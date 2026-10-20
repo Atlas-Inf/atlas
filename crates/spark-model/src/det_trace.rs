@@ -272,6 +272,14 @@ pub fn set_layer(layer: usize) {
     }
 }
 
+/// The following taps' rows start at sequence position `chunk_start` (a
+/// multi-sequence pass's per-sequence blocks).
+pub fn set_chunk_start(chunk_start: usize) {
+    if on() {
+        CURRENT.with(|c| c.set(c.get().map(|at| At { chunk_start, ..at })));
+    }
+}
+
 fn current(stage: &str) -> Option<At> {
     if !on() || !stage_selected(stage) {
         return None;
@@ -279,7 +287,7 @@ fn current(stage: &str) -> Option<At> {
     CURRENT.with(Cell::get)
 }
 
-fn device_hash(
+pub(crate) fn device_hash(
     gpu: &dyn GpuBackend,
     stream: u64,
     ptr: DevicePtr,
@@ -395,6 +403,18 @@ impl Taps<'_> {
             return;
         }
         if let Some(at) = current(stage) {
+            if rows_mode() {
+                emit(row_line(
+                    at,
+                    self.gpu,
+                    self.stream,
+                    stage,
+                    ptr,
+                    rows,
+                    row_bytes,
+                ));
+                return;
+            }
             emit(device_line(
                 at,
                 self.gpu,
@@ -407,6 +427,42 @@ impl Taps<'_> {
             ));
         }
     }
+}
+
+/// `ATLAS_GLM_DET_TRACE_ROWS=1`: one hash a ROW, keyed by sequence position,
+/// so passes of other shapes (chunked, restored, batched) compare row by row:
+/// `DETR r= q= L= s= p=<position of the first row> h=<hash>,<hash>,..`.
+fn rows_mode() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_DET_TRACE_ROWS").as_deref() == Ok("1"))
+}
+
+fn row_line(
+    at: At,
+    gpu: &dyn GpuBackend,
+    stream: u64,
+    stage: &str,
+    ptr: DevicePtr,
+    (row0, rows): (usize, usize),
+    row_bytes: usize,
+) -> String {
+    let mut host = vec![0u8; rows * row_bytes];
+    let ok = gpu.synchronize(stream).is_ok() && gpu.copy_d2h(ptr, &mut host).is_ok();
+    let hashes: Vec<String> = if ok {
+        host.chunks(row_bytes.max(1))
+            .map(|r| format!("{:08x}", hash_bytes(r) as u32))
+            .collect()
+    } else {
+        vec!["ERR".to_owned()]
+    };
+    format!(
+        "DETR r={} q={} L={} s={stage} p={} h={}",
+        at.rank,
+        at.request,
+        at.layer,
+        at.chunk_start + row0,
+        hashes.join(",")
+    )
 }
 
 /// Log a `hash` of `bytes` host bytes already read for `stage`.

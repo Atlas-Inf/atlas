@@ -54,7 +54,7 @@ impl Qwen3AttentionLayer {
         {
             return Ok(());
         }
-        ops::hc_pre_site(
+        ops::hc_pre_site_rows(
             ctx.gpu,
             self.hc_pre_k,
             streams,
@@ -67,6 +67,7 @@ impl Qwen3AttentionLayer {
             n as u32,
             h,
             eps,
+            ctx.levers.qwen4exp_hc_rows(),
             stream,
         )
     }

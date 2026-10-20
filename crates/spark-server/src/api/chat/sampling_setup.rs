@@ -188,10 +188,12 @@ pub(super) fn build_sampling(
     // A card's presence_penalty is tuned for short chat turns; over a
     // 20K-token single-file generation it suppresses every token already
     // emitted (see the flag's doc in `atlas_kernels::ModelBehavior`).
-    let preset_penalties = preset_penalties_apply(
-        tools_active,
-        state.behavior.use_sampling_preset_penalties_for_core,
-    );
+    // `--reference-mode`: an unset penalty is neutral, never the preset's.
+    let preset_penalties = !state.reference_mode
+        && preset_penalties_apply(
+            tools_active,
+            state.behavior.use_sampling_preset_penalties_for_core,
+        );
     let repetition_penalty = if force_temp_zero {
         1.0
     } else {
@@ -257,14 +259,14 @@ pub(super) fn build_sampling(
             );
         });
     }
-    let dry_multiplier = if force_temp_zero {
+    let dry_multiplier = if force_temp_zero || state.reference_mode {
         0.0
     } else {
         preset.dry_multiplier
     };
     let dry_base = preset.dry_base;
     let dry_allowed_length = preset.dry_allowed_length;
-    let lz_penalty = if force_temp_zero {
+    let lz_penalty = if force_temp_zero || state.reference_mode {
         0.0
     } else {
         preset.lz_penalty
@@ -294,6 +296,7 @@ pub(super) fn build_sampling(
     // Exponential `<tool_call>` bias decay. Skipped under ATLAS_FORCE_TEMP_ZERO
     // so the argmax is determined purely by raw logits (matches vLLM's path).
     if !force_temp_zero
+        && !state.reference_mode
         && tools_active
         && !suppress_tool_call
         && let Some(tc_id) = state.tool_call_start_token_id

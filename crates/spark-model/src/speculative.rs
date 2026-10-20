@@ -5,6 +5,7 @@
 //! Defines the [`DraftProposer`] trait for speculative decoding strategies.
 //! MTP implements this first; EAGLE-3 can implement later without engine changes.
 
+pub mod deep_depth;
 pub mod glm_repair_policy;
 pub mod ladder;
 pub mod tree_shape;
@@ -318,6 +319,23 @@ pub trait DraftProposer: Send + Sync {
         _n: usize,
         _grammar: bool,
     ) -> Option<usize> {
+        None
+    }
+
+    /// `ATLAS_QWEN4EXP_MTP_DRAFT_TP`: the announce word of a
+    /// [`Self::propose_batch`] of `n` sequences and `num_drafts` positions
+    /// handed `comm` (with a grammar mask or not), if the worker serves part
+    /// of it. The model announces such a propose with this word before it
+    /// calls it, and hands it `comm` then and only then. `ctx` is the
+    /// propose's: no announce for a propose that will not run batched.
+    fn draft_tp_word(
+        &self,
+        _comm: &dyn spark_comm::CommBackend,
+        _n: usize,
+        _num_drafts: usize,
+        _grammar: bool,
+        _ctx: &crate::layer::ForwardContext<'_>,
+    ) -> Option<u32> {
         None
     }
 

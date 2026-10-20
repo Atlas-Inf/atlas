@@ -433,3 +433,29 @@ fn qwen38_target_declarations_are_sound() {
         );
     }
 }
+
+/// Nemotron 3.5 Super VL: the omni model_type resolves to its own target;
+/// the Super assertion above stays pinned to the 3.0 target.
+#[test]
+fn nemotron_super_vl_resolves_to_its_own_target() {
+    assert_eq!(
+        resolve_name(
+            "nemotron_h_omni",
+            4096,
+            &["/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4"]
+        ),
+        Some("nemotron-3.5-super-vl-120b-a12b")
+    );
+    // Its kernel_source redirect points at the puzzle tree: the Super backbone
+    // kernels plus the LatentMoE/W4A4/GEMM shadows the plain Super tree lacks.
+    let parsed = parse_targets();
+    let vl = parsed
+        .iter()
+        .find(|t| t.name == "nemotron-3.5-super-vl-120b-a12b")
+        .expect("omni target exists");
+    assert_eq!(
+        vl.kernel_source.as_deref(),
+        Some("nemotron-labs-3-puzzle-75b-a9b"),
+        "omni reuses the puzzle kernel tree (Super backbone + LatentMoE shadows)"
+    );
+}

@@ -34,6 +34,12 @@ mod sequence_graphs;
 
 impl TransformerModel {
     pub(super) fn cache_sequence_dispatch(&self, seq: &SequenceState) {
+        // ATLAS_QWEN4EXP_PREFILL_ROWINV: the radix keeps what prefill wrote
+        // (inserted at the prompt's end); generated rows hold decode K/V, not
+        // what a prefill of those tokens computes.
+        if crate::layers::ops::qwen4exp_rowinv::on() {
+            return;
+        }
         self.finish_leaf_mirror_cache(seq);
         let bs = self.kv_cache.lock().block_size();
         // Only cache if the sequence has block-aligned content worth caching.
@@ -114,6 +120,9 @@ impl TransformerModel {
     }
 
     pub(super) fn free_sequence_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
+        // A commit left for this sequence's next verify is moot
+        // (`gdn_commit_fuse`); the slot is zeroed below.
+        self.gdn_fuse_drop_slot(seq.slot_idx);
         // Release prefix cache refs before freeing blocks.
         // dec_ref will only actually free blocks whose ref_count hits 0
         // CRITICAL: release SSM slot FIRST to prevent slot leak if later
@@ -239,6 +248,7 @@ impl TransformerModel {
                 ssm.gdn_commit_qkv = DevicePtr(0);
                 ssm.gdn_commit_gb = DevicePtr(0);
                 ssm.gdn_commit_pending = false;
+                ssm.gdn_fuse_n = DevicePtr(0);
             }
         }
 
@@ -352,31 +362,6 @@ impl TransformerModel {
         }
         seq.slot_idx = usize::MAX;
     }
-
-    pub(super) fn num_free_blocks_dispatch(&self) -> usize {
-        self.kv_cache.lock().num_free_blocks()
-    }
-
-    pub(super) fn num_total_blocks_dispatch(&self) -> usize {
-        // The constructor permanently owns one zeroed padding block. Admission
-        // and occupancy report only capacity available to real sequences.
-        self.kv_cache.lock().num_blocks().saturating_sub(1)
-    }
-
-    pub(super) fn reclaim_prefix_blocks_dispatch(&self, num_blocks: usize) -> usize {
-        if num_blocks == 0 || !self.prefix_cache.is_active() {
-            return 0;
-        }
-        // KV lock BEFORE `evict`, as every other eviction site does: with the
-        // NVMe tier, `evict` hands out record slots that must be written before
-        // anyone else can evict/restore against the same tree + pool.
-        let mut kv = self.kv_cache.lock();
-        let evicted = self.prefix_cache.evict(num_blocks);
-        if evicted.is_empty() {
-            return 0;
-        }
-        let before = kv.num_free_in_all();
-        self.apply_evicted(evicted, &mut kv);
-        kv.num_free_in_all().saturating_sub(before)
-    }
 }
+
+mod block_counts;

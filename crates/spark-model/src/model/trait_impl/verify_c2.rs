@@ -40,6 +40,10 @@ impl TransformerModel {
         _stream: u64,
     ) -> Result<[u32; 4]> {
         let stream = self.gpu.default_stream();
+        // ATLAS_QWEN4EXP_EXACT_VERIFY_CHECK: serial reference rows first,
+        // before the KV lock below (`exact_verify_check.rs`), as at K=2/3.
+        let serial_rows = self.exact_verify_serial_rows(&tokens[..], seq)?;
+        let seq_len_in = seq.seq_len;
         let h = self.config.hidden_size;
         let bf16 = 2usize;
         let fp32 = 2usize;
@@ -69,15 +73,7 @@ impl TransformerModel {
         for t in 0..k {
             let pos = seq.seq_len + t;
             let blocks_needed = (pos / bs) + 1;
-            ensure_blocks_through_decode(
-                seq,
-                blocks_needed - 1,
-                &mut kv_cache,
-                self.prefix_cache.as_ref(),
-                self.gpu.as_ref(),
-                stream,
-                self.levers.kv_poison,
-            )?;
+            self.reserve_decode_blocks(seq, blocks_needed - 1, &mut kv_cache, stream)?;
         }
 
         // 1c. Upload 4-entry attention metadata
@@ -259,6 +255,12 @@ impl TransformerModel {
                 self.gpu.begin_capture(stream)?;
             }
 
+            // qwen4_exp piecewise graphs (`model::decode_pieces`), as in
+            // verify_b/verify_c. `ATLAS_K4_DIAG` keeps the step eager
+            // (`levers.k4_diag` in the admission).
+            let pieces = self.decode_pieces_admitted(use_graphs, &kv_cache, &ctx);
+            let wide = self.decode_piece_wide(pieces, seq, k);
+
             // K4_DIAG per-layer timing (eager mode already syncs each layer —
             // this just records it). Only compiled in when the env is set.
             let mut k4_layer_us = k4_diag.then(Vec::new);
@@ -268,6 +270,21 @@ impl TransformerModel {
             let mut kda_layers = 0usize;
 
             for (layer_idx, layer) in self.layers.iter().enumerate() {
+                if pieces
+                    && self.verify_piece_run(
+                        layer_idx,
+                        k,
+                        wide,
+                        seq,
+                        &mut kv_cache,
+                        &seq_lens_vec,
+                        &block_tables_vec,
+                        &ctx,
+                        stream,
+                    )?
+                {
+                    continue;
+                }
                 let layer_type = self.config.layer_type(layer_idx);
                 let t_layer = k4_diag.then(std::time::Instant::now);
                 let layer_started = if verify_profile {
@@ -368,6 +385,10 @@ impl TransformerModel {
                 }
             }
 
+            if wide {
+                self.qsa_commit_staged_seq(seq, k, stream)?;
+            }
+
             if verify_profile {
                 tracing::info!(
                     "GLM K4 layer profile: kda={:.2}ms({}L) mla={:.2}ms({}L)",
@@ -405,7 +426,7 @@ impl TransformerModel {
             }
 
             // LM head for 4 tokens
-            self.lm_head_batched(normed, k as u32, self.buffers.logits(), stream)?;
+            self.lm_head_batched_tp(normed, k, stream)?;
 
             if k4_diag && let Err(e) = self.gpu.synchronize(stream) {
                 anyhow::bail!("K4_DIAG: CUDA error after lm_head_batched: {e:#}");
@@ -441,6 +462,10 @@ impl TransformerModel {
                     self.gpu.launch_graph(graph, stream)?;
                 }
             }
+        }
+
+        if let Some(rows) = serial_rows {
+            self.exact_verify_compare(rows, seq_len_in)?;
         }
 
         // ── Phase 3: Post-graph (D2H copy only) ──

@@ -31,6 +31,7 @@ mod mla_independent;
 mod nemotron_serial;
 mod qkv;
 mod qkv_dp4a;
+mod qkv_exact4;
 mod qkv_fp8;
 mod qsa_rows;
 #[cfg(test)]
@@ -40,11 +41,14 @@ impl Qwen3AttentionLayer {
     #[allow(clippy::too_many_arguments)]
     /// `row_owner`: when `Some`, row `i` belongs to sequence `row_owner[i]`, and `states` is indexed
     /// by sequence. Used for per-sequence aux state (QSA indexer) to advance once per row in order.
+    /// `active_rows`: rows `active_rows..num_seqs` are the padded batch's
+    /// dummy rows (`decode_a2`), which own no indexer carry.
     pub(in crate::layers::qwen3_attention) fn decode_multi_seq_inner<'a, 'b: 'a>(
         &self,
         hidden: DevicePtr,
         residual: DevicePtr,
         num_seqs: usize,
+        active_rows: usize,
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
         row_owner: Option<&[usize]>,
         kv_cache: &mut PagedKvCache,
@@ -70,6 +74,11 @@ impl Qwen3AttentionLayer {
         // ACTIVE row the per-row phase can serve -> `qsa_rows`; anything else
         // is refused HERE, before any layer state is touched (`guard.rs`).
         let qsa_rows = guard::plan_qsa_rows(self, seq_lens, num_seqs, row_owner, kv_cache, ctx)?;
+        // A staged run (`qsa_staged.rs`) is admitted only with every row inert.
+        anyhow::ensure!(
+            !(qsa_rows && crate::layers::qsa::staged_ingest()),
+            "QSA staged ingest on a step with an active selection"
+        );
         let bs = kv_cache.block_size() as u32;
         let mut c =
             ctx::MultiSeqCtx::new(self, ctx, hidden, residual, num_seqs, seq_lens, bs, stream);
@@ -77,6 +86,7 @@ impl Qwen3AttentionLayer {
         if let Some(m) = ctx.attn_metadata.as_ref() {
             c.seq_slot = m.seq_slot;
         }
+        c.active = active_rows.min(num_seqs);
 
         // DeepSeek-V4 / Qwen4-exp: Manifold-Constrained Hyper-Connections.
         if self.hc.is_some() {
@@ -342,7 +352,7 @@ impl Qwen3AttentionLayer {
         // Standalone attention (no FFN)
         if self.ffn.is_none() {
             if is_last_layer && let Some(ref head) = hc.head {
-                ops::hc_head_site(
+                ops::hc_head_site_rows(
                     ctx.gpu,
                     self.hc_head_k,
                     hc_streams,
@@ -353,6 +363,7 @@ impl Qwen3AttentionLayer {
                     n as u32,
                     h as u32,
                     eps,
+                    ctx.levers.qwen4exp_hc_rows(),
                     stream,
                 )?;
                 if diag_this {

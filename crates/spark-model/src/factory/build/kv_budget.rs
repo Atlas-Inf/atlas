@@ -407,6 +407,20 @@ pub(super) fn measure(
     budget
 }
 
+/// Blocks `budget` buys when each pool token also carries `aux_per_token`
+/// bytes of per-sequence state kept outside the pool
+/// (`TransformerLayer::aux_bytes_per_token`, the QSA indexer carry). With
+/// no such state this is `PagedKvCache::compute_num_blocks`.
+pub(super) fn blocks_with_aux(
+    kv: &spark_runtime::kv_cache::KvCacheConfig,
+    budget: usize,
+    aux_per_token: usize,
+) -> anyhow::Result<usize> {
+    let per_block = kv.block_bytes_kv_all_layers();
+    anyhow::ensure!(per_block > 0, "KV cache block size is zero");
+    Ok(budget / (per_block + aux_per_token * kv.block_size))
+}
+
 #[cfg(test)]
 #[path = "kv_budget_tests.rs"]
 mod tests;

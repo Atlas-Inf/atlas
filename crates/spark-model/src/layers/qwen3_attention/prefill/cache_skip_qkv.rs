@@ -302,7 +302,18 @@ impl Qwen3AttentionLayer {
         } else if weight_opt.and_then(|w| w.as_fp8()).is_some() {
             anyhow::bail!("w8a16_gemm kernel not loaded — cannot prefill with FP8 weights");
         } else if let Some(fp8p) = fp8 {
-            if n > 128 {
+            // ATLAS_QWEN4EXP_PREFILL_FP8_W2: the same k32 chain on a 2 x 4
+            // warp grid with 128-wide K steps, byte for byte.
+            if n > 128
+                && ctx.config.model_type == "qwen4_exp"
+                && ops::qwen4exp_prefill::try_fp8_gemm_w2(
+                    ctx.gpu,
+                    [normed_fp8, fp8p, out],
+                    [n, out_dim, h],
+                    stream,
+                )?
+            {
+            } else if n > 128 {
                 ops::fp8_fp8_gemm_n128_m128(
                     ctx.gpu,
                     self.fp8_fp8_gemm_t_m128_k,

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 #include <assert.h>   // device-side assert() for the work-list packing guard
 
@@ -131,6 +132,7 @@ extern "C" __global__ void moe_batched_blend(
     unsigned int hidden_size,
     unsigned int num_tokens
 ) {
+    atlas_pdl_enter();
     __shared__ float s_dot_partial[8]; // one per warp (256/32=8)
 
     unsigned int token = blockIdx.x;

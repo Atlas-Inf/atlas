@@ -54,6 +54,15 @@ impl ModelConfig {
         }
     }
 
+    /// `model_type == "nemotron_h_omni"` — survives `serve_load`'s text-only
+    /// `config.vision = None` drop when the kernel target ships no
+    /// `vision_encoder` module (every strix-hip target). Nemotron levers
+    /// (native FP8 attention, omni MoE paths) key on this rather than on
+    /// `config.vision.omni`, which disappears on AMD.
+    pub fn is_nemotron_h_omni(&self) -> bool {
+        self.model_type == "nemotron_h_omni"
+    }
+
     /// Number of SSM (linear attention) layers.
     pub fn num_ssm_layers(&self) -> usize {
         if !self.layer_types.is_empty() {
@@ -180,6 +189,28 @@ impl ModelConfig {
             return total;
         }
         total / self.tp_world_size
+    }
+
+    /// This config as one rank running the whole model alone: the head counts
+    /// the TP split divided (`resolve_topology` in spark-server) restored to
+    /// full width, and no TP or EP split. For a module one rank holds in full
+    /// and runs without collectives (the qwen4_exp MTP head on rank 0), so its
+    /// loaders take every weight unsliced and its kernels run every head.
+    /// A single-rank config comes back unchanged.
+    pub fn tp1_view(&self) -> Self {
+        let tp = self.tp_world_size.max(1);
+        Self {
+            num_attention_heads: self.num_attention_heads * tp,
+            num_key_value_heads: self.num_key_value_heads * tp,
+            linear_num_key_heads: self.linear_num_key_heads * tp,
+            linear_num_value_heads: self.linear_num_value_heads * tp,
+            tp_rank: 0,
+            tp_world_size: self.tp_world_size.min(1),
+            ep_rank: 0,
+            ep_world_size: self.ep_world_size.min(1),
+            expert_tp: false,
+            ..self.clone()
+        }
     }
 
     /// Weight key prefix for layer-level weights.
@@ -406,59 +437,5 @@ impl ModelConfig {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::ModelConfig;
-
-    #[test]
-    fn any_compressed_deepseek_v4_layer_is_not_kv_cache_complete() {
-        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
-        config.model_type = "deepseek_v4".to_string();
-
-        for ratios in [vec![4, 0, 0], vec![0, 4, 0], vec![0, 0, 128]] {
-            config.compress_ratios = ratios;
-            assert!(!config.kv_only_prefix_cache_is_safe());
-        }
-    }
-
-    #[test]
-    fn kv_complete_models_can_use_the_prefix_cache() {
-        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
-        assert!(config.kv_only_prefix_cache_is_safe());
-
-        config.model_type = "deepseek_v4".to_string();
-        config.compress_ratios = vec![0; 3];
-        assert!(config.kv_only_prefix_cache_is_safe());
-    }
-
-    #[test]
-    fn final_norm_identity_only_for_qwen4_exp() {
-        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
-        assert!(!config.final_norm_is_identity());
-
-        config.model_type = "qwen4_exp".to_string();
-        assert!(config.final_norm_is_identity());
-
-        config.model_type = "deepseek_v4".to_string();
-        assert!(!config.final_norm_is_identity());
-    }
-
-    #[test]
-    fn nemotron_mamba2_ssm_bytes_are_not_gdn_zero() {
-        let mut c = ModelConfig::qwen3_next_80b_nvfp4();
-        c.mamba_num_heads = 64;
-        c.mamba_head_dim = 64;
-        c.ssm_state_size = 128;
-        c.n_groups = 8;
-        c.linear_conv_kernel_dim = 4;
-        c.linear_num_value_heads = 0;
-        c.linear_value_head_dim = 0;
-        c.linear_num_key_heads = 0;
-        c.linear_key_head_dim = 0;
-        assert_eq!(c.ssm_h_state_bytes(), 64 * 64 * 128 * 4);
-        assert_eq!(c.ssm_conv_state_bytes(), (64 * 64 + 2 * 8 * 128) * 4 * 4);
-        assert_eq!(
-            c.linear_num_value_heads * c.linear_value_head_dim * c.linear_key_head_dim * 4,
-            0
-        );
-    }
-}
+#[path = "methods_tests.rs"]
+mod tests;

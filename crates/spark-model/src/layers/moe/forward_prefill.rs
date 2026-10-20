@@ -218,10 +218,13 @@ impl MoeLayer {
         // row; the shared expert and its blend run only this rank's rows, and
         // the EP all-reduce becomes a reduce-scatter into them.
         let sp = crate::layers::glm_sp::current()
-            .filter(|sp| is_ep_prefill && num_tokens == 2 * sp.rows);
+            .filter(|sp| is_ep_prefill && num_tokens == sp.total())
+            .map(|sp| self.q38_sp_rows(sp, h, shared_inter, ctx));
+        // `full_shared` (qwen4_exp): every row, as unsplit; only the blend
+        // takes the local rows (`forward_prefill_finish`).
         let (shared_in, shared_n) = match sp {
-            Some(sp) => (sp.local(input, h as usize), sp.rows as u32),
-            None => (input, n),
+            Some(sp) if !sp.full_shared => (sp.local(input, h as usize), sp.rows as u32),
+            _ => (input, n),
         };
         let overlap_shared_reduce = has_shared
             && is_ep_prefill
@@ -240,9 +243,14 @@ impl MoeLayer {
             && !overlap_shared_reduce
             && !defer_shared_hc
             && self.shared_split_ready(ctx, n);
+        // Under SP with the reduce-scatter pipe, the shared expert of this
+        // rank's rows runs while that exchange is on the wire
+        // (`forward_prefill_finish`, `defer_shared_to_rs`).
+        let defer_shared =
+            !split && self.defer_shared_to_rs(sp, has_shared, overlap_shared_reduce, h, ctx);
         if split {
             self.run_shared_split(input, n, h, shared_inter, ctx, stream)?;
-        } else if has_shared && !overlap_shared_reduce {
+        } else if has_shared && !overlap_shared_reduce && !defer_shared {
             self.run_shared_expert_prefill(
                 shared_in,
                 shared_n,
@@ -258,7 +266,7 @@ impl MoeLayer {
 
         // ── Routed expert path on default stream ──
 
-        // ATLAS_GLM_DET_TRACE stages (`det_rows`: the rows the reduce leaves here).
+        // ATLAS_GLM_DET_TRACE stages before routing (the rest are in forward_prefill_finish).
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
         let row = h as usize * 2;
         det.tap("moe_in", input, (0, num_tokens), row);
@@ -319,19 +327,12 @@ impl MoeLayer {
             stream,
         )?;
         let expert_down_out = ctx.buffers.expert_down_out();
-        self.apply_expert_lora_prefill_down(
-            ctx.buffers.expert_gate_out(),
+        self.forward_prefill_finish(
+            input,
             expert_down_out,
             expert_offsets,
             sorted_token_ids,
             total_expanded,
-            ctx,
-            stream,
-        )?;
-
-        self.forward_prefill_finish(
-            input,
-            expert_down_out,
             token_to_perm,
             indices_dev,
             weights_dev,
@@ -340,9 +341,13 @@ impl MoeLayer {
             top_k,
             num_tokens,
             has_shared,
-            defer_shared_hc,
-            overlap_shared_reduce,
+            false,
+            sp,
             split,
+            overlap_shared_reduce,
+            shared_in,
+            shared_n,
+            defer_shared_hc,
             ctx,
             stream,
         )?;

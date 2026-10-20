@@ -19,7 +19,7 @@ fn canonical_prefill_chain_needs_no_host_barriers() -> Result<()> {
         ops::gemv_touch(ops::Twin::W4Tc8).is_some(),
         "requires touch twins"
     );
-    W4a16BatchmTiers::resolve(gpu);
+    W4a16BatchmTiers::resolve(gpu, true);
     let gpu: &dyn GpuBackend = gpu;
     let (m, h, inter) = (26u32, 4096u32, 1024u32);
     let mut rng = Rng(0xcafe_26ab_4455_9911);

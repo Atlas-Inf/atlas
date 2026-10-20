@@ -30,6 +30,9 @@
 //! re-created empty, exactly like the disk-swap path.
 
 use super::*;
+use spark_model::model::kv_admission::{
+    is_partial_batch_step, is_retryable_refusal_text, kv_admission_refusal,
+};
 
 /// Starvation guard: a resumed victim may not be re-victimized until it has
 /// generated this many NEW tokens. Without it, the freshly resumed (and
@@ -67,7 +70,9 @@ pub(super) fn choose_decode_victim(
     can_spill: bool,
 ) -> Option<usize> {
     let eligible = |a: &ActiveSeq| {
-        a.grammar_state.is_none() && (can_spill || !model.tokens_contain_vision_pad(&a.seq.tokens))
+        !a.finished
+            && a.grammar_state.is_none()
+            && (can_spill || !model.tokens_contain_vision_pad(&a.seq.tokens))
     };
     let pick = |immune_ok: bool| {
         active
@@ -103,7 +108,11 @@ pub(super) fn decode_batch_with_preemption(
             Ok(l) => return Some(l),
             Err(e) => {
                 drop(refs);
-                let victim = if format!("{e:#}").contains("KV cache exhausted") && active.len() > 1
+                // A per-sequence loop that failed after some sequences ran
+                // cannot be retried: they would decode the same token twice.
+                let victim = if format!("{e:#}").contains("KV cache exhausted")
+                    && active.len() > 1
+                    && !is_partial_batch_step(&e)
                 {
                     choose_decode_victim(model, active, spill.is_some())
                 } else {
@@ -115,8 +124,10 @@ pub(super) fn decode_batch_with_preemption(
                     // exits; a head that carried on would block forever in
                     // its next collective while reporting healthy. Exit too,
                     // so clients see the connection drop and a supervisor
-                    // restarts the pair.
-                    if model.is_ep() {
+                    // restarts the pair. An AGREED refusal is the exception:
+                    // every rank rolled the step back and the worker keeps
+                    // serving, so only these requests fail.
+                    if model.is_ep() && kv_admission_refusal(&e).is_none() {
                         eprintln!("EP head step error (peer exits on it too); terminating: {e:#}");
                         crate::ep_peer_lifeline::terminate();
                     }
@@ -140,32 +151,105 @@ pub(super) fn decode_batch_with_preemption(
                 // path a fallback to the eager loop for this step, and the
                 // next step re-sorts. The vacated SSM slot is re-compacted by
                 // `retire_finished_sequences` later this same tick.
-                let v = active.remove(vi);
-                tracing::warn!(
-                    "KV cache exhausted during decode: preempting slot={} \
-                     ({} blocks, {} tokens generated) for later RESUME so the \
-                     other {} sequence(s) can continue",
-                    v.seq.slot_idx,
-                    v.seq.block_table.len(),
-                    v.output_tokens.len(),
-                    active.len(),
-                );
-                match spill.as_deref_mut() {
-                    Some(sp) => match spill_out_sequence(model, v, sp) {
-                        Ok(s) => swapped.push(s),
-                        Err((v, spill_err)) => {
-                            tracing::warn!(
-                                "decode-preempt spill failed ({spill_err:#}); \
-                                 requeuing victim for re-prefill instead"
-                            );
-                            preempted.push(preempt_requeue(model, v));
-                        }
-                    },
-                    None => preempted.push(preempt_requeue(model, v)),
-                }
+                park_victim(model, active, vi, spill.as_deref_mut(), swapped, preempted);
             }
         }
     }
+}
+
+/// Take `active[vi]` out of the batch and park it for a later RESUME:
+/// spilled when a spill pool exists, requeued for re-prefill otherwise.
+fn park_victim(
+    model: &dyn Model,
+    active: &mut Vec<ActiveSeq>,
+    vi: usize,
+    spill: Option<&mut KvSpillManager>,
+    swapped: &mut Vec<SwappedSeq>,
+    preempted: &mut Vec<PreemptedSeq>,
+) {
+    // `remove` (not `swap_remove`) keeps the ascending SSM-slot order the
+    // caller established; see `decode_batch_with_preemption`.
+    let v = active.remove(vi);
+    tracing::warn!(
+        "KV cache exhausted during decode: preempting slot={} \
+         ({} blocks, {} tokens generated) for later RESUME so the \
+         other {} sequence(s) can continue",
+        v.seq.slot_idx,
+        v.seq.block_table.len(),
+        v.output_tokens.len(),
+        active.len(),
+    );
+    match spill {
+        Some(sp) => match spill_out_sequence(model, v, sp) {
+            Ok(s) => swapped.push(s),
+            Err((v, spill_err)) => {
+                tracing::warn!(
+                    "decode-preempt spill failed ({spill_err:#}); \
+                     requeuing victim for re-prefill instead"
+                );
+                preempted.push(preempt_requeue(model, v));
+            }
+        },
+        None => preempted.push(preempt_requeue(model, v)),
+    }
+}
+
+/// The speculative steps (MTP bootstrap, single and batched verify) record a
+/// failed step as an engine error on the sequences it covered. When that
+/// error is an agreed, retryable KV refusal, the step was rolled back on
+/// every rank before its forward pass and the sequences are intact, so
+/// handle it as plain decode does: preempt one victim (resumable) and let
+/// the others retry next tick. A refused sequence is finished, with the
+/// error, only when nothing else can be preempted: a lone sequence that
+/// outgrew the pool. Before agreed refusals the worker exited on its own
+/// allocation failure and took the pair with it.
+pub(super) fn requeue_kv_refusals(
+    model: &dyn Model,
+    active: &mut Vec<ActiveSeq>,
+    spill: Option<&mut KvSpillManager>,
+    swapped: &mut Vec<SwappedSeq>,
+    preempted: &mut Vec<PreemptedSeq>,
+) {
+    let refused: Vec<usize> = active
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| {
+            a.finished
+                && a.engine_error
+                    .as_deref()
+                    .is_some_and(is_retryable_refusal_text)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if refused.is_empty() {
+        return;
+    }
+    for &i in &refused {
+        active[i].finished = false;
+    }
+    let running = active.iter().filter(|a| !a.finished).count();
+    let victim = if running > 1 {
+        choose_decode_victim(model, active, spill.is_some())
+    } else {
+        None
+    };
+    let Some(vi) = victim else {
+        for &i in &refused {
+            let a = &mut active[i];
+            a.finished = true;
+            tracing::warn!(
+                "KV cache exhausted with nothing left to preempt: finishing slot={} \
+                 at {} tokens with an error",
+                a.seq.slot_idx,
+                a.seq.seq_len,
+            );
+        }
+        return;
+    };
+    for &i in &refused {
+        active[i].engine_error = None;
+    }
+    park_victim(model, active, vi, spill, swapped, preempted);
 }
 
 /// Whether to run the `--swap-space` pool. A model that cannot resume a
@@ -277,6 +361,8 @@ pub(super) fn spill_out_sequence(
         content_tokens: a.content_tokens,
         prose_tokens_since_last_tool: a.prose_tokens_since_last_tool,
         think_watchdog_fires: a.think_watchdog_fires,
+        loop_steers: a.loop_steers,
+        loop_steer_max: a.loop_steer_max,
         rollback_count: a.rollback_count,
         tool_call_start_token: a.tool_call_start_token,
         tool_call_opened: a.tool_call_opened,
@@ -318,158 +404,6 @@ pub(super) fn preempt_requeue(model: &dyn Model, mut a: ActiveSeq) -> PreemptedS
     PreemptedSeq { a, tokens }
 }
 
-/// Resume a requeued victim by re-prefilling its token history.
-///
-/// Rebuilds KV and SSM state for `tokens` (prompt + processed output) on a
-/// freshly allocated sequence; `a.last_token` — already streamed to the
-/// client — stays the pending decode input, so nothing is re-sampled or
-/// re-emitted and the stream continues exactly where it paused. The prefill
-/// logits are discarded for the same reason. On error the client has
-/// already been notified and freed — the caller just logs.
-pub(super) fn resume_preempted_seq(model: &dyn Model, p: PreemptedSeq) -> Result<ActiveSeq> {
-    let PreemptedSeq { mut a, tokens } = p;
-    let mut seq = match model.alloc_sequence() {
-        Ok(s) => s,
-        Err(e) => {
-            send_error_to_sink(&mut a.sink, &format!("preempt-resume alloc failed: {e:#}"));
-            return Err(e);
-        }
-    };
-    seq.session_hash = a.session_hash;
-    seq.disable_mtp = a.disable_mtp;
-    seq.adapter_slot = a.seq.adapter_slot;
-    // Task #24/#25 parity with the swap-in path: keep the STABLE adapter_id
-    // stamped at the original prefill and re-acquire the slot ref released
-    // by the preempt-time free. (Preempted seqs also hold the LoRA
-    // quiescence gate in `run`, so the adapter cannot rotate in between.)
-    seq.adapter_id = a.seq.adapter_id;
-    seq.acquired_adapter_slot = model.acquire_adapter_slot(a.seq.adapter_slot);
-
-    // EP: mirror the non-chunked prefill preamble so the worker mirrors the
-    // re-prefill (no-ops on non-EP models).
-    let prefill_result = (|| -> Result<()> {
-        model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, a.disable_mtp)?;
-        model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
-        model.ep_broadcast_cmd(tokens.len() as u32)?;
-        model.ep_broadcast_cmd(0)?;
-        model.ep_broadcast_cmd(tokens.len() as u32)?;
-        model.ep_broadcast_tokens(&tokens)?;
-        model.prefill(&tokens, &mut seq, 0)?;
-        Ok(())
-    })();
-    if let Err(e) = prefill_result {
-        a.seq = seq;
-        send_error(
-            model,
-            &mut a,
-            &format!("preempt-resume re-prefill failed: {e:#}"),
-        );
-        return Err(e);
-    }
-    // NOTE: `seq.prompt_len` now spans the WHOLE history — deliberately left
-    // as prefill stamped it, because it must describe what prefill actually
-    // ref-bumped for `cache_sequence`'s prompt/generated split; restoring
-    // the original prompt length would double-bump the pre-preemption
-    // output blocks at finish and pin them forever. The min_tokens floor is
-    // an absolute position, so it carries over to the new owner unchanged.
-    a.seq.eos_ban.arm(&mut seq);
-    a.seq = seq;
-    // The rollback ring's GPU snapshots died with the old slot; start empty
-    // (identical to the disk-swap resume path).
-    a.ssm_rollback_ring = SsmDecodeRing::new(model.decode_rollback_ring_slots());
-    a.preempt_immune_until_tokens = a.output_tokens.len() + PREEMPT_IMMUNITY_TOKENS;
-    Ok(a)
-}
-
-/// Swapped sequences released their GPU ownership when spilled. Remove dead
-/// buffered callers and their spill files before restoring any GPU state.
-pub(super) fn discard_disconnected_swapped(
-    swapped: &mut Vec<SwappedSeq>,
-    spill: &mut KvSpillManager,
-) {
-    swapped.retain(|s| {
-        if !s.sink.receiver_closed() {
-            return true;
-        }
-        if let Err(e) = spill.remove_file(s.swap_id) {
-            if e.downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-            {
-                return false;
-            }
-            tracing::warn!("discard disconnected spill: {e:#}");
-            // Retain ownership so a later sweep can retry cleanup. The
-            // swap-in selector excludes closed sinks even on cleanup failure.
-            return true;
-        }
-        false
-    });
-}
-
-/// Resume requeued victims while KV blocks and batch slots allow.
-///
-/// Cheapest-first (fewest blocks to re-prefill). Gated on the history
-/// fitting with one block of growth headroom, reclaiming from the prefix
-/// cache exactly like the swap-in loop — cached blocks never volunteer
-/// themselves (see `reclaim_prefix_blocks` docs).
-pub(super) fn resume_preempted_seqs(
-    model: &dyn Model,
-    active: &mut Vec<ActiveSeq>,
-    preempted: &mut Vec<PreemptedSeq>,
-    max_batch_size: usize,
-    block_size: usize,
-) {
-    // GPU ownership was released at preemption. Drop disconnected callers
-    // before reclaiming cache blocks or rebuilding their entire history.
-    preempted.retain(|p| !p.a.sink.receiver_closed());
-    while !preempted.is_empty() && active.len() < max_batch_size {
-        let Some((idx, needed)) = preempted
-            .iter()
-            .enumerate()
-            .map(|(i, p)| (i, p.tokens.len() / block_size.max(1) + 1))
-            .min_by_key(|&(_, n)| n)
-        else {
-            return;
-        };
-        // +1 growth block of headroom: resuming into an exactly-full pool
-        // would just re-preempt on the next decode step.
-        let want = needed + 1;
-        let total = model.num_total_blocks();
-        if total > 0 && want > total {
-            // Can never fit — erroring is honest; queueing forever is not.
-            let mut p = preempted.remove(idx);
-            send_error_to_sink(
-                &mut p.a.sink,
-                &format!(
-                    "preempted sequence needs {want} KV blocks but the pool has {total}; \
-                     cannot resume"
-                ),
-            );
-            continue;
-        }
-        let mut free = model.num_free_blocks();
-        while free < want {
-            let got = model.reclaim_prefix_blocks(want - free);
-            if got == 0 {
-                break;
-            }
-            free = model.num_free_blocks();
-        }
-        if free < want {
-            return;
-        }
-        let p = preempted.remove(idx);
-        let n_tokens = p.tokens.len();
-        match resume_preempted_seq(model, p) {
-            Ok(a) => {
-                tracing::info!(
-                    "Preempt-resume: re-prefilled {n_tokens} tokens \
-                     ({} generated so far), decode continues",
-                    a.output_tokens.len(),
-                );
-                active.push(a);
-            }
-            Err(e) => tracing::error!("Preempt-resume failed: {e:#}"),
-        }
-    }
-}
+#[path = "preempt/resume.rs"]
+mod resume;
+pub(super) use resume::*;

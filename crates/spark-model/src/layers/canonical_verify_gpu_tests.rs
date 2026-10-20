@@ -278,7 +278,7 @@ fn canonical_w4a16_rows_do_not_depend_on_the_width() -> Result<()> {
     ensure!(enabled(), "run with ATLAS_W4A16_TC=1 and the switch on");
     let gpu = backend()?;
     let gpu: &dyn GpuBackend = gpu;
-    W4a16BatchmTiers::resolve(gpu);
+    W4a16BatchmTiers::resolve(gpu, true);
     let mut rng = Rng(0x5eed_1234_abcd_0001);
     let mut failed = 0;
     let mut legacy_varies = 0;

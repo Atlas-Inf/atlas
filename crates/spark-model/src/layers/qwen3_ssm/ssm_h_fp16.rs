@@ -292,6 +292,7 @@ mod prefill_narrowing_tests {
             gdn_commit_qkv: DevicePtr(0),
             gdn_commit_gb: DevicePtr(0),
             gdn_commit_pending: false,
+            gdn_fuse_n: DevicePtr::NULL,
             h_is_f16,
             h_prefill_stage: stage,
             ple: None,

@@ -21,6 +21,15 @@ impl SafetensorsLoader {
         if self.skip_mtp && name.starts_with("mtp.") {
             return true;
         }
+        // Dead namespaces the model's loader never reads (nemotron_h_omni's
+        // vision tower / mtp / projector).
+        if self
+            .skip_prefixes
+            .iter()
+            .any(|p| name.starts_with(p.as_str()))
+        {
+            return true;
+        }
         // W4A4 activation scales: never read on the w4a16 path (the NVFP4
         // loader falls back to `DevicePtr::NULL`), and 4-byte allocations are
         // almost pure granule padding at expert scale.

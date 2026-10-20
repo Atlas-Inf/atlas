@@ -18,6 +18,13 @@
 //! accepted-row hidden stash (Phase 2) MUST complete for every sequence
 //! before ANY sequence's verdict/propose runs (Phase 3).
 //!
+//! A member with `ks[i] == 1` is a DECODE ROW (`mtp_step/one_forward.rs`):
+//! no drafts, its one row is the target token at its position. Its verdict
+//! emits that row's pick (`k4_apply_verdict` with no drafts: nothing to
+//! reject, nothing to trim), and it proposes with the batch in Phase 4 under
+//! the bootstrap's bookkeeping (`adaptive_spec`), so the step carries it
+//! exactly as the bootstrap's own decode forward would have.
+//!
 //! Reachability: only via `step_mtp` Phase B when `ATLAS_MTP_MAX_SEQS > 1`
 //! (default 16 with the ladder) puts >= 2 verify-ready grammarless
 //! sequences holding drafts in one step AND the model says
@@ -35,9 +42,12 @@ pub(super) fn batch_verify_disabled() -> bool {
     *CACHED.get_or_init(|| std::env::var("ATLAS_NO_MTP_BATCH_VERIFY").is_ok())
 }
 
-/// Batched K-row verify for `batch.len() >= 2` sequences. Sequence `i` holds
-/// exactly `ks[i] - 1` pending drafts — RAGGED since D-Cut, uniform without
-/// it. Caller (Phase B in `mtp_step.rs`) guarantees: grammarless, non-DFlash,
+/// Batched K-row verify for `batch.len() >= 2` sequences, or ONE sequence
+/// verifying more rows than its own 4-row verify serves (the qwen4_exp exact
+/// lane, up to 8 rows). Sequence `i` holds
+/// exactly `ks[i] - 1` pending drafts — RAGGED since D-Cut and the confidence
+/// stop, uniform without them, none for a decode row (`ks[i] == 1`). Caller
+/// (Phase B in `mtp_step.rs`) guarantees: grammarless, non-DFlash,
 /// `pending_drafts.len() == ks[i]-1`, `Σ ks <= VERIFY_ROW_BUDGET` (128 since
 /// the wave-11 depth-at-width envelope; 64 at the 32:1 rung), batch sorted
 /// deepest-first then by ssm slot (canonical graph key), and
@@ -47,12 +57,16 @@ pub(super) fn batch_verify_disabled() -> bool {
 /// the pruned one: D-Cut prunes what gets VERIFIED, and must be free to
 /// re-expand a sequence next step, so the drafter always refills to the ladder
 /// depth. The next step's Phase B truncates whatever it does not want.
+/// `ceiling` is the step's configured draft ceiling, the dynamic depth's
+/// bound (`mtp_deep_depth`).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn step_verify_k4_batched(
     model: &dyn Model,
     batch: &mut [&mut ActiveSeq],
     sched: &crate::scheduler::sched_ctx::SchedCtx,
     ks: &[usize],
     propose_nd: usize,
+    ceiling: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
 ) {
     let n = batch.len();
@@ -68,8 +82,8 @@ pub(super) fn step_verify_k4_batched(
     let r_total = acc;
     off.push(r_total);
     debug_assert!(
-        (2..=32).contains(&n)
-            && ks.iter().all(|k| (2..=4).contains(k))
+        (1..=32).contains(&n)
+            && ks.iter().all(|k| (1..=8).contains(k))
             && r_total <= crate::scheduler::mtp_dcut::VERIFY_ROW_BUDGET
     );
 
@@ -139,6 +153,14 @@ pub(super) fn step_verify_k4_batched(
     // Rows for seq i live at row_base = i*rows in the shared logits buffer.
     let mut verdicts: Vec<(Vec<u32>, usize, Vec<crate::api::TokenLogprobs>)> =
         Vec::with_capacity(n);
+    // ATLAS_VERIFY_PICK_PAR: every member's picks first, the host-pipelined
+    // ones in parallel; each is what the per-member call below returns.
+    let mut batch_picks =
+        crate::scheduler::verify_pipeline_helper::pick_batch_applies(verify_ctx, n).then(|| {
+            crate::scheduler::verify_pipeline_helper::verify_pick_batch(
+                model, &results, &off, batch, verify_ctx,
+            )
+        });
     for (i, a) in batch.iter_mut().enumerate() {
         let rows = ks[i];
         let k_drafts = rows - 1;
@@ -146,9 +168,12 @@ pub(super) fn step_verify_k4_batched(
         // Full pre-sample pipeline per verify position, reading this
         // sequence's rows (row_base = i*rows) — same 8-stage semantics as
         // the single-seq MTP path.
-        let processed = crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(
-            model, r, a, verify_ctx, off[i],
-        );
+        let processed = match batch_picks.as_mut() {
+            Some(p) => std::mem::take(&mut p[i]),
+            None => crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(
+                model, r, a, verify_ctx, off[i],
+            ),
+        };
         let v: Vec<u32> = (0..rows)
             .map(|j| processed.get(j).copied().unwrap_or(r[j]))
             .collect();
@@ -173,7 +198,25 @@ pub(super) fn step_verify_k4_batched(
         // Width-attributed accept telemetry (ATLAS_MTP_ACCEPT_DEBUG). The
         // positional counters above are K=4-shaped and therefore SILENT at
         // the shipped n in [5,8] ladder step (k_drafts == 2); this one is not.
-        crate::scheduler::mtp_accept_debug::record(n, k_drafts, drafts[0] == v[0], num_accepted);
+        if k_drafts > 0 {
+            crate::scheduler::mtp_accept_debug::record(
+                n,
+                k_drafts,
+                drafts[0] == v[0],
+                num_accepted,
+            );
+            // Per-position acceptance and the dynamic depth; the n=1 ladders
+            // (`enabled`) keep their single-sequence verifies.
+            a.mtp_acct.record_depth_verify(
+                k_drafts,
+                num_accepted,
+                ceiling,
+                crate::scheduler::mtp_deep_depth::DepthLevers {
+                    adapt: false,
+                    ..sched.levers.depth()
+                },
+            );
+        }
         let verify_lps = if let Some(top_logprobs) = a.top_logprobs {
             extract_verify_logprobs(model, &v, top_logprobs, off[i])
         } else {
@@ -186,6 +229,17 @@ pub(super) fn step_verify_k4_batched(
     sched
         .timing
         .record(crate::scheduler::mtp_timing::Phase::PipelineProc, t_phase1);
+    // Over a TP pair the worker ran the same forward and waits for these to
+    // commit what Phase 3 commits (`ep_verify_batch.rs`). No-op single-rank.
+    let accepted: Vec<u32> = verdicts.iter().map(|v| v.1 as u32).collect();
+    if let Err(e) = model.ep_broadcast_verify_verdicts(&accepted) {
+        tracing::error!("EP broadcast batched-verify verdicts: {e:#}");
+        for a in batch.iter_mut() {
+            a.engine_error = Some(format!("{e:#}"));
+            a.finished = true;
+        }
+        return;
+    }
     let t_stash = Instant::now();
     // ── Phase 2: stash the accepted-position hiddens before any propose ──
     // Absolute forward row i*rows + num_accepted_i → stash slot i; the
@@ -210,6 +264,9 @@ pub(super) fn step_verify_k4_batched(
     // (greedy accept + rewind arithmetic + emit + trim; propose is DEFERRED
     // so Phase 4 can batch it across sequences — the per-seq drafter forward
     // reads ~850 MB of BF16 drafter weights.)
+    // A decode row whose sequence is adaptively suspended does not propose,
+    // exactly as on the bootstrap path.
+    let mut suspended = vec![false; n];
     for (i, (a, (v, num_accepted, verify_lps))) in
         batch.iter_mut().zip(verdicts.into_iter()).enumerate()
     {
@@ -225,6 +282,12 @@ pub(super) fn step_verify_k4_batched(
             K4Hidden::DeferPropose,
             verify_us,
         );
+        if ks[i] == 1 && !a.finished {
+            // The bootstrap's bookkeeping for its serially decoded token;
+            // `spec_allowed` mutates re-probe state — evaluated exactly once.
+            crate::scheduler::adaptive_spec::tick_serial(a, sched);
+            suspended[i] = !crate::scheduler::adaptive_spec::spec_allowed(a, sched);
+        }
     }
 
     // ── Phase 4: batched cross-sequence propose ──
@@ -242,7 +305,7 @@ pub(super) fn step_verify_k4_batched(
         .record(crate::scheduler::mtp_timing::Phase::Commit, t_verdict);
     let t_propose = Instant::now();
     let pending: Vec<usize> = (0..n)
-        .filter(|&i| !batch[i].finished && batch[i].pending_drafts.is_empty())
+        .filter(|&i| !batch[i].finished && batch[i].pending_drafts.is_empty() && !suspended[i])
         .collect();
     if pending.is_empty() {
         // `_step_timer` records StepTotal on drop — no explicit `step_done`

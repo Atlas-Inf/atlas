@@ -43,7 +43,8 @@ pub fn dflash_seq_uses_raw_argmax(
     raw_requested: bool,
     masked_requested: bool,
     model: &dyn spark_model::traits::Model,
-    a: &crate::scheduler::types::ActiveSeq,
+    a: &mut crate::scheduler::types::ActiveSeq,
+    argmax_ids: &[u32],
 ) -> bool {
     dflash_seq_raw_argmax_policy(
         raw_requested,
@@ -51,6 +52,7 @@ pub fn dflash_seq_uses_raw_argmax(
         model.is_lightning_dspark_product(),
         model.verify_logits_argmax_only(),
         a,
+        argmax_ids,
     )
 }
 

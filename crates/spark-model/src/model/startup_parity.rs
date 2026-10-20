@@ -35,6 +35,12 @@
 //! setting that only matters under a switch reads 0 while that switch is off
 //! (`while_on`), so stale leftovers do not fail a boot.
 //!
+//! Runtime facts a rank cannot set but the pair must share — the process's
+//! own linked library versions — live in `RUNTIME`, chained ahead of
+//! `SETTINGS` and compared exactly alike: the cuBLASLt heuristic picks other
+//! kernels in other versions, so ranks on different libcublasLt round the
+//! same GEMMs differently and serve diverging numerics.
+//!
 //! Not here: what the ranks already reconcile (`ATLAS_KV_MAX_BLOCKS` takes
 //! the pair's minimum; the RDMA pair compares its capacity and one-shot
 //! settings at bootstrap), what is local to a rank (the drafter, the rails,
@@ -49,21 +55,10 @@
 use anyhow::{Result, anyhow, ensure};
 use spark_comm::CommBackend;
 use spark_runtime::gpu::GpuBackend;
-use spark_runtime::radix_tree::{glm_pc_evict_enabled, snap_evict_alpha, snap_evict_legacy};
 
-use super::glm_long_verify::{oracle_enabled, serial_diagnostic};
-use super::trait_impl::finish_leaf;
-use super::trait_impl::prefill_b::pc_policy as pc;
-use super::{glm_c4, glm_independent, glm_vocab_split, graph_flags, mtp_carry, verify_pieces};
-use crate::layer::glm_long_owner;
-use crate::layers::dflash_head::{ConvTwinKind, rank_split};
-use crate::layers::qwen3_attention::{
-    glm_mla_multi_seq_enabled, glm_multi_seq_sparse_enabled, glm_multi_seq_sparse_graphs_enabled,
-    grouped_routed_decode_enabled, grouped_routed_decode_min, index_split_words,
-    pairwise_moe_decode_enabled, write_floor_legacy,
-};
-use crate::layers::{self, glm_kv_shard, glm_sp, moe, ops, qwen3_ssm, w4a16_gemv_tiers};
-use crate::speculative::glm_repair_policy;
+#[path = "startup_parity_table.rs"]
+mod table;
+use table::{SETTINGS, SETTINGS_TAIL};
 
 /// One agreed setting: its name and a rank's value.
 pub type Setting = (&'static str, u64);
@@ -78,283 +73,20 @@ fn warn_only() -> bool {
     std::env::var("ATLAS_STARTUP_PARITY").as_deref() == Ok("warn")
 }
 
-/// The model type the GLM parsers are asked about.
-const GLM: &str = "glm5_next";
+/// Process-runtime facts every rank must share, compared like the settings.
+/// The cuBLASLt heuristic picks other kernels in other versions, so ranks
+/// on different libcublasLt round the same GEMMs differently.
+const RUNTIME: &[(&str, fn() -> Result<u64>)] =
+    &[("cuBLASLt runtime version (libcublasLt)", || {
+        Ok(spark_runtime::cublaslt::version() as u64)
+    })];
 
-/// The settings read in this crate: name, and this process's value from the
-/// feature's own parser. One entry per setting.
-const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
-    // A rank that would only warn beside one that fails.
-    ("ATLAS_STARTUP_PARITY=warn", || Ok(warn_only() as u64)),
-    // The head's command words.
-    ("ATLAS_EP_PROTOCOL=v2", || {
-        Ok(super::ep_protocol_v2_requested() as u64)
-    }),
-    // The passes of a prefill chunk and the rows each rank runs.
-    ("ATLAS_NO_TAIL_SPLIT", || {
-        Ok(pc::tail_split_disabled() as u64)
-    }),
-    ("ATLAS_GLM_PREFILL_SP", || Ok(glm_sp::requested() as u64)),
-    // Sequence-parallel prefill needs the BF16 highway, which needs the
-    // DFlash lane.
-    ("ATLAS_GLM_HC_BF16", || Ok(ops::hc_bf16_for(GLM) as u64)),
-    ("ATLAS_GLM_INDEX_SPLIT", || Ok(index_split_words()?[0])),
-    ("ATLAS_GLM_INDEX_SPLIT_MIN_CTX", || {
-        Ok(index_split_words()?[1])
-    }),
-    (
-        "ATLAS_GLM_INDEX_SPLIT_CHECK",
-        || Ok(index_split_words()?[2]),
-    ),
-    // Prefix-cache policy: the min-reductions of a prefill, its restore
-    // depth (so its row range) and the head's cache-sequence command.
-    ("ATLAS_GLM_PC_EVICT", || Ok(glm_pc_evict_enabled() as u64)),
-    ("ATLAS_GLM_PC_BRANCH", || {
-        Ok(pc::glm_pc_branch_enabled() as u64)
-    }),
-    ("ATLAS_GLM_PC_BRANCH_MIN", || {
-        while_on(pc::glm_pc_branch_enabled(), pc::glm_pc_branch_min_tokens)
-    }),
-    // In effect, that is with the preconditions `finish_leaf::flag` checks.
-    ("ATLAS_GLM_PC_FINISH_LEAF", || {
-        Ok(finish_leaf::enabled() as u64)
-    }),
-    ("ATLAS_GLM_PC_FINISH_LEAF_BLOCKS", || {
-        while_on(finish_leaf::enabled(), finish_leaf::span_blocks)
-    }),
-    ("ATLAS_MARCONI_EXACT", || {
-        Ok(mtp_carry::marconi_exact() as u64)
-    }),
-    ("ATLAS_MARCONI_MIN_TOKENS", || {
-        Ok(mtp_carry::marconi_min_tokens() as u64)
-    }),
-    ("ATLAS_MARCONI_PREFILL_ONLY", || {
-        Ok(mtp_carry::marconi_prefill_only() as u64)
-    }),
-    // The snapshots a rank has to restore from: the decode checkpoints it
-    // takes and the ones a full pool evicts.
-    ("ATLAS_DECODE_CKPT_BLOCKS", || {
-        while_on(
-            !mtp_carry::marconi_prefill_only(),
-            mtp_carry::decode_ckpt_blocks,
-        )
-    }),
-    ("ATLAS_SNAP_EVICT_LEGACY", || {
-        Ok((!glm_pc_evict_enabled() && snap_evict_legacy()) as u64)
-    }),
-    ("ATLAS_SNAP_EVICT_ALPHA", || {
-        let unused = glm_pc_evict_enabled() || snap_evict_legacy();
-        Ok(if unused {
-            0
-        } else {
-            snap_evict_alpha().to_bits()
-        })
-    }),
-    // Which cached rows a prefill rewrites, so what each rank attends.
-    ("ATLAS_GLM_PC_WRITE_FLOOR", || {
-        Ok(pc::glm_pc_write_floor_enabled() as u64)
-    }),
-    ("ATLAS_GLM_KV_WRITE_FLOOR_LEGACY", || {
-        Ok(write_floor_legacy() as u64)
-    }),
-    // Which rank stores each block's latents, and the exchanges the shard's
-    // attention runs (the pool-size gather checks them again:
-    // `glm_kv_shard::agreed_blocks`).
-    ("ATLAS_GLM_KV_SHARD", || {
-        Ok(glm_kv_shard::requested()? as u64)
-    }),
-    ("ATLAS_GLM_KV_SHARD_COMPACT", || {
-        Ok(glm_kv_shard::MergeTuning::get()?.compact as u64)
-    }),
-    ("ATLAS_GLM_KV_SHARD_OVERLAP", || {
-        Ok(glm_kv_shard::MergeTuning::get()?.overlap as u64)
-    }),
-    ("ATLAS_GLM_KV_SHARD_CHECK", || {
-        Ok(glm_kv_shard::MergeTuning::get()?.check as u64)
-    }),
-    // Work the pair splits, and the exchanges that stand in for a reduce.
-    ("ATLAS_GLM_SHARED_TP_SPLIT", || {
-        Ok(moe::shared_tp_split_requested() as u64)
-    }),
-    ("ATLAS_GLM_DENSE_TP_SPLIT", || {
-        Ok(layers::dense_ffn::dense_tp_split_requested()? as u64)
-    }),
-    // Same bytes either way; agreed so a pair never mixes the routing
-    // chains it was measured with.
-    ("ATLAS_GLM_MOE_ROUTE_FUSE", || {
-        Ok(moe::route_fuse_requested()? as u64)
-    }),
-    ("ATLAS_GLM_KDA_COMMIT_CTAS", || {
-        Ok(ops::kda_commit_ctas()? as u64)
-    }),
-    ("ATLAS_GLM_MLA_FUSE", || {
-        Ok(ops::glm_mla_fuse_requested()? as u64)
-    }),
-    ("ATLAS_GLM_MXFP8_TILED", || {
-        Ok(ops::mxfp8_tiled_requested()? as u64)
-    }),
-    ("ATLAS_MOE_SHARED_REDUCE_OVERLAP", || {
-        Ok(moe::shared_reduce_overlap_requested() as u64)
-    }),
-    ("ATLAS_GLM_K5_FUSED_TP_HC", || {
-        Ok(layers::verify_fused_tp_hc_enabled() as u64)
-    }),
-    ("ATLAS_GLM_VERIFY_VOCAB_SPLIT", || {
-        Ok(glm_vocab_split::enabled() as u64)
-    }),
-    // The lane a decode or verify step takes on both ranks.
-    ("ATLAS_GLM_DFLASH", || {
-        Ok(glm_repair_policy::dflash_enabled() as u64)
-    }),
-    ("ATLAS_GLM_DFLASH_PREFILL_VERIFY", || {
-        Ok(glm_repair_policy::dflash_prefill_verify() as u64)
-    }),
-    ("ATLAS_GLM_MTP_REPAIR", || {
-        Ok(glm_repair_policy::enabled() as u64)
-    }),
-    ("ATLAS_GLM_MTP_LONG_CONTEXT", || {
-        Ok(glm_repair_policy::long_context_enabled() as u64)
-    }),
-    ("ATLAS_GLM_LONG_BATCH_VERIFY", || {
-        Ok(glm_long_owner::enabled()? as u64)
-    }),
-    ("ATLAS_GLM_INDEPENDENT_DECODE", || {
-        Ok(glm_independent::enabled(GLM)? as u64)
-    }),
-    // The rows of a multi-sequence decode step each layer runs together: one
-    // collective over them, or one a sequence.
-    ("ATLAS_GLM_KDA_MULTI_SEQ", || {
-        Ok(layers::kda_multi_seq_enabled() as u64)
-    }),
-    ("ATLAS_GLM_MLA_MULTI_SEQ", || {
-        Ok(glm_mla_multi_seq_enabled() as u64)
-    }),
-    ("ATLAS_GLM_KDA_BATCHED_FFN", || {
-        Ok(layers::kda_batched_ffn_enabled() as u64)
-    }),
-    ("ATLAS_GLM_C2_COMPACT_MOE", || {
-        Ok(moe::c2_compact_requested()? as u64)
-    }),
-    ("ATLAS_GLM_MULTI_SEQ_SPARSE", || {
-        Ok(glm_multi_seq_sparse_enabled(GLM) as u64)
-    }),
-    ("ATLAS_GLM_MULTI_SEQ_SPARSE_GRAPHS", || {
-        Ok(glm_multi_seq_sparse_graphs_enabled(GLM)? as u64)
-    }),
-    ("ATLAS_GLM_C4_DECODE", || Ok(glm_c4::enabled(GLM) as u64)),
-    ("ATLAS_GLM_C4_SPARSE", || {
-        Ok((glm_c4::enabled(GLM) && glm_c4::sparse_enabled(GLM)) as u64)
-    }),
-    ("ATLAS_GLM_C4_GROUPED_MOE", || {
-        Ok((glm_c4::enabled(GLM) && moe::c4_grouped_requested()) as u64)
-    }),
-    // Models without the mHC highway: the MoE passes of a batched decode
-    // step, so one EP reduce over its rows, one a pair or one a row.
-    ("ATLAS_MOE_PAIRWISE_DECODE", || {
-        Ok(pairwise_moe_decode_enabled() as u64)
-    }),
-    ("ATLAS_MOE_GROUPED_ROUTED_DECODE", || {
-        Ok(grouped_routed_decode_enabled() as u64)
-    }),
-    ("ATLAS_MOE_GROUPED_ROUTED_DECODE_MIN", || {
-        while_on(grouped_routed_decode_enabled(), grouped_routed_decode_min)
-    }),
-    ("ATLAS_MOE_LEGACY_PERTOKEN_DECODE", || {
-        Ok(qwen3_ssm::moe_legacy_pertoken_decode() as u64)
-    }),
-    // The owner-batch verify: its FFN and its layers jointly or an owner at
-    // a time, and the serial verifies its oracle adds.
-    ("ATLAS_GLM_LONG_BATCH_FFN", || {
-        while_on(glm_long_owner::enabled()?, || {
-            glm_long_owner::ffn_mode() as usize
-        })
-    }),
-    ("ATLAS_GLM_LONG_BATCH_SERIAL", || {
-        while_on(glm_long_owner::enabled()?, || {
-            2 * serial_diagnostic(true) as usize + serial_diagnostic(false) as usize
-        })
-    }),
-    ("ATLAS_GLM_LONG_BATCH_ORACLE", || {
-        Ok((glm_long_owner::enabled()? && oracle_enabled()) as u64)
-    }),
-    // Where a K=5 verify blends the shared expert: whole after the EP reduce,
-    // or a half a rank before it, which also needs the tensor-core tiers.
-    ("ATLAS_GLM_K5_GROUPED_MOE", || {
-        Ok(moe::k5_grouped_moe_requested() as u64)
-    }),
-    ("ATLAS_GLM_K5_FUSED_MOE_HC", || {
-        Ok((moe::k5_grouped_moe_requested() && moe::k5_fused_moe_hc_requested()) as u64)
-    }),
-    ("ATLAS_W4A16_TC", || {
-        Ok(w4a16_gemv_tiers::tc_requested() as u64)
-    }),
-    // Whether the shared expert's TP split and every verify op take the
-    // canonical row-invariant kernels (`layers::canonical_verify`).
-    ("ATLAS_GLM_CANONICAL_VERIFY", || {
-        Ok(layers::canonical_verify::enabled() as u64)
-    }),
-    // The MTP body a rank loads.
-    ("ATLAS_GLM_MTP_DISTRIBUTED", || {
-        Ok(glm_repair_policy::mtp_distributed() as u64)
-    }),
-    // The drafter a worker loads and the swaps of a rank-split propose,
-    // batched ones included (ATLAS_GLM_DRAFT_TP_BATCH, bit 2), how the
-    // worker reads its announce (ATLAS_GLM_DRAFT_TP_CTX, bit 3) and what the
-    // vocabulary halves swap (ATLAS_GLM_DRAFT_TP_TOPK, bit 4).
-    ("ATLAS_GLM_DRAFT_TP", || {
-        Ok(rank_split::parity_word(
-            rank_split::requested()?,
-            rank_split::batch_requested()?,
-            rank_split::ctx_requested()?,
-            rank_split::topk_requested()?,
-        ))
-    }),
-    // Changes drafts only (the convs run on the head of a split propose);
-    // agreed so a pair never drafts from a twin it was not measured with.
-    ("ATLAS_DFLASH_CONV_TWIN", || {
-        Ok(ConvTwinKind::word(ConvTwinKind::requested()?))
-    }),
-    // Whether a step runs as a CUDA graph: a capturing forward takes other
-    // collective paths than an eager one (`graph_flags`).
-    ("ATLAS_EP_GRAPHS", || Ok(graph_flags::ep_graphs() as u64)),
-    ("ATLAS_GDN_DECODE_GRAPH", || {
-        Ok(graph_flags::gdn_decode_graph() as u64)
-    }),
-    ("ATLAS_NO_DECODE_GRAPHS", || {
-        Ok(graph_flags::no_decode_graphs() as u64)
-    }),
-    ("ATLAS_NO_DECODE_GRAPHS_MULTISEQ", || {
-        Ok(!graph_flags::multiseq_graphs_enabled() as u64)
-    }),
-    ("ATLAS_GLM_TP_VERIFY_GRAPH", || {
-        Ok(graph_flags::glm_tp_verify_graph() as u64)
-    }),
-    ("ATLAS_GLM_MTP1_VERIFY_GRAPH", || {
-        Ok(graph_flags::glm_mtp1_verify_graph() as u64)
-    }),
-    ("ATLAS_DEBUG_NO_GRAPH", || {
-        Ok(graph_flags::debug_no_graph() as u64)
-    }),
-    ("ATLAS_GLM_VERIFY_GRAPH", || {
-        Ok(verify_pieces::requested() as u64)
-    }),
-    ("ATLAS_SSM_SAVE_DUMP", || {
-        Ok(graph_flags::ssm_save_dump() as u64)
-    }),
-    ("ATLAS_LIGHTNING_VERIFY_LAYER_TRACE", || {
-        Ok(graph_flags::verify_layer_trace() as u64)
-    }),
-    ("ATLAS_MS_PROFILE", || Ok(graph_flags::ms_profile() as u64)),
-    ("ATLAS_DFLASH_DEBUG_NO_GRAPH", || {
-        Ok(graph_flags::dflash_debug_no_graph() as u64)
-    }),
-    ("ATLAS_K2_DIAG", || Ok(graph_flags::k2_diag() as u64)),
-];
-
-/// This process's settings: [`SETTINGS`], then the `caller`'s.
+/// This process's settings: [`RUNTIME`], [`SETTINGS`], then the `caller`'s.
 fn settings(caller: &[Setting]) -> Result<Vec<Setting>> {
-    SETTINGS
+    RUNTIME
         .iter()
+        .chain(SETTINGS.iter())
+        .chain(SETTINGS_TAIL.iter())
         .map(|&(name, read)| Ok((name, read()?)))
         .chain(caller.iter().copied().map(Ok))
         .collect()

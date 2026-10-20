@@ -189,17 +189,32 @@ impl Qwen3AttentionLayer {
             qsa: None,
             hc_pre_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_pre")),
             hc_pre_from_raw_mix_k: gate(
-                hc,
+                hc && probes.glm_series,
                 gpu,
                 "hyper_connection",
                 &hc_name("hc_pre_from_raw_mix"),
             ),
-            hc_pre_mix_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_pre_mix")),
+            hc_pre_mix_k: gate(
+                hc && (probes.glm_series || probes.qwen4_exp),
+                gpu,
+                "hyper_connection",
+                &hc_name("hc_pre_mix"),
+            ),
             hc_post_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_post")),
-            hc_post_moe_blend_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_post_moe_blend")),
+            hc_post_moe_blend_k: gate(
+                hc && probes.glm_series,
+                gpu,
+                "hyper_connection",
+                &hc_name("hc_post_moe_blend"),
+            ),
             hc_expand_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_expand")),
             hc_head_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_head")),
-            hc_contract_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_contract")),
+            hc_contract_k: gate(
+                hc && probes.glm_series,
+                gpu,
+                "hyper_connection",
+                &hc_name("hc_contract"),
+            ),
             qkv_nvfp4_t: None,
             q_nvfp4_t: None,
             k_nvfp4_t: None,
@@ -376,7 +391,9 @@ impl Qwen3AttentionLayer {
             } else {
                 KernelHandle(0)
             },
-            glm_latent_qdq_k: if std::env::var("ATLAS_GLM_LATENT_QDQ").as_deref() == Ok("1") {
+            glm_latent_qdq_k: if probes.glm_series
+                && std::env::var("ATLAS_GLM_LATENT_QDQ").as_deref() == Ok("1")
+            {
                 gpu.kernel("reshape_and_cache", "glm_latent_qdq_fp8g128")?
             } else {
                 KernelHandle(0)
@@ -649,7 +666,17 @@ impl Qwen3AttentionLayer {
             w4a16_gemv_qg_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_qg_batch3")?,
             w4a16_gemv_dual_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_dual_batch3")?,
             w4a16_gemv_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
-            w4a16_batchm: crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu),
+            w4a16_gemv_qg_batch4_k: gate(
+                !probes.glm_series,
+                gpu,
+                "w4a16_gemv",
+                "w4a16_gemv_qg_batch4",
+            ),
+            wide_rows: crate::layers::ops::Qwen4ExpWideRows::resolve(gpu, &config.model_type),
+            w4a16_batchm: crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(
+                gpu,
+                probes.glm_series,
+            ),
             w4a16_gemv_batch16_k: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch16"),
             // `w4a16_gemv_dp4a` exists only in kernels/strix-hip/common —
             // ATLAS_TARGET_HW=strix-hip sets cfg!(atlas_hip). On every other
@@ -866,6 +893,7 @@ impl Qwen3AttentionLayer {
             ),
             sigmoid_gate_mul_batched_k: gpu.kernel("residual_add", "sigmoid_gate_mul_batched")?,
             q_fp8: None,
+            rowinv_bf16: [None; 4],
             k_fp8: None,
             v_fp8: None,
             o_fp8: None,

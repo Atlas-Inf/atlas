@@ -33,6 +33,7 @@ impl BlockDiffusionDraftHead {
         gpu: &dyn GpuBackend,
         max_seq_len: usize,
         max_batch_size: usize,
+        target_model_type: &str,
         mut startup: DsparkStartupExecution,
     ) -> Result<Self> {
         super::selector_platform::validate_requested_features(startup.diagnostics.draft_conf)?;
@@ -136,12 +137,13 @@ impl BlockDiffusionDraftHead {
         // `mtp_head.rs` plus the `extern "C" __global__` declarations under
         // `kernels/gb10/common/`.
         let paged_sink = super::paged_attn_modules::paged_sink_modules_for_head_dim(head_dim)?;
+        let glm_series = target_model_type == "glm5_next";
         let (selector_kernel, draft_conf) = super::draft_conf::selector_kernel(
             gpu,
-            startup.diagnostics.draft_conf && weights.candidate_selector.is_some(),
+            glm_series && startup.diagnostics.draft_conf && weights.candidate_selector.is_some(),
         );
         startup.diagnostics.draft_conf = draft_conf;
-        let dense_gemv_tc = dense_gemv_tc_kernels(gpu);
+        let dense_gemv_tc = dense_gemv_tc_kernels(gpu, glm_series);
         let kernels = DflashKernels {
             // DFlash drafter uses HF's vanilla RMSNorm convention
             // (`out = x * w / RMS(x)`), NOT Atlas's default offset-from-1
@@ -208,7 +210,7 @@ impl BlockDiffusionDraftHead {
                 .kernel(paged_sink.indirect.0, paged_sink.indirect.1)?,
             prefill_attn_dflash_bf16_batched_sink: gpu
                 .kernel(paged_sink.batched.0, paged_sink.batched.1)?,
-            silu_mul: silu_mul_kernel(gpu)?,
+            silu_mul: silu_mul_kernel(gpu, glm_series)?,
             residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
             argmax: gpu.kernel("argmax", "argmax_bf16")?,
             argmax_batch: gpu.kernel("argmax", "argmax_bf16_batch")?,
@@ -281,8 +283,13 @@ impl BlockDiffusionDraftHead {
             w4a16_gemv_batch8: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch8")?,
             w4a16_gemv_batch16: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch16")?,
             w4a16_gemv_batch32: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch32")?,
-            mxfp8_quantize: crate::layers::try_kernel(gpu, "mxfp8_gemv", "mxfp8_quantize_bf16"),
-            mxfp8_gemv: mxfp8_gemv_kernels(gpu),
+            mxfp8_quantize: crate::layers::try_kernel_gated(
+                glm_series,
+                gpu,
+                "mxfp8_gemv",
+                "mxfp8_quantize_bf16",
+            ),
+            mxfp8_gemv: mxfp8_gemv_kernels(gpu, glm_series),
         };
 
         // Per-step scratch buffers. BF16 = 2 bytes/element.
@@ -763,6 +770,20 @@ impl BlockDiffusionDraftHead {
             num_layers,
         );
 
+        // Own lm_head (LiLiCorr-style drafters, `has_own_lm_head: true`):
+        // draft logits come from the drafter's trained NVFP4 head, not the
+        // target's. The target BF16 pointer is replaced with NULL so no
+        // branch can silently reach it — every lm_head dispatch checks
+        // `lm_head_nvfp4` first, and the Phase-G FP8-mirror block below is
+        // gated on `lm_head_nvfp4.is_none()`.
+        let has_own_head = weights.lm_head.is_some();
+        let lm_head_nvfp4 = weights.lm_head.or(lm_head_nvfp4);
+        let lm_head_shared = if has_own_head {
+            DevicePtr::NULL
+        } else {
+            lm_head_shared
+        };
+
         let mut head = Self {
             num_layers,
             hidden_size,
@@ -996,6 +1017,26 @@ impl BlockDiffusionDraftHead {
                 "DFlash batched propose: authoritative Bxgamma for generic DFlash \
                  (default on; rollback ATLAS_DFLASH_BATCHED_PROPOSE=0; min 2, max {})",
                 head.batch_capacity
+            );
+        }
+
+        // Own NVFP4 lm_head: fail at build time if every kernel the head
+        // dispatch can fall back to is missing. Otherwise a 0 handle drops
+        // to the BF16 branch, which reads the NULL `lm_head_shared` that an
+        // own-head drafter carries, and faults deep inside a proposal step.
+        if has_own_head {
+            let wave_k = match head.gamma as u32 {
+                1..=4 => head.kernels.w4a16_gemv_batch4,
+                5..=8 => head.kernels.w4a16_gemv_batch8,
+                9..=16 => head.kernels.w4a16_gemv_batch16,
+                _ => spark_runtime::gpu::KernelHandle(0),
+            };
+            anyhow::ensure!(
+                wave_k.0 != 0 || head.kernels.w4a16_gemm.0 != 0,
+                "DFlash drafter has_own_lm_head=true but neither the γ={} NVFP4 \
+                 batched-GEMV wave kernel nor the w4a16_gemm fallback resolved in \
+                 this kernel target — the BF16 fallback would read a NULL lm_head",
+                head.gamma,
             );
         }
 

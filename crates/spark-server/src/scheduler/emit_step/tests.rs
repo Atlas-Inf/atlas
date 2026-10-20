@@ -23,3 +23,11 @@ mod glm_native_eos_tests;
 #[cfg(test)]
 #[path = "../strict_grammar_tests.rs"]
 mod strict_grammar_tests;
+
+#[cfg(test)]
+#[path = "../min_tokens_eos_tests.rs"]
+mod min_tokens_eos_tests;
+
+#[cfg(test)]
+#[path = "../ignore_eos_tests.rs"]
+mod ignore_eos_tests;

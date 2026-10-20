@@ -35,6 +35,9 @@ impl Qwen3SsmLayer {
         } else {
             ctx.buffers.ssm_qkvz()
         };
+        // A decode-only FP8 copy (`ATLAS_QWEN4EXP_FP8_GDN=1`) is invisible
+        // here: prefill keeps the BF16 GEMM that copy was quantized from.
+        let qkvz_fp8w = self.qkvz_fp8w.as_ref().filter(|_| !self.fp8w_decode_only);
         // One-time dispatch-state dump: which weight copies / kernel handles are
         // populated decides which arm of the ladder below actually runs.
         static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -43,7 +46,7 @@ impl Qwen3SsmLayer {
                 "SSM_QKVZ_DISPATCH fp8w={} fp8w_t={} nvfp4_t={} fp8={} rowwise={} \
                  w8a16={:#x} w8a16_t={:#x} w8a16_pipe={:#x} w4a16_t={:#x} force_bf16_env={} \
                  cutlass_qkvz={} cutlass={} cublas_fp8={} cublas={} w8a8={} M={k} N={qkvz_size} K={h}",
-                self.qkvz_fp8w.is_some(),
+                qkvz_fp8w.is_some(),
                 self.qkvz_fp8w_t.is_some(),
                 self.qkvz_nvfp4_t.is_some(),
                 self.qkvz_fp8.is_some(),
@@ -158,7 +161,7 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else if ctx.dispatch.cutlass_nvfp4_qkvz
-            && let Some(ref fp8w) = self.qkvz_fp8w
+            && let Some(fp8w) = qkvz_fp8w
         {
             ops::log_cutlass_nvfp4_route(
                 ctx.gpu,
@@ -178,7 +181,7 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else if ctx.dispatch.cutlass_gemm
-            && let Some(ref fp8w) = self.qkvz_fp8w
+            && let Some(fp8w) = qkvz_fp8w
         {
             ops::cutlass_bf16_proj(
                 ctx.gpu,
@@ -192,7 +195,7 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else if ctx.dispatch.cublas_fp8
-            && let Some(ref fp8w) = self.qkvz_fp8w
+            && let Some(fp8w) = qkvz_fp8w
         {
             ops::cublas_fp8_rowwise_proj(
                 ctx.gpu,
@@ -208,7 +211,7 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else if ctx.dispatch.cublas_gemm
-            && let Some(ref fp8w) = self.qkvz_fp8w
+            && let Some(fp8w) = qkvz_fp8w
         {
             ops::cublas_bf16_proj(
                 ctx.gpu,
@@ -264,7 +267,7 @@ impl Qwen3SsmLayer {
                 })?;
             }
         } else if force_w8a8
-            && let Some(ref fp8w) = self.qkvz_fp8w
+            && let Some(fp8w) = qkvz_fp8w
             && self.per_token_group_quant_fp8_k.0 != 0
             && self.fp8_gemm_t_blockscaled_k.0 != 0
         {
@@ -303,7 +306,7 @@ impl Qwen3SsmLayer {
                 h as u32,
                 stream,
             )?;
-        } else if let Some(ref fp8w) = self.qkvz_fp8w
+        } else if let Some(fp8w) = qkvz_fp8w
             && self.w8a16_gemm_pipelined_k.0 != 0
         {
             // Block-scaled W8A16 prefill: matches vLLM's per-128-block FP32
@@ -334,7 +337,7 @@ impl Qwen3SsmLayer {
                     "ssm prefill: QKVZ w8a16_gemm_pipelined failed (M={k}, N={qkvz_size}): {e}"
                 )
             })?;
-        } else if let Some(ref fp8w) = self.qkvz_fp8w
+        } else if let Some(fp8w) = qkvz_fp8w
             && fp8w.scale_format == crate::weight_map::WeightQuantFormat::Fp8BlockScaled
             && (k > 128 || self.qkvz_fp8w_t.is_none())
             && self.w8a16_gemm_n_m128_k.0 != 0
@@ -453,7 +456,7 @@ impl Qwen3SsmLayer {
                     anyhow::anyhow!("ssm prefill: QKVZ GEMM failed (M={k}, N={qkvz_size}): {e}")
                 })?;
             }
-        } else if let Some(ref fp8w) = self.qkvz_fp8w
+        } else if let Some(fp8w) = qkvz_fp8w
             && self.w8a16_gemm_k.0 != 0
         {
             // cp.async-free fallback (gfx1151/HIP): non-pipelined block-scaled

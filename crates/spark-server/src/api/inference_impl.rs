@@ -84,12 +84,35 @@ impl InferenceRequest {
         }
     }
 
-    /// Per-request stop tokens, consumed by the scheduler.
-    pub fn take_stop_tokens(&mut self) -> Vec<u32> {
-        match self {
-            InferenceRequest::Blocking { stop_tokens, .. } => std::mem::take(stop_tokens),
-            InferenceRequest::Streaming { stop_tokens, .. } => std::mem::take(stop_tokens),
+    /// The tokens that end this request, consumed by the scheduler: the
+    /// model's `eos_tokens` merged with the request's stop tokens. Under
+    /// `ignore_eos` (vLLM) the model's end tokens are left out — they decode
+    /// as ordinary tokens and the request runs to `max_tokens` — while the
+    /// request's own stop tokens still end it.
+    pub fn take_end_tokens(&mut self, eos_tokens: &[u32]) -> Vec<u32> {
+        let (stop_tokens, ignore_eos) = match self {
+            InferenceRequest::Blocking {
+                stop_tokens,
+                ignore_eos,
+                ..
+            }
+            | InferenceRequest::Streaming {
+                stop_tokens,
+                ignore_eos,
+                ..
+            } => (std::mem::take(stop_tokens), *ignore_eos),
+        };
+        let mut end = if ignore_eos {
+            Vec::new()
+        } else {
+            eos_tokens.to_vec()
+        };
+        if !stop_tokens.is_empty() {
+            end.extend(stop_tokens);
+            end.sort_unstable();
+            end.dedup();
         }
+        end
     }
 
     /// Top-k sampling parameter.
@@ -423,73 +446,6 @@ impl InferenceRequest {
     }
 }
 
-/// Tokenize stop sequence strings into single-token stop IDs.
-/// Multi-token stop sequences are logged but excluded (require string matching).
-pub(crate) fn tokenize_stop_sequences(
-    tokenizer: &crate::tokenizer::ChatTokenizer,
-    stops: &[String],
-) -> Vec<u32> {
-    let mut tokens = Vec::new();
-    for s in stops {
-        match tokenizer.encode(s) {
-            Ok(ids) if ids.len() == 1 => tokens.push(ids[0]),
-            Ok(ids) if ids.len() > 1 => {
-                tracing::info!(
-                    "Multi-token stop '{}' ({} tokens) — use string matching",
-                    s,
-                    ids.len()
-                );
-            }
-            Ok(_) => {} // Empty encoding
-            Err(e) => tracing::warn!("Failed to tokenize stop '{}': {e}", s),
-        }
-    }
-    tokens.sort_unstable();
-    tokens.dedup();
-    tokens
-}
-
-/// Strip any matching stop sequence from the end of the output text.
-/// Per OpenAI spec, returned text must not contain the stop sequence.
-pub(crate) fn strip_stop_sequences(text: String, stops: &[String]) -> String {
-    strip_stop_sequences_matched(text, stops).0
-}
-
-/// [`strip_stop_sequences`], also reporting WHICH stop sequence matched
-/// (feeds Anthropic's `stop_sequence` response field via the IR's
-/// `matched_stop`).
-pub(crate) fn strip_stop_sequences_matched(
-    mut text: String,
-    stops: &[String],
-) -> (String, Option<String>) {
-    // Try longest-first so overlapping prefixes (`["</answer", "</answer>"]`)
-    // don't truncate at the shorter (wrong) match boundary. strip_suffix
-    // is end-anchored, so usually only one of the two end-matches at a
-    // time, but defensive ordering handles the cases where it doesn't.
-    let mut sorted: Vec<&String> = stops.iter().collect();
-    sorted.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    for s in sorted {
-        if let Some(stripped) = text.strip_suffix(s.as_str()) {
-            text.truncate(stripped.len());
-            return (text, Some(s.clone()));
-        }
-    }
-    (text, None)
-}
-
-/// Extract `<think>...</think>` reasoning from model output.
-///
-/// Returns `(reasoning_content, response_content)`.
-/// - `enable_thinking=true`: reasoning extracted into first element, response in second.
-/// - `enable_thinking=false`: reasoning discarded (None), only response returned.
-pub(crate) fn extract_thinking(
-    text: &str,
-    enable_thinking: bool,
-    parser: Option<&dyn crate::reasoning_parser::ReasoningParser>,
-) -> (Option<String>, String) {
-    if let Some(p) = parser {
-        p.extract_thinking(text, enable_thinking)
-    } else {
-        (None, text.to_string())
-    }
-}
+#[path = "inference_impl/tail.rs"]
+mod tail;
+pub(crate) use tail::*;

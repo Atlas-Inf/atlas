@@ -333,8 +333,10 @@ pub fn build_model(
 
     // Capability warning: user asked for `--speculative` but the model has no
     // MTP head bundled, so speculative decoding will silently no-op. Surface
-    // this loudly so the user knows the flag was inert.
+    // this loudly so the user knows the flag was inert. Rank 0 only: the
+    // other ranks never draft and load no rank-0-only module.
     if use_speculative
+        && config.ep_rank == 0
         && dflash_args.is_none()
         && mtp_weights.is_empty()
         && v4_mtp_module.is_none()
@@ -679,8 +681,15 @@ pub fn build_model(
         sparse_index,
         glm_cache_plan.and_then(|p| p.shard()).is_some(),
     );
-    let reserve_net =
-        reserve_net + kv_nvme::host_reserve_bytes(nvme_geometry, ssm_pools.tier_lazy_host_bytes());
+    // ATLAS_QWEN4EXP_SNAPSHOT_SLOTS / _AUX_MB: the snapshots' host aux
+    // (`ssm_snapshot_budget`), 0 by default.
+    let snapshot_aux = crate::model::ssm_snapshot_budget::install(
+        &ssm_pools.snapshots,
+        layers.iter().map(|l| l.aux_bytes_per_token()).sum(),
+    );
+    let reserve_net = reserve_net
+        + snapshot_aux
+        + kv_nvme::host_reserve_bytes(nvme_geometry, ssm_pools.tier_lazy_host_bytes());
     let budget = kv_budget::measure(
         gpu.as_ref(),
         total_mem,
@@ -690,6 +699,10 @@ pub fn build_model(
         hss_cache_blocks_per_seq.is_none(),
     );
     let (used_so_far, total_budget, kv_budget) = (budget.own, budget.total_budget, budget.bytes);
+    // Per-sequence state that grows with a sequence's tokens outside the pool
+    // (the QSA indexer carry): charged per pool token, so the pool and the
+    // state riding with its tokens fit the budget together.
+    let aux_bytes_per_token: usize = layers.iter().map(|l| l.aux_bytes_per_token()).sum();
     // Phase 6.1.f: when HBM-shrink is active, size the production cache to
     // `max_batch_size × cache_blocks_per_seq` rather than the unbounded
     // budget-driven sum. This is the *whole point* of the HBM-shrink
@@ -759,7 +772,7 @@ pub fn build_model(
             }
             let n = match glm_cache_plan {
                 Some(plan) => plan.num_blocks_for_budget(kv_budget),
-                None => PagedKvCache::compute_num_blocks(&kv_config, kv_budget)?,
+                None => kv_budget::blocks_with_aux(&kv_config, kv_budget, aux_bytes_per_token)?,
             };
             let max_kv_tokens = n * kv_block_size;
             let lazy_bf16_term = if derived_reserve > 0 {
@@ -767,9 +780,18 @@ pub fn build_model(
             } else {
                 String::new()
             };
+            let aux_term = if aux_bytes_per_token > 0 {
+                format!(
+                    " (incl. {:.1} GB for {aux_bytes_per_token} B/token of per-sequence \
+                     indexer state)",
+                    gib(max_kv_tokens * aux_bytes_per_token),
+                )
+            } else {
+                String::new()
+            };
             tracing::info!(
                 "KV cache: {:.1} GB total × {:.0}% util = {:.1} GB budget; \
-                 {:.1} GB pre-KV + {:.1} GB reserve{lazy_bf16_term} → {:.1} GB for KV \
+                 {:.1} GB pre-KV + {:.1} GB reserve{lazy_bf16_term} → {:.1} GB for KV{aux_term} \
                  → {} blocks × {} tok/block = {} max KV tokens",
                 total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
                 gpu_memory_utilization * 100.0,
@@ -896,14 +918,6 @@ pub fn build_model(
         Err(e) => return Err(e),
     };
 
-    // Release the reserve balloon: everything after this point (Marconi
-    // snapshot pool, SSM decode states, drafter KV, NVFP4 staging) allocates
-    // into the contiguous region it held instead of the fragmented tail.
-    if let Some(ptr) = balloon
-        && let Err(e) = gpu.free(ptr)
-    {
-        tracing::warn!("startup reserve balloon free failed: {e}");
-    }
     if let Some(index) = sparse_index {
         kv_cache.attach_sparse_index_with_tail_slots(index, tail_slots, gpu.as_ref())?;
     }
@@ -914,6 +928,15 @@ pub fn build_model(
         comm.as_deref().map_or(0, |c| c.rank()),
         ssm_pools.tier_home,
     )?;
+
+    // Release the reserve balloon: everything after this point (Marconi
+    // snapshot pool, SSM decode states, drafter KV, NVFP4 staging) allocates
+    // into the contiguous region it held instead of the fragmented tail.
+    if let Some(ptr) = balloon
+        && let Err(e) = gpu.free(ptr)
+    {
+        tracing::warn!("startup reserve balloon free failed: {e}");
+    }
 
     // ── Step 6: Assemble model ──
     // Capture pointers for any post-construction sharing (DFlash drafter
@@ -926,6 +949,29 @@ pub fn build_model(
     let target_lm_head_nvfp4_for_dflash = lm_head_nvfp4;
     let target_hidden_for_dflash = config.hidden_size;
     let target_vocab_for_dflash = config.vocab_size;
+
+    // The BF16 lm_head is only ever a fallback: every logits producer prefers
+    // the NVFP4 head when it exists (impl_a3::lm_head, the lm_head_batched
+    // arm, the decode_b2 prefill-logits arm, and the DFlash drafter whose
+    // lm_head_shared is guarded by lm_head_nvfp4.is_none()). On NVFP4-head
+    // targets the BF16 copy (~vocab x hidden x 2 B) is provably dead weight —
+    // free it and NULL the stored pointer so no later fallback can
+    // dereference freed memory. Only when the NVFP4 head does not live in
+    // that buffer (pre-packed checkpoints) and it is not the tied embedding.
+    let lm_head = if super::lm_head_setup::bf16_lm_head_is_dead(
+        lm_head.weight,
+        lm_head_nvfp4.as_ref(),
+        embed.weight,
+    ) {
+        if let Err(e) = gpu.free(lm_head.weight) {
+            tracing::warn!("lm_head BF16 intermediate free failed: {e}");
+        }
+        crate::weight_map::DenseWeight {
+            weight: spark_runtime::gpu::DevicePtr::NULL,
+        }
+    } else {
+        lm_head
+    };
 
     let mut model = TransformerModel::new(
         config,
@@ -986,17 +1032,47 @@ pub fn build_model(
     // Same shape as 6b: the module holds a reused trunk layer, and the
     // proposer supplies the MTP-specific ends (the per-stream combiner in
     // front, the head mixer behind).
+    //
+    // ATLAS_QWEN4EXP_MTP_DRAFT_TP: on the TP2 pair the worker builds the same
+    // draft head and projects half of each batched propose's
+    // (`layers::qwen4exp_mtp::draft_tp`); it proposes nothing.
+    let (q4e_draft_tp, rank) = {
+        let c = model.config_ref();
+        let pair = c.tp_world_size == 2 && c.ep_world_size == 2;
+        let on = c.model_type == "qwen4_exp" && use_speculative && pair;
+        (
+            on && crate::layers::qwen4exp_mtp::draft_tp::requested()?,
+            c.ep_rank,
+        )
+    };
+    if q4e_draft_tp && rank != 0 {
+        let (vocab, hidden) = {
+            let c = model.config_ref();
+            (c.vocab_size, c.hidden_size)
+        };
+        let assist = crate::layers::qwen4exp_mtp::draft_tp::Qwen4ExpDraftAssist::new(
+            &q4e_mtp_lm_head,
+            vocab,
+            hidden,
+            mtp_vocab_size,
+            model.gpu_backend(),
+        )?;
+        model.set_draft_assist(std::sync::Arc::new(assist));
+        tracing::info!("qwen4_exp MTP draft head installed on rank {rank} to serve draft TP");
+    }
     if let Some(q4e_module) = q4e_mtp_module {
         match crate::layers::Qwen4ExpMtpHead::new(
             q4e_module,
             q4e_mtp_embed,
             q4e_mtp_lm_head,
-            model.config_ref(),
             model.gpu_backend(),
             mtp_vocab_size,
             max_seq_len,
         ) {
-            Ok(head) => {
+            Ok(mut head) => {
+                if q4e_draft_tp {
+                    head.enable_draft_tp(model.gpu_backend())?;
+                }
                 model.set_dflash_proposer(std::sync::Arc::new(head));
                 tracing::info!(
                     "qwen4_exp MTP speculative decoding: ENABLED (single module, \
@@ -1084,6 +1160,7 @@ pub fn build_model(
                     model.gpu_backend(),
                     max_seq_len,
                     max_batch_size,
+                    &model.config_ref().model_type,
                     startup,
                 )?;
                 // ATLAS_GLM_DRAFT_TP: on the TP2 pair both ranks hold the

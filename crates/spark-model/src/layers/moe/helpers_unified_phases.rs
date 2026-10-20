@@ -50,6 +50,55 @@ impl MoeLayer {
         Ok(())
     }
 
+    /// Frees through `free_original` so the pointers come back in the
+    /// caller's freed list — the weight store's teardown still owns them and
+    /// would free them a second time otherwise (#122).
+    pub(super) fn release_unified_shared_gate_up(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+        freed: &mut Vec<DevicePtr>,
+    ) -> Result<()> {
+        let shared_inter = config.shared_expert_intermediate_size;
+        if !self.weights.shared_expert.gate_proj.weight.is_null() && shared_inter > 0 {
+            free_original(gpu, freed, self.weights.shared_expert.gate_proj.weight)?;
+            free_original(
+                gpu,
+                freed,
+                self.weights.shared_expert.gate_proj.weight_scale,
+            )?;
+            self.weights.shared_expert.gate_proj.weight = DevicePtr::NULL;
+            self.weights.shared_expert.gate_proj.weight_scale = DevicePtr::NULL;
+            free_original(gpu, freed, self.weights.shared_expert.up_proj.weight)?;
+            free_original(gpu, freed, self.weights.shared_expert.up_proj.weight_scale)?;
+            self.weights.shared_expert.up_proj.weight = DevicePtr::NULL;
+            self.weights.shared_expert.up_proj.weight_scale = DevicePtr::NULL;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn transpose_unified_down_phase(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+        routed_group: usize,
+        keep_originals: bool,
+        keep_shared_originals: bool,
+        freed: &mut Vec<DevicePtr>,
+    ) -> Result<()> {
+        self.transpose_unified_down_owned(
+            gpu,
+            config,
+            routed_group,
+            keep_originals,
+            keep_shared_originals,
+            None,
+            freed,
+        )
+        .map(|_| ())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn transpose_unified_down_owned(
         &mut self,
@@ -59,6 +108,7 @@ impl MoeLayer {
         keep_originals: bool,
         keep_shared_originals: bool,
         mut release: Option<&mut dyn FnMut(usize, bool, DevicePtr) -> Result<()>>,
+        freed: &mut Vec<DevicePtr>,
     ) -> Result<Vec<QuantizedWeight>> {
         let h = config.hidden_size;
         let inter = config.routed_inter_local();
@@ -76,7 +126,16 @@ impl MoeLayer {
                 }
             })
             .collect();
-        let down_t = self.transpose_experts_gpu(gpu, &down_src, h, inter, routed_group)?;
+        // Owned checkpoint transforms keep their release callback; the normal
+        // unified path retains upstream's in-place allocation ownership.
+        let inplace = !keep_originals && release.is_none();
+        let mut scratch = super::inplace_transpose::TransposeScratch::new();
+        let down_t = if inplace {
+            self.transpose_experts_inplace(gpu, &down_src, h, inter, routed_group, &mut scratch)?
+        } else {
+            self.transpose_experts_gpu(gpu, &down_src, h, inter, routed_group)?
+        };
+        scratch.release(gpu)?;
         self.down_ptrs_t = Some(build_ptr_table_from_qw(&down_t, gpu)?);
         if !self.weights.shared_expert.down_proj.is_null() && shared_inter > 0 {
             self.shared_down_t = Some(self.weights.shared_expert.down_proj.transpose_for_gemm(
@@ -93,7 +152,7 @@ impl MoeLayer {
                     if let Some(release) = release.as_mut() {
                         release(index, false, expert.down_proj.weight)?;
                         release(index, true, expert.down_proj.weight_scale)?;
-                    } else {
+                    } else if !inplace {
                         gpu.free(expert.down_proj.weight)?;
                         gpu.free(expert.down_proj.weight_scale)?;
                     }
@@ -105,8 +164,12 @@ impl MoeLayer {
                 && !self.weights.shared_expert.down_proj.weight.is_null()
                 && shared_inter > 0
             {
-                gpu.free(self.weights.shared_expert.down_proj.weight)?;
-                gpu.free(self.weights.shared_expert.down_proj.weight_scale)?;
+                free_original(gpu, freed, self.weights.shared_expert.down_proj.weight)?;
+                free_original(
+                    gpu,
+                    freed,
+                    self.weights.shared_expert.down_proj.weight_scale,
+                )?;
                 self.weights.shared_expert.down_proj.weight = DevicePtr::NULL;
                 self.weights.shared_expert.down_proj.weight_scale = DevicePtr::NULL;
             }

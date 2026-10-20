@@ -37,7 +37,13 @@ pub(super) enum K4Hidden {
 #[inline]
 fn save_hidden(model: &dyn Model, hidden: K4Hidden, na: usize) -> anyhow::Result<()> {
     match hidden {
-        K4Hidden::VerifyRow => model.save_hidden_for_mtp(na, 0),
+        // A drafter reading the PRE-mixer stream highway (qwen4_exp) needs
+        // row `na` staged into row 0 too, as the K=2/3 steppers do, or it
+        // drafts from the first verify row instead of the accepted one. The
+        // stash path restores its stream row in `_from_stash`.
+        K4Hidden::VerifyRow => model
+            .select_mtp_stream_row(na)
+            .and_then(|()| model.save_hidden_for_mtp(na, 0)),
         K4Hidden::Stash(i) => model.save_hidden_for_mtp_from_stash(i, 0),
         // Deferred mode never saves inline (the batched propose reads the
         // stash rows directly; the per-seq fallback re-saves per sequence).
@@ -90,12 +96,12 @@ pub(super) fn k4_apply_verdict(
             return;
         }
         for j in 0..nd {
-            emit_token(a, drafts[j], verify_lps.get(j).cloned(), sched);
+            emit_span_row(a, drafts[j], verify_lps.get(j).cloned(), sched, j, k_rows);
             if a.finished {
                 return;
             }
         }
-        emit_token(a, v[nd], verify_lps.get(nd).cloned(), sched);
+        emit_span_row(a, v[nd], verify_lps.get(nd).cloned(), sched, nd, k_rows);
         if a.finished {
             return;
         }
@@ -121,12 +127,12 @@ pub(super) fn k4_apply_verdict(
             return;
         }
         for j in 0..na {
-            emit_token(a, drafts[j], verify_lps.get(j).cloned(), sched);
+            emit_span_row(a, drafts[j], verify_lps.get(j).cloned(), sched, j, na + 1);
             if a.finished {
                 return;
             }
         }
-        emit_token(a, v[na], verify_lps.get(na).cloned(), sched);
+        emit_span_row(a, v[na], verify_lps.get(na).cloned(), sched, na, na + 1);
         if a.finished {
             return;
         }
@@ -137,19 +143,29 @@ pub(super) fn k4_apply_verdict(
         tracing::error!("save_hidden_for_mtp({na}): {e:#}");
         return;
     }
-    if na == nd {
+    if na == nd && nd > 0 {
         // Full-accept branch trims AFTER the hidden save (original order).
+        // A decode row (nd == 0, batched path only) drafted nothing this
+        // step: there is no drafter row to trim, as on the bootstrap path —
+        // the EP worker skips it by the same rule (`ep_worker_apply_verdict`).
         if let Err(e) = model.trim_proposer_state(&mut a.seq, na, 0) {
             tracing::error!("trim_proposer_state: {e:#}");
         }
     }
     if !defer {
+        // Single sequence: the per-request depth controller picks the next
+        // depth (`ATLAS_MTP_SINGLE_DEPTH_ADAPT`); batched rows keep the step's.
+        let next_drafts = if matches!(hidden, K4Hidden::VerifyRow) {
+            a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth())
+        } else {
+            num_drafts
+        };
         let t_propose = Instant::now();
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
         match model.run_mtp_propose_multi(
             a.last_token,
             a.seq.seq_len,
-            num_drafts,
+            next_drafts,
             &mut a.seq,
             0,
             _mtp_grammar_mask.as_deref(),
@@ -169,5 +185,7 @@ pub(super) fn k4_apply_verdict(
             a.seq.seq_len
         );
     }
-    crate::scheduler::verify_k4_step::stats::k4_record_outcome(sched, na, a.seq.seq_len);
+    if nd > 0 {
+        crate::scheduler::verify_k4_step::stats::k4_record_outcome(sched, na, a.seq.seq_len);
+    }
 }

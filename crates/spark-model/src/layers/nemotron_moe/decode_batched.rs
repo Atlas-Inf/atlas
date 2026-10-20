@@ -71,6 +71,31 @@ impl NemotronMoeLayer {
     ) -> Result<()> {
         let marlin_all_widths =
             std::env::var("ATLAS_LIGHTNING_MOE_MARLIN_ALL_WIDTHS").as_deref() == Ok("1");
+        // Exact batched verify (mamba_verify_exact): LatentMoE only, one
+        // weight pass over every dense projection via bit-identical batchm
+        // twins; routed experts stay per row. Falls back to the per-row
+        // loop when a twin is unresolved.
+        let moe_exact = ctx.levers.mamba_verify_exact
+            && num_tokens > 1
+            && self.moe_latent_size > 0
+            && self.verify_exact_moe_ready();
+        static MOE_VERIFY_PATH_LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        MOE_VERIFY_PATH_LOGGED.get_or_init(|| {
+            tracing::info!(
+                "nemotron moe verify path: {} (num_tokens={num_tokens})",
+                if moe_exact {
+                    "k2-union-exact"
+                } else if num_tokens <= 1 || self.moe_latent_size > 0 {
+                    "per-row-decode"
+                } else {
+                    "batched-approx"
+                }
+            )
+        });
+        if moe_exact {
+            return self.decode_verify_exact_latent(hidden, residual, num_tokens, ctx, stream);
+        }
+
         if (num_tokens <= 1 || self.moe_latent_size > 0) && !marlin_all_widths {
             for t in 0..num_tokens {
                 let off = t * ctx.config.hidden_size * 2;
@@ -209,6 +234,15 @@ impl NemotronMoeLayer {
             && self.moe_expert_gemv_wide_grouped_k.0 != 0
             && std::env::var("ATLAS_MOE_EXPERT_GROUPED").is_ok();
         if grouped {
+            // union_stats: log the distinct routed experts per verify batch
+            // (m positions x top_k routes -> unique count) when the env is on.
+            crate::layers::moe::union_stats::maybe_sample_expert_union(
+                ctx,
+                indices,
+                n as usize,
+                top_k as usize,
+                stream,
+            );
             ops::moe_expert_gemv_wide_grouped(
                 ctx.gpu,
                 self.moe_expert_gemv_wide_grouped_k,
@@ -249,7 +283,11 @@ impl NemotronMoeLayer {
         } else {
             ops::moe_expert_gemv(
                 ctx.gpu,
-                self.moe_expert_gemv_k,
+                if self.moe_expert_gemv_pf_k.0 != 0 {
+                    self.moe_expert_gemv_pf_k
+                } else {
+                    self.moe_expert_gemv_k
+                },
                 normed,
                 self.up_ptrs.packed_ptrs,
                 self.up_ptrs.scale_ptrs,

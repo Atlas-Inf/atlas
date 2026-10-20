@@ -375,7 +375,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     store, &lp, gpu, variant, absmax_k, quantize_k, stream, config,
                 )?
             };
-            let mut dffn = DenseFfnLayer::new(ffn_weights, gpu)?;
+            let mut dffn = DenseFfnLayer::new(ffn_weights, gpu, &config.model_type)?;
             if ffn_q2 {
                 dffn.set_q2_weights(
                     packed_q2_from_store(store, &format!("{lp}.mlp.gate_proj"))?,
@@ -1681,7 +1681,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
         store: &WeightStore,
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
-    ) -> Result<Option<crate::layers::VisionEncoder>> {
+    ) -> Result<Option<crate::layers::VisionTower>> {
         // Dense Qwen3.5 / Holo VL checkpoints (e.g. Holo-3.1-0.8B, Ornith-1.0-9B)
         // ship the SAME Qwen3-VL ViT tower as their MoE siblings. The MoE
         // loader's `load_vision_encoder` reads only `store` + `config.vision`

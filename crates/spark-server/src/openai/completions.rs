@@ -69,6 +69,9 @@ pub struct CompletionRequest {
     /// Stop sequences (same as chat completions).
     #[serde(default, deserialize_with = "deserialize_stop")]
     pub stop: Vec<String>,
+    /// vLLM `ignore_eos` (same as chat completions).
+    #[serde(default)]
+    pub ignore_eos: bool,
     /// Seed for deterministic sampling (same as chat completions).
     pub seed: Option<u64>,
     /// Per-request inference deadline in seconds. `None` uses the server's

@@ -32,7 +32,7 @@ impl Glm5KdaLayer {
         // Sequence-parallel prefill: the highway and `hidden` hold this rank's
         // rows compacted at row 0 (`layers::glm_sp`); `m_hc` is their count.
         let sp = crate::layers::glm_sp::current()
-            .filter(|sp| !decode && !capture_verify_intermediates && tokens == 2 * sp.rows);
+            .filter(|sp| !decode && !capture_verify_intermediates && tokens == sp.total());
         let m_hc = sp.map_or(m, |sp| sp.rows as u32);
         let local = |x: DevicePtr| sp.map_or(x, |sp| sp.local(x, self.hidden_size));
 

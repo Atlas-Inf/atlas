@@ -6,12 +6,15 @@ use crate::weight_map::{ExpertWeight, MoeWeights, WeightQuantFormat};
 #[path = "helpers_unified_test_gpu.rs"]
 mod recording;
 use recording::{Arg, Event, RecordingGpu};
+#[path = "helpers_unified_abi_tests.rs"]
+mod abi;
 #[path = "helpers_checkpoint_down_tests.rs"]
 mod checkpoint_down;
 #[path = "helpers_unified_fault_tests.rs"]
 mod faults;
 #[path = "helpers_unified_inplace_tests.rs"]
 mod inplace;
+use abi::assert_abi_and_tables;
 
 fn make_weight(gpu: &RecordingGpu, n: usize, k: usize, gs: usize, seed: u8) -> QuantizedWeight {
     let weight = gpu.alloc(n * k / 2).unwrap();
@@ -140,8 +143,8 @@ fn kinds(trace: &[Event]) -> String {
         .collect()
 }
 
-// Declarative operation/size contract, independent of the implementation's
-// control flow. This is run unchanged on the pre-extraction legacy wrappers.
+// Declarative operation/size contract for upstream in-place unified transforms
+// and the branch's compact hybrid transforms.
 fn expected_profile(
     gs: usize,
     local: bool,
@@ -149,187 +152,55 @@ fn expected_profile(
     host: bool,
     mode: usize,
 ) -> (String, Vec<usize>) {
-    let slab = "AAAHAHAHAHAHAHLLSFFFFFF";
-    let slab_sizes = [8192, 16384 / gs, 32, 32, 16, 32, 32, 16];
+    let compact = "AAAHAHAHAHAHAHLLSFFFFFF";
     let table = "AHAHAH";
     let single = if host { "DAHDAH" } else { "AALLS" };
     let mut ops = String::new();
     let mut sizes = Vec::new();
-    for _ in 0..2 {
-        if local {
-            ops.push_str(slab);
-            sizes.extend(slab_sizes);
+    let inplace = mode < 2;
+    for p in 0..3 {
+        if inplace {
+            if p != 1 {
+                ops.push_str("AA");
+                sizes.extend([16384, 32768 / gs]);
+            }
+            ops.push_str("AHAHAHAHAHAHLLSFFFFFF");
+            sizes.extend([32, 32, 16, 32, 32, 16]);
+            if local {
+                ops.push_str("CCCC");
+            }
+            ops.push('S');
+            if p == 2 {
+                ops.push_str("FF");
+            }
+        } else if local {
+            ops.push_str(compact);
+            sizes.extend([8192, 16384 / gs, 32, 32, 16, 32, 32, 16]);
         }
-    }
-    ops.push_str(&table.repeat(2));
-    sizes.extend([32, 32, 16, 32, 32, 16]);
-    if shared {
-        ops.push_str(&single.repeat(2));
-        sizes.extend([2048, 256, 2048, 256]);
-    }
-    if mode < 2 {
-        if local {
-            ops.push_str("FFFFFFFF");
+        // Gate/up tables and shared transforms publish together after both
+        // routed projections; down publishes after its scratch is released.
+        if p == 0 {
+            continue;
         }
-        if shared && mode == 0 {
-            ops.push_str("FFFF");
+        let count = if p == 1 { 2 } else { 1 };
+        ops.push_str(&table.repeat(count));
+        for _ in 0..count {
+            sizes.extend([32, 32, 16]);
         }
-    }
-    if local {
-        ops.push_str(slab);
-        sizes.extend(slab_sizes);
-    }
-    ops.push_str(table);
-    sizes.extend([32, 32, 16]);
-    if shared {
-        ops.push_str(single);
-        sizes.extend([2048, 256]);
-    }
-    if mode < 2 {
-        if local {
-            ops.push_str("FFFF");
+        if shared {
+            ops.push_str(&single.repeat(count));
+            for _ in 0..count {
+                sizes.extend([2048, 256]);
+            }
+            if mode == 0 {
+                ops.push_str(&"FF".repeat(count));
+            }
         }
-        if shared && mode == 0 {
+        if inplace && p == 1 {
             ops.push_str("FF");
         }
     }
     (ops, sizes)
-}
-fn assert_abi_and_tables(
-    layer: &MoeLayer,
-    gpu: &RecordingGpu,
-    originals: &[ExpertWeight],
-    gs: usize,
-    local: bool,
-    shared: bool,
-    host: bool,
-) {
-    let trace = gpu.trace();
-    let mut routed = 0;
-    let mut singles = 0;
-    for event in &trace {
-        if let Event::Launch(k, grid, block, smem, stream, args) = event {
-            assert_eq!(*block, [32, 8, 1]);
-            assert_eq!(*smem, 0);
-            assert_eq!(args.len(), 4);
-            let (rows, cols) = (argument_u32(&args[2]), argument_u32(&args[3]));
-            assert_eq!(
-                *grid,
-                [
-                    cols.div_ceil(32),
-                    rows.div_ceil(32),
-                    if *k == 102 { 4 } else { 1 }
-                ]
-            );
-            if *k == 102 {
-                assert_eq!(*stream, 77);
-                let p = routed / 2;
-                let scales = routed % 2 == 1;
-                assert_eq!(
-                    (rows, cols),
-                    if p < 2 {
-                        (64, if scales { 128 / gs as u32 } else { 64 })
-                    } else {
-                        (128, if scales { 64 / gs as u32 } else { 32 })
-                    }
-                );
-                let src = decode_ptrs(&bytes_at(&trace, argument_ptr(&args[0])));
-                let dst = decode_ptrs(&bytes_at(&trace, argument_ptr(&args[1])));
-                for e in 0..4 {
-                    let w = projections(&originals[e])[p];
-                    assert_eq!(src[e], if scales { w.weight_scale } else { w.weight });
-                    assert_eq!(dst[e].is_null(), ![1, 3].contains(&e));
-                }
-                assert_eq!(dst[3].0 - dst[1].0, u64::from(rows * cols));
-                routed += 1;
-            } else {
-                assert_eq!(*k, 101);
-                assert_eq!(*stream, 0);
-                let p = singles / 2;
-                let scales = singles % 2 == 1;
-                assert_eq!(
-                    (rows, cols),
-                    if p < 2 {
-                        (32, if scales { 8 } else { 64 })
-                    } else {
-                        (128, if scales { 2 } else { 16 })
-                    }
-                );
-                let w = projections(&originals[4])[p];
-                assert_eq!(
-                    argument_ptr(&args[0]),
-                    if scales { w.weight_scale } else { w.weight }
-                );
-                singles += 1;
-            }
-        }
-    }
-    assert_eq!(routed, if local { 6 } else { 0 });
-    assert_eq!(singles, if shared && !host { 6 } else { 0 });
-    for (p, t) in [&layer.gate_ptrs_t, &layer.up_ptrs_t, &layer.down_ptrs_t]
-        .iter()
-        .enumerate()
-    {
-        let t = t.as_ref().unwrap();
-        for (scales, ptr) in [(false, t.packed_ptrs), (true, t.scale_ptrs)] {
-            let got = decode_ptrs(&gpu.read(ptr, 32));
-            if local {
-                let launch = trace
-                    .iter()
-                    .filter_map(|e| {
-                        if let Event::Launch(102, _, _, _, _, a) = e {
-                            Some(a)
-                        } else {
-                            None
-                        }
-                    })
-                    .nth(p * 2 + usize::from(scales))
-                    .unwrap();
-                assert_eq!(
-                    got,
-                    decode_ptrs(&bytes_at(&trace, argument_ptr(&launch[1])))
-                );
-            } else {
-                assert_eq!(got, vec![DevicePtr::NULL; 4]);
-            }
-        }
-        let expected: Vec<_> = originals[..4]
-            .iter()
-            .flat_map(|e| {
-                let w = projections(e)[p];
-                // Legacy transpose canonicalizes remote slots through QW::null,
-                // whose scalar is zero (MoeWeights::empty uses scalar one).
-                if w.is_null() {
-                    0.0f32
-                } else {
-                    w.weight_scale_2
-                }
-                .to_le_bytes()
-            })
-            .collect();
-        assert_eq!(gpu.read(t.scale2_vals, 16), expected);
-    }
-    for (p, t) in [layer.shared_gate_t, layer.shared_up_t, layer.shared_down_t]
-        .into_iter()
-        .enumerate()
-    {
-        assert_eq!(t.is_some(), shared);
-        if let Some(t) = t {
-            let src = projections(&originals[4])[p];
-            assert_eq!(
-                (
-                    t.weight_scale_2.to_bits(),
-                    t.input_scale,
-                    t.weight_scale_2_vec
-                ),
-                (
-                    src.weight_scale_2.to_bits(),
-                    src.input_scale,
-                    src.weight_scale_2_vec
-                )
-            );
-        }
-    }
 }
 
 #[test]
@@ -373,32 +244,20 @@ fn actual_legacy_wrappers_exact_order_abi_ownership_and_peak() {
                             .collect::<Vec<_>>(),
                         allocs
                     );
-                    assert_abi_and_tables(&layer, &gpu, &originals, gs, local, active_shared, host);
+                    assert_abi_and_tables(
+                        &layer,
+                        &gpu,
+                        &originals,
+                        gs,
+                        local,
+                        active_shared,
+                        host,
+                        mode,
+                    );
                     let mut expected_frees = Vec::new();
-                    if mode < 2 {
-                        for e in &originals[..4] {
-                            for w in [e.gate_proj, e.up_proj] {
-                                if !w.is_null() {
-                                    expected_frees.extend([w.weight, w.weight_scale]);
-                                }
-                            }
-                        }
-                        if active_shared && mode == 0 {
-                            for w in [originals[4].gate_proj, originals[4].up_proj] {
-                                expected_frees.extend([w.weight, w.weight_scale]);
-                            }
-                        }
-                        for e in &originals[..4] {
-                            if !e.down_proj.is_null() {
-                                expected_frees
-                                    .extend([e.down_proj.weight, e.down_proj.weight_scale]);
-                            }
-                        }
-                        if active_shared && mode == 0 {
-                            expected_frees.extend([
-                                originals[4].down_proj.weight,
-                                originals[4].down_proj.weight_scale,
-                            ]);
+                    if active_shared && mode == 0 {
+                        for w in projections(&originals[4]) {
+                            expected_frees.extend([w.weight, w.weight_scale]);
                         }
                     }
                     let actual_frees: Vec<_> = trace
@@ -433,7 +292,7 @@ fn actual_legacy_wrappers_exact_order_abi_ownership_and_peak() {
                             gpu.profile(),
                             match mode {
                                 0 => (35040 + ZERO_ACCUM_BYTES, 58000 + ZERO_ACCUM_BYTES),
-                                1 => (41952 + ZERO_ACCUM_BYTES, 58000 + ZERO_ACCUM_BYTES),
+                                1 => (41952 + ZERO_ACCUM_BYTES, 58160 + ZERO_ACCUM_BYTES),
                                 _ => (69600 + ZERO_ACCUM_BYTES, 69600 + ZERO_ACCUM_BYTES),
                             }
                         );
@@ -447,10 +306,11 @@ fn actual_legacy_wrappers_exact_order_abi_ownership_and_peak() {
                     {
                         for (p, w) in projections(got).iter().enumerate() {
                             let original = projections(&originals[e])[p];
-                            let freed = expected_frees.contains(&original.weight);
+                            let nulled =
+                                (e < 4 && mode < 2) || expected_frees.contains(&original.weight);
                             assert_eq!(
                                 w.weight,
-                                if freed {
+                                if nulled {
                                     DevicePtr::NULL
                                 } else {
                                     original.weight
@@ -458,7 +318,7 @@ fn actual_legacy_wrappers_exact_order_abi_ownership_and_peak() {
                             );
                             assert_eq!(
                                 w.weight_scale,
-                                if freed {
+                                if nulled {
                                     DevicePtr::NULL
                                 } else {
                                     original.weight_scale

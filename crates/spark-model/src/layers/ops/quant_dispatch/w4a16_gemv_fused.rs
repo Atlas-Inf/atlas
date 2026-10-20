@@ -154,6 +154,27 @@ pub fn w4a16_gemv_qg_batch3(
         .launch(stream)
 }
 
+/// [`w4a16_gemv_qg_batch3`] at 4 rows (`w4a16_gemv_qg_batch4`): the same
+/// launch geometry and argument list, so it shares the launcher. Row `r` is
+/// byte-identical to `w4a16_gemv_qg` on row `r` (qwen4_exp exact K=4 verify).
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemv_qg_batch4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    n: u32,
+    k: u32,
+    num_heads: u32,
+    head_dim: u32,
+    stream: u64,
+) -> Result<()> {
+    w4a16_gemv_qg_batch3(
+        gpu, kernel, input, weight, output, n, k, num_heads, head_dim, stream,
+    )
+}
+
 /// Dual-projection GEMV for 3 tokens (K+V or any 2 weight matrices).
 ///
 /// Reads each weight matrix once, produces 3 output vectors per projection.

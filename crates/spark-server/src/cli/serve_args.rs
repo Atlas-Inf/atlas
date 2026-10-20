@@ -324,6 +324,12 @@ pub struct ServeArgs {
     /// extended to the rest of the forward. That, not this flag alone, is
     /// what end-to-end spec-on == spec-off would require.
     ///
+    /// Done for qwen4_exp (Qwen3.8-Flash-Next) at K=2/3, one sequence:
+    /// `ATLAS_QWEN4EXP_EXACT_VERIFY=1` turns this chain on for that model and
+    /// moves its remaining row-count-dependent ops (attention K/V, the GDN
+    /// layers' MoE) to serial decode's arithmetic
+    /// (`spark-model/src/model/qwen4exp_exact_verify.rs`).
+    ///
     /// The default verify pass runs the WY-chunkwise / fused BF16-conv arms:
     /// fast, but their BF16-output conv (h-state relL2 ~8.6e-4 per K=4
     /// window, committed into persistent SSM state) plus a ~3.4e-8 chunkwise
@@ -446,6 +452,22 @@ pub struct ServeArgs {
     /// Harry Potter alias: `--stupify` (stuns the model's inner monologue).
     #[arg(long, visible_alias = "stupify", default_value_t = false)]
     pub disable_thinking: bool,
+
+    /// Serve exactly what the client asked for: the client's sampling
+    /// parameters and nothing else, rendered through the checkpoint's own
+    /// chat template. For benchmark runs whose rules lock sampling and
+    /// prompt handling (MLPerf Endpoints). Turns off, in one switch:
+    /// MODEL.toml sampling clamps (`temperature_max`, `min_p_floor`), the
+    /// `--default-min-p` / `--default-top-n-sigma` defaults (generation_config
+    /// values still apply), preset penalties, the `<tool_call>` logit bias,
+    /// the thinking budget and its caps, the A4 `</think>` floor, tool
+    /// grammar, the parser tool system prompt and CWD hint, jinja overrides
+    /// (implies `--disable-template-overrides`), and every output watchdog
+    /// (implies `ATLAS_DISABLE_WATCHDOGS=1`). Kernels and numerics are
+    /// unchanged. Conflicts with `--disable-thinking` and
+    /// `--max-thinking-budget`.
+    #[arg(long, default_value_t = false)]
+    pub reference_mode: bool,
 
     /// Override MODEL.toml's `[behavior].max_thinking_budget` (tokens).
     /// Sets the per-request ceiling for thinking-block length, and anchors

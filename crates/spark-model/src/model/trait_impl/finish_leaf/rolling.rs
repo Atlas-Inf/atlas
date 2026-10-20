@@ -62,9 +62,10 @@ pub(crate) struct FinishLeaf {
 }
 
 /// Holder of a sequence's [`FinishLeaf`] (the hooks see the sequence by
-/// shared reference).
+/// shared reference), and of the leaf before it while the qwen4_exp leaf
+/// (`qwen4exp`) still sits in a partial block. The GLM leaf never sets it.
 #[derive(Default)]
-pub(crate) struct LeafCell(Mutex<Option<FinishLeaf>>);
+pub(crate) struct LeafCell(Mutex<Option<FinishLeaf>>, Mutex<Option<FinishLeaf>>);
 
 impl LeafCell {
     pub(in crate::model) fn get(&self) -> Option<FinishLeaf> {
@@ -75,6 +76,12 @@ impl LeafCell {
     }
     pub(in crate::model) fn set(&self, leaf: FinishLeaf) {
         *self.0.lock() = Some(leaf);
+    }
+    pub(in crate::model) fn take_prev(&self) -> Option<FinishLeaf> {
+        self.1.lock().take()
+    }
+    pub(in crate::model) fn set_prev(&self, leaf: FinishLeaf) {
+        *self.1.lock() = Some(leaf);
     }
 }
 

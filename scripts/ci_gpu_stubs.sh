@@ -54,6 +54,7 @@ int cuModuleGetGlobal_v2(unsigned long long *dptr, unsigned long *bytes,
     (void)dptr; (void)bytes; (void)hmod; (void)name; return 100;
 }
 int cuFuncSetAttribute(void *f, int attr, int val) { (void)f; (void)attr; (void)val; return 100; }
+int cuFuncGetName(const char **name, void *f) { (void)name; (void)f; return 100; }
 int cuLaunchKernel(void *f, unsigned int gx, unsigned int gy, unsigned int gz,
                    unsigned int bx, unsigned int by, unsigned int bz,
                    unsigned int sm, void *s, void **p, void **e) {
@@ -187,10 +188,12 @@ sudo install -m 0644 /tmp/libnccl.so "$DEST/libnccl.so"
 # under ATLAS_SKIP_BUILD. Every symbol returns 1 so a real invocation
 # fails-fast; GPU paths are #[ignore]-gated.
 cat > /tmp/libcublaslt_stub.c <<'EOF'
+unsigned long cublasLtGetVersion(void){return 0;}
 int cublasLtCreate(void){return 1;}
 int cublasLtDestroy(void){return 1;}
 int cublasLtMatmul(void){return 1;}
 int cublasLtMatmulAlgoGetHeuristic(void){return 1;}
+int cublasLtMatmulAlgoConfigGetAttribute(void){return 1;}
 int cublasLtMatmulDescCreate(void){return 1;}
 int cublasLtMatmulDescDestroy(void){return 1;}
 int cublasLtMatmulDescSetAttribute(void){return 1;}
@@ -200,6 +203,7 @@ int cublasLtMatmulPreferenceSetAttribute(void){return 1;}
 int cublasLtMatrixLayoutCreate(void){return 1;}
 int cublasLtMatrixLayoutDestroy(void){return 1;}
 int cublasLtMatrixLayoutSetAttribute(void){return 1;}
+int cublasLtMatmulAlgoCheck(void){return 1;}
 EOF
 cc -shared -fPIC -nostdlib -o /tmp/libcublasLt.so /tmp/libcublaslt_stub.c
 sudo install -m 0644 /tmp/libcublasLt.so "$DEST/libcublasLt.so"

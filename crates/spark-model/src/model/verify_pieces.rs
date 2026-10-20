@@ -15,15 +15,23 @@
 //! so on: the eager pass's stream order, and the same collective calls in the
 //! same order on both ranks whether or not either rank captured.
 //!
-//! A graph-safe collective removes the split: [`Recorder::split`] is the one
-//! place that would instead forward the call into the open capture, which
-//! collapses a run into a single graph.
+//! A graph-safe collective removes the split: with `capture_collectives`
+//! (the qwen4_exp pieces' `ATLAS_QWEN4EXP_DECODE_GRAPH_COLLECTIVES=1`)
+//! [`Recorder`]'s `all_reduce_async` first offers the call to the
+//! communicator's capturable one-shot, which enqueues it into the open
+//! capture; only a refusal splits. The GLM verify cache keeps it off.
+//!
+//! The cache is generic over its key so the qwen4_exp decode and verify
+//! pieces (`model/decode_pieces.rs`) reuse it with a slot-vector key;
+//! the GLM verify cache is [`VerifyPieces`], unchanged.
 
 use anyhow::{Result, bail, ensure};
 use parking_lot::Mutex;
 use spark_comm::CommBackend;
 use spark_runtime::gpu::{GpuBackend, GraphHandle};
 use std::collections::HashMap;
+use std::fmt::Debug;
+use std::hash::Hash;
 use std::time::Instant;
 
 /// `ATLAS_GLM_VERIFY_GRAPH=1`; read once, from the profile both ranks share.
@@ -82,6 +90,9 @@ pub(crate) struct Recorder<'a> {
     gpu: &'a dyn GpuBackend,
     stream: u64,
     steps: Mutex<Vec<Step>>,
+    /// Offer each `all_reduce_async` to the communicator's capturable
+    /// one-shot before splitting (see the module docs).
+    capture_collectives: bool,
 }
 
 impl<'a> Recorder<'a> {
@@ -91,6 +102,7 @@ impl<'a> Recorder<'a> {
             gpu,
             stream,
             steps: Mutex::new(Vec::new()),
+            capture_collectives: false,
         }
     }
 
@@ -143,7 +155,19 @@ impl CommBackend for Recorder<'_> {
     fn all_reduce(&self, ptr: u64, bytes: usize) -> Result<()> {
         self.split(CommOp::AllReduce { ptr, bytes })
     }
+    /// With `capture_collectives`, the capturable one-shot records the reduce
+    /// INTO the open graph. It is the operation the eager `all_reduce_async`
+    /// would have enqueued (both try the one-shot first, under the same
+    /// size-only eligibility), so replay stays lossless and both ranks
+    /// execute the same collective sequence whatever each rank captured. A
+    /// refusal (size, channel off) splits as usual.
     fn all_reduce_async(&self, ptr: u64, bytes: usize, stream: u64) -> Result<()> {
+        if self.capture_collectives
+            && stream == self.stream
+            && self.inner.all_reduce_capturable(ptr, bytes, stream)?
+        {
+            return Ok(());
+        }
         self.on_stream(stream, CommOp::AllReduceAsync { ptr, bytes, stream })
     }
     fn peer_exchange_async(&self, send: u64, recv: u64, bytes: usize, stream: u64) -> Result<()> {
@@ -233,18 +257,26 @@ fn graph_count(steps: &[Step]) -> usize {
     steps.iter().filter(|s| matches!(s, Step::Graph(_))).count()
 }
 
-fn replay(steps: &[Step], gpu: &dyn GpuBackend, comm: &dyn CommBackend, stream: u64) -> Result<()> {
+fn replay(
+    steps: &[Step],
+    gpu: &dyn GpuBackend,
+    comm: Option<&dyn CommBackend>,
+    stream: u64,
+) -> Result<()> {
     for step in steps {
         match *step {
             Step::Graph(g) if g.0 != 0 => gpu.launch_graph(g, stream)?,
             Step::Graph(_) => {}
-            Step::Op(op) => op.run(comm)?,
+            // A run captured without a communicator recorded no collective.
+            Step::Op(op) => op.run(comm.ok_or_else(|| {
+                anyhow::anyhow!("piecewise graph replay: a collective without a communicator")
+            })?)?,
         }
     }
     Ok(())
 }
 
-fn cached(map: &HashMap<PieceKey, Entry>) -> usize {
+fn cached<K>(map: &HashMap<K, Entry>) -> usize {
     map.values()
         .map(|e| match e {
             Entry::Captured(steps) => graph_count(steps),
@@ -264,16 +296,24 @@ enum Entry {
     Refused,
 }
 
-/// Captured runs of one model.
-pub(crate) struct VerifyPieces {
-    map: Mutex<HashMap<PieceKey, Entry>>,
+/// Captured runs of one model, keyed by `K`.
+pub(crate) struct Pieces<K> {
+    map: Mutex<HashMap<K, Entry>>,
     /// Graph count past which new keys stay eager. A ~14-kernel piece costs
     /// ~0.17-0.25 MiB of unified memory (host RSS ~0.1 MiB of it) on GB10;
     /// C1 at every verify width 2..=8 is 7 x 84 = 588 graphs. Held until a
     /// LoRA clear and outside KV-pool sizing: the default 600 is ~100-150
     /// MiB of the headroom `--gpu-memory-utilization` leaves.
     budget: usize,
+    /// Log names: the step (`verify`, `decode`) and the key's fields.
+    step: &'static str,
+    key_fields: &'static str,
+    /// See [`Recorder`]'s `all_reduce_async`.
+    capture_collectives: bool,
 }
+
+/// The GLM DFlash verify cache.
+pub(crate) type VerifyPieces = Pieces<PieceKey>;
 
 impl Default for VerifyPieces {
     /// Budget: `ATLAS_GLM_VERIFY_GRAPH_MAX_GRAPHS`, default 600.
@@ -288,17 +328,11 @@ impl Default for VerifyPieces {
 
 impl VerifyPieces {
     pub(crate) fn with_budget(budget: usize) -> Self {
-        Self {
-            map: Mutex::default(),
-            budget,
-        }
+        Self::new("verify", "(slot, rows, layer)", budget, false)
     }
 
-    /// Run `body` for `key`: eagerly the first time, captured then replayed
-    /// the second, replayed after that. `body` receives the communicator its
-    /// layers must use. A failed capture pass executes nothing, so the key is
-    /// refused and `body` runs eagerly instead. A warm key over the graph
-    /// budget runs eagerly until [`Self::clear`] frees room.
+    /// [`Pieces::run_with`] with the TP communicator the GLM verify always
+    /// has.
     pub(crate) fn run(
         &self,
         key: PieceKey,
@@ -306,6 +340,45 @@ impl VerifyPieces {
         comm: &dyn CommBackend,
         stream: u64,
         mut body: impl FnMut(&dyn CommBackend) -> Result<()>,
+    ) -> Result<()> {
+        self.run_with(key, gpu, Some(comm), stream, |c| match c {
+            Some(c) => body(c),
+            None => bail!("piecewise verify graph: the communicator went missing"),
+        })
+    }
+}
+
+impl<K: Eq + Hash + Debug> Pieces<K> {
+    pub(crate) fn new(
+        step: &'static str,
+        key_fields: &'static str,
+        budget: usize,
+        capture_collectives: bool,
+    ) -> Self {
+        Self {
+            map: Mutex::default(),
+            budget,
+            step,
+            key_fields,
+            capture_collectives,
+        }
+    }
+
+    /// Run `body` for `key`: eagerly the first time, captured then replayed
+    /// the second, replayed after that. `body` receives the communicator its
+    /// layers must use: a [`Recorder`] over `comm` while capturing, `comm`
+    /// otherwise, and `None` exactly when `comm` is (a TP1 run has no
+    /// collective to split at, so it captures as one graph). A failed
+    /// capture pass executes nothing, so the key is refused and `body` runs
+    /// eagerly instead. A warm key over the graph budget runs eagerly until
+    /// [`Self::clear`] frees room.
+    pub(crate) fn run_with(
+        &self,
+        key: K,
+        gpu: &dyn GpuBackend,
+        comm: Option<&dyn CommBackend>,
+        stream: u64,
+        mut body: impl FnMut(Option<&dyn CommBackend>) -> Result<()>,
     ) -> Result<()> {
         {
             let mut map = self.map.lock();
@@ -328,20 +401,31 @@ impl VerifyPieces {
             }
         }
         let started = Instant::now();
-        let captured = gpu.begin_capture(stream).and_then(|()| {
-            let recorder = Recorder::new(comm, gpu, stream);
-            match body(&recorder) {
-                Ok(()) => recorder.finish(),
-                Err(e) => {
-                    recorder.abort();
-                    Err(e)
+        let captured = gpu.begin_capture(stream).and_then(|()| match comm {
+            Some(comm) => {
+                let mut recorder = Recorder::new(comm, gpu, stream);
+                recorder.capture_collectives = self.capture_collectives;
+                match body(Some(&recorder)) {
+                    Ok(()) => recorder.finish(),
+                    Err(e) => {
+                        recorder.abort();
+                        Err(e)
+                    }
                 }
             }
+            None => match body(None) {
+                Ok(()) => gpu.end_capture(stream).map(|g| vec![Step::Graph(g)]),
+                Err(e) => {
+                    gpu.abort_capture_if_active(stream);
+                    Err(e)
+                }
+            },
         });
+        let step = self.step;
         let steps = match captured {
             Ok(steps) => steps,
             Err(e) => {
-                tracing::warn!("piecewise verify graph refused for {key:?}, running eager: {e:#}");
+                tracing::warn!("piecewise {step} graph refused for {key:?}, running eager: {e:#}");
                 self.map.lock().insert(key, Entry::Refused);
                 return body(comm);
             }
@@ -349,13 +433,16 @@ impl VerifyPieces {
         let replayed = replay(&steps, gpu, comm, stream);
         let mut map = self.map.lock();
         let graphs = graph_count(&steps);
-        map.insert(key, Entry::Captured(steps));
+        // Logged before the insert takes the key; the replaced entry was
+        // `Warm`, so the total is the cache plus this run.
         tracing::info!(
-            "piecewise verify graph (slot, rows, layer) = {key:?}: {graphs} graphs in {:.1} ms \
+            "piecewise {step} graph {} = {key:?}: {graphs} graphs in {:.1} ms \
              ({} graphs cached)",
+            self.key_fields,
             started.elapsed().as_secs_f64() * 1e3,
-            cached(&map),
+            cached(&map) + graphs,
         );
+        map.insert(key, Entry::Captured(steps));
         replayed
     }
 

@@ -41,26 +41,15 @@ fn qkv_os_enabled() -> bool {
 
 impl Qwen3AttentionLayer {
     pub(super) fn ms_phase_qkv(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
-        let MultiSeqCtx {
-            fwd,
-            n,
-            stream,
-            h,
-            nq,
-            nkv,
-            hd,
-            eps,
-            bf16,
-            q_dim,
-            q_proj_dim,
-            q_proj_bytes,
-            per_seq_qkv,
-            normed,
-            qkv_buf,
-            ..
-        } = *c;
+        let MultiSeqCtx { fwd, n, eps, .. } = *c;
 
-        if n == 3
+        // ATLAS_QWEN4EXP_BATCH_FAST_BISECT: the sequential per-row arm.
+        if fwd.levers.batch_bisect(ops::BISECT_ATTN_PROJ) {
+            self.ms_qkv_seq_rows(c)?;
+        } else if self.ms_qkv_exact4(c)? {
+            // qwen4_exp exact K=4 verify: serial decode's arithmetic per row
+            // (`qkv_exact4.rs`).
+        } else if n == 3
             && self.q_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
             && self.k_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
             && self.v_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
@@ -111,15 +100,7 @@ impl Qwen3AttentionLayer {
             // Never branch on the unpadded seqs.len() here.
             self.ms_qkv_batchm_bf16(c)?;
         } else {
-            for i in 0..n {
-                let normed_i = normed.offset(i * h * bf16);
-                let q_out_i = qkv_buf.offset(i * per_seq_qkv);
-                let k_out_i = q_out_i.offset(q_proj_bytes);
-                let v_out_i = k_out_i.offset((nkv * hd) as usize * bf16);
-
-                self.ms_qkv_seq_q(fwd, normed_i, q_out_i, q_proj_dim, q_dim, nq, hd, h, stream)?;
-                self.ms_qkv_seq_kv(fwd, normed_i, k_out_i, v_out_i, nkv, hd, h, stream)?;
-            }
+            self.ms_qkv_seq_rows(c)?;
         }
 
         // ── Per-request Q/K/V LoRA delta (batched bgmv), pre-norm. No-op when no
@@ -144,6 +125,36 @@ impl Qwen3AttentionLayer {
     /// True when q/k/v are plain dense BF16 — no NVFP4 and no FP8 sidecar — so
     /// the projection actually reads `self.attn.{q,k,v}_proj`. Laguna ships
     /// attention unquantized in the checkpoint and it stays that way.
+    /// Sequential per-token Q/K/V: each row through the single-row GEMVs.
+    fn ms_qkv_seq_rows(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
+        let MultiSeqCtx {
+            fwd,
+            n,
+            stream,
+            h,
+            nq,
+            nkv,
+            hd,
+            bf16,
+            q_dim,
+            q_proj_dim,
+            q_proj_bytes,
+            per_seq_qkv,
+            normed,
+            qkv_buf,
+            ..
+        } = *c;
+        for i in 0..n {
+            let normed_i = normed.offset(i * h * bf16);
+            let q_out_i = qkv_buf.offset(i * per_seq_qkv);
+            let k_out_i = q_out_i.offset(q_proj_bytes);
+            let v_out_i = k_out_i.offset((nkv * hd) as usize * bf16);
+            self.ms_qkv_seq_q(fwd, normed_i, q_out_i, q_proj_dim, q_dim, nq, hd, h, stream)?;
+            self.ms_qkv_seq_kv(fwd, normed_i, k_out_i, v_out_i, nkv, hd, h, stream)?;
+        }
+        Ok(())
+    }
+
     fn qkv_is_dense_bf16(&self) -> bool {
         let dense = |w: &Option<crate::weight_map::QuantWeight>| {
             w.as_ref()
@@ -210,7 +221,7 @@ impl Qwen3AttentionLayer {
         Ok(())
     }
 
-    fn q_lora_active(&self) -> bool {
+    pub(super) fn q_lora_active(&self) -> bool {
         self.lora.as_ref().and_then(|lw| lw.q.as_ref()).is_some()
     }
 
@@ -470,17 +481,8 @@ impl Qwen3AttentionLayer {
         let kv_bytes = kv_dim as usize * bf16;
         let k_scratch = fwd.buffers.attn_output();
         let v_scratch = k_scratch.offset(3 * kv_bytes);
-        ops::w4a16_gemv_dual_batch3(
-            fwd.gpu,
-            self.w4a16_gemv_dual_batch3_k,
-            normed,
-            k_nvfp4,
-            k_scratch,
-            v_nvfp4,
-            v_scratch,
-            kv_dim,
-            h as u32,
-            stream,
+        self.ms_kv_batch3(
+            fwd, normed, k_nvfp4, k_scratch, v_nvfp4, v_scratch, kv_dim, h, stream,
         )?;
 
         for i in 0..3usize {
@@ -503,6 +505,102 @@ impl Qwen3AttentionLayer {
         // delta in `ms_phase_qkv`).
         let _ = (nq, eps);
         Ok(())
+    }
+
+    /// The K and V projections of a 2-row NVFP4 step, one weight pass each.
+    ///
+    /// `w4a16_gemv_dual_batch2` reads both weights in one launch, but it is
+    /// not the arithmetic serial decode's `w4a16_gemv_dual` runs (K split
+    /// across lanes differently, scale applied per element instead of per
+    /// block): ~1 output in 1000 differs by a BF16 ULP, and that K/V is
+    /// written to the cache serial decode reads afterwards. Under
+    /// `ATLAS_QWEN4EXP_EXACT_VERIFY` each projection takes
+    /// `w4a16_gemv_batch2` instead, whose rows are byte-identical to
+    /// `w4a16_gemv`, i.e. to `w4a16_gemv_dual` per projection
+    /// (`scripts/dev/qwen4exp_exact_verify_bench.cu`; +5 us a layer on GB10).
+    #[allow(clippy::too_many_arguments)]
+    fn ms_kv_batch2(
+        &self,
+        fwd: &crate::layer::ForwardContext<'_>,
+        normed: spark_runtime::gpu::DevicePtr,
+        k_nvfp4: &crate::weight_map::QuantizedWeight,
+        k_out: spark_runtime::gpu::DevicePtr,
+        v_nvfp4: &crate::weight_map::QuantizedWeight,
+        v_out: spark_runtime::gpu::DevicePtr,
+        kv_dim: u32,
+        h: usize,
+        stream: u64,
+    ) -> Result<()> {
+        if fwd.levers.qwen4exp_exact_verify || fwd.levers.qwen4exp_batch_fast {
+            for (w, out) in [(k_nvfp4, k_out), (v_nvfp4, v_out)] {
+                ops::w4a16_gemv_batch2(
+                    fwd.gpu,
+                    self.w4a16_gemv_batch2_k,
+                    normed,
+                    w,
+                    out,
+                    kv_dim,
+                    h as u32,
+                    stream,
+                )?;
+            }
+            return Ok(());
+        }
+        ops::w4a16_gemv_dual_batch2(
+            fwd.gpu,
+            self.w4a16_gemv_dual_batch2_k,
+            normed,
+            k_nvfp4,
+            k_out,
+            v_nvfp4,
+            v_out,
+            kv_dim,
+            h as u32,
+            stream,
+        )
+    }
+
+    /// [`Self::ms_kv_batch2`] at 3 rows.
+    #[allow(clippy::too_many_arguments)]
+    fn ms_kv_batch3(
+        &self,
+        fwd: &crate::layer::ForwardContext<'_>,
+        normed: spark_runtime::gpu::DevicePtr,
+        k_nvfp4: &crate::weight_map::QuantizedWeight,
+        k_out: spark_runtime::gpu::DevicePtr,
+        v_nvfp4: &crate::weight_map::QuantizedWeight,
+        v_out: spark_runtime::gpu::DevicePtr,
+        kv_dim: u32,
+        h: usize,
+        stream: u64,
+    ) -> Result<()> {
+        if fwd.levers.qwen4exp_exact_verify || fwd.levers.qwen4exp_batch_fast {
+            for (w, out) in [(k_nvfp4, k_out), (v_nvfp4, v_out)] {
+                ops::w4a16_gemv_batch3(
+                    fwd.gpu,
+                    self.w4a16_gemv_batch3_k,
+                    normed,
+                    w,
+                    out,
+                    kv_dim,
+                    h as u32,
+                    stream,
+                )?;
+            }
+            return Ok(());
+        }
+        ops::w4a16_gemv_dual_batch3(
+            fwd.gpu,
+            self.w4a16_gemv_dual_batch3_k,
+            normed,
+            k_nvfp4,
+            k_out,
+            v_nvfp4,
+            v_out,
+            kv_dim,
+            h as u32,
+            stream,
+        )
     }
 
     /// n=2 NVFP4 batched path.
@@ -560,17 +658,8 @@ impl Qwen3AttentionLayer {
         let kv_bytes = kv_dim as usize * bf16;
         let k_scratch = fwd.buffers.attn_output();
         let v_scratch = k_scratch.offset(2 * kv_bytes);
-        ops::w4a16_gemv_dual_batch2(
-            fwd.gpu,
-            self.w4a16_gemv_dual_batch2_k,
-            normed,
-            k_nvfp4,
-            k_scratch,
-            v_nvfp4,
-            v_scratch,
-            kv_dim,
-            h as u32,
-            stream,
+        self.ms_kv_batch2(
+            fwd, normed, k_nvfp4, k_scratch, v_nvfp4, v_scratch, kv_dim, h, stream,
         )?;
 
         for i in 0..2usize {
@@ -631,6 +720,39 @@ impl Qwen3AttentionLayer {
         // same weight-streaming bandwidth, no M>4 cliff). m=9..16 (batched
         // DFlash verify) falls back to `w4a16_gemv_batch16`; the family caps
         // there, so wider verifies (DFlash γ=16, M=17) keep the GEMM.
+        // ATLAS_QWEN4EXP_BATCH_FAST past the widest GEMV tier: 16 rows a
+        // launch of the same exact template rather than the tile GEMM.
+        // ATLAS_QWEN4EXP_W4_ROWS_WIDE: past 8 rows, one exact wide launch
+        // (falls back to the chunking below on its own if it cannot launch).
+        if c.fwd.levers.qwen4exp_batch_fast && self.wide_rows.w4_wide_serves(m, k) {
+            return self.wide_rows.w4a16_rows(
+                gpu,
+                &self.w4a16_batchm,
+                input,
+                w_base,
+                output,
+                (m, n, k),
+                stream,
+            );
+        }
+        if c.fwd.levers.qwen4exp_batch_fast && m > 16 && self.w4a16_gemv_batch16_k.0 != 0 {
+            let (in_row, out_row) = (k as usize * 2, n as usize * 2);
+            for first in (0..m).step_by(16) {
+                let rows = (m - first).min(16);
+                ops::w4a16_gemv_batchm(
+                    gpu,
+                    self.w4a16_gemv_batch16_k,
+                    input.offset(first as usize * in_row),
+                    w_base,
+                    output.offset(first as usize * out_row),
+                    rows,
+                    n,
+                    k,
+                    stream,
+                )?;
+            }
+            return Ok(());
+        }
         let mut batchm = self.w4a16_batchm.kernel(m);
         if batchm.0 == 0 && m <= 16 {
             batchm = self.w4a16_gemv_batch16_k;
@@ -817,16 +939,19 @@ impl Qwen3AttentionLayer {
         // fused GEMM's [n, fused_n] output IS the qkv_buf layout byte for
         // byte. Write straight into it and skip the scatter entirely —
         // that removes 3 GEMMs AND 48 D2D copies per attention layer.
+        // ATLAS_QWEN4EXP_BATCH_FAST: the tile GEMM is not the GEMV's
+        // arithmetic; wide batches keep the exact GEMV tiers instead.
         let use_fused = match self.qkv_nvfp4_t.as_ref() {
-            Some(qkv_t) if fused_qkv_enabled() && n > 8 => self.transposed_verify_gemm(
-                c,
-                normed,
-                qkv_t,
-                qkv_buf,
-                n as u32,
-                fused_n as u32,
-                h as u32,
-            )?,
+            Some(qkv_t) if fused_qkv_enabled() && n > 8 && !fwd.levers.qwen4exp_batch_fast => self
+                .transposed_verify_gemm(
+                    c,
+                    normed,
+                    qkv_t,
+                    qkv_buf,
+                    n as u32,
+                    fused_n as u32,
+                    h as u32,
+                )?,
             _ => false,
         };
 
@@ -980,7 +1105,7 @@ impl Qwen3AttentionLayer {
 
     /// Sequential per-token Q projection (handles gated and ungated).
     #[allow(clippy::too_many_arguments)]
-    fn ms_qkv_seq_q(
+    pub(super) fn ms_qkv_seq_q(
         &self,
         fwd: &crate::layer::ForwardContext<'_>,
         normed_i: spark_runtime::gpu::DevicePtr,
@@ -1125,7 +1250,7 @@ impl Qwen3AttentionLayer {
 
     /// Sequential per-token K + V projections.
     #[allow(clippy::too_many_arguments)]
-    fn ms_qkv_seq_kv(
+    pub(super) fn ms_qkv_seq_kv(
         &self,
         fwd: &crate::layer::ForwardContext<'_>,
         normed_i: spark_runtime::gpu::DevicePtr,

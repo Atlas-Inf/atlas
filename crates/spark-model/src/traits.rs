@@ -175,6 +175,10 @@ pub struct SequenceState {
     /// Token position of this prefill's planned branch-point SSM checkpoint
     /// (`ATLAS_GLM_PC_BRANCH`; set by the chunk-0 prefix lookup).
     pub pc_branch_at: Option<usize>,
+    /// Checkpoint position the head asked this prefill to plant for requests
+    /// that share its prefix (`ATLAS_GLM_PC_INFLIGHT`, [`EP_CMD_PC_PLANT`]).
+    /// Becomes `pc_branch_at` at the first chunk where it is still ahead.
+    pub pc_plant_at: Option<usize>,
     /// Rolling end-of-turn SSM snapshot (`ATLAS_GLM_PC_FINISH_LEAF`).
     pub(crate) finish_leaf: crate::model::trait_impl::finish_leaf::LeafCell,
     /// Contiguous prefix length (in tokens, from position 0) whose paged KV is
@@ -310,6 +314,7 @@ impl SequenceState {
             prefix_lookup_applied: false,
             prefix_lookup_skip: false,
             pc_branch_at: None,
+            pc_plant_at: None,
             finish_leaf: Default::default(),
             kv_valid_tokens: 0,
             last_decode_ckpt_block: 0,
@@ -428,3 +433,4 @@ mod model_defaults;
 pub use eos_ban::EosBan;
 pub use logprobs::*;
 pub use model::{BeamReq, Model, padded_batch_n};
+pub use model_defaults::EP_CMD_PC_PLANT;

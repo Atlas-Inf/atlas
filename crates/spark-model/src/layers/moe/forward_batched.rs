@@ -70,23 +70,24 @@ impl MoeLayer {
         let n = num_tokens as u32;
         let bf16 = 2usize;
 
-        // Router width, not expert count — they differ only on LongCat, where
-        // the router also scores the zero-computation experts. This value also
-        // strides `gate_t` below; getting it wrong reads each token's logits
-        // from the wrong offset rather than failing.
+        // Router width, not expert count — they differ only on LongCat, where the router
+        // also scores the zero-computation experts. It strides `gate_t` below; getting it
+        // wrong reads each token's logits from the wrong offset rather than failing.
         let router_n = self.router_logits_n;
-        let (gate_logits, fp32_gate, gate_elem) =
+        let gate =
             self.batched_gate_logits(input, n, h, router_n, row_adapter_base, ctx, stream)?;
+        if self.forward_batched_qwen4exp_fast(input, num_tokens, gate, ctx, stream)? {
+            return Ok(());
+        }
+        let (gate_logits, fp32_gate, gate_elem) = gate;
 
         // Per-token: topK routing + expert dispatch + weighted sum
         let h_usize = h as usize;
         let expert_gate_out = ctx.buffers.expert_gate_out();
         let expert_up_out = ctx.buffers.expert_up_out();
         let expert_down_out = ctx.buffers.expert_down_out();
-        // ⚠ logits buffer aliased — see warning in moe/forward.rs:208-219
-        // and project_batch_decode_corruption.md (bug 2). Concurrent
-        // callers using `buffers.logits()` during the forward loop MUST
-        // offset past `shared_expert_intermediate_size * 2` bytes.
+        // ⚠ logits buffer aliased (moe/forward.rs, project_batch_decode_corruption.md
+        // bug 2): concurrent users offset past `shared_expert_intermediate_size * 2`.
         let shared_gate_scratch = ctx.buffers.logits();
         let shared_up_scratch = ctx.buffers.ssm_qkvz();
 
@@ -163,8 +164,7 @@ impl MoeLayer {
                     stream,
                 )?;
             }
-            // Last-token routing dump (no-op unless ATLAS_DUMP_EXPERT_IDS=1):
-            // the token whose top-K determines the next prediction.
+            // Routing dump of the token that predicts next (no-op unless ATLAS_DUMP_EXPERT_IDS=1).
             if t == num_tokens - 1 {
                 super::dump::dump_expert_ids(ctx.gpu, stream, indices_dev, weights_dev, 1, top_k)?;
             }

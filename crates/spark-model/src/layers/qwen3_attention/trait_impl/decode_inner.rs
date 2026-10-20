@@ -651,21 +651,23 @@ impl Qwen3AttentionLayer {
             return Ok(());
         }
 
-        // Expand attention output back into multi-stream state.
-        ops::hc_post_site(
-            ctx.gpu,
-            self.hc_post_k,
-            hc,
-            attn_out,
-            hc_streams,
-            post,
-            comb,
-            hc_streams,
-            1,
-            h as u32,
-            stream,
-        )?;
+        // Expand attention output back into multi-stream state. Without the
+        // diagnostics between them, the post runs with the FFN site's pre
+        // (`hc_post_pre_site`, fused under ATLAS_QWEN4EXP_DECODE_FUSE).
         if diag_this {
+            ops::hc_post_site(
+                ctx.gpu,
+                self.hc_post_k,
+                hc,
+                attn_out,
+                hc_streams,
+                post,
+                comb,
+                hc_streams,
+                1,
+                h as u32,
+                stream,
+            )?;
             super::diag_norm_f32(
                 ctx.gpu,
                 hc_streams,
@@ -686,21 +688,41 @@ impl Qwen3AttentionLayer {
         }
 
         // ── FFN sublayer ──
-        ops::hc_pre_site(
-            ctx.gpu,
-            self.hc_pre_k,
-            hc_streams,
-            &hc.ffn,
-            hc,
-            hidden,
-            post,
-            comb,
-            ctx.buffers.hc_lowrank_scratch(),
-            1,
-            h as u32,
-            eps,
-            stream,
-        )?;
+        if diag_this {
+            ops::hc_pre_site(
+                ctx.gpu,
+                self.hc_pre_k,
+                hc_streams,
+                &hc.ffn,
+                hc,
+                hidden,
+                post,
+                comb,
+                ctx.buffers.hc_lowrank_scratch(),
+                1,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        } else {
+            ops::hc_post_pre_site(
+                ctx.gpu,
+                self.hc_post_k,
+                self.hc_pre_k,
+                hc,
+                attn_out,
+                hc_streams,
+                &hc.ffn,
+                hidden,
+                post,
+                comb,
+                ctx.buffers.hc_lowrank_scratch(),
+                1,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        }
         if diag_this {
             super::diag_norm(
                 ctx.gpu,
@@ -742,7 +764,18 @@ impl Qwen3AttentionLayer {
             ctx.gpu.copy_d2d_async(hidden, normed2, h * 2, stream)?;
         }
 
-        let ffn_out = self.ffn.forward(normed2, ctx, stream)?;
+        // The MoE may run the low-rank post itself, fused with its last
+        // kernel (ATLAS_QWEN4EXP_DECODE_FUSE), when nothing sits between.
+        let hc_post = (ops::HcVariant::of(hc) == ops::HcVariant::LowRank
+            && !diag_this
+            && self.post_ffn_out_norm.is_none()
+            && self.layer_scalar.is_none())
+        .then_some(ops::qwen4exp_decode_fuse::MoeHcPost {
+            streams: hc_streams,
+            inj: post,
+            hc_mult,
+        });
+        let (ffn_out, posted) = self.ffn.forward_hc_post(normed2, ctx, hc_post, stream)?;
         astage!("ffn");
 
         if let Some(ref post_norm) = self.post_ffn_out_norm {
@@ -763,19 +796,21 @@ impl Qwen3AttentionLayer {
             self.apply_layer_scalar(ctx.gpu, ffn_out, h, scalar, stream)?;
         }
 
-        ops::hc_post_site(
-            ctx.gpu,
-            self.hc_post_k,
-            hc,
-            ffn_out,
-            hc_streams,
-            post,
-            comb,
-            hc_streams,
-            1,
-            h as u32,
-            stream,
-        )?;
+        if !posted {
+            ops::hc_post_site(
+                ctx.gpu,
+                self.hc_post_k,
+                hc,
+                ffn_out,
+                hc_streams,
+                post,
+                comb,
+                hc_streams,
+                1,
+                h as u32,
+                stream,
+            )?;
+        }
         if diag_this {
             super::diag_norm_f32(
                 ctx.gpu,

@@ -259,19 +259,6 @@ exists solely in nemotron-labs-3-puzzle-75b-a9b. Dispatch
 (qwen3_attention/init.rs) falls back to w4a4_gemm — same family the
 27B declares. UNMEASURED for this target."""
 
-[expected_absent.moe_w4a16]
-moe_w4a16_grouped_gemm_ptrtable_e8m0 = """
-Native-MXFP4 (E8M0) scale-format variant. Shipped only in
-deepseek-v4-flash's moe_w4a16 module (ARM-2 Phase-K). This target is
-NVFP4; the ptrtable grouped GEMM that resolves here serves it."""
-moe_w4a16_grouped_gemm_ptrtable_t_e8m0 = "Same E8M0 family — NVFP4 target uses the resolved ptrtable_t variant."
-moe_w4a16_grouped_gemm_ptrtable_t_k64_e8m0 = "Same E8M0 family — NVFP4 target uses the resolved ptrtable_t_k64 variant."
-moe_w4a16_fused_gate_up_t_e8m0 = "Same E8M0 family — NVFP4 target uses the resolved fused_gate_up variant."
-moe_w4a16_fused_gate_up_t_k64_e8m0 = "Same E8M0 family — NVFP4 target uses the resolved fused_gate_up_k64 variant."
-moe_w4a16_fused_gate_up_t_k64_m128 = """
-M=128 Block-D variant shipped only in minimax-m2-229b's shadow (per the
-dispatch comment in moe/init.rs). Dispatch falls through to M=64."""
-
 # ⚠ HONESTY NOTE on the four gated_delta_rule f16 arms: unlike every
 # entry above, the FP16-h-state decode arms dispatch these handles
 # UN-PROBED (ssm_batched_recurrent.rs:279/:509) once --ssm-h-dtype f16
@@ -438,8 +425,16 @@ honor_eos_inside_thinking = true
 max_thinking_budget = 2048
 # Guards carried over from the Atlas-Inf side of the merge: cap the think
 # budget at the request's own max_tokens rather than letting a 2048-token
-# reasoning block starve the answer, and keep the repetition watchdog on --
-# this model's greedy temp-0 behaviour includes a known repetition loop
-# (onset ~token 104 on filler prompts, exonerated from QSA by position).
+# reasoning block starve the answer.
 cap_thinking_at_max_tokens = true
-enable_loop_watchdog = true
+# The repetition guards stay OFF for this model. Its greedy temp-0 output has
+# a known repetition loop (onset ~token 104 on filler prompts, exonerated from
+# QSA by position), but both detectors also end legitimate answers that repeat
+# by design: on RigMark's decode cells (2026-10-06, TP2) the scheduler's
+# content-loop watchdog cut a 50-element JSON array at ~100 tokens and Go code
+# with table-driven tests at 1.1-1.7K tokens (reported as `length`), and the
+# stream loop guards withheld every word of a 700-word memo (a 30-character
+# phrase seen four times). A loop now runs to the request's max_tokens, as on
+# other engines; clients bound it there.
+enable_loop_watchdog = false
+enable_stream_loop_guards = false

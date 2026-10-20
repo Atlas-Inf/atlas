@@ -21,6 +21,7 @@
 // 4 outputs per block, 64 threads (2 warps) per output. Cross-warp smem reduction.
 // Grid: (ceil(N / 4), 1, 1)   Block: (256, 1, 1)
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -202,6 +203,7 @@ extern "C" __global__ void w4a16_gemv(
     unsigned int N,
     unsigned int K
 ) {
+    atlas_pdl_enter();
     const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
     const unsigned int local_out = threadIdx.x / threads_per_out;
     const unsigned int lane = threadIdx.x % threads_per_out;
@@ -274,6 +276,7 @@ extern "C" __global__ void w4a16_gemv_sw(
     unsigned int N,
     unsigned int K
 ) {
+    atlas_pdl_enter();
     const unsigned int local_out = threadIdx.x / WARP_SIZE;       // 0..7
     const unsigned int lane = threadIdx.x % WARP_SIZE;            // 0..31
     const unsigned int n = blockIdx.x * N_PER_BLOCK_SW + local_out;
@@ -975,6 +978,7 @@ extern "C" __global__ void w4a16_gemv_qg(
     unsigned int num_heads,
     unsigned int head_dim
 ) {
+    atlas_pdl_enter();
     const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;
     const unsigned int local_out = threadIdx.x / threads_per_out;
     const unsigned int lane = threadIdx.x % threads_per_out;
@@ -1575,6 +1579,123 @@ extern "C" __global__ void w4a16_gemv_qg_batch3(
         C[out_idx]  = __float2bfloat16(result0);
         C1[out_idx] = __float2bfloat16(result1);
         C2[out_idx] = __float2bfloat16(result2);
+    }
+}
+
+// ============================================================
+// W4A16 GEMV batch4 with inline Q/Gate deinterleave
+// ============================================================
+// The 4-row sibling of `w4a16_gemv_qg_batch3`, for the qwen4_exp K=4 MTP
+// verify under ATLAS_QWEN4EXP_EXACT_VERIFY (one Q+gate weight pass for the
+// four verify rows). Row r's accumulation chain is `w4a16_gemv_qg`'s, op for
+// op: same lane -> k8 walk, same `acc += a * (lut * scale)` (no contraction
+// under this dir's --fmad=false), same two-warp shuffle tree and the same
+// final `smem[w0] + smem[w1]`. So row r is byte-identical to a single-row
+// `w4a16_gemv_qg` launch on row r (scripts/dev/qwen4exp_exact_verify_bench.cu).
+//
+// Input:  A[4, K] BF16.  Output: C[4, N] BF16, row r deinterleaved [Q|G].
+// Grid: (ceil(N / 4), 1, 1)   Block: (256, 1, 1)
+extern "C" __global__ void w4a16_gemv_qg_batch4(
+    const __nv_bfloat16* __restrict__ A,        // [4, K]
+    const unsigned char* __restrict__ B_packed,  // [N, K/2] uint8
+    const unsigned char* __restrict__ B_scale,   // [N, K/GROUP_SIZE] FP8-E4M3
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,               // [4, N] deinterleaved [Q|G] per token
+    unsigned int N,
+    unsigned int K,
+    unsigned int num_heads,
+    unsigned int head_dim
+) {
+    constexpr int M = 4;
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    if (n >= N) return;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K8 = K / 8;
+
+    __shared__ float s_lut[16];
+    __shared__ float smem[N_PER_BLOCK * 2 * M];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc[M];
+    #pragma unroll
+    for (int r = 0; r < M; r++) acc[r] = 0.0f;
+
+    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
+        const unsigned int base_k = k8 * 8;
+        unsigned int a_raw[M][4];
+        #pragma unroll
+        for (int r = 0; r < M; r++) {
+            uint4 a_data = ((const uint4*)(A + (size_t)r * K))[k8];
+            a_raw[r][0] = a_data.x;
+            a_raw[r][1] = a_data.y;
+            a_raw[r][2] = a_data.z;
+            a_raw[r][3] = a_data.w;
+        }
+
+        unsigned int packed4 = *(const unsigned int*)(B_packed + (unsigned long long)n * half_K + k8 * 4);
+        unsigned int scale_group = base_k / GROUP_SIZE;
+        unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + scale_group];
+        __nv_fp8_e4m3 fp8;
+        *(unsigned char*)&fp8 = scale_byte;
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+        float scale = scl_fp8(scale_byte) * scale2;
+#else
+        float scale = (float)fp8 * scale2;
+#endif
+
+        #pragma unroll
+        for (int b = 0; b < 4; b++) {
+            unsigned char byte_val = (packed4 >> (b * 8)) & 0xFF;
+            float w_lo = s_lut[byte_val & 0xF] * scale;
+            float w_hi = s_lut[byte_val >> 4] * scale;
+            #pragma unroll
+            for (int r = 0; r < M; r++) {
+                __nv_bfloat16 a_lo, a_hi;
+                *(unsigned short*)&a_lo = (unsigned short)(a_raw[r][b] & 0xFFFF);
+                *(unsigned short*)&a_hi = (unsigned short)(a_raw[r][b] >> 16);
+                acc[r] += __bfloat162float(a_lo) * w_lo;
+                acc[r] += __bfloat162float(a_hi) * w_hi;
+            }
+        }
+    }
+
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        #pragma unroll
+        for (int r = 0; r < M; r++) acc[r] += __shfl_down_sync(0xFFFFFFFF, acc[r], offset);
+    }
+
+    if (warp_lane == 0) {
+        unsigned int warp_idx = lane / WARP_SIZE;
+        #pragma unroll
+        for (int r = 0; r < M; r++) smem[local_out * 2 * M + warp_idx * M + r] = acc[r];
+    }
+    __syncthreads();
+
+    if (lane == 0) {
+        unsigned int group_dim = 2 * head_dim;
+        unsigned int h = n / group_dim;
+        unsigned int idx = n % group_dim;
+        unsigned int q_total = num_heads * head_dim;
+        unsigned int out_idx;
+        if (idx < head_dim) {
+            out_idx = h * head_dim + idx;
+        } else {
+            out_idx = q_total + h * head_dim + (idx - head_dim);
+        }
+        #pragma unroll
+        for (int r = 0; r < M; r++) {
+            float result = smem[local_out * 2 * M + r] + smem[local_out * 2 * M + M + r];
+            C[(size_t)r * N + out_idx] = __float2bfloat16(result);
+        }
     }
 }
 

@@ -66,7 +66,9 @@ impl TransformerModel {
         // `verify_pieces` stays: its KDA runs bake only fixed arenas and SSM
         // pool addresses that depend on the slot alone (never the PLE carry
         // or QSA keys freed above), so the next sequence on this slot, or a
-        // survivor compacted onto it, replays them as-is.
+        // survivor compacted onto it, replays them as-is. `decode_pieces`
+        // likewise: the qwen4_exp GDN runs exclude the PLE layer and the QSA
+        // attention layers, and are keyed by SSM pool slot.
         for g in dead {
             if g.0 != 0
                 && let Err(e) = self.gpu.destroy_graph(g)

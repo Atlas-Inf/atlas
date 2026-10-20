@@ -37,7 +37,6 @@ fn decode(model: &TestModel, rows: &mut Vec<ActiveSeq>, sched: &SchedCtx) {
         None,
         None,
         None,
-        None,
         false,
         sched,
     );
@@ -204,7 +203,6 @@ fn cancelled_host_sampling_preserves_request_adaptive_state_serial_and_parallel(
             None,
             None,
             None,
-            None,
             true,
             &SchedCtx::for_test(),
         );
@@ -229,7 +227,6 @@ fn cancelled_host_sampling_preserves_request_adaptive_state_serial_and_parallel(
         &mut rows,
         DevicePtr::NULL,
         std::time::Instant::now(),
-        None,
         None,
         None,
         None,

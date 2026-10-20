@@ -634,6 +634,7 @@ impl TransformerModel {
                     // Shifted clear of the decode lanes in a mixed step; `b`
                     // alone would land on decode lane `b`'s logits row.
                     row_base + b,
+                    None,
                     stream,
                 )?
             } else {

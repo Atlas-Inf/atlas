@@ -60,6 +60,7 @@ pub(super) fn build_prefill_in_progress(
     timeout_at: Option<Instant>,
 ) -> PrefillInProgress {
     PrefillInProgress {
+        multi: false,
         prompt_tokens,
         session_hash,
         seq,

@@ -35,6 +35,27 @@ use super::vision::parse_vision_config;
 /// config against itself; the loader reads the real sizes off the checkpoint.
 const NGRAM_VOCAB_ALIGN: u64 = 128;
 
+/// `ATLAS_QWEN4EXP_DEBUG_LAYERS=<n>` (debug only, unset in serving): keep
+/// the first `n` decoder layers. A whole-model harness that fits one GB10
+/// beside other tenants -- with `n = 8` it still has every layer kind (GDN,
+/// the PLE layer 2, QSA attention, the last layer's `hc_head`) -- for checks
+/// that compare the engine against ITSELF, such as prefill chunk invariance.
+/// The logits are not the model's.
+fn debug_truncate_layers(config: &mut ModelConfig) {
+    let keep = std::env::var("ATLAS_QWEN4EXP_DEBUG_LAYERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0 && n < config.num_hidden_layers);
+    if let Some(n) = keep {
+        eprintln!(
+            "ATLAS_QWEN4EXP_DEBUG_LAYERS: keeping {n} of {} layers",
+            config.num_hidden_layers
+        );
+        config.num_hidden_layers = n;
+        config.layer_types.truncate(n);
+    }
+}
+
 pub(crate) fn parse_qwen4_exp(raw: &Value) -> Result<ModelConfig> {
     let text = raw
         .get("text_config")
@@ -63,6 +84,7 @@ pub(crate) fn parse_qwen4_exp(raw: &Value) -> Result<ModelConfig> {
     // prefix here means `config.layer_prefix(i)` yields the real key, so the
     // shared loader helpers need no qwen4_exp-specific naming.
     config.weight_prefix = "model.language_model".to_string();
+    debug_truncate_layers(&mut config);
 
     ensure!(
         config.hidden_size > 0,

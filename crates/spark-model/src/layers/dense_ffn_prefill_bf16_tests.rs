@@ -19,7 +19,7 @@ fn fixture(run: impl FnOnce(&mut DenseFfnLayer, &ForwardContext, &MockGpuBackend
         up_proj_t: None,
         down_proj_t: None,
     };
-    let mut layer = DenseFfnLayer::new(weights, &gpu).unwrap();
+    let mut layer = DenseFfnLayer::new(weights, &gpu, "qwen4_exp").unwrap();
     let buffers = BufferArena::new(&config, 9, 16, 16, 1, &gpu).unwrap();
     let mut dispatch = ops::GemmDispatch::defaults();
     dispatch.cublas_gemm = false;

@@ -69,3 +69,27 @@ fn oom_terminal_dispatch_preserves_legacy_and_selected_exit() {
         assert!(!stdout.contains("oom-rust-drop"), "{mode}: {stdout}");
     }
 }
+
+/// Slab bookkeeping against a real backend: interior frees are no-ops and the
+/// region stays registered until the BASE is freed — the invariant the
+/// slab-aliased FP8 weight path relies on.
+#[test]
+#[ignore = "requires a GPU device (runs on strix via --ignored)"]
+fn slab_interior_frees_keep_region_until_base() {
+    use crate::cuda_backend::AtlasCudaBackend;
+    use crate::gpu::GpuBackend;
+    let gpu = AtlasCudaBackend::new(0, &[]).expect("GPU backend");
+    let slab = gpu.alloc(64 * 1024).unwrap();
+    gpu.register_slab(slab, 64 * 1024);
+    let interior = crate::gpu::DevicePtr(slab.0 + 4096);
+    assert!(GpuBackend::is_slab_interior(&gpu, interior));
+    assert!(!GpuBackend::is_slab_interior(&gpu, slab)); // base itself is not interior
+    // Freeing interior pointers must be a no-op that leaves the region live.
+    gpu.free(interior).unwrap();
+    assert!(GpuBackend::is_slab_interior(&gpu, interior));
+    gpu.free(crate::gpu::DevicePtr(slab.0 + 60 * 1024)).unwrap();
+    assert!(GpuBackend::is_slab_interior(&gpu, interior));
+    // Freeing the base drops the region; interior no longer matches.
+    gpu.free(slab).unwrap();
+    assert!(!GpuBackend::is_slab_interior(&gpu, interior));
+}

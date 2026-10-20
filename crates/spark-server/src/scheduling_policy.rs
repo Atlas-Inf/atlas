@@ -9,7 +9,8 @@
 //! Implementations:
 //! - [`FifoPolicy`]: always prefill, take first N from queue (current behavior).
 //! - [`SlaiPolicy`]: skip prefills when active sequences approach TBT deadline,
-//!   select shortest prompts first from ALL pending (SLAI — arXiv:2407.08353).
+//!   select the oldest pending request, then shortest prompts first from ALL
+//!   pending (SLAI — arXiv:2407.08353, plus a no-starvation head slot).
 
 use std::time::{Duration, Instant};
 
@@ -84,7 +85,8 @@ impl SchedulingPolicy for FifoPolicy {
 ///
 /// - Skips prefills when any active sequence waited > 80% of `tbt_deadline`
 ///   since its last token emission (decode-first priority).
-/// - Selects the N shortest prompts from ALL pending (reduces median TTFT).
+/// - Selects the oldest pending request first, then the shortest prompts from
+///   ALL pending (reduces median TTFT without starving long prompts).
 pub struct SlaiPolicy {
     tbt_deadline: Duration,
 }
@@ -113,9 +115,32 @@ impl SchedulingPolicy for SlaiPolicy {
     }
 
     fn select_prefills(&self, requests: &[PendingRequestInfo], capacity: usize) -> Vec<usize> {
-        // Sort ALL pending by prompt_len, pick shortest N.
-        let mut indices: Vec<usize> = (0..requests.len()).collect();
-        indices.sort_by_key(|&i| requests[i].prompt_len);
+        // Shortest prompts first, EXCEPT the oldest pending request, which
+        // always takes the first slot. Pure shortest-first never admits a long
+        // prompt while shorter ones keep arriving: on GB10 at 36 agentic
+        // streams over 32 slots, 85k-token prompts waited ~4 h, hit the 4 h
+        // turn timeout and aborted 255 follow-on turns (MLPerf C=36 point,
+        // 2026-10-03). The pending queue keeps arrival order (admission pushes
+        // overflow back to the FRONT), so index 0 is the oldest, and a request
+        // now waits at most for the requests ahead of it.
+        if capacity == 0 || requests.is_empty() {
+            return Vec::new();
+        }
+        let oldest = requests
+            .iter()
+            .min_by_key(|r| r.index)
+            .map(|r| r.index)
+            .unwrap_or(0);
+        let mut rest: Vec<usize> = (0..requests.len())
+            .filter(|&i| requests[i].index != oldest)
+            .collect();
+        rest.sort_by_key(|&i| requests[i].prompt_len);
+        let first = (0..requests.len())
+            .find(|&i| requests[i].index == oldest)
+            .unwrap_or(0);
+        let mut indices = Vec::with_capacity(capacity.min(requests.len()));
+        indices.push(first);
+        indices.extend(rest);
         indices.truncate(capacity);
         indices
     }
@@ -270,8 +295,9 @@ mod tests {
                 index: 4,
             },
         ];
-        // Capacity 3: picks shortest 3 → indices 1(10), 3(50), 2(200)
-        assert_eq!(policy.select_prefills(&requests, 3), vec![1, 3, 2]);
+        // Capacity 3: the oldest (index 0, 500 tokens) takes the head slot,
+        // then the shortest of the rest → 0, 1(10), 3(50)
+        assert_eq!(policy.select_prefills(&requests, 3), vec![0, 1, 3]);
     }
 
     #[test]
@@ -287,8 +313,8 @@ mod tests {
                 index: 1,
             },
         ];
-        // Capacity 10 > 2 requests: returns all sorted
-        assert_eq!(policy.select_prefills(&requests, 10), vec![1, 0]);
+        // Capacity 10 > 2 requests: oldest first, then the rest by length
+        assert_eq!(policy.select_prefills(&requests, 10), vec![0, 1]);
     }
 
     #[test]
@@ -309,6 +335,28 @@ mod tests {
             },
         ];
         assert_eq!(policy.select_prefills(&requests, 3), vec![0, 1, 2]);
+    }
+
+    /// The starvation case from the GB10 MLPerf run: a long prompt at the
+    /// head of the queue while shorter ones keep arriving. Pure shortest-first
+    /// never picks it at capacity 1; the head slot does, on the first tick.
+    #[test]
+    fn slai_never_starves_the_oldest_long_prompt() {
+        let policy = SlaiPolicy::new(100);
+        let mut requests = vec![PendingRequestInfo {
+            prompt_len: 85_291,
+            index: 0,
+        }];
+        for i in 1..40 {
+            requests.push(PendingRequestInfo {
+                prompt_len: 2_000 + i,
+                index: i,
+            });
+        }
+        assert_eq!(policy.select_prefills(&requests, 1), vec![0]);
+        // With more room the remaining slots are still shortest-first.
+        assert_eq!(policy.select_prefills(&requests, 3), vec![0, 1, 2]);
+        assert!(policy.select_prefills(&requests, 0).is_empty());
     }
 
     #[test]

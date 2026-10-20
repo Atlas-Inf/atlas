@@ -266,3 +266,9 @@ pub struct HcWeights {
     /// final norm and the checkpoint ships no `model.norm.weight`.
     pub is_last_model_layer: bool,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HeadGateActivation {
+    Sigmoid,
+    Softplus,
+}

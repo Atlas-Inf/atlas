@@ -39,6 +39,7 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for SsmStatePool {
             views.clear();
         }
         self.h_prefill_stage_pool = None;
+        self.gdn_fuse_words = spark_runtime::gpu::DevicePtr::NULL;
         let mut first_error = None;
         for ptr in self.allocations.drain(..) {
             if let Err(e) = gpu.free(ptr)

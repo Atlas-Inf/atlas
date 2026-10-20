@@ -53,17 +53,19 @@
 //! TP2 ranks keep their own snapshot pools and indexes. Only the radix match
 //! is min-reduced across ranks (F83), and the Marconi restore depth sets each
 //! rank's processed row range, so ranks that restore at different depths run
-//! mismatched collectives. With either flag, or with a spill tier (the NVMe
-//! prefix tier `ATLAS_KV_NVME_DIR` or the snapshot tier `ATLAS_SSM_TIER`: a
-//! KV restore or a snapshot fault-in can succeed on one rank only; startup
-//! refuses ranks that differ in either, `factory/build/kv_nvme.rs`), the
-//! ranks also agree on the restore depth
-//! ([`agree_restore`]): the minimum depth any rank can restore,
-//! taken only if every rank holds an exact-prefix snapshot at that depth, and
-//! otherwise a full recompute everywhere. That costs one 4-byte
-//! min-reduction per prefill, plus a second one when there is something to
-//! restore (and a third when a branch checkpoint is a candidate). This is the
-//! safety mechanism: the pools and eviction victims may diverge across ranks.
+//! mismatched collectives. The pools and eviction victims do diverge across
+//! ranks, with or without either flag (seen on qwen4_exp TP2: four concurrent
+//! 22.6K-token turns of shared-system-prompt conversations, one rank restored
+//! at 22,528 while the other found no snapshot and recomputed all of it; both
+//! ranks then waited in different collectives forever), and a spill tier (the
+//! NVMe prefix tier `ATLAS_KV_NVME_DIR` or the snapshot tier `ATLAS_SSM_TIER`)
+//! adds restores and fault-ins that succeed on one rank only. So every
+//! multi-rank world agrees on the restore depth ([`agree_restore`]): the
+//! minimum depth any rank can restore, taken only if every rank holds an
+//! exact-prefix snapshot at that depth, and otherwise a full recompute
+//! everywhere. That costs one 4-byte min-reduction per prefill, plus a second
+//! one when there is something to restore (and a third when a branch
+//! checkpoint is a candidate).
 //!
 //! # Rank env parity
 //!
@@ -73,7 +75,9 @@
 //! collectives and chunk shapes and the pair deadlocks, or pairs a
 //! restore-depth reduction with the peer's KV-admission vote. The ranks
 //! compare them at startup (`model::startup_parity`), with
-//! `ATLAS_EP_PROTOCOL` and the rest of that table.
+//! `ATLAS_EP_PROTOCOL` and the rest of that table. `ATLAS_GLM_PC_INFLIGHT`
+//! is not among them: only the head's scheduler reads it, and the worker
+//! plants what the head sends (`pc_inflight`).
 //!
 //! So are `ATLAS_GLM_PC_WRITE_FLOOR` and `ATLAS_GLM_KV_WRITE_FLOOR_LEGACY`.
 //! A mismatch there does not deadlock (the cache writes they skip are not
@@ -113,6 +117,26 @@ pub(in crate::model) fn glm_pc_branch_min_tokens() -> usize {
 pub(in crate::model) fn glm_pc_write_floor_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_GLM_PC_WRITE_FLOOR").as_deref() == Ok("1"))
+}
+
+/// The base KV write floor of a prefill pass over `[start, start + rows)`:
+/// with a Marconi restore (`marconi_skip`) the replay rows under the radix
+/// match `cached`, so the shared blocks keep their bytes; otherwise
+/// `kv_write_start` (the prefix lookup's skip depth, 0 without a restore).
+/// Shared by the single pass (`forward_layers`) and each sequence of a
+/// multi-sequence pass (`multi`), so both write the same rows.
+pub(super) fn replay_floor(
+    marconi_skip: bool,
+    cached: usize,
+    kv_write_start: usize,
+    start: usize,
+    rows: usize,
+) -> usize {
+    if marconi_skip {
+        cached.saturating_sub(start).min(rows)
+    } else {
+        kv_write_start
+    }
 }
 
 /// The KV write floor a prefill pass over rows `[start, start + rows)` hands
@@ -181,14 +205,6 @@ impl TransformerModel {
         }
         floor
     }
-}
-
-/// Whether ranks must agree on the Marconi restore depth: on with either
-/// prefix-cache policy flag, because both make later decisions depend on it.
-/// (`ATLAS_GLM_PC_FINISH_LEAF`, whose leaf a rank can lose, needs
-/// `ATLAS_GLM_PC_EVICT` and so always runs with the agreement.)
-pub(in crate::model) fn pc_rank_agree_enabled() -> bool {
-    spark_runtime::radix_tree::glm_pc_evict_enabled() || glm_pc_branch_enabled()
 }
 
 /// `ATLAS_NO_TAIL_SPLIT=1`: a last chunk runs as one pass, without the
@@ -298,12 +314,15 @@ impl TransformerModel {
                     .ssm_snapshots
                     .session_matches(snap_id, seq.session_hash))
             && (!self.requires_aux_state() || self.ssm_snapshots.has_aux(snap_id))
+            // ATLAS_QWEN4EXP_PREFILL_ROWINV: only a restore on the GDN grid
+            // replays what the cold pass computes.
+            && (!crate::layers::ops::qwen4exp_rowinv::on()
+                || snap_tok.is_multiple_of(crate::layers::ops::qwen4exp_rowinv::PASS_GRANULE))
     }
 
     /// Agree on one restore `(snapshot, depth, is_tail)` across ranks (see
     /// the module docs and [`agree_restore`]). Returns the local choice
-    /// unchanged when agreement is off (neither policy flag, no spill tier)
-    /// or this is a single-rank world;
+    /// unchanged in a single-rank world;
     /// `(None, 0, false)` means no rank restores.
     pub(super) fn pc_agree_restore(
         &self,
@@ -315,8 +334,7 @@ impl TransformerModel {
         local: (Option<usize>, usize),
     ) -> Result<(Option<usize>, usize, bool)> {
         let is_tail = prefix_match.ssm_snapshot_is_tail;
-        let spill_tier = || self.ssm_tier_store.is_some() || self.nvme_tier().is_some();
-        if !(pc_rank_agree_enabled() || spill_tier()) || !self.multi_rank_protocol_active() {
+        if !self.multi_rank_protocol_active() {
             return Ok((local.0, local.1, is_tail));
         }
         let restorable = |id: usize, tok: usize, tail: bool| {
@@ -362,7 +380,10 @@ impl TransformerModel {
         bs: usize,
     ) -> Result<()> {
         seq.pc_branch_at = None;
-        if !glm_pc_branch_enabled()
+        // ATLAS_QWEN4EXP_PC_BRANCH: the same plan, captured in-pass
+        // (`qwen4exp_points`), with its own minimum.
+        let in_pass = self.qwen4exp_pc_branch();
+        if !(glm_pc_branch_enabled() || in_pass)
             || self.config.num_ssm_layers() == 0
             || !self.ssm_snapshots.is_enabled()
             || !self.prefix_cache.is_active()
@@ -370,7 +391,11 @@ impl TransformerModel {
         {
             return Ok(());
         }
-        let min = glm_pc_branch_min_tokens();
+        let min = if in_pass {
+            super::qwen4exp_points::branch_min()
+        } else {
+            glm_pc_branch_min_tokens()
+        };
         let Some(at) = branch_checkpoint_at(matched, skip_to, tokens.len(), bs, min) else {
             return Ok(());
         };

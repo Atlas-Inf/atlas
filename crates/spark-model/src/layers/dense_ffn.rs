@@ -366,14 +366,17 @@ fn mmq_tile64_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_NO_MMQ_TILE64").as_deref() != Ok("1"))
 }
 impl DenseFfnLayer {
-    pub fn new(weights: DenseFfnWeights, gpu: &dyn GpuBackend) -> Result<Self> {
-        Self::new_with_activation(weights, FfnActivation::SiLU, gpu)
+    /// `model_type` gates the optional `w4a16_gemv_tc*` tier probes (GLM
+    /// series only) inside `W4a16BatchmTiers::resolve`.
+    pub fn new(weights: DenseFfnWeights, gpu: &dyn GpuBackend, model_type: &str) -> Result<Self> {
+        Self::new_with_activation(weights, FfnActivation::SiLU, gpu, model_type)
     }
 
     pub fn new_with_activation(
         weights: DenseFfnWeights,
         activation: FfnActivation,
         gpu: &dyn GpuBackend,
+        model_type: &str,
     ) -> Result<Self> {
         let act_mul = match activation {
             FfnActivation::SiLU => gpu.kernel("moe_silu_mul", "moe_silu_mul")?,
@@ -493,7 +496,7 @@ impl DenseFfnLayer {
                 "w4a16_gemv_dp4a",
                 "w4a16_gemv_dp4a_dual_batch8_d4_dyn_vl2",
             ),
-            w4a16_batchm: W4a16BatchmTiers::resolve(gpu),
+            w4a16_batchm: W4a16BatchmTiers::resolve(gpu, model_type == "glm5_next"),
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_m128_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128"),
             w4a16_gemm_t_m128_k16_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128_k16"),

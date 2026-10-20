@@ -42,6 +42,8 @@ mod lifecycle_tests;
 mod logit_dump;
 mod logit_processors;
 mod logprobs;
+pub mod loop_steer;
+mod min_tokens_ban;
 mod mod_helpers;
 pub use mod_helpers::capture_runtime_handle;
 pub mod dumps;
@@ -50,8 +52,11 @@ pub mod limits;
 mod mtp_accept_debug;
 mod mtp_bootstrap_step;
 mod mtp_dcut;
+mod mtp_deep_depth;
+mod mtp_depth_ladder;
 mod mtp_gate;
 mod mtp_step;
+mod mtp_step_trace;
 pub(crate) mod mtp_timing;
 #[cfg(test)]
 mod ngram_accounting_tests;
@@ -64,12 +69,15 @@ mod preempt_tests;
 mod prefill_a_step;
 mod prefill_a_step_params;
 mod prefill_b_step;
+mod prefill_burst;
+mod prefill_multi;
 mod prefill_normalization;
 mod prefill_preempt;
 mod repetition;
 mod rollback;
 mod sample_step;
 pub mod sched_ctx;
+mod shared_prefix;
 #[cfg(test)]
 mod slot_compaction_tests;
 pub mod snapshot;
@@ -84,6 +92,8 @@ mod test_support;
 #[cfg(test)]
 mod think_skip_tests;
 mod types;
+#[cfg(test)]
+mod verify_bias_tests;
 #[cfg(test)]
 mod verify_commit_tests;
 mod verify_dflash_batch_step;
@@ -255,7 +265,6 @@ pub fn run(
     block_size: usize,
     think_end_token: Option<u32>,
     think_start_token: Option<u32>,
-    code_fence_token: Option<u32>,
     tool_call_start_token: Option<u32>,
     tool_call_end_token: Option<u32>,
     mut grammar_engine: Option<GrammarEngine>,
@@ -361,6 +370,8 @@ pub fn run(
     // context ceiling, i.e. reserve each request's own max_tokens; see
     // `admission` module docs and ATLAS_KV_ADMIT_WATERMARK).
     let admit_watermark = admission::resolve_admit_watermark(sched.limits.max_seq_len);
+    let mut prefix_admit = shared_prefix::SharedPrefix::default();
+    let mut burst = prefill_burst::PrefillBurst::new(prefill_burst::BurstConfig::from_env());
 
     let pending = Arc::new((
         Mutex::new(PendingQueue {
@@ -490,6 +501,17 @@ pub fn run(
             admit_watermark,
             sched.limits.max_seq_len,
             block_size,
+        );
+        // ── Shared-prefix admission: hold requests that share a long prefix
+        // with a prefill in flight until it plants a checkpoint there
+        // (`ATLAS_GLM_PC_INFLIGHT`; a no-op otherwise). ──
+        let (new_reqs, pc_plants) = shared_prefix::admit(
+            &*model,
+            &pending,
+            new_reqs,
+            &mut prefilling,
+            chunked,
+            &mut prefix_admit,
         );
         sched.timing.record(mtp_timing::Phase::LoopDrain, t_loop);
 
@@ -647,10 +669,12 @@ pub fn run(
         // ── Start new requests ──
         let t_loop = std::time::Instant::now();
         let prefill_queue_was_empty = prefilling.is_empty();
+        let in_flight_before = active.len() + prefilling.len();
         start_new_requests(
             &*model,
             &sched,
             new_reqs,
+            pc_plants,
             chunked,
             always_mixed,
             max_prefill_tokens,
@@ -668,9 +692,27 @@ pub fn run(
             &mut prefilling,
         );
         sched.timing.record(mtp_timing::Phase::LoopAdmit, t_loop);
+        // ── ATLAS_PREFILL_BURST: more short prompts already waiting → drain
+        // them before this tick's decode (`prefill_burst`; off by default). ──
+        if burst.enabled() {
+            let (pending_n, pending_tokens) = prefill_burst::pending_load(&pending);
+            let in_flight = active.len() + prefilling.len();
+            let view = prefill_burst::TickView {
+                admitted: in_flight.saturating_sub(in_flight_before),
+                pending: pending_n,
+                pending_tokens,
+                prefilling: prefilling.len(),
+                in_flight,
+                max_batch: max_batch_size,
+            };
+            if burst.hold(Instant::now(), &view) {
+                continue;
+            }
+        }
 
         // ── Continue in-progress prefills ──
         let t_loop = std::time::Instant::now();
+        let mut step_trace = mtp_step_trace::begin(&active);
         let mut rode: Vec<usize> = Vec::new();
         let spec_step = SpecStep {
             num_drafts: model
@@ -704,7 +746,6 @@ pub fn run(
                 use_ngram_speculative,
                 think_end_token,
                 think_start_token,
-                code_fence_token,
                 tool_call_start_token,
                 tool_call_end_token,
                 adaptive_sampling,
@@ -713,6 +754,10 @@ pub fn run(
                 &mut rode,
             );
         sched.timing.record(mtp_timing::Phase::LoopPrefill, t_loop);
+        if did_mixed_step {
+            mtp_step_trace::note_kind("mixed");
+        }
+        mtp_step_trace::note_rode(&rode);
 
         if active.is_empty() {
             // Every sequence can be parked (decode-preempted/spilled) with
@@ -747,6 +792,7 @@ pub fn run(
         };
 
         // Skip decode when mixed_forward already processed decode logits.
+        mtp_step_trace::mark_decode(&mut step_trace, &active);
         if !did_mixed_step && !active.is_empty() {
             // Ensure any in-flight prefill work on the prefill stream is complete
             // before decode starts on the default stream.
@@ -779,8 +825,15 @@ pub fn run(
             // inside `<think>`. Standard MTP already verifies during think.
             // DFlash raw-argmax does not run ForcedThinkEnd, so it stays
             // serial-in-think unless this lever is on. Resume guard still
-            // serial-decodes the spec-entry window.
-            let dflash_spec_think = sched.levers.dflash_spec_think;
+            // serial-decodes the spec-entry window. A bit-exact verify
+            // (`ATLAS_QWEN4EXP_EXACT_VERIFY=1`) counts as the opt-in for a
+            // single sequence: speculating there is lossless.
+            let dflash_spec_think = mtp_gate::spec_think_for(
+                sched.levers.dflash_spec_think,
+                model.verify_bit_exact(),
+                model.batch_verify_bit_exact(),
+                active.len(),
+            );
             // ATLAS_GLM_STRICT_SPEC=1: strict structured-output sequences
             // speculate too, on the DFlash lane whose verify the GLM split head
             // grammar-masks row by row (`strict_spec`). Anywhere else they stay
@@ -1027,13 +1080,13 @@ pub fn run(
                     } else {
                         match gate.next_step() {
                             mtp_gate::GateStep::MeasureDecode => {
+                                mtp_step_trace::note_kind("gate");
                                 let t0 = std::time::Instant::now();
                                 step_decode_only(
                                     &*model,
                                     &mut active,
                                     think_end_token,
                                     think_start_token,
-                                    code_fence_token,
                                     tool_call_start_token,
                                     tool_call_end_token,
                                     adaptive_sampling,
@@ -1177,7 +1230,6 @@ pub fn run(
                     &mut active,
                     think_end_token,
                     think_start_token,
-                    code_fence_token,
                     tool_call_start_token,
                     tool_call_end_token,
                     adaptive_sampling,
@@ -1192,7 +1244,17 @@ pub fn run(
             }
         }
 
+        // A speculative step refused for KV (agreed, rolled back on every
+        // rank) preempts a victim here instead of failing its sequences.
+        preempt::requeue_kv_refusals(
+            &*model,
+            &mut active,
+            spill_manager.as_mut(),
+            &mut swapped,
+            &mut preempted,
+        );
         active.extend(rode_seqs);
+        mtp_step_trace::finish(step_trace, &active);
 
         let t_loop = std::time::Instant::now();
         // Deadline sweep BEFORE retirement, so a timed-out sequence retires

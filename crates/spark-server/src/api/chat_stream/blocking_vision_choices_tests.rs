@@ -58,6 +58,7 @@ async fn every_blocking_choice_carries_its_own_vision_input() {
                 logit_bias: vec![],
                 stop_tokens: vec![],
                 enable_thinking: false,
+                force_nonempty_content: false,
                 thinking_budget: None,
                 tools_active: false,
                 tool_choice_required: false,

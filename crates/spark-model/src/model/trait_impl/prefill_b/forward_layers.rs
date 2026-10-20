@@ -14,6 +14,8 @@ use super::super::super::types::TransformerModel;
 use crate::layer::{AttnMetadataDev, ForwardContext};
 use crate::traits::SequenceState;
 
+mod profile_tail;
+
 impl TransformerModel {
     pub(super) fn prefill_b_forward_layers(
         &self,
@@ -119,8 +121,21 @@ impl TransformerModel {
             cap_local_early: p.cap_local_early,
             h_dsts_early: &p.h_dsts_early,
             conv_dsts_early: &p.conv_dsts_early,
+            extra: &p.extra,
         });
 
+        // The chunk's ids were staged from `chunk_start` (host and device
+        // alike); a pass that computes only the chunk's uncached tail (a
+        // Marconi restore, the exact-hit last row) starts `skip` rows in.
+        // Before this, such a pass hashed its PLE n-grams from the CHUNK's
+        // first tokens.
+        let skip = effective_seq_len_start
+            .saturating_sub(chunk_start)
+            .min(chunk_len);
+        // ATLAS_QWEN4EXP_PREFILL_HOST_IDS (`embed_chunk::take_staged_ids`).
+        let host_ids = super::embed_chunk::take_staged_ids()
+            .map(|ids| ids.get(skip..).unwrap_or_default().to_vec())
+            .filter(|ids| ids.len() >= proc_count);
         let ctx = ForwardContext {
             ssm_batch: None,
             buffers: &self.buffers,
@@ -136,11 +151,13 @@ impl TransformerModel {
             graph_capture: false,
             // Marconi warm hit: GDN layers replay from a restored SSM state
             // and must use the bit-faithful WY4 recurrence (see layer.rs).
-            gdn_exact_replay: marconi_skip,
+            // ATLAS_QWEN4EXP_PREFILL_ROWINV keeps the chunked scan: a restore
+            // sits on its 64-token grid, so the replay is the cold pass's.
+            gdn_exact_replay: marconi_skip && !crate::layers::ops::qwen4exp_rowinv::on(),
             // Hash-MoE: this chunk's token IDs (uploaded in prefill_b_embed_chunk
             // to the stable buffer, in chunk order matching the MoE loop).
-            token_ids: Some(self.buffers.token_ids()),
-            host_token_ids: None,
+            token_ids: Some(self.buffers.token_ids().offset(skip * 4)),
+            host_token_ids: host_ids.as_deref(),
             // #30: request slot pairs (None unless routing to a non-active slot).
             routed_lora_layers: self.routed_slot_layers(seq.adapter_slot),
             midchunk_capture,
@@ -151,7 +168,23 @@ impl TransformerModel {
         // instead of the prefill path. Decode uses GEMV kernels optimized for M=1
         // and the decode MoE path, which is ~7x faster per layer than the prefill
         // GEMM path for a single token (0.7ms/layer vs 5ms/layer).
-        let use_decode_path = proc_count == 1 && effective_seq_len_start > 0;
+        // ATLAS_QWEN4EXP_PREFILL_ROWINV: one row is a prefill pass like any other.
+        let rowinv = crate::layers::ops::qwen4exp_rowinv::on();
+        let use_decode_path = proc_count == 1 && effective_seq_len_start > 0 && !rowinv;
+        let _rowinv = (!use_decode_path)
+            .then(|| {
+                crate::layers::ops::qwen4exp_rowinv::check_pass_start(effective_seq_len_start);
+                crate::layers::ops::qwen4exp_rowinv::enter(
+                    self.gpu.as_ref(),
+                    self.buffers.sizes().hc_lowrank_scratch,
+                    self.config.hc_mult * self.config.hidden_size,
+                    self.config.hc_lowrank,
+                    host_ids
+                        .as_deref()
+                        .is_some_and(|ids| !self.tokens_have_vision_pad(&ids[..proc_count])),
+                )
+            })
+            .flatten();
         // Marconi warm hit: this pass replays SSM state over [snap_tok,
         // matched) — positions whose K/V already live in shared prefix-cache
         // blocks. Pass the per-chunk count of those replay tokens as the
@@ -160,13 +193,13 @@ impl TransformerModel {
         // blocks and ratchet across turns). `seq.cached_prefix_tokens` is
         // the radix-tree match point; tokens at or past it are new and are
         // written normally.
-        let layer_kv_write_start = if marconi_skip {
-            seq.cached_prefix_tokens
-                .saturating_sub(effective_seq_len_start)
-                .min(proc_count)
-        } else {
-            kv_write_start
-        };
+        let layer_kv_write_start = super::pc_policy::replay_floor(
+            marconi_skip,
+            seq.cached_prefix_tokens,
+            kv_write_start,
+            effective_seq_len_start,
+            proc_count,
+        );
         let prefill_t0 = if profile_now {
             self.gpu.synchronize(stream)?;
             Some(std::time::Instant::now())
@@ -199,26 +232,41 @@ impl TransformerModel {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
+        // ATLAS_LAYER_H_PREFILL: per-layer hidden sums for the last row of the
+        // chunk and over all rows, after each layer, eager path only.
+        let probe_hp = std::env::var("ATLAS_LAYER_H_PREFILL").as_deref() == Ok("1");
         let t_loop = host_timing.then(std::time::Instant::now);
         let mut t_in_prefill = std::time::Duration::ZERO;
         let mut t_dflash = std::time::Duration::ZERO;
         // Sequence-parallel chunk: each rank runs the row-local work over half
         // the rows (`layers::glm_sp`); the last layer leaves this rank's rows
         // of the contracted `hidden`, gathered below.
-        let sp = self.glm_prefill_sp_rows(
-            proc_count,
-            passengers.is_some() || use_decode_path || midcap.is_some(),
-            &ctx,
-        );
-        let sp_scope = sp.map(crate::layers::glm_sp::enter);
+        let sp_excluded =
+            passengers.is_some() || use_decode_path || midcap.is_some_and(|p| !p.ckpt);
+        let mut sp = self.glm_prefill_sp_rows(proc_count, sp_excluded, &ctx);
+        let mut sp_scope = sp.map(crate::layers::glm_sp::enter);
+        // qwen4_exp (`ATLAS_QWEN4EXP_PREFILL_SP`): the split starts at
+        // `first_layer`, after PLE (`model::qwen4exp_prefill_sp`).
+        let qsp = sp
+            .is_none()
+            .then(|| self.qwen4exp_prefill_sp_plan(proc_count, sp_excluded, &ctx))
+            .flatten();
         // ATLAS_GLM_DET_TRACE: the embeddings, each layer's highway rows, the result.
         let det = crate::det_trace::on_stream(self.gpu.as_ref(), stream);
         det.tap("emb", hidden, (0, proc_count), h * 2);
-        let det_out = sp.map_or((0, proc_count), |sp| (sp.row0, sp.rows));
         let hc_elem = crate::layers::ops::hc_elem_bytes(&self.config.model_type);
         let hc_row = self.config.hc_mult * h * hc_elem;
         for (i, layer) in self.layers.iter().enumerate() {
             crate::det_trace::set_layer(i);
+            if let Some(p) = qsp.filter(|p| p.active && i == p.first_layer) {
+                self.qwen4exp_sp_compact(p.sp, stream)?;
+                sp_scope = Some(crate::layers::glm_sp::enter(p.sp));
+                sp = Some(p.sp);
+            }
+            let _no_defer = qsp
+                .filter(|p| p.active && i + 1 == p.first_layer)
+                .map(|_| crate::layers::ops::qwen4exp_prefill_seam::NoDefer::new());
+            let det_out = sp.map_or((0, proc_count), |sp| (sp.row0, sp.rows));
             let t_pf = host_timing.then(std::time::Instant::now);
             let lt0 = if profile_now {
                 self.gpu.synchronize(stream)?;
@@ -278,6 +326,10 @@ impl TransformerModel {
                 t_in_prefill += t.elapsed();
             }
             det.tap_floats("out", ctx.buffers.hc_streams(), det_out, hc_row, hc_elem);
+            if let Some(p) = qsp.filter(|p| p.check) {
+                let split = sp.is_some();
+                self.qwen4exp_sp_check(p, effective_seq_len_start, Some(i), split, stream);
+            }
             let t_df = host_timing.then(std::time::Instant::now);
             // DFlash chunked-prefill capture. `effective_seq_len_start` (==
             // proc_start) is the ABSOLUTE position of this chunk's first
@@ -308,6 +360,26 @@ impl TransformerModel {
             }
             if let Some(t) = t_df {
                 t_dflash += t.elapsed();
+            }
+            if probe_hp {
+                self.gpu.synchronize(stream).ok();
+                let hs = self.config.hidden_size;
+                let mut hb = vec![0u8; proc_count * hs * 2];
+                if self.gpu.copy_d2h(hidden, &mut hb).is_ok() {
+                    let mut all = 0f64;
+                    let mut last = 0f64;
+                    for (e, c) in hb.chunks_exact(2).enumerate() {
+                        let v =
+                            f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16) as f64;
+                        if v.is_finite() {
+                            all += v.abs();
+                            if e / hs == proc_count - 1 {
+                                last += v.abs();
+                            }
+                        }
+                    }
+                    tracing::warn!("ATLAS_LAYER_HP L{i} last_sabs={last:.6} all_sabs={all:.6}");
+                }
             }
             if let Some(lt0) = lt0 {
                 self.gpu.synchronize(stream)?;
@@ -419,81 +491,30 @@ impl TransformerModel {
         drop(sp_scope);
         if let Some(sp) = sp {
             sp.all_gather(hidden, self.config.hidden_size, &ctx, stream)?;
+            // qwen4_exp: both ranks' highway row 0 as unsplit (the drafter
+            // reads it).
+            if qsp.is_some() {
+                let streams = ctx.buffers.hc_streams();
+                crate::layers::glm_sp_uneven::share_row0(sp, streams, hc_row, &ctx, stream)?;
+            }
+        }
+        if let Some(p) = qsp.filter(|p| p.check) {
+            self.qwen4exp_sp_check(p, effective_seq_len_start, None, false, stream);
         }
         crate::det_trace::set_layer(self.layers.len());
         det.tap("final", hidden, (0, proc_count), h * 2);
-        if let Some(t) = t_loop {
-            let wall = t.elapsed();
-            let ffn_us = crate::layers::qwen3_attention::take_ffn_host_us();
-            let ph = crate::layers::qwen3_attention::take_attn_phase_us();
-            // loop_wall is the host's own elapsed time across the whole layer
-            // dispatch. `in_prefill` is time inside layer.prefill() itself,
-            // `dflash` is the per-layer DFlash capture (expected ~0 for models
-            // with DFlash disabled), and the remainder is other per-layer
-            // bookkeeping. Compare loop_wall against nsys GPU-busy time: the
-            // difference is host work not overlapped with the device.
-            tracing::info!(
-                "PREFILL HOST TIMING layers={} tokens={}: loop_wall={:.1}ms in_prefill={:.1}ms ffn={:.1}ms attn_rest={:.1}ms dflash={:.1}ms | qkv={:.1}ms mid={:.1}ms attn_kernel={:.1}ms",
-                self.layers.len(),
-                proc_count,
-                wall.as_secs_f64() * 1e3,
-                t_in_prefill.as_secs_f64() * 1e3,
-                ffn_us as f64 / 1e3,
-                (t_in_prefill.as_micros() as f64 - ffn_us as f64) / 1e3,
-                t_dflash.as_secs_f64() * 1e3,
-                ph[0] as f64 / 1e3,
-                ph[1] as f64 / 1e3,
-                ph[2] as f64 / 1e3,
-            );
-        }
-
-        // ATLAS_MTP_DRAFTER_PREFILL: capture this chunk's final-layer hidden
-        // rows for the whole-prompt drafter prefill. No-op when disabled.
-        self.try_mtp_prefill_capture(seq, effective_seq_len_start, proc_count, stream)?;
-        if let Some(t0) = prefill_t0 {
-            self.gpu.synchronize(stream)?;
-            let total_us = t0.elapsed().as_micros();
-            let mut indexed: Vec<(usize, u128)> = layer_times.iter().copied().enumerate().collect();
-            indexed.sort_by_key(|x| std::cmp::Reverse(x.1));
-            let top5: Vec<String> = indexed
-                .iter()
-                .take(5)
-                .map(|(i, us)| format!("L{}={:.2}ms", i, *us as f64 / 1000.0))
-                .collect();
-            let path_label = if use_decode_path { "decode" } else { "prefill" };
-            // Aggregate the same per-layer samples by layer type so the profile
-            // attributes cost to mamba / moe / attention instead of bare indices.
-            let mut by_type: std::collections::BTreeMap<String, (u128, usize)> =
-                std::collections::BTreeMap::new();
-            for (i, us) in layer_times.iter().copied().enumerate() {
-                let e = by_type
-                    .entry(format!("{:?}", self.config.layer_type(i)))
-                    .or_insert((0, 0));
-                e.0 += us;
-                e.1 += 1;
-            }
-            let per_type: Vec<String> = by_type
-                .iter()
-                .map(|(k, (us, n))| {
-                    format!(
-                        "{}x{}={:.0}ms(avg {:.1})",
-                        n,
-                        k,
-                        *us as f64 / 1000.0,
-                        *us as f64 / 1000.0 / *n as f64
-                    )
-                })
-                .collect();
-            tracing::info!(
-                "Prefill chunk {} tok (proc {}, {}): {:.1}ms total, by_type: {}, top5: {}",
-                chunk_len,
-                proc_count,
-                path_label,
-                total_us as f64 / 1000.0,
-                per_type.join(", "),
-                top5.join(", "),
-            );
-        }
-        Ok(())
+        self.prefill_b_forward_layers_profile_tail(
+            seq,
+            effective_seq_len_start,
+            proc_count,
+            chunk_len,
+            use_decode_path,
+            t_loop,
+            t_in_prefill,
+            t_dflash,
+            &layer_times,
+            prefill_t0,
+            stream,
+        )
     }
 }

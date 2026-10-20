@@ -251,6 +251,45 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
         ));
     }
 
+    // ── Batch width must be a padding rung above 32. ──
+    // A decode batch of n rows runs padded to the next rung (…32, 48, 64, 96,
+    // 128; `spark_runtime::buffers::DECODE_BATCH_RUNGS`), but the SSM state
+    // pool, the MTP pools and other per-row buffers are sized to
+    // `--max-batch-size` itself. At a non-rung width the padding rows index
+    // past them: GB10, Qwen3.6-35B, `--max-batch-size 36` → CUDA 700 on the
+    // first batch-48 step for n=35 (reiner 691, 2026-10-04). Refuse instead.
+    if args.max_batch_size > 32
+        && !spark_runtime::buffers::DECODE_BATCH_RUNGS.contains(&args.max_batch_size)
+    {
+        let up = spark_runtime::buffers::padded_batch_rung(args.max_batch_size);
+        v.push(Violation::new(
+            format!(
+                "--max-batch-size {} is not a decode padding rung.",
+                args.max_batch_size
+            ),
+            "above 32 a decode batch runs padded to the next rung (48, 64, 96, 128), and \
+             per-row buffers sized to the requested width are overrun by the padding rows.",
+            format!("use --max-batch-size 32 or {up} (any value up to 32 is fine)."),
+        ));
+    }
+
+    // ── Reference mode locks thinking to the client's request. ──
+    if args.reference_mode && args.disable_thinking {
+        v.push(Violation::new(
+            "--reference-mode is set together with --disable-thinking.",
+            "reference mode serves the client's thinking flags unchanged; \
+             --disable-thinking forces reasoning off for every request.",
+            "drop --disable-thinking (the client decides thinking in reference mode).",
+        ));
+    }
+    if args.reference_mode && args.max_thinking_budget.is_some() {
+        v.push(Violation::new(
+            "--reference-mode is set together with --max-thinking-budget.",
+            "reference mode leaves the client's max_tokens as the only cap on reasoning.",
+            "drop --max-thinking-budget.",
+        ));
+    }
+
     // ── Distributed topology sanity. ──
     if args.rank >= args.world_size {
         v.push(Violation::new(

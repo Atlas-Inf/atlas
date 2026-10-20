@@ -51,7 +51,6 @@ fn exercise_emit(decode: bool, tools: bool, boundary: Option<u32>, suppress: boo
             Instant::now(),
             Some(END),
             Some(START),
-            None,
             Some(OPEN),
             None,
             false,
@@ -62,9 +61,10 @@ fn exercise_emit(decode: bool, tools: bool, boundary: Option<u32>, suppress: boo
     }
     let a = &rows[0];
     // Actual ordinary sampling masks the native opener for generic/no-tools
-    // requests. Its remaining zero logits tie at the final vocabulary ID.
-    // MTP emission receives an already-issued token and does not resample it.
-    let emitted = if decode && !expected { 2047 } else { OPEN };
+    // requests. Its remaining zero logits tie; the lowest ID wins (the
+    // engine-wide greedy tie rule). MTP emission receives an already-issued
+    // token and does not resample it.
+    let emitted = if decode && !expected { 0 } else { OPEN };
     assert_eq!(
         a.output_tokens,
         [10, emitted],

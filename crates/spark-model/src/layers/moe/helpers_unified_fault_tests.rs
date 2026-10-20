@@ -43,8 +43,20 @@ fn isolated_shared_down_phases_preserve_native_routed_gate_up_and_no_ready() {
                 layer
                     .transpose_unified_shared_gate_up(&gpu, &config)
                     .unwrap();
+                if !keep && !keep_shared {
+                    layer
+                        .release_unified_shared_gate_up(&gpu, &config, &mut Vec::new())
+                        .unwrap();
+                }
                 layer
-                    .transpose_unified_down_owned(&gpu, &config, gs, keep, keep_shared, None)
+                    .transpose_unified_down_phase(
+                        &gpu,
+                        &config,
+                        gs,
+                        keep,
+                        keep_shared,
+                        &mut Vec::new(),
+                    )
                     .unwrap();
                 assert_eq!(
                     [table_ptrs(&layer.gate_ptrs), table_ptrs(&layer.up_ptrs)],
@@ -100,12 +112,38 @@ fn isolated_shared_down_phases_preserve_native_routed_gate_up_and_no_ready() {
 }
 
 #[test]
+fn isolated_shared_release_preserves_null_and_zero_inter_conditions() {
+    for shared in [false, true] {
+        for inter in [0, 32] {
+            let gpu = RecordingGpu::new(false);
+            let (mut layer, config, originals) = fixture(&gpu, 16, true, shared, inter);
+            layer
+                .release_unified_shared_gate_up(&gpu, &config, &mut Vec::new())
+                .unwrap();
+            let expected: Vec<_> = if shared && inter > 0 {
+                [originals[4].gate_proj, originals[4].up_proj]
+                    .into_iter()
+                    .flat_map(|w| [Event::Free(w.weight), Event::Free(w.weight_scale)])
+                    .collect()
+            } else {
+                vec![]
+            };
+            assert_eq!(gpu.trace(), expected);
+            assert_eq!(
+                layer.weights.shared_expert.down_proj.weight,
+                originals[4].down_proj.weight
+            );
+        }
+    }
+}
+
+#[test]
 fn isolated_down_preserves_gate_up_without_shared_gate_presence() {
     let gpu = RecordingGpu::new(false);
     let (mut layer, config, originals) = fixture(&gpu, 16, true, true, 32);
     layer.weights.shared_expert.gate_proj = QuantizedWeight::null();
     layer
-        .transpose_unified_down_owned(&gpu, &config, 16, false, false, None)
+        .transpose_unified_down_phase(&gpu, &config, 16, false, false, &mut Vec::new())
         .unwrap();
     assert!(layer.shared_down_t.is_some());
     assert!(layer.weights.shared_expert.down_proj.is_null());
@@ -189,19 +227,17 @@ fn every_legacy_io_failure_stops_at_exact_prefix_and_preserves_nulling_order() {
                 {
                     for (p, w) in projections(current).iter().enumerate() {
                         let src = projections(&originals[e])[p];
-                        let paired_free_succeeded =
-                            good[..at - 1].contains(&Event::Free(src.weight_scale));
-                        assert_eq!(
-                            w.weight,
-                            if paired_free_succeeded {
-                                DevicePtr::NULL
-                            } else {
-                                src.weight
-                            }
-                        );
+                        let nulled = if e < 4 && mode < 2 {
+                            // Routed allocations are reused. Native fields are
+                            // invalidated after the shared phase succeeds.
+                            publication[if p < 2 { 4 } else { 5 }] + 1 < at
+                        } else {
+                            good[..at - 1].contains(&Event::Free(src.weight_scale))
+                        };
+                        assert_eq!(w.weight, if nulled { DevicePtr::NULL } else { src.weight });
                         assert_eq!(
                             w.weight_scale,
-                            if paired_free_succeeded {
+                            if nulled {
                                 DevicePtr::NULL
                             } else {
                                 src.weight_scale

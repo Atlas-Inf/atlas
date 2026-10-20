@@ -90,6 +90,8 @@ pub struct ChatTokenizer {
     /// OpenAI-variant template: gates historical `<think>` wrappers on enable_thinking.
     /// Falls back to jinja_env if no openai/ variant exists.
     openai_jinja_env: Option<minijinja::Environment<'static>>,
+    /// nemotron_h_omni (`<image>`, `<img>`, `</img>`) ids, or None for other models.
+    omni_image_tokens: Option<(u32, u32, u32)>,
 }
 
 /// One GLM-5 multimodal placeholder after CPU preprocessing. The chat

@@ -214,6 +214,7 @@ pub fn lower_responses_to_chat(
         stop: Vec::new(),
         response_format: None,
         min_tokens: 0,
+        ignore_eos: false,
         seed: None,
         logprobs: None,
         top_logprobs: None,

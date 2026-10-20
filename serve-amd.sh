@@ -7,6 +7,8 @@
 #   PORT=9000 MAX_SEQ_LEN=32768 ./serve-amd.sh
 #   DFLASH=1 DRAFT_MODEL=/path/to/dflash2 ./serve-amd.sh   # DFlash2 spec decode
 #   SSM_CKPT_INTERVAL=128 ./serve-amd.sh   # coarser SSM snapshots for long ctx
+#   THINKING=off ./serve-amd.sh            # engine thinking kill switch
+#   THINKING=on  ./serve-amd.sh            # thinking on by server default (per-request still wins)
 #
 # DFLASH=1 swaps MTP for the DFlash2 drafter: it appends --dflash
 # --draft-model (DRAFT_MODEL, default incoai/Qwen3.8-27B-DFlash2) and forces
@@ -155,6 +157,17 @@ SPEC_ARGS=()
 if [ "${NUM_DRAFTS:-3}" -gt 0 ]; then
   SPEC_ARGS=(--speculative --num-drafts "${NUM_DRAFTS:-3}")
 fi
+# THINKING=off pins the engine kill switch (--disable-thinking) for every
+# request; THINKING=on sets the SERVER default to thinking-enabled
+# (--default-chat-template-kwargs) while clients can still turn it off per
+# request. Unset/empty = unchanged.
+THINK_ARGS=()
+case "${THINKING:-}" in
+  off) THINK_ARGS=(--disable-thinking) ;;
+  on)  THINK_ARGS=(--default-chat-template-kwargs '{"enable_thinking":true}') ;;
+  "")  ;;
+  *)   echo "THINKING must be off|on, got '${THINKING}'" >&2; exit 2 ;;
+esac
 # DFlash and MTP --speculative are mutually exclusive on this recipe:
 # DFLASH=1 wins and forces the MTP args off.
 DFLASH_ARGS=()
@@ -193,7 +206,7 @@ exec "$BIN" serve "$MODEL" "${NAME_ARG[@]}" \
   --max-prefill-tokens "$MAX_PREFILL_TOKENS" \
   --gpu-memory-utilization "$GPU_UTIL" \
   --kv-cache-dtype bf16 --lm-head-dtype "${LM_HEAD:-nvfp4}" --max-batch-size "${MAX_BATCH:-1}" \
-  "${SPEC_ARGS[@]}" "${DFLASH_ARGS[@]}" \
+  "${SPEC_ARGS[@]}" "${DFLASH_ARGS[@]}" "${THINK_ARGS[@]}" \
   --ssm-cache-slots "$SSM_SLOTS" --ssm-checkpoint-interval "$SSM_CKPT_INTERVAL" \
   $ALLOW_FALLBACKS \
   "$@"

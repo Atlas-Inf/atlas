@@ -21,11 +21,9 @@ pub(super) fn record(
         num_accepted,
     );
     if !dflash_verify_raw_argmax {
-        a.mtp_acct.record_depth_verify(
-            drafts.len(),
-            num_accepted,
-            sched.levers.mtp_single_depth_adapt,
-        );
+        // Ceiling 0: DFlash widths are not the MTP dynamic depth's.
+        a.mtp_acct
+            .record_depth_verify(drafts.len(), num_accepted, 0, sched.levers.depth());
     }
 
     // Adaptive speculation (ATLAS_DFLASH_ADAPTIVE=1): feed the rolling

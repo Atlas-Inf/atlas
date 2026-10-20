@@ -234,6 +234,7 @@ impl From<MessagesRequest> for ir::ChatRequest {
             },
             max_tokens: req.max_tokens,
             min_tokens: 0,
+            ignore_eos: false,
             stop: req.stop_sequences,
             stream: req.stream,
             n: 1,
@@ -242,6 +243,7 @@ impl From<MessagesRequest> for ir::ChatRequest {
             reasoning_effort: None,
             // The Anthropic Messages surface has no chat_template_kwargs
             // channel; the MODEL.toml override / template default applies.
+            force_nonempty_content: false,
             preserve_thinking: None,
             repetition_detection: None,
             adapter: None,

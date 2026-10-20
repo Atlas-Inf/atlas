@@ -150,6 +150,7 @@ pub(super) fn actual_kda_rows() {
                             gdn_commit_qkv: spark_runtime::gpu::DevicePtr::NULL,
                             gdn_commit_gb: spark_runtime::gpu::DevicePtr::NULL,
                             gdn_commit_pending: false,
+                            gdn_fuse_n: DevicePtr::NULL,
                             h_is_f16: false,
                             h_state_checkpoint: None,
                             conv_state_checkpoint: None,

@@ -112,6 +112,22 @@ name = "glm_hc_seam_bench"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "qwen4exp_hc_prefill_check"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "lt_kchain_pin_check"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "qwen4exp_row_invariance"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "qwen4exp_rowinv_probe"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "glm_sparse_split_bench"
 required-features = ["cuda", "gpu-examples"]
 
@@ -129,6 +145,10 @@ required-features = ["cuda", "gpu-examples", "nccl"]
 
 [[example]]
 name = "glm_topk_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "gdn_fla_scratch_garbage"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]

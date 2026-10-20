@@ -48,7 +48,7 @@ use crate::gpu::{DevicePtr, GpuBackend, GraphHandle, HostPitched, KernelHandle};
 use super::host_staging::{d2h_trace_tick, h2d_enqueue, warn_pinned_transient_source};
 
 mod pdl;
-use pdl::PDL_KERNELS;
+use pdl::pdl_kernel;
 pub use pdl::{configure_pdl, pdl_enabled};
 
 impl GpuBackend for AtlasCudaBackend {
@@ -86,10 +86,28 @@ impl GpuBackend for AtlasCudaBackend {
         Ok(DevicePtr(dptr))
     }
 
+    fn register_slab(&self, base: DevicePtr, bytes: usize) {
+        self.slab_regions.lock().push((base.0, bytes as u64));
+    }
+
+    fn is_slab_interior(&self, ptr: DevicePtr) -> bool {
+        AtlasCudaBackend::is_slab_interior(self, ptr.0)
+    }
+
     fn free(&self, ptr: DevicePtr) -> Result<()> {
         if ptr.is_null() || super::display_carveout::free(ptr) {
             return Ok(());
         }
+        // Slab interior: the packing loader carved this pointer out of one
+        // shard-level cuMemAlloc, so there is nothing to free here. The slab
+        // base is in the ledger and is reclaimed by teardown/sweep.
+        if self.is_slab_interior(ptr.0) {
+            return Ok(());
+        }
+        // A real free: if this pointer is a slab base, its region must go —
+        // otherwise a later cuMemAlloc inside the stale extent would see its
+        // frees silently no-oped.
+        self.drop_slab_region(ptr.0);
         // Off the ledger BEFORE the free: an entry that survives a successful
         // free would be double-freed at teardown. On a real failure, restore
         // ownership to the backend ledger so `sweep_unreleased` is the final
@@ -193,7 +211,9 @@ impl GpuBackend for AtlasCudaBackend {
             // see `fault_probe`. This does not change control flow: the caller
             // still receives its error either way.
             super::fault_probe::note_failure("kernel launch", &e.to_string());
-            anyhow::anyhow!("Kernel launch failed: {e}")
+            // Name the kernel: under CUDA_LAUNCH_BLOCKING=1 this is the kernel
+            // that faulted, and grid/block alone do not identify it.
+            anyhow::anyhow!("Kernel launch failed ({}): {e}", kernel_name(raw_func.0))
         })
     }
 
@@ -262,7 +282,7 @@ impl GpuBackend for AtlasCudaBackend {
         match registry.raw_function_cached(&cache, module, func_name) {
             Ok(raw) => {
                 crate::kernel_audit::record(module, func_name, true, site);
-                if pdl_enabled() && PDL_KERNELS.contains(&func_name) {
+                if pdl_kernel(func_name) {
                     atlas_core::registry::mark_pdl(raw);
                 }
                 Ok(KernelHandle(raw.0 as u64))
@@ -498,3 +518,7 @@ impl GpuBackend for AtlasCudaBackend {
         self.free_host_pinned_cu(ptr, _bytes)
     }
 }
+
+#[path = "gpu_impl/kernel_name.rs"]
+mod kernel_name;
+use kernel_name::kernel_name;

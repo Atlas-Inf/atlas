@@ -393,6 +393,8 @@ impl Fixture {
         let comm = (tp > 1 || ep > 1).then(|| {
             Arc::new(Rank(rank, inner, record.clone())) as Arc<dyn spark_comm::CommBackend>
         });
+        // Two slots: `compact_sequence` claims its target slot before copying
+        // (it must be free), so the commit-order test needs one to move to.
         let ssm_pools = crate::model::ssm_pools::SsmPools::new(
             &cfg,
             slots,

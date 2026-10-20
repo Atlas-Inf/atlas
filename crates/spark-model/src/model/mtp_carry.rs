@@ -106,9 +106,14 @@ pub fn marconi_min_tokens() -> usize {
 /// pure function of its block-aligned token prefix, so restoring it is exact;
 /// the cost is replaying the few tokens from that boundary to the match point.
 /// Default off (engine behaviour unchanged).
+/// `ATLAS_QWEN4EXP_PREFILL_ROWINV` implies it: a decode-made state is not
+/// what a prefill of the same tokens computes.
 pub fn marconi_prefill_only() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ATLAS_MARCONI_PREFILL_ONLY").as_deref() == Ok("1"))
+    *ON.get_or_init(|| {
+        std::env::var("ATLAS_MARCONI_PREFILL_ONLY").as_deref() == Ok("1")
+            || crate::layers::ops::qwen4exp_rowinv::on()
+    })
 }
 
 /// Block-count between decode checkpoints (`ATLAS_DECODE_CKPT_BLOCKS`).

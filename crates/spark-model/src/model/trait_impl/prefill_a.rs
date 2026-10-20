@@ -414,6 +414,8 @@ impl TransformerModel {
             kv_write_start
         };
         let diag_prefill = self.profile && proc_count > 1; // Only with --profile
+        // ATLAS_LAYER_H_PREFILL: per-layer hidden sums, eager path only.
+        let probe_hp = std::env::var("ATLAS_LAYER_H_PREFILL").as_deref() == Ok("1");
         for (i, layer) in self.layers.iter().enumerate() {
             layer
                 .prefill(
@@ -442,6 +444,26 @@ impl TransformerModel {
                 proc_count,
                 stream,
             )?;
+            if probe_hp {
+                self.gpu.synchronize(stream).ok();
+                let hs = self.config.hidden_size;
+                let mut hb = vec![0u8; proc_count * hs * 2];
+                if self.gpu.copy_d2h(hidden, &mut hb).is_ok() {
+                    let mut all = 0f64;
+                    let mut last = 0f64;
+                    for (e, c) in hb.chunks_exact(2).enumerate() {
+                        let v =
+                            f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16) as f64;
+                        if v.is_finite() {
+                            all += v.abs();
+                            if e / hs == proc_count - 1 {
+                                last += v.abs();
+                            }
+                        }
+                    }
+                    tracing::warn!("ATLAS_LAYER_HP L{i} last_sabs={last:.6} all_sabs={all:.6}");
+                }
+            }
 
             // MLA diagnostic: dump per-layer hidden state norm (once per model).
             // Per-model latch (see `ModelStats::dumped`) rather than a static: an
@@ -505,8 +527,41 @@ impl TransformerModel {
         let normed = self.buffers.norm_output();
         self.final_norm_rows(last_hidden, normed, 1, stream)?;
 
+        if std::env::var("ATLAS_LAYER_H_PREFILL").as_deref() == Ok("1") {
+            self.gpu.synchronize(stream)?;
+            let mut hb = vec![0u8; h * 2];
+            if self.gpu.copy_d2h(normed, &mut hb).is_ok() {
+                let mut s_ = 0f64;
+                for c in hb.chunks_exact(2) {
+                    let v = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16) as f64;
+                    if v.is_finite() {
+                        s_ += v.abs();
+                    }
+                }
+                tracing::warn!("ATLAS_LAYER_HP FINAL last_sabs={s_:.6} all_sabs={s_:.6}");
+            }
+        }
+
         // ── 6. LM head on last token → logits ──
         self.lm_head(normed, stream)?;
+
+        if std::env::var("ATLAS_LAYER_H_PREFILL").as_deref() == Ok("1") {
+            self.gpu.synchronize(stream)?;
+            let v_sz = self.config.vocab_size;
+            let mut lb = vec![0u8; v_sz * 2];
+            if self.gpu.copy_d2h(self.decode_logits_ptr(), &mut lb).is_ok() {
+                let mut top: Vec<(u32, f32)> = Vec::with_capacity(5);
+                for (i, c) in lb.chunks_exact(2).enumerate() {
+                    let v = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
+                    if v.is_finite() && (top.len() < 5 || v > top[4].1) {
+                        top.push((i as u32, v));
+                        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                        top.truncate(5);
+                    }
+                }
+                tracing::warn!("ATLAS_LAYER_HP LOGITS top5={top:?}");
+            }
+        }
 
         // ── 7. Update sequence state ──
         seq.tokens.extend_from_slice(tokens);

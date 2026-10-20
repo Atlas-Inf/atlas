@@ -207,6 +207,10 @@ impl Qwen3SsmLayer {
         let ba_size = ctx.config.ssm_ba_size() as u32;
         let gates = ctx.buffers.ssm_gates();
         let beta_fp32 = gates.offset(nv * 4); // FP32, after gate[nv]
+        // ATLAS_QWEN4EXP_DECODE_FUSE (GDN group): steps 3-7 as one exact launch.
+        if self.gdn_decode_fused(normed, state, deinterleaved, gates, beta_fp32, ctx, stream)? {
+            return self.ssm_out_proj(ctx.buffers.ssm_qkvz(), ctx, stream, trace, debug);
+        }
         prof!("ba_gates", {
             ops::dense_gemv_ba_gates(
                 ctx.gpu,
@@ -429,91 +433,8 @@ impl Qwen3SsmLayer {
             Self::debug_bf16(ctx.gpu, "gated-norm-out", normed_out, 4);
         }
 
-        // ── 8. Output projection: [value_dim → hidden_size] ──
-        let out = ctx.buffers.moe_output();
-        if let Some(ref fp8) = self.out_proj_fp8w {
-            // `w8a16_gemv` consumes `[N/BS,K/BS] BF16` block scales —
-            // the canonical Qwen FP8 release format.
-            fp8.scale_format.expect(
-                crate::weight_map::WeightQuantFormat::Fp8BlockScaled,
-                "ssm_forward::out_proj_fp8w → w8a16_gemv",
-            );
-            ops::w8a16_gemv(
-                ctx.gpu,
-                self.w8a16_gemv_k,
-                normed_out,
-                fp8.weight,
-                fp8.row_scale,
-                out,
-                h,
-                value_dim as u32,
-                stream,
-            )?;
-        } else if let Some(ref dense_out) = self.out_proj_dense {
-            if ctx.levers.gdn_fp8_decode
-                && self.dense_gemv_fp8w_k.0 != 0
-                && let Some(ref fp8w) = self.out_proj_fp8w_rowwise
-                && fp8w.scale_format == crate::weight_map::WeightQuantFormat::Fp8PerRow
-            {
-                // Per-row-FP8 decode copy (ATLAS_GDN_FP8_DECODE): half the
-                // BF16 weight bytes for the serial-decode GEMV.
-                ops::dense_gemv_fp8w(
-                    ctx.gpu,
-                    self.dense_gemv_fp8w_k,
-                    normed_out,
-                    &crate::weight_map::Fp8DenseWeight {
-                        weight: fp8w.weight,
-                        row_scale: fp8w.row_scale,
-                    },
-                    out,
-                    h,
-                    value_dim as u32,
-                    stream,
-                )?;
-            } else {
-                ops::dense_gemv(
-                    ctx.gpu,
-                    self.dense_gemv_k,
-                    normed_out,
-                    dense_out,
-                    out,
-                    h,
-                    value_dim as u32,
-                    stream,
-                )?;
-            }
-        } else {
-            ops::w4a16_decode_gemv(
-                ctx.gpu,
-                self.w4a16_gemv_k,
-                self.w4a16_gemv_sw_k,
-                ctx.levers.gemv_sw,
-                normed_out,
-                &self.ssm.out_proj,
-                out,
-                h,
-                value_dim as u32,
-                stream,
-            )?;
-        }
-        if trace {
-            ctx.gpu.synchronize(stream).inspect_err(|_e| {
-                tracing::error!("CRASH at out_proj");
-            })?;
-        }
-        if debug {
-            ctx.gpu.synchronize(stream)?;
-            Self::debug_bf16(ctx.gpu, "out-proj", out, 4);
-        }
-
-        // GDN HeadParallel: `out` is this rank's PARTIAL row-parallel out_proj
-        // over its local value heads. Reduce across TP ranks to the complete
-        // SSM output before the caller's residual add. Single-token path
-        // (dense_gemv / w8a16_gemv / w4a16_gemv above → one position), so
-        // num_tokens = 1. No-op at tp=1. Covers single-token decode
-        // (trait_decode) and per-sequence multi-seq decode (trait_decode_multi_seq).
-        self.ssm_tp_all_reduce(out, 1, ctx, stream)?;
-
+        // ── 8. Output projection + TP all-reduce (`ssm_decode_tail.rs`) ──
+        let out = self.ssm_out_proj(normed_out, ctx, stream, trace, debug)?;
         Ok(out)
     }
 }

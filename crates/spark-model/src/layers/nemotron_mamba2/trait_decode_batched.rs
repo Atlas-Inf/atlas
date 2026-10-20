@@ -55,8 +55,14 @@ impl NemotronMamba2Layer {
         )?;
 
         let proj = ctx.buffers.ssm_qkvz();
-        let pd_fp8_ok = self.fp8_gemm_t_k.0 != 0;
-        self.prefill_in_proj(normed, proj, n, h, false, false, pd_fp8_ok, ctx, stream)?;
+        // Exact verify: decode-identical batchm twins; otherwise the (faster,
+        // non-exact) prefill GEMMs the fused path tolerates.
+        if ctx.levers.mamba_verify_exact {
+            self.verify_exact_in_proj(normed, proj, n, ctx, stream)?;
+        } else {
+            let pd_fp8_ok = self.fp8_gemm_t_k.0 != 0;
+            self.prefill_in_proj(normed, proj, n, h, false, false, pd_fp8_ok, ctx, stream)?;
+        }
 
         let xbc_tmp = ctx.buffers.ssm_deinterleaved();
         let packed = ctx.buffers.qkv_output();
@@ -104,12 +110,14 @@ impl NemotronMamba2Layer {
         };
 
         let use_exact_persistent = self.mamba2_ssm_verify_exact_k.0 != 0
-            && ctx.levers.lightning_mamba_exact_recurrence
-            && std::env::var("ATLAS_LIGHTNING_MAMBA_EXACT_PERSISTENT").as_deref() == Ok("1");
+            && (ctx.levers.mamba_verify_exact
+                || (ctx.levers.lightning_mamba_exact_recurrence
+                    && std::env::var("ATLAS_LIGHTNING_MAMBA_EXACT_PERSISTENT").as_deref()
+                        == Ok("1")));
         let use_fused = use_fused_mamba_verify(
             self.mamba2_ssm_verify_k.0 != 0,
             ctx.levers.lightning_mamba_exact_recurrence,
-            std::env::var("ATLAS_NO_MAMBA_VERIFY_FUSED").is_err(),
+            ctx.levers.mamba_verify_fused,
         );
         if std::env::var("ATLAS_DFLASH_LAYER_TIMING").ok().as_deref() == Some("1") {
             tracing::info!(
@@ -196,7 +204,12 @@ impl NemotronMamba2Layer {
         )?;
 
         let out = ctx.buffers.qkv_output();
-        self.prefill_out_proj(gated_out, out, n, h, false, false, pd_fp8_ok, ctx, stream)?;
+        if ctx.levers.mamba_verify_exact {
+            self.verify_exact_out_proj(gated_out, out, n, ctx, stream)?;
+        } else {
+            let pd_fp8_ok = self.fp8_gemm_t_k.0 != 0;
+            self.prefill_out_proj(gated_out, out, n, h, false, false, pd_fp8_ok, ctx, stream)?;
+        }
         ops::residual_add(
             ctx.gpu,
             self.residual_add_k,
@@ -206,6 +219,137 @@ impl NemotronMamba2Layer {
             stream,
         )?;
         Ok(())
+    }
+
+    /// Every kernel the exact batched verify needs resolved: the persistent
+    /// exact scan, plus a bit-identical batch-M twin for whatever dtype the
+    /// in/out projections are stored in (FP8 on omni, BF16 or NVFP4 on
+    /// variants — an unresolved twin or an NVFP4-only layer falls back to
+    /// the per-row decode loop, which is already exact).
+    pub(super) fn mamba_verify_exact_ready(&self) -> bool {
+        if self.mamba2_ssm_verify_exact_k.0 == 0 {
+            return false;
+        }
+        let in_ok = if self.in_proj_bf16.is_some() {
+            self.dense_gemv_bf16_batchm_k.0 != 0
+        } else if self.in_proj_fp8.is_some() {
+            self.w8a16_gemv_batch16_k.0 != 0
+        } else {
+            self.w4a16_gemv_batch16_k.0 != 0
+        };
+        let out_ok = if self.out_proj_bf16.is_some() {
+            self.dense_gemv_bf16_batchm_k.0 != 0
+        } else if self.out_proj_fp8.is_some() {
+            self.w8a16_gemv_batch16_k.0 != 0
+        } else {
+            self.w4a16_gemv_batch16_k.0 != 0
+        };
+        in_ok && out_ok
+    }
+
+    /// in_proj for the exact verify: `normed[M,H]` -> `proj[M,in_proj_size]`
+    /// through the bit-identical batch-M twin of whichever GEMV decode uses.
+    fn verify_exact_in_proj(
+        &self,
+        normed: DevicePtr,
+        proj: DevicePtr,
+        m: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let h = ctx.config.hidden_size as u32;
+        if let Some(ref w) = self.in_proj_bf16 {
+            ops::dense_gemv_batchm(
+                ctx.gpu,
+                self.dense_gemv_bf16_batchm_k,
+                normed,
+                w,
+                proj,
+                m,
+                self.in_proj_size as u32,
+                h,
+                self.in_proj_size as u32,
+                stream,
+            )
+        } else if let Some(ref fp8w) = self.in_proj_fp8 {
+            ops::w8a16_gemv_batch4_div(
+                ctx.gpu,
+                self.w8a16_gemv_batch16_k,
+                normed,
+                fp8w.weight,
+                fp8w.row_scale,
+                proj,
+                m,
+                self.in_proj_size as u32,
+                h,
+                4,
+                stream,
+            )
+        } else {
+            ops::w4a16_gemv_batchm(
+                ctx.gpu,
+                self.w4a16_gemv_batch16_k,
+                normed,
+                &self.ssm.in_proj,
+                proj,
+                m,
+                self.in_proj_size as u32,
+                h,
+                stream,
+            )
+        }
+    }
+
+    /// out_proj for the exact verify: `gated[M,d_inner]` -> `out[M,H]`.
+    fn verify_exact_out_proj(
+        &self,
+        gated: DevicePtr,
+        out: DevicePtr,
+        m: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let h = ctx.config.hidden_size as u32;
+        if let Some(ref w) = self.out_proj_bf16 {
+            ops::dense_gemv_batchm(
+                ctx.gpu,
+                self.dense_gemv_bf16_batchm_k,
+                gated,
+                w,
+                out,
+                m,
+                h,
+                self.d_inner as u32,
+                h,
+                stream,
+            )
+        } else if let Some(ref fp8w) = self.out_proj_fp8 {
+            ops::w8a16_gemv_batch4_div(
+                ctx.gpu,
+                self.w8a16_gemv_batch16_k,
+                gated,
+                fp8w.weight,
+                fp8w.row_scale,
+                out,
+                m,
+                h,
+                self.d_inner as u32,
+                4,
+                stream,
+            )
+        } else {
+            ops::w4a16_gemv_batchm(
+                ctx.gpu,
+                self.w4a16_gemv_batch16_k,
+                gated,
+                &self.ssm.out_proj,
+                out,
+                m,
+                h,
+                self.d_inner as u32,
+                stream,
+            )
+        }
     }
 }
 

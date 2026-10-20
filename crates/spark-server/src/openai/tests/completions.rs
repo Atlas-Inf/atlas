@@ -17,6 +17,16 @@ fn completion_request_deserializes_timeout_override() {
 }
 
 #[test]
+fn completion_request_deserializes_ignore_eos() {
+    let parse = |body: serde_json::Value| -> CompletionRequest {
+        serde_json::from_value(body).expect("valid completion request")
+    };
+    let set = parse(serde_json::json!({"model": "m", "prompt": "hi", "ignore_eos": true}));
+    assert!(set.ignore_eos);
+    assert!(!parse(serde_json::json!({"model": "m", "prompt": "hi"})).ignore_eos);
+}
+
+#[test]
 fn completion_request_echo_logprobs_n_deser() {
     let req: CompletionRequest = serde_json::from_value(serde_json::json!({
         "model": "test",

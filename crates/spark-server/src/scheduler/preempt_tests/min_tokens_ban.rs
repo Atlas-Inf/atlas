@@ -45,14 +45,33 @@ fn request(min_tokens: usize) -> InferenceRequest {
     req
 }
 
+/// `request` with vLLM `ignore_eos`. With no end token to suppress, a greedy
+/// first token is a device argmax the stub lacks: sample on the host instead.
+fn ignore_eos_request(min_tokens: usize) -> InferenceRequest {
+    let mut req = request(min_tokens);
+    if let InferenceRequest::Blocking {
+        ignore_eos,
+        temperature,
+        ..
+    } = &mut req
+    {
+        *ignore_eos = true;
+        *temperature = 0.5;
+    }
+    req
+}
+
 /// Start the test prompt with a chunk budget of `budget` tokens.
 fn start(min_tokens: usize, budget: usize) -> StartPrefillResult {
-    let req = request(min_tokens);
+    start_request(request(min_tokens), budget)
+}
+
+fn start_request(req: InferenceRequest, budget: usize) -> StartPrefillResult {
     let model = PreemptStubModel::default();
     let sched = SchedCtx::for_test();
     start_chunked_prefill(
         &sched, None, None, None, None, &model, req, EOS, budget, 0, 0, &mut None, 0, false, None,
-        None,
+        None, None,
     )
     .expect("prefill starts")
 }
@@ -155,4 +174,36 @@ fn a_swap_resume_keeps_the_min_tokens_ban() {
     // The restore allocates a fresh sequence: the ban travels with the image.
     let resumed = resume_swapped_seq(None, None, &model, swapped, &mut spill).unwrap();
     assert_eq!(resumed.seq.eos_ban, ban);
+}
+
+#[test]
+fn an_ignore_eos_request_decodes_without_end_tokens_or_ban() {
+    // Both ways into decode: no end token stops it, and with nothing to stop
+    // on there is nothing to ban below min_tokens either.
+    let StartPrefillResult::Active(chunked) = start_request(ignore_eos_request(MIN_TOKENS), 64)
+    else {
+        panic!("a 3-token prompt within the chunk budget decodes at once");
+    };
+    let model = PreemptStubModel::default();
+    let sched = SchedCtx::for_test();
+    let single = prefill_request(
+        &sched,
+        None,
+        None,
+        None,
+        None,
+        &model,
+        ignore_eos_request(MIN_TOKENS),
+        EOS,
+        &mut None,
+        0,
+        None,
+    )
+    .expect("prefill runs")
+    .expect("a 3-token prompt decodes");
+    for a in [chunked, single] {
+        assert!(a.eos_tokens.is_empty());
+        assert_eq!(a.min_tokens, MIN_TOKENS);
+        assert_eq!(a.seq.eos_ban, EosBan::default());
+    }
 }

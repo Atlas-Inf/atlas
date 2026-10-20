@@ -23,6 +23,12 @@ pub const DENSE_GEMV_BATCHM_MAX_M: u32 = 8;
 pub const DENSE_GEMV_BATCHM_OUTPUTS_PER_BLOCK: u32 = 4;
 pub const DENSE_GEMV_BATCHM_THREADS: u32 = 256;
 
+/// The real `version()` reads the linked libcublasLt; under the stub there
+/// is none, and 0 says so.
+pub fn version() -> usize {
+    0
+}
+
 pub fn install_bf16_fallback(_f: Box<Bf16GemmFallback>) -> bool {
     unreachable!("cublaslt::install_bf16_fallback is cuda-only (not built for metal)")
 }

@@ -70,6 +70,13 @@ pub(crate) fn verify_layer_trace() -> bool {
     std::env::var("ATLAS_LIGHTNING_VERIFY_LAYER_TRACE").as_deref() == Ok("1")
 }
 
+/// `ATLAS_PROFILE_FIRST` (PRESENCE): profile the first prefill, which also
+/// takes the MoE prefill off the shared-reduce overlap (`ctx.profile`), so
+/// its collectives with it.
+pub(crate) fn profile_first() -> bool {
+    std::env::var_os("ATLAS_PROFILE_FIRST").is_some()
+}
+
 /// `ATLAS_MS_PROFILE=1`: multi-sequence decode.
 pub(crate) fn ms_profile() -> bool {
     std::env::var("ATLAS_MS_PROFILE").ok().as_deref() == Some("1")

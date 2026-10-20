@@ -779,6 +779,7 @@ impl Qwen3AttentionLayer {
                 bs as u32,
                 inv_sqrt_d,
                 ctx.buffers.qsa_select_scratch(),
+                Some(ctx),
                 ctx.gpu,
                 stream,
             )?;

@@ -13,7 +13,9 @@ fn unpermute_vec_eligible(flag: bool, hidden_size: usize, top_k: usize) -> bool 
 }
 
 /// The EP unpermute-reduce kernel: `moe_unpermute_reduce_indexed_ep`, or its
-/// `_vec8` twin (same launch, same bytes) where eligible and shipped.
+/// `_vec8` twin (same launch, same bytes) where eligible and shipped. A
+/// target that ships neither (only glm-5.3-flash does) gets a null handle,
+/// which `use_sparse_ep_reduce` reads as "take the dense EP reduce".
 pub(super) fn unpermute_ep_kernel(
     gpu: &dyn GpuBackend,
     config: &atlas_core::config::ModelConfig,
@@ -27,11 +29,13 @@ pub(super) fn unpermute_ep_kernel(
         .num_experts_per_toks
         .iter()
         .fold(config.num_experts_per_tok, |a, &b| a.max(b));
-    if unpermute_vec_eligible(
-        std::env::var("ATLAS_GLM_MOE_UNPERMUTE_VEC").as_deref() == Ok("1"),
-        config.hidden_size,
-        max_top_k,
-    ) {
+    if config.model_type == "glm5_next"
+        && unpermute_vec_eligible(
+            std::env::var("ATLAS_GLM_MOE_UNPERMUTE_VEC").as_deref() == Ok("1"),
+            config.hidden_size,
+            max_top_k,
+        )
+    {
         let vec = super::super::try_kernel(gpu, "moe", "moe_unpermute_reduce_indexed_ep_vec8");
         if gpu.op_cache().once("moe:unpermute_vec8") {
             if vec.0 != 0 {
@@ -46,7 +50,12 @@ pub(super) fn unpermute_ep_kernel(
             return Ok(vec);
         }
     }
-    gpu.kernel("moe", "moe_unpermute_reduce_indexed_ep")
+    Ok(super::super::try_kernel_gated(
+        config.model_type == "glm5_next",
+        gpu,
+        "moe",
+        "moe_unpermute_reduce_indexed_ep",
+    ))
 }
 
 impl MoeLayer {
@@ -73,7 +82,10 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        if !self.ep_prefill_zeroes(ctx) {
+        let force_zero = std::env::var("ATLAS_MOE_PREFILL_ZERO").as_deref() == Ok("1");
+        if !self.ep_prefill_zeroes(ctx)
+            || (self.q38_routed_serves(hidden, inter, ctx) && !force_zero)
+        {
             return Ok(());
         }
         let rows = total_expanded as usize;
@@ -108,6 +120,18 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
+        if self.try_q38_unpermute(
+            expert_output,
+            output,
+            token_to_perm,
+            topk_ids,
+            topk_weights,
+            [hidden, tokens, topk],
+            ctx,
+            stream,
+        )? {
+            return Ok(false);
+        }
         if self.use_sparse_ep_reduce(ctx) {
             let (local_start, local_end) = ctx.config.local_expert_range();
             let (local_start, local_end) = (local_start as u32, local_end as u32);

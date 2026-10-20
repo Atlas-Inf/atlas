@@ -53,6 +53,10 @@ pub fn bf16_gemm(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    // ATLAS_QWEN4EXP_PREFILL_ROWINV: an in-order k-chain inside the pass.
+    if super::qwen4exp_rowinv::try_bf16_gemm(act, weight, out, [m, n, k], stream)? {
+        return Ok(());
+    }
     if enabled() && m >= MIN_ROWS {
         let cfg = config(n, k);
         let launched = run_blocks(

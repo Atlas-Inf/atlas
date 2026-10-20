@@ -19,7 +19,7 @@ use super::preempt::{
 use super::test_support::test_seq;
 use super::types::{ActiveSeq, ResponseSink};
 use anyhow::Result;
-use spark_model::model::kv_admission::KvAdmissionRefused;
+use spark_model::model::kv_admission::{KvAdmissionRefused, after_partial_step};
 use spark_model::traits::{Model, SequenceState};
 use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_spill::KvSpillManager;
@@ -27,8 +27,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod chunk_retry;
+mod kv_refusal;
 mod min_tokens_ban;
 mod resume;
+mod shared_prefix_admit;
 mod victim_policy;
 
 /// Scripted stub: `decode_batch` fails with the KV-exhausted error for the
@@ -56,6 +58,12 @@ struct PreemptStubModel {
     refusal_is_final: bool,
     /// Every EP command word the head sends.
     wire: Mutex<Vec<u32>>,
+    /// `decode_batch` fails with an agreed, retryable refusal raised after
+    /// this many sequences of a per-sequence loop already ran.
+    partial_refusal_after: Option<usize>,
+    /// Shared-prefix admission: `pc_inflight_min_tokens`, and a multi-rank
+    /// world with 16-token blocks when set.
+    inflight_min: Option<usize>,
 }
 
 impl PreemptStubModel {
@@ -104,7 +112,14 @@ impl Model for PreemptStubModel {
         s.tokens.extend_from_slice(&t[cs..stop]);
         (s.seq_len, s.prompt_len) = (stop, t.len());
         let (by_peer, retryable) = (true, !self.refusal_is_final);
-        anyhow::ensure!(!refuse, KvAdmissionRefused { by_peer, retryable });
+        anyhow::ensure!(
+            !refuse,
+            KvAdmissionRefused {
+                by_peer,
+                retryable,
+                decode: false
+            }
+        );
         Ok(DevicePtr::NULL)
     }
     fn ep_broadcast_cmd(&self, word: u32) -> Result<()> {
@@ -117,12 +132,20 @@ impl Model for PreemptStubModel {
     fn decode_batch(
         &self,
         _t: &[u32],
-        _s: &mut [&mut SequenceState],
+        s: &mut [&mut SequenceState],
         _st: u64,
     ) -> Result<DevicePtr> {
         self.decode_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(msg) = self.hard_error {
             anyhow::bail!("{msg}");
+        }
+        if let Some(advanced) = self.partial_refusal_after {
+            let refused = KvAdmissionRefused {
+                by_peer: false,
+                retryable: true,
+                decode: true,
+            };
+            return Err(after_partial_step(refused.into(), advanced, s.len()));
         }
         if self
             .fail_decodes
@@ -273,6 +296,15 @@ impl Model for PreemptStubModel {
     fn num_total_blocks(&self) -> usize {
         self.total_blocks
     }
+    fn pc_inflight_min_tokens(&self) -> Option<usize> {
+        self.inflight_min
+    }
+    fn kv_block_size(&self) -> Option<usize> {
+        self.inflight_min.map(|_| 16)
+    }
+    fn is_ep(&self) -> bool {
+        self.inflight_min.is_some()
+    }
     fn reclaim_prefix_blocks(&self, num_blocks: usize) -> usize {
         let take = num_blocks.min(self.reclaimable.load(Ordering::SeqCst));
         self.reclaimable.fetch_sub(take, Ordering::SeqCst);
@@ -364,6 +396,28 @@ fn non_kv_error_still_fails_the_whole_batch() {
     assert!(logits.is_none());
     assert!(active.is_empty() && preempted.is_empty() && swapped.is_empty());
     // Non-recoverable errors still reach the clients.
+    assert!(rx0.try_recv().expect("response sent").is_err());
+    assert!(rx1.try_recv().expect("response sent").is_err());
+}
+
+#[test]
+fn a_refusal_after_part_of_the_batch_ran_fails_it_without_a_retry() {
+    // The per-sequence highway loop: sequence 0 already ran this step when
+    // sequence 1's block was refused. Preempting a victim and re-running the
+    // batch would feed sequence 0 its last token a second time.
+    let model = PreemptStubModel {
+        partial_refusal_after: Some(1),
+        ..Default::default()
+    };
+    let (a0, mut rx0) = active_seq(0, 3);
+    let (a1, mut rx1) = active_seq(1, 4);
+    let mut active = vec![a0, a1];
+    let (mut swapped, mut preempted) = (Vec::new(), Vec::new());
+    let logits =
+        decode_batch_with_preemption(&model, &mut active, None, &mut swapped, &mut preempted);
+    assert!(logits.is_none());
+    assert_eq!(model.decode_calls.load(Ordering::SeqCst), 1);
+    assert!(active.is_empty() && preempted.is_empty() && swapped.is_empty());
     assert!(rx0.try_recv().expect("response sent").is_err());
     assert!(rx1.try_recv().expect("response sent").is_err());
 }

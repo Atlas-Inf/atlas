@@ -1,0 +1,37 @@
+{
+ "content": null,
+ "tool_calls": [
+  {
+   "id": "call_0000000000000001",
+   "type": "function",
+   "function": {
+    "name": "maps_shortest_path",
+    "arguments": "{\"start_location\":\"New York City\",\"end_location\":\"Metropolitan Museum of Art\",\"mode\":\"walk\"}"
+   }
+  },
+  {
+   "id": "call_0000000000000002",
+   "type": "function",
+   "function": {
+    "name": "maps_shortest_path",
+    "arguments": "{\"start_location\":\"Metropolitan Museum of Art\",\"end_location\":\"Central Park\",\"mode\":\"bike\"}"
+   }
+  },
+  {
+   "id": "call_0000000000000003",
+   "type": "function",
+   "function": {
+    "name": "maps_route_times",
+    "arguments": "{\"route\":\"New York City to Metropolitan Museum of Art\",\"mode\":\"walk\"}"
+   }
+  },
+  {
+   "id": "call_0000000000000004",
+   "type": "function",
+   "function": {
+    "name": "maps_route_times",
+    "arguments": "{\"route\":\"Metropolitan Museum of Art to Central Park\",\"mode\":\"bike\"}"
+   }
+  }
+ ]
+}

@@ -39,7 +39,7 @@ use super::sanitizer::*;
 
 pub(crate) fn strip_thinking_tags(text: &str) -> String {
     let default_parser = crate::reasoning_parser::ReasoningFormat::Qwen.into_parser();
-    extract_thinking(text, false, Some(&*default_parser)).1
+    extract_thinking(text, false, false, Some(&*default_parser)).1
 }
 
 /// Residual thinking-marker scrub for the assistant `content` channel.

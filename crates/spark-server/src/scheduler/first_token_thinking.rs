@@ -50,11 +50,11 @@ impl FirstTokenThinking {
 pub(super) fn apply_native_tool_boundary(
     a: &mut super::ActiveSeq,
     token: u32,
-    native: Option<u32>,
+    env: &crate::scheduler::emit_step::CommitEnv,
 ) {
     if !a.inside_thinking
         || !a.tools_present
-        || native != Some(token)
+        || env.limits.glm_tool_boundary != Some(token)
         || a.tool_call_start_token != Some(token)
     {
         return;
@@ -71,12 +71,14 @@ pub(super) fn apply_native_tool_boundary(
     a.post_think_emitted = 0;
     a.require_tool_call = false;
     a.tool_call_opened = true;
-    tracing::info!(
-        native_opener = token,
-        session_hash = a.session_hash,
-        slot = a.seq.slot_idx,
-        "GLM native tool opener ended thinking"
-    );
+    if !env.quiet {
+        tracing::info!(
+            native_opener = token,
+            session_hash = a.session_hash,
+            slot = a.seq.slot_idx,
+            "GLM native tool opener ended thinking"
+        );
+    }
 }
 
 #[cfg(test)]

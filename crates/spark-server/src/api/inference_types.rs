@@ -118,6 +118,10 @@ pub enum InferenceRequest {
         max_tokens: usize,
         /// Minimum tokens before allowing EOS/stop (0 = no minimum).
         min_tokens: usize,
+        /// vLLM `ignore_eos`: the model's end tokens do not end the request;
+        /// they are ordinary output tokens and generation runs to
+        /// `max_tokens`. The request's own `stop_tokens` still end it.
+        ignore_eos: bool,
         temperature: f32,
         /// Top-k: keep only the k highest-probability tokens (0 = disabled).
         top_k: u32,
@@ -150,6 +154,9 @@ pub enum InferenceRequest {
         stop_tokens: Vec<u32>,
         /// Whether thinking mode is enabled for this request.
         enable_thinking: bool,
+        /// chat_template_kwargs.force_nonempty_content: all-reasoning output
+        /// is returned as content instead of an empty content string.
+        force_nonempty_content: bool,
         /// Max thinking tokens before forcing `</think>`. None = unlimited.
         thinking_budget: Option<u32>,
         /// Per-request override for the vLLM-anchored token-loop detector.
@@ -226,6 +233,8 @@ pub enum InferenceRequest {
         max_tokens: usize,
         /// Minimum tokens before allowing EOS/stop (0 = no minimum).
         min_tokens: usize,
+        /// vLLM `ignore_eos` (see Blocking variant).
+        ignore_eos: bool,
         temperature: f32,
         /// Top-k: keep only the k highest-probability tokens (0 = disabled).
         top_k: u32,
@@ -254,6 +263,9 @@ pub enum InferenceRequest {
         stop_tokens: Vec<u32>,
         /// Whether thinking mode is enabled for this request.
         enable_thinking: bool,
+        /// chat_template_kwargs.force_nonempty_content: all-reasoning output
+        /// is returned as content instead of an empty content string.
+        force_nonempty_content: bool,
         /// Max thinking tokens before forcing `</think>`. None = unlimited.
         thinking_budget: Option<u32>,
         /// Per-request override for the vLLM-anchored token-loop detector.

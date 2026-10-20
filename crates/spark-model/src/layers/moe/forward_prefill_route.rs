@@ -31,17 +31,29 @@ impl MoeLayer {
                 stream,
             )?;
         } else if let Some(ref nvfp4) = self.gate_nvfp4 {
-            ops::w4a16_gemm(
-                ctx.gpu,
-                self.w4a16_gemm,
+            // ATLAS_QWEN4EXP_PREFILL_MOE: the same logits, byte for byte.
+            if !self.try_q38_router(
                 router_in,
                 nvfp4,
                 gate_logits,
                 n,
                 self.router_logits_n,
                 h,
+                ctx,
                 stream,
-            )?;
+            )? {
+                ops::w4a16_gemm(
+                    ctx.gpu,
+                    self.w4a16_gemm,
+                    router_in,
+                    nvfp4,
+                    gate_logits,
+                    n,
+                    self.router_logits_n,
+                    h,
+                    stream,
+                )?;
+            }
         } else if ctx.config.model_type == "glm5_next"
             && n <= crate::layers::canonical_verify::MAX_ROWS
             && crate::layers::canonical_verify::enabled()

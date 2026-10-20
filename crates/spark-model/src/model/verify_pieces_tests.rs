@@ -29,6 +29,15 @@ impl CommBackend for Log {
     fn peer_exchange_async(&self, send: u64, recv: u64, bytes: usize, stream: u64) -> Result<()> {
         self.push(format!("px {send} {recv} {bytes} {stream}"))
     }
+    /// A one-shot channel for payloads up to 128 bytes. "Enqueueing into
+    /// the open capture" is logged; under the mock nothing replays it.
+    fn all_reduce_capturable(&self, ptr: u64, bytes: usize, stream: u64) -> Result<bool> {
+        if bytes > 128 {
+            return Ok(false);
+        }
+        self.push(format!("cap {ptr} {bytes} {stream}"))?;
+        Ok(true)
+    }
     fn all_gather(&self, _: u64, _: u64, _: usize) -> Result<()> {
         Ok(())
     }
@@ -209,5 +218,78 @@ fn over_budget_keys_stay_eager_until_cleared() {
         bodies.get(),
         7,
         "room freed: rows=3 warms, captures, replays"
+    );
+}
+
+#[test]
+fn capturable_collectives_stay_in_the_graph() {
+    let (gpu, comm) = (MockGpuBackend::new(), Log::default());
+    let mut recorder = Recorder::new(&comm, &gpu, S);
+    recorder.capture_collectives = true;
+    layer(&recorder).unwrap();
+    // A 4 KiB reduce is past the channel: it splits like the default.
+    recorder.all_reduce_async(5, 4096, S).unwrap();
+    let steps = recorder.finish().unwrap();
+    let kinds: String = steps
+        .iter()
+        .map(|s| match s {
+            Step::Graph(_) => 'g',
+            Step::Op(_) => 'c',
+        })
+        .collect();
+    // The exchange, the blocking reduce and the large reduce split; the
+    // 128-byte async reduce went into the open graph.
+    assert_eq!(kinds, "gcgcgcg");
+    assert_eq!(comm.take(), ["cap 3 128 7"]);
+}
+
+#[test]
+fn capturable_collectives_replay_the_rest_eagerly() {
+    let (gpu, comm) = (MockGpuBackend::new(), Log::default());
+    let pieces: Pieces<PieceKey> = Pieces::new("decode", "(k)", 600, true);
+    let mut bodies = 0;
+    let mut run = |want: &[&str]| {
+        pieces
+            .run_with((0, 1, 0), &gpu, Some(&comm), S, |c| {
+                bodies += 1;
+                layer(c.expect("TP run"))
+            })
+            .unwrap();
+        assert_eq!(comm.take(), want);
+    };
+    run(&EAGER);
+    // Capture records the one-shot in the graph, then the first replay runs
+    // the split collectives around it.
+    run(&["cap 3 128 7", "px 1 2 64 7", "ar 4 32"]);
+    run(&["px 1 2 64 7", "ar 4 32"]);
+    assert_eq!(bodies, 2);
+}
+
+#[test]
+fn without_a_communicator_a_run_is_one_graph() {
+    let gpu = MockGpuBackend::new();
+    // Budget 1: one single-graph capture fills it.
+    let pieces: Pieces<PieceKey> = Pieces::new("decode", "(k)", 1, false);
+    let bodies = std::cell::Cell::new(0);
+    let step = |rows| {
+        pieces
+            .run_with((0, rows, 0), &gpu, None, S, |c| {
+                assert!(c.is_none(), "TP1 layers see no communicator");
+                bodies.set(bodies.get() + 1);
+                Ok(())
+            })
+            .unwrap()
+    };
+    for _ in 0..3 {
+        step(1);
+    }
+    assert_eq!(bodies.get(), 2, "warm-up, capture, replay");
+    for _ in 0..3 {
+        step(2);
+    }
+    assert_eq!(
+        bodies.get(),
+        5,
+        "the budget holds one graph: rows=2 stays eager"
     );
 }

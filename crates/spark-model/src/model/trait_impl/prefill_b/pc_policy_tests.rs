@@ -4,7 +4,8 @@
 //! two-rank restore-depth agreement.
 
 use super::{
-    Agreed, agree_restore, branch_checkpoint_at, branch_split_at, layer_write_floor, tail_cut,
+    Agreed, agree_restore, branch_checkpoint_at, branch_split_at, layer_write_floor, replay_floor,
+    tail_cut,
 };
 
 const BS: usize = 16;
@@ -195,4 +196,14 @@ fn write_floor_covers_the_matched_rows_of_a_recompute() {
     assert_eq!(glm(0, 20_000, 24_576, 100), 0);
     // A Marconi replay already floors at the match: the flag adds nothing.
     assert_eq!(glm(32, 4096, 4064, 500), 32);
+}
+
+// A Marconi replay keeps its rows under the match unwritten; a pass without a
+// restore takes the lookup's floor (0 for a full recompute).
+#[test]
+fn replay_floor_covers_the_replayed_matched_rows() {
+    assert_eq!(replay_floor(true, 320, 256, 256, 100), 64);
+    assert_eq!(replay_floor(true, 320, 256, 256, 40), 40);
+    assert_eq!(replay_floor(true, 256, 256, 256, 100), 0);
+    assert_eq!(replay_floor(false, 64, 0, 0, 70), 0);
 }

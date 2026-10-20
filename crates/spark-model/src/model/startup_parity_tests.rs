@@ -132,6 +132,36 @@ fn matching_ranks_agree() {
 }
 
 #[test]
+fn the_runtime_facts_lead_the_table() {
+    let s = settings(&[]).unwrap();
+    assert_eq!(
+        s[0],
+        (
+            "cuBLASLt runtime version (libcublasLt)",
+            spark_runtime::cublaslt::version() as u64
+        )
+    );
+}
+
+#[test]
+fn a_different_cublaslt_runtime_fails_naming_both_values() {
+    let ours = settings(&CALLER).unwrap();
+    let mut peer = values(&ours);
+    peer[0] += 1;
+    for (rank, other) in [(0, 1), (1, 0)] {
+        let why = pair(rank, &ours, peer.clone()).unwrap_err().to_string();
+        let want = format!(
+            "{}: rank {rank} has {}, rank {other} has {}",
+            ours[0].0,
+            ours[0].1,
+            ours[0].1 + 1
+        );
+        assert!(why.contains(&want), "{why}");
+        assert!(why.contains("cuBLASLt runtime version"), "{why}");
+    }
+}
+
+#[test]
 fn each_setting_that_differs_is_named_with_both_values_on_both_ranks() {
     let ours = settings(&CALLER).unwrap();
     for (i, &(name, value)) in ours.iter().enumerate() {
@@ -175,7 +205,7 @@ fn every_rank_of_a_wider_world_is_compared() {
 #[test]
 fn the_gather_has_one_size_whatever_the_settings_are() {
     let names = settings(&CALLER).unwrap();
-    let words = SETTINGS.len() + CALLER.len();
+    let words = RUNTIME.len() + SETTINGS.len() + SETTINGS_TAIL.len() + CALLER.len();
     assert_eq!(names.len(), words);
     // Every flag off, every flag on, and junk: the same collective.
     for value in [0, 1, u64::MAX] {
@@ -277,7 +307,11 @@ fn warn_only_logs_and_boots_with_the_same_gathers() {
 
 #[test]
 fn the_table_carries_each_setting_once() {
-    let names: Vec<&str> = SETTINGS.iter().map(|s| s.0).collect();
+    let names: Vec<&str> = SETTINGS
+        .iter()
+        .chain(SETTINGS_TAIL.iter())
+        .map(|s| s.0)
+        .collect();
     for required in [
         "ATLAS_EP_PROTOCOL=v2",
         "ATLAS_NO_TAIL_SPLIT",
@@ -303,7 +337,37 @@ fn the_table_carries_each_setting_once() {
         "ATLAS_GLM_LONG_BATCH_FFN",
         "ATLAS_GLM_LONG_BATCH_SERIAL",
         "ATLAS_GLM_MTP_DISTRIBUTED",
+        "ATLAS_QWEN4EXP_FP8_GDN",
+        "ATLAS_QWEN4EXP_BF16_GDN",
+        "ATLAS_QWEN4EXP_LMHEAD_SPLIT",
+        "ATLAS_QWEN4EXP_LMHEAD_SPLIT_VERIFY",
+        "ATLAS_QWEN4EXP_BATCH_FAST",
+        "ATLAS_QWEN4EXP_BATCH_FAST_CHECK",
+        "ATLAS_QWEN4EXP_BATCH_FAST_BISECT",
         "ATLAS_STARTUP_PARITY=warn",
+        "ATLAS_QWEN4EXP_PREFILL_SP_SHARED",
+        "ATLAS_QWEN4EXP_PREFILL_MOE",
+        "ATLAS_QWEN4EXP_PREFILL_MOE_W2",
+        "ATLAS_QWEN4EXP_PREFILL_MOE_NODUP",
+        "ATLAS_ATTN_W4A4",
+        "ATLAS_CUTLASS_NVFP4_ATTN_O/_GEMM",
+        "ATLAS_QSA_NO_PREFILL_SELECT",
+        "ATLAS_QWEN4EXP_MOE_TC",
+        "ATLAS_QWEN4EXP_MOE_TC_V1",
+        "ATLAS_QWEN4EXP_MOE_TC_V2",
+        "ATLAS_QWEN4EXP_MOE_UNITS",
+        "ATLAS_QWEN4EXP_MOE_NO_CLAMP",
+        "ATLAS_QWEN4EXP_PREFILL_MOE_BF16",
+        "ATLAS_QWEN4EXP_PREFILL_ROWINV",
+        "ATLAS_QWEN4EXP_PREFILL_BF16_PROJ",
+        "ATLAS_QWEN4EXP_HC_MMA",
+        "ATLAS_QWEN4EXP_HC_STAGE_FIT",
+        "ATLAS_QWEN4EXP_FINISH_LEAF",
+        "ATLAS_MTP_DEEP_MAX_SEQS",
+        "ATLAS_MOE_PREFILL_FP8_DOWN",
+        "ATLAS_MOE_GROUPED_CUTLASS/_HOLO_MOE_GROUPED_CUTLASS",
+        "ATLAS_PROFILE_FIRST",
+        "ATLAS_QWEN4EXP_PREFILL_HOST_IDS",
     ] {
         assert_eq!(
             names.iter().filter(|&&n| n == required).count(),

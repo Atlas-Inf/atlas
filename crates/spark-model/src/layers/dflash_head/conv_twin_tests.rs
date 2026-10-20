@@ -90,7 +90,7 @@ fn conv_twin_deltas_at_the_glm_shape() -> Result<()> {
         .context("glm-5.3-flash/nvfp4 not in this build")?;
     let gpu = AtlasCudaBackend::new(0, &set.modules).context("CUDA backend")?;
     let gpu: &dyn GpuBackend = &gpu;
-    crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu);
+    crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu, true);
     anyhow::ensure!(
         crate::layers::w4a16_gemv_tiers::tc_kernel(8).0 != 0,
         "run with ATLAS_W4A16_TC=1"
@@ -102,8 +102,8 @@ fn conv_twin_deltas_at_the_glm_shape() -> Result<()> {
     head.kernels.dense_gemv_batchm =
         gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")?;
     [head.kernels.dense_gemv_tc16, head.kernels.dense_gemv_tc32] =
-        super::super::from_weights_kernels::dense_gemv_tc_kernels(gpu);
-    head.kernels.mxfp8_gemv = super::super::from_weights_kernels::mxfp8_gemv_kernels(gpu);
+        super::super::from_weights_kernels::dense_gemv_tc_kernels(gpu, true);
+    head.kernels.mxfp8_gemv = super::super::from_weights_kernels::mxfp8_gemv_kernels(gpu, true);
     head.kernels.mxfp8_quantize = gpu.kernel("mxfp8_gemv", "mxfp8_quantize_bf16")?;
 
     // GLM-5.3's DFlash2 conv: 16-wide groups, two taps, input and output

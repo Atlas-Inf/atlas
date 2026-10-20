@@ -117,6 +117,10 @@ pub(crate) struct SsmStatePool {
     /// Per-slot byte sizes of the two staging pools above.
     pub(super) commit_qkv_slot_bytes: usize,
     pub(super) commit_gb_slot_bytes: usize,
+    /// `ATLAS_QWEN4EXP_GDN_COMMIT_FUSE`: one u32 a slot, the accepted tokens
+    /// of the commit the slot's next deferred verify lands first
+    /// (`trait_impl/async_chkpt/gdn_commit_fuse.rs`). NULL when off.
+    pub(super) gdn_fuse_words: DevicePtr,
     /// GLM KDA fold records (`--ssm-rollback-mode records`); layout in `kda_records`.
     pub(super) kda_record_pools: Vec<DevicePtr>,
     pub(super) kda_record_row_bytes: usize,
@@ -265,6 +269,15 @@ impl SsmStatePool {
         } else {
             (Vec::new(), Vec::new())
         };
+        let gdn_fuse_words =
+            if gdn_deferred_commit && has_mtp && super::trait_impl::gdn_commit_fuse::requested() {
+                let p = gpu.alloc(total_slots * 4)?;
+                allocations.push(p);
+                gpu.memset(p, 0, total_slots * 4)?;
+                p
+            } else {
+                DevicePtr::NULL
+            };
 
         // Stage-3 f16-SIZED pool: the FP32 prefill staging arena. Allocated
         // ONLY when the h slots actually narrowed — an FP32-sized pool needs
@@ -473,6 +486,7 @@ impl SsmStatePool {
             gdn_commit_gb_pools,
             commit_qkv_slot_bytes,
             commit_gb_slot_bytes,
+            gdn_fuse_words,
             kda_record_pools,
             kda_record_row_bytes,
             free_slots: Mutex::new(free_slots),
@@ -620,6 +634,15 @@ impl SsmStatePool {
             .map_or(DevicePtr(0), |p| {
                 p.offset(slot * self.commit_qkv_slot_bytes)
             })
+    }
+
+    /// `slot`'s pending-commit word (NULL when the fuse is off).
+    pub(super) fn fuse_word(&self, slot: usize) -> DevicePtr {
+        if self.gdn_fuse_words.is_null() {
+            DevicePtr::NULL
+        } else {
+            self.gdn_fuse_words.offset(slot * 4)
+        }
     }
 
     /// See [`Self::commit_qkv`].
@@ -1326,6 +1349,7 @@ mod slot_guard_tests {
             gdn_commit_gb_pools: Vec::new(),
             commit_qkv_slot_bytes: 0,
             commit_gb_slot_bytes: 0,
+            gdn_fuse_words: DevicePtr::NULL,
             kda_record_pools: Vec::new(),
             kda_record_row_bytes: 0,
             free_slots: Mutex::new((0..max_slots).rev().collect()),

@@ -413,7 +413,7 @@ impl TransformerModel {
     /// buffer is NULL for it — including that stash. Gating the LIVE row
     /// selection on the stash silently disabled the whole fix on the only
     /// model that needs it. Stash callers check the pointer themselves.
-    fn mtp_stream_row_bytes(&self) -> Option<usize> {
+    pub(super) fn mtp_stream_row_bytes(&self) -> Option<usize> {
         let hc = self.config.hc_mult.max(self.config.hc_count);
         if hc == 0 || std::env::var("ATLAS_MTP_STREAM_ROW_FIX").ok().as_deref() == Some("0") {
             return None;
@@ -449,14 +449,7 @@ impl TransformerModel {
             .copy_d2d_async(src, self.mtp_hidden_save, h * bf16, stream)?;
         // Restore this sequence's stream row into `hc_streams` row 0, which is
         // where a pre-mixer drafter reads its input from.
-        if let Some(row_bytes) = self.mtp_stream_row_bytes()
-            && !self.verify_stream_stash.is_null()
-        {
-            let ssrc = self.verify_stream_stash.offset(idx * row_bytes);
-            self.gpu
-                .copy_d2d_async(ssrc, self.buffers.hc_streams(), row_bytes, stream)?;
-        }
-        Ok(())
+        self.restore_stream_rows_from_stash(&[idx])
     }
 
     /// ATLAS_MTP_CATCHUP: ring-capture the final hidden of a serially
@@ -623,10 +616,14 @@ impl TransformerModel {
                     })
                     .collect::<Result<Vec<_>>>()?
             }
-            _ => stash_idx
-                .iter()
-                .map(|&i| self.verify_hidden_stash.offset(i * h * 2))
-                .collect(),
+            _ => {
+                // A pre-mixer drafter reads its rows' streams, not the hidden.
+                self.restore_stream_rows_from_stash(stash_idx)?;
+                stash_idx
+                    .iter()
+                    .map(|&i| self.verify_hidden_stash.offset(i * h * 2))
+                    .collect()
+            }
         };
         let mut states: Vec<&mut dyn crate::speculative::ProposerState> = Vec::new();
         let mut expected_owners = Vec::with_capacity(seqs.len());
@@ -670,8 +667,14 @@ impl TransformerModel {
             let ctx_rows = proposer.rank_split_ctx(comm, &seqs);
             self.announce_draft_split_rows(rows, ctx_rows)?;
         }
+        // ATLAS_QWEN4EXP_MTP_DRAFT_TP: a qwen4_exp batched propose whose draft
+        // head the worker shares, announced with its plan.
+        let tp = match split {
+            Some(_) => None,
+            None => self.announce_draft_tp(proposer, tokens.len(), num_drafts, grammar, &ctx)?,
+        };
         let ctx = ForwardContext {
-            comm: split.map(|(comm, _)| comm),
+            comm: split.map(|(comm, _)| comm).or(tp),
             ..ctx
         };
         proposer.propose_batch(

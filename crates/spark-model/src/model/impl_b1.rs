@@ -584,15 +584,7 @@ impl TransformerModel {
         // 2. Pre-allocate KV cache blocks + upload attention metadata
         let bs = kv_cache.block_size();
         let blocks_needed = (seq.seq_len / bs) + 1;
-        ensure_blocks_through_decode(
-            seq,
-            blocks_needed - 1,
-            &mut kv_cache,
-            self.prefix_cache.as_ref(),
-            self.gpu.as_ref(),
-            stream,
-            self.levers.kv_poison,
-        )?;
+        self.reserve_decode_blocks(seq, blocks_needed - 1, &mut kv_cache, stream)?;
 
         let meta_base = self.buffers.scratch().offset(32768);
         let max_blocks = seq.block_table.len() as u32;

@@ -438,9 +438,40 @@ pub(crate) fn qsa_attn_tc2_decision(
     }
 }
 
+/// Whether `qsa_prefill_attn_l8` may be selected at all: explicit env opt-in,
+/// a shape the kernel can serve, and a target it does not fault on.
+///
+/// The kernel is shared into strix-hip's `qsa_indexer.cu` by symlink from
+/// the GB10 target, and on gfx1151 it destroys the context mid-prefill
+/// (winbox plan1006p9 gate, 2026-10-06: ~18k-token echo/logprobs request,
+/// cuMemFree_v2 status 719 at teardown; the default kernel scored all four
+/// windows). Unlike the numerics question `scripts/ppl.py` was meant to
+/// answer, this is a hard fault — so the env flag is refused outright on
+/// `atlas_scale` rather than merely made non-default.
+pub(crate) fn qsa_attn_l8_selectable(l8: Option<&str>, gfx: bool, shape_ok: bool) -> bool {
+    matches!(l8, Some("1") | Some("true")) && !gfx && shape_ok
+}
+
 #[cfg(test)]
 mod tests {
-    use super::qsa_attn_tc2_decision;
+    use super::{qsa_attn_l8_selectable, qsa_attn_tc2_decision};
+
+    #[test]
+    fn qsa_attn_l8_selectable_table() {
+        let d = qsa_attn_l8_selectable;
+        // NVIDIA, explicit opt-in, valid shape: selects.
+        assert!(d(Some("1"), false, true));
+        assert!(d(Some("true"), false, true));
+        // gfx1151: refused even when the operator asks (kernel faults there).
+        assert!(!d(Some("1"), true, true));
+        assert!(!d(Some("true"), true, true));
+        // Bad geometry is refused on NVIDIA too.
+        assert!(!d(Some("1"), false, false));
+        // Unset or unrecognized values never select.
+        assert!(!d(None, false, true));
+        assert!(!d(Some("0"), false, true));
+        assert!(!d(Some("yes"), false, true));
+    }
 
     #[test]
     fn qsa_attn_tc2_decision_table() {

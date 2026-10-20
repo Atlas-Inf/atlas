@@ -15,6 +15,7 @@
 //! reminders any more.
 
 mod envelope;
+mod force_nonempty_tests;
 mod harness;
 mod health_fault;
 mod model_advertise;

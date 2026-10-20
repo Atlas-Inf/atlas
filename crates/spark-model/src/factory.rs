@@ -102,8 +102,11 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
         // not during weight loading.
         "qwen3_6_moe" | "holo3_1_moe" => Ok(Box::new(Qwen35WeightLoader)),
         // Nemotron-H family (Mamba-2 + MoE + Attention), including Puzzle
-        // (heterogeneous per-block MoE intermediate / top-k).
-        "nemotron_h" | "nemotron_h_puzzle" => Ok(Box::new(NemotronHWeightLoader)),
+        // (heterogeneous per-block MoE intermediate / top-k) and the 3.5
+        // Super VL omni wrapper (same backbone under `language_model.`).
+        "nemotron_h" | "nemotron_h_puzzle" | "nemotron_h_omni" => {
+            Ok(Box::new(NemotronHWeightLoader))
+        }
         // NLLB / M2M-100 encoder-decoder translation family.
         "m2m_100" | "nllb" => Ok(Box::new(NllbWeightLoader)),
         // Gemma-4 family (pure attention, GeGLU, sliding + full attention)
@@ -129,7 +132,7 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
         "glm5_next" => Ok(Box::new(Glm5WeightLoader)),
         _ => bail!(
             "Unsupported model type: '{}' (normalized: '{}'). \
-             Supported: qwen3_next, qwen3_5_moe, qwen3_5, qwen3_6_moe, holo3_1_moe, qwen3_vl_moe, qwen4_exp, nemotron_h, nemotron_h_puzzle, gemma4, mistral, minimax_m2, step3p7, laguna, deepseek_v4, m2m_100",
+             Supported: qwen3_next, qwen3_5_moe, qwen3_5, qwen3_6_moe, holo3_1_moe, qwen3_vl_moe, qwen4_exp, nemotron_h, nemotron_h_puzzle, nemotron_h_omni, gemma4, mistral, minimax_m2, step3p7, laguna, deepseek_v4, m2m_100",
             config.model_type,
             normalized,
         ),
@@ -203,6 +206,9 @@ mod tests {
         assert!(loader_for_config(&config).is_ok());
 
         config.model_type = "nemotron_h".to_string();
+        assert!(loader_for_config(&config).is_ok());
+
+        config.model_type = "nemotron_h_omni".to_string();
         assert!(loader_for_config(&config).is_ok());
 
         config.model_type = "holo3_1_moe".to_string();

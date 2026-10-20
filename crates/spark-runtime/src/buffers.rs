@@ -17,7 +17,10 @@ mod sizes;
 mod sizes_q12;
 mod sizes_q2;
 mod verify_masks;
-pub use decode_meta::{DECODE_META_MAX_ROWS, DECODE_META_MIN_ROWS, DecodeMetaLayout};
+pub use decode_meta::{
+    DECODE_BATCH_RUNGS, DECODE_META_MAX_ROWS, DECODE_META_MIN_ROWS, DecodeMetaLayout,
+    padded_batch_rung,
+};
 pub use sizes::{
     BufferSizes, HC_SCRATCH_ALIGN, HcPreScratchLayout, QSA_SELECT_SCRATCH_ROWS,
     hc_pre_scratch_layout,

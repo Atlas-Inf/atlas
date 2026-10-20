@@ -186,6 +186,7 @@ pub(super) fn verify_dflash_tail(
         sched.levers.dflash_masked_verify,
         model,
         a,
+        &verified_argmax,
     ) {
         verified_argmax
     } else {
@@ -318,9 +319,7 @@ pub(super) fn verify_dflash_tail(
     //  - num_accepted == k_verify (full accept): no-op (h_state already correct)
     //  - 0 < num_accepted < k_verify (partial): intermediate[total_accepted-1] → h_state
     // No checkpoint write needed — the next start_checkpoint_async syncs.
-    //
-    // k_verify = drafts.len() + 1 (the prefix bonus position is also verified).
-    //
+    // k_verify counts the prefix bonus position, which is verified too.
     // Committed BEFORE emission: an emit below can finish the sequence and
     // return, and `finish_sequence` then caches `seq.tokens` with the live
     // recurrent state. The worker rank has already committed these rows (it
@@ -335,9 +334,10 @@ pub(super) fn verify_dflash_tail(
         return None;
     }
 
-    // Emit accepted drafts.
+    // Emit the accepted drafts, each row checked at its own position.
     for i in 0..num_accepted {
-        emit_token(a, drafts[i], verify_lps.get(i).cloned(), sched);
+        let lp = verify_lps.get(i).cloned();
+        emit_span_row(a, drafts[i], lp, sched, i, total_accepted);
         if a.finished {
             return None;
         }
@@ -347,8 +347,8 @@ pub(super) fn verify_dflash_tail(
     // at the first mismatch, or the next-prediction past the full-accept case).
     let bonus_idx = num_accepted;
     if bonus_idx < verified.len() {
-        let bonus = verified[bonus_idx];
-        emit_token(a, bonus, verify_lps.get(bonus_idx).cloned(), sched);
+        let (bonus, lp) = (verified[bonus_idx], verify_lps.get(bonus_idx).cloned());
+        emit_span_row(a, bonus, lp, sched, bonus_idx, total_accepted);
         if a.finished {
             return None;
         }
@@ -409,8 +409,13 @@ pub(super) fn verify_dflash_tail(
         let next_num_drafts = if dflash_verify_raw_argmax {
             num_drafts
         } else {
-            a.mtp_acct
-                .depth_drafts(num_drafts, sched.levers.mtp_single_depth_adapt)
+            a.mtp_acct.depth_drafts(
+                num_drafts,
+                crate::scheduler::mtp_deep_depth::DepthLevers {
+                    deep: false,
+                    ..sched.levers.depth()
+                },
+            )
         };
         // Owner-batched callers propose every owner in one drafter pass.
         if defer_propose && _mtp_grammar_mask.is_none() {

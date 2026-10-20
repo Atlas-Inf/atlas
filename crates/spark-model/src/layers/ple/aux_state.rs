@@ -11,7 +11,6 @@ use crate::layers::ops;
 
 use super::{PleLayer, PleSeqState};
 use crate::layers::ngram_embed::NgramTable;
-use crate::layers::ple::ids::ple_ngram_ids;
 
 impl PleLayer {
     /// Marconi aux blob: `[hist_len u32][history u32s][conv f32 bytes]`.
@@ -39,14 +38,10 @@ impl PleLayer {
         stream: u64,
     ) -> Result<()> {
         let conv_bytes = self.state_len * self.hc_mult * self.hidden * 4;
-        buf.clear();
-        buf.extend_from_slice(&(st.history.len() as u32).to_le_bytes());
-        for t in &st.history {
-            buf.extend_from_slice(&t.to_le_bytes());
-        }
+        write_aux_head(buf, &st.history);
         let off = buf.len();
         buf.resize(off + conv_bytes, 0);
-        gpu.copy_d2h_on_stream(st.conv, &mut buf[off..], stream)?;
+        crate::layers::aux_d2h::copy(gpu, st.conv, &mut buf[off..], stream)?;
         Ok(())
     }
 
@@ -58,26 +53,48 @@ impl PleLayer {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
-        anyhow::ensure!(blob.len() >= 4, "PLE aux blob truncated");
-        let n = u32::from_le_bytes(blob[..4].try_into().unwrap()) as usize;
         let conv_bytes = self.state_len * self.hc_mult * self.hidden * 4;
-        anyhow::ensure!(
-            blob.len() == 4 + n * 4 + conv_bytes,
-            "PLE aux blob size mismatch"
-        );
-        st.history = blob[4..4 + n * 4]
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
+        let (history, conv) = parse_aux(blob, conv_bytes)?;
+        st.history = history;
         st.prestaged_va = None;
         st.prestaged_n = 0;
         st.verify_snap_rows = 0;
         st.verify_tokens.clear();
         st.history_ckpt.clear();
-        gpu.copy_h2d_async(&blob[4 + n * 4..], st.conv, stream)?;
+        gpu.copy_h2d_async(conv, st.conv, stream)?;
         Ok(())
     }
 }
+
+/// Start an aux blob in `buf`: `[hist_len u32][history u32s]`; the conv
+/// carry's bytes follow.
+pub(super) fn write_aux_head(buf: &mut Vec<u8>, history: &[u32]) {
+    buf.clear();
+    buf.extend_from_slice(&(history.len() as u32).to_le_bytes());
+    for t in history {
+        buf.extend_from_slice(&t.to_le_bytes());
+    }
+}
+
+/// The token history and conv-carry bytes of an aux blob whose carry is
+/// `conv_bytes` long ([`write_aux_head`] plus the carry).
+pub(super) fn parse_aux(blob: &[u8], conv_bytes: usize) -> Result<(Vec<u32>, &[u8])> {
+    anyhow::ensure!(blob.len() >= 4, "PLE aux blob truncated");
+    let n = u32::from_le_bytes(blob[..4].try_into().unwrap()) as usize;
+    anyhow::ensure!(
+        blob.len() == 4 + n * 4 + conv_bytes,
+        "PLE aux blob size mismatch"
+    );
+    let history = blob[4..4 + n * 4]
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    Ok((history, &blob[4 + n * 4..]))
+}
+
+#[cfg(test)]
+#[path = "aux_state_tests.rs"]
+mod tests;
 
 impl PleLayer {
     /// Fresh sequence: EOS-filled history and a zeroed conv state.
@@ -121,20 +138,8 @@ impl PleLayer {
         if st.history.len() != self.dims.context_len() {
             self.reset(st, gpu, stream)?;
         }
-        // Keep what the history was BEFORE this window, and the window's own
-        // ids: `rollback_verify` rebuilds the history for whatever prefix the
-        // target ends up accepting. History is a fixed-width window, so it
-        // cannot simply be truncated back.
-        st.history_ckpt = st.history.clone();
-        st.verify_tokens = tokens.to_vec();
-        let mut window = st.history.clone();
-        window.extend_from_slice(tokens);
-        let all = ple_ngram_ids(&self.dims, &window);
-        let rows = &all[all.len() - tokens.len()..];
-        let flat: Vec<u64> = rows.iter().flat_map(|r| r.iter().copied()).collect();
+        let flat = self.stage_window(st, tokens);
         let va = self.gather_host(&flat, gpu, stream)?;
-        let keep = self.dims.context_len();
-        st.history = window[window.len() - keep..].to_vec();
         st.prestaged_va = Some(va);
         st.prestaged_n = tokens.len();
         st.last_staged_va = va;

@@ -64,6 +64,20 @@ impl MoeLayer {
                 2,
                 stream,
             )?;
+        } else if self.qwen4exp_fast_t() {
+            self.qwen4exp_fast_gate_up(
+                ctx,
+                input,
+                expert_gate_out,
+                expert_up_out,
+                indices_dev,
+                sh_gate_t,
+                shared_gate_scratch,
+                sh_up_t,
+                shared_up_scratch,
+                2,
+                stream,
+            )?;
         } else {
             let gate_t = self
                 .gate_ptrs_t
@@ -101,25 +115,41 @@ impl MoeLayer {
         } else {
             output.offset(2 * h as usize * 2)
         };
-        ops::moe_expert_silu_down_shared_batch2_t(
-            ctx.gpu,
-            self.moe_expert_silu_down_shared_batch2_t_k,
-            expert_gate_out,
-            expert_up_out,
-            down_t.packed_ptrs,
-            down_t.scale_ptrs,
-            down_t.scale2_vals,
-            expert_down_out,
-            indices_dev,
-            shared_gate_scratch,
-            shared_up_scratch,
-            sh_down_t,
-            kernel_shared_down_out,
-            h,
-            inter,
-            top_k,
-            stream,
-        )?;
+        if self.qwen4exp_fast_t() {
+            self.qwen4exp_fast_silu_down(
+                ctx,
+                expert_gate_out,
+                expert_up_out,
+                expert_down_out,
+                indices_dev,
+                shared_gate_scratch,
+                shared_up_scratch,
+                sh_down_t,
+                kernel_shared_down_out,
+                2,
+                stream,
+            )?;
+        } else {
+            ops::moe_expert_silu_down_shared_batch2_t(
+                ctx.gpu,
+                self.moe_expert_silu_down_shared_batch2_t_k,
+                expert_gate_out,
+                expert_up_out,
+                down_t.packed_ptrs,
+                down_t.scale_ptrs,
+                down_t.scale2_vals,
+                expert_down_out,
+                indices_dev,
+                shared_gate_scratch,
+                shared_up_scratch,
+                sh_down_t,
+                kernel_shared_down_out,
+                h,
+                inter,
+                top_k,
+                stream,
+            )?;
+        }
         // Mixed config: one batched BF16 shared-expert pass for both tokens
         // (3 GEMMs + silu_mul total, vs 4 launches per token in the
         // per-token fallback). Must run after silu_down_t, which owns the

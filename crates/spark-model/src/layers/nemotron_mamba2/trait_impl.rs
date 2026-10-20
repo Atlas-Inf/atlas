@@ -14,8 +14,9 @@ fn use_batched_mamba_verify(
     num_tokens: usize,
     lightning_exact: bool,
     fused_not_disabled: bool,
+    exact_ready: bool,
 ) -> bool {
-    num_tokens > 1 && !lightning_exact && fused_not_disabled
+    num_tokens > 1 && !lightning_exact && (fused_not_disabled || exact_ready)
 }
 
 impl TransformerLayer for NemotronMamba2Layer {
@@ -40,6 +41,11 @@ impl TransformerLayer for NemotronMamba2Layer {
             .downcast_mut::<SsmLayerState>()
             .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState"))?;
 
+        // ATLAS_N35_L0_DUMP: stage-01 dumped inside ; it only commits
+        // when the readback actually works (i.e. this is an eager call, not
+        // a CUDA-graph capture).
+        let mut l0d = super::l0_dump::arm(ctx.gpu, self.layer_idx, hidden, h, stream);
+
         // 1. RMS norm + save residual
         let normed = ctx.buffers.norm_output();
         ops::rms_norm_residual(
@@ -54,6 +60,9 @@ impl TransformerLayer for NemotronMamba2Layer {
             eps,
             stream,
         )?;
+        if let Some(ref mut d) = l0d {
+            d.stage(ctx.gpu, "02_normed_input", normed, h, "bf16", &[h]);
+        }
 
         // 2. in_proj GEMV: normed[hidden_size] -> proj[in_proj_size]
         //    Layout: [z(d_inner) | xBC(d_xbc) | dt(num_heads)]
@@ -98,6 +107,17 @@ impl TransformerLayer for NemotronMamba2Layer {
             )?;
         }
 
+        if let Some(ref mut d) = l0d {
+            d.stage(
+                ctx.gpu,
+                "03_in_proj_out",
+                proj,
+                self.in_proj_size,
+                "bf16",
+                &[self.in_proj_size],
+            );
+        }
+
         // Pointers into projection output (BF16, 2 bytes per element)
         let z_ptr = proj;
         let xbc_ptr = proj.offset(self.d_inner * 2);
@@ -105,6 +125,16 @@ impl TransformerLayer for NemotronMamba2Layer {
 
         // 3. Conv1d update on xBC (with bias, fused SiLU)
         let xbc_out = ctx.buffers.ssm_deinterleaved();
+        if let Some(ref mut d) = l0d {
+            d.stage(
+                ctx.gpu,
+                "04_conv_state_before",
+                ssm_state.conv_state,
+                self.d_xbc * self.d_conv,
+                "f32",
+                &[self.d_xbc, self.d_conv],
+            );
+        }
         self.conv1d_update_biased(
             ctx.gpu,
             ssm_state.conv_state,
@@ -115,6 +145,24 @@ impl TransformerLayer for NemotronMamba2Layer {
             1,
             stream,
         )?;
+        if let Some(ref mut d) = l0d {
+            d.stage(
+                ctx.gpu,
+                "05_conv_out",
+                xbc_out,
+                self.d_xbc,
+                "bf16",
+                &[self.d_xbc],
+            );
+            d.stage(
+                ctx.gpu,
+                "06_conv_state_after",
+                ssm_state.conv_state,
+                self.d_xbc * self.d_conv,
+                "f32",
+                &[self.d_xbc, self.d_conv],
+            );
+        }
 
         // 4. Split xBC_out into x, B, C (BF16 offsets)
         let x_ptr = xbc_out;
@@ -124,6 +172,17 @@ impl TransformerLayer for NemotronMamba2Layer {
 
         // 5. SSM decode: state update + y output
         let y_ptr = ctx.buffers.attn_output();
+        if let Some(ref mut d) = l0d {
+            let n_h = self.num_heads * self.head_dim * self.state_size;
+            d.stage(
+                ctx.gpu,
+                "08_ssm_state_before",
+                ssm_state.h_state,
+                n_h,
+                "f32",
+                &[self.num_heads, self.head_dim, self.state_size],
+            );
+        }
         self.ssm_decode(
             ctx.gpu,
             ssm_state.h_state,
@@ -135,6 +194,26 @@ impl TransformerLayer for NemotronMamba2Layer {
             1,
             stream,
         )?;
+
+        if let Some(ref mut d) = l0d {
+            d.stage(
+                ctx.gpu,
+                "09_ssm_decode_out",
+                y_ptr,
+                self.d_inner,
+                "bf16",
+                &[self.d_inner],
+            );
+            let n_h = self.num_heads * self.head_dim * self.state_size;
+            d.stage(
+                ctx.gpu,
+                "10_ssm_state_after",
+                ssm_state.h_state,
+                n_h,
+                "f32",
+                &[self.num_heads, self.head_dim, self.state_size],
+            );
+        }
 
         // 6. Gated RMS norm: rms_norm(y, ssm_norm) * silu(z)
         //    y is [d_inner], z is [d_inner], gate_stride = in_proj_size (z at start of proj)
@@ -159,6 +238,17 @@ impl TransformerLayer for NemotronMamba2Layer {
         // Use qkv_output (NOT ssm_qkvz) — ssm_qkvz still holds z_ptr being read
         // by gated_rms_norm above. Writing out_proj to the same buffer creates a
         // write-after-read race that corrupts the gate signal → all-zero output.
+        if let Some(ref mut d) = l0d {
+            d.stage(
+                ctx.gpu,
+                "11_gated_norm_out",
+                gated_out,
+                self.d_inner,
+                "bf16",
+                &[self.d_inner],
+            );
+        }
+
         let out = ctx.buffers.qkv_output();
         if let Some(ref w) = self.out_proj_bf16 {
             ops::dense_gemv(
@@ -198,8 +288,16 @@ impl TransformerLayer for NemotronMamba2Layer {
             )?;
         }
 
+        if let Some(ref mut d) = l0d {
+            d.stage(ctx.gpu, "12_out_proj_out", out, h, "bf16", &[h]);
+        }
+
         // 8. Residual add: hidden += out_proj_result (hidden unchanged by rms_norm_residual)
         ops::residual_add(ctx.gpu, self.residual_add_k, hidden, out, h as u32, stream)?;
+        if let Some(mut d) = l0d {
+            d.stage(ctx.gpu, "13_post_layer_hidden", hidden, h, "bf16", &[h]);
+            d.finish();
+        }
 
         Ok(())
     }
@@ -218,11 +316,23 @@ impl TransformerLayer for NemotronMamba2Layer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        if use_batched_mamba_verify(
+        // mamba_verify_exact wants the batched-exact path when all its
+        // kernels resolved; otherwise per-row decode() is already exact.
+        let exact_ready = ctx.levers.mamba_verify_exact && self.mamba_verify_exact_ready();
+        let batched = use_batched_mamba_verify(
             num_tokens,
             ctx.levers.lightning_mamba_exact_recurrence,
-            std::env::var("ATLAS_NO_MAMBA_VERIFY_FUSED").is_err(),
-        ) {
+            ctx.levers.mamba_verify_fused,
+            exact_ready,
+        );
+        static MAMBA_VERIFY_PATH_LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        MAMBA_VERIFY_PATH_LOGGED.get_or_init(|| {
+            tracing::info!(
+                "nemotron mamba verify path: {} (num_tokens={num_tokens} exact_ready={exact_ready})",
+                if batched { "batched-exact" } else { "per-row-decode" }
+            )
+        });
+        if batched {
             return self.decode_batched_verify(hidden, residual, num_tokens, state, ctx, stream);
         }
         let h = ctx.config.hidden_size;
@@ -367,6 +477,7 @@ impl TransformerLayer for NemotronMamba2Layer {
             gdn_commit_qkv: DevicePtr(0),
             gdn_commit_gb: DevicePtr(0),
             gdn_commit_pending: false,
+            gdn_fuse_n: DevicePtr::NULL,
             h_is_f16: false,
             // Stage-3 narrowing is GDN-only (`ssm_h_fp16_preconditions`
             // refuses a non-GDN SSM stack), so this state is always FP32-wide.
@@ -382,9 +493,12 @@ mod tests {
 
     #[test]
     fn lightning_exact_routes_every_mamba_stage_through_literal_m1_decode() {
-        assert!(!use_batched_mamba_verify(4, true, true));
-        assert!(use_batched_mamba_verify(4, false, true));
-        assert!(!use_batched_mamba_verify(1, false, true));
-        assert!(!use_batched_mamba_verify(4, false, false));
+        assert!(!use_batched_mamba_verify(4, true, true, false));
+        assert!(use_batched_mamba_verify(4, false, true, false));
+        // exact verify arms the batched path even with fused disabled
+        assert!(use_batched_mamba_verify(4, false, false, true));
+        assert!(!use_batched_mamba_verify(4, false, false, false));
+        assert!(!use_batched_mamba_verify(1, false, true, true));
+        assert!(!use_batched_mamba_verify(4, false, false, false));
     }
 }

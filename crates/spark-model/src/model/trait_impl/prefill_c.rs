@@ -148,10 +148,10 @@ impl TransformerModel {
                 let mut img_idx = 0usize;
                 for (i, &tok) in tokens.iter().enumerate() {
                     if tok == image_pad || tok == video_pad {
-                        let src = ve.buf_out.offset(img_idx * ve.out_hidden_size * 2);
+                        let src = ve.out_row().offset(img_idx * ve.out_hidden_size() * 2);
                         let dst = hidden.offset(i * h * fp32);
                         self.gpu
-                            .copy_d2d_async(src, dst, ve.out_hidden_size * 2, stream)?;
+                            .copy_d2d_async(src, dst, ve.out_hidden_size() * 2, stream)?;
                         img_idx += 1;
                     }
                 }

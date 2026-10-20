@@ -69,7 +69,7 @@ impl TransformerModel {
         mtp_vocab_size: u32,
         comm: Option<std::sync::Arc<dyn spark_comm::CommBackend>>,
         self_speculative: bool,
-        vision_encoder: Option<crate::layers::VisionEncoder>,
+        vision_encoder: Option<crate::layers::VisionTower>,
         ssm_cache_slots: usize,
         ssm_checkpoint_interval: usize,
         ssm_pools: super::ssm_pools::SsmPools,
@@ -111,7 +111,10 @@ impl TransformerModel {
         // Narrow batched-GEMV family (M=4..8) for the K=3..8 verify lm_head
         // (try_kernel per tier: 0-handle on targets that predate a tier;
         // dispatch widens, then falls back to the GEMM).
-        let w4a16_batchm = crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu.as_ref());
+        let w4a16_batchm = crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(
+            gpu.as_ref(),
+            config.model_type == "glm5_next",
+        );
         // M<=16 batched GEMV for the wide BATCHED-DECODE lm_head. The SSM mixer
         // already carries this handle (qwen3_ssm/mod.rs); the model level did
         // not, so the decode head had no arm above 8 and fell to the M64-tile
@@ -149,6 +152,8 @@ impl TransformerModel {
         let dense_gemv_batchm_kernel = gpu
             .kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")
             .unwrap_or(spark_runtime::gpu::KernelHandle(0));
+        let qwen4exp_wide_rows =
+            crate::layers::ops::Qwen4ExpWideRows::resolve(gpu.as_ref(), &config.model_type);
         let argmax_kernel = gpu.kernel("argmax", "argmax_bf16")?;
         let argmax_batch_kernel = gpu
             .kernel("argmax", "argmax_bf16_batch")
@@ -157,7 +162,7 @@ impl TransformerModel {
         let batched_embed_kernel = gpu.kernel("embed_from_argmax", "batched_embed")?;
         let fill_slots_kernel = gpu.kernel("metadata_fill", "fill_slots_from_block_table")?;
         let profile = config.profile;
-        let profile_first = std::env::var("ATLAS_PROFILE_FIRST").is_ok();
+        let profile_first = super::graph_flags::profile_first();
         let final_norm_identity = config.final_norm_is_identity();
         super::final_norm::check_final_norm_identity(&config)?;
 
@@ -167,6 +172,24 @@ impl TransformerModel {
         // tasks/determinism_investigation.md).
         let mut levers = ops::ModelLevers::from_env();
         levers.max_decode_seqs = (max_batch_size as u32).max(1);
+        levers.qwen4exp_exact_verify = super::qwen4exp_exact_verify::lever(&config.model_type)?;
+        levers.qwen4exp_batch_fast = super::qwen4exp_batch_fast::lever(&config.model_type)?;
+        levers.qwen4exp_mtp_depth = super::qwen4exp_mtp_depth::lever(
+            &config.model_type,
+            levers.qwen4exp_exact_verify,
+            levers.qwen4exp_batch_fast,
+        )?;
+        if levers.qwen4exp_batch_fast {
+            levers.qwen4exp_batch_small = super::qwen4exp_batch_fast::small_lever();
+            levers.qwen4exp_batch_bisect = super::qwen4exp_batch_fast::bisect_requested();
+            if levers.qwen4exp_batch_bisect != 0 {
+                tracing::warn!(
+                    "ATLAS_QWEN4EXP_BATCH_FAST_BISECT={:#x}: batched-step components forced \
+                     to single-row launches (diagnostic, slow)",
+                    levers.qwen4exp_batch_bisect
+                );
+            }
+        }
 
         tracing::info!(
             "TransformerModel: {} layers, vocab={}, hidden={}{}{}",
@@ -323,6 +346,13 @@ impl TransformerModel {
         };
         let glm_long_stage =
             super::impl_a1_spec_init::alloc_glm_long_stage(&config, has_mtp, gpu.as_ref())?;
+        let lmhead_split = super::qwen4exp_lmhead_split::HeadSplit::alloc(
+            &config.model_type,
+            config.vocab_size,
+            comm.as_deref(),
+            max_batch_size,
+            gpu.as_ref(),
+        )?;
         // Batched-verify WY pointer-table staging (fixed address for CUDA
         // graph stability; contents refreshed pre-graph every batched verify
         // step). One [h|Hi0..Hi14] x 32-entry slice per GDN layer — ~192 KB.
@@ -663,6 +693,7 @@ impl TransformerModel {
             lm_head_dp4a_quant_kernel,
             dense_gemm_kernel,
             dense_gemv_batchm_kernel,
+            qwen4exp_wide_rows,
             argmax_kernel,
             argmax_batch_kernel,
             argmax_logits_kernel,
@@ -700,6 +731,7 @@ impl TransformerModel {
             verify_hidden_stash,
             verify_stream_stash,
             glm_long_stage,
+            lmhead_split,
             mtp_catchup_ring,
             mtp_catchup_meta: parking_lot::Mutex::new((0, 0)),
             mtp_prefill_hidden,
@@ -725,13 +757,16 @@ impl TransformerModel {
             // Nothing staged yet: the buffer was memset to zero above, and no
             // key describes zero, so the first verify step always uploads.
             verify_wy_cache: Mutex::new(None),
+            verify_bt_stage: Mutex::new(super::pinned_upload::PinnedUpload::EMPTY),
             verify_kgamma_graph: Mutex::new(std::collections::HashMap::new()),
             fused_graph: Mutex::new(std::collections::HashMap::new()),
             verify_pieces: Default::default(),
+            decode_pieces: super::decode_pieces::new_cache(),
             prefix_cache,
             warm,
             secondary_stream,
             secondary_event,
+            gdn_fuse: Default::default(),
             snapshot_event,
             comm,
             ep_cmd_buf,

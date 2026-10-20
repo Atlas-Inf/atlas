@@ -95,6 +95,24 @@ impl Qwen3AttentionLayer {
                 ctx,
                 stream,
             )?;
+        // qwen4_exp (ATLAS_QWEN4EXP_PREFILL_HC): the same seam on the low-rank
+        // collapse, bit-identical to the separate post and pre.
+        let seam = seam
+            || (!diag_this
+                && ops::qwen4exp_prefill_hc::hc_post_pre_seam(
+                    ctx.gpu,
+                    hc,
+                    &hc.ffn,
+                    attn_out,
+                    ctx.buffers.hc_streams(),
+                    hidden,
+                    ctx.buffers.hc_post(),
+                    ctx.buffers.hc_lowrank_scratch(),
+                    n,
+                    ctx.config.hidden_size as u32,
+                    ctx.config.rms_norm_eps as f32,
+                    stream,
+                )?);
         Ok(seam)
     }
 

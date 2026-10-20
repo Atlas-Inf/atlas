@@ -69,18 +69,44 @@ impl MoeLayer {
         )
     }
 
+    /// `ATLAS_MOE_DECODE_ARM=grouped`, or a DFlash capture layer under
+    /// `ATLAS_FRANKENSTEIN_DECODE_VIA_PREFILL=1`: single-token decode takes
+    /// the grouped prefill MoE (`forward_prefill(M=1)`).
+    pub(super) fn decode_via_grouped_arm(&self) -> bool {
+        moe_decode_arm_grouped()
+            || (self.is_dflash_capture_layer
+                && std::env::var("ATLAS_FRANKENSTEIN_DECODE_VIA_PREFILL")
+                    .ok()
+                    .as_deref()
+                    == Some("1"))
+    }
+
     pub fn forward(
         &self,
         input: DevicePtr,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        Ok(self.forward_hc_post(input, ctx, None, stream)?.0)
+    }
+
+    /// [`Self::forward`], and with `hc_post` the layer's low-rank mHC post
+    /// when the EP shared-expert blend can run fused with it
+    /// (`ATLAS_QWEN4EXP_DECODE_FUSE`, MoE group). Returns the output and
+    /// whether the post ran.
+    pub fn forward_hc_post(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        hc_post: Option<ops::qwen4exp_decode_fuse::MoeHcPost>,
+        stream: u64,
+    ) -> Result<(DevicePtr, bool)> {
         self.btile_input_guard(input, 1, ctx, stream)?;
         // Expert TP slices the routed width, which the fused routed+shared
         // decode kernels assume equals the shared expert's; take the grouped path.
         if self.routed_scales_released || ctx.config.expert_tp {
             self.forward_prefill(input, 1, ctx, stream)?;
-            return Ok(ctx.buffers.moe_output());
+            return Ok((ctx.buffers.moe_output(), false));
         }
         // SOLID Incr-4: a genuine single-token decode (num_seqs == 1) folds the
         // routed expert down_proj LoRA delta below (before the wsum blend). The
@@ -112,13 +138,7 @@ impl MoeLayer {
         // preserving Atlas's TPS on the bulk of the network. The 5 capture layers
         // pay ~250 µs each (microbench), totalling ≈1.25 ms per token (negligible
         // at Atlas's ~58 ms/token decode latency).
-        if moe_decode_arm_grouped()
-            || (self.is_dflash_capture_layer
-                && std::env::var("ATLAS_FRANKENSTEIN_DECODE_VIA_PREFILL")
-                    .ok()
-                    .as_deref()
-                    == Some("1"))
-        {
+        if self.decode_via_grouped_arm() {
             // One-time per-process log so we can verify the env-gated route is hit.
             if ctx.stats.once("log:moe_route") {
                 tracing::info!(
@@ -126,9 +146,48 @@ impl MoeLayer {
                 );
             }
             self.forward_prefill(input, 1, ctx, stream)?;
-            return Ok(ctx.buffers.moe_output());
+            return Ok((ctx.buffers.moe_output(), false));
         }
 
+        let output = ctx.buffers.moe_output();
+        // The shared expert's down output, kept until the EP reduce adds it.
+        let shared_out = ctx.buffers.attn_output();
+        self.forward_row_local(input, output, shared_out, single_seq_decode, ctx, stream)?;
+        let posted = self.forward_ep_reduce(output, shared_out, input, 1, hc_post, ctx, stream)?;
+
+        if tracing::enabled!(tracing::Level::DEBUG) && !ctx.graph_capture {
+            ctx.gpu.synchronize(stream)?;
+            let mut buf = vec![0u8; 8];
+            ctx.gpu.copy_d2h(output, &mut buf)?;
+            let vals: Vec<f32> = (0..4)
+                .map(|i| {
+                    let lo = buf[i * 2];
+                    let hi = buf[i * 2 + 1];
+                    f32::from_bits(((lo as u32) | ((hi as u32) << 8)) << 16)
+                })
+                .collect();
+            tracing::info!("  MoE output: {:?}", vals);
+        }
+
+        Ok((output, posted))
+    }
+
+    /// One row of [`Self::forward`] from routing through the weighted-sum
+    /// blend into `output`, the shared expert's down output into `shared_out`.
+    /// Under EP the blend leaves the shared expert out (the EP reduce adds it
+    /// once, after the all-reduce): [`Self::forward_ep_reduce`] completes it.
+    /// [`Self::forward_rows`] runs this per row with the reduce batched.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn forward_row_local(
+        &self,
+        input: DevicePtr,
+        output: DevicePtr,
+        shared_out: DevicePtr,
+        single_seq_decode: bool,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let profile = ctx.profile;
         // GeGLU models: fused kernels now have GELU activation (model-specific override).
         // No longer need to redirect through sorted prefill path.
         // But we still need pre_expert_norm between routing and dispatch.
@@ -140,7 +199,6 @@ impl MoeLayer {
         let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
         let num_experts = ctx.config.num_experts as u32;
         let top_k = ctx.config.num_experts_per_tok as u32;
-        let profile = ctx.profile;
 
         macro_rules! prof {
             ($label:expr, $body:expr) => {{
@@ -371,7 +429,6 @@ impl MoeLayer {
         // `project_batch_decode_corruption.md` (2026-05-10).
         let shared_gate_scratch = ctx.buffers.logits();
         let shared_up_scratch = ctx.buffers.ssm_qkvz();
-        let shared_out = ctx.buffers.attn_output();
 
         if let (Some(gp), Some(up), Some(dp), Some(shared)) = (
             self.bf16_gate_weight_ptrs,
@@ -535,6 +592,14 @@ impl MoeLayer {
                     stream,
                 )
             })?;
+        } else if self.qwen4exp_moe_rows.units_tc
+            && self.qwen4exp_moe_rows.units_ready()
+            && self.lora.is_none()
+        {
+            // ATLAS_QWEN4EXP_MOE_TC (contract (b)): this row on the
+            // tensor-core units the batched rows take (`forward_rows`), so a
+            // row's MoE output does not depend on how it was batched.
+            self.units_experts(expert_input, indices_dev, (0, 1), shared_out, ctx, stream)?;
         } else {
             // NVFP4 path: fused routed+shared gate+up
             prof!("exp_gate_up", {
@@ -710,14 +775,10 @@ impl MoeLayer {
         // If we include it in the output before all-reduce, it gets summed world_size
         // times. Solution: pass NULL shared_out for EP, all-reduce the routed sum,
         // then add shared_out once after all-reduce.
-        let output = ctx.buffers.moe_output();
         let is_ep = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
         let shared_for_blend = if is_ep && !shared_out.is_null() {
             // EP: exclude shared expert from blend (will add after all-reduce).
-            // Zero a temp buffer to pass as shared_out (kernel reads it even with NULL gate).
-            let zero_buf = ctx.buffers.expert_gate_out(); // temp buffer, will be zeroed
-            ctx.gpu.memset_async(zero_buf, 0, h as usize * 2, stream)?;
-            zero_buf
+            self.ep_blend_zero_row(ctx, stream)?
         } else {
             shared_out
         };
@@ -738,6 +799,44 @@ impl MoeLayer {
             )
         })?;
 
+        Ok(())
+    }
+
+    /// The shared row an EP blend passes in place of the shared expert's
+    /// output (the EP reduce adds that once, after the all-reduce): a zeroed
+    /// temp row, or, where the kernel reads a null row as that zero row
+    /// (`ATLAS_QWEN4EXP_DECODE_FUSE`), null and no memset.
+    pub(super) fn ep_blend_zero_row(&self, ctx: &ForwardContext, stream: u64) -> Result<DevicePtr> {
+        if ops::qwen4exp_decode_fuse::null_shared_row(ctx.gpu)? {
+            return Ok(DevicePtr::NULL);
+        }
+        let zero_buf = ctx.buffers.expert_gate_out(); // temp buffer, zeroed here
+        ctx.gpu
+            .memset_async(zero_buf, 0, ctx.config.hidden_size * 2, stream)?;
+        Ok(zero_buf)
+    }
+
+    /// The EP tail of [`Self::forward`] over `rows` rows: ONE all-reduce of the
+    /// `[rows, h]` partial outputs, then the shared expert added once per row
+    /// (`moe_batched_blend`, one block per row; with `hc_post`, a single row's
+    /// blend, or under `ATLAS_QWEN4EXP_BATCH_SMALL` the rows' blends, may run
+    /// fused with the layer's mHC post). Each element is the
+    /// same commutative two-rank BF16 sum and the same per-row blend as `rows`
+    /// single-row tails, so a batched reduce is bit-identical to per-row ones.
+    /// Returns whether the post ran. No-op without EP.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn forward_ep_reduce(
+        &self,
+        output: DevicePtr,
+        shared_out: DevicePtr,
+        input: DevicePtr,
+        rows: usize,
+        hc_post: Option<ops::qwen4exp_decode_fuse::MoeHcPost>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        let h = ctx.config.hidden_size as u32;
+        let mut posted = false;
         // EP all-reduce: sum partial expert outputs across ranks.
         // Each rank only computed its local experts (remote → zero), so
         // SUM gives the correct global result.
@@ -745,9 +844,9 @@ impl MoeLayer {
             && ctx.config.ep_world_size > 1
         {
             if ctx.graph_capture {
-                comm.all_reduce(output.0, h as usize * 2)?;
+                comm.all_reduce(output.0, rows * h as usize * 2)?;
             } else {
-                comm.all_reduce_async(output.0, h as usize * 2, stream)?;
+                comm.all_reduce_async(output.0, rows * h as usize * 2, stream)?;
             }
             // Now add shared expert contribution ONCE (after all-reduce).
             // Must apply the sigmoid gate: output += sigmoid(dot(input, gate_w)) * shared_out.
@@ -757,38 +856,51 @@ impl MoeLayer {
             if !shared_out.is_null() {
                 if self.weights.shared_expert_gate.weight.0 == 0 {
                     // No gate weight (e.g., Mistral): shared expert always at full strength.
-                    ops::residual_add(ctx.gpu, self.residual_add, output, shared_out, h, stream)?;
-                } else {
-                    // Gated shared expert (e.g., Qwen3.5): apply sigmoid gate.
-                    ops::moe_batched_blend(
+                    ops::residual_add(
                         ctx.gpu,
-                        self.moe_batched_blend,
+                        self.residual_add,
                         output,
                         shared_out,
-                        input,
-                        self.weights.shared_expert_gate.weight,
-                        h,
-                        1,
+                        rows as u32 * h,
                         stream,
                     )?;
+                } else {
+                    // Gated shared expert (e.g., Qwen3.5): apply sigmoid gate,
+                    // fused with the layer's mHC post when it can be.
+                    // Several rows only under ATLAS_QWEN4EXP_BATCH_SMALL (a
+                    // block row per token, each the single-row arithmetic).
+                    let rows_ok = rows == 1 || ctx.levers.qwen4exp_batch_small;
+                    posted = match hc_post.filter(|_| rows_ok) {
+                        Some(post) => ops::qwen4exp_decode_fuse::moe_blend_hc_post(
+                            ctx.gpu,
+                            post,
+                            output,
+                            shared_out,
+                            input,
+                            self.weights.shared_expert_gate.weight,
+                            h,
+                            rows as u32,
+                            stream,
+                        )?,
+                        None => false,
+                    };
+                    if !posted {
+                        ops::moe_batched_blend(
+                            ctx.gpu,
+                            self.moe_batched_blend,
+                            output,
+                            shared_out,
+                            input,
+                            self.weights.shared_expert_gate.weight,
+                            h,
+                            rows as u32,
+                            stream,
+                        )?;
+                    }
                 }
             }
         }
 
-        if tracing::enabled!(tracing::Level::DEBUG) && !ctx.graph_capture {
-            ctx.gpu.synchronize(stream)?;
-            let mut buf = vec![0u8; 8];
-            ctx.gpu.copy_d2h(output, &mut buf)?;
-            let vals: Vec<f32> = (0..4)
-                .map(|i| {
-                    let lo = buf[i * 2];
-                    let hi = buf[i * 2 + 1];
-                    f32::from_bits(((lo as u32) | ((hi as u32) << 8)) << 16)
-                })
-                .collect();
-            tracing::info!("  MoE output: {:?}", vals);
-        }
-
-        Ok(output)
+        Ok(posted)
     }
 }

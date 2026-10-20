@@ -78,6 +78,9 @@ pub struct SchedLevers {
     pub mtp_gate_force: bool,
     /// Per-request K=3/K=5 selection for low-concurrency MTP.
     pub mtp_single_depth_adapt: bool,
+    /// Per-request deep MTP draft ceiling (`ATLAS_MTP_DYNAMIC_DEPTH=1`,
+    /// `mtp_deep_depth`).
+    pub mtp_dynamic_depth: bool,
     pub adadec_diagnostic: bool,
 
     /// Loop watchdog. **Runtime-mutable** — the TUI ops REPL toggles it while
@@ -184,6 +187,7 @@ impl SchedLevers {
             // the fallback for scripts that predate the flag.
             mtp_gate_force: mtp_gate_force(),
             mtp_single_depth_adapt: opt_in("ATLAS_MTP_SINGLE_DEPTH_ADAPT"),
+            mtp_dynamic_depth: spark_model::speculative::deep_depth::enabled(),
             adadec_diagnostic: present("ATLAS_ADADEC_DIAGNOSTIC"),
 
             loop_watchdog: AtomicBool::new(false),
@@ -219,8 +223,17 @@ impl SchedLevers {
             mtp_timing: false,
             mtp_gate_force: false,
             mtp_single_depth_adapt: false,
+            mtp_dynamic_depth: false,
             adadec_diagnostic: false,
             loop_watchdog: AtomicBool::new(false),
+        }
+    }
+
+    /// The per-request depth controllers' levers.
+    pub fn depth(&self) -> crate::scheduler::mtp_deep_depth::DepthLevers {
+        crate::scheduler::mtp_deep_depth::DepthLevers {
+            adapt: self.mtp_single_depth_adapt,
+            deep: self.mtp_dynamic_depth,
         }
     }
 
@@ -282,6 +295,7 @@ mod tests {
         assert!(
             !d.decode_timing && !d.mtp_timing && !d.mtp_single_depth_adapt && !d.adadec_diagnostic
         );
+        assert!(!d.mtp_dynamic_depth);
     }
 
     #[test]

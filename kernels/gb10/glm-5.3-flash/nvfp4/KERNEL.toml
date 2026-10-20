@@ -70,5 +70,11 @@ prefill_attn_compressed = "prefill_attn_compressed"
 # swiglu_limit shadow of moe_silu_mul.cu: the launch site checks the kernel
 # handle and falls back to the unfused silu_mul → per_token_group_quant_fp8
 # pair (see fused_silu_quant_ok in forward_prefill_fp8.rs).
+#
+# w4a16_gemv_qg_batch4 is the qwen4_exp exact K=4 verify's Q+gate tier
+# (qwen3.8-flash-next only). qwen3_attention resolves it with try_kernel and
+# runs it only under the qwen4_exp exact-verify / batch-fast levers, so this
+# shadow of w4a16_gemv.cu does not carry it.
 [shadow_exempt]
 moe_silu_mul = ["silu_mul_quant_fp8"]
+w4a16_gemv = ["w4a16_gemv_qg_batch4"]

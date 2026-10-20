@@ -175,6 +175,15 @@ pub struct MoeLayer {
     pub(super) moe_expert_silu_down_shared_batch2_t_k: KernelHandle,
     pub(super) moe_expert_gate_up_shared_batch3_t_k: KernelHandle,
     pub(super) moe_expert_silu_down_shared_batch3_t_k: KernelHandle,
+    /// `ATLAS_QWEN4EXP_MOE_FAST=1`: qwen4_exp's 1..4-row replacement for the
+    /// `_t` / `_batch2_t` / `_batch3_t` pairs above (`qwen4exp_fast.rs`).
+    /// Both handles 0 (off) for every other model and by default.
+    pub(super) qwen4exp_moe_fast: ops::Qwen4ExpMoeFast,
+    /// `ATLAS_QWEN4EXP_BATCH_FAST`: the expert-sorted row grid of the
+    /// originals-layout pair (`forward_rows.rs`). All 0 otherwise.
+    pub(super) qwen4exp_moe_rows: ops::Qwen4ExpMoeRows,
+    /// The router's 16-row tier under the lane (`forward_rows.rs`).
+    pub(super) wide_rows: ops::Qwen4ExpWideRows,
     pub(super) moe_expert_gate_up_shared_fp8_t_k: KernelHandle,
     pub(super) moe_expert_silu_down_shared_fp8_t_k: KernelHandle,
     pub(super) moe_expert_gate_up_shared_fp8_batch2_t_k: KernelHandle,

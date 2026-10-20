@@ -121,7 +121,7 @@ fn read(gpu: &dyn GpuBackend, p: DevicePtr, bytes: usize, stream: u64) -> Result
 fn dense_tp_split_matches_the_unsplit_ffn() -> Result<()> {
     let gpu = crate::layers::glm_gpu_test_backend::backend()?;
     let g: &dyn GpuBackend = gpu;
-    crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(g);
+    crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(g, true);
     let tc = g.kernel("w4a16_gemv", "w4a16_gemv_tc8")?;
     let act_mul = g.kernel("moe_silu_mul", "moe_silu_mul")?;
     let mut rng = Rng(0xd15c_0de5);

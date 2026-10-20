@@ -56,7 +56,7 @@ fn canonical_verify_microbench() -> Result<()> {
     ensure!(enabled(), "run with ATLAS_W4A16_TC=1 and the switch on");
     let gpu = backend()?;
     let gpu: &dyn GpuBackend = gpu;
-    crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu);
+    crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu, true);
     let mut rng = Rng(0x5eed_1234_abcd_0004);
     let w4s = |rng: &mut Rng, n, k| {
         (0..COPIES)

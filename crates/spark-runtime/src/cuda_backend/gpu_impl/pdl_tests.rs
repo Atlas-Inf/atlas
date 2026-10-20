@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Source contract between [`PDL_KERNELS`] and every kernel a PDL target serves.
+//! Source contract between each PDL target list and the kernels it serves.
 
-use super::{PDL_KERNELS, PDL_TARGETS};
+use super::PDL_TARGETS;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -108,17 +108,38 @@ fn kernels(src: &str) -> Vec<(&str, bool)> {
         .collect()
 }
 
-/// The kernel sources a quant dir serves: `common/` overlaid by file name
-/// (atlas-kernels `collect_cu_files`).
-fn served_sources(common: &Path, quant: &Path) -> Vec<PathBuf> {
+/// `[build] base_quant` of a quant dir's KERNEL.toml: the sibling it
+/// composes on (the Qwen3.8-Flash-Next EXL3 dir sits on `nvfp4/`).
+fn base_quant(quant: &Path) -> Option<String> {
+    let toml = std::fs::read_to_string(quant.join("KERNEL.toml")).ok()?;
+    toml.lines().find_map(|line| {
+        let value = line
+            .trim()
+            .strip_prefix("base_quant")?
+            .trim()
+            .strip_prefix('=')?;
+        Some(value.trim().trim_matches('"').to_owned())
+    })
+}
+
+/// The kernel sources a quant dir serves: `common/`, then its base quant dir
+/// if any, then itself, each overlaying the previous by file name
+/// (atlas-kernels `collect_cu_files`). `true` marks a file from the target's
+/// own dirs rather than `common/`.
+fn served_sources(common: &Path, quant: &Path) -> Vec<(PathBuf, bool)> {
+    let mut dirs = vec![(common.to_path_buf(), false)];
+    if let Some(base) = base_quant(quant) {
+        dirs.push((quant.parent().unwrap().join(base), true));
+    }
+    dirs.push((quant.to_path_buf(), true));
     let mut files = BTreeMap::new();
-    for dir in [common, quant] {
+    for (dir, own) in dirs {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
             // `.cuh` too: a kernel may be defined in a header its `.cu` includes
             // (the GLM M16 MoE decode kernels are).
             if path.extension().is_some_and(|e| e == "cu" || e == "cuh") {
-                files.insert(path.file_name().unwrap().to_owned(), path);
+                files.insert(path.file_name().unwrap().to_owned(), (path, own));
             }
         }
     }
@@ -226,34 +247,54 @@ extern "C" __global__ void tri_input(const unsigned char* __restrict__ w0, float
     );
 }
 
-/// A kernel is launched with PDL exactly when it is on [`PDL_KERNELS`], by
-/// name, whichever file of the target defines it. One that is listed but does
-/// not wait reads its predecessor's output early. The converse is safe:
-/// a kernel may contain a wait while retaining ordinary launch semantics.
-/// A source refactor must not silently opt more kernels into overlapping
-/// execution just to make this safety contract pass.
+/// What a PDL target lists against what its sources define:
+///
+/// * every listed kernel is defined in every quant dir of the target, and
+///   every copy of it waits first (one that does not would read its
+///   predecessor's output early);
+/// * a kernel of the target's own dirs that waits is listed (one that is not
+///   pays the launch gap PDL exists to remove: the five-row KDA triple did,
+///   at every width-5 verify step), except the GLM persistent twins whose
+///   overlapping launch has not been qualified;
+/// * a `common/` kernel that waits is listed by some PDL target. It need not
+///   be listed by every target that serves it: without the launch attribute
+///   its wait is a no-op, and each target opts its own decode chain in.
+///   RDMA one-shot is launched directly by spark-comm with its own PDL policy.
 #[test]
-fn pdl_target_kernels_wait_when_listed() {
+fn pdl_target_kernels_wait_exactly_when_listed() {
     let gb10 = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels/gb10");
+    let listed_anywhere = |name: &str| PDL_TARGETS.iter().any(|t| t.kernels.contains(&name));
     for target in PDL_TARGETS {
-        for quant in std::fs::read_dir(gb10.join(target)).unwrap() {
+        for quant in std::fs::read_dir(gb10.join(target.model)).unwrap() {
             let quant = quant.unwrap().path();
             if !quant.is_dir() {
                 continue;
             }
             let mut defined = Vec::new();
-            for path in served_sources(&gb10.join("common"), &quant) {
+            for (path, own) in served_sources(&gb10.join("common"), &quant) {
                 let src = without_comments(&std::fs::read_to_string(&path).unwrap());
                 for (name, waits) in kernels(&src) {
+                    let listed = target.kernels.contains(&name);
                     assert!(
-                        !PDL_KERNELS.contains(&name) || waits,
-                        "{}: {name} is PDL-listed but does not wait before consuming inputs",
-                        path.display()
+                        waits || !listed,
+                        "{}: {name} is on the {} PDL list but does not wait on PDL entry",
+                        path.display(),
+                        target.model
+                    );
+                    assert!(
+                        !waits
+                            || listed
+                            || (!own && listed_anywhere(name))
+                            || name == "rdma_oneshot_bf16"
+                            || (target.model == "glm-5.3-flash" && name.ends_with("_l2pf_p")),
+                        "{}: {name} waits on PDL entry but is not on the {} PDL list",
+                        path.display(),
+                        target.model
                     );
                     defined.push(name.to_owned());
                 }
             }
-            for listed in PDL_KERNELS {
+            for listed in target.kernels {
                 assert!(
                     defined.iter().any(|name| name == listed),
                     "{listed} is listed, but {} defines no such kernel",

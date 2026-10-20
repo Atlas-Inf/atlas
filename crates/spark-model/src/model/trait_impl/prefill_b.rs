@@ -29,15 +29,24 @@ mod batch_kernel;
 #[cfg(test)]
 mod batch_kernel_tests;
 mod batched_layer;
-mod embed_chunk;
+pub(in crate::model) mod embed_chunk;
 mod finalize_last;
 mod forward_layers;
 mod h_state_ptrs;
 mod midchunk_capture;
+mod multi;
+mod multi_ep;
+mod multi_head;
+pub use multi_ep::{multi_cached, multi_requested};
+#[path = "prefill_b/dispatch.rs"]
+mod dispatch;
+pub(in crate::model) mod pc_inflight;
 pub(in crate::model) mod pc_policy;
 mod prefix_lookup;
 mod proc_range;
 mod prompt_logprobs;
+mod qwen4exp_ckpt;
+pub(in crate::model) mod qwen4exp_points;
 mod save_checkpoint;
 mod stage_batched;
 mod upload_meta;
@@ -45,26 +54,6 @@ mod upload_paged;
 mod warm;
 
 impl TransformerModel {
-    pub(super) fn prefill_chunk_dispatch(
-        &self,
-        tokens: &[u32],
-        seq: &mut SequenceState,
-        chunk_start: usize,
-        chunk_len: usize,
-        is_last_chunk: bool,
-        stream: u64,
-    ) -> Result<DevicePtr> {
-        self.prefill_chunk_dispatch_with(
-            tokens,
-            seq,
-            chunk_start,
-            chunk_len,
-            is_last_chunk,
-            stream,
-            None,
-        )
-    }
-
     /// The chunk, optionally carrying DFlash verify owners after its rows
     /// (`glm_fused_chunk`).
     #[allow(clippy::too_many_arguments)]
@@ -153,8 +142,13 @@ impl TransformerModel {
             // That is the OTHER way to satisfy the invariant — always one pass — and
             // it keeps the single-pass numerics, at the cost of the warm-turn tail
             // checkpoint this split exists to create.
-            let split_disabled = pc_policy::tail_split_disabled();
-            if !split_disabled && cut > chunk_start && cut < total {
+            // ATLAS_QWEN4EXP_PREFILL_ROWINV: a block-grid cut is off the GDN
+            // grid; without the in-pass checkpoint the last chunk stays whole.
+            let split_disabled =
+                pc_policy::tail_split_disabled() || crate::layers::ops::qwen4exp_rowinv::on();
+            // ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT: one pass, checkpoint in-pass.
+            let in_pass = self.qwen4exp_ckpt_takes_tail();
+            if !split_disabled && !in_pass && cut > chunk_start && cut < total {
                 anyhow::ensure!(
                     passengers.is_none(),
                     "GLM fused chunk cannot take the tail-checkpoint split"
@@ -217,9 +211,15 @@ impl TransformerModel {
             None,
         )?;
         self.warm_trace_sync(stream)?;
+        // ATLAS_QWEN4EXP_SNAPSHOT_AUX_MB: after the restore read its slot.
+        self.enforce_snapshot_aux_budget(&mut kv_cache);
         let t_lookup = tp.elapsed() - t_embed;
-        // ATLAS_GLM_PC_BRANCH: split at the planned branch checkpoint.
-        if let Some(at) = pc_policy::branch_split_at(seq.pc_branch_at, span, passengers.is_some()) {
+        // ATLAS_GLM_PC_INFLIGHT: a checkpoint the head asked for (`pc_inflight`).
+        self.pc_apply_plant(tokens, seq, span.0, kv_cache.block_size());
+        // ATLAS_GLM_PC_BRANCH: split at the planned branch checkpoint
+        // (ATLAS_QWEN4EXP_PC_BRANCH captures it in-pass instead).
+        let split_branch = seq.pc_branch_at.filter(|_| !self.qwen4exp_pc_branch());
+        if let Some(at) = pc_policy::branch_split_at(split_branch, span, passengers.is_some()) {
             drop(kv_cache);
             return self.pc_branch_split(tokens, seq, span, at, is_last_chunk, stream);
         }
@@ -363,14 +363,14 @@ impl TransformerModel {
         // ── Mid-chunk tail SSM capture (opt-in): plan BEFORE the forward
         // pass so SSM layers split their h/conv kernels at `tb` in-pass.
         // `None` (flag off or pass doesn't span `tb`) => no split. ──
-        let midcap_plan = self.prepare_midchunk_capture(
+        let midcap_plan = self.plan_pass_capture(
             tokens,
             seq,
             &mut kv_cache,
-            proc_start,
-            proc_count,
+            [proc_start, proc_count],
+            is_last_chunk,
             stream,
-        );
+        )?;
         anyhow::ensure!(
             midcap_plan.is_none() || passenger_run.is_none(),
             "GLM fused chunk cannot split the SSM recurrence mid-chunk"
@@ -436,7 +436,7 @@ impl TransformerModel {
 
         // Register the reserved slot as the session tail once the full pass has
         // captured the @tb state into it (no-op when no capture was planned).
-        if let Some(plan) = midcap_plan.as_ref() {
+        if let Some(plan) = midcap_plan.as_ref().filter(|p| !p.ckpt) {
             self.finalize_midchunk_capture(tokens, seq, plan);
         }
 
@@ -464,6 +464,8 @@ impl TransformerModel {
             stream,
         )?;
 
+        let _pass_aux =
+            self.qwen4exp_ckpt_saves(tokens, seq, &mut kv_cache, &midcap_plan, stream)?;
         let out = if is_last_chunk {
             // ── Phase 6+7+8: final norm, lm_head, prefix-cache + snapshot save ──
             self.prefill_b_finalize_last(

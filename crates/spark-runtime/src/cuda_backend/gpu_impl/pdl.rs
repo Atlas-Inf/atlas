@@ -1,41 +1,75 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Programmatic dependent launch (PDL) gating: which kernel targets and
-//! kernels are launched with PDL under `ATLAS_PDL=1`.
+//! kernels are launched with PDL, and under which switch.
+//!
+//! Each PDL target names its switch and its own kernel list: GLM-5.3-Flash
+//! under `ATLAS_PDL=1` ([`PDL_KERNELS`]), Qwen3.8-Flash-Next under
+//! `ATLAS_QWEN4EXP_PDL=1` ([`QWEN4EXP_PDL_KERNELS`]). A list is its target's
+//! own: a `common/` kernel that waits for one target's sake is launched with
+//! PDL only where a target lists it (without the launch attribute its
+//! `griddepcontrol` instructions are no-ops).
 
 use std::sync::OnceLock;
 
-/// Kernel targets whose every copy of a [`PDL_KERNELS`] entry starts with
-/// `atlas_pdl_enter()`. Launching any other copy with PDL would let it read its
-/// predecessor's output early, so `ATLAS_PDL=1` is honoured only for these.
-const PDL_TARGETS: &[&str] = &["glm-5.3-flash"];
+/// A kernel target with PDL-entered kernels: its name, the switch that turns
+/// PDL on for it, and the kernels it then launches with PDL. Every copy of a
+/// listed kernel the target serves starts with `atlas_pdl_enter()`; launching
+/// any other kernel with PDL would let it read its predecessor's output early.
+pub(super) struct PdlTarget {
+    pub(super) model: &'static str,
+    pub(super) switch: &'static str,
+    pub(super) kernels: &'static [&'static str],
+}
 
-static PDL_TARGET: OnceLock<bool> = OnceLock::new();
+pub(super) const PDL_TARGETS: &[PdlTarget] = &[
+    PdlTarget {
+        model: "glm-5.3-flash",
+        switch: "ATLAS_PDL",
+        kernels: PDL_KERNELS,
+    },
+    PdlTarget {
+        model: "qwen3.8-flash-next",
+        switch: "ATLAS_QWEN4EXP_PDL",
+        kernels: QWEN4EXP_PDL_KERNELS,
+    },
+];
+
+static PDL_TARGET: OnceLock<Option<&'static PdlTarget>> = OnceLock::new();
 
 /// Record the served kernel target before any kernel handle is resolved.
 pub fn configure_pdl(target_model: &str) {
-    let allowed = PDL_TARGETS.contains(&target_model);
-    if !allowed && std::env::var("ATLAS_PDL").as_deref() == Ok("1") {
-        tracing::warn!(
-            "ATLAS_PDL=1 ignored: kernel target {target_model} has no PDL-entered kernels"
-        );
+    for other in PDL_TARGETS.iter().filter(|t| t.model != target_model) {
+        if std::env::var(other.switch).as_deref() == Ok("1") {
+            tracing::warn!(
+                "{}=1 ignored: it enables PDL for kernel target {}, not {target_model}",
+                other.switch,
+                other.model
+            );
+        }
     }
-    let _ = PDL_TARGET.set(allowed);
+    let _ = PDL_TARGET.set(PDL_TARGETS.iter().find(|t| t.model == target_model));
 }
 
-/// `ATLAS_PDL=1` on a PDL-ready target: launch the kernels below with
+fn target() -> Option<&'static PdlTarget> {
+    PDL_TARGET.get().copied().flatten()
+}
+
+/// The served target's PDL switch is `1`: launch its listed kernels with
 /// programmatic dependent launch. Read once, after [`configure_pdl`].
 pub fn pdl_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("ATLAS_PDL").as_deref() == Ok("1")
-            && PDL_TARGET.get().copied().unwrap_or(false)
-    })
+    *ON.get_or_init(|| target().is_some_and(|t| std::env::var(t.switch).as_deref() == Ok("1")))
 }
 
-/// Kernels whose every copy starts with `atlas_pdl_enter()`
-/// (kernels/gb10/common/atlas_pdl.cuh), or with `atlas_pdl_enter_touch(..)`
-/// (or its `_pair` / `_tri` forms),
+/// Whether `func_name` launches with PDL: PDL is on and the served target
+/// lists it.
+pub(super) fn pdl_kernel(func_name: &str) -> bool {
+    pdl_enabled() && target().is_some_and(|t| t.kernels.contains(&func_name))
+}
+
+/// GLM-5.3-Flash: kernels whose every copy starts with `atlas_pdl_enter()`
+/// (kernels/gb10/common/atlas_pdl.cuh), or with `atlas_pdl_enter_touch(..)`,
 /// which before its wait reads only two of the kernel's immutable weight
 /// parameters (kernels/gb10/glm-5.3-flash/nvfp4/atlas_pdl_touch.cuh). A kernel
 /// launched with PDL must not read its predecessor's output before that wait,
@@ -133,6 +167,54 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "kda_commit_records",
     "kda_commit_records_stride",
     "kda_sigmoid_gated_rms_norm",
+];
+
+/// Qwen3.8-Flash-Next (`ATLAS_QWEN4EXP_PDL=1`): the single-token decode chain
+/// of a GDN layer, an attention layer and the MoE, as `atlas_pdl_enter()`
+/// kernels. Not listed, on purpose: the RDMA one-shot all-reduce
+/// (`rdma_oneshot_bf16`, see its kernel note), the routed-expert GEMVs, the
+/// QSA indexer and cuBLASLt. A kernel after an unlisted one (or after a copy
+/// or memset) simply launches when its predecessor completes.
+pub(super) const QWEN4EXP_PDL_KERNELS: &[&str] = &[
+    // mHC (ATLAS_QWEN4EXP_HC_FAST) and the fused seam.
+    "hc_pre_stage_vec",
+    "hc_pre_down_vec",
+    "hc_pre_down_vec8",
+    "hc_pre_finish_vec",
+    "hc_pre_finish_vec8",
+    "hc_pre_down_vec_rows",
+    "hc_pre_finish_vec_rows",
+    "hc_pre_down_vec_wide",
+    "hc_post_vec",
+    "hc_post_stage_vec",
+    "hc_mma_down",
+    "hc_mma_down_rows",
+    "hc_mma_finish",
+    "hc_mma_finish_rows",
+    // GDN mixer: projections, the four small kernels and their fused twin.
+    "dense_gemv_bf16",
+    "dense_gemv_fp8w",
+    "w4a16_gemv",
+    "w4a16_gemv_sw",
+    "dense_gemv_ba_gates",
+    "causal_conv1d_update_l2norm_f32",
+    "gated_delta_rule_decode_f32",
+    "gated_rms_norm_f32_input_sigmoid",
+    "qwen4exp_gdn_decode_fused",
+    // Attention mixer.
+    "w4a16_gemv_qg",
+    "w4a16_gemv_dual",
+    "rms_norm",
+    "rope_forward_mrope_interleaved",
+    "reshape_and_cache_flash",
+    "paged_decode_attn",
+    "sigmoid_gate_mul",
+    // MoE glue around the expert GEMVs, and the fused EP blend + post.
+    "moe_topk_softmax",
+    "moe_weighted_sum_blend",
+    "moe_batched_blend",
+    "moe_blend_hc_post",
+    "bf16_add_inplace",
 ];
 
 #[cfg(test)]

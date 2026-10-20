@@ -21,6 +21,8 @@ mod prefill_inner_glm;
 pub(super) use diag::diag_norm;
 pub use diag::diag_norm_f32;
 
+#[path = "trait_impl/moe_transpose.rs"]
+mod moe_transpose;
 #[path = "trait_impl/state.rs"]
 mod state;
 
@@ -94,8 +96,53 @@ impl TransformerLayer for Qwen3AttentionLayer {
         self.qsa.is_some()
     }
 
+    /// Inert-step capture (`layers/qsa_staged.rs`): the mHC highway layer
+    /// with plain BF16 KV whose decode reads only device metadata, the
+    /// indexer's ingest staged. No MLA, adapters or host KV tier.
+    fn qsa_inert_capturable(&self) -> bool {
+        self.qsa_rows_static_ok() && self.lora.is_none()
+    }
+
+    fn qsa_commit_staged(
+        &self,
+        state: &mut dyn LayerState,
+        row: usize,
+        pos: usize,
+        count: usize,
+        pitched: bool,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let qsa = self
+            .qsa
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("qsa_commit_staged without an indexer"))?;
+        let st = super::helpers::qsa_seq_state(qsa, state, gpu)?;
+        qsa.commit_staged_rows(st, row, pos, count, pitched, gpu, stream)
+    }
+
     fn has_aux_state(&self) -> bool {
         self.qsa.is_some()
+    }
+
+    fn aux_bytes_per_token(&self) -> usize {
+        self.qsa.as_ref().map_or(0, |q| q.bytes_per_token())
+    }
+
+    fn reserve_aux(
+        &self,
+        state: &mut dyn LayerState,
+        tokens: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let Some(qsa) = self.qsa.as_ref() else {
+            return Ok(());
+        };
+        let st = super::helpers::qsa_seq_state(qsa, state, gpu)?;
+        // Callers reserve whole KV blocks; the last one may reach past the
+        // served context, which no position ever will.
+        qsa.reserve(st, tokens.min(qsa.capacity()), gpu, stream)
     }
 
     /// `None` when the batched path can serve an ACTIVE selection per row
@@ -263,11 +310,13 @@ impl TransformerLayer for Qwen3AttentionLayer {
         )
     }
 
+    fn prefill_multi(&self, pass: &mut crate::layer::MultiPass<'_, '_>) -> Result<()> {
+        self.prefill_multi_hc(pass)
+    }
+
     /// Q12 Path B: batched-mode attention prefill via `prefill_inner` with
-    /// `batched_meta = Some`. The model-level `prefill_attn_batched_layer`
-    /// calls this method. Per-stream block_table is unused under batched
-    /// mode (block_table_ptrs from batched_meta carries them); we still
-    /// pass an empty Vec to satisfy the signature.
+    /// `batched_meta = Some` (`prefill_attn_batched_layer`). The per-stream
+    /// block_table is unused (batched_meta's block_table_ptrs carry them).
     fn prefill_inner_batched_q12(
         &self,
         hidden_stacked: DevicePtr,
@@ -306,7 +355,7 @@ impl TransformerLayer for Qwen3AttentionLayer {
         hidden: DevicePtr,
         residual: DevicePtr,
         num_seqs: usize,
-        _active_seqs: usize,
+        active_seqs: usize,
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
         kv_cache: &mut PagedKvCache,
         seq_lens: &[usize],
@@ -318,6 +367,7 @@ impl TransformerLayer for Qwen3AttentionLayer {
             hidden,
             residual,
             num_seqs,
+            active_seqs,
             states,
             None,
             kv_cache,
@@ -344,6 +394,7 @@ impl TransformerLayer for Qwen3AttentionLayer {
         self.decode_multi_seq_inner(
             hidden,
             residual,
+            num_rows,
             num_rows,
             seq_states,
             Some(row_owner),
@@ -437,13 +488,7 @@ impl TransformerLayer for Qwen3AttentionLayer {
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
     ) -> Result<()> {
-        if let FfnComponent::Moe(moe) = &mut self.ffn {
-            moe.transpose_for_prefill_hybrid(gpu, config)?;
-        }
-        if let Some(FfnComponent::Moe(moe)) = self.moe_ffn.as_mut() {
-            moe.transpose_for_prefill_hybrid(gpu, config)?;
-        }
-        Ok(())
+        moe_transpose::transpose_moe_for_prefill_hybrid_inner(self, gpu, config)
     }
 }
 

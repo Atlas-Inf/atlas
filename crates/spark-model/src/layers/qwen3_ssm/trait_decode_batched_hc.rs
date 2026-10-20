@@ -169,7 +169,7 @@ impl Qwen3SsmLayer {
                         "hc batched verify: PLE has {} host id(s) for {num_tokens} row(s)",
                         host.len()
                     );
-                    let row_stride = hc.hc_mult * h * 4; // highway rows are FP32
+                    let mut rows = Vec::with_capacity(states.len());
                     let mut row0 = 0usize;
                     for (i, state) in states.iter_mut().enumerate() {
                         let ki = *ks.get(i).ok_or_else(|| {
@@ -183,23 +183,22 @@ impl Qwen3SsmLayer {
                         // has no token id — it gets no injection, exactly as on
                         // the multi-seq decode path.
                         if let Some(st) = ssm.ple.as_mut() {
-                            ple.forward_rows(
+                            rows.push(crate::layers::ple::PleSeqRows {
                                 st,
-                                streams.offset(row0 * row_stride),
-                                &host[row0..row0 + ki],
-                                ctx,
-                                stream,
-                            )?;
+                                row0,
+                                ids: &host[row0..row0 + ki],
+                            });
                         }
                         row0 += ki;
                     }
+                    ple.forward_seqs(&mut rows, streams, ctx, stream)?;
                 }
             }
         }
 
         stage!("gdn_block");
 
-        ops::hc_pre_site(
+        ops::hc_pre_site_rows(
             ctx.gpu,
             self.hc_pre_k,
             streams,
@@ -212,6 +211,7 @@ impl Qwen3SsmLayer {
             n,
             h as u32,
             eps,
+            ctx.levers.qwen4exp_hc_rows(),
             stream,
         )?;
         stage!("hc_pre_attn");
@@ -276,7 +276,7 @@ impl Qwen3SsmLayer {
 
         // ── MoE sublayer ──
         let normed2 = ctx.buffers.norm_output();
-        ops::hc_pre_site(
+        ops::hc_pre_site_rows(
             ctx.gpu,
             self.hc_pre_k,
             streams,
@@ -289,6 +289,7 @@ impl Qwen3SsmLayer {
             n,
             h as u32,
             eps,
+            ctx.levers.qwen4exp_hc_rows(),
             stream,
         )?;
 
@@ -323,6 +324,62 @@ impl Qwen3SsmLayer {
         // `ATLAS_HC_GENERIC_MOE_ARM=0` to restore the old refusal.
         let generic_arm = std::env::var("ATLAS_HC_GENERIC_MOE_ARM").as_deref() != Ok("0");
         stage!("hc_pre_ffn");
+
+        // ATLAS_QWEN4EXP_EXACT_VERIFY: each row through the MoE serial decode
+        // runs (`ffn.forward`, as the attention layers' verify already does in
+        // `multi_seq/hc_generic.rs`), and its own hc_post. `forward_k2/k3` is
+        // a different function of the row: its batched top-k breaks exact
+        // logit ties the other way, and on the originals expert layout its
+        // gate_up/down kernels split K across lanes differently and do not
+        // clamp gate/up to +-10 as the single-row kernels do. `forward` lands
+        // every row in `moe_output` row 0, so the post runs per row too.
+        // ATLAS_QWEN4EXP_BATCH_FAST: the same per-row `forward` arithmetic at
+        // any row count (single- or multi-sequence verify), with the EP
+        // all-reduce batched over the rows and ONE elementwise post.
+        let fold = ops::qwen4exp_decode_fuse::MoeHcPost::for_rows(ctx.levers, hc, streams, post);
+        if ctx.levers.qwen4exp_batch_fast
+            && let Some((moe_out, posted)) = self
+                .ffn
+                .forward_rows(normed2, num_tokens, fold, ctx, stream)?
+        {
+            if !posted {
+                ops::hc_post_site(
+                    ctx.gpu,
+                    self.hc_post_k,
+                    hc,
+                    moe_out,
+                    streams,
+                    post,
+                    comb,
+                    streams,
+                    n,
+                    h as u32,
+                    stream,
+                )?;
+            }
+            stage!("moe+hc_post_ffn (rows)");
+            return Ok(());
+        }
+        if ctx.levers.qwen4exp_exact_verify && (2..=4).contains(&num_tokens) {
+            for i in 0..num_tokens {
+                let moe_out = self.ffn.forward(normed2.offset(i * h * 2), ctx, stream)?;
+                ops::hc_post_site(
+                    ctx.gpu,
+                    self.hc_post_k,
+                    hc,
+                    moe_out,
+                    streams.offset(i * hc.hc_mult * h * 4),
+                    post.offset(i * hc.hc_mult * 4),
+                    comb.offset(i * hc.hc_mult * hc.hc_mult * 4),
+                    streams.offset(i * hc.hc_mult * h * 4),
+                    1,
+                    h as u32,
+                    stream,
+                )?;
+            }
+            stage!("moe+hc_post_ffn (per row)");
+            return Ok(());
+        }
 
         if num_tokens == 3 {
             self.ffn.forward_k3(normed2, ctx, stream)?;

@@ -69,6 +69,10 @@ impl ResponseSink {
 
 /// An in-progress chunked prefill (prompt being processed in chunks).
 pub(super) struct PrefillInProgress {
+    /// Deferred to a multi-sequence prefill pass (`ATLAS_QWEN4EXP_PREFILL_MULTI`):
+    /// its worker ranks got no prefill command, so only that pass may run it
+    /// (`prefill_multi`). Set once, by the deferral in `prefill_a_step`.
+    pub multi: bool,
     /// Arc-wrapped so the original request, the per-prefill scheduler
     /// state, and any retry path (Tier 5c) can share the read-only
     /// token slice without copying ~40 KB on every long prompt.
@@ -389,6 +393,10 @@ pub(super) struct ActiveSeq {
     pub prose_tokens_since_last_tool: u32,
     /// F10 (2026-04-26): how many times the thinking-loop watchdog has fired.
     pub think_watchdog_fires: u32,
+    /// Content-loop steers committed so far ([`super::loop_steer`]).
+    pub loop_steers: u32,
+    /// Steers this request may make (0 = steering off), fixed at admission.
+    pub loop_steer_max: u32,
     /// Phase-C: how many times a degeneration watchdog has rolled this
     /// sequence back to a boundary and re-steered. Capped at
     /// [`atlas_kernels::ROLLBACK_RESTEER_CAP`]; once the cap is hit the
@@ -608,6 +616,8 @@ pub(super) struct SwappedSeq {
     pub content_tokens: u32,
     pub prose_tokens_since_last_tool: u32,
     pub think_watchdog_fires: u32,
+    pub loop_steers: u32,
+    pub loop_steer_max: u32,
     /// Phase-C: watchdog rollback counter, preserved across snapshot/restore.
     pub rollback_count: u32,
     pub tool_call_start_token: Option<u32>,

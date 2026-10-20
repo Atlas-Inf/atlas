@@ -397,7 +397,9 @@ impl TransformerModel {
     /// - 0xFFFFFFF1: alloc slot (frees any prior occupant first, then re-allocates)
     /// - 0xFFFFFFF2/3/4: verify K=2/3/4 → K tokens, then accept/num_accepted
     /// - 0xFFFFFFF5/6/7, 0xFFFFFFE1, 0xFFFFFFEB/EC: GLM/vision extensions (`impl_a2_ep_worker`)
+    /// - 0xFFFFFFE6: batched multi-sequence verify (`trait_impl/ep_verify_batch.rs`)
     /// - 0xFFFFFFF8: cache this slot's sequence (`trait_impl::finish_leaf`)
+    /// - 0xFFFFFFED: plant a prefix checkpoint → position (`prefill_b::pc_inflight`)
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored; applies to the whole worker)
     pub(super) fn ep_worker_step_impl(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
         let (seq_id, cmd) = self.ep_recv_seq_and_cmd(self.ep_protocol_v2)?;
@@ -406,6 +408,14 @@ impl TransformerModel {
         if cmd == 0xFFFFFFFF {
             return Ok(false);
         }
+        // ATLAS_QWEN4EXP_GDN_COMMIT_FUSE: only the batched verify takes a
+        // pending GDN commit, and the draft-assist walk between two of them
+        // reads no GDN state; every other command lands them first.
+        if cmd != super::trait_impl::ep_verify_batch::EP_CMD_VERIFY_BATCH
+            && cmd != super::draft_assist::EP_CMD_DRAFT_ASSIST
+        {
+            self.gdn_fuse_flush_all()?;
+        }
 
         // Batched-decode (`0xFFFFFFE0`): the preamble seq_id is sentinel-0;
         // the real per-token routing lives in the seq_ids[N] payload that
@@ -413,6 +423,13 @@ impl TransformerModel {
         // + tokens off the wire and dispatches the matched compute.
         if cmd == 0xFFFFFFE0 {
             return self.ep_worker_decode_batch(slots);
+        }
+        if cmd == super::impl_a2_ep_worker::EP_CMD_PREFILL_MULTI {
+            return self.ep_worker_prefill_multi(slots);
+        }
+        // Batched multi-sequence verify (`trait_impl/ep_verify_batch.rs`).
+        if cmd == super::trait_impl::ep_verify_batch::EP_CMD_VERIFY_BATCH {
+            return self.ep_worker_verify_batch(slots);
         }
         if let Some(keep) = self.ep_worker_glm_cmd(seq_id, cmd, slots)? {
             return Ok(keep);
@@ -475,6 +492,7 @@ impl TransformerModel {
             super::vision_transport::EP_CMD_VISION_STATE => self.ep_worker_recv_vision_state()?,
             super::glm_long_verify::EP_CMD_GLM_LONG_TAIL => self.glm_long_receive_tail(seq)?,
             0xFFFFFFF6 => self.ep_worker_set_native_fence(seq)?,
+            crate::traits::EP_CMD_PC_PLANT => self.pc_plant_receive(seq)?,
             super::trait_impl::finish_leaf::EP_CMD_CACHE_SEQUENCE => {
                 self.finish_leaf_cache_command(seq)
             }
@@ -499,82 +517,40 @@ impl TransformerModel {
                     tracing::warn!("Worker SSM state normalization failed: {e:#}");
                 }
             }
+            // Verify K=2/3/4: receive K tokens, run the verify, receive the
+            // number of accepted drafts, then commit exactly as the head
+            // does (`commit_accepted_prefix`, via `ep_worker_apply_verdict`).
+            // A rollback of the worker's own making would skip what the
+            // commit also rewinds: the per-layer verify aux (qwen4_exp's PLE
+            // carry and QSA ingest watermark, replicated on every rank) and a
+            // deferred GDN commit, and the ranks would part ways.
             0xFFFFFFF2 => {
-                // Verify K=2: receive 2 tokens, run verify, receive accept/reject
                 let t0 = self.ep_broadcast_u32(0)?;
                 let t1 = self.ep_broadcast_u32(0)?;
                 self.sync_secondary()?;
                 self.decode_verify_graphed(&[t0, t1], seq, stream)?;
-                let accepted = self.ep_broadcast_u32(0)?;
-                if accepted == 1 {
-                    self.start_checkpoint_async(seq)?;
-                    self.trim_proposer_state(seq, 1, 0)?;
-                } else {
-                    seq.seq_len -= 1;
-                    seq.tokens.pop();
-                    self.trim_proposer_state(seq, 0, 0)?;
-                    self.start_rollback_and_checkpoint_async(seq, 1)?;
-                }
+                // The head sends accept (1) or reject (0) of its one draft.
+                let num_accepted = self.ep_broadcast_u32(0)? as usize;
+                self.ep_worker_apply_verdict(seq, &[t0, t1], num_accepted)?;
             }
             0xFFFFFFF3 => {
-                // Verify K=3: receive 3 tokens, run verify, receive num_accepted (0/1/2)
                 let t0 = self.ep_broadcast_u32(0)?;
                 let t1 = self.ep_broadcast_u32(0)?;
                 let t2 = self.ep_broadcast_u32(0)?;
                 self.sync_secondary()?;
                 self.decode_verify_graphed_k3(&[t0, t1, t2], seq, stream)?;
-                let num_accepted = self.ep_broadcast_u32(0)?;
-                self.trim_proposer_state(seq, num_accepted as usize, 0)?;
-                match num_accepted {
-                    2 => {
-                        self.start_checkpoint_async(seq)?;
-                    }
-                    1 => {
-                        seq.seq_len -= 1;
-                        seq.tokens.pop();
-                        self.start_rollback_and_checkpoint_async(seq, 2)?;
-                    }
-                    _ => {
-                        seq.seq_len -= 2;
-                        seq.tokens.pop();
-                        seq.tokens.pop();
-                        self.start_rollback_and_checkpoint_async(seq, 1)?;
-                    }
-                }
+                let num_accepted = self.ep_broadcast_u32(0)? as usize;
+                self.ep_worker_apply_verdict(seq, &[t0, t1, t2], num_accepted)?;
             }
             0xFFFFFFF4 => {
-                // Verify K=4: receive 4 tokens, run verify, receive num_accepted (0/1/2/3)
                 let t0 = self.ep_broadcast_u32(0)?;
                 let t1 = self.ep_broadcast_u32(0)?;
                 let t2 = self.ep_broadcast_u32(0)?;
                 let t3 = self.ep_broadcast_u32(0)?;
                 self.sync_secondary()?;
                 self.decode_verify_graphed_k4(&[t0, t1, t2, t3], seq, stream)?;
-                let num_accepted = self.ep_broadcast_u32(0)?;
-                self.trim_proposer_state(seq, num_accepted as usize, 0)?;
-                match num_accepted {
-                    3 => {
-                        self.start_checkpoint_async(seq)?;
-                    }
-                    2 => {
-                        seq.seq_len -= 1;
-                        seq.tokens.pop();
-                        self.start_rollback_and_checkpoint_async(seq, 3)?;
-                    }
-                    1 => {
-                        seq.seq_len -= 2;
-                        seq.tokens.pop();
-                        seq.tokens.pop();
-                        self.start_rollback_and_checkpoint_async(seq, 2)?;
-                    }
-                    _ => {
-                        seq.seq_len -= 3;
-                        seq.tokens.pop();
-                        seq.tokens.pop();
-                        seq.tokens.pop();
-                        self.start_rollback_and_checkpoint_async(seq, 1)?;
-                    }
-                }
+                let num_accepted = self.ep_broadcast_u32(0)? as usize;
+                self.ep_worker_apply_verdict(seq, &[t0, t1, t2, t3], num_accepted)?;
             }
             0xFFFFFFF5 => self.ep_worker_generic_verify(seq, stream)?,
             token => {
@@ -609,47 +585,10 @@ impl TransformerModel {
         let seq_ids = self.ep_broadcast_tokens(&vec![0u32; n])?;
         let tokens = self.ep_broadcast_tokens(&vec![0u32; n])?;
 
-        // Validate up front so we fail before touching slot state.
-        let mut seen = std::collections::HashSet::new();
-        for &id in &seq_ids {
-            let idx = id as usize;
-            if idx >= slots.len() {
-                anyhow::bail!(
-                    "ep_worker_decode_batch: seq_id {} exceeds slot capacity {}",
-                    id,
-                    slots.len(),
-                );
-            }
-            if !seen.insert(id) {
-                anyhow::bail!("ep_worker_decode_batch: duplicate seq_id {} in batch", id);
-            }
-        }
-
-        // Drain populated slots into a (idx, ref) Vec we can index by
-        // position with `swap_remove`. The borrow checker won't let us
-        // index `slots[seq_ids[i]]` in a loop because each `&mut` is
-        // distinct but the indexer can't prove non-overlap.
-        let mut slot_refs: Vec<(usize, &mut SequenceState)> = slots
-            .iter_mut()
-            .enumerate()
-            .filter_map(|(i, opt)| opt.as_mut().map(|s| (i, s)))
-            .collect();
-
-        // Order the refs to match the head's seq_ids order so the
-        // compute path processes tokens in the same batch index as the
-        // head — critical for KV-cache row alignment per slot.
-        let mut refs: Vec<&mut SequenceState> = Vec::with_capacity(n);
-        for &id in &seq_ids {
-            let idx = id as usize;
-            let pos = slot_refs
-                .iter()
-                .position(|(i, _)| *i == idx)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("ep_worker_decode_batch: slot {} not allocated", idx)
-                })?;
-            let (_, seq) = slot_refs.swap_remove(pos);
-            refs.push(seq);
-        }
+        // In the head's seq_ids order, so each row lands on its own slot —
+        // critical for KV-cache row alignment. Validated before any state is
+        // touched.
+        let mut refs = self.ep_worker_slot_refs(&seq_ids, slots)?;
 
         let stream = self.gpu.default_stream();
         self.sync_secondary()?; // as for the single-token decode above

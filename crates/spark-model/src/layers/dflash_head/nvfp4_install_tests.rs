@@ -37,7 +37,7 @@ fn integration_nvfp4_installs_for_the_actual_execution_route() {
         return;
     };
     let gpu = MockGpuBackend::new();
-    let _tiers = W4a16BatchmTiers::resolve(&gpu);
+    let _tiers = W4a16BatchmTiers::resolve(&gpu, true);
     for (gamma, scalar_present) in [
         (0, false),
         (4, true),

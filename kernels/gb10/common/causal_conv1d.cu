@@ -18,6 +18,7 @@
 // Block: (seq_len clamped to 1024, 1, 1)  [prefill]
 //   or   (1, 1, 1)                         [decode]
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 // ============================================================
@@ -423,6 +424,7 @@ extern "C" __global__ void causal_conv1d_update_l2norm_f32(
     unsigned int head_dim,
     float l2_eps
 ) {
+    atlas_pdl_enter();
     const unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int b = blockIdx.y;
     const unsigned int tid = threadIdx.x;

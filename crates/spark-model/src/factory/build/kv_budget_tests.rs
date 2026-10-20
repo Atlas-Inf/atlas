@@ -466,3 +466,30 @@ fn the_pool_is_never_larger_than_the_sizing_it_replaced_gave() {
         assert!(got.own <= got.used_raw, "{input:?}");
     }
 }
+
+/// qwen4_exp at TP2: one KV head of 256 per rank on 12 layers (12 KiB per
+/// token) plus the 12 QSA pooled-key carries (hd 128, ratio 4: 64 B each). The pool
+/// is sized for both; without aux state the arithmetic is unchanged.
+#[test]
+fn aux_state_is_charged_per_pool_token() {
+    use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
+    let kv = KvCacheConfig {
+        block_size: 16,
+        num_kv_heads: 1,
+        head_dim: 256,
+        num_layers: 12,
+        dtype: KvCacheDtype::Bf16,
+        layer_dtypes: vec![],
+        layer_dims: vec![],
+        cache_blocks_per_seq: None,
+    };
+    let budget = gib(12.5);
+    let plain = PagedKvCache::compute_num_blocks(&kv, budget).unwrap();
+    assert_eq!(blocks_with_aux(&kv, budget, 0).unwrap(), plain);
+    let with_qsa = blocks_with_aux(&kv, budget, 12 * 64).unwrap();
+    assert_eq!(with_qsa, budget / (16 * (12 * 1024 + 12 * 64)));
+    assert!(
+        with_qsa * 16 >= 1_000_000,
+        "12.5 GiB holds 1M tokens and their QSA keys"
+    );
+}

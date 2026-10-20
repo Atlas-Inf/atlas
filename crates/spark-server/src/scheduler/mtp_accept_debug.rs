@@ -26,6 +26,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use spark_model::speculative::deep_depth;
+
+use super::mtp_deep_depth::DepthLevers;
+
 /// Widths tracked individually; anything wider folds into the last bucket.
 ///
 /// MUST cover the MTP dispatch cap ([`spark_model::speculative::mtp_max_seqs`],
@@ -201,6 +205,13 @@ pub struct RequestAccept {
     depth_k3_accepts: u32,
     shallow_steps_since_probe: u16,
     depth_switches: u16,
+    // Per-request 1..=3-draft controller (`mtp_depth_ladder`), steering a
+    // ceiling of 2 or 3 drafts (qwen4_exp K=2..4).
+    ladder: super::mtp_depth_ladder::DepthLadder,
+    // `ATLAS_MTP_DYNAMIC_DEPTH`: the deep ceiling (`mtp_deep_depth`), and the
+    // per-position acceptance over the verifies that drafted each position.
+    deep: super::mtp_deep_depth::DeepDepth,
+    pos: super::mtp_deep_depth::PositionAccept,
 }
 
 const SURVIVAL_POSITIONS: usize = 7;
@@ -212,6 +223,7 @@ const DEPTH_REPROBE_STEPS: u16 = 128;
 impl RequestAccept {
     pub fn record_serial(&mut self) {
         self.serial_steps = self.serial_steps.saturating_add(1);
+        self.ladder.note_serial();
     }
 
     /// `emitted` is tokens committed this verify (1 + accepted drafts).
@@ -231,9 +243,23 @@ impl RequestAccept {
     /// Desired proposal depth for a single request.  This controller only
     /// selects the two measured efficient kernels: K=3 (two drafts) and K=5
     /// (four drafts).  Intermediate K=4 was slower than both on GB10.
-    pub fn depth_drafts(&self, max_drafts: usize, enabled: bool) -> usize {
-        if enabled && max_drafts >= 4 && self.depth_mode == DEPTH_SHALLOW {
+    ///
+    /// Under a 2..=3-draft ceiling the same lever arms the 1..=3 ladder
+    /// (`mtp_depth_ladder`: measured per-position survival over measured
+    /// step wall).
+    ///
+    /// `ATLAS_MTP_DYNAMIC_DEPTH` (any ceiling past 3) supersedes both: the
+    /// deep controller (`mtp_deep_depth`) steers between its floor and
+    /// `max_drafts`.
+    pub fn depth_drafts(&self, max_drafts: usize, levers: DepthLevers) -> usize {
+        let enabled = levers.adapt;
+        if levers.deep && max_drafts > super::mtp_depth_ladder::MAX_DEPTH {
+            self.deep
+                .drafts(deep_depth::deep_floor(max_drafts), max_drafts)
+        } else if enabled && max_drafts >= 4 && self.depth_mode == DEPTH_SHALLOW {
             2
+        } else if enabled && (2..=super::mtp_depth_ladder::MAX_DEPTH).contains(&max_drafts) {
+            self.ladder.drafts(max_drafts)
         } else {
             max_drafts
         }
@@ -246,8 +272,23 @@ impl RequestAccept {
     /// We retain K=5 only when its token-yield ratio pays for its measured
     /// ~20% higher target-forward cost.  K=3 periodically probes K=5 again,
     /// and promotes early when its own acceptance becomes high.
-    pub fn record_depth_verify(&mut self, drafts: usize, accepted: usize, enabled: bool) {
+    /// `max_drafts` is the ceiling the depth was chosen under (the deep
+    /// controller's `--num-drafts`).
+    pub fn record_depth_verify(
+        &mut self,
+        drafts: usize,
+        accepted: usize,
+        max_drafts: usize,
+        levers: DepthLevers,
+    ) {
+        let enabled = levers.adapt;
         self.last_verify_drafts = drafts;
+        self.pos.record(drafts, accepted);
+        if levers.deep && max_drafts > super::mtp_depth_ladder::MAX_DEPTH {
+            let floor = deep_depth::deep_floor(max_drafts);
+            self.deep.record(drafts, accepted, floor, max_drafts);
+            return;
+        }
         if !enabled {
             return;
         }
@@ -255,6 +296,14 @@ impl RequestAccept {
     }
 
     fn record_depth_verify_inner(&mut self, drafts: usize, accepted: usize) {
+        if drafts <= super::mtp_depth_ladder::MAX_DEPTH {
+            self.ladder.record(
+                drafts,
+                accepted,
+                super::mtp_depth_ladder::MAX_DEPTH,
+                std::time::Instant::now(),
+            );
+        }
         if drafts >= 4 {
             self.depth_steps = self.depth_steps.saturating_add(1);
             self.depth_full_accepts = self
@@ -376,7 +425,7 @@ impl RequestAccept {
             .map(|&s| format!("{:.2}", s as f64 / steps))
             .collect();
         format!(
-            "serial={:.2} mtp={:.2} p1={:.3} mean_na={:.3} tok_step={:.3} regime_reprobes={} depth={} depth_switches={} surv={}",
+            "serial={:.2} mtp={:.2} p1={:.3} mean_na={:.3} tok_step={:.3} regime_reprobes={} depth={} depth_switches={} acc={} surv={}",
             self.serial_frac(),
             self.mtp_frac(),
             self.p1(),
@@ -388,10 +437,16 @@ impl RequestAccept {
                 2 => "k3",
                 3 => "k4",
                 4 => "k5",
+                5 => "k6",
+                6 => "k7",
+                7 => "k8",
                 _ if self.depth_mode == DEPTH_SHALLOW => "k3",
                 _ => "k5",
             },
-            self.depth_switches,
+            self.depth_switches
+                .saturating_add(self.ladder.switches)
+                .saturating_add(self.deep.switches),
+            self.pos.suffix(),
             survival.join(","),
         )
     }

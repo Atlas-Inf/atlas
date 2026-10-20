@@ -418,6 +418,7 @@ impl TransformerModel {
             self.fused_graph.lock().drain().map(|(_, g)| g).collect(),
         );
         self.verify_pieces.clear(self.gpu.as_ref());
+        self.decode_pieces.clear(self.gpu.as_ref());
     }
 
     /// Runtime adapter rotation (eager-on-rotate). Selects the resident

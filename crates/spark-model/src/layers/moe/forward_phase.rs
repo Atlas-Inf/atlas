@@ -6,7 +6,8 @@
 //! Single helper `dispatch_unified_t_decode` runs the gate+up and silu+down
 //! kernels against transposed expert weight tables (gate_t / up_t / down_t
 //! plus shared_*_t). Mirrors the inline `else if self.use_t_layout_for_decode()`
-//! branch 1:1.
+//! branch 1:1; `ATLAS_QWEN4EXP_MOE_FAST` swaps in qwen4_exp's pair
+//! (`qwen4exp_fast.rs`), same buffers, same bytes.
 
 use anyhow::Result;
 
@@ -61,6 +62,20 @@ impl MoeLayer {
                 1,
                 stream,
             )?;
+        } else if self.qwen4exp_fast_t() {
+            self.qwen4exp_fast_gate_up(
+                ctx,
+                expert_input,
+                expert_gate_out,
+                expert_up_out,
+                indices_dev,
+                sh_gate_t,
+                shared_gate_scratch,
+                sh_up_t,
+                shared_up_scratch,
+                1,
+                stream,
+            )?;
         } else {
             let gate_t = self
                 .gate_ptrs_t
@@ -110,6 +125,21 @@ impl MoeLayer {
                 ctx,
                 stream,
             )?;
+        }
+        if self.qwen4exp_fast_t() {
+            return self.qwen4exp_fast_silu_down(
+                ctx,
+                expert_gate_out,
+                expert_up_out,
+                expert_down_out,
+                indices_dev,
+                shared_gate_scratch,
+                shared_up_scratch,
+                sh_down_t,
+                shared_out,
+                1,
+                stream,
+            );
         }
         ops::moe_expert_silu_down_shared_t(
             ctx.gpu,

@@ -84,15 +84,13 @@ pub struct BeamReq {
 /// `upload_batch_metadata_fixed` ensures `padded_n <= rows`. Rungs above the
 /// boot's `max_batch_size` are unreachable (the scheduler admits at most
 /// `max_batch_size` active sequences), so every bs<=32 boot never pads past
-/// 32 — byte-identical by construction. Rungs <=32 unchanged.
+/// 32 — byte-identical by construction. Rungs <=32 unchanged. The layout
+/// rounds `max_batch_size` UP to its rung (`DecodeMetaLayout`), since a
+/// non-rung width (36) still pads its widest batch to the next rung (48).
 /// Above 128 the fall-through behaviour is unchanged (guarded downstream).
 #[inline]
 pub fn padded_batch_n(n: usize) -> usize {
-    [2usize, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128]
-        .iter()
-        .copied()
-        .find(|&s| s >= n)
-        .unwrap_or(n)
+    spark_runtime::buffers::padded_batch_rung(n)
 }
 
 pub trait Model: Send + Sync {
@@ -223,6 +221,24 @@ pub trait Model: Send + Sync {
             decode_logits,
             prefill_logits,
         })
+    }
+
+    /// Whether [`Model::prefill_multi`] is served (`ATLAS_QWEN4EXP_PREFILL_MULTI`).
+    fn supports_prefill_multi(&self) -> bool {
+        false
+    }
+
+    /// Prefill every slice's WHOLE prompt (`chunk_start == 0`, last chunk) in
+    /// one forward over all their rows, each prompt's logits those of its
+    /// single prefill (`ATLAS_QWEN4EXP_PREFILL_MULTI`). On a multi-rank model
+    /// the head sends the other ranks the prompts itself: the caller sends
+    /// no per-request prefill command for them. Returns each slice's logits.
+    fn prefill_multi(
+        &self,
+        _streams: &mut [PrefillSlice<'_>],
+        _stream: u64,
+    ) -> Result<Vec<DevicePtr>> {
+        anyhow::bail!("this model has no multi-sequence prefill")
     }
 
     /// Process N concurrent prefill chunks in one forward pass (same weight
@@ -618,6 +634,25 @@ pub trait Model: Send + Sync {
         None
     }
 
+    /// True when every row of a single-sequence verify (K = 2..=num_drafts+1,
+    /// within `verify_max_drafts`) is bitwise the serial decode step at its
+    /// position, so a T=0 speculative run commits exactly the tokens and
+    /// logits a non-speculative one does. Default false: batch-K verify
+    /// kernels round differently from the single-row ones. qwen4_exp under
+    /// `ATLAS_QWEN4EXP_EXACT_VERIFY=1` (`model/qwen4exp_exact_verify.rs`).
+    fn verify_bit_exact(&self) -> bool {
+        false
+    }
+
+    /// True when the batched multi-sequence verify is bitwise serial decode
+    /// too, row by row, so a concurrent batch may speculate wherever a single
+    /// sequence may (inside `<think>` included). Default false. qwen4_exp
+    /// under `ATLAS_QWEN4EXP_EXACT_VERIFY=1` plus `ATLAS_QWEN4EXP_BATCH_FAST=1`
+    /// (`model/qwen4exp_batch_fast.rs`).
+    fn batch_verify_bit_exact(&self) -> bool {
+        false
+    }
+
     /// Check if speculative decoding is available (MTP or self-speculative).
     fn has_proposer(&self) -> bool;
 
@@ -707,8 +742,10 @@ pub trait Model: Send + Sync {
 
     /// Whether [`Self::decode_verify_batched`] can run for `ks.len()`
     /// sequences at `ks[i]` verify rows each (one more than that sequence's
-    /// draft count; the K-vs-batch ladder passes 2..=4, and D-Cut makes the
-    /// vector RAGGED — uniform is just the special case).
+    /// draft count; the K-vs-batch ladder passes 2..=4, and D-Cut and the
+    /// drafter's confidence stop make the vector RAGGED — uniform is just the
+    /// special case). `ks[i] == 1` is a DECODE ROW, a sequence holding no
+    /// drafts; only a model whose verify row is its decode row admits it.
     ///
     /// Default `false`: the scheduler MUST fall back to the per-sequence
     /// `decode_verify_graphed_k{2,3,4}` loop. There is deliberately NO
@@ -1276,10 +1313,34 @@ pub trait Model: Send + Sync {
         super::model_defaults::ep_broadcast_disable_mtp_for_seq(self, seq_id, disabled)
     }
 
+    /// In-flight shared-prefix checkpoints (`ATLAS_GLM_PC_INFLIGHT=1`): the
+    /// smallest shared prefix, in tokens, worth planting a checkpoint for in
+    /// a prefill other requests wait on. `None` (the default) turns the
+    /// scheduler's shared-prefix admission off.
+    fn pc_inflight_min_tokens(&self) -> Option<usize> {
+        None
+    }
+
+    /// Ask `seq`'s prefill to save an SSM checkpoint at token `at` for the
+    /// requests that share its prefix, on every rank: the head sends the
+    /// worker the same request through the command stream, so call it only
+    /// between the sequence's model commands.
+    fn pc_plant(&self, seq: &mut SequenceState, at: usize) -> Result<()> {
+        super::model_defaults::pc_plant(self, seq, at)
+    }
+
     /// Returns true if this model's EP comm path is using the v2 protocol
     /// (slot-aware seq_id preamble). Default false — pre-PR behaviour.
     fn ep_protocol_v2(&self) -> bool {
         false
+    }
+
+    /// EP: after a batched multi-sequence verify (`decode_verify_batched`),
+    /// send the drafts each sequence accepted, in batch order, so the worker
+    /// commits what the head commits. Call once every row has been read and
+    /// before any commit or propose. No-op without a multi-rank protocol.
+    fn ep_broadcast_verify_verdicts(&self, _accepted: &[u32]) -> Result<()> {
+        Ok(())
     }
 
     /// EP bulk broadcast: send an array of u32 tokens to all worker ranks.

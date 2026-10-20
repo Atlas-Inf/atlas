@@ -216,30 +216,41 @@ impl MoeLayer {
         if routes.prerouted {
             self.route_fused(input, &routes, sorted_expert_ids, [n, h], ctx, stream)?;
         } else {
-            // Gemma-4 router pre-norm (no-op for other models).
-            let router_in = self.router_input(input, n, h, ctx, stream)?;
-            super::dump::dump_gate_input(ctx.gpu, stream, router_in, n, h)?;
-            // 1. Gate GEMM: [N, H] × [H, num_experts] → [N, num_experts]
-            self.prefill_gate_gemm(router_in, gate_logits, n, num_experts, h, ctx, stream)?;
-            super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
-            det.tap("x_gate", gate_logits, rows, ne * 2);
-            // Feature-1: fold the router (`mlp.gate`) LoRA delta onto the
-            // routing logits BEFORE top-k (reproduces PEFT `mlp.gate`). No-op
-            // unless a router delta is installed (ATLAS_LORA_EXPERTS=1).
-            self.apply_router_lora_prefill(router_in, gate_logits, n, ctx, stream)?;
-            // 2. Batched top-k. DeepSeek-V3 / MiniMax-M2 use sigmoid +
-            //    correction bias (detected via `correction_bias_dev`); every
-            //    other model takes the softmax path.
-            self.prefill_topk(
-                gate_logits,
-                routes.indices,
-                routes.weights,
-                n,
-                num_experts,
-                top_k,
+            // Sequence-parallel Qwen prefill may already have routed this
+            // rank's rows before the gather. Consume those routes before the
+            // generic router; GLM's canonical/fused path remains unchanged.
+            if !self.take_local_routes(
+                input,
+                n as usize,
+                [routes.indices, routes.weights],
                 ctx,
                 stream,
-            )?;
+            )? {
+                // Gemma-4 router pre-norm (no-op for other models).
+                let router_in = self.router_input(input, n, h, ctx, stream)?;
+                super::dump::dump_gate_input(ctx.gpu, stream, router_in, n, h)?;
+                // 1. Gate GEMM: [N, H] × [H, num_experts] → [N, num_experts]
+                self.prefill_gate_gemm(router_in, gate_logits, n, num_experts, h, ctx, stream)?;
+                super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
+                det.tap("x_gate", gate_logits, rows, ne * 2);
+                // Feature-1: fold the router (`mlp.gate`) LoRA delta onto the
+                // routing logits BEFORE top-k (reproduces PEFT `mlp.gate`). No-op
+                // unless a router delta is installed (ATLAS_LORA_EXPERTS=1).
+                self.apply_router_lora_prefill(router_in, gate_logits, n, ctx, stream)?;
+                // 2. Batched top-k. DeepSeek-V3 / MiniMax-M2 use sigmoid +
+                //    correction bias (detected via `correction_bias_dev`); every
+                //    other model takes the softmax path.
+                self.prefill_topk(
+                    gate_logits,
+                    routes.indices,
+                    routes.weights,
+                    n,
+                    num_experts,
+                    top_k,
+                    ctx,
+                    stream,
+                )?;
+            }
             super::dump::dump_expert_ids(
                 ctx.gpu,
                 stream,

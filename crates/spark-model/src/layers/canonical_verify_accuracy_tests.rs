@@ -89,7 +89,7 @@ fn top8(logits: impl Iterator<Item = f64>) -> Vec<usize> {
 fn canonical_verify_accuracy() -> Result<()> {
     let gpu = backend()?;
     let gpu: &dyn GpuBackend = gpu;
-    crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu);
+    crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu, true);
     let mut rng = Rng(0x5eed_1234_abcd_0003);
 
     // W4A16 (shared-expert gate shape): 48 rows.

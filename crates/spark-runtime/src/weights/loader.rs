@@ -130,6 +130,7 @@ impl WeightLoader for SafetensorsLoader {
                 &skip_fn,
                 self.peak_memory_multiplier,
                 &mut deferred,
+                self.pack_slab,
             )?
         } else if shard_files.len() == 1 {
             load_single(&shard_files[0], gpu, oom_reserve_bytes, &skip_fn)?
@@ -354,4 +355,8 @@ pub(crate) fn check_oom_guard(
     Ok(())
 }
 mod load_fns;
+// shard planning is exercised only by the cfg(windows) streaming loader and
+// by unit tests.
+#[cfg(any(target_os = "windows", test))]
+mod slab_plan;
 use load_fns::{load_sharded, load_single};

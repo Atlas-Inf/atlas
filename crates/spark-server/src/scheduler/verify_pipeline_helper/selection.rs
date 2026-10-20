@@ -12,15 +12,97 @@ pub(super) fn select(
     row_base: usize,
     policy: CopyFailurePolicy,
 ) -> anyhow::Result<Vec<u32>> {
+    if let Some(picks) = fast(model, argmax_ids, a, ctx, row_base, policy)? {
+        return Ok(picks);
+    }
+    let k = argmax_ids.len();
+    let vocab = model.vocab_size();
+    let mut buf = super::HostRows::take(&ctx.scratch.host_bytes, k * vocab * 2);
+    if let Err(error) = copy_rows(model, row_base, ctx, &mut buf) {
+        return match policy {
+            CopyFailurePolicy::LegacyFallback => Ok(argmax_ids.to_vec()),
+            CopyFailurePolicy::Propagate => Err(error),
+        };
+    }
+    Ok(slow(&buf, k, vocab, a, ctx))
+}
+
+/// D2H of a span's `[K, vocab]` BF16 rows starting at `row_base` into `buf`
+/// (sized by the caller), timed as the D2h phase.
+pub(super) fn copy_rows(
+    model: &dyn Model,
+    row_base: usize,
+    ctx: &LogitsContext,
+    buf: &mut [u8],
+) -> anyhow::Result<()> {
+    let vocab = model.vocab_size();
+    let t_d2h = std::time::Instant::now();
+    // BF16 always for verify path: `decode_verify_graphed_*` writes BF16
+    // to `logits_buffer()`. The FP32-lm_head path (Gemma-4 dense) does
+    // not go through verify (no MTP for dense Gemma).
+    model.copy_logits_to_host(model.logits_buffer_ptr().offset(row_base * vocab * 2), buf)?;
+    ctx.timing
+        .record(crate::scheduler::mtp_timing::Phase::D2h, t_d2h);
+    Ok(())
+}
+
+/// The GPU-argmax arms of [`select`]: `Some(picks)` where one serves the
+/// span, `None` where the host pipeline must ([`slow`]).
+pub(super) fn fast(
+    model: &dyn Model,
+    argmax_ids: &[u32],
+    a: &mut ActiveSeq,
+    ctx: &LogitsContext,
+    row_base: usize,
+    policy: CopyFailurePolicy,
+) -> anyhow::Result<Option<Vec<u32>>> {
     anyhow::ensure!(
         policy == CopyFailurePolicy::LegacyFallback || a.grammar_state.is_none(),
         "checked verify selection requires a grammarless request"
     );
     use crate::scheduler::mtp_timing::Phase;
+    // Forget an earlier span's picks: only this call's slow path records any.
+    crate::scheduler::emit_step::PickEffects::clear(a);
     let k = argmax_ids.len();
     if k == 0 {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     }
+    // A content-loop steer (`loop_steer`) is the host pipeline's to apply,
+    // row by row: a span one could touch takes it.
+    if crate::scheduler::loop_steer::span_may_steer(a, argmax_ids) {
+        return Ok(None);
+    }
+    // The min_tokens end-token ban (`min_tokens_ban`): the arms below read
+    // each row's masked argmax. A span straddling the floor with a banned raw
+    // argmax goes to the host pipeline, which counts the floor row by row.
+    let fixed: Vec<u32>;
+    let argmax_ids = if crate::scheduler::min_tokens_ban::banned_ids(a).is_some() {
+        let mut picks = argmax_ids.to_vec();
+        let rows = model
+            .logits_buffer_ptr()
+            .offset(row_base * model.vocab_size() * 2);
+        let served =
+            crate::scheduler::min_tokens_ban::fix_raw_picks(model, a, &mut picks, rows, false)
+                .or_else(|e| match policy {
+                    CopyFailurePolicy::Propagate => Err(e),
+                    CopyFailurePolicy::LegacyFallback => Ok(false),
+                })?;
+        if !served {
+            return Ok(None);
+        }
+        fixed = picks;
+        &fixed[..]
+    } else {
+        argmax_ids
+    };
+    // Both GPU-argmax arms below see the span's starting state only, so they
+    // also stand down where the pipeline would act outside `<think>`: the
+    // one-shot tool-call pin, and any argmax the post-close / tool-loop masks
+    // touch (a `<think>` there would also open a block mid-span).
+    let raw_arms_ok = !crate::scheduler::fast_greedy::tool_pin_armed(a)
+        && !argmax_ids
+            .iter()
+            .any(|&t| crate::scheduler::fast_greedy::raw_pick_masked(a, t));
 
     // ── CHAT FAST PATH (2026-07-08): masked-greedy == raw-argmax guard ──
     // See `fast_masked` module docs: for a grammarless request with no
@@ -35,7 +117,7 @@ pub(super) fn select(
     if let Some(picks) =
         fast_masked::try_chat_fast_path(model, argmax_ids, a, ctx, row_base, policy, masked_verify)?
     {
-        return Ok(picks);
+        return Ok(Some(picks));
     }
 
     // ── FAST PATH (#3, 2026-06-02): on-GPU greedy pick under grammar ──
@@ -79,20 +161,17 @@ pub(super) fn select(
     // fire, so every position routes through the slow pipeline below where
     // the temp>0 sampling branch (step 4a in `verify_pick_with_pipeline`)
     // draws from the processed logits. Confirmed and kept as-is.
-    let fast_penalty_gate = if ctx.sampling.fast_greedy_grammar
+    let fast_penalty_gate = if raw_arms_ok
+        && ctx.sampling.fast_greedy_grammar
         && a.grammar_state.is_some()
         && !a.inside_thinking
         && (a.temperature == 0.0 || ctx.sampling.force_temp_zero)
     {
-        crate::scheduler::fast_greedy::classify_penalties(
-            &crate::scheduler::sample_step::penalty_params_for(
-                a,
-                crate::scheduler::sample_step::PositionKind::Verify,
-                0.0,
-                None,
-                Vec::new(),
-            ),
-        )
+        // Per row, not once at block start: `penalty_params_for` reads
+        // `inside_tool_body`, which the pick loop advances across the span —
+        // a mid-block `</tool_call>` changes later rows' gates (#241, BFCL
+        // parallel_multiple_78).
+        crate::scheduler::fast_greedy::fast_gate_over_rows(a, argmax_ids)
     } else {
         crate::scheduler::fast_greedy::PenaltyGate::Blocked
     };
@@ -167,7 +246,7 @@ pub(super) fn select(
         }
         ctx.timing.record(Phase::FastGreedy, t_fast);
         if all_allowed && fast.len() == k {
-            return Ok(fast); // no D2H, no CPU pipeline — all positions GPU-greedy + grammar-legal
+            return Ok(Some(fast)); // no D2H, no CPU pipeline — all positions GPU-greedy + grammar-legal
         }
         // else: fall through to the slow path (matcher restored above).
     }
@@ -190,25 +269,22 @@ pub(super) fn select(
     // position qualifies, the GPU argmax IS the masked-greedy pick and the
     // [K,vocab] D2H is skipped entirely.
     //
-    // Same behavioral trade #237 shipped for grammar sequences: GPU-argmax
-    // tie-breaking near equal logits can differ from the host FP32 scan, so
-    // emitted tokens are NOT byte-invariant vs the slow path at near-ties.
+    // The GPU argmax and the host scan break exact ties alike (lowest id), and
+    // BF16 -> F32 is exact, so where the gate holds the picks are the slow
+    // path's.
     // Kill switch: ATLAS_NO_FAST_GREEDY_CHAT=1 restores the slow path.
-    let chat_fast_gate = if !masked_verify
+    let chat_fast_gate = if raw_arms_ok
+        && !masked_verify
         && ctx.sampling.fast_greedy_chat
         && a.grammar_state.is_none()
         && !a.inside_thinking
         && (a.temperature == 0.0 || ctx.sampling.force_temp_zero)
     {
-        crate::scheduler::fast_greedy::classify_penalties(
-            &crate::scheduler::sample_step::penalty_params_for(
-                a,
-                crate::scheduler::sample_step::PositionKind::Verify,
-                0.0,
-                None,
-                Vec::new(),
-            ),
-        )
+        // Per row, not once at block start: `penalty_params_for` reads
+        // `inside_tool_body`, which the pick loop advances across the span —
+        // a mid-block `</tool_call>` changes later rows' gates (#241, BFCL
+        // parallel_multiple_78).
+        crate::scheduler::fast_greedy::fast_gate_over_rows(a, argmax_ids)
     } else {
         crate::scheduler::fast_greedy::PenaltyGate::Blocked
     };
@@ -245,32 +321,24 @@ pub(super) fn select(
         }
         ctx.timing.record(Phase::FastGreedy, t_fast);
         if all_immune {
-            return Ok(argmax_ids.to_vec()); // no D2H, no CPU pipeline
+            return Ok(Some(argmax_ids.to_vec())); // no D2H, no CPU pipeline
         }
         // else: some position needs the penalty-aware pipeline — slow path.
     }
 
-    let vocab = model.vocab_size();
-    // BF16 always for verify path: `decode_verify_graphed_*` writes BF16
-    // to `logits_buffer()`. The FP32-lm_head path (Gemma-4 dense) does
-    // not go through verify (no MTP for dense Gemma).
-    let elem_bytes = 2usize;
-    let total = k * vocab * elem_bytes;
-    let t_d2h = std::time::Instant::now();
-    let mut buf = vec![0u8; total];
-    if let Err(error) = model.copy_logits_to_host(
-        model
-            .logits_buffer_ptr()
-            .offset(row_base * vocab * elem_bytes),
-        &mut buf,
-    ) {
-        return match policy {
-            CopyFailurePolicy::LegacyFallback => Ok(argmax_ids.to_vec()),
-            CopyFailurePolicy::Propagate => Err(error),
-        };
-    }
-    ctx.timing.record(Phase::D2h, t_d2h);
+    Ok(None)
+}
 
+/// The host pipeline over a span's copied rows (`buf`: `[k, vocab]` BF16).
+/// Reads and writes only `a` (and `ctx`'s shared counters).
+pub(super) fn slow(
+    buf: &[u8],
+    k: usize,
+    vocab: usize,
+    a: &mut ActiveSeq,
+    ctx: &LogitsContext,
+) -> Vec<u32> {
+    let elem_bytes = 2usize;
     let mut picks: Vec<u32> = Vec::with_capacity(k);
     // Snapshot the matcher's history depth BEFORE speculative advances so we
     // roll back exactly the ACTUAL advances afterward. BUG#3 (2026-06-02):
@@ -280,42 +348,47 @@ pub(super) fn select(
     // restored, clean state.
     let grammar_steps_before = a.grammar_state.as_ref().map(|gs| gs.num_history_steps());
 
+    // Each pick is committed (think state, history, the grammar matcher —
+    // DO NOT drop that advance: the bonus pick was once masked at position
+    // 0's matcher state and desynced xgrammar on every accept) so the next
+    // position is picked against serial decode's state; restored below.
+    let span = crate::scheduler::emit_step::SpanShadow::begin(
+        a,
+        crate::scheduler::emit_step::CommitEnv::of_ctx(ctx),
+        k,
+    );
+    // ATLAS_VERIFY_PICK_PAR: the rows' dequant and F2 sums up front, in
+    // parallel (`prepick`); the loop below is unchanged either way.
+    let mut pre = (super::prepick::enabled() && k > 1).then(|| {
+        let t = std::time::Instant::now();
+        let p =
+            super::prepick::Prepicked::build(buf, k, vocab, super::prepick::f2_may_run(a, ctx, k));
+        ctx.timing
+            .record(crate::scheduler::mtp_timing::Phase::Dequant, t);
+        p
+    });
     for i in 0..k {
-        let slice = &buf[i * vocab * elem_bytes..(i + 1) * vocab * elem_bytes];
-        // P1-3 (2026-07-09): `i` threads the verify-position index down for
-        // the per-position seed offset of the temp>0 sampling branch.
-        let pick = verify_pick_with_pipeline(slice, false, vocab, a, ctx, i);
-        picks.push(pick);
-
-        // Speculatively advance the matcher with `pick[i]` so the next
-        // position's bitmask reflects post-emit state. Skip on the last
-        // position (no next position to mask) and when the seq has no
-        // grammar (nothing to advance).
-        if i + 1 < k
-            && let Some(ref mut gs) = a.grammar_state
-            && !a.inside_thinking
-        {
-            // Matcher advance can fail if `pick` is not in the current
-            // bitmask. If our pipeline correctly applied the bitmask,
-            // pick is the argmax over masked logits → MUST be in the
-            // bitmask → advance MUST succeed. The defensive check
-            // exists for forced-token fast-path returns where the
-            // grammar may have terminated; those legitimately can't
-            // advance further.
-            if !gs.accept_token(pick) {
-                tracing::debug!(
-                    pick,
-                    i,
-                    "verify_pick: grammar speculative advance refused — pipeline picked a token outside the current bitmask. \
-                     This indicates a stale bitmask in the pipeline or a forced-token fastpath that terminated grammar. \
-                     Stopping speculation here; the real `accept_token` in emit_token will fail and end the response."
-                );
-                break;
+        let pick = match pre.as_mut() {
+            Some(p) => p.pick(i, vocab, a, ctx),
+            None => {
+                let slice = &buf[i * vocab * elem_bytes..(i + 1) * vocab * elem_bytes];
+                verify_pick_with_pipeline(slice, false, vocab, a, ctx)
             }
-            // accept_token advanced the matcher as a side effect; the rollback
-            // below counts the ACTUAL advances from matcher history (BUG#3).
+        };
+        picks.push(pick);
+        if !span.pick(a, pick, i) {
+            // The pipeline masked with this matcher state, so a refusal means a
+            // stale bitmask or a forced token that terminated the grammar.
+            // Stop speculating; the real `accept_token` decides.
+            tracing::debug!(
+                pick,
+                i,
+                "verify_pick: grammar refused a pick; stopping here"
+            );
+            break;
         }
     }
+    span.end(a);
 
     // Roll back exactly the ACTUAL speculative advances (history delta) so the
     // matcher returns to its pre-call state; `emit_token` then re-advances it
@@ -329,5 +402,5 @@ pub(super) fn select(
         }
     }
 
-    Ok(picks)
+    picks
 }

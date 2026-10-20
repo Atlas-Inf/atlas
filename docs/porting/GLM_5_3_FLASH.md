@@ -2,7 +2,7 @@
 
 # GLM-5.3-Flash on GB10: local upstream integration
 
-Review: [change areas and invariants](GLM_5_3_FLASH_REVIEW.md) · [measured results](glm53-validation/README.md) · [launch recipe](../../scripts/dev/glm53_native/README.md)
+Review: [change areas and invariants](GLM_5_3_FLASH_REVIEW.md) · [measured results](glm53-validation/README.md) · [deployment recipe](../../docker/gb10/glm-5.3-flash/nvfp4/README.md) · [historical qualification recipe](../../scripts/dev/glm53_native/README.md)
 
 Current source update: [RC4 integration and pending validation](GLM_5_3_FLASH_RC4.md)
 (October 12). The results below retain their original measurement scope.

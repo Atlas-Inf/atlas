@@ -5,7 +5,14 @@
 use super::*;
 
 mod cancel;
+mod think_commit;
 pub(super) use cancel::retire_if_cancelled;
+#[cfg(test)]
+pub(in crate::scheduler) use think_commit::should_suppress_post_think_eos;
+pub(in crate::scheduler) use think_commit::{
+    CommitEnv, EndToken, PickEffects, SpanShadow, advance_thinking, end_token, hard_stop,
+    think_gate, tool_state,
+};
 
 #[cfg(test)]
 mod tests;
@@ -25,6 +32,23 @@ pub fn emit_token(
     sched: &crate::scheduler::sched_ctx::SchedCtx,
 ) {
     emit_token_at_position(a, tok, logprobs, sched, a.seq.seq_len);
+}
+
+/// [`emit_token`] for row `row` of a verify span's committed prefix of `rows`
+/// rows, which ends at the current (post-rewind) `seq_len`: the end-token and
+/// context ceilings are checked at the row's own position
+/// ([`think_commit::span_row_position`], as serial decode and the verify
+/// replay check them), not at the prefix's end for every row.
+pub(super) fn emit_span_row(
+    a: &mut ActiveSeq,
+    tok: u32,
+    logprobs: Option<crate::api::TokenLogprobs>,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    row: usize,
+    rows: usize,
+) {
+    let position = think_commit::span_row_position(a.seq.seq_len, rows, row);
+    emit_token_at_position(a, tok, logprobs, sched, position);
 }
 
 /// Emit one already-verified row after its whole target prefix was committed.
@@ -47,126 +71,34 @@ pub(super) fn emit_token_at_position(
     if retire_if_cancelled(a) {
         return;
     }
-
-    // ChatML role-boundary HARD stop (`<|im_start|>`).
-    //
-    // Handled BEFORE grammar advance / EOS suppression: if the model
-    // hallucinated a `<|im_start|>` mid-turn, we must end the turn regardless
-    // of grammar / require_tool_call / min_tokens. The regular EOS path at
-    // line ~3020 honors `suppress_eos`, which is true while a tool-call
-    // grammar is active — so if we fell through to it, the tokenizer would
-    // strip `<|im_start|>` (special-token) but the following role literal
-    // (`user` / `assistant` — regular tokens) would stream to the client,
-    // poisoning its context and causing the observed multi-turn drift /
-    // "file was corrupted" hallucinations in opencode.
-    if let Some(ims) = sched.limits.im_start_hard_stop
-        && tok == ims
-    {
-        // Push the hard-stop token to output_tokens so lifecycle.rs reports
-        // `finish_reason="stop"` (because `<|im_start|>` is registered in
-        // `eos_tokens` at startup — see tokenizer_runtime.rs::im_start_id).
-        // Without this push, `last_tok = output_tokens.last()` is the prior
-        // content token, lifecycle's `is_eos` check fails, and the response
-        // is mis-reported as `finish_reason="length"` (Bug 3 from OpenClaw
-        // 2026-05-08 session: "Done: 13 tokens (length) despite max_tokens=
-        // 8192" — clients then misinterpret the truncation as a real
-        // length-limit hit and either retry or surface a wrong error).
-        // The streamed-text path strips stop tokens server-side, so the
-        // client never sees the literal `<|im_start|>` bytes.
-        a.output_tokens.push(tok);
-        a.finished = true;
-        tracing::debug!(
-            "<|im_start|> hard-stop fired (id={ims}); ending turn before grammar/suppress_eos"
+    // A content-loop steer of this pick is counted against the state it was
+    // picked in (`loop_steer`), before the commit changes any of it.
+    if crate::scheduler::loop_steer::note_commit(a) {
+        tracing::warn!(
+            tok,
+            output_len = a.output_tokens.len(),
+            steers = a.loop_steers,
+            max = a.loop_steer_max,
+            "Content-loop steer: the pick skipped the loop's continuation token"
         );
+    }
+
+    let env = CommitEnv::of(sched);
+    // The verify pipeline's effects at the position this token was picked
+    // from (none for a token no verify picked).
+    PickEffects::apply(a, tok);
+    if hard_stop(a, tok, &env) {
+        return;
+    }
+    first_token_thinking::apply_native_tool_boundary(a, tok, &env);
+    if think_gate(a, tok, &env) {
         return;
     }
 
-    // Fix B (2026-06-05, kill-switch): <tool_response> hard stop — the model must
-    // never generate this control token; if it does (post-tool-call runaway), end
-    // the turn. Mirrors the <|im_start|> hard stop above.
-    if tool_response_stop_enabled()
-        && let Some(trs) = sched.limits.tool_response_hard_stop
-        && tok == trs
-    {
-        a.output_tokens.push(tok);
-        a.finished = true;
-        // Name the cut -- MTP twin of the decode_logits_step site.
-        a.guard_stop = Some(GUARD_STOP_TOOL_RESPONSE);
-        tracing::debug!("<tool_response> hard-stop fired (id={trs}); ending turn");
-        return;
-    }
-
-    first_token_thinking::apply_native_tool_boundary(a, tok, sched.limits.glm_tool_boundary);
-
-    // Spontaneous <think>: model generates <think> even when thinking was not
-    // requested. Enter thinking mode so EOS is suppressed and thinking content
-    // is stripped. This handles MTP bootstrap/verify paths.
-    if !a.inside_thinking && a.think_start_token == Some(tok) {
-        a.inside_thinking = true;
-        // Re-entering thinking: re-arm the spec-resume guard for the next exit.
-        a.post_think_emitted = 0;
-        a.think_ended = false;
-        a.think_skip_count = 0;
-        a.thinking_budget = Some(a.spontaneous_think_budget);
-        tracing::debug!("Spontaneous <think> detected in emit_token, entering thinking mode");
-        return; // don't emit <think> as content
-    }
-
-    // Silently skip </think> tokens outside thinking mode (same as process_decode_logits).
-    if !a.inside_thinking && a.think_end_token == Some(tok) {
-        a.think_skip_count += 1;
-        if a.think_skip_count >= 50 {
-            a.finished = true;
-            // Name the cut -- MTP twin of the decode_logits_step site; see
-            // `GUARD_STOP_THINK_SKIP` for why an unnamed skip-site finish
-            // wires "stop" and silently ends an agentic run.
-            a.guard_stop = Some(GUARD_STOP_THINK_SKIP);
-            tracing::debug!(
-                "</think> think-skip watchdog hard-stop fired (50 consecutive strays); \
-                 ending turn"
-            );
-        }
-        return;
-    }
-    // Reset skip counter when a real content token is generated — parity with
-    // `decode_logits_step.rs`. Without this the counter is CUMULATIVE on the MTP
-    // path while the non-MTP path counts CONSECUTIVE strays, so a generation
-    // that emits 50 scattered `</think>` across otherwise healthy content is
-    // force-stopped here and not there. The watchdog exists for the degenerate
-    // `</think>` REPETITION seen at long context, which is consecutive by
-    // definition; counting non-adjacent strays is a different, stricter policy
-    // that was never intended.
-    if a.think_ended {
-        a.think_skip_count = 0;
-    }
-
-    // Track <tool_call> token: once seen, legacy tool call requirement is satisfied.
-    // Guard with !inside_thinking — tool calls inside thinking are spurious.
-    if a.require_tool_call && a.tool_call_start_token == Some(tok) && !a.inside_thinking {
-        a.require_tool_call = false;
-        a.tool_call_opened = true;
-    }
-
-    // Tool-body / parameter-body state machine.
-    //
-    // SM1 (2026-05-26): extracted from inline-in-emit_token to the free
-    // function `update_tool_param_state` so the regular non-MTP decode
-    // path (`decode_logits_step.rs`) can call it too. Previously the
-    // state was ONLY updated when `emit_token` ran — which happens from
-    // spec/verify paths but NOT from `process_decode_logits`. With
-    // mtp=false (Qwen3.6 baseline), the state machine never ran and
-    // every dependent gate (A1 rep-penalty toggle, B1 margin detector)
-    // was silently dead code. (The pos-0 close-tag/AM1 logit-bias that
-    // also depended on this state was removed 2026-06-03; the state is
-    // still required for A1/B1 and the adadec_diag dump.)
-    update_tool_param_state(a, tok);
-
-    // Fix A (2026-06-05): mark a tool call complete on `</tool_call>` (outside
-    // thinking) so the EOS-escape gate can lift suppression. Inert unless
-    // `tool_eos_escape_enabled()` (default OFF).
-    if a.tool_call_end_token == Some(tok) && !a.inside_thinking {
-        a.tool_call_completed = true;
-    }
+    // The required-call opener, the tool-body / parameter-body state machine
+    // (SM1, also driven by `process_decode_logits`) and `</tool_call>`'s
+    // completion (Fix A): the commit rule's, which the verify replay runs too.
+    tool_state(a, tok, &env);
 
     // F2 mirror (Iter 46, 2026-06-02): reset the inter-tool prose budget when
     // a tool call opens on the MTP/emit path — parity with the non-MTP reset
@@ -226,6 +158,7 @@ pub(super) fn emit_token_at_position(
         a.logprobs_data.push(lp);
     }
 
+    let prior = a.output_tokens.len();
     a.output_tokens.push(tok);
 
     // Spec-resume guard bookkeeping: count tokens emitted after `</think>`.
@@ -233,18 +166,11 @@ pub(super) fn emit_token_at_position(
     // when it arrives; the transition below sets it). For requests that never
     // think, think_ended starts true, so the guard delays spec by the same N
     // from the response start.
-    if a.think_ended && !a.inside_thinking {
+    let counted_post_think = a.think_ended && !a.inside_thinking;
+    if counted_post_think {
         a.post_think_emitted += 1;
     }
 
-    // §C-1 (DS4F hard-limit lane, 2026-07-21): thinking tokens draw down the
-    // SAME completion budget (`remaining`) as content tokens on the MTP/emit
-    // path too — twin of the non-MTP fix in `decode_logits_step`. A long
-    // `<think>` block can no longer run past `max_tokens`; `thinking_budget`
-    // stays the separate per-block cap (armed below). The `remaining == 0`
-    // force-stop at function end then finishes the sequence even while inside
-    // thinking. No-op for direct-mode (thinking-OFF) turns.
-    // Detect </think> transition. Track thinking token count for budget enforcement.
     let native_glm_eos = crate::glm_tool_boundary::native_eos_while_thinking(
         sched.limits.glm_tool_boundary,
         a.inside_thinking,
@@ -252,44 +178,7 @@ pub(super) fn emit_token_at_position(
         &a.eos_tokens,
     );
     if a.inside_thinking {
-        a.consume_generation_budget();
-        if a.think_end_token == Some(tok) {
-            a.inside_thinking = false;
-            // Sticky twin of the decode-path capture — see
-            // decode_logits_step (post-think EOS guard).
-            a.think_force_closed = a.force_end_thinking;
-            a.force_end_thinking = false;
-            a.sentence_defer_count = 0;
-            a.think_ended = true;
-            // One-shot for the next decode step: pin to
-            // tool_call_start_token if require_tool_call (Change 3b).
-            a.think_just_ended = true;
-            tracing::info!(
-                "Thinking ended after {} tokens (budget={:?})",
-                a.thinking_tokens,
-                a.thinking_budget,
-            );
-        } else if !native_glm_eos {
-            a.thinking_tokens += 1;
-            if let Some(budget) = a.thinking_budget
-                && a.thinking_tokens >= budget
-                && !a.force_end_thinking
-            {
-                a.force_end_thinking = true;
-                a.sentence_defer_count = 0;
-                // Twin of the decode_logits_step site: name the source so a
-                // low client budget is distinguishable from a server cap.
-                tracing::info!(
-                    source = if a.enable_thinking {
-                        "request (client budget/effort; scaled by --max-thinking-budget)"
-                    } else {
-                        "spontaneous <think> (--max-thinking-budget / MODEL.toml)"
-                    },
-                    "Thinking budget exhausted ({budget} tokens), arming </think>; \
-                     deferring to next sentence boundary"
-                );
-            }
-        }
+        advance_thinking(a, tok, prior, native_glm_eos, &env);
     } else {
         a.consume_generation_budget();
         // Clear think_just_ended one-shot now that we've consumed the
@@ -362,6 +251,8 @@ pub(super) fn emit_token_at_position(
             && watchdog_floor_reached(a.output_tokens.len(), a.min_tokens)
             && a.content_tokens >= CONTENT_LOOP_MIN_TOKENS
             && a.content_tokens.is_multiple_of(CONTENT_LOOP_CHECK_STRIDE)
+            // The next pick steers this tail off its loop (`loop_steer`).
+            && !crate::scheduler::loop_steer::will_steer(a)
             && (detect_content_token_loop_with(&a.output_tokens, loop_params)
                 || sched.masks.numeric.as_deref().is_some_and(|m| {
                     detect_content_token_loop_normalized_with(
@@ -427,53 +318,32 @@ pub(super) fn emit_token_at_position(
         }
     }
 
-    // EOS handling: grammar-based, legacy, or min_tokens suppression.
-    // Fix A (2026-06-05, kill-switch): in tool_choice="auto" the grammar's
-    // is_terminated() never becomes true after a tool call, so EOS is suppressed
-    // forever — trapping the model into a hallucinated-transcript runaway. When
-    // enabled and a tool call has completed (and we're not inside a tool body /
-    // thinking), lift the grammar suppression so the model's natural EOS ends the
-    // turn. Inert unless ATLAS_TOOL_EOS_ESCAPE=1.
-    let eos_escape = tool_eos_escape_enabled()
-        && a.tool_call_completed
-        && !a.inside_tool_body
-        && !a.inside_thinking;
-    // #192: STOP-LEGALITY based grammar suppression — see the twin gate in
-    // `decode_logits_step::process_decode_logits`. `!is_terminated()` alone
-    // suppressed EOS forever on auto-mode turns with no completed call
-    // (armed-but-unused tools → finish="length"). Evaluated only when the
-    // token IS an EOS token (`grammar_blocks_stop` fills a bitmask).
-    //
-    // `inside_thinking` term: the matcher is PAUSED during `<think>` (tokens
-    // are neither masked nor accepted), so stop-legality is undefined there.
-    // The separate thinking suppression below also covers grammarless turns,
-    // matching ordinary decode: `</think>` is the normal thinking exit.
-    let grammar_suppresses_eos = a.eos_tokens.contains(&tok)
-        && !eos_escape
-        && ((a.inside_thinking && a.grammar_state.is_some())
-            || crate::grammar::grammar_blocks_stop(a.grammar_state.as_mut(), &a.eos_tokens));
-    let legacy_suppresses_eos = a.require_tool_call;
-    let min_tokens_suppresses = a.output_tokens.len() < a.min_tokens;
-    let hard_ceiling = hard_ceiling_hit(a.remaining, position, sched.limits.max_seq_len);
-    // Native GLM EOS ends the turn, not the reasoning block. The independent
-    // grammar-inside-thinking guard above is intentionally unchanged.
-    let thinking_suppresses_eos =
-        eos_suppressed_by_thinking(a.inside_thinking, hard_ceiling) && !native_glm_eos;
-    let suppress_eos = grammar_suppresses_eos
-        || legacy_suppresses_eos
-        || min_tokens_suppresses
-        || thinking_suppresses_eos;
-
-    // The suppressed-EOS return below precedes the bottom length check. Do
-    // not let any suppression policy bypass an exhausted output/KV ceiling.
-    if a.eos_tokens.contains(&tok) && (hard_ceiling || !suppress_eos) {
-        a.finished = true;
-        return;
-    }
-    if a.eos_tokens.contains(&tok) && suppress_eos {
-        // EOS suppressed: grammar not terminated, legacy tool call not yet seen,
-        // or min_tokens not reached. Don't stop — let the model continue generating.
-        return;
+    // The end-token decision is the commit rule's (`think_commit::end_token`),
+    // made the same way by plain decode: grammar stop-legality, an unsatisfied
+    // tool call, the `min_tokens` floor, `<think>` (an honored end token closes
+    // the block instead) and the post-`</think>` tool guard hold it back; a
+    // hard ceiling (budget spent, context full) always stops. A stop is
+    // recorded for the token count but never streamed (OpenAI: the returned
+    // text excludes the stop sequence).
+    match end_token(a, tok, prior, position, native_glm_eos, &env) {
+        EndToken::Stop => {
+            a.finished = true;
+            return;
+        }
+        // Discarded exactly as serial decode discards it: never in the output,
+        // so it never counts toward the min_tokens floor (`min_tokens_eos_tests`).
+        EndToken::Suppressed => {
+            a.output_tokens.pop();
+            // The discarded token is not emitted content: undo the spec-resume
+            // count applied above (serial never records it). `thinking_tokens`
+            // stays advanced — serial's `advance_thinking` also counts the
+            // suppressed token before `end_token` runs.
+            if counted_post_think {
+                a.post_think_emitted = a.post_think_emitted.saturating_sub(1);
+            }
+            return;
+        }
+        EndToken::No => {}
     }
     // OPENCODE FIX: see process_decode_logits — same gate. Suppress streaming
     // of spontaneous-thinking content so it doesn't pollute opencode's history.
@@ -779,7 +649,8 @@ fn advance_envelope_streak(inside_parameter_body: bool, streak: u32) -> (u32, bo
     }
 }
 
-pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
+/// `quiet`: the verify replay's, which must not log a cut the stream never sees.
+pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
     if a.inside_thinking {
         return;
     }
@@ -809,10 +680,12 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
         advance_envelope_streak(a.inside_parameter_body, a.tool_body_streak_tokens);
     a.tool_body_streak_tokens = streak;
     if exceeded {
-        tracing::warn!(
-            streak = a.tool_body_streak_tokens,
-            "Stuck in tool-call ENVELOPE for {MAX_TOOL_BODY_TOKENS}+ tokens with no </tool_call> (excludes parameter-value content); ending response (model never closed the envelope — would otherwise burn to max_tokens). Sanitizer will salvage what it can."
-        );
+        if !quiet {
+            tracing::warn!(
+                streak = a.tool_body_streak_tokens,
+                "Stuck in tool-call ENVELOPE for {MAX_TOOL_BODY_TOKENS}+ tokens with no </tool_call> (excludes parameter-value content); ending response (model never closed the envelope — would otherwise burn to max_tokens). Sanitizer will salvage what it can."
+            );
+        }
         a.guard_stop = Some("tool_envelope_stuck");
         a.finished = true;
     }

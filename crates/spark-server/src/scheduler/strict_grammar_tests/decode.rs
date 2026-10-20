@@ -100,7 +100,6 @@ fn a_strict_refusal_in_serial_decode_ends_the_response_with_an_error() {
         None,
         None,
         None,
-        None,
         false,
         &sched,
     );
@@ -128,7 +127,7 @@ fn first_cut(a: &mut ActiveSeq, len: usize, token_at: impl Fn(usize) -> u32) -> 
     a.remaining = len + 1;
     a.min_tokens = 0;
     (0..len).find(|&i| {
-        let cut = handle_content_token(a, &model, &sched) || a.finished;
+        let cut = handle_content_token(a, &model, &sched, false) || a.finished;
         a.output_tokens.push(token_at(i));
         cut
     })

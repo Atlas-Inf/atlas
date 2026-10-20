@@ -74,6 +74,7 @@ impl TransformerModel {
                         gdn_commit_qkv: DevicePtr(0),
                         gdn_commit_gb: DevicePtr(0),
                         gdn_commit_pending: false,
+                        gdn_fuse_n: DevicePtr::NULL,
                         // Padding rows point at the write-only dummy slot; tag
                         // them with the active mode so the decode mixer does
                         // not re-convert scratch on every single step.

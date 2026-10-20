@@ -8,12 +8,17 @@ use super::*;
 /// Whether the single-launch CUTLASS grouped NVFP4 path is enabled. The
 /// model-neutral name is used by new integrations; retain the Holo variable
 /// as a compatibility alias for existing recipes.
-pub(super) fn grouped_cutlass_gate_up_enabled() -> bool {
+pub(crate) fn grouped_cutlass_gate_up_enabled() -> bool {
     env_flag("ATLAS_MOE_GROUPED_CUTLASS") || env_flag("ATLAS_HOLO_MOE_GROUPED_CUTLASS")
 }
 
 pub(super) fn grouped_cutlass_down_enabled() -> bool {
     env_flag("ATLAS_MOE_GROUPED_CUTLASS") || env_flag("ATLAS_HOLO_MOE_GROUPED_DOWN")
+}
+
+/// `ATLAS_MOE_PREFILL_FP8_DOWN=1`: the grouped routed down on FP8.
+pub(crate) fn prefill_fp8_down() -> bool {
+    std::env::var("ATLAS_MOE_PREFILL_FP8_DOWN").as_deref() == Ok("1")
 }
 
 pub(super) fn env_flag(name: &str) -> bool {
@@ -90,7 +95,9 @@ impl MoeLayer {
         } && !self.btile_storage.is_published()
             && worst_case_m_tiles > 1
             && !ctx.graph_capture
-            && !self.offsets_unread(n, h, inter);
+            && !self.offsets_unread(n, h, inter)
+            // The q38 chain strides its row tiles: no host round trip needed.
+            && !self.q38_routed_serves(h, inter, ctx);
         // Keep the host copy when exact sizing already paid for it. The
         // CUTLASS grouped path also needs these offsets to build its problem
         // list; copying them again would introduce a second stream-draining
@@ -221,6 +228,26 @@ impl MoeLayer {
         // kernels write every row that can be referenced by unpermute_reduce.
         // Skipping the memset removes ~138 MB/layer of scratch clears on Holo.
         self.prepare_ep_prefill_outputs(total_expanded, inter, h, ctx, stream)?;
+        // ATLAS_QWEN4EXP_PREFILL_MOE: the whole chain below on the q38
+        // kernels, byte for byte (`forward_prefill_q38.rs`).
+        if max_m_tiles > 0
+            && self.try_q38_routed_prefill(
+                expert_input,
+                expert_offsets,
+                sorted_token_ids,
+                n,
+                h,
+                inter,
+                num_experts,
+                grid_m_strided * 64,
+                total_expanded,
+                ctx,
+                stream,
+            )?
+        {
+            prof_step!("grouped_q38");
+            return Ok(());
+        }
         // Host expert_offsets from the CUTLASS gate_up, reused by down to skip
         // a second D2H + host-blocking synchronize.
         let mut cutlass_eoff: Option<Vec<i32>> = None;
@@ -661,8 +688,7 @@ impl MoeLayer {
                         stream,
                     )?;
                 } else {
-                    let fp8_down = std::env::var("ATLAS_MOE_PREFILL_FP8_DOWN").ok().as_deref()
-                        == Some("1")
+                    let fp8_down = prefill_fp8_down()
                         && self.moe_fp8_grouped_gemm_t.0 != 0
                         && self.bf16_to_fp8_k.0 != 0;
                     if fp8_down {
@@ -751,6 +777,7 @@ impl MoeLayer {
             }
         }
         prof_step!("grouped_silu_down");
+        super::forward_prefill_q38::finish_q38_check(ctx, total_expanded, h, stream)?;
 
         Ok(())
     }

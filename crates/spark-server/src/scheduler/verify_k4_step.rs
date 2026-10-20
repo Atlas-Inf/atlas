@@ -106,6 +106,7 @@ pub fn step_verify_k4(
         sched.levers.dflash_masked_verify,
         model,
         a,
+        &[v0_argmax, v1_argmax, v2_argmax, v3_argmax],
     ) {
         // DFlash drafter proposes on raw argmax; verify on the SAME (GOLD)
         // basis so verifier/drafter judge identically. No rep_pen/DRY here.
@@ -161,6 +162,10 @@ pub fn step_verify_k4(
     // SINGLE-sequence step, i.e. the n=1 row of the same table the batched
     // step fills for n>=2.
     crate::scheduler::mtp_accept_debug::record(1, 3, drafts[0] == v0, num_accepted);
+    if !dflash_verify_raw_argmax {
+        a.mtp_acct
+            .record_depth_verify(3, num_accepted, num_drafts, sched.levers.depth());
+    }
 
     // ATLAS_MTP_REFEED_ACCEPTED: same contract as `verify_k3_step` — ring the
     // TARGET's true hidden for verify rows 0..=num_accepted under labels

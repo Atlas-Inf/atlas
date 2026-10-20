@@ -37,6 +37,7 @@ impl TransformerModel {
             proc_count,
             0,
             0,
+            None,
             stream,
         )
     }
@@ -55,6 +56,9 @@ impl TransformerModel {
         proc_count: usize,
         hidden_stream_offset_tokens: usize,
         logits_row: usize,
+        // The last row's logits, when the caller projected them already
+        // (`multi`: every sequence's row of a multi-sequence pass at once).
+        logits_in: Option<DevicePtr>,
         stream: u64,
     ) -> Result<DevicePtr> {
         let h = self.config.hidden_size;
@@ -131,6 +135,23 @@ impl TransformerModel {
         let normed = self.buffers.norm_output();
         self.final_norm_rows(last_hidden, normed, 1, stream)?;
 
+        // ATLAS_LAYER_H_PREFILL: post-final-norm sum (pairs with the
+        // per-layer ATLAS_LAYER_HP lines).
+        if std::env::var("ATLAS_LAYER_H_PREFILL").as_deref() == Ok("1") {
+            self.gpu.synchronize(stream)?;
+            let mut hb = vec![0u8; h * 2];
+            if self.gpu.copy_d2h(normed, &mut hb).is_ok() {
+                let mut s_ = 0f64;
+                for c in hb.chunks_exact(2) {
+                    let v = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16) as f64;
+                    if v.is_finite() {
+                        s_ += v.abs();
+                    }
+                }
+                tracing::warn!("ATLAS_LAYER_HP FINAL last_sabs={s_:.6} all_sabs={s_:.6}");
+            }
+        }
+
         // Diagnostic: post-norm hidden state
         if std::env::var("ATLAS_DIAG_GEMMA4").is_ok_and(|v| v == "1" || v == "true") {
             self.gpu.synchronize(stream)?;
@@ -194,7 +215,9 @@ impl TransformerModel {
         // streams' first token collapses to one shared buffer (cross-request
         // contamination). Row 0 (single-stream + batched stream 0) keeps the
         // byte-identical `lm_head` GEMV path; rows >0 write to their own offset.
-        let logits_ptr = if logits_row == 0 {
+        let logits_ptr = if let Some(ptr) = logits_in {
+            ptr
+        } else if logits_row == 0 {
             self.lm_head(normed, stream)?;
             self.decode_logits_ptr()
         } else {
@@ -210,6 +233,24 @@ impl TransformerModel {
                 (proc_count - 1, 1),
             );
             det.tap("logits", logits_ptr, row, self.config.vocab_size * 2);
+        }
+
+        if std::env::var("ATLAS_LAYER_H_PREFILL").as_deref() == Ok("1") {
+            self.gpu.synchronize(stream)?;
+            let v_sz = self.config.vocab_size;
+            let mut lb = vec![0u8; v_sz * 2];
+            if self.gpu.copy_d2h(logits_ptr, &mut lb).is_ok() {
+                let mut top: Vec<(u32, f32)> = Vec::with_capacity(5);
+                for (i, c) in lb.chunks_exact(2).enumerate() {
+                    let v = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
+                    if v.is_finite() && (top.len() < 5 || v > top[4].1) {
+                        top.push((i as u32, v));
+                        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                        top.truncate(5);
+                    }
+                }
+                tracing::warn!("ATLAS_LAYER_HP LOGITS top5={top:?}");
+            }
         }
 
         // Per-layer divergence dump: full logits vector + top-10 token IDs.
@@ -396,7 +437,10 @@ impl TransformerModel {
                     // would serve the previous request's lexical state, so
                     // aux-carrying models decline aux-less slots on restore.
                     let mut aux = self.ssm_snapshots.take_aux(snap_id);
-                    self.collect_aux_states_into(seq, stream, &mut aux)?;
+                    // ATLAS_QWEN4EXP_CKPT_AUX_SHARE: the mid-chunk finalize read these.
+                    if !super::qwen4exp_ckpt::take_pass_aux(seq.slot_idx, seq.seq_len, &mut aux) {
+                        self.collect_aux_states_into(seq, stream, &mut aux)?;
+                    }
                     if !aux.is_empty() {
                         self.ssm_snapshots.set_aux(snap_id, aux);
                     }

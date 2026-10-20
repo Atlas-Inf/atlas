@@ -100,14 +100,14 @@ fn qkv_phase_d2d(
         midchunk_capture: None,
         moe_lora_route: crate::layer::MoeLoraRoute::Fold,
     };
-    let seq_lens = vec![1; n];
+    let positions = vec![1; n];
     let c = MultiSeqCtx::new(
         layer,
         &fwd,
         buffers.hidden_states(),
         buffers.residual(),
         n,
-        &seq_lens,
+        &positions,
         16,
         0,
     );

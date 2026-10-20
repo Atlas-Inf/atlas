@@ -29,6 +29,9 @@ impl TransformerModel {
             && comm.world_size() == 2
             && rows >= 4096
             && rows.is_multiple_of(2)
+            // DFlash captures the complete target-hidden window on rank 0;
+            // SP leaves only rank-local rows and would publish capture holes.
+            && c.dflash_capture_layers.is_empty()
             && self.mtp_prefill_hidden.is_null()
             // The first and last layers (expand/contract) are KDA layers.
             && layers > 1

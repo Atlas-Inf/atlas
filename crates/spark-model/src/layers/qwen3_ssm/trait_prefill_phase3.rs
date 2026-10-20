@@ -107,6 +107,7 @@ impl Qwen3SsmLayer {
             gdn_commit_qkv: DevicePtr(0),
             gdn_commit_gb: DevicePtr(0),
             gdn_commit_pending: false,
+            gdn_fuse_n: DevicePtr::NULL,
             h_is_f16: false,
             // `Layer::alloc_state` is the NON-pooled fallback — it owns a
             // private FP32 `h_state_bytes` blob, so there is nothing to widen.

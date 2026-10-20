@@ -45,17 +45,37 @@ pub(crate) fn self_spec_supported(
     Ok(requested && model_has_it)
 }
 
-/// Floor SSM snapshot slots so a 1M prefill does not drop Marconi
-/// checkpoints (`SSM snapshot pool exhausted`). Tokens per snapshot =
-/// `ssm_checkpoint_interval * block_size` (default 256*16=4096).
-/// `--ssm-cache-slots 0` still disables the pool. Every rank must resolve
-/// the same count (`topology::rank_settings`).
+/// Floor SSM snapshot slots so a full-context prefill does not drop Marconi
+/// checkpoints (`SSM snapshot pool exhausted`). `--ssm-cache-slots 0` still
+/// disables the pool. Every rank must resolve the same count
+/// (`topology::rank_settings`).
+///
+/// A checkpoint fires only at a prefill CHUNK end whose block index is a
+/// multiple of the interval (`prefill_b_save_checkpoint`: the interval
+/// filters chunk boundaries, it does not create them), so consecutive
+/// checkpoints are at least `max(interval * block_size, chunk)` tokens apart.
+/// Sizing by the interval alone over-provisioned by chunk / interval: at
+/// --max-seq-len 262144 with 16K chunks, 72 slots where 24 cover a prompt,
+/// 2.8 GB of GPU memory per rank on Qwen3.8-Flash-Next TP2 that the KV pool
+/// could not use. Smaller chunks (mixed steps) can checkpoint more densely;
+/// a full pool then reclaims the LRU cached snapshot or skips that one
+/// checkpoint, which costs recompute on a partial prefix hit, nothing more.
 pub(super) fn resolve_ssm_cache_slots(args: &cli::ServeArgs) -> usize {
+    // ATLAS_QWEN4EXP_SNAPSHOT_SLOTS: exactly that many (`ssm_snapshot_budget`).
+    if let Some(n) = spark_model::model::ssm_snapshot_budget::snapshot_slots_requested() {
+        return n;
+    }
     let requested = args.ssm_cache_slots;
     if requested == 0 || args.ssm_checkpoint_interval == 0 || args.block_size == 0 {
         return requested;
     }
-    let tok_per = args.ssm_checkpoint_interval * args.block_size;
+    // The SSM prefill chunk (`preflight`): --max-prefill-tokens, 8192 unset.
+    let chunk = match args.max_prefill_tokens {
+        0 => 8192,
+        n => n,
+    }
+    .min(args.max_seq_len.max(1));
+    let tok_per = (args.ssm_checkpoint_interval * args.block_size).max(chunk);
     let needed = args
         .max_seq_len
         .div_ceil(tok_per)
@@ -113,7 +133,8 @@ pub(crate) fn build_model(
         .parse()
         .context("Invalid --mtp-quantization value")?;
     let ssm_cache_slots = resolve_ssm_cache_slots(args);
-    if ssm_cache_slots > args.ssm_cache_slots {
+    let env_slots = spark_model::model::ssm_snapshot_budget::snapshot_slots_requested();
+    if ssm_cache_slots > args.ssm_cache_slots && env_slots.is_none() {
         tracing::warn!(
             "raising --ssm-cache-slots {} → {ssm_cache_slots} so Marconi \
              snapshots cover --max-seq-len={} ({} tok/snapshot). \
@@ -401,6 +422,45 @@ mod self_spec_tests {
         assert!(!self_spec_supported(false, true, true).unwrap());
         assert!(!self_spec_supported(true, false, true).unwrap());
         assert!(!self_spec_supported(false, false, true).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod ssm_slot_floor_tests {
+    use clap::Parser;
+
+    use super::resolve_ssm_cache_slots;
+    use crate::cli::ServeArgs;
+
+    fn slots(extra: &[&str]) -> usize {
+        let mut argv = vec!["spark"];
+        argv.extend_from_slice(extra);
+        resolve_ssm_cache_slots(&ServeArgs::parse_from(argv))
+    }
+
+    #[test]
+    fn the_floor_follows_the_checkpoint_spacing_not_the_interval() {
+        // 16K chunks over a 256K context: 16 chunk-end checkpoints + 8.
+        let long = ["--max-seq-len", "262144", "--max-prefill-tokens", "16384"];
+        assert_eq!(slots(&long), 24);
+        // Default 8K chunks: 32 + 8.
+        assert_eq!(slots(&["--max-seq-len", "262144"]), 40);
+        // A chunk below the interval leaves the interval as the spacing.
+        assert_eq!(
+            slots(&["--max-seq-len", "262144", "--max-prefill-tokens", "2048"]),
+            64 + 8
+        );
+        // Short contexts keep the configured 16.
+        assert_eq!(slots(&["--max-seq-len", "32768"]), 16);
+        // An explicit larger request and 0 (off) are honoured.
+        assert_eq!(
+            slots(&["--max-seq-len", "262144", "--ssm-cache-slots", "100"]),
+            100
+        );
+        assert_eq!(
+            slots(&["--max-seq-len", "262144", "--ssm-cache-slots", "0"]),
+            0
+        );
     }
 }
 

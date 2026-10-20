@@ -198,3 +198,117 @@ pub fn qsa_qprep_rows(
         .arg_f32(eps)
         .launch(stream)
 }
+
+/// Decode-row block scores (`qsa_score_rows_dec`): `qsa_score_rows_exact`'s
+/// bytes for up to 16 rows, one thread per block walking every row with the
+/// block's key group in registers. `[rows, score_stride]`, -1e30 past each
+/// row's complete count.
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_score_rows_dec(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    block_keys: DevicePtr,
+    scores: DevicePtr,
+    rows: u32,
+    n_blocks_max: u32,
+    first_pos: u32,
+    score_stride: u32,
+    ratio: u32,
+    n_heads: u32,
+    hd: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([n_blocks_max.div_ceil(128), 1, 1])
+        .block([128, 1, 1])
+        .shared_mem(rows * n_heads * hd * 4)
+        .arg_ptr(q)
+        .arg_ptr(block_keys)
+        .arg_ptr(scores)
+        .arg_u32(first_pos)
+        .arg_u32(score_stride)
+        .arg_u32(ratio)
+        .arg_u32(n_heads)
+        .arg_u32(hd)
+        .arg_u32(rows)
+        .arg_u32(n_blocks_max)
+        .launch(stream)
+}
+
+/// Per-row decode top-k (`qsa_select_topk_radix_rows`): one 1024-thread CTA
+/// per row, the single-row radix select at row `r`'s geometry (position
+/// `first_pos + r`). Writes `[rows, sel_stride]` token ids.
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_select_topk_radix_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    scores: DevicePtr,
+    sel: DevicePtr,
+    rows: u32,
+    score_stride: u32,
+    sel_stride: u32,
+    first_pos: u32,
+    block_topk: u32,
+    ratio: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([rows, 1, 1])
+        .block([1024, 1, 1])
+        .arg_ptr(scores)
+        .arg_ptr(sel)
+        .arg_u32(score_stride)
+        .arg_u32(sel_stride)
+        .arg_u32(first_pos)
+        .arg_u32(block_topk)
+        .arg_u32(ratio)
+        .launch(stream)
+}
+
+/// Selected-set decode attention for `rows` rows of one sequence, straight
+/// from the paged cache (`qsa_sparse_decode_attn`). `ptrs`: q, k_pool,
+/// v_pool, out, the sequence's block table, sel. `geo`: sel_stride,
+/// first_pos, ratio, block_topk, nq, nkv, hd, block_size.
+pub fn qsa_sparse_decode_attn(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    ptrs: [DevicePtr; 6],
+    geo: [u32; 8],
+    inv_sqrt_d: f32,
+    q_stride: u32,
+    rows: u32,
+    stream: u64,
+) -> Result<()> {
+    let [q, k_pool, v_pool, out, table, sel] = ptrs;
+    let [
+        sel_stride,
+        first_pos,
+        ratio,
+        block_topk,
+        nq,
+        nkv,
+        hd,
+        block_size,
+    ] = geo;
+    KernelLaunch::new(gpu, kernel)
+        .grid([nq, rows, 1])
+        .block([256, 1, 1])
+        .arg_ptr(q)
+        .arg_ptr(k_pool)
+        .arg_ptr(v_pool)
+        .arg_ptr(out)
+        .arg_ptr(table)
+        .arg_ptr(sel)
+        .arg_u32(sel_stride)
+        .arg_u32(first_pos)
+        .arg_u32(ratio)
+        .arg_u32(block_topk)
+        .arg_u32(nq)
+        .arg_u32(nkv)
+        .arg_u32(hd)
+        .arg_u32(block_size)
+        .arg_f32(inv_sqrt_d)
+        .arg_u32(q_stride)
+        .launch(stream)
+}

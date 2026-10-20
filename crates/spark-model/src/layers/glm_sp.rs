@@ -11,6 +11,13 @@
 //! the tail rows DFlash captures (rank 0 only) are always local to it.
 //!
 //! All ops keep their per-row arithmetic, so outputs are bit-identical.
+//!
+//! qwen4_exp (`ATLAS_QWEN4EXP_PREFILL_SP=1`, `model::qwen4exp_prefill_sp`)
+//! splits UNEVENLY, at a multiple of the 2048-row mHC slab, so that each
+//! rank's collapses run the same slabs as the unsplit chunk (the slab height
+//! picks the GEMM, and so the bits); [`SpRows::split_at`]. Its exchanges move
+//! `max(rows, peer_rows)` rows each way and land the peer's in a staging
+//! buffer where the two halves differ (`glm_sp_uneven`).
 
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::DevicePtr;
@@ -27,6 +34,13 @@ pub struct SpRows {
     pub rows: usize,
     /// First row the peer owns.
     pub peer0: usize,
+    /// Rows the peer owns (`rows` for an even split).
+    pub peer_rows: usize,
+    /// The shared expert runs every row and only its blend the local ones,
+    /// instead of running the local rows only: its GEMMs' kernel choice may
+    /// depend on the row count, so a split that must keep every byte keeps
+    /// its row count (qwen4_exp).
+    pub full_shared: bool,
 }
 
 impl SpRows {
@@ -34,7 +48,37 @@ impl SpRows {
     pub fn for_rank(total: usize, rank: usize) -> Self {
         let rows = total / 2;
         let (row0, peer0) = if rank == 0 { (rows, 0) } else { (0, rows) };
-        Self { row0, rows, peer0 }
+        Self {
+            row0,
+            rows,
+            peer0,
+            peer_rows: rows,
+            full_shared: false,
+        }
+    }
+
+    /// Split `total` rows at `split`: rank 0 owns `[0, split)`, rank 1
+    /// `[split, total)` (qwen4_exp: rank 0, the only drafting rank, keeps
+    /// chunk row 0 at highway row 0). The shared expert keeps every row.
+    pub fn split_at(total: usize, split: usize, rank: usize) -> Self {
+        let (lo, hi) = (split, total - split);
+        let (row0, rows, peer0, peer_rows) = if rank == 0 {
+            (0, lo, split, hi)
+        } else {
+            (split, hi, 0, lo)
+        };
+        Self {
+            row0,
+            rows,
+            peer0,
+            peer_rows,
+            full_shared: true,
+        }
+    }
+
+    /// Rows of the whole chunk.
+    pub fn total(self) -> usize {
+        self.rows + self.peer_rows
     }
 
     /// `ptr` advanced to the local rows of a `[total, width]` BF16 tensor.
@@ -51,6 +95,9 @@ impl SpRows {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.rows != self.peer_rows {
+            return super::glm_sp_uneven::exchange(self, ptr, width, true, ctx, stream);
+        }
         exchange_rows(
             ptr.offset(self.peer0 * width * 2),
             self.local(ptr, width),
@@ -70,6 +117,9 @@ impl SpRows {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.rows != self.peer_rows {
+            return super::glm_sp_uneven::exchange(self, ptr, width, false, ctx, stream);
+        }
         exchange_rows(
             self.local(ptr, width),
             ptr.offset(self.peer0 * width * 2),
@@ -145,7 +195,9 @@ mod tests {
             SpRows {
                 row0: 4098,
                 rows: 4098,
-                peer0: 0
+                peer0: 0,
+                peer_rows: 4098,
+                full_shared: false,
             }
         );
         assert_eq!(
@@ -153,7 +205,9 @@ mod tests {
             SpRows {
                 row0: 0,
                 rows: 4098,
-                peer0: 4098
+                peer0: 4098,
+                peer_rows: 4098,
+                full_shared: false,
             }
         );
         let r = SpRows::for_rank(8, 0);
@@ -161,6 +215,22 @@ mod tests {
             r.local(DevicePtr(0x1000), 4096),
             DevicePtr(0x1000 + 4 * 4096 * 2)
         );
+    }
+
+    #[test]
+    fn split_at_gives_rank0_the_lower_rows() {
+        let lo = SpRows::split_at(16046, 8192, 0);
+        let hi = SpRows::split_at(16046, 8192, 1);
+        assert_eq!(
+            (lo.row0, lo.rows, lo.peer0, lo.peer_rows),
+            (0, 8192, 8192, 7854)
+        );
+        assert_eq!(
+            (hi.row0, hi.rows, hi.peer0, hi.peer_rows),
+            (8192, 7854, 0, 8192)
+        );
+        assert_eq!((lo.total(), hi.total()), (16046, 16046));
+        assert!(lo.full_shared && hi.full_shared);
     }
 
     #[test]

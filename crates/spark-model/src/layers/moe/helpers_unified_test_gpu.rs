@@ -125,16 +125,18 @@ impl GpuBackend for RecordingGpu {
         Ok(())
     }
     fn copy_d2d(&self, src: DevicePtr, dst: DevicePtr, n: usize) -> Result<()> {
+        Self::record(&mut self.state.lock().unwrap(), Event::D2d(src, dst, n))?;
         let bytes = self.read(src, n);
-        let mut state = self.state.lock().unwrap();
-        Self::record(&mut state, Event::D2d(src, dst, n))?;
-        let (&base, storage) = state
+        let mut s = self.state.lock().unwrap();
+        let (&base, _) = s
             .bytes
-            .range_mut(..=dst.0)
+            .range(..=dst.0)
             .next_back()
-            .expect("known destination");
+            .expect("D2D destination");
         let offset = (dst.0 - base) as usize;
-        storage[offset..offset + n].copy_from_slice(&bytes);
+        let dest = s.bytes.get_mut(&base).unwrap();
+        ensure!(offset + n <= dest.len(), "D2D destination bounds");
+        dest[offset..offset + n].copy_from_slice(&bytes);
         Ok(())
     }
     fn launch(

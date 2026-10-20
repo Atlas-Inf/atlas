@@ -20,7 +20,13 @@ extra_nvcc_flags = ["--fmad=false", "-DHDIM=128"]
 #       variant, resolved via `try_kernel` — same convention mismatch.)
 #       Porting them properly means reimplementing each against the interleaved
 #       layout, which is a Mistral kernel change, not a shadow-sync.
+# qwen4_exp-only optional kernel this shadow legitimately lacks:
+# rms_norm_f32_grouped is resolved with try_kernel only under
+# ATLAS_QWEN4EXP_MTP_GROUPED_NORM=1 (the qwen4exp MTP drafter); a null
+# handle falls back to per-row rms_norm_f32, so this model's decode chain
+# never reaches it.
 [shadow_exempt]
+norm = ["rms_norm_f32_grouped"]
 rope = [
     "rope_forward_proportional",
     "rope_forward_strided",

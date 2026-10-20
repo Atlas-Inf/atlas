@@ -165,9 +165,19 @@ mod forward_prefill_bf16;
 mod forward_prefill_finish;
 mod forward_prefill_fp8;
 mod forward_prefill_phase;
+mod forward_prefill_q38;
+pub(crate) use forward_prefill_q38::{q38_requested, sp_shared_requested, w2_requested};
+mod forward_prefill_q38_nodup;
+pub(crate) use forward_prefill_q38_nodup::{nodup_requested, skips_routed_transpose};
+mod forward_prefill_q38_rs;
 mod forward_prefill_route;
+pub(crate) mod forward_prefill_route_sp;
 mod forward_prefill_routed;
+pub(crate) use forward_prefill_routed::{grouped_cutlass_gate_up_enabled, prefill_fp8_down};
 mod forward_prefill_router;
+mod forward_prefill_tcp;
+pub(crate) use forward_prefill_tcp::tcp_requested;
+mod forward_rows;
 mod forward_token_major;
 mod gate_up_m16;
 mod gate_up_repack;
@@ -177,6 +187,7 @@ mod helpers_a;
 mod helpers_b;
 mod helpers_c;
 mod helpers_shared_only;
+mod route_dump;
 mod shared_fp8_cache;
 mod shared_fp8_cache_load;
 mod shared_fp8_cache_output;
@@ -208,5 +219,53 @@ mod prequant_fp4_c3;
 mod prequant_fp4_down;
 pub(crate) use prequant_fp4::with_owner_rows;
 mod ptr_table_build;
-mod union_stats;
+mod qwen4exp_fast;
+pub(crate) mod union_stats;
 pub(crate) use ptr_table_build::*;
+
+/// Exact `max_m_tiles` for the grouped GEMM grid: the largest per-expert row
+/// count (adjacent diffs of the sorted `expert_offsets` prefix-sum), tiled by
+/// 64 and clamped to `worst_case` for safety. `offsets_le` is the D2H copy of
+/// the `(num_experts + 1)` u32 LE prefix-sum buffer.
+pub(crate) fn exact_m_tiles(offsets_le: &[u8], worst_case: u32) -> u32 {
+    let mut prev = 0u32;
+    let mut max_rows = 0u32;
+    for raw in offsets_le.chunks_exact(4).skip(1) {
+        let cur = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        max_rows = max_rows.max(cur.saturating_sub(prev));
+        prev = cur;
+    }
+    max_rows.div_ceil(64).max(1).min(worst_case)
+}
+
+#[cfg(test)]
+mod exact_m_tiles_tests {
+    use super::exact_m_tiles;
+
+    fn offsets(counts: &[u32]) -> Vec<u8> {
+        let mut o = vec![0u8; 4];
+        let mut acc = 0u32;
+        for &c in counts {
+            acc += c;
+            o.extend_from_slice(&acc.to_le_bytes());
+        }
+        o
+    }
+
+    #[test]
+    fn tiles_cases() {
+        // all empty experts -> max diff 0 -> 1 tile
+        assert_eq!(exact_m_tiles(&offsets(&[0, 0, 0]), 100), 1);
+        // one hot expert takes all 512*22 routed rows
+        assert_eq!(
+            exact_m_tiles(&offsets(&[0, 512 * 22, 0]), 99999),
+            (512 * 22) / 64
+        );
+        // balanced: 2816 rows spread evenly over 8 experts
+        assert_eq!(exact_m_tiles(&offsets(&[352; 8]), 2816 / 64 + 1), 6);
+        // clamp to worst_case when the real max exceeds it
+        assert_eq!(exact_m_tiles(&offsets(&[0, 9000, 0]), 10), 10);
+        // empty slice -> 1
+        assert_eq!(exact_m_tiles(&[], 5), 1);
+    }
+}

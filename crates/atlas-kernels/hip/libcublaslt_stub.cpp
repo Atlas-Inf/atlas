@@ -223,6 +223,9 @@ constexpr int UNSUPPORTED = 7;
 
 extern "C" {
 
+// Not a cuBLASLt: callers gating bit-exact paths on a verified version see 0.
+size_t cublasLtGetVersion(void) { return 0; }
+
 int cublasLtCreate(hipblasLtHandle_t* handle) {
     if (!ready()) return STUB;
     return static_cast<int>(g_lt.create(handle));
@@ -312,6 +315,11 @@ int cublasLtMatmulPreferenceDestroy(hipblasLtMatmulPreference_t pref) {
     if (!ready()) return STUB;
     return static_cast<int>(g_lt.pref_destroy(pref));
 }
+
+// The k-chain pin (spark_runtime::cublaslt::kchain_pin) reads cuBLASLt algo
+// attributes; hipBLASLt's differ, so the shim reports none and the pin keeps
+// the heuristic's first result.
+int cublasLtMatmulAlgoConfigGetAttribute(const void*, int, void*, size_t, size_t*) { return STUB; }
 
 int cublasLtMatmulAlgoGetHeuristic(hipblasLtHandle_t handle, hipblasLtMatmulDesc_t desc,
                                    hipblasLtMatrixLayout_t a, hipblasLtMatrixLayout_t b,

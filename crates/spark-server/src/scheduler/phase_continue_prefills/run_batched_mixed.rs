@@ -32,7 +32,6 @@ pub(super) fn run_batched_mixed_step(
     t0_step: Instant,
     think_end_token: Option<u32>,
     think_start_token: Option<u32>,
-    code_fence_token: Option<u32>,
     tool_call_start_token: Option<u32>,
     tool_call_end_token: Option<u32>,
     adaptive_sampling: bool,
@@ -70,8 +69,10 @@ pub(super) fn run_batched_mixed_step(
             chunk_len = tb - p.chunk_offset;
         }
         let is_last = p.chunk_offset + chunk_len >= p.prompt_tokens.len();
-        if !is_last && chunk_len >= 4 {
-            chunk_len = (chunk_len / 4) * 4;
+        if !is_last && chunk_len >= spark_runtime::prefill_chunk_granule() {
+            // (ATLAS_QWEN4EXP_PREFILL_ROWINV: 64, the GDN chunk.)
+            let g = spark_runtime::prefill_chunk_granule();
+            chunk_len = (chunk_len / g) * g;
         }
         chunk_lens.push(chunk_len);
         is_last_flags.push(is_last);
@@ -162,7 +163,7 @@ pub(super) fn run_batched_mixed_step(
             p.top_k,
             p.top_p,
             p.min_p,
-            &p.eos_tokens,
+            &crate::scheduler::min_tokens_ban::first_token_suppress(&p.eos_tokens, p.min_tokens),
             p.grammar_state.as_mut(),
             &sched.levers.sampling(),
         ) {
@@ -191,7 +192,6 @@ pub(super) fn run_batched_mixed_step(
             t0_step,
             think_end_token,
             think_start_token,
-            code_fence_token,
             tool_call_start_token,
             tool_call_end_token,
             adaptive_sampling,

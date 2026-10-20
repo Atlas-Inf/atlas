@@ -10,6 +10,35 @@ use anyhow::{Result, bail, ensure};
 use super::super::super::types::TransformerModel;
 use crate::layers::ops;
 
+/// `ATLAS_QWEN4EXP_PREFILL_HOST_IDS=1`: the prefill forward hands its layers
+/// the host copy of the token ids it uploaded (`ForwardContext::
+/// host_token_ids`). PLE otherwise reads them back from the device with a
+/// blocking copy in the middle of the pass, which drains the stream and
+/// leaves the GPU idle while the host then hashes the n-grams (5.5 ms at 16K
+/// on the pair, nsys `sqpf-p3s7-r0`). The ids are the same bytes: the copy
+/// mirrors the last upload into the stable `token_ids` buffer.
+pub(in crate::model) fn host_ids_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("ATLAS_QWEN4EXP_PREFILL_HOST_IDS").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
+thread_local! {
+    /// The ids last uploaded into the stable `token_ids` buffer.
+    static STAGED_IDS: std::cell::RefCell<Option<Vec<u32>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The host copy of the ids in `token_ids`, taken by the forward that reads
+/// them (`None`: switch off, or no prefill upload since the last take).
+pub(super) fn take_staged_ids() -> Option<Vec<u32>> {
+    STAGED_IDS.with(|s| s.borrow_mut().take())
+}
+
 /// Return the packed vision-row range covered by one prompt chunk. The
 /// encoder output follows the complete prompt's pad-token order, so a chunk
 /// starting in the middle of a media run must begin after every earlier image
@@ -98,6 +127,8 @@ impl TransformerModel {
             // `tid2eid[token_id]` per token in this same chunk order.
             self.gpu
                 .copy_h2d_async(token_ids_bytes, self.buffers.token_ids(), stream)?;
+            STAGED_IDS
+                .with(|s| *s.borrow_mut() = host_ids_requested().then(|| chunk_tokens.to_vec()));
             let t_h2d = _tp.elapsed();
             if self.has_ngram_embedding() {
                 // THE chunked-prefill embed. n-gram hashes read behind the
@@ -250,10 +281,10 @@ impl TransformerModel {
 
                 for (i, &tok) in chunk_tokens.iter().enumerate() {
                     if tok == image_pad || tok == video_pad {
-                        let src = ve.buf_out.offset(row_idx * ve.out_hidden_size * 2);
+                        let src = ve.out_row().offset(row_idx * ve.out_hidden_size() * 2);
                         let dst = hidden_dst.offset(i * h * elem_bytes);
                         self.gpu
-                            .copy_d2d_async(src, dst, ve.out_hidden_size * 2, stream)?;
+                            .copy_d2d_async(src, dst, ve.out_hidden_size() * 2, stream)?;
                         row_idx += 1;
                     }
                 }

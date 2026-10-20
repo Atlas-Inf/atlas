@@ -28,7 +28,8 @@ fn mtp_thinking_eos_waits_for_visible_answer_boundary() {
             "thinking EOS must not end a plain MTP response"
         );
         assert_eq!(a.remaining, 19);
-        assert_eq!(a.output_tokens, vec![10, EOS]);
+        // Discarded as serial decode discards it (`min_tokens_eos_tests`).
+        assert_eq!(a.output_tokens, vec![10]);
         assert!(rx.try_recv().is_err(), "suppressed EOS must not stream");
         emit_token(&mut a, CLOSE, None, &sched);
         assert!(!a.inside_thinking && a.think_ended && !a.finished);
@@ -47,7 +48,8 @@ fn mtp_eos_cannot_bypass_output_or_context_ceiling() {
     for thinking in [true, false] {
         for output_ceiling in [true, false] {
             let remaining = if output_ceiling { 1 } else { 20 };
-            let (mut a, _response_rx) = test_seq(vec![10], remaining, None, 12);
+            // Held: a dropped receiver reads as a client disconnect.
+            let (mut a, _rx) = test_seq(vec![10], remaining, None, 12);
             a.finished = false;
             a.eos_tokens = vec![EOS];
             a.min_tokens = 100;

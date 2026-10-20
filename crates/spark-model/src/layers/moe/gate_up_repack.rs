@@ -62,6 +62,9 @@ mod launch_tests;
 #[path = "gate_up_native_source.rs"]
 mod native_source;
 #[cfg(test)]
+#[path = "qwen4exp_fast_tests.rs"]
+mod qwen4exp_fast_tests;
+#[cfg(test)]
 #[path = "gate_up_btile_test_gpu.rs"]
 pub(super) mod recording;
 #[cfg(test)]

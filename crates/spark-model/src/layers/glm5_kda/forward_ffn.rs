@@ -19,7 +19,7 @@ impl Glm5KdaLayer {
         );
         let mut deferred_shared_gate = None;
         let sp = crate::layers::glm_sp::current()
-            .filter(|sp| !decode && !capture_verify_intermediates && tokens == 2 * sp.rows);
+            .filter(|sp| !decode && !capture_verify_intermediates && tokens == sp.total());
         let ffn_out = if let Some(sp) = sp {
             self.ffn.forward_prefill_sp(normed, sp, ctx, stream)?
         } else if capture_verify_intermediates && tokens == 2 {
@@ -74,7 +74,7 @@ impl Glm5KdaLayer {
         // Sequence-parallel prefill: `ffn_out` and the highway hold this
         // rank's rows; the contracted rows land at their chunk position.
         let sp = crate::layers::glm_sp::current()
-            .filter(|sp| !decode && !capture_verify_intermediates && tokens == 2 * sp.rows);
+            .filter(|sp| !decode && !capture_verify_intermediates && tokens == sp.total());
         let m = sp.map_or(tokens as u32, |sp| sp.rows as u32);
         let h = self.hidden_size as u32;
         profile::step(ctx, stream, &mut profile_timer, "ffn")?;

@@ -14,7 +14,8 @@ use anyhow::Result;
 use atlas_core::config::LayerType;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
-use super::super::block_mgmt::{ensure_blocks_through_decode, extract_layer_refs};
+use super::super::block_mgmt::extract_layer_refs;
+use super::super::decode_pieces::PieceStep;
 use super::super::types::TransformerModel;
 use crate::layer::{ForwardContext, LayerState, SsmLayerState};
 use crate::layers::ops;
@@ -79,12 +80,6 @@ impl TransformerModel {
         // forward_batched.rs:269) remain at shape `h * elem` per call —
         // batching the comm shape would need new MoE kernel work and is
         // deliberately out of scope here.
-        if self.comm.is_some() {
-            let seq_ids: Vec<u32> = seqs.iter().map(|s| s.slot_idx as u32).collect();
-            self.ep_broadcast_decode_batch_dispatch(&seq_ids, tokens)?;
-            return self.decode_batch_compute_main(tokens, seqs, stream);
-        }
-
         // MLA models: as of issue #84 the batched `decode_multi_seq` path
         // HAS a genuine MLA branch (`ms_mla_decode` in
         // `qwen3_attention/trait_impl/multi_seq/mla.rs`) — the batched
@@ -125,8 +120,25 @@ impl TransformerModel {
             let bound = self.config.index_topk + self.config.index_compress_ratio - 1;
             seqs.iter().any(|s| s.seq_len >= bound)
         };
+        // ATLAS_QWEN4EXP_BATCH_FAST: an active row is served per row INSIDE
+        // the batched step (`multi_seq/qsa_rows.rs`, rows of several
+        // sequences allowed by `multi_seq/guard.rs`) wherever every attention
+        // layer's per-row phase applies (`verify_context_limit` is unbounded).
+        let qsa_rows_in_batch =
+            self.levers.qwen4exp_batch_fast && self.verify_context_limit().is_none();
         let hc_perseq = self.config.hc_mult > 0
-            && (qsa_active || std::env::var("ATLAS_HC_PERSEQ_DECODE").as_deref() == Ok("1"));
+            && ((qsa_active && !qsa_rows_in_batch)
+                || std::env::var("ATLAS_HC_PERSEQ_DECODE").as_deref() == Ok("1"));
+        // Parallel comm: the batched forward has no per-row QSA hook under EP
+        // (`multi_seq/guard.rs` refuses an active row with comm present), so a
+        // highway batch with an ACTIVE selection takes the per-seq loop below,
+        // where each `decode()` drives the worker through the single-sequence
+        // EP command exactly as C1 decode does. Everything else stays batched.
+        if self.comm.is_some() && !hc_perseq {
+            let seq_ids: Vec<u32> = seqs.iter().map(|s| s.slot_idx as u32).collect();
+            self.ep_broadcast_decode_batch_dispatch(&seq_ids, tokens)?;
+            return self.decode_batch_compute_main(tokens, seqs, stream);
+        }
         if mla_perseq_fallback || hc_perseq {
             use std::sync::atomic::Ordering;
             let logits = self.decode_logits_ptr();
@@ -148,7 +160,14 @@ impl TransformerModel {
             let result = (|| -> Result<()> {
                 let mut staged = vec![0u8; n * row_bytes];
                 for i in 0..n {
-                    self.decode(tokens[i], seqs[i], stream)?;
+                    // Under EP each sequence is one single-sequence step on
+                    // both ranks (a no-op without a parallel comm).
+                    // Sequences before `i` already ran: an error from here
+                    // on must not be retried as a whole batch.
+                    let partial = |e| crate::model::kv_admission::after_partial_step(e, i, n);
+                    self.ep_broadcast_cmd_for_seq(seqs[i].slot_idx as u32, tokens[i])
+                        .map_err(partial)?;
+                    self.decode(tokens[i], seqs[i], stream).map_err(partial)?;
                     // `decode()` wrote this sequence's logits to row 0.
                     // Pull them to the host before the next `decode()`'s
                     // `zero_all` wipes the buffer. `copy_d2h_on_stream`
@@ -208,6 +227,9 @@ impl TransformerModel {
         for s in seqs.iter_mut() {
             self.ssm_h_to_f16_dispatch(s)?;
         }
+        // ATLAS_QWEN4EXP_BATCH_FAST_CHECK: serial reference rows first, before
+        // the KV lock below (`batch_fast_check.rs`).
+        let serial_check = self.batch_fast_serial_rows(tokens, None, seqs)?;
         if std::env::var("ATLAS_DECODE_BATCH_LOG").ok().as_deref() == Some("1") {
             let slots: Vec<i64> = seqs
                 .iter()
@@ -345,15 +367,7 @@ impl TransformerModel {
         let bs = kv_cache.block_size();
         for seq in seqs.iter_mut() {
             let blocks_needed = (seq.seq_len / bs) + 1;
-            ensure_blocks_through_decode(
-                seq,
-                blocks_needed - 1,
-                &mut kv_cache,
-                self.prefix_cache.as_ref(),
-                self.gpu.as_ref(),
-                stream,
-                self.levers.kv_poison,
-            )?;
+            self.reserve_decode_blocks(seq, blocks_needed - 1, &mut kv_cache, stream)?;
         }
 
         // 1d. Upload metadata with fixed stride (active + padding)
@@ -411,6 +425,9 @@ impl TransformerModel {
                 seq.tokens.push(tokens[i]);
                 seq.seq_len += 1;
             }
+            if let Some(rows) = serial_check {
+                self.batch_fast_compare(rows, self.decode_logits_ptr())?;
+            }
             return Ok(self.decode_logits_ptr());
         }
         {
@@ -457,6 +474,7 @@ impl TransformerModel {
                             gdn_commit_qkv: DevicePtr(0),
                             gdn_commit_gb: DevicePtr(0),
                             gdn_commit_pending: false,
+                            gdn_fuse_n: DevicePtr::NULL,
                             // Padding rows point at the write-only dummy slot;
                             // tag them with the active mode so the decode mixer
                             // does not re-convert scratch on every single step.
@@ -512,10 +530,50 @@ impl TransformerModel {
 
             dump_hidden("post_embed", stream)?;
 
+            // qwen4_exp piecewise graphs (`model::decode_pieces`), keyed by
+            // the same SSM slot vector (dummy-padded) a whole-batch graph is.
+            let piece_slots = if self.decode_pieces_admitted(use_graphs, &kv_cache, &ctx) {
+                self.batch_decode_graph_key(&*seqs, padded_n)
+            } else {
+                None
+            };
+            // Wide (attention layers captured, QSA ingest staged): every live
+            // row inside the inert bound. Padding rows never ingest.
+            let wide = piece_slots.is_some()
+                && self.decode_pieces_wide(seq_lens[..n].iter().copied().max().unwrap_or(0));
+
             // Layer loop for padded_n sequences
             let mut ssm_us: u128 = 0;
             let mut attn_us: u128 = 0;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
+                if let Some(slots) = piece_slots.as_deref()
+                    && self.piece_run(
+                        layer_idx,
+                        PieceStep::Batch,
+                        wide,
+                        slots,
+                        padded_n,
+                        &ctx,
+                        stream,
+                        |li, ctx| {
+                            let mut refs = extract_layer_refs(&mut all_layer_states, li);
+                            self.layers[li].decode_multi_seq(
+                                hidden,
+                                residual,
+                                padded_n,
+                                n,
+                                &mut refs,
+                                &mut kv_cache,
+                                &seq_lens,
+                                &block_tables,
+                                ctx,
+                                stream,
+                            )
+                        },
+                    )?
+                {
+                    continue;
+                }
                 let mut layer_state_refs = extract_layer_refs(&mut all_layer_states, layer_idx);
                 let t0 = if ms_profile {
                     self.gpu.synchronize(stream).ok();
@@ -548,6 +606,12 @@ impl TransformerModel {
                     let _ = dump_hidden(&format!("after_L{:02}", layer_idx), stream);
                 }
             }
+            if wide {
+                let rows: Vec<(usize, usize)> = (0..n).map(|i| (i, seq_lens[i])).collect();
+                let mut owners: Vec<&mut Vec<Box<dyn LayerState>>> =
+                    all_layer_states.iter_mut().take(n).collect();
+                self.qsa_commit_staged(&rows, &mut owners, stream)?;
+            }
             if ms_profile {
                 self.gpu.synchronize(stream).ok();
             }
@@ -574,7 +638,7 @@ impl TransformerModel {
             // The returned pointer is discarded here: this path reports its
             // logits through `self.decode_logits_ptr()` at the end of the
             // function, which reads the same buffer.
-            self.lm_head_project_batched(normed, padded_n, h, bf16, stream)?;
+            self.lm_head_project_batched_tp(normed, padded_n, h, bf16, stream)?;
             if let Some(t0) = lmhead_t0 {
                 self.gpu.synchronize(stream).ok();
                 let head_us = t0.elapsed().as_micros();
@@ -614,6 +678,9 @@ impl TransformerModel {
         for (i, seq) in seqs.iter_mut().enumerate() {
             seq.tokens.push(tokens[i]);
             seq.seq_len += 1;
+        }
+        if let Some(rows) = serial_check {
+            self.batch_fast_compare(rows, self.decode_logits_ptr())?;
         }
 
         Ok(self.decode_logits_ptr())

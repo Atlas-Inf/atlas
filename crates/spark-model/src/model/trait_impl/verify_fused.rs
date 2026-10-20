@@ -83,15 +83,7 @@ impl TransformerModel {
         for t in 0..m {
             let pos = seq.seq_len + t;
             let blocks_needed = (pos / bs) + 1;
-            ensure_blocks_through_decode(
-                seq,
-                blocks_needed - 1,
-                &mut kv_cache,
-                self.prefix_cache.as_ref(),
-                self.gpu.as_ref(),
-                stream,
-                self.levers.kv_poison,
-            )?;
+            self.reserve_decode_blocks(seq, blocks_needed - 1, &mut kv_cache, stream)?;
         }
 
         // 1c. Upload M-entry attention metadata.

@@ -22,6 +22,33 @@ use crate::scheduler::confidence::confidence_run_step;
 
 pub struct F2ConfidenceEarlyStop;
 
+/// Whether top-1 softmax probability is >= 0.95: the stage's whole read of
+/// the logits, a pure function of them (a ~248k-term `exp` sum, ~0.5 ms on
+/// GB10 — the bulk of a thinking row's host pick).
+pub(crate) fn top1_confident(logits: &[f32]) -> bool {
+    let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let sum_exp: f32 = logits.iter().map(|&l| (l - max_logit).exp()).sum();
+    sum_exp > 0.0 && 1.0 / sum_exp >= 0.95
+}
+
+thread_local! {
+    /// [`top1_confident`] of the row about to be processed, when the caller
+    /// computed it ahead (`verify_pipeline_helper::prepick`). Consumed by the
+    /// stage if it runs; cleared by [`with_hint`] either way.
+    static HINT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` (one row's pipeline) with `hint` as that row's
+/// [`top1_confident`]. The hint MUST have been computed on the very logits
+/// the stage will see — the dequantized row before any stage touched it,
+/// which is what stage 1 reads.
+pub(crate) fn with_hint<R>(hint: Option<bool>, f: impl FnOnce() -> R) -> R {
+    HINT.with(|c| c.set(hint));
+    let r = f();
+    HINT.with(|c| c.set(None));
+    r
+}
+
 impl LogitsProcessor for F2ConfidenceEarlyStop {
     fn apply(
         &self,
@@ -35,9 +62,11 @@ impl LogitsProcessor for F2ConfidenceEarlyStop {
             && a.thinking_tokens >= 400
             && ctx.watchdog.confidence_early_stop
         {
-            let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let sum_exp: f32 = logits.iter().map(|&l| (l - max_logit).exp()).sum();
-            let confident = sum_exp > 0.0 && 1.0 / sum_exp >= 0.95;
+            // A verify span may have computed this row's answer already, on
+            // the same untouched logits (`with_hint`); else compute it here.
+            let confident = HINT
+                .with(std::cell::Cell::take)
+                .unwrap_or_else(|| top1_confident(logits));
             let (run, force_end) = confidence_run_step(
                 confident,
                 a.consecutive_confident,

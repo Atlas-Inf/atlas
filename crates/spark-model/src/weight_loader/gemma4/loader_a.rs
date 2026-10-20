@@ -430,7 +430,7 @@ pub(super) fn load_layers_impl(
             "L{i}: FFN weights loaded (bf16_mlp={bf16_mlp}), building DenseFfnLayer (GELU)..."
         );
         let mut ffn_layer =
-            DenseFfnLayer::new_with_activation(ffn_weights, FfnActivation::GeLU, gpu)?;
+            DenseFfnLayer::new_with_activation(ffn_weights, FfnActivation::GeLU, gpu, "gemma4")?;
         if let Some((g, u, d)) = bf16_mlp_weights {
             ffn_layer.set_bf16_weights(g, u, d);
             tracing::info!("L{i}: BF16 MLP weights installed");
