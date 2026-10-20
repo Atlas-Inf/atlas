@@ -64,9 +64,7 @@ fn resident_scales_index_by_global_row_id() {
         resident: Some(&arena),
     };
     for id in [0u64, 3, 4, 7, 8, 11] {
-        let sl = ss
-            .scale_resident_slice(id, stride)
-            .expect("resident slice");
+        let sl = ss.scale_resident_slice(id, stride).expect("resident slice");
         assert_eq!(
             sl,
             &arena[id as usize * stride..id as usize * stride + stride],

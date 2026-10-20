@@ -75,7 +75,9 @@ pub(super) struct RowSource<'a> {
 /// `Segmented`: the table's own shard segmentation applied to the sibling
 /// scale tensors (same `rows_per`, same deduped files).
 pub(super) enum ScaleSource<'a> {
-    Flat { file: &'a File },
+    Flat {
+        file: &'a File,
+    },
     /// `resident`: `Some` under `ATLAS_PLE_SCALES_RESIDENT` — the same
     /// (shard, local) split as `scale_loc`, answered from host RAM.
     Segmented {
