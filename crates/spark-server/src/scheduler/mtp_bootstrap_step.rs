@@ -251,7 +251,7 @@ pub(super) fn step_mtp_bootstrap_batched(
     for (j, a) in refs.iter_mut().enumerate() {
         let row_logits = logits.offset(j * vocab * elem);
         let batched = batch_toks.as_ref().filter(|_| greedy[j]).map(|t| t[j]);
-        let tok = match crate::scheduler::fast_greedy::pick_row(
+        let (tok, lp) = match crate::scheduler::fast_greedy::pick_row_scored(
             model, row_logits, a, verify_ctx, batched,
         ) {
             Ok(t) => t,
@@ -261,11 +261,6 @@ pub(super) fn step_mtp_bootstrap_batched(
                 a.finished = true;
                 continue;
             }
-        };
-        let lp = if let Some(k) = a.top_logprobs {
-            extract_single_logprobs(model, row_logits, tok, k)
-        } else {
-            None
         };
         emit_token(a, tok, lp, sched);
         if a.finished {
