@@ -174,7 +174,10 @@ impl NgramRowCache {
             scale_src: self.scales.as_ref().and_then(|sc| match &sc.src {
                 super::ScaleSrc::Constant => None,
                 super::ScaleSrc::PerRowFile(f) => Some(ScaleSource::Flat { file: f }),
-                super::ScaleSrc::Segmented(seg) => Some(ScaleSource::Segmented { seg }),
+                super::ScaleSrc::Segmented(seg) => Some(ScaleSource::Segmented {
+                    seg,
+                    resident: sc.resident.as_ref().map(|v| v.as_slice()),
+                }),
             }),
         };
         let ptrs = ArenaPtrs {

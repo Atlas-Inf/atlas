@@ -23,6 +23,8 @@ use super::*;
 ///      8     424 ms      3.85x
 ///     16     257 ms      6.35x
 ///     32     171 ms      9.55x
+///     64     ~64K IOPS  (GB10 NVMe's random-4K ceiling; +64 lifts the
+///              PLE fault wall ~20% on a cold ~17K prefill)
 /// ```
 ///
 /// `1` restores the old strictly-serial behaviour for a bisect.
@@ -30,7 +32,7 @@ pub(super) fn fault_threads() -> usize {
     std::env::var("ATLAS_PLE_FAULT_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(32)
+        .unwrap_or(64)
 }
 
 /// One scheduled miss: read row `id` into `slot`. Produced by the decision
@@ -73,15 +75,36 @@ pub(super) struct RowSource<'a> {
 /// `Segmented`: the table's own shard segmentation applied to the sibling
 /// scale tensors (same `rows_per`, same deduped files).
 pub(super) enum ScaleSource<'a> {
-    Flat { file: &'a File },
-    Segmented { seg: &'a Segments },
+    Flat {
+        file: &'a File,
+    },
+    /// `resident`: `Some` under `ATLAS_PLE_SCALES_RESIDENT` — the same
+    /// (shard, local) split as `scale_loc`, answered from host RAM.
+    Segmented {
+        seg: &'a Segments,
+        resident: Option<&'a [u8]>,
+    },
 }
 
-impl ScaleSource<'_> {
+impl<'a> ScaleSource<'a> {
+    /// The resident arena's byte offset for `id` is the same (shard, local)
+    /// split `scale_loc` uses — one mapping, two sinks.
+    pub(super) fn scale_resident_slice(&self, id: u64, stride: usize) -> Option<&'a [u8]> {
+        match self {
+            ScaleSource::Segmented { seg, resident } => {
+                let shard = id / seg.rows_per;
+                let local = id % seg.rows_per;
+                let at = (shard * seg.rows_per + local) as usize * stride;
+                resident.map(|a| &a[at..at + stride])
+            }
+            _ => None,
+        }
+    }
+
     fn scale_loc(&self, id: u64, stride: u64) -> (&File, u64) {
         match self {
             ScaleSource::Flat { file } => (file, id * stride),
-            ScaleSource::Segmented { seg } => {
+            ScaleSource::Segmented { seg, resident: _ } => {
                 let shard = (id / seg.rows_per) as usize;
                 let local = id % seg.rows_per;
                 let file = &seg.files[seg.shard_file[shard] as usize];
@@ -156,6 +179,14 @@ pub(super) fn fetch_row(
     // from the installed source (4-byte f32 or `dim/group` E4M3).
     if let (Some(ssrc), Some(sbase)) = (&src.scale_src, ptrs.scales) {
         let stride = src.scale_stride;
+        if let Some(bytes) = ssrc.scale_resident_slice(id, stride) {
+            // Resident arena: a memcpy, no disk read.
+            let sdst = unsafe {
+                std::slice::from_raw_parts_mut(sbase.add(slot as usize * stride), stride)
+            };
+            sdst.copy_from_slice(bytes);
+            return Ok(());
+        }
         let (sfile, sbyte) = ssrc.scale_loc(id, stride as u64);
         let sblock = sbyte - (sbyte % BLOCK as u64);
         let swithin = (sbyte - sblock) as usize;

@@ -51,7 +51,10 @@ fn parses_the_flash_next_map() {
         ("model.language_model.layers.0.self_attn.q_proj", mx),
         ("model.language_model.layers.0.mlp.experts", nv4),
         ("model.visual.blocks.0.mlp.linear_fc1", w4),
-        ("model.language_model.layers.1.ple.ple_embedding.ngram_embedding", plain),
+        (
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding",
+            plain,
+        ),
     ]);
     cfg.model_type = "qwen4_exp".into();
     let plan = ModeloptQuantPlan::from_config(&cfg).unwrap();
@@ -97,7 +100,9 @@ fn parses_the_csf_32x2_fixture_map() {
     ]);
     let plan = ModeloptQuantPlan::from_config(&cfg).unwrap();
     assert!(plan.is_fp4_local());
-    let gate = plan.format_of("model.language_model.layers.0.mlp.gate_proj").unwrap();
+    let gate = plan
+        .format_of("model.language_model.layers.0.mlp.gate_proj")
+        .unwrap();
     assert_eq!(gate.algo, QuantAlgo::Mxfp8);
     assert_eq!(gate.group_size, 32);
     assert_eq!(
@@ -155,10 +160,7 @@ fn qwen4_exp_registry_coverage() {
         assert!(n.covers(m, &QuantAlgo::W4A16Nvfp4), "{m}");
     }
     // Not covered: LM projections, lm_head.
-    for m in [
-        "model.language_model.layers.0.self_attn.q_proj",
-        "lm_head",
-    ] {
+    for m in ["model.language_model.layers.0.self_attn.q_proj", "lm_head"] {
         assert!(!n.covers(m, &QuantAlgo::W4A16Nvfp4), "{m}");
     }
     // An unknown model type covers nothing.

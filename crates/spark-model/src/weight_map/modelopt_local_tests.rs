@@ -28,14 +28,11 @@ fn fp4_local_config() -> ModelConfig {
     let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
     cfg.model_type = "qwen4_exp".into();
     let mut map = std::collections::BTreeMap::new();
-    map.insert(
-        "model.language_model.layers.0.mlp.experts".into(),
-        {
-            let mut s = spec("NVFP4", 16);
-            s.weight_scale_encoding = Some("csf".into());
-            s
-        },
-    );
+    map.insert("model.language_model.layers.0.mlp.experts".into(), {
+        let mut s = spec("NVFP4", 16);
+        s.weight_scale_encoding = Some("csf".into());
+        s
+    });
     map.insert(SHARED.into(), spec("MXFP8", 32));
     map.insert(GDN_OUT.into(), spec("MXFP8", 32));
     map.insert(VIS.into(), spec("W4A16_NVFP4", 16));
@@ -306,7 +303,9 @@ fn gdn_mxfp8_stays_native() {
     assert!(mx(GDN_OUT));
     assert!(mx("model.language_model.layers.7.linear_attn.in_proj_qkv"));
     assert!(mx(ATTN));
-    assert!(!mx("model.language_model.layers.3.self_attn.indexer.index_qk_proj"));
+    assert!(!mx(
+        "model.language_model.layers.3.self_attn.indexer.index_qk_proj"
+    ));
     assert!(mx("model.visual.blocks.0.attn.qkv"));
     assert!(mx("model.visual.blocks.0.attn.proj"));
     assert!(!mx("model.visual.blocks.0.mlp.linear_fc1"));
@@ -487,10 +486,7 @@ fn unregistered_nvfp4_module_expands() {
     let done = materialize(&mut store, &cfg, &gpu).unwrap();
     assert_eq!(done.nvfp4_to_bf16, 1);
     let w = store.get(&format!("{module}.weight")).unwrap();
-    assert_eq!(
-        (w.dtype, w.shape.clone()),
-        (WeightDtype::BF16, vec![1, 16])
-    );
+    assert_eq!((w.dtype, w.shape.clone()), (WeightDtype::BF16, vec![1, 16]));
     let v = gpu.read_alloc(w.ptr).unwrap();
     assert!((0..16).all(|i| {
         f32::from_bits(u32::from(u16::from_le_bytes([v[2 * i], v[2 * i + 1]])) << 16) == 1.0

@@ -44,14 +44,17 @@ struct OwnedSource {
 /// Owned mirror of [`ScaleSource`] (cloned descriptors for 'static workers).
 enum OwnedScaleSrc {
     Flat(File),
-    Segmented(Segments),
+    Segmented(Segments, Option<std::sync::Arc<Vec<u8>>>),
 }
 
 impl OwnedScaleSrc {
     fn view(&self) -> ScaleSource<'_> {
         match self {
             OwnedScaleSrc::Flat(f) => ScaleSource::Flat { file: f },
-            OwnedScaleSrc::Segmented(s) => ScaleSource::Segmented { seg: s },
+            OwnedScaleSrc::Segmented(s, r) => ScaleSource::Segmented {
+                seg: s,
+                resident: r.as_ref().map(|v| v.as_slice()),
+            },
         }
     }
 }
@@ -193,17 +196,20 @@ impl FaultPool {
                 f.try_clone()
                     .context("NgramRowCache fault pool: dup scales")?,
             )),
-            Some(ScaleSrc::Segmented(s)) => Some(OwnedScaleSrc::Segmented(Segments {
-                bases: s.bases.clone(),
-                rows_per: s.rows_per,
-                files: s
-                    .files
-                    .iter()
-                    .map(File::try_clone)
-                    .collect::<std::io::Result<_>>()
-                    .context("NgramRowCache fault pool: dup scale files")?,
-                shard_file: s.shard_file.clone(),
-            })),
+            Some(ScaleSrc::Segmented(s)) => Some(OwnedScaleSrc::Segmented(
+                Segments {
+                    bases: s.bases.clone(),
+                    rows_per: s.rows_per,
+                    files: s
+                        .files
+                        .iter()
+                        .map(File::try_clone)
+                        .collect::<std::io::Result<_>>()
+                        .context("NgramRowCache fault pool: dup scale files")?,
+                    shard_file: s.shard_file.clone(),
+                },
+                cache.scales.as_ref().and_then(|sc| sc.resident.clone()),
+            )),
         };
         let src = OwnedSource {
             file: cache

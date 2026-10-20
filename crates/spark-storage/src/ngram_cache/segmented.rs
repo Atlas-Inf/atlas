@@ -92,6 +92,7 @@ impl NgramRowCache {
             arena,
             stride: 4,
             src: ScaleSrc::Constant,
+            resident: None,
         });
         Ok(())
     }
@@ -128,6 +129,44 @@ impl NgramRowCache {
         }
         let sbytes = self.slots * scale_stride;
         let sblocks = sbytes.div_ceil(BLOCK);
+        // ATLAS_PLE_SCALES_RESIDENT=1: read every shard's scale tensor into
+        // one host arena (shard order, flat `id * stride` indexing); faults
+        // then memcpy scales instead of a second disk read. Hard error on a
+        // missing/short shard.
+        let resident_env = std::env::var("ATLAS_PLE_SCALES_RESIDENT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let resident = if resident_env {
+            let shard_bytes = rows_per as usize * scale_stride;
+            let mut arena = vec![0u8; shards.len() * shard_bytes];
+            std::thread::scope(|sc| {
+                let mut hs = Vec::new();
+                for (dst, (path, base)) in arena.chunks_mut(shard_bytes).zip(shards.iter()) {
+                    let (path, base) = (path.clone(), *base);
+                    hs.push(sc.spawn(move || -> Result<()> {
+                        use std::os::unix::fs::FileExt;
+                        std::fs::File::open(&path)
+                            .with_context(|| format!("scale shard {path:?}"))?
+                            .read_exact_at(dst, base)
+                            .with_context(|| format!("scale shard {path:?} short at {base}"))
+                    }));
+                }
+                for h in hs {
+                    h.join().expect("scale loader panic")?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
+            tracing::info!(
+                "PLE block scales resident: {:.1} GB ({} shards x {} rows x {} B)",
+                arena.len() as f64 / 1e9,
+                shards.len(),
+                rows_per,
+                scale_stride
+            );
+            Some(std::sync::Arc::new(arena))
+        } else {
+            None
+        };
         self.scales = Some(ScaleCache {
             arena: ExpertArena::new(1, sblocks as u32, BLOCK)
                 .context("NgramRowCache: block-scale arena")?,
@@ -138,6 +177,7 @@ impl NgramRowCache {
                 files,
                 shard_file,
             }),
+            resident,
         });
         Ok(())
     }
