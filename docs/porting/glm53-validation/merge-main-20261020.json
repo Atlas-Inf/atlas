@@ -1,0 +1,103 @@
+{
+  "source_revision": "a37b789bec6dc2def8128c257d465f923c07a4a8",
+  "main_revision": "e29809db9f3fd75611b7a1ed491f55275d34df0e",
+  "status": "TERMINAL_WITH_FAILURES_AND_ABORTS",
+  "counts": {
+    "ABORTED": 1,
+    "FAIL": 2,
+    "PASS": 7,
+    "PENDING": 0
+  },
+  "canonical_qualification": "FAIL",
+  "bounded_glm": "PASS",
+  "cpu": "PASS",
+  "static": "PASS",
+  "main_comparison": {
+    "main_c16_tok_s": 63.21121388023076,
+    "main_revision": "e29809db9f3fd75611b7a1ed491f55275d34df0e",
+    "merged_c16_tok_s": 63.09853910863315,
+    "merged_revision": "a37b789bec6dc2def8128c257d465f923c07a4a8",
+    "note": "Both measured canonical records remain FAIL. This is evidence of an inherited main issue, not a waived or passing gate.",
+    "params_and_serve_overrides_equal": true,
+    "status": "FAIL_REPRODUCED_ON_CURRENT_MAIN",
+    "unchanged_floor_tok_s": 72.0
+  },
+  "limitations": [
+    "All-features CPU tests compiled only.",
+    "Bounded GLM checks do not establish general quality or expanded context capacity.",
+    "A reproduced main performance failure remains a failed canonical requirement; maintainer acceptance is not asserted."
+  ],
+  "historical_results": "October15 qualification remains unchanged and does not qualify this merged source.",
+  "restoration": "RESTORED_VERIFIED",
+  "gate_thresholds_changed": false,
+  "source_summary_sha256": "aad4143d6b8492b61f6d95a4b74309ddd8be8b0178363faa8434b58e81fef6be",
+  "gates": [
+    {
+      "gate": "agentic-webserver",
+      "status": "PASS",
+      "source_record_sha256": "c52dbd57e890aa151eaf103c071fe9c8b7f9a271ae4ab8f1f653a475e45f82cd"
+    },
+    {
+      "gate": "bfcl-subset",
+      "status": "ABORTED",
+      "source_record_sha256": null
+    },
+    {
+      "gate": "bfcl-subset-echolp",
+      "status": "FAIL",
+      "source_record_sha256": "2db34abc466009b4f4d8b4ae3cfe629a9789b643f0ce58b929edc157d134e8fa"
+    },
+    {
+      "gate": "concurrency-sweep",
+      "status": "FAIL",
+      "source_record_sha256": "531d72a0d5d2e484a78fbe121a448e1a30690a9770d14b787275f9157add648a"
+    },
+    {
+      "gate": "decode-floor",
+      "status": "PASS",
+      "source_record_sha256": "68876f174b3308cbf882a49221a29f4c7d2fec2bf37087c60412e5feb0673dd1"
+    },
+    {
+      "gate": "ssm-state-poisoning-gate",
+      "status": "PASS",
+      "source_record_sha256": "a8a6b9d6917954b9d3524fb27a726658f360d561a9cfd9caf0248d78137f9bf4"
+    },
+    {
+      "gate": "ttft-cold-gate",
+      "status": "PASS",
+      "source_record_sha256": "4445533ed1c365b98ff9f73a048766862c5616700da518b44c32135969b0ed12"
+    },
+    {
+      "gate": "ttft-warm-gate",
+      "status": "PASS",
+      "source_record_sha256": "1a2fe4b86363a80e4090ddf4fbab2cda002f0109231c7eb21ecef914e2141482"
+    },
+    {
+      "gate": "video-fidelity",
+      "status": "PASS",
+      "source_record_sha256": "96648707edfa72fa1bcfddbd534c7c634655ad53da5f26b757b5cf3f43007636"
+    },
+    {
+      "gate": "vision-fidelity",
+      "status": "PASS",
+      "source_record_sha256": "5fdca6796e8184467417e4a42a0cdcc58aff696b626a749d5c1a70ba5e5691e1"
+    }
+  ],
+  "head_bfcl": {
+    "samples": 1004,
+    "overall": 86.45,
+    "overall_floor": 86.1,
+    "normalized": 85.07,
+    "normalized_floor": 86.5,
+    "verdict": "FAIL",
+    "memory_guard_tripped": false
+  },
+  "worker_bfcl": {
+    "status": "ABORTED",
+    "completed_samples": 559,
+    "planned_samples": 995,
+    "reason": "Head terminal lease cancelled the recovery before paired original-service restoration",
+    "canonical_score_written": false
+  },
+  "accuracy_attribution": "No matching main-branch BFCL control; the accuracy failure is not attributed to main."
+}

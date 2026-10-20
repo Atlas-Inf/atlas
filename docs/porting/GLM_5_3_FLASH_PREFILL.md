@@ -55,3 +55,20 @@ byte-for-byte at boundary and large row counts. CPU linking stubs cannot run
 those kernels or establish an inference speedup. Enablement requires a fresh
 native build, on/off GPU equivalence and measured prefill improvement on the
 actual two-Spark recipe; historical upstream timings are not local results.
+
+The native build at `5d652f8e0835231ead3bcac91d66e22632c08cbe` passed all six
+core CUDA checks. On the existing NVIDIA NVFP4 checkpoint, switching all four
+paths on reduced median client TTFT by 2.3–2.4% for the measured approximately
+10K-token prose, code and structured prompts; decode was essentially unchanged.
+All 11 benchmark answers and reasoning strings matched between settings.
+See [the measured settings and limits](GLM_5_3_FLASH_PREFILL_RESULTS.md).
+
+This is evidence for the bundle, not four independently measured speedups.
+The switches remain opt-in pending FP4-Local qualification and repeated,
+interleaved on/off measurements across both checkpoints at 10K and 64K input
+lengths. Default promotion requires exact-output checks to pass, a median TTFT
+improvement larger than the observed repeat-to-repeat variation, and no
+material decode or peak-memory regression. A leave-one-out comparison must
+also establish which switches contribute before enabling individual paths
+by default. These additional experiments are not claimed by the current
+bounded validation.

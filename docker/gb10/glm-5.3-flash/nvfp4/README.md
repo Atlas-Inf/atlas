@@ -214,7 +214,11 @@ their recorded sources and settings.
 
 ## GPU results for this update
 
-Pending: fresh two-Spark serving checks for FP4-Local, prefill on/off numerical
-equivalence, and measured prefill/decode throughput. The existing validation
-receipts do not qualify this update. No new speed or maximum-capacity claim is
-made until those results are recorded.
+The existing NVFP4 checkpoint passed a fresh 32K-pool comparison: all 11
+benchmark outputs matched with the four prefill switches off versus on.
+Measured approximately 10K-token chat TTFT improved by 2.3–2.4%, while decode
+was essentially unchanged. Core CUDA, tools/JSON and cancellation checks passed.
+See [settings, results and limits](../../../../docs/porting/GLM_5_3_FLASH_PREFILL_RESULTS.md).
+
+FP4-Local GPU loader and two-Spark serving checks remain pending. These bounded
+NVFP4 results do not establish FP4-Local support or a new maximum context.

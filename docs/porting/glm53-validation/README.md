@@ -2,6 +2,26 @@
 
 # GLM-5.3 release validation
 
+## October 20 update
+
+The native FP4-Local and prefill update at
+`5d652f8e0835231ead3bcac91d66e22632c08cbe` has passed CPU qualification
+(7,602 tests), six core CUDA checks, and a bounded existing-NVFP4 off/on
+comparison. [Measured results and limitations](../GLM_5_3_FLASH_PREFILL_RESULTS.md)
+and [machine-readable evidence](prefill-nvfp4-20261020.json) retain the actual
+runtime revision. FP4-Local GPU and serving qualification remains pending.
+
+The preceding main integration at `a37b789b` passed bounded GLM checks and
+seven cross-model GPU gates, but **did not pass full qualification**:
+the C16 throughput and 1,004-case normalized BFCL floors failed, and the
+995-case BFCL run was interrupted without a score. The C16 failure also
+reproduced on unmodified main; no corresponding main BFCL control was run.
+[Terminal results](merge-main-20261020.json) preserve those distinctions.
+Thresholds were not lowered. Neither this update's bounded checks nor the
+earlier October 15 passes below supersede those failures.
+
+## October 15 qualification (historical)
+
 The combined NVFP4/DFlash implementation at `cb45065cb4f21c162ccd29dd837ef4b6be3aa52e` passed the final-source
 CPU/static checks, ten canonical Qwen GPU regression gates and bounded paired
 GLM checks. [Release summary](release-summary.json) links the exact receipts.
