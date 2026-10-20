@@ -220,6 +220,19 @@ pub struct DeferredTensor {
     pub dtype: WeightDtype,
 }
 
+/// The shape of tensor `name` in a load's uploaded or deferred maps, for
+/// [`nvfp4_csf::CsfAssembler::finish`]'s scale-vs-weight check.
+pub(crate) fn loaded_shape(
+    uploaded: &HashMap<String, WeightTensor>,
+    deferred: &HashMap<String, DeferredTensor>,
+    name: &str,
+) -> Option<Vec<usize>> {
+    uploaded
+        .get(name)
+        .map(|t| t.shape.clone())
+        .or_else(|| deferred.get(name).map(|d| d.shape.clone()))
+}
+
 impl WeightStore {
     /// Create an empty weight store (for testing).
     pub fn empty() -> Self {
@@ -507,6 +520,8 @@ mod expert_filter_tests;
 #[cfg(test)]
 mod from_str_tests;
 mod name_utils;
+pub mod nvfp4_csf;
+pub mod nvfp4_csf32;
 mod side_files;
 mod store_edit;
 pub(crate) use name_utils::keeps_raw_f16;
@@ -618,3 +633,7 @@ mod tests {
         assert!(offsets[0] >= 4096, "no tensor may alias the slab base");
     }
 }
+
+#[cfg(test)]
+#[path = "weights/csf_load_tests.rs"]
+pub(crate) mod csf_load_tests;

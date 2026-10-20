@@ -5,6 +5,8 @@
 mod components;
 mod dense;
 mod expert_tp;
+mod fp4l;
+pub(crate) use fp4l::release_expanded;
 mod layers;
 mod mla_twins;
 pub(crate) mod retirement;
@@ -14,7 +16,7 @@ mod vision;
 #[cfg(test)]
 mod nvidia_dense_tests;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kv_cache::KvCacheDtype;
@@ -22,7 +24,7 @@ use spark_runtime::weights::WeightStore;
 
 use super::ModelWeightLoader;
 use crate::layer::TransformerLayer;
-use crate::weight_map::{DenseWeight, MtpWeights, dense, dense_auto};
+use crate::weight_map::{DenseWeight, MtpWeights, dense_auto};
 
 pub struct Glm5WeightLoader;
 
@@ -60,7 +62,7 @@ impl ModelWeightLoader for Glm5WeightLoader {
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
-        dense_auto(store, &format!("{}.norm.weight", config.weight_prefix), gpu)
+        fp4l::norm_bf16(store, &format!("{}.norm.weight", config.weight_prefix), gpu)
     }
 
     fn load_lm_head(
@@ -69,14 +71,9 @@ impl ModelWeightLoader for Glm5WeightLoader {
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
-        crate::model::glm_k3_head::initialize_from_weight(
-            gpu,
-            config,
-            store
-                .get("lm_head.weight")
-                .context("GLM-5: missing lm_head.weight")?,
-        )?;
-        dense(store, "lm_head.weight").context("GLM-5: missing lm_head.weight")
+        let head = fp4l::lm_head_bf16(store, gpu)?;
+        crate::model::glm_k3_head::initialize_from_weight(gpu, config, &head)?;
+        Ok(DenseWeight { weight: head.ptr })
     }
 
     fn load_mtp_weights(

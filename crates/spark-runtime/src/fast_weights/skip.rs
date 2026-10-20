@@ -21,13 +21,17 @@
 //! is only ever populated by a loader that has its own row reader.
 
 use super::FastSafetensorsLoader;
+use crate::weights::nvfp4_csf::csf_part;
 use crate::weights::parse_expert_index;
 
 impl FastSafetensorsLoader {
     /// Expert TP: a routed expert's packed weight or block scale, which the
     /// model loader slices straight from disk. The appended predictor layer
-    /// keeps its own replication rules, and the scalars load as usual.
+    /// keeps its own replication rules, and the scalars load as usual. A
+    /// CSF-compressed scale is deferred as its components (judged by the
+    /// scale's name), decoded per slice by `with_deferred_slice`.
     pub(super) fn should_defer_tensor(&self, name: &str) -> bool {
+        let name = csf_part(name).map_or(name, |(scale, _)| scale);
         self.expert_tp
             && !name.starts_with("mtp.")
             && (name.ends_with(".weight") || name.ends_with(".weight_scale"))

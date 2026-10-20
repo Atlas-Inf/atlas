@@ -33,12 +33,15 @@ pub(super) fn enabled() -> bool {
 /// This rank's shard as MXFP8 (first vocab row, weight), when prepared.
 static SHARD_MX: OnceLock<(usize, crate::weight_map::Mxfp8Weight)> = OnceLock::new();
 
-/// Quantize this rank's half of a BF16 GLM head to MXFP8 before KV sizing
+/// This rank's half of the GLM head as MXFP8 before KV sizing
 /// (`ATLAS_GLM_LM_HEAD_MXFP8=1`, ~0.33 GB); the split verify head then
-/// streams half the bytes for up to 32 rows at a time.
+/// streams half the bytes for up to 32 rows at a time. A checkpoint that
+/// ships the head MXFP8 (FP4-Local) gives its own rows, exactly; otherwise
+/// the BF16 head is quantized.
 pub(crate) fn prepare_shard_mxfp8(
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
+    store: &spark_runtime::weights::WeightStore,
     lm_head: DevicePtr,
     bf16_head: bool,
 ) -> Result<()> {
@@ -57,24 +60,25 @@ pub(crate) fn prepare_shard_mxfp8(
     );
     let shard = vocab / 2;
     let start = config.ep_rank * shard;
-    let quantize = gpu.kernel("mxfp8_gemv", "mxfp8_quantize_bf16")?;
-    let data = gpu.alloc(shard * h)?;
-    let scales = gpu.alloc(shard * h / ops::MXFP8_BLOCK)?;
     let stream = gpu.default_stream();
-    ops::mxfp8_quantize(
-        gpu,
-        quantize,
-        lm_head.offset(start * h * 2),
-        data,
-        scales,
-        shard,
-        h,
-        stream,
-    )?;
-    let mut w = crate::weight_map::Mxfp8Weight {
-        data,
-        scales,
-        tiled: false,
+    let checkpoint = crate::weight_map::raw_mxfp8(store, "lm_head")?;
+    let mut w = if let Some(raw) = checkpoint {
+        ensure!(raw.k == h, "GLM MXFP8 lm_head K {} != hidden {h}", raw.k);
+        crate::weight_map::mxfp8_row_range_twin(gpu, raw, start, shard, stream)?
+    } else {
+        let quantize = gpu.kernel("mxfp8_gemv", "mxfp8_quantize_bf16")?;
+        let w = crate::weight_map::Mxfp8Weight::alloc(gpu, shard, h)?;
+        ops::mxfp8_quantize(
+            gpu,
+            quantize,
+            lm_head.offset(start * h * 2),
+            w.data,
+            w.scales,
+            shard,
+            h,
+            stream,
+        )?;
+        w
     };
     ops::mxfp8_tile_if_requested(gpu, &mut w, shard, h, stream)?;
     gpu.synchronize(stream)?;
@@ -82,6 +86,7 @@ pub(crate) fn prepare_shard_mxfp8(
     tracing::info!(
         rank = config.ep_rank,
         shard,
+        checkpoint_bytes = checkpoint.is_some(),
         "GLM split verify head: MXFP8 shard ready"
     );
     Ok(())

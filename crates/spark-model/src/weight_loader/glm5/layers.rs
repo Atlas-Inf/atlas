@@ -6,6 +6,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kv_cache::KvCacheDtype;
 use spark_runtime::weights::WeightStore;
 
+use super::fp4l::{decoder_expanded_stems, norm_bf16, release_expanded};
 use super::retirement::{LoadedDense, RetirementLog};
 use crate::layer::TransformerLayer;
 use crate::layers::qwen3_attention::{GlmIndexerWeights, MlaWeights, Qwen3AttentionLayer};
@@ -34,11 +35,12 @@ pub(super) fn load_all(
     };
     let mut layers: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(config.num_hidden_layers);
     let mut attn_idx = 0usize;
+    let mut released = 0usize;
     for layer_idx in 0..config.num_hidden_layers {
         let lp = config.layer_prefix(layer_idx);
-        let input_norm = dense_auto(store, &format!("{lp}.input_layernorm.weight"), gpu)?;
+        let input_norm = norm_bf16(store, &format!("{lp}.input_layernorm.weight"), gpu)?;
         let post_attn_norm =
-            dense_auto(store, &format!("{lp}.post_attention_layernorm.weight"), gpu)?;
+            norm_bf16(store, &format!("{lp}.post_attention_layernorm.weight"), gpu)?;
         let ffn =
             super::components::load_ffn(store, &lp, layer_idx, config, gpu, variant, qctx, true)?;
         let hc = super::components::load_hc(store, &lp, layer_idx, config, gpu)?;
@@ -82,6 +84,12 @@ pub(super) fn load_all(
             }
             other => anyhow::bail!("GLM-5 unsupported layer type {other:?}"),
         }
+        // The layer holds its derived copies now; FP4-Local's FP8 sources
+        // are dead (no-op on the NVFP4 release, whose stems are BF16).
+        let dense_ffn = config.mlp_only_layers.contains(&layer_idx);
+        for stem in decoder_expanded_stems(&lp, config.layer_type(layer_idx), dense_ffn) {
+            released += release_expanded(store, gpu, &stem, false)?;
+        }
         if layer_idx < 5 || (layer_idx + 1).is_multiple_of(10) {
             tracing::info!(
                 "GLM-5 loaded layers 0..{} — {:.1} GiB free",
@@ -89,6 +97,12 @@ pub(super) fn load_all(
                 gpu.free_memory()? as f64 / 1_073_741_824.0,
             );
         }
+    }
+    if released > 0 {
+        tracing::info!(
+            "GLM-5 FP4-Local: released {:.2} GiB of MXFP8/FP8-block sources after expansion",
+            released as f64 / 1_073_741_824.0
+        );
     }
     Ok(layers)
 }

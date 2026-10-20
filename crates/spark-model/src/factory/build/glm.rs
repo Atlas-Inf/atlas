@@ -100,7 +100,14 @@ pub(super) fn init_arena_consumers(
     // Both ranks initialize HC's TF32 library path before state construction
     // and the actual-free KV snapshot; the optional helper reuses dead scratch.
     super::super::glm_hc_prewarm::initialize(config, gpu, buffers, max_batch_tokens)?;
-    crate::model::prepare_glm_head_mxfp8(config, gpu, lm_head, bf16_head)?;
+    crate::model::prepare_glm_head_mxfp8(config, gpu, store, lm_head, bf16_head)?;
+    // FP4-Local's MXFP8 lm_head: its last reader was the shard above; every
+    // other head path reads the exact BF16 expansion the loader made. A BF16
+    // head is the head itself and stays. Every model passes through here, and
+    // another loader may read its own FP8 lm_head natively: GLM only.
+    if config.model_type == "glm5_next" {
+        crate::weight_loader::glm5::release_expanded(store, gpu, "lm_head", false)?;
+    }
     crate::model::prepare_glm_verify_masks(config, gpu, buffers)?;
     crate::layers::moe::bind_resident_btile_arenas(config, store, gpu, layers, buffers)?;
     Ok(())

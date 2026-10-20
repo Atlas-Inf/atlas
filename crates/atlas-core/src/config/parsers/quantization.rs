@@ -157,6 +157,11 @@ pub fn parse_quantization_config(raw: &serde_json::Value) -> Option<Quantization
                 QuantLayerSpec {
                     quant_algo: algo.to_string(),
                     group_size: v.get("group_size").and_then(|g| g.as_u64()).unwrap_or(0) as usize,
+                    weight_scale_encoding: v
+                        .get("weight_scale_encoding")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
                 },
             );
         }

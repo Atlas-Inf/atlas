@@ -128,3 +128,57 @@ fn missing_required_field_names_it() {
     let err = format!("{:#}", parse_config(&json).unwrap_err());
     assert!(err.contains("kv_lora_rank"), "{err}");
 }
+
+/// nvidia/GLM-5.3-Flash-FP4-Local (revision `76348ddb`) `config.json`, its
+/// `quantized_layers` trimmed to every csf_32x2_v1 entry plus one of each
+/// other scheme (its `hf_quant_config.json` is the same object).
+const FP4_LOCAL_CONFIG: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../test_data/glm5_next_fp4local_config.json"
+));
+
+#[test]
+fn fp4_local_declares_csf32_routed_expert_scales() {
+    let cfg = parse_config(FP4_LOCAL_CONFIG).unwrap();
+    assert_eq!(cfg.model_type, "glm5_next");
+    let q = cfg
+        .quantization_config
+        .expect("ModelOpt quantization config");
+    assert_eq!(
+        (q.quant_method.as_str(), q.quant_algo.as_str()),
+        ("modelopt", "MIXED_PRECISION")
+    );
+    let spec = |path: &str| q.quantized_layers.get(path).cloned().unwrap_or_default();
+    let csf32 = |algo: &str| QuantLayerSpec {
+        quant_algo: algo.into(),
+        group_size: 16,
+        weight_scale_encoding: "csf_32x2_v1".into(),
+    };
+    // Routed experts of layers 3..=44 ship csf_32x2_v1 scales; the MTP
+    // layer's (45) are plain W4A16_NVFP4.
+    for layer in 3..=44 {
+        let path = format!("model.language_model.layers.{layer}.mlp.experts");
+        assert_eq!(spec(&path), csf32("NVFP4"), "{path}");
+    }
+    let mtp = spec("model.language_model.layers.45.mlp.experts");
+    assert_eq!(
+        (mtp.quant_algo.as_str(), mtp.weight_scale_encoding.as_str()),
+        ("W4A16_NVFP4", "")
+    );
+    let encoded = q
+        .quantized_layers
+        .values()
+        .filter(|s| !s.weight_scale_encoding.is_empty())
+        .count();
+    assert_eq!(
+        encoded, 42,
+        "only the 42 routed-expert entries are compressed"
+    );
+    for path in [
+        "lm_head",
+        "model.language_model.layers.3.mlp.shared_experts.down_proj",
+        "model.language_model.layers.45.self_attn.q_a_proj",
+    ] {
+        assert_eq!(spec(path).weight_scale_encoding, "", "{path}");
+    }
+}

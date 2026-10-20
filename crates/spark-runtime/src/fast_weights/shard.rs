@@ -2,7 +2,8 @@
 //! Single-shard buffered/direct I/O and upload; extracted without changing order.
 use super::{direct_io, header::parse_header};
 use crate::gpu::GpuBackend;
-use crate::weights::{WeightTensor, evict_page_cache, f16_to_bf16_bytes};
+use crate::weights::nvfp4_csf::{CsfAssembler, csf_part};
+use crate::weights::{WeightDtype, WeightTensor, evict_page_cache, f16_to_bf16_bytes};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs::File;
@@ -32,6 +33,7 @@ pub(super) fn load_shard_fast(
     out: &mut HashMap<String, WeightTensor>,
     deferred_out: &mut HashMap<String, crate::weights::DeferredTensor>,
     offload_logged: &mut bool,
+    csf: &mut CsfAssembler,
 ) -> Result<()> {
     // Header parsing uses a buffered fd — header is a few KB, cache pollution
     // is negligible and buffered I/O handles short reads cleanly.
@@ -51,10 +53,18 @@ pub(super) fn load_shard_fast(
     // on GB10 is managed memory, i.e. Linux swap, i.e. a kernel freeze. They
     // are recorded with their on-disk location and served either by streaming
     // per-table quantize-on-load or straight off NVMe by the row cache.
+    //
+    // Under expert TP a CSF-compressed scale's COMPONENTS are deferred (see
+    // `should_defer_tensor`), to be decoded one matrix at a time by
+    // `with_deferred_slice`; the assembler still checks them by shape.
     let mut deferred_here: Vec<(String, crate::weights::DeferredTensor)> = Vec::new();
+    let mut csf_deferred: Vec<(String, Vec<usize>, usize)> = Vec::new();
     #[allow(clippy::items_after_statements)]
     tensors.retain(|t| {
         if crate::weights::is_ngram_table(&t.name) || (!skip_fn(&t.name) && defer_fn(&t.name)) {
+            if csf_part(&t.name).is_some() {
+                csf_deferred.push((t.name.clone(), t.shape.clone(), t.len));
+            }
             deferred_here.push((
                 t.name.clone(),
                 crate::weights::DeferredTensor {
@@ -68,6 +78,14 @@ pub(super) fn load_shard_fast(
         }
         !skip_fn(&t.name)
     });
+    for (name, shape, len) in &csf_deferred {
+        csf.defer(name, shape, *len)?;
+    }
+    // A deferred plain scale is still a plain scale: one that is also
+    // CSF-compressed is refused whichever form arrives first.
+    for (name, _) in deferred_here.iter().filter(|(n, _)| csf_part(n).is_none()) {
+        csf.note_plain(name)?;
+    }
     if !deferred_here.is_empty() {
         tracing::info!(
             "Deferred {} tensor(s) in {} — served from disk, not uploaded",
@@ -138,7 +156,13 @@ pub(super) fn load_shard_fast(
     // itself fails we fall back to per-tensor allocs for this shard —
     // same behaviour as pack mode disabled.
     let slab = if pack_slab {
-        let (offsets, total) = crate::weights::slab_layout(tensors.iter().map(|t| t.len));
+        let (offsets, total) = crate::weights::slab_layout(tensors.iter().map(|t| {
+            if csf_part(&t.name).is_some() {
+                0
+            } else {
+                t.len
+            }
+        }));
         if total == 0 {
             None
         } else {
@@ -159,6 +183,24 @@ pub(super) fn load_shard_fast(
         let (idx, buf, slice_start) = result?;
         let meta = &tensors[idx];
         let raw = &buf.as_slice()[slice_start..slice_start + meta.len];
+        // CSF-compressed NVFP4 scales (either encoding): the components are
+        // gathered (possibly across shards) and only the decoded E4M3
+        // `weight_scale` is uploaded.
+        if csf_part(&meta.name).is_some() {
+            if let Some(scale) = csf.offer(&meta.name, &meta.shape, raw)? {
+                let ptr = upload(gpu, &scale.name, &scale.bytes, offload_logged)?;
+                out.insert(
+                    scale.name,
+                    WeightTensor {
+                        ptr,
+                        shape: scale.shape,
+                        dtype: WeightDtype::FP8E4M3,
+                    },
+                );
+            }
+            continue;
+        }
+        csf.note_plain(&meta.name)?;
         // F16 shards: convert bytes to BF16 before upload (same length,
         // different bit layout — meta.dtype is already staged as BF16).
         let converted: Vec<u8>;
@@ -219,6 +261,37 @@ pub(super) fn load_shard_fast(
     evict_page_cache(&buffered_file);
     drop(buffered_file);
     Ok(())
+}
+
+/// GPU-alloc and copy one tensor's bytes, falling back to managed (UVM)
+/// memory when the device allocation fails.
+fn upload(
+    gpu: &dyn GpuBackend,
+    name: &str,
+    src: &[u8],
+    offload_logged: &mut bool,
+) -> Result<crate::gpu::DevicePtr> {
+    Ok(match gpu.alloc(src.len()) {
+        Ok(p) => {
+            gpu.copy_h2d(src, p)?;
+            p
+        }
+        Err(_) => {
+            if !*offload_logged {
+                tracing::warn!(
+                    "GPU alloc failed for {} ({} bytes) — switching to managed (UVM) memory",
+                    name,
+                    src.len()
+                );
+                *offload_logged = true;
+            }
+            let p = gpu.alloc_managed(src.len())?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), p.0 as *mut u8, src.len());
+            }
+            p
+        }
+    })
 }
 
 #[cfg(target_os = "linux")]

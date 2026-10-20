@@ -14,7 +14,9 @@ use crate::weight_map::{DenseWeight, MtpWeights, dense_auto, detect_nvfp4_varian
 
 pub struct Qwen35WeightLoader;
 
-fn vision_dense_auto(
+/// A vision linear `{prefix}.weight` as BF16: BF16 as stored, FP8 (MXFP8
+/// or block) and W4A16 NVFP4 expanded, F32 narrowed. Shared with the GLM ViT.
+pub(crate) fn vision_dense_auto(
     store: &WeightStore,
     prefix: &str,
     gpu: &dyn GpuBackend,
@@ -26,6 +28,18 @@ fn vision_dense_auto(
             crate::weight_map::dense_auto_fp8_or_bf16(store, prefix, gpu)
         }
         WeightDtype::FP32 => crate::weight_map::dense_f32_safe(store, &name, gpu),
+        // W4A16 NVFP4 (nvidia Qwen3.8-Flash-Next-FP4-Local's ViT MLP and
+        // merger): packed E2M1 `[n, k/2]` + E4M3 per-16 `weight_scale` + F32
+        // `weight_scale_2`, expanded to BF16 once at load for the BF16 tower.
+        //
+        // ROUNDING IS INVOLVED, unlike the MXFP8 expansion: the kernel forms
+        // the block scale `e4m3 * scale_2` in f32 (one RNE), multiplies by
+        // the E2M1 value (exact for 0.5/1/2/4, one RNE for 1.5/3/6), and
+        // rounds that to BF16 (RNE). `scale_2` is an arbitrary f32, so no
+        // BF16 can hold every product exactly; the error is at most about one
+        // BF16 ulp per element. Exact would mean an NVFP4 linear in the
+        // tower, which it does not have. `dense_auto` is that expansion.
+        WeightDtype::UInt8 => dense_auto(store, &name, gpu),
         other => anyhow::bail!("vision_dense_auto: unsupported dtype {other:?} for {name}"),
     }
 }

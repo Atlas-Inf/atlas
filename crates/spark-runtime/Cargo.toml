@@ -114,6 +114,9 @@ objc2-foundation = { version = "0.3", optional = true, features = [
 # byte container), not an `NSData`. dispatch2 ships the wrapper.
 dispatch2 = { version = "0.3", optional = true }
 
+[dev-dependencies]
+sha2 = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

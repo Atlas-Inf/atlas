@@ -1,0 +1,216 @@
+{
+  "upstream": "https://github.com/Enntity/atlas",
+  "release": "b3b016ab7e91b73bea220b7280c9e9aa1a2cfb13",
+  "scope": "FP4-Local checkpoint loading through existing native Atlas compute paths; not optional FP4L_NATIVE serving",
+  "commits": [
+    {
+      "commit": "378ba7d89e0d12b0198152194240cc527382de63",
+      "author": "Jason McCartney",
+      "subject": "shared: lossless NVFP4-CSF block-scale decoder",
+      "url": "https://github.com/Enntity/atlas/commit/378ba7d89e0d12b0198152194240cc527382de63"
+    },
+    {
+      "commit": "e6708eeece31733563c91f15581c0c7844020356",
+      "author": "Jason McCartney",
+      "subject": "shared: decode CSF scales at upload in every safetensors loader",
+      "url": "https://github.com/Enntity/atlas/commit/e6708eeece31733563c91f15581c0c7844020356"
+    },
+    {
+      "commit": "13484591468f8c99466a8a391a6fdacd7bf2af1f",
+      "author": "Jason McCartney",
+      "subject": "shared: whole-layer and whole-checkpoint CSF checks",
+      "url": "https://github.com/Enntity/atlas/commit/13484591468f8c99466a8a391a6fdacd7bf2af1f"
+    },
+    {
+      "commit": "afe8075efd14062e363d43fba8f4b25a0b32e5d7",
+      "author": "Jason McCartney",
+      "subject": "shared: key the fast loader's index grouping by the joined shard path",
+      "url": "https://github.com/Enntity/atlas/commit/afe8075efd14062e363d43fba8f4b25a0b32e5d7"
+    },
+    {
+      "commit": "5232fb25a246be65dd7b8f2eb6ae4d5827aea5a3",
+      "author": "Jason McCartney",
+      "subject": "shared: CSF decoder: checked sizes, and every decoded scale checked against its weight",
+      "url": "https://github.com/Enntity/atlas/commit/5232fb25a246be65dd7b8f2eb6ae4d5827aea5a3"
+    },
+    {
+      "commit": "f95c52191a2ca1c2ccf9fae46fae808b301bc214",
+      "author": "Jason McCartney",
+      "subject": "shared: CSF: refuse a scale both plain and CSF-compressed in either order",
+      "url": "https://github.com/Enntity/atlas/commit/f95c52191a2ca1c2ccf9fae46fae808b301bc214"
+    },
+    {
+      "commit": "402138055a4d61dcf84a1071e310de3e958657a7",
+      "author": "Jason McCartney",
+      "subject": "shared: RDMA weight tier refuses CSF-encoded scales by name",
+      "url": "https://github.com/Enntity/atlas/commit/402138055a4d61dcf84a1071e310de3e958657a7"
+    },
+    {
+      "commit": "7d88f215f3a20df880651b0d0029056735c390bf",
+      "author": "Jason McCartney",
+      "subject": "shared: parse ModelOpt per-layer weight_scale_encoding (csf)",
+      "url": "https://github.com/Enntity/atlas/commit/7d88f215f3a20df880651b0d0029056735c390bf"
+    },
+    {
+      "commit": "f7db449916056bf515abd6a7e43a9b791b837cbd",
+      "author": "Jason McCartney",
+      "subject": "shared: exact MXFP8 -> BF16 expansion for checkpoint MXFP8 projections",
+      "url": "https://github.com/Enntity/atlas/commit/f7db449916056bf515abd6a7e43a9b791b837cbd"
+    },
+    {
+      "commit": "b6fb1a0f80ae9119be2497afaae39d42c3048cc6",
+      "author": "Jason McCartney",
+      "subject": "shared: vision_dense_auto expands W4A16 NVFP4 through dense_auto",
+      "url": "https://github.com/Enntity/atlas/commit/b6fb1a0f80ae9119be2497afaae39d42c3048cc6"
+    },
+    {
+      "commit": "218b97f1893ed2655f7a992898f74edad1431e52",
+      "author": "Jason McCartney",
+      "subject": "shared: CSF: vectorized decoded-scale check, shared across encodings",
+      "url": "https://github.com/Enntity/atlas/commit/218b97f1893ed2655f7a992898f74edad1431e52"
+    },
+    {
+      "commit": "321cebad624052d3461a22b01f56cad959560a10",
+      "author": "Jason McCartney",
+      "subject": "shared: lossless csf_32x2_v1 NVFP4 block-scale decoder",
+      "url": "https://github.com/Enntity/atlas/commit/321cebad624052d3461a22b01f56cad959560a10"
+    },
+    {
+      "commit": "f819ed0669bc81645a036b72e8e75a47c7a6c370",
+      "author": "Jason McCartney",
+      "subject": "shared: decode csf_32x2_v1 scales at upload in every safetensors loader",
+      "url": "https://github.com/Enntity/atlas/commit/f819ed0669bc81645a036b72e8e75a47c7a6c370"
+    },
+    {
+      "commit": "0d88ab49f977515ffac933bc7ee21384a360dbd8",
+      "author": "Jason McCartney",
+      "subject": "shared: expert TP decodes CSF scales per slice from deferred components",
+      "url": "https://github.com/Enntity/atlas/commit/0d88ab49f977515ffac933bc7ee21384a360dbd8"
+    },
+    {
+      "commit": "3544dee5839c6dcdac6d5435ea57f0ec307fd630",
+      "author": "Jason McCartney",
+      "subject": "glm5: expert TP slices through with_deferred_slice, CSF scales included",
+      "url": "https://github.com/Enntity/atlas/commit/3544dee5839c6dcdac6d5435ea57f0ec307fd630"
+    },
+    {
+      "commit": "f355512a775bf97a1817a3922a83153dba7ae6c4",
+      "author": "Jason McCartney",
+      "subject": "shared: FP8 block dequant reads ModelOpt FP8_PB_WO's 4-D scale grid",
+      "url": "https://github.com/Enntity/atlas/commit/f355512a775bf97a1817a3922a83153dba7ae6c4"
+    },
+    {
+      "commit": "778e4b9fbc9d05e2097831b583794e20174f9b6e",
+      "author": "Jason McCartney",
+      "subject": "glm5_next: FP4-Local's csf_32x2_v1 weight_scale_encoding parses",
+      "url": "https://github.com/Enntity/atlas/commit/778e4b9fbc9d05e2097831b583794e20174f9b6e"
+    },
+    {
+      "commit": "79d94a231ae39d447700cfbaec0846e1a192a1a2",
+      "author": "Jason McCartney",
+      "subject": "glm5: load the FP4-Local backbone through production's arms on exact/nearest BF16",
+      "url": "https://github.com/Enntity/atlas/commit/79d94a231ae39d447700cfbaec0846e1a192a1a2"
+    },
+    {
+      "commit": "b8333ad0e7e873c092d07e1fd6bcf56a7fbbd693",
+      "author": "Jason McCartney",
+      "subject": "glm5: dtype-checked lm_head; FP4-Local's split head shard is the checkpoint's MXFP8",
+      "url": "https://github.com/Enntity/atlas/commit/b8333ad0e7e873c092d07e1fd6bcf56a7fbbd693"
+    },
+    {
+      "commit": "d537e88c52d38e1592968bde2458b19b09c2a435",
+      "author": "Jason McCartney",
+      "subject": "shared: load a checkpoint's MXFP8 tensors as TP-sliced decode twins",
+      "url": "https://github.com/Enntity/atlas/commit/d537e88c52d38e1592968bde2458b19b09c2a435"
+    },
+    {
+      "commit": "2fde01449928678bfd10724ea9b6ce2d10735bfe",
+      "author": "Jason McCartney",
+      "subject": "shared: one MXFP8 probe and one block constant",
+      "url": "https://github.com/Enntity/atlas/commit/2fde01449928678bfd10724ea9b6ce2d10735bfe"
+    },
+    {
+      "commit": "3fe65b66d08793c1f31c2342b5f4f29f21a202ed",
+      "author": "Jason McCartney",
+      "subject": "shared: mxfp8_row_range_twin, a contiguous row slice of a checkpoint MXFP8 tensor",
+      "url": "https://github.com/Enntity/atlas/commit/3fe65b66d08793c1f31c2342b5f4f29f21a202ed"
+    },
+    {
+      "commit": "1c0043f284ef9d4820a612b9dd3d6f9acea2d4c5",
+      "author": "Jason McCartney",
+      "subject": "glm5: GLM ViT linears load through vision_dense_auto; FP4-Local's sources released",
+      "url": "https://github.com/Enntity/atlas/commit/1c0043f284ef9d4820a612b9dd3d6f9acea2d4c5"
+    },
+    {
+      "commit": "e839642d5aa83a72f87505ddb142d37b6f364fb4",
+      "author": "Jason McCartney",
+      "subject": "glm5: header test: hc_*_fn stays BF16 on both releases",
+      "url": "https://github.com/Enntity/atlas/commit/e839642d5aa83a72f87505ddb142d37b6f364fb4"
+    },
+    {
+      "commit": "0435a4c629e8fe2a260faa80a30aa58c56a72f65",
+      "author": "Jason McCartney",
+      "subject": "glm5: GPU tests of the FP4-Local loader on the real checkpoint (ATLAS_GLM_FP4L_CKPT)",
+      "url": "https://github.com/Enntity/atlas/commit/0435a4c629e8fe2a260faa80a30aa58c56a72f65"
+    },
+    {
+      "commit": "fe2eac1812fd2db6357093e81ee5bf070cf59f81",
+      "author": "Jason McCartney",
+      "subject": "glm5: release the lm_head source through release_expanded; CSF doc fixed",
+      "url": "https://github.com/Enntity/atlas/commit/fe2eac1812fd2db6357093e81ee5bf070cf59f81"
+    },
+    {
+      "commit": "1193c0446f155ac114e5e449da85dd88cd796e96",
+      "author": "Jason McCartney",
+      "subject": "glm5: RetirementLog's live-owner index skips reclaimed store tensors",
+      "url": "https://github.com/Enntity/atlas/commit/1193c0446f155ac114e5e449da85dd88cd796e96"
+    },
+    {
+      "commit": "d44bc948b743299fa53c455d07a0b4cd57ce0b18",
+      "author": "Jason McCartney",
+      "subject": "glm5: ViT concatenation frees its part expansions on error; teardown doc",
+      "url": "https://github.com/Enntity/atlas/commit/d44bc948b743299fa53c455d07a0b4cd57ce0b18"
+    },
+    {
+      "commit": "2ec9293bdae35523c17eaf8c802e4b0463ac02da",
+      "author": "Jason McCartney",
+      "subject": "shared: the lazy BF16 reserve skips FP8 tensors a loader already reclaimed",
+      "url": "https://github.com/Enntity/atlas/commit/2ec9293bdae35523c17eaf8c802e4b0463ac02da"
+    },
+    {
+      "commit": "9408e7de7eb4aadaeb0a0b530bbd01824747b9b8",
+      "author": "Jason McCartney",
+      "subject": "shared: FP8 block dequant refuses an empty or oversized scale grid",
+      "url": "https://github.com/Enntity/atlas/commit/9408e7de7eb4aadaeb0a0b530bbd01824747b9b8"
+    },
+    {
+      "commit": "93d27e3393b81f2aae28042607e3e6a409d52c5c",
+      "author": "Jason McCartney",
+      "subject": "shared: GPU test of the MXFP8 -> BF16 kernel path",
+      "url": "https://github.com/Enntity/atlas/commit/93d27e3393b81f2aae28042607e3e6a409d52c5c"
+    },
+    {
+      "commit": "272c31078a39a08921d411ec924a759443660bae",
+      "author": "Jason McCartney",
+      "subject": "shared: MXFP8 GPU-test helpers from the sparkqwen layer",
+      "url": "https://github.com/Enntity/atlas/commit/272c31078a39a08921d411ec924a759443660bae"
+    },
+    {
+      "commit": "d9bd1e60021544936bcdfc28fb28009bc3c1c70d",
+      "author": "Jason McCartney",
+      "subject": "glm5: the shared FP8 cache's origin check takes FP4-Local's FP8 shared experts",
+      "url": "https://github.com/Enntity/atlas/commit/d9bd1e60021544936bcdfc28fb28009bc3c1c70d"
+    }
+  ],
+  "adaptations": [
+    "Retain current-main packed allocations; CSF streams are assembled outside slabs.",
+    "Preserve checked Identity-based dense retirement already stronger than e7c69a33.",
+    "Preserve current-main VisionEncoder construction.",
+    "272c3107 imports only test_checkpoint helper.",
+    "Add memory-allocation failure regression and free temporary MXFP8 scales on failure.",
+    "Split Windows streaming helper to preserve source-size cap.",
+    "Reject components received after a compressed scale has already completed, including deferred sets; regression reproduced before fix.",
+    "Use the exact GLM GPU-test backend and check finite checkpoint projection outputs.",
+    "Retain Apache-2.0 license and original reference notices for embedded Python oracle functions."
+  ]
+}

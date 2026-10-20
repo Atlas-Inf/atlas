@@ -306,4 +306,4 @@ impl FfnComponent {
 }
 
 #[cfg(test)]
-mod glm_gpu_test_backend;
+pub(crate) mod glm_gpu_test_backend;

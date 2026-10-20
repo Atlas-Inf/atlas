@@ -104,6 +104,7 @@ fn mixed_precision_map_resolves_standard_despite_mtp_scale_inv() {
             QuantLayerSpec {
                 quant_algo: "NVFP4".into(),
                 group_size: 16,
+                weight_scale_encoding: String::new(),
             },
         );
     }
@@ -112,6 +113,7 @@ fn mixed_precision_map_resolves_standard_despite_mtp_scale_inv() {
         QuantLayerSpec {
             quant_algo: "FP8_PB_WO".into(),
             group_size: 128,
+            weight_scale_encoding: String::new(),
         },
     );
     map.insert(
@@ -119,6 +121,7 @@ fn mixed_precision_map_resolves_standard_despite_mtp_scale_inv() {
         QuantLayerSpec {
             quant_algo: "FP8".into(),
             group_size: 0,
+            weight_scale_encoding: String::new(),
         },
     );
     cfg.quantization_config = Some(QuantizationConfig {
@@ -165,6 +168,7 @@ fn mixed_precision_fp8_attn_nvfp4_mlp_resolves_standard() {
                 QuantLayerSpec {
                     quant_algo: "FP8".into(),
                     group_size: 128,
+                    weight_scale_encoding: String::new(),
                 },
             );
         }
@@ -174,6 +178,7 @@ fn mixed_precision_fp8_attn_nvfp4_mlp_resolves_standard() {
                 QuantLayerSpec {
                     quant_algo: "NVFP4".into(),
                     group_size: 16,
+                    weight_scale_encoding: String::new(),
                 },
             );
         }
@@ -217,6 +222,7 @@ fn mixed_precision_w4a16_nvfp4_labels_resolve_standard() {
                 QuantLayerSpec {
                     quant_algo: "FP8".into(),
                     group_size: 128,
+                    weight_scale_encoding: String::new(),
                 },
             );
         }
@@ -225,6 +231,7 @@ fn mixed_precision_w4a16_nvfp4_labels_resolve_standard() {
             QuantLayerSpec {
                 quant_algo: "W4A16_NVFP4".into(),
                 group_size: 16,
+                weight_scale_encoding: String::new(),
             },
         );
         for proj in ["gate_proj", "up_proj", "down_proj"] {
@@ -233,6 +240,7 @@ fn mixed_precision_w4a16_nvfp4_labels_resolve_standard() {
                 QuantLayerSpec {
                     quant_algo: "W4A16_NVFP4".into(),
                     group_size: 16,
+                    weight_scale_encoding: String::new(),
                 },
             );
         }
@@ -253,5 +261,23 @@ fn mixed_precision_w4a16_nvfp4_labels_resolve_standard() {
         Nvfp4Variant::Standard,
         "MIXED_PRECISION map with FP8 attn + W4A16_NVFP4 experts/shared_expert \
          must resolve Standard — the FP8 arm cannot read uint8-packed FP4"
+    );
+}
+
+/// nvidia FP4-Local's map puts 438 MXFP8 entries on the compute path (GDN,
+/// attention, shared experts) beside 48 CSF NVFP4 expert entries. MXFP8 is
+/// not an `FP8*` label and must not pull the global variant off Standard: the
+/// routed experts are standard ModelOpt NVFP4 once their scales are decoded,
+/// and the MXFP8 tensors are served per key by the FP8 -> BF16 funnel.
+#[test]
+fn fp4_local_mixed_map_resolves_standard() {
+    let cfg = atlas_core::config::parse_config(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test_data/qwen4_exp_flash_next_fp4local_config.json"
+    )))
+    .unwrap();
+    assert_eq!(
+        detect_nvfp4_variant(&WeightStore::empty(), &cfg),
+        Nvfp4Variant::Standard
     );
 }

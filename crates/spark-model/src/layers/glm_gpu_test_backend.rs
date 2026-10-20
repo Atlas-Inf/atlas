@@ -10,7 +10,7 @@ use spark_runtime::cuda_backend::{AtlasCudaBackend, configure_pdl, pdl_enabled};
 use spark_runtime::gpu::GpuBackend;
 use std::sync::OnceLock;
 
-pub(super) fn backend() -> Result<&'static AtlasCudaBackend> {
+pub(crate) fn backend() -> Result<&'static AtlasCudaBackend> {
     static GPU: OnceLock<Result<AtlasCudaBackend, String>> = OnceLock::new();
     let gpu = GPU.get_or_init(|| {
         // This must precede every kernel resolution: resolving a function
