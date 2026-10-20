@@ -289,72 +289,8 @@ fn kda_layer_0_loads_its_tp2_nvfp4_twins_from_mxfp8() -> Result<()> {
     Ok(())
 }
 
-/// MLA layer 3 builds on both TP2 ranks from FP8_PB_WO q_a/q_b/kv_a/o and
-/// BF16 kv_b/indexer (the expansions themselves are checked bit for bit
-/// above), and its FP8 sources are then released, nothing else.
-#[test]
-#[ignore = "needs a GB10, a glm-5.3-flash kernel build and ATLAS_GLM_FP4L_CKPT"]
-fn mla_layer_3_builds_on_both_tp2_ranks() -> Result<()> {
-    let gpu = backend()?;
-    let a = |x: &str| l(3, &format!("self_attn.{x}"));
-    let fp8 = ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "o_proj"].map(a);
-    let mut names = with_parts(&fp8, &["weight", "weight_scale"]);
-    for x in [
-        "kv_b_proj.weight",
-        "q_a_layernorm.weight",
-        "kv_a_layernorm.weight",
-        "indexer.wq_b.weight",
-        "indexer.wk.weight",
-        "indexer.weights_proj.weight",
-        "indexer.index_kpool_compress_gate",
-        "indexer.index_kpool_compress_ape",
-        "indexer.k_norm.weight",
-        "indexer.k_norm.bias",
-    ] {
-        names.push(a(x));
-    }
-    names.push(l(3, "input_layernorm.weight"));
-    names.push(l(3, "post_attention_layernorm.weight"));
-    for rank in 0..2 {
-        let config = tp2_rank(rank);
-        let (store, host) = upload(gpu, &names)?;
-        let lp = config.layer_prefix(3);
-        let norm = |x: &str| norm_bf16(&store, &format!("{lp}.{x}"), gpu);
-        crate::weight_loader::glm5::layers::load_mla_layer(
-            &store,
-            &lp,
-            3,
-            0,
-            norm("input_layernorm.weight")?,
-            norm("post_attention_layernorm.weight")?,
-            crate::layers::FfnComponent::None,
-            None,
-            &config,
-            gpu,
-            spark_runtime::kv_cache::KvCacheDtype::Bf16,
-            false,
-            None,
-        )?;
-        let mut released = 0;
-        for stem in decoder_expanded_stems(&lp, LayerType::FullAttention, false) {
-            released += release_expanded(&store, gpu, &stem, false)?;
-        }
-        let want: usize = with_parts(&fp8, &["weight", "weight_scale"])
-            .iter()
-            .map(|n| host[n].2.len())
-            .sum();
-        ensure!(
-            released == want,
-            "rank {rank}: released {released} of {want} bytes"
-        );
-        ensure!(
-            !store.was_reclaimed(&a("kv_b_proj.weight")),
-            "BF16 kv_b released"
-        );
-        eprintln!("rank {rank}: MLA layer 3 built, {released} FP8 source bytes released");
-    }
-    Ok(())
-}
+#[path = "fp4l_test_gpu_mla.rs"]
+mod mla;
 
 #[test]
 #[ignore = "needs a GB10, a glm-5.3-flash kernel build and ATLAS_GLM_FP4L_CKPT"]
