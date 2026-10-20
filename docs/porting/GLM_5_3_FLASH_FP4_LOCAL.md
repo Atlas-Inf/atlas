@@ -53,8 +53,23 @@ Ignored GPU tests compare real checkpoint projections, TP2 KDA weights,
 shared experts, output-head slices and vision linears with host references.
 They select the exact GLM kernel target and check finite outputs. Run them on
 an otherwise idle Spark with `ATLAS_GLM_FP4L_CKPT` set to the checkpoint path.
-Fresh serving, equivalence and performance results are pending for this update;
-older validation records do not qualify these changes.
+All [six checkpoint GPU tests](glm53-validation/fp4local-loader-20261020.json)
+passed with the test executable built from
+`3dbb41fb494f3db3993d9e620de1b8009adc901d`. This includes exact projection
+expansion and output-head slicing, format-specific requantization checks,
+TP2 MLA construction and cleanup, and vision projection references.
+The imported MLA test needed a test-only correction: current main retires the
+original BF16 `kv_b` after TP sharding, before expanded-source cleanup.
+The corrected test checks both that retirement and preservation of the other
+live BF16/indexer buffers.
+
+Fresh two-Spark serving checks passed with a 32K aggregate pool: text, tools,
+strict JSON, tool-or-JSON union, image colors, disconnect/reuse and C1/C4
+benchmarks. All 13 benchmark/vision answer and reasoning pairs matched with
+the four prefill switches off versus on. See the
+[measurements and limits](GLM_5_3_FLASH_PREFILL_RESULTS.md#fp4-local).
+The runtime remains `5d652f8e0835231ead3bcac91d66e22632c08cbe`;
+subsequent changes affect documentation and tests only.
 
 ## Checkpoint and fixture terms
 

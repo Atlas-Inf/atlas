@@ -16,8 +16,17 @@ can be smaller. This is a bounded starting configuration, not a maximum-context
 claim. [Validation receipts](../../../../docs/porting/glm53-validation/README.md)
 identify the measured revisions and profiles; the no-drafter option below is not
 a claim of fresh output parity with the qualified DFlash profile.
+Keep the four configured slots even when testing a single client: with this
+recipe's 4096-token prefill chunk, they provide the native path's required
+4100-row workspace. A single active request does not require a single-slot
+server configuration.
 
 ## Build from this checkout
+
+Stop existing model services on both Sparks before building or launching.
+The measured setup started with idle GPUs, at least 96 GiB of host memory
+available on each Spark, and no swap in use. Check these conditions again
+before launching the pair.
 
 On an ARM64 Spark, from the repository root:
 
@@ -220,5 +229,11 @@ Measured approximately 10K-token chat TTFT improved by 2.3–2.4%, while decode
 was essentially unchanged. Core CUDA, tools/JSON and cancellation checks passed.
 See [settings, results and limits](../../../../docs/porting/GLM_5_3_FLASH_PREFILL_RESULTS.md).
 
-FP4-Local GPU loader and two-Spark serving checks remain pending. These bounded
-NVFP4 results do not establish FP4-Local support or a new maximum context.
+FP4-Local also passed six checkpoint GPU checks and both 32K-pool serving
+profiles, including positive vision probes. All 13 compared answer/reasoning
+pairs matched between prefill settings. These bounded results do not establish
+a new maximum context.
+A separate FP4-Local smoke test passed one 65,536-token random-input request
+with a 98,304 session limit, 131,072 aggregate cap and four configured slots;
+only one request was active. Above 32K, sparse attention uses Atlas's existing
+fallback. See the [64K result and limits](../../../../docs/porting/GLM_5_3_FLASH_PREFILL_RESULTS.md#one-64k-random-input-request).

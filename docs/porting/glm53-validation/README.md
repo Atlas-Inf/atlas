@@ -9,7 +9,15 @@ The native FP4-Local and prefill update at
 (7,602 tests), six core CUDA checks, and a bounded existing-NVFP4 off/on
 comparison. [Measured results and limitations](../GLM_5_3_FLASH_PREFILL_RESULTS.md)
 and [machine-readable evidence](prefill-nvfp4-20261020.json) retain the actual
-runtime revision. FP4-Local GPU and serving qualification remains pending.
+runtime revision. The [six real-checkpoint GPU checks](fp4local-loader-20261020.json)
+also passed with the corrected test executable at `3dbb41fb`; production code
+is unchanged. [FP4-Local serving checks](prefill-fp4local-20261020.json) passed
+the same bounded comparison plus two positive vision probes, with all 13
+answer/reasoning pairs identical between settings. The two checkpoints are
+not expected to produce identical outputs to each other.
+A separate [single 64K random-input request](fp4local-64k-20261020.json) passed
+with a 131K aggregate pool cap and four configured slots. It establishes
+bounded execution, not maximum capacity or long-context retrieval quality.
 
 The preceding main integration at `a37b789b` passed bounded GLM checks and
 seven cross-model GPU gates, but **did not pass full qualification**:

@@ -211,6 +211,7 @@
     "Split Windows streaming helper to preserve source-size cap.",
     "Reject components received after a compressed scale has already completed, including deferred sets; regression reproduced before fix.",
     "Use the exact GLM GPU-test backend and check finite checkpoint projection outputs.",
-    "Retain Apache-2.0 license and original reference notices for embedded Python oracle functions."
+    "Retain Apache-2.0 license and original reference notices for embedded Python oracle functions.",
+    "Adapt the MLA GPU test to current-main TP2 source retirement; verify that later expanded-source cleanup preserves live BF16 and indexer buffers."
   ]
 }

@@ -61,11 +61,14 @@ core CUDA checks. On the existing NVIDIA NVFP4 checkpoint, switching all four
 paths on reduced median client TTFT by 2.3–2.4% for the measured approximately
 10K-token prose, code and structured prompts; decode was essentially unchanged.
 All 11 benchmark answers and reasoning strings matched between settings.
+The FP4-Local comparison also passed exact-output checks for all 13
+benchmark/vision pairs; its chat TTFT decreased by 0.8–1.1%, while the single
+random C1 request's TTFT increased by 1.6%.
 See [the measured settings and limits](GLM_5_3_FLASH_PREFILL_RESULTS.md).
 
 This is evidence for the bundle, not four independently measured speedups.
-The switches remain opt-in pending FP4-Local qualification and repeated,
-interleaved on/off measurements across both checkpoints at 10K and 64K input
+The switches remain opt-in pending repeated, interleaved on/off measurements
+across both checkpoints at 10K and 64K input
 lengths. Default promotion requires exact-output checks to pass, a median TTFT
 improvement larger than the observed repeat-to-repeat variation, and no
 material decode or peak-memory regression. A leave-one-out comparison must
