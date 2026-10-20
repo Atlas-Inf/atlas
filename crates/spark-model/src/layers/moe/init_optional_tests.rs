@@ -92,13 +92,16 @@ fn constructor_scopes_glm_only_optional_lookups() {
         assert_eq!(layer.dense_gemm_router_rows.0, 0);
         assert_eq!(layer.w4a16_batch5_dual_k.0, 0);
         // Keep optional kernels supported by other targets available.
-        for symbol in [
-            "moe_fp8_grouped_gemm",
-            "moe_w8a8_grouped_gemm",
-            "moe_w4a16_fused_gate_up_t_k64_fp4",
-        ] {
+        for symbol in ["moe_fp8_grouped_gemm", "moe_w8a8_grouped_gemm"] {
             assert!(requests.iter().any(|s| s == symbol), "lost {symbol}");
         }
+        // Qwen3.5-122B does not ship FUSED-FP4; main scopes that probe to
+        // the model families whose targets compile it.
+        assert!(
+            !requests
+                .iter()
+                .any(|s| s == "moe_w4a16_fused_gate_up_t_k64_fp4")
+        );
         let gpu = Gpu::new();
         let layer = construct(&gpu, "glm5_next", ep_world_size);
         let requests = lookups(&gpu);
@@ -115,5 +118,15 @@ fn constructor_scopes_glm_only_optional_lookups() {
         *gpu.missing.lock().unwrap() = GLM_ONLY.iter().map(|s| (*s).into()).collect();
         let _ = construct(&gpu, "glm5_next", ep_world_size);
         assert_eq!(lookups(&gpu), requests);
+    }
+    for model_type in ["holo3_1_moe", "qwen3_5", "qwen3_6_moe", "qwen4_exp"] {
+        let gpu = Gpu::new();
+        let _ = construct(&gpu, model_type, 1);
+        assert!(
+            lookups(&gpu)
+                .iter()
+                .any(|s| s == "moe_w4a16_fused_gate_up_t_k64_fp4"),
+            "{model_type} lost its supported FUSED-FP4 probe"
+        );
     }
 }

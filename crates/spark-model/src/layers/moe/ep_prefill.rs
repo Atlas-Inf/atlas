@@ -13,9 +13,8 @@ fn unpermute_vec_eligible(flag: bool, hidden_size: usize, top_k: usize) -> bool 
 }
 
 /// The EP unpermute-reduce kernel: `moe_unpermute_reduce_indexed_ep`, or its
-/// `_vec8` twin (same launch, same bytes) where eligible and shipped. A
-/// target that ships neither (only glm-5.3-flash does) gets a null handle,
-/// which `use_sparse_ep_reduce` reads as "take the dense EP reduce".
+/// `_vec8` twin (same launch, same bytes) where eligible and shipped.
+/// GLM requires the scalar kernel; other model families use their dense reduce.
 pub(super) fn unpermute_ep_kernel(
     gpu: &dyn GpuBackend,
     config: &atlas_core::config::ModelConfig,
@@ -50,12 +49,7 @@ pub(super) fn unpermute_ep_kernel(
             return Ok(vec);
         }
     }
-    Ok(super::super::try_kernel_gated(
-        config.model_type == "glm5_next",
-        gpu,
-        "moe",
-        "moe_unpermute_reduce_indexed_ep",
-    ))
+    gpu.kernel("moe", "moe_unpermute_reduce_indexed_ep")
 }
 
 impl MoeLayer {
