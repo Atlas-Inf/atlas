@@ -213,7 +213,7 @@ impl Qwen3AttentionLayer {
         let eps = ctx.config.rms_norm_eps as f32;
         let b = ctx.buffers;
         let (hidden, normed) = (b.hidden_states(), b.norm_output());
-        self.hc_pre_prefill(&hc.attn, hc, hidden, n, ctx, stream)?;
+        self.hc_pre_prefill(&hc.attn, hc, hidden, n, None, ctx, stream)?;
         ops::rms_norm(
             ctx.gpu,
             self.rms_norm_w_k,
@@ -254,10 +254,11 @@ impl Qwen3AttentionLayer {
             hc.hc_mult as u32,
             hc.sinkhorn_iters as u32,
             hc.hc_eps,
+            None,
             ctx,
             stream,
         )?;
-        if !seam {
+        if !seam.ran() {
             ops::hc_post_site(
                 ctx.gpu,
                 self.hc_post_k,
@@ -271,7 +272,7 @@ impl Qwen3AttentionLayer {
                 h as u32,
                 stream,
             )?;
-            self.hc_pre_prefill(&hc.ffn, hc, hidden, n, ctx, stream)?;
+            self.hc_pre_prefill(&hc.ffn, hc, hidden, n, None, ctx, stream)?;
         }
         ops::rms_norm(
             ctx.gpu,

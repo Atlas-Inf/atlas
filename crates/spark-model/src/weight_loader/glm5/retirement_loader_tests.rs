@@ -247,3 +247,91 @@ fn actual_kda_each_source_or_derived_free_failure_is_spent_without_retry() {
         assert!(store.is_empty());
     }
 }
+
+#[test]
+fn production_kda_checkpoint_cleanup_never_repeats_a_loader_free() {
+    use atlas_core::scope::ModelResource;
+    for (tp, rank) in [(1, 0), (2, 0), (2, 1)] {
+        let gpu = Gpu::default();
+        let mut store = kda_store(&gpu, tp);
+        let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+        cfg.hidden_size = 128;
+        cfg.linear_num_key_heads = 1;
+        cfg.linear_num_value_heads = 1;
+        cfg.linear_key_head_dim = 128;
+        cfg.linear_value_head_dim = 128;
+        cfg.linear_conv_kernel_dim = 4;
+        cfg.tp_world_size = tp;
+        cfg.tp_rank = rank;
+        // This is the production load_all path: no staged RetirementLog.
+        let _weights = super::super::components::load_kda_weights(
+            &store,
+            "l",
+            &cfg,
+            &gpu,
+            QuantizeCtx {
+                absmax_k: spark_runtime::gpu::KernelHandle(1),
+                quantize_k: spark_runtime::gpu::KernelHandle(1),
+                stream: 0,
+            },
+            None,
+        )
+        .unwrap();
+        store
+            .release(&gpu)
+            .expect("production loader must retire checkpoint ownership before teardown");
+        let frees = gpu.frees.lock();
+        let unique: std::collections::HashSet<_> = frees.iter().map(|ptr| ptr.0).collect();
+        assert_eq!(
+            unique.len(),
+            frees.len(),
+            "TP{tp} rank{rank}: duplicate free"
+        );
+    }
+}
+
+#[test]
+fn production_kda_partial_load_cleanup_does_not_retry_failed_retirement() {
+    use atlas_core::scope::ModelResource;
+    for rank in [0, 1] {
+        let gpu = Gpu::default();
+        let mut store = kda_store(&gpu, 2);
+        let failed = store.get("l.self_attn.dt_bias").unwrap().ptr;
+        *gpu.fail.lock() = Some(failed);
+        let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+        cfg.hidden_size = 128;
+        cfg.linear_num_key_heads = 1;
+        cfg.linear_num_value_heads = 1;
+        cfg.linear_key_head_dim = 128;
+        cfg.linear_value_head_dim = 128;
+        cfg.linear_conv_kernel_dim = 4;
+        cfg.tp_world_size = 2;
+        cfg.tp_rank = rank;
+        let error = super::super::components::load_kda_weights(
+            &store,
+            "l",
+            &cfg,
+            &gpu,
+            QuantizeCtx {
+                absmax_k: spark_runtime::gpu::KernelHandle(1),
+                quantize_k: spark_runtime::gpu::KernelHandle(1),
+                stream: 0,
+            },
+            None,
+        )
+        .err()
+        .expect("injected checkpoint free must fail construction");
+        assert!(error.to_string().contains("injected free outcome unknown"));
+        store
+            .release(&gpu)
+            .expect("partial load cleanup must skip attempted retirements");
+        let frees = gpu.frees.lock();
+        assert_eq!(frees.iter().filter(|&&p| p == failed).count(), 1);
+        let unique: std::collections::HashSet<_> = frees.iter().map(|ptr| ptr.0).collect();
+        assert_eq!(
+            unique.len(),
+            frees.len(),
+            "TP2 rank{rank}: duplicate cleanup free"
+        );
+    }
+}

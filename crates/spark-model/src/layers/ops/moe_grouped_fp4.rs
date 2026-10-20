@@ -121,11 +121,15 @@ pub struct K128wKernel {
 /// Which row tiles a K128W launch covers: a grid over `bound` >= the local
 /// experts' row tiles (`moe_mtile_prefix`), or `ctas` CTAs of the kernel's
 /// `_persist` twin claiming its work items from the `next_work` counter,
-/// zeroed before each launch (ATLAS_GLM_MOE_PREFILL_PERSIST). Same bytes.
+/// zeroed before each launch (ATLAS_GLM_MOE_PREFILL_PERSIST), or `ctas` CTAs
+/// of a kernel that strides over its work items itself, with the grid
+/// kernel's arguments (the GLM decode persistent twins,
+/// ATLAS_GLM_MOE_DECODE_PERSIST). Same bytes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum K128wSchedule {
     Grid { bound: u32 },
     Persistent { ctas: u32, next_work: DevicePtr },
+    Stride { ctas: u32 },
 }
 
 impl K128wSchedule {
@@ -133,7 +137,7 @@ impl K128wSchedule {
     pub fn grid(self, n_tiles: u32) -> [u32; 3] {
         match self {
             Self::Grid { bound } => [n_tiles, bound.max(1), 1],
-            Self::Persistent { ctas, .. } => [ctas.max(1), 1, 1],
+            Self::Persistent { ctas, .. } | Self::Stride { ctas } => [ctas.max(1), 1, 1],
         }
     }
 
@@ -145,7 +149,7 @@ impl K128wSchedule {
         stream: u64,
     ) -> Result<KernelLaunch<'a>> {
         let handle = match self {
-            Self::Grid { .. } => kernel.grid,
+            Self::Grid { .. } | Self::Stride { .. } => kernel.grid,
             Self::Persistent { next_work, .. } => {
                 anyhow::ensure!(kernel.persist.0 != 0, "persistent K128W kernel not loaded");
                 gpu.memset_async(next_work, 0, 4, stream)?;
@@ -159,7 +163,7 @@ impl K128wSchedule {
 
     fn finish(self, launch: KernelLaunch<'_>, stream: u64) -> Result<()> {
         match self {
-            Self::Grid { .. } => launch.launch(stream),
+            Self::Grid { .. } | Self::Stride { .. } => launch.launch(stream),
             Self::Persistent { next_work, .. } => launch.arg_ptr(next_work).launch(stream),
         }
     }

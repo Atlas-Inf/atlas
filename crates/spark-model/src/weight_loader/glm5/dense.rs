@@ -58,8 +58,11 @@ pub(super) fn load_projection(
         return Ok(result);
     }
 
+    // BF16 (bring-up) is the store's own tensor; FP4-Local's MXFP8 expands
+    // exactly to a fresh BF16 copy, freed once quantized (quantization
+    // synchronizes). Its MXFP8 source goes with the layer (`fp4l`).
     let dense = dense_auto(store, &name, gpu)?;
-    quantize_to_nvfp4(
+    let q = quantize_to_nvfp4(
         &dense,
         n,
         k,
@@ -67,5 +70,9 @@ pub(super) fn load_projection(
         qctx.absmax_k,
         qctx.quantize_k,
         qctx.stream,
-    )
+    )?;
+    if dense.weight != weight.ptr {
+        gpu.free(dense.weight)?;
+    }
+    Ok(q)
 }

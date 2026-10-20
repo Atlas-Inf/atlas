@@ -170,6 +170,11 @@ impl Glm5KdaLayer {
             preprocess_regresident_k,
             recurrent_regresident_k,
             register_resident_prefill,
+            flash_prefill: super::flash_prefill::FlashPrefill::load(
+                heads,
+                dim,
+                config.kda_gate_lower_bound,
+            )?,
             gated_norm_k: gpu.kernel("kda", "kda_sigmoid_gated_rms_norm")?,
             // Highway-storage-specific mHC kernels (FP32, or BF16 twins).
             hc_expand_k: gpu.kernel("hyper_connection", &hc_name("hc_expand"))?,

@@ -496,6 +496,16 @@ impl ActiveSeq {
             .is_some_and(GrammarState::is_strict)
     }
 
+    /// A tool-call-or-JSON union's first output token is next: it is picked
+    /// on host logits (`GrammarState::choose_branch`), never in a verify row.
+    pub(super) fn grammar_branch_pending(&self) -> bool {
+        !self.inside_thinking
+            && self
+                .grammar_state
+                .as_ref()
+                .is_some_and(GrammarState::branch_pending)
+    }
+
     /// Abort the sequence on an ENGINE error: records the cause so the wire
     /// finish reason is "error" (never "stop") and marks it finished.
     pub(super) fn abort_on_engine_error(&mut self, e: impl std::fmt::Display) {

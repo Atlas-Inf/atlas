@@ -52,6 +52,20 @@
 // its own prefetch of rows they have read hits L2 while the lines live, so
 // each byte still crosses DRAM about once.
 //
+// Persistent twins (ATLAS_GLM_MOE_DECODE_PERSIST, the *_l2pf_p kernels: the
+// prefetching gate/up and zskip down). DRAM serves a read of few tables at
+// once faster than one of many: on ennspark03 a sweep of 2 MB tables in 8 KB
+// chunks reads 248-253 GB/s one table at a time, 240 two at a time and
+// 230-234 with 12-48 (scripts/moe-decode-bench rooflines, 2026-10-09). The
+// grid twins hold two CTAs per SM, 12 experts' gate and up tables at once
+// (6 for the down); one CTA per SM halves that, and a persistent CTA strides
+// over the worklist's (expert, column tile) items, expert-major, asking its
+// next item's first stages (and building its zskip mask) during the last
+// ones, so an item's start is hidden. Measured against the grid twins
+// (moe_decode_bench, 3-32 rows): gate/up 1.5-2% and down 2.5-4.5% faster.
+// Each item is computed exactly as by the grid kernels, so the same bytes,
+// and with any CTA count (the GPU test runs 48, 7 and 1).
+//
 // Prior art (docs/glm-prior-art.md): pulling the weights the next kernels
 // read into L2 is jayleaton's L2 prefetch
 // (github.com/jayleaton/glm53-tensorfold-spark patches/0460, Apache-2.0), as
@@ -126,23 +140,24 @@ __device__ __forceinline__ void pqs_load(
 // This CTA's share of K stage kb of the expert's weight and scale tables,
 // asked into L2: of the stage's PQ2_KP packed rows and PQ2_KS / GROUP_SIZE
 // scale rows, the ones in this CTA's 1/gridDim.x by blockIdx.x, each whole
-// (every column of the grid), less the dead weight rows of `live`.
+// (every column of the grid), less the dead weight rows of `live`; `tile` is
+// the CTA's column tile of the expert's `ctas`.
 // Consecutive threads take consecutive lines of a row.
 template<bool GATE_UP>
 __device__ __forceinline__ void pqs_prefetch(
     unsigned int t, const unsigned char* B_expert, const unsigned char* S_expert,
     const unsigned char* U_expert, const unsigned char* US_expert,
-    unsigned int N, unsigned int kb, const unsigned char* live
+    unsigned int N, unsigned int kb, const unsigned char* live, unsigned int tile, unsigned int ctas
 ) {
     constexpr unsigned int TABLES = GATE_UP ? 2 : 1;
     constexpr unsigned int GROUPS = PQ2_KS / GROUP_SIZE;
-    const unsigned int ctas = gridDim.x, lines = N / 128;
+    const unsigned int lines = N / 128;
     const unsigned int rows = (PQ2_KP + ctas - 1) / ctas, groups = (GROUPS + ctas - 1) / ctas;
     const unsigned int nw = TABLES * rows * lines, total = nw + TABLES * groups * lines;
     for (unsigned int i = t; i < total; i += PQS_THREADS) {
         const bool w = i < nw;
         const unsigned int k = w ? i : i - nw, span = w ? rows : groups;
-        const unsigned int tab = k / (span * lines), r = blockIdx.x * span + k / lines % span;
+        const unsigned int tab = k / (span * lines), r = tile * span + k / lines % span;
         if (r >= (w ? PQ2_KP : GROUPS) || (w && live && !live[kb / 2 + r])) continue;
         const unsigned char* base = w ? (tab ? U_expert : B_expert) : (tab ? US_expert : S_expert);
         const unsigned char* p = base + (unsigned long long)(w ? kb / 2 + r : kb / GROUP_SIZE + r) * N
@@ -151,102 +166,169 @@ __device__ __forceinline__ void pqs_prefetch(
     }
 }
 
-template<bool GATE_UP, bool ZSKIP, int MI, bool PF = false>
+// The routed tables of work item (`slot`, `tile`): the worklist's slot-th
+// local expert and its tile-th column tile. `ok` is false for an item no CTA
+// computes (a padding slot, a second M64 row tile, an expert with no rows or
+// no weights); `full` for an expert with more rows than the slabs.
+struct PqsItem {
+    unsigned int expert_id, cta_m;
+    int M_expert;
+    const unsigned char *B, *S, *U, *US;
+    bool ok, full;
+};
+
+template<bool GATE_UP, int MI>
+__device__ __forceinline__ PqsItem pqs_item(
+    const unsigned int* __restrict__ worklist, const int* __restrict__ expert_offsets,
+    const unsigned long long* __restrict__ B_packed_ptrs, const unsigned long long* __restrict__ B_scale_ptrs,
+    const PqwGateUp& up, unsigned int num_experts, unsigned int slot
+) {
+    PqsItem it{};
+    it.expert_id = worklist[4 + slot * 2];
+    // One row tile per expert: a second M64 tile means more than 64 rows.
+    if (it.expert_id >= num_experts || worklist[5 + slot * 2] != 0) return it;
+    it.cta_m = expert_offsets[it.expert_id];
+    it.M_expert = expert_offsets[it.expert_id + 1] - (int)it.cta_m;
+    it.B = (const unsigned char*)B_packed_ptrs[it.expert_id];
+    it.S = (const unsigned char*)B_scale_ptrs[it.expert_id];
+    if (it.M_expert <= 0 || it.B == 0) return it;
+    it.full = it.M_expert > PQD_M * MI;
+    it.ok = true;
+    if (GATE_UP) {
+        it.U = (const unsigned char*)up.packed_ptrs[it.expert_id];
+        it.US = (const unsigned char*)up.scale_ptrs[it.expert_id];
+    }
+    return it;
+}
+
+// NBUF stage buffers (2; PERSIST takes 3, whose 60 KB holds one CTA per SM).
+// PERSIST: a static stride over the work items, `gridDim.x` CTAs (one per SM)
+// taking items blockIdx.x, + gridDim.x, ... of the worklist's experts x
+// column tiles, expert-major; while it runs a stage loop's last PQS_PF_DIST + 1
+// stages, a CTA asks its next item's first stages into L2 (PF only). Each
+// item's loads, MMAs and epilogue are the grid kernel's, so the same bytes.
+template<bool GATE_UP, bool ZSKIP, int MI, bool PF = false, bool PERSIST = false>
 __device__ __forceinline__ void pqs_impl(
     PQ2_ARGS,
     const unsigned int* __restrict__ worklist,
     const PqwGateUp up
 ) {
+    constexpr int NBUF = PERSIST ? 3 : 2;
     atlas_pdl_enter();
-    if ((int)blockIdx.y >= (int)worklist[0]) return;
-    const unsigned int expert_id = worklist[4 + blockIdx.y * 2];
-    // One row tile per expert: a second M64 tile means more than 64 rows.
-    if (expert_id >= num_experts || worklist[5 + blockIdx.y * 2] != 0) return;
-    const unsigned int cta_m = expert_offsets[expert_id];
-    const int M_expert = expert_offsets[expert_id + 1] - (int)cta_m;
-    const unsigned char* B_expert = (const unsigned char*)B_packed_ptrs[expert_id];
-    const unsigned char* S_expert = (const unsigned char*)B_scale_ptrs[expert_id];
-    if (M_expert <= 0 || B_expert == 0) return;
+    const unsigned int tiles = PERSIST ? N / (GATE_UP ? PQW_NT / 2 : PQW_NT) : gridDim.x;
+    const unsigned int items = PERSIST ? worklist[0] * tiles : 0;
+    if (!PERSIST && (int)blockIdx.y >= (int)worklist[0]) return;
+    unsigned int item = PERSIST ? blockIdx.x : blockIdx.y * tiles + blockIdx.x;
+    if (PERSIST && item >= items) return;
     const unsigned int t = threadIdx.x;
-    if (M_expert > PQD_M * MI) {
-        // More rows than the slabs the host selects these kernels for: NaN
-        // over them from the downs, as the M16 downs.
-        if constexpr (!GATE_UP) {
-            const __nv_bfloat16 nan = __float2bfloat16(__int_as_float(0x7fc00000));
-            for (int r = 0; r < M_expert; ++r)
-                C[(unsigned long long)(cta_m + r) * N + blockIdx.x * PQW_NT + t] = nan;
-        }
-        return;
-    }
-    const float scale2 = scale2_vals[expert_id];
-    const unsigned char* U_expert = GATE_UP ? (const unsigned char*)up.packed_ptrs[expert_id] : nullptr;
-    const unsigned char* US_expert = GATE_UP ? (const unsigned char*)up.scale_ptrs[expert_id] : nullptr;
-    const unsigned int cta_n = blockIdx.x * (GATE_UP ? PQW_NT / 2 : PQW_NT);
     const unsigned int warp_id = t / 32, lane_id = t % 32;
 
-    __shared__ __align__(16) unsigned char sA[2][PQD_M * MI][PQ2_AP];
-    __shared__ __align__(16) unsigned char sAs[2][PQD_M * MI][PQ2_KS / GROUP_SIZE];
-    __shared__ __align__(16) PqwB sB[2];
-    __shared__ __align__(16) PqwS sS[2];
+    __shared__ __align__(16) unsigned char sA[NBUF][PQD_M * MI][PQ2_AP];
+    __shared__ __align__(16) unsigned char sAs[NBUF][PQD_M * MI][PQ2_KS / GROUP_SIZE];
+    __shared__ __align__(16) PqwB sB[NBUF];
+    __shared__ __align__(16) PqwS sS[NBUF];
     __shared__ int sTok[PQD_M * MI];
-
-    if (t < PQD_M * MI)
-        sTok[t] = (sorted_token_ids && (int)t < M_expert) ? sorted_token_ids[cta_m + t] : (int)(cta_m + t);
-    __syncthreads();
-
-    // ZSKIP: the M16 zskip kernel's mask of the weight rows to load.
-    __shared__ unsigned char sLive[ZSKIP ? PQD_ZSKIP_KP : 1];
+    // ZSKIP: the M16 zskip kernel's mask of the weight rows to load, of this
+    // item and (PERSIST) of the next one, which its prefetch skips too.
+    __shared__ unsigned char sLive[PERSIST ? 2 : 1][ZSKIP ? PQD_ZSKIP_KP : 1];
     const bool zskip = ZSKIP && K / 2 <= PQD_ZSKIP_KP;
-    if (zskip) {
+    const unsigned int stages = K / PQ2_KS;
+    auto build_mask = [&](unsigned char* live, const PqsItem& m) {
         for (unsigned int kp = t; kp < K / 2; kp += PQS_THREADS) {
             unsigned int any = 0;
-            for (int r = 0; r < M_expert; ++r)
-                any |= A_packed[(unsigned long long)(unsigned int)sTok[r] * (K / 2) + kp] & 0x77u;
-            sLive[kp] = any != 0;
+            for (int r = 0; r < m.M_expert; ++r) {
+                const unsigned int tok = sorted_token_ids ? (unsigned int)sorted_token_ids[m.cta_m + r] : m.cta_m + r;
+                any |= A_packed[(unsigned long long)tok * (K / 2) + kp] & 0x77u;
+            }
+            live[kp] = any != 0;
         }
-        __syncthreads();
-    }
-
-    auto load = [&](int buf, unsigned int kb) {
-        pqs_load<GATE_UP, MI>(t, sA[buf], sAs[buf], sB[buf], sS[buf], sTok, A_packed, A_scale,
-            B_expert, S_expert, U_expert, US_expert, (unsigned int)M_expert, cta_n, N, K, kb,
-            zskip ? sLive : nullptr);
     };
+    unsigned int cur = 0;   // sLive buffer of this item
 
-    PqdAcc acc[MI];
-    #pragma unroll
-    for (int mi = 0; mi < MI; mi++)
-        #pragma unroll
-        for (int i = 0; i < 4; i++) acc[mi][i][0] = acc[mi][i][1] = acc[mi][i][2] = acc[mi][i][3] = 0.0f;
+    PqsItem it = pqs_item<GATE_UP, MI>(worklist, expert_offsets, B_packed_ptrs, B_scale_ptrs, up, num_experts,
+        item / tiles);
+    // Whether this item's first stages were asked for, and its mask built,
+    // during the last one.
+    bool asked = false;
+    for (;;) {
+        const unsigned int tile = item % tiles;
+        const unsigned int next = item + (PERSIST ? gridDim.x : 0);
+        const bool has_next = PERSIST && next < items;
+        const PqsItem nx = has_next
+            ? pqs_item<GATE_UP, MI>(worklist, expert_offsets, B_packed_ptrs, B_scale_ptrs, up, num_experts, next / tiles)
+            : PqsItem{};
+        if (it.ok && it.full) {
+            // More rows than the slabs the host selects these kernels for: NaN
+            // over them from the downs, as the M16 downs.
+            if constexpr (!GATE_UP) {
+                const __nv_bfloat16 nan = __float2bfloat16(__int_as_float(0x7fc00000));
+                for (int r = 0; r < it.M_expert; ++r)
+                    C[(unsigned long long)(it.cta_m + r) * N + tile * PQW_NT + t] = nan;
+            }
+        } else if (it.ok) {
+            const float scale2 = scale2_vals[it.expert_id];
+            const unsigned int cta_n = tile * (GATE_UP ? PQW_NT / 2 : PQW_NT);
 
-    const unsigned int stages = K / PQ2_KS;
-    // L2 prefetch of stage s (PF): asked for PQS_PF_DIST stages before it is
-    // loaded, the first ones before stage 0's loads.
-    auto prefetch = [&](unsigned int s) {
-        if constexpr (PF)
-            if (s < stages)
-                pqs_prefetch<GATE_UP>(t, B_expert, S_expert, U_expert, US_expert, N, s * PQ2_KS,
-                    zskip ? sLive : nullptr);
-    };
-    for (unsigned int s = 0; s <= PQS_PF_DIST; ++s) prefetch(s);
-    load(0, 0);
-    __syncthreads();
-    for (unsigned int st = 0; st < stages; ++st) {
-        const int buf = st & 1;
-        // Stage st is in buffer buf; the other one's MMAs ended before the
-        // last barrier.
-        prefetch(st + 1 + PQS_PF_DIST);
-        if (st + 1 < stages) load(buf ^ 1, (st + 1) * PQ2_KS);
-        #pragma unroll
-        for (int mi = 0; mi < MI; mi++)
-            pqd_mma_stage<GATE_UP>(acc[mi], *(const PqdA*)&sA[buf][mi * PQD_M], *(const PqdAs*)&sAs[buf][mi * PQD_M],
-                sB[buf], sS[buf], warp_id, lane_id);
-        __syncthreads();
+            if (t < PQD_M * MI)
+                sTok[t] = (sorted_token_ids && (int)t < it.M_expert) ? sorted_token_ids[it.cta_m + t] : (int)(it.cta_m + t);
+            const bool pf_next = PF && has_next && nx.ok && !nx.full;
+            if (zskip && !asked) build_mask(sLive[cur], it);
+            if (zskip && pf_next) build_mask(sLive[cur ^ 1], nx);
+            __syncthreads();
+            const unsigned char* live = zskip ? sLive[cur] : nullptr;
+
+            auto load = [&](int buf, unsigned int kb) {
+                pqs_load<GATE_UP, MI>(t, sA[buf], sAs[buf], sB[buf], sS[buf], sTok, A_packed, A_scale,
+                    it.B, it.S, it.U, it.US, (unsigned int)it.M_expert, cta_n, N, K, kb, live);
+            };
+
+            PqdAcc acc[MI];
+            #pragma unroll
+            for (int mi = 0; mi < MI; mi++)
+                #pragma unroll
+                for (int i = 0; i < 4; i++) acc[mi][i][0] = acc[mi][i][1] = acc[mi][i][2] = acc[mi][i][3] = 0.0f;
+
+            // L2 prefetch of stage s (PF): asked for PQS_PF_DIST stages before it
+            // is loaded, the first ones before stage 0's loads; past the last
+            // stage, the next item's.
+            auto prefetch = [&](unsigned int s) {
+                if constexpr (PF) {
+                    if (s < stages)
+                        pqs_prefetch<GATE_UP>(t, it.B, it.S, it.U, it.US, N, s * PQ2_KS, live, tile, tiles);
+                    else if (pf_next && s - stages <= PQS_PF_DIST)
+                        pqs_prefetch<GATE_UP>(t, nx.B, nx.S, nx.U, nx.US, N, (s - stages) * PQ2_KS,
+                            zskip ? sLive[cur ^ 1] : nullptr, next % tiles, tiles);
+                }
+            };
+            if (!asked)
+                for (unsigned int s = 0; s <= PQS_PF_DIST; ++s) prefetch(s);
+            load(0, 0);
+            __syncthreads();
+            for (unsigned int st = 0; st < stages; ++st) {
+                const int buf = st % NBUF;
+                // Stage st is in buffer buf; the one stage st + 1 loads into
+                // ended its MMAs before the last barrier.
+                prefetch(st + 1 + PQS_PF_DIST);
+                if (st + 1 < stages) load((st + 1) % NBUF, (st + 1) * PQ2_KS);
+                #pragma unroll
+                for (int mi = 0; mi < MI; mi++)
+                    pqd_mma_stage<GATE_UP>(acc[mi], *(const PqdA*)&sA[buf][mi * PQD_M], *(const PqdAs*)&sAs[buf][mi * PQD_M],
+                        sB[buf], sS[buf], warp_id, lane_id);
+                __syncthreads();
+            }
+            #pragma unroll
+            for (int mi = 0; mi < MI; mi++)
+                pqd_epilogue<GATE_UP>(acc[mi], warp_id, lane_id, it.expert_id, scale2, it.cta_m + mi * PQD_M,
+                    it.M_expert - mi * PQD_M, cta_n, N, C, up);
+        }
+        if (!has_next) return;
+        // The loop above asked for the next item's first stages and built its
+        // mask in the other buffer.
+        asked = PF && it.ok && !it.full && nx.ok && !nx.full && stages > 0;
+        if (asked) cur ^= 1;
+        item = next;
+        it = nx;
     }
-    #pragma unroll
-    for (int mi = 0; mi < MI; mi++)
-        pqd_epilogue<GATE_UP>(acc[mi], warp_id, lane_id, expert_id, scale2, cta_m + mi * PQD_M,
-            M_expert - mi * PQD_M, cta_n, N, C, up);
 }
 
 // Down, zero-skipping down and fused gate/up over one row slab (up to 16 rows
@@ -297,6 +379,21 @@ extern "C" __global__ void __launch_bounds__(PQS_THREADS, 2) glm_moe_decode_m32s
 }
 extern "C" __global__ void __launch_bounds__(PQS_THREADS, 2) glm_moe_decode_m32s_gate_up_silu_k128w_l2pf(PQS_GATE_UP_ARGS) {
     pqs_impl<true, false, 2, true>(PQS_TABLES, PQS_UP);
+}
+
+// The prefetching twins as persistent kernels, one CTA per SM
+// (ATLAS_GLM_MOE_DECODE_PERSIST): grid (SMs, 1, 1), arguments as above.
+extern "C" __global__ void __launch_bounds__(PQS_THREADS, 1) glm_moe_decode_m16s_k128w_zskip_l2pf_p(PQS_DOWN_ARGS) {
+    pqs_impl<false, true, 1, true, true>(PQS_TABLES, PqwGateUp{});
+}
+extern "C" __global__ void __launch_bounds__(PQS_THREADS, 1) glm_moe_decode_m16s_gate_up_silu_k128w_l2pf_p(PQS_GATE_UP_ARGS) {
+    pqs_impl<true, false, 1, true, true>(PQS_TABLES, PQS_UP);
+}
+extern "C" __global__ void __launch_bounds__(PQS_THREADS, 1) glm_moe_decode_m32s_k128w_zskip_l2pf_p(PQS_DOWN_ARGS) {
+    pqs_impl<false, true, 2, true, true>(PQS_TABLES, PqwGateUp{});
+}
+extern "C" __global__ void __launch_bounds__(PQS_THREADS, 1) glm_moe_decode_m32s_gate_up_silu_k128w_l2pf_p(PQS_GATE_UP_ARGS) {
+    pqs_impl<true, false, 2, true, true>(PQS_TABLES, PQS_UP);
 }
 
 #undef PQS_DOWN_ARGS

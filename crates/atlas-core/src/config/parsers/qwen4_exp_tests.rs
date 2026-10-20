@@ -369,3 +369,111 @@ fn the_fp8_release_carries_its_block_size_through_too() {
     assert_eq!(q.quant_method, "fp8");
     assert_eq!(q.weight_block_size, vec![128, 128]);
 }
+
+/// nvidia/Qwen3.8-Flash-Next-FP4-Local @ b9ce18a6, `config.json` vendored
+/// whole. Against the FP8 release's config it changes only the quantization
+/// (an MXFP8 backbone, CSF-compressed NVFP4 experts, W4A16 vision MLP and MTP
+/// experts), drops `norm_topk_prob`/`dtype`, adds `ple_embedding_dtype`, and
+/// renames `vision_config.model_type` to "qwen4_exp". None of that may move
+/// the architecture this parser derives.
+#[test]
+fn the_fp4_local_config_parses_to_the_same_architecture() {
+    let json = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test_data/qwen4_exp_flash_next_fp4local_config.json"
+    ));
+    let raw: Value = serde_json::from_str(json).expect("valid json");
+    // The premises: these are the diffs the parser must tolerate.
+    assert_eq!(raw["vision_config"]["model_type"], "qwen4_exp");
+    assert!(raw["text_config"].get("norm_topk_prob").is_none());
+    assert_eq!(raw["text_config"]["ple_embedding_dtype"], "nvfp4");
+
+    let new = crate::config::parse_config(json).expect("FP4-Local parses");
+    let fp8 = crate::config::parse_config(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test_data/qwen4_exp_flash_next_config.json"
+    )))
+    .expect("FP8 release parses");
+    assert_eq!(new.model_type, "qwen4_exp");
+    assert!(
+        new.norm_topk_prob,
+        "absent key must still force renormalisation"
+    );
+    macro_rules! same {
+        ($($f:ident),*) => { $(assert_eq!(new.$f, fp8.$f, stringify!($f));)* };
+    }
+    same!(
+        hidden_size,
+        num_hidden_layers,
+        num_experts,
+        num_experts_per_tok,
+        moe_intermediate_size,
+        layer_types,
+        hc_mult,
+        hc_lowrank,
+        index_topk,
+        ple_layer_ids,
+        ple_embed_dim,
+        ngram_size,
+        heads_per_ngram,
+        ngram_vocab_size_base,
+        make_ngram_vocab_size_divisible_by,
+        split_ngram_parts,
+        vocab_size,
+        head_dim,
+        num_attention_heads,
+        num_key_value_heads
+    );
+    let (v, v8) = (
+        new.vision.as_ref().expect("vision"),
+        fp8.vision.as_ref().expect("vision"),
+    );
+    assert_eq!(
+        (
+            v.depth,
+            v.hidden_size,
+            v.num_heads,
+            v.intermediate_size,
+            v.out_hidden_size
+        ),
+        (
+            v8.depth,
+            v8.hidden_size,
+            v8.num_heads,
+            v8.intermediate_size,
+            v8.out_hidden_size
+        )
+    );
+
+    let q = new
+        .quantization_config
+        .as_ref()
+        .expect("quantization_config");
+    assert_eq!(
+        (q.quant_method.as_str(), q.quant_algo.as_str()),
+        ("modelopt", "MIXED_PRECISION")
+    );
+    let count = |algo: &str, enc: &str| {
+        q.quantized_layers
+            .values()
+            .filter(|s| s.quant_algo == algo && s.weight_scale_encoding == enc)
+            .count()
+    };
+    // 36 GDN x 5 + 12 attention x 5 (q/k/v/o + indexer) + 48 shared x 3 + 27 ViT x 2.
+    assert_eq!(count("MXFP8", ""), 438);
+    // 27 ViT blocks x 2 + merger x 2 + two MTP expert entries.
+    assert_eq!(count("W4A16_NVFP4", ""), 58);
+    assert_eq!(count("NVFP4", "csf"), 48);
+    assert_eq!(count("NVFP4", ""), 1); // the PLE n-gram table
+    for (path, spec) in &q.quantized_layers {
+        if spec.weight_scale_encoding == "csf" {
+            assert!(
+                path.starts_with("model.language_model.layers.") && path.ends_with(".mlp.experts"),
+                "csf on {path}"
+            );
+        }
+        if spec.quant_algo == "MXFP8" {
+            assert_eq!(spec.group_size, 32, "{path}");
+        }
+    }
+}

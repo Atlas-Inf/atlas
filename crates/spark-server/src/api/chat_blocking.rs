@@ -137,11 +137,10 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
             num_beams,
             length_penalty,
             early_stopping,
-            image_pixels: if choice_idx == 0 {
-                image_pixels.clone()
-            } else {
-                Vec::new()
-            },
+            // Each choice is a separate scheduler request. Carry its media
+            // so prefill can prepare vision state even after another choice
+            // has completed or the shared encoder buffers have been reused.
+            image_pixels: image_pixels.clone(),
             max_tokens,
             min_tokens: req.min_tokens,
             ignore_eos: req.ignore_eos,

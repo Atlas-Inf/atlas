@@ -173,6 +173,12 @@ pub fn step_mtp(
         }
     }
     verify_idxs.extend(late_dflash);
+    // Copy drafts before the DFlash plan chooses per-sequence verify widths.
+    if dflash_verify_raw_argmax {
+        for &idx in &verify_idxs {
+            crate::scheduler::copy_drafts::offer(&mut active[idx]);
+        }
+    }
 
     // ── Phase B: Verify with pipelined checkpoint ──
     //

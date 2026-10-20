@@ -220,7 +220,7 @@ impl Model for TestModel {
         Ok(())
     }
     fn compact_sequence(&self, _: &mut SequenceState, _: usize) -> Result<bool> {
-        Ok(true)
+        Ok(false)
     }
     fn detach_slot_for_reuse(&self, _: &mut SequenceState) {}
     fn save_hidden_for_mtp(&self, _: usize, _: u64) -> Result<()> {

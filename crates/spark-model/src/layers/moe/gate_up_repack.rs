@@ -66,7 +66,7 @@ mod native_source;
 mod qwen4exp_fast_tests;
 #[cfg(test)]
 #[path = "gate_up_btile_test_gpu.rs"]
-mod recording;
+pub(super) mod recording;
 #[cfg(test)]
 #[path = "gate_up_btile_shared_tests.rs"]
 mod shared_tests;

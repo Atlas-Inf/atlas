@@ -26,6 +26,8 @@
 pub(crate) mod block_mgmt;
 mod block_table_upload;
 pub(crate) mod decode_pieces;
+mod dflash_capture_batch;
+pub(crate) mod dflash_ctx_window;
 mod draft_assist;
 pub(crate) mod qsa_commit_table;
 pub use draft_assist::DraftAssist;
@@ -116,3 +118,7 @@ pub use types::TransformerModel;
 pub fn ep_protocol_v2_requested() -> bool {
     matches!(std::env::var("ATLAS_EP_PROTOCOL").as_deref(), Ok("v2"))
 }
+
+#[cfg(test)]
+#[path = "impl_a2/idle_command_fixture.rs"]
+mod test_fixture;

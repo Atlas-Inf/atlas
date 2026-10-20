@@ -38,18 +38,8 @@ extern "C" __global__ void glm_latent_cache_write_fp8g128(
     __shared__ float amax[128];
     const long long slot = slots[blockIdx.x];
     if (slot < 0) return;
-    const unsigned int physical = (unsigned int)(slot / block_size);
-    const unsigned int offset = (unsigned int)(slot % block_size);
-    unsigned char* values = const_cast<unsigned char*>(glm_fp8g128_values(cache, physical, offset, block_size));
-    float* scales = const_cast<float*>(glm_fp8g128_scales(cache, physical, offset, block_size));
-    const __nv_bfloat16* src = key + (size_t)blockIdx.x * key_stride;
-    const int tid = threadIdx.x;
-    for (int g = 0; g < 4; ++g) {
-        float sc;
-        values[g * 128 + tid] =
-            glm_fp8g128_quantize(__bfloat162float(src[g * 128 + tid]), amax, &sc);
-        if (tid == 0) scales[g] = sc;
-    }
+    glm_latent_cache_write_fp8g128_row<false>(key + (size_t)blockIdx.x * key_stride, cache, slot,
+                                              block_size, amax);
 }
 
 // Dequantize one owner's logical tokens [0, tokens) into contiguous BF16

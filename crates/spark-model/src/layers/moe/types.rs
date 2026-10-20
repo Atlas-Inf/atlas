@@ -279,6 +279,8 @@ pub struct MoeLayer {
     /// (`ATLAS_GLM_MOE_DECODE_M16=1`, else null) and the K128W control
     /// (`ATLAS_GLM_MOE_DECODE_K128W=1`).
     pub(super) decode_m16: decode_m16::DecodeM16,
+    /// `ATLAS_GLM_MOE_ROUTE_FUSE`: the two-launch routing chain (null off).
+    pub(super) route_fuse: route_fuse::RouteFuse,
     pub(super) m5_projections: m5_projections::M5Projections,
     pub(super) moe_nvfp4_mmq_gate_up_k: KernelHandle,
     pub(super) moe_nvfp4_mmq_down_k: KernelHandle,

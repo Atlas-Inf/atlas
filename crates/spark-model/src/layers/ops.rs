@@ -92,8 +92,14 @@ mod glm_indexer;
 mod glm_indexer_dynamic;
 #[path = "ops/glm_kv_shard.rs"]
 mod glm_kv_shard;
+#[path = "ops/glm_mla_fuse.rs"]
+mod glm_mla_fuse;
 #[path = "ops/glm_router_bn4.rs"]
 mod glm_router_bn4;
+#[path = "ops/glm_sparse_canonical.rs"]
+mod glm_sparse_canonical;
+#[path = "ops/glm_sparse_native.rs"]
+mod glm_sparse_native;
 #[path = "ops/glm_sparse_prefill_tc.rs"]
 mod glm_sparse_prefill_tc;
 pub use glm_router_bn4::glm_router_bn4;
@@ -105,6 +111,9 @@ mod hyper_connection_dispatch;
 mod hyper_connection_lowrank;
 #[path = "ops/kda.rs"]
 mod kda;
+#[cfg(all(test, feature = "cuda"))]
+#[path = "ops/kda_commit_tests.rs"]
+mod kda_commit_tests;
 #[path = "ops/kda_indexed.rs"]
 mod kda_indexed;
 // Raw-GEMM plumbing for the lowrank path, split for the 500-LoC cap.
@@ -305,6 +314,9 @@ pub use glm_hc_prefill::*;
 pub use glm_indexer::*;
 pub use glm_indexer_dynamic::*;
 pub use glm_kv_shard::*;
+pub use glm_mla_fuse::*;
+pub use glm_sparse_canonical::*;
+pub use glm_sparse_native::*;
 pub use glm_sparse_prefill_tc::*;
 pub use hyper_connection::*;
 pub use hyper_connection_dispatch::*;

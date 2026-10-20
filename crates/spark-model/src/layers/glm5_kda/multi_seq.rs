@@ -114,7 +114,7 @@ impl Glm5KdaLayer {
                 stream,
             )?;
         }
-        self.hc_pre(&self.hc.attn, hidden, m, ctx, stream)?;
+        self.hc_pre(&self.hc.attn, hidden, m, None, ctx, stream)?;
 
         let normed = ctx.buffers.norm_output();
         ops::rms_norm(
@@ -319,7 +319,7 @@ impl Glm5KdaLayer {
         // Keep mixer and FFN batching independently switchable for diagnosis.
         // Atlas's K=3 FFN path emits a contiguous [N,H] result, so mHC can
         // consume the entire batch once.
-        self.hc_pre(&self.hc.ffn, hidden, m, ctx, stream)?;
+        self.hc_pre(&self.hc.ffn, hidden, m, None, ctx, stream)?;
         ops::rms_norm(
             ctx.gpu,
             self.rms_norm_k,

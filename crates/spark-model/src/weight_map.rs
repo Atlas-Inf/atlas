@@ -29,6 +29,8 @@ mod model_b;
 mod moe;
 #[path = "weight_map/mxfp8.rs"]
 mod mxfp8;
+#[path = "weight_map/mxfp8_load.rs"]
+mod mxfp8_load;
 #[path = "weight_map/nemotron.rs"]
 mod nemotron;
 #[path = "weight_map/nvfp4_detect.rs"]
@@ -52,11 +54,21 @@ mod tests;
 
 pub use expert::*;
 pub(crate) use fp8_dequant::*;
+#[cfg(test)]
+#[path = "weight_map/test_checkpoint.rs"]
+pub(crate) mod test_checkpoint;
+
 pub use loaders_fp8::*;
 pub use loaders_mtp::*;
 pub use model_a::*;
 pub use moe::*;
-pub use mxfp8::Mxfp8Weight;
+#[cfg(test)]
+pub(crate) use mxfp8::mxfp8_to_bf16_host;
+pub use mxfp8::{Mxfp8Weight, dequant_mxfp8_to_bf16};
+pub use mxfp8_load::{
+    RawMxfp8, mxfp8_cols_twin, mxfp8_geometry, mxfp8_row_range_twin, mxfp8_rows_twin, raw_mxfp8,
+    release_raw_mxfp8,
+};
 pub use nemotron::*;
 pub use nvfp4_detect::*;
 pub use quantize_fns::*;

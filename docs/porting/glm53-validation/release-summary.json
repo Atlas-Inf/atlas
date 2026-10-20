@@ -1,0 +1,80 @@
+{
+  "canonical_gpu": {
+    "gates": 10,
+    "record": "final-qualification-results.json",
+    "status": "PASS"
+  },
+  "cpu": {
+    "record": "release-cpu-results.json",
+    "scope": "CPU build/link stubs; all-features tests compiled but not executed.",
+    "status": "PASS",
+    "tests": {
+      "failed": 0,
+      "ignored": 148,
+      "passed": 7146
+    }
+  },
+  "excluded": [
+    "Checkpoint-native GLM MTP",
+    "New Strix Halo support"
+  ],
+  "formal_evidence_attachment": {
+    "archive": "final-qualification-evidence.tar.gz",
+    "bytes": 1624671,
+    "index_sha256": "f012e8a407614263e6ccd8fe5fc53eacd7dcb80336bb7d043e1618faf58d897f",
+    "payload_files": 755,
+    "sha256": "56f6285ea2b772c1427eee1e56e762b51147c483749ae0b558393596db124fcf"
+  },
+  "limitations": [
+    "Configured FP8 cache and bounded aggregate KV pool emit advisory warnings.",
+    "Teardown/backend allocation sweeps reclaim unregistered allocations; retained as an ownership-accounting limitation, not claimed absent. All measured models exited0 and GPU idle was verified.",
+    "No broader model-quality, enlarged capacity, kernel-specific dispatch, or sustained leak-freedom claim.",
+    "Fresh parity covers C1/C4 and C4 repeats with DFlash enabled; no fresh DFlash-versus-plain decode equivalence claim.",
+    "Disconnect/reuse and chunk progress are observed; no per-allocation or per-request retirement trace is claimed.",
+    "No 2.5M occupied-token qualification or general model-quality guarantee.",
+    "Historical capacity/performance measurements retain their original revisions.",
+    "Contribution rights and CLA remain separate; no publication or maintainer acceptance asserted."
+  ],
+  "measured_source_revision": "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e",
+  "measured_source_tree": "4027d7a9cde20bf7bc68c05d58f0ecfb0e58b1b5",
+  "paired_glm": {
+    "both_rank_binary_sha256": {
+      "head": "4f03c401645b087f674874338688e1dc69787131557c7526117976ce6e44ef13",
+      "worker": "4f03c401645b087f674874338688e1dc69787131557c7526117976ce6e44ef13"
+    },
+    "build": {
+      "binary_sha256": "4f03c401645b087f674874338688e1dc69787131557c7526117976ce6e44ef13",
+      "completed_unix": 1792079845.0,
+      "image_id": "sha256:c84fcda5a0fec39d1eac240f0109abbc72e7af88795bf5d953e6a4ad4492c015",
+      "revision": "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e"
+    },
+    "record": "release-glm-log-review.json",
+    "scope": "Bounded API/schema/tools, C1/C4 repeated parity, disconnect/reuse,6404-token multichunk needle and actual resident/NVMe restoration; both ranks exit0/no fatal diagnostics/no swap and verified original-service restoration.",
+    "status": "PASS"
+  },
+  "pr_count": 1,
+  "schema": 1,
+  "security_update": {
+    "dependency": "rustls",
+    "scope": "Cargo.lock only",
+    "version": "0.23.46"
+  },
+  "static": {
+    "record": "release-static-results.json",
+    "status": "PASS"
+  },
+  "status": "BOUNDED_TECHNICAL_VALIDATION_PASS",
+  "superseded_campaign": {
+    "revision": "9269a2fbbb9131ba66a3b45c7b977d5ccd341bcf",
+    "status": "Stopped before completion for the requested security update; no results reused."
+  },
+  "supplemental_evidence_attachment": {
+    "archive": "release-supplemental-evidence.tar.gz",
+    "bytes": 1170668,
+    "files": 395,
+    "index_sha256": "3b254952b37a564d9b08d9e6b5249c813075f676f5bade3a9e8693d41a4c7921",
+    "scope": "Existing final-source CPU/static logs and bounded synthetic GLM runs, both-rank logs/memory/results, identities/configuration, source pins and restoration. No models, binaries, caches or production user prompts. Formal ten-gate raw evidence has its separate attachment. All prior failed attempts remain preserved outside this bounded attachment.",
+    "sha256": "008e2e4f5400a7f6fc10830d0e14582120d491044ca0ffb5002a3aed09095e6f"
+  },
+  "target": "Atlas-Inf/atlas main"
+}

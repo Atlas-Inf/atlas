@@ -1,0 +1,151 @@
+{
+  "title": "Shared grammar compiler scaling and representational bounds",
+  "base": "7ffd183f210708d5b1afba1e046049f14ad498c7",
+  "review_branch": "review/glm53-shared-grammar",
+  "status": "Prepared local compiler-only prerequisite; not pushed or submitted",
+  "original_author": {
+    "name": "Jason McCartney",
+    "email": "jmac@theroot.org"
+  },
+  "extraction_by": {
+    "name": "Reiner Schmidt",
+    "email": "reinermschmidt@gmail.com"
+  },
+  "license": "AGPL-3.0-only; existing Atlas/XGrammar attribution retained",
+  "sources": [
+    {
+      "review_commit": "8d5314a871d0a7e71c6957752715a1e9fcaa4f2b",
+      "original_commit": "5f5e8e9751d1ebd9358b1832cdafd4e7fb17f30e",
+      "repository": "https://github.com/Enntity/atlas",
+      "contribution": "Shared rule FSM storage, packed-row reachability, and one per-grammar productivity table; scaling tests"
+    },
+    {
+      "review_commit": "a5ea2ef166f8bcfe686b43e4d5646bc9d4c87814",
+      "original_commit": "4030dd6f779c18af9936469d1a1d98785c554e78",
+      "repository": "https://github.com/Enntity/atlas",
+      "contribution": "Fallible grammar optimization and FSM representation guards; grammar-memory accounting; configurable compiler size cap; golden-mask and oversized-input tests"
+    }
+  ],
+  "extraction": "Exact crates/xgrammar path delta from the Atlas base through the second source commit. No scheduler, GLM model, kernel, server policy, or GPU changes.",
+  "behavior": [
+    "Share complete FSM storage across rule views instead of cloning it.",
+    "Build and reuse grammar productivity metadata; walk packed FSM rows directly.",
+    "Reject grammar rule counts and bounded repetition indices that cannot be represented by i16 FSM edges.",
+    "Expose a configurable compiled schema size limit, checked before cache insertion; preserve the compiler default of usize::MAX.",
+    "Include rule views, state maps, and productivity metadata in memory accounting. This makes existing byte-budget eviction more accurate."
+  ],
+  "deferred": [
+    "The server 1 MiB schema text limit, 64 MiB compiled-schema limit, and 512 MiB grammar cache budget are not included. Upstream server settings remain unchanged.",
+    "HTTP 400 propagation, strict response_format enforcement, and compiler panic containment from the integrated branch are not included. Base Atlas compile_grammar_state falls back to unconstrained generation on compilation errors; this prerequisite does not repair that existing behavior.",
+    "The GLM-specific grammar state and speculative scheduler changes remain in the later GLM integration.",
+    "No GPU behavior or GLM runtime qualification is claimed for this compiler-only extraction.",
+    "Attribution does not establish additional contributor CLA or commercial relicensing rights."
+  ],
+  "validation": {
+    "state": "passed",
+    "environment": {
+      "ATLAS_SKIP_BUILD": "1",
+      "CUDARC_CUDA_VERSION": "13000",
+      "LIBRARY_PATH": "<optional CPU-test NCCL stub directory>",
+      "LD_LIBRARY_PATH": "<optional CPU-test NCCL stub directory>"
+    },
+    "commands": [
+      {
+        "command": "cargo test --locked --offline -p xgrammar",
+        "result": "832 unit tests passed; 2 doctests passed; 1 doctest ignored; no failures"
+      },
+      {
+        "command": "cargo clippy --offline --locked -p xgrammar --tests",
+        "result": "passed"
+      },
+      {
+        "command": "cargo fmt --all -- --check",
+        "result": "passed"
+      },
+      {
+        "command": "git diff --check",
+        "result": "passed"
+      },
+      {
+        "command": "RUSTDOCFLAGS=\"-D warnings\" cargo doc --locked --offline -p xgrammar --no-deps",
+        "result": "passed"
+      },
+      {
+        "command": "typos crates/xgrammar docs/porting/shared-grammar-extraction.json",
+        "result": "passed"
+      }
+    ],
+    "log_directory": "atlas-glm53-port-audit/pr-readiness-20261012/shared-grammar",
+    "source_equivalence": "All 17 extracted Rust files byte-identical to the source commit; SPDX headers and 500-line cap checked."
+  },
+  "files": [
+    {
+      "path": "crates/xgrammar/src/api/compiler.rs",
+      "sha256": "fab8a8ef6c450b6431bb68ff588af58c165d85d72b5ac00282fc5093fd4af42e"
+    },
+    {
+      "path": "crates/xgrammar/src/compiler/compiled_grammar.rs",
+      "sha256": "87fe36d79d4c6b4693359cb4d843dbeaac29c7fd0d239dc27c88249db8609819"
+    },
+    {
+      "path": "crates/xgrammar/src/compiler/compiler.rs",
+      "sha256": "d6c665c84deef255c05de30708f6efb49d7181dfcfed3492367f0c1980f18219"
+    },
+    {
+      "path": "crates/xgrammar/src/compiler/tests/compile_tests.rs",
+      "sha256": "50fb1f18755daca951d6877b3bc68c826a6b811e6cb018abf9fa1a7757df54a3"
+    },
+    {
+      "path": "crates/xgrammar/src/compiler/tests/golden_tests.rs",
+      "sha256": "988392b8eeda8596a80875e7ba754aebea4340e0fbd18b3b5493a26475702660"
+    },
+    {
+      "path": "crates/xgrammar/src/compiler/tests/mod.rs",
+      "sha256": "961221eba62f20356d8c98c9a85114ddabe7aedf167e79e4f2a060c3014e0510"
+    },
+    {
+      "path": "crates/xgrammar/src/compiler/tests/scale_tests.rs",
+      "sha256": "e3827e2a3a51607b93889f04d50f3f3e359022cd042e2791e691e49f09b563f0"
+    },
+    {
+      "path": "crates/xgrammar/src/earley/mod.rs",
+      "sha256": "64b62f171a420654de6414348b06dc1f9931b432ea1008ac70652a258d0e589c"
+    },
+    {
+      "path": "crates/xgrammar/src/earley/parser.rs",
+      "sha256": "1dabd389bb581cdd4fb6c5f8936de54db375f99eb52e1d20d723e383f09b930c"
+    },
+    {
+      "path": "crates/xgrammar/src/earley/prune.rs",
+      "sha256": "befce92172cc1af0066cbcb72273440dbcb6d57921e715e650b0985a1d0d3a36"
+    },
+    {
+      "path": "crates/xgrammar/src/fsm/compact.rs",
+      "sha256": "089c3012f0554e215af242b22ecd8e018e888112f093af4b602cab9304b92125"
+    },
+    {
+      "path": "crates/xgrammar/src/fsm/compact_with_start_end.rs",
+      "sha256": "1cf77f6509462a2288863a96f5cfdaf3f2cd582ef6693145f8824dee93820fa0"
+    },
+    {
+      "path": "crates/xgrammar/src/grammar/data.rs",
+      "sha256": "4adbc431aae895ccfa2114284ecf6b8edcc57a04c1f7985e5d24badbd7e0a8d3"
+    },
+    {
+      "path": "crates/xgrammar/src/grammar/functor/fsm_builder.rs",
+      "sha256": "d67ee4aa045900f3088f49f37babbb107483ee8961b21661f3a5b53811a7a49b"
+    },
+    {
+      "path": "crates/xgrammar/src/grammar/functor/mod.rs",
+      "sha256": "52aa9551baacdf239cc785466402abb49329c51308287e2653c2fbd31f87fb49"
+    },
+    {
+      "path": "crates/xgrammar/src/grammar/functor/optimizer.rs",
+      "sha256": "ffe0b811aaf8ec826c081e2d498f31194851d2a9124a082b113e96d034ac548a"
+    },
+    {
+      "path": "crates/xgrammar/src/grammar/functor/optimizer_pipeline.rs",
+      "sha256": "92e4cea80862f44dc0178829939f5c6eb9281ded415ee0267f523a56b5c1ae98"
+    }
+  ]
+}

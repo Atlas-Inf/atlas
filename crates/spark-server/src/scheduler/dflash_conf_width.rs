@@ -24,11 +24,13 @@
 //! Verification is exact at any width, so only the rows per step change.
 //! The drafter has already run; the cut rows are simply never launched.
 //!
-//! The table cannot drift: every cell decays each verify back towards its
-//! confidence bin's rate over all depths (the first draft is verified at any
-//! confidence, so every bin stays observed), and every
+//! The table cannot drift: every cell decays each verify of its kind back
+//! towards its confidence bin's rate over all depths (the first draft is
+//! verified at any confidence, so every bin stays observed), and every
 //! `ATLAS_DFLASH_CONF_PROBE`-th step (default 64, 0 = never) verifies the
-//! full width, which observes the positions the rule had cut.
+//! full width, which observes the positions the rule had cut. Copied drafts
+//! (`copy_drafts`) are a kind of their own: their verifies decay and probe
+//! only the copy bins, and the drafter's only the drafter's.
 //!
 //! `ATLAS_DFLASH_CONF_LOG=1` logs each verify's confidences beside its
 //! outcome (with or without the width rule) for offline fitting.
@@ -56,24 +58,53 @@ use super::dflash_width::MAX_DRAFTS;
 const EDGES: [f32; 10] = [
     -1.5, -1.0, -0.7, -0.5, -0.35, -0.22, -0.12, -0.06, -0.03, -0.01,
 ];
-const BINS: usize = EDGES.len() + 1;
+/// The confidences a draft copied from the context carries (`copy_drafts`):
+/// above any log-probability, so copies bin apart from the drafter's picks
+/// and are priced by their own measured acceptance, one bin for copies of
+/// the prompt and one for copies of the reply (which measure far apart).
+pub(crate) const COPY_CONF: f32 = 1.0;
+pub(crate) const COPY_REPLY_CONF: f32 = 2.0;
+const COPY_BIN: usize = EDGES.len() + 1;
+const COPY_REPLY_BIN: usize = COPY_BIN + 1;
+const BINS: usize = COPY_REPLY_BIN + 1;
 /// Acceptance per bin before any verify: a drafter's top-1 probability
 /// overstates acceptance (knapcio's calibration of this drafter, the same
 /// table as `EDGES`, reads 0.96 only above p = 0.99), so the prior is a
 /// rounded reading of that table's first-position row (`g[0][7..]`). Serving
 /// replaces it within a few hundred verifies.
+///
+/// The copy bins' priors are per-draft rates (each draft's chance once the
+/// ones before it were kept) read from MiaAI-Lab's TensorFold recipe, which
+/// measured the share of copied drafts kept over 39 live code replies at five
+/// drafts a round (patch 0032; see `copy_drafts`): 74% for copies of the
+/// prompt and 23% for copies of the reply. A per-draft rate `p` keeps
+/// `(p + p^2 + .. + p^5) / 5` of five drafts: 0.74 at `p` = 0.90 and 0.23 at
+/// `p` = 0.55. Not yet measured on this engine.
 const PRIOR: [f32; BINS] = [
-    0.12, 0.16, 0.25, 0.35, 0.42, 0.48, 0.55, 0.62, 0.68, 0.76, 0.95,
+    0.12, 0.16, 0.25, 0.35, 0.42, 0.48, 0.55, 0.62, 0.68, 0.76, 0.95, 0.90, 0.55,
 ];
 /// Pseudo-observations behind the prior in a bin's all-depth rate, and
 /// behind that rate in one depth's cell.
 const PRIOR_WEIGHT: f32 = 8.0;
 const POOL_WEIGHT: f32 = 8.0;
-/// Per-verify decay of every cell (about the last two hundred verifies).
+/// Per-verify decay of the cells a verify belongs to (about the last two
+/// hundred of its kind).
 const DECAY: f32 = 0.995;
 
 fn bin(conf: f32) -> usize {
-    EDGES.iter().filter(|&&edge| conf >= edge).count()
+    if conf >= COPY_REPLY_CONF {
+        COPY_REPLY_BIN
+    } else if conf >= COPY_CONF {
+        COPY_BIN
+    } else {
+        EDGES.iter().filter(|&&edge| conf >= edge).count()
+    }
+}
+
+/// Whether drafts with confidences `conf` were copied from the context
+/// (`copy_drafts`) rather than proposed by the drafter.
+pub(crate) fn is_copy(conf: &[f32]) -> bool {
+    conf.first().is_some_and(|&c| c >= COPY_CONF)
 }
 
 /// Decayed acceptance counts per draft position and confidence bin.
@@ -117,9 +148,21 @@ impl Calibration {
 
     /// One verify of the first `drafted` drafts that accepted `accepted`.
     /// Position `j` is observed only when every earlier draft was accepted.
+    /// A drafter's verify decays the drafter's bins, a copy's only its own
+    /// copy bin: neither kind fades or moves the other's evidence.
     pub(crate) fn record(&mut self, conf: &[f32], drafted: usize, accepted: usize) {
+        let decayed = if is_copy(conf) {
+            let b = bin(conf[0]);
+            b..b + 1
+        } else {
+            0..COPY_BIN
+        };
         for cells in [&mut self.verified, &mut self.accepted] {
-            cells.iter_mut().flatten().for_each(|cell| *cell *= DECAY);
+            for row in cells.iter_mut() {
+                row[decayed.clone()]
+                    .iter_mut()
+                    .for_each(|cell| *cell *= DECAY);
+            }
         }
         let observed = drafted.min(accepted + 1).min(MAX_DRAFTS);
         for (depth, &c) in conf.iter().take(observed).enumerate() {
@@ -176,11 +219,14 @@ fn row_ms() -> f32 {
     step_ms(1, 4) - step_ms(1, 3)
 }
 
-/// The calibration and the verify counter behind the periodic full width.
+/// The calibration and the verify counters behind the periodic full width:
+/// one for verifies with drafter owners, one for verifies of copies alone,
+/// so copies never move the drafter's probe schedule.
 #[derive(Default)]
 pub(crate) struct Policy {
     pub(crate) calibration: Calibration,
     steps: u64,
+    copy_steps: u64,
 }
 
 impl Policy {
@@ -199,8 +245,13 @@ impl Policy {
         if max == 0 || owners.len() == 0 || !owners.clone().all(measured) {
             return None;
         }
-        self.steps += 1;
-        if params.probe > 0 && self.steps.is_multiple_of(params.probe) {
+        let steps = if owners.clone().all(is_copy) {
+            &mut self.copy_steps
+        } else {
+            &mut self.steps
+        };
+        *steps += 1;
+        if params.probe > 0 && steps.is_multiple_of(params.probe) {
             return Some(max);
         }
         let n = owners.len();

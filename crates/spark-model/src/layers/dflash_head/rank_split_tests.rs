@@ -30,6 +30,7 @@ fn geometry(parts: Parts) -> Geometry {
         ctx_in: 0,
         ctx_kv: 0,
         ctx: CtxRows::default(),
+        topk: false,
     }
 }
 
@@ -485,3 +486,6 @@ mod batch;
 
 #[path = "rank_split_ctx_tests.rs"]
 mod ctx;
+
+#[path = "rank_split_topk_tests.rs"]
+mod topk;

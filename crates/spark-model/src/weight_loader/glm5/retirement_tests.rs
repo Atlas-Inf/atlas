@@ -199,3 +199,34 @@ fn cleanup_keeps_both_failed_attempt_and_later_cleanup_error_visible() {
     assert_eq!(gpu.frees.lock().iter().filter(|&&p| p == down).count(), 1);
     assert!(store.is_empty());
 }
+
+/// A source the loader already reclaimed (FP4-Local's expanded MXFP8/FP8)
+/// owns nothing: an allocation now at its address (a resident arena) is not
+/// refused as aliasing it, live tensors still are, and the rebuilt store
+/// drops it so teardown does not free it again.
+#[test]
+fn reclaimed_sources_are_not_live_owners() {
+    let gpu = MockGpuBackend::new();
+    let mut store = store(&gpu);
+    let (down, gate) = (
+        store.get("down").unwrap().ptr,
+        store.get("gate").unwrap().ptr,
+    );
+    let before = RetirementLog::new(&store, &gpu).unwrap();
+    assert!(before.disjoint_live(down, 16, &gpu).is_err());
+    drop(before);
+    store.reclaim(&gpu, "down").unwrap();
+    let log = RetirementLog::new(&store, &gpu).unwrap();
+    log.disjoint_live(down, 16, &gpu)
+        .expect("a reclaimed source is not a live owner");
+    assert!(
+        log.disjoint_live(gate, 16, &gpu).is_err(),
+        "live gate still aliases"
+    );
+    log.finish().rebuild(&mut store, &gpu).unwrap();
+    let mut names: Vec<_> = store.names().collect();
+    names.sort();
+    assert_eq!(names, ["gate", "scale"]);
+    store.release(&gpu).unwrap();
+    assert_eq!((gpu.alloc_count(), gpu.invalid_free_count()), (0, 0));
+}

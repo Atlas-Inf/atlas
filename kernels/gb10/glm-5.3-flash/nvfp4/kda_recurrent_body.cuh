@@ -110,4 +110,3 @@ static __device__ __forceinline__ void atlas_kda_recurrent_body(
         __syncthreads();
     }
 }
-

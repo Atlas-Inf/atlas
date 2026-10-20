@@ -144,11 +144,14 @@ pub(super) fn plan_verify(
         plan.decode_rows.clear();
         return plan;
     }
-    // Surplus drafts past the ladder depth are not verified (their
-    // confidences are left as they were, as before: D-Cut then reads the
-    // sequence as unmeasured).
+    // Surplus drafts past the ladder depth are not verified. Keep the
+    // copy-draft metadata aligned for DFlash; MTP leaves confidences as
+    // before so D-Cut reads a truncated sequence as unmeasured.
     for &idx in &plan.batch {
         active[idx].pending_drafts.truncate(ladder_nd);
+        if dflash_verify_raw_argmax {
+            crate::scheduler::copy_drafts::cut_conf(&mut active[idx]);
+        }
     }
     let rows = ladder_nd + 1;
     if dflash_verify_raw_argmax {

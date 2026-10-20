@@ -27,8 +27,24 @@
 // or a launch failed after a fenced stage): block 0 traps on it at launch and
 // while it waits, rather than complete ops the peer never sees.
 //
-// Not on the PDL list: it must start after its stream predecessors, and its
-// successors must not read dst before it completes.
+// Programmatic dependent launch: every block starts with atlas_pdl_enter(),
+// so a PDL-launched successor (which waits in its own entry) is scheduled
+// while this kernel waits for the peer, and never reads dst before it
+// completes. The runtime's generic PDL list leaves this kernel out: spark-comm
+// launches it itself, with the PDL attribute only when the kernel stages the
+// payload (sm_stage != 0); after a copy-engine stage the predecessor is a copy
+// and the attribute would buy nothing.
+//
+// SM staging (sm_stage != 0, ATLAS_RDMA_ONESHOT_SM_STAGE): the kernel copies
+// src into the staging buffer itself instead of the copy engine, so the
+// producer -> all-reduce -> consumer chain is kernels only. Each block waits
+// until the proxy has drained the previous send (`stage` == 0), stores its
+// part of the payload (each thread exactly the elements it later lands, so an
+// in-place src == dst is read before it is overwritten), fences at system
+// scope and counts itself in state[3]; block 0 publishes `stage` once every
+// block has. sm_stage 1 stores with st.global.wt (write through the L2 to
+// system memory: what the NIC reads), 2 with plain stores (a stress-test
+// control for the stale reads seen with SM staging before).
 //
 // Prior art (ideas only, no code; docs/glm-prior-art.md): the protocol --
 // pinned parity receive slots, a host proxy that WRITEs each stripe then a
@@ -41,6 +57,7 @@
 // glm-5.3-flash-4x-gx10, experimental/arx/arx_vllm.cu, PR #4; that directory
 // carries no license, so nothing of it is reproduced here).
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 #include <stdint.h>
 
@@ -78,6 +95,31 @@ __device__ __forceinline__ unsigned short oneshot_ld_u16(const unsigned short* p
     return v;
 }
 
+__device__ __forceinline__ uint32_t oneshot_ld_acquire_u32(const uint32_t* p) {
+    uint32_t v;
+    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+
+// Staging stores into pinned host memory read by the NIC: write-through
+// (mode 1) or plain (mode 2).
+__device__ __forceinline__ void oneshot_st_v4(uint4* p, uint4 v, uint32_t mode) {
+    if (mode == 1) {
+        asm volatile("st.global.wt.v4.u32 [%0], {%1, %2, %3, %4};"
+                     ::"l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
+    } else {
+        *p = v;
+    }
+}
+
+__device__ __forceinline__ void oneshot_st_u16(unsigned short* p, unsigned short v, uint32_t mode) {
+    if (mode == 1) {
+        asm volatile("st.global.wt.u16 [%0], %1;" ::"l"(p), "h"(v) : "memory");
+    } else {
+        *p = v;
+    }
+}
+
 __device__ __forceinline__ uint64_t oneshot_now() {
     uint64_t t;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
@@ -110,24 +152,90 @@ __device__ __forceinline__ bool oneshot_arrived(
 }
 
 extern "C" __global__ void rdma_oneshot_bf16(
-    __nv_bfloat16* __restrict__ dst,
+    __nv_bfloat16* dst,         // may alias src (in place)
     const unsigned char* recv,  // receive slot 0; slot 1 is slot_stride bytes on
     uint64_t slot_stride,
     uint32_t bytes,
     uint32_t add,
     const uint64_t* flags,      // one per rail, ONESHOT_FLAG_STRIDE words apart
     uint32_t rails,
-    uint64_t* state,            // device: [0] seq, [1] finished blocks (u32), [2] go
+    uint64_t* state,            // device: [0] seq, [1] finished blocks (u32), [2] go,
+                                // [3] staged blocks (u32)
     uint32_t* stage,            // host `stage` word to publish, or null
     uint64_t* poison,
-    uint64_t timeout_ns          // 0 = wait forever
+    uint64_t timeout_ns,         // 0 = wait forever
+    const unsigned char* src,   // sm_stage: this rank's payload (device)
+    unsigned char* sbuf,        // sm_stage: the staging buffer S (pinned)
+    uint32_t sm_stage           // 0: S already staged; 1: stage, write-through; 2: plain
 ) {
+    atlas_pdl_enter();
     uint64_t* go = state + 2;
     const uint64_t seq = *(volatile uint64_t*)state + 1;
+    const uint32_t n = bytes / 2;
+    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t stride = gridDim.x * blockDim.x;
+    // The 16-byte path lands n8 * 8 elements by uint4, the rest one by one.
+    const bool vec = (reinterpret_cast<uintptr_t>(dst) & 15) == 0;
+    const uint32_t n8 = vec ? n / 8 : 0;
+    if (sm_stage != 0) {
+        if (threadIdx.x == 0) {
+            const uint64_t t0 = oneshot_now();
+            for (uint32_t spin = 1; oneshot_ld_acquire_u32(stage) != 0; ++spin) {
+                if (spin % 64 == 0) {
+                    if (oneshot_ld_acquire(poison) != 0) {
+                        __trap();
+                    }
+                    if (timeout_ns != 0 && oneshot_now() - t0 > timeout_ns) {
+                        oneshot_poison(poison, ONESHOT_POISON_TIMEOUT | seq);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        // The same element -> thread mapping as the landing below, so an
+        // in-place src == dst (same alignment) is read before it is
+        // overwritten. A src misaligned under an aligned dst is another
+        // buffer (peer exchange), copied element by element.
+        const bool vsrc = vec && (reinterpret_cast<uintptr_t>(src) & 15) == 0;
+        const uint32_t first = vsrc ? n8 * 8 : 0;
+        if (vsrc) {
+            const uint4* s4 = reinterpret_cast<const uint4*>(src);
+            uint4* o4 = reinterpret_cast<uint4*>(sbuf);
+            for (uint32_t i = tid; i < n8; i += stride) {
+                oneshot_st_v4(o4 + i, s4[i], sm_stage);
+            }
+        }
+        const unsigned short* s1 = reinterpret_cast<const unsigned short*>(src);
+        unsigned short* o1 = reinterpret_cast<unsigned short*>(sbuf);
+        for (uint32_t i = first + tid; i < n; i += stride) {
+            oneshot_st_u16(o1 + i, s1[i], sm_stage);
+        }
+        // Every thread's stores are performed at system scope before its
+        // block counts itself; block 0 publishes once all blocks have.
+        __threadfence_system();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            uint32_t* staged = reinterpret_cast<uint32_t*>(state + 3);
+            asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(staged) : "memory");
+            if (blockIdx.x == 0) {
+                for (;;) {
+                    uint32_t c;
+                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(c) : "l"(staged) : "memory");
+                    if (c == gridDim.x) {
+                        break;
+                    }
+                }
+                // No block counts the next op before this kernel completes.
+                *(volatile uint32_t*)staged = 0;
+                __threadfence_system();
+            }
+        }
+    }
     if (threadIdx.x == 0) {
         if (stage != nullptr && blockIdx.x == 0) {
-            // The staging copy completed before this kernel started (stream
-            // order), so the proxy may read it once it sees the size.
+            // The payload is in S: staged by the stream before this kernel
+            // started, or by every block above. The proxy may read it once
+            // it sees the size.
             asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(stage), "r"(bytes) : "memory");
         }
         // After the publish, which starts our send.
@@ -156,16 +264,11 @@ extern "C" __global__ void rdma_oneshot_bf16(
     }
     __syncthreads();
 
-    const unsigned char* src = recv + (seq & 1) * slot_stride;
-    const uint32_t n = bytes / 2;
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t stride = gridDim.x * blockDim.x;
-    uint32_t head = 0;
-    if ((reinterpret_cast<uintptr_t>(dst) & 15) == 0) {
-        const uint4* s4 = reinterpret_cast<const uint4*>(src);
+    const unsigned char* peer = recv + (seq & 1) * slot_stride;
+    const uint32_t head = n8 * 8;
+    if (vec) {
+        const uint4* s4 = reinterpret_cast<const uint4*>(peer);
         uint4* d4 = reinterpret_cast<uint4*>(dst);
-        const uint32_t n8 = n / 8;
-        head = n8 * 8;
         for (uint32_t base = tid; base < n8; base += ONESHOT_UNROLL * stride) {
             uint4 p[ONESHOT_UNROLL];
 #pragma unroll
@@ -192,7 +295,7 @@ extern "C" __global__ void rdma_oneshot_bf16(
             }
         }
     }
-    const unsigned short* s1 = reinterpret_cast<const unsigned short*>(src);
+    const unsigned short* s1 = reinterpret_cast<const unsigned short*>(peer);
     for (uint32_t i = head + tid; i < n; i += stride) {
         const __nv_bfloat16 p = __ushort_as_bfloat16(oneshot_ld_u16(s1 + i));
         dst[i] = add ? __hadd(dst[i], p) : p;

@@ -54,11 +54,10 @@ pub(super) fn alloc_mtp_prefill_hidden(
     // not be killed, and the head must be a precision the batched prefill
     // can actually run at — an NVFP4/FP8 MTP head would allocate this and
     // never write it.
-    // The repaired GLM long-context lane indexes a bounded 32K arena even
-    // when the native lane serves a larger context; the capture below and
-    // every stored capacity must quote that same arena. `arena_context`
-    // is the SSOT for the bound, so the private-cache quote
-    // (`PrivateStoragePlan`) cannot disagree with this allocation.
+    // Native GLM MTP repair uses the configured repair arena (32K by default)
+    // even when serving a larger context. `arena_context` supplies the same
+    // bound to this capture allocation and its stored capacity. Repair-off
+    // DFlash is not clamped here and skips this allocation below.
     let mtp_arena_context = crate::speculative::glm_repair_policy::arena_context(
         &config.model_type,
         crate::speculative::glm_repair_policy::enabled()

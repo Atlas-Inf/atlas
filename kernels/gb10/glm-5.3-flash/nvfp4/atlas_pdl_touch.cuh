@@ -69,3 +69,16 @@ __device__ __forceinline__ void atlas_pdl_enter_touch_pair(
     const bool one = blockIdx.z != 0u;
     atlas_pdl_enter_touch(one ? a1 : a0, one ? b1 : b0, rows, cta, ctas);
 }
+
+// `atlas_pdl_enter_touch` for a launch of three projections side by side in
+// x (glm_mla_fuse.cu): the CTAs of projection `role.sel` touch its pair;
+// `role.cta` and `role.ctas` count within that projection.
+template <class Role>
+__device__ __forceinline__ void atlas_pdl_enter_touch_tri(
+    const AtlasTouch a0, const AtlasTouch b0, const AtlasTouch a1, const AtlasTouch b1,
+    const AtlasTouch a2, const AtlasTouch b2, unsigned int rows, const Role role
+) {
+    const unsigned int sel = role.sel;
+    atlas_pdl_enter_touch(sel == 0u ? a0 : (sel == 1u ? a1 : a2),
+                          sel == 0u ? b0 : (sel == 1u ? b1 : b2), rows, role.cta, role.ctas);
+}

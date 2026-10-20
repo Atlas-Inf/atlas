@@ -229,25 +229,122 @@ pub fn apply_grammar_bitmask(
 /// them — pinned to the kernel defines by `tests/dflash2_selector_bounds.rs`.
 pub const DFLASH2_SELECTOR_MAX_TOP_K: usize = 16;
 pub const DFLASH2_SELECTOR_MAX_RANK: usize = 256;
-/// Mirrors `DF2_SEL_MAX_SPLITS` / `DF2_SEL_THREADS` in the same kernel.
+/// Single-sequence entry resolved by both CUDA and HIP targets.
+pub const DFLASH2_SELECTOR_SYMBOL: &str = "dflash2_candidate_selector";
+/// Both target selectors support draft end-token avoidance.
+pub const DFLASH2_SELECTOR_BANS_END_TOKENS: bool = true;
+/// Mirrors `DF2_SEL_MAX_SPLITS` / `DF2_SEL_THREADS` in the CUDA kernel.
 pub const DFLASH2_SELECTOR_MAX_SPLITS: usize = 16;
 pub const DFLASH2_SELECTOR_THREADS: u32 = 512;
 
-/// Vocab slices per row: about two blocks per SM on GB10 over the
-/// `gamma` rows.
+/// Vocab slices per row of the fused selector: about one block per SM on
+/// GB10 over the `gamma` rows (six at gamma 8, the fastest on GLM-5.3's
+/// 154880-entry vocabulary, ennspark03 2026-10-11).
 fn dflash2_selector_splits(gamma: u32) -> u32 {
-    (96 / gamma.max(1)).clamp(1, DFLASH2_SELECTOR_MAX_SPLITS as u32)
+    (48 / gamma.max(1)).clamp(1, DFLASH2_SELECTOR_MAX_SPLITS as u32)
 }
 
-/// Bytes of `dflash2_candidate_selector` scratch for up to `gamma` rows:
-/// a u32 ticket (padded to 16 bytes) plus f32 values and u32 ids of every
-/// slice's top-`DFLASH2_SELECTOR_MAX_TOP_K`. It must start zeroed (the kernel
-/// leaves the ticket at zero), and launches sharing it must be stream-ordered.
+/// Slices per row of `dflash2_selector_topk` over `columns` logits: one per
+/// 32K columns (three for half of GLM-5.3's vocabulary, the fastest there).
+fn dflash2_selector_topk_splits(columns: u32) -> u32 {
+    columns
+        .div_ceil(1 << 15)
+        .clamp(1, DFLASH2_SELECTOR_MAX_SPLITS as u32)
+}
+
+/// Bytes of `dflash2_candidate_selector` (or `dflash2_selector_topk`)
+/// scratch for up to `gamma` rows: a u32 ticket (padded to 16 bytes), f32
+/// values and u32 ids of every slice's top-`DFLASH2_SELECTOR_MAX_TOP_K`, a
+/// u32 ticket per row and f32 values and u32 ids of each row's merged list.
+/// It must start zeroed (the kernel leaves every ticket at zero), and
+/// launches sharing it must be stream-ordered.
 pub fn dflash2_selector_scratch_bytes(gamma: usize) -> usize {
     16 + 2 * 4 * gamma * DFLASH2_SELECTOR_MAX_SPLITS * DFLASH2_SELECTOR_MAX_TOP_K
+        + 4 * gamma
+        + dflash2_selector_lists_bytes(gamma)
+}
+
+/// Bytes of `gamma` rows' top-`DFLASH2_SELECTOR_MAX_TOP_K` lists: f32 values
+/// `[gamma, K]`, then u32 ids `[gamma, K]` (`dflash2_selector_topk`).
+pub fn dflash2_selector_lists_bytes(gamma: usize) -> usize {
+    2 * 4 * gamma * DFLASH2_SELECTOR_MAX_TOP_K
+}
+
+/// Steps 1-2 of the selector over one share of the vocabulary: `logits` is
+/// `[gamma, row_stride]` BF16 whose first `columns` values of each row are
+/// candidate ids `id_base..`. Writes every row's exact top-K list to `lists`
+/// (`dflash2_selector_lists_bytes`); `scratch` as the fused kernel's.
+#[allow(clippy::too_many_arguments)]
+pub fn dflash2_selector_topk(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    logits: DevicePtr,
+    row_stride: u32,
+    columns: u32,
+    id_base: u32,
+    gamma: u32,
+    lists: DevicePtr,
+    scratch: DevicePtr,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([dflash2_selector_topk_splits(columns), gamma, 1])
+        .block([DFLASH2_SELECTOR_THREADS, 1, 1])
+        .arg_ptr(logits)
+        .arg_u32(row_stride)
+        .arg_u32(columns)
+        .arg_u32(id_base)
+        .arg_u32(gamma)
+        .arg_ptr(lists)
+        .arg_ptr(scratch)
+        .launch(stream)
+}
+
+/// Steps 2-4 of the selector over the lists of two complementary shares of
+/// the vocabulary (`lists`, from `dflash2_selector_topk`): the walk of one
+/// `gamma`-row block, as `dflash2_candidate_selector` walks it.
+#[allow(clippy::too_many_arguments)]
+pub fn dflash2_selector_walk(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    lists: [DevicePtr; 2],
+    projected_hidden: DevicePtr,
+    pred_codebook: DevicePtr,
+    succ_codebook: DevicePtr,
+    out_tokens: DevicePtr,
+    anchor: DevicePtr,
+    ban_depth: DevicePtr,
+    end_ids: [u32; 4],
+    gamma: u32,
+    vocab_size: u32,
+    rank: u32,
+    top_k: u32,
+    stream: u64,
+) -> Result<()> {
+    let mut launch = KernelLaunch::new(gpu, kernel)
+        .grid([1, 1, 1])
+        .block([DFLASH2_SELECTOR_THREADS, 1, 1])
+        .arg_ptr(lists[0])
+        .arg_ptr(lists[1])
+        .arg_ptr(projected_hidden)
+        .arg_ptr(pred_codebook)
+        .arg_ptr(succ_codebook)
+        .arg_ptr(out_tokens)
+        .arg_ptr(anchor)
+        .arg_ptr(ban_depth)
+        .arg_u32(gamma)
+        .arg_u32(vocab_size)
+        .arg_u32(rank)
+        .arg_u32(top_k);
+    for id in end_ids {
+        launch = launch.arg_u32(id);
+    }
+    launch.launch(stream)
 }
 
 /// DFlash2 on-device bilinear candidate selector over one `gamma`-row block.
+/// Resolve `kernel` with [`DFLASH2_SELECTOR_SYMBOL`] for the target ABI.
+/// Both target kernels use the device-anchor and end-token-ban contract below.
 ///
 /// `anchor` is a device `u32` holding the block anchor (row 1's
 /// predecessor) and `ban_depth` a device `u32` (or null): rows

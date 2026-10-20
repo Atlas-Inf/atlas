@@ -54,6 +54,13 @@ pub(crate) fn dequant_fp8_blockscaled_to_bf16(
         "Expected 2D weight for {prefix}, got {:?}",
         w.shape
     );
+    // Checkpoint MXFP8 (one-byte E8M0 `weight_scale`, one per 32 columns):
+    // exact, and the scale dtype the GPU branch below refuses. Every FP8 →
+    // BF16 caller (`dense_auto`, `dense_auto_fp8_or_bf16`, `quantized_from_fp8`)
+    // funnels through here, so this one probe covers all of them.
+    if let Some(raw) = super::raw_mxfp8(store, prefix)? {
+        return super::dequant_mxfp8_to_bf16(gpu, &raw).with_context(|| format!("MXFP8 {prefix}"));
+    }
     let n = w.shape[0];
     let k = w.shape[1];
     let total = n * k;
@@ -73,6 +80,11 @@ pub(crate) fn dequant_fp8_blockscaled_to_bf16(
     // CPU host-dequant below. NOTE: this must stay an `if let`/fall-through, not
     // an unconditional `store.get(scale_key)?` — V4 ships no `weight_scale*` at
     // all, so a hard get would error instead of reaching the CPU path.
+    //
+    // ModelOpt `FP8_PB_WO` (nvidia GLM-5.3-Flash-FP4-Local's MLA projections
+    // and shared experts) spells its 128x128 grid 4-D, `[N/128, 1, K/128, 1]`:
+    // the same row-major f32 bytes as `[N/128, K/128]`, so it takes this path
+    // too (`block_scale_grid`).
     let gpu_scale = store
         .get(&format!("{prefix}.weight_scale_inv"))
         .ok()
@@ -80,7 +92,7 @@ pub(crate) fn dequant_fp8_blockscaled_to_bf16(
             store
                 .get(&format!("{prefix}.weight_scale"))
                 .ok()
-                .filter(|s| s.shape.len() == 2)
+                .filter(|s| block_scale_grid(&s.shape).is_some())
         });
     if let Some(s) = gpu_scale {
         ensure!(
@@ -88,8 +100,20 @@ pub(crate) fn dequant_fp8_blockscaled_to_bf16(
             "Expected BF16 or FP32 for {prefix} GPU block scale, got {:?}",
             s.dtype,
         );
-        let sn = s.shape[0];
-        let sk = s.shape[1];
+        let (sn, sk) = block_scale_grid(&s.shape)
+            .with_context(|| format!("{prefix}: block scale shape {:?}", s.shape))?;
+        // A zero (or wider-than-weight) grid would divide by zero here or
+        // hand the kernel a zero block.
+        ensure!(
+            (1..=n).contains(&sn) && (1..=k).contains(&sk),
+            "{prefix}: block scale grid {:?} for weight [{n}, {k}]",
+            s.shape
+        );
+        ensure!(
+            s.shape.len() == 2 || (n.is_multiple_of(sn) && k.is_multiple_of(sk)),
+            "{prefix}: 4-D block scale {:?} does not tile weight [{n}, {k}]",
+            s.shape
+        );
         let block_n = (n / sn) as u32;
         let block_k = (k / sk) as u32;
         let scale_is_f32 = s.dtype == WeightDtype::FP32;
@@ -270,6 +294,16 @@ pub(crate) fn dequant_fp8_blockscaled_to_bf16(
     Ok(DenseWeight { weight: out })
 }
 
+/// `(rows, cols)` of a block-scale grid: 2-D `[N/bn, K/bk]`, or ModelOpt
+/// `FP8_PB_WO`'s 4-D `[N/bn, 1, K/bk, 1]` (unit dims, identical row-major
+/// bytes). `None` for any other rank or shape.
+pub(crate) fn block_scale_grid(shape: &[usize]) -> Option<(usize, usize)> {
+    match *shape {
+        [sn, sk] | [sn, 1, sk, 1] => Some((sn, sk)),
+        _ => None,
+    }
+}
+
 /// Convert BF16 bytes (little-endian) to f32.
 pub(super) fn bf16_bytes_to_f32(bytes: [u8; 2]) -> f32 {
     let bits = u16::from_le_bytes(bytes);
@@ -289,6 +323,9 @@ pub(crate) fn dense_auto(
     let w = store.get(name)?;
     match w.dtype {
         WeightDtype::BF16 => Ok(DenseWeight { weight: w.ptr }),
+        // Truncates (`f32_to_bf16_trunc`, the high half of each f32). A loader
+        // that needs round-to-nearest-even reads F32 through
+        // `dense_f32_as_bf16` instead (GLM norms: `glm5::fp4l::norm_bf16`).
         WeightDtype::FP32 => dense_f32_safe(store, name, gpu),
         WeightDtype::FP8E4M3 => {
             // Derive prefix: "foo.q_proj.weight" -> "foo.q_proj".

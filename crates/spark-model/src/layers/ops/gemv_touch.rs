@@ -136,11 +136,33 @@ fn settings() -> Option<(u64, u32)> {
     })
 }
 
+/// The function a twin resolves: its `TWINS` name, except that the W4A16
+/// tensor-core twins follow the tier they stand in for
+/// (`w4a16_gemv_tiers::tc_name`: all `tc8` under `ATLAS_GLM_CANONICAL_VERIFY`).
+fn twin_func(func: &str, canonical_target: bool) -> String {
+    let w4_tc =
+        |rows, suffix| crate::layers::w4a16_gemv_tiers::tc_name(rows, suffix, canonical_target);
+    match func {
+        "w4a16_gemv_tc8_touch" => w4_tc(8, "_touch"),
+        "w4a16_gemv_tc16_touch" => w4_tc(16, "_touch"),
+        "w4a16_gemv_tc32_touch" => w4_tc(32, "_touch"),
+        "w4a16_gemv_tc8_pair_touch" => w4_tc(8, "_pair_touch"),
+        "w4a16_gemv_tc16_pair_touch" => w4_tc(16, "_pair_touch"),
+        "w4a16_gemv_tc32_pair_touch" => w4_tc(32, "_pair_touch"),
+        _ => func.to_string(),
+    }
+}
+
 /// The twin handles, in [`Twin`] order, when `on`: looked up with the kernels
 /// around them so the boot audit sees them before it seals. No lookup when
 /// off, so a target without the twins leaves no failed row in the audit.
 fn twin_table(gpu: &dyn GpuBackend, on: bool) -> Option<[KernelHandle; TWINS.len()]> {
-    on.then(|| TWINS.map(|(module, func)| crate::layers::try_kernel(gpu, module, func)))
+    on.then(|| {
+        let canonical_target = crate::layers::w4a16_gemv_tiers::canonical_target(gpu);
+        TWINS.map(|(module, func)| {
+            crate::layers::try_kernel(gpu, module, &twin_func(func, canonical_target))
+        })
+    })
 }
 
 static RESOLVED: OnceLock<Option<[KernelHandle; TWINS.len()]>> = OnceLock::new();

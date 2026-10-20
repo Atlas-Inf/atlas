@@ -18,6 +18,9 @@ const CALL: &[u32] = &[3, 4, 5, 6, 7, 8, 9, 10, 11];
 #[path = "reasoning_done_tests.rs"]
 mod reasoning_done_tests;
 
+#[path = "blocking_vision_choices_tests.rs"]
+mod blocking_vision_choices_tests;
+
 fn app(glm: bool) -> Arc<AppState> {
     let dir = tempfile::tempdir().unwrap();
     let words = [
@@ -242,6 +245,7 @@ fn stream_tokens_with_context(
         timeout_at: None,
         stop_string_buffer_len: 0,
         leak_markers: state.tool_call_parser.as_ref().unwrap().leak_markers(),
+        role_literal_leaks: false,
         wants_typed_arguments: true,
         max_tool_calls_per_response: 12,
         min_tokens: 0,
@@ -376,4 +380,53 @@ fn glm_native_tool_boundary_keeps_request_model_and_name_guards() {
         );
         assert_eq!(choice.tool_calls.len(), usize::from(!glm));
     }
+}
+
+#[test]
+fn poolside_holds_headers_until_complete_on_every_model() {
+    for glm in [false, true] {
+        let mut partial = vec![END];
+        partial.extend_from_slice(&CALL[..CALL.len() - 2]);
+        let (state, deltas) = stream_tokens(glm, true, partial);
+        assert!(state.thinking_done);
+        assert_eq!(
+            deltas
+                .iter()
+                .filter(|d| matches!(d, ir::StreamDelta::ToolCallStart { .. }))
+                .count(),
+            0,
+            "Poolside headers must wait for a complete validated call"
+        );
+    }
+    // Explicitly closing reasoning must not bypass GLM name admission either.
+    let (_, deltas) = stream(true, true, true, false);
+    assert!(
+        !deltas
+            .iter()
+            .any(|d| matches!(d, ir::StreamDelta::ToolCallStart { .. }))
+    );
+}
+
+#[test]
+fn non_poolside_headers_still_stream_immediately() {
+    let (ctx, mut state, _) = stream_tokens_with_context(false, true, vec![END]);
+    state
+        .detector
+        .as_mut()
+        .unwrap()
+        .set_promote_bare_names(false);
+    let mut deltas = Vec::new();
+    super::tool_handlers::handle_tool_call_start(
+        &mut state,
+        &ctx,
+        "call_example".into(),
+        "get_weather".into(),
+        0,
+        &mut deltas,
+    );
+    assert!(matches!(
+        deltas.as_slice(),
+        [ir::StreamDelta::ToolCallStart { name, .. }] if name == "get_weather"
+    ));
+    assert!(state.buffered_tool_chunks.is_empty());
 }

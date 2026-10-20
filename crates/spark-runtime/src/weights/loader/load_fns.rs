@@ -10,6 +10,7 @@ use std::path::Path;
 use super::super::{WeightDtype, WeightTensor, evict_page_cache, f16_to_bf16_bytes};
 use super::{SafetensorsIndex, check_oom_guard, estimate_has_fp8, estimate_load_bytes};
 use crate::gpu::{DevicePtr, GpuBackend};
+use crate::weights::nvfp4_csf::{CsfAssembler, csf_part};
 
 /// Upload one tensor's raw on-disk bytes to the store: F16→BF16 convert if
 /// needed, GPU-alloc (managed/UVM fallback on OOM), copy, insert. Shared by the
@@ -108,6 +109,39 @@ fn upload_one(
     Ok(())
 }
 
+/// [`upload_one`], except that a CSF-compressed NVFP4 scale half goes to the
+/// assembler, and the decoded E4M3 `weight_scale` is uploaded once its pair
+/// completes. Both halves are therefore never in the store. A plain tensor is
+/// reported to the assembler, which refuses a scale both plain and CSF.
+#[allow(clippy::too_many_arguments)]
+fn upload_or_assemble(
+    name: &str,
+    raw: &[u8],
+    st_dtype: safetensors::Dtype,
+    shape: Vec<usize>,
+    gpu: &dyn GpuBackend,
+    weights: &mut HashMap<String, WeightTensor>,
+    offload_logged: &mut bool,
+    csf: &mut CsfAssembler,
+) -> Result<()> {
+    if csf_part(name).is_none() {
+        csf.note_plain(name)?;
+        return upload_one(name, raw, st_dtype, shape, gpu, weights, offload_logged);
+    }
+    let Some(scale) = csf.offer(name, &shape, raw)? else {
+        return Ok(());
+    };
+    upload_one(
+        &scale.name,
+        &scale.bytes,
+        safetensors::Dtype::F8_E4M3,
+        scale.shape,
+        gpu,
+        weights,
+        offload_logged,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn load_sharded(
     model_dir: &Path,
@@ -120,6 +154,7 @@ pub(super) fn load_sharded(
     // Only the Windows streaming path reads this; keep the binding alive on
     // other platforms without a #[allow].
     #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] pack_slab: bool,
+    csf: &mut CsfAssembler,
 ) -> Result<HashMap<String, WeightTensor>> {
     let index_json = std::fs::read_to_string(index_path)
         .with_context(|| format!("Failed to read {}", index_path.display()))?;
@@ -220,6 +255,7 @@ pub(super) fn load_sharded(
                 &mut skipped,
                 &mut offload_logged,
                 pack_slab,
+                csf,
             )?;
         }
         #[cfg(not(target_os = "windows"))]
@@ -251,7 +287,7 @@ pub(super) fn load_sharded(
                     continue;
                 }
                 let view = tensors.tensor(name)?;
-                upload_one(
+                upload_or_assemble(
                     name,
                     view.data(),
                     view.dtype(),
@@ -259,6 +295,7 @@ pub(super) fn load_sharded(
                     gpu,
                     &mut weights,
                     &mut offload_logged,
+                    csf,
                 )?;
             }
 
@@ -293,141 +330,18 @@ pub(super) fn load_sharded(
     Ok(weights)
 }
 
-/// Windows-only streaming shard load (Strix Halo UMA). Parses the safetensors
-/// header only, then reads each tensor's byte range with seek+read into a
-/// transient host buffer that is dropped after upload. Avoids `memmap2` on the
-/// whole shard — a file-backed mapping keeps its pages resident in the unified
-/// GPU aperture (counted used by `hipMemGetInfo`) and the driver cannot reclaim
-/// them for `cuMemAlloc`, so a 20GB checkpoint double-books ~40GB. Host
-/// residency here caps at the largest single tensor instead.
 #[cfg(target_os = "windows")]
-fn stream_shard_windows(
-    file: &mut std::fs::File,
-    shard_path: &Path,
-    tensor_names: &[String],
-    skip_fn: &dyn Fn(&str) -> bool,
-    gpu: &dyn GpuBackend,
-    weights: &mut HashMap<String, WeightTensor>,
-    deferred: &mut HashMap<String, crate::weights::DeferredTensor>,
-    skipped: &mut usize,
-    offload_logged: &mut bool,
-    pack_slab: bool,
-) -> Result<()> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    // Safetensors layout: [u64 header_len][header JSON][tensor data]. Parse the
-    // header JSON directly — `SafeTensors::read_metadata` validates the whole
-    // file length, so it can't parse a header-only buffer. `TensorInfo` is
-    // Deserialize; the reserved `__metadata__` entry is dropped.
-    let mut len_buf = [0u8; 8];
-    file.read_exact(&mut len_buf)
-        .context("Failed to read safetensors header length")?;
-    let header_len = u64::from_le_bytes(len_buf) as usize;
-    let mut header_json = vec![0u8; header_len];
-    file.read_exact(&mut header_json)
-        .context("Failed to read safetensors header")?;
-    let header: HashMap<String, serde_json::Value> =
-        serde_json::from_slice(&header_json).context("Failed to parse safetensors header JSON")?;
-    let data_base = (8 + header_len) as u64;
-
-    let mut infos: HashMap<String, safetensors::tensor::TensorInfo> = HashMap::new();
-    for (k, v) in header {
-        if k == "__metadata__" {
-            continue;
-        }
-        let info: safetensors::tensor::TensorInfo = serde_json::from_value(v)
-            .with_context(|| format!("Failed to parse safetensors TensorInfo for {k}"))?;
-        infos.insert(k, info);
-    }
-
-    let plan = super::slab_plan::plan_shard(tensor_names, &infos, skip_fn, data_base)?;
-    for d in plan.deferred {
-        deferred.insert(
-            d.name,
-            crate::weights::DeferredTensor {
-                path: shard_path.to_path_buf(),
-                offset: d.offset,
-                shape: d.shape,
-                dtype: d.dtype,
-            },
-        );
-    }
-    *skipped += plan.skipped;
-
-    // Pack mode (opt-in): one alloc per shard, tensors carved at 4096-byte
-    // interior offsets — same contract as the fast loader's pack_slab (per-
-    // tensor cuMemAlloc rounds >=1 MB to 2 MB pages, ~0.6 GB waste/shard on
-    // NVFP4 MoE). If the slab alloc fails, fall back to per-tensor allocs.
-    let slab = if pack_slab {
-        let (offsets, total) = crate::weights::slab_layout(plan.kept.iter().map(|t| t.len));
-        if total == 0 {
-            None
-        } else {
-            match gpu.alloc(total) {
-                Ok(base) => {
-                    gpu.register_slab(base, total);
-                    Some((base, offsets))
-                }
-                Err(_) => None,
-            }
-        }
-    } else {
-        None
-    };
-
-    // Read each tensor into a reusable page-locked staging buffer, then H2D.
-    // A pinned source makes `cuMemcpyHtoDAsync` a true DMA; a pageable source
-    // would route through the driver's internal staging pool, which on the
-    // Windows UMA driver grows to ~the copied size and is not released — that
-    // was the second ~20GB phantom (a file-backed mmap had the same effect).
-    let pinned = gpu.alloc_host_pinned(plan.max_len.max(1))?;
-    let staging = unsafe { std::slice::from_raw_parts_mut(pinned, plan.max_len) };
-    let result = (|| -> Result<()> {
-        for (i, t) in plan.kept.iter().enumerate() {
-            file.seek(SeekFrom::Start(data_base + t.begin))?;
-            file.read_exact(&mut staging[..t.len])
-                .with_context(|| format!("Failed to read tensor {}", t.name))?;
-            let (data, dtype) = stage_upload_bytes(&t.name, &staging[..t.len], t.dtype)?;
-            debug_assert_eq!(data.len(), t.len);
-            let ptr = match &slab {
-                Some((base, offsets)) => {
-                    gpu.copy_h2d(&data, base.offset(offsets[i]))?;
-                    base.offset(offsets[i])
-                }
-                None => {
-                    // Per-tensor path — identical to the non-slab arm.
-                    upload_one(
-                        &t.name,
-                        &data,
-                        t.dtype,
-                        t.shape.clone(),
-                        gpu,
-                        weights,
-                        offload_logged,
-                    )?;
-                    continue;
-                }
-            };
-            weights.insert(
-                t.name.clone(),
-                WeightTensor {
-                    ptr,
-                    shape: t.shape.clone(),
-                    dtype,
-                },
-            );
-        }
-        Ok(())
-    })();
-    gpu.free_host_pinned(pinned, plan.max_len.max(1))?;
-    result
-}
+#[path = "load_windows.rs"]
+mod windows;
+#[cfg(target_os = "windows")]
+use windows::stream_shard_windows;
 
 pub(super) fn load_single(
     path: &Path,
     gpu: &dyn GpuBackend,
     oom_reserve_bytes: usize,
     skip_fn: &dyn Fn(&str) -> bool,
+    csf: &mut CsfAssembler,
 ) -> Result<HashMap<String, WeightTensor>> {
     let file = std::fs::File::open(path)?;
     let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
@@ -438,6 +352,21 @@ pub(super) fn load_single(
         if skip_fn(&name) {
             continue;
         }
+        if csf_part(&name).is_some() {
+            let mut logged = false;
+            upload_or_assemble(
+                &name,
+                view.data(),
+                view.dtype(),
+                view.shape().to_vec(),
+                gpu,
+                &mut weights,
+                &mut logged,
+                csf,
+            )?;
+            continue;
+        }
+        csf.note_plain(&name)?;
         let shape: Vec<usize> = view.shape().to_vec();
         // F16: convert to BF16 at load — see load_sharded above. EXL3 scale
         // vectors (`keeps_raw_f16`) keep their raw FP16 bytes.
