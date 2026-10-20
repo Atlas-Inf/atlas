@@ -7,7 +7,7 @@
 //! (`DF2_SEL_MAX_RANK`). `Dflash2CandidateSelector::new` fails fast when a
 //! checkpoint's `selector_top_k`/`selector_rank` exceeds the Rust mirrors —
 //! so the mirrors and the kernel `#define`s must never drift apart. CUDA
-//! uses the grid-wide selector; native HIP retains upstream's one-CTA ABI.
+//! and native HIP both use the grid-wide single-sequence selector.
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -63,27 +63,17 @@ fn caps_match_kernel_defines() {
             "DF2_SEL_MAX_RANK drifted from DFLASH2_SELECTOR_MAX_RANK in {rel}"
         );
     }
-    let src = kernel_src(KERNEL_GB10);
-    assert_eq!(
-        kernel_define(&src, "DF2_SEL_MAX_SPLITS"),
-        DFLASH2_SELECTOR_MAX_SPLITS
-    );
-    assert_eq!(
-        kernel_define(&src, "DF2_SEL_THREADS"),
-        DFLASH2_SELECTOR_THREADS as usize
-    );
-}
-
-#[test]
-fn hip_single_selector_keeps_its_upstream_scalar_abi() {
-    let src = kernel_src(KERNEL_STRIX);
-    let params = kernel_params(&src, "dflash2_candidate_selector");
-    assert_eq!(params.len(), 10);
-    assert_eq!(params[5], "unsigned int last_token");
-    // Both upstream entries invoke this same implementation. Rust uses the
-    // batched entry at n=1 to pass a graph-safe device anchor, never a scalar.
-    assert_eq!(src.matches("df2_selector_body(").count(), 3);
-    assert!(!src.contains("DF2_SEL_MAX_SPLITS"));
+    for rel in [KERNEL_GB10, KERNEL_STRIX] {
+        let src = kernel_src(rel);
+        assert_eq!(
+            kernel_define(&src, "DF2_SEL_MAX_SPLITS"),
+            DFLASH2_SELECTOR_MAX_SPLITS
+        );
+        assert_eq!(
+            kernel_define(&src, "DF2_SEL_THREADS"),
+            DFLASH2_SELECTOR_THREADS as usize
+        );
+    }
 }
 
 fn kernel_params(src: &str, name: &str) -> Vec<String> {
@@ -119,29 +109,31 @@ fn kernel_params(src: &str, name: &str) -> Vec<String> {
 /// builds; this one also holds under `ATLAS_SKIP_BUILD`.)
 #[test]
 fn kernel_signature_has_sixteen_params_with_device_anchor() {
-    let src = kernel_src(KERNEL_GB10);
-    let params = kernel_params(&src, "dflash2_candidate_selector");
-    assert_eq!(
-        params.len(),
-        16,
-        "dflash2_candidate_selector must take 16 parameters: {params:?}"
-    );
-    assert_eq!(
-        params[5], "const unsigned int* __restrict__ anchor",
-        "sixth parameter must be the device anchor: {params:?}"
-    );
-    assert_eq!(
-        params[10], "unsigned int top_k",
-        "eleventh parameter must be `unsigned int top_k`: {params:?}"
-    );
-    assert_eq!(
-        params[14], "unsigned int end3",
-        "fifteenth parameter must be `unsigned int end3`: {params:?}"
-    );
-    assert_eq!(
-        params[15], "unsigned int* __restrict__ scratch",
-        "last parameter must be the scratch pointer: {params:?}"
-    );
+    for rel in [KERNEL_GB10, KERNEL_STRIX] {
+        let src = kernel_src(rel);
+        let params = kernel_params(&src, "dflash2_candidate_selector");
+        assert_eq!(
+            params.len(),
+            16,
+            "dflash2_candidate_selector must take 16 parameters: {params:?}"
+        );
+        assert_eq!(
+            params[5], "const unsigned int* __restrict__ anchor",
+            "sixth parameter must be the device anchor: {params:?}"
+        );
+        assert_eq!(
+            params[10], "unsigned int top_k",
+            "eleventh parameter must be `unsigned int top_k`: {params:?}"
+        );
+        assert_eq!(
+            params[14], "unsigned int end3",
+            "fifteenth parameter must be `unsigned int end3`: {params:?}"
+        );
+        assert_eq!(
+            params[15], "unsigned int* __restrict__ scratch",
+            "last parameter must be the scratch pointer: {params:?}"
+        );
+    }
 }
 
 /// Batching has a distinct one-CTA-per-sequence ABI. It must not call the
@@ -155,7 +147,7 @@ fn batched_selector_keeps_ten_param_per_sequence_body() {
         assert_eq!(params[5], "const unsigned int* __restrict__ last_tokens");
         assert_eq!(params[9], "unsigned int top_k");
         let name = if rel == KERNEL_STRIX {
-            "df2_selector_body"
+            "df2_selector_batched_body"
         } else {
             "df2_batch_selector_body"
         };
