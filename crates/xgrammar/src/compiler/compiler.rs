@@ -170,10 +170,24 @@ impl GrammarCompiler {
         if self.cache_enabled
             && let Some(hit) = self.cache.get(&key)
         {
+            // An EBNF cache entry can have been compiled without a schema
+            // limit. Reusing it must not bypass the bounded union entry point.
+            Self::check_grammar_size(&hit, max_grammar_bytes)?;
             return Ok(hit);
         }
         let value = f()?;
-        let bytes = value.grammar_memory_size_bytes();
+        Self::check_grammar_size(&value, max_grammar_bytes)?;
+        if self.cache_enabled {
+            self.cache.insert(key, value.clone());
+        }
+        Ok(value)
+    }
+
+    fn check_grammar_size(
+        grammar: &CompiledGrammar,
+        max_grammar_bytes: usize,
+    ) -> Result<(), CompileError> {
+        let bytes = grammar.grammar_memory_size_bytes();
         if bytes > max_grammar_bytes {
             return Err(CompileError::TooLarge(format!(
                 "compiles to a {} MiB grammar, over the {} MiB limit",
@@ -181,10 +195,7 @@ impl GrammarCompiler {
                 max_grammar_bytes >> 20
             )));
         }
-        if self.cache_enabled {
-            self.cache.insert(key, value.clone());
-        }
-        Ok(value)
+        Ok(())
     }
 
     /// Refuse JSON schemas whose compiled grammar structure is larger than
@@ -215,10 +226,29 @@ impl GrammarCompiler {
     /// `GrammarCompiler::CompileGrammar(const Grammar&)` — keyed by the
     /// grammar's printed EBNF, as the C++ does.
     pub fn compile_grammar(&self, grammar: GrammarData) -> Result<CompiledGrammar, CompileError> {
+        self.compile_grammar_bounded(grammar, usize::MAX)
+    }
+
+    /// [`Self::compile_grammar`] for a grammar that embeds a JSON schema
+    /// (e.g. a union of a schema with another grammar): refused over the
+    /// [`Self::set_max_schema_grammar_bytes`] bound, as
+    /// [`Self::compile_json_schema`] is.
+    pub fn compile_schema_grammar(
+        &self,
+        grammar: GrammarData,
+    ) -> Result<CompiledGrammar, CompileError> {
+        self.compile_grammar_bounded(grammar, self.max_schema_grammar_bytes)
+    }
+
+    fn compile_grammar_bounded(
+        &self,
+        grammar: GrammarData,
+        max_grammar_bytes: usize,
+    ) -> Result<CompiledGrammar, CompileError> {
         let ebnf = crate::grammar::print_grammar(&grammar);
         let root_rule = grammar.root_rule().name.clone();
         let key = CacheKey::Ebnf { ebnf, root_rule };
-        self.get_or_compute(key, usize::MAX, || self.compile_normalized(grammar))
+        self.get_or_compute(key, max_grammar_bytes, || self.compile_normalized(grammar))
     }
 
     /// Compile the builtin "any JSON value" grammar. Port of
