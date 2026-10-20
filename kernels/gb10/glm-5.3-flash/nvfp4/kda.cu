@@ -25,6 +25,31 @@ extern "C" __global__ void kda_pack_qkv(
     packed[i] = planes[((unsigned long long)plane * tokens + t) * dim + d];
 }
 
+// ATLAS_GLM_KDA_SIDE_PROJ_LT: the packed [rows, c0 + 2 c1] x 8 BF16 side
+// projection output split into the dense beta [rows, c0 x 8] and f_a / g_a
+// [rows, c1 x 8] planes, 16 bytes a thread (a pitched cudaMemcpy2DAsync
+// moves 64-byte beta rows one copy-engine line at a time). A byte copy.
+// Grid: (ceil(rows * (c0 + 2 c1) / 256), 1, 1)  Block: (256, 1, 1).
+extern "C" __global__ void kda_split_side_proj(
+    const uint4* __restrict__ src,
+    uint4* __restrict__ beta,
+    uint4* __restrict__ fa,
+    uint4* __restrict__ ga,
+    unsigned int rows,
+    unsigned int c0,
+    unsigned int c1
+) {
+    const unsigned int per_row = c0 + 2u * c1;
+    const unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (unsigned long long)rows * per_row) return;
+    const unsigned long long r = i / per_row;
+    const unsigned int c = (unsigned int)(i % per_row);
+    const uint4 v = src[i];
+    if (c < c0) beta[r * c0 + c] = v;
+    else if (c < c0 + c1) fa[r * c1 + (c - c0)] = v;
+    else ga[r * c1 + (c - c0 - c1)] = v;
+}
+
 extern "C" __global__ void kda_recurrent_bf16(
     const __nv_bfloat16* __restrict__ qkv,
     const __nv_bfloat16* __restrict__ raw_gate,

@@ -4,6 +4,8 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
+use crate::weight_map::DenseWeight;
+
 pub fn kda_pack_qkv(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -21,6 +23,49 @@ pub fn kda_pack_qkv(
         .arg_u32(tokens)
         .arg_u32(dim)
         .launch(stream)
+}
+
+/// The KDA prefill convolution of `m` rows into `output` (`[m, 3p]`) from
+/// packed `[m, 3p]` q|k|v rows or, `planar`, the three `[m, p]` planes the
+/// projection wrote (`ATLAS_GLM_KDA_CONV_PLANES`, no `kda_pack_qkv` copy):
+/// one [`super::conv1d_update_prefill`] per plane over that plane's channels,
+/// state rows and weights. Every (channel, token) output and every channel's
+/// state is the same arithmetic either way, so the bytes are identical.
+#[allow(clippy::too_many_arguments)]
+pub fn kda_conv_prefill(
+    gpu: &dyn GpuBackend,
+    [kernel, tp_kernel]: [KernelHandle; 2],
+    conv_state: DevicePtr,
+    (input, planar): (DevicePtr, bool),
+    weight: &DenseWeight,
+    output: DevicePtr,
+    [m, p, d_conv]: [u32; 3],
+    stream: u64,
+) -> Result<()> {
+    let (planes, in_stride) = if planar { (3, p) } else { (1, 3 * p) };
+    let channels = 3 * p / planes;
+    for plane in 0..planes {
+        let ch0 = (plane * channels) as usize;
+        super::conv1d_update_prefill(
+            gpu,
+            kernel,
+            tp_kernel,
+            conv_state.offset(ch0 * d_conv as usize * 4),
+            input.offset(plane as usize * m as usize * channels as usize * 2),
+            &DenseWeight {
+                weight: weight.weight.offset(ch0 * d_conv as usize * 2),
+            },
+            DevicePtr::NULL,
+            output.offset(ch0 * 2),
+            channels,
+            d_conv,
+            m,
+            in_stride,
+            3 * p,
+            stream,
+        )?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -322,3 +367,7 @@ pub fn kda_sigmoid_gated_norm(
         .arg_f32(eps)
         .launch(stream)
 }
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "kda_conv_planes_test_gpu.rs"]
+mod conv_planes_gpu_tests;

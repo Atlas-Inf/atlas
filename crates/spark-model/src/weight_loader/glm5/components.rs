@@ -409,6 +409,12 @@ pub(super) fn load_kda_weights(
     let dt_bias = dt_bias_full
         .replaced(dt_bias, dt_len * 4, gpu)?
         .into_dense();
+    let b_proj = load_tp_dense("b_proj", dims.full_nk, dims.h, TpShardKind::ColumnParallel)?;
+    let [b_proj, f_a_proj, g_a_proj] = if crate::layers::kda_side_proj_lt_enabled() {
+        super::kda_side_pack::pack_side(store, &p, gpu, retirement, b_proj, &dims)?
+    } else {
+        [b_proj.into_dense(), load("f_a_proj")?, load("g_a_proj")?]
+    };
     Ok(Glm5KdaWeights {
         q_proj: load_hot(
             "q_proj",
@@ -431,9 +437,8 @@ pub(super) fn load_kda_weights(
             TpShardKind::ColumnParallel,
             true,
         )?,
-        b_proj: load_tp_dense("b_proj", dims.full_nk, dims.h, TpShardKind::ColumnParallel)?
-            .into_dense(),
-        f_a_proj: load("f_a_proj")?,
+        b_proj,
+        f_a_proj,
         f_b_proj: load_tp_dense(
             "f_b_proj",
             dims.full_key_dim(),
@@ -441,7 +446,7 @@ pub(super) fn load_kda_weights(
             TpShardKind::ColumnParallel,
         )?
         .into_dense(),
-        g_a_proj: load("g_a_proj")?,
+        g_a_proj,
         g_b_proj: load_tp_dense(
             "g_b_proj",
             dims.full_key_dim(),

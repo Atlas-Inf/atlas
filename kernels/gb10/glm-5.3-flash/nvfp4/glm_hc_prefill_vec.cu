@@ -422,6 +422,117 @@ __device__ __forceinline__ void glm_hc_pre_finalize_ss_vec_t(
                         y_out, post_out, comb_out, t, tid, sinkhorn_iters, hc_eps);
 }
 
+// glm_hc_pre_finalize_ss_vec_t fused with the site's block input norm
+// (rms_norm_vanilla over the collapsed row, ATLAS_GLM_HC_PREFILL_FUSE2): the
+// same gates, Sinkhorn and per-column collapse expression, and the norm
+// re-derived from the rounded row exactly as rms_norm_vanilla's 1024-thread
+// launch derives it from the stored one. Thread tid stands in for that
+// launch's threads T = tid + 256 j (j < 4), each owning the bf16 pairs T and
+// T + 1024; their partial sums are reduced through shared memory warp group
+// by warp group in rms_norm_vanilla's butterfly, so `norm_out` (and `y_out`)
+// are the separate launches' bytes without re-reading `y_out`.
+// Grid: (T, 1, 1)  Block: (256, 1, 1).
+__device__ __forceinline__ unsigned int hc_pack_bf16x2(float v0, float v1) {
+    return (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v0))
+        | ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(v1)) << 16);
+}
+__device__ __forceinline__ void hc_unpack_bf16x2(unsigned int packed, float& v0, float& v1) {
+    v0 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(packed & 0xFFFF)));
+    v1 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(packed >> 16)));
+}
+__device__ __forceinline__ float hc_warp_reduce_sum(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+    return val;
+}
+template <typename HT>
+__device__ __forceinline__ void glm_hc_pre_finalize_ss_norm_t(
+    const HT* __restrict__ streams,
+    const float* __restrict__ raw_mix,
+    const float* __restrict__ ss_in,
+    const float* __restrict__ hc_scale,
+    const float* __restrict__ hc_base,
+    __nv_bfloat16* __restrict__ y_out,
+    float* __restrict__ post_out,
+    float* __restrict__ comb_out,
+    const __nv_bfloat16* __restrict__ norm_weight,
+    __nv_bfloat16* __restrict__ norm_out,
+    const unsigned int sinkhorn_iters,
+    const float norm_eps,
+    const float hc_eps
+) {
+    constexpr unsigned int H = 4096, hc_dim = 4 * H, RMS_THREADS = 1024;
+    if (blockDim.x != HC_BLOCK) return;
+    const unsigned int t = blockIdx.x;
+    const unsigned int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    __shared__ float s_rsqrt;
+    __shared__ float s_mix[HC_MAX_MIX];
+    __shared__ float s_pre[HC_MAX_MULT];
+    __shared__ float s_part[RMS_THREADS];
+    __shared__ float s_warp[RMS_THREADS / 32];
+    if (tid == 0) s_rsqrt = rsqrtf(ss_in[t] / (float)hc_dim + norm_eps);
+    if (tid < 24) s_mix[tid] = raw_mix[(size_t)t * 24 + tid];
+    __syncthreads();
+    if (tid < 4) glm_hc_vec_gates(s_rsqrt, s_mix, s_pre, hc_scale, hc_base, post_out, t, tid, hc_eps);
+    if (tid < 16)
+        glm_hc_vec_sinkhorn(s_rsqrt, s_mix, hc_scale, hc_base, comb_out, t, tid, sinkhorn_iters, hc_eps);
+    __syncthreads();
+
+    const HT* x = streams + (size_t)t * hc_dim;
+    unsigned int* y32 = (unsigned int*)(y_out + (size_t)t * H);
+    unsigned int yv[4][2];
+    #pragma unroll
+    for (unsigned int j = 0; j < 4; ++j) {
+        const unsigned int rt = tid + j * HC_BLOCK;
+        float sum_sq = 0.0f;
+        #pragma unroll
+        for (unsigned int k = 0; k < 2; ++k) {
+            const unsigned int pair = rt + k * RMS_THREADS, d = 2 * pair;
+            // glm_hc_vec_collapse4's per-column expression and order.
+            float a = 0.f, b = 0.f;
+            #pragma unroll
+            for (unsigned int i = 0; i < 4; ++i) {
+                const float2 v = hc_ld2(&x[i * H + d]);
+                a += s_pre[i] * v.x;
+                b += s_pre[i] * v.y;
+            }
+            yv[j][k] = hc_pack_bf16x2(a, b);
+            y32[pair] = yv[j][k];
+            float v0, v1;
+            hc_unpack_bf16x2(yv[j][k], v0, v1);
+            sum_sq += v0 * v0 + v1 * v1;
+        }
+        s_part[rt] = sum_sq;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (unsigned int j = 0; j < 4; ++j) {
+        const unsigned int w = warp + j * (HC_BLOCK / 32);
+        const float sum = hc_warp_reduce_sum(s_part[w * 32 + lane]);
+        if (lane == 0) s_warp[w] = sum;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const float val = hc_warp_reduce_sum(s_warp[lane]);
+        if (lane == 0) s_warp[0] = val;
+    }
+    __syncthreads();
+    const float rms = rsqrtf(s_warp[0] / (float)H + norm_eps);
+    const unsigned int* w32 = (const unsigned int*)norm_weight;
+    unsigned int* out32 = (unsigned int*)(norm_out + (size_t)t * H);
+    #pragma unroll
+    for (unsigned int j = 0; j < 4; ++j) {
+        #pragma unroll
+        for (unsigned int k = 0; k < 2; ++k) {
+            const unsigned int pair = tid + j * HC_BLOCK + k * RMS_THREADS;
+            float xv0, xv1, wv0, wv1;
+            hc_unpack_bf16x2(yv[j][k], xv0, xv1);
+            hc_unpack_bf16x2(w32[pair], wv0, wv1);
+            out32[pair] = hc_pack_bf16x2(xv0 * rms * wv0, xv1 * rms * wv1);
+        }
+    }
+}
+
 // ── Decode/verify mHC seam (T <= 32 rows) ────────────────────────────────
 // The per-token kernels leave most SMs idle at verify widths (one CTA per
 // row, three launches per site). Here the 4x4096 highway is split across
@@ -615,6 +726,44 @@ extern "C" __global__ void glm_hc_pre_finalize_ss_vec_bf16(
     const float hc_eps
 ) {
     glm_hc_pre_finalize_ss_vec_t<__nv_bfloat16>(streams, raw_mix, ss_in, hc_scale, hc_base, y_out, post_out, comb_out, sinkhorn_iters, norm_eps, hc_eps);
+}
+
+extern "C" __global__ void __launch_bounds__(256) glm_hc_pre_finalize_ss_norm(
+    const float* __restrict__ streams,
+    const float* __restrict__ raw_mix,
+    const float* __restrict__ ss_in,
+    const float* __restrict__ hc_scale,
+    const float* __restrict__ hc_base,
+    __nv_bfloat16* __restrict__ y_out,
+    float* __restrict__ post_out,
+    float* __restrict__ comb_out,
+    const __nv_bfloat16* __restrict__ norm_weight,
+    __nv_bfloat16* __restrict__ norm_out,
+    const unsigned int sinkhorn_iters,
+    const float norm_eps,
+    const float hc_eps
+) {
+    glm_hc_pre_finalize_ss_norm_t<float>(streams, raw_mix, ss_in, hc_scale, hc_base, y_out, post_out,
+        comb_out, norm_weight, norm_out, sinkhorn_iters, norm_eps, hc_eps);
+}
+
+extern "C" __global__ void __launch_bounds__(256) glm_hc_pre_finalize_ss_norm_bf16(
+    const __nv_bfloat16* __restrict__ streams,
+    const float* __restrict__ raw_mix,
+    const float* __restrict__ ss_in,
+    const float* __restrict__ hc_scale,
+    const float* __restrict__ hc_base,
+    __nv_bfloat16* __restrict__ y_out,
+    float* __restrict__ post_out,
+    float* __restrict__ comb_out,
+    const __nv_bfloat16* __restrict__ norm_weight,
+    __nv_bfloat16* __restrict__ norm_out,
+    const unsigned int sinkhorn_iters,
+    const float norm_eps,
+    const float hc_eps
+) {
+    glm_hc_pre_finalize_ss_norm_t<__nv_bfloat16>(streams, raw_mix, ss_in, hc_scale, hc_base, y_out,
+        post_out, comb_out, norm_weight, norm_out, sinkhorn_iters, norm_eps, hc_eps);
 }
 
 extern "C" __global__ void __launch_bounds__(256) glm_hc_post_mix_ss(
