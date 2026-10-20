@@ -15,6 +15,7 @@ mod poolside;
 mod qwen3_coder_required;
 mod sanitize;
 pub(crate) mod schema_limits;
+mod tool_or_json;
 mod tools_basic;
 
 /// Build a minimal vocabulary for testing.

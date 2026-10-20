@@ -8,6 +8,7 @@
 //! - [`GrammarState`]: per-request state that wraps a [`xgrammar::GrammarMatcher`];
 //!   fills bitmasks, accepts tokens, supports rollback for MTP speculative decode.
 
+mod branch;
 mod compile_misc;
 mod compile_tools;
 mod engine;

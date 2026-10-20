@@ -191,7 +191,8 @@ pub fn spec_think_for(
 /// [`spec_dispatch_eligible`] for one active sequence. A strict
 /// (`response_format`) grammar bars speculation like `disable_mtp` (see
 /// `ActiveSeq::strict_grammar`) unless `strict_spec`: the run masks every
-/// verify row of a strict sequence (`scheduler::strict_spec`).
+/// verify row of a strict sequence (`scheduler::strict_spec`), except the
+/// union's branch token (`ActiveSeq::grammar_branch_pending`).
 pub(super) fn seq_spec_eligible(
     a: &super::ActiveSeq,
     spec_think: bool,
@@ -204,7 +205,7 @@ pub(super) fn seq_spec_eligible(
         a.post_think_emitted,
         a.output_tokens.len() as u32,
         a.suppress_tool_call,
-        a.disable_mtp || (a.strict_grammar() && !strict_spec),
+        a.disable_mtp || (a.strict_grammar() && !strict_spec) || a.grammar_branch_pending(),
         spec_think,
         resume_guard,
         dflash_raw_argmax,

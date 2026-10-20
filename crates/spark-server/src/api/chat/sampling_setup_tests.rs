@@ -9,7 +9,8 @@ mod tests {
     // `super::super::` — this file is a sibling module of `sampling_setup`,
     // so one `super` only reaches `sampling_setup_tests` itself.
     use super::super::{
-        preset_penalties_apply, tool_choice_required_for_parser, tool_grammar_escape_applies,
+        GrammarChoice, grammar_choice, preset_penalties_apply, tool_call_bias,
+        tool_choice_required_for_parser, tool_grammar_escape_applies,
     };
 
     use crate::tool_parser::{ToolChoice, ToolChoiceFunction};
@@ -127,5 +128,74 @@ mod tests {
             None,
             Some("bare_json")
         ));
+    }
+
+    /// tools x response_format x tool_choice -> grammar. `none` names
+    /// tool_choice="none"; `required` covers "required", a named function and
+    /// a parser-required format.
+    #[test]
+    fn grammar_selection_matrix() {
+        use GrammarChoice::*;
+        // (tools, response_format, none, required, escape hatch) -> choice
+        let cases = [
+            // No tools.
+            ((false, false, false, false, false), None),
+            ((false, true, false, false, false), ResponseFormat),
+            // Tools, no response_format: the tool grammar, as ever.
+            ((true, false, false, false, false), ToolCall),
+            ((true, false, true, false, false), ToolCall),
+            ((true, false, false, true, false), ToolCall),
+            // Both: auto/unset -> the union; none -> schema; required -> tools.
+            ((true, true, false, false, false), ToolCallOrResponseFormat),
+            ((true, true, true, false, false), ResponseFormat),
+            ((true, true, false, true, false), ToolCall),
+            // The escape hatch keeps auto mode unconstrained; it never
+            // applies to required (`tool_grammar_escape_applies`).
+            ((true, false, false, false, true), EscapeHatch),
+            ((true, true, false, false, true), EscapeHatch),
+            ((true, true, true, false, true), ResponseFormat),
+        ];
+        for ((tools, rf, none, required, hatch), want) in cases {
+            assert_eq!(
+                grammar_choice(tools, rf, none, required, hatch),
+                want,
+                "tools={tools} response_format={rf} none={none} required={required} hatch={hatch}"
+            );
+        }
+    }
+
+    /// The matrix's `required` input, from the wire: auto/unset and "none" are
+    /// not required; "required" and a named function are.
+    #[test]
+    fn auto_and_none_are_not_required_but_required_and_named_are() {
+        let named = ToolChoice::Specific {
+            function: ToolChoiceFunction {
+                name: "get_weather".to_string(),
+            },
+        };
+        let mode = |m: &str| ToolChoice::Mode(m.to_string());
+        let required = |tc: Option<&ToolChoice>| {
+            tool_choice_required_for_parser(true, tc, Some("poolside_v1"))
+        };
+
+        assert!(!required(None));
+        assert!(!required(Some(&mode("auto"))));
+        assert!(!required(Some(&mode("none"))));
+        assert!(required(Some(&mode("required"))));
+        assert!(required(Some(&named)));
+    }
+
+    /// The union lets the model's mass choose: no `<tool_call>` boost, while
+    /// the anti-loop decay still applies to a repeating call.
+    #[test]
+    fn the_union_takes_no_tool_call_boost_but_keeps_the_loop_decay() {
+        for repeat in 0..2 {
+            assert_eq!(tool_call_bias(repeat, false), 3.0);
+            assert_eq!(tool_call_bias(repeat, true), 0.0);
+        }
+        for union in [false, true] {
+            assert_eq!(tool_call_bias(3, union), -5.0);
+            assert_eq!(tool_call_bias(9, union), -10.0);
+        }
     }
 }
