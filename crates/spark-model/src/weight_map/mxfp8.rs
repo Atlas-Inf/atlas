@@ -107,7 +107,7 @@ pub(crate) fn mxfp8_to_bf16_host(
 
 /// Expand a checkpoint MXFP8 projection to a fresh BF16 `[n, k]` buffer.
 ///
-/// EXACT: every E4M3 value times a power of two in [`EXACT_E8M0`] is
+/// EXACT: every E4M3 value times a power of two in `EXACT_E8M0` is
 /// representable in BF16, so no rounding happens anywhere — the BF16 copy is
 /// the checkpoint's own math, not an approximation of it.
 ///

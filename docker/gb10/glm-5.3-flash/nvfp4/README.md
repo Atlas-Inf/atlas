@@ -2,8 +2,10 @@
 
 # GLM-5.3-Flash NVFP4 on two DGX Sparks
 
-Build and run native Atlas with the original `nvidia/GLM-5.3-Flash-NVFP4`
-checkpoint, **TP2/EP2**, FP8 `fp8_g128` target KV and FP32 persistent KDA state.
+Build and run native Atlas with either `nvidia/GLM-5.3-Flash-NVFP4` or
+`nvidia/GLM-5.3-Flash-FP4-Local`, **TP2/EP2**, FP8 `fp8_g128` target KV and FP32
+persistent KDA state. FP4-Local describes the weight checkpoint; the target
+KV cache remains FP8 for both choices.
 Both ranks run the same image and settings over RoCE. DFlash2 is an explicit
 option requiring separately obtained draft weights; the commands do not enable
 native MTP or require a converted NVIDIA checkpoint.
@@ -32,6 +34,24 @@ sparse-MLA paths and includes their notices. No SparkGLM checkout, FlashInfer
 package or external prefill library is needed. Both hosts need NVIDIA Container
 Toolkit, a working RoCE link and sufficient free disk for the image build.
 
+## Choose the checkpoint
+
+Use the same complete checkpoint on both hosts:
+
+| Checkpoint | Host directory example |
+| --- | --- |
+| Existing `nvidia/GLM-5.3-Flash-NVFP4` | `/absolute/path/to/GLM-5.3-Flash-NVFP4` |
+| New `nvidia/GLM-5.3-Flash-FP4-Local` | `/absolute/path/to/GLM-5.3-Flash-FP4-Local` |
+
+For FP4-Local, pin revision
+[`76348ddb2be2e35e39ecfc00e75dc07703f4f3d5`](https://huggingface.co/nvidia/GLM-5.3-Flash-FP4-Local/tree/76348ddb2be2e35e39ecfc00e75dc07703f4f3d5).
+`MODEL_DIR` must point to the checkpoint root containing its config, tokenizer,
+safetensors index and complete nested `tensors/` directory. Preserve all paths
+referenced by the index; mounting `tensors/` alone or flattening its files is
+insufficient. The container sees the root at `/model` and tensor files beneath
+`/model/tensors/`. No conversion or different kernel target is required. See
+[FP4-Local loading and checkpoint terms](../../../../docs/porting/GLM_5_3_FLASH_FP4_LOCAL.md).
+
 ## Prepare both hosts
 
 Use Bash in this repository's root on each Spark. Set these values for the
@@ -42,6 +62,8 @@ resolve inside the mounted directory; use a materialized download if needed.
 
 ```bash
 MODEL_DIR=/absolute/path/to/GLM-5.3-Flash-NVFP4
+# For FP4-Local, use its complete pinned checkpoint root instead:
+# MODEL_DIR=/absolute/path/to/GLM-5.3-Flash-FP4-Local
 HEAD_FABRIC_IP=10.10.10.1
 IFACE=enp1s0f0np0
 HCA=rocep1s0f0,rocep1s0f1
@@ -89,6 +111,26 @@ conservative stream-ordered launch policy. They enable native KDA and sparse
 prefill; KDA has FP32 state storage but BF16 internal recurrence. Keep the same
 model and algorithm settings on both ranks. Host interface names and paths can
 differ. Use the image's bundled libraries rather than host `LD_LIBRARY_PATH`.
+
+### Optional native prefill optimizations
+
+The four new prefill switches default **off** with either checkpoint. To test
+all four, append this block after defining `DOCKER_ARGS` on **both ranks**:
+
+```bash
+DOCKER_ARGS+=(
+  -e ATLAS_GLM_KDA_SIDE_PROJ_LT=1
+  -e ATLAS_GLM_KDA_CONV_PLANES=1
+  -e ATLAS_GLM_HC_PREFILL_FUSE2=1
+  -e ATLAS_GLM_SP_GATHER_OVERLAP=1
+)
+```
+
+Keep the resolved settings identical across ranks. Gather overlap uses four
+blocks for `1`, or accepts `2` through `8` as an explicit block count; start
+with `1`. Omitting this optional block leaves the existing recipe unchanged.
+These paths adapt Jason McCartney / Enntity's work; see the
+[prefill eligibility, source credits and validation requirements](../../../../docs/porting/GLM_5_3_FLASH_PREFILL.md).
 
 ### Optional DFlash2
 
@@ -169,3 +211,10 @@ tiering outside this initial recipe.
 [Source credits and licensing boundaries](../../../../docs/porting/GLM_5_3_FLASH.md#provenance-credits-and-licensing-boundaries)
 remain part of the integration; numerical and historical results are scoped to
 their recorded sources and settings.
+
+## GPU results for this update
+
+Pending: fresh two-Spark serving checks for FP4-Local, prefill on/off numerical
+equivalence, and measured prefill/decode throughput. The existing validation
+receipts do not qualify this update. No new speed or maximum-capacity claim is
+made until those results are recorded.
