@@ -30,16 +30,17 @@ impl Rng {
     }
 }
 
+/// One backend for the process, made current on the calling test's thread
+/// (libtest runs each test on its own thread).
 pub(crate) fn backend() -> Result<&'static spark_runtime::cuda_backend::AtlasCudaBackend> {
     static GPU: std::sync::OnceLock<spark_runtime::cuda_backend::AtlasCudaBackend> =
         std::sync::OnceLock::new();
-    if let Some(g) = GPU.get() {
-        return Ok(g);
-    }
-    let g = spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())
-        .expect("CUDA backend");
-    let _ = GPU.set(g);
-    Ok(GPU.get().unwrap())
+    let g = GPU.get_or_init(|| {
+        spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())
+            .expect("CUDA backend")
+    });
+    g.bind_to_thread()?;
+    Ok(g)
 }
 
 pub(crate) fn upload(gpu: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
