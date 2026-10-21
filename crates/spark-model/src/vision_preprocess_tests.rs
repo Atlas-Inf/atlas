@@ -167,6 +167,7 @@ fn glm_explicit_budget_counts_temporal_volume_for_encoder_capacity() {
 fn ok_cfg() -> VisionConfig {
     VisionConfig {
         is_glm5_next: false,
+        is_qwen3vl_video: false,
         in_channels: 3,
         depth: 27,
         hidden_size: 1152,

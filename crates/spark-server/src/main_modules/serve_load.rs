@@ -165,6 +165,8 @@ pub(crate) fn load_model(
     let vision_max_pixels = resolve_vision_max_pixels(&args, &model_dir)?;
     if let Some(v) = config.vision.as_mut() {
         v.max_pixels = vision_max_pixels;
+        v.is_qwen3vl_video =
+            super::vision_processor::read_is_qwen3vl_video(&model_dir).unwrap_or_default();
     }
     match vision_max_pixels {
         Some(px) => tracing::info!(

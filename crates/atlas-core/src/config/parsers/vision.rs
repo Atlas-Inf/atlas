@@ -41,6 +41,7 @@ pub(crate) fn parse_vision_config(raw: &serde_json::Value) -> Option<VisionConfi
         .unwrap_or(0) as u32;
     Some(VisionConfig {
         is_glm5_next: false,
+        is_qwen3vl_video: false,
         in_channels: 3,
         depth: get_usize("depth"),
         hidden_size: get_usize("hidden_size"),
@@ -215,6 +216,7 @@ pub(crate) fn parse_glm5_vision_config(
         .unwrap_or_default();
     Ok(Some(VisionConfig {
         is_glm5_next: true,
+        is_qwen3vl_video: false,
         in_channels,
         depth,
         hidden_size,

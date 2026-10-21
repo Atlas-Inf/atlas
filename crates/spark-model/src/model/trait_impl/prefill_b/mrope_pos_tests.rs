@@ -294,3 +294,87 @@ fn a_degenerate_grid_is_survivable() {
     let (t, _, _) = run(&[IMG, TXT], &[(0, 0, 0)], 0);
     assert_eq!(t.len(), 2);
 }
+
+// ── Qwen3-VL nested per-group form ───────────────────────────────────────
+
+fn run_qwen3vl(
+    tokens: &[u32],
+    grids: &[(usize, usize, usize)],
+    start: u32,
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let (mut t, mut h, mut w) = (Vec::new(), Vec::new(), Vec::new());
+    build_qwen3vl(
+        tokens,
+        grids,
+        0,
+        grids.len(),
+        start,
+        IMG,
+        VID,
+        &mut t,
+        &mut h,
+        &mut w,
+    );
+    (t, h, w)
+}
+
+/// HF's get_rope_index truth for a 2-group video at gh=gw=2, spatial_merge=2:
+/// each group is a t=1 plane (T=base), H/W carry the grid, pos advances by
+/// max(gh,gw) per plane, and timestamp + inner/outer boundary tokens are
+/// ordinary text positions.
+#[test]
+fn qwen3vl_two_group_video_gives_each_group_its_own_t1_plane() {
+    // vs ts vs pad pad pad pad ve ts vs pad pad pad pad ve ve tail
+    let tokens = [
+        TXT, 7, // outer vision_start + "<0.2 seconds>" text
+        7, // inner vision_start
+        VID, VID, VID, VID, // group 0: 4 pads
+        7,   // inner vision_end
+        8,   // "<1.4 seconds>" text
+        7,   // inner vision_start
+        VID, VID, VID, VID, // group 1: 4 pads
+        7,   // inner vision_end
+        9,   // outer vision_end
+        TXT, // trailing text
+    ];
+    let grids = [(2usize, 2usize, 2usize)];
+    let (t, h, w) = run_qwen3vl(&tokens, &grids, 0);
+    // pos: 0,1 text; 2 text; pads at base=3: T=3, H/W plane; pos→3+2=5.
+    // group-0 pads (idx 3..7): T=3, H=3,4 / 3,4 pattern, W=3,4 alternating
+    assert_eq!(&t[3..7], &[3, 3, 3, 3]);
+    assert_eq!(&h[3..7], &[3, 3, 4, 4]);
+    assert_eq!(&w[3..7], &[3, 4, 3, 4]);
+    // inner ve (idx 7) + ts (8) + vs (9) are text at 5,6,7
+    assert_eq!(&t[7..10], &[5, 6, 7]);
+    // group-1 pads (idx 10..14): base 8
+    assert_eq!(&t[10..14], &[8, 8, 8, 8]);
+    assert_eq!(&h[10..14], &[8, 8, 9, 9]);
+    assert_eq!(&w[10..14], &[8, 9, 8, 9]);
+    // inner ve (14), outer ve (15), tail text (16): 10,11,12
+    assert_eq!(&t[14..17], &[10, 11, 12]);
+}
+
+#[test]
+fn qwen3vl_image_is_the_t1_case_with_pos_advancing_by_long_side() {
+    let tokens = [TXT, IMG, IMG, IMG, IMG, IMG, IMG, TXT];
+    let (t, h, w) = run_qwen3vl(&tokens, &[(1, 2, 3)], 0);
+    assert_eq!(&t[1..7], &[1, 1, 1, 1, 1, 1]);
+    assert_eq!(&h[1..7], &[1, 1, 1, 2, 2, 2]);
+    assert_eq!(&w[1..7], &[1, 2, 3, 1, 2, 3]);
+    assert_eq!(t[7], 4);
+}
+
+/// A chunk boundary mid-video: building over the complete prompt keeps the
+/// second group's base where the full-prompt walk puts it (text between
+/// planes still advances position).
+#[test]
+fn qwen3vl_chunk_boundary_mid_video_slices_correctly() {
+    let tokens = [TXT, TXT, VID, VID, VID, VID, TXT, VID, VID, VID, VID, TXT];
+    let grids = [(2usize, 2usize, 2usize)];
+    let (t, h, w) = run_qwen3vl(&tokens, &grids, 0);
+    // group0 pads idx2..6 base=2; text idx6=4; group1 idx7..11 base=5
+    assert_eq!(&t[2..6], &[2, 2, 2, 2]);
+    assert_eq!(&t[7..11], &[5, 5, 5, 5]);
+    assert_eq!(t[11], 7);
+    let _ = (h, w);
+}

@@ -60,6 +60,12 @@ pub struct PreprocessedVideo {
     /// prompt expansion places this text after each per-frame image marker;
     /// retaining it here keeps the prompt and encoder group order coupled.
     pub timestamps: Vec<f32>,
+    /// One timestamp per temporal group under HF's Qwen3VL rule — the mean
+    /// of the first and last frame's source time in each group, formatted
+    /// `{:.1f}` by the prompt expansion. Distinct from [`Self::timestamps`]
+    /// (GLM's floor-of-first-frame rule); only read when the checkpoint's
+    /// video processor is Qwen3VL.
+    pub timestamps_hf: Vec<f32>,
 }
 
 /// Summarised rather than derived: the payload is megabytes of f32 and a
@@ -491,6 +497,17 @@ pub fn preprocess_video(
         // from the positions actually sampled.
         timestamps: (0..grid_t)
             .map(|g| frame_times[keep[g * tp]].floor())
+            .collect(),
+        // HF Qwen3VL `replace_video_token`/`_calculate_timestamps`: the mean
+        // of the first and last frame's SOURCE time within each temporal
+        // group. A short final group repeats the last kept frame's time, as
+        // HF extends the index list.
+        timestamps_hf: (0..grid_t)
+            .map(|g| {
+                let first = keep[g * tp];
+                let last = keep[(g * tp + tp - 1).min(keep.len() - 1)];
+                (frame_times[first] + frame_times[last]) / 2.0
+            })
             .collect(),
     })
 }

@@ -30,9 +30,19 @@ pub fn tokens_per_group(w: u32, h: u32, patch: u32, merge: u32) -> u32 {
 pub struct Ratio {
     /// Temporal groups inferred for the SHORTEST clip.
     pub unit_groups: usize,
+    /// Non-pad tokens the format adds PER GROUP (a timestamp string plus an
+    /// inner marker pair, at most [`MAX_GROUP_TEXT`]). 0 for formats whose
+    /// groups are pure pad runs.
+    pub per_group_text: usize,
     /// Template overhead implied, in tokens.
     pub overhead: usize,
 }
+
+/// Per-group non-pad tokens a format may add. Qwen3-VL emits
+/// `"<t.t seconds>"` plus an inner vision start/end pair per group — a
+/// timestamp like `"<123.5 seconds>"` tokenizes to ~6 + 2 markers, well under
+/// this bound. Larger would let a malformed run fake a group count.
+pub const MAX_GROUP_TEXT: usize = 16;
 
 /// Check that temporal groups scale with duration, from three clips at 1x, 2x
 /// and 4x — and infer the group count and template overhead as a by-product.
@@ -58,28 +68,36 @@ pub struct Ratio {
 /// leg is built around.
 ///
 /// `plane` is used only to turn the verified differences into a reportable
-/// group count; the pass/fail decision does not depend on it.
+/// group count; the pass/fail decision does not depend on it. A format may
+/// append up to [`MAX_GROUP_TEXT`] non-pad tokens per group (a timestamp
+/// string and marker pair), so the decomposition tries `plane + k` for the
+/// smallest fitting k — legacy formats resolve at k=0 exactly as before.
 pub fn check_proportional(t1: usize, t2: usize, t4: usize, plane: usize) -> Option<Ratio> {
     let d21 = t2.checked_sub(t1)?;
     let d42 = t4.checked_sub(t2)?;
     if d21 == 0 || d42 != 2 * d21 {
         return None;
     }
-    if plane == 0 || d21 % plane != 0 {
+    if plane == 0 {
         return None;
     }
-    let unit_groups = d21 / plane;
+    // Smallest k so a whole number of groups explains the step. The smallest
+    // admissible per-group text keeps legacy formats at k=0 unchanged.
+    let k = (0..=MAX_GROUP_TEXT).find(|&k| d21 % (plane + k) == 0)?;
+    let unit = plane + k;
+    let unit_groups = d21 / unit;
     if unit_groups == 0 {
         return None;
     }
     // The overhead the shortest clip implies must also explain the other two,
     // or the three points are not one line and the inference is meaningless.
-    let overhead = t1.checked_sub(unit_groups * plane)?;
-    if overhead + 2 * unit_groups * plane != t2 || overhead + 4 * unit_groups * plane != t4 {
+    let overhead = t1.checked_sub(unit_groups * unit)?;
+    if overhead + 2 * unit_groups * unit != t2 || overhead + 4 * unit_groups * unit != t4 {
         return None;
     }
     Some(Ratio {
         unit_groups,
+        per_group_text: k,
         overhead,
     })
 }

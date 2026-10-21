@@ -120,15 +120,24 @@ pub(super) fn render_template(
     // matching input token. Other model families keep the legacy pad-only
     // expansion below.
     let prompt_tokens = if !vision_placeholders.is_empty() {
-        match state
-            .tokenizer
-            .expand_glm5_vision_placeholders(prompt_tokens, vision_placeholders)
-        {
+        // Both placeholder families share the rendered-triple contract; the
+        // flag on the first entry picks the checkpoint's expansion family
+        // (homogeneous per request).
+        let expanded = if vision_placeholders.iter().any(|p| p.qwen3vl) {
+            state
+                .tokenizer
+                .expand_qwen3vl_vision_placeholders(prompt_tokens, vision_placeholders)
+        } else {
+            state
+                .tokenizer
+                .expand_glm5_vision_placeholders(prompt_tokens, vision_placeholders)
+        };
+        match expanded {
             Ok(tokens) => tokens,
             Err(e) => {
                 return Err(openai_error_response(
                     StatusCode::BAD_REQUEST,
-                    format!("GLM-5 vision placeholder error: {e}"),
+                    format!("vision placeholder error: {e}"),
                 ));
             }
         }

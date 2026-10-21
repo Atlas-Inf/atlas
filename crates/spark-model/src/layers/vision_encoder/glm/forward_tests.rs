@@ -111,6 +111,7 @@ const HEADS: usize = 2;
 /// tiny hidden sizes, capped at 16x16 input patches.
 fn encoder(gpu: &NamedGpu) -> GlmVisionEncoder {
     let config = VisionConfig {
+        is_qwen3vl_video: false,
         is_glm5_next: true,
         in_channels: 3,
         depth: 2,
