@@ -9,8 +9,9 @@ RAM row cache (§4 of the single-Spark doc).
 
 **Status.** It serves and is exact where exactness is claimed (§3a lists each contract and what
 proves it). Greedy output with speculation equals serial greedy output (8/8 at 1 and 8 concurrent
-streams) after every change below. The resident table is bit-identical to the NVMe-cached path. BFCL
-golden ST-995 is 87.44 / 87.45 (n=995) on the current numerics. All numbers are from one pair (two
+streams) after every change below. The resident table is bit-identical to the NVMe-cached path. On
+the final head, BFCL golden ST-995 is 87.04 / 85.75 (n=995) and the MLPerf agentic performance leg
+completes 1,007 / 1,007 turns. All numbers are from one pair (two
 GB10s, driver 580, CUDA 13.0, cuBLAS 13.0.2.14 pinned on both ranks) with the rc16 TP2 profile: util
 0.88, 8 sequences x 32K, MTP 7 drafts, exact verify, prefix cache, `reasoning_effort` low. Single runs
 unless repetitions are listed.
@@ -63,8 +64,24 @@ on the `wip/mxfp8-tc` branch.
   tails (qwen4exp fast path and the generic `forward_batched`) consume the shared expert exactly once
   (zero row before the single all-reduce, one post-reduce add; without EP, blended once in place).
 - BFCL ST-995 golden draw: 87.64 / 87.71 (`run-1792365985129633322`, first resident build, NVFP4
-  router) and 87.44 / 87.45 (`run-1792406664787105023`, BF16 router + TC MoE). The difference is
-  within run-to-run noise.
+  router) and 87.44 / 87.45 (`run-1792406664787105023`, BF16 router + TC MoE).
+- Final head 864c81fb3 on the pair (rc16 profile, resident table):
+  - speculative == serial greedy 8/8 at C1 and C8, and both identical to the earlier references;
+    behind a shared ~4.4K-token prefix (4,448 / 4,480 cached tokens) the speculative, cached C1 and C4
+    outputs equal serial uncached output 8/8; cross-contamination 8/8 (1,696 tokens); tool probe 21/21;
+  - router rollback (`ATLAS_QWEN4EXP_ROUTER_NVFP4=1`): speculative == serial 8/8; NVFP4 pack on the
+    same binary: speculative == serial 8/8 at C1 and C8;
+  - long context (4x262k profile): key-value needles at 9K, 35K, 66K, 128K and 240K tokens all found;
+    a 77K needle with a warm follow-up and four concurrent 100K prompts all answered;
+  - BFCL ST-995: 87.04 / 85.75 (`run-1792557711972352834`), above the MLPerf floors (83.64 / 85.32).
+    Against the previous build the differences are one or two items in small subsets
+    (live_parallel 2 of 16, irrelevance, live_irrelevance and live_simple 1 each) while non_live rose
+    (85.95 vs 84.91). Single run;
+  - MLPerf edge agentic performance leg (2.5 h dataset, concurrency 1, temperature 0): 1,007 / 1,007
+    turns completed, 0 failed, 4,027 s; TTFT p50 / p90 / p99 364 / 609 / 1,179 ms; TPOT 24.2 / 26.4 /
+    28.2 ms; inline action score 0.587 over 1,006 scored turns (the harness's reference, Qwen3.6-27B
+    Q4_K_M on Jetson Thor, took 2 h 37 m at ~91 ms TPOT and scored 0.634; a different model, not a
+    gate).
 
 ## 3a. Exactness and determinism contracts
 
@@ -79,20 +96,58 @@ on the `wip/mxfp8-tc` branch.
 
 ## 4. Results (same pair; tok/s; every row on its own fresh boot)
 
-| | FP4-Local, first resident build | FP4-Local, V5 | NVFP4 pack, same flags |
-|---|---|---|---|
-| decode-floor (1500 tok) x3 (accept) | 89.0 / 88.9 / 88.7 (4.37) | 84.6 / 84.6 / 84.3 (4.27) | 82.1 / 82.3 / 82.1 (4.13) |
-| short chat decode, first token | 67.98, 0.165 s | 63.02, 0.157 s | 60.86, 0.144 s |
-| ~18K agent turn decode, first token | 46.27, 5.73 s | 43.05, 5.83 s | 42.07, 6.15 s |
-| cold TTFT median (1K / 4K / 16K) | 1493 ms | 1503 ms | 1408 ms |
-| total at 1 / 2 / 4 / 5 / 8 users (isl 512, osl 256) | 63.6 / 104.1 / 137.3 / 148.2 / 165.9 | 64.5 / 108.1 / 146.0 / 161.0 / 205.7 | 61.3 / 102.5 / 156.6 / 176.8 / 232.1 |
+| | FP4-Local, first resident build | FP4-Local, V5 | V5 binary (37565c203), final session | This head (864c81fb3), final session | NVFP4 pack, same flags |
+|---|---|---|---|---|---|
+| decode-floor (1500 tok) x3 (accept) | 89.0 / 88.9 / 88.7 (4.37) | 84.6 / 84.6 / 84.3 (4.27) | 84.0 / 83.9 / 83.9 (4.27) | 83.7 / 83.6 / 83.6 (4.27) | 82.1 / 82.3 / 82.1 (4.13) |
+| short chat decode, first token | 67.98, 0.165 s | 63.02, 0.157 s | 63.48, 0.166 s | 63.07, 0.166 s | 60.86, 0.144 s |
+| ~18K agent turn decode, first token | 46.27, 5.73 s | 43.05, 5.83 s | 43.84, 5.83 s | 43.28, 5.82 s | 42.07, 6.15 s |
+| cold TTFT median (1K / 4K / 16K) | 1493 ms | 1503 ms | – | 1507 ms | 1408 ms |
+| total at 1 / 2 / 4 / 5 / 8 users (isl 512, osl 256) | 63.6 / 104.1 / 137.3 / 148.2 / 165.9 | 64.5 / 108.1 / 146.0 / 161.0 / 205.7 | 65 / 109 / 131 / 161 / 207 | 65 / 108 / 130 / 161 / 206 | 61.3 / 102.5 / 156.6 / 176.8 / 232.1 |
 
-- The NVFP4-pack column predates the TC-MoE and BF16-router changes.
+- The two "final session" columns are a same-session A/B on fresh boots: this head is within 1% of the
+  V5 binary at the same acceptance. The 4-user total reads 130-131 on both binaries in that session,
+  against 146 two days earlier on the V5 binary: the change is between sessions, not between builds.
+- The NVFP4-pack column predates the TC-MoE and BF16-router changes; §4a has the NVFP4 pack on this
+  head.
 - Single-stream speed moves with acceptance, which moves with each numerics baseline: the TC MoE
   family, the BF16 router and the prefill router each changed the exact outputs.
 - For reference, measured on one Spark with the same streaming client (another box, not an A/B):
   - Atlas FP4-Local: short 25.6 tok/s; agent turn 22.9 tok/s with a 15.4 s first token.
   - NVIDIA's vLLM recipe: short 41.5 tok/s; agent turn 43.6 tok/s with a 9.2 s first token.
+
+## 4a. Against other engines (sparkDash decode protocol)
+
+sparkDash is the decode benchmark MiaAI-Lab's TensorFold recipes and SparkQwen publish with: thinking
+off, temperature 0, 400 forced tokens, aggregate tok/s. Atlas rows are this PR's head (864c81fb3) on
+our pair, mean of 3 repetitions each (spread under 2%, except FP4-Local json at C8: 307.7-317.9), driven by SparkQwen's headless
+`sd_bench.mjs` against sparkDash `be35be9`. The other rows are published numbers from other GB10 pairs
+with their own recipes: observations, not A/Bs. Every engine here speculates (MTP; TensorFold adds
+copy drafts); Atlas's speculation is exact (drafted == serial, §3a).
+
+Aggregate tok/s at 1 / 2 / 4 / 8 concurrent requests:
+
+| Engine, checkpoint | prose | code | structured | json |
+|---|---|---|---|---|
+| Atlas TP2, FP4-Local (resident PLE) | 71.2 / 107.5 / 148.4 / 266.4 | 92.3 / 137.1 / 208.6 / 275.2 | 101.6 / 161.4 / 354 / 397.3 | 78.0 / 130.6 / 187.7 / 314.4 |
+| Atlas TP2, NVFP4 pack (same binary, cached PLE) | 72.0 / 116.9 / 160.7 / 283.9 | 91.7 / 142.2 / 218.9 / 291.0 | 99.7 / 175.0 / 403.6 / 461.1 | 83.7 / 143.8 / 202.2 / 350.9 |
+| TensorFold dual v1.0, NVFP4 (MiaAI-Lab README, 2026-10-07) | 67.4 / 98.9 / 152.2 / 231.2 | – | – | – |
+| vLLM v0.30 TP2+EP, MTP3, NVFP4 (SparkQwen RC15 receipts) | 61.0 / 95.9 / 148.2 / 238-241 | 72.2 / 120.9 / 190.8 / 291-307 | 77.3 / 129.6 / 230.5 / 362-376 | 66.4 / 115.7 / 201.2 / 331-339 |
+| SparkQwen RC16 (Atlas fork) TP2, NVFP4 (its receipts) | 72.7 / 112.5 / 170.5 / 260.3 | 93.8 / 147.9 / 214.3 / 296.9 | 102.0 / 165.1 / 251.0 / 389.1 | 84.5 / 141.4 / 217.7 / 333.0 |
+| Atlas TP2, FP4-Local, no speculation | 36.4 / 60.4 / 104.6 / 162.4 | 36.7 / 59.7 / 94.1 / 138.7 | 37.0 / 65.0 / 117.2 / 194.5 | 36.9 / 66.1 / 119.9 / 197.2 |
+
+- On the NVFP4 checkpoint, Atlas is ahead of TensorFold dual at every published point (prose
+  +7% / +18% / +6% / +23%) and of vLLM v0.30 everywhere except code at C8 (within vLLM's own 6%
+  run-to-run spread) and json at C4 (equal). Against SparkQwen RC16 it is level at C1 (1-2% lower),
+  6-7% lower at C4 on prose and json, and ahead at C8 except code (2% lower).
+- FP4-Local against the NVFP4 pack on the same binary: -7% to +2% at C1, 5-14% lower at C8. Its
+  attention/GDN projections are 8-bit MXFP8 instead of 4-bit (more bytes per step; §5).
+- SGLang publishes no sparkDash numbers for this model. Its published TP2 results (NVFP4, other
+  harnesses) are 47.5 / 87.6 / 158.2 tok/s at 1 / 4 / 8 requests on 192-token coding requests with
+  NEXTN, 26.1 tok/s without speculation (PixelML), and ~63 tok/s single stream / 306 tok/s at 6 streams
+  on long HTML generation (beastllama field notes).
+- Long context (4x262k profile): 77K-token needle found, 23.9 s to first token, 56.0 tok/s; four
+  concurrent 100K-token prompts all answered (SparkQwen's `long_probe.py`). SparkQwen RC16 reports
+  21.1 s / 58.4 tok/s and vLLM 22.3 s / 50.6 tok/s on the same probe on their pair.
 
 ## 5. Where the time goes (nsys with CUDA-graph node tracing, rank 0, per decode step)
 
