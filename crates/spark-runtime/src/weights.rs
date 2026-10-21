@@ -87,6 +87,10 @@ impl WeightDtype {
             // (`keeps_raw_f16` → FP16), everything else converts to BF16.
             safetensors::Dtype::I16 => Ok(Self::Int16),
             safetensors::Dtype::I32 => Ok(Self::Int32),
+            // U32: raw 4-byte container. Only the CSF NVFP4 scale exception
+            // streams (`*.nvfp4_csf_exceptions`) use it, and the loader
+            // decodes those on the host; signedness is never interpreted.
+            safetensors::Dtype::U32 => Ok(Self::Int32),
             safetensors::Dtype::F32 => Ok(Self::FP32),
             safetensors::Dtype::U8 => Ok(Self::UInt8),
             // I8: raw 1-byte container for 4-bit-packed NVFP4 (DeepSeek-V4 MTP
@@ -110,6 +114,8 @@ impl WeightDtype {
             "BF16" => Self::BF16,
             "I16" => Self::Int16,
             "I32" => Self::Int32,
+            // U32: raw 4-byte container, as on the disk path.
+            "U32" => Self::Int32,
             "U8" => Self::UInt8,
             // I8 is a 1-byte raw container (packed NVFP4); signedness is
             // irrelevant, treat as raw bytes exactly like the disk path.
@@ -511,7 +517,7 @@ mod side_files;
 mod store_edit;
 pub(crate) use name_utils::keeps_raw_f16;
 pub(crate) use name_utils::split_trailing_index;
-pub use name_utils::{is_ngram_table, parse_expert_index};
+pub use name_utils::{is_csf_stream, is_ngram_table, parse_expert_index};
 pub(crate) use side_files::merge_exl3_side_files;
 
 #[cfg(test)]

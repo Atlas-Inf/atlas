@@ -36,6 +36,29 @@ pub fn silu_mul(
         .launch(stream)
 }
 
+/// SiLU·mul over a `[num_tokens, inter*2]` gate‖up layout — the first `inter`
+/// columns of each row are the gate, the next `inter` the up.
+///
+/// Kernel: `fused_silu_mul` (`dense_gemm_bf16.cu`), module `gemm`.
+pub fn fused_silu_mul(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gate_up: DevicePtr,
+    output: DevicePtr,
+    num_tokens: u32,
+    inter_size: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(num_tokens * inter_size / 2, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(gate_up)
+        .arg_ptr(output)
+        .arg_u32(num_tokens)
+        .arg_u32(inter_size)
+        .launch(stream)
+}
+
 /// Fused SiLU·mul + per-token-group(128) FP8-E4M3 quantization — replaces the
 /// `silu_mul` → `per_token_group_quant_fp8` pair on the W8A8 prefill down-path
 /// without materializing the BF16 intermediate. Bit-identical to the pair

@@ -14,19 +14,100 @@ use crate::weight_map::{DenseWeight, MtpWeights, dense_auto, detect_nvfp4_varian
 
 pub struct Qwen35WeightLoader;
 
-fn vision_dense_auto(
+/// A ViT projection in its native precision: BF16 stays a raw pointer;
+/// FP4-Local's MXFP8 (`attn.qkv`/`attn.proj`) and NVFP4 (`linear_fc{1,2}`)
+/// tensors upload as shipped and expand on-GPU per GEMM — bit-identical to
+/// the host expansion other checkpoints get.
+/// A quantized tensor's resident pointer: resident if materialize uploaded
+/// it natively, else the deferred shard bytes uploaded verbatim (the vision
+/// NVFP4 tensors stay deferred — nothing else consumes them).
+#[cfg(feature = "cuda")]
+fn vision_tensor_ptr(
+    store: &WeightStore,
+    name: &str,
+    gpu: &dyn GpuBackend,
+) -> Result<(
+    spark_runtime::gpu::DevicePtr,
+    spark_runtime::weights::WeightDtype,
+    Vec<usize>,
+)> {
+    if let Ok(t) = store.get(name) {
+        return Ok((t.ptr, t.dtype, t.shape.clone()));
+    }
+    let d = store
+        .deferred(name)
+        .with_context(|| format!("vision: `{name}` neither resident nor deferred"))?;
+    let len = d.shape.iter().product::<usize>();
+    let bytes = len
+        * match d.dtype {
+            WeightDtype::BF16 | WeightDtype::FP16 => 2,
+            WeightDtype::FP32 => 4,
+            _ => 1,
+        };
+    use std::io::Read as _;
+    let mut buf = vec![0u8; bytes];
+    let mut f = std::fs::File::open(&d.path)?;
+    use std::io::Seek as _;
+    f.seek(std::io::SeekFrom::Start(d.offset))?;
+    f.read_exact(&mut buf)?;
+    let p = gpu.alloc(bytes)?;
+    gpu.copy_h2d(&buf, p)?;
+    Ok((p, d.dtype, d.shape.clone()))
+}
+
+#[cfg(feature = "cuda")]
+fn vision_weight(
     store: &WeightStore,
     prefix: &str,
     gpu: &dyn GpuBackend,
-) -> Result<DenseWeight> {
+) -> Result<crate::layers::VitWeight> {
     let name = format!("{prefix}.weight");
-    let w = store.get(&name)?;
-    match w.dtype {
-        WeightDtype::BF16 | WeightDtype::FP8E4M3 => {
-            crate::weight_map::dense_auto_fp8_or_bf16(store, prefix, gpu)
+    let (wptr, wdtype, wshape) = vision_tensor_ptr(store, &name, gpu)?;
+    match wdtype {
+        WeightDtype::BF16 => Ok(crate::layers::VitWeight::Bf16(wptr)),
+        WeightDtype::FP8E4M3 => {
+            // MXFP8: E4M3 [n,k] + U8 E8M0 [n,k/32].
+            let (sptr, sdtype, sshape) =
+                vision_tensor_ptr(store, &format!("{prefix}.weight_scale"), gpu)?;
+            anyhow::ensure!(
+                wshape.len() == 2
+                    && sdtype == WeightDtype::UInt8
+                    && sshape == [wshape[0], wshape[1] / 32],
+                "vision MXFP8 {prefix}: weight {wshape:?} + scale {sshape:?}"
+            );
+            Ok(crate::layers::VitWeight::Mxfp8(
+                crate::weight_map::Mxfp8Proj {
+                    w: crate::weight_map::Mxfp8Weight {
+                        data: wptr,
+                        scales: sptr,
+                    },
+                    n: wshape[0] as u32,
+                    k: wshape[1] as u32,
+                },
+            ))
         }
-        WeightDtype::FP32 => crate::weight_map::dense_f32_safe(store, &name, gpu),
-        other => anyhow::bail!("vision_dense_auto: unsupported dtype {other:?} for {name}"),
+        WeightDtype::UInt8 => {
+            // NVFP4: packed U8 [n,k/2] + E4M3 [n,k/16] + F32 weight_scale_2.
+            let (sptr, sdtype, sshape) =
+                vision_tensor_ptr(store, &format!("{prefix}.weight_scale"), gpu)?;
+            anyhow::ensure!(
+                wshape.len() == 2 && sdtype == WeightDtype::FP8E4M3 && sshape[0] == wshape[0],
+                "vision NVFP4 {prefix}: weight {wshape:?} + scale {sshape:?}"
+            );
+            let gname = format!("{prefix}.weight_scale_2");
+            let gt = store.get(&gname)?;
+            let mut gb = [0u8; 4];
+            gpu.copy_d2h(gt.ptr, &mut gb)?;
+            store.reclaim(gpu, &gname)?;
+            Ok(crate::layers::VitWeight::Nvfp4 {
+                packed: wptr,
+                scales: sptr,
+                global: f32::from_le_bytes(gb),
+                n: wshape[0] as u32,
+                k: (wshape[1] * 2) as u32,
+            })
+        }
+        other => anyhow::bail!("vision_weight: unsupported dtype {other:?} for {name}"),
     }
 }
 
@@ -202,18 +283,18 @@ impl ModelWeightLoader for Qwen35WeightLoader {
                 norm1_w: vision_tensor_dense_auto(store, &format!("{bp}.norm1.weight"), gpu)?
                     .weight,
                 norm1_b: vision_tensor_dense_auto(store, &format!("{bp}.norm1.bias"), gpu)?.weight,
-                qkv_w: vision_dense_auto(store, &format!("{bp}.attn.qkv"), gpu)?.weight,
+                qkv_w: vision_weight(store, &format!("{bp}.attn.qkv"), gpu)?,
                 qkv_b: vision_tensor_dense_auto(store, &format!("{bp}.attn.qkv.bias"), gpu)?.weight,
-                proj_w: vision_dense_auto(store, &format!("{bp}.attn.proj"), gpu)?.weight,
+                proj_w: vision_weight(store, &format!("{bp}.attn.proj"), gpu)?,
                 proj_b: vision_tensor_dense_auto(store, &format!("{bp}.attn.proj.bias"), gpu)?
                     .weight,
                 norm2_w: vision_tensor_dense_auto(store, &format!("{bp}.norm2.weight"), gpu)?
                     .weight,
                 norm2_b: vision_tensor_dense_auto(store, &format!("{bp}.norm2.bias"), gpu)?.weight,
-                fc1_w: vision_dense_auto(store, &format!("{bp}.mlp.linear_fc1"), gpu)?.weight,
+                fc1_w: vision_weight(store, &format!("{bp}.mlp.linear_fc1"), gpu)?,
                 fc1_b: vision_tensor_dense_auto(store, &format!("{bp}.mlp.linear_fc1.bias"), gpu)?
                     .weight,
-                fc2_w: vision_dense_auto(store, &format!("{bp}.mlp.linear_fc2"), gpu)?.weight,
+                fc2_w: vision_weight(store, &format!("{bp}.mlp.linear_fc2"), gpu)?,
                 fc2_b: vision_tensor_dense_auto(store, &format!("{bp}.mlp.linear_fc2.bias"), gpu)?
                     .weight,
             });
@@ -225,10 +306,10 @@ impl ModelWeightLoader for Qwen35WeightLoader {
             deepstack.push(crate::layers::MergerLayer {
                 norm_w: vision_tensor_dense_auto(store, &format!("{mp}.norm.weight"), gpu)?.weight,
                 norm_b: vision_tensor_dense_auto(store, &format!("{mp}.norm.bias"), gpu)?.weight,
-                fc1_w: vision_dense_auto(store, &format!("{mp}.linear_fc1"), gpu)?.weight,
+                fc1_w: vision_weight(store, &format!("{mp}.linear_fc1"), gpu)?,
                 fc1_b: vision_tensor_dense_auto(store, &format!("{mp}.linear_fc1.bias"), gpu)?
                     .weight,
-                fc2_w: vision_dense_auto(store, &format!("{mp}.linear_fc2"), gpu)?.weight,
+                fc2_w: vision_weight(store, &format!("{mp}.linear_fc2"), gpu)?,
                 fc2_b: vision_tensor_dense_auto(store, &format!("{mp}.linear_fc2.bias"), gpu)?
                     .weight,
             });
@@ -238,9 +319,9 @@ impl ModelWeightLoader for Qwen35WeightLoader {
         let merger = crate::layers::MergerLayer {
             norm_w: vision_tensor_dense_auto(store, &format!("{mp}.norm.weight"), gpu)?.weight,
             norm_b: vision_tensor_dense_auto(store, &format!("{mp}.norm.bias"), gpu)?.weight,
-            fc1_w: vision_dense_auto(store, &format!("{mp}.linear_fc1"), gpu)?.weight,
+            fc1_w: vision_weight(store, &format!("{mp}.linear_fc1"), gpu)?,
             fc1_b: vision_tensor_dense_auto(store, &format!("{mp}.linear_fc1.bias"), gpu)?.weight,
-            fc2_w: vision_dense_auto(store, &format!("{mp}.linear_fc2"), gpu)?.weight,
+            fc2_w: vision_weight(store, &format!("{mp}.linear_fc2"), gpu)?,
             fc2_b: vision_tensor_dense_auto(store, &format!("{mp}.linear_fc2.bias"), gpu)?.weight,
         };
 

@@ -97,6 +97,7 @@ pub(crate) fn load_moe_qwen35(
     quantize_k: spark_runtime::gpu::KernelHandle,
     stream: u64,
     skip_routed_experts: bool,
+    null_shared_expert: bool,
 ) -> Result<MoeWeights> {
     let p = format!("{layer_prefix}.mlp");
 
@@ -261,7 +262,14 @@ pub(crate) fn load_moe_qwen35(
         })
     };
 
-    let shared_expert = load_expert(&format!("{p}.shared_expert"))?;
+    // `null_shared_expert`: the caller serves the shared expert natively
+    // (FP4-Local's MXFP8) and installs it on the MoeLayer itself — the fused
+    // kernels see NULL shared weights and skip them.
+    let shared_expert = if null_shared_expert {
+        ExpertWeight::null()
+    } else {
+        load_expert(&format!("{p}.shared_expert"))?
+    };
 
     let mut experts = Vec::with_capacity(num_experts);
     for e in 0..num_experts {

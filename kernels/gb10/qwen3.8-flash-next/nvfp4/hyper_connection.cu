@@ -144,7 +144,7 @@ extern "C" __global__ void hc_expand(
 
 __device__ __forceinline__ void qhc_collapse(
     const float* __restrict__ streams,
-    const __nv_bfloat16* __restrict__ hc_norm_w,
+    const float* __restrict__ hc_norm_w,
     const __nv_bfloat16* __restrict__ down_w,
     const __nv_bfloat16* __restrict__ up_w,
     const __nv_bfloat16* __restrict__ inject_w,
@@ -193,7 +193,7 @@ __device__ __forceinline__ void qhc_collapse(
 
     // ── stage normed = x * rms * (1 + w) once ──
     for (unsigned int i = tid; i < hc_dim; i += blockDim.x) {
-        smem_normed[i] = x[i] * smem_rms[i / H] * (1.0f + (float)hc_norm_w[i]);
+        smem_normed[i] = x[i] * smem_rms[i / H] * (1.0f + hc_norm_w[i]);
     }
     __syncthreads();
 
@@ -252,7 +252,7 @@ __device__ __forceinline__ void qhc_collapse(
 // streams [T, hc, H] -> y_out [T, H] collapsed, inj_out [T, hc].
 extern "C" __global__ void hc_pre(
     const float* __restrict__ streams,
-    const __nv_bfloat16* __restrict__ hc_norm_w,  // [hc*H]
+    const float* __restrict__ hc_norm_w,  // [hc*H]
     const __nv_bfloat16* __restrict__ down_w,     // [rank, hc*H]
     const __nv_bfloat16* __restrict__ up_w,       // [rank, hc*H]
     const __nv_bfloat16* __restrict__ inject_w,   // [hc, hc*H]
@@ -274,7 +274,7 @@ extern "C" __global__ void hc_pre(
 // role.
 extern "C" __global__ void hc_head(
     const float* __restrict__ streams,
-    const __nv_bfloat16* __restrict__ hc_norm_w,
+    const float* __restrict__ hc_norm_w,
     const __nv_bfloat16* __restrict__ down_w,
     const __nv_bfloat16* __restrict__ up_w,
     __nv_bfloat16* __restrict__ y_out,
@@ -345,7 +345,7 @@ extern "C" __global__ void hc_post(
 // Stage 1: normed = x * rms * (1 + w) -> global scratch [T, hc*H].
 extern "C" __global__ void hc_pre_stage(
     const float* __restrict__ streams,
-    const __nv_bfloat16* __restrict__ hc_norm_w,
+    const float* __restrict__ hc_norm_w,
     float* __restrict__ normed_out,            // [T, hc*H]
     const unsigned int hidden_size,
     const unsigned int hc,
@@ -385,7 +385,7 @@ extern "C" __global__ void hc_pre_stage(
         __syncthreads();
     }
     for (unsigned int i = tid; i < hc_dim; i += blockDim.x) {
-        out[i] = x[i] * smem_rms[i / H] * (1.0f + (float)hc_norm_w[i]);
+        out[i] = x[i] * smem_rms[i / H] * (1.0f + hc_norm_w[i]);
     }
 }
 
@@ -848,7 +848,7 @@ extern "C" __global__ void hc_pre_finish_x4(
 
 extern "C" __global__ void hc_pre_stage_bf16(
     const float* __restrict__ streams,
-    const __nv_bfloat16* __restrict__ hc_norm_w,
+    const float* __restrict__ hc_norm_w,
     __nv_bfloat16* __restrict__ normed_out,    // [T, hc*H] BF16
     const unsigned int hidden_size,
     const unsigned int hc,
@@ -889,7 +889,7 @@ extern "C" __global__ void hc_pre_stage_bf16(
     }
     for (unsigned int i = tid; i < hc_dim; i += blockDim.x) {
         out[i] = __float2bfloat16(
-            x[i] * smem_rms[i / H] * (1.0f + (float)hc_norm_w[i]));
+            x[i] * smem_rms[i / H] * (1.0f + hc_norm_w[i]));
     }
 }
 
@@ -918,7 +918,7 @@ extern "C" __global__ void __launch_bounds__(QHC_WBLOCK, 1) hc_post_stage_bf16(
     const __nv_bfloat16* __restrict__ block_out, // [T, H]
     float* streams,                              // [T, hc, H]: residual in, post out
     const float* __restrict__ inj,               // [T, hc]
-    const __nv_bfloat16* __restrict__ hc_norm_w, // [hc*H]
+    const float* __restrict__ hc_norm_w, // [hc*H]
     __nv_bfloat16* __restrict__ normed_out,      // [T, hc*H] BF16
     const unsigned int hidden_size,
     const unsigned int hc,
@@ -988,7 +988,7 @@ extern "C" __global__ void __launch_bounds__(QHC_WBLOCK, 1) hc_post_stage_bf16(
                 if (s2 < hc) {
                     const unsigned int i = s2 * H + d;
                     out[i] = __float2bfloat16(
-                        v[k][s2] * smem_rms[s2] * (1.0f + (float)hc_norm_w[i]));
+                        v[k][s2] * smem_rms[s2] * (1.0f + hc_norm_w[i]));
                 }
             }
         }
@@ -2102,7 +2102,7 @@ extern "C" __global__ void hc_pre_down_vec_wide(
 // columns [y * hc_dim / S, (y + 1) * hc_dim / S) of `normed`.
 extern "C" __global__ void hc_pre_stage_vec(
     const float* __restrict__ streams,
-    const __nv_bfloat16* __restrict__ hc_norm_w,
+    const float* __restrict__ hc_norm_w,
     float* __restrict__ normed_out,            // [T, hc*H]
     const unsigned int hidden_size,
     const unsigned int hc,
@@ -2161,13 +2161,13 @@ extern "C" __global__ void hc_pre_stage_vec(
     const unsigned int c1 = blockIdx.y + 1 == gridDim.y ? hc_dim : c0 + span;
     for (unsigned int i = c0 + 4u * tid; i < c1; i += 4u * QHC_WBLOCK) {
         const float4 xv = *reinterpret_cast<const float4*>(x + i);
-        const uint2 wv = *reinterpret_cast<const uint2*>(hc_norm_w + i);
+        const float4 wv = *reinterpret_cast<const float4*>(hc_norm_w + i);
         const float rms = smem_rms[i / H];
         float4 o;
-        o.x = xv.x * rms * (1.0f + qhc_bf_lo(wv.x));
-        o.y = xv.y * rms * (1.0f + qhc_bf_hi(wv.x));
-        o.z = xv.z * rms * (1.0f + qhc_bf_lo(wv.y));
-        o.w = xv.w * rms * (1.0f + qhc_bf_hi(wv.y));
+        o.x = xv.x * rms * (1.0f + wv.x);
+        o.y = xv.y * rms * (1.0f + wv.y);
+        o.z = xv.z * rms * (1.0f + wv.z);
+        o.w = xv.w * rms * (1.0f + wv.w);
         *reinterpret_cast<float4*>(out + i) = o;
     }
 }
@@ -2234,7 +2234,7 @@ hc_post_stage_vec(
     const __nv_bfloat16* __restrict__ block_out, // [T, H]
     float* streams,                              // [T, hc, H]: residual in, post out
     const float* __restrict__ inj,               // [T, hc]
-    const __nv_bfloat16* __restrict__ hc_norm_w, // [hc*H]
+    const float* __restrict__ hc_norm_w, // [hc*H]
     float* __restrict__ normed_out,              // [T, hc*H]
     const unsigned int hidden_size,
     const unsigned int hc,
@@ -2307,13 +2307,13 @@ hc_post_stage_vec(
         v.z = r.z + qhc_bf_lo(xv.y) * ws;
         v.w = r.w + qhc_bf_hi(xv.y) * ws;
         *reinterpret_cast<float4*>(x + i) = v;
-        const uint2 nw = *reinterpret_cast<const uint2*>(hc_norm_w + i);
+        const float4 nw = *reinterpret_cast<const float4*>(hc_norm_w + i);
         const float rms = smem_rms[s];
         float4 o;
-        o.x = v.x * rms * (1.0f + qhc_bf_lo(nw.x));
-        o.y = v.y * rms * (1.0f + qhc_bf_hi(nw.x));
-        o.z = v.z * rms * (1.0f + qhc_bf_lo(nw.y));
-        o.w = v.w * rms * (1.0f + qhc_bf_hi(nw.y));
+        o.x = v.x * rms * (1.0f + nw.x);
+        o.y = v.y * rms * (1.0f + nw.y);
+        o.z = v.z * rms * (1.0f + nw.z);
+        o.w = v.w * rms * (1.0f + nw.w);
         *reinterpret_cast<float4*>(out + i) = o;
     }
 }

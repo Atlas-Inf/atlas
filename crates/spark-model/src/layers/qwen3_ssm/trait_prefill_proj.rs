@@ -67,6 +67,10 @@ impl Qwen3SsmLayer {
         // GEMM. Bonsai is `sequential_qkvz`, so `proj_dst == deinterleaved` and
         // no post-deinterleave is needed. Highest priority (all other weight
         // slots are NULL on this path).
+        // Native MXFP8 (FP4-Local): the layer's only copy, sequential layout.
+        if let Some(mx8) = self.mx8.as_ref() {
+            return self.mx8_qkvz(mx8, ctx, normed, proj_dst, k as usize, stream);
+        }
         if self.qkvz_q2.is_some() {
             let scratch = ctx.buffers.q2_dequant_scratch();
             let act_q8 = ctx.buffers.q2_act_q8();

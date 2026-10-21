@@ -25,6 +25,9 @@ mod loaders_mtp;
 mod model_a;
 #[path = "weight_map/model_b.rs"]
 mod model_b;
+#[path = "weight_map/modelopt_local.rs"]
+pub mod modelopt_local;
+pub mod modelopt_plan;
 #[path = "weight_map/moe.rs"]
 mod moe;
 #[path = "weight_map/mxfp8.rs"]
@@ -56,7 +59,7 @@ pub use loaders_fp8::*;
 pub use loaders_mtp::*;
 pub use model_a::*;
 pub use moe::*;
-pub use mxfp8::Mxfp8Weight;
+pub use mxfp8::{Mxfp8Proj, Mxfp8Weight};
 pub use nemotron::*;
 pub use nvfp4_detect::*;
 pub use quantize_fns::*;

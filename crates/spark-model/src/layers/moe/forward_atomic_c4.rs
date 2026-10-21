@@ -28,14 +28,16 @@ impl MoeLayer {
         );
         // Feature-1 phase-1: decode does not yet fold the expert delta.
         self.reject_decode_lora(ctx, "forward_atomic_c4_decode")?;
-        let has_shared = self.weights.shared_expert.gate_proj.weight.0 != 0
+        // A checkpoint-native separate shared expert still counts: the fused
+        // kernels NULL-guard it and `shared_down_out` is filled separately.
+        let has_shared = (self.weights.shared_expert.gate_proj.weight.0 != 0
             && self.weights.shared_expert.up_proj.weight.0 != 0
-            && self.weights.shared_expert.down_proj.weight.0 != 0;
+            && self.weights.shared_expert.down_proj.weight.0 != 0)
+            || self.has_separate_shared_expert();
         let nvfp4_supported = num_tokens == 4
             && self.moe_decode_atomic_c4_silu_down_accum_k.0 != 0
             && self.moe_decode_atomic_c4_finalize_k.0 != 0
             && self.bf16_gate_weight_ptrs.is_none()
-            && !self.has_mixed_bf16_shared_expert()
             && self.fp8_gate_weight_ptrs.is_none()
             && !self.use_t_layout_for_decode()
             && self.pre_expert_norm.is_none()
@@ -175,6 +177,23 @@ impl MoeLayer {
             n,
             stream,
         )?;
+
+        // Checkpoint-native separate shared expert: the fused kernels saw
+        // NULL weights (they skip it); fill `shared_down_out` for all 4 rows
+        // before the finalize/blend reads it.
+        if self.has_separate_shared_expert() {
+            self.run_separate_shared_expert(
+                input,
+                n,
+                h,
+                ctx.config.shared_expert_intermediate_size as u32,
+                shared_gate_scratch,
+                shared_up_scratch,
+                shared_down_out,
+                ctx,
+                stream,
+            )?;
+        }
 
         let is_ep = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
         ops::moe_decode_atomic_c4_finalize(

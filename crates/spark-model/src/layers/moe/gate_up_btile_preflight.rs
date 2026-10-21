@@ -30,7 +30,7 @@ pub(super) fn layer(layer: &MoeLayer, config: &ModelConfig) -> Result<()> {
             && layer.shared_down_t.is_none()
             && layer.shared_gate_up_receipt.is_none()
             && layer.cutlass_grouped_host.is_none()
-            && layer.bf16_shared_expert.is_none()
+            && layer.separate_shared_expert.is_none()
             && layer.fp8_shared_expert.is_none()
             && layer.bf16_gate_weight_ptrs.is_none()
             && layer.fp8_gate_weight_ptrs.is_none()

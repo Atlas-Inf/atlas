@@ -94,7 +94,7 @@ impl MoeLayer {
             }
             return Ok(());
         }
-        if self.run_bf16_shared_expert(
+        if self.run_separate_shared_expert(
             input,
             n,
             h,

@@ -77,10 +77,13 @@ use crate::weight_map::{DenseWeight, MtpWeights, dense};
 // compiler ran. `attach` is also the better name: the module is the three
 // per-layer attach helpers.
 mod attach;
+mod attn_mx8;
 mod ffn;
 mod gdn_fp8;
+mod gdn_mx8;
 mod hc;
 mod mtp;
+mod mx8_common;
 mod ple;
 mod probe;
 
@@ -230,26 +233,8 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         // With PLE disabled for bisection, skip the 21 MB arena and the
         // 128-shard open entirely rather than building what we will not run.
         let ple_off = std::env::var("ATLAS_QWEN4EXP_NO_PLE").as_deref() == Ok("1");
-        // GDN projections stay BF16 by DEFAULT on this checkpoint. Measured,
-        // both arms, same prompt, util 0.85 / 16K / bf16 KV:
-        //
-        //                      requantized NVFP4      BF16 (default)
-        //   layer construction   7.43 GB / 154.8 MB/L   1.39 GB / 28.9 MB/L
-        //   attn/GDN arms        7.34 GB                1.32 GB
-        //   pre-KV               95.8 GB                90.0 GB
-        //   KV budget            3.9 GB / 172144 tok    9.7 GB / 424464 tok
-        //   decode               2.207 tok/s            2.188 tok/s
-        //
-        // 6.04 GB back for ~1% of decode. GDN weight bandwidth is simply not
-        // what bounds decode here at C=1 — something else dominates — so the
-        // usual w4a16-is-faster argument does not apply yet. Revisit if that
-        // changes.
-        //
-        // And it is not only a memory lever: ONLY the routed experts are
-        // quantized in this checkpoint. The GDN projections ship BF16, so
-        // requantizing them was a lossy round trip we chose, on 36 of 48
-        // layers. `=0` opts back into it for A/B. `ATLAS_QWEN4EXP_FP8_GDN` is
-        // the FP8 middle option (`gdn_fp8`).
+        // GDN projections stay BF16 by DEFAULT (measured trade-off in
+        // `gdn_fp8`'s docs); FP4-Local's MXFP8 ones are served natively.
         let gdn = GdnProjections::from_env()?;
         tracing::info!(
             "GDN projections: {} on the {} linear-attention layers",
@@ -270,12 +255,13 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         // shards, and nothing said which arm spent it. Summed here and logged
         // once, so the answer is read rather than guessed.
         let (mut moe_bytes, mut arm_bytes, mut hc_bytes) = (0u64, 0u64, 0u64);
+        let mut mx8_scratch = None;
         let free_now = |g: &dyn GpuBackend| g.free_memory().unwrap_or(0) as u64;
 
         for i in 0..config.num_hidden_layers {
             let lp = config.layer_prefix(i);
             let f0 = free_now(gpu);
-            let ffn = ffn::build_moe(store, &lp, config, gpu, variant)?;
+            let ffn = ffn::build_moe(store, &lp, config, gpu, variant, &mut mx8_scratch)?;
             let f1 = free_now(gpu);
             moe_bytes += f0.saturating_sub(f1);
 
@@ -289,20 +275,16 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             let post_attn_norm = ones_norm(h, gpu)?;
 
             let layer = match config.layer_types[i] {
+                // FP4-Local ships these MXFP8: served on those bytes.
+                LayerType::LinearAttention if gdn_mx8::present(store, &lp) => {
+                    let scratch = mx8_common::scratch_for(&mut mx8_scratch, config, gpu)?;
+                    gdn_mx8::build(
+                        i, store, &lp, gpu, config, input_norm, post_attn_norm, ffn, scratch,
+                    )
+                    .with_context(|| format!("qwen4_exp: GDN layer {i} (MXFP8)"))?
+                }
+                // BF16 as shipped, not requantized: see `GdnProjections::Bf16`.
                 LayerType::LinearAttention if gdn == GdnProjections::Bf16 => {
-                    // Keep the GDN projections BF16 instead of requantizing
-                    // them to NVFP4 at load.
-                    //
-                    // Two reasons, and the second is the interesting one.
-                    // (1) MEMORY: the requantization is where this model's
-                    // build spends its 7.34 GB (152.8 MB/layer, measured —
-                    // the MoE costs zero because its experts ship NVFP4 and
-                    // upload straight through).
-                    // (2) PRECISION: these tensors ship as BF16 in this
-                    // checkpoint. Only the routed experts are quantized. So
-                    // BF16 -> NVFP4 here is a lossy round trip we chose, not
-                    // one the checkpoint forced, and it lands on the GDN
-                    // projections of 36 of 48 layers.
                     crate::weight_loader::qwen35::load_layers::linear_attn_arms::build_linear_attention_dense_bf16(
                         i, store, &lp, gpu, variant, config, h,
                         input_norm, post_attn_norm, ffn,
@@ -324,6 +306,17 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
                         input_norm, post_attn_norm, ffn,
                     )
                     .with_context(|| format!("qwen4_exp: GDN layer {i}"))?
+                }
+                LayerType::FullAttention if attn_mx8::present(store, &lp) => {
+                    let kv_dtype = layer_kv_dtypes.get(attn_idx).copied();
+                    let scratch = mx8_common::scratch_for(&mut mx8_scratch, config, gpu)?;
+                    let l = attn_mx8::build(
+                        i, store, &lp, gpu, config, kv_dtype.unwrap_or(KvCacheDtype::Bf16),
+                        attn_idx, (input_norm, post_attn_norm, ffn), scratch,
+                    )
+                    .with_context(|| format!("qwen4_exp: full-attention layer {i} (MXFP8)"))?;
+                    attn_idx += 1;
+                    l
                 }
                 LayerType::FullAttention => {
                     let kv_dtype = layer_kv_dtypes

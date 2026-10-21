@@ -80,6 +80,9 @@ enum MtpExpertLayout {
     /// `weight_scale_inv` (FP8_PB_WO, g=128) — declared by the pack's
     /// `quantized_layers` map entry `mtp.layers.0.mlp.experts`.
     PerExpertFp8BlockScaled,
+    /// nvidia FP4-Local: per-expert NVFP4 (`weight_scale` + `weight_scale_2`),
+    /// the trunk experts' own format — see `nvfp4`.
+    PerExpertNvfp4,
 }
 
 /// Detect the MTP expert storage layout from the store. `weight_scale_inv`
@@ -91,6 +94,9 @@ fn mtp_expert_layout(store: &WeightStore, mlp: &str) -> MtpExpertLayout {
     }
     if store.contains(&format!("{mlp}.experts.0.gate_proj.weight_scale_inv")) {
         return MtpExpertLayout::PerExpertFp8BlockScaled;
+    }
+    if store.contains(&format!("{mlp}.experts.0.gate_proj.weight_scale_2")) {
+        return MtpExpertLayout::PerExpertNvfp4;
     }
     // Default to the stacked path so its own error names what it expected.
     MtpExpertLayout::StackedBf16
@@ -177,6 +183,9 @@ fn build_mtp_moe(
                 });
             }
         }
+        MtpExpertLayout::PerExpertNvfp4 => {
+            experts = nvfp4::experts(store, &mlp, config, gpu, absmax_k, quantize_k, stream)?;
+        }
         // nvidia pack: per-expert FP8_PB_WO (weight + weight_scale_inv, g=128
         // blocks) instead of RadixArk's fused BF16 pair. Dequant to BF16 then
         // requant to NVFP4 so the body gets the same MoeLayer either way.
@@ -234,25 +243,16 @@ fn build_mtp_moe(
     }
 
     // The shared expert ships per-tensor BF16 like a main layer's, so it takes
-    // the ordinary named path rather than the stacked slicer.
+    // the ordinary named path rather than the stacked slicer. It is also
+    // installed BF16-native on the layer below — the fused kernels then take a
+    // NULL shared expert and the BF16 chain applies it separately, sparing the
+    // one expert every drafted token sees the 4-bit requant.
     let se = format!("{mlp}.shared_expert");
-    let shared_expert = ExpertWeight {
-        gate_proj: q(
-            &dense_auto(store, &format!("{se}.gate_proj.weight"), gpu)?,
-            inter,
-            h,
-        )?,
-        up_proj: q(
-            &dense_auto(store, &format!("{se}.up_proj.weight"), gpu)?,
-            inter,
-            h,
-        )?,
-        down_proj: q(
-            &dense_auto(store, &format!("{se}.down_proj.weight"), gpu)?,
-            h,
-            inter,
-        )?,
-    };
+    let se_gate = dense_auto(store, &format!("{se}.gate_proj.weight"), gpu)?;
+    let se_up = dense_auto(store, &format!("{se}.up_proj.weight"), gpu)?;
+    let se_down = dense_auto(store, &format!("{se}.down_proj.weight"), gpu)?;
+    // NULL in the fused kernels: the BF16 chain installed below applies it.
+    let shared_expert = ExpertWeight::null();
 
     let gate = dense_auto(store, &format!("{mlp}.gate.weight"), gpu)?;
     let weights = MoeWeights {
@@ -267,8 +267,9 @@ fn build_mtp_moe(
     // Router precision matters more than router size here: at 512 experts the
     // top-10 weights cluster tightly. Same treatment as `ffn::build_moe`.
     let gate_nvfp4 = Some(q(&gate, n_experts, h)?);
-    let moe = MoeLayer::new(weights, n_experts, gate_nvfp4, gpu, config)
+    let mut moe = MoeLayer::new(weights, n_experts, gate_nvfp4, gpu, config)
         .context("qwen4_exp MTP: MoeLayer")?;
+    moe.set_bf16_shared_expert(se_gate, se_up, se_down)?;
     Ok(FfnComponent::Moe(moe))
 }
 
@@ -420,71 +421,19 @@ pub fn load_qwen4exp_mtp_module(
     let spent = free_before.saturating_sub(gpu.free_memory().unwrap_or(0) as u64);
     tracing::info!(
         "qwen4_exp MTP draft module loaded: 1 reused full-attention layer \
-         (gated attn, dense — no QSA indexer + mHC + {}-expert MoE requantized from stacked BF16), \
+         (gated attn, dense — no QSA indexer + mHC + {}-expert MoE, experts {:?}), \
          shared embed/lm_head, own head mixer. Construction cost {:.2} GB.",
         config.num_experts,
+        mtp_expert_layout(store, &format!("{MTP_LAYER_PREFIX}.mlp")),
         spent as f64 / 1e9,
     );
     Ok(Some(module))
 }
 
+/// Per-expert NVFP4 MTP experts (FP4-Local).
+#[path = "mtp_nvfp4.rs"]
+mod nvfp4;
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    fn store_with(names: &[&str]) -> WeightStore {
-        let map: HashMap<String, spark_runtime::weights::WeightTensor> = names
-            .iter()
-            .map(|n| {
-                (
-                    n.to_string(),
-                    spark_runtime::weights::WeightTensor {
-                        ptr: spark_runtime::gpu::DevicePtr::NULL,
-                        shape: vec![1],
-                        dtype: spark_runtime::weights::WeightDtype::BF16,
-                    },
-                )
-            })
-            .collect();
-        WeightStore::from_map(map)
-    }
-
-    /// RadixArk pack: the fused pair selects the stacked path.
-    #[test]
-    fn stacked_markers_select_stacked_layout() {
-        let store = store_with(&[
-            "mtp.layers.0.mlp.experts.gate_up_proj",
-            "mtp.layers.0.mlp.experts.down_proj",
-        ]);
-        assert_eq!(
-            mtp_expert_layout(&store, "mtp.layers.0.mlp"),
-            MtpExpertLayout::StackedBf16
-        );
-    }
-
-    /// nvidia pack: per-expert weight_scale_inv selects the FP8 block path —
-    /// and must win even when a stray fused name is absent.
-    #[test]
-    fn per_expert_scale_inv_selects_fp8_layout() {
-        let store = store_with(&[
-            "mtp.layers.0.mlp.experts.0.gate_proj.weight",
-            "mtp.layers.0.mlp.experts.0.gate_proj.weight_scale_inv",
-        ]);
-        assert_eq!(
-            mtp_expert_layout(&store, "mtp.layers.0.mlp"),
-            MtpExpertLayout::PerExpertFp8BlockScaled
-        );
-    }
-
-    /// Neither marker → stacked default, whose loader errors with the names
-    /// it probed (better than guessing the other format).
-    #[test]
-    fn no_markers_defaults_to_stacked() {
-        let store = store_with(&[]);
-        assert_eq!(
-            mtp_expert_layout(&store, "mtp.layers.0.mlp"),
-            MtpExpertLayout::StackedBf16
-        );
-    }
-}
+#[path = "mtp_tests.rs"]
+mod tests;

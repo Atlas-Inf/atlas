@@ -45,15 +45,29 @@ pub(crate) fn keeps_raw_f16(name: &str) -> bool {
 /// filename rule would work for one release and silently fail the other,
 /// where "silently" means a 221 GB OOM pre-flight on a 121 GB box.
 ///
+/// NVIDIA's FP4-Local pack stores the table as NVFP4, so each shard also has
+/// a per-row block-scale tensor `shard_{i}.weight_scale` (E4M3 `[R, 10]`).
+/// Those are table data read by row alongside the weight, so they match too.
+///
 /// What must NOT match, because the loader needs these resident:
 ///   - LongCat's small `post_projs`
 ///   - Qwen's `ngram_embedding.weight_scale` (one BF16 scalar)
 ///   - Qwen's `ngram_heads_offsets` / `ngram_heads_vocab_sizes` (I64, 16 each)
 pub fn is_ngram_table(name: &str) -> bool {
     if name.contains("ngram_embeddings.embedders.") || name.contains("ngram_embedding.shard_") {
-        return name.ends_with(".weight") || exl3_trellis_tail(name);
+        return name.ends_with(".weight")
+            || (name.contains("ngram_embedding.shard_") && name.ends_with(".weight_scale"))
+            || exl3_trellis_tail(name);
     }
     name.ends_with(".ngram_embedding.trellis")
+}
+
+/// A CSF-compressed NVFP4 block-scale stream (`weight_scale_encoding: "csf"`).
+///
+/// Never uploaded: the loader defers both halves and the model build decodes
+/// them into a plain E4M3 `weight_scale` (see `atlas_core::modelopt_codec`).
+pub fn is_csf_stream(name: &str) -> bool {
+    name.ends_with(".nvfp4_csf_fixed") || name.ends_with(".nvfp4_csf_exceptions")
 }
 
 /// True when the tail after the last `ngram_embedding.shard_<digits>` is a
@@ -97,6 +111,11 @@ mod ngram_defer_tests {
         let base = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding";
         assert!(is_ngram_table(&format!("{base}.shard_0.weight")));
         assert!(is_ngram_table(&format!("{base}.shard_127.weight")));
+        // FP4-Local: each NVFP4 shard carries its own per-row block scales.
+        assert!(is_ngram_table(&format!("{base}.shard_0.weight_scale")));
+        assert!(is_ngram_table(&format!("{base}.shard_127.weight_scale")));
+        // ...but its per-table global scale is one resident F32.
+        assert!(!is_ngram_table(&format!("{base}.weight_scale_2")));
 
         // The per-table scalar scale (RadixArk's FP8 release) must stay
         // resident — the row cache needs it to dequantize.

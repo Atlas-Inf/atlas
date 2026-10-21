@@ -155,7 +155,10 @@ impl Qwen3AttentionLayer {
         }
 
         let o_out = fwd.buffers.moe_output();
-        if let Some(q2) = self.o_weight.as_ref().and_then(|w| w.as_packed_q2()) {
+        if let Some(r) = self.try_mx8(fwd, self.o_weight.as_ref(), attn_out, o_out, n, stream) {
+            // Native MXFP8 (FP4-Local): contiguous [n, q_dim] -> [n, h].
+            r?;
+        } else if let Some(q2) = self.o_weight.as_ref().and_then(|w| w.as_packed_q2()) {
             // Keep-packed Q2_0 (Tier-1c): per-token 2-bit o_proj GEMV.
             for i in 0..n {
                 let attn_out_i = attn_out.offset(i * q_dim as usize * bf16);

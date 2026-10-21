@@ -189,7 +189,7 @@ impl MoeLayer {
             && self.shared_gate_fp8.is_none()
             && self.shared_up_fp8.is_none()
             && self.shared_down_fp8.is_none()
-            && self.bf16_shared_expert.is_none()
+            && self.separate_shared_expert.is_none()
             && !self.m5_projections.shared.enabled()
             && !self.gelu_activation
             && self.lora.is_none()

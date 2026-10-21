@@ -228,10 +228,10 @@ impl PleLayer {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
-        // Trellis rows are not embeddings. `gather_host` already wrote the
-        // decoded BF16 matrix into `emb`; launching `batched_embed` would
-        // overwrite it with packed I16 interpreted as BF16.
-        if self.trellis.is_none() {
+        // Trellis and NVFP4 rows are not embeddings. `gather_host` already
+        // wrote the decoded BF16 matrix into `emb`; launching `batched_embed`
+        // would overwrite it with packed bytes interpreted as BF16.
+        if !self.host_decoded() {
             self.gather_embed_dispatch(table_va, num_tokens, heads, gpu, stream)?;
         }
         // The pins taken by this gather must outlive THIS kernel: record an event

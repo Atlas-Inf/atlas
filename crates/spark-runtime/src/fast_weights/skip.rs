@@ -24,10 +24,28 @@ use super::FastSafetensorsLoader;
 use crate::weights::parse_expert_index;
 
 impl FastSafetensorsLoader {
+    /// Tensors located on disk but not uploaded: host-decoded formats and
+    /// expert-TP slices. Deferred tensors are also left out of the pre-flight.
+    pub(super) fn should_defer_tensor(&self, name: &str) -> bool {
+        self.is_host_decoded(name) || self.is_expert_tp_slice(name)
+    }
+
+    /// CSF scale streams, and the weight/scale pair of every module the model
+    /// build expands on the host (`host_decode_modules`).
+    fn is_host_decoded(&self, name: &str) -> bool {
+        if crate::weights::is_csf_stream(name) {
+            return true;
+        }
+        let module = name
+            .strip_suffix(".weight")
+            .or_else(|| name.strip_suffix(".weight_scale"));
+        module.is_some_and(|m| self.host_decode_modules.contains(m))
+    }
+
     /// Expert TP: a routed expert's packed weight or block scale, which the
     /// model loader slices straight from disk. The appended predictor layer
     /// keeps its own replication rules, and the scalars load as usual.
-    pub(super) fn should_defer_tensor(&self, name: &str) -> bool {
+    fn is_expert_tp_slice(&self, name: &str) -> bool {
         self.expert_tp
             && !name.starts_with("mtp.")
             && (name.ends_with(".weight") || name.ends_with(".weight_scale"))

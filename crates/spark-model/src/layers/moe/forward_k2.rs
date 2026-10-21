@@ -70,7 +70,7 @@ impl MoeLayer {
                 self.lora.is_none()
                     && self.bf16_gate_weight_ptrs.is_none()
                     && self.fp8_gate_weight_ptrs.is_none()
-                    && !self.has_mixed_bf16_shared_expert()
+                    && !self.has_separate_shared_expert()
                     && matches!(
                         self.experts_scale_kind,
                         crate::weight_map::WeightQuantFormat::Nvfp4
@@ -129,7 +129,7 @@ impl MoeLayer {
         // through the _t kernels and run the shared expert as one batched BF16
         // GEMM pass afterwards (`mixed_bf16_shared` below). Every other layout
         // falls back to the per-token loop.
-        let mixed_bf16_shared = self.has_mixed_bf16_shared_expert();
+        let mixed_bf16_shared = self.has_separate_shared_expert();
         // Either fused layout serves the mixed config. The originals-layout
         // kernels are usable only since 37e818ad NULL-guarded their shared
         // expert (their `_t` siblings always had that guard); before it, this
@@ -182,11 +182,11 @@ impl MoeLayer {
         let output = ctx.buffers.moe_output();
 
         if use_bf16_batch2
-            && let (Some(gp), Some(up), Some(dp), Some(shared)) = (
+            && let (Some(gp), Some(up), Some(dp), Some(SeparateSharedExpert::Bf16(shared))) = (
                 self.bf16_gate_weight_ptrs,
                 self.bf16_up_weight_ptrs,
                 self.bf16_down_weight_ptrs,
-                self.bf16_shared_expert,
+                self.separate_shared_expert,
             )
         {
             // BF16 batch2 path (FP8-dequant-on-load experts, MTP K=2 verify).

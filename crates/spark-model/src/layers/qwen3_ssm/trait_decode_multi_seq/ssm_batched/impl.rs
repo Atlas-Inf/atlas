@@ -72,9 +72,12 @@ impl Qwen3SsmLayer {
                 || (self.qkvz_fp8w.is_none() && self.dense_gemm_k.0 != 0)))
             || (self.qkvz_nvfp4.is_some()
                 && ((self.w4a16_batchm.has_base() && n <= 16) || tc_wide_ok));
+        // Native MXFP8 serves every row count through `exact_rows_proj`.
+        let qkvz_ok = qkvz_ok || self.mx8.is_some();
         let out_ok = self.out_proj_fp8w.is_some()
             || self.out_proj_dense.is_some()
-            || self.qkvz_nvfp4.is_some();
+            || self.qkvz_nvfp4.is_some()
+            || self.mx8.is_some();
         // Tier-1c keep-packed Q2_0 has no batched packed GEMM; decline so the
         // per-seq fallback (`ssm_forward` → `q2_0_gemv_vec`) handles it.
         if n < 2

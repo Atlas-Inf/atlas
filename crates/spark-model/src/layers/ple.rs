@@ -72,4 +72,6 @@ pub(crate) use layer::verify_snapshots_enabled;
 // The weight loader builds an EXL3 trellis spec. Non-CUDA builds do not
 // construct PLE layers, so the import is unused there.
 #[cfg_attr(not(feature = "cuda"), allow(unused_imports))]
+pub(crate) use layer::ngram_nvfp4;
+#[cfg_attr(not(feature = "cuda"), allow(unused_imports))]
 pub(crate) use layer::ngram_trellis;

@@ -202,6 +202,25 @@ impl PleLayer {
         // Dispatch on the PRESENCE OF THE SCALE, not a dtype flag: it keeps
         // "the bytes are E4M3" and "there is something to multiply by" from
         // being able to disagree.
+        if let Some(nv) = &self.nvfp4 {
+            let scale_va = self
+                .block_scale_va
+                .context("PLE: NVFP4 table without its block-scale arena")?;
+            return ops::batched_embed_nvfp4(
+                gpu,
+                self.embed_nvfp4_k,
+                self.slots_dev,
+                DevicePtr(table_va),
+                DevicePtr(scale_va),
+                nv.geom.global,
+                self.emb,
+                (num_tokens * heads) as u32,
+                nv.geom.dim as u32,
+                nv.geom.group as u32,
+                stream,
+            )
+            .context("PLE row gather (nvfp4)");
+        }
         match self.scale_va {
             Some(scale) => ops::batched_embed_fp8(
                 gpu,

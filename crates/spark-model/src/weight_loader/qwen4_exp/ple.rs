@@ -30,6 +30,23 @@
 //! do it silently.
 
 #[cfg(feature = "cuda")]
+// The NVFP4 block-scale slot width, when the table is packed U8.
+fn nvfp4_scale_stride(
+    store: &spark_runtime::weights::WeightStore,
+    lp: &str,
+    dtype: spark_runtime::weights::WeightDtype,
+) -> usize {
+    if dtype != spark_runtime::weights::WeightDtype::UInt8 {
+        return 0;
+    }
+    store
+        .deferred(&format!(
+            "{lp}.ple_embedding.ngram_embedding.shard_0.weight_scale"
+        ))
+        .map(|d| d.shape[1])
+        .unwrap_or(0)
+}
+
 use anyhow::Context;
 use anyhow::Result;
 use atlas_core::config::ModelConfig;
@@ -42,7 +59,9 @@ use crate::layers::ple::PleLayer;
 #[cfg(feature = "cuda")]
 use crate::layers::ple::{PleIdDims, PleWeights};
 #[cfg(feature = "cuda")]
-use crate::weight_map::dense;
+use crate::weight_map::{dense, dense_keep_f32};
+#[cfg(feature = "cuda")]
+use host::{bf16_scalar, fp16_host, i64_host};
 
 /// Resident rows in the pinned arena. A forward's gather pins at most one
 /// scratch span of rows at once — `scratch_tokens * ngram_heads` — because
@@ -77,17 +96,32 @@ fn chunk_from_env() -> usize {
 }
 
 #[cfg(feature = "cuda")]
-fn slots_from_env(scratch_tokens: usize, ngram_heads: usize) -> (usize, &'static str) {
-    match std::env::var("ATLAS_PLE_CACHE_SLOTS")
+fn slots_from_env(
+    scratch_tokens: usize,
+    ngram_heads: usize,
+    slot_bytes: usize,
+) -> (usize, &'static str) {
+    // Exact slots beat GB sizing; GB beats the derived floor. The derived
+    // span figure stays a MINIMUM — the cache must always hold one gather.
+    let floor = derived_slots(scratch_tokens, ngram_heads);
+    if let Some(n) = std::env::var("ATLAS_PLE_CACHE_SLOTS")
         .ok()
         .and_then(|v| v.parse().ok())
+        && n > 0
     {
-        Some(n) if n > 0 => (n, "ATLAS_PLE_CACHE_SLOTS"),
-        _ => (
-            derived_slots(scratch_tokens, ngram_heads),
-            "(span + warm_ahead)*heads rounded up",
-        ),
+        return (n, "ATLAS_PLE_CACHE_SLOTS");
     }
+    if let Some(gb) = std::env::var("ATLAS_PLE_CACHE_GB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        && gb > 0.0
+    {
+        return (
+            (((gb * 1e9) / slot_bytes as f64) as usize).max(floor),
+            "ATLAS_PLE_CACHE_GB",
+        );
+    }
+    (floor, "(span + warm_ahead)*heads rounded up")
 }
 
 /// First uploaded name that exists. EXL3 checkpoints use the nested
@@ -108,75 +142,6 @@ fn ple_i64_name(store: &WeightStore, lp: &str, exl3: &str, nvfp4: &str) -> Strin
     first_present(store, &[&nested, &flat])
         .unwrap_or(nested.as_str())
         .to_string()
-}
-
-/// Read a small I64 device tensor back to the host.
-///
-/// `layer_multipliers` and the two per-head tables are 3 and 16 elements —
-/// they are uploaded like any other weight, and the id hash needs them on the
-/// host. Reading them back beats adding a host-side path to `WeightStore` for
-/// 280 bytes.
-#[cfg(feature = "cuda")]
-fn i64_host(store: &WeightStore, name: &str, gpu: &dyn GpuBackend) -> Result<Vec<u64>> {
-    let t = store.get(name).with_context(|| format!("PLE: {name}"))?;
-    let n = t.num_elements();
-    let mut raw = vec![0u8; n * 8];
-    gpu.copy_d2h(t.ptr, &mut raw)
-        .with_context(|| format!("PLE: reading {name} back to host"))?;
-    Ok(raw
-        .chunks_exact(8)
-        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-        .collect())
-}
-
-/// A one-element BF16 tensor, read back to the host as f32.
-///
-/// The FP8 n-gram table's dequant scale is stored this way — `shape: [1]`,
-/// dtype BF16 — rather than as a per-row scale file.
-#[cfg(feature = "cuda")]
-fn bf16_scalar(store: &WeightStore, name: &str, gpu: &dyn GpuBackend) -> Result<f32> {
-    let t = store.get(name).with_context(|| format!("PLE: {name}"))?;
-    anyhow::ensure!(
-        t.num_elements() == 1,
-        "PLE: {name} has {} elements, expected 1 (a per-tensor scale)",
-        t.num_elements()
-    );
-    let mut raw = [0u8; 2];
-    gpu.copy_d2h(t.ptr, &mut raw)
-        .with_context(|| format!("PLE: reading {name} back to host"))?;
-    let bits = u16::from_le_bytes(raw);
-    let v = f32::from_bits((bits as u32) << 16);
-    anyhow::ensure!(
-        v.is_finite() && v > 0.0,
-        "PLE: {name} is {v}, which cannot be a dequant scale"
-    );
-    Ok(v)
-}
-
-/// A resident FP16 vector, read back as raw fp16 bits.
-///
-/// EXL3 `head_bias` stays FP16 (`keeps_raw_f16`) because the n-gram dequant
-/// adds it in the same units as `decode_mul1` * scale.
-#[cfg(feature = "cuda")]
-fn fp16_host(store: &WeightStore, name: &str, n: usize, gpu: &dyn GpuBackend) -> Result<Vec<u16>> {
-    let t = store.get(name).with_context(|| format!("PLE: {name}"))?;
-    anyhow::ensure!(
-        t.num_elements() == n,
-        "PLE: {name} has {} elements, expected {n}",
-        t.num_elements()
-    );
-    anyhow::ensure!(
-        matches!(t.dtype, spark_runtime::weights::WeightDtype::FP16),
-        "PLE: {name} is {:?}, expected FP16 (raw head_bias)",
-        t.dtype
-    );
-    let mut raw = vec![0u8; n * 2];
-    gpu.copy_d2h(t.ptr, &mut raw)
-        .with_context(|| format!("PLE: reading {name} back to host"))?;
-    Ok(raw
-        .chunks_exact(2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-        .collect())
 }
 
 /// Build the PLE layer for `layer_idx`, or `None` if this model has none.
@@ -323,6 +288,9 @@ pub(super) fn load(
         // cache copies those bytes; host dequant expands each row to 160
         // BF16 before the GEMM. See `layers/ple/ngram_trellis.rs`.
         spark_runtime::weights::WeightDtype::Int16 => 2,
+        // FP4-Local NVFP4: U8 rows of packed E2M1, host-decoded with their
+        // block-scale siblings (`ple_nvfp4`).
+        spark_runtime::weights::WeightDtype::UInt8 => 1,
         other => anyhow::bail!(
             "PLE: n-gram table is {other:?}; the row cache gathers BF16, \
              F8_E4M3, or I16 rows (`batched_embed` / `batched_embed_fp8`)"
@@ -333,7 +301,8 @@ pub(super) fn load(
     // `PleLayer::new` applies, keeping the two derivations from drifting.
     let chunk = chunk_from_env();
     let span = crate::layers::ple::bounded_scratch(chunk, max_tokens);
-    let (slots, slots_from) = slots_from_env(span, heads);
+    let slot_bytes = head_dim * elem + nvfp4_scale_stride(store, &lp, dtype);
+    let (slots, slots_from) = slots_from_env(span, heads, slot_bytes);
     let mut cache = if single.is_some() {
         let (path, off) = &shards[0];
         spark_storage::NgramRowCache::open_at(
@@ -364,10 +333,17 @@ pub(super) fn load(
         );
     }
 
+    let n_shards = shards.len();
+    let nvfp4 = nvfp4::open_if_packed(store, &lp, dtype, n_shards, rows_per, head_dim, gpu)?;
+    if let Some(nv) = &nvfp4 {
+        // The block scales ride the same cache: one arena pair, one CLOCK.
+        cache.attach_segmented_block_scales(&nv.scale_shards, nv.geom.scale_stride())?;
+    }
+
     // FP8 rows need their dequant scale, or the gather returns raw E4M3
     // magnitudes and the whole n-gram contribution is off by a constant
     // factor — fluent output, wrong logits.
-    if elem == 1 {
+    if matches!(dtype, spark_runtime::weights::WeightDtype::FP8E4M3) {
         let name = format!("{lp}.ple_embedding.ngram_embedding.weight_scale");
         let scale = bf16_scalar(store, &name, gpu)?;
         cache
@@ -379,9 +355,11 @@ pub(super) fn load(
     let weights = PleWeights {
         key_proj: dense(store, &format!("{lp}.key_proj.weight"))?,
         value_proj: dense(store, &format!("{lp}.value_proj.weight"))?,
-        norm_key: dense(store, &format!("{lp}.norm_key.weight"))?,
-        norm_query: dense(store, &format!("{lp}.norm_query.weight"))?,
-        norm_conv: dense(store, &format!("{lp}.norm_conv.weight"))?,
+        // The PLE norms feed `ple_gate`, declared `const float*`: keep F32
+        // native (FP4-Local ships them F32), widen BF16 exactly (NVFP4).
+        norm_key: dense_keep_f32(store, &format!("{lp}.norm_key.weight"), gpu)?,
+        norm_query: dense_keep_f32(store, &format!("{lp}.norm_query.weight"), gpu)?,
+        norm_conv: dense_keep_f32(store, &format!("{lp}.norm_conv.weight"), gpu)?,
         conv1d: dense(store, &format!("{lp}.conv1d.weight"))?,
     };
 
@@ -428,6 +406,8 @@ pub(super) fn load(
                 head_vocab_sizes: dims.head_vocab_sizes.clone(),
             }),
         )
+    } else if let Some(n) = &nvfp4 {
+        (n.geom.dim, None)
     } else {
         (head_dim, None)
     };
@@ -445,6 +425,7 @@ pub(super) fn load(
         max_tokens,
         span,
         trellis,
+        nvfp4,
         gpu,
     )
     .map(Some)
@@ -490,3 +471,12 @@ mod slots_tests {
         assert!(derived_slots(20481, 16) >= 20481 * 16);
     }
 }
+
+/// Host readback of the small resident PLE tensors.
+#[cfg(feature = "cuda")]
+#[path = "ple_host.rs"]
+mod host;
+/// FP4-Local's NVFP4 n-gram table: block-scale cache and global scale.
+#[cfg(feature = "cuda")]
+#[path = "ple_nvfp4.rs"]
+mod nvfp4;

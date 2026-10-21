@@ -77,14 +77,17 @@ pub struct NgramRowCache {
     row_stride: usize,
     slots: usize,
     rows_total: u64,
-    /// row_id -> slot.
-    map: HashMap<u64, u32>,
-    /// slot -> resident row id (`u64::MAX` = empty).
-    slot_row: Vec<u64>,
+    /// row_id -> slot (row ids are < 2^32, enforced at open).
+    map: HashMap<u32, u32>,
+    /// slot -> resident row id (`u32::MAX` = empty).
+    slot_row: Vec<u32>,
     /// CLOCK reference bits.
     refbit: Vec<bool>,
     /// Slots pinned for the batch in flight (never evicted).
     pinned: Vec<bool>,
+    /// The pinned slots of the batch in flight, so `end_batch` is O(pins),
+    /// never O(slots).
+    pinned_list: Vec<u32>,
     hand: usize,
     pub hits: u64,
     pub misses: u64,
@@ -93,6 +96,10 @@ pub struct NgramRowCache {
     keepalive: Option<keepalive::KeepAlive>,
     /// `ATLAS_PLE_FAULT_POOL=1` workers, built on the first multi-row fault.
     fault_pool: Option<fault_pool::FaultPool>,
+    /// Cumulative wall time of the fault passes (pass 2 of `resolve_inner`).
+    pub fault_us: u64,
+    /// Throttle for the periodic residency line (item: observability).
+    last_stats_log: std::time::Instant,
 }
 
 /// A table split across equal-sized shards at scattered file offsets, which
@@ -126,7 +133,25 @@ struct Segments {
 /// value, written once at open and never touched again.
 struct ScaleCache {
     arena: ExpertArena,
-    file: Option<File>,
+    /// Bytes of scale payload per slot (4 for f32, `dim/group` E4M3 for NVFP4).
+    stride: usize,
+    src: ScaleSrc,
+    /// `ATLAS_PLE_SCALES_RESIDENT`: the whole scale table resident in host
+    /// RAM, concatenated in shard order. Set only for a segmented src; a
+    /// fault memcpys `arena[id * stride..]` instead of a second disk read.
+    resident: Option<std::sync::Arc<Vec<u8>>>,
+}
+
+/// Where a scale row comes from on a fault.
+enum ScaleSrc {
+    /// Per-tensor constant, written once (no fault refresh).
+    Constant,
+    /// One f32 per row in a single file at `id * stride`.
+    PerRowFile(File),
+    /// Per-shard block-scale rows at scattered offsets — the NVFP4 PLE table's
+    /// sibling `shard_i.weight_scale` tensors, mapped by the same
+    /// `rows_per`/dedupe logic as the weight shards.
+    Segmented(Segments),
 }
 
 /// A 4 KiB-aligned host buffer for O_DIRECT reads.
@@ -178,6 +203,10 @@ impl NgramRowCache {
         row_stride: usize,
         slots: usize,
     ) -> Result<Self> {
+        anyhow::ensure!(
+            rows_total <= u32::MAX as u64,
+            "NgramRowCache: {rows_total} rows exceed the u32 bookkeeping limit"
+        );
         if row_stride == 0 || slots == 0 {
             bail!("NgramRowCache: zero geometry (row_stride={row_stride}, slots={slots})");
         }
@@ -202,7 +231,9 @@ impl NgramRowCache {
                 Some(ScaleCache {
                     arena: ExpertArena::new(1, sblocks as u32, BLOCK)
                         .context("NgramRowCache: scale arena")?,
-                    file: Some(open_direct(sp)?),
+                    stride: 4,
+                    src: ScaleSrc::PerRowFile(open_direct(sp)?),
+                    resident: None,
                 })
             }
             None => None,
@@ -216,16 +247,19 @@ impl NgramRowCache {
             row_stride,
             slots,
             rows_total,
-            map: HashMap::with_capacity(slots * 2),
-            slot_row: vec![u64::MAX; slots],
+            map: HashMap::with_capacity(slots),
+            slot_row: vec![u32::MAX; slots],
             refbit: vec![false; slots],
             pinned: vec![false; slots],
+            pinned_list: Vec::new(),
             hand: 0,
             hits: 0,
             misses: 0,
             evictions: 0,
             keepalive: None,
             fault_pool: None,
+            fault_us: 0,
+            last_stats_log: std::time::Instant::now(),
         })
     }
 
@@ -314,6 +348,37 @@ impl NgramRowCache {
     pub fn stats(&self) -> (u64, u64, u64) {
         (self.hits, self.misses, self.evictions)
     }
+
+    /// Resident slots (map size) and total slots — the "n/N" of the log line.
+    pub fn occupancy(&self) -> (usize, usize) {
+        (self.map.len(), self.slots)
+    }
+
+    /// The periodic observability line: at most once per 30 s while the
+    /// cache is being resolved against. Callers: `resolve`/`prefetch`.
+    pub(crate) fn maybe_log_stats(&mut self) {
+        let dt = self.last_stats_log.elapsed();
+        if dt < std::time::Duration::from_secs(30) {
+            return;
+        }
+        self.last_stats_log = std::time::Instant::now();
+        let total = self.hits + self.misses;
+        let rate = if total > 0 {
+            self.hits as f64 * 100.0 / total as f64
+        } else {
+            0.0
+        };
+        tracing::info!(
+            "NgramRowCache: {}/{} slots resident, {} hits / {} misses ({:.1}% hit),              {} evictions, fault wall {:.1}s cumulative",
+            self.map.len(),
+            self.slots,
+            self.hits,
+            self.misses,
+            rate,
+            self.evictions,
+            self.fault_us as f64 / 1e6
+        );
+    }
 }
 
 /// The decide+fault cluster (`resolve`, `prefetch`, `resolve_inner`,
@@ -354,4 +419,22 @@ fn open_direct(path: &Path) -> Result<File> {
 mod segmented;
 
 #[cfg(test)]
+#[path = "ngram_cache/scale_tests.rs"]
+mod scale_tests;
+#[cfg(test)]
 mod tests;
+
+impl Drop for NgramRowCache {
+    /// One shutdown line: the same stats the periodic line prints.
+    fn drop(&mut self) {
+        if self.hits + self.misses > 0 {
+            tracing::info!(
+                "NgramRowCache closed: {} hits / {} misses, {} evictions, fault wall {:.1}s",
+                self.hits,
+                self.misses,
+                self.evictions,
+                self.fault_us as f64 / 1e6
+            );
+        }
+    }
+}

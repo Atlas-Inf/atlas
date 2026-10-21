@@ -156,7 +156,7 @@ impl MoeLayer {
         // shared scratch buffers for the non-mixed case.
         if mixed_bf16_shared {
             let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
-            self.run_bf16_shared_expert(
+            self.run_separate_shared_expert(
                 input,
                 2,
                 h,

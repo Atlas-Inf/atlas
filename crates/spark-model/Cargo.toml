@@ -208,6 +208,18 @@ name = "w8a16_gemv_batch4_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "mxfp8_proj_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "ngram_nvfp4_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "vit_dq_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "q2_0_gemv_microtest"
 required-features = ["cuda", "gpu-examples"]
 
