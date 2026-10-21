@@ -137,11 +137,12 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
             num_beams,
             length_penalty,
             early_stopping,
-            image_pixels: if choice_idx == 0 {
-                image_pixels.clone()
-            } else {
-                Vec::new()
-            },
+            // Every choice carries the pixels. Choices 1.. used to send none and
+            // ride on choice 0's leftover encoder rows; since the per-request
+            // vision state is cleared for a request without media (#174),
+            // they would answer about nothing (vision-fidelity
+            // `multi-choice-image`).
+            image_pixels: image_pixels.clone(),
             max_tokens,
             min_tokens: req.min_tokens,
             ignore_eos: req.ignore_eos,
