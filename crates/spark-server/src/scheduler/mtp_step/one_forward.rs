@@ -33,6 +33,23 @@ fn decode_rows_disabled() -> bool {
     *CACHED.get_or_init(|| std::env::var_os("ATLAS_NO_MTP_ONE_FORWARD").is_some())
 }
 
+/// `ATLAS_GRAMMAR_SERIAL_VERIFY=1` restores the pre-batch behaviour: every
+/// grammar-bearing sequence verifies on the serial path. Read once, like the
+/// neighbouring kill switches.
+fn grammar_serial_verify() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("ATLAS_GRAMMAR_SERIAL_VERIFY").is_some())
+}
+
+/// Whether a sequence may ride the batched verify. Grammarless always; a
+/// NON-STRICT grammar sequence also, unless the kill switch is on — the
+/// batched pick runs the same per-sequence fast/slow selection the serial
+/// path does, with per-row masks keeping picks grammar-legal. Strict
+/// grammars keep the serial path either way.
+fn grammar_rides_batch(a: &ActiveSeq) -> bool {
+    a.grammar_state.is_none() || (!a.strict_grammar() && !grammar_serial_verify())
+}
+
 /// The batched verify of one step.
 pub(super) struct VerifyPlan {
     /// Members in dispatch order (`active` indices).
@@ -98,7 +115,7 @@ pub(super) fn plan_verify(
     };
     for &idx in verify_idxs {
         let a = &active[idx];
-        if a.grammar_state.is_none() && a.pending_drafts.len() >= min_drafts {
+        if grammar_rides_batch(a) && a.pending_drafts.len() >= min_drafts {
             plan.batch.push(idx);
         } else {
             plan.serial.push(idx);
@@ -113,7 +130,7 @@ pub(super) fn plan_verify(
         plan.decode_rows = bootstrap_idxs
             .iter()
             .copied()
-            .filter(|&i| active[i].grammar_state.is_none())
+            .filter(|&i| grammar_rides_batch(&active[i]))
             .collect();
         plan.batch.extend_from_slice(&plan.decode_rows);
     }
