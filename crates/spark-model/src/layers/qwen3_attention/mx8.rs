@@ -65,6 +65,9 @@ impl Qwen3AttentionLayer {
     /// `out[m, n] = input[m, k] @ W^T` when `weight` is MXFP8 (`Some(result)`);
     /// `None` for any other format, which the caller dispatches itself.
     /// `input` and `out` rows are contiguous at the projection's widths.
+    /// `exact` selects the numerics family: decode and verify take
+    /// `mxfp8_proj_exact_rows` (every row the serial GEMV's bytes at any m),
+    /// prefill takes `mxfp8_proj` (expand + GEMM past 32 rows).
     pub(crate) fn try_mx8(
         &self,
         ctx: &ForwardContext,
@@ -72,6 +75,7 @@ impl Qwen3AttentionLayer {
         input: DevicePtr,
         out: DevicePtr,
         m: usize,
+        exact: bool,
         stream: u64,
     ) -> Option<Result<()>> {
         let proj = weight.and_then(QuantWeight::as_mxfp8)?;
@@ -80,16 +84,28 @@ impl Qwen3AttentionLayer {
                 .as_ref()
                 .context("MXFP8 attention weight without its kernels")
                 .and_then(|rt| {
-                    ops::mxfp8_proj(
-                        ctx.gpu,
-                        &rt.kernels,
-                        proj,
-                        input,
-                        out,
-                        m,
-                        rt.scratch,
-                        stream,
-                    )
+                    if exact {
+                        ops::mxfp8_proj_exact_rows(
+                            ctx.gpu,
+                            &rt.kernels,
+                            proj,
+                            input,
+                            out,
+                            m,
+                            stream,
+                        )
+                    } else {
+                        ops::mxfp8_proj(
+                            ctx.gpu,
+                            &rt.kernels,
+                            proj,
+                            input,
+                            out,
+                            m,
+                            rt.scratch,
+                            stream,
+                        )
+                    }
                 }),
         )
     }
@@ -107,7 +123,7 @@ impl Qwen3AttentionLayer {
         m: u32,
         stream: u64,
     ) -> Option<Result<()>> {
-        self.try_mx8(ctx, weight, input, out, m as usize, stream)
+        self.try_mx8(ctx, weight, input, out, m as usize, false, stream)
             .or_else(|| self.try_q2_prefill(ctx, weight, input, out, m, stream))
     }
 }

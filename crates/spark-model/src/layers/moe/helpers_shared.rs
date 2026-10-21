@@ -71,6 +71,7 @@ impl MoeLayer {
         up_out: DevicePtr,
         down_out: DevicePtr,
         ctx: &ForwardContext,
+        exact: bool,
         stream: u64,
     ) -> Result<bool> {
         let Some(shared) = self.separate_shared_expert else {
@@ -91,42 +92,50 @@ impl MoeLayer {
         } = shared
         {
             let m = num_tokens as usize;
+            // Decode and verify rows must be the serial GEMV's bytes; prefill
+            // may use the dequant + GEMM tier for m > 32.
+            let proj = |p: &Mxfp8Proj, a: DevicePtr, o: DevicePtr, rows: usize| {
+                if exact {
+                    ops::mxfp8_proj_exact_rows(ctx.gpu, &kernels, p, a, o, rows, stream)
+                } else {
+                    ops::mxfp8_proj(ctx.gpu, &kernels, p, a, o, rows, scratch, stream)
+                }
+            };
+            // `gate_up_out` holds one <=32-row chunk: when the exact caller's
+            // m exceeds that, the serial chain (gate_up -> fused_silu_mul ->
+            // down) runs once per chunk so every row is the fused path's bytes.
             if let Some(gu) = gate_up
-                && m <= ops::MXFP8_PROJ_MAX_CHUNKED_ROWS
                 && gu.silu_mul.0 != 0
+                && (m <= ops::MXFP8_PROJ_MAX_CHUNKED_ROWS || exact)
             {
-                // One projection yields `[m, 2*inter]` gate|up; fused_silu_mul
-                // halves it in place-compatible scratch before the down pass.
-                ops::mxfp8_proj(
-                    ctx.gpu,
-                    &kernels,
-                    &gu.proj,
-                    input,
-                    gu.gate_up_out,
-                    m,
-                    scratch,
-                    stream,
-                )?;
-                ops::fused_silu_mul(
-                    ctx.gpu,
-                    gu.silu_mul,
-                    gu.gate_up_out,
-                    up_out,
-                    num_tokens,
-                    shared_intermediate,
-                    stream,
-                )?;
-                ops::mxfp8_proj(
-                    ctx.gpu, &kernels, &down_proj, up_out, down_out, m, scratch, stream,
-                )?;
+                let inter_b = shared_intermediate as usize * 2;
+                let h_b = hidden_size as usize * 2;
+                for first in (0..m).step_by(ops::MXFP8_PROJ_MAX_CHUNKED_ROWS) {
+                    let rows = (m - first).min(ops::MXFP8_PROJ_MAX_CHUNKED_ROWS);
+                    // One projection yields `[rows, 2*inter]` gate|up;
+                    // fused_silu_mul halves it into the up_out chunk before
+                    // the down pass.
+                    proj(&gu.proj, input.offset(first * h_b), gu.gate_up_out, rows)?;
+                    ops::fused_silu_mul(
+                        ctx.gpu,
+                        gu.silu_mul,
+                        gu.gate_up_out,
+                        up_out.offset(first * inter_b),
+                        rows as u32,
+                        shared_intermediate,
+                        stream,
+                    )?;
+                    proj(
+                        &down_proj,
+                        up_out.offset(first * inter_b),
+                        down_out.offset(first * h_b),
+                        rows,
+                    )?;
+                }
                 return Ok(true);
             }
-            ops::mxfp8_proj(
-                ctx.gpu, &kernels, &gate_proj, input, gate_out, m, scratch, stream,
-            )?;
-            ops::mxfp8_proj(
-                ctx.gpu, &kernels, &up_proj, input, up_out, m, scratch, stream,
-            )?;
+            proj(&gate_proj, input, gate_out, m)?;
+            proj(&up_proj, input, up_out, m)?;
             ops::silu_mul(
                 ctx.gpu,
                 self.moe_act_mul,
@@ -136,9 +145,7 @@ impl MoeLayer {
                 num_tokens * shared_intermediate,
                 stream,
             )?;
-            ops::mxfp8_proj(
-                ctx.gpu, &kernels, &down_proj, gate_out, down_out, m, scratch, stream,
-            )?;
+            proj(&down_proj, gate_out, down_out, m)?;
             return Ok(true);
         }
         let SeparateSharedExpert::Bf16(shared) = shared else {

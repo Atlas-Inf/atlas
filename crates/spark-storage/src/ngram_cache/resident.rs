@@ -11,7 +11,9 @@
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail, ensure};
+#[cfg(all(unix, not(target_os = "macos")))]
+use anyhow::bail;
+use anyhow::{Context, Result, ensure};
 
 #[cfg(feature = "cuda")]
 use spark_runtime::gpu::{DevicePtr, GpuBackend};

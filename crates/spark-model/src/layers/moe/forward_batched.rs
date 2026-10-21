@@ -455,6 +455,7 @@ impl MoeLayer {
                     shared_up_scratch,
                     shared_out,
                     ctx,
+                    true,
                     stream,
                 )?;
             }

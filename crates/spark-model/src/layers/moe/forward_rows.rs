@@ -297,6 +297,7 @@ impl MoeLayer {
                 ctx.buffers.ssm_qkvz(),
                 shared_out,
                 ctx,
+                true,
                 stream,
             )?;
         }

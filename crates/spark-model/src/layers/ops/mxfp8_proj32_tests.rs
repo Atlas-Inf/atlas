@@ -7,7 +7,9 @@ mod gpu {
     use spark_runtime::gpu::{DevicePtr, GpuBackend};
     use spark_runtime::kernel_args::KernelLaunch;
 
-    use crate::layers::ops::mxfp8_proj::{Mxfp8ProjKernels, Mxfp8Scratch, mxfp8_proj};
+    use crate::layers::ops::mxfp8_proj::{
+        Mxfp8ProjKernels, Mxfp8Scratch, mxfp8_proj, mxfp8_proj_exact_rows,
+    };
     use crate::weight_map::{Mxfp8Proj, Mxfp8Weight};
     use spark_runtime::kernel_args::div_ceil;
 
@@ -118,6 +120,83 @@ mod gpu {
                     down(g, cm, cm_bytes).unwrap(),
                 );
                 assert_eq!(got, want, "{label} m={m}: bucketed rows differ from gemv");
+            }
+        }
+    }
+
+    /// m > 32 through `mxfp8_proj_exact_rows` must stay byte-identical to the
+    /// m = 1 GEMV on every row (verify batches can reach 8 seqs x 8 spec
+    /// rows): 64- and 65-row launches on the GDN qkvz shape, realistic and
+    /// hostile bytes.
+    #[test]
+    #[ignore = "GPU"]
+    fn exact_rows_over_32_match_gemv_bit_for_bit() {
+        let gpu =
+            spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())
+                .expect("CUDA backend");
+        let g: &dyn GpuBackend = &gpu;
+        let stream = g.default_stream();
+        let kernels = Mxfp8ProjKernels::resolve(g).expect("mxfp8 kernels");
+        let (n, k, label) = SHAPES[0];
+        let mut rng = Lcg(0x6E5D);
+        for hostile in [false, true] {
+            let w: Vec<u8> = (0..(n as usize * k as usize))
+                .map(|_| if hostile { rng.u8() } else { rng.u8() & 0x7E })
+                .collect();
+            let sd: Vec<u8> = (0..(n as usize * (k / 32) as usize))
+                .map(|_| {
+                    if hostile {
+                        rng.u8()
+                    } else {
+                        115 + rng.u8() % 13
+                    }
+                })
+                .collect();
+            let a: Vec<half::bf16> = (0..65 * k as usize)
+                .map(|_| {
+                    if hostile {
+                        half::bf16::from_bits(rng.u8() as u16 | ((rng.u8() as u16) << 8))
+                    } else {
+                        half::bf16::from_f32(rng.u8() as f32 / 128.0 - 1.0)
+                    }
+                })
+                .collect();
+            let ab: Vec<u8> = a.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect();
+            let (ad, wd, sdd) = (
+                upload(g, &ab).unwrap(),
+                upload(g, &w).unwrap(),
+                upload(g, &sd).unwrap(),
+            );
+            let proj = Mxfp8Proj {
+                w: Mxfp8Weight {
+                    data: wd,
+                    scales: sdd,
+                },
+                n,
+                k,
+            };
+            for m in [64usize, 65] {
+                let want = g.alloc(m * n as usize * 2).unwrap();
+                for r in 0..m {
+                    KernelLaunch::new(g, kernels.gemv)
+                        .grid([div_ceil(n, 4), 1, 1])
+                        .block([256, 1, 1])
+                        .arg_ptr(ad.offset(r * k as usize * 2))
+                        .arg_ptr(wd)
+                        .arg_ptr(sdd)
+                        .arg_ptr(want.offset(r * n as usize * 2))
+                        .arg_u32(n)
+                        .arg_u32(k)
+                        .launch(stream)
+                        .unwrap();
+                }
+                let got = g.alloc(m * n as usize * 2).unwrap();
+                mxfp8_proj_exact_rows(g, &kernels, &proj, ad, got, m, stream).unwrap();
+                assert_eq!(
+                    down(g, got, m * n as usize * 2).unwrap(),
+                    down(g, want, m * n as usize * 2).unwrap(),
+                    "{label} hostile={hostile} m={m}: exact_rows rows differ from gemv"
+                );
             }
         }
     }
