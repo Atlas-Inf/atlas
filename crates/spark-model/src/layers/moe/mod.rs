@@ -85,6 +85,7 @@ impl Bf16SharedExpert {
 /// A shared expert kept outside the fused routed-expert kernels and run as
 /// its own gate/up → silu_mul → down chain over the same scratch contract.
 #[derive(Debug, Clone, Copy)]
+#[allow(clippy::large_enum_variant)] // one instance per MoE layer; Copy is relied on
 pub(crate) enum SeparateSharedExpert {
     /// Checkpoint-native BF16 (Laguna).
     Bf16(Bf16SharedExpert),
@@ -100,6 +101,9 @@ pub(crate) enum SeparateSharedExpert {
         gate_up: Option<Mxfp8GateUp>,
         kernels: ops::Mxfp8ProjKernels,
         scratch: ops::Mxfp8Scratch,
+        /// `ATLAS_QWEN4EXP_PREFILL_W8A8` operands of gate / up / down for the
+        /// unfused prefill arm (> 32 rows); `None` with the switch off.
+        w8a8: [Option<ops::MxW8a8>; 3],
     },
 }
 

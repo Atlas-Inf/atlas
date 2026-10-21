@@ -114,7 +114,9 @@ pub(super) fn in_order(algo: *const c_void) -> bool {
 
 /// Algo 21 without split-K or a reduction: the in-order k-chain.
 fn kchain(algo: *const c_void) -> bool {
-    attr(algo, CONFIG_ID) == Some(ALGO_SM80) && in_order(algo)
+    attr(algo, CONFIG_ID) == Some(ALGO_SM80)
+        && attr(algo, CONFIG_SPLITK_NUM).is_some_and(|s| s <= 1)
+        && attr(algo, CONFIG_REDUCTION_SCHEME) == Some(0)
 }
 
 /// How `gemm_bf16_pick` chooses among the heuristic's results.

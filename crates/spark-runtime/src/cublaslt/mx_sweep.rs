@@ -13,6 +13,9 @@
 //! (no "an in-order kernel differs" / "the tuned kernel differs" failure;
 //! it prints `cuBLASLt <version>` first), add that version to the shape's
 //! `verified_on`. Never add a version the sweep has not run on.
+//!
+//! Ported from Enntity/atlas (branch `sparkqwen` @ 92dd543, AGPL-3.0-only),
+//! `crates/spark-runtime/src/cublaslt/mx_sweep.rs`, with Atlas-Inf/atlas#198's integration changes.
 
 /// One projection the sweep covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

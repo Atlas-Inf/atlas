@@ -21,6 +21,10 @@ use crate::weight_map::{Mxfp8Proj, QuantWeight};
 pub struct Mx8AttnRt {
     pub kernels: Mxfp8ProjKernels,
     pub scratch: Mxfp8Scratch,
+    /// The q/k/v/o W8A8 operands (tiled scales) built when
+    /// `ATLAS_QWEN4EXP_PREFILL_W8A8` was on at load; `None` on the weight
+    /// the switch leaves at the BF16 expand + GEMM.
+    pub w8a8: [Option<ops::MxW8a8>; 4],
 }
 
 impl Qwen3AttentionLayer {
@@ -67,11 +71,14 @@ impl Qwen3AttentionLayer {
     /// `input` and `out` rows are contiguous at the projection's widths.
     /// `exact` selects the numerics family: decode and verify take
     /// `mxfp8_proj_exact_rows` (every row the serial GEMV's bytes at any m),
-    /// prefill takes `mxfp8_proj` (expand + GEMM past 32 rows).
+    /// prefill takes `mxfp8_proj_prefill` — expand + GEMM past 32 rows, or
+    /// the W8A8 `w8a8` operand when `ATLAS_QWEN4EXP_PREFILL_W8A8` built it.
+    /// Only the prefill branch reads `w8a8`; decode and verify pass `None`.
     pub(crate) fn try_mx8(
         &self,
         ctx: &ForwardContext,
         weight: Option<&QuantWeight>,
+        w8a8: Option<&ops::MxW8a8>,
         input: DevicePtr,
         out: DevicePtr,
         m: usize,
@@ -95,10 +102,11 @@ impl Qwen3AttentionLayer {
                             stream,
                         )
                     } else {
-                        ops::mxfp8_proj(
+                        ops::mxfp8_proj_prefill(
                             ctx.gpu,
                             &rt.kernels,
                             proj,
+                            w8a8,
                             input,
                             out,
                             m,
@@ -123,7 +131,23 @@ impl Qwen3AttentionLayer {
         m: u32,
         stream: u64,
     ) -> Option<Result<()>> {
-        self.try_mx8(ctx, weight, input, out, m as usize, false, stream)
+        // This weight's W8A8 slot, by which stored projection it is.
+        let w8a8 = self.mx8_rt.as_ref().and_then(|rt| {
+            [
+                &self.q_weight,
+                &self.k_weight,
+                &self.v_weight,
+                &self.o_weight,
+            ]
+            .iter()
+            .position(|w| {
+                w.as_ref()
+                    .zip(weight)
+                    .is_some_and(|(a, b)| std::ptr::eq(a, b))
+            })
+            .and_then(|i| rt.w8a8[i].as_ref())
+        });
+        self.try_mx8(ctx, weight, w8a8, input, out, m as usize, false, stream)
             .or_else(|| self.try_q2_prefill(ctx, weight, input, out, m, stream))
     }
 }

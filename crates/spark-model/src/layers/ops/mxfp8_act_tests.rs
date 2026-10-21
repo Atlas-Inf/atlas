@@ -9,6 +9,9 @@
 //! `compute_scale` / `compute_scale_e8m0_NV` / `quantize`, Apache-2.0), with
 //! an E4M3 encoder written independently of the device's `cvt`: the nearest
 //! of the 126 finite magnitudes, ties to the even code, saturating at 448.
+//!
+//! Ported from Enntity/atlas (branch `sparkqwen` @ 92dd543, AGPL-3.0-only),
+//! `crates/spark-model/src/layers/ops/mxfp8_act_tests.rs`, with Atlas-Inf/atlas#198's integration changes.
 
 use super::{mx_lt_inner_pad, mx_lt_scale_bytes, mx_lt_sf_offset};
 

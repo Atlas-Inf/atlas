@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas (branch `sparkqwen` @ 92dd543, AGPL-3.0-only), `crates/spark-runtime/src/cublaslt/mx_algo_tests.rs`.
 
 use super::{Algo, bucket, key, prepare_rows, store};
 

@@ -11,6 +11,9 @@
 //!
 //! A producer kernel can emit the same bytes itself through the header's
 //! device functions (`hc_up_mix_bf16_nt_mx` does).
+//!
+//! Ported from Enntity/atlas (branch `sparkqwen` @ 92dd543, AGPL-3.0-only),
+//! `crates/spark-model/src/layers/ops/mxfp8_act.rs`, with Atlas-Inf/atlas#198's integration changes.
 
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -129,4 +132,4 @@ pub(crate) mod tests;
 
 #[cfg(test)]
 #[path = "mxfp8_act_test_gpu.rs"]
-mod gpu_tests;
+pub(crate) mod gpu_tests;

@@ -33,6 +33,9 @@
 //! Timing runs on the caller's own operands (the output is rewritten by the
 //! real call that follows) and synchronizes `stream`, once per key; never
 //! under graph capture. [`fp8_gemm_mx_prepare`] does it at load instead.
+//!
+//! Ported from Enntity/atlas (branch `sparkqwen` @ 92dd543, AGPL-3.0-only),
+//! `crates/spark-runtime/src/cublaslt/mx_algo.rs`, with Atlas-Inf/atlas#198's integration changes.
 
 use std::sync::Mutex;
 

@@ -181,21 +181,35 @@ pub(super) fn build(
         config,
         gpu,
     )?;
+    let qkvz = Mxfp8Proj {
+        w: qkvz,
+        n: config.ssm_qkvz_size() as u32,
+        k: h as u32,
+    };
+    let out = Mxfp8Proj {
+        w: Mxfp8Weight {
+            data: out_l[0],
+            scales: out_l[1],
+        },
+        n: h as u32,
+        k: local_z as u32,
+    };
+    // ATLAS_QWEN4EXP_PREFILL_W8A8: tile this rank's (already sliced) scales for
+    // the W8A8 prefill GEMM; nothing is built with the switch off.
+    let w8a8 = |p: &Mxfp8Proj| -> Result<Option<crate::layers::ops::MxW8a8>> {
+        if !crate::layers::ops::prefill_w8a8() {
+            return Ok(None);
+        }
+        let stream = gpu.default_stream();
+        crate::layers::ops::MxW8a8::from_twin(gpu, &p.w, [p.n as usize, p.k as usize], 0, stream)
+            .map(Some)
+    };
     layer
         .set_mx8_projections(Mx8Gdn {
-            qkvz: Mxfp8Proj {
-                w: qkvz,
-                n: config.ssm_qkvz_size() as u32,
-                k: h as u32,
-            },
-            out: Mxfp8Proj {
-                w: Mxfp8Weight {
-                    data: out_l[0],
-                    scales: out_l[1],
-                },
-                n: h as u32,
-                k: local_z as u32,
-            },
+            w8a8_qkvz: w8a8(&qkvz)?,
+            w8a8_out: w8a8(&out)?,
+            qkvz,
+            out,
             kernels: Mxfp8ProjKernels::resolve(gpu)?,
             scratch,
         })

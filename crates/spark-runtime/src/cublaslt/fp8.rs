@@ -280,6 +280,7 @@ pub fn fp8_gemm_act_weight_t_blkscaled(
 }
 
 /// MXFP8 W8A8 `out[M,N] = act[M,K] @ weight[N,K]ᵀ` → BF16 (FP32 accumulate),
+/// ported from Enntity/atlas (`sparkqwen` @ 92dd543, AGPL-3.0-only);
 /// both operands E4M3 with one UE8M0 scale per 32 K values
 /// (`CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0` on A and B; TN only on GB10).
 /// GB10, FP4-Local's TP2 prefill shapes (`mxfp8_gemm_bench_gpu.rs` in

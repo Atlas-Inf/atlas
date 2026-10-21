@@ -38,6 +38,9 @@ pub struct Mxfp8ProjKernels {
     /// Register-tiled 2..=32-row tier (`mxfp8_proj_rows32`); optional —
     /// targets without it fall back to `batchm`.
     pub rows32: KernelHandle,
+    /// `mxfp8_quant_act_bf16` (module `mxfp8_act_quant`) for the opt-in W8A8
+    /// prefill; optional — targets without it refuse the switch.
+    pub quant: KernelHandle,
 }
 
 impl Mxfp8ProjKernels {
@@ -49,6 +52,12 @@ impl Mxfp8ProjKernels {
             batchm: gpu.kernel("mxfp8_proj", "mxfp8_proj_batchm")?,
             dequant: gpu.kernel("mxfp8_proj", "mxfp8_proj_dequant")?,
             rows32: crate::layers::kernel_pick::try_kernel(gpu, "mxfp8_proj", "mxfp8_proj_rows32"),
+            // Optional: the W8A8 prefill's activation quantizer.
+            quant: crate::layers::kernel_pick::try_kernel(
+                gpu,
+                super::MXFP8_ACT_MODULE,
+                super::MX_QUANT_KERNEL,
+            ),
         })
     }
 }
@@ -85,6 +94,110 @@ pub fn mxfp8_proj(
         return gemv_rows(gpu, kernels, proj, act, out, m, stream);
     }
     expand_and_gemm(gpu, kernels, proj, act, out, m, scratch, stream)
+}
+
+/// `ATLAS_QWEN4EXP_PREFILL_W8A8=1`: prefill MXFP8 projections past 32 rows run
+/// as W8A8 (MXFP8 activations on cuBLASLt's block-scaled tensor cores) instead
+/// of the exact BF16 expansion. Off by default; read once; both ranks must
+/// agree (`startup_parity`).
+pub fn prefill_w8a8() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_PREFILL_W8A8").as_deref() == Ok("1"))
+}
+
+/// Prefill-only entry: `mxfp8_proj` unless `ATLAS_QWEN4EXP_PREFILL_W8A8` is
+/// on, m exceeds the chunked rows and the caller's W8A8 tiled scales are
+/// built — then the activation rows are quantized (MXFP8, ModelOpt rounding)
+/// and the GEMM is cuBLASLt's block-scaled FP8 (`MxW8a8`), Enntity's recipe.
+/// m <= 32 always stays on the GEMV tiers.
+#[allow(clippy::too_many_arguments)]
+pub fn mxfp8_proj_prefill(
+    gpu: &dyn GpuBackend,
+    kernels: &Mxfp8ProjKernels,
+    proj: &Mxfp8Proj,
+    w8a8: Option<&super::MxW8a8>,
+    act: DevicePtr,
+    out: DevicePtr,
+    m: usize,
+    scratch: Mxfp8Scratch,
+    stream: u64,
+) -> Result<()> {
+    if prefill_w8a8()
+        && m > MXFP8_PROJ_MAX_CHUNKED_ROWS
+        && let Some(w) = w8a8
+    {
+        return mxfp8_proj_w8a8(gpu, kernels.quant, w, act, out, m, scratch, stream);
+    }
+    mxfp8_proj(gpu, kernels, proj, act, out, m, scratch, stream)
+}
+
+/// Rows per W8A8 chunk for `m` rows of `k` in a `scratch_bytes` scratch: all
+/// `m` when they fit, else the most whole 128-row scale tiles that fit
+/// (E4M3 rows plus their tiled scales); `0` when not even one tile fits.
+pub fn w8a8_chunk_rows(m: usize, k: usize, scratch_bytes: usize) -> usize {
+    let need = |rows: usize| rows * k + super::mx_lt_scale_bytes(rows, k);
+    if need(m) <= scratch_bytes {
+        return m;
+    }
+    let tile = super::MX_LT_TILE_ROWS;
+    let mut chunk = (scratch_bytes / (k + super::mx_lt_inner_pad(k))).min(m);
+    chunk -= chunk % tile;
+    while chunk > 0 && need(chunk) > scratch_bytes {
+        chunk -= tile;
+    }
+    chunk
+}
+
+/// The W8A8 arm of [`mxfp8_proj_prefill`]: quantize `act[m, k]` (BF16) per row
+/// into `scratch` (E4M3 rows, then their tiled scales) and multiply by `w` on
+/// cuBLASLt's block-scaled FP8 GEMM, in row chunks that fit `scratch`. A row's
+/// quantized bytes and the in-order GEMM's output row depend on that row only,
+/// so the chunking does not change the result.
+#[allow(clippy::too_many_arguments)]
+pub fn mxfp8_proj_w8a8(
+    gpu: &dyn GpuBackend,
+    quant: KernelHandle,
+    w: &super::MxW8a8,
+    act: DevicePtr,
+    out: DevicePtr,
+    m: usize,
+    scratch: Mxfp8Scratch,
+    stream: u64,
+) -> Result<()> {
+    let (n, k) = (w.n, w.k);
+    ensure!(
+        quant.0 != 0,
+        "MXFP8 W8A8: mxfp8_quant_act is not in this kernel target"
+    );
+    let chunk = w8a8_chunk_rows(m, k, scratch.bytes);
+    ensure!(
+        !scratch.ptr.is_null() && chunk > 0,
+        "MXFP8 W8A8: a {} B scratch cannot hold one {}-row chunk of k={k}",
+        scratch.bytes,
+        super::MX_LT_TILE_ROWS
+    );
+    for row0 in (0..m).step_by(chunk) {
+        let rows = (m - row0).min(chunk);
+        let sf = scratch.ptr.offset(rows * k);
+        super::mxfp8_quant_act(
+            gpu,
+            quant,
+            act.offset(row0 * k * 2),
+            k as u32,
+            scratch.ptr,
+            sf,
+            rows as u32,
+            k as u32,
+            stream,
+        )?;
+        w.gemm(
+            super::MxAct { q: scratch.ptr, sf },
+            out.offset(row0 * n * 2),
+            rows,
+            stream,
+        )?;
+    }
+    Ok(())
 }
 
 /// The bit-exact variant for decode and speculative verify: every row is the

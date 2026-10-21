@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas (branch `sparkqwen` @ 92dd543, AGPL-3.0-only),
+// `kernels/gb10/common/mxfp8_act_quant.cuh`, with Atlas-Inf/atlas#198's integration changes.
 //
 // MXFP8 activation quantization for the cuBLASLt W8A8 prefill GEMM
 // (`spark_runtime::cublaslt::fp8_gemm_act_weight_t_mx`): device functions a

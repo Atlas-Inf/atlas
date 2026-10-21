@@ -172,13 +172,33 @@ pub(super) fn build_moe(
         // layer's attention/GDN on the same stream, so the transient buffer
         // is never live twice.
         let scratch = mx8_common::scratch_for(mx8_scratch, config, gpu)?;
+        let (gate, up, down) = (view(0), view(inter), m("down_proj", h, inter)?);
+        // ATLAS_QWEN4EXP_PREFILL_W8A8: W8A8 operands for the unfused prefill
+        // arm (> 32 rows); nothing is built with the switch off.
+        let w8a8 = if crate::layers::ops::prefill_w8a8() {
+            let stream = gpu.default_stream();
+            let mut w = [None, None, None];
+            for (slot, p) in w.iter_mut().zip([&gate, &up, &down]) {
+                *slot = Some(crate::layers::ops::MxW8a8::from_twin(
+                    gpu,
+                    &p.w,
+                    [p.n as usize, p.k as usize],
+                    0,
+                    stream,
+                )?);
+            }
+            w
+        } else {
+            [None, None, None]
+        };
         moe.set_mxfp8_shared_expert(
-            view(0),
-            view(inter),
-            m("down_proj", h, inter)?,
+            gate,
+            up,
+            down,
             gate_up,
             Mxfp8ProjKernels::resolve(gpu)?,
             scratch,
+            w8a8,
         )?;
     }
     Ok(FfnComponent::Moe(moe))

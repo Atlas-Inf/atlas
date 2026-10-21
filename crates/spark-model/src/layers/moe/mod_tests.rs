@@ -103,6 +103,7 @@ fn mxfp8_shared_expert_runs_at_decode_verify_and_prefill_rows() {
         batchm: KernelHandle(222),
         dequant: KernelHandle(333),
         rows32: KernelHandle(0),
+        quant: KernelHandle(0),
     };
     let scratch = ops::Mxfp8Scratch {
         ptr: DevicePtr(0x9000_0000),
@@ -116,6 +117,7 @@ fn mxfp8_shared_expert_runs_at_decode_verify_and_prefill_rows() {
             None,
             kernels,
             scratch,
+            [None, None, None],
         )
         .unwrap();
     assert!(layer.has_separate_shared_expert());

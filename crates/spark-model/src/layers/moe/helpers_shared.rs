@@ -33,6 +33,7 @@ impl MoeLayer {
         gate_up: Option<Mxfp8GateUp>,
         kernels: ops::Mxfp8ProjKernels,
         scratch: ops::Mxfp8Scratch,
+        w8a8: [Option<ops::MxW8a8>; 3],
     ) -> Result<()> {
         self.btile_storage.require_legacy()?;
         anyhow::ensure!(
@@ -46,6 +47,7 @@ impl MoeLayer {
             gate_up,
             kernels,
             scratch,
+            w8a8,
         });
         Ok(())
     }
@@ -89,16 +91,22 @@ impl MoeLayer {
             gate_up,
             kernels,
             scratch,
+            w8a8,
         } = shared
         {
             let m = num_tokens as usize;
             // Decode and verify rows must be the serial GEMV's bytes; prefill
             // may use the dequant + GEMM tier for m > 32.
-            let proj = |p: &Mxfp8Proj, a: DevicePtr, o: DevicePtr, rows: usize| {
+            // `w`: the projection's W8A8 prefill operands (unfused arm only).
+            let proj = |p: &Mxfp8Proj,
+                        w: Option<&ops::MxW8a8>,
+                        a: DevicePtr,
+                        o: DevicePtr,
+                        rows: usize| {
                 if exact {
                     ops::mxfp8_proj_exact_rows(ctx.gpu, &kernels, p, a, o, rows, stream)
                 } else {
-                    ops::mxfp8_proj(ctx.gpu, &kernels, p, a, o, rows, scratch, stream)
+                    ops::mxfp8_proj_prefill(ctx.gpu, &kernels, p, w, a, o, rows, scratch, stream)
                 }
             };
             // `gate_up_out` holds one <=32-row chunk: when the exact caller's
@@ -115,7 +123,13 @@ impl MoeLayer {
                     // One projection yields `[rows, 2*inter]` gate|up;
                     // fused_silu_mul halves it into the up_out chunk before
                     // the down pass.
-                    proj(&gu.proj, input.offset(first * h_b), gu.gate_up_out, rows)?;
+                    proj(
+                        &gu.proj,
+                        None,
+                        input.offset(first * h_b),
+                        gu.gate_up_out,
+                        rows,
+                    )?;
                     ops::fused_silu_mul(
                         ctx.gpu,
                         gu.silu_mul,
@@ -127,6 +141,7 @@ impl MoeLayer {
                     )?;
                     proj(
                         &down_proj,
+                        None,
                         up_out.offset(first * inter_b),
                         down_out.offset(first * h_b),
                         rows,
@@ -134,8 +149,8 @@ impl MoeLayer {
                 }
                 return Ok(true);
             }
-            proj(&gate_proj, input, gate_out, m)?;
-            proj(&up_proj, input, up_out, m)?;
+            proj(&gate_proj, w8a8[0].as_ref(), input, gate_out, m)?;
+            proj(&up_proj, w8a8[1].as_ref(), input, up_out, m)?;
             ops::silu_mul(
                 ctx.gpu,
                 self.moe_act_mul,
@@ -145,7 +160,7 @@ impl MoeLayer {
                 num_tokens * shared_intermediate,
                 stream,
             )?;
-            proj(&down_proj, gate_out, down_out, m)?;
+            proj(&down_proj, w8a8[2].as_ref(), gate_out, down_out, m)?;
             return Ok(true);
         }
         let SeparateSharedExpert::Bf16(shared) = shared else {

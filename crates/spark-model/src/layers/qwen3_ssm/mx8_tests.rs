@@ -68,6 +68,8 @@ fn mx8(gpu: &MockGpuBackend, config: &ModelConfig) -> Mx8Gdn {
     let out = proj(h, value_dim);
     let bytes = qkvz.bf16_bytes().max(out.bf16_bytes());
     Mx8Gdn {
+        w8a8_qkvz: None,
+        w8a8_out: None,
         qkvz,
         out,
         kernels: Mxfp8ProjKernels::resolve(gpu).unwrap(),

@@ -8,6 +8,9 @@
 //!   inf, NaN, -0, subnormal and exact-power blocks;
 //! - `mxfp8_lt_scale_tile` against the host relayout (random scales and a TP
 //!   K slice through `src_ld`).
+//!
+//! Ported from Enntity/atlas (branch `sparkqwen` @ 92dd543, AGPL-3.0-only),
+//! `crates/spark-model/src/layers/ops/mxfp8_act_test_gpu.rs`, with Atlas-Inf/atlas#198's integration changes.
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -27,32 +30,29 @@ impl Rng {
     }
 }
 
-fn backend() -> Result<&'static spark_runtime::cuda_backend::AtlasCudaBackend> {
+pub(crate) fn backend() -> Result<&'static spark_runtime::cuda_backend::AtlasCudaBackend> {
     static GPU: std::sync::OnceLock<spark_runtime::cuda_backend::AtlasCudaBackend> =
         std::sync::OnceLock::new();
     if let Some(g) = GPU.get() {
         return Ok(g);
     }
-    let g = spark_runtime::cuda_backend::AtlasCudaBackend::new(
-        0,
-        &atlas_kernels::ptx_modules(),
-    )
-    .expect("CUDA backend");
+    let g = spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())
+        .expect("CUDA backend");
     let _ = GPU.set(g);
     Ok(GPU.get().unwrap())
 }
 
-fn upload(gpu: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
+pub(crate) fn upload(gpu: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
     let p = gpu.alloc(bytes.len())?;
     gpu.copy_h2d(bytes, p)?;
     Ok(p)
 }
 
-pub(super) fn u16_bytes(v: &[u16]) -> Vec<u8> {
+pub(crate) fn u16_bytes(v: &[u16]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-pub(super) fn down(gpu: &dyn GpuBackend, p: DevicePtr, bytes: usize) -> Result<Vec<u8>> {
+pub(crate) fn down(gpu: &dyn GpuBackend, p: DevicePtr, bytes: usize) -> Result<Vec<u8>> {
     let mut v = vec![0u8; bytes];
     gpu.copy_d2h(p, &mut v)?;
     Ok(v)
@@ -204,4 +204,3 @@ fn mxfp8_lt_scale_tile_matches_the_host_relayout() -> Result<()> {
     }
     Ok(())
 }
-

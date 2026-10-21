@@ -75,6 +75,7 @@ fn projections(gpu: &MockGpuBackend, config: &ModelConfig) -> ([Mxfp8Proj; 4], M
     ];
     let bytes = 2 * q_dim * h * 2;
     let rt = Mx8AttnRt {
+        w8a8: [None, None, None, None],
         kernels: Mxfp8ProjKernels::resolve(gpu).unwrap(),
         scratch: Mxfp8Scratch {
             ptr: gpu.alloc(bytes).unwrap(),

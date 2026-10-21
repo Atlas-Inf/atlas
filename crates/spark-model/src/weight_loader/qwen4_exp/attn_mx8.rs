@@ -128,12 +128,31 @@ pub(super) fn build(
         config.fp8_kv_calibration_tokens,
         config,
     )?;
+    // W8A8 prefill operands (tiled scales) over the sliced weights —
+    // opt-in only.
+    let stream = gpu.default_stream();
+    let w8a8 = if crate::layers::ops::prefill_w8a8() {
+        let mut out = [None, None, None, None];
+        for (i, pr) in projs.iter().enumerate() {
+            out[i] = Some(crate::layers::ops::MxW8a8::from_twin(
+                gpu,
+                &pr.w,
+                [pr.n as usize, pr.k as usize],
+                0,
+                stream,
+            )?);
+        }
+        out
+    } else {
+        [None, None, None, None]
+    };
     layer
         .set_mx8_projections(
             projs,
             Mx8AttnRt {
                 kernels: Mxfp8ProjKernels::resolve(gpu)?,
                 scratch,
+                w8a8,
             },
         )
         .with_context(|| format!("MXFP8 attention layer {layer_idx}"))?;

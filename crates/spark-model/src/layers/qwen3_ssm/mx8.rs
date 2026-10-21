@@ -26,6 +26,10 @@ pub struct Mx8Gdn {
     pub out: Mxfp8Proj,
     pub kernels: Mxfp8ProjKernels,
     pub scratch: Mxfp8Scratch,
+    /// `ATLAS_QWEN4EXP_PREFILL_W8A8`: the W8A8 prefill operands of `qkvz` and
+    /// `out` (built at load only when the switch is on; `None` otherwise).
+    pub w8a8_qkvz: Option<ops::MxW8a8>,
+    pub w8a8_out: Option<ops::MxW8a8>,
 }
 
 impl Qwen3SsmLayer {
@@ -59,6 +63,8 @@ impl Qwen3SsmLayer {
     }
 
     /// `dst[m, qkvz] = act[m, hidden] @ W_qkvz^T`, sequential `[Q|K|V|Z]`.
+    /// Up to 32 rows (decode) this is `mxfp8_proj`'s GEMV; past it, prefill
+    /// numerics (W8A8 when switched on).
     pub(super) fn mx8_qkvz(
         &self,
         mx8: &Mx8Gdn,
@@ -68,10 +74,11 @@ impl Qwen3SsmLayer {
         m: usize,
         stream: u64,
     ) -> Result<()> {
-        ops::mxfp8_proj(
+        ops::mxfp8_proj_prefill(
             ctx.gpu,
             &mx8.kernels,
             &mx8.qkvz,
+            mx8.w8a8_qkvz.as_ref(),
             act,
             dst,
             m,
@@ -90,10 +97,11 @@ impl Qwen3SsmLayer {
         m: usize,
         stream: u64,
     ) -> Result<()> {
-        ops::mxfp8_proj(
+        ops::mxfp8_proj_prefill(
             ctx.gpu,
             &mx8.kernels,
             &mx8.out,
+            mx8.w8a8_out.as_ref(),
             act,
             dst,
             m,

@@ -19,18 +19,16 @@
 //! rounded to E4M3 under a power-of-two scale per 32 values, which puts a
 //! projection's output ~2-3e-2 (relative) from the same weights on BF16
 //! activations.
+//!
+//! Ported from Enntity/atlas (branch `sparkqwen` @ 92dd543, AGPL-3.0-only),
+//! `crates/spark-model/src/layers/ops/mxfp8_w8a8.rs`, with Atlas-Inf/atlas#198's integration changes.
 
-use std::ops::Range;
 use std::sync::Mutex;
 
 use anyhow::{Result, ensure};
-use spark_runtime::buffers::BufferArena;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
-use super::{
-    MX_LT_TILE_ROWS, MXFP8_ACT_MODULE, MXFP8_BLOCK, mx_lt_inner_pad, mx_lt_scale_bytes,
-    mxfp8_lt_tile_scales, mxfp8_quant_act,
-};
+use super::{MXFP8_ACT_MODULE, MXFP8_BLOCK, mx_lt_scale_bytes, mxfp8_lt_tile_scales};
 use crate::weight_map::Mxfp8Weight;
 
 /// [`mxfp8_quant_act`]'s kernel in [`MXFP8_ACT_MODULE`].
@@ -85,11 +83,6 @@ impl MxW8a8 {
         })
     }
 
-    /// Bytes this operand allocated (the tiled scales).
-    pub fn owned_bytes(&self) -> usize {
-        mx_lt_scale_bytes(self.n, self.k)
-    }
-
     /// Free the tiled scales (the E4M3 bytes are the twin's).
     pub fn free(self, gpu: &dyn GpuBackend) -> Result<()> {
         gpu.free(self.sf)
@@ -120,83 +113,12 @@ pub fn undo_on_err<T>(r: Result<T>, undo: impl FnOnce() -> Result<()>) -> Result
     r
 }
 
-/// What installing W8A8 prefill on a layer did: the bytes its operands
-/// allocated, and the BF16 copies it took out of the layer (pointer, bytes),
-/// which the caller frees.
-#[derive(Debug, Default)]
-pub struct W8a8Swap {
-    pub allocated: usize,
-    pub bf16: Vec<(DevicePtr, usize)>,
-}
-
 /// An MXFP8 activation: E4M3 rows (`k` bytes each) from `q`, their scales
 /// in the tiled layout from `sf`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MxAct {
     pub q: DevicePtr,
     pub sf: DevicePtr,
-}
-
-impl MxAct {
-    /// The same operand from row `row0` on: a whole number of scale tiles,
-    /// so `row0` must be a multiple of 128.
-    pub fn rows_from(self, row0: usize, k: usize) -> Result<Self> {
-        ensure!(
-            row0.is_multiple_of(MX_LT_TILE_ROWS),
-            "MXFP8 activation rows from {row0}: not on the 128-row scale tile grid"
-        );
-        Ok(Self {
-            q: self.q.offset(row0 * k),
-            sf: self.sf.offset(row0 * mx_lt_inner_pad(k)),
-        })
-    }
-}
-
-/// The arena's FP8 activation scratch (`fp8_act` / `fp8_act_scale`, which
-/// no other qwen4_exp prefill op touches) as an `[m, k]` MXFP8 operand.
-pub fn mx_act_scratch(buffers: &BufferArena, m: usize, k: usize) -> Result<MxAct> {
-    let (q_cap, sf_cap) = (buffers.fp8_act_bytes(), buffers.sizes().fp8_act_scale);
-    ensure!(
-        m * k <= q_cap && mx_lt_scale_bytes(m, k) <= sf_cap,
-        "MXFP8 W8A8: a [{m}, {k}] activation needs {} + {} B of FP8 scratch, the arena has \
-         {q_cap} + {sf_cap}",
-        m * k,
-        mx_lt_scale_bytes(m, k),
-    );
-    Ok(MxAct {
-        q: buffers.fp8_act(),
-        sf: buffers.fp8_act_scale(),
-    })
-}
-
-/// Quantize `rows` of BF16 `x` (`[m, k]`, contiguous) into the same rows of
-/// `act`. `rows.start` must be on the 128-row tile grid. `kernel` is
-/// [`MX_QUANT_KERNEL`].
-pub fn mx_quant_rows(
-    gpu: &dyn GpuBackend,
-    kernel: KernelHandle,
-    x: DevicePtr,
-    act: MxAct,
-    rows: Range<usize>,
-    k: usize,
-    stream: u64,
-) -> Result<()> {
-    if rows.is_empty() {
-        return Ok(());
-    }
-    let at = act.rows_from(rows.start, k)?;
-    let (m, k32) = (rows.len() as u32, k as u32);
-    mxfp8_quant_act(
-        gpu,
-        kernel,
-        x.offset(rows.start * k * 2),
-        k32,
-        at.q,
-        at.sf,
-        m,
-        k32,
-        stream,
-    )
 }
 
 /// `(n, k, m_max)` already tuned in this process, and the milliseconds the
@@ -225,10 +147,9 @@ pub fn mx_prepare(n: usize, k: usize, m_max: usize, stream: u64) -> Result<()> {
     Ok(())
 }
 
-/// Milliseconds [`mx_prepare`] has spent in this process.
-pub fn mx_prepare_ms() -> f64 {
-    PREPARED.lock().unwrap().1
-}
+#[cfg(test)]
+#[path = "mxfp8_w8a8_test_gpu.rs"]
+mod gpu_tests;
 
 #[cfg(test)]
 mod tests {

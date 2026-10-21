@@ -27,6 +27,7 @@ fn mxfp8_exact_rows_chunks_and_never_dequants() {
         batchm: KernelHandle(222),
         dequant: KernelHandle(333),
         rows32: KernelHandle(444),
+        quant: KernelHandle(0),
     };
     let scratch = ops::Mxfp8Scratch {
         ptr: DevicePtr(0x9000_0000),
@@ -129,6 +130,7 @@ fn mxfp8_shared_expert_exact_chunks_the_fused_chain() {
         batchm: KernelHandle(222),
         dequant: KernelHandle(333),
         rows32: KernelHandle(444),
+        quant: KernelHandle(0),
     };
     let scratch = ops::Mxfp8Scratch {
         ptr: DevicePtr(0x9000_0000),
@@ -148,6 +150,7 @@ fn mxfp8_shared_expert_exact_chunks_the_fused_chain() {
             Some(gu),
             kernels,
             scratch,
+            [None, None, None],
         )
         .unwrap();
 
@@ -262,5 +265,99 @@ fn mxfp8_shared_expert_exact_chunks_the_fused_chain() {
                 "m={m} chunk{c} silu rows"
             );
         }
+    }
+}
+
+/// With `ATLAS_QWEN4EXP_PREFILL_W8A8` off (no test sets it), the prefill entry
+/// launches exactly what `mxfp8_proj` does at every row count, W8A8 operands
+/// present or not, and never the activation quantizer.
+#[test]
+fn mxfp8_proj_prefill_with_the_switch_off_is_mxfp8_proj() {
+    use crate::layers::moe::shared_fp8_cache_test_gpu::RecordingGpu;
+
+    assert!(
+        !ops::prefill_w8a8(),
+        "the test process must not set the switch"
+    );
+    let gpu = RecordingGpu::new();
+    let proj = ops::Mxfp8Proj {
+        w: crate::weight_map::Mxfp8Weight {
+            data: DevicePtr(0x10000),
+            scales: DevicePtr(0x11000),
+        },
+        n: 640,
+        k: 2560,
+    };
+    let kernels = ops::Mxfp8ProjKernels {
+        gemv: KernelHandle(111),
+        batchm: KernelHandle(222),
+        dequant: KernelHandle(333),
+        rows32: KernelHandle(444),
+        quant: KernelHandle(555),
+    };
+    let scratch = ops::Mxfp8Scratch {
+        ptr: DevicePtr(0x9000_0000),
+        bytes: 1 << 24,
+    };
+    let w8a8 = ops::MxW8a8 {
+        data: proj.w.data,
+        sf: DevicePtr(0x12000),
+        n: 640,
+        k: 2560,
+    };
+    let launches_of = |f: &mut dyn FnMut() -> anyhow::Result<()>| {
+        gpu.launches.lock().unwrap().clear();
+        let _ = f();
+        let ls: Vec<u64> = gpu
+            .launches
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|l| l.kernel)
+            .collect();
+        ls
+    };
+    let (act, out) = (DevicePtr(1), DevicePtr(2));
+    for m in [1usize, 32, 33, 100] {
+        let plain =
+            launches_of(&mut || ops::mxfp8_proj(&gpu, &kernels, &proj, act, out, m, scratch, 19));
+        for w in [None, Some(&w8a8)] {
+            let pre = launches_of(&mut || {
+                ops::mxfp8_proj_prefill(&gpu, &kernels, &proj, w, act, out, m, scratch, 19)
+            });
+            assert_eq!(
+                pre, plain,
+                "m={m}: prefill entry diverged with the switch off"
+            );
+            assert!(
+                !pre.contains(&555),
+                "m={m}: quantizer launched with the switch off"
+            );
+        }
+    }
+}
+
+/// The W8A8 arm's row chunks: everything when it fits, else whole 128-row
+/// scale tiles that fit the scratch, and 0 (refused) below one tile.
+#[test]
+fn w8a8_chunks_are_whole_scale_tiles_that_fit_the_scratch() {
+    let k = 2560;
+    let need = |rows: usize| rows * k + ops::mx_lt_scale_bytes(rows, k);
+    assert_eq!(ops::w8a8_chunk_rows(1000, k, need(1000)), 1000);
+    assert_eq!(ops::w8a8_chunk_rows(1000, k, need(256) + 100), 256);
+    assert_eq!(ops::w8a8_chunk_rows(1000, k, need(384) - 1), 256);
+    assert_eq!(ops::w8a8_chunk_rows(16384, k, 1 << 25), 99 * 128);
+    assert_eq!(ops::w8a8_chunk_rows(1000, k, need(128) - 1), 0);
+    for (m, bytes) in [
+        (5000usize, 3usize << 24),
+        (16384, 42 << 20),
+        (777, need(300)),
+    ] {
+        let c = ops::w8a8_chunk_rows(m, k, bytes);
+        assert!(
+            c == m || (c > 0 && c.is_multiple_of(128)),
+            "m={m}: chunk {c}"
+        );
+        assert!(need(c) <= bytes, "m={m}: chunk {c} overflows {bytes} B");
     }
 }

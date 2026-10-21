@@ -53,6 +53,7 @@ impl Qwen3AttentionLayer {
         } else if let Some(r) = self.try_mx8(
             ctx,
             self.o_weight.as_ref(),
+            None,
             attn_out,
             o_out,
             1,
