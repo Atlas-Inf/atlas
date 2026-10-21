@@ -45,6 +45,7 @@ impl MoeLayer {
                 ctx.buffers.ssm_qkvz(),
                 ctx.buffers.attn_output(),
                 ctx,
+                false,
                 stream,
             )?;
         }

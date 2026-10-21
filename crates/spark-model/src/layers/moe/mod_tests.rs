@@ -3,6 +3,7 @@
 //! Tests split out of `moe/mod.rs` for the ≤500 LoC file-size cap.
 
 use super::*;
+
 use spark_runtime::gpu::mock::MockGpuBackend;
 
 #[test]
@@ -101,6 +102,7 @@ fn mxfp8_shared_expert_runs_at_decode_verify_and_prefill_rows() {
         gemv: KernelHandle(111),
         batchm: KernelHandle(222),
         dequant: KernelHandle(333),
+        rows32: KernelHandle(0),
     };
     let scratch = ops::Mxfp8Scratch {
         ptr: DevicePtr(0x9000_0000),
@@ -164,6 +166,7 @@ fn mxfp8_shared_expert_runs_at_decode_verify_and_prefill_rows() {
                 up_out,
                 down_out,
                 &ctx,
+                true,
                 19,
             )
             .unwrap();
@@ -175,15 +178,90 @@ fn mxfp8_shared_expert_runs_at_decode_verify_and_prefill_rows() {
             .iter()
             .map(|l| l.kernel)
             .collect();
-        let want_n = if m == 1 {
-            3
-        } else {
-            3 * (m as usize).div_ceil(8)
-        };
+        // O1: batchm serves 2..=32 rows in ONE launch per projection, so the
+        // shared expert is 3 launches at every row count here (m=1 takes the
+        // single-row GEMV arm, also one launch each).
+        let want_n = 3;
         assert_eq!(
             kernels_run.iter().filter(|&&k| k == want).count(),
             want_n,
             "m={m}: expected {want_n} launches of {want}, got {kernels_run:?}"
         );
+    }
+}
+
+#[test]
+fn bf16_router_keeps_dense_gemm_unless_flagged() {
+    // Regression for the FP4-Local row-invariant router arm: a BF16-gate
+    // MoeLayer whose builder did NOT call set_row_invariant_bf16_router()
+    // must route through the scalar dense_gemm (its launch block is 2D),
+    // not the qwen4exp dense_gemv_batchm tiers (1D blocks).
+    use crate::layer::ForwardContext;
+    use crate::layers::moe::shared_fp8_cache_test_gpu::RecordingGpu;
+    use atlas_core::config::ModelConfig;
+    use spark_runtime::buffers::BufferArena;
+
+    let gpu = RecordingGpu::new();
+    let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+    config.hidden_size = 2560;
+    config.num_experts = 512;
+    config.num_experts_per_tok = 10;
+    config.moe_intermediate_size = 640;
+    config.shared_expert_intermediate_size = 640;
+    config.vocab_size = 8;
+    for flagged in [false, true] {
+        let mut layer = MoeLayer::new(MoeWeights::empty(512), 512, None, &gpu, &config).unwrap();
+        if flagged {
+            layer.set_row_invariant_bf16_router();
+        }
+        let buffers = BufferArena::new(&config, 64, 4096, 16, 1, &gpu).unwrap();
+        let dispatch = ops::GemmDispatch::defaults();
+        let derived = ops::DerivedWeights::new();
+        let levers = ops::ModelLevers::defaults();
+        let stats = ops::ModelStats::new();
+        let ctx = ForwardContext {
+            buffers: &buffers,
+            gpu: &gpu,
+            config: &config,
+            dispatch: &dispatch,
+            derived: &derived,
+            levers: &levers,
+            stats: &stats,
+            ssm_batch: None,
+            attn_metadata: None,
+            profile: false,
+            comm: None,
+            graph_capture: false,
+            gdn_exact_replay: false,
+            token_ids: None,
+            host_token_ids: None,
+            routed_lora_layers: None,
+            midchunk_capture: None,
+            moe_lora_route: crate::layer::MoeLoraRoute::Skip,
+        };
+        gpu.launches.lock().unwrap().clear();
+        let n = 8u32;
+        layer
+            .batched_gate_logits(
+                DevicePtr(0x40000),
+                n,
+                config.hidden_size as u32,
+                config.num_experts as u32,
+                DevicePtr(0),
+                &ctx,
+                19,
+            )
+            .unwrap();
+        let launches = gpu.launches.lock().unwrap();
+        // dense_gemm is a 2D-block tiled kernel; the dense_rows/dense_gemv
+        // tiers all launch 1D blocks.
+        let gemm_blocks = launches.iter().filter(|l| l.block[1] > 1).count();
+        let rows_blocks = launches.iter().filter(|l| l.block[1] == 1).count();
+        if flagged {
+            assert_eq!(gemm_blocks, 0, "flagged layer must not run dense_gemm");
+            assert!(rows_blocks > 0);
+        } else {
+            assert_eq!(gemm_blocks, 1, "unflagged BF16 router must run dense_gemm");
+        }
     }
 }

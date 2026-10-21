@@ -70,11 +70,16 @@ impl Qwen4ExpMoeRows {
         (top_k, rows): (u32, u32),
         stream: u64,
     ) -> Result<()> {
-        // v3 always runs the shared unit (v1/v2 write zeros without one).
+        // All-or-nothing shared weights: a partial set has nowhere to go.
+        let n_shared = [sh_gate, sh_up, sh_down]
+            .iter()
+            .filter(|w| w.weight.0 != 0)
+            .count();
         anyhow::ensure!(
-            [sh_gate, sh_up, sh_down].iter().all(|w| w.weight.0 != 0),
-            "qwen4exp MoE TC v3: no shared expert"
+            n_shared == 0 || n_shared == 3,
+            "qwen4exp MoE TC v3: partial shared expert ({n_shared}/3 weights)"
         );
+        let has_shared = (n_shared == 3) as u32;
         KernelLaunch::new(gpu, self.units_plan)
             .grid([1, 1, 1])
             .block([1024, 1, 1])
@@ -83,6 +88,7 @@ impl Qwen4ExpMoeRows {
             .arg_ptr(ws)
             .arg_u32(top_k)
             .arg_u32(rows)
+            .arg_u32(has_shared)
             .launch(stream)?;
         let mut l = KernelLaunch::new(gpu, self.units_fused)
             .grid([self.units_ctas, 1, 1])

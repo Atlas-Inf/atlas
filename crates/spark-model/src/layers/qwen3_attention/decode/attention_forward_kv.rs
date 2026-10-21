@@ -30,10 +30,10 @@ impl Qwen3AttentionLayer {
             return Ok(());
         }
 
-        if let Some(r) = self.try_mx8(ctx, self.k_weight.as_ref(), normed, k_out, 1, stream) {
+        if let Some(r) = self.try_mx8(ctx, self.k_weight.as_ref(), normed, k_out, 1, true, stream) {
             r?;
             return self
-                .try_mx8(ctx, self.v_weight.as_ref(), normed, v_out, 1, stream)
+                .try_mx8(ctx, self.v_weight.as_ref(), normed, v_out, 1, true, stream)
                 .unwrap_or_else(|| anyhow::bail!("MXFP8 k_proj without an MXFP8 v_proj"));
         }
 

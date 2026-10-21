@@ -14,10 +14,10 @@
 //! 26.8 GiB on disk against the NVFP4 pack's 47.7 GiB FP8 table, with the
 //! same row count: fewer bytes per fault, more rows per page-cache GiB.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "cuda"))]
 use anyhow::Context as _;
 use anyhow::{Result, ensure};
-#[cfg(test)]
+#[cfg(any(test, feature = "cuda"))]
 use atlas_core::modelopt_codec::nvfp4_rows_to_bf16;
 
 /// Row geometry of an NVFP4 n-gram table.
@@ -68,11 +68,12 @@ pub fn check_packed_stride(stride: usize, spec: &Nvfp4RowGeom, scaled: bool) -> 
     Ok(())
 }
 
-/// Decode gathered rows — kept as the oracle for the GPU microtest and
-/// the host-side cache tests; the serving path decodes in
-/// `batched_embed_nvfp4`. `packed[i]` and `scales[i]` are row `i`'s bytes
-/// from the weight and block-scale caches. Returns little-endian BF16.
-#[cfg(test)]
+/// Decode gathered rows — the host ORACLE for the GPU microtest, the
+/// host-side cache tests, and the `ATLAS_PLE_RESIDENT` boot self-check; the
+/// serving path decodes in `batched_embed_nvfp4`. `packed[i]` and
+/// `scales[i]` are row `i`'s bytes from the weight and block-scale caches.
+/// Returns little-endian BF16.
+#[cfg(any(test, feature = "cuda"))]
 pub fn decode_rows_bf16(
     spec: &Nvfp4RowGeom,
     packed: &[Vec<u8>],

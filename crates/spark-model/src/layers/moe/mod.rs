@@ -176,6 +176,7 @@ pub(crate) use lora::MoeLoraWeights;
 mod forward_atomic_c4;
 mod forward_batched;
 mod forward_batched_gate;
+mod forward_batched_guards;
 mod forward_c2;
 mod forward_c4;
 mod forward_independent;
@@ -205,6 +206,9 @@ mod forward_prefill_q38_rs;
 mod forward_prefill_route;
 pub(crate) mod forward_prefill_route_sp;
 mod forward_prefill_routed;
+#[cfg(all(test, feature = "cuda"))]
+#[path = "router_determinism_gpu_tests.rs"]
+mod router_determinism_gpu_tests;
 pub(crate) use forward_prefill_routed::{grouped_cutlass_gate_up_enabled, prefill_fp8_down};
 mod forward_prefill_router;
 mod forward_prefill_tcp;
@@ -232,6 +236,7 @@ pub(crate) use shared_fp8_cache::validate_shared_fp8_cache_factory_reserve;
 pub use shared_fp8_cache::{validate_shared_fp8_cache_graphs, validate_shared_fp8_cache_profile};
 pub(crate) use shared_fp8_origin::load_glm_shared_fp8_weight;
 mod init;
+mod init_ctor;
 mod init_optional;
 mod inplace_transpose;
 mod m5_projection_oracle;
@@ -244,6 +249,9 @@ mod shared_m16;
 pub(crate) use m5_projections::validate_m5_projection_graphs;
 #[cfg(test)]
 mod mod_tests;
+#[cfg(test)]
+#[path = "mxfp8_exact_tests.rs"]
+mod mxfp8_exact_tests;
 mod prequant_fp4;
 mod prequant_fp4_c3;
 mod prequant_fp4_down;

@@ -54,16 +54,7 @@ impl Qwen3SsmLayer {
                 GdnProj::Qkvz => &mx8.qkvz,
                 GdnProj::Out => &mx8.out,
             };
-            ops::mxfp8_proj(
-                ctx.gpu,
-                &mx8.kernels,
-                p,
-                input,
-                output,
-                rows,
-                mx8.scratch,
-                stream,
-            )?;
+            ops::mxfp8_proj_exact_rows(ctx.gpu, &mx8.kernels, p, input, output, rows, stream)?;
             return Ok(true);
         }
         if !ctx.levers.qwen4exp_batch_fast
