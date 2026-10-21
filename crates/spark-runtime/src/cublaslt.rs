@@ -17,8 +17,19 @@ mod fp8;
 mod fp8_tensorwise;
 pub use fp8_tensorwise::fp8_gemm_act_weight_t_tensorwise;
 mod grouped;
-pub use fp8::{fp8_gemm_act_weight_t_blkscaled, fp8_gemm_act_weight_t_rowwise};
+pub use fp8::{
+    fp8_gemm_act_weight_t_blkscaled, fp8_gemm_act_weight_t_mx, fp8_gemm_act_weight_t_rowwise,
+};
+mod mx_algo;
+pub use mx_algo::fp8_gemm_mx_prepare;
+// The MXFP8 kernel choice's introspection, for tests and benches only.
+#[cfg(any(test, feature = "test-utils"))]
+pub use fp8::fp8_gemm_act_weight_t_mx_candidate;
+#[cfg(any(test, feature = "test-utils"))]
+pub use mx_algo::{MX_CANDIDATES, fp8_gemm_mx_candidate_times, mx_algo_description, mx_per_bucket};
+mod mx_sweep;
 pub use grouped::bf16_grouped_gemm_act_weight_t;
+pub use mx_sweep::{MX_SWEEP, MxSweepShape};
 mod tf32;
 pub use tf32::tf32_gemm_act_weight_t;
 mod fixed_algo;
@@ -62,6 +73,9 @@ const DESC_B_SCALE_POINTER: u32 = 18;
 const DESC_A_SCALE_MODE: u32 = 31;
 const DESC_B_SCALE_MODE: u32 = 32;
 const SCALE_MODE_OUTER_VEC_32F: i32 = 3;
+/// `CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0`: one UE8M0 scale per 32 K
+/// values (MXFP8), in cuBLASLt's tiled scale layout.
+const SCALE_MODE_VEC32_UE8M0: i32 = 2;
 const SCALE_MODE_VEC128_32F: i32 = 4;
 const SCALE_MODE_BLK128X128_32F: i32 = 5;
 const PREF_MAX_WORKSPACE_BYTES: u32 = 1;
