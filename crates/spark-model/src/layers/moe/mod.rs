@@ -249,6 +249,9 @@ mod shared_m16;
 pub(crate) use m5_projections::validate_m5_projection_graphs;
 #[cfg(test)]
 mod mod_tests;
+#[cfg(test)]
+#[path = "mxfp8_exact_tests.rs"]
+mod mxfp8_exact_tests;
 mod prequant_fp4;
 mod prequant_fp4_c3;
 mod prequant_fp4_down;
