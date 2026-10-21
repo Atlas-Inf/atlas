@@ -46,8 +46,8 @@ fn grammar_serial_verify() -> bool {
 /// batched pick runs the same per-sequence fast/slow selection the serial
 /// path does, with per-row masks keeping picks grammar-legal. Strict
 /// grammars keep the serial path either way.
-fn grammar_rides_batch(a: &ActiveSeq) -> bool {
-    a.grammar_state.is_none() || (!a.strict_grammar() && !grammar_serial_verify())
+fn grammar_rides_batch(a: &ActiveSeq, serial_verify: bool) -> bool {
+    a.grammar_state.is_none() || (!a.strict_grammar() && !serial_verify)
 }
 
 /// The batched verify of one step.
@@ -115,7 +115,7 @@ pub(super) fn plan_verify(
     };
     for &idx in verify_idxs {
         let a = &active[idx];
-        if grammar_rides_batch(a) && a.pending_drafts.len() >= min_drafts {
+        if grammar_rides_batch(a, grammar_serial_verify()) && a.pending_drafts.len() >= min_drafts {
             plan.batch.push(idx);
         } else {
             plan.serial.push(idx);
@@ -130,7 +130,7 @@ pub(super) fn plan_verify(
         plan.decode_rows = bootstrap_idxs
             .iter()
             .copied()
-            .filter(|&i| grammar_rides_batch(&active[i]))
+            .filter(|&i| grammar_rides_batch(&active[i], grammar_serial_verify()))
             .collect();
         plan.batch.extend_from_slice(&plan.decode_rows);
     }
