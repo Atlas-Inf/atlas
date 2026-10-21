@@ -335,3 +335,109 @@ fn qwen4exp_moe_fast_hybrid_batched_rows_keep_per_row_routing_blends_and_reducti
         }
     }
 }
+
+/// The GENERIC `forward_batched` EP tail (no fast pair installed): a gated
+/// shared expert's output is consumed exactly once — under EP the pre-reduce
+/// `moe_weighted_sum_blend` blends the zero row, exactly one all-reduce of
+/// `rows*H` BF16 follows, then exactly one `moe_batched_blend` adds
+/// `shared_out`; without EP the blend carries `shared_out` and no reduction
+/// or post add runs.
+#[test]
+fn generic_batched_ep_tail_consumes_shared_expert_once() {
+    let gpu = Gpu::new();
+    let (config, mut layer) = qwen4exp_layer(&gpu, 2);
+    layer
+        .set_bf16_shared_expert(
+            DenseWeight {
+                weight: gpu.alloc(I * H * 2).unwrap(),
+            },
+            DenseWeight {
+                weight: gpu.alloc(I * H * 2).unwrap(),
+            },
+            DenseWeight {
+                weight: gpu.alloc(H * I * 2).unwrap(),
+            },
+        )
+        .unwrap();
+    let arena = BufferArena::new(&config, 8, 2048, 16, 8, &gpu).unwrap();
+    let resources = ContextResources::new();
+    let comm = Comm {
+        gpu: &gpu,
+        reductions: Mutex::new(vec![]),
+    };
+
+    // EP world 2.
+    let mut ctx = resources.view(&arena, &config, &gpu);
+    ctx.comm = Some(&comm);
+    for rows in [2usize, 4] {
+        comm.reductions.lock().unwrap().clear();
+        gpu.clear();
+        layer
+            .forward_batched(arena.norm_output(), rows, &ctx, 7)
+            .unwrap();
+        let calls = launches(&gpu);
+        let blend: Vec<_> = calls
+            .iter()
+            .filter(|c| c.0 == layer.moe_weighted_sum_blend.0)
+            .collect();
+        let post: Vec<_> = calls
+            .iter()
+            .filter(|c| c.0 == layer.moe_batched_blend.0)
+            .collect();
+        let reductions = comm.reductions.lock().unwrap().clone();
+        assert_eq!(blend.len(), rows, "rows={rows}");
+        // The generic tail runs `forward_ep_reduce` once per row: one
+        // all-reduce of H BF16 then one `moe_batched_blend` adding
+        // shared_out — exactly once per row in both modes.
+        assert_eq!(post.len(), rows, "rows={rows}: post-reduce shared adds");
+        assert_eq!(reductions.len(), rows, "rows={rows}: all-reduces");
+        for c in 0..rows {
+            assert_eq!(reductions[c].0, H * 2, "rows={rows} reduce {c} bytes");
+        }
+        // The shared row blended before the reduce is the zero row: the
+        // memset'd expert_gate_out temp, or NULL under DECODE_FUSE.
+        for r in 0..rows {
+            let zero_ok = matches!(
+                &blend[r].4[3],
+                Arg::Ptr(p) if *p == arena.expert_gate_out() || *p == DevicePtr::NULL
+            );
+            assert!(
+                zero_ok,
+                "rows={rows} row{r}: EP blend shared arg is not the zero row"
+            );
+        }
+        // Each post-reduce shared add carries the real shared_out.
+        for (r, pl) in post.iter().enumerate() {
+            assert_eq!(
+                pl.4[1],
+                Arg::Ptr(arena.attn_output()),
+                "rows={rows} row{r}: post add must carry shared_out"
+            );
+        }
+    }
+
+    // No EP: the blend carries shared_out directly; no reduce, no post add.
+    let ctx = resources.view(&arena, &config, &gpu);
+    gpu.clear();
+    layer
+        .forward_batched(arena.norm_output(), 2, &ctx, 7)
+        .unwrap();
+    let calls = launches(&gpu);
+    let blend: Vec<_> = calls
+        .iter()
+        .filter(|c| c.0 == layer.moe_weighted_sum_blend.0)
+        .collect();
+    let post = calls
+        .iter()
+        .filter(|c| c.0 == layer.moe_batched_blend.0)
+        .count();
+    assert_eq!(blend.len(), 2);
+    for r in 0..2 {
+        assert_eq!(
+            blend[r].4[3],
+            Arg::Ptr(arena.attn_output()),
+            "non-EP row{r}: blend must carry shared_out"
+        );
+    }
+    assert_eq!(post, 0, "non-EP: no post-reduce shared add");
+}
