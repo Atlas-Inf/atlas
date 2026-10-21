@@ -206,6 +206,9 @@ mod forward_prefill_q38_rs;
 mod forward_prefill_route;
 pub(crate) mod forward_prefill_route_sp;
 mod forward_prefill_routed;
+#[cfg(all(test, feature = "cuda"))]
+#[path = "router_determinism_gpu_tests.rs"]
+mod router_determinism_gpu_tests;
 pub(crate) use forward_prefill_routed::{grouped_cutlass_gate_up_enabled, prefill_fp8_down};
 mod forward_prefill_router;
 mod forward_prefill_tcp;
