@@ -18,6 +18,7 @@ fn no_ffmpeg() -> FfmpegPolicy {
 fn cfg() -> VisionConfig {
     VisionConfig {
         is_glm5_next: false,
+        is_qwen3vl_video: false,
         in_channels: 3,
         depth: 2,
         hidden_size: 32,

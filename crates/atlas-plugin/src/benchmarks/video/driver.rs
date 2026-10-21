@@ -334,12 +334,13 @@ impl Benchmark for VideoFidelity {
                     Some(r) => CountCell::Match {
                         id: "group-proportionality",
                         detail: format!(
-                            "1s={t1}, 2s={t2}, 4s={t4} tok -> {}/{}/{} groups at {} tok/group \
+                            "1s={t1}, 2s={t2}, 4s={t4} tok -> {}/{}/{} groups at {}+{} tok/group \
                              (template overhead {})",
                             r.unit_groups,
                             r.unit_groups * 2,
                             r.unit_groups * 4,
                             self.plane,
+                            r.per_group_text,
                             r.overhead
                         ),
                     },
