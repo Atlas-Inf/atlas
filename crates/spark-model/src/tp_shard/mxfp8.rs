@@ -311,7 +311,10 @@ mod tests {
                 joined.extend_from_slice(&d);
             }
             let got: Vec<u32> = joined.iter().map(|v| v.to_bits()).collect();
-            let want: Vec<u32> = full[r * k..(r + 1) * k].iter().map(|v| v.to_bits()).collect();
+            let want: Vec<u32> = full[r * k..(r + 1) * k]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
             assert_eq!(got, want, "row {r}: reassembled dequant differs");
         }
         // (k / tp) % 32 != 0 must be rejected: a rank would split a scale group.
