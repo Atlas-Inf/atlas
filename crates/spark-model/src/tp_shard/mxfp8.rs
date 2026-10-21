@@ -278,4 +278,46 @@ mod tests {
         }
         assert_ne!(good, bad);
     }
+
+    /// Row-parallel reassembly: dequant(shard0) || dequant(shard1) per row
+    /// equals dequant(full) bit-for-bit, on hostile E4M3/E8M0 bytes (NaN
+    /// codes, exponent extremes) compared via f32::to_bits.
+    #[test]
+    fn row_parallel_reassembly_is_bit_exact_on_hostile_bytes() {
+        let gpu = MockGpuBackend::new();
+        let (n, k) = (4usize, 128usize);
+        // E4M3 0x7F / 0xFF are NaN codes; E8M0 0xFF is NaN, 0x00 subnormal.
+        let mut data: Vec<u8> = (0..n * k).map(|i| (i * 91) as u8).collect();
+        let mut scales: Vec<u8> = (0..n * (k / 32)).map(|i| (i * 61) as u8).collect();
+        for (i, b) in [0x00u8, 0x7F, 0xFF, 0x80, 0xFE].iter().enumerate() {
+            data[i] = *b;
+            scales[i] = [0x00u8, 0xFE, 0xFF, 0x7F, 0x80][i];
+        }
+        let src = [upload(&gpu, &data), upload(&gpu, &scales)];
+        let full = dequant(&data, &scales, n, k);
+        for r in 0..n {
+            let mut joined = Vec::new();
+            for rank in 0..2 {
+                let (l, lk) = shard_mxfp8_row_parallel(src, n, k, rank, 2, &gpu).unwrap();
+                let ld = fetch(&gpu, l[0], n * lk);
+                let ls = fetch(&gpu, l[1], n * (lk / 32));
+                // Row r of the local module: dequant it standalone.
+                let d = dequant(
+                    &ld[r * lk..(r + 1) * lk],
+                    &ls[r * (lk / 32)..(r + 1) * (lk / 32)],
+                    1,
+                    lk,
+                );
+                joined.extend_from_slice(&d);
+            }
+            let got: Vec<u32> = joined.iter().map(|v| v.to_bits()).collect();
+            let want: Vec<u32> = full[r * k..(r + 1) * k].iter().map(|v| v.to_bits()).collect();
+            assert_eq!(got, want, "row {r}: reassembled dequant differs");
+        }
+        // (k / tp) % 32 != 0 must be rejected: a rank would split a scale group.
+        assert!(
+            shard_mxfp8_row_parallel(src, n, 96, 0, 2, &gpu).is_err(),
+            "k=96 over tp=2 leaves 48 not a multiple of 32"
+        );
+    }
 }
