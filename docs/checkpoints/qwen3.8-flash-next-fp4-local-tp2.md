@@ -161,16 +161,45 @@ Aggregate tok/s at 1 / 2 / 4 / 8 concurrent requests:
 Profile captures must trace graph nodes (`--cuda-graph-trace=node`). At graph level the kernel tables
 show only the ~25% of GPU time spent outside graphs.
 
+### 5a. Where prefill time goes (nsys, rank 0, V5 numerics, one cold prefill workload)
+
+| Kernel family | Share of prefill GPU time |
+|---|---|
+| BF16 GEMMs (the expanded MXFP8 projections, mHC, LM-side) | 26.3% |
+| Routed MoE (`moe_q38wn_gate_up_silu`, `_down`, unpermute) | 22.1% |
+| mHC (`hc_post_stage_bf16` 9.4%, `hc_pre_mix` 3.8%) | 14.8% |
+| Attention / QSA (`qsa_prefill_attn_tc2r` 10.3%) | 13.5% |
+| GDN chunked recurrence | 13.3% |
+| norms, activations, copies | 5.1% |
+| all-reduce | 1.8% |
+
+The fidelity release that SparkQwen ships reaches first token ~20% sooner on the same server_argv
+(maplepaladin73's same-box A/B on this PR). I ported its MXFP8 W8A8 prefill GEMM for the projections
+(cuBLASLt block-scaled FP8, activations quantized per row with ModelOpt's rule) as an opt-in on the
+branch `wip/fp4-local-tp2-w8a8`, not in this PR. On our pair it is exact where it has to be:
+- speculative == serial, cached == uncached and C8 == C1, all 8/8, in separate boots;
+- every output row is independent of the pass height, its position in the pass and the scratch
+  chunking, 0 differences;
+- the activation quantizer matches ModelOpt's reference byte for byte;
+- outputs are 2.4-2.5% (relative) from the exact BF16-activation projection.
+
+It moved cold TTFT by only 4-7% (2K / 8K / 16K / 28K: 0.93 / 2.68 / 5.65 / 9.47 s exact vs 0.86 / 2.55
+/ 5.43 / 9.09 s W8A8, 3 runs each, same session). The projection GEMMs are a small slice of the table
+above; the rest of the gap has to come from mHC, MoE and QSA prefill, which the fidelity release also
+reworks.
+
 ## 6. What is left (ranked)
 
-1. MXFP8 projections are still ~11 ms/step (1 stream) and ~22 ms/step (8 streams), against a ~7.5 ms
+1. Prefill (TTFT): mHC prefill (`hc_post_stage_bf16`, `hc_pre_mix`), routed-MoE prefill and QSA
+   prefill attention, per §5a. The W8A8 projection GEMM alone is worth 4-7%, so it stays off this PR.
+2. MXFP8 projections are still ~11 ms/step (1 stream) and ~22 ms/step (8 streams), against a ~7.5 ms
    bandwidth floor. The GEMV tiers are load/latency-bound. Next: cp.async-pipelined staging, plus more
    CTAs per small-n projection.
-2. MTP depth / draft policy sweep on the current numerics (measurement only).
-3. Head-sharded resident table (each rank holds 8 of the 16 n-gram heads, then an all-gather of
+3. MTP depth / draft policy sweep on the current numerics (measurement only).
+4. Head-sharded resident table (each rank holds 8 of the 16 n-gram heads, then an all-gather of
    `[T, 8x160]` before the replicated projections; bit-exact): frees 14.4 GB per rank, so the 0.70
    sidecar setting fits.
-4. MXFP8 verify LM head as an opt-in (NVIDIA ships one; lossy, so off by default); shared-expert TP
+5. MXFP8 verify LM head as an opt-in (NVIDIA ships one; lossy, so off by default); shared-expert TP
    split; mHC split.
 
 ## 7. Running it
@@ -183,6 +212,14 @@ pinned on both. Start rank 1 first:
 --rank={0,1} --master-addr=<rank-0 cable IP>`.
 Per rank, the boot log shows pre-KV ≈ 85–87 GB, a ~1.1–1.3M-token KV pool and the line
 `PLE resident: 320001536 rows, 28.8 GB on device ... self-check PASS`.
+
+Through sparkrun: the recipe `qwen3.8/qwen3.8-flash-next-fp4-local-tp2` (Atlas-Inf/sparkrun-recipes#20,
+draft until this PR and #195 are in an image) carries the same profile, the measurements above and its own
+launch receipts. Launched with it on a validation image of this PR's head, the greedy outputs, tool
+probe and contamination results are identical to the native runs, and decode speed is within 2%. Point
+`model:` at a snapshot already on both nodes (or let sparkrun fetch it): sparkrun's model distribution
+from the head node to itself removed the blob symlinks of a cache that keeps its blobs in a separate
+store.
 
 ### 7a. Switches this PR adds, and rollback
 
