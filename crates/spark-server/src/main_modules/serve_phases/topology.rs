@@ -253,12 +253,6 @@ fn rank_settings(
             "ATLAS_PLE_RESIDENT",
             (std::env::var("ATLAS_PLE_RESIDENT").as_deref() == Ok("1")) as u64,
         ),
-        // The MXFP8 tensor-core tier is a numerics family: both ranks must
-        // route every projection on it or neither does.
-        (
-            "ATLAS_QWEN4EXP_MXFP8_TC",
-            (std::env::var("ATLAS_QWEN4EXP_MXFP8_TC").as_deref() == Ok("1")) as u64,
-        ),
     ]
 }
 

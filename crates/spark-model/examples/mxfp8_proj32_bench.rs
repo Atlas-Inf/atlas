@@ -4,7 +4,7 @@
 //! shapes, COLD-L2: each iteration reads a different weight copy (copies
 //! total > 2x L2), so reported times are DRAM-bound, not L2-bound.
 //! Tiers: `batchm` (8-row chunked loop), `rows32` (register-tiled GEMV,
-//! one launch), `tc` (mxfp8_proj_tc, the MMA family).
+//! one launch).
 
 use anyhow::Result;
 use half::bf16;
@@ -37,15 +37,14 @@ fn main() -> Result<()> {
     let stream = g.default_stream();
     let kb = gpu.kernel("mxfp8_proj", "mxfp8_proj_batchm")?;
     let kr = gpu.kernel("mxfp8_proj", "mxfp8_proj_rows32")?;
-    let kt = gpu.kernel("mxfp8_proj", "mxfp8_proj_tc")?;
     let mut rng: u64 = 0x5EED;
     let mut next = move || {
         rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
         (rng >> 33) as u8
     };
     println!(
-        "{:>16} {:>4} {:>10} {:>10} {:>10} {:>9} {:>9} {:>9}",
-        "shape", "m", "batchm us", "rows32 us", "tc us", "bm GB/s", "r32 GB/s", "tc GB/s"
+        "{:>16} {:>4} {:>10} {:>10} {:>9} {:>9}",
+        "shape", "m", "batchm us", "rows32 us", "bm GB/s", "r32 GB/s"
     );
     for &(n, kk, label) in SHAPES {
         let wbytes = n as usize * kk as usize;
@@ -64,24 +63,13 @@ fn main() -> Result<()> {
         let cd = g.alloc(32 * n as usize * 2)?;
         let bytes = (wbytes + sbytes) as f64;
         for &m in MS {
-            // which: 0 = batchm 8-row chunks, 1 = rows32, 2 = tc.
+            // which: 0 = batchm 8-row chunks, 1 = rows32.
             let launch = |which: usize, i: usize| -> Result<()> {
                 let (wd, sd) = (wds[i % COPIES], sds[i % COPIES]);
                 match which {
                     1 => KernelLaunch::new(g, kr)
                         .grid([div_ceil(n, 8), 1, 1])
                         .block([256, 1, 1])
-                        .arg_ptr(ad)
-                        .arg_ptr(wd)
-                        .arg_ptr(sd)
-                        .arg_ptr(cd)
-                        .arg_u32(m as u32)
-                        .arg_u32(n)
-                        .arg_u32(kk)
-                        .launch(stream),
-                    2 => KernelLaunch::new(g, kt)
-                        .grid([div_ceil(n, 64), div_ceil(m as u32, 16), 1])
-                        .block([128, 1, 1])
                         .arg_ptr(ad)
                         .arg_ptr(wd)
                         .arg_ptr(sd)
@@ -121,12 +109,11 @@ fn main() -> Result<()> {
                 g.synchronize(stream)?;
                 Ok(t0.elapsed().as_micros() as f64 / ITERS as f64)
             };
-            let (t0, t1, t2) = (time(0)?, time(1)?, time(2)?);
+            let (t0, t1) = (time(0)?, time(1)?);
             println!(
-                "{label:>16} {m:>4} {t0:>10.1} {t1:>10.1} {t2:>10.1} {:>9.0} {:>9.0} {:>9.0}",
+                "{label:>16} {m:>4} {t0:>10.1} {t1:>10.1} {:>9.0} {:>9.0}",
                 bytes / (t0 * 1e3),
-                bytes / (t1 * 1e3),
-                bytes / (t2 * 1e3)
+                bytes / (t1 * 1e3)
             );
         }
     }
