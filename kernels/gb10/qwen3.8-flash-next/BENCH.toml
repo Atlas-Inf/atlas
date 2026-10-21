@@ -147,7 +147,7 @@ profile without HC_FAST; (2) run-1792488042130537521, 2026-10-20, binary \
 87.44 / normalized 87.32. ★ As with the vendor pack above, that identity is \
 reproducibility across two builds and a lever change, NOT a repeat-spread: \
 the exact-verify and exact-batching lanes are bit-exact against serial decode \
-and HC_FAST was CHECKed 0/256 rows different, so identical scores are what \
+and the HC_FAST check found 0/256 rows different, so identical scores are what \
 correctness predicts. The 0.4 margin is the dense sibling's documented MTP \
 nondeterminism floor, inherited and labelled as such. Same build and flags \
 with the vendor pack swapped in scored 86.23 / 85.64 (run-1792378038850732185) \
