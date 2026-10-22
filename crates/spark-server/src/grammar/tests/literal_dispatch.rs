@@ -119,3 +119,28 @@ fn required_poolside_grammar_does_not_enable_literal_bypass() {
     );
     assert!(!state.accept_token(b'T' as u32));
 }
+
+#[test]
+fn auto_literal_dispatch_keeps_compiled_stop_tokens_out_of_history() {
+    let mut state = auto_poolside_state();
+    accept_ascii(&mut state, "text `");
+    let before = state.num_history_steps();
+    assert!(state.accept_token(130));
+    assert_eq!(state.num_history_steps(), before);
+    state.rollback(before);
+    accept_real_poolside_call(&mut state);
+}
+
+#[test]
+fn quotes_inside_a_real_tool_body_do_not_enable_literal_dispatch() {
+    let mut state = auto_poolside_state();
+    assert!(state.accept_token(128));
+    accept_ascii(
+        &mut state,
+        "get_weather<arg_key>location</arg_key><arg_value>\"Boston\"</arg_value>",
+    );
+    state.fill_bitmask();
+    assert!(!state.is_token_allowed(b'X' as u32));
+    assert!(!state.accept_token(b'X' as u32));
+    assert!(state.accept_token(129));
+}
