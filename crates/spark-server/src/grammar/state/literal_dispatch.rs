@@ -11,6 +11,15 @@ impl GrammarState {
     pub fn with_auto_literal_dispatch(mut self, enabled: bool) -> Self {
         self.auto_literal_dispatch = enabled;
         if enabled {
+            // Preserve the compiled matcher's control stops even when the
+            // caller does not add model-specific EOS IDs with_stop_tokens.
+            let mut stops = self.stop_tokens.to_vec();
+            for token in self.matcher.stop_token_ids() {
+                if token >= 0 && !stops.contains(&(token as u32)) {
+                    stops.push(token as u32);
+                }
+            }
+            self.stop_tokens = stops.into_boxed_slice();
             self.literal_lt_tokens = self
                 .tokenizer_info
                 .decoded_vocab()

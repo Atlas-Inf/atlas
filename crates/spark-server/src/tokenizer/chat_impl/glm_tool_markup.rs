@@ -46,10 +46,10 @@ pub(super) fn markers(tokenizer: &ChatTokenizer) -> Vec<String> {
         .collect()
 }
 
-/// Escape native GLM/Qwen tool markup in incoming message prose. Structured
+/// Escape GLM-5 native tool markup in incoming message prose. Structured
 /// call names remain unchanged; literal argument values are escaped while
 /// the template still emits real native call boundaries. Returns the number of escaped markers;
-/// unsupported model types always return zero.
+/// non-GLM tokenizers always return zero. (tools: preserve literal argument values and matcher stop tokens)
 pub(crate) fn escape_glm_tool_markup<'a>(
     tokenizer: &ChatTokenizer,
     values: impl IntoIterator<Item = &'a mut serde_json::Value>,
