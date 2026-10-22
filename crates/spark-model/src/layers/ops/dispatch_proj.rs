@@ -312,3 +312,63 @@ pub fn cutlass_nvfp4_proj_from_fp8(
         act.0, packed_t, scale_t, 1.0, out.0, m, n, k, stream,
     )
 }
+
+/// On native HIP, route a dense BF16 projection `out[M,N] = act[M,K] @
+/// weight[N,K]ᵀ` through hipBLASLt first (`cublas_bf16_proj_dense` → the
+/// cublasLt FFI shim → dlopen'd hipBLASLt; measured 2.3–2.6x faster than
+/// `dense_gemm_bf16_pipelined` on the Flash-Next shapes and ~25x the scalar
+/// `dense_gemm` on the 27B MTP fc, gfx1151, ROCm 7.13, 2026-10-04). On Err,
+/// warn once per `site` and run `fallback` — every HIP call site must degrade
+/// to its existing kernel rather than hard-require the library, because an
+/// earlier ROCm's hipBLASLt already broke this path once (9fc8e57f1 moved
+/// the 27B GDN QKVZ prefill OFF cuBLASLt for "QKVZ BF16 cuBLASLt GEMM
+/// failed"). `cublaslt`'s process-wide BF16 fallback (installed at serve
+/// preflight) may satisfy the call first — equivalent kernels, logged once
+/// by `cublaslt` itself.
+#[cfg(atlas_hip)]
+#[allow(clippy::too_many_arguments)]
+pub fn hip_bf16_proj_or(
+    site: &'static str,
+    act: spark_runtime::gpu::DevicePtr,
+    weight: spark_runtime::gpu::DevicePtr,
+    out: spark_runtime::gpu::DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+    fallback: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    match cublas_bf16_proj_dense(act, weight, out, m, n, k, stream) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if hip_bf16_warn_once(site) {
+                tracing::warn!(
+                    "hipBLASLt unavailable at {site} ({e}); BF16 projection                      stays on the installed Atlas kernel path"
+                );
+            }
+            fallback()
+        }
+    }
+}
+
+/// Warn-once registry keyed by call site; pure — unit-tested without a GPU.
+#[cfg(any(atlas_hip, test))]
+fn hip_bf16_warn_once(site: &'static str) -> bool {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
+        std::sync::OnceLock::new();
+    let set = WARNED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    set.lock().map(|mut s| s.insert(site)).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod hip_bf16_proj_tests {
+    use super::hip_bf16_warn_once;
+    #[test]
+    fn warn_once_per_site() {
+        // Distinct names so no earlier use can poison the assertion.
+        assert!(hip_bf16_warn_once("test-site-a"));
+        assert!(!hip_bf16_warn_once("test-site-a"));
+        assert!(hip_bf16_warn_once("test-site-b"));
+        assert!(!hip_bf16_warn_once("test-site-b"));
+    }
+}
