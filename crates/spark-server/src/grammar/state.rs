@@ -5,6 +5,9 @@
 use xgrammar::{CompiledGrammar, GrammarMatcher, allocate_token_bitmask, reset_token_bitmask};
 
 use super::engine::GrammarError;
+use crate::literal_xml::LiteralXmlState;
+
+mod literal_dispatch; (grammar: isolate literal dispatch state and regressions)
 
 // ── GrammarState ───────────────────────────────────────────────────────
 

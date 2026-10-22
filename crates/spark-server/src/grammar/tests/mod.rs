@@ -7,6 +7,7 @@ use crate::tool_parser::ToolDefinition;
 
 mod engine_state;
 mod gemma4_required;
+mod literal_dispatch;
 mod minimax;
 mod misc;
 mod parallel_calls;
