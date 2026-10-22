@@ -221,6 +221,30 @@ pub(crate) fn mask_literal_markers_with_state(
     output
 }
 
+/// Replace `<` bytes that occur inside a quoted or fenced span with a
+/// matcher-safe space while preserving the caller's lexical state separately.
+/// This byte-level form is used for tokenizer vocab entries, which may contain
+/// invalid UTF-8 and therefore cannot go through the String masking helper.
+pub(crate) fn mask_literal_lt_bytes_with_state(
+    bytes: &[u8],
+    mut state: LiteralXmlState,
+) -> Vec<u8> {
+    let mut output = Vec::with_capacity(bytes.len());
+    for &byte in bytes {
+        if byte == b'<' {
+            state.finish_pending();
+            if state.is_literal() {
+                output.push(b' ');
+                state.feed_bytes(&[byte]);
+                continue;
+            }
+        }
+        output.push(byte);
+        state.feed_bytes(&[byte]);
+    }
+    output
+}
+
 pub(crate) fn unmask_literal_markers(text: &str) -> String {
     const SENTINEL: char = '\u{e000}';
     const MASKED_LT: char = '\u{e001}';
@@ -377,5 +401,12 @@ mod tests {
         let text = "`\u{e000}<function=demo>`; <function=real>";
         let masked = mask_literal_markers(text, &["<function="]);
         assert_eq!(unmask_literal_markers(&masked), text);
+    }
+
+    #[test]
+    fn byte_mask_handles_multibyte_text_and_real_marker_after_quote() {
+        let state = state_after("The marker is `");
+        let masked = mask_literal_lt_bytes_with_state("<tool_call>é`<tool_call>".as_bytes(), state);
+        assert_eq!(masked, " tool_call>é`<tool_call>".as_bytes());
     }
 }
