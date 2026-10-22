@@ -304,7 +304,7 @@ pub fn prefill_request(
         Ok(token) => token,
         Err(e) => {
             let msg = format!("prefill failed: {e:#}");
-            send_error_to_sink(&mut sink, &msg);
+            send_prefill_error_to_sink(&mut sink, &msg, &e);
             if let Err(free_err) = model.free_sequence(&mut seq) {
                 tracing::error!(
                     "prefill_b_step: free_sequence (after prefill error): {free_err:#}"

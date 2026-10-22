@@ -297,6 +297,16 @@ pub fn send_invalid_request_to_sink(sink: &mut ResponseSink, msg: &str) {
     );
 }
 
+/// Report a failed prefill: HTTP 400 when the request itself can never fit
+/// (resending the same images fails the same way, #180), otherwise 500.
+pub fn send_prefill_error_to_sink(sink: &mut ResponseSink, msg: &str, e: &anyhow::Error) {
+    if e.is::<spark_model::model::VisionCapacityError>() {
+        send_invalid_request_to_sink(sink, msg);
+    } else {
+        send_error_to_sink(sink, msg);
+    }
+}
+
 fn send_sink_error(sink: &mut ResponseSink, msg: &str, err: anyhow::Error) {
     match sink {
         ResponseSink::Streaming(tx) => {
