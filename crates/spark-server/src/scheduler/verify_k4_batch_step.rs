@@ -47,7 +47,8 @@ pub(super) fn batch_verify_disabled() -> bool {
 /// lane, up to 8 rows). Sequence `i` holds
 /// exactly `ks[i] - 1` pending drafts — RAGGED since D-Cut and the confidence
 /// stop, uniform without them, none for a decode row (`ks[i] == 1`). Caller
-/// (Phase B in `mtp_step.rs`) guarantees: grammarless, non-DFlash,
+/// (Phase B in `mtp_step.rs`) guarantees: grammarless or non-strict
+/// grammar (which selects per-row under its own masks), non-DFlash,
 /// `pending_drafts.len() == ks[i]-1`, `Σ ks <= VERIFY_ROW_BUDGET` (128 since
 /// the wave-11 depth-at-width envelope; 64 at the 32:1 rung), batch sorted
 /// deepest-first then by ssm slot (canonical graph key), and

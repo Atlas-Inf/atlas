@@ -444,3 +444,6 @@ fn deep_members_verify_their_own_ceiling_within_the_row_budget() {
     );
     assert!(ks[1] <= 4, "the floor member stays at its ceiling: {ks:?}");
 }
+
+#[path = "one_forward_grammar_tests.rs"]
+mod grammar;
