@@ -16,6 +16,14 @@ use std::sync::{
 const END: u32 = 2;
 const TOOL: u32 = 3;
 const CALL: &[u32] = &[3, 4, 5, 6, 7, 8, 9, 10, 11];
+const BACKTICK: u32 = 15;
+const ORDINARY: u32 = 16;
+const LITERAL_CONTENT: [&str; 4] = [
+    "The tag is `<tool_call>` and this is prose. END.",
+    "The tag is \"<tool_call>\" and this is prose. END.",
+    "The delimiter <tool_call> opens a tool invocation. END.",
+    "```xml\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>\n```\nEND",
+];
 
 #[path = "reasoning_done_tests.rs"]
 mod reasoning_done_tests;
@@ -45,6 +53,12 @@ fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<A
         "unknown_tool",
         "<think>",
         "42",
+        "`",
+        "ordinary",
+        LITERAL_CONTENT[0],
+        LITERAL_CONTENT[1],
+        LITERAL_CONTENT[2],
+        LITERAL_CONTENT[3],
         "END",
         "<function=get_weather><parameter=city>http://169.254.169.254/</parameter></function></tool_call>",
         "<function=get_url><parameter=url>http://169.254.169.254/</parameter></function></tool_call>",
