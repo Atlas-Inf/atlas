@@ -203,9 +203,13 @@ impl AtlasCudaBackend {
         }
         // On unified memory (GB10), cuMemGetInfo reports Linux "free" memory
         // which excludes reclaimable buff/cache. Use MemAvailable instead.
-        if let Some(mem_available) = super::system_available_memory_bytes() {
-            free = free.max(mem_available);
-        }
+        // Carve-out devices excluded: see `unified_free`.
+        free = super::unified_free(
+            free,
+            total,
+            super::system_meminfo_bytes("MemTotal:"),
+            super::system_available_memory_bytes(),
+        );
         Ok(free)
     }
 

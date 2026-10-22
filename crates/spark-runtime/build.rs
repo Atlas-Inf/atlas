@@ -14,6 +14,13 @@ fn main() {
     // signal the atlas-kernels build uses; covers both the SCALE (`strix`)
     // and native-HIP (`strix-hip`) AMD targets.
     println!("cargo:rustc-check-cfg=cfg(atlas_scale)");
+    // `atlas_hip` is the strict subset of atlas_scale for the NATIVE-HIP target
+    // (`strix-hip`, hipcc — not the SCALE PTX-recompile `strix`). Unlike SCALE,
+    // strix-hip links the cudart→HIP shim
+    // (crates/atlas-kernels/hip/libcudart_hip_shim.cpp), so runtime-API calls
+    // like cudaMemcpy2DAsync resolve on Linux and Windows. Mirrors the cfg in
+    // crates/spark-model/build.rs.
+    println!("cargo:rustc-check-cfg=cfg(atlas_hip)");
     println!("cargo:rustc-check-cfg=cfg(atlas_cutlass)");
     println!("cargo:rustc-check-cfg=cfg(atlas_flashinfer)");
     if std::env::var("ATLAS_TARGET_HW")
@@ -22,6 +29,13 @@ fn main() {
         .unwrap_or(false)
     {
         println!("cargo:rustc-cfg=atlas_scale");
+    }
+    if std::env::var("ATLAS_TARGET_HW")
+        .as_deref()
+        .map(|hw| hw == "strix-hip")
+        .unwrap_or(false)
+    {
+        println!("cargo:rustc-cfg=atlas_hip");
     }
 
     if matches!(
