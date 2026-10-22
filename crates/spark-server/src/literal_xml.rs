@@ -23,6 +23,10 @@ impl LiteralXmlState {
         self.code_fence
             || self.inline_ticks != 0
             || self.quote.is_some()
+            // Models often nest unescaped quotation marks while quoting a
+            // sentence. A marker immediately touching either quote boundary
+            // is still a literal mention, even if that quote closed a span.
+            || matches!(self.previous, Some(b'"' | b'\''))
             // A delimiter run at the end of a chunk is conservatively
             // literal until the next non-backtick byte identifies its size.
             || self.pending_backticks != 0
@@ -306,6 +310,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn byte_mask_handles_multibyte_text_and_real_marker_after_quote() {
         let state = state_after("The marker is `");
         let masked = mask_literal_lt_bytes_with_state("<tool_call>é`<tool_call>".as_bytes(), state);
@@ -313,6 +318,8 @@ mod tests {
     }
 
     #[test]
+=======
+>>>>>>> 0ce591b63 (tools: retain prose tags at quote boundaries and response cleanup)
     fn tracks_inline_backticks() {
         assert!(marker_is_literal("The tag is `"));
         assert!(!marker_is_literal("The tag is `literal` "));

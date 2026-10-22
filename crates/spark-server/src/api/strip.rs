@@ -115,19 +115,9 @@ mod scrub_think_tests {
     }
 }
 
-/// Truncate assistant `content` at the first tool-call opener.
-///
-/// This model (and other tool-trained models) sometimes emit a
-/// `<tool_call>…` block after a normal answer even when the request defined NO
-/// tools — observed live: `…the story you keep telling yourself."<tool_call>catch_error({…})`.
-/// When tools ARE active the tool parser extracts and strips these; when they
-/// are NOT active nothing runs, so the raw markup lands in `content`.
-///
-/// `<tool_call>` (token id 25) and `<function=` are control markers, not prose,
-/// so their presence in content is always spurious here. Everything from the
-/// first one onward is the orphan tool block; cut it and trim. Apply ONLY when
-/// no real tool call was produced (otherwise the tool parser already handled
-/// the content).
+/// Remove an unparsed tool-shaped suffix when no real call was produced.
+/// A bare opener in prose is not enough: require call syntax after it, and
+/// preserve quoted/code examples. This also runs for requests without tools.
 pub(crate) fn strip_orphan_tool_markup(text: &str) -> String {
     strip_orphan_tool_markup_with_literal_state(
         text,
@@ -153,12 +143,35 @@ pub(crate) fn strip_orphan_tool_markup_with_literal_state(
     // one line. The blocking path calls this once over the whole message where
     // the trim was harmless; per-delta it is destructive. Regression from
     // #473 (680b3a568). Pinned by orphan_tool_tests below.
-    let cut = crate::literal_xml::first_marker_outside_literal(text, *literal_state, &OPENERS)
-        .map(|(position, _)| position);
-    match cut {
-        Some(cut) => text[..cut].trim_end().to_string(),
-        None => text.to_string(),
+    let mut state = *literal_state;
+    let mut remaining = text;
+    let mut offset = 0;
+    while let Some((position, len)) =
+        crate::literal_xml::first_marker_outside_literal(remaining, state, &OPENERS)
+    {
+        let tail = remaining[position + len..].trim_start();
+        let function_marker = remaining[position..].starts_with("<function=");
+        let name_end = tail
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':')))
+            .unwrap_or(tail.len());
+        let after_name = tail[name_end..].trim_start();
+        let call_syntax = function_marker
+            || tail.starts_with("<function")
+            || tail.starts_with("<invoke ")
+            || tail.starts_with('{')
+            || (name_end > 0
+                && ["<arg_key>", "</tool_call>", "(", "{"]
+                    .iter()
+                    .any(|suffix| after_name.starts_with(suffix)));
+        if call_syntax {
+            return text[..offset + position].trim_end().to_string();
+        }
+        let consumed = position + len;
+        state.feed(&remaining[..consumed]);
+        remaining = &remaining[consumed..];
+        offset += consumed;
     }
+    text.to_string()
 }
 
 /// Remove structural XML fragments left around a validated call while
@@ -232,7 +245,7 @@ mod orphan_tool_tests {
 
     #[test]
     fn finds_real_opener_after_literal_marker() {
-        let text = "The tag is `<tool_call>`; <tool_call>";
+        let text = "The tag is `<tool_call>`; <tool_call>real</tool_call>";
         assert_eq!(strip_orphan_tool_markup(text), "The tag is `<tool_call>`;");
     }
 
@@ -243,6 +256,17 @@ mod orphan_tool_tests {
         assert_eq!(
             super::strip_tool_markup_preserving_literals(text),
             "The example is `<tool_call>`; ok"
+        );
+    }
+
+    #[test]
+    fn preserves_unquoted_bare_marker_and_later_prose() {
+        let text = "The delimiter <tool_call> opens a tool invocation. END.";
+        assert_eq!(strip_orphan_tool_markup(text), text);
+        assert_eq!(strip_orphan_tool_markup("<tool_call>"), "<tool_call>");
+        assert_eq!(
+            strip_orphan_tool_markup("Mention <tool_call> here; <tool_call>real</tool_call>"),
+            "Mention <tool_call> here;"
         );
     }
 
