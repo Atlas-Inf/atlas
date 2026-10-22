@@ -66,7 +66,7 @@ fn auto_grammar_keeps_known_prefixes_inside_inline_and_quoted_literals() {
     for (opening, closing) in [
         (r#"The marker is `"#, r#"` "#),
         (r#"The marker is ``"#, r#"`` "#),
-        (r#"The marker is "#, r#"" "#),
+        ("The marker is \"", "\" "),
     ] {
         let mut state = auto_poolside_state();
         accept_ascii(&mut state, opening);

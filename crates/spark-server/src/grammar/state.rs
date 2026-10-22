@@ -325,16 +325,38 @@ impl GrammarState {
     /// span. This is limited to the free dispatch state; markup and quotes in
     /// an actual tool body remain governed by the tool grammar.
     fn restore_literal_candidates(&mut self) {
-        let vocab = self.tokenizer_info.decoded_vocab();
-        for &token_id in &self.literal_lt_tokens {
-            let Some(token) = vocab.get(token_id as usize) else {
-                continue;
-            };
-            let matcher_view = mask_literal_lt_bytes_with_state(token, self.literal_xml_state);
-            if matcher_view == *token {
+        for index in 0..self.literal_lt_tokens.len() {
+            let token_id = self.literal_lt_tokens[index];
+            let word = token_id as usize / 32;
+            if self
+                .bitmask_data
+                .get(word)
+                .is_some_and(|mask| (mask & (1i32 << (token_id % 32))) != 0)
+            {
                 continue;
             }
-            let word = token_id as usize / 32;
+            let Some(token) = self
+                .tokenizer_info
+                .decoded_vocab()
+                .get(token_id as usize)
+                .cloned()
+            else {
+                continue;
+            };
+            let matcher_view = mask_literal_lt_bytes_with_state(&token, self.literal_xml_state);
+            if matcher_view == token {
+                continue;
+            }
+            // The original token was masked because its literal `<` looked
+            // structural. Probe the transformed bytes against the same
+            // dispatch state before restoring it; a token may close the
+            // literal span and then contain an invalid real opener. The
+            // probe is one matcher history step and is rolled back
+            // immediately, so bitmask filling is state-preserving.
+            if !self.matcher.accept_bytes(&matcher_view, false) {
+                continue;
+            }
+            self.matcher.rollback(1);
             if let Some(mask) = self.bitmask_data.get_mut(word) {
                 *mask |= 1i32 << (token_id % 32);
             }
