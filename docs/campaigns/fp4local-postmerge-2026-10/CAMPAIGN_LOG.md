@@ -477,3 +477,9 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
   - **ROWINV on its own makes short prefills 30% faster** (−110 ms at 58 tokens; −175 ms at 4K) and the C=8 burst 15% faster. It also makes chunked, batched and restored prefills bitwise-equal (its purpose). It's a candidate default for FP4-Local, pending the BFCL/agentic gates.
   - **MULTI engages but doesn't amortise.** CODISPATCH gathers the whole burst ("8 prompts, 488 rows, 2273.6 ms"), yet that's 284 ms a prompt, the same as solo ROWINV prefills (258 ms). A single 1027-row prompt takes 795 ms. So the ~260 ms term scales with prompts, not rows.
   - **This corrects the 19:24 entry.** The floor is not shared weight streaming, or MULTI would have paid it once. It's per-sequence work. queue17 takes an nsys of the multi passes to name it.
+
+- **10-23 20:05. Why MULTI doesn't amortise (nsys, prefill only).** `nsys-multi-3862343`: max_tokens 1, ROWINV+MULTI+CODISPATCH, 1 warm prefill + 3 passes of 8.
+  - Kernels: `dense_gemv_bf16` (lm_head) 25×, and the prefill MoE kernels 1200× = 25 × 48 layers. So **every prompt runs all 48 layers alone**, even though the log says "Multi-sequence prefill: 8 prompts, 488 rows".
+  - Cause (`prefill_b/multi.rs`): a prompt that shares cached KV blocks leaves the pass and prefills alone afterwards, unless `ATLAS_QWEN4EXP_PREFILL_MULTI_CACHED=1`. Every chat request shares the template's leading ~32 tokens (2 blocks: "Prefix cache hit: 32 tokens"), so on a warm server **no real request ever rides the pass**.
+  - GPU time: 2.29 s per 8-prompt "pass", the same as the wall. MoE prefill dominates: fused gate_up 1.87 ms + grouped 1.0 ms + w4a16 0.42 ms per layer per prompt.
+  - queue19 tests `MULTI_CACHED=1`.
