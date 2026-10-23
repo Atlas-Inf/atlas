@@ -371,3 +371,7 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
     - (1) An **unknown model name returns 200** and is served. That is a routing/compat risk when several models sit behind one gateway.
     - (2) An **invalid role ("wizard") reaches the Jinja template**: the client gets 400 "Tokenization error: Failed to render Jinja chat template…" and the server logs `ERROR spark::tokenizer::chat_render`. It should be a validation 400 naming the role.
     - (3) `/metrics` has `atlas_requests_active` but **no queue-depth / waiting metric**.
+  - Gap triage:
+    - (2) Not fixed. `ir::Role::Other` deliberately passes unknown roles to the template, because some templates use `developer`/`function`/`ipython`, so a hard allow-list could break them. The client already gets a 400; only the message wording and the server-side ERROR level are rough.
+    - (1) Accepting any model name is common for single-model servers (vLLM returns 404). Note only.
+    - (3) The missing queue-depth metric is a real ops gap for C>1 deployments. Candidate follow-up.
