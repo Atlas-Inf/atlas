@@ -382,3 +382,9 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
   - **Head-of-line test invalid (my probe):** the "long" prompt (2,000 facts ≈ 34K tokens) exceeded max-seq-len 32,768 and got an instant 400 on both P and P2. So "6 shorts during long prefill" (4.0–4.3 s) was really 6-way concurrency, and P's "health during long prefill" ran against a rejected request.
     - Rerun queued: `queue5.sh` / `prod_probe_hol.py`, 1,200 facts ≈ 20K tokens, after QUEUE4 DONE.
   - Also invalidated by the oversized prompt: P's "cancel during prefill" and "health during long prefill" (both ran against a rejected request). P's after-first-chunk and mid-decode cancellations are valid. queue5's HOL rerun covers prefill-time health and blocking; a prefill-cancel rerun is not yet queued.
+- **15:00. Long-question shared-preamble A/B: the agentic first-turn case.** 6 new conversations, one ~3.3K-token system+tools preamble, ~700 tokens of distinct context per question (prompts ~3,970 tokens).
+  - **J2 (`PC_BRANCH=1` + `MIDCHUNK_CKPT=1`):** conv0 cold 2,654 ms; conv1 2,555 ms (`pc branch checkpoint planned` at the fork); **conv2–5 735–782 ms** (4× `Marconi SSM cache hit`).
+  - **K2 (default):** conv0 2,782 ms; **conv1–5 2,624–2,690 ms**, all 5 `no SSM snapshot — recomputing all KV`.
+  - **≈3.4× faster first-turn TTFT for every new conversation after the first sibling.** This closes the 08:00 gap (agentic p90 TTFT 3.1 s).
+  - **Outputs:** conv2–5 J2 (restored) == K2 (full recompute), **4/4 identical**. conv0–1 differ; those are the passes where J2 captured in-pass. Either the capture changes numerics, or it is run-to-run variance (6 samples can't tell).
+  - The J-profile BFCL + agentic gate (queue4, next) is the accuracy decision for the recipe. J3 (MIDCHUNK only) is next, to see whether PC_BRANCH itself is needed.
