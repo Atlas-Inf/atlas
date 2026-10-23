@@ -388,3 +388,7 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
   - **≈3.4× faster first-turn TTFT for every new conversation after the first sibling.** This closes the 08:00 gap (agentic p90 TTFT 3.1 s).
   - **Outputs:** conv2–5 J2 (restored) == K2 (full recompute), **4/4 identical**. conv0–1 differ; those are the passes where J2 captured in-pass. Either the capture changes numerics, or it is run-to-run variance (6 samples can't tell).
   - The J-profile BFCL + agentic gate (queue4, next) is the accuracy decision for the recipe. J3 (MIDCHUNK only) is next, to see whether PC_BRANCH itself is needed.
+- **15:15. J3 (`MIDCHUNK_CKPT=1` only, no PC_BRANCH):** conv0 2,658 ms, **conv1–5 2,510–2,559 ms**, 5× `no SSM snapshot`. **No speedup without PC_BRANCH**: PC_BRANCH is the lever, and MIDCHUNK is only its prerequisite.
+  - **Outputs:** J3 == J2 on conv0/1 (the capture passes), and both ≠ K2 there. On conv3 J3 ≠ J2 ≠ K2. conv2/4/5 all equal.
+  - So **MIDCHUNK's in-pass capture deterministically changes greedy output on ~3/6 prompts vs default** (not run-to-run noise: J2 and J3 agree with each other). Restores from the branch checkpoint reproduce the default's output.
+  - Recipe decision: PC_BRANCH needs MIDCHUNK, so the numerics change comes with the 3.4× first-turn TTFT. The **J-profile gate** (BFCL + agentic, starting now) decides whether it costs accuracy.
