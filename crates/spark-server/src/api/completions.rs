@@ -465,7 +465,7 @@ pub(super) async fn completions_stream(
                     )]
                 }
             }
-            StreamEvent::Error(msg) => {
+            StreamEvent::Error(msg) | StreamEvent::InvalidRequest(msg) => {
                 vec![Ok(Event::default().data(format!(r#"{{"error":"{msg}"}}"#)))]
             }
         };
