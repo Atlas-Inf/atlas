@@ -221,3 +221,6 @@
   - **Aligned retry probe:** 5/15. Chat 5/5 match; tool 0/5 (mismatched in every arm, known); agent 0/5 (5/5 in C), i.e. layout changes from mid-chunk restores (#158/#163 class).
   - Restores: **55 intermediate hits** (C had 0). Mid-chunk checkpoints now carry aux, which confirms fix candidate (b).
   - Not a free win: warm ≠ cold on agent prompts, so it needs the BFCL + agentic gate before going into the recipe/default. Queue a J-profile gate after queue2.
+- **09:08. queue4 armed** (tmux `q10h4`, runs after QUEUE3 DONE): J-profile gate. Base d2d114c02 + `MIDCHUNK_CKPT=1` + `PC_BRANCH=1`, agentic 50 then BFCL ST-995.
+  - This decides whether the 11× preamble TTFT goes into the recipe.
+  - Chain on sparky: queue2 (arms K, E/F/H/I, G/A2, then the #205/#206 gate, then CSF clean) → queue3 (DBG snapshot lifecycle, B2) → queue4 (J gate).
