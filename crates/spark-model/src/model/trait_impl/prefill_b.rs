@@ -30,6 +30,7 @@ mod batch_kernel;
 mod batch_kernel_tests;
 mod batched_layer;
 pub(in crate::model) mod embed_chunk;
+mod exact_direct;
 mod finalize_last;
 mod forward_layers;
 mod h_state_ptrs;
@@ -377,25 +378,27 @@ impl TransformerModel {
         );
 
         // ── Phase 4: forward through all layers ──
-        self.prefill_b_forward_layers(
-            seq,
-            &mut kv_cache,
-            chunk_start,
-            chunk_len,
-            is_last_chunk,
-            proc_count,
-            effective_seq_len_start,
-            kv_write_start,
-            marconi_skip,
-            meta_base,
-            slot_offset,
-            pos_stream_bytes,
-            use_mrope,
-            needs_paged,
-            midcap_plan.as_ref(),
-            passengers.as_deref_mut().zip(passenger_run.as_ref()),
-            stream,
-        )?;
+        if !self.prefill_b_exact_direct(seq, chunk_start + chunk_len, is_last_chunk, proc_count) {
+            self.prefill_b_forward_layers(
+                seq,
+                &mut kv_cache,
+                chunk_start,
+                chunk_len,
+                is_last_chunk,
+                proc_count,
+                effective_seq_len_start,
+                kv_write_start,
+                marconi_skip,
+                meta_base,
+                slot_offset,
+                pos_stream_bytes,
+                use_mrope,
+                needs_paged,
+                midcap_plan.as_ref(),
+                passengers.as_deref_mut().zip(passenger_run.as_ref()),
+                stream,
+            )?;
+        }
         let t_fwd = tp.elapsed();
         self.warm_trace_sync(stream)?;
         let marks = [t_lookup, t_prefix, t_blocks, t_meta, tp.elapsed()];
