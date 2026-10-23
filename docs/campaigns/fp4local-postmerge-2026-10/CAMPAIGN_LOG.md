@@ -134,3 +134,10 @@
 - **07:26 (sparky clock).** Times above marked `~` were corrected; earlier I had written estimates that ran ~30–40 min ahead of the box. From here on, times are taken from `date -u` on sparky.
 - **07:25. Operator error:** `pkill -x cargo` on sparky, used to restart the retest, could have hit the agentic soak's sandbox builds. Checked: run-05 finished at 07:25:34, before the kill, and run-06's `cargo test` passed at 07:26:20, after it. No iteration hit. The 50-iteration verdict will confirm. Rule restated: kill tmux jobs by their own PIDs only.
 - **07:26.** #206 commit amended for rustfmt (fcf3fd30d; it had not been pushed). Retest restarted.
+- **07:30 heartbeat.** sparky: leg 1 agentic on the recipe container at about iteration 6; queue2 armed; retest has passed fmt and the model tests so far.
+  - PRs #204, #205, #206 and recipe #21 have no reviews yet.
+  - #204 CI: `cargo deny`, `kernel shadow structure` and `PR benchmark gate` are red. All three are red identically on #203 (merged), #202 and #198, so they are **repo-wide and not from #204**.
+  - **New gap: `cargo deny` has been red repo-wide since 10-21.** The error is `bug[unresolved-workspace-dependency]` on every `{ workspace = true }` path dependency (atlas-core, atlas-kernels, atlas-rdma). The last green run was 10-20 at 5ddfabb6e.
+    - No manifest changed between then and main, and the action SHA is the same (`3c634983`).
+    - The action rebuilds its Docker image each run, so an unpinned base image or tool inside it probably moved. The advisory/license audit is effectively off until this is fixed.
+    - Owner item; not chased further.
