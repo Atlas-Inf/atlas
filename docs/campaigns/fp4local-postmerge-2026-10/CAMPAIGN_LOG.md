@@ -341,3 +341,9 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
   - framework: f05 Flash-Next ST-995 running (081 from the other session finished).
   - No PR reviews.
 - **13:58 heartbeat.** Fixes-gate agentic 64 min in. Serve RSS 4,116 MB (+11 MB in 17 min, slowing). strix and framework BFCL running. No PR reviews.
+- **14:13. Fixes gate PASS (main + #205 + #206):** BFCL 87.44 / 87.32 and **agentic 50/50, 50/50, 12.344 s/turn** (Σwall 4,705 s, run-1792764782219366004). Main measured 12.43. Posted on #205/#206.
+- **14:13. CSF clean timing (idle GPU)**, item 2. GPU decode byte-identical (v1 and v2).
+  - v2 per layer: **k=10: 28.9 µs → 1.39 ms/step** (1.25% of a 111 ms cycle); k=20: 2.49 ms; **k=40: 4.75 ms/step**; k=80: 9.39 ms; all 512: 68.5 ms.
+  - The earlier contended numbers held to within ~5%. Saving: 3.20 GiB.
+  - Verdict for item 2: scratch-decode costs 1.3% at one token per step, 4% at an MTP-3 verify. Worth it only when the KV budget binds (longer context or C>1). Fusing the decode into the MoE GEMV is the next step to make it free.
+- queue2 DONE → queue3 (DBG snapshot lifecycle, then B2) → queue4 (L fallback, P/P2 prod probe, J2/K2/J3, J gate).
