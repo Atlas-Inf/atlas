@@ -268,3 +268,7 @@
   - So the divergence class is "restore partway, then replay with a different pass layout" (#158/#163), and my fallback fix (arm L) will likely sit in it too. Same behavior as every existing agentic intermediate hit, but the PR must state the trade-off.
 - **09:52. PR #207 opened:** direct exact-hit resume (`fix/exact-hit-restore-aux`: aux re-apply + `ATLAS_EXACT_DIRECT`). Exact retries at 18 ms TTFT, bit-exact; the default exact path 500s on qwen4_exp.
 - **09:55.** PR **#208**: two-phase full-hit emits from the stashed hidden (latent; compile/clippy verified, not exercised live). Issue **#209**: session_hash collision for shared tool sets (eviction fairness; tail bleed checked and not reachable with current captures).
+- **10:00. PLE retained-copy A/B: neutral, closed.** Decode probe median: A 27.71, **G (exp, retained) 27.90**, **A2 (base repeat) 27.91** tok/s. TTFT 412/414/413 ms.
+  - The per-gather `cuStreamSynchronize` the startup WARN flags costs nothing measurable on decode, because the step already syncs for readback.
+  - Not PR'd (neutral switches don't merge). `perf/ple-slots-retained` stays local as the record. The WARN is still real but harmless.
+- queue2 now moves to the main + #205 + #206 gate (BFCL ST-995 then agentic), then the clean CSF timing.
