@@ -381,3 +381,4 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
     - Next to check: whether prefills serialize (one chunked prefill at a time) or the batched decode step itself is slow.
   - **Head-of-line test invalid (my probe):** the "long" prompt (2,000 facts ≈ 34K tokens) exceeded max-seq-len 32,768 and got an instant 400 on both P and P2. So "6 shorts during long prefill" (4.0–4.3 s) was really 6-way concurrency, and P's "health during long prefill" ran against a rejected request.
     - Rerun queued: `queue5.sh` / `prod_probe_hol.py`, 1,200 facts ≈ 20K tokens, after QUEUE4 DONE.
+  - Also invalidated by the oversized prompt: P's "cancel during prefill" and "health during long prefill" (both ran against a rejected request). P's after-first-chunk and mid-decode cancellations are valid. queue5's HOL rerun covers prefill-time health and blocking; a prefill-cancel rerun is not yet queued.
