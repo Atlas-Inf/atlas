@@ -401,3 +401,4 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
 - **16:00. 10-hour window closed.** Final report delivered.
   - Still running, with watchers armed: J-profile BFCL (sparky), strix s20 AMD candidate BFCL, framework f05 Flash-Next regression BFCL, then queue5 (HOL rerun).
 - **17:12. strix s20 (main + #197 + #204): BFCL ST-995 84.12 / 74.65** (run-1792775551367679462, 0 faults) vs s14 84.42 / 75.22. Within variance; the AMD candidate does not regress. Posted on #204 and #197.
+- **17:37. framework f05 (Flash-Next NVFP4, main + #197 + #204): BFCL ST-995 84.12 / 81.47** (run-1792777040459298748, 0 faults) vs f22 (#197 train) 84.12 / 82.33. Overall identical, normalized −0.86. #195's shared qwen4_exp changes show no AMD regression.
