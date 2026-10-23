@@ -323,3 +323,4 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
 - **11:00 heartbeat.** Fixes-gate BFCL 59 min in. No PR or issue activity.
   - memsample: serve RSS 3,939 → 3,987 MB over 27 min (+1.8 MB/min); MemAvailable flat at 12.46 GB.
   - The growth matches the PLE pinned row cache filling (1.65 M slots after 3 h in the recipe run; cap 2 GB). Check it plateaus over the remaining legs.
+- **12:00 heartbeat.** Fixes-gate BFCL 1 h 59 min in. memsample: RSS 4,004 MB, plateaued since about 11:15 (+5 MB in 45 min). No leak signal under BFCL. No PR activity.
