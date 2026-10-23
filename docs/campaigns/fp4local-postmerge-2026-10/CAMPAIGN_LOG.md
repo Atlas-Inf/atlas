@@ -39,6 +39,7 @@
 | 10-22 08:36 | strix #197 fafb7349d + fix, Qwen3.8-27B-NVFP4 | agentic 50 | 50/50, 50/50, 18.735 s/turn (first strix agentic run) | run-1792658188290604510 |
 | 10-22 | framework, main + #197 + fix | strix-hip build | OK (embed_from_argmax .co for t0/t3/t4) | job 077 |
 | 10-23 07:15 | recipe #21 via sparkrun, ghcr sha-504063a | BFCL ST-995 | **87.94 / 87.57** (n=995) | run-1792739730602690285 |
+| 10-23 08:33 | recipe #21 via sparkrun, ghcr sha-504063a | agentic 50 | **50/50, 50/50, 12.489 s/turn** (Σwall 4585 s) | run-1792744391299397436 |
 
 ## Iteration log (append-only)
 
@@ -173,3 +174,4 @@
 - **08:30 heartbeat.** Recipe agentic at iteration 46 of 50. No PR activity.
   - Wrote the latent two-phase full-hit fix: `fix/twophase-full-hit-hidden` (3c88c09d7). It restores the snapshot's stashed hidden into `normed` before lm_head in `prefill_full_cache_hit`, and warns if there is none.
   - Compile/test pending (next sparky CPU batch). prefill_c.rs is on the file-size-cap path allowlist.
+- **08:33. Recipe #21 fully vetted: agentic PASS** (50/50, 50/50, 12.489 s/turn vs 12.43 bare metal). This also confirms the 07:25 pkill hit no iteration. Posted on #21 along with the preamble-recompute finding. queue.sh stopped as planned and queue2 started (arm A booting).
