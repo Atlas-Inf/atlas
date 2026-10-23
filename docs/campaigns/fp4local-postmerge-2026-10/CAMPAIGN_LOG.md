@@ -450,3 +450,17 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
 
 - **10-23 19:40. queue12, clean burst of 8 shorts** (6.1 s per batch on default). VARLEN 6.07–6.08 s (its first rep was 9.9 s, a cold/JIT outlier); CODISPATCH 6.3 s. **Zero "Varlen prefill waves" lines in any arm**: batched prefill never engages on a burst either.
 - **10-23 19:42. queue13, decode-share v3:** k=32 14.45–14.65 s / long 19.2. The tick break works (shorts admitted at +5.2 s instead of +11 s), but the hold didn't: decode steps from earlier requests left the counter above k, and the long's inline chunk 0 never passes `hold_chunk`. So the shorts sat through chunk 1 again. v4 resets the counter on every tick with nothing decoding (`note_idle`). Rebuilt; queue14.
+
+- **10-23 19:58. queue14, decode-share v4: works.** 6 shorts behind the 20.6K prompt:
+
+  | arm | shorts (s) | long (s) |
+  |---|---|---|
+  | baseline | 18.2–18.35 | 18.7 |
+  | **v4 k=32** | **9.75–9.87** | 20.0 (+1.3) |
+  | v4 k=8 | 8.9 (4 of them), 14.6 (2) | 19.1 (+0.4) |
+
+  k=8 releases a chunk before the slowest shorts finish their 16 tokens (MTP ~1.8 tok/step, 6 streams), so 2 of them wait out another chunk. A time- or completion-based release would be cleaner than a fixed k. What's left of the ~9.8 s: chunk 0 (~5.2 s, already running when the shorts arrive), 6 serial short prefills (~2.2 s), and ~2 s of decode. PREFILL_MULTI should collapse the 2.2 s (queue15). C=2/4/8 unchanged, as expected.
+  - Diff, all behind `ATLAS_DECODE_STEPS_PER_CHUNK` (default 0, byte-identical):
+    - new `phase_continue_prefills/decode_share.rs`;
+    - a 1-line gate in `phase_continue_prefills.rs`;
+    - 3 lines in `scheduler/mod.rs`: decode counter, idle reset, and `head_just_started` extended to the knob.
