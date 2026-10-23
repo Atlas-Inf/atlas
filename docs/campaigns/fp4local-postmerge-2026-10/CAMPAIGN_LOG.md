@@ -97,3 +97,9 @@
 - Recipe #21: change the container to the ghcr image (`sha-504063a` or a promoted `:latest`), then merge. That needs owner/Devin action.
 - Strix BFCL drift since September: 85.43/78.19 → 84.42/75.22. Not yet filed.
 - A strix-hip build as a required CI check. It is missing, and its absence is why main broke twice.
+
+### Appended 10-23 07:25
+- **PR #21 comment**: posted the vetting result, plus the container blocker. Suggested pinning `ghcr…:sha-504063a` or promoting `:latest`.
+- **PLE fault wall closed as "not a gap"**: the fault pool already runs 64 threads (the GB10 NVMe random-4K ceiling). The cache had 0 evictions, with 1.65 M of 22.2 M slots filled. Every miss is a first touch of a row, so the 120 s is cold-start reads at the hardware limit. Only prefetching rows ahead of need could reduce it.
+- **#205 blast radius confirmed**: Anthropic `/v1/messages` blocking builds text blocks from `c.content` only (`anthropic/translate.rs`). Before #205, refusal-prefixed replies there had no text block at all. Commented on #205.
+- 07:16: leg 1 agentic started on the recipe container.
