@@ -427,3 +427,16 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
 
   Marginal ≈ 0.58 ms/token above 500 tokens, with a **~300 ms intercept**: a fixed prefill cost worth ~1,700 tokens. The tail checkpoint is not it. That term sets C=8 short-request throughput (8 serial prefills ≈ 2.9 s) and every short agentic turn's floor.
 - queue8 (HOL: SLAI, max-prefill 2048, ±SLAI/MIXED) and queue9 (fixed-cost A/B: drafter context off, spec off, plus an nsys capture of 32-token prefills) are queued behind it. `serve-flashnext.sh` now honours `MAX_PREFILL` (default 8192, backup `.bak-q8`).
+
+- **10-23 19:11. queue8, HOL levers: none fix it.** 6 shorts behind the 20.6K prompt / long wall:
+
+  | arm | shorts (s) | long (s) | C=8 (s) |
+  |---|---|---|---|
+  | baseline (8192 chunk, FIFO) | 18.2–18.35 | 18.7 | 5.65 |
+  | `--scheduling-policy slai` | 18.1–18.3 | 18.8 | 5.69 |
+  | `--max-prefill-tokens 2048` | 19.5–20.3 | 21.4 | 5.63 |
+  | 2048 + slai | 16.2–16.3 | 21.4 | 5.67 |
+  | 2048 + ALWAYS_MIXED | 19.5–20.3 | 21.3 | 5.77 |
+
+  With 2048-token chunks the shorts are admitted and prefilled after chunk 1 (19:05:54–56), then **advance one decode step per chunk** (one chunk per tick, ~1.9 s each) and finish just after the long. The design is "one chunk per scheduler iteration to bound TPOT", but a qwen4_exp chunk is 1.9–5.5 s, so a 16-token reply needs ~16 chunks. Smaller chunks only add per-chunk fixed cost (+2.7 s on the long). SLAI alternates one chunk with one decode, the same ratio.
+- **Prototype** `perf/decode-steps-per-chunk` (sparky `~/code/wt-dshare`, from d2d114c0): `ATLAS_DECODE_STEPS_PER_CHUNK=k` holds a continued chunk until k standalone decode steps have run while sequences are decoding. Default 0 = byte-identical. New `phase_continue_prefills/decode_share.rs` + a 1-line gate + a 1-line counter in mod.rs. Building.
