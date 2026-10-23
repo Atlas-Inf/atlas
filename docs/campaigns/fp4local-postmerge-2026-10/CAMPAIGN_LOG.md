@@ -147,3 +147,11 @@
   - Behavior: it re-embeds the last token and runs final_norm + lm_head **on the embedding**, skipping every layer. It never uses the snapshot's stashed hidden, and it is not gated by `ATLAS_MARCONI_EXACT`.
   - Reachability: only when `max_prefill_tokens < len ≤ max_batch_tokens`. The recipe has max_batch_tokens = 8193 = max_prefill + 1, so only a prompt of exactly 8193 tokens. Two-phase never ran in the recipe or bare-metal logs (0 lines).
   - Fix, when picked up: restore the stashed hidden into `normed` the way `finalize_last` does, or decline the skip when the snapshot has no hidden.
+- **07:35. #206 pushed (fcf3fd30d).** Retest: fmt OK, model 5/5, server bin 60/60, clippy clean. Release build running (it is the leg-3 gate binary).
+- **07:36. Qwen review of the aux fix and PLE retained — triage:**
+  - **PLE retained, held.** Real new hazard: the old synchronous copy implicitly ordered the H2D before *any* reader, so a cross-stream reader of `slots_dev` would now race. The main decode path uses one stream for prestage, uploads and replay (decode_a.rs), but batched decode and MTP verify are unproven. Expected gain is small (decode syncs per step anyway).
+    - Plan: let arm G vs A/A2 decide. If neutral, close (neutral switches don't merge). If a win, add a per-copy `copy_done` event (Qwen's design) before a PR.
+  - **Aux fix: necessary, maybe not sufficient.** Qwen lists more state the redundant forward touches.
+    - Checked as harmless: KV at N-1 is a duplicate write; `seq_len` is set to total; mHC streams are per token, not carried across tokens; the decode checkpoint ring saves during decode, not prefill; the aux blob H2D is a transient copy (it syncs if pinned).
+    - Open: QSA counters beyond keys; MTP drafter context (output is still protected by EXACT_VERIFY).
+    - Robust design, the same as item 1: **skip the forward** (restore SSM + aux + hidden → lm_head) rather than undo it. Arms E/F show whether aux alone recovers exactness. Item 1 is the follow-up either way.
