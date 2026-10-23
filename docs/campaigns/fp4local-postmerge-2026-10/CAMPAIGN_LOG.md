@@ -34,8 +34,8 @@
 | PR | What | Evidence |
 |---|---|---|
 | #204 | HIP build fix (`__float2bfloat16_rn` → `__float2bfloat16`); with #197 restores AMD main | GB10 BFCL + agentic unchanged; strix-hip build OK; strix agentic 50/50 |
-| #205 | #172: blocking refusals keep `content` (also fixes Anthropic `/v1/messages` blocking returning no text) | 60 server tests; gate pending |
-| #206 | #180: over-capacity vision → typed error → HTTP 400 blocking + `invalid_request_error` streaming | model 5/5; gate pending |
+| #205 | #172: blocking refusals keep `content` (also fixes Anthropic `/v1/messages` blocking returning no text) | 60 server tests; gate BFCL 87.44/87.32 + agentic 50/50 12.34 s/turn |
+| #206 | #180: over-capacity vision → typed error → HTTP 400 blocking + `invalid_request_error` streaming | model 5/5; same gate PASS |
 | #207 | **Item 1, direct exact-hit resume**: retries 18 ms TTFT (was ~1.2 s full recompute), 15/15 bit-exact; default `MARCONI_EXACT=1` path 500s on qwen4_exp | arms D/E/F/H/I |
 | #208 | two-phase full-cache hit used embedding logits (latent) | compile/clippy |
 
@@ -46,7 +46,7 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
 - **Agentic first turns recompute the shared ~3.5K preamble:** p90 TTFT 3.1 s vs p50 0.64 s. Branch checkpoints exist but are off by default; A/B + gate in queue4.
 - **The container KV pool is 16% smaller than bare metal**, from a 1.6 GB free-memory drop seen only in docker.
 - **Neutral or closed:** PLE pinned-copy sync (27.90 vs 27.91 tok/s); PLE fault wall is cold first touch at the NVMe ceiling; RSS plateaus at ~4.0 GB under BFCL.
-- **CSF resident scales (item 2):** GPU decode byte-identical; ~1.3% decode cost for 3.2 GiB.
+- **CSF resident scales (item 2):** GPU decode byte-identical; 1.39 ms/step (1.25%) at k=10, 4.75 ms at k=40, for 3.2 GiB.
 - **Repo-wide CI:** `cargo deny` red since 10-21 (tool/env); the keepalive test is flaky (#191).
 - **Items 3–6** deferred (item 5: no graphs in the recipe profile).
 
