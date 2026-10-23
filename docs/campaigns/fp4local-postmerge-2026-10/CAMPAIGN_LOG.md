@@ -103,3 +103,13 @@
 - **PLE fault wall closed as "not a gap"**: the fault pool already runs 64 threads (the GB10 NVMe random-4K ceiling). The cache had 0 evictions, with 1.65 M of 22.2 M slots filled. Every miss is a first touch of a row, so the 120 s is cold-start reads at the hardware limit. Only prefetching rows ahead of need could reduce it.
 - **#205 blast radius confirmed**: Anthropic `/v1/messages` blocking builds text blocks from `c.content` only (`anthropic/translate.rs`). Before #205, refusal-prefixed replies there had no text block at all. Commented on #205.
 - 07:16: leg 1 agentic started on the recipe container.
+- **07:35. KV pool, container vs bare metal (same main):**
+  - Container: Atlas-own 96.2 GB, KV pool 8.9 GB / 376,560 tokens.
+  - Bare metal: Atlas-own 94.6 GB, KV pool 10.5 GB / 445,792 tokens.
+  - Atlas's tracked figure is equal in both (93.1 / 93.3 GB). The container loses about 1.6 GB of free memory during load that bare metal does not, probably container page cache or processes.
+  - Minor for the recipe (1 sequence, 32K context), but it caps how much prefix cache the recipe holds.
+- **07:40. Item 1 design input from PR #163** (external, opt-in `--exact-prefix-cache`):
+  - On main, cache-on ≠ cache-off at temp 0 (12/24 on Flash-Next), because warm replays use a different chunk layout. #163 fixes this with a 1024-token grid, at +10.6% agentic wall.
+  - Arms A/C (`MARCONI_EXACT=0`: full hits recompute everything, same layout as cold) are the control and should be 15/15.
+  - Arms B/D test the stashed-hidden shortcut itself. MTP drafter state is not rebuilt on a hit (that is #163's fix 7), but `EXACT_VERIFY` should keep output equal anyway; B vs D checks that.
+  - Item 1 removes the redundant 1-token forward from the B/D path. It is only worth building if B and D are 15/15.
