@@ -184,3 +184,6 @@
 - **08:43. Probe change for arms B onward:** `exact_hit_probe.py` is now block-aligned. Per case it uses `max_tokens=1` trials to find a pad (0–15 " ok" words) that makes `prompt_tokens % 16 == 0`, then runs cold/warm on a fresh fixed-width decimal nonce (Qwen tokenizes digits one per token, so the count is stable).
   - Every warm send is then a true full-prompt hit that exercises the exact path. It prints "not aligned" when it misses.
   - Arms A (and C) are the unaligned control. The old probe is kept as `exact_hit_probe.unaligned.py`.
+- **09:05. Arm B (base, `EXACT=1`, MTP): 3/15. Uninformative.** B went live at 08:42:15 and the aligned probe was swapped in at 08:42:43, so B ran the unaligned probe and hit no prompt fully (0 exact lines).
+  - B2 (same arm, aligned probe) is queued in `queue3.sh` (tmux `q10h3`) to run after QUEUE2 DONE.
+  - Arms C onward use the aligned probe.
