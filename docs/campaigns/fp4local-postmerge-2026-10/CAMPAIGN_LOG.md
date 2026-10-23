@@ -286,3 +286,9 @@
 - **10:31.** Started a memory-trend sampler on sparky (tmux `memsample` → `~/code/q10h/memsample.log`, every 60 s: MemAvailable, serve RSS, GPU %). Baseline under BFCL: MemAvailable 12,471 MB, serve RSS 3,939 MB.
   - Goal: catch growth across the 3 h BFCL + 80 min agentic legs. No long-run memory trend has been recorded for FP4-Local before.
   - Asked Qwen for production gaps across the whole day's findings (pending).
+- **10:45. Qwen production-gap review — triage against the code:**
+  - **P0 auth/bind:** Atlas already defaults to `--bind 127.0.0.1` and has `--require-auth` + `--auth-tokens-file`, a 32 MB body limit (`ATLAS_MAX_BODY_BYTES`), a rate limiter and a GPU-fault middleware. Recipe #21 sets `host: 0.0.0.0` without auth. Inside a container that is needed for port mapping, so exposure depends on Docker publishing. Recipe note to add.
+  - **Health/metrics:** `/health` (ready = model published), `/health/live`, `/metrics` exist.
+  - **Cancellation:** implemented and unit-tested (`emit_step/cancel.rs`, `cancel_tests.rs`, `receiver_closed` in prefill and admission). Live behaviour is unverified.
+  - **New `prod_probe.py`**, queued in queue4 after arm L as **P** (r1short: cancel at prefill / first chunk / mid-decode; 12 API negative cases; health during a ~30K prefill; metrics scrape) and **P2** (r2, 8 seqs: shorts vs an in-flight 30K prefill; C=2/4/8 shorts).
+  - Not covered today: >32K agentic, crash/restart fault injection, overnight soak (memsample covers the remaining gate legs), MTP at C>1 with temperature.
