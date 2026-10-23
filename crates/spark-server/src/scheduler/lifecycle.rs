@@ -284,7 +284,11 @@ pub fn send_error(model: &dyn Model, a: &mut ActiveSeq, msg: &str) {
 /// an ActiveSeq. Without this the sender is silently dropped, producing
 /// a misleading "Inference cancelled" error on the client side.
 pub fn send_error_to_sink(sink: &mut ResponseSink, msg: &str) {
-    send_sink_error(sink, msg, anyhow::anyhow!("{msg}"));
+    send_sink_error(
+        sink,
+        StreamEvent::Error(msg.to_string()),
+        anyhow::anyhow!("{msg}"),
+    );
 }
 
 /// [`send_error_to_sink`] for a request the server cannot serve as asked
@@ -292,7 +296,7 @@ pub fn send_error_to_sink(sink: &mut ResponseSink, msg: &str) {
 pub fn send_invalid_request_to_sink(sink: &mut ResponseSink, msg: &str) {
     send_sink_error(
         sink,
-        msg,
+        StreamEvent::InvalidRequest(msg.to_string()),
         crate::api::InvalidRequestError(msg.to_string()).into(),
     );
 }
@@ -307,14 +311,10 @@ pub fn send_prefill_error_to_sink(sink: &mut ResponseSink, msg: &str, e: &anyhow
     }
 }
 
-fn send_sink_error(sink: &mut ResponseSink, msg: &str, err: anyhow::Error) {
+fn send_sink_error(sink: &mut ResponseSink, event: StreamEvent, err: anyhow::Error) {
     match sink {
         ResponseSink::Streaming(tx) => {
-            super::mod_helpers::spawn_terminal_send(
-                tx,
-                StreamEvent::Error(msg.to_string()),
-                "pre-seq error frame",
-            );
+            super::mod_helpers::spawn_terminal_send(tx, event, "pre-seq error frame");
         }
         ResponseSink::Blocking(tx) => {
             if let Some(tx) = tx.take()

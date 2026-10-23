@@ -32,16 +32,17 @@ const VISION_MAX_PAYLOAD_BYTES: usize = 1 << 30;
 pub struct VisionCapacityError {
     pub rows: usize,
     pub capacity: usize,
-    pub images: usize,
+    /// Image/video grids in the request (an image is one grid).
+    pub grids: usize,
 }
 
 impl std::fmt::Display for VisionCapacityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "vision row count {} ({} images) exceeds encoder capacity {}; \
+            "vision row count {} ({} image grids) exceeds encoder capacity {}; \
              drop or downscale images from the request",
-            self.rows, self.images, self.capacity
+            self.rows, self.grids, self.capacity
         )
     }
 }
@@ -107,7 +108,7 @@ pub(crate) fn validate_state(state: &VisionWireState, max_rows: usize) -> Result
         return Err(VisionCapacityError {
             rows: state.rows,
             capacity: max_rows,
-            images: state.grid_count,
+            grids: state.grid_count,
         }
         .into());
     }
@@ -278,10 +279,13 @@ mod tests {
             Some(&VisionCapacityError {
                 rows: 17,
                 capacity: 16,
-                images: 2,
+                grids: 2,
             })
         );
-        // Still typed once the scheduler adds its own context.
+        // Still typed once the scheduler adds its own context, but not once
+        // flattened to a string: callers must keep the error, not its text.
+        let flat = anyhow::anyhow!("{e:#}");
+        assert!(!flat.is::<VisionCapacityError>());
         assert!(e.context("prefill").is::<VisionCapacityError>());
     }
 
