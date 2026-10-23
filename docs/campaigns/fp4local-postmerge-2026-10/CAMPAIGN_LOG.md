@@ -335,3 +335,8 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
     - Queued **behind another session's job 081-f40-drafter-ab** (submitted 13:07:47, running). Not touched.
   - FP4-Local itself can't run on framework: not downloaded, and 68 GB free < ~96 GB.
 - 13:00. Fixes-gate agentic leg running on sparky.
+- **13:28 heartbeat. All three boxes busy.**
+  - sparky: fixes-gate agentic, 33 min in. Serve RSS 4,087 MB (+80 MB since agentic began; watch).
+  - strix: s20 binary b9ab4ed54 (sha aaaa3c289775, reused build); BFCL ST-995 started 13:11:50.
+  - framework: f05 Flash-Next ST-995 running (081 from the other session finished).
+  - No PR reviews.
