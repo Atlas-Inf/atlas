@@ -326,3 +326,4 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
 - **12:00 heartbeat.** Fixes-gate BFCL 1 h 59 min in. memsample: RSS 4,004 MB, plateaued since about 11:15 (+5 MB in 45 min). No leak signal under BFCL. No PR activity.
 - **12:28 heartbeat.** Fixes-gate BFCL 2 h 29 min in. RSS 4,005 MB (flat). No PR activity.
 - **13:00. Fixes gate (main + #205 + #206, binary 64bbdec27bd2ffea): BFCL ST-995 87.44 / 87.32** (run-1792760075267807876). Identical to main, accuracy-neutral. Posted on #205/#206. Agentic leg next.
+- **12:58 heartbeat.** Fixes-gate agentic leg started (3 min in). RSS 4,012 MB. No reviewer activity on #204–#208.
