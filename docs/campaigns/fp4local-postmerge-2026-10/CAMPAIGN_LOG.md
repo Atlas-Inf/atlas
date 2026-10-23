@@ -276,3 +276,7 @@
   - The visible scratch in this profile: buffer arena 8,193 tokens × 3.34 GB; one shared MXFP8 BF16 prefill scratch; PLE pinned row cache 2 GB; snapshot pool 16 × 114 MB + decode-rollback 8 × 114 MB.
   - Item 5's payoff therefore isn't established for FP4-Local. Deferred, per Qwen's P5 ranking. Revisit only if a graph-enabled profile becomes the recipe.
 - 10:00. Fixes gate (main + #205 + #206, binary f3fc512c) booting: BFCL ST-995 (~3 h) then agentic (~1.3 h).
+- **10:15. PR CI sweep** (excluding the three checks red repo-wide):
+  - **#207:** file-size cap failed (`finalize_last.rs` 506 > 500). Fixed in 4529e1a44 by moving the aux re-apply into `exact_direct.rs`; finalize_last back to 499. fmt and clippy clean on sparky. Pushed and commented.
+  - **#207 / #206:** `cargo test --workspace` and `cargo llvm-cov --workspace` failed only on the flaky `spark-storage ngram_cache::keepalive::tests::ticks_only_while_active` (keepalive.rs:201; #191 fixes it). #206's job rerun; #207 re-runs on the new push.
+  - #205 and #208 have no PR-specific failures.
