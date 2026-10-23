@@ -2,6 +2,8 @@
 
 //! The unit of vision input handed to the model.
 
+use std::sync::Arc;
+
 /// One vision item: a still image, or a video, ready for the encoder.
 ///
 /// `groups` holds the TEMPORAL GROUPS. A still image has exactly one; a video
@@ -20,7 +22,9 @@ pub struct VisionItem {
     /// The in-flight-rows permit this item holds (vision_admit).
     pub held: crate::vision_budget::HeldRows,
     /// Per temporal group: `[grid_h * grid_w, C * temporal_patch_size * patch^2]`.
-    pub groups: Vec<Vec<f32>>,
+    /// Clones share this immutable pixel storage so serial `n > 1` choices do
+    /// not duplicate the image while each choice is in flight.
+    pub groups: Arc<Vec<Vec<f32>>>,
     /// Pre-merge patch grid, identical across this item's groups.
     pub grid_h: usize,
     pub grid_w: usize,
@@ -50,8 +54,7 @@ impl VisionItem {
     pub fn video(groups: Vec<Vec<f32>>, grid_h: usize, grid_w: usize) -> Self {
         let content_hash = content_hash(&groups, grid_h, grid_w);
         Self {
-            held: crate::vision_budget::HeldRows::default(),
-            groups,
+            groups: Arc::new(groups),
             grid_h,
             grid_w,
             content_hash,
@@ -103,6 +106,8 @@ fn content_hash(groups: &[Vec<f32>], grid_h: usize, grid_w: usize) -> u128 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::VisionItem;
 
     #[test]
@@ -124,5 +129,12 @@ mod tests {
             a.content_hash, clip.content_hash,
             "grouping is part of the identity"
         );
+    }
+
+    #[test]
+    fn clones_share_pixel_storage() {
+        let item = VisionItem::image(vec![0.25; 8], 2, 4);
+        let clone = item.clone();
+        assert!(Arc::ptr_eq(&item.groups, &clone.groups));
     }
 }
