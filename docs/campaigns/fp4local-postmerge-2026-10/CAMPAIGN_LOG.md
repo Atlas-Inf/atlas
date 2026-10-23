@@ -363,3 +363,11 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
   - **Output equality vs cold: 2/15** (ids stripped). The full recompute it replaces (C/K) and direct resume (#207) are both 15/15. Replaying through a different pass layout changes greedy output on most prompts (the #158/#163 class; cf. arm A 5/15, J 6/15).
   - Decision: **no PR as default.** It would turn a bit-exact retry into a different answer ~87% of the time to save TTFT on ~1/16 of prompt lengths. `fix/marconi-fallback-shallower` stays local with this result. The exact way to get partial restores is #163's fixed prefill grid. #207 covers exact hits, fast and exact.
   - The same data makes another point: **the default already diverges on every unaligned retry** (intermediate restore + replay; arm A 5/15). That is existing #158 behaviour, worth noting on #163.
+- **14:40. Production probe P (r1short, main d2d114c02) — mostly clean.**
+  - **Cancellation:** stream closed during a 24K prefill / after the first chunk / mid-decode. In each case the next request is normal (0.69–0.74 s vs 0.74 s baseline) and health is 200. The live behaviour matches the cancel code.
+  - **API negatives** (all answered in 0.0 s): malformed JSON 400; max_tokens 0 → 400 "must be at least 1"; −1 → 400; empty messages 400; content-not-string 400; invalid tool schema 400; corrupt image 400 ("unrecognized image format; send JPEG, PNG…"); 33 MB body **413**. Unicode/zero-width and multi-token stop strings are fine. The server stays healthy throughout.
+  - **Health:** `/health` answered in 0.0 s five times during the 24K prefill.
+  - **Gaps:**
+    - (1) An **unknown model name returns 200** and is served. That is a routing/compat risk when several models sit behind one gateway.
+    - (2) An **invalid role ("wizard") reaches the Jinja template**: the client gets 400 "Tokenization error: Failed to render Jinja chat template…" and the server logs `ERROR spark::tokenizer::chat_render`. It should be a validation 400 naming the role.
+    - (3) `/metrics` has `atlas_requests_active` but **no queue-depth / waiting metric**.
