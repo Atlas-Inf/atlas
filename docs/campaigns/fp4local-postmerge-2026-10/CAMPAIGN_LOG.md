@@ -170,3 +170,6 @@
   - Atlas already has the fix, off by default and with no recorded measurement: `ATLAS_QWEN4EXP_PC_BRANCH=1` + `ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT=1` (from #174) captures an in-pass checkpoint at the fork of a cached path (`qwen4exp_points.rs`, min 1,024 tokens).
   - Added queue2 arms J (flags on) and K (control) with `preamble_probe.py`: 6 new conversations on one fixed ~3.5K-token preamble. Compare TTFT on conversations 2–6 and per-conversation output equality.
   - If J wins and matches K, the recipe (and the default) should turn it on.
+- **08:30 heartbeat.** Recipe agentic at iteration 46 of 50. No PR activity.
+  - Wrote the latent two-phase full-hit fix: `fix/twophase-full-hit-hidden` (3c88c09d7). It restores the snapshot's stashed hidden into `normed` before lm_head in `prefill_full_cache_hit`, and warns if there is none.
+  - Compile/test pending (next sparky CPU batch). prefill_c.rs is on the file-size-cap path allowlist.
