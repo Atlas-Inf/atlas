@@ -327,3 +327,11 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
 - **12:28 heartbeat.** Fixes-gate BFCL 2 h 29 min in. RSS 4,005 MB (flat). No PR activity.
 - **13:00. Fixes gate (main + #205 + #206, binary 64bbdec27bd2ffea): BFCL ST-995 87.44 / 87.32** (run-1792760075267807876). Identical to main, accuracy-neutral. Posted on #205/#206. Agentic leg next.
 - **12:58 heartbeat.** Fixes-gate agentic leg started (3 min in). RSS 4,012 MB. No reviewer activity on #204–#208.
+- **13:10. AMD boxes put back to work** (idle since this morning's AMD soak/build):
+  - **strix job 314 `s20-st995-main197-hipfix`**: build main 504063ad4 + #197 + #204 (b9ab4ed54), then BFCL ST-995 on Qwen3.8-27B-NVFP4 with the s14/s19 profile. This is the AMD train candidate gate.
+    - The strix "drift" source is now found: `s14` measured **84.42 / 75.22** on this profile.
+    - The strix repo lacked main; fetched origin main and bundled the integration branch. Dispatcher started.
+  - **framework job 082 `f05-fnext-st995-main197`**: AMD regression check of #195 (shared qwen4_exp code) on Flash-Next NVFP4, using f22's profile (84.12 / 82.33 on the #197 train), binary main197-hipfix from f03.
+    - Queued **behind another session's job 081-f40-drafter-ab** (submitted 13:07:47, running). Not touched.
+  - FP4-Local itself can't run on framework: not downloaded, and 68 GB free < ~96 GB.
+- 13:00. Fixes-gate agentic leg running on sparky.
