@@ -283,3 +283,6 @@
 - **10:30 heartbeat.** Fixes gate BFCL 29 min in (GPU 90%). Its serve log has only the 5 known startup WARNs and 0 errors so far.
   - #207 `cargo test --workspace` now SUCCESS on rerun (the flaky keepalive test).
   - No reviews yet on #204–#208 or recipe #21.
+- **10:31.** Started a memory-trend sampler on sparky (tmux `memsample` → `~/code/q10h/memsample.log`, every 60 s: MemAvailable, serve RSS, GPU %). Baseline under BFCL: MemAvailable 12,471 MB, serve RSS 3,939 MB.
+  - Goal: catch growth across the 3 h BFCL + 80 min agentic legs. No long-run memory trend has been recorded for FP4-Local before.
+  - Asked Qwen for production gaps across the whole day's findings (pending).
