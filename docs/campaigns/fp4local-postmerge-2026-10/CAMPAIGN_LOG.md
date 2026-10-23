@@ -394,3 +394,9 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
   - Recipe decision: PC_BRANCH needs MIDCHUNK, so the numerics change comes with the 3.4× first-turn TTFT. The **J-profile gate** (BFCL + agentic, starting now) decides whether it costs accuracy.
 - **14:58 (sparky clock; the ~15:00/15:15 stamps above ran ~15 min ahead).** J-profile gate agentic started 14:38 (~80 min), then BFCL (~3 h, ~19:00). strix and framework AMD BFCL ~1.5 h in. No PR reviews. The 10-hour window ends 16:00; the final report goes out then, with the J-profile BFCL and AMD results marked pending.
 - **15:28 heartbeat.** J-profile agentic 49 min in (RSS 3,843 MB). strix/framework AMD BFCL 2 h 17 min in. No PR reviews.
+- **15:58. J-profile gate, agentic leg: PASS. 50/50, 50/50, 12.115 s/turn** (Σwall 4,521 s, run-1792770855397417305). Default: 12.34–12.49.
+  - Serve log: 50 `pc branch checkpoint planned` (one per new conversation) and 286 restores (vs ~145 in default runs).
+  - **TTFT p50 500 ms / p90 2,241 ms**, vs default 636 / 3,100 ms (p90 −28%).
+  - BFCL leg running (~19:00). This is the remaining accuracy check before recommending `PC_BRANCH=1 + MIDCHUNK_CKPT=1` for recipe #21.
+- **16:00. 10-hour window closed.** Final report delivered.
+  - Still running, with watchers armed: J-profile BFCL (sparky), strix s20 AMD candidate BFCL, framework f05 Flash-Next regression BFCL, then queue5 (HOL rerun).
