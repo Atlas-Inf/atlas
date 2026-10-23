@@ -187,3 +187,19 @@
 - **09:05. Arm B (base, `EXACT=1`, MTP): 3/15. Uninformative.** B went live at 08:42:15 and the aligned probe was swapped in at 08:42:43, so B ran the unaligned probe and hit no prompt fully (0 exact lines).
   - B2 (same arm, aligned probe) is queued in `queue3.sh` (tmux `q10h3`) to run after QUEUE2 DONE.
   - Arms C onward use the aligned probe.
+- **08:55. Arm C (base, `EXACT=0`, no MTP, aligned): 10/15**, all prompts aligned (`warm_cached == ptok`). Still 0 bypass lines, because the prompt-end snapshot was gone before the retry.
+  - **Root cause of "identical retry recomputes everything":** the lifecycle trace shows `Saved SSM snapshot 9 for 1312 [chunk]` → `Saved finish-leaf SSM snapshot 5 for 1357` → retry `Prefix cache hit: 1312 tokens … no SSM snapshot`.
+  - The finish-leaf goes through `insert_with_snapshot` → `SsmSnapshotIndex::insert_tail`, whose supersede sweep keeps **at most one tail (+sibling) per session**. So the prompt-end snapshot is freed the moment the turn ends.
+  - Continuing conversations are fine (the next turn extends past the leaf). **Identical retries, regenerate, edit-last-message and n-branches always recompute the full prompt.** This is the real gap behind item 1.
+- **08:55. Arm D (base, `EXACT=1`, no MTP): HTTP 500 on the first real exact hit.**
+  ```
+  Marconi SSM cache hit: 1312 tokens skipped (82 blocks), snapshot 9, replaying 0 SSM tokens to reach 1312
+  ERROR Prefill start error: Prefill-as-decode layer 3 failed: QSA: decode at pos 1311 but 1312 tokens ingested — the indexer cache lost sync
+  ```
+  - **On qwen4_exp the `ATLAS_MARCONI_EXACT=1` shortcut fails requests**, not just degrades them: the restored QSA indexer is at N, and the redundant re-run decodes position N-1. The aux fix (E/F) still runs that forward, so it is expected to hit the same error.
+  - **Direct resume (H/I) never runs it.** This confirms item 1's design: skip the forward, don't undo it.
+  - The probe aborted on the 500. It now records errors and continues (swapped before E).
+- **Item 1, revised plan:**
+  - (1) Direct resume, so an exact hit never re-runs the last token.
+  - (2) Keep the prompt-end snapshot when the finish-leaf supersedes it (one extra slot per session, first to be evicted), so retries and branches can restore at all.
+  - Without (2), (1) only fires on the rare retry whose prompt-end snapshot survived.
