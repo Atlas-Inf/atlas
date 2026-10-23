@@ -131,3 +131,6 @@
   - Also fixed: renamed `images` → `grids`, and added a negative test that a stringified error loses its type.
   - **Rejected with evidence:** TP hang (`validate_state` runs before the command preamble by design); missed entry points (vision state is broadcast only from chunk 0 and prefill_b); #205 double emission (only `openai/encode.rs` reads `refusal`); strict-JSON breakage (grammar-constrained, and there is no server-side `json_object` validation on blocking); "redaction" (streaming never stripped).
   - Both triages posted as PR comments. Retest on sparky (tmux `retest`, `wt-fixes/retest.log`); the gate binary is rebuilt at the PR head.
+- **07:26 (sparky clock).** Times above marked `~` were corrected; earlier I had written estimates that ran ~30–40 min ahead of the box. From here on, times are taken from `date -u` on sparky.
+- **07:25. Operator error:** `pkill -x cargo` on sparky, used to restart the retest, could have hit the agentic soak's sandbox builds. Checked: run-05 finished at 07:25:34, before the kill, and run-06's `cargo test` passed at 07:26:20, after it. No iteration hit. The 50-iteration verdict will confirm. Rule restated: kill tmux jobs by their own PIDs only.
+- **07:26.** #206 commit amended for rustfmt (fcf3fd30d; it had not been pushed). Retest restarted.
