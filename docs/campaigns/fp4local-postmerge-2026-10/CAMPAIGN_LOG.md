@@ -260,3 +260,10 @@
   - Cold==warm: **10/15, the same cases as control K** (all chat and agent match; all 5 tool cases mismatch in every arm, the known prefix-path variance). Direct resume adds no divergence.
   - Correction to my own analysis: cross-arm cold comparisons are invalid, because the probe draws a random nonce per run (E vs H, same binary, agree on only 1/15 cold). Only within-arm cold vs warm counts.
   - Next: arm I (no MTP), then PR. The PR is `fix/exact-hit-restore-aux` (aux re-apply + `ATLAS_EXACT_DIRECT` opt-in), with the fallback PR alongside.
+- **09:50. Arm I (direct resume, no MTP): 14/14 served, < 100 ms TTFT, 0 errors.**
+- **09:50. RE-SCORE, correcting my own probe bug.** The "tool cases always mismatch" pattern was the **tool-call `id` counter** (`call_…08` vs `call_…09`), not output divergence. With ids excluded:
+  - **C 15/15, K 15/15, H 15/15, I 15/15.** Default full-recompute retries and direct resume are bit-exact against cold, with and without MTP.
+  - E/F 1/15 (14 errors).
+  - **A/B 5/15** (unaligned → partial hit + replay); **J 6/15** (mid-chunk restore + replay).
+  - So the divergence class is "restore partway, then replay with a different pass layout" (#158/#163), and my fallback fix (arm L) will likely sit in it too. Same behavior as every existing agentic intermediate hit, but the PR must state the trade-off.
+- **09:52. PR #207 opened:** direct exact-hit resume (`fix/exact-hit-restore-aux`: aux re-apply + `ATLAS_EXACT_DIRECT`). Exact retries at 18 ms TTFT, bit-exact; the default exact path 500s on qwen4_exp.
