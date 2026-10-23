@@ -7,6 +7,8 @@
 //! 1-token layer re-run contributes nothing but a second advance of every
 //! recurrent and aux state, which the fixup then has to undo. Skip it.
 
+use anyhow::Result;
+
 use super::super::super::types::TransformerModel;
 use crate::traits::SequenceState;
 
@@ -34,5 +36,24 @@ impl TransformerModel {
             );
         }
         direct
+    }
+
+    /// `finalize_last`'s exact-hit fixup, part (3): the 1-token re-run also
+    /// advanced the PLE n-gram history/conv carry and the QSA indexer a second
+    /// time, and decode reads both; re-apply the snapshot's aux state, as the
+    /// prefix restore did.
+    pub(in crate::model) fn exact_hit_reapply_aux(
+        &self,
+        seq: &mut SequenceState,
+        snap_id: usize,
+        stream: u64,
+    ) -> Result<()> {
+        if let Some(res) = self
+            .ssm_snapshots
+            .with_aux(snap_id, |aux| self.apply_aux_states(seq, aux, stream))
+        {
+            res?;
+        }
+        Ok(())
     }
 }
