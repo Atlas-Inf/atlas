@@ -404,3 +404,9 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
 - **17:37. framework f05 (Flash-Next NVFP4, main + #197 + #204): BFCL ST-995 84.12 / 81.47** (run-1792777040459298748, 0 faults) vs f22 (#197 train) 84.12 / 82.33. Overall identical, normalized −0.86. #195's shared qwen4_exp changes show no AMD regression.
 
 - **10-23 18:47.** J-profile BFCL ST-995 (PC_BRANCH + MIDCHUNK, d2d114c02): **87.64 / 87.38** (run-1792781263471144759), vs default 87.44 / 87.32. With agentic 50/50 at 12.115 s/turn, the J profile passes both gates. Posted the table on sparkrun-recipes #21 as an optional env and left the bake-in decision to the owner. queue5 HOL rerun (P3, r2) booted at 18:48.
+
+- **10-23 18:49. P3 head-of-line rerun** (r2 profile, ~20K-token long prompt, fits max-seq-len):
+  - Short request alone: 0.88–0.96 s.
+  - **6 shorts sent during the long prefill: all finish at 18.18–18.35 s; the long finishes at 18.7 s.** So shorts wait out the whole long prefill: full head-of-line blocking on the default scheduler.
+  - Concurrency (shorts only): C=2 1.60 s, C=4 2.95 s, C=8 5.65 s per request, about 1.16×, 1.26× and 1.32× aggregate over serial. Shorts are close to serialized.
+  - The code has opt-in knobs aimed at this: `ATLAS_PREFILL_VARLEN` (ragged batched prefill that a late arrival can join), `ATLAS_HOLO_ALWAYS_MIXED` (fuse prefill chunks into active decode), `ATLAS_PREFILL_CODISPATCH`. queue6 A/Bs VARLEN, MIXED and both on the same probe (18:51).
