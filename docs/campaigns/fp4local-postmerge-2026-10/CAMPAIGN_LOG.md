@@ -292,3 +292,6 @@
   - **Cancellation:** implemented and unit-tested (`emit_step/cancel.rs`, `cancel_tests.rs`, `receiver_closed` in prefill and admission). Live behaviour is unverified.
   - **New `prod_probe.py`**, queued in queue4 after arm L as **P** (r1short: cancel at prefill / first chunk / mid-decode; 12 API negative cases; health during a ~30K prefill; metrics scrape) and **P2** (r2, 8 seqs: shorts vs an in-flight 30K prefill; C=2/4/8 shorts).
   - Not covered today: >32K agentic, crash/restart fault injection, overnight soak (memsample covers the remaining gate legs), MTP at C>1 with temperature.
+- **11:00 heartbeat.** Fixes-gate BFCL 59 min in. No PR or issue activity.
+  - memsample: serve RSS 3,939 → 3,987 MB over 27 min (+1.8 MB/min); MemAvailable flat at 12.46 GB.
+  - The growth matches the PLE pinned row cache filling (1.65 M slots after 3 h in the recipe run; cap 2 GB). Check it plateaus over the remaining legs.
