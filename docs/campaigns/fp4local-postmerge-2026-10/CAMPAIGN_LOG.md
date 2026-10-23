@@ -181,3 +181,6 @@
   - Only the block-aligned prompts (432 and 4,144 tokens) hit fully, and both matched cold. Prompts >4,096 tokens restore from the 4,096-token intermediate checkpoint and replay the rest (12×).
   - Mismatches are tool/agent cases plus one chat case; known prefix-cache-path variance (FP4-Local doc §3, "optional preamble sentence"; #158/#163 layout).
   - **Item 1 reframed:** the exact-hit shortcut and direct resume only apply to ~1 in 16 prompt lengths. The retry lever is a checkpoint at or below the last whole block. qwen4_exp's in-pass tail checkpoint (`ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT=1`, 64-row grid) should do that. Arm J (MIDCHUNK + PC_BRANCH) also runs the retry probe, so it measures this too.
+- **08:43. Probe change for arms B onward:** `exact_hit_probe.py` is now block-aligned. Per case it uses `max_tokens=1` trials to find a pad (0–15 " ok" words) that makes `prompt_tokens % 16 == 0`, then runs cold/warm on a fresh fixed-width decimal nonce (Qwen tokenizes digits one per token, so the count is stable).
+  - Every warm send is then a true full-prompt hit that exercises the exact path. It prints "not aligned" when it misses.
+  - Arms A (and C) are the unaligned control. The old probe is kept as `exact_hit_probe.unaligned.py`.
