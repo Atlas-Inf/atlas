@@ -483,3 +483,15 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
   - Cause (`prefill_b/multi.rs`): a prompt that shares cached KV blocks leaves the pass and prefills alone afterwards, unless `ATLAS_QWEN4EXP_PREFILL_MULTI_CACHED=1`. Every chat request shares the template's leading ~32 tokens (2 blocks: "Prefix cache hit: 32 tokens"), so on a warm server **no real request ever rides the pass**.
   - GPU time: 2.29 s per 8-prompt "pass", the same as the wall. MoE prefill dominates: fused gate_up 1.87 ms + grouped 1.0 ms + w4a16 0.42 ms per layer per prompt.
   - queue19 tests `MULTI_CACHED=1`.
+
+- **10-23 20:08. queue19, `MULTI_CACHED=1`: batching works.** ROWINV + MULTI + MULTI_CACHED + CODISPATCH:
+
+  | | default | ROWINV only | **+MULTI+MULTI_CACHED+CODISPATCH** |
+  |---|---|---|---|
+  | 8-prompt prefill pass | n/a (serial) | 2.3 s (ejected → serial) | **0.61 s** |
+  | burst 8, max_tokens 1 | n/a | 2.35 s | **0.65 s** |
+  | burst 8, max_tokens 16 | 6.1 s | 5.18 s | **3.45 s** (−43%) |
+  | burst 4, max_tokens 16 | ~3.1 s | 2.66 s | **1.89 s** |
+
+  The 8-prompt pass costs about 2.3× a single short prefill, not 8×. So once the prompts really share a forward, the weights are streamed once. The bandwidth reading holds for the pass; the earlier "doesn't amortise" was the ejection.
+- **10-23 20:10. queue20 launched:** gate of this profile on r1short (the recipe profile): agentic 50 (prefix cache on), then BFCL ST-995. Label `nq-fp4l-multiprofile-d2d114c02`. Default reference: BFCL 87.44 / 87.32; agentic 50/50 at 12.43 s/turn.
