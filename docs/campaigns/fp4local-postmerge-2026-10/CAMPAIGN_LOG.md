@@ -162,3 +162,11 @@
   - prefill_b.rs is at 499 lines; the predicate lives in the new `prefill_b/exact_direct.rs`.
   - Known cost: the first MTP draft sees no real hidden context. Acceptance only; output is protected by EXACT_VERIFY.
   - queue2 restarted (it was only waiting) with arms H/I (exp, `EXACT=1 + DIRECT=1`, MTP on/off). The wt-exp fmt/clippy check runs after the retest build.
+- **08:00 heartbeat.** Recipe agentic at about iteration 25 of 50. wt-exp fmt OK and clippy clean (spark-model). No new PR comments.
+- **08:00. New deployment gap, from the agentic-phase serve log** (4,629 lines since 07:16, 0 WARN/ERROR):
+  - TTFT p50 is 636 ms but p90 is 3,100 ms (n=198).
+  - **51 turns** logged `Prefix cache hit: 3168|3696 tokens … but no SSM snapshot — recomputing all KV`. That is the first turn of every iteration: each new conversation shares the system prompt + tools, the radix cache matches it, but no SSM snapshot exists at that depth. Snapshots sit only at leaves and every 4,096 tokens, and 3,696 < 4,096.
+  - So every new session pays a full ~3.5K-token prefill.
+  - Atlas already has the fix, off by default and with no recorded measurement: `ATLAS_QWEN4EXP_PC_BRANCH=1` + `ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT=1` (from #174) captures an in-pass checkpoint at the fork of a cached path (`qwen4exp_points.rs`, min 1,024 tokens).
+  - Added queue2 arms J (flags on) and K (control) with `preamble_probe.py`: 6 new conversations on one fixed ~3.5K-token preamble. Compare TTFT on conversations 2–6 and per-conversation output equality.
+  - If J wins and matches K, the recipe (and the default) should turn it on.
