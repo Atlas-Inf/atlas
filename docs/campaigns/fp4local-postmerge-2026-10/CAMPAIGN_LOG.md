@@ -495,3 +495,29 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
 
   The 8-prompt pass costs about 2.3× a single short prefill, not 8×. So once the prompts really share a forward, the weights are streamed once. The bandwidth reading holds for the pass; the earlier "doesn't amortise" was the ejection.
 - **10-23 20:10. queue20 launched:** gate of this profile on r1short (the recipe profile): agentic 50 (prefix cache on), then BFCL ST-995. Label `nq-fp4l-multiprofile-d2d114c02`. Default reference: BFCL 87.44 / 87.32; agentic 50/50 at 12.43 s/turn.
+
+## 2026-10-23 21:45 UTC — queue20 gate: multi profile loses warm-turn prefix reuse
+
+Profile `ROWINV + MULTI + MULTI_CACHED + CODISPATCH` (r1short, prefix cache on), agentic-webserver 50:
+
+| run | webserver_ok | s/turn | turns | agentic TTFT median / p90 (first 380 reqs) | decode med tok/s |
+|---|---|---|---|---|---|
+| default (`nq-fp4l-main`) | 50/50 | 12.43 | 379 | 632 / 3010 ms | 25.6 |
+| J-profile | 50/50 | 12.12 | 370 | — | — |
+| multi profile (queue20) | 50/50 | **13.97** | 354 | **3062 / 3423 ms** | 25.5 |
+
+Decode is unchanged, so the +12% s/turn comes entirely from TTFT. The serve log shows **0** SSM
+checkpoint saves and **0** Marconi intermediate hits (default: 1338 saves, 299 hits). Every warm
+turn logs "Prefix cache hit … but no SSM snapshot — recomputing all KV".
+
+Cause (code, d2d114c0): `prefill_b.rs` sets `split_disabled = tail_split_disabled() || rowinv::on()`,
+because a 16-token block-grid cut is off ROWINV's 64-token GDN grid. The comment says so outright:
+"without the in-pass checkpoint the last chunk stays whole". The tail checkpoints therefore never
+land. `pc_policy` restores under ROWINV also need `snap_tok % 64 == 0`. The intended pairing is
+`ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT=1`, which places the in-pass checkpoint on the 64 grid
+(`qwen4exp_pass_points`). queue20 was missing it. This is a config error, not an engine bug. It is
+still a trap: ROWINV alone silently turns the agentic prefix cache into a no-op, and nothing warns.
+
+I stopped queue20's BFCL leg at 21:42 because that profile is already disqualified. queue21
+re-gates the profile with `+ ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT=1` (label `nq-fp4l-multickpt-d2d114c02`).
+Follow-up worth a PR: WARN at boot when ROWINV is on, the prefix cache is on and MIDCHUNK_CKPT is off.
