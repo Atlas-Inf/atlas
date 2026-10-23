@@ -216,3 +216,8 @@
   - In multi-user agentic serving, every client with the same tool set (or a system prompt >1,024 tokens) is one "session". Session-aware eviction cannot tell them apart.
   - The tail-snapshot session gate (whose purpose is to stop cross-conversation tail restores, since "a tail's SSM state bleeds past its advertised token_count") does not separate them. Whether a wrong-state restore is reachable is not checked yet: it needs a tail whose prefix hash matches another conversation's tokens at that count.
   - A DBG run (debug logs for snapshot lifecycle; 3 cases) is queued in queue3 after QUEUE2 DONE.
+- **09:05. Arm J (base + `MIDCHUNK_CKPT=1` + `PC_BRANCH=1`).**
+  - **Preamble probe:** conv0 (cold, 3,285 tokens) TTFT 2,087 ms; **conv1–5 TTFT 181–186 ms** (cached 3,264), about **11× faster** first-turn TTFT for every new conversation on a shared preamble. Tool picks look sane. Output equality vs control K is pending.
+  - **Aligned retry probe:** 5/15. Chat 5/5 match; tool 0/5 (mismatched in every arm, known); agent 0/5 (5/5 in C), i.e. layout changes from mid-chunk restores (#158/#163 class).
+  - Restores: **55 intermediate hits** (C had 0). Mid-chunk checkpoints now carry aux, which confirms fix candidate (b).
+  - Not a free win: warm ≠ cold on agent prompts, so it needs the BFCL + agentic gate before going into the recipe/default. Queue a J-profile gate after queue2.
