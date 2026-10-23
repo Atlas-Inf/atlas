@@ -393,3 +393,4 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
   - So **MIDCHUNK's in-pass capture deterministically changes greedy output on ~3/6 prompts vs default** (not run-to-run noise: J2 and J3 agree with each other). Restores from the branch checkpoint reproduce the default's output.
   - Recipe decision: PC_BRANCH needs MIDCHUNK, so the numerics change comes with the 3.4× first-turn TTFT. The **J-profile gate** (BFCL + agentic, starting now) decides whether it costs accuracy.
 - **14:58 (sparky clock; the ~15:00/15:15 stamps above ran ~15 min ahead).** J-profile gate agentic started 14:38 (~80 min), then BFCL (~3 h, ~19:00). strix and framework AMD BFCL ~1.5 h in. No PR reviews. The 10-hour window ends 16:00; the final report goes out then, with the J-profile BFCL and AMD results marked pending.
+- **15:28 heartbeat.** J-profile agentic 49 min in (RSS 3,843 MB). strix/framework AMD BFCL 2 h 17 min in. No PR reviews.
