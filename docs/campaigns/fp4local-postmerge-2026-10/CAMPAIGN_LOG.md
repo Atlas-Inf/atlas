@@ -141,3 +141,9 @@
     - No manifest changed between then and main, and the action SHA is the same (`3c634983`).
     - The action rebuilds its Docker image each run, so an unpinned base image or tool inside it probably moved. The advisory/license audit is effectively off until this is fixed.
     - Owner item; not chased further.
+- **07:45. Strix BFCL drift numbers (85.43/78.19 → 84.42/75.22) not filed.** They come from the 10-22 Qwen summary, and I can find no source for them in BENCH.toml, docs or #197. Filing needs run ids first.
+- **07:50. Latent wrong-logits bug in `prefill_d.rs::prefill_full_cache_hit`.**
+  - Path: two-phase prefill (`prefill_twophase_dispatch`), with an SSM snapshot covering the whole prompt (`proc_count == 0`).
+  - Behavior: it re-embeds the last token and runs final_norm + lm_head **on the embedding**, skipping every layer. It never uses the snapshot's stashed hidden, and it is not gated by `ATLAS_MARCONI_EXACT`.
+  - Reachability: only when `max_prefill_tokens < len ≤ max_batch_tokens`. The recipe has max_batch_tokens = 8193 = max_prefill + 1, so only a prompt of exactly 8193 tokens. Two-phase never ran in the recipe or bare-metal logs (0 lines).
+  - Fix, when picked up: restore the stashed hidden into `normed` the way `finalize_last` does, or decline the skip when the snapshot has no hidden.
