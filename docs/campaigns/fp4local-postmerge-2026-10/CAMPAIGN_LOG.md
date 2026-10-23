@@ -253,3 +253,10 @@
   - Fallback branch checks on sparky: spark-runtime snapshot tests 75/75 (new test included), clippy clean, release build OK (762bc4a5).
   - rustfmt wanted the new test's asserts wrapped; amended locally (unpushed; binary unaffected).
   - Arm L starts once queue2/queue3 drain.
+- **09:45. ITEM 1 RESULT. Arm H (exp, `MARCONI_EXACT=1` + `EXACT_DIRECT=1`, MTP): direct resume works.**
+  - 14/14 exact retries served with **no errors** (E/F: 14/14 HTTP 500). 28 hit/direct lines.
+  - **Warm TTFT 18.1–18.8 ms**, vs 1.1–1.4 s for the full recompute the default does (about 60×).
+  - Warm wall time is lower on every case, e.g. case 13: 2.12 s vs control K 5.41 s.
+  - Cold==warm: **10/15, the same cases as control K** (all chat and agent match; all 5 tool cases mismatch in every arm, the known prefix-path variance). Direct resume adds no divergence.
+  - Correction to my own analysis: cross-arm cold comparisons are invalid, because the probe draws a random nonce per run (E vs H, same binary, agree on only 1/15 cold). Only within-arm cold vs warm counts.
+  - Next: arm I (no MTP), then PR. The PR is `fix/exact-hit-restore-aux` (aux re-apply + `ATLAS_EXACT_DIRECT` opt-in), with the fallback PR alongside.
