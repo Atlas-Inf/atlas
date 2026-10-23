@@ -356,3 +356,4 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
   - So "retries recompute everything" holds only for **block-aligned** prompts (exact bypass, no fallback; arm C 15/15) and tiny prompts. The fallback fix's scope is aligned prompts (~1/16) plus aux-less snapshots.
   - PR #207 body and the fallback PR draft corrected.
   - The real big-ticket item remains the shared-preamble/tool-JSON prefix with no snapshot at the fork (agentic first turns, cold tool requests). That is the J2/K2/J3 + J-gate work in queue4.
+- **14:30. Arm B2 (unmodified main, `MARCONI_EXACT=1`, MTP, aligned): 14/14 exact retries → HTTP 500.** Confirms the bug is main's, not the aux branch. Posted on #207. queue3 DONE → queue4 next (arm L fallback).
