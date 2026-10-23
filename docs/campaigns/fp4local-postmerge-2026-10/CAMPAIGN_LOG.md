@@ -375,3 +375,9 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
     - (2) Not fixed. `ir::Role::Other` deliberately passes unknown roles to the template, because some templates use `developer`/`function`/`ipython`, so a hard allow-list could break them. The client already gets a 400; only the message wording and the server-side ERROR level are rough.
     - (1) Accepting any model name is common for single-model servers (vLLM returns 404). Note only.
     - (3) The missing queue-depth metric is a real ops gap for C>1 deployments. Candidate follow-up.
+- **14:50. Production probe P2 (r2 profile: 8 seqs, MTP 1 draft, ATLAS_MTP_MAX_SEQS=8).**
+  - **Concurrency scaling for short requests is poor:** C=1 0.89–0.97 s each; C=2 1.52–1.60 s; C=4 2.73–2.95 s; **C=8 5.6–6.05 s each**. Aggregate throughput gain at C=8 is only ~1.3× over serial. All 200s; no errors or hangs.
+    - For multi-user FP4-Local deployments, batching barely helps short interactive requests on this profile.
+    - Next to check: whether prefills serialize (one chunked prefill at a time) or the batched decode step itself is slow.
+  - **Head-of-line test invalid (my probe):** the "long" prompt (2,000 facts ≈ 34K tokens) exceeded max-seq-len 32,768 and got an instant 400 on both P and P2. So "6 shorts during long prefill" (4.0–4.3 s) was really 6-way concurrency, and P's "health during long prefill" ran against a rejected request.
+    - Rerun queued: `queue5.sh` / `prod_probe_hol.py`, 1,200 facts ≈ 20K tokens, after QUEUE4 DONE.
