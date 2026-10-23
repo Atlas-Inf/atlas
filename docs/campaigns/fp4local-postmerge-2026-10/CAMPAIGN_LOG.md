@@ -357,3 +357,9 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
   - PR #207 body and the fallback PR draft corrected.
   - The real big-ticket item remains the shared-preamble/tool-JSON prefix with no snapshot at the fork (agentic first turns, cold tool requests). That is the J2/K2/J3 + J-gate work in queue4.
 - **14:30. Arm B2 (unmodified main, `MARCONI_EXACT=1`, MTP, aligned): 14/14 exact retries → HTTP 500.** Confirms the bug is main's, not the aux branch. Posted on #207. queue3 DONE → queue4 next (arm L fallback).
+- **14:30. Arm L (fallback-to-shallower, `EXACT=0`, aligned retries) — works, but NOT shipped as default.**
+  - All 15 declined exact hits fell back one checkpoint (e.g. @1312 → @1280, @144 → @112) and replayed 32 SSM tokens. 14 intermediate restores, 0 errors.
+  - Warm wall time drops on long prompts: case 12 9.25 → 5.62 s (K: 9.71 → 9.49); case 10 5.66 → 3.03 (K: 5.27 → 5.00).
+  - **Output equality vs cold: 2/15** (ids stripped). The full recompute it replaces (C/K) and direct resume (#207) are both 15/15. Replaying through a different pass layout changes greedy output on most prompts (the #158/#163 class; cf. arm A 5/15, J 6/15).
+  - Decision: **no PR as default.** It would turn a bit-exact retry into a different answer ~87% of the time to save TTFT on ~1/16 of prompt lengths. `fix/marconi-fallback-shallower` stays local with this result. The exact way to get partial restores is #163's fixed prefill grid. #207 covers exact hits, fast and exact.
+  - The same data makes another point: **the default already diverges on every unaligned retry** (intermediate restore + replay; arm A 5/15). That is existing #158 behaviour, worth noting on #163.
