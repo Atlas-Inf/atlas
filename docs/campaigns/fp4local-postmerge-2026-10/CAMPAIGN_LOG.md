@@ -232,3 +232,13 @@
   - K aligned retry probe: 10/15 (same as C). This is the default baseline.
   - New probe mode `long` (+~200 tokens of distinct context per first message). queue4 now runs **J2** (PC_BRANCH + MIDCHUNK), **K2** (control) and **J3** (MIDCHUNK only) with long questions *before* the J-profile gate.
 - **09:12.** EXP build OK (e0158eda); arms E/F/H/I next.
+- **09:25. Arm E (exp = aux fix, `EXACT=1`, MTP, aligned): 14/15 warm sends hit the exact path and all 14 returned HTTP 500** (`QSA: decode at pos N-1 but N tokens ingested`).
+  - Reproducible on every exact retry with `ATLAS_MARCONI_EXACT=1` on qwen4_exp.
+  - The aux fix alone cannot help: the failure is in the redundant forward. Item 1 = skip the forward; H/I test it.
+  - The aux-fix-only branch is **not PR-worthy on its own**. It folds into direct resume (same branch, 264361a3d/f5dc0fb7d).
+- **09:25. Qwen consult on retry fallback + session_hash — triage:**
+  - **Fallback-to-shallower by default:** agreed. Implement as candidate enumeration with reject reasons (exact bypass / missing aux / session / pin failed), not "decline then give up". Pin the chosen snapshot through restore. Replay with prefill/extend semantics (never decode for a prompt token).
+  - **Direct resume:** opt-in and capability-gated (snapshot has stashed hidden + aux + KV through N; disable with prompt logprobs, which I already did; first MTP step degraded). My prototype matches.
+  - **Cross-session tail bleed (A):** checked, **not reachable with current captures**. The default mid-chunk tail capture saves GDN state *exactly at tb* (split kernels; midchunk_capture.rs), and qwen4_exp in-pass checkpoints capture PLE/QSA aux at that exact row. Physical == logical extent, so a cross-session restore of such a tail is as safe as an exact-prefix snapshot. The "bleeds past token_count" justification in `lookup` describes the older clamp-based `ATLAS_SSM_TAIL_CKPT` path.
+  - **Session-hash collision** stays a real issue, but for eviction fairness and observability, not correctness. Proposed identity: request/conversation id for LRU affinity; prefix hash for correctness (already how non-tail entries work).
+  - **Misleading log:** agreed; part of the fallback change.
