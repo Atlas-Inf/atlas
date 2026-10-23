@@ -242,3 +242,10 @@
   - **Cross-session tail bleed (A):** checked, **not reachable with current captures**. The default mid-chunk tail capture saves GDN state *exactly at tb* (split kernels; midchunk_capture.rs), and qwen4_exp in-pass checkpoints capture PLE/QSA aux at that exact row. Physical == logical extent, so a cross-session restore of such a tail is as safe as an exact-prefix snapshot. The "bleeds past token_count" justification in `lookup` describes the older clamp-based `ATLAS_SSM_TAIL_CKPT` path.
   - **Session-hash collision** stays a real issue, but for eviction fairness and observability, not correctness. Proposed identity: request/conversation id for LRU affinity; prefix hash for correctness (already how non-tail entries work).
   - **Misleading log:** agreed; part of the fallback change.
+- **09:35. Retry fix written: `fix/marconi-fallback-shallower` (64f33b27a).**
+  - `PrefixCache::snapshot_below` (radix: the deepest resident index entry under a cap) feeds `marconi_fallback` (pc_policy.rs). When the deepest snapshot is declined, it walks down ≤4 candidates until one passes `marconi_restorable`, then the existing intermediate-hit path replays the gap.
+  - Single-rank only. The bypass check now keys on the chosen depth, and the log says "no restorable SSM snapshot".
+  - Unit test `snapshot_below_returns_the_next_shallower_restore_point`. All four touched files stay under the 500-line cap.
+  - sparky: `wt-fallback` = main + fallback + twophase-full-hit fix. fmt/test/clippy/release running (tmux `fbcheck`).
+  - **Arm L** (fallback binary, `EXACT=0`, aligned retry probe) is at the head of queue4.
+  - Expected: warm sends restore at a shallower snapshot, replay < 64 tokens, warm wall time drops. Match rate vs cold should be ≥ C's 10/15 if the replay numerics hold.
