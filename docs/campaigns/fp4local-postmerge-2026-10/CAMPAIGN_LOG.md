@@ -155,3 +155,10 @@
     - Checked as harmless: KV at N-1 is a duplicate write; `seq_len` is set to total; mHC streams are per token, not carried across tokens; the decode checkpoint ring saves during decode, not prefill; the aux blob H2D is a transient copy (it syncs if pinned).
     - Open: QSA counters beyond keys; MTP drafter context (output is still protected by EXACT_VERIFY).
     - Robust design, the same as item 1: **skip the forward** (restore SSM + aux + hidden → lm_head) rather than undo it. Arms E/F show whether aux alone recovers exactness. Item 1 is the follow-up either way.
+- **07:34. Item 1 prototype: `ATLAS_EXACT_DIRECT=1`** (264361a3d, on `fix/exact-hit-restore-aux`).
+  - On an exact leaf hit whose snapshot has the stashed hidden (last chunk, `proc_count == 1`, no prompt logprobs), skip `prefill_b_forward_layers`. `finalize_last`'s fixup already supplies the hidden for lm_head.
+  - Nothing re-runs, so nothing is double-advanced.
+  - Covers the single-stream path only; the batched/multi paths keep the re-run.
+  - prefill_b.rs is at 499 lines; the predicate lives in the new `prefill_b/exact_direct.rs`.
+  - Known cost: the first MTP draft sees no real hidden context. Acceptance only; output is protected by EXACT_VERIFY.
+  - queue2 restarted (it was only waiting) with arms H/I (exp, `EXACT=1 + DIRECT=1`, MTP on/off). The wt-exp fmt/clippy check runs after the retest build.
