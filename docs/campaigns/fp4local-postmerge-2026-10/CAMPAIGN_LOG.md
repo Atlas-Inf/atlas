@@ -400,3 +400,4 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
   - BFCL leg running (~19:00). This is the remaining accuracy check before recommending `PC_BRANCH=1 + MIDCHUNK_CKPT=1` for recipe #21.
 - **16:00. 10-hour window closed.** Final report delivered.
   - Still running, with watchers armed: J-profile BFCL (sparky), strix s20 AMD candidate BFCL, framework f05 Flash-Next regression BFCL, then queue5 (HOL rerun).
+- **17:12. strix s20 (main + #197 + #204): BFCL ST-995 84.12 / 74.65** (run-1792775551367679462, 0 faults) vs s14 84.42 / 75.22. Within variance; the AMD candidate does not regress. Posted on #204 and #197.
