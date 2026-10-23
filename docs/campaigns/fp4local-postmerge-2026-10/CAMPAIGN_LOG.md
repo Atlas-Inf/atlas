@@ -224,3 +224,11 @@
 - **09:08. queue4 armed** (tmux `q10h4`, runs after QUEUE3 DONE): J-profile gate. Base d2d114c02 + `MIDCHUNK_CKPT=1` + `PC_BRANCH=1`, agentic 50 then BFCL ST-995.
   - This decides whether the 11× preamble TTFT goes into the recipe.
   - Chain on sparky: queue2 (arms K, E/F/H/I, G/A2, then the #205/#206 gate, then CSF clean) → queue3 (DBG snapshot lifecycle, B2) → queue4 (J gate).
+- **09:12. Arm K (control, default flags). CORRECTION to J's "11×".**
+  - The preamble probe is equally fast with no flags: conv1–5 TTFT 181–186 ms (cached 3,264); conv0 cold 2,237 ms.
+  - K restored from **snapshot 7, the default `Intermediate SSM checkpoint saved at token 3264 (block 204)`**, the last-block checkpoint before each prompt end. That carries aux.
+  - The probe's questions are ~20 tokens, so that checkpoint falls *inside* the shared preamble and is reusable. **The probe didn't test the agentic case**, where long first messages put the last-block checkpoint past the fork and nothing exists at the preamble boundary (the 51 misses).
+  - Outputs J vs K: conv1–5 identical tool picks; conv0, cold in both, differs (J `list_dir,search` / K `list_dir`). Either the mid-chunk capture changes cold numerics, or this is run-to-run variance.
+  - K aligned retry probe: 10/15 (same as C). This is the default baseline.
+  - New probe mode `long` (+~200 tokens of distinct context per first message). queue4 now runs **J2** (PC_BRANCH + MIDCHUNK), **K2** (control) and **J3** (MIDCHUNK only) with long questions *before* the J-profile gate.
+- **09:12.** EXP build OK (e0158eda); arms E/F/H/I next.
