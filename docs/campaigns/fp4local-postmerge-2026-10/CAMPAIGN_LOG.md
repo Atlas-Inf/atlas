@@ -417,3 +417,13 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
   2. *Server TTFT omits queue wait.* Those shorts log `TTFT=360 ms` after waiting ~10 s to be admitted. The long logs 16.3 s. Server-side TTFT can't see head-of-line blocking (a production-metric gap, alongside the missing queue-depth metric).
   3. *C=8.* The 8 requests arrive within 3 ms. Under VARLEN only the first two are deferred, and even those take `run_standard`, not the batched path. The rest prefill inline one at a time at ~360 ms each (≈2.9 s), then decode at width 8 for ~2.3 s. Batched prefill never engages: `want_varlen_defer` needs `active.is_empty()`, and the first finished short makes `active` non-empty.
   4. *A 48-token prefill costs ~360 ms*, split into two forwards by the tail checkpoint at token 16 (~150 ms + ~200 ms). That's about 5–6 decode steps for 48 tokens, so there's a large fixed term. queue7 sweeps prompt length 8–4000 with and without `ATLAS_SSM_TAIL_MIDCHUNK=0` (18:59).
+
+- **10-23 19:03. queue7, prefill vs prompt length** (r2, max_tokens=1, thinking off; server TTFT ≈ client wall):
+
+  | prompt tokens | 34 | 58 | 126 | 276 | 527 | 1027 | 2027 | 4027 |
+  |---|---|---|---|---|---|---|---|---|
+  | TTFT ms (default) | 300 | 368 | 410 | 469 | 617 | 865 | 1402 | 2650 |
+  | `ATLAS_SSM_TAIL_MIDCHUNK=0` | 295 | 368 | 413 | 467 | 611 | 869 | 1394 | 2647 |
+
+  Marginal ≈ 0.58 ms/token above 500 tokens, with a **~300 ms intercept**: a fixed prefill cost worth ~1,700 tokens. The tail checkpoint is not it. That term sets C=8 short-request throughput (8 serial prefills ≈ 2.9 s) and every short agentic turn's floor.
+- queue8 (HOL: SLAI, max-prefill 2048, ±SLAI/MIXED) and queue9 (fixed-cost A/B: drafter context off, spec off, plus an nsys capture of 32-token prefills) are queued behind it. `serve-flashnext.sh` now honours `MAX_PREFILL` (default 8192, backup `.bak-q8`).
