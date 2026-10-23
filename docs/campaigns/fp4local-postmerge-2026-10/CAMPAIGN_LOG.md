@@ -42,7 +42,9 @@
 Issue #209: session_hash collides for shared tool sets (eviction fairness; cross-conversation tail bleed checked, not reachable).
 
 **Findings (deployment gaps):**
-- **Identical retries recompute everything** (declined exact hit + no shallower fallback; misleading "no SSM snapshot" log). #207 fixes aligned exact hits. Fallback-to-shallower branch is pending arm L.
+- **Block-aligned identical retries recompute everything:** the exact hit is declined and nothing falls back to a shallower snapshot, and the log misleadingly says "no SSM snapshot". Unaligned retries already restore the last intermediate checkpoint.
+  - #207 serves exact hits directly, in 18 ms. The fallback branch covers the aligned/aux-less case (pending arm L).
+  - The bigger gap is the **shared prefix with no snapshot at the fork**: agentic first turns, and cold tool requests sharing ~1.2K tokens of tool JSON.
 - **Agentic first turns recompute the shared ~3.5K preamble:** p90 TTFT 3.1 s vs p50 0.64 s. Branch checkpoints exist but are off by default; A/B + gate in queue4.
 - **The container KV pool is 16% smaller than bare metal**, from a 1.6 GB free-memory drop seen only in docker.
 - **Neutral or closed:** PLE pinned-copy sync (27.90 vs 27.91 tok/s); PLE fault wall is cold first touch at the NVMe ceiling; RSS plateaus at ~4.0 GB under BFCL.
