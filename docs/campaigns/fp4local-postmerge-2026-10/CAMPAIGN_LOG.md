@@ -22,6 +22,34 @@
 - Recipe profile: r1short, MTP 3 drafts, EXACT_VERIFY / DECODE_FUSE / BATCH_FAST / BATCH_SMALL / HC_FAST, PLE cache 2 GB, prefix caching ON.
 - Reference: 87.44 / 87.32 and 50/50, 50/50.
 
+## Summary (living; updated as legs land)
+
+**FP4-Local is merged, verified and recipe-vetted.**
+- main (#195) + HIP fix: BFCL ST-995 **87.44 / 87.32**; agentic **50/50, 50/50, 12.43 s/turn**.
+- Recipe #21 via sparkrun on `ghcr…:sha-504063a`: BFCL **87.94 / 87.57**; agentic **50/50, 50/50, 12.49 s/turn**.
+- The only blocker on #21 is its `container:` line, which needs a tag that actually has #195.
+
+**PRs opened (Atlas-Inf/atlas):**
+
+| PR | What | Evidence |
+|---|---|---|
+| #204 | HIP build fix (`__float2bfloat16_rn` → `__float2bfloat16`); with #197 restores AMD main | GB10 BFCL + agentic unchanged; strix-hip build OK; strix agentic 50/50 |
+| #205 | #172: blocking refusals keep `content` (also fixes Anthropic `/v1/messages` blocking returning no text) | 60 server tests; gate pending |
+| #206 | #180: over-capacity vision → typed error → HTTP 400 blocking + `invalid_request_error` streaming | model 5/5; gate pending |
+| #207 | **Item 1, direct exact-hit resume**: retries 18 ms TTFT (was ~1.2 s full recompute), 15/15 bit-exact; default `MARCONI_EXACT=1` path 500s on qwen4_exp | arms D/E/F/H/I |
+| #208 | two-phase full-cache hit used embedding logits (latent) | compile/clippy |
+
+Issue #209: session_hash collides for shared tool sets (eviction fairness; cross-conversation tail bleed checked, not reachable).
+
+**Findings (deployment gaps):**
+- **Identical retries recompute everything** (declined exact hit + no shallower fallback; misleading "no SSM snapshot" log). #207 fixes aligned exact hits. Fallback-to-shallower branch is pending arm L.
+- **Agentic first turns recompute the shared ~3.5K preamble:** p90 TTFT 3.1 s vs p50 0.64 s. Branch checkpoints exist but are off by default; A/B + gate in queue4.
+- **The container KV pool is 16% smaller than bare metal**, from a 1.6 GB free-memory drop seen only in docker.
+- **Neutral or closed:** PLE pinned-copy sync (27.90 vs 27.91 tok/s); PLE fault wall is cold first touch at the NVMe ceiling; RSS plateaus at ~4.0 GB under BFCL.
+- **CSF resident scales (item 2):** GPU decode byte-identical; ~1.3% decode cost for 3.2 GiB.
+- **Repo-wide CI:** `cargo deny` red since 10-21 (tool/env); the keepalive test is flaky (#191).
+- **Items 3–6** deferred (item 5: no graphs in the recipe profile).
+
 ## Reproduce
 - Bare-metal serve: `~/code/nightq/serve-flashnext.sh fp4local r1short` with `profile-r1short.env` (sparky).
 - Recipe: `sparkrun run fp4l.yaml --solo --hosts localhost --image ghcr.io/atlas-inf/atlas-gb10:sha-504063a`. `fp4l.yaml` is sparkrun-recipes PR #21 at `2cbe348b`.
