@@ -175,3 +175,9 @@
   - Wrote the latent two-phase full-hit fix: `fix/twophase-full-hit-hidden` (3c88c09d7). It restores the snapshot's stashed hidden into `normed` before lm_head in `prefill_full_cache_hit`, and warns if there is none.
   - Compile/test pending (next sparky CPU batch). prefill_c.rs is on the file-size-cap path allowlist.
 - **08:33. Recipe #21 fully vetted: agentic PASS** (50/50, 50/50, 12.489 s/turn vs 12.43 bare metal). This also confirms the 07:25 pkill hit no iteration. Posted on #21 along with the preamble-recompute finding. queue.sh stopped as planned and queue2 started (arm A booting).
+- **09:00. Arm A (base, `MARCONI_EXACT=0`, MTP): 4/15 cold==warm; 0 exact-hit lines.**
+  - Decode probe: 27.71 tok/s median, TTFT median 412 ms.
+  - **Key finding: identical retries are almost never exact hits.** The radix cache matches whole 16-token blocks, so a warm identical prompt matches `floor(len/16)*16` tokens (e.g. 1,296 of 1,305). The leaf snapshot sits at the unaligned end, so there is no snapshot at the match: 27× `Prefix cache hit … no SSM snapshot — recomputing all KV`, i.e. **a full recompute on retry**.
+  - Only the block-aligned prompts (432 and 4,144 tokens) hit fully, and both matched cold. Prompts >4,096 tokens restore from the 4,096-token intermediate checkpoint and replay the rest (12×).
+  - Mismatches are tool/agent cases plus one chat case; known prefix-cache-path variance (FP4-Local doc §3, "optional preamble sentence"; #158/#163 layout).
+  - **Item 1 reframed:** the exact-hit shortcut and direct resume only apply to ~1 in 16 prompt lengths. The retry lever is a checkpoint at or below the last whole block. qwen4_exp's in-pass tail checkpoint (`ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT=1`, 64-row grid) should do that. Arm J (MIDCHUNK + PC_BRANCH) also runs the retry probe, so it measures this too.
