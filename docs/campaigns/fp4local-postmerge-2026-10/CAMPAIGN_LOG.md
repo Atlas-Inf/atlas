@@ -126,3 +126,8 @@
   - Arms E/F: exp binary = main + PLE retained + aux fix, `MARCONI_EXACT=1`, MTP on/off.
   - G vs A/A2: PLE retained decode A/B, using `decode_probe.py` (10 × 512-token answers).
   - Then the fixes gate (BFCL + agentic), then the clean CSF timing.
+- **08:10. Qwen peer review of #205 / #206 received. Triage:**
+  - **Real gap, fixed in #206 (1abf05704):** streaming clients still got `server_error`/500. `send_invalid_request_to_sink` sent the same `StreamEvent::Error`, and `handle_error` always renders 500. #180's client (opencode) streams. Added `StreamEvent::InvalidRequest`, rendered as `invalid_request_error`/400. Only 2 `StreamEvent` consumers exist (chat_stream, completions); responses/messages inherit through chat deltas.
+  - Also fixed: renamed `images` → `grids`, and added a negative test that a stringified error loses its type.
+  - **Rejected with evidence:** TP hang (`validate_state` runs before the command preamble by design); missed entry points (vision state is broadcast only from chunk 0 and prefill_b); #205 double emission (only `openai/encode.rs` reads `refusal`); strict-JSON breakage (grammar-constrained, and there is no server-side `json_object` validation on blocking); "redaction" (streaming never stripped).
+  - Both triages posted as PR comments. Retest on sparky (tmux `retest`, `wt-fixes/retest.log`); the gate binary is rebuilt at the PR head.
