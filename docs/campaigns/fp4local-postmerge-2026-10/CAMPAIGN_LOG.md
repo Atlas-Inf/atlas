@@ -203,3 +203,16 @@
   - (1) Direct resume, so an exact hit never re-runs the last token.
   - (2) Keep the prompt-end snapshot when the finish-leaf supersedes it (one extra slot per session, first to be evicted), so retries and branches can restore at all.
   - Without (2), (1) only fires on the rare retry whose prompt-end snapshot survived.
+- **09:20. CORRECTION: the 08:55 "insert_tail sweep" root cause is WRONG.** The prompt-end snapshot is not deleted. Actual cause, from the code and arm C's trace (a distinct-session chat case with no pool pressure still "lost" it):
+  - `pc_policy.rs::marconi_restorable` declines it: `bypass_exact = snap_tok == matched && matched == total && !marconi_exact()`. That is the default `ATLAS_MARCONI_EXACT` bypass, applied *before* the bypass log line.
+  - The caller then prints the misleading `Prefix cache hit … but no SSM snapshot — recomputing all KV`.
+  - There is **no fallback to a shallower snapshot**. For a 1,312-token prompt the 1,280 intermediate existed; restoring it and replaying 32 tokens would give correct first-token logits with no double advance.
+  - **Unaligned retries** (match = floor(len/16)*16): the deepest snapshot ≤ match is the mid-chunk tail capture (`ssm_tail_midchunk=true`). It carries no aux unless `ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT=1`, and aux-carrying models decline aux-less slots, so it is declined too. Arm J (MIDCHUNK + PC_BRANCH) tests exactly this.
+  - **Fix candidates** for item 1, all small and in `prefix_lookup` / `marconi_restorable`:
+    - (a) When the deepest snapshot is declined (exact bypass, aux-less, session), retry the lookup capped below it and restore the next-shallower snapshot instead of recomputing from 0.
+    - (b) MIDCHUNK_CKPT on by default for qwen4_exp, if J is clean.
+    - (c) Log the decline reason instead of "no SSM snapshot".
+- **09:20. New finding: `session_hash` collides for every tool request.** `compute_session_hash` hashes the first 1,024 prompt tokens, and with tools the chat template puts the tool JSON first. Arm C: **all 70 tool requests share `0x65871a44fdf76528`**; each chat request is distinct.
+  - In multi-user agentic serving, every client with the same tool set (or a system prompt >1,024 tokens) is one "session". Session-aware eviction cannot tell them apart.
+  - The tail-snapshot session gate (whose purpose is to stop cross-conversation tail restores, since "a tail's SSM state bleeds past its advertised token_count") does not separate them. Whether a wrong-state restore is reachable is not checked yet: it needs a tail whose prefix hash matches another conversation's tokens at that count.
+  - A DBG run (debug logs for snapshot lifecycle; 3 cases) is queued in queue3 after QUEUE2 DONE.
