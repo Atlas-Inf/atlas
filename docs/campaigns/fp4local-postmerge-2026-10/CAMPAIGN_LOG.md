@@ -249,3 +249,7 @@
   - sparky: `wt-fallback` = main + fallback + twophase-full-hit fix. fmt/test/clippy/release running (tmux `fbcheck`).
   - **Arm L** (fallback binary, `EXACT=0`, aligned retry probe) is at the head of queue4.
   - Expected: warm sends restore at a shallower snapshot, replay < 64 tokens, warm wall time drops. Match rate vs cold should be ≥ C's 10/15 if the replay numerics hold.
+- **09:28. Arm F (exp aux fix, `EXACT=1`, no MTP): 14/14 exact retries → HTTP 500**, same as E. Independent of MTP.
+  - Fallback branch checks on sparky: spark-runtime snapshot tests 75/75 (new test included), clippy clean, release build OK (762bc4a5).
+  - rustfmt wanted the new test's asserts wrapped; amended locally (unpushed; binary unaffected).
+  - Arm L starts once queue2/queue3 drain.
