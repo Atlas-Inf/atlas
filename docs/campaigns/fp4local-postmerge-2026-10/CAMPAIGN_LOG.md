@@ -280,3 +280,6 @@
   - **#207:** file-size cap failed (`finalize_last.rs` 506 > 500). Fixed in 4529e1a44 by moving the aux re-apply into `exact_direct.rs`; finalize_last back to 499. fmt and clippy clean on sparky. Pushed and commented.
   - **#207 / #206:** `cargo test --workspace` and `cargo llvm-cov --workspace` failed only on the flaky `spark-storage ngram_cache::keepalive::tests::ticks_only_while_active` (keepalive.rs:201; #191 fixes it). #206's job rerun; #207 re-runs on the new push.
   - #205 and #208 have no PR-specific failures.
+- **10:30 heartbeat.** Fixes gate BFCL 29 min in (GPU 90%). Its serve log has only the 5 known startup WARNs and 0 errors so far.
+  - #207 `cargo test --workspace` now SUCCESS on rerun (the flaky keepalive test).
+  - No reviews yet on #204–#208 or recipe #21.
