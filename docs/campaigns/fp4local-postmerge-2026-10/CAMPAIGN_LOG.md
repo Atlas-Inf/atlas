@@ -521,3 +521,19 @@ still a trap: ROWINV alone silently turns the agentic prefix cache into a no-op,
 I stopped queue20's BFCL leg at 21:42 because that profile is already disqualified. queue21
 re-gates the profile with `+ ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT=1` (label `nq-fp4l-multickpt-d2d114c02`).
 Follow-up worth a PR: WARN at boot when ROWINV is on, the prefix cache is on and MIDCHUNK_CKPT is off.
+
+## 2026-10-23 22:56 UTC — queue21 agentic: multi profile + MIDCHUNK_CKPT passes, fastest so far
+
+Profile `ROWINV + MULTI + MULTI_CACHED + CODISPATCH + MIDCHUNK_CKPT` (r1short, prefix cache on), agentic-webserver 50:
+
+| run | webserver_ok | followed | s/turn | turns | TTFT median / p90 | Σ TTFT | decode med tok/s |
+|---|---|---|---|---|---|---|---|
+| default | 50/50 | 50/50 | 12.43 | 379 | 632 / 3010 ms | 428 s | 25.6 |
+| J-profile | 50/50 | 50/50 | 12.12 | 370 | — | — | — |
+| multi, no ckpt (q20) | 50/50 | 50/50 | 13.97 | 354 | 3062 / 3423 ms | 1079 s | 25.5 |
+| **multi + MIDCHUNK_CKPT (q21)** | **50/50** | **50/50** | **11.76** | 357 | **510 / 2252 ms** | **284 s** | 25.4 |
+
+Checkpoint resumes are back: 307 intermediate hits, 49 "no SSM snapshot" (q20: 0 / 384). s/turn is −5.4% vs the
+default and Σ TTFT −34%. At C=1 the agentic soak never issues a multi pass, so this gain comes from ROWINV's
+cheaper short prefill and the in-pass checkpoint. Multi batching only adds to it under bursts (−43% on the
+8-prompt burst, queue19). BFCL ST-995 started 22:56.
