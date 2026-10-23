@@ -347,3 +347,10 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
   - The earlier contended numbers held to within ~5%. Saving: 3.20 GiB.
   - Verdict for item 2: scratch-decode costs 1.3% at one token per step, 4% at an MTP-3 verify. Worth it only when the KV budget binds (longer context or C>1). Fusing the decode into the MoE GEMV is the next step to make it free.
 - queue2 DONE → queue3 (DBG snapshot lifecycle, then B2) → queue4 (L fallback, P/P2 prod probe, J2/K2/J3, J gate).
+- **14:20. CORRECTION from the DBG snapshot-lifecycle run + re-reading arm A: unaligned identical retries DO restore by default.**
+  - DBG: warm 854-token retries (match 848) restored from the `Intermediate SSM checkpoint saved at token 832` (warm prefill ~0.2 s vs ~0.86 s cold). My log extract had dropped the "Marconi intermediate hit" lines because they don't contain "snapshot".
+  - Arm A's "no SSM snapshot" lines are mostly **cold** sends: 15 that matched only the 16/32-token template prefix, and 9 cold tool/agent sends that matched the ~1,184–1,200 tokens of shared tool JSON (the same no-snapshot-at-the-fork gap as the agentic preamble finding).
+  - Arm A's warm unaligned retries: **12 intermediate hits**.
+  - So "retries recompute everything" holds only for **block-aligned** prompts (exact bypass, no fallback; arm C 15/15) and tiny prompts. The fallback fix's scope is aligned prompts (~1/16) plus aux-less snapshots.
+  - PR #207 body and the fallback PR draft corrected.
+  - The real big-ticket item remains the shared-preamble/tool-JSON prefix with no snapshot at the fork (agentic first turns, cold tool requests). That is the J2/K2/J3 + J-gate work in queue4.
