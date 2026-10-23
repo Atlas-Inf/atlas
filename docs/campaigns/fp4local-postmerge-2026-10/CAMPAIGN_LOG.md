@@ -464,3 +464,16 @@ Issue #209: session_hash collides for shared tool sets (eviction fairness; cross
     - new `phase_continue_prefills/decode_share.rs`;
     - a 1-line gate in `phase_continue_prefills.rs`;
     - 3 lines in `scheduler/mod.rs`: decode counter, idle reset, and `head_just_started` extended to the knob.
+
+- **10-23 19:57. queue15/16: ROWINV, PREFILL_MULTI.** MULTI is ignored without `ATLAS_QWEN4EXP_PREFILL_ROWINV=1` (it WARNs at boot; queue15 was a no-op).
+
+  | arm | burst of 8 (batch wall) | burst of 4 | TTFT 58 / 1027 / 4027 tok |
+  |---|---|---|---|
+  | default | 6.1 s | ~3.1 s | 368 / 865 / 2650 ms |
+  | ROWINV | **5.18 s** | 2.66 s | **258 / 795 / 2475 ms** |
+  | ROWINV + MULTI | 5.18 s | 2.65 s | 258 / 798 / 2470 ms |
+  | ROWINV + MULTI + CODISPATCH | 5.13 s | 2.62 s | 271 / 813 / 2477 ms |
+
+  - **ROWINV on its own makes short prefills 30% faster** (−110 ms at 58 tokens; −175 ms at 4K) and the C=8 burst 15% faster. It also makes chunked, batched and restored prefills bitwise-equal (its purpose). It's a candidate default for FP4-Local, pending the BFCL/agentic gates.
+  - **MULTI engages but doesn't amortise.** CODISPATCH gathers the whole burst ("8 prompts, 488 rows, 2273.6 ms"), yet that's 284 ms a prompt, the same as solo ROWINV prefills (258 ms). A single 1027-row prompt takes 795 ms. So the ~260 ms term scales with prompts, not rows.
+  - **This corrects the 19:24 entry.** The floor is not shared weight streaming, or MULTI would have paid it once. It's per-sequence work. queue17 takes an nsys of the multi passes to name it.
