@@ -272,3 +272,7 @@
   - The per-gather `cuStreamSynchronize` the startup WARN flags costs nothing measurable on decode, because the step already syncs for readback.
   - Not PR'd (neutral switches don't merge). `perf/ple-slots-retained` stays local as the record. The WARN is still real but harmless.
 - queue2 now moves to the main + #205 + #206 gate (BFCL ST-995 then agentic), then the clean CSF timing.
+- **10:05. Item 5 scoping (shared scratch across graph shapes).** The recipe-profile serve log (r1short: MTP 3 drafts + EXACT_VERIFY) shows **no CUDA-graph capture lines**. MODEL.toml lists graphs as served, but this profile doesn't exercise them.
+  - The visible scratch in this profile: buffer arena 8,193 tokens × 3.34 GB; one shared MXFP8 BF16 prefill scratch; PLE pinned row cache 2 GB; snapshot pool 16 × 114 MB + decode-rollback 8 × 114 MB.
+  - Item 5's payoff therefore isn't established for FP4-Local. Deferred, per Qwen's P5 ranking. Revisit only if a graph-enabled profile becomes the recipe.
+- 10:00. Fixes gate (main + #205 + #206, binary f3fc512c) booting: BFCL ST-995 (~3 h) then agentic (~1.3 h).
