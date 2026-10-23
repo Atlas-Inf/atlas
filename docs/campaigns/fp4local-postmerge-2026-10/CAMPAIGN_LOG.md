@@ -113,3 +113,16 @@
   - Arms A/C (`MARCONI_EXACT=0`: full hits recompute everything, same layout as cold) are the control and should be 15/15.
   - Arms B/D test the stashed-hidden shortcut itself. MTP drafter state is not rebuilt on a hit (that is #163's fix 7), but `EXACT_VERIFY` should keep output equal anyway; B vs D checks that.
   - Item 1 removes the redundant 1-token forward from the B/D path. It is only worth building if B and D are 15/15.
+- **07:50. Likely root cause of the exact-hit quality loss on qwen4_exp.**
+  - On an exact full-prompt hit (`MARCONI_EXACT=1`) the last prompt token is re-run through every layer.
+  - The `finalize_last` fixup re-restores only the SSM h/conv state (`ssm_snapshots.restore`) and the stashed hidden. It never re-applies the snapshot's **aux** state (PLE n-gram history/conv carry, QSA indexer keys).
+  - The prefix-hit restore does apply aux (`with_aux → apply_aux_states` in prefill_a/prefill_c). The shortcut predates PLE/QSA.
+  - So decode continues from double-advanced PLE/QSA state.
+  - Fix: `fix/exact-hit-restore-aux` (81655d56a) re-applies aux in the fixup.
+  - Remaining unknown: the MTP drafter context carry may also consume the redundant token. That is #163's fix 7.
+- **07:55. PLE prefetch correction.** `PleWarm` (layers/ple/warm.rs) already prefetches the prompt's n-gram rows ahead of the gather. The 120 s fault wall is what is left after that prefetch.
+- **07:20. queue2** (`~/code/q10h/queue2.sh`, tmux `q10h2`) replaces queue.sh legs 3–4. queue.sh stops at "STOP before arm A".
+  - Arms A–D: base binary.
+  - Arms E/F: exp binary = main + PLE retained + aux fix, `MARCONI_EXACT=1`, MTP on/off.
+  - G vs A/A2: PLE retained decode A/B, using `decode_probe.py` (10 × 512-token answers).
+  - Then the fixes gate (BFCL + agentic), then the clean CSF timing.
