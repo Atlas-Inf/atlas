@@ -562,3 +562,7 @@ ATLAS_QWEN4EXP_PREFILL_MULTI_CACHED=1 ATLAS_PREFILL_CODISPATCH=1 ATLAS_QWEN4EXP_
 passes both gates the owner cares about. Agentic is 50/50 at 11.76 s/turn (−5.4%), BFCL is neutral, and a
 burst of 8 short requests takes 3.45 s instead of 6.1 s (−43%). MIDCHUNK_CKPT is mandatory with ROWINV
 (see the 21:45 entry).
+
+## 2026-10-24 — PR #210: WARN for ROWINV without MIDCHUNK_CKPT
+
+Branch `fix/rowinv-needs-midchunk-ckpt` (1d51b6db, from main 504063ad). `pc_policy::rowinv_tail_unsplit` warns once at the tail-split site. fmt, clippy -D warnings and the pc_policy tests (11) pass. Live check (queue22): ROWINV alone → 1 warning, 0 intermediate hits; with MIDCHUNK_CKPT → 0 warnings, 1 hit.
