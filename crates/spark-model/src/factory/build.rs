@@ -760,7 +760,11 @@ pub fn build_model(
         v_aliases_k: glm_cache_plan.is_some(),
         index: sparse_index,
         tail_slots,
-    };
+        // Native proposer bytes (GLM MTP head private KV, #199) are absent
+        // on main — 0 here; QSA per-token bytes come through with_per_token_aux.
+        auxiliary_block_bytes: 0,
+    }
+    .with_per_token_aux(aux_bytes_per_token)?;
     let (blocks, kv_placement) =
         if hss_cache_blocks_per_seq.is_none() && glm_cache_plan.and_then(|p| p.shard()).is_none() {
             kv_carveout::extend(gpu.as_ref(), kv_shape, num_kv_blocks)

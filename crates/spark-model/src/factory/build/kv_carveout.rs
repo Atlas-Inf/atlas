@@ -23,9 +23,22 @@ pub(super) struct KvShape<'a> {
     pub(super) v_aliases_k: bool,
     pub(super) index: Option<SparseIndexCacheConfig>,
     pub(super) tail_slots: Option<TailSlotPlan>,
+    /// Proposer and per-token auxiliary bytes per block; remain in system memory.
+    /// (GLM latent-shard pools are #199 infra, absent on main.)
+    pub(super) auxiliary_block_bytes: usize,
 }
 
 impl KvShape<'_> {
+    /// QSA's pooled index keys grow with the logical pool too, even when
+    /// some K/V buffers are placed in the display heap.
+    pub(super) fn with_per_token_aux(mut self, bytes: usize) -> anyhow::Result<Self> {
+        self.auxiliary_block_bytes = bytes
+            .checked_mul(self.config.block_size)
+            .and_then(|n| n.checked_add(self.auxiliary_block_bytes))
+            .ok_or_else(|| anyhow::anyhow!("KV auxiliary block budget overflow"))?;
+        Ok(self)
+    }
+
     fn buffers(self, blocks: usize) -> Vec<(KvBuffer, usize)> {
         PagedKvCache::buffer_sizes(
             self.config,
@@ -34,6 +47,19 @@ impl KvShape<'_> {
             self.index,
             self.tail_slots,
         )
+    }
+
+    /// System-memory bytes outside the per-layer buffers that depend on
+    /// `blocks`: per-block auxiliary bytes (QSA index keys).
+    fn side_bytes(self, blocks: usize) -> usize {
+        blocks * self.auxiliary_block_bytes
+    }
+
+    /// System-memory bytes of a `blocks` pool with `placement`'s buffers in
+    /// the carveout.
+    fn system_bytes(self, blocks: usize, placement: &KvPlacement) -> usize {
+        let buffers = self.buffers(blocks);
+        total(&buffers) - placement.carved_bytes(&buffers) + self.side_bytes(blocks)
     }
 }
 
