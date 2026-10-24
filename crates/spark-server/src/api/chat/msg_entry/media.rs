@@ -62,7 +62,9 @@ fn qwen_video_rows_ceiling(
     let p_max = spark_model::layers::vision_encoder::derive_max_patches(max_pixels, ps).0;
     let per_frame_pixels = p_max.saturating_mul(ps).saturating_mul(ps);
     let max_frames = video.ffmpeg.max_frames.max(1);
-    let frame_volume = max_frames.saturating_mul(per_frame_pixels);
+    // Preprocessing repeats an odd final frame to fill its temporal group.
+    let padded_frames = max_frames.div_ceil(tp).saturating_mul(tp);
+    let frame_volume = padded_frames.saturating_mul(per_frame_pixels);
     let configured_volume = vcfg
         .video_pixels
         .map(|bounds| bounds.max_pixels)
@@ -277,5 +279,27 @@ mod tests {
             qwen_video_rows_ceiling(&vcfg, Some(16_777_216), &video),
             229_376
         );
+    }
+
+    #[test]
+    fn odd_video_cap_reserves_the_padded_temporal_group() {
+        let mut vcfg = qwen_config();
+        vcfg.video_pixels = Some(PixelBounds {
+            min_pixels: 4_096,
+            max_pixels: 469_762_048,
+        });
+        let reservation = |max_frames| {
+            let ffmpeg = FfmpegPolicy {
+                max_frames,
+                ..Default::default()
+            };
+            let video = VideoDecode {
+                ffmpeg: &ffmpeg,
+                fps: 2.0,
+            };
+            qwen_video_rows_ceiling(&vcfg, Some(16_777_216), &video)
+        };
+        assert_eq!(reservation(1), reservation(2));
+        assert_eq!(reservation(3), reservation(4));
     }
 }
