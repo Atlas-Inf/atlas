@@ -213,6 +213,27 @@ pub(in crate::model) fn tail_split_disabled() -> bool {
     std::env::var("ATLAS_NO_TAIL_SPLIT").as_deref() == Ok("1")
 }
 
+/// `ATLAS_QWEN4EXP_PREFILL_ROWINV=1`: the last chunk runs unsplit, since
+/// a block-grid cut is off the GDN grid. Without the in-pass checkpoint
+/// (`_MIDCHUNK_CKPT`, `in_pass`) no tail checkpoint is saved at all, so
+/// every warm turn recomputes its whole prompt: measured on Flash-Next
+/// FP4-Local agentic-webserver, 0 checkpoints, TTFT p50 632 -> 3062 ms.
+/// Warns once in that case.
+pub(in crate::model) fn rowinv_tail_unsplit(in_pass: bool) -> bool {
+    let rowinv = crate::layers::ops::qwen4exp_rowinv::on();
+    if rowinv && !in_pass {
+        static WARN: std::sync::Once = std::sync::Once::new();
+        WARN.call_once(|| {
+            tracing::warn!(
+                "ATLAS_QWEN4EXP_PREFILL_ROWINV=1 without \
+                 ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT=1 saves no tail SSM checkpoint: \
+                 warm turns will recompute their whole prompt"
+            )
+        });
+    }
+    rowinv
+}
+
 /// The tail-split cut for a `total`-token prompt: one block below the last
 /// block boundary strictly under `total` (`prefill_chunk_dispatch_with`).
 pub(in crate::model) fn tail_cut(total: usize, bs: usize) -> usize {
