@@ -7,10 +7,12 @@ use std::sync::Arc;
 /// One vision item: a still image, or a video, ready for the encoder.
 ///
 /// `groups` holds the TEMPORAL GROUPS. A still image has exactly one; a video
-/// has `frames / temporal_patch_size`, each group a full `grid_h x grid_w`
-/// patch plane built from `temporal_patch_size` consecutive frames. Every
-/// group is shaped identically — which is why the ViT consumes them on the
-/// same path and needs no notion of time.
+/// has one group per `temporal_patch_size` frame window. Qwen pads a final
+/// partial window by repeating its last frame, while GLM drops that window.
+/// Each group is a full `grid_h x grid_w` patch plane built from
+/// `temporal_patch_size` consecutive frames. Every group is shaped
+/// identically — which is why the ViT consumes them on the same path and
+/// needs no notion of time.
 ///
 /// Grouping lives in the TYPE rather than in a parallel `groups_per_item`
 /// vector carried alongside the pixels. Two vectors that must agree is

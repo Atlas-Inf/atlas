@@ -15,8 +15,8 @@ pub struct SeqVision {
     pub items: Vec<crate::VisionItem>,
     /// Per-item `(t_len, grid_h_post_merge, grid_w_post_merge)`. MRoPE
     /// positions from these; `t_len` is TEMPORAL GROUPS (1 for a still), not
-    /// encoder rows — a video feeds `t_len` rows to the ViT but occupies ONE
-    /// contiguous pad run.
+    /// encoder rows — a video feeds `t_len` rows to the ViT and Qwen expands
+    /// them into one timestamp-separated pad plane per group.
     pub grids: Vec<(usize, usize, usize)>,
     /// Per-item content hash, parallel to `grids`. Keys the prefix cache
     /// (`SequenceState::vision_cache_key`).

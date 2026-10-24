@@ -8,7 +8,9 @@ use tokenizers::Tokenizer;
 
 mod glm5_vision;
 mod glm_tool_markup;
+mod load;
 mod qwen3vl_vision;
+mod qwen_vision;
 mod vision_markup;
 
 use super::{

@@ -14,26 +14,20 @@
 /// Matches HF Qwen3-VL's `get_rope_index` / `get_vision_position_ids`:
 ///
 /// - a TEXT token takes `T = H = W = pos` and advances `pos` by one;
-/// - a VISION item of `t_len` temporal groups over a post-merge `gh × gw`
-///   grid occupies `t_len * gh * gw` consecutive pad tokens, where token `k`
-///   of group `g` takes `T = base + g`, `H = base + row`, `W = base + col`,
-///   and afterwards `pos` advances by `max(t_len, gh, gw)`.
+/// - a VISION image occupies one `gh × gw` pad plane;
+/// - a Qwen video item of `t_len` temporal groups is rendered as one
+///   timestamped `gh × gw` pad plane per group, with its boundary/timestamp
+///   tokens walked as ordinary text between planes. Each frame plane therefore
+///   starts a fresh base, matching Qwen3.8's reference `get_rope_index` after
+///   it repeats `video_grid_thw` and sets each temporal extent to one.
 ///
 /// An IMAGE is the `t_len = 1` case and reduces exactly to the image-only
 /// rule that preceded this: `base + g` collapses to `base`, and the advance
 /// to `max(gh, gw)`.
 ///
-/// NOTE: this is the Qwen2-VL shape — one contiguous pad run with T
-/// advancing per group. Qwen3-VL's actual prompt nests per-group
-/// timestamp/start/end inside the video's outer pair and assigns every
-/// group its own t=1 plane — see [`build_qwen3vl`], which the checkpoint's
-/// video processor selects.
-///
-/// Both pad tokens are recognized. They are consumed identically — the item's
-/// own `t_len` already says whether it is a still or a clip — but a video run
-/// whose token went unrecognized would be walked one text token at a time,
-/// handing each of its thousands of pad positions a distinct index and
-/// shifting every token after it.
+/// Both pad tokens are recognized. Video pad planes are consumed one at a time
+/// when the owning item has `t_len > 1`; this handles both the timestamped
+/// Qwen3.8 form and a compact legacy run without changing image arithmetic.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build(
     chunk_tokens: &[u32],
@@ -50,6 +44,7 @@ pub(crate) fn build(
     let is_pad = |tok: u32| tok == image_pad || tok == video_pad;
     let mut pos = start_pos;
     let mut item = grid_base;
+    let mut video_frame = 0usize;
     let mut i = 0usize;
     while i < chunk_tokens.len() {
         if is_pad(chunk_tokens[i]) && item < grid_hi {
@@ -58,24 +53,46 @@ pub(crate) fn build(
             let plane = (gh * gw).max(1);
             let run_len = t_len * plane;
             let base = pos;
-            for k in 0..run_len {
-                // [group, row, col] order — the order the encoder emitted the
-                // groups, and therefore the order the merged rows are spliced.
-                let g = (k / plane) as u32;
-                let within = k % plane;
-                let row = (within / gw.max(1)) as u32;
-                let col = (within % gw.max(1)) as u32;
-                t_out.push(base + g);
-                h_out.push(base + row);
-                w_out.push(base + col);
+            if chunk_tokens[i] == video_pad && t_len > 1 {
+                // Qwen3.8's processor repeats one video_grid_thw row per
+                // temporal group and emits a timestamped vision range for
+                // every row. The timestamp and vision boundaries are ordinary
+                // text positions, so each pad plane starts at the current
+                // base and advances the spatial extent only.
+                for k in 0..plane {
+                    let row = (k / gw.max(1)) as u32;
+                    let col = (k % gw.max(1)) as u32;
+                    t_out.push(base);
+                    h_out.push(base + row);
+                    w_out.push(base + col);
+                }
+                pos += gh.max(gw).max(1) as u32;
+                i += plane;
+                video_frame += 1;
+                if video_frame >= t_len {
+                    video_frame = 0;
+                    item += 1;
+                }
+            } else {
+                for k in 0..run_len {
+                    // [group, row, col] order — the order the encoder emitted
+                    // the groups, and therefore the order the merged rows are
+                    // spliced.
+                    let g = (k / plane) as u32;
+                    let within = k % plane;
+                    let row = (within / gw.max(1)) as u32;
+                    let col = (within % gw.max(1)) as u32;
+                    t_out.push(base + g);
+                    h_out.push(base + row);
+                    w_out.push(base + col);
+                }
+                // The item's extent on EVERY axis, so the next text token
+                // starts clear of all three streams.
+                pos += t_len.max(gh).max(gw) as u32;
+                i += run_len;
+                item += 1;
+                video_frame = 0;
             }
-            // The item's extent on EVERY axis, so the next text token starts
-            // clear of all three streams. A long clip can exceed its own
-            // spatial extent, which is why t_len joins the max rather than
-            // the spatial pair being assumed to dominate.
-            pos += t_len.max(gh).max(gw) as u32;
-            i += run_len;
-            item += 1;
         } else {
             t_out.push(pos);
             h_out.push(pos);

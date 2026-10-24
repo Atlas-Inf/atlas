@@ -11,7 +11,7 @@ use axum::response::Response;
 use std::sync::Arc;
 
 use crate::AppState;
-use crate::tokenizer::Glm5VisionPlaceholder;
+use crate::tokenizer::{Glm5VisionPlaceholder, QwenVisionPlaceholder};
 
 use super::super::compact::{compact_messages, openai_error_response};
 use super::msg_entry::MsgEntry;
@@ -33,6 +33,7 @@ pub(super) fn render_template(
     messages: &[MsgEntry],
     image_pad_counts: &[usize],
     vision_placeholders: &[Glm5VisionPlaceholder],
+    qwen_vision_placeholders: &[QwenVisionPlaceholder],
     enable_thinking: bool,
     thinking_budget: Option<u32>,
     reasoning_effort: Option<crate::ir::ReasoningEffort>,
@@ -154,6 +155,19 @@ pub(super) fn render_template(
                 return Err(openai_error_response(
                     StatusCode::BAD_REQUEST,
                     format!("vision placeholder error: {e}"),
+                ));
+            }
+        }
+    } else if !qwen_vision_placeholders.is_empty() {
+        match state
+            .tokenizer
+            .expand_qwen_vision_placeholders(prompt_tokens, qwen_vision_placeholders)
+        {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                return Err(openai_error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("Qwen vision placeholder error: {e}"),
                 ));
             }
         }

@@ -16,7 +16,7 @@ use atlas_core::config::VisionConfig;
 use crate::ir::{ContentPart, ImageData, MediaKind, Message, Role};
 
 use super::super::compact::openai_error_response;
-use crate::tokenizer::Glm5VisionPlaceholder;
+use crate::tokenizer::{Glm5VisionPlaceholder, QwenVisionPlaceholder};
 
 mod glm5_vision;
 mod media;
@@ -74,6 +74,10 @@ pub(super) struct BuildOut {
     /// the template renderer uses this to expand GLM's image/video marker
     /// triples after Jinja rendering.
     pub(super) vision_placeholders: Vec<Glm5VisionPlaceholder>,
+    /// Qwen3.8-specific placeholder geometry. Empty for GLM/text families;
+    /// the renderer uses this to split each video into timestamped frame
+    /// ranges after Jinja rendering.
+    pub(super) qwen_vision_placeholders: Vec<QwenVisionPlaceholder>,
 }
 
 /// Bytes of data URIs (base64, about 4/3 of the fetched bytes) the remote
@@ -259,6 +263,7 @@ pub(super) fn build_msg_entries_admitted(
     let mut media: Vec<MediaInput> = Vec::new();
     let mut image_pad_counts: Vec<usize> = Vec::new();
     let mut vision_placeholders: Vec<Glm5VisionPlaceholder> = Vec::new();
+    let mut qwen_vision_placeholders: Vec<QwenVisionPlaceholder> = Vec::new();
     let mut consecutive_tool_errors: u32 = 0;
     // BW1 bash-wandering watchdog: tally tool-call productivity across the
     // conversation so a steering nudge can fire if the agent explores/runs
@@ -505,6 +510,7 @@ pub(super) fn build_msg_entries_admitted(
             admission,
             &mut image_pad_counts,
             &mut vision_placeholders,
+            &mut qwen_vision_placeholders,
         )?;
     }
 
@@ -529,6 +535,7 @@ pub(super) fn build_msg_entries_admitted(
         image_pixels,
         image_pad_counts,
         vision_placeholders,
+        qwen_vision_placeholders,
     })
 }
 

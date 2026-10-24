@@ -242,6 +242,35 @@ fn grouping_produces_correctly_shaped_buffers() {
     }
 }
 
+#[test]
+fn qwen_odd_clip_repeats_only_the_final_temporal_slot() {
+    let uri = make_gif(3, 64);
+    let v = preprocess_video(&uri, &cfg(), None, 10.0, &no_ffmpeg()).expect("preprocess");
+    assert_eq!(
+        v.grid_t, 2,
+        "Qwen patchify pads 3 frames to two temporal groups"
+    );
+    assert_eq!(v.groups.len(), 2);
+    let ps = 16usize;
+    let last = &v.groups[1];
+    assert_eq!(
+        last[0],
+        last[ps * ps],
+        "only the final temporal slot is padded"
+    );
+    assert!((v.timestamps[1] - 0.2).abs() < 0.001, "{:?}", v.timestamps);
+}
+
+#[test]
+fn qwen_video_timestamps_average_each_temporal_pair() {
+    let uri = make_gif(4, 64);
+    let v = preprocess_video(&uri, &cfg(), None, 10.0, &no_ffmpeg()).expect("preprocess");
+    assert_eq!(v.grid_t, 2);
+    assert_eq!(v.timestamps.len(), 2);
+    assert!((v.timestamps[0] - 0.05).abs() < 0.001, "{:?}", v.timestamps);
+    assert!((v.timestamps[1] - 0.25).abs() < 0.001, "{:?}", v.timestamps);
+}
+
 /// Token accounting, which is what the prompt-side pad run must match.
 #[test]
 fn pad_count_is_groups_times_the_merged_plane() {
@@ -322,9 +351,11 @@ fn an_mp4_is_refused_by_name_with_a_conversion_hint() {
 #[test]
 fn a_single_frame_gif_is_refused_rather_than_treated_as_a_still() {
     let uri = make_gif(1, 64);
+    let mut glm = cfg();
+    glm.is_glm5_next = true;
     let err = format!(
         "{:#}",
-        preprocess_video(&uri, &cfg(), None, 10.0, &no_ffmpeg()).unwrap_err()
+        preprocess_video(&uri, &glm, None, 10.0, &no_ffmpeg()).unwrap_err()
     );
     assert!(err.contains("temporal group"), "{err}");
 }

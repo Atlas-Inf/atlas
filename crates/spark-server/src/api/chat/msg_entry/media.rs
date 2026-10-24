@@ -25,7 +25,7 @@ use super::super::super::compact::openai_error_response;
 use super::super::vision_admit::Admission;
 use super::{MediaInput, VideoDecode, glm5_vision};
 use crate::ir::MediaKind;
-use crate::tokenizer::Glm5VisionPlaceholder;
+use crate::tokenizer::{Glm5VisionPlaceholder, QwenVisionKind, QwenVisionPlaceholder};
 
 /// An item sized but (for a still) not yet decoded.
 enum Sized {
@@ -44,6 +44,7 @@ pub(super) fn preprocess_media(
     mut admission: Admission<'_>,
     pad_counts: &mut [usize],
     placeholders: &mut Vec<Glm5VisionPlaceholder>,
+    qwen_placeholders: &mut Vec<QwenVisionPlaceholder>,
 ) -> Result<Vec<VisionItem>, Response> {
     let sms = vcfg.spatial_merge_size;
     let image_error =
@@ -97,6 +98,24 @@ pub(super) fn preprocess_media(
                 pad_counts[idx],
                 video_timestamps,
             )?);
+        } else {
+            qwen_placeholders.push(match input.kind {
+                MediaKind::Image => QwenVisionPlaceholder {
+                    kind: QwenVisionKind::Image,
+                    pad_count: pad_counts[idx],
+                    per_frame_pad_count: pad_counts[idx],
+                    timestamps: Vec::new(),
+                },
+                MediaKind::Video => {
+                    let per_frame_pad_count = (item.grid_h / sms) * (item.grid_w / sms);
+                    QwenVisionPlaceholder {
+                        kind: QwenVisionKind::Video,
+                        pad_count: pad_counts[idx],
+                        per_frame_pad_count,
+                        timestamps: video_timestamps,
+                    }
+                }
+            });
         }
         if input.kind == MediaKind::Video {
             // Logged at the media index, not a video ordinal: the index is
