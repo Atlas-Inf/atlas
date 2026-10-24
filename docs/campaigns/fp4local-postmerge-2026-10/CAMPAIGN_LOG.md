@@ -566,3 +566,17 @@ burst of 8 short requests takes 3.45 s instead of 6.1 s (−43%). MIDCHUNK_CKPT 
 ## 2026-10-24 — PR #210: WARN for ROWINV without MIDCHUNK_CKPT
 
 Branch `fix/rowinv-needs-midchunk-ckpt` (1d51b6db, from main 504063ad). `pc_policy::rowinv_tail_unsplit` warns once at the tail-split site. fmt, clippy -D warnings and the pc_policy tests (11) pass. Live check (queue22): ROWINV alone → 1 warning, 0 intermediate hits; with MIDCHUNK_CKPT → 0 warnings, 1 hit.
+
+## 2026-10-24 02:10 UTC — queue23: concurrency with the gated multi+ckpt profile (r2, prod_probe_hol)
+
+| r2 probe | default (P3) | multi+ckpt | multi+ckpt + decode-share k=8 (wt-dshare 16b73e22) |
+|---|---|---|---|
+| 6 shorts behind 20.6K long | 18.2 s | 16.8–16.9 s | **7.3 s (3) / 13.0 s (3)** |
+| long prompt | 18.7 s | 17.4 s | 17.2 s |
+| C=2 shorts | 1.60 s | 1.22 s | 1.22 s |
+| C=4 shorts | 2.95 s | **1.88 s** | 1.88 s |
+| C=8 shorts | 5.65 s | **3.31 s** (−41%) | 3.34 s |
+
+- **The profile alone** cuts concurrent short-request latency 24–41%, because the shorts now share one prefill pass. Head-of-line blocking stays essentially unchanged, since the long prefill's chunks still serialize decodes.
+- **With decode-share added**, the shorts complete in two waves of 3, which is the multi pass grouping arrivals. The long prompt pays nothing (17.2 vs 17.4 s); on the default profile it paid +0.4–1.3 s. Uncontended C=N is unchanged.
+- The two levers stack. decode-share is still a fixed k; a time-based release (hold until about X ms of decode has run since the last chunk) would remove the step-count tuning. That's next on the prototype.
