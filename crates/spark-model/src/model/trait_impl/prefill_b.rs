@@ -142,12 +142,12 @@ impl TransformerModel {
             // That is the OTHER way to satisfy the invariant — always one pass — and
             // it keeps the single-pass numerics, at the cost of the warm-turn tail
             // checkpoint this split exists to create.
+            // ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT: one pass, checkpoint in-pass.
+            let in_pass = self.qwen4exp_ckpt_takes_tail();
             // ATLAS_QWEN4EXP_PREFILL_ROWINV: a block-grid cut is off the GDN
             // grid; without the in-pass checkpoint the last chunk stays whole.
             let split_disabled =
-                pc_policy::tail_split_disabled() || crate::layers::ops::qwen4exp_rowinv::on();
-            // ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT: one pass, checkpoint in-pass.
-            let in_pass = self.qwen4exp_ckpt_takes_tail();
+                pc_policy::tail_split_disabled() || pc_policy::rowinv_tail_unsplit(in_pass);
             if !split_disabled && !in_pass && cut > chunk_start && cut < total {
                 anyhow::ensure!(
                     passengers.is_none(),
