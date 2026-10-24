@@ -52,7 +52,7 @@ fn every_still_image_request_within_the_request_limit_is_servable() {
     // The window is sized so the encoder never decides: any mix of still
     // images under the request limit passes the window check.
     let l = limits(usize::MAX);
-    for n in [1, 2, 4, 5, 7, 16, 64, 1024] {
+    for n in [1, 2, 4, 5, 7, 16, 64, 1024, 3600, MAX_VISION_ITEMS] {
         assert_eq!(
             l.check(&vec![FULL; n], false),
             Ok(()),
@@ -93,7 +93,19 @@ fn items_past_the_protocol_limit_are_rejected() {
     let l = limits(usize::MAX);
     assert_eq!(l.check(&vec![1; MAX_VISION_ITEMS], false), Ok(()));
     let err = l.check(&vec![1; MAX_VISION_ITEMS + 1], false).unwrap_err();
-    assert!(err.contains("1025 images"), "{err}");
+    assert!(
+        err.contains(&format!("{} images", MAX_VISION_ITEMS + 1)),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_hour_of_qwen_groups_fits_the_grid_record_limit() {
+    // 7,200 frames at 2 fps with temporal_patch_size=2 becomes 3,600
+    // one-group VisionItems. The protocol must carry all of their metadata.
+    assert!(MAX_VISION_ITEMS >= 3600);
+    let l = limits(usize::MAX);
+    assert_eq!(l.check(&vec![64; 3600], true), Ok(()));
 }
 
 #[test]

@@ -20,7 +20,7 @@
 //!   rank 0 holds the request's preprocessed pixels (f32, 24 KiB per merged
 //!   row on the Qwen tower) from admission until its prefill ends.
 //! - **items** — the rank-to-rank protocol's item limit, applied on every
-//!   world size (a single rank refuses a 1025-item request too, so a request
+//!   world size (a single rank refuses an over-limit request too, so a request
 //!   does not pass on one deployment and fail on another).
 //!
 //! [`VisionRowLimits::check`] rejects a request that one of them would fail

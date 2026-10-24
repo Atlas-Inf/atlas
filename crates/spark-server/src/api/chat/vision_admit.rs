@@ -8,8 +8,9 @@
 //! header before it is decoded (`vision_preprocess::probe_image`), so a
 //! request over its limits is refused with a 400 the client can act on before
 //! any pixel is allocated; a request within them then takes all of its rows
-//! from the server's in-flight budget (`vision_budget`) in one acquire, and a
-//! spent budget is a 503 with `Retry-After`. The passes are in
+//! from the server's in-flight budget (`vision_budget`) in one acquire (or a
+//! conservative pre-decode reservation for opaque videos), and a spent budget
+//! is a 503 with `Retry-After`. The passes are in
 //! `msg_entry::media`. Every endpoint that takes images goes through
 //! `prepare_chat_prompt` (chat completions, Responses, Anthropic messages),
 //! streaming or not, so this covers them all.
@@ -69,6 +70,11 @@ pub(super) struct Admission<'a> {
     n_items: usize,
     has_video: bool,
     rows: Vec<usize>,
+    /// A conservative Qwen-video reservation held while the decoder runs.
+    /// It is resized to the actual request total in `admit`, so decoding never
+    /// allocates an unaccounted clip and the final acquire cannot race after a
+    /// temporary permit is dropped.
+    preheld: Option<VisionRowPermit>,
 }
 
 /// An admitted request: its permit, shared by every item it attaches to.
@@ -108,7 +114,71 @@ impl<'a> Admission<'a> {
             n_items,
             has_video,
             rows: Vec::with_capacity(n_items.min(MAX_VISION_ITEMS)),
+            preheld: None,
         })
+    }
+
+    /// Hold a conservative reservation before an opaque video is decoded.
+    ///
+    /// Still images can be sized from their headers before their pixels are
+    /// read. A video has no equivalent cheap geometry probe, so Qwen callers
+    /// reserve the configured worst-case row count first. The reservation is
+    /// kept in this admission until `admit` grows or shrinks it to the actual
+    /// total, avoiding both an unbounded decode and a drop/reacquire race.
+    #[allow(clippy::result_large_err)]
+    pub(super) fn reserve_video(&mut self, rows: usize) -> Result<(), Response> {
+        if rows == 0 {
+            return Ok(());
+        }
+        if let Some(limits) = self.ctx.limits
+            && limits.request_rows > 0
+            && rows > limits.request_rows
+        {
+            return Err(too_large(format!(
+                "vision input too large: a video may need {rows} vision tokens, more than the \
+                 {} this server accepts per request; lower the video pixel/frame bound or raise \
+                 the request limit",
+                limits.request_rows
+            )));
+        }
+        let Some(budget) = self.ctx.budget else {
+            return Ok(());
+        };
+        if let Some(permit) = &mut self.preheld {
+            if permit.try_grow(rows) {
+                return Ok(());
+            }
+            return Err(busy(rows));
+        }
+        self.preheld = Some(budget.try_acquire(rows).ok_or_else(|| busy(rows))?);
+        Ok(())
+    }
+
+    /// Reconcile the reservation after one opaque video has been decoded.
+    /// `actual_rows` is the cumulative row count of all decoded videos in the
+    /// request; still images are still header-only at this point. Keeping the
+    /// permit alive while shrinking it prevents a second video from rejecting
+    /// merely because the first video was short.
+    #[allow(clippy::result_large_err)]
+    pub(super) fn reconcile_video(&mut self, actual_rows: usize) -> Result<(), Response> {
+        let Some(budget) = self.ctx.budget else {
+            return Ok(());
+        };
+        if let Some(permit) = &mut self.preheld {
+            if permit.rows() < actual_rows && !permit.try_grow(actual_rows - permit.rows()) {
+                return Err(busy(actual_rows));
+            }
+            permit.shrink_to(actual_rows);
+            return Ok(());
+        }
+        if actual_rows > 0 {
+            self.preheld = Some(
+                budget
+                    .try_acquire(actual_rows)
+                    .ok_or_else(|| busy(actual_rows))?,
+            );
+        }
+        Ok(())
     }
 
     /// The next item carries `rows` (its vision tokens, known for a still
@@ -141,12 +211,24 @@ impl<'a> Admission<'a> {
                 .map_err(too_large)?;
         }
         let total: usize = self.rows.iter().sum();
+        if total == 0 {
+            return Ok(Admitted(None));
+        }
+
+        if let Some(mut permit) = self.preheld {
+            if permit.rows() < total && !permit.try_grow(total - permit.rows()) {
+                return Err(busy(total));
+            }
+            permit.shrink_to(total);
+            return Ok(Admitted(Some(Arc::new(permit))));
+        }
+
         match self.ctx.budget {
-            Some(budget) if total > 0 => budget
+            Some(budget) => budget
                 .try_acquire(total)
                 .map(|p| Admitted(Some(Arc::new(p))))
                 .ok_or_else(|| busy(total)),
-            _ => Ok(Admitted(None)),
+            None => Ok(Admitted(None)),
         }
     }
 }

@@ -26,9 +26,11 @@ pub(crate) const VISION_HEADER_WORDS: usize = 7;
 pub(crate) const VISION_GRID_WORDS: usize = 7;
 
 /// A malformed or accidentally unbounded request must not turn the worker's
-/// scratch broadcast into an arbitrary allocation/collective. Normal prompts
-/// use very few items; this is a protocol limit, not a model capacity claim.
-pub(crate) const VISION_MAX_GRID_ITEMS: usize = 1024;
+/// scratch broadcast into an arbitrary allocation/collective. The limit also
+/// has to admit a Qwen video split into one temporal group per item: the
+/// reference hour profile is 7,200 frames at `temporal_patch_size = 2`, or
+/// 3,600 grid records. This is a protocol limit, not a model capacity claim.
+pub(crate) const VISION_MAX_GRID_ITEMS: usize = 8192;
 const VISION_MAX_GRID_CELLS: usize = 1 << 24;
 const VISION_BF16_BYTES: usize = 2;
 /// A request whose images need more encoder rows than one encode holds

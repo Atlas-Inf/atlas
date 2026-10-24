@@ -39,6 +39,7 @@ fn probe_command(policy: &FfmpegPolicy) -> Command {
 /// otherwise its instantaneous rate — used only to plan coverage, and NOT as a
 /// substitute for a duration that could not be read.
 pub(super) fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<ClipTiming> {
+    let input_file = input::SeekableInput::new(bytes)?;
     let mut child = probe_command(policy)
         .args([
             "-v",
@@ -49,9 +50,9 @@ pub(super) fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<Clip
             "format=duration:stream=avg_frame_rate,r_frame_rate,nb_frames",
             "-of",
             "default=nw=1",
-            "pipe:0",
         ])
-        .stdin(Stdio::piped())
+        .arg(input_file.path())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

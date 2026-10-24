@@ -69,6 +69,81 @@ fn the_worst_chunk_is_checked_once_every_item_is_sized() {
     assert_eq!(a.admit().err().unwrap().status(), StatusCode::BAD_REQUEST);
 }
 
+#[test]
+fn a_video_reservation_is_reconciled_into_the_shared_request_permit() {
+    let l = limits(usize::MAX);
+    let budget = VisionRowBudget::new(1_000);
+    let mut a = Admission::begin(admit(&l, Some(&budget)), 1, true).unwrap();
+
+    // The decoder needs a conservative 800-row reservation, but the actual
+    // clip produces only 250 rows. The same permit is shrunk before it is
+    // attached to the item; no drop/reacquire window exists.
+    a.reserve_video(800).unwrap();
+    assert_eq!(budget.in_use(), 800);
+    a.note(250).unwrap();
+    let admitted = a.admit().unwrap();
+    assert_eq!(budget.in_use(), 250);
+    let item = admitted.attach(VisionItem::image(vec![0.0; 4], 2, 2));
+    drop(admitted);
+    assert_eq!(budget.in_use(), 250);
+    drop(item);
+    assert_eq!(budget.in_use(), 0);
+}
+
+#[test]
+fn sequential_short_videos_release_their_unused_ceiling_before_the_next_decode() {
+    let l = limits(usize::MAX);
+    let budget = VisionRowBudget::new(1_000);
+    let mut a = Admission::begin(admit(&l, Some(&budget)), 2, true).unwrap();
+
+    a.reserve_video(800).unwrap();
+    a.reconcile_video(50).unwrap();
+    assert_eq!(budget.in_use(), 50);
+    a.note(50).unwrap();
+
+    // A second short clip can reserve the same ceiling because the first
+    // clip's unused 750 rows were returned before this decode began.
+    a.reserve_video(800).unwrap();
+    assert_eq!(budget.in_use(), 850);
+    a.reconcile_video(100).unwrap();
+    assert_eq!(budget.in_use(), 100);
+    a.note(50).unwrap();
+    let admitted = a.admit().unwrap();
+    assert_eq!(budget.in_use(), 100);
+    drop(admitted);
+    assert_eq!(budget.in_use(), 0);
+}
+
+#[test]
+fn a_video_reservation_refuses_before_decode_when_budget_is_spent() {
+    let l = limits(usize::MAX);
+    let budget = VisionRowBudget::new(600);
+    let held = budget.try_acquire(300).unwrap();
+    let mut a = Admission::begin(admit(&l, Some(&budget)), 1, true).unwrap();
+    assert_eq!(
+        a.reserve_video(400).unwrap_err().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        budget.in_use(),
+        300,
+        "the failed reservation allocated nothing"
+    );
+    drop(held);
+}
+
+#[test]
+fn a_video_reservation_above_the_request_bound_is_a_bad_request_before_decode() {
+    let l = limits(600);
+    let budget = VisionRowBudget::new(1_000);
+    let mut a = Admission::begin(admit(&l, Some(&budget)), 1, true).unwrap();
+    assert_eq!(
+        a.reserve_video(601).unwrap_err().status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(budget.in_use(), 0);
+}
+
 #[tokio::test]
 async fn the_budget_is_taken_for_the_whole_request_or_not_at_all() {
     // Atomic: a request that does not fit holds nothing, so two large
@@ -121,7 +196,8 @@ fn a_request_that_can_never_fit_is_a_400_even_when_the_budget_is_spent() {
 
 #[tokio::test]
 async fn the_item_count_is_checked_before_any_url_is_fetched() {
-    // 1025 image URLs: refused for their count, before any is resolved
+    // One more than the protocol's image-item limit: refused for their count,
+    // before any URL is resolved
     // (here fetching is off, which would have answered "not fetched").
     let l = limits(usize::MAX);
     let parts: Vec<ContentPart> = (0..=MAX_VISION_ITEMS)
