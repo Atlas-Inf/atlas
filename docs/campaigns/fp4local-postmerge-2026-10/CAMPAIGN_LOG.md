@@ -580,3 +580,26 @@ Branch `fix/rowinv-needs-midchunk-ckpt` (1d51b6db, from main 504063ad). `pc_poli
 - **The profile alone** cuts concurrent short-request latency 24–41%, because the shorts now share one prefill pass. Head-of-line blocking stays essentially unchanged, since the long prefill's chunks still serialize decodes.
 - **With decode-share added**, the shorts complete in two waves of 3, which is the multi pass grouping arrivals. The long prompt pays nothing (17.2 vs 17.4 s); on the default profile it paid +0.4–1.3 s. Uncontended C=N is unchanged.
 - The two levers stack. decode-share is still a fixed k; a time-based release (hold until about X ms of decode has run since the last chunk) would remove the step-count tuning. That's next on the prototype.
+
+## 2026-10-24 02:50 UTC — time-based decode share tried and dropped (queue24–27)
+
+`ATLAS_DECODE_SHARE_PCT=p` held each continued chunk until decoding had had p% of the wall time since the
+last chunk, so the hold would scale with chunk cost instead of a step count. On the gated multi+ckpt profile
+(r2, 6 shorts behind a 20.6K prompt):
+
+| setting | shorts | long |
+|---|---|---|
+| k=8 (step count) | **7.3 s (3) / 13.0 s (3)** | 17.2 s |
+| pct 20 / 33 / 50 (v1) | 16.0 / 13.0 / 12.8 s | 17.1–17.3 s |
+| pct 33 / 50, idle tick timed from its start | 12.8 / 13.6 s | 17.2 / 17.9 s |
+| pct 33 / 50, longest idle tick | 12.8 / 14.1 s | 17.2 / 18.5 s |
+
+The debug trace (queue27) shows why none of these held the first window. In the tick after the long
+prompt's inline first chunk, the release goes to the short prompts' batched prefill (`prefill_multi` runs in
+the continue phase), not to a long chunk. Decode was therefore owed 0.46 s (that pass) instead of 5.2 s
+(the chunk), and the next 5.5 s long chunk went through after about 2 decode steps. From the second window
+on, the hold was right (owed 5547 ms, held until wave 1 finished), but by then wave 1 had already waited one
+chunk. Fixing this needs a timing hook where the first chunk runs (`phase_start_prefills`), and that buys
+nothing over k=8, which already gives decoders about 2 s per chunk on this model. Dropped and reverted on
+`perf/decode-steps-per-chunk` (b0c452fb). The tree is byte-identical to the k-only 16b73e22, and the binary
+is rebuilt from it.
