@@ -537,3 +537,28 @@ Checkpoint resumes are back: 307 intermediate hits, 49 "no SSM snapshot" (q20: 0
 default and Σ TTFT −34%. At C=1 the agentic soak never issues a multi pass, so this gain comes from ROWINV's
 cheaper short prefill and the in-pass checkpoint. Multi batching only adds to it under bursts (−43% on the
 8-prompt burst, queue19). BFCL ST-995 started 22:56.
+
+## 2026-10-24 01:50 UTC — queue21 BFCL ST-995: multi + MIDCHUNK_CKPT within noise
+
+| subset (n) | default | J-profile | multi+ckpt | Δ vs default |
+|---|---|---|---|---|
+| **overall** | 87.44 | 87.64 | **87.34** | −0.10 |
+| **normalized single-turn** | 87.32 | 87.38 | **86.50** | −0.82 |
+| irrelevance (24; 1 item = 4.17) | 95.83 | 95.83 | 91.67 | −1 item |
+| live_irrelevance | 90.91 | 89.77 | 89.77 | −1 item |
+| live_parallel (16; 1 item = 6.25) | 81.25 | 68.75 | 75.00 | −1 item |
+| live_parallel_multiple (12) | 66.67 | 66.67 | 75.00 | +1 item |
+| simple_javascript (31) | 70.97 | 77.42 | 67.74 | −1 item |
+| multiple | 91.13 | 93.55 | 92.74 | +2 items |
+| live / non_live category | 82.94 / 85.65 | 82.94 / 86.39 | 82.94 / 85.85 | 0 / +0.20 |
+
+The normalized drop is a one-item swing in each of a few small subsets. The J-profile, already accepted
+as neutral, swings just as much (live_parallel −2 items). Multi passes: 0, as expected, because r1short
+runs one sequence. ROWINV changes prefill numerics, so the greedy output differs on some prompts, as with
+the J-profile.
+
+**Verdict:** the profile `ATLAS_QWEN4EXP_PREFILL_ROWINV=1 ATLAS_QWEN4EXP_PREFILL_MULTI=1
+ATLAS_QWEN4EXP_PREFILL_MULTI_CACHED=1 ATLAS_PREFILL_CODISPATCH=1 ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT=1`
+passes both gates the owner cares about. Agentic is 50/50 at 11.76 s/turn (−5.4%), BFCL is neutral, and a
+burst of 8 short requests takes 3.45 s instead of 6.1 s (−43%). MIDCHUNK_CKPT is mandatory with ROWINV
+(see the 21:45 entry).
