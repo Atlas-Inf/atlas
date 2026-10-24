@@ -25,10 +25,9 @@
 //!
 //! - **No shell.** Arguments are passed as argv. Nothing is interpolated into
 //!   a command string, so no input can become a flag or a second command.
-//! - **No temp file.** The container goes in over stdin, so there is no path
-//!   to traverse, collide on, or leave behind.
-//! - **`-nostdin`, and stdin is the pipe** — ffmpeg cannot reach for a
-//!   terminal or block waiting on one.
+//! - **Private seekable input.** A uniquely created, owner-only temporary file
+//!   supports tail-index containers and is removed when decoding ends.
+//! - **`-nostdin`** prevents ffmpeg from waiting on a terminal.
 //! - **Frame count** capped with `-frames:v`, so a long clip cannot decode
 //!   forever — but the cap is applied to a plan that SPANS the clip
 //!   ([`crate::video_sample`]) rather than to a fixed-rate walk that would

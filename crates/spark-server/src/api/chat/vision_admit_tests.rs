@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::*;
-use crate::ir::message::{ContentPart, ImageData, ImageSource, Message, Role};
+use crate::ir::{
+    MediaKind,
+    message::{ContentPart, ImageData, ImageSource, Message, Role, VideoSource},
+};
+use crate::tokenizer::QwenVisionKind;
 use spark_model::vision_preprocess::fixtures::{header_only_png, png, qwen_config};
 
 fn limits(request_rows: usize) -> VisionRowLimits {
@@ -26,6 +30,20 @@ fn admit<'a>(l: &'a VisionRowLimits, b: Option<&'a Arc<VisionRowBudget>>) -> Adm
         limits: Some(l),
         budget: b,
     }
+}
+
+/// Four distinct 64x64 GIF frames, each held for 500 ms. At the production
+/// test rate (2 fps) this becomes two Qwen temporal groups, which lets the
+/// tests exercise the group split without depending on ffmpeg.
+fn short_gif() -> String {
+    const GIF_B64: &str = "R0lGODlhQABAAIEAABQo6wAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQAMgAAACwAAAAAQABAAAAIaQABCBxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFixgzatzIsaPHjyBDihxJsqTJkyhTqlzJsqXLlzBjypxJs6bNmzhz6tzJs6fPn0CDCh1KtKjRo0iTKl3KtKnTp1CjSp1KtarVq1izagUQEAAh+QQBMgABACwAAAAAQABAAIE5KMYAAAAAAAAAAAAIaQABCBxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFixgzatzIsaPHjyBDihxJsqTJkyhTqlzJsqXLlzBjypxJs6bNmzhz6tzJs6fPn0CDCh1KtKjRo0iTKl3KtKnTp1CjSp1KtarVq1izagUQEAAh+QQBMgABACwAAAAAQABAAIFeKKEAAAAAAAAAAAAIaQABCBxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFixgzatzIsaPHjyBDihxJsqTJkyhTqlzJs6bNmzhz6tzJs6fPn0CDCh1KtKjRo0iTKl3KtKnTp1CjSp1KtarVq1izagUQEAAh+QQBMgABACwAAAAAQABAAIGDKHwAAAAAAAAAAAAIaQABCBxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFixgzatzIsaPHjyBDihxJsqTJkyhTqlzJs6bNmzhz6tzJs6fPn0CDCh1KtKjRo0iTKl3KtKnTp1CjSp1KtarVq1izagUQEAA7";
+    format!("data:image/gif;base64,{GIF_B64}")
+}
+
+fn video(uri: String) -> ContentPart {
+    ContentPart::Video(VideoSource {
+        data: ImageData::Base64(uri),
+    })
 }
 
 #[tokio::test]
@@ -262,6 +280,85 @@ fn build_parts(
         false,
         ctx,
     )
+}
+
+#[tokio::test]
+async fn legacy_qwen_short_gif_is_admitted_from_actual_rows() {
+    // The legacy profile has no checkpoint video-pixel bound, so admission
+    // must not reject this small clip using the opaque-video worst-case
+    // ceiling.  The 64-row request limit is below that ceiling by orders of
+    // magnitude, but above the clip's actual two temporal groups (8 rows).
+    let out = match build_parts(vec![video(short_gif())], admit(&limits(64), None)) {
+        Ok(out) => out,
+        Err(resp) => panic!("short legacy GIF should be admitted: {}", body(resp).await),
+    };
+
+    assert_eq!(out.image_pixels.len(), 2, "one VisionItem per Qwen group");
+    assert!(out.image_pixels.iter().all(|item| item.t_len() == 1));
+    assert_eq!(out.image_pad_counts, vec![8]);
+    assert_eq!(out.qwen_vision_placeholders.len(), 1);
+    let placeholder = &out.qwen_vision_placeholders[0];
+    assert_eq!(placeholder.kind, QwenVisionKind::Video);
+    assert_eq!(placeholder.pad_count, 8);
+    assert_eq!(placeholder.per_frame_pad_count, 4);
+    assert_eq!(placeholder.timestamps, vec![0.25, 1.25]);
+}
+
+#[tokio::test]
+async fn mixed_image_video_image_keeps_temporal_groups_aligned() {
+    let out = match build_parts(
+        vec![
+            ContentPart::Image(ImageSource {
+                data: ImageData::Base64(png(64, 64)),
+            }),
+            video(short_gif()),
+            ContentPart::Image(ImageSource {
+                data: ImageData::Base64(png(64, 64)),
+            }),
+        ],
+        admit(&limits(64), None),
+    ) {
+        Ok(out) => out,
+        Err(resp) => panic!("mixed media should be admitted: {}", body(resp).await),
+    };
+
+    // The video occupies two encoder items after temporal splitting, while
+    // its one prompt marker remains between the two still-image markers.
+    assert_eq!(out.image_pixels.len(), 4);
+    assert_eq!(
+        out.image_pixels
+            .iter()
+            .map(|item| item.t_len())
+            .collect::<Vec<_>>(),
+        vec![1, 1, 1, 1]
+    );
+    assert_eq!(out.image_pad_counts, vec![4, 8, 4]);
+    assert_eq!(
+        out.messages[0].media,
+        vec![MediaKind::Image, MediaKind::Video, MediaKind::Image]
+    );
+    assert_eq!(
+        out.qwen_vision_placeholders
+            .iter()
+            .map(|placeholder| placeholder.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            QwenVisionKind::Image,
+            QwenVisionKind::Video,
+            QwenVisionKind::Image
+        ]
+    );
+    assert_eq!(
+        out.qwen_vision_placeholders
+            .iter()
+            .map(|placeholder| placeholder.pad_count)
+            .collect::<Vec<_>>(),
+        vec![4, 8, 4]
+    );
+    assert_ne!(
+        out.image_pixels[1].content_hash, out.image_pixels[2].content_hash,
+        "distinct GIF frames must remain distinct after splitting"
+    );
 }
 
 #[tokio::test]

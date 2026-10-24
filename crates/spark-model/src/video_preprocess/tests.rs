@@ -376,3 +376,14 @@ fn invalid_geometry_is_refused_before_dividing_by_it() {
     c.patch_size = 0;
     assert!(preprocess_video(&uri, &c, None, 10.0, &no_ffmpeg()).is_err());
 }
+
+#[test]
+fn gif_respects_explicit_aggregate_decode_budget() {
+    let uri = make_gif(4, 64);
+    let mut policy = no_ffmpeg();
+    policy.max_total_decoded_pixels = Some(4 * 64 * 64);
+    assert!(decode_frames(&uri, 10.0, &policy).is_ok());
+    policy.max_total_decoded_pixels = Some(4 * 64 * 64 - 1);
+    let error = format!("{:#}", decode_frames(&uri, 10.0, &policy).unwrap_err());
+    assert!(error.contains("decoded-image budget"), "{error}");
+}

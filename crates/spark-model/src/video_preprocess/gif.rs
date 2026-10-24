@@ -53,7 +53,8 @@ pub(super) fn decode_gif(
     let budget = policy
         .max_frames
         .max(1)
-        .saturating_mul(policy.max_decoded_pixels.max(1));
+        .saturating_mul(policy.max_decoded_pixels.max(1))
+        .min(policy.max_total_decoded_pixels.unwrap_or(usize::MAX));
     ensure!(
         count.saturating_mul(max_area) <= budget,
         "animated GIF would decode to {} frames of up to {max_area} pixels each, above the \

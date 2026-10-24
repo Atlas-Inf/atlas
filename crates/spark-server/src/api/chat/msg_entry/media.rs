@@ -92,6 +92,9 @@ pub(super) fn preprocess_media(
     qwen_placeholders: &mut Vec<QwenVisionPlaceholder>,
 ) -> Result<Vec<VisionItem>, Response> {
     let sms = vcfg.spatial_merge_size;
+    // Legacy short-video profiles retain their decode gate and final admission.
+    // Only an explicit aggregate bound makes a pre-decode reservation useful.
+    let reserve_decode = !vcfg.is_glm5_next && video.ffmpeg.max_total_decoded_pixels.is_some();
     let image_error =
         |e| openai_error_response(StatusCode::BAD_REQUEST, format!("Image decode error: {e}"));
     let mut sized = Vec::with_capacity(media.len());
@@ -107,7 +110,7 @@ pub(super) fn preprocess_media(
             MediaKind::Video => {
                 // Decoded before admission (no header probe): under the
                 // large-decode gate, so videos cannot add to the decode peak.
-                if !vcfg.is_glm5_next {
+                if reserve_decode {
                     // Reserve only this video's worst case. After it is
                     // decoded, reconcile to its actual rows before moving to
                     // the next clip, so several short clips do not consume
@@ -159,7 +162,9 @@ pub(super) fn preprocess_media(
                         pad_count = pad_count.saturating_add(rows);
                     }
                     actual_video_rows = actual_video_rows.saturating_add(pad_count);
-                    admission.reconcile_video(actual_video_rows)?;
+                    if reserve_decode {
+                        admission.reconcile_video(actual_video_rows)?;
+                    }
                     Sized::Video {
                         items,
                         timestamps,
