@@ -521,6 +521,7 @@ impl TransformerModel {
         // ATLAS_MTP_DRAFTER_PREFILL: capture the processed rows' final-layer
         // hiddens for the whole-prompt drafter prefill. No-op when disabled.
         self.try_mtp_prefill_capture(seq, seq_len_start, proc_count, stream)?;
+        self.note_mtp_prompt_rows(seq, seq_len_start, proc_count, 0);
 
         // ── 5. Final norm on LAST token only ──
         let last_hidden = hidden.offset((proc_count - 1) * h * fp32);

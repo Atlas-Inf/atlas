@@ -515,6 +515,7 @@ impl TransformerModel {
             prefill_hidden,
             stream,
         )?;
+        self.note_mtp_prompt_rows(prefill_seq, effective_seq_len_start, proc_count, padded_n);
 
         // Restore decode layer_states to sequences
         for (seq, ls) in decode_seqs

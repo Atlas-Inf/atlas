@@ -380,7 +380,13 @@ impl Qwen4ExpMtpHead {
         let (h32, n32) = (h as u32, n as u32);
 
         // ── 1-3. Each row's input from the device token row j ──
-        self.stage_rows_input(self.batch_slab.offset(j * n * 4), n, ctx, stream)?;
+        self.stage_rows_input(
+            &self.own_scratch(),
+            self.batch_slab.offset(j * n * 4),
+            n,
+            ctx,
+            stream,
+        )?;
 
         // ── 4. Body: the layer's multi-sequence decode, one row a sequence ──
         let body_ctx = self.body_ctx(ctx, slab_meta(self.batch_slab, j, n, max_blocks));
