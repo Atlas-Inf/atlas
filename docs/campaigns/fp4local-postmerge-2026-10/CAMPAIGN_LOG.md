@@ -801,3 +801,18 @@ across columns, independent accumulator chains, each column's k-order unchanged)
 full-hit path probably still wasn't reached. Log analysis pending; no further attempt queued.
 
 **Job 22** (recipe #21 J profile via sparkrun on ghcr sha-da7985c) running since 15:35.
+
+## 2026-10-27 16:27 UTC — recipe vet (job 22) stopped as invalid; re-queued as job 26
+
+Job 22 served the WRONG env and its agentic leg never ran:
+- The job called `make_recipe.py <yaml> <img>`, but that script's signature is `<out.yaml> <tag>`. It rendered its own
+  7-var template over `~/code/q10h/recipe21-fp4l.yaml`, and the container served 7 ATLAS_ vars, not the J profile's 9
+  (`RECIPE ENV COUNT: 7`).
+- The agentic bench ran without `~/.cargo/env`: `elapsed_s` 1, no metrics. The job went on to BFCL anyway.
+
+I killed it by process group at 16:27 (runner: FAILED rc=143), ran `sparkrun stop --all`, and memory was back to 116 GB.
+The YAML on sparky is restored from sparkrun-recipes 66b5fb0 (9 vars) and set read-only. The re-queued vet (job 26,
+output `nq-recipe21-vet2`) copies the YAML verbatim, asserts the container env equals the YAML's 9 keys before any
+benchmark, and aborts if agentic yields no metrics. The smoke from the invalid run (tool call OK, needle) is not
+counted. The invalid run's artifacts stay in `~/code/perf/nq-recipe21-vet/` as a record.
+#208: live-repro notes posted on the PR; no further GPU time.
