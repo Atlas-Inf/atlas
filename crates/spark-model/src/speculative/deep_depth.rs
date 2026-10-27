@@ -55,6 +55,26 @@ pub fn deep_floor(num_drafts: usize) -> usize {
     f.clamp(1, num_drafts.max(1))
 }
 
+/// Verifies per ceiling decision of the per-request controller
+/// (`ATLAS_MTP_DEEP_WINDOW`, default 48, clamped to 4..=1024); a decision
+/// needs a quarter of them to have drafted the deepest position.
+pub fn decision_window() -> u16 {
+    static N: OnceLock<u16> = OnceLock::new();
+    *N.get_or_init(|| {
+        env_usize("ATLAS_MTP_DEEP_WINDOW")
+            .unwrap_or(48)
+            .clamp(4, 1024) as u16
+    })
+}
+
+/// The ceiling a request starts at (`ATLAS_MTP_DEEP_START`; unset = the
+/// floor, so deep rows are earned), clamped into the floor..=max range by
+/// the controller.
+pub fn deep_start() -> Option<usize> {
+    static N: OnceLock<Option<usize>> = OnceLock::new();
+    *N.get_or_init(|| env_usize("ATLAS_MTP_DEEP_START"))
+}
+
 /// Average verify rows a sequence may spend in a batch
 /// (`ATLAS_MTP_DEEP_ROWS_PER_SEQ`, default 5, at least 2).
 pub fn rows_per_seq() -> usize {

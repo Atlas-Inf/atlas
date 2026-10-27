@@ -20,8 +20,8 @@
 //! under a confidence stop a deep ceiling costs drafter and verify rows only
 //! on confident runs, so the controller steers what it costs when it binds.
 //!
-//! Every [`WINDOW`] verifies at one ceiling, with at least [`MIN_DRAFTED`]
-//! observations of position `d`:
+//! Every [`WINDOW`] verifies at one ceiling (`ATLAS_MTP_DEEP_WINDOW`), with
+//! at least [`MIN_DRAFTED`] (a quarter) observations of position `d`:
 //!
 //! | a_d | step |
 //! |---|---|
@@ -31,7 +31,8 @@
 //! | < 0.25 | -1 |
 //!
 //! (the thresholds of the RecoverSSM/vLLM K=3..7 recipe). A request starts at
-//! the floor, so the first deep rows are earned, not assumed. Fewer than
+//! the floor, so the first deep rows are earned, not assumed
+//! (`ATLAS_MTP_DEEP_START` moves the start). Fewer than
 //! [`MIN_DRAFTED`] observations hold the ceiling: the confidence stop rarely
 //! reaches it, so it rarely costs anything.
 
@@ -92,7 +93,9 @@ impl DeepDepth {
     pub fn drafts(&self, floor: usize, max: usize) -> usize {
         let floor = floor.clamp(1, max.max(1));
         if self.depth == 0 {
-            floor
+            // `ATLAS_MTP_DEEP_START`: begin elsewhere than the floor.
+            spark_model::speculative::deep_depth::deep_start()
+                .map_or(floor, |s| s.clamp(floor, max.max(1)))
         } else {
             (self.depth as usize).clamp(floor, max.max(1))
         }
@@ -107,11 +110,18 @@ impl DeepDepth {
             self.drafted += 1;
             self.hits += u16::from(accepted >= cur);
         }
-        if self.steps < WINDOW {
+        // `ATLAS_MTP_DEEP_WINDOW` (default `WINDOW`, `MIN_DRAFTED` a quarter).
+        let window = spark_model::speculative::deep_depth::decision_window();
+        if self.steps < window {
             return;
         }
         let a = self.hits as f32 / self.drafted.max(1) as f32;
-        let next = if self.drafted < MIN_DRAFTED {
+        let min_drafted = if window == WINDOW {
+            MIN_DRAFTED
+        } else {
+            window / 4
+        };
+        let next = if self.drafted < min_drafted {
             cur
         } else {
             let lo = floor.clamp(1, max.max(1)) as isize;
