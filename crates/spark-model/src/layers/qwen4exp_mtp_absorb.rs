@@ -201,7 +201,8 @@ impl Qwen4ExpMtpHead {
         Ok(())
     }
 
-    /// Write every planned row, at most `PROPOSE_BATCH_MAX` per pass.
+    /// Write every planned row, at most `PROPOSE_BATCH_MAX` per pass. The
+    /// propose's input rows come back whatever happens.
     fn absorb_rows(
         &self,
         sts: &mut [&mut Qwen4ExpMtpProposerState],
@@ -210,9 +211,8 @@ impl Qwen4ExpMtpHead {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let max = qwen4exp_mtp_batch::PROPOSE_BATCH_MAX;
         anyhow::ensure!(
-            keep <= max
+            keep <= qwen4exp_mtp_batch::PROPOSE_BATCH_MAX
                 && self.dense_gemv_batchm_k.0 != 0
                 && self.batched_embed_k.0 != 0
                 && !self.absorb.save.is_null(),
@@ -220,7 +220,6 @@ impl Qwen4ExpMtpHead {
         );
         let (gpu, rb) = (ctx.gpu, self.absorb.row_bytes);
         let streams = ctx.buffers.hc_streams();
-        gpu.copy_d2d_async(streams, self.absorb.save, keep * rb, stream)?;
         let mut rows = Vec::new();
         for (i, (st, p)) in sts.iter_mut().zip(plans).enumerate() {
             if let Some((first, _, na)) = *p {
@@ -229,9 +228,39 @@ impl Qwen4ExpMtpHead {
                 rows.extend((0..na).map(|j| (i, j)));
             }
         }
+        gpu.copy_d2d_async(streams, self.absorb.save, keep * rb, stream)?;
+        let done = self.absorb_passes(sts, plans, &rows, ctx, stream);
+        gpu.copy_d2d_async(self.absorb.save, streams, keep * rb, stream)?;
+        done?;
+        for (st, p) in sts.iter_mut().zip(plans) {
+            if let Some((first, _, na)) = *p {
+                st.seq_len = first + na;
+            }
+        }
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(
+                "qwen4_exp MTP absorb active: {} verified rows rewritten from the target",
+                rows.len()
+            );
+        }
+        Ok(())
+    }
+
+    /// The passes of [`Self::absorb_rows`]: `rows` = (state, staged row).
+    fn absorb_passes(
+        &self,
+        sts: &mut [&mut Qwen4ExpMtpProposerState],
+        plans: &[Option<(usize, usize, usize)>],
+        rows: &[(usize, usize)],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let (gpu, rb) = (ctx.gpu, self.absorb.row_bytes);
+        let streams = ctx.buffers.hc_streams();
         let mut kv = self.kv_cache.lock();
         let bs = kv.block_size();
-        for chunk in rows.chunks(max) {
+        for chunk in rows.chunks(qwen4exp_mtp_batch::PROPOSE_BATCH_MAX) {
             let n = chunk.len();
             let (mut tokens, mut pos, mut kv_rows, mut tables) =
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -274,20 +303,7 @@ impl Qwen4ExpMtpHead {
                 "qwen4_exp MTP absorb: the body has no KV-only decode"
             );
         }
-        drop(kv);
-        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            tracing::info!(
-                "qwen4_exp MTP absorb active: {} verified rows rewritten from the target",
-                rows.len()
-            );
-        }
-        for (st, p) in sts.iter_mut().zip(plans) {
-            if let Some((first, _, na)) = *p {
-                st.seq_len = first + na;
-            }
-        }
-        gpu.copy_d2d_async(self.absorb.save, streams, keep * rb, stream)
+        Ok(())
     }
 }
 
