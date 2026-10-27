@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//!
-//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
@@ -329,6 +327,7 @@ impl TransformerLayer for Qwen3AttentionLayer {
             hidden_stacked,
             residual_stacked,
             num_tokens,
+            // Ported from Enntity/atlas 166e2b1 / 030ec26 (AGPL-3.0-only).
             &mut EmptyLayerState,
             kv_cache,
             seq_len_start,

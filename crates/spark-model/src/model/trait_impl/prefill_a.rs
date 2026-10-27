@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//!
-//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! Prefill phase A — non-chunked single-pass path.
 //!
@@ -523,6 +521,7 @@ impl TransformerModel {
         // ATLAS_MTP_DRAFTER_PREFILL: capture the processed rows' final-layer
         // hiddens for the whole-prompt drafter prefill. No-op when disabled.
         self.try_mtp_prefill_capture(seq, seq_len_start, proc_count, stream)?;
+        // Ported from Enntity/atlas e7d4e1a (AGPL-3.0-only).
         self.note_mtp_prompt_rows(seq, seq_len_start, proc_count, 0);
 
         // ── 5. Final norm on LAST token only ──

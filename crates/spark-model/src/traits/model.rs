@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//!
-//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! `Model` trait — the interface the scheduler talks to.
 //!
@@ -1021,6 +1019,7 @@ pub trait Model: Send + Sync {
     /// drafts they accepted, so the drafter can rebuild those positions from
     /// the target (`DraftProposer::stage_absorb`). Call after the verify and
     /// before anything reuses its buffers. Default: no-op.
+    // Ported from Enntity/atlas 166e2b1 (AGPL-3.0-only).
     fn stage_mtp_absorb(
         &self,
         _seq: &mut SequenceState,

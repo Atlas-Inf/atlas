@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! K=3 verify step.
 
@@ -340,6 +339,7 @@ pub fn step_verify_k3(
         // Same row, the other input shape: a drafter reading the PRE-mixer
         // stream highway needs row 2 staged into row 0, or it proposes from
         // the first verify row instead of the accepted one.
+        // Ported from Enntity/atlas 166e2b1 (AGPL-3.0-only).
         super::verify_k4_verdict::stage_absorb(model, a, 0, &drafts[..2]);
         if let Err(e) = model.select_mtp_stream_row(2) {
             tracing::error!("select_mtp_stream_row(2): {e:#}");

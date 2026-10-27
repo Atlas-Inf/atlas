@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//!
-//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! What the qwen4_exp drafter keeps of its own KV after a verdict
 //! (`ATLAS_QWEN4EXP_MTP_KV_KEEP=1`, default off: an acceptance A/B switch).
@@ -27,6 +25,7 @@
 //! positions the sequence then fills with other tokens.
 
 use super::Qwen4ExpMtpProposerState;
+// Ported from Enntity/atlas 166e2b1 (AGPL-3.0-only).
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype};
 
 /// `ATLAS_QWEN4EXP_MTP_KV_KEEP=1`, read once. The absorb

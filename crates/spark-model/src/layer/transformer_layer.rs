@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//!
-//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! `TransformerLayer` trait — composable per-layer forward/decode hooks.
 
@@ -897,6 +895,8 @@ pub trait TransformerLayer: Send + Sync {
     /// depends on its own input row only, which is what the qwen4_exp MTP
     /// absorb (`ATLAS_QWEN4EXP_MTP_ABSORB`) relies on. `Ok(false)` =
     /// unsupported.
+    ///
+    /// Ported from Enntity/atlas 166e2b1 / 030ec26 (AGPL-3.0-only).
     fn decode_rows_kv_only(
         &self,
         _rows: KvRows<'_>,

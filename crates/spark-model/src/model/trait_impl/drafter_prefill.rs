@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//!
-//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! Whole-prompt drafter context: the capture write and its EAGER consume.
 //!
@@ -224,6 +222,7 @@ impl TransformerModel {
         if seq.proposer_state.is_none() {
             return Ok(());
         }
+        // Ported from Enntity/atlas e7d4e1a, 23350fb (AGPL-3.0-only).
         let ctx = self.drafter_ctx();
         self.ensure_drafter_context(proposer.as_ref(), seq, &ctx, stream)?;
         if crate::speculative::mtp_accept_debug() {
