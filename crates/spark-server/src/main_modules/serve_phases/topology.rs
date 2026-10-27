@@ -333,13 +333,15 @@ pub(crate) fn init_nccl_comm(
     crate::ep_peer_lifeline::watch(&backend).context("Failed to arm the EP peer lifeline")?;
     // Before any other collective: a rank running another value of one of
     // these would deadlock or mispair the ranks at a prompt-dependent step.
-    let settings = rank_settings(
+    let mut settings = rank_settings(
         args,
         config.expert_tp,
         prefill_budget,
         max_batch_tokens,
         config.vision.as_ref().and_then(|v| v.max_pixels),
-    );
+    )
+    .to_vec();
+    settings.extend(atlas_core::qwen_yarn::rank_settings(config));
     spark_model::model::startup_parity::agree(&backend, gpu, &settings)
         .context("Startup settings agreement")?;
     Ok(Some(

@@ -160,6 +160,11 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 32768)]
     pub max_seq_len: usize,
 
+    /// Opt-in static YaRN extension for Qwen3.8-Flash-Next (2 or 4).
+    /// Does not change checkpoint files or reserve KV for every scheduler slot.
+    #[arg(long)]
+    pub qwen_yarn_factor: Option<u8>,
+
     /// KV cache block size (tokens per block).
     #[arg(long, default_value_t = 16)]
     pub block_size: usize,

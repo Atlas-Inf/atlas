@@ -111,7 +111,7 @@ pub(crate) fn parse_qwen4_exp(raw: &Value) -> Result<ModelConfig> {
         config.eos_token_id = primary.unwrap_or(0) as u32;
     }
 
-    parse_rope(text, &mut config);
+    parse_rope(text, &mut config)?;
     parse_hyper_connections(text, &mut config)?;
     parse_indexer(text, &mut config)?;
     parse_ngram_ple(text, &mut config)?;
@@ -172,9 +172,9 @@ pub(crate) fn parse_qwen4_exp(raw: &Value) -> Result<ModelConfig> {
 
 /// mRoPE + partial rotary live under `rope_parameters`, not at text_config
 /// top level, so serde's derive does not reach them.
-fn parse_rope(text: &Value, config: &mut ModelConfig) {
+fn parse_rope(text: &Value, config: &mut ModelConfig) -> Result<()> {
     let Some(rp) = text.get("rope_parameters") else {
-        return;
+        return Ok(());
     };
     if let Some(theta) = rp.get("rope_theta").and_then(Value::as_f64) {
         config.rope_theta = theta;
@@ -191,6 +191,7 @@ fn parse_rope(text: &Value, config: &mut ModelConfig) {
             config.mrope_section[i] = v.as_u64().unwrap_or(0) as usize;
         }
     }
+    crate::qwen_yarn::parse_parameters(rp, config)
 }
 
 /// `hc_count` / `hc_lowrank` -> `hc_mult` / `hc_lowrank`.

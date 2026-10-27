@@ -90,6 +90,8 @@ pub mod model_stats;
 pub(crate) mod moe_gate_up_repack;
 #[path = "ops/strix_f16.rs"]
 mod strix_f16;
+#[path = "ops/yarn_mrope.rs"]
+mod yarn_mrope;
 pub use model_stats::ModelStats;
 
 #[path = "ops/exl3_ops.rs"]
@@ -228,6 +230,8 @@ mod qsa;
 mod qsa_prefill_attn;
 #[path = "ops/qsa_rows.rs"]
 mod qsa_rows;
+#[path = "ops/qsa_yarn.rs"]
+mod qsa_yarn;
 #[path = "ops/quant_dispatch.rs"]
 mod quant_dispatch;
 pub mod qwen4exp;
@@ -382,6 +386,7 @@ pub use q4k_mmq::*;
 pub use qsa::*;
 pub use qsa_prefill_attn::*;
 pub use qsa_rows::*;
+pub use qsa_yarn::*;
 pub use quant_dispatch::*;
 pub use qwen4exp_moe::*;
 pub use qwen4exp_moe_rows::*;
@@ -402,3 +407,4 @@ pub use ssm_ssd::*;
 pub use strix_f16::*;
 pub use strix_s64::*;
 pub use wide_prefill::*;
+pub use yarn_mrope::*;

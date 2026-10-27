@@ -494,3 +494,5 @@ fn qwen4exp_oracle_hc_matches_the_cpu_reference() {
 mod ple;
 #[path = "qwen4exp_oracle_qsa_tests.rs"]
 mod qsa;
+#[path = "qwen4exp_yarn_gpu_tests.rs"]
+mod yarn;

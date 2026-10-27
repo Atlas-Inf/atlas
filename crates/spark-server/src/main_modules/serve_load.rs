@@ -121,6 +121,16 @@ pub(crate) fn load_model(
     // 1. Load model config (supports HF config.json and Mistral params.json)
     spark_runtime::progress::phase(2, "config");
     let (mut config, config_json) = serve_phases::load_model_config(&model_dir)?;
+    atlas_core::qwen_yarn::configure_context(&mut config, args.qwen_yarn_factor, args.max_seq_len)?;
+    if config.model_type == "qwen4_exp" && config.yarn_factor > 0.0 {
+        tracing::info!(
+            factor = config.yarn_factor,
+            original_context = config.yarn_original_max_position_embeddings,
+            context = args.max_seq_len,
+            attention_factor = config.yarn_attention_factor,
+            "Qwen static YaRN enabled; extended-context quality requires qualification"
+        );
+    }
 
     // CLI `--lm-head-dtype` override (replaces ATLAS_LMHEAD_BF16). Validate eagerly (PCND).
     // Sets both `lm_head_bf16_override` (skip/keep-quantized signal consumed by

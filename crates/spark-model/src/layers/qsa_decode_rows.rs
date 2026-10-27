@@ -242,7 +242,7 @@ impl QsaIndexer {
             s.scores = gpu.alloc(QSA_ROWS_MAX * cap * 4)?;
             s.blocks_cap = cap;
         }
-        ops::qsa_qprep_rows(
+        ops::qsa_qprep_rows_scaled(
             gpu,
             self.k_qprep_rows_k,
             self.qk_scratch,
@@ -256,6 +256,8 @@ impl QsaIndexer {
             self.rot,
             self.theta,
             self.eps,
+            self.yarn_inv_freq,
+            self.yarn_attention_factor,
             stream,
         )?;
         ops::qsa_score_rows_dec(
