@@ -603,3 +603,40 @@ chunk. Fixing this needs a timing hook where the first chunk runs (`phase_start_
 nothing over k=8, which already gives decoders about 2 s per chunk on this model. Dropped and reverted on
 `perf/decode-steps-per-chunk` (b0c452fb). The tree is byte-identical to the k-only 16b73e22, and the binary
 is rebuilt from it.
+
+## 2026-10-24 06:57 UTC — queue28 gate (collected 10-27): decode-share k=8 on the multi+ckpt profile passes
+
+The session that launched queue28 ended at 04:02 UTC (API error) before the result arrived. Recovered from sparky
+`~/code/q10h/queue28.log` on 10-27. Binary `~/code/wt-dshare` b0c452fb (d2d114c02 + `ATLAS_DECODE_STEPS_PER_CHUNK`),
+r1short, PLE cache 2 GB, prefix cache on, NQENV = multi+ckpt profile + `ATLAS_DECODE_STEPS_PER_CHUNK=8`.
+
+| run | agentic 50 | s/turn | turns | intermediate hits / no-snapshot | BFCL ST-995 | run ids |
+|---|---|---|---|---|---|---|
+| default (main + HIP fix) | 50/50, 50/50 | 12.43 | 379 | 299 / — | 87.44 / 87.32 | run-1792654228906033074, run-1792664799374893012 |
+| multi+ckpt (q21) | 50/50, 50/50 | 11.76 | 357 | 307 / 49 | 87.34 / 86.50 | run-1792796159549090251, run-1792806584366445361 |
+| **multi+ckpt + dshare k=8 (q28)** | **50/50, 50/50** | **11.74** | 350 | 300 / 49 | **87.34 / 86.50** | run-1792814374289258605, run-1792825067944442327 |
+
+r1short serves one sequence, so decode-share should be inert here (it only holds a chunk while other sequences
+decode). q28 matches q21 on BFCL exactly and on agentic within one sample. This is the no-regression gate, not a
+speed claim. Multi passes: 0 (expected at one sequence). Open: q21/q28 normalized 86.50 sits below the committed
+FP4-Local bfcl-subset floor 86.92. The previous session called it a one-item swing per small subset. That is not yet
+established with repeats; it matters if recipe #21 adopts this profile.
+
+## 2026-10-27 — overnight plan (owner-approved), resumed after a 3-day gap
+
+Owner decisions (10-27 ~06:00 UTC):
+- **Merge train.** Verified PRs merge as ONE integration train once it passes the gate: `integ/train-2026-10-27` =
+  main 504063ad4 + #191 #192 #204 #196 #205 #206 #207 #208 #210 (each `--no-ff`). Gate on sparky: control 4/4 vs
+  main, then agentic 50 + BFCL ST-995 on the default recipe profile. Pass = 50/50 + 50/50, s/turn in line with
+  main's 12.34–12.49, BFCL ≥ the committed floors 87.04 / 86.92, no panics.
+- **Recipe #21.** Gate the best single-GB10 profile (multi+ckpt + `ATLAS_QWEN4EXP_PC_BRANCH=1`) on the train binary.
+  If it passes, update #21's env, pin its container to a ghcr sha that contains #195 + the train, and fix the `\"`
+  quoting. The owner merges #21.
+- **Night focus after the gates:** S7 MoE verify-row dedup (decode speed) on the GPU, with the repo-wide cargo-deny
+  red investigated CPU-side in parallel.
+- New PR: decode-share (`ATLAS_DECODE_STEPS_PER_CHUNK`), with a knob-off identity control and an n=3 HOL A/B.
+
+Box-side engine: the nightq runner on sparky (`~/code/nightq/queue/*.sh`, one job at a time, per-job TIMEOUT, cron
+health check every 5 min with stall kill), re-armed 10-27. Queue: 10-train-gate → 20-dshare-hol → 30-combo-gate →
+90/91 agentic repeats (run-to-run variance for the s/turn comparisons above). Mac mirror:
+`~/code/fp4local-night/` (STATUS.md, RESULTS.md, perf/) every 15 min.
