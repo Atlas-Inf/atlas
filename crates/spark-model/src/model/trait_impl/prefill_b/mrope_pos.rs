@@ -23,6 +23,12 @@
 /// rule that preceded this: `base + g` collapses to `base`, and the advance
 /// to `max(gh, gw)`.
 ///
+/// NOTE: this is the Qwen2-VL shape — one contiguous pad run with T
+/// advancing per group. Qwen3-VL's actual prompt nests per-group
+/// timestamp/start/end inside the video's outer pair and assigns every
+/// group its own t=1 plane — see [`build_qwen3vl`], which the checkpoint's
+/// video processor selects.
+///
 /// Both pad tokens are recognized. They are consumed identically — the item's
 /// own `t_len` already says whether it is a still or a clip — but a video run
 /// whose token went unrecognized would be walked one text token at a time,
@@ -77,6 +83,71 @@ pub(crate) fn build(
             pos += 1;
             i += 1;
         }
+    }
+}
+
+/// Qwen3-VL position walk for the checkpoint's expanded prompt form. HF's
+/// `get_rope_index` splits `video_grid_thw` into one `t=1` plane per
+/// temporal group (`repeat_interleave` + `[:,0]=1`), so every contiguous
+/// pad run is a single `gh × gw` plane whose T is the plane base, and the
+/// timestamp/start/end tokens between planes are ordinary 1-D text
+/// positions. Images are the `t_len = 1` case.
+///
+/// Consumes `grids` item-by-item in media order: an image takes ONE plane
+/// (its `t_len` is 1), a video takes `t_len` planes — one per group — then
+/// advances to the next item. Boundary markers and timestamp text are plain
+/// text positions, matching the processor's nested expansion.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_qwen3vl(
+    chunk_tokens: &[u32],
+    grids: &[(usize, usize, usize)],
+    grid_base: usize,
+    grid_hi: usize,
+    start_pos: u32,
+    image_pad: u32,
+    video_pad: u32,
+    t_out: &mut Vec<u32>,
+    h_out: &mut Vec<u32>,
+    w_out: &mut Vec<u32>,
+) {
+    let is_pad = |tok: u32| tok == image_pad || tok == video_pad;
+    let mut pos = start_pos;
+    let mut item = grid_base;
+    let mut group = 0usize;
+    let mut i = 0usize;
+    while i < chunk_tokens.len() {
+        if is_pad(chunk_tokens[i]) && item < grid_hi {
+            let (t_len, gh, gw) = grids[item];
+            let plane = (gh * gw).max(1);
+            let contiguous = i + plane <= chunk_tokens.len()
+                && chunk_tokens[i..i + plane].iter().copied().all(is_pad);
+            if group < t_len.max(1) && contiguous {
+                // One t=1 plane: T stays at the base for the whole group,
+                // H/W carry the grid. Pos advances by the spatial extent so
+                // the next group's timestamp starts clear of it — HF's
+                // `pos += max(gh, gw) // spatial_merge_size`, with gh/gw
+                // already post-merge here.
+                let base = pos;
+                for k in 0..plane {
+                    t_out.push(base);
+                    h_out.push(base + (k / gw.max(1)) as u32);
+                    w_out.push(base + (k % gw.max(1)) as u32);
+                }
+                pos += gh.max(gw).max(1) as u32;
+                group += 1;
+                if group >= t_len.max(1) {
+                    item += 1;
+                    group = 0;
+                }
+                i += plane;
+                continue;
+            }
+        }
+        t_out.push(pos);
+        h_out.push(pos);
+        w_out.push(pos);
+        pos += 1;
+        i += 1;
     }
 }
 

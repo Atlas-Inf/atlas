@@ -135,13 +135,18 @@ impl TransformerModel {
                 let is_pad = |tok: u32| tok == pad_id || tok == video_pad_id;
                 let chunk_tokens = &tokens[chunk_start..chunk_start + chunk_len];
                 let glm_vision = self.config.vision.as_ref().filter(|v| v.is_glm5_next);
+                let qwen3vl = self
+                    .config
+                    .vision
+                    .as_ref()
+                    .is_some_and(|v| v.is_qwen3vl_video);
                 // GLM's expanded video has structural text tokens between
                 // frame planes, and post-media text inherits the compressed
                 // position base. Build against the complete prompt and slice
                 // the processed range below; looking only at this chunk loses
                 // the active video frame at a chunk boundary.
                 let have_vision = !grids.is_empty()
-                    && if glm_vision.is_some() {
+                    && if glm_vision.is_some() || qwen3vl {
                         tokens.iter().copied().any(is_pad)
                     } else {
                         chunk_tokens.iter().copied().any(is_pad)
@@ -187,6 +192,39 @@ impl TransformerModel {
                         if end > full_t.len() || end > full_h.len() || end > full_w.len() {
                             anyhow::bail!(
                                 "GLM-5 MRoPE position range {}..{} exceeds prompt length {}",
+                                proc_start,
+                                end,
+                                full_t.len()
+                            );
+                        }
+                        stg.positions.extend_from_slice(&full_t[proc_start..end]);
+                        stg.positions_h.extend_from_slice(&full_h[proc_start..end]);
+                        stg.positions_w.extend_from_slice(&full_w[proc_start..end]);
+                    } else if qwen3vl {
+                        // Qwen3-VL's nested per-group form has timestamp and
+                        // boundary text between the t=1 group planes — the
+                        // same chunk-boundary hazard as GLM-5, so the walk
+                        // runs over the complete prompt and slices.
+                        let (mut full_t, mut full_h, mut full_w) =
+                            (Vec::new(), Vec::new(), Vec::new());
+                        mrope_pos::build_qwen3vl(
+                            tokens,
+                            &grids,
+                            grid_base,
+                            grid_hi,
+                            0,
+                            pad_id,
+                            video_pad_id,
+                            &mut full_t,
+                            &mut full_h,
+                            &mut full_w,
+                        );
+                        let end = proc_start.checked_add(proc_count).ok_or_else(|| {
+                            anyhow::anyhow!("Qwen3-VL MRoPE position range overflow")
+                        })?;
+                        if end > full_t.len() || end > full_h.len() || end > full_w.len() {
+                            anyhow::bail!(
+                                "Qwen3-VL MRoPE position range {}..{} exceeds prompt length {}",
                                 proc_start,
                                 end,
                                 full_t.len()

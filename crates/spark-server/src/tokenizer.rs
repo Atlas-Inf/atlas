@@ -109,6 +109,10 @@ pub(crate) struct Glm5VisionPlaceholder {
     pub(crate) pad_count: usize,
     pub(crate) per_frame_pad_count: usize,
     pub(crate) timestamps: Vec<f32>,
+    /// Expansion family: GLM-5's begin/end-of-image video frames, or
+    /// Qwen3-VL's nested per-group timestamp + start/end markers. Homogeneous
+    /// within a request — a checkpoint's processor is one or the other.
+    pub(crate) qwen3vl: bool,
 }
 
 /// Wrapper around tokenizers::DecodeStream that hides the generic parameters.

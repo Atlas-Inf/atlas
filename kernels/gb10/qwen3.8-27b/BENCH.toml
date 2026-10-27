@@ -627,31 +627,35 @@ checkpoint = "nvidia/Qwen3.8-27B-NVFP4"
 gate = "video-fidelity"
 recipe = "qwen3.8/qwen3.8-27b-nvfp4-agentic"
 label = "Qwen3.8-27B dense (NVFP4, nvidia)"
-# `default = false` since 2026-08-15: qwen3.6-27b owns this gate's required
-# subject. Not a demotion of the checkpoint and not a lowered bar -- the
-# thresholds below are unchanged and this entry is still measured whenever it
-# is run explicitly. It is a choice of INSTRUMENT. `video-before-image` sits
-# exactly at this checkpoint's capability edge: with the bright-green fixture
-# it measured 13/13 on a manual serve (util 0.70, no drafts), 12/13 on this
-# recipe as pinned -- "[red, green, blue]", one colour short -- and 0 colours
-# with num_drafts=0, i.e. the leg's outcome moves with serve config while the
-# geometry never does. qwen3.6-27b and qwen3.6-35b-a3b both pass it 13/13
-# solidly. A gate whose required subject is one token away from failing
-# reports on the model's edge, not on the video pipeline it exists to guard,
-# and it would go red on PRs that changed nothing about video.
+# `default = true` since 2026-10-21: this NVIDIA checkpoint is the gate's
+# required subject again (it was qwen3.6-27b's unsloth pack, 2026-08-15 ..
+# 2026-10-21). The one-colour misses that moved with serve config here were
+# not this checkpoint's capability edge but Atlas's video PROMPT: HF's
+# Qwen3VLProcessor emits, per temporal group, `<t seconds>` + its own
+# vision_start / pads / vision_end inside the item's outer pair, and
+# Qwen3VLModel.get_rope_index gives every group its own t=1 plane. Atlas
+# rendered one flat block with no timestamps and Qwen2-VL-style T = base + g.
+# Measured 2026-10-21 on sparky with the same mixed-media request: Atlas
+# (old) read [red, blue, yellow] at 240/286 prompt tokens; vLLM, with the
+# reference prompt, read all four at 272/333; Atlas with the reference prompt
+# read all four at 272/318 (the remaining 15 are the still image's
+# min-pixel upscale, a separate image-side difference). Thresholds unchanged.
 #
-# This entry is also served by the AGENTIC recipe (thinking on, num_drafts 3,
-# util 0.85), whose own metadata says "do not cross-use" it with the vision /
-# tool profile. There is no vision-profile recipe for this checkpoint; adding
-# one upstream in atlas-recipes is the real fix, after which this can take
-# the default back with a measured run behind it.
-default = false
+# This entry is served by the AGENTIC recipe (thinking on, num_drafts 3,
+# util 0.85); the gate turns thinking off per request and the video legs
+# passed under it, so no separate vision-profile recipe is required.
+default = true
 status = "measured"
 note = """\
 REFERENCE RUN 2026-08-14, dgx-00, binary feat/video-support: PASS, 13/13 legs, 0 \
 skipped, control held. Re-measured 2026-08-15 after the fixture fix: 13/13 on a manual \
 vision-style serve, 12/13 under this entry's own agentic recipe (video-before-image \
-one colour short) -- see the default = false comment above. group-proportionality \
+one colour short). ★ 2026-10-21, sparky, Qwen3-VL reference video prompt (see the \
+comment above): --pull-request-gate run-1792578413095376992 PASS 13/13, 0 skipped, \
+control held; group-proportionality 1s=75 2s=132 4s=246 -> 1/2/4 groups at 49+8 \
+tok/group (8 = timestamp text + inner marker pair), template overhead 18; MP4 and GIF \
+both 246; image+video 318; two-videos 501; video-before-image 320; video-in-history \
+285. The 2026-08 token counts below predate that format. group-proportionality \
 1s=67 2s=116 4s=214 tokens -> 1/2/4 \
 temporal groups at 49 tok/group with an 18-token template overhead; forward clip read \
 "red, green, blue, yellow" and the reversed clip "Yellow, Blue, Green, Red"; MP4 and \

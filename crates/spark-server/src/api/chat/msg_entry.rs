@@ -459,7 +459,11 @@ pub(super) fn build_msg_entries(
                         video.ffmpeg,
                     ) {
                         Ok(v) => {
-                            let timestamps = v.timestamps.clone();
+                            let timestamps = if vcfg.is_qwen3vl_video {
+                                v.timestamps_hf.clone()
+                            } else {
+                                v.timestamps.clone()
+                            };
                             (
                                 spark_model::VisionItem {
                                     groups: v.groups,
@@ -479,12 +483,13 @@ pub(super) fn build_msg_entries(
                 }
             };
             image_pad_counts[idx] = item.pad_count(vcfg.spatial_merge_size);
-            if vcfg.is_glm5_next {
+            if vcfg.is_glm5_next || vcfg.is_qwen3vl_video {
                 vision_placeholders.push(glm5_vision::placeholder(
                     input.kind,
                     &item,
                     image_pad_counts[idx],
                     video_timestamps,
+                    vcfg.is_qwen3vl_video,
                 )?);
             }
             if input.kind == MediaKind::Video {

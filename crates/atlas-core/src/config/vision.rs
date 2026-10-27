@@ -9,6 +9,13 @@ pub struct VisionConfig {
     /// True only for the native GLM-5.3 vision tower.  Its RMSNorm/SwiGLU/
     /// convolutional merger is not interchangeable with the Qwen ViT path.
     pub is_glm5_next: bool,
+    /// True only when the checkpoint's video processor is HF's Qwen3VL
+    /// (`video_processor_type: Qwen3VLVideoProcessor`, or `processor_class:
+    /// Qwen3VLProcessor`). Its prompt nests per-temporal-group timestamp
+    /// text and vision start/end markers inside the video's outer pair, and
+    /// its MRoPE gives every group its own t=1 plane. Resolved at serve
+    /// time from the checkpoint's preprocessor config, not config.json.
+    pub is_qwen3vl_video: bool,
     /// Input channel count for the visual patch embed (GLM uses 3).
     pub in_channels: usize,
     /// Number of ViT transformer blocks (depth=27).

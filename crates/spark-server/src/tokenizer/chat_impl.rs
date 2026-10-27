@@ -7,6 +7,7 @@ use std::path::Path;
 use tokenizers::Tokenizer;
 
 mod glm5_vision;
+mod qwen3vl_vision;
 
 use super::{
     ChatEncoding, ChatTokenizer, StreamingDecoder, autoclose_assistant_think,
