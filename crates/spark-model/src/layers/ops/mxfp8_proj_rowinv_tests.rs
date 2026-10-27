@@ -46,9 +46,10 @@ mod gpu {
     #[test]
     #[ignore = "GPU"]
     fn rowinv_rows_match_the_tall_pass_bit_for_bit() {
-        let gpu =
-            spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())
-                .expect("CUDA backend");
+        let set = atlas_kernels::ptx_for_exact_target("qwen3.8-flash-next", "nvfp4")
+            .expect("qwen3.8-flash-next nvfp4 target set");
+        let gpu = spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &set.modules)
+            .expect("CUDA backend");
         let g: &dyn GpuBackend = &gpu;
         let stream = g.default_stream();
         let kernels = Mxfp8ProjKernels::resolve(g).expect("mxfp8 kernels");
