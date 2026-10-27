@@ -38,6 +38,18 @@
 
 use super::*;
 
+/// Failures of the absorb so far (`warn_sparsely`).
+static ABSORB_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Log the 1st, 2nd, 4th, 8th ... occurrence counted by `count`: a failure
+/// that repeats every step stays visible without a line a step.
+pub(crate) fn warn_sparsely(count: &std::sync::atomic::AtomicU64, msg: impl FnOnce() -> String) {
+    let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::warn!("{} ({n} so far)", msg());
+    }
+}
+
 /// `ATLAS_QWEN4EXP_MTP_ABSORB=1`, read once.
 pub(crate) fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -183,14 +195,16 @@ impl Qwen4ExpMtpHead {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        if !(enabled() || super::qwen4exp_mtp_prompt::enabled()) {
+        if !(enabled() || super::qwen4exp_mtp_prompt::enabled()) || !self.absorb_supported() {
             return Ok(());
         }
         let plans: Vec<_> = sts.iter().map(|st| plan(&st.absorb, st.seq_len)).collect();
         if plans.iter().any(Option::is_some)
             && let Err(e) = self.absorb_rows(sts, &plans, keep, ctx, stream)
         {
-            tracing::warn!("qwen4_exp MTP absorb failed (drafting without it): {e:#}");
+            warn_sparsely(&ABSORB_FAILED, || {
+                format!("qwen4_exp MTP absorb failed (drafting without it): {e:#}")
+            });
         }
         for (st, &position) in sts.iter_mut().zip(positions) {
             st.absorb.tokens.clear();
@@ -199,6 +213,25 @@ impl Qwen4ExpMtpHead {
             st.absorb.row0 = Some((st.seq_len, position));
         }
         Ok(())
+    }
+
+    /// Whether the absorb and the prompt rows can run: the batched row
+    /// kernels, the save buffer, and a body with a KV-only decode (the
+    /// drafter indexer of `ATLAS_MTP_DRAFTER_QSA=1` has none). Said once
+    /// when not; the switches then leave the drafter as without them.
+    pub(super) fn absorb_supported(&self) -> bool {
+        let ok = self.dense_gemv_batchm_k.0 != 0
+            && self.batched_embed_k.0 != 0
+            && !self.absorb.save.is_null()
+            && !self.module.body.has_aux_state();
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ok && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                "qwen4_exp MTP absorb / prompt rows inactive: no batched row kernels or no \
+                 KV-only drafter decode (ATLAS_MTP_DRAFTER_QSA=1 gives the drafter an indexer)"
+            );
+        }
+        ok
     }
 
     /// Write every planned row, at most `PROPOSE_BATCH_MAX` per pass. The

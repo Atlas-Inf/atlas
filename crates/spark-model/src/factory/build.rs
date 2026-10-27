@@ -971,6 +971,7 @@ pub fn build_model(
         tracing::info!("qwen4_exp MTP draft head installed on rank {rank} to serve draft TP");
     }
     if let Some(q4e_module) = q4e_mtp_module {
+        crate::layers::qwen4exp_mtp::qwen4exp_mtp_prompt::check_exclusive()?;
         match crate::layers::Qwen4ExpMtpHead::new(
             q4e_module,
             q4e_mtp_embed,

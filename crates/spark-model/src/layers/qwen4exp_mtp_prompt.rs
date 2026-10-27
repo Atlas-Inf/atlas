@@ -57,10 +57,29 @@ pub(crate) fn enabled() -> bool {
 /// Rows per drafter pass over the prompt.
 pub(super) const PASS_ROWS: usize = 64;
 
+/// Prompt chunks the drafter KV pool was short for (`warn_sparsely`).
+static POOL_SHORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `ATLAS_QWEN4EXP_MTP_PREFILL` replaces the drafter-context prefill's
+/// obsolete opt-in, which asks for drafter KV over the prompt too: refuse the
+/// pair at startup instead of leaving an operator unsure which one ran. (The
+/// default drafter context never writes this proposer's KV: it implements no
+/// `prefill_drafter` / `install_drafter_kv`.)
+pub fn check_exclusive() -> Result<()> {
+    anyhow::ensure!(
+        !(enabled() && std::env::var_os("ATLAS_MTP_DRAFTER_PREFILL").is_some()),
+        "ATLAS_QWEN4EXP_MTP_PREFILL and ATLAS_MTP_DRAFTER_PREFILL both ask for drafter KV \
+         over the prompt; unset ATLAS_MTP_DRAFTER_PREFILL"
+    );
+    Ok(())
+}
+
 /// Where a prompt pair's stream row is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Src {
-    /// The stage buffer's row 0 (a previous chunk's last row).
+    /// The stage buffer's row 0: the previous chunk's last row, held for the
+    /// next chunk's first token. Rare: only a prompt longer than one chunk
+    /// takes it, once per chunk boundary.
     Stage,
     /// A highway row of this chunk.
     Row(usize),
@@ -184,20 +203,32 @@ impl Qwen4ExpMtpHead {
         let Some(note) = st.absorb.prompt.take() else {
             return Ok(());
         };
+        if !self.absorb_supported() {
+            return Ok(());
+        }
         let lo = prompt.len().saturating_sub(window());
         let (pairs, left) = prompt_pairs(prompt, st.absorb.tail.take(), note, lo);
         let (gpu, rb) = (ctx.gpu, self.absorb.row_bytes());
         let streams = ctx.buffers.hc_streams();
+        // The passes save and restore highway rows `0..PASS_ROWS` and read the
+        // chunk's rows `hc_row ..`, all inside the highway.
+        let (_, rows, hc_row) = note;
+        anyhow::ensure!(
+            PASS_ROWS.max(hc_row + rows) * rb <= ctx.buffers.sizes().hc_streams,
+            "qwen4_exp MTP prefill: rows {hc_row}+{rows} (or the {PASS_ROWS}-row save) exceed hc_streams"
+        );
         if !pairs.is_empty() {
             let mut kv = self.kv_cache.lock();
             let bs = kv.block_size();
             let need = (st.seq_len + pairs.len()) / bs + 1;
             let fresh = need.saturating_sub(st.block_table.len());
             if kv.num_free_blocks() < fresh + kv.num_blocks() / 8 {
-                tracing::warn!(
-                    "qwen4_exp MTP prefill: {} prompt rows skipped, the drafter KV pool is short",
-                    pairs.len()
-                );
+                let n = pairs.len();
+                super::qwen4exp_mtp_absorb::warn_sparsely(&POOL_SHORT, || {
+                    format!(
+                        "qwen4_exp MTP prefill: {n} prompt rows skipped, the drafter KV pool is short"
+                    )
+                });
             } else {
                 while st.block_table.len() < need {
                     st.block_table.push(kv.alloc_block()?);
