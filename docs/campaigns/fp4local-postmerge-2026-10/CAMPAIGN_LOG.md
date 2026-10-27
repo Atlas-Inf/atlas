@@ -672,3 +672,41 @@ health check every 5 min with stall kill), re-armed 10-27. Queue: 10-train-gate 
 `~/code/wt-train-1027`, control vs d2d114c02, #196 Nemotron smoke, agentic 50, BFCL) → 20-dshare-hol (builds
 e05c6c325; 3 alternating off/k=8 pairs, r2) → 30-combo-gate (train binary, multi+ckpt + PC_BRANCH, r1short; the
 recipe #21 candidate) → 90/91 agentic repeats (default / combo).
+
+## 2026-10-27 07:00–07:30 UTC — train gate legs 1–2 pass; cargo-deny fix #215; S7 + #208 jobs queued
+
+**#212 train gate (job 10), legs 1–2:**
+- Control (default r1short): byte-identical to main + #204 (d2d114c02).
+- #196 smoke on NVIDIA Nemotron-3.5-Super-VL-120B-A12B-NVFP4: marker classes resolved from the served tokenizer;
+  both tool-repro cases finish `tool_calls` at 3,240 completion tokens (past the old 1024-token cut); 0
+  `tool_envelope_stuck`.
+- Agentic leg started 06:35:32, then BFCL (~3 h).
+
+**#215 cargo deny** (lockfile only). The action image pins cargo-deny 0.20.2, reproduced locally. The red is the
+three advisories: webpki-roots 1.0.6 → 1.0.10 (RUSTSEC-2026-0381), rustls-webpki → 0.103.16 (-0382), tokio
+1.52.3 → 1.53.3 (-0386 `AsyncFd` unsound; no patched 1.52.x exists). Every fixed version is ≥ 7 days old. The 14
+`bug[unresolved-workspace-dependency]` lines are a 0.20.2 quirk on `{ workspace = true }` path deps and non-fatal
+(bans/licenses/sources ok). No ignores; deny.toml untouched. tokio is the runtime, so #215 gets a GB10 gate in the
+next train.
+
+**S7 (MoE verify-row dedup):**
+- 8aa12c36c cherry-picks cleanly onto main (`perf/fp4l-moe-t-rows-dedup`). Correction to the 10-19 note: the
+  `_t_rows` kernels already stage through smem (double-buffered 16-byte loads, TILE_KH=64). The K=1 slowdown is the
+  per-row mask loop + the union launch; wiring uses rows ≥ 2 only.
+- Bench rework 944aa9fd1: cold rotation over 48 layer tables; routing to an exact union of 19/26/33 of 40 slots at
+  K=4 (the measured p10/mean/p90 for 4 rows × top-10). Note: the bench prints `union=26/40`, where 40 means slots,
+  not experts (FP4-Local has 512).
+- Job 15 = the microbench. Stage-2 gate, fixed now: every row byte-identical; K=4 union 26 ≤ 0.80× the time of 4
+  single-row launches; K=2/3 ≤ 1.00×.
+- Job 25 (self-deciding on job 15's lines): wiring in `forward_rows_t.rs` on the train tip; in-situ byte identity
+  (control, EXACT_VERIFY_CHECK = 0 rows, NVFP4 control); 3 alternating speed pairs (ab_stream + decode_probe).
+
+**#208 live repro (job 16).** Reachability is traced in source. Two-phase needs `len > max_prefill_tokens` with no
+active decode; `proc_count == 0` needs a block-aligned prompt with a snapshot at exactly its length. Only the
+chunked path's `[chunk]` save stashes the hidden, so the cold send runs beside a decoy decode with
+`ATLAS_HOLO_ALWAYS_MIXED=1`, and the warm identical send runs alone. Serve: `MAX_PREFILL=4096
+ATLAS_MAX_BATCH_TOKENS=8192`, r2. A/B: d2d114c02 (pre-fix) vs the train binary. `reasoning_effort: none` so
+content is compared, not two empty strings.
+
+**Queue order** (renamed so the recipe gate runs earlier): 10 → 15 → 16 → 18-combo-gate → 20-dshare-hol →
+25-s7-gates → 90/91.
