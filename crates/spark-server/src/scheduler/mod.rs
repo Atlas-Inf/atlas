@@ -724,7 +724,7 @@ pub fn run(
         // prompts that arrived during the first chunk are admitted at the
         // next boundary (two back-to-back 8K chunks held both ~6 s).
         // (ATLAS_GLM_WARM_CHUNK_RUN: not when that chunk computed nothing.)
-        let head_just_started = model.is_ep()
+        let head_just_started = (model.is_ep() || phase_continue_prefills::decode_share::enabled())
             && prefill_queue_was_empty
             && prefilling
                 .first()
@@ -759,6 +759,7 @@ pub fn run(
         mtp_step_trace::note_rode(&rode);
 
         if active.is_empty() {
+            phase_continue_prefills::decode_share::note_idle();
             // Every sequence can be parked (decode-preempted/spilled) with
             // nothing new admitted; the resume passes at the tail of the
             // loop sit AFTER decode, which this `continue` skips — so give
@@ -793,6 +794,7 @@ pub fn run(
         // Skip decode when mixed_forward already processed decode logits.
         mtp_step_trace::mark_decode(&mut step_trace, &active);
         if !did_mixed_step && !active.is_empty() {
+            phase_continue_prefills::decode_share::note_decode_step();
             // Ensure any in-flight prefill work on the prefill stream is complete
             // before decode starts on the default stream.
             if !prefilling.is_empty() {
