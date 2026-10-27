@@ -15,7 +15,6 @@
 //! a full decode would add change nothing it keeps.
 
 use anyhow::Result;
-use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::ctx::MultiSeqCtx;
