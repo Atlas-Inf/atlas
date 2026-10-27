@@ -103,6 +103,11 @@ impl<'a> Tick<'a> {
     /// One tick's start phase.
     fn admit(&mut self, reqs: Vec<InferenceRequest>) {
         let plants = vec![None; reqs.len()];
+        self.admit_planted(reqs, plants);
+    }
+
+    /// One tick's start phase with shared-prefix plants.
+    fn admit_planted(&mut self, reqs: Vec<InferenceRequest>, plants: Vec<Option<usize>>) {
         start_new_requests(
             self.model,
             &self.sched,
@@ -279,17 +284,36 @@ fn srpt_orders_queued_first_chunks_by_tokens_left() {
         "the 4-token tail first"
     );
 
+    // A short newcomer queued ahead of a long remainder: 18 tokens take two
+    // chunks, so it queues, and SRPT puts its 18 ahead of the 24 left.
     let model = multi_rank();
     let mut t = Tick::new(&model, true, true);
     let (a, _ra) = request(40);
-    let (c, _rc) = request(3);
+    let (c, _rc) = request(18);
     t.admit(vec![a]);
     t.admit(vec![c]);
-    assert_eq!(t.queue(), vec![(3, 0, Some(3)), (40, 16, None)]);
+    assert_eq!(t.queue(), vec![(18, 0, Some(16)), (40, 16, None)]);
     t.step();
-    assert_eq!(wire(&model), vec![CHUNK, 16, 0, 40, CHUNK, 3, 0, 3]);
-    assert_eq!(t.active.len(), 1, "the 3-token prompt decodes");
-    assert_eq!(t.queue(), vec![(40, 16, None)]);
+    assert_eq!(wire(&model), vec![CHUNK, 16, 0, 40, CHUNK, 16, 0, 18]);
+}
+
+/// A prompt that fits one chunk runs it at admission behind a long prefill
+/// in flight, lever on or off, SRPT on or off: queued, it would wait for
+/// every remaining chunk of the long prompt.
+#[test]
+fn a_one_chunk_prompt_runs_at_admission_behind_a_long_prefill() {
+    for srpt in [false, true] {
+        let model = multi_rank();
+        let mut t = Tick::new(&model, true, srpt);
+        let (a, _ra) = request(200);
+        let (c, _rc) = request(3);
+        t.admit(vec![a]);
+        t.admit(vec![c]);
+        assert_eq!(t.active.len(), 1, "the 3-token prompt decodes at once");
+        assert_eq!(t.queue(), vec![(200, 16, None)]);
+        assert_eq!(wire(&model), vec![CHUNK, 16, 0, 200, CHUNK, 3, 0, 3]);
+        assert_eq!(chunks(&model), vec![(0, 16), (0, 3)]);
+    }
 }
 
 /// A queued request whose caller left frees its slot on every rank, and the
@@ -336,18 +360,57 @@ fn a_queued_stream_whose_client_left_is_freed_without_a_chunk() {
     );
 }
 
-/// A refused queued first chunk fails only its request, as an inline one
-/// does: no victim, and the release follows the refused command.
+/// A refused queued first chunk preempts a decoding sequence and retries,
+/// as a later chunk does: by the time it runs it competes for KV blocks with
+/// the sequences decoding beside it.
 #[test]
-fn a_refused_queued_first_chunk_fails_only_its_request() {
+fn a_refused_queued_first_chunk_preempts_like_a_later_chunk() {
     let model = multi_rank();
+    let mut t = Tick::new(&model, true, false);
+    let (a, mut ra) = request(20);
+    let (b, mut rb) = request(36);
+    t.admit(vec![a]);
+    t.admit(vec![b]);
+    t.step();
+    assert_eq!(t.active.len(), 1);
+    model.refuse_chunks.store(1, Ordering::SeqCst);
+    t.step();
+    assert!(
+        ra.try_recv().expect("victim answered").is_err(),
+        "the decoding request is the victim"
+    );
+    assert!(
+        rb.try_recv().is_err(),
+        "the queued request is still running"
+    );
+    assert!(t.active.is_empty());
+    assert_eq!(t.queue(), vec![(36, 16, None)]);
+    assert_eq!(
+        chunks(&model)[2..],
+        [(0, 16), (0, 16)],
+        "refused, then rerun"
+    );
+    assert_eq!(
+        wire(&model),
+        vec![
+            CHUNK, 16, 0, 20, CHUNK, 4, 16, 20, CHUNK, 16, 0, 36, RELEASE, CHUNK, 16, 0, 36
+        ]
+    );
+}
+
+/// A final refusal of a queued first chunk fails only its request.
+#[test]
+fn a_finally_refused_queued_first_chunk_fails_only_its_request() {
+    let model = PreemptStubModel {
+        refusal_is_final: true,
+        ..multi_rank()
+    };
     let mut t = Tick::new(&model, true, false);
     let (a, _ra) = request(20);
     let (b, mut rb) = request(36);
     t.admit(vec![a]);
     t.admit(vec![b]);
     t.step();
-    assert_eq!(t.active.len(), 1);
     model.refuse_chunks.store(1, Ordering::SeqCst);
     t.step();
     assert!(rb.try_recv().expect("response sent").is_err());
@@ -357,6 +420,30 @@ fn a_refused_queued_first_chunk_fails_only_its_request() {
         wire(&model),
         vec![
             CHUNK, 16, 0, 20, CHUNK, 4, 16, 20, CHUNK, 16, 0, 36, RELEASE
+        ]
+    );
+}
+
+/// A queued prompt with a shared-prefix plant: the plant reaches the worker
+/// at admission (the setup), the chunk command only when the head runs it.
+#[test]
+fn a_queued_prompt_plants_at_admission_and_sends_its_chunk_later() {
+    let model = multi_rank();
+    let mut t = Tick::new(&model, true, false);
+    let (a, _ra) = request(40);
+    let (b, _rb) = request(36);
+    t.admit(vec![a]);
+    t.admit_planted(vec![b], vec![Some(16)]);
+    let plant = spark_model::traits::EP_CMD_PC_PLANT;
+    assert_eq!(wire(&model), vec![CHUNK, 16, 0, 40, plant, 16]);
+    assert_eq!(t.prefilling[1].seq.pc_plant_at, Some(16));
+    for _ in 0..3 {
+        t.step();
+    }
+    assert_eq!(
+        wire(&model),
+        vec![
+            CHUNK, 16, 0, 40, plant, 16, CHUNK, 16, 16, 40, CHUNK, 8, 32, 40, CHUNK, 16, 0, 36
         ]
     );
 }
