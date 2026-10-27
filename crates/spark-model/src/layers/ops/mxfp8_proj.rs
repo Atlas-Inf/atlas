@@ -78,13 +78,53 @@ pub fn mxfp8_proj(
         m > 0 && n > 0 && k.is_multiple_of(32),
         "mxfp8_proj: m={m} n={n} k={k} (k must be a multiple of 32)"
     );
-    if m == 1 {
-        return gemv_rows(gpu, kernels, proj, act, out, 1, stream);
+    match prefill_tier(m, super::qwen4exp_rowinv::active()) {
+        Tier::Gemv => gemv_rows(gpu, kernels, proj, act, out, m, stream),
+        Tier::Gemm => mxfp8_proj_rowinv(gpu, kernels, proj, act, out, m, scratch, stream),
     }
-    if m <= MXFP8_PROJ_MAX_CHUNKED_ROWS {
-        return gemv_rows(gpu, kernels, proj, act, out, m, stream);
-    }
+}
+
+/// `mxfp8_proj`'s ROWINV arm, callable directly (the GPU parity test cannot
+/// set env vars): every row is the expansion + row-invariant GEMM's bytes at
+/// any `m`, which is what makes a cached row equal to the tall pass's.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mxfp8_proj_rowinv(
+    gpu: &dyn GpuBackend,
+    kernels: &Mxfp8ProjKernels,
+    proj: &Mxfp8Proj,
+    act: DevicePtr,
+    out: DevicePtr,
+    m: usize,
+    scratch: Mxfp8Scratch,
+    stream: u64,
+) -> Result<()> {
     expand_and_gemm(gpu, kernels, proj, act, out, m, scratch, stream)
+}
+
+/// The projection tier a prefill pass serves at `m` rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tier {
+    /// `gemv_rows`: the 1-row kernel's bytes on every row.
+    Gemv,
+    /// `expand_and_gemm`: dequant + tensor-core GEMM.
+    Gemm,
+}
+
+/// Issue #218 (prefix-cache exactness): under the ROWINV prefill contract
+/// (`crate::layers::ops::qwen4exp_rowinv::active`) a cached K/V row must equal
+/// what the uncached pass computes for it. GEMV tiers and the GEMM are
+/// different numerics families, so a row written by a short pass (a short
+/// final chunk, a cache-restore suffix, or a one-row pass — all of which
+/// stay on the prefill path under ROWINV) would otherwise differ from the
+/// same row's bytes in a tall pass. Every m takes the GEMM arm under
+/// ROWINV; unset = today's split, byte-identical. The GEMM itself is the
+/// ROWINV in-order k-chain via `bf16_gemm`'s `try_bf16_gemm` arm.
+fn prefill_tier(m: usize, rowinv: bool) -> Tier {
+    if rowinv || m > MXFP8_PROJ_MAX_CHUNKED_ROWS {
+        Tier::Gemm
+    } else {
+        Tier::Gemv
+    }
 }
 
 /// The bit-exact variant for decode and speculative verify: every row is the
@@ -207,4 +247,29 @@ fn expand_and_gemm(
         .arg_u32(k)
         .launch(stream)?;
     super::bf16_gemm(act, scratch.ptr.0, out, m as u32, n, k, stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MXFP8_PROJ_MAX_CHUNKED_ROWS, Tier, prefill_tier};
+
+    /// Issue #218: under the ROWINV contract every m takes the GEMM arm, so a
+    /// cached row is the tall pass's bytes at any chunk height. The GPU test
+    /// proves the bytes; this pins the dispatch table.
+    #[test]
+    fn prefill_tier_uses_the_gemm_for_every_m_under_rowinv() {
+        for m in [1usize, 2, 7, 16, 31, 32, 33, 64, 100, 512, 1024, 4096] {
+            assert_eq!(prefill_tier(m, true), Tier::Gemm, "rowinv m={m}");
+        }
+    }
+
+    #[test]
+    fn prefill_tier_keeps_the_today_split_without_rowinv() {
+        for m in 1..=MXFP8_PROJ_MAX_CHUNKED_ROWS {
+            assert_eq!(prefill_tier(m, false), Tier::Gemv, "m={m}");
+        }
+        for m in [MXFP8_PROJ_MAX_CHUNKED_ROWS + 1, 64, 1024, 4096] {
+            assert_eq!(prefill_tier(m, false), Tier::Gemm, "m={m}");
+        }
+    }
 }

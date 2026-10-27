@@ -34,6 +34,9 @@ mod mxfp8_proj;
 #[cfg(test)]
 #[path = "ops/mxfp8_proj32_tests.rs"]
 mod mxfp8_proj32_tests;
+#[cfg(test)]
+#[path = "ops/mxfp8_proj_rowinv_tests.rs"]
+mod mxfp8_proj_rowinv_tests;
 // Row-wise FP8 routing, split out when it took dispatch_proj.rs over the cap.
 #[path = "ops/dispatch_proj_rowwise.rs"]
 mod dispatch_proj_rowwise;
