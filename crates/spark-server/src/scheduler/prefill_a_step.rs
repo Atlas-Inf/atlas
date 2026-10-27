@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas 5eeeb1a (AGPL-3.0-only, sparkqwen queued-first-chunk series).
 
 //! start_chunked_prefill (chunked prefill orchestration).
 

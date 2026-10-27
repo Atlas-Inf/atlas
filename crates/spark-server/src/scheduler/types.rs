@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas 5eeeb1a (AGPL-3.0-only, sparkqwen queued-first-chunk series).
 
 //! Shared scheduler-internal type definitions, factored out of `mod.rs`
 //! for the ≤500 LoC cap (refactor wave-4e). Visibility is `pub(super)`

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas 5eeeb1a (AGPL-3.0-only, sparkqwen queued-first-chunk series).
 
 //! Shared-prefix admission against the scripted model: what the head puts on
 //! the worker's command stream, and what goes back to the pending queue.

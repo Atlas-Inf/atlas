@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas 5eeeb1a, f1cc7cb (AGPL-3.0-only, sparkqwen queued-first-chunk series).
 
 //! Phase: continue in-progress chunked prefills. When `active` is empty,
 //! all chunks run back-to-back (TTFT minimisation). When active is

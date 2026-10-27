@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas 5eeeb1a (AGPL-3.0-only, sparkqwen queued-first-chunk series).
 
 //! Scheduler levers, resolved once per run and then carried.
 //!
