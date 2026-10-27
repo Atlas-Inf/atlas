@@ -752,3 +752,24 @@ passes the gate.
 
 **Queue:** 18-combo-gate (running since 10:56) → 19-twophase-208 → 19b-s7-bench2 → 20-dshare-hol → 25-s7-gates →
 30-train2-gate → 40-recipe21-vet → 90/91.
+
+## 2026-10-27 15:02 UTC — combo profile gate (job 18): agentic win, BFCL below floor → recipe #21 gets the J profile
+
+Same binary c3bf9aa25 (= main da7985ca4 tree), r1short, only the env differs:
+
+| profile | BFCL ST-995 | agentic 50 | s/turn | turns | TTFT p50/p90 | Σ TTFT (380 req) | hits / nosnap / pcbranch |
+|---|---|---|---|---|---|---|---|
+| default (job 10) | 87.44 / 87.32 | 50/50, 50/50 | 12.60 | 380 | 648 / 3,018 ms | 433 s | 299 / 987 / 0 |
+| combo (job 18) | 87.34 / **86.50** | 50/50, 50/50 | **11.55** | 360 | **514 / 925 ms** | **218 s** | 477 / 868 / 11 |
+
+Run ids: job 18 agentic + BFCL run-1793113303376550894; job 10 run-1793087766586885957 / run-1793098282379875687.
+Every ROWINV profile now lands on exactly 87.34 / 86.50 on three binaries (q21 d2d114c02, q28 b0c452fb, job 18
+c3bf9aa25). That is a deterministic output change from ROWINV numerics. Normalized 86.50 < the committed floor
+86.92, so the pre-set criterion fails. The J profile (MIDCHUNK + PC_BRANCH, no ROWINV; 10-23, d2d114c02) scored
+87.64 / 87.38 with agentic 50/50 at 12.12 s/turn. **Recipe #21 → J profile + container sha-da7985c**
+(sparkrun-recipes local commit 66b5fb0, not pushed). Vet through sparkrun on that image = job 22.
+
+**S7 job 19b (ROWS templates + smem A):** rows=1 1.01× (was 1.76×), so the local-memory accumulator was the K=1
+cost. Multi-row is still slower: rows=2 1.11×, rows=3 1.03 / 1.31×, rows=4 1.13 / 1.40 / 1.68× at union 19 / 26 / 33
+of 40 slots. Every case byte-identical. Per-expert time roughly doubles from 1 to 4 rows (28 → 59 µs), so the kernel
+is now instruction/latency-bound in the per-row inner loop, not bandwidth-bound. Gate not met; job 25 skips again.
