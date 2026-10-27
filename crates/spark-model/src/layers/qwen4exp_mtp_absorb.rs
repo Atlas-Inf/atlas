@@ -51,13 +51,20 @@ const STAGE_ROWS: usize = qwen4exp_mtp_batch::PROPOSE_BATCH_MAX_DRAFTS;
 pub struct Absorb {
     /// The last propose's row 0: (drafter KV row, sequence position).
     row0: Option<(usize, usize)>,
-    /// The accepted drafts staged with their verify rows (rows of `buf`).
-    tokens: Vec<u32>,
+    /// The accepted drafts staged with their verify rows (rows of `buf`), or
+    /// the prompt tail's token.
+    pub(super) tokens: Vec<u32>,
     /// The accepted count of the verdict applied since that propose.
     pub(super) verdict: Option<usize>,
     /// `[STAGE_ROWS, hc, hidden]` FP32 from the head's pool; NULL until the
     /// first stage.
-    buf: DevicePtr,
+    pub(super) buf: DevicePtr,
+    /// This prefill chunk's highway rows (`qwen4exp_mtp_prompt.rs`):
+    /// `(first position, rows, first highway row)`.
+    pub(super) prompt: Option<(usize, usize, usize)>,
+    /// The position of the prompt row staged in `buf` row 0 whose token was
+    /// not known yet (`qwen4exp_mtp_prompt.rs`).
+    pub(super) tail: Option<usize>,
 }
 
 impl Default for Absorb {
@@ -67,6 +74,8 @@ impl Default for Absorb {
             tokens: Vec::new(),
             verdict: None,
             buf: DevicePtr::NULL,
+            prompt: None,
+            tail: None,
         }
     }
 }
@@ -74,6 +83,10 @@ impl Default for Absorb {
 /// What the next propose absorbs: `(first drafter row, first position, rows)`,
 /// when the stage, the verdict and the row-0 record agree.
 pub(super) fn plan(a: &Absorb, seq_len: usize) -> Option<(usize, usize, usize)> {
+    // The prompt's last row, its token known by now: after the prompt rows.
+    if let Some(pos) = a.tail {
+        return (a.tokens.len() == 1).then_some((seq_len, pos, 1));
+    }
     let (row0, pos0) = a.row0?;
     let na = a.tokens.len();
     (na > 0 && a.verdict == Some(na) && seq_len > row0).then_some((row0 + 1, pos0 + 1, na))
@@ -88,12 +101,14 @@ pub(super) struct AbsorbBufs {
     pool: Mutex<Vec<DevicePtr>>,
     /// One highway row: `hc * hidden` FP32.
     row_bytes: usize,
+    /// `ATLAS_QWEN4EXP_MTP_PREFILL` (`qwen4exp_mtp_prompt.rs`).
+    pub(super) prompt: Option<super::qwen4exp_mtp_prompt::PromptBufs>,
 }
 
 impl AbsorbBufs {
     pub(super) fn new(gpu: &dyn GpuBackend, hc: usize, h: usize) -> Result<Self> {
         let row_bytes = hc * h * 4;
-        let save = if enabled() {
+        let save = if enabled() || super::qwen4exp_mtp_prompt::enabled() {
             gpu.alloc(qwen4exp_mtp_batch::PROPOSE_BATCH_MAX * row_bytes)?
         } else {
             DevicePtr::NULL
@@ -102,7 +117,20 @@ impl AbsorbBufs {
             save,
             pool: Mutex::new(Vec::new()),
             row_bytes,
+            prompt: super::qwen4exp_mtp_prompt::PromptBufs::new(gpu, hc, h)?,
         })
+    }
+
+    pub(super) fn row_bytes(&self) -> usize {
+        self.row_bytes
+    }
+
+    /// A stage buffer: a finished sequence's, else a new one.
+    pub(super) fn take_buf(&self, gpu: &dyn GpuBackend) -> Result<DevicePtr> {
+        match self.pool.lock().pop() {
+            Some(buf) => Ok(buf),
+            None => gpu.alloc(STAGE_ROWS * self.row_bytes),
+        }
     }
 
     /// Return a finished sequence's stage buffer to the pool.
@@ -137,10 +165,7 @@ impl Qwen4ExpMtpHead {
         }
         let rb = self.absorb.row_bytes;
         if st.absorb.buf.is_null() {
-            st.absorb.buf = match self.absorb.pool.lock().pop() {
-                Some(buf) => buf,
-                None => gpu.alloc(STAGE_ROWS * rb)?,
-            };
+            st.absorb.buf = self.absorb.take_buf(gpu)?;
         }
         gpu.copy_d2d_async(streams, st.absorb.buf, tokens.len() * rb, stream)?;
         st.absorb.tokens.extend_from_slice(tokens);
@@ -148,8 +173,8 @@ impl Qwen4ExpMtpHead {
     }
 
     /// Before a propose of `sts` at `positions`, whose input rows are highway
-    /// rows `0..keep`: absorb each agreed stage, then record each propose's
-    /// row 0. A no-op with the switch off.
+    /// rows `0..keep`: absorb each agreed stage (or the prompt tail), then
+    /// record each propose's row 0. A no-op with both switches off.
     pub(super) fn absorb_before_propose(
         &self,
         sts: &mut [&mut Qwen4ExpMtpProposerState],
@@ -158,7 +183,7 @@ impl Qwen4ExpMtpHead {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        if !enabled() {
+        if !(enabled() || super::qwen4exp_mtp_prompt::enabled()) {
             return Ok(());
         }
         let plans: Vec<_> = sts.iter().map(|st| plan(&st.absorb, st.seq_len)).collect();
@@ -170,6 +195,7 @@ impl Qwen4ExpMtpHead {
         for (st, &position) in sts.iter_mut().zip(positions) {
             st.absorb.tokens.clear();
             st.absorb.verdict = None;
+            st.absorb.tail = None;
             st.absorb.row0 = Some((st.seq_len, position));
         }
         Ok(())
@@ -232,7 +258,7 @@ impl Qwen4ExpMtpHead {
                 self.batch_slab_blocks,
             )?;
             gpu.copy_h2d_async(&slab.bytes, self.batch_slab, stream)?;
-            self.stage_rows_input(self.batch_slab, n, ctx, stream)?;
+            self.stage_rows_input(&self.own_scratch(), self.batch_slab, n, ctx, stream)?;
             let meta = qwen4exp_mtp_batch::slab_meta(self.batch_slab, 0, n, slab.max_blocks);
             let written = self.module.body.decode_rows_kv_only(
                 ctx.buffers.hidden_states(),
@@ -298,5 +324,16 @@ mod tests {
         assert_eq!(plan(&absorb(None, &[7], Some(1)), 1), None);
         // The drafter lost row 0 (a reset): nothing to append after.
         assert_eq!(plan(&absorb(Some((9, 40)), &[7], Some(1)), 9), None);
+    }
+
+    #[test]
+    fn the_prompt_tail_appends_once_its_token_is_known() {
+        let mut a = absorb(None, &[], None);
+        a.tail = Some(57);
+        // Token not handed over yet: nothing.
+        assert_eq!(plan(&a, 56), None);
+        a.tokens = vec![9];
+        // After the 56 prompt rows, at the prompt's last position.
+        assert_eq!(plan(&a, 56), Some((56, 57, 1)));
     }
 }

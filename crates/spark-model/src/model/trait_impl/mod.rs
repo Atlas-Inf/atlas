@@ -230,6 +230,7 @@ impl Model for TransformerModel {
             self.gpu.abort_capture_if_active(self.gpu.default_stream());
         }
         let out = r?;
+        self.try_mtp_prompt_absorb(prefill_seq, prefill_tokens, stream);
         self.try_eager_drafter_prefill(prefill_seq, prefill_is_last, stream)?;
         Ok(out)
     }

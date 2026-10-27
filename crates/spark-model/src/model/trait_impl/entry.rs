@@ -40,6 +40,7 @@ impl TransformerModel {
 
         (|| {
             let logits = self.prefill_dispatch(tokens, seq, stream)?;
+            self.try_mtp_prompt_absorb(seq, tokens, stream);
             self.try_eager_drafter_prefill(seq, true, stream)?;
             Ok(logits)
         })()
@@ -72,6 +73,7 @@ impl TransformerModel {
                 is_last_chunk,
                 stream,
             )?;
+            self.try_mtp_prompt_absorb(seq, tokens, stream);
             self.try_eager_drafter_prefill(seq, is_last_chunk, stream)?;
             Ok(logits)
         })()
@@ -93,6 +95,7 @@ impl TransformerModel {
 
         (|| {
             let logits = self.prefill_twophase_dispatch(tokens, seq, chunk_size, stream)?;
+            self.try_mtp_prompt_absorb(seq, tokens, stream);
             self.try_eager_drafter_prefill(seq, true, stream)?;
             Ok(logits)
         })()

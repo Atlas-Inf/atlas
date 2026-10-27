@@ -361,6 +361,7 @@ impl TransformerModel {
             let (len, from, count) = (tokens.len(), start[k], rows[k]);
             let src = hidden.offset(row0[k] * h * 2);
             self.try_mtp_prefill_capture_from(seq, from, count, src, stream)?;
+            self.note_mtp_prompt_rows(seq, from, count, row0[k]);
             let mut kv = self.kv_cache.lock();
             let bs = kv.block_size();
             seq.tokens.extend_from_slice(tokens);
@@ -394,6 +395,11 @@ impl TransformerModel {
             }
             logits[k] = row;
             self.try_eager_drafter_prefill(seq, true, stream)?;
+        }
+        // After every sequence's logits: the drafter reuses the activations.
+        for &k in &picked {
+            let (tokens, seq) = &mut seqs[k];
+            self.try_mtp_prompt_absorb(seq, tokens, stream);
         }
         let layout: Vec<(usize, usize, usize)> = picked
             .iter()

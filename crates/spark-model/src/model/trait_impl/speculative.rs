@@ -130,6 +130,8 @@ impl TransformerModel {
         let Some(prop_state) = proposer_state.as_mut() else {
             return Ok(());
         };
+        // ATLAS_QWEN4EXP_MTP_PREFILL: the sampled token of the prompt's last row.
+        proposer.prompt_tail_token(prop_state.as_mut(), seq_tokens);
         let prompt_len = *prompt_len;
         // ATLAS_MTP_DRAFTER_PREFILL: on the FIRST propose of a sequence,
         // batch-prefill the drafter's KV over the prompt (fresh-state check
