@@ -640,3 +640,35 @@ Box-side engine: the nightq runner on sparky (`~/code/nightq/queue/*.sh`, one jo
 health check every 5 min with stall kill), re-armed 10-27. Queue: 10-train-gate → 20-dshare-hol → 30-combo-gate →
 90/91 agentic repeats (run-to-run variance for the s/turn comparisons above). Mac mirror:
 `~/code/fp4local-night/` (STATUS.md, RESULTS.md, perf/) every 15 min.
+
+## 2026-10-27 06:00–06:45 UTC — queue29 checks, train + decode-share PRs opened, runner live
+
+**queue29** (sparky, r1short, PLE 2 GB; log `~/code/q10h/queue29.log`):
+- Decode-share knob OFF = unchanged: 4-request T=0 control identical between d2d114c02 (main + #204) and b0c452fb
+  (same + the knob), 4/4.
+- PC_BRANCH engages under ROWINV. Long-question shared-preamble probe, binary b0c452fb. P = multi+ckpt + k=8:
+
+  | conv | P (C0) TTFT | P + `ATLAS_QWEN4EXP_PC_BRANCH=1` (C1) TTFT |
+  |---|---|---|
+  | 0 (cold) | 2659 ms | 2659 ms |
+  | 1 | 2534 ms | 2507 ms (branch checkpoint planned) |
+  | 2–5 | 2512–2527 ms (5× "no SSM snapshot") | **720–734 ms** (4× Marconi SSM cache hit) |
+
+  Outputs C1 == C0 on conv2–5, 4/4. The feared `snap_tok % 64` decline doesn't happen: the planned point sits on
+  the pass granule (pc_policy.rs `is_multiple_of(PASS_GRANULE)`). One sample per conv, so TTFT is indicative. The
+  ~3.5× matches J2 (735–782 ms) without ROWINV.
+
+**PRs:**
+- #210 updated → d221f72fe: @maplepaladin73's truth-table + warn-once tests, applied verbatim, co-authored.
+  `rowinv` 3 passed, `pc_policy` 13 passed.
+- **#212 integration train** `integ/train-2026-10-27` c3bf9aa25 = main + #191 #192 #204 #196 #205 #206 #207 #208
+  #210 (`--no-ff`). Zero conflicts; prefill_b.rs 499 lines. sparky tests: spark-server bin 2731, spark-model lib
+  1875, spark-storage keepalive 3, all passed. Comment on every constituent PR + #172 + #180.
+- **#213 decode-share** `perf/decode-steps-per-chunk` e05c6c325 (one commit on main; scheduler only). Draft until the
+  n=3 HOL A/B (job 20) reports.
+- **#211** this log, as a draft docs PR.
+
+**Runner** re-armed (pid 3007477, ARMED = current boot). Queue: 10-train-gate (started 06:25:55; builds c3bf9aa25 in
+`~/code/wt-train-1027`, control vs d2d114c02, #196 Nemotron smoke, agentic 50, BFCL) → 20-dshare-hol (builds
+e05c6c325; 3 alternating off/k=8 pairs, r2) → 30-combo-gate (train binary, multi+ckpt + PC_BRANCH, r1short; the
+recipe #21 candidate) → 90/91 agentic repeats (default / combo).
