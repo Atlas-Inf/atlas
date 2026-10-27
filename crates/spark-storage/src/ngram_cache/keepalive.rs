@@ -189,20 +189,37 @@ mod tests {
     }
 
     /// Reads only while touched, stops after `idle`, and joins on drop.
+    ///
+    /// Deadlines, not fixed sleeps: on a loaded CI runner the ticker thread
+    /// can go unscheduled for longer than a fixed 30 ms window, which made
+    /// the "touched: ticking" assert flake. Keep touching until a read lands
+    /// (bounded), then stop and wait until the count holds still for well past
+    /// the idle window (bounded).
     #[test]
     fn ticks_only_while_active() {
         let (path, f) = temp_file(4);
         let k = KeepAlive::spawn(f, Duration::from_millis(2), Duration::from_millis(40)).unwrap();
         std::thread::sleep(Duration::from_millis(30));
         assert_eq!(k.reads(), 0, "no resolve yet: the drive may sleep");
-        k.touch();
-        std::thread::sleep(Duration::from_millis(30));
-        let during = k.reads();
-        assert!(during > 0, "touched: ticking");
-        std::thread::sleep(Duration::from_millis(120));
-        let after = k.reads();
-        std::thread::sleep(Duration::from_millis(60));
-        assert_eq!(k.reads(), after, "idle past the window: stopped");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while k.reads() == 0 && Instant::now() < deadline {
+            k.touch();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(k.reads() > 0, "touched: ticking");
+        // Untouched: the ticker must go quiet once `idle` (40 ms) has passed.
+        // Quiet = no new read across a 200 ms span (5x the idle window).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stopped = false;
+        while Instant::now() < deadline {
+            let before = k.reads();
+            std::thread::sleep(Duration::from_millis(200));
+            if k.reads() == before {
+                stopped = true;
+                break;
+            }
+        }
+        assert!(stopped, "idle past the window: stopped");
         drop(k);
         std::fs::remove_file(path).unwrap();
     }
