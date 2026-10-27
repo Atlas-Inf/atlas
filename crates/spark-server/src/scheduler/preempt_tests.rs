@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas 7fd2412 (AGPL-3.0-only, sparkqwen queued-first-chunk series).
 
 //! Tests for decode-time KV preemption with resume (`preempt.rs`).
 //!

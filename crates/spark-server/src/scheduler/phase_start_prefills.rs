@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas 5eeeb1a, dc896cc (AGPL-3.0-only, sparkqwen queued-first-chunk series).
 
 //! Phase: start new requests — either single-shot prefill (legacy) or
 //! chunked prefill that pushes onto `prefilling`. Handles SSM-pool-full

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas dc896cc, f1cc7cb, 7fd2412 (AGPL-3.0-only, sparkqwen queued-first-chunk series).
 
 //! Queued first chunks (`ATLAS_PREFILL_QUEUE_FIRST_CHUNK`) against the
 //! scripted model: the real start and continue phases, asserted on the order

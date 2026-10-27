@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas 5eeeb1a (AGPL-3.0-only, sparkqwen queued-first-chunk series).
 
 //! The min_tokens end-token ban must be armed on every way into decode, not
 //! only on the multi-chunk promotion: a prompt that prefills in one chunk,

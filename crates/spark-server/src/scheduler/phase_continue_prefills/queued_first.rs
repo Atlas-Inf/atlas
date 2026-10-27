@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas 5eeeb1a, f1cc7cb (AGPL-3.0-only, sparkqwen queued-first-chunk series).
 
 //! The first chunk of a prompt queued for it at admission
 //! (`ATLAS_PREFILL_QUEUE_FIRST_CHUNK`, `phase_start_prefills::queue_first`),

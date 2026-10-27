@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas 5eeeb1a, dc896cc (AGPL-3.0-only, sparkqwen queued-first-chunk series).
 
 //! `ATLAS_PREFILL_QUEUE_FIRST_CHUNK=1` (default off): a new prompt admitted
 //! behind a prefill in flight waits in `prefilling` for its first chunk.
