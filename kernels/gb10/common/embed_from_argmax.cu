@@ -156,7 +156,7 @@ extern "C" __global__ void batched_embed_nvfp4(
     for (unsigned int i = threadIdx.x; i < dim / 2; i += blockDim.x) {
         const unsigned char byte = src[i];
         const float block = ngram_fp8_decode(srow[(i * 2) / group]);
-        dst[i * 2]     = __float2bfloat16_rn(ngram_e2m1_decode(byte & 15u) * block * global);
-        dst[i * 2 + 1] = __float2bfloat16_rn(ngram_e2m1_decode(byte >> 4) * block * global);
+        dst[i * 2]     = __float2bfloat16(ngram_e2m1_decode(byte & 15u) * block * global);
+        dst[i * 2 + 1] = __float2bfloat16(ngram_e2m1_decode(byte >> 4) * block * global);
     }
 }
