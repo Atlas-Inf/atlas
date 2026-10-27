@@ -863,3 +863,17 @@ alternating speed pairs vs the train binary. The exploratory v3_b128 run is supe
 Then health.sh's 75-min stall check killed it mid-agentic: the container's serve log isn't under `$NQ/logs`, so health
 saw no progress. No metrics were produced. Re-queued as job 30c with `docker logs -f` into `$NQ/logs` (keepalive +
 TTFT source). Queue: 30-train2-gate (running since 17:58) → 30b-s7-gate-v3b256 → 30c-recipe21-vet → 90 → 91.
+
+## 2026-10-27 19:21 UTC — train 2 (#217) gate: control identical, agentic 50/50 at 12.43 s/turn; clean S7 branch verified
+
+Job 30 (32d6622a1 = da7985ca4 + #213 + #215 with the tokio 1.53.3 runtime bump): control byte-identical to train 1;
+agentic 50/50, 50/50, 12.43 s/turn, 381 turns, 22.05 tok/s (run-1793128886445013968). Default-profile s/turn so far:
+12.43 (main), 12.34 (#205+#206), 12.60 (train 1), 12.43 (train 2), roughly a ±1.1% spread across builds. BFCL running.
+
+Clean S7 branch `perf/fp4l-moe-verify-dedup` 87b28ea0f (on da7985ca4, 13 files, all S7). The kernel diff vs bench6's
+8edc3c383 only removes the variant instantiations and adds the `<R,256,1,true>` ship macro (ROWS 2..8); the impl
+template bodies are unchanged, so it ships the code job 27 measured. Union + rows lookups are `try_kernel_gated`. Job
+30b gates this tip (slim-bench identity/ratio guard, then the in-situ legs).
+
+Note: main moved to 8863dc5e5 (the AMD session merged #197, #187, #188). #217 and the S7 branch will need a merge or
+rebase onto it; no file overlap expected.
