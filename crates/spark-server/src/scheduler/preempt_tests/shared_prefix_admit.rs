@@ -14,7 +14,7 @@ use super::super::sched_ctx::SchedCtx;
 use super::super::shared_prefix::{SharedPrefix, admit};
 use super::super::test_support::{EOS, test_request};
 use super::super::types::{PendingQueue, PrefillInProgress};
-use super::super::{StartPrefillResult, start_chunked_prefill};
+use super::super::{FirstChunk, StartPrefillResult, start_chunked_prefill};
 use super::*;
 use crate::api::InferenceRequest;
 
@@ -123,7 +123,7 @@ fn a_new_leader_sends_its_plant_before_the_first_chunk() {
         0,
         &mut None,
         0,
-        false,
+        FirstChunk::Inline,
         None,
         None,
         Some(SHARED),
