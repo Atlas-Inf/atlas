@@ -186,6 +186,7 @@ impl TransformerModel {
         //   (1) re-restore the pristine SSM state@N from the snapshot, and
         //   (2) overwrite `normed` with the snapshot's stashed last-token
         //       post-norm hidden so `lm_head` emits the correct first token.
+        //   (3) re-apply its aux state (`exact_direct.rs`).
         // The redundant 1-token forward is otherwise harmless (its KV write
         // duplicates already-cached values).
         if let Some(snap_id) = seq.marconi_exact_snap {
@@ -196,6 +197,7 @@ impl TransformerModel {
                 self.gpu.as_ref(),
                 stream,
             )?;
+            self.exact_hit_reapply_aux(seq, snap_id, stream)?;
             if self.ssm_snapshots.has_hidden(snap_id) {
                 self.ssm_snapshots
                     .restore_hidden(snap_id, normed, self.gpu.as_ref(), stream)?;
