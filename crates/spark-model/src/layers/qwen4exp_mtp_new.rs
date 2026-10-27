@@ -36,7 +36,18 @@ impl Qwen4ExpMtpHead {
             config.num_key_value_heads,
             config.head_dim,
         );
-        let num_blocks = max_seq_len / kv_config.block_size + 1;
+        // `ATLAS_QWEN4EXP_MTP_PREFILL`: every speculating sequence
+        // (`mtp_max_seqs`) may hold `window` prompt rows for its lifetime, on
+        // top of the decode rows the one sequence's worth below covers.
+        let prompt_rows = qwen4exp_mtp_prompt::window() * crate::speculative::mtp_max_seqs();
+        let num_blocks = (max_seq_len + prompt_rows) / kv_config.block_size + 1;
+        if prompt_rows > 0 {
+            tracing::info!(
+                "qwen4_exp MTP drafter KV pool: {num_blocks} blocks ({:.0} MiB), \
+                 {prompt_rows} of its rows for prompts",
+                (num_blocks * kv_config.block_bytes_kv_all_layers()) as f64 / (1 << 20) as f64
+            );
+        }
         let block_size = kv_config.block_size;
         let kv_cache = PagedKvCache::new(kv_config, num_blocks, gpu)?;
 
