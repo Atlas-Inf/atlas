@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! Qwen3.8-Flash-Next Multi-Token-Prediction (MTP) draft proposer.
 //!

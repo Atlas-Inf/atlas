@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! `ATLAS_QWEN4EXP_PREFILL_MULTI=1` (default off; needs
 //! `ATLAS_QWEN4EXP_PREFILL_ROWINV=1`): several short prompts prefilled in

@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! Whole-prompt drafter context: the capture write and its EAGER consume.
 //!

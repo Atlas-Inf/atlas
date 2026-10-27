@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! Batched multi-sequence K-row verify step (batched-MTP E10 + the
 //! K-vs-batch ladder, task #35).

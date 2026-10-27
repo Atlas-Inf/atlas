@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! `impl Model for TransformerModel` — thin trait impl that delegates to
 //! `<method>_dispatch` helpers split across sibling files for the ≤500

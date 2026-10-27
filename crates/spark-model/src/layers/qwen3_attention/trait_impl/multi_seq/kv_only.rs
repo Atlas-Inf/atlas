@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! KV rows only ([`crate::layer::TransformerLayer::decode_rows_kv_only`]):
 //! each row's attention input on the mHC highway — the attention site's
@@ -28,14 +30,17 @@ impl Qwen3AttentionLayer {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::layers::qwen3_attention) fn decode_rows_kv_only_inner(
         &self,
-        hidden: DevicePtr,
-        residual: DevicePtr,
-        n: usize,
+        rows: crate::layer::KvRows<'_>,
         kv_cache: &mut PagedKvCache,
-        seq_lens: &[usize],
         ctx: &ForwardContext,
-        stream: u64,
     ) -> Result<bool> {
+        let crate::layer::KvRows {
+            hidden,
+            residual,
+            n,
+            seq_lens,
+            stream,
+        } = rows;
         let Some(hc) = self.hc.as_ref() else {
             return Ok(false);
         };

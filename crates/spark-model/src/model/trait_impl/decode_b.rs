@@ -3,6 +3,8 @@
 //!
 //! Same POD-array-to-byte-slice `unsafe` pattern as `verify_c.rs`; see
 //! that file's module docs for the full safety contract.
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 #![allow(unused_imports, dead_code, clippy::too_many_arguments)]
 

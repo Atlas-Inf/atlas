@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
@@ -399,15 +401,11 @@ impl TransformerLayer for Qwen3AttentionLayer {
 
     fn decode_rows_kv_only(
         &self,
-        hidden: DevicePtr,
-        residual: DevicePtr,
-        n: usize,
+        rows: crate::layer::KvRows<'_>,
         kv: &mut PagedKvCache,
-        seq_lens: &[usize],
         ctx: &ForwardContext,
-        stream: u64,
     ) -> Result<bool> {
-        self.decode_rows_kv_only_inner(hidden, residual, n, kv, seq_lens, ctx, stream)
+        self.decode_rows_kv_only_inner(rows, kv, ctx)
     }
 
     fn alloc_state(&self, _gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {

@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! Dynamic MTP draft depth past the K-vs-batch ladder
 //! (`ATLAS_MTP_DYNAMIC_DEPTH=1`, default off).

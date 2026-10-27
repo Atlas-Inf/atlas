@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! Phase 4: forward through every transformer layer (decode-path on
 //! single-token chunks, prefill-path otherwise) plus DFlash capture
