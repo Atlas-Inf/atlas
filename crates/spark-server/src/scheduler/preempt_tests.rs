@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod chunk_retry;
 mod kv_refusal;
 mod min_tokens_ban;
+mod queue_first_chunk;
 mod resume;
 mod shared_prefix_admit;
 mod victim_policy;
@@ -64,6 +65,8 @@ struct PreemptStubModel {
     /// Shared-prefix admission: `pc_inflight_min_tokens`, and a multi-rank
     /// world with 16-token blocks when set.
     inflight_min: Option<usize>,
+    /// A multi-rank world without shared-prefix admission.
+    ep: bool,
 }
 
 impl PreemptStubModel {
@@ -303,7 +306,7 @@ impl Model for PreemptStubModel {
         self.inflight_min.map(|_| 16)
     }
     fn is_ep(&self) -> bool {
-        self.inflight_min.is_some()
+        self.ep || self.inflight_min.is_some()
     }
     fn reclaim_prefix_blocks(&self, num_blocks: usize) -> usize {
         let take = num_blocks.min(self.reclaimable.load(Ordering::SeqCst));
