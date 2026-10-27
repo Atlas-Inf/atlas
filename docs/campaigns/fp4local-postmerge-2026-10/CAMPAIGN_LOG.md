@@ -718,3 +718,37 @@ Main + #204 (run-1792654228906033074): 12.43 s/turn, 379 turns, Σwall 4,762 s, 
 Σ TTFT 428 s. Train: TTFT p50/p90 648/3,017 ms, Σ TTFT 433 s. Server decode and TTFT agree within ~1–3%. The +71 s
 Σwall is ~5 s TTFT; the rest is one extra turn plus harness-side time. Single run per arm: observation, not a
 regression verdict. Job 90 repeats this binary. BFCL running.
+
+## 2026-10-27 10:51–11:10 UTC — #212 train MERGED (da7985ca4); train 2 = #217; S7 kernels miss the gate
+
+**#212 gate, final:** BFCL ST-995 **87.44 / 87.32** (run-1793098282379875687), identical to main on all 15 subsets.
+Agentic 50/50, 50/50, 12.60 s/turn (run-1793087766586885957). Control byte-identical; Nemotron #196 smoke 2/2;
+serve log 0 ERROR / 0 panic. CI: only the repo-wide PR-benchmark-gate + cargo-deny reds (kernel shadow green via
+#192). Merged with a merge commit as **da7985ca4**. #191 #192 #196 #204 #205 #206 #207 #208 #210 show MERGED;
+#172 auto-closed; #180 closed by hand.
+
+**Train 2 #217** (`integ/train-2026-10-27b` 32d6622a1) = da7985ca4 + #213 + #215, no conflicts. Gate = job 30
+(control, agentic 50, BFCL). #213 also needs job 20 (n=3 HOL A/B) before merging.
+
+**S7 job 15 (cold microbench, `~/code/nightq/logs/15-s7-bench.log`): byte-identical in every case, but slower in
+every case.** `union` = unique experts among rows × top-10 slots:
+
+| rows | union | K × single-row | `_t_rows` | ratio |
+|---|---|---|---|---|
+| 1 | 10 | 297 µs (93 GB/s) | 523 µs (58 GB/s) | 1.76 |
+| 2 | 19 | 589 µs | 1,031 µs | 1.75 |
+| 3 | 19 / 26 | 836 / 870 µs | 1,357 / 1,462 µs | 1.62 / 1.68 |
+| 4 | 19 / 26 / 33 | 1,090 / 1,135 / 1,156 µs | 1,662 / 1,715 / 1,908 µs | 1.53 / 1.51 / 1.65 |
+
+rows=1 reads the same bytes as the single-row kernel and is still 1.76× slower, so this is the kernel, not the
+dedup idea. Cause in source: the inner loop indexes `acc[r]` with a runtime `__ffs` row (local-memory accumulators,
+a data-dependent branch per byte) and reads A from global per row. Stage 1b (in progress): compile-time ROWS
+templates, all rows computed unconditionally with the mask applied only at the store (byte identity unchanged:
+same per-row expression and order), A staged in smem. Re-bench = job 19b. Job 25 skips itself until a bench
+passes the gate.
+
+**#208 repro, job 16: invalid run.** Calibration started at ~8.7K tokens and only padded upward, so it never entered
+(4096, 8192]. Fixed (steers toward ~6K) and re-queued as job 19.
+
+**Queue:** 18-combo-gate (running since 10:56) → 19-twophase-208 → 19b-s7-bench2 → 20-dshare-hol → 25-s7-gates →
+30-train2-gate → 40-recipe21-vet → 90/91.
