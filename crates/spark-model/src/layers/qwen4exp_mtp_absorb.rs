@@ -340,6 +340,10 @@ impl Qwen4ExpMtpHead {
     }
 }
 
+#[cfg(all(test, feature = "cuda"))]
+#[path = "qwen4exp_mtp_kv_only_gpu_tests.rs"]
+mod kv_only_gpu_tests;
+
 #[cfg(test)]
 mod tests {
     use super::{Absorb, plan};
