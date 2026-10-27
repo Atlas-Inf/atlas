@@ -93,6 +93,24 @@ pub(super) fn prompt_pairs(
     (pairs, left)
 }
 
+/// A pass's input copies: `(destination row, source, rows)` runs of
+/// consecutive source rows, none crossing `split` (rows below it read from
+/// the save).
+pub(super) fn copy_runs(chunk: &[(Src, usize, u32)], split: usize) -> Vec<(usize, Src, usize)> {
+    let mut runs: Vec<(usize, Src, usize)> = Vec::new();
+    for (i, &(src, _, _)) in chunk.iter().enumerate() {
+        if let (Some((_, Src::Row(r0), n)), Src::Row(r)) = (runs.last_mut(), src)
+            && *r0 + *n == r
+            && (r < split) == (*r0 < split)
+        {
+            *n += 1;
+            continue;
+        }
+        runs.push((i, src, 1));
+    }
+    runs
+}
+
 /// The head's prompt buffers (allocated with the switch on).
 pub(super) struct PromptBufs {
     scratch: RowScratch,
@@ -222,13 +240,15 @@ impl Qwen4ExpMtpHead {
             let mut meta = vec![0u8; PASS_ROWS * 12];
             let mut toks = Vec::with_capacity(n * 4);
             let mut kv_rows = Vec::with_capacity(n);
-            for (i, &(src, pos, tok)) in chunk.iter().enumerate() {
-                let from = match src {
+            for (dst, from, rows) in copy_runs(chunk, PASS_ROWS) {
+                let from = match from {
                     Src::Stage => st.absorb.buf,
                     Src::Row(r) if r < PASS_ROWS => bufs.save.offset(r * rb),
                     Src::Row(r) => streams.offset(r * rb),
                 };
-                gpu.copy_d2d_async(from, streams.offset(i * rb), rb, stream)?;
+                gpu.copy_d2d_async(from, streams.offset(dst * rb), rows * rb, stream)?;
+            }
+            for (i, &(_, pos, tok)) in chunk.iter().enumerate() {
                 let row = st.seq_len + i;
                 let slot = st.block_table[row / bs] as i64 * bs as i64 + (row % bs) as i64;
                 meta[i * 4..i * 4 + 4].copy_from_slice(&(pos as u32).to_le_bytes());
@@ -303,6 +323,27 @@ mod tests {
         let (pairs, left) = prompt_pairs(&prompt, None, (4, 2, 5), 0);
         assert_eq!(pairs, vec![(Src::Row(5), 5, 15)]);
         assert_eq!(left, Some((6, 6)));
+    }
+
+    #[test]
+    fn copies_run_over_consecutive_rows_and_split_at_the_save() {
+        use super::copy_runs;
+        let p = |s| (s, 0, 0);
+        let chunk = [
+            p(Src::Stage),
+            p(Src::Row(62)),
+            p(Src::Row(63)),
+            p(Src::Row(64)),
+            p(Src::Row(65)),
+        ];
+        assert_eq!(
+            copy_runs(&chunk, 64),
+            vec![
+                (0, Src::Stage, 1),
+                (1, Src::Row(62), 2),
+                (3, Src::Row(64), 2)
+            ]
+        );
     }
 
     #[test]
