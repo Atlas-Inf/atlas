@@ -710,3 +710,11 @@ content is compared, not two empty strings.
 
 **Queue order** (renamed so the recipe gate runs earlier): 10 → 15 → 16 → 18-combo-gate → 20-dshare-hol →
 25-s7-gates → 90/91.
+
+## 2026-10-27 07:56 UTC — #212 train gate, agentic leg: 50/50, 50/50, 12.60 s/turn
+
+run-1793087766586885957, train c3bf9aa25, default r1short, 380 turns, Σwall 4,833 s, harness decode 22.06 tok/s.
+Main + #204 (run-1792654228906033074): 12.43 s/turn, 379 turns, Σwall 4,762 s, 21.98 tok/s, TTFT p50/p90 631/3,000 ms,
+Σ TTFT 428 s. Train: TTFT p50/p90 648/3,017 ms, Σ TTFT 433 s. Server decode and TTFT agree within ~1–3%. The +71 s
+Σwall is ~5 s TTFT; the rest is one extra turn plus harness-side time. Single run per arm: observation, not a
+regression verdict. Job 90 repeats this binary. BFCL running.
