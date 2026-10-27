@@ -739,7 +739,7 @@ fn hip_mirror_source(
             let dst = mirror_dir.join(name);
             let text = std::fs::read_to_string(&p)
                 .unwrap_or_else(|e| panic!("read {} for HIP mirror: {e}", p.display()));
-            let widened = widen_warp_masks(&text);
+            let widened = anchor_relative_includes(&widen_warp_masks(&text), src_dir);
             // Only rewrite when content changed (keeps mtimes stable across
             // incremental builds → no needless hipcc recompiles).
             let needs_write = match std::fs::read_to_string(&dst) {
@@ -755,6 +755,36 @@ fn hip_mirror_source(
     }
 
     mirror_dir.join(src.file_name().unwrap())
+}
+
+/// Rewrite every `#include "../…"` to the absolute path it names from the
+/// ORIGINAL source directory, which is how clang resolves it on the unmirrored
+/// file. The mirror lives under OUT_DIR, so a parent-relative include names
+/// nothing from there: #174's `#include "../../common/atlas_pdl.cuh"` in the
+/// GDN kernel that strix-hip's 35B-A3B and Flash-Next targets share stopped
+/// both from compiling. Sibling includes (`"foo.cuh"`) are left alone, since
+/// the whole directory is mirrored; an include whose target does not exist is
+/// left as written so the compiler reports it.
+fn anchor_relative_includes(src: &str, src_dir: &std::path::Path) -> String {
+    let mut out = String::with_capacity(src.len());
+    for line in src.split_inclusive('\n') {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("#include \"../")
+            && let Some(end) = rest.find('"')
+            && let abs = src_dir.join(format!("../{}", &rest[..end]))
+            && abs.exists()
+        {
+            let indent = &line[..line.len() - t.len()];
+            out.push_str(&format!(
+                "{indent}#include \"{}\"{}",
+                abs.display(),
+                &rest[end + 1..]
+            ));
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
 }
 
 /// Append `ULL` to the warp-mask literal that is the first argument of every
