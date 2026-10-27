@@ -39,6 +39,10 @@ pub struct SchedLevers {
     /// `ATLAS_PREFILL_SRPT=1`: a new multi-chunk prefill joins the queue by
     /// tokens left (shortest first) instead of by arrival.
     pub prefill_srpt: bool,
+    /// `ATLAS_PREFILL_QUEUE_FIRST_CHUNK=1` (multi-rank worlds): a new prompt
+    /// admitted behind a prefill in flight waits in the queue for its first
+    /// chunk instead of running it at admission (`phase_start_prefills::queue_first`).
+    pub prefill_queue_first_chunk: bool,
 
     // ── DFlash speculation ──
     pub dflash_masked_verify: bool,
@@ -154,6 +158,7 @@ impl SchedLevers {
             mtp_minp: on_unless("ATLAS_NO_MTP_MINP"),
             mtp_verify_sample: on_unless("ATLAS_NO_MTP_VERIFY_SAMPLE"),
             prefill_srpt: opt_in("ATLAS_PREFILL_SRPT"),
+            prefill_queue_first_chunk: opt_in("ATLAS_PREFILL_QUEUE_FIRST_CHUNK"),
 
             dflash_masked_verify: opt_in("ATLAS_DFLASH_MASKED_VERIFY"),
             dflash_seam_serial: opt_in("ATLAS_DFLASH_SEAM_SERIAL"),
@@ -205,6 +210,7 @@ impl SchedLevers {
             mtp_minp: true,
             mtp_verify_sample: true,
             prefill_srpt: false,
+            prefill_queue_first_chunk: false,
             dflash_masked_verify: false,
             dflash_seam_serial: false,
             dflash_adaptive: false,
@@ -296,6 +302,7 @@ mod tests {
             !d.decode_timing && !d.mtp_timing && !d.mtp_single_depth_adapt && !d.adadec_diagnostic
         );
         assert!(!d.mtp_dynamic_depth);
+        assert!(!d.prefill_srpt && !d.prefill_queue_first_chunk);
     }
 
     #[test]
