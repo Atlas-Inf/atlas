@@ -831,3 +831,21 @@ COLS > 1 spans BS×COLS columns; fixed in 1415284c1 and re-benched as job 24. Th
 job 25 printed `S7 GATE NOT MET`. ptxas: 56–96 registers, 64-byte stack frames on the COLS variants, 9–32 KB smem, no
 spills flagged. A self-deciding job 24b (after 24) wires whichever variant passes (v4c4 → v4 → v3_b128 preference)
 and runs the in-situ legs (control, EXACT_VERIFY_CHECK, NVFP4 control, 3 speed pairs).
+
+## 2026-10-27 16:30–16:40 UTC — job 24 (v4 fixed): v3_b128 still best at 0.821×; jobs 26/30 script bugs fixed; queue reordered
+
+**Job 24 bench5 (all identical after the COLW fix), rows=4 union=26:** v3_b128 0.821, v2_b128 0.921, v3_b64 0.948,
+v4 1.222, v4c4 2.319. The COLS=4 variant spills: ptxas reported 64-byte stack frames, and it is 2.3–2.8× slower
+everywhere. Job 24b: `S7 GATE NOT MET`. v3_b128 = 0.818 / 0.821 over two runs, just over the pre-set 0.80. The gate
+stays. Next: one exploratory in-situ run of v3_b128 (job 31, labelled exploratory, not a gate pass) and one more
+variant bench (job 27: BS=256, occupancy, wider scale staging).
+
+**Script failures, fixed by me:**
+- Job 30 (train 2): `cargo build --release -p spark`, and no package is named `spark` (same bug as job 14). Fixed to a
+  plain workspace build.
+- Job 26 (recipe vet 2): the env assertion grepped `ATLAS_*` from the whole YAML, including a comment that names
+  ROWINV, so it reported a false "missing" var. The container actually had exactly the 9 recipe vars. Now parsed from the
+  YAML `env:` mapping; output `nq-recipe21-vet3`.
+
+Job 90 (filler) was killed 2 min in so the deliverables run first, then re-queued. Queue: 26 (running since 16:37)
+→ 27-s7-bench6 → 30-train2-gate → 31-s7-insitu-v3b128 → 90 → 91.
