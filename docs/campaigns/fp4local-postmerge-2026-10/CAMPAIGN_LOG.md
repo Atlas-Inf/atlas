@@ -816,3 +816,18 @@ output `nq-recipe21-vet2`) copies the YAML verbatim, asserts the container env e
 benchmark, and aborts if agentic yields no metrics. The smoke from the invalid run (tool call OK, needle) is not
 counted. The invalid run's artifacts stay in `~/code/perf/nq-recipe21-vet/` as a record.
 #208: live-repro notes posted on the PR; no further GPU time.
+
+## 2026-10-27 16:29 UTC — S7 bench4 (job 23): v3_b128 at 0.818×, byte-identical; v4 fixed and re-queued
+
+The leak fix held (MemAvailable 116 GB at start, full 64-case run). Gate case rows=4 union=26 of 40 slots, ratio vs
+4 single-row launches (cold):
+
+| v0 | v1 | v2_b64 | v2_b128 | v3_b64 | v3_b128 | v4 | v4c4 |
+|---|---|---|---|---|---|---|---|
+| 1.386 | 1.124 | 1.020 | 0.906 | 0.917 | **0.818** | 0.828 ✗ | 0.800 ✗ |
+
+✗ = not byte-identical. The V2 stride fix made v2/v3 identical everywhere. v4's staging copied BS bytes per k-row while
+COLS > 1 spans BS×COLS columns; fixed in 1415284c1 and re-benched as job 24. The gate stays at ≤ 0.80 (pre-set), so
+job 25 printed `S7 GATE NOT MET`. ptxas: 56–96 registers, 64-byte stack frames on the COLS variants, 9–32 KB smem, no
+spills flagged. A self-deciding job 24b (after 24) wires whichever variant passes (v4c4 → v4 → v3_b128 preference)
+and runs the in-situ legs (control, EXACT_VERIFY_CHECK, NVFP4 control, 3 speed pairs).
