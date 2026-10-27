@@ -310,7 +310,10 @@ impl TransformerModel {
             return;
         };
         if let Err(e) = p.absorb_prompt(st.as_mut(), prompt, &self.drafter_ctx(), stream) {
-            tracing::warn!("MTP drafter prompt rows failed (drafting without them): {e:#}");
+            static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            crate::layers::qwen4exp_mtp::qwen4exp_mtp_absorb::warn_sparsely(&FAILED, || {
+                format!("MTP drafter prompt rows failed (drafting without them): {e:#}")
+            });
         }
     }
 }
