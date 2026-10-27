@@ -220,16 +220,27 @@ pub(in crate::model) fn tail_split_disabled() -> bool {
 /// FP4-Local agentic-webserver, 0 checkpoints, TTFT p50 632 -> 3062 ms.
 /// Warns once in that case.
 pub(in crate::model) fn rowinv_tail_unsplit(in_pass: bool) -> bool {
+    static WARN: std::sync::Once = std::sync::Once::new();
     let rowinv = crate::layers::ops::qwen4exp_rowinv::on();
+    rowinv_tail_unsplit_with(rowinv, in_pass, &WARN, || {
+        tracing::warn!(
+            "ATLAS_QWEN4EXP_PREFILL_ROWINV=1 without \
+             ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT=1 saves no tail SSM checkpoint: \
+             warm turns will recompute their whole prompt"
+        )
+    })
+}
+
+/// [`rowinv_tail_unsplit`] with the flag, the once-guard and the warning
+/// passed in, so tests can drive it without the read-once env flag.
+fn rowinv_tail_unsplit_with(
+    rowinv: bool,
+    in_pass: bool,
+    warn: &std::sync::Once,
+    emit: impl FnOnce(),
+) -> bool {
     if rowinv && !in_pass {
-        static WARN: std::sync::Once = std::sync::Once::new();
-        WARN.call_once(|| {
-            tracing::warn!(
-                "ATLAS_QWEN4EXP_PREFILL_ROWINV=1 without \
-                 ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT=1 saves no tail SSM checkpoint: \
-                 warm turns will recompute their whole prompt"
-            )
-        });
+        warn.call_once(emit);
     }
     rowinv
 }
