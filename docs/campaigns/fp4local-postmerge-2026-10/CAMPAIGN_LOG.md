@@ -849,3 +849,17 @@ variant bench (job 27: BS=256, occupancy, wider scale staging).
 
 Job 90 (filler) was killed 2 min in so the deliverables run first, then re-queued. Queue: 26 (running since 16:37)
 → 27-s7-bench6 → 30-train2-gate → 31-s7-insitu-v3b128 → 90 → 91.
+
+## 2026-10-27 18:20 UTC — S7 v3_b256 MEETS the microbench gate; recipe vet killed by the stall watchdog, re-queued
+
+**Job 27 bench6** (80 cases, all byte-identical): rows=4 union=26 **v3_b256 0.764×** (v3_b128 0.829, v3lb_b128 0.818,
+v3_b64 0.902). v3_b256 also: rows=2 0.908, rows=3 0.791 / 0.814, so every pre-set condition is met. Scale staging was
+already 16-byte; the launch-bounds variant gave no extra gain. Next: a clean PR branch `perf/fp4l-moe-verify-dedup` with
+ONLY the union kernel + v3_b256 rows kernels + wiring (no variant zoo). Job 30b gates exactly that branch: slim bench
+identity guard, then control vs job 10, EXACT_VERIFY_CHECK = 0 mismatches with the arm engaged, NVFP4 control, 3
+alternating speed pairs vs the train binary. The exploratory v3_b128 run is superseded.
+
+**Job 26 (recipe vet 3):** env check passed (9/9 recipe vars in the container), control 4/4, tool call OK, needle PASS.
+Then health.sh's 75-min stall check killed it mid-agentic: the container's serve log isn't under `$NQ/logs`, so health
+saw no progress. No metrics were produced. Re-queued as job 30c with `docker logs -f` into `$NQ/logs` (keepalive +
+TTFT source). Queue: 30-train2-gate (running since 17:58) → 30b-s7-gate-v3b256 → 30c-recipe21-vet → 90 → 91.
