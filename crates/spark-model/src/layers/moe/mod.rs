@@ -210,6 +210,7 @@ mod forward_prefill_router;
 mod forward_prefill_tcp;
 pub(crate) use forward_prefill_tcp::tcp_requested;
 mod forward_rows;
+mod forward_rows_t;
 mod forward_token_major;
 mod gate_up_m16;
 mod gate_up_repack;
