@@ -199,7 +199,7 @@ fn qwen4exp_mtp_kv_only_gpu_matches_the_full_decode() {
         let (k_only, v_only) = read(&kv);
         let (mut differ, mut max_abs, mut max_ref) = (0usize, 0f32, 0f32);
         for (a, b) in [(&k_full, &k_only), (&v_full, &v_only)] {
-            for (x, y) in a.chunks_exact(2).zip(b.chunks_exact(2)) {
+            for (x, y) in a.as_chunks::<2>().0.iter().zip(b.as_chunks::<2>().0) {
                 let (x, y) = (bf16(x), bf16(y));
                 differ += usize::from(x.to_bits() != y.to_bits());
                 max_abs = max_abs.max((x - y).abs());
