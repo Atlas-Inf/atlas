@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//!
-//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! Dynamic MTP draft depth past the K-vs-batch ladder
 //! (`ATLAS_MTP_DYNAMIC_DEPTH=1`, default off).
@@ -60,6 +58,7 @@ pub fn deep_floor(num_drafts: usize) -> usize {
 /// Verifies per ceiling decision of the per-request controller
 /// (`ATLAS_MTP_DEEP_WINDOW`, default 48, clamped to 4..=1024); a decision
 /// needs a quarter of them to have drafted the deepest position.
+// Ported from Enntity/atlas 294d2ba (AGPL-3.0-only).
 pub fn decision_window() -> u16 {
     static N: OnceLock<u16> = OnceLock::new();
     *N.get_or_init(|| {

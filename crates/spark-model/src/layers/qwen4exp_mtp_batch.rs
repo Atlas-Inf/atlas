@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//!
-//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! Batched cross-sequence propose for the qwen4_exp MTP drafter: ONE drafter
 //! forward per draft position for n sequences, chained on the device.
@@ -89,6 +87,7 @@ pub(super) fn lp_off(n: usize, d: usize) -> usize {
 }
 
 /// Attention metadata of position `j` of a slab packed for `n` rows.
+// Ported from Enntity/atlas 166e2b1 (AGPL-3.0-only).
 pub(super) fn slab_meta(slab: DevicePtr, j: usize, n: usize, max_blocks: usize) -> AttnMetadataDev {
     let hdr = slab.offset(HDR_OFF + j * HDR_BYTES);
     AttnMetadataDev {

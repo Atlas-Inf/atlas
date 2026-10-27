@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//!
-//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! Speculative decoding abstraction (SDD).
 //!
@@ -604,6 +602,7 @@ pub trait DraftProposer: Send + Sync {
     /// stream highway (`[rows, hc, hidden]` FP32, the live forward's). A
     /// proposer that rebuilds its context from the target copies them now —
     /// the next forward reuses the buffer. Default: no-op.
+    // Ported from Enntity/atlas 166e2b1, e7d4e1a (AGPL-3.0-only).
     fn stage_absorb(
         &self,
         _state: &mut dyn ProposerState,

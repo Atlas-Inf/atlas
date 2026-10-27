@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//!
-//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! Qwen3.8-Flash-Next Multi-Token-Prediction (MTP) draft proposer.
 //!
@@ -60,6 +58,7 @@ use anyhow::Result;
 use parking_lot::Mutex;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
+// Ported from Enntity/atlas 166e2b1, e7d4e1a (AGPL-3.0-only).
 use spark_runtime::kv_cache::PagedKvCache;
 
 use crate::layer::{AttnMetadataDev, ForwardContext, LayerState};

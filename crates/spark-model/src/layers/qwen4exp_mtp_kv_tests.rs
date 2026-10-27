@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//!
-//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! The drafter's KV geometry (`drafter_kv_config`).
 
 use super::*;
 use spark_runtime::gpu::mock::MockGpuBackend;
+// Ported from Enntity/atlas 166e2b1 (AGPL-3.0-only).
 use spark_runtime::kv_cache::KvCacheDtype;
 
 /// The written slot keeps a full layer's strides; the twelve slots in

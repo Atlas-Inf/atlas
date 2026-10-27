@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//!
-//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! `impl Model for TransformerModel` — thin trait impl that delegates to
 //! `<method>_dispatch` helpers split across sibling files for the ≤500
@@ -233,6 +231,7 @@ impl Model for TransformerModel {
             self.gpu.abort_capture_if_active(self.gpu.default_stream());
         }
         let out = r?;
+        // Ported from Enntity/atlas 166e2b1, e7d4e1a (AGPL-3.0-only).
         self.try_mtp_prompt_absorb(prefill_seq, prefill_tokens, stream);
         self.try_eager_drafter_prefill(prefill_seq, prefill_is_last, stream)?;
         Ok(out)

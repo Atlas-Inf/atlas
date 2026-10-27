@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//!
-//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! Bodies behind `impl Model for TransformerModel` entry points that grew
 //! GLM/vision/distributed logic: prefill stream selection + fallible eager
@@ -42,6 +40,7 @@ impl TransformerModel {
 
         (|| {
             let logits = self.prefill_dispatch(tokens, seq, stream)?;
+            // Ported from Enntity/atlas e7d4e1a (AGPL-3.0-only).
             self.try_mtp_prompt_absorb(seq, tokens, stream);
             self.try_eager_drafter_prefill(seq, true, stream)?;
             Ok(logits)

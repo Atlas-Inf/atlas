@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//!
-//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! Per-request dynamic MTP draft ceiling for deep speculation
 //! (`ATLAS_MTP_DYNAMIC_DEPTH=1`, `spark_model::speculative::deep_depth`),
@@ -96,6 +94,7 @@ impl DeepDepth {
         let floor = floor.clamp(1, max.max(1));
         if self.depth == 0 {
             // `ATLAS_MTP_DEEP_START`: begin elsewhere than the floor.
+            // Ported from Enntity/atlas 294d2ba (AGPL-3.0-only).
             spark_model::speculative::deep_depth::deep_start()
                 .map_or(floor, |s| s.clamp(floor, max.max(1)))
         } else {

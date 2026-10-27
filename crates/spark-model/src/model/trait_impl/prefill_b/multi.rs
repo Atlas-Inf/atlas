@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//!
-//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! `ATLAS_QWEN4EXP_PREFILL_MULTI=1` (default off; needs
 //! `ATLAS_QWEN4EXP_PREFILL_ROWINV=1`): several short prompts prefilled in
@@ -363,6 +361,7 @@ impl TransformerModel {
             let (len, from, count) = (tokens.len(), start[k], rows[k]);
             let src = hidden.offset(row0[k] * h * 2);
             self.try_mtp_prefill_capture_from(seq, from, count, src, stream)?;
+            // Ported from Enntity/atlas e7d4e1a (AGPL-3.0-only).
             self.note_mtp_prompt_rows(seq, from, count, row0[k]);
             let mut kv = self.kv_cache.lock();
             let bs = kv.block_size();

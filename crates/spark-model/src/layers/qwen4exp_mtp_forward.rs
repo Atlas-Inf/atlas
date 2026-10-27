@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//!
-//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! One draft step through the MTP module: the target's pre-mixer
 //! residual in, a draft logit out. Split out of `qwen4exp_mtp.rs`
@@ -34,6 +32,7 @@ impl Qwen4ExpMtpHead {
 
         // ── 1. Per-stream grouped norm of the incoming residual ──
         // Read out BEFORE step 3 overwrites `streams`.
+        // Ported from Enntity/atlas e7d4e1a (AGPL-3.0-only).
         self.stream_norms(ctx, streams, hc, self.normed_h, stream)?;
 
         // ── 2. Per-stream projection, shared weight ──

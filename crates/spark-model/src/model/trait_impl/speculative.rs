@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//!
-//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 #![allow(unused_imports, dead_code, clippy::too_many_arguments)]
 
@@ -133,6 +131,7 @@ impl TransformerModel {
             return Ok(());
         };
         // ATLAS_QWEN4EXP_MTP_PREFILL: the sampled token of the prompt's last row.
+        // Ported from Enntity/atlas e7d4e1a (AGPL-3.0-only).
         proposer.prompt_tail_token(prop_state.as_mut(), seq_tokens);
         let prompt_len = *prompt_len;
         // ATLAS_MTP_DRAFTER_PREFILL: on the FIRST propose of a sequence,

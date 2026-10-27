@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//!
-//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! Phase 2: per-token Q/K/V projection. Three branches:
 //! - n=3 + NVFP4 → batch3 GEMV path
@@ -330,6 +328,7 @@ impl Qwen3AttentionLayer {
     /// Shared q/k RMS-norm pass over the per-seq `qkv_buf` regions. Extracted
     /// so all projection branches (seq / batch2 / batch3 / batchn) defer norms
     /// to one place, after the pre-norm K/V LoRA delta.
+    // Ported from Enntity/atlas 73c19db (AGPL-3.0-only).
     pub(super) fn ms_qkv_norms(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
         let MultiSeqCtx {
             fwd,
