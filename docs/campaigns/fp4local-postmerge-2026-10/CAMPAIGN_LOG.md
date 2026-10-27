@@ -773,3 +773,31 @@ c3bf9aa25). That is a deterministic output change from ROWINV numerics. Normaliz
 cost. Multi-row is still slower: rows=2 1.11×, rows=3 1.03 / 1.31×, rows=4 1.13 / 1.40 / 1.68× at union 19 / 26 / 33
 of 40 slots. Every case byte-identical. Per-expert time roughly doubles from 1 to 4 rows (28 → 59 µs), so the kernel
 is now instruction/latency-bound in the per-row inner loop, not bandwidth-bound. Gate not met; job 25 skips again.
+
+## 2026-10-27 15:10–16:30 UTC — decode-share confirmed at n=3; OOM incident; S7 V1 progress; #208 repro still unreached
+
+**#213 decode-share, job 20 (head e05c6c325, r2, multi+ckpt env, 3 alternating fresh-boot pairs):** 6 shorts behind a
+20.6K prompt: off 16.70–17.23 s; k=8 first wave 7.24–7.79 s, second wave 12.94–13.49 s. Long prompt: off 17.4 / 17.5 /
+17.7 s, k=8 17.6 / 17.7 / 17.2 s. C=8 burst 3.31–3.32 s in both arms. Posted on #213; marked ready; rides train 2 #217.
+
+**OOM on sparky at 15:35:41.** The OOM killer took tailscaled, fwupd and user-slice processes. The tmux server went
+with them, so the runner and mem watchdog died; the health cron restarted both within the minute, and the runner moved
+on to job 22. Cause: `moe_t_rows_bench.rs` allocates ~5.3 GB of expert tables per case and never frees them. The
+variant run (job 21) reached ~20 cases ≈ 106 GB. Fix in progress: allocate once, plus a MemAvailable ≥ 20 GB guard.
+Lesson: every GPU microbench needs a memory guard; the runner only protects against overlapping jobs, not leaks.
+
+**S7 job 21 (partial, up to the OOM), ratio = `_t_rows` / K × single-row, cold:**
+
+| variant | rows=2 u19 | rows=3 u19 / u26 | rows=4 u19 / u26 / u33 | identical |
+|---|---|---|---|---|
+| v0 (ROWS templates, smem A) | 1.10 | 1.03 / 1.25 | 1.13 / 1.37 / 1.69 | yes |
+| v1 (+ 16-byte A loads) | 1.07 | 0.97 / 1.20 | 0.97 / 1.20 / 1.48 | yes |
+| v2_b64 (64 columns per CTA) | 0.93 | 0.94 / 1.22 | 0.97 / 1.19 | **no** (indexing bug) |
+
+The gate (rows=4 u26 ≤ 0.80) is still unmet. Next: fix or drop V2; V4 = 2 or 4 output columns per thread (A reused
+across columns, independent accumulator chains, each column's k-order unchanged).
+
+**#208, job 21b (`ATLAS_MARCONI_EXACT=1`):** main and train give the same cold and the same warm output, so the
+full-hit path probably still wasn't reached. Log analysis pending; no further attempt queued.
+
+**Job 22** (recipe #21 J profile via sparkrun on ghcr sha-da7985c) running since 15:35.
