@@ -877,3 +877,27 @@ template bodies are unchanged, so it ships the code job 27 measured. Union + row
 
 Note: main moved to 8863dc5e5 (the AMD session merged #197, #187, #188). #217 and the S7 branch will need a merge or
 rebase onto it; no file overlap expected.
+
+## 2026-10-27 22:18–23:15 UTC — train 2 MERGED (b7af7fa81); S7 passes in situ, +4.5% decode, byte-identical → PR #219
+
+**#217 train 2 gate, final:** BFCL ST-995 **87.44 / 87.32** (run-1793139494136338474), identical to train 1 on every
+subset; agentic 50/50, 50/50, 12.43 s/turn (run-1793128886445013968); control identical; 0 ERROR/panic. Merged as
+**b7af7fa81**, so #213 (decode-share) and #215 (cargo-deny lockfile; `cargo deny` now green) are on main.
+
+**S7 v3_b256 in situ (job 30b, clean branch 87b28ea0f vs base c3bf9aa25, default r1short, MTP 3):**
+- control byte-identical; EXACT_VERIFY_CHECK **0 mismatches** with the arm engaged; NVFP4 control identical.
+- 3 alternating fresh-boot pairs, ab_stream fixed prompts, identical completion lengths in both arms:
+  short medians 25.98 → **27.20** tok/s (n=9), agent (~17K-token prompt) 23.41 → **24.46** tok/s (n=9). Per prompt:
+  +4.0% to +4.7%. Within-arm spread ≤ 0.1 tok/s.
+- That's about +4.5% decode, below what the microbench ratio implied, because only the verify-row part of routed
+  gate_up/silu_down (~13 of ~30 ms/token in the 10-19 profile) is affected.
+- PR **#219** opened. Its merge-with-main GB10 gate (`refs/pull/219/merge`: control, agentic 50, BFCL) is queued as job 35.
+
+**Job 30c (recipe vet 4):** env 9/9, control 4/4, tool call OK. `docker logs -f` produced an EMPTY file: the
+container's spark output doesn't go to container stdout, so the 75-min stall check would have killed it again. Added
+an external heartbeat (`~/code/q10h/vet4-heartbeat.sh`) that appends container-up + `atlas_requests_total` to
+`$NQ/logs/nq-recipe21-vet4.serve.log` every 4 min while the job runs. Lesson for container jobs: the runner's stall
+detector needs a host-side progress line.
+
+Also fixed: job 30's BFCL marker never printed (`bfcl_res.py` called without its TAG argument); fixed in job 35.
+Queue: 30c (running since 23:08) → 35-s7pr-gate → 90 → 91.
