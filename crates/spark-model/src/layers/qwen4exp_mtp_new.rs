@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! Construction of the qwen4_exp MTP proposer and its per-sequence state.
 //! Split out of `qwen4exp_mtp.rs` for the 500-LoC cap.

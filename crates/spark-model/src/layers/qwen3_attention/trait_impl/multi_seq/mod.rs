@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! Multi-sequence batched-decode body for [`super::super::Qwen3AttentionLayer`].
 //! Split into phase modules under `_inner` delegation: `ctx`, `qkv`, `attn`, `ffn`.

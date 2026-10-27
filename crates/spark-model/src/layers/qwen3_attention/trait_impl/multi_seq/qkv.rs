@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! Phase 2: per-token Q/K/V projection. Three branches:
 //! - n=3 + NVFP4 → batch3 GEMV path

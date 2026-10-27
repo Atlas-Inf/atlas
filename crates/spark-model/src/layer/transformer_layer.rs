@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! `TransformerLayer` trait — composable per-layer forward/decode hooks.
 
@@ -33,6 +35,18 @@ mod default_loops;
 /// is a pure host-side layout change). 48 GDN layers x 16 tables x 32
 /// entries x 8 B = 192 KB.
 pub const VERIFY_WY_TABLE_SEQS: usize = 32;
+
+/// The decode rows of a [`TransformerLayer::decode_rows_kv_only`] call:
+/// `n` rows of `hidden` / `residual` scratch, row `i` at KV row `seq_lens[i]`.
+/// (Ported from Enntity/atlas 030ec26, AGPL-3.0-only.)
+#[derive(Clone, Copy)]
+pub struct KvRows<'a> {
+    pub hidden: DevicePtr,
+    pub residual: DevicePtr,
+    pub n: usize,
+    pub seq_lens: &'a [usize],
+    pub stream: u64,
+}
 /// Tables per GDN layer: h_state + Hi0..Hi14 (K=16 verify → 15
 /// intermediates). wy2..4 read only the first `k` slabs and wyN reads only
 /// slabs 0 (h) and 1 (Hi_0 base) — the extra slabs exist so the
@@ -878,21 +892,16 @@ pub trait TransformerLayer: Send + Sync {
         )
     }
 
-    /// Write the KV rows of `num_rows` decode rows (metadata in `ctx`, row
-    /// `i` at KV row `seq_lens[i]`) and nothing else: no attention read, FFN
-    /// or residual update. A one-layer drafter's KV row depends on its own
-    /// input row only, which is what the qwen4_exp MTP absorb
-    /// (`ATLAS_QWEN4EXP_MTP_ABSORB`) relies on. `Ok(false)` = unsupported.
-    #[allow(clippy::too_many_arguments)]
+    /// Write the KV rows of `rows` (metadata in `ctx`) and nothing else: no
+    /// attention read, FFN or residual update. A one-layer drafter's KV row
+    /// depends on its own input row only, which is what the qwen4_exp MTP
+    /// absorb (`ATLAS_QWEN4EXP_MTP_ABSORB`) relies on. `Ok(false)` =
+    /// unsupported.
     fn decode_rows_kv_only(
         &self,
-        _hidden: DevicePtr,
-        _residual: DevicePtr,
-        _num_rows: usize,
+        _rows: KvRows<'_>,
         _kv_cache: &mut PagedKvCache,
-        _seq_lens: &[usize],
         _ctx: &ForwardContext,
-        _stream: u64,
     ) -> Result<bool> {
         Ok(false)
     }

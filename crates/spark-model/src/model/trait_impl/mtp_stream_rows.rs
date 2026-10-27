@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! Stream-highway stash rows -> `hc_streams`: the input of a pre-mixer
 //! drafter (qwen4_exp), for the per-sequence and the batched propose alike.

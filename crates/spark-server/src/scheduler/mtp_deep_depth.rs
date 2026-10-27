@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! Per-request dynamic MTP draft ceiling for deep speculation
 //! (`ATLAS_MTP_DYNAMIC_DEPTH=1`, `spark_model::speculative::deep_depth`),

@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! GPU: `decode_rows_kv_only` (the absorb's and the prompt rows' KV writes)
 //! writes the drafter KV rows a full multi-row decode of the same rows
@@ -17,7 +19,7 @@
 //! ```
 
 use super::*;
-use crate::layer::KvRows;
+
 use crate::layers::ops::{DerivedWeights, GemmDispatch, ModelLevers, ModelStats};
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::kv_cache::KvCacheDtype;
@@ -154,7 +156,7 @@ fn qwen4exp_mtp_kv_only_gpu_matches_the_full_decode() {
                 .unwrap();
             let body_ctx = head.body_ctx(&ctx, meta);
             if kv_only {
-                let rows = KvRows {
+                let rows = crate::layer::KvRows {
                     hidden: buffers.hidden_states(),
                     residual: buffers.residual(),
                     n,

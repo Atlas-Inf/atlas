@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! One draft step through the MTP module: the target's pre-mixer
 //! residual in, a draft logit out. Split out of `qwen4exp_mtp.rs`

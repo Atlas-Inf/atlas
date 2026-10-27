@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! The drafter's KV over the prompt (`ATLAS_QWEN4EXP_MTP_PREFILL=<rows>`,
 //! default off: an acceptance switch; drafts only propose).
@@ -306,13 +308,15 @@ impl Qwen4ExpMtpHead {
                 moe_row_adapter: DevicePtr::NULL,
             };
             let written = self.module.body.decode_rows_kv_only(
-                ctx.buffers.hidden_states(),
-                ctx.buffers.residual(),
-                n,
+                crate::layer::KvRows {
+                    hidden: ctx.buffers.hidden_states(),
+                    residual: ctx.buffers.residual(),
+                    n,
+                    seq_lens: &kv_rows,
+                    stream,
+                },
                 kv,
-                &kv_rows,
                 &self.body_ctx(ctx, meta),
-                stream,
             )?;
             anyhow::ensure!(
                 written,

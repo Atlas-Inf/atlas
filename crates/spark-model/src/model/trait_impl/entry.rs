@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! Bodies behind `impl Model for TransformerModel` entry points that grew
 //! GLM/vision/distributed logic: prefill stream selection + fallible eager

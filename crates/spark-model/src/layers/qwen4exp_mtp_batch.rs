@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! Batched cross-sequence propose for the qwen4_exp MTP drafter: ONE drafter
 //! forward per draft position for n sequences, chained on the device.

@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 //! The drafter absorbs the target's verified rows
 //! (`ATLAS_QWEN4EXP_MTP_ABSORB=1`, default off: an acceptance switch; drafts
@@ -323,13 +325,15 @@ impl Qwen4ExpMtpHead {
             self.stage_rows_input(&self.own_scratch(), self.batch_slab, n, ctx, stream)?;
             let meta = qwen4exp_mtp_batch::slab_meta(self.batch_slab, 0, n, slab.max_blocks);
             let written = self.module.body.decode_rows_kv_only(
-                ctx.buffers.hidden_states(),
-                ctx.buffers.residual(),
-                n,
+                crate::layer::KvRows {
+                    hidden: ctx.buffers.hidden_states(),
+                    residual: ctx.buffers.residual(),
+                    n,
+                    seq_lens: &kv_rows,
+                    stream,
+                },
                 &mut kv,
-                &kv_rows,
                 &self.body_ctx(ctx, meta),
-                stream,
             )?;
             anyhow::ensure!(
                 written,
