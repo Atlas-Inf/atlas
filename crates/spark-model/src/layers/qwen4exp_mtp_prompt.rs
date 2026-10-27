@@ -13,14 +13,14 @@
 //! has why that suffices), over the last `<rows>` prompt positions:
 //!
 //! 1. At each prefill chunk's capture point the model notes which highway
-//!    rows hold the chunk's final streams ([`Qwen4ExpMtpHead::note_prompt_rows_impl`]).
+//!    rows hold the chunk's final streams (`Qwen4ExpMtpHead::note_prompt_rows_impl`).
 //! 2. After the chunk's prefill returns (its logits computed: the pass
 //!    reuses the model's activation buffers) the drafter writes position
 //!    `p + 1` from row `p` and prompt token `t_{p+1}`
-//!    ([`Qwen4ExpMtpHead::absorb_prompt_impl`]), in passes of [`PASS_ROWS`].
+//!    (`Qwen4ExpMtpHead::absorb_prompt_impl`), in passes of `PASS_ROWS`.
 //! 3. The chunk's last row has no next token yet when it is the prompt's
 //!    last: it is staged, and the first propose (whose sequence holds the
-//!    sampled token) appends it ([`Qwen4ExpMtpHead::prompt_tail_token_impl`]).
+//!    sampled token) appends it (`Qwen4ExpMtpHead::prompt_tail_token_impl`).
 //!    A middle chunk's last row pairs with the next chunk's first token.
 //!
 //! What it cannot see, and leaves blind: a restored prefix (prefix cache,

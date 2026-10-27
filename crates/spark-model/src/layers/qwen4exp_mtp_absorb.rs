@@ -18,12 +18,12 @@
 //! the target's streams (TensorFold `absorb`), so the drafter's context is
 //! exact for every committed token. This does the same:
 //!
-//! 1. [`Qwen4ExpMtpHead::stage_absorb_impl`], after the verify and before any
+//! 1. `Qwen4ExpMtpHead::stage_absorb_impl`, after the verify and before any
 //!    forward reuses its buffers: copy verify rows `0 .. na` of the target's
 //!    final streams and the `na` accepted drafts into the sequence's stage.
 //! 2. The verdict keeps at least row 0 (the switch implies
 //!    `ATLAS_QWEN4EXP_MTP_KV_KEEP`'s row rule, `qwen4exp_mtp_kv.rs`).
-//! 3. [`Qwen4ExpMtpHead::absorb_before_propose`], at the next propose: rewind
+//! 3. `Qwen4ExpMtpHead::absorb_before_propose`, at the next propose: rewind
 //!    the drafter to row 0 and write positions `Q + 1 ..= Q + na` from the
 //!    staged `(h_{Q+j}, d_j)` pairs, KV only
 //!    (`TransformerLayer::decode_rows_kv_only`: a one-layer drafter's KV row
