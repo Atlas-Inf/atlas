@@ -118,3 +118,19 @@ fn shards_in_a_subdirectory_receive_their_tensors() {
     );
     assert!(tensors_routed_to(&map, dir, &dir.join("model-00001-of-00002.safetensors")).is_empty());
 }
+
+/// The tensors an index routes to `shard_path`, compared as PATHS under
+/// `model_dir` (the FP4-Local pack routes every tensor to
+/// `tensors/model-000NN-of-00021.safetensors`; matching by bare file name
+/// found nothing). Kept here to pin the lookup `by_shard` does once in
+/// `resolve_shards` after the production call site moved to it.
+fn tensors_routed_to(
+    map: &HashMap<String, String>,
+    model_dir: &Path,
+    shard_path: &Path,
+) -> Vec<String> {
+    map.iter()
+        .filter(|(_, s)| model_dir.join(s.as_str()) == shard_path)
+        .map(|(t, _)| t.clone())
+        .collect()
+}
