@@ -9,9 +9,10 @@
 // (`openai::delta_to_chunk_events`).
 
 use crate::ir::StreamDelta;
+use crate::literal_xml::{first_marker_outside_literal, state_after};
 use crate::tool_parser;
 
-use super::super::sanitizer::sanitize_content_chunk;
+use super::super::sanitizer::sanitize_content_chunk_with_literal_state;
 use super::super::stream_guards::{bump_f12_tool_call_count, check_loop_watchdog};
 use super::ctx::StreamCtx;
 use super::state::StreamState;
@@ -147,9 +148,19 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
     // GLM's native opener ends reasoning and must also reach the existing
     // content/tool parser. The startup carrier is model-scoped, not inferred
     // from the display name or from tool-shaped reasoning text.
+    let native_marker_is_literal = ctx.state.glm_tool_boundary == Some(tok)
+        && state.detector.is_some()
+        && state.all_toks.len() > 1
+        && ctx
+            .state
+            .tokenizer
+            .decode(&state.all_toks[..state.all_toks.len() - 1])
+            .ok()
+            .is_some_and(|prefix| state_after(&prefix).is_literal());
     let implicit_tool = !state.thinking_done
         && state.detector.is_some()
-        && ctx.state.glm_tool_boundary == Some(tok);
+        && ctx.state.glm_tool_boundary == Some(tok)
+        && !native_marker_is_literal;
     // ── Thinking-phase: token-ID based boundary detection ──────────
     if !state.thinking_done && (ctx.state.think_end_token_id == Some(tok) || implicit_tool) {
         // Keep the opener out of a residual reasoning delta's token IDs;
@@ -242,6 +253,7 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
             if stable_end > state.emitted {
                 let raw = state.content_decoded[state.emitted..stable_end].to_string();
                 let mut cleaned = raw.clone();
+                let reasoning_literal_before = state.reasoning_literal_xml_state;
                 state.emitted = stable_end;
                 // Strip format tokens that shouldn't appear in thinking.
                 // `<think>` only fires at the literal opener (always
@@ -269,16 +281,28 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
                 // Boundary-preserving strip: see `strip_preserving_boundary`
                 // doc — prevents `the<tool_call>...</tool_call>project`
                 // from collapsing to `theproject`.
-                while let Some(start) = cleaned.find("<tool_call>") {
-                    if let Some(end_rel) = cleaned[start..].find("</tool_call>") {
-                        let end = start + end_rel + "</tool_call>".len();
+                while let Some((start, _)) = first_marker_outside_literal(
+                    &cleaned,
+                    reasoning_literal_before,
+                    &["<tool_call>"],
+                ) {
+                    if let Some((end_rel, end_len)) = first_marker_outside_literal(
+                        &cleaned[start..],
+                        reasoning_literal_before,
+                        &["</tool_call>"],
+                    ) {
+                        let end = start + end_rel + end_len;
                         cleaned = strip_preserving_boundary(&cleaned, start, end);
                     } else {
                         cleaned = cleaned[..start].to_string();
                         break;
                     }
                 }
-                if let Some(start) = cleaned.find("<function=") {
+                if let Some((start, _)) = first_marker_outside_literal(
+                    &cleaned,
+                    reasoning_literal_before,
+                    &["<function="],
+                ) {
                     cleaned = cleaned[..start].to_string();
                 }
                 // Strip leaked tool-call closing tags from reasoning
@@ -288,7 +312,12 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
                 // to avoid gluing words when a closing tag straddles
                 // two reasoning sentences.
                 for tag in &["</parameter>", "</function>", "</tool_call>"] {
-                    cleaned = strip_all_preserving_boundary(&cleaned, tag);
+                    while let Some((start, len)) =
+                        first_marker_outside_literal(&cleaned, reasoning_literal_before, &[*tag])
+                    {
+                        cleaned =
+                            strip_all_preserving_boundary(&cleaned, &cleaned[start..start + len]);
+                    }
                 }
                 // Collapse role-word repetition loops (Qwen3.5/3.6
                 // post-tool-call hallucination): `userX...userX` →
@@ -326,13 +355,19 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
                             .find(|&(i, _)| i >= drop_to)
                             .map(|(i, _)| i)
                             .unwrap_or(state.reasoning_xml_scan_buf.len());
+                        let dropped = state.reasoning_xml_scan_buf[..cut].to_string();
+                        state.reasoning_xml_scan_state.feed(&dropped);
                         state.reasoning_xml_scan_buf.drain(..cut);
                     }
-                    let opener = ["<tool_call>", "<function=", "<parameter=", "<invoke "]
-                        .iter()
-                        .copied()
-                        .filter_map(|m| state.reasoning_xml_scan_buf.find(m).map(|at| (at, m)))
-                        .min_by_key(|&(at, _)| at);
+                    let opener = first_marker_outside_literal(
+                        &state.reasoning_xml_scan_buf,
+                        state.reasoning_xml_scan_state,
+                        &["<tool_call>", "<function=", "<parameter=", "<invoke "],
+                    )
+                    .and_then(|(at, len)| {
+                        let marker = state.reasoning_xml_scan_buf[at..at + len].to_string();
+                        Some((at, marker))
+                    });
                     if let Some((at, op)) = opener {
                         // Snapshot the log tail BEFORE consuming the match,
                         // so the WARN still shows the opener in context.
@@ -348,6 +383,8 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
                         // occurrence is counted once, not on every
                         // subsequent delta the rolling tail still contains
                         // it in.
+                        let consumed = state.reasoning_xml_scan_buf[..at + op.len()].to_string();
+                        state.reasoning_xml_scan_state.feed(&consumed);
                         state.reasoning_xml_scan_buf.drain(..at + op.len());
                         state.reasoning_xml_opener_hits =
                             state.reasoning_xml_opener_hits.saturating_add(1);
@@ -397,11 +434,12 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
                 }
                 // F19: final structured sanitisation pass catches
                 // any leak markers the hand-rolled cleanups missed.
-                let cleaned = sanitize_content_chunk(
+                let cleaned = sanitize_content_chunk_with_literal_state(
                     &cleaned,
                     &mut state.reasoning_tag_scan_buf,
                     &mut state.reasoning_suppressing_leak,
                     &mut state.reasoning_inside_envelope,
+                    &mut state.reasoning_literal_xml_state,
                     &ctx.leak_markers,
                 );
                 // Emit whitespace-only chunks too. The `sanitize_content_chunk`
@@ -493,7 +531,10 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
         let tools_active_request =
             !ctx.tool_defs_for_backfill.is_empty() || state.detector.is_some();
         if !tools_active_request {
-            delta = crate::api::strip::strip_orphan_tool_markup(&delta);
+            delta = crate::api::strip::strip_orphan_tool_markup_with_literal_state(
+                &delta,
+                &state.literal_xml_state,
+            );
         }
     }
 
@@ -548,11 +589,12 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
         // Tokens queued AFTER a guard or stop match are rejected at handle_token
         // entry, before detokenization, content accumulation or token-ID tracking.
         if !delta.is_empty() {
-            let cleaned = sanitize_content_chunk(
+            let cleaned = sanitize_content_chunk_with_literal_state(
                 &delta,
                 &mut state.tag_scan_buf,
                 &mut state.suppressing_param_leak,
                 &mut state.inside_envelope,
+                &mut state.literal_xml_state,
                 &ctx.leak_markers,
             );
             if !cleaned.is_empty() {
@@ -608,11 +650,12 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
             }
         }
     } else {
-        let sanitized = sanitize_content_chunk(
+        let sanitized = sanitize_content_chunk_with_literal_state(
             &delta,
             &mut state.tag_scan_buf,
             &mut state.suppressing_param_leak,
             &mut state.inside_envelope,
+            &mut state.literal_xml_state,
             &ctx.leak_markers,
         );
         if let Some(events_out) = process_detector_content(state, ctx, &sanitized) {
@@ -723,11 +766,12 @@ fn process_detector_content(
 /// Detector-active branch's `Content(text)` arm: sanitize first,
 /// then run the shared semantic/token watchdog + emit pipeline.
 fn detector_content_arm(state: &mut StreamState, ctx: &StreamCtx, text: &str) -> Option<DeltaVec> {
-    let sanitized = sanitize_content_chunk(
+    let sanitized = sanitize_content_chunk_with_literal_state(
         text,
         &mut state.tag_scan_buf,
         &mut state.suppressing_param_leak,
         &mut state.inside_envelope,
+        &mut state.literal_xml_state,
         &ctx.leak_markers,
     );
     process_detector_content(state, ctx, &sanitized)
