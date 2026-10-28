@@ -159,7 +159,7 @@ fn build_mtp_moe(
     let inter = config.moe_intermediate_size;
     let n_experts = config.num_experts;
     let absmax_k = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
-    let quantize_k = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
+    let quantize_k = gpu.kernel("quantize_nvfp4", super::mode::weight_quantizer()?)?;
     let stream = gpu.default_stream();
 
     let mlp = format!("{MTP_LAYER_PREFIX}.mlp");
@@ -305,7 +305,7 @@ pub fn load_qwen4exp_mtp_module(
     let h = config.hidden_size;
     let variant = crate::weight_map::detect_nvfp4_variant(store, config);
     let absmax_k = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
-    let quantize_k = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
+    let quantize_k = gpu.kernel("quantize_nvfp4", super::mode::weight_quantizer()?)?;
     let stream = gpu.default_stream();
     let free_before = gpu.free_memory().unwrap_or(0) as u64;
 

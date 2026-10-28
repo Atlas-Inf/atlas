@@ -82,6 +82,7 @@ mod ffn;
 mod gdn_fp8;
 mod gdn_mx8;
 mod hc;
+pub mod mode;
 mod mtp;
 mod mx8_common;
 mod ple;
