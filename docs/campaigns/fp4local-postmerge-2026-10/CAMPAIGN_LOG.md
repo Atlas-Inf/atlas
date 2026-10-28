@@ -1059,3 +1059,19 @@ Proposed as the next work item for the owner. Not started overnight (large, desi
 Job 41 (86c11d766): control identical; agentic 50/50, 50/50, **11.19 s/turn**, harness decode 24.81 tok/s
 (run-1793181820586414906). Same default profile, by build: main 12.43 s/turn / 22.05 tok/s → #219 11.99 / 22.92 →
 #228 11.19 / 24.81. Single run per build, consistent with the fixed-prompt A/Bs. BFCL running (~13:00).
+
+## 2026-10-28 12:50 UTC — #228 (S7.1) MERGED (87df79b2f)
+
+Job 41 final: BFCL ST-995 **87.44 / 87.32** (run-1793191492360335768), all 15 subsets identical to main; agentic 50/50,
+50/50, 11.19 s/turn, 24.81 tok/s; control identical; TTFT p50/p90 639/3,026 ms (unchanged); 0 ERROR/panic. Merged.
+
+Main (default FP4-Local recipe profile, single GB10) over this campaign, same harness:
+
+| main | agentic s/turn | harness decode tok/s | short-prompt decode (fixed prompts) | ~17K agent decode |
+|---|---|---|---|---|
+| b7af7fa81 (before S7) | 12.43 | 22.05 | 25.98 | 23.41 |
+| db442e2d4 (+ #219) | 11.99 | 22.92 | 27.20 | 24.46 |
+| **87df79b2f (+ #228)** | **11.19** | **24.81** | **34.22** | **27.06** |
+
+BFCL 87.44 / 87.32 unchanged throughout. Every decode change was byte-identical (control, EXACT_VERIFY_CHECK and
+BATCH_FAST_CHECK all 0 rows differ). The per-build s/turn values are single runs; the decode columns are 3-pair medians.
