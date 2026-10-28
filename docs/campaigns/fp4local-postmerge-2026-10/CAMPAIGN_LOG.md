@@ -1053,3 +1053,9 @@ Options, with estimates from the job-36 idle distribution (preliminary):
 2. PLE-only (still QSA-vetoed): ~2–2.5 ms/token at best.
 3. Drafter-only piece: < 1 ms/token.
 Proposed as the next work item for the owner. Not started overnight (large, design-level change).
+
+## 2026-10-28 10:03 UTC — #228 (S7.1) gate agentic: 11.19 s/turn
+
+Job 41 (86c11d766): control identical; agentic 50/50, 50/50, **11.19 s/turn**, harness decode 24.81 tok/s
+(run-1793181820586414906). Same default profile, by build: main 12.43 s/turn / 22.05 tok/s → #219 11.99 / 22.92 →
+#228 11.19 / 24.81. Single run per build, consistent with the fixed-prompt A/Bs. BFCL running (~13:00).
