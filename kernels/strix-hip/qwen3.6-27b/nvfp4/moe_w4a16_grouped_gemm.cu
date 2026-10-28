@@ -1146,9 +1146,16 @@ __device__ __forceinline__ uint4 bf16x8_to_f16x8(uint4 v) {
 
 #define MOEF_M_TILE 64
 #define MOEF_N_TILE 128
-#define MOEF_K_STEP 32
+// K_STEP 64: each warp holds one 16-row accumulator set, so a 32-wide K step issued
+// only 16 WMMA between its two barriers (the dense m128 kernel issues 32). At 64 the
+// barrier and staging cost per WMMA halves; LDS is ~28 KB, still 4 CTAs per WGP. Each
+// output still accumulates its 16-wide K blocks in the same order: bit-identical.
+// Warps whose 16 rows all lie past M_expert skip their (never-stored) WMMA too.
+// strix in-process bench at Flash-Next routing (512 experts, s79): 1.09-1.17x at
+// ~40 and ~160 rows/expert, 100% bit-equal.
+#define MOEF_K_STEP 64
 #define MOEF_GROUP 16
-#define MOEF_B_ROW 40
+#define MOEF_B_ROW 72
 #define MOEF_B_OFF(n) ((n) * MOEF_B_ROW + ((n) >> 4) * 8)
 
 // Shared body. `B_expert`/`S_expert`/`scale2`/`C` are resolved by the caller.
@@ -1178,34 +1185,47 @@ __device__ __forceinline__ void moef_body(
     v8f acc[8];
     #pragma unroll
     for (int i = 0; i < 8; i++) acc[i] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
+    const bool warp_live = (cta_m_local + (int)warp_m_offset) < M_expert;
 
-    // A: 64 rows x 32 cols f16 = 2 rows of uint4 per thread; B as in m128.
-    const unsigned int a_row_base = threadIdx.x >> 2;
-    const unsigned int a_col = (threadIdx.x & 3) << 3;
+    // K_STEP 64: A is 64 rows x 64 cols f16 = 4 uint4 per thread (rows r, r+16, r+32, r+48);
+    // B is 32 k-pairs x 128 n = two uint4 per thread (k-pairs kp and kp + 16).
+    const unsigned int a_row_base = threadIdx.x >> 3;
+    const unsigned int a_col = (threadIdx.x & 7) << 3;
     const unsigned int b_kp = threadIdx.x >> 3;
     const unsigned int b_ns = (threadIdx.x & 7) << 4;
-    const unsigned int a_row0 = (unsigned int)smem_tok[a_row_base];
-    const unsigned int a_row1 = (unsigned int)smem_tok[32 + a_row_base];
-    const bool a_ok0 = (cta_m_local + (int)a_row_base) < M_expert;
-    const bool a_ok1 = (cta_m_local + 32 + (int)a_row_base) < M_expert;
+    unsigned int a_row[4]; bool a_ok[4];
+    #pragma unroll
+    for (int q = 0; q < 4; q++) {
+        a_row[q] = (unsigned int)smem_tok[16 * q + a_row_base];
+        a_ok[q] = (cta_m_local + 16 * q + (int)a_row_base) < M_expert;
+    }
 
     #define MOEF_LOAD(kb, ra, rb, rs) do { \
         const unsigned int gc = (kb) + a_col; \
-        (ra)[0] = (a_ok0 && gc + 7 < K) ? *(const uint4*)&A[(unsigned long long)a_row0 * K + gc] : uint4{0, 0, 0, 0}; \
-        (ra)[1] = (a_ok1 && gc + 7 < K) ? *(const uint4*)&A[(unsigned long long)a_row1 * K + gc] : uint4{0, 0, 0, 0}; \
-        const unsigned int gke = (kb) + (b_kp << 1); \
+        _Pragma("unroll") \
+        for (int q = 0; q < 4; q++) \
+            (ra)[q] = (a_ok[q] && gc + 7 < K) ? *(const uint4*)&A[(unsigned long long)a_row[q] * K + gc] : uint4{0, 0, 0, 0}; \
         const unsigned int gns = cta_n + b_ns; \
-        (rb) = ((gke + 1 <= K) && (gns + 15 < N)) \
-            ? *(const uint4*)&B_expert[(unsigned long long)(gke >> 1) * N + gns] : uint4{0, 0, 0, 0}; \
-        const unsigned int sg = (kb) / MOEF_GROUP + (b_kp >> 3); \
-        (rs) = (gns + 15 < N) ? *(const uint4*)&S_expert[(unsigned long long)sg * N + gns] : uint4{0, 0, 0, 0}; \
+        _Pragma("unroll") \
+        for (int hh2 = 0; hh2 < 2; hh2++) { \
+            const unsigned int kp = b_kp + 16u * hh2; \
+            const unsigned int gke = (kb) + (kp << 1); \
+            (rb)[hh2] = ((gke + 1 <= K) && (gns + 15 < N)) \
+                ? *(const uint4*)&B_expert[(unsigned long long)(gke >> 1) * N + gns] : uint4{0, 0, 0, 0}; \
+            const unsigned int sg = (kb) / MOEF_GROUP + (kp >> 3); \
+            (rs)[hh2] = (gns + 15 < N && gke < K) ? *(const uint4*)&S_expert[(unsigned long long)sg * N + gns] : uint4{0, 0, 0, 0}; \
+        } \
     } while (0)
 
     #define MOEF_STORE(buf, ra, rb, rs) do { \
-        *(uint4*)&smem_A[(buf)][a_row_base][a_col] = A_BF16 ? bf16x8_to_f16x8((ra)[0]) : (ra)[0]; \
-        *(uint4*)&smem_A[(buf)][32 + a_row_base][a_col] = A_BF16 ? bf16x8_to_f16x8((ra)[1]) : (ra)[1]; \
-        const unsigned int* pw = (const unsigned int*)&(rb); \
-        const unsigned int* ps = (const unsigned int*)&(rs); \
+        _Pragma("unroll") \
+        for (int q = 0; q < 4; q++) \
+            *(uint4*)&smem_A[(buf)][16 * q + a_row_base][a_col] = A_BF16 ? bf16x8_to_f16x8((ra)[q]) : (ra)[q]; \
+        _Pragma("unroll") \
+        for (int hh2 = 0; hh2 < 2; hh2++) { \
+        const unsigned int kp = b_kp + 16u * hh2; \
+        const unsigned int* pw = (const unsigned int*)&(rb)[hh2]; \
+        const unsigned int* ps = (const unsigned int*)&(rs)[hh2]; \
         _Pragma("unroll") \
         for (int d = 0; d < 4; d++) { \
             const unsigned int hl = e2m1x4_f16hi(pw[d] & 0x0F0F0F0Fu); \
@@ -1219,15 +1239,16 @@ __device__ __forceinline__ void moef_body(
                 v2h w; __builtin_memcpy(&w, &wb, 4); \
                 const _Float16 s = (j == 0) ? s01.x : (j == 1) ? s01.y : (j == 2) ? s23.x : s23.y; \
                 w = w * (v2h){s, s}; \
-                *(v2h*)&smem_B[(buf)][MOEF_B_OFF(b_ns + d * 4 + j) + b_kp * 2] = w; \
+                *(v2h*)&smem_B[(buf)][MOEF_B_OFF(b_ns + d * 4 + j) + kp * 2] = w; \
             } \
+        } \
         } \
     } while (0)
 
-    #define MOEF_COMPUTE(buf) do { \
+    #define MOEF_COMPUTE(buf) if (warp_live) do { \
         const unsigned int m_row = warp_m_offset + (lane_id & 15); \
         _Pragma("unroll") \
-        for (int h = 0; h < 2; h++) { \
+        for (int h = 0; h < 4; h++) { \
             v16h a; __builtin_memcpy(&a, &smem_A[(buf)][m_row][h * 16], 32); \
             _Pragma("unroll") \
             for (int nb = 0; nb < 8; nb++) { \
@@ -1237,7 +1258,7 @@ __device__ __forceinline__ void moef_body(
         } \
     } while (0)
 
-    uint4 ra[2], rb, rs;
+    uint4 ra[4], rb[2], rs[2];
     MOEF_LOAD(0, ra, rb, rs);
     MOEF_STORE(0, ra, rb, rs);
     __syncthreads();
