@@ -77,7 +77,10 @@ impl MoeLayer {
             row_invariant_bf16_router: false,
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_sw: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
-            // Untransposed router GEMM (Enntity s64 twin on native HIP).
+            // Untransposed router GEMM. On native HIP this resolves to the
+            // bit-identical `w4a16_gemm_s64` twin (64-deep K stage) when the
+            // target ships it; every other target keeps `w4a16_gemm`. See
+            // layers/ops/strix_s64.rs.
             w4a16_gemm: crate::layers::ops::w4a16_gemm_kernel(gpu)?,
             dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             dense_gemm_router: super::super::try_kernel(gpu, "gemm", "dense_gemm_bf16_router"),
