@@ -4,8 +4,9 @@
 /// Ported from Enntity/atlas fa5331b2 et seq. (AGPL-3.0-only).
 #[derive(clap::Args, Debug, Clone, PartialEq)]
 pub struct ToolGuardArgs {
-    /// Screen complete tool calls before release (on by default).
-    #[arg(long, default_value = "on", value_parser = ["on", "off"])]
+    /// Screen complete tool calls before release (off by default here;
+    /// SparkQwen ships it on — enable with `--tool-guard on`).
+    #[arg(long, default_value = "off", value_parser = ["on", "off"])]
     pub tool_guard: String,
     /// Exact host exception for callback/credential-transfer checks; repeatable.
     /// Does not override metadata protection or an explicit denied host.
@@ -35,7 +36,11 @@ mod tests {
     use clap::Parser;
     #[test]
     fn tool_guard_default_and_operator_configuration() {
-        for (extra, enabled) in [(vec![], true), (vec!["--tool-guard", "off"], false)] {
+        for (extra, enabled) in [
+            (vec![], false),
+            (vec!["--tool-guard", "off"], false),
+            (vec!["--tool-guard", "on"], true),
+        ] {
             let mut args = vec!["spark", "serve", "fixture"];
             args.extend(extra);
             let Command::Serve(s) = Cli::try_parse_from(args).unwrap().command else {
