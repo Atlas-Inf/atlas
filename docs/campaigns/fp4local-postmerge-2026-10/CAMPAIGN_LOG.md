@@ -1165,3 +1165,12 @@ MMA). Earlier measurements on this box: cuBLAS reaches 75–206 TFLOP/s; vLLM's 
 changes numerics (accumulation order / FP4 MMA), so it needs BFCL gating.** The byte-exact levers are each ≤ ~5–8%: host
 readbacks, and hc kernels (`hc_post_vec` + `hc_pre_stage` ≈ 1.3 s at P17K, ~2× under bandwidth by estimate). QSA
 attention (2.4 s at P17K) is latency-bound per earlier work.
+
+## 2026-10-28 21:45 UTC — owner: MoE prefill GEMM throughput first
+
+Phase 1 (in progress): read both production kernels (`moe_w4a16_fused_gate_up_t_k64`,
+`moe_w4a16_grouped_gemm_ptrtable_t_k64`): grid/tiles/MMA/pipelining, dequant placement, small-M handling,
+per-element K order. Then an isolated microbench at FP4-Local shapes (T = 2.9K / 19.2K, top-10 of 512) against on-box
+ceilings (cuBLAS BF16 at equivalent shapes, a pure NVFP4 weight-streaming read), plus dequant-only / MMA-only
+diagnostic variants. Key question: can a re-tiled W4A16 kernel keep the same MMA instruction and per-element K order?
+If so it stays byte-identical (lighter gating than native-FP4 W4A4, which changes activation numerics).
