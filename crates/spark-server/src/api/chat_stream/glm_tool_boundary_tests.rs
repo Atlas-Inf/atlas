@@ -31,7 +31,7 @@ mod blocking_vision_choices_tests;
 
 fn app(glm: bool) -> Arc<AppState> {
     app_for_model(
-        if glm { "glm5_next" } else { "qwen4_exp" },
+        if glm { "glm5_next" } else { "qwen3" },
         tool_parser::ToolCallFormat::PoolsideV1,
     )
 }
