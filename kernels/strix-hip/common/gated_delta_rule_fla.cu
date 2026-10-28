@@ -192,12 +192,20 @@ gated_delta_rule_recompute_wu(
     // Two independent right-looking forward-subs on disjoint halves — identical
     // to gb10 (RL_BLK must stay compile-time or xb spills to local).
     if (tid < v_dim) {
+        // acc[] is indexed only by compile-time loop counters (bounds CHUNK, the
+        // runtime ce becomes a predicate), so it stays in VGPRs instead of 272 B of
+        // scratch. Same operations, same order per element: bit-identical.
         float acc[CHUNK];
-        for (unsigned int i = 0; i < ce; i++) {
-            float bi = beta[(unsigned long long)(cs + i) * gb_stride + vh];
-            acc[i] = bi * (float)value[(unsigned long long)(cs + i) * v_stride + vh * v_dim + tid];
+        #pragma unroll
+        for (unsigned int i = 0; i < CHUNK; i++) {
+            if (i < ce) {
+                float bi = beta[(unsigned long long)(cs + i) * gb_stride + vh];
+                acc[i] = bi * (float)value[(unsigned long long)(cs + i) * v_stride + vh * v_dim + tid];
+            }
         }
-        for (unsigned int jb = 0; jb < ce; jb += RL_BLK) {
+        #pragma unroll
+        for (unsigned int jb = 0; jb < CHUNK; jb += RL_BLK) {
+            if (jb >= ce) continue;
             float xb[RL_BLK];
             #pragma unroll
             for (unsigned int r = 0; r < RL_BLK; r++) {
@@ -211,7 +219,9 @@ gated_delta_rule_recompute_wu(
                 acc[jb + r] = x;
                 U_out[base * CHUNK * V_DIM + (jb + r) * v_dim + tid] = __float2bfloat16(x);
             }
-            for (unsigned int i = jb + RL_BLK; i < ce; i++) {
+            #pragma unroll
+            for (unsigned int i = jb + RL_BLK; i < CHUNK; i++) {
+                if (i >= ce) continue;
                 float a = acc[i];
                 #pragma unroll
                 for (unsigned int q = 0; q < RL_BLK; q++) {
@@ -224,11 +234,16 @@ gated_delta_rule_recompute_wu(
     const unsigned int wtid = tid - 128u;
     if (tid >= 128u && wtid < k_dim) {
         float acc[CHUNK];
-        for (unsigned int i = 0; i < ce; i++) {
-            float bi = beta[(unsigned long long)(cs + i) * gb_stride + vh];
-            acc[i] = bi * expf(gc[i]) * (float)sk[i * K_DIM + wtid];
+        #pragma unroll
+        for (unsigned int i = 0; i < CHUNK; i++) {
+            if (i < ce) {
+                float bi = beta[(unsigned long long)(cs + i) * gb_stride + vh];
+                acc[i] = bi * expf(gc[i]) * (float)sk[i * K_DIM + wtid];
+            }
         }
-        for (unsigned int jb = 0; jb < ce; jb += RL_BLK) {
+        #pragma unroll
+        for (unsigned int jb = 0; jb < CHUNK; jb += RL_BLK) {
+            if (jb >= ce) continue;
             float xb[RL_BLK];
             #pragma unroll
             for (unsigned int r = 0; r < RL_BLK; r++) {
@@ -242,7 +257,9 @@ gated_delta_rule_recompute_wu(
                 acc[jb + r] = x;
                 W_out[base * CHUNK * K_DIM + (jb + r) * k_dim + wtid] = __float2bfloat16(x);
             }
-            for (unsigned int i = jb + RL_BLK; i < ce; i++) {
+            #pragma unroll
+            for (unsigned int i = jb + RL_BLK; i < CHUNK; i++) {
+                if (i >= ce) continue;
                 float a = acc[i];
                 #pragma unroll
                 for (unsigned int q = 0; q < RL_BLK; q++) {
