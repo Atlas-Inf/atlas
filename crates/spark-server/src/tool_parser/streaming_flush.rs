@@ -92,7 +92,7 @@ impl StreamingToolDetector {
 
         // Try bare function detection on the remaining buffer.
         // Only if no tool calls were already found (avoid duplicate extraction).
-        if !self.has_tool_calls() && !self.emitted_tool_calls {
+        if !was_inside_tag && !self.has_tool_calls() && !self.emitted_tool_calls {
             let (content, calls) = parse_bare_function_calls(&text);
             if !calls.is_empty() {
                 let mut out = Vec::new();
@@ -111,7 +111,7 @@ impl StreamingToolDetector {
         // Fallback: JSON tool calls without any XML wrapper.
         // Nemotron-H Super 120B sometimes outputs Hermes-style JSON or JSON
         // in code blocks instead of <tool_call> XML. Catch those here.
-        if !self.has_tool_calls() && !self.emitted_tool_calls {
+        if !was_inside_tag && !self.has_tool_calls() && !self.emitted_tool_calls {
             let json_calls = parse_json_fallback_calls(&text);
             if !json_calls.is_empty() {
                 let mut out = Vec::new();
