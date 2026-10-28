@@ -912,3 +912,16 @@ Job 30c, sparkrun on ghcr sha-da7985c (image sha256:63f2e1e1c091…, revision la
 
 Pushed to sparkrun-recipes `recipe/qwen38-flash-next-fp4-local` (fast-forward 2cbe348 → 66b5fb0) and commented on #21.
 The owner merges. Job 35 (#219 merge gate) started at 03:21.
+
+## 2026-10-28 04:41 UTC — #219 merge gate agentic: 11.99 s/turn (main 12.43); next = decode re-profile
+
+Job 35 (`refs/pull/219/merge` 949fa6b72 = #219 on main b7af7fa81): control byte-identical; agentic 50/50, 50/50,
+**11.99 s/turn**, harness decode 22.92 tok/s (run-1793162479652381763). Train 2 / main tree: 12.43 s/turn, 22.05 tok/s.
+Single run per arm, consistent with the fixed-prompt +4.5%. BFCL running.
+
+Next iteration, queued as job 36: nsys decode profile, main vs main + S7, top-20 kernels per generated token, idle gaps,
+achieved GB/s. Code recon so far:
+- `mxfp8_proj_batchm` already batches all verify rows into one launch (`qwen3_ssm/exact_rows.rs:43`), so the S7
+  dedup idea doesn't transfer; any win there has to come from inside that kernel.
+- No CUDA graphs on this path: zero "graph" lines in any FP4-Local r1short serve log, so decode/verify runs fully
+  eager. If job 36 shows idle gaps large, the next task is finding qwen4_exp's capture gate.
