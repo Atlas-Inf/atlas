@@ -1103,3 +1103,25 @@ Proposed next work, all byte-exact, owner to pick:
   87.84 / 87.48). Awaiting the owner's merge; it can be re-pinned to an image with #219/#228 after its own re-vet.
 - Not shipped: ROWINV combo profile (BFCL normalized 86.50 < 86.92 floor, deterministic across 3 binaries); #208 live
   repro (path unreachable in 3 attempts).
+
+## 2026-10-28 13:15 UTC — recipe #21 merged; new focus: PREFILL (owner)
+
+sparkrun-recipes #21 merged (squash, 76f69cc66): FP4-Local single GB10, J profile, ghcr sha-da7985c.
+
+**What we know about FP4-Local prefill (older builds, to be re-measured on main 87df79b2f):**
+- ~17K-token cold agent prompt: Atlas TTFT ~14.4 s (13.7 s with opt-in resident PLE scales) vs vLLM 9.2 s on the same
+  box (ab_stream, 10-18).
+- Short prompts: ~300 ms fixed cost (58 tokens 368 ms; marginal ~0.58 ms/token above 500 tokens). nsys 10-23: 339 ms
+  of GPU per 58-token request, MoE 183 ms, MXFP8 projections 115 ms. Even 58 tokens × top-10 touch most experts.
+- 17K prefill attribution (10-19, s4f2): MoE 25%, QSA attn 18%, hc 15%, GEMM 11%, GDN 11%, gaps ~16%. A large part of
+  cold TTFT was GPU idle waiting on PLE n-gram faults (host NVMe I/O; mitigated by 64 fault threads + opt-in resident
+  scales).
+- Agentic: Σ TTFT ≈ 430 s of ≈ 4,800 s wall at default; p90 3.0 s from first turns. The J profile (now in the recipe)
+  takes p90 to 2.2 s.
+
+**Plan:**
+1. Fresh nsys prefill attribution on main, prefill-only requests (max_tokens 1) at ~60 / ~1.3K (BFCL-like with tools) /
+   ~4K / ~17K tokens, distinct prompts (no cache hits). Per request: wall, GPU busy/idle, kernels grouped by family,
+   PLE fault-wall lines. Fix the nsys export race by waiting for the report size to settle.
+2. From that, pick byte-exact levers, the same way S7.1 was found: profile, then look in source for redundant work.
+3. Gate any change: control identical + exactness, TTFT A/B (fixed prompts, alternating fresh boots), then agentic + BFCL.
