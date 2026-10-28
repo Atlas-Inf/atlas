@@ -75,6 +75,10 @@ fn dispatch(s: &mut StreamState, c: &StreamCtx, text: &str) -> Vec<ir::StreamDel
                 handle_tool_call_end(s, c, idx, &mut out)
             }
             tool_parser::DetectorOutput::ToolCall(mut tc, idx) => {
+                eprintln!(
+                    "COMPLETE idx={idx} name={} args={}",
+                    tc.function.name, tc.function.arguments
+                );
                 handle_complete_tool_call(s, c, &mut tc, idx, &mut out)
             }
             tool_parser::DetectorOutput::Content(_) => {}
@@ -98,7 +102,8 @@ fn tool_guard_checks_both_native_formats_before_any_tool_bytes() {
         let (c, mut s) = setup(glm);
         let text = xml(glm, "http://169.254.169.254/latest/meta-data/");
         for ch in text.chars() {
-            assert!(dispatch(&mut s, &c, &ch.to_string()).is_empty());
+            let d = dispatch(&mut s, &c, &ch.to_string());
+            assert!(d.is_empty(), "ch={ch:?} -> {d:?}");
         }
         assert!(s.cancel_flag.load(Ordering::Acquire));
         assert_blocked(&finish(&mut s, &c));

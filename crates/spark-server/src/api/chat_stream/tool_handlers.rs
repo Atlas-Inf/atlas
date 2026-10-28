@@ -554,16 +554,6 @@ pub(super) fn handle_tool_call_end(
             state.stop_string_triggered = true;
             state.tool_loop_capped = true;
         }
-        if ctx.state.tool_guard.enabled {
-            if state.stop_string_triggered {
-                drop_buffered_tool_chunks(state, idx);
-                state
-                    .cancel_flag
-                    .store(true, std::sync::atomic::Ordering::Release);
-            } else {
-                flush_buffered_tool_chunks(state, idx, deltas);
-            }
-        }
         let run_len = advance_name_run(&mut state.name_run, &name);
         if run_len >= MAX_CONSEC_SAME_NAME_CALLS && !state.stop_string_triggered && !reference {
             tracing::warn!(
@@ -573,6 +563,16 @@ pub(super) fn handle_tool_call_end(
             );
             state.stop_string_triggered = true;
             state.tool_loop_capped = true;
+        }
+        if ctx.state.tool_guard.enabled {
+            if state.stop_string_triggered {
+                drop_buffered_tool_chunks(state, idx);
+                state
+                    .cancel_flag
+                    .store(true, std::sync::atomic::Ordering::Release);
+            } else {
+                flush_buffered_tool_chunks(state, idx, deltas);
+            }
         }
         if !state.stop_string_triggered {
             // Successful streaming tool call — log + metric to match the
