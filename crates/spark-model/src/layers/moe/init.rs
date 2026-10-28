@@ -68,6 +68,7 @@ impl MoeLayer {
 
         let _ = num_experts;
         let optional = super::init_optional::OptionalKernels::resolve(gpu, config);
+        let t_rows = super::init_t_rows::TRowsKernels::resolve(gpu);
         let rms_norm_k = gpu.kernel("norm", "rms_norm")?;
         let mut layer = Self {
             weights,
@@ -280,28 +281,9 @@ impl MoeLayer {
             ),
             // S7 verify-row dedup (`forward_rows_t`): gb10-only entries in
             // the same module — gated, so other targets get KernelHandle(0).
-            moe_expert_union_t_k: super::super::try_kernel_gated(
-                !cfg!(atlas_hip),
-                gpu,
-                "moe_shared_expert_fused_t",
-                "moe_expert_union_t",
-            ),
-            moe_expert_gate_up_shared_t_rows_k: std::array::from_fn(|r| {
-                super::super::try_kernel_gated(
-                    !cfg!(atlas_hip) && (2..=8).contains(&r),
-                    gpu,
-                    "moe_shared_expert_fused_t",
-                    &format!("moe_expert_gate_up_shared_t_rows_v3_r{r}_b256"),
-                )
-            }),
-            moe_expert_silu_down_shared_t_rows_k: std::array::from_fn(|r| {
-                super::super::try_kernel_gated(
-                    !cfg!(atlas_hip) && (2..=8).contains(&r),
-                    gpu,
-                    "moe_shared_expert_fused_t",
-                    &format!("moe_expert_silu_down_shared_t_rows_v3_r{r}_b256"),
-                )
-            }),
+            moe_expert_union_t_k: t_rows.moe_expert_union_t_k,
+            moe_expert_gate_up_shared_t_rows_k: t_rows.moe_expert_gate_up_shared_t_rows_k,
+            moe_expert_silu_down_shared_t_rows_k: t_rows.moe_expert_silu_down_shared_t_rows_k,
             // sqrtsoftplus kernels: lazy-loaded via try_kernel so models that
             // don't register them (all except DeepSeek-V4) start fine.
             moe_topk_sqrtsoftplus_k: super::super::try_kernel(
