@@ -251,6 +251,8 @@ impl LeakMarkers {
     };
 }
 
+mod literal_markers;
+
 pub use prompt_levers::PromptLevers;
 
 pub trait ToolCallParser: Send + Sync {

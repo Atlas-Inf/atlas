@@ -14,6 +14,13 @@ use std::time::Duration;
 const END: u32 = 2;
 const TOOL: u32 = 3;
 const CALL: &[u32] = &[3, 4, 5, 6, 7, 8, 9, 10, 11];
+const ORDINARY: u32 = 16;
+const LITERAL_CONTENT: [&str; 4] = [
+    "The tag is `<tool_call>` and this is prose. END.",
+    "The tag is \"<tool_call>\" and this is prose. END.",
+    "The delimiter <tool_call> opens a tool invocation. END.",
+    "```xml\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>\n```\nEND",
+];
 
 #[path = "reasoning_done_tests.rs"]
 mod reasoning_done_tests;
@@ -46,7 +53,28 @@ fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<A
         "unknown_tool",
         "<think>",
         "42",
-        "END",
+        "`",
+        "ordinary",
+        LITERAL_CONTENT[0],
+        LITERAL_CONTENT[1],
+        LITERAL_CONTENT[2],
+        LITERAL_CONTENT[3],
+        "The closing tag is `</tool_call>`. </tool_call> END.",
+        "<|im_start|>",
+        "The tag is `",
+        "</",
+        "tool",
+        "_call>",
+        "` and this is prose. END.",
+        "The delimiter ",
+        " opens a tool invocation. END.",
+        "<",
+        "<function=get_weather><parameter=city>Oslo</parameter></function>",
+        "`<tool_call><function=get_weather><parameter=not_a_parameter>BAD</parameter></function></tool_call>` END.",
+        "<tool_call><function=not_registered><parameter=value>42</parameter></function></tool_call> END.",
+        "<tool_call><function=not_registered><parameter=value>42",
+        "get_weather<arg_key>not_a_parameter</arg_key><arg_value>BAD</arg_value></tool_call> END.",
+        "get_weather<arg_key>city</arg_key><arg_value>http://169.254.169.254/</arg_value></tool_call>",
         "<function=get_weather><parameter=city>http://169.254.169.254/</parameter></function></tool_call>",
         "<function=get_url><parameter=url>http://169.254.169.254/</parameter></function></tool_call>",
         "get_url<arg_key>url</arg_key><arg_value>http://169.254.169.254/</arg_value></tool_call>",
@@ -240,6 +268,16 @@ fn stream_tokens_with_context(
 /// Same runner with a caller-built `AppState` and `ChatRequest` (the
 /// tool-guard tests pick the policy and declare their own tools). Ported
 /// from Enntity/atlas fa5331b2 (AGPL-3.0-only).
+/// Enntity's test-entry name over our request-passing runner (the literal-XML
+/// tests use the shared `request()` tools).
+fn stream_for_app(
+    state: Arc<AppState>,
+    tools: bool,
+    tokens: Vec<u32>,
+) -> (StreamCtx, StreamState, Vec<ir::StreamDelta>) {
+    stream_tokens_with_state(state, tools, tokens, request())
+}
+
 fn stream_tokens_with_state(
     state: Arc<AppState>,
     tools: bool,
@@ -486,3 +524,9 @@ fn blocking_refusal_prefix_keeps_content() {
 
 #[path = "tool_security_tests.rs"]
 mod tool_security_tests;
+
+#[path = "glm_literal_xml_tests.rs"]
+mod glm_literal_xml_tests;
+
+#[path = "qwen_literal_xml_tests.rs"]
+mod qwen_literal_xml_tests;
