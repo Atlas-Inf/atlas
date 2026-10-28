@@ -277,10 +277,11 @@ pub(crate) fn bench_case(
     const ITERS: usize = 24;
     let t0 = std::time::Instant::now();
     for it in 0..ITERS {
-        let (gpk, gsc, gs2, upk, usc, dpk, dsc) = {
+        let (gpk, gsc, gs2, upk, usc, _dpk, _dsc) = {
             let t = &tabs[it % LAYER_SET];
             (t[0], t[1], t[2], t[3], t[4], t[5], t[6])
         };
+        let _ = (_dpk, _dsc);
         for r in 0..rows {
             let ids_r = ids_d.offset(r * TOP_K * 4);
             ops::moe_expert_gate_up_shared_t(
@@ -305,6 +306,19 @@ pub(crate) fn bench_case(
                 TOP_K as u32,
                 0,
             )?;
+        }
+    }
+    gpu.synchronize(0)?;
+    let t_single_gu = t0.elapsed() / ITERS as u32;
+    let t0d = std::time::Instant::now();
+    for it in 0..ITERS {
+        let (_gpk, _gsc, gs2, _upk, _usc, dpk, dsc) = {
+            let t = &tabs[it % LAYER_SET];
+            (t[0], t[1], t[2], t[3], t[4], t[5], t[6])
+        };
+        let _ = (_gpk, _gsc, _upk, _usc);
+        for r in 0..rows {
+            let ids_r = ids_d.offset(r * TOP_K * 4);
             ops::moe_expert_silu_down_shared_t(
                 gpu,
                 dk,
@@ -327,15 +341,17 @@ pub(crate) fn bench_case(
         }
     }
     gpu.synchronize(0)?;
-    let t_single = t0.elapsed() / ITERS as u32;
+    let t_single_sd = t0d.elapsed() / ITERS as u32;
+    let t_single = t_single_gu + t_single_sd;
 
     // ── multi-row dedup ──
     let t1 = std::time::Instant::now();
     for it in 0..ITERS {
-        let (gpk, gsc, gs2, upk, usc, dpk, dsc) = {
+        let (gpk, gsc, gs2, upk, usc, _dpk, _dsc) = {
             let t = &tabs[it % LAYER_SET];
             (t[0], t[1], t[2], t[3], t[4], t[5], t[6])
         };
+        let _ = (_dpk, _dsc);
         ops::moe_expert_union_t(
             gpu,
             uk,
@@ -377,6 +393,16 @@ pub(crate) fn bench_case(
             vbs,
             0,
         )?;
+    }
+    gpu.synchronize(0)?;
+    let t_rows_gu = t1.elapsed() / ITERS as u32;
+    let t1d = std::time::Instant::now();
+    for it in 0..ITERS {
+        let (_gpk, _gsc, gs2, _upk, _usc, dpk, dsc) = {
+            let t = &tabs[it % LAYER_SET];
+            (t[0], t[1], t[2], t[3], t[4], t[5], t[6])
+        };
+        let _ = (_gpk, _gsc, _upk, _usc);
         ops::moe_expert_silu_down_shared_t_rows(
             gpu,
             dkr,
@@ -404,7 +430,8 @@ pub(crate) fn bench_case(
         )?;
     }
     gpu.synchronize(0)?;
-    let t_rows = t1.elapsed() / ITERS as u32;
+    let t_rows_sd = t1d.elapsed() / ITERS as u32;
+    let t_rows = t_rows_gu + t_rows_sd;
 
     // compare bytes
     let mut identical = true;
@@ -476,6 +503,10 @@ pub(crate) fn bench_case(
         t_single,
         t_rows,
         t_rows.as_secs_f64() / t_single.as_secs_f64()
+    );
+    println!(
+        "  PHASE rows={rows} union={union} variant={vname} gu={:?}->{:?} sd={:?}->{:?}",
+        t_single_gu, t_rows_gu, t_single_sd, t_rows_sd
     );
     Ok(())
 }
