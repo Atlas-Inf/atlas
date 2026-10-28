@@ -302,3 +302,37 @@ fn flush_before_tool_boundary_recovers_from_stuck_suppression() {
 // similarity over assistant text. See `loop_detector.rs` tests
 // (`three_identical_intros_fire_loop`,
 // `slightly_varied_intros_still_fire`).
+
+#[test]
+fn sanitizer_preserves_poolside_literal_opener_across_chunks() {
+    let markers = crate::tool_parser::PoolsideV1Parser.leak_markers();
+    let mut tag_scan_buf = String::new();
+    let mut suppressing = false;
+    let mut inside_envelope = false;
+    let mut literal_state = crate::literal_xml::LiteralXmlState::default();
+    let mut out = String::new();
+    for chunk in [
+        "The opening tag is `",
+        "<tool_",
+        "call>",
+        "` and this is prose.",
+    ] {
+        out.push_str(&super::sanitize_content_chunk_with_literal_state(
+            chunk,
+            &mut tag_scan_buf,
+            &mut suppressing,
+            &mut inside_envelope,
+            &mut literal_state,
+            &markers,
+        ));
+    }
+    out.push_str(&super::flush_content_sanitizer(
+        &mut tag_scan_buf,
+        &mut suppressing,
+        &markers,
+    ));
+
+    assert_eq!(out, "The opening tag is `<tool_call>` and this is prose.");
+    assert!(!suppressing);
+    assert!(!inside_envelope);
+}

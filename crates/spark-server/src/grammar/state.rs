@@ -37,6 +37,10 @@ pub struct GrammarState {
     /// The run's verify-timing sink.
     timing: std::sync::Arc<crate::scheduler::mtp_timing::RunTiming>,
     matcher: GrammarMatcher,
+    /// Tokenizer bytes paired with the compiled matcher. The scheduler uses
+    /// this only when a candidate native opener is emitted, to distinguish a
+    /// literal XML mention in earlier reasoning from a real tool boundary.
+    tokenizer_info: xgrammar::tokenizer::TokenizerInfo,
     /// Bitmask buffer: `Box<[i32]>` of shape `(1, ceil(vocab_size / 32))`.
     bitmask_data: Box<[i32]>,
     vocab_size: usize,
@@ -132,6 +136,7 @@ impl GrammarState {
         Ok(Self {
             timing: std::sync::Arc::default(),
             matcher,
+            tokenizer_info: compiled.tokenizer_info().clone(),
             bitmask_data,
             vocab_size,
             stop_tokens: Box::new([]),
@@ -176,6 +181,40 @@ impl GrammarState {
     /// grammar's first output token (the native tool opener).
     pub fn opens_output(&self, tok: u32) -> bool {
         self.native_opener == Some(tok)
+    }
+
+    /// Whether the native opener follows a quoted or fenced XML mention in
+    /// the already emitted token history. This runs only at a candidate
+    /// opener, so decoding the accumulated prefix is off the hot path.
+    pub fn native_opener_is_literal(&self, output_tokens: &[u32]) -> bool {
+        let mut state = crate::literal_xml::LiteralXmlState::default();
+        for &token_id in output_tokens {
+            let Some(bytes) = self.tokenizer_info.decoded_vocab().get(token_id as usize) else {
+                return false;
+            };
+            state.feed_bytes(bytes);
+        }
+        state.finish_pending();
+        state.is_literal()
+    }
+
+    /// Variant used by speculative verification, where the already emitted
+    /// history and the drafts accepted so far live in separate slices. Avoid
+    /// allocating a concatenated history on every verify row.
+    pub fn native_opener_is_literal_after(
+        &self,
+        output_tokens: &[u32],
+        suffix_tokens: &[u32],
+    ) -> bool {
+        let mut state = crate::literal_xml::LiteralXmlState::default();
+        for &token_id in output_tokens.iter().chain(suffix_tokens) {
+            let Some(bytes) = self.tokenizer_info.decoded_vocab().get(token_id as usize) else {
+                return false;
+            };
+            state.feed_bytes(bytes);
+        }
+        state.finish_pending();
+        state.is_literal()
     }
 
     /// Register a union's answer-branch first-token mask (`answer_start`).

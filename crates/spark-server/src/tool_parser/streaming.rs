@@ -11,6 +11,9 @@ use super::*;
 pub struct StreamingToolDetector {
     pub(super) buffer: String,
     pub(super) inside_tag: bool,
+    /// Exact opener retained so a non-call XML mention can be returned as
+    /// content byte-for-byte, including namespaced/native opener variants.
+    pub(super) current_tag_open: Option<String>,
     pub(super) inside_dsml: bool,
     /// Whether a bare identifier inside `<tool_call>` is a legitimate
     /// zero-argument call (Poolside v1 only — see
@@ -52,6 +55,9 @@ pub struct StreamingToolDetector {
     /// the current call — tells the close branch to emit only the residual
     /// (closing `}` / backfill / JSON tail) instead of the full args.
     pub(super) incremental_emitted: bool,
+    /// Lexical context for content already emitted by the detector. XML-looking
+    /// markers inside code or quotes remain content and update this state.
+    pub(super) literal_xml_state: crate::literal_xml::LiteralXmlState,
 }
 
 pub enum DetectorOutput {
@@ -90,6 +96,20 @@ impl StreamingToolDetector {
         }
     }
 
+    pub(super) fn push_content(&mut self, outputs: &mut Vec<DetectorOutput>, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        self.literal_xml_state.feed(&text);
+        outputs.push(DetectorOutput::Content(text));
+    }
+
+    pub(super) fn marker_is_literal(&self, position: usize) -> bool {
+        let mut state = self.literal_xml_state;
+        state.feed(&self.buffer[..position]);
+        state.is_literal()
+    }
+
     pub(super) fn has_partial_tool_opener(&self) -> bool {
         !self.buffer.is_empty()
             && [
@@ -101,6 +121,31 @@ impl StreamingToolDetector {
             ]
             .iter()
             .any(|tag| tag.starts_with(&self.buffer))
+    }
+
+    pub(super) fn find_tool_opener(&self) -> Option<(usize, usize)> {
+        self.buffer
+            .find("<tool_call>")
+            .map(|p| (p, "<tool_call>".len()))
+            .or_else(|| {
+                self.buffer
+                    .find("<|tool_call>")
+                    .map(|p| (p, "<|tool_call>".len()))
+            })
+            .or_else(|| {
+                self.buffer
+                    .find("<minimax:tool_call>")
+                    .map(|p| (p, "<minimax:tool_call>".len()))
+            })
+            .or_else(|| {
+                self.buffer
+                    .find("<minimax:_call>")
+                    .map(|p| (p, "<minimax:_call>".len()))
+            })
+    }
+
+    pub(super) fn is_registered_tool(&self, name: &str) -> bool {
+        self.tools.is_empty() || self.tools.iter().any(|tool| tool.function.name == name)
     }
 }
 
