@@ -43,10 +43,20 @@ fn min_rows() -> u32 {
     })
 }
 
-fn dequant_kernel(gpu: &dyn GpuBackend) -> Option<KernelHandle> {
-    static K: OnceLock<Option<KernelHandle>> = OnceLock::new();
+/// The dequant kernel, preferring the 8-per-thread twin. `true` = `_v8`.
+///
+/// `dequant_fp8_blockscaled_bf16` maps one element to each thread and measured
+/// 3.8 ms per launch on this route, 7.3% of a 16k 27B prefill (strix s69).
+/// `dequant_fp8_bs128_bf16_v8` computes the same expression on 8 consecutive
+/// elements per thread, so the scratch is bit-identical either way.
+fn dequant_kernel(gpu: &dyn GpuBackend) -> Option<(KernelHandle, bool)> {
+    static K: OnceLock<Option<(KernelHandle, bool)>> = OnceLock::new();
     *K.get_or_init(|| {
+        if let Ok(k) = gpu.kernel("dequant_fp8_bs128_bf16_v8", "dequant_fp8_bs128_bf16_v8") {
+            return Some((k, true));
+        }
         gpu.kernel("dequant_fp8_blockscaled_bf16", "dequant_fp8_blockscaled_bf16")
+            .map(|k| (k, false))
             .map_err(|e| tracing::warn!("hip fp8 prefill: no dequant kernel ({e}); fused FP8 GEMM only"))
             .ok()
     })
@@ -88,7 +98,7 @@ pub(super) fn try_w8a16_n(
     if min == 0 || m < min {
         return Ok(false);
     }
-    let Some(kernel) = dequant_kernel(gpu) else {
+    let Some((kernel, v8)) = dequant_kernel(gpu) else {
         return Ok(false);
     };
     let w_bf16 = match scratch(gpu, stream, n as usize * k as usize * 2) {
@@ -99,19 +109,35 @@ pub(super) fn try_w8a16_n(
             return Ok(false);
         }
     };
-    KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(k, 64), div_ceil(n, 4), 1])
-        .block([64, 4, 1])
-        .arg_ptr(weight)
-        .arg_ptr(block_scale)
-        .arg_ptr(w_bf16)
-        .arg_u32(n)
-        .arg_u32(k)
-        .arg_u32(128) // block_n
-        .arg_u32(128) // block_k
-        .arg_u32(div_ceil(k, 128)) // sk: scale row stride
-        .arg_u32(1) // scale_is_fp32
-        .launch(stream)?;
+    if v8 && k.is_multiple_of(8) {
+        let threads = u64::from(n) * u64::from(k) / 8;
+        KernelLaunch::new(gpu, kernel)
+            .grid([threads.div_ceil(256) as u32, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(weight)
+            .arg_ptr(block_scale)
+            .arg_ptr(w_bf16)
+            .arg_u32(n)
+            .arg_u32(k)
+            .arg_u32(div_ceil(k, 128)) // sk: scale row stride
+            .launch(stream)?;
+    } else if v8 {
+        return Ok(false);
+    } else {
+        KernelLaunch::new(gpu, kernel)
+            .grid([div_ceil(k, 64), div_ceil(n, 4), 1])
+            .block([64, 4, 1])
+            .arg_ptr(weight)
+            .arg_ptr(block_scale)
+            .arg_ptr(w_bf16)
+            .arg_u32(n)
+            .arg_u32(k)
+            .arg_u32(128) // block_n
+            .arg_u32(128) // block_k
+            .arg_u32(div_ceil(k, 128)) // sk: scale row stride
+            .arg_u32(1) // scale_is_fp32
+            .launch(stream)?;
+    }
     match super::bf16_gemm(input, w_bf16.0, output, m, n, k, stream) {
         Ok(()) => Ok(true),
         Err(e) => {
