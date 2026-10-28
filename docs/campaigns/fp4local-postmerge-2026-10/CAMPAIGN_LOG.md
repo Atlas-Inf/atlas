@@ -1125,3 +1125,24 @@ sparkrun-recipes #21 merged (squash, 76f69cc66): FP4-Local single GB10, J profil
    PLE fault-wall lines. Fix the nsys export race by waiting for the report size to settle.
 2. From that, pick byte-exact levers, the same way S7.1 was found: profile, then look in source for redundant work.
 3. Gate any change: control identical + exactness, TTFT A/B (fixed prompts, alternating fresh boots), then agentic + BFCL.
+
+## 2026-10-28 20:55 UTC — prefill profile of main 87df79b2f (job 43, nsys, default r1short, prefill-only requests)
+
+| request | prompt tokens | TTFT | GPU busy | GPU idle in burst |
+|---|---|---|---|---|
+| P60 ×3 | ~28 | ~218 ms | 190 ms | ~18 ms |
+| P1300a/b (tools) | 2,805 / 2,987 | 2,246 / 2,231 ms | 1,910 / 2,036 ms | 326 / 146 ms |
+| P4K | 4,569 | 3,637 ms | 2,979 ms | 614 ms |
+| P17K | 19,172 | **15,764 ms** | 12,842 ms | 2,903 ms (18%) |
+
+Kernel ms by family at P17K: MoE 3,707 (`moe_w4a16_fused_gate_up_t_k64` 1,990 ×192, `grouped_gemm_ptrtable_t_k64`
+1,184), QSA 2,536 (`qsa_prefill_attn_tc2` 1,987, `qsa_score_rows_exact` 441), dense GEMM 1,732 (cuBLAS nvjet 968), hc
+1,674 (`hc_post_vec` 738, `hc_pre_stage_bf16` 545), GDN 991, MXFP8 157, PLE 48. At ~2.9K tokens MoE is ~40% of
+kernel time. Call counts show one extra forward per prefill on this default profile (96 MoE calls at 2.9K = 1 chunk +
+the tail-checkpoint split; 192 at 19K = 3 chunks + tail). The recipe's MIDCHUNK_CKPT removes that extra forward.
+
+**Host side (CUDA driver API, whole capture):** `cuMemcpyDtoHAsync` 1,048 calls / 20.3 s (≈150 blocking readbacks per
+request); `cuMemFree` 229,277 calls / 5.0 s; `cuStreamSynchronize` 1,111 / 80 ms. (The first summary searched for runtime
+`cuda*` names and reported zero.) Attribution in progress (CPU-only, existing capture): readback sizes and call sites,
+per-layer placement, the free storm's source, and the idle each causes. Candidate byte-exact lever: remove per-layer
+host readbacks / frees in prefill.
