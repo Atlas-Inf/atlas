@@ -1075,3 +1075,31 @@ Main (default FP4-Local recipe profile, single GB10) over this campaign, same ha
 
 BFCL 87.44 / 87.32 unchanged throughout. Every decode change was byte-identical (control, EXACT_VERIFY_CHECK and
 BATCH_FAST_CHECK all 0 rows differ). The per-build s/turn values are single runs; the decode columns are 3-pair medians.
+
+## 2026-10-28 13:00 UTC — decode profile of main 87df79b2f (S7 + S7.1) and the next levers
+
+Job 42 (nsys, same probe as job 36; this capture caught 2 of the 3 requests, so whole-step tok/s from it is unreliable;
+the per-kernel ms/token of unchanged kernels agrees with job 36 within 1–3%). Its export raced the report write again
+(0-byte `.nsys-rep` at export time); I exported offline after the write finished.
+- silu_down rows: 6.55 → **1.69 ms/token**. That confirms the S7.1 mechanism (the per-column `__expf` recompute was the cost).
+- Remaining shares on main: GPU idle ≈ 20% of wall (the structural CUDA-graph veto, previous entry);
+  `mxfp8_proj_batchm` ≈ 4.0 ms/token; `_t_rows` gate_up ≈ 3.6; LM head (`dense_gemv_bf16` + `_batchm`) ≈ 3.0;
+  `hc_pre_down/finish` ≈ 2.2; silu_down rows 1.7; union 0.3.
+
+Proposed next work, all byte-exact, owner to pick:
+1. CUDA graphs on the verify path: prestage QSA + PLE host half, capture `verify_c2` layer pieces (~4.5 ms/token of idle).
+2. `mxfp8_proj_batchm` kernel efficiency (already one launch for all rows, so this is kernel-internal work).
+3. gate_up rows at union 33 (still 0.60× in the microbench; the stage loop may have the same kind of per-thread
+   redundancy).
+4. LM head ~3 ms/token.
+
+## Night summary (2026-10-27 06:00 → 2026-10-28 13:00 UTC)
+- Merged to main: train 1 #212 (#191 #192 #196 #204 #205 #206 #207 #208 #210), train 2 #217 (#213 decode-share, #215
+  cargo-deny green), #219 S7 verify-row dedup, #228 S7.1 silu activation. Issues #172, #180 closed.
+- FP4-Local on one GB10, default recipe profile, main before → after: agentic **12.43 → 11.19 s/turn**; short-prompt
+  decode **25.98 → 34.22 tok/s**; ~17K-token agent decode **23.41 → 27.06 tok/s**. BFCL ST-995 unchanged at
+  87.44 / 87.32. All decode changes were byte-identical.
+- sparkrun-recipes #21: J profile + ghcr sha-da7985c, vetted through sparkrun (agentic 50/50 12.28 s/turn, BFCL
+  87.84 / 87.48). Awaiting the owner's merge; it can be re-pinned to an image with #219/#228 after its own re-vet.
+- Not shipped: ROWINV combo profile (BFCL normalized 86.50 < 86.92 floor, deterministic across 3 binaries); #208 live
+  repro (path unreachable in 3 attempts).
