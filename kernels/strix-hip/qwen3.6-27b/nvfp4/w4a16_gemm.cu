@@ -1516,10 +1516,10 @@ __device__ __forceinline__ void w4a16_m128_f16_body(
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;
 
-    __shared__ __align__(16) _Float16 smem_A[2][2 * F16_M_TILE][F16_K_STEP + F16_PAD_T];
+    __shared__ __align__(16) _Float16 smem_A[1][2 * F16_M_TILE][F16_K_STEP + F16_PAD_T];
     #define F16_B_ROW 40
     #define F16_B_OFF(n) ((n) * F16_B_ROW + ((n) >> 4) * 8)
-    __shared__ __align__(16) _Float16 smem_B[2][F16_B_OFF(F16_N_TILE)];
+    __shared__ __align__(16) _Float16 smem_B[1][F16_B_OFF(F16_N_TILE)];
 
     v8f acc0[8], acc1[8];
     #pragma unroll
@@ -1613,16 +1613,19 @@ __device__ __forceinline__ void w4a16_m128_f16_body(
     F16_STORE_TILE(0, reg_A, reg_Bp, reg_Bs);
     __syncthreads();
 
-    int cur = 0;
+    // One LDS buffer (41 -> ~20.6 KB per CTA). The double-buffered kernel was
+    // LDS-occupancy-bound on gfx1151: 5.35 waves/CU measured (strix s40, rocprofv3),
+    // since only ~3 of its CTAs fit a WGP's 128 KB. The register prefetch still
+    // overlaps the next tile's global loads with this tile's WMMA; the price is
+    // a second barrier per K-step. Same operands, same order: bit-identical.
     for (unsigned int k_base = F16_K_STEP; k_base < K; k_base += F16_K_STEP) {
-        int nxt = 1 - cur;
         F16_LOAD_REGS(k_base, reg_A, reg_Bp, reg_Bs);
-        F16_COMPUTE(cur);
-        F16_STORE_TILE(nxt, reg_A, reg_Bp, reg_Bs);
+        F16_COMPUTE(0);
         __syncthreads();
-        cur = nxt;
+        F16_STORE_TILE(0, reg_A, reg_Bp, reg_Bs);
+        __syncthreads();
     }
-    F16_COMPUTE(cur);
+    F16_COMPUTE(0);
 
     #undef F16_LOAD_REGS
     #undef F16_STORE_TILE
