@@ -302,7 +302,12 @@ fn stream_tokens_with_state(
         max_tokens: 192,
         timeout_at: None,
         stop_string_buffer_len: 0,
-        leak_markers: state.tool_call_parser.as_ref().unwrap().leak_markers(),
+        leak_markers: state
+            .tool_call_parser
+            .as_ref()
+            .unwrap()
+            .leak_markers()
+            .for_literal_xml(state.tokenizer.glm_tool_markup_as_text),
         role_literal_leaks: false,
         wants_typed_arguments: true,
         max_tool_calls_per_response: 12,
