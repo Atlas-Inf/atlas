@@ -1015,3 +1015,21 @@ Second lever: 4.5 ms/token of GPU idle, since this path captures no CUDA graphs.
 - S7.1 (`perf/fp4l-moe-verify-dedup-act`, 86c11d766: silu activation computed once per element per CTA in smem):
   in-situ job 39c (control, EXACT_VERIFY_CHECK + BATCH_FAST_CHECK summary verdicts, 3 speed pairs vs #219) running
   since 08:15. It started on the vacuous 39b PASS, but it's the decisive test anyway.
+
+## 2026-10-28 08:45–09:00 UTC — #219 MERGED (db442e2d4); S7.1 = +25% short / +10% agent decode, byte-identical → PR #228
+
+**S7.1 in situ (job 39c, 86c11d766 vs #219 139efbd07, default r1short, 3 alternating fresh-boot pairs, ab_stream fixed
+prompts, identical completion lengths):** control identical; EXACT_VERIFY_CHECK 512 rows and BATCH_FAST_CHECK C=4
+(4 summaries) both **0 rows differ**, engaged.
+- short: 27.76/27.72/27.75 → 34.87/34.92/34.92 (A), 27.27/27.28/27.30 → 34.22/34.20/34.30 (B), 26.62/26.57/26.65 →
+  33.52/33.41/33.58 (C). Medians 27.28 → **34.22 tok/s (+25.4%)**.
+- agent (~17K-token prompt): medians 24.52 → **27.06 tok/s (+10.4%)**.
+- Vs main before S7 (25.98 / 23.41 on the same prompts): about +32% short, +16% agent decode.
+
+**Microbench (job 40, the first real slim-bench run; parsed-line counts printed, all identical):** rows=4 union 26/40
+ratio 0.771 (#219) → **0.479** (S7.1); silu_down rows 328 → 142 µs. The single-row reference drifted ~15% between the
+two builds' runs, so it's directional only.
+
+**#219 merged** as db442e2d4 after jobs 35/37/38c/40 + CI (only the repo-wide benchmark gate red; the file-size cap
+fixed for main too). **#228** (S7.1) retargeted to main; its GB10 gate (job 41: control, agentic 50, BFCL) has been
+running since 08:48.
