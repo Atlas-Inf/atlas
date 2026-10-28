@@ -1174,3 +1174,25 @@ per-element K order. Then an isolated microbench at FP4-Local shapes (T = 2.9K /
 ceilings (cuBLAS BF16 at equivalent shapes, a pure NVFP4 weight-streaming read), plus dequant-only / MMA-only
 diagnostic variants. Key question: can a re-tiled W4A16 kernel keep the same MMA instruction and per-element K order?
 If so it stays byte-identical (lighter gating than native-FP4 W4A4, which changes activation numerics).
+
+## 2026-10-28 22:10 UTC — MoE prefill kernels: source read (S1)
+
+Both kernels are in `kernels/gb10/qwen3.8-flash-next/nvfp4/moe_w4a16_grouped_gemm.cu` (symlinked to other targets):
+`fused_gate_up_t_k64` (~l.748; gate+up in one launch over 2N) and `grouped_gemm_ptrtable_t_k64` (~l.455; down,
+device pointer table). Structure:
+- Grid: z = expert, x = N-tile, y = persistent M-tile stride. CTA tile M64 × N128 × K64, 256 threads.
+- cp.async 2-stage double buffer: A (BF16) + packed nibbles + g16 scales. Weights are dequantized via an E2M1 LUT into
+  **FP8 E4M3** smem once per K-tile per CTA, i.e. repeated for every M-tile of the same expert.
+- MMA: `mma.sync.m16n8k32 f32.e4m3.e4m3`. So despite the "w4a16" name, the math is e4m3 × e4m3 with fp32
+  accumulation.
+- Rows are gathered per expert via `expert_offsets` + `sorted_token_ids`. grid.y is host-sized (~2× the average
+  expert). Each output element accumulates K in ascending K64 tiles, so any re-tile / re-pipeline that keeps that order
+  and the same MMA instruction stays **byte-exact**; split-K would not.
+- In-tree alternatives: `_k64_fp4` native-FP4 clones (~l.1511 / ~l.1833; earlier note: a wash), `moe_w4a4_prequant` +
+  tile worklist (GLM-only), FP8-weight variant (~l.1282). No cuBLAS in the MoE path.
+
+Byte-exact design options, pending the isolated bench (job 44, branch `bench/moe-prefill-gemm` 1b19b96a3):
+1. Retile / deeper pipeline (est. 40–60 TFLOP/s).
+2. Weight-stationary persistent CTA per (expert, N-tile): dequantize each B tile once, reuse it across that expert's
+   M-tiles.
+3. Warp-specialized TMA/mbarrier pipeline (est. 60–100 TFLOP/s, high effort).
