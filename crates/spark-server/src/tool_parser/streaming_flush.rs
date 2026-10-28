@@ -19,6 +19,11 @@ impl StreamingToolDetector {
         }
         let text = std::mem::take(&mut self.buffer);
         let was_inside_tag = self.inside_tag;
+        let literal_before = self.literal_xml_state;
+        let tag_open = self
+            .current_tag_open
+            .take()
+            .unwrap_or_else(|| "<tool_call>".to_string());
         self.inside_tag = false;
 
         // When inside_tag was true, we have the raw content between
@@ -46,6 +51,7 @@ impl StreamingToolDetector {
                 contain_unterminated_call_tail(text.trim()),
                 self.call_counter,
             )
+            .filter(|tc| self.is_registered_tool(&tc.function.name))
         {
             let idx = self.call_counter as usize;
             if self.current_tc_name.is_some() {
@@ -85,7 +91,7 @@ impl StreamingToolDetector {
         }
 
         let text = if was_inside_tag {
-            format!("<tool_call>{text}")
+            format!("{tag_open}{text}")
         } else {
             text
         };
@@ -97,7 +103,7 @@ impl StreamingToolDetector {
             if !calls.is_empty() {
                 let mut out = Vec::new();
                 if let Some(c) = content {
-                    out.push(DetectorOutput::Content(c));
+                    self.push_content(&mut out, c);
                 }
                 for tc in calls {
                     let idx = self.call_counter as usize;
@@ -122,7 +128,7 @@ impl StreamingToolDetector {
                 }
                 let clean = clean.trim().to_string();
                 if !clean.is_empty() {
-                    out.push(DetectorOutput::Content(clean));
+                    self.push_content(&mut out, clean);
                 }
                 for tc in json_calls {
                     let idx = self.call_counter as usize;
@@ -133,7 +139,14 @@ impl StreamingToolDetector {
             }
         }
 
-        vec![DetectorOutput::Content(text)]
+        let mut out = Vec::new();
+        self.push_content(&mut out, text);
+        if was_inside_tag {
+            // The body of an opaque malformed XML block is not allowed to
+            // leave an unbalanced quote/fence that hides a later real call.
+            self.literal_xml_state = literal_before;
+        }
+        out
     }
 
     pub fn has_tool_calls(&self) -> bool {

@@ -72,7 +72,15 @@ pub(super) fn prepare(
     let Some(gs) = a.grammar_state.as_mut() else {
         return Ok(None);
     };
-    row_masks(gs, thinking, (think_start, think_end), drafts, vocab).map(Some)
+    row_masks_with_history(
+        gs,
+        thinking,
+        (think_start, think_end),
+        drafts,
+        vocab,
+        &a.output_tokens,
+    )
+    .map(Some)
 }
 
 /// The drafts (and their confidences) the verify carries.
@@ -128,6 +136,28 @@ pub(super) fn row_masks(
     drafts: &[u32],
     vocab: usize,
 ) -> Result<StrictVerify> {
+    row_masks_with_history(
+        gs,
+        inside_thinking,
+        (think_start, think_end),
+        drafts,
+        vocab,
+        &[],
+    )
+}
+
+/// Same walk as [`row_masks`], with the already emitted token history used to
+/// distinguish a quoted/fenced native opener from a real GLM tool boundary.
+/// The public wrapper keeps existing grammar tests and non-native callers
+/// concise; the production verify path supplies `ActiveSeq::output_tokens`.
+pub(super) fn row_masks_with_history(
+    gs: &mut GrammarState,
+    inside_thinking: bool,
+    (think_start, think_end): (Option<u32>, Option<u32>),
+    drafts: &[u32],
+    vocab: usize,
+    history: &[u32],
+) -> Result<StrictVerify> {
     let words = vocab.div_ceil(32);
     ensure!(
         gs.bitmask_data().len() == words,
@@ -181,8 +211,14 @@ pub(super) fn row_masks(
                 None => d = 0,
             }
         }
+        let literal_native_opener =
+            thinking && gs.opens_output(d) && gs.native_opener_is_literal_after(history, &kept);
         if thinking && !gs.opens_output(d) {
             thinking = think_end != Some(d);
+        } else if literal_native_opener {
+            // The opener is ordinary text inside a quote/code span. Keep it
+            // in the reasoning walk but do not feed it to the grammar or end
+            // thinking; this mirrors the serial boundary hook.
         } else {
             // A native tool opener ends the reasoning as the first output
             // token, as `first_token_thinking::apply_native_tool_boundary`

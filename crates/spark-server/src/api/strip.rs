@@ -129,6 +129,20 @@ mod scrub_think_tests {
 /// no real tool call was produced (otherwise the tool parser already handled
 /// the content).
 pub(crate) fn strip_orphan_tool_markup(text: &str) -> String {
+    strip_orphan_tool_markup_with_literal_state(
+        text,
+        &crate::literal_xml::LiteralXmlState::default(),
+    )
+}
+
+/// Streaming variant of [`strip_orphan_tool_markup`]. The caller owns the
+/// lexical state and feeds the accepted text through the normal sanitizer
+/// afterward; this helper only classifies opener positions and never mutates
+/// the state itself.
+pub(crate) fn strip_orphan_tool_markup_with_literal_state(
+    text: &str,
+    literal_state: &crate::literal_xml::LiteralXmlState,
+) -> String {
     const OPENERS: [&str; 2] = ["<tool_call>", "<function="];
     // Trim ONLY when an orphan opener was actually found and cut. The no-match
     // path must pass the text through byte-identical: this function runs
@@ -139,10 +153,51 @@ pub(crate) fn strip_orphan_tool_markup(text: &str) -> String {
     // one line. The blocking path calls this once over the whole message where
     // the trim was harmless; per-delta it is destructive. Regression from
     // #473 (680b3a568). Pinned by orphan_tool_tests below.
-    match OPENERS.iter().filter_map(|op| text.find(op)).min() {
+    let cut = crate::literal_xml::first_marker_outside_literal(text, *literal_state, &OPENERS)
+        .map(|(position, _)| position);
+    match cut {
         Some(cut) => text[..cut].trim_end().to_string(),
         None => text.to_string(),
     }
+}
+
+/// Remove structural XML fragments left around a validated call while
+/// preserving the same markers when they occur in quoted or fenced examples.
+pub(crate) fn strip_tool_markup_preserving_literals(text: &str) -> String {
+    let masked = crate::literal_xml::mask_literal_markers(
+        text,
+        &[
+            "<tool_call>",
+            "</tool_call>",
+            "<function=",
+            "<function ",
+            "<|function=",
+            "<|function ",
+            "<parameter=",
+            "</function>",
+            "</parameter>",
+        ],
+    );
+    let mut cleaned = masked;
+    for tag in ["</parameter>", "</function>", "</tool_call>", "<tool_call>"] {
+        cleaned = cleaned.replace(tag, "");
+    }
+    for opener in [
+        "<function=",
+        "<function ",
+        "<|function=",
+        "<|function ",
+        "<parameter=",
+    ] {
+        while let Some(start) = cleaned.find(opener) {
+            let end = cleaned[start..]
+                .find('>')
+                .map(|position| start + position + 1)
+                .unwrap_or(cleaned.len());
+            cleaned = format!("{}{}", &cleaned[..start], &cleaned[end..]);
+        }
+    }
+    crate::literal_xml::unmask_literal_markers(&cleaned)
 }
 
 #[cfg(test)]
@@ -164,6 +219,30 @@ mod orphan_tool_tests {
         assert_eq!(
             strip_orphan_tool_markup("Here you go.<function=foo>{}</function>"),
             "Here you go."
+        );
+    }
+
+    #[test]
+    fn leaves_quoted_and_fenced_markers_untouched() {
+        let quoted = "The tag is `<tool_call>` and this is prose.";
+        assert_eq!(strip_orphan_tool_markup(quoted), quoted);
+        let fenced = "```xml\n<tool_call>\n```";
+        assert_eq!(strip_orphan_tool_markup(fenced), fenced);
+    }
+
+    #[test]
+    fn finds_real_opener_after_literal_marker() {
+        let text = "The tag is `<tool_call>`; <tool_call>";
+        assert_eq!(strip_orphan_tool_markup(text), "The tag is `<tool_call>`;");
+    }
+
+    #[test]
+    fn structured_scrub_keeps_literal_xml_when_real_call_is_present() {
+        let text = "The example is `<tool_call>`; <tool_call><function=real>\
+                    <parameter=x>ok</parameter></function></tool_call>";
+        assert_eq!(
+            super::strip_tool_markup_preserving_literals(text),
+            "The example is `<tool_call>`; ok"
         );
     }
 
