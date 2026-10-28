@@ -19,8 +19,8 @@ mod tables;
 use anyhow::Result;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 
-use crate::cases::{bench_case, mem_kb};
-use crate::tables::{LAYER_SET, Layer, Lcg, TOP_K};
+use crate::cases::bench_case;
+use crate::tables::{LAYER_SET, Layer, Lcg, TOP_K, mem_kb};
 
 fn main() -> Result<()> {
     let g = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;

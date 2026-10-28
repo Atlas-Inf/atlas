@@ -9,20 +9,6 @@ use spark_runtime::gpu::GpuBackend;
 
 use crate::tables::*;
 
-/// Weight bytes one expert contributes per kernel pair (packed + scale for
-/// gate & up + down).
-fn expert_bytes() -> usize {
-    (K_RED / 2 * N_OUT + K_RED / 16 * N_OUT) * 2 + (K_DOWN / 2 * N_DOWN + K_DOWN / 16 * N_DOWN)
-}
-
-pub(crate) fn mem_kb() -> Option<u64> {
-    std::fs::read_to_string("/proc/meminfo").ok().and_then(|s| {
-        s.lines()
-            .find(|l| l.starts_with("MemAvailable"))
-            .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
-    })
-}
-
 pub(crate) fn bench_case(
     g: &dyn GpuBackend,
     layers: &[Layer],
