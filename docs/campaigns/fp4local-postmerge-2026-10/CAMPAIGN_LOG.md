@@ -901,3 +901,14 @@ detector needs a host-side progress line.
 
 Also fixed: job 30's BFCL marker never printed (`bfcl_res.py` called without its TAG argument); fixed in job 35.
 Queue: 30c (running since 23:08) → 35-s7pr-gate → 90 → 91.
+
+## 2026-10-28 03:21 UTC — recipe #21 vetted through sparkrun and pushed (66b5fb0)
+
+Job 30c, sparkrun on ghcr sha-da7985c (image sha256:63f2e1e1c091…, revision label da7985c), J-profile recipe:
+- env 9/9 asserted against the YAML keys; control 4/4; tool call OK; needle PASS.
+- agentic 50/50, 50/50, **12.28 s/turn** (run-1793147348923138592).
+- BFCL ST-995 **87.84 / 87.48** (run-1793157682433576890), above the 87.04 / 86.92 floors. References: J profile bare metal 87.64 / 87.38; main default 87.44 / 87.32.
+- Container stopped, MemAvailable back to 118 GB.
+
+Pushed to sparkrun-recipes `recipe/qwen38-flash-next-fp4-local` (fast-forward 2cbe348 → 66b5fb0) and commented on #21.
+The owner merges. Job 35 (#219 merge gate) started at 03:21.
