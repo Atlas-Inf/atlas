@@ -628,7 +628,12 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
                 tool_parser::DetectorOutput::Content(text) => {
                     if let Some(events_out) = detector_content_arm(state, ctx, &text) {
                         deltas.extend(events_out);
-                        return deltas;
+                        // One token can yield text before, inside and after a
+                        // literal marker (Enntity/atlas fbda04d1); drain every
+                        // event unless a guard actually cancelled this response.
+                        if state.stop_string_triggered {
+                            return deltas;
+                        }
                     }
                 }
                 tool_parser::DetectorOutput::ToolCall(mut tc, tc_idx) => {
