@@ -941,3 +941,15 @@ exactness, but with no summary line it isn't a positive proof that steps were ch
 - r2 at C=4 and C=8 with BATCH_FAST_CHECK + EXACT_VERIFY_CHECK (multi-sequence rows also reach `forward_rows`);
 - PASS requires ≥ 1 summary line, every summary "0 rows differ", zero per-row warnings, and the arm engaged.
 #219 merges only after jobs 35 and 37 both pass.
+
+## 2026-10-28 05:45 UTC — unattended watchers armed (10+ h)
+
+| watcher | where | cadence | what it does |
+|---|---|---|---|
+| nightq runner | sparky tmux `nightq` | continuous | runs `~/code/nightq/queue/*.sh` one at a time, per-job TIMEOUT; currently 9 jobs ≈ 12.5 h |
+| health.sh | sparky cron */5 | 5 min | restarts a dead runner + mem watchdog (same boot only), kills a job with 75 min of no log progress, writes STATUS.md |
+| refill.sh | sparky cron */20 | 20 min | if the queue empties: queues one agentic-50 variance filler on the newest gated binary (max 4 a day). Stop: `~/code/q10h/REFILL_STOP` |
+| nightwatch.sh | Mac cron */10 | 10 min | every newly finished job → raw result lines posted as a PR comment (#219 for S7 jobs, else #211) + appended to `~/code/fp4local-night/AUTOLOG.md`; one-time alert on #211 if the runner is down, paused or idle. Never merges. Stop: `~/code/fp4local-night/NIGHTWATCH_STOP` |
+| rsync mirror | Mac cron */15 | 15 min | STATUS.md, RESULTS.md, runner.log, `perf/nq-*` → `~/code/fp4local-night/` |
+
+Merges stay with the lead session: #219 after jobs 35 (BFCL) and 37 (exactness) both pass.
