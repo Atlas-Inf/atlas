@@ -5,6 +5,7 @@ members = [
     "crates/atlas-kernels",
     "crates/atlas-plugin",
     "crates/atlas-tier",
+    "crates/atlas-tool-guard",
     "crates/atlas-rdma",
     "crates/spark-runtime",
     "crates/spark-comm",
@@ -86,6 +87,7 @@ parking_lot = "0.12"
 atlas-core = { path = "crates/atlas-core", default-features = false }
 atlas-kernels = { path = "crates/atlas-kernels" }
 atlas-tier = { path = "crates/atlas-tier" }
+atlas-tool-guard = { path = "crates/atlas-tool-guard" }
 atlas-rdma = { path = "crates/atlas-rdma" }
 
 # W7: the `[patch.crates-io] xgrammar-rs` entry was removed — Atlas now

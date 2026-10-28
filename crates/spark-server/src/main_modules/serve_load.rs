@@ -1271,7 +1271,14 @@ pub(crate) fn load_model(
         .transpose()?
         .unwrap_or_default();
 
+    let tool_guard = args.tool_guard.policy().map_err(anyhow::Error::msg)?;
+    tracing::info!(
+        enabled = tool_guard.enabled,
+        max_bytes = tool_guard.max_bytes,
+        "tool-call guard configured"
+    );
     let state = Arc::new(AppState {
+        tool_guard,
         tokenizer,
         model_name,
         adapter_name: nllb_adapter_name

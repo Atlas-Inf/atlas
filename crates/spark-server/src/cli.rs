@@ -12,6 +12,7 @@ pub mod bench_run;
 mod bench_selfstart;
 pub(crate) mod flag_values;
 mod serve_args;
+mod tool_guard_args;
 mod validate;
 pub use bench_args::BenchmarkArgs;
 pub use serve_args::{DEFAULT_DFLASH_GAMMA, DEFAULT_KV_CACHE_DTYPE, DEFAULT_NUM_DRAFTS, ServeArgs};

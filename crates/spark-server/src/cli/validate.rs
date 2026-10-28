@@ -48,6 +48,7 @@ impl Violation {
 /// error string listing EVERY violation (so the operator fixes them in one
 /// pass), or `Ok(())` when the invocation is self-consistent.
 pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
+    args.tool_guard.policy()?;
     let mut v: Vec<Violation> = Vec::new();
 
     // ── Enumerated-value typos (caught here so a typo fails fast, before the

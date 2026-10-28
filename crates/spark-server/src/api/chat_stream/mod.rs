@@ -32,6 +32,7 @@ mod state;
 mod strip;
 mod token_ids;
 mod tool_handlers;
+mod tool_security;
 
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive};

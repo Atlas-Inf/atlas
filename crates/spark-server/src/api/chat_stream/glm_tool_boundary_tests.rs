@@ -19,6 +19,13 @@ const CALL: &[u32] = &[3, 4, 5, 6, 7, 8, 9, 10, 11];
 mod reasoning_done_tests;
 
 fn app(glm: bool) -> Arc<AppState> {
+    app_for_model(
+        if glm { "glm5_next" } else { "qwen4_exp" },
+        tool_parser::ToolCallFormat::PoolsideV1,
+    )
+}
+
+fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<AppState> {
     let dir = tempfile::tempdir().unwrap();
     let words = [
         "[UNK]",
@@ -36,6 +43,10 @@ fn app(glm: bool) -> Arc<AppState> {
         "unknown_tool",
         "<think>",
         "42",
+        "END",
+        "<function=get_weather><parameter=city>http://169.254.169.254/</parameter></function></tool_call>",
+        "<function=get_url><parameter=url>http://169.254.169.254/</parameter></function></tool_call>",
+        "get_url<arg_key>url</arg_key><arg_value>http://169.254.169.254/</arg_value></tool_call>",
     ];
     let vocab = words
         .iter()
@@ -56,7 +67,7 @@ fn app(glm: bool) -> Arc<AppState> {
         dir.path(),
         0,
         true,
-        "glm5_next",
+        model_type,
         "",
         None,
         false,
@@ -68,6 +79,7 @@ fn app(glm: bool) -> Arc<AppState> {
     );
     let (request_tx, _) = tokio::sync::mpsc::channel(1);
     Arc::new(AppState {
+        tool_guard: Default::default(),
         tokenizer,
         model_name: "display-name-is-not-model-type".into(),
         adapter_name: None,
@@ -87,9 +99,7 @@ fn app(glm: bool) -> Arc<AppState> {
         default_top_p: 1.0,
         default_top_n_sigma: 0.0,
         default_min_p: 0.0,
-        tool_call_parser: Some(Arc::from(
-            tool_parser::ToolCallFormat::PoolsideV1.into_parser(),
-        )),
+        tool_call_parser: Some(Arc::from(format.into_parser())),
         chat: Default::default(),
         reasoning_parser: Some(crate::reasoning_parser::ReasoningFormat::Qwen.into_parser()),
         think_end_token_id: Some(END),
@@ -97,11 +107,7 @@ fn app(glm: bool) -> Arc<AppState> {
         tool_max_tokens: 192,
         sampling_presets: Default::default(),
         tool_call_start_token_id: Some(TOOL),
-        glm_tool_boundary: crate::glm_tool_boundary::native_opener(
-            if glm { "glm5_next" } else { "qwen3" },
-            true,
-            Some(TOOL),
-        ),
+        glm_tool_boundary: crate::glm_tool_boundary::native_opener(model_type, true, Some(TOOL)),
         auto_compact_threshold: None,
         request_timeout: 0,
         effective_context: 0,
@@ -222,7 +228,16 @@ fn stream_tokens_with_context(
     tools: bool,
     tokens: Vec<u32>,
 ) -> (StreamCtx, StreamState, Vec<ir::StreamDelta>) {
-    let state = app(glm);
+    stream_tokens_with_state(app(glm), tools, tokens)
+}
+
+/// Same runner with a caller-built `AppState` (the tool-guard tests pick the
+/// policy themselves). Ported from Enntity/atlas fa5331b2 (AGPL-3.0-only).
+fn stream_tokens_with_state(
+    state: Arc<AppState>,
+    tools: bool,
+    tokens: Vec<u32>,
+) -> (StreamCtx, StreamState, Vec<ir::StreamDelta>) {
     let defs = if tools { request().tools } else { vec![] };
     let ctx = StreamCtx {
         _active_guard: crate::metrics::ActiveRequestGuard::new(),
@@ -252,7 +267,12 @@ fn stream_tokens_with_context(
     let cancel = Arc::new(AtomicBool::new(false));
     let mut stream = StreamState::new(tools, true, cancel, defs);
     if let Some(detector) = stream.detector.as_mut() {
-        detector.set_promote_bare_names(true);
+        detector.set_promote_bare_names(
+            state
+                .tool_call_parser
+                .as_ref()
+                .is_some_and(|p| p.name() == "poolside_v1"),
+        );
     }
     let mut deltas = vec![];
     for token in tokens {
@@ -402,3 +422,6 @@ fn blocking_refusal_prefix_keeps_content() {
         assert_eq!(r, "I cannot verify that source.");
     }
 }
+
+#[path = "tool_security_tests.rs"]
+mod tool_security_tests;
