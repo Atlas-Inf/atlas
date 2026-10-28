@@ -808,6 +808,12 @@ pub fn w8a16_gemm_n_m128(
     stream: u64,
 ) -> Result<()> {
     super::log_gemm_shape(gpu, "w8a16_gemm_n_m128", m, n, k);
+    // gfx1151 prefill: dequant once + hipBLASLt beats the fused kernel at
+    // M >= 1024 (see hip_fp8_blas.rs); falls through when not taken.
+    #[cfg(atlas_hip)]
+    if super::hip_fp8_blas::try_w8a16_n(gpu, input, weight, block_scale, output, m, n, k, stream)? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
         .block([256, 1, 1])
