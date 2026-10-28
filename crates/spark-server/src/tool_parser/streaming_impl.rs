@@ -253,6 +253,7 @@ impl StreamingToolDetector {
                 if self.current_tc_name.is_none()
                     && let Some(name) =
                         extract_streaming_name(&self.buffer, self.promote_bare_names)
+                    && self.is_registered_tool(&name)
                 {
                     let id = next_tool_call_id();
                     let idx = self.call_counter as usize;
