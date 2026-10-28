@@ -1146,3 +1146,22 @@ request); `cuMemFree` 229,277 calls / 5.0 s; `cuStreamSynchronize` 1,111 / 80 ms
 `cuda*` names and reported zero.) Attribution in progress (CPU-only, existing capture): readback sizes and call sites,
 per-layer placement, the free storm's source, and the idle each causes. Candidate byte-exact lever: remove per-layer
 host readbacks / frees in prefill.
+
+## 2026-10-28 21:30 UTC — prefill host stalls attributed; lever sizes
+
+From job 43's capture (CPU-only):
+- The blocking readbacks are a **2,052-byte D2H per layer per forward** (512 × 4 B per-expert token counts: the grouped
+  MoE `moe_sort_by_expert` path sizes its grouped-GEMM launch on the host), plus one PLE token-id readback per forward
+  (`layers/ple/layer.rs:300`, host n-gram hash; its comment says it's illegal under capture).
+- At P17K, idle within 0.5 ms of a D2H = **1,254 ms of 2,903 ms** idle. The 229K `cuMemFree` calls are boot-time
+  (~0 inside requests).
+- Recoverable by device-side offsets / a fixed-grid grouped GEMM + token-id prestage (byte-exact): est. **0.4–1.2 s at
+  P17K** (3–8% of TTFT), only ~10–40 ms at ~2.9K tokens.
+
+Achieved MoE prefill throughput at P17K (FLOPs = tokens × top-10 × 48 layers × 6.55 / 3.28 MFLOP for gate_up / down):
+`fused_gate_up_t_k64` ≈ 30 TFLOP/s, `grouped_gemm_ptrtable_t_k64` ≈ 25 TFLOP/s, i.e. W4A16 (dequant to BF16 + BF16
+MMA). Earlier measurements on this box: cuBLAS reaches 75–206 TFLOP/s; vLLM's NVFP4 MoE uses native FP4 MMA. MoE is
+~40% of prefill kernel time at ~3K tokens and 3.7 of 12.8 s busy at 19K. **This is the big prefill lever, but it
+changes numerics (accumulation order / FP4 MMA), so it needs BFCL gating.** The byte-exact levers are each ≤ ~5–8%: host
+readbacks, and hc kernels (`hc_post_vec` + `hc_pre_stage` ≈ 1.3 s at P17K, ~2× under bandwidth by estimate). QSA
+attention (2.4 s at P17K) is latency-bound per earlier work.
