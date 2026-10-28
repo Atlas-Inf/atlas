@@ -1,168 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Byte-identity + speed for the multi-row dedup `_rows` kernels vs K
-//! single-row `moe_expert_gate_up_shared_t`/`silu_down_shared_t` launches.
-//!
-//! Cold pattern: 48 layers x 40 separately-allocated expert tables (the
-//! FP4-Local expert count), a fresh table set each iteration, and routing
-//! built to hit an exact routed-expert union of 19 / 26 / 33 at K=4 rows
-//! (the 10-19 measured p10 / mean / p90 of the 4-row verify union). K=2/3
-//! run the union targets that fit in K*TOP_K slots; K=1 is the degenerate
-//! arm (production wiring only uses rows >= 2). NVFP4 shared expert on.
-//!
-//! Run on sparky:
-//!   cargo run -p spark-model --release --features cuda,gpu-examples \
-//!     --example moe_t_rows_bench
+//! Benchmark cases: union routing, memory guard and the RESULT printer.
 
 use anyhow::Result;
 use half::bf16;
 use spark_model::layers::ops;
 use spark_model::weight_map::QuantizedWeight;
-use spark_runtime::cuda_backend::AtlasCudaBackend;
-use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::gpu::GpuBackend;
 
-const N_EXP: usize = 40; // routed experts (FP4-Local)
-const N_OUT: usize = 640; // gate/up output N
-const K_RED: usize = 2560; // reduction K (gate/up)
-const N_DOWN: usize = 2560; // down output N
-const K_DOWN: usize = 640; // down reduction K
-const TOP_K: usize = 10;
-
-struct Lcg(u64);
-impl Lcg {
-    fn u(&mut self) -> u64 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        self.0 >> 11
-    }
-    fn f(&mut self) -> f32 {
-        (self.u() as f64 / (1u64 << 53) as f64) as f32
-    }
-    fn b(&mut self) -> u8 {
-        (self.u() & 0xFF) as u8
-    }
-    fn sc(&mut self) -> u8 {
-        0x28 + (self.u() % 0x21) as u8
-    } // E4M3 ~2^-6..2^2
-    fn s2(&mut self) -> f32 {
-        0.001 + self.f() * 0.009
-    } // ~1e-3..1e-2
-    fn act(&mut self) -> f32 {
-        (self.f() * 4.0 - 2.0).clamp(-2.0, 2.0)
-    }
-}
-
-fn up(g: &dyn GpuBackend, d: &[u8]) -> Result<DevicePtr> {
-    let p = g.alloc(d.len().max(1))?;
-    g.copy_h2d(d, p)?;
-    Ok(p)
-}
-fn dn(g: &dyn GpuBackend, p: DevicePtr, n: usize) -> Result<Vec<u8>> {
-    let mut b = vec![0u8; n];
-    g.copy_d2h(p, &mut b)?;
-    Ok(b)
-}
-
-/// One layer's transposed ptr tables: each expert separately allocated.
-struct Layer {
-    gpk: Vec<DevicePtr>,
-    gsc: Vec<DevicePtr>,
-    upk: Vec<DevicePtr>,
-    usc: Vec<DevicePtr>,
-    dpk: Vec<DevicePtr>,
-    dsc: Vec<DevicePtr>,
-    s2: Vec<f32>,
-}
-impl Layer {
-    fn new(g: &dyn GpuBackend, rng: &mut Lcg) -> Result<Self> {
-        let mut s2: Vec<f32> = Vec::new();
-        let mk_packed = |bytes: usize, rng: &mut Lcg| -> Result<Vec<DevicePtr>> {
-            (0..N_EXP)
-                .map(|_| {
-                    let d: Vec<u8> = (0..bytes).map(|_| rng.b()).collect();
-                    up(g, &d)
-                })
-                .collect()
-        };
-        let mk_scale = |bytes: usize, rng: &mut Lcg| -> Result<Vec<DevicePtr>> {
-            (0..N_EXP)
-                .map(|_| {
-                    let d: Vec<u8> = (0..bytes).map(|_| rng.sc()).collect();
-                    up(g, &d)
-                })
-                .collect()
-        };
-        for _ in 0..N_EXP {
-            s2.push(rng.s2());
-        }
-        Ok(Self {
-            gpk: mk_packed(K_RED / 2 * N_OUT, rng)?,
-            gsc: mk_scale(K_RED / 16 * N_OUT, rng)?,
-            upk: mk_packed(K_RED / 2 * N_OUT, rng)?,
-            usc: mk_scale(K_RED / 16 * N_OUT, rng)?,
-            dpk: mk_packed(K_DOWN / 2 * N_DOWN, rng)?,
-            dsc: mk_scale(K_DOWN / 16 * N_DOWN, rng)?,
-            s2,
-        })
-    }
-    fn ptr_tables(&self, g: &dyn GpuBackend) -> Result<[DevicePtr; 7]> {
-        let v = |ps: &[DevicePtr]| -> Result<DevicePtr> {
-            let d: Vec<u8> = ps.iter().flat_map(|p| p.0.to_le_bytes()).collect();
-            up(g, &d)
-        };
-        let s2d: Vec<u8> = self.s2.iter().flat_map(|x| x.to_le_bytes()).collect();
-        Ok([
-            v(&self.gpk)?,
-            v(&self.gsc)?,
-            up(g, &s2d)?,
-            v(&self.upk)?,
-            v(&self.usc)?,
-            v(&self.dpk)?,
-            v(&self.dsc)?,
-        ])
-    }
-}
-
-const LAYER_SET: usize = 48; // ~5 GB of tables: cold-streams L2 like a real step.
-
-/// Routing with an exact routed-expert union of `union` experts across
-/// `rows` x TOP_K distinct-per-row ids. Requires TOP_K <= union <=
-/// min(N_EXP, rows*TOP_K). pool[0..union] ends up exactly covering rows.
-fn union_ids(rng: &mut Lcg, rows: usize, union: usize) -> Vec<u32> {
-    let mut pool: Vec<u32> = (0..N_EXP as u32).collect();
-    for i in (1..pool.len()).rev() {
-        let j = (rng.u() % (i as u64 + 1)) as usize;
-        pool.swap(i, j);
-    }
-    let mut ids: Vec<Vec<u32>> = vec![Vec::new(); rows];
-    ids[0] = pool[..TOP_K].to_vec();
-    let extra = union - TOP_K;
-    let per = if rows > 1 { extra / (rows - 1) } else { 0 };
-    let mut rem = extra - per * (rows - 1);
-    let mut used = TOP_K;
-    for r in 1..rows {
-        let f = per
-            + if rem > 0 {
-                rem -= 1;
-                1
-            } else {
-                0
-            };
-        for _ in 0..f {
-            ids[r].push(pool[used]);
-            used += 1;
-        }
-        while ids[r].len() < TOP_K {
-            let id = pool[(rng.u() % used as u64) as usize];
-            if !ids[r].contains(&id) {
-                ids[r].push(id);
-            }
-        }
-    }
-    debug_assert_eq!(used, union);
-    ids.concat()
-}
+use crate::tables::*;
 
 /// Weight bytes one expert contributes per kernel pair (packed + scale for
 /// gate & up + down).
@@ -170,7 +15,7 @@ fn expert_bytes() -> usize {
     (K_RED / 2 * N_OUT + K_RED / 16 * N_OUT) * 2 + (K_DOWN / 2 * N_DOWN + K_DOWN / 16 * N_DOWN)
 }
 
-fn mem_kb() -> Option<u64> {
+pub(crate) fn mem_kb() -> Option<u64> {
     std::fs::read_to_string("/proc/meminfo").ok().and_then(|s| {
         s.lines()
             .find(|l| l.starts_with("MemAvailable"))
@@ -178,7 +23,7 @@ fn mem_kb() -> Option<u64> {
     })
 }
 
-fn bench_case(
+pub(crate) fn bench_case(
     g: &dyn GpuBackend,
     layers: &[Layer],
     rows: usize,
@@ -188,11 +33,11 @@ fn bench_case(
     vsuffix: &str,
     vbs: u32,
 ) -> Result<()> {
-    if let Some(kb) = mem_kb() {
-        if kb < 20 * 1024 * 1024 {
-            println!("ABORT: MemAvailable {kb} kB < 20 GB");
-            std::process::exit(2);
-        }
+    if let Some(kb) = mem_kb()
+        && kb < 20 * 1024 * 1024
+    {
+        println!("ABORT: MemAvailable {kb} kB < 20 GB");
+        std::process::exit(2);
     }
     let gpu = g;
     let mut rng = Lcg(0xC0FFEE ^ (rows as u64) << 8 | union as u64);
@@ -577,11 +422,7 @@ fn bench_case(
         let (va, vb) = (&ref_host[i], &rows_host[i]);
         let inf = va
             .chunks_exact(2)
-            .filter(|c| {
-                c[0] == 0x7f && c[1] == 0x7f
-                    || c[0] == 0xff && c[1] == 0x7f
-                    || c[0] == 0xff && c[1] == 0xff
-            })
+            .filter(|c| (c[0] == 0x7f || c[0] == 0xff) && (c[1] == 0x7f || c[1] == 0xff))
             .count();
         if inf > 0 {
             println!("  WARN {name}: {inf} inf/nan bytes in ref");
@@ -636,64 +477,5 @@ fn bench_case(
         t_rows,
         t_rows.as_secs_f64() / t_single.as_secs_f64()
     );
-    Ok(())
-}
-
-fn main() -> Result<()> {
-    let g = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
-    let mut rng = Lcg(0xC0FFEE);
-    let layers: Vec<Layer> = (0..LAYER_SET)
-        .map(|_| Layer::new(&g, &mut rng))
-        .collect::<Result<_>>()?;
-    println!("MemAvailable at start: {:?} kB", mem_kb());
-    if let Ok(sel) = std::env::var("MOE_ROWS_ONLY") {
-        let un = std::env::var("MOE_UNION")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(26);
-        let sh = std::env::var("MOE_SHARED")
-            .map(|v| v == "1")
-            .unwrap_or(true);
-        for rows in sel.split(',').filter_map(|x| x.parse::<usize>().ok()) {
-            bench_case(&g, &layers, rows, un, sh, "v0", &format!("_r{rows}"), 32)?;
-        }
-        return Ok(());
-    }
-    let variants: [(&str, u32); 1] = [("v3_b256", 256)];
-    let suffix = |vname: &str, rows: usize| -> String {
-        match vname {
-            _ => format!("_{}_r{rows}_{}", &vname[..2], &vname[3..]),
-        }
-    };
-    for (vname, vbs) in variants {
-        let rows = 1;
-        bench_case(
-            &g,
-            &layers,
-            rows,
-            TOP_K,
-            true,
-            vname,
-            &suffix(vname, rows),
-            vbs,
-        )?; // degenerate
-        for rows in [2usize, 3, 4] {
-            for union in [19usize, 26, 33] {
-                if union <= rows * TOP_K {
-                    bench_case(
-                        &g,
-                        &layers,
-                        rows,
-                        union,
-                        true,
-                        vname,
-                        &suffix(vname, rows),
-                        vbs,
-                    )?;
-                }
-            }
-        }
-    }
-    println!("MemAvailable at end: {:?} kB", mem_kb());
     Ok(())
 }
