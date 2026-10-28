@@ -74,6 +74,8 @@ impl MoeLayer {
         let _ = num_experts;
         let optional = super::init_optional::OptionalKernels::resolve(gpu, config);
         let t_rows = super::init_t_rows::TRowsKernels::resolve(gpu);
+        let batched =
+            super::init_batched::BatchedKernels::resolve(gpu, config.model_type == "glm5_next")?;
         let rms_norm_k = gpu.kernel("norm", "rms_norm")?;
         let mut layer = Self {
             weights,
@@ -138,43 +140,22 @@ impl MoeLayer {
             moe_weighted_sum_blend: gpu.kernel("moe_expert_gemv", "moe_weighted_sum_blend")?,
             residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
             moe_topk_batched: gpu.kernel("moe_topk", "moe_topk_softmax_batched")?,
-            moe_expert_gate_up_shared_batch2: gpu
-                .kernel("moe_fused_batch2", "moe_expert_gate_up_shared_batch2")?,
-            moe_expert_silu_down_shared_batch2: gpu
-                .kernel("moe_fused_batch2", "moe_expert_silu_down_shared_batch2")?,
-            moe_weighted_sum_blend_batch2: gpu
-                .kernel("moe_fused_batch2", "moe_weighted_sum_blend_batch2")?,
-            w4a16_gemv_batch2: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
-            moe_expert_gate_up_shared_batch3: gpu
-                .kernel("moe_fused_batch3", "moe_expert_gate_up_shared_batch3")?,
-            moe_expert_silu_down_shared_batch3: gpu
-                .kernel("moe_fused_batch3", "moe_expert_silu_down_shared_batch3")?,
-            moe_weighted_sum_blend_batch3: gpu
-                .kernel("moe_fused_batch3", "moe_weighted_sum_blend_batch3")?,
-            w4a16_gemv_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
-            w4a16_batchm: W4a16BatchmTiers::resolve(gpu, config.model_type == "glm5_next"),
-            w4a16_batch5_dual_k: super::super::try_kernel_gated(
-                config.model_type == "glm5_next",
-                gpu,
-                "w4a16_gemv",
-                "w4a16_gemv_batch5_dual",
-            ),
-            moe_expert_gate_up_shared_token_major: gpu
-                .kernel("moe_prefill", "moe_expert_gate_up_shared_prefill")?,
-            moe_expert_silu_down_shared_token_major: gpu
-                .kernel("moe_prefill", "moe_expert_silu_down_shared_prefill")?,
-            moe_weighted_sum_blend_token_major: gpu
-                .kernel("moe_prefill", "moe_weighted_sum_blend_prefill")?,
-            moe_decode_atomic_c4_silu_down_accum_k: super::super::try_kernel(
-                gpu,
-                "moe_decode_atomic_c4",
-                "moe_decode_atomic_c4_silu_down_accum",
-            ),
-            moe_decode_atomic_c4_finalize_k: super::super::try_kernel(
-                gpu,
-                "moe_decode_atomic_c4",
-                "moe_decode_atomic_c4_finalize",
-            ),
+            moe_expert_gate_up_shared_batch2: batched.moe_expert_gate_up_shared_batch2,
+            moe_expert_silu_down_shared_batch2: batched.moe_expert_silu_down_shared_batch2,
+            moe_weighted_sum_blend_batch2: batched.moe_weighted_sum_blend_batch2,
+            w4a16_gemv_batch2: batched.w4a16_gemv_batch2,
+            moe_expert_gate_up_shared_batch3: batched.moe_expert_gate_up_shared_batch3,
+            moe_expert_silu_down_shared_batch3: batched.moe_expert_silu_down_shared_batch3,
+            moe_weighted_sum_blend_batch3: batched.moe_weighted_sum_blend_batch3,
+            w4a16_gemv_batch3: batched.w4a16_gemv_batch3,
+            w4a16_batchm: batched.w4a16_batchm,
+            w4a16_batch5_dual_k: batched.w4a16_batch5_dual_k,
+            moe_expert_gate_up_shared_token_major: batched.moe_expert_gate_up_shared_token_major,
+            moe_expert_silu_down_shared_token_major: batched
+                .moe_expert_silu_down_shared_token_major,
+            moe_weighted_sum_blend_token_major: batched.moe_weighted_sum_blend_token_major,
+            moe_decode_atomic_c4_silu_down_accum_k: batched.moe_decode_atomic_c4_silu_down_accum_k,
+            moe_decode_atomic_c4_finalize_k: batched.moe_decode_atomic_c4_finalize_k,
             moe_sort_by_expert: ops::glm_decode_fuse::twin(
                 gpu,
                 ops::glm_decode_fuse::MOE_SORT,

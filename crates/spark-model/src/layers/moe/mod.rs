@@ -233,6 +233,7 @@ pub(crate) use shared_fp8_cache::validate_shared_fp8_cache_factory_reserve;
 pub use shared_fp8_cache::{validate_shared_fp8_cache_graphs, validate_shared_fp8_cache_profile};
 pub(crate) use shared_fp8_origin::load_glm_shared_fp8_weight;
 mod init;
+mod init_batched;
 mod init_optional;
 mod init_t_rows;
 mod inplace_transpose;
