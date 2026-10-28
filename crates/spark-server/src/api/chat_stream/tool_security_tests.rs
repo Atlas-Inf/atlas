@@ -23,7 +23,7 @@ fn stream_for_app(
     tools: bool,
     tokens: Vec<u32>,
 ) -> (StreamCtx, StreamState, Vec<ir::StreamDelta>) {
-    super::stream_tokens_with_state(state, tools, tokens)
+    super::stream_tokens_with_state(state, tools, tokens, request())
 }
 
 fn setup(glm: bool) -> (StreamCtx, StreamState) {

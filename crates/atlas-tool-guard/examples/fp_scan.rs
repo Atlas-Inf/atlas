@@ -16,7 +16,9 @@ fn main() {
             let mut rest = line;
             while let Some(start) = rest.find("\"arguments\"") {
                 rest = &rest[start + 11..];
-                let Some(js) = rest.find('"').map(|q| &rest[q + 1..]) else { break };
+                let Some(js) = rest.find('"').map(|q| &rest[q + 1..]) else {
+                    break;
+                };
                 let Some(end) = js.find('"') else { break };
                 let args = js[..end].replace("\\\"", "\"").replace("\\n", "\n");
                 rest = &rest[end..];
@@ -24,7 +26,11 @@ fn main() {
                 if let Err(r) = policy.inspect(&args) {
                     blocked += 1;
                     if examples.len() < 10 {
-                        examples.push(format!("{path}:{i} {} {:?}", r.code(), &args[..args.len().min(160)]));
+                        examples.push(format!(
+                            "{path}:{i} {} {:?}",
+                            r.code(),
+                            &args[..args.len().min(160)]
+                        ));
                     }
                 }
             }
@@ -39,7 +45,11 @@ fn main() {
                     if let Err(r) = policy.inspect(&args) {
                         blocked += 1;
                         if examples.len() < 10 {
-                            examples.push(format!("{path}:{i} {} {:?}", r.code(), &args[..args.len().min(160)]));
+                            examples.push(format!(
+                                "{path}:{i} {} {:?}",
+                                r.code(),
+                                &args[..args.len().min(160)]
+                            ));
                         }
                     }
                 }
@@ -48,5 +58,7 @@ fn main() {
         }
     }
     println!("fp-scan: {total} complete calls, {blocked} would be refused");
-    for e in examples { println!("  {e}"); }
+    for e in examples {
+        println!("  {e}");
+    }
 }

@@ -228,17 +228,19 @@ fn stream_tokens_with_context(
     tools: bool,
     tokens: Vec<u32>,
 ) -> (StreamCtx, StreamState, Vec<ir::StreamDelta>) {
-    stream_tokens_with_state(app(glm), tools, tokens)
+    stream_tokens_with_state(app(glm), tools, tokens, request())
 }
 
-/// Same runner with a caller-built `AppState` (the tool-guard tests pick the
-/// policy themselves). Ported from Enntity/atlas fa5331b2 (AGPL-3.0-only).
+/// Same runner with a caller-built `AppState` and `ChatRequest` (the
+/// tool-guard tests pick the policy and declare their own tools). Ported
+/// from Enntity/atlas fa5331b2 (AGPL-3.0-only).
 fn stream_tokens_with_state(
     state: Arc<AppState>,
     tools: bool,
     tokens: Vec<u32>,
+    request: ir::ChatRequest,
 ) -> (StreamCtx, StreamState, Vec<ir::StreamDelta>) {
-    let defs = if tools { request().tools } else { vec![] };
+    let defs = if tools { request.tools } else { vec![] };
     let ctx = StreamCtx {
         _active_guard: crate::metrics::ActiveRequestGuard::new(),
         state: state.clone(),
