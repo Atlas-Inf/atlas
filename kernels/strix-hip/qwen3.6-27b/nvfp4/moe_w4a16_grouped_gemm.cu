@@ -1164,8 +1164,8 @@ __device__ __forceinline__ void moef_body(
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;
 
-    __shared__ __align__(16) _Float16 smem_A[2][MOEF_M_TILE][MOEF_K_STEP + 8];
-    __shared__ __align__(16) _Float16 smem_B[2][MOEF_B_OFF(MOEF_N_TILE)];
+    __shared__ __align__(16) _Float16 smem_A[1][MOEF_M_TILE][MOEF_K_STEP + 8];
+    __shared__ __align__(16) _Float16 smem_B[1][MOEF_B_OFF(MOEF_N_TILE)];
     __shared__ int smem_tok[MOEF_M_TILE];
 
     if (threadIdx.x < MOEF_M_TILE) {
@@ -1241,16 +1241,18 @@ __device__ __forceinline__ void moef_body(
     MOEF_LOAD(0, ra, rb, rs);
     MOEF_STORE(0, ra, rb, rs);
     __syncthreads();
-    int cur = 0;
+    // One LDS buffer (31 -> ~15.6 KB per CTA, so twice the CTAs fit per WGP; the
+    // double-buffered kernel was LDS-occupancy-bound). The register prefetch still
+    // overlaps the next tile's global loads with this tile's WMMA; the price is a
+    // second barrier per K-step. Same operands in the same order: bit-identical.
     for (unsigned int kb = MOEF_K_STEP; kb < K; kb += MOEF_K_STEP) {
-        const int nxt = 1 - cur;
         MOEF_LOAD(kb, ra, rb, rs);
-        MOEF_COMPUTE(cur);
-        MOEF_STORE(nxt, ra, rb, rs);
+        MOEF_COMPUTE(0);
         __syncthreads();
-        cur = nxt;
+        MOEF_STORE(0, ra, rb, rs);
+        __syncthreads();
     }
-    MOEF_COMPUTE(cur);
+    MOEF_COMPUTE(0);
     #undef MOEF_LOAD
     #undef MOEF_STORE
     #undef MOEF_COMPUTE
