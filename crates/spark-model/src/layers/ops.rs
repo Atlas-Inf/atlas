@@ -70,6 +70,8 @@ mod gemm_fp4;
 pub mod model_stats;
 #[path = "ops/moe_gate_up_repack.rs"]
 pub(crate) mod moe_gate_up_repack;
+#[path = "ops/strix_f16.rs"]
+mod strix_f16;
 pub use model_stats::ModelStats;
 
 #[path = "ops/exl3_ops.rs"]
@@ -272,6 +274,8 @@ mod ssm_mamba_snap;
 mod ssm_preproc;
 #[path = "ops/ssm_ssd.rs"]
 mod ssm_ssd;
+#[path = "ops/strix_s64.rs"]
+mod strix_s64;
 pub mod token_overlay;
 #[path = "ops/wide_prefill.rs"]
 mod wide_prefill;
@@ -372,4 +376,6 @@ pub use ssm_mamba::*;
 pub use ssm_mamba_snap::*;
 pub use ssm_preproc::*;
 pub use ssm_ssd::*;
+pub use strix_f16::*;
+pub use strix_s64::*;
 pub use wide_prefill::*;
