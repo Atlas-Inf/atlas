@@ -38,7 +38,16 @@ fn main() -> Result<()> {
             .map(|v| v == "1")
             .unwrap_or(true);
         for rows in sel.split(',').filter_map(|x| x.parse::<usize>().ok()) {
-            bench_case(&g, &layers, rows, un, sh, "v0", &format!("_r{rows}"), 32)?;
+            bench_case(
+                &g,
+                &layers,
+                rows,
+                un,
+                sh,
+                "v3_b256",
+                &format!("_v3_r{rows}_b256"),
+                256,
+            )?;
         }
         return Ok(());
     }
@@ -47,17 +56,6 @@ fn main() -> Result<()> {
         format!("_{}_r{rows}_{}", &vname[..2], &vname[3..])
     };
     for (vname, vbs) in variants {
-        let rows = 1;
-        bench_case(
-            &g,
-            &layers,
-            rows,
-            TOP_K,
-            true,
-            vname,
-            &suffix(vname, rows),
-            vbs,
-        )?; // degenerate
         for rows in [2usize, 3, 4] {
             for union in [19usize, 26, 33] {
                 if union <= rows * TOP_K {
