@@ -109,19 +109,17 @@ impl MoeLayer {
         // route to the per-token batched path, like the bf16/fp8 arms above.
         // cfg gate: NVIDIA byte-unchanged.
         //
-        // Default 64, the bf16/fp8 arms' bound. It was 1024, from a winbox
-        // crossover (2026-09-20) taken when a grouped call cost ~15 ms nearly
-        // flat in N; #155's F16 grouped twins made it cheap, and the
-        // per-token path then cost ~7 s for one 423-row chunk (one warm agent
-        // turn). Cold TTFT, Flash-Next NVFP4, framework gfx1151 Linux,
-        // 2026-10-27 (f46), 1024 -> 64:
-        //   132 tok 2.50 -> 0.81 s    253 tok 4.63 -> 1.07 s
-        //   470 tok 8.36 -> 1.09 s    649 tok 11.61 -> 1.31 s
-        //   1035 / 1676 tok unchanged (already grouped)
-        //   Marconi resume, 6.1k prefix + 300 new: 5.76 -> 1.36 s
-        // 32 also wins at 59 tok (1.08 -> 0.67 s) and ties at 34; not yet
-        // gated, so the default stays on the bound the agentic and ST-995
-        // gates ran.
+        // Default 256. It was 1024, from a winbox crossover (2026-09-20) taken when
+        // a grouped call cost ~15 ms nearly flat in N; #155's F16 grouped twins made
+        // it cheap, and the per-token path then cost ~7 s for one 423-row chunk
+        // (one warm agent turn). Cold TTFT, Flash-Next NVFP4, framework gfx1151
+        // Linux, 2026-10-27 (f46), 1024 -> 256: 470 tok 8.36 -> 1.06 s, 649 tok
+        // 11.61 -> 1.30 s; 1035 / 1676 tok unchanged.
+        // Why not lower: 64 also wins below 256 tokens (132 tok 2.50 -> 0.81 s) but
+        // its agentic-webserver runs scored 45/50 and 47/50 webserver_ok, every
+        // failure "no Cargo.toml was written" (f47, f53), against 50/50 at 1024
+        // (f51). 256 scored 49/50 / 50/50 with no such failure, Sigma wall
+        // 15,441 -> 13,049 s and median TTFT 5.08 -> 3.65 s (f57).
         if cfg!(atlas_hip) {
             static HIP_NVFP4_GROUPED_MIN_TOKENS: std::sync::OnceLock<usize> =
                 std::sync::OnceLock::new();
@@ -134,7 +132,7 @@ impl MoeLayer {
                 std::env::var("ATLAS_HIP_MOE_GROUPED_MIN_TOKENS")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(if cfg!(test) { 1 } else { 64 })
+                    .unwrap_or(if cfg!(test) { 1 } else { 256 })
             });
             if num_tokens < min {
                 return self.forward_batched(input, num_tokens, ctx, stream);
