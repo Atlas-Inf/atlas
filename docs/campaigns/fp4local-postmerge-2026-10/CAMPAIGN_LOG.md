@@ -1001,3 +1001,17 @@ offline. Per generated token:
 (`perf/fp4l-moe-verify-dedup-act`): microbench vs the current rows kernel in one job (39b), then a self-deciding in-situ
 job (39c). Upper bound if silu_down_rows reaches gate_up_rows' bytes-per-ms: about 4–5 ms/token (preliminary).
 Second lever: 4.5 ms/token of GPU idle, since this path captures no CUDA graphs.
+
+## 2026-10-28 08:10–08:40 UTC — #219 cap fixed (main merged, init.rs 491); vacuous bench gates found and fixed; S7.1 in situ
+
+- #219 @ 62554db05: main merged (no conflicts), and batched/token-major/atomic lookups moved to `init_batched.rs`
+  (pure move, `glm5_next` gating passed through). The workflow's cap loop shows 0 violations; CI's cap check is green.
+  Smoke (job 38c): control identical, engaged, 0 errors.
+- **Vacuous gates:** the #219 slim bench example called the unshipped `_r1_b256` kernel and crashed. Job 30b's
+  microbench guard and job 39b's S7.1 verdict both printed PASS with 0 parsed lines. #219's decision doesn't rest on
+  them (in-situ control, job 37 summary-line exactness and the job 35 BFCL did). Fixed: the example runs rows 2..4
+  (139efbd07), and every verdict now fails on 0 parsed lines or a non-zero bench exit. Job 40 is the first real slim-
+  bench run (#219 vs S7.1, one job).
+- S7.1 (`perf/fp4l-moe-verify-dedup-act`, 86c11d766: silu activation computed once per element per CTA in smem):
+  in-situ job 39c (control, EXACT_VERIFY_CHECK + BATCH_FAST_CHECK summary verdicts, 3 speed pairs vs #219) running
+  since 08:15. It started on the vacuous 39b PASS, but it's the decisive test anyway.
