@@ -925,3 +925,19 @@ achieved GB/s. Code recon so far:
   dedup idea doesn't transfer; any win there has to come from inside that kernel.
 - No CUDA graphs on this path: zero "graph" lines in any FP4-Local r1short serve log, so decode/verify runs fully
   eager. If job 36 shows idle gaps large, the next task is finding qwen4_exp's capture gate.
+
+## 2026-10-28 05:30 UTC — 12.5 h of queued work on sparky; S7 exactness check must be re-run non-vacuously
+
+Owner asked for 12 h of unattended iteration. Queue (runner + health cron, every job self-contained):
+35 (#219 merge gate, BFCL leg) → 36 nsys decode profile (main vs main + S7) → **37 S7 exactness** → 38 long context
+32K–240K (main vs S7) → 39 NVFP4-pack engagement + speed → 40/41/42 agentic 50 on main + S7 (default / J recipe
+profile / ROWINV combo) → 90/91 agentic repeats on train 1 (variance). Expected to finish around 18:00 UTC.
+
+**Correction to the job-30b exactness claim.** The 30b EXACT_VERIFY_CHECK run (160 tokens, ~55 verify steps) printed
+only the "armed" line. The summary line prints every `SUMMARY_EVERY` steps (`exact_verify_check.rs` ~276), and the
+old counter greps for "differ", which also matches "0 rows differ". Zero per-row differ warnings is consistent with
+exactness, but with no summary line it isn't a positive proof that steps were checked. Job 37 fixes that:
+- r1short with EXACT_VERIFY_CHECK at 800 tokens;
+- r2 at C=4 and C=8 with BATCH_FAST_CHECK + EXACT_VERIFY_CHECK (multi-sequence rows also reach `forward_rows`);
+- PASS requires ≥ 1 summary line, every summary "0 rows differ", zero per-row warnings, and the arm engaged.
+#219 merges only after jobs 35 and 37 both pass.
