@@ -7,7 +7,9 @@ use std::path::Path;
 use tokenizers::Tokenizer;
 
 mod glm5_vision;
+mod glm_tool_markup;
 mod qwen3vl_vision;
+mod vision_markup;
 
 use super::{
     ChatEncoding, ChatTokenizer, StreamingDecoder, autoclose_assistant_think,
@@ -173,6 +175,7 @@ impl ChatTokenizer {
             tokenizer,
             eos_token_id,
             supports_thinking,
+            glm_tool_markup_as_text: matches!(model_type, "glm5_next" | "qwen4_exp"),
             chat_encoding,
             omni_image_tokens,
             chat_template,
@@ -186,6 +189,12 @@ impl ChatTokenizer {
     /// callers that need to drive low-level encode/decode directly).
     pub fn inner(&self) -> &tokenizers::Tokenizer {
         &self.tokenizer
+    }
+
+    /// Bare-role literal filtering applies only when the model does NOT
+    /// encode tool markup as text (Enntity/atlas 1c1a8fee, AGPL-3.0-only).
+    pub(crate) fn filters_bare_role_literals(&self) -> bool {
+        !self.glm_tool_markup_as_text && self.tokenizer.token_to_id("<|im_start|>").is_some()
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
@@ -332,7 +341,7 @@ impl ChatTokenizer {
             );
         }
 
-        self.encode(&rendered)
+        self.encode_rendered(&rendered)
     }
 
     /// Apply the OpenAI-variant template (if available), falling back to the default.
@@ -397,7 +406,7 @@ impl ChatTokenizer {
                 },
             )
             .map_err(|e| anyhow::anyhow!("Failed to render OpenAI Jinja template: {e}"))?;
-            self.encode(&rendered)
+            self.encode_rendered(&rendered)
         } else {
             self.apply_chat_template_jinja_with_effort(
                 messages,
