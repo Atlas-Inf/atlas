@@ -46,6 +46,8 @@ mod fp8_moe;
 mod fp8_moe_batch_a;
 #[path = "ops/fp8_moe_batch_b.rs"]
 mod fp8_moe_batch_b;
+#[path = "ops/fp8_moe_rows.rs"]
+mod fp8_moe_rows;
 #[path = "ops/gdn_flashinfer.rs"]
 // The FlashInfer GDN bridge uses dlopen/dlsym, which do not exist on Windows.
 // The absent variant is mounted at the SAME module path so both call sites
@@ -294,6 +296,7 @@ pub use fp8_gemv_batch::*;
 pub use fp8_moe::*;
 pub use fp8_moe_batch_a::*;
 pub use fp8_moe_batch_b::*;
+pub use fp8_moe_rows::*;
 pub use gemm_dense::*;
 pub use gemm_dense_int8::*;
 pub use gemm_dense_router::*;
@@ -325,7 +328,7 @@ pub use marlin_nvfp4::*;
 pub use marlin_nvfp4_pack::marlin_pack_nvfp4;
 pub use model_levers::{
     BISECT_ATTN_PROJ, BISECT_ATTN_ROWS, BISECT_GDN, BISECT_HC, BISECT_HEAD, BISECT_MOE_FORWARD,
-    BISECT_MOE_ROWS, ModelLevers,
+    BISECT_MOE_ROWS, BISECT_MOE_T_ROWS, ModelLevers,
 };
 pub use moe_atomic_c4::*;
 pub use moe_expert::*;
