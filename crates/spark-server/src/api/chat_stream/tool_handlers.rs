@@ -440,7 +440,9 @@ pub(super) fn handle_tool_call_delta(
         // deltas: the start delta was already emitted in real time, so
         // `emit_or_buffer_tool_delta` just adds the args delta.
         emit_or_buffer_tool_delta(state, ctx, idx, frag, deltas);
-        flush_buffered_tool_chunks(state, idx, deltas);
+        if !ctx.state.tool_guard.enabled {
+            flush_buffered_tool_chunks(state, idx, deltas);
+        }
     }
 }
 
