@@ -57,6 +57,32 @@ fn fp4_local_config() -> ModelConfig {
 /// Only MXFP8 modules are host-expanded: the trunk experts, MTP experts, PLE
 /// table and the vision tower (native NVFP4 dequant on-GPU) keep their own
 /// paths.
+/// GLM-5.3 FP4-Local declares `FP8_PB_WO` (128x128-block FP32 scales) on its
+/// shared experts: those are NOT MXFP8 per-32 E8M0 and must stay resident for
+/// the layer's own loader (`shared_expert_requantizes_from_fp8_blocks`), not
+/// host-expanded. Before this fix the "no native consumer" arm scooped them
+/// into `mxfp8_to_bf16` and the 2048-byte scale failed its shape check at
+/// model build.
+#[test]
+fn host_decode_modules_leaves_fp8_block_scales_to_the_layer_loader() {
+    let mut cfg = fp4_local_config();
+    cfg.model_type = "glm5_next".into();
+    let shared = "model.language_model.layers.10.mlp.shared_experts.down_proj";
+    cfg.quantization_config
+        .as_mut()
+        .unwrap()
+        .quantized_layers
+        .insert(shared.into(), spec("FP8_PB_WO", 128));
+    // glm5_next registers no native consumers: MXFP8 and NVFP4-family
+    // modules keep the pre-existing defer-and-expand path (BF16, as in the
+    // 494-module build log), while FP8_PB_WO shared experts stay resident
+    // for the GLM loader's own fp8 handling.
+    let got = host_decode_modules(&cfg);
+    assert!(got.contains(SHARED) && got.contains(GDN_OUT));
+    assert!(got.contains(VIS), "NVFP4 vision modules still host-expand");
+    assert!(!got.contains(shared), "FP8_PB_WO must not be host-expanded");
+}
+
 #[test]
 fn host_decode_modules_pick_mxfp8_and_vision_nvfp4_only() {
     let got = host_decode_modules(&fp4_local_config());
