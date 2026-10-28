@@ -267,9 +267,10 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
                 }
                 // Qwen4 treats tool markup as ordinary text until the
                 // explicit think-end token (Enntity/atlas 69d32d3e, AGPL).
-                if ctx.state.tokenizer.glm_tool_markup_as_text
-                    && ctx.state.glm_tool_boundary.is_none()
-                {
+                // Enntity/atlas: literal-XML carriers preserve textual
+                // spellings in reasoning; the native-opener token was
+                // already handled by token ID above (69d32d3e/1c1a8fee).
+                if ctx.state.tokenizer.glm_tool_markup_as_text {
                     if !state.reasoning_suppressing_leak && !cleaned.is_empty() {
                         deltas.push(StreamDelta::Reasoning {
                             text: cleaned,
