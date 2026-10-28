@@ -16,6 +16,7 @@ fn mxfp8_exact_rows_chunks_and_never_dequants() {
     let gpu = RecordingGpu::new();
     let proj = ops::Mxfp8Proj {
         w: crate::weight_map::Mxfp8Weight {
+            tiled: false,
             data: DevicePtr(0x10000),
             scales: DevicePtr(0x11000),
         },
@@ -118,6 +119,7 @@ fn mxfp8_shared_expert_exact_chunks_the_fused_chain() {
     let (h, inter) = (config.hidden_size, config.shared_expert_intermediate_size);
     let proj = |n: usize, k: usize, ptr: u64| Mxfp8Proj {
         w: crate::weight_map::Mxfp8Weight {
+            tiled: false,
             data: DevicePtr(ptr),
             scales: DevicePtr(ptr + 0x1000),
         },

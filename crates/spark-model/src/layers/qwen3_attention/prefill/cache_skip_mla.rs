@@ -61,6 +61,7 @@ impl Qwen3AttentionLayer {
             // Not at 17..=32 rows, where the 32-row tier lost time to it
             // (scripts/dev/glm_decode_gemv_touch_bench.cu).
             if m <= 16
+                && !mx.tiled
                 && self
                     .mla
                     .as_ref()
@@ -71,13 +72,20 @@ impl Qwen3AttentionLayer {
                     ctx.gpu, input, mx.data, mx.scales, output, m, n, k, n, stream,
                 );
             }
-            let kernel = self.mxfp8_gemv_k[match m {
-                0..=8 => 0,
-                9..=16 => 1,
-                _ => 2,
-            }];
+            let kernel = ops::mxfp8_kernel(ctx.gpu, mx, &self.mxfp8_gemv_k, m);
             return ops::mxfp8_gemv(
                 ctx.gpu, kernel, input, mx.data, mx.scales, output, m, n, k, n, stream,
+            );
+        }
+        if ctx.config.model_type == "glm5_next"
+            && m <= crate::layers::canonical_verify::MAX_ROWS
+            && crate::layers::canonical_verify::enabled()
+        {
+            // The indexer projections: one tensor-core family for every
+            // verify width (cuBLASLt picks its algorithm per row count, and
+            // one row took `dense_gemm_tc`).
+            return crate::layers::canonical_verify::dense(
+                ctx.gpu, input, weight, output, m, n, k, n, stream,
             );
         }
         if use_cublas_mla_prefill(ctx.dispatch.cublas_gemm, m) {

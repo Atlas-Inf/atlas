@@ -10,7 +10,7 @@ const CLOSE: u32 = 901;
 #[test]
 fn mtp_thinking_eos_waits_for_visible_answer_boundary() {
     for requested in [true, false] {
-        let (mut a, _) = test_seq(vec![10], 20, None, 12);
+        let (mut a, _response_rx) = test_seq(vec![10], 20, None, 12);
         a.finished = false;
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         a.sink = ResponseSink::Streaming(tx);

@@ -49,7 +49,9 @@ impl Qwen3AttentionLayer {
     /// Quantize BF16 projections `(weight, n, k)` to MXFP8 twins that
     /// `mla_prefill_dense` (and `glm_head_gemm` for the per-head W_uk / W_uv)
     /// use for verify-sized row counts. Runs at load, before KV sizing, so the
-    /// twins come out of the KV budget.
+    /// twins come out of the KV budget. q_b and o, which only
+    /// `mla_prefill_dense`'s plain tiers read, take the chunk-tiled layout
+    /// under `ATLAS_GLM_MXFP8_TILED=1`.
     pub fn install_mla_mxfp8(
         &mut self,
         gpu: &dyn spark_runtime::gpu::GpuBackend,
@@ -73,7 +75,18 @@ impl Qwen3AttentionLayer {
                 k,
                 stream,
             )?;
-            let mx = crate::weight_map::Mxfp8Weight { data, scales };
+            let mut mx = crate::weight_map::Mxfp8Weight {
+                data,
+                scales,
+                tiled: false,
+            };
+            if self
+                .mla
+                .as_ref()
+                .is_some_and(|mla| [mla.wq_b.weight, mla.wo.weight].contains(&weight))
+            {
+                crate::layers::ops::mxfp8_tile_if_requested(gpu, &mut mx, n, k, stream)?;
+            }
             self.mla_mx.push((weight, [n, k], mx));
         }
         gpu.synchronize(stream)

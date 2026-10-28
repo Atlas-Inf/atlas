@@ -17,10 +17,21 @@ use super::*;
 ///
 /// Resolves the effective type from a JSON schema property, handling `anyOf`/`oneOf`
 /// wrappers (e.g., Pydantic v2's `Optional[int]` → `{"anyOf": [{"type":"integer"},{"type":"null"}]}`).
-fn resolve_schema_type(schema: &serde_json::Value) -> Option<&str> {
-    // Direct "type" field
-    if let Some(t) = schema.get("type").and_then(|t| t.as_str()) {
-        return Some(t);
+pub(super) fn resolve_schema_type(schema: &serde_json::Value) -> Option<&str> {
+    // Direct "type" field, or the first non-null member of a type array
+    // (`["integer", "null"]`).
+    match schema.get("type") {
+        Some(serde_json::Value::String(t)) => return Some(t),
+        Some(serde_json::Value::Array(types)) => {
+            if let Some(t) = types
+                .iter()
+                .filter_map(|t| t.as_str())
+                .find(|t| *t != "null")
+            {
+                return Some(t);
+            }
+        }
+        _ => {}
     }
     // anyOf / oneOf: pick first non-null type
     for key in ["anyOf", "oneOf"] {
@@ -198,6 +209,16 @@ pub fn backfill_required_params(calls: &mut [ToolCall], tools: &[ToolDefinition]
         // 1. Coerce existing parameters to schema-expected types.
         if let Some(props) = properties {
             for (key, value) in args.iter_mut() {
+                if matches!(value, serde_json::Value::String(s) if s == "null") {
+                    if props
+                        .get(key)
+                        .is_some_and(super::type_coerce::permits_unambiguous_null)
+                    {
+                        *value = serde_json::Value::Null;
+                        changed = true;
+                    }
+                    continue;
+                }
                 let expected_type = props.get(key).and_then(|p| resolve_schema_type(p));
                 if let (Some(expected), serde_json::Value::String(s)) = (expected_type, &value) {
                     let coerced = match expected {

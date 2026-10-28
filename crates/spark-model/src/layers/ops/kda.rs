@@ -4,6 +4,8 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
+use crate::weight_map::DenseWeight;
+
 pub fn kda_pack_qkv(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -21,6 +23,49 @@ pub fn kda_pack_qkv(
         .arg_u32(tokens)
         .arg_u32(dim)
         .launch(stream)
+}
+
+/// The KDA prefill convolution of `m` rows into `output` (`[m, 3p]`) from
+/// packed `[m, 3p]` q|k|v rows or, `planar`, the three `[m, p]` planes the
+/// projection wrote (`ATLAS_GLM_KDA_CONV_PLANES`, no `kda_pack_qkv` copy):
+/// one [`super::conv1d_update_prefill`] per plane over that plane's channels,
+/// state rows and weights. Every (channel, token) output and every channel's
+/// state is the same arithmetic either way, so the bytes are identical.
+#[allow(clippy::too_many_arguments)]
+pub fn kda_conv_prefill(
+    gpu: &dyn GpuBackend,
+    [kernel, tp_kernel]: [KernelHandle; 2],
+    conv_state: DevicePtr,
+    (input, planar): (DevicePtr, bool),
+    weight: &DenseWeight,
+    output: DevicePtr,
+    [m, p, d_conv]: [u32; 3],
+    stream: u64,
+) -> Result<()> {
+    let (planes, in_stride) = if planar { (3, p) } else { (1, 3 * p) };
+    let channels = 3 * p / planes;
+    for plane in 0..planes {
+        let ch0 = (plane * channels) as usize;
+        super::conv1d_update_prefill(
+            gpu,
+            kernel,
+            tp_kernel,
+            conv_state.offset(ch0 * d_conv as usize * 4),
+            input.offset(plane as usize * m as usize * channels as usize * 2),
+            &DenseWeight {
+                weight: weight.weight.offset(ch0 * d_conv as usize * 2),
+            },
+            DevicePtr::NULL,
+            output.offset(ch0 * 2),
+            channels,
+            d_conv,
+            m,
+            in_stride,
+            3 * p,
+            stream,
+        )?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -148,28 +193,81 @@ pub fn kda_recurrent_verify_snap_owners(
 /// Floats per head in one row of KDA fold records (decay, key, correction).
 pub const KDA_RECORD_FLOATS: usize = 384;
 
-/// Advance `state` (FP32, `heads` x 128 x 128) over the first `rows` fold
-/// records `record_stride` floats apart: the accepted prefix of a records
-/// verify, bit-identical to the state that verify reached at that row.
+/// Key-row blocks per head in [`kda_commit_records`] (`KDA_COMMIT_KSPLIT`).
+const KDA_COMMIT_KSPLIT: u32 = 4;
+
+/// `ATLAS_GLM_KDA_COMMIT_CTAS`: unset or `0` commits over the full grid
+/// (`kda_commit_records`, one CTA per key-row block of every layer), `N` in
+/// `1..=4096` over `N` CTAs (`kda_commit_records_stride`, same words). Read
+/// once.
+pub fn kda_commit_ctas() -> Result<u32> {
+    static CTAS: std::sync::OnceLock<std::result::Result<u32, String>> = std::sync::OnceLock::new();
+    CTAS.get_or_init(
+        || match std::env::var("ATLAS_GLM_KDA_COMMIT_CTAS").as_deref() {
+            Err(_) => Ok(0),
+            Ok(value) => value
+                .parse::<u32>()
+                .ok()
+                .filter(|&n| n <= 4096)
+                .ok_or_else(|| {
+                    format!("ATLAS_GLM_KDA_COMMIT_CTAS requires 0..=4096, got {value:?}")
+                }),
+        },
+    )
+    .clone()
+    .map_err(anyhow::Error::msg)
+}
+
+/// The commit kernel for [`kda_commit_ctas`] CTAs.
+pub fn kda_commit_kernel(gpu: &dyn GpuBackend, ctas: u32) -> Result<KernelHandle> {
+    let name = match ctas {
+        0 => "kda_commit_records",
+        _ => "kda_commit_records_stride",
+    };
+    gpu.kernel("kda", name)
+}
+
+/// Advance `layers` FP32 states (`heads` x 128 x 128 each, layer `l` at
+/// `state + l * state_layer_stride` floats) over the first `rows` fold
+/// records `record_stride` floats apart (layer `l`'s at `records + l *
+/// records_layer_stride` floats): the accepted prefix of a records verify,
+/// bit-identical to the state that verify reached at that row. One launch
+/// for every layer; a single layer passes `layers == 1` (strides unused).
+/// `kernel` is [`kda_commit_kernel`]`(ctas)`: the full grid at `ctas == 0`,
+/// else `ctas` CTAs striding over it.
+#[allow(clippy::too_many_arguments)]
 pub fn kda_commit_records(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
     state: DevicePtr,
+    state_layer_stride: usize,
     records: DevicePtr,
+    records_layer_stride: usize,
     record_stride: usize,
     rows: u32,
     heads: u32,
+    layers: u32,
+    ctas: u32,
     stream: u64,
 ) -> Result<()> {
-    KernelLaunch::new(gpu, kernel)
-        .grid([heads, 1, 1])
+    let grid = match ctas {
+        0 => [heads * KDA_COMMIT_KSPLIT, layers, 1],
+        _ => [ctas.min(heads * KDA_COMMIT_KSPLIT * layers), 1, 1],
+    };
+    let launch = KernelLaunch::new(gpu, kernel)
+        .grid(grid)
         .block([128, 1, 1])
         .arg_ptr(state)
+        .arg_u64(state_layer_stride as u64)
         .arg_ptr(records)
+        .arg_u64(records_layer_stride as u64)
         .arg_u64(record_stride as u64)
         .arg_u32(rows)
-        .arg_u32(heads)
-        .launch(stream)
+        .arg_u32(heads);
+    match ctas {
+        0 => launch.launch(stream),
+        _ => launch.arg_u32(layers).launch(stream),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -269,3 +367,7 @@ pub fn kda_sigmoid_gated_norm(
         .arg_f32(eps)
         .launch(stream)
 }
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "kda_conv_planes_test_gpu.rs"]
+mod conv_planes_gpu_tests;

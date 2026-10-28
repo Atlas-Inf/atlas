@@ -33,12 +33,15 @@ pub(super) fn enabled() -> bool {
 /// This rank's shard as MXFP8 (first vocab row, weight), when prepared.
 static SHARD_MX: OnceLock<(usize, crate::weight_map::Mxfp8Weight)> = OnceLock::new();
 
-/// Quantize this rank's half of a BF16 GLM head to MXFP8 before KV sizing
+/// This rank's half of the GLM head as MXFP8 before KV sizing
 /// (`ATLAS_GLM_LM_HEAD_MXFP8=1`, ~0.33 GB); the split verify head then
-/// streams half the bytes for up to 32 rows at a time.
+/// streams half the bytes for up to 32 rows at a time. A checkpoint that
+/// ships the head MXFP8 (FP4-Local) gives its own rows, exactly; otherwise
+/// the BF16 head is quantized.
 pub(crate) fn prepare_shard_mxfp8(
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
+    store: &spark_runtime::weights::WeightStore,
     lm_head: DevicePtr,
     bf16_head: bool,
 ) -> Result<()> {
@@ -57,25 +60,33 @@ pub(crate) fn prepare_shard_mxfp8(
     );
     let shard = vocab / 2;
     let start = config.ep_rank * shard;
-    let quantize = gpu.kernel("mxfp8_gemv", "mxfp8_quantize_bf16")?;
-    let data = gpu.alloc(shard * h)?;
-    let scales = gpu.alloc(shard * h / ops::MXFP8_BLOCK)?;
     let stream = gpu.default_stream();
-    ops::mxfp8_quantize(
-        gpu,
-        quantize,
-        lm_head.offset(start * h * 2),
-        data,
-        scales,
-        shard,
-        h,
-        stream,
-    )?;
+    let checkpoint = crate::weight_map::raw_mxfp8(store, "lm_head")?;
+    let mut w = if let Some(raw) = checkpoint {
+        ensure!(raw.k == h, "GLM MXFP8 lm_head K {} != hidden {h}", raw.k);
+        crate::weight_map::mxfp8_row_range_twin(gpu, raw, start, shard, stream)?
+    } else {
+        let quantize = gpu.kernel("mxfp8_gemv", "mxfp8_quantize_bf16")?;
+        let w = crate::weight_map::Mxfp8Weight::alloc(gpu, shard, h)?;
+        ops::mxfp8_quantize(
+            gpu,
+            quantize,
+            lm_head.offset(start * h * 2),
+            w.data,
+            w.scales,
+            shard,
+            h,
+            stream,
+        )?;
+        w
+    };
+    ops::mxfp8_tile_if_requested(gpu, &mut w, shard, h, stream)?;
     gpu.synchronize(stream)?;
-    let _ = SHARD_MX.set((start, crate::weight_map::Mxfp8Weight { data, scales }));
+    let _ = SHARD_MX.set((start, w));
     tracing::info!(
         rank = config.ep_rank,
         shard,
+        checkpoint_bytes = checkpoint.is_some(),
         "GLM split verify head: MXFP8 shard ready"
     );
     Ok(())
@@ -199,11 +210,7 @@ impl TransformerModel {
                 let m = (rows - first).min(32);
                 ops::mxfp8_gemv(
                     self.gpu.as_ref(),
-                    k[match m {
-                        0..=8 => 0,
-                        9..=16 => 1,
-                        _ => 2,
-                    }],
+                    ops::mxfp8_kernel(self.gpu.as_ref(), &w, &k, m as u32),
                     normed.offset(first * h * 2),
                     w.data,
                     w.scales,
@@ -310,6 +317,50 @@ impl TransformerModel {
             .arg_u32((ban_rows >> 32) as u32)
             .launch(stream)?;
         Ok(true)
+    }
+}
+
+impl TransformerModel {
+    /// Whether a one-row verify's split head runs the MXFP8 shard, the
+    /// row-invariant arithmetic `glm_split_head_full_row` completes.
+    pub(super) fn glm_split_head_mxfp8(&self) -> bool {
+        self.glm_split_head_decline(1).is_none()
+            && self.comm.as_ref().is_some_and(|c| {
+                SHARD_MX
+                    .get()
+                    .is_some_and(|(s, _)| *s == c.rank() * (self.config.vocab_size / 2))
+            })
+    }
+
+    /// After a one-row split-head verify left this rank's half of row 0's
+    /// logits in `logits`, fetch the peer's half (through `moe_output`, free
+    /// once the layers ran) so the row holds the full vocabulary: the plain
+    /// decode of `ATLAS_GLM_CANONICAL_VERIFY` samples it. Both ranks call it.
+    pub(super) fn glm_split_head_full_row(&self, stream: u64) -> Result<()> {
+        let comm = self
+            .comm
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("split head full row needs the pair"))?;
+        let shard = self.config.vocab_size / 2;
+        let bytes = shard * 2;
+        let stage = self.buffers.moe_output();
+        ensure!(
+            self.buffers.sizes().moe_output >= 2 * bytes,
+            "split head full row: moe_output holds {} of {} bytes",
+            self.buffers.sizes().moe_output,
+            2 * bytes
+        );
+        let logits = self.buffers.logits();
+        let rank = comm.rank();
+        self.gpu
+            .copy_d2d_async(logits.offset(rank * bytes), stage, bytes, stream)?;
+        comm.peer_exchange_async(stage.0, stage.offset(bytes).0, bytes, stream)?;
+        self.gpu.copy_d2d_async(
+            stage.offset(bytes),
+            logits.offset((1 - rank) * bytes),
+            bytes,
+            stream,
+        )
     }
 }
 

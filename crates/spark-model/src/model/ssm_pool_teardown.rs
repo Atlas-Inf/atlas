@@ -32,13 +32,14 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for SsmStatePool {
             &mut self.h_checkpoint_pools,
             &mut self.conv_checkpoint_pools,
             &mut self.replay_input_rings,
+            &mut self.kda_record_pools,
             &mut self.gdn_commit_qkv_pools,
             &mut self.gdn_commit_gb_pools,
-            &mut self.kda_record_pools,
         ] {
             views.clear();
         }
         self.h_prefill_stage_pool = None;
+        self.gdn_fuse_words = spark_runtime::gpu::DevicePtr::NULL;
         let mut first_error = None;
         for ptr in self.allocations.drain(..) {
             if let Err(e) = gpu.free(ptr)
@@ -111,6 +112,35 @@ mod tests {
             p.release(&gpu).unwrap();
             assert_eq!(gpu.invalid_free_count(), 0);
         }
+    }
+
+    #[test]
+    fn records_mode_releases_bases_and_clears_views() {
+        let gpu = MockGpuBackend::new();
+        let mut config = config();
+        config.model_type = "glm5_next".to_owned();
+        config.linear_key_head_dim = 128;
+        config.linear_value_head_dim = 128;
+        let mut pool = SsmStatePool::new(
+            &config,
+            2,
+            true,
+            4,
+            3,
+            false,
+            SsmRollbackMode::Records,
+            false,
+            &gpu,
+        )
+        .unwrap();
+        assert!(pool.kda_record_pools.len() > 1);
+        assert!(pool.h_intermediate_pools.is_empty());
+        pool.release(&gpu).unwrap();
+        assert!(pool.kda_record_pools.is_empty());
+        assert_eq!(gpu.invalid_free_count(), 0);
+        assert_eq!(gpu.alloc_count(), 0);
+        pool.release(&gpu).unwrap();
+        assert_eq!(gpu.invalid_free_count(), 0);
     }
 
     /// Guard on the mock itself: freeing a view IS counted, so the test above

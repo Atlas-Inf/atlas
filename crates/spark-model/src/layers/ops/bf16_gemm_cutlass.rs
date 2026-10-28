@@ -58,37 +58,68 @@ pub fn bf16_gemm(
         return Ok(());
     }
     if enabled() && m >= MIN_ROWS {
-        let cfg = config(n, k);
-        let launched = run_blocks(
-            row_blocks(m, k, cfg),
-            |row, rows| {
-                spark_runtime::cutlass::bf16_gemm_tuned(
-                    act.0 + u64::from(row) * u64::from(k) * 2,
-                    weight,
-                    out.0 + u64::from(row) * u64::from(n) * 2,
-                    rows,
-                    n,
-                    k,
-                    k,
-                    n,
-                    cfg,
-                    stream,
-                )
-            },
-            spark_runtime::cutlass::rejected_before_launch,
-        )?;
-        if launched {
+        if cutlass_gemm(act, weight, out, [m, n, k], stream)? {
             return Ok(());
         }
         static REPORTED: std::sync::Once = std::sync::Once::new();
         REPORTED.call_once(|| {
             tracing::warn!(
-                "bf16_gemm: CUTLASS rejected {m}x{n}x{k} config {cfg}; such shapes run in \
-                 cuBLASLt (reported once)"
+                "bf16_gemm: CUTLASS rejected {m}x{n}x{k} config {}; such shapes run in \
+                 cuBLASLt (reported once)",
+                config(n, k)
             )
         });
     }
     spark_runtime::cublaslt::bf16_gemm_act_weight_t(act.0, weight, out.0, m, n, k, stream)
+}
+
+/// [`bf16_gemm`]'s CUTLASS tiles at any row count and whatever
+/// `ATLAS_BF16_GEMM_CUTLASS` says, for a K at which they produce
+/// `dense_gemm_bf16_pipelined`'s bytes ([`bf16_gemm_matches_pipelined`]), so a
+/// caller may swap one for the other per call. `Ok(false)`: CUTLASS rejected
+/// the operands and launched nothing (the caller keeps the pipelined kernel).
+pub fn bf16_gemm_pipelined_twin(
+    act: DevicePtr,
+    weight: u64,
+    out: DevicePtr,
+    [m, n, k]: [u32; 3],
+    stream: u64,
+) -> Result<bool> {
+    ensure!(
+        bf16_gemm_matches_pipelined(k),
+        "CUTLASS is the pipelined kernel's twin only in whole k16 steps (K = {k})"
+    );
+    cutlass_gemm(act, weight, out, [m, n, k], stream)
+}
+
+/// Every row block of `out = act @ weight^T` in CUTLASS; `Ok(false)` when it
+/// rejected the operands before launching anything.
+fn cutlass_gemm(
+    act: DevicePtr,
+    weight: u64,
+    out: DevicePtr,
+    [m, n, k]: [u32; 3],
+    stream: u64,
+) -> Result<bool> {
+    let cfg = config(n, k);
+    run_blocks(
+        row_blocks(m, k, cfg),
+        |row, rows| {
+            spark_runtime::cutlass::bf16_gemm_tuned(
+                act.0 + u64::from(row) * u64::from(k) * 2,
+                weight,
+                out.0 + u64::from(row) * u64::from(n) * 2,
+                rows,
+                n,
+                k,
+                k,
+                n,
+                cfg,
+                stream,
+            )
+        },
+        spark_runtime::cutlass::rejected_before_launch,
+    )
 }
 
 /// Launches every row block. `Ok(false)` means the backend `rejected` the

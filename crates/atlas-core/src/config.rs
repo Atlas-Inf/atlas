@@ -728,14 +728,20 @@ pub struct QuantizationConfig {
 }
 
 /// One `quantized_layers` entry: the algorithm applied to that module path
-/// (`"NVFP4"`, `"FP8"`, `"FP8_PB_WO"`, …) plus its scaling group when given.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// (`"NVFP4"`, `"MXFP8"`, `"W4A16_NVFP4"`, `"FP8_PB_WO"`, …) plus its scaling
+/// group when given.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QuantLayerSpec {
     pub quant_algo: String,
     pub group_size: usize,
-    /// ModelOpt scale-stream encoding, e.g. `"csf"` or `"csf_32x2_v1"`.
-    /// `Some` marks the FP4-Local family (compressed scale streams beside
-    /// `weight_scale`); `None` for plain row scales.
+    /// How the block scales are STORED, when not plainly: `"csf"` means each
+    /// `weight_scale` ships as a compressed `nvfp4_csf_fixed` +
+    /// `nvfp4_csf_exceptions` pair (nvidia Qwen FP4-Local's routed experts);
+    /// `"csf_32x2_v1"` as five `csf32_{bases,codes,page_bases,offsets,
+    /// exceptions}` components (nvidia GLM-5.3-Flash-FP4-Local's). The
+    /// safetensors loaders decode both at upload regardless of this field
+    /// (`spark_runtime::weights::nvfp4_csf`, `nvfp4_csf32`); it is read to
+    /// REPORT the format. `None` for plain row scales.
     pub weight_scale_encoding: Option<String>,
     /// Per-module block-quant tile, e.g. `[1, 32]` (MXFP8's 1×32 group,
     /// spelled as a tile) or `[128, 128]` (FP8_PB_WO). Empty when absent.

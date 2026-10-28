@@ -234,6 +234,11 @@ pub(crate) async fn run_chat_stream(
         stop_strings,
         stop_string_buffer_len,
         leak_markers,
+        role_literal_leaks: state
+            .tokenizer
+            .inner()
+            .token_to_id("<|im_start|>")
+            .is_some(),
         wants_typed_arguments: state
             .tool_call_parser
             .as_ref()

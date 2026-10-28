@@ -46,6 +46,27 @@ fn attest_all(root: &std::path::Path) -> Attestation {
 
 const SHARED: &str = "kernels/gb10/common/shared.cu";
 
+#[test]
+fn changing_shared_per_source_math_flags_invalidates_both_targets() {
+    let root = fixture("shared-source-flags");
+    let path = "kernels/gb10/common/KERNEL.toml";
+    std::fs::write(
+        root.join(path),
+        "[build.kernel_nvcc_flags]\nshared = [\"--prec-div=true\"]\n",
+    )
+    .unwrap();
+    let before = attest_all(&root);
+    std::fs::write(
+        root.join(path),
+        "[build.kernel_nvcc_flags]\nshared = [\"--prec-div=false\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        changed_targets(&root, &[path.to_string()], &before),
+        ["gb10/modelA/nvfp4", "gb10/modelB/nvfp4"]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The point of the mechanism
 // ---------------------------------------------------------------------------

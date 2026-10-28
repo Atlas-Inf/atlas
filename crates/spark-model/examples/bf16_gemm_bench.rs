@@ -2,13 +2,13 @@
 //! BF16 prefill GEMM throughput and bit-identity at GLM-5.3 Flash TP2 shapes:
 //! cuBLASLt's heuristic vs the CUTLASS configs of
 //! `spark_runtime::cutlass::bf16_gemm_tuned` vs `dense_gemm_bf16_pipelined`
-//! (KDA's small projections, and their beta|f_a|g_a triple), plus the
+//! (KDA's small projections, their beta|f_a|g_a triple and its packed GEMM), plus the
 //! head-batched MLA absorb / V-up GEMMs (cuBLASLt vs CUTLASS batched).
 //! Timings are cold-L2: every rep follows its own 64 MiB memset and is
 //! bracketed by CUDA events; the median is reported. `=N` counts BF16 outputs
 //! that differ from the reference (cuBLASLt for CUTLASS, cfg9 for the
-//! pipelined kernel, three pipelined launches for the triple); 0 means
-//! bit-identical.
+//! pipelined kernel, the triple for the packed beta|f_a|g_a CUTLASS GEMM);
+//! 0 means bit-identical.
 //!
 //! Run:
 //!   ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=glm-5.3-flash \
@@ -162,13 +162,33 @@ fn main() -> Result<()> {
             0,
         )
     })?;
+    // ATLAS_GLM_KDA_SIDE_PROJ_LT: the weights back to back, one CUTLASS GEMM
+    // into a [M, 288] scratch plus three pitched copies (into c, against c2).
+    let n_all = (heads + 2 * dim) as usize;
+    let packed = g.alloc(n_all * h as usize * 2)?;
+    let mut row = 0;
+    for (wi, n) in w.iter().zip([heads, dim, dim]) {
+        let bytes = (n * h) as usize * 2;
+        g.copy_d2d(wi.weight, packed.offset(row), bytes)?;
+        row += bytes;
+    }
+    let stage = g.alloc(M as usize * n_all * 2)?;
+    let packed_run = || {
+        ops::dense_gemm_packed_triple_n(g, a, packed, stage, planes(c), M, [heads, dim], h, 0)
+            .map(|_| ())
+    };
+    let lt = time(&packed_run)?;
     println!(
-        "kda beta|f_a|g_a: 3x pipelined {:7.1}us | triple {:7.1}us ={}",
+        "kda beta|f_a|g_a: 3x pipelined {:7.1}us | triple {:7.1}us | packed CUTLASS {:7.1}us ={}",
         three * 1e6,
         one * 1e6,
+        lt * 1e6,
         diff(c, c2, out)?
     );
-    for p in [a, c, c2].into_iter().chain(w.iter().map(|w| w.weight)) {
+    for p in [a, c, c2, packed, stage]
+        .into_iter()
+        .chain(w.iter().map(|w| w.weight))
+    {
         g.free(p)?;
     }
 

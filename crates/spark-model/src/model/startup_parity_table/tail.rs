@@ -9,6 +9,20 @@ use crate::model::{graph_flags, qwen4exp_batch_fast, qwen4exp_exact_verify, qwen
 /// chains them after [`super::SETTINGS`], so the gathered order is
 /// unchanged.
 pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
+    // GLM exact prefill: both ranks must select the same arithmetic and,
+    // for overlap, the same number and ordering of row-block exchanges.
+    ("ATLAS_GLM_KDA_SIDE_PROJ_LT", || {
+        Ok(crate::layers::kda_side_proj_lt_enabled() as u64)
+    }),
+    ("ATLAS_GLM_KDA_CONV_PLANES", || {
+        Ok(crate::layers::kda_conv_planes_enabled() as u64)
+    }),
+    ("ATLAS_GLM_HC_PREFILL_FUSE2", || {
+        Ok(crate::layers::qwen3_attention::hc_prefill_fuse2_enabled() as u64)
+    }),
+    ("ATLAS_GLM_SP_GATHER_OVERLAP", || {
+        Ok(crate::layers::glm_sp_overlap::requested_blocks() as u64)
+    }),
     ("ATLAS_QWEN4EXP_EXACT_VERIFY_CHECK", || {
         Ok(qwen4exp_exact_verify::check_requested() as u64)
     }),

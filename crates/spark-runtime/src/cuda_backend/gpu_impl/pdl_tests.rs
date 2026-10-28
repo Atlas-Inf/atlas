@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Source contract between [`PDL_KERNELS`] and every kernel a PDL target serves.
+//! Source contract between each PDL target list and the kernels it serves.
 
 use super::PDL_TARGETS;
 use std::collections::BTreeMap;
@@ -40,14 +40,24 @@ fn weight_param(signature: &str, name: &str) -> bool {
 
 /// Whether a function body (the text after its `{`) waits before anything
 /// else: `atlas_pdl_enter();`, or `atlas_pdl_enter_touch({w, ..}, {s, ..}, ..);`
-/// (`_pair`: one pair per plane), the same entry with discarded loads ahead
+/// (`_pair`: one pair per plane; `_tri`: one pair per projection), the same entry with discarded loads ahead
 /// of its wait, which is safe only while every touched region is a weight
 /// parameter of `signature` (a predecessor may still be writing anything else).
 fn waits_first(signature: &str, body: &str) -> bool {
-    let body = body.trim_start();
+    // Local constexpr initializers are evaluated at compile time: they cannot
+    // read activations a predecessor still writes. Everything else, including
+    // an ordinary const initializer, must remain behind the dependency wait.
+    let mut body = body.trim_start();
+    while let Some(decl) = body.strip_prefix("constexpr ") {
+        let Some((_, rest)) = decl.split_once(';') else {
+            return false;
+        };
+        body = rest.trim_start();
+    }
     let touch = body
         .strip_prefix("atlas_pdl_enter_touch(")
-        .or_else(|| body.strip_prefix("atlas_pdl_enter_touch_pair("));
+        .or_else(|| body.strip_prefix("atlas_pdl_enter_touch_pair("))
+        .or_else(|| body.strip_prefix("atlas_pdl_enter_touch_tri("));
     if let Some(args) = touch {
         let call = args.split(");").next().unwrap_or("");
         let regions: Vec<&str> = call
@@ -155,6 +165,23 @@ __device__ __forceinline__ void wrapper(const float* a) {
     body<NT>(a);
 }
 __device__ void not_a_wrapper(const float* a) { body<1>(a); atlas_pdl_enter(); }
+template <bool PERSIST>
+__device__ void constexpr_wrapper(const float* a) {
+    constexpr int buffers = PERSIST ? 3 : 2;
+    constexpr int lanes = buffers * 32;
+    atlas_pdl_enter();
+    body<lanes>(a);
+}
+extern "C" __global__ void wrapped_constexpr(const float* a) { constexpr_wrapper<true>(a); }
+extern "C" __global__ void constexpr_then_runtime(const float* a) {
+    constexpr int index = 0;
+    const float value = a[index];
+    atlas_pdl_enter();
+}
+extern "C" __global__ void ordinary_const(const float* a) {
+    const int index = 0;
+    atlas_pdl_enter();
+}
 extern "C" __global__ void wrapped(const float* a) { wrapper<2>(a); }
 extern "C" __global__ void plain(const float* a) { not_a_wrapper(a); }
 extern "C" __global__ void late(const float* a) {
@@ -185,12 +212,25 @@ extern "C" __global__ void pair(const unsigned char* __restrict__ w0,
 extern "C" __global__ void pair_input(const unsigned char* __restrict__ w0, const float* a) {
     atlas_pdl_enter_touch_pair({w0, 8u, 8u}, {w0, 1u, 1u}, {a, 8u, 8u}, {w0, 1u, 1u}, 4u, 0u, 2u);
 }
+extern "C" __global__ void tri(const unsigned char* __restrict__ w0,
+                               const unsigned char* __restrict__ w1) {
+    atlas_pdl_enter_touch_tri({w0, 8u, 0ull}, {w1, 1u, 0ull}, {w1, 8u, 0ull}, {w0, 1u, 0ull},
+                              {w0, 8u, 0ull}, {w1, 1u, 0ull}, 1u, role(4u));
+    body<1>(w0);
+}
+extern "C" __global__ void tri_input(const unsigned char* __restrict__ w0, float* a) {
+    atlas_pdl_enter_touch_tri({w0, 8u, 0ull}, {w0, 1u, 0ull}, {w0, 8u, 0ull}, {w0, 1u, 0ull},
+                              {a, 8u, 0ull}, {w0, 1u, 0ull}, 1u, role(4u));
+}
 "#,
     );
     assert_eq!(
         kernels(&src),
         [
             ("direct", true),
+            ("wrapped_constexpr", true),
+            ("constexpr_then_runtime", false),
+            ("ordinary_const", false),
             ("wrapped", true),
             ("plain", false),
             ("late", false),
@@ -201,6 +241,8 @@ extern "C" __global__ void pair_input(const unsigned char* __restrict__ w0, cons
             ("touches_prefix", false),
             ("pair", true),
             ("pair_input", false),
+            ("tri", true),
+            ("tri_input", false),
         ]
     );
 }
@@ -212,10 +254,12 @@ extern "C" __global__ void pair_input(const unsigned char* __restrict__ w0, cons
 ///   predecessor's output early);
 /// * a kernel of the target's own dirs that waits is listed (one that is not
 ///   pays the launch gap PDL exists to remove: the five-row KDA triple did,
-///   at every width-5 verify step);
+///   at every width-5 verify step), except the GLM persistent twins whose
+///   overlapping launch has not been qualified;
 /// * a `common/` kernel that waits is listed by some PDL target. It need not
 ///   be listed by every target that serves it: without the launch attribute
 ///   its wait is a no-op, and each target opts its own decode chain in.
+///   RDMA one-shot is launched directly by spark-comm with its own PDL policy.
 #[test]
 fn pdl_target_kernels_wait_exactly_when_listed() {
     let gb10 = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels/gb10");
@@ -238,7 +282,11 @@ fn pdl_target_kernels_wait_exactly_when_listed() {
                         target.model
                     );
                     assert!(
-                        !waits || listed || (!own && listed_anywhere(name)),
+                        !waits
+                            || listed
+                            || (!own && listed_anywhere(name))
+                            || name == "rdma_oneshot_bf16"
+                            || (target.model == "glm-5.3-flash" && name.ends_with("_l2pf_p")),
                         "{}: {name} waits on PDL entry but is not on the {} PDL list",
                         path.display(),
                         target.model

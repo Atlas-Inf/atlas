@@ -201,4 +201,3 @@ __device__ __forceinline__ void c8_dq16(unsigned long long p, float sc, float (&
         }
     }
 }
-

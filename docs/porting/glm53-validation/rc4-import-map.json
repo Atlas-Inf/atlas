@@ -1,0 +1,137 @@
+{
+  "description": "RC4 source import history; source equivalence is not runtime qualification. Earlier imports remain documented in GLM_5_3_FLASH_RC2.md and history-map.json.",
+  "source_base": "a1c9b1bc",
+  "source_tip": "0b515eec96a9c6f637d60d9d910b18c7e7a6cb94",
+  "sparkglm_recipe_pr": "https://github.com/Enntity/sparkglm/pull/46",
+  "layered_reference": "5c523903c886d1abf2f4bda6a0af1cdf91c28523",
+  "native_review_tip": "c6fe7377136a772274e5c6abbe2ad82b9a26b1a4",
+  "runtime_validation": "pending",
+  "entries": [
+    {
+      "source": "f353841684c0396da33c84c843cc63539ce2da64",
+      "source_url": "https://github.com/Enntity/atlas/commit/f353841684c0396da33c84c843cc63539ce2da64",
+      "author": "Jason McCartney",
+      "author_email": "jmac@theroot.org",
+      "subject": "comm: one-shot all-reduce stages on the SMs inside the PDL chain (ATLAS_RDMA_ONESHOT_SM_STAGE, default off)",
+      "native_revision": "41f0cc15e30f2a1394b324fd4ec1b1d779b8dc1d",
+      "disposition": "imported with native adaptation"
+    },
+    {
+      "source": "e1e5fbdb1cbe606a2fb5e128711ebb7f9d3f67dd",
+      "source_url": "https://github.com/Enntity/atlas/commit/e1e5fbdb1cbe606a2fb5e128711ebb7f9d3f67dd",
+      "author": "Jason McCartney",
+      "author_email": "jmac@theroot.org",
+      "subject": "glm moe: routing chain in two launches (ATLAS_GLM_MOE_ROUTE_FUSE)",
+      "native_revision": "a2171563bc0497a9a9a0a5eecd4dff8ab1775338",
+      "disposition": "imported with native adaptation"
+    },
+    {
+      "source": "2e7800441b37d7a7b09995bf633e7ccec3a3c69c",
+      "source_url": "https://github.com/Enntity/atlas/commit/2e7800441b37d7a7b09995bf633e7ccec3a3c69c",
+      "author": "Jason McCartney",
+      "author_email": "jmac@theroot.org",
+      "subject": "glm dense: split the verify dense FFN across the pair (ATLAS_GLM_DENSE_TP_SPLIT)",
+      "native_revision": "9eb2bf3572463d7728686d804304a7233ee94151",
+      "disposition": "imported with native adaptation"
+    },
+    {
+      "source": "05b978a526969027c3b6ccc6d31e859c22973bcc",
+      "source_url": "https://github.com/Enntity/atlas/commit/05b978a526969027c3b6ccc6d31e859c22973bcc",
+      "author": "Jason McCartney",
+      "author_email": "jmac@theroot.org",
+      "subject": "glm kda: commit records over a fixed grid (ATLAS_GLM_KDA_COMMIT_CTAS)",
+      "native_revision": "0bb78cc4d00eaf6009057b2cd6d453c0f15e5801",
+      "disposition": "imported with native adaptation"
+    },
+    {
+      "source": "f473f620131690c84e26ae955f9718902d49e4cb",
+      "source_url": "https://github.com/Enntity/atlas/commit/f473f620131690c84e26ae955f9718902d49e4cb",
+      "author": "Jason McCartney",
+      "author_email": "jmac@theroot.org",
+      "subject": "dflash2 selector: threshold top-k and parallel merges; rank split swaps candidate lists",
+      "native_revision": "2b76ccbf86a3b9b3a35aef3bacc34ceeaccfdd05",
+      "disposition": "imported with native adaptation"
+    },
+    {
+      "source": "5b93d84b212ceb7cb24080fb572631a7d669f25e",
+      "source_url": "https://github.com/Enntity/atlas/commit/5b93d84b212ceb7cb24080fb572631a7d669f25e",
+      "author": "Jason McCartney",
+      "author_email": "jmac@theroot.org",
+      "subject": "dflash forward_block: ATLAS_DFLASH_ASYNC_UPLOADS uploads without draining the stream",
+      "native_revision": "2c607992a84d3ce97cb0b93e9497fe62d5b2c0a4",
+      "disposition": "imported with native adaptation"
+    },
+    {
+      "source": "553ecd0caf882f72daa4011d18d64bd49aef1544",
+      "source_url": "https://github.com/Enntity/atlas/commit/553ecd0caf882f72daa4011d18d64bd49aef1544",
+      "author": "Jason McCartney",
+      "author_email": "jmac@theroot.org",
+      "subject": "glm mla: layer front in two launches (ATLAS_GLM_MLA_FUSE)",
+      "native_revision": "ace94a07082b228874400367168639e5029deb2a",
+      "disposition": "imported with native adaptation"
+    },
+    {
+      "source": "496a77fdb462f6c21fd7b165d97b94b5b121d8d5",
+      "source_url": "https://github.com/Enntity/atlas/commit/496a77fdb462f6c21fd7b165d97b94b5b121d8d5",
+      "author": "Jason McCartney",
+      "author_email": "jmac@theroot.org",
+      "subject": "glm mxfp8: chunk-tiled twins for q_b, o and the split head (ATLAS_GLM_MXFP8_TILED)",
+      "native_revision": "a616ae8772fb9962ff364e3fab599abd1581ffc6",
+      "disposition": "imported with native adaptation"
+    },
+    {
+      "source": "2b3daefddb5bba2d3845f119d0a3739fc002652c",
+      "source_url": "https://github.com/Enntity/atlas/commit/2b3daefddb5bba2d3845f119d0a3739fc002652c",
+      "author": "Jason McCartney",
+      "author_email": "jmac@theroot.org",
+      "subject": "dflash2 selector: edge-weight twins (ATLAS_DFLASH2_EDGE=0.6|0.8); draft log analysis",
+      "native_revision": "f04cbafed176bdb17f336f45f9ce97e19f4382a7",
+      "disposition": "imported with native adaptation"
+    },
+    {
+      "source": "ad04763856efbfa7cae81436e3a4a67e4290c2b4",
+      "source_url": "https://github.com/Enntity/atlas/commit/ad04763856efbfa7cae81436e3a4a67e4290c2b4",
+      "author": "Jason McCartney",
+      "author_email": "jmac@theroot.org",
+      "subject": "dflash2 conv: NVFP4 / MXFP8 twins of the delta projections (ATLAS_DFLASH_CONV_TWIN)",
+      "native_revision": "4f8b25bc699810b128b7abb91cf536f700439014",
+      "disposition": "imported with native adaptation"
+    },
+    {
+      "source": "7e13c1bbf63708226ad6c2c109784ee5e54cf5f0",
+      "source_url": "https://github.com/Enntity/atlas/commit/7e13c1bbf63708226ad6c2c109784ee5e54cf5f0",
+      "author": "Jason McCartney",
+      "author_email": "jmac@theroot.org",
+      "subject": "glm prefill: drop the unused `sharded` flag from the owner path",
+      "native_revision": "97a08890ef91564974d6b1ebd5d229af4023ac2d",
+      "disposition": "imported with native adaptation"
+    },
+    {
+      "source": "bc9d0de4baee5fc5219089e37748cf501ec88455",
+      "source_url": "https://github.com/Enntity/atlas/commit/bc9d0de4baee5fc5219089e37748cf501ec88455",
+      "author": "Jason McCartney",
+      "author_email": "jmac@theroot.org",
+      "subject": "glm mxfp8: name the mxfp8_tile16 kernel in plain code, not as a doc link",
+      "native_revision": "cd7db0ebaea7f7878839cf9cccbeeebd22494c7c",
+      "disposition": "imported with native adaptation"
+    },
+    {
+      "source": "a6f35bf7e6c540abc6f2f7f449095d4341d943fb",
+      "source_url": "https://github.com/Enntity/atlas/commit/a6f35bf7e6c540abc6f2f7f449095d4341d943fb",
+      "author": "Jason McCartney",
+      "author_email": "jmac@theroot.org",
+      "subject": "dflash2 selector: mirror the DF2_SEL_EDGE twin into the strix-hip copy",
+      "native_revision": "ad3785c41f689ea02d846d890b0b6f7a36a91b19",
+      "disposition": "imported with native adaptation"
+    },
+    {
+      "source": "0b515eec96a9c6f637d60d9d910b18c7e7a6cb94",
+      "source_url": "https://github.com/Enntity/atlas/commit/0b515eec96a9c6f637d60d9d910b18c7e7a6cb94",
+      "author": "Jason McCartney",
+      "author_email": "jmac@theroot.org",
+      "subject": "canonical verify gpu tests: rustfmt",
+      "native_revision": null,
+      "disposition": "already formatted in native branch"
+    }
+  ]
+}

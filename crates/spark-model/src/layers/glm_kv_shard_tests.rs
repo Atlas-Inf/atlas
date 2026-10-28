@@ -18,8 +18,7 @@ fn disjoint(regions: &[(usize, usize)]) -> bool {
 #[test]
 fn merge_layout_regions_are_aligned_and_disjoint() {
     for rows in 1..=MERGE_MAX_ROWS as u32 {
-        let splits = merge_splits(rows);
-        assert!((1..=MAX_SPLITS).contains(&splits), "rows {rows}");
+        let splits = MERGE_SPLITS;
         let m = MergeLayout::new(rows, splits);
         let (r, s) = (rows as usize, splits as usize);
         let part = r * 32 * 512 * 4;
@@ -51,7 +50,7 @@ fn scratch_layout_holds_views_pieces_and_the_widest_owner() {
     let bytes = 16 * 528;
     let l = ScratchLayout::new(32772, 8256, bytes);
     let widest = (1..=MERGE_MAX_ROWS as u32)
-        .map(|r| MergeLayout::new(r, merge_splits(r)).total)
+        .map(|r| MergeLayout::new(r, MERGE_SPLITS).total)
         .max()
         .unwrap();
     let work = (2 * (PIECE_BLOCKS * bytes).next_multiple_of(256)).max(widest);
@@ -66,9 +65,10 @@ fn scratch_layout_holds_views_pieces_and_the_widest_owner() {
     ];
     assert!(disjoint(&regions));
     assert_eq!(l.total, l.work + work.next_multiple_of(256));
-    // 512K tokens of fp8_g128 latents: a 264 MiB view + ~38 MiB of work.
-    assert!(l.total < 310 << 20, "{}", l.total);
-    assert!(widest < 40 << 20, "{widest}");
+    // 512K tokens of fp8_g128 latents: a 264 MiB view + ~47 MiB of work
+    // (64 rows in MERGE_SPLITS partitions per group).
+    assert!(l.total < 320 << 20, "{}", l.total);
+    assert!(widest < 48 << 20, "{widest}");
 }
 
 /// One partition's normalized output and natural LSE (`-inf`, zeros when

@@ -199,7 +199,7 @@ impl BlockDiffusionDraftHead {
             self.startup.diagnostics.first_append,
             self.startup.diagnostics.no_decode_append || eagle_skip,
             target_hidden_stack,
-            dstate.ctx_len < dstate.max_ctx_len,
+            dstate.ctx_len < dstate.max_ctx_len && dstate.ctx_hidden_acc.0 != 0,
             preceding,
             dstate.own_row,
         )

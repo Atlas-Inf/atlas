@@ -153,6 +153,15 @@ pub(super) fn parse_header(file: &mut File) -> Result<Vec<TensorMeta>> {
                     (WeightDtype::BF16, true)
                 }
             }
+            // CSF component streams (slab exception words; csf_32x2_v1 page
+            // origins, prefixes and records). Never stored: the copy loop
+            // hands every CSF part to `CsfAssembler`, which re-derives the
+            // element width from byte length against shape. `UInt8` is only
+            // the staging container here; U16/U32 anywhere else is still
+            // refused below.
+            "U16" | "U32" if crate::weights::nvfp4_csf::csf_part(name).is_some() => {
+                (WeightDtype::UInt8, false)
+            }
             // Every other dtype maps exactly as on the buffered and RDMA paths:
             // one table (`from_safetensors_str`), so the loaders cannot drift.
             other => (

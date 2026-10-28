@@ -537,7 +537,9 @@ extern "C" __global__ void __launch_bounds__(256) moe_unpermute_blend_ep_vec8(
 // and the scatter are the original's, so rows keep its contract (any order
 // within an expert group). Grid: (1, 1, 1)  Block: (256, 1, 1); at most 1024
 // experts.
-extern "C" __global__ void moe_sort_by_expert_scan(
+// Body of moe_sort_by_expert_scan, shared with glm_moe_route_select
+// (glm_moe_route.cu), which runs it after its own top-k in one CTA.
+__device__ __forceinline__ void moe_sort_by_expert_scan_body(
     const unsigned int* __restrict__ topk_ids,
     int* __restrict__ sorted_token_ids,
     int* __restrict__ sorted_expert_ids,
@@ -547,7 +549,6 @@ extern "C" __global__ void moe_sort_by_expert_scan(
     unsigned int num_experts,
     unsigned int topk
 ) {
-    atlas_pdl_enter();
     __shared__ unsigned int counts[1024];
     __shared__ unsigned int offsets[1025];
     __shared__ unsigned int warp_sums[8];
@@ -603,6 +604,21 @@ extern "C" __global__ void moe_sort_by_expert_scan(
     }
 }
 
+extern "C" __global__ void moe_sort_by_expert_scan(
+    const unsigned int* __restrict__ topk_ids,
+    int* __restrict__ sorted_token_ids,
+    int* __restrict__ sorted_expert_ids,
+    int* __restrict__ expert_offsets,
+    int* __restrict__ token_to_perm,
+    unsigned int total_expanded,
+    unsigned int num_experts,
+    unsigned int topk
+) {
+    atlas_pdl_enter();
+    moe_sort_by_expert_scan_body(topk_ids, sorted_token_ids, sorted_expert_ids, expert_offsets,
+                                 token_to_perm, total_expanded, num_experts, topk);
+}
+
 // moe_build_tile_worklist with the chunked Hillis-Steele scan replaced by the
 // shuffle scan of moe_sort_by_expert_scan (ATLAS_GLM_DECODE_FUSE): each thread
 // owns up to four consecutive experts, so one scan places every expert where
@@ -610,7 +626,8 @@ extern "C" __global__ void moe_sort_by_expert_scan(
 // sums and the same expert/m/n emission order, so the work-list and
 // total_tiles are the same words. Grid: (1, 1, 1)  Block: (256, 1, 1); at most
 // 1024 experts.
-extern "C" __global__ void moe_build_tile_worklist_scan(
+// Body of moe_build_tile_worklist_scan, shared with glm_moe_route_select.
+__device__ __forceinline__ void moe_build_tile_worklist_scan_body(
     const int* __restrict__ expert_offsets,
     const unsigned long long* __restrict__ B_weight_ptrs,
     unsigned int* __restrict__ worklist,
@@ -619,7 +636,6 @@ extern "C" __global__ void moe_build_tile_worklist_scan(
     unsigned int n_tiles,
     unsigned int m_tile
 ) {
-    atlas_pdl_enter();
     __shared__ unsigned int warp_sums[8];
     const unsigned int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
     if (blockDim.x != 256 || num_experts > 1024) return;
@@ -665,4 +681,18 @@ extern "C" __global__ void moe_build_tile_worklist_scan(
         for (unsigned int v = 0; v < 8; v++) total += warp_sums[v];
         total_tiles[0] = (int)total;
     }
+}
+
+extern "C" __global__ void moe_build_tile_worklist_scan(
+    const int* __restrict__ expert_offsets,
+    const unsigned long long* __restrict__ B_weight_ptrs,
+    unsigned int* __restrict__ worklist,
+    int* __restrict__ total_tiles,
+    unsigned int num_experts,
+    unsigned int n_tiles,
+    unsigned int m_tile
+) {
+    atlas_pdl_enter();
+    moe_build_tile_worklist_scan_body(expert_offsets, B_weight_ptrs, worklist, total_tiles,
+                                      num_experts, n_tiles, m_tile);
 }

@@ -244,6 +244,37 @@ pub(crate) fn launch_merge_extra(
         .launch(stream)
 }
 
+/// `glm_sparse_decode_split_merge_pair` over `rows` x 32 heads: the second
+/// group's `splits` partitions (`part_b`, `plse_b`) merged to one FP32
+/// partial at `extra` (output then LSEs, as [`launch_merge_f32`] writes them),
+/// then the BF16 merge of the first group's partitions with it as the last
+/// ([`launch_merge_extra`]), in one launch. With one split the second group's
+/// partition must already be at `extra`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_merge_pair(
+    gpu: &dyn GpuBackend,
+    [part, plse]: [DevicePtr; 2],
+    [out, lse]: [DevicePtr; 2],
+    rows: u32,
+    splits: u32,
+    [part_b, plse_b]: [DevicePtr; 2],
+    extra: DevicePtr,
+    stream: u64,
+) -> Result<()> {
+    let k = gpu
+        .op_cache()
+        .kernel(gpu, SHARD_MODULE, "glm_sparse_decode_split_merge_pair")?;
+    ensure!(
+        k.0 != 0 && (1..16).contains(&splits) && extra.0 != 0,
+        "GLM paired split merge needs its kernel, a partial and 1..=15 splits"
+    );
+    merge_launch(gpu, k, part, plse, out, lse, rows, rows * 32, splits)
+        .arg_ptr(part_b)
+        .arg_ptr(plse_b)
+        .arg_ptr(extra)
+        .launch(stream)
+}
+
 /// `glm_sparse_decode_split_merge` over `grid` = rows x 32 heads.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_merge(

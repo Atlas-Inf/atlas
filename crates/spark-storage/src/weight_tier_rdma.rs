@@ -116,6 +116,30 @@ impl RdmaWeightLoader {
     }
 }
 
+/// Refuse a manifest that carries CSF-compressed NVFP4 scales.
+///
+/// The disk loaders gather the CSF components (two for the slab encoding,
+/// five for `csf_32x2_v1`) and upload only the decoded E4M3 `weight_scale`
+/// (`spark_runtime::weights::nvfp4_csf::CsfAssembler`). This tier copies each
+/// tensor's bytes as they are, so it would upload the compressed components
+/// under their own names and no `weight_scale` at all: the
+/// experts would then load without scales, or with another tensor's.
+// Only reached from the `atlas_rdma_verbs` load path (see `should_skip_tensor`).
+#[cfg_attr(not(atlas_rdma_verbs), allow(dead_code))]
+fn refuse_csf<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    if let Some(name) = names
+        .into_iter()
+        .find(|n| spark_runtime::weights::nvfp4_csf::csf_part(n).is_some())
+    {
+        anyhow::bail!(
+            "CSF-encoded scales are not supported by the RDMA weight tier ({name}); \
+             unset ATLAS_WEIGHT_PEER to load this checkpoint from disk, where the \
+             loaders decode them"
+        );
+    }
+    Ok(())
+}
+
 impl WeightLoader for RdmaWeightLoader {
     fn load(
         &self,
@@ -185,6 +209,7 @@ impl RdmaWeightLoader {
             .iter()
             .filter(|t| !self.should_skip_tensor(t))
             .collect();
+        refuse_csf(retained.iter().map(|t| t.name.as_str()))?;
 
         // 3. Advisory OOM pre-flight (parity with the disk loaders — estimate
         // from the manifest, not local headers).
@@ -410,5 +435,28 @@ impl RdmaWeightLoader {
 
         tracing::info!("RDMA-loaded {} weight tensors", weights.len());
         Ok(WeightStore::from_map(weights))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn csf_parts_are_refused_by_name() {
+        let ok = ["x.weight", "x.weight_scale", "x.weight_scale_2"];
+        super::refuse_csf(ok).unwrap();
+        for csf in [
+            "x.weight_scale.nvfp4_csf_fixed",
+            "x.weight_scale.nvfp4_csf_exceptions",
+            "x.weight_scale.csf32_bases",
+            "x.weight_scale.csf32_codes",
+            "x.weight_scale.csf32_page_bases",
+            "x.weight_scale.csf32_offsets",
+            "x.weight_scale.csf32_exceptions",
+        ] {
+            let e = super::refuse_csf(ok.into_iter().chain([csf])).unwrap_err();
+            let e = format!("{e:#}");
+            assert!(e.contains("not supported by the RDMA weight tier"), "{e}");
+            assert!(e.contains(csf), "{e}");
+        }
     }
 }

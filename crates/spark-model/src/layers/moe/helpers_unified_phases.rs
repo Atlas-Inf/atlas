@@ -16,7 +16,7 @@ pub(in crate::layers::moe) fn btile_shared_fixture(
 }
 
 impl MoeLayer {
-    pub(super) fn transpose_unified_shared_gate_up(
+    pub(in crate::layers::moe) fn transpose_unified_shared_gate_up(
         &mut self,
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
@@ -77,6 +77,7 @@ impl MoeLayer {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn transpose_unified_down_phase(
         &mut self,
         gpu: &dyn GpuBackend,

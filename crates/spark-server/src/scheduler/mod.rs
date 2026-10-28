@@ -19,6 +19,7 @@ mod beam_prefill;
 #[cfg(test)]
 mod cancel_test_model;
 mod confidence;
+mod copy_drafts;
 mod decode_logits_content;
 mod decode_logits_seq;
 mod decode_logits_step;

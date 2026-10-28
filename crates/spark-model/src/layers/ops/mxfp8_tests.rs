@@ -85,3 +85,20 @@ fn grouped_gemv_rejects_unservable_shapes() {
     }
     assert_eq!(gpu.launch_count(), 0);
 }
+
+#[test]
+fn tiled_switch_is_explicit() {
+    assert!(!parse_tiled(None).unwrap());
+    assert!(!parse_tiled(Some("0")).unwrap());
+    assert!(parse_tiled(Some("1")).unwrap());
+    for value in ["", "true", "2", " 1"] {
+        assert!(parse_tiled(Some(value)).is_err(), "{value:?}");
+    }
+}
+
+#[test]
+fn plain_tiers_split_at_8_and_16_rows() {
+    for (m, tier) in [(1, 0), (8, 0), (9, 1), (16, 1), (17, 2), (32, 2)] {
+        assert_eq!(mxfp8_tier(m), tier, "m={m}");
+    }
+}

@@ -18,10 +18,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 /// Names this wire format; bump the digit when the head or layout changes.
-const MAGIC: [u8; 8] = *b"ATLPAIR4";
+const MAGIC: [u8; 8] = *b"ATLPAIR5";
 /// What both ranks must agree on, in wire order, and where to look when
 /// they do not.
-const FIELDS: [(&str, &str); 7] = [
+const FIELDS: [(&str, &str); 8] = [
     ("rail count", "check ATLAS_RDMA_RAILS on both nodes"),
     ("PAIR_CHAIN", "check ATLAS_RDMA_PAIR_CHAIN on both nodes"),
     (
@@ -36,6 +36,10 @@ const FIELDS: [(&str, &str); 7] = [
     (
         "one-shot stripe min",
         "check ATLAS_RDMA_ONESHOT_STRIPE_MIN on both nodes",
+    ),
+    (
+        "one-shot SM staging",
+        "check ATLAS_RDMA_ONESHOT_SM_STAGE on both nodes",
     ),
     ("command ring", "check ATLAS_GLM_CMD_RDMA on both nodes"),
 ];
@@ -54,8 +58,8 @@ pub(super) struct Head {
     pub(super) chain: bool,
     pub(super) segments: usize,
     pub(super) capacity: usize,
-    /// One-shot `max` and `stripe_min`, zero when off.
-    pub(super) oneshot: [u64; 2],
+    /// One-shot `max`, `stripe_min` and `sm_stage`, zero when off.
+    pub(super) oneshot: [u64; 3],
     /// Command ring words, zero when off.
     pub(super) cmd: u64,
 }
@@ -70,6 +74,7 @@ impl Head {
             self.capacity as u64,
             self.oneshot[0],
             self.oneshot[1],
+            self.oneshot[2],
             self.cmd,
         ]
     }

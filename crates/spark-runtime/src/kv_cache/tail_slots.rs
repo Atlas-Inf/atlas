@@ -44,12 +44,18 @@ pub(super) struct TailSlots {
 }
 
 impl TailSlots {
-    pub(super) fn new(num_blocks: usize, plan: TailSlotPlan, gpu: &dyn GpuBackend) -> Result<Self> {
+    pub(super) fn new(
+        num_blocks: usize,
+        plan: TailSlotPlan,
+        gpu: &dyn GpuBackend,
+        placement: &super::KvPlacement,
+    ) -> Result<Self> {
         let capacity = plan.capacity();
         if capacity == 0 || u32::try_from(capacity).is_err() {
             bail!("sparse index tail slot capacity {capacity} must be a positive u32");
         }
-        let map = gpu.alloc(num_blocks * std::mem::size_of::<u32>())?;
+        let map_bytes = num_blocks * std::mem::size_of::<u32>();
+        let map = placement.alloc(gpu, super::KvBuffer::TailMap, map_bytes)?;
         if let Err(error) = gpu.memset(map, 0xFF, num_blocks * std::mem::size_of::<u32>()) {
             let _ = gpu.free(map);
             return Err(error);

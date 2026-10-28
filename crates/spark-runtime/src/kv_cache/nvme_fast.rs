@@ -143,13 +143,14 @@ impl FastIo {
     }
 }
 
-/// Maximal runs of consecutive ascending blocks: `(start, len)`.
-pub(super) fn block_runs(blocks: &[u32]) -> Vec<(usize, usize)> {
+/// Maximal runs of ascending blocks `step` ids apart (a lane's neighbours;
+/// `step` = 1 unsharded): `(start, len)`.
+pub(super) fn block_runs(blocks: &[u32], step: u32) -> Vec<(usize, usize)> {
     let mut runs = Vec::new();
     let mut i = 0;
     while i < blocks.len() {
         let mut j = i + 1;
-        while j < blocks.len() && blocks[j - 1].checked_add(1) == Some(blocks[j]) {
+        while j < blocks.len() && blocks[j - 1].checked_add(step) == Some(blocks[j]) {
             j += 1;
         }
         runs.push((i, j - i));
@@ -186,17 +187,17 @@ fn copy_blocks(
             blocks.len() * record,
         )
     };
-    let runs = block_runs(blocks);
+    let runs = block_runs(blocks, spill.step as u32);
     for &(start, len) in &runs {
         for (seg, &off) in spill.segments.iter().zip(seg_off) {
             let shape = Pitched {
                 host_pitch: record,
-                dev_pitch: seg.stride,
+                dev_pitch: seg.pitch(spill.step),
                 width: seg.stride,
                 height: len,
             };
             let host = &mut stage[start * record + off..][..shape.host_span()];
-            let dev = seg.base.offset(blocks[start] as usize * seg.stride);
+            let dev = seg.at(blocks[start]);
             match (to_device, len) {
                 (true, 1) => gpu.copy_h2d_async_retained(host, dev, stream)?,
                 (false, 1) => gpu.copy_d2h_async(dev, host, stream)?,
@@ -273,7 +274,8 @@ pub(super) fn write(
 
 /// Pipelined restore; same contract as the synchronous `nvme_read`, plus:
 /// `blocks[..n]` is sorted first, so the restored run lands on ascending
-/// blocks and scatters in pitched runs.
+/// blocks and scatters in pitched runs (a latent-shard lane's blocks share
+/// one residue, so sorting them keeps every block on its residue).
 pub(super) fn read(
     spill: &NvmeSpill,
     (fast, io): (&mut FastIo, &mut NvmeIoStats),

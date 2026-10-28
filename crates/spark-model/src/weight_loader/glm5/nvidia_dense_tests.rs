@@ -156,3 +156,71 @@ fn nvidia_dense_ffn_keeps_existing_unquantized_fallback() {
         "BF16 checkpoints still use runtime quantization"
     );
 }
+
+/// The dense FFN of a store whose three projections are `dtype` `[n, k]`,
+/// plus a UE8M0 `weight_scale` of 1.0 per 32 values when `mxfp8`.
+fn unquantized_fixture(gpu: &MockGpuBackend, mxfp8: bool) -> WeightStore {
+    let mut tensors = HashMap::new();
+    for (projection, n, k) in [
+        ("gate_proj", 64, 32),
+        ("up_proj", 64, 32),
+        ("down_proj", 32, 64),
+    ] {
+        let (dtype, width) = if mxfp8 {
+            (WeightDtype::FP8E4M3, 1)
+        } else {
+            (WeightDtype::BF16, 2)
+        };
+        tensors.insert(
+            format!("l.mlp.{projection}.weight"),
+            WeightTensor {
+                ptr: gpu.alloc(n * k * width).unwrap(),
+                shape: vec![n, k],
+                dtype,
+            },
+        );
+        if mxfp8 {
+            let ptr = gpu.alloc(n * k / 32).unwrap();
+            gpu.copy_h2d(&vec![127u8; n * k / 32], ptr).unwrap();
+            tensors.insert(
+                format!("l.mlp.{projection}.weight_scale"),
+                WeightTensor {
+                    ptr,
+                    shape: vec![n, k / 32],
+                    dtype: WeightDtype::UInt8,
+                },
+            );
+        }
+    }
+    WeightStore::from_map(tensors)
+}
+
+/// nvidia GLM-5.3-Flash-FP4-Local's dense MLP (MXFP8): expanded exactly to
+/// BF16, quantized like a BF16 checkpoint's, and the BF16 copy freed, so the
+/// load leaves the same live allocations as the BF16 path beyond the store's.
+/// The MXFP8 source itself stays for the layer's release.
+#[test]
+fn fp4local_mxfp8_dense_ffn_frees_its_bf16_expansion() {
+    let live_after_load = |mxfp8: bool| {
+        let gpu = MockGpuBackend::new();
+        let store = unquantized_fixture(&gpu, mxfp8);
+        let stored = gpu.alloc_count();
+        let FfnComponent::Dense(layer) = load(&store, &gpu).unwrap() else {
+            panic!("expected dense FFN")
+        };
+        for name in ["gate_proj", "up_proj", "down_proj"] {
+            let src = store.get(&format!("l.mlp.{name}.weight")).unwrap().ptr;
+            assert!(gpu.read_alloc(src).is_some(), "{name}: source kept");
+        }
+        assert_ne!(
+            layer.weights.gate_proj.weight,
+            store.get("l.mlp.gate_proj.weight").unwrap().ptr
+        );
+        (gpu.alloc_count() - stored, gpu.launch_count())
+    };
+    let (bf16_live, bf16_launches) = live_after_load(false);
+    let (mx_live, mx_launches) = live_after_load(true);
+    assert_eq!(mx_live, bf16_live, "no BF16 expansion left behind");
+    // One exact MXFP8 -> BF16 expansion per projection on top.
+    assert_eq!(mx_launches, bf16_launches + 3);
+}

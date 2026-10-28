@@ -61,4 +61,3 @@ extern "C" __global__ void dense_gemm_bf16_router_bn32(
         for(unsigned j=0;j<4;j++) if(col+j<N) C[size_t(row)*N+col+j]=__float2bfloat16_rn(acc[j]);
     }
 }
-

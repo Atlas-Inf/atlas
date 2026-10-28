@@ -28,3 +28,9 @@ README.md merge=union
 # Union keeps both sides' lines, and `Journey::deduplicated` collapses any
 # duplicate on read — identity excludes `at`, so a replay converges.
 governance/*.jsonl merge=union
+
+# NVFP4-CSF golden streams (raw U8/U32 tensor bytes, ~170 KB total). Binary so
+# no text normalisation can touch them; plain git, not LFS, for the reason above.
+test_data/nvfp4_csf/*.bin binary
+test_data/nvfp4_csf32/*.bin binary
+test_data/mxfp8/*.bin binary
