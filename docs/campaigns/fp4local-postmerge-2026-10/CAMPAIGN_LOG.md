@@ -1033,3 +1033,23 @@ two builds' runs, so it's directional only.
 **#219 merged** as db442e2d4 after jobs 35/37/38c/40 + CI (only the repo-wide benchmark gate red; the file-size cap
 fixed for main too). **#228** (S7.1) retargeted to main; its GB10 gate (job 41: control, agentic 50, BFCL) has been
 running since 08:48.
+
+## 2026-10-28 09:30 UTC — next lever after S7.1: GPU idle (~4.5 ms/token) is a structural CUDA-graph veto
+
+Code read (no GPU):
+- Single-sequence MTP verify on qwen4_exp enters `verify_c2.rs`. Its per-step capture decision (~l.191) is
+  `use_graphs = comm.is_none() && !hss_engaged && !lora_eager && !k4_diag && !layer_veto`.
+- `layer_veto` is true on EVERY layer of this model. `Qwen3SsmLayer::decode_graph_unsupported` returns
+  `ple.is_some()` (PLE host n-gram hash + NVMe fault-in, `trait_layer.rs:416`). `Qwen3AttentionLayer` returns
+  `qsa.is_some()` (QSA indexer host ingest counter + position-dependent launch params, `trait_impl.rs:95`).
+- The same veto sits in verify_b/verify_c/verify_e/decode_a2. No env knob overrides it, and bypassing it would hit
+  illegal-capture faults (900/901).
+- The pieces infrastructure (`decode_pieces.rs` keys, the PLE host-half hoist in `verify_c2`) already exists.
+  `layers/qsa_staged.rs` has an inert-step staged QSA, but only for the plain-BF16-KV highway path.
+
+Options, with estimates from the job-36 idle distribution (preliminary):
+1. Prestage QSA + run PLE's host half before capture, then capture the verify_c2 layer chain as pieces. Removes most of
+   the ~4.5 ms/token idle. Real engineering.
+2. PLE-only (still QSA-vetoed): ~2–2.5 ms/token at best.
+3. Drafter-only piece: < 1 ms/token.
+Proposed as the next work item for the owner. Not started overnight (large, design-level change).
