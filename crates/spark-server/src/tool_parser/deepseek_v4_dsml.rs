@@ -180,10 +180,16 @@ impl StreamingToolDetector {
             return DsmlStreamAction::NotDsml;
         };
         if start > 0 {
-            let content = &self.buffer[..start];
+            let content = self.buffer[..start].to_string();
             if !content.trim().is_empty() {
-                outputs.push(DetectorOutput::Content(content.to_string()));
+                self.push_content(outputs, content);
             }
+        }
+        if self.marker_is_literal(start) {
+            let marker = self.buffer[start..start + DSML_OPEN.len()].to_string();
+            self.buffer = self.buffer[start + DSML_OPEN.len()..].to_string();
+            self.push_content(outputs, marker);
+            return DsmlStreamAction::Continue;
         }
         self.buffer = self.buffer[start + DSML_OPEN.len()..].to_string();
         self.inside_dsml = true;

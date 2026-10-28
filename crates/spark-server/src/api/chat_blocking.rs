@@ -15,6 +15,7 @@ use axum::response::{IntoResponse, Json, Response};
 
 use crate::AppState;
 use crate::ir;
+use crate::literal_xml::state_after;
 use crate::tool_parser;
 
 use super::chat_blocking_choice::{build_choice_message, build_logprobs};
@@ -285,15 +286,24 @@ pub(super) fn decode_response_text(
     // tool call. This never scans arbitrary reasoning text for call syntax.
     let native_split = if enable_thinking && tools_active {
         state.glm_tool_boundary.and_then(|opener| {
-            let pos = output_tokens.iter().position(|&token| token == opener)?;
-            if output_tokens[..pos]
+            output_tokens
                 .iter()
-                .any(|token| Some(*token) == state.think_end_token_id)
-            {
-                None
-            } else {
-                Some((&output_tokens[..pos], &output_tokens[pos..]))
-            }
+                .enumerate()
+                .filter(|(_, token)| **token == opener)
+                .find_map(|(pos, _)| {
+                    if output_tokens[..pos]
+                        .iter()
+                        .any(|token| Some(*token) == state.think_end_token_id)
+                    {
+                        return None;
+                    }
+                    let prefix_is_literal = state
+                        .tokenizer
+                        .decode(&output_tokens[..pos])
+                        .ok()
+                        .is_some_and(|prefix| state_after(&prefix).is_literal());
+                    (!prefix_is_literal).then_some((&output_tokens[..pos], &output_tokens[pos..]))
+                })
         })
     } else {
         None

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::AppState;
+use crate::literal_xml::{LiteralXmlState, first_marker_outside_literal};
 use crate::openai::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, CompletionChunk,
     CompletionRequest, CompletionResponse, ModelInfo, ModelListResponse, Usage,
@@ -40,10 +41,32 @@ pub fn sanitize_content_chunk(
     inside_envelope: &mut bool,
     markers: &tool_parser::LeakMarkers,
 ) -> String {
+    let mut literal_state = LiteralXmlState::default();
+    sanitize_content_chunk_with_literal_state(
+        text,
+        tag_scan_buf,
+        suppressing_param_leak,
+        inside_envelope,
+        &mut literal_state,
+        markers,
+    )
+}
+
+/// Sanitize one content delta while retaining quote/code context across
+/// chunks. The legacy wrapper above remains useful for isolated callers.
+pub fn sanitize_content_chunk_with_literal_state(
+    text: &str,
+    tag_scan_buf: &mut String,
+    suppressing_param_leak: &mut bool,
+    inside_envelope: &mut bool,
+    literal_state: &mut LiteralXmlState,
+    markers: &tool_parser::LeakMarkers,
+) -> String {
     // Fast-path: parser opted out of sanitization (default for Hermes,
     // Gemma4, Mistral, BareJson). Pass the text straight through without
     // buffering, so no tail-retention latency penalty for those deployments.
     if markers.orphan_open.is_empty() && markers.envelope_open.is_empty() {
+        literal_state.feed(text);
         return text.to_string();
     }
     // Keep enough trailing bytes buffered that a partial tag straddling
@@ -62,11 +85,8 @@ pub fn sanitize_content_chunk(
     let mut out = String::new();
     loop {
         if *suppressing_param_leak {
-            let earliest = markers
-                .close
-                .iter()
-                .filter_map(|t| tag_scan_buf.find(t).map(|p| (p, t.len())))
-                .min_by_key(|(p, _)| *p);
+            let earliest =
+                first_marker_outside_literal(tag_scan_buf, *literal_state, markers.close);
             match earliest {
                 Some((pos, len)) => {
                     tag_scan_buf.drain(..pos + len);
@@ -95,16 +115,10 @@ pub fn sanitize_content_chunk(
         // precedence over a stray-looking inner `<invoke ...>`. Inside
         // an envelope, orphan_open is suppressed-skip — the inner
         // tags are part of the legitimate (if mangled) tool call.
-        let earliest_env_open = markers
-            .envelope_open
-            .iter()
-            .filter_map(|t| tag_scan_buf.find(t).map(|p| (p, t.len())))
-            .min_by_key(|(p, _)| *p);
-        let earliest_env_close = markers
-            .envelope_close
-            .iter()
-            .filter_map(|t| tag_scan_buf.find(t).map(|p| (p, t.len())))
-            .min_by_key(|(p, _)| *p);
+        let earliest_env_open =
+            first_marker_outside_literal(tag_scan_buf, *literal_state, markers.envelope_open);
+        let earliest_env_close =
+            first_marker_outside_literal(tag_scan_buf, *literal_state, markers.envelope_close);
         // Inside an envelope, skip BOTH orphan_open and orphan_close
         // matching — the inner `<invoke>...<parameter>...</parameter>
         // </invoke>` content is legitimate and must pass through
@@ -114,16 +128,8 @@ pub fn sanitize_content_chunk(
             (None, None)
         } else {
             (
-                markers
-                    .orphan_open
-                    .iter()
-                    .filter_map(|t| tag_scan_buf.find(t).map(|p| (p, t.len())))
-                    .min_by_key(|(p, _)| *p),
-                markers
-                    .close
-                    .iter()
-                    .filter_map(|t| tag_scan_buf.find(t).map(|p| (p, t.len())))
-                    .min_by_key(|(p, _)| *p),
+                first_marker_outside_literal(tag_scan_buf, *literal_state, markers.orphan_open),
+                first_marker_outside_literal(tag_scan_buf, *literal_state, markers.close),
             )
         };
         // Action variants: (pos, len, kind) where kind selects the
@@ -157,6 +163,7 @@ pub fn sanitize_content_chunk(
         match best {
             Some((pos, tag_len, kind)) => {
                 let before: String = tag_scan_buf.drain(..pos).collect();
+                literal_state.feed(&before);
                 out.push_str(&before);
                 match kind {
                     ActKind::EnvelopeOpen => {
@@ -199,6 +206,9 @@ pub fn sanitize_content_chunk(
                 // produces the same bytes, only sooner.
                 let cut = marker_prefix_hold_start(tag_scan_buf, tag_max, markers);
                 let emit: String = tag_scan_buf.drain(..cut).collect();
+                if !*inside_envelope {
+                    literal_state.feed(&emit);
+                }
                 out.push_str(&emit);
                 break;
             }

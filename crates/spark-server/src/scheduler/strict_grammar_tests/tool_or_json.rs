@@ -6,7 +6,7 @@
 //! output on the emit path and in the strict verify walk alike.
 
 use super::*;
-use crate::scheduler::strict_spec::row_masks;
+use crate::scheduler::strict_spec::{row_masks, row_masks_with_history};
 use crate::scheduler::test_support::{GRAMMAR_TOOL_CALL as TOOL_CALL, GRAMMAR_VOCAB, THINK_END};
 use crate::tool_parser::{FunctionDefinition, PoolsideV1Parser, ToolDefinition};
 
@@ -178,4 +178,27 @@ fn a_parser_without_a_tool_grammar_cannot_silently_drop_response_format() {
         .err()
         .expect("client receives an error");
     assert!(error.is::<crate::api::InvalidRequestError>());
+}
+
+#[test]
+fn the_verify_walk_keeps_a_quoted_native_opener_in_reasoning() {
+    let mut gs = union(true);
+    let history = [b'`' as u32];
+    let mut drafts = vec![TOOL_CALL, b'`' as u32, TOOL_CALL];
+    drafts.extend(bytes(CALL_BODY));
+    let v = row_masks_with_history(
+        &mut gs,
+        true,
+        (None, Some(THINK_END)),
+        &drafts,
+        GRAMMAR_VOCAB,
+        &history,
+    )
+    .unwrap();
+    assert_eq!(&v.drafts[..3], &drafts[..3]);
+    assert!(
+        v.drafts.len() > 3,
+        "the real opener should enter the tool branch"
+    );
+    assert_eq!(gs.num_history_steps(), 0, "the walk rolls back");
 }

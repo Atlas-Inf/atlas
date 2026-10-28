@@ -67,7 +67,14 @@ pub(super) fn apply_native_tool_boundary(
         a.tools_present,
         a.tool_call_start_token,
     );
-    if !a.inside_thinking || opener != Some(token) {
+    if !a.inside_thinking || opener != Some(token) || a.in_code_fence {
+        return;
+    }
+    let literal_opener = a
+        .grammar_state
+        .as_ref()
+        .is_some_and(|gs| gs.native_opener_is_literal(&a.output_tokens));
+    if literal_opener {
         return;
     }
     a.inside_thinking = false;
