@@ -1586,22 +1586,24 @@ __device__ __forceinline__ void w4a16_m128_f16_body(
         } \
     } while (0)
 
+    // Each B fragment is read from LDS once and feeds both 64-row halves
+    // (acc0, acc1): 16 B-fragment LDS reads per 32-K step instead of 32.
+    // Every accumulator sees the same WMMA operands in the same h order, so
+    // the result is bit-identical to the ch-outer loop this replaced.
     #define F16_COMPUTE(buf) do { \
+        const unsigned int m_row0 = warp_m_offset + (lane_id & 15); \
         _Pragma("unroll") \
-        for (int ch = 0; ch < 2; ch++) { \
-            v8f* acc = ch ? acc1 : acc0; \
-            unsigned int m_row = ch * F16_M_TILE + warp_m_offset + (lane_id & 15); \
+        for (int h = 0; h < 2; h++) { \
+            v16h a0, a1; \
+            __builtin_memcpy(&a0, &smem_A[(buf)][m_row0][h * 16], 32); \
+            __builtin_memcpy(&a1, &smem_A[(buf)][F16_M_TILE + m_row0][h * 16], 32); \
             _Pragma("unroll") \
-            for (int h = 0; h < 2; h++) { \
-                v16h a; \
-                __builtin_memcpy(&a, &smem_A[(buf)][m_row][h * 16], 32); \
-                _Pragma("unroll") \
-                for (int nb = 0; nb < 8; nb++) { \
-                    unsigned int nc = nb * 16 + (lane_id & 15); \
-                    v16h b; \
-                    __builtin_memcpy(&b, &smem_B[(buf)][F16_B_OFF(nc) + h * 16], 32); \
-                    acc[nb] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc[nb]); \
-                } \
+            for (int nb = 0; nb < 8; nb++) { \
+                unsigned int nc = nb * 16 + (lane_id & 15); \
+                v16h b; \
+                __builtin_memcpy(&b, &smem_B[(buf)][F16_B_OFF(nc) + h * 16], 32); \
+                acc0[nb] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b, acc0[nb]); \
+                acc1[nb] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b, acc1[nb]); \
             } \
         } \
     } while (0)
