@@ -33,23 +33,6 @@ pub(super) struct TensorMeta {
 }
 
 /// The tensors an index routes to `shard_path`.
-///
-/// Compared as PATHS under `model_dir`, not by file name: an index may name
-/// its shards with a directory (nvidia's FP4-Local pack routes every tensor to
-/// `tensors/model-000NN-of-00021.safetensors`), and a bare-name comparison then
-/// matches nothing — every shard "loads" zero tensors and the build fails far
-/// from the cause, on a missing embedding.
-pub(super) fn tensors_routed_to(
-    map: &HashMap<String, String>,
-    model_dir: &Path,
-    shard_path: &Path,
-) -> Vec<String> {
-    map.iter()
-        .filter(|(_, s)| model_dir.join(s.as_str()) == shard_path)
-        .map(|(t, _)| t.clone())
-        .collect()
-}
-
 /// Discover which safetensor files to load. Mirrors the resolution order in
 /// `crate::weights::SafetensorsLoader::load`.
 ///
