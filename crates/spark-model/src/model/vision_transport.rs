@@ -25,6 +25,30 @@ const VISION_MAX_GRID_CELLS: usize = 1 << 24;
 const VISION_BF16_BYTES: usize = 2;
 const VISION_MAX_PAYLOAD_BYTES: usize = 1 << 30;
 
+/// A request whose images need more encoder rows than one encode holds.
+/// The client resending the same history cannot succeed, so the server
+/// answers it with HTTP 400 rather than a retryable 500 (#180).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VisionCapacityError {
+    pub rows: usize,
+    pub capacity: usize,
+    /// Image/video grids in the request (an image is one grid).
+    pub grids: usize,
+}
+
+impl std::fmt::Display for VisionCapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "vision row count {} ({} image grids) exceeds encoder capacity {}; \
+             drop or downscale images from the request",
+            self.rows, self.grids, self.capacity
+        )
+    }
+}
+
+impl std::error::Error for VisionCapacityError {}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct VisionWireState {
     pub rows: usize,
@@ -80,12 +104,14 @@ pub(crate) fn validate_state(state: &VisionWireState, max_rows: usize) -> Result
         "vision state received but this rank has no vision encoder capacity"
     );
 
-    ensure!(
-        state.rows <= max_rows,
-        "vision row count {} exceeds encoder capacity {}",
-        state.rows,
-        max_rows
-    );
+    if state.rows > max_rows {
+        return Err(VisionCapacityError {
+            rows: state.rows,
+            capacity: max_rows,
+            grids: state.grid_count,
+        }
+        .into());
+    }
     ensure!(
         state.grid_count > 0,
         "non-empty vision state has no grid metadata"
@@ -243,6 +269,24 @@ mod tests {
             slice_rows: 4,
         };
         assert_eq!(validate_state(&packed, 16).unwrap(), packed);
+    }
+
+    #[test]
+    fn over_capacity_is_a_typed_error() {
+        let e = parse_state_header(&[17, 2, 0, 0, 0, 17], 16).unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<VisionCapacityError>(),
+            Some(&VisionCapacityError {
+                rows: 17,
+                capacity: 16,
+                grids: 2,
+            })
+        );
+        // Still typed once the scheduler adds its own context, but not once
+        // flattened to a string: callers must keep the error, not its text.
+        let flat = anyhow::anyhow!("{e:#}");
+        assert!(!flat.is::<VisionCapacityError>());
+        assert!(e.context("prefill").is::<VisionCapacityError>());
     }
 
     #[test]

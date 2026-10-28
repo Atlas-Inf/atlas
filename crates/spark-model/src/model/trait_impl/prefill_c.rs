@@ -258,8 +258,16 @@ impl TransformerModel {
 
         // If the entire prompt is cached, just process the last token for logits.
         if proc_count == 0 {
-            return self
-                .prefill_full_cache_hit(tokens, seq, hidden, h as u32, bs, total_len, stream);
+            return self.prefill_full_cache_hit(
+                tokens,
+                seq,
+                hidden,
+                h as u32,
+                bs,
+                total_len,
+                eff_snapshot,
+                stream,
+            );
         }
 
         // PLE: warm the row cache ahead of the layer-1 gather — the ids are

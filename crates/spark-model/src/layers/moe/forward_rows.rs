@@ -125,6 +125,16 @@ impl MoeLayer {
         let shared_out = ctx.buffers.attn_output();
         if self.rows_pair_eligible(rows, ctx) {
             self.forward_rows_pair(input, rows, output, shared_out, ctx, stream)?;
+        } else if self.t_rows_eligible(rows, ctx) {
+            self.forward_rows_t(
+                input,
+                rows,
+                output,
+                shared_out,
+                single_seq_decode,
+                ctx,
+                stream,
+            )?;
         } else {
             for r in 0..rows {
                 let off = r * h * bf16;

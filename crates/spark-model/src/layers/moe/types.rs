@@ -156,6 +156,13 @@ pub struct MoeLayer {
     // decode variants. KernelHandle(0) on models that don't ship them.
     pub(super) moe_expert_gate_up_shared_t_e8m0_k: KernelHandle,
     pub(super) moe_expert_silu_down_shared_t_e8m0_k: KernelHandle,
+    // S7 verify-row dedup: unique-expert map + multi-row `_t` gate/up and
+    // silu/down over the transposed tables, one extern "C" instantiation per
+    // row count (`_r1.._r8`; index = rows). gb10-only; KernelHandle(0)
+    // elsewhere and the `forward_rows_t` arm stays ineligible.
+    pub(super) moe_expert_union_t_k: KernelHandle,
+    pub(super) moe_expert_gate_up_shared_t_rows_k: [KernelHandle; 9],
+    pub(super) moe_expert_silu_down_shared_t_rows_k: [KernelHandle; 9],
     // ── sqrtsoftplus routing (DeepSeek-V4) ──
     pub(super) moe_topk_sqrtsoftplus_k: KernelHandle,
     pub(super) moe_topk_sqrtsoftplus_batched_k: KernelHandle,
@@ -297,6 +304,8 @@ pub struct MoeLayer {
     pub(super) quantize_nvfp4_k: KernelHandle,
     pub(super) silu_mul_quant_nvfp4_k: KernelHandle,
     pub(super) moe_fused_gate_up_t: KernelHandle,
+    /// Both `_f16a` routed-MoE twins resolved (native HIP only).
+    pub(super) moe_f16_prefill: bool,
     pub(super) moe_fused_gate_up_t_k64: KernelHandle,
     // ARM-2 Phase-K: native-MXFP4 (E8M0 per-32) prefill variants of the W4A16
     // routed-expert GEMMs. KernelHandle(0) on models that don't ship them

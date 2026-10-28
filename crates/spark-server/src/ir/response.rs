@@ -29,8 +29,8 @@ pub struct ChatResponse {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Choice {
     pub index: usize,
-    /// Assistant text (`None` mirrors the wire's `content: null`, e.g.
-    /// after a refusal strip).
+    /// Assistant text (`None` mirrors the wire's `content: null`). A
+    /// detected refusal sets `refusal` and keeps this text (#172).
     pub content: Option<String>,
     /// Reasoning/thinking trace, when the model produced one.
     pub reasoning: Option<String>,

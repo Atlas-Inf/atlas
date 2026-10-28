@@ -24,6 +24,8 @@
 
 #[path = "phase_continue_prefills/cached_run.rs"]
 mod cached_run;
+#[path = "phase_continue_prefills/decode_share.rs"]
+pub(super) mod decode_share;
 #[path = "phase_continue_prefills/prefill_waves.rs"]
 mod prefill_waves;
 #[path = "phase_continue_prefills/run_batched_mixed.rs"]
@@ -195,7 +197,7 @@ pub(super) fn continue_in_progress_prefills(
     } else {
         // Resting production path — unchanged binary gate.
         let do_chunks = active.is_empty() || policy.should_prefill(&timings);
-        if !do_chunks {
+        if !do_chunks || decode_share::hold_chunk(!active.is_empty()) {
             return did_mixed_step;
         }
     }

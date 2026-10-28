@@ -377,3 +377,28 @@ fn glm_native_tool_boundary_keeps_request_model_and_name_guards() {
         assert_eq!(choice.tool_calls.len(), usize::from(!glm));
     }
 }
+
+/// #172: a blocking reply whose text opens with a refusal prefix keeps its
+/// full `content` (the streamed path always did). `refusal` is not asserted
+/// strictly: `refusal::tests` flips the process-wide kill switch in parallel.
+#[test]
+fn blocking_refusal_prefix_keeps_content() {
+    let state = app(false);
+    let req = request();
+    let response = response(vec![]);
+    let text = "I cannot verify that source. Here is what the paper itself says: ...";
+    let choice = crate::api::chat_blocking_choice::build_choice_message(
+        &state,
+        &req,
+        &response,
+        None,
+        text.to_string(),
+        false,
+        None,
+        0,
+    );
+    assert_eq!(choice.content.as_deref(), Some(text));
+    if let Some(r) = choice.refusal.as_deref() {
+        assert_eq!(r, "I cannot verify that source.");
+    }
+}

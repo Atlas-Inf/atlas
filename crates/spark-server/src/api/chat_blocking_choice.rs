@@ -160,14 +160,17 @@ pub(super) fn build_choice_message(
     }
 
     // Refusal classifier: when the model's assistant text opens with
-    // a known refusal pattern AND no tool call fired, populate
-    // `refusal` and null out `content` per the OpenAI spec.
+    // a known refusal pattern AND no tool call fired, populate `refusal`.
+    // `content` is kept: the classifier is a prefix heuristic, and a reply
+    // like "I cannot verify that, but here is ..." carries a real answer
+    // after its first sentence. The streamed path sends every content piece
+    // and appends the refusal delta at the end, so blocking now matches it
+    // (#172: 27/200 blocking replies came back with `content: null`).
     if msg_tool_calls.is_none()
         && let Some(content_text) = msg_content.as_deref()
         && let Some(refusal_sentence) = crate::refusal::detect(content_text)
     {
         msg_refusal = Some(refusal_sentence);
-        msg_content = None;
     }
 
     // Validated wire tool calls → IR (arguments are serde-normalized

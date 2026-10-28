@@ -45,18 +45,18 @@ pub(crate) fn hc_finish_x4() -> bool {
     *X4.get_or_init(|| std::env::var("ATLAS_HC_FIN_X4").as_deref() != Ok("0"))
 }
 
-/// `ATLAS_HC_MT`: token-fused decode collapse (`hc_pre_down_mt` +
-/// `hc_pre_finish_x4_mt`) for T <= 4. Default ON under HIP, where it was
-/// measured; default off elsewhere until measured there (`=1` opts in). It is
-/// bit-identical to the per-token kernels either way, so the flag only picks
-/// launch shape. Read once per process.
+/// `ATLAS_HC_MT=1`: token-fused decode collapse (`hc_pre_down_mt` +
+/// `hc_pre_finish_x4_mt`) for T <= 4. Bit-identical to the per-token kernels,
+/// so the flag only picks launch shape. Off by default: on gfx1151 the pair
+/// measured SLOWER than the per-token kernels (strix job 146: 0.91x at T=1,
+/// 0.69x at T=2; #154 closed on it), and it is unmeasured on GB10.
+/// Never on under HIP: the strix-hip twin of `hyper_connection.cu` does not
+/// carry these kernels, and the dispatch looks them up per call, so a default-on
+/// HIP arm made the first decode step abort in the kernel audit. Read once per
+/// process.
 pub(crate) fn hc_token_fused() -> bool {
     static MT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *MT.get_or_init(|| match std::env::var("ATLAS_HC_MT").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => cfg!(atlas_hip),
-    })
+    *MT.get_or_init(|| !cfg!(atlas_hip) && std::env::var("ATLAS_HC_MT").as_deref() == Ok("1"))
 }
 
 /// `ATLAS_QWEN4EXP_HC_FAST=1`: the vectorized decode collapse
@@ -147,7 +147,11 @@ pub(crate) fn hc_gemm(
     if super::qwen4exp_rowinv::try_bf16_gemm(a, w.0, out, [m, n, k], stream)? {
         return Ok(());
     }
-    if n.div_ceil(128) * m.div_ceil(128) < sm_count {
+    // On native HIP the machine-fill test stays for NVIDIA: hipBLASLt wins
+    // at EVERY shape on gfx1151 (measured 2026-10-04: 2.3-2.6x the tile
+    // kernel incl. the wide up-projection), so try it unconditionally; any
+    // Err lands on the same warn-once + gemm_raw fallback.
+    if cfg!(atlas_hip) || n.div_ceil(128) * m.div_ceil(128) < sm_count {
         match crate::layers::ops::cublas_bf16_proj_dense(a, w, out, m, n, k, stream) {
             Ok(()) => return Ok(()),
             // A failed launch may have written part of `out`: never rerun it.
