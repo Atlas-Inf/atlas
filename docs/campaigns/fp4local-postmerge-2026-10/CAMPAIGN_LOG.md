@@ -953,3 +953,16 @@ exactness, but with no summary line it isn't a positive proof that steps were ch
 | rsync mirror | Mac cron */15 | 15 min | STATUS.md, RESULTS.md, runner.log, `perf/nq-*` → `~/code/fp4local-night/` |
 
 Merges stay with the lead session: #219 after jobs 35 (BFCL) and 37 (exactness) both pass.
+
+## 2026-10-28 07:00 UTC — owner: no re-runs, no unnecessary ablations → queue pruned
+
+Kept only jobs with a decision attached:
+- 35 (#219 merge gate, BFCL leg, running);
+- 36 (nsys decode profile, which picks the next lever);
+- 37 (S7 exactness: single-sequence + C=4/C=8 summary-line checks; merge-blocking for #219). Its C>1 throughput A/B was
+  removed.
+
+Parked, not deleted, in sparky `~/code/q10h/parked-20261028/`: 38 long context, 39 NVFP4 pack, 40/41/42 agentic
+profile stacking, 90/91 agentic repeats. `refill.sh` disabled (`~/code/q10h/REFILL_STOP`), since its fillers are
+re-runs. nightwatch keeps relaying results. After 37, the GPU stays idle until there is a new code change worth
+measuring.
