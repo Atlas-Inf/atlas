@@ -966,3 +966,38 @@ Parked, not deleted, in sparky `~/code/q10h/parked-20261028/`: 38 long context, 
 profile stacking, 90/91 agentic repeats. `refill.sh` disabled (`~/code/q10h/REFILL_STOP`), since its fillers are
 re-runs. nightwatch keeps relaying results. After 37, the GPU stays idle until there is a new code change worth
 measuring.
+
+## 2026-10-28 07:30–08:10 UTC — #219 passes every gate; decode profile names the next lever; cap red inherited from main
+
+**#219 gates, all passed:**
+- Merge gate (job 35, 949fa6b72): BFCL **87.44 / 87.32** (run-1793172763024546566), all 15 subsets identical to main;
+  agentic 50/50, 50/50, **11.99 s/turn** (main 12.43); TTFT unchanged (p50 637 ms both).
+- Exactness (job 37), summary-line verdicts: single sequence 512 rows, C=4 1,468 rows, C=8 2,944 rows, all
+  **0 rows differ, 0 argmax flips**, with the arm engaged.
+- Smoke after the init.rs split (job 38b, 5b8350c50): control identical, engaged.
+
+**Merge blocked on the 500-LoC cap.** `moe/init.rs` is 510 lines on the PR merge ref because main's own init.rs is
+504 since #197 (AMD train, c3774309e). Main's cap check has been red since then. Fix in progress: merge main into
+#219 and move one existing cluster out of init.rs (target ≤ 495), then smoke (job 38c), then merge.
+
+**Decode profile (job 36, nsys, 3 × 1,024 tokens per arm, identical code-gen prompts, `reasoning_effort: none`;
+single capture per arm, so preliminary).** The export first raced the report write and I re-exported the captures
+offline. Per generated token:
+
+| | main | main + S7 |
+|---|---|---|
+| burst wall | 28.02 ms (35.7 tok/s) | 27.00 ms (37.0 tok/s) |
+| GPU busy / idle | 23.09 / 4.92 ms (17.6% idle) | 22.52 / 4.48 ms (16.6%) |
+| routed gate_up | 7.41 (`_t`) | 3.57 (`_t_rows`) |
+| routed silu_down | 3.28 (`_t`) | **6.55** (`_t_rows`) |
+| `mxfp8_proj_batchm` + `_gemv` | 3.32 + 1.40 | 3.90 + 0.23 (the separate shared expert now batches its rows) |
+| union | — | 0.31 |
+| LM head (`dense_gemv_bf16` + `_batchm`) | 1.65 + 1.25 | 1.70 + 1.28 |
+| hc_pre down + finish | 2.10 | 2.20 |
+
+**Next lever (S7.1):** `silu_down_t_rows` is ~2× slower than per-row on half of gate_up's bytes. In source, it recomputes
+`silu(g)·u` (2 × `__expf` + divide) per element, per row, in all 256 column threads. The single-row kernel computes
+`s_act` once per CTA into smem. A byte-exact fix (same expression, fp32 smem) is in development
+(`perf/fp4l-moe-verify-dedup-act`): microbench vs the current rows kernel in one job (39b), then a self-deciding in-situ
+job (39c). Upper bound if silu_down_rows reaches gate_up_rows' bytes-per-ms: about 4–5 ms/token (preliminary).
+Second lever: 4.5 ms/token of GPU idle, since this path captures no CUDA graphs.
