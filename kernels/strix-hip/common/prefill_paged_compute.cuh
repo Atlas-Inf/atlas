@@ -484,18 +484,26 @@ extern "C" __global__ void KERNEL_NAME(
 }
 
 // ==========================================================================
-// BR=64 entry (KERNEL_NAME##_64). On AMD/gfx1151 these _64 paged prefill
-// kernels ARE still dispatched (paged_attn.rs picks them on chunk length
-// alone), so BR64 is clamped to 32 here both to keep LDS within RDNA3.5's
-// 64 KB cap and to make the tiling correct; the host grid is clamped to match
-// by cfg!(atlas_scale) in ops/prefill_attn_main_{a,b}.rs, and the two MUST
-// agree. (An earlier comment claimed a `force_br32_prefill` HARDWARE.toml key
-// routed dispatch away from them — no such routing existed, the key had no
-// reader, and it has been removed.) Mirrors inferspark_prefill_wmma.cu. The
-// wave32 WMMA + smem-softmax
-// body is identical to the BR=32 kernel; only the entry symbol differs so the
-// registry links. NVIDIA keeps BR64=64 verbatim.
-#define BR64 32
+// BR=64 entry (KERNEL_NAME##_64): 64 query rows per CTA on all 8 warps.
+// Warps 0..3 compute Q.K^T for rows 0..63 (16 each), one thread per row runs the
+// smem online softmax, and the 8 warps split P.V as 4 row groups x 2 head_dim
+// halves. LDS is 62.6 KB at HDIM=256 (Q 33 KB, the shared K/V buffer 16.5 KB,
+// S 8 KB, P 4 KB), inside gfx1151's 64 KB cap because K and V share one buffer.
+//
+// This used to be clamped to BR64=32 with 4 of the 256 launched threads working.
+// Each row's arithmetic is unchanged: the same BC=32 key tiles in the same order,
+// the same 16-row WMMA blocks, and the same per-row softmax. Only the rows per K/V
+// tile load double. So the output is bit-identical, and the explicit masked p = 0
+// below covers the one tile shape BR=64 adds. strix kernel bench at 27B geometry
+// (24 q / 4 kv heads, hd 256, 2048-row chunk, s72): kv_len 2k 1.35x, 8k 1.61x,
+// 16k 1.59-1.68x, 100.0000% bit-equal.
+//
+// The host grids must use BR=64 on atlas_hip (prefill_attn_main_b.rs: the
+// paged / fp8 / nvfp4 _64 launchers). The batched _64 launchers
+// (prefill_attn_batched.rs) always used 64, and on the clamped kernel they left
+// query rows 32..63 of every 64-row band unwritten. The SCALE `strix` tree keeps
+// its own header and its BR64 32. NVIDIA keeps BR64=64 verbatim.
+#define BR64 64
 #define TILE_CHUNKS_Q64 (BR64 * (HDIM / 8))
 
 #define _PAGED_CONCAT(a, b) a##b
@@ -561,7 +569,6 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     const unsigned int lane_lo = lane_id & 15;
     const unsigned int lane_hi = lane_id >> 4;
 
-    if (warp_id >= 4) return;  // clamped BR64=32 uses only 4 warps (128 threads)
 
     if (q_head >= num_q_heads) return;
     const unsigned int q_start = q_block * BR64;
@@ -598,8 +605,8 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
 #endif
     (void)q_rope_pos;
 
-    const unsigned int pv_warp_m  = (warp_id & 1) * 16;
-    const unsigned int pv_n_start = (warp_id >> 1) * PV_N_TILES;
+    const unsigned int pv_warp_m  = (warp_id & 3) * 16;
+    const unsigned int pv_n_start = (warp_id >> 2) * PV_N_TILES;
 
     v8f acc_o[PV_N_TILES];
     #pragma unroll
@@ -619,14 +626,14 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
         kv_block_lo = num_kv_blocks - 1;
     }
 
-    for (unsigned int r = tid; r < BR64; r += 128) {
+    for (unsigned int r = tid; r < BR64; r += 256) {
         smem_ml[r][0] = -1e30f;
         smem_ml[r][1] = 0.0f;
     }
 
     {
         const unsigned int cpr = HDIM / 8;
-        for (unsigned int idx = tid; idx < TILE_CHUNKS_Q64; idx += 128) {
+        for (unsigned int idx = tid; idx < TILE_CHUNKS_Q64; idx += 256) {
             unsigned int row = idx / cpr, col = (idx % cpr) * 8;
             if (q_start + row < q_len_eff) {
 #ifdef PREFILL_BATCHED
@@ -648,10 +655,10 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
         unsigned int kv_tile_len = kv_end - kv_start;
 
         // K tile load only (V reloaded into smem_K after QK, buffer-share).
-        LOAD_KV_TILE(K_cache, block_table, smem_K, kv_start, kv_len, kv_head, tid, 128);
+        LOAD_KV_TILE(K_cache, block_table, smem_K, kv_start, kv_len, kv_head, tid, 256);
         __syncthreads();
 
-        if (warp_id < 2) {
+        if (warp_id < 4) {
             const unsigned int qk_m = warp_id * 16;
             v8f acc_s[QK_N_TILES];
             #pragma unroll
@@ -712,7 +719,14 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
             float sum = 0.0f;
             #pragma unroll
             for (unsigned int c = 0; c < BC; c++) {
-                float p = sw_exp(smem_S[r][c] - m_new);
+                // Masked scores contribute exactly 0. Wherever a row has seen a
+                // valid key this equals sw_exp(-1e30 - m_new) (0 in FP32), so the
+                // output is unchanged; it only matters for a tile that is ENTIRELY
+                // masked for a row before its first valid key (m_new == -1e30 would
+                // give p = 1). At BR=32 that tile cannot exist; at BR=64 a later
+                // row's sliding window can start past the CTA's first tile.
+                const float s_c = smem_S[r][c];
+                float p = (s_c <= -1e30f) ? 0.0f : sw_exp(s_c - m_new);
 #ifdef ATLAS_DISABLE_FP16_PV
                 smem_P[r][c] = __float2bfloat16(p);
 #else
@@ -726,7 +740,7 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
         }
 
         // V reload into smem_K (buffer-share; K consumed by QK, barrier above covers WAR).
-        LOAD_KV_TILE(V_cache, block_table, smem_K, kv_start, kv_len, kv_head, tid, 128);
+        LOAD_KV_TILE(V_cache, block_table, smem_K, kv_start, kv_len, kv_head, tid, 256);
         __syncthreads();
 
         {
