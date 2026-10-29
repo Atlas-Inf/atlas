@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Qwen TP2 modes share native target precision and target-verified MTP.
 //! Ported from Enntity/atlas `weight_loader/qwen4_exp/mode.rs` (AGPL-3.0-only),
-//! adapted for this stack: `ATLAS_QWEN4EXP_MXFP8_DECODE`,
-//! `ATLAS_QWEN4EXP_PREFILL_W8A8` and `ATLAS_QWEN4EXP_MTP_BF16_ATTN` have no
-//! implementation here (their features are not in this tree), so they are
-//! omitted from the flag contract.
+//! adapted for this stack: `ATLAS_QWEN4EXP_MXFP8_DECODE` and
+//! `ATLAS_QWEN4EXP_PREFILL_W8A8` have no implementation here (their features
+//! are not in this tree), so they are omitted from the flag contract.
 use anyhow::{Result, bail, ensure};
 use atlas_core::config::ModelConfig;
 
@@ -53,13 +52,18 @@ impl ServingMode {
         Ok(())
     }
 
-    /// Strict keeps the BF16 draft head (the only attention path in this
-    /// stack — Enntity's separate `ATLAS_QWEN4EXP_MTP_BF16_ATTN` switch is
-    /// absent here); Spark selects the NVFP4 draft copy.
-    pub fn drafter_flags(self) -> [(&'static str, &'static str); 1] {
+    /// Strict drafts on the checkpoint's BF16 MTP attention and the BF16
+    /// draft head; Spark on NVFP4 MTP attention and the NVFP4 draft copy.
+    pub fn drafter_flags(self) -> [(&'static str, &'static str); 2] {
         match self {
-            Self::Strict => [("ATLAS_QWEN4EXP_DRAFT_HEAD_NVFP4", "0")],
-            Self::Spark => [("ATLAS_QWEN4EXP_DRAFT_HEAD_NVFP4", "1")],
+            Self::Strict => [
+                ("ATLAS_QWEN4EXP_MTP_BF16_ATTN", "1"),
+                ("ATLAS_QWEN4EXP_DRAFT_HEAD_NVFP4", "0"),
+            ],
+            Self::Spark => [
+                ("ATLAS_QWEN4EXP_MTP_BF16_ATTN", "0"),
+                ("ATLAS_QWEN4EXP_DRAFT_HEAD_NVFP4", "1"),
+            ],
         }
     }
 
@@ -170,6 +174,22 @@ mod tests {
                     .is_err()
                 );
             }
+        }
+    }
+    #[test]
+    fn strict_drafts_on_bf16_attention_and_spark_on_nvfp4() {
+        let flag = |mode: ServingMode, key: &str| {
+            mode.drafter_flags()
+                .into_iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v)
+        };
+        for (mode, attn, head) in [
+            (ServingMode::Strict, "1", "0"),
+            (ServingMode::Spark, "0", "1"),
+        ] {
+            assert_eq!(flag(mode, "ATLAS_QWEN4EXP_MTP_BF16_ATTN"), Some(attn));
+            assert_eq!(flag(mode, "ATLAS_QWEN4EXP_DRAFT_HEAD_NVFP4"), Some(head));
         }
     }
     #[test]
