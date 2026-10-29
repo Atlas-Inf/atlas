@@ -3,8 +3,8 @@
 use anyhow::Result;
 
 use super::while_on;
-use crate::layers::{self, ops};
 use crate::layers::dflash_head::ConvTwinKind;
+use crate::layers::{self, ops};
 use crate::model::{graph_flags, qwen4exp_batch_fast, qwen4exp_exact_verify, qwen4exp_mtp_depth};
 
 /// The table's trailing entries, split for the 500-LoC cap. The caller
