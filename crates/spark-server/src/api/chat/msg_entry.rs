@@ -84,100 +84,9 @@ struct MediaInput {
     uri: String,
 }
 
-/// Append every media part on `m` to `media` **in content order**, growing
-/// `image_pad_counts` in lockstep (each pad count is filled in later by the
-/// preprocessor). Shared by the tool-message branch and the normal branch so
-/// media rides every role uniformly — including tool results, the motivating
-/// case for issue #165.
-#[allow(clippy::result_large_err)]
-fn collect_message_media(
-    m: &Message,
-    media: &mut Vec<MediaInput>,
-    image_pad_counts: &mut Vec<usize>,
-    remote: &super::remote_image::RemoteImagePolicy,
-) -> Result<(), Response> {
-    // ORDER IS A CONTRACT, and the order is the CLIENT'S. The template emits
-    // one marker per media item in the order they appear in the content
-    // array, and `expand_vision_pads` walks pad tokens left to right
-    // consuming one count each — so this one pass, `MsgEntry::media` and the
-    // preprocessing loop below must all traverse `m.content` the same way.
-    // Grouping by modality anywhere in that chain shows the model the items
-    // in an order the caller never wrote, and does it silently: every count
-    // still agrees with every other one.
-    for part in &m.content {
-        let (kind, data) = match part {
-            ContentPart::Image(src) => (MediaKind::Image, &src.data),
-            ContentPart::Video(src) => (MediaKind::Video, &src.data),
-            ContentPart::Text(_) => continue,
-        };
-        media.push(MediaInput {
-            kind,
-            uri: resolve_media_uri(kind, data, remote)?,
-        });
-        image_pad_counts.push(0);
-    }
-    Ok(())
-}
-
-/// Resolve one media source to an encoder-input string, applying the
-/// operator's remote-fetch policy. Shared by both modalities because the
-/// policy and its failure modes are identical — only the noun in the message
-/// differs.
-#[allow(clippy::result_large_err)]
-fn resolve_media_uri(
-    kind: MediaKind,
-    data: &ImageData,
-    remote: &super::remote_image::RemoteImagePolicy,
-) -> Result<String, Response> {
-    let noun = match kind {
-        MediaKind::Image => "image",
-        MediaKind::Video => "video",
-    };
-    match data {
-        ImageData::Base64(s) => Ok(s.clone()),
-        // Neither the encoder nor the video decoder fetches remote URLs
-        // itself. Either the operator has granted this server the
-        // capability, in which case the URL is resolved to a data: URI here,
-        // or it has not, in which case this is a 400 naming the flag. What
-        // must not happen is feeding the URL string onward: it would reach
-        // the base64 decoder and fail with a confusing "base64 decode
-        // failed" (PCND: fail fast, with the real reason).
-        ImageData::Url(url) => {
-            let shown: String = url.chars().take(120).collect();
-            if !remote.enabled {
-                return Err(openai_error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "{noun} URLs are not fetched by this server (got '{shown}'); \
-                         send the {noun} as a base64 data: URI, or start the server \
-                         with --vision-allow-remote-images to enable fetching"
-                    ),
-                ));
-            }
-            let remote_kind = match kind {
-                MediaKind::Image => super::remote_image::RemoteMediaKind::Image,
-                MediaKind::Video => super::remote_image::RemoteMediaKind::Video,
-            };
-            match super::remote_image::fetch_media_as_data_uri(url, remote, remote_kind) {
-                Ok(data_uri) => Ok(data_uri),
-                Err(why) => {
-                    // The reason is surfaced rather than flattened to "could
-                    // not fetch": the operator turned this on deliberately,
-                    // and "resolves to a private address" and "exceeds the
-                    // size cap" call for different fixes.
-                    tracing::warn!("remote {noun} fetch refused: {shown}: {why}");
-                    Err(openai_error_response(
-                        StatusCode::BAD_REQUEST,
-                        format!("could not fetch {noun} URL '{shown}': {why}"),
-                    ))
-                }
-            }
-        }
-    }
-}
-
 #[allow(clippy::result_large_err)]
 pub(super) fn build_msg_entries(
+    admit: super::vision_admit::AdmitCtx<'_>,
     vision_config: Option<&VisionConfig>,
     vision_max_pixels: Option<usize>,
     remote_images: &super::remote_image::RemoteImagePolicy,
@@ -279,7 +188,7 @@ pub(super) fn build_msg_entries(
                 media: m.media_kinds(),
                 reasoning_content: None,
             });
-            collect_message_media(m, &mut media, &mut image_pad_counts, remote_images)?;
+            media::collect_message_media(m, &mut media, &mut image_pad_counts, remote_images)?;
             continue;
         }
 
@@ -326,7 +235,7 @@ pub(super) fn build_msg_entries(
                 None
             },
         });
-        collect_message_media(m, &mut media, &mut image_pad_counts, remote_images)?;
+        media::collect_message_media(m, &mut media, &mut image_pad_counts, remote_images)?;
     }
 
     // P1-6 (2026-07-09): duplicate-error observation masking
@@ -339,8 +248,8 @@ pub(super) fn build_msg_entries(
     // ATLAS_NO_ERROR_DEDUP=1 restores verbatim history. MUST run
     // before the vacuous-system removal below — the recorded indices
     // refer to the un-shifted `messages` vec.
-    if tools_active && !error_dedup_disabled() {
-        for (idx, replacement) in duplicate_error_masks(&tool_result_originals) {
+    if tools_active && !tail::error_dedup_disabled() {
+        for (idx, replacement) in tail::duplicate_error_masks(&tool_result_originals) {
             messages[idx].content = replacement;
         }
     }
@@ -391,7 +300,7 @@ pub(super) fn build_msg_entries(
     // bare `Label:` line qualifies; any substantive prompt is untouched.
     if messages
         .first()
-        .is_some_and(|m| m.role == "system" && is_vacuous_system_content(&m.content))
+        .is_some_and(|m| m.role == "system" && tail::is_vacuous_system_content(&m.content))
     {
         let removed = messages.remove(0);
         tracing::info!(
@@ -410,6 +319,8 @@ pub(super) fn build_msg_entries(
     // are the same item by construction. Preprocessing images and videos in
     // separate passes would re-introduce the grouping this fix removed.
     let mut image_pixels: Vec<spark_model::VisionItem> = Vec::new();
+    let has_video = media.iter().any(|m| m.kind == MediaKind::Video);
+    let mut admission = super::vision_admit::Admission::begin(admit, media.len(), has_video)?;
     if !media.is_empty() {
         let Some(vcfg) = vision_config else {
             return Err(openai_error_response(
@@ -466,6 +377,7 @@ pub(super) fn build_msg_entries(
                             };
                             (
                                 spark_model::VisionItem {
+                                    held: spark_model::vision_budget::HeldRows::default(),
                                     groups: v.groups,
                                     grid_h: v.grid_h,
                                     grid_w: v.grid_w,
@@ -483,6 +395,7 @@ pub(super) fn build_msg_entries(
                 }
             };
             image_pad_counts[idx] = item.pad_count(vcfg.spatial_merge_size);
+            admission.note(image_pad_counts[idx])?;
             if vcfg.is_glm5_next || vcfg.is_qwen3vl_video {
                 vision_placeholders.push(glm5_vision::placeholder(
                     input.kind,
@@ -507,6 +420,13 @@ pub(super) fn build_msg_entries(
             }
             image_pixels.push(item);
         }
+    }
+    let admitted = admission.admit()?;
+    for item in image_pixels.iter_mut() {
+        *item = admitted.attach(std::mem::replace(
+            item,
+            spark_model::VisionItem::image(Vec::new(), 0, 0),
+        ));
     }
 
     // BW1 bash-wandering watchdog: if the agent has run many tool calls with
@@ -533,100 +453,16 @@ pub(super) fn build_msg_entries(
     })
 }
 
-/// True when a system message carries no actual instruction and should
-/// be treated as absent. Conservative by design — a substantive prompt
-/// must never be stripped:
-///   * empty / whitespace-only body, OR
-///   * a single short bare label line ending in ':' with nothing after
-///     it (e.g. `User Context:`, `Context:`, `System:`) — the residue
-///     of an empty client template (Open WebUI's RAG/context block).
-/// Anything multi-line, or with any text past the colon, is a real
-/// prompt and returns false.
-fn is_vacuous_system_content(content: &str) -> bool {
-    let t = content.trim();
-    if t.is_empty() {
-        return true;
-    }
-    if !t.contains('\n') && t.len() <= 32 && t.ends_with(':') {
-        let label = &t[..t.len() - 1];
-        return !label.is_empty()
-            && label
-                .chars()
-                .all(|c| c.is_ascii_alphabetic() || c == ' ' || c == '_' || c == '-');
-    }
-    false
-}
-
-/// P1-6 (2026-07-09): kill-switch — `ATLAS_NO_ERROR_DEDUP=1` restores
-/// verbatim duplicate-error history (disables the masking pass).
-fn error_dedup_disabled() -> bool {
-    std::env::var("ATLAS_NO_ERROR_DEDUP").as_deref() == Ok("1")
-}
-
-/// P1-6 (2026-07-09): duplicate-error observation masking.
-///
-/// Input: `(message_index, original_pre_hint_text)` for every
-/// tool-result entry, in conversation order. Output: `(message_index,
-/// replacement_text)` for the OLDER members of each duplicate-error
-/// group; the newest member of each group stays verbatim. Two
-/// tool results are duplicates when BOTH are error-shaped
-/// (`crate::hint_injector::looks_like_error`) AND either equal after
-/// trim or Jaccard >= 0.9 over 4-gram shingles (the loop_detector
-/// measure — SSOT). Successful outputs never participate: identical
-/// success observations (e.g. repeated `ls`) are legitimate.
-fn duplicate_error_masks(tool_results: &[(usize, String)]) -> Vec<(usize, String)> {
-    const NEAR_DUP_JACCARD: f64 = 0.9;
-    let errors: Vec<(usize, &str)> = tool_results
-        .iter()
-        .filter(|(_, t)| crate::hint_injector::looks_like_error(t))
-        .map(|(i, t)| (*i, t.trim()))
-        .collect();
-    if errors.len() < 2 {
-        return Vec::new();
-    }
-    let shingle_sets: Vec<_> = errors
-        .iter()
-        .map(|(_, t)| crate::loop_detector::shingle_set(t))
-        .collect();
-    // First-match grouping against each group's first member. Short
-    // errors (< 4 tokens) have empty shingle sets — jaccard() returns
-    // 0.0 for those, so they group via exact-trim match only.
-    let mut groups: Vec<Vec<usize>> = Vec::new(); // indices into `errors`
-    for i in 0..errors.len() {
-        let group = groups.iter_mut().find(|g| {
-            let rep = g[0];
-            errors[rep].1 == errors[i].1
-                || crate::loop_detector::jaccard(&shingle_sets[rep], &shingle_sets[i])
-                    >= NEAR_DUP_JACCARD
-        });
-        match group {
-            Some(g) => g.push(i),
-            None => groups.push(vec![i]),
-        }
-    }
-    let mut masks = Vec::new();
-    for g in &groups {
-        let n = g.len();
-        if n < 2 {
-            continue;
-        }
-        // Keep the LAST (newest) verbatim; mask the earlier ones.
-        for (k, &ei) in g.iter().take(n - 1).enumerate() {
-            masks.push((
-                errors[ei].0,
-                format!("[same error as below, attempt {} of {}]", k + 1, n),
-            ));
-        }
-    }
-    masks
-}
-
-#[cfg(test)]
 #[path = "msg_entry_tests.rs"]
 mod msg_entry_tests;
 
 // A sibling file rather than a module inside `msg_entry_tests.rs`: these cases
 // carried that file past the 500-LoC cap.
+#[path = "msg_entry/media.rs"]
+mod media;
 #[cfg(test)]
 #[path = "msg_entry_media_order_tests.rs"]
 mod msg_entry_media_order_tests;
+
+#[path = "msg_entry/tail.rs"]
+mod tail;

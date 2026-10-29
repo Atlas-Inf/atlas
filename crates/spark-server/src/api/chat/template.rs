@@ -346,6 +346,7 @@ mod json_message_tests {
         ];
 
         let out = super::super::msg_entry::build_msg_entries(
+            crate::api::chat::vision_admit::AdmitCtx::default(),
             None,
             None,
             &crate::api::chat::remote_image::RemoteImagePolicy::default(),

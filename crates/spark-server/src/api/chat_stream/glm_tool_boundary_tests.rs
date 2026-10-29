@@ -80,6 +80,8 @@ fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<A
     let (request_tx, _) = tokio::sync::mpsc::channel(1);
     Arc::new(AppState {
         tool_guard: Default::default(),
+        vision_budget: None,
+        vision_limits: None,
         tokenizer,
         model_name: "display-name-is-not-model-type".into(),
         adapter_name: None,
@@ -154,6 +156,7 @@ fn request() -> ir::ChatRequest {
 fn response(tokens: Vec<u32>) -> crate::api::inference_types::InferenceResponse {
     crate::api::inference_types::InferenceResponse {
         output_tokens: tokens,
+        guard_stop: None,
         finish_reason: "length".into(),
         time_to_first_token_ms: 0.0,
         decode_time_ms: 0.0,
@@ -162,7 +165,6 @@ fn response(tokens: Vec<u32>) -> crate::api::inference_types::InferenceResponse 
         cached_prompt_tokens: 0,
         accepted_prediction_tokens: 0,
         prompt_logprobs: vec![],
-        guard_stop: None,
     }
 }
 
@@ -426,5 +428,27 @@ fn blocking_refusal_prefix_keeps_content() {
     }
 }
 
+fn base64_encode(b: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in b.chunks(3) {
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            let idx = (n >> (18 - 6 * i)) & 63;
+            out.push(if i < 2 + c.len() - 1 {
+                T[idx as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
 #[path = "tool_security_tests.rs"]
 mod tool_security_tests;
+
+#[path = "vision_admission_refusal_tests.rs"]
+mod vision_admission_refusal_tests;
