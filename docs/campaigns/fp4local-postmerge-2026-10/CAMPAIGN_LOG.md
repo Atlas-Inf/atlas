@@ -1219,3 +1219,15 @@ Next (byte-exact, same MMA + per-element K order):
    bench run.
 2. Persistent work queue over (expert, M-tile) pairs instead of grid.y striding.
 3. Weight-stationary reuse across an expert's M-tiles.
+
+## 2026-10-29 — MoE prefill occupancy probe: registers bind, not smem → persistent work queue next (K2a)
+
+- Bench pitfall fixed: in multi-target builds `atlas_kernels::ptx_modules()` aliases target 0 (`build_codegen.rs`
+  ~86–95). The bench now loads the qwen3.8-flash-next target set. The production baseline re-measured there matches the
+  earlier numbers (gate_up 9.0 / 38.1 ms, down 5.5 / 22.0 ms at T = 2,900 / 19,200).
+- ptxas (sm_121a): production 39,360 B smem / 128 regs; register-capped at 4 CTAs/SM (128 regs × 128 threads). An
+  N64 tile cuts smem to 29.6 KB but stays register-capped, and the "N64" variant wasn't a real retile (the MMA unroll
+  is hard-wired for N128; the sanitizer caught the OOB). So the occupancy path is a dead end.
+- **K2a:** persistent CTAs (SMs × 4) pull (expert, M-tile, N-tile) items from a device-built, hot-expert-first work
+  list. Same tile body and per-element K order, so byte-exact. Gate: identical + sanitizer clean + gate_up ≥ 1.3× at
+  T = 2,900, with down not slower. If it wins, the per-layer expert-count readback may become removable too.
