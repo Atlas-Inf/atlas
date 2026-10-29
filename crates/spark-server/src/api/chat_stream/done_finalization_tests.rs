@@ -38,7 +38,7 @@ fn flush_sanitizer(state: &mut StreamState) -> DeltaVec {
 
 fn assert_finish_only(deltas: &[StreamDelta], expected: &str) {
     assert!(
-        matches!(deltas, [StreamDelta::Finish { reason, usage: actual, token_ids }]
+        matches!(deltas, [StreamDelta::Finish { reason, usage: actual, token_ids, guard_stop: _ }]
             if reason.as_wire() == expected && *actual == usage() && token_ids.is_empty()),
         "guard must emit metadata/finish only, got {deltas:?}"
     );

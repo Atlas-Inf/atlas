@@ -44,6 +44,11 @@ pub struct Choice {
     /// Per-token logprobs (opt-in). Only the OpenAI surface encodes
     /// these today.
     pub logprobs: Option<ChoiceLogprobs>,
+    /// #55 (Enntity/atlas 8150f896): the server-side guard that cut this
+    /// response, when one did (`ActiveSeq::guard_stop`). Surfaced as a
+    /// `guard_stop` extension field on the wire choice; the standard
+    /// finish_reason remains unchanged.
+    pub guard_stop: Option<&'static str>,
 }
 
 /// Neutral logprob report: sampled token + alternatives.

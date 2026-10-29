@@ -358,6 +358,11 @@ pub struct InferenceResponse {
     /// i+1. Empty unless requested. The handler prepends the null entry
     /// for the first prompt token (no preceding context).
     pub prompt_logprobs: Vec<TokenLogprobs>,
+    /// #55 (Enntity/atlas 8150f896): the server-side guard that cut this
+    /// response, when one did (`ActiveSeq::guard_stop`). Flows to the
+    /// blocking Choice and the final stream chunk as a `guard_stop`
+    /// extension field; the standard finish_reason is unchanged.
+    pub guard_stop: Option<&'static str>,
 }
 
 /// Events sent during streaming generation.

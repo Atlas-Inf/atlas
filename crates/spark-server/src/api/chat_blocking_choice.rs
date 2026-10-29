@@ -113,6 +113,7 @@ pub(super) fn build_choice_message(
                     tool_calls: Vec::new(),
                     refusal: None,
                     finish_reason: ir::FinishReason::ContentFilter,
+                    guard_stop: Some(atlas_tool_guard::GUARD_STOP),
                     matched_stop: None,
                     logprobs: None,
                 };
@@ -211,6 +212,7 @@ pub(super) fn build_choice_message(
         finish_reason: ir::FinishReason::from(finish_reason_i.as_str()),
         matched_stop: None, // caller fills
         logprobs: None,     // caller fills
+        guard_stop: response.guard_stop,
     }
 }
 

@@ -30,6 +30,11 @@ pub struct ChunkChoice {
     pub index: usize,
     pub delta: ChunkDelta,
     pub finish_reason: Option<String>,
+    /// #55 (Enntity/atlas 8150f896): set when a server-side guard cut this
+    /// response short. Extension field, ignored by every SDK; skipped
+    /// when absent so the default wire format stays byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guard_stop: Option<&'static str>,
     pub logprobs: Option<ChoiceLogprobs>,
     /// Exact sampled token IDs for this chunk (vLLM-compatible
     /// `return_token_ids`). Skipped when empty so the default wire
@@ -84,6 +89,7 @@ impl ChatCompletionChunk {
                     refusal: None,
                 },
                 finish_reason: None,
+                guard_stop: None,
                 logprobs: None,
                 token_ids: Vec::new(),
             }],
@@ -110,6 +116,7 @@ impl ChatCompletionChunk {
                     refusal: None,
                 },
                 finish_reason: None,
+                guard_stop: None,
                 logprobs: None,
                 token_ids: Vec::new(),
             }],
@@ -135,6 +142,7 @@ impl ChatCompletionChunk {
                     refusal: None,
                 },
                 finish_reason: None,
+                guard_stop: None,
                 logprobs: None,
                 token_ids: Vec::new(),
             }],
@@ -175,6 +183,7 @@ impl ChatCompletionChunk {
                     refusal: None,
                 },
                 finish_reason: None,
+                guard_stop: None,
                 logprobs: None,
                 token_ids: Vec::new(),
             }],
@@ -211,6 +220,7 @@ impl ChatCompletionChunk {
                     refusal: None,
                 },
                 finish_reason: None,
+                guard_stop: None,
                 logprobs: None,
                 token_ids: Vec::new(),
             }],
@@ -219,7 +229,13 @@ impl ChatCompletionChunk {
     }
 
     /// Final chunk with finish_reason, empty delta, and usage.
-    pub fn done_chunk(model: &str, id: &str, finish_reason: &str, usage: Usage) -> Self {
+    pub fn done_chunk(
+        model: &str,
+        id: &str,
+        finish_reason: &str,
+        guard_stop: Option<&'static str>,
+        usage: Usage,
+    ) -> Self {
         Self {
             id: id.to_string(),
             object: "chat.completion.chunk".to_string(),
@@ -236,6 +252,7 @@ impl ChatCompletionChunk {
                     refusal: None,
                 },
                 finish_reason: Some(finish_reason.to_string()),
+                guard_stop,
                 logprobs: None,
                 token_ids: Vec::new(),
             }],
@@ -282,6 +299,7 @@ impl ChatCompletionChunk {
                     refusal: Some(refusal),
                 },
                 finish_reason: None,
+                guard_stop: None,
                 logprobs: None,
                 token_ids: Vec::new(),
             }],
@@ -292,7 +310,12 @@ impl ChatCompletionChunk {
     /// Final chunk carrying only `finish_reason`, with `usage:null`. Used
     /// when `include_usage=true` (the usage sits in `usage_only_chunk`
     /// emitted just before this one).
-    pub fn final_chunk_no_usage(model: &str, id: &str, finish_reason: &str) -> Self {
+    pub fn final_chunk_no_usage(
+        model: &str,
+        id: &str,
+        finish_reason: &str,
+        guard_stop: Option<&'static str>,
+    ) -> Self {
         Self {
             id: id.to_string(),
             object: "chat.completion.chunk".to_string(),
@@ -309,6 +332,7 @@ impl ChatCompletionChunk {
                     refusal: None,
                 },
                 finish_reason: Some(finish_reason.to_string()),
+                guard_stop,
                 logprobs: None,
                 token_ids: Vec::new(),
             }],
