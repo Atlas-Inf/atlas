@@ -1336,3 +1336,19 @@ put the weight dequant at 31–50% and the MMA issue structure well off peak (~3
 remains: a warp-specialized producer/consumer rewrite (big; byte-exact possible), a numerics-changing native-FP4 path
 (BFCL-gated; an earlier note says it was a wash), or other prefill levers. Owner decision. Branch
 `perf/moe-prefill-occupancy` e986d79cc (local; bench + probes).
+
+## 2026-10-29 — owner: warp-specialized rewrite of the MoE prefill GEMM (W1)
+
+Design (byte-exact target), starting with the down kernel (`grouped_gemm_ptrtable_t_k64`, the simpler one):
+- Same CTA tile (M64 × N128 per (expert, M-tile, N-tile)), same grid/striding, same epilogue, same per-element MMA
+  order (`m16n8k32 e4m3`, ascending K).
+- **Producer warps** (e.g. 2): cp.async A / packed / scales for K-tile k+s, then the LUT dequant into a ring of S
+  `smem_B_fp8` stages, then signal "full[s]".
+- **Consumer warps** (4, which own the accumulators): wait "full[s]", run the MMAs for that K-tile, signal "empty[s]".
+- Sync with named barriers (`bar.sync`/`bar.arrive` with explicit ids and counts) or mbarriers if sm_121 supports them
+  cleanly. No CTA-wide `__syncthreads` in the K loop.
+- `__align__(16)` on all shared arrays; ring depth S = 2–3 within ~48 KB smem; check regs (consumers ~64 accumulator regs
+  each) and CTAs/SM.
+- Gate per kernel: identical outputs, sanitizer clean (memcheck + racecheck), ≥ 1.25× at T = 2,900, not slower at
+  19,200. Then gate_up with its 2N gate/up handling unchanged. Then wiring (+ dropping the per-layer expert-count D2H if
+  it becomes unnecessary) and the full gate (control, prefill TTFT A/B, agentic, BFCL).
