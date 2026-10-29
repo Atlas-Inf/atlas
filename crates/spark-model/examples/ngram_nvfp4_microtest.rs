@@ -45,6 +45,8 @@ fn gather(
         .arg_ptr(out)
         .arg_u32(DIM as u32)
         .arg_u32(GROUP as u32)
+        .arg_u32((DIM / 2) as u32)
+        .arg_u32((DIM / GROUP) as u32)
         .launch(0)
 }
 

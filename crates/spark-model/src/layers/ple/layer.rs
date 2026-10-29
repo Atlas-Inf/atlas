@@ -63,12 +63,14 @@ pub struct PleLayer {
     scale_va: Option<u64>,
     /// NVFP4 gather kernel (`Some` when `nvfp4` is set).
     embed_nvfp4_k: KernelHandle,
-    /// Device VA of the cache's `[slots, dim/group]` E4M3 block-scale arena.
+    /// Device VA of the cache's `[slots, dim/group]` E4M3 block-scale arena;
+    /// `None` for interleaved NVFP4 rows, which carry their own scales.
     block_scale_va: Option<u64>,
     /// Packed EXL3 n-gram rows. Host-dequanted into `emb` before the GEMM.
     trellis: Option<ngram_trellis::NgramTrellis>,
-    /// NVFP4 n-gram rows (FP4-Local): packed rows + block scales stay in the
-    /// pinned caches and decode inside `batched_embed_nvfp4`.
+    /// NVFP4 n-gram rows (FP4-Local): codes + block scales (split arenas, or
+    /// interleaved rows) stay in the pinned cache and decode inside
+    /// `batched_embed_nvfp4`.
     nvfp4: Option<ngram_nvfp4::NgramNvfp4>,
     gemm_k: KernelHandle,
     gate_k: KernelHandle,

@@ -138,8 +138,10 @@ pub fn embed_from_argmax(
         .arg_u32(hidden_size)
         .launch(stream)
 }
-/// NVFP4 n-gram gather: slots index a `[slots, dim/2]` packed-E2M1 arena and
-/// a `[slots, dim/group]` E4M3 block-scale arena. Kernel:
+/// NVFP4 n-gram gather: slots index a packed-E2M1 plane and an E4M3
+/// block-scale plane, `row_stride` and `scale_stride` bytes per slot (split
+/// arenas: `dim/2` and `dim/group`; interleaved rows: the row stride for both,
+/// `scales` just past the codes — `Nvfp4RowGeom::gather_planes`). Kernel:
 /// `embed_from_argmax.cu::batched_embed_nvfp4`.
 pub fn batched_embed_nvfp4(
     gpu: &dyn GpuBackend,
@@ -152,6 +154,8 @@ pub fn batched_embed_nvfp4(
     num_tokens: u32,
     dim: u32,
     group: u32,
+    row_stride: u32,
+    scale_stride: u32,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
@@ -164,6 +168,8 @@ pub fn batched_embed_nvfp4(
         .arg_ptr(output)
         .arg_u32(dim)
         .arg_u32(group)
+        .arg_u32(row_stride)
+        .arg_u32(scale_stride)
         .launch(stream)
 }
 

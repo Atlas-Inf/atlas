@@ -101,6 +101,14 @@ which keeps a 262K-token context. "Tracked" is the driver-accounted figure; the 
 free-memory pre-KV estimate swings by up to ±7 GB between boots of the same binary and must not be
 used for A/Bs.
 
+A miss read in place costs two NVMe reads, one per tensor (codes, scales). `ATLAS_PLE_PACKED_DIR=<dir>`
+(off by default) packs the table once into a 28.8 GB copy of 96-byte rows (80 B codes, 10 B scales,
+6 B pad) under `<dir>`, never the checkpoint directory, and serves that: one read per miss,
+bit-identical rows. Every open checks the copy's identity (source names, sizes, mtimes, inodes,
+offsets), one row per shard against the checkpoint and 16 random CRC32 chunks
+(`ATLAS_PLE_PACKED_VERIFY=full`: all 1,221), and rebuilds it when stale. `ATLAS_PLE_CACHE_GB` then
+counts 96 B per slot. `ATLAS_PLE_RESIDENT=1` takes precedence and ignores it.
+
 ## 5. Serve configuration that was benchmarked
 
 Existing default-off qwen4_exp levers were swept on FP4-Local (fresh boot per config; decode-floor =

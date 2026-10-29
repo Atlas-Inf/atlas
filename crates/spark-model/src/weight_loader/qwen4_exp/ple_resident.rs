@@ -36,6 +36,7 @@ pub(super) fn load(
         "ATLAS_PLE_CACHE_GB",
         "ATLAS_PLE_CACHE_SLOTS",
         "ATLAS_PLE_NVME_KEEPALIVE_MS",
+        "ATLAS_PLE_PACKED_DIR",
     ] {
         if std::env::var_os(env).is_some() {
             tracing::warn!("PLE resident: {env} is set and ignored (no row cache)");
@@ -162,6 +163,8 @@ fn self_check(
         check.len() as u32,
         geom.dim as u32,
         geom.group as u32,
+        geom.packed_stride() as u32,
+        geom.scale_stride() as u32,
         stream,
     )?;
     let mut got = vec![0u8; check.len() * geom.dim * 2];

@@ -300,9 +300,13 @@ pub(super) fn load(
         );
     }
 
-    let slot_bytes = head_dim * elem + nvfp4::scale_stride(store, &lp, dtype);
+    // `ATLAS_PLE_PACKED_DIR`: NVFP4 codes and scales through one interleaved copy.
+    let packed = nvfp4.as_ref().zip(nvfp4::packed_dir_from_env());
+    let slot_bytes = nvfp4::slot_bytes(nvfp4.as_ref(), packed.is_some(), head_dim * elem);
     let (slots, slots_from) = slots_from_env(span, heads, slot_bytes);
-    let mut cache = if single.is_some() {
+    let mut cache = if let Some((nv, dir)) = &packed {
+        nvfp4::open_packed(nv, &shards, rows_per as u64, dir, slots)
+    } else if single.is_some() {
         let (path, off) = &shards[0];
         spark_storage::NgramRowCache::open_at(
             path,
@@ -332,7 +336,7 @@ pub(super) fn load(
         );
     }
 
-    if let Some(nv) = &nvfp4 {
+    if let Some(nv) = nvfp4.as_ref().filter(|_| packed.is_none()) {
         // The block scales ride the same cache: one arena pair, one CLOCK.
         cache.attach_segmented_block_scales(&nv.scale_shards, nv.geom.scale_stride())?;
     }
