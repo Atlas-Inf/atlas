@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+mod build_glm_kda;
+
 fn main() {
     println!("cargo:rerun-if-env-changed=ATLAS_SKIP_BUILD");
     println!("cargo:rerun-if-env-changed=ATLAS_TARGET_HW");
+    println!("cargo:rerun-if-env-changed=ATLAS_TARGET_MODEL");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUTLASS_HOME");
     println!("cargo:rerun-if-env-changed=FLASHINFER_HOME");
     println!("cargo:rerun-if-env-changed=ATLAS_CUDA_ARCH");
@@ -23,6 +27,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(atlas_hip)");
     println!("cargo:rustc-check-cfg=cfg(atlas_cutlass)");
     println!("cargo:rustc-check-cfg=cfg(atlas_flashinfer)");
+    println!("cargo:rustc-check-cfg=cfg(atlas_glm_kda)");
     if std::env::var("ATLAS_TARGET_HW")
         .as_deref()
         .map(|hw| hw.starts_with("strix"))
@@ -96,7 +101,13 @@ fn main() {
     println!("cargo:rustc-link-search=native=/usr/lib/aarch64-linux-gnu");
 
     if let Some(cutlass_home) = std::env::var_os("CUTLASS_HOME") {
-        build_cutlass_object(std::path::PathBuf::from(cutlass_home));
+        let cutlass_home = std::path::PathBuf::from(cutlass_home);
+        build_cutlass_object(cutlass_home.clone());
+        let hardware = std::env::var("ATLAS_TARGET_HW").unwrap_or_else(|_| "gb10".into());
+        let model = std::env::var("ATLAS_TARGET_MODEL").unwrap_or_else(|_| "*".into());
+        if build_glm_kda::selected(&hardware, &model) {
+            build_glm_kda::build(&cutlass_home);
+        }
     }
 
     if let Some(fi_home) = std::env::var_os("FLASHINFER_HOME") {

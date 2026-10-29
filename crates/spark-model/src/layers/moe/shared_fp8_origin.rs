@@ -38,7 +38,16 @@ impl SharedFp8Origin {
     }
 }
 
-fn source_is_bf16(store: &WeightStore, prefix: &str, n: usize, k: usize) -> Result<bool> {
+/// Whether `quantized_any` will DERIVE this shared projection's NVFP4 at load
+/// (`true`: a BF16 source, or FP4-Local's FP8 one, requantized) rather than
+/// hand back the checkpoint's own packed NVFP4 (`false`). Anything else, or
+/// any mismatch of geometry, dtype or markers, is refused.
+fn source_is_runtime_quantized(
+    store: &WeightStore,
+    prefix: &str,
+    n: usize,
+    k: usize,
+) -> Result<bool> {
     anyhow::ensure!(
         matches!((n, k), (2048, 4096) | (4096, 2048)),
         "shared FP8 origin requires exact GU/down geometry"
@@ -74,7 +83,36 @@ fn source_is_bf16(store: &WeightStore, prefix: &str, n: usize, k: usize) -> Resu
         super::m5_projections::span(tensor.ptr, bytes, 16)?;
         return Ok(true);
     }
-    // Native NVFP4 remains allowed, but not an FP8-source re-quantization path.
+    // nvidia GLM-5.3-Flash-FP4-Local: E4M3 `[n, k]` with FP8_PB_WO's F32
+    // 128x128 grid (or MXFP8's UE8M0 per 32). `quantized_any` routes it
+    // through `quantized_from_fp8` (FP8 -> BF16 -> NVFP4), the same runtime
+    // requantization a BF16 source gets, so it is derived like one.
+    if !has_packed
+        && let Ok(weight) = store.get(&format!("{prefix}.weight"))
+        && weight.dtype == WeightDtype::FP8E4M3
+    {
+        for marker in ["weight_scale_inv", "weight_scale_2", "weight_global_scale"] {
+            anyhow::ensure!(
+                !has(marker),
+                "shared FP8 E4M3 source has unexpected {marker}"
+            );
+        }
+        let scale = store.get(&format!("{prefix}.weight_scale"))?;
+        let block = scale.dtype == WeightDtype::FP32
+            && crate::weight_map::block_scale_grid(&scale.shape)
+                .is_some_and(|(sn, sk)| n.is_multiple_of(sn) && k.is_multiple_of(sk));
+        anyhow::ensure!(
+            weight.shape == [n, k]
+                && (block || crate::weight_map::mxfp8_geometry(store, prefix)?.is_some()),
+            "shared FP8 E4M3 source must be [{n},{k}] with an FP8 block or MXFP8 scale, \
+             got {:?} + {:?} {:?}",
+            weight.shape,
+            scale.dtype,
+            scale.shape
+        );
+        return Ok(true);
+    }
+    // Native NVFP4 remains allowed.
     anyhow::ensure!(!has_inv && has_scale, "shared FP8 native source markers");
     let weight = store.get(&format!(
         "{prefix}.{}",
@@ -131,7 +169,7 @@ pub(super) fn load_with_origin(
         );
     }
     let derived_bf16 = if track {
-        source_is_bf16(store, prefix, n, k)?
+        source_is_runtime_quantized(store, prefix, n, k)?
     } else {
         false
     };

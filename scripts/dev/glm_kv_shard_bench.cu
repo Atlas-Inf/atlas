@@ -1,26 +1,27 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Standalone check of the ATLAS_GLM_KV_SHARD merge-form attention kernels
-// (one verify owner of `rows` rows x 32 heads over 2051 selected tokens of a
-// `ctx`-token fp8_g128 history), three ways:
+// Standalone check of the merge-form attention kernels (one verify owner of
+// `rows` rows x 32 heads over 2051 selected tokens of a `ctx`-token fp8_g128
+// history), three ways:
 //
-//   U   unsharded: the split kernel over the full pool + the BF16 merge;
-//   S0  sharded (ATLAS_GLM_KV_SHARD=1): both ranks localize the selection
-//       (the peer's tokens become -1), attend both ranks' heads over the
-//       tokens they store, FP32-merge the peer's heads' partial, and merge;
-//   S1  S0 with ATLAS_GLM_KV_SHARD_COMPACT=1: compacted ids + per-row
-//       counts, counted split kernels, and the peer's partial merged where
-//       it landed (no copies).
+//   U   the unsharded kernels before the canonical form: the split kernel
+//       over the full pool + the BF16 merge;
+//   C   the canonical form an unsharded TP pair runs now: the selection split
+//       by the shard's ownership rule (glm_kv_canonical_partition), both
+//       groups' counted splits in one launch, and the paired merge;
+//   S   sharded (ATLAS_GLM_KV_SHARD=1): both ranks pack the ids they store
+//       (glm_kv_shard_localize_compact), attend both ranks' heads over them
+//       with the counted split, FP32-merge the peer's heads' partial, and
+//       merge it where it landed as the last partition.
 //
 // Both ranks are simulated on one GPU (two half pools); the exchanges are
 // plain device copies and are NOT part of what is timed as "kernels". Checks,
 // for BOTH ranks' heads (exit status = failed checks):
-//   - the localized ids of glm_kv_shard_localize against the ownership rule
-//     on the CPU, and glm_kv_shard_localize_compact against them (the same
-//     owned ids in the same order at the front, their count, -1 behind);
+//   - the packed ids of glm_kv_shard_localize_compact and of
+//     glm_kv_canonical_partition against the ownership rule on the CPU;
+//   - C against S: BF16 outputs and merged LSEs bitwise equal;
 //   - each pipeline against a double-precision CPU softmax attention over
 //     the same dequantized latents (the exact merge of its FP32 partials, and
-//     its BF16 output), and S0/S1 against U and each other;
-//   - the in-place merge against copy + merge of the same partials, bitwise.
+//     its BF16 output).
 // Then times one rank's kernels per layer: `reps` layers are enqueued per
 // synchronize (the GPU on the bench host is time-sliced with live services,
 // so a single launch mostly measures the slice), the three pipelines are
@@ -29,11 +30,11 @@
 // of the two exchanged payloads into device-mapped pinned host memory.
 //
 //   nvcc -arch=sm_121a -O3 --fmad=false -I kernels/gb10/glm-5.3-flash/nvfp4 \
-//        scripts/dev/glm_kv_shard_bench.cu -o kv_shard_bench
+//        scripts/dev/glm_kv_shard_bench.cu -o kv_shard_bench   # KERNEL.toml flags
 //   ./kv_shard_bench [rows=8] [ctx=65536] [iters=40] [skew=50] [reps=50] [causal=-1]
 // `skew` = percent of the selection stored by rank 0. `causal` >= 0 takes the
 // dense-exact form of sequences up to 2048 tokens instead: no selection (the
-// shard kernels generate causal ids, row r = tokens [0, causal + r + 1));
+// merge-form kernels generate causal ids, row r = tokens [0, causal + r + 1));
 // `causal` + rows <= 16 leaves rank 1 owning nothing. Device memory: the
 // history twice (full + two halves), ~70 MB per 64K tokens.
 #include "glm_sparse_prefill_kv_reuse.cu"
@@ -75,9 +76,11 @@ static unsigned split_count(unsigned rows) {
     }
     return best;
 }
-// merge_splits (crates/spark-model/src/layers/glm_kv_shard.rs).
-static unsigned merge_splits(unsigned rows) {
-    return std::min(std::min(split_count(rows), 15u), std::max(192u / rows, 1u));
+// MERGE_SPLITS (crates/spark-model/src/layers/glm_kv_shard.rs), the same for
+// every row count; the environment's MERGE_SPLITS=n (2..15) times another.
+static unsigned merge_splits(unsigned) {
+    const char* v = getenv("MERGE_SPLITS");
+    return v ? (unsigned)atoi(v) : 4u;
 }
 
 template <class T> static T* dalloc(size_t n) { T* p; CK(cudaMalloc(&p, n * sizeof(T))); return p; }
@@ -85,10 +88,18 @@ template <class T> static T* dalloc(size_t n) { T* p; CK(cudaMalloc(&p, n * size
 struct Rank {
     unsigned char* pool;            // this rank's half pool
     __nv_bfloat16 *q_own, *q_peer;  // [rows, 32, 512]
-    int* ids;                       // [rows, 2051] localized
+    int* ids;                       // [rows, 2051] localized and packed
     unsigned* counts;               // [rows]
     float *own_o, *own_lse, *peer_o, *peer_lse, *send, *recv, *out_lse;
     __nv_bfloat16* out;             // [rows, 32, 512]
+};
+
+// The canonical form's buffers for one rank's heads over the full pool.
+struct Canonical {
+    int *own, *peer;                // [rows, 2051] packed global ids
+    unsigned *own_counts, *peer_counts;
+    float *own_o, *own_lse, *peer_o, *peer_lse, *extra, *out_lse;
+    __nv_bfloat16* out;
 };
 
 struct Env {
@@ -113,18 +124,14 @@ static void partials(bool counted, const __nv_bfloat16* q, const void* pool, con
 
 // One rank's launches up to the partial it sends (the peer's heads over this
 // rank's tokens), as glm_shard_merge_attention orders them.
-static void shard_first_half(const Env& e, Rank& r, bool compact) {
-    if (compact)
-        glm_kv_shard_localize_compact<<<e.rows, 256>>>(e.selected, r.ids, r.counts, e.table,
-            e.rows, WIDTH, BS, e.rank_id, 2, e.causal_start);
-    else
-        glm_kv_shard_localize<<<dim3((WIDTH + 255) / 256, e.rows), 256>>>(e.selected, r.ids,
-            e.table, e.rows, WIDTH, BS, e.rank_id, 2, e.causal_start);
+static void shard_first_half(const Env& e, Rank& r) {
+    glm_kv_shard_localize_compact<<<e.rows, 256>>>(e.selected, r.ids, r.counts, e.table, e.rows,
+                                                   WIDTH, BS, e.rank_id, 2, e.causal_start);
     if (e.splits == 1) {
-        partials(compact, r.q_peer, r.pool, r.ids, e.identity, r.counts, e.rows, 1, r.send,
+        partials(true, r.q_peer, r.pool, r.ids, e.identity, r.counts, e.rows, 1, r.send,
                  r.send + e.part / 4);
     } else {
-        partials(compact, r.q_peer, r.pool, r.ids, e.identity, r.counts, e.rows, e.splits,
+        partials(true, r.q_peer, r.pool, r.ids, e.identity, r.counts, e.rows, e.splits,
                  r.peer_o, r.peer_lse);
         glm_sparse_decode_split_merge_f32<<<e.rows * HEADS, 256>>>(r.peer_o, r.peer_lse, r.send,
             r.send + e.part / 4, e.rows, HEADS, DIM, e.splits);
@@ -132,20 +139,31 @@ static void shard_first_half(const Env& e, Rank& r, bool compact) {
 }
 
 // ...and from the peer's partial (already in `recv`) to the BF16 output.
-static void shard_second_half(const Env& e, Rank& r, bool compact) {
-    partials(compact, r.q_own, r.pool, r.ids, e.identity, r.counts, e.rows, e.splits, r.own_o,
+static void shard_second_half(const Env& e, Rank& r) {
+    partials(true, r.q_own, r.pool, r.ids, e.identity, r.counts, e.rows, e.splits, r.own_o,
              r.own_lse);
-    if (compact) {
-        glm_sparse_decode_split_merge_extra<<<e.rows * HEADS, 256>>>(r.own_o, r.own_lse, r.out,
-            r.out_lse, e.rows, HEADS, DIM, e.splits, r.recv);
-    } else {
-        CK(cudaMemcpyAsync((char*)r.own_o + e.splits * e.part, r.recv, e.part,
-                           cudaMemcpyDeviceToDevice, 0));
-        CK(cudaMemcpyAsync((char*)r.own_lse + e.splits * e.lse, (char*)r.recv + e.part, e.lse,
-                           cudaMemcpyDeviceToDevice, 0));
-        glm_sparse_decode_split_merge<<<e.rows * HEADS, 256>>>(r.own_o, r.own_lse, r.out,
-            r.out_lse, e.rows, HEADS, DIM, e.splits + 1);
-    }
+    glm_sparse_decode_split_merge_extra<<<e.rows * HEADS, 256>>>(r.own_o, r.own_lse, r.out,
+        r.out_lse, e.rows, HEADS, DIM, e.splits, r.recv);
+}
+
+// The canonical form of rank `e.rank_id`'s heads over the full pool through
+// the sequence's own table (glm_sparse_canonical.rs); `stages` bit 0 = the
+// partition, 1 = the paired split, 2 = the paired merge (the timing breakdown).
+static void canonical(const Env& e, const __nv_bfloat16* q, const void* pool, Canonical& c,
+                      unsigned stages = 7) {
+    if (stages & 1)
+        glm_kv_canonical_partition<<<e.rows, 256>>>(e.selected, c.own, c.own_counts, c.peer,
+            c.peer_counts, e.rows, WIDTH, BS, e.rank_id, e.causal_start);
+    float* peer_o = e.splits == 1 ? c.extra : c.peer_o;
+    float* peer_lse = e.splits == 1 ? c.extra + e.part / 4 : c.peer_lse;
+    if (stages & 2)
+    glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split_counted_pair<<<dim3(1, e.rows,
+        2 * e.splits), 256, SMEM>>>(q, pool, pool, c.own, nullptr, e.table, e.rows, HEADS, DIM,
+        WIDTH, BS, 0.0625f, c.own_o, c.own_lse, c.own_counts, c.peer, peer_o, peer_lse,
+        c.peer_counts, q);
+    if (stages & 4)
+    glm_sparse_decode_split_merge_pair<<<e.rows * HEADS, 256>>>(c.own_o, c.own_lse, c.out,
+        c.out_lse, e.rows, HEADS, DIM, e.splits, c.peer_o, c.peer_lse, c.extra);
 }
 
 static double now_us() {
@@ -266,6 +284,7 @@ int main(int argc, char** argv) {
     const size_t part = (size_t)rows * HEADS * DIM * 4, lse = (size_t)rows * HEADS * 4;
     const size_t qn = (size_t)rows * HEADS * DIM;
     Rank rk[2];
+    Canonical cn[2];
     __nv_bfloat16* d_q[2];
     for (int i = 0; i < 2; ++i) {
         d_q[i] = dalloc<__nv_bfloat16>(qn);
@@ -280,14 +299,26 @@ int main(int argc, char** argv) {
         CK(cudaMemcpy(r.q_peer, d_q[1 - i], qn * 2, cudaMemcpyDeviceToDevice));
         r.ids = dalloc<int>(rows * WIDTH);
         r.counts = dalloc<unsigned>(rows);
-        r.own_o = dalloc<float>((splits + 1) * part / 4);
-        r.own_lse = dalloc<float>((splits + 1) * lse / 4);
+        r.own_o = dalloc<float>(splits * part / 4);
+        r.own_lse = dalloc<float>(splits * lse / 4);
         r.peer_o = dalloc<float>(splits * part / 4);
         r.peer_lse = dalloc<float>(splits * lse / 4);
         r.send = dalloc<float>((part + lse) / 4);
         r.recv = dalloc<float>((part + lse) / 4);
         r.out_lse = dalloc<float>(lse / 4);
         r.out = dalloc<__nv_bfloat16>(qn);
+        Canonical& c = cn[i];
+        c.own = dalloc<int>(rows * WIDTH);
+        c.peer = dalloc<int>(rows * WIDTH);
+        c.own_counts = dalloc<unsigned>(rows);
+        c.peer_counts = dalloc<unsigned>(rows);
+        c.own_o = dalloc<float>(splits * part / 4);
+        c.own_lse = dalloc<float>(splits * lse / 4);
+        c.peer_o = dalloc<float>(splits * part / 4);
+        c.peer_lse = dalloc<float>(splits * lse / 4);
+        c.extra = dalloc<float>((part + lse) / 4);
+        c.out_lse = dalloc<float>(lse / 4);
+        c.out = dalloc<__nv_bfloat16>(qn);
     }
     float* u_o = dalloc<float>(splits_u * part / 4);
     float* u_lse = dalloc<float>(splits_u * lse / 4);
@@ -297,6 +328,8 @@ int main(int argc, char** argv) {
     CK(cudaFuncSetAttribute(glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split,
                             cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
     CK(cudaFuncSetAttribute(glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split_counted,
+                            cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
+    CK(cudaFuncSetAttribute(glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split_counted_pair,
                             cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
 
     auto unsharded = [&](int rank) {
@@ -309,11 +342,11 @@ int main(int argc, char** argv) {
         env[i] = Env{rows, splits, i, causal >= 0 ? nullptr : d_selected,
                      (unsigned)std::max(causal, 0), d_table, d_identity, part, lse};
     // Both ranks of one sharded layer, with the partial exchange as a copy.
-    auto sharded = [&](bool compact) {
-        for (int i = 0; i < 2; ++i) shard_first_half(env[i], rk[i], compact);
+    auto sharded = [&] {
+        for (int i = 0; i < 2; ++i) shard_first_half(env[i], rk[i]);
         for (int i = 0; i < 2; ++i)
             CK(cudaMemcpyAsync(rk[i].recv, rk[1 - i].send, part + lse, cudaMemcpyDeviceToDevice, 0));
-        for (int i = 0; i < 2; ++i) shard_second_half(env[i], rk[i], compact);
+        for (int i = 0; i < 2; ++i) shard_second_half(env[i], rk[i]);
     };
     auto fetch = [&](const __nv_bfloat16* p) {
         std::vector<unsigned short> h(qn);
@@ -322,7 +355,7 @@ int main(int argc, char** argv) {
     };
 
     // FP32 partials of one pipeline for one rank's heads: its own `n` splits
-    // and (sharded) the peer's merged partial.
+    // and (canonical, sharded) the other group's merged partial.
     struct Parts { std::vector<float> o, l; };
     auto fetch_f = [&](const float* p, size_t floats) {
         std::vector<float> h(floats);
@@ -334,74 +367,87 @@ int main(int argc, char** argv) {
         CK(cudaMemcpy(h.data(), p, h.size() * 4, cudaMemcpyDeviceToHost));
         return h;
     };
+    auto fetch_u = [&](const unsigned* p) {
+        std::vector<unsigned> h(rows);
+        CK(cudaMemcpy(h.data(), p, rows * 4, cudaMemcpyDeviceToHost));
+        return h;
+    };
     const size_t rh = (size_t)rows * HEADS;
 
     // ---- Correctness: both ranks' heads, all three pipelines vs the CPU. ----
-    std::vector<unsigned short> out_u[2], out_s0[2], out_s1[2];
-    Parts pu[2], ps0[2], ps1[2];
-    std::vector<float> peer_s0[2], peer_s1[2];
-    std::vector<int> ids_s0[2], ids_s1[2];
-    std::vector<unsigned> counts[2];
+    std::vector<unsigned short> out_u[2], out_c[2], out_s[2];
+    Parts pu[2], pc[2], ps[2];
+    std::vector<float> extra_c[2], peer_s[2], lse_c[2], lse_s[2];
+    std::vector<int> ids_s[2], own_c[2], peer_c[2];
+    std::vector<unsigned> counts[2], own_counts[2], peer_counts[2];
     for (int i = 0; i < 2; ++i) {
         unsharded(i); CK(cudaDeviceSynchronize());
         out_u[i] = fetch(u_out);
         pu[i] = Parts{fetch_f(u_o, splits_u * rh * DIM), fetch_f(u_lse, splits_u * rh)};
+        canonical(env[i], d_q[i], d_full, cn[i]); CK(cudaDeviceSynchronize());
+        out_c[i] = fetch(cn[i].out);
+        lse_c[i] = fetch_f(cn[i].out_lse, rh);
+        pc[i] = Parts{fetch_f(cn[i].own_o, splits * rh * DIM), fetch_f(cn[i].own_lse, splits * rh)};
+        extra_c[i] = fetch_f(cn[i].extra, rh * (DIM + 1));
+        own_c[i] = fetch_ids(cn[i].own);
+        peer_c[i] = fetch_ids(cn[i].peer);
+        own_counts[i] = fetch_u(cn[i].own_counts);
+        peer_counts[i] = fetch_u(cn[i].peer_counts);
     }
-    sharded(false); CK(cudaDeviceSynchronize());
+    sharded(); CK(cudaDeviceSynchronize());
     for (int i = 0; i < 2; ++i) {
-        out_s0[i] = fetch(rk[i].out);
-        ps0[i] = Parts{fetch_f(rk[i].own_o, splits * rh * DIM), fetch_f(rk[i].own_lse, splits * rh)};
-        peer_s0[i] = fetch_f(rk[i].recv, rh * (DIM + 1));
-        ids_s0[i] = fetch_ids(rk[i].ids);
-    }
-    sharded(true); CK(cudaDeviceSynchronize());
-    bool extra_same = true;
-    for (int i = 0; i < 2; ++i) {
-        out_s1[i] = fetch(rk[i].out);
-        ps1[i] = Parts{fetch_f(rk[i].own_o, splits * rh * DIM), fetch_f(rk[i].own_lse, splits * rh)};
-        peer_s1[i] = fetch_f(rk[i].recv, rh * (DIM + 1));
-        ids_s1[i] = fetch_ids(rk[i].ids);
-        counts[i].resize(rows);
-        CK(cudaMemcpy(counts[i].data(), rk[i].counts, rows * 4, cudaMemcpyDeviceToHost));
-        // The in-place merge against copying the partial behind the own
-        // partitions and merging splits + 1 (what S0 does): same bits.
-        CK(cudaMemcpy((char*)rk[i].own_o + splits * part, rk[i].recv, part, cudaMemcpyDeviceToDevice));
-        CK(cudaMemcpy((char*)rk[i].own_lse + splits * lse, (char*)rk[i].recv + part, lse,
-                      cudaMemcpyDeviceToDevice));
-        glm_sparse_decode_split_merge<<<rows * HEADS, 256>>>(rk[i].own_o, rk[i].own_lse, u_out,
-            u_out_lse, rows, HEADS, DIM, splits + 1);
-        CK(cudaDeviceSynchronize());
-        extra_same = extra_same && fetch(u_out) == out_s1[i];
+        out_s[i] = fetch(rk[i].out);
+        lse_s[i] = fetch_f(rk[i].out_lse, rh);
+        ps[i] = Parts{fetch_f(rk[i].own_o, splits * rh * DIM), fetch_f(rk[i].own_lse, splits * rh)};
+        peer_s[i] = fetch_f(rk[i].recv, rh * (DIM + 1));
+        ids_s[i] = fetch_ids(rk[i].ids);
+        counts[i] = fetch_u(rk[i].counts);
     }
     CK(cudaGetLastError());
 
-    // The localized ids: glm_kv_shard_localize against the ownership rule,
-    // and glm_kv_shard_localize_compact against glm_kv_shard_localize.
-    bool localize_ok = true, compact_ok = true;
+    // The packed ids against the ownership rule: the shard's local ids of the
+    // tokens each rank stores, and the canonical form's global ids of the
+    // tokens rank i would store (own) and its peer would (peer).
+    auto packed_ok = [&](const int* got, unsigned count, const std::vector<int>& want) {
+        return count == want.size() && std::equal(want.begin(), want.end(), got)
+            && std::all_of(got + want.size(), got + WIDTH, [](int v) { return v == -1; });
+    };
+    bool compact_ok = true, partition_ok = true;
     unsigned empty_rows = 0;
     for (unsigned i = 0; i < 2; ++i) {
         for (unsigned r = 0; r < rows; ++r) {
-            std::vector<int> owned;
+            std::vector<int> local, mine, theirs;
             for (unsigned j = 0; j < WIDTH; ++j) {
                 const int t = selected[r * WIDTH + j];
-                const unsigned block = t >= 0 ? table[(unsigned)t / BS] : ~0u;
-                const int want = t >= 0 && block % 2 == i ? (int)((block / 2) * BS + (unsigned)t % BS) : -1;
-                localize_ok = localize_ok && ids_s0[i][r * WIDTH + j] == want;
-                if (want >= 0) owned.push_back(want);
+                if (t < 0) continue;
+                const unsigned block = table[(unsigned)t / BS];
+                if (block % 2 == i) local.push_back((int)((block / 2) * BS + (unsigned)t % BS));
+                ((unsigned)t / BS % 2 == i ? mine : theirs).push_back(t);
             }
-            const int* got = &ids_s1[i][r * WIDTH];
-            compact_ok = compact_ok && counts[i][r] == owned.size()
-                && std::equal(owned.begin(), owned.end(), got)
-                && std::all_of(got + owned.size(), got + WIDTH, [](int v) { return v == -1; });
-            empty_rows += owned.empty();
+            compact_ok = compact_ok && packed_ok(&ids_s[i][r * WIDTH], counts[i][r], local);
+            partition_ok = partition_ok && packed_ok(&own_c[i][r * WIDTH], own_counts[i][r], mine)
+                && packed_ok(&peer_c[i][r * WIDTH], peer_counts[i][r], theirs);
+            empty_rows += local.empty();
         }
     }
-    printf("rows=%u ctx=%u splits U=%u shard=%u skew=%u%% causal=%d counts[0]: rank0=%u rank1=%u "
-           "(of %u); rows a rank owns nothing of: %u\n", rows, ctx, splits_u, splits, skew, causal,
-           counts[0][0], counts[1][0], WIDTH, empty_rows);
-    printf("localized ids vs the ownership rule: %s; compact vs localize (stable pack + counts): %s\n",
-           localize_ok ? "ok" : "MISMATCH", compact_ok ? "ok" : "MISMATCH");
-    unsigned failed = !localize_ok + !compact_ok + !extra_same;
+    printf("rows=%u ctx=%u splits U=%u merge form=%u skew=%u%% causal=%d counts[0]: rank0=%u "
+           "rank1=%u (of %u); rows a rank owns nothing of: %u\n", rows, ctx, splits_u, splits,
+           skew, causal, counts[0][0], counts[1][0], WIDTH, empty_rows);
+    printf("packed ids vs the ownership rule: shard %s, canonical %s\n",
+           compact_ok ? "ok" : "MISMATCH", partition_ok ? "ok" : "MISMATCH");
+    unsigned failed = !compact_ok + !partition_ok;
+
+    for (unsigned i = 0; i < 2; ++i) {
+        const bool out_same = out_c[i] == out_s[i];
+        const bool lse_same = memcmp(lse_c[i].data(), lse_s[i].data(), rh * 4) == 0;
+        const bool parts_same = memcmp(pc[i].o.data(), ps[i].o.data(), pc[i].o.size() * 4) == 0
+            && memcmp(pc[i].l.data(), ps[i].l.data(), pc[i].l.size() * 4) == 0
+            && memcmp(extra_c[i].data(), peer_s[i].data(), extra_c[i].size() * 4) == 0;
+        printf("rank %u heads: canonical vs shard: BF16 output %s, LSE %s, FP32 partials %s\n", i,
+               out_same ? "bitwise equal" : "DIFFERS", lse_same ? "bitwise equal" : "DIFFERS",
+               parts_same ? "bitwise equal" : "DIFFER");
+        failed += !out_same + !lse_same + !parts_same;
+    }
 
     for (unsigned i = 0; i < 2; ++i) {
         std::vector<unsigned short> ref(qn);
@@ -446,44 +492,41 @@ int main(int argc, char** argv) {
             }
         }
         ref_rms = sqrt(ref_rms / qn);
-        auto parts_error = [&](const Parts& p, unsigned n, const std::vector<float>* peer) {
+        auto parts_error = [&](const Parts& p, unsigned n, const std::vector<float>* other) {
             std::vector<const float*> o, l;
             for (unsigned s = 0; s < n; ++s) {
                 o.push_back(&p.o[s * rh * DIM]);
                 l.push_back(&p.l[s * rh]);
             }
-            if (peer) { o.push_back(peer->data()); l.push_back(peer->data() + rh * DIM); }
+            if (other) { o.push_back(other->data()); l.push_back(other->data() + rh * DIM); }
             return merged_error(o, l, rh, ref_d);
         };
         const double eu = parts_error(pu[i], splits_u, nullptr);
-        const double e0 = parts_error(ps0[i], splits, &peer_s0[i]);
-        const double e1 = parts_error(ps1[i], splits, &peer_s1[i]);
+        const double ec = parts_error(pc[i], splits, &extra_c[i]);
+        const double es = parts_error(ps[i], splits, &peer_s[i]);
         printf("rank %u heads: FP32 partials, exact merge, max abs error vs CPU double attention "
-               "(output rms %.4f): U=%.3e S0=%.3e S1=%.3e\n", i, ref_rms, eu, e0, e1);
-        const Diff du = diff(out_u[i], ref), d0 = diff(out_s0[i], ref), d1 = diff(out_s1[i], ref);
+               "(output rms %.4f): U=%.3e C=%.3e S=%.3e\n", i, ref_rms, eu, ec, es);
+        const Diff du = diff(out_u[i], ref), dc = diff(out_c[i], ref), ds = diff(out_s[i], ref);
         printf("rank %u heads: BF16 output vs bf16(CPU double): max abs / differing of %zu: "
-               "U=%.3e/%zu S0=%.3e/%zu S1=%.3e/%zu\n", i, qn, du.max, du.count, d0.max, d0.count,
-               d1.max, d1.count);
-        const Diff a0 = diff(out_s0[i], out_u[i]), a1 = diff(out_s1[i], out_u[i]),
-                   a2 = diff(out_s1[i], out_s0[i]);
-        printf("rank %u heads: BF16 output pairs: S0 vs U=%.3e/%zu  S1 vs U=%.3e/%zu  "
-               "S1 vs S0=%.3e/%zu\n", i, a0.max, a0.count, a1.max, a1.count, a2.max, a2.count);
+               "U=%.3e/%zu C=%.3e/%zu S=%.3e/%zu\n", i, qn, du.max, du.count, dc.max, dc.count,
+               ds.max, ds.count);
+        const Diff a = diff(out_c[i], out_u[i]);
+        printf("rank %u heads: BF16 output C vs U (the unsharded bits that move): %.3e/%zu\n", i,
+               a.max, a.count);
         // The kernels round each probability to BF16, so allow 2% of the
         // output rms before the output's own rounding and two BF16 ulps of
         // the largest value after it. `!(x <= tol)` also fails a NaN.
         const double tol = 0.02 * ref_rms, tol_bf16 = tol + ref_max / 64.0;
-        for (double e : {eu, e0, e1}) failed += !(e <= tol);
-        for (double e : {du.max, d0.max, d1.max}) failed += !(e <= tol_bf16);
+        for (double e : {eu, ec, es}) failed += !(e <= tol);
+        for (double e : {du.max, dc.max, ds.max}) failed += !(e <= tol_bf16);
     }
-    printf("merge_extra vs copy + merge of the same partials (both ranks): %s\n",
-           extra_same ? "bitwise equal" : "DIFFERS");
     printf("CHECK %s (%u failed)\n", failed ? "FAIL" : "PASS", failed);
     if (iters == 0) return (int)failed;
 
     // ---- Timing: one rank's kernels per MLA layer, pipelines interleaved. ----
-    auto rank_layer = [&](bool compact) {
-        shard_first_half(env[0], rk[0], compact);
-        shard_second_half(env[0], rk[0], compact);
+    auto rank_layer = [&] {
+        shard_first_half(env[0], rk[0]);
+        shard_second_half(env[0], rk[0]);
     };
     auto timed = [&](auto&& launches) {
         const double t0 = now_us();
@@ -491,18 +534,32 @@ int main(int argc, char** argv) {
         CK(cudaDeviceSynchronize());
         return (now_us() - t0) / reps;
     };
-    std::vector<double> tu, ts0, ts1;
+    std::vector<double> tu, tc, ts;
     for (unsigned i = 0; i < iters + 2; ++i) {
         const double a = timed([&] { unsharded(0); });
-        const double b = timed([&] { rank_layer(false); });
-        const double c = timed([&] { rank_layer(true); });
-        if (i >= 2) { tu.push_back(a); ts0.push_back(b); ts1.push_back(c); }
+        const double b = timed([&] { canonical(env[0], d_q[0], d_full, cn[0]); });
+        const double c = timed([&] { rank_layer(); });
+        if (i >= 2) { tu.push_back(a); tc.push_back(b); ts.push_back(c); }
     }
-    printf("kernel us per layer, min (median) of %u x %u: U=%.1f (%.1f)  S0=%.1f (%.1f)  "
-           "S1=%.1f (%.1f)\n", iters, reps, lowest(tu), median(tu), lowest(ts0), median(ts0),
-           lowest(ts1), median(ts1));
-    printf("shard kernel cost per layer over U (min): S0=%+.1f us  S1=%+.1f us\n",
-           lowest(ts0) - lowest(tu), lowest(ts1) - lowest(tu));
+    printf("kernel us per layer, min (median) of %u x %u: U=%.1f (%.1f)  C=%.1f (%.1f)  "
+           "S=%.1f (%.1f)\n", iters, reps, lowest(tu), median(tu), lowest(tc), median(tc),
+           lowest(ts), median(ts));
+    printf("kernel cost per layer over U (min): C=%+.1f us  S=%+.1f us\n",
+           lowest(tc) - lowest(tu), lowest(ts) - lowest(tu));
+    std::vector<double> stage[4];
+    for (unsigned i = 0; i < iters + 2; ++i) {
+        for (unsigned b = 0; b < 3; ++b) {
+            const double t = timed([&] { canonical(env[0], d_q[0], d_full, cn[0], 1u << b); });
+            if (i >= 2) stage[b].push_back(t);
+        }
+        const double t = timed([&] {
+            partials(false, d_q[0], d_full, d_selected, d_table, nullptr, rows, splits_u, u_o,
+                     u_lse);
+        });
+        if (i >= 2) stage[3].push_back(t);
+    }
+    printf("C stages, min us: partition=%.1f split=%.1f merge=%.1f; U split alone=%.1f\n",
+           lowest(stage[0]), lowest(stage[1]), lowest(stage[2]), lowest(stage[3]));
 
     // ---- Copy-engine staging of the exchanged payloads (send + land). ----
     const size_t q_bytes = qn * 2, p_bytes = part + lse;

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The GLM paged prefill over a latent-sharded cache (`ATLAS_GLM_KV_SHARD=1`):
 //! which pool, slots and block table each launch is handed, and what the pair
-//! exchanges. Recorded launches, not CUDA numerics.
+//! exchanges; and, unsharded, the canonical form of the same few-row owners.
+//! Recorded launches, not CUDA numerics.
 use super::*;
 use crate::layers::glm_kv_shard::{self as shard, ScratchLayout};
 use spark_runtime::kv_cache::LatentShard;
@@ -13,6 +14,9 @@ const COPY_BLOCKS: u64 = 832;
 const LATENT_WRITE: u64 = 821;
 const SPARSE_ATTN: u64 = 840;
 const PIPE_ATTN: u64 = 841;
+const PARTITION: u64 = 834;
+const PAIR: u64 = 835;
+const MERGE_PAIR: u64 = 836;
 const RANK: usize = 1;
 const BLOCKS: usize = 512;
 
@@ -72,8 +76,9 @@ struct Pass {
     /// Typed launches `(kernel, arguments)` in order.
     launches: Vec<(u64, Vec<Vec<u8>>)>,
     exchanges: Vec<usize>,
-    shard: LatentShard,
-    layout: ScratchLayout,
+    /// The shard and its scratch layout (`None` unsharded).
+    shard: Option<LatentShard>,
+    layout: Option<ScratchLayout>,
     /// This rank's latent pool, the sequence's slots and its block table.
     pool: DevicePtr,
     slot: DevicePtr,
@@ -85,8 +90,14 @@ impl Pass {
         let launches = self.launches.iter();
         launches.filter(|l| l.0 == kernel).map(|l| &l.1).collect()
     }
+    fn shard(&self) -> LatentShard {
+        self.shard.expect("a sharded pass")
+    }
+    fn layout(&self) -> ScratchLayout {
+        self.layout.expect("a sharded pass")
+    }
     fn scratch(&self, offset: usize) -> Vec<u8> {
-        ptr(self.shard.scratch.offset(offset))
+        ptr(self.shard().scratch.offset(offset))
     }
 }
 
@@ -117,11 +128,33 @@ fn pass_with(
     misplaced: Option<usize>,
     verdict: Option<u64>,
 ) -> (Result<()>, Pass) {
+    pass_on(true, dtype, seq_len_start, rows, floor, misplaced, verdict)
+}
+
+/// [`pass_with`] on a sharded cache, or on an unsharded one of rank
+/// [`RANK`] of a TP pair.
+fn pass_on(
+    sharded: bool,
+    dtype: KvCacheDtype,
+    seq_len_start: usize,
+    rows: usize,
+    floor: usize,
+    misplaced: Option<usize>,
+    verdict: Option<u64>,
+) -> (Result<()>, Pass) {
     let mut out = None;
     fixture_with(dtype, |gpu, config, layer| {
         layer.glm_sparse_attn_k = KernelHandle(SPARSE_ATTN);
         let layer = &*layer;
-        let mut arena = BufferArena::new(config, rows.max(256), 32768, 16, 1, gpu).unwrap();
+        let mut config = config.clone();
+        if !sharded {
+            (config.tp_world_size, config.tp_rank) = (2, RANK);
+        }
+        let config = &config;
+        // Unsharded few-row owners take the canonical form in the expert
+        // scratch, which needs a wider arena.
+        let tokens = rows.max(if sharded { 256 } else { 512 });
+        let mut arena = BufferArena::new(config, tokens, 32768, 16, 1, gpu).unwrap();
         if dtype == KvCacheDtype::Fp8G128 {
             arena.attach_glm_latent_scratch(4096, gpu).unwrap();
         }
@@ -187,7 +220,10 @@ fn pass_with(
             cache_blocks_per_seq: None,
         };
         let spec = shard::spec(RANK, &kv_config, BLOCKS * 16 - 64, 256.max(rows));
-        let mut cache = PagedKvCache::new_latent_sharded(kv_config, BLOCKS, gpu, spec).unwrap();
+        let mut cache = match sharded {
+            true => PagedKvCache::new_latent_sharded(kv_config, BLOCKS, gpu, spec).unwrap(),
+            false => PagedKvCache::new(kv_config, BLOCKS, gpu).unwrap(),
+        };
         cache
             .attach_sparse_index(SparseIndexCacheConfig::bf16(4, 128), gpu)
             .unwrap();
@@ -206,12 +242,12 @@ fn pass_with(
             &ctx,
             0,
         );
-        let shard = cache.latent_shard().unwrap();
+        let shard = cache.latent_shard();
         let pass = Pass {
             launches: gpu.1.lock().unwrap()[before..].to_vec(),
             exchanges: pair.exchanges.lock().unwrap().clone(),
             shard,
-            layout: ScratchLayout::of(&shard, cache.config()).unwrap(),
+            layout: shard.map(|s| ScratchLayout::of(&s, cache.config()).unwrap()),
             pool: cache.latent_pool_ptr(0),
             slot: meta.slot,
             block_table: meta.block_table,
@@ -228,7 +264,7 @@ fn a_floored_write_maps_only_the_written_rows_to_this_ranks_slots() {
     // to this rank's pool, never through the unsharded pool accessors.
     for dtype in [KvCacheDtype::Bf16, KvCacheDtype::Fp8G128] {
         let p = pass(dtype, 4096, 8, 4);
-        let local = p.scratch(p.layout.slots);
+        let local = p.scratch(p.layout().slots);
         let [map] = p.of(MAP_SLOTS)[..] else {
             panic!("{dtype:?}: one slot mapping");
         };
@@ -260,18 +296,56 @@ fn few_rows_take_the_merge_form_over_this_ranks_tokens() {
         let [localize] = p.of(LOCALIZE)[..] else {
             panic!("{dtype:?}: one localize");
         };
-        // The selection is read through the sequence's table; the attention
-        // reads the localized ids through the identity table over the pool.
-        assert_eq!(localize[2], ptr(p.block_table), "{dtype:?}");
+        // The selection is read through the sequence's table (after the
+        // ids and their counts); the attention reads the localized ids
+        // through the identity table over the pool.
+        assert_eq!(localize[3], ptr(p.block_table), "{dtype:?}");
         assert!(p.of(COPY_BLOCKS).is_empty(), "{dtype:?}: no view");
         assert!(
             p.of(SPARSE_ATTN).is_empty(),
             "{dtype:?}: no unsharded reader"
         );
-        let reads_pool =
-            |a: &&Vec<Vec<u8>>| a.len() > 5 && a[1] == ptr(p.pool) && a[5] == ptr(p.shard.identity);
-        let partials = p.launches.iter().map(|(_, a)| a).filter(reads_pool).count();
-        assert_eq!(partials, 2, "{dtype:?}: peer heads, then own heads");
+        // Both heads' partitions in one paired launch over this rank's pool.
+        let [pair] = p.of(PAIR)[..] else {
+            panic!("{dtype:?}: one paired split");
+        };
+        assert_eq!(
+            [&pair[1], &pair[5]],
+            [&ptr(p.pool), &ptr(p.shard().identity)]
+        );
+    }
+}
+
+#[test]
+fn unsharded_few_rows_take_the_canonical_form_over_the_whole_pool() {
+    // Verify-sized owners, sparse (past the top-k boundary) and dense: no
+    // exchange, no view, none of the earlier kernels; the selection split by
+    // the ownership rule for this rank, both groups attended through the
+    // sequence's table over the whole pool, both merges in one launch.
+    for dtype in [KvCacheDtype::Bf16, KvCacheDtype::Fp8G128] {
+        for (start, causal) in [(4096, false), (100, true)] {
+            let (result, p) = pass_on(false, dtype, start, 8, 0, None, None);
+            result.unwrap();
+            let case = format!("{dtype:?} from {start}");
+            assert!(p.exchanges.is_empty(), "{case}");
+            assert!(p.shard.is_none(), "{case}");
+            for k in [LOCALIZE, COPY_BLOCKS, SPARSE_ATTN, PIPE_ATTN, 805, 809, 810] {
+                assert!(p.of(k).is_empty(), "{case}: kernel {k}");
+            }
+            let ([partition], [pair], [merge]) =
+                (&p.of(PARTITION)[..], &p.of(PAIR)[..], &p.of(MERGE_PAIR)[..])
+            else {
+                panic!("{case}: one partition, paired split and paired merge");
+            };
+            // Causal owners generate their ids; rank RANK's split, from `start`.
+            assert_eq!(partition[0] == ptr(DevicePtr::NULL), causal, "{case}");
+            let tail = [8, 2051, 16, RANK as u32, start as u32].map(word);
+            assert_eq!(partition[5..], tail, "{case}");
+            assert_eq!([&pair[1], &pair[5]], [&ptr(p.pool), &ptr(p.block_table)]);
+            // Both groups attend this rank's heads.
+            assert_eq!(pair[0], pair[19], "{case}");
+            assert_eq!(merge[4], word(8), "{case}");
+        }
     }
 }
 
@@ -286,7 +360,7 @@ fn a_chunk_reads_its_history_assembled_from_both_ranks() {
         [8, 132 * block],
         "the table verdicts, then one round of the peer's blocks"
     );
-    let view = p.scratch(p.layout.view);
+    let view = p.scratch(p.layout().view);
     let copies = p.of(COPY_BLOCKS);
     let blocks: Vec<_> = copies.iter().map(|a| a[4].clone()).collect();
     assert_eq!(blocks, [word(132), word(132), word(132)], "own, send, land");
@@ -297,7 +371,7 @@ fn a_chunk_reads_its_history_assembled_from_both_ranks() {
         panic!("one sparse attention launch");
     };
     assert_eq!(attn[1..3], [view.clone(), view]);
-    assert_eq!(attn[5], ptr(p.shard.identity));
+    assert_eq!(attn[5], ptr(p.shard().identity));
     assert!(p.of(LOCALIZE).is_empty(), "the view form localizes nothing");
 }
 
@@ -374,7 +448,7 @@ fn an_fp8_chunk_under_the_pipe_and_the_index_split_reads_the_assembled_view() {
         [quarter, quarter, 8, 137 * block],
         "the split selection's two quarters, the table verdicts, the peer's blocks"
     );
-    let view = p.scratch(p.layout.view);
+    let view = p.scratch(p.layout().view);
     let [attn] = p.of(PIPE_ATTN)[..] else {
         panic!(
             "one pipelined launch, got {:?}",
@@ -382,7 +456,7 @@ fn an_fp8_chunk_under_the_pipe_and_the_index_split_reads_the_assembled_view() {
         );
     };
     assert_eq!(attn[1..3], [view.clone(), view], "fp8_g128 read in place");
-    assert_eq!(attn[5], ptr(p.shard.identity));
+    assert_eq!(attn[5], ptr(p.shard().identity));
     assert_eq!(attn[6], word(288));
     assert!(p.of(LOCALIZE).is_empty() && p.of(SPARSE_ATTN).is_empty());
 }

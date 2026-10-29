@@ -72,7 +72,7 @@ impl Qwen3AttentionLayer {
             eps,
             stream,
         )? {
-            self.hc_pre_prefill_site(&hc.attn, hc, hidden, n, ctx, stream)?;
+            self.hc_pre_prefill_site(&hc.attn, hc, hidden, n, None, ctx, stream)?;
         }
         // Each sequence's block reads its rows of the collapse in `hidden`
         // (the single pass reads the same bytes copied to `norm_output`, which
@@ -139,7 +139,10 @@ impl Qwen3AttentionLayer {
         }
         // ── FFN sublayer ──
         let normed2 = ctx.buffers.norm_output();
-        if !self.hc_post_pre_prefill_seam(hc, attn_out, hidden, n, false, ctx, stream)? {
+        if !self
+            .hc_post_pre_prefill_seam(hc, attn_out, hidden, n, false, None, ctx, stream)?
+            .ran()
+        {
             ops::hc_post_site(
                 ctx.gpu,
                 self.hc_post_k,
@@ -153,7 +156,7 @@ impl Qwen3AttentionLayer {
                 h as u32,
                 stream,
             )?;
-            self.hc_pre_prefill_site(&hc.ffn, hc, hidden, n, ctx, stream)?;
+            self.hc_pre_prefill_site(&hc.ffn, hc, hidden, n, None, ctx, stream)?;
         }
         ctx.gpu
             .copy_d2d_async(hidden, normed2, total * h * 2, stream)?;

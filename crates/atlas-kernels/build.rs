@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 
+mod build_kernel_flags;
+
 /// Per-category sampling defaults parsed from MODEL.toml `[sampling.*]`.
 #[derive(Debug, Clone)]
 struct SamplingCat {
@@ -87,6 +89,7 @@ struct Target {
     /// `kernel_source` redirect — the last overlay layer.
     local_kernel_dir: Option<PathBuf>,
     extra_flags: Vec<String>,
+    kernel_flags: build_kernel_flags::KernelFlags,
     module_overrides: HashMap<String, String>,
     /// `(module, kernel)` pairs declared in `[shadow_exempt]` — kernels this
     /// target may drop from `common/` WITHOUT it being drift, each with a
@@ -348,6 +351,16 @@ fn main() {
     }
 
     for (idx, target) in targets.iter().enumerate() {
+        if target.hw == "gb10" && target.model == "glm-5.3-flash" {
+            // The normal source include closure covers provenance; Cargo also
+            // needs to rerun when an imported device header changes.
+            println!(
+                "cargo:rerun-if-changed={}",
+                workspace_root
+                    .join("third_party/nvidia_sparse_mla_sm120")
+                    .display()
+            );
+        }
         let cu_files = collect_cu_files(
             target.common_kernel_dir.as_deref(),
             &target.overlay_dirs(),
@@ -361,6 +374,17 @@ fn main() {
             target.model,
             target.quant,
         );
+        for stem in target.kernel_flags.keys() {
+            assert!(
+                cu_files
+                    .iter()
+                    .any(|p| p.file_stem().is_some_and(|s| s == stem.as_str())),
+                "Per-source compiler flags name a missing kernel: {}/{}/{}:{stem}",
+                target.hw,
+                target.model,
+                target.quant,
+            );
+        }
 
         // Gather work for this target (no compilation yet — that runs
         // in parallel after the full work plan is built).
@@ -378,11 +402,11 @@ fn main() {
                 cu_file.clone()
             };
 
-            // Dedup key: same (source, arch, sorted-flags) → identical
-            // binary output. Sort flags so flag-order doesn't bust the cache.
-            let mut sorted_flags = target.extra_flags.clone();
-            sorted_flags.sort();
-            let key = (compile_source.clone(), target.arch.clone(), sorted_flags);
+            // Compiler flag order is significant (the last conflicting flag
+            // wins). Never deduplicate two sources by a sorted flag set.
+            let flags =
+                build_kernel_flags::for_source(&target.extra_flags, &target.kernel_flags, &stem);
+            let key = (compile_source.clone(), target.arch.clone(), flags.clone());
 
             if let Some(existing) = compile_cache.get(&key) {
                 copy_jobs.push((existing.clone(), out_file));
@@ -390,7 +414,7 @@ fn main() {
                 compile_jobs.push(CompileJob {
                     cu_file: compile_source.clone(),
                     arch: target.arch.clone(),
-                    extra_flags: target.extra_flags.clone(),
+                    extra_flags: flags,
                     out_file: out_file.clone(),
                 });
                 compile_cache.insert(key, out_file);
@@ -641,6 +665,11 @@ fn closure_attestation(
                 .join("kernels")
                 .join(&target.hw)
                 .join("HARDWARE.toml"),
+            target
+                .common_kernel_dir
+                .as_ref()
+                .map(|d| d.join("KERNEL.toml"))
+                .unwrap_or_default(),
             model_dir.map(|d| d.join("MODEL.toml")).unwrap_or_default(),
             target
                 .base_kernel_dir
@@ -677,6 +706,7 @@ fn closure_attestation(
                 "arch": target.arch,
                 "compiler": compiler,
                 "flags": target.extra_flags,
+                "kernel_flags": target.kernel_flags,
             }),
         );
     }
@@ -1204,14 +1234,16 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
             // now: common parses first as the base; the model toml appends
             // flags (deduped, model last) and wins per-key on [modules].
             let mut extra_flags: Vec<String> = Vec::new();
+            let mut kernel_flags = build_kernel_flags::KernelFlags::new();
             let mut module_overrides: HashMap<String, String> = HashMap::new();
             // Shadow-drop exemptions merge the same way: common/ declares the
             // repo-wide superseded kernels, a model KERNEL.toml adds the ones
             // only IT may drop (e.g. mistral's divergent RoPE convention).
             let mut shadow_exempt: Vec<(String, String)> = Vec::new();
             if has_common_dir && common_kernel_dir.join("KERNEL.toml").exists() {
-                let (f, m) = parse_kernel_toml(&common_kernel_dir, &target_vendor);
+                let (f, m, k) = parse_kernel_toml(&common_kernel_dir, &target_vendor);
                 extra_flags.extend(f);
+                kernel_flags.extend(k);
                 module_overrides.extend(m);
                 shadow_exempt.extend(parse_shadow_exempt(&common_kernel_dir));
             }
@@ -1243,7 +1275,8 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 if !dir.join("KERNEL.toml").exists() {
                     continue;
                 }
-                let (f, m) = parse_kernel_toml(dir, &target_vendor);
+                let (f, m, k) = parse_kernel_toml(dir, &target_vendor);
+                kernel_flags.extend(k);
                 for flag in f {
                     if !extra_flags.contains(&flag) {
                         extra_flags.push(flag);
@@ -1286,6 +1319,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 },
                 base_kernel_dir,
                 extra_flags,
+                kernel_flags,
                 module_overrides,
                 shadow_exempt,
                 expected_absent,

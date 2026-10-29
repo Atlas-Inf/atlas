@@ -940,3 +940,65 @@ it, a block is written once for as long as its record is kept.
   computation. The prefix lookup now releases the kept records of the blocks
   it is about to recompute (§5), so what a restore returns is what the block
   held, with or without KEEP.
+
+## 13. Under the latent shard (`ATLAS_GLM_KV_SHARD=1`)
+
+The shard (`glm-kv-shard.md`) stores block `b`'s latents on rank `b % 2`
+only, at local slot `b / 2`, and draws the block for logical index `l` with
+`b % 2 == l % 2`, so both ranks agree which rank owns logical block `l` while
+their physical ids differ. The index pools stay full on both ranks. The tier
+used to be refused beside it; it now runs with it, as follows.
+
+- **Two record classes.** The tree splits its slots into two classes
+  (`NvmePrefixTier::enable_classes`): a node spilled from block `b` takes a
+  slot `s` with `s % 2 == b % 2`. That residue is the node's logical index
+  residue, so the class of every node, and every slot the tree hands out,
+  is the same on both ranks (the trees see the same operations; only the ids
+  differ, and the classes do not read them beyond their residue).
+- **One record file (lane) per class and rank**
+  (`kv_cache/nvme_lanes.rs`), `atlas-kv-prefix.<pid>.r<rank>.c<class>.swap`,
+  record `s / 2` of class `s % 2`:
+  - the rank's OWN class (`class == rank`): the full record of §4, the
+    latents gathered from the local slot;
+  - the PEER class: the index rows only (GLM-5.3: 11 × 1024 B + trailer =
+    12 288 B per block, against 106 496 B for a full record).
+  Each rank thus spills and restores only the latents it stores, and every
+  block's index rows (sparse-index values and scales; raw tails are never in
+  a record, as unsharded).
+- **Budget.** `ATLAS_KV_NVME_GB` buys `budget / (own + peer record)` slots of
+  EACH class, so the two files together stay within it. On GLM-5.3 that is
+  ~59 KB per block per rank instead of 106 KB: ~1.8× the tokens per GiB.
+  The host reserve counts both lanes' staging and every slot of both classes;
+  the rank word fingerprints the total slots and `own + peer`, so a shard rank
+  and an unsharded rank do not start together (the shard settings themselves
+  are agreed in the same word).
+- **Budget drops per class.** A full class drops the coldest on-disk tail of
+  ITS class: a leaf, or (shard only) a node of the class whose children are
+  all leaves of the other class — a chain alternates classes, so this is what
+  lets a full class trim a chain whose leaf is in the other class. A victim
+  colder than every droppable record of its class is deleted (cold drop) even
+  when the other class has room. The rules read only the classes and the
+  access order, so both ranks drop the same records.
+- **Restore placement.** `restore_prefix` already allocates each restored
+  block at its logical index, so its residue is its record's class on both
+  ranks. `nvme_read` splits the run by class, reads each lane, and returns the
+  shortest verified prefix over both (a failure in either lane ends the
+  restore there). The fast path sorts a lane's blocks for pitched copies;
+  within a lane they share a residue, so every block keeps its position's
+  residue. Pitched runs step two ids at a time: the latents at their local
+  slots (pitch = one block), the index rows at a doubled pitch.
+- **Rank agreement.** Unchanged and sufficient: a restore is rank-local, and
+  the F83 minimum caps both ranks to the blocks both of them hold, so the
+  merge-form attention never meets a logical block whose owner lacks its
+  latents. The Marconi depth agreement (`pc_agree_restore`) and the SSM
+  snapshot tier work as unsharded (snapshots are per-rank state the shard does
+  not touch).
+- **Checks.** A spill order whose block residue is not its slot's class is
+  reported failed (the node is dropped); a restore target off its slot's
+  class ends the restore in front of it. Neither can happen with blocks drawn
+  at their logical index.
+- **Shard off.** One class, one lane, `.r<rank>.swap`, the same slots, the
+  same records, the same rank word and the same reserve as before.
+
+Not supported under the shard: nothing beyond what the shard already refuses
+(`--high-speed-swap`, and the lanes in `glm-kv-shard.md`).

@@ -302,7 +302,7 @@ fn run_ffmpeg(
     // not per-side (a 1xN strip has a huge side inside any per-side bound).
     let filter = format!(
         "{selection},showinfo,{}",
-        scale::decoded_scale_filter(policy.max_decoded_pixels),
+        scale::decoded_scale_filter(tail::decoded_frame_budget(policy, output_frames)?),
     );
 
     let mut child = Command::new(&policy.binary)
@@ -440,7 +440,7 @@ fn run_ffmpeg(
         bail!("decoder failed: {why}");
     }
 
-    let frames = split_png_stream(&out)?;
+    let frames = tail::split_png_stream(&out)?;
     ensure!(
         !frames.is_empty(),
         "the container decoded to zero frames (is there a video stream?)"
@@ -458,33 +458,12 @@ fn run_ffmpeg(
     Ok((frames, times))
 }
 
-/// Split a concatenated PNG stream into images.
-///
-/// Splitting on the signature rather than parsing IEND chunks: a PNG's
-/// payload can legitimately contain the IEND byte pattern, whereas the
-/// 8-byte signature only appears at a file start in a well-formed stream
-/// produced by `image2pipe`.
-fn split_png_stream(buf: &[u8]) -> Result<Vec<RgbImage>> {
-    let mut starts = Vec::new();
-    let mut i = 0usize;
-    while i + PNG_MAGIC.len() <= buf.len() {
-        if buf[i..i + PNG_MAGIC.len()] == PNG_MAGIC {
-            starts.push(i);
-            i += PNG_MAGIC.len();
-        } else {
-            i += 1;
-        }
-    }
-    let mut frames = Vec::with_capacity(starts.len());
-    for (n, &s) in starts.iter().enumerate() {
-        let e = starts.get(n + 1).copied().unwrap_or(buf.len());
-        let img = image::load_from_memory_with_format(&buf[s..e], image::ImageFormat::Png)
-            .with_context(|| format!("frame {n} did not decode as PNG"))?;
-        frames.push(img.to_rgb8());
-    }
-    Ok(frames)
-}
-
 #[cfg(test)]
 #[path = "video_decode_ffmpeg_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "video_decode_ffmpeg_hour_tests.rs"]
+mod hour_tests;
+#[path = "video_decode_ffmpeg/tail.rs"]
+mod tail;

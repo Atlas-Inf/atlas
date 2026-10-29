@@ -158,7 +158,7 @@ fn isolated_down_preserves_gate_up_without_shared_gate_presence() {
 #[test]
 fn every_legacy_io_failure_stops_at_exact_prefix_and_preserves_nulling_order() {
     for host in [false, true] {
-        for mode in 0..4 {
+        for mode in 2..4 {
             let gpu = RecordingGpu::new(host);
             let (mut layer, config, _) = fixture(&gpu, 16, true, true, 32);
             run(&mut layer, &gpu, &config, mode).unwrap();

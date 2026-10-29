@@ -87,7 +87,18 @@ pub trait NvmePrefixTier: Send + Sync {
     /// Turn spill-on-evict on with a budget of `max_slots` records. Must be
     /// called before any block is cached. Returns `false` if already enabled
     /// or `max_slots == 0`.
-    fn enable(&self, max_slots: u32) -> bool;
+    fn enable(&self, max_slots: u32) -> bool {
+        self.enable_classes(max_slots, 1)
+    }
+
+    /// [`Self::enable`] with the record slots split into `classes` classes of
+    /// `per_class` slots: a block `b` spills into a slot `s` with
+    /// `s % classes == b % classes`, and the budget drops only on-disk blocks
+    /// of the class that is full. A latent-sharded KV cache
+    /// (`ATLAS_GLM_KV_SHARD=1`) takes one class per rank, since its records
+    /// differ in size by owner (`PagedKvCache::nvme_classes`). `classes = 1`
+    /// is [`Self::enable`].
+    fn enable_classes(&self, per_class: u32, classes: u32) -> bool;
 
     fn is_enabled(&self) -> bool;
 

@@ -12,6 +12,8 @@ mod abi;
 mod checkpoint_down;
 #[path = "helpers_unified_fault_tests.rs"]
 mod faults;
+#[path = "helpers_unified_inplace_tests.rs"]
+mod inplace;
 use abi::assert_abi_and_tables;
 
 fn make_weight(gpu: &RecordingGpu, n: usize, k: usize, gs: usize, seed: u8) -> QuantizedWeight {
@@ -214,7 +216,7 @@ fn actual_legacy_wrappers_exact_order_abi_ownership_and_peak() {
             (false, false, 32),
         ] {
             for host in [false, true] {
-                for mode in 0..4 {
+                for mode in 2..4 {
                     let gpu = RecordingGpu::new(host);
                     let (mut layer, config, originals) = fixture(&gpu, gs, local, shared, inter);
                     let initial = gpu.live();

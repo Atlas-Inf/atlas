@@ -9,6 +9,7 @@ use super::*;
 /// prefill MoE.
 pub(crate) fn k5_grouped_moe_requested() -> bool {
     std::env::var("ATLAS_GLM_K5_GROUPED_MOE").as_deref() == Ok("1")
+        && !crate::layers::canonical_verify::enabled()
 }
 
 /// `ATLAS_GLM_K5_FUSED_MOE_HC=1`: on that grouped pass the shared expert is
@@ -18,6 +19,7 @@ pub(crate) fn k5_grouped_moe_requested() -> bool {
 /// half beside the other's whole.
 pub(crate) fn k5_fused_moe_hc_requested() -> bool {
     std::env::var("ATLAS_GLM_K5_FUSED_MOE_HC").as_deref() == Ok("1")
+        && !crate::layers::canonical_verify::enabled()
 }
 
 impl MoeLayer {
@@ -97,7 +99,9 @@ impl MoeLayer {
         // to E4M3 on chip for FP8 MMA; unlike NVFP4 MMQ, it does not quantize and
         // stage the verifier activations in FP4. This preserves acceptance while
         // amortizing routed weights across the verifier batch.
-        if self.use_btile_or_t_prefill() && k5_grouped_moe_requested() {
+        // Expert TP slices the routed width: only the grouped path serves it
+        // (as forward_k2 / forward_k3), with or without the K=5 switch.
+        if ctx.config.expert_tp || (self.use_btile_or_t_prefill() && k5_grouped_moe_requested()) {
             self.forward_prefill(input, 5, ctx, stream)?;
             return Ok(ctx.buffers.moe_output());
         }

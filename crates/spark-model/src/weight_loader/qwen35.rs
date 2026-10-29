@@ -78,6 +78,7 @@ fn vision_weight(
             Ok(crate::layers::VitWeight::Mxfp8(
                 crate::weight_map::Mxfp8Proj {
                     w: crate::weight_map::Mxfp8Weight {
+                        tiled: false,
                         data: wptr,
                         scales: sptr,
                     },
@@ -108,6 +109,32 @@ fn vision_weight(
             })
         }
         other => anyhow::bail!("vision_weight: unsupported dtype {other:?} for {name}"),
+    }
+}
+
+/// A vision linear `{prefix}.weight` as BF16: BF16 as stored, FP8 (MXFP8
+/// or block) and W4A16 NVFP4 expanded, F32 narrowed. Shared with the GLM ViT.
+/// (Ported from Enntity/atlas PR #199, AGPL-3.0-only.)
+#[cfg(feature = "cuda")]
+pub(crate) fn vision_dense_auto(
+    store: &WeightStore,
+    prefix: &str,
+    gpu: &dyn GpuBackend,
+) -> Result<DenseWeight> {
+    let name = format!("{prefix}.weight");
+    let w = store.get(&name)?;
+    match w.dtype {
+        WeightDtype::BF16 | WeightDtype::FP8E4M3 => {
+            crate::weight_map::dense_auto_fp8_or_bf16(store, prefix, gpu)
+        }
+        WeightDtype::FP32 => crate::weight_map::dense_f32_safe(store, &name, gpu),
+        // W4A16 NVFP4 (nvidia Qwen3.8-Flash-Next-FP4-Local's ViT MLP and
+        // merger): packed E2M1 `[n, k/2]` + E4M3 per-16 `weight_scale` + F32
+        // `weight_scale_2`, expanded to BF16 once at load for the BF16 tower.
+        // Rounding involved, unlike the MXFP8 expansion (see the comment in
+        // `dense_auto`); about one BF16 ulp per element at most.
+        WeightDtype::UInt8 => dense_auto(store, &name, gpu),
+        other => anyhow::bail!("vision_dense_auto: unsupported dtype {other:?} for {name}"),
     }
 }
 

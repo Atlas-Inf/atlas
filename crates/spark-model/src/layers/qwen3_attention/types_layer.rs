@@ -67,7 +67,7 @@ pub struct Qwen3AttentionLayer {
     /// Optional YaRN frequencies for standard (non-MLA) attention.
     pub(crate) yarn_inv_freq: DevicePtr,
     pub(crate) yarn_attention_factor: f32,
-    /// Post-attention output norm (Gemma-4).  
+    /// Post-attention output norm (Gemma-4).
     pub(crate) post_attn_out_norm: Option<DenseWeight>,
     /// Post-FFN output norm (Gemma-4).
     pub(crate) post_ffn_out_norm: Option<DenseWeight>,

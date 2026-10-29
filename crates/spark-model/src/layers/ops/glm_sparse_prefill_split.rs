@@ -177,6 +177,84 @@ pub(crate) fn launch_sparse_partials(
     .launch(stream)
 }
 
+/// One group of [`launch_sparse_partial_pair`]: its queries (`[rows, 32,
+/// 512]` BF16), packed selected IDs with per-row counts, and where its
+/// `splits` partial outputs and LSEs go.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PartialGroup {
+    pub query: DevicePtr,
+    pub indices: DevicePtr,
+    pub counts: DevicePtr,
+    pub part_o: DevicePtr,
+    pub part_lse: DevicePtr,
+}
+
+/// The counted split ([`launch_sparse_partials`] with row counts) of two
+/// groups in one launch (`*_split_counted_pair`, grid z = 2 x `splits`): every
+/// CTA is the one the counted launch of its group runs for its partition, so
+/// the partials are bitwise those of two counted launches. `a` supplies the
+/// cache, table and geometry; its `query` and `indices` are not read.
+pub(crate) fn launch_sparse_partial_pair(
+    gpu: &dyn GpuBackend,
+    a: &GlmSparsePrefillTc<'_>,
+    splits: u32,
+    [g, h]: [PartialGroup; 2],
+    stream: u64,
+) -> Result<()> {
+    validate_geometry(a)?;
+    ensure!(
+        (1..=16).contains(&splits) && a.rows > 0 && a.identical_kv_latent,
+        "GLM sparse partial pair needs 1..=16 splits, rows and identical K/V"
+    );
+    ensure!(
+        [g, h].iter().all(|x| {
+            [x.query, x.indices, x.counts, x.part_o, x.part_lse]
+                .iter()
+                .all(|p| p.0 != 0)
+        }) && a.k_cache.0 != 0
+            && a.block_table.0 != 0,
+        "GLM sparse partial pair has missing storage"
+    );
+    let (_, _, shared_mem) = kernel_spec(true, a.dtype, false);
+    let symbol = if a.dtype == KvCacheDtype::Fp8G128 {
+        "glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split_counted_pair"
+    } else {
+        "glm_sparse_mla_prefill_bf16_head32_tc_kv_pad_split_counted_pair"
+    };
+    let kernel = gpu
+        .op_cache()
+        .kernel(gpu, super::super::glm_kv_shard::MODULE, symbol)?;
+    ensure!(
+        kernel.0 != 0,
+        "GLM sparse partial pair kernel is unavailable"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([a.heads.div_ceil(32), a.rows, 2 * splits])
+        .block([256, 1, 1])
+        .shared_mem(shared_mem)
+        .arg_ptr(g.query)
+        .arg_ptr(a.k_cache)
+        .arg_ptr(a.v_cache)
+        .arg_ptr(g.indices)
+        .arg_ptr(a.output)
+        .arg_ptr(a.block_table)
+        .arg_u32(a.rows)
+        .arg_u32(a.heads)
+        .arg_u32(a.head_dim)
+        .arg_u32(a.index_width)
+        .arg_u32(a.block_size)
+        .arg_f32(a.scale)
+        .arg_ptr(g.part_o)
+        .arg_ptr(g.part_lse)
+        .arg_ptr(g.counts)
+        .arg_ptr(h.indices)
+        .arg_ptr(h.part_o)
+        .arg_ptr(h.part_lse)
+        .arg_ptr(h.counts)
+        .arg_ptr(h.query)
+        .launch(stream)
+}
+
 /// A pinned split launch, once per backend: that the pin is live, then each
 /// row count whose bits it changes. Only a launch that really splits logs.
 fn log_pin(gpu: &dyn GpuBackend, a: &GlmSparsePrefillTc<'_>, splits: u32) {

@@ -117,7 +117,11 @@ pub(super) fn build_moe(
             let [w, s] =
                 mx8_common::module(store, &format!("{lp}.mlp.shared_expert.{proj}"), n, k)?;
             Ok(Mxfp8Proj {
-                w: Mxfp8Weight { data: w, scales: s },
+                w: Mxfp8Weight {
+                    tiled: false,
+                    data: w,
+                    scales: s,
+                },
                 n: n as u32,
                 k: k as u32,
             })
@@ -150,6 +154,7 @@ pub(super) fn build_moe(
         }
         let view = |rows_off: usize| Mxfp8Proj {
             w: Mxfp8Weight {
+                tiled: false,
                 data: gu_w.offset(rows_off * h),
                 scales: gu_s.offset(rows_off * (h / 32)),
             },
@@ -159,6 +164,7 @@ pub(super) fn build_moe(
         let gate_up = Some(crate::layers::moe::Mxfp8GateUp {
             proj: Mxfp8Proj {
                 w: Mxfp8Weight {
+                    tiled: false,
                     data: gu_w,
                     scales: gu_s,
                 },

@@ -8,7 +8,7 @@ use anyhow::Result;
 use spark_runtime::radix_tree::{glm_pc_evict_enabled, snap_evict_alpha, snap_evict_legacy};
 
 use crate::layer::glm_long_owner;
-use crate::layers::dflash_head::rank_split;
+use crate::layers::dflash_head::{ConvTwinKind, rank_split};
 use crate::layers::qwen3_attention::{
     glm_mla_multi_seq_enabled, glm_multi_seq_sparse_enabled, glm_multi_seq_sparse_graphs_enabled,
     grouped_routed_decode_enabled, grouped_routed_decode_min, index_split_words,
@@ -288,6 +288,7 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
             rank_split::requested()?,
             rank_split::batch_requested()?,
             rank_split::ctx_requested()?,
+            rank_split::topk_requested()?,
         ))
     }),
     // The draft head a qwen4_exp worker builds and the swaps of each batched
@@ -481,6 +482,15 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     // verify) and the check's serial steps (their collectives).
     ("ATLAS_QWEN4EXP_EXACT_VERIFY", || {
         Ok(qwen4exp_exact_verify::requested() as u64)
+    }),
+    ("ATLAS_GLM_DENSE_TP_SPLIT", || {
+        Ok(layers::dense_ffn::dense_tp_split_requested()? as u64)
+    }),
+    ("ATLAS_GLM_MOE_ROUTE_FUSE", || {
+        Ok(moe::route_fuse_requested()? as u64)
+    }),
+    ("ATLAS_GLM_KDA_COMMIT_CTAS", || {
+        Ok(ops::kda_commit_ctas()? as u64)
     }),
 ];
 

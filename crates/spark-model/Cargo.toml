@@ -31,7 +31,7 @@ metal-example = ["metal", "dep:tokenizers", "dep:memmap2", "dep:safetensors"]
 # no-GPU CI `cargo test --workspace` skips building them (they link CUDA
 # driver symbols — cuGraph*/cuStream*/cuMem* — that aren't available on the
 # CI runner). Build on a real GPU host with `--features gpu-examples`.
-gpu-examples = []
+gpu-examples = ["dep:safetensors"]
 # The NCCL/RDMA-pair CommBackend, for the two-rank `comm_pair_bench` example.
 nccl = ["cuda", "spark-comm/nccl"]
 

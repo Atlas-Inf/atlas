@@ -16,7 +16,7 @@
 
 use super::lifecycle_tests::{COMMITS, StubModel, VERIFY_PICKS};
 use super::sched_ctx::SchedCtx;
-use super::test_support::{EOS, test_seq};
+use super::test_support::{EOS, RespRx, test_seq};
 use super::types::ActiveSeq;
 use super::verify_dflash_batch_step::apply_dflash_accept;
 use super::verify_dflash_step::verify_dflash_tail;
@@ -26,14 +26,12 @@ const PRE: usize = 40;
 
 /// A live sequence as `decode_verify_dflash` leaves it: `seq_len` and
 /// `seq.tokens` advanced by the whole `k`-row verify block.
-fn verified(k: usize) -> ActiveSeq {
+fn verified(k: usize) -> (ActiveSeq, RespRx) {
     let (mut a, rx) = test_seq(vec![10], 20, None, PRE + k);
-    // A dropped receiver reads as a client disconnect: keep it alive.
-    std::mem::forget(rx);
     a.finished = false;
     a.min_tokens = 0;
     a.seq.tokens = (0..(PRE + k) as u32).collect();
-    a
+    (a, rx)
 }
 
 fn commits() -> Vec<(usize, usize, usize)> {
@@ -68,7 +66,7 @@ fn tail(a: &mut ActiveSeq, drafts: &[u32], argmax: &[u32]) -> Option<usize> {
 #[test]
 fn tail_commits_when_the_bonus_token_finishes_the_sequence() {
     // Two of four drafts accepted; the bonus (row 2) is the stop token.
-    let mut a = verified(5);
+    let (mut a, _rx) = verified(5);
     assert_eq!(tail(&mut a, &[1, 2, 3, 4], &[1, 2, EOS[0], 9, 9]), None);
     assert!(a.finished, "the stop token must finish the sequence");
     assert_eq!(a.seq.tokens.len(), PRE + 3);
@@ -81,7 +79,7 @@ fn tail_commits_when_an_accepted_draft_finishes_the_sequence() {
     // All four drafts accepted; draft 1 is the stop token, so the emit loop
     // returns with two accepted rows still un-emitted. The state still has to
     // hold every accepted row, exactly as `seq.tokens` and the worker do.
-    let mut a = verified(5);
+    let (mut a, _rx) = verified(5);
     let drafts = [1, EOS[0], 3, 4];
     assert_eq!(tail(&mut a, &drafts, &[1, EOS[0], 3, 4, 7]), None);
     assert!(a.finished);
@@ -91,7 +89,7 @@ fn tail_commits_when_an_accepted_draft_finishes_the_sequence() {
 
 #[test]
 fn tail_commits_once_when_the_sequence_continues() {
-    let mut a = verified(5);
+    let (mut a, _rx) = verified(5);
     assert_eq!(tail(&mut a, &[1, 2, 3, 4], &[1, 2, 8, 9, 9]), Some(4));
     assert!(!a.finished);
     assert_eq!(a.last_token, 8);
@@ -102,7 +100,7 @@ fn tail_commits_once_when_the_sequence_continues() {
 fn batched_accept_commits_when_an_emit_finishes_the_sequence() {
     let sched = SchedCtx::for_test();
     let accept = |drafts: &[u32], argmax: &[u32]| {
-        let mut a = verified(4);
+        let (mut a, _rx) = verified(4);
         apply_dflash_accept(
             &StubModel::default(),
             &mut a,
@@ -132,20 +130,19 @@ fn batched_accept_commits_when_an_emit_finishes_the_sequence() {
 }
 
 /// A live sequence before its verify: `PRE` tokens, `last_token` the anchor.
-fn unverified() -> ActiveSeq {
+fn unverified() -> (ActiveSeq, RespRx) {
     let (mut a, rx) = test_seq(vec![10], 20, None, PRE);
-    std::mem::forget(rx);
     a.finished = false;
     a.min_tokens = 0;
     a.seq.tokens = (0..PRE as u32).collect();
-    a
+    (a, rx)
 }
 
 #[test]
 fn k4_verdict_commits_before_an_emit_can_finish_the_sequence() {
     let sched = SchedCtx::for_test();
     let verdict = |drafts: &[u32], v: &[u32], na: usize| {
-        let mut a = verified(drafts.len() + 1);
+        let (mut a, _rx) = verified(drafts.len() + 1);
         let hidden = K4Hidden::DeferPropose;
         let model = StubModel::default();
         k4_apply_verdict(&model, &mut a, &sched, drafts, v, vec![], 3, na, hidden, 0);
@@ -182,7 +179,7 @@ fn k4_verdict_commits_before_an_emit_can_finish_the_sequence() {
 fn k_step(drafts: &[u32], picks: &[u32]) -> (bool, usize, Vec<(usize, usize, usize)>) {
     let sched = SchedCtx::for_test();
     let ctx = sched.verify_logits_ctx(None, None, None, None);
-    let (model, mut a) = (StubModel::default(), unverified());
+    let (model, (mut a, _rx)) = (StubModel::default(), unverified());
     VERIFY_PICKS.with(|p| *p.borrow_mut() = picks.to_vec());
     if drafts.len() == 1 {
         super::verify_k2_step::step_verify_k2(&model, &mut a, &sched, drafts, 1, &ctx, false);
@@ -232,7 +229,7 @@ fn ngram_verify_commits_the_rolled_back_prefix_before_it_emits() {
     let sched = SchedCtx::for_test();
     let ctx = sched.verify_logits_ctx(None, None, None, None);
     let step = |drafts: &[u32], picks: &[u32]| {
-        let (model, mut a) = (StubModel::default(), unverified());
+        let (model, (mut a, _rx)) = (StubModel::default(), unverified());
         let mut proposer = crate::ngram::NgramProposer::new(3);
         VERIFY_PICKS.with(|p| *p.borrow_mut() = picks.to_vec());
         a.pending_drafts = drafts.to_vec();

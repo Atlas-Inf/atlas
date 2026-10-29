@@ -21,12 +21,16 @@
 //! is only ever populated by a loader that has its own row reader.
 
 use super::FastSafetensorsLoader;
+use crate::weights::nvfp4_csf::csf_part;
 use crate::weights::parse_expert_index;
 
 impl FastSafetensorsLoader {
     /// Tensors located on disk but not uploaded: host-decoded formats and
     /// expert-TP slices. Deferred tensors are also left out of the pre-flight.
+    /// A CSF-compressed scale defers as its components (judged by the scale's
+    /// name), decoded per slice by `with_deferred_slice`.
     pub(super) fn should_defer_tensor(&self, name: &str) -> bool {
+        let name = csf_part(name).map_or(name, |(scale, _)| scale);
         self.is_host_decoded(name) || self.is_expert_tp_slice(name)
     }
 

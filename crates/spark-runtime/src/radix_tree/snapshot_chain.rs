@@ -6,8 +6,8 @@
 //!
 //! The default victim (`session_aware_victim`) groups entries by
 //! `session_hash`, the hash of the first 1024 prompt tokens. Agentic clients
-//! (omp, Claude-Code-like tools) open every session with the same system
-//! prompt and tools, so every session lands in ONE group and the policy is
+//! often open every session with the same system prompt and tools, so every
+//! session lands in ONE group and the policy is
 //! plain LRU over entries. Each turn saves one snapshot (its prompt tail), so
 //! a session looping on fast tool calls fills all 16 slots with its own
 //! history — every snapshot but its newest is useless to it — and evicts the
