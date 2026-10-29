@@ -302,7 +302,7 @@ fn run_ffmpeg(
     // not per-side (a 1xN strip has a huge side inside any per-side bound).
     let filter = format!(
         "{selection},showinfo,{}",
-        scale::decoded_scale_filter(policy.max_decoded_pixels),
+        scale::decoded_scale_filter(decoded_frame_budget(policy, output_frames)?),
     );
 
     let mut child = Command::new(&policy.binary)
@@ -458,6 +458,22 @@ fn run_ffmpeg(
     Ok((frames, times))
 }
 
+/// Per-frame pixel bound under the aggregate decode budget: the smaller of
+/// the per-frame cap and `max_total_decoded_pixels / frames` when the
+/// operator set the total bound (Enntity/atlas 8fe99bfe).
+fn decoded_frame_budget(policy: &FfmpegPolicy, frames: usize) -> Result<usize> {
+    let area = policy
+        .max_total_decoded_pixels
+        .map_or(policy.max_decoded_pixels, |total| {
+            policy.max_decoded_pixels.min(total / frames.max(1))
+        });
+    ensure!(
+        area > 0,
+        "video decode pixel budget cannot hold {frames} frames"
+    );
+    Ok(area)
+}
+
 /// Split a concatenated PNG stream into images.
 ///
 /// Splitting on the signature rather than parsing IEND chunks: a PNG's
@@ -488,3 +504,7 @@ fn split_png_stream(buf: &[u8]) -> Result<Vec<RgbImage>> {
 #[cfg(test)]
 #[path = "video_decode_ffmpeg_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "video_decode_ffmpeg_hour_tests.rs"]
+mod hour_tests;
