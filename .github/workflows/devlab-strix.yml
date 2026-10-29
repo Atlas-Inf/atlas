@@ -30,11 +30,21 @@ on:
         default: main
         type: string
       job:
-        description: "probe = report the runner environment only; build = probe + native strix-hip build"
+        description: "probe = runner environment only; build = probe + native strix-hip build; bench = build + run a scripts/devlab/*.sh script on the GPU"
         required: true
         default: probe
         type: choice
-        options: [probe, build]
+        options: [probe, build, bench]
+      script:
+        description: "bench only: script under scripts/devlab/ (e.g. scripts/devlab/ab_prefill.sh)"
+        required: false
+        default: ""
+        type: string
+      args:
+        description: "bench only: arguments for the script (space-separated; no shell metacharacters)"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -100,7 +110,7 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Rust toolchain (cached under the tool cache)
-        if: inputs.job == 'build'
+        if: inputs.job == 'build' || inputs.job == 'bench'
         shell: bash
         run: |
           set -euo pipefail
@@ -116,7 +126,7 @@ jobs:
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Native strix-hip build (all models)
-        if: inputs.job == 'build'
+        if: inputs.job == 'build' || inputs.job == 'bench'
         shell: bash
         run: |
           set -euo pipefail
@@ -124,3 +134,30 @@ jobs:
           start=$(date +%s)
           ./build-amd.sh
           echo "build: $(( $(date +%s) - start ))s, binary $(sha256sum target/release/spark | cut -c1-16)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # bench: run one script from scripts/devlab/ against the build above, on the runner's gfx1151.
+      # Inputs reach the shell only through env (never interpolated into the script text), the path is
+      # pinned to scripts/devlab/*.sh, and args may not carry shell metacharacters.
+      - name: Bench script
+        if: inputs.job == 'bench'
+        shell: bash
+        env:
+          SCRIPT: ${{ inputs.script }}
+          ARGS: ${{ inputs.args }}
+        run: |
+          set -euo pipefail
+          [[ "$SCRIPT" =~ ^scripts/devlab/[A-Za-z0-9_.-]+\.sh$ ]] || { echo "::error::script must be scripts/devlab/<name>.sh (got: $SCRIPT)"; exit 1; }
+          [[ "$ARGS" =~ ^[A-Za-z0-9_./:=,@+-\ ]*$ ]] || { echo "::error::args contain disallowed characters"; exit 1; }
+          [ -f "$SCRIPT" ] || { echo "::error::$SCRIPT not found at this ref"; exit 1; }
+          export DEVLAB_OUT="$RUNNER_TEMP/devlab-out"; mkdir -p "$DEVLAB_OUT"
+          read -r -a argv <<< "$ARGS"
+          bash "$SCRIPT" "${argv[@]}" 2>&1 | tee "$DEVLAB_OUT/console.log"
+          { echo "## bench: $SCRIPT $ARGS"; echo '```'; cat "$DEVLAB_OUT/RESULTS.txt" 2>/dev/null || tail -40 "$DEVLAB_OUT/console.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload bench output
+        if: always() && inputs.job == 'bench'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: devlab-bench-${{ github.run_id }}
+          path: ${{ runner.temp }}/devlab-out
+          if-no-files-found: warn
