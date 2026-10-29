@@ -1277,3 +1277,17 @@ production kernels built with and without the probe (numbers only, not identity:
 what the K3 software pipeline (double-buffered `smem_B_fp8`, dequant k+1 under MMA k, 3-stage cp.async) can win before
 it's written. `_wq` removed from the branch. Kept rule: new shared declarations must not precede unaligned uchar/bf16
 arrays (or everything gets `__align__(16)`).
+
+## 2026-10-29 — dequant priced: 31–50% of MoE prefill kernel time (job 48b, `MOE_PROBE_CHEAP_DEQUANT`)
+
+| kernel | T | normal ms (TFLOP/s) | probe ms (TFLOP/s) | dequant share |
+|---|---|---|---|---|
+| gate_up | 2,900 | 9.11 (20.9) | 5.61 (33.9) | 38% |
+| down | 2,900 | 5.30 (17.9) | 3.66 (25.9) | 31% |
+| gate_up | 19,200 | 35.14 (35.8) | 17.42 (72.2) | 50% |
+| down | 19,200 | 22.88 (27.5) | 14.84 (42.4) | 35% |
+
+Arm A reproduces the production baseline; arm B is the probe (its math differs; identity not expected). Overlapping
+the dequant with the MMAs is bounded at ~1.6× (gate_up, 2.9K) to ~2× (19.2K). That is the K3 target: dequant of
+K-tile k+1 under the MMAs of tile k, double-buffered `smem_B_fp8`, 3-stage cp.async, byte-exact. Branch
+`perf/moe-prefill-occupancy` fef8b78d1.
