@@ -1301,3 +1301,19 @@ The pipeline is dropped. A third failed restructure (after occupancy and K2a): t
 against a 228 TFLOP/s FP8 ceiling. Next hypothesis to PRICE before more surgery: the activation-side bf16→e4m3
 conversion (`moe_bf16x4_to_e4m3x4`, done per MMA from smem inside `K64_COMPUTE_MMA`). If it's large, convert A once
 per tile into smem as e4m3 (byte-exact if it's the same conversion). Branch `perf/moe-prefill-occupancy` 3093686e2.
+
+## 2026-10-29 — A-side conversion is ~free (job 50); the weight dequant + MMA structure are the binders
+
+| kernel | T | normal | ACONV probe | both probes |
+|---|---|---|---|---|
+| gate_up | 2,900 | 9.09 ms | 9.01 | 5.59 |
+| down | 2,900 | 5.39 | 5.48 | 3.54 |
+| gate_up | 19,200 | 34.80 | 34.67 | 17.25 |
+| down | 19,200 | 22.78 | 22.66 | 14.85 |
+
+`moe_bf16x4_to_e4m3x4` costs 1–3%. The weight dequant is 38–50%. Even with both probes the kernels reach only ~32% of
+the FP8 ceiling, so the MMA issue structure is a second, stacked limit. Next byte-exact candidates, in one bench:
+- K_STEP 64 → 128: the same ascending sequence of `m16n8k32` MMAs into each accumulator, so the same per-element order;
+  half the barriers per K, dequant amortized over 2× MMA work. More smem; watch CTAs/SM.
+- A LUT-free FP4 decode (`__byte_perm` / arithmetic) producing the same e4m3 bytes.
+Warp-specialized dequant/MMA warps are the bigger fallback.
