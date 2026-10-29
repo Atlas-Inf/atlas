@@ -148,3 +148,45 @@ fn tool_call_response_carries_reasoning_content() {
         "reasoning_content missing: {json}"
     );
 }
+
+// ── guard_stop wire field (stack/loop-repair, #232) ─────────────────
+
+/// A non-stream choice whose `guard_stop` is set must emit it on the wire;
+/// an ordinary finish must not carry the key at all (PCND).
+#[test]
+fn guard_stop_serializes_on_the_wire_choice_and_is_absent_when_none() {
+    let choice = ChatChoice {
+        index: 0,
+        message: ChatMessage {
+            role: "assistant".into(),
+            reasoning_content: None,
+            content: Some("[atlas] A tool call was blocked by the tool-call guard".into()),
+            tool_calls: None,
+            annotations: None,
+            refusal: None,
+        },
+        finish_reason: "content_filter".into(),
+        logprobs: None,
+        guard_stop: Some(atlas_tool_guard::GUARD_STOP),
+    };
+    let json = serde_json::to_value(&choice).unwrap();
+    assert_eq!(
+        json["guard_stop"].as_str().unwrap_or_default(),
+        atlas_tool_guard::GUARD_STOP,
+        "guard_stop must reach the wire choice"
+    );
+
+    let mut plain = ChatChoice {
+        index: 0,
+        message: choice.message,
+        finish_reason: "stop".into(),
+        logprobs: None,
+        guard_stop: None,
+    };
+    let json = serde_json::to_value(&plain).unwrap();
+    assert!(
+        json.get("guard_stop").is_none(),
+        "ordinary finish must not carry guard_stop"
+    );
+    plain.finish_reason = "stop".into();
+}

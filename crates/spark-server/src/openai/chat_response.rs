@@ -28,6 +28,10 @@ pub struct ChatChoice {
     pub message: ChatMessage,
     pub finish_reason: String,
     pub logprobs: Option<ChoiceLogprobs>,
+    /// Extension field: why the tool-call guard stopped a call, when one did.
+    /// Emitted on the wire as `guard_stop`; absent on ordinary finishes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guard_stop: Option<&'static str>,
 }
 
 /// Token usage and performance timing.
@@ -183,6 +187,7 @@ impl ChatCompletionResponse {
                 },
                 finish_reason: finish_reason.to_string(),
                 logprobs: None,
+                guard_stop: None,
             }],
             usage,
             service_tier: None,
@@ -215,6 +220,7 @@ impl ChatCompletionResponse {
                 },
                 finish_reason: "tool_calls".to_string(),
                 logprobs: None,
+                guard_stop: None,
             }],
             usage,
             service_tier: None,
