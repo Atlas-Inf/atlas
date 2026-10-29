@@ -160,3 +160,13 @@ fn the_rounding_mode_is_pinned() {
     assert_eq!(snap(752, 32), 768, "23.5 rounds to even (24)");
     assert_eq!(snap(854, 32), 864, "26.69 rounds up");
 }
+
+#[test]
+fn the_bounds_are_the_processors_not_the_images() {
+    // The same 224x224 plane: scaled up under the image floor, kept under the video floor.
+    assert_eq!(reference_target(224, 224, 32), (256, 256));
+    assert_eq!(
+        reference_target_within(224, 224, 32, 4_096, 25_165_824),
+        (224, 224)
+    );
+}
