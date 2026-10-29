@@ -64,16 +64,18 @@ pub struct FastSafetensorsLoader {
     /// identical local arithmetic while distributing only its output head.
     pub replicated_expert_prefix: Option<String>,
     pub peak_memory_multiplier: Option<f64>,
-    /// Skip the W4A4 `*.input_scale` activation scales at load.
+    /// Do not upload the W4A4 `*.input_scale` activation scales; defer them
+    /// (every expert's, on every rank) for a model loader that reads them on
+    /// the host.
     ///
     /// ModelOpt NVFP4 checkpoints ship one 0-dim F32 scalar per quantized
     /// projection. On a 512-expert model that is ~74k four-byte allocations,
-    /// each taking a full allocation granule — GBs of padding for values
-    /// Atlas never reads, because it serves w4a16 (BF16 activations) and the
-    /// NVFP4 loader already treats the key as optional.
+    /// each taking a full allocation granule — GBs of padding for scalars a
+    /// loader can read from disk (qwen4_exp's W4A4 prefill tables); the
+    /// NVFP4 loader already treats the uploaded key as optional.
     ///
     /// OPT-IN: `step3p7` reads this key on its own path, so it must stay off
-    /// unless the model's loader is known not to need it.
+    /// unless the model's loader is known not to need it uploaded.
     pub skip_activation_scales: bool,
     /// Skip `mtp.*` tensors at load.
     ///
@@ -406,6 +408,23 @@ mod expert_filter_tests {
         ] {
             assert!(!loader.should_defer_tensor(&name), "{name}");
         }
+    }
+
+    /// Every expert's activation scales -- a remote one's too -- are deferred,
+    /// never uploaded; the rest of an expert keeps the EP filter.
+    #[test]
+    fn activation_scales_are_deferred_for_every_expert() {
+        let mut loader = FastSafetensorsLoader::with_ep(0, 2, 512);
+        loader.skip_activation_scales = true;
+        for e in [3, 300] {
+            let name =
+                format!("model.language_model.layers.7.mlp.experts.{e}.down_proj.input_scale");
+            assert!(!loader.should_skip_tensor(&name));
+            assert!(loader.should_defer_tensor(&name));
+        }
+        let remote = "model.language_model.layers.7.mlp.experts.300.down_proj.weight";
+        assert!(loader.should_skip_tensor(remote));
+        assert!(!loader.should_defer_tensor(remote));
     }
 
     #[test]
