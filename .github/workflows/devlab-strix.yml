@@ -147,7 +147,8 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$SCRIPT" =~ ^scripts/devlab/[A-Za-z0-9_.-]+\.sh$ ]] || { echo "::error::script must be scripts/devlab/<name>.sh (got: $SCRIPT)"; exit 1; }
-          [[ "$ARGS" =~ ^[A-Za-z0-9_./:=,@+-\ ]*$ ]] || { echo "::error::args contain disallowed characters"; exit 1; }
+          args_re='^[A-Za-z0-9_./:=,@+ -]*$'
+          [[ "$ARGS" =~ $args_re ]] || { echo "::error::args contain disallowed characters"; exit 1; }
           [ -f "$SCRIPT" ] || { echo "::error::$SCRIPT not found at this ref"; exit 1; }
           export DEVLAB_OUT="$RUNNER_TEMP/devlab-out"; mkdir -p "$DEVLAB_OUT"
           read -r -a argv <<< "$ARGS"
