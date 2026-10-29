@@ -150,7 +150,7 @@ pub struct VisionEncoder {
     rope_inv_freq: Vec<f32>,      // [head_dim / 4] frequencies
 }
 
-mod enc_impl;
+pub(crate) mod enc_impl;
 
 #[cfg(all(test, feature = "cuda"))]
 #[path = "vision_encoder/glm_oracle_tests.rs"]
