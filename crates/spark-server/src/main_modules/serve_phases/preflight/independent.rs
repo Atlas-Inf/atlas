@@ -18,6 +18,19 @@ pub(crate) fn prepare_reserve<B>(
 }
 
 fn prepare_topology(args: &cli::ServeArgs, config: &mut ModelConfig) -> Result<Option<Topology>> {
+    if spark_model::weight_loader::qwen4exp_mode::selected()?.is_some() {
+        anyhow::ensure!(
+            !args.no_fast_load && std::env::var("ATLAS_FAST_LOAD").as_deref() != Ok("0"),
+            "Qwen serving modes require fast loading to retain deferred input scales"
+        );
+        let topology = resolve_topology(args, config)?;
+        spark_model::weight_loader::qwen4exp_mode::validate(
+            config,
+            args.speculative,
+            args.dflash || args.self_speculative || args.ngram_speculative,
+        )?;
+        return Ok(Some(topology));
+    }
     if spark_model::speculative::glm_repair_policy::long_context_enabled() {
         anyhow::ensure!(
             args.dflash

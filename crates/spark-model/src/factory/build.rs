@@ -71,6 +71,11 @@ pub fn build_model(
     // encoder-decoder checkpoint). `None` = base model.
     nllb_lora_dir: Option<std::path::PathBuf>,
 ) -> Result<Box<dyn Model>> {
+    crate::weight_loader::qwen4_exp::mode::validate(
+        &config,
+        use_speculative,
+        self_speculative || dflash_args.is_some(),
+    )?;
     super::glm_sparse_decode::initialize(
         gpu.as_ref(),
         super::glm_sparse_decode::BuildPolicy {
@@ -308,6 +313,9 @@ pub fn build_model(
             ) {
                 Ok(m) => m,
                 Err(e) => {
+                    if crate::weight_loader::qwen4_exp::mode::selected()?.is_some() {
+                        return Err(e.context("Qwen serving mode requires a working MTP module"));
+                    }
                     tracing::error!("qwen4_exp MTP module load FAILED: {e:#}");
                     None
                 }
@@ -316,6 +324,12 @@ pub fn build_model(
             None
         };
     let q4e_mtp_loaded = q4e_mtp_module.is_some();
+    anyhow::ensure!(
+        crate::weight_loader::qwen4_exp::mode::selected()?.is_none()
+            || config.ep_rank != 0
+            || q4e_mtp_loaded,
+        "Qwen serving mode requires checkpoint MTP weights on rank 0"
+    );
     let q4e_mtp_embed = embed;
     let q4e_mtp_lm_head = lm_head;
 
@@ -991,9 +1005,14 @@ pub fn build_model(
                      reused full-attention body)"
                 );
             }
-            Err(e) => tracing::warn!(
-                "Failed to build qwen4_exp MTP proposer: {e:#}. Speculative decoding disabled."
-            ),
+            Err(e) => {
+                if crate::weight_loader::qwen4_exp::mode::selected()?.is_some() {
+                    return Err(e.context("Qwen serving mode requires a working MTP proposer"));
+                }
+                tracing::warn!(
+                    "Failed to build qwen4_exp MTP proposer: {e:#}. Speculative decoding disabled."
+                );
+            }
         }
     }
 

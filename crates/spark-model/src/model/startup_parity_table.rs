@@ -35,6 +35,14 @@ const GLM: &str = "glm5_next";
 /// The settings read in this crate: name, and this process's value from the
 /// feature's own parser. One entry per setting.
 pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
+    ("ATLAS_QWEN4EXP_SERVING_MODE", || {
+        use crate::weight_loader::qwen4_exp::mode::{ServingMode, selected};
+        Ok(match selected()? {
+            None => 0,
+            Some(ServingMode::Strict) => 1,
+            Some(ServingMode::Spark) => 2,
+        })
+    }),
     // A rank that would only warn beside one that fails.
     (
         "ATLAS_STARTUP_PARITY=warn",
