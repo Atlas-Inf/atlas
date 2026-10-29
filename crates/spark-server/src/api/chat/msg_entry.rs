@@ -84,6 +84,7 @@ struct MediaInput {
     uri: String,
 }
 
+<<<<<<< HEAD
 /// Append every media part on `m` to `media` **in content order**, growing
 /// `image_pad_counts` in lockstep (each pad count is filled in later by the
 /// preprocessor). Shared by the tool-message branch and the normal branch so
@@ -211,6 +212,8 @@ fn resolve_media_uri(
 }
 
 #[allow(clippy::result_large_err)]
+=======
+>>>>>>> 177b23e7f
 pub(super) fn build_msg_entries(
     admit: super::vision_admit::AdmitCtx<'_>,
     vision_config: Option<&VisionConfig>,
@@ -314,7 +317,7 @@ pub(super) fn build_msg_entries(
                 media: m.media_kinds(),
                 reasoning_content: None,
             });
-            collect_message_media(m, &mut media, &mut image_pad_counts, remote_images)?;
+            media::collect_message_media(m, &mut media, &mut image_pad_counts, remote_images)?;
             continue;
         }
 
@@ -361,7 +364,7 @@ pub(super) fn build_msg_entries(
                 None
             },
         });
-        collect_message_media(m, &mut media, &mut image_pad_counts, remote_images)?;
+        media::collect_message_media(m, &mut media, &mut image_pad_counts, remote_images)?;
     }
 
     // P1-6 (2026-07-09): duplicate-error observation masking
@@ -374,8 +377,8 @@ pub(super) fn build_msg_entries(
     // ATLAS_NO_ERROR_DEDUP=1 restores verbatim history. MUST run
     // before the vacuous-system removal below — the recorded indices
     // refer to the un-shifted `messages` vec.
-    if tools_active && !error_dedup_disabled() {
-        for (idx, replacement) in duplicate_error_masks(&tool_result_originals) {
+    if tools_active && !tail::error_dedup_disabled() {
+        for (idx, replacement) in tail::duplicate_error_masks(&tool_result_originals) {
             messages[idx].content = replacement;
         }
     }
@@ -426,7 +429,7 @@ pub(super) fn build_msg_entries(
     // bare `Label:` line qualifies; any substantive prompt is untouched.
     if messages
         .first()
-        .is_some_and(|m| m.role == "system" && is_vacuous_system_content(&m.content))
+        .is_some_and(|m| m.role == "system" && tail::is_vacuous_system_content(&m.content))
     {
         let removed = messages.remove(0);
         tracing::info!(
@@ -492,7 +495,12 @@ pub(super) fn build_msg_entries(
                 }
                 MediaKind::Video => {
                     if reserve_decode {
+<<<<<<< HEAD
                         let ceiling = qwen_video_rows_ceiling(vcfg, vision_max_pixels, video);
+=======
+                        let ceiling =
+                            media::qwen_video_rows_ceiling(vcfg, vision_max_pixels, video);
+>>>>>>> 177b23e7f
                         admission.reserve_video(ceiling)?;
                     }
                     match spark_model::vision_preprocess::decode_gated(|| {
@@ -591,100 +599,16 @@ pub(super) fn build_msg_entries(
     })
 }
 
-/// True when a system message carries no actual instruction and should
-/// be treated as absent. Conservative by design — a substantive prompt
-/// must never be stripped:
-///   * empty / whitespace-only body, OR
-///   * a single short bare label line ending in ':' with nothing after
-///     it (e.g. `User Context:`, `Context:`, `System:`) — the residue
-///     of an empty client template (Open WebUI's RAG/context block).
-/// Anything multi-line, or with any text past the colon, is a real
-/// prompt and returns false.
-fn is_vacuous_system_content(content: &str) -> bool {
-    let t = content.trim();
-    if t.is_empty() {
-        return true;
-    }
-    if !t.contains('\n') && t.len() <= 32 && t.ends_with(':') {
-        let label = &t[..t.len() - 1];
-        return !label.is_empty()
-            && label
-                .chars()
-                .all(|c| c.is_ascii_alphabetic() || c == ' ' || c == '_' || c == '-');
-    }
-    false
-}
-
-/// P1-6 (2026-07-09): kill-switch — `ATLAS_NO_ERROR_DEDUP=1` restores
-/// verbatim duplicate-error history (disables the masking pass).
-fn error_dedup_disabled() -> bool {
-    std::env::var("ATLAS_NO_ERROR_DEDUP").as_deref() == Ok("1")
-}
-
-/// P1-6 (2026-07-09): duplicate-error observation masking.
-///
-/// Input: `(message_index, original_pre_hint_text)` for every
-/// tool-result entry, in conversation order. Output: `(message_index,
-/// replacement_text)` for the OLDER members of each duplicate-error
-/// group; the newest member of each group stays verbatim. Two
-/// tool results are duplicates when BOTH are error-shaped
-/// (`crate::hint_injector::looks_like_error`) AND either equal after
-/// trim or Jaccard >= 0.9 over 4-gram shingles (the loop_detector
-/// measure — SSOT). Successful outputs never participate: identical
-/// success observations (e.g. repeated `ls`) are legitimate.
-fn duplicate_error_masks(tool_results: &[(usize, String)]) -> Vec<(usize, String)> {
-    const NEAR_DUP_JACCARD: f64 = 0.9;
-    let errors: Vec<(usize, &str)> = tool_results
-        .iter()
-        .filter(|(_, t)| crate::hint_injector::looks_like_error(t))
-        .map(|(i, t)| (*i, t.trim()))
-        .collect();
-    if errors.len() < 2 {
-        return Vec::new();
-    }
-    let shingle_sets: Vec<_> = errors
-        .iter()
-        .map(|(_, t)| crate::loop_detector::shingle_set(t))
-        .collect();
-    // First-match grouping against each group's first member. Short
-    // errors (< 4 tokens) have empty shingle sets — jaccard() returns
-    // 0.0 for those, so they group via exact-trim match only.
-    let mut groups: Vec<Vec<usize>> = Vec::new(); // indices into `errors`
-    for i in 0..errors.len() {
-        let group = groups.iter_mut().find(|g| {
-            let rep = g[0];
-            errors[rep].1 == errors[i].1
-                || crate::loop_detector::jaccard(&shingle_sets[rep], &shingle_sets[i])
-                    >= NEAR_DUP_JACCARD
-        });
-        match group {
-            Some(g) => g.push(i),
-            None => groups.push(vec![i]),
-        }
-    }
-    let mut masks = Vec::new();
-    for g in &groups {
-        let n = g.len();
-        if n < 2 {
-            continue;
-        }
-        // Keep the LAST (newest) verbatim; mask the earlier ones.
-        for (k, &ei) in g.iter().take(n - 1).enumerate() {
-            masks.push((
-                errors[ei].0,
-                format!("[same error as below, attempt {} of {}]", k + 1, n),
-            ));
-        }
-    }
-    masks
-}
-
-#[cfg(test)]
 #[path = "msg_entry_tests.rs"]
 mod msg_entry_tests;
 
 // A sibling file rather than a module inside `msg_entry_tests.rs`: these cases
 // carried that file past the 500-LoC cap.
+#[path = "msg_entry/media.rs"]
+mod media;
 #[cfg(test)]
 #[path = "msg_entry_media_order_tests.rs"]
 mod msg_entry_media_order_tests;
+
+#[path = "msg_entry/tail.rs"]
+mod tail;

@@ -9,7 +9,7 @@
 //! nothing here has to decode: a URI is carried verbatim at this stage, so
 //! the cases run without a vision config, real pixels, or ffmpeg.
 
-use super::collect_message_media;
+use super::media::collect_message_media;
 use crate::ir::MediaKind;
 use crate::ir::message::{ContentPart, ImageData, ImageSource, Message, Role, VideoSource};
 
