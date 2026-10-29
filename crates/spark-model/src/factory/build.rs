@@ -831,7 +831,11 @@ pub fn build_model(
         index: sparse_index,
         tail_slots,
         latent_shard: glm_cache_plan.and_then(|p| p.shard()),
-    };
+        // Native proposer bytes per logical block; always remain in system
+        // memory (Enntity/atlas 4d75b9ec).
+        auxiliary_block_bytes: 0,
+    }
+    .with_per_token_aux(aux_bytes_per_token)?;
     let (blocks, kv_placement) = if hss_cache_blocks_per_seq.is_none() {
         kv_carveout::extend(gpu.as_ref(), kv_shape, num_kv_blocks)
     } else {

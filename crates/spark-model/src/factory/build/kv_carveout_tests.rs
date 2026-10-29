@@ -34,6 +34,7 @@ fn sparkglm(config: &KvCacheConfig) -> KvShape<'_> {
             sequences: 5,
         }),
         latent_shard: None,
+        auxiliary_block_bytes: 0,
     }
 }
 
@@ -97,6 +98,7 @@ fn a_generic_cache_with_separate_k_and_v_grows_too() {
         index: None,
         tail_slots: None,
         latent_shard: None,
+        auxiliary_block_bytes: 0,
     };
     let (n, placement) = plan(shape, 1_000, 64 * MIB);
     assert!(n > 1_000);
@@ -171,4 +173,54 @@ fn a_shards_pool_is_sized_at_its_local_slots() {
     assert_eq!(shape.side_bytes(1000), shape.side_bytes(2000));
     assert_eq!(shape.side_bytes(100_002) - shape.side_bytes(100_000), 4);
     assert_eq!(sparkglm(&cfg).side_bytes(100_000), 0);
+}
+
+// Ported from Enntity/atlas 4d75b9ec (AGPL-3.0-only).
+#[test]
+fn qwen_carveout_growth_reserves_indexer_state_for_every_added_token() {
+    let mut cfg = config(12, KvCacheDtype::Bf16);
+    cfg.head_dim = 256;
+    let bare = KvShape {
+        config: &cfg,
+        v_aliases_k: false,
+        index: None,
+        tail_slots: None,
+        latent_shard: None,
+        auxiliary_block_bytes: 0,
+    };
+    let shape = bare.with_per_token_aux(768).unwrap();
+    let budgeted = 208_676;
+    let (n, placement) = plan(shape, budgeted, GB10);
+    assert!(n > budgeted);
+    let actual = |blocks, placement: &KvPlacement| {
+        bare.system_bytes(blocks, placement) + blocks * cfg.block_size * 768
+    };
+    let budget = actual(budgeted, &KvPlacement::default());
+    assert!(actual(n, &placement) <= budget);
+    assert!(carveout_footprint(shape, n, &placement) <= GB10);
+    let over = KvPlacement::plan(&shape.buffers(n + 1), GB10);
+    assert!(actual(n + 1, &over) > budget);
+    let (old_n, old_placement) = plan(bare, budgeted, GB10);
+    assert!(actual(old_n, &old_placement) > budget);
+    assert!(bare.with_per_token_aux(usize::MAX).is_err());
+}
+
+/// A model with no per-token aux (no QSA indexer) keeps the parent's block
+/// count and placement — `with_per_token_aux(0)` is a no-op.
+#[test]
+fn carveout_growth_is_unchanged_without_per_token_aux() {
+    let cfg = config(12, KvCacheDtype::Bf16);
+    let bare = KvShape {
+        config: &cfg,
+        v_aliases_k: false,
+        index: None,
+        tail_slots: None,
+        latent_shard: None,
+        auxiliary_block_bytes: 0,
+    };
+    let budgeted = 208_676;
+    assert_eq!(
+        plan(bare, budgeted, GB10),
+        plan(bare.with_per_token_aux(0).unwrap(), budgeted, GB10),
+    );
 }
