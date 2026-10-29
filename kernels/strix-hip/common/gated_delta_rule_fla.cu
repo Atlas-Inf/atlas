@@ -32,6 +32,13 @@ typedef float  v8f   __attribute__((ext_vector_type(8)));
 // log(0)=-inf → exp(gc_i-gc_l) NaNs in the chunked log-space form.
 #define GATE_FLOOR 1e-30f
 
+// chunk_delta_h_vfused stages each chunk's W/U/K into LDS as 16-byte loads (K rows fall back to the element loop
+// when the key row base is not 16-byte aligned) and computes the chunk's decay terms across threads. The bytes
+// and the expf operands are the same, so the spine is bit-identical. strix s126 (27B geometry, 48 v-heads, one
+// 2048-token chunk): 6.0-6.7 ms -> 3.8-3.9 ms. The element-wise staging was the spine's critical path (splitting
+// the v columns over more CTAs made it 2-4x slower, s125).
+#define GDN_VEC_STAGE
+
 // Per-stream prefill geometry — identical to the gb10 macro (varlen reads
 // cu_seqlens/cu_chunks; uniform reduces to b*seq_len / b*num_chunks).
 struct GdnGeom { unsigned int seqlen, nchunks, choff; unsigned long long tokoff; };
@@ -304,22 +311,47 @@ gated_delta_rule_chunk_delta_h_vfused(
 
         __syncthreads();
         const __nv_bfloat16* Wsrc = W_in + base * CHUNK * K_DIM;
+        const __nv_bfloat16* Usrc0 = U_in + base * CHUNK * V_DIM;
+#ifdef GDN_VEC_STAGE
+        // 16-byte staging (same bytes as the element loops below). W/U are chunk-contiguous; K rows are
+        // contiguous along kx, so a row gathers as K_DIM/8 uint4 when the key row base is 16-byte aligned.
+        const bool kvec = ((((unsigned long long)(key_b + kh * k_dim)) & 15ull) == 0) && (qk_stride % 8 == 0);
+        for (unsigned int e = t; e < CHUNK * K_DIM / 8; e += nthr) ((uint4*)Wp)[e] = ((const uint4*)Wsrc)[e];
+        for (unsigned int e = t; e < CHUNK * V_DIM / 8; e += nthr) ((uint4*)Up)[e] = ((const uint4*)Usrc0)[e];
+        if (kvec) {
+            for (unsigned int e = t; e < CHUNK * K_DIM / 8; e += nthr) {
+                unsigned int i = (e * 8) / K_DIM, kx = (e * 8) % K_DIM;
+                ((uint4*)Kp)[e] = (i < ce)
+                    ? *(const uint4*)&key_b[(unsigned long long)(cs + i) * qk_stride + kh * k_dim + kx]
+                    : make_uint4(0, 0, 0, 0);
+            }
+        } else
+#endif
+        {
+#ifndef GDN_VEC_STAGE
         for (unsigned int e = t; e < CHUNK * K_DIM; e += nthr) Wp[e] = Wsrc[e];
+        for (unsigned int e = t; e < CHUNK * V_DIM; e += nthr) Up[e] = Usrc0[e];
+#endif
         for (unsigned int e = t; e < CHUNK * K_DIM; e += nthr) {
             unsigned int i = e / K_DIM, kx = e % K_DIM;
             Kp[e] = (i < ce)
                 ? key_b[(unsigned long long)(cs + i) * qk_stride + kh * k_dim + kx]
                 : __float2bfloat16(0.0f);
         }
-        {
-            const __nv_bfloat16* Usrc0 = U_in + base * CHUNK * V_DIM;
-            for (unsigned int e = t; e < CHUNK * V_DIM; e += nthr) Up[e] = Usrc0[e];
         }
+#ifdef GDN_VEC_STAGE
+        {   // decay terms across threads: each value is the same expf of the same operands.
+            const float dl = gc_in[base * CHUNK + ce - 1];
+            if (t == 0) decs[0] = expf(dl);
+            if (t < ce) decs[1 + t] = expf(dl - gc_in[base * CHUNK + t]);
+        }
+#else
         if (t == 0) {
             float dl = gc_in[base * CHUNK + ce - 1];
             decs[0] = expf(dl);
             for (unsigned int i = 0; i < ce; i++) decs[1 + i] = expf(dl - gc_in[base * CHUNK + i]);
         }
+#endif
         __syncthreads();
 
         #pragma unroll
