@@ -246,6 +246,7 @@ pub(crate) fn load_model(
         enabled: args.video_allow_ffmpeg,
         binary: args.video_ffmpeg_path.clone(),
         max_frames: args.video_max_frames,
+        max_total_decoded_pixels: args.video_max_pixels,
         timeout_secs: args.video_decode_timeout_s,
         ..Default::default()
     };
