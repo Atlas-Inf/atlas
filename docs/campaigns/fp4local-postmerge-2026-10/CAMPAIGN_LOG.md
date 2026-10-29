@@ -1231,3 +1231,13 @@ Next (byte-exact, same MMA + per-element K order):
 - **K2a:** persistent CTAs (SMs × 4) pull (expert, M-tile, N-tile) items from a device-built, hot-expert-first work
   list. Same tile body and per-element K order, so byte-exact. Gate: identical + sanitizer clean + gate_up ≥ 1.3× at
   T = 2,900, with down not slower. If it wins, the per-layer expert-count readback may become removable too.
+
+## 2026-10-29 — K2a bench: stale embedded PTX caught; readback confirmed removable with the work queue
+
+Jobs 47/47b ran a binary with the OLD embedded PTX (`strings`: `_v64` present, `_wq` absent) even after
+`cargo clean -p atlas-kernels`. Same class as the AGENTS.md stale-artifact warning. Rule for this workstream: every
+kernel bench/gate builds in a brand-new worktree with a fresh `target/` at the exact SHA, and checks with `strings` that
+the new symbols are present and the removed ones absent before timing. Their production baselines still hold
+(gate_up 9.0 ms, down 5.3 ms at T = 2,900). Confirmed in source: the per-layer 2,052-byte expert-offset D2H
+(`forward_prefill_routed.rs:110`) only feeds `max_m_tiles` (grid sizing), so a device-built work queue makes it
+unnecessary. Re-run as job 47c.
