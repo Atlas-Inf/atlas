@@ -373,6 +373,7 @@ fn the_table_carries_each_setting_once() {
         "ATLAS_QWEN4EXP_PREFILL_HOST_IDS",
         "ATLAS_QWEN4EXP_MXFP8_DECODE",
         "ATLAS_QWEN4EXP_PREFILL_W8A8",
+        "ATLAS_QWEN4EXP_MXFP8_SHARED",
     ] {
         assert_eq!(
             names.iter().filter(|&&n| n == required).count(),

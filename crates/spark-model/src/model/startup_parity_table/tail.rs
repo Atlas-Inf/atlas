@@ -54,6 +54,11 @@ pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_PREFILL_W8A8", || {
         Ok(crate::layers::ops::qwen4exp_w8a8::enabled() as u64)
     }),
+    // Which shared expert a rank loads: under EP SparkQwen's is a slice whose
+    // partial joins the reduce, the other a whole one added after it.
+    ("ATLAS_QWEN4EXP_MXFP8_SHARED", || {
+        Ok(crate::layers::moe::shared_mxfp8_requested() as u64)
+    }),
     ("ATLAS_SSM_SAVE_DUMP", || {
         Ok(graph_flags::ssm_save_dump() as u64)
     }),

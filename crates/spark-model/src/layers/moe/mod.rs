@@ -101,6 +101,10 @@ pub(crate) enum SeparateSharedExpert {
         kernels: ops::Mxfp8ProjKernels,
         scratch: ops::Mxfp8Scratch,
     },
+    /// The same checkpoint bytes as SparkQwen serves them
+    /// (`ATLAS_QWEN4EXP_MXFP8_SHARED=1`, `shared_mxfp8.rs`): tensor-core
+    /// SwiGLU tiers, W8A8 prefill, and under EP this rank's slice.
+    Mxfp8Native(Mxfp8SharedExpert),
 }
 
 /// The fused small-row arm of a [`SeparateSharedExpert::Mxfp8`].
@@ -224,6 +228,8 @@ mod helpers_a;
 mod helpers_b;
 mod helpers_c;
 mod helpers_shared;
+mod shared_mxfp8;
+pub(crate) use shared_mxfp8::{Mxfp8SharedExpert, requested as shared_mxfp8_requested};
 mod route_dump;
 mod shared_fp8_cache;
 mod shared_fp8_cache_load;
