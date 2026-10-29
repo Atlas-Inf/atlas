@@ -90,6 +90,40 @@ struct MediaInput {
 /// media rides every role uniformly — including tool results, the motivating
 /// case for issue #165.
 #[allow(clippy::result_large_err)]
+
+/// Worst-case vision rows one video clip can take: the encoder's per-frame
+/// pixel bound times the frame cap (padded up to whole temporal groups — the
+/// preprocessor repeats an odd final frame to fill its group), against the
+/// checkpoint's video bound when one is configured. Upper bound; the actual
+/// groups are reconciled after decode (Enntity/atlas d0cead1).
+fn qwen_video_rows_ceiling(
+    vcfg: &atlas_core::config::VisionConfig,
+    max_pixels: Option<usize>,
+    video: &VideoDecode<'_>,
+) -> usize {
+    let ps = vcfg.patch_size.max(1);
+    let sms = vcfg.spatial_merge_size.max(1);
+    let tp = vcfg.temporal_patch_size.max(1);
+    let p_max = spark_model::layers::vision_encoder::derive_max_patches(max_pixels, ps).0;
+    let per_frame_pixels = p_max.saturating_mul(ps).saturating_mul(ps);
+    let max_frames = video.ffmpeg.max_frames.max(1);
+    let padded_frames = max_frames.div_ceil(tp).saturating_mul(tp);
+    let frame_volume = padded_frames.saturating_mul(per_frame_pixels);
+    let configured_volume = vcfg
+        .video_pixels
+        .map(|bounds| bounds.max_pixels)
+        .filter(|&pixels| pixels > 0)
+        .unwrap_or(usize::MAX);
+    let volume = configured_volume.min(frame_volume);
+    let row_pixels = tp
+        .saturating_mul(ps)
+        .saturating_mul(ps)
+        .saturating_mul(sms)
+        .saturating_mul(sms)
+        .max(1);
+    volume.div_ceil(row_pixels).max(1)
+}
+
 fn collect_message_media(
     m: &Message,
     media: &mut Vec<MediaInput>,
@@ -420,6 +454,9 @@ pub(super) fn build_msg_entries(
                 "this model does not accept image or video input (no vision config)".to_string(),
             ));
         };
+        let reserve_decode = media.iter().any(|m| m.kind == MediaKind::Video)
+            && !vcfg.is_glm5_next
+            && video.ffmpeg.max_total_decoded_pixels.is_some();
         for (idx, input) in media.iter().enumerate() {
             let (item, video_timestamps) = match input.kind {
                 MediaKind::Image => {
@@ -454,13 +491,19 @@ pub(super) fn build_msg_entries(
                     }
                 }
                 MediaKind::Video => {
-                    match spark_model::video_preprocess::preprocess_video(
-                        &input.uri,
-                        vcfg,
-                        vision_max_pixels,
-                        video.fps,
-                        video.ffmpeg,
-                    ) {
+                    if reserve_decode {
+                        let ceiling = qwen_video_rows_ceiling(vcfg, vision_max_pixels, video);
+                        admission.reserve_video(ceiling)?;
+                    }
+                    match spark_model::vision_preprocess::decode_gated(|| {
+                        spark_model::video_preprocess::preprocess_video(
+                            &input.uri,
+                            vcfg,
+                            vision_max_pixels,
+                            video.fps,
+                            video.ffmpeg,
+                        )
+                    }) {
                         Ok(v) => {
                             let timestamps = if vcfg.is_qwen3vl_video {
                                 v.timestamps_hf.clone()
@@ -488,6 +531,9 @@ pub(super) fn build_msg_entries(
             };
             image_pad_counts[idx] = item.pad_count(vcfg.spatial_merge_size);
             admission.note(image_pad_counts[idx])?;
+            if reserve_decode {
+                admission.reconcile_video(image_pad_counts[idx])?;
+            }
             if vcfg.is_glm5_next || vcfg.is_qwen3vl_video {
                 vision_placeholders.push(glm5_vision::placeholder(
                     input.kind,
