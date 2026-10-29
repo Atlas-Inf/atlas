@@ -138,28 +138,48 @@ pub(super) fn read_probe(
     mut child: std::process::Child,
     timeout_secs: u64,
 ) -> Result<(Vec<u8>, String, std::process::ExitStatus)> {
-    let mut out = Vec::new();
-    let read_res = child
-        .stdout
-        .take()
-        .context("no ffprobe stdout pipe")?
-        .read_to_end(&mut out);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.max(1));
-    let status = loop {
-        match child.try_wait().context("waiting for ffprobe")? {
-            Some(s) => break s,
-            None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("probing the clip's duration exceeded {timeout_secs}s and was stopped");
+    let mut stdout = child.stdout.take().context("no ffprobe stdout pipe")?;
+    let mut stderr = child.stderr.take().context("no ffprobe stderr pipe")?;
+    let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+    // A blocked stdout read can outlive any deadline that is only checked
+    // after it; the watchdog runs in its own thread so a hung probe is
+    // killed while the read is in flight, which is what lets the read
+    // finish (Enntity/atlas 8fe99bfe).
+    let watchdog = {
+        let child = std::sync::Arc::clone(&child);
+        let secs = timeout_secs.max(1);
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            loop {
+                let mut guard = child.lock().unwrap();
+                match guard.try_wait() {
+                    Ok(Some(_)) => return false,
+                    Ok(None) if std::time::Instant::now() >= deadline => {
+                        let _ = guard.kill();
+                        let _ = guard.wait();
+                        return true;
+                    }
+                    _ => {}
+                }
+                drop(guard);
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            None => std::thread::sleep(std::time::Duration::from_millis(50)),
-        }
+        })
     };
+    let mut out = Vec::new();
+    let read_res = stdout.read_to_end(&mut out);
     let mut err_text = String::new();
-    if let Some(mut e) = child.stderr.take() {
-        let _ = e.read_to_string(&mut err_text);
-    }
+    let _ = stderr.read_to_string(&mut err_text);
+    let killed = watchdog.join().unwrap_or(true);
+    ensure!(
+        !killed,
+        "probing the clip's duration exceeded {timeout_secs}s and was stopped"
+    );
     read_res.context("reading the ffprobe report")?;
+    let status = child
+        .lock()
+        .unwrap()
+        .wait()
+        .context("waiting for ffprobe")?;
     Ok((out, err_text, status))
 }
