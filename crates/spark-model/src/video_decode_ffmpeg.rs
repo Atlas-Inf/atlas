@@ -458,6 +458,7 @@ fn run_ffmpeg(
     Ok((frames, times))
 }
 
+#[cfg(test)]
 #[path = "video_decode_ffmpeg_tests.rs"]
 mod tests;
 
