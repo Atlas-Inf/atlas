@@ -1352,3 +1352,12 @@ Design (byte-exact target), starting with the down kernel (`grouped_gemm_ptrtabl
 - Gate per kernel: identical outputs, sanitizer clean (memcheck + racecheck), ≥ 1.25× at T = 2,900, not slower at
   19,200. Then gate_up with its 2N gate/up handling unchanged. Then wiring (+ dropping the per-layer expert-count D2H if
   it becomes unnecessary) and the full gate (control, prefill TTFT A/B, agentic, BFCL).
+
+## 2026-10-29 06:16 UTC — W1 `_ws` down kernel: built, first sanitizer bug fixed, job 52d timed out in racecheck
+
+`moe_w4a16_grouped_gemm_ptrtable_t_k64_ws` (branch `perf/moe-prefill-occupancy` e01e7a38e): 2 producer warps
+(loads + LUT dequant into a 2-stage ring) + 4 consumer warps (production MMA/epilogue), named `bar.arrive`/`bar.sync`
+(ids 1–4, 192-thread counts), no CTA-wide barrier in the K loop. Memcheck caught producers using the 128-thread row
+stride (OOB on `smem_tok`/`smem_Bp`); fixed. Job 52d was killed at its 60-min timeout inside racecheck before timing
+ran. Next: timing + identity first, memcheck at small T, and racecheck on a minimal config (1–2 experts, 1 iteration)
+in its own job.
