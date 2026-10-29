@@ -358,8 +358,8 @@ pub(super) fn load(
     let dilation = config.emb_neighbor_num; // conv dilation IS ngram_size
     tracing::info!(
         "PLE at MODEL LAYER {layer_idx} (ple_layer_ids={:?}, 1-indexed): \
-         {} shards over {} file(s) x {rows_per} rows x {head_dim} dims = {} rows \
-         ({:.1} GB {dtype:?}) \
+         {} shards over {} file(s) x {rows_per} rows x {head_dim} cols = {} rows \
+         of {slot_bytes} B ({:.1} GB {dtype:?}) \
          served off NVMe with {slots} cached slots ({:.1} MB, {slots_from}: \
          span {span} x {heads} heads, floored at 65536); \
          scratch {span} tokens = {:.2} GB (ATLAS_PLE_CHUNK={chunk}); \
@@ -368,8 +368,8 @@ pub(super) fn load(
         shards.len(),
         distinct_files,
         shards.len() * rows_per,
-        (shards.len() * rows_per * head_dim * elem) as f64 / 1e9,
-        (slots * head_dim * 2) as f64 / 1e6,
+        (shards.len() * rows_per * slot_bytes) as f64 / 1e9,
+        (slots * slot_bytes) as f64 / 1e6,
         (span * 10240 * 14) as f64 / 1e9,
         config.ple_conv_kernel_size,
         (config.ple_conv_kernel_size - 1) * dilation,
