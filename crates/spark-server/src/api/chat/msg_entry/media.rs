@@ -1,14 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Message-entry media collection/admission helpers (extracted from `msg_entry.rs`).
+//! Message-entry media collection helpers (extracted from `msg_entry.rs`).
 
 use super::*;
 
-/// Worst-case vision rows one video clip can take: the encoder's per-frame
-/// pixel bound times the frame cap (padded up to whole temporal groups — the
-/// preprocessor repeats an odd final frame to fill its group), against the
-/// checkpoint's video bound when one is configured. Upper bound; the actual
-/// groups are reconciled after decode (Enntity/atlas d0cead1).
+#[allow(clippy::result_large_err)]
 pub(super) fn qwen_video_rows_ceiling(
     vcfg: &atlas_core::config::VisionConfig,
     max_pixels: Option<usize>,
