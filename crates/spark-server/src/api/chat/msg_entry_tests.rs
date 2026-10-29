@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod error_dedup_tests {
-    use super::super::duplicate_error_masks;
+    use super::super::tail::duplicate_error_masks;
 
     #[test]
     fn exact_duplicate_errors_mask_older_keep_newest() {
@@ -88,7 +88,7 @@ mod glm5_video_metadata_tests {
 
 #[cfg(test)]
 mod vacuous_system_tests {
-    use super::super::is_vacuous_system_content;
+    use super::super::tail::is_vacuous_system_content;
 
     #[test]
     fn empty_or_whitespace_is_vacuous() {
