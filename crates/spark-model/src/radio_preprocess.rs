@@ -119,7 +119,7 @@ pub fn pixel_shuffle_v2_permutation(a: usize, b: usize, c: usize) -> Vec<u32> {
 use anyhow::Result;
 use atlas_core::config::VisionConfig;
 
-use super::vision_preprocess::decode_image;
+use crate::vision_preprocess::decode_image;
 
 /// Omni (`nemotron_h_omni`) image preprocessing, the port of
 /// `image_processing_nemotron_h_omni.py`:

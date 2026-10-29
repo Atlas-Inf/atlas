@@ -12,31 +12,76 @@
 //!
 //! Vision-token count is the observable that moves when preprocessing
 //! changes, and the server reports it for free in `usage.prompt_tokens`. This
-//! module is the model those assertions are checked against.
+//! module is the model those assertions are checked against: the reference
+//! processor's `smart_resize` (`Qwen2VLImageProcessorFast`, which Qwen3-VL
+//! checkpoints declare), not any one engine's approximation of it.
 
-/// Snap a side to the patch grid, the way the preprocessor does when no
-/// downscale is required: `round(side / grid) * grid`.
+/// The reference processor's lower area bound for patch 16 / merge 2
+/// checkpoints: `size.shortest_edge` in their `preprocessor_config.json`
+/// (Qwen3.8-Flash-Next-FP4-Local declares 65536, i.e. 256×256). An image
+/// smaller than this is scaled UP until it covers it. Two ladder rungs sit
+/// below it (224×224, which is also the calibration fixture, and the 8×8
+/// tiny), so their expectations depend on it.
+pub const MIN_PIXELS: u64 = 65_536;
+/// The matching upper bound (`size.longest_edge`, 16777216 = 4096×4096). The
+/// ladder sits inside it on purpose, so no rung depends on it.
+pub const MAX_PIXELS: u64 = 16_777_216;
+
+/// Snap a side to the patch grid, the way the reference preprocessor does
+/// when no rescale is required: Python's `round(side / grid) * grid`.
 ///
-/// `f32::round` is half-away-from-zero, which is what makes 336 → 352 rather
-/// than 320. Pinned by `the_rounding_mode_is_pinned`; if
-/// the engine ever switches to half-even this model must move with it or every
-/// expectation silently drifts by one grid unit.
+/// Python's `round` is half-to-EVEN, which is what makes 336 → 320 and
+/// 720 → 704 (10.5 → 10, 22.5 → 22). Pinned by `the_rounding_mode_is_pinned`.
+/// Before 2026-10-29 this model used half-away-from-zero (336 → 352), which
+/// matched the engine of the time but not the processor the checkpoint was
+/// trained with. The engine moved to the reference rounding with #237, and
+/// this model moved with it.
 pub fn snap(side: u32, grid: u32) -> u32 {
-    (((side as f32) / (grid as f32)).round() as u32).max(1) * grid
+    ((((side as f64) / (grid as f64)).round_ties_even() as u32).max(1)) * grid
+}
+
+/// [`reference_target`] under explicit area bounds, for a processor whose
+/// `size.shortest_edge` / `size.longest_edge` differ from the image
+/// processor's (the video processor declares its own).
+pub fn reference_target_within(
+    w: u32,
+    h: u32,
+    grid: u32,
+    min_pixels: u64,
+    max_pixels: u64,
+) -> (u32, u32) {
+    let (wf, hf, g) = (w as f64, h as f64, grid as f64);
+    let (mut sw, mut sh) = (snap(w, grid) as f64, snap(h, grid) as f64);
+    if sw * sh > max_pixels as f64 {
+        let beta = (wf * hf / max_pixels as f64).sqrt();
+        sw = g.max((wf / beta / g).floor() * g);
+        sh = g.max((hf / beta / g).floor() * g);
+    } else if sw * sh < min_pixels as f64 {
+        let beta = (min_pixels as f64 / (wf * hf)).sqrt();
+        sw = (wf * beta / g).ceil() * g;
+        sh = (hf * beta / g).ceil() * g;
+    }
+    (sw as u32, sh as u32)
+}
+
+/// The reference `smart_resize` target for a `w × h` image: both sides snapped
+/// to `grid`, then, if the snapped area is outside `[MIN_PIXELS, MAX_PIXELS]`,
+/// rescaled by the area ratio (floored to the grid going down, ceiled going
+/// up), exactly as `transformers`' `smart_resize` does.
+pub fn reference_target(w: u32, h: u32, grid: u32) -> (u32, u32) {
+    reference_target_within(w, h, grid, MIN_PIXELS, MAX_PIXELS)
 }
 
 /// Merged vision tokens for a `w × h` image at the given geometry.
 ///
-/// Both sides snap to `patch × merge` first, then each `patch × patch` square
-/// is one patch and each `merge × merge` block of patches becomes one token.
-/// For Qwen3-VL geometry (patch 16, merge 2) a 448×448 image is 784 patches
-/// and **196 tokens** — the figure measured against a live server on
+/// The image goes to its reference target first, then each `patch × patch`
+/// square is one patch and each `merge × merge` block of patches becomes one
+/// token. For Qwen3-VL geometry (patch 16, merge 2) a 448×448 image is 784
+/// patches and **196 tokens**: the figure measured against a live server on
 /// 2026-08-14, which anchors this whole model.
 pub fn expected_vision_tokens(w: u32, h: u32, patch: u32, merge: u32) -> u32 {
-    let grid = patch * merge;
-    let sw = snap(w, grid);
-    let sh = snap(h, grid);
-    (sw / patch) * (sh / patch) / (merge * merge)
+    let (tw, th) = reference_target(w, h, patch * merge);
+    (tw / patch) * (th / patch) / (merge * merge)
 }
 
 // A `within_bound(w, h, max_pixels)` helper used to live here, documented as

@@ -4,11 +4,35 @@
 
 use super::*;
 
-/// Append every media part on `m` to `media` **in content order**, growing
-/// `image_pad_counts` in lockstep (each pad count is filled in later by the
-/// preprocessor). Shared by the tool-message branch and the normal branch so
-/// media rides every role uniformly — including tool results, the motivating
-/// case for issue #165.
+#[allow(clippy::result_large_err)]
+pub(super) fn qwen_video_rows_ceiling(
+    vcfg: &atlas_core::config::VisionConfig,
+    max_pixels: Option<usize>,
+    video: &VideoDecode<'_>,
+) -> usize {
+    let ps = vcfg.patch_size.max(1);
+    let sms = vcfg.spatial_merge_size.max(1);
+    let tp = vcfg.temporal_patch_size.max(1);
+    let p_max = spark_model::layers::vision_encoder::derive_max_patches(max_pixels, ps).0;
+    let per_frame_pixels = p_max.saturating_mul(ps).saturating_mul(ps);
+    let max_frames = video.ffmpeg.max_frames.max(1);
+    let padded_frames = max_frames.div_ceil(tp).saturating_mul(tp);
+    let frame_volume = padded_frames.saturating_mul(per_frame_pixels);
+    let configured_volume = vcfg
+        .video_pixels
+        .map(|bounds| bounds.max_pixels)
+        .filter(|&pixels| pixels > 0)
+        .unwrap_or(usize::MAX);
+    let volume = configured_volume.min(frame_volume);
+    let row_pixels = tp
+        .saturating_mul(ps)
+        .saturating_mul(ps)
+        .saturating_mul(sms)
+        .saturating_mul(sms)
+        .max(1);
+    volume.div_ceil(row_pixels).max(1)
+}
+
 #[allow(clippy::result_large_err)]
 pub(super) fn collect_message_media(
     m: &Message,
