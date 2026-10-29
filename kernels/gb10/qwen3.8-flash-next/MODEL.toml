@@ -154,20 +154,21 @@ mtp_layers = 1
 mtp_type = "full_attention"
 vision = true
 
-# Sampling: model-card recommendations (2026-08, relayed from the vendor
-# card): thinking temperature=1.0 top_p=0.95 top_k=20 min_p=0
-# presence_penalty=0 repetition_penalty=1.0; instruct/non-thinking
-# temperature=0.7 top_p=0.80 top_k=20 min_p=0 presence_penalty=1.5
-# repetition_penalty=1.0. Tools follows the instruct row (the card has no
-# tools-specific set).
-[sampling.thinking_text]
-temperature = 1.0
-top_p = 0.95
-top_k = 20
+# Sampling: the checkpoint's generation_config.json (temperature 1.0,
+# top_p 0.95, top_k 20), which the reference server (vLLM) applies to EVERY
+# request a client leaves unset, thinking or not, tools or not. Until
+# 2026-10-19 the non-thinking and tools rows carried an older Qwen card's
+# instruct set (0.7 / 0.80 / presence 1.5); the nvidia FP4-Local card gives
+# none. Explicit request values always win.
+#
 # Card declares NO min_p and no sigma filter: pin both OFF so the CLI
 # defaults (min_p 0.08, top_n_sigma 1.0) cannot stack on the card values.
 # sigma=1.0 truncates temp-1.0 sampling to near-greedy, which is exactly
 # the greedy-thinking loop this model exhibits on short prompts.
+[sampling.thinking_text]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
 min_p = 0.0
 top_n_sigma = 0.0
 
@@ -175,34 +176,20 @@ top_n_sigma = 0.0
 temperature = 1.0
 top_p = 0.95
 top_k = 20
-# Card declares NO min_p and no sigma filter: pin both OFF so the CLI
-# defaults (min_p 0.08, top_n_sigma 1.0) cannot stack on the card values.
-# sigma=1.0 truncates temp-1.0 sampling to near-greedy, which is exactly
-# the greedy-thinking loop this model exhibits on short prompts.
 min_p = 0.0
 top_n_sigma = 0.0
 
 [sampling.non_thinking]
-temperature = 0.7
-top_p = 0.8
+temperature = 1.0
+top_p = 0.95
 top_k = 20
-presence_penalty = 1.5
-# Card declares NO min_p and no sigma filter: pin both OFF so the CLI
-# defaults (min_p 0.08, top_n_sigma 1.0) cannot stack on the card values.
-# sigma=1.0 truncates temp-1.0 sampling to near-greedy, which is exactly
-# the greedy-thinking loop this model exhibits on short prompts.
 min_p = 0.0
 top_n_sigma = 0.0
 
 [sampling.tools]
-temperature = 0.7
-top_p = 0.8
+temperature = 1.0
+top_p = 0.95
 top_k = 20
-presence_penalty = 1.5
-# Card declares NO min_p and no sigma filter: pin both OFF so the CLI
-# defaults (min_p 0.08, top_n_sigma 1.0) cannot stack on the card values.
-# sigma=1.0 truncates temp-1.0 sampling to near-greedy, which is exactly
-# the greedy-thinking loop this model exhibits on short prompts.
 min_p = 0.0
 top_n_sigma = 0.0
 
@@ -397,13 +384,11 @@ tool_call_parser = "qwen3_coder"
 # after a [sampling.*] header it silently becomes a preset key and does
 # nothing — the exact trap that shipped 2026-08-26.
 use_sampling_presets_for_core = true
-# ...but NOT the card's non-thinking presence_penalty = 1.5 for core requests
-# that leave penalties unset. That value is tuned for short chat turns; on a
-# 20K-token single-file build (2026-09-04 tower-defense benchmark, this
-# checkpoint on a GB10) it suppressed every already-emitted token and the
-# engine shipped dead/inert files twice, while the identical engine and
-# sampler with presence 0 wrote a working 51 KB game. Tool-calling requests
-# still inherit [sampling.tools]; explicit request values always win.
+# Penalties: the presets carry none (the reference applies none), so this
+# only keeps core requests off a future preset penalty. History: the old
+# presence_penalty = 1.5 suppressed every already-emitted token on a 20K-token
+# single-file build (2026-09-04 tower-defense benchmark) and the engine
+# shipped dead/inert files twice; presence 0 wrote a working 51 KB game.
 use_sampling_preset_penalties_for_core = false
 # ATLAS_MOE_DECODE_ARM=grouped routes every layer's single-token MoE through the
 # tensor-core grouped-GEMM arm (forward_prefill M=1) instead of the scalar FP32-FMA
@@ -417,16 +402,33 @@ use_sampling_preset_penalties_for_core = false
 # ATLAS_LOGIT_DUMP: steps 11-13 topped by im_end/im_start while </think>
 # reappears at logit ~6 the moment the floor expires. 0 disables the floor.
 min_reasoning_floor_tokens = 0
-# When the model does sample an EOS inside <think> (temp 1.0 makes this
-# reachable), honor it by closing the block instead of swallowing the token
-# and forcing continued reasoning — the swallow path is what turned early
-# closes into <|im_start|>user template simulation.
-honor_eos_inside_thinking = true
-max_thinking_budget = 2048
-# Guards carried over from the Atlas-Inf side of the merge: cap the think
-# budget at the request's own max_tokens rather than letting a 2048-token
-# reasoning block starve the answer.
-cap_thinking_at_max_tokens = true
+# REFERENCE BEHAVIOUR (2026-10-19, SparkQwen fidelity): the reference server
+# for this checkpoint is vLLM over the checkpoint's own chat template (model
+# card: --reasoning-parser qwen3 --tool-call-parser qwen3_xml
+# --enable-auto-tool-choice). It renders the template and nothing else, puts
+# no budget on reasoning unless the client sends one, ends the turn on an end
+# token wherever it falls, and does not steer tool calls. Atlas serves the
+# same; api/chat/reference_prompt_tests.rs pins the prompt bytes.
+#
+# The prompt is the template's render of the client's conversation: no parser
+# tool prompt beside the template's own tool block (it rendered the tool list
+# twice), no tool-result hints or notices, and `tojson` spaced as transformers
+# renders it.
+verbatim_prompt = true
+# No server thinking budget: an effort-silent request renders the template's
+# default (xhigh) and thinks until it closes `</think>` or hits max_tokens; a
+# client's reasoning_effort only picks the template's tier. An explicit client
+# token budget (thinking_token_budget, thinking.budget_tokens) still binds.
+max_thinking_budget = 0
+cap_thinking_at_max_tokens = false
+confidence_early_stop = false
+enable_think_loop_watchdog = false
+# An end token inside <think> (temp 1.0 makes it reachable) ends the turn.
+eos_ends_thinking = true
+# No `<tool_call>` bias or loop-detector mask, and no cap on prose between
+# tool calls.
+tool_call_steering = false
+max_inter_tool_prose = 0
 # The repetition guards stay OFF for this model. Its greedy temp-0 output has
 # a known repetition loop (onset ~token 104 on filler prompts, exonerated from
 # QSA by position), but both detectors also end legitimate answers that repeat
