@@ -23,6 +23,8 @@ mod guard;
 mod hc_ffn;
 mod hc_generic;
 mod hc_pre_site;
+// Ported from Enntity/atlas 166e2b1 (AGPL-3.0-only).
+mod kv_only;
 mod mla;
 mod mla_gemv;
 mod mla_glm;

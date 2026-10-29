@@ -328,7 +328,8 @@ impl Qwen3AttentionLayer {
     /// Shared q/k RMS-norm pass over the per-seq `qkv_buf` regions. Extracted
     /// so all projection branches (seq / batch2 / batch3 / batchn) defer norms
     /// to one place, after the pre-norm K/V LoRA delta.
-    fn ms_qkv_norms(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
+    // Ported from Enntity/atlas 73c19db (AGPL-3.0-only).
+    pub(super) fn ms_qkv_norms(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
         let MultiSeqCtx {
             fwd,
             n,

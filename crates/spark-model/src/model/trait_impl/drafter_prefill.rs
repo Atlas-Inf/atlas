@@ -222,29 +222,8 @@ impl TransformerModel {
         if seq.proposer_state.is_none() {
             return Ok(());
         }
-        let ctx = ForwardContext {
-            ssm_batch: None,
-            buffers: &self.buffers,
-            gpu: self.gpu.as_ref(),
-            config: &self.config,
-            dispatch: &self.dispatch,
-            // Route-aware v0: base (Skip) proceeds free; an active adapter is
-            // rejected before the fold on these multi-seq/speculative paths
-            // (reject_decode_lora), so Fold is inert here.
-            moe_lora_route: self.decode_moe_route(),
-            derived: &self.derived,
-            levers: &self.levers,
-            stats: &self.stats,
-            attn_metadata: None,
-            profile: false,
-            comm: None,
-            graph_capture: false,
-            gdn_exact_replay: false,
-            token_ids: None,
-            host_token_ids: None,
-            routed_lora_layers: None,
-            midchunk_capture: None,
-        };
+        // Ported from Enntity/atlas e7d4e1a, 23350fb (AGPL-3.0-only).
+        let ctx = self.drafter_ctx();
         self.ensure_drafter_context(proposer.as_ref(), seq, &ctx, stream)?;
         if crate::speculative::mtp_accept_debug() {
             let rows =
@@ -266,5 +245,76 @@ impl TransformerModel {
             );
         }
         Ok(())
+    }
+
+    /// The drafter's context outside a propose: rank-local (`comm: None`),
+    /// no metadata, no capture.
+    fn drafter_ctx(&self) -> ForwardContext<'_> {
+        ForwardContext {
+            ssm_batch: None,
+            buffers: &self.buffers,
+            gpu: self.gpu.as_ref(),
+            config: &self.config,
+            dispatch: &self.dispatch,
+            // Route-aware v0: base (Skip) proceeds free; an active adapter is
+            // rejected before the fold on these multi-seq/speculative paths
+            // (reject_decode_lora), so Fold is inert here.
+            moe_lora_route: self.decode_moe_route(),
+            derived: &self.derived,
+            levers: &self.levers,
+            stats: &self.stats,
+            attn_metadata: None,
+            profile: false,
+            comm: None,
+            graph_capture: false,
+            gdn_exact_replay: false,
+            token_ids: None,
+            host_token_ids: None,
+            routed_lora_layers: None,
+            midchunk_capture: None,
+        }
+    }
+
+    /// `ATLAS_QWEN4EXP_MTP_PREFILL`: highway rows `hc_row ..` hold the final
+    /// streams of `seq`'s prompt positions `first_pos ..` (`rows` of them)
+    /// until the next forward (`DraftProposer::note_prompt_rows`).
+    pub(in crate::model) fn note_mtp_prompt_rows(
+        &self,
+        seq: &mut SequenceState,
+        first_pos: usize,
+        rows: usize,
+        hc_row: usize,
+    ) {
+        if let (Some(p), Some(st), false) = (
+            self.proposer.as_ref(),
+            seq.proposer_state.as_mut(),
+            seq.disable_mtp,
+        ) {
+            p.note_prompt_rows(st.as_mut(), first_pos, rows, hc_row);
+        }
+    }
+
+    /// After a prefill chunk of `seq` returns, its logits computed: the
+    /// drafter's context over the rows it noted (`DraftProposer::absorb_prompt`;
+    /// `prompt` = the whole prompt's tokens). A failure costs only drafts.
+    pub(in crate::model) fn try_mtp_prompt_absorb(
+        &self,
+        seq: &mut SequenceState,
+        prompt: &[u32],
+        stream: u64,
+    ) {
+        let (Some(p), Some(st), false) = (
+            self.proposer.clone(),
+            seq.proposer_state.as_mut(),
+            seq.disable_mtp,
+        ) else {
+            return;
+        };
+        if let Err(e) = p.absorb_prompt(st.as_mut(), prompt, &self.drafter_ctx(), stream) {
+            static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            crate::layers::qwen4exp_mtp::qwen4exp_mtp_absorb::warn_sparsely(&FAILED, || {
+                format!("MTP drafter prompt rows failed (drafting without them): {e:#}")
+            });
+        }
     }
 }

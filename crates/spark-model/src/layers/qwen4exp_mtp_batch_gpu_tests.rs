@@ -23,6 +23,8 @@
 use super::*;
 use crate::layers::ops::{DerivedWeights, GemmDispatch, ModelLevers, ModelStats};
 use spark_runtime::buffers::BufferArena;
+// Ported from Enntity/atlas 166e2b1 (AGPL-3.0-only).
+use spark_runtime::kv_cache::KvCacheDtype;
 use spark_runtime::weights::{SafetensorsLoader, WeightLoader};
 
 const DRAFTS: usize = 3;
