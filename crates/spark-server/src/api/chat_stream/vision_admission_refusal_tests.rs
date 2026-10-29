@@ -44,25 +44,20 @@ fn an_over_cap_image_is_refused_through_prepare_chat_prompt_with_vision_too_larg
         s.vision_limits = Some(spark_model::vision_limits::VisionRowLimits {
             window_rows: 65_536,
             chunk_tokens: 16_388,
-            request_rows: 100,
+            request_rows: 3,
         });
         s.vision_budget = Some(spark_model::vision_budget::VisionRowBudget::new(65_536));
     }
-    // PNG header claiming 20000x20000 (tiny body): probe sizes it way over
-    // request_rows=100 before any pixel is decoded.
-    let mut ihdr = vec![0u8; 24];
-    ihdr[..8].copy_from_slice(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
-    ihdr[8..12].copy_from_slice(&13u32.to_be_bytes());
-    ihdr[12..16].copy_from_slice(b"IHDR");
-    ihdr[16..20].copy_from_slice(&20_000u32.to_be_bytes());
-    ihdr[20..24].copy_from_slice(&20_000u32.to_be_bytes());
+    // A real 64x64 PNG: it decodes and sizes on #236's own admission path
+    // (the IHDR-probe variant that refuses pre-decode lives in #237). Its
+    // merged rows (4) exceed request_rows=3, so it is refused
+    // vision_input_too_large.
+    const PNG64: &str = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgnABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC";
     let mut req = request();
     req.messages = vec![ir::Message {
         role: ir::Role::User,
         content: vec![ir::ContentPart::Image(ir::message::ImageSource {
-            data: ir::ImageData::Base64(
-                format!("data:image/png;base64,{}", base64_encode(&ihdr)).into(),
-            ),
+            data: ir::ImageData::Base64(format!("data:image/png;base64,{PNG64}")),
         })],
         tool_calls: vec![],
         tool_call_id: None,
