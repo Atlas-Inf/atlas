@@ -84,6 +84,11 @@ pub struct FfmpegPolicy {
     /// scaled to fit BEFORE it is read back as RGB, which is what bounds the
     /// returned frame collection at `max_frames × max_decoded_pixels`.
     pub max_decoded_pixels: usize,
+    /// Aggregate bound on the pixels decoded for one request. When set, the
+    /// admission path reserves the video's worst-case rows before decode and
+    /// reconciles to the actual groups after it (Enntity/atlas d0cead1).
+    /// `None` keeps the legacy decode-without-reservation path.
+    pub max_total_decoded_pixels: Option<usize>,
 }
 
 /// Default decoded-frame area cap: 640×640.
@@ -107,6 +112,7 @@ impl Default for FfmpegPolicy {
             timeout_secs: 120,
             fps: 2.0,
             max_decoded_pixels: DEFAULT_MAX_DECODED_PIXELS,
+            max_total_decoded_pixels: None,
         }
     }
 }
