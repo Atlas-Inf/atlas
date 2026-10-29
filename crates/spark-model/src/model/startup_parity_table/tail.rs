@@ -44,6 +44,11 @@ pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_BATCH_FAST_BISECT", || {
         Ok(qwen4exp_batch_fast::bisect_requested() as u64)
     }),
+    // Which MXFP8 GEMV family sums the decode/verify projections: two
+    // summation orders in one out_proj all-reduce.
+    ("ATLAS_QWEN4EXP_MXFP8_DECODE", || {
+        Ok(crate::layers::ops::mxfp8_decode_tc() as u64)
+    }),
     ("ATLAS_SSM_SAVE_DUMP", || {
         Ok(graph_flags::ssm_save_dump() as u64)
     }),

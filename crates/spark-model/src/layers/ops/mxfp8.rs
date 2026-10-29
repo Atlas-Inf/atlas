@@ -69,6 +69,16 @@ pub fn mxfp8_gemv(
         .launch(stream)
 }
 
+/// The [`mxfp8_gemv`] tier for `m` rows: 0 (`tc8`, up to 8), 1 (`tc16`) or
+/// 2 (`tc32`).
+pub fn mxfp8_tier(m: u32) -> usize {
+    match m {
+        0..=8 => 0,
+        9..=16 => 1,
+        _ => 2,
+    }
+}
+
 /// Widest row count [`mxfp8_gemv_grouped`] serves.
 pub const MXFP8_GROUPED_MAX_M: u32 = 16;
 

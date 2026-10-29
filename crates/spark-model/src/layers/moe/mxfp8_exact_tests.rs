@@ -27,6 +27,7 @@ fn mxfp8_exact_rows_chunks_and_never_dequants() {
         batchm: KernelHandle(222),
         dequant: KernelHandle(333),
         rows32: KernelHandle(444),
+        tc: [KernelHandle(0); 3],
     };
     let scratch = ops::Mxfp8Scratch {
         ptr: DevicePtr(0x9000_0000),
@@ -129,6 +130,7 @@ fn mxfp8_shared_expert_exact_chunks_the_fused_chain() {
         batchm: KernelHandle(222),
         dequant: KernelHandle(333),
         rows32: KernelHandle(444),
+        tc: [KernelHandle(0); 3],
     };
     let scratch = ops::Mxfp8Scratch {
         ptr: DevicePtr(0x9000_0000),
