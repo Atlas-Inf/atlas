@@ -178,20 +178,22 @@ mod tests {
             return; // an override changes the cut; the table below is for the default
         }
         let twin = KernelHandle(11);
-        // Twin won (strix job 146): 27B gate/up, 27B down, Flash-Next GDN qkvz.
-        for (n, k) in [(17408, 5120), (5120, 17408), (16384, 2560)] {
+        // The single-LDS twin wins at every measured shape (strix s104): 27B gate/up,
+        // 27B down, Flash-Next GDN qkvz, and the three the old 40M cut sent to BF16
+        // (Flash-Next attn q, 27B qkv, Flash-Next out), plus Flash-Next kv.
+        for (n, k) in [
+            (17408, 5120),
+            (5120, 17408),
+            (16384, 2560),
+            (12288, 2560),
+            (5120, 5120),
+            (2560, 6144),
+            (1024, 2560),
+        ] {
             assert_eq!(
                 m128_for_shape(twin, n, k).0,
                 11,
                 "{n}x{k} should keep the twin"
-            );
-        }
-        // Twin lost: Flash-Next attn q, 27B qkv, Flash-Next out.
-        for (n, k) in [(12288, 2560), (5120, 5120), (2560, 6144)] {
-            assert_eq!(
-                m128_for_shape(twin, n, k).0,
-                22,
-                "{n}x{k} should fall back to bf16"
             );
         }
         // Any other handle passes through untouched.
