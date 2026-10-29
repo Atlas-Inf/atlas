@@ -162,9 +162,27 @@ pub(crate) fn load_model(
     // preprocessor and the GPU encoder came to hold two different ideas of the
     // maximum image — the preprocessor clamped to 1280px, the encoder
     // allocated for 6400 patches, and nothing connected them.
-    let vision_max_pixels = resolve_vision_max_pixels(&args, &model_dir)?;
+    // Enntity/atlas 0eef4031: both bounds of each modality come from the
+    // checkpoint's processor config — a still below the min is scaled UP,
+    // a clip is sized over its frames.
+    let image = super::processor_pixels::read_declared_pixels(
+        &model_dir,
+        super::processor_pixels::Modality::Image,
+    );
+    let vision_max_pixels = resolve_vision_max_pixels(&args, image.map(|d| d.max_pixels))?;
     if let Some(v) = config.vision.as_mut() {
         v.max_pixels = vision_max_pixels;
+        v.min_pixels = image.and_then(|d| d.min_pixels);
+        v.video_pixels = super::processor_pixels::read_declared_pixels(
+            &model_dir,
+            super::processor_pixels::Modality::Video,
+        )
+        .and_then(|d| {
+            Some(atlas_core::config::PixelBounds {
+                min_pixels: d.min_pixels?,
+                max_pixels: d.max_pixels,
+            })
+        });
         v.is_qwen3vl_video =
             super::vision_processor::read_is_qwen3vl_video(&model_dir).unwrap_or_default();
     }

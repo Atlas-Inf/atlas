@@ -334,7 +334,7 @@ pub(super) fn build_auth_config(
 /// checkpoint at the resolution it was built for.
 pub(super) fn resolve_vision_max_pixels(
     args: &cli::ServeArgs,
-    model_dir: &std::path::Path,
+    declared: Option<usize>,
 ) -> Result<Option<usize>> {
     if args.vision_max_pixels > 0 {
         return Ok(Some(args.vision_max_pixels));
@@ -350,7 +350,7 @@ pub(super) fn resolve_vision_max_pixels(
             }
         }
     }
-    Ok(read_preprocessor_max_pixels(model_dir))
+    Ok(declared)
 }
 
 /// Pull the IMAGE area bound out of the checkpoint's processor config, if it

@@ -133,6 +133,8 @@ fn encoder(gpu: &NamedGpu) -> GlmVisionEncoder {
         video_start_token_id: 0,
         video_end_token_id: 0,
         max_pixels: Some(256 * TEMPORAL * PATCH * PATCH),
+        min_pixels: None,
+        video_pixels: None,
         omni: None,
     };
     let w = DevicePtr(0x1000);
