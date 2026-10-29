@@ -961,7 +961,7 @@ extern "C" __global__ void hc_pre_down_tiled(
 // the scalar kernels on gfx1151 (f84: HC = 26.5% of Flash-Next decode). HIP edits: the PTX ld.global.nc
 // loaders are plain vector loads (same bits), and the cluster-fused hc_post+stage kernel is compiled out
 // (gfx1151 has no thread-block clusters; the host falls back to hc_post_vec + hc_pre_stage_vec).
-#include "atlas_pdl.cuh"
+#include "../../common/atlas_pdl.cuh"
 // ── Vectorized decode collapse (ATLAS_QWEN4EXP_HC_FAST, T <= HC_V_MAX) ────
 //
 // nsys, TP2 C1 decode, 96 mHC sites per token (2026-10-05):
