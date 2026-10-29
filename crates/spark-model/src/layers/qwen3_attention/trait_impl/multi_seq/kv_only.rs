@@ -88,7 +88,7 @@ impl Qwen3AttentionLayer {
         }
         // K and V only where the exact lane's K/V arm serves: a KV row never
         // reads Q, the bulk of the projection's weight bytes.
-        if self.ms_kv_proj_only(&c)? {
+        if self.ms_kv_batchm_bf16(&c)? || self.ms_kv_proj_only(&c)? {
             self.ms_qkv_norms(&c)?;
         } else {
             self.ms_phase_qkv(&c)?;

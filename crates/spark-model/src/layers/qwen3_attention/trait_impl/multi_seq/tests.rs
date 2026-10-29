@@ -192,3 +192,6 @@ fn fused_qkv_twin_never_reaches_the_base_weight_gemv() {
         );
     }
 }
+
+#[path = "kv_bf16_tests.rs"]
+mod kv_bf16;
