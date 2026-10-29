@@ -1267,3 +1267,13 @@ starvation, the cost is the tile body's serial chain: LUT dequant → smem_B_fp8
 pipeline, 4 CTAs/SM (register-capped). Next, K3 (byte-exact): dequantize K-tile k+1 while the MMAs of tile k run
 (double-buffered B_fp8) plus deeper cp.async stages, and trim registers toward 5 CTAs/SM. Branch
 `perf/moe-prefill-occupancy` b81f29199 (local).
+
+## 2026-10-29 — K3 prep: the kernel documents its own serialization; price the dequant first
+
+`moe_w4a16_grouped_gemm.cu` (~l.580) says the K-step pipeline runs MMA → barrier → DEQUANT → barrier → MMA, so the
+FP4→FP8 conversion is serialized with the tensor cores ("the leading suspect", 39 vs 156 TFLOP/s vs cuBLAS in its
+note). An in-tree compile-time probe, `MOE_PROBE_CHEAP_DEQUANT`, stubs the conversion to price it. Next: bench the
+production kernels built with and without the probe (numbers only, not identity: the probe changes math). That bounds
+what the K3 software pipeline (double-buffered `smem_B_fp8`, dequant k+1 under MMA k, 3-stage cp.async) can win before
+it's written. `_wq` removed from the branch. Kept rule: new shared declarations must not precede unaligned uchar/bf16
+arrays (or everything gets `__align__(16)`).
