@@ -1373,3 +1373,20 @@ Jobs 53/54, down kernel `_ws`:
 Splitting dequant onto producer warps with 2 barrier round-trips per K-tile and a 2-stage ring adds latency without
 hiding the MMA idle. A correct design needs phase-tagged mbarriers (and likely TMA / deeper rings), a substantially
 larger rewrite. Paused pending the owner's call. Branch `perf/moe-prefill-occupancy` a1ea22ddd (local).
+
+## 2026-10-29 — W1 attempt 1 negative; owner re-prioritizes single-Spark deployments
+
+W1 (named-barrier warp specialization, down kernel): memcheck clean, but racecheck 139K+ hazards (consumers read
+smem_A/smem_B_fp8 while producers write), identical=false (epilogue bug, fixed a1ea22ddd), and 2.5× slower. A correct
+design needs phase-tagged mbarriers / TMA, a much larger rewrite. **Parked** on branch `perf/moe-prefill-occupancy`
+(local) with the bench + probes.
+
+**New goal (owner):** single-GB10 deployments of the top-priority checkpoints are tested, merged and documented on
+their PRs, on current main 87df79b2f (#219 + #228): **nvidia/Qwen3.8-27B-NVFP4** and **Qwen3.8-Flash-Next
+NVFP4 / FP4-Local**.
+1. FP4-Local: re-pin sparkrun-recipes' recipe to the main image with #219/#228 and vet through sparkrun (agentic 50 +
+   BFCL ST-995). PR + results.
+2. Flash-Next NVFP4 (nvidia/Qwen3.8-Flash-Next-NVFP4): its single-GB10 recipe on the main image, the same vet. Check
+   whether S7/S7.1 engage on this pack.
+3. Qwen3.8-27B-NVFP4 (dense): its single-GB10 recipe on the main image, the same vet.
+Each vet's results go on its sparkrun-recipes PR, and a recipe-pin PR is opened when the image changes.
