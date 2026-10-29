@@ -17,6 +17,8 @@
 /// a desync between them is silent — fluent output, wrong answer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VisionItem {
+    /// The in-flight-rows permit this item holds (vision_admit).
+    pub held: crate::vision_budget::HeldRows,
     /// Per temporal group: `[grid_h * grid_w, C * temporal_patch_size * patch^2]`.
     pub groups: Vec<Vec<f32>>,
     /// Pre-merge patch grid, identical across this item's groups.
@@ -26,8 +28,18 @@ pub struct VisionItem {
 
 impl VisionItem {
     /// A still image: one temporal group.
+    /// Ride an in-flight-rows permit (vision_admit; Enntity/atlas b060f987).
+    pub fn holding(
+        mut self,
+        permit: std::sync::Arc<crate::vision_budget::VisionRowPermit>,
+    ) -> Self {
+        self.held = crate::vision_budget::HeldRows(Some(permit));
+        self
+    }
+
     pub fn image(pixels: Vec<f32>, grid_h: usize, grid_w: usize) -> Self {
         Self {
+            held: crate::vision_budget::HeldRows::default(),
             groups: vec![pixels],
             grid_h,
             grid_w,

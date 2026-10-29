@@ -60,6 +60,11 @@ pub struct AppState {
     pub vision_config: Option<atlas_core::config::VisionConfig>,
     /// Optional vLLM-style image area cap applied before vision patching.
     pub vision_max_pixels: Option<usize>,
+    /// `vision_admit`: the per-request row cap (--vision-max-request-rows)
+    /// and the in-flight budget (--vision-max-inflight-rows; None = no
+    /// limit). Enntity/atlas 7d33dd4c + d85c88d0.
+    pub vision_limits: Option<spark_model::vision_limits::VisionRowLimits>,
+    pub vision_budget: Option<std::sync::Arc<spark_model::vision_budget::VisionRowBudget>>,
     /// Whether (and how) to fetch `image_url` parts carrying an http(s) URL.
     /// Default-disabled; see `api::chat::remote_image` for why this one
     /// capability is opt-in rather than default-ON with a kill-switch.

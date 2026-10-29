@@ -20,10 +20,20 @@ pub(crate) const VISION_HEADER_WORDS: usize = 6;
 /// A malformed or accidentally unbounded request must not turn the worker's
 /// scratch broadcast into an arbitrary allocation/collective. Normal prompts
 /// use very few items; this is a protocol limit, not a model capacity claim.
-pub(crate) const VISION_MAX_GRID_ITEMS: usize = 1024;
+pub(crate) const VISION_MAX_GRID_ITEMS: usize = 8192;
 const VISION_MAX_GRID_CELLS: usize = 1 << 24;
 const VISION_BF16_BYTES: usize = 2;
 const VISION_MAX_PAYLOAD_BYTES: usize = 1 << 30;
+
+/// `(window, request)`: the merged vision rows one encode may write (the
+/// encoder output window, `VisionEncoder::output_rows`, which one prefill
+/// chunk's items must fit) and the rows one request may carry.
+/// Enntity/atlas b060f987.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VisionRowBounds {
+    pub window: usize,
+    pub request: usize,
+}
 
 /// A request whose images need more encoder rows than one encode holds.
 /// The client resending the same history cannot succeed, so the server
