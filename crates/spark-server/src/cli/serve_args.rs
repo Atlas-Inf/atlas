@@ -1027,6 +1027,14 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 768)]
     pub video_max_frames: usize,
 
+    /// Qwen video pixel volume across all sampled frames, overriding the
+    /// checkpoint's video processor bound. 469762048 is the reference
+    /// hour-video recipe (224K merged tokens). Does not change still images.
+    /// When set, admission reserves the clip's worst-case rows before decode
+    /// and reconciles to its actual groups after (Enntity/atlas d0cead1).
+    #[arg(long)]
+    pub video_max_pixels: Option<usize>,
+
     /// Wall-clock budget for decoding one video. Bounds a decoder that hangs
     /// on a malformed container; the child is killed when it expires.
     #[arg(long, default_value_t = 120)]
