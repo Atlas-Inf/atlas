@@ -40,23 +40,36 @@ pub fn snap(side: u32, grid: u32) -> u32 {
     ((((side as f64) / (grid as f64)).round_ties_even() as u32).max(1)) * grid
 }
 
+/// [`reference_target`] under explicit area bounds, for a processor whose
+/// `size.shortest_edge` / `size.longest_edge` differ from the image
+/// processor's (the video processor declares its own).
+pub fn reference_target_within(
+    w: u32,
+    h: u32,
+    grid: u32,
+    min_pixels: u64,
+    max_pixels: u64,
+) -> (u32, u32) {
+    let (wf, hf, g) = (w as f64, h as f64, grid as f64);
+    let (mut sw, mut sh) = (snap(w, grid) as f64, snap(h, grid) as f64);
+    if sw * sh > max_pixels as f64 {
+        let beta = (wf * hf / max_pixels as f64).sqrt();
+        sw = g.max((wf / beta / g).floor() * g);
+        sh = g.max((hf / beta / g).floor() * g);
+    } else if sw * sh < min_pixels as f64 {
+        let beta = (min_pixels as f64 / (wf * hf)).sqrt();
+        sw = (wf * beta / g).ceil() * g;
+        sh = (hf * beta / g).ceil() * g;
+    }
+    (sw as u32, sh as u32)
+}
+
 /// The reference `smart_resize` target for a `w × h` image: both sides snapped
 /// to `grid`, then, if the snapped area is outside `[MIN_PIXELS, MAX_PIXELS]`,
 /// rescaled by the area ratio (floored to the grid going down, ceiled going
 /// up), exactly as `transformers`' `smart_resize` does.
 pub fn reference_target(w: u32, h: u32, grid: u32) -> (u32, u32) {
-    let (wf, hf, g) = (w as f64, h as f64, grid as f64);
-    let (mut sw, mut sh) = (snap(w, grid) as f64, snap(h, grid) as f64);
-    if sw * sh > MAX_PIXELS as f64 {
-        let beta = (wf * hf / MAX_PIXELS as f64).sqrt();
-        sw = g.max((wf / beta / g).floor() * g);
-        sh = g.max((hf / beta / g).floor() * g);
-    } else if sw * sh < MIN_PIXELS as f64 {
-        let beta = (MIN_PIXELS as f64 / (wf * hf)).sqrt();
-        sw = (wf * beta / g).ceil() * g;
-        sh = (hf * beta / g).ceil() * g;
-    }
-    (sw as u32, sh as u32)
+    reference_target_within(w, h, grid, MIN_PIXELS, MAX_PIXELS)
 }
 
 /// Merged vision tokens for a `w × h` image at the given geometry.

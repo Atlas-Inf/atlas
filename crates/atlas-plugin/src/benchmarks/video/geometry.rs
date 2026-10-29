@@ -16,13 +16,30 @@
 //! violated the moment sampling or grouping breaks, and needs no knowledge of
 //! how the server was started.
 
+/// The video processor's own area floor: `size.shortest_edge` in the
+/// checkpoint's `video_preprocessor_config.json` (Qwen3VLVideoProcessor, 4096
+/// for Qwen3.8-Flash-Next-FP4-Local). Far below the image processor's 65536,
+/// so a 224x224 clip group keeps its 7x7 grid where a 224x224 still is scaled up.
+pub const VIDEO_MIN_PIXELS: u64 = 4_096;
+/// The matching ceiling (`size.longest_edge`, 25165824). It bounds a whole
+/// clip's volume; the fixture clips sit far inside it, so it is applied per
+/// group here only as a guard.
+pub const VIDEO_MAX_PIXELS: u64 = 25_165_824;
+
 /// Merged tokens one temporal group of a `w x h` clip occupies.
 ///
-/// Identical arithmetic to a still image's — a group IS a still, spatially —
-/// so this deliberately mirrors `vision::geometry::expected_vision_tokens`
-/// rather than reimplementing it differently.
+/// Same arithmetic as a still image's (a group IS a still, spatially, with the
+/// same half-to-even snap), but under the VIDEO processor's bounds, not the
+/// image processor's.
 pub fn tokens_per_group(w: u32, h: u32, patch: u32, merge: u32) -> u32 {
-    crate::benchmarks::vision::geometry::expected_vision_tokens(w, h, patch, merge)
+    let (tw, th) = crate::benchmarks::vision::geometry::reference_target_within(
+        w,
+        h,
+        patch * merge,
+        VIDEO_MIN_PIXELS,
+        VIDEO_MAX_PIXELS,
+    );
+    (tw / patch) * (th / patch) / (merge * merge)
 }
 
 /// What the geometry leg concluded.
