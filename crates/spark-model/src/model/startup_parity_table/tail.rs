@@ -49,6 +49,11 @@ pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_MXFP8_DECODE", || {
         Ok(crate::layers::ops::mxfp8_decode_tc() as u64)
     }),
+    // Whether prefill projections are W8A8 or BF16-expansion GEMMs: the
+    // rows a rank writes into the prefix cache and the SP gathers.
+    ("ATLAS_QWEN4EXP_PREFILL_W8A8", || {
+        Ok(crate::layers::ops::qwen4exp_w8a8::enabled() as u64)
+    }),
     ("ATLAS_SSM_SAVE_DUMP", || {
         Ok(graph_flags::ssm_save_dump() as u64)
     }),

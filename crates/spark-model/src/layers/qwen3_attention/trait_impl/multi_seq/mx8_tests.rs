@@ -80,6 +80,7 @@ fn projections(gpu: &MockGpuBackend, config: &ModelConfig) -> ([Mxfp8Proj; 4], M
             ptr: gpu.alloc(bytes).unwrap(),
             bytes,
         },
+        w8a8: None,
     };
     (projs, rt)
 }

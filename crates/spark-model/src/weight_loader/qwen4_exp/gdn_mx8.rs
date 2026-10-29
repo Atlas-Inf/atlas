@@ -26,7 +26,7 @@ use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
-use super::mx8_common::{MX8_GROUP, module};
+use super::mx8_common::{self, MX8_GROUP, module};
 use crate::layer::TransformerLayer;
 use crate::layers::FfnComponent;
 use crate::layers::Qwen3SsmLayer;
@@ -181,23 +181,26 @@ pub(super) fn build(
         config,
         gpu,
     )?;
+    let qkvz = Mxfp8Proj {
+        w: qkvz,
+        n: config.ssm_qkvz_size() as u32,
+        k: h as u32,
+    };
+    let out = Mxfp8Proj {
+        w: Mxfp8Weight {
+            data: out_l[0],
+            scales: out_l[1],
+        },
+        n: h as u32,
+        k: local_z as u32,
+    };
     layer
         .set_mx8_projections(Mx8Gdn {
-            qkvz: Mxfp8Proj {
-                w: qkvz,
-                n: config.ssm_qkvz_size() as u32,
-                k: h as u32,
-            },
-            out: Mxfp8Proj {
-                w: Mxfp8Weight {
-                    data: out_l[0],
-                    scales: out_l[1],
-                },
-                n: h as u32,
-                k: local_z as u32,
-            },
+            qkvz,
+            out,
             kernels: Mxfp8ProjKernels::resolve(gpu)?,
             scratch,
+            w8a8: mx8_common::w8a8_prefill(gpu, [&qkvz, &out], config)?,
         })
         .with_context(|| format!("MXFP8 GDN layer {layer_idx}"))?;
     Ok(Box::new(layer))

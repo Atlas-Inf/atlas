@@ -45,7 +45,7 @@ impl Qwen3SsmLayer {
         prof!("qkvz", {
             if let Some(mx8) = self.mx8.as_ref() {
                 // Native MXFP8 (FP4-Local): sequential, straight into place.
-                self.mx8_qkvz(mx8, ctx, normed, deinterleaved, 1, stream)
+                self.mx8_qkvz(mx8, ctx, normed, deinterleaved, 1, false, stream)
             } else if let Some(ref fp8) = self.qkvz_fp8w {
                 // FP8 native: w8a16_gemv + deinterleave (no fused QKVZ variant yet).
                 // `w8a16_gemv` consumes `[N/BS,K/BS] BF16` block scales

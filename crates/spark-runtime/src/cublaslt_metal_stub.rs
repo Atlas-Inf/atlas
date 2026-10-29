@@ -123,3 +123,53 @@ pub fn fp8_gemm_act_weight_t_tensorwise(
 ) -> anyhow::Result<()> {
     anyhow::bail!("cuBLASLt tensorwise FP8 requires CUDA")
 }
+
+pub fn fp8_blkscaled_pinned_prepare(_weight_sf: u64, _act_sf: u64, _n: u32, _k: u32) -> Result<()> {
+    unreachable!("cublaslt::fp8_blkscaled_pinned_prepare is cuda-only (not built for metal)")
+}
+
+pub fn fp8_gemm_act_weight_t_blkscaled_pinned(
+    _act_fp8: u64,
+    _act_scale: u64,
+    _weight_fp8: u64,
+    _weight_block_scale: u64,
+    _out: u64,
+    [_m, _n, _k]: [u32; 3],
+    _stream: u64,
+) -> Result<()> {
+    unreachable!(
+        "cublaslt::fp8_gemm_act_weight_t_blkscaled_pinned is cuda-only (not built for metal)"
+    )
+}
+
+pub fn fp8_gemm_act_weight_t_mx(
+    _act_fp8: u64,
+    _act_sf: u64,
+    _weight_fp8: u64,
+    _weight_sf: u64,
+    _out: u64,
+    [_m, _n, _k]: [u32; 3],
+    _stream: u64,
+) -> Result<()> {
+    unreachable!("cublaslt::fp8_gemm_act_weight_t_mx is cuda-only (not built for metal)")
+}
+
+pub fn fp8_gemm_act_weight_t_mx_pinned(
+    _act_fp8: u64,
+    _act_sf: u64,
+    _weight_fp8: u64,
+    _weight_sf: u64,
+    _out: u64,
+    [_m, _n, _k]: [u32; 3],
+    _stream: u64,
+) -> Result<()> {
+    unreachable!("cublaslt::fp8_gemm_act_weight_t_mx_pinned is cuda-only (not built for metal)")
+}
+
+pub fn fp8_gemm_mx_pinned_prepare(_n: u32, _k: u32, _ref_m: u32, _stream: u64) -> Result<()> {
+    unreachable!("cublaslt::fp8_gemm_mx_pinned_prepare is cuda-only (not built for metal)")
+}
+
+pub fn fp8_gemm_mx_prepare(_n: u32, _k: u32, _m_max: u32, _stream: u64) -> Result<()> {
+    unreachable!("cublaslt::fp8_gemm_mx_prepare is cuda-only (not built for metal)")
+}

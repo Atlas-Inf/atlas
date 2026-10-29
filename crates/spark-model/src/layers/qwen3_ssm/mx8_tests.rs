@@ -75,6 +75,7 @@ fn mx8(gpu: &MockGpuBackend, config: &ModelConfig) -> Mx8Gdn {
             ptr: gpu.alloc(bytes).unwrap(),
             bytes,
         },
+        w8a8: None,
     }
 }
 

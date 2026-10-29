@@ -13,14 +13,18 @@ use spark_runtime::gpu::DevicePtr;
 
 use super::Qwen3AttentionLayer;
 use crate::layer::ForwardContext;
+use crate::layers::ops::qwen4exp_w8a8::{self, MxPrefill};
 use crate::layers::ops::{self, Mxfp8ProjKernels, Mxfp8Scratch};
 use crate::weight_map::{Mxfp8Proj, QuantWeight};
 
-/// Kernels and the prefill expansion scratch for MXFP8 projections.
+/// Kernels and the prefill expansion scratch for MXFP8 projections, and
+/// under `ATLAS_QWEN4EXP_PREFILL_W8A8=1` the W8A8 GEMMs of q/k/v/o that
+/// prefill runs instead.
 #[derive(Debug, Clone, Copy)]
 pub struct Mx8AttnRt {
     pub kernels: Mxfp8ProjKernels,
     pub scratch: Mxfp8Scratch,
+    pub w8a8: Option<MxPrefill<4>>,
 }
 
 impl Qwen3AttentionLayer {
@@ -67,7 +71,8 @@ impl Qwen3AttentionLayer {
     /// `input` and `out` rows are contiguous at the projection's widths.
     /// `exact` selects the numerics family: decode and verify take
     /// `mxfp8_proj_exact_rows` (every row the serial GEMV's bytes at any m),
-    /// prefill takes `mxfp8_proj` (expand + GEMM past 32 rows).
+    /// prefill takes the W8A8 GEMM where it is installed, else `mxfp8_proj`
+    /// (expand + GEMM past 32 rows).
     pub(crate) fn try_mx8(
         &self,
         ctx: &ForwardContext,
@@ -84,7 +89,12 @@ impl Qwen3AttentionLayer {
                 .as_ref()
                 .context("MXFP8 attention weight without its kernels")
                 .and_then(|rt| {
-                    if exact {
+                    if !exact
+                        && let Some(w) = &rt.w8a8
+                        && w.project(ctx.gpu, ctx.buffers, proj, input, out, m, stream)?
+                    {
+                        Ok(())
+                    } else if exact {
                         ops::mxfp8_proj_exact_rows(
                             ctx.gpu,
                             &rt.kernels,
@@ -125,5 +135,23 @@ impl Qwen3AttentionLayer {
     ) -> Option<Result<()>> {
         self.try_mx8(ctx, weight, input, out, m as usize, false, stream)
             .or_else(|| self.try_q2_prefill(ctx, weight, input, out, m, stream))
+    }
+
+    /// Arm the collapse that writes rows `[row0, row0 + rows)` of `x`
+    /// (`[total, hidden]`, the W8A8 projections' input) to emit their MXFP8
+    /// image too (`ops::qwen4exp_w8a8::Producer`). `None` without W8A8.
+    pub(crate) fn w8a8_producer(
+        &self,
+        ctx: &ForwardContext,
+        x: DevicePtr,
+        total: usize,
+        row0: usize,
+        rows: usize,
+    ) -> Result<Option<qwen4exp_w8a8::Producer>> {
+        if self.mx8_rt.as_ref().is_none_or(|rt| rt.w8a8.is_none()) {
+            return Ok(None);
+        }
+        let h = ctx.config.hidden_size;
+        qwen4exp_w8a8::Producer::arm(ctx.buffers, x, total, row0, rows, h)
     }
 }
