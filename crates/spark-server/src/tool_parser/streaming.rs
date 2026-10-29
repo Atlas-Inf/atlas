@@ -78,6 +78,15 @@ pub enum DetectorOutput {
 }
 
 impl StreamingToolDetector {
+    /// Unreleased raw tool syntax, for the API's bounded tool-call guard.
+    pub fn pending_tool_bytes(&self) -> usize {
+        if self.inside_tag || self.inside_dsml || self.current_tc_name.is_some() {
+            self.buffer.len()
+        } else {
+            0
+        }
+    }
+
     pub(super) fn has_partial_tool_opener(&self) -> bool {
         !self.buffer.is_empty()
             && [

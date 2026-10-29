@@ -33,6 +33,9 @@ pub fn resolve_adapter_slot(adapter_names: &[String], adapter: Option<&str>) -> 
 
 /// Shared application state accessible from all HTTP handlers.
 pub struct AppState {
+    /// Operator-only tool-call guard (`cli::ToolGuardArgs`; default on).
+    /// Ported from Enntity/atlas fa5331b2 et seq. (AGPL-3.0-only).
+    pub tool_guard: atlas_tool_guard::Policy,
     pub tokenizer: ChatTokenizer,
     pub model_name: String,
     /// Startup LoRA adapter name (`--lora-adapter NAME=…`). `None` = no

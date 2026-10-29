@@ -21,7 +21,8 @@ type DeltaVec = Vec<StreamDelta>;
 /// an unregistered name (rejected at validation) or an envelope the response
 /// cuts off before `</tool_call>` (never validated, so never flushed).
 fn holds_tool_deltas(state: &StreamState, ctx: &StreamCtx) -> bool {
-    ctx.tool_retry_enabled
+    ctx.state.tool_guard.enabled
+        || ctx.tool_retry_enabled
         || state
             .detector
             .as_ref()
@@ -42,11 +43,18 @@ fn emit_or_buffer_tool_delta(
     deltas: &mut DeltaVec,
 ) {
     if holds_tool_deltas(state, ctx) {
-        state
-            .buffered_tool_chunks
-            .entry(idx)
-            .or_default()
-            .push(delta);
+        // The guard inspects the completed JSON, so buffer the args as one
+        // string rather than a fragment run.
+        let chunks = state.buffered_tool_chunks.entry(idx).or_default();
+        if let StreamDelta::ToolCallArgs { fragment, .. } = &delta
+            && let Some(StreamDelta::ToolCallArgs {
+                fragment: previous, ..
+            }) = chunks.last_mut()
+        {
+            previous.push_str(fragment);
+        } else {
+            chunks.push(delta);
+        }
     } else {
         deltas.push(delta);
     }
@@ -98,6 +106,9 @@ pub(super) fn handle_complete_tool_call(
     }
     if let Some(ref cwd) = ctx.cwd_for_normalize {
         tool_parser::normalize_paths(std::slice::from_mut(tc), cwd);
+    }
+    if super::tool_security::check(state, ctx, &tc.function.arguments) {
+        return;
     }
     // Typed severity (was a fragile `contains("non-empty")` sniff): soft =
     // MissingParam (2026-07-03 ST-collapse class) + EmptyRequired (2026-05-25
@@ -252,6 +263,12 @@ pub(super) fn handle_tool_call_start(
     idx: usize,
     deltas: &mut DeltaVec,
 ) {
+    if state.guard_stop == Some(atlas_tool_guard::GUARD_STOP) {
+        return;
+    }
+    if super::tool_security::check_size(state, ctx, name.len().saturating_add(tc_id.len())) {
+        return;
+    }
     let pre_tool_tail = flush_content_sanitizer(
         &mut state.tag_scan_buf,
         &mut state.suppressing_param_leak,
@@ -304,6 +321,12 @@ pub(super) fn handle_tool_call_delta(
     idx: usize,
     deltas: &mut DeltaVec,
 ) {
+    if state.guard_stop == Some(atlas_tool_guard::GUARD_STOP) {
+        return;
+    }
+    if super::tool_security::check_size(state, ctx, args.len()) {
+        return;
+    }
     let mut emit_args = args.clone();
     if let Some(entry) = state.streaming_tool_args.get_mut(&idx) {
         let name = entry.0.clone();
@@ -417,7 +440,9 @@ pub(super) fn handle_tool_call_delta(
         // deltas: the start delta was already emitted in real time, so
         // `emit_or_buffer_tool_delta` just adds the args delta.
         emit_or_buffer_tool_delta(state, ctx, idx, frag, deltas);
-        flush_buffered_tool_chunks(state, idx, deltas);
+        if !ctx.state.tool_guard.enabled {
+            flush_buffered_tool_chunks(state, idx, deltas);
+        }
     }
 }
 
@@ -430,20 +455,32 @@ pub(super) fn handle_tool_call_delta(
 /// must precede its arguments).
 pub(super) fn handle_tool_call_args_fragment(
     state: &mut StreamState,
-    _ctx: &StreamCtx,
+    ctx: &StreamCtx,
     fragment: String,
     idx: usize,
     deltas: &mut DeltaVec,
 ) {
+    if state.guard_stop == Some(atlas_tool_guard::GUARD_STOP) {
+        return;
+    }
+    if super::tool_security::check_size(state, ctx, fragment.len()) {
+        return;
+    }
     let Some(entry) = state.streaming_tool_args.get_mut(&idx) else {
         return;
     };
     entry.1.push_str(&fragment);
-    deltas.push(StreamDelta::ToolCallArgs {
-        index: idx,
-        fragment,
-        token_ids: Vec::new(),
-    });
+    emit_or_buffer_tool_delta(
+        state,
+        ctx,
+        idx,
+        StreamDelta::ToolCallArgs {
+            index: idx,
+            fragment,
+            token_ids: Vec::new(),
+        },
+        deltas,
+    );
 }
 
 /// Advance the same-name run counter for a completed call, returning the new
@@ -494,8 +531,22 @@ fn advance_name_run(name_run: &mut Option<(String, u32)>, name: &str) -> u32 {
 /// are still caught earlier by the F11 within-response dedup.
 const MAX_CONSEC_SAME_NAME_CALLS: u32 = 8;
 
-pub(super) fn handle_tool_call_end(state: &mut StreamState, ctx: &StreamCtx, idx: usize) {
+pub(super) fn handle_tool_call_end(
+    state: &mut StreamState,
+    ctx: &StreamCtx,
+    idx: usize,
+    deltas: &mut DeltaVec,
+) {
+    if state.guard_stop == Some(atlas_tool_guard::GUARD_STOP) {
+        return;
+    }
     if let Some((name, args_json)) = state.streaming_tool_args.remove(&idx) {
+        if super::tool_security::check(state, ctx, &args_json) {
+            return;
+        }
+        if !ctx.state.tool_guard.enabled {
+            flush_buffered_tool_chunks(state, idx, deltas);
+        }
         let reference = ctx.state.reference_mode;
         if !reference && state.tool_arg_dedup_within.check(&name, &args_json) {
             tracing::warn!(
@@ -514,6 +565,16 @@ pub(super) fn handle_tool_call_end(state: &mut StreamState, ctx: &StreamCtx, idx
             );
             state.stop_string_triggered = true;
             state.tool_loop_capped = true;
+        }
+        if ctx.state.tool_guard.enabled {
+            if state.stop_string_triggered {
+                drop_buffered_tool_chunks(state, idx);
+                state
+                    .cancel_flag
+                    .store(true, std::sync::atomic::Ordering::Release);
+            } else {
+                flush_buffered_tool_chunks(state, idx, deltas);
+            }
         }
         if !state.stop_string_triggered {
             // Successful streaming tool call — log + metric to match the

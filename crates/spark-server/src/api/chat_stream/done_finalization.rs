@@ -50,6 +50,13 @@ pub(super) fn finalize_done<'a>(
         deltas.push(StreamDelta::Refusal { text: r.clone() });
     }
 
+    if state.guard_stop == Some(atlas_tool_guard::GUARD_STOP) {
+        deltas.push(StreamDelta::Content {
+            text: atlas_tool_guard::REFUSAL.into(),
+            token_ids: Vec::new(),
+        });
+    }
+
     // Terminal delta: finish reason + usage. The `include_usage`
     // two-chunk framing (usage-only chunk before a usage-less finish
     // chunk) is the OpenAI encoder's decision
