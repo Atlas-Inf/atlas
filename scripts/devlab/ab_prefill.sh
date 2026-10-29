@@ -17,8 +17,10 @@ for kv in "${@:4}"; do [[ "$kv" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9_./:,+-]*$ ]] && e
 # calls that mismatch implausible and budgets KV as util x 62.5 GB with no weights counted, which then cannot fit:
 # a 55 GB pool on top of 21 GB of 27B weights failed with "Failed to build model". The budget also ignores the
 # ~6 GB of reserves/arena/balloon/MTP pools, so at 0.55 (34.4 GB KV) the total still hit 60.9 of 62.5 GiB.
-# 0.40 (~25 GB KV, >300k tokens) leaves headroom. Size it explicitly.
-export GPU_UTIL=${GPU_UTIL:-0.40} MAX_SEQ_LEN=${MAX_SEQ_LEN:-26624} ATLAS_KV_EXTERNAL_RESERVE_GB=${ATLAS_KV_EXTERNAL_RESERVE_GB:-0}
+# Even at 0.40 a load reached 61.5 of 62.5 GiB with serve-amd's default SSM pools. So use the strix box's proven
+# 27B recipe (SSM_SLOTS=4, SSM_CKPT_INTERVAL=512, MAX_BATCH=1) and a small KV share (0.30, still >200k tokens).
+export GPU_UTIL=${GPU_UTIL:-0.30} MAX_SEQ_LEN=${MAX_SEQ_LEN:-26624} ATLAS_KV_EXTERNAL_RESERVE_GB=${ATLAS_KV_EXTERNAL_RESERVE_GB:-0} \
+  SSM_SLOTS=${SSM_SLOTS:-4} SSM_CKPT_INTERVAL=${SSM_CKPT_INTERVAL:-512} MAX_BATCH=${MAX_BATCH:-1}
 OUT=${DEVLAB_OUT:-$PWD/devlab-out}; mkdir -p "$OUT"; RES="$OUT/RESULTS.txt"
 log() { echo "[$(date -u +%H:%M:%SZ)] $*" | tee -a "$RES"; }
 TEST_DIR=$PWD; BASE_DIR="${RUNNER_TEMP:-/tmp}/devlab-base"
