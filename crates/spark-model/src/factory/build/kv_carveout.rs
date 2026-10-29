@@ -32,9 +32,21 @@ pub(super) struct KvShape<'a> {
     pub(super) tail_slots: Option<TailSlotPlan>,
     /// The latent shard the pool is built with (`glm::new_kv_cache`).
     pub(super) latent_shard: Option<LatentShardSpec>,
+    /// Proposer and per-token auxiliary bytes per block; remain in system
+    /// memory (Enntity/atlas 4d75b9ec — QSA pooled index keys grow with the
+    /// logical pool even when K/V buffers are placed in the display heap).
+    pub(super) auxiliary_block_bytes: usize,
 }
 
 impl KvShape<'_> {
+    /// Per-token aux bytes (QSA pooled index keys) grow with the pool too.
+    pub(super) fn with_per_token_aux(mut self, bytes: usize) -> anyhow::Result<Self> {
+        self.auxiliary_block_bytes = bytes
+            .checked_mul(self.config.block_size)
+            .and_then(|n| n.checked_add(self.auxiliary_block_bytes))
+            .ok_or_else(|| anyhow::anyhow!("KV auxiliary block budget overflow"))?;
+        Ok(self)
+    }
     fn buffers(self, blocks: usize) -> Vec<(KvBuffer, usize)> {
         let k_slots = self
             .latent_shard
@@ -54,6 +66,7 @@ impl KvShape<'_> {
     fn side_bytes(self, blocks: usize) -> usize {
         self.latent_shard
             .map_or(0, |s| LatentShard::allocation_bytes(blocks, &s))
+            + blocks * self.auxiliary_block_bytes
     }
 
     /// System-memory bytes of a `blocks` pool with `placement`'s buffers in
@@ -77,7 +90,8 @@ pub(super) fn plan(shape: KvShape, blocks: usize, capacity: usize) -> (usize, Kv
     let system = shape.system_bytes(blocks, &KvPlacement::default());
     // Per block over two blocks: a sharded K pool grows by a slot every
     // second block. Unsharded this is the one-block step.
-    let per_block = (total(&shape.buffers(blocks + 2)) - total(&shape.buffers(blocks))) / 2;
+    let per_block = (total(&shape.buffers(blocks + 2)) - total(&shape.buffers(blocks))) / 2
+        + shape.auxiliary_block_bytes;
     // A block's bytes all in the carveout bound the gain (to within the one
     // block the two-block step can hide); walk down from there to the first
     // count whose system-memory share fits. `blocks` always does.
