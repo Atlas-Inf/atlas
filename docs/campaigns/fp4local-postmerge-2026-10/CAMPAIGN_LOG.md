@@ -1317,3 +1317,22 @@ the FP8 ceiling, so the MMA issue structure is a second, stacked limit. Next byt
   half the barriers per K, dequant amortized over 2× MMA work. More smem; watch CTAs/SM.
 - A LUT-free FP4 decode (`__byte_perm` / arithmetic) producing the same e4m3 bytes.
 Warp-specialized dequant/MMA warps are the bigger fallback.
+
+## 2026-10-29 — K128 and LUT-free decode: identical but much slower (job 51f). K-series summary.
+
+| case | production | `_nolut` | `_k128` |
+|---|---|---|---|
+| gate_up T=2,900 | 9.00 ms | 15.41 (0.58×) | — |
+| down T=2,900 | 5.41 | 8.80 (0.61×) | 15.38 (0.35×) |
+| gate_up T=19,200 | 34.7 | 61.0 (0.57×) | — |
+| down T=19,200 | 22.8 | 35.8 (0.64×) | 63.3 (0.36×) |
+
+All byte-identical and sanitizer-clean. The branchy arithmetic decode loses to a 16-byte smem LUT read. K128's doubled
+staging (64–75 KB smem → 2–3 CTAs/SM) plus longer serial chains cost far more than halving the barriers saves.
+
+**Byte-exact restructures tried on the production tile body, none faster:** occupancy (register-capped), persistent
+work queue (0.86–0.95×), 3-stage software pipeline (down 0.6×), K_STEP 128 (0.35×), LUT-free decode (0.6×). The probes
+put the weight dequant at 31–50% and the MMA issue structure well off peak (~32% of FP8 even with free dequant). What
+remains: a warp-specialized producer/consumer rewrite (big; byte-exact possible), a numerics-changing native-FP4 path
+(BFCL-gated; an earlier note says it was a wash), or other prefill levers. Owner decision. Branch
+`perf/moe-prefill-occupancy` e986d79cc (local; bench + probes).
