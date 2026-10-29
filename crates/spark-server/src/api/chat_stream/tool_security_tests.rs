@@ -188,6 +188,12 @@ fn tool_guard_blocking_and_reasoning_hoists_are_filtered() {
             assert!(choice.reasoning.is_none());
             assert_eq!(choice.finish_reason, ir::FinishReason::ContentFilter);
             assert_eq!(choice.content.as_deref(), Some(atlas_tool_guard::REFUSAL));
+            // #232: a blocking guard refusal carries guard_stop on the wire.
+            assert_eq!(
+                choice.guard_stop,
+                Some(atlas_tool_guard::GUARD_STOP),
+                "{choice:?}"
+            );
         }
     }
 }
