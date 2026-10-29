@@ -52,7 +52,7 @@ fn an_over_cap_image_is_refused_through_prepare_chat_prompt_with_vision_too_larg
     // (the IHDR-probe variant that refuses pre-decode lives in #237). Its
     // merged rows (4) exceed request_rows=3, so it is refused
     // vision_input_too_large.
-    const PNG64: &str = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgnABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC";
+    const PNG64: &str = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAX0lEQVR4nO3PQQ0AIBDAMMC/50MEj4ZkVbDtWX87OuBVA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA9oFUoUBf3Xr7AgAAAAASUVORK5CYII=";
     let mut req = request();
     req.messages = vec![ir::Message {
         role: ir::Role::User,
@@ -115,7 +115,10 @@ fn a_video_request_with_a_spent_in_flight_budget_is_refused_busy_before_decode()
             video_end_token_id: 0,
             max_pixels: None,
             min_pixels: None,
-            video_pixels: None,
+            video_pixels: Some(atlas_core::config::PixelBounds {
+                min_pixels: 0,
+                max_pixels: 65_536,
+            }),
             token_budgets: atlas_core::config::VisionTokenBudgets::default(),
             omni: None,
         });
