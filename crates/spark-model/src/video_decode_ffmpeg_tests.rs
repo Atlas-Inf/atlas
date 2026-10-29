@@ -356,7 +356,7 @@ fn an_hevc_clip_decodes_too_when_the_encoder_is_available() {
 #[test]
 fn an_empty_stream_splits_to_nothing() {
     assert!(
-        split_png_stream(b"")
+        tail::split_png_stream(b"")
             .expect("empty is not an error")
             .is_empty()
     );
@@ -373,7 +373,7 @@ fn a_stream_of_two_pngs_splits_into_two_frames() {
             .expect("encode");
         buf.extend_from_slice(&one);
     }
-    let frames = split_png_stream(&buf).expect("split");
+    let frames = tail::split_png_stream(&buf).expect("split");
     assert_eq!(frames.len(), 2);
     assert_eq!(frames[0].dimensions(), (4, 3));
 }
