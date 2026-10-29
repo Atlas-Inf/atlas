@@ -83,6 +83,34 @@ fn host_decode_modules_leaves_fp8_block_scales_to_the_layer_loader() {
     assert!(!got.contains(shared), "FP8_PB_WO must not be host-expanded");
 }
 
+/// Per-layer the same suffix may carry DIFFERENT algos (GLM-5.3's
+/// `shared_experts.down_proj`: FP8_PB_WO on most layers, MXFP8 on the MTP
+/// layer). Classification must key the exact per-layer path — an FP8_PB_WO
+/// layer is never host-expanded, an MXFP8 layer is.
+#[test]
+fn the_same_suffix_classifies_per_layer_not_per_suffix() {
+    let mut cfg = fp4_local_config();
+    cfg.model_type = "glm5_next".into();
+    let m = "model.language_model.layers";
+    let block = spec("FP8_PB_WO", 128);
+    let e8m0 = spec("MXFP8", 32);
+    let ql = &mut cfg.quantization_config.as_mut().unwrap().quantized_layers;
+    ql.insert(
+        format!("{m}.10.mlp.shared_experts.down_proj"),
+        block.clone(),
+    );
+    ql.insert(format!("{m}.45.mlp.shared_experts.down_proj"), e8m0);
+    let got = host_decode_modules(&cfg);
+    assert!(
+        !got.contains(&format!("{m}.10.mlp.shared_experts.down_proj")),
+        "the FP8_PB_WO layer stays for the GLM loader"
+    );
+    assert!(
+        got.contains(&format!("{m}.45.mlp.shared_experts.down_proj")),
+        "the MXFP8 layer is host-expanded"
+    );
+}
+
 #[test]
 fn host_decode_modules_pick_mxfp8_and_vision_nvfp4_only() {
     let got = host_decode_modules(&fp4_local_config());
