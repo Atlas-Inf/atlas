@@ -333,6 +333,12 @@ impl NgramRowCache {
         }
     }
 
+    /// The backing file of a flat (non-segmented) table, so a caller can
+    /// check it is the file it validated (`ngram_pack::PackedTable`).
+    pub(crate) fn backing_file(&self) -> &File {
+        &self.file
+    }
+
     pub fn table_dev_va(&self) -> Result<u64> {
         self.arena.slot_dev_va(0, 0)
     }
