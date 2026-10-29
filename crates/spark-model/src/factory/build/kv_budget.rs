@@ -174,7 +174,27 @@ impl KvBudget {
 }
 
 pub(super) fn size(i: &Inputs) -> KvBudget {
-    let used_raw = i.total.saturating_sub(i.free_now);
+    // `total` and `free_now` can come from different scales. On a GTT-capped
+    // unified-memory APU (DevLab Strix Halo: hipMemGetInfo total = the 62.5 GB
+    // GTT cap, while free tracks the 124 GB of system RAM) free reads 79 GB
+    // against a 62.5 GB total, so `total - free_now` saturates to 0. The delta
+    // check below then calls the (correct) self-relative footprint implausible,
+    // the budget charges 0 GB pre-KV, and serve-amd's default utilization sized
+    // a 55 GB pool next to 21 GB of 27B weights: "Failed to build model".
+    // When free exceeds total, the self-relative measures are the only
+    // consistent ones: charge everything in use as the larger of the delta and
+    // the tracked footprint (no co-tenants on such a box is the conservative
+    // reading of an unreadable split), and read free as what that leaves of
+    // `total`. A device whose free fits its total is sized exactly as before.
+    let scales_disagree = i.free_now > i.total;
+    let (used_raw, free_now) = if scales_disagree {
+        let delta = i.baseline_free.map_or(0, |b| b.saturating_sub(i.free_now));
+        let tracked = i.tracked.map_or(0, |t| t.total());
+        let used = delta.max(tracked).min(i.total);
+        (used, i.total - used)
+    } else {
+        (i.total - i.free_now, i.free_now)
+    };
     let (basis, basis_own) = match (i.manual_external, i.baseline_free) {
         (Some(external), _) => (Basis::Manual, used_raw.saturating_sub(external)),
         (None, Some(baseline)) => match baseline.saturating_sub(i.free_now) {
@@ -195,10 +215,7 @@ pub(super) fn size(i: &Inputs) -> KvBudget {
     }
     .min(i.total.saturating_sub(total_budget));
     let by_budget = total_budget.saturating_sub(own).saturating_sub(i.reserve);
-    let by_free = i
-        .free_now
-        .saturating_sub(i.reserve)
-        .saturating_sub(headroom);
+    let by_free = free_now.saturating_sub(i.reserve).saturating_sub(headroom);
     KvBudget {
         used_raw,
         basis,
@@ -225,6 +242,20 @@ pub(super) struct Note {
 pub(super) fn notes(i: &Inputs, b: &KvBudget, pool_from_budget: bool) -> Vec<Note> {
     let mut out = Vec::new();
     let mut say = |warn: bool, text: String| out.push(Note { warn, text });
+    if i.free_now > i.total {
+        say(
+            true,
+            format!(
+                "free-memory reading {:.1} GB exceeds the {:.1} GB device total (GTT-capped \
+                 unified memory?): charging pre-KV as the self-relative footprint {:.1} GB \
+                 and reading free as {:.1} GB",
+                gib(i.free_now),
+                gib(i.total),
+                gib(b.used_raw),
+                gib(i.total.saturating_sub(b.used_raw)),
+            ),
+        );
+    }
     match (b.basis, i.manual_external, i.baseline_free) {
         (Basis::Manual, Some(external), _) => say(
             false,
