@@ -328,6 +328,9 @@ pub(super) fn build_msg_entries(
                 "this model does not accept image or video input (no vision config)".to_string(),
             ));
         };
+        let reserve_decode = media.iter().any(|m| m.kind == MediaKind::Video)
+            && !vcfg.is_glm5_next
+            && video.ffmpeg.max_total_decoded_pixels.is_some();
         for (idx, input) in media.iter().enumerate() {
             let (item, video_timestamps) = match input.kind {
                 MediaKind::Image => {
@@ -362,13 +365,19 @@ pub(super) fn build_msg_entries(
                     }
                 }
                 MediaKind::Video => {
-                    match spark_model::video_preprocess::preprocess_video(
-                        &input.uri,
-                        vcfg,
-                        vision_max_pixels,
-                        video.fps,
-                        video.ffmpeg,
-                    ) {
+                    if reserve_decode {
+                        let ceiling = qwen_video_rows_ceiling(vcfg, vision_max_pixels, video);
+                        admission.reserve_video(ceiling)?;
+                    }
+                    match spark_model::vision_preprocess::decode_gated(|| {
+                        spark_model::video_preprocess::preprocess_video(
+                            &input.uri,
+                            vcfg,
+                            vision_max_pixels,
+                            video.fps,
+                            video.ffmpeg,
+                        )
+                    }) {
                         Ok(v) => {
                             let timestamps = if vcfg.is_qwen3vl_video {
                                 v.timestamps_hf.clone()
@@ -396,6 +405,9 @@ pub(super) fn build_msg_entries(
             };
             image_pad_counts[idx] = item.pad_count(vcfg.spatial_merge_size);
             admission.note(image_pad_counts[idx])?;
+            if reserve_decode {
+                admission.reconcile_video(image_pad_counts[idx])?;
+            }
             if vcfg.is_glm5_next || vcfg.is_qwen3vl_video {
                 vision_placeholders.push(glm5_vision::placeholder(
                     input.kind,

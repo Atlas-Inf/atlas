@@ -42,10 +42,7 @@ pub const CEILING_MAX_PATCHES: usize = 16384;
 /// decision alongside the value so the caller can say out loud when a
 /// checkpoint asked for more than it got — silently ignoring the checkpoint is
 /// the failure mode this whole change exists to remove.
-pub(crate) fn derive_max_patches(
-    max_pixels: Option<usize>,
-    patch_size: usize,
-) -> (usize, Option<usize>) {
+pub fn derive_max_patches(max_pixels: Option<usize>, patch_size: usize) -> (usize, Option<usize>) {
     let Some(area) = max_pixels.filter(|&a| a > 0) else {
         return (FALLBACK_MAX_PATCHES, None);
     };
