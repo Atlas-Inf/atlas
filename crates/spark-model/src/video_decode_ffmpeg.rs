@@ -305,6 +305,19 @@ fn run_ffmpeg(
     let mut stdout = child.stdout.take().context("no stdout pipe")?;
     let mut stderr = child.stderr.take().context("no stderr pipe")?;
 
+    // `showinfo` emits one stderr line per selected frame under `-v info`:
+    // drain it concurrently or the pipe fills mid-decode and ffmpeg blocks
+    // writing while the stdout reader waits (frames silently truncated).
+    // Enntity/atlas d0cead1's `stderr_reader`.
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr
+            .by_ref()
+            .take(8 * 1024 * 1024)
+            .read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
+
     // Feed the container on a thread. It MUST be concurrent with reading:
     // ffmpeg writes output while still consuming input, so a write-then-read
     // sequence deadlocks as soon as the output pipe buffer fills.
@@ -359,8 +372,9 @@ fn run_ffmpeg(
         let _ = g.kill();
     }
 
-    let mut err_text = String::new();
-    let _ = stderr.read_to_string(&mut err_text);
+    let err_text = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("ffmpeg stderr reader panicked"))?;
     let _ = writer.join();
 
     let status = {
