@@ -79,8 +79,11 @@ pub(crate) fn prepare_chat_prompt(
             "ATLAS_NO_TOOL_INJECT=1: skipping the parser tool system prompt.              This is an experiment - the injection is load-bearing for the              hallucination category (~96 vs 30/64 without)."
         );
     }
+    // A verbatim-prompt model gets the template's tool block alone, as on
+    // the reference server.
     if tools_active
         && !skip_inject
+        && !state.chat.verbatim_prompt
         && let Some(ref parser) = state.tool_call_parser
     {
         let default_choice = crate::tool_parser::ToolChoice::Mode("auto".to_string());

@@ -397,4 +397,64 @@ mod build_tests {
             "client prompt\nworking directory: /tmp/project"
         );
     }
+
+    /// A verbatim-prompt model's conversation reaches the template as sent:
+    /// no tool-error marker, error hints, duplicate-error masks, cwd hint or
+    /// content-free-system drop.
+    #[test]
+    fn a_verbatim_prompt_keeps_the_conversation_as_sent() {
+        use crate::api::chat::levers::ChatLevers;
+        let err = "Error: bash: lss: command not found (exit code 127)";
+        let tool = |t: &str| Message {
+            tool_error: true,
+            ..text(Role::Tool, t)
+        };
+        let build = |msgs: &[Message], levers: &ChatLevers| -> Vec<String> {
+            build_msg_entries(
+                crate::api::chat::vision_admit::AdmitCtx::default(),
+                None,
+                None,
+                &crate::api::chat::remote_image::RemoteImagePolicy::default(),
+                &crate::api::chat::msg_entry::VideoDecode {
+                    ffmpeg: &spark_model::video_decode_ffmpeg::FfmpegPolicy {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    fps: 2.0,
+                },
+                msgs,
+                true,
+                levers,
+                false,
+            )
+            .expect("built")
+            .messages
+            .into_iter()
+            .map(|m| m.content)
+            .collect()
+        };
+        let verbatim = ChatLevers {
+            verbatim_prompt: true,
+            ..ChatLevers::OFF
+        };
+        let agent = [
+            text(Role::System, "working directory: /tmp/project"),
+            text(Role::User, "list"),
+            tool(err),
+            tool(err),
+        ];
+        let sent = ["working directory: /tmp/project", "list", err, err];
+        assert_eq!(build(&agent, &verbatim), sent);
+        assert_ne!(
+            build(&agent, &ChatLevers::OFF),
+            sent,
+            "the aids are on by default"
+        );
+        let vacuous = [
+            text(Role::System, "User Context:\n\n"),
+            text(Role::User, "hi"),
+        ];
+        assert_eq!(build(&vacuous, &verbatim), ["User Context:\n\n", "hi"]);
+        assert_eq!(build(&vacuous, &ChatLevers::OFF), ["hi"]);
+    }
 }

@@ -40,6 +40,7 @@ fn glm_tokenizer() -> (tempfile::TempDir, ChatTokenizer) {
                 .as_path(),
         ),
         false,
+        false,
     )
     .unwrap();
     (dir, tokenizer)

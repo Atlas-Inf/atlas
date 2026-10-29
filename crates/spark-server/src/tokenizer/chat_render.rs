@@ -30,6 +30,11 @@ pub(crate) struct RenderFlags<'a> {
     /// — every effort-silent client silently bought the MOST expensive
     /// directive tier.
     pub reasoning_effort: Option<&'a str>,
+    /// Leave an effort-silent thinking render's `reasoning_effort` UNDEFINED
+    /// instead of the `"medium"` fallback, so the template's own default
+    /// applies, as transformers/vLLM render it (MODEL.toml
+    /// `[behavior].verbatim_prompt`).
+    pub template_effort_default: bool,
     /// Tri-state `preserve_thinking` (Qwen3.6+ dense templates). `None` =
     /// the variable is left UNDEFINED in the Jinja context so the model
     /// template's own default applies (Qwen3.6 strips historical `<think>`
@@ -105,6 +110,8 @@ pub(crate) fn render_chat(
     // (resolved in api/chat/prepare.rs before this fallback).
     let reasoning_effort: minijinja::Value = if let Some(effort) = flags.reasoning_effort {
         effort.into()
+    } else if enable_thinking && flags.template_effort_default {
+        minijinja::Value::UNDEFINED
     } else if enable_thinking {
         "medium".into()
     } else {

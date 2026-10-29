@@ -53,10 +53,15 @@ pub(super) fn render_template(
     // `tools` to Jinja as well would re-render the full JSON schema and
     // defeat the compaction. Pass `None` so the template's `{% if tools
     // %}` branch falls through — the tool-call format instructions
-    // still come from `system_prompt()`.
-    let jinja_tools: Option<Vec<serde_json::Value>> = if tools_active
-        && (state.tokenizer.uses_deepseek_v4_encoding() || !state.chat.prompt.tscg)
-    {
+    // still come from `system_prompt()`. A verbatim-prompt model renders
+    // the request's tools whenever it has any, `tool_choice: "none"`
+    // included, as the reference server does.
+    let render_tools = if state.chat.verbatim_prompt {
+        !tools.is_empty()
+    } else {
+        tools_active && (state.tokenizer.uses_deepseek_v4_encoding() || !state.chat.prompt.tscg)
+    };
+    let jinja_tools: Option<Vec<serde_json::Value>> = if render_tools {
         Some(
             tools
                 .iter()
