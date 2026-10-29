@@ -261,8 +261,7 @@ pub fn decode_with_plan(
                 .filter(|&count| count > 1)
                 .map(|count| timing.duration_secs / (count - 1) as f32)
                 .or_else(|| {
-                    crate::video_sample::finite_positive(timing.native_fps)
-                        .map(|rate| 1.0 / rate)
+                    crate::video_sample::finite_positive(timing.native_fps).map(|rate| 1.0 / rate)
                 })
                 .unwrap_or(1.0 / fps);
             let old_end = *plan.times.last().expect("a non-empty plan");
@@ -313,6 +312,10 @@ fn run_ffmpeg(
             &filter,
             "-frames:v",
             &output_frames.to_string(),
+            // No CFR dup/drop on sparse selections: emit the frames the
+            // filter produced, at their own PTS (Enntity/atlas d0cead1).
+            "-fps_mode",
+            "passthrough",
             "-f",
             "image2pipe",
             "-vcodec",
