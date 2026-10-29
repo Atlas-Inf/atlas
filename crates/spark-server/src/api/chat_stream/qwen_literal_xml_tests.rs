@@ -106,7 +106,7 @@ fn qwen_literal_xml_does_not_disable_legacy_chatml_filtering() {
     assert!(app(false).tokenizer.filters_bare_role_literals());
     for word in ["tool", "user", "assistant"] {
         let mut text = word.to_owned();
-        super::super::handle_token::strip_bare_role_literal(&mut text, false);
+        crate::api::chat_stream::handle_token::strip_bare_role_literal(&mut text, false);
         assert!(text.is_empty());
     }
 }
