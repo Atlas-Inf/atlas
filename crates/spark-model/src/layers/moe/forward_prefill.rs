@@ -105,34 +105,34 @@ impl MoeLayer {
             return self.forward_batched(input, num_tokens, ctx, stream);
         }
 
-        // NVFP4 experts on native HIP: the grouped path pays off only for
-        // long prefills — at small N every expert block still walks the full
-        // K loop for ≤1 real row (2026-09-20 GPU-timed winbox trace: grouped
-        // GEMMs = 1,754 of 2,754 ms GPU in a 44-token prefill, ~15 ms/call
-        // nearly flat in N). Below ATLAS_HIP_MOE_GROUPED_MIN_TOKENS route to
-        // the per-token batched path like the bf16/fp8 arms above. cfg gate:
-        // NVIDIA byte-unchanged.
+        // NVFP4 experts on native HIP: below ATLAS_HIP_MOE_GROUPED_MIN_TOKENS
+        // route to the per-token batched path, like the bf16/fp8 arms above.
+        // cfg gate: NVIDIA byte-unchanged.
         //
-        // Default 1024 = measured crossover, serial arm, hipBLASLt live,
-        // temp 0, winbox 2026-09-20 (TTFT ms, grouped vs batched):
-        //   20 tok   2053 vs ~600      44 tok  2946 vs ~1000
-        //  266 tok   7027 vs ~4196    708 tok 10825 vs ~9795
-        // 1150 tok  14347 vs 15594  <- grouped wins
-        // Batched leads through 708 and loses at 1150; crossover ~900,
-        // rounded to the nearest power of two.
+        // Default 256. It was 1024, from a winbox crossover (2026-09-20) taken when
+        // a grouped call cost ~15 ms nearly flat in N; #155's F16 grouped twins made
+        // it cheap, and the per-token path then cost ~7 s for one 423-row chunk
+        // (one warm agent turn). Cold TTFT, Flash-Next NVFP4, framework gfx1151
+        // Linux, 2026-10-27 (f46), 1024 -> 256: 470 tok 8.36 -> 1.06 s, 649 tok
+        // 11.61 -> 1.30 s; 1035 / 1676 tok unchanged.
+        // Why not lower: 64 also wins below 256 tokens (132 tok 2.50 -> 0.81 s) but
+        // its agentic-webserver runs scored 45/50 and 47/50 webserver_ok, every
+        // failure "no Cargo.toml was written" (f47, f53), against 50/50 at 1024
+        // (f51). 256 scored 49/50 / 50/50 with no such failure, Sigma wall
+        // 15,441 -> 13,049 s and median TTFT 5.08 -> 3.65 s (f57).
         if cfg!(atlas_hip) {
             static HIP_NVFP4_GROUPED_MIN_TOKENS: std::sync::OnceLock<usize> =
                 std::sync::OnceLock::new();
             // Unit tests drive this dispatch through a recording backend and
-            // assert the grouped path (the GB10 dispatch); the 1024 crossover is
-            // a serving choice measured on hardware, so under cfg(test) the
-            // default is 1 (the env var still overrides). With 1024, six GLM
-            // MoE tests failed or hung on HIP builds.
+            // assert the grouped path (the GB10 dispatch); the production
+            // threshold is a serving choice measured on hardware, so under
+            // cfg(test) the default is 1 (the env var still overrides). With
+            // 1024, six GLM MoE tests failed or hung on HIP builds.
             let min = *HIP_NVFP4_GROUPED_MIN_TOKENS.get_or_init(|| {
                 std::env::var("ATLAS_HIP_MOE_GROUPED_MIN_TOKENS")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(if cfg!(test) { 1 } else { 1024 })
+                    .unwrap_or(if cfg!(test) { 1 } else { 256 })
             });
             if num_tokens < min {
                 return self.forward_batched(input, num_tokens, ctx, stream);
