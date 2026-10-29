@@ -1241,3 +1241,11 @@ the new symbols are present and the removed ones absent before timing. Their pro
 (gate_up 9.0 ms, down 5.3 ms at T = 2,900). Confirmed in source: the per-layer 2,052-byte expert-offset D2H
 (`forward_prefill_routed.rs:110`) only feeds `max_m_tiles` (grid sizing), so a device-built work queue makes it
 unnecessary. Re-run as job 47c.
+
+## 2026-10-29 — K2a `_wq`: misaligned shared write (open)
+
+`_wq` and the device work-list builder embed correctly (strings guard). The sanitizer reports
+`Invalid __shared__ write of size 16` in `fused_gate_up_t_k64_wq+0x9a0` at smem offset 0x888 (8 mod 16), across 4 layout
+tweaks of the work-item slot. Next: `-lineinfo` + a device backtrace to name the store, explicit `__align__(16)` on
+every staging array, and a single shared `__device__` tile body for the production and `_wq` kernels. Capped at 2 more
+attempts, then reassess. Branch `perf/moe-prefill-occupancy` eab4134d8 (local).
