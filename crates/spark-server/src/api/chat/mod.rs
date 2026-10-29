@@ -25,6 +25,9 @@
 pub(crate) mod echo;
 pub(crate) mod levers;
 mod loop_detect;
+#[cfg(test)]
+#[path = "loop_detect_tests.rs"]
+mod loop_detect_tests;
 mod msg_entry;
 pub(crate) mod prepare;
 pub(crate) mod remote_image;

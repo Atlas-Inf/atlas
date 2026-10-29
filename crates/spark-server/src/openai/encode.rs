@@ -77,6 +77,7 @@ pub(crate) fn encode_chat_response(
                 },
                 finish_reason: c.finish_reason.as_wire().to_string(),
                 logprobs: c.logprobs.map(encode_logprobs),
+                guard_stop: c.guard_stop,
             }
         })
         .collect();

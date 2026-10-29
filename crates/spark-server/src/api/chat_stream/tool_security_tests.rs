@@ -188,8 +188,43 @@ fn tool_guard_blocking_and_reasoning_hoists_are_filtered() {
             assert!(choice.reasoning.is_none());
             assert_eq!(choice.finish_reason, ir::FinishReason::ContentFilter);
             assert_eq!(choice.content.as_deref(), Some(atlas_tool_guard::REFUSAL));
+            // #232: a blocking guard refusal carries guard_stop on the wire.
+            assert_eq!(
+                choice.guard_stop,
+                Some(atlas_tool_guard::GUARD_STOP),
+                "{choice:?}"
+            );
         }
     }
+}
+
+/// #232: the SCHEDULER-side refusal path — a seq the tool guard already
+/// consumed carries `guard_stop` on `StreamEvent::Done`; the blocking
+/// response and wire choice must surface it too (the gap a live refusal hit:
+/// ContentFilter with no guard_stop). The inspect-arm path is covered by the
+/// test above; this covers `Done.guard_stop -> response -> choice`.
+#[test]
+fn a_seq_level_guard_stop_reaches_the_blocking_wire_choice() {
+    let (c, _s) = setup(false);
+    let mut resp = response(vec![]);
+    resp.guard_stop = Some(atlas_tool_guard::GUARD_STOP);
+    resp.finish_reason = "content_filter".into();
+    let choice = crate::api::chat_blocking_choice::build_choice_message(
+        &c.state,
+        &request(),
+        &resp,
+        None,
+        atlas_tool_guard::REFUSAL.into(),
+        true,
+        None,
+        0,
+    );
+    assert_eq!(choice.finish_reason, ir::FinishReason::ContentFilter);
+    assert_eq!(
+        choice.guard_stop,
+        Some(atlas_tool_guard::GUARD_STOP),
+        "{choice:?}"
+    );
 }
 
 #[test]

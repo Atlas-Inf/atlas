@@ -68,6 +68,8 @@ pub(super) fn finalize_done<'a>(
         reason: crate::ir::FinishReason::from(fr),
         usage,
         token_ids: state.take_ids_if(return_token_ids),
+        // #55 (Enntity/atlas 8150f896): surface a guard cut on the wire.
+        guard_stop: state.guard_stop,
     });
 
     (deltas, fr)

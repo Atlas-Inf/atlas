@@ -162,6 +162,7 @@ fn response(tokens: Vec<u32>) -> crate::api::inference_types::InferenceResponse 
         cached_prompt_tokens: 0,
         accepted_prediction_tokens: 0,
         prompt_logprobs: vec![],
+        guard_stop: None,
     }
 }
 
