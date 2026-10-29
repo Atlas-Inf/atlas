@@ -140,7 +140,11 @@ pub fn prefill_attention_paged_64(
     // NVIDIA keeps 64 byte-identical.
     // Native HIP's prefill_paged_compute.cuh runs BR64=64 on 8 warps; the SCALE
     // `strix` tree still clamps to 32.
-    let br = if cfg!(atlas_scale) && !cfg!(atlas_hip) { 32u32 } else { 64u32 };
+    let br = if cfg!(atlas_scale) && !cfg!(atlas_hip) {
+        32u32
+    } else {
+        64u32
+    };
     KernelLaunch::new(gpu, kernel)
         .grid([num_q_heads, div_ceil(q_len, br), 1])
         .block([256, 1, 1])
@@ -195,7 +199,11 @@ pub fn prefill_attention_paged_fp8_64(
     // NVIDIA keeps 64 byte-identical.
     // Native HIP's prefill_paged_compute.cuh runs BR64=64 on 8 warps; the SCALE
     // `strix` tree still clamps to 32.
-    let br = if cfg!(atlas_scale) && !cfg!(atlas_hip) { 32u32 } else { 64u32 };
+    let br = if cfg!(atlas_scale) && !cfg!(atlas_hip) {
+        32u32
+    } else {
+        64u32
+    };
     KernelLaunch::new(gpu, kernel)
         .grid([num_q_heads, div_ceil(q_len, br), 1])
         .block([256, 1, 1])
@@ -352,7 +360,11 @@ pub fn prefill_attention_paged_nvfp4_64(
     // NVIDIA keeps 64 byte-identical.
     // Native HIP's prefill_paged_compute.cuh runs BR64=64 on 8 warps; the SCALE
     // `strix` tree still clamps to 32.
-    let br = if cfg!(atlas_scale) && !cfg!(atlas_hip) { 32u32 } else { 64u32 };
+    let br = if cfg!(atlas_scale) && !cfg!(atlas_hip) {
+        32u32
+    } else {
+        64u32
+    };
     KernelLaunch::new(gpu, kernel)
         .grid([num_q_heads, div_ceil(q_len, br), 1])
         .block([256, 1, 1])

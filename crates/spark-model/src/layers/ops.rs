@@ -80,9 +80,6 @@ mod exl3_ops;
 mod gemm_fp8_prefill;
 #[path = "ops/gemm_quant.rs"]
 mod gemm_quant;
-#[cfg(atlas_hip)]
-#[path = "ops/hip_fp8_blas.rs"]
-mod hip_fp8_blas;
 #[path = "ops/gemv_q2.rs"]
 mod gemv_q2;
 #[path = "ops/gemv_q2_vec.rs"]
@@ -105,6 +102,9 @@ mod glm_kv_shard;
 mod glm_router_bn4;
 #[path = "ops/glm_sparse_prefill_tc.rs"]
 mod glm_sparse_prefill_tc;
+#[cfg(atlas_hip)]
+#[path = "ops/hip_fp8_blas.rs"]
+mod hip_fp8_blas;
 pub use glm_router_bn4::glm_router_bn4;
 #[path = "ops/hyper_connection.rs"]
 mod hyper_connection;

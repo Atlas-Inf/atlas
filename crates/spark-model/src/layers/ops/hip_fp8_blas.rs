@@ -55,17 +55,25 @@ fn dequant_kernel(gpu: &dyn GpuBackend) -> Option<(KernelHandle, bool)> {
         if let Ok(k) = gpu.kernel("dequant_fp8_bs128_bf16_v8", "dequant_fp8_bs128_bf16_v8") {
             return Some((k, true));
         }
-        gpu.kernel("dequant_fp8_blockscaled_bf16", "dequant_fp8_blockscaled_bf16")
-            .map(|k| (k, false))
-            .map_err(|e| tracing::warn!("hip fp8 prefill: no dequant kernel ({e}); fused FP8 GEMM only"))
-            .ok()
+        gpu.kernel(
+            "dequant_fp8_blockscaled_bf16",
+            "dequant_fp8_blockscaled_bf16",
+        )
+        .map(|k| (k, false))
+        .map_err(|e| {
+            tracing::warn!("hip fp8 prefill: no dequant kernel ({e}); fused FP8 GEMM only")
+        })
+        .ok()
     })
 }
 
 /// Per-stream BF16 scratch of at least `bytes`.
 fn scratch(gpu: &dyn GpuBackend, stream: u64, bytes: usize) -> Result<DevicePtr> {
     static S: OnceLock<Mutex<HashMap<u64, (u64, usize)>>> = OnceLock::new();
-    let mut map = S.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
+    let mut map = S
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let slot = map.entry(stream).or_insert((0, 0));
     if slot.1 < bytes {
         if slot.0 != 0 {
@@ -105,7 +113,9 @@ pub(super) fn try_w8a16_n(
         Ok(p) => p,
         Err(e) => {
             static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| tracing::warn!("hip fp8 prefill: scratch alloc failed ({e}); fused FP8 GEMM"));
+            WARNED.call_once(|| {
+                tracing::warn!("hip fp8 prefill: scratch alloc failed ({e}); fused FP8 GEMM")
+            });
             return Ok(false);
         }
     };
@@ -142,7 +152,9 @@ pub(super) fn try_w8a16_n(
         Ok(()) => Ok(true),
         Err(e) => {
             static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| tracing::warn!("hip fp8 prefill: BF16 GEMM unavailable ({e}); fused FP8 GEMM"));
+            WARNED.call_once(|| {
+                tracing::warn!("hip fp8 prefill: BF16 GEMM unavailable ({e}); fused FP8 GEMM")
+            });
             Ok(false)
         }
     }
