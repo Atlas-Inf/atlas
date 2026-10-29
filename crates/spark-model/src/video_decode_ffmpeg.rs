@@ -55,7 +55,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use crate::video_sample::{grid_step, sample_plan, wanted_frames};
+use crate::video_sample::{sample_plan, wanted_frames};
 
 mod probe;
 mod scale;
@@ -183,6 +183,9 @@ pub struct ClipTiming {
     /// The video stream's own rate: an average when the container declares
     /// one, otherwise the instantaneous rate. Used only to plan coverage.
     pub native_fps: f32,
+    /// Declared source frame count (`nb_frames`), when the container names
+    /// it. `None` sizes the plan by duration alone.
+    pub frame_count: Option<u64>,
 }
 
 /// Decode `bytes` to RGB frames spanning the clip, plus the plan that
@@ -231,21 +234,49 @@ pub fn decode_with_plan(
         policy.max_frames,
         fps,
     );
-    // The plan converts the frame COUNT into evenly spaced positions across
-    // the probed duration — this, and not the frame count, is what makes the
-    // samples cover the whole clip instead of stopping `cap / fps` seconds in.
-    let plan = sample_plan(want, timing.duration_secs)?;
-    // The grid runs at the SOURCE rate, subdivided so the selector's indices
-    // land on a dense-enough grid to name the plan's positions. The coverage
-    // bound the operator's `fps` represents is enforced by how MANY samples
-    // the plan asks for, not by ffmpeg dropping the rest — which is exactly
-    // the distinction the old `fps=` filter could not make.
-    let native = crate::video_sample::finite_positive(timing.native_fps).unwrap_or(fps);
-    let step = grid_step(native, fps, fps);
-    // `fps=A/B` samples one frame every `B/A` seconds, so the frame the
-    // selector names for index K is the grid frame at time `K × B/A`.
-    let grid = format!("fps={native}/{step}");
-    run_ffmpeg(bytes, &plan, &grid, policy)
+    // Enntity/atlas d0cead1: when the cap can hold every declared source
+    // frame, keep the whole clip verbatim — a short CFR or VFR clip is not
+    // warped by an evenly spaced time plan. showinfo still reports the real
+    // PTS of the frames ffmpeg actually emits.
+    let (selection, output_frames) = if let Some(count) = timing
+        .frame_count
+        .filter(|&count| count > 0 && count <= crate::video_sample::MAX_SAMPLE_PLAN as u64)
+        .filter(|&count| want >= count as usize)
+    {
+        ("select=1".to_string(), count as usize)
+    } else {
+        // The plan converts the frame COUNT into evenly spaced positions
+        // across the probed duration — this, and not the frame count, is what
+        // makes the samples cover the whole clip instead of stopping
+        // `cap / fps` seconds in.
+        let mut plan = sample_plan(want, timing.duration_secs)?;
+        // A container's duration usually names the end of its presentation
+        // timeline, while its last frame starts one frame interval earlier.
+        // Rescale the targets to end inside that final interval so the
+        // timestamp selector can actually reach it. The returned time is
+        // still the decoded frame's PTS, captured from ffmpeg below.
+        if plan.len() > 1 {
+            let final_step = timing
+                .frame_count
+                .filter(|&count| count > 1)
+                .map(|count| timing.duration_secs / (count - 1) as f32)
+                .or_else(|| {
+                    crate::video_sample::finite_positive(timing.native_fps)
+                        .map(|rate| 1.0 / rate)
+                })
+                .unwrap_or(1.0 / fps);
+            let old_end = *plan.times.last().expect("a non-empty plan");
+            let new_end = old_end.min((timing.duration_secs - final_step).max(0.0));
+            if new_end < old_end && old_end > 0.0 {
+                for time in &mut plan.times {
+                    *time = *time * new_end / old_end;
+                }
+            }
+        }
+        let output_frames = plan.len();
+        (plan.select_time_filter(), output_frames)
+    };
+    run_ffmpeg(bytes, &selection, output_frames, policy)
 }
 
 /// Spawn ffmpeg with the plan's filter and collect the frames.
@@ -255,18 +286,17 @@ pub fn decode_with_plan(
 /// RGB) is readable on its own.
 fn run_ffmpeg(
     bytes: &[u8],
-    plan: &crate::video_sample::SamplePlan,
-    grid: &str,
+    selection: &str,
+    output_frames: usize,
     policy: &FfmpegPolicy,
 ) -> Result<(Vec<RgbImage>, Vec<f32>)> {
-    // `select` first, `scale` after: at most `plan.len()` frames are ever
+    // `select` first, `scale` after: at most `output_frames` frames are ever
     // scaled, and the scale is what caps the RGB the returned Vec holds.
     // Enntity/atlas 6f3d0a71 + 95d20a25: `showinfo` reports each selected
     // frame's real PTS (VFR-accurate), and the scale bounds by PIXEL AREA,
     // not per-side (a 1xN strip has a huge side inside any per-side bound).
     let filter = format!(
-        "{grid},{},showinfo,{}",
-        plan.select_filter(),
+        "{selection},showinfo,{}",
         scale::decoded_scale_filter(policy.max_decoded_pixels),
     );
 
@@ -282,7 +312,7 @@ fn run_ffmpeg(
             "-vf",
             &filter,
             "-frames:v",
-            &plan.len().to_string(),
+            &output_frames.to_string(),
             "-f",
             "image2pipe",
             "-vcodec",

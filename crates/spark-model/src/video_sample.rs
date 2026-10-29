@@ -62,6 +62,32 @@ impl SamplePlan {
             .collect();
         format!("select='{}'", clauses.join("+"))
     }
+
+    /// The ffmpeg `select` filter that advances through this plan by source
+    /// timestamp rather than by a synthetic frame index. `selected_n` is the
+    /// count of frames already accepted; for each plan position the filter
+    /// takes the first source frame whose `t` reaches that position — CFR and
+    /// VFR inputs keep their own timeline and `showinfo` can report the
+    /// selected frame's real PTS. Enntity/atlas d0cead1.
+    pub fn select_time_filter(&self) -> String {
+        // Plans are uniformly spaced. Express the next target from selected_n
+        // in constant space: thousands of clauses exceed Linux's argv bound
+        // and require quadratic work across an hour of source frames.
+        if self.times.len() <= 1 {
+            return "select='eq(selected_n,0)'".into();
+        }
+        let start = f64::from(self.times[0]);
+        let end = f64::from(self.times[self.times.len() - 1]);
+        // Source times are f32: at an hour their rounding can put the final
+        // target beyond the last actual PTS. Compute the repeated step in f64
+        // and inset by two f32 rounding units (under 1 ms at an hour).
+        let rounding = f64::from(f32::EPSILON) * end.abs().max(1.0) * 2.0;
+        let step = (end - start - rounding).max(0.0) / (self.times.len() - 1) as f64;
+        format!(
+            "select='lt(selected_n\\,{})*gte(t\\,{start:.12}+selected_n*{step:.12})'",
+            self.times.len()
+        )
+    }
 }
 
 /// Spacing of the sampling grid, in the decoder's own frame-index space.
