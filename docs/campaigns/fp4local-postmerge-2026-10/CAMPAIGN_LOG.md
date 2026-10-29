@@ -1196,3 +1196,26 @@ Byte-exact design options, pending the isolated bench (job 44, branch `bench/moe
 2. Weight-stationary persistent CTA per (expert, N-tile): dequantize each B tile once, reuse it across that expert's
    M-tiles.
 3. Warp-specialized TMA/mbarrier pipeline (est. 60–100 TFLOP/s, high effort).
+
+## 2026-10-29 — MoE prefill kernels are occupancy/latency-bound (isolated bench, branch bench/moe-prefill-gemm cf70977a3)
+
+Production wrappers, skewed top-10 of 512 routing, cold 48-layer weight rotation. The numbers match job 43's in-situ
+per-call times, so the bench reproduces production:
+
+| kernel | T | ms | TFLOP/s | weight GB/s |
+|---|---|---|---|---|
+| fused_gate_up_t_k64 | 2,900 | 9.36 | 20.3 | ~100 |
+| grouped_gemm_ptrtable_t_k64 | 2,900 | 5.35 | 17.8 | ~88 |
+| fused_gate_up_t_k64 | 19,200 | 38.0 | 33.1 | ~25 |
+| grouped_gemm_ptrtable_t_k64 | 19,200 | 22.0 | 28.6 | ~21 |
+
+On-box ceiling: dense cuBLASLt FP8 e4m3 at the gate_up shape (29,000 × 1,280 × 2,560) ≈ **228 TFLOP/s**. The MoE kernels
+sit at 9–15% of it and far below DRAM bandwidth, so they are neither compute- nor bandwidth-bound: occupancy/latency.
+Likely contributors: ~37 KB static smem (2 CTAs/SM), the strided-M grid with many empty CTAs (grid.z = 512), and
+dequantizing every weight tile again for each M-tile.
+
+Next (byte-exact, same MMA + per-element K order):
+1. Occupancy: N_TILE 128 → 64 and/or trimmed B staging, as new kernel symbols, compared against production in one
+   bench run.
+2. Persistent work queue over (expert, M-tile) pairs instead of grid.y striding.
+3. Weight-stationary reuse across an expert's M-tiles.
