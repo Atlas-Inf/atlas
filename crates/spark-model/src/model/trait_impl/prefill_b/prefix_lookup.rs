@@ -366,6 +366,10 @@ impl TransformerModel {
             self.nvme_forget_rewritten(tokens, seq.adapter_id, skip_tokens, matched, bs);
             self.pc_plan_branch(tokens, seq, matched, skip_tokens, bs)?;
             self.finish_leaf_restored(tokens, seq, skip_tokens, bs, stream)?;
+            // ATLAS_DFLASH_WARM_CTX (Enntity/atlas 5573f4d5): where the
+            // drafter's window may start, and its stored rows under the
+            // restore point.
+            self.dflash_warm_begin(seq, Some(tokens), skip_tokens, total, stream)?;
             seq.marconi_skip_to = skip_tokens;
             seq.prefix_lookup_skip = skip;
             seq.prefix_lookup_applied = true;

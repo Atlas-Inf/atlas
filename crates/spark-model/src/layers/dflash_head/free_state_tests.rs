@@ -274,6 +274,10 @@ pub(super) fn live_state(
         own_capture: false,
         own_row_at: None,
         own_row: None,
+        warm_ctx: super::WarmCtx::Legacy,
+        ctx_floor: 0,
+        ctx_run: None,
+        ctx_store: super::warm_ctx_store::StoreRefs::default(),
         lane_id: 0,
         lifecycle: Some(CaptureDescriptor::bind(own, 40, 4, 4, 16).unwrap()),
     })
@@ -326,6 +330,10 @@ pub(super) fn fresh_state_inner(gpu: &MockGpuBackend) -> Box<DflashProposerState
         own_capture: false,
         own_row_at: None,
         own_row: None,
+        warm_ctx: super::WarmCtx::Legacy,
+        ctx_floor: 0,
+        ctx_run: None,
+        ctx_store: super::warm_ctx_store::StoreRefs::default(),
         lane_id: 0,
         lifecycle: None,
     })

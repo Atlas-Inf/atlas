@@ -28,6 +28,7 @@ mod block_table_upload;
 pub(crate) mod decode_pieces;
 mod dflash_capture_batch;
 pub(crate) mod dflash_ctx_window;
+mod dflash_warm_ctx;
 mod draft_assist;
 pub(crate) mod qsa_commit_table;
 pub use draft_assist::DraftAssist;

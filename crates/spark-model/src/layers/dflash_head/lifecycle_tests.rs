@@ -186,6 +186,10 @@ fn owner_failure_reclaim_frees_state_resources_without_leaking() {
         own_capture: false,
         own_row_at: None,
         own_row: None,
+        warm_ctx: super::WarmCtx::Legacy,
+        ctx_floor: 0,
+        ctx_run: None,
+        ctx_store: super::warm_ctx_store::StoreRefs::default(),
         lane_id: 0,
         lifecycle: Some(CaptureDescriptor::bind(owner_now, 40, 4, 4, 16).unwrap()),
     };
