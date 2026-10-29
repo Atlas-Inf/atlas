@@ -1390,3 +1390,16 @@ NVFP4 / FP4-Local**.
    whether S7/S7.1 engage on this pack.
 3. Qwen3.8-27B-NVFP4 (dense): its single-GB10 recipe on the main image, the same vet.
 Each vet's results go on its sparkrun-recipes PR, and a recipe-pin PR is opened when the image changes.
+
+## 2026-10-29 — single-Spark deployment vets queued (≈ 3 × 4.5 h)
+
+`ghcr.io/atlas-inf/atlas-gb10:sha-87df79b` (main with #219 + #228) exists, and all three checkpoints are cached on sparky.
+Queued on sparky, each a sparkrun vet of the recipe YAML verbatim with only the container re-pinned to `sha-87df79b`.
+Each run: env-key assertion, smoke (control / tool call / needle), agentic-webserver 50, BFCL ST-995, and a heartbeat
+against the stall kill:
+- job 55: `recipes/qwen3.8/qwen3.8-flash-next-fp4-local.yaml` (was sha-da7985c);
+- job 56: `recipes/qwen3.8/qwen3.8-flash-next-nvfp4.yaml` (was `:latest`);
+- job 57: `recipes/qwen3.8/qwen3.8-27b-nvfp4.yaml` (was `:latest`).
+Re-pin commits are ready locally (`vet/fp4local-main-pin` c018fa2, `vet/fnext-main-pin` 8bcec90, `vet/27b-main-pin`
+c136a26). Each gets pushed as a sparkrun-recipes PR with its vet results once its vet passes. The nightwatch cron
+relays each job's raw results as they land.
