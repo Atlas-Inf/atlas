@@ -59,6 +59,12 @@ pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_MXFP8_SHARED", || {
         Ok(crate::layers::moe::shared_mxfp8_requested() as u64)
     }),
+    // The routed experts' prefill numerics (W4A4 at the checkpoint's input
+    // scales vs q38's E4M3 chain) in the rows both ranks reduce, and whether
+    // the routed K-major copy exists (the KV pools part without it).
+    ("ATLAS_QWEN4EXP_PREFILL_W4A4", || {
+        Ok(crate::layers::moe::w4a4_requested() as u64)
+    }),
     ("ATLAS_SSM_SAVE_DUMP", || {
         Ok(graph_flags::ssm_save_dump() as u64)
     }),

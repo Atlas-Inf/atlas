@@ -109,6 +109,8 @@ pub(super) fn build_moe(
     };
 
     let mut moe = MoeLayer::new(weights, config.num_experts, gate_nvfp4, gpu, config)?;
+    // The routed prefill's W4A4 activation scales (`moe::w4a4_scales`).
+    moe.load_w4a4_scales(store, &format!("{lp}.mlp"), config, gpu)?;
     if row_invariant_router {
         moe.set_row_invariant_bf16_router();
     }
