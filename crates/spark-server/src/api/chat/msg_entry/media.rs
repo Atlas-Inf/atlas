@@ -33,6 +33,7 @@ pub(super) fn qwen_video_rows_ceiling(
     volume.div_ceil(row_pixels).max(1)
 }
 
+#[allow(clippy::result_large_err)]
 pub(super) fn collect_message_media(
     m: &Message,
     media: &mut Vec<MediaInput>,
