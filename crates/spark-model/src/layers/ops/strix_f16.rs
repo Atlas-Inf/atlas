@@ -41,20 +41,24 @@ pub fn w4a16_m128_kernel(gpu: &dyn GpuBackend) -> KernelHandle {
     base
 }
 
-/// The dense twin wins only on large weights. strix job 146 (gfx1151), BF16 vs
-/// F16-twin TF/s at M=2048, N x K:
+/// The dense twin now wins at every measured shape, so there is no cut by
+/// default. The 40M N*K cut this replaces was fitted on the double-buffered
+/// twin (strix job 146), where the BF16 base won the small weights. Since the
+/// single-LDS + B-reuse twin (#235) it is the other way round. strix s104
+/// (gfx1151, M=2048, three alternating rounds), base -> twin TF/s:
 ///
-///   27B gate/up 17408x5120   17.68 -> 21.31   27B down 5120x17408   18.32 -> 20.71
-///   FNext qkvz  16384x2560   17.49 -> 20.14   FNext attn q 12288x2560 21.65 -> 20.45
-///   27B qkv      5120x5120   22.17 -> 21.77   FNext out    2560x6144  22.67 -> 20.58
+///   27B gate/up 17408x5120  20.7-23.1 -> 27.1-29.6   27B down 5120x17408   18.0-22.1 -> 29.2-29.4
+///   FNext qkvz  16384x2560  20.5-22.3 -> 28.8-29.0   FNext attn q 12288x2560 20.7-22.4 -> 27.7-28.9
+///   27B qkv      5120x5120  21.9-22.4 -> 28.2-28.7   FNext out    2560x6144  19.6-21.8 -> 25.4-28.0
+///   FNext kv     1024x2560  18.2-18.5 -> 22.6-22.9
 ///
-/// The BF16 kernel already reaches ~22 TF/s on the smaller weights, where its
-/// software bf16 rounding is not the limiter, and the twin's extra LDS pass for
-/// the A tile then costs more than it saves. `N*K >= 40M` separates the six
-/// measured shapes exactly; it is a fitted cut from six points, so
-/// `ATLAS_F16_M128_MIN_NK` overrides it (0 = always the twin). The routed-MoE
-/// twins are not gated: they won 2.1x / 1.9x on the Flash-Next shapes.
-const F16_M128_MIN_NK_DEFAULT: u64 = 40_000_000;
+/// End to end, Flash-Next NVFP4 prefill is -3% at 1.9k / 7.4k / 12.5k
+/// (framework f82, interleaved x3). The twin's dequant is exact in F16 where the
+/// base rounds every weight to BF16, so outputs change: the f80 gate (ppl dense
+/// 9.6654 -> 9.6383, above-bound 1.0000, needles 12/12) and the Qwen3.6-27B gate
+/// (s105) cleared that. `ATLAS_F16_M128_MIN_NK` still restores a cut (e.g.
+/// 40000000 for the old behaviour).
+const F16_M128_MIN_NK_DEFAULT: u64 = 0;
 
 static M128_PAIR: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
 
