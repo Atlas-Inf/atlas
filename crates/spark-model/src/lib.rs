@@ -42,7 +42,9 @@ pub mod traits;
 pub mod video_decode_ffmpeg;
 pub mod video_preprocess;
 pub mod video_sample;
+pub mod vision_budget;
 pub mod vision_item;
+pub mod vision_limits;
 pub mod vision_preprocess;
 pub use vision_item::VisionItem;
 

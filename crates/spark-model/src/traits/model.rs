@@ -1165,6 +1165,12 @@ pub trait Model: Send + Sync {
     /// Must be called before `prefill_chunk` when the prompt contains `<|image_pad|>` tokens.
     ///
     /// Default: no-op (text-only models).
+    /// `(window, request)`: the merged vision rows one encode may write and
+    /// the rows one request may carry (`vision_limits`). Default `(0, 0)`.
+    fn vision_row_limits(&self) -> (usize, usize) {
+        (0, 0)
+    }
+
     fn prepare_vision_embed(&self, _images: &[crate::VisionItem]) -> Result<()> {
         Ok(())
     }
