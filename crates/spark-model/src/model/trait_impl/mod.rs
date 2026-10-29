@@ -90,6 +90,11 @@ impl Model for TransformerModel {
         }
     }
 
+    fn vision_row_limits(&self) -> (usize, usize) {
+        let b = self.vision_row_bounds();
+        (b.window, b.request)
+    }
+
     fn prepare_vision_embed(&self, images: &[crate::VisionItem]) -> Result<()> {
         self.prepare_vision_embed_dispatch(images)
     }
@@ -234,6 +239,8 @@ impl Model for TransformerModel {
             self.gpu.abort_capture_if_active(self.gpu.default_stream());
         }
         let out = r?;
+        // Ported from Enntity/atlas 166e2b1, e7d4e1a (AGPL-3.0-only).
+        self.try_mtp_prompt_absorb(prefill_seq, prefill_tokens, stream);
         self.try_eager_drafter_prefill(prefill_seq, prefill_is_last, stream)?;
         Ok(out)
     }
@@ -704,6 +711,14 @@ impl Model for TransformerModel {
 
     fn select_mtp_stream_row(&self, row: usize) -> Result<()> {
         self.select_mtp_stream_row_dispatch(row)
+    }
+    fn stage_mtp_absorb(
+        &self,
+        seq: &mut SequenceState,
+        row: usize,
+        accepted: &[u32],
+    ) -> Result<()> {
+        self.stage_mtp_absorb_dispatch(seq, row, accepted)
     }
     fn save_hidden_for_mtp(&self, token_idx: usize, _stream: u64) -> Result<()> {
         self.save_hidden_for_mtp_dispatch(token_idx, _stream)

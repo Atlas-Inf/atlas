@@ -503,6 +503,11 @@ impl TransformerModel {
         }
         crate::det_trace::set_layer(self.layers.len());
         det.tap("final", hidden, (0, proc_count), h * 2);
+        // ATLAS_QWEN4EXP_MTP_PREFILL: the final highway rows this rank holds
+        // (of a split chunk, rank 0's half at row 0), for the drafter.
+        // Ported from Enntity/atlas e7d4e1a (AGPL-3.0-only).
+        let held = sp.map_or(proc_count, |s| if s.row0 == 0 { s.rows } else { 0 });
+        self.note_mtp_prompt_rows(seq, effective_seq_len_start, held, 0);
         self.prefill_b_forward_layers_profile_tail(
             seq,
             effective_seq_len_start,

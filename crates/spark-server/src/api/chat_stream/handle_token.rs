@@ -592,8 +592,12 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
                     handle_tool_call_args_fragment(state, ctx, fragment, idx, &mut deltas);
                 }
                 tool_parser::DetectorOutput::ToolCallEnd { idx } => {
-                    handle_tool_call_end(state, ctx, idx);
+                    handle_tool_call_end(state, ctx, idx, &mut deltas);
                 }
+            }
+            if state.guard_stop == Some(atlas_tool_guard::GUARD_STOP) {
+                deltas.clear();
+                return deltas;
             }
         }
     } else {

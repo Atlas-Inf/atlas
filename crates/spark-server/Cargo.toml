@@ -36,6 +36,7 @@ path = "src/main.rs"
 
 [dependencies]
 atlas-core = { workspace = true }
+atlas-tool-guard = { workspace = true }
 atlas-kernels = { workspace = true }
 # `default-features = false` on path-deps so the metal feature actually
 # disables the cuda default that each downstream crate inherits.

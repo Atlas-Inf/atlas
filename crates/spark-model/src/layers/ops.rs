@@ -114,6 +114,9 @@ mod glm_sparse_canonical;
 mod glm_sparse_native;
 #[path = "ops/glm_sparse_prefill_tc.rs"]
 mod glm_sparse_prefill_tc;
+#[cfg(atlas_hip)]
+#[path = "ops/hip_fp8_blas.rs"]
+mod hip_fp8_blas;
 pub use glm_router_bn4::glm_router_bn4;
 #[path = "ops/hyper_connection.rs"]
 mod hyper_connection;

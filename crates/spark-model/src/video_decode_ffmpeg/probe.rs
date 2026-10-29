@@ -46,7 +46,7 @@ pub(super) fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<Clip
             "-select_streams",
             "v:0",
             "-show_entries",
-            "format=duration:stream=avg_frame_rate,r_frame_rate",
+            "format=duration:stream=avg_frame_rate,r_frame_rate,nb_frames",
             "-of",
             "default=nw=1",
             "pipe:0",
@@ -140,9 +140,17 @@ pub(super) fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<Clip
         .and_then(crate::video_sample::finite_positive)
         .unwrap_or(policy.fps);
 
+    // Declared source frames (`nb_frames`): the decoder keeps the whole clip
+    // verbatim when the cap can hold it, instead of warping a CFR/VFR clip
+    // onto an evenly spaced plan. Enntity/atlas d0cead1.
+    let frame_count = field("nb_frames")
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&count| count > 0);
+
     Ok(ClipTiming {
         duration_secs,
         native_fps,
+        frame_count,
     })
 }
 

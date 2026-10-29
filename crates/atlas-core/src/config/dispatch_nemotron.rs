@@ -215,6 +215,9 @@ pub fn parse_nemotron_h_omni(raw: &serde_json::Value) -> Result<ModelConfig> {
             video_start_token_id: 0,
             video_end_token_id: 0,
             max_pixels: None,
+            token_budgets: Default::default(),
+            min_pixels: None,
+            video_pixels: None,
             omni: Some(crate::config::OmniVisionConfig {
                 norm_mean: g3("norm_mean"),
                 norm_std: g3("norm_std"),

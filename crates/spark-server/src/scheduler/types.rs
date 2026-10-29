@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas 5eeeb1a (AGPL-3.0-only, sparkqwen queued-first-chunk series).
 
 //! Shared scheduler-internal type definitions, factored out of `mod.rs`
 //! for the ≤500 LoC cap (refactor wave-4e). Visibility is `pub(super)`
@@ -73,6 +74,11 @@ pub(super) struct PrefillInProgress {
     /// its worker ranks got no prefill command, so only that pass may run it
     /// (`prefill_multi`). Set once, by the deferral in `prefill_a_step`.
     pub multi: bool,
+    /// `Some(len)`: queued for its first chunk, `len` tokens
+    /// (`ATLAS_PREFILL_QUEUE_FIRST_CHUNK`). Set up at admission, its worker
+    /// ranks got no prefill command yet, so only the continue phase may run
+    /// that chunk, as the head of the queue (`phase_continue_prefills::queued_first`).
+    pub queued_first_chunk: Option<usize>,
     /// Arc-wrapped so the original request, the per-prefill scheduler
     /// state, and any retry path (Tier 5c) can share the read-only
     /// token slice without copying ~40 KB on every long prompt.

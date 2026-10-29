@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas 5eeeb1a, f1cc7cb (AGPL-3.0-only, sparkqwen queued-first-chunk series).
 
 //! Phase: continue in-progress chunked prefills. When `active` is empty,
 //! all chunks run back-to-back (TTFT minimisation). When active is
@@ -21,6 +22,8 @@
 //!  - `run_batched_mixed`   — Q12 Phase 5 batched mixed (decode+prefill) step.
 //!  - `prefill_waves`       — pure wave planner for `run_batched_prefill`
 //!                            (VARLEN budget capping + geometry grouping).
+//!  - `queued_first`        — a first chunk queued at admission
+//!                            (`ATLAS_PREFILL_QUEUE_FIRST_CHUNK`).
 
 #[path = "phase_continue_prefills/cached_run.rs"]
 mod cached_run;
@@ -28,6 +31,8 @@ mod cached_run;
 pub(super) mod decode_share;
 #[path = "phase_continue_prefills/prefill_waves.rs"]
 mod prefill_waves;
+#[path = "phase_continue_prefills/queued_first.rs"]
+mod queued_first;
 #[path = "phase_continue_prefills/run_batched_mixed.rs"]
 mod run_batched_mixed;
 #[path = "phase_continue_prefills/run_batched_prefill.rs"]
@@ -66,7 +71,7 @@ pub(super) fn retire_disconnected_prefills(
     let mut retired = 0;
     let mut i = 0;
     while i < prefilling.len() {
-        if prefilling[i].sink.receiver_closed() {
+        if prefilling[i].sink.receiver_closed() || queued_first::abandoned(&prefilling[i]) {
             let mut p = prefilling.remove(i);
             if let Err(e) = model.free_sequence(&mut p.seq) {
                 tracing::error!("phase_continue_prefills: free_sequence (disconnected): {e:#}");
@@ -363,7 +368,9 @@ pub(super) fn continue_in_progress_prefills(
         // byte-identical to today (the `active.is_empty()` guard only applies
         // when always-mixed is enabled; otherwise the original two-phase
         // condition is preserved exactly).
-        let use_twophase = (!always_mixed || active.is_empty())
+        // A queued first chunk is the inline one, run late (`queued_first`).
+        let use_twophase = p.queued_first_chunk.is_none()
+            && (!always_mixed || active.is_empty())
             && p.chunk_offset == 0
             && p.prompt_tokens.len() > max_prefill_tokens;
         if use_twophase {
@@ -426,30 +433,42 @@ pub(super) fn continue_in_progress_prefills(
                 if p.sink.receiver_closed() {
                     return false;
                 }
-                run_standard_chunk_loop(
+                let queued = queued_first::run(
                     model,
                     p,
                     idx,
                     active,
-                    max_prefill_tokens,
-                    slice_budget,
                     prefill_stream,
                     prefill_event,
-                    use_mtp,
-                    use_self_speculative,
-                    use_ngram_speculative,
-                    think_end_token,
-                    think_start_token,
-                    tool_call_start_token,
-                    tool_call_end_token,
-                    adaptive_sampling,
                     sched,
                     &mut completed_indices,
-                    &mut did_mixed_step,
-                    max_batch_tokens,
-                    spec,
-                    rode,
                 );
+                if !queued {
+                    run_standard_chunk_loop(
+                        model,
+                        p,
+                        idx,
+                        active,
+                        max_prefill_tokens,
+                        slice_budget,
+                        prefill_stream,
+                        prefill_event,
+                        use_mtp,
+                        use_self_speculative,
+                        use_ngram_speculative,
+                        think_end_token,
+                        think_start_token,
+                        tool_call_start_token,
+                        tool_call_end_token,
+                        adaptive_sampling,
+                        sched,
+                        &mut completed_indices,
+                        &mut did_mixed_step,
+                        max_batch_tokens,
+                        spec,
+                        rode,
+                    );
+                }
                 // A chunk that failed, finished the prompt or carried a
                 // decode step ends the tick like one that computed.
                 let plain = completed_indices.is_empty() && !did_mixed_step && rode.is_empty();

@@ -101,6 +101,23 @@ pub(super) fn build_choice_message(
             if let Some(cwd) = cwd_hint {
                 tool_parser::normalize_paths(&mut tool_calls_i, cwd);
             }
+            if let Some(reason) = tool_calls_i
+                .iter()
+                .find_map(|tc| state.tool_guard.inspect(&tc.function.arguments).err())
+            {
+                tracing::warn!(reason = reason.code(), "tool-call guard blocked a response");
+                return ir::Choice {
+                    index: choice_idx,
+                    content: Some(atlas_tool_guard::REFUSAL.into()),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    refusal: None,
+                    finish_reason: ir::FinishReason::ContentFilter,
+                    guard_stop: Some(atlas_tool_guard::GUARD_STOP),
+                    matched_stop: None,
+                    logprobs: None,
+                };
+            }
             let validated = tool_parser::validate_tool_calls(tool_calls_i, &tools_ref);
             if !validated.errors.is_empty() {
                 for err in &validated.errors {
@@ -195,6 +212,7 @@ pub(super) fn build_choice_message(
         finish_reason: ir::FinishReason::from(finish_reason_i.as_str()),
         matched_stop: None, // caller fills
         logprobs: None,     // caller fills
+        guard_stop: response.guard_stop,
     }
 }
 

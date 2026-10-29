@@ -35,6 +35,14 @@ const GLM: &str = "glm5_next";
 /// The settings read in this crate: name, and this process's value from the
 /// feature's own parser. One entry per setting.
 pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
+    ("ATLAS_QWEN4EXP_SERVING_MODE", || {
+        use crate::weight_loader::qwen4_exp::mode::{ServingMode, selected};
+        Ok(match selected()? {
+            None => 0,
+            Some(ServingMode::Strict) => 1,
+            Some(ServingMode::Spark) => 2,
+        })
+    }),
     // A rank that would only warn beside one that fails.
     (
         "ATLAS_STARTUP_PARITY=warn",
@@ -447,6 +455,21 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     }),
     ("ATLAS_QWEN4EXP_PREFILL_MOE_BF16", || {
         Ok(moe::tcp_requested() as u64)
+    }),
+    // Drafter work splits across ranks under ATLAS_QWEN4EXP_MTP_DRAFT_TP:
+    // absorb/prompt-row writes must match row for row.
+    ("ATLAS_QWEN4EXP_MTP_ABSORB", || {
+        Ok(crate::layers::qwen4exp_mtp::qwen4exp_mtp_absorb::enabled() as u64)
+    }),
+    ("ATLAS_QWEN4EXP_MTP_PREFILL", || {
+        Ok(crate::layers::qwen4exp_mtp::qwen4exp_mtp_prompt::window() as u64)
+    }),
+    // The decision window and start steer every rank's verify depth.
+    ("ATLAS_MTP_DEEP_WINDOW/_START", || {
+        while_on(crate::speculative::deep_depth::enabled(), || {
+            (crate::speculative::deep_depth::decision_window() as usize) << 8
+                | crate::speculative::deep_depth::deep_start().unwrap_or(0)
+        })
     }),
     // Both apply only through the vectorized collapse (`_HC_FAST`).
     ("ATLAS_QWEN4EXP_HC_MMA", || {

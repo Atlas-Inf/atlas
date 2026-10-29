@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas 5eeeb1a (AGPL-3.0-only, sparkqwen queued-first-chunk series).
 
 //! Shared-prefix admission against the scripted model: what the head puts on
 //! the worker's command stream, and what goes back to the pending queue.
@@ -14,7 +15,7 @@ use super::super::sched_ctx::SchedCtx;
 use super::super::shared_prefix::{SharedPrefix, admit};
 use super::super::test_support::{EOS, test_request};
 use super::super::types::{PendingQueue, PrefillInProgress};
-use super::super::{StartPrefillResult, start_chunked_prefill};
+use super::super::{FirstChunk, StartPrefillResult, start_chunked_prefill};
 use super::*;
 use crate::api::InferenceRequest;
 
@@ -123,7 +124,7 @@ fn a_new_leader_sends_its_plant_before_the_first_chunk() {
         0,
         &mut None,
         0,
-        false,
+        FirstChunk::Inline,
         None,
         None,
         Some(SHARED),

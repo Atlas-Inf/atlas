@@ -34,6 +34,8 @@ pub const DEFAULT_KV_CACHE_DTYPE: &str = "fp8";
 /// Arguments for the `serve` subcommand.
 #[derive(Parser, Debug, Clone, PartialEq)]
 pub struct ServeArgs {
+    #[command(flatten)]
+    pub tool_guard: super::tool_guard_args::ToolGuardArgs,
     /// HuggingFace model ID (e.g. "nvidia/Qwen3-Next-80B-A3B-Instruct-NVFP4")
     /// or a local directory path containing config.json.
     /// Optional: omit both this and `--model-from-path` to boot into the
@@ -950,6 +952,12 @@ pub struct ServeArgs {
     /// capped while being read rather than by trusting `Content-Length`, the
     /// response must declare an image content type, and the whole request is
     /// time-limited.
+    /// Vision rows (temporal groups x grid) one request may carry; 400 over.
+    #[arg(long, default_value_t = 32768)]
+    pub vision_max_request_rows: usize,
+    /// Vision rows all requests may hold at once; 503 + Retry-After over.
+    #[arg(long, default_value_t = 65536)]
+    pub vision_max_inflight_rows: usize,
     #[arg(long, default_value_t = false)]
     pub vision_allow_remote_images: bool,
 

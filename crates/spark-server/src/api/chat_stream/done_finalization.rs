@@ -50,6 +50,13 @@ pub(super) fn finalize_done<'a>(
         deltas.push(StreamDelta::Refusal { text: r.clone() });
     }
 
+    if state.guard_stop == Some(atlas_tool_guard::GUARD_STOP) {
+        deltas.push(StreamDelta::Content {
+            text: atlas_tool_guard::REFUSAL.into(),
+            token_ids: Vec::new(),
+        });
+    }
+
     // Terminal delta: finish reason + usage. The `include_usage`
     // two-chunk framing (usage-only chunk before a usage-less finish
     // chunk) is the OpenAI encoder's decision
@@ -61,6 +68,8 @@ pub(super) fn finalize_done<'a>(
         reason: crate::ir::FinishReason::from(fr),
         usage,
         token_ids: state.take_ids_if(return_token_ids),
+        // #55 (Enntity/atlas 8150f896): surface a guard cut on the wire.
+        guard_stop: state.guard_stop,
     });
 
     (deltas, fr)

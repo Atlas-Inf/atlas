@@ -197,6 +197,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlas-tool-guard"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "shlex",
+ "url",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2470,6 +2479,7 @@ dependencies = [
  "atlas-core",
  "atlas-kernels",
  "atlas-plugin",
+ "atlas-tool-guard",
  "axum",
  "base64 0.22.1",
  "clap",

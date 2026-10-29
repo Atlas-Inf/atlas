@@ -256,6 +256,11 @@ pub(super) fn step_verify_k4_batched(
         // save-from-stash will fail and skip only its re-propose.
         tracing::error!("stash_verify_hidden_rows: {e:#}");
     }
+    // The same live rows for the drafter's absorb (`ATLAS_QWEN4EXP_MTP_ABSORB`).
+    // Ported from Enntity/atlas 166e2b1 (AGPL-3.0-only).
+    for (i, (a, (_, na, _))) in batch.iter_mut().zip(&verdicts).enumerate() {
+        super::verify_k4_verdict::stage_absorb(model, a, off[i], &drafts_per_seq[i][..*na]);
+    }
 
     sched
         .timing

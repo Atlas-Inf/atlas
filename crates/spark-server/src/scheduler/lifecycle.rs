@@ -198,6 +198,7 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize)
                     reasoning_tokens: a.thinking_tokens,
                     cached_prompt_tokens: a.cached_prompt_tokens,
                     accepted_prediction_tokens: a.mtp_acct.accepted_total() as usize,
+                    guard_stop: a.guard_stop,
                     prompt_logprobs: std::mem::take(&mut a.seq.prompt_logprobs)
                         .into_iter()
                         .map(|p| crate::api::TokenLogprobs {

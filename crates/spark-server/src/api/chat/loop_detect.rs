@@ -268,11 +268,16 @@ pub(super) fn check_loops(messages: &[Message], tools_active: bool) -> LoopDetec
     }
 
     if spinning {
-        tracing::warn!(
+        // Enntity/atlas 8150f896 + e2fcc5cd (#55): short-prose history is
+        // diagnostic only — never hard-masks <tool_call> and no longer
+        // biases it either (client-supplied history is not provenance;
+        // suppressing/biasing before the model's first call creates the
+        // loop it exists to prevent). Suppress keeps its P1-5 hard mask
+        // (failing/progressing carve-outs).
+        tracing::debug!(
             recent_short,
-            "Spinning detection fired — suppressing <tool_call>"
+            "Short prose history detected; tool availability unchanged"
         );
-        suppress_tool_call = !loop_suppress_disabled();
     }
 
     LoopDetectOut {

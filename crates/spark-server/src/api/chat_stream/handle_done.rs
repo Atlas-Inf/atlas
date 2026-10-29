@@ -49,12 +49,29 @@ pub(super) fn handle_done(
         response_tokens_per_second: tps,
     };
 
+    // A truncated native call must never be salvaged into an executable call.
+    if ctx.state.tool_guard.enabled
+        && !state.buffered_tool_chunks.is_empty()
+        && state.guard_stop.is_none()
+        && !state.stop_string_triggered
+    {
+        super::tool_security::reject(state, atlas_tool_guard::BlockReason::IncompleteCall);
+    }
     let (deltas, fr) = finalization::finalize_done(
         state,
         &finish_reason,
         usage,
         ctx.req_return_token_ids,
-        |state| flush_pending_output(state, ctx),
+        |state| {
+            let deltas = flush_pending_output(state, ctx);
+            if ctx.state.tool_guard.enabled
+                && !state.stop_string_triggered
+                && !state.buffered_tool_chunks.is_empty()
+            {
+                super::tool_security::reject(state, atlas_tool_guard::BlockReason::IncompleteCall);
+            }
+            deltas
+        },
     );
 
     // Metrics. (REQUESTS_ACTIVE is released by the ActiveRequestGuard in
@@ -192,7 +209,7 @@ fn flush_pending_output(state: &mut StreamState, ctx: &StreamCtx) -> DeltaVec {
                             handle_tool_call_args_fragment(state, ctx, fragment, idx, &mut deltas);
                         }
                         tool_parser::DetectorOutput::ToolCallEnd { idx } => {
-                            handle_tool_call_end(state, ctx, idx);
+                            handle_tool_call_end(state, ctx, idx, &mut deltas);
                         }
                     }
                 }
@@ -257,7 +274,7 @@ fn flush_pending_output(state: &mut StreamState, ctx: &StreamCtx) -> DeltaVec {
                     handle_tool_call_args_fragment(state, ctx, fragment, idx, &mut deltas);
                 }
                 tool_parser::DetectorOutput::ToolCallEnd { idx } => {
-                    handle_tool_call_end(state, ctx, idx);
+                    handle_tool_call_end(state, ctx, idx, &mut deltas);
                 }
             }
         }
@@ -332,7 +349,9 @@ fn resolve_wire_finish_reason<'a>(
     stop_string_matched: bool,
     stream_guard_stop: Option<&'static str>,
 ) -> &'a str {
-    if scheduler_reason == crate::ir::FINISH_REASON_TIMEOUT {
+    if stream_guard_stop == Some(atlas_tool_guard::GUARD_STOP) {
+        "content_filter"
+    } else if scheduler_reason == crate::ir::FINISH_REASON_TIMEOUT {
         scheduler_reason
     } else if tool_loop_capped {
         "length"

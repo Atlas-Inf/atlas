@@ -81,11 +81,53 @@ pub struct VisionConfig {
     /// the encoder is constructed. `None` keeps the historical behaviour on
     /// both sides.
     pub max_pixels: Option<usize>,
+    /// GLM-5.3's processor token bounds, resolved by the server next to
+    /// [`Self::max_pixels`]; other towers ignore them.
+    pub token_budgets: VisionTokenBudgets,
+    /// The checkpoint's image `min_pixels` (`size.shortest_edge`): HF's Qwen
+    /// `smart_resize` scales a smaller still UP to it. `None` when the
+    /// checkpoint declares none.
+    /// Enntity/atlas 0eef4031.
+    pub min_pixels: Option<usize>,
+    /// The checkpoint's video processor bounds, as `t x h x w` pixel
+    /// volumes over a clip's sampled frames
+    /// (`video_preprocessor_config.json` or `processor_config.json`
+    /// `[video_processor]`). `None` sizes each frame like a still.
+    pub video_pixels: Option<PixelBounds>,
 
     /// Omni (`nemotron_h_omni`) RADIO-tower parameters. `Some` marks this
     /// vision config as the RADIO preprocessing/encoder family rather
     /// than the Qwen-VL one.
     pub omni: Option<OmniVisionConfig>,
+}
+
+/// `(min, max)` vision tokens per still and per video, as GLM-5.3's nested
+/// `processor_config.json` declares them (`image_processor` /
+/// `video_processor` → `min_image_tokens` / `max_image_tokens`). A vision
+/// token is one temporal group of one `merge × merge` patch block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisionTokenBudgets {
+    pub image: (usize, usize),
+    pub video: (usize, usize),
+}
+
+impl Default for VisionTokenBudgets {
+    /// The processor classes' own defaults, which the shipped checkpoint
+    /// repeats: 16..8000 tokens per still, 16..240000 per video.
+    fn default() -> Self {
+        Self {
+            image: (16, 8_000),
+            video: (16, 240_000),
+        }
+    }
+}
+
+/// A processor's `size = {shortest_edge, longest_edge}`: pixel counts, not
+/// edge lengths, despite the names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PixelBounds {
+    pub min_pixels: usize,
+    pub max_pixels: usize,
 }
 
 impl VisionConfig {

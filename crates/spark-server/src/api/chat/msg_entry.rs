@@ -178,6 +178,7 @@ fn resolve_media_uri(
 
 #[allow(clippy::result_large_err)]
 pub(super) fn build_msg_entries(
+    admit: super::vision_admit::AdmitCtx<'_>,
     vision_config: Option<&VisionConfig>,
     vision_max_pixels: Option<usize>,
     remote_images: &super::remote_image::RemoteImagePolicy,
@@ -410,6 +411,8 @@ pub(super) fn build_msg_entries(
     // are the same item by construction. Preprocessing images and videos in
     // separate passes would re-introduce the grouping this fix removed.
     let mut image_pixels: Vec<spark_model::VisionItem> = Vec::new();
+    let has_video = media.iter().any(|m| m.kind == MediaKind::Video);
+    let mut admission = super::vision_admit::Admission::begin(admit, media.len(), has_video)?;
     if !media.is_empty() {
         let Some(vcfg) = vision_config else {
             return Err(openai_error_response(
@@ -466,6 +469,7 @@ pub(super) fn build_msg_entries(
                             };
                             (
                                 spark_model::VisionItem {
+                                    held: spark_model::vision_budget::HeldRows::default(),
                                     groups: v.groups,
                                     grid_h: v.grid_h,
                                     grid_w: v.grid_w,
@@ -483,6 +487,7 @@ pub(super) fn build_msg_entries(
                 }
             };
             image_pad_counts[idx] = item.pad_count(vcfg.spatial_merge_size);
+            admission.note(image_pad_counts[idx])?;
             if vcfg.is_glm5_next || vcfg.is_qwen3vl_video {
                 vision_placeholders.push(glm5_vision::placeholder(
                     input.kind,
@@ -507,6 +512,13 @@ pub(super) fn build_msg_entries(
             }
             image_pixels.push(item);
         }
+    }
+    let admitted = admission.admit()?;
+    for item in image_pixels.iter_mut() {
+        *item = admitted.attach(std::mem::replace(
+            item,
+            spark_model::VisionItem::image(Vec::new(), 0, 0),
+        ));
     }
 
     // BW1 bash-wandering watchdog: if the agent has run many tool calls with
