@@ -80,6 +80,9 @@ mod exl3_ops;
 mod gemm_fp8_prefill;
 #[path = "ops/gemm_quant.rs"]
 mod gemm_quant;
+#[cfg(atlas_hip)]
+#[path = "ops/hip_fp8_blas.rs"]
+mod hip_fp8_blas;
 #[path = "ops/gemv_q2.rs"]
 mod gemv_q2;
 #[path = "ops/gemv_q2_vec.rs"]
