@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas 5eeeb1a (AGPL-3.0-only, sparkqwen queued-first-chunk series).
 
 //! The min_tokens end-token ban must be armed on every way into decode, not
 //! only on the multi-chunk promotion: a prompt that prefills in one chunk,
@@ -7,7 +8,7 @@
 
 use super::super::sched_ctx::SchedCtx;
 use super::super::test_support::{EOS, test_request};
-use super::super::{StartPrefillResult, prefill_request, start_chunked_prefill};
+use super::super::{FirstChunk, StartPrefillResult, prefill_request, start_chunked_prefill};
 use super::*;
 use crate::api::InferenceRequest;
 use spark_model::speculative::ProposerState;
@@ -70,8 +71,23 @@ fn start_request(req: InferenceRequest, budget: usize) -> StartPrefillResult {
     let model = PreemptStubModel::default();
     let sched = SchedCtx::for_test();
     start_chunked_prefill(
-        &sched, None, None, None, None, &model, req, EOS, budget, 0, 0, &mut None, 0, false, None,
-        None, None,
+        &sched,
+        None,
+        None,
+        None,
+        None,
+        &model,
+        req,
+        EOS,
+        budget,
+        0,
+        0,
+        &mut None,
+        0,
+        FirstChunk::Inline,
+        None,
+        None,
+        None,
     )
     .expect("prefill starts")
 }

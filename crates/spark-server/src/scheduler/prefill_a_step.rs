@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas 5eeeb1a (AGPL-3.0-only, sparkqwen queued-first-chunk series).
 
 //! start_chunked_prefill (chunked prefill orchestration).
 
@@ -6,6 +7,22 @@ use super::*;
 
 mod vision_dispatch;
 use vision_dispatch::dispatch_chunk0_vision;
+
+/// What `start_chunked_prefill` does with a request's first chunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirstChunk {
+    /// Run it now, and sample the first token when it is the whole prompt.
+    Inline,
+    /// Co-dispatch, VARLEN, always-mixed fuse or multi-prompt prefill: set
+    /// up, and send the EP worker its chunk-0 command now (the batched step
+    /// does not; the multi pass sends its own), but leave the chunk to a
+    /// batched step.
+    Defer,
+    /// `ATLAS_PREFILL_QUEUE_FIRST_CHUNK`: set up, but send no prefill
+    /// command; the continue phase sends and runs the chunk when the prompt
+    /// reaches the head of the queue (`phase_continue_prefills::queued_first`).
+    Queue,
+}
 
 /// Start a chunked prefill: process chunk 0, return result.
 pub fn start_chunked_prefill(
@@ -22,12 +39,13 @@ pub fn start_chunked_prefill(
     prefill_event: u64,
     grammar_engine: &mut Option<GrammarEngine>,
     spontaneous_think_budget: u32,
-    // Co-dispatch: when true, do all per-request setup (grammar/sink/seq
-    // alloc/EP broadcast) but SKIP the inline chunk-0 prefill + first-token
-    // sampling, returning `InProgress { chunk_offset: 0 }` so >=2 concurrent
-    // streams batch into one `run_batched_prefill_step` forward. Vision is
-    // excluded upstream (PrefillInProgress carries no pixel state).
-    defer: bool,
+    // Not `Inline`: do all per-request setup (grammar/sink/seq alloc/EP
+    // setup broadcast) but SKIP the inline chunk-0 prefill + first-token
+    // sampling, returning `InProgress { chunk_offset: 0 }` — `Defer` so >=2
+    // concurrent streams batch into one `run_batched_prefill_step` forward,
+    // `Queue` so the chunk waits for its turn. Vision is excluded upstream
+    // (PrefillInProgress carries no pixel state).
+    first_chunk: FirstChunk,
     // Vision co-dispatch: when Some, this request's images were already encoded
     // (batched with other requests) into the shared buf_out; skip the per-request
     // encode and instead set the per-stream slice base around the chunk-0 splice.
@@ -293,27 +311,32 @@ pub fn start_chunked_prefill(
     // Deferred co-dispatch: setup + EP broadcast, then return InProgress at
     // chunk 0 WITHOUT prefilling — the batched step packs >=2 streams into one
     // forward. Vision is excluded upstream, so no chunk-0 embedding injection.
-    if defer {
+    if first_chunk != FirstChunk::Inline {
         debug_assert!(
             image_pixels.is_empty(),
             "vision must be excluded from co-dispatch"
         );
         // ATLAS_QWEN4EXP_PREFILL_MULTI: the multi pass sends the worker this
         // prompt (`super::prefill_multi`), so no prefill command here.
-        let multi = super::prefill_multi::eligible(
-            model,
-            prompt_tokens.len(),
-            is_last,
-            req_prompt_logprobs.is_some(),
-            req_adapter_slot,
-        );
+        let multi = first_chunk == FirstChunk::Defer
+            && super::prefill_multi::eligible(
+                model,
+                prompt_tokens.len(),
+                is_last,
+                req_prompt_logprobs.is_some(),
+                req_adapter_slot,
+            );
+        // Queued: the command goes out when the chunk runs, so the worker
+        // sees every chunk command in the order the head runs the chunks.
+        let queue = first_chunk == FirstChunk::Queue;
         if let Err(e) = (|| -> Result<()> {
             // EP: broadcast chunk 0 to worker (no-op on single-GPU; the batched
-            // step does NOT re-broadcast, so this stays the only broadcast site).
+            // step does NOT re-broadcast, so this stays the only broadcast site
+            // for a deferred chunk; a queued one sends it when it runs).
             model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, req_disable_mtp)?;
             model.ep_broadcast_vision_state_for_seq(seq.slot_idx as u32, false, 0, 0, 0, 0)?;
             plant_chunk0(model, &mut seq, pc_plant)?;
-            if multi {
+            if multi || queue {
                 return Ok(());
             }
             model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
@@ -369,6 +392,7 @@ pub fn start_chunked_prefill(
             req_timeout_at,
         );
         p.multi = multi;
+        p.queued_first_chunk = queue.then_some(chunk_len);
         return Ok(StartPrefillResult::InProgress(p));
     }
 
