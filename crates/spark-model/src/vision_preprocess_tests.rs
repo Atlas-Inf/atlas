@@ -191,6 +191,8 @@ fn ok_cfg() -> VisionConfig {
         // with an explicit bound, so the config-carried one is not the
         // subject here.
         max_pixels: None,
+        min_pixels: None,
+        video_pixels: None,
         omni: None,
     }
 }

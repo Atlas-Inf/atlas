@@ -39,6 +39,8 @@ fn cfg() -> VisionConfig {
         video_start_token_id: 0,
         video_end_token_id: 0,
         max_pixels: None,
+        min_pixels: None,
+        video_pixels: None,
         omni: None,
     }
 }

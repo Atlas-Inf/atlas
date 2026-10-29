@@ -82,10 +82,30 @@ pub struct VisionConfig {
     /// both sides.
     pub max_pixels: Option<usize>,
 
+    /// The checkpoint's image `min_pixels` (`size.shortest_edge`): HF's Qwen
+    /// `smart_resize` scales a smaller still UP to it. `None` when the
+    /// checkpoint declares none.
+    /// Enntity/atlas 0eef4031.
+    pub min_pixels: Option<usize>,
+    /// The checkpoint's video processor bounds, as `t x h x w` pixel
+    /// volumes over a clip's sampled frames
+    /// (`video_preprocessor_config.json` or `processor_config.json`
+    /// `[video_processor]`). `None` sizes each frame like a still.
+    pub video_pixels: Option<PixelBounds>,
+
     /// Omni (`nemotron_h_omni`) RADIO-tower parameters. `Some` marks this
     /// vision config as the RADIO preprocessing/encoder family rather
     /// than the Qwen-VL one.
     pub omni: Option<OmniVisionConfig>,
+}
+
+/// A processor's `size = {shortest_edge, longest_edge}`: pixel counts,
+/// not edge lengths, despite the names.
+/// Enntity/atlas 0eef4031.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PixelBounds {
+    pub min_pixels: usize,
+    pub max_pixels: usize,
 }
 
 impl VisionConfig {
