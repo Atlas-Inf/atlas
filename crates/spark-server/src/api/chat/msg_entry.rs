@@ -84,6 +84,7 @@ struct MediaInput {
     uri: String,
 }
 
+#[allow(clippy::result_large_err)]
 pub(super) fn build_msg_entries(
     admit: super::vision_admit::AdmitCtx<'_>,
     vision_config: Option<&VisionConfig>,
