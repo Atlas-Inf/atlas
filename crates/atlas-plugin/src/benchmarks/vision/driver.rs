@@ -558,8 +558,8 @@ impl Benchmark for VisionFidelity {
                     //    comparison cannot tell an envelope difference from a
                     //    vision one.
                     7 => {
-                        let (_, small, sw, sh) = FIXTURES[0]; // 224 -> 49
-                        let (_, large, lw, lh) = FIXTURES[1]; // 336 -> 121
+                        let (_, small, sw, sh) = FIXTURES[0]; // 224 -> 64
+                        let (_, large, lw, lh) = FIXTURES[1]; // 336 -> 100
                         let delta = (expected_vision_tokens(lw, lh, 16, 2)
                             - expected_vision_tokens(sw, sh, 16, 2))
                             as usize;
@@ -578,8 +578,8 @@ impl Benchmark for VisionFidelity {
                     // 9. Thinking ON — the configuration these checkpoints
                     //    ship in, and the one every other leg turns off.
                     8 => {
-                        let (_, small, sw, sh) = FIXTURES[0]; // 224 -> 49
-                        let (_, large, lw, lh) = FIXTURES[1]; // 336 -> 121
+                        let (_, small, sw, sh) = FIXTURES[0]; // 224 -> 64
+                        let (_, large, lw, lh) = FIXTURES[1]; // 336 -> 100
                         let delta = (expected_vision_tokens(lw, lh, 16, 2)
                             - expected_vision_tokens(sw, sh, 16, 2))
                             as usize;
