@@ -791,6 +791,11 @@ pub(crate) fn load_model(
         return Ok(None);
     }
     let model = model_opt.expect("head retains model on rank 0");
+    // Read before the scheduler takes the model: the API's admission check
+    // needs the encoder's output window (`spark_model::vision_limits`). A
+    // model whose tower did not load (window 0) serves text only, and the
+    // API refuses media as it does for a text model. Enntity/atlas b060f987.
+    let (vision_window_rows, vision_request_bound) = model.vision_row_limits();
 
     // Read default sampling parameters from generation_config.json.
     let serve_phases::SamplingDefaults {
@@ -1332,6 +1337,25 @@ pub(crate) fn load_model(
         },
         vision_config: config.vision.clone(),
         vision_max_pixels,
+        vision_limits: if args.vision_max_request_rows > 0 {
+            let (window_rows, request_bound) = (vision_window_rows, vision_request_bound);
+            Some(spark_model::vision_limits::VisionRowLimits::resolve(
+                window_rows,
+                max_batch_tokens,
+                args.vision_max_request_rows,
+                request_bound,
+                args.vision_max_inflight_rows,
+            ))
+        } else {
+            None
+        },
+        vision_budget: if args.vision_max_inflight_rows > 0 {
+            Some(spark_model::vision_budget::VisionRowBudget::new(
+                args.vision_max_inflight_rows,
+            ))
+        } else {
+            None
+        },
         remote_image_policy,
         video_ffmpeg,
         video_fps: args.video_fps,

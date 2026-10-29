@@ -129,6 +129,7 @@ mod build_tests {
 
     fn assert_bad_request(msgs: &[Message], tools_active: bool) {
         match build_msg_entries(
+            crate::api::chat::vision_admit::AdmitCtx::default(),
             None,
             None,
             &crate::api::chat::remote_image::RemoteImagePolicy::default(),
@@ -182,6 +183,7 @@ mod build_tests {
     fn text_only_builds_without_vision_config() {
         let msgs = vec![text(Role::User, "hello")];
         let out = build_msg_entries(
+            crate::api::chat::vision_admit::AdmitCtx::default(),
             None,
             None,
             &crate::api::chat::remote_image::RemoteImagePolicy::default(),
@@ -223,6 +225,7 @@ mod build_tests {
         // scans that string-compare on "system".
         let msgs = vec![text(Role::Other("developer".into()), "be terse")];
         let out = build_msg_entries(
+            crate::api::chat::vision_admit::AdmitCtx::default(),
             None,
             None,
             &crate::api::chat::remote_image::RemoteImagePolicy::default(),
@@ -245,6 +248,7 @@ mod build_tests {
         // template to handle.
         let msgs = vec![text(Role::Other("critic".into()), "hm")];
         let out = build_msg_entries(
+            crate::api::chat::vision_admit::AdmitCtx::default(),
             None,
             None,
             &crate::api::chat::remote_image::RemoteImagePolicy::default(),
@@ -273,6 +277,7 @@ mod build_tests {
             tool,
         ];
         let out = build_msg_entries(
+            crate::api::chat::vision_admit::AdmitCtx::default(),
             None,
             None,
             &crate::api::chat::remote_image::RemoteImagePolicy::default(),
@@ -313,6 +318,7 @@ mod build_tests {
             tool_error: false,
         };
         match build_msg_entries(
+            crate::api::chat::vision_admit::AdmitCtx::default(),
             None,
             None,
             &crate::api::chat::remote_image::RemoteImagePolicy::default(),
@@ -343,6 +349,7 @@ mod build_tests {
         )];
 
         let enabled = build_msg_entries(
+            crate::api::chat::vision_admit::AdmitCtx::default(),
             None,
             None,
             &crate::api::chat::remote_image::RemoteImagePolicy::default(),
@@ -367,6 +374,7 @@ mod build_tests {
             ..ChatLevers::OFF
         };
         let disabled = build_msg_entries(
+            crate::api::chat::vision_admit::AdmitCtx::default(),
             None,
             None,
             &crate::api::chat::remote_image::RemoteImagePolicy::default(),
