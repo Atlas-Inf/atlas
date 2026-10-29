@@ -493,3 +493,43 @@ fn aux_state_is_charged_per_pool_token() {
         "12.5 GiB holds 1M tokens and their QSA keys"
     );
 }
+
+/// DevLab Strix Halo (2026-10-29, runs 40835733703 / 40836997818): hipMemGetInfo
+/// reports the 62.5 GB GTT cap as total while free tracks 124 GB of system RAM,
+/// so free (79.4) exceeds total. The budget used to charge 0 GB pre-KV and size a
+/// pool that could not fit beside the 27B's weights ("Failed to build model").
+#[test]
+fn free_above_total_charges_the_self_relative_footprint() {
+    let i = Inputs {
+        total: gib(62.5),
+        free_now: gib(79.4),
+        utilization: 0.88,
+        reserve: gib(4.2),
+        baseline_free: Some(gib(118.7)),
+        manual_external: None,
+        tracked: None,
+    };
+    let b = size(&i);
+    assert_eq!(b.basis, Basis::Delta);
+    // The pre-KV footprint is the 39.3 GB the load took, not 0.
+    assert!(
+        (b.own as f64 / GIB_F - 39.3).abs() < 0.05,
+        "own {}",
+        b.own as f64 / GIB_F
+    );
+    // The pool fits in what is left of the device after the footprint and reserve.
+    assert!(b.bytes > 0);
+    assert!(
+        b.own + i.reserve + b.bytes <= i.total,
+        "pool {} does not fit",
+        b.bytes as f64 / GIB_F
+    );
+}
+
+/// A device whose free reading fits inside its total is sized exactly as before.
+#[test]
+fn free_within_total_is_unchanged() {
+    let i = start(118.0, 15.0, driver(100.0));
+    let b = size(&i);
+    assert_eq!(b.used_raw, i.total - i.free_now);
+}
