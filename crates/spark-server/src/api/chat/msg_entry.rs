@@ -366,7 +366,8 @@ pub(super) fn build_msg_entries(
                 }
                 MediaKind::Video => {
                     if reserve_decode {
-                        let ceiling = qwen_video_rows_ceiling(vcfg, vision_max_pixels, video);
+                        let ceiling =
+                            media::qwen_video_rows_ceiling(vcfg, vision_max_pixels, video);
                         admission.reserve_video(ceiling)?;
                     }
                     match spark_model::vision_preprocess::decode_gated(|| {
