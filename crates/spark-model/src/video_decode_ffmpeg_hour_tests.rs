@@ -11,7 +11,7 @@ fn hour_decode_budget_is_total_volume_not_frames_times_still_bound() {
         max_total_decoded_pixels: Some(469_762_048),
         ..Default::default()
     };
-    let per_frame = decoded_frame_budget(&p, 7200).unwrap();
+    let per_frame = tail::decoded_frame_budget(&p, 7200).unwrap();
     assert!(per_frame * 7200 <= 469_762_048);
     assert!(per_frame > 64_000);
 }
