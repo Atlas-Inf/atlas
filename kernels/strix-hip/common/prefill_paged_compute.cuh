@@ -40,6 +40,21 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+// ATLAS_STRIX_ATTN_BF16_REGKV (set only by the BF16 paged entry, strix-hip/common/
+// inferspark_prefill_paged.cu): the _64 kernel moves its K/V tiles through registers
+// (V's global load in flight during Q.K^T + softmax, the next K's during P.V) and
+// stores V to LDS as f16 once, instead of converting bf16 -> f32 -> f16 per element
+// inside every P.V fragment (256 u16 loads + ~540 VALU per tile per wave before).
+// Same values, same order: output is bit-identical. strix s117/s118 (27B geometry,
+// 2048-row chunk, interleaved x3): kv 2k -20%, 8k -12..-28%, 20k -8..-15%.
+// The register loader is BF16-only, so FP8/NVFP4/batched entries never set it.
+#if defined(ATLAS_STRIX_ATTN_BF16_REGKV) && !defined(PREFILL_BATCHED)
+#define ATLAS_ATTN_KV_PREFETCH
+#ifndef ATLAS_DISABLE_FP16_PV
+#define ATLAS_ATTN_V_F16
+#endif
+#endif
+
 // Async global→shared 16-byte copy helpers. AMD/gfx1151 has no cp.async
 // (hipcc rejects the PTX "l" constraint), so these degrade to synchronous
 // uint4 copies; commit/wait become no-ops. The NVIDIA/SCALE copy of this
@@ -509,6 +524,43 @@ extern "C" __global__ void KERNEL_NAME(
 #define _PAGED_CONCAT(a, b) a##b
 #define PAGED_CONCAT(a, b) _PAGED_CONCAT(a, b)
 
+#ifdef ATLAS_ATTN_KV_PREFETCH
+// BF16 paged KV tile <-> registers, 256 threads, TILE_CHUNKS/256 uint4 each (same chunk map as LOAD_KV_TILE).
+#define KV_PF_N (TILE_CHUNKS / 256)
+#define KV_PF_LOAD(cache, regs, kv_s) do { \
+    const unsigned int _cpr = HDIM / 8; \
+    const unsigned long long _ps = (unsigned long long)cache_block_size * num_kv_heads * head_dim; \
+    const unsigned long long _rs = (unsigned long long)num_kv_heads * head_dim; \
+    _Pragma("unroll") for (unsigned int _u = 0; _u < KV_PF_N; _u++) { \
+        unsigned int _i = tid + _u * 256, _row = _i / _cpr, _col = (_i % _cpr) * 8, _pos = (kv_s) + _row; \
+        if (_pos < kv_len) { \
+            unsigned int _pb = (unsigned int)block_table[_pos / cache_block_size]; \
+            regs[_u] = *(const uint4*)((cache) + _pb * _ps + (_pos % cache_block_size) * _rs + kv_head * head_dim + _col); \
+        } else regs[_u] = make_uint4(0, 0, 0, 0); \
+    } } while (0)
+#define KV_PF_STORE(smem, regs) do { \
+    const unsigned int _cpr = HDIM / 8; \
+    _Pragma("unroll") for (unsigned int _u = 0; _u < KV_PF_N; _u++) { \
+        unsigned int _i = tid + _u * 256; *((uint4*)&(smem)[_i / _cpr][(_i % _cpr) * 8]) = regs[_u]; \
+    } } while (0)
+#endif
+
+#ifdef ATLAS_ATTN_V_F16
+// Same value as the PV loop's (__fp16)(float)bf16, computed once per element at store.
+__device__ __forceinline__ unsigned int atlas_bf2_to_h2(unsigned int w) {
+    __fp16 lo = (__fp16)__uint_as_float(w << 16), hi = (__fp16)__uint_as_float(w & 0xFFFF0000u);
+    return (unsigned int)__builtin_bit_cast(unsigned short, lo) | ((unsigned int)__builtin_bit_cast(unsigned short, hi) << 16);
+}
+#define KV_PF_STORE_VH(smem, regs) do { \
+    const unsigned int _cpr = HDIM / 8; \
+    _Pragma("unroll") for (unsigned int _u = 0; _u < KV_PF_N; _u++) { \
+        unsigned int _i = tid + _u * 256; uint4 _r = regs[_u]; \
+        _r.x = atlas_bf2_to_h2(_r.x); _r.y = atlas_bf2_to_h2(_r.y); _r.z = atlas_bf2_to_h2(_r.z); _r.w = atlas_bf2_to_h2(_r.w); \
+        *((uint4*)&(smem)[_i / _cpr][(_i % _cpr) * 8]) = _r; \
+    } } while (0)
+#endif
+
+
 extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     const __nv_bfloat16* __restrict__ Q,
     K_CACHE_TYPE K_cache,
@@ -649,13 +701,22 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     }
     __syncthreads();
 
+#ifdef ATLAS_ATTN_KV_PREFETCH
+    uint4 pfk[KV_PF_N], pfv[KV_PF_N];
+    if (kv_block_lo < num_kv_blocks) KV_PF_LOAD(K_cache, pfk, kv_block_lo * BC);
+#endif
     for (unsigned int kv_block = kv_block_lo; kv_block < num_kv_blocks; kv_block++) {
         unsigned int kv_start = kv_block * BC;
         unsigned int kv_end = min(kv_start + BC, kv_len);
         unsigned int kv_tile_len = kv_end - kv_start;
 
         // K tile load only (V reloaded into smem_K after QK, buffer-share).
+#ifdef ATLAS_ATTN_KV_PREFETCH
+        KV_PF_STORE(smem_K, pfk);
+        KV_PF_LOAD(V_cache, pfv, kv_start);   // V in flight during Q.K^T + softmax
+#else
         LOAD_KV_TILE(K_cache, block_table, smem_K, kv_start, kv_len, kv_head, tid, 256);
+#endif
         __syncthreads();
 
         if (warp_id < 4) {
@@ -740,7 +801,16 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
         }
 
         // V reload into smem_K (buffer-share; K consumed by QK, barrier above covers WAR).
+#ifdef ATLAS_ATTN_KV_PREFETCH
+#ifdef ATLAS_ATTN_V_F16
+        KV_PF_STORE_VH(smem_K, pfv);   // V as f16 bits, converted once here instead of per fragment
+#else
+        KV_PF_STORE(smem_K, pfv);
+#endif
+        if (kv_block + 1 < num_kv_blocks) KV_PF_LOAD(K_cache, pfk, kv_start + BC);  // next K during P.V
+#else
         LOAD_KV_TILE(V_cache, block_table, smem_K, kv_start, kv_len, kv_head, tid, 256);
+#endif
         __syncthreads();
 
         {
@@ -785,7 +855,11 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
                     v16h bb;
                     #pragma unroll
                     for (int k = 0; k < 16; k++)
+#ifdef ATLAS_ATTN_V_F16
+                        bb[k] = reinterpret_cast<const __fp16(*)[HDIM_PAD]>(smem_K)[k_off + k][d_col];
+#else
                         bb[k] = (__fp16)(float)smem_K[k_off + k][d_col]; // buffer-share: smem_K holds V here
+#endif
                     acc_o[nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bb, acc_o[nt]);
                 }
 #endif
