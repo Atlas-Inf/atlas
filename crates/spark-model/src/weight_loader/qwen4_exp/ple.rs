@@ -29,24 +29,6 @@
 //! shard past the first and, since the rows are all valid embeddings, would
 //! do it silently.
 
-#[cfg(feature = "cuda")]
-// The NVFP4 block-scale slot width, when the table is packed U8.
-fn nvfp4_scale_stride(
-    store: &spark_runtime::weights::WeightStore,
-    lp: &str,
-    dtype: spark_runtime::weights::WeightDtype,
-) -> usize {
-    if dtype != spark_runtime::weights::WeightDtype::UInt8 {
-        return 0;
-    }
-    store
-        .deferred(&format!(
-            "{lp}.ple_embedding.ngram_embedding.shard_0.weight_scale"
-        ))
-        .map(|d| d.shape[1])
-        .unwrap_or(0)
-}
-
 use anyhow::Context;
 use anyhow::Result;
 use atlas_core::config::ModelConfig;
@@ -296,12 +278,29 @@ pub(super) fn load(
              F8_E4M3, or I16 rows (`batched_embed` / `batched_embed_fp8`)"
         ),
     };
-    // The gather pins at most one span's rows at once, so the arena sizes
-    // off the effective span — `bounded_scratch` is the same clamp
-    // `PleLayer::new` applies, keeping the two derivations from drifting.
+    // The gather pins one span's rows at once, so the arena sizes off the
+    // same `bounded_scratch` clamp `PleLayer::new` applies.
     let chunk = chunk_from_env();
     let span = crate::layers::ple::bounded_scratch(chunk, max_tokens);
-    let slot_bytes = head_dim * elem + nvfp4_scale_stride(store, &lp, dtype);
+    let nvfp4 = nvfp4::open_if_packed(store, &lp, dtype, shards.len(), rows_per, head_dim, gpu)?;
+    if std::env::var("ATLAS_PLE_RESIDENT").as_deref() == Ok("1") {
+        return resident::load(
+            store,
+            config,
+            layer_idx,
+            max_tokens,
+            &lp,
+            &dims,
+            shards,
+            rows_per,
+            dtype,
+            single.is_some(),
+            nvfp4,
+            gpu,
+        );
+    }
+
+    let slot_bytes = head_dim * elem + nvfp4::scale_stride(store, &lp, dtype);
     let (slots, slots_from) = slots_from_env(span, heads, slot_bytes);
     let mut cache = if single.is_some() {
         let (path, off) = &shards[0];
@@ -333,8 +332,6 @@ pub(super) fn load(
         );
     }
 
-    let n_shards = shards.len();
-    let nvfp4 = nvfp4::open_if_packed(store, &lp, dtype, n_shards, rows_per, head_dim, gpu)?;
     if let Some(nv) = &nvfp4 {
         // The block scales ride the same cache: one arena pair, one CLOCK.
         cache.attach_segmented_block_scales(&nv.scale_shards, nv.geom.scale_stride())?;
@@ -352,16 +349,7 @@ pub(super) fn load(
         tracing::info!("PLE n-gram table: F8_E4M3, per-tensor scale {scale:.6} from {name}");
     }
 
-    let weights = PleWeights {
-        key_proj: dense(store, &format!("{lp}.key_proj.weight"))?,
-        value_proj: dense(store, &format!("{lp}.value_proj.weight"))?,
-        // The PLE norms feed `ple_gate`, declared `const float*`: keep F32
-        // native (FP4-Local ships them F32), widen BF16 exactly (NVFP4).
-        norm_key: dense_keep_f32(store, &format!("{lp}.norm_key.weight"), gpu)?,
-        norm_query: dense_keep_f32(store, &format!("{lp}.norm_query.weight"), gpu)?,
-        norm_conv: dense_keep_f32(store, &format!("{lp}.norm_conv.weight"), gpu)?,
-        conv1d: dense(store, &format!("{lp}.conv1d.weight"))?,
-    };
+    let weights = ple_weights(store, &lp, gpu)?;
 
     let dilation = config.emb_neighbor_num; // conv dilation IS ngram_size
     tracing::info!(
@@ -471,6 +459,28 @@ mod slots_tests {
         assert!(derived_slots(20481, 16) >= 20481 * 16);
     }
 }
+
+/// The dense weights of one PLE site — one builder for the cached and
+/// resident branches. The three norms are **F32** — `ple_gate` is declared
+/// `const float*` — everything else is BF16.
+#[cfg(feature = "cuda")]
+fn ple_weights(store: &WeightStore, lp: &str, gpu: &dyn GpuBackend) -> Result<PleWeights> {
+    Ok(PleWeights {
+        key_proj: dense(store, &format!("{lp}.key_proj.weight"))?,
+        value_proj: dense(store, &format!("{lp}.value_proj.weight"))?,
+        // The PLE norms feed `ple_gate`, declared `const float*`: keep F32
+        // native (FP4-Local ships them F32), widen BF16 exactly (NVFP4).
+        norm_key: dense_keep_f32(store, &format!("{lp}.norm_key.weight"), gpu)?,
+        norm_query: dense_keep_f32(store, &format!("{lp}.norm_query.weight"), gpu)?,
+        norm_conv: dense_keep_f32(store, &format!("{lp}.norm_conv.weight"), gpu)?,
+        conv1d: dense(store, &format!("{lp}.conv1d.weight"))?,
+    })
+}
+
+/// `ATLAS_PLE_RESIDENT=1`: the whole NVFP4 table on device (no row cache).
+#[cfg(feature = "cuda")]
+#[path = "ple_resident.rs"]
+mod resident;
 
 /// Host readback of the small resident PLE tensors.
 #[cfg(feature = "cuda")]

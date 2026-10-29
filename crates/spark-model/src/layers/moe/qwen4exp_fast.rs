@@ -239,19 +239,35 @@ impl MoeLayer {
                     shared_up_scratch,
                     shared_out,
                     ctx,
+                    true,
                     stream,
                 )?;
             }
+            // EP fix (the `forward_row_local` contract): the shared expert is
+            // replicated on all ranks, so the pre-reduce blend takes a zero
+            // row and `forward_ep_reduce` adds `shared_out` once per row
+            // after the all-reduce. Outside EP, each row blends ITS OWN
+            // shared output (`shared_out.offset(t * h * bf16)`).
+            // The zero row may itself be NULL (`ep_blend_zero_row` under
+            // ATLAS_QWEN4EXP_DECODE_FUSE, read by the kernel as zeros), so
+            // select on EP, never on the pointer.
+            let is_ep = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
+            let zero_row = if is_ep && !shared_out.is_null() {
+                Some(self.ep_blend_zero_row(ctx, stream)?)
+            } else {
+                None
+            };
             for t in 0..rows {
                 let row = first + t;
                 let output_t = ctx.buffers.moe_output().offset(row * h * bf16);
+                let shared_t = zero_row.unwrap_or_else(|| shared_out.offset(t * h * bf16));
                 ops::moe_weighted_sum_blend(
                     ctx.gpu,
                     self.moe_weighted_sum_blend,
                     output_t,
                     expert_down_out.offset(t * top_k * h * bf16),
                     weights.offset(row * top_k * 4),
-                    shared_out.offset(t * h * bf16),
+                    shared_t,
                     input.offset(row * h * bf16),
                     self.weights.shared_expert_gate.weight,
                     h as u32,
@@ -259,16 +275,16 @@ impl MoeLayer {
                     h as u32,
                     stream,
                 )?;
-                if let Some(comm) = ctx.comm
-                    && ctx.config.ep_world_size > 1
-                {
-                    if ctx.graph_capture {
-                        comm.all_reduce(output_t.0, h * 2)?;
-                    } else {
-                        comm.all_reduce_async(output_t.0, h * 2, stream)?;
-                    }
-                }
             }
+            self.forward_ep_reduce(
+                ctx.buffers.moe_output().offset(first * h * bf16),
+                shared_out,
+                input.offset(first * h * bf16),
+                rows,
+                None,
+                ctx,
+                stream,
+            )?;
         }
         Ok(true)
     }

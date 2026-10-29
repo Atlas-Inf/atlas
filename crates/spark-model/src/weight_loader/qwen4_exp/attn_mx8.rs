@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-
+//
 //! Full-attention layers of nvidia/Qwen3.8-Flash-Next-FP4-Local, on their
 //! MXFP8 q/k/v/o bytes.
 //!
@@ -9,8 +9,15 @@
 //! QAD already trained in MXFP8, so this builder skips it: q (with its
 //! interleaved gate rows), k, v and o stay exactly as shipped and every
 //! forward reads them through `mxfp8_proj.cu`.
+//!
+//! TP: q/k/v are column-parallel (each rank a contiguous row slice — the same
+//! slice the BF16 arm takes, so the gated-q layout is preserved per rank) and
+//! o is row-parallel (each rank a per-row column slice of whole 32-input
+//! scale groups; partial sums reconcile in the existing post-o_proj
+//! all-reduce). The slices are byte-exact — packed E4M3 + E8M0 needs no
+//! dequant.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kv_cache::KvCacheDtype;
@@ -21,6 +28,7 @@ use crate::layer::TransformerLayer;
 use crate::layers::ops::{Mxfp8ProjKernels, Mxfp8Scratch};
 use crate::layers::qwen3_attention::mx8::Mx8AttnRt;
 use crate::layers::{FfnComponent, Qwen3AttentionLayer};
+use crate::tp_shard::{TpAttentionDims, TpShardKind, shard_mxfp8_row_parallel, shard_mxfp8_rows};
 use crate::weight_map::{
     AttentionWeights, DenseWeight, Mxfp8Proj, Mxfp8Weight, QuantizedWeight, dense_auto,
     load_kv_scales,
@@ -48,28 +56,46 @@ pub(super) fn build(
     (input_norm, post_attn_norm, ffn): (DenseWeight, DenseWeight, FfnComponent),
     scratch: Mxfp8Scratch,
 ) -> Result<Box<dyn TransformerLayer>> {
-    ensure!(
-        config.tp_world_size.max(1) == 1,
-        "MXFP8 attention layer {layer_idx}: tensor parallelism is not supported yet"
-    );
     let h = config.hidden_size;
-    let q_dim = config.num_attention_heads * config.head_dim;
-    let q_rows = if config.attn_gated { 2 * q_dim } else { q_dim };
-    let kv_rows = config.num_key_value_heads * config.head_dim;
+    let dims = TpAttentionDims::from_config(config);
+    let tp = dims.tp_size;
     let p = format!("{lp}.self_attn");
     let proj = |name: &str, n: usize, k: usize| -> Result<Mxfp8Proj> {
-        let [data, scales] = module(store, &format!("{p}.{name}"), n, k)?;
+        let full = module(store, &format!("{p}.{name}"), n, k)?;
+        let kind = dims
+            .proj_shape(name)
+            .map(|(_, _, kind)| kind)
+            .unwrap_or(TpShardKind::Replicated);
+        let (local, ln, lk) = match kind {
+            TpShardKind::RowParallel => {
+                let (l, lk) = shard_mxfp8_row_parallel(full, n, k, dims.tp_rank, tp, gpu)?;
+                (l, n, lk)
+            }
+            _ => {
+                let (l, ln) = shard_mxfp8_rows(full, &[n], k, dims.tp_rank, tp, gpu)?;
+                (l, ln, k)
+            }
+        };
+        if tp > 1 {
+            // The store's full module is dead once the local slice exists.
+            for t in ["weight", "weight_scale"] {
+                store.reclaim(gpu, &format!("{p}.{name}.{t}"))?;
+            }
+        }
         Ok(Mxfp8Proj {
-            w: Mxfp8Weight { data, scales },
-            n: n as u32,
-            k: k as u32,
+            w: Mxfp8Weight {
+                data: local[0],
+                scales: local[1],
+            },
+            n: ln as u32,
+            k: lk as u32,
         })
     };
     let projs = [
-        proj("q_proj", q_rows, h)?,
-        proj("k_proj", kv_rows, h)?,
-        proj("v_proj", kv_rows, h)?,
-        proj("o_proj", h, q_dim)?,
+        proj("q_proj", dims.full_q_n, h)?,
+        proj("k_proj", dims.full_kv_n, h)?,
+        proj("v_proj", dims.full_kv_n, h)?,
+        proj("o_proj", h, dims.full_o_in)?,
     ];
 
     let null = DenseWeight {
@@ -111,6 +137,13 @@ pub(super) fn build(
             },
         )
         .with_context(|| format!("MXFP8 attention layer {layer_idx}"))?;
-    tracing::info!("Layer {layer_idx}: attention q/k/v/o native MXFP8 (FP4-Local)");
+    tracing::info!(
+        "Layer {layer_idx}: attention q/k/v/o native MXFP8 (FP4-Local){}",
+        if tp > 1 {
+            format!(", tp={tp}")
+        } else {
+            String::new()
+        }
+    );
     Ok(Box::new(layer))
 }

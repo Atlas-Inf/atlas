@@ -31,17 +31,8 @@ impl MoeLayer {
                 || (self.correction_bias_dev.is_some() && ctx.config.scoring_func == "softmax"),
             "zero-expert MoE routing is not wired on this dispatch variant yet (forward_batched)"
         );
-        self.btile_input_guard(input, num_tokens, ctx, stream)?;
-        // The equal-memory NVFP4 MMQ repack replaces the checkpoint-native
-        // expert payloads. Only the grouped dispatcher understands that block
-        // layout; the per-token fused kernels below expect the original packed
-        // weights. Small speculative-verification batches reach this entry
-        // through the K2/K3/K5 fallbacks, so route them through the same MMQ
-        // pipeline as ordinary prefill rather than interpreting repacked bytes
-        // with the old-layout kernels. `forward_prefill` does not bounce MMQ
-        // layers back here, so this cannot recurse.
-        if self.nvfp4_mmq_layout || self.routed_scales_released {
-            return self.forward_prefill(input, num_tokens, ctx, stream);
+        if self.batched_prefill_guards(input, num_tokens, ctx, stream)? {
+            return Ok(());
         }
 
         // SOLID Incr-4: batched decode folds the routed-expert gate/up + down
@@ -464,17 +455,27 @@ impl MoeLayer {
                     shared_up_scratch,
                     shared_out,
                     ctx,
+                    true,
                     stream,
                 )?;
             }
 
+            // EP fix (same contract as `forward_row_local`): the shared expert
+            // is computed identically on all ranks, so it must stay out of the
+            // pre-reduce blend or the all-reduce sums it once per rank.
+            let is_ep = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
+            let shared_for_blend = if is_ep && !shared_out.is_null() {
+                self.ep_blend_zero_row(ctx, stream)?
+            } else {
+                shared_out
+            };
             ops::moe_weighted_sum_blend(
                 ctx.gpu,
                 self.moe_weighted_sum_blend,
                 output_t,
                 expert_down_out,
                 weights_dev,
-                shared_out,
+                shared_for_blend,
                 input_t,
                 self.weights.shared_expert_gate.weight,
                 h,
@@ -483,16 +484,9 @@ impl MoeLayer {
                 stream,
             )?;
 
-            // EP all-reduce per-token partial output
-            if let Some(comm) = ctx.comm
-                && ctx.config.ep_world_size > 1
-            {
-                if ctx.graph_capture {
-                    comm.all_reduce(output_t.0, h as usize * 2)?;
-                } else {
-                    comm.all_reduce_async(output_t.0, h as usize * 2, stream)?;
-                }
-            }
+            // EP all-reduce per-token partial output, then the shared expert
+            // added ONCE (`forward_ep_reduce` does both).
+            self.forward_ep_reduce(output_t, shared_out, input_t, 1, None, ctx, stream)?;
         }
 
         Ok(())

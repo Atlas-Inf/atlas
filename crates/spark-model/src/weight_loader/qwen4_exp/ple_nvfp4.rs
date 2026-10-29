@@ -77,3 +77,21 @@ fn open(
     };
     Ok(NgramNvfp4 { geom, scale_shards })
 }
+
+#[cfg(feature = "cuda")]
+// The NVFP4 block-scale slot width, when the table is packed U8.
+pub(super) fn scale_stride(
+    store: &spark_runtime::weights::WeightStore,
+    lp: &str,
+    dtype: spark_runtime::weights::WeightDtype,
+) -> usize {
+    if dtype != spark_runtime::weights::WeightDtype::UInt8 {
+        return 0;
+    }
+    store
+        .deferred(&format!(
+            "{lp}.ple_embedding.ngram_embedding.shard_0.weight_scale"
+        ))
+        .map(|d| d.shape[1])
+        .unwrap_or(0)
+}

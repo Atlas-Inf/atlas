@@ -43,7 +43,7 @@ impl Qwen3AttentionLayer {
             (self.k_weight.as_ref(), k_scratch),
             (self.v_weight.as_ref(), v_scratch),
         ] {
-            self.try_mx8(fwd, w, normed, out, n, stream)
+            self.try_mx8(fwd, w, normed, out, n, true, stream)
                 .unwrap_or_else(|| anyhow::bail!("MXFP8 q_proj with a non-MXFP8 k/v_proj"))?;
         }
         if self.gated && !self.q_lora_active() {

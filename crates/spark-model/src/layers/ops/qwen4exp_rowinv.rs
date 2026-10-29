@@ -146,6 +146,24 @@ pub fn enter(
     Some(Scope(()))
 }
 
+/// `enter` without the env gate, for the #[ignore]d GPU tests (which cannot
+/// set env vars process-wide). `hc_rows`/`decode`/`text` mirror `enter`'s.
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn enter_test(gpu: &dyn GpuBackend, hc_rows: u32, decode: bool, text: bool) -> Scope {
+    // SAFETY: same borrow contract as `enter` — the caller holds the Scope
+    // inside the borrow of `gpu`.
+    let gpu: &'static dyn GpuBackend = unsafe { std::mem::transmute(gpu) };
+    PASS.with(|p| {
+        p.set(Some(Pass {
+            gpu: gpu as *const _,
+            hc_rows,
+            decode,
+            text,
+        }))
+    });
+    Scope(())
+}
+
 /// A row-invariant prefill pass is running on this thread.
 pub fn active() -> bool {
     PASS.with(|p| p.get().is_some())

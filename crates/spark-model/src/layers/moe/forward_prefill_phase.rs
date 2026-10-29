@@ -103,6 +103,7 @@ impl MoeLayer {
             shared_up_out,
             shared_down_out,
             ctx,
+            false,
             aux,
         )? {
             if use_overlap {

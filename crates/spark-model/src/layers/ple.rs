@@ -51,6 +51,11 @@ pub mod ids;
 #[path = "ple/tests.rs"]
 mod tests;
 
+/// GPU parity test for `NgramTable::ResidentNvfp4` (real CUDA + files).
+#[cfg(all(test, feature = "cuda"))]
+#[path = "ple/resident_tests.rs"]
+mod resident_tests;
+
 #[path = "ple/dump.rs"]
 pub mod dump;
 
