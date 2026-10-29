@@ -13,9 +13,7 @@ use std::sync::Arc;
 
 // Reuse the actual build-time MODEL.toml parser. Its other returned policy
 // fields are intentionally unused here; no duplicate metadata parser/default.
-#[allow(dead_code)]
-#[path = "../../../../atlas-kernels/build_parse_behavior.rs"]
-mod build_behavior;
+use crate::api::test_app_state::build_behavior;
 
 const END: u32 = 101;
 const PREVIOUS: u32 = 10;
