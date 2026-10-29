@@ -191,7 +191,8 @@ fn rank_settings(
     expert_tp: bool,
     prefill_budget: usize,
     max_batch_tokens: usize,
-) -> [spark_model::model::startup_parity::Setting; 16] {
+    vision_max_pixels: Option<usize>,
+) -> [spark_model::model::startup_parity::Setting; 17] {
     // Off the speculative lanes no pool is sized by the draft depth.
     let num_drafts = if args.speculative || args.self_speculative || args.ngram_speculative {
         args.num_drafts.unwrap_or(0)
@@ -208,6 +209,13 @@ fn rank_settings(
             prefill_budget as u64,
         ),
         ("--max-batch-size", args.max_batch_size as u64),
+        // The vision encoder's capacity and output window derive from it: a
+        // rank with a smaller window refuses a chunk encode the other enters
+        // the payload collective for (`vision_cache`). Enntity/atlas aa494ccb.
+        (
+            "vision max pixels (--vision-max-pixels, ATLAS_VISION_MAX_PIXELS, checkpoint)",
+            vision_max_pixels.unwrap_or(0) as u64,
+        ),
         ("--max-seq-len", args.max_seq_len as u64),
         ("--block-size", args.block_size as u64),
         ("--enable-prefix-caching", args.enable_prefix_caching as u64),
@@ -325,7 +333,13 @@ pub(crate) fn init_nccl_comm(
     crate::ep_peer_lifeline::watch(&backend).context("Failed to arm the EP peer lifeline")?;
     // Before any other collective: a rank running another value of one of
     // these would deadlock or mispair the ranks at a prompt-dependent step.
-    let settings = rank_settings(args, config.expert_tp, prefill_budget, max_batch_tokens);
+    let settings = rank_settings(
+        args,
+        config.expert_tp,
+        prefill_budget,
+        max_batch_tokens,
+        config.vision.as_ref().and_then(|v| v.max_pixels),
+    );
     spark_model::model::startup_parity::agree(&backend, gpu, &settings)
         .context("Startup settings agreement")?;
     Ok(Some(
@@ -389,7 +403,7 @@ mod tests {
         let settings = |(argv, prefill_budget, max_batch_tokens): (&[&str], usize, usize)| {
             let argv = ["spark", "some/model"].iter().chain(argv);
             let args = crate::cli::ServeArgs::parse_from(argv);
-            super::rank_settings(&args, false, prefill_budget, max_batch_tokens)
+            super::rank_settings(&args, false, prefill_budget, max_batch_tokens, None)
         };
         let (a, b) = (settings(a), settings(b));
         a.iter()
