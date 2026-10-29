@@ -645,6 +645,7 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     __shared__ float smem_S[BR64][BC];
     __shared__ float smem_ml[BR64][2];
     __shared__ float smem_resc[BR64];
+    __shared__ float smem_mnew[BR64];
 
     KERNEL_PREAMBLE
 
@@ -755,16 +756,22 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
         }
         __syncthreads();
 
-        if (tid < BR64) {
-            unsigned int r = tid;
-            // Slot-space mask coordinate — see the BR=32 kernel above.
-            unsigned int qr = q_offset + q_start + r;
-            bool row_valid = (r < q_tile_len);
+        // Online softmax, parallel and bit-identical: 4 threads per row (64 rows x 4 = 256)
+        // do the mask, the row max (order-independent) and p = sw_exp(s - m_new) for 8
+        // columns each, the same expressions as before. One thread per row then sums p in
+        // the original c = 0..BC-1 order and updates m / l. strix kernel bench at 27B
+        // geometry (s86): 1.05-1.12x at kv 8k-16k, 100% bit-equal.
+        {
+            const unsigned int r = tid >> 2, q4 = tid & 3u;
+            // Slot-space mask coordinate -- see the BR=32 kernel above.
+            const unsigned int qr = q_offset + q_start + r;
+            const bool row_valid = (r < q_tile_len);
             float rmax = -1e30f;
             #pragma unroll
-            for (unsigned int c = 0; c < BC; c++) {
+            for (unsigned int j = 0; j < BC / 4; j++) {
+                const unsigned int c = q4 * (BC / 4) + j;
                 float s = smem_S[r][c] * inv_sqrt_d;
-                unsigned int kpos = kv_start + c;
+                const unsigned int kpos = kv_start + c;
                 bool masked = (c >= kv_tile_len) || !row_valid;
                 if (causal_mask_enabled && kpos > qr) masked = true;
                 if (sliding_window > 0 && kpos <= qr &&
@@ -773,13 +780,12 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
                 smem_S[r][c] = s;
                 rmax = fmaxf(rmax, s);
             }
-            float m_old = smem_ml[r][0];
-            float l_old = smem_ml[r][1];
-            float m_new = fmaxf(m_old, rmax);
-            float resc = sw_exp(m_old - m_new);
-            float sum = 0.0f;
+            rmax = fmaxf(rmax, __shfl_xor(rmax, 1));
+            rmax = fmaxf(rmax, __shfl_xor(rmax, 2));
+            const float m_new = fmaxf(smem_ml[r][0], rmax);
             #pragma unroll
-            for (unsigned int c = 0; c < BC; c++) {
+            for (unsigned int j = 0; j < BC / 4; j++) {
+                const unsigned int c = q4 * (BC / 4) + j;
                 // Masked scores contribute exactly 0. Wherever a row has seen a
                 // valid key this equals sw_exp(-1e30 - m_new) (0 in FP32), so the
                 // output is unchanged; it only matters for a tile that is ENTIRELY
@@ -787,14 +793,26 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
                 // give p = 1). At BR=32 that tile cannot exist; at BR=64 a later
                 // row's sliding window can start past the CTA's first tile.
                 const float s_c = smem_S[r][c];
-                float p = (s_c <= -1e30f) ? 0.0f : sw_exp(s_c - m_new);
+                const float p = (s_c <= -1e30f) ? 0.0f : sw_exp(s_c - m_new);
 #ifdef ATLAS_DISABLE_FP16_PV
                 smem_P[r][c] = __float2bfloat16(p);
 #else
                 smem_P[r][c] = __float2half(p);
 #endif
-                sum += p;
+                smem_S[r][c] = p;
             }
+            if (q4 == 0) smem_mnew[r] = m_new;
+        }
+        __syncthreads();
+        if (tid < BR64) {
+            const unsigned int r = tid;
+            const float m_old = smem_ml[r][0];
+            const float l_old = smem_ml[r][1];
+            const float m_new = smem_mnew[r];
+            const float resc = sw_exp(m_old - m_new);
+            float sum = 0.0f;
+            #pragma unroll
+            for (unsigned int c = 0; c < BC; c++) sum += smem_S[r][c];
             smem_ml[r][0] = m_new;
             smem_ml[r][1] = l_old * resc + sum;
             smem_resc[r] = resc;
