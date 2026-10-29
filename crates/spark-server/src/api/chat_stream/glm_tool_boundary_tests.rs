@@ -268,6 +268,7 @@ fn stream_tokens_with_state(
         req_return_token_ids: true,
         req_ctx: None,
         dump_seq: None,
+        role_literal_leaks: false,
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let mut stream = StreamState::new(tools, true, cancel, defs);
