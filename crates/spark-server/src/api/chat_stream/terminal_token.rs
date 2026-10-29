@@ -79,7 +79,7 @@ mod tests {
     fn explicit_stop_preserves_same_event_prefix_but_not_following_tokens() {
         let mut s = state();
         let prefix = while_open(&mut s, |s| {
-            let text = super::super::apply_stop_string_holdback(
+            let text = crate::api::chat_stream::handle_token::apply_stop_string_holdback(
                 "hello STOP trailing",
                 &["STOP".into()],
                 3,
