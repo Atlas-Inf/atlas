@@ -136,3 +136,39 @@ fn an_undersized_scratch_is_refused() {
     let err = layer.set_mx8_projections(m).unwrap_err();
     assert!(err.to_string().contains("prefill scratch"), "{err:#}");
 }
+
+/// `ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE` pipes out_proj by row ranges only
+/// where a range's rows are the whole pass's bytes: the dense BF16 arm, or
+/// MXFP8 on W8A8 (per-row quant, in-order kernels). MXFP8 on the GEMV tiers
+/// and the expansion is not: a short range would take the other family.
+#[test]
+fn only_w8a8_mxfp8_out_proj_pipes_by_row_ranges() {
+    use crate::layers::ops::MxW8a8;
+    use crate::layers::ops::qwen4exp_w8a8::MxPrefill;
+    let config = ModelConfig::qwen3_next_80b_nvfp4();
+    let gpu = MockGpuBackend::new();
+    let mut layer = bare_layer(&gpu, &config);
+    assert!(!layer.out_proj_rows_independent(), "no out_proj at all");
+    let mut m = mx8(&gpu, &config);
+    let op = |p: &Mxfp8Proj| MxW8a8 {
+        data: p.w.data,
+        sf: DevicePtr(0x1),
+        n: p.n as usize,
+        k: p.k as usize,
+        pinned: false,
+    };
+    let w8a8 = MxPrefill {
+        ops: [op(&m.qkvz), op(&m.out)],
+        quant: spark_runtime::gpu::KernelHandle(7),
+    };
+    layer.set_mx8_projections(m).unwrap();
+    assert!(
+        !layer.out_proj_rows_independent(),
+        "MXFP8 on the GEMV tiers"
+    );
+    let mut layer = bare_layer(&gpu, &config);
+    m = mx8(&gpu, &config);
+    m.w8a8 = Some(w8a8);
+    layer.set_mx8_projections(m).unwrap();
+    assert!(layer.out_proj_rows_independent(), "MXFP8 on W8A8");
+}

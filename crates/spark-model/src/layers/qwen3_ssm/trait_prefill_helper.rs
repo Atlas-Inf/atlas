@@ -52,12 +52,25 @@ impl Qwen3SsmLayer {
         Ok(())
     }
 
+    /// Whether out_proj's prefill rows do not depend on the rows beside
+    /// them: the dense BF16 arm (the tile kernel, or under the k-chain pin a
+    /// cuBLASLt k-chain kernel with the same bytes per row at every row
+    /// count), or native MXFP8 on W8A8 (`ATLAS_QWEN4EXP_PREFILL_W8A8`:
+    /// per-row activation quant and in-order kernels). Native MXFP8 without
+    /// it is not: a short range takes the GEMV tiers, a tall one the
+    /// expansion and GEMM.
+    pub(super) fn out_proj_rows_independent(&self) -> bool {
+        match &self.mx8 {
+            Some(mx8) => mx8.w8a8.is_some(),
+            None => self.out_proj_dense.is_some(),
+        }
+    }
+
     /// The out_proj and the SP reduce-scatter of a qwen4_exp chunk, pipelined
     /// (`ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE`): the GEMM by row ranges, the
-    /// window the peer needs first. Taken only on the dense BF16 arm, whose
-    /// rows are independent (the tile kernel, or under the k-chain pin a
-    /// cuBLASLt k-chain kernel with the same bytes per row at every row
-    /// count), so every byte is the unsplit GEMM + reduce-scatter's.
+    /// window the peer needs first. Taken only where a range's rows are the
+    /// whole pass's bytes ([`Self::out_proj_rows_independent`]), so every
+    /// byte is the unsplit GEMM + reduce-scatter's.
     /// `Ok(false)`: not taken, nothing launched.
     pub(super) fn out_proj_reduce_scatter_piped(
         &self,
@@ -74,7 +87,7 @@ impl Qwen3SsmLayer {
         else {
             return Ok(false);
         };
-        if fp8_rowwise || ctx.dispatch.cutlass_nvfp4_ssm_out || self.out_proj_dense.is_none() {
+        if fp8_rowwise || ctx.dispatch.cutlass_nvfp4_ssm_out || !self.out_proj_rows_independent() {
             return Ok(false);
         }
         crate::layers::qwen4exp_sp_pipe::compute_and_reduce_scatter(
