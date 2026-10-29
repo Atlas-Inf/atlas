@@ -11,10 +11,16 @@
 # uploads the directory as an artifact). Models download through the runner's HF mirror into $HF_HOME.
 set -euo pipefail
 MODEL=${1:?model}; BASE=${2:?base ref}; ROUNDS=${3:-3}
+# Extra args of the form KEY=VALUE become env for the serves (serve-amd.sh knobs: GPU_UTIL, MAX_SEQ_LEN, ...).
+for kv in "${@:4}"; do [[ "$kv" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9_./:,+-]*$ ]] && export "$kv"; done
+# DevLab Strix Halo exposes 62.5 GB to HIP (the GTT limit) against 124 GB of system RAM. Atlas's KV auto-measure
+# calls that mismatch implausible and budgets KV as util x 62.5 GB with no weights counted, which then cannot fit:
+# a 55 GB pool on top of 21 GB of 27B weights failed with "Failed to build model". Size it explicitly.
+export GPU_UTIL=${GPU_UTIL:-0.55} MAX_SEQ_LEN=${MAX_SEQ_LEN:-26624} ATLAS_KV_EXTERNAL_RESERVE_GB=${ATLAS_KV_EXTERNAL_RESERVE_GB:-0}
 OUT=${DEVLAB_OUT:-$PWD/devlab-out}; mkdir -p "$OUT"; RES="$OUT/RESULTS.txt"
 log() { echo "[$(date -u +%H:%M:%SZ)] $*" | tee -a "$RES"; }
 TEST_DIR=$PWD; BASE_DIR="${RUNNER_TEMP:-/tmp}/devlab-base"
-log "test $(git -C "$TEST_DIR" rev-parse --short=9 HEAD)  base $BASE  model $MODEL  rounds $ROUNDS"
+log "test $(git -C "$TEST_DIR" rev-parse --short=9 HEAD)  base $BASE  model $MODEL  rounds $ROUNDS  GPU_UTIL=$GPU_UTIL MAX_SEQ_LEN=$MAX_SEQ_LEN"
 
 # --- model: spark serve reads the HF cache only, so fetch it first (through $HF_ENDPOINT into $HF_HOME;
 # the cache sits on the runner's persistent scratch, so later runs skip the download) ---------------------
