@@ -1249,3 +1249,21 @@ unnecessary. Re-run as job 47c.
 tweaks of the work-item slot. Next: `-lineinfo` + a device backtrace to name the store, explicit `__align__(16)` on
 every staging array, and a single shared `__device__` tile body for the production and `_wq` kernels. Capped at 2 more
 attempts, then reassess. Branch `perf/moe-prefill-occupancy` eab4134d8 (local).
+
+## 2026-10-29 — K2a persistent work queue: byte-identical but SLOWER → bound is inside the tile body
+
+Job 47j (sanitizer clean, all identical). The fault fix was `__align__(16)` on every shared declaration: adding a small
+shared declaration ahead of them had reshuffled the uchar/bf16 array bases.
+
+| case | production | `_wq` | ratio |
+|---|---|---|---|
+| gate_up T=2,900 | 9.10 ms | 9.64 ms | 0.95× |
+| down T=2,900 | 5.32 ms | 5.89 ms | 0.90× |
+| gate_up T=19,200 | 34.8 ms | 40.4 ms | 0.86× |
+| down T=19,200 | 22.7 ms | 24.9 ms | 0.90× |
+
+Gate not met; K2a dropped. Work distribution isn't the binder. With ~10% of the FP8 ceiling, ~100 GB/s, and no grid
+starvation, the cost is the tile body's serial chain: LUT dequant → smem_B_fp8 store → ldmatrix → MMA, in a 2-stage
+pipeline, 4 CTAs/SM (register-capped). Next, K3 (byte-exact): dequantize K-tile k+1 while the MMAs of tile k run
+(double-buffered B_fp8) plus deeper cp.async stages, and trim registers toward 5 CTAs/SM. Branch
+`perf/moe-prefill-occupancy` b81f29199 (local).
