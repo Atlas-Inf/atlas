@@ -804,7 +804,7 @@ pub(crate) use parsers::{
     parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_qwen4_exp, parse_step3p7,
     parse_vision_config,
 };
-pub use vision::{OmniVisionConfig, PixelBounds, VisionConfig};
+pub use vision::{OmniVisionConfig, PixelBounds, VisionConfig, VisionTokenBudgets};
 
 pub(crate) fn finalize_config(config: &mut ModelConfig, raw: &serde_json::Value) -> Result<()> {
     if config.quantization_config.is_none() {
