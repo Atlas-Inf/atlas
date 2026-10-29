@@ -16,6 +16,17 @@ log() { echo "[$(date -u +%H:%M:%SZ)] $*" | tee -a "$RES"; }
 TEST_DIR=$PWD; BASE_DIR="${RUNNER_TEMP:-/tmp}/devlab-base"
 log "test $(git -C "$TEST_DIR" rev-parse --short=9 HEAD)  base $BASE  model $MODEL  rounds $ROUNDS"
 
+# --- model: spark serve reads the HF cache only, so fetch it first (through $HF_ENDPOINT into $HF_HOME;
+# the cache sits on the runner's persistent scratch, so later runs skip the download) ---------------------
+python3 -c "import huggingface_hub" 2>/dev/null || python3 -m pip install --user -q --break-system-packages huggingface_hub
+t0=$(date +%s)
+python3 - "$MODEL" <<'PY2' || { log "MODEL DOWNLOAD FAILED ($MODEL via ${HF_ENDPOINT:-hf.co})"; exit 1; }
+import sys
+from huggingface_hub import snapshot_download
+print(snapshot_download(sys.argv[1]))
+PY2
+log "model ready in $(( $(date +%s) - t0 ))s (HF_ENDPOINT=${HF_ENDPOINT:-unset} HF_HOME=${HF_HOME:-unset})"
+
 # --- base build ---------------------------------------------------------------------------------------
 rm -rf "$BASE_DIR"
 git -C "$TEST_DIR" fetch -q --depth=1 https://github.com/Atlas-Inf/atlas.git "$BASE"
