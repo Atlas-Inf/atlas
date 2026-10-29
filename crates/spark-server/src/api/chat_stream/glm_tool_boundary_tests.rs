@@ -528,7 +528,6 @@ fn blocking_refusal_prefix_keeps_content() {
     }
 }
 
-
 fn an_over_cap_image_is_refused_through_prepare_chat_prompt_with_vision_too_large() {
     // #236 regression: production callers used AdmitCtx::default(), so the
     // per-request row cap never fired. This drives the real path —
@@ -619,7 +618,11 @@ fn base64_encode(b: &[u8]) -> String {
             | *c.get(2).unwrap_or(&0) as u32;
         for i in 0..4 {
             let idx = (n >> (18 - 6 * i)) & 63;
-            out.push(if i < 2 + c.len() - 1 { T[idx as usize] as char } else { '=' });
+            out.push(if i < 2 + c.len() - 1 {
+                T[idx as usize] as char
+            } else {
+                '='
+            });
         }
     }
     out
