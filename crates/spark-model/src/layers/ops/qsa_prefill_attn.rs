@@ -410,14 +410,10 @@ pub fn qsa_prefill_attn_g(
 /// needles are the gate, not greedy identity). An explicit
 /// `ATLAS_QSA_ATTN_TC=1` / `ATLAS_QSA_ATTN_L8=1` keeps selecting its own
 /// kernel; `ATLAS_QSA_ATTN_TC3=1` already wins because it is checked first;
-/// `ATLAS_QSA_ATTN_TC2=0` restores the exact grouped kernel.
-///
-/// Native HIP (`atlas_hip`, gfx1151) has its own WMMA `qsa_attn_tc2.cu` and is
-/// default ON by the same gate (nvidia/Qwen3.8-Flash-Next-NVFP4, framework
-/// Linux, 2026-10-28, f66/f67): cold TTFT 7.4k 10.25 -> 9.21 s (-10 %), 12.5k
-/// 17.83 -> 15.69 s (-12 %); dense-region ppl identical (max |dlp| 0),
-/// above-bound ppl +0.08 %, needles 12/12 (4k/9k/13k x 4 depths) as the scalar
-/// kernel. SCALE builds that are not native HIP keep default OFF (unmeasured).
+/// `ATLAS_QSA_ATTN_TC2=0` restores the exact grouped kernel. Native HIP has its
+/// own WMMA `qsa_attn_tc2.cu`, default ON by the same gate (Flash-Next, 2026-10-28:
+/// TTFT -10 %/-12 % at 7.4k/12.5k, dense ppl identical, above-bound +0.08 %,
+/// needles 12/12). Non-HIP SCALE builds keep default OFF (unmeasured).
 pub fn qsa_attn_tc2_enabled() -> bool {
     let v = |k: &str| std::env::var(k).ok();
     qsa_attn_tc2_decision(
