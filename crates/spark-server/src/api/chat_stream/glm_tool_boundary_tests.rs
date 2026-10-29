@@ -91,8 +91,6 @@ fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<A
         rotation_tx: None,
         vision_config: None,
         vision_max_pixels: None,
-        vision_limits: None,
-        vision_budget: None,
         remote_image_policy: Default::default(),
         video_ffmpeg: Default::default(),
         video_fps: 1.0,
@@ -164,7 +162,6 @@ fn response(tokens: Vec<u32>) -> crate::api::inference_types::InferenceResponse 
         cached_prompt_tokens: 0,
         accepted_prediction_tokens: 0,
         prompt_logprobs: vec![],
-        guard_stop: None,
     }
 }
 
