@@ -16,6 +16,7 @@ async fn every_blocking_choice_carries_its_own_vision_input() {
         groups: vec![vec![0.5; 4], vec![0.75; 4]],
         grid_h: 2,
         grid_w: 2,
+        held: Default::default(),
     };
     // Include text-only requests and ordered mixed media; n=1 must retain
     // its behavior while every independently scheduled n>1 choice sees it.

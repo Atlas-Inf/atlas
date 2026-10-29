@@ -83,6 +83,8 @@ fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<A
     let (request_tx, _) = tokio::sync::mpsc::channel(1);
     Arc::new(AppState {
         tool_guard: Default::default(),
+        vision_budget: None,
+        vision_limits: None,
         tokenizer,
         model_name: "display-name-is-not-model-type".into(),
         adapter_name: None,
@@ -157,6 +159,7 @@ fn request() -> ir::ChatRequest {
 fn response(tokens: Vec<u32>) -> crate::api::inference_types::InferenceResponse {
     crate::api::inference_types::InferenceResponse {
         output_tokens: tokens,
+        guard_stop: None,
         finish_reason: "length".into(),
         time_to_first_token_ms: 0.0,
         decode_time_ms: 0.0,
