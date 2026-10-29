@@ -74,40 +74,8 @@ pub(super) fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<Clip
         drop(stdin);
     });
 
-    let mut out = Vec::new();
-    let read_res = child
-        .stdout
-        .take()
-        .context("no ffprobe stdout pipe")?
-        .read_to_end(&mut out);
-
-    // Bound the wait the same way the decoder is bounded: a probe that hangs
-    // must not hold a request thread. The watchdog kills the child, which
-    // closes its stdout and releases the reader above.
-    let mut err_text = String::new();
-    let status = {
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(policy.timeout_secs.max(1));
-        loop {
-            match child.try_wait().context("waiting for ffprobe")? {
-                Some(s) => break s,
-                None if std::time::Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    bail!(
-                        "probing the clip's duration exceeded {}s and was stopped",
-                        policy.timeout_secs
-                    );
-                }
-                None => std::thread::sleep(std::time::Duration::from_millis(50)),
-            }
-        }
-    };
-    if let Some(mut e) = child.stderr.take() {
-        let _ = e.read_to_string(&mut err_text);
-    }
+    let (out, err_text, status) = read_probe(child, policy.timeout_secs)?;
     let _ = writer.join();
-    read_res.context("reading the ffprobe report")?;
 
     let text = String::from_utf8_lossy(&out);
     let field = |name: &str| -> Option<String> {
@@ -161,4 +129,57 @@ fn parse_rate(s: &str) -> Option<f32> {
     let num: f32 = num.trim().parse().ok()?;
     let den: f32 = den.trim().parse().ok()?;
     (den != 0.0).then(|| num / den)
+}
+
+/// Read a probe child to completion under the same deadline the decoder
+/// uses: a hung process is killed and reported, never held forever
+/// (Enntity/atlas 8fe99bfe). Returns (stdout bytes, stderr text, exit status).
+pub(super) fn read_probe(
+    mut child: std::process::Child,
+    timeout_secs: u64,
+) -> Result<(Vec<u8>, String, std::process::ExitStatus)> {
+    let mut stdout = child.stdout.take().context("no ffprobe stdout pipe")?;
+    let mut stderr = child.stderr.take().context("no ffprobe stderr pipe")?;
+    let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+    // A blocked stdout read can outlive any deadline that is only checked
+    // after it; the watchdog runs in its own thread so a hung probe is
+    // killed while the read is in flight, which is what lets the read
+    // finish (Enntity/atlas 8fe99bfe).
+    let watchdog = {
+        let child = std::sync::Arc::clone(&child);
+        let secs = timeout_secs.max(1);
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            loop {
+                let mut guard = child.lock().unwrap();
+                match guard.try_wait() {
+                    Ok(Some(_)) => return false,
+                    Ok(None) if std::time::Instant::now() >= deadline => {
+                        let _ = guard.kill();
+                        let _ = guard.wait();
+                        return true;
+                    }
+                    _ => {}
+                }
+                drop(guard);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        })
+    };
+    let mut out = Vec::new();
+    let read_res = stdout.read_to_end(&mut out);
+    let mut err_text = String::new();
+    let _ = stderr.read_to_string(&mut err_text);
+    let killed = watchdog.join().unwrap_or(true);
+    ensure!(
+        !killed,
+        "probing the clip's duration exceeded {timeout_secs}s and was stopped"
+    );
+    read_res.context("reading the ffprobe report")?;
+    let status = child
+        .lock()
+        .unwrap()
+        .wait()
+        .context("waiting for ffprobe")?;
+    Ok((out, err_text, status))
 }
