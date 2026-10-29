@@ -256,7 +256,8 @@ impl Verbs {
     }
 
     /// [`Self::post_write`] of `len` bytes, then an 8-byte WRITE of the word
-    /// at `flag_addr` to `flag_remote`, in one post; only the flag is
+    /// at `flag_addr` to `flag_remote`, inline (the word is read at post
+    /// time, and the single inline WQE goes by BlueFlame); only the flag is
     /// signaled, so a single `poll` reaps both. Relies on the responder
     /// placing same-QP WRITEs in order (true without relaxed ordering, which
     /// no MR here requests), so the peer sees the flag after the data.

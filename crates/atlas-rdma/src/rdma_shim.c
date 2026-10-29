@@ -88,6 +88,7 @@ struct rs_conn *rs_create(const char *dev_name, int gid_idx) {
     qa.cap.max_recv_wr = 16;
     qa.cap.max_send_sge = 1;
     qa.cap.max_recv_sge = 1;
+    qa.cap.max_inline_data = 16; // the flag WRITE of rs_post_write_flag
     c->qp = ibv_create_qp(c->pd, &qa);
     if (!c->qp) {
         goto err;
@@ -248,14 +249,17 @@ int rs_post_write(struct rs_conn *c, void *local_addr, uint32_t lkey,
     return ibv_post_send(c->qp, &wr, &bad);
 }
 
-// Post a WRITE of `len` bytes followed, in the same ibv_post_send, by an 8-byte
-// WRITE of the word at `flag_addr` (same MR, same lkey/rkey) to `flag_remote`.
-// Only the flag is signaled: its completion (tagged `wr_id`) retires both.
-// Without relaxed ordering on the MRs, the responder places same-QP WRITEs in
-// order, so the peer does not observe the flag before the data (a practical
-// NIC property, not an IB-spec guarantee: callers keep it opt-in).
-// Same chaining as b12x RoCEnante's proxy (data WR -> signaled flag WR;
-// github.com/local-inference-lab/b12x b12x/comm/roce/_roce_proxy.c,
+// Post a WRITE of `len` bytes, then an 8-byte WRITE of the word at `flag_addr`
+// (same MR, same lkey/rkey) to `flag_remote`, inline: its value is copied at
+// post time. Only the flag is signaled: its completion (tagged `wr_id`)
+// retires both. Without relaxed ordering on the MRs, the responder places
+// same-QP WRITEs in order, so the peer does not observe the flag before the
+// data (a practical NIC property, not an IB-spec guarantee: callers keep it
+// opt-in). Two posts, not one chain: a single inline WQE goes to the NIC by
+// BlueFlame instead of a doorbell and a WQE fetch, about 2 us less per chain
+// hop at decode sizes (comm_pair_bench, four-node chain, 2026-10-18).
+// Same data -> signaled flag pairing as b12x RoCEnante's proxy
+// (github.com/local-inference-lab/b12x b12x/comm/roce/_roce_proxy.c,
 // Apache-2.0; idea only, no code).
 int rs_post_write_flag(struct rs_conn *c, void *local_addr, uint32_t lkey,
                        uint64_t remote_addr, uint32_t rkey, uint32_t len,
@@ -277,12 +281,12 @@ int rs_post_write_flag(struct rs_conn *c, void *local_addr, uint32_t lkey,
         wr[i].opcode = IBV_WR_RDMA_WRITE;
         wr[i].wr.rdma.rkey = rkey;
     }
-    wr[0].next = &wr[1];
     wr[0].wr.rdma.remote_addr = remote_addr;
     wr[1].wr.rdma.remote_addr = flag_remote;
-    wr[1].send_flags = IBV_SEND_SIGNALED;
+    wr[1].send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
     struct ibv_send_wr *bad = NULL;
-    return ibv_post_send(c->qp, wr, &bad);
+    int rc = ibv_post_send(c->qp, &wr[0], &bad);
+    return rc ? rc : ibv_post_send(c->qp, &wr[1], &bad);
 }
 
 // Blocking busy-poll for exactly one completion. On success returns 0 and writes
