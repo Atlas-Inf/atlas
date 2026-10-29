@@ -15,8 +15,10 @@ MODEL=${1:?model}; BASE=${2:?base ref}; ROUNDS=${3:-3}
 for kv in "${@:4}"; do [[ "$kv" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9_./:,+-]*$ ]] && export "$kv"; done
 # DevLab Strix Halo exposes 62.5 GB to HIP (the GTT limit) against 124 GB of system RAM. Atlas's KV auto-measure
 # calls that mismatch implausible and budgets KV as util x 62.5 GB with no weights counted, which then cannot fit:
-# a 55 GB pool on top of 21 GB of 27B weights failed with "Failed to build model". Size it explicitly.
-export GPU_UTIL=${GPU_UTIL:-0.55} MAX_SEQ_LEN=${MAX_SEQ_LEN:-26624} ATLAS_KV_EXTERNAL_RESERVE_GB=${ATLAS_KV_EXTERNAL_RESERVE_GB:-0}
+# a 55 GB pool on top of 21 GB of 27B weights failed with "Failed to build model". The budget also ignores the
+# ~6 GB of reserves/arena/balloon/MTP pools, so at 0.55 (34.4 GB KV) the total still hit 60.9 of 62.5 GiB.
+# 0.40 (~25 GB KV, >300k tokens) leaves headroom. Size it explicitly.
+export GPU_UTIL=${GPU_UTIL:-0.40} MAX_SEQ_LEN=${MAX_SEQ_LEN:-26624} ATLAS_KV_EXTERNAL_RESERVE_GB=${ATLAS_KV_EXTERNAL_RESERVE_GB:-0}
 OUT=${DEVLAB_OUT:-$PWD/devlab-out}; mkdir -p "$OUT"; RES="$OUT/RESULTS.txt"
 log() { echo "[$(date -u +%H:%M:%SZ)] $*" | tee -a "$RES"; }
 TEST_DIR=$PWD; BASE_DIR="${RUNNER_TEMP:-/tmp}/devlab-base"
