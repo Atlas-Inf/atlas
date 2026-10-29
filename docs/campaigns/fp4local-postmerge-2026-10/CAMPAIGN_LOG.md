@@ -1361,3 +1361,15 @@ Design (byte-exact target), starting with the down kernel (`grouped_gemm_ptrtabl
 stride (OOB on `smem_tok`/`smem_Bp`); fixed. Job 52d was killed at its 60-min timeout inside racecheck before timing
 ran. Next: timing + identity first, memcheck at small T, and racecheck on a minimal config (1–2 experts, 1 iteration)
 in its own job.
+
+## 2026-10-29 — W1 (named-barrier warp specialization) attempt 1: negative
+
+Jobs 53/54, down kernel `_ws`:
+- memcheck clean.
+- racecheck **139K+ hazards** (cap hit): consumers read `smem_A` / `smem_B_fp8` while producers write. Either named
+  `bar.arrive`/`bar.sync` doesn't order the cp.async writes as used, or there's a ring-index bug.
+- `identical=false` (epilogue bound the wrong accumulator array; fixed in a1ea22ddd, re-run 53b pending).
+- **2.5× slower** (13.6 / 57.0 ms vs 5.4 / 22.8 ms at T = 2,900 / 19,200).
+Splitting dequant onto producer warps with 2 barrier round-trips per K-tile and a 2-stage ring adds latency without
+hiding the MMA idle. A correct design needs phase-tagged mbarriers (and likely TMA / deeper rings), a substantially
+larger rewrite. Paused pending the owner's call. Branch `perf/moe-prefill-occupancy` a1ea22ddd (local).
