@@ -507,7 +507,7 @@ pub fn prefill_request(
         inside_thinking: thinking.inside_thinking,
         enable_thinking: req_enable_thinking,
         thinking_budget: if spontaneous_think {
-            Some(spontaneous_think_budget)
+            atlas_kernels::thinking_ceiling(spontaneous_think_budget)
         } else {
             req_thinking_budget
         },

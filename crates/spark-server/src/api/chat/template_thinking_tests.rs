@@ -146,3 +146,16 @@ fn response_format_with_thinking_off_renders_a_closed_think_block() {
         (true, Some(32))
     );
 }
+
+#[test]
+fn template_forced_thinking_preserves_no_server_ceiling_and_explicit_budget() {
+    let open = [9, 3, START];
+    assert_eq!(
+        reconcile_prompt_thinking(&open, Some(START), Some(END), false, None, 0),
+        (true, None)
+    );
+    assert_eq!(
+        reconcile_prompt_thinking(&open, Some(START), Some(END), true, Some(32), 0),
+        (true, Some(32))
+    );
+}

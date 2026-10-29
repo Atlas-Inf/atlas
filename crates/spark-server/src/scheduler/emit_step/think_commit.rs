@@ -94,12 +94,14 @@ pub(in crate::scheduler) fn think_gate(a: &mut ActiveSeq, tok: u32, env: &Commit
         a.think_skip_count = 0;
         // Re-entering thinking re-arms the spec-resume guard for the next exit.
         a.post_think_emitted = 0;
-        // Floored so the watchdog stays functional.
-        a.thinking_budget = Some(decayed.max(8));
+        // Floored so the watchdog stays functional; none without a server
+        // ceiling (`atlas_kernels::thinking_ceiling`).
+        a.thinking_budget =
+            atlas_kernels::thinking_ceiling(a.spontaneous_think_budget).map(|_| decayed.max(8));
         if !env.quiet {
             tracing::debug!(
                 fires = a.think_watchdog_fires,
-                budget = decayed.max(8),
+                budget = ?a.thinking_budget,
                 "spontaneous <think>: entering thinking mode"
             );
         }

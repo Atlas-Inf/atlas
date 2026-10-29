@@ -193,7 +193,7 @@ fn reconcile_prompt_thinking(
                  overriding enable_thinking=true with budget={}",
                 max_thinking_budget,
             );
-            (true, Some(max_thinking_budget))
+            (true, atlas_kernels::thinking_ceiling(max_thinking_budget))
         } else {
             (enable_thinking, thinking_budget)
         }
