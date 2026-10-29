@@ -115,7 +115,10 @@ fn a_video_request_with_a_spent_in_flight_budget_is_refused_busy_before_decode()
             video_end_token_id: 0,
             max_pixels: None,
             min_pixels: None,
-            video_pixels: None,
+            video_pixels: Some(atlas_core::config::PixelBounds {
+                min_pixels: 0,
+                max_pixels: 65_536,
+            }),
             token_budgets: atlas_core::config::VisionTokenBudgets::default(),
             omni: None,
         });
