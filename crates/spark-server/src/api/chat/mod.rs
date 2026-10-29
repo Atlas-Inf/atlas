@@ -36,6 +36,7 @@ mod template;
 #[cfg(test)]
 mod text_only_tests;
 mod thinking;
+pub(crate) mod vision_admit;
 
 use crate::main_modules::model_host::CurrentModel;
 use axum::extract::State;
@@ -69,6 +70,7 @@ pub(crate) fn test_build_msg_entries(
     tools_active: bool,
 ) -> Result<Vec<msg_entry::MsgEntry>, axum::response::Response> {
     msg_entry::build_msg_entries(
+        crate::api::chat::vision_admit::AdmitCtx::default(),
         None,
         None,
         &remote_image::RemoteImagePolicy::default(),

@@ -284,6 +284,17 @@ impl TransformerModel {
     /// and both ranks wedged in shape-mismatched collectives (head stuck
     /// in `sample_first_token` D2H, worker in the next cmd recv, both
     /// GPUs spinning in NCCL kernels).
+    /// `(window, request)` vision-row bounds the API admits against
+    /// (`vision_limits`). Enntity/atlas b060f987.
+    pub(crate) fn vision_row_bounds(&self) -> crate::model::vision_transport::VisionRowBounds {
+        let ve = self.vision_encoder.as_ref();
+        let window = ve.map_or(0, |ve| ve.output_rows());
+        crate::model::vision_transport::VisionRowBounds {
+            window,
+            request: self.config.max_seq_len,
+        }
+    }
+
     pub(crate) fn multi_rank_protocol_active(&self) -> bool {
         self.comm.is_some() && (self.config.ep_world_size > 1 || self.config.tp_world_size > 1)
     }

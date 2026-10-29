@@ -123,6 +123,7 @@ pub(crate) fn prepare_chat_prompt(
         image_pad_counts,
         vision_placeholders,
     } = msg_entry::build_msg_entries(
+        crate::api::chat::vision_admit::AdmitCtx::default(),
         state.vision_config.as_ref(),
         state.vision_max_pixels,
         &state.remote_image_policy,
