@@ -59,6 +59,7 @@ use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kv_cache::KvCacheDtype;
 use spark_runtime::weights::WeightStore;
 
+use super::helpers::MtpPrecision;
 use super::{attach, hc};
 use crate::layer::TransformerLayer;
 use crate::layers::qwen3_attention::HcHeadWeights;
@@ -154,6 +155,7 @@ fn build_mtp_moe(
     store: &WeightStore,
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
+    precision: MtpPrecision,
 ) -> Result<FfnComponent> {
     let h = config.hidden_size;
     let inter = config.moe_intermediate_size;
@@ -243,16 +245,25 @@ fn build_mtp_moe(
     }
 
     // The shared expert ships per-tensor BF16 like a main layer's, so it takes
-    // the ordinary named path rather than the stacked slicer. It is also
-    // installed BF16-native on the layer below — the fused kernels then take a
-    // NULL shared expert and the BF16 chain applies it separately, sparing the
-    // one expert every drafted token sees the 4-bit requant.
+    // the ordinary named path rather than the stacked slicer. With the BF16
+    // router (Enntity's drafter MoE) it is an NVFP4 copy the fused expert
+    // kernels apply. Otherwise it is installed BF16-native on the layer below
+    // — the fused kernels then take a NULL shared expert and the BF16 chain
+    // applies it separately, sparing the one expert every drafted token sees
+    // the 4-bit requant.
     let se = format!("{mlp}.shared_expert");
     let se_gate = dense_auto(store, &format!("{se}.gate_proj.weight"), gpu)?;
     let se_up = dense_auto(store, &format!("{se}.up_proj.weight"), gpu)?;
     let se_down = dense_auto(store, &format!("{se}.down_proj.weight"), gpu)?;
-    // NULL in the fused kernels: the BF16 chain installed below applies it.
-    let shared_expert = ExpertWeight::null();
+    let shared_expert = if precision.bf16_router {
+        ExpertWeight {
+            gate_proj: q(&se_gate, inter, h)?,
+            up_proj: q(&se_up, inter, h)?,
+            down_proj: q(&se_down, h, inter)?,
+        }
+    } else {
+        ExpertWeight::null()
+    };
 
     let gate = dense_auto(store, &format!("{mlp}.gate.weight"), gpu)?;
     let weights = MoeWeights {
@@ -265,11 +276,19 @@ fn build_mtp_moe(
     };
 
     // Router precision matters more than router size here: at 512 experts the
-    // top-10 weights cluster tightly. Same treatment as `ffn::build_moe`.
-    let gate_nvfp4 = Some(q(&gate, n_experts, h)?);
+    // top-10 weights cluster tightly. The BF16 router is the checkpoint's own
+    // weight on the scalar BF16 arms (Enntity's drafter; not the target's
+    // row-invariant tiers), else an NVFP4 copy.
+    let gate_nvfp4 = if precision.bf16_router {
+        None
+    } else {
+        Some(q(&gate, n_experts, h)?)
+    };
     let mut moe = MoeLayer::new(weights, n_experts, gate_nvfp4, gpu, config)
         .context("qwen4_exp MTP: MoeLayer")?;
-    moe.set_bf16_shared_expert(se_gate, se_up, se_down)?;
+    if !precision.bf16_router {
+        moe.set_bf16_shared_expert(se_gate, se_up, se_down)?;
+    }
     Ok(FfnComponent::Moe(moe))
 }
 
@@ -301,7 +320,10 @@ pub fn load_qwen4exp_mtp_module(
     // be built for this rank's share of the experts though it holds all 512.
     // The MTP tensors are never sliced or EP-skipped at upload, so every one
     // is here in full.
-    let config = &config.tp1_view();
+    // `MtpPrecision` puts the drafter-only precision switches on this copy
+    // alone; the target keeps its own.
+    let precision = MtpPrecision::from_env()?;
+    let config = &precision.drafter_config(config);
     let h = config.hidden_size;
     let variant = crate::weight_map::detect_nvfp4_variant(store, config);
     let absmax_k = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
@@ -309,7 +331,7 @@ pub fn load_qwen4exp_mtp_module(
     let stream = gpu.default_stream();
     let free_before = gpu.free_memory().unwrap_or(0) as u64;
 
-    let ffn = build_mtp_moe(store, config, gpu)?;
+    let ffn = build_mtp_moe(store, config, gpu, precision)?;
 
     // Norm placeholders, exactly as the main layers get them: this model keeps
     // its normalization inside the hyper-connection blocks, so there is no
@@ -422,7 +444,7 @@ pub fn load_qwen4exp_mtp_module(
     tracing::info!(
         "qwen4_exp MTP draft module loaded: 1 reused full-attention layer \
          (gated attn, dense — no QSA indexer + mHC + {}-expert MoE, experts {:?}), \
-         shared embed/lm_head, own head mixer. Construction cost {:.2} GB.",
+         shared embed/lm_head, own head mixer, {precision:?}. Construction cost {:.2} GB.",
         config.num_experts,
         mtp_expert_layout(store, &format!("{MTP_LAYER_PREFIX}.mlp")),
         spent as f64 / 1e9,
