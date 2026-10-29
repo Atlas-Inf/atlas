@@ -431,7 +431,10 @@ fn poolside_holds_headers_until_complete_on_every_model() {
 
 #[test]
 fn non_poolside_headers_still_stream_immediately() {
-    let (ctx, mut state, _) = stream_tokens_with_context(false, true, vec![END]);
+    // Non-guard streaming path: release the header immediately (the guard
+    // would hold it until call end; the fixture enables it via Policy::default).
+    let (mut ctx, mut state, _) = stream_tokens_with_context(false, true, vec![END]);
+    Arc::get_mut(&mut ctx.state).unwrap().tool_guard.enabled = false;
     state
         .detector
         .as_mut()
