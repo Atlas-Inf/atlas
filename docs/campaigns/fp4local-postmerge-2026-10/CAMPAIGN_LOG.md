@@ -1291,3 +1291,13 @@ Arm A reproduces the production baseline; arm B is the probe (its math differs; 
 the dequant with the MMAs is bounded at ~1.6× (gate_up, 2.9K) to ~2× (19.2K). That is the K3 target: dequant of
 K-tile k+1 under the MMAs of tile k, double-buffered `smem_B_fp8`, 3-stage cp.async, byte-exact. Branch
 `perf/moe-prefill-occupancy` fef8b78d1.
+
+## 2026-10-29 — K3 software pipeline: no-go (job 49)
+
+Production vs `_sp` (3-stage cp.async + double-buffered `smem_B_fp8`): gate_up 9.00 → 8.86 ms (2.9K) and 39.5 → 34.4 ms
+(19.2K), but NOT identical (the fused 2N clone broke the up path). Down got slower: 5.39 → 9.36 ms and 25.3 → 40.3 ms
+(identical). Extra waits/barriers and ~24 KB more smem (likely 3 vs 4 CTAs/SM) cost more than the overlap recovers.
+The pipeline is dropped. A third failed restructure (after occupancy and K2a): the kernels stay at ~20–36 TFLOP/s
+against a 228 TFLOP/s FP8 ceiling. Next hypothesis to PRICE before more surgery: the activation-side bf16→e4m3
+conversion (`moe_bf16x4_to_e4m3x4`, done per MMA from smem inside `K64_COMPUTE_MMA`). If it's large, convert A once
+per tile into smem as e4m3 (byte-exact if it's the same conversion). Branch `perf/moe-prefill-occupancy` 3093686e2.
