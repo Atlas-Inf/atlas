@@ -58,6 +58,8 @@ use std::sync::{Arc, Mutex};
 use crate::video_sample::{grid_step, sample_plan, wanted_frames};
 
 mod probe;
+mod scale;
+mod timestamps;
 use probe::probe_duration;
 
 /// Operator policy for subprocess decoding.
@@ -243,14 +245,7 @@ pub fn decode_with_plan(
     // `fps=A/B` samples one frame every `B/A` seconds, so the frame the
     // selector names for index K is the grid frame at time `K × B/A`.
     let grid = format!("fps={native}/{step}");
-    let frames = run_ffmpeg(bytes, &plan, &grid, policy)?;
-
-    // The frame-bearing timestamps come from the plan, clipped to the frames
-    // that were actually produced: a container whose last frame lands earlier
-    // than its declared duration must not be reported with timestamps for
-    // frames the model never received.
-    let times = plan.times.iter().copied().take(frames.len()).collect();
-    Ok((frames, times))
+    run_ffmpeg(bytes, &plan, &grid, policy)
 }
 
 /// Spawn ffmpeg with the plan's filter and collect the frames.
@@ -263,19 +258,22 @@ fn run_ffmpeg(
     plan: &crate::video_sample::SamplePlan,
     grid: &str,
     policy: &FfmpegPolicy,
-) -> Result<Vec<RgbImage>> {
+) -> Result<(Vec<RgbImage>, Vec<f32>)> {
     // `select` first, `scale` after: at most `plan.len()` frames are ever
     // scaled, and the scale is what caps the RGB the returned Vec holds.
+    // Enntity/atlas 6f3d0a71 + 95d20a25: `showinfo` reports each selected
+    // frame's real PTS (VFR-accurate), and the scale bounds by PIXEL AREA,
+    // not per-side (a 1xN strip has a huge side inside any per-side bound).
     let filter = format!(
-        "{grid},{},scale='min({px},iw)':'min({px},ih)':force_original_aspect_ratio=decrease",
+        "{grid},{},showinfo,{}",
         plan.select_filter(),
-        px = policy.max_decoded_pixels.max(1),
+        scale::decoded_scale_filter(policy.max_decoded_pixels),
     );
 
     let mut child = Command::new(&policy.binary)
         .args([
             "-v",
-            "error",
+            "info",
             // Never touch a terminal: without this ffmpeg can block on a
             // prompt when it thinks stdin is interactive.
             "-nostdin",
@@ -394,7 +392,17 @@ fn run_ffmpeg(
         !frames.is_empty(),
         "the container decoded to zero frames (is there a video stream?)"
     );
-    Ok(frames)
+    // Enntity/atlas 6f3d0a71: the real PTS showinfo printed per emitted
+    // frame — the timestamps of the frames the model actually received,
+    // not the plan's assumed positions.
+    let times = timestamps::parse_showinfo_timestamps(&err_text)?;
+    ensure!(
+        times.len() == frames.len(),
+        "ffmpeg reported {} selected frame timestamps for {} decoded frames",
+        times.len(),
+        frames.len()
+    );
+    Ok((frames, times))
 }
 
 /// Split a concatenated PNG stream into images.
