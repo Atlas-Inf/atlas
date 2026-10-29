@@ -134,6 +134,14 @@ pub fn marconi_exact() -> bool {
     std::env::var("ATLAS_MARCONI_EXACT").as_deref() == Ok("1")
 }
 
+/// `ATLAS_EXACT_DIRECT=1` (with `ATLAS_MARCONI_EXACT=1`): on an exact
+/// full-prompt leaf hit, skip the 1-token layer forward entirely and emit the
+/// first token from the snapshot's stashed hidden. Nothing is re-run, so no
+/// recurrent/aux state is double-advanced and there is nothing to undo.
+pub fn exact_direct() -> bool {
+    std::env::var("ATLAS_EXACT_DIRECT").as_deref() == Ok("1")
+}
+
 pub fn mtp_carry_drafter_enabled(levers: &crate::layers::ops::ModelLevers) -> bool {
     // Force-off in multi-seq MTP mode: the carry slot is single-sequence by
     // design (one slot, `active.len() == 1` assumption). See

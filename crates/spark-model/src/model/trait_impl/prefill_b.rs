@@ -30,6 +30,7 @@ mod batch_kernel;
 mod batch_kernel_tests;
 mod batched_layer;
 pub(in crate::model) mod embed_chunk;
+mod exact_direct;
 mod finalize_last;
 mod forward_layers;
 mod h_state_ptrs;
@@ -142,12 +143,12 @@ impl TransformerModel {
             // That is the OTHER way to satisfy the invariant — always one pass — and
             // it keeps the single-pass numerics, at the cost of the warm-turn tail
             // checkpoint this split exists to create.
+            // ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT: one pass, checkpoint in-pass.
+            let in_pass = self.qwen4exp_ckpt_takes_tail();
             // ATLAS_QWEN4EXP_PREFILL_ROWINV: a block-grid cut is off the GDN
             // grid; without the in-pass checkpoint the last chunk stays whole.
             let split_disabled =
-                pc_policy::tail_split_disabled() || crate::layers::ops::qwen4exp_rowinv::on();
-            // ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT: one pass, checkpoint in-pass.
-            let in_pass = self.qwen4exp_ckpt_takes_tail();
+                pc_policy::tail_split_disabled() || pc_policy::rowinv_tail_unsplit(in_pass);
             if !split_disabled && !in_pass && cut > chunk_start && cut < total {
                 anyhow::ensure!(
                     passengers.is_none(),
@@ -377,25 +378,27 @@ impl TransformerModel {
         );
 
         // ── Phase 4: forward through all layers ──
-        self.prefill_b_forward_layers(
-            seq,
-            &mut kv_cache,
-            chunk_start,
-            chunk_len,
-            is_last_chunk,
-            proc_count,
-            effective_seq_len_start,
-            kv_write_start,
-            marconi_skip,
-            meta_base,
-            slot_offset,
-            pos_stream_bytes,
-            use_mrope,
-            needs_paged,
-            midcap_plan.as_ref(),
-            passengers.as_deref_mut().zip(passenger_run.as_ref()),
-            stream,
-        )?;
+        if !self.prefill_b_exact_direct(seq, chunk_start + chunk_len, is_last_chunk, proc_count) {
+            self.prefill_b_forward_layers(
+                seq,
+                &mut kv_cache,
+                chunk_start,
+                chunk_len,
+                is_last_chunk,
+                proc_count,
+                effective_seq_len_start,
+                kv_write_start,
+                marconi_skip,
+                meta_base,
+                slot_offset,
+                pos_stream_bytes,
+                use_mrope,
+                needs_paged,
+                midcap_plan.as_ref(),
+                passengers.as_deref_mut().zip(passenger_run.as_ref()),
+                stream,
+            )?;
+        }
         let t_fwd = tp.elapsed();
         self.warm_trace_sync(stream)?;
         let marks = [t_lookup, t_prefix, t_blocks, t_meta, tp.elapsed()];

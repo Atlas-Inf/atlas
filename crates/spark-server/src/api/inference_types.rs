@@ -401,4 +401,8 @@ pub enum StreamEvent {
         guard_stop: Option<&'static str>,
     },
     Error(String),
+    /// A request the server cannot serve as asked (the streaming twin of
+    /// [`InvalidRequestError`]): sent as `invalid_request_error` / 400 so
+    /// agent clients stop resending it (#180).
+    InvalidRequest(String),
 }

@@ -168,37 +168,66 @@ impl Qwen3SsmLayer {
             )
         } else if let Some(ref dense_out) = self.out_proj_dense {
             // SSM out_proj is kept BF16 dense for accuracy (decode uses FP8
-            // block-scaled, prefill stays BF16). Always routed through the
-            // tensor-core dense_gemm_bf16_pipelined kernel (~40× vs the old
-            // scalar dense_gemm, identical BF16 math, cosine=1.0).
-            // ATLAS_LT_KCHAIN_PIN (qwen4_exp, >= 2048 rows): the tile kernel's
-            // own in-order k-chain on a faster cuBLASLt kernel, byte for byte
-            // (TP2, 16016 x 2560 x 3072: 4.24 -> 3.46 ms a layer).
-            if ctx.config.model_type == "qwen4_exp"
-                && k >= 2048
-                && spark_runtime::cublaslt::bf16_gemm_act_weight_t_kchain(
-                    normed_out_buf.0,
-                    dense_out.weight.0,
-                    out_proj_buf.0,
-                    k,
-                    h as u32,
-                    value_dim as u32,
-                    stream,
-                )?
-            {
-                return Ok(());
-            }
-            ops::dense_gemm_bf16_pipelined(
-                ctx.gpu,
-                self.dense_gemm_pipelined_k,
+            // block-scaled, prefill stays BF16). On native HIP, hipBLASLt
+            // first (2.3x faster than the tile kernel at the Flash-Next
+            // 2560x6144 shape, 2026-10-04) with the tensor-core
+            // dense_gemm_bf16_pipelined kernel (~40x vs the old scalar
+            // dense_gemm, identical BF16 math, cosine=1.0) as fallback.
+            #[cfg(atlas_hip)]
+            return ops::hip_bf16_proj_or(
+                "ssm_out_proj",
                 normed_out_buf,
-                dense_out,
+                dense_out.weight,
                 out_proj_buf,
                 k,
                 h as u32,
                 value_dim as u32,
                 stream,
-            )
+                || {
+                    ops::dense_gemm_bf16_pipelined(
+                        ctx.gpu,
+                        self.dense_gemm_pipelined_k,
+                        normed_out_buf,
+                        dense_out,
+                        out_proj_buf,
+                        k,
+                        h as u32,
+                        value_dim as u32,
+                        stream,
+                    )
+                },
+            );
+            #[cfg(not(atlas_hip))]
+            {
+                // ATLAS_LT_KCHAIN_PIN (qwen4_exp, >= 2048 rows): the tile kernel's
+                // own in-order k-chain on a faster cuBLASLt kernel, byte for byte
+                // (TP2, 16016 x 2560 x 3072: 4.24 -> 3.46 ms a layer).
+                if ctx.config.model_type == "qwen4_exp"
+                    && k >= 2048
+                    && spark_runtime::cublaslt::bf16_gemm_act_weight_t_kchain(
+                        normed_out_buf.0,
+                        dense_out.weight.0,
+                        out_proj_buf.0,
+                        k,
+                        h as u32,
+                        value_dim as u32,
+                        stream,
+                    )?
+                {
+                    return Ok(());
+                }
+                ops::dense_gemm_bf16_pipelined(
+                    ctx.gpu,
+                    self.dense_gemm_pipelined_k,
+                    normed_out_buf,
+                    dense_out,
+                    out_proj_buf,
+                    k,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )
+            }
         } else if force_w8a8
             && let Some(ref fp8w) = self.out_proj_fp8w
             && self.per_token_group_quant_fp8_k.0 != 0

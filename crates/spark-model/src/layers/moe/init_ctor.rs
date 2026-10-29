@@ -51,7 +51,15 @@ impl MoeLayer {
             weights.correction_bias.map(|dw| dw.weight);
 
         let _ = num_experts;
+        // Resolve the gfx1151 F16-operand twins + whether both resolved; the
+        // forward engages them via the n128 launchers when `moe_f16_prefill` holds.
+        let (moe_grouped_gemm_t, moe_fused_gate_up_t, moe_f16_prefill) =
+            crate::layers::ops::moe_f16_prefill_handles(gpu)?;
+
         let optional = super::init_optional::OptionalKernels::resolve(gpu, config);
+        let t_rows = super::init_t_rows::TRowsKernels::resolve(gpu);
+        let batched =
+            super::init_batched::BatchedKernels::resolve(gpu, config.model_type == "glm5_next")?;
         let rms_norm_k = gpu.kernel("norm", "rms_norm")?;
         let mut layer = Self {
             weights,
@@ -69,7 +77,11 @@ impl MoeLayer {
             row_invariant_bf16_router: false,
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_sw: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
-            w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
+            // Untransposed router GEMM. On native HIP this resolves to the
+            // bit-identical `w4a16_gemm_s64` twin (64-deep K stage) when the
+            // target ships it; every other target keeps `w4a16_gemm`. See
+            // layers/ops/strix_s64.rs.
+            w4a16_gemm: crate::layers::ops::w4a16_gemm_kernel(gpu)?,
             dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             dense_gemm_router: super::super::try_kernel(gpu, "gemm", "dense_gemm_bf16_router"),
             router_prefill_bn32: router_prefill_bn32::resolve(config, gpu)?,
@@ -113,43 +125,22 @@ impl MoeLayer {
             moe_weighted_sum_blend: gpu.kernel("moe_expert_gemv", "moe_weighted_sum_blend")?,
             residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
             moe_topk_batched: gpu.kernel("moe_topk", "moe_topk_softmax_batched")?,
-            moe_expert_gate_up_shared_batch2: gpu
-                .kernel("moe_fused_batch2", "moe_expert_gate_up_shared_batch2")?,
-            moe_expert_silu_down_shared_batch2: gpu
-                .kernel("moe_fused_batch2", "moe_expert_silu_down_shared_batch2")?,
-            moe_weighted_sum_blend_batch2: gpu
-                .kernel("moe_fused_batch2", "moe_weighted_sum_blend_batch2")?,
-            w4a16_gemv_batch2: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
-            moe_expert_gate_up_shared_batch3: gpu
-                .kernel("moe_fused_batch3", "moe_expert_gate_up_shared_batch3")?,
-            moe_expert_silu_down_shared_batch3: gpu
-                .kernel("moe_fused_batch3", "moe_expert_silu_down_shared_batch3")?,
-            moe_weighted_sum_blend_batch3: gpu
-                .kernel("moe_fused_batch3", "moe_weighted_sum_blend_batch3")?,
-            w4a16_gemv_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
-            w4a16_batchm: W4a16BatchmTiers::resolve(gpu, config.model_type == "glm5_next"),
-            w4a16_batch5_dual_k: super::super::try_kernel_gated(
-                config.model_type == "glm5_next",
-                gpu,
-                "w4a16_gemv",
-                "w4a16_gemv_batch5_dual",
-            ),
-            moe_expert_gate_up_shared_token_major: gpu
-                .kernel("moe_prefill", "moe_expert_gate_up_shared_prefill")?,
-            moe_expert_silu_down_shared_token_major: gpu
-                .kernel("moe_prefill", "moe_expert_silu_down_shared_prefill")?,
-            moe_weighted_sum_blend_token_major: gpu
-                .kernel("moe_prefill", "moe_weighted_sum_blend_prefill")?,
-            moe_decode_atomic_c4_silu_down_accum_k: super::super::try_kernel(
-                gpu,
-                "moe_decode_atomic_c4",
-                "moe_decode_atomic_c4_silu_down_accum",
-            ),
-            moe_decode_atomic_c4_finalize_k: super::super::try_kernel(
-                gpu,
-                "moe_decode_atomic_c4",
-                "moe_decode_atomic_c4_finalize",
-            ),
+            moe_expert_gate_up_shared_batch2: batched.moe_expert_gate_up_shared_batch2,
+            moe_expert_silu_down_shared_batch2: batched.moe_expert_silu_down_shared_batch2,
+            moe_weighted_sum_blend_batch2: batched.moe_weighted_sum_blend_batch2,
+            w4a16_gemv_batch2: batched.w4a16_gemv_batch2,
+            moe_expert_gate_up_shared_batch3: batched.moe_expert_gate_up_shared_batch3,
+            moe_expert_silu_down_shared_batch3: batched.moe_expert_silu_down_shared_batch3,
+            moe_weighted_sum_blend_batch3: batched.moe_weighted_sum_blend_batch3,
+            w4a16_gemv_batch3: batched.w4a16_gemv_batch3,
+            w4a16_batchm: batched.w4a16_batchm,
+            w4a16_batch5_dual_k: batched.w4a16_batch5_dual_k,
+            moe_expert_gate_up_shared_token_major: batched.moe_expert_gate_up_shared_token_major,
+            moe_expert_silu_down_shared_token_major: batched
+                .moe_expert_silu_down_shared_token_major,
+            moe_weighted_sum_blend_token_major: batched.moe_weighted_sum_blend_token_major,
+            moe_decode_atomic_c4_silu_down_accum_k: batched.moe_decode_atomic_c4_silu_down_accum_k,
+            moe_decode_atomic_c4_finalize_k: batched.moe_decode_atomic_c4_finalize_k,
             moe_sort_by_expert: ops::glm_decode_fuse::twin(
                 gpu,
                 ops::glm_decode_fuse::MOE_SORT,
@@ -159,7 +150,7 @@ impl MoeLayer {
             moe_sorted_gate_up: gpu.kernel("moe_sorted", "moe_sorted_gate_up")?,
             moe_sorted_silu_down: gpu.kernel("moe_sorted", "moe_sorted_silu_down")?,
             moe_grouped_gemm: gpu.kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable")?,
-            moe_grouped_gemm_t: gpu.kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable_t")?,
+            moe_grouped_gemm_t,
             moe_grouped_gemm_t_k64: gpu
                 .kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable_t_k64")?,
             moe_grouped_gemm_t_k64_m32: optional.moe_grouped_gemm_t_k64_m32,
@@ -190,7 +181,8 @@ impl MoeLayer {
             moe_expert_silu_down_shared_mmq_k: optional.moe_expert_silu_down_shared_mmq_k,
             quantize_nvfp4_k: gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?,
             silu_mul_quant_nvfp4_k: optional.silu_mul_quant_nvfp4_k,
-            moe_fused_gate_up_t: gpu.kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t")?,
+            moe_fused_gate_up_t,
+            moe_f16_prefill,
             moe_fused_gate_up_t_k64: gpu.kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t_k64")?,
             moe_grouped_gemm_e8m0: optional.moe_grouped_gemm_e8m0,
             moe_grouped_gemm_t_e8m0: optional.moe_grouped_gemm_t_e8m0,
@@ -263,6 +255,11 @@ impl MoeLayer {
                 "moe_shared_expert_fused_t",
                 "moe_expert_silu_down_shared_t_e8m0",
             ),
+            // S7 verify-row dedup (`forward_rows_t`): gb10-only entries in
+            // the same module — gated, so other targets get KernelHandle(0).
+            moe_expert_union_t_k: t_rows.moe_expert_union_t_k,
+            moe_expert_gate_up_shared_t_rows_k: t_rows.moe_expert_gate_up_shared_t_rows_k,
+            moe_expert_silu_down_shared_t_rows_k: t_rows.moe_expert_silu_down_shared_t_rows_k,
             // sqrtsoftplus kernels: lazy-loaded via try_kernel so models that
             // don't register them (all except DeepSeek-V4) start fine.
             moe_topk_sqrtsoftplus_k: super::super::try_kernel(

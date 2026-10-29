@@ -326,6 +326,7 @@ pub(crate) async fn run_chat_stream(
                 )
             }
             StreamEvent::Error(msg) => handle_error::handle_error(&ctx, msg),
+            StreamEvent::InvalidRequest(msg) => handle_error::handle_invalid_request(&ctx, msg),
         };
 
         futures::stream::iter(deltas).boxed()

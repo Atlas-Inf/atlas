@@ -178,6 +178,9 @@ pub const BISECT_ATTN_PROJ: u32 = 16;
 pub const BISECT_ATTN_ROWS: u32 = 32;
 /// LM head: `dense_gemv_bf16` per row.
 pub const BISECT_HEAD: u32 = 64;
+/// Verify-row MoE dedup (`forward_rows_t`): per-row expert launches on the
+/// transposed tables instead of the `_t_rows` union kernels.
+pub const BISECT_MOE_T_ROWS: u32 = 128;
 
 /// Opt-IN: off unless the variable is exactly `1`.
 fn opt_in(var: &str) -> bool {
