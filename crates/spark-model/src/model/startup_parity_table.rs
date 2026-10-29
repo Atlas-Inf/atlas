@@ -492,18 +492,6 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_GLM_KDA_COMMIT_CTAS", || {
         Ok(ops::kda_commit_ctas()? as u64)
     }),
-    ("ATLAS_GLM_MLA_FUSE", || {
-        Ok(ops::glm_mla_fuse_requested()? as u64)
-    }),
-    ("ATLAS_GLM_MXFP8_TILED", || {
-        Ok(ops::mxfp8_tiled_requested()? as u64)
-    }),
-    ("ATLAS_GLM_CANONICAL_VERIFY", || {
-        Ok(layers::canonical_verify::enabled() as u64)
-    }),
-    ("ATLAS_DFLASH_CONV_TWIN", || {
-        Ok(ConvTwinKind::word(ConvTwinKind::requested()?))
-    }),
 ];
 
 #[path = "startup_parity_table/tail.rs"]
