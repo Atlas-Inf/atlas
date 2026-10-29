@@ -47,6 +47,7 @@ use super::sanitizer::*;
 
 pub async fn responses_endpoint(
     CurrentModel(state): CurrentModel,
+    headers: axum::http::HeaderMap,
     req: Result<Json<crate::openai::ResponsesRequest>, JsonRejection>,
 ) -> Response {
     let Json(r) = match req {
@@ -132,6 +133,16 @@ pub async fn responses_endpoint(
         chat_req.messages = combined;
     }
 
+    // Session key (#209): a header, else the stable `conversation` id, else
+    // whatever the lowered body carries. Not `previous_response_id`: it names
+    // the prior turn, so it changes every turn.
+    let client_session = crate::session_key::from_headers(&headers).or_else(|| {
+        crate::session_key::ClientSessionId::new(
+            crate::session_key::SessionKeySource::Conversation,
+            conversation_id.as_deref(),
+        )
+    });
+
     if streaming {
         return responses_endpoint_stream(
             CurrentModel(state),
@@ -139,6 +150,7 @@ pub async fn responses_endpoint(
             metadata,
             store_flag,
             conversation_id,
+            client_session,
         )
         .await;
     }
@@ -151,7 +163,8 @@ pub async fn responses_endpoint(
     // request. Use the _inner variant because we already have a parsed
     // struct (no raw bytes available to dump at this layer; the Responses
     // handler dumps at its own entry point if --dump is enabled).
-    let resp = chat_completions_inner(state.clone(), None, chat_req.into(), None).await;
+    let ir_req = crate::session_key::with_override(chat_req.into(), client_session);
+    let resp = chat_completions_inner(state.clone(), None, ir_req, None).await;
     let conv_pair = conversation_id.map(|cid| (state.conversation_store.clone(), cid));
     translate_chat_response_to_responses(
         resp,

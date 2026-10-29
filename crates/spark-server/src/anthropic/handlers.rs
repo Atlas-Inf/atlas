@@ -21,7 +21,11 @@ use super::types::*;
 /// response back into Anthropic format. The Anthropic-specific surface
 /// is strictly format conversion — no policy or sampling decisions are
 /// made here.
-pub async fn messages(CurrentModel(state): CurrentModel, body: axum::body::Bytes) -> Response {
+pub async fn messages(
+    CurrentModel(state): CurrentModel,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
     // 1. Parse the Anthropic request.
     let req: MessagesRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -73,7 +77,9 @@ pub async fn messages(CurrentModel(state): CurrentModel, body: axum::body::Bytes
     //    sampling preset, and prompt mutation logic lives there.
     //    Anthropic has no echo-only wire fields (service_tier / store /
     //    stream_options), so the echo context stays default.
-    let outcome = crate::api::chat_completions_inner(state.clone(), None, req.into(), None).await;
+    let ir_req =
+        crate::session_key::with_override(req.into(), crate::session_key::from_headers(&headers));
+    let outcome = crate::api::chat_completions_inner(state.clone(), None, ir_req, None).await;
 
     // 5. Encode back to Anthropic shape. Non-streaming success arrives
     //    as the response IR — no body re-parse; a malformed inner body

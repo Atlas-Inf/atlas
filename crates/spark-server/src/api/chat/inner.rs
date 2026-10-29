@@ -121,6 +121,8 @@ pub(crate) async fn chat_completions_inner(
     // is no second request to unblock, so it buys nothing there and costs one
     // task handoff; it is worth it for concurrent serving.
     let _t_seg = std::time::Instant::now();
+    // Keyed on the client's messages, before prepare's tool-prompt injection.
+    let session_key = crate::session_key::resolve_from_request(&req);
     let state_for_prepare = state.clone();
     let (prepared, moved_req) = match tokio::task::spawn_blocking(move || {
         let out = prepare::prepare_chat_prompt(&state_for_prepare, &mut req);
@@ -176,7 +178,7 @@ pub(crate) async fn chat_completions_inner(
     } = loop_detect::check_loops(&req.messages, tools_active);
     let us_loop_detect = _t_seg.elapsed().as_micros() - us_prepare;
 
-    let session_hash = crate::session_manager::compute_session_hash(&prompt_tokens);
+    let session_hash = crate::session_key::chat_session_hash(session_key, &prompt_tokens);
     let us_session_hash = _t_seg.elapsed().as_micros() - us_prepare - us_loop_detect;
     let tools_count = req.tools.len();
     tracing::info!(

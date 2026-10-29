@@ -59,6 +59,7 @@ mod response_store;
 mod retrieval_heads;
 mod scheduler;
 mod scheduling_policy;
+mod session_key;
 mod session_manager;
 mod symbol_trie;
 mod tokenizer;

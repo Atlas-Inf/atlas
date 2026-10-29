@@ -8,8 +8,9 @@
 //! NOT (sequence-dependent). This manager gates snapshot restore/save by session,
 //! preventing cross-session state contamination.
 //!
-//! Sessions are identified by hashing the first N tokens of the prompt (covering
-//! system prompt + first user message). The manager tracks which SSM snapshot pool
+//! Chat sessions are keyed by `session_key` (client conversation id, else the
+//! first user turn); [`compute_session_hash`] is the token-prefix fallback and
+//! the `/v1/completions` key. The manager tracks which SSM snapshot pool
 //! slots belong to which session and evicts the least-recently-used session when
 //! the pool is exhausted.
 
@@ -125,11 +126,11 @@ impl SessionSsmManager {
     }
 }
 
-/// Compute a session hash from tokenized prompt.
-/// Hashes up to 1024 tokens — covers the full system prompt + first user
-/// message for most clients (Claude Code ~7k, OpenCode ~17k system prompts).
-/// Using more tokens reduces false session collisions where two different
-/// conversations share a short prefix.
+/// Compute a session hash from the first 1024 prompt tokens. The fallback key
+/// only: with tools the template renders the tool JSON first, so every request
+/// sharing a tool set hashes alike (#209). Chat requests use
+/// `session_key::chat_session_hash`, which reaches this only when the request
+/// has no client id and no user message.
 pub fn compute_session_hash(prompt_tokens: &[u32]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();

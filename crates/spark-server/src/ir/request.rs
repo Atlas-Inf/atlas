@@ -86,6 +86,9 @@ pub struct ChatRequest {
     pub timeout_secs: Option<f32>,
     /// Emit sampled token IDs on stream chunks (vLLM extension).
     pub return_token_ids: bool,
+    /// Client conversation id keying SSM snapshot sessions (#209); `None` =
+    /// derive the key from the messages (`session_key`).
+    pub client_session: Option<crate::session_key::ClientSessionId>,
 }
 
 /// Client sampling parameters. `None` = client silent → the server's

@@ -129,3 +129,40 @@ fn all_seventy_real_tool_schemas_survive_lowering() {
     let first_schema = &raw_again.as_array().unwrap()[0]["input_schema"];
     assert_eq!(ir.tools[0].function.parameters.as_ref(), Some(first_schema));
 }
+
+/// #209: two Claude Code sessions share the 26 KB system prompt and all 70
+/// tools. `metadata.user_id` (which embeds the session uuid) keys them apart;
+/// without it the first user turn does.
+#[test]
+fn real_sessions_sharing_the_preamble_get_distinct_session_keys() {
+    use crate::session_key::{SessionKeySource, hash_client_id, resolve_from_request};
+    let lower = |user: &str, metadata: serde_json::Value| {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 4096,
+            "system": system_prompt(),
+            "tools": tools(),
+            "messages": [{"role": "user", "content": user}],
+        });
+        if !metadata.is_null() {
+            body["metadata"] = metadata;
+        }
+        let req: MessagesRequest = serde_json::from_value(body).expect("MessagesRequest");
+        resolve_from_request(&ChatRequest::from(req)).expect("session key")
+    };
+    let uid = |s: &str| serde_json::json!({ "user_id": format!("user_ab_account_1_session_{s}") });
+
+    let a = lower("go", uid("aaaa"));
+    assert_eq!(a.0, SessionKeySource::Metadata);
+    assert_eq!(a.1, hash_client_id("user_ab_account_1_session_aaaa"));
+    assert_ne!(
+        a.1,
+        lower("go", uid("bbbb")).1,
+        "same tokens, distinct sessions"
+    );
+    assert_eq!(a, lower("a different turn", uid("aaaa")), "same session id");
+
+    let p = lower("fix the parser", serde_json::Value::Null);
+    assert_eq!(p.0, SessionKeySource::FirstUserTurn);
+    assert_ne!(p.1, lower("fix the lexer", serde_json::Value::Null).1);
+}

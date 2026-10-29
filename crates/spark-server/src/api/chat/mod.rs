@@ -105,6 +105,7 @@ pub async fn chat_completions(
         std::sync::Arc<crate::main_modules::model_host::ModelHost>,
     >,
     req_ctx: Option<axum::extract::Extension<crate::rate_limiter::RequestContext>>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
     // Parse the body ourselves (instead of using axum's `Json`
@@ -202,7 +203,9 @@ pub async fn chat_completions(
     // Wire → IR at the edge: echo-only fields peel off beside the
     // envelope; everything downstream reads only the IR.
     let echo = ResponseEcho::from(&req);
-    match chat_completions_inner(state.clone(), req_ctx, req.into(), dump_seq).await {
+    let ir_req =
+        crate::session_key::with_override(req.into(), crate::session_key::from_headers(&headers));
+    match chat_completions_inner(state.clone(), req_ctx, ir_req, dump_seq).await {
         ChatOutcome::Blocking(ir) => {
             crate::openai::encode_chat_response(&state, *ir, &echo, dump_seq)
         }
