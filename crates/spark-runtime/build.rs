@@ -191,11 +191,12 @@ fn build_cutlass_object(cutlass_home: std::path::PathBuf) {
         std::path::PathBuf::from("cuda/cutlass_bf16_gemm.cu"),
         std::path::PathBuf::from("cuda/cutlass_nvfp4_gemm.cu"),
         std::path::PathBuf::from("cuda/cutlass_nvfp4_grouped_gemm.cu"),
+        std::path::PathBuf::from("cuda/cutlass_fp8_blockwise_gemm.cu"),
     ];
     for src in &sources {
         println!("cargo:rerun-if-changed={}", src.display());
     }
-    // The three sources share this header; its launch-status base must match
+    // The sources share this header; its launch-status base must match
     // `cutlass::LAUNCH_FAILED`.
     println!("cargo:rerun-if-changed=cuda/atlas_stale_cuda_error.h");
     println!("cargo:rustc-cfg=atlas_cutlass");
