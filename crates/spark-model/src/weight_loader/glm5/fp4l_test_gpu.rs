@@ -27,22 +27,22 @@ use anyhow::{Context, Result, ensure};
 use atlas_core::numeric::{f32_to_bf16, fp8_e4m3_to_f32, nvfp4_dequant};
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 
-fn ckpt() -> Result<std::path::PathBuf> {
+pub(super) fn ckpt() -> Result<std::path::PathBuf> {
     std::env::var("ATLAS_GLM_FP4L_CKPT")
         .map(Into::into)
         .context("ATLAS_GLM_FP4L_CKPT=<nvidia/GLM-5.3-Flash-FP4-Local dir>")
 }
 
-fn backend() -> Result<&'static AtlasCudaBackend> {
+pub(super) fn backend() -> Result<&'static AtlasCudaBackend> {
     crate::layers::glm_gpu_test_backend::backend()
 }
 
 /// Host bytes of the tensors a test reads, by name.
-type Host = HashMap<String, (WeightDtype, Vec<usize>, Vec<u8>)>;
+pub(super) type Host = HashMap<String, (WeightDtype, Vec<usize>, Vec<u8>)>;
 
 /// `names` read from the checkpoint and uploaded into a fresh store, with the
 /// host bytes kept for references.
-fn upload(gpu: &dyn GpuBackend, names: &[String]) -> Result<(WeightStore, Host)> {
+pub(super) fn upload(gpu: &dyn GpuBackend, names: &[String]) -> Result<(WeightStore, Host)> {
     let dir = ckpt()?;
     let (mut map, mut host) = (HashMap::new(), Host::new());
     for name in names {
@@ -63,14 +63,14 @@ fn upload(gpu: &dyn GpuBackend, names: &[String]) -> Result<(WeightStore, Host)>
     Ok((WeightStore::from_map(map), host))
 }
 
-fn with_parts(stems: &[String], parts: &[&str]) -> Vec<String> {
+pub(super) fn with_parts(stems: &[String], parts: &[&str]) -> Vec<String> {
     stems
         .iter()
         .flat_map(|s| parts.iter().map(move |p| format!("{s}.{p}")))
         .collect()
 }
 
-fn bf16s(gpu: &dyn GpuBackend, p: DevicePtr, n: usize) -> Result<Vec<u16>> {
+pub(super) fn bf16s(gpu: &dyn GpuBackend, p: DevicePtr, n: usize) -> Result<Vec<u16>> {
     let mut b = vec![0u8; n * 2];
     gpu.copy_d2h(p, &mut b)?;
     let values: Vec<_> = b
@@ -84,7 +84,7 @@ fn bf16s(gpu: &dyn GpuBackend, p: DevicePtr, n: usize) -> Result<Vec<u16>> {
     Ok(values)
 }
 
-fn f(bits: u16) -> f32 {
+pub(super) fn f(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
@@ -114,7 +114,7 @@ fn host_bf16(host: &Host, stem: &str) -> Result<(Vec<u16>, usize, usize)> {
     Ok((out, n, k))
 }
 
-fn l(i: usize, rest: &str) -> String {
+pub(super) fn l(i: usize, rest: &str) -> String {
     format!("model.language_model.layers.{i}.{rest}")
 }
 
@@ -207,7 +207,7 @@ fn qctx(gpu: &dyn GpuBackend) -> Result<QuantizeCtx> {
 
 /// The config a TP2 rank loads with (`serve_phases::topology` halves the
 /// head counts).
-fn tp2_rank(rank: usize) -> ModelConfig {
+pub(super) fn tp2_rank(rank: usize) -> ModelConfig {
     let mut c = fp4l_config();
     c.num_attention_heads /= 2;
     c.num_key_value_heads /= 2;
@@ -421,3 +421,6 @@ fn vit_block_0_linears_expand_to_the_host_reference() -> Result<()> {
     ensure!(worst <= Some(1), "gate/up concatenation: {worst:?} ulps");
     Ok(())
 }
+
+#[path = "fp4l_test_gpu_kda.rs"]
+mod kda;
