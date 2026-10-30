@@ -32,9 +32,32 @@ hc_eps = 1e-6
 model_type = "glm5_next"
 hidden_size = 4096
 
+# Sampling follows generation_config.json (temperature 1.0, top_p 0.95) and
+# nothing else, as vLLM serves it: the filters the checkpoint does not ask
+# for stay off.
+[sampling.non_thinking]
+top_k = 0
+min_p = 0.0
+top_n_sigma = 0.0
+
 [behavior]
-thinking_default = false
-thinking_in_tools = false
+# The checkpoint's chat_template.jinja (rendered as shipped; no override in
+# jinja-templates/) opens `<think>` on every request: `Reasoning Effort: Max`
+# unless the client asks for low or high, with or without tools or
+# response_format. It has no thinking switch, so every request reasons.
+thinking_default = true
+thinking_in_tools = true
+verbatim_reasoning_effort = true
+# No server thinking budget, as in vLLM: the model closes its reasoning, or
+# max_tokens ends it. An explicit client budget (thinking_token_budget,
+# thinking.budget_tokens, chat_template_kwargs.thinking_budget) is the only
+# cap, and it is not shrunk to 90% of max_tokens.
+max_thinking_budget = 0
+cap_thinking_at_max_tokens = false
+confidence_early_stop = false
+enable_think_loop_watchdog = false
+# The system prompt reaches the template as the client wrote it.
+disable_cwd_hint_injection = true
 # Preserve native brief reasoning instead of imposing the generic A4 bias.
 min_reasoning_floor_tokens = 0
 tool_call_parser = "poolside_v1"
