@@ -342,7 +342,15 @@ pub fn start_chunked_prefill(
             // step does NOT re-broadcast, so this stays the only broadcast site
             // for a deferred chunk; a queued one sends it when it runs).
             model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, req_disable_mtp)?;
-            model.ep_broadcast_vision_state_for_seq(seq.slot_idx as u32, false, 0, 0, 0, 0)?;
+            model.ep_broadcast_vision_state_for_seq(
+                &seq,
+                seq.slot_idx as u32,
+                false,
+                0,
+                0,
+                0,
+                0,
+            )?;
             plant_chunk0(model, &mut seq, pc_plant)?;
             if multi || queue {
                 return Ok(());
@@ -404,14 +412,21 @@ pub fn start_chunked_prefill(
         return Ok(StartPrefillResult::InProgress(p));
     }
 
+    let mut image_pixels = image_pixels;
+    let has_images = !image_pixels.is_empty();
     // Guard: free SSM slot on any error after allocation.
     let prefill_result = (|| -> Result<DevicePtr> {
         // Vision: encode images and store embeddings for chunk 0 token overwrite.
         // Skipped when the images were already batch-encoded by the co-dispatch
         // pre-pass (vision_slice.is_some()) — that path runs ONE encode + fence
         // for the whole tick; here we only set the per-stream slice base below.
-        if vision_slice.is_none() && !image_pixels.is_empty() {
-            model.prepare_vision_embed(&image_pixels)?;
+        if vision_slice.is_none() && has_images {
+            // The images move onto `seq` (per-sequence vision state), which
+            // encodes per chunk only the items each chunk computes: two
+            // image prompts can interleave prefill chunks. Moved, not copied:
+            // the sequence holds the request's only copy of the pixels (and
+            // the in-flight permits they carry) until its last chunk.
+            model.prepare_vision_embed_for_chunked(&mut seq, std::mem::take(&mut image_pixels))?;
             // prepare_vision_embed() runs the vision encoder asynchronously on
             // the default stream, writing this request's patch embeddings into
             // the encoder's buf_out. The chunk-0 embedding injection inside
@@ -425,7 +440,16 @@ pub fn start_chunked_prefill(
             model.stream_wait_event(prefill_stream, prefill_event)?;
         }
 
-        dispatch_chunk0_vision(model, &seq, vision_slice, &image_pixels, req_disable_mtp)?;
+        // Co-dispatch: the batched encode wrote this request's rows into its
+        // slice of the shared buf_out; the grids/hashes live per-sequence, so
+        // stamp them for MRoPE and the worker's wire state. The resident
+        // window runs from row 0 through the end of the slice.
+        if let Some(s) = vision_slice {
+            model.stage_vision_grids(&mut seq, &image_pixels);
+            seq.vision.rows_encoded = s.patch_row_offset + s.patch_row_count;
+            seq.vision.rows_base = 0;
+        }
+        dispatch_chunk0_vision(model, &mut seq, vision_slice, has_images, req_disable_mtp)?;
         plant_chunk0(model, &mut seq, pc_plant)?;
         // EP: broadcast chunk 0 tokens to worker.
         // Send full prompt length + all tokens so worker can do
@@ -452,12 +476,12 @@ pub fn start_chunked_prefill(
             tracing::info!(
                 "VIT_TIMING prefill_chunk {} tok (img={}): {:.1}ms",
                 chunk_len,
-                vision_slice.is_some() || !image_pixels.is_empty(),
+                vision_slice.is_some() || has_images,
                 _pt0.elapsed().as_secs_f64() * 1000.0
             );
         }
         if vision_slice.is_some() {
-            model.set_vision_slice_base(0, 0, 0, 0);
+            model.set_vision_slice_base(&mut seq, 0, 0, 0, 0);
         }
         let logits = chunk_res?;
         super::prefill_normalization::initial(model, &seq)?;

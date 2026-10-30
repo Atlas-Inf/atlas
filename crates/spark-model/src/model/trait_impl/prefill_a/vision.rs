@@ -12,11 +12,13 @@
 use anyhow::Result;
 
 use super::super::super::types::TransformerModel;
+use crate::traits::SequenceState;
 
 impl TransformerModel {
     pub(in crate::model) fn prepare_vision_embed_dispatch(
         &self,
-        images: &[crate::VisionItem],
+        seq: &mut SequenceState,
+        images: Vec<crate::VisionItem>,
     ) -> Result<()> {
         let ve = match &self.vision_encoder {
             Some(ve) => ve,
@@ -34,7 +36,7 @@ impl TransformerModel {
         // tuples back to the original item boundaries.
         let mut item_refs: Vec<&crate::VisionItem> = Vec::with_capacity(images.len());
         let mut item_groups: Vec<usize> = Vec::with_capacity(images.len());
-        for it in images {
+        for it in &images {
             item_groups.push(it.t_len());
             item_refs.push(it);
         }
@@ -62,8 +64,17 @@ impl TransformerModel {
             out
         };
         let total_merged: usize = per_image.iter().map(|(_, _, mp)| *mp).sum();
-        *self.vision_embed_patches.lock() = total_merged;
-        *self.vision_image_grids.lock() = post_merge_grids;
+        // The whole prompt is encoded in one pass: every row is resident from
+        // physical 0, nothing is cached or deferred. The pixels (and the
+        // in-flight permits they carry) are done once encoded: dropped here.
+        seq.vision.grids = post_merge_grids;
+        seq.vision.hashes = images.iter().map(|it| it.content_hash).collect();
+        seq.vision.items = Vec::new();
+        seq.vision.rows_encoded = total_merged;
+        seq.vision.rows_base = 0;
+        seq.vision.skip_rows = 0;
+        seq.vision.computed_from = 0;
+        seq.vision.deferred = false;
         tracing::info!(
             "Vision encoder (batched): {} images, {} merged patches encoded",
             images.len(),
@@ -75,11 +86,11 @@ impl TransformerModel {
     /// Cross-request batched encode: flatten every request's images into ONE
     /// `forward_batched` call so block GEMM weights are read once over Σpatches
     /// across the whole tick (the concurrent-image win). `per_request[i]` holds
-    /// request i's images. Fills the shared packed `buf_out` + `vision_image_grids`
-    /// (in request-then-image order) and returns one
+    /// request i's images. Fills the shared packed `buf_out` and returns one
     /// `(patch_row_offset, grid_index_offset, num_images, patch_row_count)` per
-    /// request locating its slice. Each request's chunk-0 splice/MRoPE then reads
-    /// its slice via `set_vision_slice_base`.
+    /// request locating its slice. Each request's chunk-0 splice reads its
+    /// slice via `set_vision_slice_base`; the scheduler stamps each request's
+    /// own grids/hashes into its `SequenceState` (`stage_vision_grids`).
     pub(in crate::model) fn prepare_vision_embed_batched_dispatch(
         &self,
         per_request: &[Vec<crate::VisionItem>],
@@ -110,27 +121,13 @@ impl TransformerModel {
             per_req_groups.push(groups);
         }
         let per_image = ve.forward_items(&flat_items, self.gpu.as_ref(), stream)?;
-        let grids: Vec<(usize, usize, usize)> = {
-            let mut out = Vec::new();
-            let mut row = 0usize;
-            for groups in &per_req_groups {
-                for t_len in groups {
-                    let (h, w, _) = per_image[row];
-                    out.push((*t_len, h, w));
-                    row += t_len;
-                }
-            }
-            out
-        };
         let total_merged: usize = per_image.iter().map(|(_, _, mp)| *mp).sum();
-        *self.vision_embed_patches.lock() = total_merged;
-        *self.vision_image_grids.lock() = grids;
         // Per-request slice descriptors (request order matches the flatten order,
         // so row offsets accumulate Σ merged_p of earlier requests).
         // (buf_out row offset, GRID index offset, grid count, merged rows).
-        // The grid offset/count are in ITEMS — `vision_image_grids` is now one
-        // entry per item, not per encoder row — while the row offset stays in
-        // merged rows, which is what the splice indexes.
+        // The grid offset/count are in ITEMS — one entry per item, not per
+        // encoder row — while the row offset stays in merged rows, which is
+        // what the splice indexes.
         let mut out = Vec::with_capacity(per_request.len());
         let mut row_cursor = 0usize;
         let mut grid_cursor = 0usize;

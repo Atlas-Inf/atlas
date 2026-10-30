@@ -19,6 +19,7 @@ impl TransformerModel {
         tokens: &[u32],
         seq: &mut SequenceState,
         chunk_start: usize,
+        chunk_len: usize,
         total: usize,
         kv_cache: &mut PagedKvCache,
         stream: u64,
@@ -387,6 +388,14 @@ impl TransformerModel {
             // drafter's window may start, and its stored rows under the
             // restore point.
             self.dflash_warm_begin(seq, Some(tokens), skip_tokens, total, stream)?;
+            // Encode the vision items this prefill computes (`vision_cache`).
+            self.vision_resolve_deferred(
+                seq,
+                tokens,
+                skip_tokens.min(total.saturating_sub(1)),
+                chunk_start + chunk_len,
+                stream,
+            )?;
             seq.marconi_skip_to = skip_tokens;
             seq.prefix_lookup_skip = skip;
             seq.prefix_lookup_applied = true;

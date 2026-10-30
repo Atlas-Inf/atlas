@@ -26,6 +26,11 @@ impl VisionTower {
         }
     }
 
+    /// Whether this is the native GLM tower.
+    pub fn is_glm(&self) -> bool {
+        matches!(self, VisionTower::Qwen(v) if v.glm.is_some())
+    }
+
     pub fn out_hidden_size(&self) -> usize {
         match self {
             VisionTower::Qwen(v) => v.out_hidden_size,

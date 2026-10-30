@@ -194,13 +194,13 @@ impl TransformerModel {
             stream
         };
 
-        // Zero the arena and embed the chunk (phases 1+1b, `warm`): here, or
-        // with ATLAS_GLM_WARM_SKIP_CACHED after the prefix lookup and only
-        // for a chunk that computes.
+        // Zero and embed the chunk (phases 1+1b, `warm`) here, or after the
+        // prefix lookup (ATLAS_GLM_WARM_SKIP_CACHED; vision, `vision_cache`).
         let lookup_first = self.warm_lookup_first();
         let span = (chunk_start, chunk_len);
+        let embed_after = self.vision_embed_after(seq, tokens, span, stream)? || lookup_first;
         let mut t_pre =
-            self.prefill_b_zero_and_embed(!lookup_first, tokens, span.0, span.1, stream)?;
+            self.prefill_b_zero_and_embed(seq, !embed_after, tokens, span.0, span.1, stream)?;
         let t_embed = tp.elapsed();
 
         let mut kv_cache = self.kv_cache.lock();
@@ -210,6 +210,7 @@ impl TransformerModel {
             tokens,
             seq,
             chunk_start,
+            chunk_len,
             total,
             &mut kv_cache,
             stream,
@@ -229,8 +230,8 @@ impl TransformerModel {
             return self.pc_branch_split(tokens, seq, span, at, is_last_chunk, stream);
         }
         let cached = lookup_first && seq.prefill_chunk_cached(span.0 + span.1, is_last_chunk);
-        if lookup_first {
-            t_pre = self.prefill_b_zero_and_embed(!cached, tokens, span.0, span.1, stream)?;
+        if embed_after {
+            t_pre = self.prefill_b_zero_and_embed(seq, !cached, tokens, span.0, span.1, stream)?;
         }
         let t_prefix = tp.elapsed();
 

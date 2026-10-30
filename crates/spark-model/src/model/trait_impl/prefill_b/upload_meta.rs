@@ -126,7 +126,9 @@ impl TransformerModel {
             if use_mrope {
                 stg.positions_h.clear();
                 stg.positions_w.clear();
-                let grids = self.vision_image_grids.lock().clone();
+                // Per-sequence grids: this request's items only (the model
+                // holds no vision state between requests).
+                let grids = seq.vision.grids.clone();
                 // Both pad tokens: consumed identically here — the item's
                 // t_len already says which it is — but the scan has to
                 // recognize both, or a video run would be walked one text
@@ -155,9 +157,9 @@ impl TransformerModel {
                 if have_vision {
                     stg.positions.clear();
                     // Co-dispatch: this request owns grids[grid_base .. grid_base+owned]
-                    // of the shared packed vision_image_grids (0/all for legacy).
-                    let grid_base = *self.vision_grid_base.lock();
-                    let owned = *self.vision_owned_images.lock();
+                    // of its staged grids (0/all for legacy).
+                    let grid_base = seq.vision.grid_base;
+                    let owned = seq.vision.owned_images;
                     let grid_hi = if owned > 0 {
                         (grid_base + owned).min(grids.len())
                     } else {

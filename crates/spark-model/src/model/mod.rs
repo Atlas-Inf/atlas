@@ -104,6 +104,7 @@ pub(crate) mod token_overlay;
 pub(crate) mod trait_impl;
 pub(crate) mod types;
 pub(crate) mod verify_pieces;
+mod vision_cache;
 pub(crate) mod vision_transport;
 pub use vision_transport::VisionCapacityError;
 mod warm_turn;

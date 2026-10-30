@@ -64,6 +64,7 @@ impl TransformerModel {
                     seq,
                     0,
                     tokens.len(),
+                    tokens.len(),
                     &mut kv,
                     stream,
                     None,
@@ -148,10 +149,17 @@ impl TransformerModel {
         // `prefill_b_proc_range` below, as the single path's are.
         let first = picked[0];
         let (t0, r0) = (seqs[first].0, rows[first]);
-        let pre = self.prefill_b_zero_and_embed(true, &t0[start[first]..], 0, r0, stream)?;
+        let pre = self.prefill_b_zero_and_embed(
+            &*seqs[first].1,
+            true,
+            &t0[start[first]..],
+            0,
+            r0,
+            stream,
+        )?;
         for &k in &picked[1..] {
             let dst = hidden.offset(row0[k] * h * 2);
-            self.prefill_b_embed_chunk_at(seqs[k].0, start[k], rows[k], dst, stream)?;
+            self.prefill_b_embed_chunk_at(&*seqs[k].1, seqs[k].0, start[k], rows[k], dst, stream)?;
         }
         let _ = super::embed_chunk::take_staged_ids();
         self.buffers.note_rows(total);

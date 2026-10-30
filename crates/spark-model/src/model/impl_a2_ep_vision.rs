@@ -1,39 +1,43 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! EP vision-state protocol: rank-0 broadcast and worker receive of the
-//! encoder rows plus MRoPE metadata (`EP_CMD_VISION_STATE`).
+//! encoder rows plus MRoPE metadata and item content hashes
+//! (`EP_CMD_VISION_STATE`). A deferred encode sends its rows later, from the
+//! chunk's prefix lookup / per-chunk encode (`vision_cache`); the per-chunk
+//! rows ride the same raw broadcast `vision_encode_items` issues.
 
 use anyhow::Result;
 
 use super::types::TransformerModel;
 use super::vision_transport::{
-    EP_CMD_VISION_STATE, VISION_HEADER_WORDS, VisionWireState, parse_grid_words,
-    parse_state_header, payload_bytes, validate_state,
+    EP_CMD_VISION_STATE, VISION_GRID_WORDS, VISION_HEADER_WORDS, VisionWireState, grid_words,
+    parse_grid_words, parse_state_header, payload_bytes, validate_state,
 };
+use crate::traits::SequenceState;
 
 impl TransformerModel {
     /// Broadcast the rank-0 vision encoder result and its MRoPE metadata before
     /// a worker enters the matching prefill command. The payload uses the
     /// encoder's own device buffer, so it never aliases the small command or
     /// token scratch buffers. `enabled=false` is an explicit text-state clear.
+    /// The state read is `seq`'s own (per-sequence vision state).
+    ///
+    /// A co-dispatched slice goes on the wire as the worker's whole state: its
+    /// own grids and rows, sent from the slice's first `buf_out` row and
+    /// received at row 0. The head keeps reading its slice of the shared
+    /// packed output (`row_base`); both ranks splice the same rows.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn ep_broadcast_vision_state_for_seq_dispatch(
         &self,
+        seq: &SequenceState,
         seq_id: u32,
         enabled: bool,
         row_base: usize,
-        grid_base: usize,
+        _grid_base: usize,
         owned_images: usize,
         slice_rows: usize,
     ) -> Result<()> {
         if !self.multi_rank_protocol_active() {
-            if !enabled {
-                *self.vision_embed_patches.lock() = 0;
-                self.vision_image_grids.lock().clear();
-                *self.vision_row_base.lock() = 0;
-                *self.vision_grid_base.lock() = 0;
-                *self.vision_owned_images.lock() = 0;
-                *self.vision_slice_rows.lock() = 0;
-            }
             return Ok(());
         }
 
@@ -44,61 +48,52 @@ impl TransformerModel {
         if enabled && self.vision_encoder.is_none() {
             self.ep_broadcast_seq_and_cmd(seq_id, EP_CMD_VISION_STATE, self.ep_protocol_v2)?;
             self.ep_broadcast_tokens(&[0; VISION_HEADER_WORDS])?;
-            *self.vision_embed_patches.lock() = 0;
-            self.vision_image_grids.lock().clear();
-            *self.vision_row_base.lock() = 0;
-            *self.vision_grid_base.lock() = 0;
-            *self.vision_owned_images.lock() = 0;
-            *self.vision_slice_rows.lock() = 0;
             anyhow::bail!("vision request cannot use the multi-rank protocol without an encoder");
         }
 
-        let (state, grids, payload) = if enabled {
+        let (state, grids, hashes, payload, src_row) = if enabled {
             let ve = self.vision_encoder.as_ref().expect("checked above");
-            let rows = *self.vision_embed_patches.lock();
-            let grids = self.vision_image_grids.lock().clone();
+            let grids = seq.vision.grids.clone();
+            let hashes = seq.vision.hashes.clone();
+            let co_dispatched = owned_images > 0;
+            // A deferred encode has no rows yet: the header carries the rows
+            // its grids describe, and the payload follows from the lookup.
+            let rows = if seq.vision.deferred {
+                grids.iter().map(|&(t, h, w)| t * h * w).sum()
+            } else if co_dispatched {
+                slice_rows
+            } else {
+                seq.vision.rows_encoded
+            };
             let state = VisionWireState {
                 rows,
                 grid_count: grids.len(),
-                row_base,
-                grid_base,
-                owned_images,
-                slice_rows: if owned_images == 0 { rows } else { slice_rows },
+                slice_rows: rows,
+                deferred: seq.vision.deferred,
+                ..Default::default()
             };
-            let state = validate_state(&state, ve.output_rows())?;
-            let payload = payload_bytes(&state, ve.out_hidden_size(), ve.output_rows())?;
-            anyhow::ensure!(
-                payload > 0,
-                "vision request produced an empty encoder payload"
-            );
-            (state, grids, payload)
+            let state = validate_state(&state, self.vision_row_bounds())?;
+            let payload = if seq.vision.deferred {
+                0
+            } else {
+                let payload =
+                    payload_bytes(&state, ve.out_hidden_size(), self.vision_row_bounds())?;
+                anyhow::ensure!(
+                    payload > 0,
+                    "vision request produced an empty encoder payload"
+                );
+                payload
+            };
+            let src_row = if co_dispatched { row_base } else { 0 };
+            (state, grids, hashes, payload, src_row)
         } else {
-            // Text requests must reset worker-global vision state. A stale
+            // Text requests must reset the worker slot's vision state. A stale
             // buffer is otherwise observable by the next image request after
             // slot reuse, even though this request contains no pad tokens.
-            *self.vision_embed_patches.lock() = 0;
-            self.vision_image_grids.lock().clear();
-            *self.vision_row_base.lock() = 0;
-            *self.vision_grid_base.lock() = 0;
-            *self.vision_owned_images.lock() = 0;
-            *self.vision_slice_rows.lock() = 0;
-            (
-                VisionWireState {
-                    rows: 0,
-                    grid_count: 0,
-                    row_base: 0,
-                    grid_base: 0,
-                    owned_images: 0,
-                    slice_rows: 0,
-                },
-                Vec::new(),
-                0,
-            )
+            (VisionWireState::default(), Vec::new(), Vec::new(), 0, 0)
         };
 
-        *self.vision_slice_rows.lock() = state.slice_rows;
-
-        if enabled {
+        if payload > 0 {
             // The encoder launches on default_stream while NCCL uses its own
             // legacy stream. Explicitly complete the producer before handing
             // that pointer to NCCL; an event on the prefill stream would not
@@ -109,32 +104,20 @@ impl TransformerModel {
         // Convert every local value before sending the command preamble. A
         // wire-type failure must not leave rank 1 waiting for a header that
         // rank 0 will never send.
+        let word = |v: usize, what: &str| {
+            u32::try_from(v).map_err(|_| anyhow::anyhow!("vision {what} exceeds u32 wire type"))
+        };
         let header = [
-            u32::try_from(state.rows)
-                .map_err(|_| anyhow::anyhow!("vision rows exceed u32 wire type"))?,
-            u32::try_from(state.grid_count)
-                .map_err(|_| anyhow::anyhow!("vision grid count exceeds u32 wire type"))?,
-            u32::try_from(state.row_base)
-                .map_err(|_| anyhow::anyhow!("vision row base exceeds u32 wire type"))?,
-            u32::try_from(state.grid_base)
-                .map_err(|_| anyhow::anyhow!("vision grid base exceeds u32 wire type"))?,
-            u32::try_from(state.owned_images)
-                .map_err(|_| anyhow::anyhow!("vision owned image count exceeds u32 wire type"))?,
-            u32::try_from(state.slice_rows)
-                .map_err(|_| anyhow::anyhow!("vision slice rows exceed u32 wire type"))?,
+            word(state.rows, "rows")?,
+            word(state.grid_count, "grid count")?,
+            word(state.row_base, "row base")?,
+            word(state.grid_base, "grid base")?,
+            word(state.owned_images, "owned image count")?,
+            word(state.slice_rows, "slice rows")?,
+            u32::from(state.deferred),
         ];
         debug_assert_eq!(header.len(), VISION_HEADER_WORDS);
-        let mut grid_words = Vec::with_capacity(state.grid_count * 3);
-        for (t_len, grid_h, grid_w) in &grids {
-            grid_words.extend([
-                u32::try_from(*t_len)
-                    .map_err(|_| anyhow::anyhow!("vision temporal length exceeds u32 wire type"))?,
-                u32::try_from(*grid_h)
-                    .map_err(|_| anyhow::anyhow!("vision grid height exceeds u32 wire type"))?,
-                u32::try_from(*grid_w)
-                    .map_err(|_| anyhow::anyhow!("vision grid width exceeds u32 wire type"))?,
-            ]);
-        }
+        let grid_words = grid_words(&grids, &hashes)?;
         // Apply the same bounded geometry and row-count validation locally
         // before the command preamble. Otherwise rank 0 could enter the
         // payload collective with metadata that rank 1 rejects first.
@@ -154,27 +137,28 @@ impl TransformerModel {
                 .vision_encoder
                 .as_ref()
                 .expect("vision payload without encoder");
-            comm.broadcast(ve.out_row().0, payload, 0)?;
+            let src = ve.out_row().offset(src_row * ve.out_hidden_size() * 2);
+            comm.broadcast(src.0, payload, 0)?;
         }
         Ok(())
     }
 
-    /// Worker side of `EP_CMD_VISION_STATE`.
-    pub(super) fn ep_worker_recv_vision_state(&self) -> Result<()> {
+    /// Worker side of `EP_CMD_VISION_STATE`. Stores the wire state into the
+    /// addressed slot's own `SequenceState` (per-sequence vision state — the
+    /// model holds none between requests).
+    pub(super) fn ep_worker_recv_vision_state(&self, seq: &mut SequenceState) -> Result<()> {
         let header = self.ep_broadcast_tokens(&[0; VISION_HEADER_WORDS])?;
-        let max_rows = self
-            .vision_encoder
-            .as_ref()
-            .map_or(0, |ve| ve.output_rows());
-        let state = parse_state_header(&header, max_rows)?;
+        let state = parse_state_header(&header, self.vision_row_bounds())?;
         let grid_words = if state.grid_count > 0 {
-            self.ep_broadcast_tokens(&vec![0; state.grid_count * 3])?
+            self.ep_broadcast_tokens(&vec![0; state.grid_count * VISION_GRID_WORDS])?
         } else {
             Vec::new()
         };
-        let grids = parse_grid_words(&grid_words, &state)?;
-        let payload = if let Some(ve) = &self.vision_encoder {
-            payload_bytes(&state, ve.out_hidden_size(), ve.output_rows())?
+        let (grids, hashes) = parse_grid_words(&grid_words, &state)?;
+        let payload = if state.deferred {
+            0
+        } else if let Some(ve) = &self.vision_encoder {
+            payload_bytes(&state, ve.out_hidden_size(), self.vision_row_bounds())?
         } else {
             anyhow::ensure!(
                 state.rows == 0,
@@ -192,12 +176,22 @@ impl TransformerModel {
                 .expect("validated vision payload without communicator")
                 .broadcast(ve.out_row().0, payload, 0)?;
         }
-        *self.vision_embed_patches.lock() = state.rows;
-        *self.vision_image_grids.lock() = grids;
-        *self.vision_row_base.lock() = state.row_base;
-        *self.vision_grid_base.lock() = state.grid_base;
-        *self.vision_owned_images.lock() = state.owned_images;
-        *self.vision_slice_rows.lock() = state.slice_rows;
+        seq.vision.grids = grids;
+        seq.vision.hashes = hashes;
+        // The worker's per-chunk encode (`vision_encode_chunk_items`) and the
+        // chunk-0 resolve (`vision_resolve_deferred`, which min-reduces
+        // `computed_from` with the head) both gate on this flag: it must
+        // mirror the head's, or the ranks leave the collective at different
+        // points.
+        seq.vision.deferred = state.deferred;
+        seq.vision.rows_encoded = if state.deferred { 0 } else { state.rows };
+        seq.vision.rows_base = 0;
+        seq.vision.skip_rows = 0;
+        seq.vision.computed_from = 0;
+        seq.vision.row_base = state.row_base;
+        seq.vision.grid_base = state.grid_base;
+        seq.vision.owned_images = state.owned_images;
+        seq.vision.slice_rows = state.slice_rows;
         Ok(())
     }
 }

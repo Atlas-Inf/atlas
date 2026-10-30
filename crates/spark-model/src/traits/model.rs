@@ -1176,16 +1176,46 @@ pub trait Model: Send + Sync {
     /// Each tuple is `(pixels: Vec<f32>, grid_h: usize, grid_w: usize)`.
     /// Pixels are laid out [P, C×T×Hp×Wp] matching `vision_preprocess::preprocess_image`.
     /// Must be called before `prefill_chunk` when the prompt contains `<|image_pad|>` tokens.
+    /// The embeddings, grids and hashes land on `seq` (per-sequence vision
+    /// state) — the model holds none between requests.
     ///
     /// Default: no-op (text-only models).
-    /// `(window, request)`: the merged vision rows one encode may write and
+    fn prepare_vision_embed(
+        &self,
+        _seq: &mut crate::traits::SequenceState,
+        _images: Vec<crate::VisionItem>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// `(window, request)`: the merged vision rows one encode may write (the
+    /// encoder output window, which one prefill chunk's items must fit) and
     /// the rows one request may carry (`vision_limits`). Default `(0, 0)`.
     fn vision_row_limits(&self) -> (usize, usize) {
         (0, 0)
     }
 
-    fn prepare_vision_embed(&self, _images: &[crate::VisionItem]) -> Result<()> {
-        Ok(())
+    /// `prepare_vision_embed` for a request whose chunk 0 goes through
+    /// `prefill_chunk`: the model may stage the images on `seq` and encode,
+    /// per chunk, only the items that chunk computes (inside the chunk-0
+    /// prefix lookup for chunk 0). Default: encode now.
+    fn prepare_vision_embed_for_chunked(
+        &self,
+        seq: &mut crate::traits::SequenceState,
+        images: Vec<crate::VisionItem>,
+    ) -> Result<()> {
+        self.prepare_vision_embed(seq, images)
+    }
+
+    /// Derive `seq`'s per-item post-merge grids and content hashes from
+    /// `images` WITHOUT encoding: the co-dispatch path's rows are already in
+    /// the shared `buf_out` slice, but MRoPE, the cache key and the worker's
+    /// wire state need the geometry. Default: no-op (text models).
+    fn stage_vision_grids(
+        &self,
+        _seq: &mut crate::traits::SequenceState,
+        _images: &[crate::VisionItem],
+    ) {
     }
 
     /// Batched vision encode across N requests' images in ONE `forward_batched`
@@ -1200,12 +1230,13 @@ pub trait Model: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Set the co-dispatched batched-ViT slice for the NEXT prefill_chunk
-    /// (row offset into buf_out, grid index offset, image count and row count
-    /// owned). Pass all zeroes to reset to the legacy single-request
+    /// Set the co-dispatched batched-ViT slice for the NEXT prefill_chunk of
+    /// `seq` (row offset into buf_out, grid index offset, image count and row
+    /// count owned). Pass all zeroes to reset to the legacy single-request
     /// behaviour. Default: no-op.
     fn set_vision_slice_base(
         &self,
+        _seq: &mut crate::traits::SequenceState,
         _row_base: usize,
         _grid_base: usize,
         _owned_images: usize,
@@ -1222,6 +1253,7 @@ pub trait Model: Send + Sync {
     /// packed slice. Text-only models keep the default no-op implementation.
     fn ep_broadcast_vision_state_for_seq(
         &self,
+        _seq: &crate::traits::SequenceState,
         _seq_id: u32,
         _enabled: bool,
         _row_base: usize,
