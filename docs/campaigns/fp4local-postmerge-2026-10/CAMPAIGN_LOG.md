@@ -1403,3 +1403,19 @@ against the stall kill:
 Re-pin commits are ready locally (`vet/fp4local-main-pin` c018fa2, `vet/fnext-main-pin` 8bcec90, `vet/27b-main-pin`
 c136a26). Each gets pushed as a sparkrun-recipes PR with its vet results once its vet passes. The nightwatch cron
 relays each job's raw results as they land.
+
+## 2026-10-30 08:20 UTC — #257 / #163 gates; recipe #22 merged; main baseline refresh
+
+- sparkrun-recipes **#22 merged**: FP4-Local recipe pinned to `sha-87df79b`. Vet job 55: env 9/9, control 4/4, tool
+  call OK, agentic 50/50 + 50/50 (25.4 tok/s, run-1793259986118470148), BFCL ST-995 **87.84 / 87.48**
+  (run-1793269409528598043).
+- Owner priority: **#257** (session key for #209), then **#163** (`--exact-prefix-cache`, #158).
+- Job 50a (`refs/pull/257/merge` 47b767d0d): `session_key` tests 11/11; agentic 50/50 + 50/50, 11.83 s/turn, 337 turns
+  (run-1793341506832517369); BFCL running. Its control DIFFERS from job 10's reference, but main has moved 219
+  commits past 87df79b2f (#265–#272, including #271's qwen3.8-flash-next reference-server `[behavior]` defaults and #267's
+  MTP drafter changes). So that reference is stale, and the diff isn't attributable to #257. Added job 50a2: main at
+  #257's merge base, same profile, with control, agentic 50 and BFCL. That gives the one-variable #257 A/B and the new
+  control reference for #163's gate (50b).
+- Jobs 56/57 (Flash-Next NVFP4, 27B NVFP4 vets) failed on a script bug (polled port 8890; those recipes bind
+  8889/8888). Fixed (port read from the YAML) and re-queued as 56b/57b.
+- Queue: 50a (running) → 50a2 → 50b → 56b → 57b, ≈ 22 h.
