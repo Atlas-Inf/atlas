@@ -188,7 +188,8 @@ impl MoeLayer {
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
     ) -> Result<Vec<DevicePtr>> {
-        self.transpose_for_prefill_unified_inner(gpu, config, false, false)
+        let inplace = super::inplace_transpose::enabled();
+        self.transpose_for_prefill_unified_inner(gpu, config, false, false, inplace)
     }
 
     /// Unified routed-expert layout while retaining only the small shared
@@ -201,7 +202,8 @@ impl MoeLayer {
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
     ) -> Result<Vec<DevicePtr>> {
-        self.transpose_for_prefill_unified_inner(gpu, config, false, true)
+        let inplace = super::inplace_transpose::enabled();
+        self.transpose_for_prefill_unified_inner(gpu, config, false, true, inplace)
     }
 
     /// Hybrid-layout transpose pass — analogue of `transpose_for_prefill_unified`
@@ -217,23 +219,27 @@ impl MoeLayer {
         config: &atlas_core::config::ModelConfig,
     ) -> Result<()> {
         // Hybrid keeps the originals, so there is nothing freed to report.
-        self.transpose_for_prefill_unified_inner(gpu, config, true, true)
+        self.transpose_for_prefill_unified_inner(gpu, config, true, true, false)
             .map(|_| ())
     }
 
     /// Phased build of the transposed weight set. When `keep_originals` is true
     /// (hybrid-layout mode), Phase B and Phase D frees are skipped so decode
     /// paths still find the untransposed weights. When false (unified-layout
-    /// mode), routed allocations are transposed in place. The independent
-    /// `keep_shared_originals` bit retains the shared expert's native copies.
-    /// Freed originals are returned so their owner can stop tracking them.
+    /// mode), routed allocations are transposed in place, or with `inplace`
+    /// false (`ATLAS_MOE_INPLACE_TRANSPOSE=0`) into one slab per projection,
+    /// the originals freed. The independent `keep_shared_originals` bit
+    /// retains the shared expert's native copies. Freed originals are
+    /// returned so their owner can stop tracking them.
     pub(super) fn transpose_for_prefill_unified_inner(
         &mut self,
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
         keep_originals: bool,
         keep_shared_originals: bool,
+        inplace: bool,
     ) -> Result<Vec<DevicePtr>> {
+        let inplace = inplace && !keep_originals;
         let mut freed = Vec::new();
         self.btile_storage.require_legacy()?;
         let h = config.hidden_size;
@@ -290,7 +296,7 @@ impl MoeLayer {
             })
             .collect();
         let mut scratch = TransposeScratch::new();
-        let (gate_t, up_t) = if keep_originals {
+        let (gate_t, up_t) = if !inplace {
             (
                 self.transpose_experts_gpu(gpu, &gate_src, inter, h, routed_gs)?,
                 self.transpose_experts_gpu(gpu, &up_src, inter, h, routed_gs)?,
@@ -313,13 +319,22 @@ impl MoeLayer {
             // contain stale addresses, but the unified dispatch never reads
             // them (gated by `use_t_layout_for_decode()`).
             for expert in &mut self.weights.experts {
-                // The original allocations now hold the transposed data;
-                // NULL the fields so no untransposed path can read them.
+                // In place, the original allocations now hold the transposed
+                // data; consolidated, they are freed. Either way NULL the
+                // fields so no untransposed path can read them.
                 if !expert.gate_proj.weight.is_null() {
+                    if !inplace {
+                        free_original(gpu, &mut freed, expert.gate_proj.weight)?;
+                        free_original(gpu, &mut freed, expert.gate_proj.weight_scale)?;
+                    }
                     expert.gate_proj.weight = DevicePtr::NULL;
                     expert.gate_proj.weight_scale = DevicePtr::NULL;
                 }
                 if !expert.up_proj.weight.is_null() {
+                    if !inplace {
+                        free_original(gpu, &mut freed, expert.up_proj.weight)?;
+                        free_original(gpu, &mut freed, expert.up_proj.weight_scale)?;
+                    }
                     expert.up_proj.weight = DevicePtr::NULL;
                     expert.up_proj.weight_scale = DevicePtr::NULL;
                 }
@@ -342,7 +357,7 @@ impl MoeLayer {
                 }
             })
             .collect();
-        let down_t = if keep_originals {
+        let down_t = if !inplace {
             self.transpose_experts_gpu(gpu, &down_src, h, inter, routed_gs)?
         } else {
             self.transpose_experts_inplace(gpu, &down_src, h, inter, routed_gs, &mut scratch)?
@@ -360,6 +375,10 @@ impl MoeLayer {
             // ── Phase D: free down untransposed ──
             for expert in &mut self.weights.experts {
                 if !expert.down_proj.weight.is_null() {
+                    if !inplace {
+                        free_original(gpu, &mut freed, expert.down_proj.weight)?;
+                        free_original(gpu, &mut freed, expert.down_proj.weight_scale)?;
+                    }
                     expert.down_proj.weight = DevicePtr::NULL;
                     expert.down_proj.weight_scale = DevicePtr::NULL;
                 }

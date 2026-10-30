@@ -89,7 +89,7 @@ fn run(
             .map(|_| ()),
         2 => layer.transpose_for_prefill_hybrid(gpu, config),
         3 => layer
-            .transpose_for_prefill_unified_inner(gpu, config, true, false)
+            .transpose_for_prefill_unified_inner(gpu, config, true, false, false)
             .map(|_| ()),
         _ => unreachable!(),
     }

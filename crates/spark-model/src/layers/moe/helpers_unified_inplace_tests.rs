@@ -67,3 +67,49 @@ fn unified_tables_keep_routed_allocations_and_report_only_released_shared_weight
         }
     }
 }
+
+/// `ATLAS_MOE_INPLACE_TRANSPOSE=0`: the routed experts transpose into fresh
+/// slabs, and every routed original is freed and reported to the owner.
+#[test]
+fn consolidated_unified_frees_and_reports_every_routed_original() {
+    for gs in [16, 32] {
+        for keep_shared in [false, true] {
+            let gpu = RecordingGpu::new(false);
+            let (mut layer, config, originals) = fixture(&gpu, gs, true, true, 32);
+            let freed = layer
+                .transpose_for_prefill_unified_inner(&gpu, &config, false, keep_shared, false)
+                .unwrap();
+            let live = gpu.live();
+            let routed: Vec<DevicePtr> = originals[..4]
+                .iter()
+                .flat_map(projections)
+                .filter(|w| !w.is_null())
+                .flat_map(|w| [w.weight, w.weight_scale])
+                .collect();
+            for p in &routed {
+                assert!(freed.contains(p) && !live.contains_key(&p.0), "{p:?}");
+            }
+            let shared: Vec<DevicePtr> = projections(&originals[4])
+                .into_iter()
+                .flat_map(|w| [w.weight, w.weight_scale])
+                .collect();
+            for p in &shared {
+                assert_eq!(freed.contains(p), !keep_shared);
+            }
+            let released = if keep_shared { 0 } else { shared.len() };
+            assert_eq!(freed.len(), routed.len() + released);
+            for table in [&layer.gate_ptrs_t, &layer.up_ptrs_t, &layer.down_ptrs_t] {
+                let table = table.as_ref().unwrap();
+                for ptrs in [table.packed_ptrs, table.scale_ptrs] {
+                    for e in [1, 3] {
+                        let p = decode_ptrs(&gpu.read(ptrs, 32))[e];
+                        assert!(!p.is_null() && !routed.contains(&p));
+                    }
+                }
+            }
+            for w in layer.weights.experts.iter().flat_map(projections) {
+                assert!(w.weight.is_null() && w.weight_scale.is_null());
+            }
+        }
+    }
+}
