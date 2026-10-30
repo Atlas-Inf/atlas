@@ -300,9 +300,13 @@ pub(super) fn load(
         );
     }
 
-    let slot_bytes = head_dim * elem + nvfp4::scale_stride(store, &lp, dtype);
+    // `ATLAS_PLE_PACKED_DIR`: NVFP4 codes and scales through one interleaved copy.
+    let packed = nvfp4.as_ref().zip(nvfp4::packed_dir_from_env());
+    let slot_bytes = nvfp4::slot_bytes(nvfp4.as_ref(), packed.is_some(), head_dim * elem);
     let (slots, slots_from) = slots_from_env(span, heads, slot_bytes);
-    let mut cache = if single.is_some() {
+    let mut cache = if let Some((nv, dir)) = &packed {
+        nvfp4::open_packed(nv, &shards, rows_per as u64, dir, slots)
+    } else if single.is_some() {
         let (path, off) = &shards[0];
         spark_storage::NgramRowCache::open_at(
             path,
@@ -332,7 +336,7 @@ pub(super) fn load(
         );
     }
 
-    if let Some(nv) = &nvfp4 {
+    if let Some(nv) = nvfp4.as_ref().filter(|_| packed.is_none()) {
         // The block scales ride the same cache: one arena pair, one CLOCK.
         cache.attach_segmented_block_scales(&nv.scale_shards, nv.geom.scale_stride())?;
     }
@@ -354,8 +358,8 @@ pub(super) fn load(
     let dilation = config.emb_neighbor_num; // conv dilation IS ngram_size
     tracing::info!(
         "PLE at MODEL LAYER {layer_idx} (ple_layer_ids={:?}, 1-indexed): \
-         {} shards over {} file(s) x {rows_per} rows x {head_dim} dims = {} rows \
-         ({:.1} GB {dtype:?}) \
+         {} shards over {} file(s) x {rows_per} rows x {head_dim} cols = {} rows \
+         of {slot_bytes} B ({:.1} GB {dtype:?}) \
          served off NVMe with {slots} cached slots ({:.1} MB, {slots_from}: \
          span {span} x {heads} heads, floored at 65536); \
          scratch {span} tokens = {:.2} GB (ATLAS_PLE_CHUNK={chunk}); \
@@ -364,8 +368,8 @@ pub(super) fn load(
         shards.len(),
         distinct_files,
         shards.len() * rows_per,
-        (shards.len() * rows_per * head_dim * elem) as f64 / 1e9,
-        (slots * head_dim * 2) as f64 / 1e6,
+        (shards.len() * rows_per * slot_bytes) as f64 / 1e9,
+        (slots * slot_bytes) as f64 / 1e6,
         (span * 10240 * 14) as f64 / 1e9,
         config.ple_conv_kernel_size,
         (config.ple_conv_kernel_size - 1) * dilation,

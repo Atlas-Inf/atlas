@@ -13,6 +13,18 @@
 //!
 //! 26.8 GiB on disk against the NVFP4 pack's 47.7 GiB FP8 table, with the
 //! same row count: fewer bytes per fault, more rows per page-cache GiB.
+//!
+//! That split costs two NVMe reads per miss. With `ATLAS_PLE_PACKED_DIR` the
+//! loader instead interleaves the two planes once (`spark_storage::
+//! ngram_pack`) into rows of
+//!
+//! ```text
+//! [ dim/2 B codes | dim/group B scales | zero pad to a 16 B multiple ]
+//!   80              10                   6        = 96 B at dim 160
+//! ```
+//!
+//! and the main cache holds those whole rows, with no block-scale arena: one
+//! read per miss, and the same bytes reach the same decode.
 
 #[cfg(any(test, feature = "cuda"))]
 use anyhow::Context as _;
@@ -49,20 +61,43 @@ impl Nvfp4RowGeom {
     pub fn scale_stride(&self) -> usize {
         self.dim / self.group
     }
+
+    /// Bytes per interleaved row: codes, block scales, zero pad to 16.
+    pub fn interleaved_stride(&self) -> usize {
+        (self.packed_stride() + self.scale_stride()).next_multiple_of(16)
+    }
+
+    /// What `batched_embed_nvfp4` reads for a gather from `table_va`: the
+    /// block-scale base, the code-row stride and the scale-row stride. Split
+    /// rows find their scales in the cache's block-scale arena; an
+    /// interleaved row (no arena) carries them right after its codes.
+    pub fn gather_planes(&self, table_va: u64, block_scales: Option<u64>) -> (u64, usize, usize) {
+        match block_scales {
+            Some(va) => (va, self.packed_stride(), self.scale_stride()),
+            None => (
+                table_va + self.packed_stride() as u64,
+                self.interleaved_stride(),
+                self.interleaved_stride(),
+            ),
+        }
+    }
 }
 
-/// The weight cache must hold packed rows, and the segmented block-scale
-/// arena must be attached: the NVFP4 gather reads both.
+/// The weight cache holds either split rows (codes only, with the segmented
+/// block-scale arena attached) or interleaved rows (codes and scales, no
+/// arena). Any other pairing gathers the wrong bytes.
 pub fn check_packed_stride(stride: usize, spec: &Nvfp4RowGeom, scaled: bool) -> Result<()> {
+    let (want, layout) = if scaled {
+        (spec.packed_stride(), "codes beside the block-scale arena")
+    } else {
+        (
+            spec.interleaved_stride(),
+            "interleaved codes + scales, no arena",
+        )
+    };
     ensure!(
-        scaled,
-        "PLE: NVFP4 n-gram rows need the block-scale arena attached to the \
-         row cache (`attach_segmented_block_scales`)"
-    );
-    ensure!(
-        stride == spec.packed_stride(),
-        "PLE: NVFP4 row stride {stride} != {} packed bytes for {} dims",
-        spec.packed_stride(),
+        stride == want,
+        "PLE: NVFP4 row stride {stride} != {want} ({layout}) for {} dims",
         spec.dim
     );
     Ok(())

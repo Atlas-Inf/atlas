@@ -106,6 +106,9 @@ pub mod expert_tier;
 // primitive as the expert tier.
 #[cfg(feature = "cuda")]
 pub mod ngram_cache;
+// One-time repack of a split-row n-gram table (data + scale planes) into one
+// row-major derived file, so a row-cache miss is one read. Plain file I/O.
+pub mod ngram_pack;
 // RDMA expert staging needs rdma-core (libibverbs), which is Linux-only.
 #[cfg(all(feature = "cuda", unix))]
 pub mod expert_tier_rdma;

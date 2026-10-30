@@ -129,6 +129,11 @@ extern "C" __global__ void batched_embed_fp8(
 // per `group` elements and a per-tensor f32 global. BIT-IDENTICAL to the
 // host decoder `atlas_core::modelopt_codec::nvfp4_rows_to_bf16`:
 // bf16_rne((e2m1 * e4m3) * global) in f32, in exactly that multiply order.
+// `row_stride` / `scale_stride` are the bytes between slots of each plane:
+// dim/2 and dim/group for the split arenas, and the interleaved row's stride
+// for both when `scales` points just past the codes of one packed row
+// (`ATLAS_PLE_PACKED_DIR`, `spark_storage::ngram_pack`). The two planes then
+// share one buffer; both are only read, which `__restrict__` permits.
 //
 // Grid: (num_tokens, 1, 1)  Block: (256, 1, 1)
 __device__ __forceinline__ float ngram_e2m1_decode(unsigned int nib) {
@@ -141,17 +146,19 @@ __device__ __forceinline__ float ngram_e2m1_decode(unsigned int nib) {
 }
 extern "C" __global__ void batched_embed_nvfp4(
     const unsigned int* __restrict__ token_ids,    // [num_tokens] slot ids
-    const unsigned char* __restrict__ packed,      // [slots, dim/2] E2M1 pairs
-    const unsigned char* __restrict__ scales,      // [slots, dim/group] E4M3
+    const unsigned char* __restrict__ packed,      // [slots, row_stride] E2M1 pairs
+    const unsigned char* __restrict__ scales,      // [slots, scale_stride] E4M3
     float global,
     __nv_bfloat16* __restrict__ output,            // [num_tokens, dim]
     unsigned int dim,
-    unsigned int group
+    unsigned int group,
+    unsigned int row_stride,
+    unsigned int scale_stride
 ) {
     const unsigned int token_idx = blockIdx.x;
     const unsigned int slot = token_ids[token_idx];
-    const unsigned char* src = packed + (unsigned long long)slot * (dim / 2);
-    const unsigned char* srow = scales + (unsigned long long)slot * (dim / group);
+    const unsigned char* src = packed + (unsigned long long)slot * row_stride;
+    const unsigned char* srow = scales + (unsigned long long)slot * scale_stride;
     __nv_bfloat16* dst = output + (unsigned long long)token_idx * dim;
     for (unsigned int i = threadIdx.x; i < dim / 2; i += blockDim.x) {
         const unsigned char byte = src[i];

@@ -154,6 +154,8 @@ fn resident_gather_matches_cached_gather() {
         m as u32,
         dim as u32,
         group as u32,
+        row_b as u32,
+        scale_b as u32,
         stream,
     )
     .unwrap();
@@ -178,6 +180,8 @@ fn resident_gather_matches_cached_gather() {
             chunk.len() as u32,
             dim as u32,
             group as u32,
+            row_b as u32,
+            scale_b as u32,
             stream,
         )
         .unwrap();

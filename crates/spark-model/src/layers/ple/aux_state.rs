@@ -203,9 +203,9 @@ impl PleLayer {
         // "the bytes are E4M3" and "there is something to multiply by" from
         // being able to disagree.
         if let Some(nv) = &self.nvfp4 {
-            let scale_va = self
-                .block_scale_va
-                .context("PLE: NVFP4 table without its block-scale arena")?;
+            // `PleLayer::new` checked the cache's stride against its layout.
+            let (scale_va, row_stride, scale_stride) =
+                nv.geom.gather_planes(table_va, self.block_scale_va);
             return ops::batched_embed_nvfp4(
                 gpu,
                 self.embed_nvfp4_k,
@@ -217,6 +217,8 @@ impl PleLayer {
                 (num_tokens * heads) as u32,
                 nv.geom.dim as u32,
                 nv.geom.group as u32,
+                row_stride as u32,
+                scale_stride as u32,
                 stream,
             )
             .context("PLE row gather (nvfp4)");

@@ -2524,6 +2524,7 @@ dependencies = [
  "atlas-core",
  "atlas-rdma",
  "atlas-tier",
+ "crc32fast",
  "cufile-sys",
  "half",
  "io-uring",
