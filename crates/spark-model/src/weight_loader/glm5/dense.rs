@@ -77,10 +77,6 @@ pub(super) fn load_projection(
     Ok(q)
 }
 
-/// Rows the pinned W8A8 kernel is timed at (a prefill pass's height:
-/// `ATLAS_GLM_PREFILL_4096`), as for KDA's W8A8 operands.
-const PIN_REF_ROWS: usize = 4096;
-
 /// FP4-Local's MXFP8 dense MLP at `prefix` (`...mlp`) as native twins
 /// (`ATLAS_GLM_FP4L_DENSE_MXFP8`, `layers::dense_ffn_native`): the whole
 /// (replicated) gate / up `[inter, h]` and down `[h, inter]` copied from the
@@ -136,7 +132,7 @@ pub(super) fn native_dense(
                 // The pinned kernel (as KDA's): no row bucket tuned at load.
                 operands.push(
                     MxW8a8::from_twin(gpu, &twin, shape, 0, stream)?
-                        .pinned_timed(PIN_REF_ROWS, stream),
+                        .pinned_timed(super::kda_mx::PIN_REF_ROWS, stream),
                 );
             }
         }

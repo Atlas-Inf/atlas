@@ -8,7 +8,7 @@ use spark_runtime::weights::{WeightDtype, WeightStore};
 use crate::layers::qwen3_attention::{HcSiteWeights, HcWeights};
 use crate::layers::{Glm5KdaWeights, Glm5Projection};
 use crate::tp_shard::{TpGdnDims, TpShardKind, shard_dense_bf16, shard_gdn_value_vector};
-use crate::weight_map::{DenseWeight, QuantizeCtx, dense_auto, quantize_to_nvfp4};
+use crate::weight_map::{DenseWeight, QuantizeCtx, QuantizedWeight, dense_auto, quantize_to_nvfp4};
 
 pub(super) use super::ffn::load_ffn;
 
@@ -71,6 +71,7 @@ pub(super) fn load_kda_weights(
     let load = |name: &str| dense_auto(store, &format!("{p}.{name}.weight"), gpu);
     let dims = TpGdnDims::from_config(config);
     let p_dim = dims.local_key_dim();
+    let mx_policy = super::kda_mx::KdaMxPolicy::from_env();
     let load_tp_dense =
         |name: &str, n: usize, k: usize, kind: TpShardKind| -> Result<LoadedDense<'_>> {
             let source =
@@ -92,36 +93,73 @@ pub(super) fn load_kda_weights(
                     kind: TpShardKind,
                     transpose_prefill: bool|
      -> Result<Glm5Projection> {
-        let dense = load_tp_dense(name, n, k, kind)?;
-        let local_n = if kind == TpShardKind::ColumnParallel {
-            n / dims.tp_size
-        } else {
-            n
-        };
-        let local_k = if kind == TpShardKind::RowParallel {
-            k / dims.tp_size
-        } else {
-            k
-        };
-        let decode_nvfp4 = quantize_to_nvfp4(
-            &dense.dense,
-            local_n,
-            local_k,
+        // Opt-in: FP4-Local's own MXFP8 bytes as the decode/verify twin
+        // and/or the W8A8 prefill operand (`kda_mx`).
+        let mx = super::kda_mx::kda_twin(
+            mx_policy,
+            store,
+            &format!("{p}.{name}"),
+            [n, k],
+            kind,
+            dims.tp_rank,
+            dims.tp_size,
             gpu,
-            qctx.absmax_k,
-            qctx.quantize_k,
-            qctx.stream,
-        )?;
-        // Quantization synchronizes internally, so the checkpoint-native BF16
-        // source is no longer needed. Releasing it keeps the safe 92% memory
-        // budget viable on GB10 instead of retaining two projection copies.
-        dense.release(gpu)?;
-        let prefill_nvfp4_t = transpose_prefill
-            .then(|| decode_nvfp4.transpose_for_gemm(gpu, local_n, local_k))
-            .transpose()?;
+        )?
+        .unwrap_or_default();
+        if mx.serves_all() {
+            // Decode, verify and prefill all read the MXFP8 twin: no BF16
+            // expansion, no NVFP4 copies.
+            return Ok(Glm5Projection {
+                nvfp4: QuantizedWeight::null(),
+                prefill_nvfp4_t: None,
+                mxfp8: mx.decode,
+                w8a8: mx.w8a8,
+            });
+        }
+        let nvfp4 = || -> Result<(QuantizedWeight, Option<QuantizedWeight>)> {
+            let dense = load_tp_dense(name, n, k, kind)?;
+            let local_n = if kind == TpShardKind::ColumnParallel {
+                n / dims.tp_size
+            } else {
+                n
+            };
+            let local_k = if kind == TpShardKind::RowParallel {
+                k / dims.tp_size
+            } else {
+                k
+            };
+            let decode_nvfp4 = quantize_to_nvfp4(
+                &dense.dense,
+                local_n,
+                local_k,
+                gpu,
+                qctx.absmax_k,
+                qctx.quantize_k,
+                qctx.stream,
+            )?;
+            // Quantization synchronizes internally, so the checkpoint-native BF16
+            // source is no longer needed. Releasing it keeps the safe 92% memory
+            // budget viable on GB10 instead of retaining two projection copies.
+            dense.release(gpu)?;
+            // W8A8 serves every prefill row, so no transposed prefill twin.
+            let prefill_nvfp4_t = (transpose_prefill && mx.w8a8.is_none())
+                .then(|| decode_nvfp4.transpose_for_gemm(gpu, local_n, local_k))
+                .transpose()?;
+            Ok((decode_nvfp4, prefill_nvfp4_t))
+        };
+        let (nvfp4, prefill_nvfp4_t) = match nvfp4() {
+            Ok(built) => built,
+            Err(e) => {
+                // Do not leave the MXFP8 twin behind a failed load.
+                mx.free(gpu)?;
+                return Err(e);
+            }
+        };
         Ok(Glm5Projection {
-            nvfp4: decode_nvfp4,
+            nvfp4,
             prefill_nvfp4_t,
+            mxfp8: mx.decode,
+            w8a8: mx.w8a8,
         })
     };
     let width = config.linear_conv_kernel_dim;

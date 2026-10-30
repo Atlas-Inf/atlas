@@ -179,6 +179,7 @@ fn actual_independent_width_entry() {
         }
     }
     kda::actual_kda_rows();
+    kda::mixed_kda_twins_are_refused();
 }
 
 /// The GLM router (288 experts: a 72-CTA grid) resolves the load-ahead batchm
