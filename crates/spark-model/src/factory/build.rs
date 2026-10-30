@@ -882,11 +882,20 @@ pub fn build_model(
     // free it and NULL the stored pointer so no later fallback can
     // dereference freed memory. Only when the NVFP4 head does not live in
     // that buffer (pre-packed checkpoints) and it is not the tied embedding.
-    let lm_head = if super::lm_head_setup::bf16_lm_head_is_dead(
-        lm_head.weight,
-        lm_head_nvfp4.as_ref(),
-        embed.weight,
-    ) {
+    //
+    // Not when an MTP drafter captured the BF16 head above: `q4e_mtp_lm_head`
+    // and `v4_mtp_lm_head` are copies of this pointer, taken before this point,
+    // and the drafters project with it. Freeing it made Qwen3.8-Flash-Next's
+    // first propose read freed memory under `--lm-head-dtype nvfp4` (#264:
+    // illegal address in run_mtp_propose_multi; the fp8 and bf16 heads never
+    // reach this free, and NUM_DRAFTS=0 never reads the head).
+    let drafter_holds_bf16_head = q4e_mtp_loaded || v4_mtp_module.is_some();
+    let lm_head = if !drafter_holds_bf16_head
+        && super::lm_head_setup::bf16_lm_head_is_dead(
+            lm_head.weight,
+            lm_head_nvfp4.as_ref(),
+            embed.weight,
+        ) {
         if let Err(e) = gpu.free(lm_head.weight) {
             tracing::warn!("lm_head BF16 intermediate free failed: {e}");
         }
