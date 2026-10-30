@@ -138,9 +138,7 @@ fn an_over_cap_image_is_refused_through_prepare_chat_prompt_with_vision_too_larg
     req.messages = vec![ir::Message {
         role: ir::Role::User,
         content: vec![ir::ContentPart::Image(ir::message::ImageSource {
-            data: ir::ImageData::Base64(
-                format!("data:image/png;base64,{}", base64_encode(&ihdr)).into(),
-            ),
+            data: ir::ImageData::Base64(format!("data:image/png;base64,{}", base64_encode(&ihdr))),
         })],
         tool_calls: vec![],
         tool_call_id: None,
