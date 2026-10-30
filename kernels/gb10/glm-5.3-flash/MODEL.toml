@@ -69,6 +69,10 @@ enable_loop_watchdog = false
 enable_stream_loop_guards = false
 default_num_drafts = 0
 default_kv_dtype = "bf16"
+# SparkGLM 0.2.0 tells the model when it repeats an identical tool round
+# and keeps `<tool_call>` unmasked there (production applied this to every
+# model; here it is the [behavior] key).
+tool_repeat_notice = true
 
 # These optional lookups were harvested from an EP=2 boot audit on two DGX
 # Sparks. Both ranks reported the same 33 unresolved probes; the 2026-09-28
