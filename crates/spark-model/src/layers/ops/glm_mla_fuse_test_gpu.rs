@@ -95,6 +95,7 @@ fn mx(gpu: &dyn GpuBackend, rng: &mut Rng, n: u32) -> Result<(DevicePtr, DeviceP
 
 /// The layer's weights, shared by both runs.
 struct Weights {
+    fp8_block: bool,
     q_a: (DevicePtr, DevicePtr),
     kv_a: (DevicePtr, DevicePtr),
     wk: DevicePtr,
@@ -107,10 +108,12 @@ struct Weights {
 }
 
 impl Weights {
-    fn new(gpu: &dyn GpuBackend, rng: &mut Rng) -> Result<Self> {
+    fn new(gpu: &dyn GpuBackend, rng: &mut Rng, fp8_block: bool) -> Result<Self> {
+        let weight = if fp8_block { native::weight } else { mx };
         Ok(Self {
-            q_a: mx(gpu, rng, QL)?,
-            kv_a: mx(gpu, rng, KVL)?,
+            fp8_block,
+            q_a: weight(gpu, rng, QL)?,
+            kv_a: weight(gpu, rng, KVL)?,
             wk: upload(gpu, &bf16_bytes((ID * H) as usize, rng, 0.02, 0.0))?,
             gate: upload(gpu, &bf16_bytes((ID * H) as usize, rng, 0.02, 0.0))?,
             q_norm: upload(gpu, &bf16_bytes(QL as usize, rng, 0.25, 1.0))?,
@@ -301,6 +304,7 @@ fn fused(
         n,
     };
     let down = DownArgs {
+        fp8_block: w.fp8_block,
         input,
         rows,
         k: H,
@@ -351,11 +355,15 @@ fn fused(
 #[test]
 #[ignore = "needs a GB10 and the glm-5.3-flash kernels"]
 fn fused_front_matches_the_twelve_launches() -> Result<()> {
+    compare_front(false)
+}
+
+fn compare_front(fp8_block: bool) -> Result<()> {
     let gpu = backend()?;
     let f = MlaFuse::load(gpu).context("glm_mla_fuse kernels")?;
     let s = gpu.default_stream();
     let mut rng = Rng(0x6d6c_6166_7573_6501);
-    let w = Weights::new(gpu, &mut rng)?;
+    let w = Weights::new(gpu, &mut rng, fp8_block)?;
     let owners = [
         ShardRank { rank: 0, world: 1 },
         ShardRank { rank: 0, world: 2 },
@@ -413,3 +421,6 @@ fn fused_front_matches_the_twelve_launches() -> Result<()> {
     );
     Ok(())
 }
+
+#[path = "glm_mla_fuse_test_native.rs"]
+mod native;

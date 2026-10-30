@@ -48,7 +48,7 @@
 // The indexer's key and gate CTAs, then q_a's, then kv_a's (16 output rows
 // each). `wk` / `wg` are BF16 [ni, K]; q_a / kv_a MXFP8 values [n, K] and
 // E8M0 scales [n, K/32].
-template <int NT>
+template <int NT, bool B128 = false>
 __device__ __forceinline__ void glm_mla_down_fuse_impl(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ wk,
     const unsigned char* __restrict__ wg, const unsigned char* __restrict__ wqa,
@@ -68,10 +68,10 @@ __device__ __forceinline__ void glm_mla_down_fuse_impl(
     }
     b -= 2u * ic;
     if (b < qc) {
-        mxfp8_gemv_tc_cta<NT>(A, wqa, sqa, q_out, M, nq, K, K, nq, b);
+        mxfp8_gemv_tc_cta<NT, false, B128>(A, wqa, sqa, q_out, M, nq, K, K, nq, b);
         return;
     }
-    mxfp8_gemv_tc_cta<NT>(A, wkva, skva, kv_out, M, nkv, K, K, nkv, b - qc);
+    mxfp8_gemv_tc_cta<NT, false, B128>(A, wkva, skva, kv_out, M, nkv, K, K, nkv, b - qc);
 }
 
 // This CTA's (projection, CTA within it, touching CTAs of it) for
@@ -95,7 +95,7 @@ __device__ __forceinline__ GlmMlaDownRole glm_mla_down_role(
 // ceil(nq/16) + ceil(nkv/16), 1, 1), block (256, 1, 1). `_tc{8,16,32}` take
 // up to 8, 16 and 32 rows, the activation tiles (NT) of the canonical tiers
 // the four launches ran at that row count.
-template <int NT>
+template <int NT, bool B128 = false>
 __device__ __forceinline__ void glm_mla_down_fuse_entry(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ wk,
     const unsigned char* __restrict__ wg, const unsigned char* __restrict__ wqa,
@@ -111,7 +111,7 @@ __device__ __forceinline__ void glm_mla_down_fuse_entry(
                               {wkva, touch_kva, 0ull}, {skva, touch_skva, 0ull},
                               {wk, touch_wk, 0ull}, {wg, touch_wg, 0ull}, 1u,
                               glm_mla_down_role(ni, nq, nkv, touch_ctas));
-    glm_mla_down_fuse_impl<NT>(A, wk, wg, wqa, sqa, wkva, skva, keys, gates, q_out, kv_out, M, K,
+    glm_mla_down_fuse_impl<NT, B128>(A, wk, wg, wqa, sqa, wkva, skva, keys, gates, q_out, kv_out, M, K,
                                ni, nq, nkv);
 }
 
@@ -159,6 +159,55 @@ extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE) glm_mla_do
     unsigned int touch_wg, unsigned int touch_ctas
 ) {
     glm_mla_down_fuse_entry<4>(A, wk, wg, wqa, sqa, wkva, skva, keys, gates, q_out, kv_out, M, K,
+                               ni, nq, nkv, touch_qa, touch_sqa, touch_kva, touch_skva, touch_wk,
+                               touch_wg, touch_ctas);
+}
+
+// Native E4M3 weights with FP32 128x128 block scales; identical CTA arithmetic.
+extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE) glm_mla_down_fuse_fp8b_tc8(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ wk,
+    const unsigned char* __restrict__ wg, const unsigned char* __restrict__ wqa,
+    const unsigned char* __restrict__ sqa, const unsigned char* __restrict__ wkva,
+    const unsigned char* __restrict__ skva, __nv_bfloat16* __restrict__ keys,
+    __nv_bfloat16* __restrict__ gates, __nv_bfloat16* __restrict__ q_out,
+    __nv_bfloat16* __restrict__ kv_out, unsigned int M, unsigned int K, unsigned int ni,
+    unsigned int nq, unsigned int nkv, unsigned int touch_qa, unsigned int touch_sqa,
+    unsigned int touch_kva, unsigned int touch_skva, unsigned int touch_wk,
+    unsigned int touch_wg, unsigned int touch_ctas
+) {
+    glm_mla_down_fuse_entry<1, true>(A, wk, wg, wqa, sqa, wkva, skva, keys, gates, q_out, kv_out, M, K,
+                               ni, nq, nkv, touch_qa, touch_sqa, touch_kva, touch_skva, touch_wk,
+                               touch_wg, touch_ctas);
+}
+
+extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE) glm_mla_down_fuse_fp8b_tc16(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ wk,
+    const unsigned char* __restrict__ wg, const unsigned char* __restrict__ wqa,
+    const unsigned char* __restrict__ sqa, const unsigned char* __restrict__ wkva,
+    const unsigned char* __restrict__ skva, __nv_bfloat16* __restrict__ keys,
+    __nv_bfloat16* __restrict__ gates, __nv_bfloat16* __restrict__ q_out,
+    __nv_bfloat16* __restrict__ kv_out, unsigned int M, unsigned int K, unsigned int ni,
+    unsigned int nq, unsigned int nkv, unsigned int touch_qa, unsigned int touch_sqa,
+    unsigned int touch_kva, unsigned int touch_skva, unsigned int touch_wk,
+    unsigned int touch_wg, unsigned int touch_ctas
+) {
+    glm_mla_down_fuse_entry<2, true>(A, wk, wg, wqa, sqa, wkva, skva, keys, gates, q_out, kv_out, M, K,
+                               ni, nq, nkv, touch_qa, touch_sqa, touch_kva, touch_skva, touch_wk,
+                               touch_wg, touch_ctas);
+}
+
+extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE) glm_mla_down_fuse_fp8b_tc32(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ wk,
+    const unsigned char* __restrict__ wg, const unsigned char* __restrict__ wqa,
+    const unsigned char* __restrict__ sqa, const unsigned char* __restrict__ wkva,
+    const unsigned char* __restrict__ skva, __nv_bfloat16* __restrict__ keys,
+    __nv_bfloat16* __restrict__ gates, __nv_bfloat16* __restrict__ q_out,
+    __nv_bfloat16* __restrict__ kv_out, unsigned int M, unsigned int K, unsigned int ni,
+    unsigned int nq, unsigned int nkv, unsigned int touch_qa, unsigned int touch_sqa,
+    unsigned int touch_kva, unsigned int touch_skva, unsigned int touch_wk,
+    unsigned int touch_wg, unsigned int touch_ctas
+) {
+    glm_mla_down_fuse_entry<4, true>(A, wk, wg, wqa, sqa, wkva, skva, keys, gates, q_out, kv_out, M, K,
                                ni, nq, nkv, touch_qa, touch_sqa, touch_kva, touch_skva, touch_wk,
                                touch_wg, touch_ctas);
 }

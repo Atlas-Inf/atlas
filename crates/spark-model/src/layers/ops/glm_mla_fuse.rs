@@ -56,6 +56,7 @@ pub fn glm_mla_fuse_requested() -> Result<bool> {
 #[derive(Clone, Copy, Debug)]
 pub struct MlaFuse {
     down: [KernelHandle; 3],
+    down_fp8b: [KernelHandle; 3],
     mid: KernelHandle,
 }
 
@@ -87,9 +88,21 @@ impl MlaFuse {
                 "glm_mla_down_fuse_tc32",
             ]
             .map(kernel),
+            down_fp8b: [
+                "glm_mla_down_fuse_fp8b_tc8",
+                "glm_mla_down_fuse_fp8b_tc16",
+                "glm_mla_down_fuse_fp8b_tc32",
+            ]
+            .map(kernel),
             mid: kernel("glm_mla_mid_fuse"),
         };
-        (this.mid.0 != 0 && this.down.iter().all(|k| k.0 != 0)).then_some(this)
+        (this.mid.0 != 0
+            && this
+                .down
+                .iter()
+                .chain(this.down_fp8b.iter())
+                .all(|k| k.0 != 0))
+        .then_some(this)
     }
 }
 
@@ -106,7 +119,8 @@ pub fn initialize_glm_mla_fuse(
     Ok(())
 }
 
-/// One MXFP8 projection: values `[n, k]` and E8M0 scales `[n, k / 32]`.
+/// One row-major FP8 projection. Scales are E8M0 per 32 values for MXFP8,
+/// or FP32 per 128x128 block when `DownArgs::fp8_block` is true.
 #[derive(Clone, Copy, Debug)]
 pub struct MxProj {
     pub data: DevicePtr,
@@ -121,6 +135,7 @@ pub struct MxProj {
 /// geometry ([`super::GemvTouch`]), or `None` for no touch.
 #[derive(Clone, Copy, Debug)]
 pub struct DownArgs {
+    pub fp8_block: bool,
     pub input: DevicePtr,
     pub rows: u32,
     pub k: u32,
@@ -139,11 +154,18 @@ pub struct DownArgs {
 /// within `budget` bytes in all.
 fn touch_bytes(a: &DownArgs, budget: u64) -> [u32; 6] {
     let k = u64::from(a.k);
+    let scales = |n: u32| {
+        if a.fp8_block {
+            u64::from(n.div_ceil(128)) * k.div_ceil(128) * 4
+        } else {
+            u64::from(n) * k / 32
+        }
+    };
     let sizes = [
         u64::from(a.q_a.n) * k,
-        u64::from(a.q_a.n) * k / 32,
+        scales(a.q_a.n),
         u64::from(a.kv_a.n) * k,
-        u64::from(a.kv_a.n) * k / 32,
+        scales(a.kv_a.n),
         u64::from(a.ni) * k * 2,
         u64::from(a.ni) * k * 2,
     ];
@@ -202,7 +224,7 @@ impl MlaFuse {
     pub fn launch_down(&self, gpu: &dyn GpuBackend, a: &DownArgs, stream: u64) -> Result<()> {
         ensure!(
             (1..=MLA_FUSE_MAX_ROWS).contains(&a.rows)
-                && a.k.is_multiple_of(64)
+                && a.k.is_multiple_of(if a.fp8_block { 128 } else { 64 })
                 && a.ni.is_multiple_of(16)
                 && a.q_a.n.is_multiple_of(16)
                 && a.kv_a.n.is_multiple_of(16),
@@ -221,7 +243,13 @@ impl MlaFuse {
         let (budget, ctas) = a.touch.unwrap_or((0, 1));
         let touch = touch_bytes(a, budget);
         let grid = 2 * div_ceil(a.ni, 16) + div_ceil(a.q_a.n, 16) + div_ceil(a.kv_a.n, 16);
-        let mut launch = KernelLaunch::new(gpu, self.down[tier])
+        let kernel = if a.fp8_block {
+            self.down_fp8b[tier]
+        } else {
+            self.down[tier]
+        };
+        ensure!(kernel.0 != 0, "fused GLM MLA native FP8 kernel unavailable");
+        let mut launch = KernelLaunch::new(gpu, kernel)
             .grid([grid, 1, 1])
             .block([256, 1, 1])
             .arg_ptr(a.input)
@@ -331,7 +359,8 @@ mod tests {
             out: DevicePtr::NULL,
             n,
         };
-        let a = DownArgs {
+        let mut a = DownArgs {
+            fp8_block: false,
             input: DevicePtr::NULL,
             rows: 3,
             k: 4096,
@@ -358,6 +387,21 @@ mod tests {
         let budget = 1536 * 4096 + 1000;
         assert_eq!(touch_bytes(&a, budget), [1536 * 4096, 1000, 0, 0, 0, 0]);
         assert_eq!(touch_bytes(&a, 0), [0; 6]);
+        a.fp8_block = true;
+        assert_eq!(
+            touch_bytes(&a, 12 << 20),
+            [
+                1536 * 4096,
+                12 * 32 * 4,
+                512 * 4096,
+                4 * 32 * 4,
+                128 * 8192,
+                128 * 8192
+            ]
+        );
+        // Native scales have a final partial 128-row block at other shapes.
+        a.kv_a.n = 528;
+        assert_eq!(touch_bytes(&a, 12 << 20)[3], 5 * 32 * 4);
     }
 }
 

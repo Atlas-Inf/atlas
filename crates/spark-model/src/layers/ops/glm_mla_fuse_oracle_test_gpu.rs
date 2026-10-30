@@ -22,7 +22,12 @@ pub(super) fn unfused(
         9..=16 => "16",
         _ => "32",
     };
-    let mxk = kernel(gpu, "mxfp8_gemv", &format!("mxfp8_gemv_tc{}", tier(rows)))?;
+    let family = if w.fp8_block { "fp8b" } else { "mxfp8" };
+    let mxk = kernel(
+        gpu,
+        "mxfp8_gemv",
+        &format!("{family}_gemv_tc{}", tier(rows)),
+    )?;
     let dk = kernel(
         gpu,
         "dense_gemv_bf16_batchm",
@@ -31,9 +36,14 @@ pub(super) fn unfused(
     let norm = kernel(gpu, "glm_rms_norm_regs", "rms_norm_vanilla_regs")?;
     let idx = |name| kernel(gpu, "glm_indexer", name);
     let dw = |weight| DenseWeight { weight };
-    ops::mxfp8_gemv(gpu, mxk, input, w.q_a.0, w.q_a.1, run.q, rows, QL, H, QL, s)?;
+    let gemv = if w.fp8_block {
+        native::gemv
+    } else {
+        ops::mxfp8_gemv
+    };
+    gemv(gpu, mxk, input, w.q_a.0, w.q_a.1, run.q, rows, QL, H, QL, s)?;
     ops::rms_norm(gpu, norm, run.q, &dw(w.q_norm), run.q, rows, QL, 1e-6, s)?;
-    ops::mxfp8_gemv(
+    gemv(
         gpu, mxk, input, w.kv_a.0, w.kv_a.1, run.kv, rows, KVL, H, KVL, s,
     )?;
     ops::rms_norm(

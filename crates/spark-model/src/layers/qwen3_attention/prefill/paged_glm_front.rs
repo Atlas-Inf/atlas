@@ -165,7 +165,7 @@ impl Qwen3AttentionLayer {
 
     /// The fused front ([`ops::MlaFuse`]) where it applies: a canonical
     /// verify block of at most `MLA_FUSE_MAX_ROWS` rows with nothing below
-    /// the write floor, the MXFP8 q_a / kv_a and BF16 index projections the
+    /// the write floor, the MXFP8 or native FP8 q_a / kv_a and BF16 index projections the
     /// canonical path would run, an fp8_g128 latent cache and the BF16
     /// four-token semantic index. Returns whether it localized the owner.
     fn glm_front_fused(
@@ -196,13 +196,38 @@ impl Qwen3AttentionLayer {
                 && s.head_dim == ctx.config.index_head_dim
                 && index_dim == 128
         });
-        let (Some(Some(q_a)), Some(Some(kv_a)), Some(None), Some(None)) = (
-            mx(&mla.wq_a),
-            mx(&mla.wkv_a),
-            mx(&indexer.wk),
-            mx(&indexer.kpool_gate),
-        ) else {
+        if !matches!(
+            (mx(&indexer.wk), mx(&indexer.kpool_gate)),
+            (Some(None), Some(None))
+        ) || self.mla_is_native(&indexer.wk)
+            || self.mla_is_native(&indexer.kpool_gate)
+        {
             return Ok(None);
+        }
+        // ATLAS_GLM_FP4L_MLA_FP8: native q_a / kv_a through the FP8 block body.
+        let native = (
+            self.mla_native_twin(mla.wq_a.weight),
+            self.mla_native_twin(mla.wkv_a.weight),
+        );
+        let (qa_data, qa_scales, kva_data, kva_scales, fp8_block) = match native {
+            (Some((q_shape, q)), Some((kv_shape, kv)))
+                if matches!(ctx.config.tp_world_size, 2 | 4)
+                    && ctx.config.ep_world_size == ctx.config.tp_world_size
+                    && !q.tiled
+                    && !kv.tiled
+                    && args.h.is_multiple_of(128)
+                    && q_shape == [mla.q_lora_rank, args.h as usize]
+                    && kv_shape == [mla.kv_lora_rank, args.h as usize] =>
+            {
+                (q.data, q.scales, kv.data, kv.scales, true)
+            }
+            (None, None) => match (mx(&mla.wq_a), mx(&mla.wkv_a)) {
+                (Some(Some(q)), Some(Some(kv))) if !q.tiled && !kv.tiled => {
+                    (q.data, q.scales, kv.data, kv.scales, false)
+                }
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
         };
         let n = args.n;
         if !(ctx.config.model_type == "glm5_next"
@@ -221,14 +246,11 @@ impl Qwen3AttentionLayer {
         let (q_latent, kv_latent) = (ctx.buffers.ssm_ba(), ctx.buffers.expert_gate_out());
         let keys = ctx.buffers.ssm_qkvz();
         let gates = keys.offset(n as usize * index_dim as usize * 2);
-        let proj = |w: crate::weight_map::Mxfp8Weight, out, rows: usize| {
-            debug_assert!(!w.tiled, "the fused front reads row-major q_a / kv_a twins");
-            ops::MxProj {
-                data: w.data,
-                scales: w.scales,
-                out,
-                n: rows as u32,
-            }
+        let proj = |data, scales, out, rows: usize| ops::MxProj {
+            data,
+            scales,
+            out,
+            n: rows as u32,
         };
         // The q_a / kv_a touch twins' geometry, where they ran (<= 16 rows).
         let touch = (n <= 16)
@@ -236,6 +258,7 @@ impl Qwen3AttentionLayer {
             .flatten()
             .map(|t| (t.bytes, t.ctas));
         let down = ops::DownArgs {
+            fp8_block,
             input: args.normed,
             rows: n,
             k: args.h,
@@ -244,8 +267,8 @@ impl Qwen3AttentionLayer {
             keys,
             gates,
             ni: index_dim,
-            q_a: proj(q_a, q_latent, mla.q_lora_rank),
-            kv_a: proj(kv_a, kv_latent, mla.kv_lora_rank),
+            q_a: proj(qa_data, qa_scales, q_latent, mla.q_lora_rank),
+            kv_a: proj(kva_data, kva_scales, kv_latent, mla.kv_lora_rank),
             touch,
         };
         let shard = kv_cache.latent_shard();
