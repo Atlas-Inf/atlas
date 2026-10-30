@@ -64,6 +64,11 @@ impl TransformerModel {
             stream
         };
         self.stamp_overlay_route(seq.adapter_slot);
+        // Chunk 0 keys a vision prompt for the prefix cache (`vision_cache`);
+        // a retried chunk 0 keeps the key its lookup used.
+        if chunk_start == 0 && !seq.prefix_lookup_applied {
+            self.stamp_vision_cache_key(tokens, seq);
+        }
 
         (|| {
             let logits = self.prefill_chunk_dispatch(

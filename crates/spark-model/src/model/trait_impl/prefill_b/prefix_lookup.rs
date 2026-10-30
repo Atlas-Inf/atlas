@@ -47,7 +47,11 @@ impl TransformerModel {
             let reserved = reserved_match.is_some();
             // ATLAS_GLM_DET_TRACE=1 traces every request as a full recompute.
             let det_recompute = crate::det_trace::begin_request(seq.slot_idx);
-            let mut prefix_match = if self.tokens_have_vision_pad(tokens)
+            // The radix sees the vision-keyed prompt (`vision_cache`); a
+            // placeholder the key does not cover keeps the prompt uncached.
+            let key = self.pc_key(seq, tokens);
+            let key_tokens: &[u32] = key.as_deref().unwrap_or(tokens);
+            let mut prefix_match = if key.is_none()
                 || seq.collect_prompt_logprobs.is_some()
                 || self.mla_prefill_needs_full_recompute()
                 || (det_recompute && !reserved)
@@ -58,9 +62,13 @@ impl TransformerModel {
             } else {
                 // NVMe spill tier: page the on-disk continuation back in so
                 // the resident-only lookup below sees it (no-op when off).
-                self.nvme_restore_prefix(tokens, seq, kv_cache, stream);
-                self.prefix_cache
-                    .lookup_whole_blocks(tokens, bs, seq.session_hash, seq.adapter_id)
+                self.nvme_restore_prefix(key_tokens, seq, kv_cache, stream);
+                self.prefix_cache.lookup_whole_blocks(
+                    key_tokens,
+                    bs,
+                    seq.session_hash,
+                    seq.adapter_id,
+                )
             };
             // F83 (2026-04-30): on EP>1, head and worker have
             // independent local prefix caches whose match counts can
@@ -91,7 +99,7 @@ impl TransformerModel {
                 if agreed < prefix_match.matched_tokens {
                     prefix_match = cap_prefix_match(
                         self.prefix_cache.as_ref(),
-                        tokens,
+                        key_tokens,
                         bs,
                         seq.session_hash,
                         seq.adapter_id,
@@ -115,7 +123,7 @@ impl TransformerModel {
             // and the block pool progressively wedges). Cleared on the no-match
             // path so a later cache-less turn on the same seq doesn't over-release.
             if matched > 0 {
-                seq.prefix_ref_tokens = tokens[..matched].to_vec();
+                seq.prefix_ref_tokens = key_tokens[..matched].to_vec();
             } else {
                 seq.prefix_ref_tokens.clear();
             }
@@ -154,7 +162,7 @@ impl TransformerModel {
             // Multi-rank + ATLAS_GLM_PC_EVICT/BRANCH: every rank restores at
             // one agreed depth or none does (`pc_policy`). Otherwise unchanged.
             let (eff_snapshot, eff_snapshot_tokens, eff_is_tail) = self.pc_agree_restore(
-                tokens,
+                key_tokens,
                 seq,
                 &prefix_match,
                 matched,
@@ -381,13 +389,13 @@ impl TransformerModel {
             };
             // ATLAS_GLM_NVME_KEEP: kept records of the blocks this pass
             // recomputes in place are stale from here on (no-op otherwise).
-            self.nvme_forget_rewritten(tokens, seq.adapter_id, skip_tokens, matched, bs);
-            self.pc_plan_branch(tokens, seq, matched, skip_tokens, bs)?;
-            self.finish_leaf_restored(tokens, seq, skip_tokens, bs, stream)?;
+            self.nvme_forget_rewritten(key_tokens, seq.adapter_id, skip_tokens, matched, bs);
+            self.pc_plan_branch(key_tokens, seq, matched, skip_tokens, bs)?;
+            self.finish_leaf_restored(key_tokens, seq, skip_tokens, bs, stream)?;
             // ATLAS_DFLASH_WARM_CTX (Enntity/atlas 5573f4d5): where the
             // drafter's window may start, and its stored rows under the
             // restore point.
-            self.dflash_warm_begin(seq, Some(tokens), skip_tokens, total, stream)?;
+            self.dflash_warm_begin(seq, key.as_deref(), skip_tokens, total, stream)?;
             // Encode the vision items this prefill computes (`vision_cache`).
             self.vision_resolve_deferred(
                 seq,

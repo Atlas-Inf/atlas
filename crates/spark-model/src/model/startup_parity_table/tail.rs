@@ -107,6 +107,12 @@ pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_PREFILL_W4A4", || {
         Ok(crate::layers::moe::w4a4_requested() as u64)
     }),
+    // Vision prompts keyed for the prefix cache (`vision_cache`): a rank
+    // without the key neither looks up nor inserts a vision prompt, so the
+    // ranks' radix walks and checkpoint inserts part.
+    ("ATLAS_VISION_PREFIX_CACHE", || {
+        Ok(crate::model::vision_cache::switch_on() as u64)
+    }),
     ("ATLAS_SSM_SAVE_DUMP", || {
         Ok(graph_flags::ssm_save_dump() as u64)
     }),

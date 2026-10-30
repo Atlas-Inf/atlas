@@ -267,3 +267,99 @@ fn a_head_without_pixels_fails_instead_of_splicing_stale_rows() {
         assert_eq!(f.seq.vision.rows_encoded, 0);
     }
 }
+
+#[test]
+fn every_tower_keys_its_vision_prompts_for_the_prefix_cache() {
+    // The key is content hashes over the placeholder runs, and every MRoPE
+    // walker positions a prefill that starts after a cached image from the
+    // whole prompt: nothing about it is GLM's. A Qwen image prompt was
+    // uncached (every turn of a 75K-token conversation re-prefilled ~22 s).
+    let (mut f, tokens) = staged();
+    let mut qwen = test_tower::config();
+    qwen.is_glm5_next = false;
+    f.model.config.vision = Some(qwen);
+    f.model.prefix_cache = Box::new(spark_runtime::radix_tree::RadixTree::new());
+    f.model.stamp_vision_cache_key(&tokens, &mut f.seq);
+    assert_eq!(f.seq.vision_cache_key.len(), tokens.len());
+    let key = f
+        .model
+        .pc_key(&f.seq, &tokens)
+        .expect("the prompt is cacheable");
+    assert_eq!(key[..4], tokens[..4], "text before the image keys as text");
+    assert!(key[4..68].iter().all(|&k| k != PAD && k & (1 << 31) != 0));
+    assert_eq!(key[68..], tokens[68..]);
+}
+
+#[test]
+fn a_placeholder_the_key_does_not_cover_is_never_cached() {
+    // A prompt with more placeholders than its items have rows (a pasted
+    // `<|image_pad|>` string) cannot be keyed: it neither looks up nor
+    // inserts, as every vision prompt did before.
+    let (mut f, mut tokens) = staged();
+    f.model.prefix_cache = Box::new(spark_runtime::radix_tree::RadixTree::new());
+    tokens.push(PAD);
+    f.model.stamp_vision_cache_key(&tokens, &mut f.seq);
+    assert!(f.seq.vision_cache_key.is_empty());
+    assert!(f.model.pc_key(&f.seq, &tokens).is_none());
+    // Text alone is its own key, keyed or not.
+    assert_eq!(
+        f.model.pc_key(&f.seq, &tokens[..4]).as_deref(),
+        Some(&tokens[..4])
+    );
+}
+
+#[test]
+fn a_vision_sequence_releases_its_prompt_not_its_reply() {
+    // Its reply is never cached (decode positions differ from a re-prefill's
+    // MRoPE positions), so the radix references it holds when freed are its
+    // prompt's, in key form. Releasing over the reply would drop references
+    // it never took from a node another request's prompt put on the same
+    // key and tokens (the next turn re-sending this reply).
+    let (mut f, tokens) = staged();
+    f.model.prefix_cache = Box::new(spark_runtime::radix_tree::RadixTree::new());
+    f.model.stamp_vision_cache_key(&tokens, &mut f.seq);
+    let key = f.seq.vision_cache_key.clone();
+    f.seq.prompt_len = tokens.len();
+    f.seq.tokens = tokens.iter().copied().chain([9, 10, 11]).collect();
+    assert_eq!(&*f.model.radix_held_tokens(&f.seq), &key[..]);
+}
+
+#[test]
+fn a_cache_hit_encodes_only_what_the_prefill_computes() {
+    // The image (64 rows, pads 4..68) lies wholly in a cached prefix of 68:
+    // the hit skips the ViT and the computed tail needs no rows.
+    let (mut f, tokens) = staged();
+    f.order();
+    f.model
+        .vision_resolve_deferred(&mut f.seq, &tokens, 68, tokens.len(), CALLER)
+        .unwrap();
+    // An encode drains the prefill stream before it writes `buf_out`.
+    assert!(!f.order().contains(&Order::Sync(CALLER)), "nothing encoded");
+    assert_eq!((f.seq.vision.skip_rows, f.seq.vision.rows_encoded), (64, 0));
+    let hidden = f.model.buffers.hidden_states();
+    f.model
+        .splice_vision_rows(&f.seq, &tokens, 68, 4, hidden, CALLER)
+        .unwrap();
+
+    // A prefix ending inside the image (40): the image is encoded whole and
+    // the computed pads 40..68 read its own rows 36..64.
+    let (mut f, tokens) = staged();
+    f.model
+        .vision_resolve_deferred(&mut f.seq, &tokens, 40, tokens.len(), CALLER)
+        .unwrap();
+    assert_eq!((f.seq.vision.skip_rows, f.seq.vision.rows_encoded), (0, 64));
+    let plan = crate::model::trait_impl::prefill_b::embed_chunk::vision_splice_plan(
+        &tokens,
+        40,
+        tokens.len() - 40,
+        |t| t == PAD,
+        0,
+        0,
+        40,
+        f.seq.vision.rows_base,
+        f.seq.vision.rows_encoded,
+    )
+    .unwrap();
+    let rows: Vec<usize> = plan.iter().map(|&(_, row)| row).collect();
+    assert_eq!(rows, (36..64).collect::<Vec<_>>());
+}

@@ -380,6 +380,7 @@ fn the_table_carries_each_setting_once() {
         "ATLAS_QWEN4EXP_PREFILL_W8A8",
         "ATLAS_QWEN4EXP_MXFP8_SHARED",
         "ATLAS_QWEN4EXP_PREFILL_W4A4",
+        "ATLAS_VISION_PREFIX_CACHE",
     ] {
         assert_eq!(
             names.iter().filter(|&&n| n == required).count(),

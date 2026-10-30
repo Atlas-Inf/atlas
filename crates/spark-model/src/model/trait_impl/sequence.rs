@@ -61,7 +61,10 @@ impl TransformerModel {
             // off): the manual inc_ref below would never get a paired dec_ref
             // from cache eviction, leaking the seq's blocks every request.
             // Also skip on HSS-slid (front of block_table no longer parallels
-            // tokens) and vision prompts — both handled by the guard below.
+            // tokens) and vision prompts — both handled by the guard below. A
+            // keyed vision prompt is already cached by its prefill; its reply
+            // is not, because decode positions differ from a re-prefill's
+            // MRoPE positions (`vision_cache`).
             if self.prefix_cache.is_active()
                 && !self.tokens_have_vision_pad(&seq.tokens)
                 && seq.hss_window_start() == 0
@@ -206,7 +209,7 @@ impl TransformerModel {
         // Release prefix cache refs before freeing blocks.
         // (i.e., blocks not shared with the prefix cache).
         self.prefix_cache.release(
-            self.radix_held_tokens(seq),
+            &self.radix_held_tokens(seq),
             self.kv_cache.lock().block_size(),
             seq.adapter_id,
         );

@@ -1,6 +1,37 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Per-sequence vision state and the per-chunk vision encode.
+//! Prefix caching for vision prompts (issue #58), per-sequence vision state
+//! and the per-chunk vision encode.
+//!
+//! # Keys
+//!
+//! Every image of a prompt is the same run of placeholder tokens, so the radix
+//! tree cannot be keyed on the prompt as the model sees it. At chunk 0 each
+//! rank stamps `SequenceState::vision_cache_key`: the prompt with every
+//! placeholder replaced by an id derived from its item's content hash and its
+//! index in the item ([`vision_cache_key`]). Every prefix-cache call takes its
+//! tokens through [`TransformerModel::pc_key`]; embedding, the splice, MRoPE
+//! and the drafters keep reading the real tokens. The head computes the hashes
+//! (`VisionItem::content_hash`) and sends them with the grids
+//! (`EP_CMD_VISION_STATE`), so a worker rebuilds the same key and its radix
+//! walk agrees with the head's before the EP min-sync.
+//!
+//! Every tower's prompts are keyed. Every MRoPE walker rebuilds positions from
+//! the complete prompt (`mrope_pos::walk_rows`), so a prefill that starts
+//! after a cached image positions the rest exactly as a full one would. A
+//! cache path of its own (qwen4_exp's in-pass checkpoints) must register
+//! under the key too (`pc_key`), or skip the prompt; a path that still tests
+//! the raw tokens for placeholders skips every vision prompt, as before.
+//!
+//! The generated tokens of a vision sequence are not cached: decode writes
+//! them at linear positions while a prefill of the same text writes the
+//! compressed MRoPE positions, so their KV would not equal a recompute.
+//! A next turn reuses the previous prompt and re-prefills the reply.
+//!
+//! `ATLAS_VISION_PREFIX_CACHE=0` turns the keys off: vision prompts then
+//! neither look up nor insert. It only matters with the prefix cache on
+//! (`--enable-prefix-caching`), and both ranks must agree on it
+//! (`startup_parity`).
 //!
 //! # Encoding only what the prefill computes
 //!
@@ -18,12 +49,23 @@
 //! scratch: an encode first drains the prefill stream, whose queued splice
 //! may still be reading the previous chunk's rows.
 
+use std::borrow::Cow;
+use std::sync::OnceLock;
+
 use anyhow::Result;
+use spark_runtime::prefix_cache::vision_key::vision_cache_key;
 
 use super::types::TransformerModel;
 use crate::VisionItem;
 use crate::request_local::request_local;
 use crate::traits::SequenceState;
+
+/// `ATLAS_VISION_PREFIX_CACHE` (default on; `0` turns vision prefix caching
+/// off, as before). Read once.
+pub(crate) fn switch_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_VISION_PREFIX_CACHE").as_deref() != Ok("0"))
+}
 
 #[path = "vision_cache_items.rs"]
 mod items;
@@ -64,6 +106,64 @@ fn item_rows(seq: &SequenceState) -> Vec<usize> {
 }
 
 impl TransformerModel {
+    /// Whether vision prompts are keyed for the prefix cache (module docs).
+    pub(super) fn vision_prefix_cache_ok(&self) -> bool {
+        self.prefix_cache.is_active() && self.vision_encoder.is_some() && switch_on()
+    }
+
+    /// Stamp `seq`'s cache key from the sequence's own vision state. Chunk 0
+    /// only; a prompt without placeholders, or whose items cannot be keyed,
+    /// keeps an empty key (and therefore stays uncached if it has
+    /// placeholders).
+    pub(in crate::model) fn stamp_vision_cache_key(&self, tokens: &[u32], seq: &mut SequenceState) {
+        seq.vision_cache_key.clear();
+        if !self.vision_prefix_cache_ok() || !self.tokens_have_vision_pad(tokens) {
+            return;
+        }
+        let (grids, hashes) = (&seq.vision.grids, &seq.vision.hashes);
+        if grids.len() != hashes.len() {
+            return;
+        }
+        let items: Vec<(u128, usize)> = grids
+            .iter()
+            .zip(hashes)
+            .map(|(&(t, h, w), &hash)| (hash, t * h * w))
+            .collect();
+        if let Some(key) = vision_cache_key(tokens, |t| self.is_vision_pad(t), &items) {
+            seq.vision_cache_key = key;
+        }
+    }
+
+    /// `tokens` (a prefix of `seq`'s stream from position 0) with the
+    /// stamped key over the positions it covers.
+    pub(in crate::model) fn pc_key_tokens<'a>(
+        &self,
+        seq: &SequenceState,
+        tokens: &'a [u32],
+    ) -> Cow<'a, [u32]> {
+        let key = &seq.vision_cache_key;
+        if key.is_empty() {
+            return Cow::Borrowed(tokens);
+        }
+        let n = key.len().min(tokens.len());
+        let mut out = Vec::with_capacity(tokens.len());
+        out.extend_from_slice(&key[..n]);
+        out.extend_from_slice(&tokens[n..]);
+        Cow::Owned(out)
+    }
+
+    /// The prefix-cache key for `tokens` (a prefix of `seq`'s stream from
+    /// position 0), or `None` when it holds a placeholder the key does not
+    /// cover: such a prefix must not be looked up or cached.
+    pub(in crate::model) fn pc_key<'a>(
+        &self,
+        seq: &SequenceState,
+        tokens: &'a [u32],
+    ) -> Option<Cow<'a, [u32]>> {
+        let covered = seq.vision_cache_key.len().min(tokens.len());
+        (!self.tokens_have_vision_pad(&tokens[covered..])).then(|| self.pc_key_tokens(seq, tokens))
+    }
+
     /// Before the embed of chunk `span` (`(start, len)`): a later chunk of a
     /// deferred prefill encodes its own items here, on every rank alike. True
     /// when the embed must follow the prefix lookup instead, where a deferred

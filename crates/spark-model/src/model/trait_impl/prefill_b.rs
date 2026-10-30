@@ -106,8 +106,8 @@ impl TransformerModel {
         // state (its cold turn 1 saved no tail checkpoint). On EP>1 the
         // split is unconditional instead: rank-local radix contents diverge,
         // and chunk sequences must be deterministic on (tokens, config)
-        // across ranks (bug #33 invariant). Skipped for vision prompts (pad
-        // runs must not straddle chunk boundaries) and non-SSM models
+        // across ranks (bug #33 invariant). Skipped for vision prompts the
+        // cache cannot key (`vision_cache`) and non-SSM models
         // (KV-only cache hits need no snapshot).
         // R11 fix 1: the pass grid replaces the tail split below (meta/grid.rs).
         if let Some(r) = self.grid_cut(tokens, seq, chunk_start, chunk_len, is_last_chunk, stream) {
@@ -117,7 +117,7 @@ impl TransformerModel {
             && self.config.num_ssm_layers() > 0
             && self.tail_split_snapshots()
             && self.prefix_cache.is_active()
-            && !self.tokens_have_vision_pad(tokens)
+            && self.pc_key(seq, tokens).is_some()
         {
             let bs = self.kv_cache.lock().block_size();
             // One block below the last block boundary strictly under `total`.
