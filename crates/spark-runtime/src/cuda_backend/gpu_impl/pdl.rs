@@ -74,9 +74,6 @@ pub(super) fn pdl_kernel(func_name: &str) -> bool {
 /// parameters (kernels/gb10/glm-5.3-flash/nvfp4/atlas_pdl_touch.cuh). A kernel
 /// launched with PDL must not read its predecessor's output before that wait,
 /// so only these qualify.
-/// This is a launch allowlist, not every kernel containing a wait. In
-/// particular, persistent MoE twins retain the source's ordinary launch
-/// semantics until their overlapping execution is qualified separately.
 pub(super) const PDL_KERNELS: &[&str] = &[
     "w4a16_gemv_tc8",
     "w4a16_gemv_tc8_ld",
@@ -160,9 +157,19 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "moe_topk_sigmoid_batched",
     "moe_sort_by_expert",
     "moe_sort_by_expert_scan",
+    "reshape_and_cache_flash",
+    "glm_latent_cache_write_fp8g128",
+    "glm_latent_dequant_fp8g128",
+    "glm_index_layernorm_bf16",
+    "glm_index_tail_write_bf16",
+    "glm_index_kpool_finalize_bf16",
+    // The DFlash drafter's conv and residual add (each enters first).
+    "dflash2_grouped_dynamic_causal_conv",
+    "bf16_residual_add",
     "moe_build_tile_worklist",
     "moe_build_tile_worklist_scan",
     "quantize_bf16_to_nvfp4",
+    "quantize_bf16_to_nvfp4_weight_rne",
     "glm_moe_router_quant",
     "glm_moe_route_select",
     "moe_w4a4_grouped_gemm_prequant_t_k64_vecscale_compact_gate_up",
@@ -184,6 +191,18 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "glm_moe_decode_m32s_gate_up_silu_k128w_l2pf",
     "glm_moe_decode_m32s_k128w_l2pf",
     "glm_moe_decode_m32s_k128w_zskip_l2pf",
+    "glm_moe_decode_m16s_gate_up_silu_k128w_l2pf_p",
+    "glm_moe_decode_m16s_k128w_zskip_l2pf_p",
+    "glm_moe_decode_m32s_gate_up_silu_k128w_l2pf_p",
+    "glm_moe_decode_m32s_k128w_zskip_l2pf_p",
+    "glm_moe_decode_m64s_gate_up_silu_k128w_l2pf_p",
+    "glm_moe_decode_m16s_a16_k128w_l2pf_p",
+    "glm_moe_decode_m16s_a16_gate_up_silu_k128w_l2pf_p",
+    "glm_moe_decode_m32s_a16_k128w_l2pf_p",
+    "glm_moe_decode_m32s_a16_gate_up_silu_k128w_l2pf_p",
+    "glm_moe_decode_m64s_a16_k128w_l2pf_p",
+    "glm_moe_decode_m64s_a16_gate_up_silu_k128w_l2pf_p",
+    "glm_moe_decode_m64s_k128w_zskip_l2pf_p",
     "moe_unpermute_reduce_indexed_ep",
     "moe_unpermute_reduce_indexed_ep_vec8",
     "moe_batched_blend",

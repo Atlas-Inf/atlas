@@ -146,6 +146,25 @@ fn served_sources(common: &Path, quant: &Path) -> Vec<(PathBuf, bool)> {
     files.into_values().collect()
 }
 
+/// The comment-free text of `path`, then of the namesakes it includes
+/// (`#include "../../common/reshape_and_cache.cu"` in the GLM shadow of that
+/// file): a shadow serves its namesake's kernels verbatim, under its own name.
+fn with_namesakes(path: &Path) -> Vec<String> {
+    let src = without_comments(&std::fs::read_to_string(path).unwrap());
+    let mut texts = Vec::new();
+    for line in src.lines() {
+        let Some(inc) = line.trim().strip_prefix("#include \"") else {
+            continue;
+        };
+        let inc = Path::new(inc.trim_end_matches('"'));
+        if inc.file_name() == path.file_name() {
+            texts.extend(with_namesakes(&path.parent().unwrap().join(inc)));
+        }
+    }
+    texts.insert(0, src);
+    texts
+}
+
 #[test]
 fn parser_sees_direct_and_wrapped_waits() {
     let src = without_comments(
@@ -254,8 +273,7 @@ extern "C" __global__ void tri_input(const unsigned char* __restrict__ w0, float
 ///   predecessor's output early);
 /// * a kernel of the target's own dirs that waits is listed (one that is not
 ///   pays the launch gap PDL exists to remove: the five-row KDA triple did,
-///   at every width-5 verify step), except the GLM persistent twins whose
-///   overlapping launch has not been qualified;
+///   at every width-5 verify step);
 /// * a `common/` kernel that waits is listed by some PDL target. It need not
 ///   be listed by every target that serves it: without the launch attribute
 ///   its wait is a no-op, and each target opts its own decode chain in.
@@ -272,26 +290,29 @@ fn pdl_target_kernels_wait_exactly_when_listed() {
             }
             let mut defined = Vec::new();
             for (path, own) in served_sources(&gb10.join("common"), &quant) {
-                let src = without_comments(&std::fs::read_to_string(&path).unwrap());
-                for (name, waits) in kernels(&src) {
-                    let listed = target.kernels.contains(&name);
-                    assert!(
-                        waits || !listed,
-                        "{}: {name} is on the {} PDL list but does not wait on PDL entry",
-                        path.display(),
-                        target.model
-                    );
-                    assert!(
-                        !waits
-                            || listed
-                            || (!own && listed_anywhere(name))
-                            || name == "rdma_oneshot_bf16"
-                            || (target.model == "glm-5.3-flash" && name.ends_with("_l2pf_p")),
-                        "{}: {name} waits on PDL entry but is not on the {} PDL list",
-                        path.display(),
-                        target.model
-                    );
-                    defined.push(name.to_owned());
+                // An included namesake is another dir's source: as with
+                // `common/`, its target opts its kernels in.
+                for (i, src) in with_namesakes(&path).iter().enumerate() {
+                    let own = own && i == 0;
+                    for (name, waits) in kernels(src) {
+                        let listed = target.kernels.contains(&name);
+                        assert!(
+                            waits || !listed,
+                            "{}: {name} is on the {} PDL list but does not wait on PDL entry",
+                            path.display(),
+                            target.model
+                        );
+                        assert!(
+                            !waits
+                                || listed
+                                || (!own && listed_anywhere(name))
+                                || name == "rdma_oneshot_bf16",
+                            "{}: {name} waits on PDL entry but is not on the {} PDL list",
+                            path.display(),
+                            target.model
+                        );
+                        defined.push(name.to_owned());
+                    }
                 }
             }
             for listed in target.kernels {
@@ -302,5 +323,22 @@ fn pdl_target_kernels_wait_exactly_when_listed() {
                 );
             }
         }
+    }
+}
+
+/// `common/` kernels of SparkGLM's drafter chain: the contract above accepts
+/// them on any target's list, and only this one launches them.
+#[test]
+fn glm_lists_the_drafter_chain() {
+    let glm = PDL_TARGETS
+        .iter()
+        .find(|t| t.model == "glm-5.3-flash")
+        .unwrap();
+    for name in [
+        "dflash2_grouped_dynamic_causal_conv",
+        "bf16_residual_add",
+        "reshape_and_cache_flash",
+    ] {
+        assert!(glm.kernels.contains(&name), "{name}");
     }
 }

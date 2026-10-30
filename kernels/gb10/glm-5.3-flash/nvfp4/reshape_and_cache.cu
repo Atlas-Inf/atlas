@@ -35,6 +35,7 @@ extern "C" __global__ void glm_latent_cache_write_fp8g128(
     const long long* __restrict__ slots,
     unsigned int block_size,
     unsigned int key_stride) {
+    atlas_pdl_enter();
     __shared__ float amax[128];
     const long long slot = slots[blockIdx.x];
     if (slot < 0) return;
@@ -51,6 +52,7 @@ extern "C" __global__ void glm_latent_dequant_fp8g128(
     __nv_bfloat16* __restrict__ out,
     unsigned int tokens,
     unsigned int block_size) {
+    atlas_pdl_enter();
     const unsigned int t = blockIdx.x;
     if (t >= tokens) return;
     const unsigned int physical = block_table[t / block_size], offset = t % block_size;

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #include <cuda_bf16.h>
+#include "atlas_pdl.cuh"
 
 // DFlash2 two-tap grouped dynamic causal convolution.
 //
@@ -32,6 +33,7 @@ extern "C" __global__ void dflash2_grouped_dynamic_causal_conv(
     unsigned int group_size,
     unsigned int num_groups
 ) {
+    atlas_pdl_enter();
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int total = K * hidden_size;
     if (idx >= total) return;

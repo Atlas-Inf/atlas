@@ -4,6 +4,7 @@
 // stores pooled keys as BF16; the later FP8 path adds a Hadamard bookend and a
 // per-vector scale without changing the pool addressing established here.
 
+#include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
 #include <math.h>
 
@@ -16,6 +17,7 @@ extern "C" __global__ void glm_index_layernorm_bf16(
     unsigned int rows,
     unsigned int dim,
     float eps) {
+    atlas_pdl_enter();
     const unsigned int row = blockIdx.x;
     if (row >= rows) return;
     extern __shared__ float reduce[];
@@ -38,6 +40,7 @@ extern "C" __global__ void glm_index_tail_write_bf16(
     unsigned int pool_size,
     unsigned int head_dim,
     unsigned long long tail_block_stride_bytes) {
+    atlas_pdl_enter();
     const unsigned int token = blockIdx.x;
     if (token >= num_tokens) return;
     (void)pool_size;
@@ -60,6 +63,7 @@ extern "C" __global__ void glm_index_kpool_finalize_bf16(
     unsigned int head_dim,
     unsigned long long tail_block_stride_bytes,
     unsigned long long values_block_stride_bytes) {
+    atlas_pdl_enter();
     const unsigned int token = blockIdx.x;
     if (token >= num_tokens) return;
     glm_index_kpool_finalize_row(tail, tail_map, ape, cache, slots, token, block_size, pool_size,
