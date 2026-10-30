@@ -391,12 +391,7 @@ pub(super) fn build_msg_entries(
                                 v.timestamps.clone()
                             };
                             (
-                                spark_model::VisionItem {
-                                    held: spark_model::vision_budget::HeldRows::default(),
-                                    groups: v.groups,
-                                    grid_h: v.grid_h,
-                                    grid_w: v.grid_w,
-                                },
+                                spark_model::VisionItem::video(v.groups, v.grid_h, v.grid_w),
                                 timestamps,
                             )
                         }
