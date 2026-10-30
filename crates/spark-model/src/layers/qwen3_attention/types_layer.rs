@@ -55,10 +55,9 @@ pub struct Qwen3AttentionLayer {
     pub(crate) k_eq_v: bool,
     /// Ones-filled BF16 weight buffer for the pure-RMSNorm v_norm path.
     pub(crate) v_norm_weight: Option<DenseWeight>,
-    /// Per-head attention gate weight (Step 3.7 g_proj).
-    /// Shape: [num_q_heads, hidden_size] BF16. Applied as:
-    /// attn_out = attn_out * sigmoid(g_proj @ hidden_states)
-    /// with broadcast over head_dim.
+    /// Per-head attention gate weight (Step 3.7 g_proj), shape
+    /// [num_q_heads, hidden_size] BF16. Applied as
+    /// attn_out *= sigmoid(g_proj @ hidden_states), broadcast over head_dim.
     pub(crate) head_gate_weight: Option<DenseWeight>,
     pub(crate) head_gate_activation: HeadGateActivation,
     /// Kernel handle for per-head sigmoid gate broadcast multiply.
