@@ -107,13 +107,13 @@ pub struct Qwen3AttentionLayer {
     pub(super) mx8_rt: Option<super::mx8::Mx8AttnRt>,
     // ── MLA (Multi-head Latent Attention) — 2-step decode ──
     pub(crate) mla: Option<MlaWeights>,
-    /// MXFP8 twins of MLA weights keyed by the BF16 weight pointer, with the
-    /// `[n, k]` they were quantized as: verify rows and paged prefill chunks
-    /// that short (<= 32) read half the bytes; longer chunks keep BF16.
+    /// MXFP8 twins of MLA weights keyed by the BF16 pointer, with their `[n, k]`:
+    /// rows of short (<= 32) calls read half the bytes; longer keep BF16.
     pub(crate) mla_mx: Vec<(DevicePtr, [usize; 2], crate::weight_map::Mxfp8Weight)>,
-    /// NVFP4 twins of the same projections (`ATLAS_GLM_MLA_NVFP4=1`, LOSSY
-    /// opt-in: ~half the MXFP8 bytes) on the W4A16 tensor-core tier.
+    /// NVFP4 twins (`ATLAS_GLM_MLA_NVFP4=1`, LOSSY) on the W4A16 TC tier.
     pub(crate) mla_q4: Vec<(DevicePtr, crate::weight_map::QuantizedWeight)>,
+    /// The checkpoint's FP8 block q_a / q_b / kv_a / o (`mla_native.rs`).
+    pub(crate) mla_native: super::mla_native::MlaNative,
     // ── Manifold-Constrained Hyper-Connections (mHC) — DeepSeek-V4 ──
     /// Per-block HC parameters. `Some` only for DeepSeek-V4 (`hc_mult > 0`),
     /// in which case the attn/ffn residual sites use `hc_pre`/`hc_post`

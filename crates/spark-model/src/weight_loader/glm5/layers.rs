@@ -207,6 +207,27 @@ pub(super) fn load_mla_layer(
         k_norm_weight: dense_auto(store, &format!("{indexer_prefix}.k_norm.weight"), gpu)?,
         k_norm_bias: dense_auto(store, &format!("{indexer_prefix}.k_norm.bias"), gpu)?,
     };
+    // ATLAS_GLM_FP4L_MLA_FP8: the checkpoint's FP8 block q_a / kv_a / q_b / o.
+    let native_prefill = crate::layers::ops::Fp8bPrefill::from_env()?;
+    let mut native = super::mla_native::mla_native_twins(
+        crate::layers::glm_native::NativePolicy::from_env(),
+        store,
+        &p,
+        &tp,
+        config,
+        force_dimension_overrides,
+        gpu,
+    )?;
+    if let Some(twins) = native.as_mut() {
+        super::mla_native::tile_large_twins(twins, native_prefill, gpu)?;
+        // Pick each W8A8 prefill GEMM now (cuBLASLt block FP8, else the
+        // in-tree kernel): fail at load, never mid-prefill.
+        if native_prefill == crate::layers::ops::Fp8bPrefill::W8a8 {
+            for (twin, [n, k]) in twins.iter() {
+                crate::layers::ops::fp8b_w8a8_prepare(gpu, twin, *n, *k)?;
+            }
+        }
+    }
     let opt_in_twins = super::mla_twins::opt_in_mxfp8_twins(
         config,
         [glm_indexer.wq_b.weight, w_uk_t.weight, w_uv.weight],
@@ -214,7 +235,7 @@ pub(super) fn load_mla_layer(
             .map(|flag| std::env::var(flag).as_deref() == Ok("1")),
         force_dimension_overrides,
     );
-    let mla = MlaWeights {
+    let mut mla = MlaWeights {
         wq_a,
         wq_a_nvfp4: None,
         wq_a_fp8: None,
@@ -295,14 +316,43 @@ pub(super) fn load_mla_layer(
             tp.local_q_heads * tp.v_head_dim,
         ),
     ];
+    // Native: the twins replace the BF16 copies (unless they serve prefill)
+    // and the MXFP8 / NVFP4 twins of the same four projections.
+    let native_keys = match native.as_ref() {
+        Some(_) => {
+            let keys = super::mla_native::settle_bf16(
+                &mut [
+                    &mut mla.wq_a.weight,
+                    &mut mla.wkv_a.weight,
+                    &mut mla.wq_b.weight,
+                    &mut mla.wo.weight,
+                ],
+                native_prefill,
+                layer_idx,
+                gpu,
+            )?;
+            // Aliases of wkv_a / wo (never read for GLM) follow their keys.
+            mla.wkv_a_merged = mla.wkv_a;
+            mla.wo_b = mla.wo;
+            Some(keys)
+        }
+        None => None,
+    };
     layer.set_mla_weights(mla);
     // Target layers only: the replicated MTP body keeps its own paths.
-    if !force_dimension_overrides && std::env::var("ATLAS_GLM_MLA_NVFP4").as_deref() == Ok("1") {
+    let quantized_twins = !force_dimension_overrides && native.is_none();
+    if quantized_twins && std::env::var("ATLAS_GLM_MLA_NVFP4").as_deref() == Ok("1") {
         layer.install_mla_nvfp4(gpu, &mx)?;
-    } else if !force_dimension_overrides
-        && std::env::var("ATLAS_GLM_MLA_MXFP8").as_deref() == Ok("1")
-    {
+    } else if quantized_twins && std::env::var("ATLAS_GLM_MLA_MXFP8").as_deref() == Ok("1") {
         layer.install_mla_mxfp8(gpu, &mx)?;
+    }
+    if let (Some(twins), Some(keys)) = (native, native_keys) {
+        let twins = keys
+            .into_iter()
+            .zip(twins)
+            .map(|(key, (twin, nk))| (key, nk, twin))
+            .collect();
+        layer.install_mla_native(twins, native_prefill);
     }
     if !opt_in_twins.is_empty() {
         layer.install_mla_mxfp8(gpu, &opt_in_twins)?;

@@ -2,12 +2,11 @@
 
 //! GLM-5 zero-RoPE MLA decode, including selected independent rows 2..8.
 //!
-//! The generic absorbed-MLA implementation is deliberately per-sequence to
-//! accommodate several architectures. GLM-5 has a simpler fixed shape: no
-//! RoPE arm, no output LoRA, and BF16 Q/KV/O projections. This first guarded
-//! step batches the four stateless projections and, for exact K=5 verification,
-//! Q absorption, cache mutation, causal paged attention, and value extraction.
-//! Every row retains its own sequence length and block table.
+//! The generic absorbed-MLA implementation is deliberately per-sequence to accommodate
+//! several architectures. GLM-5 has a simpler fixed shape: no RoPE arm, no output LoRA,
+//! and BF16 Q/KV/O projections. This first guarded step batches the four stateless
+//! projections and, for exact K=5 verification, Q absorption, cache mutation, causal
+//! paged attention, and value extraction. Every row keeps its own length and block table.
 
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, KernelHandle};
@@ -151,6 +150,10 @@ impl Qwen3AttentionLayer {
                 }
                 n => anyhow::bail!("GLM MLA multi-sequence projection requires N=2..=5, got {n}"),
             }
+        } else if self.mla_native_gemv(
+            c.fwd.gpu, dense, input, output, c.n as u32, n_out, k, c.stream,
+        )? {
+            Ok(())
         } else {
             let kernel = if c.n == 5 && self.dense_gemv_batch5_k.0 != 0 {
                 self.dense_gemv_batch5_k

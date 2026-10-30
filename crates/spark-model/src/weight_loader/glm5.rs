@@ -9,6 +9,7 @@ mod fp4l;
 pub(crate) use fp4l::release_expanded;
 mod kda_side_pack;
 mod layers;
+mod mla_native;
 mod mla_twins;
 pub mod mode;
 pub(crate) mod retirement;

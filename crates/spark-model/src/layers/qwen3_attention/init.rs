@@ -181,6 +181,7 @@ impl Qwen3AttentionLayer {
             mla: None,
             mla_mx: Vec::new(),
             mla_q4: Vec::new(),
+            mla_native: Default::default(),
             // ── DeepSeek-V4 Manifold-Constrained Hyper-Connections (mHC) ──
             // `hc` stays None for non-V4 models; the V4 loader attaches real
             // HcWeights after this constructor. Kernel handles are lazy (null

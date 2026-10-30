@@ -285,19 +285,36 @@ impl QueryPlan {
         let stream = c.stream;
         let batch_kernel = layer.dense_gemv_batchm_k;
         ensure!(batch_kernel.0 != 0, "{FLAG}: batchm kernel unavailable");
+        // ATLAS_GLM_FP4L_MLA_FP8: q_a / q_b on the native twins; the scalar
+        // comparison reads the BF16 copies, which a native layer does not keep.
+        ensure!(
+            self.diagnostic.is_none() || !layer.mla_is_native(&mla.wq_a),
+            "{FLAG}: the scalar comparison needs the BF16 Qa / Qb a native MLA layer frees"
+        );
 
-        ops::dense_gemv_batchm(
+        if !layer.mla_native_gemv(
             gpu,
-            batch_kernel,
-            c.normed,
             &mla.wq_a,
+            c.normed,
             self.latent,
             self.rows as u32,
             Q_LORA as u32,
             HIDDEN as u32,
-            Q_LORA as u32,
             stream,
-        )?;
+        )? {
+            ops::dense_gemv_batchm(
+                gpu,
+                batch_kernel,
+                c.normed,
+                &mla.wq_a,
+                self.latent,
+                self.rows as u32,
+                Q_LORA as u32,
+                HIDDEN as u32,
+                Q_LORA as u32,
+                stream,
+            )?;
+        }
 
         if let Some(reference) = self.diagnostic {
             // Compare the raw Qa result before the in-place RMS pass can
@@ -371,18 +388,28 @@ impl QueryPlan {
             )?;
         }
 
-        ops::dense_gemv_batchm(
+        if !layer.mla_native_gemv_strided(
             gpu,
-            batch_kernel,
-            self.latent,
             &mla.wq_b,
+            self.latent,
             self.q_full,
-            self.rows as u32,
-            Q_DIM as u32,
-            Q_LORA as u32,
+            [self.rows as u32, Q_DIM as u32, Q_LORA as u32],
             Q_DIM as u32,
             stream,
-        )?;
+        )? {
+            ops::dense_gemv_batchm(
+                gpu,
+                batch_kernel,
+                self.latent,
+                &mla.wq_b,
+                self.q_full,
+                self.rows as u32,
+                Q_DIM as u32,
+                Q_LORA as u32,
+                Q_DIM as u32,
+                stream,
+            )?;
+        }
 
         let indexer = mla
             .glm_indexer

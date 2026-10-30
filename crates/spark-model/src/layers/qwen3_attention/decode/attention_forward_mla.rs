@@ -101,16 +101,7 @@ impl Qwen3AttentionLayer {
                     stream,
                 )
             } else {
-                ops::dense_gemv(
-                    ctx.gpu,
-                    self.dense_gemv_k,
-                    normed,
-                    &mla.wq_a,
-                    q_latent,
-                    q_lora,
-                    h,
-                    stream,
-                )
+                self.mla_gemv1(ctx.gpu, normed, &mla.wq_a, q_latent, q_lora, h, stream)
             }
         })?;
         prof!("q_norm", {
@@ -140,16 +131,7 @@ impl Qwen3AttentionLayer {
                     stream,
                 )
             } else {
-                ops::dense_gemv(
-                    ctx.gpu,
-                    self.dense_gemv_k,
-                    q_latent,
-                    &mla.wq_b,
-                    q_full,
-                    q_dim,
-                    q_lora,
-                    stream,
-                )
+                self.mla_gemv1(ctx.gpu, q_latent, &mla.wq_b, q_full, q_dim, q_lora, stream)
             }
         })?;
 
@@ -251,16 +233,7 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             } else {
-                ops::dense_gemv(
-                    ctx.gpu,
-                    self.dense_gemv_k,
-                    normed,
-                    &mla.wkv_a,
-                    kv_latent,
-                    kv_lora,
-                    h,
-                    stream,
-                )?;
+                self.mla_gemv1(ctx.gpu, normed, &mla.wkv_a, kv_latent, kv_lora, h, stream)?;
             }
             ops::rms_norm(
                 ctx.gpu,
@@ -467,9 +440,8 @@ impl Qwen3AttentionLayer {
                     stream,
                 )
             } else {
-                ops::dense_gemv(
+                self.mla_gemv1(
                     ctx.gpu,
-                    self.dense_gemv_k,
                     v_extracted,
                     &mla.wo,
                     o_out,

@@ -46,6 +46,10 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // ATLAS_GLM_FP4L_MLA_FP8: the checkpoint's FP8 block twin (`mla_native`).
+        if self.mla_native_rows(ctx, weight, input, output, m, n, k, stream)? {
+            return Ok(());
+        }
         let tc = crate::layers::w4a16_gemv_tiers::tc_kernel(m);
         if m <= 32
             && tc.0 != 0
