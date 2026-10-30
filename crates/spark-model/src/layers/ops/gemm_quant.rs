@@ -400,6 +400,35 @@ pub fn per_token_group_quant_fp8(
         .launch(stream)
 }
 
+/// [`per_token_group_quant_fp8`] on its warp-per-group twin
+/// (`per_token_group_quant_fp8_warp`, eight groups a CTA instead of one; the
+/// same bytes). `k % 128 == 0`.
+#[allow(clippy::too_many_arguments)]
+pub fn per_token_group_quant_fp8_warp(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input_bf16: DevicePtr,
+    output_fp8: DevicePtr,
+    a_scale: DevicePtr,
+    m: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        k.is_multiple_of(128),
+        "per_token_group_quant_fp8_warp: K {k} is not whole 128-groups"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([(m * (k / 128)).div_ceil(8), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input_bf16)
+        .arg_ptr(output_fp8)
+        .arg_ptr(a_scale)
+        .arg_u32(m)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// W8A8 + FP32 epilogue GEMM with per-token activation scales and
 /// per-block weight scales — vLLM-equivalent FP8 numerics.
 ///

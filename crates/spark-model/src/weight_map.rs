@@ -11,6 +11,8 @@
 pub mod exl3;
 #[path = "weight_map/expert.rs"]
 mod expert;
+#[path = "weight_map/fp8_block_load.rs"]
+mod fp8_block_load;
 #[path = "weight_map/fp8_dequant.rs"]
 mod fp8_dequant;
 #[path = "weight_map/fp8_lut.rs"]
@@ -56,6 +58,12 @@ mod ssm_qwen35_more;
 mod tests;
 
 pub use expert::*;
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use fp8_block_load::fp8_block_gemm_host;
+pub use fp8_block_load::{
+    FP8_BLOCK, Fp8BlockWeight, RawFp8Block, fp8_block_bytes, fp8_block_twin, raw_fp8_block,
+};
 pub(crate) use fp8_dequant::*;
 #[cfg(test)]
 #[path = "weight_map/test_checkpoint.rs"]

@@ -27,6 +27,8 @@ mod dispatch_config;
 mod dispatch_helpers;
 #[path = "ops/dispatch_proj.rs"]
 mod dispatch_proj;
+#[path = "ops/fp8b.rs"]
+mod fp8b;
 #[path = "ops/mxfp8.rs"]
 mod mxfp8;
 #[path = "ops/mxfp8_act.rs"]
@@ -331,6 +333,7 @@ pub use fp8_moe::*;
 pub use fp8_moe_batch_a::*;
 pub use fp8_moe_batch_b::*;
 pub use fp8_moe_rows::*;
+pub use fp8b::*;
 pub use gemm_dense::*;
 pub use gemm_dense_int8::*;
 pub use gemm_dense_router::*;
@@ -341,7 +344,7 @@ pub use gemv_q2::*;
 pub use gemv_q2_vec::*;
 pub use gemv_sw::*;
 pub use gemv_touch::{
-    GemvTouch, Twin, gemv_touch, gemv_touch_resolve, mxfp8_tc_twin, w4a16_pair_touch,
+    GemvTouch, Twin, gemv_touch, gemv_touch_resolve, mxfp8_tc_twin, native_touch, w4a16_pair_touch,
     w4a16_tc_twin, w4a16_verify_touch,
 };
 pub use glm_hc_prefill::*;
