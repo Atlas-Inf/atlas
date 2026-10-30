@@ -960,8 +960,8 @@ pub fn run(
                     // is what made the 2026-09-15 nvidia pack read "engages,
                     // accepts ~nothing" while the lane's own debug lines
                     // showed na=1 on 93 of 143 proposals (jobqueue 074). It
-                    // also feeds `usage.completion_tokens_details.
-                    // accepted_prediction_tokens`.
+                    // is raw verify telemetry. Completion usage separately
+                    // counts accepted draft tokens retained by emission.
                     //
                     // Deliberately NOT `mtp_accept_debug::record`: that
                     // histogram steers `adaptive_rung`'s MTP dispatch width,

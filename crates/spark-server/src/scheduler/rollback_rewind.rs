@@ -67,6 +67,7 @@ pub(super) fn apply_rollback(
         keep_len,
         unfed_tail,
     );
+    a.mtp_acct.truncate_accepted_output(a.output_tokens.len());
 
     // 3. Restore the generation budget that the dropped tokens consumed.
     //    Every dropped token decremented `remaining` by one (since the §C-1
@@ -97,4 +98,36 @@ pub(super) fn apply_rollback(
     //    not immediately re-trigger before fresh tokens arrive.
     a.prose_tokens_since_last_tool = 0;
     a.consecutive_confident = 0;
+}
+
+#[cfg(test)]
+mod prediction_usage_tests {
+    use super::*;
+    use crate::scheduler::emit_step::{emit_span_row, emit_token};
+    use crate::scheduler::lifecycle_tests::finish_and_recv;
+    use crate::scheduler::sched_ctx::SchedCtx;
+    use crate::scheduler::test_support::test_seq;
+
+    #[test]
+    fn prediction_usage_rollback_removes_only_discarded_draft_positions() {
+        let (mut a, rx) = test_seq(vec![10], 10, None, 34);
+        a.finished = false;
+        a.min_tokens = 0;
+        let sched = SchedCtx::for_test();
+        for (row, token) in [41, 42, 43].into_iter().enumerate() {
+            emit_span_row(&mut a, token, None, &sched, row, 3);
+        }
+        emit_token(&mut a, 44, None, &sched);
+        a.mtp_acct.record_verify_emitted(3);
+        assert_eq!(a.output_tokens, vec![10, 41, 42, 43, 44]);
+        assert_eq!(a.mtp_acct.accepted_output_total(), 2);
+        apply_rollback(&mut a, 2, 3, 1);
+        // Reusing the discarded positions for ordinary output must not revive them.
+        emit_token(&mut a, 45, None, &sched);
+        emit_token(&mut a, 46, None, &sched);
+        assert_eq!(a.mtp_acct.accepted_total(), 2, "raw telemetry is unchanged");
+        let response = finish_and_recv(a, rx);
+        assert_eq!(response.output_tokens, vec![10, 41, 45, 46]);
+        assert_eq!(response.accepted_prediction_tokens, 1);
+    }
 }

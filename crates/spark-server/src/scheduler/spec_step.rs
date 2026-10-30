@@ -131,7 +131,7 @@ pub fn step_self_spec(
 
     for i in 0..n_drafts {
         if draft_tokens[i] == verified[i] {
-            emit_token(a, draft_tokens[i], None, sched);
+            emit_accepted_token(a, draft_tokens[i], sched);
             if a.finished {
                 return;
             }
