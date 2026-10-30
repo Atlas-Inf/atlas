@@ -38,9 +38,6 @@ pub(super) fn render_template(
     reasoning_effort: Option<crate::ir::ReasoningEffort>,
     preserve_thinking: Option<bool>,
     tools_active: bool,
-    // `response_format` set: thinking off renders a closed think block
-    // (`RenderFlags::empty_think_off`), so no template-forced thinking.
-    structured_output: bool,
 ) -> Result<TemplateOut, Response> {
     // Use closed thinking when client doesn't explicitly enable it.
     let template_thinking = enable_thinking;
@@ -51,8 +48,8 @@ pub(super) fn render_template(
     });
 
     // Build JSON messages with structured tool_calls for Jinja.
-    let json_messages =
-        build_json_messages_for(messages, state.tokenizer.uses_deepseek_v4_encoding());
+    let mut json_messages =
+        build_json_messages_for(messages, state.tokenizer.tool_call_ids_in_template);
     // When TSCG is enabled the parser's `system_prompt()` has already
     // placed the compact tool signatures into messages[0]; passing
     // `tools` to Jinja as well would re-render the full JSON schema and
@@ -66,7 +63,7 @@ pub(super) fn render_template(
     } else {
         tools_active && (state.tokenizer.uses_deepseek_v4_encoding() || !state.chat.prompt.tscg)
     };
-    let jinja_tools: Option<Vec<serde_json::Value>> = if render_tools {
+    let mut jinja_tools: Option<Vec<serde_json::Value>> = if render_tools {
         Some(
             tools
                 .iter()
@@ -77,13 +74,27 @@ pub(super) fn render_template(
         None
     };
 
+    // Enntity/atlas b1b53814 (AGPL-3.0-only): GLM/Qwen register their
+    // tool-envelope XML as added tokens — escape matching markup in incoming
+    // message prose and tool schemas before rendering so it stays text.
+    // Structured tool_calls are left untouched for the template to emit as
+    // real native calls.
+    let escaped_tool_markup = state.tokenizer.escape_glm_tool_markup(
+        json_messages
+            .iter_mut()
+            .chain(jinja_tools.iter_mut().flatten()),
+    );
+    if escaped_tool_markup > 0 {
+        tracing::info!("{escaped_tool_markup} GLM tool markers in message text encoded as text");
+    }
+
     // Progressive auto-compact (DISABLED BY DEFAULT 2026-04-25 —
     // see project_no_auto_compaction memory feedback).
     let auto_compact_active = state
         .auto_compact_threshold
         .map(|t| t > 0.0)
         .unwrap_or(false);
-    let mut json_messages = if auto_compact_active && json_messages.len() > 4 {
+    let json_messages = if auto_compact_active && json_messages.len() > 4 {
         let trial_tokens = state
             .tokenizer
             .apply_chat_template_openai_with_effort(
@@ -93,7 +104,6 @@ pub(super) fn render_template(
                 state.behavior.disable_tool_steering,
                 reasoning_effort,
                 preserve_thinking,
-                structured_output,
             )
             .map(|t| t.len())
             .unwrap_or(0);
@@ -106,17 +116,6 @@ pub(super) fn render_template(
         json_messages
     };
 
-    // Enntity/atlas b1b53814 (AGPL-3.0-only): GLM/Qwen register their
-    // tool-envelope XML as added tokens — escape matching markup in incoming
-    // message prose before rendering so it stays text. Structured tool_calls
-    // are left untouched for the template to emit as real native calls.
-    let escaped_tool_markup = state
-        .tokenizer
-        .escape_glm_tool_markup(json_messages.iter_mut());
-    if escaped_tool_markup > 0 {
-        tracing::info!("{escaped_tool_markup} GLM tool markers in message text encoded as text");
-    }
-
     let prompt_tokens = match state.tokenizer.apply_chat_template_openai_with_effort(
         &json_messages,
         jinja_tools.as_deref(),
@@ -124,7 +123,6 @@ pub(super) fn render_template(
         state.behavior.disable_tool_steering,
         reasoning_effort,
         preserve_thinking,
-        structured_output,
     ) {
         Ok(t) => t,
         Err(e) => {

@@ -186,7 +186,6 @@ pub(crate) fn prepare_chat_prompt(
         // leaves the Jinja variable undefined (template default).
         req.preserve_thinking.or(state.behavior.preserve_thinking),
         tools_active,
-        req.response_format.is_some(),
     )?;
     if state.chat.phase_timing {
         let us_template = _t_phase.elapsed().as_micros() - us_msg_entry - us_thinking;
@@ -331,3 +330,7 @@ mod tests {
         assert_eq!(messages[0].text(), "tool instructions\n\noriginal");
     }
 }
+
+#[cfg(test)]
+#[path = "glm_prompt_parity_tests.rs"]
+mod glm_prompt_parity_tests;

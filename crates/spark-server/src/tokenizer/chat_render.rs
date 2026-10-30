@@ -48,12 +48,6 @@ pub(crate) struct RenderFlags<'a> {
     /// strip the trailing `<|im_end|>` so the assistant content becomes the
     /// final prefill token(s). The OpenAI-variant path pins this false.
     pub allow_continue_final: bool,
-    /// Render thinking-off as a closed, empty think block where the template
-    /// would otherwise open its own low-effort reasoning (GLM-5.3 without
-    /// tools; the template's `glm_empty_think_off`). Set for `response_format`
-    /// requests: thinking off must leave no reasoning, and the grammar must
-    /// own the first generated token. OR'd with `ATLAS_GLM_EMPTY_THINK_OFF=1`.
-    pub empty_think_off: bool,
 }
 
 /// Apply Atlas preprocessing and render the chat template to a string.
@@ -131,7 +125,6 @@ pub(crate) fn render_chat(
         preserve_thinking => preserve_thinking,
         disable_tool_steering => flags.disable_tool_steering,
         add_vision_id => false,
-        glm_empty_think_off => flags.empty_think_off || glm_empty_think_off(),
     };
 
     let mut rendered = tmpl.render(ctx).map_err(|e| {
@@ -150,11 +143,4 @@ pub(crate) fn render_chat(
     }
 
     Ok(rendered)
-}
-
-/// `ATLAS_GLM_EMPTY_THINK_OFF=1`: GLM-5.3 renders thinking-off as an empty
-/// `<think></think>` instead of its low-effort reasoning mode.
-fn glm_empty_think_off() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ATLAS_GLM_EMPTY_THINK_OFF").as_deref() == Ok("1"))
 }

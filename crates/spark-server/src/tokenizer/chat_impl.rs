@@ -176,6 +176,8 @@ impl ChatTokenizer {
             eos_token_id,
             supports_thinking,
             glm_tool_markup_as_text: matches!(model_type, "glm5_next" | "qwen4_exp"),
+            tool_call_ids_in_template: model_type == "glm5_next"
+                || chat_encoding == ChatEncoding::DeepseekV4,
             chat_encoding,
             omni_image_tokens,
             chat_template,
@@ -326,7 +328,6 @@ impl ChatTokenizer {
                 template_effort_default: self.verbatim_prompt,
                 preserve_thinking,
                 allow_continue_final: true,
-                empty_think_off: false,
             },
         )?;
 
@@ -361,12 +362,9 @@ impl ChatTokenizer {
             disable_tool_steering,
             None,
             None,
-            false,
         )
     }
 
-    /// `empty_think_off`: see `chat_render::RenderFlags::empty_think_off`
-    /// (OpenAI-variant templates only).
     pub fn apply_chat_template_openai_with_effort(
         &self,
         messages: &[serde_json::Value],
@@ -375,7 +373,6 @@ impl ChatTokenizer {
         disable_tool_steering: bool,
         reasoning_effort: Option<&str>,
         preserve_thinking: Option<bool>,
-        empty_think_off: bool,
     ) -> Result<Vec<u32>> {
         if self.chat_encoding == ChatEncoding::DeepseekV4 {
             return self.apply_chat_template_jinja_with_effort(
@@ -402,7 +399,6 @@ impl ChatTokenizer {
                     template_effort_default: self.verbatim_prompt,
                     preserve_thinking,
                     allow_continue_final: false,
-                    empty_think_off,
                 },
             )
             .map_err(|e| anyhow::anyhow!("Failed to render OpenAI Jinja template: {e}"))?;
