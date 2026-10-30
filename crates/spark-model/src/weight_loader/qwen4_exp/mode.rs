@@ -2,8 +2,8 @@
 //! Qwen TP2 modes share native target precision and target-verified MTP.
 //! Ported from Enntity/atlas `weight_loader/qwen4_exp/mode.rs` (AGPL-3.0-only),
 //! adapted for this stack: `ATLAS_QWEN4EXP_MXFP8_DECODE` and
-//! `ATLAS_QWEN4EXP_PREFILL_W8A8` have no implementation here (their features
-//! are not in this tree), so they are omitted from the flag contract.
+//! `ATLAS_QWEN4EXP_PREFILL_W8A8` are opt-in here (startup parity checks
+//! them), so they are not part of this flag contract.
 use anyhow::{Result, bail, ensure};
 use atlas_core::config::ModelConfig;
 

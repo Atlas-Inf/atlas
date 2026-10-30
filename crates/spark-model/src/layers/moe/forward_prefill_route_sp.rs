@@ -64,14 +64,22 @@ impl MoeLayer {
             && self.correction_bias_dev.is_none()
             && self.weights.router_pre_norm.is_none()
             && self.lora.is_none();
-        let Some(router) = self.gate_nvfp4.as_ref().filter(|_| serves) else {
+        if !serves {
             return Ok(());
-        };
+        }
         let logits = ctx.buffers.gate_logits();
         let rows = sp.rows as u32;
         let local_in = sp.local(input, h);
         let n_out = self.router_logits_n;
-        if !self.try_q38_router(local_in, router, logits, rows, n_out, h as u32, ctx, stream)? {
+        // The NVFP4 pack's router through its dequant, or FP4-Local's BF16
+        // router on the whole-batch prefill's own tile GEMM.
+        let routed = match self.gate_nvfp4.as_ref() {
+            Some(router) => {
+                self.try_q38_router(local_in, router, logits, rows, n_out, h as u32, ctx, stream)?
+            }
+            None => self.try_bf16_router_gemm(local_in, logits, rows, h as u32, ctx.gpu, stream)?,
+        };
+        if !routed {
             return Ok(());
         }
         let top_k = ctx.config.num_experts_per_tok;

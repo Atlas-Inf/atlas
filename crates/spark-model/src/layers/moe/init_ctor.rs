@@ -229,6 +229,7 @@ impl MoeLayer {
             gate_ptrs_t: None,
             up_ptrs_t: None,
             down_ptrs_t: None,
+            w4a4: None,
             cutlass_grouped_host: None,
             _cutlass_sfb_owned: Vec::new(),
             routed_scales_released: false,

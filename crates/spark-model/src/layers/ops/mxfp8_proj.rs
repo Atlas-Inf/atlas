@@ -11,6 +11,10 @@
 //!   `mxfp8_proj_batchm`, one weight pass for the whole window — the launch
 //!   buckets rows at 8/16/24/32 and every row is bit-identical to the 1-row
 //!   kernel;
+//! * under `ATLAS_QWEN4EXP_MXFP8_DECODE=1` both of the above run on the
+//!   `mxfp8_gemv_tc{8,16,32}` tensor-core tiers instead (`mxfp8_gemv.cu`,
+//!   SparkQwen's decode kernels), as row-invariant as the GEMV tiers but
+//!   summed in another order;
 //! * more rows (prefill): `mxfp8_proj_dequant` expands the weight into a BF16
 //!   scratch, exactly (E4M3 times a power of two is a BF16 value), and
 //!   [`super::bf16_gemm`] multiplies by it. The scratch is transient and
@@ -38,6 +42,10 @@ pub struct Mxfp8ProjKernels {
     /// Register-tiled 2..=32-row tier (`mxfp8_proj_rows32`); optional —
     /// targets without it fall back to `batchm`.
     pub rows32: KernelHandle,
+    /// `mxfp8_gemv_tc{8,16,32}` under [`mxfp8_decode_tc`]: they serve every
+    /// 1..=32-row launch in place of the three tiers above. Zero handles
+    /// otherwise.
+    pub tc: [KernelHandle; 3],
 }
 
 impl Mxfp8ProjKernels {
@@ -49,8 +57,37 @@ impl Mxfp8ProjKernels {
             batchm: gpu.kernel("mxfp8_proj", "mxfp8_proj_batchm")?,
             dequant: gpu.kernel("mxfp8_proj", "mxfp8_proj_dequant")?,
             rows32: crate::layers::kernel_pick::try_kernel(gpu, "mxfp8_proj", "mxfp8_proj_rows32"),
+            tc: if mxfp8_decode_tc() {
+                Self::tc_tiers(gpu)?
+            } else {
+                [KernelHandle(0); 3]
+            },
         })
     }
+
+    /// The tensor-core tiers, or fail: the switch asks for them by name.
+    pub fn tc_tiers(gpu: &dyn GpuBackend) -> Result<[KernelHandle; 3]> {
+        Ok([
+            gpu.kernel("mxfp8_gemv", "mxfp8_gemv_tc8")?,
+            gpu.kernel("mxfp8_gemv", "mxfp8_gemv_tc16")?,
+            gpu.kernel("mxfp8_gemv", "mxfp8_gemv_tc32")?,
+        ])
+    }
+}
+
+/// `ATLAS_QWEN4EXP_MXFP8_DECODE` (read once): `1` serves the 1..=32-row
+/// launches on the `mxfp8_gemv_tc{8,16,32}` tensor-core tiers; anything else
+/// keeps the `mxfp8_proj` GEMV tiers. The two sum in different orders, so
+/// the ranks must agree (startup parity).
+pub fn mxfp8_decode_tc() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        mxfp8_decode_tc_requested(std::env::var("ATLAS_QWEN4EXP_MXFP8_DECODE").ok().as_deref())
+    })
+}
+
+pub(crate) fn mxfp8_decode_tc_requested(value: Option<&str>) -> bool {
+    value == Some("1")
 }
 
 /// A BF16 scratch for the prefill expansion: device pointer and capacity.
@@ -175,6 +212,12 @@ fn gemv_rows(
     stream: u64,
 ) -> Result<()> {
     let Mxfp8Proj { w, n, k } = *proj;
+    if kernels.tc[0].0 != 0 {
+        let tier = kernels.tc[super::mxfp8_tier(m as u32)];
+        return super::mxfp8_gemv(
+            gpu, tier, act, w.data, w.scales, out, m as u32, n, k, n, stream,
+        );
+    }
     if m == 1 {
         return KernelLaunch::new(gpu, kernels.gemv)
             .grid([div_ceil(n, 4), 1, 1])

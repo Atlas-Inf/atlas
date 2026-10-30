@@ -230,8 +230,13 @@ impl MoeLayer {
             Some(sp) if !sp.full_shared => (sp.local(input, h as usize), sp.rows as u32),
             _ => (input, n),
         };
+        // An MXFP8 shared expert under EP is this rank's slice
+        // (`shared_mxfp8.rs`): its partial over every row joins the routed sum
+        // before the reduce (`split`).
+        let mx_split = has_shared && is_ep_prefill && self.shared_joins_reduce();
         let overlap_shared_reduce = has_shared
             && is_ep_prefill
+            && !mx_split
             && num_tokens > 64
             && !ctx.graph_capture
             && !ctx.profile
@@ -241,18 +246,22 @@ impl MoeLayer {
         // (decode / verify), each rank computes half the shared expert's
         // intermediate columns and blends that partial before the EP
         // all-reduce, which sums the halves; each rank reads half the weights.
-        let split = has_shared
-            && is_ep_prefill
-            && sp.is_none()
-            && !overlap_shared_reduce
-            && !defer_shared_hc
-            && self.shared_split_ready(ctx, n);
+        let split = mx_split
+            || (has_shared
+                && is_ep_prefill
+                && sp.is_none()
+                && !overlap_shared_reduce
+                && !defer_shared_hc
+                && self.shared_split_ready(ctx, n));
         // Under SP with the reduce-scatter pipe, the shared expert of this
         // rank's rows runs while that exchange is on the wire
         // (`forward_prefill_finish`, `defer_shared_to_rs`).
         let defer_shared =
             !split && self.defer_shared_to_rs(sp, has_shared, overlap_shared_reduce, h, ctx);
-        if split {
+        if mx_split {
+            // Every row (an SP chunk's too): the slice's partial of each.
+            self.run_shared_expert_prefill(input, n, h, shared_inter, stream, stream, false, ctx)?;
+        } else if split {
             self.run_shared_split(input, n, h, shared_inter, ctx, stream)?;
         } else if has_shared && !overlap_shared_reduce && !defer_shared {
             self.run_shared_expert_prefill(

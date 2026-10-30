@@ -69,6 +69,62 @@ pub fn mxfp8_gemv(
         .launch(stream)
 }
 
+/// The [`mxfp8_gemv`] tier for `m` rows: 0 (`tc8`, up to 8), 1 (`tc16`) or
+/// 2 (`tc32`).
+pub fn mxfp8_tier(m: u32) -> usize {
+    match m {
+        0..=8 => 0,
+        9..=16 => 1,
+        _ => 2,
+    }
+}
+
+/// Outputs a `mxfp8_gemv_tc{8,16,32}_swiglu` CTA writes.
+const SWIGLU_CTA_COLS: u32 = 8;
+
+/// `SiLU(gate) * up` of `rows` rows of `input` (`[rows, k]`, contiguous) into
+/// `output` (`[rows, inter]`, contiguous) through the MXFP8 `w` = `[gate;
+/// up]` (`[2 * inter, k]`), each projection value the tensor-core tiers' sum
+/// rounded to BF16 and the activation rounded as vLLM's `silu_and_mul`
+/// rounds it (`mx_swiglu` in `mxfp8_gemv.cu`). `swiglu` holds
+/// `mxfp8_gemv_tc{8,16,32}_swiglu`; launches of up to 32 rows, each row's
+/// bytes independent of the rows beside it.
+#[allow(clippy::too_many_arguments)]
+pub fn mxfp8_swiglu_rows(
+    gpu: &dyn GpuBackend,
+    swiglu: &[KernelHandle; 3],
+    w: &crate::weight_map::Mxfp8Weight,
+    input: DevicePtr,
+    output: DevicePtr,
+    rows: usize,
+    inter: usize,
+    k: usize,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        k.is_multiple_of(MXFP8_BLOCK) && inter > 0,
+        "mxfp8_swiglu_rows: inter={inter} k={k} (need k % 32 == 0)"
+    );
+    for first in (0..rows).step_by(32) {
+        let m = (rows - first).min(32) as u32;
+        let kernel = swiglu[mxfp8_tier(m)];
+        ensure!(kernel.0 != 0, "mxfp8_swiglu_rows: no kernel for {m} rows");
+        KernelLaunch::new(gpu, kernel)
+            .grid([div_ceil(inter as u32, SWIGLU_CTA_COLS), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(input.offset(first * k * 2))
+            .arg_ptr(w.data)
+            .arg_ptr(w.scales)
+            .arg_ptr(output.offset(first * inter * 2))
+            .arg_u32(m)
+            .arg_u32(inter as u32)
+            .arg_u32(k as u32)
+            .arg_u32(inter as u32)
+            .launch(stream)?;
+    }
+    Ok(())
+}
+
 /// Widest row count [`mxfp8_gemv_grouped`] serves.
 pub const MXFP8_GROUPED_MAX_M: u32 = 16;
 
