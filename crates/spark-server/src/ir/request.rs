@@ -170,11 +170,18 @@ pub enum EffortLevel {
     XHigh,
 }
 
+/// The wire `reasoning_effort` spelling, `none` excepted (that is thinking
+/// off). Each spelling stays distinct so a template that owns its effort
+/// vocabulary can be handed exactly what the client sent
+/// ([`wire_str`](Self::wire_str)); [`as_str`](Self::as_str) is the
+/// cross-template tier every other template consumes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningEffort {
+    Minimal,
     Low,
     Medium,
     High,
+    XHigh,
     Max,
 }
 
@@ -191,10 +198,23 @@ impl ReasoningEffort {
     ///   (unchanged behavior; "high" and thinking-off "none" still pass).
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Minimal | Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh | Self::Max => "xhigh",
+        }
+    }
+
+    /// The spelling the client sent, which vLLM hands every chat template
+    /// verbatim (MODEL.toml `[behavior].verbatim_reasoning_effort`).
+    pub fn wire_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
-            Self::Max => "xhigh",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
         }
     }
 }
@@ -223,7 +243,7 @@ pub fn parse_wire_effort(s: &str) -> Option<(Option<ReasoningEffort>, ThinkingDi
     Some(match s {
         "none" => (None, ThinkingDirective::Off),
         "minimal" => (
-            Some(ReasoningEffort::Low),
+            Some(ReasoningEffort::Minimal),
             ThinkingDirective::OnEffort(EffortLevel::Minimal),
         ),
         "low" => (
@@ -238,7 +258,11 @@ pub fn parse_wire_effort(s: &str) -> Option<(Option<ReasoningEffort>, ThinkingDi
             Some(ReasoningEffort::High),
             ThinkingDirective::OnEffort(EffortLevel::High),
         ),
-        "xhigh" | "max" => (
+        "xhigh" => (
+            Some(ReasoningEffort::XHigh),
+            ThinkingDirective::OnEffort(EffortLevel::XHigh),
+        ),
+        "max" => (
             Some(ReasoningEffort::Max),
             ThinkingDirective::OnEffort(EffortLevel::XHigh),
         ),

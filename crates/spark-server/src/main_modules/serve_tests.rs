@@ -180,7 +180,7 @@ fn default_kwargs_reasoning_effort_sets_both_halves() {
     let kw = parse_default_chat_template_kwargs(r#"{"reasoning_effort":"xhigh"}"#).unwrap();
     // The template string AND the budget directive come from one parse,
     // so effort-silent requests get the same tier on both paths.
-    assert_eq!(kw.reasoning_effort, Some(ReasoningEffort::Max));
+    assert_eq!(kw.reasoning_effort, Some(ReasoningEffort::XHigh));
     assert_eq!(kw.thinking, ThinkingDirective::OnEffort(EffortLevel::XHigh));
     assert_eq!(kw.preserve_thinking, None);
 

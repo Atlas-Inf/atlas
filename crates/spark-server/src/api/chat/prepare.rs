@@ -158,10 +158,12 @@ pub(crate) fn prepare_chat_prompt(
     let force_nonempty_content = req.force_nonempty_content;
     let (enable_thinking, thinking_budget) =
         thinking::resolve_thinking(state, thinking_directive, gen_max as u32, tools_active);
+    // A template that owns its effort vocabulary gets the client's effort
+    // whatever thinking resolved to, as vLLM passes it.
     let reasoning_effort = effective_reasoning_effort(
         req.reasoning_effort,
         state.default_reasoning_effort,
-        enable_thinking,
+        enable_thinking || state.behavior.verbatim_reasoning_effort,
     );
     let us_thinking = _t_phase.elapsed().as_micros() - us_msg_entry;
 

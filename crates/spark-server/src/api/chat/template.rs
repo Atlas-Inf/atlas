@@ -44,6 +44,11 @@ pub(super) fn render_template(
 ) -> Result<TemplateOut, Response> {
     // Use closed thinking when client doesn't explicitly enable it.
     let template_thinking = enable_thinking;
+    let reasoning_effort = reasoning_effort.map(if state.behavior.verbatim_reasoning_effort {
+        crate::ir::ReasoningEffort::wire_str
+    } else {
+        crate::ir::ReasoningEffort::as_str
+    });
 
     // Build JSON messages with structured tool_calls for Jinja.
     let json_messages =
@@ -86,7 +91,7 @@ pub(super) fn render_template(
                 jinja_tools.as_deref(),
                 template_thinking,
                 state.behavior.disable_tool_steering,
-                reasoning_effort.map(crate::ir::ReasoningEffort::as_str),
+                reasoning_effort,
                 preserve_thinking,
                 structured_output,
             )
@@ -117,7 +122,7 @@ pub(super) fn render_template(
         jinja_tools.as_deref(),
         template_thinking,
         state.behavior.disable_tool_steering,
-        reasoning_effort.map(crate::ir::ReasoningEffort::as_str),
+        reasoning_effort,
         preserve_thinking,
         structured_output,
     ) {
