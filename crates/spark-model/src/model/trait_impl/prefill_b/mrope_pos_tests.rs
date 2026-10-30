@@ -378,3 +378,71 @@ fn qwen3vl_chunk_boundary_mid_video_slices_correctly() {
     assert_eq!(t[11], 7);
     let _ = (h, w);
 }
+
+// ── resumed prefill (cache hit / later chunk) ────────────────────────────
+
+/// `walk_rows` over `rows`, as three vectors.
+fn rows_of(
+    walk: Walk,
+    tokens: &[u32],
+    grids: &[(usize, usize, usize)],
+    rows: std::ops::Range<usize>,
+) -> [Vec<u32>; 3] {
+    let (mut t, mut h, mut w) = (Vec::new(), Vec::new(), Vec::new());
+    walk_rows(
+        walk,
+        tokens,
+        grids,
+        0,
+        grids.len(),
+        (IMG, VID),
+        rows,
+        [&mut t, &mut h, &mut w],
+    )
+    .unwrap();
+    [t, h, w]
+}
+
+#[test]
+fn every_row_range_is_positioned_as_the_whole_prompt_positions_it() {
+    // Text, a 2x3 image, text, a 2x2 image, text. A prefill resuming after a
+    // cached prefix (or any later chunk) computes rows `[a, b)`: their
+    // positions must equal the full prompt's, or a cache hit would feed the
+    // layers different rotary positions than the miss it replaces. The
+    // chunk-local walk restarted at the linear position `a` and at item 0.
+    let tokens: Vec<u32> = std::iter::repeat_n(TXT, 3)
+        .chain(std::iter::repeat_n(IMG, 6))
+        .chain(std::iter::repeat_n(TXT, 2))
+        .chain(std::iter::repeat_n(IMG, 4))
+        .chain(std::iter::repeat_n(TXT, 3))
+        .collect();
+    let grids = [(1, 2, 3), (1, 2, 2)];
+    for walk in [Walk::Generic, Walk::Qwen3vl] {
+        let full = rows_of(walk, &tokens, &grids, 0..tokens.len());
+        for a in 0..tokens.len() {
+            for b in a + 1..=tokens.len() {
+                let got = rows_of(walk, &tokens, &grids, a..b);
+                for s in 0..3 {
+                    assert_eq!(got[s], full[s][a..b], "stream {s}, rows {a}..{b}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_row_range_past_the_prompt_fails_its_request_only() {
+    let (mut t, mut h, mut w) = (Vec::new(), Vec::new(), Vec::new());
+    let err = walk_rows(
+        Walk::Generic,
+        &[TXT, IMG],
+        &[(1, 1, 1)],
+        0,
+        1,
+        (IMG, VID),
+        1..3,
+        [&mut t, &mut h, &mut w],
+    )
+    .unwrap_err();
+    assert!(crate::request_local::is_request_local(&err));
+}
