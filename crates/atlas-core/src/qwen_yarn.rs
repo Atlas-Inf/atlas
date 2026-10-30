@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Qwen static YaRN policy and frequency table. No I/O or checkpoint mutation.
-//! Equations: Peng et al., YaRN (https://arxiv.org/abs/2309.00071), and Qwen's
+//! Equations: Peng et al., YaRN (<https://arxiv.org/abs/2309.00071>), and Qwen's
 //! published Qwen3.8-Flash-Next rope_parameters contract. Amplitude is applied
 //! only to the rotated dimensions, including QSA indexer query/key rotations.
 
