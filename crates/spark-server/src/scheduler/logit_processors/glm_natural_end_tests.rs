@@ -111,13 +111,17 @@ fn glm_natural_end_actual_model_policy_has_no_minimum_reasoning_bias() {
         policy.tool_call_parser, "poolside_v1",
         "actual GLM metadata read"
     );
-    // Content and stream loop guards off (they cut legitimate counting and
-    // code); the thinking-loop watchdog stays armed.
+    // Every loop guard and early stop off, as in vLLM: content and stream
+    // guards cut legitimate counting and code, and reasoning ends when the
+    // model ends it (no confidence stop, no thinking-loop watchdog, no
+    // server budget).
     assert!(
         !policy.enable_loop_watchdog
             && !policy.enable_stream_loop_guards
-            && policy.enable_think_loop_watchdog
+            && !policy.enable_think_loop_watchdog
+            && !policy.confidence_early_stop
     );
+    assert_eq!(policy.max_thinking_budget, 0);
     // Disable only the mid-word input to isolate A4. No global atomic writes.
     assert_eq!(
         pick(true, false, policy.min_reasoning_floor_tokens, false),
