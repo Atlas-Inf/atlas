@@ -81,6 +81,11 @@ mod rdma_pair_bootstrap;
 #[allow(dead_code)] // the switch and the bootstrap word are read by the pair
 #[path = "nccl_backend/rdma_pair/cmd_ring.rs"]
 mod rdma_pair_cmd_ring;
+// Nor does choosing the proxy's core: it reads sysfs.
+#[cfg(all(test, not(atlas_rdma_verbs)))]
+#[allow(dead_code)] // the pin itself runs on the pair's proxy thread
+#[path = "nccl_backend/rdma_pair/pin.rs"]
+mod rdma_pair_pin;
 mod recv_buffer;
 use recv_buffer::ensure_payload_fits;
 pub use recv_buffer::{ALL_REDUCE_DTYPE_BYTES, required_recv_bytes};
