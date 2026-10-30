@@ -57,6 +57,14 @@ pub struct ResponsesRequest {
     /// to the current `input`.
     #[serde(default)]
     pub previous_response_id: Option<String>,
+    /// Client conversation id for prefix-cache routing; keys the SSM
+    /// snapshot session (`session_key`).
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
+    /// End-user id (OpenAI). Folded with the first user turn into the
+    /// session key, never used alone.
+    #[serde(default)]
+    pub user: Option<String>,
     /// Store the response for later retrieval (`true` = default per
     /// OpenAI's 2026 Responses API). `false` opts out of storage.
     #[serde(default)]
