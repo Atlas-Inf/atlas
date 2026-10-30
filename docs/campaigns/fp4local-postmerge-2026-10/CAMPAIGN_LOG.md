@@ -1419,3 +1419,14 @@ relays each job's raw results as they land.
 - Jobs 56/57 (Flash-Next NVFP4, 27B NVFP4 vets) failed on a script bug (polled port 8890; those recipes bind
   8889/8888). Fixed (port read from the YAML) and re-queued as 56b/57b.
 - Queue: 50a (running) → 50a2 → 50b → 56b → 57b, ≈ 22 h.
+
+## 2026-10-30 — #257 MERGED (a7a1f35db; fixes #209)
+
+One-variable A/B at merge base b0df50185 (job 50a2 vs job 50a):
+- control byte-identical;
+- agentic 11.82 vs 11.83 s/turn (338 vs 337 turns), both 50/50 + 50/50;
+- BFCL ST-995 87.64 / 87.13 in both arms, every subset identical
+  (run-1793365805020178746 / run-1793351507833439068);
+- the session key engaged on the PR arm only (1,341 lines vs 0); 0 errors.
+Main's #273/#274 touch only unrelated lines of the same files. The 50a2 control
+(`~/code/perf/nq-main-base-b0df50185/control`) is the new reference. #163's gate (job 50b) runs against it.
