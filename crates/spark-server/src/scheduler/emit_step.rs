@@ -723,6 +723,13 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
     let Some(m) = super::tool_markers::get() else {
         return;
     };
+    if let Some(inside) = m.native_value_transition(a.inside_parameter_body, tok) {
+        // A value opening or closing is forward progress.
+        a.inside_parameter_body = inside;
+        a.param_body_chars_emitted = 0;
+        a.tool_body_streak_tokens = 0;
+        return;
+    }
     // CC6 (2026-06-07): count ONLY envelope tokens — tokens of a
     // `<parameter=…>` VALUE (the file content of a `write` call) are exempt,
     // so a legitimately large single-file Write streams without tripping the
@@ -742,6 +749,14 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
         }
         a.guard_stop = Some("tool_envelope_stuck");
         a.finished = true;
+    }
+    if m.has_native_values() {
+        // Native markers own value tracking; the `<parameter=` scan below
+        // would match unrelated tokens in this vocabulary.
+        if a.inside_parameter_body {
+            a.param_body_chars_emitted = a.param_body_chars_emitted.saturating_add(1);
+        }
+        return;
     }
 
     if a.inside_parameter_body {
