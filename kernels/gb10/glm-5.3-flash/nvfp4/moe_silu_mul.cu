@@ -79,18 +79,16 @@ extern "C" __global__ void moe_silu_mul(
 // BF16 intermediate; MoE down-projection LoRA may request it because its fold
 // consumes the post-SiLU activations.
 
-extern "C" __global__ void silu_mul_quant_nvfp4(
+__device__ __forceinline__ void silu_mul_quant_nvfp4_row(
     const __nv_bfloat16* __restrict__ gate,
     const __nv_bfloat16* __restrict__ up,
     unsigned char* __restrict__ packed_out,
     unsigned char* __restrict__ scale_out,
     __nv_bfloat16* __restrict__ out_bf16,
-    unsigned int M,
-    unsigned int K
+    unsigned int row,
+    unsigned int K,
+    float g
 ) {
-    atlas_pdl_enter();
-    const unsigned int row = blockIdx.x;
-    if (row >= M) return;
 
     const __nv_bfloat16* grow = gate + (unsigned long long)row * K;
     const __nv_bfloat16* urow = up + (unsigned long long)row * K;
@@ -113,7 +111,7 @@ extern "C" __global__ void silu_mul_quant_nvfp4(
         }
 
         float inv;
-        srow[group] = silu_nvfp4_group_scale(group_max, &inv);
+        srow[group] = silu_nvfp4_group_scale(group_max, &inv, g);
 #pragma unroll
         for (int i = 0; i < 16; i += 2) {
             const unsigned int q0 = silu_nvfp4_quantize_e2m1(vals[i] * inv);
@@ -121,4 +119,46 @@ extern "C" __global__ void silu_mul_quant_nvfp4(
             prow[group * 8 + i / 2] = (unsigned char)((q1 << 4) | q0);
         }
     }
+}
+
+extern "C" __global__ void silu_mul_quant_nvfp4(
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    unsigned char* __restrict__ packed_out,
+    unsigned char* __restrict__ scale_out,
+    __nv_bfloat16* __restrict__ out_bf16,
+    unsigned int M,
+    unsigned int K
+) {
+    atlas_pdl_enter();
+    const unsigned int row = blockIdx.x;
+    if (row >= M) return;
+    silu_mul_quant_nvfp4_row(gate, up, packed_out, scale_out, out_bf16, row, K, 1.0f);
+}
+
+// silu_mul_quant_nvfp4 over rows sorted by expert (`expert_offsets`, E + 1
+// starts), each quantized with its expert's global scale `a2_gscale[e]`
+// (1 / w2 input_scale, ATLAS_GLM_FP4L_INPUT_SCALES).
+extern "C" __global__ void silu_mul_quant_nvfp4_by_expert(
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    unsigned char* __restrict__ packed_out,
+    unsigned char* __restrict__ scale_out,
+    __nv_bfloat16* __restrict__ out_bf16,
+    unsigned int M,
+    unsigned int K,
+    const int* __restrict__ expert_offsets,
+    const float* __restrict__ a2_gscale,
+    unsigned int num_experts
+) {
+    atlas_pdl_enter();
+    const unsigned int row = blockIdx.x;
+    if (row >= M) return;
+    // The expert e with expert_offsets[e] <= row < expert_offsets[e + 1].
+    unsigned int lo = 0, hi = num_experts;
+    while (hi - lo > 1) {
+        const unsigned int mid = (lo + hi) / 2;
+        if ((unsigned int)__ldcg(expert_offsets + mid) <= row) lo = mid; else hi = mid;
+    }
+    silu_mul_quant_nvfp4_row(gate, up, packed_out, scale_out, out_bf16, row, K, __ldcg(a2_gscale + lo));
 }

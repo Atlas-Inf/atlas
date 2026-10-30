@@ -47,13 +47,14 @@
 // Router CTAs `[0, router_ctas)`: rows of `gate_w` (`[E, K]` BF16) 16 per
 // CTA into `logits` (`[M, E]` BF16). The rest: NVFP4 groups of `A`
 // (`[M, K]`), 256 per CTA, into `a_packed` (`[M, K/2]`) and `a_scale`
-// (`[M, K/16]`) with scale2 = 1 (gemm_fp4.rs quantize_bf16_to_nvfp4).
+// (`[M, K/16]`) with scale2 = `a_scale2`: 1 (gemm_fp4.rs quantize_bf16_to_nvfp4), or
+// the gate/up input scale under ATLAS_GLM_FP4L_INPUT_SCALES (input_scales.rs).
 template <int NT>
 __device__ __forceinline__ void glm_moe_router_quant_impl(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ gate_w,
     __nv_bfloat16* __restrict__ logits, unsigned char* __restrict__ a_packed,
     unsigned char* __restrict__ a_scale, unsigned int M, unsigned int E, unsigned int K,
-    unsigned int router_ctas
+    unsigned int router_ctas, float a_scale2
 ) {
     if (blockIdx.x < router_ctas) {
         dense_gemv_bf16_tc_impl<NT>(A, reinterpret_cast<const __nv_bfloat16*>(gate_w), logits,
@@ -66,7 +67,8 @@ __device__ __forceinline__ void glm_moe_router_quant_impl(
     const unsigned int row = q / groups;
     nvfp4_quantize_group(A + (unsigned long long)row * K,
                          a_packed + (unsigned long long)row * (K / 2),
-                         a_scale + (unsigned long long)row * groups, q % groups, 1.0f, 1.0f);
+                         a_scale + (unsigned long long)row * groups, q % groups, a_scale2,
+                         1.0f / a_scale2);
 }
 
 // `touch_rows` (E, or 0 for none) router weight rows and the correction
@@ -78,16 +80,20 @@ extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE) glm_moe_ro
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ gate_w,
     const unsigned char* __restrict__ bias, __nv_bfloat16* __restrict__ logits,
     unsigned char* __restrict__ a_packed, unsigned char* __restrict__ a_scale, unsigned int M,
-    unsigned int E, unsigned int K, unsigned int router_ctas, unsigned int touch_rows
+    unsigned int E, unsigned int K, unsigned int router_ctas, unsigned int touch_rows,
+    float a_scale2
 ) {
     atlas_pdl_enter_touch({gate_w, K * 2u, K * 2ull}, {bias, 4u, 4ull}, touch_rows, blockIdx.x,
                           router_ctas);
     if (M <= 8u)
-        glm_moe_router_quant_impl<1>(A, gate_w, logits, a_packed, a_scale, M, E, K, router_ctas);
+        glm_moe_router_quant_impl<1>(A, gate_w, logits, a_packed, a_scale, M, E, K, router_ctas,
+                                        a_scale2);
     else if (M <= 16u)
-        glm_moe_router_quant_impl<2>(A, gate_w, logits, a_packed, a_scale, M, E, K, router_ctas);
+        glm_moe_router_quant_impl<2>(A, gate_w, logits, a_packed, a_scale, M, E, K, router_ctas,
+                                        a_scale2);
     else
-        glm_moe_router_quant_impl<4>(A, gate_w, logits, a_packed, a_scale, M, E, K, router_ctas);
+        glm_moe_router_quant_impl<4>(A, gate_w, logits, a_packed, a_scale, M, E, K, router_ctas,
+                                        a_scale2);
 }
 
 // The sigmoid top-k of row `row` on one warp (moe_topk_sigmoid_batched's

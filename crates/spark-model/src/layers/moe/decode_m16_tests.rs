@@ -239,14 +239,22 @@ fn verify_ffn(
         };
         assert_eq!([gate_up[0].0, down[0].0], grid);
         assert_eq!([gate_up[0].1, down[0].1], [[256, 1, 1]; 2]);
-        // The K128W argument lists: 17 fused gate/up, 12 down, the worklist
+        // The K128W argument lists: 18 fused gate/up, 12 down, the worklist
         // scratch where they take the prefix.
-        assert_eq!((gate_up[0].2.len(), down[0].2.len()), (17, 12));
+        assert_eq!((gate_up[0].2.len(), down[0].2.len()), (18, 12));
         assert_eq!(gate_up[0].2[11], Arg::Ptr(scratch));
         assert_eq!(down[0].2[11], Arg::Ptr(scratch));
         // Gate/up leaves the NVFP4 SiLU product where the down reads it.
         let scales = up_out.offset((routed * inter / 2) as usize);
-        assert_eq!(gate_up[0].2[15..], [Arg::Ptr(up_out), Arg::Ptr(scales)]);
+        // ...and, without ATLAS_GLM_FP4L_INPUT_SCALES, no down input scales.
+        assert_eq!(
+            gate_up[0].2[15..],
+            [
+                Arg::Ptr(up_out),
+                Arg::Ptr(scales),
+                Arg::Ptr(DevicePtr::NULL)
+            ]
+        );
         assert_eq!(down[0].2[..2], [Arg::Ptr(up_out), Arg::Ptr(scales)]);
         assert!(position(&gate_up_name) < position(&down_name));
         // Nothing of the M64 paths runs.

@@ -119,6 +119,9 @@ pub struct MoeLayer {
     /// qwen4_exp's W4A4 routed prefill: the checkpoint's activation scales
     /// and their alpha tables (`w4a4_scales.rs`).
     pub(super) w4a4: Option<super::W4a4Scales>,
+    /// `ATLAS_GLM_FP4L_INPUT_SCALES`: the calibrated activation scales and
+    /// their folded tables (`input_scales.rs`).
+    pub(super) input_scales: Option<super::InputScales>,
     /// CUTLASS grouped-NVFP4 host tables (`ATLAS_HOLO_MOE_GROUPED_CUTLASS`).
     /// Per-expert packed/SFB pointer values + scale2, snapshotted ONCE at load
     /// by `build_cutlass_grouped_sfb` (the SFB swizzle is built there from the

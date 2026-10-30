@@ -337,10 +337,11 @@ __device__ __forceinline__ void pqs_impl(
 #define PQS_GATE_UP_ARGS \
     PQ2_ARGS, const unsigned int* __restrict__ worklist, \
     const unsigned long long* __restrict__ up_packed_ptrs, const unsigned long long* __restrict__ up_scale_ptrs, \
-    const float* __restrict__ up_scale2_vals, unsigned char* __restrict__ out_packed, unsigned char* __restrict__ out_scale
+    const float* __restrict__ up_scale2_vals, unsigned char* __restrict__ out_packed, unsigned char* __restrict__ out_scale, \
+    const float* __restrict__ a2_gscale
 #define PQS_TABLES A_packed, A_scale, B_packed_ptrs, B_scale_ptrs, scale2_vals, C, \
     expert_offsets, sorted_token_ids, num_experts, N, K, worklist
-#define PQS_UP PqwGateUp{up_packed_ptrs, up_scale_ptrs, up_scale2_vals, out_packed, out_scale}
+#define PQS_UP PqwGateUp{up_packed_ptrs, up_scale_ptrs, up_scale2_vals, out_packed, out_scale, a2_gscale}
 
 extern "C" __global__ void __launch_bounds__(PQS_THREADS, 2) glm_moe_decode_m16s_k128w(PQS_DOWN_ARGS) {
     pqs_impl<false, false, 1>(PQS_TABLES, PqwGateUp{});

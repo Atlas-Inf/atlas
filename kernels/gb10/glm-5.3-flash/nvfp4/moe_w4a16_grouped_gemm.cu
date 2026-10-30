@@ -863,6 +863,9 @@ struct PqwGateUp {
     const float* __restrict__ scale2_vals;
     unsigned char* __restrict__ out_packed;   // [rows, N/2] E2M1
     unsigned char* __restrict__ out_scale;    // [rows, N/16] E4M3
+    // Per-expert global scale of the NVFP4 SiLU output (the down input):
+    // 1 / w2 input_scale (ATLAS_GLM_FP4L_INPUT_SCALES), or null for 1.
+    const float* __restrict__ a2_gscale;
 };
 
 // One K128W tile is 64 rows x 256 B columns (GATE_UP: 128 gate columns and
@@ -1041,6 +1044,7 @@ __device__ __forceinline__ void pqw_epilogue(
         // Gate subtile j pairs with up subtile j + 4 (same columns); each
         // 16-column group spans two subtiles, i.e. one quad of threads.
         const float scale2_up = up.scale2_vals[expert_id];
+        const float a2g = up.a2_gscale != nullptr ? up.a2_gscale[expert_id] : 1.0f;
         #pragma unroll
         for (int mi = 0; mi < 2; mi++) {
             const unsigned int rl = warp_m_offset + mi * 16 + group_id;
@@ -1062,7 +1066,7 @@ __device__ __forceinline__ void pqw_epilogue(
                     group_max = fmaxf(group_max, __shfl_xor_sync(0xffffffffu, group_max, 1));
                     group_max = fmaxf(group_max, __shfl_xor_sync(0xffffffffu, group_max, 2));
                     float inv;
-                    const unsigned char sc = silu_nvfp4_group_scale(group_max, &inv);
+                    const unsigned char sc = silu_nvfp4_group_scale(group_max, &inv, a2g);
                     const unsigned int col = cta_n + (warp_id >> 1) * 32 + q * 16;
                     if (!valid) continue;
                     if (tid == 0) up.out_scale[(unsigned long long)row * (N / 16) + col / 16] = sc;
@@ -1179,11 +1183,12 @@ extern "C" __global__ void __launch_bounds__(256, 2) moe_w4a4_grouped_gemm_prequ
     const unsigned long long* __restrict__ up_scale_ptrs,
     const float* __restrict__ up_scale2_vals,
     unsigned char* __restrict__ out_packed,
-    unsigned char* __restrict__ out_scale
+    unsigned char* __restrict__ out_scale,
+    const float* __restrict__ a2_gscale
 ) {
     pqw_impl<true>(A_packed, A_scale, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,
         expert_offsets, sorted_token_ids, num_experts, N, K, mtile_prefix,
-        PqwGateUp{up_packed_ptrs, up_scale_ptrs, up_scale2_vals, out_packed, out_scale});
+        PqwGateUp{up_packed_ptrs, up_scale_ptrs, up_scale2_vals, out_packed, out_scale, a2_gscale});
 }
 
 // ── Persistent K128W (ATLAS_GLM_MOE_PREFILL_PERSIST) ─────────────────────
@@ -1301,11 +1306,12 @@ extern "C" __global__ void __launch_bounds__(256, 2) moe_w4a4_grouped_gemm_prequ
     const float* __restrict__ up_scale2_vals,
     unsigned char* __restrict__ out_packed,
     unsigned char* __restrict__ out_scale,
+    const float* __restrict__ a2_gscale,
     int* __restrict__ next_work
 ) {
     pqp_impl<true>(A_packed, A_scale, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,
         expert_offsets, sorted_token_ids, num_experts, N, K, mtile_prefix, next_work,
-        PqwGateUp{up_packed_ptrs, up_scale_ptrs, up_scale2_vals, out_packed, out_scale});
+        PqwGateUp{up_packed_ptrs, up_scale_ptrs, up_scale2_vals, out_packed, out_scale, a2_gscale});
 }
 
 // Grid (2 x SMs, 1, 1), 256 threads; arguments as

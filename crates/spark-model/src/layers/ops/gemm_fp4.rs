@@ -27,13 +27,33 @@ pub fn quantize_bf16_to_nvfp4(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    // scale2 = 1.0 (single-level; activation range fits E4M3 group scales).
+    quantize_bf16_to_nvfp4_scaled(gpu, kernel, input, packed_out, scale_out, 1.0, m, k, stream)
+}
+
+/// [`quantize_bf16_to_nvfp4`] at activation global scale `1 / scale2`: the
+/// block scales are `e4m3(amax / (6 * scale2))` and the codes `e2m1(x /
+/// (scale2 * sf))` (`ATLAS_GLM_FP4L_INPUT_SCALES`: the checkpoint's gate/up
+/// input scale). `scale2 = 1` is [`quantize_bf16_to_nvfp4`] bit for bit.
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_bf16_to_nvfp4_scaled(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    packed_out: DevicePtr,
+    scale_out: DevicePtr,
+    scale2: f32,
+    m: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
         .grid([m, 1, 1])
         .block([128, 1, 1])
         .arg_ptr(input)
         .arg_ptr(packed_out)
         .arg_ptr(scale_out)
-        .arg_f32(1.0) // scale2 = 1.0 (single-level; activation range fits E4M3 group scales)
+        .arg_f32(scale2)
         .arg_u32(m) // kernel's N param = rows = tokens
         .arg_u32(k)
         .launch(stream)

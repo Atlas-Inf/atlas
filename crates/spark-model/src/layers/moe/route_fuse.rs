@@ -123,6 +123,7 @@ impl RouteFuse {
             .arg_u32(a.hidden)
             .arg_u32(router_ctas)
             .arg_u32(a.experts)
+            .arg_f32(a.a_scale2)
             .launch(stream)?;
         KernelLaunch::new(gpu, self.select)
             .grid([1, 1, 1])
@@ -171,6 +172,9 @@ pub(super) struct RouteArgs {
     pub top_k: u32,
     pub normalize: bool,
     pub scaling: f32,
+    /// The NVFP4 input's `scale2`: 1, or the gate/up input scale
+    /// (`ATLAS_GLM_FP4L_INPUT_SCALES`).
+    pub a_scale2: f32,
 }
 
 /// Where steps 1-3 leave the routes of `forward_prefill`'s batch.
@@ -341,6 +345,7 @@ impl MoeLayer {
             top_k,
             normalize: ctx.config.norm_topk_prob,
             scaling: ctx.config.routed_scaling_factor as f32,
+            a_scale2: self.a1_scale2(),
         };
         self.route_fuse.launch(ctx.gpu, &args, stream)
     }

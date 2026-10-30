@@ -149,6 +149,7 @@ __device__ __forceinline__ void pqd_epilogue(
     const unsigned int group_id = lane_id >> 2, tid = lane_id & 3;
     if constexpr (GATE_UP) {
         const float scale2_up = up.scale2_vals[expert_id];
+        const float a2g = up.a2_gscale != nullptr ? up.a2_gscale[expert_id] : 1.0f;
         const unsigned int col = cta_n + warp_id * 16;
         #pragma unroll
         for (int half = 0; half < 2; half++) {
@@ -166,7 +167,7 @@ __device__ __forceinline__ void pqd_epilogue(
             group_max = fmaxf(group_max, __shfl_xor_sync(0xffffffffu, group_max, 1));
             group_max = fmaxf(group_max, __shfl_xor_sync(0xffffffffu, group_max, 2));
             float inv;
-            const unsigned char sc = silu_nvfp4_group_scale(group_max, &inv);
+            const unsigned char sc = silu_nvfp4_group_scale(group_max, &inv, a2g);
             if (!valid) continue;
             if (tid == 0) up.out_scale[(unsigned long long)row * (N / 16) + col / 16] = sc;
             #pragma unroll
@@ -311,9 +312,10 @@ extern "C" __global__ void __launch_bounds__(256) glm_moe_decode_m16_gate_up_sil
     const unsigned long long* __restrict__ up_scale_ptrs,
     const float* __restrict__ up_scale2_vals,
     unsigned char* __restrict__ out_packed,
-    unsigned char* __restrict__ out_scale
+    unsigned char* __restrict__ out_scale,
+    const float* __restrict__ a2_gscale
 ) {
     pqd_impl<true, false>(A_packed, A_scale, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,
         expert_offsets, sorted_token_ids, num_experts, N, K, worklist,
-        PqwGateUp{up_packed_ptrs, up_scale_ptrs, up_scale2_vals, out_packed, out_scale});
+        PqwGateUp{up_packed_ptrs, up_scale_ptrs, up_scale2_vals, out_packed, out_scale, a2_gscale});
 }

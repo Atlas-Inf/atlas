@@ -26,6 +26,9 @@ impl MoeLayer {
         // scales. No allocation or persistent memory is introduced.
         let a_packed = expert_up_out;
         let a_scale = a_packed.offset(total_expanded as usize * inter as usize / 2);
+        // ATLAS_GLM_FP4L_INPUT_SCALES: the table folding each expert's down
+        // input scale back (`input_scales.rs`).
+        let down = self.a4_table(down)?;
         let grouped_kernel = if self.nvfp4_vecscale && self.moe_w4a4_prequant_t_k64_vecscale.0 != 0
         {
             self.moe_w4a4_prequant_t_k64_vecscale
@@ -55,6 +58,7 @@ impl MoeLayer {
         expert_up_out: DevicePtr,
         total_expanded: u32,
         inter: u32,
+        [expert_offsets, num_experts]: [u64; 2],
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -70,18 +74,33 @@ impl MoeLayer {
         } else {
             DevicePtr::NULL
         };
-        ops::silu_mul_quant_nvfp4(
-            ctx.gpu,
-            self.silu_mul_quant_nvfp4_k,
-            expert_gate_out,
-            expert_up_out,
-            staged_packed,
-            staged_scale,
-            out_bf16,
-            total_expanded,
-            inter,
-            stream,
-        )?;
+        // ATLAS_GLM_FP4L_INPUT_SCALES: each expert's rows at its own down
+        // input scale (`input_scales.rs`).
+        if let Some(s) = &self.input_scales {
+            ops::silu_mul_quant_nvfp4_by_expert(
+                ctx.gpu,
+                s.silu_by_expert,
+                [expert_gate_out, expert_up_out],
+                [staged_packed, staged_scale, out_bf16],
+                [total_expanded, inter],
+                [DevicePtr(expert_offsets), s.a2_gscale],
+                num_experts as u32,
+                stream,
+            )?;
+        } else {
+            ops::silu_mul_quant_nvfp4(
+                ctx.gpu,
+                self.silu_mul_quant_nvfp4_k,
+                expert_gate_out,
+                expert_up_out,
+                staged_packed,
+                staged_scale,
+                out_bf16,
+                total_expanded,
+                inter,
+                stream,
+            )?;
+        }
         ctx.gpu.copy_d2d_async(
             staged_packed,
             expert_up_out,

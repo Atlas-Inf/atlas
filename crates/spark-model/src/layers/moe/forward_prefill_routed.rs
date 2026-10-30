@@ -591,6 +591,7 @@ impl MoeLayer {
                     expert_up_out,
                     total_expanded,
                     inter,
+                    [expert_offsets.0, num_experts as u64],
                     ctx,
                     stream,
                 )?;
@@ -663,6 +664,11 @@ impl MoeLayer {
                     )?;
                 } else if self.nvfp4_prequant_moe && self.moe_w4a4_prequant_t_k64.0 != 0 {
                     if !fused_nvfp4_down {
+                        anyhow::ensure!(
+                            self.input_scales.is_none(),
+                            "ATLAS_GLM_FP4L_INPUT_SCALES needs the fused SiLU quantization \
+                             (ATLAS_NVFP4_FUSED_SILU_QUANT=1)"
+                        );
                         let a_packed = expert_up_out;
                         let a_scale = a_packed.offset(total_expanded as usize * inter as usize / 2);
                         ops::quantize_bf16_to_nvfp4(

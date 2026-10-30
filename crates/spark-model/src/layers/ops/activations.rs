@@ -127,6 +127,36 @@ pub fn silu_mul_quant_nvfp4(
         .launch(stream)
 }
 
+/// [`silu_mul_quant_nvfp4`] over `m` rows sorted by expert (`expert_offsets`,
+/// `num_experts + 1` starts), each row under its expert's activation global
+/// scale `a2_gscale[e]` (`silu_mul_quant_nvfp4_by_expert`).
+#[allow(clippy::too_many_arguments)]
+pub fn silu_mul_quant_nvfp4_by_expert(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    [gate, up]: [DevicePtr; 2],
+    [packed_out, scale_out, out_bf16]: [DevicePtr; 3],
+    [m, k]: [u32; 2],
+    [expert_offsets, a2_gscale]: [DevicePtr; 2],
+    num_experts: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([m, 1, 1])
+        .block([128, 1, 1])
+        .arg_ptr(gate)
+        .arg_ptr(up)
+        .arg_ptr(packed_out)
+        .arg_ptr(scale_out)
+        .arg_ptr(out_bf16)
+        .arg_u32(m)
+        .arg_u32(k)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(a2_gscale)
+        .arg_u32(num_experts)
+        .launch(stream)
+}
+
 /// L2 normalization (in-place): `data[i] = data[i] / sqrt(sum(data^2) + eps)`.
 ///
 /// Applied per head: data is [num_heads, head_dim], each head normalized independently.

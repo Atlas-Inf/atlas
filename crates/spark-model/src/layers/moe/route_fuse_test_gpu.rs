@@ -166,6 +166,7 @@ impl Bufs {
                 top_k: TOPK,
                 normalize: true,
                 scaling: SCALING,
+                a_scale2: 1.0,
             },
         })
     }

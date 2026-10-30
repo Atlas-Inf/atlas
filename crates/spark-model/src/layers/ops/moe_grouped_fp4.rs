@@ -223,8 +223,7 @@ pub fn moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w(
     a_scale: DevicePtr,
     [gate_packed, gate_scale, gate_scale2]: [DevicePtr; 3],
     [up_packed, up_scale, up_scale2]: [DevicePtr; 3],
-    out_packed: DevicePtr,
-    out_scale: DevicePtr,
+    [out_packed, out_scale, a2_gscale]: [DevicePtr; 3],
     expert_offsets: DevicePtr,
     sorted_token_ids: DevicePtr,
     num_experts: u32,
@@ -252,7 +251,8 @@ pub fn moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w(
         .arg_ptr(up_scale)
         .arg_ptr(up_scale2)
         .arg_ptr(out_packed)
-        .arg_ptr(out_scale);
+        .arg_ptr(out_scale)
+        .arg_ptr(a2_gscale);
     schedule.finish(launch, stream)
 }
 
