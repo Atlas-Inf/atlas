@@ -390,7 +390,12 @@ impl BufferSizes {
         // prefill input is FP8-precast into this buffer.
         let max_proj_k = h.max(q_heads * hd).max(mamba2_d_inner);
         let fp8_act = m * max_proj_k;
-        let fp8_act_scale = m * max_proj_k.div_ceil(128) * 4;
+        // The same buffer also holds an MXFP8 activation's cuBLASLt scale
+        // image (one byte per 32 values, in 128-row x 4-column tiles), which
+        // pads the rows up to a whole tile: a 16390-row prefill pass needs
+        // 16512 rows of scales, past the per-row size above.
+        let fp8_act_scale = (m * max_proj_k.div_ceil(128) * 4)
+            .max(m.next_multiple_of(128) * max_proj_k.div_ceil(32).next_multiple_of(4));
         // LoRA scratch — only when an adapter is configured (adapter_max_rank
         // set programmatically pre-build). Widest target n_out =
         // max(hidden, intermediate, q_proj): covers k/v, o/down (hidden),

@@ -44,6 +44,21 @@ pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_BATCH_FAST_BISECT", || {
         Ok(qwen4exp_batch_fast::bisect_requested() as u64)
     }),
+    // Which MXFP8 GEMV family sums the decode/verify projections: two
+    // summation orders in one out_proj all-reduce.
+    ("ATLAS_QWEN4EXP_MXFP8_DECODE", || {
+        Ok(crate::layers::ops::mxfp8_decode_tc() as u64)
+    }),
+    // Whether prefill projections are W8A8 or BF16-expansion GEMMs: the
+    // rows a rank writes into the prefix cache and the SP gathers.
+    ("ATLAS_QWEN4EXP_PREFILL_W8A8", || {
+        Ok(crate::layers::ops::qwen4exp_w8a8::enabled() as u64)
+    }),
+    // Which shared expert a rank loads: under EP SparkQwen's is a slice whose
+    // partial joins the reduce, the other a whole one added after it.
+    ("ATLAS_QWEN4EXP_MXFP8_SHARED", || {
+        Ok(crate::layers::moe::shared_mxfp8_requested() as u64)
+    }),
     ("ATLAS_SSM_SAVE_DUMP", || {
         Ok(graph_flags::ssm_save_dump() as u64)
     }),

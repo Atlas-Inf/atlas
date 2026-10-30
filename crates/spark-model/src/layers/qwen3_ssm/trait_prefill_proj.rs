@@ -69,7 +69,7 @@ impl Qwen3SsmLayer {
         // slots are NULL on this path).
         // Native MXFP8 (FP4-Local): the layer's only copy, sequential layout.
         if let Some(mx8) = self.mx8.as_ref() {
-            return self.mx8_qkvz(mx8, ctx, normed, proj_dst, k as usize, stream);
+            return self.mx8_qkvz(mx8, ctx, normed, proj_dst, k as usize, true, stream);
         }
         if self.qkvz_q2.is_some() {
             let scratch = ctx.buffers.q2_dequant_scratch();
