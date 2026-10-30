@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Qwen TP2 modes share native target precision and target-verified MTP.
 //! Ported from Enntity/atlas `weight_loader/qwen4_exp/mode.rs` (AGPL-3.0-only),
-//! adapted for this stack: `ATLAS_QWEN4EXP_MXFP8_DECODE` and
-//! `ATLAS_QWEN4EXP_PREFILL_W8A8` have no implementation here (their features
-//! are not in this tree), so they are omitted from the flag contract.
+//! adapted for this stack: the switches its native-precision paths need
+//! (`ATLAS_QWEN4EXP_MXFP8_DECODE`, `_PREFILL_W8A8`, `_MXFP8_SHARED`,
+//! `_PREFILL_W4A4`) are opt-in here, so a mode requires each at `1`.
 use anyhow::{Result, bail, ensure};
 use atlas_core::config::ModelConfig;
 
@@ -17,8 +17,12 @@ pub const REQUIRED_FLAGS: &[(&str, &str)] = &[
     ("ATLAS_QWEN4EXP_NO_PLE", "0"),
     ("ATLAS_MTP_DRAFTER_QSA", "0"),
     ("ATLAS_QSA_DISABLE", "0"),
+    ("ATLAS_QWEN4EXP_MXFP8_DECODE", "1"),
     ("ATLAS_QWEN4EXP_BF16_GDN", "1"),
     ("ATLAS_QWEN4EXP_FP8_GDN", "0"),
+    ("ATLAS_QWEN4EXP_PREFILL_W8A8", "1"),
+    ("ATLAS_QWEN4EXP_MXFP8_SHARED", "1"),
+    ("ATLAS_QWEN4EXP_PREFILL_W4A4", "1"),
     ("ATLAS_QWEN4EXP_PREFILL_MOE", "1"),
     ("ATLAS_QWEN4EXP_PREFILL_MOE_BF16", "0"),
     ("ATLAS_QWEN4EXP_PREFILL_BF16_PROJ", "0"),
@@ -174,6 +178,17 @@ mod tests {
                     .is_err()
                 );
             }
+        }
+    }
+    #[test]
+    fn modes_require_the_native_precision_paths() {
+        for key in [
+            "ATLAS_QWEN4EXP_MXFP8_DECODE",
+            "ATLAS_QWEN4EXP_PREFILL_W8A8",
+            "ATLAS_QWEN4EXP_MXFP8_SHARED",
+            "ATLAS_QWEN4EXP_PREFILL_W4A4",
+        ] {
+            assert!(REQUIRED_FLAGS.contains(&(key, "1")), "{key}");
         }
     }
     #[test]
