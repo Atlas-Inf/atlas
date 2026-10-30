@@ -1430,3 +1430,19 @@ One-variable A/B at merge base b0df50185 (job 50a2 vs job 50a):
 - the session key engaged on the PR arm only (1,341 lines vs 0); 0 errors.
 Main's #273/#274 touch only unrelated lines of the same files. The 50a2 control
 (`~/code/perf/nq-main-base-b0df50185/control`) is the new reference. #163's gate (job 50b) runs against it.
+
+## 2026-10-30 17:40 UTC — #163 MERGED (8eb907260, opt-in `--exact-prefix-cache`)
+
+Job 50b (same base b0df50185 as 50a2):
+- tests 5/5; flag OFF control byte-identical to main (default unchanged);
+- flag ON: agentic 50/50 + 50/50 at 11.25 s/turn, 345 turns (different trajectories); BFCL 87.84 / 86.94 vs main
+  87.64 / 87.13 (floor 86.92); 0 errors.
+- Exact-hit probe: 10/15 in both arms, and every "mismatch" is only the sequential tool-call id. So on FP4-Local, main
+  already gives cold == warm, and the flag's benefit isn't observable here. The flag moves prefill chunk boundaries, so it
+  changes numerics.
+Merged as opt-in, with these findings on the PR. The CLA check was a transient failure (re-run passed; all commits by
+maplepaladin73).
+
+Recipe vets: jobs 56/57 and their first re-runs failed on job-script bugs (port nested under `defaults.port`; an empty
+env-key list made the env diff fail). Both are fixed. Queue: 56d Flash-Next NVFP4 vet (running) → 57d 27B NVFP4 vet → 58
+FP4-Local recipe vet on `sha-8eb9072` (main after #163; waits up to 2 h for the image). ≈ 13 h.
