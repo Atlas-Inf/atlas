@@ -126,9 +126,6 @@ impl Qwen3AttentionLayer {
         } = GlmIndexSelection::from_config(config, &probes)?;
         // Short gate flags so each GLM/hyper-connection lookup stays one line.
         let (glm, hc) = (probes.glm_kpool_indexer, probes.hyper_connection);
-        // Only these targets ship native MXFP8 projection kernels.
-        let glm_target = config.model_type == "glm5_next";
-        let native_mxfp8 = glm_target || config.model_type == "qwen4_exp";
         let mut layer = Self {
             input_norm,
             attn,
