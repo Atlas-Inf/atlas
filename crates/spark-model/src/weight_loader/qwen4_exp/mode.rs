@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Qwen TP2 modes share native target precision and target-verified MTP.
 //! Ported from Enntity/atlas `weight_loader/qwen4_exp/mode.rs` (AGPL-3.0-only),
-//! adapted for this stack: `ATLAS_QWEN4EXP_MXFP8_DECODE` selects the
-//! tensor-core MXFP8 tiers (`ops::mxfp8_decode_tc`) and is checked by startup
-//! parity, not here; `ATLAS_QWEN4EXP_PREFILL_W8A8` and
-//! `ATLAS_QWEN4EXP_MTP_BF16_ATTN` have no implementation here (their features
-//! are not in this tree), so they are omitted from the flag contract; the corrected-RNE quantizer kernel
-//! (`quantize_bf16_to_nvfp4_weight_rne`) likewise has no target here, so
-//! `weight_quantizer()` always names the standard converter and Spark's draft
-//! copy does not carry Enntity's corrected-rounding guarantee.
+//! adapted for this stack: `ATLAS_QWEN4EXP_MXFP8_DECODE` and
+//! `ATLAS_QWEN4EXP_PREFILL_W8A8` are opt-in here (startup parity checks
+//! them), so they are not part of this flag contract.
 use anyhow::{Result, bail, ensure};
 use atlas_core::config::ModelConfig;
 
@@ -57,13 +52,18 @@ impl ServingMode {
         Ok(())
     }
 
-    /// Strict keeps the BF16 draft head (the only attention path in this
-    /// stack — Enntity's separate `ATLAS_QWEN4EXP_MTP_BF16_ATTN` switch is
-    /// absent here); Spark selects the NVFP4 draft copy.
-    pub fn drafter_flags(self) -> [(&'static str, &'static str); 1] {
+    /// Strict drafts on the checkpoint's BF16 MTP attention and the BF16
+    /// draft head; Spark on NVFP4 MTP attention and the NVFP4 draft copy.
+    pub fn drafter_flags(self) -> [(&'static str, &'static str); 2] {
         match self {
-            Self::Strict => [("ATLAS_QWEN4EXP_DRAFT_HEAD_NVFP4", "0")],
-            Self::Spark => [("ATLAS_QWEN4EXP_DRAFT_HEAD_NVFP4", "1")],
+            Self::Strict => [
+                ("ATLAS_QWEN4EXP_MTP_BF16_ATTN", "1"),
+                ("ATLAS_QWEN4EXP_DRAFT_HEAD_NVFP4", "0"),
+            ],
+            Self::Spark => [
+                ("ATLAS_QWEN4EXP_MTP_BF16_ATTN", "0"),
+                ("ATLAS_QWEN4EXP_DRAFT_HEAD_NVFP4", "1"),
+            ],
         }
     }
 
@@ -110,13 +110,19 @@ pub fn selected() -> Result<Option<ServingMode>> {
     .map_err(anyhow::Error::msg)
 }
 
-/// Draft-weight quantizer name. Enntity selects the corrected-RNE converter
-/// (`quantize_bf16_to_nvfp4_weight_rne`) under a mode; that kernel is not in
-/// this stack, so both modes use the standard converter — Spark's draft copy
-/// therefore does NOT carry their rounding guarantee.
+/// Enntity's corrected RNE weight conversion (GLM's), scoped to the Qwen draft
+/// copies under a mode: the MTP drafter's and the draft head's. The
+/// checkpoint target and activation quantizers remain unchanged.
 pub fn weight_quantizer() -> Result<&'static str> {
-    let _ = selected()?;
-    Ok("quantize_bf16_to_nvfp4")
+    Ok(weight_quantizer_for(selected()?))
+}
+
+fn weight_quantizer_for(mode: Option<ServingMode>) -> &'static str {
+    if mode.is_some() {
+        "quantize_bf16_to_nvfp4_weight_rne"
+    } else {
+        "quantize_bf16_to_nvfp4"
+    }
 }
 
 pub fn validate(config: &ModelConfig, mtp: bool, alternate: bool) -> Result<()> {
@@ -168,6 +174,32 @@ mod tests {
                     .is_err()
                 );
             }
+        }
+    }
+    #[test]
+    fn strict_drafts_on_bf16_attention_and_spark_on_nvfp4() {
+        let flag = |mode: ServingMode, key: &str| {
+            mode.drafter_flags()
+                .into_iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v)
+        };
+        for (mode, attn, head) in [
+            (ServingMode::Strict, "1", "0"),
+            (ServingMode::Spark, "0", "1"),
+        ] {
+            assert_eq!(flag(mode, "ATLAS_QWEN4EXP_MTP_BF16_ATTN"), Some(attn));
+            assert_eq!(flag(mode, "ATLAS_QWEN4EXP_DRAFT_HEAD_NVFP4"), Some(head));
+        }
+    }
+    #[test]
+    fn draft_copies_take_the_rne_weight_converter_only_under_a_mode() {
+        assert_eq!(weight_quantizer_for(None), "quantize_bf16_to_nvfp4");
+        for mode in [ServingMode::Strict, ServingMode::Spark] {
+            assert_eq!(
+                weight_quantizer_for(Some(mode)),
+                "quantize_bf16_to_nvfp4_weight_rne"
+            );
         }
     }
     #[test]

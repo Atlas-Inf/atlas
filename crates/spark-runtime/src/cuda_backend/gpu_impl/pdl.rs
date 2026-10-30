@@ -180,6 +180,8 @@ pub(super) const PDL_KERNELS: &[&str] = &[
 /// QSA indexer and cuBLASLt. A kernel after an unlisted one (or after a copy
 /// or memset) simply launches when its predecessor completes.
 pub(super) const QWEN4EXP_PDL_KERNELS: &[&str] = &[
+    // The corrected-RNE weight converter of the draft copies enters first.
+    "quantize_bf16_to_nvfp4_weight_rne",
     // mHC (ATLAS_QWEN4EXP_HC_FAST) and the fused seam.
     "hc_pre_stage_vec",
     "hc_pre_down_vec",
