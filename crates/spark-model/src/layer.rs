@@ -380,6 +380,8 @@ pub struct ForwardContext<'a> {
     /// cached K/V, and the replay range [snap_tok, matched) is rewritten
     /// into SHARED prefix-cache blocks — non-exact recompute poisons them
     /// and the drift ratchets across turns (2026-06-10 warm-hit stutter).
+    /// Exact path: register-resident token-sequential kernel (default), WY4
+    /// fallback. Off under the prefill grid (see `grid_replay_is_cold`).
     pub gdn_exact_replay: bool,
     /// Device `[num_tokens]` u32 token IDs for the tokens being processed this
     /// pass, in the SAME order the per-token MoE loop visits them. Required by

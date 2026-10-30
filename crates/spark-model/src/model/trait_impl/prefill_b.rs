@@ -109,9 +109,13 @@ impl TransformerModel {
         // across ranks (bug #33 invariant). Skipped for vision prompts (pad
         // runs must not straddle chunk boundaries) and non-SSM models
         // (KV-only cache hits need no snapshot).
+        // R11 fix 1: the pass grid replaces the tail split below (meta/grid.rs).
+        if let Some(r) = self.grid_cut(tokens, seq, chunk_start, chunk_len, is_last_chunk, stream) {
+            return r;
+        }
         if is_last_chunk
             && self.config.num_ssm_layers() > 0
-            && self.ssm_snapshots.is_enabled()
+            && self.tail_split_snapshots()
             && self.prefix_cache.is_active()
             && !self.tokens_have_vision_pad(tokens)
         {

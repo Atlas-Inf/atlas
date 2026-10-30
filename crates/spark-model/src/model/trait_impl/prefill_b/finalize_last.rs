@@ -326,8 +326,9 @@ impl TransformerModel {
         // orphan a pool slot).
         let full_blocks = tokens.len() / bs;
         let valid_blocks = seq.kv_valid_tokens / bs;
-        let cache_blocks = full_blocks.min(valid_blocks);
-        let cap_applied = cache_blocks < full_blocks;
+        // R11 fix 1: the pass grid caps this further, with no leaf snapshot.
+        let (cache_blocks, cap_applied, grid_cap) =
+            self.grid_cap_blocks(full_blocks.min(valid_blocks), full_blocks, tokens.len(), bs);
         let cache_tokens_len = if cap_applied {
             cache_blocks * bs
         } else {
@@ -340,7 +341,7 @@ impl TransformerModel {
         } else {
             &seq.disk_block_ids[..cache_blocks.min(seq.disk_block_ids.len())]
         };
-        if cap_applied {
+        if cap_applied && !grid_cap {
             tracing::warn!(
                 "Prefix-cache stale-V cap: caching {} of {} complete blocks \
                  (kv_valid_tokens={} < prompt_len={}); trailing blocks had \

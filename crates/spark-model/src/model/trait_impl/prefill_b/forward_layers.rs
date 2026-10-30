@@ -153,7 +153,13 @@ impl TransformerModel {
             // and must use the bit-faithful WY4 recurrence (see layer.rs).
             // ATLAS_QWEN4EXP_PREFILL_ROWINV keeps the chunked scan: a restore
             // sits on its 64-token grid, so the replay is the cold pass's.
-            gdn_exact_replay: marconi_skip && !crate::layers::ops::qwen4exp_rowinv::on(),
+            // R11 fix 6: under the prefill grid a warm replay pass IS a cold
+            // pass (same start, same length), so the cold run's FLA kernel is
+            // the bit-faithful one; forcing the exact-replay kernel there
+            // (register-resident, or WY4 if that is off) made warm != cold.
+            gdn_exact_replay: marconi_skip
+                && !crate::layers::ops::qwen4exp_rowinv::on()
+                && !self.grid_replay_is_cold(),
             // Hash-MoE: this chunk's token IDs (uploaded in prefill_b_embed_chunk
             // to the stable buffer, in chunk order matching the MoE loop).
             token_ids: Some(self.buffers.token_ids().offset(skip * 4)),
