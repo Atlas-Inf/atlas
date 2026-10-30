@@ -200,6 +200,14 @@ echo "serving $MODEL on ${GFX:-AMD} via $HW"
 # resolve to the same thing, kept explicit so LM_HEAD stays a knob). For the
 # unsloth checkpoint use LM_HEAD=bf16 — its lm_head ships per-row FP8 and the
 # frozen accuracy recipe preserves it to BF16.
+# Flash-Next's FP8 GDN decode copy (the gfx1151 default since #275) costs
+# ~1.9 GB on top of the BF16 projections kept for prefill. At MAX_BATCH 1 that
+# is +17% decode for nothing; at MAX_BATCH 8 it left 0.1 GB of KV on a 96 GB
+# GPU and C4/C8 requests ran one at a time (framework f114). So above batch 1
+# the recipe keeps BF16 unless ATLAS_QWEN4EXP_FP8_GDN is set explicitly.
+if [ "${MAX_BATCH:-1}" -gt 1 ]; then
+  export ATLAS_QWEN4EXP_FP8_GDN="${ATLAS_QWEN4EXP_FP8_GDN:-0}"
+fi
 exec "$BIN" serve "$MODEL" "${NAME_ARG[@]}" \
   --host "${HOST:-0.0.0.0}" --port "${PORT:-8081}" \
   --max-seq-len "$MAX_SEQ_LEN" \
