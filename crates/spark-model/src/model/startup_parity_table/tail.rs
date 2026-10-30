@@ -11,6 +11,14 @@ use crate::model::{graph_flags, qwen4exp_batch_fast, qwen4exp_exact_verify, qwen
 /// chains them after [`super::SETTINGS`], so the gathered order is
 /// unchanged.
 pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
+    ("ATLAS_GLM_SERVING_MODE", || {
+        use crate::weight_loader::glm5_mode::{ServingMode, selected};
+        Ok(match selected()? {
+            None => 0,
+            Some(ServingMode::Strict) => 1,
+            Some(ServingMode::Spark) => 2,
+        })
+    }),
     ("ATLAS_GLM_MLA_FUSE", || {
         Ok(ops::glm_mla_fuse_requested()? as u64)
     }),
