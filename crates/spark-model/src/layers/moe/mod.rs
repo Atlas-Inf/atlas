@@ -19,6 +19,8 @@ pub(crate) use btile_model_owners::{
 };
 #[cfg(test)]
 pub(crate) use gate_up_repack::model_fixture as btile_model_fixture;
+#[cfg(test)]
+pub(crate) use gate_up_repack::recording as kernel_recording;
 
 /// Device-side pointer table for one projection across all experts.
 ///

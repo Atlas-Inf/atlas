@@ -164,3 +164,23 @@ fn drafter_copies_take_the_rne_weight_converter_only_under_a_mode() {
         );
     }
 }
+
+#[test]
+fn a_mode_refuses_a_fallback_conversion() {
+    for mode in [ServingMode::Strict, ServingMode::Spark] {
+        assert!(require_format_for(Some(mode), true, "weights").is_ok());
+        let err = require_format_for(Some(mode), false, "x MXFP8 weights").unwrap_err();
+        assert!(err.to_string().contains("x MXFP8 weights"), "{err}");
+    }
+    assert!(require_format_for(None, false, "weights").is_ok());
+}
+
+#[test]
+fn missing_local_scales_cannot_masquerade_as_remote_experts() {
+    assert!(validate_calibration(true, [true; 3], [true; 3]).is_ok());
+    assert!(validate_calibration(true, [false; 3], [false; 3]).is_ok());
+    assert!(validate_calibration(true, [true; 3], [false; 3]).is_err());
+    assert!(validate_calibration(true, [true; 3], [true, true, false]).is_err());
+    assert!(validate_calibration(true, [true, false, true], [true; 3]).is_err());
+    assert!(validate_calibration(false, [true; 3], [false; 3]).is_ok());
+}

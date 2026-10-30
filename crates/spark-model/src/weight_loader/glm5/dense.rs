@@ -97,6 +97,7 @@ pub(super) fn native_dense(
         return Ok(None);
     }
     if raw_mxfp8(store, &format!("{prefix}.gate_proj"))?.is_none() {
+        super::mode::require_format(false, &format!("{prefix} MXFP8 weights"))?;
         static IGNORED: std::sync::Once = std::sync::Once::new();
         IGNORED.call_once(|| {
             tracing::warn!(

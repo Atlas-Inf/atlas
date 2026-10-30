@@ -30,6 +30,7 @@ pub(super) fn shared_native_twins(
         return Ok(None);
     }
     if raw_fp8_block(store, &format!("{prefix}.gate_proj"))?.is_none() {
+        super::mode::require_format(false, &format!("{prefix} FP8 block weights"))?;
         static IGNORED: std::sync::Once = std::sync::Once::new();
         IGNORED.call_once(|| {
             tracing::warn!(

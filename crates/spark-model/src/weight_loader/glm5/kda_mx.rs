@@ -128,6 +128,7 @@ pub(super) fn kda_twin(
         return Ok(None);
     }
     let Some(raw) = raw_mxfp8(store, stem)? else {
+        super::mode::require_format(false, &format!("{stem} MXFP8 weights"))?;
         static IGNORED: std::sync::Once = std::sync::Once::new();
         IGNORED.call_once(|| {
             tracing::warn!(

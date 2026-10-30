@@ -46,6 +46,7 @@ pub(super) fn mla_native_twins(
         return Ok(None);
     }
     if raw_fp8_block(store, &format!("{p}.q_a_proj"))?.is_none() {
+        super::mode::require_format(false, &format!("{p} FP8 block weights"))?;
         static IGNORED: std::sync::Once = std::sync::Once::new();
         IGNORED.call_once(|| {
             tracing::warn!(

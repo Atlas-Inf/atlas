@@ -1193,6 +1193,7 @@ pub fn build_model(
                 };
                 // Strict for every head: an unknown value fails the build.
                 startup.diagnostics.first_append = FirstAppend::for_head()?;
+                startup.diagnostics.warm_ctx = crate::layers::dflash_head::WarmCtx::for_head()?;
                 let mut head = crate::layers::BlockDiffusionDraftHead::from_weights(
                     weights,
                     target_embed_for_dflash,

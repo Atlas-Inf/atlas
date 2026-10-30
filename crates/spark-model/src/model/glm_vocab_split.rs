@@ -67,6 +67,7 @@ pub(crate) fn prepare_shard_mxfp8(
     let start = config.ep_rank * shard;
     let stream = gpu.default_stream();
     let checkpoint = crate::weight_map::raw_mxfp8(store, "lm_head")?;
+    crate::weight_loader::glm5_mode::require_format(checkpoint.is_some(), "checkpoint MXFP8 head")?;
     let mut w = if let Some(raw) = checkpoint {
         ensure!(raw.k == h, "GLM MXFP8 lm_head K {} != hidden {h}", raw.k);
         crate::weight_map::mxfp8_row_range_twin(gpu, raw, start, shard, stream)?

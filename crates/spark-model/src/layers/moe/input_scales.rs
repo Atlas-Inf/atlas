@@ -113,11 +113,25 @@ impl MoeLayer {
             bail!("ATLAS_GLM_FP4L_INPUT_SCALES: the routed tables are not built");
         };
         let n = self.weights.experts.len();
+        let require_calibration = crate::weight_loader::glm5_mode::selected()?.is_some();
         let scales = self
             .weights
             .experts
             .iter()
             .map(|e| {
+                crate::weight_loader::glm5_mode::validate_calibration(
+                    require_calibration,
+                    [
+                        !e.gate_proj.is_null(),
+                        !e.up_proj.is_null(),
+                        !e.down_proj.is_null(),
+                    ],
+                    [
+                        !e.gate_proj.input_scale.is_null(),
+                        !e.up_proj.input_scale.is_null(),
+                        !e.down_proj.input_scale.is_null(),
+                    ],
+                )?;
                 Ok([
                     input_scale(gpu, &e.gate_proj)?,
                     input_scale(gpu, &e.up_proj)?,

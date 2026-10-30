@@ -17,6 +17,18 @@ use crate::weight_map::{
     quantize_to_nvfp4,
 };
 
+// Target weight conversion uses nearest-even; activation quantization keeps
+// its own entry.
+pub(super) const WEIGHT_QUANTIZER: &str = "quantize_bf16_to_nvfp4_weight_rne";
+
+fn quantize_ctx(gpu: &dyn GpuBackend) -> Result<QuantizeCtx> {
+    Ok(QuantizeCtx {
+        absmax_k: gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?,
+        quantize_k: gpu.kernel("quantize_nvfp4", WEIGHT_QUANTIZER)?,
+        stream: gpu.default_stream(),
+    })
+}
+
 pub(super) fn load_all(
     store: &WeightStore,
     config: &ModelConfig,
@@ -28,11 +40,7 @@ pub(super) fn load_all(
         "GLM-5 Atlas bring-up expects index_topk=2048"
     );
     let variant = detect_nvfp4_variant(store, config);
-    let qctx = QuantizeCtx {
-        absmax_k: gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?,
-        quantize_k: gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?,
-        stream: gpu.default_stream(),
-    };
+    let qctx = quantize_ctx(gpu)?;
     let mut layers: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(config.num_hidden_layers);
     let mut attn_idx = 0usize;
     let mut released = 0usize;
@@ -372,4 +380,37 @@ pub(super) fn load_mla_layer(
         );
     }
     Ok(Box::new(layer))
+}
+
+#[cfg(test)]
+mod quantizer_tests {
+    use super::quantize_ctx;
+    use crate::layers::moe::kernel_recording::{Event, Gpu};
+
+    /// Spark's shared expert and KDA twins are converted here, and the FP8
+    /// prefill cache derives from them: a plain conversion changes the served
+    /// output at every row count, not just at decode.
+    #[test]
+    fn target_weights_convert_with_the_rne_entry() {
+        let gpu = Gpu::new();
+        quantize_ctx(&gpu).unwrap();
+        let names: Vec<String> = gpu
+            .trace()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Lookup(_, name) => Some(name),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "quantize_bf16_to_nvfp4_weight_rne"),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "quantize_bf16_to_nvfp4"),
+            "{names:?}"
+        );
+    }
 }

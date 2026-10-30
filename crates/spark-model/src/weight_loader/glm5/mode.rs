@@ -140,6 +140,30 @@ pub fn selected() -> Result<Option<ServingMode>> {
     .map_err(anyhow::Error::msg)
 }
 
+/// This includes Spark: unapproved fallback requantization is forbidden in
+/// both modes.
+pub fn require_format(present: bool, description: &str) -> Result<()> {
+    require_format_for(selected()?, present, description)
+}
+
+fn require_format_for(mode: Option<ServingMode>, present: bool, description: &str) -> Result<()> {
+    ensure!(
+        mode.is_none() || present,
+        "GLM serving mode requires {description}; refusing fallback weight conversion"
+    );
+    Ok(())
+}
+
+/// A calibrated expert is either local with all scales, or an empty EP
+/// placeholder.
+pub fn validate_calibration(required: bool, live: [bool; 3], scaled: [bool; 3]) -> Result<()> {
+    ensure!(
+        !required || live == [false; 3] || (live == [true; 3] && scaled == [true; 3]),
+        "GLM serving mode requires gate/up/down input scales on every live expert"
+    );
+    Ok(())
+}
+
 /// Native MTP remains an explicit, bounded Strict option.
 pub fn strict_native_mtp() -> bool {
     std::env::var("ATLAS_GLM_STRICT_NATIVE_MTP").as_deref() == Ok("1")
