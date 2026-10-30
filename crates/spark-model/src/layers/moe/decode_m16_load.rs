@@ -67,6 +67,28 @@ impl DecodeM16 {
         let wide4 = Some(pair(persistent.is_some(), "m64s", "_l2pf_p"))
             .filter(|p| p.iter().all(|k| k.0 != 0))
             .unwrap_or([KernelHandle(0); 2]);
+        let a16_on = persistent.is_some() && super::super::decode_a16::requested();
+        let a16 = Some(["m16s", "m32s", "m64s"].map(|family| {
+            [
+                kernel(
+                    a16_on,
+                    &format!("glm_moe_decode_{family}_a16_gate_up_silu_k128w_l2pf_p"),
+                ),
+                kernel(a16_on, &format!("glm_moe_decode_{family}_a16_k128w_l2pf_p")),
+            ]
+        }))
+        .filter(|sets| sets.iter().flatten().all(|k| k.0 != 0));
+        if super::super::decode_a16::requested() && gpu.op_cache().once("moe:decode_a16") {
+            if a16.is_some() {
+                tracing::info!(
+                    "ATLAS_GLM_FP4L_DECODE_A16: decode and verify rows on the persistent W4A16 twins (up to {WIDE_MAX_ROWS} rows a batch)"
+                );
+            } else {
+                tracing::warn!(
+                    "ATLAS_GLM_FP4L_DECODE_A16: no W4A16 stream twins (they need ATLAS_GLM_MOE_DECODE_PERSIST=1 and the target's _a16 kernels); decode and verify rows take the grouped W4A16 path"
+                );
+            }
+        }
         let ctas = match persistent {
             Some(_) => gpu.sm_count()?,
             None => 0,
@@ -76,6 +98,7 @@ impl DecodeM16 {
             down,
             wide,
             wide4,
+            a16,
             zskip,
             k128w: toggle("ATLAS_GLM_MOE_DECODE_K128W")? && glm,
             nosync: toggle("ATLAS_GLM_MOE_STREAM_NOSYNC")? && glm,

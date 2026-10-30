@@ -1559,6 +1559,9 @@ extern "C" __global__ void moe_w4a4_grouped_gemm_prequant_t_k64_vecscale_compact
 // GLM verify-decode M16 twins of the K128W kernels (ATLAS_GLM_MOE_DECODE_M16).
 #include "glm_moe_decode_m16.cuh"
 
+// The W4A16 MMA stage of their stream twins' `_a16` kernels.
+#include "glm_moe_decode_a16.cuh"
+
 // Their stream-loaded twins, one and two row slabs (ATLAS_GLM_MOE_DECODE_STREAM).
 #include "glm_moe_decode_stream.cuh"
 

@@ -26,6 +26,36 @@ impl MoeLayer {
         // scales. No allocation or persistent memory is introduced.
         let a_packed = expert_up_out;
         let a_scale = a_packed.offset(total_expanded as usize * inter as usize / 2);
+        if self.a16_stream() {
+            // ATLAS_GLM_FP4L_DECODE_A16: the gate/up twin left BF16 SiLU·mul
+            // rows there; the W4A16 down twin reads them and the plain table.
+            let grid = wide.filter(|g| {
+                g.down.grid.0 != 0 && h.is_multiple_of(256) && inter.is_multiple_of(128)
+            });
+            anyhow::ensure!(
+                grid.is_some(),
+                "ATLAS_GLM_FP4L_DECODE_A16: {total_expanded} routed rows left the W4A16 stream twins' grid"
+            );
+            let grid = grid.expect("checked above");
+            return ops::moe_w4a4_grouped_gemm_prequant_k128w(
+                ctx.gpu,
+                grid.down,
+                a_packed,
+                DevicePtr::NULL,
+                down.packed_ptrs,
+                down.scale_ptrs,
+                down.scale2_vals,
+                expert_down_out,
+                expert_offsets,
+                DevicePtr::NULL,
+                num_experts,
+                h,
+                inter,
+                grid.prefix,
+                grid.schedule,
+                stream,
+            );
+        }
         // ATLAS_GLM_FP4L_INPUT_SCALES: the table folding each expert's down
         // input scale back (`input_scales.rs`).
         let down = self.a4_table(down)?;

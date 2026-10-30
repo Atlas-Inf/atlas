@@ -232,6 +232,8 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         use crate::layer::glm_long_owner as owner;
         // Every row-local stage (mHC, norms, projections, TP reduce) runs once
         // over all owners' rows; only the recurrence is per owner.
@@ -263,6 +265,9 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The chunk's prompt rows, then the passengers' verify rows: the
+        // routed FFN runs each on its reference lane (ATLAS_GLM_FP4L_DECODE_A16).
+        let _prompt = crate::layers::moe::PromptRows::enter(num_tokens);
         let rows = crate::layer::glm_long_owner::owner_rows(passengers)?;
         ensure!(
             ctx.midchunk_capture.is_none(),
@@ -307,6 +312,8 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         self.forward_inner(hidden, state, 1, true, false, ctx, stream)
     }
 
@@ -342,6 +349,8 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         // Speculative verify rows are one temporal sequence, not independent
         // requests. Batch the stateless projections/mHC work, but advance the
         // KDA recurrent state row-by-row and capture rollback intermediates.
@@ -361,6 +370,8 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         let independent = crate::model::glm_independent::selected(ctx, num_seqs)?;
         if independent
             || crate::model::glm_c4::batched_kda_rows(

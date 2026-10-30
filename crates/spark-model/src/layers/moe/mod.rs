@@ -234,6 +234,8 @@ mod forward_prefill_w4a4;
 pub(crate) use forward_prefill_w4a4::requested as w4a4_requested;
 mod w4a4_scales;
 pub(crate) use w4a4_scales::W4a4Scales;
+mod decode_a16;
+pub(crate) use decode_a16::{DecodeRows, PromptRows};
 mod input_scales;
 pub(crate) use input_scales::InputScales;
 mod forward_rows;

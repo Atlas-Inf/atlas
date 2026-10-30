@@ -126,7 +126,7 @@ impl MoeLayer {
 
     pub(super) fn glm_grouped_resources(&self, ctx: &ForwardContext) -> bool {
         self.glm_native_moe_resources(ctx)
-            && self.nvfp4_prequant_moe
+            && self.prequant_moe()
             && self.nvfp4_fused_silu_quant
             && self.moe_w4a4_prequant_t_k64.0 != 0
             && self.moe_w4a4_prequant_t_k64_compact.0 != 0
@@ -190,6 +190,40 @@ impl MoeLayer {
         // `prerouted`: `glm_moe_router_quant` wrote them (route_fuse.rs).
         let a_packed = ctx.buffers.expert_down_out();
         let a_scale = a_packed.offset(n as usize * h as usize / 2);
+        // ATLAS_GLM_FP4L_DECODE_A16's stream twins read the BF16 rows and the
+        // plain tables (`decode_a16.rs`).
+        if self.a16_stream() {
+            let grid = wide.filter(|g| g.gate_up_silu.grid.0 != 0);
+            anyhow::ensure!(
+                grid.is_some() && inter.is_multiple_of(128) && h.is_multiple_of(128),
+                "ATLAS_GLM_FP4L_DECODE_A16: {n} rows left the W4A16 stream twins' grid"
+            );
+            let grid = grid.expect("checked above");
+            if ctx.gpu.op_cache().first_shape("moe:decode_a16", n, 0, 0) {
+                tracing::info!(
+                    "ATLAS_GLM_FP4L_DECODE_A16 engaged: rows={n} on the W4A16 stream twins"
+                );
+            }
+            ops::moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w(
+                ctx.gpu,
+                grid.gate_up_silu,
+                expert_input,
+                DevicePtr::NULL,
+                [gate.packed_ptrs, gate.scale_ptrs, gate.scale2_vals],
+                [up.packed_ptrs, up.scale_ptrs, up.scale2_vals],
+                // The BF16 SiLU·mul rows over the up output's.
+                [expert_up_out, DevicePtr::NULL, DevicePtr::NULL],
+                expert_offsets,
+                sorted_token_ids,
+                num_experts,
+                inter,
+                h,
+                grid.prefix,
+                grid.schedule,
+                stream,
+            )?;
+            return Ok(true);
+        }
         if !prerouted {
             ops::quantize_bf16_to_nvfp4_scaled(
                 ctx.gpu,

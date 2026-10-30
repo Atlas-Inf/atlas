@@ -139,8 +139,10 @@ __device__ __forceinline__ void pqd_mma_stage(
 }
 
 // Warp warp_id's stores of a finished tile, as pqw_epilogue: BF16 C, or
-// (GATE_UP) the packed NVFP4 SiLU·mul of its 16 gate/up columns.
-template<bool GATE_UP>
+// (GATE_UP) the packed NVFP4 SiLU·mul of its 16 gate/up columns; with A16
+// (the W4A16 twins, glm_moe_decode_a16.cuh) that SiLU·mul as BF16 rows
+// `[rows, N]` in `up.out_packed`, the down twin's activations.
+template<bool GATE_UP, bool A16 = false>
 __device__ __forceinline__ void pqd_epilogue(
     const PqdAcc& acc, unsigned int warp_id, unsigned int lane_id,
     unsigned int expert_id, float scale2, unsigned int cta_m, int M_expert,
@@ -163,6 +165,16 @@ __device__ __forceinline__ void pqd_epilogue(
                     __bfloat162float(__float2bfloat16(acc[j][e] * scale2)),
                     __bfloat162float(__float2bfloat16(acc[j + 2][e] * scale2_up)));
                 group_max = fmaxf(group_max, fabsf(v[i]));
+            }
+            if constexpr (A16) {
+                // v[i] is column col + 8 (i / 2) + 2 tid + i % 2, already BF16.
+                if (valid) {
+                    __nv_bfloat16* out = reinterpret_cast<__nv_bfloat16*>(up.out_packed)
+                        + (unsigned long long)row * N + col + tid * 2;
+                    *(__nv_bfloat162*)out = __floats2bfloat162_rn(v[0], v[1]);
+                    *(__nv_bfloat162*)(out + 8) = __floats2bfloat162_rn(v[2], v[3]);
+                }
+                continue;
             }
             group_max = fmaxf(group_max, __shfl_xor_sync(0xffffffffu, group_max, 1));
             group_max = fmaxf(group_max, __shfl_xor_sync(0xffffffffu, group_max, 2));

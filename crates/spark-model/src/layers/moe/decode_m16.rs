@@ -89,6 +89,10 @@ pub(super) struct DecodeM16 {
     /// The four-slab persistent pair (null unless the persistent twins are
     /// loaded and the target ships it).
     wide4: [KernelHandle; 2],
+    /// The persistent twins' W4A16 pairs, one, two and four slabs
+    /// (`ATLAS_GLM_FP4L_DECODE_A16` with the persistent twins loaded; all
+    /// or none).
+    a16: Option<[[KernelHandle; 2]; 3]>,
     zskip: bool,
     k128w: bool,
     /// `ATLAS_GLM_MOE_STREAM_NOSYNC`.
@@ -123,8 +127,17 @@ impl DecodeM16 {
 
     /// The fused gate/up and down kernels of a batch of `rows` rows: one slab
     /// up to [`MAX_ROWS`], the stream pair's two up to [`STREAM_MAX_ROWS`],
-    /// else the four-slab pair.
-    fn pair(&self, rows: u32) -> [KernelHandle; 2] {
+    /// else the four-slab pair; their W4A16 twins for an `a16` batch.
+    fn pair(&self, rows: u32, a16: bool) -> [KernelHandle; 2] {
+        if let Some(sets) = self.a16.filter(|_| a16) {
+            return sets[if rows <= MAX_ROWS {
+                0
+            } else if rows <= STREAM_MAX_ROWS {
+                1
+            } else {
+                2
+            }];
+        }
         if rows <= MAX_ROWS {
             [self.gate_up_silu, self.down]
         } else if rows <= STREAM_MAX_ROWS {
@@ -191,6 +204,15 @@ impl MoeLayer {
         self.decode_m16.nosync && self.stream_m16_prequant(rows, h, inter)
     }
 
+    /// Whether a routed FFN of `rows` rows can take the stream twins' W4A16
+    /// kernels (`ATLAS_GLM_FP4L_DECODE_A16`): loaded, and the batch one the
+    /// stream twins take.
+    pub(super) fn a16_stream_fits(&self, rows: u32, h: u32, inter: u32) -> bool {
+        self.decode_m16.a16.is_some()
+            && rows <= WIDE_MAX_ROWS
+            && self.stream_m16_prequant(rows, h, inter)
+    }
+
     /// Whether a routed FFN of `rows` rows takes the stream twins' prequant path.
     pub(super) fn stream_m16_prequant(&self, rows: u32, h: u32, inter: u32) -> bool {
         self.decode_m16.stream()
@@ -202,7 +224,7 @@ impl MoeLayer {
             && self.up_ptrs_t.is_some()
             && self.down_ptrs_t.is_some()
             && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
-            && self.nvfp4_prequant_moe
+            && self.prequant_moe()
             && self.moe_w4a4_prequant_t_k64.0 != 0
     }
 
@@ -364,7 +386,7 @@ impl MoeLayer {
             grid,
             persist: KernelHandle(0),
         };
-        let [gate_up_silu, down] = k.pair(rows);
+        let [gate_up_silu, down] = k.pair(rows, self.a16_stream());
         // The persistent twins stride over the worklist's items themselves.
         let schedule = match k.ctas {
             0 => ops::K128wSchedule::Grid {
@@ -384,6 +406,10 @@ impl MoeLayer {
 
 #[path = "decode_m16_load.rs"]
 mod load;
+
+#[cfg(test)]
+#[path = "decode_m16_pair_tests.rs"]
+mod pair_tests;
 
 #[cfg(test)]
 #[path = "decode_m16_test_gpu.rs"]

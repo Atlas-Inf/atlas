@@ -23,6 +23,9 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16): every
+        // entry of this decode (`decode_glm_long_owners`).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         ensure!(
             self.mla.is_some() && self.hc.is_some() && !self.ffn.is_none(),
             "GLM long owner batch requires an mHC MLA layer with FFN"
@@ -164,6 +167,9 @@ impl Qwen3AttentionLayer {
             self.block_idx != 0 && self.block_idx + 1 != ctx.config.num_hidden_layers,
             "GLM fused prefill + verify MLA cannot be the first or last layer"
         );
+        // The chunk's prompt rows, then the passengers' verify rows: the
+        // routed FFN runs each on its reference lane (ATLAS_GLM_FP4L_DECODE_A16).
+        let _prompt = crate::layers::moe::PromptRows::enter(num_tokens);
         let rows = long_owner::owner_rows(passengers)?;
         let meta = ctx
             .attn_metadata

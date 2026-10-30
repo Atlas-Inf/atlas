@@ -214,7 +214,7 @@ impl MoeLayer {
             && h == 4096
             && inter == 2048
             && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
-            && self.nvfp4_prequant_moe
+            && self.prequant_moe()
             && self.moe_w4a4_prequant_t_k64.0 != 0
             && self.moe_w4a4_prequant_t_k64_compact.0 != 0
             && self.moe_build_tile_worklist_k.0 != 0;
@@ -341,7 +341,7 @@ impl MoeLayer {
                         max_m_tiles,
                         stream,
                     )?;
-                } else if self.nvfp4_prequant_moe && self.moe_w4a4_prequant_t_k64.0 != 0 {
+                } else if self.prequant_moe() && self.moe_w4a4_prequant_t_k64.0 != 0 {
                     // Verify-decode batches take the M16 row tiles when
                     // selected (ATLAS_GLM_MOE_DECODE_M16), else the compact
                     // M64 worklist; any other batch the K128W grid.
@@ -578,7 +578,7 @@ impl MoeLayer {
                     .cutlass_grouped_host
                     .as_ref()
                     .is_some_and(|t| t.down.is_some());
-            let fused_nvfp4_down = self.nvfp4_prequant_moe
+            let fused_nvfp4_down = self.prequant_moe()
                 && self.nvfp4_fused_silu_quant
                 && self.silu_mul_quant_nvfp4_k.0 != 0
                 && !cutlass_down;
@@ -662,7 +662,7 @@ impl MoeLayer {
                         max_m_tiles,
                         stream,
                     )?;
-                } else if self.nvfp4_prequant_moe && self.moe_w4a4_prequant_t_k64.0 != 0 {
+                } else if self.prequant_moe() && self.moe_w4a4_prequant_t_k64.0 != 0 {
                     if !fused_nvfp4_down {
                         anyhow::ensure!(
                             self.input_scales.is_none(),

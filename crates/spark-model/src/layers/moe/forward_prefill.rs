@@ -37,6 +37,27 @@ impl MoeLayer {
         stream: u64,
         defer_shared_hc: bool,
     ) -> Result<()> {
+        // ATLAS_GLM_FP4L_DECODE_A16: a prompt chunk with verify rows runs
+        // each half on its own lane; decode and verify rows take W4A16 (BF16
+        // activations), as the reference's non-prompt rows.
+        if self.forward_prefill_mixed(input, num_tokens, ctx, stream, defer_shared_hc)? {
+            return Ok(());
+        }
+        let _a16 = super::decode_a16::A16Scope::enter(self.a16_stream_fits(
+            num_tokens as u32,
+            ctx.config.hidden_size as u32,
+            ctx.config.routed_inter_local() as u32,
+        ));
+        if super::decode_a16::A16Scope::lane() == super::decode_a16::Activations::A16Grouped
+            && ctx
+                .gpu
+                .op_cache()
+                .first_shape("moe:decode_a16_grouped", num_tokens as u32, 0, 0)
+        {
+            tracing::info!(
+                "ATLAS_GLM_FP4L_DECODE_A16: rows={num_tokens} on the grouped W4A16 path (the stream twins do not take them)"
+            );
+        }
         self.btile_input_guard(input, num_tokens, ctx, stream)?;
         anyhow::ensure!(
             !self.btile_storage.is_published() || self.nvfp4_prequant_moe,

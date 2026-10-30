@@ -13,8 +13,13 @@
 //! `persistent_rows_do_not_depend_on_the_batch` holds each row of a batch to
 //! the bits it gets alone.
 //!
+//! `a16_twins_match_a_host_w4a16_reference` holds the persistent twins'
+//! W4A16 pairs (`ATLAS_GLM_FP4L_DECODE_A16`: BF16 activations) to a host
+//! W4A16 reference within BF16 rounding, and each row to its bits alone.
+//!
 //!   cargo test --release -p spark-model --lib persistent_twins_match_the_grid_twins -- --ignored --nocapture
 //!   cargo test --release -p spark-model --lib persistent_rows_do_not_depend_on_the_batch -- --ignored --nocapture
+//!   cargo test --release -p spark-model --lib a16_twins_match_a_host_w4a16_reference -- --ignored --nocapture
 
 use super::*;
 use anyhow::{Context, ensure};
@@ -478,3 +483,6 @@ fn down_finiteness_allows_only_the_capacity_backstop() {
         assert!(check_down_output(&out, &offsets, 16).is_err());
     }
 }
+
+#[path = "decode_m16_test_gpu/a16.rs"]
+mod a16;
