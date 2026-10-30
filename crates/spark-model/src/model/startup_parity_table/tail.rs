@@ -25,6 +25,32 @@ pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_GLM_MXFP8_TILED", || {
         Ok(ops::mxfp8_tiled_requested()? as u64)
     }),
+    // FP4-Local native formats: which layer groups compute on the
+    // checkpoint's own MXFP8 / FP8 block bytes, and how their prefill runs.
+    ("ATLAS_GLM_FP4L_NATIVE", || {
+        Ok(layers::glm_native::NativePolicy::from_env().bits())
+    }),
+    ("ATLAS_GLM_FP4L_FP8_PREFILL", || {
+        Ok(ops::Fp8bPrefill::from_env()? as u64)
+    }),
+    // The W8A8 block FP8 prefill GEMM: rounds its group sums differently
+    // from the in-tree kernel, so ranks that disagree serve a mix of both.
+    ("ATLAS_GLM_FP8B_CUTLASS", || {
+        Ok(ops::fp8b_cutlass_requested()? as u64)
+    }),
+    // The routed experts' activation scales and the non-prompt rows' A16
+    // lane: the rows both ranks reduce.
+    ("ATLAS_GLM_FP4L_INPUT_SCALES", || {
+        Ok(layers::moe::input_scales_requested() as u64)
+    }),
+    ("ATLAS_GLM_FP4L_DECODE_A16", || {
+        Ok(layers::moe::decode_a16_requested() as u64)
+    }),
+    // The split verify head's MXFP8 shard: another GEMV family in the
+    // argmax both ranks merge.
+    ("ATLAS_GLM_LM_HEAD_MXFP8", || {
+        Ok((std::env::var("ATLAS_GLM_LM_HEAD_MXFP8").as_deref() == Ok("1")) as u64)
+    }),
     ("ATLAS_GLM_CANONICAL_VERIFY", || {
         Ok(layers::canonical_verify::enabled() as u64)
     }),

@@ -381,6 +381,12 @@ fn the_table_carries_each_setting_once() {
         "ATLAS_QWEN4EXP_MXFP8_SHARED",
         "ATLAS_QWEN4EXP_PREFILL_W4A4",
         "ATLAS_VISION_PREFIX_CACHE",
+        "ATLAS_GLM_FP4L_NATIVE",
+        "ATLAS_GLM_FP4L_FP8_PREFILL",
+        "ATLAS_GLM_FP8B_CUTLASS",
+        "ATLAS_GLM_FP4L_INPUT_SCALES",
+        "ATLAS_GLM_FP4L_DECODE_A16",
+        "ATLAS_GLM_LM_HEAD_MXFP8",
     ] {
         assert_eq!(
             names.iter().filter(|&&n| n == required).count(),
