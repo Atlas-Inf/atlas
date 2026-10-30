@@ -73,17 +73,24 @@ impl Qwen3AttentionLayer {
             });
         }
         let accelerated = super::projection::enabled(&ctx.config.model_type)?;
-        self.paged_glm_projection(
+        let project = |weight: &DenseWeight, out: DevicePtr, width: u32| {
+            self.paged_glm_projection(normed, weight, out, n, width, h, ctx, stream, accelerated)
+        };
+        // ATLAS_GLM_FP4L_MLA_FP8: q_a and kv_a in one launch (`mla_native`).
+        let paired = self.mla_native_pair(
+            ctx.gpu,
+            [
+                (&mla.wq_a, q_latent, q_lora),
+                (&mla.wkv_a, kv_latent, kv_lora),
+            ],
             normed,
-            &mla.wq_a,
-            q_latent,
             n,
-            q_lora,
             h,
-            ctx,
             stream,
-            accelerated,
         )?;
+        if !paired {
+            project(&mla.wq_a, q_latent, q_lora)?;
+        }
         ops::rms_norm(
             ctx.gpu,
             self.rms_norm_w_k,
@@ -95,17 +102,9 @@ impl Qwen3AttentionLayer {
             eps,
             stream,
         )?;
-        self.paged_glm_projection(
-            normed,
-            &mla.wkv_a,
-            kv_latent,
-            n,
-            kv_lora,
-            h,
-            ctx,
-            stream,
-            accelerated,
-        )?;
+        if !paired {
+            project(&mla.wkv_a, kv_latent, kv_lora)?;
+        }
         ops::rms_norm(
             ctx.gpu,
             self.rms_norm_w_k,

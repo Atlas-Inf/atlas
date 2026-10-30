@@ -129,6 +129,51 @@ impl Qwen3AttentionLayer {
         Ok(true)
     }
 
+    /// q_a and kv_a of the same `m` rows of `input` (`[m, k]`) in one
+    /// `fp8b_gemv_tc*_multi` launch (each CTA its own projection's tier body:
+    /// the same words as two launches); `false`, nothing launched, unless both
+    /// are native and `m` takes the GEMV tiers.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn mla_native_pair(
+        &self,
+        gpu: &dyn spark_runtime::gpu::GpuBackend,
+        [(w0, out0, n0), (w1, out1, n1)]: [(&DenseWeight, DevicePtr, u32); 2],
+        input: DevicePtr,
+        m: u32,
+        k: u32,
+        stream: u64,
+    ) -> Result<bool> {
+        let (Some(([a_n, a_k], a)), Some(([b_n, b_k], b))) = (
+            self.mla_native_twin(w0.weight),
+            self.mla_native_twin(w1.weight),
+        ) else {
+            return Ok(false);
+        };
+        if m as usize > NATIVE_GEMV_MAX_ROWS || a.tiled != b.tiled {
+            return Ok(false);
+        }
+        ensure!(
+            [a_n, a_k, b_n, b_k] == [n0 as usize, k as usize, n1 as usize, k as usize],
+            "GLM MLA native pair: twins [{a_n}, {a_k}] / [{b_n}, {b_k}] for [{n0}, {k}] / [{n1}, {k}]"
+        );
+        let kernels = ops::native_kernels(gpu);
+        let parts = [
+            ops::MxPart::fp8b(a, out0, a_n),
+            ops::MxPart::fp8b(b, out1, b_n),
+        ];
+        ops::mx_multi_rows(
+            gpu,
+            &kernels.fp8b_multi,
+            a.tiled,
+            input,
+            &parts,
+            m as usize,
+            k as usize,
+            stream,
+        )?;
+        Ok(true)
+    }
+
     /// [`Self::mla_native_rows`] for a caller that never runs prefill-sized
     /// row counts (decode, multi-sequence, K3 stages: at most 32 rows).
     #[allow(clippy::too_many_arguments)]
