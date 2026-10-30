@@ -128,10 +128,16 @@ mod scrub_think_tests {
 /// first one onward is the orphan tool block; cut it and trim. Apply ONLY when
 /// no real tool call was produced (otherwise the tool parser already handled
 /// the content).
-pub(crate) fn strip_orphan_tool_markup(text: &str) -> String {
+///
+/// `literal_xml`: the served model spells its tool envelope as added tokens
+/// that also occur in prose (GLM-5.3, Qwen4_exp; `glm_tool_markup_as_text`).
+/// There a bare opener is not enough: the cut needs call syntax after it, so
+/// "The delimiter <tool_call> opens a tool invocation." stays text.
+pub(crate) fn strip_orphan_tool_markup(text: &str, literal_xml: bool) -> String {
     strip_orphan_tool_markup_with_literal_state(
         text,
         &crate::literal_xml::LiteralXmlState::default(),
+        literal_xml,
     )
 }
 
@@ -142,6 +148,7 @@ pub(crate) fn strip_orphan_tool_markup(text: &str) -> String {
 pub(crate) fn strip_orphan_tool_markup_with_literal_state(
     text: &str,
     literal_state: &crate::literal_xml::LiteralXmlState,
+    literal_xml: bool,
 ) -> String {
     const OPENERS: [&str; 2] = ["<tool_call>", "<function="];
     // Trim ONLY when an orphan opener was actually found and cut. The no-match
@@ -153,12 +160,39 @@ pub(crate) fn strip_orphan_tool_markup_with_literal_state(
     // one line. The blocking path calls this once over the whole message where
     // the trim was harmless; per-delta it is destructive. Regression from
     // #473 (680b3a568). Pinned by orphan_tool_tests below.
-    let cut = crate::literal_xml::first_marker_outside_literal(text, *literal_state, &OPENERS)
-        .map(|(position, _)| position);
-    match cut {
-        Some(cut) => text[..cut].trim_end().to_string(),
-        None => text.to_string(),
+    let mut state = *literal_state;
+    let mut remaining = text;
+    let mut offset = 0;
+    while let Some((position, len)) =
+        crate::literal_xml::first_marker_outside_literal(remaining, state, &OPENERS)
+    {
+        if !literal_xml || opens_call_syntax(&remaining[position..], len) {
+            return text[..offset + position].trim_end().to_string();
+        }
+        let consumed = position + len;
+        state.feed(&remaining[..consumed]);
+        remaining = &remaining[consumed..];
+        offset += consumed;
     }
+    text.to_string()
+}
+
+/// Whether the opener (`len` bytes) starting `text` is followed by call
+/// syntax: a function marker, JSON, or a name with arguments or a close.
+fn opens_call_syntax(text: &str, len: usize) -> bool {
+    let tail = text[len..].trim_start();
+    let name_end = tail
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':')))
+        .unwrap_or(tail.len());
+    let after_name = tail[name_end..].trim_start();
+    text.starts_with("<function=")
+        || tail.starts_with("<function")
+        || tail.starts_with("<invoke ")
+        || tail.starts_with('{')
+        || (name_end > 0
+            && ["<arg_key>", "</tool_call>", "(", "{"]
+                .iter()
+                .any(|suffix| after_name.starts_with(suffix)))
 }
 
 /// Remove structural XML fragments left around a validated call while
@@ -209,7 +243,7 @@ mod orphan_tool_tests {
         let s = "You are the story you keep telling yourself.\
                  <tool_call>catch_error({'error': {'message': \"nope\"}})";
         assert_eq!(
-            strip_orphan_tool_markup(s),
+            strip_orphan_tool_markup(s, false),
             "You are the story you keep telling yourself."
         );
     }
@@ -217,7 +251,7 @@ mod orphan_tool_tests {
     #[test]
     fn cuts_at_function_opener() {
         assert_eq!(
-            strip_orphan_tool_markup("Here you go.<function=foo>{}</function>"),
+            strip_orphan_tool_markup("Here you go.<function=foo>{}</function>", false),
             "Here you go."
         );
     }
@@ -225,15 +259,48 @@ mod orphan_tool_tests {
     #[test]
     fn leaves_quoted_and_fenced_markers_untouched() {
         let quoted = "The tag is `<tool_call>` and this is prose.";
-        assert_eq!(strip_orphan_tool_markup(quoted), quoted);
+        assert_eq!(strip_orphan_tool_markup(quoted, false), quoted);
         let fenced = "```xml\n<tool_call>\n```";
-        assert_eq!(strip_orphan_tool_markup(fenced), fenced);
+        assert_eq!(strip_orphan_tool_markup(fenced, false), fenced);
     }
 
     #[test]
     fn finds_real_opener_after_literal_marker() {
         let text = "The tag is `<tool_call>`; <tool_call>";
-        assert_eq!(strip_orphan_tool_markup(text), "The tag is `<tool_call>`;");
+        assert_eq!(
+            strip_orphan_tool_markup(text, false),
+            "The tag is `<tool_call>`;"
+        );
+        let text = "The tag is `<tool_call>`; <tool_call>real</tool_call>";
+        assert_eq!(
+            strip_orphan_tool_markup(text, true),
+            "The tag is `<tool_call>`;"
+        );
+    }
+
+    /// Literal-XML carriers (GLM): a bare opener in prose stays text; the cut
+    /// needs call syntax after it. Other models keep cutting at the opener.
+    #[test]
+    fn preserves_unquoted_bare_marker_and_later_prose() {
+        let text = "The delimiter <tool_call> opens a tool invocation. END.";
+        assert_eq!(strip_orphan_tool_markup(text, true), text);
+        assert_eq!(strip_orphan_tool_markup(text, false), "The delimiter");
+        assert_eq!(strip_orphan_tool_markup("<tool_call>", true), "<tool_call>");
+        assert_eq!(
+            strip_orphan_tool_markup(
+                "Mention <tool_call> here; <tool_call>real</tool_call>",
+                true
+            ),
+            "Mention <tool_call> here;"
+        );
+        for call in [
+            "x<tool_call>get<arg_key>a</arg_key>",
+            "x<tool_call>{\"name\":\"f\"}",
+            "x<tool_call>f(1)",
+            "x<function=f>",
+        ] {
+            assert_eq!(strip_orphan_tool_markup(call, true), "x", "{call}");
+        }
     }
 
     #[test]
@@ -249,14 +316,14 @@ mod orphan_tool_tests {
     #[test]
     fn leaves_clean_content_untouched() {
         let s = "The sky is blue due to Rayleigh scattering.";
-        assert_eq!(strip_orphan_tool_markup(s), s);
+        assert_eq!(strip_orphan_tool_markup(s, false), s);
     }
 
     #[test]
     fn does_not_trip_on_the_word_function() {
         // Only the control markers "<tool_call>" / "<function=" cut; prose is safe.
         let s = "You can call a function to do that.";
-        assert_eq!(strip_orphan_tool_markup(s), s);
+        assert_eq!(strip_orphan_tool_markup(s, false), s);
     }
 
     /// PINS the streaming-detok space-drop bug (wt/repair-479).
@@ -276,11 +343,11 @@ mod orphan_tool_tests {
     #[test]
     fn no_opener_passes_through_byte_identical_including_whitespace() {
         // The standalone space token before a digit — the live repro.
-        assert_eq!(strip_orphan_tool_markup(" "), " ");
+        assert_eq!(strip_orphan_tool_markup(" ", false), " ");
         // Standalone paragraph-break token (`ĊĊ`).
-        assert_eq!(strip_orphan_tool_markup("\n\n"), "\n\n");
+        assert_eq!(strip_orphan_tool_markup("\n\n", false), "\n\n");
         // A delta that merely ENDS in whitespace must keep it: the next
         // delta ("7", "3", …) concatenates directly after these bytes.
-        assert_eq!(strip_orphan_tool_markup("found "), "found ");
+        assert_eq!(strip_orphan_tool_markup("found ", false), "found ");
     }
 }

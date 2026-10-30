@@ -156,7 +156,8 @@ pub(super) fn build_choice_message(
     // scrubbed content when it produced a call, so any surviving markup here is
     // spurious — cut it from content so it does not reach the client.
     if msg_tool_calls.is_none() {
-        msg_content = msg_content.map(|c| super::strip::strip_orphan_tool_markup(&c));
+        let literal_xml = state.tokenizer.glm_tool_markup_as_text;
+        msg_content = msg_content.map(|c| super::strip::strip_orphan_tool_markup(&c, literal_xml));
     }
 
     // Refusal classifier: when the model's assistant text opens with

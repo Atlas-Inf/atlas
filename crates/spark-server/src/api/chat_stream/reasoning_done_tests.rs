@@ -87,3 +87,45 @@ fn sanitizer_prefix_first_content_token_reaches_neutral_delta_immediately() {
         matches!(deltas.as_slice(), [ir::StreamDelta::Content { text, .. }, ir::StreamDelta::Finish { .. }] if text == "42")
     );
 }
+
+#[test]
+fn all_literal_content_events_from_one_token_reach_the_stream() {
+    for (index, expected) in LITERAL_CONTENT.iter().enumerate() {
+        let (ctx, mut stream, mut deltas) =
+            stream_tokens_with_context(true, true, vec![END, 17 + index as u32]);
+        deltas.extend(done(&mut stream, &ctx, "stop"));
+        let content: String = deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                ir::StreamDelta::Content { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(content, *expected, "literal case {index}");
+        assert!(
+            !deltas
+                .iter()
+                .any(|delta| matches!(delta, ir::StreamDelta::ToolCallStart { .. }))
+        );
+    }
+}
+
+#[test]
+fn reasoning_leak_cleanup_preserves_quoted_copy_of_closing_tag() {
+    let (ctx, mut stream, mut deltas) = stream_tokens_with_context(false, true, vec![21]);
+    deltas.extend(done(&mut stream, &ctx, "stop"));
+    let reasoning: String = deltas
+        .iter()
+        .filter_map(|delta| match delta {
+            ir::StreamDelta::Reasoning { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(reasoning.contains("`</tool_call>`"), "{reasoning:?}");
+    assert_eq!(
+        reasoning.matches("</tool_call>").count(),
+        1,
+        "{reasoning:?}"
+    );
+    assert!(reasoning.contains("END."), "{reasoning:?}");
+}

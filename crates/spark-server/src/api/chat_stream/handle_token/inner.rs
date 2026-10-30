@@ -184,8 +184,7 @@ pub(crate) fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: 
                     while let Some((start, len)) =
                         first_marker_outside_literal(&cleaned, reasoning_literal_before, &[*tag])
                     {
-                        cleaned =
-                            strip_all_preserving_boundary(&cleaned, &cleaned[start..start + len]);
+                        cleaned = strip_preserving_boundary(&cleaned, start, start + len);
                     }
                 }
                 // Collapse role-word repetition loops (Qwen3.5/3.6
@@ -392,10 +391,9 @@ pub(crate) fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: 
             state.detok_prefix_offset = 0;
             state.detok_read_offset = 0;
         }
-        // Orphan tool-call markup in content when NO tools are defined: the
-        // model emits a spurious `<tool_call>…` block after a normal answer and
-        // the tool detector (which would strip it) is not running. Cut content
-        // at the opener — SSOT with the blocking path's strip_orphan_tool_markup.
+        // Orphan tool-call markup in content when NO tools are defined (the
+        // detector that would strip it is not running): cut content at the
+        // opener, SSOT with blocking's strip_orphan_tool_markup.
         // When tools ARE active the detector owns tool markup, so leave it.
         let tools_active_request =
             !ctx.tool_defs_for_backfill.is_empty() || state.detector.is_some();
@@ -403,6 +401,7 @@ pub(crate) fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: 
             delta = crate::api::strip::strip_orphan_tool_markup_with_literal_state(
                 &delta,
                 &state.literal_xml_state,
+                ctx.state.tokenizer.glm_tool_markup_as_text,
             );
         }
     }
