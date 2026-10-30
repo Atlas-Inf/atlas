@@ -129,6 +129,9 @@ impl GrammarState {
             .record(crate::scheduler::mtp_timing::Phase::GrammarFill, t_fill);
         self.bitmask_valid = true;
         self.bitmask_fill_result = filled;
+        if filled && self.auto_literal_dispatch && self.matcher.is_grammar_completed() {
+            self.restore_literal_candidates();
+        }
         filled
     }
 
@@ -189,6 +192,9 @@ impl GrammarState {
         // corrupt tool-call STRUCTURE — only non-stop tokens drive the matcher.
         if self.stop_tokens.contains(&token_id) {
             return true;
+        }
+        if let Some(accepted) = self.accept_literal_dispatch(token_id) {
+            return accepted;
         }
         self.matcher.accept_token(token_id as i32)
     }
@@ -294,12 +300,14 @@ impl GrammarState {
     pub fn rollback(&mut self, n: usize) {
         self.bitmask_valid = false;
         self.matcher.rollback(n as i32);
+        self.rollback_literal_state(Some(n));
     }
 
     /// Reset the grammar state to the initial position.
     pub fn reset(&mut self) {
         self.bitmask_valid = false;
         self.matcher.reset();
+        self.rollback_literal_state(None);
     }
 
     /// Apply the current bitmask to a slice of f32 logits in-place.

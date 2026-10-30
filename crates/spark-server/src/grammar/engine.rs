@@ -27,6 +27,10 @@ pub struct GrammarEngine {
     /// Set only while [`Self::compile_tool_or_json_grammar`] runs: the JSON
     /// branch every structural-tag tool grammar is unioned with.
     pub(super) json_alternative: Option<xgrammar::Grammar>,
+    /// The served model spells its tool envelope with tokens that also occur
+    /// in prose (`ChatTokenizer::glm_tool_markup_as_text`): automatic tool
+    /// grammars take quote/code-aware dispatch (`state::literal_dispatch`).
+    literal_dispatch: bool,
 }
 
 // SAFETY: GrammarEngine is initialized on the main thread and moved to the
@@ -161,11 +165,23 @@ impl GrammarEngine {
             compiler,
             vocab_size,
             json_alternative: None,
+            literal_dispatch: false,
         })
     }
 
     /// Vocabulary size (determines bitmask width).
     pub fn vocab_size(&self) -> usize {
         self.vocab_size
+    }
+
+    /// See the `literal_dispatch` field. Default off.
+    #[must_use]
+    pub fn with_literal_dispatch(mut self, on: bool) -> Self {
+        self.literal_dispatch = on;
+        self
+    }
+
+    pub fn literal_dispatch(&self) -> bool {
+        self.literal_dispatch
     }
 }

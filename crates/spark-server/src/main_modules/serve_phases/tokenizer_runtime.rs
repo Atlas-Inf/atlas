@@ -310,7 +310,7 @@ pub(crate) fn resolve_tokenizer_runtime(
                     "Grammar engine initialized (vocab_size={}, vocab_type=auto-detected from tokenizer)",
                     engine.vocab_size()
                 );
-                Some(engine)
+                Some(engine.with_literal_dispatch(tokenizer.glm_tool_markup_as_text))
             }
             Err(e) => {
                 tracing::warn!("Grammar engine init failed (constrained decoding disabled): {e}");

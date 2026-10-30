@@ -609,7 +609,18 @@ fn compile_spec(
     // Exempt the model's stop/EOS tokens from grammar refusal so a legitimate
     // end-of-turn token cannot desync the NPDA and truncate the response
     // (see GrammarState::accept_token).
-    let state = state.with_stop_tokens(eos_tokens);
+    let state = state
+        .with_stop_tokens(eos_tokens)
+        .with_auto_literal_dispatch(
+            engine.literal_dispatch()
+                && matches!(
+                    spec,
+                    GrammarSpec::ToolCall {
+                        use_triggers: true,
+                        ..
+                    }
+                ),
+        );
     // A union picks its branch by mass at its first token (`grammar::branch`).
     let GrammarSpec::ToolCallOrJson { schema, .. } = spec else {
         return Ok(Some(state));

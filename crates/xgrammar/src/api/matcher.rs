@@ -79,6 +79,13 @@ impl GrammarMatcher {
         self.inner.accept_string(input, debug_print)
     }
 
+    /// Accept literal bytes in one rollback step. Tokenizer vocabulary entries
+    /// are byte strings and are not always valid UTF-8, so callers that adapt
+    /// a whole token must use this form instead of [`Self::accept_string`].
+    pub fn accept_bytes(&mut self, input: &[u8], debug_print: bool) -> bool {
+        self.inner.accept_bytes(input, debug_print)
+    }
+
     /// Fill the next-token bitmask into `bitmask` (`index` selects the
     /// matcher's slice when several share one buffer; pass `0` for a
     /// single matcher). Returns whether the mask is non-trivial and

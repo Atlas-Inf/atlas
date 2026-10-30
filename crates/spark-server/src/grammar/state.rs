@@ -82,6 +82,20 @@ pub struct GrammarState {
     /// A tool-call-or-JSON union's answer (JSON) branch first-token mask: the
     /// branch is chosen by mass at the first output token (`grammar::branch`).
     answer_start: Option<Box<[i32]>>,
+    /// Whether this is an automatic tool-call grammar whose root has a
+    /// free-text dispatch state, for a model that spells its envelope as
+    /// tokens which also occur in prose (`literal_dispatch`). Required tool
+    /// grammars and response-format grammars stay on the exact token path.
+    auto_literal_dispatch: bool,
+    /// Lexical state of the emitted free-text prefix. Quotes inside an actual
+    /// tool body must never make the body unconstrained.
+    literal_xml_state: crate::literal_xml::LiteralXmlState,
+    /// One lexical state per xgrammar matcher history step. `accept_bytes`
+    /// records one rollback step for a whole decoded token.
+    literal_xml_history: Vec<crate::literal_xml::LiteralXmlState>,
+    /// Vocabulary tokens that contain a possible markup delimiter. This keeps
+    /// the literal-candidate repair out of the full-vocabulary hot loop.
+    literal_lt_tokens: Box<[u32]>,
 }
 
 impl GrammarState {
@@ -146,6 +160,10 @@ impl GrammarState {
             opens_in_thinking: false,
             native_opener: None,
             answer_start: None,
+            auto_literal_dispatch: false,
+            literal_xml_state: Default::default(),
+            literal_xml_history: Vec::new(),
+            literal_lt_tokens: Box::new([]),
         })
     }
 
@@ -170,6 +188,8 @@ impl GrammarState {
         self
     }
 }
+#[path = "state/literal_dispatch.rs"]
+mod literal_dispatch;
 #[path = "state/literal_ops.rs"]
 mod literal_ops;
 pub use literal_ops::grammar_blocks_stop;
