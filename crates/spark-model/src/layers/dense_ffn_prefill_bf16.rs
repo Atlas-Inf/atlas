@@ -92,6 +92,10 @@ impl DenseFfnLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
+        // ATLAS_GLM_FP4L_DENSE_MXFP8: every row count (`dense_ffn_native.rs`).
+        if self.try_native(input, rows, ctx, stream)? {
+            return Ok(true);
+        }
         if ctx.config.model_type != "glm5_next"
             || !crate::layers::canonical_verify::enabled()
             || !(1..=crate::layers::canonical_verify::MAX_ROWS as usize).contains(&rows)
@@ -124,9 +128,8 @@ impl DenseFfnLayer {
             return Ok(false);
         }
         // ATLAS_GLM_DENSE_TP_SPLIT: half the columns on each rank.
-        if crate::layers::glm_sp::current().is_none()
-            && self.glm_verify_rows_split(input, rows, tc, ctx, stream)?
-        {
+        let proj = super::tp_split::SplitProj::Nvfp4 { weights: w, tc };
+        if self.glm_verify_rows_split(input, rows, proj, ctx, stream)? {
             return Ok(true);
         }
         let h = ctx.config.hidden_size as u32;

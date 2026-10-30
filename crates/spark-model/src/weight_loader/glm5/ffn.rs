@@ -13,7 +13,8 @@ use crate::layers::dense_ffn::DenseFfnWeights;
 use crate::layers::{DenseFfnLayer, FfnComponent, MoeLayer};
 use crate::tp_shard::TpShardKind;
 use crate::weight_map::{
-    DenseWeight, ExpertWeight, MoeWeights, Nvfp4Variant, QuantizeCtx, dense_auto, quantized_any,
+    DenseWeight, ExpertWeight, MoeWeights, Nvfp4Variant, QuantizeCtx, QuantizedWeight, dense_auto,
+    quantized_any,
 };
 
 pub(super) fn load_ffn(
@@ -52,6 +53,36 @@ fn load_dense_ffn(
     let p = format!("{lp}.mlp");
     let h = config.hidden_size;
     let inter = config.intermediate_size;
+    // ATLAS_GLM_FP4L_DENSE_MXFP8: the checkpoint's MXFP8 projections and no
+    // NVFP4 copy at all (null placeholders).
+    if let Some(native) = super::dense::native_dense(
+        crate::layers::glm_native::NativePolicy::from_env(),
+        store,
+        &p,
+        [h, inter],
+        gpu,
+    )? {
+        let weights = DenseFfnWeights {
+            gate_proj: QuantizedWeight::null(),
+            up_proj: QuantizedWeight::null(),
+            down_proj: QuantizedWeight::null(),
+            gate_proj_t: None,
+            up_proj_t: None,
+            down_proj_t: None,
+        };
+        let installed =
+            DenseFfnLayer::new(weights, gpu, &config.model_type).and_then(|mut layer| {
+                layer.install_native(native)?;
+                Ok(layer)
+            });
+        return match installed {
+            Ok(layer) => Ok(FfnComponent::Dense(layer)),
+            Err(e) => {
+                native.free(gpu)?;
+                Err(e)
+            }
+        };
+    }
     let weights = DenseFfnWeights {
         gate_proj: super::dense::load_projection(
             store,

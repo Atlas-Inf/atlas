@@ -177,9 +177,8 @@ fn dense_tp_split_matches_the_unsplit_ffn() -> Result<()> {
                         let split = SplitFfn {
                             gpu: g,
                             comm: &comm,
-                            weights,
+                            proj: SplitProj::Nvfp4 { weights, tc },
                             act_mul,
-                            tc,
                             h: H,
                             inter: I,
                         };

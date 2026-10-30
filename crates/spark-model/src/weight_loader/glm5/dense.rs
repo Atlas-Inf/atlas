@@ -76,3 +76,90 @@ pub(super) fn load_projection(
     }
     Ok(q)
 }
+
+/// Rows the pinned W8A8 kernel is timed at (a prefill pass's height:
+/// `ATLAS_GLM_PREFILL_4096`), as for KDA's W8A8 operands.
+const PIN_REF_ROWS: usize = 4096;
+
+/// FP4-Local's MXFP8 dense MLP at `prefix` (`...mlp`) as native twins
+/// (`ATLAS_GLM_FP4L_DENSE_MXFP8`, `layers::dense_ffn_native`): the whole
+/// (replicated) gate / up `[inter, h]` and down `[h, inter]` copied from the
+/// checkpoint's bytes, with W8A8 operands over them when prefill runs W8A8
+/// (on the pinned kernel: chunk- and history-invariant rows). `None` when the switch is off or the
+/// checkpoint ships them in another format (logged once). Frees what it built
+/// on error. Synchronizes the default stream.
+pub(super) fn native_dense(
+    policy: crate::layers::glm_native::NativePolicy,
+    store: &WeightStore,
+    prefix: &str,
+    [h, inter]: [usize; 2],
+    gpu: &dyn GpuBackend,
+) -> Result<Option<crate::layers::dense_ffn::DenseNative>> {
+    use crate::layers::ops::{Fp8bPrefill, MxW8a8};
+    use crate::weight_map::{mxfp8_rows_twin, raw_mxfp8};
+    if !policy.dense_mxfp8 {
+        return Ok(None);
+    }
+    if raw_mxfp8(store, &format!("{prefix}.gate_proj"))?.is_none() {
+        static IGNORED: std::sync::Once = std::sync::Once::new();
+        IGNORED.call_once(|| {
+            tracing::warn!(
+                "{} set, but {prefix}.gate_proj is not MXFP8 in this checkpoint: \
+                 the dense MLP keeps its NVFP4 copies",
+                crate::layers::glm_native::NativePolicy::DENSE
+            )
+        });
+        return Ok(None);
+    }
+    let w8a8 = Fp8bPrefill::from_env()? == Fp8bPrefill::W8a8;
+    let stream = gpu.default_stream();
+    let mut twins = Vec::with_capacity(3);
+    let mut operands = Vec::with_capacity(3);
+    let built = (|| -> Result<()> {
+        for (name, shape) in [
+            ("gate_proj", [inter, h]),
+            ("up_proj", [inter, h]),
+            ("down_proj", [h, inter]),
+        ] {
+            let stem = format!("{prefix}.{name}");
+            let raw = raw_mxfp8(store, &stem)?
+                .ok_or_else(|| anyhow::anyhow!("{stem}: not MXFP8 beside an MXFP8 gate"))?;
+            ensure!(
+                [raw.n, raw.k] == shape,
+                "{stem}: checkpoint MXFP8 [{}, {}] is not the config's {shape:?}",
+                raw.n,
+                raw.k
+            );
+            let (twin, _, _) = mxfp8_rows_twin(gpu, &[(raw, &[raw.n][..])], 0, 1, stream)?;
+            twins.push(twin);
+            if w8a8 {
+                // The pinned kernel (as KDA's): no row bucket tuned at load.
+                operands.push(
+                    MxW8a8::from_twin(gpu, &twin, shape, 0, stream)?
+                        .pinned_timed(PIN_REF_ROWS, stream),
+                );
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = built {
+        for w in operands {
+            w.free(gpu)?;
+        }
+        for t in twins {
+            gpu.free(t.data)?;
+            gpu.free(t.scales)?;
+        }
+        return Err(e);
+    }
+    Ok(Some(crate::layers::dense_ffn::DenseNative {
+        gate: twins[0],
+        up: twins[1],
+        down: twins[2],
+        w8a8: w8a8.then(|| [operands[0], operands[1], operands[2]]),
+    }))
+}
+
+#[cfg(test)]
+#[path = "dense_native_tests.rs"]
+mod native_tests;

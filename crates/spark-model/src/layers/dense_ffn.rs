@@ -17,10 +17,13 @@ use crate::weight_map::{
 
 #[path = "dense_ffn_dp4a.rs"]
 mod dp4a_decode;
+#[path = "dense_ffn_native.rs"]
+mod native;
 #[path = "dense_ffn_prefill_bf16.rs"]
 mod prefill_bf16;
 #[path = "dense_ffn_tp_split.rs"]
 mod tp_split;
+pub use native::DenseNative;
 pub(crate) use tp_split::dense_tp_split_requested;
 
 pub struct DenseFfnWeights {
@@ -297,6 +300,9 @@ pub struct DenseFfnLayer {
     /// it is unaffected). M0: stored only — compute reads land in M1.
     #[allow(dead_code)]
     lora: Option<ops::lora_delta::LoraFfnWeights>,
+    /// The checkpoint's MXFP8 projections (`ATLAS_GLM_FP4L_DENSE_MXFP8`,
+    /// `dense_ffn_native.rs`): when set, every row runs on them.
+    native: Option<DenseNative>,
 
     /// Native keep-packed ternary Q2_0 dense MLP weights (`ATLAS_GGUF_NATIVE_Q2`).
     /// When installed via `set_q2_weights`, decode dispatches `q2_0_gemv_vec`
@@ -566,6 +572,7 @@ impl DenseFfnLayer {
             ),
             w8a16_gemm_t_m128_k: super::try_kernel(gpu, "w8a16_gemm_t_m128", "w8a16_gemm_t_m128"),
             lora: None,
+            native: None,
             q2_weights: None,
             // Winner of the decode-GEMV bench: candidate B (vectorized code loads
             // + smem A-stage, 1 warp/row × 8 rows/CTA). ~268 GB/s (98% of the
@@ -989,6 +996,9 @@ impl DenseFfnLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        if self.try_native(input, 1, ctx, stream)? {
+            return Ok(ctx.buffers.moe_output());
+        }
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.intermediate_size as u32;
 
