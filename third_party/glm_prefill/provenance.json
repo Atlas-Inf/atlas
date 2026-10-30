@@ -58,7 +58,7 @@
       "contribution": "Existing Atlas runtime adapters and GLM integration; engine file history remains authoritative."
     }
   ],
-  "scope": "Historical attribution for the removed reference-only bridge and patch. Neither is built, copied or loaded by native Atlas. Current native provenance is in crates/spark-runtime/cuda/glm_kda/vendor/ and third_party/nvidia_sparse_mla_sm120/.",
+  "scope": "Historical attribution for the removed reference-only bridge and patch. Neither is built, copied or loaded by native Atlas. Current native provenance is in crates/spark-runtime/cuda/glm_kda/vendor/ and third_party/nvidia_sparse_mla_sm120/; SparkGLM 0.2.0's later bridge and patches (ATLAS_KDA_FLASH_LIBRARY) are in crates/spark-runtime/cuda/glm_kda_fp32/.",
   "archive": {
     "atlas_revision": "3c991613462c79730e2936a7b0f97add40f74370",
     "path_prefix": "third_party/glm_prefill/",

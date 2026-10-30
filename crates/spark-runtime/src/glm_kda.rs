@@ -7,6 +7,8 @@
 
 #[path = "glm_kda/layout.rs"]
 mod layout;
+#[path = "glm_kda/sparkglm.rs"]
+pub mod sparkglm;
 pub use layout::{CHUNK, DIM, HEADS, MAX_ROWS, MIN_ROWS, ScratchLayout};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
