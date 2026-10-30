@@ -88,12 +88,35 @@ impl GdnProjections {
         Self::parse(
             var("ATLAS_QWEN4EXP_BF16_GDN").as_deref(),
             var("ATLAS_QWEN4EXP_FP8_GDN").as_deref(),
+            Self::platform_default(),
         )
     }
 
-    fn parse(bf16_gdn: Option<&str>, fp8_gdn: Option<&str>) -> Result<Self> {
+    /// What an unset `ATLAS_QWEN4EXP_FP8_GDN` means. On gfx1151 it is the
+    /// decode-only FP8 copy: Flash-Next decode +12..21% with MTP and +17%
+    /// plain (framework f88), ppl dense/above-bound ratio 1.0000 and needles
+    /// 12/12 (f91), agentic-webserver 47/50 vs 48/50 BF16 (f93/f92). It costs
+    /// the FP8 copy's memory on top of the BF16 kept for prefill. `=0` opts
+    /// out. Elsewhere BF16 stays the default (unmeasured there).
+    fn platform_default() -> Self {
+        if cfg!(atlas_hip) {
+            Self::Fp8Decode
+        } else {
+            Self::Bf16
+        }
+    }
+
+    fn parse(bf16_gdn: Option<&str>, fp8_gdn: Option<&str>, unset: Self) -> Result<Self> {
+        // Unset defers to `unset` unless the NVFP4 requantization was asked for.
+        let unset = if bf16_gdn == Some("0") {
+            None
+        } else {
+            Some(unset)
+        }
+        .filter(|u| matches!(u, Self::Fp8Decode | Self::Fp8Full));
         let fp8 = match fp8_gdn {
-            None | Some("" | "0") => None,
+            None => unset,
+            Some("" | "0") => None,
             Some("1") => Some(Self::Fp8Decode),
             Some("full") => Some(Self::Fp8Full),
             Some(v) => bail!("ATLAS_QWEN4EXP_FP8_GDN={v}: expected 0, 1 or full"),
@@ -207,16 +230,33 @@ mod tests {
 
     #[test]
     fn unset_is_the_shipped_bf16_and_bf16_gdn_keeps_its_reading() {
-        assert_eq!(GdnProjections::parse(None, None).unwrap(), Bf16);
-        assert_eq!(GdnProjections::parse(Some("1"), Some("0")).unwrap(), Bf16);
-        assert_eq!(GdnProjections::parse(Some("0"), None).unwrap(), Nvfp4);
-        assert_eq!(GdnProjections::parse(Some("0"), Some("")).unwrap(), Nvfp4);
+        assert_eq!(GdnProjections::parse(None, None, Bf16).unwrap(), Bf16);
+        assert_eq!(
+            GdnProjections::parse(Some("1"), Some("0"), Bf16).unwrap(),
+            Bf16
+        );
+        assert_eq!(GdnProjections::parse(Some("0"), None, Bf16).unwrap(), Nvfp4);
+        assert_eq!(
+            GdnProjections::parse(Some("0"), Some(""), Bf16).unwrap(),
+            Nvfp4
+        );
+    }
+
+    #[test]
+    fn hip_default_is_fp8_decode_and_both_opt_outs_still_work() {
+        let p = |b, f| GdnProjections::parse(b, f, Fp8Decode).unwrap();
+        assert_eq!(p(None, None), Fp8Decode);
+        assert_eq!(p(Some("1"), None), Fp8Decode);
+        assert_eq!(p(None, Some("0")), Bf16);
+        assert_eq!(p(None, Some("full")), Fp8Full);
+        // Asking for the NVFP4 requantization is not a conflict with a default.
+        assert_eq!(p(Some("0"), None), Nvfp4);
     }
 
     #[test]
     fn fp8_values_and_parity_words() {
-        let one = GdnProjections::parse(None, Some("1")).unwrap();
-        let full = GdnProjections::parse(Some("1"), Some("full")).unwrap();
+        let one = GdnProjections::parse(None, Some("1"), Bf16).unwrap();
+        let full = GdnProjections::parse(Some("1"), Some("full"), Bf16).unwrap();
         assert_eq!(one, Fp8Decode);
         assert_eq!(full, Fp8Full);
         assert_eq!(
@@ -227,9 +267,9 @@ mod tests {
 
     #[test]
     fn refuses_a_stray_value_and_the_nvfp4_combination() {
-        let e = GdnProjections::parse(None, Some("true")).unwrap_err();
+        let e = GdnProjections::parse(None, Some("true"), Bf16).unwrap_err();
         assert!(e.to_string().contains("expected 0, 1 or full"), "{e}");
-        let e = GdnProjections::parse(Some("0"), Some("1")).unwrap_err();
+        let e = GdnProjections::parse(Some("0"), Some("1"), Bf16).unwrap_err();
         assert!(e.to_string().contains("set one of them"), "{e}");
     }
 }
