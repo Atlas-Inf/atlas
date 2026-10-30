@@ -5,6 +5,7 @@
 mod components;
 mod dense;
 mod expert_tp;
+mod ffn;
 mod fp4l;
 pub(crate) use fp4l::release_expanded;
 mod kda_side_pack;
@@ -13,6 +14,7 @@ mod mla_native;
 mod mla_twins;
 pub mod mode;
 pub(crate) mod retirement;
+mod shared_native;
 mod tp;
 mod vision;
 

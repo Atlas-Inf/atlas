@@ -381,6 +381,7 @@ impl MoeLayer {
             shared_gate_up_receipt: None,
             shared_up_t: None,
             shared_down_t: None,
+            shared_native: None,
             gate_fp8: None,
             shared_gate_fp8: None,
             shared_fp8_cache: Default::default(),

@@ -118,6 +118,10 @@ impl MoeLayer {
     ) -> Result<DevicePtr> {
         self.btile_input_guard(input, 4, ctx, stream)?;
         anyhow::ensure!(
+            self.shared_native.is_none(),
+            "C4 MoE reads the NVFP4 shared expert a native layer does not keep"
+        );
+        anyhow::ensure!(
             crate::model::glm_c4::enabled(&ctx.config.model_type)
                 && super::prequant_fp4::c4_grouped_shape(ctx.config, 4, ctx.levers.max_decode_seqs)
                 && ctx.attn_metadata.is_some_and(|m| m.num_seqs == 4)

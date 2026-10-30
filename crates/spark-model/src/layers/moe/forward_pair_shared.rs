@@ -17,6 +17,17 @@ pub(crate) fn shared_reduce_overlap_requested() -> bool {
     std::env::var("ATLAS_MOE_SHARED_REDUCE_OVERLAP").as_deref() == Ok("1")
 }
 
+/// The ranks a replicated row's native shared expert splits over under
+/// [`shared_tp_split_requested`] (`shared_native.rs`): the EP2 pair or the
+/// EP4 chain, each rank running its `1/ranks` of the intermediate columns.
+pub(super) fn shared_split_ranks(ctx: &ForwardContext) -> Option<usize> {
+    let ranks = ctx.config.ep_world_size;
+    (shared_tp_split_requested()
+        && matches!(ranks, 2 | 4)
+        && ctx.comm.is_some_and(|c| c.world_size() == ranks))
+    .then_some(ranks)
+}
+
 impl MoeLayer {
     #[allow(clippy::too_many_arguments)]
     /// Shared expert for an owner-batched verify of `rows` (9..=32) rows:

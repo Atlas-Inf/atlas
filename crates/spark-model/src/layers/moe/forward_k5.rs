@@ -101,7 +101,7 @@ impl MoeLayer {
         // amortizing routed weights across the verifier batch.
         // Expert TP slices the routed width: only the grouped path serves it
         // (as forward_k2 / forward_k3), with or without the K=5 switch.
-        if ctx.config.expert_tp || (self.use_btile_or_t_prefill() && k5_grouped_moe_requested()) {
+        if self.grouped_only(ctx) || (self.use_btile_or_t_prefill() && k5_grouped_moe_requested()) {
             self.forward_prefill(input, 5, ctx, stream)?;
             return Ok(ctx.buffers.moe_output());
         }

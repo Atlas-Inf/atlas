@@ -16,7 +16,7 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        if ctx.config.expert_tp {
+        if self.grouped_only(ctx) {
             return self.forward_prefill(input, num_tokens, ctx, stream);
         }
         // LongCat zero-experts ARE wired here (softmax+bias arm below); the

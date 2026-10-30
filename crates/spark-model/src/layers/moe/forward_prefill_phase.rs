@@ -44,6 +44,14 @@ impl MoeLayer {
             ctx.gpu.stream_wait_event(aux, self.event_a)?;
         }
 
+        // ATLAS_GLM_FP4L_SHARED_FP8: the checkpoint's FP8 block twins, every row.
+        if self.shared_native.is_some() {
+            self.run_shared_native(input, n, h, shared_inter, ctx, aux)?;
+            if use_overlap {
+                ctx.gpu.record_event(self.event_b, aux)?;
+            }
+            return Ok(());
+        }
         let shared_gate_out = ctx.buffers.ssm_deinterleaved();
         let shared_up_out = ctx.buffers.ssm_qkvz();
         let shared_down_out = ctx.buffers.attn_output();
