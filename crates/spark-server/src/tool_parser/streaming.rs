@@ -111,7 +111,10 @@ impl StreamingToolDetector {
     }
 
     pub(super) fn has_partial_tool_opener(&self) -> bool {
-        !self.buffer.is_empty()
+        // Whitespace is retained until an ambiguous opener is identified.
+        // It must not hide the pending protocol prefix from role-word guards.
+        let pending = self.buffer.trim_start();
+        !pending.is_empty()
             && [
                 "<tool_call>",
                 "<|tool_call>",
@@ -120,7 +123,7 @@ impl StreamingToolDetector {
                 DSML_OPEN,
             ]
             .iter()
-            .any(|tag| tag.starts_with(&self.buffer))
+            .any(|tag| tag.starts_with(pending))
     }
 
     pub(super) fn find_tool_opener(&self) -> Option<(usize, usize)> {

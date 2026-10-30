@@ -391,8 +391,14 @@ impl StreamingToolDetector {
                     let dsml_leading_whitespace = !remainder.is_empty()
                         && content.trim().is_empty()
                         && DSML_OPEN.starts_with(&remainder);
+                    if dsml_leading_whitespace {
+                        // A partial `<` may still become a different XML
+                        // marker. Keep its preceding whitespace until the
+                        // tag is known; only actual DSML owns DSML trimming.
+                        break;
+                    }
                     self.buffer = remainder;
-                    if !content.is_empty() && !dsml_leading_whitespace {
+                    if !content.is_empty() {
                         self.push_content(&mut outputs, content);
                     }
                 }
