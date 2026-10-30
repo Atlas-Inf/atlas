@@ -61,6 +61,8 @@ mod scratch;
 pub(in crate::scheduler) use scratch::HostRows;
 mod selection;
 mod selection_io;
+mod split_rows;
+pub(in crate::scheduler) use split_rows::split_verify_picks;
 
 use crate::scheduler::ActiveSeq;
 use crate::scheduler::helpers::bf16_to_f32;
@@ -148,6 +150,20 @@ pub(super) fn pick_dequantized(
     a: &mut ActiveSeq,
     ctx: &LogitsContext,
 ) -> u32 {
+    pick_processed(f32_logits, vocab_size, a, ctx, None).unwrap_or(0)
+}
+
+/// [`pick_dequantized`] over a row that may leave tokens out: a split verify
+/// head's candidates (`split_rows`), `absent` with the ids present (the rest
+/// NaN in the row). `None` when the present tokens do not decide the pick
+/// (`spark_runtime::sampler::sample_with_absent`); a whole row always does.
+pub(super) fn pick_processed(
+    f32_logits: &mut [f32],
+    vocab_size: usize,
+    a: &mut ActiveSeq,
+    ctx: &LogitsContext,
+    absent: Option<(spark_runtime::sampler::Absent, &[u32])>,
+) -> Option<u32> {
     use crate::scheduler::mtp_timing::Phase;
     // 2. Build this position's penalty/bias params (Verify kind: greedy,
     //    seed-free, the request's bias — the builder still appends the A4
@@ -178,7 +194,7 @@ pub(super) fn pick_dequantized(
         crate::scheduler::sample_step::PositionKind::Verify,
     ) {
         ctx.timing.record(Phase::PipelineProc, t_proc);
-        return tok;
+        return Some(tok);
     }
     ctx.timing.record(Phase::PipelineProc, t_proc);
 
@@ -228,8 +244,24 @@ pub(super) fn pick_dequantized(
         // uses (`decode_logits_seq.rs`).
         let f32_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(f32_logits.as_ptr() as *const u8, vocab_size * 4) };
-        let sampled =
-            spark_runtime::sampler::sample_with_params_history(f32_bytes, &sampler_shape, &[]);
+        let sampled = match absent {
+            Some((absent, ids)) => {
+                let present: Vec<(u32, f32)> =
+                    ids.iter().map(|&i| (i, f32_logits[i as usize])).collect();
+                spark_runtime::sampler::sample_with_absent(
+                    &present,
+                    vocab_size,
+                    &sampler_shape,
+                    step_seed,
+                    absent,
+                )
+            }
+            None => Some(spark_runtime::sampler::sample_with_params_history(
+                f32_bytes,
+                &sampler_shape,
+                &[],
+            )),
+        };
         // Recorded under the Argmax phase: it replaces the argmax pick and
         // keeps the mtp_timing phase set unchanged.
         ctx.timing.record(Phase::Argmax, t_sample);
@@ -241,7 +273,11 @@ pub(super) fn pick_dequantized(
     let t_argmax = std::time::Instant::now();
     let best_id = argmax::argmax_first_wins(f32_logits);
     ctx.timing.record(Phase::Argmax, t_argmax);
-    best_id
+    // An absent token could only beat a present maximum at or after it.
+    let best = f32_logits[best_id as usize];
+    absent
+        .is_none_or(|(a, _)| best > a.bound || (best == a.bound && best_id <= a.bound_id))
+        .then_some(best_id)
 }
 
 /// Convenience: copy the full `[K, vocab]` verify logits buffer to

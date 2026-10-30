@@ -5,6 +5,7 @@
 use super::*;
 
 mod glm_owner;
+mod split_head;
 mod stats;
 mod think_end;
 pub use glm_owner::{step_verify_glm_long_batched, step_verify_glm_long_with};
@@ -57,6 +58,11 @@ fn step_verify_dflash_inner(
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
 ) {
+    // Reject an unsupported sampled request before any worker enters the
+    // verify command and waits for its verdict.
+    if let Err(e) = split_head::ensure_available(model, a) {
+        return a.abort_on_engine_error(format_args!("split verify admission: {e:#}"));
+    }
     let _step_timer = crate::scheduler::mtp_timing::StepTimer::new(&sched.timing, a.seq.seq_len);
 
     if let Err(e) = model.sync_secondary() {
@@ -181,9 +187,34 @@ pub(super) fn verify_dflash_tail(
     // drafter judge on the SAME (GOLD) basis. For non-DFlash callers (unreachable
     // today since step_verify_dflash is only dispatched at drafts.len()>=4 which
     // only DFlash produces), apply the full pre-sample pipeline as in K=2/3/4.
-    let mut verified = if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
-        dflash_verify_raw_argmax,
-        sched.levers.dflash_masked_verify,
+    // An argmax-only split head that can sample picks every other sequence's
+    // rows through its exchange (`split_rows`): a sampled row accepts its
+    // draft only while it matches the sampled pick.
+    let (raw, masked) = (dflash_verify_raw_argmax, sched.levers.dflash_masked_verify);
+    let split_rows = crate::scheduler::helpers::dflash_seq_uses_split_rows(
+        raw,
+        masked,
+        model,
+        a,
+        &verified_argmax,
+    );
+    let mut verified = if split_rows {
+        match crate::scheduler::verify_pipeline_helper::split_verify_picks(
+            model,
+            &verified_argmax,
+            drafts,
+            a,
+            verify_ctx,
+        ) {
+            Ok(picks) => picks,
+            Err(e) => {
+                split_head::abort_exchange(model, a, "sampled picks", &e);
+                return None;
+            }
+        }
+    } else if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
+        raw,
+        masked,
         model,
         a,
         &verified_argmax,
@@ -210,13 +241,24 @@ pub(super) fn verify_dflash_tail(
     // proposer's guess for the same slot. First mismatch terminates the
     // accepted prefix; verified[first_mismatch] becomes the bonus token.
     // An exhausted thinking budget may end the step early at `</think>`.
-    let num_accepted = accept_with_forced_think_end(
-        a,
-        verify_ctx.think_end_token,
-        verify_ctx.boundary_mask.as_deref(),
-        drafts,
-        &mut verified,
-    );
+    let num_accepted = if split_rows {
+        // Split picks enforce boundaries with each row's shadow state;
+        // replaying the raw helper would use the restored pre-span fence.
+        drafts
+            .iter()
+            .zip(&verified)
+            .take_while(|(d, v)| d == v)
+            .count()
+            .min(verified.len().saturating_sub(1))
+    } else {
+        accept_with_forced_think_end(
+            a,
+            verify_ctx.think_end_token,
+            verify_ctx.boundary_mask.as_deref(),
+            drafts,
+            &mut verified,
+        )
+    };
     if let Some(raw) = raw_trace {
         tracing::info!(
             "LIGHTNING VERIFY TOKEN TRACE slot={} last={} drafts={:?} raw={:?} processed={:?} accepted={}",
@@ -499,3 +541,6 @@ pub(super) fn verify_dflash_tail(
     }
     None
 }
+
+#[cfg(test)]
+mod masked_path_tests;
