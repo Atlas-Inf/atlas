@@ -94,12 +94,14 @@ pub(in crate::scheduler) fn think_gate(a: &mut ActiveSeq, tok: u32, env: &Commit
         a.think_skip_count = 0;
         // Re-entering thinking re-arms the spec-resume guard for the next exit.
         a.post_think_emitted = 0;
-        // Floored so the watchdog stays functional.
-        a.thinking_budget = Some(decayed.max(8));
+        // Floored so the watchdog stays functional; none without a server
+        // ceiling (`atlas_kernels::thinking_ceiling`).
+        a.thinking_budget =
+            atlas_kernels::thinking_ceiling(a.spontaneous_think_budget).map(|_| decayed.max(8));
         if !env.quiet {
             tracing::debug!(
                 fires = a.think_watchdog_fires,
-                budget = decayed.max(8),
+                budget = ?a.thinking_budget,
                 "spontaneous <think>: entering thinking mode"
             );
         }
@@ -290,9 +292,11 @@ pub(in crate::scheduler) fn end_token(
     let by_legacy_tool = a.require_tool_call;
     let by_min_tokens = prior < a.min_tokens;
     let hard_ceiling = hard_ceiling_hit(a.remaining, position, env.limits.max_seq_len);
-    // GLM may end its turn without closing reasoning.
-    let by_thinking =
-        eos_suppressed_by_thinking(a.inside_thinking, hard_ceiling) && !native_glm_eos;
+    // GLM may end its turn without closing reasoning, and so may a model
+    // whose end token ends the turn anywhere (`eos_ends_thinking`).
+    let by_thinking = eos_suppressed_by_thinking(a.inside_thinking, hard_ceiling)
+        && !native_glm_eos
+        && !env.watchdog.eos_ends_thinking;
     let by_post_think =
         should_suppress_post_think_eos(a, (prior as u32).saturating_sub(a.thinking_tokens));
     let suppress = by_grammar || by_legacy_tool || by_min_tokens || by_thinking || by_post_think;

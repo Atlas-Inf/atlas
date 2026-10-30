@@ -57,6 +57,8 @@ pub mod strip;
 pub mod stubs;
 
 #[cfg(test)]
+pub(crate) mod test_app_state;
+#[cfg(test)]
 mod tests;
 
 // Re-exports to preserve the original `crate::api::*` import surface.

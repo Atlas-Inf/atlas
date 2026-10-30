@@ -271,6 +271,24 @@ fn q38_unset_equals_explicit_medium() {
     assert_eq!(unset, medium);
 }
 
+/// A verbatim-prompt model leaves an effort-silent render's
+/// `reasoning_effort` undefined, so the template's own default applies
+/// (Qwen3.8: `xhigh`), as transformers and vLLM render it.
+#[test]
+fn q38_template_effort_default_renders_the_template_tier() {
+    let r = render_fixture(
+        "qwen3.8-27b-unsloth",
+        &fixture_messages(),
+        Some(&fixture_tools()),
+        RenderFlags {
+            template_effort_default: true,
+            ..thinking_on()
+        },
+    )
+    .unwrap();
+    assert_eq!(r, q38_golden());
+}
+
 #[test]
 fn q38_preserve_thinking_false_strips_history_think() {
     let r = render_fixture(

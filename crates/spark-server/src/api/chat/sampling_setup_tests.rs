@@ -128,4 +128,52 @@ mod tests {
             Some("bare_json")
         ));
     }
+
+    /// A tool-armed request gets the `<tool_call>` +3 bias unless the model
+    /// turns tool-call steering off (MODEL.toml `[behavior]`).
+    #[test]
+    fn tool_call_steering_gates_the_tool_call_bias() {
+        let dir = tempfile::tempdir().unwrap();
+        let vocab = [("[UNK]".to_string(), 0), ("<tool_call>".to_string(), 1)];
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(vocab.into_iter().collect())
+            .unk_token("[UNK]".into())
+            .build()
+            .unwrap();
+        tokenizers::Tokenizer::new(model)
+            .save(dir.path().join("tokenizer.json"), false)
+            .unwrap();
+        let wire: crate::openai::ChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "fixture", "messages": [{"role": "user", "content": "weather"}],
+                "tools": [{"type": "function", "function": {"name": "get_weather",
+                    "parameters": {"type": "object", "properties": {}}}}]
+            }))
+            .unwrap();
+        let req: crate::ir::ChatRequest = wire.into();
+        let bias = |steering: bool| {
+            let tokenizer = crate::tokenizer::ChatTokenizer::from_model_dir(
+                dir.path(),
+                0,
+                false,
+                "qwen4_exp",
+                "",
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+            let mut state = crate::api::test_app_state::app_state(tokenizer);
+            state.tool_call_start_token_id = Some(1);
+            state.behavior.tool_call_steering = steering;
+            let state = std::sync::Arc::new(state);
+            let Ok(setup) = super::super::build_sampling(&state, &req, false, true, false, 0)
+            else {
+                panic!("sampling setup");
+            };
+            setup.logit_bias
+        };
+        assert_eq!(bias(true), [(1, 3.0)]);
+        assert!(bias(false).is_empty());
+    }
 }

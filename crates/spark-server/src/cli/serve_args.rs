@@ -477,7 +477,9 @@ pub struct ServeArgs {
     /// = 1/4x, 1/2x, 1x, 2x, 4x of this value). An explicit client token
     /// budget (`thinking.budget_tokens`, `thinking_token_budget`) still
     /// wins outright; the (max_tokens * 9 / 10) safety cap is enforced
-    /// unless MODEL.toml sets `cap_thinking_at_max_tokens = false`.
+    /// unless MODEL.toml sets `cap_thinking_at_max_tokens = false`. 0 = no
+    /// server budget: effort levels are the template's alone and reasoning
+    /// runs until the model closes it (or `max_tokens`).
     #[arg(long)]
     pub max_thinking_budget: Option<u32>,
 

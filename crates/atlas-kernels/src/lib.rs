@@ -377,6 +377,28 @@ pub struct ModelBehavior {
     /// multi-turn prompt bytes and therefore prefix-cache hit rate.
     /// Per-request `chat_template_kwargs.preserve_thinking` still wins.
     pub preserve_thinking: Option<bool>,
+    /// The prompt is the checkpoint template's render of the client's
+    /// request and nothing else, as on the reference server (vLLM over
+    /// transformers): no Atlas tool prompt, hints or injected kwargs, and
+    /// `tojson` spaced like `json.dumps`. Default `false`.
+    pub verbatim_prompt: bool,
+    /// An end token sampled inside `<think>` ends the turn, as on the
+    /// reference engines. Default `false` (discarded, or the block closed
+    /// under `honor_eos_inside_thinking`).
+    pub eos_ends_thinking: bool,
+    /// Atlas's `<tool_call>` logit bias and loop-detector mask on tool-armed
+    /// requests. Default `true`; `false` leaves the opener to the model.
+    pub tool_call_steering: bool,
+}
+
+/// The server's thinking ceiling for a `max_thinking_budget`: 0 means none,
+/// so only a client's explicit token budget (or `max_tokens`) bounds it.
+pub const fn thinking_ceiling(max_thinking_budget: u32) -> Option<u32> {
+    if max_thinking_budget == 0 {
+        None
+    } else {
+        Some(max_thinking_budget)
+    }
 }
 
 /// Phase-C: maximum number of watchdog-triggered rollbacks a single
@@ -440,6 +462,9 @@ impl Default for ModelBehavior {
             rom_head: "",
             tool_retry: true,
             preserve_thinking: None,
+            verbatim_prompt: false,
+            eos_ends_thinking: false,
+            tool_call_steering: true,
         }
     }
 }

@@ -112,6 +112,9 @@ pub(super) fn build_msg_entries(
     // injected hints vary with the escalation counter and would break
     // exact-match grouping.
     let mut tool_result_originals: Vec<(usize, String)> = Vec::new();
+    // Atlas's prompt aids below (tool-result markers and hints, the cwd hint,
+    // the content-free system drop); none for a verbatim-prompt model.
+    let aids = !levers.verbatim_prompt;
 
     // F6 (2026-05-26): `last_query_index` was previously used to gate
     // an empty `<think>\n\n</think>\n\n` injection for historical
@@ -126,7 +129,7 @@ pub(super) fn build_msg_entries(
         // success over error text. Rendered here (not in the adapters) so
         // every surface gets identical prompt bytes, and applied before the
         // error-hint scan below so hints see the final text.
-        if m.tool_error {
+        if m.tool_error && aids {
             text = format!("[tool error]\n{text}");
         }
 
@@ -174,7 +177,7 @@ pub(super) fn build_msg_entries(
             // P1-6 (2026-07-09): record the pre-hint original at the
             // index this entry is about to occupy.
             tool_result_originals.push((messages.len(), text.clone()));
-            if crate::hint_injector::looks_like_error(&text) {
+            if aids && crate::hint_injector::looks_like_error(&text) {
                 consecutive_tool_errors += 1;
                 crate::hint_injector::inject_hints(&mut text, consecutive_tool_errors);
             } else {
@@ -248,7 +251,7 @@ pub(super) fn build_msg_entries(
     // ATLAS_NO_ERROR_DEDUP=1 restores verbatim history. MUST run
     // before the vacuous-system removal below — the recorded indices
     // refer to the un-shifted `messages` vec.
-    if tools_active && !tail::error_dedup_disabled() {
+    if tools_active && aids && !tail::error_dedup_disabled() {
         for (idx, replacement) in tail::duplicate_error_masks(&tool_result_originals) {
             messages[idx].content = replacement;
         }
@@ -277,6 +280,7 @@ pub(super) fn build_msg_entries(
     // Inject CWD hint into the system message (NOT tool definitions —
     // those go to the Jinja template).
     if tools_active
+        && aids
         && !levers.disable_cwd_hint_injection
         && let Some(ref cwd) = cwd_hint
     {
@@ -298,9 +302,10 @@ pub(super) fn build_msg_entries(
     // such a message as absent so a degenerate client prompt can't poison
     // generation. Conservative — only an empty body or a single short
     // bare `Label:` line qualifies; any substantive prompt is untouched.
-    if messages
-        .first()
-        .is_some_and(|m| m.role == "system" && tail::is_vacuous_system_content(&m.content))
+    if aids
+        && messages
+            .first()
+            .is_some_and(|m| m.role == "system" && tail::is_vacuous_system_content(&m.content))
     {
         let removed = messages.remove(0);
         tracing::info!(
@@ -447,6 +452,7 @@ pub(super) fn build_msg_entries(
     // tool response (what the model reads just before its next action). Gated
     // by ATLAS_BASH_WANDER_WATCHDOG (PCND, default-off).
     if tools_active
+        && aids
         && let Some(hint) = crate::hint_injector::bash_wander_hint(
             total_tool_calls,
             productive_tool_calls,

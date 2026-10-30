@@ -140,6 +140,9 @@ struct Target {
     behavior_rom_head: String,
     behavior_tool_retry: bool,
     behavior_preserve_thinking: Option<bool>,
+    behavior_verbatim_prompt: bool,
+    behavior_eos_ends_thinking: bool,
+    behavior_tool_call_steering: bool,
     /// Which `(model_type, hidden_size)` pairs this kernel target supports.
     /// Parsed from `[[model_types]]` in MODEL.toml.
     model_type_matches: Vec<ModelTypeMatch>,
@@ -1329,6 +1332,9 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_rom_head: pb.rom_head,
                 behavior_tool_retry: pb.tool_retry,
                 behavior_preserve_thinking: pb.preserve_thinking,
+                behavior_verbatim_prompt: pb.verbatim_prompt,
+                behavior_eos_ends_thinking: pb.eos_ends_thinking,
+                behavior_tool_call_steering: pb.tool_call_steering,
                 model_type_matches,
                 match_names,
                 dflash,

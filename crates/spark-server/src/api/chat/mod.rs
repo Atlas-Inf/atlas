@@ -30,6 +30,9 @@ mod loop_detect;
 mod loop_detect_tests;
 mod msg_entry;
 pub(crate) mod prepare;
+#[cfg(test)]
+#[path = "reference_prompt_tests.rs"]
+mod reference_prompt_tests;
 pub(crate) mod remote_image;
 mod sampling_setup;
 mod template;

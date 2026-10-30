@@ -92,6 +92,9 @@ pub struct ChatTokenizer {
     openai_jinja_env: Option<minijinja::Environment<'static>>,
     /// nemotron_h_omni (`<image>`, `<img>`, `</img>`) ids, or None for other models.
     omni_image_tokens: Option<(u32, u32, u32)>,
+    /// MODEL.toml `[behavior].verbatim_prompt`: render as transformers does
+    /// (spaced `tojson`, the template's own effort default).
+    verbatim_prompt: bool,
 }
 
 /// One GLM-5 multimodal placeholder after CPU preprocessing. The chat

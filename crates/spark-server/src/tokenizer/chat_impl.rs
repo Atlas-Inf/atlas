@@ -52,6 +52,11 @@ impl ChatTokenizer {
         template_override: &str,
         repo_root: Option<&Path>,
         disable_template_overrides: bool,
+        // MODEL.toml `[behavior].verbatim_prompt`: `tojson` spaced like
+        // Python's `json.dumps`, as transformers renders it (otherwise the
+        // process-wide `ATLAS_USE_HF_REF_JSON_DUMPS` choice), and an
+        // effort-silent render keeps the template's own effort default.
+        verbatim_prompt: bool,
     ) -> Result<Self> {
         let tokenizer_path = model_dir.join("tokenizer.json");
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
@@ -107,7 +112,17 @@ impl ChatTokenizer {
             super::jinja_helpers::default_chatml_template(supports_thinking)
         };
 
-        let jinja_env = super::jinja_helpers::build_jinja_env(&chat_template)?;
+        let build_env = |t: &str| {
+            if verbatim_prompt {
+                super::jinja_helpers::build_jinja_env_with(
+                    t,
+                    super::jinja_helpers::ToolJsonStyle::HfSpaced,
+                )
+            } else {
+                super::jinja_helpers::build_jinja_env(t)
+            }
+        };
+        let jinja_env = build_env(&chat_template)?;
 
         // Load OpenAI-variant template if it exists (jinja-templates/openai/{model_type}.jinja).
         // This variant gates historical <think> wrappers on enable_thinking, preventing
@@ -123,7 +138,7 @@ impl ChatTokenizer {
         } else {
             super::jinja_helpers::load_openai_template(model_type, repo_root).and_then(|tmpl| {
                 tracing::info!("Loaded OpenAI-variant Jinja template for {model_type}");
-                super::jinja_helpers::build_jinja_env(&tmpl).ok()
+                build_env(&tmpl).ok()
             })
         };
         let chat_encoding = if model_type == "deepseek_v4" {
@@ -163,6 +178,7 @@ impl ChatTokenizer {
             chat_template,
             jinja_env,
             openai_jinja_env,
+            verbatim_prompt,
         })
     }
 
@@ -298,6 +314,7 @@ impl ChatTokenizer {
                 enable_thinking,
                 disable_tool_steering,
                 reasoning_effort,
+                template_effort_default: self.verbatim_prompt,
                 preserve_thinking,
                 allow_continue_final: true,
                 empty_think_off: false,
@@ -373,6 +390,7 @@ impl ChatTokenizer {
                     enable_thinking,
                     disable_tool_steering,
                     reasoning_effort,
+                    template_effort_default: self.verbatim_prompt,
                     preserve_thinking,
                     allow_continue_final: false,
                     empty_think_off,

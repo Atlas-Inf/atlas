@@ -9,7 +9,6 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
 
 const END: u32 = 2;
 const TOOL: u32 = 3;
@@ -71,75 +70,22 @@ fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<A
         "",
         None,
         false,
+        false,
     )
     .unwrap();
     assert_eq!(
         tokenizer.decode(CALL).unwrap(),
         "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>"
     );
-    let (request_tx, _) = tokio::sync::mpsc::channel(1);
-    Arc::new(AppState {
-        tool_guard: Default::default(),
-        vision_budget: None,
-        vision_limits: None,
-        tokenizer,
-        model_name: "display-name-is-not-model-type".into(),
-        adapter_name: None,
-        adapter_names: vec![],
-        active_adapter: Arc::default(),
-        max_seq_len: 4096,
-        request_tx,
-        reference_mode: false,
-        rotation_tx: None,
-        vision_config: None,
-        vision_max_pixels: None,
-        remote_image_policy: Default::default(),
-        video_ffmpeg: Default::default(),
-        video_fps: 1.0,
-        default_temperature: 0.0,
-        default_top_k: 0,
-        default_top_p: 1.0,
-        default_top_n_sigma: 0.0,
-        default_min_p: 0.0,
-        tool_call_parser: Some(Arc::from(format.into_parser())),
-        chat: Default::default(),
-        reasoning_parser: Some(crate::reasoning_parser::ReasoningFormat::Qwen.into_parser()),
-        think_end_token_id: Some(END),
-        think_start_token_id: Some(13),
-        tool_max_tokens: 192,
-        sampling_presets: Default::default(),
-        tool_call_start_token_id: Some(TOOL),
-        glm_tool_boundary: crate::glm_tool_boundary::native_opener(model_type, true, Some(TOOL)),
-        auto_compact_threshold: None,
-        request_timeout: 0,
-        effective_context: 0,
-        behavior: Default::default(),
-        disable_thinking: false,
-        default_thinking: Default::default(),
-        default_reasoning_effort: None,
-        response_store: crate::response_store::ResponseStore::with_config(
-            1,
-            Duration::from_secs(60),
-        ),
-        conversation_store: crate::conversation_store::ConversationStore::with_config(
-            1,
-            Duration::from_secs(60),
-        ),
-        rate_limiter: crate::rate_limiter::RateLimiter::with_config(
-            crate::rate_limiter::RateLimitConfig {
-                rpm: 0,
-                tpm: 0,
-                burst_rpm: 1,
-                burst_tpm: 1,
-            },
-        ),
-        dump_writer: None,
-        lora_stageable: Default::default(),
-        lora_peer_addr: None,
-        promotion: None,
-        promoted_slots: Arc::default(),
-        lora_disk_stageable: Default::default(),
-    })
+    let mut state = crate::api::test_app_state::app_state(tokenizer);
+    state.model_name = "display-name-is-not-model-type".into();
+    state.tool_call_parser = Some(Arc::from(format.into_parser()));
+    state.reasoning_parser = Some(crate::reasoning_parser::ReasoningFormat::Qwen.into_parser());
+    state.think_end_token_id = Some(END);
+    state.think_start_token_id = Some(13);
+    state.tool_call_start_token_id = Some(TOOL);
+    state.glm_tool_boundary = crate::glm_tool_boundary::native_opener(model_type, true, Some(TOOL));
+    Arc::new(state)
 }
 
 fn request() -> ir::ChatRequest {

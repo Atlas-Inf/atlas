@@ -397,6 +397,10 @@ pub struct WatchdogParams {
     /// FIRST model's value for every model after it, and its installer runs
     /// after the scheduler thread is already spawned.
     pub honor_eos_inside_thinking: bool,
+    /// An end token inside `<think>` ends the turn (MODEL.toml
+    /// `[behavior].eos_ends_thinking`), outranking
+    /// `honor_eos_inside_thinking`. Default false.
+    pub eos_ends_thinking: bool,
     /// Per-model gate for the THINKING-phase token-loop watchdog. Default
     /// `true` (the behaviour before the flag existed), so a model that does not
     /// opt out is unaffected. Was a `OnceLock`; see the note above.
@@ -438,6 +442,7 @@ const DEFAULT_WATCHDOG_PARAMS: WatchdogParams = WatchdogParams {
     rollback_resteer: true,
     // FALSE = pre-p350 behaviour: a mid-think EOS is discarded, not honored.
     honor_eos_inside_thinking: false,
+    eos_ends_thinking: false,
     enable_think_loop_watchdog: true,
     content_loop_min_repeats: None,
 };
@@ -488,6 +493,7 @@ impl WatchdogParams {
             max_post_think_content_tokens: b.max_post_think_content_tokens,
             rollback_resteer: b.rollback_resteer,
             honor_eos_inside_thinking: b.honor_eos_inside_thinking,
+            eos_ends_thinking: b.eos_ends_thinking,
             enable_think_loop_watchdog: b.enable_think_loop_watchdog,
             content_loop_min_repeats: None,
         };
