@@ -46,7 +46,7 @@ impl TransformerModel {
         self.decode_verify_graphed_kgamma_dispatch(&[token], seq, stream, None)?;
         self.commit_accepted_prefix_dispatch(seq, 1, 1)?;
         self.sync_secondary_dispatch()?;
-        self.glm_split_head_full_row(self.gpu.default_stream())?;
+        self.glm_split_head_full_rows(1, self.gpu.default_stream())?;
         Ok(Some(self.buffers.logits()))
     }
 }

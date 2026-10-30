@@ -70,6 +70,23 @@ impl Model for TransformerModel {
         self.glm_verify_logits_argmax_only()
     }
 
+    fn verify_split_sampling(&self) -> bool {
+        self.glm_verify_sample_supported()
+    }
+
+    fn verify_split_candidates(
+        &self,
+        rows: usize,
+        temperature: f32,
+        specials: &[u32],
+    ) -> Result<Vec<crate::model::SplitRow>> {
+        self.glm_verify_candidates(rows, temperature, specials)
+    }
+
+    fn verify_split_full_rows(&self, rows: usize, out: &mut [u8]) -> Result<()> {
+        self.glm_verify_full_rows(rows, out)
+    }
+
     fn lightning_dspark_product_policy(
         &self,
     ) -> Option<&crate::layers::dflash_head::LightningDsparkProductPolicy> {

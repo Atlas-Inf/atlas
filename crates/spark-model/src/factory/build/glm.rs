@@ -109,6 +109,7 @@ pub(super) fn init_arena_consumers(
         crate::weight_loader::glm5::release_expanded(store, gpu, "lm_head", false)?;
     }
     crate::model::prepare_glm_verify_masks(config, gpu, buffers)?;
+    crate::model::prepare_glm_verify_sample(config, gpu)?;
     crate::layers::moe::bind_resident_btile_arenas(config, store, gpu, layers, buffers)?;
     Ok(())
 }

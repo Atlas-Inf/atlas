@@ -5,7 +5,8 @@
 //! the verified-step verdict.
 //!
 //! EP worker protocol extensions (see `ep_worker_step_impl`):
-//! - 0xFFFFFFF5: generic verify → K, K tokens, then num accepted drafts
+//! - 0xFFFFFFF5: generic verify → K, K tokens, then num accepted drafts (after
+//!   any sampled-verify requests, `glm_verify_sample`)
 //! - 0xFFFFFFF6: set request-local native-only fence → disabled (0/1)
 //! - 0xFFFFFFF7: synchronize vision metadata and BF16 encoder rows
 //! - 0xFFFFFFE1: distributed GLM MTP propose → token, position, drafts, hidden row
@@ -95,13 +96,28 @@ impl TransformerModel {
         }
         self.sync_secondary()?;
         self.decode_verify_graphed_kgamma(&tokens, seq, stream)?;
-        let num_accepted = self.ep_broadcast_u32(0)? as usize;
+        let num_accepted = self.ep_worker_verdict()?;
         anyhow::ensure!(
             num_accepted < k,
             "EP generic verify accepted {num_accepted} drafts for K={k}"
         );
         self.ep_worker_apply_verdict(seq, &tokens, num_accepted)?;
         Ok(())
+    }
+
+    /// A verify's verdict word: the head's accepted-draft count, after
+    /// serving any sampled-verify requests the head sends before it
+    /// (`glm_verify_sample`).
+    pub(super) fn ep_worker_verdict(&self) -> Result<usize> {
+        loop {
+            match self.ep_broadcast_u32(0)? {
+                w @ (super::glm_verify_sample::EP_VERIFY_CANDIDATES
+                | super::glm_verify_sample::EP_VERIFY_FULL_ROWS) => {
+                    self.glm_verify_sample_serve(w)?
+                }
+                accepted => return Ok(accepted as usize),
+            }
+        }
     }
 
     /// Worker side of a verified K-row step once the head's accepted-draft

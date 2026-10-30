@@ -30,6 +30,11 @@ pub(super) fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_GLM_VERIFY_VOCAB_SPLIT").as_deref() == Ok("1"))
 }
 
+/// Whether the split head may serve `ranks` ranks: enabled, on the pair.
+pub(super) fn serves(ranks: usize) -> bool {
+    ranks == 2 && enabled()
+}
+
 /// This rank's shard as MXFP8 (first vocab row, weight), when prepared.
 static SHARD_MX: OnceLock<(usize, crate::weight_map::Mxfp8Weight)> = OnceLock::new();
 
@@ -322,7 +327,7 @@ impl TransformerModel {
 
 impl TransformerModel {
     /// Whether a one-row verify's split head runs the MXFP8 shard, the
-    /// row-invariant arithmetic `glm_split_head_full_row` completes.
+    /// row-invariant arithmetic `glm_split_head_full_rows` completes.
     pub(super) fn glm_split_head_mxfp8(&self) -> bool {
         self.glm_split_head_decline(1).is_none()
             && self.comm.as_ref().is_some_and(|c| {
@@ -332,11 +337,13 @@ impl TransformerModel {
             })
     }
 
-    /// After a one-row split-head verify left this rank's half of row 0's
-    /// logits in `logits`, fetch the peer's half (through `moe_output`, free
-    /// once the layers ran) so the row holds the full vocabulary: the plain
-    /// decode of `ATLAS_GLM_CANONICAL_VERIFY` samples it. Both ranks call it.
-    pub(super) fn glm_split_head_full_row(&self, stream: u64) -> Result<()> {
+    /// After a split-head verify left this rank's half of rows `[0, rows)`
+    /// of the logits in `logits`, fetch the peer's halves (through
+    /// `moe_output`, free once the layers ran) so the rows hold the full
+    /// vocabulary: the plain decode of `ATLAS_GLM_CANONICAL_VERIFY` samples
+    /// row 0, a sampled verify the rows its candidates do not decide
+    /// (`glm_verify_sample`). Both ranks call it.
+    pub(super) fn glm_split_head_full_rows(&self, rows: usize, stream: u64) -> Result<()> {
         let comm = self
             .comm
             .as_ref()
@@ -350,17 +357,20 @@ impl TransformerModel {
             self.buffers.sizes().moe_output,
             2 * bytes
         );
-        let logits = self.buffers.logits();
-        let rank = comm.rank();
-        self.gpu
-            .copy_d2d_async(logits.offset(rank * bytes), stage, bytes, stream)?;
-        comm.peer_exchange_async(stage.0, stage.offset(bytes).0, bytes, stream)?;
-        self.gpu.copy_d2d_async(
-            stage.offset(bytes),
-            logits.offset((1 - rank) * bytes),
-            bytes,
-            stream,
-        )
+        let (rank, row_bytes) = (comm.rank(), self.config.vocab_size * 2);
+        for row in 0..rows {
+            let logits = self.buffers.logits().offset(row * row_bytes);
+            self.gpu
+                .copy_d2d_async(logits.offset(rank * bytes), stage, bytes, stream)?;
+            comm.peer_exchange_async(stage.0, stage.offset(bytes).0, bytes, stream)?;
+            self.gpu.copy_d2d_async(
+                stage.offset(bytes),
+                logits.offset((1 - rank) * bytes),
+                bytes,
+                stream,
+            )?;
+        }
+        Ok(())
     }
 }
 

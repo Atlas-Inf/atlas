@@ -205,3 +205,227 @@ extern "C" __global__ void argmax_pair_merge_ban(
         out[r] = v1 > v0 ? p1[o + 1] + shard : p0[o + 1];
     }
 }
+
+// ── Sampled verify on the vocabulary split (`glm_verify_sample`) ──
+//
+// A sampled verify row needs the target's distribution, not its argmax, but
+// each rank holds only its part of the row. Each rank reports its best
+// GLM_SAMPLE_C logits (value descending, then the lower index: the sampler's
+// order), the logits of up to four special tokens the host pipeline may mask,
+// and the mass of everything else at the row's temperature; the head samples
+// from those (`spark_runtime::sampler::sample_with_absent`).
+#define GLM_SAMPLE_C 64
+#define GLM_SAMPLE_REC_WORDS (8 + 2 * GLM_SAMPLE_C)
+
+// BF16 bits to an unsigned key ordered like the values (-0 is +0).
+__device__ __forceinline__ unsigned int glm_bf16_key(unsigned short b) {
+    if (b == 0x8000u) {
+        b = 0;
+    }
+    return (b & 0x8000u) ? (~b & 0xFFFFu) : (b | 0x8000u);
+}
+
+__device__ __forceinline__ float glm_key_value(unsigned int k) {
+    const unsigned int b = (k & 0x8000u) ? (k ^ 0x8000u) : (~k & 0xFFFFu);
+    return __uint_as_float(b << 16);
+}
+
+// The highest key `t` with at least `need` keys >= t among keys whose high
+// byte is `high` (pass 2, `high_only`) or among all keys (pass 1, on the high
+// byte): thread 0 scans the 256-bin histogram from the top. Returns the bin and
+// the count strictly above it.
+__device__ __forceinline__ void glm_hist_cut(
+    const unsigned int* hist, unsigned int above, unsigned int need,
+    unsigned int* bin, unsigned int* count_above
+) {
+    unsigned int acc = above;
+    for (int h = 255; h >= 0; --h) {
+        if (acc + hist[h] >= need) {
+            *bin = (unsigned int)h;
+            *count_above = acc;
+            return;
+        }
+        acc += hist[h];
+    }
+    *bin = 0;
+    *count_above = acc;
+}
+
+// Grid: (rows, 1, 1)  Block: (1024, 1, 1). Row r reads this rank's `n` logits
+// at logits[r * row_stride ..] (vocabulary ids start..start+n) and writes
+// out[r * GLM_SAMPLE_REC_WORDS ..]:
+//   [0] candidates c = min(C, n)   [1] best value (f32)
+//   [2] Σ exp((v - best) * inv_t) over this rank's other non-special tokens
+//   [4..8) the special tokens' logits (f32), 0xFFFFFFFF where not this rank's
+//   [8 + 2j, 9 + 2j) candidate j: value (f32), vocabulary id; sorted.
+// inv_t == 0 skips the row (c = 0). Every step is deterministic.
+extern "C" __global__ void argmax_bf16_candidates(
+    const unsigned short* __restrict__ logits,
+    unsigned int* __restrict__ out,
+    unsigned int n,
+    unsigned int row_stride,
+    unsigned int start,
+    float inv_t,
+    unsigned int s0,
+    unsigned int s1,
+    unsigned int s2,
+    unsigned int s3
+) {
+    __shared__ unsigned int hist[256];
+    __shared__ unsigned int s_cut[4];
+    __shared__ unsigned int s_warp[2][32];
+    __shared__ unsigned int s_off[2][33];
+    __shared__ unsigned long long s_cand[GLM_SAMPLE_C];
+    __shared__ float s_red[1024];
+
+    const unsigned short* row = logits + (size_t)blockIdx.x * row_stride;
+    unsigned int* o = out + (size_t)blockIdx.x * GLM_SAMPLE_REC_WORDS;
+    const unsigned int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const unsigned int specials[4] = {s0, s1, s2, s3};
+    if (inv_t == 0.0f) {
+        if (tid == 0) {
+            o[0] = 0;
+        }
+        return;
+    }
+    const unsigned int c = n < GLM_SAMPLE_C ? n : GLM_SAMPLE_C;
+
+    // Pass 1: high-byte histogram and the best key.
+    if (tid < 256) {
+        hist[tid] = 0;
+    }
+    if (tid == 0) {
+        s_cut[3] = 0;
+    }
+    __syncthreads();
+    unsigned int best = 0;
+    for (unsigned int i = tid; i < n; i += blockDim.x) {
+        const unsigned int k = glm_bf16_key(row[i]);
+        atomicAdd(&hist[k >> 8], 1u);
+        best = max(best, k);
+    }
+    atomicMax(&s_cut[3], best);
+    __syncthreads();
+    if (tid == 0) {
+        glm_hist_cut(hist, 0, c, &s_cut[0], &s_cut[1]);
+    }
+    __syncthreads();
+    const unsigned int high = s_cut[0], above_high = s_cut[1];
+    const float vmax = glm_key_value(s_cut[3]);
+
+    // Pass 2: low-byte histogram inside the cut's high byte: the C-th key.
+    if (tid < 256) {
+        hist[tid] = 0;
+    }
+    __syncthreads();
+    for (unsigned int i = tid; i < n; i += blockDim.x) {
+        const unsigned int k = glm_bf16_key(row[i]);
+        if ((k >> 8) == high) {
+            atomicAdd(&hist[k & 255], 1u);
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        unsigned int low, gt;
+        glm_hist_cut(hist, above_high, c, &low, &gt);
+        s_cut[0] = (high << 8) | low;
+        s_cut[1] = gt;
+    }
+    __syncthreads();
+    const unsigned int cut = s_cut[0], count_gt = s_cut[1], need_eq = c - count_gt;
+
+    // Pass 3, in index order a tile at a time: keys above the cut, then the
+    // lowest-index ties at it, are the candidates; the rest is the tail.
+    float tail = 0.0f;
+    unsigned int base_gt = 0, base_eq = 0;
+    const unsigned int lt_mask = (1u << lane) - 1u;
+    for (unsigned int t0 = 0; t0 < n; t0 += blockDim.x) {
+        const unsigned int i = t0 + tid;
+        const bool valid = i < n;
+        const unsigned short b = valid ? row[i] : 0;
+        const unsigned int k = valid ? glm_bf16_key(b) : 0;
+        const bool gt = valid && k > cut, eq = valid && k == cut;
+        const unsigned int bg = __ballot_sync(0xFFFFFFFFu, gt);
+        const unsigned int be = __ballot_sync(0xFFFFFFFFu, eq);
+        if (lane == 0) {
+            s_warp[0][warp] = __popc(bg);
+            s_warp[1][warp] = __popc(be);
+        }
+        __syncthreads();
+        if (tid < 2) {
+            unsigned int acc = 0;
+            for (unsigned int w = 0; w < blockDim.x / 32; ++w) {
+                s_off[tid][w] = acc;
+                acc += s_warp[tid][w];
+            }
+            s_off[tid][32] = acc;
+        }
+        __syncthreads();
+        const unsigned int pos_gt = base_gt + s_off[0][warp] + __popc(bg & lt_mask);
+        const unsigned int pos_eq = base_eq + s_off[1][warp] + __popc(be & lt_mask);
+        const bool take_eq = eq && pos_eq < need_eq;
+        if (gt || take_eq) {
+            const unsigned int slot = gt ? pos_gt : count_gt + pos_eq;
+            s_cand[slot] = ((unsigned long long)(0xFFFFu - k) << 32) | i;
+        } else if (valid) {
+            const unsigned int id = start + i;
+            if (id != specials[0] && id != specials[1] && id != specials[2] && id != specials[3]) {
+                tail += __expf((__uint_as_float((unsigned int)b << 16) - vmax) * inv_t);
+            }
+        }
+        base_gt += s_off[0][32];
+        base_eq += s_off[1][32];
+        __syncthreads();
+    }
+
+    // Deterministic tree sum of the tail.
+    s_red[tid] = tail;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_red[tid] += s_red[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // Bitonic sort of the candidates on (value descending, index ascending).
+    if (tid < GLM_SAMPLE_C && tid >= c) {
+        s_cand[tid] = ~0ull;
+    }
+    __syncthreads();
+    for (unsigned int size = 2; size <= GLM_SAMPLE_C; size <<= 1) {
+        for (unsigned int stride = size >> 1; stride > 0; stride >>= 1) {
+            if (tid < GLM_SAMPLE_C) {
+                const unsigned int j = tid ^ stride;
+                if (j > tid) {
+                    const bool up = (tid & size) == 0;
+                    const unsigned long long a = s_cand[tid], d = s_cand[j];
+                    if ((a > d) == up) {
+                        s_cand[tid] = d;
+                        s_cand[j] = a;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    if (tid < c) {
+        const unsigned long long e = s_cand[tid];
+        const unsigned int k = 0xFFFFu - (unsigned int)(e >> 32);
+        o[8 + 2 * tid] = __float_as_uint(glm_key_value(k));
+        o[9 + 2 * tid] = start + (unsigned int)(e & 0xFFFFFFFFu);
+    }
+    if (tid < 4) {
+        const unsigned int id = specials[tid];
+        o[4 + tid] = (id >= start && id - start < n)
+            ? __float_as_uint(__uint_as_float((unsigned int)row[id - start] << 16))
+            : 0xFFFFFFFFu;
+    }
+    if (tid == 0) {
+        o[0] = c;
+        o[1] = __float_as_uint(vmax);
+        o[2] = __float_as_uint(s_red[0]);
+        o[3] = 0;
+    }
+}
