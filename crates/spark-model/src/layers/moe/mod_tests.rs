@@ -103,6 +103,7 @@ fn mxfp8_shared_expert_runs_at_decode_verify_and_prefill_rows() {
         batchm: KernelHandle(222),
         dequant: KernelHandle(333),
         rows32: KernelHandle(0),
+        tc: [KernelHandle(0); 3],
     };
     let scratch = ops::Mxfp8Scratch {
         ptr: DevicePtr(0x9000_0000),
@@ -262,6 +263,40 @@ fn bf16_router_keeps_dense_gemm_unless_flagged() {
             assert!(rows_blocks > 0);
         } else {
             assert_eq!(gemm_blocks, 1, "unflagged BF16 router must run dense_gemm");
+        }
+    }
+}
+
+#[test]
+fn the_bf16_router_tile_gemm_serves_only_a_flagged_layer() {
+    // `ATLAS_QWEN4EXP_PREFILL_SP_ROUTE` routes an SP rank's own rows on the
+    // same tile GEMM the whole-batch FP4-Local router runs: one launch, a
+    // 128x128 tile per CTA, on a layer flagged row-invariant; nothing on
+    // another.
+    use crate::layers::moe::shared_fp8_cache_test_gpu::RecordingGpu;
+    use atlas_core::config::ModelConfig;
+
+    let gpu = RecordingGpu::new();
+    let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+    config.hidden_size = 2560;
+    config.num_experts = 512;
+    for flagged in [false, true] {
+        let mut layer = MoeLayer::new(MoeWeights::empty(512), 512, None, &gpu, &config).unwrap();
+        if flagged {
+            layer.set_row_invariant_bf16_router();
+        }
+        gpu.launches.lock().unwrap().clear();
+        let rows = 8024u32;
+        let served = layer
+            .try_bf16_router_gemm(DevicePtr(0x40000), DevicePtr(0x80000), rows, 2560, &gpu, 19)
+            .unwrap();
+        let launches = gpu.launches.lock().unwrap();
+        assert_eq!(served, flagged);
+        if flagged {
+            assert_eq!(launches.len(), 1);
+            assert_eq!(launches[0].grid, [512 / 128, rows.div_ceil(128), 1]);
+        } else {
+            assert!(launches.is_empty());
         }
     }
 }

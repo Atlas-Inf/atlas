@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Qwen TP2 modes share native target precision and target-verified MTP.
 //! Ported from Enntity/atlas `weight_loader/qwen4_exp/mode.rs` (AGPL-3.0-only),
-//! adapted for this stack: `ATLAS_QWEN4EXP_MXFP8_DECODE` and
-//! `ATLAS_QWEN4EXP_PREFILL_W8A8` have no implementation here (their features
-//! are not in this tree), so they are omitted from the flag contract.
+//! adapted for this stack: `ATLAS_QWEN4EXP_MXFP8_DECODE` selects the
+//! tensor-core MXFP8 tiers (`ops::mxfp8_decode_tc`) and is checked by startup
+//! parity, not here; `ATLAS_QWEN4EXP_PREFILL_W8A8` and
+//! `ATLAS_QWEN4EXP_MTP_BF16_ATTN` have no implementation here (their features
+//! are not in this tree), so they are omitted from the flag contract; the corrected-RNE quantizer kernel
+//! (`quantize_bf16_to_nvfp4_weight_rne`) likewise has no target here, so
+//! `weight_quantizer()` always names the standard converter and Spark's draft
+//! copy does not carry Enntity's corrected-rounding guarantee.
 use anyhow::{Result, bail, ensure};
 use atlas_core::config::ModelConfig;
 

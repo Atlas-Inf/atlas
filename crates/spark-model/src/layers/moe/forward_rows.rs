@@ -122,7 +122,9 @@ impl MoeLayer {
             self.reject_decode_lora(ctx, "forward_rows")?;
         }
         let output = ctx.buffers.moe_output();
-        let shared_out = ctx.buffers.attn_output();
+        // An MXFP8 shared expert's rows run on the side lane, forked here.
+        let side = self.fork_mxfp8_shared(input, rows, ctx, stream)?;
+        let shared_out = side.unwrap_or(ctx.buffers.attn_output());
         if self.rows_pair_eligible(rows, ctx) {
             self.forward_rows_pair(input, rows, output, shared_out, ctx, stream)?;
         } else if self.t_rows_eligible(rows, ctx) {
@@ -148,6 +150,7 @@ impl MoeLayer {
                 )?;
             }
         }
+        self.end_mxfp8_shared_fork(ctx, stream)?;
         let posted =
             self.forward_ep_reduce(output, shared_out, input, rows, hc_post, ctx, stream)?;
         Ok(Some((output, posted)))
@@ -314,7 +317,8 @@ impl MoeLayer {
 
         // Each row's blend, as `forward_row_local` runs it: under EP against a
         // zeroed shared row (the EP reduce adds the shared expert once).
-        let is_ep = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
+        let is_ep =
+            ctx.comm.is_some() && ctx.config.ep_world_size > 1 && !self.shared_joins_reduce();
         let zero_row = if is_ep {
             self.ep_blend_zero_row(ctx, stream)?
         } else {

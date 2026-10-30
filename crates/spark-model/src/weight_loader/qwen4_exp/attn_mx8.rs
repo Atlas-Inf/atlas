@@ -23,7 +23,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kv_cache::KvCacheDtype;
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
-use super::mx8_common::module;
+use super::mx8_common::{self, module};
 use crate::layer::TransformerLayer;
 use crate::layers::ops::{Mxfp8ProjKernels, Mxfp8Scratch};
 use crate::layers::qwen3_attention::mx8::Mx8AttnRt;
@@ -134,6 +134,7 @@ pub(super) fn build(
             Mx8AttnRt {
                 kernels: Mxfp8ProjKernels::resolve(gpu)?,
                 scratch,
+                w8a8: mx8_common::w8a8_prefill(gpu, projs.each_ref(), config)?,
             },
         )
         .with_context(|| format!("MXFP8 attention layer {layer_idx}"))?;

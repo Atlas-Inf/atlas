@@ -35,6 +35,19 @@ pub(crate) struct ExpertPtrTable {
     pub(crate) scale2_vals: DevicePtr,
 }
 
+impl ExpertPtrTable {
+    /// This table's weights with other per-expert `scale2_vals` (owned by
+    /// the caller; the pointer arrays stay this table's).
+    pub(crate) fn with_scale2(&self, scale2_vals: DevicePtr) -> Self {
+        Self {
+            allocation: None,
+            packed_ptrs: self.packed_ptrs,
+            scale_ptrs: self.scale_ptrs,
+            scale2_vals,
+        }
+    }
+}
+
 /// Device-resident top-k routing results that can be sliced across fused
 /// small-M expert waves without recomputing the router projection.
 #[derive(Clone, Copy)]
@@ -101,6 +114,10 @@ pub(crate) enum SeparateSharedExpert {
         kernels: ops::Mxfp8ProjKernels,
         scratch: ops::Mxfp8Scratch,
     },
+    /// The same checkpoint bytes as SparkQwen serves them
+    /// (`ATLAS_QWEN4EXP_MXFP8_SHARED=1`, `shared_mxfp8.rs`): tensor-core
+    /// SwiGLU tiers, W8A8 prefill, and under EP this rank's slice.
+    Mxfp8Native(Mxfp8SharedExpert),
 }
 
 /// The fused small-row arm of a [`SeparateSharedExpert::Mxfp8`].
@@ -213,6 +230,10 @@ pub(crate) use forward_prefill_routed::{grouped_cutlass_gate_up_enabled, prefill
 mod forward_prefill_router;
 mod forward_prefill_tcp;
 pub(crate) use forward_prefill_tcp::tcp_requested;
+mod forward_prefill_w4a4;
+pub(crate) use forward_prefill_w4a4::requested as w4a4_requested;
+mod w4a4_scales;
+pub(crate) use w4a4_scales::W4a4Scales;
 mod forward_rows;
 mod forward_rows_t;
 mod forward_token_major;
@@ -224,6 +245,8 @@ mod helpers_a;
 mod helpers_b;
 mod helpers_c;
 mod helpers_shared;
+mod shared_mxfp8;
+pub(crate) use shared_mxfp8::{Mxfp8SharedExpert, requested as shared_mxfp8_requested};
 mod route_dump;
 mod shared_fp8_cache;
 mod shared_fp8_cache_load;

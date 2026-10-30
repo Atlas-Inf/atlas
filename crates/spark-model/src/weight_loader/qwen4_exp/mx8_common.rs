@@ -9,7 +9,8 @@ use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
-use crate::layers::ops::Mxfp8Scratch;
+use crate::layers::ops::qwen4exp_w8a8::{self, MxPrefill};
+use crate::layers::ops::{Mxfp8Proj, Mxfp8Scratch};
 
 /// Inputs per E8M0 scale.
 pub(super) const MX8_GROUP: usize = 32;
@@ -73,4 +74,21 @@ pub(super) fn scratch_for(
     );
     *shared = Some(s);
     Ok(s)
+}
+
+/// Under `ATLAS_QWEN4EXP_PREFILL_W8A8=1` (and not
+/// `ATLAS_QWEN4EXP_PREFILL_BF16_PROJ`), a layer's W8A8 prefill GEMMs over
+/// `projs`, their row buckets tuned up to the largest prefill pass.
+pub(super) fn w8a8_prefill<const N: usize>(
+    gpu: &dyn GpuBackend,
+    projs: [&Mxfp8Proj; N],
+    config: &ModelConfig,
+) -> Result<Option<MxPrefill<N>>> {
+    if !qwen4exp_w8a8::enabled() {
+        return Ok(None);
+    }
+    let built = MxPrefill::build(gpu, projs, config.max_batch_tokens, gpu.default_stream());
+    built.map(Some).map_err(|e| {
+        e.context("MXFP8 W8A8 prefill install (ATLAS_QWEN4EXP_PREFILL_W8A8=0 loads without it)")
+    })
 }
