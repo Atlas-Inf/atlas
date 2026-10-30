@@ -25,8 +25,9 @@
 // production).
 //
 // MI row slabs of 16: MI = 2 takes up to 32 rows per expert (owner batches
-// of two to four streams, which M16 leaves to the M64 K128W grid), each slab
-// its own pqd_mma_stage over the same weight tile.
+// of two to four streams, which M16 leaves to the M64 K128W grid), MI = 4 up
+// to 64 (five to eight streams), each slab its own pqd_mma_stage over the
+// same weight tile.
 //
 // Grid and arguments as the M16 kernels; block (PQS_THREADS, 1, 1).
 //
@@ -78,7 +79,7 @@
 
 #define PQS_THREADS 256
 // 16-byte pieces of a stage per thread: 1024 weight, 128 scale and up to 128
-// activation pieces.
+// activation pieces (the four-slab twins take one more).
 #define PQS_PIECES 5
 // Stages ahead of the one being loaded that the L2 prefetch asks for (a stage
 // is about 7 us of a CTA's time at two CTAs per SM and DRAM speed).
@@ -100,13 +101,16 @@ __device__ __forceinline__ void pqs_load(
     constexpr unsigned int NC = PQW_NT / 16;                      // 16-byte chunks per row
     constexpr unsigned int NB = PQ2_KP * NC;                      // weight pieces
     constexpr unsigned int NS = (PQ2_KS / GROUP_SIZE) * NC;       // block-scale pieces
-    constexpr unsigned int NA = PQD_M * MI * (PQ2_KP / 16);       // activation pieces
-    static_assert(NB + NS + NA <= PQS_PIECES * PQS_THREADS, "stage pieces exceed the block");
+    constexpr unsigned int AP = PQ2_KP / 16;                      // pieces per row
+    constexpr unsigned int NA = PQD_M * MI * AP;                  // activation pieces
+    // PQS_PIECES a thread, or as many as four slabs' activations need.
+    constexpr int PIECES = (NB + NS + NA + PQS_THREADS - 1) / PQS_THREADS > PQS_PIECES
+        ? (NB + NS + NA + PQS_THREADS - 1) / PQS_THREADS : PQS_PIECES;
     const uint4 zero = make_uint4(0, 0, 0, 0);
-    uint4 v[PQS_PIECES];
-    uint4* dst[PQS_PIECES];
+    uint4 v[PIECES];
+    uint4* dst[PIECES];
     #pragma unroll
-    for (int r = 0; r < PQS_PIECES; ++r) {
+    for (int r = 0; r < PIECES; ++r) {
         const unsigned int p = t + r * PQS_THREADS;
         v[r] = zero;
         dst[r] = nullptr;
@@ -122,18 +126,19 @@ __device__ __forceinline__ void pqs_load(
             v[r] = __ldcs((const uint4*)&(pqw_chunk_up<GATE_UP>(c) ? US_expert : S_expert)[
                 (unsigned long long)(kb / GROUP_SIZE + g) * N + pqw_chunk_col<GATE_UP>(cta_n, c)]);
         } else if (p < NB + NS + NA) {
-            const unsigned int row = (p - NB - NS) >> 2, col = ((p - NB - NS) & 3) << 4;
+            const unsigned int row = (p - NB - NS) / AP, col = (p - NB - NS) % AP * 16;
             dst[r] = (uint4*)&sA[row][col];
+            const unsigned long long rb = K / 2, ob = kb / 2;
             if (row < M_eff)
-                v[r] = *(const uint4*)&A_packed[(unsigned long long)(unsigned int)sTok[row] * (K / 2) + kb / 2 + col];
+                v[r] = __ldcg((const uint4*)&A_packed[(unsigned long long)(unsigned int)sTok[row] * rb + ob + col]);
         }
     }
     #pragma unroll
-    for (int r = 0; r < PQS_PIECES; ++r)
+    for (int r = 0; r < PIECES; ++r)
         if (dst[r]) *dst[r] = v[r];
     if (t < PQD_M * MI)
         *(unsigned long long*)&sAs[t][0] = t < M_eff
-            ? *(const unsigned long long*)&A_scale[(unsigned long long)(unsigned int)sTok[t] * (K / GROUP_SIZE) + kb / GROUP_SIZE]
+            ? __ldcg((const unsigned long long*)&A_scale[(unsigned long long)(unsigned int)sTok[t] * (K / GROUP_SIZE) + kb / GROUP_SIZE])
             : 0ull;
 }
 
@@ -184,11 +189,11 @@ __device__ __forceinline__ PqsItem pqs_item(
     const PqwGateUp& up, unsigned int num_experts, unsigned int slot
 ) {
     PqsItem it{};
-    it.expert_id = worklist[4 + slot * 2];
+    it.expert_id = __ldcg(worklist + 4 + slot * 2);
     // One row tile per expert: a second M64 tile means more than 64 rows.
-    if (it.expert_id >= num_experts || worklist[5 + slot * 2] != 0) return it;
-    it.cta_m = expert_offsets[it.expert_id];
-    it.M_expert = expert_offsets[it.expert_id + 1] - (int)it.cta_m;
+    if (it.expert_id >= num_experts || __ldcg(worklist + 5 + slot * 2) != 0) return it;
+    it.cta_m = __ldcg(expert_offsets + it.expert_id);
+    it.M_expert = __ldcg(expert_offsets + it.expert_id + 1) - (int)it.cta_m;
     it.B = (const unsigned char*)B_packed_ptrs[it.expert_id];
     it.S = (const unsigned char*)B_scale_ptrs[it.expert_id];
     if (it.M_expert <= 0 || it.B == 0) return it;
@@ -213,11 +218,11 @@ __device__ __forceinline__ void pqs_impl(
     const unsigned int* __restrict__ worklist,
     const PqwGateUp up
 ) {
-    constexpr int NBUF = PERSIST ? 3 : 2;
     atlas_pdl_enter();
+    constexpr int NBUF = PERSIST ? 3 : 2;
     const unsigned int tiles = PERSIST ? N / (GATE_UP ? PQW_NT / 2 : PQW_NT) : gridDim.x;
-    const unsigned int items = PERSIST ? worklist[0] * tiles : 0;
-    if (!PERSIST && (int)blockIdx.y >= (int)worklist[0]) return;
+    const unsigned int items = PERSIST ? __ldcg(worklist) * tiles : 0;
+    if (!PERSIST && (int)blockIdx.y >= (int)__ldcg(worklist)) return;
     unsigned int item = PERSIST ? blockIdx.x : blockIdx.y * tiles + blockIdx.x;
     if (PERSIST && item >= items) return;
     const unsigned int t = threadIdx.x;
@@ -237,8 +242,8 @@ __device__ __forceinline__ void pqs_impl(
         for (unsigned int kp = t; kp < K / 2; kp += PQS_THREADS) {
             unsigned int any = 0;
             for (int r = 0; r < m.M_expert; ++r) {
-                const unsigned int tok = sorted_token_ids ? (unsigned int)sorted_token_ids[m.cta_m + r] : m.cta_m + r;
-                any |= A_packed[(unsigned long long)tok * (K / 2) + kp] & 0x77u;
+                const unsigned int tok = sorted_token_ids ? (unsigned int)__ldcg(sorted_token_ids + m.cta_m + r) : m.cta_m + r;
+                any |= __ldcg(A_packed + (unsigned long long)tok * (K / 2) + kp) & 0x77u;
             }
             live[kp] = any != 0;
         }
@@ -270,7 +275,7 @@ __device__ __forceinline__ void pqs_impl(
             const unsigned int cta_n = tile * (GATE_UP ? PQW_NT / 2 : PQW_NT);
 
             if (t < PQD_M * MI)
-                sTok[t] = (sorted_token_ids && (int)t < it.M_expert) ? sorted_token_ids[it.cta_m + t] : (int)(it.cta_m + t);
+                sTok[t] = (sorted_token_ids && (int)t < it.M_expert) ? __ldcg(sorted_token_ids + it.cta_m + t) : (int)(it.cta_m + t);
             const bool pf_next = PF && has_next && nx.ok && !nx.full;
             if (zskip && !asked) build_mask(sLive[cur], it);
             if (zskip && pf_next) build_mask(sLive[cur ^ 1], nx);
@@ -395,6 +400,15 @@ extern "C" __global__ void __launch_bounds__(PQS_THREADS, 1) glm_moe_decode_m32s
 }
 extern "C" __global__ void __launch_bounds__(PQS_THREADS, 1) glm_moe_decode_m32s_gate_up_silu_k128w_l2pf_p(PQS_GATE_UP_ARGS) {
     pqs_impl<true, false, 2, true, true>(PQS_TABLES, PQS_UP);
+}
+// Four slabs (up to 64 rows per expert), persistent and prefetching only:
+// owner-batched verifies of 33..=64 rows (five to eight streams), which the
+// two-slab twins leave to the M64 K128W grid.
+extern "C" __global__ void __launch_bounds__(PQS_THREADS, 1) glm_moe_decode_m64s_k128w_zskip_l2pf_p(PQS_DOWN_ARGS) {
+    pqs_impl<false, true, 4, true, true>(PQS_TABLES, PqwGateUp{});
+}
+extern "C" __global__ void __launch_bounds__(PQS_THREADS, 1) glm_moe_decode_m64s_gate_up_silu_k128w_l2pf_p(PQS_GATE_UP_ARGS) {
+    pqs_impl<true, false, 4, true, true>(PQS_TABLES, PQS_UP);
 }
 
 #undef PQS_DOWN_ARGS
