@@ -11,9 +11,8 @@
 //! - Spark speculates with its reviewed NVFP4 drafter and blends the shared
 //!   expert's full output (no shared TP split).
 //!
-//! The FP4-Local native-format groups Enntity's mode also validates
-//! (`NativePolicy`, checkpoint input scales, routed A16 decode) are not on
-//! this base; their checks belong beside those formats when they land.
+//! Both modes serve the FP4-Local native formats; Strict also decodes KDA on
+//! MXFP8 and the routed experts at A16.
 use anyhow::{Result, bail, ensure};
 use atlas_core::config::ModelConfig;
 
@@ -44,9 +43,33 @@ const STRICT_FLAGS: &[(&str, &str)] = &[
     ("ATLAS_GLM_DRAFT_TP_TOPK", "0"),
 ];
 
+/// The FP4-Local native target both modes serve.
+const NATIVE_FLAGS: &[(&str, &str)] = &[
+    ("ATLAS_GLM_FP4L_NATIVE", "1"),
+    ("ATLAS_GLM_FP4L_MLA_FP8", "1"),
+    ("ATLAS_GLM_FP4L_DENSE_MXFP8", "1"),
+    ("ATLAS_GLM_FP4L_KDA_W8A8_PREFILL", "1"),
+    ("ATLAS_GLM_FP4L_INPUT_SCALES", "1"),
+    ("ATLAS_GLM_FP4L_FP8_PREFILL", "w8a8"),
+    ("ATLAS_GLM_LM_HEAD_MXFP8", "1"),
+    ("ATLAS_GLM_FP4L_KDA_TILED_TWIN", "0"),
+];
+
+/// Strict's target: native shared expert, MXFP8 KDA decode, A16 routed decode.
+const STRICT_NATIVE_FLAGS: &[(&str, &str)] = &[
+    ("ATLAS_GLM_FP4L_SHARED_FP8", "1"),
+    ("ATLAS_GLM_FP4L_KDA_MXFP8_DECODE", "1"),
+    ("ATLAS_GLM_FP4L_DECODE_A16", "1"),
+];
+
 /// Splitting the shared expert rounds each partial BF16 output before the
 /// routed/shared blend; Spark's matched arithmetic needs the full output.
-const SPARK_FLAGS: &[(&str, &str)] = &[("ATLAS_GLM_SHARED_TP_SPLIT", "0")];
+/// Its shared expert format comes from the profile.
+const SPARK_FLAGS: &[(&str, &str)] = &[
+    ("ATLAS_GLM_SHARED_TP_SPLIT", "0"),
+    ("ATLAS_GLM_FP4L_KDA_MXFP8_DECODE", "0"),
+    ("ATLAS_GLM_FP4L_DECODE_A16", "0"),
+];
 
 impl ServingMode {
     pub fn parse(value: Option<&str>) -> Result<Option<Self>> {
@@ -60,7 +83,8 @@ impl ServingMode {
 
     /// The launcher's flag contract for this mode, read through `lookup`
     /// (an environment lookup). `native_mtp`: Strict's opt-in native
-    /// predictor replaces the DFlash lane, so the drafter policy is moot.
+    /// predictor replaces the DFlash lane, so the drafter policy is moot;
+    /// the target's still holds.
     pub fn validate_flags(
         self,
         native_mtp: bool,
@@ -70,18 +94,18 @@ impl ServingMode {
             !native_mtp || self == Self::Strict,
             "ATLAS_GLM_STRICT_NATIVE_MTP requires ATLAS_GLM_SERVING_MODE=strict"
         );
-        let flags = match self {
-            Self::Strict if native_mtp => &[][..],
-            Self::Strict => STRICT_FLAGS,
+        let flags: &[&[(&str, &str)]] = match self {
+            Self::Strict if native_mtp => &[NATIVE_FLAGS, STRICT_NATIVE_FLAGS],
+            Self::Strict => &[NATIVE_FLAGS, STRICT_NATIVE_FLAGS, STRICT_FLAGS],
             Self::Spark => {
                 ensure!(
                     lookup("ATLAS_NO_DFLASH_DRAFTER_NVFP4").is_none(),
                     "Spark mode requires its reviewed NVFP4 drafter policy"
                 );
-                SPARK_FLAGS
+                &[NATIVE_FLAGS, SPARK_FLAGS]
             }
         };
-        for &(key, expected) in flags {
+        for &(key, expected) in flags.iter().copied().flatten() {
             ensure!(
                 lookup(key).as_deref() == Some(expected),
                 "{self:?} mode requires {key}={expected}"
