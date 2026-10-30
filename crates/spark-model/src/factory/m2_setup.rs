@@ -72,14 +72,15 @@ pub(super) fn maybe_run_minimax_m2_moe_transpose(
     let cost_gate_up: usize = local_experts * 2 * per_expert_one * config.num_hidden_layers;
     let gb = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
     if crate::layers::moe::skips_routed_transpose(config) {
-        // ATLAS_QWEN4EXP_PREFILL_MOE_NODUP: prefill reads the routed experts
-        // in their checkpoint layout, so only the shared expert is transposed.
+        // ATLAS_QWEN4EXP_PREFILL_MOE_NODUP / _PREFILL_W4A4: prefill reads the
+        // routed experts in their checkpoint layout, so only the shared
+        // expert is transposed.
         let free = gpu.free_memory()?;
         for layer in layers.iter_mut() {
             layer.transpose_moe_for_prefill(gpu, config)?;
         }
         tracing::info!(
-            "ATLAS_QWEN4EXP_PREFILL_MOE_NODUP: routed K-major prefill copy not built, \
+            "qwen4_exp prefill MoE (_MOE_NODUP / _PREFILL_W4A4): routed K-major prefill copy not built, \
              {} bytes ({:.1} GiB: {} experts x {} layers) saved; shared-expert \
              transpose {:.2} GiB, {:.1} GiB free",
             cost_full,

@@ -104,16 +104,24 @@ fn up_mix_exact() -> bool {
 }
 
 /// The fast arm's kernels, resolved per call. `up_mix` is `None` where the
-/// fused up+mix would not be exact ([`up_mix_exact`]).
+/// fused up+mix would not be exact ([`up_mix_exact`]); `up_mix_mx` (its twin
+/// that also writes `y` as MXFP8, `ATLAS_QWEN4EXP_PREFILL_W8A8`) is `None`
+/// with it, or when the build lacks it.
 pub(super) struct HcFastKernels {
     post_stage: KernelHandle,
     up_mix: Option<KernelHandle>,
+    up_mix_mx: Option<KernelHandle>,
 }
 
 impl HcFastKernels {
     /// Whether the slabs read `up_wt`, the `[hc*H, rank]` copy of `up_w`.
     pub(super) fn reads_up_wt(&self) -> bool {
         self.up_mix.is_some()
+    }
+
+    /// Whether every slab can write `y`'s MXFP8 image too.
+    pub(super) fn emits_mx(&self) -> bool {
+        self.up_mix_mx.is_some()
     }
 }
 
@@ -157,9 +165,12 @@ pub(super) fn prefill_arm(
         return None;
     }
     let up_mix = crate::layers::try_kernel(gpu, "hyper_connection", "hc_up_mix_bf16_nt");
+    let up_mix_mx = crate::layers::try_kernel(gpu, "hyper_connection", "hc_up_mix_bf16_nt_mx");
+    let exact = up_mix_exact();
     let k = HcFastKernels {
         post_stage: crate::layers::try_kernel(gpu, "hyper_connection", "hc_post_stage_bf16"),
-        up_mix: up_mix_exact().then_some(up_mix),
+        up_mix: exact.then_some(up_mix),
+        up_mix_mx: (exact && up_mix_mx.0 != 0).then_some(up_mix_mx),
     };
     if k.post_stage.0 == 0 || up_mix.0 == 0 {
         static WARNED: std::sync::Once = std::sync::Once::new();
@@ -271,8 +282,11 @@ fn slab_fast(c: &HcPrefillCall, k: &HcFastKernels, io: &HcSlabIo, stream: u64) -
         ts,
         stream,
     )?;
-    // 3. y = mean_s sigmoid(low x up_w) * normed, inj, in one kernel.
-    KernelLaunch::new(gpu, up_mix)
+    // 3. y = mean_s sigmoid(low x up_w) * normed, inj, in one kernel; under
+    // ATLAS_QWEN4EXP_PREFILL_W8A8 also y's MXFP8 image (`hc_up_mix_bf16_nt_mx`,
+    // the same launch with three more arguments).
+    let mx = io.mx.zip(k.up_mix_mx);
+    let launch = KernelLaunch::new(gpu, mx.map_or(up_mix, |(_, mx_k)| mx_k))
         .grid([c.hidden / HUM_BD, ts.div_ceil(HUM_BM), 1])
         .block([256, 1, 1])
         .arg_ptr(c.low)
@@ -280,12 +294,19 @@ fn slab_fast(c: &HcPrefillCall, k: &HcFastKernels, io: &HcSlabIo, stream: u64) -
         .arg_ptr(c.normed)
         .arg_ptr(if c.inject { c.inj_pre } else { DevicePtr::NULL })
         .arg_ptr(io.y)
-        .arg_ptr(io.inj)
-        .arg_u32(ts)
-        .arg_u32(c.hidden)
-        .arg_u32(c.rank())
-        .arg_f32(1.0f32 / c.hc_mult as f32)
-        .launch(stream)
+        .arg_ptr(io.inj);
+    let launch = match mx {
+        Some(((act, _), _)) => launch.arg_ptr(act.q).arg_ptr(act.sf),
+        None => launch,
+    }
+    .arg_u32(ts)
+    .arg_u32(c.hidden)
+    .arg_u32(c.rank())
+    .arg_f32(1.0f32 / c.hc_mult as f32);
+    match mx {
+        Some(((_, pad), _)) => launch.arg_u32(pad).launch(stream),
+        None => launch.launch(stream),
+    }
 }
 
 /// Device scratch for the check: the slab's highway and `inj` before the

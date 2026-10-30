@@ -109,10 +109,14 @@ pub(super) fn build_moe(
     };
 
     let mut moe = MoeLayer::new(weights, config.num_experts, gate_nvfp4, gpu, config)?;
+    // The routed prefill's W4A4 activation scales (`moe::w4a4_scales`).
+    moe.load_w4a4_scales(store, &format!("{lp}.mlp"), config, gpu)?;
     if row_invariant_router {
         moe.set_row_invariant_bf16_router();
     }
-    if native_shared {
+    if native_shared && crate::layers::moe::shared_mxfp8_requested() {
+        moe.set_native_mxfp8_shared_expert(super::shared_mx8::load(store, lp, config, gpu)?)?;
+    } else if native_shared {
         let m = |proj: &str, n: usize, k: usize| -> Result<Mxfp8Proj> {
             let [w, s] =
                 mx8_common::module(store, &format!("{lp}.mlp.shared_expert.{proj}"), n, k)?;

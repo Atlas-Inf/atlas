@@ -10,7 +10,9 @@
 //!      table). Model-declared, so it is checked FIRST and independently of
 //!      expert parallelism.
 //!   2. **EP sharding** — remote experts belong to another rank.
-//!   3. **`skip_activation_scales`** — W4A4 `*.input_scale`, opt-in.
+//!   3. **`skip_activation_scales`** — W4A4 `*.input_scale`, opt-in: not
+//!      uploaded but DEFERRED, every expert's on every rank (the model loader
+//!      reads the scalars from disk).
 //!   4. **`skip_mtp`** — `mtp.*` for a loader that builds no MTP head, opt-in.
 //!
 //!   5. **`skip_layer_prefix`** — an unused appended predictor layer, opt-in.
@@ -25,9 +27,14 @@ use crate::weights::parse_expert_index;
 
 impl FastSafetensorsLoader {
     /// Tensors located on disk but not uploaded: host-decoded formats and
-    /// expert-TP slices. Deferred tensors are also left out of the pre-flight.
+    /// expert-TP slices; the activation scales under `skip_activation_scales`
+    /// (one 0-dim F32 per projection, read on the host by a model loader that
+    /// needs them, whichever rank owns the expert). Deferred tensors are also
+    /// left out of the pre-flight.
     pub(super) fn should_defer_tensor(&self, name: &str) -> bool {
-        self.is_host_decoded(name) || self.is_expert_tp_slice(name)
+        (self.skip_activation_scales && name.ends_with(".input_scale"))
+            || self.is_host_decoded(name)
+            || self.is_expert_tp_slice(name)
     }
 
     /// CSF scale streams, and the weight/scale pair of every module the model
@@ -106,11 +113,13 @@ impl FastSafetensorsLoader {
         {
             return true;
         }
-        // W4A4 activation scales: never read on the w4a16 path (the NVFP4
-        // loader falls back to `DevicePtr::NULL`), and 4-byte allocations are
-        // almost pure granule padding at expert scale.
+        // W4A4 activation scales: not uploaded -- 4-byte allocations are
+        // almost pure granule padding at expert scale, and the NVFP4 loader
+        // falls back to `DevicePtr::NULL` -- but deferred (`should_defer_tensor`)
+        // for every expert, remote ones included: qwen4_exp's W4A4 prefill
+        // quantizes a layer's input under the max over all of them.
         if self.skip_activation_scales && name.ends_with(".input_scale") {
-            return true;
+            return false;
         }
         if self.ep_world_size <= 1 {
             return false;

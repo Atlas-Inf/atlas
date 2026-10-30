@@ -51,6 +51,9 @@ pub(super) struct HcSlabIo {
     /// This slab's rows of the previous sublayer's `hc_post`, when the caller
     /// fused it into this collapse (the fast arm only).
     pub fold: Option<HcPostFold>,
+    /// Where this slab's rows of `y` go as MXFP8, and the scale rows' padded
+    /// width (`ATLAS_QWEN4EXP_PREFILL_W8A8`; the fast arm only).
+    pub mx: Option<(super::MxAct, u32)>,
     pub ts: u32,
 }
 
@@ -150,6 +153,12 @@ pub(super) fn hc_pre_gemm(
             .launch(stream)?;
     }
 
+    // ATLAS_QWEN4EXP_PREFILL_W8A8: a layer armed this collapse to write `y`'s
+    // MXFP8 image too, which the fused up+mix does in its epilogue. Taken
+    // either way, so a target never outlives the collapse it was armed for.
+    let mx = super::qwen4exp_w8a8::take_target(num_tokens, hidden_size)
+        .filter(|_| fast.as_ref().is_some_and(|k| k.emits_mx()));
+
     let mut t0 = 0u32;
     while t0 < num_tokens {
         let ts = HC_PREFILL_SLAB.min(num_tokens - t0);
@@ -161,6 +170,9 @@ pub(super) fn hc_pre_gemm(
                 block_out: f.block_out.offset(t0 as usize * hidden_size as usize * 2),
                 inj: f.inj.offset(t0 as usize * hc_mult as usize * 4),
             }),
+            mx: mx
+                .map(|t| Ok::<_, anyhow::Error>((t.slab(t0 as usize)?, t.inner_pad())))
+                .transpose()?,
             ts,
         };
         match &fast {
@@ -170,6 +182,9 @@ pub(super) fn hc_pre_gemm(
         t0 += ts;
         // ATLAS_QWEN4EXP_PREFILL_SP_PIPE: rows [0, t0) of `y_out` are set.
         crate::layers::qwen4exp_sp_pipe::slab_done(t0 as usize, stream)?;
+    }
+    if mx.is_some() {
+        super::qwen4exp_w8a8::mark_produced();
     }
     Ok(())
 }

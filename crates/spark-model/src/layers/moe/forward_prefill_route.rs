@@ -64,24 +64,7 @@ impl MoeLayer {
             self.independent_router_logits(router_in, gate_logits, 2, ctx, stream)?;
         } else if self.glm_c4_grouped(ctx, n) {
             self.c4_router_logits(router_in, gate_logits, ctx, stream)?;
-        } else if self.row_invariant_bf16_router
-            && h.is_multiple_of(16)
-            && let Ok(k_gemm) = ctx.gpu.kernel("gemm", "dense_gemm_bf16_pipelined")
-        {
-            // FP4-Local's prefill contract allows different numerics than
-            // decode: the shipped BF16 gate already sits in the layout the
-            // pipelined GEMM reads, so no NVFP4 dequant step is needed —
-            // the same kernel try_q38_router runs after dequantizing the
-            // NVFP4 pack's router. Chunk-invariant (every logit is an
-            // independent in-order m16n8k16 chain), which the cached-prefix
-            // gate requires.
-            super::forward_prefill_route_sp::q38_router_gemm(
-                ctx.gpu,
-                k_gemm,
-                [router_in, self.weights.gate.weight, gate_logits],
-                [n, self.router_logits_n, h],
-                stream,
-            )?;
+        } else if self.try_bf16_router_gemm(router_in, gate_logits, n, h, ctx.gpu, stream)? {
         } else {
             // Selection numerics — see router_gate_gemm_dense for why this
             // must stay on the scalar kernel and why ATLAS_CUBLAS_GEMM must
@@ -98,6 +81,41 @@ impl MoeLayer {
             )?;
         }
         Ok(())
+    }
+
+    /// FP4-Local's BF16 router on `n` rows into `logits`, when the layer is
+    /// flagged row-invariant (`set_row_invariant_bf16_router`): the shipped
+    /// BF16 gate already sits in the layout the pipelined tile GEMM reads, so
+    /// no NVFP4 dequant step is needed (the same kernel `try_q38_router` runs
+    /// after dequantizing the NVFP4 pack's router). Chunk-invariant (every
+    /// logit is an independent in-order m16n8k16 chain), which the
+    /// cached-prefix gate and an SP rank routing its own rows
+    /// (`forward_prefill_route_sp`) require. `Ok(false)`: not served,
+    /// nothing launched.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn try_bf16_router_gemm(
+        &self,
+        router_in: DevicePtr,
+        logits: DevicePtr,
+        n: u32,
+        h: u32,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<bool> {
+        if !self.row_invariant_bf16_router || !h.is_multiple_of(16) {
+            return Ok(false);
+        }
+        let Ok(k_gemm) = gpu.kernel("gemm", "dense_gemm_bf16_pipelined") else {
+            return Ok(false);
+        };
+        super::forward_prefill_route_sp::q38_router_gemm(
+            gpu,
+            k_gemm,
+            [router_in, self.weights.gate.weight, logits],
+            [n, self.router_logits_n, h],
+            stream,
+        )?;
+        Ok(true)
     }
 
     /// Step 2: batched top-k over `gate_logits` into `indices_dev` / `weights_dev`.

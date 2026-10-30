@@ -41,6 +41,7 @@
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include "../../common/atlas_pdl.cuh"
+#include "../../common/mxfp8_act_quant.cuh"
 
 #define QHC_BLOCK 256
 #define QHC_MAX_MULT 8
@@ -193,7 +194,7 @@ __device__ __forceinline__ void qhc_collapse(
 
     // ── stage normed = x * rms * (1 + w) once ──
     for (unsigned int i = tid; i < hc_dim; i += blockDim.x) {
-        smem_normed[i] = x[i] * smem_rms[i / H] * (1.0f + hc_norm_w[i]);
+        smem_normed[i] = x[i] * smem_rms[i / H] * (1.0f + (float)hc_norm_w[i]);
     }
     __syncthreads();
 
@@ -385,7 +386,7 @@ extern "C" __global__ void hc_pre_stage(
         __syncthreads();
     }
     for (unsigned int i = tid; i < hc_dim; i += blockDim.x) {
-        out[i] = x[i] * smem_rms[i / H] * (1.0f + hc_norm_w[i]);
+        out[i] = x[i] * smem_rms[i / H] * (1.0f + (float)hc_norm_w[i]);
     }
 }
 
@@ -889,7 +890,7 @@ extern "C" __global__ void hc_pre_stage_bf16(
     }
     for (unsigned int i = tid; i < hc_dim; i += blockDim.x) {
         out[i] = __float2bfloat16(
-            x[i] * smem_rms[i / H] * (1.0f + hc_norm_w[i]));
+            x[i] * smem_rms[i / H] * (1.0f + (float)hc_norm_w[i]));
     }
 }
 
@@ -988,7 +989,7 @@ extern "C" __global__ void __launch_bounds__(QHC_WBLOCK, 1) hc_post_stage_bf16(
                 if (s2 < hc) {
                     const unsigned int i = s2 * H + d;
                     out[i] = __float2bfloat16(
-                        v[k][s2] * smem_rms[s2] * (1.0f + hc_norm_w[i]));
+                        v[k][s2] * smem_rms[s2] * (1.0f + (float)hc_norm_w[i]));
                 }
             }
         }
@@ -1078,6 +1079,8 @@ extern "C" __global__ void hc_pre_mix(
 #ifndef HUM_BD
 #define HUM_BD 32
 #endif
+// The MX epilogue quantizes a CTA's columns as whole 32-value MXFP8 blocks.
+static_assert(HUM_BD % 32 == 0, "HUM_BD must be a whole number of MXFP8 blocks");
 #ifndef HUM_MINB
 #define HUM_MINB 2
 #endif
@@ -1093,17 +1096,27 @@ __device__ __forceinline__ void hum_cp16(void* smem_ptr, const void* gmem_ptr) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sp), "l"(gmem_ptr));
 }
 
-extern "C" __global__ void __launch_bounds__(256, HUM_MINB) hc_up_mix_bf16_nt(
+// MX: the epilogue also (or, with y_out null, only) writes `y` as MXFP8 for
+// the cuBLASLt W8A8 GEMM -- E4M3 [T, H] plus UE8M0 scales in cuBLASLt's tiled
+// layout (`common/mxfp8_act_quant.cuh`), each value the quantization of the
+// BF16 `y` the plain kernel writes, so the bytes equal hc_up_mix_bf16_nt then
+// mxfp8_quant_act_bf16. A CTA's HUM_BD columns are whole 32-value blocks, and
+// a block's 32 values of a row sit in the quad of lanes sharing `g` (8 each).
+template <bool MX>
+__device__ __forceinline__ void hc_up_mix_body(
     const __nv_bfloat16* __restrict__ low,     // [T, rank] silu'd low-rank vector
     const __nv_bfloat16* __restrict__ up_wt,   // [hc*H, rank] transposed up_w
     const __nv_bfloat16* __restrict__ normed,  // [T, hc*H]
     const __nv_bfloat16* __restrict__ inj_pre, // [T, hc] or null
-    __nv_bfloat16* __restrict__ y_out,         // [T, H]
+    __nv_bfloat16* __restrict__ y_out,         // [T, H] (MX: may be null)
     float* __restrict__ inj_out,               // [T, hc]
     const unsigned int T,
     const unsigned int hidden_size,
     const unsigned int rank,
-    const float inv_hc
+    const float inv_hc,
+    unsigned char* __restrict__ y_q,           // MX: E4M3 [T, H]
+    unsigned char* __restrict__ y_sf,          // MX: tiled UE8M0 scales
+    const unsigned int sf_inner_pad            // MX: round_up(H / 32, 4)
 ) {
     __shared__ __align__(16) __nv_bfloat16 smem_A[HUM_STAGES][HUM_BM][HUM_STRIDE];
     __shared__ __align__(16) __nv_bfloat16 smem_B[HUM_STAGES][HUM_BN][HUM_STRIDE];
@@ -1211,7 +1224,10 @@ extern "C" __global__ void __launch_bounds__(256, HUM_MINB) hc_up_mix_bf16_nt(
     #pragma unroll
     for (unsigned int half = 0; half < 2; ++half) {
         const unsigned int row = m0 + warp * 16 + g + half * 8;
-        if (row >= T) continue;
+        // MX: rows past T still run (on row 0's `normed`, zero `low`) so the
+        // whole warp reaches the quad shuffles; only their stores are skipped.
+        if (!MX && row >= T) continue;
+        unsigned int ybits[HUM_BD / 8];
         #pragma unroll
         for (unsigned int q = 0; q < HUM_BD / 8; ++q) {
             const unsigned int d = d0 + q * 8 + t4 * 2;
@@ -1228,7 +1244,45 @@ extern "C" __global__ void __launch_bounds__(256, HUM_MINB) hc_up_mix_bf16_nt(
             const unsigned int packed =
                   (unsigned int)__bfloat16_as_ushort(__float2bfloat16(mixed0 * inv_hc))
                 | ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(mixed1 * inv_hc)) << 16);
-            *reinterpret_cast<unsigned int*>(y_out + (size_t)row * H + d) = packed;
+            if (!MX) {
+                *reinterpret_cast<unsigned int*>(y_out + (size_t)row * H + d) = packed;
+            } else {
+                if (y_out != nullptr && row < T) {
+                    *reinterpret_cast<unsigned int*>(y_out + (size_t)row * H + d) = packed;
+                }
+                ybits[q] = packed;
+            }
+        }
+        if (MX) {
+            #pragma unroll
+            for (unsigned int b = 0; b < HUM_BD / 32; ++b) {
+                float v[8];
+                float amax = 0.0f;
+                #pragma unroll
+                for (unsigned int j = 0; j < 4; ++j) {
+                    const unsigned int w = ybits[b * 4 + j];
+                    v[2 * j] = __uint_as_float(w << 16);
+                    v[2 * j + 1] = __uint_as_float(w & 0xFFFF0000u);
+                    amax = fmaxf(amax, fmaxf(mx_abs_clamped(v[2 * j]), mx_abs_clamped(v[2 * j + 1])));
+                }
+                const int e = mx_quad_exponent(amax);
+                const float inv = mx_inv_scale(e);
+                if (row < T) {
+                    #pragma unroll
+                    for (unsigned int j = 0; j < 4; ++j) {
+                        const unsigned int d = d0 + (b * 4 + j) * 8 + t4 * 2;
+                        const unsigned short pair =
+                            (unsigned short)mx_e4m3(v[2 * j], inv)
+                            | (unsigned short)((unsigned short)mx_e4m3(v[2 * j + 1], inv) << 8);
+                        *reinterpret_cast<unsigned short*>(y_q + (size_t)row * H + d) = pair;
+                    }
+                    if (t4 == 0) {
+                        const unsigned int blk = d0 / 32 + b;
+                        y_sf[mx_sf_offset(row, blk, sf_inner_pad)] = (unsigned char)(e + 127);
+                        if (blk + 1 == H / 32) mx_sf_zero_pad(y_sf, row, blk + 1, sf_inner_pad);
+                    }
+                }
+            }
         }
     }
     if (inj_pre != nullptr && blockIdx.x == 0) {
@@ -1240,6 +1294,44 @@ extern "C" __global__ void __launch_bounds__(256, HUM_MINB) hc_up_mix_bf16_nt(
             }
         }
     }
+}
+
+extern "C" __global__ void __launch_bounds__(256, HUM_MINB) hc_up_mix_bf16_nt(
+    const __nv_bfloat16* __restrict__ low,
+    const __nv_bfloat16* __restrict__ up_wt,
+    const __nv_bfloat16* __restrict__ normed,
+    const __nv_bfloat16* __restrict__ inj_pre,
+    __nv_bfloat16* __restrict__ y_out,
+    float* __restrict__ inj_out,
+    const unsigned int T,
+    const unsigned int hidden_size,
+    const unsigned int rank,
+    const float inv_hc
+) {
+    hc_up_mix_body<false>(low, up_wt, normed, inj_pre, y_out, inj_out, T, hidden_size, rank,
+                          inv_hc, nullptr, nullptr, 0);
+}
+
+// hc_up_mix_bf16_nt with `y` (also) emitted as MXFP8 (see hc_up_mix_body),
+// for ATLAS_QWEN4EXP_PREFILL_W8A8 (`qwen4exp_prefill_hc.rs` launches it when
+// a W8A8 producer is armed). Same grid and block.
+extern "C" __global__ void __launch_bounds__(256, HUM_MINB) hc_up_mix_bf16_nt_mx(
+    const __nv_bfloat16* __restrict__ low,
+    const __nv_bfloat16* __restrict__ up_wt,
+    const __nv_bfloat16* __restrict__ normed,
+    const __nv_bfloat16* __restrict__ inj_pre,
+    __nv_bfloat16* __restrict__ y_out,         // null: MXFP8 only
+    float* __restrict__ inj_out,
+    unsigned char* __restrict__ y_q,
+    unsigned char* __restrict__ y_sf,
+    const unsigned int T,
+    const unsigned int hidden_size,
+    const unsigned int rank,
+    const float inv_hc,
+    const unsigned int sf_inner_pad
+) {
+    hc_up_mix_body<true>(low, up_wt, normed, inj_pre, y_out, inj_out, T, hidden_size, rank,
+                         inv_hc, y_q, y_sf, sf_inner_pad);
 }
 
 // Transpose a BF16 matrix `[R, C] -> [C, R]`. Exists for one caller: the

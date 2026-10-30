@@ -239,7 +239,9 @@ impl MoeLayer {
 
         // Each row's blend, as `forward_row_local` runs it: under EP against
         // a zeroed shared row (the EP reduce adds the shared expert once).
-        let is_ep = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
+        // (An MXFP8 shared expert's slice blends here: `shared_mxfp8.rs`.)
+        let is_ep =
+            ctx.comm.is_some() && ctx.config.ep_world_size > 1 && !self.shared_joins_reduce();
         let zero_row = if is_ep && !shared_out.is_null() {
             self.ep_blend_zero_row(ctx, stream)?
         } else {

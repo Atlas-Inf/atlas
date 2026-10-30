@@ -116,6 +116,9 @@ pub struct MoeLayer {
     pub(super) gate_ptrs_t: Option<ExpertPtrTable>,
     pub(super) up_ptrs_t: Option<ExpertPtrTable>,
     pub(super) down_ptrs_t: Option<ExpertPtrTable>,
+    /// qwen4_exp's W4A4 routed prefill: the checkpoint's activation scales
+    /// and their alpha tables (`w4a4_scales.rs`).
+    pub(super) w4a4: Option<super::W4a4Scales>,
     /// CUTLASS grouped-NVFP4 host tables (`ATLAS_HOLO_MOE_GROUPED_CUTLASS`).
     /// Per-expert packed/SFB pointer values + scale2, snapshotted ONCE at load
     /// by `build_cutlass_grouped_sfb` (the SFB swizzle is built there from the

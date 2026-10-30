@@ -104,3 +104,22 @@ fn buffer_total_matches_actual_mock_allocations_with_grouped_o_and_adapters() {
     );
     assert_actual_arena_total(&config, 5);
 }
+
+#[test]
+fn fp8_act_scale_holds_an_mxfp8_tile_image_of_every_row_count() {
+    // The cuBLASLt MXFP8 scale image pads rows up to a 128-row tile and the
+    // per-row scale count (K/32) up to 4; a 16390-row pass once overran it.
+    let config = ModelConfig::qwen3_next_80b_nvfp4();
+    let k = config
+        .hidden_size
+        .max(config.num_attention_heads * config.head_dim);
+    for rows in [1, 127, 128, 129, 16384, 16390] {
+        let sizes = BufferSizes::from_config(&config, rows, 256, 16, 4);
+        let tiled = rows.next_multiple_of(128) * (k / 32).next_multiple_of(4);
+        assert!(
+            sizes.fp8_act_scale >= tiled,
+            "{rows} rows: fp8_act_scale {} < tiled MXFP8 scales {tiled}",
+            sizes.fp8_act_scale
+        );
+    }
+}

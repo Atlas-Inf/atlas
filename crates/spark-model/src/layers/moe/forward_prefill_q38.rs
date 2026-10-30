@@ -27,6 +27,9 @@
 //! selected. Remote experts (EP) have null tables and return early, as in the
 //! default kernels, so `prepare_ep_prefill_outputs`' zeroing still stands.
 //!
+//! `ATLAS_QWEN4EXP_PREFILL_W4A4=1` runs the routed chain W4A4 instead
+//! (`forward_prefill_w4a4`).
+//!
 //! `ATLAS_QWEN4EXP_PREFILL_MOE_W2=1` runs the GEMMs on their `moe_q38w_*`
 //! twins (2 x 4 warp grid, 16-byte dequant stores), byte-identical; see
 //! [`w2_requested`].
@@ -389,9 +392,7 @@ impl MoeLayer {
             && self.lora.is_none()
             && !fp8_down
             && !super::forward_prefill_routed::grouped_cutlass_gate_up_enabled()
-            && h.is_multiple_of(128)
-            && inter.is_multiple_of(64)
-            && crate::layers::try_kernel(ctx.gpu, "moe_prefill_q38", "moe_q38_down").0 != 0
+            && self.routed_chain_kernels_serve(h, inter, ctx)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -416,12 +417,13 @@ impl MoeLayer {
         if !self.q38_routed_serves(h, inter, ctx) {
             return Ok(false);
         }
-        // ATLAS_QWEN4EXP_PREFILL_MOE_BF16: the same work on the TC numerics.
+        // _PREFILL_MOE_BF16 (the TC numerics) or _PREFILL_W4A4 instead.
         let dims = (h, inter, num_experts, rows_per_expert_grid);
-        if self.try_tcp_routed_prefill(
+        if self.try_checkpoint_routed_prefill(
             expert_input,
             expert_offsets,
             sorted_token_ids,
+            [n, total_expanded],
             dims,
             ctx,
             stream,
