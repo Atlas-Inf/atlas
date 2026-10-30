@@ -30,6 +30,8 @@ const LITERAL_CONTENT: [&str; 4] = [
 mod glm_boundary_case_tests;
 #[path = "glm_literal_xml_tests.rs"]
 mod glm_literal_xml_tests;
+#[path = "glm_tool_args_tests.rs"]
+mod glm_tool_args_tests;
 #[path = "qwen_literal_xml_tests.rs"]
 mod qwen_literal_xml_tests;
 #[path = "reasoning_done_tests.rs"]

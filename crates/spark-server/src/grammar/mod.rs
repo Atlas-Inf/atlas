@@ -12,6 +12,7 @@ mod branch;
 mod compile_misc;
 mod compile_tools;
 mod engine;
+mod poolside_values;
 mod schema;
 mod state;
 

@@ -94,6 +94,8 @@ Atlas expands the multi-turn conversation through the chat template and runs a f
 
 `"required"` is implemented via the XGrammar grammar (see [XGrammar](../deep-dives/xgrammar.md)) — the grammar masks the "no-tool-call" path, so the sampler can only produce a valid tool-call opening.
 
+Argument values are a format's own choice. For the Poolside v1 format (GLM-5.3 Flash, Laguna), a forced or `"required"` call decodes a property with an `enum` or `const` from that set: a string as raw text, any other value as its JSON. Other properties stay free text up to `</arg_value>`. Types, nesting and `required` are not enforced, and `"auto"` leaves every value free. Arguments are delivered in the order the model wrote them, re-encoded as compact JSON.
+
 ## Streaming
 
 Streaming is enabled with `"stream": true`:
