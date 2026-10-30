@@ -8,6 +8,9 @@ use super::*;
 // longer references it, and `deny(warnings)` makes an unused import fatal.
 use crate::config::LayerType;
 
+#[path = "qwen4_exp_yarn_tests.rs"]
+mod yarn_tests;
+
 /// A trimmed copy of the shipped config — every key the parser reads, with
 /// the checkpoint's actual values, so a rename upstream fails here first.
 fn raw_config() -> Value {

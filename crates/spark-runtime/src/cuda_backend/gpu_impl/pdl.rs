@@ -212,6 +212,7 @@ pub(super) const QWEN4EXP_PDL_KERNELS: &[&str] = &[
     "w4a16_gemv_dual",
     "rms_norm",
     "rope_forward_mrope_interleaved",
+    "rope_forward_mrope_interleaved_yarn",
     "reshape_and_cache_flash",
     "paged_decode_attn",
     "sigmoid_gate_mul",

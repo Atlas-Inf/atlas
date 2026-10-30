@@ -467,20 +467,19 @@ impl Qwen3AttentionLayer {
         } else if self.rope_disabled {
             // Nemotron-H: no RoPE in attention (position lives in Mamba).
         } else if !self.yarn_inv_freq.is_null() {
-            ops::rope_yarn_scaled(
+            self.apply_scaled_rope(
                 ctx.gpu,
-                self.rope_yarn_scaled_k,
                 q_out,
                 k_out,
                 meta.positions,
+                meta.positions_h,
+                meta.positions_w,
                 1,
                 nq,
                 nkv,
                 hd,
                 self.rotary_dim_override
                     .unwrap_or(ctx.config.rotary_dim() as u32),
-                self.yarn_inv_freq,
-                self.yarn_attention_factor,
                 stream,
             )?;
         } else if self.rope_proportional && self.rope_proportional_k.0 != 0 {

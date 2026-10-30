@@ -126,7 +126,7 @@ impl Qwen3AttentionLayer {
         } = GlmIndexSelection::from_config(config, &probes)?;
         // Short gate flags so each GLM/hyper-connection lookup stays one line.
         let (glm, hc) = (probes.glm_kpool_indexer, probes.hyper_connection);
-        let layer = Self {
+        let mut layer = Self {
             input_norm,
             attn,
             post_attn_norm,
@@ -369,6 +369,7 @@ impl Qwen3AttentionLayer {
             ),
             rope_yarn_k: super::super::try_kernel(gpu, "rope", "rope_forward_yarn"),
             rope_yarn_scaled_k: super::super::try_kernel(gpu, "rope", "rope_forward_yarn_scaled"),
+            rope_yarn_mrope_k: spark_runtime::gpu::KernelHandle(0),
             // Interleaved (GPT-J / is_neox_style=False) YaRN RoPE — DeepSeek-V4 MLA.
             rope_yarn_interleaved_k: super::super::try_kernel(
                 gpu,
@@ -921,6 +922,7 @@ impl Qwen3AttentionLayer {
                 None
             },
         };
+        layer.configure_qwen_yarn(config, gpu)?;
         if independent {
             layer.validate_independent_kernels()?;
         }

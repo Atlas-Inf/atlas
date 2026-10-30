@@ -144,7 +144,8 @@ impl Qwen3AttentionLayer {
         //   - mrope_interleaved kernel handle loaded
         //   - BF16 KV cache (FP8 path has its own quantization noise that
         //     masks the cliff; not the workload that needs this fix)
-        let fused_kv_enabled = self.mrope_interleaved
+        let fused_kv_enabled = self.yarn_inv_freq.is_null()
+            && self.mrope_interleaved
             && self.fused_k_norm_rope_mrope_cache_write_bf16_k.0 != 0
             && self.reshape_and_cache_flash_v_only_k.0 != 0
             && std::env::var("ATLAS_FUSED_KV").ok().as_deref() == Some("1");
@@ -343,20 +344,19 @@ impl Qwen3AttentionLayer {
             // Nemotron-H: the HF reference applies no rotary embeddings in
             // attention — position lives in the Mamba layers.
         } else if !self.yarn_inv_freq.is_null() {
-            ops::rope_yarn_scaled(
+            self.apply_scaled_rope(
                 ctx.gpu,
-                self.rope_yarn_scaled_k,
                 q_contiguous,
                 k_contiguous,
                 bmeta_positions,
+                bmeta_positions_h,
+                bmeta_positions_w,
                 n,
                 nq,
                 nkv,
                 hd,
                 self.rotary_dim_override
                     .unwrap_or(ctx.config.rotary_dim() as u32),
-                self.yarn_inv_freq,
-                self.yarn_attention_factor,
                 stream,
             )?;
         } else if let Some(ref mla) = self.mla {

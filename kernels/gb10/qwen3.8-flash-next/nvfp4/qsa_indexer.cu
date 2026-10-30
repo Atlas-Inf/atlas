@@ -1558,3 +1558,5 @@ extern "C" __global__ void __launch_bounds__(QSA_RADIX_THREADS) qsa_select_topk_
 {
     qsa_radix_select(scores, sel, complete, block_topk, ratio, tail_start, visible);
 }
+
+#include "qsa_yarn.cuh"
