@@ -393,6 +393,9 @@ pub struct ModelBehavior {
     /// (`minimal`, `xhigh`, `max`), as vLLM hands it. Default `false`: the
     /// cross-template tier (`low`/`medium`/`high`/`xhigh`).
     pub verbatim_reasoning_effort: bool,
+    /// Identical tool rounds get a repeat notice and keep `<tool_call>` open
+    /// instead of the loop mask (`hint_injector::repeat_notice`). Default off.
+    pub tool_repeat_notice: bool,
 }
 
 /// The server's thinking ceiling for a `max_thinking_budget`: 0 means none,
@@ -470,6 +473,7 @@ impl Default for ModelBehavior {
             eos_ends_thinking: false,
             tool_call_steering: true,
             verbatim_reasoning_effort: false,
+            tool_repeat_notice: false,
         }
     }
 }

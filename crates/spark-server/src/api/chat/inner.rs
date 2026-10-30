@@ -150,6 +150,7 @@ pub(crate) async fn chat_completions_inner(
         enable_thinking,
         thinking_budget,
         force_nonempty_content,
+        repeat_run,
     } = match prepared {
         Ok(p) => p,
         Err(resp) => {
@@ -179,6 +180,7 @@ pub(crate) async fn chat_completions_inner(
     } = loop_detect::check_loops(
         &req.messages,
         tools_active && state.behavior.tool_call_steering,
+        repeat_run,
     );
     let us_loop_detect = _t_seg.elapsed().as_micros() - us_prepare;
 

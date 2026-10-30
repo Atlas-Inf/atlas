@@ -202,6 +202,7 @@ pub(super) fn generate_target_ptx_rs(
              \x20               eos_ends_thinking: {},\n\
              \x20               tool_call_steering: {},\n\
              \x20               verbatim_reasoning_effort: {},\n\
+             \x20               tool_repeat_notice: {},\n\
              \x20           }},\n\
              \x20           model_type_matches: vec![{}],\n\
              \x20           match_names: &[{}],\n\
@@ -253,6 +254,7 @@ pub(super) fn generate_target_ptx_rs(
             target.behavior_eos_ends_thinking,
             target.behavior_tool_call_steering,
             target.behavior_verbatim_reasoning_effort,
+            target.behavior_tool_repeat_notice,
             target.model_type_matches.iter().map(|m| {
                 let hs = match m.hidden_size {
                     Some(v) => format!("Some({v})"),

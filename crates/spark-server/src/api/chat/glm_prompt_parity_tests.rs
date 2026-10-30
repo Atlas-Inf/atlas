@@ -263,3 +263,37 @@ fn literal_glm_tool_markup_stays_text_while_structured_call_stays_native() {
         "only the structured historical call may use the native opener"
     );
 }
+
+/// `[behavior].tool_repeat_notice` (SparkGLM 0.2.0, Enntity/atlas 236beb90):
+/// the second identical tool round gets a notice on its latest result. Off,
+/// the prompt is the client's conversation.
+#[test]
+fn identical_tool_rounds_get_a_repeat_notice_only_when_the_target_asks() {
+    let round = |id: &str| {
+        [
+            serde_json::json!({"role": "assistant", "content": "", "tool_calls": [{
+                "id": id, "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\":\"Oslo\"}"}
+            }]}),
+            serde_json::json!({"role": "tool", "tool_call_id": id, "content": "rain"}),
+        ]
+    };
+    let mut messages = vec![serde_json::json!({"role": "user", "content": "weather?"})];
+    messages.extend(round("a"));
+    messages.extend(round("b"));
+    let request = serde_json::json!({
+        "model": "glm", "max_tokens": 64, "messages": messages,
+        "tools": [{"type": "function", "function": {"name": "get_weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]
+    });
+    for on in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = glm_state(dir.path());
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .behavior
+            .tool_repeat_notice = on;
+        let (prompt, ..) = render(&state, "repeat", &request);
+        assert_eq!(prompt.contains("<REPEAT NOTICE>"), on, "{prompt}");
+    }
+}

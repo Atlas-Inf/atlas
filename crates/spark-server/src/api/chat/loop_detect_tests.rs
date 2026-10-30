@@ -49,7 +49,7 @@ fn filler_turns_never_trip_spinning() {
     let mut messages = filler;
     messages.push(user_turn("Find the Q3 budget report and email the total."));
 
-    let out = check_loops(&messages, true);
+    let out = check_loops(&messages, true, 0);
     assert!(
         !out.suppress_tool_call,
         "filler alone must not suppress tool calls"
@@ -65,7 +65,7 @@ fn varied_short_prose_never_discourages_the_next_tool() {
     let messages: Vec<Message> = (0..8)
         .map(|i| text_turn(&format!("Working on step {i}.")))
         .collect();
-    let out = check_loops(&messages, true);
+    let out = check_loops(&messages, true, 0);
     assert!(!out.suppress_tool_call);
     assert_eq!(out.tool_call_repeat_count, 0);
 }
@@ -90,7 +90,7 @@ fn suppress_verdict_keeps_its_hard_mask() {
         tool_error: false,
     };
     let messages = vec![user_turn("x"), call(), call(), call()];
-    let out = check_loops(&messages, true);
+    let out = check_loops(&messages, true, 0);
     assert!(
         out.suppress_tool_call,
         "the Suppress verdict must keep its hard mask (repeated succeeding calls)"

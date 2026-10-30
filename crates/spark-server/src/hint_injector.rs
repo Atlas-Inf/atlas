@@ -393,6 +393,70 @@ fn bash_wander_hint_inner(total_tool_calls: usize, productive_calls: usize) -> O
     Some(format!("\n\n{body}"))
 }
 
+/// Runs at or above this length get [`repeat_notice`] on the latest tool
+/// result, keep tool calls available, and think harder for one turn
+/// (MODEL.toml `[behavior].tool_repeat_notice`). Ported from Enntity/atlas
+/// 236beb90 (AGPL-3.0-only).
+pub const REPEAT_NOTICE_MIN_RUN: usize = 2;
+
+/// Trailing run of identical tool rounds: the same calls (names and
+/// arguments; ids ignored) answered by the same results, ending the
+/// conversation. 0 unless the last message is a tool result, and 0 for
+/// error results, which [`inject_hints`] already covers.
+pub fn identical_tool_round_run(messages: &[crate::ir::Message]) -> usize {
+    use crate::ir::Role;
+    use crate::ir::message::ToolCall;
+    // Newest first: (calls, trimmed results) per round.
+    let mut rounds: Vec<(&[ToolCall], Vec<String>)> = Vec::new();
+    let mut end = messages.len();
+    while rounds.len() < 8 {
+        let start = messages[..end]
+            .iter()
+            .rposition(|m| m.role != Role::Tool)
+            .map_or(0, |i| i + 1);
+        if start == end || start == 0 {
+            break;
+        }
+        let asked = &messages[start - 1];
+        if asked.role != Role::Assistant || asked.tool_calls.is_empty() {
+            break;
+        }
+        let results = messages[start..end]
+            .iter()
+            .map(|m| m.text().trim().to_owned())
+            .collect();
+        rounds.push((asked.tool_calls.as_slice(), results));
+        end = start - 1;
+    }
+    let Some((calls, results)) = rounds.first() else {
+        return 0;
+    };
+    if results.iter().any(|r| looks_like_error(r)) {
+        return 0;
+    }
+    let same = |a: &[ToolCall]| {
+        a.len() == calls.len()
+            && a.iter()
+                .zip(calls.iter())
+                .all(|(x, y)| x.name == y.name && x.arguments == y.arguments)
+    };
+    rounds
+        .iter()
+        .take_while(|(c, r)| same(c) && r == results)
+        .count()
+}
+
+/// Appended to the latest tool result when the same call has returned the
+/// same result `run` times in a row. It informs instead of masking
+/// `<tool_call>`: a masked model narrates the action it cannot take.
+pub fn repeat_notice(run: usize) -> String {
+    format!(
+        "\n\n<REPEAT NOTICE>\nThis exact tool call has now returned the same result {run} times \
+         in a row; running it again will not change it. Use this result, or try a different \
+         command, file or approach.\n</REPEAT NOTICE>"
+    )
+}
+
 #[cfg(test)]
 #[path = "hint_injector_tests.rs"]
 mod hint_injector_tests;
