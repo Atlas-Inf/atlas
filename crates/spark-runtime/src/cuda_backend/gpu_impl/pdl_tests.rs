@@ -40,14 +40,15 @@ fn weight_param(signature: &str, name: &str) -> bool {
 
 /// Whether a function body (the text after its `{`) waits before anything
 /// else: `atlas_pdl_enter();`, or `atlas_pdl_enter_touch({w, ..}, {s, ..}, ..);`
-/// (`_pair`: one pair per plane), the same entry with discarded loads ahead
+/// (`_pair`: one pair per plane; `_tri`: one pair per projection), the same entry with discarded loads ahead
 /// of its wait, which is safe only while every touched region is a weight
 /// parameter of `signature` (a predecessor may still be writing anything else).
 fn waits_first(signature: &str, body: &str) -> bool {
     let body = body.trim_start();
     let touch = body
         .strip_prefix("atlas_pdl_enter_touch(")
-        .or_else(|| body.strip_prefix("atlas_pdl_enter_touch_pair("));
+        .or_else(|| body.strip_prefix("atlas_pdl_enter_touch_pair("))
+        .or_else(|| body.strip_prefix("atlas_pdl_enter_touch_tri("));
     if let Some(args) = touch {
         let call = args.split(");").next().unwrap_or("");
         let regions: Vec<&str> = call

@@ -77,6 +77,11 @@ impl MoeLayer {
         let Some(shared) = self.separate_shared_expert else {
             return Ok(false);
         };
+        if let SeparateSharedExpert::Mxfp8Native(mx) = &shared {
+            let m = num_tokens as usize;
+            self.run_native_mxfp8_shared(mx, input, m, up_out, down_out, exact, ctx, stream)?;
+            return Ok(true);
+        }
         anyhow::ensure!(
             num_tokens > 0 && shared_intermediate > 0,
             "separate shared expert requires non-zero token and intermediate dimensions"

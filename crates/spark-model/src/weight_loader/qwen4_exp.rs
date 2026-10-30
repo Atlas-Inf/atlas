@@ -87,6 +87,7 @@ mod mtp;
 mod mx8_common;
 mod ple;
 mod probe;
+mod shared_mx8;
 
 pub(crate) use gdn_fp8::GdnProjections;
 pub use mtp::{Qwen4ExpMtpModule, load_qwen4exp_mtp_module};

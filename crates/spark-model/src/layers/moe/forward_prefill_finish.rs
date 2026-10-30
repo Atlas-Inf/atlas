@@ -78,8 +78,11 @@ impl MoeLayer {
         let run_shared = |s: u64| {
             self.run_shared_expert_prefill(shared_in, shared_n, h, shared_inter, s, s, false, ctx)
         };
+        // An MXFP8 shared expert's partial is blended into each row range
+        // before it goes on the wire (`shared_mxfp8.rs`).
+        let mx_split = split && self.shared_joins_reduce();
         let rs_done = match sp {
-            Some(sp) if !split && !overlap_shared_reduce && !use_overlap => self
+            Some(sp) if (!split || mx_split) && !overlap_shared_reduce && !use_overlap => self
                 .q38_unpermute_reduce_scatter(
                     sp,
                     [
@@ -90,6 +93,7 @@ impl MoeLayer {
                         weights_dev,
                     ],
                     [h, top_k],
+                    mx_split.then_some(input),
                     ctx,
                     stream,
                     |s| if defer_shared { run_shared(s) } else { Ok(()) },
@@ -165,9 +169,10 @@ impl MoeLayer {
             )?;
         }
 
-        // `ATLAS_GLM_SHARED_TP_SPLIT=1`: each rank already blended its partial
-        // shared-expert columns before this point (see forward_prefill).
-        if split && !blended {
+        // `ATLAS_GLM_SHARED_TP_SPLIT=1` (or an MXFP8 shared expert's slice):
+        // blend this rank's partial shared-expert columns before the reduce,
+        // unless the unpermute (or the reduce-scatter pipe) already did.
+        if split && !blended && !rs_done {
             ops::moe_batched_blend(
                 ctx.gpu,
                 self.moe_batched_blend,

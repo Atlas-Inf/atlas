@@ -252,7 +252,8 @@ impl MoeLayer {
             // ATLAS_QWEN4EXP_DECODE_FUSE, read by the kernel as zeros), so
             // select on EP, never on the pointer.
             let is_ep = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
-            let zero_row = if is_ep && !shared_out.is_null() {
+            // (An MXFP8 shared expert's slice blends here: `shared_mxfp8.rs`.)
+            let zero_row = if is_ep && !shared_out.is_null() && !self.shared_joins_reduce() {
                 Some(self.ep_blend_zero_row(ctx, stream)?)
             } else {
                 None

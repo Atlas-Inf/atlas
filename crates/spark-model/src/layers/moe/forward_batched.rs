@@ -463,7 +463,9 @@ impl MoeLayer {
             // EP fix (same contract as `forward_row_local`): the shared expert
             // is computed identically on all ranks, so it must stay out of the
             // pre-reduce blend or the all-reduce sums it once per rank.
-            let is_ep = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
+            // (An MXFP8 shared expert's slice blends here: `shared_mxfp8.rs`.)
+            let is_ep =
+                ctx.comm.is_some() && ctx.config.ep_world_size > 1 && !self.shared_joins_reduce();
             let shared_for_blend = if is_ep && !shared_out.is_null() {
                 self.ep_blend_zero_row(ctx, stream)?
             } else {

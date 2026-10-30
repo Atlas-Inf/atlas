@@ -41,7 +41,9 @@ impl MoeLayer {
             && self.fp8_gate_weight_ptrs.is_none()
             && !self.use_t_layout_for_decode()
             && self.pre_expert_norm.is_none()
-            && has_shared;
+            && has_shared
+            // Its finalize adds a whole shared expert after the reduce.
+            && !self.shared_joins_reduce();
         if !nvfp4_supported {
             return self.forward_batched(input, num_tokens, ctx, stream);
         }
