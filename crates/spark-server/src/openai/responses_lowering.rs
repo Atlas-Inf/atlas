@@ -215,6 +215,7 @@ pub fn lower_responses_to_chat(
         response_format: None,
         min_tokens: 0,
         ignore_eos: false,
+        disable_mtp: false,
         seed: None,
         logprobs: None,
         top_logprobs: None,
