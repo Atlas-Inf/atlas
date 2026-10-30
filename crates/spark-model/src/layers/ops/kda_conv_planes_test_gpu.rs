@@ -73,7 +73,7 @@ fn kda_conv_planes_match_pack_then_conv() -> Result<()> {
             state_want,
             (packed, false),
             &weight,
-            want,
+            (want, false),
             geometry,
             stream,
         )?;
@@ -83,7 +83,7 @@ fn kda_conv_planes_match_pack_then_conv() -> Result<()> {
             state_got,
             (planes, true),
             &weight,
-            got,
+            (got, false),
             geometry,
             stream,
         )?;
@@ -92,6 +92,34 @@ fn kda_conv_planes_match_pack_then_conv() -> Result<()> {
             read(g, got, rows)?,
             "m={m}: convolved"
         );
+        // Planar output, from packed and from planar input: packed back, the
+        // same rows.
+        for planar_in in [false, true] {
+            let state = upload(g, &state0)?;
+            let (out_planes, repacked) = (g.alloc(rows)?, g.alloc(rows)?);
+            let input = if planar_in { planes } else { packed };
+            kda_conv_prefill(
+                g,
+                kernels,
+                state,
+                (input, planar_in),
+                &weight,
+                (out_planes, true),
+                geometry,
+                stream,
+            )?;
+            kda_pack_qkv(g, pack, out_planes, repacked, m, p, stream)?;
+            assert_eq!(
+                read(g, want, rows)?,
+                read(g, repacked, rows)?,
+                "m={m}: planar output (planar input {planar_in})"
+            );
+            assert_eq!(
+                read(g, state_want, state0.len())?,
+                read(g, state, state0.len())?,
+                "m={m}: conv state, planar output"
+            );
+        }
         let state_bytes = state0.len();
         assert_eq!(
             read(g, state_want, state_bytes)?,

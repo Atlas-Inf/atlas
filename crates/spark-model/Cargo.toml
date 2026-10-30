@@ -83,6 +83,8 @@ required-features = ["metal-example"]
 # `default-features = false` so a metal-feature build of spark-model doesn't
 # inadvertently pull cudarc back in via the dev-dep chain.
 spark-runtime = { path = "../spark-runtime", default-features = false, features = ["test-utils"] }
+# GPU parity test against SparkGLM's own FlashKDA library (glm5_kda).
+libloading = "0.8"
 
 [lints]
 workspace = true

@@ -59,21 +59,36 @@ impl Glm5KdaLayer {
         stream: u64,
     ) -> Result<()> {
         let m = tokens as u32;
+        let flash = self
+            .flash_prefill
+            .as_ref()
+            .filter(|_| flash_prefill::eligible(tokens, decode, ctx.graph_capture));
+        // ATLAS_GLM_KDA_FLASH_PLANES: convolve into FlashKDA's q / k / v planes.
+        let planes = flash.is_some_and(|f| f.takes_planes());
         ops::kda_conv_prefill(
             ctx.gpu,
             [self.conv_prefill_k, self.conv_prefill_tp_k],
             state.conv_state,
             input,
             &self.weights.conv,
-            convolved,
+            (convolved, planes),
             [m, (self.heads * self.dim) as u32, self.conv_width as u32],
             stream,
         )?;
-        if let Some(flash) = self
-            .flash_prefill
-            .as_ref()
-            .filter(|_| flash_prefill::eligible(tokens, decode, ctx.graph_capture))
-        {
+        if let Some(flash) = flash.filter(|_| planes) {
+            flash.forward_planes(
+                convolved,
+                g1,
+                beta,
+                self.weights.a_log.weight,
+                self.weights.dt_bias.weight,
+                state.h_state,
+                core_out,
+                tokens,
+                ctx,
+                stream,
+            )
+        } else if let Some(flash) = flash {
             // Convolution has finished reading packed. Its storage and the
             // idle expert buffers can now be borrowed on this same stream.
             flash.forward(

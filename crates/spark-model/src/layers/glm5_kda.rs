@@ -58,6 +58,13 @@ pub(crate) fn kda_conv_planes_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_GLM_KDA_CONV_PLANES").ok().as_deref() == Some("1"))
 }
 
+/// The KDA prefill operator (`ATLAS_KDA_FLASH_PREFILL`, and SparkGLM's
+/// FP32-recurrence FlashKDA under `ATLAS_KDA_FLASH_LIBRARY` /
+/// `ATLAS_GLM_KDA_FLASH_PLANES`) as one word: the recurrent state's bytes.
+pub(crate) fn kda_flash_prefill_word() -> Result<u64> {
+    flash_prefill::requested().map(flash_prefill::Choice::word)
+}
+
 fn verify_batched_conv_snapshot_enabled() -> bool {
     std::env::var("ATLAS_GLM_K5_BATCHED_CONV_SNAPSHOT")
         .ok()

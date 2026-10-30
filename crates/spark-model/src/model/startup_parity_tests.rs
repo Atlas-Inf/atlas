@@ -318,6 +318,7 @@ fn the_table_carries_each_setting_once() {
         "ATLAS_GLM_PREFILL_SP",
         "ATLAS_GLM_KDA_SIDE_PROJ_LT",
         "ATLAS_GLM_KDA_CONV_PLANES",
+        "ATLAS_KDA_FLASH_LIBRARY",
         "ATLAS_GLM_HC_PREFILL_FUSE2",
         "ATLAS_GLM_SP_GATHER_OVERLAP",
         "ATLAS_GLM_INDEX_SPLIT",

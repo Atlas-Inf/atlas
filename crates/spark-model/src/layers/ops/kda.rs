@@ -31,6 +31,9 @@ pub fn kda_pack_qkv(
 /// one [`super::conv1d_update_prefill`] per plane over that plane's channels,
 /// state rows and weights. Every (channel, token) output and every channel's
 /// state is the same arithmetic either way, so the bytes are identical.
+/// `planar_out`: `output` takes the three `[m, p]` planes instead
+/// (`ATLAS_GLM_KDA_FLASH_PLANES`, the FlashKDA bridge's operands), the same
+/// values at other addresses.
 #[allow(clippy::too_many_arguments)]
 pub fn kda_conv_prefill(
     gpu: &dyn GpuBackend,
@@ -38,30 +41,41 @@ pub fn kda_conv_prefill(
     conv_state: DevicePtr,
     (input, planar): (DevicePtr, bool),
     weight: &DenseWeight,
-    output: DevicePtr,
+    (output, planar_out): (DevicePtr, bool),
     [m, p, d_conv]: [u32; 3],
     stream: u64,
 ) -> Result<()> {
-    let (planes, in_stride) = if planar { (3, p) } else { (1, 3 * p) };
+    let planes = if planar || planar_out { 3 } else { 1 };
     let channels = 3 * p / planes;
+    // Where channel group `plane`'s rows start, and their stride, in a
+    // packed `[m, 3p]` or a planar `3 x [m, p]` operand.
+    let at = |base: DevicePtr, planar: bool, plane: u32| {
+        if planar {
+            (base.offset(plane as usize * m as usize * p as usize * 2), p)
+        } else {
+            (base.offset((plane * channels) as usize * 2), 3 * p)
+        }
+    };
     for plane in 0..planes {
         let ch0 = (plane * channels) as usize;
+        let (src, in_stride) = at(input, planar, plane);
+        let (dst, out_stride) = at(output, planar_out, plane);
         super::conv1d_update_prefill(
             gpu,
             kernel,
             tp_kernel,
             conv_state.offset(ch0 * d_conv as usize * 4),
-            input.offset(plane as usize * m as usize * channels as usize * 2),
+            src,
             &DenseWeight {
                 weight: weight.weight.offset(ch0 * d_conv as usize * 2),
             },
             DevicePtr::NULL,
-            output.offset(ch0 * 2),
+            dst,
             channels,
             d_conv,
             m,
             in_stride,
-            3 * p,
+            out_stride,
             stream,
         )?;
     }

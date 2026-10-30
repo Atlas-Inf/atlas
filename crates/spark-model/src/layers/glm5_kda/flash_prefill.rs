@@ -3,13 +3,72 @@
 //! FP32 persistent state is retained in the engine layout; the tensor-core
 //! algorithm uses BF16 internally and remains explicitly opt-in pending quality
 //! qualification. Decode and speculative verification keep native FP32 kernels.
+//!
+//! `ATLAS_KDA_FLASH_LIBRARY` (SparkGLM's switch for its FlashKDA bridge)
+//! selects SparkGLM 0.2.0's FP32-recurrence FlashKDA instead
+//! ([`sparkglm`]), compiled into spark-runtime; the path is not opened.
 use anyhow::{Result, bail, ensure};
 use spark_runtime::glm_kda;
 use spark_runtime::gpu::DevicePtr;
 
 use crate::layer::ForwardContext;
 
-pub(super) struct FlashPrefill;
+#[path = "flash_prefill_sparkglm.rs"]
+mod sparkglm;
+
+pub(super) enum FlashPrefill {
+    /// Atlas's H32 operator (BF16 recurrent tiles).
+    Native,
+    /// SparkGLM's bridge (FP32 recurrence) at 16 or 32 local heads.
+    SparkGlm(sparkglm::SparkGlm),
+}
+
+/// The KDA prefill operator the environment asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Choice {
+    Off,
+    Native,
+    /// `planes`: `ATLAS_GLM_KDA_FLASH_PLANES=1`, the convolution writes the
+    /// bridge's q / k / v planes (the same values, no packed copy).
+    SparkGlm {
+        planes: bool,
+    },
+}
+
+impl Choice {
+    /// The startup-parity word: every rank must run the same arithmetic.
+    pub(crate) fn word(self) -> u64 {
+        match self {
+            Self::Off => 0,
+            Self::Native => 1,
+            Self::SparkGlm { planes } => 2 + planes as u64,
+        }
+    }
+}
+
+/// `ATLAS_KDA_FLASH_PREFILL` turns the operator on; a nonempty
+/// `ATLAS_KDA_FLASH_LIBRARY` picks SparkGLM's, whose
+/// `ATLAS_GLM_KDA_FLASH_PLANES=1` it alone reads (as SparkGLM did).
+fn choose(prefill: Option<&str>, library: Option<&str>, planes: Option<&str>) -> Result<Choice> {
+    if !enabled(prefill)? {
+        return Ok(Choice::Off);
+    }
+    Ok(match library {
+        Some(path) if !path.is_empty() => Choice::SparkGlm {
+            planes: planes == Some("1"),
+        },
+        _ => Choice::Native,
+    })
+}
+
+pub(crate) fn requested() -> Result<Choice> {
+    let var = |name| std::env::var(name).ok();
+    choose(
+        var("ATLAS_KDA_FLASH_PREFILL").as_deref(),
+        var("ATLAS_KDA_FLASH_LIBRARY").as_deref(),
+        var("ATLAS_GLM_KDA_FLASH_PLANES").as_deref(),
+    )
+}
 
 fn enabled(value: Option<&str>) -> Result<bool> {
     match value {
@@ -36,24 +95,23 @@ fn pieces(tokens: usize) -> impl Iterator<Item = (usize, usize)> {
 
 impl FlashPrefill {
     pub(super) fn load(heads: usize, dim: usize, lower: f32) -> Result<Option<Self>> {
-        Self::load_with(
-            heads,
-            dim,
-            lower,
-            enabled(std::env::var("ATLAS_KDA_FLASH_PREFILL").ok().as_deref())?,
-            glm_kda::preload,
-        )
+        Self::load_with(heads, dim, lower, requested()?, glm_kda::preload)
     }
 
     fn load_with(
         heads: usize,
         dim: usize,
         lower: f32,
-        requested: bool,
+        choice: Choice,
         preload: impl FnOnce() -> std::result::Result<(), glm_kda::Error>,
     ) -> Result<Option<Self>> {
-        if !requested {
-            return Ok(None);
+        match choice {
+            Choice::Off => return Ok(None),
+            Choice::SparkGlm { planes } => {
+                return sparkglm::SparkGlm::load(heads, dim, lower, planes)
+                    .map(|s| Some(Self::SparkGlm(s)));
+            }
+            Choice::Native => {}
         }
         ensure!(
             heads == 32 && dim == 128 && lower == -5.0,
@@ -66,7 +124,44 @@ impl FlashPrefill {
         tracing::info!(
             "Atlas native KDA prefill enabled for H32/D128 pieces 2048..=4100; FP32 storage/BF16 internal recurrence"
         );
-        Ok(Some(Self))
+        Ok(Some(Self::Native))
+    }
+
+    /// Whether [`Self::forward_planes`] serves: the convolution then writes
+    /// q / k / v planes for it.
+    pub(super) fn takes_planes(&self) -> bool {
+        matches!(self, Self::SparkGlm(s) if s.planes)
+    }
+
+    /// [`Self::forward`] over q / k / v planes (`3 x [tokens, heads * 128]`
+    /// at `planes`).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn forward_planes(
+        &self,
+        planes: DevicePtr,
+        gate: DevicePtr,
+        beta: DevicePtr,
+        a: DevicePtr,
+        bias: DevicePtr,
+        state: DevicePtr,
+        output: DevicePtr,
+        tokens: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let Self::SparkGlm(s) = self else {
+            bail!("Native KDA takes interleaved q / k / v, not planes");
+        };
+        ensure!(
+            eligible(tokens, false, ctx.graph_capture),
+            "Unsupported native KDA invocation"
+        );
+        s.forward_planes(
+            [planes, gate, beta, a, bias, state, output],
+            tokens,
+            ctx,
+            stream,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -87,6 +182,14 @@ impl FlashPrefill {
             eligible(tokens, false, ctx.graph_capture),
             "Unsupported native KDA invocation"
         );
+        if let Self::SparkGlm(s) = self {
+            return s.forward(
+                [qkv, gate, beta, a, bias, state, output],
+                tokens,
+                ctx,
+                stream,
+            );
+        }
         let plane_row = 32 * 128 * 2;
         for (row, rows) in pieces(tokens) {
             self.forward_piece(
@@ -148,7 +251,7 @@ mod tests {
     #[test]
     fn enabled_load_preloads_before_returning_the_operator() {
         let calls = std::cell::Cell::new(0);
-        let loaded = FlashPrefill::load_with(32, 128, -5.0, true, || {
+        let loaded = FlashPrefill::load_with(32, 128, -5.0, Choice::Native, || {
             calls.set(calls.get() + 1);
             Ok(())
         })
@@ -158,8 +261,9 @@ mod tests {
     }
     #[test]
     fn preload_errors_abort_load_and_disabled_or_invalid_shapes_never_touch_cuda() {
-        let result =
-            FlashPrefill::load_with(32, 128, -5.0, true, || Err(glm_kda::Error::Preload(701)));
+        let result = FlashPrefill::load_with(32, 128, -5.0, Choice::Native, || {
+            Err(glm_kda::Error::Preload(701))
+        });
         let error = result
             .err()
             .expect("CUDA preload failure must stop model construction");
@@ -167,13 +271,13 @@ mod tests {
             error.downcast_ref::<glm_kda::Error>(),
             Some(&glm_kda::Error::Preload(701))
         );
-        let disabled = FlashPrefill::load_with(32, 128, -5.0, false, || {
+        let disabled = FlashPrefill::load_with(32, 128, -5.0, Choice::Off, || {
             panic!("disabled operator must not touch CUDA")
         })
         .unwrap();
         assert!(disabled.is_none());
         assert!(
-            FlashPrefill::load_with(16, 128, -5.0, true, || {
+            FlashPrefill::load_with(16, 128, -5.0, Choice::Native, || {
                 panic!("invalid shape must fail before CUDA")
             })
             .is_err()
@@ -185,6 +289,66 @@ mod tests {
         assert!(!enabled(Some("0")).unwrap());
         assert!(enabled(Some("1")).unwrap());
         assert!(enabled(Some("true")).is_err());
+    }
+    #[test]
+    fn sparkglm_library_switch_selects_its_bridge_and_planes() {
+        let lib = Some("/opt/atlas/native/libatlas_mango_flash.so");
+        assert_eq!(choose(None, lib, Some("1")).unwrap(), Choice::Off);
+        assert_eq!(choose(Some("0"), lib, None).unwrap(), Choice::Off);
+        assert_eq!(choose(Some("1"), None, Some("1")).unwrap(), Choice::Native);
+        assert_eq!(choose(Some("1"), Some(""), None).unwrap(), Choice::Native);
+        assert_eq!(
+            choose(Some("1"), lib, None).unwrap(),
+            Choice::SparkGlm { planes: false }
+        );
+        assert_eq!(
+            choose(Some("1"), lib, Some("true")).unwrap(),
+            Choice::SparkGlm { planes: false }
+        );
+        assert_eq!(
+            choose(Some("1"), lib, Some("1")).unwrap(),
+            Choice::SparkGlm { planes: true }
+        );
+        assert!(choose(Some("yes"), lib, None).is_err());
+        let words = [
+            Choice::Off,
+            Choice::Native,
+            Choice::SparkGlm { planes: false },
+            Choice::SparkGlm { planes: true },
+        ]
+        .map(Choice::word);
+        assert_eq!(words, [0, 1, 2, 3]);
+    }
+    #[test]
+    fn sparkglm_load_checks_shape_then_build_and_never_preloads_native() {
+        let never = || -> std::result::Result<(), glm_kda::Error> {
+            panic!("SparkGLM's bridge must not preload Atlas's operator")
+        };
+        for (heads, dim, lower) in [(8, 128, -5.0), (32, 64, -5.0), (16, 128, -4.0)] {
+            let error = FlashPrefill::load_with(
+                heads,
+                dim,
+                lower,
+                Choice::SparkGlm { planes: false },
+                never,
+            )
+            .err()
+            .expect("unqualified shape");
+            assert!(error.to_string().contains("H16/H32"), "{error}");
+        }
+        for heads in [16, 32] {
+            let loaded =
+                FlashPrefill::load_with(heads, 128, -5.0, Choice::SparkGlm { planes: true }, never);
+            if glm_kda::available() {
+                assert!(loaded.unwrap().unwrap().takes_planes());
+            } else {
+                let error = loaded.err().expect("uncompiled bridge must stop startup");
+                assert_eq!(
+                    error.downcast_ref::<glm_kda::Error>(),
+                    Some(&glm_kda::Error::Unavailable)
+                );
+            }
+        }
     }
     #[test]
     fn qualification_excludes_decode_capture_and_short_tails() {

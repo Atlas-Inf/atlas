@@ -31,6 +31,12 @@ pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_GLM_KDA_CONV_PLANES", || {
         Ok(crate::layers::kda_conv_planes_enabled() as u64)
     }),
+    // Which KDA prefill recurrence: Atlas's (BF16 tiles) or SparkGLM's FP32
+    // FlashKDA (`ATLAS_KDA_FLASH_LIBRARY`, with `ATLAS_GLM_KDA_FLASH_PLANES`).
+    (
+        "ATLAS_KDA_FLASH_LIBRARY",
+        crate::layers::kda_flash_prefill_word,
+    ),
     ("ATLAS_GLM_HC_PREFILL_FUSE2", || {
         Ok(crate::layers::qwen3_attention::hc_prefill_fuse2_enabled() as u64)
     }),
