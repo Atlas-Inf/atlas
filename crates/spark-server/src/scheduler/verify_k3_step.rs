@@ -13,7 +13,6 @@ const K3_SUMMARY_PERIOD: u64 = 100;
 mod record;
 pub(super) use record::*;
 
-
 /// K=3 verify: [last_token, draft1, draft2] → [v0, v1, v2]. Three outcomes.
 ///
 /// `verify_ctx` carries the tokenizer special-token IDs the
