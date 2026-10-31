@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::*;
+use crate::tool_parser::ToolCallParser;
 
 fn auto_poolside_state() -> GrammarState {
     let mut engine = GrammarEngine::new(&test_vocab(), &[130]).unwrap();
@@ -143,4 +144,31 @@ fn quotes_inside_a_real_tool_body_do_not_enable_literal_dispatch() {
     assert!(!state.is_token_allowed(b'X' as u32));
     assert!(!state.accept_token(b'X' as u32));
     assert!(state.accept_token(129));
+}
+
+/// qwen4_exp spark config: temp 0, tools armed (`use_triggers`), the model
+/// shows a fenced ```xml <tool_call> example. Inside the fence the grammar
+/// must not let the literal opener count as a real call (mask side), and
+/// must not forbid the fence's bytes (allow side). Discriminates the
+/// literal-dispatch mask shape from plain dispatch.
+#[test]
+fn qwen_xml_fence_keeps_literal_tool_call_text() {
+    let parser = crate::tool_parser::Qwen3XmlParser;
+    let mut engine = GrammarEngine::new(&test_vocab(), &[130]).unwrap();
+    let compiled = parser
+        .compile_tool_grammar(&mut engine, &test_tool_defs(), true)
+        .expect("qwen3_xml tool grammar must compile")
+        .expect("qwen3_xml tool grammar must compile");
+    let mut state = GrammarState::new(&compiled, engine.vocab_size())
+        .unwrap()
+        .with_auto_literal_dispatch(true);
+    accept_ascii(&mut state, "example:\n```xml\n");
+    state.fill_bitmask();
+    // Inside the fence, a literal `<tool_call>` token must still be
+    // sampleable — the masked-view mask is what lets literal prose through.
+    let lt = b'<' as u32;
+    assert!(
+        state.is_token_allowed(lt),
+        "literal `<` must remain legal inside a fenced literal"
+    );
 }
