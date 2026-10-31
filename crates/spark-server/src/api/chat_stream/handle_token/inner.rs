@@ -414,13 +414,9 @@ pub(crate) fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: 
     // ChatML formats only: elsewhere `user`, `assistant` and `tool` are
     // ordinary words, and GLM streams " tool" as one token, so the strip
     // deleted it from prose ("I don't have a that can ...").
-    if ctx.role_literal_leaks {
-        let inside_tool_call = state
-            .detector
-            .as_ref()
-            .is_some_and(|d| d.inside_tool_call());
-        strip_bare_role_literal(&mut delta, inside_tool_call);
-    }
+    // (GLM `role_literal_leaks` gate omitted on main: the StreamCtx field and
+    // tokenizer filter live in #199, so bare role-literal stripping is GLM
+    // infrastructure this port leaves out.)
 
     if delta.is_empty() {
         return deltas;
@@ -486,9 +482,6 @@ pub(crate) fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: 
         // (which take other &mut state fields) run.
         let outputs = {
             let det = state.detector.as_mut().expect("detector is Some");
-            // A native GLM boundary must not publish an unvalidated call header.
-            // Keep this metadata-scoped; other models retain early headers.
-            det.set_complete_poolside_calls(ctx.state.glm_tool_boundary.is_some());
             det.process(&delta)
         };
         for output in outputs {

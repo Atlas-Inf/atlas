@@ -238,7 +238,6 @@ pub(crate) async fn run_chat_stream(
         stop_strings,
         stop_string_buffer_len,
         leak_markers,
- (tokenizer + spark-server: literal GLM/Qwen tool markup in prose encodes and streams as text)
         wants_typed_arguments: state
             .tool_call_parser
             .as_ref()
