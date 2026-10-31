@@ -91,6 +91,7 @@ mod test_support;
 #[cfg(test)]
 mod think_skip_tests;
 pub(crate) mod tool_markers;
+mod ttft_trace;
 mod types;
 #[cfg(test)]
 mod verify_bias_tests;
@@ -387,6 +388,9 @@ pub fn run(
     std::thread::spawn(move || {
         let mut rx = request_rx;
         while let Some(req) = rx.blocking_recv() {
+            if ttft_trace::enabled() {
+                ttft_trace::arrive(&req.prompt_tokens_arc());
+            }
             p.0.lock().requests.push(req);
             p.1.notify_one();
         }
@@ -670,6 +674,7 @@ pub fn run(
         let t_loop = std::time::Instant::now();
         let prefill_queue_was_empty = prefilling.is_empty();
         let in_flight_before = active.len() + prefilling.len();
+        ttft_trace::begin_tick();
         start_new_requests(
             &*model,
             &sched,
@@ -794,6 +799,7 @@ pub fn run(
 
         // Skip decode when mixed_forward already processed decode logits.
         mtp_step_trace::mark_decode(&mut step_trace, &active);
+        let ttft_step = ttft_trace::step_begin();
         if !did_mixed_step && !active.is_empty() {
             phase_continue_prefills::decode_share::note_decode_step();
             // Ensure any in-flight prefill work on the prefill stream is complete
@@ -1259,6 +1265,7 @@ pub fn run(
         );
         active.extend(rode_seqs);
         mtp_step_trace::finish(step_trace, &active);
+        ttft_trace::step_end(ttft_step, &active);
 
         let t_loop = std::time::Instant::now();
         // Deadline sweep BEFORE retirement, so a timed-out sequence retires

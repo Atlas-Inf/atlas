@@ -140,11 +140,10 @@ pub struct AppState {
     /// Server-level default `reasoning_effort` (template side), applied
     /// in `api/chat/prepare.rs` when the request carries no effort and
     /// thinking is ON. Wired from `--default-chat-template-kwargs`
-    /// `{"reasoning_effort":"..."}`. `None` = the cross-template
-    /// `"medium"` fallback in `tokenizer/chat_render.rs` applies (the
-    /// neutral tier — pre-2026-08 the fallback was `"high"`, which
-    /// Qwen3.8's template escalates to its most expensive `xhigh`
-    /// directive).
+    /// `{"reasoning_effort":"..."}`, else MODEL.toml
+    /// `[behavior].default_reasoning_effort`. `None` = the variable stays
+    /// undefined and the template's own default applies
+    /// (`tokenizer/chat_render.rs`).
     pub default_reasoning_effort: Option<crate::ir::ReasoningEffort>,
     /// Shared in-memory store for stateful Responses API resume
     /// (`previous_response_id`) and opt-in Chat-Completions storage
