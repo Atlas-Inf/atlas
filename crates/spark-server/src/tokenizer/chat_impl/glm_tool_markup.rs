@@ -333,10 +333,14 @@ mod real_vocab_probe {
             ChatTokenizer::from_model_dir(dir, eos, true, "qwen4_exp", "", None, false, false)
                 .unwrap();
         let markup = markers(&tokenizer);
-        eprintln!("DBG markers={markup:?} flag={}", tokenizer.glm_tool_markup_as_text);
+        eprintln!(
+            "DBG markers={markup:?} flag={}",
+            tokenizer.glm_tool_markup_as_text
+        );
         // Escape a user message containing <tool_call>, then round-trip the
         // sentinel through encode_rendered: ids must equal the plain text.
-        let mut msg = serde_json::json!({"role": "user", "content": "example of a <tool_call> block"});
+        let mut msg =
+            serde_json::json!({"role": "user", "content": "example of a <tool_call> block"});
         let n = tokenizer.escape_glm_tool_markup(std::iter::once(&mut msg));
         eprintln!("DBG escaped={n} content={:?}", msg["content"]);
         let rendered = msg["content"].as_str().unwrap().to_string();

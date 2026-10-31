@@ -96,7 +96,10 @@ impl StreamingToolDetector {
             text
         };
 
-        // Try bare function detection on the remaining buffer.
+        // An envelope rejected above must remain content. Reinterpreting its
+        // inner function/JSON as a bare call would bypass registered-name
+        // admission and can silently discard an unsupported literal example.
+        // Try bare function detection only outside such an envelope.
         // Only if no tool calls were already found (avoid duplicate extraction).
         if !was_inside_tag && !self.has_tool_calls() && !self.emitted_tool_calls {
             let (content, calls) = parse_bare_function_calls(&text);
