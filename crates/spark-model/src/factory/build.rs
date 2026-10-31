@@ -25,6 +25,7 @@ use crate::weight_loader::load_dflash_weights;
 
 mod glm;
 mod kv_budget;
+mod kv_carveout;
 mod kv_nvme;
 mod kv_summary;
 
@@ -752,10 +753,28 @@ pub fn build_model(
             n
         }
     };
+    // The carveout adds blocks beyond the budget (not to a fixed HSS window or
+    // a latent shard, whose ranks hold different latents).
+    let kv_shape = kv_carveout::KvShape {
+        config: &kv_config,
+        v_aliases_k: glm_cache_plan.is_some(),
+        index: sparse_index,
+        tail_slots,
+        // Native proposer bytes (GLM MTP head private KV, #199) are absent
+        // on main — 0 here; QSA per-token bytes come through with_per_token_aux.
+        auxiliary_block_bytes: 0,
+    }
+    .with_per_token_aux(aux_bytes_per_token)?;
+    let (blocks, kv_placement) =
+        if hss_cache_blocks_per_seq.is_none() && glm_cache_plan.and_then(|p| p.shard()).is_none() {
+            kv_carveout::extend(gpu.as_ref(), kv_shape, num_kv_blocks)
+        } else {
+            (num_kv_blocks, Default::default())
+        };
     num_kv_blocks = glm::agree_kv_blocks(
         comm.as_deref(),
         gpu.as_ref(),
-        num_kv_blocks,
+        blocks,
         glm_cache_plan,
         kv_nvme::rank_word(nvme_record_bytes, ssm_pools.tier_home),
     )?;
@@ -828,6 +847,7 @@ pub fn build_model(
         num_kv_blocks,
         gpu.as_ref(),
         glm_cache_plan,
+        kv_placement.clone(),
     ) {
         Ok(kv) => kv,
         Err(e) if balloon.is_some() => {
@@ -838,7 +858,13 @@ pub fn build_model(
             if let Some(ptr) = balloon.take() {
                 gpu.free(ptr)?;
             }
-            glm::new_kv_cache(kv_config, num_kv_blocks, gpu.as_ref(), glm_cache_plan)?
+            glm::new_kv_cache(
+                kv_config,
+                num_kv_blocks,
+                gpu.as_ref(),
+                glm_cache_plan,
+                kv_placement,
+            )?
         }
         Err(e) => return Err(e),
     };
