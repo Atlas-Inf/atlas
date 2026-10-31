@@ -40,7 +40,7 @@ fn probe_command(policy: &FfmpegPolicy) -> Command {
 /// substitute for a duration that could not be read.
 pub(super) fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<ClipTiming> {
     let input_file = input::SeekableInput::new(bytes)?;
-    let mut child = probe_command(policy)
+    let child = probe_command(policy)
         .args([
             "-v",
             "error",
