@@ -487,11 +487,6 @@ pub(super) fn handle_tool_call_args_fragment(
     );
 }
 
-/// Advance the same-name run counter for a completed call, returning the new
-/// run length. Pure over the `Option` state so the #192 parallel fan-out
-/// contract (N same-name calls with distinct args below the cap must NOT be
-/// treated as a doom loop) is unit-testable without a `StreamState`.
-
 #[path = "tool_handlers/tail.rs"]
 mod tail;
 pub(crate) use tail::*;
