@@ -19,6 +19,9 @@ pub(crate) struct ParsedBehavior {
     pub max_thinking_budget: u32,
     /// See `behavior_defaults.rs`: clamp effort levels at the ceiling.
     pub effort_capped_at_ceiling: bool,
+    /// `[behavior].default_reasoning_effort` — qualitative effort string
+    /// the template renders when a request is effort-silent ("" = unset).
+    pub default_reasoning_effort: String,
     pub thinking_default: bool,
     pub fp8_kv_calibration_tokens: usize,
     pub default_kv_dtype: String,
@@ -103,6 +106,7 @@ impl Default for ParsedBehavior {
             thinking_in_tools: true,
             max_thinking_budget: DEFAULT_MAX_THINKING_BUDGET,
             effort_capped_at_ceiling: DEFAULT_EFFORT_CAPPED_AT_CEILING,
+            default_reasoning_effort: String::new(),
             thinking_default: false,
             fp8_kv_calibration_tokens: 0,
             default_kv_dtype: String::new(),
@@ -164,6 +168,11 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.as_integer())
         .map(|v| v as u32)
         .unwrap_or(DEFAULT_MAX_THINKING_BUDGET);
+    let default_reasoning_effort = b
+        .and_then(|v| v.get("default_reasoning_effort"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let effort_capped_at_ceiling = b
         .and_then(|v| v.get("effort_capped_at_ceiling"))
         .and_then(|v| v.as_bool())
@@ -329,6 +338,7 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         thinking_in_tools,
         max_thinking_budget,
         effort_capped_at_ceiling,
+        default_reasoning_effort,
         thinking_default,
         fp8_kv_calibration_tokens,
         default_kv_dtype,

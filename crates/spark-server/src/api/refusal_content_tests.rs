@@ -31,8 +31,17 @@ fn tokenizer(dir: &std::path::Path) -> crate::tokenizer::ChatTokenizer {
     let mut inner = tokenizers::Tokenizer::new(model);
     inner.with_decoder(Some(tokenizers::decoders::fuse::Fuse::new()));
     inner.save(dir.join("tokenizer.json"), false).unwrap();
-    crate::tokenizer::ChatTokenizer::from_model_dir(dir, 0, true, "glm5_next", "", None, false)
-        .unwrap()
+    crate::tokenizer::ChatTokenizer::from_model_dir(
+        dir,
+        0,
+        true,
+        "glm5_next",
+        "",
+        None,
+        false,
+        false,
+    )
+    .unwrap()
 }
 
 /// A minimal `AppState` — only the fields `build_choice_message` and the
@@ -98,6 +107,10 @@ fn state(dir: &std::path::Path) -> AppState {
         promotion: None,
         promoted_slots: Arc::default(),
         lora_disk_stageable: Default::default(),
+        tool_guard: Default::default(),
+        vision_budget: None,
+        vision_limits: Default::default(),
+        reference_mode: false,
     }
 }
 
@@ -114,6 +127,7 @@ fn response(finish_reason: &str) -> crate::api::inference_types::InferenceRespon
         cached_prompt_tokens: 0,
         accepted_prediction_tokens: 0,
         prompt_logprobs: vec![],
+        guard_stop: None,
     }
 }
 
