@@ -49,10 +49,15 @@ LD_LIBRARY_PATH="${SHIM:-}:${ROCM_PATH:-/opt/rocm}/lib:${LD_LIBRARY_PATH:-}" \
 # responses.jsonl and prints the rescore command, so install the module into that venv and rescore in place.
 if grep -aq "No module named 'soundfile'" "$OUT/bfcl.log"; then
   V=$(grep -aoE "/[^ ]*/bfcl/venv" "$OUT/bfcl.log" | head -1)
-  RC=$(sed -E 's/\x1b\[[0-9;]*m//g' "$OUT/bfcl.log" | grep -aoE "can be rescored: .*" | head -1 | sed 's/^can be rescored: //')
+  # The runner prints "...can be rescored: <cmd> failed (exit status: 1):", so cut the trailing status off the command.
+  RC=$(sed -E 's/\x1b\[[0-9;]*m//g' "$OUT/bfcl.log" | grep -aoE "can be rescored: .*" | head -1 | sed -E 's/^can be rescored: //; s/ failed \(exit status.*$//')
   log "scorer missing soundfile; installing into $V and rescoring"
-  "$V/bin/python" -m pip install -q soundfile >> "$OUT/bfcl.log" 2>&1 || true
-  [ -n "$RC" ] && bash -c "$RC" >> "$OUT/bfcl.log" 2>&1 || true
+  # The provisioned venv may have no pip (run 41212989922: the quiet install changed nothing), so bootstrap it first.
+  "$V/bin/python" -m pip --version >/dev/null 2>&1 || "$V/bin/python" -m ensurepip --upgrade >> "$OUT/pip.log" 2>&1 || true
+  "$V/bin/python" -m pip install soundfile >> "$OUT/pip.log" 2>&1 \
+    || { command -v uv >/dev/null && uv pip install --python "$V/bin/python" soundfile >> "$OUT/pip.log" 2>&1; } || true
+  "$V/bin/python" -c "import soundfile" 2>> "$OUT/pip.log" && log "soundfile importable" || { log "soundfile STILL missing; pip log:"; tail -5 "$OUT/pip.log" | tee -a "$RES"; }
+  [ -n "$RC" ] && bash -c "$RC" > "$OUT/rescore.log" 2>&1; cat "$OUT/rescore.log" >> "$OUT/bfcl.log" 2>/dev/null || true
 fi
 sed -E 's/\x1b\[[0-9;]*m//g' "$OUT/bfcl.log" | grep -aE "^\s+[a-z_]+\s+(hallucination|live|non_live)\s+[0-9.]+|▸|overall [0-9.]+" | tee -a "$RES" \
   || { log "no BFCL table in the log; tail:"; tail -15 "$OUT/bfcl.log" | tee -a "$RES"; }
