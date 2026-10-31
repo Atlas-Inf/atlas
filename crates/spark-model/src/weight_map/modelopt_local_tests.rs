@@ -57,6 +57,26 @@ fn fp4_local_config() -> ModelConfig {
 /// Only MXFP8 modules are host-expanded: the trunk experts, MTP experts, PLE
 /// table and the vision tower (native NVFP4 dequant on-GPU) keep their own
 /// paths.
+/// Under a GLM native policy `weight_loader/glm5` reads the checkpoint's own
+/// MXFP8 and NVFP4 bytes: expanding them here would leave it BF16 copies and
+/// every native path on its fallback. Without one, and for any other model,
+/// the rule above stands.
+#[test]
+fn a_glm_native_policy_leaves_every_module_to_its_loaders() {
+    let on =
+        NativePolicy::from_lookup(|name| (name == NativePolicy::UMBRELLA).then(|| "1".to_string()));
+    let off = NativePolicy::default();
+    let mut glm = fp4_local_config();
+    glm.model_type = "glm5_next".into();
+    assert!(host_decode_modules_for(&glm, on).is_empty());
+    assert!(!host_decode_modules_for(&glm, off).is_empty());
+    let qwen = fp4_local_config();
+    assert_eq!(
+        host_decode_modules_for(&qwen, on),
+        host_decode_modules_for(&qwen, off)
+    );
+}
+
 /// GLM-5.3 FP4-Local declares `FP8_PB_WO` (128x128-block FP32 scales) on its
 /// shared experts: those are NOT MXFP8 per-32 E8M0 and must stay resident for
 /// the layer's own loader (`shared_expert_requantizes_from_fp8_blocks`), not

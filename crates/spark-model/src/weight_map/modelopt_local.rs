@@ -33,6 +33,7 @@
 use std::collections::HashSet;
 
 use super::modelopt_plan::{ModeloptQuantPlan, QuantAlgo, native_consumers};
+use crate::layers::glm_native::NativePolicy;
 use anyhow::{Context, Result, ensure};
 use atlas_core::config::ModelConfig;
 use atlas_core::modelopt_codec::{decode_csf_scales, mxfp8_to_bf16, nvfp4_rows_to_bf16};
@@ -48,9 +49,18 @@ const CSF_EXCEPTIONS: &str = ".nvfp4_csf_exceptions";
 /// native consumer (its packed bytes are never meant to be resident). The
 /// pre-plan rule for non-FP4-Local packs is the `MXFP8`-only arm.
 pub fn host_decode_modules(config: &ModelConfig) -> HashSet<String> {
+    host_decode_modules_for(config, NativePolicy::from_env())
+}
+
+fn host_decode_modules_for(config: &ModelConfig, glm: NativePolicy) -> HashSet<String> {
     let Some(qc) = config.quantization_config.as_ref() else {
         return HashSet::new();
     };
+    // `weight_loader/glm5` reads the checkpoint's own bytes under a native
+    // policy: every module stays resident for it, nothing expands here.
+    if config.model_type == "glm5_next" && glm.bits() != 0 {
+        return HashSet::new();
+    }
     if let Some(plan) = ModeloptQuantPlan::from_config(config)
         && plan.is_fp4_local()
     {
