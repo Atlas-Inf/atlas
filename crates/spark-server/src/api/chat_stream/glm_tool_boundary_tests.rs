@@ -20,7 +20,7 @@ const CALL: &[u32] = &[3, 4, 5, 6, 7, 8, 9, 10, 11];
 #[path = "reasoning_done_tests.rs"]
 mod reasoning_done_tests;
 
-fn app(glm: bool) -> Arc<AppState> {
+fn app(_glm: bool) -> Arc<AppState> {
     app_for_model("qwen3", tool_parser::ToolCallFormat::PoolsideV1)
 }
 
