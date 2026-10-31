@@ -19,10 +19,8 @@ pub(super) use think_end::accept_with_forced_think_end;
 /// before the first mismatch are accepted; the target token at the mismatch
 /// becomes the bonus token and subsequent drafts are dropped.
 ///
-/// Remaining DFlash-specific work:
-///   * Per-position logprobs extraction.
-///   * Sliding-window state rollback for sliding-attention layers
-///     (Gemma-4-style; not used by Qwen3.6 targets).
+/// Remaining DFlash-specific work: sliding-window state rollback for
+/// sliding-attention layers (Gemma-4-style; not used by Qwen3.6 targets).
 #[allow(clippy::too_many_arguments)]
 pub fn step_verify_dflash(
     model: &dyn Model,
@@ -176,12 +174,21 @@ pub(super) fn verify_dflash_tail(
         None
     };
 
-    // DFlash drafter proposes on raw argmax; when dflash_verify_raw_argmax is set
-    // (process-wide DFlash mode), skip the rep_pen/DRY pipeline so verifier and
-    // drafter judge on the SAME (GOLD) basis. For non-DFlash callers (unreachable
-    // today since step_verify_dflash is only dispatched at drafts.len()>=4 which
-    // only DFlash produces), apply the full pre-sample pipeline as in K=2/3/4.
-    let mut verified = if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
+    // Score the same processed rows as serial decode when requested. Plain
+    // requests retain the existing raw/masked selection paths.
+    let Ok(scored) = super::verify_pipeline_helper::scored::requested(
+        model,
+        verified_argmax.len(),
+        a,
+        verify_ctx,
+        0,
+        Some(drafts),
+    ) else {
+        return None;
+    };
+    let mut verified = if let Some(scored) = &scored {
+        scored.tokens.clone()
+    } else if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
         dflash_verify_raw_argmax,
         sched.levers.dflash_masked_verify,
         model,
@@ -210,13 +217,23 @@ pub(super) fn verify_dflash_tail(
     // proposer's guess for the same slot. First mismatch terminates the
     // accepted prefix; verified[first_mismatch] becomes the bonus token.
     // An exhausted thinking budget may end the step early at `</think>`.
-    let num_accepted = accept_with_forced_think_end(
-        a,
-        verify_ctx.think_end_token,
-        verify_ctx.boundary_mask.as_deref(),
-        drafts,
-        &mut verified,
-    );
+    let num_accepted = if scored.is_some() {
+        // The full pipeline already enforces thinking boundaries per position.
+        drafts
+            .iter()
+            .zip(&verified)
+            .take_while(|(d, v)| d == v)
+            .count()
+            .min(verified.len().saturating_sub(1))
+    } else {
+        accept_with_forced_think_end(
+            a,
+            verify_ctx.think_end_token,
+            verify_ctx.boundary_mask.as_deref(),
+            drafts,
+            &mut verified,
+        )
+    };
     if let Some(raw) = raw_trace {
         tracing::info!(
             "LIGHTNING VERIFY TOKEN TRACE slot={} last={} drafts={:?} raw={:?} processed={:?} accepted={}",
@@ -239,24 +256,7 @@ pub(super) fn verify_dflash_tail(
         );
     }
 
-    // Logprobs for the tokens this step emits: the accepted prefix plus the
-    // bonus, which is exactly `verified[0..=num_accepted]` because an accepted
-    // draft is by definition equal to `verified` at that index. Extracted here,
-    // before `commit_ctx` reuses the logits buffer — the same ordering the
-    // verify_k2/k3/k4 paths use.
-    //
-    // Without this the DFlash path emitted every token with `logprobs: None`,
-    // so a request that asked for logprobs got the OpenAI four-array shape back
-    // filled entirely with nulls: structurally valid, informationally empty,
-    // and indistinguishable from "this model has no logprobs". The MTP verify
-    // paths have always extracted them; only this one did not. Gated on the
-    // request, so an ordinary run copies no logits and pays nothing.
-    let verify_lps = if let Some(k_logprobs) = a.top_logprobs {
-        let upto = (num_accepted + 1).min(verified.len());
-        extract_verify_logprobs(model, &verified[..upto], k_logprobs, 0)
-    } else {
-        Vec::new()
-    };
+    let verify_lps = scored.map(|s| s.logprobs).unwrap_or_default();
 
     if let Err(e) = model.ep_broadcast_cmd(num_accepted as u32) {
         tracing::error!("EP broadcast generic verify result: {e:#}");

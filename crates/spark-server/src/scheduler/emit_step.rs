@@ -48,7 +48,31 @@ pub(super) fn emit_span_row(
     rows: usize,
 ) {
     let position = think_commit::span_row_position(a.seq.seq_len, rows, row);
+    let prior = a.output_tokens.len();
     emit_token_at_position(a, tok, logprobs, sched, position);
+    // The final row is the target bonus. Earlier rows are accepted drafts.
+    if row + 1 < rows {
+        accepted_output(a, tok, prior);
+    }
+}
+
+/// Self-speculation emits its accepted drafts without a committed span index.
+pub(super) fn emit_accepted_token(
+    a: &mut ActiveSeq,
+    tok: u32,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+) {
+    let prior = a.output_tokens.len();
+    emit_token(a, tok, None, sched);
+    accepted_output(a, tok, prior);
+}
+
+fn accepted_output(a: &mut ActiveSeq, tok: u32, prior: usize) {
+    // Emission may suppress/pop the token, or append synthetic grammar closes.
+    // Count only this draft, only if it remains at its original output position.
+    if a.output_tokens.get(prior) == Some(&tok) {
+        a.mtp_acct.record_accepted_output(prior);
+    }
 }
 
 /// Emit one already-verified row after its whole target prefix was committed.

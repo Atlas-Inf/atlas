@@ -156,12 +156,13 @@ pub(super) fn step_verify_k4_batched(
         Vec::with_capacity(n);
     // ATLAS_VERIFY_PICK_PAR: every member's picks first, the host-pipelined
     // ones in parallel; each is what the per-member call below returns.
-    let mut batch_picks =
-        crate::scheduler::verify_pipeline_helper::pick_batch_applies(verify_ctx, n).then(|| {
-            crate::scheduler::verify_pipeline_helper::verify_pick_batch(
-                model, &results, &off, batch, verify_ctx,
-            )
-        });
+    let mut batch_picks = (batch.iter().all(|a| a.top_logprobs.is_none())
+        && crate::scheduler::verify_pipeline_helper::pick_batch_applies(verify_ctx, n))
+    .then(|| {
+        crate::scheduler::verify_pipeline_helper::verify_pick_batch(
+            model, &results, &off, batch, verify_ctx,
+        )
+    });
     for (i, a) in batch.iter_mut().enumerate() {
         let rows = ks[i];
         let k_drafts = rows - 1;
@@ -169,11 +170,29 @@ pub(super) fn step_verify_k4_batched(
         // Full pre-sample pipeline per verify position, reading this
         // sequence's rows (row_base = i*rows) — same 8-stage semantics as
         // the single-seq MTP path.
-        let processed = match batch_picks.as_mut() {
-            Some(p) => std::mem::take(&mut p[i]),
-            None => crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(
-                model, r, a, verify_ctx, off[i],
-            ),
+        let Ok(scored) = super::verify_pipeline_helper::scored::requested(
+            model, rows, a, verify_ctx, off[i], None,
+        ) else {
+            // Every member's forward already advanced its cache. Without a
+            // verdict none may resume from that uncommitted state.
+            let reason = a
+                .engine_error
+                .clone()
+                .unwrap_or_else(|| format!("batched verify score read failed for member {i}"));
+            for member in batch.iter_mut() {
+                member.abort_on_engine_error(&reason);
+            }
+            return;
+        };
+        let processed = if let Some(s) = &scored {
+            s.tokens.clone()
+        } else {
+            match batch_picks.as_mut() {
+                Some(p) => std::mem::take(&mut p[i]),
+                None => crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(
+                    model, r, a, verify_ctx, off[i],
+                ),
+            }
         };
         let v: Vec<u32> = (0..rows)
             .map(|j| processed.get(j).copied().unwrap_or(r[j]))
@@ -218,11 +237,7 @@ pub(super) fn step_verify_k4_batched(
                 },
             );
         }
-        let verify_lps = if let Some(top_logprobs) = a.top_logprobs {
-            extract_verify_logprobs(model, &v, top_logprobs, off[i])
-        } else {
-            Vec::new()
-        };
+        let verify_lps = scored.map(|s| s.logprobs).unwrap_or_default();
         a.last_token_time = Instant::now();
         verdicts.push((v, num_accepted, verify_lps));
     }

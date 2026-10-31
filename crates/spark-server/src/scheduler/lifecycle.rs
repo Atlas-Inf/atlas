@@ -179,7 +179,7 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize)
                     decode_time_ms: decode_ms,
                     reasoning_tokens: a.thinking_tokens,
                     cached_prompt_tokens: a.cached_prompt_tokens,
-                    accepted_prediction_tokens: a.mtp_acct.accepted_total() as usize,
+                    accepted_prediction_tokens: a.mtp_acct.accepted_output_total() as usize,
                     guard_stop: a.guard_stop,
                 },
                 "done frame",
@@ -197,7 +197,7 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize)
                     logprobs: std::mem::take(&mut a.logprobs_data),
                     reasoning_tokens: a.thinking_tokens,
                     cached_prompt_tokens: a.cached_prompt_tokens,
-                    accepted_prediction_tokens: a.mtp_acct.accepted_total() as usize,
+                    accepted_prediction_tokens: a.mtp_acct.accepted_output_total() as usize,
                     guard_stop: a.guard_stop,
                     prompt_logprobs: std::mem::take(&mut a.seq.prompt_logprobs)
                         .into_iter()
