@@ -23,9 +23,8 @@ pub struct ChatMessage {
     /// retrieval clients see a familiar shape. Omitted when empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<Vec<Annotation>>,
-    /// Assistant refusal message. When set, `content` should be treated
-    /// as null by the client. Atlas does not currently emit refusals; the
-    /// field is present so safety-aware clients stay compatible.
+    /// Heuristic refusal annotation. The full assistant text remains in
+    /// `content`; this field supplements it and does not redact the answer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
 }

@@ -195,6 +195,10 @@ pub struct ModelBehavior {
     /// (historical ladder shape). See `behavior_defaults.rs` for when a
     /// model should set `true` (measured budget non-monotonicity).
     pub effort_capped_at_ceiling: bool,
+    /// `[behavior].default_reasoning_effort` — qualitative effort a
+    /// request gets when it leaves effort undefined (template default); ""
+    /// means the template's own default applies, as on the reference server.
+    pub default_reasoning_effort: &'static str,
     /// Default thinking state for this model when the client request does not
     /// specify a reasoning_effort / thinking parameter. Typical values:
     /// - thinking-first models (Mistral Small 4, Qwen3.5, …): `true`
@@ -430,6 +434,7 @@ impl Default for ModelBehavior {
             thinking_in_tools: true,
             max_thinking_budget: DEFAULT_MAX_THINKING_BUDGET,
             effort_capped_at_ceiling: DEFAULT_EFFORT_CAPPED_AT_CEILING,
+            default_reasoning_effort: "",
             thinking_default: false,
             fp8_kv_calibration_tokens: 0,
             default_kv_dtype: "",

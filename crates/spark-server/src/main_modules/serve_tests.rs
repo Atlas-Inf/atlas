@@ -191,6 +191,28 @@ fn default_kwargs_reasoning_effort_sets_both_halves() {
 }
 
 #[test]
+fn model_default_effort_is_template_only_and_fails_fast() {
+    use crate::ir::ReasoningEffort;
+    let with = |e: &'static str| atlas_kernels::ModelBehavior {
+        default_reasoning_effort: e,
+        ..Default::default()
+    };
+    // Unset: the template's own default applies.
+    assert_eq!(model_default_reasoning_effort(&with("")).unwrap(), None);
+    assert_eq!(
+        model_default_reasoning_effort(&with("medium")).unwrap(),
+        Some(ReasoningEffort::Medium)
+    );
+    assert_eq!(
+        model_default_reasoning_effort(&with("max")).unwrap(),
+        Some(ReasoningEffort::Max)
+    );
+    // Not a thinking-on tier, or not a tier at all: refuse to boot.
+    assert!(model_default_reasoning_effort(&with("none")).is_err());
+    assert!(model_default_reasoning_effort(&with("hihg")).is_err());
+}
+
+#[test]
 fn default_kwargs_explicit_thinking_keys_outrank_effort_directive() {
     use crate::ir::{ReasoningEffort, ThinkingDirective};
     let kw =

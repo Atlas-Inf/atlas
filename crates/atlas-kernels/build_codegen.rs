@@ -166,6 +166,7 @@ pub(super) fn generate_target_ptx_rs(
              \x20               thinking_in_tools: {},\n\
              \x20               max_thinking_budget: {},\n\
              \x20               effort_capped_at_ceiling: {},\n\
+             \x20               default_reasoning_effort: \"{}\",\n\
              \x20               thinking_default: {},\n\
              \x20               fp8_kv_calibration_tokens: {},\n\
              \x20               default_kv_dtype: \"{}\",\n\
@@ -216,6 +217,7 @@ pub(super) fn generate_target_ptx_rs(
             target.behavior_thinking_in_tools,
             target.behavior_max_thinking_budget,
             target.behavior_effort_capped_at_ceiling,
+            target.behavior_default_reasoning_effort,
             target.behavior_thinking_default,
             target.behavior_fp8_kv_calibration_tokens,
             target.behavior_default_kv_dtype,
