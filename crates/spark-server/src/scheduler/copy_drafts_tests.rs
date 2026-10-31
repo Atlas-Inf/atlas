@@ -277,7 +277,7 @@ fn offer_is_a_no_op_with_copy_drafts_off() {
 }
 
 #[test]
-fn a_cut_keeps_a_copys_confidences_and_leaves_the_drafters_as_before() {
+fn a_cut_keeps_copy_confidences_and_leaves_the_drafters_as_before() {
     let s = Settings {
         match_len: 3,
         ..on()
