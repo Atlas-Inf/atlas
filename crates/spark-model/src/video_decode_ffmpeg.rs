@@ -49,7 +49,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use image::RgbImage;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};

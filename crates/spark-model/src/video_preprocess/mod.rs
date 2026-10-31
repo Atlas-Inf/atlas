@@ -106,6 +106,7 @@ impl PreprocessedVideo {
 /// The result is clamped into `[min_frames, max_frames]` and then to a
 /// multiple of `temporal_patch_size`, because a partial group cannot be
 /// encoded. Returns indices into the decoded frame list.
+#[allow(dead_code)] // exercised by tests.rs
 pub fn sample_indices(
     n_frames: usize,
     native_fps: f32,

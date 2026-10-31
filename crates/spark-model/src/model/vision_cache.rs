@@ -67,7 +67,7 @@ impl TransformerModel {
     pub(super) fn vision_prefix_cache_ok(&self) -> bool {
         self.prefix_cache.is_active()
             && self.vision_encoder.is_some()
-            && self.config.vision.as_ref().is_some_and(|v| false)
+            && self.config.vision.as_ref().is_some_and(|_| false)
             && switch_on()
     }
 
@@ -107,7 +107,7 @@ impl TransformerModel {
             return Cow::Borrowed(tokens);
         }
         let n = key.len().min(tokens.len());
-        let mut out = Vec::with_capacity(tokens.len());
+        let out = Vec::with_capacity(tokens.len());
         out.extend_from_slice(&key[..n]);
         out.extend_from_slice(&tokens[n..]);
         Cow::Owned(out)
