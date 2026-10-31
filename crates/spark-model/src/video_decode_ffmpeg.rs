@@ -43,7 +43,7 @@
 //! - **Wall clock** capped by a watchdog that kills the child; a decoder that
 //!   hangs must not hold a request thread indefinitely.
 //! - **Protocol whitelist** is moot because the input is a pipe, but
-//!   `-f image2pipe` output and a `pipe:0` input mean ffmpeg is never asked
+//!   `-f image2pipe` output and a seekable private temp input mean ffmpeg is never asked
 //!   to open a URL — the SSRF path that `remote_image` guards for stills
 //!   simply does not exist here.
 

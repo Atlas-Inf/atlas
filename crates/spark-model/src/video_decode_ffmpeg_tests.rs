@@ -379,3 +379,85 @@ fn a_stream_of_two_pngs_splits_into_two_frames() {
 }
 
 // ── frames by index (GLM-5.3's sampler) ──────────────────────────────────
+
+// ── issue #239: MP4 with moov at the END (no +faststart) ─────────────────
+// `pipe:0` was not seekable, so an MP4 whose moov box follows the media data
+// could not be probed or decoded. `input::SeekableInput` makes the input a
+// private seekable file removed on drop. This MP4 uses ffmpeg's default
+// layout (moov at end) and must decode identically to a faststart one.
+
+fn make_mp4_at(
+    seconds: u32,
+    fps: u32,
+    size: &str,
+    codec: &str,
+    faststart: bool,
+) -> Option<Vec<u8>> {
+    static SEQ2: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SEQ2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "atlas-vid-moov-{}-{n}-{faststart}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).ok()?;
+    let out = dir.join("clip.mp4");
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-y",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("testsrc=size={size}:rate={fps}:duration={seconds}"),
+        "-c:v",
+        codec,
+        "-pix_fmt",
+        "yuv420p",
+    ]);
+    if faststart {
+        cmd.args(["-movflags", "+faststart"]);
+    }
+    cmd.arg(&out).stdout(Stdio::null()).stderr(Stdio::null());
+    if !cmd.status().ok()?.success() {
+        return None;
+    }
+    std::fs::read(&out).ok()
+}
+
+#[test]
+fn a_moov_at_end_mp4_probes_and_decodes() {
+    if !have_ffmpeg() {
+        return;
+    }
+    let clip = make_mp4_at(2, 8, "64x64", "libx264", false).expect("generate MP4");
+    let policy = super::FfmpegPolicy::default();
+    let timing = super::probe::probe_duration(&clip, &policy).expect("moov-at-end probe");
+    assert!(
+        (timing.duration_secs - 2.0).abs() < 0.2,
+        "duration should be ~2s, got {}",
+        timing.duration_secs
+    );
+    let frames = super::decode_frames(&clip, 2.0, &policy).expect("moov-at-end decode");
+    assert!(
+        !frames.is_empty(),
+        "moov-at-end clip should decode to frames"
+    );
+}
+
+#[test]
+fn a_faststart_mp4_probes_and_decodes() {
+    if !have_ffmpeg() {
+        return;
+    }
+    let clip = make_mp4_at(2, 8, "64x64", "libx264", true).expect("generate MP4");
+    let policy = super::FfmpegPolicy::default();
+    let timing = super::probe::probe_duration(&clip, &policy).expect("faststart probe");
+    assert!(
+        (timing.duration_secs - 2.0).abs() < 0.2,
+        "duration should be ~2s, got {}",
+        timing.duration_secs
+    );
+    let frames = super::decode_frames(&clip, 2.0, &policy).expect("faststart decode");
+    assert!(!frames.is_empty(), "faststart clip should decode to frames");
+}

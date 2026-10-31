@@ -65,18 +65,7 @@ pub(super) fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<Clip
             )
         })?;
 
-    // Same reason ffmpeg's input is fed on a thread: the child writes its
-    // report while still draining stdin, so a write-then-read sequence can
-    // deadlock on a large container.
-    let mut stdin = child.stdin.take().context("no ffprobe stdin pipe")?;
-    let input = bytes.to_vec();
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(&input);
-        drop(stdin);
-    });
-
     let (out, err_text, status) = read_probe(child, policy.timeout_secs)?;
-    let _ = writer.join();
 
     let text = String::from_utf8_lossy(&out);
     let field = |name: &str| -> Option<String> {
