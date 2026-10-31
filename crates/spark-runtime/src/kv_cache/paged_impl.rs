@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 
 use super::block_trace::BlockTrace;
 use super::free_blocks::FreeBlocks;
-use super::{KvCacheConfig, KvCacheDtype, LayerPool, PagedKvCache};
+use super::{KvBuffer, KvCacheConfig, KvCacheDtype, KvPlacement, LayerPool, PagedKvCache};
 use crate::gpu::{DevicePtr, GpuBackend};
 
 impl PagedKvCache {
@@ -26,7 +26,19 @@ impl PagedKvCache {
         gpu: &dyn GpuBackend,
         v_aliases_k: bool,
     ) -> Result<Self> {
-        Self::new_with_k_slots(config, num_blocks, num_blocks, gpu, v_aliases_k)
+        Self::new_placed(config, num_blocks, gpu, v_aliases_k, KvPlacement::default())
+    }
+
+    /// [`Self::new_with_v_alias`] with the pools `placement` names allocated
+    /// from the backend's carveout (and the sparse index's, once attached).
+    pub fn new_placed(
+        config: KvCacheConfig,
+        num_blocks: usize,
+        gpu: &dyn GpuBackend,
+        v_aliases_k: bool,
+        placement: KvPlacement,
+    ) -> Result<Self> {
+        Self::new_with_k_slots(config, num_blocks, num_blocks, gpu, v_aliases_k, placement)
     }
 
     /// [`Self::new_with_v_alias`] with `k_slots` K-pool block slots per layer
@@ -37,6 +49,7 @@ impl PagedKvCache {
         k_slots: usize,
         gpu: &dyn GpuBackend,
         v_aliases_k: bool,
+        placement: KvPlacement,
     ) -> Result<Self> {
         let mut layers = Vec::with_capacity(config.num_layers);
         let mut total_bytes: usize = 0;
@@ -58,7 +71,7 @@ impl PagedKvCache {
                     }
                 }
             };
-            let k_pool = match gpu.alloc(k_pool_bytes) {
+            let k_pool = match placement.alloc(gpu, KvBuffer::K(i), k_pool_bytes) {
                 Ok(p) => p,
                 Err(e) => {
                     release(&layers);
@@ -70,7 +83,7 @@ impl PagedKvCache {
             } else {
                 let v_block_bytes = config.v_block_bytes_for_layer(i);
                 let v_pool_bytes = num_blocks * v_block_bytes;
-                match gpu.alloc(v_pool_bytes) {
+                match placement.alloc(gpu, KvBuffer::V(i), v_pool_bytes) {
                     Ok(p) => (p, v_block_bytes, v_pool_bytes),
                     Err(e) => {
                         let _ = gpu.free(k_pool);
@@ -134,6 +147,7 @@ impl PagedKvCache {
             trace: BlockTrace::new(num_blocks),
             nvme: None,
             latent_shard: None,
+            placement,
         })
     }
 
