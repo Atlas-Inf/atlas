@@ -341,10 +341,15 @@ mod real_vocab_probe {
         eprintln!("DBG escaped={n} content={:?}", msg["content"]);
         let rendered = msg["content"].as_str().unwrap().to_string();
         let esc_ids = tokenizer.encode_rendered(&rendered).unwrap();
-        let plain_ids = tokenizer
-            .encode("example of a <tool_call> block")
-            .unwrap();
-        eprintln!("DBG esc_ids={esc_ids:?} plain_ids={plain_ids:?}");
-        assert_eq!(esc_ids, plain_ids, "sentinel unwrap must reproduce plain text");
+        let decoded = tokenizer.decode_with_special(&esc_ids).unwrap();
+        eprintln!("DBG esc_ids={esc_ids:?} decoded={decoded:?}");
+        assert_eq!(
+            decoded, "example of a <tool_call> block",
+            "sentinel unwrap must encode the marker as literal text"
+        );
+        assert!(
+            !decoded.contains(OPEN) && !decoded.contains(TAG) && !decoded.contains(CLOSE),
+            "no FDD sentinels may reach the prompt"
+        );
     }
 }
