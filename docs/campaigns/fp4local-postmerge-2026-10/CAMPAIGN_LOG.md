@@ -1489,3 +1489,14 @@ Stack (#198 → stack/vision-probe → #242 → #253 → #254 → #255 → #256)
 reviewed before push. S2, gate the stack tip on sparky: workspace tests, FP4-Local control / agentic 50 / BFCL vs a
 same-base main, plus Flash-Next NVFP4 and 27B NVFP4 controls. The dual-node paths can't be gated from sparky, and the
 merge notes will say so.
+
+## 2026-10-31 19:00 UTC — the stack is being re-cut by another session; switching to a GB10 train gate
+
+- A parallel AzeezIsh session is porting the stack onto main and merging it: #198 and #237 merged; #253 superseded by
+  #279 (merged, pair-gated); #254 landed in #282 (merged). New ports are open: #284 #285 #286 #287 #290 #293 (SparkQwen
+  0.4.0) and #294 (data-angel). My local stack merges (43 conflicts resolved) stay local and unpushed, to avoid colliding.
+- Sparky's role: the GB10 single-Spark gate for those open PRs, batched as `integ/train-2026-10-31` (main + #285 + #284 + #287
+  + #290 + #293 + #294 + #286). Job 62: tests, FP4-Local control / agentic 50 / BFCL vs main at the same base, plus Flash-Next
+  NVFP4 and 27B NVFP4 controls. Results go on each PR, and each merges if the gate passes.
+- Qwen4 draft: job 61 Flash-Next control IDENTICAL on the draft branch; job 60's synthetic-checkpoint boot FAILED. That
+  debugging is parked until after the train.
