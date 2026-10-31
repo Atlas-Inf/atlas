@@ -242,6 +242,7 @@ pub(crate) async fn run_chat_stream(
             .tool_call_parser
             .as_ref()
             .is_some_and(|p| p.wants_typed_arguments()),
+        role_literal_leaks: state.tokenizer.filters_bare_role_literals(),
         max_tool_calls_per_response,
         min_tokens,
         req_return_token_ids,

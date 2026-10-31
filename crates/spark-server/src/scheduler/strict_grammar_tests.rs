@@ -29,6 +29,8 @@ fn compile(spec: GrammarSpec, opens_in_thinking: bool) -> Option<GrammarState> {
         &Some(spec),
         &[EOS],
         opens_in_thinking,
+        None,
+        None,
         &mut sink,
     )
     .unwrap()
@@ -82,6 +84,8 @@ fn an_unarmable_response_format_is_reported_not_decoded_unconstrained() {
         &Some(GrammarSpec::JsonObject),
         &[EOS],
         false,
+        None,
+        None,
         &mut sink,
     )
     .err()
@@ -96,7 +100,7 @@ fn an_unarmable_response_format_is_reported_not_decoded_unconstrained() {
     // No grammar requested: nothing to arm, nothing reported.
     let mut sink = ResponseSink::Blocking(None);
     assert!(
-        compile_grammar_state(&mut None, &None, &[EOS], false, &mut sink)
+        compile_grammar_state(&mut None, &None, &[EOS], false, None, None, &mut sink)
             .unwrap()
             .is_none()
     );
@@ -187,6 +191,8 @@ fn a_schema_too_large_to_compile_is_a_400_not_a_crash() {
         &Some(GrammarSpec::JsonSchema { schema }),
         &[EOS],
         false,
+        None,
+        None,
         &mut sink,
     )
     .err()
