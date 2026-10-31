@@ -57,6 +57,7 @@ mod batch;
 pub(in crate::scheduler) use batch::{applies as pick_batch_applies, verify_pick_batch};
 mod fast_masked;
 mod prepick;
+pub(in crate::scheduler) mod scored;
 mod scratch;
 pub(in crate::scheduler) use scratch::HostRows;
 mod selection;

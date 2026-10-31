@@ -36,6 +36,10 @@ struct Stub {
     /// Admit decode rows (`ks[i] == 1`), windows of up to 8 rows and a lone
     /// window past 4 rows, as qwen4_exp's exact lane does.
     decode_rows: bool,
+    fail_logits: bool,
+    bootstrap_rows: Vec<Vec<f32>>,
+    fp32: bool,
+    fail_row: Option<usize>,
     seen: Mutex<Seen>,
 }
 
@@ -43,6 +47,10 @@ impl Stub {
     fn new(decode_rows: bool) -> Self {
         Self {
             decode_rows,
+            fail_logits: false,
+            bootstrap_rows: Vec::new(),
+            fp32: false,
+            fail_row: None,
             seen: Mutex::new(Seen::default()),
         }
     }
@@ -201,7 +209,10 @@ impl Model for Stub {
         Ok(())
     }
     fn vocab_size(&self) -> usize {
-        0
+        self.bootstrap_rows.first().map_or(0, Vec::len)
+    }
+    fn decode_logits_fp32(&self) -> bool {
+        self.fp32
     }
     fn bind_gpu_to_thread(&self) -> Result<()> {
         Ok(())
@@ -209,8 +220,11 @@ impl Model for Stub {
     fn alloc_sequence(&self) -> Result<SequenceState> {
         Ok(SequenceState::host_only(0))
     }
-    fn copy_logits_to_host(&self, _p: DevicePtr, _d: &mut [u8]) -> Result<()> {
-        Ok(())
+    fn copy_logits_to_host(&self, p: DevicePtr, d: &mut [u8]) -> Result<()> {
+        if self.fail_logits {
+            bail!("injected score read failure");
+        }
+        self.copy_bootstrap_logits(p, d)
     }
     fn logits_buffer_ptr(&self) -> DevicePtr {
         DevicePtr::NULL
@@ -447,3 +461,8 @@ fn deep_members_verify_their_own_ceiling_within_the_row_budget() {
 
 #[path = "one_forward_grammar_tests.rs"]
 mod grammar;
+#[path = "one_forward_logprob_tests.rs"]
+mod logprob_tests;
+
+#[path = "bootstrap_score_tests.rs"]
+mod bootstrap_score_tests;
