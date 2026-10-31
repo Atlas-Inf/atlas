@@ -6,7 +6,7 @@ use crate::ir::{
     message::{ContentPart, ImageData, ImageSource, Message, Role, VideoSource},
 };
 use crate::tokenizer::QwenVisionKind;
-use spark_model::vision_preprocess::fixtures::{header_only_png, png, qwen_config};
+use spark_model::vision_preprocess::fixtures::{header_only_png, png, qwen_config, short_gif};
 
 fn limits(request_rows: usize) -> VisionRowLimits {
     VisionRowLimits::resolve(
@@ -30,14 +30,6 @@ fn admit<'a>(l: &'a VisionRowLimits, b: Option<&'a Arc<VisionRowBudget>>) -> Adm
         limits: Some(l),
         budget: b,
     }
-}
-
-/// Four distinct 64x64 GIF frames, each held for 500 ms. At the production
-/// test rate (2 fps) this becomes two Qwen temporal groups, which lets the
-/// tests exercise the group split without depending on ffmpeg.
-fn short_gif() -> String {
-    const GIF_B64: &str = "R0lGODlhQABAAIEAABQo6wAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQAMgAAACwAAAAAQABAAAAIaQABCBxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFixgzatzIsaPHjyBDihxJsqTJkyhTqlzJsqXLlzBjypxJs6bNmzhz6tzJs6fPn0CDCh1KtKjRo0iTKl3KtKnTp1CjSp1KtarVq1izagUQEAAh+QQBMgABACwAAAAAQABAAIE5KMYAAAAAAAAAAAAIaQABCBxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFixgzatzIsaPHjyBDihxJsqTJkyhTqlzJsqXLlzBjypxJs6bNmzhz6tzJs6fPn0CDCh1KtKjRo0iTKl3KtKnTp1CjSp1KtarVq1izagUQEAAh+QQBMgABACwAAAAAQABAAIFeKKEAAAAAAAAAAAAIaQABCBxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFixgzatzIsaPHjyBDihxJsqTJkyhTqlzJs6bNmzhz6tzJs6fPn0CDCh1KtKjRo0iTKl3KtKnTp1CjSp1KtarVq1izagUQEAAh+QQBMgABACwAAAAAQABAAIGDKHwAAAAAAAAAAAAIaQABCBxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFixgzatzIsaPHjyBDihxJsqTJkyhTqlzJs6bNmzhz6tzJs6fPn0CDCh1KtKjRo0iTKl3KtKnTp1CjSp1KtarVq1izagUQEAA7";
-    format!("data:image/gif;base64,{GIF_B64}")
 }
 
 fn video(uri: String) -> ContentPart {
