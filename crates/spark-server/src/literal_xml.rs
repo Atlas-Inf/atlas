@@ -276,6 +276,19 @@ mod tests {
     };
 
     #[test]
+    fn marker_touching_nested_quote_boundary_is_literal() {
+        assert!(marker_is_literal("\"The opening tag is \""));
+        assert!(!marker_is_literal("\"finished quote\" "));
+    }
+
+    #[test]
+    fn byte_mask_handles_multibyte_text_and_real_marker_after_quote() {
+        let state = state_after("The marker is `");
+        let masked = mask_literal_lt_bytes_with_state("<tool_call>é`<tool_call>".as_bytes(), state);
+        assert_eq!(masked, " tool_call>é`<tool_call>".as_bytes());
+    }
+
+    #[test]
     fn tracks_inline_backticks() {
         assert!(marker_is_literal("The tag is `"));
         assert!(!marker_is_literal("The tag is `literal` "));
