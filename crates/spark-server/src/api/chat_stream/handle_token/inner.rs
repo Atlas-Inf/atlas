@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+use super::detector_outputs::{drain_detector_outputs, finish_on_stop_string};
 use super::*;
 
 pub(crate) fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> DeltaVec {
@@ -455,27 +456,7 @@ pub(crate) fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: 
         }
     }
 
-    if state.stop_string_triggered {
-        // Only the current token's genuine client stop match can reach this
-        // branch. Emit its pre-stop prefix once, preserving markup sanitization.
-        // Tokens queued AFTER a guard or stop match are rejected at handle_token
-        // entry, before detokenization, content accumulation or token-ID tracking.
-        if !delta.is_empty() {
-            let cleaned = sanitize_content_chunk_with_literal_state(
-                &delta,
-                &mut state.tag_scan_buf,
-                &mut state.suppressing_param_leak,
-                &mut state.inside_envelope,
-                &mut state.literal_xml_state,
-                &ctx.leak_markers,
-            );
-            if !cleaned.is_empty() {
-                deltas.push(StreamDelta::Content {
-                    text: cleaned,
-                    token_ids: state.take_ids_if(ctx.req_return_token_ids),
-                });
-            }
-        }
+    if finish_on_stop_string(state, ctx, &delta, &mut deltas) {
         return deltas;
     }
 
@@ -488,43 +469,8 @@ pub(crate) fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: 
             let det = state.detector.as_mut().expect("detector is Some");
             det.process(&delta)
         };
-        for output in outputs {
-            match output {
-                tool_parser::DetectorOutput::Content(text) => {
-                    if let Some(events_out) = detector_content_arm(state, ctx, &text) {
-                        deltas.extend(events_out);
-                        // One token can yield text before, inside and after a
-                        // literal marker (Enntity/atlas fbda04d1); drain every
-                        // event unless a guard actually cancelled this response.
-                        if state.stop_string_triggered {
-                            return deltas;
-                        }
-                    }
-                }
-                tool_parser::DetectorOutput::ToolCall(mut tc, tc_idx) => {
-                    handle_complete_tool_call(state, ctx, &mut tc, tc_idx, &mut deltas);
-                }
-                tool_parser::DetectorOutput::ToolCallStart {
-                    id: tc_id,
-                    name,
-                    idx,
-                } => {
-                    handle_tool_call_start(state, ctx, tc_id, name, idx, &mut deltas);
-                }
-                tool_parser::DetectorOutput::ToolCallDelta { args, idx } => {
-                    handle_tool_call_delta(state, ctx, args, idx, &mut deltas);
-                }
-                tool_parser::DetectorOutput::ToolCallArgsFragment { fragment, idx } => {
-                    handle_tool_call_args_fragment(state, ctx, fragment, idx, &mut deltas);
-                }
-                tool_parser::DetectorOutput::ToolCallEnd { idx } => {
-                    handle_tool_call_end(state, ctx, idx, &mut deltas);
-                }
-            }
-            if state.guard_stop == Some(atlas_tool_guard::GUARD_STOP) {
-                deltas.clear();
-                return deltas;
-            }
+        if drain_detector_outputs(state, ctx, outputs, &mut deltas) {
+            return deltas;
         }
     } else {
         let sanitized = sanitize_content_chunk_with_literal_state(

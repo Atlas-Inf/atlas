@@ -47,7 +47,7 @@ pub(super) fn render_template(
     let template_thinking = enable_thinking;
 
     // Build JSON messages with structured tool_calls for Jinja.
-    let json_messages =
+    let mut json_messages =
         build_json_messages_for(messages, state.tokenizer.uses_deepseek_v4_encoding());
     // When TSCG is enabled the parser's `system_prompt()` has already
     // placed the compact tool signatures into messages[0]; passing
@@ -62,7 +62,7 @@ pub(super) fn render_template(
     } else {
         tools_active && (state.tokenizer.uses_deepseek_v4_encoding() || !state.chat.prompt.tscg)
     };
-    let jinja_tools: Option<Vec<serde_json::Value>> = if render_tools {
+    let mut jinja_tools: Option<Vec<serde_json::Value>> = if render_tools {
         Some(
             tools
                 .iter()
