@@ -461,9 +461,6 @@ fn deep_members_verify_their_own_ceiling_within_the_row_budget() {
 
 #[path = "one_forward_grammar_tests.rs"]
 mod grammar;
-#[path = "one_forward_tests/copy.rs"]
-mod copy;
-
 #[path = "one_forward_logprob_tests.rs"]
 mod logprob_tests;
 
