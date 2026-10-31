@@ -174,6 +174,16 @@ impl ChatTokenizer {
         tracing::info!("Loaded tokenizer from {}", tokenizer_path.display());
         Ok(Self {
             tokenizer,
+            large_encode_gate: super::large_encode::configured(
+                std::env::var("ATLAS_LARGE_ENCODE_CONCURRENCY")
+                    .ok()
+                    .as_deref(),
+            )
+            .map_err(anyhow::Error::msg)?,
+            ids_only: super::ids_only::configured(
+                std::env::var("ATLAS_TOKENIZER_IDS_ONLY").ok().as_deref(),
+            )
+            .map_err(anyhow::Error::msg)?,
             eos_token_id,
             supports_thinking,
             glm_tool_markup_as_text: matches!(model_type, "glm5_next" | "qwen4_exp"),
@@ -199,9 +209,14 @@ impl ChatTokenizer {
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        let encoding = self
-            .tokenizer
-            .encode(text, false)
+        // HF's normalized splits/offsets can consume hundreds of MiB for a
+        // long prompt. Acquire before touching the tokenizer and retain the
+        // permit until the Encoding is dropped, including on error/unwind.
+        let _permit = self
+            .large_encode_gate
+            .as_ref()
+            .and_then(|gate| gate.acquire(text.len()));
+        let encoding = super::ids_only::encode(&self.tokenizer, text, self.ids_only)
             .map_err(|e| anyhow::anyhow!("Tokenizer encode error: {e}"))?;
         Ok(encoding.get_ids().to_vec())
     }
