@@ -233,9 +233,9 @@ pub(crate) fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: 
                         state.reasoning_xml_scan_state,
                         &["<tool_call>", "<function=", "<parameter=", "<invoke "],
                     )
-                    .and_then(|(at, len)| {
+                    .map(|(at, len)| {
                         let marker = state.reasoning_xml_scan_buf[at..at + len].to_string();
-                        Some((at, marker))
+                        (at, marker)
                     });
                     if let Some((at, op)) = opener {
                         // Snapshot the log tail BEFORE consuming the match,

@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// Advance the same-name run counter for a completed call, returning the new
+/// run length. Pure over the `Option` state so the #192 parallel fan-out
+/// contract (N same-name calls with distinct args below the cap must NOT be
+/// treated as a doom loop) is unit-testable without a `StreamState`.
 pub(crate) fn advance_name_run(name_run: &mut Option<(String, u32)>, name: &str) -> u32 {
     let run_len = match name_run {
         Some((prev, n)) if prev == name => *n + 1,

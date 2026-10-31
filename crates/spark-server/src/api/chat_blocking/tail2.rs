@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// Core finalization: usage assembly, metrics, and the rate-limit
+/// true-up. Returns the canonical response IR — wire encoding (plus
+/// `store:`/`--dump` handling) happens in the per-surface encoders.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finalize_response(
     state: Arc<AppState>,

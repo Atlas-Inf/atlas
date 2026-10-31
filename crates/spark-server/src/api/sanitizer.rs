@@ -397,12 +397,6 @@ pub fn primary_arg_for_tool(name: &str, args_json: &str) -> Option<String> {
     None
 }
 
-/// Byte offset where the streaming sanitizer must start holding: the
-/// earliest position `p` in the last `tag_max - 1` bytes such that
-/// `buf[p..]` is a PROPER prefix of some marker (i.e. more bytes could
-/// complete it). Returns `buf.len()` when no such suffix exists, so the
-/// whole buffer is emitted. Always a UTF-8 char boundary.
-
 #[path = "sanitizer/marker_hold.rs"]
 mod marker_hold;
 pub(crate) use marker_hold::*;
