@@ -72,8 +72,7 @@ pub(crate) fn test_build_msg_entries(
     input: &[crate::ir::Message],
     tools_active: bool,
 ) -> Result<Vec<msg_entry::MsgEntry>, axum::response::Response> {
-    msg_entry::build_msg_entries(
-        crate::api::chat::vision_admit::AdmitCtx::default(),
+    msg_entry::build_msg_entries_admitted(
         None,
         None,
         &remote_image::RemoteImagePolicy::default(),
@@ -88,6 +87,7 @@ pub(crate) fn test_build_msg_entries(
         tools_active,
         &levers::ChatLevers::OFF,
         false,
+        crate::api::chat::vision_admit::AdmitCtx::default(),
     )
     .map(|o| o.messages)
 }

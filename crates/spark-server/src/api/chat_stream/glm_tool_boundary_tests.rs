@@ -2,6 +2,9 @@
 
 //! Real blocking decoder/choice and streaming-token paths, with a tiny real
 //! tokenizer. No scheduler or model inference is replaced by these API tests.
+
+use std::time::Duration;
+
 use super::{ctx::StreamCtx, handle_token::handle_token, state::StreamState};
 use crate::{AppState, ir, tool_parser};
 use serde_json::json;
@@ -18,10 +21,7 @@ const CALL: &[u32] = &[3, 4, 5, 6, 7, 8, 9, 10, 11];
 mod reasoning_done_tests;
 
 fn app(glm: bool) -> Arc<AppState> {
-    app_for_model(
-        if glm { "glm5_next" } else { "qwen3" },
-        tool_parser::ToolCallFormat::PoolsideV1,
-    )
+    app_for_model("qwen3", tool_parser::ToolCallFormat::PoolsideV1)
 }
 
 fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<AppState> {
@@ -77,17 +77,6 @@ fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<A
         tokenizer.decode(CALL).unwrap(),
         "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>"
     );
-<<<<<<< HEAD
-    let mut state = crate::api::test_app_state::app_state(tokenizer);
-    state.model_name = "display-name-is-not-model-type".into();
-    state.tool_call_parser = Some(Arc::from(format.into_parser()));
-    state.reasoning_parser = Some(crate::reasoning_parser::ReasoningFormat::Qwen.into_parser());
-    state.think_end_token_id = Some(END);
-    state.think_start_token_id = Some(13);
-    state.tool_call_start_token_id = Some(TOOL);
-    state.glm_tool_boundary = crate::glm_tool_boundary::native_opener(model_type, true, Some(TOOL));
-    Arc::new(state)
-=======
     let (request_tx, _) = tokio::sync::mpsc::channel(1);
     Arc::new(AppState {
         tokenizer,
@@ -102,6 +91,8 @@ fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<A
         vision_max_pixels: None,
         vision_limits: None,
         vision_budget: None,
+        tool_guard: Default::default(),
+        reference_mode: false,
         remote_image_policy: Default::default(),
         video_ffmpeg: Default::default(),
         video_fps: 1.0,
@@ -120,11 +111,7 @@ fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<A
         tool_max_tokens: 192,
         sampling_presets: Default::default(),
         tool_call_start_token_id: Some(TOOL),
-        glm_tool_boundary: crate::glm_tool_boundary::native_opener(
-            if glm { "glm5_next" } else { "qwen3" },
-            true,
-            Some(TOOL),
-        ),
+        glm_tool_boundary: crate::glm_tool_boundary::native_opener("qwen3", true, Some(TOOL)),
         auto_compact_threshold: None,
         request_timeout: 0,
         effective_context: 0,
@@ -155,7 +142,6 @@ fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<A
         promoted_slots: Arc::default(),
         lora_disk_stageable: Default::default(),
     })
->>>>>>> 7d33dd4cc (shared: admit vision items from their headers under the request limit and the in-flight budget)
 }
 
 fn request() -> ir::ChatRequest {

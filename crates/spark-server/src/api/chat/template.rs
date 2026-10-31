@@ -361,8 +361,7 @@ mod json_message_tests {
             text_msg(Role::User, "thanks"),
         ];
 
-        let out = super::super::msg_entry::build_msg_entries(
-            crate::api::chat::vision_admit::AdmitCtx::default(),
+        let out = super::super::msg_entry::build_msg_entries_admitted(
             None,
             None,
             &crate::api::chat::remote_image::RemoteImagePolicy::default(),
@@ -377,6 +376,7 @@ mod json_message_tests {
             true,
             &crate::api::chat::levers::ChatLevers::OFF,
             false,
+            crate::api::chat::vision_admit::AdmitCtx::default(),
         )
         .expect("fixture builds");
         assert_eq!(out.cwd_hint.as_deref(), Some("/tmp/proj"));

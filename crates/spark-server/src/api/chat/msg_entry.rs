@@ -84,41 +84,6 @@ struct MediaInput {
     uri: String,
 }
 
-/// Append every media part on `m` to `media` **in content order**, growing
-/// `image_pad_counts` in lockstep (each pad count is filled in later by the
-/// preprocessor). Shared by the tool-message branch and the normal branch so
-/// media rides every role uniformly — including tool results, the motivating
-/// case for issue #165.
-#[allow(clippy::result_large_err)]
-fn collect_message_media(
-    m: &Message,
-    media: &mut Vec<MediaInput>,
-    image_pad_counts: &mut Vec<usize>,
-    remote: &super::remote_image::RemoteImagePolicy,
-) -> Result<(), Response> {
-    // ORDER IS A CONTRACT, and the order is the CLIENT'S. The template emits
-    // one marker per media item in the order they appear in the content
-    // array, and `expand_vision_pads` walks pad tokens left to right
-    // consuming one count each — so this one pass, `MsgEntry::media` and the
-    // preprocessing loop below must all traverse `m.content` the same way.
-    // Grouping by modality anywhere in that chain shows the model the items
-    // in an order the caller never wrote, and does it silently: every count
-    // still agrees with every other one.
-    for part in &m.content {
-        let (kind, data) = match part {
-            ContentPart::Image(src) => (MediaKind::Image, &src.data),
-            ContentPart::Video(src) => (MediaKind::Video, &src.data),
-            ContentPart::Text(_) => continue,
-        };
-        media.push(MediaInput {
-            kind,
-            uri: resolve_media_uri(kind, data, remote)?,
-        });
-        image_pad_counts.push(0);
-    }
-    Ok(())
-}
-
 /// Resolve one media source to an encoder-input string, applying the
 /// operator's remote-fetch policy. Shared by both modalities because the
 /// policy and its failure modes are identical — only the noun in the message
@@ -176,9 +141,13 @@ fn resolve_media_uri(
     }
 }
 
+#[path = "msg_entry/media.rs"]
+pub(super) mod media;
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+#[path = "msg_entry/tail.rs"]
+pub(super) mod tail;
+
 pub(super) fn build_msg_entries(
-    admit: super::vision_admit::AdmitCtx<'_>,
     vision_config: Option<&VisionConfig>,
     vision_max_pixels: Option<usize>,
     remote_images: &super::remote_image::RemoteImagePolicy,
@@ -231,9 +200,6 @@ pub(super) fn build_msg_entries_admitted(
     // injected hints vary with the escalation counter and would break
     // exact-match grouping.
     let mut tool_result_originals: Vec<(usize, String)> = Vec::new();
-    // Atlas's prompt aids below (tool-result markers and hints, the cwd hint,
-    // the content-free system drop); none for a verbatim-prompt model.
-    let aids = !levers.verbatim_prompt;
 
     // F6 (2026-05-26): `last_query_index` was previously used to gate
     // an empty `<think>\n\n</think>\n\n` injection for historical
@@ -248,7 +214,7 @@ pub(super) fn build_msg_entries_admitted(
         // success over error text. Rendered here (not in the adapters) so
         // every surface gets identical prompt bytes, and applied before the
         // error-hint scan below so hints see the final text.
-        if m.tool_error && aids {
+        if m.tool_error {
             text = format!("[tool error]\n{text}");
         }
 
@@ -296,7 +262,7 @@ pub(super) fn build_msg_entries_admitted(
             // P1-6 (2026-07-09): record the pre-hint original at the
             // index this entry is about to occupy.
             tool_result_originals.push((messages.len(), text.clone()));
-            if aids && crate::hint_injector::looks_like_error(&text) {
+            if crate::hint_injector::looks_like_error(&text) {
                 consecutive_tool_errors += 1;
                 crate::hint_injector::inject_hints(&mut text, consecutive_tool_errors);
             } else {
@@ -370,7 +336,7 @@ pub(super) fn build_msg_entries_admitted(
     // ATLAS_NO_ERROR_DEDUP=1 restores verbatim history. MUST run
     // before the vacuous-system removal below — the recorded indices
     // refer to the un-shifted `messages` vec.
-    if tools_active && aids && !tail::error_dedup_disabled() {
+    if tools_active && !error_dedup_disabled() {
         for (idx, replacement) in tail::duplicate_error_masks(&tool_result_originals) {
             messages[idx].content = replacement;
         }
@@ -399,7 +365,6 @@ pub(super) fn build_msg_entries_admitted(
     // Inject CWD hint into the system message (NOT tool definitions —
     // those go to the Jinja template).
     if tools_active
-        && aids
         && !levers.disable_cwd_hint_injection
         && let Some(ref cwd) = cwd_hint
     {
@@ -421,10 +386,9 @@ pub(super) fn build_msg_entries_admitted(
     // such a message as absent so a degenerate client prompt can't poison
     // generation. Conservative — only an empty body or a single short
     // bare `Label:` line qualifies; any substantive prompt is untouched.
-    if aids
-        && messages
-            .first()
-            .is_some_and(|m| m.role == "system" && tail::is_vacuous_system_content(&m.content))
+    if messages
+        .first()
+        .is_some_and(|m| m.role == "system" && tail::is_vacuous_system_content(&m.content))
     {
         let removed = messages.remove(0);
         tracing::info!(
@@ -443,8 +407,6 @@ pub(super) fn build_msg_entries_admitted(
     // are the same item by construction. Preprocessing images and videos in
     // separate passes would re-introduce the grouping this fix removed.
     let mut image_pixels: Vec<spark_model::VisionItem> = Vec::new();
-    let has_video = media.iter().any(|m| m.kind == MediaKind::Video);
-    let mut admission = super::vision_admit::Admission::begin(admit, media.len(), has_video)?;
     if !media.is_empty() {
         let Some(vcfg) = vision_config else {
             return Err(openai_error_response(
@@ -472,20 +434,13 @@ pub(super) fn build_msg_entries_admitted(
                     (charge.attach(item), Vec::new())
                 }
                 MediaKind::Video => {
-                    if reserve_decode {
-                        let ceiling =
-                            media::qwen_video_rows_ceiling(vcfg, vision_max_pixels, video);
-                        admission.reserve_video(ceiling)?;
-                    }
-                    match spark_model::vision_preprocess::decode_gated(|| {
-                        spark_model::video_preprocess::preprocess_video(
-                            &input.uri,
-                            vcfg,
-                            vision_max_pixels,
-                            video.fps,
-                            video.ffmpeg,
-                        )
-                    }) {
+                    match spark_model::video_preprocess::preprocess_video(
+                        &input.uri,
+                        vcfg,
+                        vision_max_pixels,
+                        video.fps,
+                        video.ffmpeg,
+                    ) {
                         Ok(v) => {
                             // A video is bounded by its own decode budget and
                             // charged once decoded (no header probe).
@@ -505,17 +460,13 @@ pub(super) fn build_msg_entries_admitted(
                 }
             };
             image_pad_counts[idx] = item.pad_count(vcfg.spatial_merge_size);
-            admission.note(image_pad_counts[idx])?;
-            if reserve_decode {
-                admission.reconcile_video(image_pad_counts[idx])?;
-            }
-            if vcfg.is_glm5_next || vcfg.is_qwen3vl_video {
+            if vcfg.is_glm5_next {
                 vision_placeholders.push(glm5_vision::placeholder(
                     input.kind,
                     &item,
                     image_pad_counts[idx],
                     video_timestamps,
-                    vcfg.is_qwen3vl_video,
+                    false, // GLM path: qwen3vl=false
                 )?);
             }
             if input.kind == MediaKind::Video {
@@ -535,20 +486,12 @@ pub(super) fn build_msg_entries_admitted(
         }
         admission.finish()?;
     }
-    let admitted = admission.admit()?;
-    for item in image_pixels.iter_mut() {
-        *item = admitted.attach(std::mem::replace(
-            item,
-            spark_model::VisionItem::image(Vec::new(), 0, 0),
-        ));
-    }
 
     // BW1 bash-wandering watchdog: if the agent has run many tool calls with
     // no productive file output, append a steering nudge to the most recent
     // tool response (what the model reads just before its next action). Gated
     // by ATLAS_BASH_WANDER_WATCHDOG (PCND, default-off).
     if tools_active
-        && aids
         && let Some(hint) = crate::hint_injector::bash_wander_hint(
             total_tool_calls,
             productive_tool_calls,
@@ -568,16 +511,38 @@ pub(super) fn build_msg_entries_admitted(
     })
 }
 
+/// True when a system message carries no actual instruction and should
+/// be treated as absent. Conservative by design — a substantive prompt
+/// must never be stripped:
+///   * empty / whitespace-only body, OR
+///   * a single short bare label line ending in ':' with nothing after
+///     it (e.g. `User Context:`, `Context:`, `System:`) — the residue
+///     of an empty client template (Open WebUI's RAG/context block).
+/// Anything multi-line, or with any text past the colon, is a real
+/// prompt and returns false.
+/// P1-6 (2026-07-09): kill-switch — `ATLAS_NO_ERROR_DEDUP=1` restores
+/// verbatim duplicate-error history (disables the masking pass).
+fn error_dedup_disabled() -> bool {
+    std::env::var("ATLAS_NO_ERROR_DEDUP").as_deref() == Ok("1")
+}
+
+/// P1-6 (2026-07-09): duplicate-error observation masking.
+///
+/// Input: `(message_index, original_pre_hint_text)` for every
+/// tool-result entry, in conversation order. Output: `(message_index,
+/// replacement_text)` for the OLDER members of each duplicate-error
+/// group; the newest member of each group stays verbatim. Two
+/// tool results are duplicates when BOTH are error-shaped
+/// (`crate::hint_injector::looks_like_error`) AND either equal after
+/// trim or Jaccard >= 0.9 over 4-gram shingles (the loop_detector
+/// measure — SSOT). Successful outputs never participate: identical
+/// success observations (e.g. repeated `ls`) are legitimate.
+#[cfg(test)]
 #[path = "msg_entry_tests.rs"]
 mod msg_entry_tests;
 
 // A sibling file rather than a module inside `msg_entry_tests.rs`: these cases
 // carried that file past the 500-LoC cap.
-#[path = "msg_entry/media.rs"]
-mod media;
 #[cfg(test)]
 #[path = "msg_entry_media_order_tests.rs"]
 mod msg_entry_media_order_tests;
-
-#[path = "msg_entry/tail.rs"]
-mod tail;

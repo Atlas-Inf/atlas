@@ -143,7 +143,7 @@ pub(crate) fn prepare_chat_prompt(
         // A request the engine cannot serve is refused while its media are
         // read, with a 400, rather than failing at prefill start where
         // clients retry it forever (`vision_admit`).
-        vision_admit::AdmitCtx {
+        super::vision_admit::AdmitCtx {
             limits: state.vision_limits.as_ref(),
             budget: state.vision_budget.as_ref(),
         },

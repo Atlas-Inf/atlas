@@ -953,8 +953,6 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 0)]
     pub vision_max_pixels: usize,
 
-<<<<<<< HEAD
-=======
     /// Vision tokens (merged patches, one prompt placeholder each) one request
     /// may carry across all its images and videos. A request over it, one of
     /// more than 1024 items (the rank protocol's limit, applied on every world
@@ -984,7 +982,6 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 65_536)]
     pub vision_max_inflight_rows: usize,
 
->>>>>>> 7d33dd4cc (shared: admit vision items from their headers under the request limit and the in-flight budget)
     /// Fetch `image_url` parts that carry an http(s) URL, instead of
     /// rejecting them.
     ///
@@ -1002,12 +999,6 @@ pub struct ServeArgs {
     /// capped while being read rather than by trusting `Content-Length`, the
     /// response must declare an image content type, and the whole request is
     /// time-limited.
-    /// Vision rows (temporal groups x grid) one request may carry; 400 over.
-    #[arg(long, default_value_t = 32768)]
-    pub vision_max_request_rows: usize,
-    /// Vision rows all requests may hold at once; 503 + Retry-After over.
-    #[arg(long, default_value_t = 65536)]
-    pub vision_max_inflight_rows: usize,
     #[arg(long, default_value_t = false)]
     pub vision_allow_remote_images: bool,
 
