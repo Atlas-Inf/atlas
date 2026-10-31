@@ -174,7 +174,9 @@ pub fn step_verify_k4(
     // SINGLE-sequence step, i.e. the n=1 row of the same table the batched
     // step fills for n>=2.
     crate::scheduler::mtp_accept_debug::record(1, 3, drafts[0] == v0, num_accepted);
-    if !dflash_verify_raw_argmax {
+    // A copy round (`copy_drafts::mtp`) says nothing about the head.
+    let copied = crate::scheduler::copy_drafts::mtp::settle(a, 3, num_accepted);
+    if !dflash_verify_raw_argmax && !copied {
         a.mtp_acct
             .record_depth_verify(3, num_accepted, num_drafts, sched.levers.depth());
     }

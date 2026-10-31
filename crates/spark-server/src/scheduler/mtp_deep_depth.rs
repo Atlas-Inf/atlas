@@ -88,15 +88,33 @@ fn step_for(a: f32) -> isize {
     }
 }
 
+/// Observations of the deepest position a decision over `window` verifies
+/// needs (`ATLAS_MTP_DEEP_WINDOW`): [`MIN_DRAFTED`] of the default
+/// [`WINDOW`], a quarter of any other.
+pub(super) fn min_drafted(window: u16) -> u16 {
+    if window == WINDOW {
+        MIN_DRAFTED
+    } else {
+        window / 4
+    }
+}
+
 impl DeepDepth {
     /// Draft ceiling under `floor..=max`.
     pub fn drafts(&self, floor: usize, max: usize) -> usize {
+        self.drafts_from(
+            spark_model::speculative::deep_depth::deep_start(),
+            floor,
+            max,
+        )
+    }
+
+    /// [`Self::drafts`] for a request that starts at `start` (unset = the
+    /// floor; `ATLAS_MTP_DEEP_START`).
+    fn drafts_from(&self, start: Option<usize>, floor: usize, max: usize) -> usize {
         let floor = floor.clamp(1, max.max(1));
         if self.depth == 0 {
-            // `ATLAS_MTP_DEEP_START`: begin elsewhere than the floor.
-            // Ported from Enntity/atlas 294d2ba (AGPL-3.0-only).
-            spark_model::speculative::deep_depth::deep_start()
-                .map_or(floor, |s| s.clamp(floor, max.max(1)))
+            start.map_or(floor, |s| s.clamp(floor, max.max(1)))
         } else {
             (self.depth as usize).clamp(floor, max.max(1))
         }
@@ -104,25 +122,39 @@ impl DeepDepth {
 
     /// Feed one verify that verified `drafts` drafts and accepted `accepted`.
     pub fn record(&mut self, drafts: usize, accepted: usize, floor: usize, max: usize) {
-        let cur = self.drafts(floor, max);
+        use spark_model::speculative::deep_depth::{decision_window, deep_start};
+        self.record_in(
+            drafts,
+            accepted,
+            floor,
+            max,
+            decision_window(),
+            deep_start(),
+        );
+    }
+
+    /// [`Self::record`] with the decision window and start ceiling given.
+    fn record_in(
+        &mut self,
+        drafts: usize,
+        accepted: usize,
+        floor: usize,
+        max: usize,
+        window: u16,
+        start: Option<usize>,
+    ) {
+        let cur = self.drafts_from(start, floor, max);
         self.depth = cur as u8;
         self.steps += 1;
         if drafts >= cur {
             self.drafted += 1;
             self.hits += u16::from(accepted >= cur);
         }
-        // `ATLAS_MTP_DEEP_WINDOW` (default `WINDOW`, `MIN_DRAFTED` a quarter).
-        let window = spark_model::speculative::deep_depth::decision_window();
         if self.steps < window {
             return;
         }
         let a = self.hits as f32 / self.drafted.max(1) as f32;
-        let min_drafted = if window == WINDOW {
-            MIN_DRAFTED
-        } else {
-            window / 4
-        };
-        let next = if self.drafted < min_drafted {
+        let next = if self.drafted < min_drafted(window) {
             cur
         } else {
             let lo = floor.clamp(1, max.max(1)) as isize;
