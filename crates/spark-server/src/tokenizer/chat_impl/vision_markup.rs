@@ -49,6 +49,10 @@ const VISION_MARKUP: &[&str] = &[
 const OPEN: char = '\u{FDD0}';
 const CLOSE: char = '\u{FDD1}';
 
+/// The most digits a sentinel's marker index has. Caller text can carry a bare
+/// opener, so the search for its close must stop here, not at the prompt's end.
+const MAX_INDEX_DIGITS: usize = 20;
+
 /// Whether markers in the text of media requests are escaped. Read once.
 fn markup_as_text() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -114,22 +118,31 @@ pub(super) fn encode_with_sentinel_families(
     families: &[SentinelFamily<'_>],
     mut encode: impl FnMut(&str) -> Result<Vec<u32>>,
 ) -> Result<Vec<u32>> {
-    if !families.iter().any(|family| rendered.contains(family.open)) {
+    // Each family's next opener: a family with none must not be searched for
+    // again per sentinel.
+    let mut next_open: Vec<_> = families.iter().map(|f| rendered.find(f.open)).collect();
+    if next_open.iter().all(Option::is_none) {
         return encode(rendered);
     }
     let mut out = Vec::new();
     let mut text_from = 0usize;
     let mut search_from = 0usize;
-    while let Some((open, family_index)) = families
-        .iter()
-        .enumerate()
-        .filter_map(|(index, family)| {
-            rendered[search_from..]
-                .find(family.open)
-                .map(|offset| (search_from + offset, index))
-        })
-        .min_by_key(|(open, _)| *open)
-    {
+    loop {
+        for (family, next) in families.iter().zip(&mut next_open) {
+            if next.is_some_and(|open| open < search_from) {
+                *next = rendered[search_from..]
+                    .find(family.open)
+                    .map(|offset| search_from + offset);
+            }
+        }
+        let Some((open, family_index)) = next_open
+            .iter()
+            .enumerate()
+            .filter_map(|(index, next)| next.map(|open| (open, index)))
+            .min_by_key(|(open, _)| *open)
+        else {
+            break;
+        };
         let family = families[family_index];
         let body_start = open + family.open.len_utf8();
         let tag_len = family.tag.map_or(0, char::len_utf8);
@@ -140,7 +153,11 @@ pub(super) fn encode_with_sentinel_families(
             continue;
         }
         let body = body_start + tag_len;
-        let marker = rendered[body..].find(family.close).and_then(|len| {
+        let close = rendered[body..]
+            .char_indices()
+            .take(MAX_INDEX_DIGITS + 1)
+            .find(|&(_, c)| c == family.close);
+        let marker = close.and_then(|(len, _)| {
             let i: usize = rendered[body..body + len].parse().ok()?;
             Some((family.markup.get(i)?, body + len + family.close.len_utf8()))
         });
@@ -226,7 +243,10 @@ impl ChatTokenizer {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_with_sentinels, escape_in_value};
+    use super::{
+        CLOSE, OPEN, SentinelFamily, encode_with_sentinel_families, encode_with_sentinels,
+        escape_in_value,
+    };
 
     const PAD: u32 = 900;
 
@@ -289,6 +309,66 @@ mod tests {
         assert_eq!(
             encode_with_sentinels(rendered, &markup(), fake_encode).unwrap(),
             fake_encode(rendered).unwrap()
+        );
+    }
+
+    /// A rescan per sentinel takes tens of seconds here; the bound leaves
+    /// room for a loaded machine.
+    fn assert_quick(rendered: &str, families: &[SentinelFamily<'_>]) {
+        let start = std::time::Instant::now();
+        let ids =
+            encode_with_sentinel_families(rendered, families, |s| Ok(vec![0; s.len().min(1)]))
+                .unwrap();
+        assert!(!ids.is_empty());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn many_sentinels_do_not_rescan_a_family_with_none() {
+        let markup = markup();
+        let rendered = "\u{FDD2}\u{FDD4}0\u{FDD3}".repeat(1 << 18);
+        let families = [
+            SentinelFamily {
+                open: '\u{FDD0}',
+                tag: None,
+                close: '\u{FDD1}',
+                markup: &markup,
+            },
+            SentinelFamily {
+                open: '\u{FDD2}',
+                tag: Some('\u{FDD4}'),
+                close: '\u{FDD3}',
+                markup: &markup,
+            },
+        ];
+        assert_quick(&rendered, &families);
+    }
+
+    #[test]
+    fn unclosed_openers_do_not_rescan_for_a_close() {
+        let markup = markup();
+        let rendered = "\u{FDD0}".repeat(1 << 19);
+        assert_quick(
+            &rendered,
+            &[SentinelFamily {
+                open: '\u{FDD0}',
+                tag: None,
+                close: '\u{FDD1}',
+                markup: &markup,
+            }],
+        );
+    }
+
+    #[test]
+    fn a_body_too_long_for_an_index_stays_text() {
+        let rendered = format!("x{OPEN}{}1{CLOSE}y", "0".repeat(32));
+        assert_eq!(
+            encode_with_sentinels(&rendered, &markup(), fake_encode).unwrap(),
+            fake_encode(&rendered).unwrap()
         );
     }
 
