@@ -66,7 +66,6 @@ impl VisionItem {
 
     /// The item, holding `permit` until its last copy drops.
     /// Several items of one request may share one permit.
-
     /// Temporal extent, in groups. 1 for a still.
     pub fn t_len(&self) -> usize {
         self.groups.len().max(1)
