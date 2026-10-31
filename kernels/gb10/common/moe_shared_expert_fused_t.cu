@@ -1180,3 +1180,30 @@ T_ROWS_SHIP(5)
 T_ROWS_SHIP(6)
 T_ROWS_SHIP(7)
 T_ROWS_SHIP(8)
+
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+// gfx1151: 128-column tiles as well (ATLAS_MOE_T_ROWS_BS=128). At Flash-Next's gate/up N = 640 the
+// 256-column tile needs ceil(640/256) = 3 CTAs per (expert, proj), the third half dead columns;
+// 128 columns tile it exactly (5 CTAs) and spread the union over more CUs. Same per-(row, slot,
+// column) arithmetic and k order as the b256 kernels: only how columns map to CTAs changes.
+#define T_ROWS_SHIP_B128(R) \
+extern "C" __global__ void moe_expert_gate_up_shared_t_rows_v3_r##R##_b128(T_ROWS_GU_ARGS) { \
+    (void)num_rows; \
+    gate_up_shared_t_rows_impl<R,128,1,true>(A, gpk, gsc, gs2, gate_out, upk, usc, us2, \
+        up_out, u_experts, u_rowmask, u_rowslot, u_count, sgp, sgs, sg2, \
+        sh_gate_out, sup, sus, su2, sh_up_out, N, K, top_k, h); \
+} \
+extern "C" __global__ void moe_expert_silu_down_shared_t_rows_v3_r##R##_b128(T_ROWS_SD_ARGS) { \
+    (void)num_rows; \
+    silu_down_shared_t_rows_impl<R,128,1,true>(gate_out, up_out, pk, sc, s2, C, \
+        u_experts, u_rowmask, u_rowslot, u_count, sh_gate_in, sh_up_in, \
+        sdp, sds, sd2, sh_down_out, N, K, top_k); \
+}
+T_ROWS_SHIP_B128(2)
+T_ROWS_SHIP_B128(3)
+T_ROWS_SHIP_B128(4)
+T_ROWS_SHIP_B128(5)
+T_ROWS_SHIP_B128(6)
+T_ROWS_SHIP_B128(7)
+T_ROWS_SHIP_B128(8)
+#endif

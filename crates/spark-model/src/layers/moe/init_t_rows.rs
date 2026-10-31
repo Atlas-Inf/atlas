@@ -35,7 +35,10 @@ impl TRowsKernels {
                     (2..=8).contains(&r),
                     gpu,
                     "moe_shared_expert_fused_t",
-                    &format!("moe_expert_gate_up_shared_t_rows_v3_r{r}_b256"),
+                    &format!(
+                        "moe_expert_gate_up_shared_t_rows_v3_r{r}_b{}",
+                        t_rows_block()
+                    ),
                 )
             }),
             moe_expert_silu_down_shared_t_rows_k: std::array::from_fn(|r| {
@@ -43,9 +46,27 @@ impl TRowsKernels {
                     (2..=8).contains(&r),
                     gpu,
                     "moe_shared_expert_fused_t",
-                    &format!("moe_expert_silu_down_shared_t_rows_v3_r{r}_b256"),
+                    &format!(
+                        "moe_expert_silu_down_shared_t_rows_v3_r{r}_b{}",
+                        t_rows_block()
+                    ),
                 )
             }),
         }
     }
+}
+
+/// Columns per CTA (= threads per block) of the verify-row dedup kernels:
+/// 256 everywhere by default. On gfx1151, `ATLAS_MOE_T_ROWS_BS=128` selects
+/// the `_b128` instantiations (same per-column arithmetic; see
+/// moe_shared_expert_fused_t.cu). Read once.
+pub(super) fn t_rows_block() -> u32 {
+    static BS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BS.get_or_init(|| {
+        if cfg!(atlas_hip) && std::env::var("ATLAS_MOE_T_ROWS_BS").as_deref() == Ok("128") {
+            128
+        } else {
+            256
+        }
+    })
 }

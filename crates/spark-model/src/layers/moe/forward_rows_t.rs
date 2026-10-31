@@ -193,7 +193,7 @@ impl MoeLayer {
             top_k,
             h,
             rows as u32,
-            256,
+            super::init_t_rows::t_rows_block(),
             stream,
         )?;
         ops::moe_expert_silu_down_shared_t_rows(
@@ -218,7 +218,7 @@ impl MoeLayer {
             inter,
             top_k,
             rows as u32,
-            256,
+            super::init_t_rows::t_rows_block(),
             stream,
         )?;
 
