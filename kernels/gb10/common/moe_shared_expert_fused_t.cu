@@ -719,6 +719,21 @@ extern "C" __global__ void moe_expert_union_t(
 // ROWS single-row launches. Masks gate stores only; an unselected row still
 // reads its own in-bounds A row and is never stored.
 // Grid: (N/(BS*COLS), u_count + 1, 2); blockIdx.y == u_count -> shared.
+// The rows kernels stage a CTA's whole COLW-column tile, so when N is not a
+// multiple of COLW the last CTA reads past each weight row: Flash-Next's
+// N = 640 at COLW 256 reads 128 bytes past every row, and past the end of the
+// tensor on its last row. Those columns are never stored (vc[] gates every
+// store), so the staged bytes are dead. On gb10 the read lands in mapped
+// memory. On gfx1151 it faulted (framework f127, grid [3, 41, 2] =
+// ceil(640/256) x (4 rows x top-10 + 1) x {gate, up}), so there the tail
+// chunks are skipped. N is a multiple of 16 for every shape these kernels
+// take (one chunk never straddles N), and the gb10 build is unchanged.
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+#define T_ROWS_TAIL_GUARD(col, N) if ((col) >= (N)) continue;
+#else
+#define T_ROWS_TAIL_GUARD(col, N)
+#endif
+
 template<int ROWS, int BS = 32, int COLS = 1, bool VEC = false>
 __device__ __forceinline__ void gate_up_shared_t_rows_impl(
     const __nv_bfloat16* __restrict__ A,               // [ROWS, h]
@@ -805,6 +820,7 @@ __device__ __forceinline__ void gate_up_shared_t_rows_impl(
         for (unsigned int j = lane; j < TILE_KH * (COLW / 16u); j += BS) {
             const unsigned int rr = j / (COLW / 16u);
             const unsigned int cb = (j % (COLW / 16u)) * 16u;
+            T_ROWS_TAIL_GUARD(ns0 + cb, N)
             *(uint4*)&s_pk[buf][rr * STRIDE + cb] =
                 *(const uint4*)&B_packed[(unsigned long long)(r0 + rr) * N + ns0 + cb];
         }
@@ -813,6 +829,7 @@ __device__ __forceinline__ void gate_up_shared_t_rows_impl(
         for (unsigned int j = lane; j < ng * (COLW / 16u); j += BS) {
             const unsigned int sg = j / (COLW / 16u);
             const unsigned int cb = (j % (COLW / 16u)) * 16u;
+            T_ROWS_TAIL_GUARD(ns0 + cb, N)
             *(uint4*)&s_sc[buf][sg * STRIDE + cb] =
                 *(const uint4*)&B_scale[(unsigned long long)(tg * ng + sg) * N + ns0 + cb];
         }
@@ -1001,6 +1018,7 @@ __device__ __forceinline__ void silu_down_shared_t_rows_impl(
         for (unsigned int j = lane; j < TILE_KH * (COLW / 16u); j += BS) {
             const unsigned int rr = j / (COLW / 16u);
             const unsigned int cb = (j % (COLW / 16u)) * 16u;
+            T_ROWS_TAIL_GUARD(ns0 + cb, N)
             *(uint4*)&s_pk[buf][rr * STRIDE + cb] =
                 *(const uint4*)&B_packed[(unsigned long long)(r0 + rr) * N + ns0 + cb];
         }
@@ -1009,6 +1027,7 @@ __device__ __forceinline__ void silu_down_shared_t_rows_impl(
         for (unsigned int j = lane; j < ng * (COLW / 16u); j += BS) {
             const unsigned int sg = j / (COLW / 16u);
             const unsigned int cb = (j % (COLW / 16u)) * 16u;
+            T_ROWS_TAIL_GUARD(ns0 + cb, N)
             *(uint4*)&s_sc[buf][sg * STRIDE + cb] =
                 *(const uint4*)&B_scale[(unsigned long long)(tg * ng + sg) * N + ns0 + cb];
         }

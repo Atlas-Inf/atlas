@@ -294,7 +294,17 @@ pub fn mtp_max_seqs() -> usize {
             // Pre-ladder baseline (cap=4, binary 472ed410): C=1 25.55
             // (1.80x vLLM) · C=2 35.35 (1.27x) · C=4 54.1 (1.01x) ·
             // C=8/16 MTP-off 73.5/131.0.
-            .unwrap_or(if mtp_ladder_disabled() { 4 } else { 32 })
+            // gfx1151: MTP off above 4 active sequences. At C>4 a 1-draft
+            // verify (2 rows per sequence) costs more on Strix Halo than the
+            // tokens it accepts, for both NVFP4 targets (Gufo protocol, x2):
+            // 27B strix s168 cap 4 vs 32: C1 14.4/14.6, C4 28.7/29.0,
+            // C6 26.5/24.7, C8 34.1/30.2; Flash-Next framework f142 MTP vs
+            // AR: C4 32.2/30.4, C6 28.4/30.1, C8 31.4/34.2.
+            .unwrap_or(if mtp_ladder_disabled() || cfg!(atlas_hip) {
+                4
+            } else {
+                32
+            })
     })
 }
 
