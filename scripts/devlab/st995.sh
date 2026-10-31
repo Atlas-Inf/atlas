@@ -36,8 +36,16 @@ for _ in $(seq 1 720); do
   sleep 5
 done
 log "serving; bfcl-subset starting"
-"$PWD/target/release/spark" benchmark run bfcl-subset --yes --url "http://127.0.0.1:$PORT" --model m > "$OUT/bfcl.log" 2>&1 || true
-sed -E 's/\x1b\[[0-9;]*m//g' "$OUT/bfcl.log" | grep -aE "^\s+[a-z_]+\s+(hallucination|live|non_live)\s+[0-9.]+|▸|overall [0-9.]+" | tee -a "$RES"
+# The CLI links the same HIP shims as the server (libcuda/libcudart/libcublasLt from atlas-kernels' OUT_DIR), which
+# serve-amd.sh puts on LD_LIBRARY_PATH for its own process only; same discovery as serve-amd.sh.
+SHIM=""
+for d in $(ls -dt "$PWD"/target/release/build/atlas-kernels-*/out 2>/dev/null); do
+  if ls "$d"/libcuda.so* >/dev/null 2>&1; then SHIM="$d"; break; fi
+done
+LD_LIBRARY_PATH="${SHIM:-}:${ROCM_PATH:-/opt/rocm}/lib:${LD_LIBRARY_PATH:-}" \
+  "$PWD/target/release/spark" benchmark run bfcl-subset --yes --url "http://127.0.0.1:$PORT" --model m > "$OUT/bfcl.log" 2>&1 || true
+sed -E 's/\x1b\[[0-9;]*m//g' "$OUT/bfcl.log" | grep -aE "^\s+[a-z_]+\s+(hallucination|live|non_live)\s+[0-9.]+|▸|overall [0-9.]+" | tee -a "$RES" \
+  || { log "no BFCL table in the log; tail:"; tail -15 "$OUT/bfcl.log" | tee -a "$RES"; }
 kill -INT $SPID 2>/dev/null || true; for _ in $(seq 1 90); do kill -0 $SPID 2>/dev/null || break; sleep 2; done; kill -9 $SPID 2>/dev/null || true
 log "faults: ERROR=$(grep -ac ' ERROR ' "$OUT/serve.log" || true) panics=$(grep -ac 'panicked' "$OUT/serve.log" || true)"
 log "DONE"
