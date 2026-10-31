@@ -23,13 +23,13 @@ impl LiteralXmlState {
         self.code_fence
             || self.inline_ticks != 0
             || self.quote.is_some()
-            // A delimiter run at the end of a chunk is conservatively
-            // literal until the next non-backtick byte identifies its size.
-            || self.pending_backticks != 0
             // Models often nest unescaped quotation marks while quoting a
             // sentence. A marker immediately touching either quote boundary
             // is still a literal mention, even if that quote closed a span.
             || matches!(self.previous, Some(b'"' | b'\''))
+            // A delimiter run at the end of a chunk is conservatively
+            // literal until the next non-backtick byte identifies its size.
+            || self.pending_backticks != 0
     }
 
     pub(crate) fn feed(&mut self, text: &str) {
@@ -221,29 +221,6 @@ pub(crate) fn mask_literal_markers_with_state(
     output
 }
 
-pub(crate) fn unmask_literal_markers(text: &str) -> String {
-    const SENTINEL: char = '\u{e000}';
-    const MASKED_LT: char = '\u{e001}';
-    let mut output = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(ch) = chars.next() {
-        if ch != SENTINEL {
-            output.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some(next) if next == SENTINEL => output.push(SENTINEL),
-            Some(next) if next == MASKED_LT => output.push('<'),
-            Some(next) => {
-                output.push(SENTINEL);
-                output.push(next);
-            }
-            None => output.push(SENTINEL),
-        }
-    }
-    output
-}
-
 /// Replace `<` bytes that occur inside a quoted or fenced span with a
 /// matcher-safe space while preserving the caller's lexical state separately.
 /// This byte-level form is used for tokenizer vocab entries, which may contain
@@ -268,6 +245,29 @@ pub(crate) fn mask_literal_lt_bytes_with_state(
     output
 }
 
+pub(crate) fn unmask_literal_markers(text: &str) -> String {
+    const SENTINEL: char = '\u{e000}';
+    const MASKED_LT: char = '\u{e001}';
+    let mut output = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != SENTINEL {
+            output.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some(next) if next == SENTINEL => output.push(SENTINEL),
+            Some(next) if next == MASKED_LT => output.push('<'),
+            Some(next) => {
+                output.push(SENTINEL);
+                output.push(next);
+            }
+            None => output.push(SENTINEL),
+        }
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -279,13 +279,6 @@ mod tests {
     fn marker_touching_nested_quote_boundary_is_literal() {
         assert!(marker_is_literal("\"The opening tag is \""));
         assert!(!marker_is_literal("\"finished quote\" "));
-    }
-
-    #[test]
-    fn byte_mask_handles_multibyte_text_and_real_marker_after_quote() {
-        let state = state_after("The marker is `");
-        let masked = mask_literal_lt_bytes_with_state("<tool_call>é`<tool_call>".as_bytes(), state);
-        assert_eq!(masked, " tool_call>é`<tool_call>".as_bytes());
     }
 
     #[test]
@@ -377,5 +370,12 @@ mod tests {
         let text = "`\u{e000}<function=demo>`; <function=real>";
         let masked = mask_literal_markers(text, &["<function="]);
         assert_eq!(unmask_literal_markers(&masked), text);
+    }
+
+    #[test]
+    fn byte_mask_handles_multibyte_text_and_real_marker_after_quote() {
+        let state = state_after("The marker is `");
+        let masked = mask_literal_lt_bytes_with_state("<tool_call>é`<tool_call>".as_bytes(), state);
+        assert_eq!(masked, " tool_call>é`<tool_call>".as_bytes());
     }
 }

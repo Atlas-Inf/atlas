@@ -643,8 +643,16 @@ fn compile_spec(
     };
 
     let grammar = compiled.map_err(|e| format!("Grammar compilation failed: {e}"))?;
+    let auto_literal_dispatch = matches!(
+        spec,
+        GrammarSpec::ToolCall {
+            use_triggers: true,
+            ..
+        }
+    );
     let state = GrammarState::new(&grammar, engine.vocab_size())
-        .map_err(|e| format!("Grammar state creation failed: {e}"))?;
+        .map_err(|e| format!("Grammar state creation failed: {e}"))?
+        .with_auto_literal_dispatch(auto_literal_dispatch);
     tracing::info!("Grammar constrained decoding active: {label}");
     // Exempt the model's stop/EOS tokens from grammar refusal so a legitimate
     // end-of-turn token cannot desync the NPDA and truncate the response

@@ -238,3 +238,37 @@ fn qwen_literal_xml_reasoning_does_not_consume_a_later_real_call() {
         |d| matches!(d, ir::StreamDelta::Finish { reason, .. } if reason.as_wire() == "tool_calls")
     ));
 }
+
+/// N106: the fenced-XML newline survives when ```xml, \\n, and <tool_call>
+/// arrive as SEPARATE tokens — the whitespace held while markup is ambiguous
+/// must be released, not dropped.
+#[test]
+fn qwen_literal_xml_split_tokens_keep_the_fence_newline() {
+    const XML_FENCE: u32 = 42;
+    const NEWLINE: u32 = 43;
+    // "```xml" "\n" "<tool_call>" body "</tool_call>" "\n" "```"
+    let deltas = run(
+        true,
+        vec![
+            END, XML_FENCE, NEWLINE, 3, 4, 5, 6, 7, 8, 9, 10, 11, NEWLINE, 15, 15, 15,
+        ],
+    );
+    let content: String = deltas
+        .iter()
+        .filter_map(|d| match d {
+            ir::StreamDelta::Content { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        content,
+        "```xml\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>\n```",
+        "{deltas:?}"
+    );
+    assert!(
+        !deltas
+            .iter()
+            .any(|d| matches!(d, ir::StreamDelta::ToolCallStart { .. })),
+        "{deltas:?}"
+    );
+}
