@@ -18,30 +18,6 @@ use crate::layers::ops;
 use crate::traits::SequenceState;
 
 impl TransformerModel {
-    pub(in crate::model) fn prefill_b_finalize_last(
-        &self,
-        tokens: &[u32],
-        seq: &mut SequenceState,
-        kv_cache: &mut PagedKvCache,
-        chunk_start: usize,
-        chunk_len: usize,
-        proc_count: usize,
-        stream: u64,
-    ) -> Result<DevicePtr> {
-        self.prefill_b_finalize_last_at(
-            tokens,
-            seq,
-            kv_cache,
-            chunk_start,
-            chunk_len,
-            proc_count,
-            0,
-            0,
-            None,
-            stream,
-        )
-    }
-
     /// Q12 Path B: stream-offset-aware finalize for the kernel-batched
     /// orchestrator. `hidden_stream_offset_tokens` is `b * chunk_len`
     /// where `b` is the stream's index in the batched dispatch.
@@ -509,3 +485,6 @@ impl TransformerModel {
         Ok(logits_ptr)
     }
 }
+
+#[path = "finalize_last/wrapper.rs"]
+mod wrapper;
