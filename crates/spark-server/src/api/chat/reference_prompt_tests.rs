@@ -247,3 +247,21 @@ fn no_request_form_gets_a_thinking_budget_or_a_tool_call_bias() {
         assert!(sampling.logit_bias.is_empty(), "{}: logit bias", case.name);
     }
 }
+
+/// N104 probe: render the failing fenced-tool_call request and print the
+/// prompt + token ids so it can be diffed across trees.
+#[test]
+fn n104_fenced_tool_call_render() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let request = serde_json::json!({
+        "model": "qwen4_exp",
+        "reasoning_effort": "low",
+        "messages": [{"role": "user", "content": "Show, inside a ```xml code fence, an example of a <tool_call> block for get_weather with city Paris. Do not actually call the tool."}],
+        "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}],
+    });
+    let prompt = atlas_prompt(&state, &request).expect("render");
+    let (_, prepared) = prepare(&state, &request).unwrap();
+    eprintln!("PROMPT>>>{prompt}<<<");
+    eprintln!("IDS>>>{:?}<<<", prepared.prompt_tokens);
+}

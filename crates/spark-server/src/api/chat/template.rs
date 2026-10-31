@@ -47,7 +47,7 @@ pub(super) fn render_template(
     let template_thinking = enable_thinking;
 
     // Build JSON messages with structured tool_calls for Jinja.
-    let json_messages =
+    let mut json_messages =
         build_json_messages_for(messages, state.tokenizer.uses_deepseek_v4_encoding());
     // When TSCG is enabled the parser's `system_prompt()` has already
     // placed the compact tool signatures into messages[0]; passing
@@ -73,13 +73,40 @@ pub(super) fn render_template(
         None
     };
 
+    // GLM-5 registers its tool-envelope XML as added tokens. Escape matching
+    // markup in incoming message prose before rendering so it remains text;
+    // structured call envelopes are still emitted by the template as native
+    // calls; literal argument values and schema descriptions remain text.
+    let escaped_tool_markup = state.tokenizer.escape_glm_tool_markup(
+        json_messages
+            .iter_mut()
+            .chain(jinja_tools.iter_mut().flatten()),
+    );
+    if escaped_tool_markup > 0 {
+        tracing::info!("{escaped_tool_markup} GLM tool markers in message text encoded as text");
+    }
+
+    // In a request with media only the template's own vision markers may
+    // become placeholders: markers written in message text encode as text
+    // (`tokenizer::vision_markup`).
+    if !image_pad_counts.is_empty() || !vision_placeholders.is_empty() {
+        let escaped = state.tokenizer.escape_vision_markup(
+            json_messages
+                .iter_mut()
+                .chain(jinja_tools.iter_mut().flatten()),
+        );
+        if escaped > 0 {
+            tracing::info!("{escaped} vision markers in message text encoded as text");
+        }
+    }
+
     // Progressive auto-compact (DISABLED BY DEFAULT 2026-04-25 —
     // see project_no_auto_compaction memory feedback).
     let auto_compact_active = state
         .auto_compact_threshold
         .map(|t| t > 0.0)
         .unwrap_or(false);
-    let mut json_messages = if auto_compact_active && json_messages.len() > 4 {
+    let json_messages = if auto_compact_active && json_messages.len() > 4 {
         let trial_tokens = state
             .tokenizer
             .apply_chat_template_openai_with_effort(
@@ -101,20 +128,6 @@ pub(super) fn render_template(
     } else {
         json_messages
     };
-
-    // Enntity/atlas b1b53814 (AGPL-3.0-only): GLM/Qwen register their
-    // tool-envelope XML as added tokens — escape matching markup in incoming
-    // message prose before rendering so it stays text. Structured call
-    // envelopes are still emitted by the template as native calls; literal
-    // argument values and schema descriptions remain text.
-    let escaped_tool_markup = state.tokenizer.escape_glm_tool_markup(
-        json_messages
-            .iter_mut()
-            .chain(jinja_tools.iter_mut().flatten()),
-    );
-    if escaped_tool_markup > 0 {
-        tracing::info!("{escaped_tool_markup} GLM tool markers in message text encoded as text");
-    }
 
     let prompt_tokens = match state.tokenizer.apply_chat_template_openai_with_effort(
         &json_messages,
