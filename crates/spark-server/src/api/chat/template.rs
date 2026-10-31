@@ -78,7 +78,7 @@ pub(super) fn render_template(
         .auto_compact_threshold
         .map(|t| t > 0.0)
         .unwrap_or(false);
-    let json_messages = if auto_compact_active && json_messages.len() > 4 {
+    let mut json_messages = if auto_compact_active && json_messages.len() > 4 {
         let trial_tokens = state
             .tokenizer
             .apply_chat_template_openai_with_effort(
@@ -100,6 +100,17 @@ pub(super) fn render_template(
     } else {
         json_messages
     };
+
+    // Enntity/atlas b1b53814 (AGPL-3.0-only): GLM/Qwen register their
+    // tool-envelope XML as added tokens — escape matching markup in incoming
+    // message prose before rendering so it stays text. Structured tool_calls
+    // are left untouched for the template to emit as real native calls.
+    let escaped_tool_markup = state
+        .tokenizer
+        .escape_glm_tool_markup(json_messages.iter_mut());
+    if escaped_tool_markup > 0 {
+        tracing::info!("{escaped_tool_markup} GLM tool markers in message text encoded as text");
+    }
 
     let prompt_tokens = match state.tokenizer.apply_chat_template_openai_with_effort(
         &json_messages,

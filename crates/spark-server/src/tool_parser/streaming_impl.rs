@@ -19,6 +19,7 @@ impl StreamingToolDetector {
         Self {
             buffer: String::new(),
             inside_tag: false,
+            current_tag_open: None,
             inside_dsml: false,
             promote_bare_names: false,
             call_counter: 0,
@@ -31,6 +32,7 @@ impl StreamingToolDetector {
             args_open: false,
             emitted_keys: Vec::new(),
             incremental_emitted: false,
+            literal_xml_state: crate::literal_xml::LiteralXmlState::default(),
         }
     }
 
@@ -53,7 +55,9 @@ impl StreamingToolDetector {
     pub fn reset(&mut self) {
         self.buffer.clear();
         self.inside_tag = false;
+        self.current_tag_open = None;
         self.inside_dsml = false;
+        self.literal_xml_state = crate::literal_xml::LiteralXmlState::default();
         self.reset_call_state();
     }
 
@@ -62,6 +66,7 @@ impl StreamingToolDetector {
     pub(super) fn reset_call_state(&mut self) {
         self.current_tc_name = None;
         self.current_tc_id = None;
+        self.current_tag_open = None;
         self.current_tc_emitted = 0;
         self.args_open = false;
         self.emitted_keys.clear();
@@ -103,6 +108,12 @@ impl StreamingToolDetector {
                     });
                 if let Some((end, close_len)) = close_pos {
                     let idx = self.call_counter as usize;
+                    let literal_before = self.literal_xml_state;
+                    let tag_open = self
+                        .current_tag_open
+                        .clone()
+                        .unwrap_or_else(|| "<tool_call>".to_string());
+                    let close = self.buffer[end..end + close_len].to_string();
 
                     if self.current_tc_name.is_some() {
                         // Name was already emitted via ToolCallStart.
@@ -131,6 +142,7 @@ impl StreamingToolDetector {
                         // Parse the complete inner content to extract JSON arguments.
                         if let Some(tc) =
                             parse_complete_call(&inner, self.call_counter, self.promote_bare_names)
+                                .filter(|tc| self.is_registered_tool(&tc.function.name))
                         {
                             // Always emit when the parser produced a named call,
                             // even if arguments are `{}`. Argument-less tools
@@ -146,7 +158,12 @@ impl StreamingToolDetector {
                             self.call_counter += 1;
                             self.emitted_tool_calls = true;
                         } else {
-                            tracing::warn!("Failed to parse tool call body, dropping");
+                            // A complete XML-looking block that does not
+                            // identify one of this request's tools is prose.
+                            // Preserve it byte-for-byte instead of swallowing
+                            // it from the stream.
+                            self.push_content(&mut outputs, format!("{tag_open}{inner}{close}"));
+                            self.literal_xml_state = literal_before;
                         }
                         // Reset incremental state for next tool call.
                         self.reset_call_state();
@@ -167,23 +184,65 @@ impl StreamingToolDetector {
                         // other formats.
                         let trimmed = inner.trim();
                         if trimmed.contains("<invoke name=") {
-                            for tc in parse_minimax_xml_calls_all(trimmed) {
-                                let call_idx = self.call_counter as usize;
-                                self.call_counter += 1;
-                                self.emitted_tool_calls = true;
-                                outputs.push(DetectorOutput::ToolCall(tc, call_idx));
+                            let calls = parse_minimax_xml_calls_all(trimmed);
+                            if !calls.is_empty()
+                                && calls
+                                    .iter()
+                                    .all(|tc| self.is_registered_tool(&tc.function.name))
+                            {
+                                for tc in calls {
+                                    let call_idx = self.call_counter as usize;
+                                    self.call_counter += 1;
+                                    self.emitted_tool_calls = true;
+                                    outputs.push(DetectorOutput::ToolCall(tc, call_idx));
+                                }
+                            } else {
+                                self.push_content(
+                                    &mut outputs,
+                                    format!("{tag_open}{inner}{close}"),
+                                );
+                                self.literal_xml_state = literal_before;
                             }
                         } else if let Some(tc) =
                             parse_complete_call(trimmed, self.call_counter, self.promote_bare_names)
+                                .filter(|tc| self.is_registered_tool(&tc.function.name))
                         {
                             self.call_counter += 1;
                             self.emitted_tool_calls = true;
                             outputs.push(DetectorOutput::ToolCall(tc, idx));
+                        } else {
+                            self.push_content(&mut outputs, format!("{tag_open}{inner}{close}"));
+                            self.literal_xml_state = literal_before;
                         }
                     }
                     // Reset incremental state for next tool call
                     self.reset_call_state();
                     continue;
+                }
+
+                // Keep scanning if this opener was only prose and another
+                // opener later in the same buffer starts a real call. A
+                // chunked real header remains buffered until its name syntax
+                // is complete, so this does not reject split calls.
+                if self.current_tc_name.is_none()
+                    && let Some((next, _)) = self.find_tool_opener()
+                {
+                    let candidate = self.buffer[..next].to_string();
+                    let known_name = extract_streaming_name(&candidate, self.promote_bare_names)
+                        .is_some_and(|name| self.is_registered_tool(&name));
+                    if !known_name {
+                        let literal_before = self.literal_xml_state;
+                        let tag_open = self
+                            .current_tag_open
+                            .clone()
+                            .unwrap_or_else(|| "<tool_call>".to_string());
+                        self.push_content(&mut outputs, format!("{tag_open}{candidate}"));
+                        self.literal_xml_state = literal_before;
+                        self.buffer = self.buffer[next..].to_string();
+                        self.inside_tag = false;
+                        self.reset_call_state();
+                        continue;
+                    }
                 }
 
                 // No closing tag yet — try to extract function name for early header emission.
@@ -194,6 +253,7 @@ impl StreamingToolDetector {
                 if self.current_tc_name.is_none()
                     && let Some(name) =
                         extract_streaming_name(&self.buffer, self.promote_bare_names)
+                    && self.is_registered_tool(&name)
                 {
                     let id = next_tool_call_id();
                     let idx = self.call_counter as usize;
@@ -222,7 +282,7 @@ impl StreamingToolDetector {
                 // wait for more tokens.
                 if mistral_start > 0 {
                     let before = self.buffer[..mistral_start].to_string();
-                    outputs.push(DetectorOutput::Content(before));
+                    self.push_content(&mut outputs, before);
                     self.buffer = self.buffer[mistral_start..].to_string();
                 }
                 // Must have [ARGS] before we can extract a name.
@@ -281,32 +341,27 @@ impl StreamingToolDetector {
                 let consumed = json_rel + json_end_rel;
                 self.buffer = self.buffer[consumed..].to_string();
                 continue;
-            } else if let Some((start, tag_len)) = self
-                .buffer
-                .find("<tool_call>")
-                .map(|p| (p, 11usize))
-                .or_else(|| self.buffer.find("<|tool_call>").map(|p| (p, 12usize)))
-                .or_else(|| {
-                    self.buffer
-                        .find("<minimax:tool_call>")
-                        .map(|p| (p, "<minimax:tool_call>".len()))
-                })
-                .or_else(|| {
-                    self.buffer
-                        .find("<minimax:_call>")
-                        .map(|p| (p, "<minimax:_call>".len()))
-                })
-            {
+            } else if let Some((start, tag_len)) = self.find_tool_opener() {
                 // Recognised opener forms:
                 //   - `<tool_call>` (hermes / qwen3-coder, 11 chars)
                 //   - `<|tool_call>` (gemma-4, 12 chars)
                 //   - `<minimax:tool_call>` (MiniMax canonical, 19 chars)
                 //   - `<minimax:_call>` (MiniMax BPE-broken — F73 / fix42)
                 let before = self.buffer[..start].to_string();
+                let literal = self.marker_is_literal(start);
+                let marker = self.buffer[start..start + tag_len].to_string();
                 self.buffer = self.buffer[start + tag_len..].to_string();
-                self.inside_tag = true;
                 if !before.is_empty() {
-                    outputs.push(DetectorOutput::Content(before));
+                    self.push_content(&mut outputs, before);
+                }
+                if literal {
+                    // A marker inside a quote or code span is ordinary prose.
+                    // Feed it through the same stateful path so a closing
+                    // delimiter in a later chunk restores structural parsing.
+                    self.push_content(&mut outputs, marker);
+                } else {
+                    self.inside_tag = true;
+                    self.current_tag_open = Some(marker);
                 }
                 continue;
             } else if self.buffer.contains("<function") {
@@ -329,7 +384,7 @@ impl StreamingToolDetector {
                         && DSML_OPEN.starts_with(&remainder);
                     self.buffer = remainder;
                     if !content.is_empty() && !dsml_leading_whitespace {
-                        outputs.push(DetectorOutput::Content(content));
+                        self.push_content(&mut outputs, content);
                     }
                 }
                 break;

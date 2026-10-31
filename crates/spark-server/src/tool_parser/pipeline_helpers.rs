@@ -7,7 +7,19 @@ use super::*;
 /// Models sometimes output tool calls without the `<tool_call>` wrapper,
 /// especially at lower quantization levels. This catches those cases.
 pub(super) fn parse_bare_function_calls(text: &str) -> (Option<String>, Vec<ToolCall>) {
-    ToolCallPipeline::bare_function_default().run(text)
+    let masked = crate::literal_xml::mask_literal_markers(
+        text,
+        &[
+            "<function>",
+            "<function=",
+            "<function ",
+            "<|function=",
+            "<|function ",
+        ],
+    );
+    let (content, calls) = ToolCallPipeline::bare_function_default().run(&masked);
+    let content = content.map(|content| crate::literal_xml::unmask_literal_markers(&content));
+    (content, calls)
 }
 
 // ── JSON fallback tool call parser ──
