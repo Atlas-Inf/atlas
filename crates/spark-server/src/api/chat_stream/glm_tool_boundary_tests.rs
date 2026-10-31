@@ -24,7 +24,7 @@ fn app(glm: bool) -> Arc<AppState> {
     app_for_model("qwen3", tool_parser::ToolCallFormat::PoolsideV1)
 }
 
-fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<AppState> {
+fn app_for_model(model_type: &str, _format: tool_parser::ToolCallFormat) -> Arc<AppState> {
     let dir = tempfile::tempdir().unwrap();
     let words = [
         "[UNK]",

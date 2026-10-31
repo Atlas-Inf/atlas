@@ -832,7 +832,7 @@ pub(crate) fn load_model(
     // needs the encoder's output window (`spark_model::vision_limits`). A
     // model whose tower did not load (window 0) serves text only, and the
     // API refuses media as it does for a text model. Enntity/atlas b060f987.
-    let (vision_window_rows, vision_request_bound) = model.vision_row_limits();
+    let _ = model.vision_row_limits();
 
     // Read default sampling parameters from generation_config.json.
     let serve_phases::SamplingDefaults {
