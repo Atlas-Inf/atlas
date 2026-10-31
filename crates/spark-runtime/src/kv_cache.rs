@@ -459,6 +459,8 @@ pub struct PagedKvCache {
     /// Token-sharded latent storage (`ATLAS_GLM_KV_SHARD=1`); `None` stores
     /// every block's latents locally.
     latent_shard: Option<LatentShard>,
+    /// Which pools came from the backend's carveout.
+    placement: KvPlacement,
 }
 
 mod block_trace;
@@ -472,12 +474,14 @@ mod nvme_spill;
 mod nvme_sync;
 pub use nvme_spill::NvmeIoStats;
 mod paged_impl;
+mod placement;
 mod release;
 mod sparse_index;
 mod sparse_index_impl;
 mod tail_slots;
 mod zero_impl;
 pub use latent_shard::{ExchangeLane, LatentShard, LatentShardSpec, LatentViewPlan};
+pub use placement::{KvBuffer, KvPlacement};
 pub use sparse_index::{SparseIndexCacheConfig, SparseIndexCacheDtype};
 pub use tail_slots::{NO_TAIL, TailSlotPlan};
 #[cfg(test)]
