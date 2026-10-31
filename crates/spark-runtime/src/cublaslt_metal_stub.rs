@@ -29,6 +29,18 @@ pub fn version() -> usize {
     0
 }
 
+pub fn bf16_gemm_act_weight_t_f32out(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    _m: u32,
+    _n: u32,
+    _k: u32,
+    _stream: u64,
+) -> Result<()> {
+    unreachable!("cublaslt::bf16_gemm_act_weight_t_f32out is cuda-only (not built for metal)")
+}
+
 pub fn install_bf16_fallback(_f: Box<Bf16GemmFallback>) -> bool {
     unreachable!("cublaslt::install_bf16_fallback is cuda-only (not built for metal)")
 }

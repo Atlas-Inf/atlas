@@ -93,6 +93,48 @@ pub(super) fn read_declared_pixels(
     None
 }
 
+/// GLM-5.3's token budgets from its nested `processor_config.json`:
+/// `min_image_tokens` / `max_image_tokens` under `image_processor` and
+/// `video_processor`. GLM declares no pixel area (`size` / `max_pixels`), so
+/// `read_preprocessor_max_pixels` finds nothing and these are the bound.
+/// A missing file or key keeps the processor classes' defaults, which the
+/// shipped checkpoint repeats.
+pub(super) fn read_glm_token_budgets(
+    model_dir: &std::path::Path,
+) -> atlas_core::config::VisionTokenBudgets {
+    let mut budgets = atlas_core::config::VisionTokenBudgets::default();
+    let path = model_dir.join("processor_config.json");
+    let Some(json) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+    else {
+        return budgets;
+    };
+    for (key, slot) in [
+        ("image_processor", &mut budgets.image),
+        ("video_processor", &mut budgets.video),
+    ] {
+        let read = |field: &str| {
+            json.get(key)
+                .and_then(|scope| scope.get(field))
+                .and_then(serde_json::Value::as_u64)
+                .filter(|&tokens| tokens > 0)
+                .map(|tokens| tokens as usize)
+        };
+        *slot = (
+            read("min_image_tokens").unwrap_or(slot.0),
+            read("max_image_tokens").unwrap_or(slot.1),
+        );
+    }
+    tracing::info!(
+        "GLM vision token budgets from {}: image {:?}, video {:?}",
+        path.display(),
+        budgets.image,
+        budgets.video,
+    );
+    budgets
+}
+
 #[cfg(test)]
 #[path = "processor_pixels_tests.rs"]
 mod tests;

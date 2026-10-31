@@ -39,16 +39,13 @@
 //
 // Grid: (ceil(total_elements / 256), 1, 1)  Block: (256, 1, 1)
 
-#include "../../common/atlas_pdl.cuh"
+#include "atlas_pdl_touch.cuh"
 #include <cuda_bf16.h>
 
-extern "C" __global__ void moe_silu_mul(
-    const __nv_bfloat16* __restrict__ gate,   // [total_expanded, inter_size]
-    const __nv_bfloat16* __restrict__ up,     // [total_expanded, inter_size]
-    __nv_bfloat16* __restrict__ output,        // [total_expanded, inter_size]
-    unsigned int total_elements
+__device__ __forceinline__ void moe_silu_mul_body(
+    const __nv_bfloat16* __restrict__ gate, const __nv_bfloat16* __restrict__ up,
+    __nv_bfloat16* __restrict__ output, unsigned int total_elements
 ) {
-    atlas_pdl_enter();
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_elements) return;
 
@@ -62,6 +59,34 @@ extern "C" __global__ void moe_silu_mul(
     float sigmoid_g = 1.0f / (1.0f + __expf(-g));
     float result = g * sigmoid_g * u;
     output[idx] = __float2bfloat16(result);
+}
+
+extern "C" __global__ void moe_silu_mul(
+    const __nv_bfloat16* __restrict__ gate,   // [total_expanded, inter_size]
+    const __nv_bfloat16* __restrict__ up,     // [total_expanded, inter_size]
+    __nv_bfloat16* __restrict__ output,        // [total_expanded, inter_size]
+    unsigned int total_elements
+) {
+    atlas_pdl_enter();
+    moe_silu_mul_body(gate, up, output, total_elements);
+}
+
+// moe_silu_mul that also asks the routed FFN's router weight (`rows` rows of
+// `row_bytes`) and its correction bias (f32 [rows]) into L2 during its PDL
+// wait (atlas_pdl_touch.cuh; every CTA takes a share). The shared expert's
+// SiLU of a decode step is resident through the attention all-reduce, while
+// the memory bus idles, and the router (glm_moe_route_one) runs two launches
+// later, behind the shared down whose CTAs leave it no room to touch its own
+// weight. Discarded loads of immutable weights: the same bytes.
+extern "C" __global__ void moe_silu_mul_touch(
+    const __nv_bfloat16* __restrict__ gate, const __nv_bfloat16* __restrict__ up,
+    __nv_bfloat16* __restrict__ output, unsigned int total_elements,
+    const unsigned char* __restrict__ router_w, const unsigned char* __restrict__ router_bias,
+    unsigned int rows, unsigned int row_bytes
+) {
+    atlas_pdl_enter_touch({router_w, row_bytes, row_bytes}, {router_bias, 4u, 4ull}, rows,
+                          blockIdx.x, gridDim.x);
+    moe_silu_mul_body(gate, up, output, total_elements);
 }
 
 
@@ -79,18 +104,16 @@ extern "C" __global__ void moe_silu_mul(
 // BF16 intermediate; MoE down-projection LoRA may request it because its fold
 // consumes the post-SiLU activations.
 
-extern "C" __global__ void silu_mul_quant_nvfp4(
+__device__ __forceinline__ void silu_mul_quant_nvfp4_row(
     const __nv_bfloat16* __restrict__ gate,
     const __nv_bfloat16* __restrict__ up,
     unsigned char* __restrict__ packed_out,
     unsigned char* __restrict__ scale_out,
     __nv_bfloat16* __restrict__ out_bf16,
-    unsigned int M,
-    unsigned int K
+    unsigned int row,
+    unsigned int K,
+    float g
 ) {
-    atlas_pdl_enter();
-    const unsigned int row = blockIdx.x;
-    if (row >= M) return;
 
     const __nv_bfloat16* grow = gate + (unsigned long long)row * K;
     const __nv_bfloat16* urow = up + (unsigned long long)row * K;
@@ -113,7 +136,7 @@ extern "C" __global__ void silu_mul_quant_nvfp4(
         }
 
         float inv;
-        srow[group] = silu_nvfp4_group_scale(group_max, &inv);
+        srow[group] = silu_nvfp4_group_scale(group_max, &inv, g);
 #pragma unroll
         for (int i = 0; i < 16; i += 2) {
             const unsigned int q0 = silu_nvfp4_quantize_e2m1(vals[i] * inv);
@@ -121,4 +144,46 @@ extern "C" __global__ void silu_mul_quant_nvfp4(
             prow[group * 8 + i / 2] = (unsigned char)((q1 << 4) | q0);
         }
     }
+}
+
+extern "C" __global__ void silu_mul_quant_nvfp4(
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    unsigned char* __restrict__ packed_out,
+    unsigned char* __restrict__ scale_out,
+    __nv_bfloat16* __restrict__ out_bf16,
+    unsigned int M,
+    unsigned int K
+) {
+    atlas_pdl_enter();
+    const unsigned int row = blockIdx.x;
+    if (row >= M) return;
+    silu_mul_quant_nvfp4_row(gate, up, packed_out, scale_out, out_bf16, row, K, 1.0f);
+}
+
+// silu_mul_quant_nvfp4 over rows sorted by expert (`expert_offsets`, E + 1
+// starts), each quantized with its expert's global scale `a2_gscale[e]`
+// (1 / w2 input_scale, ATLAS_GLM_FP4L_INPUT_SCALES).
+extern "C" __global__ void silu_mul_quant_nvfp4_by_expert(
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    unsigned char* __restrict__ packed_out,
+    unsigned char* __restrict__ scale_out,
+    __nv_bfloat16* __restrict__ out_bf16,
+    unsigned int M,
+    unsigned int K,
+    const int* __restrict__ expert_offsets,
+    const float* __restrict__ a2_gscale,
+    unsigned int num_experts
+) {
+    atlas_pdl_enter();
+    const unsigned int row = blockIdx.x;
+    if (row >= M) return;
+    // The expert e with expert_offsets[e] <= row < expert_offsets[e + 1].
+    unsigned int lo = 0, hi = num_experts;
+    while (hi - lo > 1) {
+        const unsigned int mid = (lo + hi) / 2;
+        if ((unsigned int)__ldcg(expert_offsets + mid) <= row) lo = mid; else hi = mid;
+    }
+    silu_mul_quant_nvfp4_row(gate, up, packed_out, scale_out, out_bf16, row, K, __ldcg(a2_gscale + lo));
 }

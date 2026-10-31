@@ -479,7 +479,9 @@ pub fn apply_penalties_and_bias(
     }
 }
 
+mod absent;
 mod sample_impl;
+pub use absent::{Absent, sample_with_absent};
 pub use sample_impl::{
     argmax_last_wins_f32, sample_with_params_history, sample_with_params_seeded,
 };

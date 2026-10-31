@@ -148,7 +148,12 @@ pub(super) fn head(variant: FirstAppend) -> BlockDiffusionDraftHead {
     let mut head = zero_head();
     head.target_layer_ids = vec![0, 1];
     head.target_hidden_size = SLOT / 4;
-    head.max_seq_len = WINDOW;
+    // A bounded noncausal window avoids the global context pool: mock
+    // backends own separate allocations even when tests run in parallel.
+    head.max_seq_len = WINDOW + 1;
+    head.ctx_window = WINDOW + 1;
+    head.query_causal = false;
+    head.window_size = Some(WINDOW);
     head.startup.diagnostics.first_append = variant;
     head.startup.diagnostics.no_decode_append = false;
     head
@@ -166,6 +171,7 @@ pub(super) fn after_prefill(
     gpu: &MockGpuBackend,
 ) -> Box<dyn ProposerState> {
     let mut state = head.alloc_state(gpu).unwrap();
+    head.acquire_ctx_acc(gpu, state.as_mut()).unwrap();
     let d = dstate(&mut state);
     d.ctx_len = PROMPT;
     d.ctx_positions = (0..PROMPT as i32).collect();
@@ -313,10 +319,13 @@ fn a_full_accumulator_appends_in_no_variant() {
 /// Every non-legacy variant gets the spare row (its own decode captures land
 /// there); legacy allocations are byte-for-byte what they were.
 #[test]
-fn alloc_state_reserves_the_own_row_for_non_legacy_only() {
+fn acquire_ctx_acc_reserves_the_own_row_for_non_legacy_only() {
     for variant in ALL {
         let gpu = MockGpuBackend::new();
-        let mut state = head(variant).alloc_state(&gpu).unwrap();
+        let head = head(variant);
+        let mut state = head.alloc_state(&gpu).unwrap();
+        assert_eq!(dstate(&mut state).ctx_hidden_acc, DevicePtr(0));
+        head.acquire_ctx_acc(&gpu, state.as_mut()).unwrap();
         let d = dstate(&mut state);
         let own = variant != FirstAppend::Legacy;
         assert_eq!(d.max_ctx_len, WINDOW, "{variant:?}");

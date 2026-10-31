@@ -73,6 +73,12 @@ __device__ __forceinline__ float sw_exp_512(float x) {
 #endif
 }
 
+// Q/K/V tiles are stored with their 16-byte chunks XOR-swizzled by row
+// (chunk c of row r at chunk c ^ (r & 7)): a fragment's eight rows then fall
+// in eight different bank groups instead of one (rows are 1 KB apart). The
+// same elements reach the same MMAs, so every output is unchanged.
+#define SWZ512(row, col) ((row) * HDIM_512 + (((((col) >> 3) ^ ((row) & 7u))) << 3) + ((col) & 7u))
+
 #define BR_512   32
 #define BC_512   32
 #define HDIM_512 512
@@ -124,8 +130,16 @@ extern "C" __global__ void KERNEL_NAME(
     const unsigned int group_id     = lane_id >> 2;
     const unsigned int tid_in_group = lane_id & 3;
     const unsigned int qk_warp_m    = (warp_id & 1) * 16;          // warps 0-1
-    const unsigned int pv_warp_m    = (warp_id & 1) * 16;          // pair: rows 0-15/16-31
-    const unsigned int pv_n_start   = (warp_id >> 1) * N_TILES_PER_WARP_512;
+    // A tile of at most 16 rows (decode / verify): rows 16-31 are padding, so
+    // warp 1 skips its QK^T and every warp runs the PV of rows 0-15 over its
+    // own eighth of the columns. Each output element sees the same rescales
+    // and MMAs in the same order, only on another warp: the same words.
+    const bool half = q_tile_len <= 16;
+    const bool qk_warp = warp_id == 0 || (warp_id == 1 && !half);
+    const unsigned int pv_warp_m    = half ? 0u : (warp_id & 1) * 16;  // pair: rows 0-15/16-31
+    const unsigned int pv_n_start   = half ? warp_id * (N_TILES_PER_WARP_512 / 2)
+                                           : (warp_id >> 1) * N_TILES_PER_WARP_512;
+    const unsigned int pv_n_tiles   = half ? N_TILES_PER_WARP_512 / 2 : N_TILES_PER_WARP_512;
     const unsigned int p_smem_stride = BC_512 + PAD_P_512;
 
     float acc_o[N_TILES_PER_WARP_512][4];
@@ -145,11 +159,11 @@ extern "C" __global__ void KERNEL_NAME(
         const unsigned int cpr = HDIM_512 / 8;
         for (unsigned int idx = tid; idx < TILE_CHUNKS_512; idx += blockDim.x) {
             unsigned int row = idx / cpr, col = (idx % cpr) * 8;
-            unsigned int sa = __cvta_generic_to_shared(&smem_Q[row * HDIM_512 + col]);
+            unsigned int sa = __cvta_generic_to_shared(&smem_Q[SWZ512(row, col)]);
             if (q_start + row < q_len) {
                 const void* gm = (const void*)&Q[(q_start+row)*q_seq_stride + q_head*head_dim + col];
                 asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(sa), "l"(gm));
-            } else { *((uint4*)&smem_Q[row * HDIM_512 + col]) = make_uint4(0,0,0,0); }
+            } else { *((uint4*)&smem_Q[SWZ512(row, col)]) = make_uint4(0,0,0,0); }
         }
         if (num_kv_blocks > 0) {
             LOAD_KV_TILE_512(K_cache, block_table, smem_K, 0, kv_len, kv_head, tid, blockDim.x);
@@ -166,7 +180,7 @@ extern "C" __global__ void KERNEL_NAME(
 
         // === Warp-specialized: warps 0-1 QK^T  ||  warps 2-7 V load ===
         float acc_s[4][4];
-        if (warp_id < 2) {
+        if (qk_warp) {
             #pragma unroll
             for (int i=0;i<4;i++){acc_s[i][0]=0;acc_s[i][1]=0;acc_s[i][2]=0;acc_s[i][3]=0;}
             const unsigned short* sQ = (const unsigned short*)smem_Q;
@@ -177,15 +191,15 @@ extern "C" __global__ void KERNEL_NAME(
                 unsigned int kb = ks*16;
                 unsigned int ar0=qk_warp_m+group_id, ar1=ar0+8;
                 unsigned int ac0=kb+tid_in_group*2, ac1=ac0+8;
-                unsigned int a0=*(const unsigned int*)&sQ[ar0*HDIM_512+ac0];
-                unsigned int a1=*(const unsigned int*)&sQ[ar1*HDIM_512+ac0];
-                unsigned int a2=*(const unsigned int*)&sQ[ar0*HDIM_512+ac1];
-                unsigned int a3=*(const unsigned int*)&sQ[ar1*HDIM_512+ac1];
+                unsigned int a0=*(const unsigned int*)&sQ[SWZ512(ar0,ac0)];
+                unsigned int a1=*(const unsigned int*)&sQ[SWZ512(ar1,ac0)];
+                unsigned int a2=*(const unsigned int*)&sQ[SWZ512(ar0,ac1)];
+                unsigned int a3=*(const unsigned int*)&sQ[SWZ512(ar1,ac1)];
                 #pragma unroll
                 for (int nt=0; nt<4; nt++) {
                     unsigned int nc=nt*8+group_id, k0=kb+tid_in_group*2, k1=k0+8;
-                    unsigned int b0=((unsigned int)sK[nc*HDIM_512+k0+1]<<16)|(unsigned int)sK[nc*HDIM_512+k0];
-                    unsigned int b1=((unsigned int)sK[nc*HDIM_512+k1+1]<<16)|(unsigned int)sK[nc*HDIM_512+k1];
+                    unsigned int b0=((unsigned int)sK[SWZ512(nc,k0+1)]<<16)|(unsigned int)sK[SWZ512(nc,k0)];
+                    unsigned int b1=((unsigned int)sK[SWZ512(nc,k1+1)]<<16)|(unsigned int)sK[SWZ512(nc,k1)];
                     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                         "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
                         :"=f"(acc_s[nt][0]),"=f"(acc_s[nt][1]),"=f"(acc_s[nt][2]),"=f"(acc_s[nt][3])
@@ -264,6 +278,8 @@ extern "C" __global__ void KERNEL_NAME(
                 smem_ml[row1*2  ]=m_r1; smem_ml[row1*2+1]=l_r1;
             }
             asm volatile("cp.async.commit_group;");  // empty: balance with V load
+        } else if (warp_id < 2) {
+            asm volatile("cp.async.commit_group;");  // warp 1 of a half tile
         } else {
             // Warps 2-7 (192 threads): cooperative V tile load.
             // Renumber threads 0..191 within this group; share LOAD_KV_TILE_512 macro.
@@ -274,8 +290,8 @@ extern "C" __global__ void KERNEL_NAME(
         asm volatile("cp.async.wait_group 0;");
         __syncthreads();
 
-        // Warps 2-7 rescale to current m before PV
-        if(warp_id>=2){
+        // Warps 2-7 (and warp 1 of a half tile) rescale to current m before PV
+        if(!qk_warp){
             unsigned int r0=pv_warp_m+group_id, r1=r0+8;
             float cm0=smem_ml[r0*2], cm1=smem_ml[r1*2];
             if (cm0 != m_r0) {
@@ -290,6 +306,14 @@ extern "C" __global__ void KERNEL_NAME(
                 for(int i=0;i<N_TILES_PER_WARP_512;i++){acc_o[i][2]*=er1;acc_o[i][3]*=er1;}
                 m_r1=cm1;
             }
+        }
+
+        // === K[next] load, overlapping the PV: the QK^T that read smem_K
+        // finished before the barrier above, and PV reads only P and V ===
+        const bool k_next = kv_block + 1 < num_kv_blocks;
+        if (k_next) {
+            LOAD_KV_TILE_512(K_cache, block_table, smem_K, (kv_block+1)*BC_512, kv_len, kv_head, tid, blockDim.x);
+            asm volatile("cp.async.commit_group;");
         }
 
         // === PV MMA (all 8 warps) ===
@@ -307,9 +331,10 @@ extern "C" __global__ void KERNEL_NAME(
                 unsigned int a3=*(const unsigned int*)&sP[ar1*p_smem_stride+ac1];
                 #pragma unroll
                 for(int nt=0;nt<N_TILES_PER_WARP_512;nt++){
+                    if ((unsigned int)nt >= pv_n_tiles) continue;
                     unsigned int nc=(pv_n_start+nt)*8+group_id, k0=ko+tid_in_group*2, k1=k0+8;
-                    unsigned int b0=((unsigned int)sV[(k0+1)*HDIM_512+nc]<<16)|(unsigned int)sV[k0*HDIM_512+nc];
-                    unsigned int b1=((unsigned int)sV[(k1+1)*HDIM_512+nc]<<16)|(unsigned int)sV[k1*HDIM_512+nc];
+                    unsigned int b0=((unsigned int)sV[SWZ512(k0+1,nc)]<<16)|(unsigned int)sV[SWZ512(k0,nc)];
+                    unsigned int b1=((unsigned int)sV[SWZ512(k1+1,nc)]<<16)|(unsigned int)sV[SWZ512(k1,nc)];
                     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                         "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
                         :"=f"(acc_o[nt][0]),"=f"(acc_o[nt][1]),"=f"(acc_o[nt][2]),"=f"(acc_o[nt][3])
@@ -319,22 +344,15 @@ extern "C" __global__ void KERNEL_NAME(
             }
         }
 
+        if (k_next) asm volatile("cp.async.wait_group 0;");
         __syncthreads();
-
-        // === Sequential K[next] load (single-buffered, all 256 threads) ===
-        if(kv_block+1 < num_kv_blocks){
-            LOAD_KV_TILE_512(K_cache, block_table, smem_K, (kv_block+1)*BC_512, kv_len, kv_head, tid, blockDim.x);
-            asm volatile("cp.async.commit_group;");
-            asm volatile("cp.async.wait_group 0;");
-            __syncthreads();
-        }
     }
 
     // === Final normalization and store ===
     {
         unsigned int r0=pv_warp_m+group_id, r1=r0+8;
         float il0,il1;
-        if(warp_id<2){
+        if(qk_warp){
             il0=(l_r0>0)?(1.f/l_r0):0;
             il1=(l_r1>0)?(1.f/l_r1):0;
         } else {
@@ -346,6 +364,7 @@ extern "C" __global__ void KERNEL_NAME(
         __nv_bfloat16* ob = O + q_head*head_dim;
         #pragma unroll
         for(int nt=0;nt<N_TILES_PER_WARP_512;nt++){
+            if ((unsigned int)nt >= pv_n_tiles) continue;
             unsigned int c0 = (pv_n_start+nt)*8 + tid_in_group*2;
             unsigned int gr0 = q_start+r0, gr1 = q_start+r1;
             if(gr0<q_len && r0<q_tile_len && c0<head_dim){

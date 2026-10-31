@@ -1064,10 +1064,11 @@ pub struct ServeArgs {
     pub video_fps: f32,
 
     /// Hard cap on frames taken from one video, before temporal grouping.
-    /// Matches the checkpoints' `max_frames`. At the default 2 fps this is
-    /// just over six minutes of clip.
-    #[arg(long, default_value_t = 768)]
-    pub video_max_frames: usize,
+    /// Defaults to the checkpoint processor's own cap: 2048 for GLM-5.3
+    /// (`max_frame_count_dynamic`, about 17 minutes at its 2 fps), 768 for
+    /// the Qwen-VL families (`max_frames`, just over six minutes).
+    #[arg(long)]
+    pub video_max_frames: Option<usize>,
 
     /// Qwen video pixel volume across all sampled frames, overriding the
     /// checkpoint's video processor bound. 469762048 is the reference

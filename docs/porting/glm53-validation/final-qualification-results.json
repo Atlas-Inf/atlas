@@ -1,0 +1,961 @@
+{
+  "schema_version": 1,
+  "status": "PASS_ALL_10_CANONICAL_GATES",
+  "measured_source_revision": "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e",
+  "measured_source_tree": "4027d7a9cde20bf7bc68c05d58f0ecfb0e58b1b5",
+  "checked_submission_revision": "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e",
+  "recorded_utc": "2026-10-15T21:10:29.123053+00:00",
+  "scope": "Fresh ten canonical Qwen regression gates on two independent Sparks; not paired GLM capacity or HIP numerical tests.",
+  "canonical_checker": {
+    "status": "PASS",
+    "required_gates": 10,
+    "passed_gates": 10,
+    "submission_revision": "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e",
+    "checker_build_revision": "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e",
+    "source_equality": [
+      {
+        "path": "crates/atlas-plugin/src/gate",
+        "git_object": "e749112a2c372a88f205553e6d88d71c1aede739",
+        "identical_at": [
+          "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e"
+        ]
+      },
+      {
+        "path": "crates/atlas-plugin/src/benchmarks",
+        "git_object": "b0fac75844735b4feff32058526ebd441f3271a2",
+        "identical_at": [
+          "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e"
+        ]
+      },
+      {
+        "path": "crates/spark-server/src/cli",
+        "git_object": "6ecf56a57405c4eda64cefbfe864489e9dc67519",
+        "identical_at": [
+          "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e"
+        ]
+      },
+      {
+        "path": "Cargo.toml",
+        "git_object": "17171ba4d0b4c9791d4ecffff02eedd1bee80e2e",
+        "identical_at": [
+          "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e"
+        ]
+      },
+      {
+        "path": "Cargo.lock",
+        "git_object": "4a800a8217f7136a88bfffd85b00cf7d1d1ab339",
+        "identical_at": [
+          "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e"
+        ]
+      },
+      {
+        "path": "rust-toolchain.toml",
+        "git_object": "ab5473da5409811f7901b700c153208faeb010b9",
+        "identical_at": [
+          "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e"
+        ]
+      },
+      {
+        "path": "vendor",
+        "git_object": "eaf9f24ff999ac58ff30f55cf80a53c4e85e03be",
+        "identical_at": [
+          "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e"
+        ]
+      }
+    ],
+    "other_source_differences": [],
+    "explicit_test_only_differences": [],
+    "command": [
+      "spark",
+      "benchmark",
+      "--pull-request-gate-check"
+    ],
+    "actual_container_argv": [
+      "docker",
+      "run",
+      "--rm",
+      "--network=none",
+      "--memory=4g",
+      "--memory-swap=4g",
+      "--cpus=2",
+      "--mount",
+      "type=bind,src=/home/abc/storage/models,dst=/home/abc/storage/models,readonly",
+      "--mount",
+      "type=bind,src=/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/final-release-cpu-cb45065c/final-release/checker,dst=/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/final-release-cpu-cb45065c/final-release/checker,readonly",
+      "-e",
+      "GIT_CONFIG_COUNT=1",
+      "-e",
+      "GIT_CONFIG_KEY_0=safe.directory",
+      "-e",
+      "GIT_CONFIG_VALUE_0=/home/abc/storage/models/atlas-glm53-release-no-mtp",
+      "-w",
+      "/home/abc/storage/models/atlas-glm53-release-no-mtp",
+      "--entrypoint",
+      "bash",
+      "sha256:29308ac79421ff80d69ead9d1d8993a67c8a0966a8e9d182f12f55d59fde7cc7",
+      "-c",
+      "mkdir -p /tmp/atlas-checker-driver; ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/atlas-checker-driver/libcuda.so.1; export LD_LIBRARY_PATH=/tmp/atlas-checker-driver:/usr/local/cuda/lib64/stubs:/usr/local/cuda/lib64; exec \"$1\" benchmark --pull-request-gate-check",
+      "atlas-gate-check",
+      "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/final-release-cpu-cb45065c/final-release/checker/spark"
+    ],
+    "binary_sha256": "563419011e1313f77f141b1fdd299ffed77d6283a960bf07d0266e150b98609e",
+    "build_receipt_sha256": "d42c393debcc1f4c3cb8f874cc8b97a21f5ae5201b5f3efb4b28646d027dd3b4",
+    "returncode": 0,
+    "stdout": "gate check for cb45065cb4 (/home/abc/storage/models/atlas-glm53-release-no-mtp)\n  PASS  agentic-webserver\n  PASS  vision-fidelity\n  PASS  video-fidelity\n  PASS  ttft-warm-gate\n  PASS  ttft-cold-gate\n  PASS  bfcl-subset\n  PASS  bfcl-subset-echolp\n  PASS  ssm-state-poisoning-gate\n  PASS  decode-floor\n  PASS  concurrency-sweep\n\nintent: not evaluated (no --pr)\nall 10 required gates pass\n",
+    "log_sha256": "1747fb70fe7e1f0b9972d85491f136d2fe4f393b53423ff04c5e26ee97901c5a",
+    "pr_intent_evaluated": false,
+    "execution_note": "Current gate/CLI implementation, proven against selected native build. CPU-only record validation without GPU access; no inference qualification."
+  },
+  "build": {
+    "revision": "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e",
+    "bundle_sha256": "edf02b8ebbaea7c7cee90c083d089f7feb53747eebaaae90db1a1867191afdad",
+    "builder_image": "sha256:0bdd5f775c98320c899e5df62e91a16bdf823df489cd723eadc757713fb625d8",
+    "build_returncode": 0,
+    "architecture": "aarch64 CUDA13 sm_121f",
+    "binary_build": "fresh CUDA-only wildcard release; no CUTLASS_HOME/NCCL",
+    "binary_sha256": "cfd3cf555b7dae86f5e52430e623190688986a73b7b3059a2f0768cc8f4d0b8d",
+    "binary_bytes": 115819448,
+    "targets_verified": [
+      "qwen3.6-35b-a3b",
+      "qwen3.6-27b",
+      "qwen3.8-27b"
+    ]
+  },
+  "model_revisions": {
+    "Qwen/Qwen3.6-35B-A3B-FP8": "61a5771f218894aaacf97551e24a25b866750fc2",
+    "unsloth/Qwen3.6-27B-NVFP4": "ccdaab7e68af2409599b8949a8f2685703c9bae5",
+    "nvidia/Qwen3.8-27B-NVFP4": "482ca0f3832238542f8f5295dde86b5f22711d80"
+  },
+  "recipe_pin": "869808b52e8ca6f4cb2fc622cebcef5a240c1c84",
+  "recipe_sha256": {
+    "qwen3.6/qwen3.6-35b-a3b-fp8-bf16head": "9d41b0d7b78bb37d7e656cd27ef7475964818c5cbe592b626632ab3f6ccf4741",
+    "qwen3.6/qwen3.6-27b-nvfp4-unsloth": "8e0b2954380a43e6f8f4a378537c019df7e2d0476f02d099c6fa7d50b09cf34d",
+    "qwen3.8/qwen3.8-27b-nvfp4-bfcl": "ca1556878ebec748cf5c1ae7c38866c261d5016333e0af0a8a11f1e0a82ae5ac",
+    "qwen3.8/qwen3.8-27b-nvfp4-agentic": "3770f163405e5b3d2c11ae840696627a8775d942b0cbe0817a44dc0fa70ae522"
+  },
+  "scorer_versions": {
+    "bfcl-eval": "2026.3.23",
+    "soundfile": "0.13.1"
+  },
+  "ttft_baseline": {
+    "baseline_revision": "7ffd183f210708d5b1afba1e046049f14ad498c7",
+    "binary_sha256": "1d61b9555a1105f373bdcfd18295febf224749c7e38bbfbeebb26052bc074f75",
+    "model_revision": "61a5771f218894aaacf97551e24a25b866750fc2",
+    "recipe_pin": "869808b52e8ca6f4cb2fc622cebcef5a240c1c84",
+    "recipe_index_sha256": "dd90cdd0207ba3fa2834e3ca89b849e776b1522a99e14be3d926f2b432f2de7c",
+    "hostname": "gx10-4386",
+    "campaign": "/home/mangokid/atlas-glm53-dev/audit/qualification-ttft-base/comparison-home/runs/20261013T003704-eaf03b3b",
+    "baselines": [
+      {
+        "gate": "ttft-warm-gate",
+        "file": "frozen-base/ttft-warm-gate/baseline-qwen-qwen3.6-35b-a3b-fp8.json",
+        "sha256": "59ccf1e1dcc5ae5523aef0b3db402a47c68d7a57851ad3cf73621f306ea331cd",
+        "original_baseline": {
+          "recorded_at": 1791851937,
+          "target": "http://127.0.0.1:42205",
+          "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+          "metrics": {
+            "median_ms": 806.767838,
+            "p90_ms": 1948.930511,
+            "samples": 36.0
+          }
+        },
+        "record_verdicts": [
+          "info"
+        ]
+      },
+      {
+        "gate": "ttft-cold-gate",
+        "file": "frozen-base/ttft-cold-gate/baseline-qwen-qwen3.6-35b-a3b-fp8.json",
+        "sha256": "d9b8ad41115cc502987005d4a4eb90e53c76951a28f181ddf9cdd425c1f753d5",
+        "original_baseline": {
+          "recorded_at": 1791852008,
+          "target": "http://127.0.0.1:46219",
+          "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+          "metrics": {
+            "median_ms": 889.003474,
+            "p90_ms": 1961.4665040000002,
+            "samples": 36.0
+          }
+        },
+        "record_verdicts": [
+          "info"
+        ]
+      }
+    ],
+    "meaning": "Measured Atlas base, INFO because initial box baseline absent. No formal PASS claimed. Candidate may compare against these immutable bytes; never substitute a candidate measurement."
+  },
+  "campaign": {
+    "started_utc": "2026-10-15T16:37:17.530669+00:00",
+    "completed_utc": "2026-10-15T21:02:22.269060+00:00",
+    "elapsed_seconds": 15904.738,
+    "sampled_min_mem_available_kib": 20317476,
+    "sampled_max_swap_used_kib": 0,
+    "guard_trips": 0,
+    "memory_guard_floor_kib": 8388608,
+    "maximum_new_swap_kib": 262144
+  },
+  "gates": [
+    {
+      "id": "agentic-webserver",
+      "status": "PASS",
+      "checkpoint": "Qwen/Qwen3.6-35B-A3B-FP8",
+      "host_role": "head",
+      "metrics": {
+        "decode_tps": 36.037585437411074,
+        "followed_directions": 10.0,
+        "iterations": 10.0,
+        "s_per_turn": 5.899694323979865,
+        "step:curled": 10.0,
+        "step:ran_server": 10.0,
+        "step:ran_tests": 10.0,
+        "step:tore_down": 10.0,
+        "step:wrote_project": 10.0,
+        "step:wrote_tests": 10.0,
+        "sum_agent_wall_s": 879.0544542729999,
+        "sum_completion_tokens": 31679.0,
+        "sum_tool_calls": 139.0,
+        "sum_turns": 149.0,
+        "sum_wall_s": 887.1469012550001,
+        "webserver_ok": 10.0
+      },
+      "thresholds": {
+        "followed_directions": {
+          "min": 10.0
+        },
+        "iterations": {
+          "min": 10.0,
+          "max": 10.0
+        },
+        "sum_wall_s": {
+          "max": 1800.0
+        },
+        "sum_turns": {
+          "max": 250.0
+        },
+        "s_per_turn": {
+          "max": 8.5
+        },
+        "webserver_ok": {
+          "min": 10.0
+        }
+      },
+      "canonical_argv": [
+        "$GATE_SPARK",
+        "benchmark",
+        "run",
+        "agentic-webserver",
+        "--hardware",
+        "gb10",
+        "--pull-request-gate",
+        "--checkpoint",
+        "Qwen/Qwen3.6-35B-A3B-FP8",
+        "--yes",
+        "--serve-override",
+        "gpu_memory_utilization=0.80"
+      ],
+      "record_path": ".benchmarks/agentic-webserver/2026-10-15-cb45065cb4.json",
+      "record_sha256": "4e8e175dfd39921c6a1ba4f48ed138aaf5090d88d88ad5d965672792b2577d7b",
+      "recorded_git_sha": "cb45065cb4",
+      "started_utc": "2026-10-15T16:41:56.327812+00:00",
+      "completed_utc": "2026-10-15T16:57:09.496516+00:00",
+      "wall_seconds": 913.169,
+      "memory": {
+        "guard_tripped": false,
+        "sample_count": 912,
+        "min_available_kib": 20317476,
+        "max_swap_used_kib": 0
+      },
+      "hardware_postcheck": {
+        "validity": "valid",
+        "concerns": [
+          "hottest chassis zone moved +13 \u00b0C"
+        ]
+      }
+    },
+    {
+      "id": "bfcl-subset",
+      "status": "PASS",
+      "checkpoint": "nvidia/Qwen3.8-27B-NVFP4",
+      "host_role": "worker",
+      "metrics": {
+        "normalized_single_turn_score": 88.68,
+        "overall_accuracy": 88.14,
+        "samples": 995.0
+      },
+      "thresholds": {
+        "samples": {
+          "min": 995.0,
+          "max": 995.0
+        },
+        "overall_accuracy": {
+          "min": 83.82,
+          "noise": 0.4
+        },
+        "normalized_single_turn_score": {
+          "min": 83.72,
+          "noise": 0.4
+        }
+      },
+      "canonical_argv": [
+        "$GATE_SPARK",
+        "benchmark",
+        "run",
+        "bfcl-subset",
+        "--hardware",
+        "gb10",
+        "--pull-request-gate",
+        "--checkpoint",
+        "nvidia/Qwen3.8-27B-NVFP4"
+      ],
+      "record_path": ".benchmarks/bfcl-subset/2026-10-15-cb45065cb4.json",
+      "record_sha256": "144d8c8eb7074c979d6b5496d764d4eaafe06e2ada37c793dd4cf917b096b672",
+      "recorded_git_sha": "cb45065cb4",
+      "started_utc": "2026-10-15T16:44:16.055374+00:00",
+      "completed_utc": "2026-10-15T21:02:22.269060+00:00",
+      "wall_seconds": 15486.214,
+      "memory": {
+        "guard_tripped": false,
+        "sample_count": 15473,
+        "min_available_kib": 34975472,
+        "max_swap_used_kib": 0
+      },
+      "hardware_postcheck": {
+        "validity": "not-applicable",
+        "concerns": [
+          "thermally throttled for 0.00% of the run",
+          "hottest chassis zone moved +6 \u00b0C"
+        ]
+      }
+    },
+    {
+      "id": "bfcl-subset-echolp",
+      "status": "PASS",
+      "checkpoint": "Qwen/Qwen3.6-35B-A3B-FP8",
+      "host_role": "head",
+      "metrics": {
+        "normalized_single_turn_score": 87.1,
+        "overall_accuracy": 87.65,
+        "samples": 1004.0
+      },
+      "thresholds": {
+        "normalized_single_turn_score": {
+          "min": 86.9,
+          "noise": 0.4
+        },
+        "overall_accuracy": {
+          "min": 86.5,
+          "noise": 0.4
+        },
+        "samples": {
+          "min": 1004,
+          "max": 1004
+        }
+      },
+      "canonical_argv": [
+        "$GATE_SPARK",
+        "benchmark",
+        "run",
+        "bfcl-subset-echolp",
+        "--hardware",
+        "gb10",
+        "--pull-request-gate",
+        "--checkpoint",
+        "Qwen/Qwen3.6-35B-A3B-FP8",
+        "--serve-override",
+        "gpu_memory_utilization=0.80"
+      ],
+      "record_path": ".benchmarks/bfcl-subset-echolp/2026-10-15-cb45065cb4.json",
+      "record_sha256": "01d3417ad9f820eafc52f094eeb9a54659f0cf77cd4df24f014808a80b0bde86",
+      "recorded_git_sha": "cb45065cb4",
+      "started_utc": "2026-10-15T16:57:12.333764+00:00",
+      "completed_utc": "2026-10-15T19:38:38.533253+00:00",
+      "wall_seconds": 9686.199,
+      "memory": {
+        "guard_tripped": false,
+        "sample_count": 9680,
+        "min_available_kib": 20770900,
+        "max_swap_used_kib": 0
+      },
+      "hardware_postcheck": {
+        "validity": "not-applicable",
+        "concerns": [
+          "hottest chassis zone moved +2 \u00b0C"
+        ]
+      }
+    },
+    {
+      "id": "concurrency-sweep",
+      "status": "PASS",
+      "checkpoint": "nvidia/Qwen3.8-27B-NVFP4",
+      "host_role": "worker",
+      "metrics": {
+        "c16_aggregate_tok_s": 78.5036083862604,
+        "c16_ttft_p50_ms": 9505.378411,
+        "c1_aggregate_tok_s": 24.534716044912628,
+        "c1_ttft_p50_ms": 1225.456157,
+        "c4_aggregate_tok_s": 41.26442656662683,
+        "c4_ttft_p50_ms": 2956.2722519999998,
+        "c8_aggregate_tok_s": 59.407111667776704,
+        "c8_ttft_p50_ms": 3278.58764,
+        "min_completion_tokens": 320.0,
+        "peak_aggregate_tok_s": 78.5036083862604,
+        "vacuous_cells": 0.0
+      },
+      "thresholds": {
+        "c1_aggregate_tok_s": {
+          "min": 17.0,
+          "noise": 0.8
+        },
+        "c4_aggregate_tok_s": {
+          "min": 35.0,
+          "noise": 1.5
+        },
+        "c8_aggregate_tok_s": {
+          "min": 52.0,
+          "noise": 1.5
+        },
+        "c16_aggregate_tok_s": {
+          "min": 73.5,
+          "noise": 1.5
+        },
+        "peak_aggregate_tok_s": {
+          "min": 73.5,
+          "noise": 1.5
+        },
+        "min_completion_tokens": {
+          "min": 280.0
+        },
+        "vacuous_cells": {
+          "max": 0.0
+        }
+      },
+      "canonical_argv": [
+        "$GATE_SPARK",
+        "benchmark",
+        "run",
+        "concurrency-sweep",
+        "--hardware",
+        "gb10",
+        "--pull-request-gate",
+        "--checkpoint",
+        "nvidia/Qwen3.8-27B-NVFP4",
+        "--serve-override",
+        "gpu_memory_utilization=0.80"
+      ],
+      "record_path": ".benchmarks/concurrency-sweep/2026-10-15-cb45065cb4.json",
+      "record_sha256": "6efbaf8a9af91b1ed207372fa8b920a1edd193bd20f38702225a14610e53585e",
+      "recorded_git_sha": "cb45065cb4",
+      "started_utc": "2026-10-15T16:40:19.657047+00:00",
+      "completed_utc": "2026-10-15T16:44:10.539101+00:00",
+      "wall_seconds": 230.882,
+      "memory": {
+        "guard_tripped": false,
+        "sample_count": 230,
+        "min_available_kib": 21577488,
+        "max_swap_used_kib": 0
+      },
+      "hardware_postcheck": {
+        "validity": "valid",
+        "concerns": [
+          "hottest chassis zone moved +12 \u00b0C"
+        ]
+      }
+    },
+    {
+      "id": "decode-floor",
+      "status": "PASS",
+      "checkpoint": "nvidia/Qwen3.8-27B-NVFP4",
+      "host_role": "worker",
+      "metrics": {
+        "accept_len_mean": 2.934884532284362,
+        "output_tokens": 803.0,
+        "runs": 3.0,
+        "server_decode_tok_s": 27.975430790003426
+      },
+      "thresholds": {
+        "server_decode_tok_s": {
+          "min": 21.0,
+          "noise": 0.5
+        },
+        "output_tokens": {
+          "min": 700.0
+        },
+        "runs": {
+          "min": 3.0,
+          "max": 3.0
+        }
+      },
+      "canonical_argv": [
+        "$GATE_SPARK",
+        "benchmark",
+        "run",
+        "decode-floor",
+        "--hardware",
+        "gb10",
+        "--pull-request-gate",
+        "--checkpoint",
+        "nvidia/Qwen3.8-27B-NVFP4",
+        "--serve-override",
+        "gpu_memory_utilization=0.80"
+      ],
+      "record_path": ".benchmarks/decode-floor/2026-10-15-cb45065cb4.json",
+      "record_sha256": "32a180eba42adfe2f74f17ae911c2a89cfd7c53e9e4027370817f6b6d177e02b",
+      "recorded_git_sha": "cb45065cb4",
+      "started_utc": "2026-10-15T16:37:58.479881+00:00",
+      "completed_utc": "2026-10-15T16:40:19.633782+00:00",
+      "wall_seconds": 141.154,
+      "memory": {
+        "guard_tripped": false,
+        "sample_count": 140,
+        "min_available_kib": 22066660,
+        "max_swap_used_kib": 0
+      },
+      "hardware_postcheck": {
+        "validity": "valid",
+        "concerns": [
+          "hottest chassis zone moved +33 \u00b0C"
+        ]
+      }
+    },
+    {
+      "id": "ssm-state-poisoning-gate",
+      "status": "PASS",
+      "checkpoint": "Qwen/Qwen3.6-35B-A3B-FP8",
+      "host_role": "head",
+      "metrics": {
+        "collapsed": 0.0,
+        "invariant": 2.0,
+        "jittered": 10.0,
+        "min_cached_prompt_tokens": 1024.0,
+        "rounds": 12.0,
+        "sum_wall_s": 54.68862704,
+        "unmeasured": 0.0
+      },
+      "thresholds": {
+        "rounds": {
+          "min": 12.0,
+          "max": 12.0
+        },
+        "collapsed": {
+          "max": 0.0
+        },
+        "unmeasured": {
+          "max": 0.0
+        },
+        "min_cached_prompt_tokens": {
+          "min": 1.0
+        },
+        "sum_wall_s": {
+          "max": 1200.0
+        }
+      },
+      "canonical_argv": [
+        "$GATE_SPARK",
+        "benchmark",
+        "run",
+        "ssm-state-poisoning-gate",
+        "--hardware",
+        "gb10",
+        "--pull-request-gate",
+        "--checkpoint",
+        "Qwen/Qwen3.6-35B-A3B-FP8",
+        "--serve-override",
+        "gpu_memory_utilization=0.80"
+      ],
+      "record_path": ".benchmarks/ssm-state-poisoning-gate/2026-10-15-cb45065cb4.json",
+      "record_sha256": "61bbcecd2cb3f568152d9361eedc0061d9ce7e843a02721e09270426827ab260",
+      "recorded_git_sha": "cb45065cb4",
+      "started_utc": "2026-10-15T16:40:36.785824+00:00",
+      "completed_utc": "2026-10-15T16:41:56.298123+00:00",
+      "wall_seconds": 79.512,
+      "memory": {
+        "guard_tripped": false,
+        "sample_count": 79,
+        "min_available_kib": 21008568,
+        "max_swap_used_kib": 0
+      },
+      "hardware_postcheck": {
+        "validity": "not-applicable",
+        "concerns": [
+          "hottest chassis zone moved +12 \u00b0C"
+        ]
+      }
+    },
+    {
+      "id": "ttft-cold-gate",
+      "status": "PASS",
+      "checkpoint": "Qwen/Qwen3.6-35B-A3B-FP8",
+      "host_role": "head",
+      "metrics": {
+        "median_ms": 881.1804450000001,
+        "p90_ms": 1943.517699,
+        "samples": 36.0
+      },
+      "thresholds": {
+        "median_ms": {
+          "max": 1623.59
+        },
+        "p90_ms": {
+          "max": 4482.03
+        }
+      },
+      "canonical_argv": [
+        "$GATE_SPARK",
+        "benchmark",
+        "run",
+        "ttft-cold-gate",
+        "--hardware",
+        "gb10",
+        "--pull-request-gate",
+        "--checkpoint",
+        "Qwen/Qwen3.6-35B-A3B-FP8",
+        "--serve-override",
+        "gpu_memory_utilization=0.80"
+      ],
+      "record_path": ".benchmarks/ttft-cold-gate/2026-10-15-cb45065cb4.json",
+      "record_sha256": "9e4311321867645de215cde98425b337ba8593a739d684ae45f610891d42e089",
+      "recorded_git_sha": "cb45065cb4",
+      "started_utc": "2026-10-15T16:38:13.085998+00:00",
+      "completed_utc": "2026-10-15T16:39:24.566833+00:00",
+      "wall_seconds": 71.481,
+      "memory": {
+        "guard_tripped": false,
+        "sample_count": 71,
+        "min_available_kib": 20741544,
+        "max_swap_used_kib": 0
+      },
+      "hardware_postcheck": {
+        "validity": "valid",
+        "concerns": [
+          "hottest chassis zone moved +21 \u00b0C"
+        ]
+      }
+    },
+    {
+      "id": "ttft-warm-gate",
+      "status": "PASS",
+      "checkpoint": "Qwen/Qwen3.6-35B-A3B-FP8",
+      "host_role": "head",
+      "metrics": {
+        "median_ms": 190.982714,
+        "p90_ms": 209.977301,
+        "samples": 36.0
+      },
+      "thresholds": {
+        "median_ms": {
+          "max": 1559.32
+        },
+        "p90_ms": {
+          "max": 4507.44
+        }
+      },
+      "canonical_argv": [
+        "$GATE_SPARK",
+        "benchmark",
+        "run",
+        "ttft-warm-gate",
+        "--hardware",
+        "gb10",
+        "--pull-request-gate",
+        "--checkpoint",
+        "Qwen/Qwen3.6-35B-A3B-FP8",
+        "--serve-override",
+        "gpu_memory_utilization=0.80"
+      ],
+      "record_path": ".benchmarks/ttft-warm-gate/2026-10-15-cb45065cb4.json",
+      "record_sha256": "4f2844f53e89bfba872b2bbf6e70681697b9c824b76956fbe277bcca3bc41c33",
+      "recorded_git_sha": "cb45065cb4",
+      "started_utc": "2026-10-15T16:37:17.530669+00:00",
+      "completed_utc": "2026-10-15T16:38:13.059693+00:00",
+      "wall_seconds": 55.529,
+      "memory": {
+        "guard_tripped": false,
+        "sample_count": 55,
+        "min_available_kib": 21666828,
+        "max_swap_used_kib": 0
+      },
+      "hardware_postcheck": {
+        "validity": "valid",
+        "concerns": [
+          "hottest chassis zone moved +13 \u00b0C"
+        ]
+      }
+    },
+    {
+      "id": "video-fidelity",
+      "status": "PASS",
+      "checkpoint": "unsloth/Qwen3.6-27B-NVFP4",
+      "host_role": "worker",
+      "metrics": {
+        "conc_1_correct": 1.0,
+        "conc_1_wall_ms": 716.0,
+        "conc_2_correct": 2.0,
+        "conc_2_wall_ms": 1416.0,
+        "conc_4_correct": 4.0,
+        "conc_4_wall_ms": 2828.0,
+        "control_held": 1.0,
+        "legs_asserted": 13.0,
+        "legs_passed": 13.0,
+        "legs_skipped": 0.0
+      },
+      "thresholds": {
+        "legs_passed": {
+          "min": 13.0
+        },
+        "legs_skipped": {
+          "max": 0.0
+        },
+        "control_held": {
+          "min": 1.0
+        }
+      },
+      "canonical_argv": [
+        "$GATE_SPARK",
+        "benchmark",
+        "run",
+        "video-fidelity",
+        "--hardware",
+        "gb10",
+        "--pull-request-gate",
+        "--checkpoint",
+        "unsloth/Qwen3.6-27B-NVFP4",
+        "--serve-override",
+        "gpu_memory_utilization=0.80"
+      ],
+      "record_path": ".benchmarks/video-fidelity/2026-10-15-cb45065cb4.json",
+      "record_sha256": "5898ce2bff381fccf803b93aa1082278fd5144e90b1282604c9f80dbc7e593a1",
+      "recorded_git_sha": "cb45065cb4",
+      "started_utc": "2026-10-15T16:37:17.899784+00:00",
+      "completed_utc": "2026-10-15T16:37:52.296193+00:00",
+      "wall_seconds": 34.396,
+      "memory": {
+        "guard_tripped": false,
+        "sample_count": 34,
+        "min_available_kib": 22266588,
+        "max_swap_used_kib": 0
+      },
+      "hardware_postcheck": {
+        "validity": "not-applicable",
+        "concerns": [
+          "hottest chassis zone moved +15 \u00b0C"
+        ]
+      }
+    },
+    {
+      "id": "vision-fidelity",
+      "status": "PASS",
+      "checkpoint": "Qwen/Qwen3.6-35B-A3B-FP8",
+      "host_role": "head",
+      "metrics": {
+        "conc_1_wall_ms": 348.0,
+        "conc_2_wall_ms": 682.0,
+        "conc_4_wall_ms": 1372.0,
+        "concurrency_levels_clean": 3.0,
+        "control_held": 1.0,
+        "geometry_asserted": 14.0,
+        "geometry_cells": 14.0,
+        "geometry_matched": 14.0,
+        "integrity_measured": 10.0,
+        "integrity_passed": 10.0,
+        "probes_passed": 3.0,
+        "probes_total": 3.0
+      },
+      "thresholds": {
+        "geometry_matched": {
+          "min": 14.0
+        },
+        "geometry_asserted": {
+          "min": 14.0
+        },
+        "integrity_passed": {
+          "min": 10.0
+        },
+        "integrity_measured": {
+          "min": 10.0
+        },
+        "probes_passed": {
+          "min": 3.0
+        },
+        "control_held": {
+          "min": 1.0
+        }
+      },
+      "canonical_argv": [
+        "$GATE_SPARK",
+        "benchmark",
+        "run",
+        "vision-fidelity",
+        "--hardware",
+        "gb10",
+        "--pull-request-gate",
+        "--checkpoint",
+        "Qwen/Qwen3.6-35B-A3B-FP8",
+        "--serve-override",
+        "gpu_memory_utilization=0.80"
+      ],
+      "record_path": ".benchmarks/vision-fidelity/2026-10-15-cb45065cb4.json",
+      "record_sha256": "9a015d87deb0a18e3276b9170ed2be0ed77bd62f757b613b8f31b43a6e4d2b69",
+      "recorded_git_sha": "cb45065cb4",
+      "started_utc": "2026-10-15T16:39:29.813477+00:00",
+      "completed_utc": "2026-10-15T16:40:36.761955+00:00",
+      "wall_seconds": 66.948,
+      "memory": {
+        "guard_tripped": false,
+        "sample_count": 66,
+        "min_available_kib": 20650900,
+        "max_swap_used_kib": 0
+      },
+      "hardware_postcheck": {
+        "validity": "not-applicable",
+        "concerns": [
+          "hottest chassis zone moved +14 \u00b0C"
+        ]
+      }
+    }
+  ],
+  "restoration": {
+    "status": "RESTORED_VERIFIED",
+    "completed_utc": "2026-10-15T21:05:56.220249+00:00",
+    "original_services": {
+      "worker": "atlas-glm53-native-rank1.service",
+      "head": "atlas-sparkglm.service"
+    },
+    "model_id": "glm-5.3-flash",
+    "synthetic_answer": "391",
+    "synthetic_passed": true,
+    "scope": "Original model service restored; no deployment claim for qualification binary.",
+    "supervisor_result_sha256": "df129596f67931129520e02c0e13e12fa78c7100110355f744463dbe5df8b767"
+  },
+  "collection_manifest": {
+    "campaign_revision": "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e",
+    "checked_submission_revision": "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e",
+    "original_records_preserved": 616,
+    "inventories": [
+      {
+        "host_role": "head",
+        "inventory_sha256": "99194c4fded981710c8dfb6215d0f7a3d75f3991818d0ba5719fbc60b1f6447c",
+        "files_verified": 466,
+        "bytes_verified": 11194306,
+        "omitted": []
+      },
+      {
+        "host_role": "worker",
+        "inventory_sha256": "634cc5c3d4078aeb922c975b19e3cfc9c727b2b47f6dcea768a655a585ec8066",
+        "files_verified": 260,
+        "bytes_verified": 5894177,
+        "omitted": [
+          {
+            "path": "gates/runs/20261015T164416-ef8a9503/bfcl-subset/runner.log",
+            "bytes": 29758494,
+            "reason": "bounded receipt limit"
+          }
+        ]
+      }
+    ],
+    "records": [
+      {
+        "gate": "agentic-webserver",
+        "host_role": "head",
+        "source_receipt": "receipts/head/gates/runs/20261015T163929-5febc718/agentic-webserver/records-after/2026-10-15-cb45065cb4.json",
+        "destination": ".benchmarks/agentic-webserver/2026-10-15-cb45065cb4.json",
+        "sha256": "4e8e175dfd39921c6a1ba4f48ed138aaf5090d88d88ad5d965672792b2577d7b",
+        "bytes": 16082,
+        "result_sha256": "734cfc18b072c49b6165fd3df454455ff2f85d7ea643e526e95920f691a084c5"
+      },
+      {
+        "gate": "bfcl-subset",
+        "host_role": "worker",
+        "source_receipt": "receipts/worker/gates/runs/20261015T164416-ef8a9503/bfcl-subset/records-after/2026-10-15-cb45065cb4.json",
+        "destination": ".benchmarks/bfcl-subset/2026-10-15-cb45065cb4.json",
+        "sha256": "144d8c8eb7074c979d6b5496d764d4eaafe06e2ada37c793dd4cf917b096b672",
+        "bytes": 15375,
+        "result_sha256": "5b17e76102e1f045d8ad94004e0db69896e3e4d89138b0c41d0c602092283984"
+      },
+      {
+        "gate": "bfcl-subset-echolp",
+        "host_role": "head",
+        "source_receipt": "receipts/head/gates/runs/20261015T165712-1c60d2d6/bfcl-subset-echolp/records-after/2026-10-15-cb45065cb4.json",
+        "destination": ".benchmarks/bfcl-subset-echolp/2026-10-15-cb45065cb4.json",
+        "sha256": "01d3417ad9f820eafc52f094eeb9a54659f0cf77cd4df24f014808a80b0bde86",
+        "bytes": 15521,
+        "result_sha256": "49aeabd1a018cd8fb6c64115eb6d9e350a30cd112c778125e688f44d68a5cf44"
+      },
+      {
+        "gate": "concurrency-sweep",
+        "host_role": "worker",
+        "source_receipt": "receipts/worker/gates/runs/20261015T163758-4eb6bbd9/concurrency-sweep/records-after/2026-10-15-cb45065cb4.json",
+        "destination": ".benchmarks/concurrency-sweep/2026-10-15-cb45065cb4.json",
+        "sha256": "6efbaf8a9af91b1ed207372fa8b920a1edd193bd20f38702225a14610e53585e",
+        "bytes": 16367,
+        "result_sha256": "673037749050698e9f83803692c6edff00e0d2c9c612688170750e9d02f19677"
+      },
+      {
+        "gate": "decode-floor",
+        "host_role": "worker",
+        "source_receipt": "receipts/worker/gates/runs/20261015T163758-4eb6bbd9/decode-floor/records-after/2026-10-15-cb45065cb4.json",
+        "destination": ".benchmarks/decode-floor/2026-10-15-cb45065cb4.json",
+        "sha256": "32a180eba42adfe2f74f17ae911c2a89cfd7c53e9e4027370817f6b6d177e02b",
+        "bytes": 14914,
+        "result_sha256": "124ed423f26aca34fe210f003ecab7e9618f62f6f89fe02e8c6c90e4b88a9d1b"
+      },
+      {
+        "gate": "ssm-state-poisoning-gate",
+        "host_role": "head",
+        "source_receipt": "receipts/head/gates/runs/20261015T163929-5febc718/ssm-state-poisoning-gate/records-after/2026-10-15-cb45065cb4.json",
+        "destination": ".benchmarks/ssm-state-poisoning-gate/2026-10-15-cb45065cb4.json",
+        "sha256": "61bbcecd2cb3f568152d9361eedc0061d9ce7e843a02721e09270426827ab260",
+        "bytes": 15363,
+        "result_sha256": "14c59129f5d0f5f7ddd6d952462f086bdd7bc4b17a4acfa3e0fa8ef152673c85"
+      },
+      {
+        "gate": "ttft-cold-gate",
+        "host_role": "head",
+        "source_receipt": "receipts/head/gates/runs/20261015T163717-ce0f3259/ttft-cold-gate/records-after/2026-10-15-cb45065cb4.json",
+        "destination": ".benchmarks/ttft-cold-gate/2026-10-15-cb45065cb4.json",
+        "sha256": "9e4311321867645de215cde98425b337ba8593a739d684ae45f610891d42e089",
+        "bytes": 15066,
+        "result_sha256": "d886eb2cbe82d0ea026de0531e5e70f599b1b8b7ed99e2b7196c2249e89e9acb"
+      },
+      {
+        "gate": "ttft-warm-gate",
+        "host_role": "head",
+        "source_receipt": "receipts/head/gates/runs/20261015T163717-ce0f3259/ttft-warm-gate/records-after/2026-10-15-cb45065cb4.json",
+        "destination": ".benchmarks/ttft-warm-gate/2026-10-15-cb45065cb4.json",
+        "sha256": "4f2844f53e89bfba872b2bbf6e70681697b9c824b76956fbe277bcca3bc41c33",
+        "bytes": 15062,
+        "result_sha256": "18abee5eba48c2b40bac178f50932cfe4b5ebb127b52d25cbdb6ad188c341210"
+      },
+      {
+        "gate": "video-fidelity",
+        "host_role": "worker",
+        "source_receipt": "receipts/worker/gates/runs/20261015T163717-537dd8a0/video-fidelity/records-after/2026-10-15-cb45065cb4.json",
+        "destination": ".benchmarks/video-fidelity/2026-10-15-cb45065cb4.json",
+        "sha256": "5898ce2bff381fccf803b93aa1082278fd5144e90b1282604c9f80dbc7e593a1",
+        "bytes": 15087,
+        "result_sha256": "9dd3dee4ff5b26e309908110ec2bf0f6a49fba9f31094e0ce08afb3224ed251c"
+      },
+      {
+        "gate": "vision-fidelity",
+        "host_role": "head",
+        "source_receipt": "receipts/head/gates/runs/20261015T163929-5febc718/vision-fidelity/records-after/2026-10-15-cb45065cb4.json",
+        "destination": ".benchmarks/vision-fidelity/2026-10-15-cb45065cb4.json",
+        "sha256": "9a015d87deb0a18e3276b9170ed2be0ed77bd62f757b613b8f31b43a6e4d2b69",
+        "bytes": 15275,
+        "result_sha256": "43a23e91b15b69e5f9bdf649196da2e31e770533ed0d01991e7a0bc1ed2fd061"
+      }
+    ]
+  },
+  "source_availability": {
+    "measured_is_ancestor_of_checked_tip": true,
+    "performance_inputs_equal": true,
+    "extra_historical_qualification_ref_required": false
+  },
+  "limitations": [
+    "PR intent not evaluated: no --pr argument or published PR.",
+    "Intermediate submission branches are not automatically qualified by full-stack records.",
+    "Explicit allocation overrides are preserved in canonical argv, not described as untouched default recipes.",
+    "Collector omissions are listed in collection_manifest.inventories; oversized logs do not indicate benchmark failure.",
+    "HIP numeric execution and paired GLM large-context/needle/failure tests are outside this campaign."
+  ]
+}

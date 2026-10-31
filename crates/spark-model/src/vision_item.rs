@@ -38,7 +38,6 @@ pub struct VisionItem {
 }
 
 impl VisionItem {
-    /// A still image: one temporal group.
     /// Ride an in-flight-rows permit (vision_admit; Enntity/atlas b060f987).
     pub fn holding(
         mut self,
@@ -48,6 +47,7 @@ impl VisionItem {
         self
     }
 
+    /// A still image: one temporal group.
     pub fn image(pixels: Vec<f32>, grid_h: usize, grid_w: usize) -> Self {
         Self::video(vec![pixels], grid_h, grid_w)
     }

@@ -419,6 +419,8 @@ pub fn start_chunked_prefill(
         return Ok(StartPrefillResult::InProgress(p));
     }
 
+    let image_pixels = image_pixels;
+    let has_images = !image_pixels.is_empty();
     // Guard: free SSM slot on any error after allocation.
     let prefill_result = (|| -> Result<DevicePtr> {
         // Vision: encode images and store embeddings for chunk 0 token overwrite.
@@ -489,7 +491,7 @@ pub fn start_chunked_prefill(
             tracing::info!(
                 "VIT_TIMING prefill_chunk {} tok (img={}): {:.1}ms",
                 chunk_len,
-                vision_slice.is_some() || !image_pixels.is_empty(),
+                vision_slice.is_some() || has_images,
                 _pt0.elapsed().as_secs_f64() * 1000.0
             );
         }

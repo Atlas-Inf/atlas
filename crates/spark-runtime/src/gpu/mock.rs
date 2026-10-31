@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Mock GPU backend for unit tests (no GPU required).
 
+mod allocation_failure;
+
 use super::*;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -45,6 +47,7 @@ pub struct MockGpuBackend {
     host_pinned_allocs: AtomicUsize,
     /// Pending `free` failure injections (see [`Self::fail_next_free`]).
     pending_free_failures: AtomicUsize,
+    alloc_failure_countdown: Mutex<Option<usize>>,
     /// `free` calls on a pointer that is not the base of a live allocation
     /// (see [`Self::invalid_free_count`]).
     invalid_frees: AtomicUsize,
@@ -89,6 +92,7 @@ impl MockGpuBackend {
             memsets: AtomicUsize::new(0),
             host_pinned_allocs: AtomicUsize::new(0),
             pending_free_failures: AtomicUsize::new(0),
+            alloc_failure_countdown: Mutex::new(None),
             invalid_frees: AtomicUsize::new(0),
             destroyed_graphs: AtomicUsize::new(0),
             live_streams: AtomicUsize::new(0),

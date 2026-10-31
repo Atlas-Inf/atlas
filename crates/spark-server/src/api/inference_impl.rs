@@ -387,6 +387,10 @@ impl InferenceRequest {
     /// disabled for this request (set when tools are active and the
     /// env gate is on).
     pub fn disable_mtp(&self) -> bool {
+        // GLM Strict decodes every request on the canonical one-row target.
+        if spark_model::weight_loader::glm5_mode::strict_serial() {
+            return true;
+        }
         match self {
             InferenceRequest::Blocking { disable_mtp, .. } => *disable_mtp,
             InferenceRequest::Streaming { disable_mtp, .. } => *disable_mtp,

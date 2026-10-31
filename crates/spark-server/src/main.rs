@@ -82,11 +82,21 @@ pub(crate) use crate::main_modules::AppState;
 /// Re-export for convenience in api.rs / anthropic.rs.
 pub type ModelBehavior = atlas_kernels::ModelBehavior;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    if let Command::DisplayCarveout(args) = cli.command {
+        tracing_subscriber::fmt().with_env_filter("info").init();
+        return display_carveout::run(args);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(cli))
+}
+
+async fn run(cli: Cli) -> Result<()> {
     // Parse BEFORE subscriber install so the TUI gate can see `--no-tui`.
     // clap emits no tracing events, so plain-mode output is unchanged.
-    let cli = Cli::parse();
     let no_tui = match &cli.command {
         // `--check-kernels` is a script's entry point too: it prints a report
         // and a JSON line on stdout and exits, so a dashboard would take the

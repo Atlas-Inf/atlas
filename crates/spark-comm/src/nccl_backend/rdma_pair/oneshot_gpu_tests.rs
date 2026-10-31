@@ -67,17 +67,21 @@ fn new_stream() -> u64 {
     stream
 }
 
+/// Kernel `name` of `file` in `ATLAS_ONESHOT_CUBIN_DIR` (the context is
+/// current).
+fn load(file: &str, name: &str) -> u64 {
+    let dir = std::env::var("ATLAS_ONESHOT_CUBIN_DIR").unwrap();
+    let path = std::ffi::CString::new(format!("{dir}/{file}")).unwrap();
+    let name = std::ffi::CString::new(name).unwrap();
+    let (mut module, mut f) = (0u64, 0u64);
+    ck!(cuModuleLoad(&mut module, path.as_ptr()));
+    ck!(cuModuleGetFunction(&mut f, module, name.as_ptr()));
+    f
+}
+
 /// The CUDA context and kernels, or `None` (test skipped) without a cubin dir.
 fn gpu() -> Option<Gpu> {
-    let dir = std::env::var("ATLAS_ONESHOT_CUBIN_DIR").ok()?;
-    let load = |file: &str, name: &str| {
-        let path = std::ffi::CString::new(format!("{dir}/{file}")).unwrap();
-        let name = std::ffi::CString::new(name).unwrap();
-        let (mut module, mut f) = (0u64, 0u64);
-        ck!(cuModuleLoad(&mut module, path.as_ptr()));
-        ck!(cuModuleGetFunction(&mut f, module, name.as_ptr()));
-        f
-    };
+    std::env::var("ATLAS_ONESHOT_CUBIN_DIR").ok()?;
     let mut ctx = 0u64;
     ck!(cuInit(0));
     ck!(cuDevicePrimaryCtxRetain(&mut ctx, 0));
@@ -323,6 +327,11 @@ fn test_cfg(stripe_min: usize) -> Config {
         stripe_min,
         timeout_ns: 10_000_000_000,
         stage_fence: std::env::var("ATLAS_RDMA_ONESHOT_STAGE_FENCE").as_deref() == Ok("1"),
+        sm_stage: std::env::var("ATLAS_RDMA_ONESHOT_SM_STAGE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        pdl: std::env::var("ATLAS_RDMA_ONESHOT_PDL").as_deref() != Ok("0"),
     }
 }
 

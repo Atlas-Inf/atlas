@@ -118,6 +118,10 @@ impl MoeLayer {
     ) -> Result<DevicePtr> {
         self.btile_input_guard(input, 4, ctx, stream)?;
         anyhow::ensure!(
+            self.shared_native.is_none(),
+            "C4 MoE reads the NVFP4 shared expert a native layer does not keep"
+        );
+        anyhow::ensure!(
             crate::model::glm_c4::enabled(&ctx.config.model_type)
                 && super::prequant_fp4::c4_grouped_shape(ctx.config, 4, ctx.levers.max_decode_seqs)
                 && ctx.attn_metadata.is_some_and(|m| m.num_seqs == 4)
@@ -161,8 +165,9 @@ impl MoeLayer {
         Ok(output)
     }
 
-    /// Match the scalar control's GEMV arithmetic and BF16 routing logits for
-    /// every independent C4 row. C3 retains its distinct dense-GEMM control.
+    /// Match the scalar control's GEMV arithmetic and routing logits (FP32
+    /// under [`Self::router_f32`]) for every independent C4 row. C3 retains
+    /// its distinct dense-GEMM control.
     pub(super) fn c4_router_logits(
         &self,
         input: DevicePtr,
@@ -203,10 +208,10 @@ impl MoeLayer {
         for row in 0..rows {
             ops::dense_gemv(
                 ctx.gpu,
-                self.dense_gemv,
+                self.router_gemv,
                 input.offset(row * h * 2),
                 &self.weights.gate,
-                output.offset(row * experts * 2),
+                output.offset(row * experts * ctx.config.router_logit_bytes()),
                 experts as u32,
                 h as u32,
                 stream,

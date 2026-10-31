@@ -22,6 +22,7 @@ impl StreamingToolDetector {
             current_tag_open: None,
             inside_dsml: false,
             promote_bare_names: false,
+            complete_poolside_calls: false,
             call_counter: 0,
             emitted_tool_calls: false,
             current_tc_name: None,
@@ -41,6 +42,13 @@ impl StreamingToolDetector {
     /// request-scoped, so `reset()` deliberately leaves it alone.
     pub fn set_promote_bare_names(&mut self, on: bool) {
         self.promote_bare_names = on;
+    }
+
+    /// Hold Poolside headers until the envelope closes so the API can validate
+    /// the complete call before emitting it. Other formats keep streaming.
+    /// Like parser selection, this request policy survives `reset()`.
+    pub fn set_complete_poolside_calls(&mut self, on: bool) {
+        self.complete_poolside_calls = on;
     }
 
     /// Poolside v1 mode: the call's arguments are buffered until
@@ -250,7 +258,8 @@ impl StreamingToolDetector {
                 // (`<parameter=key>value</parameter>`) must be converted to JSON before
                 // emission. The name header is emitted immediately so clients get instant
                 // feedback that a tool call started.
-                if self.current_tc_name.is_none()
+                if !(self.promote_bare_names && self.complete_poolside_calls)
+                    && self.current_tc_name.is_none()
                     && let Some(name) =
                         extract_streaming_name(&self.buffer, self.promote_bare_names)
                     && self.is_registered_tool(&name)

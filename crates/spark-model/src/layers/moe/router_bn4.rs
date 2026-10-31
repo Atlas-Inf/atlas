@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Called only from the existing exact-M5 BF16 router arm.
+//! Called only from the existing exact-M5 router arm (BF16 operands, FP32
+//! logits).
 use super::m5_projections::{RouterResources, disjoint, router_eligible, span};
 use super::*;
 
@@ -10,14 +11,14 @@ fn checked_output(
     owner: DevicePtr,
     capacity: usize,
 ) -> Result<usize> {
-    let bytes = 5 * 288 * 2;
+    let bytes = 5 * 288 * 4;
     anyhow::ensure!(
         output == owner && capacity >= bytes,
         "GLM BN4 router output owner/capacity"
     );
     let a = span(input, 5 * 4096 * 2, 8)?;
     let b = span(weight, 288 * 4096 * 2, 8)?;
-    let c = span(output, bytes, 2)?;
+    let c = span(output, bytes, 4)?;
     disjoint(&a, &c)?;
     disjoint(&b, &c)?;
     Ok(bytes)

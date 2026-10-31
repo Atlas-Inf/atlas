@@ -56,12 +56,14 @@ use std::sync::{Arc, Mutex};
 
 use crate::video_sample::{sample_plan, wanted_frames};
 
+mod frames;
+mod input;
 mod probe;
 mod scale;
 mod timestamps;
+pub(crate) use frames::{decode_frame_indices, probe_frames};
 use probe::probe_duration;
 use scale::decoded_scale_filter;
-mod input;
 mod png_stream;
 use png_stream::decoded_frame_budget;
 use timestamps::parse_showinfo_timestamps;
@@ -287,6 +289,25 @@ pub fn decode_with_plan(
     run_ffmpeg(bytes, &selection, output_frames, policy)
 }
 
+fn ensure_decoder(policy: &FfmpegPolicy) -> Result<()> {
+    ensure!(
+        policy.enabled,
+        "this container needs ffmpeg to decode and subprocess decoding is disabled; \
+         pass --video-allow-ffmpeg to enable it, or send an animated GIF"
+    );
+    if let Availability::Missing(detail) = probe(policy) {
+        anyhow::bail!(
+            "the ffmpeg decoder is not usable: {detail} (no ffmpeg installed at that path, or it \
+             could not run) — install ffmpeg with its ffprobe companion, or point \
+             --video-ffmpeg-path at a usable build"
+        );
+    }
+    Ok(())
+}
+
+/// Generic ffmpeg subprocess: seekable staged input, streamed stdout read,
+/// stderr drained on a thread, watchdog kill after `policy.timeout_secs`
+/// (Enntity/atlas d0cead1).
 /// Spawn ffmpeg with the plan's filter and collect the frames.
 ///
 /// Split out so the argument construction (the part with the correctness

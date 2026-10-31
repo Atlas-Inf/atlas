@@ -3,12 +3,80 @@
 use anyhow::Result;
 
 use super::while_on;
+use crate::layers::dflash_head::ConvTwinKind;
+use crate::layers::{self, ops};
 use crate::model::{graph_flags, qwen4exp_batch_fast, qwen4exp_exact_verify, qwen4exp_mtp_depth};
 
 /// The table's trailing entries, split for the 500-LoC cap. The caller
 /// chains them after [`super::SETTINGS`], so the gathered order is
 /// unchanged.
 pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
+    ("ATLAS_GLM_SERVING_MODE", || {
+        use crate::weight_loader::glm5_mode::{ServingMode, selected};
+        Ok(match selected()? {
+            None => 0,
+            Some(ServingMode::Strict) => 1,
+            Some(ServingMode::Spark) => 2,
+        })
+    }),
+    ("ATLAS_GLM_MLA_FUSE", || {
+        Ok(ops::glm_mla_fuse_requested()? as u64)
+    }),
+    ("ATLAS_GLM_MXFP8_TILED", || {
+        Ok(ops::mxfp8_tiled_requested()? as u64)
+    }),
+    // FP4-Local native formats: which layer groups compute on the
+    // checkpoint's own MXFP8 / FP8 block bytes, and how their prefill runs.
+    ("ATLAS_GLM_FP4L_NATIVE", || {
+        Ok(layers::glm_native::NativePolicy::from_env().bits())
+    }),
+    ("ATLAS_GLM_FP4L_FP8_PREFILL", || {
+        Ok(ops::Fp8bPrefill::from_env()? as u64)
+    }),
+    // The W8A8 block FP8 prefill GEMM: rounds its group sums differently
+    // from the in-tree kernel, so ranks that disagree serve a mix of both.
+    ("ATLAS_GLM_FP8B_CUTLASS", || {
+        Ok(ops::fp8b_cutlass_requested()? as u64)
+    }),
+    // The routed experts' activation scales and the non-prompt rows' A16
+    // lane: the rows both ranks reduce.
+    ("ATLAS_GLM_FP4L_INPUT_SCALES", || {
+        Ok(layers::moe::input_scales_requested() as u64)
+    }),
+    ("ATLAS_GLM_FP4L_DECODE_A16", || {
+        Ok(layers::moe::decode_a16_requested() as u64)
+    }),
+    // The split verify head's MXFP8 shard: another GEMV family in the
+    // argmax both ranks merge.
+    ("ATLAS_GLM_LM_HEAD_MXFP8", || {
+        Ok((std::env::var("ATLAS_GLM_LM_HEAD_MXFP8").as_deref() == Ok("1")) as u64)
+    }),
+    ("ATLAS_GLM_CANONICAL_VERIFY", || {
+        Ok(layers::canonical_verify::enabled() as u64)
+    }),
+    ("ATLAS_DFLASH_CONV_TWIN", || {
+        Ok(ConvTwinKind::word(ConvTwinKind::requested()?))
+    }),
+    // GLM exact prefill: both ranks must select the same arithmetic and,
+    // for overlap, the same number and ordering of row-block exchanges.
+    ("ATLAS_GLM_KDA_SIDE_PROJ_LT", || {
+        Ok(crate::layers::kda_side_proj_lt_enabled() as u64)
+    }),
+    ("ATLAS_GLM_KDA_CONV_PLANES", || {
+        Ok(crate::layers::kda_conv_planes_enabled() as u64)
+    }),
+    // Which KDA prefill recurrence: Atlas's (BF16 tiles) or SparkGLM's FP32
+    // FlashKDA (`ATLAS_KDA_FLASH_LIBRARY`, with `ATLAS_GLM_KDA_FLASH_PLANES`).
+    (
+        "ATLAS_KDA_FLASH_LIBRARY",
+        crate::layers::kda_flash_prefill_word,
+    ),
+    ("ATLAS_GLM_HC_PREFILL_FUSE2", || {
+        Ok(crate::layers::qwen3_attention::hc_prefill_fuse2_enabled() as u64)
+    }),
+    ("ATLAS_GLM_SP_GATHER_OVERLAP", || {
+        Ok(crate::layers::glm_sp_overlap::requested_blocks() as u64)
+    }),
     ("ATLAS_QWEN4EXP_EXACT_VERIFY_CHECK", || {
         Ok(qwen4exp_exact_verify::check_requested() as u64)
     }),
@@ -64,6 +132,12 @@ pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
     // the routed K-major copy exists (the KV pools part without it).
     ("ATLAS_QWEN4EXP_PREFILL_W4A4", || {
         Ok(crate::layers::moe::w4a4_requested() as u64)
+    }),
+    // Vision prompts keyed for the prefix cache (`vision_cache`): a rank
+    // without the key neither looks up nor inserts a vision prompt, so the
+    // ranks' radix walks and checkpoint inserts part.
+    ("ATLAS_VISION_PREFIX_CACHE", || {
+        Ok(crate::model::vision_cache::switch_on() as u64)
     }),
     ("ATLAS_SSM_SAVE_DUMP", || {
         Ok(graph_flags::ssm_save_dump() as u64)

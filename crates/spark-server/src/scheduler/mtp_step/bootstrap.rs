@@ -61,6 +61,7 @@ pub(super) fn bootstrap_one(
                 if n_active >= 2 && !dspark_batch_verify_disabled() {
                     return true;
                 }
+                crate::scheduler::copy_drafts::offer(a);
                 let (init, conf) = a.take_drafts();
                 if dflash_verify_raw_argmax || glm_repaired_narrow {
                     step_verify_dflash(

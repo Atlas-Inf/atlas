@@ -1,0 +1,44 @@
+{
+ "source": "https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local/tree/b9ce18a6887e18c089fdea8509a33e63429a3300",
+ "reference": "torch float8_e4m3fn -> f32 * 2^(e-127) -> bfloat16",
+ "cases": [
+  {
+   "tag": "l0_gdn_in_proj_b",
+   "tensor": "model.language_model.layers.0.linear_attn.in_proj_b",
+   "shape": [
+    48,
+    2560
+   ],
+   "bf16_sha256": "e0f020cba530baa05e3e491073b98f52ec102ef9e5fbc7ca93c65d15aac381bb",
+   "head": [
+    48160,
+    15504,
+    47680,
+    15504,
+    48016,
+    15472,
+    15216,
+    48256
+   ]
+  },
+  {
+   "tag": "l0_gdn_in_proj_a",
+   "tensor": "model.language_model.layers.0.linear_attn.in_proj_a",
+   "shape": [
+    48,
+    2560
+   ],
+   "bf16_sha256": "9172e90601512b96eab8287417944ee86d477b5a8a053090291eabf2b831def7",
+   "head": [
+    48096,
+    48160,
+    15120,
+    15536,
+    15152,
+    48256,
+    14256,
+    48272
+   ]
+  }
+ ]
+}

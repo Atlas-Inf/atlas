@@ -9,20 +9,60 @@ Three kinds of debt, kept apart:
 - **Code or data copied or adapted**: kept only under a license compatible
   with AGPL-3.0-only, with the origin, copyright and license notice in the
   file and below.
-- **Ideas or designs taken** from a named project: no license obligation,
-  but credited here and in the module that implements them.
+- **Ideas or designs taken** from a named project: credited here and in the
+  module that implements them, separately from copied source material.
 - **Related work** we did not derive from: listed so readers can compare.
 
-Commit messages cannot be amended, so these credits live in the code and
-in this file.
+Credits are retained in the code and this file independently of commit-message
+normalization in the local review history.
+
+The October 12 [native RC4 source note](porting/GLM_5_3_FLASH_RC4.md) and
+[import history](porting/glm53-validation/rc4-import-map.json) identify Jason
+McCartney / Enntity's subsequent engine contributions. These complement the
+original contributor and license records below.
 
 ## Code and data from other projects
 
 | Material in this tree | Origin | License |
 |---|---|---|
 | `EDGES` and `PRIOR` in `crates/spark-server/src/scheduler/dflash_conf_width.rs` | knapcio, [`overlay/glm_bav_table_seg.json`](https://github.com/knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4/blob/d80f4fd/overlay/glm_bav_table_seg.json) @ d80f4fd: `EDGES` is its `edges[7..]` exactly; `PRIOR` is a rounded reading of its `g[0][7..]` (table source "mtpshadow capture 1633") | MIT, Copyright (c) 2026 knapcio (notice below) |
-| `scripts/dev/glm_sparse_native/reference/traits/model/model_type.h`; the restated declarations in `native-bridge.cpp` and `native-init.cpp` | NVIDIA's sparse-MLA SM120 prefill sources in [FlashInfer](https://github.com/flashinfer-ai/flashinfer) (`include/flashinfer/attention/sparse_mla_sm120/`, `csrc/sparse_mla_sm120_prefill.cu`) | BSD-3-Clause, Copyright 2026 NVIDIA CORPORATION & AFFILIATES; notice in the header and `NATIVE-BRIDGE-NOTICE.txt` |
-| FlashKDA, loaded at run time by `crates/spark-model/src/layers/glm5_kda/flash_prefill.rs` and `research/flash-kda-prefill/` (not in this tree) | [MoonshotAI/FlashKDA](https://github.com/MoonshotAI/FlashKDA) @ 1ce47ea3 | MIT (see `research/flash-kda-prefill/README.md`) |
+| `third_party/nvidia_sparse_mla_sm120/` (17 device headers) | NVIDIA's sparse-MLA SM120 device source in [FlashInfer](https://github.com/flashinfer-ai/flashinfer) @ `8eccd0c1352165302840c0e19066bc42d36dbd7a`; no FlashInfer host dispatcher/package | BSD-3-Clause, Copyright 2026 NVIDIA CORPORATION & AFFILIATES; per-file notices, LICENSE and provenance.json retained |
+| `crates/spark-runtime/cuda/glm_kda/vendor/` (three device headers) | [MoonshotAI/FlashKDA](https://github.com/MoonshotAI/FlashKDA) @ `1ce47ea3bb22c84eb9cc665028399cf35e8ffb0b` | MIT; LICENSE, NOTICE and provenance.json retained. Shared-memory state conversion adapted to Atlas's canonical key-major layout |
+| `crates/spark-runtime/cuda/glm_kda_fp32/` (`ATLAS_KDA_FLASH_LIBRARY`, off by default) | SparkGLM 0.2.0's KDA prefill: [MoonshotAI/FlashKDA](https://github.com/MoonshotAI/FlashKDA) @ `1ce47ea3bb22c84eb9cc665028399cf35e8ffb0b` with Jason McCartney / Enntity's state-slot, TMA-swizzle and FP32-recurrence patches, his C bridge and the `Enntity/atlas` c87f2790 runtime bridge, all verbatim and compiled in-tree with SparkGLM's flags | MIT upstream AND AGPL-3.0-only patches and bridges; LICENSE, NOTICE and provenance.json (every hash) retained |
+| Atlas KDA launcher and sparse prep/split/merge integration | Atlas-owned parameter, workspace, state and launch code; prior GLM integration and main/tail composition by Jason McCartney / Enntity and Reiner Schmidt / Mango-kid. KDA launch layouts follow the credited MIT device source | AGPL-3.0-only Atlas integration; mixed source identified as AGPL-3.0-only AND MIT. Original imported history/notices retained |
+
+These kernels now compile into Atlas and use its own state/workspace/dispatch
+contracts. The final image does not build/load an external prefill bridge or
+require a SparkGLM recipe, FlashKDA Python API or FlashInfer host API. CUDA and
+the engine CUTLASS pin remain standard build dependencies. Numerical GPU and
+full-model qualification are separate from source integration; see
+[`docs/porting/GLM_5_3_FLASH.md`](porting/GLM_5_3_FLASH.md).
+
+### Historical comparison scaffolding (removed after qualification)
+
+The native GPU tests no longer require the external bridge builders. Local
+archive commit `3c991613462c79730e2936a7b0f97add40f74370` retains
+`scripts/build_glm_prefill/`, `research/flash-kda-prefill/` and historical files
+under `scripts/dev/glm_sparse_native/`. That commit and its rewritten counterpart
+are not ancestors of the proposed PR branches: cloning this stack does not
+provide those local archive objects.
+
+The original SparkGLM [FlashKDA bridge](https://github.com/Enntity/sparkglm/blob/84310dc3bbdfb99526e1b17342859241b447606d/install/flash_kda/atlas_flash_kda_bridge.cu),
+[state-slot patch](https://github.com/Enntity/sparkglm/blob/84310dc3bbdfb99526e1b17342859241b447606d/install/flash_kda/flash_kda_sm121_slots.patch)
+and [native build recipe](https://github.com/Enntity/sparkglm/blob/84310dc3bbdfb99526e1b17342859241b447606d/install/build-native.sh)
+remain accessible at their pinned upstream revision. These recover the credited
+upstream inputs, not all later local comparison scaffolding. The inventory
+below records the original paths and hashes; native builds need none of these
+removed reference implementations.
+
+| Retained record | Origin and purpose |
+|---|---|
+| [Sparse source map and NVIDIA notice](../third_party/nvidia_sparse_mla_sm120/history/README.md) | NVIDIA sparse-MLA sources and Jason McCartney / Enntity's earlier experiment; original maps and notices preserved verbatim |
+| [FlashKDA bridge/patch inventory](../third_party/glm_prefill/provenance.json) | Jason McCartney / Enntity, [SparkGLM](https://github.com/Enntity/sparkglm) at `84310dc3bbdfb99526e1b17342859241b447606d`, with MoonshotAI MIT source; original paths, hashes and license texts retained |
+
+The [native GPU tests and fixture converter](../scripts/dev/glm_sparse_native/README.md)
+remain available. Neither those tests nor deployment require rebuilding an
+external prefill library.
 
 ### knapcio MIT notice (for `EDGES` and `PRIOR`)
 
@@ -69,6 +109,7 @@ No code from these projects is in this tree.
 | KDA fold-record rollback (`--ssm-rollback-mode records`) | `model/ssm_pool/kda_records.rs`, `kda_recurrent_bf16_verify_rec_owners` / `kda_commit_records` in `kernels/gb10/glm-5.3-flash/nvfp4/kda.cu` | vLLM RecoverSSM ([vllm#51855](https://github.com/vllm-project/vllm/pull/51855), ZJY0516 with benchislett), from ReplaySSM ([vllm#48018](https://github.com/vllm-project/vllm/pull/48018), Johnny-Liou, Dao AI Lab, NVIDIA), as RiNGSiDE ships it for GLM-5.3 (`--use-replayssm`); Apache-2.0 | CUDA kernels on our snapshot-verify template, our record layout (decays, normalized keys, corrections) and one fold rounding order shared by verify and commit |
 | SSM snapshot chain eviction | `spark-runtime/src/radix_tree/snapshot_chain.rs` | Reederey87's prefix-cache overlays (Artem Matskevych, [glm53-flash-exl3-2x-dgx-spark](https://github.com/Reederey87/glm53-flash-exl3-2x-dgx-spark) `overlay/patch_apc_tail_boundary.py`, `cache_tail_evict.py`, `patch_cache_hot_protect.py`; Apache-2.0); branch points from Marconi (MLSys'25, arXiv:2411.19379) | The chain / superseded / one-protected-slot-per-session policy |
 | Speculative decoding with strict structured output (`ATLAS_GLM_STRICT_SPEC`) | `scheduler/strict_spec.rs`, `model/glm_verify_masks.rs`, `argmax_bf16_value_ban_allow` in `kernels/gb10/glm-5.3-flash/nvfp4/argmax_bf16.cu`, `scripts/dev/glm_strict_split_argmax_bitcheck.cu` | vLLM [#14702](https://github.com/vllm-project/vllm/pull/14702) ("Enable Speculative Decoding with Structured Outputs": walk the matcher through the drafts, one bitmask per verify row plus the bonus row, roll back, trim at the first rejected draft), [#44297](https://github.com/vllm-project/vllm/pull/44297) ("Constrain bitmask and trim grammar advance at the reasoning boundary": rows before `</think>` unmasked, rows after it from the grammar's start state, the matcher never fed reasoning), tracked by RFC [#48197](https://github.com/vllm-project/vllm/issues/48197); Apache-2.0 | The TP2 vocab-split masked argmax: the masks broadcast to both ranks and each rank's slice applied before its partial argmax and the existing pair merge; the dead first draft that keeps a verify at width 2 |
+| GB10 display carveout as KV memory (`spark display-carveout`; originally SparkGLM-only, now an optional native Atlas path) | `spark-server/src/display_carveout.rs`, `display_carveout/rm.rs`, `spark-runtime/src/gpu/carveout.rs`, `cuda_backend/display_carveout.rs`, `kv_cache/placement.rs`, `spark-model/src/factory/build/kv_carveout.rs` | kindling-spark-os's `dispram` (kindlingai: mmastrac, coffee-the-dev, adapt-ai-systems; [kindlingai/kindling-spark-os](https://github.com/kindlingai/kindling-spark-os) `dispram/`; AGPL-3.0 daemon, GPL-3.0 client): the 2 GiB `DISPLAY_FRM` carveout that GB10's driver never allocates from, wrapped in an `NV01_MEMORY_LIST_SYSTEM` object, exported as an fd and imported with `cuMemImportFromShareableHandle`, glued behind ordinary memory for vLLM's KV tail. They credit an earlier NVIDIA developer forum post by emihuang | Re-derived from open-gpu-kernel-modules 580.173.02/580.178.04 (why the heap is unused, why exports outlive the exporter); no daemon: a launcher exports, takes a host flock, drops CAP_SYS_ADMIN and execs the server; whole per-layer KV pools placed so system-memory KV bytes never grow through the ranks' block agreement |
 
 ## Related work, not derived from
 

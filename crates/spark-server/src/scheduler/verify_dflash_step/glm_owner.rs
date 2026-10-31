@@ -46,6 +46,17 @@ pub fn step_verify_glm_long_with(
     dflash_verify_raw_argmax: bool,
     traverse: &mut OwnerTraverse<'_>,
 ) {
+    // Admission precedes the traversal (including a fused prompt chunk),
+    // so unsupported sampling never strands workers at an owner verdict.
+    if let Some(error) = group
+        .iter()
+        .find_map(|a| super::split_head::ensure_available(model, a).err())
+    {
+        for a in group.iter_mut() {
+            a.abort_on_engine_error(format_args!("split verify admission: {error:#}"));
+        }
+        return;
+    }
     let fail_all = |group: &mut [&mut ActiveSeq]| group.iter_mut().for_each(|a| a.finished = true);
     let t_step = Instant::now();
     if let Err(e) = model.sync_secondary() {
@@ -148,6 +159,15 @@ pub fn step_verify_glm_long_with(
             true,
         ) {
             deferred.push((owner, next));
+        }
+        // EP exchange errors terminate above. A non-EP backend/test can
+        // return a request error: do not start another owner or proposal
+        // after a tail failed, either.
+        if let Some(error) = group[owner].engine_error.clone() {
+            for a in group.iter_mut() {
+                a.abort_on_engine_error(format_args!("GLM owner tail failed: {error}"));
+            }
+            return;
         }
     }
     propose_owner_batch(

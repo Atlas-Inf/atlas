@@ -41,6 +41,7 @@ impl MockGpuBackend {
     }
 
     pub(super) fn carveout_alloc(&self, bytes: usize) -> Result<DevicePtr> {
+        self.check_alloc_failure()?;
         let mut arena = self.carveout.lock();
         let Some(arena) = arena.as_mut() else {
             anyhow::bail!("mock has no carveout");

@@ -109,3 +109,23 @@ fn all_literal_content_events_from_one_token_reach_the_stream() {
         );
     }
 }
+
+#[test]
+fn reasoning_leak_cleanup_preserves_quoted_copy_of_closing_tag() {
+    let (ctx, mut stream, mut deltas) = stream_tokens_with_context(false, true, vec![21]);
+    deltas.extend(done(&mut stream, &ctx, "stop"));
+    let reasoning: String = deltas
+        .iter()
+        .filter_map(|delta| match delta {
+            ir::StreamDelta::Reasoning { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(reasoning.contains("`</tool_call>`"), "{reasoning:?}");
+    assert_eq!(
+        reasoning.matches("</tool_call>").count(),
+        1,
+        "{reasoning:?}"
+    );
+    assert!(reasoning.contains("END."), "{reasoning:?}");
+}

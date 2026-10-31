@@ -5,11 +5,12 @@
 //! defers the packed weights and block scales, so no rank ever holds a whole
 //! expert: gate/up keep rows `[r*I/ep, (r+1)*I/ep)` (column-parallel), down
 //! keeps the matching input columns (row-parallel), and the per-tensor
-//! scalars are shared by both slices.
+//! scalars are shared by both slices. A CSF-compressed scale is decoded per
+//! slice from its deferred components (`with_deferred_slice`).
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use atlas_core::config::ModelConfig;
-use spark_runtime::fast_weights::with_deferred_bytes;
+use spark_runtime::fast_weights::{SliceAxis, with_deferred_slice};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::WeightStore;
 
@@ -58,6 +59,9 @@ pub(super) fn load_expert_slice(
     })
 }
 
+/// This rank's slice of the deferred `[rows, row_bytes]` tensor `name`, read
+/// from disk — or, for a CSF-compressed scale, decoded from its deferred
+/// components one matrix at a time — and uploaded.
 fn read_slice(
     store: &WeightStore,
     name: &str,
@@ -67,57 +71,20 @@ fn read_slice(
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
 ) -> Result<DevicePtr> {
-    let d = store
-        .deferred(name)
-        .with_context(|| format!("expert TP: {name} was not deferred by the fast loader"))?;
-    ensure!(
-        d.shape.len() == 2 && d.shape[0] == rows && d.shape[1] * d.dtype.byte_size() == row_bytes,
-        "expert TP: {name} has shape {:?}, expected [{rows}, {row_bytes} bytes]",
-        d.shape
-    );
-    let (rank, world) = (config.ep_rank, config.ep_world_size);
-    ensure!(
-        rows.is_multiple_of(world) && row_bytes.is_multiple_of(world),
-        "expert TP: {name} [{rows}, {row_bytes} bytes] does not split {world} ways"
-    );
-    match kind {
-        TpShardKind::ColumnParallel => {
-            let local = rows / world;
-            with_deferred_bytes(d, rank * local * row_bytes, local * row_bytes, |bytes| {
-                upload(gpu, bytes)
-            })
-        }
-        TpShardKind::RowParallel => {
-            let local = row_bytes / world;
-            with_deferred_bytes(d, 0, rows * row_bytes, |bytes| {
-                upload(gpu, &column_slice(bytes, row_bytes, rank, local))
-            })
-        }
+    let axis = match kind {
+        TpShardKind::ColumnParallel => SliceAxis::Rows,
+        TpShardKind::RowParallel => SliceAxis::Cols,
         TpShardKind::Replicated => anyhow::bail!("expert TP: {name} must be sliced"),
-    }
-}
-
-/// Bytes `[rank*local, (rank+1)*local)` of every `row_bytes`-wide row.
-fn column_slice(bytes: &[u8], row_bytes: usize, rank: usize, local: usize) -> Vec<u8> {
-    bytes
-        .chunks_exact(row_bytes)
-        .flat_map(|row| &row[rank * local..(rank + 1) * local])
-        .copied()
-        .collect()
+    };
+    let (rank, world) = (config.ep_rank, config.ep_world_size);
+    with_deferred_slice(store, name, rows, row_bytes, axis, rank, world, |bytes| {
+        upload(gpu, bytes)
+    })
+    .with_context(|| format!("expert TP: slicing {name}"))
 }
 
 fn upload(gpu: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
     let dst = gpu.alloc(bytes.len())?;
     gpu.copy_h2d(bytes, dst)?;
     Ok(dst)
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn column_slice_keeps_each_rows_rank_half() {
-        let bytes: Vec<u8> = (0..12).collect(); // 3 rows x 4 bytes
-        assert_eq!(super::column_slice(&bytes, 4, 0, 2), [0, 1, 4, 5, 8, 9]);
-        assert_eq!(super::column_slice(&bytes, 4, 1, 2), [2, 3, 6, 7, 10, 11]);
-    }
 }

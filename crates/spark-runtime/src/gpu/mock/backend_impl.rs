@@ -9,6 +9,7 @@ impl GpuBackend for MockGpuBackend {
     }
 
     fn alloc(&self, bytes: usize) -> Result<DevicePtr> {
+        self.check_alloc_failure()?;
         let mut next = self.next_ptr.lock();
         let ptr = *next;
         *next += bytes as u64;

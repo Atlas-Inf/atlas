@@ -42,11 +42,12 @@ impl atlas_core::scope::ModelResource<dyn crate::gpu::GpuBackend> for PagedKvCac
         {
             first_error = Some(e);
         }
-        if let Some(mut spill) = self.nvme.take()
-            && let Err(e) = spill.free_staging(gpu)
-            && first_error.is_none()
-        {
-            first_error = Some(e);
+        for mut spill in std::mem::take(&mut self.nvme) {
+            if let Err(e) = spill.free_staging(gpu)
+                && first_error.is_none()
+            {
+                first_error = Some(e);
+            }
         }
         if let Some(shard) = self.latent_shard.take() {
             if let Some(lane) = shard.lane

@@ -516,7 +516,8 @@ impl BufferSizes {
             gate_logits: if config.num_experts > 0 {
                 // LongCat zero-experts: the router scores (routed + zero)
                 // logits even though only `num_experts` expert FFNs exist.
-                m * (config.num_experts + config.zero_expert_num) * bf16
+                // FP32 logits for a router that keeps them (GLM-5).
+                m * (config.num_experts + config.zero_expert_num) * config.router_logit_bytes()
             } else {
                 256
             },

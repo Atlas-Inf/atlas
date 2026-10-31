@@ -709,11 +709,34 @@ impl GrammarEngine {
     /// Automatic tool choice uses the complete per-tool opener as its trigger.
     /// A shared `<tool_call>` trigger would claim that marker when it appears
     /// inside ordinary prose or code, before the tool name proves intent.
+    /// A forced call (`use_triggers=false`) also decodes `enum`/`const`
+    /// values from their set (`poolside_values`); should that grammar not
+    /// compile, the call keeps the open value grammar rather than failing.
     pub fn compile_poolside_v1_tool_grammar(
         &mut self,
         tools: &[ToolDefinition],
         use_triggers: bool,
         value_close: &str,
+    ) -> Result<CompiledGrammar, GrammarError> {
+        if !use_triggers {
+            match self.compile_poolside_v1_grammar(tools, false, value_close, true) {
+                Err(GrammarError::NoTools) => return Err(GrammarError::NoTools),
+                Err(error) => tracing::warn!(
+                    "Poolside closed argument values did not compile ({error}); \
+                     the forced call keeps open values"
+                ),
+                compiled => return compiled,
+            }
+        }
+        self.compile_poolside_v1_grammar(tools, use_triggers, value_close, false)
+    }
+
+    fn compile_poolside_v1_grammar(
+        &mut self,
+        tools: &[ToolDefinition],
+        use_triggers: bool,
+        value_close: &str,
+        closed_values: bool,
     ) -> Result<CompiledGrammar, GrammarError> {
         if tools.is_empty() {
             return Err(GrammarError::NoTools);
@@ -754,14 +777,26 @@ impl GrammarEngine {
                 _ => "paramname ::= [a-zA-Z_] [a-zA-Z_0-9]*".to_string(),
             };
             let value_ladder = ebnf_until_close_ladder(value_close);
+            let pair_rules = param_names
+                .as_deref()
+                .filter(|_| closed_values)
+                .and_then(|names| {
+                    super::poolside_values::closed_pair_rules(&schema, names, value_close)
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "pair_body ::= paramname \"</arg_key><arg_value>\" value \"{value_close}\"\n\
+                         {paramname_rule}"
+                    )
+                });
             let content = if has_no_parameters {
                 serde_json::json!({"type": "const_string", "value": ""})
             } else {
                 let body_ebnf = format!(
                     "root ::= first_pair pair*\n\
-                     first_pair ::= \"arg_key>\" paramname \"</arg_key><arg_value>\" value \"{value_close}\"\n\
-                     pair ::= \"<arg_key>\" paramname \"</arg_key><arg_value>\" value \"{value_close}\"\n\
-                     {paramname_rule}\n\
+                     first_pair ::= \"arg_key>\" pair_body\n\
+                     pair ::= \"<arg_key>\" pair_body\n\
+                     {pair_rules}\n\
                      value ::= value_part*\n\
                      value_part ::= {value_ladder}"
                 );

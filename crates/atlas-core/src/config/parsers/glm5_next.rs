@@ -85,6 +85,14 @@ pub fn parse_glm5_next(raw: &Value) -> Result<ModelConfig> {
         .unwrap_or("")
         .to_string();
     config.use_routing_bias = text.get("topk_method").and_then(Value::as_str) == Some("noaux_tc");
+    // GLM-5 routes on FP32 logits; configs before `moe_router_dtype` existed
+    // meant it too (the reference forces FP32 for them).
+    let router_dtype = text.get("moe_router_dtype").and_then(Value::as_str);
+    ensure!(
+        matches!(router_dtype, None | Some("float32")),
+        "glm5_next `moe_router_dtype` {router_dtype:?}: Atlas serves the GLM-5 router in float32"
+    );
+    config.router_logits_f32 = true;
     config.routed_scaling_factor = text
         .get("routed_scaling_factor")
         .and_then(Value::as_f64)

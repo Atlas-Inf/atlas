@@ -232,8 +232,11 @@ extern "C" int atlas_cutlass_bf16_grouped_gemm_act_weight_t(
 
 // Row-major `out[m, ldc] = act[m, lda] @ weight[n, k]^T` with an L2-aware CTA
 // raster: without it, K >= 4096 re-streams every weight strip from DRAM per
-// M-row of tiles (the whole [N, K] panel outgrows L2).
-template <int TB_M, int TB_N, int TB_K, int W_M, int W_N, int W_K, int STAGES, int SWIZZLE>
+// M-row of tiles (the whole [N, K] panel outgrows L2). `Out` is the output
+// element: BF16, or FP32 (the FP32 accumulator unrounded, for GLM-5's FP32
+// router logits).
+template <typename Out, int TB_M, int TB_N, int TB_K, int W_M, int W_N, int W_K, int STAGES,
+          int SWIZZLE>
 int atlas_cutlass_bf16_tuned_impl(
     const void* act,
     const void* weight,
@@ -250,7 +253,7 @@ int atlas_cutlass_bf16_tuned_impl(
       cutlass::layout::RowMajor,
       Element,
       cutlass::layout::ColumnMajor,
-      Element,
+      Out,
       cutlass::layout::RowMajor,
       float,
       cutlass::arch::OpClassTensorOp,
@@ -258,15 +261,16 @@ int atlas_cutlass_bf16_tuned_impl(
       cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,
       cutlass::gemm::GemmShape<W_M, W_N, W_K>,
       cutlass::gemm::GemmShape<16, 8, 16>,
-      cutlass::epilogue::thread::LinearCombination<Element, 8, float, float>,
+      cutlass::epilogue::thread::LinearCombination<Out, 128 / cutlass::sizeof_bits<Out>::value,
+                                                   float, float>,
       cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<SWIZZLE>,
       STAGES>;
   typename Gemm::Arguments args(
       {m, n, k},
       {static_cast<Element const*>(act), lda},
       {static_cast<Element const*>(weight), k},
-      {static_cast<Element const*>(out), ldc},
-      {static_cast<Element*>(out), ldc},
+      {static_cast<Out const*>(out), ldc},
+      {static_cast<Out*>(out), ldc},
       {1.0f, 0.0f});
   Gemm gemm;
   cutlass::Status status = gemm.can_implement(args);
@@ -280,7 +284,9 @@ int atlas_cutlass_bf16_tuned_impl(
   return atlas_launch_status(static_cast<int>(gemm(stream)));
 }
 
-extern "C" int atlas_cutlass_bf16_gemm_tuned(
+// `config` picks the tiles (bf16_gemm_cutlass.rs `config`).
+template <typename Out>
+int atlas_cutlass_bf16_gemm_tuned_out(
     const void* act,
     const void* weight,
     void* out,
@@ -294,20 +300,35 @@ extern "C" int atlas_cutlass_bf16_gemm_tuned(
   atlas_drain_stale_cuda_error();
   switch (config) {
     case 0:
-      return atlas_cutlass_bf16_tuned_impl<128, 128, 32, 64, 64, 32, 4, 1>(
+      return atlas_cutlass_bf16_tuned_impl<Out, 128, 128, 32, 64, 64, 32, 4, 1>(
           act, weight, out, m, n, k, lda, ldc, stream);
     case 4:
-      return atlas_cutlass_bf16_tuned_impl<128, 256, 32, 64, 64, 32, 3, 4>(
+      return atlas_cutlass_bf16_tuned_impl<Out, 128, 256, 32, 64, 64, 32, 3, 4>(
           act, weight, out, m, n, k, lda, ldc, stream);
     case 5:
-      return atlas_cutlass_bf16_tuned_impl<128, 256, 32, 64, 64, 32, 3, 8>(
+      return atlas_cutlass_bf16_tuned_impl<Out, 128, 256, 32, 64, 64, 32, 3, 8>(
           act, weight, out, m, n, k, lda, ldc, stream);
     case 9:
-      return atlas_cutlass_bf16_tuned_impl<128, 128, 64, 64, 64, 64, 3, 8>(
+      return atlas_cutlass_bf16_tuned_impl<Out, 128, 128, 64, 64, 64, 64, 3, 8>(
           act, weight, out, m, n, k, lda, ldc, stream);
     default:
       return -5;
   }
+}
+
+extern "C" int atlas_cutlass_bf16_gemm_tuned(
+    const void* act, const void* weight, void* out, int m, int n, int k, int lda, int ldc,
+    int config, cudaStream_t stream) {
+  return atlas_cutlass_bf16_gemm_tuned_out<cutlass::bfloat16_t>(act, weight, out, m, n, k, lda,
+                                                                ldc, config, stream);
+}
+
+// FP32 output: the same tiles and mainloop, the accumulator stored unrounded.
+extern "C" int atlas_cutlass_bf16_gemm_tuned_f32out(
+    const void* act, const void* weight, void* out, int m, int n, int k, int lda, int ldc,
+    int config, cudaStream_t stream) {
+  return atlas_cutlass_bf16_gemm_tuned_out<float>(act, weight, out, m, n, k, lda, ldc, config,
+                                                  stream);
 }
 
 extern "C" int atlas_cublaslt_bf16_gemm_act_weight_t_algo(

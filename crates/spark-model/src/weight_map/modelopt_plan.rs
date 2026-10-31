@@ -96,7 +96,8 @@ impl ModeloptQuantPlan {
                 ModuleFormat {
                     algo,
                     group_size,
-                    scale_encoding: spec.weight_scale_encoding.clone(),
+                    // The parser stores an absent encoding as `Some("")`.
+                    scale_encoding: spec.weight_scale_encoding.clone().filter(|e| !e.is_empty()),
                 },
             );
         }

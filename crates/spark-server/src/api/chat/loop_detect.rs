@@ -33,6 +33,8 @@ fn loop_suppress_disabled() -> bool {
     std::env::var("ATLAS_LOOP_NO_SUPPRESS").as_deref() == Ok("1")
 }
 
+/// `repeat_run`: the trailing run of identical tool rounds that got a repeat
+/// notice (`prepare.rs`); 0 otherwise.
 pub(super) fn check_loops(
     messages: &[Message],
     tools_active: bool,

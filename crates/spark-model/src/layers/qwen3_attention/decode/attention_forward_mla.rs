@@ -101,16 +101,7 @@ impl Qwen3AttentionLayer {
                     stream,
                 )
             } else {
-                ops::dense_gemv(
-                    ctx.gpu,
-                    self.dense_gemv_k,
-                    normed,
-                    &mla.wq_a,
-                    q_latent,
-                    q_lora,
-                    h,
-                    stream,
-                )
+                self.mla_gemv1(ctx.gpu, normed, &mla.wq_a, q_latent, q_lora, h, stream)
             }
         })?;
         prof!("q_norm", {
@@ -140,16 +131,7 @@ impl Qwen3AttentionLayer {
                     stream,
                 )
             } else {
-                ops::dense_gemv(
-                    ctx.gpu,
-                    self.dense_gemv_k,
-                    q_latent,
-                    &mla.wq_b,
-                    q_full,
-                    q_dim,
-                    q_lora,
-                    stream,
-                )
+                self.mla_gemv1(ctx.gpu, q_latent, &mla.wq_b, q_full, q_dim, q_lora, stream)
             }
         })?;
 
@@ -251,16 +233,7 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             } else {
-                ops::dense_gemv(
-                    ctx.gpu,
-                    self.dense_gemv_k,
-                    normed,
-                    &mla.wkv_a,
-                    kv_latent,
-                    kv_lora,
-                    h,
-                    stream,
-                )?;
+                self.mla_gemv1(ctx.gpu, normed, &mla.wkv_a, kv_latent, kv_lora, h, stream)?;
             }
             ops::rms_norm(
                 ctx.gpu,
@@ -383,37 +356,32 @@ impl Qwen3AttentionLayer {
         // Step 8: Paged decode attention
         let attn_out = ctx.buffers.attn_output();
         let inv_sqrt_d = self.effective_attn_scale(hd);
-        let (sparse_indices, fp8) = self
-            .mla_decode_sparse_indices(mla, meta, normed, q_latent, pos, kv_cache, ctx, stream)?;
+        // The canonical form (unsharded GLM pair) attends a dense row's
+        // causal IDs too, as the shard's merge form does.
+        let canonical = self.glm_canonical_rank(kv_cache, ctx, nq, 1)?;
+        let (sparse_indices, fp8) = self.mla_decode_sparse_indices(
+            mla,
+            meta,
+            (normed, q_latent),
+            (pos, canonical.is_some()),
+            kv_cache,
+            ctx,
+            stream,
+        )?;
         prof!("paged_attn", {
-            if kv_cache.latent_shard().is_some() {
-                let dims = [nq, mla_cache_dim];
-                self.mla_decode_shard_attn(
-                    kv_cache,
-                    ctx,
-                    meta,
-                    (sparse_indices, pos),
-                    q_absorbed_buf,
-                    attn_out,
-                    dims,
-                    stream,
-                )
-            } else {
-                self.mla_decode_paged_attn(
-                    ctx,
-                    kv_cache,
-                    meta,
-                    sparse_indices,
-                    fp8,
-                    q_absorbed_buf,
-                    attn_out,
-                    nq,
-                    mla_cache_dim,
-                    bs,
-                    inv_sqrt_d,
-                    stream,
-                )
-            }
+            let selection = (sparse_indices, pos, fp8, canonical);
+            let dims = [nq, mla_cache_dim, bs as u32];
+            self.mla_decode_attn(
+                ctx,
+                kv_cache,
+                meta,
+                selection,
+                q_absorbed_buf,
+                attn_out,
+                dims,
+                inv_sqrt_d,
+                stream,
+            )
         })?;
 
         // Step 9: V extraction (batched GEMV)
@@ -472,9 +440,8 @@ impl Qwen3AttentionLayer {
                     stream,
                 )
             } else {
-                ops::dense_gemv(
+                self.mla_gemv1(
                     ctx.gpu,
-                    self.dense_gemv_k,
                     v_extracted,
                     &mla.wo,
                     o_out,

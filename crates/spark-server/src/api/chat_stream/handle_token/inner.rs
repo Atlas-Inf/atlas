@@ -185,8 +185,7 @@ pub(crate) fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: 
                     while let Some((start, len)) =
                         first_marker_outside_literal(&cleaned, reasoning_literal_before, &[*tag])
                     {
-                        cleaned =
-                            strip_all_preserving_boundary(&cleaned, &cleaned[start..start + len]);
+                        cleaned = strip_preserving_boundary(&cleaned, start, start + len);
                     }
                 }
                 // Collapse role-word repetition loops (Qwen3.5/3.6
@@ -467,6 +466,9 @@ pub(crate) fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: 
         // (which take other &mut state fields) run.
         let outputs = {
             let det = state.detector.as_mut().expect("detector is Some");
+            // A native GLM boundary must not publish an unvalidated call header.
+            // Keep this metadata-scoped; other models retain early headers.
+            det.set_complete_poolside_calls(ctx.state.glm_tool_boundary.is_some());
             det.process(&delta)
         };
         if drain_detector_outputs(state, ctx, outputs, &mut deltas) {

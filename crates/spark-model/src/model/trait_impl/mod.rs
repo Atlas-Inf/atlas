@@ -26,6 +26,7 @@ mod decode_a3;
 mod decode_a_diag;
 mod decode_b;
 mod decode_b2;
+mod decode_canonical;
 mod decode_checkpoint;
 mod decode_graph_key;
 mod drafter_anchor;
@@ -37,6 +38,7 @@ mod exact_verify_check;
 pub(crate) mod finish_leaf;
 pub(crate) mod gdn_commit_fuse;
 mod graph_borrow;
+mod kda_commit;
 mod lm_head_batched;
 pub(crate) use lm_head_batched::lm_head_batch_gemv_enabled;
 mod lm_head_dp4a;
@@ -65,6 +67,23 @@ pub(in crate::model) mod verify_rows;
 impl Model for TransformerModel {
     fn verify_logits_argmax_only(&self) -> bool {
         self.glm_verify_logits_argmax_only()
+    }
+
+    fn verify_split_sampling(&self) -> bool {
+        self.glm_verify_sample_supported()
+    }
+
+    fn verify_split_candidates(
+        &self,
+        rows: usize,
+        temperature: f32,
+        specials: &[u32],
+    ) -> Result<Vec<crate::model::SplitRow>> {
+        self.glm_verify_candidates(rows, temperature, specials)
+    }
+
+    fn verify_split_full_rows(&self, rows: usize, out: &mut [u8]) -> Result<()> {
+        self.glm_verify_full_rows(rows, out)
     }
 
     fn lightning_dspark_product_policy(

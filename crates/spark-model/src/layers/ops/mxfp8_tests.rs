@@ -92,6 +92,7 @@ fn swiglu(gpu: &dyn GpuBackend, rows: usize) -> Result<()> {
     let w = crate::weight_map::Mxfp8Weight {
         data: DevicePtr(0x200),
         scales: DevicePtr(0x300),
+        tiled: false,
     };
     mxfp8_swiglu_rows(
         gpu,
@@ -120,6 +121,16 @@ fn swiglu_rows_run_32_row_launches_on_the_row_tier() {
         assert_eq!(launches.iter().map(|l| l.func).collect::<Vec<_>>(), want);
         // A CTA writes 8 outputs of the [rows, inter] activation.
         assert!(launches.iter().all(|l| l.grid == [320 / 8, 1, 1]));
+    }
+}
+
+#[test]
+fn tiled_switch_is_explicit() {
+    assert!(!parse_tiled(None).unwrap());
+    assert!(!parse_tiled(Some("0")).unwrap());
+    assert!(parse_tiled(Some("1")).unwrap());
+    for value in ["", "true", "2", " 1"] {
+        assert!(parse_tiled(Some(value)).is_err(), "{value:?}");
     }
 }
 
@@ -165,6 +176,7 @@ fn swiglu_rows_refuse_a_k_off_the_scale_grid() {
     let w = crate::weight_map::Mxfp8Weight {
         data: DevicePtr(0x200),
         scales: DevicePtr(0x300),
+        tiled: false,
     };
     let r = mxfp8_swiglu_rows(
         &gpu,
@@ -179,4 +191,11 @@ fn swiglu_rows_refuse_a_k_off_the_scale_grid() {
     );
     assert!(r.is_err());
     assert_eq!(gpu.launch_count(), 0);
+}
+
+#[test]
+fn plain_tiers_split_at_8_and_16_rows() {
+    for (m, tier) in [(1, 0), (8, 0), (9, 1), (16, 1), (17, 2), (32, 2)] {
+        assert_eq!(mxfp8_tier(m), tier, "m={m}");
+    }
 }

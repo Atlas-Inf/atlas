@@ -224,6 +224,19 @@ impl TransformerModel {
     /// most 2 NCCL ops per chunk-0 cache hit (negligible vs the prefill
     /// compute it unblocks).
     pub(super) fn ep_min_u32(&self, val: u32) -> Result<u32> {
+        self.ep_min_u32_with(val, false)
+    }
+
+    /// [`Self::ep_min_u32`] where rank 0 may arrive long after the others
+    /// (it encoded vision items they only receive: about 20 s per 2048^2
+    /// image). The others take rank 0's word as an idle receive, which the
+    /// slow-collective latch does not count, so a long encode does not mark
+    /// the communicator unhealthy. Same collectives, same order.
+    pub(super) fn ep_min_u32_head_late(&self, val: u32) -> Result<u32> {
+        self.ep_min_u32_with(val, true)
+    }
+
+    fn ep_min_u32_with(&self, val: u32, head_late: bool) -> Result<u32> {
         let Some(comm) = self.comm.as_ref() else {
             return Ok(val);
         };
@@ -243,7 +256,11 @@ impl TransformerModel {
                 comm.broadcast(self.ep_cmd_buf.0, 4, root)?;
                 val
             } else {
-                comm.broadcast(self.ep_cmd_buf.0, 4, root)?;
+                if head_late && root == 0 {
+                    comm.receive_idle_command_word(self.ep_cmd_buf.0)?;
+                } else {
+                    comm.broadcast(self.ep_cmd_buf.0, 4, root)?;
+                }
                 self.gpu.synchronize(stream)?;
                 let mut buf = [0u8; 4];
                 self.gpu.copy_d2h(self.ep_cmd_buf, &mut buf)?;
@@ -285,13 +302,27 @@ impl TransformerModel {
     /// in `sample_first_token` D2H, worker in the next cmd recv, both
     /// GPUs spinning in NCCL kernels).
     /// `(window, request)` vision-row bounds the API admits against
-    /// (`vision_limits`). Enntity/atlas b060f987.
+    /// (`vision_limits`) and both ranks apply to the vision wire state.
+    /// Derived from the shared configuration only, so the head and the
+    /// worker agree. Enntity/atlas b060f987.
+    ///
+    /// The native GLM tower on a multi-rank world keeps a deferred request
+    /// inside its window: that is what the rank protocol admitted before
+    /// (the header was checked against the window), and the per-chunk
+    /// encode past it is not measured on GLM. A single GLM rank never checked
+    /// the header, so it keeps the context bound (its chunks are still
+    /// checked against the window). Enntity/atlas ab1823c8.
     pub(crate) fn vision_row_bounds(&self) -> crate::model::vision_transport::VisionRowBounds {
         let ve = self.vision_encoder.as_ref();
         let window = ve.map_or(0, |ve| ve.output_rows());
+        let glm = ve.is_some_and(|ve| ve.is_glm());
         crate::model::vision_transport::VisionRowBounds {
             window,
-            request: self.config.max_seq_len,
+            request: if glm && self.multi_rank_protocol_active() {
+                window
+            } else {
+                self.config.max_seq_len
+            },
         }
     }
 

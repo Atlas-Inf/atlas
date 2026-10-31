@@ -39,16 +39,18 @@ pub(super) fn render_template(
     reasoning_effort: Option<crate::ir::ReasoningEffort>,
     preserve_thinking: Option<bool>,
     tools_active: bool,
-    // `response_format` set: thinking off renders a closed think block
-    // (`RenderFlags::empty_think_off`), so no template-forced thinking.
-    structured_output: bool,
 ) -> Result<TemplateOut, Response> {
     // Use closed thinking when client doesn't explicitly enable it.
     let template_thinking = enable_thinking;
+    let reasoning_effort = reasoning_effort.map(if state.behavior.verbatim_reasoning_effort {
+        crate::ir::ReasoningEffort::wire_str
+    } else {
+        crate::ir::ReasoningEffort::as_str
+    });
 
     // Build JSON messages with structured tool_calls for Jinja.
     let mut json_messages =
-        build_json_messages_for(messages, state.tokenizer.uses_deepseek_v4_encoding());
+        build_json_messages_for(messages, state.tokenizer.tool_call_ids_in_template);
     // When TSCG is enabled the parser's `system_prompt()` has already
     // placed the compact tool signatures into messages[0]; passing
     // `tools` to Jinja as well would re-render the full JSON schema and
@@ -114,9 +116,8 @@ pub(super) fn render_template(
                 jinja_tools.as_deref(),
                 template_thinking,
                 state.behavior.disable_tool_steering,
-                reasoning_effort.map(crate::ir::ReasoningEffort::as_str),
+                reasoning_effort,
                 preserve_thinking,
-                structured_output,
             )
             .map(|t| t.len())
             .unwrap_or(0);
@@ -134,9 +135,8 @@ pub(super) fn render_template(
         jinja_tools.as_deref(),
         template_thinking,
         state.behavior.disable_tool_steering,
-        reasoning_effort.map(crate::ir::ReasoningEffort::as_str),
+        reasoning_effort,
         preserve_thinking,
-        structured_output,
     ) {
         Ok(t) => t,
         Err(e) => {

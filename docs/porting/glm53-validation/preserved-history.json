@@ -1,0 +1,17 @@
+{
+  "records": [
+    {
+      "source": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/documentation-drafts/submission-stack-history-20261014.json",
+      "destination": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/release-final-cb45065c-20261015/documentation-drafts/submission-stack-history-20261014.json",
+      "sha256": "3b83631771e6896206b12bfaa239789b52b7b00a238dcc27cbde7282d162ba02",
+      "meaning": "Unchanged historical source/rights record; no new rights or qualification decision."
+    },
+    {
+      "source": "/home/abc/storage/models/atlas-glm53-verify-metric-fix/docs/porting/glm53-validation/rights-audit.json",
+      "destination": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/release-final-cb45065c-20261015/documentation-drafts/rights-audit.json",
+      "sha256": "2ed44de1f455d56b0af76d11fc895ae7ecda8cf2af54a5275924b9005930bd8b",
+      "meaning": "Unchanged historical source/rights record; no new rights or qualification decision."
+    }
+  ],
+  "rights_scope": "Historical ledger may mention deferred work; unchanged copy preserves human/source credits and unresolved contributor questions."
+}

@@ -9,7 +9,7 @@
 
 use spark_runtime::gpu::{DevicePtr, KernelHandle};
 
-mod glm;
+pub(crate) mod glm;
 pub(crate) use glm::{
     GlmVisionBlockWeights, GlmVisionEncoder, GlmVisionMergerWeights, GlmVisionWeights,
 };

@@ -13,6 +13,7 @@ pub fn bf16_to_f32(lo: u8, hi: u8) -> f32 {
 mod dflash_seq_policy;
 mod watchdog_floor;
 use dflash_seq_policy::dflash_seq_raw_argmax_policy;
+pub use dflash_seq_policy::dflash_seq_uses_split_rows;
 pub use watchdog_floor::watchdog_floor_reached;
 
 /// Whether a verify path may bypass the canonical logits pipeline.
@@ -38,7 +39,9 @@ pub fn dflash_verify_uses_raw_argmax(
 /// so a nonzero request temperature does not itself disqualify the raw
 /// path — only transforms that can move the argmax do. A model whose verify
 /// head writes only argmax ids (`verify_logits_argmax_only`) always takes
-/// the raw path: its logits buffer is partly stale.
+/// the raw path here: its logits buffer is partly stale. The DFlash tail
+/// serves such a head's other sequences through its sampled-verify exchange
+/// ([`dflash_seq_uses_split_rows`]).
 pub fn dflash_seq_uses_raw_argmax(
     raw_requested: bool,
     masked_requested: bool,

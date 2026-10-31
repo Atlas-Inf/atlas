@@ -54,15 +54,6 @@ pub(crate) fn strip_stop_sequences_matched(
     (text, None)
 }
 
-/// Strip `<think>...</think>` reasoning content from model output.
-///
-/// Qwen3.5 models generate internal reasoning between `<think>` and `</think>` tags.
-/// This must be removed from the API response so that:
-/// 1. Clients don't see internal reasoning in the content field
-/// 2. Multi-turn conversations aren't corrupted when clients echo assistant content back
-///
-/// Returns only the text after the final `</think>` tag (the actual response),
-/// trimmed of leading whitespace.
 /// Extract `<think>...</think>` reasoning from model output.
 ///
 /// Returns `(reasoning_content, response_content)`.

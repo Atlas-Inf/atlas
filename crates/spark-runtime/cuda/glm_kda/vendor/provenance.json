@@ -1,0 +1,34 @@
+{
+  "repository": "https://github.com/MoonshotAI/FlashKDA",
+  "revision": "1ce47ea3bb22c84eb9cc665028399cf35e8ffb0b",
+  "license": "MIT",
+  "copyright": "Copyright (c)2026 MoonshotAI",
+  "files": [
+    {
+      "path": "fwd_kernel1.cuh",
+      "upstream_path": "csrc/smxx/fwd_kernel1.cuh",
+      "upstream_sha256": "e0f369b51753d5e1a62b8435f0b692fdc856d87e52eb27d012c22b6575a0370f",
+      "changes": [
+        "Added per-file license and provenance pointer."
+      ]
+    },
+    {
+      "path": "fwd_kernel2.cuh",
+      "upstream_path": "csrc/smxx/fwd_kernel2.cuh",
+      "upstream_sha256": "f8a634154ca26a18855adbd3db17d6208a874b16f173d0eb9814bfefff03b9b9",
+      "changes": [
+        "Added per-file license and provenance pointer."
+      ]
+    },
+    {
+      "path": "utils.cuh",
+      "upstream_path": "csrc/smxx/utils.cuh",
+      "upstream_sha256": "211cc28d910758e2658a53f5bcda779f1076df281ff75c09ce9bd1638a54151a",
+      "changes": [
+        "Added per-file license and provenance pointer.",
+        "Transpose indices in shared-memory FP32/BF16 conversion for Atlas canonical [key,value] persistent state; no global transpose workspace.",
+        "Removed an extra blank line at EOF; license notice and code unchanged."
+      ]
+    }
+  ]
+}

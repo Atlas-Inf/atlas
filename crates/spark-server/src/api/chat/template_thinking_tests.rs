@@ -58,6 +58,16 @@ fn tokenizer_with(
     inner
         .save(dir.path().join("tokenizer.json"), false)
         .unwrap();
+    // GLM renders the checkpoint's own template; no override carries it.
+    if model_type == "glm5_next" {
+        std::fs::write(dir.path().join("tokenizer_config.json"), "{}").unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("test_data/chat_templates/glm-5.3-flash-fp4-local.jinja"),
+            dir.path().join("chat_template.jinja"),
+        )
+        .unwrap();
+    }
     let tokenizer = ChatTokenizer::from_model_dir(
         dir.path(),
         0,
@@ -77,55 +87,6 @@ fn tokenizer_with(
 }
 
 #[test]
-fn rendered_glm_generation_tail_reconciles_requested_thinking() {
-    let (_dir, tokenizer) = glm_tokenizer();
-    assert_eq!(tokenizer.encode("<think></think>").unwrap(), [START, END]);
-    let messages = [json!({"role":"user","content":"Use get_weather for Oslo."})];
-    let tools = [json!({"type":"function","function":{
-        "name":"get_weather","parameters":{"type":"object","properties":{
-            "city":{"type":"string"}},"required":["city"]}
-    }})];
-    for requested in [false, true] {
-        let rendered = tokenizer
-            .apply_chat_template_openai(&messages, Some(&tools), requested, false)
-            .unwrap();
-        let suffix: &[u32] = if requested {
-            &[3, START]
-        } else {
-            &[3, START, END]
-        };
-        assert!(rendered.ends_with(suffix), "resolved thinking={requested}");
-        assert_eq!(
-            reconcile_prompt_thinking(&rendered, Some(START), Some(END), requested, Some(16), 128),
-            if requested {
-                (true, Some(16))
-            } else {
-                (false, None)
-            },
-            "GLM tools must retain enabled reasoning and its explicit budget"
-        );
-        let open = tokenizer
-            .apply_chat_template_openai(&messages, None, requested, false)
-            .unwrap();
-        // Without tools, thinking-off renders GLM's low-effort reasoning: the
-        // prompt still ends with an open <think>, and the server treats it as
-        // template-forced thinking with the maximum budget.
-        assert!(
-            open.ends_with(&[START]),
-            "plain request thinking={requested}"
-        );
-        assert_eq!(
-            reconcile_prompt_thinking(&open, Some(START), Some(END), requested, Some(32), 128),
-            if requested {
-                (true, Some(32))
-            } else {
-                (true, Some(128))
-            }
-        );
-    }
-}
-
-#[test]
 fn unrelated_or_missing_prompt_markers_preserve_policy() {
     for enabled in [false, true] {
         for tokens in [&[9, 10][..], &[START, END, 3][..], &[END][..]] {
@@ -142,39 +103,6 @@ fn unrelated_or_missing_prompt_markers_preserve_policy() {
     assert_eq!(
         reconcile_prompt_thinking(&[9, START], Some(START), None, false, None, 128),
         (true, Some(128))
-    );
-}
-
-#[test]
-fn response_format_with_thinking_off_renders_a_closed_think_block() {
-    // The rem-appraisal request shape: system + user, no tools, thinking off.
-    let (_dir, tokenizer) = glm_tokenizer();
-    let messages = [
-        json!({"role":"system","content":"Appraise the memories. Reply in JSON."}),
-        json!({"role":"user","content":"Hi"}),
-    ];
-    let render = |thinking: bool, structured: bool| {
-        tokenizer
-            .apply_chat_template_openai_with_effort(
-                &messages, None, thinking, false, None, None, structured,
-            )
-            .unwrap()
-    };
-    // response_format + thinking off: closed tail, never template-forced on.
-    let structured = render(false, true);
-    assert!(structured.ends_with(&[3, START, END]));
-    assert_eq!(
-        reconcile_prompt_thinking(&structured, Some(START), Some(END), false, None, 128),
-        (false, None)
-    );
-    // Without response_format the low-effort open think is unchanged.
-    assert!(render(false, false).ends_with(&[3, START]));
-    // Thinking on keeps its reasoning; the grammar starts after `</think>`.
-    let thinking = render(true, true);
-    assert!(thinking.ends_with(&[3, START]));
-    assert_eq!(
-        reconcile_prompt_thinking(&thinking, Some(START), Some(END), true, Some(32), 128),
-        (true, Some(32))
     );
 }
 
@@ -232,7 +160,6 @@ fn role_tokens_in_results_arguments_and_schemas_stay_text() {
                     false,
                     None,
                     None,
-                    false,
                 )
                 .unwrap();
             // Only the template's own turns remain.

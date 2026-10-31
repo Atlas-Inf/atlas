@@ -89,7 +89,21 @@ pub fn build_model(
             dflash: dflash_args.is_some() && lora_args.is_none(),
         },
     )?;
+    // Validate and load Atlas's sparse CUDA modules before the KV free-memory
+    // snapshot so code residency is included in the model's memory budget.
+    crate::layers::ops::initialize_glm_sparse_native(
+        &config,
+        max_batch_tokens,
+        max_seq_len,
+        kv_block_size,
+        max_batch_size,
+        kv_dtype,
+        &layer_dtypes,
+    )?;
+    crate::layers::ops::preload_glm_sparse_native(gpu.as_ref())?;
     crate::layers::ops::initialize_glm_sparse_prefill_pipe(gpu.as_ref(), &config)?;
+    crate::layers::ops::initialize_glm_kv_canonical(gpu.as_ref(), &config, kv_dtype)?;
+    crate::layers::ops::initialize_glm_mla_fuse(gpu.as_ref(), &config)?;
     // NLLB / M2M-100 is an encoder-decoder model that cannot be represented by
     // the decoder-only TransformerModel stack. Serve it with the dedicated
     // `NllbGpuModel`, which reads its weights from the standard `store` — this
@@ -201,6 +215,14 @@ pub fn build_model(
         && let Some(ref sub) = args.drafter_config.dflash_config
     {
         config.dflash_capture_layers = sub.target_layer_ids.clone();
+        // The window a bidirectional head keeps (`ctx_window_len`): the served
+        // one (Lightning admission's, else the caller's) capped at max_seq_len.
+        let served = lightning_dspark_policy
+            .as_ref()
+            .map(|policy| policy.profile().attention.swa_window)
+            .or(args.window_size);
+        config.dflash_ctx_window = (!args.drafter_config.query_causal())
+            .then(|| served.unwrap_or(max_seq_len).min(max_seq_len));
         tracing::info!(
             "DFlash: target layer capture indices = {:?} (drafter target_layer_ids, used directly)",
             config.dflash_capture_layers,
@@ -525,6 +547,58 @@ pub fn build_model(
     // ── KV budget: what is left of total × gpu_memory_utilization ──
     // (contract, own-footprint measures and headroom floor: `kv_budget`).
     //
+    // User-facing contract (matches vLLM / sparkrun convention):
+    //   total_memory × gpu_memory_utilization = hard ceiling on everything
+    //   this process consumes (weights + buffers + KV cache + reserves).
+    //
+    // KV cache gets whatever remains inside that ceiling after deducting
+    // prior allocations (model weights, buffer arena, CUDA context/driver)
+    // and the inference reserve (SSM state pools, CUDA headroom).  A safety
+    // clamp ensures we never exceed what the device can physically provide
+    // right now (handles external memory pressure on shared-memory /
+    // unified-memory systems like GB10).
+    // Prime one DFlash ctx accumulator NOW — before the residual KV-pool
+    // sizing below consumes every remaining byte of the device map. The acc
+    // is ~`ctx_window` rows of target hiddens (600+ MB at ctx_window≥12K);
+    // allocating it lazily at request time lands AFTER the KV pool claim
+    // and hits the fragmentation wall with GBs nominally free. One buffer
+    // covers the first request; a warm turn's acc returns through carry
+    // adoption, and any further demand falls to the lazy path. Failure only
+    // forfeits the optimization — the request-time path still allocates.
+    // AMD APUs only (atlas_scale), like both balloons below: on GB10 the
+    // lazy path never hit that wall, and every byte held here comes out of
+    // the KV pool (27B DFlash2 at util 0.80: 43.9k -> 9.9k KV tokens).
+    if cfg!(atlas_scale)
+        && let Some(ref args) = dflash_args
+        && let Some(ref sub) = args.drafter_config.dflash_config
+    {
+        let ctx_window: usize = std::env::var("ATLAS_DFLASH_CTX_WINDOW")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4096);
+        let ctx_capacity = ctx_window.min(max_seq_len);
+        if ctx_capacity > 0 && !sub.target_layer_ids.is_empty() {
+            let acc_bytes = ctx_capacity
+                .saturating_mul(sub.target_layer_ids.len())
+                .saturating_mul(config.hidden_size)
+                .saturating_mul(2);
+            match gpu.alloc(acc_bytes) {
+                Ok(ptr) => {
+                    crate::layers::dflash_head::CTX_ACC_POOL.lock().push(ptr);
+                    tracing::info!(
+                        "DFlash ctx acc pool: primed {acc_bytes} B before KV residual sizing"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "DFlash ctx acc pool prime: alloc of {acc_bytes} B failed ({e}); \
+                         request-time path will allocate on demand"
+                    );
+                }
+            }
+        }
+    }
+
     // SSM state/snapshot pools MUST be allocated before the
     // `gpu.free_memory()` snapshot below: whatever is live at that point
     // lands in `used_so_far` and shrinks the KV budget automatically
@@ -626,8 +700,12 @@ pub fn build_model(
     let derived_reserve = crate::layers::ops::lazy_bf16_reserve(&store);
     // NVMe spill tiers (default off → 0): their staging, the index of a full
     // disk budget and the SSM tier's arena are all committed after this point.
-    let nvme_record_bytes =
-        PagedKvCache::nvme_record_bytes_for(&kv_config, glm_cache_plan.is_some(), sparse_index);
+    let nvme_geometry = PagedKvCache::nvme_geometry_for(
+        &kv_config,
+        glm_cache_plan.is_some(),
+        sparse_index,
+        glm_cache_plan.and_then(|p| p.shard()).is_some(),
+    );
     // ATLAS_QWEN4EXP_SNAPSHOT_SLOTS / _AUX_MB: the snapshots' host aux
     // (`ssm_snapshot_budget`), 0 by default.
     let snapshot_aux = crate::model::ssm_snapshot_budget::install(
@@ -636,7 +714,7 @@ pub fn build_model(
     );
     let reserve_net = reserve_net
         + snapshot_aux
-        + kv_nvme::host_reserve_bytes(nvme_record_bytes, ssm_pools.tier_lazy_host_bytes());
+        + kv_nvme::host_reserve_bytes(nvme_geometry, ssm_pools.tier_lazy_host_bytes());
     let budget = kv_budget::measure(
         gpu.as_ref(),
         total_mem,
@@ -753,30 +831,30 @@ pub fn build_model(
             n
         }
     };
-    // The carveout adds blocks beyond the budget (not to a fixed HSS window or
-    // a latent shard, whose ranks hold different latents).
+    // The carveout adds blocks beyond the budget (not to a fixed HSS window).
+    // Under a latent shard it holds this rank's half-size latent pools.
     let kv_shape = kv_carveout::KvShape {
         config: &kv_config,
         v_aliases_k: glm_cache_plan.is_some(),
         index: sparse_index,
         tail_slots,
-        // Native proposer bytes (GLM MTP head private KV, #199) are absent
-        // on main — 0 here; QSA per-token bytes come through with_per_token_aux.
+        latent_shard: glm_cache_plan.and_then(|p| p.shard()),
+        // Native proposer bytes per logical block; always remain in system
+        // memory (Enntity/atlas 4d75b9ec).
         auxiliary_block_bytes: 0,
     }
     .with_per_token_aux(aux_bytes_per_token)?;
-    let (blocks, kv_placement) =
-        if hss_cache_blocks_per_seq.is_none() && glm_cache_plan.and_then(|p| p.shard()).is_none() {
-            kv_carveout::extend(gpu.as_ref(), kv_shape, num_kv_blocks)
-        } else {
-            (num_kv_blocks, Default::default())
-        };
+    let (blocks, kv_placement) = if hss_cache_blocks_per_seq.is_none() {
+        kv_carveout::extend(gpu.as_ref(), kv_shape, num_kv_blocks)
+    } else {
+        (num_kv_blocks, Default::default())
+    };
     num_kv_blocks = glm::agree_kv_blocks(
         comm.as_deref(),
         gpu.as_ref(),
         blocks,
         glm_cache_plan,
-        kv_nvme::rank_word(nvme_record_bytes, ssm_pools.tier_home),
+        kv_nvme::rank_word(nvme_geometry, ssm_pools.tier_home),
     )?;
     let _max_kv_tokens = num_kv_blocks * kv_block_size;
     // Phase 6.1.f / 6.2.c — when --high-speed-swap is on with HBM-shrink, the
@@ -868,6 +946,7 @@ pub fn build_model(
         }
         Err(e) => return Err(e),
     };
+
     if let Some(index) = sparse_index {
         kv_cache.attach_sparse_index_with_tail_slots(index, tail_slots, gpu.as_ref())?;
     }
@@ -1114,6 +1193,7 @@ pub fn build_model(
                 };
                 // Strict for every head: an unknown value fails the build.
                 startup.diagnostics.first_append = FirstAppend::for_head()?;
+                startup.diagnostics.warm_ctx = crate::layers::dflash_head::WarmCtx::for_head()?;
                 let mut head = crate::layers::BlockDiffusionDraftHead::from_weights(
                     weights,
                     target_embed_for_dflash,
@@ -1141,7 +1221,8 @@ pub fn build_model(
                 if let Some(parts) = split {
                     let batch = crate::layers::dflash_head::rank_split::batch_requested()?;
                     let ctx = crate::layers::dflash_head::rank_split::ctx_requested()?;
-                    head.enable_rank_split(parts, batch, ctx, model.gpu_backend())?;
+                    let topk = crate::layers::dflash_head::rank_split::topk_requested()?;
+                    head.enable_rank_split(parts, batch, ctx, topk, model.gpu_backend())?;
                 }
                 if rank != 0 {
                     anyhow::ensure!(

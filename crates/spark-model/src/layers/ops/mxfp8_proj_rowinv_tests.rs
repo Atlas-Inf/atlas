@@ -65,6 +65,7 @@ mod gpu {
                 .collect();
             let proj = Mxfp8Proj {
                 w: Mxfp8Weight {
+                    tiled: false,
                     data: upload(g, &w).unwrap(),
                     scales: upload(g, &s).unwrap(),
                 },

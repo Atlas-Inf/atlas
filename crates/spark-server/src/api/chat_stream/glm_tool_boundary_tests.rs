@@ -26,6 +26,8 @@ const LITERAL_CONTENT: [&str; 4] = [
     "```xml\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>\n```\nEND",
 ];
 
+#[path = "glm_boundary_case_tests.rs"]
+mod glm_boundary_case_tests;
 #[path = "glm_literal_xml_tests.rs"]
 mod glm_literal_xml_tests;
 #[path = "glm_tool_args_tests.rs"]
@@ -36,6 +38,8 @@ mod qwen_literal_xml_tests;
 mod reasoning_done_tests;
 #[path = "tool_security_tests.rs"]
 mod tool_security_tests;
+#[path = "vision_admission_refusal_tests.rs"]
+mod vision_admission_refusal_tests;
 
 fn app(glm: bool) -> Arc<AppState> {
     app_for_model(

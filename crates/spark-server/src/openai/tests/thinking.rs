@@ -301,7 +301,7 @@ fn chat_template_kwargs_reasoning_effort_channel() {
         req.client_thinking_directive(),
         ThinkingDirective::OnEffort(EffortLevel::XHigh)
     );
-    assert_eq!(req.client_reasoning_effort(), Some(ReasoningEffort::Max));
+    assert_eq!(req.client_reasoning_effort(), Some(ReasoningEffort::XHigh));
 }
 
 /// Trap C fix: a typo'd effort must FAIL, not silently resolve — on any
@@ -405,4 +405,24 @@ fn reasoning_effort_strings_render_template_safe() {
         chat_req(b).client_reasoning_effort(),
         Some(ReasoningEffort::Medium)
     );
+}
+
+#[test]
+fn every_wire_effort_keeps_its_spelling_and_its_cross_template_tier() {
+    // `wire_str` is what a template that owns its effort vocabulary is
+    // handed ([behavior].verbatim_reasoning_effort, as vLLM passes it);
+    // `as_str` stays the cross-template tier every other model renders.
+    for (wire, tier) in [
+        ("minimal", "low"),
+        ("low", "low"),
+        ("medium", "medium"),
+        ("high", "high"),
+        ("xhigh", "xhigh"),
+        ("max", "xhigh"),
+    ] {
+        let (effort, _) = crate::ir::parse_wire_effort(wire).unwrap();
+        let effort = effort.unwrap();
+        assert_eq!(effort.wire_str(), wire);
+        assert_eq!(effort.as_str(), tier);
+    }
 }
