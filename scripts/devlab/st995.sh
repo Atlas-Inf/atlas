@@ -44,6 +44,16 @@ for d in $(ls -dt "$PWD"/target/release/build/atlas-kernels-*/out 2>/dev/null); 
 done
 LD_LIBRARY_PATH="${SHIM:-}:${ROCM_PATH:-/opt/rocm}/lib:${LD_LIBRARY_PATH:-}" \
   "$PWD/target/release/spark" benchmark run bfcl-subset --yes --url "http://127.0.0.1:$PORT" --model m > "$OUT/bfcl.log" 2>&1 || true
+# bfcl-eval's scorer imports qwen_agent, which imports soundfile, which the provisioned venv does not carry: run
+# 41187711625 generated all 995 responses and then failed to score ("No module named 'soundfile'"). The runner keeps
+# responses.jsonl and prints the rescore command, so install the module into that venv and rescore in place.
+if grep -aq "No module named 'soundfile'" "$OUT/bfcl.log"; then
+  V=$(grep -aoE "/[^ ]*/bfcl/venv" "$OUT/bfcl.log" | head -1)
+  RC=$(sed -E 's/\x1b\[[0-9;]*m//g' "$OUT/bfcl.log" | grep -aoE "can be rescored: .*" | head -1 | sed 's/^can be rescored: //')
+  log "scorer missing soundfile; installing into $V and rescoring"
+  "$V/bin/python" -m pip install -q soundfile >> "$OUT/bfcl.log" 2>&1 || true
+  [ -n "$RC" ] && bash -c "$RC" >> "$OUT/bfcl.log" 2>&1 || true
+fi
 sed -E 's/\x1b\[[0-9;]*m//g' "$OUT/bfcl.log" | grep -aE "^\s+[a-z_]+\s+(hallucination|live|non_live)\s+[0-9.]+|▸|overall [0-9.]+" | tee -a "$RES" \
   || { log "no BFCL table in the log; tail:"; tail -15 "$OUT/bfcl.log" | tee -a "$RES"; }
 kill -INT $SPID 2>/dev/null || true; for _ in $(seq 1 90); do kill -0 $SPID 2>/dev/null || break; sleep 2; done; kill -9 $SPID 2>/dev/null || true
