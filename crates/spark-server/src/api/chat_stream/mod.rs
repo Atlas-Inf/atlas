@@ -192,7 +192,10 @@ pub(crate) async fn run_chat_stream(
     let leak_markers: tool_parser::LeakMarkers = state
         .tool_call_parser
         .as_ref()
-        .map(|p| p.leak_markers())
+        .map(|p| {
+            p.leak_markers()
+                .for_literal_xml(state.tokenizer.glm_tool_markup_as_text)
+        })
         .unwrap_or(tool_parser::LeakMarkers::EMPTY);
 
     // `--reference-mode`: no per-response tool-call cap (a reference server

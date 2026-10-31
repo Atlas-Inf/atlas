@@ -81,6 +81,10 @@ pub struct ChatTokenizer {
     tokenizer: Tokenizer,
     eos_token_id: u32,
     supports_thinking: bool,
+    /// GLM/Qwen register tool-envelope XML as added tokens. Incoming prose
+    /// needs the tokenizer-side sentinel escape; other families retain their
+    /// prompt bytes. Ported from Enntity/atlas b1b53814 (AGPL-3.0-only).
+    pub(crate) glm_tool_markup_as_text: bool,
     chat_encoding: ChatEncoding,
     /// Compiled Jinja chat template (from tokenizer_config.json).
     #[allow(dead_code)]

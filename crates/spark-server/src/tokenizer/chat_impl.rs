@@ -7,7 +7,9 @@ use std::path::Path;
 use tokenizers::Tokenizer;
 
 mod glm5_vision;
+mod glm_tool_markup;
 mod qwen3vl_vision;
+mod vision_markup;
 
 use super::{
     ChatEncoding, ChatTokenizer, StreamingDecoder, autoclose_assistant_think,
@@ -173,6 +175,7 @@ impl ChatTokenizer {
             tokenizer,
             eos_token_id,
             supports_thinking,
+            glm_tool_markup_as_text: matches!(model_type, "glm5_next" | "qwen4_exp"),
             chat_encoding,
             omni_image_tokens,
             chat_template,
@@ -186,6 +189,12 @@ impl ChatTokenizer {
     /// callers that need to drive low-level encode/decode directly).
     pub fn inner(&self) -> &tokenizers::Tokenizer {
         &self.tokenizer
+    }
+
+    /// Bare-role literal filtering applies only when the model does NOT
+    /// encode tool markup as text (Enntity/atlas 1c1a8fee, AGPL-3.0-only).
+    pub(crate) fn filters_bare_role_literals(&self) -> bool {
+        !self.glm_tool_markup_as_text && self.tokenizer.token_to_id("<|im_start|>").is_some()
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
@@ -332,7 +341,7 @@ impl ChatTokenizer {
             );
         }
 
-        self.encode(&rendered)
+        self.encode_rendered(&rendered)
     }
 
     /// Apply the OpenAI-variant template (if available), falling back to the default.
@@ -397,7 +406,7 @@ impl ChatTokenizer {
                 },
             )
             .map_err(|e| anyhow::anyhow!("Failed to render OpenAI Jinja template: {e}"))?;
-            self.encode(&rendered)
+            self.encode_rendered(&rendered)
         } else {
             self.apply_chat_template_jinja_with_effort(
                 messages,
@@ -513,32 +522,6 @@ impl ChatTokenizer {
     }
 }
 
-/// nemotron_h_omni: each bare `<image>`(img) -> `<img>` + N×img + `</img>`.
-/// `pad_counts[i]` is the i-th image's token count (target_patches /
-/// downsample²), matching the checkpoint processor's `num_tokens`.
-/// Refuse-not-truncate is enforced downstream: a pad run that would
-/// not fit the sequence budget makes the request fail rather than
-/// being cut mid-image.
-pub(crate) fn expand_omni_pads(
-    tokens: Vec<u32>,
-    pad_counts: &[usize],
-    img: u32,
-    start: u32,
-    end: u32,
-) -> Vec<u32> {
-    let mut out = Vec::with_capacity(tokens.len() + pad_counts.iter().sum::<usize>());
-    let mut idx = 0usize;
-    for t in tokens {
-        if t == img && idx < pad_counts.len() {
-            out.push(start);
-            for _ in 0..pad_counts[idx].max(1) {
-                out.push(img);
-            }
-            out.push(end);
-            idx += 1;
-        } else {
-            out.push(t);
-        }
-    }
-    out
-}
+#[path = "chat_impl/omni_pads.rs"]
+mod omni_pads;
+pub(crate) use omni_pads::*;

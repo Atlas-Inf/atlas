@@ -39,6 +39,7 @@ mod halluc_probe;
 mod hint_injector;
 mod ids;
 mod ir;
+mod literal_xml;
 mod llmlingua;
 mod lookback_lens;
 mod loop_detector;
