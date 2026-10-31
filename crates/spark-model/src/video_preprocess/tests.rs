@@ -11,10 +11,14 @@ use crate::video_decode_ffmpeg::FfmpegPolicy;
 
 /// The default: no subprocess. Every GIF case must pass without it, which is
 /// the guarantee that the pure-Rust path is not quietly depending on ffmpeg.
+#[allow(dead_code)]
+#[allow(dead_code)]
 fn no_ffmpeg() -> FfmpegPolicy {
     FfmpegPolicy::default()
 }
 
+#[allow(dead_code)]
+#[allow(dead_code)]
 fn cfg() -> VisionConfig {
     VisionConfig {
         is_glm5_next: false,
@@ -179,6 +183,8 @@ fn glm5_sampling_plans_whole_temporal_groups() {
 // ── decode + grouping, against a real generated GIF ──────────────────────
 
 /// Build an animated GIF of `n` solid-color frames at `size`x`size`.
+#[allow(dead_code)]
+#[allow(dead_code)]
 fn make_gif(n: u16, size: u16) -> String {
     use image::codecs::gif::GifEncoder;
     use image::{Delay, Frame, RgbaImage};
