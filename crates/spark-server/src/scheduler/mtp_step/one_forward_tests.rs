@@ -488,4 +488,4 @@ mod grammar;
 mod logprob_tests;
 
 #[path = "bootstrap_score_tests.rs"]
-mod bootstrap_score_tests; (shared: copy drafts in place of the MTP head's propose (ATLAS_QWEN_COPY_DRAFTS))
+mod bootstrap_score_tests;

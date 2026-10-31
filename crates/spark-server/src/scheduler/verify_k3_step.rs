@@ -135,7 +135,7 @@ fn k3_propose(
             tracing::error!("run_mtp_propose_multi: {e:#}");
         }
     }
-} (shared: copy drafts in place of the MTP head's propose (ATLAS_QWEN_COPY_DRAFTS))
+}
 /// K=3 verify: [last_token, draft1, draft2] → [v0, v1, v2]. Three outcomes.
 ///
 /// `verify_ctx` carries the tokenizer special-token IDs the

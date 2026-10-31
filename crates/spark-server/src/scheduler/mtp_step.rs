@@ -179,7 +179,7 @@ pub fn step_mtp(
         for &idx in &verify_idxs {
             crate::scheduler::copy_drafts::offer(&mut active[idx]);
         }
-    } (shared: copy drafts in place of the MTP head's propose (ATLAS_QWEN_COPY_DRAFTS))
+    }
 
     // ── Phase B: Verify with pipelined checkpoint ──
     //

@@ -508,7 +508,7 @@ impl MtpGate {
         if self.win_steps >= WINDOW_STEPS {
             self.close_window();
         } else if !self.probing
-            && !self.require_full_window (scheduler: amortize width-change startup before MTP arbitration)
+            && !self.require_full_window
             && self.tokens_since_event >= self.event_interval()
         {
             // Time to look at the other mode: finish the current window

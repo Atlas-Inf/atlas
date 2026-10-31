@@ -114,7 +114,7 @@ impl DeepDepth {
     fn drafts_from(&self, start: Option<usize>, floor: usize, max: usize) -> usize {
         let floor = floor.clamp(1, max.max(1));
         if self.depth == 0 {
-            start.map_or(floor, |s| s.clamp(floor, max.max(1)))'s decision window and start ceiling)
+            start.map_or(floor, |s| s.clamp(floor, max.max(1)))
         } else {
             (self.depth as usize).clamp(floor, max.max(1))
         }
