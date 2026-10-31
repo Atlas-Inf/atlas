@@ -44,6 +44,10 @@ pub(super) fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<Clip
         .args([
             "-v",
             "error",
+            "-protocol_whitelist",
+            "file,pipe",
+            "-format_whitelist",
+            "mov,matroska,webm,avi,mpegts,mpeg,ogg,flv",
             "-select_streams",
             "v:0",
             "-show_entries",
@@ -107,7 +111,7 @@ pub(super) fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<Clip
 
     Ok(ClipTiming {
         duration_secs,
-        native_fps,
+        native_fps: native_fps.into(),
         frame_count,
     })
 }

@@ -183,6 +183,27 @@ pub fn decode_frames(
     Ok(decode_with_plan(bytes, target_fps, policy)?.0)
 }
 
+/// Refuse before probing when subprocess decoding is off or its binary
+/// cannot run. Checked BEFORE the clip is probed: otherwise a missing binary
+/// surfaces as an unprobeable clip, which sends the operator hunting for a
+/// corrupt video when the real fix is to install ffmpeg. `probe` names the
+/// binary and the remedy.
+fn ensure_decoder(policy: &FfmpegPolicy) -> Result<()> {
+    ensure!(
+        policy.enabled,
+        "this container needs ffmpeg to decode and subprocess decoding is disabled; \
+         pass --video-allow-ffmpeg to enable it, or send an animated GIF"
+    );
+    if let Availability::Missing(detail) = probe(policy) {
+        anyhow::bail!(
+            "the ffmpeg decoder is not usable: {detail} (no ffmpeg installed at that path, or it \
+             could not run) — install ffmpeg with its ffprobe companion, or point \
+             --video-ffmpeg-path at a usable build"
+        );
+    }
+    Ok(())
+}
+
 /// What a probe found, or the error that says it could not be determined.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClipTiming {
@@ -190,7 +211,7 @@ pub struct ClipTiming {
     pub duration_secs: f32,
     /// The video stream's own rate: an average when the container declares
     /// one, otherwise the instantaneous rate. Used only to plan coverage.
-    pub native_fps: f32,
+    pub native_fps: f64,
     /// Declared source frame count (`nb_frames`), when the container names
     /// it. `None` sizes the plan by duration alone.
     pub frame_count: Option<u64>,
@@ -237,7 +258,7 @@ pub fn decode_with_plan(
     let timing = probe_duration(bytes, policy)?;
     let want = wanted_frames(
         timing.duration_secs,
-        timing.native_fps,
+        timing.native_fps as f32,
         fps,
         policy.max_frames,
         fps,
@@ -269,7 +290,8 @@ pub fn decode_with_plan(
                 .filter(|&count| count > 1)
                 .map(|count| timing.duration_secs / (count - 1) as f32)
                 .or_else(|| {
-                    crate::video_sample::finite_positive(timing.native_fps).map(|rate| 1.0 / rate)
+                    crate::video_sample::finite_positive(timing.native_fps as f32)
+                        .map(|rate| 1.0 / rate)
                 })
                 .unwrap_or(1.0 / fps);
             let old_end = *plan.times.last().expect("a non-empty plan");
@@ -350,7 +372,16 @@ fn spawn_ffmpeg<T>(
     let mut child = Command::new(&policy.binary)
         // Never touch a terminal: without `-nostdin` ffmpeg can block on a
         // prompt when it thinks stdin is interactive.
-        .args(["-v", log_level, "-nostdin", "-i"])
+        .args([
+            "-v",
+            log_level,
+            "-nostdin",
+            "-protocol_whitelist",
+            "file,pipe",
+            "-format_whitelist",
+            "mov,matroska,webm,avi,mpegts,mpeg,ogg,flv",
+            "-i",
+        ])
         .arg(input_file.path())
         .args(["-vf", filter])
         .args(["-frames:v", &frames.to_string()])
