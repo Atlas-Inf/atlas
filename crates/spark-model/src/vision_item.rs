@@ -51,7 +51,6 @@ impl VisionItem {
         let content_hash = content_hash(&groups, grid_h, grid_w);
         Self {
             held: crate::vision_budget::HeldRows::default(),
-            groups: vec![pixels],
             groups,
             grid_h,
             grid_w,

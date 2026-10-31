@@ -75,11 +75,10 @@ impl TransformerModel {
                 payload > 0,
                 "vision request produced an empty encoder payload"
             );
-            (state, grids, payload)
             let payload = if deferred {
                 0
             } else {
-                let payload = payload_bytes(&state, ve.out_hidden_size, ve.output_rows())?;
+                let payload = payload_bytes(&state, ve.out_hidden_size(), ve.output_rows())?;
                 anyhow::ensure!(
                     payload > 0,
                     "vision request produced an empty encoder payload"
@@ -163,14 +162,11 @@ impl TransformerModel {
         } else {
             Vec::new()
         };
-        let grids = parse_grid_words(&grid_words, &state)?;
-        let payload = if let Some(ve) = &self.vision_encoder {
-            payload_bytes(&state, ve.out_hidden_size(), ve.output_rows())?
         let (grids, hashes) = parse_grid_words(&grid_words, &state)?;
         let payload = if state.deferred {
             0
         } else if let Some(ve) = &self.vision_encoder {
-            payload_bytes(&state, ve.out_hidden_size, ve.output_rows())?
+            payload_bytes(&state, ve.out_hidden_size(), ve.output_rows())?
         } else {
             anyhow::ensure!(
                 state.rows == 0,

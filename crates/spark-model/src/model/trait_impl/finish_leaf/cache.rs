@@ -86,8 +86,6 @@ impl TransformerModel {
             return std::borrow::Cow::Borrowed(&seq.prefix_ref_tokens);
         }
         let finish = finish_cache(self.multi_rank_protocol_active(), self.leaf_on());
-        &seq.tokens[..held_tokens(finish, seq.prompt_len, seq.tokens.len())]
-        let finish = finish_cache(self.multi_rank_protocol_active(), enabled());
         self.pc_key_tokens(
             seq,
             &seq.tokens[..held_tokens(finish, seq.prompt_len, seq.tokens.len())],

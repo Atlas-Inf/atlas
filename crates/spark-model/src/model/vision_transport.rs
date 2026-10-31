@@ -67,7 +67,6 @@ impl std::fmt::Display for VisionCapacityError {
 
 impl std::error::Error for VisionCapacityError {}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct VisionWireState {
     pub rows: usize,

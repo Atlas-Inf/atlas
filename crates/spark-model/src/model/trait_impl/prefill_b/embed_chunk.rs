@@ -224,17 +224,6 @@ impl TransformerModel {
 
         // ── 1b. Overwrite image_pad token positions with vision encoder embeddings ──
         self.splice_vision_rows(tokens, chunk_start, chunk_len, hidden_dst, stream)?;
-
-                for (i, &tok) in chunk_tokens.iter().enumerate() {
-                    if tok == image_pad || tok == video_pad {
-                        let src = ve.out_row().offset(row_idx * ve.out_hidden_size() * 2);
-                        let dst = hidden_dst.offset(i * h * elem_bytes);
-                        self.gpu
-                            .copy_d2d_async(src, dst, ve.out_hidden_size() * 2, stream)?;
-                        row_idx += 1;
-                    }
-                }
-            }
         Ok(())
     }
 
@@ -322,10 +311,10 @@ impl TransformerModel {
                     start + i
                 );
             } else {
-                let src = ve.buf_out.offset(row_idx * ve.out_hidden_size * 2);
+                let src = ve.out_row().offset(row_idx * ve.out_hidden_size() * 2);
                 let dst = hidden_dst.offset(i * h * elem_bytes);
                 self.gpu
-                    .copy_d2d_async(src, dst, ve.out_hidden_size * 2, stream)?;
+                    .copy_d2d_async(src, dst, ve.out_hidden_size() * 2, stream)?;
                 row_idx += 1;
             }
             pad_idx += 1;

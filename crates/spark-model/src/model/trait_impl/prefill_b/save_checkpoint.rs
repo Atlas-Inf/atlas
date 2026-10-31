@@ -220,8 +220,6 @@ impl TransformerModel {
         let Some(boundary_key) = self.pc_key(seq, boundary_tokens) else {
             self.ssm_snapshots.free(snap_id);
             return false;
-        }
-            return Ok(());
         };
         let boundary_disk = if seq.disk_block_ids.len() >= end_block {
             &seq.disk_block_ids[..end_block]
