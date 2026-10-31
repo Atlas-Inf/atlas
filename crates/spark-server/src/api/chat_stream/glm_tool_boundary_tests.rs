@@ -25,6 +25,10 @@ const LITERAL_CONTENT: [&str; 4] = [
     "```xml\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>\n```\nEND",
 ];
 
+#[path = "glm_literal_xml_tests.rs"]
+mod glm_literal_xml_tests;
+#[path = "qwen_literal_xml_tests.rs"]
+mod qwen_literal_xml_tests;
 #[path = "reasoning_done_tests.rs"]
 mod reasoning_done_tests;
 
@@ -249,6 +253,23 @@ fn stream_tokens_with_context(
     tokens: Vec<u32>,
 ) -> (StreamCtx, StreamState, Vec<ir::StreamDelta>) {
     stream_tokens_with_state(app(glm), tools, tokens, request())
+}
+
+fn stream_for_app(
+    state: Arc<AppState>,
+    tools: bool,
+    tokens: Vec<u32>,
+) -> (StreamCtx, StreamState, Vec<ir::StreamDelta>) {
+    stream_for_request(state, tools, tokens, request())
+}
+
+fn stream_for_request(
+    state: Arc<AppState>,
+    tools: bool,
+    tokens: Vec<u32>,
+    request: ir::ChatRequest,
+) -> (StreamCtx, StreamState, Vec<ir::StreamDelta>) {
+    stream_tokens_with_state(state, tools, tokens, request)
 }
 
 /// Same runner with a caller-built `AppState` and `ChatRequest` (the
