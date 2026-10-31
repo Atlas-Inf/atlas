@@ -1471,3 +1471,21 @@ Then resume the dual-Spark stack (#198 → #242 → #253 → #254 → #255).
 Vets on `sha-87df79b`: Flash-Next NVFP4 PASS (agentic 50/50 + 50/50 at 15.79 s/turn, BFCL 86.53 / 85.69). 27B NVFP4: agentic
 50/50 + 50/50 at 8.92 s/turn, BFCL 83.02 / **71.32**. Normalized collapses because the hallucination category is 39.96
 (irrelevance 45.83, live_irrelevance 34.09), i.e. tool-call discipline; it's under investigation before its re-pin.
+
+## 2026-10-31 — Qwen4-27B draft up (local); stack resumed, sparky-only
+
+Draft `draft/qwen4-27b-dense` 3100e292d (local, not pushed):
+- dense-FFN arm for the qwen4_exp layers + the MTP drafter (`num_experts == 0`);
+- `hyper_connection.cu` QHC_PS_DPT 4 → 5 so H = 5120 is covered (dead iterations below; Flash-Next bit-identical);
+- `kernels/gb10/qwen4-27b/` target (`(qwen4_exp, 5120)` dispatch key coexisting with Flash-Next's 2560);
+- stdlib synthetic-checkpoint writer.
+SPEC updated from llama.cpp#31072: GDN 48V / 16K × 128 (QKVZ, BA96/48 per TP1/TP2); attention 24Q / 4KV × 256 with a sigmoid
+output gate; HC4 / lr320; FFN intermediate likely 14336; MTP draft 4. Open until the checkpoint: layer count / mix,
+`model_type`, GDN packed ordering. Sparky jobs 60 (synthetic smoke, MTP draft 4) and 61 (Flash-Next control on the draft)
+are queued.
+
+Stack (#198 → stack/vision-probe → #242 → #253 → #254 → #255 → #256), owner constraint: **sparky only**
+(reiner + spark2 are in use elsewhere). Plan: S1, check the chain and resolve conflicts with main via merge commits,
+reviewed before push. S2, gate the stack tip on sparky: workspace tests, FP4-Local control / agentic 50 / BFCL vs a
+same-base main, plus Flash-Next NVFP4 and 27B NVFP4 controls. The dual-node paths can't be gated from sparky, and the
+merge notes will say so.
