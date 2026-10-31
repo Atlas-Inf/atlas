@@ -94,6 +94,20 @@ fn tool_grammar_escape_applies(disable_tool_grammar: bool, tool_choice_required:
     disable_tool_grammar && !tool_choice_required
 }
 
+/// The `<tool_call>` logit bias by how often the same call already repeated.
+/// A tool-call-or-JSON union never takes the boost: the model's own mass
+/// picks its branch (`grammar::branch`), and a boost after a call pulls the
+/// next token toward yet another call instead of the answer.
+fn tool_call_bias(repeat_count: usize, union: bool) -> f32 {
+    match repeat_count {
+        0 | 1 if union => 0.0,
+        0 | 1 => 3.0,
+        2 => 0.0,
+        3 => -5.0,
+        _ => -10.0,
+    }
+}
+
 /// The grammar a request is decoded under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GrammarChoice {
@@ -343,6 +357,25 @@ pub(super) fn build_sampling(
         req.logit_bias.clone()
     };
 
+    // Tool-choice + parser-driven required mode.
+    let tool_choice_required = tool_choice_required_for_parser(
+        tools_active,
+        req.tool_choice.as_ref(),
+        state.tool_call_parser.as_ref().map(|p| p.name()),
+    );
+
+    let tool_choice_none = req
+        .tool_choice
+        .as_ref()
+        .is_some_and(|tc| matches!(tc, tool_parser::ToolChoice::Mode(m) if m == "none"));
+    let choice = grammar_choice(
+        tools_active,
+        req.response_format.is_some(),
+        tool_choice_none,
+        tool_choice_required,
+        tool_grammar_escape_applies(state.behavior.disable_tool_grammar, tool_choice_required),
+    );
+
     // Exponential `<tool_call>` bias decay. Skipped under ATLAS_FORCE_TEMP_ZERO
     // so the argmax is determined purely by raw logits (matches vLLM's path).
     if !force_temp_zero
@@ -352,12 +385,8 @@ pub(super) fn build_sampling(
         && !suppress_tool_call
         && let Some(tc_id) = state.tool_call_start_token_id
     {
-        let bias = match tool_call_repeat_count {
-            0 | 1 => 3.0,
-            2 => 0.0,
-            3 => -5.0,
-            _ => -10.0,
-        };
+        let union = choice == GrammarChoice::ToolCallOrResponseFormat;
+        let bias = tool_call_bias(tool_call_repeat_count, union);
         if bias != 0.0 {
             logit_bias.push((tc_id, bias));
         }
@@ -389,24 +418,6 @@ pub(super) fn build_sampling(
     // (post-completion open cap, prose budget, loop detectors) bound run-on.
     let stop_tokens = tokenize_stop_sequences(&state.tokenizer, &req.stop);
 
-    // Tool-choice + parser-driven required mode.
-    let tool_choice_required = tool_choice_required_for_parser(
-        tools_active,
-        req.tool_choice.as_ref(),
-        state.tool_call_parser.as_ref().map(|p| p.name()),
-    );
-
-    let tool_choice_none = req
-        .tool_choice
-        .as_ref()
-        .is_some_and(|tc| matches!(tc, tool_parser::ToolChoice::Mode(m) if m == "none"));
-    let choice = grammar_choice(
-        tools_active,
-        req.response_format.is_some(),
-        tool_choice_none,
-        tool_choice_required,
-        tool_grammar_escape_applies(state.behavior.disable_tool_grammar, tool_choice_required),
-    );
     if choice == GrammarChoice::EscapeHatch {
         // Structure-snowballing escape hatch (arXiv:2604.06066): this
         // model tool-calls more reliably unconstrained. Tool calls are
