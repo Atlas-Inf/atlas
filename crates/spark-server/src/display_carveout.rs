@@ -124,11 +124,6 @@ fn export() -> Result<(i32, u64)> {
 #[cfg(target_os = "linux")]
 fn drop_sys_admin() -> Result<()> {
     const CAP_SYS_ADMIN: u32 = 21;
-    if unsafe { libc::prctl(libc::PR_CAPBSET_READ, CAP_SYS_ADMIN) } == 1
-        && unsafe { libc::prctl(libc::PR_CAPBSET_DROP, CAP_SYS_ADMIN) } != 0
-    {
-        bail!("PR_CAPBSET_DROP: {}", Error::last_os_error());
-    }
     #[repr(C)]
     struct Header {
         version: u32,
@@ -149,6 +144,17 @@ fn drop_sys_admin() -> Result<()> {
     let mut sets = [Sets::default(); 2];
     if unsafe { libc::syscall(libc::SYS_capget, &mut header, sets.as_mut_ptr()) } != 0 {
         bail!("capget: {}", Error::last_os_error());
+    }
+    if sets[0].permitted & (1u32 << CAP_SYS_ADMIN) == 0 {
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            bail!("PR_SET_NO_NEW_PRIVS: {}", Error::last_os_error());
+        }
+        return Ok(());
+    }
+    if unsafe { libc::prctl(libc::PR_CAPBSET_READ, CAP_SYS_ADMIN) } == 1
+        && unsafe { libc::prctl(libc::PR_CAPBSET_DROP, CAP_SYS_ADMIN) } != 0
+    {
+        bail!("PR_CAPBSET_DROP: {}", Error::last_os_error());
     }
     let bit = !(1u32 << CAP_SYS_ADMIN);
     sets[0].effective &= bit;
