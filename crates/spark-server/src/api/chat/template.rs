@@ -62,7 +62,7 @@ pub(super) fn render_template(
     } else {
         tools_active && (state.tokenizer.uses_deepseek_v4_encoding() || !state.chat.prompt.tscg)
     };
-    let jinja_tools: Option<Vec<serde_json::Value>> = if render_tools {
+    let mut jinja_tools: Option<Vec<serde_json::Value>> = if render_tools {
         Some(
             tools
                 .iter()
@@ -104,11 +104,14 @@ pub(super) fn render_template(
 
     // Enntity/atlas b1b53814 (AGPL-3.0-only): GLM/Qwen register their
     // tool-envelope XML as added tokens — escape matching markup in incoming
-    // message prose before rendering so it stays text. Structured tool_calls
-    // are left untouched for the template to emit as real native calls.
-    let escaped_tool_markup = state
-        .tokenizer
-        .escape_glm_tool_markup(json_messages.iter_mut());
+    // message prose before rendering so it stays text. Structured call
+    // envelopes are still emitted by the template as native calls; literal
+    // argument values and schema descriptions remain text.
+    let escaped_tool_markup = state.tokenizer.escape_glm_tool_markup(
+        json_messages
+            .iter_mut()
+            .chain(jinja_tools.iter_mut().flatten()),
+    );
     if escaped_tool_markup > 0 {
         tracing::info!("{escaped_tool_markup} GLM tool markers in message text encoded as text");
     }
