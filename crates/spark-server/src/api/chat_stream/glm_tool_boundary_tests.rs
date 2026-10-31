@@ -104,9 +104,7 @@ fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<A
         default_top_p: 1.0,
         default_top_n_sigma: 0.0,
         default_min_p: 0.0,
-        tool_call_parser: Some(Arc::from(
-            tool_parser::ToolCallFormat::PoolsideV1.into_parser(),
-        )),
+        tool_call_parser: Some(Arc::from(format.into_parser())),
         chat: Default::default(),
         reasoning_parser: Some(crate::reasoning_parser::ReasoningFormat::Qwen.into_parser()),
         think_end_token_id: Some(END),
