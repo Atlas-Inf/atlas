@@ -176,6 +176,8 @@ mod tests {
         };
         assert_eq!(bias(true), [(1, 3.0)]);
         assert!(bias(false).is_empty());
+    }
+
     /// tools x response_format x tool_choice -> grammar. `none` names
     /// tool_choice="none"; `required` covers "required", a named function and
     /// a parser-required format.

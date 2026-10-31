@@ -159,19 +159,6 @@ impl GrammarState {
         self
     }
 
-    /// Register the native tool opener (see the `native_opener` field).
-    #[must_use]
-    pub fn with_native_opener(mut self, native_opener: Option<u32>) -> Self {
-        self.native_opener = native_opener;
-        self
-    }
-
-    /// Whether `tok`, emitted inside `<think>`, ends the reasoning and is the
-    /// grammar's first output token (the native tool opener).
-    pub fn opens_output(&self, tok: u32) -> bool {
-        self.native_opener == Some(tok)
-    }
-
     /// Register a union's answer-branch first-token mask (`answer_start`).
     #[must_use]
     pub fn with_answer_start(mut self, answer_start: Box<[i32]>) -> Self {

@@ -23,7 +23,11 @@ pub(super) fn resolve_schema_type(schema: &serde_json::Value) -> Option<&str> {
     match schema.get("type") {
         Some(serde_json::Value::String(t)) => return Some(t),
         Some(serde_json::Value::Array(types)) => {
-            if let Some(t) = types.iter().filter_map(|t| t.as_str()).find(|t| *t != "null") {
+            if let Some(t) = types
+                .iter()
+                .filter_map(|t| t.as_str())
+                .find(|t| *t != "null")
+            {
                 return Some(t);
             }
         }
