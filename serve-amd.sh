@@ -207,6 +207,13 @@ echo "serving $MODEL on ${GFX:-AMD} via $HW"
 # the recipe keeps BF16 unless ATLAS_QWEN4EXP_FP8_GDN is set explicitly.
 if [ "${MAX_BATCH:-1}" -gt 1 ]; then
   export ATLAS_QWEN4EXP_FP8_GDN="${ATLAS_QWEN4EXP_FP8_GDN:-0}"
+  # The qwen4_exp exact batching lane is what batches a Flash-Next multi-sequence
+  # decode step on gfx1151 (without it the mHC multi-seq paths run the MoE a row at
+  # a time). Framework f128/f132: C4 15.3 -> 24.3, C8 15.1 -> 27.9 tok/s (AR), C4
+  # 15.2 -> 25.6, C8 15.0 -> 27.3 (MTP). It also takes over the single-sequence MTP
+  # verify, which costs a lone request ~15% (f132: C1 MTP 20.6 -> 17.5), so the
+  # recipe turns it on only for multi-request serving. Explicit values win.
+  export ATLAS_QWEN4EXP_BATCH_FAST="${ATLAS_QWEN4EXP_BATCH_FAST:-1}"
 fi
 exec "$BIN" serve "$MODEL" "${NAME_ARG[@]}" \
   --host "${HOST:-0.0.0.0}" --port "${PORT:-8081}" \

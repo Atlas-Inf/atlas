@@ -42,6 +42,13 @@ pub const DECODE_META_MAX_ROWS: usize = 128;
 /// shape serves a range of widths. SSOT here because the metadata layout must
 /// hold the PADDED width, not the served `max_batch_size`: a boot at a width
 /// that is not itself a rung (e.g. 36) pads n=33..36 to 48.
+///
+/// gfx1151 adds a 6 rung. Its batched decode GEMVs are compute-bound at these
+/// widths, so a C=5..6 step padded to 8 rows paid for 8 rows to emit 5..6
+/// tokens: strix s166/s168 (27B AR) C6 26.6 tok/s ~= 6/8 of C8's 34.1.
+#[cfg(atlas_hip)]
+pub const DECODE_BATCH_RUNGS: [usize; 12] = [2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128];
+#[cfg(not(atlas_hip))]
 pub const DECODE_BATCH_RUNGS: [usize; 11] = [2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128];
 
 /// The rung a batch of `n` pads to; `n` itself above the last rung.
