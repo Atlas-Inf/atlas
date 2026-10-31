@@ -26,6 +26,10 @@ impl LiteralXmlState {
             // A delimiter run at the end of a chunk is conservatively
             // literal until the next non-backtick byte identifies its size.
             || self.pending_backticks != 0
+            // Models often nest unescaped quotation marks while quoting a
+            // sentence. A marker immediately touching either quote boundary
+            // is still a literal mention, even if that quote closed a span.
+            || matches!(self.previous, Some(b'"' | b'\''))
     }
 
     pub(crate) fn feed(&mut self, text: &str) {
@@ -240,12 +244,49 @@ pub(crate) fn unmask_literal_markers(text: &str) -> String {
     output
 }
 
+/// Replace `<` bytes that occur inside a quoted or fenced span with a
+/// matcher-safe space while preserving the caller's lexical state separately.
+/// This byte-level form is used for tokenizer vocab entries, which may contain
+/// invalid UTF-8 and therefore cannot go through the String masking helper.
+pub(crate) fn mask_literal_lt_bytes_with_state(
+    bytes: &[u8],
+    mut state: LiteralXmlState,
+) -> Vec<u8> {
+    let mut output = Vec::with_capacity(bytes.len());
+    for &byte in bytes {
+        if byte == b'<' {
+            state.finish_pending();
+            if state.is_literal() {
+                output.push(b' ');
+                state.feed_bytes(&[byte]);
+                continue;
+            }
+        }
+        output.push(byte);
+        state.feed_bytes(&[byte]);
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        LiteralXmlState, marker_is_literal, mask_literal_markers, state_after,
-        unmask_literal_markers,
+        LiteralXmlState, marker_is_literal, mask_literal_lt_bytes_with_state, mask_literal_markers,
+        state_after, unmask_literal_markers,
     };
+
+    #[test]
+    fn marker_touching_nested_quote_boundary_is_literal() {
+        assert!(marker_is_literal("\"The opening tag is \""));
+        assert!(!marker_is_literal("\"finished quote\" "));
+    }
+
+    #[test]
+    fn byte_mask_handles_multibyte_text_and_real_marker_after_quote() {
+        let state = state_after("The marker is `");
+        let masked = mask_literal_lt_bytes_with_state("<tool_call>é`<tool_call>".as_bytes(), state);
+        assert_eq!(masked, " tool_call>é`<tool_call>".as_bytes());
+    }
 
     #[test]
     fn tracks_inline_backticks() {
