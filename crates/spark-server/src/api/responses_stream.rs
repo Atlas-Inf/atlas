@@ -44,6 +44,9 @@ use super::strip::strip_thinking_tags;
 use super::inference_types::*;
 use super::sanitizer::*;
 
+#[path = "responses_stream/conv_items.rs"]
+mod conv_items;
+
 pub(super) async fn responses_endpoint_stream(
     CurrentModel(state): CurrentModel,
     mut chat_req: ChatCompletionRequest,
@@ -63,30 +66,11 @@ pub(super) async fn responses_endpoint_stream(
     let model = chat_req.model.clone();
     let input_messages = chat_req.messages.clone();
     let state_arc = state.clone();
-
     // Capture the conversation-linked user items (the new turn's user
     // input) before handing chat_req off. We use them to append back
     // to the conversation after the stream finishes.
-    let conv_new_user_items: Vec<serde_json::Value> = if let Some(cid) = conversation_id.as_ref() {
-        let prior = state_arc
-            .conversation_store
-            .get(cid)
-            .map(|s| s.items.len())
-            .unwrap_or(0);
-        input_messages
-            .iter()
-            .skip(prior)
-            .map(|m| {
-                serde_json::json!({
-                    "type": "message",
-                    "role": m.role,
-                    "content": [{"type": "input_text", "text": m.content.text}],
-                })
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let conv_new_user_items: Vec<serde_json::Value> =
+        conv_items::conv_new_user_items(&state_arc, conversation_id.as_ref(), &input_messages);
 
     // Run the chat-completions streaming handler (re-using the full
     // pipeline: scheduler, tool detection, thinking, logprobs, ...).
