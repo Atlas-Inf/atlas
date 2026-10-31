@@ -172,7 +172,11 @@ fn fp4_local_declares_csf32_routed_expert_scales() {
     let encoded = q
         .quantized_layers
         .values()
-        .filter(|s| s.weight_scale_encoding.is_some())
+        .filter(|s| {
+            s.weight_scale_encoding
+                .as_deref()
+                .is_some_and(|e| !e.is_empty())
+        })
         .count();
     assert_eq!(
         encoded, 42,
@@ -183,6 +187,7 @@ fn fp4_local_declares_csf32_routed_expert_scales() {
         "model.language_model.layers.3.mlp.shared_experts.down_proj",
         "model.language_model.layers.45.self_attn.q_a_proj",
     ] {
-        assert_eq!(spec(path).weight_scale_encoding, None, "{path}");
+        let entry = spec(path).weight_scale_encoding;
+        assert_eq!(entry.as_deref().unwrap_or(""), "", "{path}");
     }
 }
