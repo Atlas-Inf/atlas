@@ -111,6 +111,7 @@ pub(super) fn step_verify_k4_batched(
     let mut drafts_per_seq: Vec<Vec<u32>> = Vec::with_capacity(n);
     let mut tokens: Vec<u32> = Vec::with_capacity(r_total);
     for (i, a) in batch.iter_mut().enumerate() {
+        crate::scheduler::copy_drafts::mtp::begin_verify(model, sched, a);
         let d = std::mem::take(&mut a.pending_drafts);
         // Confidences describe the taken drafts — cleared in lock-step so a
         // later step can never rank on a stale vector (SSOT, `mtp_dcut`).
@@ -227,15 +228,18 @@ pub(super) fn step_verify_k4_batched(
             );
             // Per-position acceptance and the dynamic depth; the n=1 ladders
             // (`enabled`) keep their single-sequence verifies.
-            a.mtp_acct.record_depth_verify(
-                k_drafts,
-                num_accepted,
-                ceiling,
-                crate::scheduler::mtp_deep_depth::DepthLevers {
-                    adapt: false,
-                    ..sched.levers.depth()
-                },
-            );
+            // A copy round (`copy_drafts::mtp`) says nothing about the head.
+            if !crate::scheduler::copy_drafts::mtp::settle(a, k_drafts, num_accepted) {
+                a.mtp_acct.record_depth_verify(
+                    k_drafts,
+                    num_accepted,
+                    ceiling,
+                    crate::scheduler::mtp_deep_depth::DepthLevers {
+                        adapt: false,
+                        ..sched.levers.depth()
+                    },
+                );
+            }
         }
         let verify_lps = scored.map(|s| s.logprobs).unwrap_or_default();
         a.last_token_time = Instant::now();
@@ -325,9 +329,14 @@ pub(super) fn step_verify_k4_batched(
         .timing
         .record(crate::scheduler::mtp_timing::Phase::Commit, t_verdict);
     let t_propose = Instant::now();
-    let pending: Vec<usize> = (0..n)
+    let mut pending: Vec<usize> = (0..n)
         .filter(|&i| !batch[i].finished && batch[i].pending_drafts.is_empty() && !suspended[i])
         .collect();
+    // A copy (`ATLAS_QWEN_COPY_DRAFTS`) drafts a verified sequence instead of
+    // the head; a decode row bootstraps, so it always proposes.
+    pending.retain(|&i| {
+        ks[i] == 1 || !crate::scheduler::copy_drafts::mtp::propose(model, sched, batch[i], ceiling)
+    });
     if pending.is_empty() {
         // `_step_timer` records StepTotal on drop — no explicit `step_done`
         // here: the pre-existing pair (guard + explicit call) double-counted

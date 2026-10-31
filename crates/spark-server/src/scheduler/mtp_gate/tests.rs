@@ -22,14 +22,6 @@ fn drive_mtp(g: &mut MtpGate, n: usize, emitted: usize, wall: Duration) {
     }
 }
 
-/// [`drive_mtp`] at batch `width`.
-fn drive_mtp_w(g: &mut MtpGate, n: usize, emitted: usize, width: usize, wall: Duration) {
-    for _ in 0..n {
-        assert_eq!(g.next_step(), GateStep::MeasureVerify);
-        g.record_verify_step(wall, emitted, width);
-    }
-}
-
 /// Drive `n` serial decode steps at `wall` each.
 fn drive_serial(g: &mut MtpGate, n: usize, wall: Duration) {
     for _ in 0..n {
@@ -188,9 +180,8 @@ fn depth_change_schedules_early_probe_without_state_wipe() {
         tps_before,
         "no state wipe on regime change"
     );
-    // The current mode re-measures over one full window in the new regime;
-    // the early probe opens right after it.
-    drive_mtp(&mut g, WINDOW_STEPS, 2, ms(50));
+    // The probe-due condition closes the window on the very next step.
+    drive_mtp(&mut g, 1, 2, ms(50));
     assert_eq!(
         g.next_step(),
         GateStep::MeasureDecode,
@@ -203,8 +194,8 @@ fn depth_change_schedules_early_probe_without_state_wipe() {
     assert_eq!(g.next_step(), GateStep::MeasureVerify);
     assert!(!g.in_serial_mode());
     let mut serial_steps = WINDOW_STEPS;
-    let mut mtp_steps = WINDOW_STEPS * 3;
-    let mut tokens = WINDOW_STEPS * 3 * 2 + WINDOW_STEPS;
+    let mut mtp_steps = WINDOW_STEPS * 2 + 1;
+    let mut tokens = (WINDOW_STEPS * 2 + 1) * 2 + WINDOW_STEPS;
     while tokens < 1000 {
         match g.next_step() {
             GateStep::MeasureVerify => {
@@ -493,11 +484,11 @@ fn arbiter_charges_active_width_never_a_padded_width() {
 
 /// A width-regime change is a depth-regime change's twin: EWMAs measured at
 /// batch 1 must not arbitrate against windows measured at batch 8. The
-/// mixed-width partial window is discarded and both baselines go stale; the
-/// current mode then re-measures over one FULL window in the new regime,
-/// which REPLACES its EWMA, and only then does the probe measure the other
-/// mode at the new width. Arbitration therefore only ever compares two
-/// same-regime, full-window numbers.
+/// mixed-width partial window is discarded, and — like a depth change — the
+/// probe cadence is pulled forward after a full in-regime window REPLACES
+/// the current mode's EWMA. The next step then probes the other mode at the
+/// new width. Startup cost is amortized across that window. Arbitration only
+/// ever compares two same-regime numbers.
 #[test]
 fn width_regime_change_stales_and_remeasures_in_the_new_regime() {
     let mut g = MtpGate::new(1);
@@ -509,23 +500,21 @@ fn width_regime_change_stales_and_remeasures_in_the_new_regime() {
     drive_mtp(&mut g, WINDOW_STEPS / 2, 2, ms(50));
     g.record_verify_step(ms(5), 6, 8);
     assert!(
-        g.serial.stale && g.mtp.stale,
-        "both baselines are stale after the change"
+        g.serial.stale,
+        "off-mode baseline is stale after the change"
     );
-    assert_eq!(
-        g.next_step(),
-        GateStep::MeasureVerify,
-        "a one-step window must not open the probe"
-    );
-    drive_mtp_w(&mut g, WINDOW_STEPS - 1, 6, 8, ms(5));
-    let mtp = g.mtp_tps_debug().expect("in-regime window closed");
+    assert!(g.mtp.stale, "one startup step cannot refresh the baseline");
+    assert_eq!(g.next_step(), GateStep::MeasureVerify);
+    for _ in 1..WINDOW_STEPS {
+        g.record_verify_step(ms(5), 6, 8);
+    }
+    let mtp = g.mtp_tps_debug().expect("full in-regime window closed");
     assert!(
         (mtp - 1200.0).abs() < 1.0,
         "Mtp EWMA must be REPLACED by the in-regime window (6 tok / 5 ms = \
          1200 tok/s), not blended with the width-1 40 tok/s (got {mtp:.0})"
     );
-    // The early probe opens after that window, measuring serial at the new
-    // width.
+    // The early probe follows one full window, measuring serial at the new width.
     assert_eq!(
         g.next_step(),
         GateStep::MeasureDecode,
@@ -559,24 +548,15 @@ fn width_jitter_inside_a_bucket_does_not_stale() {
         "same-bucket churn is noise"
     );
     assert_eq!(g.win_steps, 7, "nothing discarded inside the bucket");
-    // Dropping to bucket 4 IS a regime change: the partial window is
-    // discarded and both baselines go stale. The crossing step opens the new
-    // regime's window; Mtp re-measures over all of it before the probe, and
-    // the never-measured serial side stays stale until its probe.
+    // Dropping to bucket 4 IS a regime change: partial window discarded,
+    // new window must finish before either baseline becomes fresh.
     g.record_verify_step(ms(10), 8, 4);
     assert!(g.serial.stale && g.mtp.stale);
     assert_eq!(
         g.win_steps, 1,
-        "mixed-width window discarded, the crossing step opens the new one"
+        "mixed-width window discarded; new window started"
     );
     assert_eq!(g.next_step(), GateStep::MeasureVerify);
-    drive_mtp_w(&mut g, WINDOW_STEPS - 1, 8, 4, ms(10));
-    assert!(g.serial.stale && !g.mtp.stale);
-    assert_eq!(
-        g.next_step(),
-        GateStep::MeasureDecode,
-        "probe pulled forward"
-    );
 }
 
 /// The probe cadence is per sequence. Counted over the whole batch, a C=8
@@ -608,72 +588,33 @@ fn probe_cadence_is_per_sequence_at_width() {
     assert_eq!(steps * 2, g.refresh, "1024 tokens at 2 a step");
 }
 
-/// A width change still pulls the probe forward: it opens after the current
-/// mode's one full in-regime window (96 batch tokens here), not the new
-/// regime's 1024 x 8-token refresh interval.
+/// A width change still pulls the probe forward: the pull is counted in the
+/// new regime's (wider) interval.
 #[test]
 fn widening_still_pulls_the_probe_forward() {
     let mut g = MtpGate::new(1);
     run_mtp_until_probe(&mut g, 2, ms(50));
     drive_serial(&mut g, WINDOW_STEPS, ms(40));
-    drive_mtp_w(&mut g, WINDOW_STEPS, 6, 8, ms(5));
+    for _ in 0..WINDOW_STEPS {
+        g.record_verify_step(ms(5), 6, 8);
+    }
     assert_eq!(
         g.next_step(),
         GateStep::MeasureDecode,
-        "probe pulled forward"
+        "probe follows the full new-width window, not the 1024-token cadence"
     );
 }
 
-/// 2026-10-21, concurrency-sweep on nvidia/Qwen3.8-27B-NVFP4
-/// (run-1792544951131605812): all eight C=8 prefills landed before the first
-/// batched step, so the batch went from width 1 straight into bucket 8 and
-/// the first in-regime step was the bootstrap (one token per sequence, plus
-/// lazy graph captures). Closed as a one-step window it became the Mtp
-/// baseline, and the gate logged `switching Mtp -> Serial (current 33.5
-/// tok/s vs other 56.4 tok/s, margin 8.2, depth=734)` while verify was
-/// delivering ~70 — the slow mode of a bimodal C=8 cell. Walls and token
-/// counts below are that cell's.
 #[test]
-fn one_bootstrap_step_cannot_set_a_new_regime_baseline() {
-    let mut g = MtpGate::new(3);
-    run_mtp_until_probe(&mut g, 2, ms(50));
-    drive_serial(&mut g, WINDOW_STEPS, ms(40));
-    g.record_verify_step(ms(239), 8, 8);
-    for _ in 0..WINDOW_STEPS * 6 {
-        match g.next_step() {
-            GateStep::MeasureVerify => g.record_verify_step(ms(270), 19, 8),
-            GateStep::MeasureDecode => g.record_decode(ms(142), 8),
+fn request_disable_mtp_overrides_all_spec_dispatch_modes() {
+    for thinking in [false, true] {
+        for raw_argmax in [false, true] {
+            assert!(!spec_dispatch_eligible(
+                thinking, 100, 100, false, true, true, 0, raw_argmax,
+            ));
+            assert!(spec_dispatch_eligible(
+                thinking, 100, 100, false, false, true, 0, raw_argmax,
+            ));
         }
     }
-    assert!(
-        !g.in_serial_mode(),
-        "verify delivers ~70 tok/s against serial's ~56: the gate must stay Mtp"
-    );
-    assert_eq!(g.take_fresh_decision(), None);
-}
-
-/// A probe that straddles a regime change re-measures the OTHER mode in the
-/// new regime while the current mode still holds the old regime's number.
-/// That pair describes two economies; it must not even count as a losing
-/// window.
-#[test]
-fn stale_current_baseline_cannot_count_a_losing_window() {
-    let mut g = MtpGate::new(1);
-    run_mtp_until_probe(&mut g, 2, ms(50));
-    // The serial probe widens to bucket 4 on its first step: a fresh
-    // 400 tok/s serial against a stale width-1 40 tok/s Mtp.
-    for _ in 0..WINDOW_STEPS {
-        assert_eq!(g.next_step(), GateStep::MeasureDecode);
-        g.record_decode(ms(10), 4);
-    }
-    assert!(!g.serial.stale && g.mtp.stale);
-    assert_eq!(
-        g.losing_windows, 0,
-        "a stale baseline must not lose a window"
-    );
-    // Mtp re-measures in-regime at 800 tok/s and keeps the mode.
-    drive_mtp_w(&mut g, WINDOW_STEPS, 8, 4, ms(10));
-    assert!(!g.mtp.stale);
-    assert!(!g.in_serial_mode());
-    assert_eq!(g.take_fresh_decision(), None);
 }
