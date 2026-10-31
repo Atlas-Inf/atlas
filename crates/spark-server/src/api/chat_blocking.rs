@@ -434,10 +434,6 @@ pub(super) fn merge_hoisted_tool_calls(
     hoisted
 }
 
-/// Core finalization: usage assembly, metrics, and the rate-limit
-/// true-up. Returns the canonical response IR — wire encoding (plus
-/// `store:`/`--dump` handling) happens in the per-surface encoders.
-
 #[path = "chat_blocking/tail2.rs"]
 mod tail2;
 pub(crate) use tail2::*;

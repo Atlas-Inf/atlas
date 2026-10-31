@@ -2,6 +2,11 @@
 
 use super::*;
 
+/// Byte offset where the streaming sanitizer must start holding: the
+/// earliest position `p` in the last `tag_max - 1` bytes such that
+/// `buf[p..]` is a PROPER prefix of some marker (i.e. more bytes could
+/// complete it). Returns `buf.len()` when no such suffix exists, so the
+/// whole buffer is emitted. Always a UTF-8 char boundary.
 pub(crate) fn marker_prefix_hold_start(
     buf: &str,
     tag_max: usize,
