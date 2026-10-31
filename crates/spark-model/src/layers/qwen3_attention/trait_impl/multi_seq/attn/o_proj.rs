@@ -238,13 +238,22 @@ impl Qwen3AttentionLayer {
                 )?;
             }
         } else if let Some(o_fp8) = self.o_weight.as_ref().and_then(|w| w.as_fp8()) {
-            let batch_kernel = if n <= 4 {
-                self.w8a16_gemv_batch4_k
+            // Rows 5..8 take the 8-row tier (bit-identical per row to batch16),
+            // as the SSM projections do (`ssm_batched/impl.rs`).
+            let (batch_kernel, div) = if n <= 4 {
+                (self.w8a16_gemv_batch4_k, 4)
             } else {
-                self.w8a16_gemv_batch16_k
+                ops::fp8_verify_gemv_tier(
+                    n,
+                    ops::gemv_vl2_enabled(),
+                    self.w8a16_gemv_batch8_k,
+                    self.w8a16_gemv_batch8_dyn_vl2_k,
+                    self.w8a16_gemv_batch8_dyn_vl2_n2_k,
+                    self.w8a16_gemv_batch16_k,
+                )
             };
             if (2..=16).contains(&n) && batch_kernel.0 != 0 {
-                ops::w8a16_gemv_batch4(
+                ops::w8a16_gemv_batch4_div(
                     fwd.gpu,
                     batch_kernel,
                     attn_out,
@@ -254,6 +263,7 @@ impl Qwen3AttentionLayer {
                     n as u32,
                     h as u32,
                     nq * hd,
+                    div,
                     stream,
                 )?;
             } else {
