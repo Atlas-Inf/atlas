@@ -1446,3 +1446,28 @@ maplepaladin73).
 Recipe vets: jobs 56/57 and their first re-runs failed on job-script bugs (port nested under `defaults.port`; an empty
 env-key list made the env diff fail). Both are fixed. Queue: 56d Flash-Next NVFP4 vet (running) → 57d 27B NVFP4 vet → 58
 FP4-Local recipe vet on `sha-8eb9072` (main after #163; waits up to 2 h for the image). ≈ 13 h.
+
+## 2026-10-31 — Qwen4-27B day-0 prep (owner priority; dual-Spark stack paused)
+
+Source: analytics-zoo/vllm-xpu-kernels PR #22 ("Enable Qwen3.8-flash-next 8 cards fp8 & int4 and optimize
+qwen4-27b"), merged Oct 23 into a private downstream branch; the repo now 404s. Its 10 commits (5ccce89..265bbe2) are
+still reachable through the public fork hzjane/vllm-xpu-kernels and are saved locally in `~/code/qwen4-prework/`
+(branch `saved/pr22-head-265bbe2`, full patch, git bundle), plus the Wayback capture of the PR page. The companion
+vLLM model PR (head 5c37e9b) isn't publicly reachable.
+
+Architecture so far (owner-confirmed + the PR text): **dense** model on the Qwen4Exp (`qwen4_exp`) backbone; hidden 5120;
+HC4 hyper-connections; GDN layers with fused dual projections (QKVZ / BA) and gated outputs; QSA attention with
+Q12 / KV2 GQA per TP2 rank (24 Q / 4 KV heads); ngram/PLE short-conv; MTP draft 4; the KV cache doesn't shrink vs
+Qwen3.8. Intel validated TP2 FP8 and TP1/TP2 INT4 (no real QSA checkpoint).
+
+Work (local, not pushed):
+1. Extract every shape from the saved patch plus public references (llama.cpp#31072, TensorFold#1244 RFC, vLLM Qwen4Exp
+   / #53909) into `~/code/qwen4-prework/QWEN4-27B-SPEC.md`, with per-field confidence.
+2. Atlas draft branch `draft/qwen4-27b-dense`: dense-MLP qwen4_exp variant, shape-generic kernels for H=5120 / 24Q /
+   4KV, a `qwen4-27b` kernel target, loader support. Tests: a synthetic 2–4-layer random-weight checkpoint smoke on
+   sparky (incl. MTP draft 4), plus a Flash-Next control that must stay identical.
+Then resume the dual-Spark stack (#198 → #242 → #253 → #254 → #255).
+
+Vets on `sha-87df79b`: Flash-Next NVFP4 PASS (agentic 50/50 + 50/50 at 15.79 s/turn, BFCL 86.53 / 85.69). 27B NVFP4: agentic
+50/50 + 50/50 at 8.92 s/turn, BFCL 83.02 / **71.32**. Normalized collapses because the hallucination category is 39.96
+(irrelevance 45.83, live_irrelevance 34.09), i.e. tool-call discipline; it's under investigation before its re-pin.
