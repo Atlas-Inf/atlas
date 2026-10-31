@@ -67,11 +67,23 @@ impl CarveoutOrder {
 }
 
 impl KvPlacement {
-    /// Largest buffers first, each taken while its footprint still fits
-    /// `capacity`. Ties go to the lower [`KvBuffer`], so every rank with the
-    /// same sizes plans the same set.
+    /// [`Self::plan_ordered`] in the order `ATLAS_KV_CARVEOUT_ORDER` selects.
     pub fn plan(buffers: &[(KvBuffer, usize)], capacity: usize) -> Self {
-        let mut order: Vec<_> = buffers.iter().filter(|(_, bytes)| *bytes > 0).collect();
+        Self::plan_ordered(buffers, capacity, CarveoutOrder::from_env())
+    }
+
+    /// The buffers `which` takes, largest first, each taken while its
+    /// footprint still fits `capacity`. Ties go to the lower [`KvBuffer`],
+    /// so every rank with the same sizes plans the same set.
+    pub fn plan_ordered(
+        buffers: &[(KvBuffer, usize)],
+        capacity: usize,
+        which: CarveoutOrder,
+    ) -> Self {
+        let mut order: Vec<_> = buffers
+            .iter()
+            .filter(|(buffer, bytes)| *bytes > 0 && which.takes(*buffer))
+            .collect();
         order.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         let mut left = capacity;
         let mut carveout = BTreeSet::new();
