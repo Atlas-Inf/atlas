@@ -15,14 +15,11 @@
 //!   4    → forward_layers  (per-layer prefill/decode + diagnostics)
 //!   5-8  → finalize_last   (final norm + lm_head + snapshot save) — last chunk
 //!   9    → save_intermediate_checkpoint — non-last chunk
-
 #![allow(unused_imports, dead_code, clippy::too_many_arguments)]
-
-use anyhow::Result;
-use spark_runtime::gpu::DevicePtr;
-
 use super::super::types::TransformerModel;
 use crate::traits::{Model, SequenceState};
+use anyhow::Result;
+use spark_runtime::gpu::DevicePtr;
 
 mod batch;
 mod batch_kernel;

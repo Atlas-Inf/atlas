@@ -523,12 +523,6 @@ impl ChatTokenizer {
     }
 }
 
-/// nemotron_h_omni: each bare `<image>`(img) -> `<img>` + N×img + `</img>`.
-/// `pad_counts[i]` is the i-th image's token count (target_patches /
-/// downsample²), matching the checkpoint processor's `num_tokens`.
-/// Refuse-not-truncate is enforced downstream: a pad run that would
-/// not fit the sequence budget makes the request fail rather than
-/// being cut mid-image.
 #[path = "chat_impl/omni_pads.rs"]
 mod omni_pads;
 pub(crate) use omni_pads::*;
