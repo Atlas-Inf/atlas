@@ -106,7 +106,7 @@ pub(super) fn render_template(
         .auto_compact_threshold
         .map(|t| t > 0.0)
         .unwrap_or(false);
-    let mut json_messages = if auto_compact_active && json_messages.len() > 4 {
+    let json_messages = if auto_compact_active && json_messages.len() > 4 {
         let trial_tokens = state
             .tokenizer
             .apply_chat_template_openai_with_effort(
