@@ -269,11 +269,11 @@ impl GpuBackend for MockGpuBackend {
     }
 
     fn free(&self, ptr: DevicePtr) -> Result<()> {
-        if self
-            .pending_free_failures
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-            .is_ok()
-        {
+        #[allow(deprecated)]
+        let pending_free =
+            self.pending_free_failures
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+        if pending_free.is_ok() {
             anyhow::bail!("mock free failed (injected): ptr {ptr}");
         }
         if self.allocs.lock().remove(&ptr.0).is_none() && !ptr.is_null() {
