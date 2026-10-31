@@ -67,7 +67,7 @@ const BINS: usize = COPY_REPLY_BIN + 1;
 /// rounded reading of that table's first-position row (`g[0][7..]`). Serving
 /// replaces it within a few hundred verifies.
 const PRIOR: [f32; BINS] = [
-    0.12, 0.16, 0.25, 0.35, 0.42, 0.48, 0.55, 0.62, 0.68, 0.76, 0.95, 0.74, 0.23,
+    0.12, 0.16, 0.25, 0.35, 0.42, 0.48, 0.55, 0.62, 0.68, 0.76, 0.95, 0.90, 0.55,
 ];
 /// Pseudo-observations behind the prior in a bin's all-depth rate, and
 /// behind that rate in one depth's cell.
@@ -133,9 +133,21 @@ impl Calibration {
 
     /// One verify of the first `drafted` drafts that accepted `accepted`.
     /// Position `j` is observed only when every earlier draft was accepted.
+    /// A drafter's verify decays the drafter's bins, a copy's only its own
+    /// copy bin: neither kind fades or moves the other's evidence.
     pub(crate) fn record(&mut self, conf: &[f32], drafted: usize, accepted: usize) {
+        let decayed = if is_copy(conf) {
+            let b = bin(conf[0]);
+            b..b + 1
+        } else {
+            0..COPY_BIN
+        };
         for cells in [&mut self.verified, &mut self.accepted] {
-            cells.iter_mut().flatten().for_each(|cell| *cell *= DECAY);
+            for row in cells.iter_mut() {
+                row[decayed.clone()]
+                    .iter_mut()
+                    .for_each(|cell| *cell *= DECAY);
+            }
         }
         let observed = drafted.min(accepted + 1).min(MAX_DRAFTS);
         for (depth, &c) in conf.iter().take(observed).enumerate() {
@@ -197,6 +209,7 @@ fn row_ms() -> f32 {
 pub(crate) struct Policy {
     pub(crate) calibration: Calibration,
     steps: u64,
+    copy_steps: u64,
 }
 
 impl Policy {
@@ -215,8 +228,13 @@ impl Policy {
         if max == 0 || owners.len() == 0 || !owners.clone().all(measured) {
             return None;
         }
-        self.steps += 1;
-        if params.probe > 0 && self.steps.is_multiple_of(params.probe) {
+        let steps = if owners.clone().all(is_copy) {
+            &mut self.copy_steps
+        } else {
+            &mut self.steps
+        };
+        *steps += 1;
+        if params.probe > 0 && steps.is_multiple_of(params.probe) {
             return Some(max);
         }
         let n = owners.len();
