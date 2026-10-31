@@ -46,10 +46,10 @@ pub(super) fn markers(tokenizer: &ChatTokenizer) -> Vec<String> {
         .collect()
 }
 
-/// Escape native GLM/Qwen tool markup in incoming message prose. Structured
+/// Escape GLM-5 native tool markup in incoming message prose. Structured
 /// call names remain unchanged; literal argument values are escaped while
 /// the template still emits real native call boundaries. Returns the number of escaped markers;
-/// unsupported model types always return zero.
+/// non-GLM tokenizers always return zero. (tools: preserve literal argument values and matcher stop tokens)
 pub(crate) fn escape_glm_tool_markup<'a>(
     tokenizer: &ChatTokenizer,
     values: impl IntoIterator<Item = &'a mut serde_json::Value>,
@@ -308,5 +308,52 @@ mod tests {
             format!("{OPEN}{TAG}0{CLOSE}")
         );
         assert_eq!(messages[2]["content"][1]["image_url"]["url"], "<tool_call>");
+    }
+}
+
+#[cfg(test)]
+mod real_vocab_probe {
+    use super::*;
+    use crate::tokenizer::ChatTokenizer;
+
+    const HF_SNAPSHOT: &str = "/home/azeez/.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-FP4-Local/snapshots/b9ce18a6887e18c089fdea8509a33e63429a3300";
+
+    #[test]
+    fn n105_real_vocab_marker_roundtrip() {
+        let dir = std::path::Path::new(HF_SNAPSHOT);
+        if !dir.join("tokenizer.json").exists() {
+            eprintln!("skip: HF snapshot absent");
+            return;
+        }
+        let eos = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
+            .unwrap()
+            .token_to_id("<|im_end|>")
+            .unwrap();
+        let tokenizer =
+            ChatTokenizer::from_model_dir(dir, eos, true, "qwen4_exp", "", None, false, false)
+                .unwrap();
+        let markup = markers(&tokenizer);
+        eprintln!(
+            "DBG markers={markup:?} flag={}",
+            tokenizer.glm_tool_markup_as_text
+        );
+        // Escape a user message containing <tool_call>, then round-trip the
+        // sentinel through encode_rendered: ids must equal the plain text.
+        let mut msg =
+            serde_json::json!({"role": "user", "content": "example of a <tool_call> block"});
+        let n = tokenizer.escape_glm_tool_markup(std::iter::once(&mut msg));
+        eprintln!("DBG escaped={n} content={:?}", msg["content"]);
+        let rendered = msg["content"].as_str().unwrap().to_string();
+        let esc_ids = tokenizer.encode_rendered(&rendered).unwrap();
+        let decoded = tokenizer.decode_with_special(&esc_ids).unwrap();
+        eprintln!("DBG esc_ids={esc_ids:?} decoded={decoded:?}");
+        assert_eq!(
+            decoded, "example of a <tool_call> block",
+            "sentinel unwrap must encode the marker as literal text"
+        );
+        assert!(
+            !decoded.contains(OPEN) && !decoded.contains(TAG) && !decoded.contains(CLOSE),
+            "no FDD sentinels may reach the prompt"
+        );
     }
 }

@@ -21,6 +21,7 @@ use spark_runtime::gpu::DevicePtr;
 use std::time::Instant;
 
 mod call_site;
+mod prediction_usage;
 
 pub(super) const EOS: &[u32] = &[151645];
 pub(super) const TOOL_END: Option<u32> = Some(151658);

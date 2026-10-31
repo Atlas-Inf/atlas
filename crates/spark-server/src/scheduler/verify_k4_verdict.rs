@@ -122,7 +122,7 @@ pub(super) fn k4_apply_verdict(
         for _ in 0..(nd - na) {
             a.seq.tokens.pop();
         }
-        if let Err(e) = model.trim_proposer_state(&mut a.seq, na, 0) {
+        if let Err(e) = crate::scheduler::copy_drafts::mtp::trim_proposer(model, a, na) {
             tracing::error!("trim_proposer_state: {e:#}");
         }
         // Item #2: rewind live h_state to intermediate[na] (state after the
@@ -161,7 +161,7 @@ pub(super) fn k4_apply_verdict(
         // A decode row (nd == 0, batched path only) drafted nothing this
         // step: there is no drafter row to trim, as on the bootstrap path —
         // the EP worker skips it by the same rule (`ep_worker_apply_verdict`).
-        if let Err(e) = model.trim_proposer_state(&mut a.seq, na, 0) {
+        if let Err(e) = crate::scheduler::copy_drafts::mtp::trim_proposer(model, a, na) {
             tracing::error!("trim_proposer_state: {e:#}");
         }
     }
@@ -174,19 +174,22 @@ pub(super) fn k4_apply_verdict(
             num_drafts
         };
         let t_propose = Instant::now();
-        let _mtp_grammar_mask = mtp_grammar_mask_for(a);
-        match model.run_mtp_propose_multi(
-            a.last_token,
-            a.seq.seq_len,
-            next_drafts,
-            &mut a.seq,
-            0,
-            _mtp_grammar_mask.as_deref(),
-        ) {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!("run_mtp_propose_multi: {e:#}");
+        // A copy (`ATLAS_QWEN_COPY_DRAFTS`) drafts in place of the head.
+        if nd == 0 || !crate::scheduler::copy_drafts::mtp::propose(model, sched, a, num_drafts) {
+            let _mtp_grammar_mask = mtp_grammar_mask_for(a);
+            match model.run_mtp_propose_multi(
+                a.last_token,
+                a.seq.seq_len,
+                next_drafts,
+                &mut a.seq,
+                0,
+                _mtp_grammar_mask.as_deref(),
+            ) {
+                Ok(d) if !d.is_empty() => a.pending_drafts = d,
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!("run_mtp_propose_multi: {e:#}");
+                }
             }
         }
         sched

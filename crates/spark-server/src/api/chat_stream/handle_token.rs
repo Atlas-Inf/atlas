@@ -134,6 +134,8 @@ fn handle_open_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Delt
     result
 }
 
+#[path = "handle_token/detector_outputs.rs"]
+mod detector_outputs;
 #[path = "handle_token/inner.rs"]
 mod inner;
 pub(crate) use inner::*;

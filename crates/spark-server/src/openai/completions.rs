@@ -41,7 +41,7 @@ pub struct CompletionRequest {
     /// token-ID forms bypass tokenization and feed the scheduler verbatim
     /// (see `PromptInput` and the handler in `api/completions.rs`).
     pub prompt: PromptInput,
-    #[serde(default = "default_max_tokens")]
+    #[serde(default = "default_completion_max_tokens")]
     pub max_tokens: usize,
     pub temperature: Option<f32>,
     /// Top-k: keep only the k highest-probability tokens before sampling.
@@ -344,4 +344,10 @@ impl CompletionChunk {
 pub struct TokenizeResponse {
     pub tokens: Vec<u32>,
     pub count: usize,
+}
+
+/// `/v1/completions` without `max_tokens`: 4096 (the chat surfaces default to
+/// the rest of the context instead).
+fn default_completion_max_tokens() -> usize {
+    4096
 }

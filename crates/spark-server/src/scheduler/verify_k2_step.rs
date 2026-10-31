@@ -153,7 +153,17 @@ pub fn step_verify_k2(
     a.last_token_time = Instant::now();
     let (v0_argmax, v1_argmax) = (result_vec[0], result_vec[1]);
 
-    let (v0, v1) = if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
+    let Ok(scored) =
+        super::verify_pipeline_helper::scored::requested(model, 2, a, verify_ctx, 0, None)
+    else {
+        return;
+    };
+    let (v0, v1) = if let Some(s) = &scored {
+        (
+            s.tokens.first().copied().unwrap_or(v0_argmax),
+            s.tokens.get(1).copied().unwrap_or(v1_argmax),
+        )
+    } else if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
         dflash_verify_raw_argmax,
         sched.levers.dflash_masked_verify,
         model,
@@ -179,7 +189,9 @@ pub fn step_verify_k2(
         )
     };
     let accepted = drafts[0] == v0;
-    if !dflash_verify_raw_argmax {
+    // A copy round (`copy_drafts::mtp`) says nothing about the head.
+    let copied = crate::scheduler::copy_drafts::mtp::settle(a, 1, usize::from(accepted));
+    if !dflash_verify_raw_argmax && !copied {
         a.mtp_acct
             .record_depth_verify(1, usize::from(accepted), num_drafts, sched.levers.depth());
     }
@@ -187,12 +199,7 @@ pub fn step_verify_k2(
     // itself when the lever is off.
     let next_drafts = a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth());
 
-    // Extract logprobs from verify logits buffer (K=2 positions) when requested.
-    let verify_lps = if let Some(top_logprobs) = a.top_logprobs {
-        extract_verify_logprobs(model, &[v0, v1], top_logprobs, 0)
-    } else {
-        Vec::new()
-    };
+    let verify_lps = scored.map(|s| s.logprobs).unwrap_or_default();
 
     // EP: always broadcast accept/reject to worker (prevents deadlock on EOS).
     if let Err(e) = model.ep_broadcast_cmd(accepted as u32) {
@@ -262,7 +269,7 @@ pub fn step_verify_k2(
         }
         sched.timing.record(Phase::SaveHidden, t_save);
         let t_trim = Instant::now();
-        if let Err(e) = model.trim_proposer_state(&mut a.seq, 1, 0) {
+        if let Err(e) = crate::scheduler::copy_drafts::mtp::trim_proposer(model, a, 1) {
             tracing::error!("trim_proposer_state: {e:#}");
         }
         sched.timing.record(Phase::TrimProposer, t_trim);
@@ -270,18 +277,21 @@ pub fn step_verify_k2(
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
         sched.timing.record(Phase::ProposeMask, t_mask);
         let t_propose = Instant::now();
-        match model.run_mtp_propose_multi(
-            v1,
-            a.seq.seq_len,
-            crate::scheduler::spec_step::effective_drafts_under_grammar(a, next_drafts),
-            &mut a.seq,
-            0,
-            _mtp_grammar_mask.as_deref(),
-        ) {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!("run_mtp_propose_multi: {e:#}");
+        // A copy (`ATLAS_QWEN_COPY_DRAFTS`) drafts in place of the head.
+        if !crate::scheduler::copy_drafts::mtp::propose(model, sched, a, num_drafts) {
+            match model.run_mtp_propose_multi(
+                v1,
+                a.seq.seq_len,
+                crate::scheduler::spec_step::effective_drafts_under_grammar(a, next_drafts),
+                &mut a.seq,
+                0,
+                _mtp_grammar_mask.as_deref(),
+            ) {
+                Ok(d) if !d.is_empty() => a.pending_drafts = d,
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!("run_mtp_propose_multi: {e:#}");
+                }
             }
         }
         sched.timing.record(Phase::Propose, t_propose);
@@ -308,7 +318,7 @@ pub fn step_verify_k2(
         a.seq.tokens.pop();
 
         let t_trim = Instant::now();
-        if let Err(e) = model.trim_proposer_state(&mut a.seq, 0, 0) {
+        if let Err(e) = crate::scheduler::copy_drafts::mtp::trim_proposer(model, a, 0) {
             tracing::error!("trim_proposer_state: {e:#}");
         }
         sched.timing.record(Phase::TrimProposer, t_trim);
@@ -347,18 +357,21 @@ pub fn step_verify_k2(
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
         sched.timing.record(Phase::ProposeMask, t_mask);
         let t_propose = Instant::now();
-        match model.run_mtp_propose_multi(
-            v0,
-            a.seq.seq_len,
-            crate::scheduler::spec_step::effective_drafts_under_grammar(a, next_drafts),
-            &mut a.seq,
-            0,
-            _mtp_grammar_mask.as_deref(),
-        ) {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!("run_mtp_propose_multi: {e:#}");
+        // A copy (`ATLAS_QWEN_COPY_DRAFTS`) drafts in place of the head.
+        if !crate::scheduler::copy_drafts::mtp::propose(model, sched, a, num_drafts) {
+            match model.run_mtp_propose_multi(
+                v0,
+                a.seq.seq_len,
+                crate::scheduler::spec_step::effective_drafts_under_grammar(a, next_drafts),
+                &mut a.seq,
+                0,
+                _mtp_grammar_mask.as_deref(),
+            ) {
+                Ok(d) if !d.is_empty() => a.pending_drafts = d,
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!("run_mtp_propose_multi: {e:#}");
+                }
             }
         }
         sched.timing.record(Phase::Propose, t_propose);

@@ -76,13 +76,20 @@ impl TransformerModel {
     /// stay pinned forever → the pool wedges. When `seq.tokens` is too short
     /// to cover the matched prefix, release over the stashed prefix tokens
     /// instead. Exactly one of the two covers the matched nodes, so they are
-    /// released once (never double-released).
-    pub(in super::super) fn radix_held_tokens<'a>(&self, seq: &'a SequenceState) -> &'a [u32] {
+    /// released once (never double-released). Both are in cache-key form: a
+    /// vision prompt's nodes live under its content key (`vision_cache`).
+    pub(in super::super) fn radix_held_tokens<'a>(
+        &self,
+        seq: &'a SequenceState,
+    ) -> std::borrow::Cow<'a, [u32]> {
         if seq.tokens.len() < seq.cached_prefix_tokens {
-            return &seq.prefix_ref_tokens;
+            return std::borrow::Cow::Borrowed(&seq.prefix_ref_tokens);
         }
         let finish = finish_cache(self.multi_rank_protocol_active(), self.leaf_on());
-        &seq.tokens[..held_tokens(finish, seq.prompt_len, seq.tokens.len())]
+        self.pc_key_tokens(
+            seq,
+            &seq.tokens[..held_tokens(finish, seq.prompt_len, seq.tokens.len())],
+        )
     }
 }
 

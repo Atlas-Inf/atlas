@@ -202,6 +202,8 @@ pub(crate) async fn chat_completions_inner(
         ));
     }
 
+    req.max_tokens = crate::ir::resolve_max_tokens(req.max_tokens, prompt_len, state.max_seq_len);
+
     // ── Phase 6: sampling preset / stop / grammar / timeout ─────
     let sampling_setup::SamplingSetup {
         temperature,

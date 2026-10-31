@@ -103,7 +103,7 @@ fn items_past_the_protocol_limit_are_rejected() {
 fn an_hour_of_qwen_groups_fits_the_grid_record_limit() {
     // 7,200 frames at 2 fps with temporal_patch_size=2 becomes 3,600
     // one-group VisionItems. The protocol must carry all of their metadata.
-    const { assert!(MAX_VISION_ITEMS >= 3600) };
+    const { assert!(MAX_VISION_ITEMS >= 3600) }
     let l = limits(usize::MAX);
     assert_eq!(l.check(&vec![64; 3600], true), Ok(()));
 }

@@ -92,3 +92,44 @@ fn position_acceptance_divides_by_the_verifies_that_drafted_it() {
     p.record(1, 0);
     assert_eq!(p.suffix(), "0.75,0.67,0.50,-,-,-,-");
 }
+
+#[test]
+fn a_decision_needs_a_quarter_of_its_window_drafted() {
+    assert_eq!(min_drafted(WINDOW), MIN_DRAFTED);
+    assert_eq!(MIN_DRAFTED, WINDOW / 4);
+    assert_eq!(min_drafted(16), 4);
+    assert_eq!(min_drafted(4), 1);
+}
+
+/// `ATLAS_MTP_DEEP_WINDOW=16`: a decision every 16 verifies, with 4 that
+/// drafted the deepest position.
+#[test]
+fn a_shorter_window_decides_sooner() {
+    let mut d = DeepDepth::default();
+    for _ in 0..15 {
+        d.record_in(3, 3, 3, 7, 16, None);
+    }
+    assert_eq!(d.drafts_from(None, 3, 7), 3, "15 verifies decide nothing");
+    d.record_in(3, 3, 3, 7, 16, None);
+    assert_eq!(d.drafts_from(None, 3, 7), 5, "the 16th promotes by two");
+    // Too few observations of the deepest position: the ceiling holds.
+    for i in 0..16 {
+        d.record_in(if i < 3 { 5 } else { 4 }, 5, 3, 7, 16, None);
+    }
+    assert_eq!(d.drafts_from(None, 3, 7), 5);
+}
+
+/// `ATLAS_MTP_DEEP_START=7`: a request starts at the ceiling, clamped into
+/// the floor..=max range, and demotes from there.
+#[test]
+fn a_start_ceiling_is_where_a_request_begins() {
+    let d = DeepDepth::default();
+    assert_eq!(d.drafts_from(Some(7), 3, 7), 7);
+    assert_eq!(d.drafts_from(Some(9), 3, 7), 7);
+    assert_eq!(d.drafts_from(Some(1), 3, 7), 3);
+    let mut d = DeepDepth::default();
+    for _ in 0..16 {
+        d.record_in(7, 0, 3, 7, 16, Some(7));
+    }
+    assert_eq!(d.drafts_from(Some(7), 3, 7), 5, "a = 0 demotes by two");
+}

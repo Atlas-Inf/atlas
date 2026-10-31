@@ -64,7 +64,9 @@ fn normalize_tool_call_arguments(messages: &[serde_json::Value]) -> Vec<serde_js
 mod chat_impl;
 mod chat_render;
 mod deepseek_v4;
+mod ids_only;
 mod jinja_helpers;
+mod large_encode;
 mod message_preprocess;
 
 pub(crate) use message_preprocess::{
@@ -79,6 +81,10 @@ enum ChatEncoding {
 
 pub struct ChatTokenizer {
     tokenizer: Tokenizer,
+    /// Shared by every caller of this tokenizer; limits only large CPU encodes.
+    large_encode_gate: Option<std::sync::Arc<large_encode::Gate>>,
+    /// Explicitly skip unused token spellings and offsets during serving encode.
+    ids_only: bool,
     eos_token_id: u32,
     supports_thinking: bool,
     /// GLM/Qwen register tool-envelope XML as added tokens. Incoming prose
@@ -120,6 +126,23 @@ pub(crate) struct Glm5VisionPlaceholder {
     /// Qwen3-VL's nested per-group timestamp + start/end markers. Homogeneous
     /// within a request — a checkpoint's processor is one or the other.
     pub(crate) qwen3vl: bool,
+}
+
+/// One compact Qwen vision marker after CPU preprocessing. Qwen3.8's
+/// processor expands a video marker into one timestamped vision range per
+/// temporal group; images keep the ordinary single range shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QwenVisionKind {
+    Image,
+    Video,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct QwenVisionPlaceholder {
+    pub(crate) kind: QwenVisionKind,
+    pub(crate) pad_count: usize,
+    pub(crate) per_frame_pad_count: usize,
+    pub(crate) timestamps: Vec<f32>,
 }
 
 /// Wrapper around tokenizers::DecodeStream that hides the generic parameters.

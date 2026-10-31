@@ -11,10 +11,12 @@ use crate::video_decode_ffmpeg::FfmpegPolicy;
 
 /// The default: no subprocess. Every GIF case must pass without it, which is
 /// the guarantee that the pure-Rust path is not quietly depending on ffmpeg.
+#[allow(dead_code)]
 fn no_ffmpeg() -> FfmpegPolicy {
     FfmpegPolicy::default()
 }
 
+#[allow(dead_code)]
 fn cfg() -> VisionConfig {
     VisionConfig {
         is_glm5_next: false,
@@ -179,6 +181,7 @@ fn glm5_sampling_plans_whole_temporal_groups() {
 // ── decode + grouping, against a real generated GIF ──────────────────────
 
 /// Build an animated GIF of `n` solid-color frames at `size`x`size`.
+#[allow(dead_code)]
 fn make_gif(n: u16, size: u16) -> String {
     use image::codecs::gif::GifEncoder;
     use image::{Delay, Frame, RgbaImage};
@@ -240,6 +243,35 @@ fn grouping_produces_correctly_shaped_buffers() {
     for (i, g) in v.groups.iter().enumerate() {
         assert_eq!(g.len(), expect, "group {i} is the wrong length");
     }
+}
+
+#[test]
+fn qwen_odd_clip_repeats_only_the_final_temporal_slot() {
+    let uri = make_gif(3, 64);
+    let v = preprocess_video(&uri, &cfg(), None, 10.0, &no_ffmpeg()).expect("preprocess");
+    assert_eq!(
+        v.grid_t, 2,
+        "Qwen patchify pads 3 frames to two temporal groups"
+    );
+    assert_eq!(v.groups.len(), 2);
+    let ps = 16usize;
+    let last = &v.groups[1];
+    assert_eq!(
+        last[0],
+        last[ps * ps],
+        "only the final temporal slot is padded"
+    );
+    assert!((v.timestamps[1] - 0.2).abs() < 0.001, "{:?}", v.timestamps);
+}
+
+#[test]
+fn qwen_video_timestamps_average_each_temporal_pair() {
+    let uri = make_gif(4, 64);
+    let v = preprocess_video(&uri, &cfg(), None, 10.0, &no_ffmpeg()).expect("preprocess");
+    assert_eq!(v.grid_t, 2);
+    assert_eq!(v.timestamps.len(), 2);
+    assert!((v.timestamps[0] - 0.05).abs() < 0.001, "{:?}", v.timestamps);
+    assert!((v.timestamps[1] - 0.25).abs() < 0.001, "{:?}", v.timestamps);
 }
 
 /// Token accounting, which is what the prompt-side pad run must match.
@@ -322,9 +354,11 @@ fn an_mp4_is_refused_by_name_with_a_conversion_hint() {
 #[test]
 fn a_single_frame_gif_is_refused_rather_than_treated_as_a_still() {
     let uri = make_gif(1, 64);
+    let mut glm = cfg();
+    glm.is_glm5_next = true;
     let err = format!(
         "{:#}",
-        preprocess_video(&uri, &cfg(), None, 10.0, &no_ffmpeg()).unwrap_err()
+        preprocess_video(&uri, &glm, None, 10.0, &no_ffmpeg()).unwrap_err()
     );
     assert!(err.contains("temporal group"), "{err}");
 }
@@ -344,4 +378,15 @@ fn invalid_geometry_is_refused_before_dividing_by_it() {
     let mut c = cfg();
     c.patch_size = 0;
     assert!(preprocess_video(&uri, &c, None, 10.0, &no_ffmpeg()).is_err());
+}
+
+#[test]
+fn gif_respects_explicit_aggregate_decode_budget() {
+    let uri = make_gif(4, 64);
+    let mut policy = no_ffmpeg();
+    policy.max_total_decoded_pixels = Some(4 * 64 * 64);
+    assert!(decode_frames(&uri, 10.0, &policy).is_ok());
+    policy.max_total_decoded_pixels = Some(4 * 64 * 64 - 1);
+    let error = format!("{:#}", decode_frames(&uri, 10.0, &policy).unwrap_err());
+    assert!(error.contains("decoded-image budget"), "{error}");
 }

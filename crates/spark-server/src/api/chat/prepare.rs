@@ -128,11 +128,8 @@ pub(crate) fn prepare_chat_prompt(
         image_pixels,
         image_pad_counts,
         vision_placeholders,
-    } = msg_entry::build_msg_entries(
-        crate::api::chat::vision_admit::AdmitCtx {
-            limits: state.vision_limits.as_ref(),
-            budget: state.vision_budget.as_ref(),
-        },
+        qwen_vision_placeholders,
+    } = msg_entry::build_msg_entries_admitted(
         state.vision_config.as_ref(),
         state.vision_max_pixels,
         &state.remote_image_policy,
@@ -144,6 +141,13 @@ pub(crate) fn prepare_chat_prompt(
         tools_active,
         &state.chat,
         state.tokenizer.uses_deepseek_v4_encoding(),
+        // A request the engine cannot serve is refused while its media are
+        // read, with a 400, rather than failing at prefill start where
+        // clients retry it forever (`vision_admit`).
+        super::vision_admit::AdmitCtx {
+            limits: state.vision_limits.as_ref(),
+            budget: state.vision_budget.as_ref(),
+        },
     )?;
     // A call that keeps returning the same result gets a notice on its
     // latest result and one turn of deeper thinking, instead of having
@@ -213,6 +217,7 @@ pub(crate) fn prepare_chat_prompt(
         &messages,
         &image_pad_counts,
         &vision_placeholders,
+        &qwen_vision_placeholders,
         enable_thinking,
         thinking_budget,
         reasoning_effort,
@@ -251,10 +256,10 @@ pub(crate) fn prepare_chat_prompt(
 /// `thinking_in_tools=false`, ...) must never carry an effort directive
 /// into the render (Qwen3.8 gates its effort block on `enable_thinking`;
 /// Mistral's validator raises on any effort other than `none` when the
-/// settings line is emitted). `None` with thinking on falls through to
-/// the cross-template `"medium"` fallback in `tokenizer/chat_render.rs`
-/// — the neutral tier, NOT the pre-2026-08 `"high"` that Qwen3.8
-/// escalated to its most expensive `xhigh` directive.
+/// settings line is emitted). `None` with thinking on leaves the
+/// template's own default (`tokenizer/chat_render.rs`); `server_default`
+/// already folds MODEL.toml `[behavior].default_reasoning_effort` below
+/// the CLI flag.
 fn effective_reasoning_effort(
     request: Option<crate::ir::ReasoningEffort>,
     server_default: Option<crate::ir::ReasoningEffort>,
@@ -322,8 +327,8 @@ mod tests {
         assert_eq!(effective_reasoning_effort(low, max, true), low);
         // Server default fills a silent request.
         assert_eq!(effective_reasoning_effort(None, max, true), max);
-        // Fully unset: None → the "medium" chat_render fallback (the
-        // neutral tier), asserted byte-level in tokenizer/tests/qwen_dense.rs.
+        // Fully unset: None → the template's own default, asserted
+        // byte-level in tokenizer/tests/qwen_dense.rs.
         assert_eq!(effective_reasoning_effort(None, None, true), None);
         // Thinking off suppresses both sources.
         assert_eq!(effective_reasoning_effort(low, max, false), None);

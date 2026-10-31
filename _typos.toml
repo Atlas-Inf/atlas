@@ -28,6 +28,10 @@ extend-ignore-identifiers-re = [
 # `arange` — the NumPy/torch range primitive, referenced in math comments
 # (qwen_yarn inverse-frequency derivation). Not a typo of `arrange`.
 arange = "arange"
+
+# `hihg` — a deliberately malformed `reasoning_effort` value in serve_tests.rs
+# (0.4.0 has the same string): the test asserts the parser rejects it.
+hihg = "hihg"
 # `suh` / `svh` — the ExLlamaV3 (EXL3) per-linear sign-and-scale vectors
 # applied around the Hadamard rotation (`W = diag(suh) H W_inner H diag(svh)`);
 # real checkpoint tensor names, not a typo of `such`.
