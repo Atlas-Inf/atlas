@@ -20,11 +20,14 @@ const CALL: &[u32] = &[3, 4, 5, 6, 7, 8, 9, 10, 11];
 #[path = "reasoning_done_tests.rs"]
 mod reasoning_done_tests;
 
-fn app(_glm: bool) -> Arc<AppState> {
-    app_for_model("qwen3", tool_parser::ToolCallFormat::PoolsideV1)
+fn app(glm: bool) -> Arc<AppState> {
+    app_for_model(
+        if glm { "glm5_next" } else { "qwen3" },
+        tool_parser::ToolCallFormat::PoolsideV1,
+    )
 }
 
-fn app_for_model(model_type: &str, _format: tool_parser::ToolCallFormat) -> Arc<AppState> {
+fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<AppState> {
     let dir = tempfile::tempdir().unwrap();
     let words = [
         "[UNK]",
