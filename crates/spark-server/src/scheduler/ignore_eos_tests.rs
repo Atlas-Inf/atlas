@@ -139,6 +139,8 @@ fn a_grammar_passes_the_end_token_through() {
         &Some(GrammarSpec::JsonObject),
         &[GRAMMAR_EOS],
         false,
+        None,
+        None,
         &mut ResponseSink::Blocking(None),
     )
     .unwrap();

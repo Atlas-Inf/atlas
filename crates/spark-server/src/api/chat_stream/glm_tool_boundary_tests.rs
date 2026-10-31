@@ -266,6 +266,7 @@ fn stream_tokens_with_state(
         stop_string_buffer_len: 0,
         leak_markers: state.tool_call_parser.as_ref().unwrap().leak_markers(),
         wants_typed_arguments: true,
+        role_literal_leaks: state.tokenizer.filters_bare_role_literals(),
         max_tool_calls_per_response: 12,
         min_tokens: 0,
         req_return_token_ids: true,

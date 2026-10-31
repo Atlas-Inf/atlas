@@ -45,6 +45,16 @@ impl FirstTokenThinking {
     }
 }
 
+/// The token that ends reasoning as a native GLM tool call: the configured
+/// boundary, when tools are armed and it is the tool-call opener.
+pub(super) fn native_opener(
+    glm_tool_boundary: Option<u32>,
+    tools_present: bool,
+    tool_call_start_token: Option<u32>,
+) -> Option<u32> {
+    glm_tool_boundary.filter(|&b| tools_present && tool_call_start_token == Some(b))
+}
+
 /// Consume only a configured native GLM delimiter, never text within reasoning.
 /// Call before grammar, tool bookkeeping and token accounting on every emit path.
 pub(super) fn apply_native_tool_boundary(
