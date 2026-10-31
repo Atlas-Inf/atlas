@@ -209,8 +209,18 @@ fn mtp_ladder_steps() -> &'static [(usize, usize)] {
         // aggregate 124–128 → 141–144 tok/s on 2×GB10 TP2, Atlas-Inf #220).
         // The 8/16/32 rungs still step down with concurrency — the ladder's
         // job is the wide end, not the ceiling.
-        let mut steps =
-            parsed.unwrap_or_else(|| vec![(1, usize::MAX), (4, 3), (8, 3), (16, 1), (32, 1)]);
+        // gfx1151 steps down at n=2: the 4:3 / 8:3 rungs above were measured on
+        // GB10. On Strix Halo a >=2-draft verify at C>=4 is the slow arm (strix s153,
+        // 27B NVFP4, MIN_N 9: C4 drafts 1/2/3 = 28.2 / 20.9 / 20.6 tok/s, C8 28.2 /
+        // 21.4 / 21.3; C1 still prefers depth, 13.9 / 14.8 / 14.4). s154, interleaved
+        // x2, NUM_DRAFTS=3: this ladder vs the default, C1 14.6/14.4 vs 15.3/14.4,
+        // C4 28.2/28.2 vs 21.5/20.6 (+34%), C8 28.1/28.1 vs 21.9/21.9 (+28%).
+        let default_steps = if cfg!(atlas_hip) {
+            vec![(1, usize::MAX), (8, 1), (16, 1), (32, 1)]
+        } else {
+            vec![(1, usize::MAX), (4, 3), (8, 3), (16, 1), (32, 1)]
+        };
+        let mut steps = parsed.unwrap_or(default_steps);
         steps.sort_by_key(|&(n, _)| n);
         steps
     })
