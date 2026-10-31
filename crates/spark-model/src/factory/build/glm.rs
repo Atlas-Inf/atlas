@@ -248,17 +248,19 @@ pub(super) fn shard_plan(
 }
 
 /// The paged cache `plan` describes: latent-sharded, V aliasing K (GLM), or
-/// the generic layout.
+/// the generic layout, with `placement`'s pools in the carveout (never under
+/// a latent shard, which `factory::build` sizes without one).
 pub(super) fn new_kv_cache(
     kv_config: KvCacheConfig,
     num_blocks: usize,
     gpu: &dyn GpuBackend,
     plan: Option<GlmCachePlan>,
+    placement: spark_runtime::kv_cache::KvPlacement,
 ) -> Result<spark_runtime::kv_cache::PagedKvCache> {
     use spark_runtime::kv_cache::PagedKvCache;
     match plan.and_then(GlmCachePlan::shard) {
         Some(spec) => PagedKvCache::new_latent_sharded(kv_config, num_blocks, gpu, spec),
-        None => PagedKvCache::new_with_v_alias(kv_config, num_blocks, gpu, plan.is_some()),
+        None => PagedKvCache::new_placed(kv_config, num_blocks, gpu, plan.is_some(), placement),
     }
 }
 
