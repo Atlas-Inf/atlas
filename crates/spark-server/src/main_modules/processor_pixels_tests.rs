@@ -182,3 +182,44 @@ fn reads_the_video_bounds() {
         None
     );
 }
+
+/// GLM-5.3 declares token budgets, not pixel areas: the nested image and
+/// video blocks of the shipped `processor_config.json` are read as given
+/// (the serving video cap is applied where the budget is used).
+#[test]
+fn reads_the_glm_token_budgets_per_modality() {
+    let dir_with = |files: &[(&str, &str)]| {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in files {
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
+        dir
+    };
+    let d = dir_with(&[(
+        "processor_config.json",
+        r#"{
+            "image_processor": {"min_image_tokens": 16, "max_image_tokens": 8000},
+            "video_processor": {"min_image_tokens": 16, "max_image_tokens": 240000, "fps": 2}
+        }"#,
+    )]);
+    let budgets = read_glm_token_budgets(d.path());
+    assert_eq!(budgets.image, (16, 8000));
+    assert_eq!(budgets.video, (16, 240_000));
+    assert!(
+        crate::main_modules::processor_pixels::read_declared_pixels(
+            d.path(),
+            crate::main_modules::processor_pixels::Modality::Image
+        )
+        .is_none()
+    );
+
+    let custom = dir_with(&[(
+        "processor_config.json",
+        r#"{"image_processor": {"max_image_tokens": 1024}}"#,
+    )]);
+    let budgets = read_glm_token_budgets(custom.path());
+    assert_eq!(budgets.image, (16, 1024), "a missing key keeps the default");
+    assert_eq!(budgets.video, (16, 240_000));
+    let empty = tempfile::tempdir().expect("tempdir");
+    assert_eq!(read_glm_token_budgets(empty.path()), Default::default());
+}
