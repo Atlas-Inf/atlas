@@ -20,6 +20,9 @@ use crate::tokenizer::{Glm5VisionPlaceholder, QwenVisionPlaceholder};
 
 mod glm5_vision;
 mod media;
+
+#[path = "msg_entry/tail.rs"]
+pub(super) mod tail;
 #[cfg(test)]
 use glm5_vision::checked_glm5_video_timestamps;
 
@@ -211,9 +214,6 @@ fn resolve_media_uri(
 /// [`build_msg_entries_admitted`] without vision bounds (tests).
 #[cfg(test)]
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
-#[path = "msg_entry/tail.rs"]
-pub(super) mod tail;
-
 pub(super) fn build_msg_entries(
     vision_config: Option<&VisionConfig>,
     vision_max_pixels: Option<usize>,
