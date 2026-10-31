@@ -35,6 +35,7 @@ impl Drop for TransformerModel {
         // same ownership shape as `drop_pinned_staging`. No-op when the tier
         // never ran (the buffer is allocated on first spill).
         self.ssm_snapshots.free_staging(self.gpu.as_ref());
+        self.dflash_warm_store.free(self.gpu.as_ref());
         // Page-locked verify block-table staging (`pinned_upload.rs`); no-op
         // when the switch never ran.
         if let Err(e) = self.verify_bt_stage.lock().release(self.gpu.as_ref()) {

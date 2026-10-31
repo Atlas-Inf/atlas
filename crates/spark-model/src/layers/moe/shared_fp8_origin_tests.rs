@@ -79,7 +79,7 @@ fn source_geometry_dtype_and_markers_are_checked_before_quantizer_work() {
     ] {
         let gpu = MockGpuBackend::new();
         let (store, source) = bf16_store(&gpu, shape, dtype);
-        assert!(source_is_bf16(&store, "shared", 2048, 4096).is_err());
+        assert!(source_is_runtime_quantized(&store, "shared", 2048, 4096).is_err());
         assert_eq!(gpu.launch_count(), 0);
         assert!(gpu.copy_d2h(source, &mut [0]).is_ok());
     }
@@ -114,7 +114,7 @@ fn bf16_with_any_quantization_marker_is_not_claimed_as_validated_dense_origin() 
                 },
             ),
         ]));
-        assert!(source_is_bf16(&store, "shared", 2048, 4096).is_err());
+        assert!(source_is_runtime_quantized(&store, "shared", 2048, 4096).is_err());
     }
 }
 
@@ -138,7 +138,7 @@ fn native_packed_dtype_and_exact_shapes_remain_explicit() {
             },
         ),
     ]));
-    assert!(!source_is_bf16(&store, "shared", 2048, 4096).unwrap());
+    assert!(!source_is_runtime_quantized(&store, "shared", 2048, 4096).unwrap());
 }
 
 #[test]
@@ -155,4 +155,88 @@ fn actual_source_seam_rejects_unapproved_model_variant_before_quantization() {
         assert_eq!(gpu.launch_count(), 0);
         assert!(gpu.copy_d2h(source, &mut [0]).is_ok());
     }
+}
+
+/// `shared.weight` E4M3 `[n, k]` plus a `weight_scale` of `dtype`/`shape`.
+fn fp8_store(n: usize, k: usize, scale: (WeightDtype, Vec<usize>)) -> WeightStore {
+    WeightStore::from_map(fp8_map(n, k, scale))
+}
+
+fn fp8_map(
+    n: usize,
+    k: usize,
+    scale: (WeightDtype, Vec<usize>),
+) -> std::collections::HashMap<String, WeightTensor> {
+    std::collections::HashMap::from([
+        (
+            "shared.weight".into(),
+            WeightTensor {
+                ptr: DevicePtr(16),
+                shape: vec![n, k],
+                dtype: WeightDtype::FP8E4M3,
+            },
+        ),
+        (
+            "shared.weight_scale".into(),
+            WeightTensor {
+                ptr: DevicePtr(0x500000),
+                shape: scale.1,
+                dtype: scale.0,
+            },
+        ),
+    ])
+}
+
+/// nvidia GLM-5.3-Flash-FP4-Local's shared experts: FP8_PB_WO (F32
+/// `[n/128, 1, k/128, 1]`), and layer 45's MXFP8 (U8 `[n, k/32]`), are
+/// requantized like a BF16 source, so the cache treats them as derived.
+#[test]
+fn fp4local_fp8_shared_sources_are_runtime_quantized() {
+    for (n, k, scale) in [
+        (2048, 4096, (WeightDtype::FP32, vec![16, 1, 32, 1])),
+        (4096, 2048, (WeightDtype::FP32, vec![32, 1, 16, 1])),
+        (4096, 2048, (WeightDtype::FP32, vec![32, 16])),
+        (2048, 4096, (WeightDtype::UInt8, vec![2048, 128])),
+    ] {
+        let store = fp8_store(n, k, scale.clone());
+        assert!(
+            source_is_runtime_quantized(&store, "shared", n, k).unwrap(),
+            "{scale:?}"
+        );
+    }
+}
+
+#[test]
+fn fp8_shared_sources_with_wrong_geometry_or_markers_are_refused() {
+    for (n, k, scale) in [
+        // Grid that does not tile [2048, 4096].
+        (2048, 4096, (WeightDtype::FP32, vec![3, 1, 32, 1])),
+        // A per-tensor scalar is not a block grid.
+        (2048, 4096, (WeightDtype::FP32, vec![1])),
+        // BF16 block scales are not FP4-Local's.
+        (2048, 4096, (WeightDtype::BF16, vec![16, 32])),
+        // MXFP8 scale of the wrong width.
+        (2048, 4096, (WeightDtype::UInt8, vec![2048, 64])),
+    ] {
+        let store = fp8_store(n, k, scale.clone());
+        assert!(
+            source_is_runtime_quantized(&store, "shared", n, k).is_err(),
+            "{scale:?}"
+        );
+    }
+    // Transposed weight.
+    let store = fp8_store(4096, 2048, (WeightDtype::FP32, vec![32, 1, 16, 1]));
+    assert!(source_is_runtime_quantized(&store, "shared", 2048, 4096).is_err());
+    // An NVFP4 marker beside an E4M3 weight.
+    let mut map = fp8_map(2048, 4096, (WeightDtype::FP32, vec![16, 1, 32, 1]));
+    map.insert(
+        "shared.weight_scale_2".into(),
+        WeightTensor {
+            ptr: DevicePtr(0x600000),
+            shape: vec![],
+            dtype: WeightDtype::FP32,
+        },
+    );
+    let store = WeightStore::from_map(map);
+    assert!(source_is_runtime_quantized(&store, "shared", 2048, 4096).is_err());
 }

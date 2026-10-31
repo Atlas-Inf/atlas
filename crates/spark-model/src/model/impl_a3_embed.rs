@@ -8,7 +8,7 @@
 //! reads as fluent degenerate text, not as an error. Callers holding the
 //! sequence use `embed_ctx`.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use spark_runtime::gpu::DevicePtr;
 
 use super::TransformerModel;
@@ -31,12 +31,45 @@ impl TransformerModel {
     /// The plain single-row gather, with no n-gram guard. Shared by `embed`
     /// and by `embed_ctx`'s non-n-gram arm.
     fn embed_row(&self, token: u32, output: DevicePtr, stream: u64) -> Result<()> {
-        let h = self.config.hidden_size;
-        let row_bytes = h * 2; // BF16 embedding row
-        let src = self.embed_tokens.weight.offset(token as usize * row_bytes);
+        self.validate_embedding_tokens(std::slice::from_ref(&token))?;
+        let row_bytes = self
+            .config
+            .hidden_size
+            .checked_mul(2) // BF16 embedding row
+            .context("embedding row byte size overflow")?;
+        anyhow::ensure!(row_bytes > 0, "embedding row has zero hidden size");
+        let offset = (token as usize)
+            .checked_mul(row_bytes)
+            .context("embedding row byte offset overflow")?;
+        let address = self
+            .embed_tokens
+            .weight
+            .0
+            .checked_add(offset as u64)
+            .context("embedding row device address overflow")?;
+        address
+            .checked_add(row_bytes as u64)
+            .context("embedding row device range overflow")?;
+        let src = DevicePtr(address);
         self.gpu.copy_d2d_async(src, output, row_bytes, stream)?;
         // Scale embeddings (Gemma-4: sqrt(hidden_size))
         self.scale_embeddings(output, 1, stream)
+    }
+
+    /// Bound every base-table lookup by the served vocabulary. LoRA token
+    /// overlays replace rows within this same vocabulary; they do not extend it.
+    pub(super) fn validate_embedding_tokens(&self, tokens: &[u32]) -> Result<()> {
+        if let Some((position, &token)) = tokens
+            .iter()
+            .enumerate()
+            .find(|(_, token)| **token as usize >= self.config.vocab_size)
+        {
+            anyhow::bail!(
+                "embedding: token {token} at position {position} is outside served vocabulary {}",
+                self.config.vocab_size
+            );
+        }
+        Ok(())
     }
 
     /// Embed ONE token that is preceded by `history` in its sequence.
@@ -60,3 +93,7 @@ impl TransformerModel {
         self.scale_embeddings(output, 1, stream)
     }
 }
+
+#[cfg(test)]
+#[path = "impl_a3_embed_tests.rs"]
+mod tests;

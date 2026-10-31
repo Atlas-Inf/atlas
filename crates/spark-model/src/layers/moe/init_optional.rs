@@ -453,3 +453,7 @@ mod tests {
         assert_eq!(handles(false, true, true), ([0, 0, 0, 0], 0));
     }
 }
+
+#[cfg(test)]
+#[path = "init_optional_tests.rs"]
+mod lookup_tests;

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-#[path = "idle_command_fixture.rs"]
-mod fixture;
+use crate::model::test_fixture as fixture;
 // The host command channel's tests share the fixture.
 #[path = "cmd_words_tests.rs"]
 mod cmd_words;

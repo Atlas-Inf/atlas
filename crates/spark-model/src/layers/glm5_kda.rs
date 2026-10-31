@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! GLM-5 KDA recurrent block for the conservative GB10 bring-up path.
+mod flash_prefill;
 mod forward_attention;
 mod forward_attention_entry;
 mod forward_attention_qkv;
+mod forward_attention_side;
 mod forward_ffn;
 mod forward_recurrent;
 mod forward_recurrent_owners;
@@ -15,6 +17,7 @@ mod profile;
 mod projection;
 mod recurrent;
 mod shared_cache;
+mod sp_overlap;
 
 use std::mem::size_of;
 
@@ -37,6 +40,22 @@ pub use projection::{Glm5KdaWeights, Glm5Projection};
 /// Both ranks must run the same value (`model::startup_parity`).
 pub(crate) fn kda_batched_ffn_enabled() -> bool {
     std::env::var("ATLAS_GLM_KDA_BATCHED_FFN").ok().as_deref() == Some("1")
+}
+
+/// `ATLAS_GLM_KDA_SIDE_PROJ_LT=1`: the loader stores b / f_a / g_a back to
+/// back (`weight_loader::glm5::kda_side_pack`) and prefill projects them as one
+/// CUTLASS GEMM (`ops::dense_gemm_packed_triple_n`), the triple's bytes.
+pub(crate) fn kda_side_proj_lt_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_KDA_SIDE_PROJ_LT").ok().as_deref() == Some("1"))
+}
+
+/// `ATLAS_GLM_KDA_CONV_PLANES=1`: prefill convolves the projection's q / k /
+/// v planes in place instead of first copying them into packed rows
+/// (`kda_pack_qkv`); the same bytes.
+pub(crate) fn kda_conv_planes_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_KDA_CONV_PLANES").ok().as_deref() == Some("1"))
 }
 
 fn verify_batched_conv_snapshot_enabled() -> bool {
@@ -145,6 +164,7 @@ pub struct Glm5KdaLayer {
     preprocess_regresident_k: KernelHandle,
     recurrent_regresident_k: KernelHandle,
     register_resident_prefill: bool,
+    flash_prefill: Option<flash_prefill::FlashPrefill>,
     gated_norm_k: KernelHandle,
     hc_expand_k: KernelHandle,
     hc_pre_k: KernelHandle,

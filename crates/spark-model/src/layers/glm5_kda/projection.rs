@@ -116,6 +116,19 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if crate::layers::canonical_verify::enabled() {
+            // One tensor-core family for every row count (1..=32).
+            return crate::layers::canonical_verify::w4a16(
+                ctx.gpu,
+                input,
+                &weight.nvfp4,
+                output,
+                m,
+                n,
+                k,
+                stream,
+            );
+        }
         if (2..=8).contains(&m) {
             self.project_hot_multi_decode(input, weight, output, m, n, k, ctx, stream)
         } else if m > 8
@@ -173,6 +186,11 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if crate::layers::canonical_verify::enabled() {
+            return crate::layers::canonical_verify::dense(
+                ctx.gpu, input, weight, output, m, n, k, n, stream,
+            );
+        }
         if m == 1 {
             self.project_dense(input, weight, output, m, n, k, ctx, stream)
         } else if m <= ops::DENSE_GEMV_BATCHM_MAX_M {
@@ -473,21 +491,5 @@ mod tests {
 }
 
 #[cfg(test)]
-mod verify_row_chunk_tests {
-    use super::verify_row_chunks;
-
-    #[test]
-    fn verify_row_chunks_cover_rows_within_the_kernel_cap() {
-        for m in 9..=96u32 {
-            let chunks: Vec<_> = verify_row_chunks(m).collect();
-            let mut next = 0;
-            for &(start, rows) in &chunks {
-                assert_eq!(start, next, "m={m} chunks must be contiguous");
-                assert!((2..=8).contains(&rows), "m={m} chunk of {rows} rows");
-                next += rows;
-            }
-            assert_eq!(next, m, "m={m} chunks must cover every row");
-        }
-        assert_eq!(verify_row_chunks(12).collect::<Vec<_>>(), [(0, 6), (6, 6)]);
-    }
-}
+#[path = "projection_row_tests.rs"]
+mod verify_row_chunk_tests;

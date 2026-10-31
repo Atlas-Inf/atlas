@@ -28,6 +28,8 @@ impl SsmStatePool {
         // uniform. The vec lengths are the capacity gates every verify arm
         // checks before writing. KDA records replace the H snapshots when
         // allocated.
+        state.gdn_commit_qkv = self.commit_qkv(ssm_layer_idx, slot);
+        state.gdn_commit_gb = self.commit_gb(ssm_layer_idx, slot);
         state.kda_records = self.kda_records(ssm_layer_idx, slot);
         state.gdn_commit_qkv = self.commit_qkv(ssm_layer_idx, slot);
         state.gdn_commit_gb = self.commit_gb(ssm_layer_idx, slot);

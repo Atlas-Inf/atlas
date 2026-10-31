@@ -1,0 +1,724 @@
+{
+  "status": "PASS",
+  "revision": "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e",
+  "reviewed_utc": "2026-10-15T16:14:10.486405+00:00",
+  "controller_result_sha256": "45cd446a593bf4eda16b288dfc86058bc80c183c0b94fb1b93f2e9a44049b47a",
+  "approved_for_formal_gates": true,
+  "scope": "Bounded API/schema/tools, C1/C4 repeated parity, disconnect/reuse,6404-token multichunk needle and actual resident/NVMe restoration; both ranks exit0/no fatal diagnostics/no swap and verified original-service restoration.",
+  "rank_evidence": [
+    {
+      "profile": "full",
+      "rank": 0,
+      "minimum_available_kib": 12645920,
+      "swap_used_kib": 0,
+      "memory_samples": 160,
+      "owned_id": "2322f4ff1ee092a6dcc57172cb4d0da54bb8bb69934c9478f32fbd844e7f84c5",
+      "cleanup_confirmed": true,
+      "fallback_warning_count": 1,
+      "result_sha256": "4728bcff134d1c358bdd0fe64deafccfd39d1fce36a3b8ae454d38f752936a38",
+      "rank_log_sha256": "3204879d81a7cdc5d3d0f68d8dd9e95bfebeeca5831bf266f48e7e8150822003",
+      "memory_sha256": "063a5a5a2048351c8c2ae13717687bb0640f06ea68f65f6dbec4a05944050059"
+    },
+    {
+      "profile": "full",
+      "rank": 1,
+      "minimum_available_kib": 13906020,
+      "swap_used_kib": 0,
+      "memory_samples": 166,
+      "owned_id": "72b2f3cfaf424c535445ba78cc95d53dbea3ac6bc8e221379d6c4dd072c1a3ec",
+      "cleanup_confirmed": true,
+      "fallback_warning_count": 1,
+      "result_sha256": "bb56104447e90cd0011ead85e6a1be0889ceb890f1e4a4e0ab6e4550ecffffb5",
+      "rank_log_sha256": "28389e9629f66db6d354d04739ed1a066acac18ffcf8d3aaf067e8f08733a2f6",
+      "memory_sha256": "aa235b86d29f37d948c110056ce1cd44309fbda6d6916dffdc5a4d4baf0656ea"
+    },
+    {
+      "profile": "resident",
+      "rank": 0,
+      "minimum_available_kib": 13167124,
+      "swap_used_kib": 0,
+      "memory_samples": 154,
+      "owned_id": "d9d8d7a5277453df1a50133c008fbb3bdd475e3bb6b9db99cb7efbf36cf736d4",
+      "cleanup_confirmed": true,
+      "fallback_warning_count": 1,
+      "result_sha256": "a60e4b05472869f2b957ce20fa2428fcd4430788488b399a1a0370889f0bd608",
+      "rank_log_sha256": "a14d7e5a64e66f409de629061768ffffd3fee6b04118c7b40247fc373e45599d",
+      "memory_sha256": "a20e1f18973026c68d73ff9bca9a18f5d14a352999a200cef0f20b777f31215f"
+    },
+    {
+      "profile": "resident",
+      "rank": 1,
+      "minimum_available_kib": 13911588,
+      "swap_used_kib": 0,
+      "memory_samples": 161,
+      "owned_id": "7fd36fc4827bf637e07cc314e828ae42f7021cf4be8965bf1c9051ea3739079e",
+      "cleanup_confirmed": true,
+      "fallback_warning_count": 1,
+      "result_sha256": "f48e12ae25a6a94280250c611ae42553b9310129a53a0bde949bb8113c16e94a",
+      "rank_log_sha256": "a155aa3c43c85cc9257233c5c1840b8468b0a9351a9ba86a83093fee087da96e",
+      "memory_sha256": "89fe1dd843eca4c86062e90b8be6896aeaa38d3bffbe3684ab8db1d49569c675"
+    },
+    {
+      "profile": "nvme-sync",
+      "rank": 0,
+      "minimum_available_kib": 13007704,
+      "swap_used_kib": 0,
+      "memory_samples": 146,
+      "owned_id": "130c629f6b45bbfadbdd66e8ac5afffa53f511498a6dace621cc0a2e97faca3a",
+      "cleanup_confirmed": true,
+      "fallback_warning_count": 1,
+      "result_sha256": "20c4073858a82c62930d7dc223326993729623f52916b4b8ce49bed9ae718194",
+      "rank_log_sha256": "a8b1c58dfc71df2353170de9d05c1de0db25bcddcec4d10fb86778774ed77a33",
+      "memory_sha256": "674ab134d9f9bdb9709348ddb15c5397bfcc8be56d9bd43caca1aa22d9f9fb05"
+    },
+    {
+      "profile": "nvme-sync",
+      "rank": 1,
+      "minimum_available_kib": 13051964,
+      "swap_used_kib": 0,
+      "memory_samples": 152,
+      "owned_id": "fa3799d0c0a78ac6efe8948843f5f58b2c8745e83bf05acce40b55a2d3b15410",
+      "cleanup_confirmed": true,
+      "fallback_warning_count": 1,
+      "result_sha256": "5b5cc2a5ef12bd3d1059800b41c24e78fadb8d872bd78bc34ea45381807e69e0",
+      "rank_log_sha256": "48f04e29e8e9b165d68a71e6243a71ddce27108df3c243a69767391023cfe9a2",
+      "memory_sha256": "3c5c61496dd5ee521996460a164273d1bfe9088020354d1f9cb5be89f6c3aa08"
+    },
+    {
+      "profile": "nvme-fast-keep",
+      "rank": 0,
+      "minimum_available_kib": 12977588,
+      "swap_used_kib": 0,
+      "memory_samples": 146,
+      "owned_id": "2dad6c88690da42d0d026bc5d416627ec464c4639cb657b4e6f90141a90e45e8",
+      "cleanup_confirmed": true,
+      "fallback_warning_count": 1,
+      "result_sha256": "d7b617dd3e80e67346112614c980ccc3b1008e7b93fdfa68bb2125ba7285e49c",
+      "rank_log_sha256": "6a86f0a6b614d387a8301fb1d1e722d28f74510cbb2772711288638f66d9f72e",
+      "memory_sha256": "7c9869782d481eceb0eeedcb5a360edf2fb00e429cb45d25205f9c21fe34b619"
+    },
+    {
+      "profile": "nvme-fast-keep",
+      "rank": 1,
+      "minimum_available_kib": 13644292,
+      "swap_used_kib": 0,
+      "memory_samples": 152,
+      "owned_id": "a3427c6f2c6de3fe9e800270317c7afb1dfc42ad851886d28ae1069c785ef959",
+      "cleanup_confirmed": true,
+      "fallback_warning_count": 1,
+      "result_sha256": "d54055f3fcda9e5b18a1926a3683d4b9ed0c816a15bba3d091eb2c0aebdf571b",
+      "rank_log_sha256": "7feae817554c8a5b1802b5835c4f0d9ba403ee51f918901467f3ae20e3442350",
+      "memory_sha256": "f5d6836b2f08f102bbe1fd56b8e43ae2c643f260e316283149b9643a157b83a4"
+    }
+  ],
+  "warnings_preserved": [
+    {
+      "profile": "full",
+      "rank": 0,
+      "line": "2026-10-15T15:59:08.351991Z  WARN spark::main_modules::serve_phases::kv_cache: KV cache dtype: fp8_g128 (user override). MODEL.toml recommends 'bf16' for this model \u2014 mismatched KV dtype is a known cause of decode-path corruption (e.g. gemma `<unused>` collapse, mistral character-token loops on NVFP4 KV). Pass --kv-cache-dtype bf16 to use the recommended value."
+    },
+    {
+      "profile": "full",
+      "rank": 0,
+      "line": "2026-10-15T15:59:08.352006Z  WARN spark::main_modules::serve_phases::kv_cache: \u26a0 --kv-high-precision-layers is 0: all KV cache layers use fp8_g128 precision. NVFP4 models may hallucinate or lose coherence at long context. Consider --kv-high-precision-layers max (or 2-5) for better quality."
+    },
+    {
+      "profile": "full",
+      "rank": 0,
+      "line": "2026-10-15T16:00:23.260345Z  WARN spark_model::factory::build: KV OVERCOMMIT: pool fits 1 seq(s) at full --max-seq-len=32768 but --max-batch-size=4 requested (2048 block(s)/seq, 2048 block(s) total). Paged KV allocates on demand; long-context bursts are back-pressured at the block allocator, not refused at boot."
+    },
+    {
+      "profile": "full",
+      "rank": 0,
+      "line": "2026-10-15T16:00:24.498613Z  WARN spark::scheduler: --mtp-gate force: MTP throughput gate DISARMED (diagnostic; verify runs even where the gate would measure it net-negative)"
+    },
+    {
+      "profile": "full",
+      "rank": 0,
+      "line": "2026-10-15T16:00:29.303757Z  WARN spark_runtime::cuda_backend::host_staging: copy_h2d_async was handed a PAGE-LOCKED source. That copy is genuinely asynchronous, so the promise that the caller may drop the buffer on return is now being paid for with a cuStreamSynchronize on every such call. If the source outlives the next sync, switch the call site to copy_h2d_async_retained; if it does not, this sync is what keeps it from being a use-after-free."
+    },
+    {
+      "profile": "full",
+      "rank": 0,
+      "line": "2026-10-15T16:01:01.173816Z  WARN spark_model::model::types: teardown swept 75794 allocation(s) that no ModelResource released \u2014 they are reclaimed, but each one is memory whose owner is unaccounted for"
+    },
+    {
+      "profile": "full",
+      "rank": 1,
+      "line": "2026-10-15T15:59:08.356999Z  WARN spark::main_modules::serve_phases::kv_cache: KV cache dtype: fp8_g128 (user override). MODEL.toml recommends 'bf16' for this model \u2014 mismatched KV dtype is a known cause of decode-path corruption (e.g. gemma `<unused>` collapse, mistral character-token loops on NVFP4 KV). Pass --kv-cache-dtype bf16 to use the recommended value."
+    },
+    {
+      "profile": "full",
+      "rank": 1,
+      "line": "2026-10-15T15:59:08.357013Z  WARN spark::main_modules::serve_phases::kv_cache: \u26a0 --kv-high-precision-layers is 0: all KV cache layers use fp8_g128 precision. NVFP4 models may hallucinate or lose coherence at long context. Consider --kv-high-precision-layers max (or 2-5) for better quality."
+    },
+    {
+      "profile": "full",
+      "rank": 1,
+      "line": "2026-10-15T16:00:23.258779Z  WARN spark_model::factory::build::kv_budget: KV own-footprint: free memory fell by 100.49 GB but Atlas's own counters account for 97.45 GB \u2014 3.04 GB was taken by something else during the load, or is Atlas memory the counters miss; keeping the larger figure (the KV pool may be smaller than it needs to be)"
+    },
+    {
+      "profile": "full",
+      "rank": 1,
+      "line": "2026-10-15T16:00:23.259276Z  WARN spark_model::factory::build: KV OVERCOMMIT: pool fits 1 seq(s) at full --max-seq-len=32768 but --max-batch-size=4 requested (2048 block(s)/seq, 2048 block(s) total). Paged KV allocates on demand; long-context bursts are back-pressured at the block allocator, not refused at boot."
+    },
+    {
+      "profile": "full",
+      "rank": 1,
+      "line": "2026-10-15T16:01:01.539085Z  WARN spark_runtime::cuda_backend: backend drop reclaimed 149602 allocation(s) that no owner released \u2014 expected if a load was abandoned part-way, otherwise an unregistered owner"
+    },
+    {
+      "profile": "resident",
+      "rank": 0,
+      "line": "2026-10-15T16:01:58.192691Z  WARN spark::main_modules::serve_load: dflash: --enable-prefix-caching has a community-reported correctness regression on SM12.x with DFlash; outputs may be wrong on multi-turn cache hits. Run a greedy diff-test against a non-DFlash baseline before relying on outputs."
+    },
+    {
+      "profile": "resident",
+      "rank": 0,
+      "line": "2026-10-15T16:02:00.599634Z  WARN spark::main_modules::serve_phases::kv_cache: KV cache dtype: fp8_g128 (user override). MODEL.toml recommends 'bf16' for this model \u2014 mismatched KV dtype is a known cause of decode-path corruption (e.g. gemma `<unused>` collapse, mistral character-token loops on NVFP4 KV). Pass --kv-cache-dtype bf16 to use the recommended value."
+    },
+    {
+      "profile": "resident",
+      "rank": 0,
+      "line": "2026-10-15T16:02:00.599647Z  WARN spark::main_modules::serve_phases::kv_cache: \u26a0 --kv-high-precision-layers is 0: all KV cache layers use fp8_g128 precision. NVFP4 models may hallucinate or lose coherence at long context. Consider --kv-high-precision-layers max (or 2-5) for better quality."
+    },
+    {
+      "profile": "resident",
+      "rank": 0,
+      "line": "2026-10-15T16:03:14.788139Z  WARN spark_model::factory::build::kv_budget: KV own-footprint: free memory fell by 100.41 GB but Atlas's own counters account for 97.60 GB \u2014 2.82 GB was taken by something else during the load, or is Atlas memory the counters miss; keeping the larger figure (the KV pool may be smaller than it needs to be)"
+    },
+    {
+      "profile": "resident",
+      "rank": 0,
+      "line": "2026-10-15T16:03:15.125509Z  WARN spark_model::factory::build: KV OVERCOMMIT: pool fits 0 seq(s) at full --max-seq-len=32768 but --max-batch-size=4 requested (2048 block(s)/seq, 512 block(s) total). Paged KV allocates on demand; long-context bursts are back-pressured at the block allocator, not refused at boot."
+    },
+    {
+      "profile": "resident",
+      "rank": 0,
+      "line": "2026-10-15T16:03:16.347986Z  WARN spark::scheduler: --mtp-gate force: MTP throughput gate DISARMED (diagnostic; verify runs even where the gate would measure it net-negative)"
+    },
+    {
+      "profile": "resident",
+      "rank": 0,
+      "line": "2026-10-15T16:03:24.703615Z  WARN spark_runtime::cuda_backend::host_staging: copy_h2d_async was handed a PAGE-LOCKED source. That copy is genuinely asynchronous, so the promise that the caller may drop the buffer on return is now being paid for with a cuStreamSynchronize on every such call. If the source outlives the next sync, switch the call site to copy_h2d_async_retained; if it does not, this sync is what keeps it from being a use-after-free."
+    },
+    {
+      "profile": "resident",
+      "rank": 0,
+      "line": "2026-10-15T16:03:49.579353Z  WARN spark_model::model::types: teardown swept 75795 allocation(s) that no ModelResource released \u2014 they are reclaimed, but each one is memory whose owner is unaccounted for"
+    },
+    {
+      "profile": "resident",
+      "rank": 1,
+      "line": "2026-10-15T16:01:57.118748Z  WARN spark::main_modules::serve_load: dflash: --enable-prefix-caching has a community-reported correctness regression on SM12.x with DFlash; outputs may be wrong on multi-turn cache hits. Run a greedy diff-test against a non-DFlash baseline before relying on outputs."
+    },
+    {
+      "profile": "resident",
+      "rank": 1,
+      "line": "2026-10-15T16:02:00.592820Z  WARN spark::main_modules::serve_phases::kv_cache: KV cache dtype: fp8_g128 (user override). MODEL.toml recommends 'bf16' for this model \u2014 mismatched KV dtype is a known cause of decode-path corruption (e.g. gemma `<unused>` collapse, mistral character-token loops on NVFP4 KV). Pass --kv-cache-dtype bf16 to use the recommended value."
+    },
+    {
+      "profile": "resident",
+      "rank": 1,
+      "line": "2026-10-15T16:02:00.592835Z  WARN spark::main_modules::serve_phases::kv_cache: \u26a0 --kv-high-precision-layers is 0: all KV cache layers use fp8_g128 precision. NVFP4 models may hallucinate or lose coherence at long context. Consider --kv-high-precision-layers max (or 2-5) for better quality."
+    },
+    {
+      "profile": "resident",
+      "rank": 1,
+      "line": "2026-10-15T16:03:15.123881Z  WARN spark_model::factory::build::kv_budget: KV own-footprint: free memory fell by 100.54 GB but Atlas's own counters account for 97.60 GB \u2014 2.94 GB was taken by something else during the load, or is Atlas memory the counters miss; keeping the larger figure (the KV pool may be smaller than it needs to be)"
+    },
+    {
+      "profile": "resident",
+      "rank": 1,
+      "line": "2026-10-15T16:03:15.124374Z  WARN spark_model::factory::build: KV OVERCOMMIT: pool fits 0 seq(s) at full --max-seq-len=32768 but --max-batch-size=4 requested (2048 block(s)/seq, 512 block(s) total). Paged KV allocates on demand; long-context bursts are back-pressured at the block allocator, not refused at boot."
+    },
+    {
+      "profile": "resident",
+      "rank": 1,
+      "line": "2026-10-15T16:03:50.033258Z  WARN spark_runtime::cuda_backend: backend drop reclaimed 149605 allocation(s) that no owner released \u2014 expected if a load was abandoned part-way, otherwise an unregistered owner"
+    },
+    {
+      "profile": "nvme-sync",
+      "rank": 0,
+      "line": "2026-10-15T16:04:49.943950Z  WARN spark::main_modules::serve_load: dflash: --enable-prefix-caching has a community-reported correctness regression on SM12.x with DFlash; outputs may be wrong on multi-turn cache hits. Run a greedy diff-test against a non-DFlash baseline before relying on outputs."
+    },
+    {
+      "profile": "nvme-sync",
+      "rank": 0,
+      "line": "2026-10-15T16:04:52.331865Z  WARN spark::main_modules::serve_phases::kv_cache: KV cache dtype: fp8_g128 (user override). MODEL.toml recommends 'bf16' for this model \u2014 mismatched KV dtype is a known cause of decode-path corruption (e.g. gemma `<unused>` collapse, mistral character-token loops on NVFP4 KV). Pass --kv-cache-dtype bf16 to use the recommended value."
+    },
+    {
+      "profile": "nvme-sync",
+      "rank": 0,
+      "line": "2026-10-15T16:04:52.331880Z  WARN spark::main_modules::serve_phases::kv_cache: \u26a0 --kv-high-precision-layers is 0: all KV cache layers use fp8_g128 precision. NVFP4 models may hallucinate or lose coherence at long context. Consider --kv-high-precision-layers max (or 2-5) for better quality."
+    },
+    {
+      "profile": "nvme-sync",
+      "rank": 0,
+      "line": "2026-10-15T16:06:04.404435Z  WARN spark_model::factory::build::kv_budget: KV own-footprint: free memory fell by 100.45 GB but Atlas's own counters account for 97.68 GB \u2014 2.78 GB was taken by something else during the load, or is Atlas memory the counters miss; keeping the larger figure (the KV pool may be smaller than it needs to be)"
+    },
+    {
+      "profile": "nvme-sync",
+      "rank": 0,
+      "line": "2026-10-15T16:06:06.660503Z  WARN spark_model::factory::build: KV OVERCOMMIT: pool fits 0 seq(s) at full --max-seq-len=32768 but --max-batch-size=4 requested (2048 block(s)/seq, 512 block(s) total). Paged KV allocates on demand; long-context bursts are back-pressured at the block allocator, not refused at boot."
+    },
+    {
+      "profile": "nvme-sync",
+      "rank": 0,
+      "line": "2026-10-15T16:06:06.671589Z  WARN spark_runtime::kv_cache::nvme_spill: NVMe spill tier: pinned staging is not 4 KiB-aligned; O_DIRECT I/O will bounce"
+    },
+    {
+      "profile": "nvme-sync",
+      "rank": 0,
+      "line": "2026-10-15T16:06:08.020000Z  WARN spark::scheduler: --mtp-gate force: MTP throughput gate DISARMED (diagnostic; verify runs even where the gate would measure it net-negative)"
+    },
+    {
+      "profile": "nvme-sync",
+      "rank": 0,
+      "line": "2026-10-15T16:06:14.804162Z  WARN spark_runtime::cuda_backend::host_staging: copy_h2d_async was handed a PAGE-LOCKED source. That copy is genuinely asynchronous, so the promise that the caller may drop the buffer on return is now being paid for with a cuStreamSynchronize on every such call. If the source outlives the next sync, switch the call site to copy_h2d_async_retained; if it does not, this sync is what keeps it from being a use-after-free."
+    },
+    {
+      "profile": "nvme-sync",
+      "rank": 0,
+      "line": "2026-10-15T16:06:31.683931Z  WARN spark_model::model::types: teardown swept 75795 allocation(s) that no ModelResource released \u2014 they are reclaimed, but each one is memory whose owner is unaccounted for"
+    },
+    {
+      "profile": "nvme-sync",
+      "rank": 1,
+      "line": "2026-10-15T16:04:47.939509Z  WARN spark::main_modules::serve_load: dflash: --enable-prefix-caching has a community-reported correctness regression on SM12.x with DFlash; outputs may be wrong on multi-turn cache hits. Run a greedy diff-test against a non-DFlash baseline before relying on outputs."
+    },
+    {
+      "profile": "nvme-sync",
+      "rank": 1,
+      "line": "2026-10-15T16:04:52.364231Z  WARN spark::main_modules::serve_phases::kv_cache: KV cache dtype: fp8_g128 (user override). MODEL.toml recommends 'bf16' for this model \u2014 mismatched KV dtype is a known cause of decode-path corruption (e.g. gemma `<unused>` collapse, mistral character-token loops on NVFP4 KV). Pass --kv-cache-dtype bf16 to use the recommended value."
+    },
+    {
+      "profile": "nvme-sync",
+      "rank": 1,
+      "line": "2026-10-15T16:04:52.364247Z  WARN spark::main_modules::serve_phases::kv_cache: \u26a0 --kv-high-precision-layers is 0: all KV cache layers use fp8_g128 precision. NVFP4 models may hallucinate or lose coherence at long context. Consider --kv-high-precision-layers max (or 2-5) for better quality."
+    },
+    {
+      "profile": "nvme-sync",
+      "rank": 1,
+      "line": "2026-10-15T16:06:06.658645Z  WARN spark_model::factory::build::kv_budget: KV own-footprint: free memory fell by 100.41 GB but Atlas's own counters account for 97.66 GB \u2014 2.75 GB was taken by something else during the load, or is Atlas memory the counters miss; keeping the larger figure (the KV pool may be smaller than it needs to be)"
+    },
+    {
+      "profile": "nvme-sync",
+      "rank": 1,
+      "line": "2026-10-15T16:06:06.659352Z  WARN spark_model::factory::build: KV OVERCOMMIT: pool fits 0 seq(s) at full --max-seq-len=32768 but --max-batch-size=4 requested (2048 block(s)/seq, 512 block(s) total). Paged KV allocates on demand; long-context bursts are back-pressured at the block allocator, not refused at boot."
+    },
+    {
+      "profile": "nvme-sync",
+      "rank": 1,
+      "line": "2026-10-15T16:06:06.668190Z  WARN spark_runtime::kv_cache::nvme_spill: NVMe spill tier: pinned staging is not 4 KiB-aligned; O_DIRECT I/O will bounce"
+    },
+    {
+      "profile": "nvme-sync",
+      "rank": 1,
+      "line": "2026-10-15T16:06:32.143340Z  WARN spark_runtime::cuda_backend: backend drop reclaimed 149605 allocation(s) that no owner released \u2014 expected if a load was abandoned part-way, otherwise an unregistered owner"
+    },
+    {
+      "profile": "nvme-fast-keep",
+      "rank": 0,
+      "line": "2026-10-15T16:07:32.029557Z  WARN spark::main_modules::serve_load: dflash: --enable-prefix-caching has a community-reported correctness regression on SM12.x with DFlash; outputs may be wrong on multi-turn cache hits. Run a greedy diff-test against a non-DFlash baseline before relying on outputs."
+    },
+    {
+      "profile": "nvme-fast-keep",
+      "rank": 0,
+      "line": "2026-10-15T16:07:33.810423Z  WARN spark::main_modules::serve_phases::kv_cache: KV cache dtype: fp8_g128 (user override). MODEL.toml recommends 'bf16' for this model \u2014 mismatched KV dtype is a known cause of decode-path corruption (e.g. gemma `<unused>` collapse, mistral character-token loops on NVFP4 KV). Pass --kv-cache-dtype bf16 to use the recommended value."
+    },
+    {
+      "profile": "nvme-fast-keep",
+      "rank": 0,
+      "line": "2026-10-15T16:07:33.810438Z  WARN spark::main_modules::serve_phases::kv_cache: \u26a0 --kv-high-precision-layers is 0: all KV cache layers use fp8_g128 precision. NVFP4 models may hallucinate or lose coherence at long context. Consider --kv-high-precision-layers max (or 2-5) for better quality."
+    },
+    {
+      "profile": "nvme-fast-keep",
+      "rank": 0,
+      "line": "2026-10-15T16:08:45.842488Z  WARN spark_model::factory::build::kv_budget: KV own-footprint: free memory fell by 100.43 GB but Atlas's own counters account for 97.66 GB \u2014 2.77 GB was taken by something else during the load, or is Atlas memory the counters miss; keeping the larger figure (the KV pool may be smaller than it needs to be)"
+    },
+    {
+      "profile": "nvme-fast-keep",
+      "rank": 0,
+      "line": "2026-10-15T16:08:48.298809Z  WARN spark_model::factory::build: KV OVERCOMMIT: pool fits 0 seq(s) at full --max-seq-len=32768 but --max-batch-size=4 requested (2048 block(s)/seq, 512 block(s) total). Paged KV allocates on demand; long-context bursts are back-pressured at the block allocator, not refused at boot."
+    },
+    {
+      "profile": "nvme-fast-keep",
+      "rank": 0,
+      "line": "2026-10-15T16:08:49.681628Z  WARN spark::scheduler: --mtp-gate force: MTP throughput gate DISARMED (diagnostic; verify runs even where the gate would measure it net-negative)"
+    },
+    {
+      "profile": "nvme-fast-keep",
+      "rank": 0,
+      "line": "2026-10-15T16:08:56.232633Z  WARN spark_runtime::cuda_backend::host_staging: copy_h2d_async was handed a PAGE-LOCKED source. That copy is genuinely asynchronous, so the promise that the caller may drop the buffer on return is now being paid for with a cuStreamSynchronize on every such call. If the source outlives the next sync, switch the call site to copy_h2d_async_retained; if it does not, this sync is what keeps it from being a use-after-free."
+    },
+    {
+      "profile": "nvme-fast-keep",
+      "rank": 0,
+      "line": "2026-10-15T16:09:12.836948Z  WARN spark_model::model::types: teardown swept 75795 allocation(s) that no ModelResource released \u2014 they are reclaimed, but each one is memory whose owner is unaccounted for"
+    },
+    {
+      "profile": "nvme-fast-keep",
+      "rank": 1,
+      "line": "2026-10-15T16:07:30.911946Z  WARN spark::main_modules::serve_load: dflash: --enable-prefix-caching has a community-reported correctness regression on SM12.x with DFlash; outputs may be wrong on multi-turn cache hits. Run a greedy diff-test against a non-DFlash baseline before relying on outputs."
+    },
+    {
+      "profile": "nvme-fast-keep",
+      "rank": 1,
+      "line": "2026-10-15T16:07:33.806663Z  WARN spark::main_modules::serve_phases::kv_cache: KV cache dtype: fp8_g128 (user override). MODEL.toml recommends 'bf16' for this model \u2014 mismatched KV dtype is a known cause of decode-path corruption (e.g. gemma `<unused>` collapse, mistral character-token loops on NVFP4 KV). Pass --kv-cache-dtype bf16 to use the recommended value."
+    },
+    {
+      "profile": "nvme-fast-keep",
+      "rank": 1,
+      "line": "2026-10-15T16:07:33.806680Z  WARN spark::main_modules::serve_phases::kv_cache: \u26a0 --kv-high-precision-layers is 0: all KV cache layers use fp8_g128 precision. NVFP4 models may hallucinate or lose coherence at long context. Consider --kv-high-precision-layers max (or 2-5) for better quality."
+    },
+    {
+      "profile": "nvme-fast-keep",
+      "rank": 1,
+      "line": "2026-10-15T16:08:48.297315Z  WARN spark_model::factory::build::kv_budget: KV own-footprint: free memory fell by 100.56 GB but Atlas's own counters account for 97.67 GB \u2014 2.89 GB was taken by something else during the load, or is Atlas memory the counters miss; keeping the larger figure (the KV pool may be smaller than it needs to be)"
+    },
+    {
+      "profile": "nvme-fast-keep",
+      "rank": 1,
+      "line": "2026-10-15T16:08:48.297609Z  WARN spark_model::factory::build: KV OVERCOMMIT: pool fits 0 seq(s) at full --max-seq-len=32768 but --max-batch-size=4 requested (2048 block(s)/seq, 512 block(s) total). Paged KV allocates on demand; long-context bursts are back-pressured at the block allocator, not refused at boot."
+    },
+    {
+      "profile": "nvme-fast-keep",
+      "rank": 1,
+      "line": "2026-10-15T16:09:13.206798Z  WARN spark_runtime::cuda_backend: backend drop reclaimed 149605 allocation(s) that no owner released \u2014 expected if a load was abandoned part-way, otherwise an unregistered owner"
+    }
+  ],
+  "summary_evidence": [
+    {
+      "path": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/glm-dflash-release-cb45065c/runs/followon-full-cb45065c-20261015/api/summary.json",
+      "sha256": "c4ac0dc0a692ec8a7a5f3e2bf6bbc5e4f416ab2af03c67a9538e6a7217d5a5dc",
+      "value": {
+        "results": [
+          {
+            "case": "json-schema",
+            "passed": true
+          },
+          {
+            "case": "tool",
+            "passed": true
+          },
+          {
+            "case": "post-cancel-reuse",
+            "passed": true
+          }
+        ],
+        "passed": true
+      }
+    },
+    {
+      "path": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/glm-dflash-release-cb45065c/runs/followon-full-cb45065c-20261015/cancel/summary.json",
+      "sha256": "28ff978a5c7c913905bc999ef0caf7d7c5fe9db2253178fdce5b74df2b5dd130",
+      "value": {
+        "http_checks_completed": true,
+        "mode": "cancel",
+        "qualification_pass": null,
+        "reason": "Correlate rank logs, process identity and memory cleanup; HTTP success alone is insufficient."
+      }
+    },
+    {
+      "path": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/glm-dflash-release-cb45065c/runs/followon-full-cb45065c-20261015/long-prefill/summary.json",
+      "sha256": "0c1eee4f7e37d2dda5d81a6d240297defa3621a5f3eb91e70547fa2e5b5604a7",
+      "value": {
+        "http_checks_completed": true,
+        "exact_recall_passed": true,
+        "recall_prompt_tokens": 6404,
+        "disconnect_prompt_tokens": 6403,
+        "followup_42_passed": true,
+        "qualification_pass": null,
+        "reason": "Correlate both rank logs, request admission/prefill cursor, retirement and memory; do not infer native kernel dispatch or prefill cancellation from HTTP results alone.",
+        "native_dispatch_qualification": "pending server evidence",
+        "prefill_retirement_qualification": "pending server evidence"
+      }
+    },
+    {
+      "path": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/glm-dflash-release-cb45065c/runs/followon-full-cb45065c-20261015/parity/summary.json",
+      "sha256": "2614b5b332b7b13dc649112d1d8e0e308acef526f2bbdfb7e417871d361b74b6",
+      "value": {
+        "c1_equals_c4": [
+          true,
+          true,
+          true,
+          true
+        ],
+        "c4_repeat_matches": [
+          true,
+          true,
+          true,
+          true
+        ]
+      }
+    },
+    {
+      "path": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/glm-dflash-release-cb45065c/runs/followon-resident-cb45065c-20261015/long-prefill/summary.json",
+      "sha256": "0c1eee4f7e37d2dda5d81a6d240297defa3621a5f3eb91e70547fa2e5b5604a7",
+      "value": {
+        "http_checks_completed": true,
+        "exact_recall_passed": true,
+        "recall_prompt_tokens": 6404,
+        "disconnect_prompt_tokens": 6403,
+        "followup_42_passed": true,
+        "qualification_pass": null,
+        "reason": "Correlate both rank logs, request admission/prefill cursor, retirement and memory; do not infer native kernel dispatch or prefill cancellation from HTTP results alone.",
+        "native_dispatch_qualification": "pending server evidence",
+        "prefill_retirement_qualification": "pending server evidence"
+      }
+    },
+    {
+      "path": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/glm-dflash-release-cb45065c/runs/followon-resident-cb45065c-20261015/prefix/summary.json",
+      "sha256": "ce178f35421a92fc1bcb4ea127b2c6a53847a11a1a62c23b760d04231f68a41a",
+      "value": {
+        "http_passed": true,
+        "qualified": false,
+        "reason": "Run verify with both full rank logs to prove restore paths."
+      }
+    },
+    {
+      "path": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/glm-dflash-release-cb45065c/runs/followon-nvme-sync-cb45065c-20261015/prefix/summary.json",
+      "sha256": "ce178f35421a92fc1bcb4ea127b2c6a53847a11a1a62c23b760d04231f68a41a",
+      "value": {
+        "http_passed": true,
+        "qualified": false,
+        "reason": "Run verify with both full rank logs to prove restore paths."
+      }
+    },
+    {
+      "path": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/glm-dflash-release-cb45065c/runs/followon-nvme-fast-keep-cb45065c-20261015/prefix/summary.json",
+      "sha256": "ce178f35421a92fc1bcb4ea127b2c6a53847a11a1a62c23b760d04231f68a41a",
+      "value": {
+        "http_passed": true,
+        "qualified": false,
+        "reason": "Run verify with both full rank logs to prove restore paths."
+      }
+    }
+  ],
+  "storage_evidence": [
+    {
+      "profile": "resident",
+      "verification": {
+        "profile": "resident",
+        "ranks": [
+          {
+            "rank": 0,
+            "path": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/glm-dflash-release-cb45065c/runs/followon-resident-cb45065c-20261015/collected-rank0/rank.log",
+            "sha256": "a14d7e5a64e66f409de629061768ffffd3fee6b04118c7b40247fc373e45599d",
+            "nvme_positive_restores": 0,
+            "ssm_fault_in_restores": 0,
+            "kv_tier_on": false,
+            "ssm_real_disk": false,
+            "failure_lines": []
+          },
+          {
+            "rank": 1,
+            "path": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/glm-dflash-release-cb45065c/runs/followon-resident-cb45065c-20261015/collected-rank1/rank.log",
+            "sha256": "a155aa3c43c85cc9257233c5c1840b8468b0a9351a9ba86a83093fee087da96e",
+            "nvme_positive_restores": 0,
+            "ssm_fault_in_restores": 0,
+            "kv_tier_on": false,
+            "ssm_real_disk": false,
+            "failure_lines": []
+          }
+        ],
+        "checks": {
+          "all_correct": true,
+          "complete_cases": true,
+          "resident_cache_hit": true,
+          "rank0_no_io_gpu_failure": true,
+          "rank1_no_io_gpu_failure": true
+        },
+        "qualified": true
+      }
+    },
+    {
+      "profile": "nvme-sync",
+      "verification": {
+        "profile": "nvme-sync",
+        "ranks": [
+          {
+            "rank": 0,
+            "path": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/glm-dflash-release-cb45065c/runs/followon-nvme-sync-cb45065c-20261015/collected-rank0/rank.log",
+            "sha256": "a8b1c58dfc71df2353170de9d05c1de0db25bcddcec4d10fb86778774ed77a33",
+            "nvme_positive_restores": 1,
+            "ssm_fault_in_restores": 1,
+            "kv_tier_on": true,
+            "ssm_real_disk": true,
+            "failure_lines": []
+          },
+          {
+            "rank": 1,
+            "path": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/glm-dflash-release-cb45065c/runs/followon-nvme-sync-cb45065c-20261015/collected-rank1/rank.log",
+            "sha256": "48f04e29e8e9b165d68a71e6243a71ddce27108df3c243a69767391023cfe9a2",
+            "nvme_positive_restores": 1,
+            "ssm_fault_in_restores": 1,
+            "kv_tier_on": true,
+            "ssm_real_disk": true,
+            "failure_lines": []
+          }
+        ],
+        "checks": {
+          "all_correct": true,
+          "complete_cases": true,
+          "resident_cache_hit": true,
+          "return_cache_hit": true,
+          "rank0_kv_restore": true,
+          "rank0_ssm_restore": true,
+          "rank0_disk_config": true,
+          "rank0_no_io_gpu_failure": true,
+          "rank1_kv_restore": true,
+          "rank1_ssm_restore": true,
+          "rank1_disk_config": true,
+          "rank1_no_io_gpu_failure": true
+        },
+        "qualified": true
+      }
+    },
+    {
+      "profile": "nvme-fast-keep",
+      "verification": {
+        "profile": "nvme-fast-keep",
+        "ranks": [
+          {
+            "rank": 0,
+            "path": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/glm-dflash-release-cb45065c/runs/followon-nvme-fast-keep-cb45065c-20261015/collected-rank0/rank.log",
+            "sha256": "6a86f0a6b614d387a8301fb1d1e722d28f74510cbb2772711288638f66d9f72e",
+            "nvme_positive_restores": 1,
+            "ssm_fault_in_restores": 1,
+            "kv_tier_on": true,
+            "ssm_real_disk": true,
+            "failure_lines": []
+          },
+          {
+            "rank": 1,
+            "path": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/glm-dflash-release-cb45065c/runs/followon-nvme-fast-keep-cb45065c-20261015/collected-rank1/rank.log",
+            "sha256": "7feae817554c8a5b1802b5835c4f0d9ba403ee51f918901467f3ae20e3442350",
+            "nvme_positive_restores": 1,
+            "ssm_fault_in_restores": 1,
+            "kv_tier_on": true,
+            "ssm_real_disk": true,
+            "failure_lines": []
+          }
+        ],
+        "checks": {
+          "all_correct": true,
+          "complete_cases": true,
+          "resident_cache_hit": true,
+          "return_cache_hit": true,
+          "rank0_kv_restore": true,
+          "rank0_ssm_restore": true,
+          "rank0_disk_config": true,
+          "rank0_no_io_gpu_failure": true,
+          "rank1_kv_restore": true,
+          "rank1_ssm_restore": true,
+          "rank1_disk_config": true,
+          "rank1_no_io_gpu_failure": true
+        },
+        "qualified": true
+      }
+    }
+  ],
+  "observed_prefill_progress": [
+    {
+      "profile": "full",
+      "rank": 0,
+      "line": "2026-10-15T16:00:31.164041Z  INFO spark::api::chat::template: Template-forced thinking detected (unclosed \\<think\\> in prompt tail) \u2014 overriding enable_thinking=true with budget=256"
+    },
+    {
+      "profile": "full",
+      "rank": 0,
+      "line": "2026-10-15T16:00:50.139164Z  INFO spark::api::chat: Session 0x28fd882277bd4425: 6404 prompt tokens, tools=false (0 defined)"
+    },
+    {
+      "profile": "full",
+      "rank": 0,
+      "line": "2026-10-15T16:00:50.139329Z  INFO spark::scheduler::prefill_a_step: Chunked prefill start: 6404 prompt tokens, chunk_size=4100, max_tokens=64"
+    },
+    {
+      "profile": "full",
+      "rank": 0,
+      "line": "2026-10-15T16:00:51.776856Z  INFO spark::scheduler::phase_start_prefills: Prefill chunk 0/6404: 4100/6404 tokens"
+    },
+    {
+      "profile": "full",
+      "rank": 0,
+      "line": "2026-10-15T16:00:53.029303Z  INFO spark::scheduler::phase_continue_prefills::run_standard: Prefill chunk 6404/6404 tokens"
+    },
+    {
+      "profile": "full",
+      "rank": 0,
+      "line": "2026-10-15T16:00:53.620894Z  INFO spark::api::chat: Session 0x73efa651f8398462: 6403 prompt tokens, tools=false (0 defined)"
+    },
+    {
+      "profile": "full",
+      "rank": 0,
+      "line": "2026-10-15T16:00:53.621148Z  INFO spark::scheduler::prefill_a_step: Chunked prefill start: 6403 prompt tokens, chunk_size=4100, max_tokens=64"
+    },
+    {
+      "profile": "full",
+      "rank": 0,
+      "line": "2026-10-15T16:00:55.246831Z  INFO spark::scheduler::phase_start_prefills: Prefill chunk 0/6403: 4100/6403 tokens"
+    },
+    {
+      "profile": "full",
+      "rank": 1,
+      "line": "2026-10-15T15:59:02.976403Z  INFO spark::main_modules::serve_phases::preflight::gpu_init: GDN chunked prefill reserve: 161 MB (chunk_size=4100, max_seq_len=32768)"
+    },
+    {
+      "profile": "resident",
+      "rank": 0,
+      "line": "2026-10-15T16:03:14.464040Z  INFO spark_model::layers::moe::shared_fp8_cache: GLM shared FP8 deferred reserve checked before allocation free=19790716928 remaining=503316480 protected=4294967296 required=4798283776"
+    },
+    {
+      "profile": "resident",
+      "rank": 0,
+      "line": "2026-10-15T16:03:37.567697Z  INFO spark::api::chat: Session 0x28fd882277bd4425: 6404 prompt tokens, tools=false (0 defined)"
+    },
+    {
+      "profile": "resident",
+      "rank": 0,
+      "line": "2026-10-15T16:03:37.568050Z  INFO spark::scheduler::prefill_a_step: Chunked prefill start: 6404 prompt tokens, chunk_size=4100, max_tokens=64"
+    },
+    {
+      "profile": "resident",
+      "rank": 0,
+      "line": "2026-10-15T16:03:39.203618Z  INFO spark::scheduler::phase_start_prefills: Prefill chunk 0/6404: 4100/6404 tokens"
+    },
+    {
+      "profile": "resident",
+      "rank": 0,
+      "line": "2026-10-15T16:03:40.531348Z  INFO spark::scheduler::phase_continue_prefills::run_standard: Prefill chunk 6404/6404 tokens"
+    },
+    {
+      "profile": "resident",
+      "rank": 0,
+      "line": "2026-10-15T16:03:42.023462Z  INFO spark::api::chat: Session 0x73efa651f8398462: 6403 prompt tokens, tools=false (0 defined)"
+    },
+    {
+      "profile": "resident",
+      "rank": 0,
+      "line": "2026-10-15T16:03:42.023731Z  INFO spark::scheduler::prefill_a_step: Chunked prefill start: 6403 prompt tokens, chunk_size=4100, max_tokens=64"
+    },
+    {
+      "profile": "resident",
+      "rank": 0,
+      "line": "2026-10-15T16:03:43.673937Z  INFO spark::scheduler::phase_start_prefills: Prefill chunk 0/6403: 4100/6403 tokens"
+    },
+    {
+      "profile": "nvme-sync",
+      "rank": 0,
+      "line": "2026-10-15T16:06:04.006374Z  INFO spark_model::layers::moe::shared_fp8_cache: GLM shared FP8 deferred reserve checked before allocation free=20314640384 remaining=981467136 protected=4294967296 required=5276434432"
+    }
+  ],
+  "limitations": [
+    "Configured FP8 cache and bounded aggregate KV pool emit advisory warnings.",
+    "Teardown/backend allocation sweeps reclaim unregistered allocations; retained as an ownership-accounting limitation, not claimed absent. All measured models exited0 and GPU idle was verified.",
+    "No broader model-quality, enlarged capacity, kernel-specific dispatch, or sustained leak-freedom claim.",
+    "Fresh parity covers C1/C4 and C4 repeats with DFlash enabled; no fresh DFlash-versus-plain decode equivalence claim.",
+    "Disconnect/reuse and chunk progress are observed; no per-allocation or per-request retirement trace is claimed."
+  ],
+  "root_review": "Independently inspected all eight raw rank logs, complete severity warning inventory, HTTP summaries, actual both-rank prefix verification, rank result/cleanup and memory samples, image/binary identity and original-service restoration. Hashes revalidated; bounded limitations retained.",
+  "agent_review_sha256": "a71cfc19e45b257ddef0cdd3845bc90c002a859f5e0fe0d39bd8e14ebb9bd2f1"
+}

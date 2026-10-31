@@ -393,7 +393,7 @@ template <int NT>
 __device__ __forceinline__ void dg_tc_load(
     DgTcChunk<NT>& t, const __nv_bfloat16* w0p, const __nv_bfloat16* w1p,
     const __nv_bfloat16* A, unsigned int g, unsigned int M, unsigned int K,
-    unsigned int kb, bool v0, bool v1
+    unsigned int lda, unsigned int kb, bool v0, bool v1
 ) {
     const uint4 z = make_uint4(0u, 0u, 0u, 0u);
     t.w0 = z; t.w1 = z;
@@ -405,25 +405,30 @@ __device__ __forceinline__ void dg_tc_load(
     #pragma unroll
     for (int i = 0; i < NT; i++) {
         const unsigned int row = 8u * i + g;
-        if (row < M) t.x[i] = *(const uint4*)(A + (unsigned long long)row * K + kb);
+        if (row < M) t.x[i] = *(const uint4*)(A + (unsigned long long)row * lda + kb);
     }
 }
 
+// The body for weight-row tile `cta` (rows 16 * cta ..): the plain tiers'
+// CTA `blockIdx.x`, or a CTA of a launch that runs other work beside it
+// (glm_mla_fuse.cu).
 template <int NT>
-__device__ __forceinline__ void dense_gemv_bf16_tc_impl(
+__device__ __forceinline__ void dense_gemv_bf16_tc_cta(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
     __nv_bfloat16* __restrict__ C,
     unsigned int M,
     unsigned int N,
     unsigned int K,
-    unsigned int out_stride
+    unsigned int out_stride,
+    unsigned int lda,
+    unsigned int cta
 ) {
     __shared__ float s_red[DG_TC_WARPS][WARP_SIZE][NT * 4];
     const unsigned int warp = threadIdx.x / WARP_SIZE;
     const unsigned int lane = threadIdx.x % WARP_SIZE;
     const unsigned int g = lane >> 2, c = lane & 3u;
-    const unsigned int r0 = blockIdx.x * 16u + g, r1 = r0 + 8u;
+    const unsigned int r0 = cta * 16u + g, r1 = r0 + 8u;
     const bool v0 = r0 < N, v1 = r1 < N;
     const __nv_bfloat16* w0p = B + (unsigned long long)(v0 ? r0 : 0u) * K;
     const __nv_bfloat16* w1p = B + (unsigned long long)(v1 ? r1 : 0u) * K;
@@ -434,10 +439,10 @@ __device__ __forceinline__ void dense_gemv_bf16_tc_impl(
     const unsigned int chunks = (K + 31u) / 32u;
     DgTcChunk<NT> cur, nxt;
     unsigned int ch = warp;
-    if (ch < chunks) dg_tc_load<NT>(cur, w0p, w1p, A, g, M, K, ch * 32u + 8u * c, v0, v1);
+    if (ch < chunks) dg_tc_load<NT>(cur, w0p, w1p, A, g, M, K, lda, ch * 32u + 8u * c, v0, v1);
     for (; ch < chunks; ch += DG_TC_WARPS) {
         const unsigned int next = ch + DG_TC_WARPS;
-        if (next < chunks) dg_tc_load<NT>(nxt, w0p, w1p, A, g, M, K, next * 32u + 8u * c, v0, v1);
+        if (next < chunks) dg_tc_load<NT>(nxt, w0p, w1p, A, g, M, K, lda, next * 32u + 8u * c, v0, v1);
         const unsigned int w0w[4] = {cur.w0.x, cur.w0.y, cur.w0.z, cur.w0.w};
         const unsigned int w1w[4] = {cur.w1.x, cur.w1.y, cur.w1.z, cur.w1.w};
         #pragma unroll
@@ -481,13 +486,22 @@ __device__ __forceinline__ void dense_gemv_bf16_tc_impl(
     }
 }
 
+template <int NT>
+__device__ __forceinline__ void dense_gemv_bf16_tc_impl(
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int out_stride, unsigned int lda) {
+    dense_gemv_bf16_tc_cta<NT>(A, B, C, M, N, K, out_stride, lda, blockIdx.x);
+}
+
 extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE)
 dense_gemv_bf16_tc16(
     const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
     __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
     unsigned int out_stride
 ) {
-    dense_gemv_bf16_tc_impl<2>(A, B, C, M, N, K, out_stride);
+    atlas_pdl_enter();
+    dense_gemv_bf16_tc_impl<2>(A, B, C, M, N, K, out_stride, K);
 }
 
 extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE)
@@ -496,5 +510,116 @@ dense_gemv_bf16_tc32(
     __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
     unsigned int out_stride
 ) {
-    dense_gemv_bf16_tc_impl<4>(A, B, C, M, N, K, out_stride);
+    atlas_pdl_enter();
+    dense_gemv_bf16_tc_impl<4>(A, B, C, M, N, K, out_stride, K);
+}
+
+// NT = 1 instance for 1..8 rows (ATLAS_GLM_CANONICAL_VERIFY: the router, the
+// KDA beta/f/g and the MLA indexer projections at every verify width): the
+// tc16/tc32 body, so a row's bits match theirs whatever the row count.
+extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE)
+dense_gemv_bf16_tc8(
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int out_stride
+) {
+    atlas_pdl_enter();
+    dense_gemv_bf16_tc_impl<1>(A, B, C, M, N, K, out_stride, K);
+}
+
+// Per-head twins (GLM MLA W_uk absorb / W_uv extract under
+// ATLAS_GLM_CANONICAL_VERIFY): head h = blockIdx.z multiplies the activation
+// columns [h*K, +K) of rows `lda` apart by W[h] ([G, N, K]) into output
+// columns [h*N, +N) of rows `ldc` apart. Same body per head: bit-identical
+// rows to the plain tiers, whatever the row count.
+template <int NT>
+__device__ __forceinline__ void dg_tc_grouped(
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int lda, unsigned int ldc
+) {
+    const unsigned long long h = blockIdx.z;
+    dense_gemv_bf16_tc_impl<NT>(A + h * K, B + h * N * K, C + h * N, M, N, K, ldc, lda);
+}
+
+extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE) dense_gemv_bf16_tc8_grouped(
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int lda, unsigned int ldc
+) {
+    atlas_pdl_enter();
+    dg_tc_grouped<1>(A, B, C, M, N, K, lda, ldc);
+}
+
+extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE) dense_gemv_bf16_tc16_grouped(
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int lda, unsigned int ldc
+) {
+    atlas_pdl_enter();
+    dg_tc_grouped<2>(A, B, C, M, N, K, lda, ldc);
+}
+
+extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE) dense_gemv_bf16_tc32_grouped(
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int lda, unsigned int ldc
+) {
+    atlas_pdl_enter();
+    dg_tc_grouped<4>(A, B, C, M, N, K, lda, ldc);
+}
+
+
+// Up to three independent projections in one launch (grid z = plane, each
+// plane `A_z [M, K_z] · B_z [N_z, K_z]^T -> C_z`, rows N_z apart): the KDA
+// beta | f_a | g_a and f_b | g_b sets under ATLAS_GLM_CANONICAL_VERIFY. Each
+// plane runs the plain tier's body: bit-identical to its own launch.
+// Plane z (`blockIdx.z`) of the planes kernels below.
+template <int NT>
+__device__ __forceinline__ void dg_tc_planes(
+    const __nv_bfloat16* A0, const __nv_bfloat16* A1, const __nv_bfloat16* A2,
+    const __nv_bfloat16* B0, const __nv_bfloat16* B1, const __nv_bfloat16* B2,
+    __nv_bfloat16* C0, __nv_bfloat16* C1, __nv_bfloat16* C2,
+    unsigned int N0, unsigned int N1, unsigned int N2,
+    unsigned int K0, unsigned int K1, unsigned int K2, unsigned int M
+) {
+    const unsigned int z = blockIdx.z;
+    const unsigned int N = z == 0u ? N0 : (z == 1u ? N1 : N2);
+    const unsigned int K = z == 0u ? K0 : (z == 1u ? K1 : K2);
+    if (blockIdx.x * 16u >= N) return;
+    dense_gemv_bf16_tc_impl<NT>(z == 0u ? A0 : (z == 1u ? A1 : A2), z == 0u ? B0 : (z == 1u ? B1 : B2),
+                                z == 0u ? C0 : (z == 1u ? C1 : C2), M, N, K, N, K);
+}
+
+extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE) dense_gemv_bf16_tc8_planes(
+    const __nv_bfloat16* A0, const __nv_bfloat16* A1, const __nv_bfloat16* A2,
+    const __nv_bfloat16* B0, const __nv_bfloat16* B1, const __nv_bfloat16* B2,
+    __nv_bfloat16* C0, __nv_bfloat16* C1, __nv_bfloat16* C2,
+    unsigned int N0, unsigned int N1, unsigned int N2,
+    unsigned int K0, unsigned int K1, unsigned int K2, unsigned int M
+) {
+    atlas_pdl_enter();
+    dg_tc_planes<1>(A0, A1, A2, B0, B1, B2, C0, C1, C2, N0, N1, N2, K0, K1, K2, M);
+}
+
+extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE) dense_gemv_bf16_tc16_planes(
+    const __nv_bfloat16* A0, const __nv_bfloat16* A1, const __nv_bfloat16* A2,
+    const __nv_bfloat16* B0, const __nv_bfloat16* B1, const __nv_bfloat16* B2,
+    __nv_bfloat16* C0, __nv_bfloat16* C1, __nv_bfloat16* C2,
+    unsigned int N0, unsigned int N1, unsigned int N2,
+    unsigned int K0, unsigned int K1, unsigned int K2, unsigned int M
+) {
+    atlas_pdl_enter();
+    dg_tc_planes<2>(A0, A1, A2, B0, B1, B2, C0, C1, C2, N0, N1, N2, K0, K1, K2, M);
+}
+
+extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE) dense_gemv_bf16_tc32_planes(
+    const __nv_bfloat16* A0, const __nv_bfloat16* A1, const __nv_bfloat16* A2,
+    const __nv_bfloat16* B0, const __nv_bfloat16* B1, const __nv_bfloat16* B2,
+    __nv_bfloat16* C0, __nv_bfloat16* C1, __nv_bfloat16* C2,
+    unsigned int N0, unsigned int N1, unsigned int N2,
+    unsigned int K0, unsigned int K1, unsigned int K2, unsigned int M
+) {
+    atlas_pdl_enter();
+    dg_tc_planes<4>(A0, A1, A2, B0, B1, B2, C0, C1, C2, N0, N1, N2, K0, K1, K2, M);
 }

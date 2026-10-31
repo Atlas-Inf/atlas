@@ -11,7 +11,8 @@
 //! copies). `factory/build.rs` reserves the superset footprint up front.
 //!
 //! Only RESIDENT tensors count: `WeightStore::names()`/`get()` iterate the
-//! resident map, while deferred tensors (e.g. the qwen4_exp PLE n-gram tables)
+//! resident map (minus tensors a loader already reclaimed: FP4-Local's FP8
+//! sources are expanded and freed at load, so no lazy copy can follow), while deferred tensors (e.g. the qwen4_exp PLE n-gram tables)
 //! live in `store.deferred(..)` and are never uploaded, so nothing can
 //! dequantise them to BF16.
 
@@ -29,6 +30,7 @@ pub fn lazy_bf16_reserve(store: &WeightStore) -> usize {
     let bytes = lazy_bf16_copy_bytes(
         store
             .names()
+            .filter(|n| !store.was_reclaimed(n))
             .filter_map(|n| store.get(n).ok().map(|t| (n, t.dtype, t.shape.as_slice()))),
     );
     if bytes > 0 {

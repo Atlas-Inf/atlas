@@ -23,6 +23,7 @@
 //! is only ever populated by a loader that has its own row reader.
 
 use super::FastSafetensorsLoader;
+use crate::weights::nvfp4_csf::csf_part;
 use crate::weights::parse_expert_index;
 
 impl FastSafetensorsLoader {
@@ -30,8 +31,11 @@ impl FastSafetensorsLoader {
     /// expert-TP slices; the activation scales under `skip_activation_scales`
     /// (one 0-dim F32 per projection, read on the host by a model loader that
     /// needs them, whichever rank owns the expert). Deferred tensors are also
-    /// left out of the pre-flight.
+    /// left out of the pre-flight. A CSF-compressed scale defers as its
+    /// components (judged by the scale's name), decoded per slice by
+    /// `with_deferred_slice`.
     pub(super) fn should_defer_tensor(&self, name: &str) -> bool {
+        let name = csf_part(name).map_or(name, |(scale, _)| scale);
         (self.skip_activation_scales && name.ends_with(".input_scale"))
             || self.is_host_decoded(name)
             || self.is_expert_tp_slice(name)

@@ -19,7 +19,7 @@ mod reasoning_done_tests;
 
 fn app(glm: bool) -> Arc<AppState> {
     app_for_model(
-        if glm { "glm5_next" } else { "qwen4_exp" },
+        if glm { "glm5_next" } else { "qwen3" },
         tool_parser::ToolCallFormat::PoolsideV1,
     )
 }
@@ -208,6 +208,7 @@ fn stream_tokens_with_state(
         timeout_at: None,
         stop_string_buffer_len: 0,
         leak_markers: state.tool_call_parser.as_ref().unwrap().leak_markers(),
+        role_literal_leaks: state.tokenizer.filters_bare_role_literals(),
         wants_typed_arguments: true,
         max_tool_calls_per_response: 12,
         min_tokens: 0,

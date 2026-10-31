@@ -46,6 +46,9 @@ pub(super) fn try_fused_chunk(
     if !enabled() || !spec.dflash_verify_raw_argmax {
         return false;
     }
+    active
+        .iter_mut()
+        .for_each(crate::scheduler::copy_drafts::offer);
     // `mtp_step`'s owner-batched width rule over the owners holding drafts.
     let eligible = |a: &ActiveSeq| a.grammar_state.is_none() && !a.finished;
     let lens: Vec<usize> = active

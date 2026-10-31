@@ -20,7 +20,12 @@ impl Glm5KdaLayer {
         let m = tokens as u32;
         let p = self.heads * self.dim;
         let packed = ctx.buffers.ssm_qkvz();
-        ops::kda_pack_qkv(ctx.gpu, self.pack_k, projected, packed, m, p as u32, stream)?;
+        // ATLAS_GLM_KDA_CONV_PLANES: a prefill convolves the projection's
+        // q / k / v planes where they are, without the packed copy.
+        let planar = !decode && !capture_verify_intermediates && kda_conv_planes_enabled();
+        if !planar {
+            ops::kda_pack_qkv(ctx.gpu, self.pack_k, projected, packed, m, p as u32, stream)?;
+        }
         let convolved = ctx.buffers.ssm_conv_out_f32();
         let core_out = ctx.buffers.attn_output();
         if capture_verify_intermediates {
@@ -28,19 +33,21 @@ impl Glm5KdaLayer {
                 packed, convolved, g1, beta, core_out, state, 0, tokens, ctx, stream,
             )?;
         } else {
+            let input = (if planar { projected } else { packed }, planar);
             self.sequence_recurrent_rows(
-                packed, convolved, g1, beta, core_out, state, tokens, decode, ctx, stream,
+                input, convolved, g1, beta, core_out, state, tokens, decode, ctx, stream,
             )?;
         }
         Ok(core_out)
     }
 
     /// Convolution + recurrence of one sequence over rows `[0, tokens)` of
-    /// already-packed `packed`/`g1`/`beta` (prefill or single-row decode).
+    /// `g1`/`beta` and the q|k|v `input` (`ops::kda_conv_prefill`'s packed
+    /// rows or planes; prefill or single-row decode).
     #[allow(clippy::too_many_arguments)]
     fn sequence_recurrent_rows(
         &self,
-        packed: DevicePtr,
+        input: (DevicePtr, bool),
         convolved: DevicePtr,
         g1: DevicePtr,
         beta: DevicePtr,
@@ -52,34 +59,48 @@ impl Glm5KdaLayer {
         stream: u64,
     ) -> Result<()> {
         let m = tokens as u32;
-        let p = self.heads * self.dim;
-        ops::conv1d_update_prefill(
+        ops::kda_conv_prefill(
             ctx.gpu,
-            self.conv_prefill_k,
-            self.conv_prefill_tp_k,
+            [self.conv_prefill_k, self.conv_prefill_tp_k],
             state.conv_state,
-            packed,
+            input,
             &self.weights.conv,
-            DevicePtr::NULL,
             convolved,
-            (3 * p) as u32,
-            self.conv_width as u32,
-            m,
-            (3 * p) as u32,
-            (3 * p) as u32,
+            [m, (self.heads * self.dim) as u32, self.conv_width as u32],
             stream,
         )?;
-        self.run_recurrent(
-            convolved,
-            g1,
-            beta,
-            state.h_state,
-            core_out,
-            m,
-            decode,
-            ctx,
-            stream,
-        )
+        if let Some(flash) = self
+            .flash_prefill
+            .as_ref()
+            .filter(|_| flash_prefill::eligible(tokens, decode, ctx.graph_capture))
+        {
+            // Convolution has finished reading packed. Its storage and the
+            // idle expert buffers can now be borrowed on this same stream.
+            flash.forward(
+                convolved,
+                g1,
+                beta,
+                self.weights.a_log.weight,
+                self.weights.dt_bias.weight,
+                state.h_state,
+                core_out,
+                tokens,
+                ctx,
+                stream,
+            )
+        } else {
+            self.run_recurrent(
+                convolved,
+                g1,
+                beta,
+                state.h_state,
+                core_out,
+                m,
+                decode,
+                ctx,
+                stream,
+            )
+        }
     }
 
     /// Fused prefill chunk + verify owners: pack every row once, advance
@@ -116,7 +137,16 @@ impl Glm5KdaLayer {
             packed, convolved, g1, beta, core_out, chunk, owners, rows, ctx, stream,
         )?;
         self.sequence_recurrent_rows(
-            packed, convolved, g1, beta, core_out, state, chunk, false, ctx, stream,
+            (packed, false),
+            convolved,
+            g1,
+            beta,
+            core_out,
+            state,
+            chunk,
+            false,
+            ctx,
+            stream,
         )?;
         Ok(core_out)
     }

@@ -57,7 +57,11 @@ pub(super) fn load(
         }
     }
     let proj = |[data, scales]: [_; 2], n: usize, k: usize| Mxfp8Proj {
-        w: Mxfp8Weight { data, scales },
+        w: Mxfp8Weight {
+            data,
+            scales,
+            tiled: false,
+        },
         n: n as u32,
         k: k as u32,
     };

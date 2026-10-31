@@ -13,3 +13,8 @@ SECURITY.md
 .clang-format
 .antigravityignore
 deny.toml
+
+# Keep the full notice for imported GLM confidence tables in Docker builds.
+!docs/
+docs/**
+!docs/glm-prior-art.md

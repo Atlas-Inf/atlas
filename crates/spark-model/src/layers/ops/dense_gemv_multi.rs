@@ -315,6 +315,86 @@ pub fn dense_gemm_pipelined_triple_n(
     )
 }
 
+/// Large-M twin of [`dense_gemm_pipelined_triple_n`] for the three weights
+/// stored back to back (`packed` is `[first_n + 2 * other_n, k]`,
+/// `ATLAS_GLM_KDA_SIDE_PROJ_LT`): one CUTLASS GEMM reads the activation once
+/// into `scratch` (`[m, first_n + 2 * other_n]`), then `kda_split_side_proj`
+/// (or, without it, three pitched copies) lands the planes. Each output is the same k16 MMA chain as the pipelined
+/// kernel's ([`super::bf16_gemm_pipelined_twin`]), so the planes are the
+/// triple's bytes at any `m`. `Ok(false)`: CUTLASS rejected the shape and
+/// nothing was launched.
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemm_packed_triple_n(
+    gpu: &dyn GpuBackend,
+    input: DevicePtr,
+    packed: DevicePtr,
+    scratch: DevicePtr,
+    outputs: [DevicePtr; 3],
+    m: u32,
+    [first_n, other_n]: [u32; 2],
+    k: u32,
+    stream: u64,
+) -> Result<bool> {
+    let n = first_n + 2 * other_n;
+    if !super::bf16_gemm_pipelined_twin(input, packed.0, scratch, [m, n, k], stream)? {
+        return Ok(false);
+    }
+    let split = gpu.op_cache().kernel(gpu, "kda", "kda_split_side_proj");
+    match split {
+        Ok(kernel) if first_n.is_multiple_of(8) && other_n.is_multiple_of(8) => {
+            let (c0, c1) = (first_n / 8, other_n / 8);
+            KernelLaunch::new(gpu, kernel)
+                .grid([div_ceil(m * (c0 + 2 * c1), 256), 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(scratch)
+                .arg_ptr(outputs[0])
+                .arg_ptr(outputs[1])
+                .arg_ptr(outputs[2])
+                .arg_u32(m)
+                .arg_u32(c0)
+                .arg_u32(c1)
+                .launch(stream)?;
+        }
+        _ => split_columns(
+            gpu,
+            scratch,
+            outputs,
+            m,
+            [first_n, other_n, other_n],
+            stream,
+        )?,
+    }
+    Ok(true)
+}
+
+/// Rows of `src` (`[m, sum(widths)]` BF16) split by column into the dense
+/// `[m, widths[i]]` planes `outputs[i]`, one pitched copy each.
+fn split_columns(
+    gpu: &dyn GpuBackend,
+    src: DevicePtr,
+    outputs: [DevicePtr; 3],
+    m: u32,
+    widths: [u32; 3],
+    stream: u64,
+) -> Result<()> {
+    let pitch = widths.iter().sum::<u32>() as usize * 2;
+    let mut col = 0;
+    for (out, width) in outputs.into_iter().zip(widths) {
+        let bytes = width as usize * 2;
+        gpu.copy_d2d_2d_async(
+            src.offset(col),
+            pitch,
+            out,
+            bytes,
+            bytes,
+            m as usize,
+            stream,
+        )?;
+        col += bytes;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn launch_triple_n(
     gpu: &dyn GpuBackend,
@@ -350,3 +430,7 @@ fn launch_triple_n(
 #[cfg(test)]
 #[path = "dense_gemv_multi_tests.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "dense_gemv_multi_test_gpu.rs"]
+mod gpu_tests;

@@ -4,7 +4,7 @@
 //! tail of `forward_block` walked as pieces and swaps, with each run of
 //! pieces between two swaps captured as one CUDA graph.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use spark_comm::CommBackend;
 use spark_runtime::gpu::GraphHandle;
 
@@ -72,6 +72,24 @@ impl SplitOps for HeadWalk<'_> {
             Piece::GateUp(_) | Piece::Down(_) | Piece::Vocab => {
                 let frame = Frame::serial(scratch);
                 head.split_piece(self.split, piece, 0, ctx.gpu, &frame, self.stream)
+            }
+            // The head's lists, then the selector's hidden rows while the
+            // worker finishes its share.
+            Piece::TopK => {
+                let frame = Frame::serial(scratch);
+                head.split_piece(self.split, piece, 0, ctx.gpu, &frame, self.stream)?;
+                let selector = head
+                    .candidate_selector
+                    .as_ref()
+                    .context("rank-split candidate swap without a DFlash2 selector")?;
+                selector.project_hidden(
+                    scratch.norm_buf,
+                    scratch.dflash2_projected_hidden,
+                    head.gamma,
+                    &|src, w, dst, m, n, k| {
+                        head.drafter_dense_gemm(ctx.gpu, src, w, dst, m, n, k, self.stream)
+                    },
+                )
             }
         }
     }

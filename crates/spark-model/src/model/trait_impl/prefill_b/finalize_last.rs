@@ -468,6 +468,9 @@ impl TransformerModel {
                     if let Some(old) = displaced {
                         self.ssm_snapshots.free(old);
                     }
+                    // ATLAS_DFLASH_WARM_CTX=restore (Enntity/atlas
+                    // 5573f4d5): the drafter rows up to the prompt leaf.
+                    self.dflash_warm_save(seq, tokens, stream)?;
                 }
             } else if !self.tokens_have_vision_pad(tokens) && !self.hss_window_slid(seq) {
                 let acquired = self.prefix_cache.insert(

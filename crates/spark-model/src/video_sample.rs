@@ -184,6 +184,102 @@ pub fn sample_plan(wanted: usize, duration_secs: f32) -> Result<SamplePlan> {
 /// claim about any particular rate.
 const PLAN_FPS_DENOM: f32 = 100.0;
 
+/// GLM reference sampling defaults (`max_frame_count_dynamic`, `fps` in
+/// vLLM's `glm5next` video processor).
+pub const GLM_DEFAULT_MAX_FRAMES: usize = 2_048;
+pub const GLM_DEFAULT_FPS: f64 = 2.0;
+
+/// The ffmpeg `select` filter that keeps exactly the input frames numbered
+/// `indices` (`eq(n\,K)` matches one frame by its index).
+/// (Enntity/atlas d0cead1.)
+pub fn select_frames(indices: impl IntoIterator<Item = usize>) -> String {
+    let clauses: Vec<String> = indices
+        .into_iter()
+        .map(|k| format!("eq(n\\,{k})"))
+        .collect();
+    format!("select='{}'", clauses.join("+"))
+}
+
+/// vLLM `glm5next` frame-index sampling: `linspace` over the clip when it is
+/// shorter than the extraction count, else a `1/(tp*fps)` walk over declared
+/// frame times, then a linspace re-count. The last index is duplicated when
+/// the count is odd — the processor pads the final temporal pair.
+/// (Enntity/atlas d0cead1.)
+pub fn glm_sample_frame_indices(
+    total_frames: usize,
+    fps: f64,
+    duration: f64,
+    target_fps: Option<f64>,
+    max_frame_count: Option<usize>,
+    temporal_patch_size: usize,
+) -> Vec<usize> {
+    let max_frame_idx = total_frames as f64 - 1.0;
+    let duration = if duration != 0.0 {
+        duration
+    } else if fps != 0.0 {
+        (max_frame_idx / fps).round_ties_even() + 1.0
+    } else {
+        0.0
+    };
+    let target_fps = target_fps.unwrap_or(GLM_DEFAULT_FPS);
+    let extract_t =
+        ((duration * target_fps) as usize).min(max_frame_count.unwrap_or(GLM_DEFAULT_MAX_FRAMES));
+    let mut indices: Vec<usize> = if total_frames < extract_t {
+        (0..extract_t)
+            .map(|i| i * total_frames / extract_t)
+            .collect()
+    } else {
+        let per_frame = 1.0 / fps;
+        let step = 1.0 / (temporal_patch_size as f64 * target_fps);
+        let max_second = duration.trunc();
+        let mut walk = Vec::new();
+        let mut current = 0.0f64;
+        for index in 0..total_frames {
+            if index as f64 * per_frame >= current {
+                current += step;
+                walk.push(index);
+                if current >= max_second {
+                    break;
+                }
+            }
+        }
+        walk
+    };
+    if indices.len() < extract_t {
+        let (start, end) = match (indices.first(), indices.last()) {
+            (Some(&first), Some(&last)) => (first, last),
+            _ => (0, total_frames.saturating_sub(1)),
+        };
+        indices = linspace_floor(start, end, extract_t);
+    } else if indices.len() > extract_t {
+        indices = linspace_floor(0, total_frames.saturating_sub(1), extract_t);
+    }
+    let mut seen = std::collections::HashSet::new();
+    indices.retain(|&index| seen.insert(index));
+    if indices.len() % 2 == 1 {
+        indices.push(indices[indices.len() - 1]);
+    }
+    indices
+}
+
+/// `np.linspace(start, end, num, dtype=int)`: `k × step + start` in f64,
+/// floored, with the endpoint exact. (Enntity/atlas d0cead1.)
+fn linspace_floor(start: usize, end: usize, num: usize) -> Vec<usize> {
+    if num <= 1 {
+        return vec![start; num];
+    }
+    let step = (end as f64 - start as f64) / (num - 1) as f64;
+    (0..num)
+        .map(|k| {
+            if k == num - 1 {
+                end
+            } else {
+                (k as f64 * step + start as f64).floor() as usize
+            }
+        })
+        .collect()
+}
+
 /// `Some` only for a rate that can be divided by.
 pub(crate) fn finite_positive(x: f32) -> Option<f32> {
     (x.is_finite() && x > 0.0).then_some(x)

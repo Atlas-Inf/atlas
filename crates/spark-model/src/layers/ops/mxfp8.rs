@@ -5,6 +5,8 @@ use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
+use crate::weight_map::Mxfp8Weight;
+
 /// Values per E8M0 scale block.
 pub const MXFP8_BLOCK: usize = 32;
 
@@ -36,7 +38,8 @@ pub fn mxfp8_quantize(
 }
 
 /// `C[m, n] = A[m, k] · dequant(W)[n, k]ᵀ` on the tensor cores; `kernel` is
-/// `mxfp8_gemv_tc8/16/32` for up to 8/16/32 rows.
+/// `mxfp8_gemv_tc8/16/32` for up to 8/16/32 rows (their `_tiled` twins on a
+/// tiled twin: [`mxfp8_kernel`]).
 #[allow(clippy::too_many_arguments)]
 pub fn mxfp8_gemv(
     gpu: &dyn GpuBackend,
@@ -125,6 +128,146 @@ pub fn mxfp8_swiglu_rows(
     Ok(())
 }
 
+fn parse_tiled(value: Option<&str>) -> Result<bool> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => anyhow::bail!("ATLAS_GLM_MXFP8_TILED must be 0 or 1, got {other:?}"),
+    }
+}
+
+/// `ATLAS_GLM_MXFP8_TILED` as set (read once): the GLM MLA q_b and o twins
+/// and the split verify head's shard take the `mxfp8_tile16` kernel's layout at load
+/// and the `mxfp8_gemv_tc{8,16,32}_tiled` tiers. Every output bit is the
+/// row-major tiers' (the same values into the same MMAs in the same order);
+/// each warp's 64-value chunk of 16 rows is one contiguous KiB instead of
+/// sixteen 64-byte pieces K bytes apart.
+pub fn mxfp8_tiled_requested() -> Result<bool> {
+    static ON: std::sync::OnceLock<std::result::Result<bool, String>> = std::sync::OnceLock::new();
+    ON.get_or_init(|| {
+        parse_tiled(std::env::var("ATLAS_GLM_MXFP8_TILED").ok().as_deref())
+            .map_err(|e| e.to_string())
+    })
+    .clone()
+    .map_err(anyhow::Error::msg)
+}
+
+/// `mxfp8_gemv_tc{8,16,32}_tiled` and `mxfp8_tile16`, resolved once (zero
+/// handles when the target lacks them).
+fn tiled_kernels(gpu: &dyn GpuBackend) -> ([KernelHandle; 3], KernelHandle) {
+    static K: std::sync::OnceLock<([KernelHandle; 3], KernelHandle)> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        let k = |name: &str| crate::layers::try_kernel(gpu, "mxfp8_gemv", name);
+        (
+            [
+                "mxfp8_gemv_tc8_tiled",
+                "mxfp8_gemv_tc16_tiled",
+                "mxfp8_gemv_tc32_tiled",
+            ]
+            .map(k),
+            k("mxfp8_tile16"),
+        )
+    })
+}
+
+/// The kernel serving `m` rows of twin `w`: its `_tiled` tier when `w` is
+/// tiled, else `row_major[mxfp8_tier(m)]`.
+pub fn mxfp8_kernel(
+    gpu: &dyn GpuBackend,
+    w: &Mxfp8Weight,
+    row_major: &[KernelHandle; 3],
+    m: u32,
+) -> KernelHandle {
+    let tiers = if w.tiled {
+        tiled_kernels(gpu).0
+    } else {
+        *row_major
+    };
+    tiers[mxfp8_tier(m)]
+}
+
+/// Row-major bytes staged per `mxfp8_tile16` launch of [`mxfp8_tile_in_place`].
+const TILE_STAGE_BYTES: usize = 32 << 20;
+
+/// Rewrite the row-major twin `w` (`[n, k]`, `n % 16 == 0`, `k % 64 == 0`) in
+/// place into `mxfp8_tile16`'s chunk-tiled layout and mark it tiled. Each
+/// 16-row tile keeps its byte range, so the twin is rewritten a staged run of
+/// whole tiles at a time. Load time only: synchronizes `stream`.
+pub fn mxfp8_tile_in_place(
+    gpu: &dyn GpuBackend,
+    w: &mut Mxfp8Weight,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<()> {
+    let kernel = tiled_kernels(gpu).1;
+    ensure!(
+        !w.tiled && n > 0 && n.is_multiple_of(16) && k > 0 && k.is_multiple_of(64),
+        "mxfp8_tile16: n={n} k={k} tiled={}",
+        w.tiled
+    );
+    ensure!(
+        kernel.0 != 0,
+        "mxfp8_tile16 is missing from the kernel target"
+    );
+    let (tile_w, tile_s) = (16 * k, 16 * k / MXFP8_BLOCK);
+    let tiles = n / 16;
+    let batch = (TILE_STAGE_BYTES / tile_w).clamp(1, tiles);
+    let stage_w = gpu.alloc(batch * tile_w)?;
+    let stage_s = gpu.alloc(batch * tile_s)?;
+    let run = || -> Result<()> {
+        for first in (0..tiles).step_by(batch) {
+            let count = batch.min(tiles - first);
+            let (dw, ds) = (
+                w.data.offset(first * tile_w),
+                w.scales.offset(first * tile_s),
+            );
+            gpu.copy_d2d_async(dw, stage_w, count * tile_w, stream)?;
+            gpu.copy_d2d_async(ds, stage_s, count * tile_s, stream)?;
+            let threads = (count * (k / 64) * 32) as u32;
+            KernelLaunch::new(gpu, kernel)
+                .grid([div_ceil(threads, 256), 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(stage_w)
+                .arg_ptr(stage_s)
+                .arg_ptr(dw)
+                .arg_ptr(ds)
+                .arg_u32((count * 16) as u32)
+                .arg_u32(k as u32)
+                .launch(stream)?;
+            // The next run overwrites the stage.
+            gpu.synchronize(stream)?;
+        }
+        Ok(())
+    };
+    let done = run();
+    gpu.free(stage_w)?;
+    gpu.free(stage_s)?;
+    done?;
+    w.tiled = true;
+    Ok(())
+}
+
+/// [`mxfp8_tile_in_place`] under `ATLAS_GLM_MXFP8_TILED=1` for a twin served
+/// only by [`mxfp8_gemv`] through [`mxfp8_kernel`]; a no-op otherwise, or
+/// when the shape has a partial tile or chunk (the row-major tiers serve it).
+pub fn mxfp8_tile_if_requested(
+    gpu: &dyn GpuBackend,
+    w: &mut Mxfp8Weight,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<()> {
+    if !mxfp8_tiled_requested()? || !n.is_multiple_of(16) || !k.is_multiple_of(64) {
+        return Ok(());
+    }
+    ensure!(
+        tiled_kernels(gpu).0.iter().all(|t| t.0 != 0),
+        "ATLAS_GLM_MXFP8_TILED=1 but the mxfp8_gemv_tc*_tiled tiers are missing"
+    );
+    mxfp8_tile_in_place(gpu, w, n, k, stream)
+}
+
 /// Widest row count [`mxfp8_gemv_grouped`] serves.
 pub const MXFP8_GROUPED_MAX_M: u32 = 16;
 
@@ -180,3 +323,7 @@ pub fn mxfp8_gemv_grouped(
 #[cfg(test)]
 #[path = "mxfp8_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "mxfp8_tiled_test_gpu.rs"]
+mod tiled_gpu_tests;

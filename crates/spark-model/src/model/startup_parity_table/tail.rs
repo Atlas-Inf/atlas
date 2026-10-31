@@ -3,12 +3,40 @@
 use anyhow::Result;
 
 use super::while_on;
+use crate::layers::dflash_head::ConvTwinKind;
+use crate::layers::{self, ops};
 use crate::model::{graph_flags, qwen4exp_batch_fast, qwen4exp_exact_verify, qwen4exp_mtp_depth};
 
 /// The table's trailing entries, split for the 500-LoC cap. The caller
 /// chains them after [`super::SETTINGS`], so the gathered order is
 /// unchanged.
 pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
+    ("ATLAS_GLM_MLA_FUSE", || {
+        Ok(ops::glm_mla_fuse_requested()? as u64)
+    }),
+    ("ATLAS_GLM_MXFP8_TILED", || {
+        Ok(ops::mxfp8_tiled_requested()? as u64)
+    }),
+    ("ATLAS_GLM_CANONICAL_VERIFY", || {
+        Ok(layers::canonical_verify::enabled() as u64)
+    }),
+    ("ATLAS_DFLASH_CONV_TWIN", || {
+        Ok(ConvTwinKind::word(ConvTwinKind::requested()?))
+    }),
+    // GLM exact prefill: both ranks must select the same arithmetic and,
+    // for overlap, the same number and ordering of row-block exchanges.
+    ("ATLAS_GLM_KDA_SIDE_PROJ_LT", || {
+        Ok(crate::layers::kda_side_proj_lt_enabled() as u64)
+    }),
+    ("ATLAS_GLM_KDA_CONV_PLANES", || {
+        Ok(crate::layers::kda_conv_planes_enabled() as u64)
+    }),
+    ("ATLAS_GLM_HC_PREFILL_FUSE2", || {
+        Ok(crate::layers::qwen3_attention::hc_prefill_fuse2_enabled() as u64)
+    }),
+    ("ATLAS_GLM_SP_GATHER_OVERLAP", || {
+        Ok(crate::layers::glm_sp_overlap::requested_blocks() as u64)
+    }),
     ("ATLAS_QWEN4EXP_EXACT_VERIFY_CHECK", || {
         Ok(qwen4exp_exact_verify::check_requested() as u64)
     }),

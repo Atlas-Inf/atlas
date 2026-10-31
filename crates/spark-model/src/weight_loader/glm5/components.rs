@@ -146,6 +146,9 @@ fn load_moe(
     qctx: QuantizeCtx,
     allow_prefill_layout: bool,
 ) -> Result<FfnComponent> {
+    let mmq_moe = env_flag("ATLAS_NVFP4_MMQ_MOE");
+    let cutlass_moe = env_flag("ATLAS_MOE_GROUPED_CUTLASS");
+    validate_moe_layout(config.expert_tp, mmq_moe, cutlass_moe)?;
     let p = format!("{lp}.mlp");
     let h = config.hidden_size;
     let inter = config.moe_intermediate_size;
@@ -266,14 +269,8 @@ fn load_moe(
     };
     let mut layer = MoeLayer::new(weights, config.num_experts, None, gpu, config)?;
     layer.set_shared_fp8_origins([gate_origin, up_origin, down_origin])?;
-    let mmq_moe = env_flag("ATLAS_NVFP4_MMQ_MOE");
-    let cutlass_moe = env_flag("ATLAS_MOE_GROUPED_CUTLASS");
-    anyhow::ensure!(
-        !(mmq_moe && cutlass_moe),
-        "ATLAS_NVFP4_MMQ_MOE and ATLAS_MOE_GROUPED_CUTLASS are mutually exclusive"
-    );
     if mmq_moe {
-        layer.repack_nvfp4_mmq_unified(gpu, config)?;
+        layer.repack_nvfp4_mmq_unified(gpu, config, store)?;
     } else if cutlass_moe {
         // CUTLASS consumes the checkpoint-native packed weights and adds only
         // its block-scale swizzle. Avoid materializing the much larger Atlas
@@ -290,12 +287,24 @@ fn load_moe(
         // K=4 verification batches GLM's always-on shared expert through the
         // exact-M=4 GEMV, which needs its decode-native layout. Routed experts
         // remain transposed-only to avoid hybrid layout's memory cost.
-        store
-            .mark_freed_elsewhere(&layer.transpose_for_prefill_unified_keep_shared(gpu, config)?)?;
+        let freed = layer.transpose_for_prefill_unified_keep_shared(gpu, config)?;
+        store.mark_freed_elsewhere(&freed)?;
     }
     // The factory installs optional shared FP8 caches only after all target,
     // MTP and head loading has released replaced checkpoint allocations.
     Ok(FfnComponent::Moe(layer))
+}
+
+fn validate_moe_layout(expert_tp: bool, mmq: bool, cutlass: bool) -> Result<()> {
+    anyhow::ensure!(
+        !(mmq && expert_tp),
+        "ATLAS_NVFP4_MMQ_MOE does not support expert TP"
+    );
+    anyhow::ensure!(
+        !(mmq && cutlass),
+        "ATLAS_NVFP4_MMQ_MOE and ATLAS_MOE_GROUPED_CUTLASS are mutually exclusive"
+    );
+    Ok(())
 }
 
 fn unified_moe_layout_enabled(value: Option<&str>) -> bool {
@@ -400,6 +409,12 @@ pub(super) fn load_kda_weights(
     let dt_bias = dt_bias_full
         .replaced(dt_bias, dt_len * 4, gpu)?
         .into_dense();
+    let b_proj = load_tp_dense("b_proj", dims.full_nk, dims.h, TpShardKind::ColumnParallel)?;
+    let [b_proj, f_a_proj, g_a_proj] = if crate::layers::kda_side_proj_lt_enabled() {
+        super::kda_side_pack::pack_side(store, &p, gpu, retirement, b_proj, &dims)?
+    } else {
+        [b_proj.into_dense(), load("f_a_proj")?, load("g_a_proj")?]
+    };
     Ok(Glm5KdaWeights {
         q_proj: load_hot(
             "q_proj",
@@ -422,9 +437,8 @@ pub(super) fn load_kda_weights(
             TpShardKind::ColumnParallel,
             true,
         )?,
-        b_proj: load_tp_dense("b_proj", dims.full_nk, dims.h, TpShardKind::ColumnParallel)?
-            .into_dense(),
-        f_a_proj: load("f_a_proj")?,
+        b_proj,
+        f_a_proj,
         f_b_proj: load_tp_dense(
             "f_b_proj",
             dims.full_key_dim(),
@@ -432,7 +446,7 @@ pub(super) fn load_kda_weights(
             TpShardKind::ColumnParallel,
         )?
         .into_dense(),
-        g_a_proj: load("g_a_proj")?,
+        g_a_proj,
         g_b_proj: load_tp_dense(
             "g_b_proj",
             dims.full_key_dim(),
@@ -456,7 +470,21 @@ pub(super) fn load_kda_weights(
 
 #[cfg(test)]
 mod tests {
-    use super::unified_moe_layout_enabled;
+    use super::{unified_moe_layout_enabled, validate_moe_layout};
+
+    #[test]
+    fn mmq_layout_rejects_unsupported_loading_combinations() {
+        for expert_tp in [false, true] {
+            for mmq in [false, true] {
+                for cutlass in [false, true] {
+                    assert_eq!(
+                        validate_moe_layout(expert_tp, mmq, cutlass).is_ok(),
+                        !(mmq && (expert_tp || cutlass))
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn unified_moe_layout_is_explicitly_opt_in() {

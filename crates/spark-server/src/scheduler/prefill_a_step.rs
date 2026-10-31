@@ -143,6 +143,11 @@ pub fn start_chunked_prefill(
         // The model's EOS passes through the matcher even under `ignore_eos`.
         &[model_eos, eos_tokens].concat(),
         req_enable_thinking && think_end_token.is_some(),
+        first_token_thinking::native_opener(
+            sched.limits.glm_tool_boundary,
+            req_tools_present,
+            tool_call_start_token,
+        ),
         &mut sink,
     )?;
 

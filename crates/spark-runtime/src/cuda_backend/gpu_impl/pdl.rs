@@ -74,6 +74,9 @@ pub(super) fn pdl_kernel(func_name: &str) -> bool {
 /// parameters (kernels/gb10/glm-5.3-flash/nvfp4/atlas_pdl_touch.cuh). A kernel
 /// launched with PDL must not read its predecessor's output before that wait,
 /// so only these qualify.
+/// This is a launch allowlist, not every kernel containing a wait. In
+/// particular, persistent MoE twins retain the source's ordinary launch
+/// semantics until their overlapping execution is qualified separately.
 pub(super) const PDL_KERNELS: &[&str] = &[
     "w4a16_gemv_tc8",
     "w4a16_gemv_tc8_ld",
@@ -87,6 +90,7 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "w4a16_gemv_tc16_pair_touch",
     "w4a16_gemv_tc32_pair_touch",
     "mxfp8_gemv_tc8",
+    "mxfp8_gemv_tc8_tiled",
     "mxfp8_gemv_tc8_touch",
     "mxfp8_gemv_tc16_touch",
     "mxfp8_gemv_tc32_touch",
@@ -124,6 +128,19 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "dense_gemv_bf16_batchm_dual",
     "dense_gemv_bf16_batchm_dual_k128",
     "dense_gemv_bf16_batchm_triple_n",
+    "dense_gemv_bf16_tc8",
+    "dense_gemv_bf16_tc16",
+    "dense_gemv_bf16_tc32",
+    "dense_gemv_bf16_tc8_grouped",
+    "dense_gemv_bf16_tc16_grouped",
+    "dense_gemv_bf16_tc32_grouped",
+    "dense_gemv_bf16_tc8_planes",
+    "dense_gemv_bf16_tc16_planes",
+    "dense_gemv_bf16_tc32_planes",
+    "glm_mla_down_fuse_tc8",
+    "glm_mla_down_fuse_tc16",
+    "glm_mla_down_fuse_tc32",
+    "glm_mla_mid_fuse",
     "rms_norm_vanilla",
     "rms_norm_vanilla_regs",
     "bf16_add_inplace",
@@ -143,6 +160,8 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "moe_build_tile_worklist",
     "moe_build_tile_worklist_scan",
     "quantize_bf16_to_nvfp4",
+    "glm_moe_router_quant",
+    "glm_moe_route_select",
     "moe_w4a4_grouped_gemm_prequant_t_k64_vecscale_compact_gate_up",
     "silu_mul_quant_nvfp4",
     "moe_w4a4_grouped_gemm_prequant_t_k128",
@@ -170,6 +189,7 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "causal_conv1d_update_prefill_tp_snap",
     "kda_recurrent_bf16_verify_rec_owners",
     "kda_commit_records",
+    "kda_commit_records_stride",
     "kda_sigmoid_gated_rms_norm",
 ];
 

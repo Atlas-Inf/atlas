@@ -46,6 +46,9 @@ impl MoeLayer {
         top_k: u32,
         num_tokens: usize,
         ne: usize,
+        // `route_and_sort` already wrote the M16 worklist and the NVFP4
+        // input (`ATLAS_GLM_MOE_ROUTE_FUSE`).
+        prerouted: bool,
         t0: &mut Option<std::time::Instant>,
         ctx: &ForwardContext,
         stream: u64,
@@ -203,6 +206,7 @@ impl MoeLayer {
         // 16 KiB even for a one-row arena: enough for the K=5 gate/up worklist
         // (640 items + counter) without allocations.
         let compact_k5 = std::env::var("ATLAS_GLM_K5_COMPACT_MOE").as_deref() == Ok("1")
+            && !crate::layers::canonical_verify::enabled()
             && ctx.config.model_type == "glm5_next"
             && n == 5
             && total_expanded == 40
@@ -349,9 +353,14 @@ impl MoeLayer {
                         [n, top_k],
                         [h, inter],
                         num_experts,
+                        prerouted,
                         ctx,
                         stream,
                     )?;
+                    anyhow::ensure!(
+                        wide.is_some() || !prerouted,
+                        "fused MoE routing: {n} rows left the M16 grid it built a worklist for"
+                    );
                     silu_done = self.prequant_fp4_gate_up(
                         expert_input,
                         gp,
@@ -367,6 +376,7 @@ impl MoeLayer {
                         max_m_tiles,
                         compact,
                         wide,
+                        prerouted,
                         ctx,
                         stream,
                     )?;

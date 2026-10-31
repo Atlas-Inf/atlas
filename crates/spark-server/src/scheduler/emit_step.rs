@@ -483,18 +483,23 @@ pub(super) fn strict_refusal(tok: u32, at: usize) -> String {
 /// prompt leaves the model inside `<think>`), and failing to arm one is
 /// reported to the client on `sink` as an invalid request (HTTP 400 when
 /// blocking) and returned as `Err`: its output must never come back
-/// unconstrained as if it were valid.
+/// unconstrained as if it were valid. One with a tool branch also learns the
+/// `native_opener` that can end reasoning as its first output token
+/// (`first_token_thinking::native_opener`).
 pub fn compile_grammar_state(
     engine: &mut Option<GrammarEngine>,
     grammar_spec: &Option<GrammarSpec>,
     eos_tokens: &[u32],
     opens_in_thinking: bool,
+    native_opener: Option<u32>,
     sink: &mut ResponseSink,
 ) -> Result<Option<GrammarState>> {
     let Some(spec) = grammar_spec.as_ref() else {
         return Ok(None);
     };
     let strict = spec.is_response_format();
+    let native_opener =
+        native_opener.filter(|_| matches!(spec, GrammarSpec::ToolCallOrJson { .. }));
     let compiled = match engine.as_mut() {
         // Backstop: nothing a client sends may unwind the scheduler thread.
         Some(engine) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -505,7 +510,10 @@ pub fn compile_grammar_state(
         None => Ok(None),
     };
     match compiled {
-        Ok(state) if strict => Ok(state.map(|s| s.strict_output(opens_in_thinking))),
+        Ok(state) if strict => Ok(state.map(|s| {
+            s.strict_output(opens_in_thinking)
+                .with_native_opener(native_opener)
+        })),
         Ok(state) => Ok(state),
         // A request the server cannot serve as asked: HTTP 400 for a blocking
         // client, not a retryable 500. A tool grammar too large to compile is
@@ -566,6 +574,19 @@ fn compile_spec(
         },
         GrammarSpec::JsonObject => engine.compile_json_grammar(),
         GrammarSpec::JsonSchema { schema } => engine.compile_json_schema(schema),
+        GrammarSpec::ToolCallOrJson {
+            tools,
+            parser,
+            schema,
+        } => match engine.compile_tool_or_json_grammar(&**parser, tools, schema.as_deref()) {
+            Some(result) => result,
+            None => {
+                return Err(format!(
+                    "parser '{}' has no tool grammar for response_format + tools",
+                    parser.name(),
+                ));
+            }
+        },
     };
 
     let label = match spec {
@@ -574,6 +595,11 @@ fn compile_spec(
         }
         GrammarSpec::JsonObject => "response_format=json_object".to_string(),
         GrammarSpec::JsonSchema { .. } => "response_format=json_schema".to_string(),
+        GrammarSpec::ToolCallOrJson { parser, tools, .. } => format!(
+            "parser={}, tools={} OR response_format",
+            parser.name(),
+            tools.len()
+        ),
     };
 
     let grammar = compiled.map_err(|e| format!("Grammar compilation failed: {e}"))?;
@@ -583,7 +609,15 @@ fn compile_spec(
     // Exempt the model's stop/EOS tokens from grammar refusal so a legitimate
     // end-of-turn token cannot desync the NPDA and truncate the response
     // (see GrammarState::accept_token).
-    Ok(Some(state.with_stop_tokens(eos_tokens)))
+    let state = state.with_stop_tokens(eos_tokens);
+    // A union picks its branch by mass at its first token (`grammar::branch`).
+    let GrammarSpec::ToolCallOrJson { schema, .. } = spec else {
+        return Ok(Some(state));
+    };
+    let answer = engine
+        .json_start_mask(schema.as_deref())
+        .map_err(|e| format!("Grammar compilation failed: {e}"))?;
+    Ok(Some(state.with_answer_start(answer)))
 }
 
 /// Result of starting a chunked prefill.

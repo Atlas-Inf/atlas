@@ -142,6 +142,21 @@ pub fn flush_content_sanitizer(
     suppressing_param_leak: &mut bool,
     markers: &tool_parser::LeakMarkers,
 ) -> String {
+    let mut literal_state = crate::literal_xml::LiteralXmlState::default();
+    flush_content_sanitizer_with_literal_state(
+        tag_scan_buf,
+        suppressing_param_leak,
+        &mut literal_state,
+        markers,
+    )
+}
+
+pub fn flush_content_sanitizer_with_literal_state(
+    tag_scan_buf: &mut String,
+    suppressing_param_leak: &mut bool,
+    literal_state: &mut crate::literal_xml::LiteralXmlState,
+    markers: &tool_parser::LeakMarkers,
+) -> String {
     if *suppressing_param_leak {
         tag_scan_buf.clear();
         *suppressing_param_leak = false;
@@ -177,7 +192,8 @@ pub fn flush_content_sanitizer(
     // Scrubbing would destroy the payload, so skip the scrub whenever
     // the marker set declares envelopes.
     if markers.envelope_open.is_empty() {
-        final_text = super::scrub::scrub_tool_tags(&final_text, markers);
+        final_text =
+            super::scrub::scrub_tool_tags_with_literal_state(&final_text, *literal_state, markers);
     }
     // Drop a TRAILING INCOMPLETE close marker (e.g. the stream ended after
     // `</_call` before its closing `>` arrived). The original
@@ -205,6 +221,7 @@ pub fn flush_content_sanitizer(
     if looks_like_partial_tag {
         String::new()
     } else {
+        literal_state.feed(&final_text);
         final_text
     }
 }
