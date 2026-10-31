@@ -89,6 +89,8 @@ fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<A
         "get_url<arg_key>url</arg_key><arg_value>http://169.254.169.254/</arg_value></tool_call>",
         "ops",
         ORDERED_OPS,
+        "```xml",
+        "\n",
     ];
     let vocab = words
         .iter()
