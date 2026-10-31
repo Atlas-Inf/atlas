@@ -183,27 +183,6 @@ pub fn decode_frames(
     Ok(decode_with_plan(bytes, target_fps, policy)?.0)
 }
 
-/// Refuse before probing when subprocess decoding is off or its binary
-/// cannot run. Checked BEFORE the clip is probed: otherwise a missing binary
-/// surfaces as an unprobeable clip, which sends the operator hunting for a
-/// corrupt video when the real fix is to install ffmpeg. `probe` names the
-/// binary and the remedy.
-fn ensure_decoder(policy: &FfmpegPolicy) -> Result<()> {
-    ensure!(
-        policy.enabled,
-        "this container needs ffmpeg to decode and subprocess decoding is disabled; \
-         pass --video-allow-ffmpeg to enable it, or send an animated GIF"
-    );
-    if let Availability::Missing(detail) = probe(policy) {
-        anyhow::bail!(
-            "the ffmpeg decoder is not usable: {detail} (no ffmpeg installed at that path, or it \
-             could not run) — install ffmpeg with its ffprobe companion, or point \
-             --video-ffmpeg-path at a usable build"
-        );
-    }
-    Ok(())
-}
-
 /// What a probe found, or the error that says it could not be determined.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClipTiming {
