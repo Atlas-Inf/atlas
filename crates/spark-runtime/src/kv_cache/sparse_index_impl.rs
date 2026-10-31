@@ -4,7 +4,7 @@
 
 use anyhow::{Result, bail};
 
-use super::{KvCacheConfig, PagedKvCache, SparseIndexCacheConfig};
+use super::{KvBuffer, KvCacheConfig, PagedKvCache, SparseIndexCacheConfig};
 use crate::gpu::{DevicePtr, GpuBackend};
 
 impl PagedKvCache {
@@ -31,7 +31,9 @@ impl PagedKvCache {
         }
         spec.block_bytes(self.config.block_size)?;
         let tails = tail_slots
-            .map(|plan| super::tail_slots::TailSlots::new(self.num_blocks, plan, gpu))
+            .map(|plan| {
+                super::tail_slots::TailSlots::new(self.num_blocks, plan, gpu, &self.placement)
+            })
             .transpose()?;
         let tail_entries = tails.as_ref().map_or(self.num_blocks, |t| t.capacity());
         let values_stride = spec.values_block_bytes(self.config.block_size);
@@ -39,8 +41,13 @@ impl PagedKvCache {
         let tail_stride = spec.tail_block_bytes(self.config.block_size);
         let mut allocations: Vec<(DevicePtr, DevicePtr, DevicePtr)> =
             Vec::with_capacity(self.layers.len());
-        for _ in 0..self.layers.len() {
-            let values = match gpu.alloc(self.num_blocks * values_stride) {
+        let placement = &self.placement;
+        for layer in 0..self.layers.len() {
+            let values = match placement.alloc(
+                gpu,
+                KvBuffer::IndexValues(layer),
+                self.num_blocks * values_stride,
+            ) {
                 Ok(ptr) => ptr,
                 Err(error) => {
                     free_allocations(gpu, allocations);
@@ -50,7 +57,11 @@ impl PagedKvCache {
             let scales = if scales_stride == 0 {
                 DevicePtr::NULL
             } else {
-                match gpu.alloc(self.num_blocks * scales_stride) {
+                match placement.alloc(
+                    gpu,
+                    KvBuffer::IndexScales(layer),
+                    self.num_blocks * scales_stride,
+                ) {
                     Ok(ptr) => ptr,
                     Err(error) => {
                         let _ = gpu.free(values);
@@ -59,7 +70,11 @@ impl PagedKvCache {
                     }
                 }
             };
-            let tail = match gpu.alloc(tail_entries * tail_stride) {
+            let tail = match placement.alloc(
+                gpu,
+                KvBuffer::IndexTail(layer),
+                tail_entries * tail_stride,
+            ) {
                 Ok(ptr) => ptr,
                 Err(error) => {
                     let _ = gpu.free(values);
