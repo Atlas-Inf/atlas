@@ -112,7 +112,7 @@ fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<A
         tool_max_tokens: 192,
         sampling_presets: Default::default(),
         tool_call_start_token_id: Some(TOOL),
-        glm_tool_boundary: crate::glm_tool_boundary::native_opener("qwen3", true, Some(TOOL)),
+        glm_tool_boundary: crate::glm_tool_boundary::native_opener(model_type, true, Some(TOOL)),
         auto_compact_threshold: None,
         request_timeout: 0,
         effective_context: 0,
