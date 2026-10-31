@@ -163,6 +163,24 @@ fn hc_rows(ctx: &ForwardContext, row0: usize) -> (DevicePtr, DevicePtr, DevicePt
     )
 }
 
+/// Tokens a warp, kernel-name suffix and block size of the
+/// `glm_hc_mix_ss` / `glm_hc_post_mix_ss` tile a call runs: a row's bytes
+/// are the same at any tile (a token is one warp's, or with `m2` one warp
+/// pair's, its columns and order fixed), so the tile is chosen for speed
+/// alone. Cold-L2 medians on one GB10 (BF16 highway, register-prefetching
+/// kernels) at 512 / 2048 / 8192 rows: the post-mix at two tokens a warp
+/// 234 / 819 / 3115 us (one: 258 / 835 / 3092; the kernels before the
+/// prefetch 294 / 930 / 3473 at their best tile); the mix at two with the
+/// 24 dots split over a warp pair 170 / 491 / 1560 us (one, unsplit: 184 /
+/// 520 / 1774; before: 234 / 571 / 1652). At 1024 rows every tile is within
+/// 7%.
+fn mix_tile(post: bool) -> (u32, &'static str, u32) {
+    match post {
+        true => (2, "_w2", 256),
+        false => (2, "_w2m2", 512),
+    }
+}
+
 /// `glm_hc_mix_ss` (or, with the finishing site's `block_out`,
 /// `glm_hc_post_mix_ss`) over highway rows `[row0, row0 + tokens)`: the raw
 /// mix and sum of squares of each row into `gate_logits_f32`. Both kernels
@@ -178,12 +196,13 @@ pub(super) fn mix_ss(
     let raw_mix = ctx.buffers.gate_logits_f32();
     let ss = raw_mix.offset(tokens as usize * 24 * 4);
     let (streams, post, comb) = hc_rows(ctx, row0);
+    let (per_warp, tile, threads) = mix_tile(block_out.is_some());
     let launch = |kernel: &str| -> Result<KernelLaunch<'_>> {
-        let name = ops::hc_kernel_name(&ctx.config.model_type, kernel);
+        let name = ops::hc_kernel_name(&ctx.config.model_type, &format!("{kernel}{tile}"));
         Ok(
             KernelLaunch::new(ctx.gpu, ctx.gpu.kernel("glm_hc_prefill_vec", &name)?)
-                .grid([tokens.div_ceil(32), 1, 1])
-                .block([256, 1, 1]),
+                .grid([tokens.div_ceil(8 * per_warp), 1, 1])
+                .block([threads, 1, 1]),
         )
     };
     match block_out {

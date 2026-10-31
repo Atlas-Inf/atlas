@@ -139,6 +139,7 @@ impl ModelConfig {
             mtp_transformer_layers: 0,
             rotary_dim: 0,
             dflash_capture_layers: Vec::new(),
+            dflash_ctx_window: None,
             adapter_max_rank: 0,
             // No n-gram embeddings: the trio is opt-in per checkpoint.
             // No PLE tower: `ple_layer_ids` empty is the gate.

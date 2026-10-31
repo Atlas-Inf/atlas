@@ -216,6 +216,7 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "moe_unpermute_reduce_indexed_ep_vec8_e4m3",
     "moe_batched_blend",
     "moe_unpermute_blend_ep_vec8",
+    "glm_hc_moe_blend_post_bf16",
     "moe_silu_mul",
     "moe_silu_mul_touch",
     "kda_pack_qkv",

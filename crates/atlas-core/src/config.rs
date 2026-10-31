@@ -565,6 +565,14 @@ pub struct ModelConfig {
     #[serde(default)]
     pub dflash_capture_layers: Vec<usize>,
 
+    /// Prompt positions a bidirectional DFlash drafter's context window keeps
+    /// (the served window, capped at `max_seq_len`); `None` when DFlash is
+    /// off or its window is not that (a causal head). Every rank sets it from
+    /// the same arguments, so it can gate decisions both ranks must agree on
+    /// (sequence-parallel prefill keeps the window on rank 0).
+    #[serde(default)]
+    pub dflash_ctx_window: Option<usize>,
+
     /// LoRA adapter rank ceiling (`--max-lora-rank`). `0` = LoRA disabled.
     /// Set programmatically before model build (never parsed from the HF
     /// `config.json`); the only consumer is `BufferSizes`, which sizes the
