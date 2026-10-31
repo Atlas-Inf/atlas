@@ -54,7 +54,7 @@ fn plan_takes_the_largest_buffers_that_fit() {
     let (config, index) = glm(3);
     let sizes = PagedKvCache::buffer_sizes(&config, 100, true, Some(index), None);
     // K 844800 B and tails 819200 B occupy 13 × 64 KiB each, values 2 × 64 KiB.
-    let placement = KvPlacement::plan(&sizes, 2 * MIB);
+    let placement = KvPlacement::plan_ordered(&sizes, 2 * MIB, CarveoutOrder::Size);
     let expected: BTreeSet<_> = [
         KvBuffer::K(0),
         KvBuffer::K(1),
@@ -80,7 +80,7 @@ fn buffer_sizes_match_what_the_constructors_allocate() {
     // Room for everything: every non-empty listed buffer must land in the
     // carveout at exactly its listed size.
     let gpu = MockGpuBackend::with_carveout(64 * MIB);
-    let placement = KvPlacement::plan(&sizes, 64 * MIB);
+    let placement = KvPlacement::plan_ordered(&sizes, 64 * MIB, CarveoutOrder::Size);
     let _cache = build(&gpu, 3, 100, placement);
     let mut listed: Vec<usize> = sizes.iter().map(|&(_, n)| n).filter(|&n| n > 0).collect();
     let mut allocated = gpu.carveout_alloc_sizes();
@@ -103,7 +103,7 @@ fn buffer_sizes_match_with_slot_mapped_tails() {
         &gpu,
         2,
         100,
-        KvPlacement::plan(&sizes, 64 * MIB),
+        KvPlacement::plan_ordered(&sizes, 64 * MIB, CarveoutOrder::Size),
         Some(slots),
     );
     let mut listed: Vec<usize> = sizes.iter().map(|&(_, n)| n).filter(|&n| n > 0).collect();
@@ -117,7 +117,7 @@ fn buffer_sizes_match_with_slot_mapped_tails() {
 fn only_placed_buffers_use_the_carveout() {
     let (config, index) = glm(3);
     let sizes = PagedKvCache::buffer_sizes(&config, 100, true, Some(index), None);
-    let placement = KvPlacement::plan(&sizes, 2 * MIB);
+    let placement = KvPlacement::plan_ordered(&sizes, 2 * MIB, CarveoutOrder::Size);
     let gpu = MockGpuBackend::with_carveout(2 * MIB);
     let _cache = build(&gpu, 3, 100, placement.clone());
     let footprints: usize = sizes
@@ -134,7 +134,7 @@ fn a_placement_planned_at_more_blocks_fits_fewer() {
     // Ranks agree on a block count no larger than the one each planned at.
     let (config, index) = glm(3);
     let planned = PagedKvCache::buffer_sizes(&config, 100, true, Some(index), None);
-    let placement = KvPlacement::plan(&planned, 2 * MIB);
+    let placement = KvPlacement::plan_ordered(&planned, 2 * MIB, CarveoutOrder::Size);
     let gpu = MockGpuBackend::with_carveout(2 * MIB);
     let _cache = build(&gpu, 3, 61, placement.clone());
     let fewer = PagedKvCache::buffer_sizes(&config, 61, true, Some(index), None);
@@ -146,7 +146,12 @@ fn release_returns_carveout_memory() {
     let (config, index) = glm(3);
     let sizes = PagedKvCache::buffer_sizes(&config, 100, true, Some(index), None);
     let gpu = MockGpuBackend::with_carveout(2 * MIB);
-    let mut cache = build(&gpu, 3, 100, KvPlacement::plan(&sizes, 2 * MIB));
+    let mut cache = build(
+        &gpu,
+        3,
+        100,
+        KvPlacement::plan_ordered(&sizes, 2 * MIB, CarveoutOrder::Size),
+    );
     assert!(gpu.carveout_used() > 0);
     cache.release(&gpu).unwrap();
     assert_eq!(gpu.carveout_used(), 0);
@@ -156,7 +161,7 @@ fn release_returns_carveout_memory() {
 fn without_a_carveout_nothing_is_placed() {
     let (config, index) = glm(2);
     let sizes = PagedKvCache::buffer_sizes(&config, 100, true, Some(index), None);
-    assert!(KvPlacement::plan(&sizes, 0).is_empty());
+    assert!(KvPlacement::plan_ordered(&sizes, 0, CarveoutOrder::Size).is_empty());
     let gpu = MockGpuBackend::new();
     let _cache = build(&gpu, 2, 100, KvPlacement::default());
     assert!(gpu.carveout_alloc_sizes().is_empty());

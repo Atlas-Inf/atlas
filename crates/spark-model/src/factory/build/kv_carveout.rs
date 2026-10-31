@@ -73,15 +73,18 @@ pub(super) fn plan(shape: KvShape, blocks: usize, capacity: usize) -> (usize, Kv
     if capacity == 0 || blocks == 0 {
         return (blocks, KvPlacement::default());
     }
-    let system = total(&shape.buffers(blocks));
-    let per_block = total(&shape.buffers(blocks + 1)) - system;
-    // A block's bytes all in the carveout bound the gain; walk down from there
-    // to the first count whose system-memory share fits. `blocks` always does.
-    let ceiling = blocks + capacity / per_block.max(1);
+    let system = shape.system_bytes(blocks, &KvPlacement::default());
+    // Per block over two blocks: a sharded K pool grows by a slot every
+    // second block. Unsharded this is the one-block step.
+    let per_block = (total(&shape.buffers(blocks + 2)) - total(&shape.buffers(blocks))) / 2
+        + shape.auxiliary_block_bytes;
+    // A block's bytes all in the carveout bound the gain (to within the one
+    // block the two-block step can hide); walk down from there to the first
+    // count whose system-memory share fits. `blocks` always does.
+    let ceiling = blocks + capacity / per_block.max(1) + 1;
     for n in (blocks..=ceiling).rev() {
-        let buffers = shape.buffers(n);
-        let placement = KvPlacement::plan(&buffers, capacity);
-        if total(&buffers) - placement.carved_bytes(&buffers) <= system {
+        let placement = KvPlacement::plan(&shape.buffers(n), capacity);
+        if shape.system_bytes(n, &placement) <= system {
             return (n, placement);
         }
     }
