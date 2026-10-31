@@ -379,3 +379,36 @@ fn a_stream_of_two_pngs_splits_into_two_frames() {
 }
 
 // ── frames by index (GLM-5.3's sampler) ──────────────────────────────────
+
+fn timing(frame_count: Option<u64>, duration_secs: f32, native_fps: f32) -> ClipTiming {
+    ClipTiming {
+        duration_secs,
+        native_fps,
+        frame_count,
+    }
+}
+
+#[test]
+fn declared_frames_reads_nb_frames_then_duration_times_rate() {
+    assert_eq!(
+        frames::declared_frames(&timing(Some(10), 1.0, 10.0), 1848).unwrap(),
+        10
+    );
+    assert_eq!(
+        frames::declared_frames(&timing(None, 2.0, 30.0), 1848).unwrap(),
+        60
+    );
+}
+
+#[test]
+fn a_frame_count_the_payload_cannot_hold_is_refused() {
+    // ffprobe reported this count for a 1,848-byte MP4 with a patched `stts`.
+    let err = frames::declared_frames(&timing(Some(4_000_000_000), 1.0, 10.0), 1848).unwrap_err();
+    assert!(err.to_string().contains("4000000000"), "{err}");
+    // Without `nb_frames` the same claim arrives as duration × rate.
+    assert!(frames::declared_frames(&timing(None, f32::MAX, f32::MAX), 1848).is_err());
+    assert_eq!(
+        frames::declared_frames(&timing(Some(1848), 1.0, 10.0), 1848).unwrap(),
+        1848
+    );
+}
