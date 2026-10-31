@@ -1081,7 +1081,6 @@ pub struct ServeArgs {
     /// checkpoint's video processor bound. 469762048 is the reference
     /// hour-video recipe (224K merged tokens). Does not change still images.
     #[arg(long)]
-    pub video_max_pixels: Option<usize>,
 
     /// Wall-clock budget for decoding one video. Bounds a decoder that hangs
     /// on a malformed container; the child is killed when it expires.

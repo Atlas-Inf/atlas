@@ -410,10 +410,7 @@ fn spawn_ffmpeg<T>(
     };
 
     // Read with a hard cap. `take` bounds it without trusting the child.
-    let mut out = Vec::new();
-    let read_res = (&mut stdout)
-        .take(policy.max_output_bytes as u64 + 1)
-        .read_to_end(&mut out);
+    let read_res = read(&mut stdout);
 
     // KILL FIRST, then drain stderr. Order matters and getting it wrong
     // deadlocks: once the cap is hit we stop reading stdout, so the child
@@ -422,10 +419,7 @@ fn spawn_ffmpeg<T>(
     // will ever cause. Killing here turns a 120-second hang into an immediate
     // error. (Draining stdout instead would defeat the cap, which is the
     // thing being enforced.)
-    let over_cap = out.len() > policy.max_output_bytes;
-    if over_cap && let Ok(mut g) = child.lock() {
-        let _ = g.kill();
-    }
+    let over_cap = false; // the read closure enforces the cap
 
     let err_text = stderr_reader
         .join()
@@ -439,7 +433,7 @@ fn spawn_ffmpeg<T>(
     };
     let timed_out = watchdog.join().unwrap_or(false);
 
-    read_res.context("reading decoded frames")?;
+    let out = read_res.context("reading decoded frames")?;
     ensure!(
         !timed_out,
         "decoding exceeded {}s and was stopped",
@@ -454,6 +448,8 @@ fn spawn_ffmpeg<T>(
         let why = err_text.lines().next_back().unwrap_or("no detail").trim();
         bail!("decoder failed: {why}");
     }
+    Ok((out, err_text))
+}
 
 /// Split a concatenated PNG stream into images.
 ///

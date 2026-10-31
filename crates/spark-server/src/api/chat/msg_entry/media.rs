@@ -191,6 +191,7 @@ pub(super) fn preprocess_media(
                         &item,
                         pad_counts[idx],
                         Vec::new(),
+                        false, // GLM path: qwen3vl=false
                     )?);
                 } else {
                     qwen_placeholders.push(QwenVisionPlaceholder {
@@ -218,6 +219,7 @@ pub(super) fn preprocess_media(
                         first,
                         pad_counts[idx],
                         timestamps,
+                        false, // GLM path: qwen3vl=false
                     )?);
                 } else {
                     let per_frame_pad_count = (first.grid_h / sms) * (first.grid_w / sms);

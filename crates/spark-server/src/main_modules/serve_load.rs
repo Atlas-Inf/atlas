@@ -279,11 +279,10 @@ pub(crate) fn load_model(
         max_frames: args.video_max_frames,
         max_total_decoded_pixels: args.video_max_pixels,
         timeout_secs: args.video_decode_timeout_s,
-        max_total_decoded_pixels: args.video_max_pixels,
         max_output_bytes: args.video_max_pixels.map_or(512 * 1024 * 1024, |pixels| {
             pixels
                 .saturating_mul(4)
-                .saturating_add(video_max_frames.saturating_mul(1024))
+                .saturating_add(args.video_max_frames.saturating_mul(1024))
         }),
         ..Default::default()
     };
