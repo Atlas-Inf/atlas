@@ -149,7 +149,7 @@ pub fn sample_indices(
         return (0..n_frames).collect();
     }
     // Uniform positions across the clip, nearest index, deduplicated in order.
-    let mut out = Vec::with_capacity(wanted);
+    let out = Vec::with_capacity(wanted);
     for i in 0..wanted {
         let pos = if wanted == 1 {
             0.0

@@ -15,6 +15,7 @@ use super::DEFAULT_FPS;
 /// The result is clamped into `[min_frames, max_frames]` and then to a
 /// multiple of `temporal_patch_size`, because a partial group cannot be
 /// encoded. Returns indices into the decoded frame list.
+#[allow(dead_code)]
 pub fn sample_indices(
     n_frames: usize,
     native_fps: f32,
@@ -85,6 +86,7 @@ fn _legacy_sampling_reference() {}
 /// `temporal_patch_size` frames — so a remainder is dropped here rather than
 /// padded. Frames are never duplicated to fill a group, which would charge
 /// the model for motion it never saw.
+#[allow(dead_code)]
 pub fn group_indices(n_frames: usize, temporal_patch_size: usize) -> Vec<usize> {
     let tp = temporal_patch_size.max(1);
     let whole = n_frames / tp * tp;
