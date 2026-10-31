@@ -11,7 +11,7 @@ const K3_SUMMARY_PERIOD: u64 = 100;
 
 #[path = "verify_k3_step/record.rs"]
 mod record;
-pub(super) use record::*;
+use record::*;
 
 /// A K=3 verdict's re-propose from `token`: a copy in place of the head
 /// (`ATLAS_QWEN_COPY_DRAFTS`, `copy_drafts::mtp`), else the head at the

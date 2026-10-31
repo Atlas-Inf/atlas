@@ -3,7 +3,7 @@
 //! (extracted; identical content).
 
 use super::*;
-use crate::openai::ChatMessage;
+use crate::openai::IncomingMessage;
 
 /// Capture the conversation-linked user items (the new turn's user input)
 /// before `chat_req` is handed off. Used to append back to the
@@ -11,7 +11,7 @@ use crate::openai::ChatMessage;
 pub(super) fn conv_new_user_items(
     state_arc: &Arc<AppState>,
     conversation_id: Option<&String>,
-    input_messages: &[ChatMessage],
+    input_messages: &[IncomingMessage],
 ) -> Vec<serde_json::Value> {
     let Some(cid) = conversation_id else {
         return Vec::new();
