@@ -59,8 +59,14 @@ impl MoeLayer {
             && crate::layers::canonical_verify::enabled()
         {
             // ATLAS_GLM_CANONICAL_VERIFY: one tensor-core family for every
-            // verify width, so near-tied experts do not flip with the width.
-            crate::layers::canonical_verify::dense(
+            // verify width, so near-tied experts do not flip with the width
+            // (its FP32-output twin for FP32 router logits).
+            let canonical = if self.router_f32 {
+                crate::layers::canonical_verify::dense_f32
+            } else {
+                crate::layers::canonical_verify::dense
+            };
+            canonical(
                 ctx.gpu,
                 router_in,
                 &self.weights.gate,

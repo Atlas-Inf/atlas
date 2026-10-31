@@ -133,6 +133,7 @@ impl ModelConfig {
             // base Qwen3-Next-80B template behaves identically to before.
             scoring_func: String::new(),
             use_routing_bias: false,
+            router_logits_f32: false,
             qk_norm_type: String::new(),
             num_mtp_modules: 0,
             mtp_transformer_layers: 0,

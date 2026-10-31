@@ -527,6 +527,12 @@ pub struct ModelConfig {
     /// per MoE layer).
     #[serde(default)]
     pub use_routing_bias: bool,
+    /// The MoE router's logits stay FP32 into top-k (`moe_router_dtype:
+    /// "float32"`, GLM-5): BF16 operands, FP32 accumulation and an unrounded
+    /// FP32 logit, as the reference's `GateLinear(out_dtype=float32)`.
+    /// False: the router stores BF16 logits.
+    #[serde(default)]
+    pub router_logits_f32: bool,
     /// QK normalization granularity. "" = none (Qwen3-Next default).
     /// "per_layer" = each attention layer has its own learned q_layernorm /
     /// k_layernorm weight of shape `[head_dim]`, applied after Q/K projection

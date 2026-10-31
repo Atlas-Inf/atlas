@@ -295,6 +295,7 @@ impl MoeLayer {
         rows: u32,
         h: u32,
         inter: u32,
+        router_touch: Option<super::route_fuse::RouterTouch>,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -325,15 +326,21 @@ impl MoeLayer {
             h,
             stream,
         )?;
-        ops::silu_mul(
-            ctx.gpu,
-            self.moe_act_mul,
-            gate_out,
-            up_out,
-            gate_out,
-            (rows * part) as u32,
-            stream,
-        )?;
+        let elements = (rows * part) as u32;
+        match router_touch {
+            Some((kernel, touch)) => ops::silu_mul_touch(
+                ctx.gpu, kernel, gate_out, up_out, gate_out, elements, touch, stream,
+            )?,
+            None => ops::silu_mul(
+                ctx.gpu,
+                self.moe_act_mul,
+                gate_out,
+                up_out,
+                gate_out,
+                elements,
+                stream,
+            )?,
+        }
         ensure!(
             !native.down.tiled,
             "the split shared down reads a row-major twin"

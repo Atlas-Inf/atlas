@@ -269,6 +269,7 @@ mod init;
 mod init_batched;
 mod init_ctor;
 mod init_optional;
+mod init_router;
 mod init_t_rows;
 mod inplace_transpose;
 mod m5_projection_oracle;

@@ -58,19 +58,45 @@ pub fn bf16_gemm(
         return Ok(());
     }
     if enabled() && m >= MIN_ROWS {
-        if cutlass_gemm(act, weight, out, [m, n, k], stream)? {
+        if cutlass_gemm(false, act, weight, out, [m, n, k], stream)? {
             return Ok(());
         }
-        static REPORTED: std::sync::Once = std::sync::Once::new();
-        REPORTED.call_once(|| {
-            tracing::warn!(
-                "bf16_gemm: CUTLASS rejected {m}x{n}x{k} config {}; such shapes run in \
-                 cuBLASLt (reported once)",
-                config(n, k)
-            )
-        });
+        report_rejected(m, n, k);
     }
     spark_runtime::cublaslt::bf16_gemm_act_weight_t(act.0, weight, out.0, m, n, k, stream)
+}
+
+/// [`bf16_gemm`] with an FP32 `out` (the FP32 accumulator unrounded, GLM-5's
+/// FP32 router logits): the same CUTLASS tiles where [`bf16_gemm`] takes
+/// them, so a row's words do not depend on the call's row count either, and
+/// cuBLASLt with an FP32 output elsewhere.
+pub fn bf16_gemm_f32out(
+    act: DevicePtr,
+    weight: u64,
+    out: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    if enabled() && m >= MIN_ROWS {
+        if cutlass_gemm(true, act, weight, out, [m, n, k], stream)? {
+            return Ok(());
+        }
+        report_rejected(m, n, k);
+    }
+    spark_runtime::cublaslt::bf16_gemm_act_weight_t_f32out(act.0, weight, out.0, m, n, k, stream)
+}
+
+fn report_rejected(m: u32, n: u32, k: u32) {
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    REPORTED.call_once(|| {
+        tracing::warn!(
+            "bf16_gemm: CUTLASS rejected {m}x{n}x{k} config {}; such shapes run in \
+             cuBLASLt (reported once)",
+            config(n, k)
+        )
+    });
 }
 
 /// [`bf16_gemm`]'s CUTLASS tiles at any row count and whatever
@@ -89,12 +115,14 @@ pub fn bf16_gemm_pipelined_twin(
         bf16_gemm_matches_pipelined(k),
         "CUTLASS is the pipelined kernel's twin only in whole k16 steps (K = {k})"
     );
-    cutlass_gemm(act, weight, out, [m, n, k], stream)
+    cutlass_gemm(false, act, weight, out, [m, n, k], stream)
 }
 
-/// Every row block of `out = act @ weight^T` in CUTLASS; `Ok(false)` when it
-/// rejected the operands before launching anything.
+/// Every row block of `out = act @ weight^T` in CUTLASS, `out` FP32 when
+/// `f32_out` (else BF16); `Ok(false)` when it rejected the operands before
+/// launching anything.
 fn cutlass_gemm(
+    f32_out: bool,
     act: DevicePtr,
     weight: u64,
     out: DevicePtr,
@@ -102,13 +130,21 @@ fn cutlass_gemm(
     stream: u64,
 ) -> Result<bool> {
     let cfg = config(n, k);
+    let (tuned, out_bytes) = if f32_out {
+        (
+            spark_runtime::cutlass::bf16_gemm_tuned_f32out as TunedGemm,
+            4,
+        )
+    } else {
+        (spark_runtime::cutlass::bf16_gemm_tuned as TunedGemm, 2)
+    };
     run_blocks(
         row_blocks(m, k, cfg),
         |row, rows| {
-            spark_runtime::cutlass::bf16_gemm_tuned(
+            tuned(
                 act.0 + u64::from(row) * u64::from(k) * 2,
                 weight,
-                out.0 + u64::from(row) * u64::from(n) * 2,
+                out.0 + u64::from(row) * u64::from(n) * out_bytes,
                 rows,
                 n,
                 k,
@@ -121,6 +157,8 @@ fn cutlass_gemm(
         spark_runtime::cutlass::rejected_before_launch,
     )
 }
+
+type TunedGemm = fn(u64, u64, u64, u32, u32, u32, u32, u32, u32, u64) -> Result<()>;
 
 /// Launches every row block. `Ok(false)` means the backend `rejected` the
 /// operands before launching anything. That depends only on the shape and the

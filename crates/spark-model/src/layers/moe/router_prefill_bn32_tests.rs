@@ -8,6 +8,7 @@ fn fixture(run: impl FnOnce(&mut MoeLayer, &ForwardContext, &RecordingGpu)) {
 fn fixture_model(model: &str, run: impl FnOnce(&mut MoeLayer, &ForwardContext, &RecordingGpu)) {
     let gpu = RecordingGpu::new();
     let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+    config.router_logits_f32 = model == "glm5_next";
     config.model_type = model.into();
     config.hidden_size = 4096;
     config.num_experts = 288;

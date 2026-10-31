@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // GLM N288/K4096 prefill specialization. The BM16/BN32 body is the standalone
 // oracle winner: one accumulator per output, k0..K-1, separate FMUL/FADD.
+// FP32 logits (`moe_router_dtype: float32`).
 // Grid (ceil(N/32),ceil(M/16),1), block (8,16,1); no model/cache allocation.
 // sB[][65] has no different-address bank collision across the eight x lanes.
 #pragma once
@@ -8,7 +9,7 @@
 extern "C" __global__ void dense_gemm_bf16_router_bn32(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
-    __nv_bfloat16* __restrict__ C,
+    float* __restrict__ C,
     unsigned M,unsigned N,unsigned K
 ) {
     constexpr unsigned BM=16, BN=32, BK=64, THREADS=8*BM;
@@ -58,6 +59,6 @@ extern "C" __global__ void dense_gemm_bf16_router_bn32(
     }
     if(row<M) {
         #pragma unroll
-        for(unsigned j=0;j<4;j++) if(col+j<N) C[size_t(row)*N+col+j]=__float2bfloat16_rn(acc[j]);
+        for(unsigned j=0;j<4;j++) if(col+j<N) C[size_t(row)*N+col+j]=acc[j];
     }
 }

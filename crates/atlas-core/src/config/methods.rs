@@ -149,6 +149,12 @@ impl ModelConfig {
         (start, end)
     }
 
+    /// Bytes of one MoE router logit: 4 when the router keeps FP32 logits
+    /// ([`Self::router_logits_f32`]), else 2 (BF16).
+    pub fn router_logit_bytes(&self) -> usize {
+        if self.router_logits_f32 { 4 } else { 2 }
+    }
+
     /// Routed-expert intermediate width held by this rank: the full
     /// `moe_intermediate_size`, or its EP-rank slice under expert TP.
     pub fn routed_inter_local(&self) -> usize {

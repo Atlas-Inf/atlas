@@ -97,7 +97,7 @@ pub fn w4a16(
 /// (`dense_gemv_bf16_tc{8,16,32}{suffix}`, `suffix` one of [`DENSE_TWINS`]),
 /// or a zero handle.
 fn dense_tier(gpu: &dyn GpuBackend, m: u32, suffix: &str) -> KernelHandle {
-    static TC: std::sync::OnceLock<[[KernelHandle; 3]; 3]> = std::sync::OnceLock::new();
+    static TC: std::sync::OnceLock<[[KernelHandle; 3]; 4]> = std::sync::OnceLock::new();
     let tiers = TC.get_or_init(|| {
         DENSE_TWINS.map(|twin| {
             [8, 16, 32].map(|rows| {
@@ -120,8 +120,9 @@ fn dense_tier(gpu: &dyn GpuBackend, m: u32, suffix: &str) -> KernelHandle {
     }
 }
 
-/// The BF16 tier families: plain, per-head grouped, up to three planes.
-const DENSE_TWINS: [&str; 3] = ["", "_grouped", "_planes"];
+/// The BF16 tier families: plain, per-head grouped, up to three planes, and
+/// the plain tiers with FP32 output (the MoE router's FP32 logits).
+const DENSE_TWINS: [&str; 4] = ["", "_grouped", "_planes", "_f32"];
 
 /// The canonical BF16 tensor-core GEMV tier for `m` rows, or a zero handle.
 pub fn dense_kernel(gpu: &dyn GpuBackend, m: u32) -> KernelHandle {
@@ -142,10 +143,56 @@ pub fn dense(
     out_stride: u32,
     stream: u64,
 ) -> Result<()> {
-    let tier = dense_kernel(gpu, m);
+    dense_out(
+        gpu,
+        "",
+        input,
+        weight,
+        output,
+        [m, n, k, out_stride],
+        stream,
+    )
+}
+
+/// [`dense`] with an FP32 `C` (`dense_gemv_bf16_tc{8,16,32}_f32`: the same
+/// fragments and sums, unrounded): the MoE router's FP32 logits.
+#[allow(clippy::too_many_arguments)]
+pub fn dense_f32(
+    gpu: &dyn GpuBackend,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    out_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    dense_out(
+        gpu,
+        "_f32",
+        input,
+        weight,
+        output,
+        [m, n, k, out_stride],
+        stream,
+    )
+}
+
+/// [`dense`] on the `twin` tiers.
+fn dense_out(
+    gpu: &dyn GpuBackend,
+    twin: &str,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    [m, n, k, out_stride]: [u32; 4],
+    stream: u64,
+) -> Result<()> {
+    let tier = dense_tier(gpu, m, twin);
     ensure!(
         tier.0 != 0 && k.is_multiple_of(8),
-        "canonical BF16 GEMV: no tensor-core tier for {m} rows (k={k})"
+        "canonical BF16 GEMV: no tensor-core tier{twin} for {m} rows (k={k})"
     );
     ops::dense_gemv_bf16_tc(
         gpu, tier, input, weight, output, m, n, k, out_stride, stream,

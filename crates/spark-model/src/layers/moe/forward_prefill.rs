@@ -287,7 +287,8 @@ impl MoeLayer {
             // Every row (an SP chunk's too): the slice's partial of each.
             self.run_shared_expert_prefill(input, n, h, shared_inter, stream, stream, false, ctx)?;
         } else if native_split {
-            self.run_shared_native_split(input, n, h, shared_inter, ctx, stream)?;
+            let touch = self.router_touch(n, h, inter, ctx);
+            self.run_shared_native_split(input, n, h, shared_inter, touch, ctx, stream)?;
         } else if split {
             self.run_shared_split(input, n, h, shared_inter, ctx, stream)?;
         } else if has_shared && !overlap_shared_reduce && !defer_shared {

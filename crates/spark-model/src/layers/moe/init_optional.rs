@@ -103,17 +103,19 @@ pub(super) fn router_gemv_batchm(
     config: &atlas_core::config::ModelConfig,
 ) -> KernelHandle {
     let module = "dense_gemv_bf16_batchm";
+    // FP32 router logits: the FP32-output twins.
+    let f32 = if config.router_logits_f32 { "_f32" } else { "" };
     let ahead = super::super::try_kernel_gated(
         config.model_type == "glm5_next"
             && config.num_experts.div_ceil(4) <= ops::DENSE_GEMV_AHEAD_MAX_CTAS as usize,
         gpu,
         module,
-        "dense_gemv_bf16_batchm_ahead",
+        &format!("dense_gemv_bf16_batchm_ahead{f32}"),
     );
     if ahead.0 != 0 {
         return ahead;
     }
-    super::super::try_kernel(gpu, module, "dense_gemv_bf16_batchm")
+    super::super::try_kernel(gpu, module, &format!("dense_gemv_bf16_batchm{f32}"))
 }
 
 impl OptionalKernels {

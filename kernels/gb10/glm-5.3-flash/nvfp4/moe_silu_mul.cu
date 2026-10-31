@@ -39,16 +39,13 @@
 //
 // Grid: (ceil(total_elements / 256), 1, 1)  Block: (256, 1, 1)
 
-#include "../../common/atlas_pdl.cuh"
+#include "atlas_pdl_touch.cuh"
 #include <cuda_bf16.h>
 
-extern "C" __global__ void moe_silu_mul(
-    const __nv_bfloat16* __restrict__ gate,   // [total_expanded, inter_size]
-    const __nv_bfloat16* __restrict__ up,     // [total_expanded, inter_size]
-    __nv_bfloat16* __restrict__ output,        // [total_expanded, inter_size]
-    unsigned int total_elements
+__device__ __forceinline__ void moe_silu_mul_body(
+    const __nv_bfloat16* __restrict__ gate, const __nv_bfloat16* __restrict__ up,
+    __nv_bfloat16* __restrict__ output, unsigned int total_elements
 ) {
-    atlas_pdl_enter();
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_elements) return;
 
@@ -62,6 +59,34 @@ extern "C" __global__ void moe_silu_mul(
     float sigmoid_g = 1.0f / (1.0f + __expf(-g));
     float result = g * sigmoid_g * u;
     output[idx] = __float2bfloat16(result);
+}
+
+extern "C" __global__ void moe_silu_mul(
+    const __nv_bfloat16* __restrict__ gate,   // [total_expanded, inter_size]
+    const __nv_bfloat16* __restrict__ up,     // [total_expanded, inter_size]
+    __nv_bfloat16* __restrict__ output,        // [total_expanded, inter_size]
+    unsigned int total_elements
+) {
+    atlas_pdl_enter();
+    moe_silu_mul_body(gate, up, output, total_elements);
+}
+
+// moe_silu_mul that also asks the routed FFN's router weight (`rows` rows of
+// `row_bytes`) and its correction bias (f32 [rows]) into L2 during its PDL
+// wait (atlas_pdl_touch.cuh; every CTA takes a share). The shared expert's
+// SiLU of a decode step is resident through the attention all-reduce, while
+// the memory bus idles, and the router (glm_moe_route_one) runs two launches
+// later, behind the shared down whose CTAs leave it no room to touch its own
+// weight. Discarded loads of immutable weights: the same bytes.
+extern "C" __global__ void moe_silu_mul_touch(
+    const __nv_bfloat16* __restrict__ gate, const __nv_bfloat16* __restrict__ up,
+    __nv_bfloat16* __restrict__ output, unsigned int total_elements,
+    const unsigned char* __restrict__ router_w, const unsigned char* __restrict__ router_bias,
+    unsigned int rows, unsigned int row_bytes
+) {
+    atlas_pdl_enter_touch({router_w, row_bytes, row_bytes}, {router_bias, 4u, 4ull}, rows,
+                          blockIdx.x, gridDim.x);
+    moe_silu_mul_body(gate, up, output, total_elements);
 }
 
 

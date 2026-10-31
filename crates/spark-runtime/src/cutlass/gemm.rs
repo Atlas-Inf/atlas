@@ -65,10 +65,52 @@ pub fn bf16_gemm_tuned(
     config: u32,
     stream: u64,
 ) -> Result<()> {
+    tuned(
+        false,
+        [act, weight, out],
+        [m, n, k, lda, ldc, config],
+        stream,
+    )
+}
+
+/// [`bf16_gemm_tuned`] with an FP32 `out`: the same tiles and mainloop, the
+/// accumulator stored unrounded (GLM-5's FP32 router logits).
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_gemm_tuned_f32out(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    lda: u32,
+    ldc: u32,
+    config: u32,
+    stream: u64,
+) -> Result<()> {
+    tuned(
+        true,
+        [act, weight, out],
+        [m, n, k, lda, ldc, config],
+        stream,
+    )
+}
+
+fn tuned(
+    f32_out: bool,
+    [act, weight, out]: [u64; 3],
+    [m, n, k, lda, ldc, config]: [u32; 6],
+    stream: u64,
+) -> Result<()> {
     #[cfg(atlas_cutlass)]
     {
+        let launch = if f32_out {
+            atlas_cutlass_bf16_gemm_tuned_f32out
+        } else {
+            atlas_cutlass_bf16_gemm_tuned
+        };
         let status = drained("bf16_gemm_tuned", unsafe {
-            atlas_cutlass_bf16_gemm_tuned(
+            launch(
                 act as *const c_void,
                 weight as *const c_void,
                 out as *mut c_void,
@@ -84,14 +126,14 @@ pub fn bf16_gemm_tuned(
         if status != 0 {
             return Err(super::status_error(
                 status,
-                format!("CUTLASS tuned bf16 GEMM {m}x{n}x{k} config {config}"),
+                format!("CUTLASS tuned bf16 GEMM {m}x{n}x{k} config {config} (f32 out {f32_out})"),
             ));
         }
         Ok(())
     }
     #[cfg(not(atlas_cutlass))]
     {
-        let _ = (act, weight, out, m, n, k, lda, ldc, config, stream);
+        let _ = (f32_out, act, weight, out, m, n, k, lda, ldc, config, stream);
         Err(anyhow::Error::new(super::RejectedBeforeLaunch)
             .context("CUTLASS support was not built; set CUTLASS_HOME when building"))
     }

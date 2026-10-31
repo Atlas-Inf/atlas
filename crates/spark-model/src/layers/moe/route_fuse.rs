@@ -2,7 +2,8 @@
 
 //! Steps 1-3 of `MoeLayer::forward_prefill` (router GEMM, top-k, sort by
 //! expert), and `ATLAS_GLM_MOE_ROUTE_FUSE=1` (default off), which runs them
-//! for a canonical verify block in two launches.
+//! for a canonical verify block in two launches. Router logits are FP32 under
+//! `MoeLayer::router_f32` (GLM-5) on every path.
 //!
 //! A GLM verify block of 1..=32 rows reaches its routed gate/up through five
 //! dependent launches per MoE layer: the canonical router GEMV, the sigmoid
@@ -23,13 +24,16 @@
 //! (`prerouted`). Every other batch runs the five launches.
 
 use super::*;
+#[cfg(test)]
 use spark_runtime::kernel_args::KernelLaunch;
 
-/// Widest batch the switch takes. The select's top-k runs a warp per row
-/// on eight warps, so past 16 rows it is slower than the per-row top-k CTAs
-/// (glm_moe_route_bench: 12 us a layer saved at 1..=8 rows, 7 at 16, 5
-/// lost at 32); wider batches run the five launches, same words.
-const MAX_ROWS: u32 = 16;
+mod kernels;
+
+/// Widest batch the switch takes: the select's top-k runs a warp per row on
+/// eight warps, and with each lane's scores in registers it beats the
+/// per-row top-k CTAs to 32 rows (glm_moe_route_bench: 12.8 us a layer saved
+/// at 16 rows, 5.8 at 32). Wider batches run the five launches, same words.
+const MAX_ROWS: u32 = 32;
 
 /// `ATLAS_GLM_MOE_ROUTE_FUSE` as set: `0` (or unset) or `1`. Read once.
 pub(crate) fn route_fuse_requested() -> Result<bool> {
@@ -47,108 +51,34 @@ pub(crate) fn route_fuse_requested() -> Result<bool> {
     .map_err(anyhow::Error::msg)
 }
 
-/// The two routing kernels, both loaded or both null.
+/// The two routing kernels, both loaded or both null, and the one-launch
+/// pair for batches of at most [`ONE_MAX_ROWS`] rows (null when the target
+/// lacks it) with its completion counter.
 #[derive(Clone, Copy)]
 pub(super) struct RouteFuse {
     router_quant: KernelHandle,
     select: KernelHandle,
+    one: KernelHandle,
+    /// `glm_moe_route_one`'s completion counter, then its router shares
+    /// ([`ONE_PARTIALS`] bytes from `done + 16`).
+    done: DevicePtr,
+    /// `moe_silu_mul_touch` (null when the target lacks it): the shared
+    /// expert's SiLU asks the router weight into L2 ([`MoeLayer::router_touch`]).
+    pub(super) silu_touch: KernelHandle,
 }
 
-impl RouteFuse {
-    pub(super) fn new(
-        gpu: &dyn GpuBackend,
-        config: &atlas_core::config::ModelConfig,
-    ) -> Result<Self> {
-        let on = route_fuse_requested()? && config.model_type == "glm5_next";
-        let this = if on { Self::load(gpu) } else { Self::NULL };
-        if on && gpu.op_cache().once("moe:route_fuse") {
-            if this.loaded() {
-                tracing::info!("ATLAS_GLM_MOE_ROUTE_FUSE: routing chain in two launches");
-            } else {
-                tracing::warn!("ATLAS_GLM_MOE_ROUTE_FUSE=1 ignored: target lacks glm_moe_route");
-            }
-        }
-        Ok(this)
-    }
+/// [`MoeLayer::router_touch`]: the touching SiLU and its
+/// `ops::silu_mul_touch` region (router weight, bias, rows, row bytes).
+pub(super) type RouterTouch = (KernelHandle, (DevicePtr, DevicePtr, u32, u32));
 
-    const NULL: Self = Self {
-        router_quant: KernelHandle(0),
-        select: KernelHandle(0),
-    };
-
-    /// Both kernels of the target, or neither.
-    pub(super) fn load(gpu: &dyn GpuBackend) -> Self {
-        let kernel = |name| super::super::try_kernel(gpu, "glm_moe_route", name);
-        let this = Self {
-            router_quant: kernel("glm_moe_router_quant"),
-            select: kernel("glm_moe_route_select"),
-        };
-        if this.router_quant.0 != 0 && this.select.0 != 0 {
-            this
-        } else {
-            Self::NULL
-        }
-    }
-
-    pub(super) fn loaded(&self) -> bool {
-        self.select.0 != 0
-    }
-
-    /// The two launches over `rows` rows of `input` (`[rows, hidden]`): the
-    /// router logits, the routes, the sort, the M16 worklist (one N tile of
-    /// 64 rows per routed local expert, `local_ptrs` nonzero, as
-    /// `decode_m16_grid`) and the NVFP4 input (`a_packed`, its group scales
-    /// after `rows * hidden / 2` bytes, as `prequant_fp4_gate_up`).
-    pub(super) fn launch(&self, gpu: &dyn GpuBackend, a: &RouteArgs, stream: u64) -> Result<()> {
-        anyhow::ensure!(
-            self.loaded() && a.hidden.is_multiple_of(16) && a.experts <= 512 && a.top_k <= 32,
-            "fused MoE routing: unsupported shape (hidden {}, {} experts, top-{})",
-            a.hidden,
-            a.experts,
-            a.top_k
-        );
-        let router_ctas = a.experts.div_ceil(16);
-        let quant_ctas = (a.rows * (a.hidden / 16)).div_ceil(256);
-        KernelLaunch::new(gpu, self.router_quant)
-            .grid([router_ctas + quant_ctas, 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(a.input)
-            .arg_ptr(a.gate)
-            .arg_ptr(a.bias)
-            .arg_ptr(a.logits)
-            .arg_ptr(a.a_packed)
-            .arg_ptr(a.a_packed.offset(a.rows as usize * a.hidden as usize / 2))
-            .arg_u32(a.rows)
-            .arg_u32(a.experts)
-            .arg_u32(a.hidden)
-            .arg_u32(router_ctas)
-            .arg_u32(a.experts)
-            .arg_f32(a.a_scale2)
-            .launch(stream)?;
-        KernelLaunch::new(gpu, self.select)
-            .grid([1, 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(a.logits)
-            .arg_ptr(a.bias)
-            .arg_ptr(a.indices)
-            .arg_ptr(a.weights)
-            .arg_ptr(a.sorted_token_ids)
-            .arg_ptr(a.sorted_expert_ids)
-            .arg_ptr(a.expert_offsets)
-            .arg_ptr(a.token_to_perm)
-            .arg_ptr(a.local_ptrs)
-            .arg_ptr(a.total_tiles.offset(16))
-            .arg_ptr(a.total_tiles)
-            .arg_u32(a.rows)
-            .arg_u32(a.experts)
-            .arg_u32(a.top_k)
-            .arg_u32(a.normalize as u32)
-            .arg_f32(a.scaling)
-            .arg_u32(1)
-            .arg_u32(64)
-            .launch(stream)
-    }
-}
+/// Widest batch, and most experts, `glm_moe_route_one` takes.
+const ONE_MAX_ROWS: u32 = 8;
+const ONE_MAX_EXPERTS: u32 = 320;
+/// Router warp shares a `glm_moe_route_one` CTA runs (`ROUTE_ONE_VW`).
+const ONE_VW: u32 = 3;
+/// `glm_moe_route_one`'s share buffer: eight shares of 32 lanes x 4 f32 a
+/// 16-expert tile.
+const ONE_PARTIALS: usize = (ONE_MAX_EXPERTS as usize / 16) * 8 * 32 * 16;
 
 /// The buffers and shape of one [`RouteFuse::launch`]. `total_tiles` holds
 /// the tile count, the worklist 16 bytes past it.
@@ -172,6 +102,9 @@ pub(super) struct RouteArgs {
     pub top_k: u32,
     pub normalize: bool,
     pub scaling: f32,
+    /// Device `[rows]` u32 liveness of dead verify rows
+    /// (`moe_route_mask_rows`), or 0.
+    pub row_live: DevicePtr,
     /// The NVFP4 input's `scale2`: 1, or the gate/up input scale
     /// (`ATLAS_GLM_FP4L_INPUT_SCALES`).
     pub a_scale2: f32,
@@ -235,8 +168,20 @@ impl MoeLayer {
                 super::dump::dump_gate_input(ctx.gpu, stream, router_in, n, h)?;
                 // 1. Gate GEMM: [N, H] × [H, num_experts] → [N, num_experts]
                 self.prefill_gate_gemm(router_in, gate_logits, n, num_experts, h, ctx, stream)?;
-                super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
-                det.tap("x_gate", gate_logits, rows, ne * 2);
+                super::dump::dump_gate_logits(
+                    ctx.gpu,
+                    stream,
+                    gate_logits,
+                    n,
+                    num_experts,
+                    self.router_f32,
+                )?;
+                det.tap(
+                    "x_gate",
+                    gate_logits,
+                    rows,
+                    ne * ctx.config.router_logit_bytes(),
+                );
                 // Feature-1: fold the router (`mlp.gate`) LoRA delta onto the
                 // routing logits BEFORE top-k (reproduces PEFT `mlp.gate`). No-op
                 // unless a router delta is installed (ATLAS_LORA_EXPERTS=1).
@@ -284,11 +229,13 @@ impl MoeLayer {
     }
 
     /// Whether `ATLAS_GLM_MOE_ROUTE_FUSE` takes a batch of `n` rows: the
-    /// canonical BF16 router, the unadapted sigmoid top-k with correction
-    /// bias, and a routed FFN on the M16 stream twins of the prequant path.
+    /// canonical router on a BF16 weight with FP32 logits, the unadapted
+    /// sigmoid top-k with correction bias, and a routed FFN on the M16 stream
+    /// twins of the prequant path.
     fn route_fused_applies(&self, n: u32, h: u32, inter: u32, ctx: &ForwardContext) -> bool {
         self.route_fuse.loaded()
             && ctx.config.model_type == "glm5_next"
+            && self.router_f32
             && crate::layers::canonical_verify::enabled()
             && (1..=MAX_ROWS).contains(&n)
             && self.gate_fp8.is_none()
@@ -306,6 +253,28 @@ impl MoeLayer {
             && !self.ep_prefill_zeroes(ctx)
             && h.is_multiple_of(16)
             && self.stream_m16_prequant(n, h, inter)
+    }
+
+    /// The router weight and correction bias for the shared expert's SiLU to
+    /// ask into L2 (`ops::silu_mul_touch`) when this batch routes through
+    /// the fused launches: the SiLU waits through the attention all-reduce
+    /// with the bus idle, while the router runs behind the shared down, cold.
+    /// Same bytes either way.
+    pub(super) fn router_touch(
+        &self,
+        n: u32,
+        h: u32,
+        inter: u32,
+        ctx: &ForwardContext,
+    ) -> Option<RouterTouch> {
+        let kernel = self.route_fuse.silu_touch;
+        (kernel.0 != 0 && self.route_fused_applies(n, h, inter, ctx)).then(|| {
+            let bias = self
+                .correction_bias_dev
+                .expect("route_fused_applies checked");
+            let experts = ctx.config.num_experts as u32;
+            (kernel, (self.weights.gate.weight, bias, experts, h * 2))
+        })
     }
 
     /// Steps 1-3 plus the M16 worklist and the NVFP4 input, in two launches.
@@ -345,6 +314,7 @@ impl MoeLayer {
             top_k,
             normalize: ctx.config.norm_topk_prob,
             scaling: ctx.config.routed_scaling_factor as f32,
+            row_live: DevicePtr(0),
             a_scale2: self.a1_scale2(),
         };
         self.route_fuse.launch(ctx.gpu, &args, stream)

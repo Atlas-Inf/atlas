@@ -335,7 +335,14 @@ impl MoeLayer {
             )?;
         }
 
-        super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
+        super::dump::dump_gate_logits(
+            ctx.gpu,
+            stream,
+            gate_logits,
+            n,
+            num_experts,
+            self.router_f32,
+        )?;
 
         // Feature-1: fold the router (`mlp.gate`) LoRA delta onto the routing
         // logits BEFORE top-k (device-clean, no capture guard). No-op unless a

@@ -81,8 +81,8 @@ mod grouped;
 mod pack;
 
 pub use gemm::{
-    bf16_gemm_act_weight_t, bf16_gemm_tuned, bf16_grouped_gemm_act_weight_t,
-    fp8_blockwise_gemm_act_weight_t, nvfp4_gemm_bf16_act_weight_t,
+    bf16_gemm_act_weight_t, bf16_gemm_tuned, bf16_gemm_tuned_f32out,
+    bf16_grouped_gemm_act_weight_t, fp8_blockwise_gemm_act_weight_t, nvfp4_gemm_bf16_act_weight_t,
 };
 pub use grouped::{nvfp4_grouped_down, nvfp4_grouped_gate_up, nvfp4_grouped_gate_up_fused};
 pub use pack::{pack_bf16_weight_to_nvfp4_t, pack_weight_sfb, transpose_nvfp4_packed_kton};
@@ -104,6 +104,18 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
     pub(crate) fn atlas_cutlass_bf16_gemm_tuned(
+        act: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        lda: i32,
+        ldc: i32,
+        config: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub(crate) fn atlas_cutlass_bf16_gemm_tuned_f32out(
         act: *const c_void,
         weight: *const c_void,
         out: *mut c_void,

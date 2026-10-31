@@ -36,6 +36,35 @@ pub fn silu_mul(
         .launch(stream)
 }
 
+/// [`silu_mul`] through the GLM `moe_silu_mul_touch` twin: the same bytes,
+/// and during its PDL wait it asks `touch` (`rows` rows of `row_bytes`, and
+/// an f32 `[rows]` vector) into L2 for a launch that follows it.
+#[allow(clippy::too_many_arguments)]
+pub fn silu_mul_touch(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gate: DevicePtr,
+    up: DevicePtr,
+    output: DevicePtr,
+    num_elements: u32,
+    touch: (DevicePtr, DevicePtr, u32, u32),
+    stream: u64,
+) -> Result<()> {
+    let (rows_ptr, vector, rows, row_bytes) = touch;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(num_elements, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(gate)
+        .arg_ptr(up)
+        .arg_ptr(output)
+        .arg_u32(num_elements)
+        .arg_ptr(rows_ptr)
+        .arg_ptr(vector)
+        .arg_u32(rows)
+        .arg_u32(row_bytes)
+        .launch(stream)
+}
+
 /// SiLU·mul over a `[num_tokens, inter*2]` gate‖up layout — the first `inter`
 /// columns of each row are the gate, the next `inter` the up.
 ///

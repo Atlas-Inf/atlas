@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 #include "../../common/atlas_pdl.cuh"
+#include "glm_moe_unpermute_row.cuh"
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <assert.h>   // device-side assert() for the work-list packing guard
 
 // Atlas MoE token permutation kernels.
@@ -241,6 +243,26 @@ extern "C" __global__ void moe_batched_blend(
 // token_to_perm always describe the same permutation. Consumers must address
 // rows only through sorted_token_ids / token_to_perm and treat each row on its
 // own; a bytewise comparison or hash of a route-major buffer is not meaningful.
+// Dead verify rows (ATLAS_DFLASH_DEAD_ROWS): every route of a row whose
+// `row_live` word is 0 becomes expert `num_experts`, past every expert. The
+// sorts (moe_sort_by_expert, moe_sort_by_expert_scan) place those routes after
+// expert_offsets[num_experts], so no routed GEMM reads them and no weight is
+// read for them; every unpermute keeps only routes inside the local expert
+// range, so the row's routed output is 0. A live row's routes, sorted
+// positions within its experts aside, are untouched.
+// Grid: (ceil(rows * topk / 256), 1, 1)  Block: (256, 1, 1).
+extern "C" __global__ void moe_route_mask_rows(
+    unsigned int* __restrict__ topk_ids,           // [rows, topk]
+    const unsigned int* __restrict__ row_live,     // [rows]: 0 = dead
+    unsigned int rows,
+    unsigned int topk,
+    unsigned int num_experts
+) {
+    atlas_pdl_enter();
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows * topk && row_live[i / topk] == 0) topk_ids[i] = num_experts;
+}
+
 extern "C" __global__ void moe_sort_by_expert(
     const unsigned int* __restrict__ topk_ids,      // [total_expanded] expert ids
     int* __restrict__ sorted_token_ids,              // [total_expanded] → original token index
@@ -256,8 +278,8 @@ extern "C" __global__ void moe_sort_by_expert(
     __shared__ unsigned int counts[1024];
     __shared__ unsigned int offsets[1025];
 
-    // Clear counts
-    for (unsigned int i = threadIdx.x; i < num_experts; i += blockDim.x)
+    // Clear counts, the dead-row bucket `num_experts` too (moe_route_mask_rows).
+    for (unsigned int i = threadIdx.x; i <= num_experts; i += blockDim.x)
         counts[i] = 0;
     __syncthreads();
 
@@ -277,7 +299,7 @@ extern "C" __global__ void moe_sort_by_expert(
     __syncthreads();
 
     // Phase 3: reset counts for scatter
-    for (unsigned int i = threadIdx.x; i < num_experts; i += blockDim.x)
+    for (unsigned int i = threadIdx.x; i <= num_experts; i += blockDim.x)
         counts[i] = 0;
     __syncthreads();
 
@@ -387,43 +409,40 @@ extern "C" __global__ void moe_unpermute_reduce_indexed_ep_vec8(
     unsigned int local_expert_end
 ) {
     atlas_pdl_enter();
-    constexpr unsigned int MAX_TOPK = 8;
-    const unsigned int token = blockIdx.x;
-    if (token >= num_tokens) return;
-    // The token's routes in slot order, each live if local. Every index is
-    // a compile-time slot, so the arrays stay in registers.
-    unsigned int rows[MAX_TOPK];
-    float weights[MAX_TOPK];
-    bool live[MAX_TOPK];
-    #pragma unroll
-    for (unsigned int k = 0; k < MAX_TOPK; k++) {
-        const unsigned int slot = token * topk + k;
-        const int expert = k < topk ? topk_ids[slot] : -1;
-        live[k] = k < topk && expert >= (int)local_expert_start && expert < (int)local_expert_end;
-        rows[k] = live[k] ? (unsigned int)token_to_perm[slot] : 0u;
-        weights[k] = live[k] ? topk_weights[slot] : 0.0f;
+    // A token a block; a grid shorter than the tokens strides over them (a
+    // capped grid leaves SMs to a concurrent exchange), each token the same.
+    for (unsigned int token = blockIdx.x; token < num_tokens; token += gridDim.x) {
+        const glm_unpermute::Routes r = glm_unpermute::load_routes(
+            token, token_to_perm, topk_ids, topk_weights, topk, local_expert_start, local_expert_end);
+        glm_unpermute::row_vec8<false>(r, expert_output, &output[token * hidden_size], hidden_size);
     }
-    for (unsigned int c = threadIdx.x * 8; c < hidden_size; c += blockDim.x * 8) {
-        uint4 raw[MAX_TOPK];
-        #pragma unroll
-        for (unsigned int i = 0; i < MAX_TOPK; i++)
-            if (live[i]) raw[i] = *(const uint4*)&expert_output[rows[i] * hidden_size + c];
-        float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-        #pragma unroll
-        for (unsigned int i = 0; i < MAX_TOPK; i++) {
-            if (!live[i]) continue;
-            const __nv_bfloat16* v = reinterpret_cast<const __nv_bfloat16*>(&raw[i]);
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                const float value = __bfloat162float(v[j]);
-                acc[j] += weights[i] * value;
-            }
-        }
-        uint4 out;
-        __nv_bfloat16* o = reinterpret_cast<__nv_bfloat16*>(&out);
-        #pragma unroll
-        for (int j = 0; j < 8; j++) o[j] = __float2bfloat16(acc[j]);
-        *(uint4*)&output[token * hidden_size + c] = out;
+}
+
+// moe_unpermute_reduce_indexed_ep_vec8 over the E4M3 down rows of the K128W
+// `_e4m3` grids (ATLAS_GLM_MOE_DOWN_E4M3): expert_output holds E4M3 bytes
+// [rows, hidden] and scales [rows, hidden/64] FP32; each route's value is
+// scale * E4M3, summed in slot order as the BF16 kernel sums. Its blocks
+// stride over the tokens as the BF16 kernel's do.
+// Grid: (<= num_tokens, 1, 1)  Block: (256, 1, 1); hidden_size % 64 == 0,
+// topk <= 8.
+extern "C" __global__ void moe_unpermute_reduce_indexed_ep_vec8_e4m3(
+    const unsigned char* __restrict__ expert_output,
+    __nv_bfloat16* __restrict__ output,
+    const int* __restrict__ token_to_perm,
+    const int* __restrict__ topk_ids,
+    const float* __restrict__ topk_weights,
+    unsigned int hidden_size,
+    unsigned int num_tokens,
+    unsigned int topk,
+    unsigned int local_expert_start,
+    unsigned int local_expert_end,
+    const float* __restrict__ scales
+) {
+    atlas_pdl_enter();
+    for (unsigned int token = blockIdx.x; token < num_tokens; token += gridDim.x) {
+        const glm_unpermute::Routes r = glm_unpermute::load_routes(
+            token, token_to_perm, topk_ids, topk_weights, topk, local_expert_start, local_expert_end);
+        glm_unpermute::row_vec8_e4m3<false>(r, expert_output, scales, &output[token * hidden_size], hidden_size);
     }
 }
 
@@ -553,9 +572,10 @@ __device__ __forceinline__ void moe_sort_by_expert_scan_body(
     __shared__ unsigned int offsets[1025];
     __shared__ unsigned int warp_sums[8];
     const unsigned int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
-    if (blockDim.x != 256 || num_experts > 1024) return;
+    if (blockDim.x != 256 || num_experts >= 1024) return;
 
-    for (unsigned int i = tid; i < num_experts; i += blockDim.x)
+    // The dead-row bucket `num_experts` too (moe_route_mask_rows).
+    for (unsigned int i = tid; i <= num_experts; i += blockDim.x)
         counts[i] = 0;
     __syncthreads();
     for (unsigned int i = tid; i < total_expanded; i += blockDim.x)
@@ -592,7 +612,7 @@ __device__ __forceinline__ void moe_sort_by_expert_scan_body(
     }
     __syncthreads();
 
-    for (unsigned int i = tid; i < num_experts; i += blockDim.x)
+    for (unsigned int i = tid; i <= num_experts; i += blockDim.x)
         counts[i] = 0;
     __syncthreads();
     for (unsigned int i = tid; i < total_expanded; i += blockDim.x) {

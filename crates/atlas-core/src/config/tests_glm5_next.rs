@@ -51,6 +51,8 @@ fn nvidia_checkpoint_maps_hybrid_kda_mla_moe_shape() {
     assert_eq!(cfg.shared_expert_intermediate_size, 2048);
     assert_eq!(cfg.scoring_func, "sigmoid");
     assert!(cfg.use_routing_bias);
+    assert!(cfg.router_logits_f32);
+    assert_eq!(cfg.router_logit_bytes(), 4);
     assert_eq!(cfg.mlp_only_layers, vec![0, 1, 2]);
 
     // mHC and the k-pool semantic indexer.
@@ -86,6 +88,19 @@ fn layer_types_follow_the_checkpoint_not_a_fixed_period() {
         };
         assert_eq!(cfg.layer_type(layer), expected, "layer {layer}");
     }
+}
+
+#[test]
+fn router_logits_are_float32_and_nothing_else() {
+    let json = text_config_with(|t| {
+        t.remove("moe_router_dtype");
+    });
+    assert!(parse_config(&json).unwrap().router_logits_f32);
+    let json = text_config_with(|t| {
+        t["moe_router_dtype"] = "bfloat16".into();
+    });
+    let err = parse_config(&json).unwrap_err().to_string();
+    assert!(err.contains("moe_router_dtype"), "{err}");
 }
 
 #[test]

@@ -346,6 +346,36 @@ pub fn bf16_gemm_act_weight_t(
     }
 }
 
+/// [`bf16_gemm_act_weight_t`] with an FP32 `out[M,N]`: the FP32 accumulator
+/// unrounded (GLM-5's `moe_router_dtype: float32` router logits, the
+/// reference's `torch.mm(x, w.T, out_dtype=float32)`). No BF16 fallback.
+pub fn bf16_gemm_act_weight_t_f32out(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    let pick = if kchain_pin::applies(m, n, true) {
+        kchain_pin::Pick::Pin
+    } else {
+        kchain_pin::Pick::First
+    };
+    gemm_bf16::gemm_bf16_pick(
+        act,
+        weight,
+        out,
+        [m, n, k],
+        CUBLAS_OP_T,
+        pick,
+        CUDA_R_32F,
+        stream,
+    )
+    .map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

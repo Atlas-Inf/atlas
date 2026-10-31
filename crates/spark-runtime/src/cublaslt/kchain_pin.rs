@@ -181,6 +181,7 @@ pub fn bf16_gemm_act_weight_t_kchain(
         [m, n, k],
         super::CUBLAS_OP_T,
         Pick::Force,
+        super::CUDA_R_16BF,
         stream,
     )
 }
@@ -207,6 +208,7 @@ pub fn bf16_gemm_act_weight_t_kchain_any(
         [m, n, k],
         super::CUBLAS_OP_T,
         Pick::Force,
+        super::CUDA_R_16BF,
         stream,
     )
 }

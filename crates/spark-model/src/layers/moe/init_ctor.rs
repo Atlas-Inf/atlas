@@ -51,6 +51,9 @@ impl MoeLayer {
             weights.correction_bias.map(|dw| dw.weight);
 
         let _ = num_experts;
+        let router_f32 = init_router::resolve(config.router_logits_f32, gate_nvfp4.is_none())?;
+        let dense_gemv = gpu.kernel("gemv", "dense_gemv_bf16")?;
+        let dense_gemm = gpu.kernel("gemm", "dense_gemm_bf16")?;
         // Resolve the gfx1151 F16-operand twins + whether both resolved; the
         // forward engages them via the n128 launchers when `moe_f16_prefill` holds.
         let (moe_grouped_gemm_t, moe_fused_gate_up_t, moe_f16_prefill) =
@@ -72,7 +75,7 @@ impl MoeLayer {
             gate_nvfp4,
             pre_expert_norm: None,
             pre_expert_norm_k: rms_norm_k,
-            dense_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
+            dense_gemv,
             dense_gemv_batchm: super::init_optional::router_gemv_batchm(gpu, config),
             row_invariant_bf16_router: false,
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
@@ -82,17 +85,36 @@ impl MoeLayer {
             // target ships it; every other target keeps `w4a16_gemm`. See
             // layers/ops/strix_s64.rs.
             w4a16_gemm: crate::layers::ops::w4a16_gemm_kernel(gpu)?,
-            dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
-            dense_gemm_router: super::super::try_kernel(gpu, "gemm", "dense_gemm_bf16_router"),
+            dense_gemm,
+            router_f32,
+            router_gemv: if router_f32 {
+                gpu.kernel("gemv", "dense_gemv_bf16_fp32out")?
+            } else {
+                dense_gemv
+            },
+            router_gemm: if router_f32 {
+                gpu.kernel("gemm", "dense_gemm_bf16_f32out")?
+            } else {
+                dense_gemm
+            },
+            dense_gemm_router: super::super::try_kernel(
+                gpu,
+                "gemm",
+                if router_f32 {
+                    "dense_gemm_bf16_router_f32out"
+                } else {
+                    "dense_gemm_bf16_router"
+                },
+            ),
             router_prefill_bn32: router_prefill_bn32::resolve(config, gpu)?,
             dense_gemm_router_m5: super::super::try_kernel_gated(
-                config.model_type == "glm5_next",
+                router_f32 && config.model_type == "glm5_next",
                 gpu,
                 "gemm",
                 "dense_gemm_bf16_router_m5",
             ),
             dense_gemm_router_rows: super::super::try_kernel_gated(
-                config.model_type == "glm5_next",
+                router_f32 && config.model_type == "glm5_next",
                 gpu,
                 "gemm",
                 "dense_gemm_bf16_router_rows",
@@ -463,11 +485,15 @@ impl MoeLayer {
             // softmax-MoE model startup (observed on Qwen3.5-35B-A3B-FP8 in
             // alpha-2.43: "Module 'moe_topk_sig' not loaded" during model
             // build).
-            moe_topk_sigmoid_k: super::super::try_kernel(gpu, "moe_topk_sig", "moe_topk_sigmoid"),
+            moe_topk_sigmoid_k: super::super::try_kernel(
+                gpu,
+                "moe_topk_sig",
+                &init_router::kernel_name(router_f32, "moe_topk_sigmoid"),
+            ),
             moe_topk_sigmoid_batched_k: super::super::try_kernel(
                 gpu,
                 "moe_topk_sig",
-                "moe_topk_sigmoid_batched",
+                &init_router::kernel_name(router_f32, "moe_topk_sigmoid_batched"),
             ),
         };
         if crate::model::glm_independent::enabled(&config.model_type)? {

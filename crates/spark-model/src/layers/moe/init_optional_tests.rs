@@ -39,6 +39,7 @@ fn lookups(gpu: &Gpu) -> Vec<String> {
 fn construct(gpu: &Gpu, model_type: &str, ep_world_size: usize) -> MoeLayer {
     let mut config = ModelConfig::qwen3_next_80b_nvfp4();
     config.model_type = model_type.into();
+    config.router_logits_f32 = model_type == "glm5_next";
     config.ep_world_size = ep_world_size;
     MoeLayer::new(
         MoeWeights::empty(config.num_experts),
