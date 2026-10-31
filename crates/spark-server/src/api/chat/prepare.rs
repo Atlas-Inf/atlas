@@ -148,7 +148,7 @@ pub(crate) fn prepare_chat_prompt(
     // A call that keeps returning the same result gets a notice on its
     // latest result and one turn of deeper thinking, instead of having
     // `<tool_call>` masked (see `loop_detect::check_loops`).
-    let repeat_run = if tools_active {
+    let repeat_run = if tools_active && !state.chat.verbatim_prompt {
         crate::hint_injector::identical_tool_round_run(&req.messages)
     } else {
         0
