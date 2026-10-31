@@ -11,7 +11,7 @@ use axum::response::Response;
 use std::sync::Arc;
 
 use crate::AppState;
-use crate::tokenizer::Glm5VisionPlaceholder;
+use crate::tokenizer::{Glm5VisionPlaceholder, QwenVisionPlaceholder};
 
 use super::super::compact::{compact_messages, openai_error_response};
 use super::msg_entry::MsgEntry;
@@ -33,6 +33,7 @@ pub(super) fn render_template(
     messages: &[MsgEntry],
     image_pad_counts: &[usize],
     vision_placeholders: &[Glm5VisionPlaceholder],
+    qwen_vision_placeholders: &[QwenVisionPlaceholder],
     enable_thinking: bool,
     thinking_budget: Option<u32>,
     reasoning_effort: Option<crate::ir::ReasoningEffort>,
@@ -160,6 +161,19 @@ pub(super) fn render_template(
                 ));
             }
         }
+    } else if !qwen_vision_placeholders.is_empty() {
+        match state
+            .tokenizer
+            .expand_qwen_vision_placeholders(prompt_tokens, qwen_vision_placeholders)
+        {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                return Err(openai_error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("Qwen vision placeholder error: {e}"),
+                ));
+            }
+        }
     } else if image_pad_counts.iter().any(|&c| c > 1) {
         state
             .tokenizer
@@ -183,43 +197,9 @@ pub(super) fn render_template(
         thinking_budget,
     })
 }
-
-fn reconcile_prompt_thinking(
-    prompt_tokens: &[u32],
-    think_start_token_id: Option<u32>,
-    think_end_token_id: Option<u32>,
-    enable_thinking: bool,
-    thinking_budget: Option<u32>,
-    max_thinking_budget: u32,
-) -> (bool, Option<u32>) {
-    if let Some(think_start) = think_start_token_id {
-        // An explicit empty reasoning suffix has already closed thinking before
-        // generation (GLM tools). Do not mistake a historical pair followed by
-        // another assistant header or prompt text for this terminal boundary.
-        if think_end_token_id.is_some_and(|end| prompt_tokens.ends_with(&[think_start, end])) {
-            return (false, None);
-        }
-        let tail = &prompt_tokens[prompt_tokens.len().saturating_sub(8)..];
-        let last_start = tail.iter().rposition(|t| *t == think_start);
-        let has_unclosed_think = match (last_start, think_end_token_id) {
-            (Some(si), Some(end_tok)) => !tail[si + 1..].contains(&end_tok),
-            (Some(_), None) => true,
-            (None, _) => false,
-        };
-        if has_unclosed_think && !enable_thinking {
-            tracing::info!(
-                "Template-forced thinking detected (unclosed \\<think\\> in prompt tail) — \
-                 overriding enable_thinking=true with budget={}",
-                max_thinking_budget,
-            );
-            (true, atlas_kernels::thinking_ceiling(max_thinking_budget))
-        } else {
-            (enable_thinking, thinking_budget)
-        }
-    } else {
-        (enable_thinking, thinking_budget)
-    }
-}
+#[path = "template/reconcile.rs"]
+mod reconcile;
+use reconcile::reconcile_prompt_thinking;
 
 #[cfg(test)]
 #[path = "template_thinking_tests.rs"]
@@ -364,8 +344,7 @@ mod json_message_tests {
             text_msg(Role::User, "thanks"),
         ];
 
-        let out = super::super::msg_entry::build_msg_entries(
-            crate::api::chat::vision_admit::AdmitCtx::default(),
+        let out = super::super::msg_entry::build_msg_entries_admitted(
             None,
             None,
             &crate::api::chat::remote_image::RemoteImagePolicy::default(),
@@ -380,6 +359,7 @@ mod json_message_tests {
             true,
             &crate::api::chat::levers::ChatLevers::OFF,
             false,
+            crate::api::chat::vision_admit::AdmitCtx::default(),
         )
         .expect("fixture builds");
         assert_eq!(out.cwd_hint.as_deref(), Some("/tmp/proj"));

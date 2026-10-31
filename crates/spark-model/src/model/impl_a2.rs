@@ -500,7 +500,9 @@ impl TransformerModel {
         let stream = self.gpu.default_stream();
 
         match cmd {
-            super::vision_transport::EP_CMD_VISION_STATE => self.ep_worker_recv_vision_state()?,
+            super::vision_transport::EP_CMD_VISION_STATE => {
+                self.ep_worker_recv_vision_state(seq)?
+            }
             super::glm_long_verify::EP_CMD_GLM_LONG_TAIL => self.glm_long_receive_tail(seq)?,
             0xFFFFFFF6 => self.ep_worker_set_native_fence(seq)?,
             crate::traits::EP_CMD_PC_PLANT => self.pc_plant_receive(seq)?,

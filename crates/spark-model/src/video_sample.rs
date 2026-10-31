@@ -25,13 +25,9 @@
 
 use anyhow::{Result, ensure};
 
-/// Refuse to build a `select` filter with more clauses than this.
-///
-/// The bound exists because the clauses are handed to ffmpeg as ONE argv
-/// element: a container that declares an absurd duration must fail with a
-/// message about the container rather than build a megabyte-long argument.
-/// Well above the 768 the checkpoint's `video_processor` declares.
-pub const MAX_SAMPLE_PLAN: usize = 4_096;
+/// Bound the host-side timestamp vector and downstream frame work. The
+/// FFmpeg timestamp filter itself is constant-size even for hour-long clips.
+pub const MAX_SAMPLE_PLAN: usize = 16_384;
 
 /// What to decode, and when each returned frame sits in the source clip.
 #[derive(Debug, Clone, PartialEq)]

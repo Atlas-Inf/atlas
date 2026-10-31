@@ -11,6 +11,7 @@ use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::super::types::TransformerModel;
+use crate::request_local::request_local;
 use crate::traits::SequenceState;
 
 pub(in crate::model) struct MetaLayout {
@@ -107,26 +108,22 @@ impl TransformerModel {
             // Build (T, H, W) streams matching HF Qwen3-VL's
             // `get_rope_index`/`get_vision_position_ids`:
             //   - text token: T = H = W = current_pos, increment current_pos by 1.
-            //   - vision-pad run (item of t_len groups over a post-merge grid
-            //     gh×gw, at base = current_pos): token k of group g gets
-            //       T = base + g, H = base + k/gw, W = base + k%gw.
-            //     After the run, current_pos += max(t_len, gh, gw).
-            // This matters because Qwen3-VL/3.6 was trained with T constant
-            // across one image and subsequent text tokens shifted by the
-            // image's max spatial extent — Atlas's previous "T=linear over
-            // all tokens" scheme produced out-of-distribution position IDs
-            // for every post-image token.
-            //
-            // An IMAGE is the t_len = 1 case: `base + g` collapses to `base`,
-            // and `max(1, gh, gw)` to `max(gh, gw)`, so the arithmetic below
-            // is byte-identical to the image-only version it replaces. A
-            // VIDEO is where the two diverge — its T advances once per
-            // temporal group, which is the whole reason the run cannot be
-            // treated as t_len separate images.
+            //   - image pad run: T is constant, H/W are the post-merge
+            //     row/column streams, and current_pos advances by the long
+            //     spatial side.
+            //   - Qwen3.8 video pad planes are one timestamp-separated
+            //     `grid_t=1` range each, so the walker resets T/H/W at every
+            //     plane while timestamps and marker boundaries move current_pos
+            //     as ordinary text.
+            // This matters because Qwen3-VL/3.6/3.8 was trained with
+            // structured 3-D positions, not a linear position over the entire
+            // multimodal prompt.
             if use_mrope {
                 stg.positions_h.clear();
                 stg.positions_w.clear();
-                let grids = self.vision_image_grids.lock().clone();
+                // Per-sequence grids: this request's items only (the model
+                // holds no vision state between requests).
+                let grids = seq.vision.grids.clone();
                 // Both pad tokens: consumed identically here — the item's
                 // t_len already says which it is — but the scan has to
                 // recognize both, or a video run would be walked one text
@@ -134,79 +131,44 @@ impl TransformerModel {
                 let (pad_id, video_pad_id) = self.vision_pad_ids();
                 let is_pad = |tok: u32| tok == pad_id || tok == video_pad_id;
                 let chunk_tokens = &tokens[chunk_start..chunk_start + chunk_len];
-                let glm_vision = self.config.vision.as_ref().filter(|v| v.is_glm5_next);
+
+                // Both walkers build against the prompt from position 0 and
+                // slice the processed range: text after an image keeps the
+                // image's compressed position base in every later chunk, an
+                // item straddling a chunk boundary keeps its plane, and a
+                // later chunk's item takes its own grid. (A chunk-local walk
+                // restarted each chunk at the linear position and at item 0.)
+                // GLM's expanded video and Qwen3.8's timestamped video both
+                // have structural text tokens between frame planes, which
+                // only the complete prompt shows.
+                let end = proc_start
+                    .checked_add(proc_count)
+                    .filter(|&end| end <= tokens.len())
+                    .ok_or_else(|| request_local("MRoPE position range exceeds the prompt"))?;
                 let qwen3vl = self
                     .config
                     .vision
                     .as_ref()
                     .is_some_and(|v| v.is_qwen3vl_video);
-                // GLM's expanded video has structural text tokens between
-                // frame planes, and post-media text inherits the compressed
-                // position base. Build against the complete prompt and slice
-                // the processed range below; looking only at this chunk loses
-                // the active video frame at a chunk boundary.
-                let have_vision = !grids.is_empty()
-                    && if glm_vision.is_some() || qwen3vl {
-                        tokens.iter().copied().any(is_pad)
-                    } else {
-                        chunk_tokens.iter().copied().any(is_pad)
-                    };
+                let have_vision = !grids.is_empty() && tokens[..end].iter().copied().any(is_pad);
 
                 if have_vision {
                     stg.positions.clear();
                     // Co-dispatch: this request owns grids[grid_base .. grid_base+owned]
-                    // of the shared packed vision_image_grids (0/all for legacy).
-                    let grid_base = *self.vision_grid_base.lock();
-                    let owned = *self.vision_owned_images.lock();
+                    // of the shared packed vision_grids (0/all for legacy).
+                    let grid_base = seq.vision.grid_base;
+                    let owned = seq.vision.owned_images;
                     let grid_hi = if owned > 0 {
                         (grid_base + owned).min(grids.len())
                     } else {
                         grids.len()
                     };
-                    if let Some(v) = glm_vision {
-                        // GLM-5 expands a video into per-frame image markers
-                        // and timestamp text. The generic contiguous-pad
-                        // walker would skip the boundary/timestamp tokens and
-                        // assign the following image to the wrong grid.
-                        let (mut full_t, mut full_h, mut full_w) =
-                            (Vec::new(), Vec::new(), Vec::new());
-                        mrope_pos::build_glm5(
-                            tokens,
-                            &grids,
-                            grid_base,
-                            grid_hi,
-                            0,
-                            v.image_start_token_id,
-                            v.image_end_token_id,
-                            v.video_start_token_id,
-                            v.video_end_token_id,
-                            pad_id,
-                            video_pad_id,
-                            &mut full_t,
-                            &mut full_h,
-                            &mut full_w,
-                        );
-                        let end = proc_start.checked_add(proc_count).ok_or_else(|| {
-                            anyhow::anyhow!("GLM-5 MRoPE position range overflow")
-                        })?;
-                        if end > full_t.len() || end > full_h.len() || end > full_w.len() {
-                            anyhow::bail!(
-                                "GLM-5 MRoPE position range {}..{} exceeds prompt length {}",
-                                proc_start,
-                                end,
-                                full_t.len()
-                            );
-                        }
-                        stg.positions.extend_from_slice(&full_t[proc_start..end]);
-                        stg.positions_h.extend_from_slice(&full_h[proc_start..end]);
-                        stg.positions_w.extend_from_slice(&full_w[proc_start..end]);
-                    } else if qwen3vl {
+                    if qwen3vl {
                         // Qwen3-VL's nested per-group form has timestamp and
                         // boundary text between the t=1 group planes — the
                         // same chunk-boundary hazard as GLM-5, so the walk
                         // runs over the complete prompt and slices.
-                        let (mut full_t, mut full_h, mut full_w) =
-                            (Vec::new(), Vec::new(), Vec::new());
+                        let (mut t, mut h, mut w) = (Vec::new(), Vec::new(), Vec::new());
                         mrope_pos::build_qwen3vl(
                             tokens,
                             &grids,
@@ -215,24 +177,24 @@ impl TransformerModel {
                             0,
                             pad_id,
                             video_pad_id,
-                            &mut full_t,
-                            &mut full_h,
-                            &mut full_w,
+                            &mut t,
+                            &mut h,
+                            &mut w,
                         );
                         let end = proc_start.checked_add(proc_count).ok_or_else(|| {
                             anyhow::anyhow!("Qwen3-VL MRoPE position range overflow")
                         })?;
-                        if end > full_t.len() || end > full_h.len() || end > full_w.len() {
+                        if end > t.len() || end > h.len() || end > w.len() {
                             anyhow::bail!(
                                 "Qwen3-VL MRoPE position range {}..{} exceeds prompt length {}",
                                 proc_start,
                                 end,
-                                full_t.len()
+                                t.len()
                             );
                         }
-                        stg.positions.extend_from_slice(&full_t[proc_start..end]);
-                        stg.positions_h.extend_from_slice(&full_h[proc_start..end]);
-                        stg.positions_w.extend_from_slice(&full_w[proc_start..end]);
+                        stg.positions.extend_from_slice(&t[proc_start..end]);
+                        stg.positions_h.extend_from_slice(&h[proc_start..end]);
+                        stg.positions_w.extend_from_slice(&w[proc_start..end]);
                     } else {
                         let current_pos: u32 = proc_start as u32;
                         mrope_pos::build(

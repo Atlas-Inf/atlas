@@ -5,6 +5,8 @@ use crate::ir::{
     MediaKind,
     message::{ContentPart, ImageData, ImageSource, Message, Role, VideoSource},
 };
+use crate::tokenizer::QwenVisionKind;
+use spark_model::vision_preprocess::fixtures::{header_only_png, png, qwen_config, short_gif};
 
 fn limits(request_rows: usize) -> VisionRowLimits {
     VisionRowLimits::resolve(
@@ -200,4 +202,207 @@ fn a_request_that_can_never_fit_is_a_400_even_when_the_budget_is_spent() {
         a.note(4096).unwrap();
     }
     assert_eq!(a.note(296).err().unwrap().status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn the_item_count_is_checked_before_any_url_is_fetched() {
+    // One more than the protocol's image-item limit: refused for their count,
+    // before any URL is resolved
+    // (here fetching is off, which would have answered "not fetched").
+    let l = limits(usize::MAX);
+    let parts: Vec<ContentPart> = (0..=MAX_VISION_ITEMS)
+        .map(|i| {
+            ContentPart::Image(ImageSource {
+                data: ImageData::Url(format!("http://127.0.0.1/{i}.png")),
+            })
+        })
+        .collect();
+    let resp = build_parts(parts, admit(&l, None)).err().unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body(resp).await["error"]["code"], VISION_TOO_LARGE_CODE);
+}
+
+#[allow(clippy::result_large_err)]
+fn build(
+    uris: &[String],
+    ctx: AdmitCtx<'_>,
+) -> Result<super::super::msg_entry::BuildOut, Response> {
+    let parts = uris
+        .iter()
+        .map(|u| {
+            ContentPart::Image(ImageSource {
+                data: ImageData::Base64(u.clone()),
+            })
+        })
+        .collect();
+    build_parts(parts, ctx)
+}
+
+#[allow(clippy::result_large_err)]
+fn build_parts(
+    mut parts: Vec<ContentPart>,
+    ctx: AdmitCtx<'_>,
+) -> Result<super::super::msg_entry::BuildOut, Response> {
+    parts.push(ContentPart::Text("describe".into()));
+    let msg = Message {
+        role: Role::User,
+        content: parts,
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        name: None,
+        reasoning: None,
+        tool_error: false,
+    };
+    let mut vcfg = qwen_config();
+    vcfg.max_pixels = Some(16_777_216);
+    super::super::msg_entry::build_msg_entries_admitted(
+        Some(&vcfg),
+        Some(16_777_216),
+        &crate::api::chat::remote_image::RemoteImagePolicy::default(),
+        &crate::api::chat::msg_entry::VideoDecode {
+            ffmpeg: &spark_model::video_decode_ffmpeg::FfmpegPolicy {
+                enabled: false,
+                ..Default::default()
+            },
+            fps: 2.0,
+        },
+        &[msg],
+        false,
+        &crate::api::chat::levers::ChatLevers::OFF,
+        false,
+        ctx,
+    )
+}
+
+#[tokio::test]
+async fn legacy_qwen_short_gif_is_admitted_from_actual_rows() {
+    // The legacy profile has no checkpoint video-pixel bound, so admission
+    // must not reject this small clip using the opaque-video worst-case
+    // ceiling.  The 64-row request limit is below that ceiling by orders of
+    // magnitude, but above the clip's actual two temporal groups (8 rows).
+    let out = match build_parts(vec![video(short_gif())], admit(&limits(64), None)) {
+        Ok(out) => out,
+        Err(resp) => panic!("short legacy GIF should be admitted: {}", body(resp).await),
+    };
+
+    assert_eq!(out.image_pixels.len(), 2, "one VisionItem per Qwen group");
+    assert!(out.image_pixels.iter().all(|item| item.t_len() == 1));
+    assert_eq!(out.image_pad_counts, vec![8]);
+    assert_eq!(out.qwen_vision_placeholders.len(), 1);
+    let placeholder = &out.qwen_vision_placeholders[0];
+    assert_eq!(placeholder.kind, QwenVisionKind::Video);
+    assert_eq!(placeholder.pad_count, 8);
+    assert_eq!(placeholder.per_frame_pad_count, 4);
+    assert_eq!(placeholder.timestamps, vec![0.25, 1.25]);
+}
+
+#[tokio::test]
+async fn mixed_image_video_image_keeps_temporal_groups_aligned() {
+    let out = match build_parts(
+        vec![
+            ContentPart::Image(ImageSource {
+                data: ImageData::Base64(png(64, 64)),
+            }),
+            video(short_gif()),
+            ContentPart::Image(ImageSource {
+                data: ImageData::Base64(png(64, 64)),
+            }),
+        ],
+        admit(&limits(64), None),
+    ) {
+        Ok(out) => out,
+        Err(resp) => panic!("mixed media should be admitted: {}", body(resp).await),
+    };
+
+    // The video occupies two encoder items after temporal splitting, while
+    // its one prompt marker remains between the two still-image markers.
+    assert_eq!(out.image_pixels.len(), 4);
+    assert_eq!(
+        out.image_pixels
+            .iter()
+            .map(|item| item.t_len())
+            .collect::<Vec<_>>(),
+        vec![1, 1, 1, 1]
+    );
+    assert_eq!(out.image_pad_counts, vec![4, 8, 4]);
+    assert_eq!(
+        out.messages[0].media,
+        vec![MediaKind::Image, MediaKind::Video, MediaKind::Image]
+    );
+    assert_eq!(
+        out.qwen_vision_placeholders
+            .iter()
+            .map(|placeholder| placeholder.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            QwenVisionKind::Image,
+            QwenVisionKind::Video,
+            QwenVisionKind::Image
+        ]
+    );
+    assert_eq!(
+        out.qwen_vision_placeholders
+            .iter()
+            .map(|placeholder| placeholder.pad_count)
+            .collect::<Vec<_>>(),
+        vec![4, 8, 4]
+    );
+    assert_ne!(
+        out.image_pixels[1].content_hash, out.image_pixels[2].content_hash,
+        "distinct GIF frames must remain distinct after splitting"
+    );
+}
+
+#[tokio::test]
+async fn a_huge_declared_image_is_refused_from_its_header_without_decoding() {
+    // M1: a few-byte PNG declaring 8000x8000 would decode to hundreds of
+    // MiB of f32. Sized from its header (4096 vision tokens at the encoder's
+    // 2048^2 capacity), it is refused as too large; decoded, its truncated
+    // data would have failed as a decode error instead.
+    let l = limits(1000);
+    let budget = VisionRowBudget::new(65_536);
+    let t = std::time::Instant::now();
+    let resp = build(&[header_only_png(8000, 8000)], admit(&l, Some(&budget)))
+        .err()
+        .unwrap();
+    assert!(t.elapsed().as_millis() < 500, "{:?}", t.elapsed());
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = body(resp).await;
+    assert_eq!(v["error"]["code"], VISION_TOO_LARGE_CODE, "{v}");
+    assert_eq!(budget.in_use(), 0, "nothing is held after a refusal");
+}
+
+#[tokio::test]
+async fn a_spent_budget_defers_the_request_before_any_decode() {
+    // The header-only image would fail to decode: a 503 proves it was not.
+    let l = limits(usize::MAX);
+    let budget = VisionRowBudget::new(6000);
+    let held = budget.try_acquire(3000).unwrap();
+    let resp = build(&[header_only_png(8000, 8000)], admit(&l, Some(&budget)))
+        .err()
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drop(held);
+    // Admitted, its decode fails: the request's rows come back with it.
+    let resp = build(&[header_only_png(8000, 8000)], admit(&l, Some(&budget)))
+        .err()
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "decode error");
+    assert_eq!(budget.in_use(), 0);
+}
+
+#[test]
+fn an_admitted_request_holds_its_rows_until_its_items_drop() {
+    // The items travel to the scheduler and are dropped when the prefill
+    // ends (`scheduler::vision_release`); here, when the build output drops.
+    let l = limits(usize::MAX);
+    let budget = VisionRowBudget::new(65_536);
+    let out = build(&[png(640, 480), png(320, 320)], admit(&l, Some(&budget))).unwrap();
+    let rows: usize = out.image_pad_counts.iter().sum();
+    assert_eq!(rows, 300 + 100);
+    assert_eq!(budget.in_use(), rows);
+    let items = out.image_pixels;
+    assert_eq!(budget.in_use(), rows);
+    drop(items);
+    assert_eq!(budget.in_use(), 0);
 }

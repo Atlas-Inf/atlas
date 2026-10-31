@@ -346,6 +346,13 @@ pub(crate) fn maybe_run_ep_worker(
                     crate::ep_peer_lifeline::expect_peer_exit();
                     break;
                 }
+                // Every rank raised this at the same point of the same
+                // request (`spark_model::request_local`): the communicator is
+                // in step, and the head fails the request and resets this
+                // slot (0xFFFFFFF1). One bad prompt must not end the pair.
+                Err(e) if spark_model::request_local::is_request_local(&e) => {
+                    tracing::warn!("EP worker: request failed on every rank: {e:#}");
+                }
                 Err(e) => {
                     // An EP worker error may follow a failed collective.  A
                     // local break leaves the rank alive and lets the head

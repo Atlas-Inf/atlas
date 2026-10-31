@@ -18,30 +18,6 @@ use crate::layers::ops;
 use crate::traits::SequenceState;
 
 impl TransformerModel {
-    pub(in crate::model) fn prefill_b_finalize_last(
-        &self,
-        tokens: &[u32],
-        seq: &mut SequenceState,
-        kv_cache: &mut PagedKvCache,
-        chunk_start: usize,
-        chunk_len: usize,
-        proc_count: usize,
-        stream: u64,
-    ) -> Result<DevicePtr> {
-        self.prefill_b_finalize_last_at(
-            tokens,
-            seq,
-            kv_cache,
-            chunk_start,
-            chunk_len,
-            proc_count,
-            0,
-            0,
-            None,
-            stream,
-        )
-    }
-
     /// Q12 Path B: stream-offset-aware finalize for the kernel-batched
     /// orchestrator. `hidden_stream_offset_tokens` is `b * chunk_len`
     /// where `b` is the stream's index in the batched dispatch.
@@ -360,9 +336,11 @@ impl TransformerModel {
         } else if cap_applied {
             // Cap forced — never attach the full-length snapshot to a
             // truncated tree (would be unreachable + leak a pool slot).
-            if !self.tokens_have_vision_pad(cache_tokens) && !self.hss_window_slid(seq) {
+            if let Some(key) = self.pc_key(seq, cache_tokens)
+                && !self.hss_window_slid(seq)
+            {
                 let acquired = self.prefix_cache.insert(
-                    cache_tokens,
+                    &key,
                     cache_block_table,
                     cache_disk_block_ids,
                     bs,
@@ -421,14 +399,10 @@ impl TransformerModel {
                 }
             };
             if let Some(snap_id) = snap_result {
-                if self.tokens_have_vision_pad(tokens) || self.hss_window_slid(seq) {
-                    // Vision-pad: image-tainted snapshot + colliding token key.
-                    // HSS-slid: `block_table` no longer parallels the token
-                    // stream (see `hss_window_slid`). Either way we decline the
-                    // radix insert, and the snapshot is only reachable through
-                    // those nodes — so free it rather than leak a pool slot.
-                    self.ssm_snapshots.free(snap_id);
-                } else {
+                let key = self
+                    .pc_key(seq, tokens)
+                    .filter(|_| !self.hss_window_slid(seq));
+                if let Some(key) = key {
                     tracing::info!(
                         "Saved SSM snapshot {} for {} tokens ({} blocks) [chunk]",
                         snap_id,
@@ -455,7 +429,7 @@ impl TransformerModel {
                     self.ssm_snapshots
                         .save_hidden(snap_id, normed, self.gpu.as_ref(), stream)?;
                     let (displaced, acquired) = self.prefix_cache.insert_with_snapshot(
-                        tokens,
+                        &key,
                         &seq.block_table,
                         &seq.disk_block_ids,
                         bs,
@@ -468,10 +442,21 @@ impl TransformerModel {
                     if let Some(old) = displaced {
                         self.ssm_snapshots.free(old);
                     }
+                } else {
+                    // A placeholder the content key does not cover (an
+                    // image-tainted snapshot under a colliding key), or HSS
+                    // slid (`block_table` no longer parallels the token
+                    // stream, see `hss_window_slid`): either way we decline
+                    // the radix insert, and the snapshot is only reachable
+                    // through those nodes — so free it rather than leak a
+                    // pool slot.
+                    self.ssm_snapshots.free(snap_id);
                 }
-            } else if !self.tokens_have_vision_pad(tokens) && !self.hss_window_slid(seq) {
+            } else if let Some(key) = self.pc_key(seq, tokens)
+                && !self.hss_window_slid(seq)
+            {
                 let acquired = self.prefix_cache.insert(
-                    tokens,
+                    &key,
                     &seq.block_table,
                     &seq.disk_block_ids,
                     bs,
@@ -480,9 +465,11 @@ impl TransformerModel {
                 );
                 super::super::super::block_mgmt::cache_acquires_refs(&acquired, kv_cache);
             }
-        } else if !self.tokens_have_vision_pad(tokens) && !self.hss_window_slid(seq) {
+        } else if let Some(key) = self.pc_key(seq, tokens)
+            && !self.hss_window_slid(seq)
+        {
             let acquired = self.prefix_cache.insert(
-                tokens,
+                &key,
                 &seq.block_table,
                 &seq.disk_block_ids,
                 bs,
@@ -498,3 +485,6 @@ impl TransformerModel {
         Ok(logits_ptr)
     }
 }
+
+#[path = "finalize_last/wrapper.rs"]
+mod wrapper;
