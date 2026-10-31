@@ -69,6 +69,13 @@ pub struct GrammarState {
     /// The strict grammar's response opens inside `<think>`, so the first
     /// sampled token is reasoning and must not be masked or consumed.
     opens_in_thinking: bool,
+    /// Native tool token forbidden during a deferred required-tool preamble.
+    first_token_suppress: Option<u32>,
+    /// GLM's native tool opener, which ends reasoning without a `</think>`
+    /// and is itself the first output token. Set for a union grammar
+    /// (`GrammarSpec::ToolCallOrJson`), whose matcher must see it; `None`
+    /// elsewhere.
+    native_opener: Option<u32>,
     /// A tool-call-or-JSON union's answer (JSON) branch first-token mask: the
     /// branch is chosen by mass at the first output token (`grammar::branch`).
     /// (GLM `native_opener` is #199 infra — dropped for main.)
@@ -134,6 +141,8 @@ impl GrammarState {
             bitmask_fill_result: false,
             strict: false,
             opens_in_thinking: false,
+            first_token_suppress: None,
+            native_opener: None,
             answer_start: None,
         })
     }
@@ -159,11 +168,39 @@ impl GrammarState {
         self
     }
 
+    /// A required tool grammar for a model with an explicit think-end starts
+    /// after reasoning, just like its decode-step mask. This does not change
+    /// the existing tool grammar's refusal policy.
+    pub fn defer_first_token(mut self, tool_opener: Option<u32>) -> Self {
+        self.opens_in_thinking = true;
+        self.first_token_suppress = tool_opener;
+        self
+    }
+
+    /// Match the decode-time tool-opener mask during required-tool reasoning.
+    pub fn first_token_suppress(&self) -> Option<u32> {
+        self.first_token_suppress
+    }
+
     /// Register a union's answer-branch first-token mask (`answer_start`).
     #[must_use]
     pub fn with_answer_start(mut self, answer_start: Box<[i32]>) -> Self {
         self.answer_start = Some(answer_start);
         self
+    }
+
+    /// Set this grammar's native opener (the token that ends reasoning and
+    /// is itself the first output token). Union grammars only.
+    #[must_use]
+    pub fn with_native_opener(mut self, native_opener: Option<u32>) -> Self {
+        self.native_opener = native_opener;
+        self
+    }
+
+    /// Whether `tok`, emitted inside `<think>`, ends the reasoning and is the
+    /// grammar's first output token (the native tool opener).
+    pub fn opens_output(&self, tok: u32) -> bool {
+        self.native_opener == Some(tok)
     }
 
     /// A union's first output token is still to choose its branch.
@@ -197,7 +234,7 @@ impl GrammarState {
     /// other path. Tool grammars keep masking it (GLM can open a tool call
     /// as its first token, which implicitly ends thinking).
     pub fn masks_first_token(&self) -> bool {
-        !(self.strict && self.opens_in_thinking)
+        !self.opens_in_thinking
     }
 
     /// Fill the allowed-token bitmask for the next decode step.

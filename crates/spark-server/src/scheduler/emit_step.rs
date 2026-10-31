@@ -489,12 +489,28 @@ pub fn compile_grammar_state(
     grammar_spec: &Option<GrammarSpec>,
     eos_tokens: &[u32],
     opens_in_thinking: bool,
+    native_opener: Option<u32>,
+    tool_call_start_token: Option<u32>,
     sink: &mut ResponseSink,
 ) -> Result<Option<GrammarState>> {
     let Some(spec) = grammar_spec.as_ref() else {
         return Ok(None);
     };
     let strict = spec.is_response_format();
+    // Required tool grammars must not force their opener into an explicit
+    // reasoning preamble. Later decode already leaves thinking unmasked.
+    // GLM's native opener can end thinking and retains its existing path.
+    let defer_required_tool = opens_in_thinking
+        && native_opener.is_none()
+        && matches!(
+            spec,
+            GrammarSpec::ToolCall {
+                use_triggers: false,
+                ..
+            }
+        );
+    let native_opener =
+        native_opener.filter(|_| matches!(spec, GrammarSpec::ToolCallOrJson { .. }));
     let compiled = match engine.as_mut() {
         // Backstop: nothing a client sends may unwind the scheduler thread.
         Some(engine) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -505,7 +521,13 @@ pub fn compile_grammar_state(
         None => Ok(None),
     };
     match compiled {
-        Ok(state) if strict => Ok(state.map(|s| s.strict_output(opens_in_thinking))),
+        Ok(state) if strict => Ok(state.map(|s| {
+            s.strict_output(opens_in_thinking)
+                .with_native_opener(native_opener)
+        })),
+        Ok(state) if defer_required_tool => {
+            Ok(state.map(|s| s.defer_first_token(tool_call_start_token)))
+        }
         Ok(state) => Ok(state),
         // A request the server cannot serve as asked: HTTP 400 for a blocking
         // client, not a retryable 500. A tool grammar too large to compile is
