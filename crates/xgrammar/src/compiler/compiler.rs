@@ -215,10 +215,29 @@ impl GrammarCompiler {
     /// `GrammarCompiler::CompileGrammar(const Grammar&)` — keyed by the
     /// grammar's printed EBNF, as the C++ does.
     pub fn compile_grammar(&self, grammar: GrammarData) -> Result<CompiledGrammar, CompileError> {
+        self.compile_grammar_bounded(grammar, usize::MAX)
+    }
+
+    /// [`Self::compile_grammar`] for a grammar that embeds a JSON schema
+    /// (e.g. a union of a schema with another grammar): refused over the
+    /// [`Self::set_max_schema_grammar_bytes`] bound, as
+    /// [`Self::compile_json_schema`] is.
+    pub fn compile_schema_grammar(
+        &self,
+        grammar: GrammarData,
+    ) -> Result<CompiledGrammar, CompileError> {
+        self.compile_grammar_bounded(grammar, self.max_schema_grammar_bytes)
+    }
+
+    fn compile_grammar_bounded(
+        &self,
+        grammar: GrammarData,
+        max_grammar_bytes: usize,
+    ) -> Result<CompiledGrammar, CompileError> {
         let ebnf = crate::grammar::print_grammar(&grammar);
         let root_rule = grammar.root_rule().name.clone();
         let key = CacheKey::Ebnf { ebnf, root_rule };
-        self.get_or_compute(key, usize::MAX, || self.compile_normalized(grammar))
+        self.get_or_compute(key, max_grammar_bytes, || self.compile_normalized(grammar))
     }
 
     /// Compile the builtin "any JSON value" grammar. Port of

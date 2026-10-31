@@ -414,9 +414,13 @@ pub(crate) fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: 
     // ChatML formats only: elsewhere `user`, `assistant` and `tool` are
     // ordinary words, and GLM streams " tool" as one token, so the strip
     // deleted it from prose ("I don't have a that can ...").
-    // (GLM `role_literal_leaks` gate omitted on main: the StreamCtx field and
-    // tokenizer filter live in #199, so bare role-literal stripping is GLM
-    // infrastructure this port leaves out.)
+    if ctx.role_literal_leaks {
+        let inside_tool_call = state
+            .detector
+            .as_ref()
+            .is_some_and(|d| d.inside_tool_call());
+        strip_bare_role_literal(&mut delta, inside_tool_call);
+    }
 
     if delta.is_empty() {
         return deltas;

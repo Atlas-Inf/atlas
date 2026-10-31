@@ -39,6 +39,9 @@ pub(crate) struct PreparedChat {
     pub(crate) enable_thinking: bool,
     pub(crate) thinking_budget: Option<u32>,
     pub(crate) force_nonempty_content: bool,
+    /// Trailing run of identical tool rounds
+    /// ([`crate::hint_injector::identical_tool_round_run`]); 0 without tools.
+    pub(crate) repeat_run: usize,
 }
 
 /// Run the prompt-affecting phases against the IR envelope. Mutates
@@ -120,7 +123,7 @@ pub(crate) fn prepare_chat_prompt(
 
     // ── Phase 1: build MsgEntry vec + image preprocess + cwd ────
     let msg_entry::BuildOut {
-        messages,
+        mut messages,
         cwd_hint,
         image_pixels,
         image_pad_counts,
@@ -142,6 +145,24 @@ pub(crate) fn prepare_chat_prompt(
         &state.chat,
         state.tokenizer.uses_deepseek_v4_encoding(),
     )?;
+    // A call that keeps returning the same result gets a notice on its
+    // latest result and one turn of deeper thinking, instead of having
+    // `<tool_call>` masked (see `loop_detect::check_loops`).
+    let repeat_run = if tools_active && !state.chat.verbatim_prompt {
+        crate::hint_injector::identical_tool_round_run(&req.messages)
+    } else {
+        0
+    };
+    let repeating = repeat_run >= crate::hint_injector::REPEAT_NOTICE_MIN_RUN;
+    if repeating && let Some(last_tool) = messages.iter_mut().rev().find(|e| e.role == "tool") {
+        last_tool
+            .content
+            .push_str(&crate::hint_injector::repeat_notice(repeat_run));
+        tracing::info!(
+            repeat_run,
+            "Repeat notice appended to the latest tool result"
+        );
+    }
     let us_msg_entry = _t_phase.elapsed().as_micros();
 
     // ── Phase 1.5 + 2: thinking directive + resolution (pre-template) ─
@@ -156,8 +177,24 @@ pub(crate) fn prepare_chat_prompt(
     let gen_max =
         thinking::generation_max_tokens(req.max_tokens, tools_active, state.tool_max_tokens);
     let force_nonempty_content = req.force_nonempty_content;
-    let (enable_thinking, thinking_budget) =
+    let (enable_thinking, mut thinking_budget) =
         thinking::resolve_thinking(state, thinking_directive, gen_max as u32, tools_active);
+    // Escalate a server-chosen budget for the repeat turn (an explicit
+    // client budget stands): the xhigh rung, capped at the generation room.
+    if repeating
+        && enable_thinking
+        && !matches!(
+            thinking_directive,
+            crate::ir::ThinkingDirective::On { budget: Some(_) }
+        )
+    {
+        let deeper = state
+            .behavior
+            .max_thinking_budget
+            .saturating_mul(4)
+            .min(gen_max as u32);
+        thinking_budget = thinking_budget.map(|b| b.max(deeper));
+    }
     let reasoning_effort = effective_reasoning_effort(
         req.reasoning_effort,
         state.default_reasoning_effort,
@@ -203,6 +240,7 @@ pub(crate) fn prepare_chat_prompt(
         enable_thinking,
         thinking_budget,
         force_nonempty_content,
+        repeat_run,
     })
 }
 
