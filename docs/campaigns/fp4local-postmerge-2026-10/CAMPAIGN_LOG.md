@@ -1500,3 +1500,17 @@ merge notes will say so.
   NVFP4 and 27B NVFP4 controls. Results go on each PR, and each merges if the gate passes.
 - Qwen4 draft: job 61 Flash-Next control IDENTICAL on the draft branch; job 60's synthetic-checkpoint boot FAILED. That
   debugging is parked until after the train.
+
+## 2026-10-31 23:30 UTC — train 2026-10-31 (#284 #285 #286 #287 #290 #293 #294) gate: mixed → same-base attribution queued
+
+Job 62 (train b53c5aaf2 on main 170c3ed3a):
+- tests: spark-server 3002/0. spark-model 2000/3, all three `video_decode_ffmpeg` (#287's chain added the `enabled` gate
+  without setting it in its tests). They pass on main; a test-only fix is on the train (05185b837).
+- controls (train vs same-base main): FP4-Local IDENTICAL, Flash-Next NVFP4 IDENTICAL; 27B not run (no single-box 27B serve
+  script; coverage gap).
+- agentic 50: **47/50**, 47/50, 10.80 s/turn, 369 turns (run-1793478986972058487). Base reference 11.82 (older base).
+- BFCL ST-995: **87.54 / 85.94** (run-1793488879414911145): below the 86.92 floor. Live category −4.12 vs the older
+  b0df50185 base (live_parallel −12.5, live_multiple −3.8), non_live +1.48.
+- 0 errors.
+Not yet attributable: main has moved since b0df50185 (#279 / #282 / #283 …, and #279's own gate reported 87.54 / 86.85 on main).
+Job 63 runs main at 170c3ed3a (the train's base) with agentic 50 + BFCL. No train PR merges before that comparison.
