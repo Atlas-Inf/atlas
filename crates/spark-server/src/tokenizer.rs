@@ -122,6 +122,23 @@ pub(crate) struct Glm5VisionPlaceholder {
     pub(crate) qwen3vl: bool,
 }
 
+/// One compact Qwen vision marker after CPU preprocessing. Qwen3.8's
+/// processor expands a video marker into one timestamped vision range per
+/// temporal group; images keep the ordinary single range shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QwenVisionKind {
+    Image,
+    Video,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct QwenVisionPlaceholder {
+    pub(crate) kind: QwenVisionKind,
+    pub(crate) pad_count: usize,
+    pub(crate) per_frame_pad_count: usize,
+    pub(crate) timestamps: Vec<f32>,
+}
+
 /// Wrapper around tokenizers::DecodeStream that hides the generic parameters.
 /// O(1) per step vs O(n) for full re-decode.
 pub struct StreamingDecoder<'a> {

@@ -84,7 +84,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         num_beams,
         length_penalty,
         early_stopping,
-        image_pixels,
+        mut image_pixels,
         max_tokens,
         temperature,
         top_k,
@@ -138,12 +138,14 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
             num_beams,
             length_penalty,
             early_stopping,
-            // Every choice carries the pixels. Choices 1.. used to send none and
-            // ride on choice 0's leftover encoder rows; since the per-request
-            // vision state is cleared for a request without media (#174),
-            // they would answer about nothing (vision-fidelity
-            // `multi-choice-image`).
-            image_pixels: image_pixels.clone(),
+            // VisionItem clones share the pixel storage and in-flight permit.
+            // Keep the images present for every serial choice; move the final
+            // vector so n=1 and the last choice avoid an extra Vec clone.
+            image_pixels: if choice_idx + 1 == n {
+                std::mem::take(&mut image_pixels)
+            } else {
+                image_pixels.clone()
+            },
             max_tokens,
             min_tokens: req.min_tokens,
             ignore_eos: req.ignore_eos,
@@ -441,3 +443,135 @@ pub(crate) use tail2::*;
 #[path = "chat_blocking/tail.rs"]
 mod tail;
 pub(crate) use tail::*;
+
+/// OpenAI contract: a response ended by a client stop sequence is
+/// `finish_reason="stop"`, never `"length"`. The blocking path only
+/// detects multi-token stop strings post-hoc (the suffix strip in the
+/// caller), so this corrects exactly the "length" misreport — EOS
+/// already reports "stop", and "timeout"/"tool_calls" keep outranking a
+/// stop match (same precedence as the streaming resolver in
+/// `chat_stream::handle_done::resolve_wire_finish_reason`).
+fn stop_match_corrected(fr: ir::FinishReason, stop_matched: bool) -> ir::FinishReason {
+    if stop_matched && fr == ir::FinishReason::Length {
+        ir::FinishReason::Stop
+    } else {
+        fr
+    }
+}
+
+#[cfg(test)]
+mod stop_match_corrected_tests {
+    use super::stop_match_corrected;
+    use crate::ir::{FINISH_REASON_TIMEOUT, FinishReason};
+
+    #[test]
+    fn matched_stop_corrects_length_to_stop() {
+        assert_eq!(
+            stop_match_corrected(FinishReason::Length, true),
+            FinishReason::Stop
+        );
+    }
+
+    #[test]
+    fn everything_else_passes_through() {
+        // No match ⇒ a real budget stop stays "length".
+        assert_eq!(
+            stop_match_corrected(FinishReason::Length, false),
+            FinishReason::Length
+        );
+        // A match never rewrites tool_calls or the timeout contract.
+        assert_eq!(
+            stop_match_corrected(FinishReason::ToolCalls, true),
+            FinishReason::ToolCalls
+        );
+        assert_eq!(
+            stop_match_corrected(FinishReason::Other(FINISH_REASON_TIMEOUT.into()), true),
+            FinishReason::Other(FINISH_REASON_TIMEOUT.into())
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        extract_hoisted_tool_calls, merge_hoisted_tool_calls, output_tokens_without_stop,
+        split_at_first_think_end,
+    };
+    use crate::tool_parser::{FunctionCall, ToolCall};
+
+    fn tool_call(id: &str, city: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "get_weather".into(),
+                arguments: format!(r#"{{"city":"{city}"}}"#),
+            },
+        }
+    }
+
+    #[test]
+    fn duplicate_call_across_reasoning_and_content_is_emitted_once() {
+        let merged = merge_hoisted_tool_calls(
+            vec![tool_call("reasoning", "Boston")],
+            vec![tool_call("content", "Boston")],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "content");
+    }
+
+    #[test]
+    fn distinct_calls_across_reasoning_and_content_are_preserved() {
+        let merged = merge_hoisted_tool_calls(
+            vec![tool_call("reasoning", "Boston")],
+            vec![tool_call("content", "Seattle")],
+        );
+
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn blocking_decode_excludes_terminal_stop_token() {
+        let tokens = [10, 11, 24];
+
+        assert_eq!(output_tokens_without_stop(&tokens, "stop"), &[10, 11]);
+        assert_eq!(output_tokens_without_stop(&tokens, "length"), &tokens);
+    }
+
+    #[test]
+    fn blocking_thinking_split_uses_first_end_token() {
+        let tokens = [10, 19, 20, 19, 30];
+
+        let split = split_at_first_think_end(&tokens, 19, true);
+
+        assert_eq!(split, Some((&[10][..], &[20, 19, 30][..])));
+        assert_eq!(split_at_first_think_end(&tokens, 19, false), None);
+    }
+
+    #[test]
+    fn poolside_tool_call_in_reasoning_is_not_hoisted() {
+        let reasoning = "plan <tool_call>write_file<arg_key>path</arg_key>\
+            <arg_value>/tmp/x</arg_value></tool_call> more";
+
+        let (preserved, calls) = extract_hoisted_tool_calls(Some(reasoning), Some("poolside_v1"));
+
+        assert_eq!(preserved.as_deref(), Some(reasoning));
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn non_poolside_tool_call_in_reasoning_is_still_hoisted() {
+        let reasoning =
+            r#"plan <tool_call>{"name":"get_weather","arguments":{"city":"Boston"}}</tool_call>"#;
+
+        let (_scrubbed, calls) = extract_hoisted_tool_calls(Some(reasoning), Some("hermes"));
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+    }
+}
+
+#[cfg(test)]
+#[path = "chat_blocking_vision_tests.rs"]
+mod vision_fanout_tests;

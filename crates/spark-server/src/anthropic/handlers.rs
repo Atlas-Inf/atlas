@@ -145,12 +145,16 @@ pub async fn count_tokens(
     // rendered through the non-openai Jinja variant, so counts drifted
     // from real usage.
     let mut ir_req = crate::ir::ChatRequest::from(req);
-    // Counting must not require the vision encoder: strip image parts
+    // Counting must not require the vision encoder: strip image and video parts
     // (they contributed 0 tokens in the old count too — pad expansion
     // needs real pixel grids, which a count endpoint can't produce).
     for m in &mut ir_req.messages {
-        m.content
-            .retain(|p| !matches!(p, crate::ir::ContentPart::Image(_)));
+        m.content.retain(|p| {
+            !matches!(
+                p,
+                crate::ir::ContentPart::Image(_) | crate::ir::ContentPart::Video(_)
+            )
+        });
     }
     // Same treatment as the chat handler: the Jinja render + tokenize inside
     // `prepare_chat_prompt` is CPU-bound (measured 13 ms at 12931 prompt tokens)

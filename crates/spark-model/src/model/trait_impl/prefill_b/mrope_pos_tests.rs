@@ -122,35 +122,52 @@ fn two_images_each_advance_the_running_position() {
 
 // ── video ────────────────────────────────────────────────────────────────
 
-/// ★ The rule video exists for. Three temporal groups over a 2×2 grid: T
-/// advances once per GROUP while H and W restart each group, and the item
-/// advances the running position by max(3, 2, 2) = 3.
+/// Qwen3.8 splits a video into timestamped frame ranges. Each range has
+/// `grid_t=1`, so T starts at that range's base; the timestamp and marker
+/// boundaries advance the ordinary text position between planes.
 #[test]
-fn a_video_advances_t_once_per_temporal_group() {
+fn a_qwen_video_uses_one_mrope_range_per_timestamped_frame() {
     let tokens = [
-        TXT, VID, VID, VID, VID, VID, VID, VID, VID, VID, VID, VID, VID, TXT,
+        TXT, 8, 9, 11, VID, VID, VID, VID, 12, 8, 9, 11, VID, VID, VID, VID, 12, 8, 9, 11, VID,
+        VID, VID, VID, 12, TXT,
     ];
     let (t, h, w) = run(&tokens, &[(3, 2, 2)], 0);
 
-    // base = 1. Group g gets T = 1 + g, four tokens each.
+    // Timestamp/vision boundaries are ordinary positions. Each four-token
+    // frame plane starts at the current base and advances by max(2, 2) = 2.
     assert_eq!(
         t,
-        vec![0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4],
-        "T must step per group"
+        vec![
+            0, 1, 2, 3, 4, 4, 4, 4, 6, 7, 8, 9, 10, 10, 10, 10, 12, 13, 14, 15, 16, 16, 16, 16, 18,
+            19
+        ],
+        "T must restart at each timestamp-separated frame"
     );
-    // H and W repeat their 2x2 pattern in every group.
-    assert_eq!(h, vec![0, 1, 1, 2, 2, 1, 1, 2, 2, 1, 1, 2, 2, 4]);
-    assert_eq!(w, vec![0, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 4]);
-    // Trailing text at 1 + max(3, 2, 2) = 4.
-    assert_eq!(*t.last().unwrap(), 4);
+    assert_eq!(
+        h,
+        vec![
+            0, 1, 2, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 10, 11, 11, 12, 13, 14, 15, 16, 16, 17, 17, 18,
+            19
+        ]
+    );
+    assert_eq!(
+        w,
+        vec![
+            0, 1, 2, 3, 4, 5, 4, 5, 6, 7, 8, 9, 10, 11, 10, 11, 12, 13, 14, 15, 16, 17, 16, 17, 18,
+            19
+        ]
+    );
+    assert_eq!(
+        *t.last().unwrap(),
+        19,
+        "trailing text follows the final frame"
+    );
 }
 
-/// A clip longer than it is wide must advance by its TEMPORAL extent. If the
-/// advance assumed the spatial pair dominates, a long video would overlap the
-/// text that follows it — every subsequent token sharing positions with the
-/// tail of the clip.
+/// Each Qwen timestamp-separated frame is a one-group vision range. A long
+/// clip therefore advances by its spatial extent once per frame.
 #[test]
-fn a_long_clip_advances_by_its_temporal_extent() {
+fn a_long_clip_advances_by_one_spatial_extent_per_qwen_frame() {
     let t_len = 10usize;
     let mut tokens = vec![TXT];
     tokens.extend(std::iter::repeat_n(VID, t_len)); // 1x1 grid

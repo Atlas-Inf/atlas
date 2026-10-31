@@ -9,7 +9,7 @@ use super::*;
 /// worker this request's MTP fence and the same slice descriptor.
 pub(super) fn dispatch_chunk0_vision(
     model: &dyn Model,
-    seq: &SequenceState,
+    seq: &mut SequenceState,
     vision_slice: Option<VisionSlice>,
     image_pixels: &[spark_model::VisionItem],
     req_disable_mtp: bool,
@@ -20,13 +20,14 @@ pub(super) fn dispatch_chunk0_vision(
     let vision_enabled = vision_slice.is_some() || !image_pixels.is_empty();
     if let Some(s) = vision_slice {
         model.set_vision_slice_base(
+            seq,
             s.patch_row_offset,
             s.grid_index_offset,
             s.num_images,
             s.patch_row_count,
         );
     } else {
-        model.set_vision_slice_base(0, 0, 0, 0);
+        model.set_vision_slice_base(seq, 0, 0, 0, 0);
     }
     model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, req_disable_mtp)?;
     let (vision_row_base, vision_grid_base, vision_owned_images, vision_slice_rows) = vision_slice
@@ -39,6 +40,7 @@ pub(super) fn dispatch_chunk0_vision(
             )
         });
     model.ep_broadcast_vision_state_for_seq(
+        seq,
         seq.slot_idx as u32,
         vision_enabled,
         vision_row_base,

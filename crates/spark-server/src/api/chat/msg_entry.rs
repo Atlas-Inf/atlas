@@ -16,9 +16,13 @@ use atlas_core::config::VisionConfig;
 use crate::ir::{ContentPart, ImageData, MediaKind, Message, Role};
 
 use super::super::compact::openai_error_response;
-use crate::tokenizer::Glm5VisionPlaceholder;
+use crate::tokenizer::{Glm5VisionPlaceholder, QwenVisionPlaceholder};
 
 mod glm5_vision;
+mod media;
+
+#[path = "msg_entry/tail.rs"]
+pub(super) mod tail;
 #[cfg(test)]
 use glm5_vision::checked_glm5_video_timestamps;
 
@@ -73,6 +77,32 @@ pub(super) struct BuildOut {
     /// the template renderer uses this to expand GLM's image/video marker
     /// triples after Jinja rendering.
     pub(super) vision_placeholders: Vec<Glm5VisionPlaceholder>,
+    /// Qwen3.8-specific placeholder geometry. Empty for GLM/text families;
+    /// the renderer uses this to split each video into timestamped frame
+    /// ranges after Jinja rendering.
+    pub(super) qwen_vision_placeholders: Vec<QwenVisionPlaceholder>,
+}
+
+/// Bytes of data URIs (base64, about 4/3 of the fetched bytes) the remote
+/// fetches of one request may bring in: the size of the largest request
+/// body, so fetching cannot multiply it.
+const REMOTE_FETCH_TOTAL_MAX: usize = 32 << 20;
+
+/// Charge `len` data-URI bytes to a request's remote fetches.
+#[allow(clippy::result_large_err)]
+fn charge_fetched(fetched: &mut usize, len: usize) -> Result<(), Response> {
+    *fetched += len;
+    if *fetched > REMOTE_FETCH_TOTAL_MAX {
+        return Err(openai_error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "this request's media URLs fetch more than {} MiB of data URIs, the \
+                 per-request limit; send fewer or smaller media",
+                REMOTE_FETCH_TOTAL_MAX >> 20
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// One media item on its way to the vision path: what it is, and the
@@ -84,9 +114,107 @@ struct MediaInput {
     uri: String,
 }
 
+/// Append every media part on `m` to `media` **in content order**, growing
+/// `image_pad_counts` in lockstep (each pad count is filled in later by the
+/// preprocessor). Shared by the tool-message branch and the normal branch so
+/// media rides every role uniformly — including tool results, the motivating
+/// case for issue #165.
 #[allow(clippy::result_large_err)]
+fn collect_message_media(
+    m: &Message,
+    media: &mut Vec<MediaInput>,
+    image_pad_counts: &mut Vec<usize>,
+    remote: &super::remote_image::RemoteImagePolicy,
+    fetched: &mut usize,
+) -> Result<(), Response> {
+    // ORDER IS A CONTRACT, and the order is the CLIENT'S. The template emits
+    // one marker per media item in the order they appear in the content
+    // array, and `expand_vision_pads` walks pad tokens left to right
+    // consuming one count each — so this one pass, `MsgEntry::media` and the
+    // preprocessing loop below must all traverse `m.content` the same way.
+    // Grouping by modality anywhere in that chain shows the model the items
+    // in an order the caller never wrote, and does it silently: every count
+    // still agrees with every other one.
+    for part in &m.content {
+        let (kind, data) = match part {
+            ContentPart::Image(src) => (MediaKind::Image, &src.data),
+            ContentPart::Video(src) => (MediaKind::Video, &src.data),
+            ContentPart::Text(_) => continue,
+        };
+        media.push(MediaInput {
+            kind,
+            uri: resolve_media_uri(kind, data, remote, fetched)?,
+        });
+        image_pad_counts.push(0);
+    }
+    Ok(())
+}
+
+/// Resolve one media source to an encoder-input string, applying the
+/// operator's remote-fetch policy. Shared by both modalities because the
+/// policy and its failure modes are identical — only the noun in the message
+/// differs.
+#[allow(clippy::result_large_err)]
+fn resolve_media_uri(
+    kind: MediaKind,
+    data: &ImageData,
+    remote: &super::remote_image::RemoteImagePolicy,
+    fetched: &mut usize,
+) -> Result<String, Response> {
+    let noun = match kind {
+        MediaKind::Image => "image",
+        MediaKind::Video => "video",
+    };
+    match data {
+        ImageData::Base64(s) => Ok(s.clone()),
+        // Neither the encoder nor the video decoder fetches remote URLs
+        // itself. Either the operator has granted this server the
+        // capability, in which case the URL is resolved to a data: URI here,
+        // or it has not, in which case this is a 400 naming the flag. What
+        // must not happen is feeding the URL string onward: it would reach
+        // the base64 decoder and fail with a confusing "base64 decode
+        // failed" (PCND: fail fast, with the real reason).
+        ImageData::Url(url) => {
+            let shown: String = url.chars().take(120).collect();
+            if !remote.enabled {
+                return Err(openai_error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "{noun} URLs are not fetched by this server (got '{shown}'); \
+                         send the {noun} as a base64 data: URI, or start the server \
+                         with --vision-allow-remote-images to enable fetching"
+                    ),
+                ));
+            }
+            let remote_kind = match kind {
+                MediaKind::Image => super::remote_image::RemoteMediaKind::Image,
+                MediaKind::Video => super::remote_image::RemoteMediaKind::Video,
+            };
+            match super::remote_image::fetch_media_as_data_uri(url, remote, remote_kind) {
+                Ok(data_uri) => {
+                    charge_fetched(fetched, data_uri.len())?;
+                    Ok(data_uri)
+                }
+                Err(why) => {
+                    // The reason is surfaced rather than flattened to "could
+                    // not fetch": the operator turned this on deliberately,
+                    // and "resolves to a private address" and "exceeds the
+                    // size cap" call for different fixes.
+                    tracing::warn!("remote {noun} fetch refused: {shown}: {why}");
+                    Err(openai_error_response(
+                        StatusCode::BAD_REQUEST,
+                        format!("could not fetch {noun} URL '{shown}': {why}"),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// [`build_msg_entries_admitted`] without vision bounds (tests).
+#[cfg(test)]
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 pub(super) fn build_msg_entries(
-    admit: super::vision_admit::AdmitCtx<'_>,
     vision_config: Option<&VisionConfig>,
     vision_max_pixels: Option<usize>,
     remote_images: &super::remote_image::RemoteImagePolicy,
@@ -96,10 +224,46 @@ pub(super) fn build_msg_entries(
     levers: &super::levers::ChatLevers,
     preserve_developer_role: bool,
 ) -> Result<BuildOut, Response> {
+    build_msg_entries_admitted(
+        vision_config,
+        vision_max_pixels,
+        remote_images,
+        video,
+        input,
+        tools_active,
+        levers,
+        preserve_developer_role,
+        super::vision_admit::AdmitCtx::default(),
+    )
+}
+
+/// [`build_msg_entries`] under the server's vision bounds: each item is sized
+/// from its header and admitted (`vision_admit`) before it is decoded.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+pub(super) fn build_msg_entries_admitted(
+    vision_config: Option<&VisionConfig>,
+    vision_max_pixels: Option<usize>,
+    remote_images: &super::remote_image::RemoteImagePolicy,
+    video: &VideoDecode<'_>,
+    input: &[Message],
+    tools_active: bool,
+    levers: &super::levers::ChatLevers,
+    preserve_developer_role: bool,
+    admit: super::vision_admit::AdmitCtx<'_>,
+) -> Result<BuildOut, Response> {
+    // The item count is checked before any media is fetched or read.
+    let parts = || input.iter().flat_map(|m| &m.content);
+    let n_media = parts()
+        .filter(|p| matches!(p, ContentPart::Image(_) | ContentPart::Video(_)))
+        .count();
+    let has_video = parts().any(|p| matches!(p, ContentPart::Video(_)));
+    let admission = super::vision_admit::Admission::begin(admit, n_media, has_video)?;
+    let mut fetched = 0usize;
     let mut messages: Vec<MsgEntry> = Vec::with_capacity(input.len());
     let mut media: Vec<MediaInput> = Vec::new();
     let mut image_pad_counts: Vec<usize> = Vec::new();
     let mut vision_placeholders: Vec<Glm5VisionPlaceholder> = Vec::new();
+    let mut qwen_vision_placeholders: Vec<QwenVisionPlaceholder> = Vec::new();
     let mut consecutive_tool_errors: u32 = 0;
     // BW1 bash-wandering watchdog: tally tool-call productivity across the
     // conversation so a steering nudge can fire if the agent explores/runs
@@ -191,7 +355,13 @@ pub(super) fn build_msg_entries(
                 media: m.media_kinds(),
                 reasoning_content: None,
             });
-            media::collect_message_media(m, &mut media, &mut image_pad_counts, remote_images)?;
+            collect_message_media(
+                m,
+                &mut media,
+                &mut image_pad_counts,
+                remote_images,
+                &mut fetched,
+            )?;
             continue;
         }
 
@@ -238,7 +408,13 @@ pub(super) fn build_msg_entries(
                 None
             },
         });
-        media::collect_message_media(m, &mut media, &mut image_pad_counts, remote_images)?;
+        collect_message_media(
+            m,
+            &mut media,
+            &mut image_pad_counts,
+            remote_images,
+            &mut fetched,
+        )?;
     }
 
     // P1-6 (2026-07-09): duplicate-error observation masking
@@ -251,7 +427,7 @@ pub(super) fn build_msg_entries(
     // ATLAS_NO_ERROR_DEDUP=1 restores verbatim history. MUST run
     // before the vacuous-system removal below — the recorded indices
     // refer to the un-shifted `messages` vec.
-    if tools_active && aids && !tail::error_dedup_disabled() {
+    if tools_active && aids && !error_dedup_disabled() {
         for (idx, replacement) in tail::duplicate_error_masks(&tool_result_originals) {
             messages[idx].content = replacement;
         }
@@ -324,8 +500,6 @@ pub(super) fn build_msg_entries(
     // are the same item by construction. Preprocessing images and videos in
     // separate passes would re-introduce the grouping this fix removed.
     let mut image_pixels: Vec<spark_model::VisionItem> = Vec::new();
-    let has_video = media.iter().any(|m| m.kind == MediaKind::Video);
-    let mut admission = super::vision_admit::Admission::begin(admit, media.len(), has_video)?;
     if !media.is_empty() {
         let Some(vcfg) = vision_config else {
             return Err(openai_error_response(
@@ -333,118 +507,16 @@ pub(super) fn build_msg_entries(
                 "this model does not accept image or video input (no vision config)".to_string(),
             ));
         };
-        let reserve_decode = media.iter().any(|m| m.kind == MediaKind::Video)
-            && !vcfg.is_glm5_next
-            && video.ffmpeg.max_total_decoded_pixels.is_some();
-        for (idx, input) in media.iter().enumerate() {
-            let (item, video_timestamps) = match input.kind {
-                MediaKind::Image => {
-                    let item = if let Some(omni) = &vcfg.omni {
-                        spark_model::radio_preprocess::preprocess_image_omni(
-                            &input.uri,
-                            vcfg,
-                            &omni.norm_mean,
-                            &omni.norm_std,
-                            vcfg.patch_size,
-                            omni.downsample_ratio,
-                            omni.max_num_patches,
-                            omni.min_num_patches,
-                        )
-                        .map(|(pixels, gh, gw)| spark_model::VisionItem::image(pixels, gh, gw))
-                    } else {
-                        spark_model::vision_preprocess::preprocess_image_with_max_pixels(
-                            &input.uri,
-                            vcfg,
-                            vision_max_pixels,
-                        )
-                        .map(|(pixels, gh, gw)| spark_model::VisionItem::image(pixels, gh, gw))
-                    };
-                    match item {
-                        Ok(item) => (item, Vec::new()),
-                        Err(e) => {
-                            return Err(openai_error_response(
-                                StatusCode::BAD_REQUEST,
-                                format!("Image decode error: {e}"),
-                            ));
-                        }
-                    }
-                }
-                MediaKind::Video => {
-                    if reserve_decode {
-                        let ceiling =
-                            media::qwen_video_rows_ceiling(vcfg, vision_max_pixels, video);
-                        admission.reserve_video(ceiling)?;
-                    }
-                    match spark_model::vision_preprocess::decode_gated(|| {
-                        spark_model::video_preprocess::preprocess_video(
-                            &input.uri,
-                            vcfg,
-                            vision_max_pixels,
-                            video.fps,
-                            video.ffmpeg,
-                        )
-                    }) {
-                        Ok(v) => {
-                            let timestamps = if vcfg.is_qwen3vl_video {
-                                v.timestamps_hf.clone()
-                            } else {
-                                v.timestamps.clone()
-                            };
-                            (
-                                spark_model::VisionItem {
-                                    held: spark_model::vision_budget::HeldRows::default(),
-                                    groups: v.groups,
-                                    grid_h: v.grid_h,
-                                    grid_w: v.grid_w,
-                                },
-                                timestamps,
-                            )
-                        }
-                        Err(e) => {
-                            return Err(openai_error_response(
-                                StatusCode::BAD_REQUEST,
-                                format!("Video decode error: {e:#}"),
-                            ));
-                        }
-                    }
-                }
-            };
-            image_pad_counts[idx] = item.pad_count(vcfg.spatial_merge_size);
-            admission.note(image_pad_counts[idx])?;
-            if reserve_decode {
-                admission.reconcile_video(image_pad_counts[idx])?;
-            }
-            if vcfg.is_glm5_next || vcfg.is_qwen3vl_video {
-                vision_placeholders.push(glm5_vision::placeholder(
-                    input.kind,
-                    &item,
-                    image_pad_counts[idx],
-                    video_timestamps,
-                    vcfg.is_qwen3vl_video,
-                )?);
-            }
-            if input.kind == MediaKind::Video {
-                // Logged at the media index, not a video ordinal: the index
-                // is what lines the clip up with its pad run and its
-                // encoder rows.
-                tracing::info!(
-                    "Video (media item {}): {} temporal groups, {}x{} patches, {} vision tokens",
-                    idx,
-                    item.t_len(),
-                    item.grid_h,
-                    item.grid_w,
-                    image_pad_counts[idx],
-                );
-            }
-            image_pixels.push(item);
-        }
-    }
-    let admitted = admission.admit()?;
-    for item in image_pixels.iter_mut() {
-        *item = admitted.attach(std::mem::replace(
-            item,
-            spark_model::VisionItem::image(Vec::new(), 0, 0),
-        ));
+        image_pixels = media::preprocess_media(
+            &media,
+            vcfg,
+            vision_max_pixels,
+            video,
+            admission,
+            &mut image_pad_counts,
+            &mut vision_placeholders,
+            &mut qwen_vision_placeholders,
+        )?;
     }
 
     // BW1 bash-wandering watchdog: if the agent has run many tool calls with
@@ -469,19 +541,42 @@ pub(super) fn build_msg_entries(
         image_pixels,
         image_pad_counts,
         vision_placeholders,
+        qwen_vision_placeholders,
     })
 }
 
+/// True when a system message carries no actual instruction and should
+/// be treated as absent. Conservative by design — a substantive prompt
+/// must never be stripped:
+///   * empty / whitespace-only body, OR
+///   * a single short bare label line ending in ':' with nothing after
+///     it (e.g. `User Context:`, `Context:`, `System:`) — the residue
+///     of an empty client template (Open WebUI's RAG/context block).
+/// Anything multi-line, or with any text past the colon, is a real
+/// prompt and returns false.
+/// P1-6 (2026-07-09): kill-switch — `ATLAS_NO_ERROR_DEDUP=1` restores
+/// verbatim duplicate-error history (disables the masking pass).
+fn error_dedup_disabled() -> bool {
+    std::env::var("ATLAS_NO_ERROR_DEDUP").as_deref() == Ok("1")
+}
+
+/// P1-6 (2026-07-09): duplicate-error observation masking.
+///
+/// Input: `(message_index, original_pre_hint_text)` for every
+/// tool-result entry, in conversation order. Output: `(message_index,
+/// replacement_text)` for the OLDER members of each duplicate-error
+/// group; the newest member of each group stays verbatim. Two
+/// tool results are duplicates when BOTH are error-shaped
+/// (`crate::hint_injector::looks_like_error`) AND either equal after
+/// trim or Jaccard >= 0.9 over 4-gram shingles (the loop_detector
+/// measure — SSOT). Successful outputs never participate: identical
+/// success observations (e.g. repeated `ls`) are legitimate.
+#[cfg(test)]
 #[path = "msg_entry_tests.rs"]
 mod msg_entry_tests;
 
 // A sibling file rather than a module inside `msg_entry_tests.rs`: these cases
 // carried that file past the 500-LoC cap.
-#[path = "msg_entry/media.rs"]
-mod media;
 #[cfg(test)]
 #[path = "msg_entry_media_order_tests.rs"]
 mod msg_entry_media_order_tests;
-
-#[path = "msg_entry/tail.rs"]
-mod tail;
