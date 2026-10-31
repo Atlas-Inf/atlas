@@ -107,7 +107,7 @@ impl TransformerModel {
             return Cow::Borrowed(tokens);
         }
         let n = key.len().min(tokens.len());
-        let out = Vec::with_capacity(tokens.len());
+        let mut out = Vec::with_capacity(tokens.len());
         out.extend_from_slice(&key[..n]);
         out.extend_from_slice(&tokens[n..]);
         Cow::Owned(out)

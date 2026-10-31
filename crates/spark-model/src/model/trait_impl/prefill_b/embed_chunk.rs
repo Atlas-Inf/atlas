@@ -333,7 +333,6 @@ impl TransformerModel {
                     )));
                 }
             } else {
-                let src = ve.out_row().offset(row_idx * ve.out_hidden_size() * 2);
                 let physical = row_idx.checked_sub(rows_base).ok_or_else(|| {
                     request_local(format!(
                         "vision row {row_idx} already consumed (base {rows_base})"
