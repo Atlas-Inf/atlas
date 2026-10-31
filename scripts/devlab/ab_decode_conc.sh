@@ -14,8 +14,9 @@ set -euo pipefail
 MODEL=${1:?model}; BASE=${2:?base ref}; ROUNDS=${3:-2}
 # Extra args of the form KEY=VALUE become env for the serves (serve-amd.sh knobs: GPU_UTIL, MAX_BATCH, ...).
 for kv in "${@:4}"; do [[ "$kv" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9_./:,+-]*$ ]] && export "$kv"; done
-# Same memory reasoning as ab_prefill.sh (62.5 GB GTT; util covers weights + pools + KV), with the batch-8 pools.
-export GPU_UTIL=${GPU_UTIL:-0.88} MAX_SEQ_LEN=${MAX_SEQ_LEN:-16384} ATLAS_KV_EXTERNAL_RESERVE_GB=${ATLAS_KV_EXTERNAL_RESERVE_GB:-0} \
+# Same memory reasoning as ab_prefill.sh, but the batch-8 SSM/MTP pools need more headroom: at util 0.88 the 27B load
+# hit cuMemAlloc failed (2 GB requested, 1.2 GB free; run 41181983380), so the default here is 0.70.
+export GPU_UTIL=${GPU_UTIL:-0.70} MAX_SEQ_LEN=${MAX_SEQ_LEN:-16384} ATLAS_KV_EXTERNAL_RESERVE_GB=${ATLAS_KV_EXTERNAL_RESERVE_GB:-0} \
   SSM_SLOTS=${SSM_SLOTS:-8} SSM_CKPT_INTERVAL=${SSM_CKPT_INTERVAL:-512} MAX_BATCH=${MAX_BATCH:-8} NUM_DRAFTS=${NUM_DRAFTS:-0}
 OUT=${DEVLAB_OUT:-$PWD/devlab-out}; mkdir -p "$OUT"; RES="$OUT/RESULTS.txt"
 log() { echo "[$(date -u +%H:%M:%SZ)] $*" | tee -a "$RES"; }
