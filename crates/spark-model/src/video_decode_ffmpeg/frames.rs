@@ -18,13 +18,27 @@ use crate::vision_preprocess::{DECODE_MAX_ALLOC, DECODE_MAX_SIDE};
 pub fn probe_frames(bytes: &[u8], policy: &FfmpegPolicy) -> Result<(usize, f64)> {
     ensure_decoder(policy)?;
     let timing = probe_duration(bytes, policy)?;
-    let fps = timing.native_fps as f64;
+    Ok((
+        declared_frames(&timing, bytes.len())?,
+        timing.native_fps as f64,
+    ))
+}
+
+/// The frame count `timing` declares, which is only the container's word: a
+/// patched sample table has ffprobe report billions of frames for a few
+/// kilobytes, and the sampler walks this count. Every stored frame takes at
+/// least a byte, so the payload bounds it.
+pub(super) fn declared_frames(timing: &ClipTiming, payload_bytes: usize) -> Result<usize> {
     let frames = timing.frame_count.map_or_else(
-        || (timing.duration_secs as f64 * fps + 0.5).floor() as usize,
+        || (timing.duration_secs as f64 * timing.native_fps + 0.5).floor() as usize,
         |frames| frames as usize,
     );
     ensure!(frames > 0, "the clip declares no video frames");
-    Ok((frames, fps))
+    ensure!(
+        frames <= payload_bytes,
+        "the clip declares {frames} video frames in {payload_bytes} bytes"
+    );
+    Ok(frames)
 }
 
 /// Decode the source frames numbered `indices` (ascending, distinct), handing
