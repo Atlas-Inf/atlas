@@ -98,8 +98,6 @@ pub(crate) fn render_chat(
     // `default_reasoning_effort`) is resolved in api/chat/prepare.rs.
     let reasoning_effort: minijinja::Value = if let Some(effort) = flags.reasoning_effort {
         effort.into()
-    } else if enable_thinking && flags.template_effort_default {
-        minijinja::Value::UNDEFINED
     } else if enable_thinking {
         minijinja::Value::UNDEFINED
     } else {

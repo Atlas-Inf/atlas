@@ -529,7 +529,6 @@ impl ChatTokenizer {
 /// Refuse-not-truncate is enforced downstream: a pad run that would
 /// not fit the sequence budget makes the request fail rather than
 /// being cut mid-image.
-
 #[path = "chat_impl/omni_pads.rs"]
 mod omni_pads;
 pub(crate) use omni_pads::*;
