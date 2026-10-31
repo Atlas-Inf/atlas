@@ -249,7 +249,6 @@ fn find_alloc_mut(
     None
 }
 
-
 impl HostPitched for MockGpuBackend {
     fn h2d_retained(&self, src: &[u8], dst: DevicePtr, shape: Pitched, _stream: u64) -> Result<()> {
         // One tick per call, as `copy_d2d_2d_async`: the rows are emulation.

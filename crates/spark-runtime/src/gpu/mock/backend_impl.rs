@@ -235,4 +235,3 @@ impl GpuBackend for MockGpuBackend {
         Ok(())
     }
 }
-
