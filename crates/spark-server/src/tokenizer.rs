@@ -64,7 +64,9 @@ fn normalize_tool_call_arguments(messages: &[serde_json::Value]) -> Vec<serde_js
 mod chat_impl;
 mod chat_render;
 mod deepseek_v4;
+mod ids_only;
 mod jinja_helpers;
+mod large_encode;
 mod message_preprocess;
 
 pub(crate) use message_preprocess::{
@@ -79,6 +81,10 @@ enum ChatEncoding {
 
 pub struct ChatTokenizer {
     tokenizer: Tokenizer,
+    /// Shared by every caller of this tokenizer; limits only large CPU encodes.
+    large_encode_gate: Option<std::sync::Arc<large_encode::Gate>>,
+    /// Explicitly skip unused token spellings and offsets during serving encode.
+    ids_only: bool,
     eos_token_id: u32,
     supports_thinking: bool,
     /// GLM/Qwen register tool-envelope XML as added tokens. Incoming prose
