@@ -117,6 +117,7 @@ async fn blocking_choices_each_receive_vision_and_share_admission() {
     let outcome = run_blocking_path(BlockingPathArgs {
         state,
         req: request(),
+        force_nonempty_content: false,
         req_ctx: None,
         prompt_tokens: vec![1],
         session_hash: 0,

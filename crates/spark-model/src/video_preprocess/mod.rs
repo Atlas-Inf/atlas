@@ -34,8 +34,6 @@ use image::RgbImage;
 
 mod types;
 
-pub use types::{group_indices, sample_indices};
-
 use crate::vision_preprocess::{
     MEAN, STD, decode_data_uri_bytes, glm_resize_or_pad, glm_target_size, normalize_channel,
     patch_coordinates, target_size_for,
@@ -495,6 +493,7 @@ pub fn preprocess_video(
     }
 
     Ok(PreprocessedVideo {
+        timestamps_hf: frame_times.clone(),
         groups,
         grid_t,
         grid_h,
@@ -518,6 +517,5 @@ pub fn preprocess_video(
 
 mod timestamps;
 
-#[cfg(test)]
 #[path = "tests.rs"]
 mod tests;

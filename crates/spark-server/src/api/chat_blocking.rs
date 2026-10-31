@@ -579,4 +579,3 @@ mod tests {
 #[cfg(test)]
 #[path = "chat_blocking_vision_tests.rs"]
 mod vision_fanout_tests;
->>>>>>> 9fabbf1c5 (server: preserve shared image pixels for every blocking choice)

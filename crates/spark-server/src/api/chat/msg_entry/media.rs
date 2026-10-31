@@ -97,6 +97,7 @@ pub(super) fn preprocess_media(
                 &item,
                 pad_counts[idx],
                 video_timestamps,
+                false, // GLM path: qwen3vl=false
             )?);
         } else {
             qwen_placeholders.push(match input.kind {

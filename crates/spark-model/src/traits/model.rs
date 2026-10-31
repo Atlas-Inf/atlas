@@ -1201,7 +1201,7 @@ pub trait Model: Send + Sync {
     fn prepare_vision_embed_for_chunked(
         &self,
         seq: &mut crate::traits::SequenceState,
-        images: &[crate::VisionItem],
+        images: Vec<crate::VisionItem>,
     ) -> Result<()> {
         self.prepare_vision_embed(seq, images)
     }

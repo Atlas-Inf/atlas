@@ -56,6 +56,7 @@ impl VisionItem {
     pub fn video(groups: Vec<Vec<f32>>, grid_h: usize, grid_w: usize) -> Self {
         let content_hash = content_hash(&groups, grid_h, grid_w);
         Self {
+            held: crate::vision_budget::HeldRows::default(),
             groups: Arc::new(groups),
             grid_h,
             grid_w,
@@ -65,13 +66,6 @@ impl VisionItem {
 
     /// The item, holding `permit` until its last copy drops.
     /// Several items of one request may share one permit.
-    pub fn holding(
-        mut self,
-        permit: std::sync::Arc<crate::vision_budget::VisionRowPermit>,
-    ) -> Self {
-        self.held = crate::vision_budget::HeldRows(Some(permit));
-        self
-    }
 
     /// Temporal extent, in groups. 1 for a still.
     pub fn t_len(&self) -> usize {

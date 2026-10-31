@@ -419,7 +419,7 @@ pub fn start_chunked_prefill(
             // prefix lookup instead, and only the items it does not cover.
             // The images move onto `seq` (per-sequence vision state): two
             // image prompts can now interleave prefill chunks.
-            model.prepare_vision_embed_for_chunked(&mut seq, &image_pixels)?;
+            model.prepare_vision_embed_for_chunked(&mut seq, image_pixels.clone())?;
             // prepare_vision_embed() runs the vision encoder asynchronously on
             // the default stream, writing this request's patch embeddings into
             // the encoder's buf_out. The chunk-0 embedding injection inside

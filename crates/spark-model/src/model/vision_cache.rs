@@ -67,7 +67,7 @@ impl TransformerModel {
     pub(super) fn vision_prefix_cache_ok(&self) -> bool {
         self.prefix_cache.is_active()
             && self.vision_encoder.is_some()
-            && self.config.vision.as_ref().is_some_and(|v| v.is_glm5_next)
+            && self.config.vision.as_ref().is_some_and(|v| false)
             && switch_on()
     }
 
@@ -144,7 +144,7 @@ impl TransformerModel {
             .iter()
             .map(|it| (it.t_len(), it.grid_h / sms, it.grid_w / sms))
             .collect();
-        seq.vision.hashes = images.iter().map(|it| it.content_hash).collect();
+        seq.vision.hashes = (*images).iter().map(|it| it.content_hash).collect();
     }
 
     /// Trait entry for [`Self::stage_vision_grids`] (the co-dispatch path's
@@ -174,7 +174,7 @@ impl TransformerModel {
         images: &[VisionItem],
     ) -> Result<()> {
         if self.vision_encoder.is_none() {
-            return self.prepare_vision_embed_dispatch(seq, images);
+            return self.prepare_vision_embed_dispatch(seq, images.to_vec());
         }
         let sms = self
             .config

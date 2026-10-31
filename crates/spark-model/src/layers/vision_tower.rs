@@ -47,7 +47,7 @@ impl VisionTower {
             VisionTower::Radio(r) => {
                 let mut images = Vec::new();
                 for item in items {
-                    for group in &item.groups {
+                    for group in item.groups.iter() {
                         images.push((group.as_slice(), item.grid_h, item.grid_w));
                     }
                 }
