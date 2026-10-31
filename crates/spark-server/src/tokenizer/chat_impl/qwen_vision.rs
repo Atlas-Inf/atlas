@@ -106,7 +106,7 @@ where
                     );
                 }
                 let mut replacement = Vec::with_capacity(2 + frame_count * (per_frame + 4));
-                for timestamp in placeholder.timestamps.iter().copied() {
+                for timestamp in &placeholder.timestamps {
                     // This is the exact Qwen3-VL/Qwen3.8 processor spelling.
                     replacement.extend(encode_timestamp(&format!("<{timestamp:.1} seconds>"))?);
                     replacement.push(ids.vision_start);
