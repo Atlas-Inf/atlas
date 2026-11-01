@@ -129,7 +129,25 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
-        if !(self.qwen4exp_fast_t()
+        // gfx1151 has no qwen4exp_moe_fast kernels (cp.async.bulk prefetch;
+        // `qwen4exp_moe_fast_requested` is off under atlas_hip), so this arm used
+        // to fall through to the per-token loop: one routed+shared gate/up and
+        // one silu/down launch per token per layer. That is every prefill piece
+        // under ATLAS_HIP_MOE_GROUPED_MIN_TOKENS: the snapshot-split tail of a
+        // cold prompt with SSM snapshots on (framework f169s8: 1,152 per-token
+        // gate/up + 1,152 silu/down for a 24-token tail, ~0.45 s of a 2.2 s
+        // TTFT) and every short agentic suffix after a prefix hit. There the
+        // verify-row dedup kernels run the chunk instead (`rows_t`, up to 8 rows
+        // a launch): byte-identical per (row, slot) to the single-row `_t`
+        // kernels the loop launches, with the loop's own top-k and blends.
+        let fast = self.qwen4exp_fast_t();
+        let rows_t = !fast
+            && cfg!(atlas_hip)
+            && num_tokens >= 2
+            && self.t_rows_eligible(2, ctx)
+            && self.t_rows_eligible(T_ROWS_CHUNK, ctx)
+            && t_rows_scratch_bytes(num_tokens, ctx.config.num_experts_per_tok) <= 32 * 1024;
+        if !((fast || rows_t)
             && self.use_t_layout_for_prefill()
             && num_tokens > 0
             && self.lora.is_none()
@@ -187,8 +205,19 @@ impl MoeLayer {
         let shared_gate_scratch = ctx.buffers.logits();
         let shared_up_scratch = ctx.buffers.ssm_qkvz();
         let shared_out = ctx.buffers.attn_output();
-        for first in (0..num_tokens).step_by(ops::QWEN4EXP_MOE_MAX_ROWS) {
-            let rows = (num_tokens - first).min(ops::QWEN4EXP_MOE_MAX_ROWS);
+        // Union scratch for the rows_t arm, after every token's indices and weights.
+        let u_base = scratch.offset(2 * num_tokens * top_k * 4);
+        let u_slots = T_ROWS_CHUNK * top_k;
+        let (u_experts, u_rowmask) = (u_base, u_base.offset(u_slots * 4));
+        let u_rowslot = u_base.offset(2 * u_slots * 4);
+        let u_count = u_base.offset(2 * u_slots * 4 + 8 * u_slots);
+        let mut first = 0;
+        while first < num_tokens {
+            let rows = if fast {
+                (num_tokens - first).min(ops::QWEN4EXP_MOE_MAX_ROWS)
+            } else {
+                t_rows_chunk(num_tokens - first)
+            };
             let chunk_indices = indices.offset(first * top_k * 4);
             // A checkpoint-native separate shared expert never reaches the
             // fused kernels: NULL `_t` weights make them skip it, and the
@@ -203,32 +232,46 @@ impl MoeLayer {
                     self.shared_down_t.as_ref().unwrap_or(&null_qw),
                 )
             };
-            self.qwen4exp_fast_gate_up(
-                ctx,
-                input.offset(first * h * bf16),
-                expert_gate_out,
-                expert_up_out,
-                chunk_indices,
-                sh_gate_t,
-                shared_gate_scratch,
-                sh_up_t,
-                shared_up_scratch,
-                rows,
-                stream,
-            )?;
-            self.qwen4exp_fast_silu_down(
-                ctx,
-                expert_gate_out,
-                expert_up_out,
-                expert_down_out,
-                chunk_indices,
-                shared_gate_scratch,
-                shared_up_scratch,
-                sh_down_t,
-                shared_out,
-                rows,
-                stream,
-            )?;
+            if fast {
+                self.qwen4exp_fast_gate_up(
+                    ctx,
+                    input.offset(first * h * bf16),
+                    expert_gate_out,
+                    expert_up_out,
+                    chunk_indices,
+                    sh_gate_t,
+                    shared_gate_scratch,
+                    sh_up_t,
+                    shared_up_scratch,
+                    rows,
+                    stream,
+                )?;
+                self.qwen4exp_fast_silu_down(
+                    ctx,
+                    expert_gate_out,
+                    expert_up_out,
+                    expert_down_out,
+                    chunk_indices,
+                    shared_gate_scratch,
+                    shared_up_scratch,
+                    sh_down_t,
+                    shared_out,
+                    rows,
+                    stream,
+                )?;
+            } else {
+                self.rows_t_experts(
+                    input.offset(first * h * bf16),
+                    rows,
+                    chunk_indices,
+                    (u_experts, u_rowmask, u_rowslot, u_count),
+                    (expert_gate_out, expert_up_out, expert_down_out),
+                    (shared_gate_scratch, shared_up_scratch, shared_out),
+                    (sh_gate_t, sh_up_t, sh_down_t),
+                    ctx,
+                    stream,
+                )?;
+            }
             if separate {
                 self.run_separate_shared_expert(
                     input.offset(first * h * bf16),
@@ -286,7 +329,148 @@ impl MoeLayer {
                 ctx,
                 stream,
             )?;
+            first += rows;
         }
         Ok(true)
+    }
+
+    /// The routed + shared experts of one `rows`-row chunk through the
+    /// verify-row dedup kernels (`moe_expert_union_t` + the `_t_rows` pair), as
+    /// `forward_rows_t` launches them, from the chunk's top-k already in
+    /// `indices`. Writes the per-row-loop layout: `down_out` rows
+    /// `[(r * top_k + slot), h]` and `sh_out` rows `[r, h]`.
+    #[allow(clippy::too_many_arguments)]
+    fn rows_t_experts(
+        &self,
+        input: DevicePtr,
+        rows: usize,
+        indices: DevicePtr,
+        (u_experts, u_rowmask, u_rowslot, u_count): (DevicePtr, DevicePtr, DevicePtr, DevicePtr),
+        (gate_out, up_out, down_out): (DevicePtr, DevicePtr, DevicePtr),
+        (sh_gate_scratch, sh_up_scratch, sh_out): (DevicePtr, DevicePtr, DevicePtr),
+        (sh_gate_t, sh_up_t, sh_down_t): (&QuantizedWeight, &QuantizedWeight, &QuantizedWeight),
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let h = ctx.config.hidden_size as u32;
+        let inter = ctx.config.moe_intermediate_size as u32;
+        let top_k = ctx.config.num_experts_per_tok as u32;
+        let slots = rows as u32 * top_k;
+        let gate_t = self.gate_ptrs_t.as_ref().expect("gate_ptrs_t under rows_t");
+        let up_t = self.up_ptrs_t.as_ref().expect("up_ptrs_t under rows_t");
+        let down_t = self.down_ptrs_t.as_ref().expect("down_ptrs_t under rows_t");
+        ops::moe_expert_union_t(
+            ctx.gpu,
+            self.moe_expert_union_t_k,
+            indices,
+            u_experts,
+            u_rowmask,
+            u_rowslot,
+            u_count,
+            rows as u32,
+            top_k,
+            stream,
+        )?;
+        ops::moe_expert_gate_up_shared_t_rows(
+            ctx.gpu,
+            self.moe_expert_gate_up_shared_t_rows_k[rows],
+            input,
+            gate_t.packed_ptrs,
+            gate_t.scale_ptrs,
+            gate_t.scale2_vals,
+            gate_out,
+            up_t.packed_ptrs,
+            up_t.scale_ptrs,
+            up_t.scale2_vals,
+            up_out,
+            u_experts,
+            u_rowmask,
+            u_rowslot,
+            u_count,
+            slots,
+            sh_gate_t,
+            sh_gate_scratch,
+            sh_up_t,
+            sh_up_scratch,
+            inter,
+            h,
+            top_k,
+            h,
+            rows as u32,
+            256,
+            stream,
+        )?;
+        ops::moe_expert_silu_down_shared_t_rows(
+            ctx.gpu,
+            self.moe_expert_silu_down_shared_t_rows_k[rows],
+            gate_out,
+            up_out,
+            down_t.packed_ptrs,
+            down_t.scale_ptrs,
+            down_t.scale2_vals,
+            down_out,
+            u_experts,
+            u_rowmask,
+            u_rowslot,
+            u_count,
+            slots,
+            sh_gate_scratch,
+            sh_up_scratch,
+            sh_down_t,
+            sh_out,
+            h,
+            inter,
+            top_k,
+            rows as u32,
+            256,
+            stream,
+        )
+    }
+}
+
+/// Rows per rows_t chunk (the largest `_t_rows` instantiation).
+const T_ROWS_CHUNK: usize = 8;
+
+/// The next chunk of `remaining` rows: up to 8, never leaving a single row
+/// behind (there is no 1-row `_t_rows` kernel), so 9 -> 7 + 2.
+fn t_rows_chunk(remaining: usize) -> usize {
+    let rows = remaining.min(T_ROWS_CHUNK);
+    if remaining > rows && remaining - rows == 1 {
+        rows - 1
+    } else {
+        rows
+    }
+}
+
+/// Routing scratch the rows_t arm needs for `num_tokens` tokens: every token's
+/// indices and weights, then one chunk's union buffers (u_experts, u_rowmask,
+/// u_rowslot at 8 B a slot, u_count).
+fn t_rows_scratch_bytes(num_tokens: usize, top_k: usize) -> usize {
+    let u_slots = T_ROWS_CHUNK * top_k;
+    2 * num_tokens * top_k * 4 + 2 * u_slots * 4 + 8 * u_slots + 4
+}
+
+#[cfg(test)]
+mod rows_t_tail_tests {
+    use super::{t_rows_chunk, t_rows_scratch_bytes};
+
+    #[test]
+    fn chunks_never_leave_one_row() {
+        for n in 2..300 {
+            let (mut left, mut total) = (n, 0);
+            while left > 0 {
+                let c = t_rows_chunk(left);
+                assert!((2..=8).contains(&c), "n={n} chunk {c}");
+                left -= c;
+                total += c;
+            }
+            assert_eq!(total, n);
+        }
+    }
+
+    #[test]
+    fn scratch_fits_under_the_grouped_threshold() {
+        // Flash-Next top-10: every sub-256-token piece fits the 32 KiB scratch.
+        assert!(t_rows_scratch_bytes(255, 10) <= 32 * 1024);
     }
 }
