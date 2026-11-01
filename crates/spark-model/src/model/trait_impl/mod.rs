@@ -105,7 +105,7 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         images: Vec<crate::VisionItem>,
     ) -> Result<()> {
-        self.prepare_vision_embed_deferred_dispatch(seq, &images)
+        self.prepare_vision_embed_deferred_dispatch(seq, images)
     }
     fn stage_vision_grids(&self, seq: &mut SequenceState, images: &[crate::VisionItem]) {
         self.stage_vision_grids_dispatch(seq, images);

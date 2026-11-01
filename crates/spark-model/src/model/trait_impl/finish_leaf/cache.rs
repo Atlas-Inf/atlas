@@ -77,19 +77,23 @@ impl TransformerModel {
     /// to cover the matched prefix, release over the stashed prefix tokens
     /// instead. Exactly one of the two covers the matched nodes, so they are
     /// released once (never double-released). Both are in cache-key form: a
-    /// vision prompt's nodes live under its content key (`vision_cache`).
-    pub(in super::super) fn radix_held_tokens<'a>(
+    /// vision prompt's nodes live under its content key (`vision_cache`), and
+    /// a vision sequence is never cached when it finishes (its reply's KV
+    /// sits at decode positions), so it holds its prompt's alone.
+    pub(in crate::model) fn radix_held_tokens<'a>(
         &self,
         seq: &'a SequenceState,
     ) -> std::borrow::Cow<'a, [u32]> {
         if seq.tokens.len() < seq.cached_prefix_tokens {
             return std::borrow::Cow::Borrowed(&seq.prefix_ref_tokens);
         }
-        let finish = finish_cache(self.multi_rank_protocol_active(), self.leaf_on());
-        self.pc_key_tokens(
-            seq,
-            &seq.tokens[..held_tokens(finish, seq.prompt_len, seq.tokens.len())],
-        )
+        let finish = if self.tokens_have_vision_pad(&seq.tokens) {
+            FinishCache::Skip
+        } else {
+            finish_cache(self.multi_rank_protocol_active(), self.leaf_on())
+        };
+        let held = held_tokens(finish, seq.prompt_len, seq.tokens.len());
+        self.pc_key_tokens(seq, &seq.tokens[..held])
     }
 }
 

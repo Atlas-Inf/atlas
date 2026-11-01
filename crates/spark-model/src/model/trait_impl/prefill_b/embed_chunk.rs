@@ -41,43 +41,79 @@ pub(super) fn take_staged_ids() -> Option<Vec<u32>> {
     STAGED_IDS.with(|s| s.borrow_mut().take())
 }
 
-/// Return the packed vision-row range covered by one prompt chunk. The
-/// encoder output follows the complete prompt's pad-token order, so a chunk
-/// starting in the middle of a media run must begin after every earlier image
-/// or video pad token. `row_base` is the request slice in co-dispatch output;
-/// `skip_rows` the leading rows of cached items the encoder did not produce
-/// (their placeholders are not copied); `window_end` is the virtual row one
-/// past the resident window (`rows_base + rows_encoded`): the chunk's pads
-/// must all map inside it. A pad outside it is request-local (every rank
-/// decides it from the same tokens and window, `request_local`): a prompt
-/// with more placeholders than its items have rows fails alone.
-fn vision_pad_row_range(
+/// Where each placeholder of `tokens[start..start + count]` that the prefill
+/// COMPUTES reads its encoder row: `(offset in the range, physical buf_out
+/// row)`.
+///
+/// The encoder output follows the complete prompt's placeholder order, less
+/// the leading `skip_rows` of items the prefix cache covered wholly (their
+/// rows are never produced). `row_idx` is a placeholder's index in that
+/// packed order (`row_base` offsets a co-dispatched slice); `buf_out` holds
+/// the last encode's window, re-based to physical 0 at `rows_base`, of
+/// `pending` rows.
+///
+/// A placeholder before `computed_from` needs no row: its KV is restored from
+/// the cache and no layer reads its embedding. That includes the cached head
+/// of an item the cache covers only in part, whose rows the window holds
+/// only from the chunk that first computes one of its placeholders: such a
+/// head still advances `row_idx`, so the computed tail maps to its own rows.
+/// Requiring rows for it failed every chunk lying wholly in the cache with a
+/// straddling item in it (the issue-180 history on a warm cache).
+///
+/// A computed placeholder outside the window, or one belonging to a wholly
+/// cached item, is request-local (every rank decides it from the same tokens
+/// and window): a prompt with more placeholders than its items have rows
+/// fails alone.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::model) fn vision_splice_plan(
     tokens: &[u32],
-    chunk_start: usize,
-    chunk_len: usize,
-    image_pad: u32,
-    video_pad: u32,
+    start: usize,
+    count: usize,
+    is_pad: impl Fn(u32) -> bool,
     row_base: usize,
     skip_rows: usize,
-    window_end: usize,
-) -> Result<(usize, usize)> {
-    let chunk_tokens = &tokens[chunk_start..chunk_start + chunk_len];
-    let is_pad = |tok: &&u32| **tok == image_pad || **tok == video_pad;
-    let prior_pad_count = tokens[..chunk_start].iter().filter(is_pad).count();
-    let chunk_pad_count = chunk_tokens.iter().filter(is_pad).count();
-    let start = row_base
-        .checked_add(prior_pad_count.saturating_sub(skip_rows))
+    computed_from: usize,
+    rows_base: usize,
+    pending: usize,
+) -> Result<Vec<(usize, usize)>> {
+    let prior = tokens[..start].iter().filter(|&&t| is_pad(t)).count();
+    let mut pad_idx = prior;
+    let mut row_idx = row_base
+        .checked_add(prior.saturating_sub(skip_rows))
         .ok_or_else(|| request_local("vision pad overlay row offset overflow"))?;
-    let end = row_base
-        .checked_add((prior_pad_count + chunk_pad_count).saturating_sub(skip_rows))
-        .ok_or_else(|| request_local("vision pad overlay row count overflow"))?;
-    if end > window_end {
-        return Err(request_local(format!(
-            "vision pad overlay exceeds the resident window: base={}, prior={}, chunk={}, skipped={}, window_end={}",
-            row_base, prior_pad_count, chunk_pad_count, skip_rows, window_end
-        )));
+    let mut plan = Vec::new();
+    for (i, &tok) in tokens[start..start + count].iter().enumerate() {
+        if !is_pad(tok) {
+            continue;
+        }
+        let pos = start + i;
+        if pad_idx < skip_rows {
+            if pos >= computed_from {
+                return Err(request_local(format!(
+                    "cached vision placeholder at {pos} is computed (from {computed_from})"
+                )));
+            }
+        } else {
+            if pos >= computed_from {
+                let physical = row_idx.checked_sub(rows_base).ok_or_else(|| {
+                    request_local(format!(
+                        "vision row {row_idx} already consumed (base {rows_base})"
+                    ))
+                })?;
+                if physical >= pending {
+                    return Err(request_local(format!(
+                        "vision pad overlay exceeds the resident window: row {row_idx} at {pos}, \
+                         window {rows_base}..{}, skipped={skip_rows}",
+                        rows_base + pending
+                    )));
+                }
+                plan.push((i, physical));
+            }
+            row_idx += 1;
+        }
+        pad_idx += 1;
     }
-    Ok((start, end))
+    Ok(plan)
 }
 
 impl TransformerModel {
@@ -265,7 +301,10 @@ impl TransformerModel {
         let Some(ve) = &self.vision_encoder else {
             return Ok(());
         };
-        if pending == 0 && skip_rows == 0 {
+        // A text request. A vision one is always planned: a computed
+        // placeholder with no resident row is an error, never a silent raw
+        // token embedding.
+        if pending == 0 && skip_rows == 0 && seq.vision.grids.is_empty() {
             return Ok(());
         }
         let chunk_tokens = &tokens[start..start + count];
@@ -300,56 +339,26 @@ impl TransformerModel {
                 "vision pad rows exceed co-dispatched slice: prior={prior_pad_rows}, chunk={chunk_pad_rows}, slice={slice_rows}"
             )));
         }
-        // The encoder output is packed in prompt order, while this function
-        // may be called for several chunks. Starting at zero for every chunk
-        // would repeat earlier vision rows. `row_idx` is the row's index in
-        // that packed order; `buf_out` holds the resident window re-based to
-        // physical 0 at `rows_base`, so the physical row is the packed index
-        // minus the rows that slid off the front (consumed, then overwritten
-        // by a later per-chunk encode). Co-dispatch reads a slice of the
-        // shared packed output with the base at 0 (the batched encode wrote
-        // every request's rows; nothing has been re-encoded since).
-        let rows_base = seq.vision.rows_base;
-        let (mut row_idx, _) = vision_pad_row_range(
+        // Physical rows from the packed prompt order (`vision_splice_plan`).
+        // Co-dispatch reads a slice of the shared packed output with the base
+        // at 0 (the batched encode wrote every request's rows; nothing has
+        // been re-encoded since).
+        let plan = vision_splice_plan(
             tokens,
             start,
             count,
-            image_pad,
-            video_pad,
+            |t| t == image_pad || t == video_pad,
             row_base,
             skip_rows,
-            rows_base + pending,
+            computed_from,
+            seq.vision.rows_base,
+            pending,
         )?;
-        let mut pad_idx = prior_pad_rows;
-        for (i, &tok) in chunk_tokens.iter().enumerate() {
-            if tok != image_pad && tok != video_pad {
-                continue;
-            }
-            if pad_idx < skip_rows {
-                if start + i >= computed_from {
-                    return Err(request_local(format!(
-                        "cached vision placeholder at {} is computed (from {computed_from})",
-                        start + i
-                    )));
-                }
-            } else {
-                let physical = row_idx.checked_sub(rows_base).ok_or_else(|| {
-                    request_local(format!(
-                        "vision row {row_idx} already consumed (base {rows_base})"
-                    ))
-                })?;
-                if physical >= pending {
-                    return Err(request_local(format!(
-                        "vision row {row_idx} is not resident (base {rows_base}, {pending} rows)"
-                    )));
-                }
-                let src = ve.out_row().offset(physical * ve.out_hidden_size() * 2);
-                let dst = hidden_dst.offset(i * h * elem_bytes);
-                self.gpu
-                    .copy_d2d_async(src, dst, ve.out_hidden_size() * 2, stream)?;
-                row_idx += 1;
-            }
-            pad_idx += 1;
+        for (i, physical) in plan {
+            let src = ve.out_row().offset(physical * ve.out_hidden_size() * 2);
+            let dst = hidden_dst.offset(i * h * elem_bytes);
+            self.gpu
+                .copy_d2d_async(src, dst, ve.out_hidden_size() * 2, stream)?;
         }
         Ok(())
     }
@@ -357,34 +366,52 @@ impl TransformerModel {
 
 #[cfg(test)]
 mod tests {
-    use super::vision_pad_row_range;
+    use super::vision_splice_plan;
+
+    const IMAGE: u32 = 10;
+    const VIDEO: u32 = 11;
+    const TEXT: u32 = 1;
+    fn pad(t: u32) -> bool {
+        t == IMAGE || t == VIDEO
+    }
+
+    /// Physical rows the computed placeholders of `[start, start + count)` read.
+    fn rows(
+        tokens: &[u32],
+        start: usize,
+        count: usize,
+        args: (usize, usize, usize, usize, usize),
+    ) -> Vec<usize> {
+        let (row_base, skip, computed_from, rows_base, pending) = args;
+        vision_splice_plan(
+            tokens,
+            start,
+            count,
+            pad,
+            row_base,
+            skip,
+            computed_from,
+            rows_base,
+            pending,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(_, p)| p)
+        .collect()
+    }
 
     #[test]
     fn vision_rows_follow_the_full_prompt_across_chunks() {
-        let image = 10;
-        let video = 11;
-        let text = 1;
-        let tokens = [text, image, image, text, image, video, video, text];
-
-        assert_eq!(
-            vision_pad_row_range(&tokens, 0, 3, image, video, 4, 0, 9).unwrap(),
-            // `row_base` is already included in this absolute range; the
-            // copy site must not add it a second time.
-            (4, 6)
-        );
-        assert_eq!(
-            vision_pad_row_range(&tokens, 3, 3, image, video, 4, 0, 9).unwrap(),
-            (6, 8)
-        );
-        assert_eq!(
-            vision_pad_row_range(&tokens, 6, 2, image, video, 4, 0, 9).unwrap(),
-            (8, 9)
-        );
+        let tokens = [TEXT, IMAGE, IMAGE, TEXT, IMAGE, VIDEO, VIDEO, TEXT];
+        // A co-dispatched slice at row 4 of a window based at 0.
+        assert_eq!(rows(&tokens, 0, 3, (4, 0, 0, 0, 9)), [4, 5]);
+        assert_eq!(rows(&tokens, 3, 3, (4, 0, 0, 0, 9)), [6, 7]);
+        assert_eq!(rows(&tokens, 6, 2, (4, 0, 0, 0, 9)), [8]);
     }
 
     #[test]
     fn vision_rows_fail_closed_when_the_packed_slice_is_short() {
-        let err = vision_pad_row_range(&[1, 10, 10], 1, 2, 10, 11, 3, 0, 4)
+        let err = vision_splice_plan(&[1, 10, 10], 1, 2, pad, 3, 0, 0, 0, 4)
             .expect_err("two rows cannot fit in one packed row");
         assert!(err.to_string().contains("exceeds the resident window"));
     }
@@ -394,43 +421,44 @@ mod tests {
         // One 2-row image, then a stray placeholder (a pad id the request's
         // items do not explain) in a later chunk: every rank reaches this
         // check alike, so the error must be request-local, not rank-fatal.
-        let (image, text) = (10, 1);
-        let tokens = [text, image, image, text, image, text];
-        let err = vision_pad_row_range(&tokens, 3, 3, image, 11, 0, 0, 2)
-            .expect_err("the stray pad has no row");
+        let tokens = [TEXT, IMAGE, IMAGE, TEXT, IMAGE, TEXT];
+        let err = vision_splice_plan(&tokens, 3, 3, pad, 0, 0, 0, 0, 2).expect_err("stray pad");
         assert!(crate::request_local::is_request_local(&err));
     }
 
     #[test]
     fn cached_items_shift_rows_down_by_the_skipped_rows() {
-        let (image, text) = (10, 1);
         // Item 0 (2 rows, cached) at 1..3, item 1 (2 rows, encoded) at 4..6.
-        let tokens = [text, image, image, text, image, image, text];
-        // buf_out holds only item 1: rows 0..2 (window_end 0 + 2).
-        assert_eq!(
-            vision_pad_row_range(&tokens, 3, 4, image, 11, 0, 2, 2).unwrap(),
-            (0, 2)
-        );
-        // A chunk over the cached item maps to no encoded rows.
-        assert_eq!(
-            vision_pad_row_range(&tokens, 0, 3, image, 11, 0, 2, 2).unwrap(),
-            (0, 0)
-        );
-        assert!(vision_pad_row_range(&tokens, 3, 4, image, 11, 0, 2, 1).is_err());
+        let tokens = [TEXT, IMAGE, IMAGE, TEXT, IMAGE, IMAGE, TEXT];
+        assert_eq!(rows(&tokens, 3, 4, (0, 2, 3, 0, 2)), [0, 1]);
+        // A chunk over the cached item computes nothing.
+        assert!(rows(&tokens, 0, 3, (0, 2, 3, 0, 2)).is_empty());
+        assert!(vision_splice_plan(&tokens, 3, 4, pad, 0, 2, 3, 0, 1).is_err());
+    }
+
+    #[test]
+    fn a_cached_head_of_a_straddling_item_needs_no_rows() {
+        // Item 0 (3 rows) at 1..4 is cached up to position 3: its head (1, 2)
+        // has no row and the window is empty; the chunk over it must pass
+        // (it failed with "exceeds the resident window", issue 180), and the
+        // chunk that computes its tail reads its own rows 2.. of the item.
+        let tokens = [TEXT, IMAGE, IMAGE, IMAGE, TEXT];
+        assert!(rows(&tokens, 0, 3, (0, 0, 3, 0, 0)).is_empty());
+        // The later chunk re-encodes item 0 whole: window [0, 3).
+        assert_eq!(rows(&tokens, 3, 2, (0, 0, 3, 0, 3)), [2]);
     }
 
     #[test]
     fn a_per_chunk_window_covers_exactly_its_own_splice_range() {
-        let (image, text) = (10, 1);
         // Item 0 (2 rows) pads at 1..3, item 1 (3 rows) pads at 4..7. Chunk 1
-        // = [3, 8) holds item 1's pads only (item 0's pads all sit before 3):
-        // its window is virtual [2, 5) — 3 rows at physical 0, base 2.
-        let tokens = [text, image, image, text, image, image, image, text];
-        assert_eq!(
-            vision_pad_row_range(&tokens, 3, 5, image, 11, 0, 0, 5).unwrap(),
-            (2, 5)
-        );
-        // A window that does not cover the chunk's pads fails closed.
-        assert!(vision_pad_row_range(&tokens, 3, 5, image, 11, 0, 0, 4).is_err());
+        // = [3, 8) holds item 1's pads only: its window is virtual [2, 5) —
+        // 3 rows at physical 0, base 2.
+        let tokens = [TEXT, IMAGE, IMAGE, TEXT, IMAGE, IMAGE, IMAGE, TEXT];
+        assert_eq!(rows(&tokens, 3, 5, (0, 0, 0, 2, 3)), [0, 1, 2]);
+        assert!(vision_splice_plan(&tokens, 3, 5, pad, 0, 0, 0, 2, 2).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "embed_chunk_sim_tests.rs"]
+mod sim_tests;

@@ -55,9 +55,18 @@ pub(crate) fn items_in_range(
         .iter()
         .zip(last_pad)
         .enumerate()
+        // A placeholder in `[lo, to)`, `lo = max(from, computed_from)`.
+        // Clamping only the first pad (`first.max(computed_from) < to &&
+        // last >= from`) also selected an item the cache covers wholly but
+        // which ends inside the range: the window then started one item early
+        // while the splice skips that item's rows, and every later image read
+        // the previous image's rows (8 x 2048^2 on a warm cache: the sixth
+        // image answered as the fifth). A chunk wholly in the cache (`lo >=
+        // to`) computes nothing and encodes nothing, not even the item that
+        // straddles `computed_from` (its later chunk encodes it).
         .filter(|&(_, (&first, &last))| {
-            let first = first.max(computed_from);
-            first < to && last >= from
+            let lo = from.max(computed_from);
+            lo < to && first < to && last >= lo
         })
         .map(|(i, _)| i)
         .collect()
