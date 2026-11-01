@@ -291,3 +291,19 @@ fn a_head_without_pixels_fails_instead_of_splicing_stale_rows() {
         assert_eq!(f.seq.vision.rows_encoded, 0);
     }
 }
+
+#[test]
+fn a_vision_sequence_releases_its_prompt_not_its_reply() {
+    // Its reply is never cached (decode positions differ from a re-prefill's
+    // MRoPE positions), so the radix references it holds when freed are its
+    // prompt's, in key form. Releasing over the reply would drop references
+    // it never took from a node another request's prompt put on the same
+    // key and tokens (the next turn re-sending this reply).
+    let (mut f, tokens) = staged();
+    f.model.prefix_cache = Box::new(spark_runtime::radix_tree::RadixTree::new());
+    f.model.stamp_vision_cache_key(&tokens, &mut f.seq);
+    let key = f.seq.vision_cache_key.clone();
+    f.seq.prompt_len = tokens.len();
+    f.seq.tokens = tokens.iter().copied().chain([9, 10, 11]).collect();
+    assert_eq!(&*f.model.radix_held_tokens(&f.seq), &key[..]);
+}
