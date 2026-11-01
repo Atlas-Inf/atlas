@@ -354,11 +354,9 @@ fn an_mp4_is_refused_by_name_with_a_conversion_hint() {
 #[test]
 fn a_single_frame_gif_is_refused_rather_than_treated_as_a_still() {
     let uri = make_gif(1, 64);
-    let mut glm = cfg();
-    glm.is_glm5_next = true;
     let err = format!(
         "{:#}",
-        preprocess_video(&uri, &glm, None, 10.0, &no_ffmpeg()).unwrap_err()
+        preprocess_video(&uri, &cfg(), None, 10.0, &no_ffmpeg()).unwrap_err()
     );
     assert!(err.contains("temporal group"), "{err}");
 }
@@ -401,6 +399,16 @@ fn glm_cfg() -> VisionConfig {
         patch_size: 14,
         ..cfg()
     }
+}
+
+/// The reference pads one sampled frame into a temporal pair rather than
+/// refusing it; Qwen keeps the short-clip refusal above.
+#[test]
+fn a_glm_single_sample_is_padded_to_a_temporal_group() {
+    let video = preprocess_video(&make_gif(1, 64), &glm_cfg(), None, 10.0, &no_ffmpeg())
+        .expect("the reference pads a sampled frame");
+    assert_eq!(video.grid_t, 1);
+    assert_eq!(video.timestamps, vec![0.0]);
 }
 
 /// A 2.5 s GIF at 10 fps samples frames [0, 6, 12, 18, 24] (the reference

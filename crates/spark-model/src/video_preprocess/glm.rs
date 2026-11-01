@@ -49,10 +49,6 @@ pub(super) fn preprocess_glm_video(
         "the clip declares no frame rate to sample by"
     );
     let tp = vcfg.temporal_patch_size;
-    ensure!(
-        total >= tp,
-        "video has {total} usable frame(s) but temporal_patch_size is {tp}; a clip must carry at          least one full temporal group"
-    );
     // The loader decodes each sampled frame once; the pair-filling repeat of
     // the last index is restored after decoding, as the processor pads.
     let mut indices = glm_sample_frame_indices(
