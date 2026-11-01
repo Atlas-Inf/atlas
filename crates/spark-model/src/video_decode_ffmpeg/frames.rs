@@ -18,10 +18,7 @@ use crate::vision_preprocess::{DECODE_MAX_ALLOC, DECODE_MAX_SIDE};
 pub fn probe_frames(bytes: &[u8], policy: &FfmpegPolicy) -> Result<(usize, f64)> {
     ensure_decoder(policy)?;
     let timing = probe_duration(bytes, policy)?;
-    Ok((
-        declared_frames(&timing, bytes.len())?,
-        timing.native_fps,
-    ))
+    Ok((declared_frames(&timing, bytes.len())?, timing.native_fps))
 }
 
 /// The frame count `timing` declares, which is only the container's word: a
