@@ -255,7 +255,6 @@ fn live_state(gpu: &MockGpuBackend, own: SequenceGeneration) -> Box<DflashPropos
     })
 }
 
-
 /// Grab two real KV pool blocks into the state's block table.
 fn hold_two_blocks(state: &mut DflashProposerState, kv: &parking_lot::Mutex<PagedKvCache>) {
     for _ in 0..2 {

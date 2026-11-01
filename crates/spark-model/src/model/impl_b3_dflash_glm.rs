@@ -23,7 +23,7 @@ impl TransformerModel {
             && let Some(ref proposer) = self.proposer
         {
             proposer.acquire_ctx_acc(self.gpu.as_ref(), dstate)?;
-            }
+        }
         let h = self.config.hidden_size;
         let bf16 = 2usize;
         let n_capture = self.dflash_capture_layers.len();
@@ -64,7 +64,7 @@ impl TransformerModel {
                 n_capture * h * bf16,
                 stream,
             )?;
-            }
+        }
         let Some(plan) = plan else {
             return Ok(());
         };
@@ -84,19 +84,19 @@ impl TransformerModel {
         proc_count: usize,
     ) -> Result<()> {
         if self.dflash_capture_layers.is_empty() {
-        return Ok(());
+            return Ok(());
         }
         if let Some(ref c) = self.comm
-        && c.rank() != 0
+            && c.rank() != 0
         {
-        return Ok(());
+            return Ok(());
         }
         if let Some(ps) = seq.proposer_state.as_mut()
-        && let Some(dstate) = ps
-            .as_any_mut()
-            .downcast_mut::<crate::layers::DflashProposerState>()
+            && let Some(dstate) = ps
+                .as_any_mut()
+                .downcast_mut::<crate::layers::DflashProposerState>()
         {
-        dstate.seed_prefill_ctx(seq.tokens.len(), chunk_start + proc_count, seq.seq_len);
+            dstate.seed_prefill_ctx(seq.tokens.len(), chunk_start + proc_count, seq.seq_len);
         }
         Ok(())
     }
