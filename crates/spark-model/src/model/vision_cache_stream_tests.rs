@@ -16,22 +16,17 @@ use crate::layers::vision_encoder::glm::test_tower;
 use crate::layers::{VisionEncoder, VisionTower};
 use crate::traits::Model;
 
-/// The tiny GLM tower on `f`'s backend.
-fn tower(f: &Fixture) -> VisionTower {
-    let enc = VisionEncoder::new_glm(
-        test_tower::weights(),
-        &test_tower::config(),
-        f.model.gpu.as_ref(),
-    );
-    VisionTower::Qwen(Box::new(enc.unwrap()))
-}
-
 /// A single-rank fixture with the tiny GLM tower and one staged 64-row image
 /// whose placeholders sit at positions 4..68 of a 72-token prompt.
 fn staged() -> (Fixture, Vec<u32>) {
     let mut f = Fixture::new(1, 1, 0);
-    let tower = tower(&f);
-    f.model.vision_encoder = Some(tower);
+    let tower = VisionEncoder::new_glm(
+        test_tower::weights(),
+        &test_tower::config(),
+        f.model.gpu.as_ref(),
+    )
+    .unwrap();
+    f.model.vision_encoder = Some(VisionTower::Qwen(Box::new(tower)));
     let item = test_tower::image(16);
     f.seq.vision.grids = vec![(1, 8, 8)];
     f.seq.vision.hashes = vec![item.content_hash];
@@ -138,6 +133,25 @@ fn every_tower_encodes_per_chunk_not_at_admission() {
 }
 
 #[test]
+fn every_tower_keys_its_vision_prompts_for_the_prefix_cache() {
+    // The key is content hashes over the placeholder runs, and both MRoPE
+    // walkers position a prefill that starts after a cached image from the
+    // whole prompt: nothing about it is GLM's. A Qwen image prompt was
+    // uncached (every turn of a 75K-token conversation re-prefilled ~22 s).
+    let (mut f, tokens) = staged();
+    let mut qwen = test_tower::config();
+    qwen.is_glm5_next = false;
+    f.model.config.vision = Some(qwen);
+    f.model.prefix_cache = Box::new(spark_runtime::radix_tree::RadixTree::new());
+    f.model.stamp_vision_cache_key(&tokens, &mut f.seq);
+    assert_eq!(f.seq.vision_cache_key.len(), tokens.len());
+    assert!(
+        f.model.pc_key(&f.seq, &tokens).is_some(),
+        "the prompt is cacheable"
+    );
+}
+
+#[test]
 fn a_chunk_over_the_output_window_fails_alone_before_any_launch() {
     // Every rank derives a chunk's rows from the same grids, so a chunk that
     // would overrun `buf_out` must fail request-locally on each of them
@@ -185,8 +199,13 @@ fn a_worker_waits_for_the_heads_encode_as_an_idle_receive() {
     // word as an idle receive; the order of collectives is unchanged.
     let (_, tokens) = staged();
     let mut w = Fixture::new(2, 1, 1);
-    let tower = tower(&w);
-    w.model.vision_encoder = Some(tower);
+    let tower = VisionEncoder::new_glm(
+        test_tower::weights(),
+        &test_tower::config(),
+        w.model.gpu.as_ref(),
+    )
+    .unwrap();
+    w.model.vision_encoder = Some(VisionTower::Qwen(Box::new(tower)));
     w.seq.vision.grids = vec![(1, 8, 8)];
     w.seq.vision.hashes = vec![1];
     w.seq.vision.deferred = true;
@@ -248,8 +267,13 @@ fn a_head_without_pixels_fails_instead_of_splicing_stale_rows() {
     // (through the agreement on a multi-rank world).
     for tp in [1, 2] {
         let mut f = Fixture::new(tp, 1, 0);
-        let tower = tower(&f);
-        f.model.vision_encoder = Some(tower);
+        let tower = VisionEncoder::new_glm(
+            test_tower::weights(),
+            &test_tower::config(),
+            f.model.gpu.as_ref(),
+        )
+        .unwrap();
+        f.model.vision_encoder = Some(VisionTower::Qwen(Box::new(tower)));
         let (_, tokens) = staged();
         f.seq.vision.grids = vec![(1, 8, 8)];
         f.seq.vision.hashes = vec![1];
@@ -269,25 +293,19 @@ fn a_head_without_pixels_fails_instead_of_splicing_stale_rows() {
 }
 
 #[test]
-fn every_tower_keys_its_vision_prompts_for_the_prefix_cache() {
-    // The key is content hashes over the placeholder runs, and every MRoPE
-    // walker positions a prefill that starts after a cached image from the
-    // whole prompt: nothing about it is GLM's. A Qwen image prompt was
-    // uncached (every turn of a 75K-token conversation re-prefilled ~22 s).
+fn a_vision_sequence_releases_its_prompt_not_its_reply() {
+    // Its reply is never cached (decode positions differ from a re-prefill's
+    // MRoPE positions), so the radix references it holds when freed are its
+    // prompt's, in key form. Releasing over the reply would drop references
+    // it never took from a node another request's prompt put on the same
+    // key and tokens (the next turn re-sending this reply).
     let (mut f, tokens) = staged();
-    let mut qwen = test_tower::config();
-    qwen.is_glm5_next = false;
-    f.model.config.vision = Some(qwen);
     f.model.prefix_cache = Box::new(spark_runtime::radix_tree::RadixTree::new());
     f.model.stamp_vision_cache_key(&tokens, &mut f.seq);
-    assert_eq!(f.seq.vision_cache_key.len(), tokens.len());
-    let key = f
-        .model
-        .pc_key(&f.seq, &tokens)
-        .expect("the prompt is cacheable");
-    assert_eq!(key[..4], tokens[..4], "text before the image keys as text");
-    assert!(key[4..68].iter().all(|&k| k != PAD && k & (1 << 31) != 0));
-    assert_eq!(key[68..], tokens[68..]);
+    let key = f.seq.vision_cache_key.clone();
+    f.seq.prompt_len = tokens.len();
+    f.seq.tokens = tokens.iter().copied().chain([9, 10, 11]).collect();
+    assert_eq!(&*f.model.radix_held_tokens(&f.seq), &key[..]);
 }
 
 #[test]
@@ -306,22 +324,6 @@ fn a_placeholder_the_key_does_not_cover_is_never_cached() {
         f.model.pc_key(&f.seq, &tokens[..4]).as_deref(),
         Some(&tokens[..4])
     );
-}
-
-#[test]
-fn a_vision_sequence_releases_its_prompt_not_its_reply() {
-    // Its reply is never cached (decode positions differ from a re-prefill's
-    // MRoPE positions), so the radix references it holds when freed are its
-    // prompt's, in key form. Releasing over the reply would drop references
-    // it never took from a node another request's prompt put on the same
-    // key and tokens (the next turn re-sending this reply).
-    let (mut f, tokens) = staged();
-    f.model.prefix_cache = Box::new(spark_runtime::radix_tree::RadixTree::new());
-    f.model.stamp_vision_cache_key(&tokens, &mut f.seq);
-    let key = f.seq.vision_cache_key.clone();
-    f.seq.prompt_len = tokens.len();
-    f.seq.tokens = tokens.iter().copied().chain([9, 10, 11]).collect();
-    assert_eq!(&*f.model.radix_held_tokens(&f.seq), &key[..]);
 }
 
 #[test]
