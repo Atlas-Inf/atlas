@@ -214,6 +214,10 @@ if [ "${MAX_BATCH:-1}" -gt 1 ]; then
   # verify, which costs a lone request ~15% (f132: C1 MTP 20.6 -> 17.5), so the
   # recipe turns it on only for multi-request serving. Explicit values win.
   export ATLAS_QWEN4EXP_BATCH_FAST="${ATLAS_QWEN4EXP_BATCH_FAST:-1}"
+  # On top of the lane, the per-row MoE top-k / blend and the GDN decode chain as one launch per
+  # layer (qwen4exp_gdn_decode_fused_rows: the strix-hip port of the gb10 cluster kernel). Framework
+  # f160 (Flash-Next, AR, x2): C4 34.0 -> 35.9, C8 38.2 -> 40.0 tok/s; solo text identical 8/8.
+  export ATLAS_QWEN4EXP_BATCH_SMALL="${ATLAS_QWEN4EXP_BATCH_SMALL:-1}"
 fi
 exec "$BIN" serve "$MODEL" "${NAME_ARG[@]}" \
   --host "${HOST:-0.0.0.0}" --port "${PORT:-8081}" \
