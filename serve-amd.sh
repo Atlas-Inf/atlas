@@ -80,7 +80,14 @@ export ATLAS_MTP_GATE_REPROBE=64  # re-probe the MTP accept gate every 64 tokens
 # The actual default is resolved below the DFLASH block — DFlash needs a
 # smaller one (see below).
 GPU_UTIL="${GPU_UTIL:-}"
-SSM_SLOTS="${SSM_SLOTS:-0}"
+# SSM_SLOTS: Marconi snapshot slots (the engine raises the count to cover MAX_SEQ_LEN). 0 DISABLES the pool,
+# and a hybrid model (27B, Flash-Next: GDN layers) can then never restore a cached prefix: every prefix-cache hit
+# is dropped ("Prefix cache hit: N tokens but no SSM snapshot -- recomputing all KV"). Default 8 (2026-11-01):
+#   Flash-Next, framework f165/f168 (1 user, MTP): TTFT after 8k of context 10.0 -> 3.15 s, after 16k 21.3 -> 5.8 s
+#   27B, strix s177 (1 user, MTP): TTFT after 8k 35.3 -> 9.25 s, after 16k 68.7 -> 10.5 s
+# at the cost of a cold prompt (Flash-Next 2k: 1.82 -> 2.34 s; 27B 2k: 5.7 -> 6.6 s). Agentic leg with it on:
+# 45/50 (f167; earlier slots-8 gates 46-48/50). SSM_SLOTS=0 restores the old behaviour.
+SSM_SLOTS="${SSM_SLOTS:-8}"
 # SSM_CKPT_INTERVAL: tokens between Marconi snapshots; default 16 (=256
 # tok/snapshot, the certified warm-prefill recipe). The engine raises
 # --ssm-cache-slots to cover MAX_SEQ_LEN at that granularity, so at 24K ctx
