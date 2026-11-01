@@ -1677,3 +1677,19 @@ Gate 68b runs next after 68a, the Qwen4 sanitizer boot.
 - Atlas never checked the shape, which is a robustness gap worth a main PR: refuse a projection whose element count doesn't match the expected shape.
 - With the fixed synth, the server boots. MTP fails to load (synth MTP tensor names), and the first prefill faults after the GDN layers. Next: name the faulting kernel.
 - Flash-Next control on the draft is IDENTICAL.
+
+## 2026-11-01 19:35 UTC — knob phase 2: A2 agentic (verbatim_prompt off only)
+
+- **A2:** 50/50 at 11.60 s/turn (run-1793561389183871850). That matches A6's 50/50 at 11.61, against A0's 47/50 at 10.85.
+- On this deployment, `verbatim_prompt` accounts for the whole agentic difference (observed, one run per arm). Posted on #271 (issuecomment-6562815714).
+- Running next: A1 agentic (72), then BFCL A2 and A1 (73, 74).
+
+**Qwen4 synth:**
+- `--verify-against` now checks every tensor against the Flash-Next index with per-family scaling, and passes.
+- Fixes since the last entry:
+  - MTP `fc_embedding` / `fc_hidden` are H×H;
+  - `pre_fc_norm_hidden` is 4H;
+  - indexer `index_qk_proj` is (4+1)·128;
+  - GDN is held at spec (16K·128 / 48V), so `in_proj_qkv` is [10240, 5120].
+- PLE width (10240 vs 4H) is unresolved. The no-PLE synth is the main test.
+- Boot is OK. The first 16-token request returned HTTP 500; iterating.
