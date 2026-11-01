@@ -451,7 +451,7 @@ fn timing(frame_count: Option<u64>, duration_secs: f32, native_fps: f32) -> Clip
         native_fps: f64::from(native_fps),
         frame_count,
     }
-    let policy = enabled();
+}
 
 #[test]
 fn declared_frames_reads_nb_frames_then_duration_times_rate() {
