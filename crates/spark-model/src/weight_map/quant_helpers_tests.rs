@@ -85,3 +85,25 @@ fn unknown_name_frees_directly() {
     assert_eq!(gpu.alloc_count(), 0);
     assert_eq!(store.reclaimed_count(), 0);
 }
+
+/// A `q_proj` missing its gate-fused half (the Qwen4 synth bug) fails at load
+/// time with the config-implied shape in the message, not as a sticky
+/// CUDA_ERROR_ILLEGAL_ADDRESS inside `quantize_to_nvfp4`.
+#[test]
+fn ensure_checkpoint_shape_rejects_a_short_q_proj() {
+    let gpu = MockGpuBackend::new();
+    let name = "model.language_model.layers.0.self_attn.q_proj.weight";
+    let store = store_with(&gpu, name, WeightDtype::BF16); // [16, 32]
+
+    // Matches: passes.
+    ensure_checkpoint_shape(&store, name, 16, 32, "test dims").unwrap();
+
+    // Half-sized: fails, naming the gate rule.
+    let err = ensure_checkpoint_shape(&store, name, 32, 32, "attn_output_gate doubles q rows")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("[16, 32]") && err.contains("[32, 32]") && err.contains("attn_output_gate"),
+        "unexpected message: {err}"
+    );
+}

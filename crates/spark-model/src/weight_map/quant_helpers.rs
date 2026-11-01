@@ -276,6 +276,32 @@ pub(super) fn bf16_bytes_to_f32(bytes: [u8; 2]) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
+/// Refuse a checkpoint tensor whose safetensors shape disagrees with the
+/// `[n, k]` the config implies, BEFORE it is uploaded and quantized. A short
+/// tensor (e.g. a `q_proj` missing its gate-fused half) is otherwise only
+/// caught as a sticky `CUDA_ERROR_ILLEGAL_ADDRESS` from a kernel that read
+/// `n*k` elements off the end of the uploaded buffer (CWE-125).
+///
+/// `why` names the config rule that set the expected shape
+/// ("attn_output_gate doubles q rows", "linear_attn qkv = (2*key+value)*dim").
+pub(crate) fn ensure_checkpoint_shape(
+    store: &WeightStore,
+    name: &str,
+    n: usize,
+    k: usize,
+    why: &str,
+) -> Result<()> {
+    let w = store
+        .get(name)
+        .with_context(|| format!("{name}: not found in the checkpoint"))?;
+    ensure!(
+        w.shape.len() == 2 && w.shape[0] == n && w.shape[1] == k,
+        "{name}: checkpoint shape {:?} but the config implies [{n}, {k}] ({why})",
+        w.shape,
+    );
+    Ok(())
+}
+
 /// Load a dense weight, auto-detecting FP8 block-scaled vs BF16/FP32.
 ///
 /// If the tensor is FP8E4M3 and a `{name_without_.weight}.weight_scale_inv` key exists,
