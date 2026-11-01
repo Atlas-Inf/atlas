@@ -56,9 +56,12 @@ use std::sync::{Arc, Mutex};
 
 use crate::video_sample::{sample_plan, wanted_frames};
 
+mod frames;
+mod input;
 mod probe;
 mod scale;
 mod timestamps;
+pub(crate) use frames::{decode_frame_indices, probe_frames};
 use probe::probe_duration;
 use scale::decoded_scale_filter;
 mod input;
@@ -292,6 +295,132 @@ pub fn decode_with_plan(
 /// Split out so the argument construction (the part with the correctness
 /// claims: `select` instead of a bare `fps`, and a `scale` that bounds decoded
 /// RGB) is readable on its own.
+fn ensure_decoder(policy: &FfmpegPolicy) -> Result<()> {
+    ensure!(
+        policy.enabled,
+        "this container needs ffmpeg to decode and subprocess decoding is disabled; \
+         pass --video-allow-ffmpeg to enable it, or send an animated GIF"
+    );
+    if let Availability::Missing(detail) = probe(policy) {
+        anyhow::bail!(
+            "the ffmpeg decoder is not usable: {detail} (no ffmpeg installed at that path, or it \
+             could not run) — install ffmpeg with its ffprobe companion, or point \
+             --video-ffmpeg-path at a usable build"
+        );
+    }
+    Ok(())
+}
+
+/// Generic ffmpeg subprocess: seekable staged input, streamed stdout read,
+/// stderr drained on a thread, watchdog kill after `policy.timeout_secs`
+/// (Enntity/atlas d0cead1).
+fn spawn_ffmpeg<T>(
+    bytes: &[u8],
+    filter: &str,
+    frames: usize,
+    output: &[&str],
+    policy: &FfmpegPolicy,
+    log_level: &str,
+    read: impl FnOnce(&mut std::process::ChildStdout) -> Result<T>,
+) -> Result<(T, String)> {
+    let input_file = input::SeekableInput::new(bytes)?;
+    let mut child = Command::new(&policy.binary)
+        .args([
+            "-v",
+            log_level,
+            "-nostdin",
+            "-protocol_whitelist",
+            "file,pipe",
+            "-format_whitelist",
+            "mov,matroska,webm,avi,mpegts,mpeg,ogg,flv",
+            "-i",
+        ])
+        .arg(input_file.path())
+        .args(["-vf", filter])
+        .args(["-frames:v", &frames.to_string()])
+        .args(output)
+        .args(["-f", "image2pipe", "pipe:1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "could not run {:?} — is ffmpeg installed and on PATH? \
+                 (set --video-ffmpeg-path to point at it)",
+                policy.binary
+            )
+        })?;
+
+    let mut stdout = child.stdout.take().context("no stdout pipe")?;
+    let mut stderr = child.stderr.take().context("no stderr pipe")?;
+
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr
+            .by_ref()
+            .take(8 * 1024 * 1024)
+            .read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
+
+    let child = Arc::new(Mutex::new(child));
+    let watchdog = {
+        let child = Arc::clone(&child);
+        let secs = policy.timeout_secs.max(1);
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let mut guard = match child.lock() {
+                    Ok(g) => g,
+                    Err(_) => return false,
+                };
+                match guard.try_wait() {
+                    Ok(Some(_)) => return false,
+                    Ok(None) => {}
+                    Err(_) => return false,
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = guard.kill();
+                    return true;
+                }
+            }
+        })
+    };
+
+    let read_res = read(&mut stdout);
+    if read_res.is_err()
+        && let Ok(mut g) = child.lock()
+    {
+        let _ = g.kill();
+    }
+
+    let err_text = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("ffmpeg stderr reader panicked"))?;
+
+    let status = {
+        let mut g = child
+            .lock()
+            .map_err(|_| anyhow::anyhow!("decoder lock poisoned"))?;
+        g.wait().context("waiting for the decoder")?
+    };
+    let timed_out = watchdog.join().unwrap_or(false);
+
+    ensure!(
+        !timed_out,
+        "decoding exceeded {}s and was stopped",
+        policy.timeout_secs
+    );
+    let out = read_res?;
+    if !status.success() {
+        let why = err_text.lines().next_back().unwrap_or("no detail").trim();
+        bail!("decoder failed: {why}");
+    }
+    Ok((out, err_text))
+}
+
 fn run_ffmpeg(
     bytes: &[u8],
     selection: &str,
