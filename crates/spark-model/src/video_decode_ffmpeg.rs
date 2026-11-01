@@ -198,6 +198,22 @@ pub struct ClipTiming {
     pub frame_count: Option<u64>,
 }
 
+fn ensure_decoder(policy: &FfmpegPolicy) -> Result<()> {
+    ensure!(
+        policy.enabled,
+        "this container needs ffmpeg to decode and subprocess decoding is disabled; \
+         pass --video-allow-ffmpeg to enable it, or send an animated GIF"
+    );
+    if let Availability::Missing(detail) = probe(policy) {
+        anyhow::bail!(
+            "the ffmpeg decoder is not usable: {detail} (no ffmpeg installed at that path, or it \
+             could not run) — install ffmpeg with its ffprobe companion, or point \
+             --video-ffmpeg-path at a usable build"
+        );
+    }
+    Ok(())
+}
+
 /// Decode `bytes` to RGB frames spanning the clip, plus the plan that
 /// produced them.
 ///
@@ -210,22 +226,11 @@ pub fn decode_with_plan(
     target_fps: f32,
     policy: &FfmpegPolicy,
 ) -> Result<(Vec<RgbImage>, Vec<f32>)> {
-    ensure!(
-        policy.enabled,
-        "this container needs ffmpeg to decode and subprocess decoding is disabled; \
-         pass --video-allow-ffmpeg to enable it, or send an animated GIF"
-    );
     // Check the decoder BEFORE probing the clip. Otherwise a missing binary
     // surfaces as an unprobeable clip, which sends the operator hunting for a
     // corrupt video when the real fix is to install ffmpeg. `probe` names the
     // binary and the remedy.
-    if let Availability::Missing(detail) = probe(policy) {
-        anyhow::bail!(
-            "the ffmpeg decoder is not usable: {detail} (no ffmpeg installed at that path, or it \
-             could not run) — install ffmpeg with its ffprobe companion, or point \
-             --video-ffmpeg-path at a usable build"
-        );
-    }
+    ensure_decoder(policy)?;
     // A caller that passes a usable rate wins; anything else falls back to the
     // policy's, which is the operator's SSOT for video sampling.
     let policy_fps = crate::video_sample::finite_positive(policy.fps)
@@ -294,22 +299,6 @@ pub fn decode_with_plan(
 /// Split out so the argument construction (the part with the correctness
 /// claims: `select` instead of a bare `fps`, and a `scale` that bounds decoded
 /// RGB) is readable on its own.
-fn ensure_decoder(policy: &FfmpegPolicy) -> Result<()> {
-    ensure!(
-        policy.enabled,
-        "this container needs ffmpeg to decode and subprocess decoding is disabled; \
-         pass --video-allow-ffmpeg to enable it, or send an animated GIF"
-    );
-    if let Availability::Missing(detail) = probe(policy) {
-        anyhow::bail!(
-            "the ffmpeg decoder is not usable: {detail} (no ffmpeg installed at that path, or it \
-             could not run) — install ffmpeg with its ffprobe companion, or point \
-             --video-ffmpeg-path at a usable build"
-        );
-    }
-    Ok(())
-}
-
 fn run_ffmpeg(
     bytes: &[u8],
     selection: &str,
