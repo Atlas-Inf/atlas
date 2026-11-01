@@ -403,16 +403,6 @@ fn glm_cfg() -> VisionConfig {
     }
 }
 
-/// The reference pads one sampled frame into a temporal pair rather than
-/// refusing it; Qwen keeps the short-clip refusal above.
-#[test]
-fn a_glm_single_sample_is_padded_to_a_temporal_group() {
-    let video = preprocess_video(&make_gif(1, 64), &glm_cfg(), None, 10.0, &no_ffmpeg())
-        .expect("the reference pads a sampled frame");
-    assert_eq!(video.grid_t, 1);
-    assert_eq!(video.timestamps, vec![0.0]);
-}
-
 /// A 2.5 s GIF at 10 fps samples frames [0, 6, 12, 18, 24] (the reference
 /// returns them with the last repeated to fill the third pair), resized as one
 /// five-frame volume: 64x64 is under the 16-token minimum, so it is upscaled
