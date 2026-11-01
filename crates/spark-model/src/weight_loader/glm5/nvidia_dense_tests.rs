@@ -60,6 +60,7 @@ fn load(store: &WeightStore, gpu: &MockGpuBackend) -> anyhow::Result<FfnComponen
             stream: 0,
         },
         true,
+        None,
     )
 }
 

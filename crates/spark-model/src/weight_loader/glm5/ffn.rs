@@ -11,12 +11,14 @@ use spark_runtime::weights::WeightStore;
 
 use crate::layers::dense_ffn::DenseFfnWeights;
 use crate::layers::{DenseFfnLayer, FfnComponent, MoeLayer};
-use crate::tp_shard::TpShardKind;
 use crate::weight_map::{
     DenseWeight, ExpertWeight, MoeWeights, Nvfp4Variant, QuantizeCtx, QuantizedWeight, dense_auto,
     quantized_any,
 };
 
+/// The layer's FFN; `host_experts`: its expert-TP slices when already read
+/// ([`super::expert_tp::read_layer_experts`]), else they are read here.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn load_ffn(
     store: &WeightStore,
     lp: &str,
@@ -26,6 +28,7 @@ pub(super) fn load_ffn(
     variant: Nvfp4Variant,
     qctx: QuantizeCtx,
     allow_prefill_layout: bool,
+    host_experts: Option<super::expert_tp::HostExperts>,
 ) -> Result<FfnComponent> {
     if config.mlp_only_layers.contains(&layer_idx) {
         return load_dense_ffn(store, lp, config, gpu, variant, qctx);
@@ -39,6 +42,7 @@ pub(super) fn load_ffn(
         variant,
         qctx,
         allow_prefill_layout,
+        host_experts,
     )
 }
 
@@ -123,6 +127,7 @@ fn load_dense_ffn(
     )?))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_moe(
     store: &WeightStore,
     lp: &str,
@@ -132,6 +137,7 @@ fn load_moe(
     variant: Nvfp4Variant,
     qctx: QuantizeCtx,
     allow_prefill_layout: bool,
+    host_experts: Option<super::expert_tp::HostExperts>,
 ) -> Result<FfnComponent> {
     let mmq_moe = env_flag("ATLAS_NVFP4_MMQ_MOE");
     let cutlass_moe = env_flag("ATLAS_MOE_GROUPED_CUTLASS");
@@ -139,69 +145,58 @@ fn load_moe(
     let p = format!("{lp}.mlp");
     let h = config.hidden_size;
     let inter = config.moe_intermediate_size;
-    let mut experts = Vec::with_capacity(config.num_experts);
     anyhow::ensure!(
         !config.expert_tp || matches!(variant, Nvfp4Variant::Standard),
         "expert TP slices ModelOpt NVFP4 experts only, got {variant:?}"
     );
-    for expert in 0..config.num_experts {
-        if config.expert_tp {
-            let ep = format!("{p}.experts.{expert}");
-            let slice = |name: &str, n: usize, k: usize, kind: TpShardKind| {
-                super::expert_tp::load_expert_slice(
-                    store,
-                    &format!("{ep}.{name}"),
-                    n,
-                    k,
-                    kind,
-                    config,
-                    gpu,
-                )
-                .with_context(|| format!("GLM-5 expert {expert} {name} (expert TP)"))
-            };
-            experts.push(ExpertWeight {
-                gate_proj: slice("gate_proj", inter, h, TpShardKind::ColumnParallel)?,
-                up_proj: slice("up_proj", inter, h, TpShardKind::ColumnParallel)?,
-                down_proj: slice("down_proj", h, inter, TpShardKind::RowParallel)?,
-            });
-        } else if config.is_local_expert(expert) {
-            let ep = format!("{p}.experts.{expert}");
-            experts.push(ExpertWeight {
-                gate_proj: quantized_any(
-                    store,
-                    &format!("{ep}.gate_proj"),
-                    inter,
-                    h,
-                    gpu,
-                    variant,
-                    qctx,
-                )
-                .with_context(|| format!("GLM-5 expert {expert} gate_proj"))?,
-                up_proj: quantized_any(
-                    store,
-                    &format!("{ep}.up_proj"),
-                    inter,
-                    h,
-                    gpu,
-                    variant,
-                    qctx,
-                )
-                .with_context(|| format!("GLM-5 expert {expert} up_proj"))?,
-                down_proj: quantized_any(
-                    store,
-                    &format!("{ep}.down_proj"),
-                    h,
-                    inter,
-                    gpu,
-                    variant,
-                    qctx,
-                )
-                .with_context(|| format!("GLM-5 expert {expert} down_proj"))?,
-            });
-        } else {
-            experts.push(ExpertWeight::null());
-        }
-    }
+    let experts = if config.expert_tp {
+        let host = match host_experts {
+            Some(host) => host,
+            None => super::expert_tp::read_layer_experts(store, &p, config)?,
+        };
+        super::expert_tp::upload_experts(store, &p, host, gpu)?
+    } else {
+        (0..config.num_experts)
+            .map(|expert| -> Result<ExpertWeight> {
+                if !config.is_local_expert(expert) {
+                    return Ok(ExpertWeight::null());
+                }
+                let ep = format!("{p}.experts.{expert}");
+                Ok(ExpertWeight {
+                    gate_proj: quantized_any(
+                        store,
+                        &format!("{ep}.gate_proj"),
+                        inter,
+                        h,
+                        gpu,
+                        variant,
+                        qctx,
+                    )
+                    .with_context(|| format!("GLM-5 expert {expert} gate_proj"))?,
+                    up_proj: quantized_any(
+                        store,
+                        &format!("{ep}.up_proj"),
+                        inter,
+                        h,
+                        gpu,
+                        variant,
+                        qctx,
+                    )
+                    .with_context(|| format!("GLM-5 expert {expert} up_proj"))?,
+                    down_proj: quantized_any(
+                        store,
+                        &format!("{ep}.down_proj"),
+                        h,
+                        inter,
+                        gpu,
+                        variant,
+                        qctx,
+                    )
+                    .with_context(|| format!("GLM-5 expert {expert} down_proj"))?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
     let shared = format!("{p}.shared_experts");
     let (shared_gate, gate_origin) = crate::layers::moe::load_glm_shared_fp8_weight(
         store,

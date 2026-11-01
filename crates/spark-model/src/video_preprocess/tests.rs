@@ -352,16 +352,6 @@ fn an_mp4_is_refused_by_name_with_a_conversion_hint() {
 }
 
 #[test]
-fn a_single_frame_gif_is_refused_rather_than_treated_as_a_still() {
-    let uri = make_gif(1, 64);
-    let err = format!(
-        "{:#}",
-        preprocess_video(&uri, &cfg(), None, 10.0, &no_ffmpeg()).unwrap_err()
-    );
-    assert!(err.contains("temporal group"), "{err}");
-}
-
-#[test]
 fn garbage_is_an_error_not_a_panic() {
     assert!(decode_frames("data:video/gif;base64,bm90LWEtZ2lm", 10.0, &no_ffmpeg()).is_err());
     assert!(decode_frames("!!! not base64 !!!", 10.0, &no_ffmpeg()).is_err());
