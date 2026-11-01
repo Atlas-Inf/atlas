@@ -66,7 +66,7 @@ pub(crate) struct MsgEntry {
     pub(super) reasoning_content: Option<String>,
 }
 
-/// Outputs of [`build_msg_entries`]. Bundled as a struct because
+/// Outputs of [`build_msg_entries_admitted`]. Bundled as a struct because
 /// the caller threads each field through five later phases.
 pub(super) struct BuildOut {
     pub(super) messages: Vec<MsgEntry>,
@@ -237,7 +237,7 @@ pub(super) fn build_msg_entries(
     )
 }
 
-/// [`build_msg_entries`] under the server's vision bounds: each item is sized
+/// `build_msg_entries` under the server's vision bounds: each item is sized
 /// from its header and admitted (`vision_admit`) before it is decoded.
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
 pub(super) fn build_msg_entries_admitted(
