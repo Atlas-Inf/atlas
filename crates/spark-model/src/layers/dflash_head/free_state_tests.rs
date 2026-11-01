@@ -257,6 +257,7 @@ fn live_state(gpu: &MockGpuBackend, own: SequenceGeneration) -> Box<DflashPropos
 /// A state as `alloc_state` returns it: accumulator allocated, every ctx
 /// watermark at zero, no paged blocks. This is the shape `adopt_dflash_ctx`
 /// sees in production (the call site guards on `ctx_len == 0`).
+#[allow(dead_code)]
 pub(super) fn fresh_state(gpu: &MockGpuBackend) -> Box<DflashProposerState> {
     fresh_state_with_owner(gpu, None)
 }
@@ -264,6 +265,7 @@ pub(super) fn fresh_state(gpu: &MockGpuBackend) -> Box<DflashProposerState> {
 /// Fresh state with a lifecycle bound, as `alloc_seq` leaves it before the
 /// first ctx seed — `adopt_dflash_ctx` reads the owner off this to re-key
 /// carried graphs.
+#[allow(dead_code)]
 pub(super) fn fresh_state_with_owner(
     gpu: &MockGpuBackend,
     own: Option<SequenceGeneration>,
@@ -275,6 +277,7 @@ pub(super) fn fresh_state_with_owner(
     s
 }
 
+#[allow(dead_code)]
 pub(super) fn fresh_state_inner(gpu: &MockGpuBackend) -> Box<DflashProposerState> {
     Box::new(DflashProposerState {
         block_table: Vec::new(),
