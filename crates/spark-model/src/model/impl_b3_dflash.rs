@@ -149,8 +149,6 @@ impl TransformerModel {
             },
             None => return Ok(()),
         };
-<<<<<<< HEAD
-=======
         if dstate.max_ctx_len == 0 {
             return Ok(()); // ctx conditioning disabled
         }
@@ -242,7 +240,6 @@ impl TransformerModel {
         {
             proposer.acquire_ctx_acc(self.gpu.as_ref(), dstate)?;
         }
->>>>>>> 5c15afb91 (dflash: warm-ctx drafting — real per-frame windows + device-resident restore)
         let h = self.config.hidden_size;
         let bf16 = 2usize;
         let n_capture = self.dflash_capture_layers.len();

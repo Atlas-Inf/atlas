@@ -442,7 +442,6 @@ impl TransformerModel {
                     if let Some(old) = displaced {
                         self.ssm_snapshots.free(old);
                     }
-<<<<<<< HEAD
                 } else {
                     // A placeholder the content key does not cover (an
                     // image-tainted snapshot under a colliding key), or HSS
@@ -452,11 +451,9 @@ impl TransformerModel {
                     // through those nodes — so free it rather than leak a
                     // pool slot.
                     self.ssm_snapshots.free(snap_id);
-=======
                     // ATLAS_DFLASH_WARM_CTX=restore (Enntity/atlas
                     // 5573f4d5): the drafter rows up to the prompt leaf.
                     self.dflash_warm_save(seq, tokens, stream)?;
->>>>>>> 5c15afb91 (dflash: warm-ctx drafting — real per-frame windows + device-resident restore)
                 }
             } else if let Some(key) = self.pc_key(seq, tokens)
                 && !self.hss_window_slid(seq)
