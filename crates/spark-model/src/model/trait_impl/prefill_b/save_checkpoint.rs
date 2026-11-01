@@ -188,7 +188,7 @@ impl TransformerModel {
     /// checkpoint of `tokens[..end_token]`, with the prefix-cache blocks
     /// under it. `false` (snapshot freed): the boundary cannot be cached
     /// (the KV is not valid that far, the sliding window has begun, or the
-    /// prefix holds a vision placeholder).
+    /// prefix holds a vision placeholder its content key does not cover).
     pub(in crate::model) fn register_intermediate_checkpoint(
         &self,
         tokens: &[u32],

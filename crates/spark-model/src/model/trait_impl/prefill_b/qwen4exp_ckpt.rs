@@ -156,10 +156,13 @@ impl TransformerModel {
         let [proc_start, proc_count] = span;
         // A pass that failed after planning left its hooks armed: disarm.
         let _ = ckpt::end();
+        // A vision prompt registers under its content key
+        // (`register_intermediate_checkpoint`); one the key does not cover
+        // takes no checkpoint (`vision_cache`).
         if !self.qwen4exp_ckpt_takes_tail()
             || !self.ssm_snapshots.is_enabled()
             || !self.prefix_cache.is_active()
-            || self.tokens_have_vision_pad(tokens)
+            || self.pc_key(seq, tokens).is_none()
         {
             return Ok(None);
         }
