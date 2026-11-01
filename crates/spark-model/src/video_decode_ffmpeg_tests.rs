@@ -445,6 +445,26 @@ fn a_moov_at_end_mp4_probes_and_decodes() {
     );
 }
 
+fn timing(frame_count: Option<u64>, duration_secs: f32, native_fps: f32) -> ClipTiming {
+    ClipTiming {
+        duration_secs,
+        native_fps,
+        frame_count,
+    }
+}
+
+#[test]
+fn declared_frames_reads_nb_frames_then_duration_times_rate() {
+    assert_eq!(
+        frames::declared_frames(&timing(Some(10), 1.0, 10.0), 1848).unwrap(),
+        10
+    );
+    assert_eq!(
+        frames::declared_frames(&timing(None, 2.0, 30.0), 1848).unwrap(),
+        60
+    );
+}
+
 #[test]
 fn a_faststart_mp4_probes_and_decodes() {
     if !have_ffmpeg() {
@@ -460,4 +480,17 @@ fn a_faststart_mp4_probes_and_decodes() {
     );
     let frames = super::decode_frames(&clip, 2.0, &policy).expect("faststart decode");
     assert!(!frames.is_empty(), "faststart clip should decode to frames");
+}
+
+#[test]
+fn a_frame_count_the_payload_cannot_hold_is_refused() {
+    // ffprobe reported this count for a 1,848-byte MP4 with a patched `stts`.
+    let err = frames::declared_frames(&timing(Some(4_000_000_000), 1.0, 10.0), 1848).unwrap_err();
+    assert!(err.to_string().contains("4000000000"), "{err}");
+    // Without `nb_frames` the same claim arrives as duration × rate.
+    assert!(frames::declared_frames(&timing(None, f32::MAX, f32::MAX), 1848).is_err());
+    assert_eq!(
+        frames::declared_frames(&timing(Some(1848), 1.0, 10.0), 1848).unwrap(),
+        1848
+    );
 }
