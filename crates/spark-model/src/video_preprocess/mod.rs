@@ -39,6 +39,10 @@ use crate::vision_preprocess::{
     patch_coordinates, target_size_for,
 };
 
+mod gif_access;
+mod glm;
+mod patchify;
+
 /// Frames per second to sample at, when the caller has no better idea.
 /// Matches the `fps: 2` every Qwen3-VL `video_processor` block declares.
 pub const DEFAULT_FPS: f32 = 2.0;
@@ -258,6 +262,11 @@ pub fn preprocess_video(
         vcfg.patch_size > 0 && vcfg.spatial_merge_size > 0 && vcfg.temporal_patch_size > 0,
         "vision_config geometry is invalid (patch/merge/temporal size is 0)"
     );
+    if vcfg.is_glm5_next {
+        // The GLM reference path: index sampling, one canvas, pair padding
+        // (Enntity/atlas f3f3876b).
+        return glm::preprocess_glm_video(data_uri, vcfg, max_pixels, target_fps, ffmpeg);
+    }
     let (frames, frame_times) = decode_frames(data_uri, target_fps, ffmpeg)?;
     let tp = vcfg.temporal_patch_size;
 
