@@ -1610,3 +1610,20 @@ Review fixes before push:
 Gate 68b runs next after 68a, the Qwen4 sanitizer boot.
 
 **Knob A0 (main 8c2b67218) BFCL ST-995:** 87.54 / 85.94 (run-1793521232941271578), identical to the 170c3ed3a run. A6 (full 565aa68 revert) BFCL is running.
+
+## 2026-11-01 11:40 UTC — knob phase 2: BFCL A0 vs A6 (one variable: Flash-Next MODEL.toml)
+
+| | A0 main 8c2b67218 | A6 pre-565aa68 MODEL.toml | Δ |
+|---|---:|---:|---:|
+| overall | 87.54 | 88.04 | +0.50 |
+| normalized | 85.94 | 88.08 | +2.14 |
+| hallucination | 91.48 | 95.64 | +4.16 |
+| live | 79.41 | 82.35 | +2.94 |
+| non_live | 86.93 | 86.26 | −0.67 |
+
+- Runs: run-1793521232941271578 / run-1793531962246711760.
+- One run per arm, so this is an observation, not cross-validated.
+- Posted on #271 (issuecomment-6557256069).
+- The A2/A1 BFCL arms (jobs 73/74) will attribute it to a knob. Agentic A0/A6 is next (69/70).
+- 68a (Qwen4 synth under compute-sanitizer): BOOT FAILED, with an unresolved kernel lookup plus 82 sanitizer errors. The draft fix is in progress (local).
+- 68b (train #305 gate) is running.
