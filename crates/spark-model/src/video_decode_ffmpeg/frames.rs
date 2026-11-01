@@ -20,7 +20,7 @@ pub fn probe_frames(bytes: &[u8], policy: &FfmpegPolicy) -> Result<(usize, f64)>
     let timing = probe_duration(bytes, policy)?;
     Ok((
         declared_frames(&timing, bytes.len())?,
-        timing.native_fps as f64,
+        timing.native_fps,
     ))
 }
 
@@ -30,7 +30,7 @@ pub fn probe_frames(bytes: &[u8], policy: &FfmpegPolicy) -> Result<(usize, f64)>
 /// least a byte, so the payload bounds it.
 pub(super) fn declared_frames(timing: &ClipTiming, payload_bytes: usize) -> Result<usize> {
     let frames = timing.frame_count.map_or_else(
-        || (timing.duration_secs as f64 * timing.native_fps as f64 + 0.5).floor() as usize,
+        || (timing.duration_secs as f64 * timing.native_fps + 0.5).floor() as usize,
         |frames| frames as usize,
     );
     ensure!(frames > 0, "the clip declares no video frames");
