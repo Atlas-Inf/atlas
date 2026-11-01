@@ -96,6 +96,11 @@ pub(crate) fn load_model(
     // (the head that freezes the value is built last, on the head rank only).
     if args.dflash {
         spark_model::layers::dflash_head::FirstAppend::from_env()?;
+        // ATLAS_DFLASH_WARM_CTX=restore (Enntity/atlas 5573f4d5): check the
+        // slots count only when the restore arm is on.
+        if spark_model::layers::dflash_head::WarmCtx::from_env()?.restores() {
+            spark_model::layers::dflash_head::warm_ctx::store_slots_from_env()?;
+        }
     }
     // #158: the exact prefix-cache grid is read once, at model build.
     spark_runtime::prefill_grid::set_exact_prefix_cache(args.exact_prefix_cache);

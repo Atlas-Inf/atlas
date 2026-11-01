@@ -389,6 +389,7 @@ impl TransformerModel {
             };
             // ATLAS_GLM_NVME_KEEP: kept records of the blocks this pass
             // recomputes in place are stale from here on (no-op otherwise).
+<<<<<<< HEAD
             self.nvme_forget_rewritten(key_tokens, seq.adapter_id, skip_tokens, matched, bs);
             self.pc_plan_branch(key_tokens, seq, matched, skip_tokens, bs)?;
             self.finish_leaf_restored(key_tokens, seq, skip_tokens, bs, stream)?;
@@ -400,6 +401,15 @@ impl TransformerModel {
                 chunk_start + chunk_len,
                 stream,
             )?;
+=======
+            self.nvme_forget_rewritten(tokens, seq.adapter_id, skip_tokens, matched, bs);
+            self.pc_plan_branch(tokens, seq, matched, skip_tokens, bs)?;
+            self.finish_leaf_restored(tokens, seq, skip_tokens, bs, stream)?;
+            // ATLAS_DFLASH_WARM_CTX (Enntity/atlas 5573f4d5): where the
+            // drafter's window may start, and its stored rows under the
+            // restore point.
+            self.dflash_warm_begin(seq, Some(tokens), skip_tokens, total, stream)?;
+>>>>>>> 5c15afb91 (dflash: warm-ctx drafting — real per-frame windows + device-resident restore)
             seq.marconi_skip_to = skip_tokens;
             seq.prefix_lookup_skip = skip;
             seq.prefix_lookup_applied = true;

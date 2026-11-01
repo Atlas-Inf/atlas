@@ -307,7 +307,13 @@ impl BlockDiffusionDraftHead {
         //
         // ATLAS_DFLASH_FIRST_APPEND picks what the first propose after
         // prefill appends (`first_append`).
+        let first_propose = dstate.first_append_at == Some(position);
         self.append_decode_ctx(dstate, target_hidden_stack, position, ctx.gpu, _stream)?;
+        // Enntity/atlas 5573f4d5 + 43a5b9a6 (ATLAS_DFLASH_WARM_CTX): one
+        // window dump on the first propose for dflash_warm_ctx_check.py.
+        if first_propose && super::warm_ctx::dump_dir().is_some() {
+            super::warm_ctx::dump_first_window(dstate, position, ctx.gpu, _stream)?;
+        }
 
         // ── I/O-PARITY DUMP: full ctx_hidden_acc accumulator after the decode
         // append (exactly the slots the block forward attends) ──

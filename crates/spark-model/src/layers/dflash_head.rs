@@ -422,6 +422,15 @@ pub struct DflashProposerState {
     /// `max_ctx_len`, holding this sequence's latest own capture (its last
     /// prefilled position, then each single-sequence decode).
     pub own_row: Option<DevicePtr>,
+    /// `ATLAS_DFLASH_WARM_CTX`, frozen from the head at allocation.
+    pub warm_ctx: WarmCtx,
+    /// Lowest prompt position the prefill window may start at: the first
+    /// position this prefill computes or restored (`warm_ctx`); 0 = none.
+    pub ctx_floor: usize,
+    /// The accumulator rows this prefill wrote or restored (`warm_ctx`).
+    pub(crate) ctx_run: Option<warm_ctx::CtxRun>,
+    /// The store windows this prefill wrote and restored from (`warm_ctx`).
+    pub(crate) ctx_store: warm_ctx_store::StoreRefs,
 }
 
 impl DflashProposerState {
@@ -808,6 +817,21 @@ use markov_slots::{MARKOV_BAN_DEPTH_OFFSET, MARKOV_PREV_BYTES};
 mod twins;
 pub use twins::{DflashTwins, LayerMxfp8};
 
+// Enntity/atlas 5573f4d5 + 43a5b9a6 + cfa56639 + d3953211
+// (ATLAS_DFLASH_WARM_CTX): the drafter's prompt-window plan and the
+// device-resident row store a warm turn restores from. Off by default.
+pub mod warm_ctx;
+pub use warm_ctx::WarmCtx;
+mod warm_ctx_seq;
+pub(crate) mod warm_ctx_store;
+pub use warm_ctx_store::{WarmCtxStore, store_bytes as warm_ctx_store_bytes};
+#[cfg(all(test, feature = "cuda"))]
+mod warm_ctx_gpu_tests;
+#[cfg(test)]
+mod warm_ctx_store_tests;
+#[cfg(test)]
+mod warm_ctx_tests;
+
 impl BlockDiffusionDraftHead {
     /// Total propose lanes (lane 0 = default-stream scratch; the rest live
     /// in `extra_lanes`). `ATLAS_DFLASH_PROPOSE_LANES` overrides (default 1).
@@ -1172,6 +1196,10 @@ impl DraftProposer for BlockDiffusionDraftHead {
             own_capture: false,
             own_row_at: None,
             own_row: own.then(|| ctx_hidden_acc.offset(max_ctx_len * ctx_slot_bytes)),
+            warm_ctx: self.startup.diagnostics.warm_ctx,
+            ctx_floor: 0,
+            ctx_run: None,
+            ctx_store: warm_ctx_store::StoreRefs::default(),
             // Propose lane: fixed for the seq lifetime (batch positions
             // reorder; captured graphs bake lane scratch pointers). Round-
             // robin keeps concurrent seqs spread across the lane streams.

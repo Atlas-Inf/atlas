@@ -760,6 +760,8 @@ impl TransformerModel {
             dflash_hidden_save,
             dflash_hidden_save_rows,
             dflash_hidden_save_nseq,
+            // `build_model` installs the reserved store (`set_dflash_warm_store`).
+            dflash_warm_store: crate::layers::dflash_head::WarmCtxStore::disabled(),
             dflash_capture_layers,
             verify2_graph: Mutex::new(std::collections::HashMap::new()),
             verify3_graph: Mutex::new(std::collections::HashMap::new()),
