@@ -61,6 +61,17 @@ pub(crate) fn build_full_attention_nvfp4(
                 let src = if store.contains(&format!("{prefix}.weight_packed")) {
                     quantized_auto(store, &prefix, gpu, variant)?
                 } else {
+                    crate::weight_map::ensure_checkpoint_shape(
+                        store,
+                        &format!("{prefix}.weight"),
+                        full_n,
+                        full_k,
+                        if config.attn_gated && name == "q_proj" {
+                            "attn_output_gate doubles q rows"
+                        } else {
+                            "attention projection dims from the config"
+                        },
+                    )?;
                     let dense_bf16 = dense_auto(store, &format!("{prefix}.weight"), gpu)?;
                     quantize_to_nvfp4(
                         &dense_bf16,
@@ -112,6 +123,17 @@ pub(crate) fn build_full_attention_nvfp4(
                 crate::weight_map::QuantizedWeight,
             )> {
                 let __t0 = std::time::Instant::now();
+                crate::weight_map::ensure_checkpoint_shape(
+                    store,
+                    &format!("{p}.{name}.weight"),
+                    full_n,
+                    full_k,
+                    if config.attn_gated && name == "q_proj" {
+                        "attn_output_gate doubles q rows"
+                    } else {
+                        "attention projection dims from the config"
+                    },
+                )?;
                 let src = dense_auto(store, &format!("{p}.{name}.weight"), gpu)?;
                 let __t_dq_ms = __t0.elapsed().as_millis();
                 let (sharded_ptr, local_n, local_k) =
