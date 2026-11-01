@@ -26,12 +26,9 @@
 pub(crate) mod block_mgmt;
 mod block_table_upload;
 pub(crate) mod decode_pieces;
-<<<<<<< HEAD
-=======
 mod dflash_capture_batch;
 pub(crate) mod dflash_ctx_window;
 mod dflash_warm_ctx;
->>>>>>> 5c15afb91 (dflash: warm-ctx drafting — real per-frame windows + device-resident restore)
 mod draft_assist;
 pub(crate) mod qsa_commit_table;
 pub use draft_assist::DraftAssist;
