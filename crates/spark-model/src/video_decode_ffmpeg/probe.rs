@@ -177,3 +177,22 @@ pub(super) fn read_probe(
         .context("waiting for ffprobe")?;
     Ok((out, err_text, status))
 }
+
+/// Refuse before touching the container when the subprocess decoder is off or
+/// its binary cannot run — the error names the flag or the missing install
+/// rather than letting the failure surface later as a decode error.
+pub(super) fn ensure_decoder(policy: &FfmpegPolicy) -> Result<()> {
+    ensure!(
+        policy.enabled,
+        "this container needs ffmpeg to decode and subprocess decoding is disabled; \
+         pass --video-allow-ffmpeg to enable it, or send an animated GIF"
+    );
+    if let Availability::Missing(detail) = probe(policy) {
+        anyhow::bail!(
+            "the ffmpeg decoder is not usable: {detail} (no ffmpeg installed at that path, or it \
+             could not run) — install ffmpeg with its ffprobe companion, or point \
+             --video-ffmpeg-path at a usable build"
+        );
+    }
+    Ok(())
+}

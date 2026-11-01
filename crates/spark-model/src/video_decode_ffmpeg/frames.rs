@@ -16,7 +16,7 @@ use crate::vision_preprocess::{DECODE_MAX_ALLOC, DECODE_MAX_SIDE};
 /// them: the stream's declared `nb_frames`, else `duration × fps` rounded
 /// (OpenCV's own estimate), and the stream's average rate.
 pub fn probe_frames(bytes: &[u8], policy: &FfmpegPolicy) -> Result<(usize, f64)> {
-    ensure_decoder(policy)?;
+    super::probe::ensure_decoder(policy)?;
     let timing = probe_duration(bytes, policy)?;
     Ok((declared_frames(&timing, bytes.len())?, timing.native_fps))
 }
@@ -47,7 +47,7 @@ pub fn decode_frame_indices(
     policy: &FfmpegPolicy,
     on_frame: &mut dyn FnMut(RgbImage) -> Result<()>,
 ) -> Result<usize> {
-    ensure_decoder(policy)?;
+    super::probe::ensure_decoder(policy)?;
     ensure!(
         !indices.is_empty() && indices.len() <= crate::video_sample::MAX_SAMPLE_PLAN,
         "video sampling selected {} frames; the decoder takes 1..={}",
