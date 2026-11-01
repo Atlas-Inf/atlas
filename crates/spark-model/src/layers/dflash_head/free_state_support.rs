@@ -4,6 +4,7 @@
 //! modules — moved out of `free_state_tests.rs` for the 500-LoC cap (no
 //! behaviour change).
 
+use spark_runtime::gpu::GpuBackend;
 use spark_runtime::gpu::mock::MockGpuBackend;
 
 use super::lifecycle::CaptureDescriptor;

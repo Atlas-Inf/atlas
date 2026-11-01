@@ -19,7 +19,7 @@ use spark_runtime::gpu::GpuBackend;
 use spark_runtime::gpu::mock::MockGpuBackend;
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
-use super::free_state_support::*;
+use crate::speculative::DraftProposer;
 use super::lifecycle::*;
 use super::{BlockDiffusionDraftHead, DflashKernels, DflashProposerState, DflashScratch};
 use crate::weight_map::DenseWeight;
