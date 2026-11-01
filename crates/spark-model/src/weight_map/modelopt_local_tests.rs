@@ -492,3 +492,6 @@ fn unregistered_nvfp4_module_expands() {
         f32::from_bits(u32::from(u16::from_le_bytes([v[2 * i], v[2 * i + 1]])) << 16) == 1.0
     }));
 }
+
+#[path = "modelopt_local_native_tests.rs"]
+mod native;

@@ -37,12 +37,9 @@ impl FastSafetensorsLoader {
             || self.is_expert_tp_slice(name)
     }
 
-    /// CSF scale streams, and the weight/scale pair of every module the model
-    /// build expands on the host (`host_decode_modules`).
+    /// The weight/scale pair of every module the model build expands on the
+    /// host (`host_decode_modules`).
     fn is_host_decoded(&self, name: &str) -> bool {
-        if crate::weights::is_csf_stream(name) {
-            return true;
-        }
         let module = name
             .strip_suffix(".weight")
             .or_else(|| name.strip_suffix(".weight_scale"));
