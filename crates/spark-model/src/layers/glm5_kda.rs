@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! GLM-5 KDA recurrent block for the conservative GB10 bring-up path.
+mod flash_prefill;
 mod forward_attention;
 mod forward_attention_entry;
 mod forward_attention_qkv;
+mod forward_attention_side;
 mod forward_ffn;
 mod forward_recurrent;
 mod forward_recurrent_owners;
@@ -15,6 +17,7 @@ mod profile;
 mod projection;
 mod recurrent;
 mod shared_cache;
+mod sp_overlap;
 
 use std::mem::size_of;
 
@@ -37,6 +40,29 @@ pub use projection::{Glm5KdaWeights, Glm5Projection};
 /// Both ranks must run the same value (`model::startup_parity`).
 pub(crate) fn kda_batched_ffn_enabled() -> bool {
     std::env::var("ATLAS_GLM_KDA_BATCHED_FFN").ok().as_deref() == Some("1")
+}
+
+/// `ATLAS_GLM_KDA_SIDE_PROJ_LT=1`: the loader stores b / f_a / g_a back to
+/// back (`weight_loader::glm5::kda_side_pack`) and prefill projects them as one
+/// CUTLASS GEMM (`ops::dense_gemm_packed_triple_n`), the triple's bytes.
+pub(crate) fn kda_side_proj_lt_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_KDA_SIDE_PROJ_LT").ok().as_deref() == Some("1"))
+}
+
+/// `ATLAS_GLM_KDA_CONV_PLANES=1`: prefill convolves the projection's q / k /
+/// v planes in place instead of first copying them into packed rows
+/// (`kda_pack_qkv`); the same bytes.
+pub(crate) fn kda_conv_planes_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_KDA_CONV_PLANES").ok().as_deref() == Some("1"))
+}
+
+/// The KDA prefill operator (`ATLAS_KDA_FLASH_PREFILL`, and SparkGLM's
+/// FP32-recurrence FlashKDA under `ATLAS_KDA_FLASH_LIBRARY` /
+/// `ATLAS_GLM_KDA_FLASH_PLANES`) as one word: the recurrent state's bytes.
+pub(crate) fn kda_flash_prefill_word() -> Result<u64> {
+    flash_prefill::requested().map(flash_prefill::Choice::word)
 }
 
 fn verify_batched_conv_snapshot_enabled() -> bool {
@@ -121,6 +147,10 @@ pub struct Glm5KdaLayer {
     w4a16_gemv_batch3_k: KernelHandle,
     w4a16_gemv_batch5_qkv_k: KernelHandle,
     w4a16_gemv_batchm: W4a16BatchmTiers,
+    /// `mxfp8_gemv_tc{8,16,32}` for MXFP8 q/k/v/o twins (zero when absent).
+    mxfp8_gemv_k: [KernelHandle; 3],
+    /// `mxfp8_quant_act_bf16` for W8A8 prefill operands (zero when absent).
+    mx_quant_k: KernelHandle,
     w4a16_gemm_k: KernelHandle,
     w4a16_gemm_t_m128_k: KernelHandle,
     dense_gemm_k: KernelHandle,
@@ -145,6 +175,7 @@ pub struct Glm5KdaLayer {
     preprocess_regresident_k: KernelHandle,
     recurrent_regresident_k: KernelHandle,
     register_resident_prefill: bool,
+    flash_prefill: Option<flash_prefill::FlashPrefill>,
     gated_norm_k: KernelHandle,
     hc_expand_k: KernelHandle,
     hc_pre_k: KernelHandle,
@@ -205,6 +236,8 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         use crate::layer::glm_long_owner as owner;
         // Every row-local stage (mHC, norms, projections, TP reduce) runs once
         // over all owners' rows; only the recurrence is per owner.
@@ -236,6 +269,9 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The chunk's prompt rows, then the passengers' verify rows: the
+        // routed FFN runs each on its reference lane (ATLAS_GLM_FP4L_DECODE_A16).
+        let _prompt = crate::layers::moe::PromptRows::enter(num_tokens);
         let rows = crate::layer::glm_long_owner::owner_rows(passengers)?;
         ensure!(
             ctx.midchunk_capture.is_none(),
@@ -280,6 +316,8 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         self.forward_inner(hidden, state, 1, true, false, ctx, stream)
     }
 
@@ -315,6 +353,8 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         // Speculative verify rows are one temporal sequence, not independent
         // requests. Batch the stateless projections/mHC work, but advance the
         // KDA recurrent state row-by-row and capture rollback intermediates.
@@ -334,6 +374,8 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         let independent = crate::model::glm_independent::selected(ctx, num_seqs)?;
         if independent
             || crate::model::glm_c4::batched_kda_rows(

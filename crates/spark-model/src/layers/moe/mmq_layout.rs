@@ -281,7 +281,12 @@ impl MoeLayer {
         &mut self,
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
+        store: &spark_runtime::weights::WeightStore,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !config.expert_tp,
+            "NVFP4 MMQ does not support expert TP; use the checkpoint-native or unified layout"
+        );
         self.btile_storage.require_legacy()?;
         self.experts_scale_kind.expect(
             crate::weight_map::WeightQuantFormat::Nvfp4,
@@ -327,7 +332,7 @@ impl MoeLayer {
         let (gate, gate_slab) =
             self.repack_mmq_projection(gpu, &gate_src, &self.gate_ptrs, inter, h, stream)?;
         for expert in &mut self.weights.experts {
-            free_quantized_payload(gpu, &mut expert.gate_proj)?;
+            free_quantized_payload(gpu, store, &mut expert.gate_proj)?;
         }
         free_expert_table(gpu, &self.gate_ptrs)?;
         self.gate_ptrs = gate;
@@ -337,7 +342,7 @@ impl MoeLayer {
         let (up, up_slab) =
             self.repack_mmq_projection(gpu, &up_src, &self.up_ptrs, inter, h, stream)?;
         for expert in &mut self.weights.experts {
-            free_quantized_payload(gpu, &mut expert.up_proj)?;
+            free_quantized_payload(gpu, store, &mut expert.up_proj)?;
         }
         free_expert_table(gpu, &self.up_ptrs)?;
         self.up_ptrs = up;
@@ -347,7 +352,7 @@ impl MoeLayer {
         let (down, down_slab) =
             self.repack_mmq_projection(gpu, &down_src, &self.down_ptrs, h, inter, stream)?;
         for expert in &mut self.weights.experts {
-            free_quantized_payload(gpu, &mut expert.down_proj)?;
+            free_quantized_payload(gpu, store, &mut expert.down_proj)?;
         }
         free_expert_table(gpu, &self.down_ptrs)?;
         self.down_ptrs = down;
@@ -413,12 +418,24 @@ impl MoeLayer {
     }
 }
 
-fn free_quantized_payload(gpu: &dyn GpuBackend, weight: &mut QuantizedWeight) -> Result<()> {
-    if !weight.weight.is_null() {
-        gpu.free(weight.weight)?;
-        gpu.free(weight.weight_scale)?;
-        weight.weight = DevicePtr::NULL;
-        weight.weight_scale = DevicePtr::NULL;
+fn free_quantized_payload(
+    gpu: &dyn GpuBackend,
+    store: &spark_runtime::weights::WeightStore,
+    weight: &mut QuantizedWeight,
+) -> Result<()> {
+    for ptr in [&mut weight.weight, &mut weight.weight_scale] {
+        if ptr.is_null() {
+            continue;
+        }
+        // Retire each source before the irreversible driver call. Marking only
+        // after all projections finish leaves stale checkpoint owners if a
+        // later allocation/free fails, or if an address is reused by a slab.
+        // A poisoned store leaves the pointer untouched and performs no free.
+        store.mark_freed_elsewhere(&[*ptr])?;
+        let source = std::mem::replace(ptr, DevicePtr::NULL);
+        // On a driver error CUDA restores its cleanup ledger entry. Leave
+        // that backstop as the only owner; the layer/store must not retry.
+        gpu.free(source)?;
     }
     Ok(())
 }
@@ -429,3 +446,7 @@ fn free_expert_table(gpu: &dyn GpuBackend, table: &ExpertPtrTable) -> Result<()>
     gpu.free(table.scale2_vals)?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "mmq_layout_tests.rs"]
+mod tests;

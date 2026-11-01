@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Single-shard buffered/direct I/O and upload; extracted without changing order.
-use super::csf_assembler::CsfAssembler;
 use super::shard_readers::ShardReaders;
 use super::{direct_io, header::parse_header};
 use crate::gpu::GpuBackend;
-use crate::weights::{
-    WeightDtype, WeightTensor, evict_page_cache, f16_to_bf16_bytes, is_csf_stream,
-};
+use crate::weights::nvfp4_csf::{CsfAssembler, csf_part};
+use crate::weights::{WeightDtype, WeightTensor, evict_page_cache, f16_to_bf16_bytes};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs::File;
@@ -51,10 +49,18 @@ pub(super) fn load_shard_fast(
     // on GB10 is managed memory, i.e. Linux swap, i.e. a kernel freeze. They
     // are recorded with their on-disk location and served either by streaming
     // per-table quantize-on-load or straight off NVMe by the row cache.
+    //
+    // Under expert TP a CSF-compressed scale's COMPONENTS are deferred (see
+    // `should_defer_tensor`), to be decoded one matrix at a time by
+    // `with_deferred_slice`; the assembler still checks them by shape.
     let mut deferred_here: Vec<(String, crate::weights::DeferredTensor)> = Vec::new();
+    let mut csf_deferred: Vec<(String, Vec<usize>, usize)> = Vec::new();
     #[allow(clippy::items_after_statements)]
     tensors.retain(|t| {
         if crate::weights::is_ngram_table(&t.name) || (!skip_fn(&t.name) && defer_fn(&t.name)) {
+            if csf_part(&t.name).is_some() {
+                csf_deferred.push((t.name.clone(), t.shape.clone(), t.len));
+            }
             deferred_here.push((
                 t.name.clone(),
                 crate::weights::DeferredTensor {
@@ -68,9 +74,12 @@ pub(super) fn load_shard_fast(
         }
         !skip_fn(&t.name)
     });
+    for (name, shape, len) in &csf_deferred {
+        csf.defer(name, shape, *len)?;
+    }
     // A deferred plain scale is still a plain scale: one that is also
     // CSF-compressed is refused whichever form arrives first.
-    for (name, _) in &deferred_here {
+    for (name, _) in deferred_here.iter().filter(|(n, _)| csf_part(n).is_none()) {
         csf.note_plain(name)?;
     }
     if !deferred_here.is_empty() {
@@ -134,12 +143,13 @@ pub(super) fn load_shard_fast(
     // itself fails we fall back to per-tensor allocs for this shard —
     // same behaviour as pack mode disabled.
     let slab = if pack_slab {
-        // A CSF stream is never uploaded: it takes no room in the slab.
-        let (offsets, total) = crate::weights::slab_layout(
-            tensors
-                .iter()
-                .map(|t| if is_csf_stream(&t.name) { 0 } else { t.len }),
-        );
+        let (offsets, total) = crate::weights::slab_layout(tensors.iter().map(|t| {
+            if csf_part(&t.name).is_some() {
+                0
+            } else {
+                t.len
+            }
+        }));
         if total == 0 {
             None
         } else {
@@ -161,9 +171,10 @@ pub(super) fn load_shard_fast(
         let (idx, buf, slice_start) = result?;
         let meta = &tensors[idx];
         let raw = &buf.as_slice()[slice_start..slice_start + meta.len];
-        // CSF streams are gathered (possibly across shards) and only the
-        // decoded E4M3 `weight_scale` is uploaded.
-        if is_csf_stream(&meta.name) {
+        // CSF-compressed NVFP4 scales (either encoding): the components are
+        // gathered (possibly across shards) and only the decoded E4M3
+        // `weight_scale` is uploaded.
+        if csf_part(&meta.name).is_some() {
             if let Some(scale) = csf.offer(&meta.name, &meta.shape, raw)? {
                 let ptr = upload(gpu, &scale.name, &scale.bytes, offload_logged)?;
                 out.insert(

@@ -51,6 +51,8 @@ fn nvidia_checkpoint_maps_hybrid_kda_mla_moe_shape() {
     assert_eq!(cfg.shared_expert_intermediate_size, 2048);
     assert_eq!(cfg.scoring_func, "sigmoid");
     assert!(cfg.use_routing_bias);
+    assert!(cfg.router_logits_f32);
+    assert_eq!(cfg.router_logit_bytes(), 4);
     assert_eq!(cfg.mlp_only_layers, vec![0, 1, 2]);
 
     // mHC and the k-pool semantic indexer.
@@ -86,6 +88,19 @@ fn layer_types_follow_the_checkpoint_not_a_fixed_period() {
         };
         assert_eq!(cfg.layer_type(layer), expected, "layer {layer}");
     }
+}
+
+#[test]
+fn router_logits_are_float32_and_nothing_else() {
+    let json = text_config_with(|t| {
+        t.remove("moe_router_dtype");
+    });
+    assert!(parse_config(&json).unwrap().router_logits_f32);
+    let json = text_config_with(|t| {
+        t["moe_router_dtype"] = "bfloat16".into();
+    });
+    let err = parse_config(&json).unwrap_err().to_string();
+    assert!(err.contains("moe_router_dtype"), "{err}");
 }
 
 #[test]
@@ -127,4 +142,67 @@ fn missing_required_field_names_it() {
     });
     let err = format!("{:#}", parse_config(&json).unwrap_err());
     assert!(err.contains("kv_lora_rank"), "{err}");
+}
+
+/// nvidia/GLM-5.3-Flash-FP4-Local (revision `76348ddb`) `config.json`, its
+/// `quantized_layers` trimmed to every csf_32x2_v1 entry plus one of each
+/// other scheme (its `hf_quant_config.json` is the same object).
+const FP4_LOCAL_CONFIG: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../test_data/glm5_next_fp4local_config.json"
+));
+
+#[test]
+fn fp4_local_declares_csf32_routed_expert_scales() {
+    let cfg = parse_config(FP4_LOCAL_CONFIG).unwrap();
+    assert_eq!(cfg.model_type, "glm5_next");
+    let q = cfg
+        .quantization_config
+        .expect("ModelOpt quantization config");
+    assert_eq!(
+        (q.quant_method.as_str(), q.quant_algo.as_str()),
+        ("modelopt", "MIXED_PRECISION")
+    );
+    let spec = |path: &str| q.quantized_layers.get(path).cloned().unwrap_or_default();
+    let csf32 = |algo: &str| QuantLayerSpec {
+        quant_algo: algo.into(),
+        group_size: 16,
+        weight_scale_encoding: Some("csf_32x2_v1".into()),
+        weight_block_size: vec![],
+    };
+    // Routed experts of layers 3..=44 ship csf_32x2_v1 scales; the MTP
+    // layer's (45) are plain W4A16_NVFP4.
+    for layer in 3..=44 {
+        let path = format!("model.language_model.layers.{layer}.mlp.experts");
+        assert_eq!(spec(&path), csf32("NVFP4"), "{path}");
+    }
+    let mtp = spec("model.language_model.layers.45.mlp.experts");
+    assert_eq!(
+        (
+            mtp.quant_algo.as_str(),
+            mtp.weight_scale_encoding.as_deref().unwrap_or("")
+        ),
+        ("W4A16_NVFP4", "")
+    );
+    let encoded = q
+        .quantized_layers
+        .values()
+        .filter(|s| {
+            s.weight_scale_encoding
+                .as_deref()
+                .is_some_and(|e| !e.is_empty())
+        })
+        .count();
+    assert_eq!(
+        encoded, 42,
+        "only the 42 routed-expert entries are compressed"
+    );
+    for path in [
+        "lm_head",
+        "model.language_model.layers.3.mlp.shared_experts.down_proj",
+        "model.language_model.layers.45.self_attn.q_a_proj",
+    ] {
+        let entry = spec(path).weight_scale_encoding;
+        assert_eq!(entry.as_deref().unwrap_or(""), "", "{path}");
+    }
 }

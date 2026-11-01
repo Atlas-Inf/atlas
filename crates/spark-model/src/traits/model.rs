@@ -145,6 +145,32 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// Whether a sampled verify on that argmax-only head can still pick from
+    /// the target's distribution: [`Self::verify_split_candidates`] and
+    /// [`Self::verify_split_full_rows`] serve.
+    fn verify_split_sampling(&self) -> bool {
+        false
+    }
+
+    /// Head only, between a verify's forward and its verdict word: every
+    /// rank's best logits of verify rows `[0, rows)` at `temperature`, with
+    /// the logits of `specials` (the tokens the host pipeline may mask) and
+    /// what the rest of each row adds up to (`spark_model::model::SplitRow`).
+    fn verify_split_candidates(
+        &self,
+        _rows: usize,
+        _temperature: f32,
+        _specials: &[u32],
+    ) -> Result<Vec<crate::model::SplitRow>> {
+        bail!("this model has no split verify head")
+    }
+
+    /// Head only, like [`Self::verify_split_candidates`]: verify rows
+    /// `[0, rows)` whole, `rows * vocab` BF16 logits into `out`.
+    fn verify_split_full_rows(&self, _rows: usize, _out: &mut [u8]) -> Result<()> {
+        bail!("this model has no split verify head")
+    }
+
     /// Run beam search to completion for each request, returning each one's
     /// winning hypothesis token ids (EOS-terminated). Called from the prefill
     /// path for `num_beams > 1` requests, bypassing the token-by-token decode
@@ -1180,18 +1206,19 @@ pub trait Model: Send + Sync {
     /// state) — the model holds none between requests.
     ///
     /// Default: no-op (text-only models).
-    /// `(window, request)`: the merged vision rows one encode may write and
-    /// the rows one request may carry (`vision_limits`). Default `(0, 0)`.
-    fn vision_row_limits(&self) -> (usize, usize) {
-        (0, 0)
-    }
-
     fn prepare_vision_embed(
         &self,
         _seq: &mut crate::traits::SequenceState,
         _images: Vec<crate::VisionItem>,
     ) -> Result<()> {
         Ok(())
+    }
+
+    /// `(window, request)`: the merged vision rows one encode may write (the
+    /// encoder output window, which one prefill chunk's items must fit) and
+    /// the rows one request may carry (`vision_limits`). Default `(0, 0)`.
+    fn vision_row_limits(&self) -> (usize, usize) {
+        (0, 0)
     }
 
     /// `prepare_vision_embed` for a request whose chunk 0 goes through

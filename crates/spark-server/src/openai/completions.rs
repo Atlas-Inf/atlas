@@ -66,6 +66,10 @@ pub struct CompletionRequest {
     pub logit_bias: Option<std::collections::HashMap<String, f32>>,
     #[serde(default)]
     pub stream: bool,
+    /// Decode this request without speculative proposals or verification.
+    /// The resident model and its draft weights remain loaded.
+    #[serde(default)]
+    pub disable_mtp: bool,
     /// Stop sequences (same as chat completions).
     #[serde(default, deserialize_with = "deserialize_stop")]
     pub stop: Vec<String>,

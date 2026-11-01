@@ -91,7 +91,8 @@ impl MoeLayer {
         Ok(())
     }
 
-    /// C3 router logits in scalar `dense_gemm` numerics. Short batches use
+    /// C3 router logits in scalar `dense_gemm` numerics (FP32 under
+    /// [`Self::router_f32`]: `dense_gemm_bf16_f32out` and the rows kernel). Short batches use
     /// the bit-identical row-parallel kernel (`ATLAS_GLM_ROUTER_ROWS=0`
     /// reverts; `ATLAS_GLM_ROUTER_ROWS_CHECK=1` compares both byte for byte).
     #[allow(clippy::too_many_arguments)]
@@ -115,7 +116,7 @@ impl MoeLayer {
         let scalar = |out: DevicePtr| {
             ops::dense_gemm(
                 ctx.gpu,
-                self.dense_gemm,
+                self.router_gemm,
                 router_in,
                 &self.weights.gate,
                 out,
@@ -140,7 +141,7 @@ impl MoeLayer {
             stream,
         )?;
         if check {
-            let bytes = (rows * num_experts) as usize * 2;
+            let bytes = (rows * num_experts) as usize * ctx.config.router_logit_bytes();
             let mut fast = vec![0u8; bytes];
             ctx.gpu.copy_d2h(gate_logits, &mut fast)?;
             scalar(gate_logits)?;

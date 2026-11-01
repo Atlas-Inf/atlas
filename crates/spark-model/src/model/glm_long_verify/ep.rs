@@ -116,7 +116,7 @@ impl TransformerModel {
         );
         let tokens = self.ep_broadcast_tokens(&vec![0u32; rows])?;
         self.glm_long_restore_owner(owner, rows)?;
-        let accepted = self.ep_broadcast_u32(0)? as usize;
+        let accepted = self.ep_worker_verdict()?;
         ensure!(
             accepted < rows,
             "GLM long owner verdict {accepted} for {rows} rows"

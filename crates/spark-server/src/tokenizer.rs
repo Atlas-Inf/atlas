@@ -91,6 +91,10 @@ pub struct ChatTokenizer {
     /// needs the tokenizer-side sentinel escape; other families retain their
     /// prompt bytes. Ported from Enntity/atlas b1b53814 (AGPL-3.0-only).
     pub(crate) glm_tool_markup_as_text: bool,
+    /// Tool results reach the template with their `tool_call_id`, as vLLM
+    /// passes them (DeepSeek-V4's encoder; GLM-5.3's template orders
+    /// parallel results by it). Other families keep their prompt bytes.
+    pub(crate) tool_call_ids_in_template: bool,
     chat_encoding: ChatEncoding,
     /// Compiled Jinja chat template (from tokenizer_config.json).
     #[allow(dead_code)]

@@ -300,6 +300,91 @@ pub(crate) fn build_glm5(
     }
 }
 
+/// Which walker positions a vision prompt (the checkpoint's prompt form).
+#[derive(Clone, Copy)]
+pub(crate) enum Walk {
+    /// [`build`]: one contiguous pad run per item.
+    Generic,
+    /// [`build_qwen3vl`]: one timestamp-separated `t=1` plane per group.
+    Qwen3vl,
+    /// [`build_glm5`]: per-frame image markers; the four marker ids.
+    Glm5 {
+        image_start: u32,
+        image_end: u32,
+        video_start: u32,
+        video_end: u32,
+    },
+}
+
+/// The (T, H, W) positions of prompt rows `rows`, appended to `out`: the
+/// walker runs over the prompt from position 0 and the range is sliced out,
+/// so text after an image keeps the image's compressed position base in
+/// every later chunk, an item straddling a chunk boundary keeps its plane,
+/// and a later chunk's item takes its own grid. A prefill that starts after
+/// a cached prefix therefore positions its rows exactly as a full prefill
+/// does. A walk shorter than the range means the placeholders and grids
+/// disagree; every rank decides that from the same tokens and grids
+/// (`request_local`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn walk_rows(
+    walk: Walk,
+    tokens: &[u32],
+    grids: &[(usize, usize, usize)],
+    grid_base: usize,
+    grid_hi: usize,
+    (image_pad, video_pad): (u32, u32),
+    rows: std::ops::Range<usize>,
+    out: [&mut Vec<u32>; 3],
+) -> anyhow::Result<()> {
+    if rows.end > tokens.len() || rows.start > rows.end {
+        return Err(crate::request_local::request_local(format!(
+            "MRoPE position range {rows:?} exceeds the {}-token prompt",
+            tokens.len()
+        )));
+    }
+    let (mut t, mut h, mut w) = (Vec::new(), Vec::new(), Vec::new());
+    match walk {
+        Walk::Generic => build(
+            tokens, grids, grid_base, grid_hi, 0, image_pad, video_pad, &mut t, &mut h, &mut w,
+        ),
+        Walk::Qwen3vl => build_qwen3vl(
+            tokens, grids, grid_base, grid_hi, 0, image_pad, video_pad, &mut t, &mut h, &mut w,
+        ),
+        Walk::Glm5 {
+            image_start,
+            image_end,
+            video_start,
+            video_end,
+        } => build_glm5(
+            tokens,
+            grids,
+            grid_base,
+            grid_hi,
+            0,
+            image_start,
+            image_end,
+            video_start,
+            video_end,
+            image_pad,
+            video_pad,
+            &mut t,
+            &mut h,
+            &mut w,
+        ),
+    }
+    if rows.end > t.len().min(h.len()).min(w.len()) {
+        return Err(crate::request_local::request_local(format!(
+            "MRoPE position range {rows:?} exceeds the {} walked positions",
+            t.len()
+        )));
+    }
+    let [ot, oh, ow] = out;
+    ot.extend_from_slice(&t[rows.clone()]);
+    oh.extend_from_slice(&h[rows.clone()]);
+    ow.extend_from_slice(&w[rows]);
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "mrope_pos_tests.rs"]
 mod tests;

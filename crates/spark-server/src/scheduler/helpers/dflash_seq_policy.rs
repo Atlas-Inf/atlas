@@ -25,6 +25,33 @@ pub(super) fn dflash_seq_raw_argmax_policy(
             == crate::scheduler::fast_greedy::PenaltyGate::Neutral
 }
 
+/// Whether this sequence's DFlash verify picks come from the argmax-only
+/// split head's rows (`verify_pipeline_helper::split_rows`): the head can
+/// sample (`verify_split_sampling`) and the pick is not the raw argmax, so a
+/// sampled request is one even where `dflash_seq_uses_raw_argmax` keeps
+/// other heads greedy. A strict structured-output greedy pick is the raw
+/// argmax: the split head masks its rows (`strict_spec`).
+pub fn dflash_seq_uses_split_rows(
+    raw_requested: bool,
+    masked_requested: bool,
+    model: &dyn spark_model::traits::Model,
+    a: &mut crate::scheduler::types::ActiveSeq,
+    argmax_ids: &[u32],
+) -> bool {
+    model.verify_logits_argmax_only()
+        && model.verify_split_sampling()
+        && !(a.strict_grammar() && a.temperature == 0.0)
+        && (a.temperature > 0.0
+            || !dflash_seq_raw_argmax_policy(
+                raw_requested,
+                masked_requested,
+                model.is_lightning_dspark_product(),
+                false,
+                a,
+                argmax_ids,
+            ))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -63,5 +90,48 @@ mod tests {
         assert!(gate(true, false, false, true, &mut a, &[]));
         assert!(gate(false, true, false, true, &mut a, &[]));
         assert!(!gate(true, false, false, false, &mut a, &[]));
+    }
+
+    /// A split head that can sample picks from its rows every sequence the
+    /// raw argmax would not serve, a sampled one included; other heads never.
+    #[test]
+    fn a_sampling_split_head_takes_every_non_raw_pick_from_its_rows() {
+        use super::dflash_seq_uses_split_rows as split;
+        use crate::scheduler::cancel_test_model::{SCRIPT, Script, TestModel, VerifyScript};
+        let model = |verify: Option<std::sync::Arc<VerifyScript>>| TestModel {
+            tokens: vec![],
+            host_logits: false,
+            cancel_after_sampling: None,
+            cancel_after_row_commit: None,
+            verify,
+        };
+        let split_head = model(Some(Default::default()));
+        let (mut a, _rx) = crate::scheduler::test_support::test_seq(vec![1, 2, 3], 10, None, 32);
+        let script = |on: bool| {
+            SCRIPT.with(|s| {
+                *s.borrow_mut() = on.then(|| Script {
+                    rows: vec![],
+                    cursor: 0,
+                })
+            })
+        };
+        script(true);
+        // Greedy and neutral: the raw argmax is the pick.
+        assert!(!split(true, false, &split_head, &mut a, &[]));
+        a.temperature = 0.7;
+        assert!(split(true, false, &split_head, &mut a, &[]));
+        a.temperature = 0.0;
+        a.presence_penalty = 1.5;
+        assert!(split(true, false, &split_head, &mut a, &[]));
+        a.presence_penalty = 0.0;
+        a.require_tool_call = true;
+        assert!(split(true, false, &split_head, &mut a, &[]));
+        a.require_tool_call = false;
+        assert!(split(false, false, &split_head, &mut a, &[]));
+        // A full-logits head, or a split head that cannot sample: never.
+        a.temperature = 0.7;
+        assert!(!split(true, false, &model(None), &mut a, &[]));
+        script(false);
+        assert!(!split(true, false, &split_head, &mut a, &[]));
     }
 }

@@ -34,6 +34,10 @@ impl MoeLayer {
         stream: u64,
     ) -> Result<DevicePtr> {
         anyhow::ensure!(
+            self.shared_native.is_none(),
+            "C2 compact reads the NVFP4 shared expert a native layer does not keep"
+        );
+        anyhow::ensure!(
             self.glm_c2_grouped(ctx, 2)
                 && !self.is_dflash_capture_layer
                 && input == ctx.buffers.norm_output()

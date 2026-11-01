@@ -3,6 +3,8 @@
 
 #[path = "prefill_stream_commit_order_tests.rs"]
 mod commit_order;
+#[path = "prefill_dflash_first_append_tests.rs"]
+mod dflash_first_append;
 #[path = "prefill_stream_test_fixture.rs"]
 mod fixture;
 use crate::model::kv_admission::kv_admission_refusal;

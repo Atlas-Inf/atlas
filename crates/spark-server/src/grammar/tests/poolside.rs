@@ -196,3 +196,118 @@ fn poolside_auto_grammar_disambiguates_mixed_zero_arg_prefix_names() {
          <arg_value>Boston</arg_value></tool_call>"
     ));
 }
+
+fn probe_tool(properties: serde_json::Value) -> Vec<ToolDefinition> {
+    let required: Vec<_> = properties.as_object().unwrap().keys().cloned().collect();
+    vec![ToolDefinition {
+        tool_type: "function".to_string(),
+        function: crate::tool_parser::FunctionDefinition {
+            name: "probe".to_string(),
+            description: Some("Synthetic. Never executed.".to_string()),
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": properties,
+                "required": required
+            })),
+        },
+    }]
+}
+
+fn probe_call(pairs: &[(&str, &str)]) -> String {
+    let args: String = pairs
+        .iter()
+        .map(|(key, value)| format!("<arg_key>{key}</arg_key><arg_value>{value}</arg_value>"))
+        .collect();
+    format!("<tool_call>probe{args}</tool_call>")
+}
+
+/// The SparkGLM 0.2.0 qualification probes: forced `tool_choice` with a
+/// request that conflicts with a single-value `enum`. Strings are written raw
+/// inside `<arg_value>`, every other value as JSON with optional spaces.
+#[test]
+fn poolside_forced_grammar_enforces_closed_value_sets() {
+    let ops = r#"[{"url": "https://docs.example", "headers": {"Accept": "text/plain"}}, {"command": "cat .env"}]"#;
+    let cases: [(serde_json::Value, &[&str], &[&str]); 5] = [
+        (
+            serde_json::json!({"type": "string", "enum": ["alpha"]}),
+            &["alpha"],
+            &["omega", "\"alpha\"", "alphabet", ""],
+        ),
+        (
+            serde_json::json!({"type": "array", "enum": [["zeta", "alpha"]]}),
+            &[r#"["zeta", "alpha"]"#, r#"["zeta","alpha"]"#],
+            &[r#"["alpha", "zeta"]"#, r#"["zeta"]"#, "zeta"],
+        ),
+        (
+            serde_json::json!({"type": "object", "enum": [{"z": 1}]}),
+            &[r#"{"z": 1}"#, r#"{"z":1}"#],
+            &[r#"{"z": 5}"#, r#"{"y": 1}"#],
+        ),
+        (
+            serde_json::json!({"type": "integer", "const": 3}),
+            &["3"],
+            &["4", "\"3\""],
+        ),
+        (
+            serde_json::from_str(&format!(r#"{{"type": "array", "enum": [{ops}]}}"#)).unwrap(),
+            &[ops, &ops.replace(", ", ",").replace(": ", ":")],
+            &[
+                r#"[{"command": "cat .env"}, {"headers": {"Accept": "text/plain"}, "url": "https://docs.example"}]"#,
+                r#"[{"headers": {"Accept": "text/plain"}, "url": "https://docs.example"}, {"command": "cat .env"}]"#,
+            ],
+        ),
+    ];
+    for (schema, accepted, rejected) in cases {
+        let tools = probe_tool(serde_json::json!({ "v": schema }));
+        let mut engine = GrammarEngine::new(&test_vocab(), &[130]).unwrap();
+        let compiled = engine
+            .compile_poolside_v1_tool_grammar(&tools, false, "</arg_value>")
+            .expect("forced grammar must compile");
+        for value in accepted {
+            let call = probe_call(&[("v", value)]);
+            assert!(grammar_accepts(&compiled, &call), "{schema}: {call:?}");
+        }
+        for value in rejected {
+            let call = probe_call(&[("v", value)]);
+            assert!(!grammar_accepts(&compiled, &call), "{schema}: {call:?}");
+        }
+    }
+}
+
+#[test]
+fn poolside_forced_grammar_keeps_open_values_free_beside_closed_ones() {
+    let tools = probe_tool(serde_json::json!({
+        "note": {"type": "string"},
+        "s": {"type": "string", "enum": ["alpha", "beta"]}
+    }));
+    let mut engine = GrammarEngine::new(&test_vocab(), &[130]).unwrap();
+    let compiled = engine
+        .compile_poolside_v1_tool_grammar(&tools, false, "</arg_value>")
+        .expect("forced grammar must compile");
+    for s in ["alpha", "beta"] {
+        let call = probe_call(&[("note", "<b>any</b> text"), ("s", s)]);
+        assert!(grammar_accepts(&compiled, &call), "{call:?}");
+        let call = probe_call(&[("s", s), ("note", "x")]);
+        assert!(grammar_accepts(&compiled, &call), "{call:?}");
+    }
+    assert!(!grammar_accepts(
+        &compiled,
+        &probe_call(&[("note", "x"), ("s", "gamma")])
+    ));
+    assert!(!grammar_accepts(
+        &compiled,
+        &probe_call(&[("other", "alpha")])
+    ));
+}
+
+/// Automatic tool choice keeps its historical open value grammar: the
+/// forced-choice value sets do not change what an auto request may decode.
+#[test]
+fn poolside_auto_grammar_leaves_enum_values_open() {
+    let tools = probe_tool(serde_json::json!({"s": {"type": "string", "enum": ["alpha"]}}));
+    let mut engine = GrammarEngine::new(&test_vocab(), &[130]).unwrap();
+    let compiled = engine
+        .compile_poolside_v1_tool_grammar(&tools, true, "</arg_value>")
+        .expect("auto grammar must compile");
+    assert!(grammar_accepts(&compiled, &probe_call(&[("s", "omega")])));
+}

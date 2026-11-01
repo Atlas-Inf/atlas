@@ -4,8 +4,11 @@
 // stores pooled keys as BF16; the later FP8 path adds a Hadamard bookend and a
 // per-vector scale without changing the pool addressing established here.
 
+#include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
 #include <math.h>
+
+#include "glm_indexer_rows.cuh"
 
 extern "C" __global__ void glm_index_layernorm_bf16(
     __nv_bfloat16* __restrict__ values,
@@ -14,52 +17,12 @@ extern "C" __global__ void glm_index_layernorm_bf16(
     unsigned int rows,
     unsigned int dim,
     float eps) {
+    atlas_pdl_enter();
     const unsigned int row = blockIdx.x;
     if (row >= rows) return;
     extern __shared__ float reduce[];
-    __nv_bfloat16* x = values + (unsigned long long)row * dim;
-    float sum = 0.0f;
-    for (unsigned int d = threadIdx.x; d < dim; d += blockDim.x) {
-        sum += __bfloat162float(x[d]);
-    }
-    reduce[threadIdx.x] = sum;
-    __syncthreads();
-    for (unsigned int stride = blockDim.x / 2; stride; stride >>= 1) {
-        if (threadIdx.x < stride) reduce[threadIdx.x] += reduce[threadIdx.x + stride];
-        __syncthreads();
-    }
-    const float mean = reduce[0] / (float)dim;
-    // Every thread must hold the mean before thread 0 reuses reduce[0] for
-    // its squared sum: without this barrier a warp scheduled late reads the
-    // squared sum as the row sum and normalizes its lanes with a wrong mean.
-    __syncthreads();
-    float sq = 0.0f;
-    for (unsigned int d = threadIdx.x; d < dim; d += blockDim.x) {
-        const float centered = __bfloat162float(x[d]) - mean;
-        sq += centered * centered;
-    }
-    reduce[threadIdx.x] = sq;
-    __syncthreads();
-    for (unsigned int stride = blockDim.x / 2; stride; stride >>= 1) {
-        if (threadIdx.x < stride) reduce[threadIdx.x] += reduce[threadIdx.x + stride];
-        __syncthreads();
-    }
-    const float inv_std = rsqrtf(reduce[0] / (float)dim + eps);
-    for (unsigned int d = threadIdx.x; d < dim; d += blockDim.x) {
-        const float y = (__bfloat162float(x[d]) - mean) * inv_std
-                      * __bfloat162float(weight[d]) + __bfloat162float(bias[d]);
-        x[d] = __float2bfloat16(y);
-    }
-}
-
-// Raw tails are indexed by physical block, or through `tail_map` (block ->
-// lent tail slot) when the cache slot-maps them; an unmapped block is skipped.
-__device__ __forceinline__ bool glm_index_tail_index(
-    const unsigned int* __restrict__ tail_map,
-    unsigned int physical_block,
-    unsigned int* tail_index) {
-    *tail_index = tail_map ? tail_map[physical_block] : physical_block;
-    return *tail_index != 0xFFFFFFFFu;
+    glm_index_layernorm_row(values + (unsigned long long)row * dim, weight, bias, dim, eps, reduce,
+                            threadIdx.x, blockDim.x, GlmCtaBarrier{});
 }
 
 // Persist the raw key and gate for every token in the physical block that owns
@@ -77,26 +40,12 @@ extern "C" __global__ void glm_index_tail_write_bf16(
     unsigned int pool_size,
     unsigned int head_dim,
     unsigned long long tail_block_stride_bytes) {
+    atlas_pdl_enter();
     const unsigned int token = blockIdx.x;
     if (token >= num_tokens) return;
-    const long long slot = slots[token];
-    if (slot < 0) return;
-    const unsigned int physical_block = (unsigned int)(slot / block_size);
-    const unsigned int raw_offset = (unsigned int)(slot % block_size);
-    unsigned int tail_index;
-    if (!glm_index_tail_index(tail_map, physical_block, &tail_index)) return;
-    __nv_bfloat16* block_tail = (__nv_bfloat16*)((char*)tail
-        + (unsigned long long)tail_index * tail_block_stride_bytes);
-    __nv_bfloat16* key_dst = block_tail + (unsigned long long)raw_offset * head_dim;
-    __nv_bfloat16* gate_dst = block_tail
-        + (unsigned long long)block_size * head_dim
-        + (unsigned long long)raw_offset * head_dim;
-    const __nv_bfloat16* key_src = keys + (unsigned long long)token * head_dim;
-    const __nv_bfloat16* gate_src = gates + (unsigned long long)token * head_dim;
-    for (unsigned int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        key_dst[d] = key_src[d];
-        gate_dst[d] = gate_src[d];
-    }
+    (void)pool_size;
+    glm_index_tail_write_row(keys, gates, tail, tail_map, slots, token, block_size, head_dim,
+                             tail_block_stride_bytes, threadIdx.x, blockDim.x);
 }
 
 // Finalize every pool-ending token after all raw keys/gates in this chunk have
@@ -114,46 +63,12 @@ extern "C" __global__ void glm_index_kpool_finalize_bf16(
     unsigned int head_dim,
     unsigned long long tail_block_stride_bytes,
     unsigned long long values_block_stride_bytes) {
+    atlas_pdl_enter();
     const unsigned int token = blockIdx.x;
-    if (token >= num_tokens || pool_size != 4) return;
-    const long long slot = slots[token];
-    if (slot < 0) return;
-    const unsigned int physical_block = (unsigned int)(slot / block_size);
-    const unsigned int raw_offset = (unsigned int)(slot % block_size);
-    if (raw_offset % pool_size != pool_size - 1) return;
-    unsigned int tail_index;
-    if (!glm_index_tail_index(tail_map, physical_block, &tail_index)) return;
-    const __nv_bfloat16* block_tail = (const __nv_bfloat16*)((const char*)tail
-        + (unsigned long long)tail_index * tail_block_stride_bytes);
-    const unsigned int first = raw_offset - (pool_size - 1);
-    const __nv_bfloat16* tail_keys = block_tail
-        + (unsigned long long)first * head_dim;
-    const __nv_bfloat16* tail_gates = block_tail
-        + (unsigned long long)block_size * head_dim
-        + (unsigned long long)first * head_dim;
-    __nv_bfloat16* dst = (__nv_bfloat16*)((char*)cache
-        + (unsigned long long)physical_block * values_block_stride_bytes)
-        + (unsigned long long)(raw_offset / pool_size) * head_dim;
-    for (unsigned int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        float score[4];
-        float max_score = -INFINITY;
-#pragma unroll
-        for (unsigned int i = 0; i < 4; ++i) {
-            score[i] = __bfloat162float(tail_gates[(unsigned long long)i * head_dim + d])
-                     + __bfloat162float(ape[(unsigned long long)i * head_dim + d]);
-            max_score = fmaxf(max_score, score[i]);
-        }
-        float denom = 0.0f;
-        float weighted = 0.0f;
-#pragma unroll
-        for (unsigned int i = 0; i < 4; ++i) {
-            const float p = expf(score[i] - max_score);
-            denom += p;
-            weighted += p * __bfloat162float(
-                tail_keys[(unsigned long long)i * head_dim + d]);
-        }
-        dst[d] = __float2bfloat16(weighted / denom);
-    }
+    if (token >= num_tokens) return;
+    glm_index_kpool_finalize_row(tail, tail_map, ape, cache, slots, token, block_size, pool_size,
+                                 head_dim, tail_block_stride_bytes, values_block_stride_bytes,
+                                 threadIdx.x, blockDim.x);
 }
 
 extern "C" __global__ void glm_index_fill_causal(

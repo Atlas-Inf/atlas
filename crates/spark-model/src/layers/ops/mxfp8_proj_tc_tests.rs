@@ -37,6 +37,7 @@ fn proj(n: u32, k: u32) -> Mxfp8Proj {
         w: Mxfp8Weight {
             data: DevicePtr(0x200),
             scales: DevicePtr(0x300),
+            tiled: false,
         },
         n,
         k,
@@ -244,6 +245,7 @@ fn tc_rows_match_the_one_row_launch_bit_for_bit() {
                 w: Mxfp8Weight {
                     data: upload(&w),
                     scales: upload(&s),
+                    tiled: false,
                 },
                 n,
                 k,

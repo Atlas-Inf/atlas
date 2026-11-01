@@ -189,6 +189,7 @@ impl TransformerModel {
     /// under it. `false` (snapshot freed): the boundary cannot be cached
     /// (the KV is not valid that far, the sliding window has begun, or the
     /// prefix holds a vision placeholder its content key does not cover).
+    /// A keyed vision prefix registers under its key (`vision_cache`).
     pub(in crate::model) fn register_intermediate_checkpoint(
         &self,
         tokens: &[u32],

@@ -143,11 +143,32 @@ impl PagedKvCache {
         index: Option<SparseIndexCacheConfig>,
         tail_slots: Option<TailSlotPlan>,
     ) -> Vec<(KvBuffer, usize)> {
+        Self::buffer_sizes_with_k_slots(
+            config,
+            num_blocks,
+            num_blocks,
+            v_aliases_k,
+            index,
+            tail_slots,
+        )
+    }
+
+    /// [`Self::buffer_sizes`] with `k_slots` K-pool block slots per layer,
+    /// as [`Self::new_latent_sharded_placed`] allocates them (a rank's
+    /// [`super::LatentShard::local_blocks_for`]).
+    pub fn buffer_sizes_with_k_slots(
+        config: &KvCacheConfig,
+        num_blocks: usize,
+        k_slots: usize,
+        v_aliases_k: bool,
+        index: Option<SparseIndexCacheConfig>,
+        tail_slots: Option<TailSlotPlan>,
+    ) -> Vec<(KvBuffer, usize)> {
         let mut out = Vec::new();
         for layer in 0..config.num_layers {
             out.push((
                 KvBuffer::K(layer),
-                num_blocks * config.k_block_bytes_for_layer(layer),
+                k_slots * config.k_block_bytes_for_layer(layer),
             ));
             if !v_aliases_k {
                 out.push((

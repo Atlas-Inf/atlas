@@ -35,6 +35,10 @@ impl MoeLayer {
             !ctx.config.expert_tp,
             "expert TP runs K=3 on the grouped path"
         );
+        anyhow::ensure!(
+            !include_shared || self.shared_native.is_none(),
+            "a native shared expert runs K=3 on the grouped path"
+        );
         self.btile_input_guard(input, 3, ctx, stream)?;
         if !include_shared {
             anyhow::ensure!(

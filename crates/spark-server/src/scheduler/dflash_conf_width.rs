@@ -24,11 +24,13 @@
 //! Verification is exact at any width, so only the rows per step change.
 //! The drafter has already run; the cut rows are simply never launched.
 //!
-//! The table cannot drift: every cell decays each verify back towards its
-//! confidence bin's rate over all depths (the first draft is verified at any
-//! confidence, so every bin stays observed), and every
+//! The table cannot drift: every cell decays each verify of its kind back
+//! towards its confidence bin's rate over all depths (the first draft is
+//! verified at any confidence, so every bin stays observed), and every
 //! `ATLAS_DFLASH_CONF_PROBE`-th step (default 64, 0 = never) verifies the
-//! full width, which observes the positions the rule had cut.
+//! full width, which observes the positions the rule had cut. Copied drafts
+//! (`copy_drafts`) are a kind of their own: their verifies decay and probe
+//! only the copy bins, and the drafter's only the drafter's.
 //!
 //! `ATLAS_DFLASH_CONF_LOG=1` logs each verify's confidences beside its
 //! outcome (with or without the width rule) for offline fitting.
@@ -56,6 +58,10 @@ use super::dflash_width::MAX_DRAFTS;
 const EDGES: [f32; 10] = [
     -1.5, -1.0, -0.7, -0.5, -0.35, -0.22, -0.12, -0.06, -0.03, -0.01,
 ];
+/// The confidences a draft copied from the context carries (`copy_drafts`):
+/// above any log-probability, so copies bin apart from the drafter's picks
+/// and are priced by their own measured acceptance, one bin for copies of
+/// the prompt and one for copies of the reply (which measure far apart).
 pub(crate) const COPY_CONF: f32 = 1.0;
 pub(crate) const COPY_REPLY_CONF: f32 = 2.0;
 const COPY_BIN: usize = EDGES.len() + 1;
@@ -66,6 +72,14 @@ const BINS: usize = COPY_REPLY_BIN + 1;
 /// table as `EDGES`, reads 0.96 only above p = 0.99), so the prior is a
 /// rounded reading of that table's first-position row (`g[0][7..]`). Serving
 /// replaces it within a few hundred verifies.
+///
+/// The copy bins' priors are per-draft rates (each draft's chance once the
+/// ones before it were kept) read from MiaAI-Lab's TensorFold recipe, which
+/// measured the share of copied drafts kept over 39 live code replies at five
+/// drafts a round (patch 0032; see `copy_drafts`): 74% for copies of the
+/// prompt and 23% for copies of the reply. A per-draft rate `p` keeps
+/// `(p + p^2 + .. + p^5) / 5` of five drafts: 0.74 at `p` = 0.90 and 0.23 at
+/// `p` = 0.55. Not yet measured on this engine.
 const PRIOR: [f32; BINS] = [
     0.12, 0.16, 0.25, 0.35, 0.42, 0.48, 0.55, 0.62, 0.68, 0.76, 0.95, 0.90, 0.55,
 ];
@@ -73,7 +87,8 @@ const PRIOR: [f32; BINS] = [
 /// behind that rate in one depth's cell.
 const PRIOR_WEIGHT: f32 = 8.0;
 const POOL_WEIGHT: f32 = 8.0;
-/// Per-verify decay of every cell (about the last two hundred verifies).
+/// Per-verify decay of the cells a verify belongs to (about the last two
+/// hundred of its kind).
 const DECAY: f32 = 0.995;
 
 fn bin(conf: f32) -> usize {
@@ -204,7 +219,9 @@ fn row_ms() -> f32 {
     step_ms(1, 4) - step_ms(1, 3)
 }
 
-/// The calibration and the verify counter behind the periodic full width.
+/// The calibration and the verify counters behind the periodic full width:
+/// one for verifies with drafter owners, one for verifies of copies alone,
+/// so copies never move the drafter's probe schedule.
 #[derive(Default)]
 pub(crate) struct Policy {
     pub(crate) calibration: Calibration,

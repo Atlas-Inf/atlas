@@ -302,13 +302,27 @@ impl TransformerModel {
     /// in `sample_first_token` D2H, worker in the next cmd recv, both
     /// GPUs spinning in NCCL kernels).
     /// `(window, request)` vision-row bounds the API admits against
-    /// (`vision_limits`). Enntity/atlas b060f987.
+    /// (`vision_limits`) and both ranks apply to the vision wire state.
+    /// Derived from the shared configuration only, so the head and the
+    /// worker agree. Enntity/atlas b060f987.
+    ///
+    /// The native GLM tower on a multi-rank world keeps a deferred request
+    /// inside its window: that is what the rank protocol admitted before
+    /// (the header was checked against the window), and the per-chunk
+    /// encode past it is not measured on GLM. A single GLM rank never checked
+    /// the header, so it keeps the context bound (its chunks are still
+    /// checked against the window). Enntity/atlas ab1823c8.
     pub(crate) fn vision_row_bounds(&self) -> crate::model::vision_transport::VisionRowBounds {
         let ve = self.vision_encoder.as_ref();
         let window = ve.map_or(0, |ve| ve.output_rows());
+        let glm = ve.is_some_and(|ve| ve.is_glm());
         crate::model::vision_transport::VisionRowBounds {
             window,
-            request: self.config.max_seq_len,
+            request: if glm && self.multi_rank_protocol_active() {
+                window
+            } else {
+                self.config.max_seq_len
+            },
         }
     }
 

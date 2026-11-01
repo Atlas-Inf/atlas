@@ -34,7 +34,7 @@ fn finish(tools: bool, tokens: &[u32], reason: &str) -> Vec<ir::StreamDelta> {
     assert_eq!(ids, tokens, "each sampled ID exactly once: {deltas:?}");
     assert!(stream.pending_token_ids.is_empty());
     assert!(deltas.iter().any(|delta| matches!(delta,
-        ir::StreamDelta::Finish { usage, .. }
+        ir::StreamDelta::Finish { usage, guard_stop: None, .. }
         if usage.completion_tokens == tokens.len()
     )));
     deltas
@@ -141,5 +141,69 @@ fn glm_literal_xml_reasoning_preserves_closing_tag_bytes() {
         let deltas = finish(tools, &[21], "stop");
         assert_eq!(text(&deltas, true), expected);
         assert_eq!(text(&deltas, true).matches("</tool_call>").count(), 2);
+    }
+}
+
+#[test]
+fn glm_native_opener_in_prose_stays_content_blocking_and_streamed() {
+    // SparkGLM 0.2.0 harness "plain": the model writes the native opener
+    // token in an unquoted sentence. No call follows, so blocking and the
+    // stream both keep the whole sentence, the space before the opener too.
+    let tokens = [1, END, 28, TOOL, 29];
+    let expected = "The delimiter <tool_call> opens a tool invocation. END.";
+    for tools in [false, true] {
+        let state = app(true);
+        let response = response(tokens.to_vec());
+        let (reasoning, content) =
+            crate::api::chat_blocking::decode_response_text(&state, &response, true, tools, false);
+        let choice = crate::api::chat_blocking_choice::build_choice_message(
+            &state,
+            &request(),
+            &response,
+            reasoning,
+            content,
+            tools,
+            None,
+            0,
+        );
+        assert!(choice.tool_calls.is_empty(), "tools={tools}; {choice:?}");
+        assert_eq!(choice.content.as_deref(), Some(expected), "tools={tools}");
+        let deltas = finish(tools, &tokens, "stop");
+        assert_eq!(text(&deltas, false), expected, "tools={tools}; {deltas:?}");
+    }
+}
+
+#[test]
+fn glm_text_spelled_call_markup_streams_like_blocking() {
+    // SparkGLM 0.2.0 forced-choice probe: the model spells a call as text,
+    // without the native opener token (TOOL), so it is content. The arguments
+    // that follow must stream exactly as the blocking response returns them.
+    let spelled = [25, 26, 4, 5, 6, 7, 8, 9, 10, 11];
+    for tools in [false, true] {
+        let state = app(true);
+        let expected = state.tokenizer.decode(&spelled).unwrap();
+        assert_eq!(
+            expected,
+            "tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>"
+        );
+        let mut tokens = vec![1, END];
+        tokens.extend(spelled);
+        let response = response(tokens.clone());
+        let (reasoning, content) =
+            crate::api::chat_blocking::decode_response_text(&state, &response, true, tools, false);
+        let choice = crate::api::chat_blocking_choice::build_choice_message(
+            &state,
+            &request(),
+            &response,
+            reasoning,
+            content,
+            tools,
+            None,
+            0,
+        );
+        assert!(choice.tool_calls.is_empty(), "tools={tools}; {choice:?}");
+        assert_eq!(choice.content.as_deref(), Some(expected.as_str()));
+        let deltas = finish(tools, &tokens, "stop");
+        assert_eq!(text(&deltas, false), expected, "tools={tools}; {deltas:?}");
     }
 }

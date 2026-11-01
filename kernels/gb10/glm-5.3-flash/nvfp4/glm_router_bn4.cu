@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// GLM-specific M5 BF16 router; production compiles with --fmad=false.
+// GLM-specific M5 router (BF16 operands, FP32 logits: `moe_router_dtype:
+// float32`); production compiles with --fmad=false.
 #ifdef __CUDACC__
 #define ROUTER_HD __host__ __device__
 #else
@@ -21,7 +22,7 @@ ROUTER_HD constexpr unsigned load_k(unsigned chunk) { return (chunk % (bk/4))*4;
 #include <cuda_bf16.h>
 extern "C" __global__ void glm_router_m5_bn4(
     const __nv_bfloat16* __restrict__ a,const __nv_bfloat16* __restrict__ b,
-    __nv_bfloat16* __restrict__ out,unsigned m,unsigned n,unsigned k) {
+    float* __restrict__ out,unsigned m,unsigned n,unsigned k) {
     using namespace glm_router_bn4;
     if(!geometry(m,n,k,blockDim.x,blockDim.y,blockDim.z)
         || gridDim.x!=columns/bn || gridDim.y!=1 || gridDim.z!=1) return;
@@ -53,6 +54,6 @@ extern "C" __global__ void glm_router_m5_bn4(
         }
         __syncwarp(0xffffffffu);
     }
-    if(owns_output(lane)) out[row(lane)*n+blockIdx.x*bn+column(lane)]=__float2bfloat16(acc);
+    if(owns_output(lane)) out[row(lane)*n+blockIdx.x*bn+column(lane)]=acc;
 }
 #endif

@@ -37,7 +37,10 @@ impl TransformerModel {
             return Ok(false);
         }
         let stream = self.gpu.default_stream();
-        self.sync_secondary_dispatch()?; // a verify commit may still be folding into old_slot
+        // A verify commit may still be folding into old_slot. Until the
+        // copy starts, failure must return the destination claim unchanged.
+        self.sync_secondary_dispatch()
+            .inspect_err(|_| self.ssm_pool.release_slot(new_slot))?;
         self.ssm_pool
             .copy_slot(old_slot, new_slot, self.gpu.as_ref(), stream)
             .inspect_err(|_| self.ssm_pool.release_slot(new_slot))?; // un-claim

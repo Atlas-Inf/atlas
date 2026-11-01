@@ -24,6 +24,7 @@ pub(crate) mod glm_k3_mla_o;
 mod glm_long_context;
 mod glm_sparse_graphs_policy;
 mod hc_prefill;
+mod hc_prefill_block;
 pub(crate) mod helpers;
 mod init;
 mod init_arch_gates;
@@ -31,6 +32,7 @@ mod init_glm;
 mod init_independent;
 mod init_kernel_dispatch;
 mod kernel_requirements;
+pub(crate) mod mla_native;
 pub(crate) mod mx8;
 mod op_dump;
 // `innerq_driver` calls the CUDA Driver API directly via `atlas_core::registry`,
@@ -54,7 +56,10 @@ pub use innerq_driver::InnerQDriver;
 pub use glm_sparse_graphs_policy::{
     glm_c1_decode_graph_vetoed, glm_multi_seq_sparse_graphs_enabled,
 };
-pub(crate) use hc_prefill::{hc_post_pre_prefill_fused, hc_pre_prefill_mix};
+pub(crate) use hc_prefill::{
+    HcNorm, HcSeam, hc_post_pre_prefill_fused, hc_pre_prefill_mix, hc_prefill_fuse2_enabled,
+};
+pub(crate) use hc_prefill_block::hc_seam_overlapped;
 pub(crate) use prefill::{attn_w4a4_requested, index_split_words, write_floor_legacy};
 pub(crate) use trait_impl::{
     grouped_routed_decode_enabled, grouped_routed_decode_min, pairwise_moe_decode_enabled,
@@ -186,5 +191,8 @@ mod split_ref_seqs_tests {
         assert_ne!(split_ref_seqs(1, 4), split_ref_seqs(1, 16));
     }
 }
+
 #[cfg(test)]
 mod fp8_gemv_parity_gpu_tests;
+#[cfg(test)]
+mod init_glm_probe_tests;

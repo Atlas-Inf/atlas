@@ -57,4 +57,3 @@ static __device__ __forceinline__ void atlas_causal_conv1d_update_body(
         state[k] = s[k];
     }
 }
-

@@ -41,7 +41,9 @@ impl Qwen3AttentionLayer {
     ) -> Result<()> {
         // The existing helper selects BF16 cuBLAS when enabled, otherwise its
         // established TC/scalar fallback. No weight or activation conversion.
-        if accelerated && ctx.config.model_type == "glm5_next" {
+        // A native FP8 block projection (`mla_native`) has no BF16 copy to
+        // hand the plain GEMM: it takes the native rows either way.
+        if (accelerated && ctx.config.model_type == "glm5_next") || self.mla_is_native(weight) {
             return self.mla_prefill_dense(input, weight, output, m, n, k, ctx, stream);
         }
         ops::dense_gemm(

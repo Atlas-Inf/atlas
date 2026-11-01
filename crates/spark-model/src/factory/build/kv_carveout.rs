@@ -9,10 +9,17 @@
 //! with whole per-layer buffers moved into the carveout. The placement is
 //! planned at that count and kept through the ranks' agreement
 //! (`glm::agree_kv_blocks`), which can only lower it.
+//!
+//! Under a latent shard (`ATLAS_GLM_KV_SHARD=1`) each rank's K pools hold
+//! `ceil(blocks / 2)` slots and the shard's one scratch allocation grows with
+//! the pool (its identity table), so both enter the system-memory account the
+//! same way. Both ranks plan from the same sizes; their latents differ, their
+//! buffer sizes do not.
 
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kv_cache::{
-    KvBuffer, KvCacheConfig, KvPlacement, PagedKvCache, SparseIndexCacheConfig, TailSlotPlan,
+    KvBuffer, KvCacheConfig, KvPlacement, LatentShard, LatentShardSpec, PagedKvCache,
+    SparseIndexCacheConfig, TailSlotPlan,
 };
 
 /// The cache geometry the factory allocates (`glm::new_kv_cache` and
@@ -23,14 +30,16 @@ pub(super) struct KvShape<'a> {
     pub(super) v_aliases_k: bool,
     pub(super) index: Option<SparseIndexCacheConfig>,
     pub(super) tail_slots: Option<TailSlotPlan>,
-    /// Proposer and per-token auxiliary bytes per block; remain in system memory.
-    /// (GLM latent-shard pools are #199 infra, absent on main.)
+    /// The latent shard the pool is built with (`glm::new_kv_cache`).
+    pub(super) latent_shard: Option<LatentShardSpec>,
+    /// Proposer and per-token auxiliary bytes per block; remain in system
+    /// memory (Enntity/atlas 4d75b9ec — QSA pooled index keys grow with the
+    /// logical pool even when K/V buffers are placed in the display heap).
     pub(super) auxiliary_block_bytes: usize,
 }
 
 impl KvShape<'_> {
-    /// QSA's pooled index keys grow with the logical pool too, even when
-    /// some K/V buffers are placed in the display heap.
+    /// Per-token aux bytes (QSA pooled index keys) grow with the pool too.
     pub(super) fn with_per_token_aux(mut self, bytes: usize) -> anyhow::Result<Self> {
         self.auxiliary_block_bytes = bytes
             .checked_mul(self.config.block_size)
@@ -38,11 +47,14 @@ impl KvShape<'_> {
             .ok_or_else(|| anyhow::anyhow!("KV auxiliary block budget overflow"))?;
         Ok(self)
     }
-
     fn buffers(self, blocks: usize) -> Vec<(KvBuffer, usize)> {
-        PagedKvCache::buffer_sizes(
+        let k_slots = self
+            .latent_shard
+            .map_or(blocks, |s| LatentShard::local_blocks_for(blocks, s.world));
+        PagedKvCache::buffer_sizes_with_k_slots(
             self.config,
             blocks,
+            k_slots,
             self.v_aliases_k,
             self.index,
             self.tail_slots,
@@ -50,9 +62,11 @@ impl KvShape<'_> {
     }
 
     /// System-memory bytes outside the per-layer buffers that depend on
-    /// `blocks`: per-block auxiliary bytes (QSA index keys).
+    /// `blocks`: the latent shard's scratch with its identity table.
     fn side_bytes(self, blocks: usize) -> usize {
-        blocks * self.auxiliary_block_bytes
+        self.latent_shard
+            .map_or(0, |s| LatentShard::allocation_bytes(blocks, &s))
+            + blocks * self.auxiliary_block_bytes
     }
 
     /// System-memory bytes of a `blocks` pool with `placement`'s buffers in

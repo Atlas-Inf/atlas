@@ -392,6 +392,10 @@ impl TransformerModel {
             self.nvme_forget_rewritten(key_tokens, seq.adapter_id, skip_tokens, matched, bs);
             self.pc_plan_branch(key_tokens, seq, matched, skip_tokens, bs)?;
             self.finish_leaf_restored(key_tokens, seq, skip_tokens, bs, stream)?;
+            // ATLAS_DFLASH_WARM_CTX (Enntity/atlas 5573f4d5): where the
+            // drafter's window may start, and its stored rows under the
+            // restore point.
+            self.dflash_warm_begin(seq, key.as_deref(), skip_tokens, total, stream)?;
             // Encode the vision items this prefill computes (`vision_cache`).
             self.vision_resolve_deferred(
                 seq,

@@ -55,7 +55,7 @@ use crate::traits::SequenceState;
 
 /// `ATLAS_VISION_PREFIX_CACHE=0` turns vision prefix caching off (vision
 /// prompts then neither look up nor insert, as before). Read once.
-fn switch_on() -> bool {
+pub(crate) fn switch_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_VISION_PREFIX_CACHE").as_deref() != Ok("0"))
 }

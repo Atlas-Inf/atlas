@@ -9,8 +9,8 @@ mod tests {
     // `super::super::` — this file is a sibling module of `sampling_setup`,
     // so one `super` only reaches `sampling_setup_tests` itself.
     use super::super::{
-        GrammarChoice, grammar_choice, preset_penalties_apply, tool_choice_required_for_parser,
-        tool_grammar_escape_applies,
+        GrammarChoice, grammar_choice, preset_penalties_apply, tool_call_bias,
+        tool_choice_required_for_parser, tool_grammar_escape_applies,
     };
 
     use crate::tool_parser::{ToolChoice, ToolChoiceFunction};
@@ -231,5 +231,19 @@ mod tests {
         assert!(!required(Some(&mode("none"))));
         assert!(required(Some(&mode("required"))));
         assert!(required(Some(&named)));
+    }
+
+    /// The union lets the model's mass choose: no `<tool_call>` boost, while
+    /// the anti-loop decay still applies to a repeating call.
+    #[test]
+    fn the_union_takes_no_tool_call_boost_but_keeps_the_loop_decay() {
+        for repeat in 0..2 {
+            assert_eq!(tool_call_bias(repeat, false), 3.0);
+            assert_eq!(tool_call_bias(repeat, true), 0.0);
+        }
+        for union in [false, true] {
+            assert_eq!(tool_call_bias(3, union), -5.0);
+            assert_eq!(tool_call_bias(9, union), -10.0);
+        }
     }
 }

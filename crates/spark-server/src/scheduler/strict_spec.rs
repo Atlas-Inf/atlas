@@ -14,7 +14,9 @@
 //! The walk is rolled back afterwards: only `emit_token` advances the matcher,
 //! with the tokens the verify actually emits. Rows before a `</think>` are
 //! unconstrained and never fed to the matcher; the row after it starts from
-//! the matcher's untouched start state (#44297).
+//! the matcher's untouched start state (#44297). GLM's native tool opener
+//! also ends the reasoning, but as the matcher's first token
+//! (`GrammarState::opens_output`, a tool-call-or-JSON union).
 //!
 //! DFlash proposes a whole block at once, so its drafts cannot be masked per
 //! position; they are proposed unmasked (`mtp_grammar_mask_for`: a draft-0
@@ -70,7 +72,15 @@ pub(super) fn prepare(
     let Some(gs) = a.grammar_state.as_mut() else {
         return Ok(None);
     };
-    row_masks(gs, thinking, (think_start, think_end), drafts, vocab).map(Some)
+    row_masks_with_history(
+        gs,
+        thinking,
+        (think_start, think_end),
+        drafts,
+        vocab,
+        &a.output_tokens,
+    )
+    .map(Some)
 }
 
 /// The drafts (and their confidences) the verify carries.
@@ -126,6 +136,28 @@ pub(super) fn row_masks(
     drafts: &[u32],
     vocab: usize,
 ) -> Result<StrictVerify> {
+    row_masks_with_history(
+        gs,
+        inside_thinking,
+        (think_start, think_end),
+        drafts,
+        vocab,
+        &[],
+    )
+}
+
+/// Same walk as [`row_masks`], with the already emitted token history used to
+/// distinguish a quoted/fenced native opener from a real GLM tool boundary.
+/// The public wrapper keeps existing grammar tests and non-native callers
+/// concise; the production verify path supplies `ActiveSeq::output_tokens`.
+pub(super) fn row_masks_with_history(
+    gs: &mut GrammarState,
+    inside_thinking: bool,
+    (think_start, think_end): (Option<u32>, Option<u32>),
+    drafts: &[u32],
+    vocab: usize,
+    history: &[u32],
+) -> Result<StrictVerify> {
     let words = vocab.div_ceil(32);
     ensure!(
         gs.bitmask_data().len() == words,
@@ -144,6 +176,25 @@ pub(super) fn row_masks(
         let Some(&draft) = drafts.get(r) else {
             break Ok(());
         };
+        // The row after a `</think>` would pick a union's branch token, which
+        // only host logits choose (`ActiveSeq::grammar_branch_pending`): the
+        // verify ends at the `</think>` position. As the only draft, it gives
+        // way to a dead `<think>` its row refuses, so that row's pick is the
+        // step's one token.
+        if thinking && think_end == Some(draft) && gs.branch_pending() {
+            match (r, think_start) {
+                (0, Some(dead_token)) => {
+                    let w = &mut masks[row_at + dead_token as usize / 32];
+                    *w &= !(1u32 << (dead_token % 32));
+                    kept.push(dead_token);
+                    masks.extend_from_within(row_at..);
+                    dead = true;
+                    break Ok(());
+                }
+                (0, None) => {}
+                _ => break Ok(()),
+            }
+        }
         let row = &masks[row_at..];
         let mut d = draft;
         if !allowed(row, d, vocab) {
@@ -160,12 +211,24 @@ pub(super) fn row_masks(
                 None => d = 0,
             }
         }
-        if thinking {
+        let literal_native_opener =
+            thinking && gs.opens_output(d) && gs.native_opener_is_literal_after(history, &kept);
+        if thinking && !gs.opens_output(d) {
             thinking = think_end != Some(d);
-        } else if !gs.accept_token(d) {
-            break Err(anyhow::anyhow!(
-                "grammar refused draft {d} that its own mask allows"
-            ));
+        } else if literal_native_opener {
+            // The opener is ordinary text inside a quote/code span. Keep it
+            // in the reasoning walk but do not feed it to the grammar or end
+            // thinking; this mirrors the serial boundary hook.
+        } else {
+            // A native tool opener ends the reasoning as the first output
+            // token, as `first_token_thinking::apply_native_tool_boundary`
+            // does at the emit.
+            thinking = false;
+            if !gs.accept_token(d) {
+                break Err(anyhow::anyhow!(
+                    "grammar refused draft {d} that its own mask allows"
+                ));
+            }
         }
         kept.push(d);
     };

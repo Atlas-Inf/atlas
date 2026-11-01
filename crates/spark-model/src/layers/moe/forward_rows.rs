@@ -47,7 +47,7 @@ impl MoeLayer {
     /// Whether [`Self::forward_rows`] can serve this layer: `forward`'s own
     /// fused decode arm (not one of its grouped-prefill early returns).
     fn forward_rows_eligible(&self, ctx: &ForwardContext) -> bool {
-        !(self.routed_scales_released || ctx.config.expert_tp || self.decode_via_grouped_arm())
+        !(self.routed_scales_released || self.grouped_only(ctx) || self.decode_via_grouped_arm())
     }
 
     /// Whether `forward_row_local` takes the originals-layout NVFP4 arm with

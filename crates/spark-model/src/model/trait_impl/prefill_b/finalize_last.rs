@@ -442,6 +442,9 @@ impl TransformerModel {
                     if let Some(old) = displaced {
                         self.ssm_snapshots.free(old);
                     }
+                    // ATLAS_DFLASH_WARM_CTX=restore (Enntity/atlas
+                    // 5573f4d5): the drafter rows up to the prompt leaf.
+                    self.dflash_warm_save(seq, &key, stream)?;
                 } else {
                     // A placeholder the content key does not cover (an
                     // image-tainted snapshot under a colliding key), or HSS

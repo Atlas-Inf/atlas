@@ -71,6 +71,7 @@ mod gpu {
             let (wd, sd) = (upload(g, &w).unwrap(), upload(g, &s).unwrap());
             let proj = Mxfp8Proj {
                 w: Mxfp8Weight {
+                    tiled: false,
                     data: wd,
                     scales: sd,
                 },
@@ -171,6 +172,7 @@ mod gpu {
             );
             let proj = Mxfp8Proj {
                 w: Mxfp8Weight {
+                    tiled: false,
                     data: wd,
                     scales: sdd,
                 },

@@ -2417,6 +2417,7 @@ dependencies = [
  "base64 0.22.1",
  "half",
  "image",
+ "libloading 0.8.9",
  "memmap2",
  "parking_lot",
  "safetensors",
@@ -2465,6 +2466,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
 ]

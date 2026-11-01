@@ -96,6 +96,11 @@ pub(crate) fn load_model(
     // (the head that freezes the value is built last, on the head rank only).
     if args.dflash {
         spark_model::layers::dflash_head::FirstAppend::from_env()?;
+        // ATLAS_DFLASH_WARM_CTX=restore (Enntity/atlas 5573f4d5): check the
+        // slots count only when the restore arm is on.
+        if spark_model::layers::dflash_head::WarmCtx::from_env()?.restores() {
+            spark_model::layers::dflash_head::warm_ctx::store_slots_from_env()?;
+        }
     }
     // #158: the exact prefix-cache grid is read once, at model build.
     spark_runtime::prefill_grid::set_exact_prefix_cache(args.exact_prefix_cache);
@@ -185,6 +190,9 @@ pub(crate) fn load_model(
     let vision_max_pixels = resolve_vision_max_pixels(&args, image.map(|d| d.max_pixels))?;
     if let Some(v) = config.vision.as_mut() {
         v.max_pixels = vision_max_pixels;
+        if v.is_glm5_next {
+            v.token_budgets = super::processor_pixels::read_glm_token_budgets(&model_dir);
+        }
         v.min_pixels = image.and_then(|d| d.min_pixels);
         v.video_pixels = super::processor_pixels::read_declared_pixels(
             &model_dir,
@@ -273,16 +281,22 @@ pub(crate) fn load_model(
     // that enabled video and has no ffmpeg is misconfigured, and the operator
     // should learn that from the startup log rather than from a user's failed
     // request an hour later.
+    let glm_vision = config.vision.as_ref().is_some_and(|v| v.is_glm5_next);
+    let video_max_frames = args.video_max_frames.unwrap_or(if glm_vision {
+        spark_model::video_sample::GLM_DEFAULT_MAX_FRAMES
+    } else {
+        spark_model::video_preprocess::DEFAULT_MAX_FRAMES
+    });
     let video_ffmpeg = spark_model::video_decode_ffmpeg::FfmpegPolicy {
         enabled: args.video_allow_ffmpeg,
         binary: args.video_ffmpeg_path.clone(),
-        max_frames: args.video_max_frames,
+        max_frames: video_max_frames,
         max_total_decoded_pixels: args.video_max_pixels,
         timeout_secs: args.video_decode_timeout_s,
         max_output_bytes: args.video_max_pixels.map_or(512 * 1024 * 1024, |pixels| {
             pixels
                 .saturating_mul(4)
-                .saturating_add(args.video_max_frames.saturating_mul(1024))
+                .saturating_add(video_max_frames.saturating_mul(1024))
         }),
         ..Default::default()
     };
@@ -292,7 +306,7 @@ pub(crate) fn load_model(
             args.video_ffmpeg_path,
             v,
             args.video_fps,
-            args.video_max_frames,
+            video_max_frames,
         ),
         // WARN, not a hard failure: the server still serves text and images
         // perfectly well, and refusing to boot would turn a video

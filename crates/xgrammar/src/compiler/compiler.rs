@@ -170,10 +170,24 @@ impl GrammarCompiler {
         if self.cache_enabled
             && let Some(hit) = self.cache.get(&key)
         {
+            // An EBNF cache entry can have been compiled without a schema
+            // limit. Reusing it must not bypass the bounded union entry point.
+            Self::check_grammar_size(&hit, max_grammar_bytes)?;
             return Ok(hit);
         }
         let value = f()?;
-        let bytes = value.grammar_memory_size_bytes();
+        Self::check_grammar_size(&value, max_grammar_bytes)?;
+        if self.cache_enabled {
+            self.cache.insert(key, value.clone());
+        }
+        Ok(value)
+    }
+
+    fn check_grammar_size(
+        grammar: &CompiledGrammar,
+        max_grammar_bytes: usize,
+    ) -> Result<(), CompileError> {
+        let bytes = grammar.grammar_memory_size_bytes();
         if bytes > max_grammar_bytes {
             return Err(CompileError::TooLarge(format!(
                 "compiles to a {} MiB grammar, over the {} MiB limit",
@@ -181,10 +195,7 @@ impl GrammarCompiler {
                 max_grammar_bytes >> 20
             )));
         }
-        if self.cache_enabled {
-            self.cache.insert(key, value.clone());
-        }
-        Ok(value)
+        Ok(())
     }
 
     /// Refuse JSON schemas whose compiled grammar structure is larger than

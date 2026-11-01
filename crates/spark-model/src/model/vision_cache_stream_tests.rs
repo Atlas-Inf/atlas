@@ -307,3 +307,61 @@ fn a_vision_sequence_releases_its_prompt_not_its_reply() {
     f.seq.tokens = tokens.iter().copied().chain([9, 10, 11]).collect();
     assert_eq!(&*f.model.radix_held_tokens(&f.seq), &key[..]);
 }
+
+#[test]
+fn a_placeholder_the_key_does_not_cover_is_never_cached() {
+    // A prompt with more placeholders than its items have rows (a pasted
+    // `<|image_pad|>` string) cannot be keyed: it neither looks up nor
+    // inserts, as every vision prompt did before.
+    let (mut f, mut tokens) = staged();
+    f.model.prefix_cache = Box::new(spark_runtime::radix_tree::RadixTree::new());
+    tokens.push(PAD);
+    f.model.stamp_vision_cache_key(&tokens, &mut f.seq);
+    assert!(f.seq.vision_cache_key.is_empty());
+    assert!(f.model.pc_key(&f.seq, &tokens).is_none());
+    // Text alone is its own key, keyed or not.
+    assert_eq!(
+        f.model.pc_key(&f.seq, &tokens[..4]).as_deref(),
+        Some(&tokens[..4])
+    );
+}
+
+#[test]
+fn a_cache_hit_encodes_only_what_the_prefill_computes() {
+    // The image (64 rows, pads 4..68) lies wholly in a cached prefix of 68:
+    // the hit skips the ViT and the computed tail needs no rows.
+    let (mut f, tokens) = staged();
+    f.order();
+    f.model
+        .vision_resolve_deferred(&mut f.seq, &tokens, 68, tokens.len(), CALLER)
+        .unwrap();
+    // An encode drains the prefill stream before it writes `buf_out`.
+    assert!(!f.order().contains(&Order::Sync(CALLER)), "nothing encoded");
+    assert_eq!((f.seq.vision.skip_rows, f.seq.vision.rows_encoded), (64, 0));
+    let hidden = f.model.buffers.hidden_states();
+    f.model
+        .splice_vision_rows(&f.seq, &tokens, 68, 4, hidden, CALLER)
+        .unwrap();
+
+    // A prefix ending inside the image (40): the image is encoded whole and
+    // the computed pads 40..68 read its own rows 36..64.
+    let (mut f, tokens) = staged();
+    f.model
+        .vision_resolve_deferred(&mut f.seq, &tokens, 40, tokens.len(), CALLER)
+        .unwrap();
+    assert_eq!((f.seq.vision.skip_rows, f.seq.vision.rows_encoded), (0, 64));
+    let plan = crate::model::trait_impl::prefill_b::embed_chunk::vision_splice_plan(
+        &tokens,
+        40,
+        tokens.len() - 40,
+        |t| t == PAD,
+        0,
+        0,
+        40,
+        f.seq.vision.rows_base,
+        f.seq.vision.rows_encoded,
+    )
+    .unwrap();
+    let rows: Vec<usize> = plan.iter().map(|&(_, row)| row).collect();
+    assert_eq!(rows, (36..64).collect::<Vec<_>>());
+}

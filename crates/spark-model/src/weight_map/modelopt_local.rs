@@ -35,6 +35,7 @@
 use std::collections::HashSet;
 
 use super::modelopt_plan::{ModeloptQuantPlan, QuantAlgo, native_consumers};
+use crate::layers::glm_native::NativePolicy;
 use anyhow::{Context, Result, ensure};
 use atlas_core::config::ModelConfig;
 use atlas_core::modelopt_codec::{decode_csf_scales, mxfp8_to_bf16, nvfp4_rows_to_bf16};
@@ -50,9 +51,18 @@ const CSF_EXCEPTIONS: &str = ".nvfp4_csf_exceptions";
 /// native consumer (its packed bytes are never meant to be resident). The
 /// pre-plan rule for non-FP4-Local packs is the `MXFP8`-only arm.
 pub fn host_decode_modules(config: &ModelConfig) -> HashSet<String> {
+    host_decode_modules_for(config, NativePolicy::from_env())
+}
+
+fn host_decode_modules_for(config: &ModelConfig, glm: NativePolicy) -> HashSet<String> {
     let Some(qc) = config.quantization_config.as_ref() else {
         return HashSet::new();
     };
+    // `weight_loader/glm5` reads the checkpoint's own bytes under a native
+    // policy: every module stays resident for it, nothing expands here.
+    if config.model_type == "glm5_next" && glm.bits() != 0 {
+        return HashSet::new();
+    }
     if let Some(plan) = ModeloptQuantPlan::from_config(config)
         && plan.is_fp4_local()
     {
@@ -61,7 +71,15 @@ pub fn host_decode_modules(config: &ModelConfig) -> HashSet<String> {
             .modules()
             .filter(|m| {
                 let f = plan.format_of(m).expect("plan module");
-                matches!(f.algo, QuantAlgo::Mxfp8) || !natives.covers(m, &f.algo)
+                match f.algo {
+                    QuantAlgo::Mxfp8 => true,
+                    // NVFP4-family modules with no registered native consumer
+                    // host-expand to BF16; any other declared algo (e.g.
+                    // FP8_PB_WO block scales — GLM-5.3's shared experts, the
+                    // layer loader reads those itself) stays resident.
+                    QuantAlgo::Nvfp4 | QuantAlgo::W4A16Nvfp4 => !natives.covers(m, &f.algo),
+                    _ => false,
+                }
             })
             .cloned()
             .collect();
@@ -288,6 +306,7 @@ fn expand_module(
     store: &mut WeightStore,
     gpu: &dyn GpuBackend,
     module: &str,
+    algo: &QuantAlgo,
 ) -> Result<Option<(bool, u64)>> {
     let Some(w) = take(store, gpu, &format!("{module}.weight"))? else {
         return Ok(None);
@@ -303,6 +322,23 @@ fn expand_module(
     let (bytes, inp, mx) = match w.dtype {
         WeightDtype::FP8E4M3 => {
             let inp = w.shape[1];
+            ensure!(
+                matches!(algo, QuantAlgo::Mxfp8),
+                "{module}: declared {algo:?} but FP8E4M3 host expansion only                  supports MXFP8 per-32 E8M0 scales; leave it to the layer loader"
+            );
+            // MXFP8 is U8 `[out, inp/32]` E8M0-per-32. GLM-5.3 declares some
+            // `shared_experts.down_proj` layers MXFP8 while their scale is the
+            // FP8_PB_WO block-scale layout ([32,1,16,1] F32) — a declared
+            // MXFP8 that is physically block-scaled stays for the layer
+            // loader instead of a failed expand.
+            if s.dtype != WeightDtype::UInt8 || s.shape != [out, inp / 32] {
+                tracing::info!(
+                    "{module}: declared MXFP8 but scale is {:?} {:?} — deferring to the layer loader",
+                    s.dtype,
+                    s.shape
+                );
+                return Ok(None);
+            }
             (mxfp8_to_bf16(&w.bytes, &s.bytes, out, inp)?, inp, true)
         }
         WeightDtype::UInt8 => {
@@ -381,7 +417,7 @@ pub fn materialize(
             // An NVFP4/algo-native module stays deferred for its own loader.
             continue;
         }
-        let Some((mx, n)) = expand_module(store, gpu, &module)? else {
+        let Some((mx, n)) = expand_module(store, gpu, &module, &algo)? else {
             continue;
         };
         if mx {

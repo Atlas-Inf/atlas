@@ -128,6 +128,9 @@ pub struct ChatCompletionRequest {
     /// (benchmark harnesses send it with `min_tokens`). `stop` still applies.
     #[serde(default)]
     pub ignore_eos: bool,
+    /// Disable speculative decoding for this request (Atlas extension).
+    #[serde(default)]
+    pub disable_mtp: bool,
     /// Seed for deterministic sampling. When set, stochastic sampling uses this
     /// seed for the RNG, producing reproducible output for the same inputs.
     /// None = non-deterministic (default).

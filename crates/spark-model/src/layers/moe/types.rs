@@ -50,13 +50,25 @@ pub struct MoeLayer {
     pub(super) w4a16_gemv_sw: KernelHandle,
     pub(super) w4a16_gemm: KernelHandle,
     pub(super) dense_gemm: KernelHandle,
-    /// Order-preserving register-blocked router GEMM (`dense_gemm_bf16_router`):
+    /// The router keeps FP32 logits (`ModelConfig::router_logits_f32`, GLM-5):
+    /// every router GEMM below writes, and every top-k reads, FP32 logits.
+    pub(super) router_f32: bool,
+    /// The router's single-row GEMV and its scalar-order GEMM:
+    /// `dense_gemv` / `dense_gemm`, or their FP32-output twins
+    /// (`dense_gemv_bf16_fp32out` / `dense_gemm_bf16_f32out`, the same
+    /// accumulators unrounded) under [`Self::router_f32`].
+    pub(super) router_gemv: KernelHandle,
+    pub(super) router_gemm: KernelHandle,
+    /// Order-preserving register-blocked router GEMM (`dense_gemm_bf16_router`,
+    /// `_f32out` under [`Self::router_f32`]):
     /// bit-identical to the scalar `dense_gemm` (same per-output FP32 k-order,
     /// `--fmad=false` build) at ~2x speed. `KernelHandle(0)` on miss → the
     /// pinned scalar kernel. Used ONLY by `router_gate_gemm_dense`.
     pub(super) dense_gemm_router: KernelHandle,
     pub(super) router_prefill_bn32: KernelHandle,
     /// Exact-M=5, scalar-order router specialization for GLM verification.
+    /// It, the rows router and the BN32 prefill router are GLM's (FP32
+    /// logits): zero unless [`Self::router_f32`].
     pub(super) dense_gemm_router_m5: KernelHandle,
     pub(super) dense_gemm_router_rows: KernelHandle,
     pub(super) dense_gemm_pipelined: KernelHandle,
@@ -119,6 +131,9 @@ pub struct MoeLayer {
     /// qwen4_exp's W4A4 routed prefill: the checkpoint's activation scales
     /// and their alpha tables (`w4a4_scales.rs`).
     pub(super) w4a4: Option<super::W4a4Scales>,
+    /// `ATLAS_GLM_FP4L_INPUT_SCALES`: the calibrated activation scales and
+    /// their folded tables (`input_scales.rs`).
+    pub(super) input_scales: Option<super::InputScales>,
     /// CUTLASS grouped-NVFP4 host tables (`ATLAS_HOLO_MOE_GROUPED_CUTLASS`).
     /// Per-expert packed/SFB pointer values + scale2, snapshotted ONCE at load
     /// by `build_cutlass_grouped_sfb` (the SFB swizzle is built there from the
@@ -261,6 +276,9 @@ pub struct MoeLayer {
     pub(super) shared_gate_up_receipt: Option<helpers_a::SharedGateUpReceipt>,
     pub(super) shared_up_t: Option<QuantizedWeight>,
     pub(super) shared_down_t: Option<QuantizedWeight>,
+    /// The checkpoint's FP8 block shared expert (`ATLAS_GLM_FP4L_SHARED_FP8`,
+    /// `shared_native.rs`): when set, the NVFP4 shared copies are gone.
+    pub(crate) shared_native: Option<shared_native::SharedNative>,
     pub(super) moe_grouped_gemm_t: KernelHandle,
     pub(super) moe_grouped_gemm_t_k64: KernelHandle,
     /// Optional M=32 NVFP4 twin of `moe_grouped_gemm_t_k64`.
@@ -295,6 +313,8 @@ pub struct MoeLayer {
     /// (`ATLAS_GLM_MOE_DECODE_M16=1`, else null) and the K128W control
     /// (`ATLAS_GLM_MOE_DECODE_K128W=1`).
     pub(super) decode_m16: decode_m16::DecodeM16,
+    /// `ATLAS_GLM_MOE_ROUTE_FUSE`: the two-launch routing chain (null off).
+    pub(super) route_fuse: route_fuse::RouteFuse,
     pub(super) m5_projections: m5_projections::M5Projections,
     pub(super) moe_nvfp4_mmq_gate_up_k: KernelHandle,
     pub(super) moe_nvfp4_mmq_down_k: KernelHandle,
@@ -353,8 +373,9 @@ pub struct MoeLayer {
     /// `None` = Atlas's default softmax path. When `Some`, every top-k
     /// dispatch site branches to `moe_topk_sigmoid` with this bias arg.
     pub(super) correction_bias_dev: Option<DevicePtr>,
-    /// Handle to `moe_topk_sigmoid` kernel. Lazy-loaded in `new()` even
-    /// when bias is `None` (harmless if kernel isn't used).
+    /// Handle to `moe_topk_sigmoid` kernel (`_f32` under
+    /// [`Self::router_f32`]). Lazy-loaded in `new()` even when bias is `None`
+    /// (harmless if kernel isn't used).
     pub(super) moe_topk_sigmoid_k: KernelHandle,
     /// Batched variant for prefill / MTP-verify (one block per token).
     /// Loaded via `try_kernel` — returns KernelHandle(0) on models whose

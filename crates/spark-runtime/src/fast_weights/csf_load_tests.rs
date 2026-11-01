@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 const GATE: &str = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale";
 const DOWN: &str = "model.language_model.layers.0.mlp.experts.1.down_proj.weight_scale";
 const PLAIN: &str = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight";
+const DOWN_WEIGHT: &str = "model.language_model.layers.0.mlp.experts.1.down_proj.weight";
 
 struct Dir(PathBuf);
 
@@ -80,9 +81,9 @@ fn fixed(scale: &str, seed: u8) -> T {
     (format!("{scale}.nvfp4_csf_fixed"), "U8", vec![1, 32], bytes)
 }
 
-/// One exception: position 3 becomes `0xAB`.
+/// One exception: position 3 becomes `0x2B`.
 fn exceptions(scale: &str) -> T {
-    let word = (0xABu32 << 24) | 3;
+    let word = (0x2Bu32 << 24) | 3;
     (
         format!("{scale}.nvfp4_csf_exceptions"),
         "U32",
@@ -93,6 +94,11 @@ fn exceptions(scale: &str) -> T {
 
 fn plain(name: &str, bytes: Vec<u8>) -> T {
     (name.to_string(), "U8", vec![bytes.len()], bytes)
+}
+
+/// The packed NVFP4 weight a `[16, 2]` scale belongs to.
+fn weight(name: &str) -> T {
+    (name.to_string(), "U8", vec![16, 16], vec![7; 256])
 }
 
 fn load(dir: &Path, gpu: &MockGpuBackend) -> anyhow::Result<crate::weights::WeightStore> {
@@ -113,8 +119,8 @@ fn a_pair_across_shards_becomes_one_resident_scale_in_either_order() {
     checkpoint(
         &dir.0,
         &[
-            vec![fixed(GATE, 10), exceptions(DOWN), plain(PLAIN, vec![7; 64])],
-            vec![exceptions(GATE), fixed(DOWN, 30)],
+            vec![fixed(GATE, 10), exceptions(DOWN), weight(PLAIN)],
+            vec![exceptions(GATE), fixed(DOWN, 30), weight(DOWN_WEIGHT)],
         ],
     );
     let gpu = MockGpuBackend::new();
@@ -126,7 +132,7 @@ fn a_pair_across_shards_becomes_one_resident_scale_in_either_order() {
         assert_eq!(gpu.read_alloc(t.ptr).unwrap(), want(seed), "{name}");
     }
     assert!(store.contains(PLAIN));
-    assert_eq!(store.len(), 3, "a stream reached the store");
+    assert_eq!(store.len(), 4, "a stream reached the store");
     assert!(
         store.deferred_sorted().is_empty(),
         "a stream stayed on disk"
@@ -188,11 +194,7 @@ fn a_slab_holds_no_stream_bytes() {
     let dir = Dir::new("slab");
     checkpoint(
         &dir.0,
-        &[vec![
-            fixed(GATE, 10),
-            exceptions(GATE),
-            plain(PLAIN, vec![7; 64]),
-        ]],
+        &[vec![fixed(GATE, 10), exceptions(GATE), weight(PLAIN)]],
     );
     let gpu = MockGpuBackend::new();
     let mut loader = FastSafetensorsLoader::new();

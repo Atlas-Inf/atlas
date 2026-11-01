@@ -24,13 +24,15 @@ use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-mod csf_assembler;
+mod deferred_slice;
 mod direct_io;
 mod header;
 mod shard;
 mod shard_readers;
 
-use header::{resolve_shards, tensors_routed_to};
+pub use deferred_slice::{SliceAxis, decode_deferred_csf_scale, with_deferred_slice};
+
+use header::resolve_shards;
 
 /// Run `f` over `len` bytes at `start` within a deferred tensor, read with
 /// `O_DIRECT` when the filesystem allows it (so the bytes never sit in the
@@ -272,7 +274,23 @@ impl WeightLoader for FastSafetensorsLoader {
         let total_shards = shard_files.len();
         let initial_free = gpu.free_memory()?;
         let mut offload_logged = false;
-        let mut csf = csf_assembler::CsfAssembler::default();
+        let mut csf = crate::weights::nvfp4_csf::CsfAssembler::new();
+
+        // Index entries grouped by the shard path they name, ONCE, keyed by
+        // `model_dir.join(<index string>)` — the very expression
+        // `resolve_shards` built `shard_files` from, so the lookup below is
+        // exact whatever the index spells (FP4-Local's
+        // `tensors/model-00001-of-00021.safetensors` keeps its shards in a
+        // subdirectory). Matching the index string to the bare FILE NAME
+        // instead found nothing for such a checkpoint and silently loaded
+        // zero tensors from every shard.
+        let mut by_shard: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        for (t, s) in tensor_to_shard.iter().flatten() {
+            by_shard
+                .entry(model_dir.join(s))
+                .or_default()
+                .push(t.clone());
+        }
 
         for (i, shard_path) in shard_files.iter().enumerate() {
             // When an index is present, only load the tensors it routes here;
@@ -283,7 +301,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 .unwrap_or_default();
             let tensor_filter: Option<Vec<String>> = tensor_to_shard
                 .as_ref()
-                .map(|map| tensors_routed_to(map, model_dir, shard_path));
+                .map(|_| by_shard.remove(shard_path).unwrap_or_default());
 
             tracing::info!(
                 "Fast-loading shard {}/{}: {}{}",
@@ -363,7 +381,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 &mut csf,
             )?;
         }
-        csf.finish()?;
+        csf.finish(|n| crate::weights::loaded_shape(&weights, &deferred, n))?;
 
         tracing::info!("Fast-loaded {} weight tensors", weights.len());
         let mut store = WeightStore::from_map(weights);
@@ -393,7 +411,7 @@ mod expert_filter_tests {
         assert!(loader.should_skip_tensor(target));
     }
 
-    /// FP4-Local: listed modules are located, not uploaded; their scalar
+    /// FP4-Local: listed MXFP8 modules are located, not uploaded; their scalar
     /// siblings, the CSF streams (decoded at upload) and every other tensor
     /// load as usual.
     #[test]
@@ -440,7 +458,12 @@ mod expert_filter_tests {
         loader.expert_tp = true;
         loader.rank0_only_expert_prefix = Some(".layers.45.".into());
         let p = "model.language_model.layers.44.mlp.experts.1.gate_proj";
-        for suffix in ["weight", "weight_scale"] {
+        for suffix in [
+            "weight",
+            "weight_scale",
+            "weight_scale.csf32_codes",
+            "weight_scale.nvfp4_csf_fixed",
+        ] {
             let name = format!("{p}.{suffix}");
             assert!(!loader.should_skip_tensor(&name));
             assert!(loader.should_defer_tensor(&name));

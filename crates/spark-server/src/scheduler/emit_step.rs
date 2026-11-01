@@ -507,7 +507,9 @@ pub(super) fn strict_refusal(tok: u32, at: usize) -> String {
 /// prompt leaves the model inside `<think>`), and failing to arm one is
 /// reported to the client on `sink` as an invalid request (HTTP 400 when
 /// blocking) and returned as `Err`: its output must never come back
-/// unconstrained as if it were valid.
+/// unconstrained as if it were valid. One with a tool branch also learns the
+/// `native_opener` that can end reasoning as its first output token
+/// (`first_token_thinking::native_opener`).
 pub fn compile_grammar_state(
     engine: &mut Option<GrammarEngine>,
     grammar_spec: &Option<GrammarSpec>,
@@ -760,6 +762,13 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
     let Some(m) = super::tool_markers::get() else {
         return;
     };
+    if let Some(inside) = m.native_value_transition(a.inside_parameter_body, tok) {
+        // A value opening or closing is forward progress.
+        a.inside_parameter_body = inside;
+        a.param_body_chars_emitted = 0;
+        a.tool_body_streak_tokens = 0;
+        return;
+    }
     // CC6 (2026-06-07): count ONLY envelope tokens — tokens of a
     // `<parameter=…>` VALUE (the file content of a `write` call) are exempt,
     // so a legitimately large single-file Write streams without tripping the
@@ -779,6 +788,14 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
         }
         a.guard_stop = Some("tool_envelope_stuck");
         a.finished = true;
+    }
+    if m.has_native_values() {
+        // Native markers own value tracking; the `<parameter=` scan below
+        // would match unrelated tokens in this vocabulary.
+        if a.inside_parameter_body {
+            a.param_body_chars_emitted = a.param_body_chars_emitted.saturating_add(1);
+        }
+        return;
     }
 
     if a.inside_parameter_body {

@@ -17,7 +17,7 @@
 use anyhow::{Result, ensure};
 
 use super::free_blocks::FreeBlocks;
-use super::{KvCacheConfig, PagedKvCache};
+use super::{KvCacheConfig, KvPlacement, PagedKvCache};
 use crate::gpu::{DevicePtr, GpuBackend};
 
 /// Topology and scratch of a latent shard, fixed at construction.
@@ -192,6 +192,21 @@ impl PagedKvCache {
         gpu: &dyn GpuBackend,
         spec: LatentShardSpec,
     ) -> Result<Self> {
+        Self::new_latent_sharded_placed(config, num_blocks, gpu, spec, KvPlacement::default())
+    }
+
+    /// [`Self::new_latent_sharded`] with the pools `placement` names allocated
+    /// from the backend's carveout (and the sparse index's, once attached).
+    /// The placement is planned over
+    /// [`Self::buffer_sizes_with_k_slots`] at this rank's local slots; the
+    /// shard scratch always comes from system memory.
+    pub fn new_latent_sharded_placed(
+        config: KvCacheConfig,
+        num_blocks: usize,
+        gpu: &dyn GpuBackend,
+        spec: LatentShardSpec,
+        placement: KvPlacement,
+    ) -> Result<Self> {
         ensure!(
             spec.world == 2 && spec.rank < spec.world && num_blocks > 0,
             "latent shard supports a rank pair and a non-empty pool (rank {} of {}, {num_blocks} blocks)",
@@ -206,14 +221,7 @@ impl PagedKvCache {
             .collect();
         let built = gpu.copy_h2d(&table, identity).and_then(|()| {
             let lane = spec.lane.then(|| ExchangeLane::new(gpu)).transpose()?;
-            match Self::new_with_k_slots(
-                config,
-                num_blocks,
-                local_blocks,
-                gpu,
-                true,
-                super::KvPlacement::default(),
-            ) {
+            match Self::new_with_k_slots(config, num_blocks, local_blocks, gpu, true, placement) {
                 Ok(cache) => Ok((lane, cache)),
                 Err(error) => {
                     if let Some(lane) = lane {

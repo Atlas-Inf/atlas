@@ -261,9 +261,9 @@ pub fn prefill_request(
         return Ok(None);
     }
 
+    // Guard: free SSM slot on any error after allocation (Bug #16).
     let mut image_pixels = image_pixels;
     let has_images = !image_pixels.is_empty();
-    // Guard: free SSM slot on any error after allocation (Bug #16).
     let prefill_result = (|| -> Result<u32> {
         // Vision: encode images and store embeddings for prefill token overwrite.
         if has_images {

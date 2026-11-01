@@ -409,5 +409,6 @@ pub fn preprocess_video(
 
 mod timestamps;
 
+#[cfg(test)]
 #[path = "tests.rs"]
 mod tests;

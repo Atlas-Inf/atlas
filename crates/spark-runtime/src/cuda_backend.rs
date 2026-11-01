@@ -216,8 +216,6 @@ impl AtlasCudaBackend {
         })
     }
 
-    /// This model's kernel modules, for the paths that need the registry
-    /// directly rather than through `GpuBackend`.
     /// True when `ptr` lies strictly inside a registered slab — carved
     /// interior pointers own no storage and must never reach cuMemFree.
     pub(crate) fn is_slab_interior(&self, ptr: u64) -> bool {

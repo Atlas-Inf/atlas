@@ -69,6 +69,7 @@ pub(crate) async fn run_chat_stream(
     max_tokens: usize,
     min_tokens: usize,
     ignore_eos: bool,
+    disable_mtp: bool,
     temperature: f32,
     top_k: u32,
     top_p: f32,
@@ -162,7 +163,7 @@ pub(crate) async fn run_chat_stream(
         require_tool_call: tool_choice_required,
         tools_present: tools_active,
         suppress_tool_call,
-        disable_mtp: false,
+        disable_mtp,
         grammar_spec,
         seed,
         top_logprobs,
@@ -238,11 +239,11 @@ pub(crate) async fn run_chat_stream(
         stop_strings,
         stop_string_buffer_len,
         leak_markers,
+        role_literal_leaks: state.tokenizer.filters_bare_role_literals(),
         wants_typed_arguments: state
             .tool_call_parser
             .as_ref()
             .is_some_and(|p| p.wants_typed_arguments()),
-        role_literal_leaks: state.tokenizer.filters_bare_role_literals(),
         max_tool_calls_per_response,
         min_tokens,
         req_return_token_ids,

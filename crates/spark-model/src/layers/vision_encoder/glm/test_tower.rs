@@ -5,9 +5,9 @@
 //! tiny hidden sizes, capped at 16x16 input patches (64 merged rows).
 
 use atlas_core::config::VisionConfig;
-use spark_runtime::gpu::DevicePtr;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
-use super::{GlmVisionBlockWeights, GlmVisionMergerWeights, GlmVisionWeights};
+use super::{GlmVisionBlockWeights, GlmVisionEncoder, GlmVisionMergerWeights, GlmVisionWeights};
 use crate::VisionItem;
 
 pub(crate) const PATCH: usize = 14;
@@ -17,8 +17,8 @@ pub(crate) const HEADS: usize = 2;
 
 pub(crate) fn config() -> VisionConfig {
     VisionConfig {
-        is_glm5_next: true,
         is_qwen3vl_video: false,
+        is_glm5_next: true,
         in_channels: 3,
         depth: 2,
         hidden_size: 64 * HEADS,
@@ -79,6 +79,13 @@ pub(crate) fn weights() -> GlmVisionWeights {
             down_w: w,
         },
     }
+}
+
+/// The tower itself.
+pub(crate) fn encoder(gpu: &dyn GpuBackend) -> GlmVisionEncoder {
+    let encoder = GlmVisionEncoder::new(weights(), &config(), gpu).unwrap();
+    assert_eq!(encoder.p_max, 256);
+    encoder
 }
 
 /// A `grid` x `grid`-patch still image (zero pixels).

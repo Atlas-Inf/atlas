@@ -98,6 +98,8 @@ pub(crate) struct ParsedBehavior {
     pub eos_ends_thinking: bool,
     /// See `ModelBehavior::tool_call_steering`.
     pub tool_call_steering: bool,
+    /// See `ModelBehavior::verbatim_reasoning_effort`.
+    pub verbatim_reasoning_effort: bool,
 }
 
 impl Default for ParsedBehavior {
@@ -142,6 +144,7 @@ impl Default for ParsedBehavior {
             verbatim_prompt: false,
             eos_ends_thinking: false,
             tool_call_steering: true,
+            verbatim_reasoning_effort: false,
         }
     }
 }
@@ -334,6 +337,7 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
     let verbatim_prompt = flag("verbatim_prompt", false);
     let eos_ends_thinking = flag("eos_ends_thinking", false);
     let tool_call_steering = flag("tool_call_steering", true);
+    let verbatim_reasoning_effort = flag("verbatim_reasoning_effort", false);
     ParsedBehavior {
         thinking_in_tools,
         max_thinking_budget,
@@ -374,5 +378,6 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         verbatim_prompt,
         eos_ends_thinking,
         tool_call_steering,
+        verbatim_reasoning_effort,
     }
 }

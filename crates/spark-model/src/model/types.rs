@@ -329,6 +329,10 @@ pub struct TransformerModel {
     pub(super) dflash_hidden_save_rows: usize,
     /// How many sequences the capture buffer is strided for (1 = C=1 layout).
     pub(super) dflash_hidden_save_nseq: usize,
+    /// `ATLAS_DFLASH_WARM_CTX=restore`: drafter windows saved with prefill
+    /// checkpoints (rank 0; `build_model` reserves the slab before KV
+    /// sizing). Enntity/atlas d3953211.
+    pub(super) dflash_warm_store: crate::layers::dflash_head::WarmCtxStore,
     /// Cached CUDA graphs for K=2 verification, **keyed by `seq.slot_idx`**.
     /// Same rationale as `decode_graph`: the captured graph has SSM
     /// h_state/conv_state pointers baked in as kernel arguments, so replay for
@@ -438,34 +442,6 @@ pub struct TransformerModel {
     pub(super) verify_row_masks: super::glm_verify_masks::VerifyRowMasks,
     /// Optional vision encoder for VL models (Qwen3-VL).
     pub(super) vision_encoder: Option<crate::layers::VisionTower>,
-    /// Number of patches encoded by the last prepare_vision_embed() call.
-    /// 0 means no vision embeddings pending.
-    pub(super) vision_embed_patches: Mutex<usize>,
-    /// Per-ITEM `(t_len, grid_h_post_merge, grid_w_post_merge)` from the most
-    /// recent prepare_vision_embed() call. Used by MRoPE prefill to assign
-    /// correct (t, h, w) position IDs to each vision pad token. Empty when no
-    /// vision input is pending.
-    ///
-    /// `t_len` is the number of TEMPORAL GROUPS the item spans: 1 for a still
-    /// image, `frames / temporal_patch_size` for a video. It is per item and
-    /// not per encoder row on purpose — a video feeds `t_len` rows to the ViT
-    /// but occupies ONE contiguous pad run, and the position builder has to
-    /// treat that run as a single item whose T advances rather than as
-    /// `t_len` unrelated images (which would restart T and mis-advance the
-    /// running position for everything after it).
-    pub(super) vision_image_grids: Mutex<Vec<(usize, usize, usize)>>,
-    /// Co-dispatched batched-ViT slice base for the NEXT prefill_chunk. When a
-    /// tick batches >=2 image requests into one buf_out, each request's chunk-0
-    /// splice/MRoPE must read its OWN slice: `vision_row_base` = first buf_out
-    /// row, `vision_grid_base` = first vision_image_grids index, and
-    /// `vision_owned_images` bounds the grid scan. All 0 ⇒ legacy (read from
-    /// row 0 / grid 0). Set right before prefill_chunk, reset to 0 right after.
-    pub(super) vision_row_base: Mutex<usize>,
-    pub(super) vision_grid_base: Mutex<usize>,
-    pub(super) vision_owned_images: Mutex<usize>,
-    /// Number of encoded rows owned by the current co-dispatched request.
-    /// Zero means the legacy single-request range (or no pending vision).
-    pub(super) vision_slice_rows: Mutex<usize>,
     /// Page-locked host staging for batched metadata H2D transfers.
     /// Allocated once at init via cuMemAllocHost, freed in Drop.
     ///

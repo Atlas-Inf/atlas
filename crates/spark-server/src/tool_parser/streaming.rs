@@ -20,6 +20,9 @@ pub struct StreamingToolDetector {
     /// `ToolCallParser::promotes_bare_call_names`). Default FALSE: every
     /// other format drops it as malformed, matching the blocking parser.
     pub(super) promote_bare_names: bool,
+    /// Require a closed Poolside envelope before emitting any call event.
+    /// GLM uses this to validate native calls before exposing their headers.
+    pub(super) complete_poolside_calls: bool,
     pub(super) call_counter: u32,
     /// Track if any tool calls were emitted during process() to prevent
     /// flush() from re-emitting them (causes duplicate arguments in stream).

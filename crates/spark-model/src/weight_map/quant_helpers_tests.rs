@@ -86,6 +86,93 @@ fn unknown_name_frees_directly() {
     assert_eq!(store.reclaimed_count(), 0);
 }
 
+#[test]
+fn block_scale_grid_reads_2d_and_modelopt_4d_spellings() {
+    assert_eq!(block_scale_grid(&[32, 16]), Some((32, 16)));
+    // nvidia GLM-5.3-Flash-FP4-Local o_proj [4096, 16384], FP8_PB_WO 128x128.
+    assert_eq!(block_scale_grid(&[32, 1, 128, 1]), Some((32, 128)));
+    for other in [
+        &[] as &[usize],
+        &[7],
+        &[32, 2, 128, 1],
+        &[32, 1, 128, 2],
+        &[1, 2, 3],
+    ] {
+        assert_eq!(block_scale_grid(other), None, "{other:?}");
+    }
+}
+
+/// `{prefix}.weight` E4M3 `[n, k]` + F32 `weight_scale` of `scale_shape`.
+fn fp8_block_store(
+    gpu: &MockGpuBackend,
+    n: usize,
+    k: usize,
+    scale_shape: Vec<usize>,
+) -> WeightStore {
+    let scale_elems: usize = scale_shape.iter().product();
+    let mut map = HashMap::new();
+    map.insert(
+        "l.o_proj.weight".to_string(),
+        WeightTensor {
+            ptr: gpu.alloc(n * k).unwrap(),
+            shape: vec![n, k],
+            dtype: WeightDtype::FP8E4M3,
+        },
+    );
+    map.insert(
+        "l.o_proj.weight_scale".to_string(),
+        WeightTensor {
+            ptr: gpu.alloc(scale_elems * 4).unwrap(),
+            shape: scale_shape,
+            dtype: WeightDtype::FP32,
+        },
+    );
+    WeightStore::from_map(map)
+}
+
+/// FP4-Local's 4-D FP8_PB_WO scale reaches the GPU block dequant (one launch
+/// over the whole `[n, k]`) instead of the CPU fallback, which bails on rank 4.
+#[test]
+fn dense_auto_dequants_a_4d_fp8_block_scale_on_the_gpu_path() {
+    let gpu = MockGpuBackend::new();
+    let (n, k) = (256, 512);
+    let store = fp8_block_store(&gpu, n, k, vec![2, 1, 4, 1]);
+    let out = dense_auto(&store, "l.o_proj.weight", &gpu).unwrap();
+    assert_ne!(out.weight, store.get("l.o_proj.weight").unwrap().ptr);
+    let launches = gpu.launches_snapshot();
+    assert_eq!(launches.len(), 1);
+    assert_eq!(launches[0].grid, [(k / 64) as u32, (n / 4) as u32, 1]);
+    assert_eq!(gpu.d2h_blocking_count(), 0, "no host fallback");
+}
+
+#[test]
+fn a_4d_block_scale_that_does_not_tile_the_weight_is_refused() {
+    let gpu = MockGpuBackend::new();
+    let store = fp8_block_store(&gpu, 256, 512, vec![3, 1, 4, 1]);
+    let err = dense_auto(&store, "l.o_proj.weight", &gpu).unwrap_err();
+    assert!(format!("{err:#}").contains("does not tile"), "{err:#}");
+    assert!(gpu.launches_snapshot().is_empty());
+}
+
+#[test]
+fn an_empty_or_oversized_block_scale_grid_is_refused_not_divided_by() {
+    for grid in [
+        vec![0, 4],
+        vec![2, 0],
+        vec![0, 1, 4, 1],
+        vec![512, 4],
+        vec![2, 1024],
+    ] {
+        let gpu = MockGpuBackend::new();
+        let store = fp8_block_store(&gpu, 256, 512, grid.clone());
+        assert!(
+            dense_auto(&store, "l.o_proj.weight", &gpu).is_err(),
+            "{grid:?}"
+        );
+        assert!(gpu.launches_snapshot().is_empty());
+    }
+}
+
 /// A `q_proj` missing its gate-fused half (the Qwen4 synth bug) fails at load
 /// time with the config-implied shape in the message, not as a sticky
 /// CUDA_ERROR_ILLEGAL_ADDRESS inside `quantize_to_nvfp4`.

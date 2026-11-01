@@ -133,11 +133,13 @@ impl ModelConfig {
             // base Qwen3-Next-80B template behaves identically to before.
             scoring_func: String::new(),
             use_routing_bias: false,
+            router_logits_f32: false,
             qk_norm_type: String::new(),
             num_mtp_modules: 0,
             mtp_transformer_layers: 0,
             rotary_dim: 0,
             dflash_capture_layers: Vec::new(),
+            dflash_ctx_window: None,
             adapter_max_rank: 0,
             // No n-gram embeddings: the trio is opt-in per checkpoint.
             // No PLE tower: `ple_layer_ids` empty is the gate.

@@ -278,6 +278,9 @@ pub fn decode_with_plan(
     run_ffmpeg(bytes, &selection, output_frames, policy)
 }
 
+/// Generic ffmpeg subprocess: seekable staged input, streamed stdout read,
+/// stderr drained on a thread, watchdog kill after `policy.timeout_secs`
+/// (Enntity/atlas d0cead1).
 /// Spawn ffmpeg with the plan's filter and collect the frames.
 ///
 /// Split out so the argument construction (the part with the correctness

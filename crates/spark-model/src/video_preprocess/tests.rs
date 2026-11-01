@@ -382,7 +382,6 @@ fn gif_respects_explicit_aggregate_decode_budget() {
 // ── GLM-5.3: the reference sampler and processor ─────────────────────────
 // (Enntity/atlas f3f3876b.)
 
-#[allow(dead_code)]
 fn glm_cfg() -> VisionConfig {
     VisionConfig {
         is_glm5_next: true,
@@ -392,7 +391,7 @@ fn glm_cfg() -> VisionConfig {
 }
 
 /// The reference pads one sampled frame into a temporal pair rather than
-/// refusing it.
+/// refusing it; Qwen keeps the short-clip refusal above.
 #[test]
 fn a_glm_single_sample_is_padded_to_a_temporal_group() {
     let video = preprocess_video(&make_gif(1, 64), &glm_cfg(), None, 10.0, &no_ffmpeg())

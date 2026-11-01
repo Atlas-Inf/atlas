@@ -113,6 +113,7 @@ fn w8a8_rows_do_not_depend_on_the_pass_and_track_the_bf16_expansion() {
             w: Mxfp8Weight {
                 data: upload(g, &w),
                 scales: upload(g, &sc),
+                tiled: false,
             },
             n: n as u32,
             k: k as u32,

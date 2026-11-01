@@ -201,10 +201,14 @@ extern "C" __global__ void dense_gemm_f32in_f32out(
 #define RG_BK 64
 #define RG_NCOL 4
 
-extern "C" __global__ void dense_gemm_bf16_router(
+__device__ __forceinline__ void rg_store(__nv_bfloat16* c, float v) { *c = __float2bfloat16(v); }
+__device__ __forceinline__ void rg_store(float* c, float v) { *c = v; }
+
+template <typename OutT>
+__device__ __forceinline__ void dense_gemm_bf16_router_body(
     const __nv_bfloat16* __restrict__ A,  // [M, K] row-major
     const __nv_bfloat16* __restrict__ B,  // [N, K] row-major (read transposed)
-    __nv_bfloat16* __restrict__ C,         // [M, N] row-major
+    OutT* __restrict__ C,                  // [M, N] row-major
     unsigned int M,
     unsigned int N,
     unsigned int K
@@ -278,8 +282,25 @@ extern "C" __global__ void dense_gemm_bf16_router(
     if (row < M) {
         #pragma unroll
         for (int j = 0; j < RG_NCOL; j++)
-            if (col + j < N) C[(size_t)row * N + col + j] = __float2bfloat16(acc[j]);
+            if (col + j < N) rg_store(C + (size_t)row * N + col + j, acc[j]);
     }
+}
+
+extern "C" __global__ void dense_gemm_bf16_router(
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K
+) {
+    dense_gemm_bf16_router_body(A, B, C, M, N, K);
+}
+
+// FP32-output twin (routers that keep FP32 logits, GLM-5's
+// `moe_router_dtype: float32`): the same chains, unrounded, so each output is
+// dense_gemm_bf16_f32out's.
+extern "C" __global__ void dense_gemm_bf16_router_f32out(
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
+    float* __restrict__ C, unsigned int M, unsigned int N, unsigned int K
+) {
+    dense_gemm_bf16_router_body(A, B, C, M, N, K);
 }
 
 // ─────────────────────────────────────────────────────────────────────────

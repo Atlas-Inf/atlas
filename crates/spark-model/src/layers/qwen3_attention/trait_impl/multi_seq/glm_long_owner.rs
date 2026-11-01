@@ -23,6 +23,9 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16): every
+        // entry of this decode (`decode_glm_long_owners`).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         ensure!(
             self.mla.is_some() && self.hc.is_some() && !self.ffn.is_none(),
             "GLM long owner batch requires an mHC MLA layer with FFN"
@@ -164,6 +167,9 @@ impl Qwen3AttentionLayer {
             self.block_idx != 0 && self.block_idx + 1 != ctx.config.num_hidden_layers,
             "GLM fused prefill + verify MLA cannot be the first or last layer"
         );
+        // The chunk's prompt rows, then the passengers' verify rows: the
+        // routed FFN runs each on its reference lane (ATLAS_GLM_FP4L_DECODE_A16).
+        let _prompt = crate::layers::moe::PromptRows::enter(num_tokens);
         let rows = long_owner::owner_rows(passengers)?;
         let meta = ctx
             .attn_metadata
@@ -213,7 +219,7 @@ impl Qwen3AttentionLayer {
         let eps = ctx.config.rms_norm_eps as f32;
         let b = ctx.buffers;
         let (hidden, normed) = (b.hidden_states(), b.norm_output());
-        self.hc_pre_prefill(&hc.attn, hc, hidden, n, ctx, stream)?;
+        self.hc_pre_prefill(&hc.attn, hc, hidden, n, None, ctx, stream)?;
         ops::rms_norm(
             ctx.gpu,
             self.rms_norm_w_k,
@@ -254,10 +260,11 @@ impl Qwen3AttentionLayer {
             hc.hc_mult as u32,
             hc.sinkhorn_iters as u32,
             hc.hc_eps,
+            None,
             ctx,
             stream,
         )?;
-        if !seam {
+        if !seam.ran() {
             ops::hc_post_site(
                 ctx.gpu,
                 self.hc_post_k,
@@ -271,7 +278,7 @@ impl Qwen3AttentionLayer {
                 h as u32,
                 stream,
             )?;
-            self.hc_pre_prefill(&hc.ffn, hc, hidden, n, ctx, stream)?;
+            self.hc_pre_prefill(&hc.ffn, hc, hidden, n, None, ctx, stream)?;
         }
         ops::rms_norm(
             ctx.gpu,

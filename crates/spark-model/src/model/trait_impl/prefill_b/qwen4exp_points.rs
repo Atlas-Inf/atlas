@@ -202,8 +202,10 @@ impl TransformerModel {
             align: num_lcm(ratio, grid),
         };
         let adapter = seq.adapter_id;
+        // The index holds a vision prompt under its content key.
+        let key = self.pc_key_tokens(seq, tokens);
         plan_points(ask, |r| {
-            self.prefix_cache.snapshot_at(tokens, r, adapter).is_some()
+            self.prefix_cache.snapshot_at(&key, r, adapter).is_some()
         })
     }
 

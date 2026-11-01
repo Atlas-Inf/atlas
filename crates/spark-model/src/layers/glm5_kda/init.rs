@@ -117,6 +117,13 @@ impl Glm5KdaLayer {
                 "w4a16_gemv_batch5_qkv",
             ),
             w4a16_gemv_batchm: W4a16BatchmTiers::resolve(gpu, true),
+            mxfp8_gemv_k: ["mxfp8_gemv_tc8", "mxfp8_gemv_tc16", "mxfp8_gemv_tc32"]
+                .map(|name| super::super::try_kernel(gpu, "mxfp8_gemv", name)),
+            mx_quant_k: super::super::try_kernel(
+                gpu,
+                crate::layers::ops::MXFP8_ACT_MODULE,
+                crate::layers::ops::MX_QUANT_KERNEL,
+            ),
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_m128_k: gpu.kernel("w4a16", "w4a16_gemm_t_m128")?,
             dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
@@ -170,6 +177,11 @@ impl Glm5KdaLayer {
             preprocess_regresident_k,
             recurrent_regresident_k,
             register_resident_prefill,
+            flash_prefill: super::flash_prefill::FlashPrefill::load(
+                heads,
+                dim,
+                config.kda_gate_lower_bound,
+            )?,
             gated_norm_k: gpu.kernel("kda", "kda_sigmoid_gated_rms_norm")?,
             // Highway-storage-specific mHC kernels (FP32, or BF16 twins).
             hc_expand_k: gpu.kernel("hyper_connection", &hc_name("hc_expand"))?,
@@ -190,6 +202,27 @@ impl Glm5KdaLayer {
             ),
             hc_contract_k: gpu.kernel("hyper_connection", &hc_name("hc_contract"))?,
         };
+        // One activation-scratch lane per layer: W8A8's MXFP8 image (and the
+        // fused K=5 QKV / LT FP8 NVFP4 lanes) is shared Q -> K -> V through
+        // `project_hot_cast`'s cast flag, and a null NVFP4 copy is only safe
+        // when every projection has the twins that replace it.
+        let w = &layer.weights;
+        let projections = [&w.q_proj, &w.k_proj, &w.v_proj, &w.o_proj];
+        ensure!(
+            projections
+                .iter()
+                .all(|p| p.mxfp8.is_some() == w.q_proj.mxfp8.is_some()
+                    && p.w8a8.is_some() == w.q_proj.w8a8.is_some()),
+            "GLM KDA layer {layer_idx}: q/k/v/o disagree on MXFP8 decode / W8A8 prefill twins"
+        );
+        ensure!(
+            !layer.has_mxfp8_projections() || layer.mxfp8_gemv_k.iter().all(|k| k.0 != 0),
+            "GLM KDA layer {layer_idx}: MXFP8 q/k/v/o twins need the mxfp8_gemv tiers"
+        );
+        ensure!(
+            layer.weights.q_proj.w8a8.is_none() || layer.mx_quant_k.0 != 0,
+            "GLM KDA layer {layer_idx}: W8A8 prefill needs mxfp8_quant_act_bf16"
+        );
         // Eager (boot-audited) lookup of the K = 128 dual tier, which
         // `ops::dense_gemv_batchm_dual` then reads from the backend's op cache.
         super::super::ops::dense_gemv_dual_k128_kernel(gpu);

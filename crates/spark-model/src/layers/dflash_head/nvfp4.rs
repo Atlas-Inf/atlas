@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Drafter NVFP4: load-time quant + small-M `w4a16_gemv_batch4` dispatch.
+//! Drafter NVFP4: load-time quant and scalar or tensor-core dispatch.
+//!
+//! The drafter runs its per-step projections at M=γ rows: `w4a16_gemv_batch4`
+//! covers γ ≤ 4 and `w4a16_gemv_batch8` covers γ in 5..8. The opt-in
+//! tensor-core route covers wider blocks in pieces of up to 32 rows.
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
@@ -12,15 +16,56 @@ use crate::weight_map::{
     DenseWeight, Fp8DenseWeight, Mxfp8Weight, QuantizedWeight, quantize_to_nvfp4,
 };
 
+/// Which batched-GEMV tier the drafter NVFP4 projections dispatch through at a
+/// given γ. Pure decision so `try_install_nvfp4` quantizes only what decode
+/// will actually read, and so the tier table is testable without a GPU.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum DrafterNvfp4Tier {
+    Batch4,
+    Batch8,
+}
+
+impl DrafterNvfp4Tier {
+    fn kernel_name(self) -> &'static str {
+        match self {
+            Self::Batch4 => "w4a16_gemv_batch4",
+            Self::Batch8 => "w4a16_gemv_batch8",
+        }
+    }
+}
+
+/// Pure γ→tier pick; `None` above the batched GEMV tiers' reach (γ > 8).
+pub(super) fn drafter_nvfp4_tier(gamma: u32) -> Option<DrafterNvfp4Tier> {
+    match gamma {
+        1..=4 => Some(DrafterNvfp4Tier::Batch4),
+        5..=8 => Some(DrafterNvfp4Tier::Batch8),
+        _ => None,
+    }
+}
+
 impl BlockDiffusionDraftHead {
-    pub(super) fn try_install_nvfp4(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
+    pub(super) fn try_install_nvfp4(&mut self, gpu: &dyn GpuBackend, nvfp4_tc: bool) -> Result<()> {
         if std::env::var("ATLAS_NO_DFLASH_DRAFTER_NVFP4").is_ok() {
             return Ok(());
         }
-        if self.kernels.w4a16_gemv_batch4.0 == 0 {
-            tracing::warn!("ATLAS_DFLASH_DRAFTER_NVFP4=1 but w4a16_gemv_batch4 missing");
+        let scalar_tier = drafter_nvfp4_tier(self.gamma as u32).filter(|tier| {
+            match tier {
+                DrafterNvfp4Tier::Batch4 => self.kernels.w4a16_gemv_batch4,
+                DrafterNvfp4Tier::Batch8 => self.kernels.w4a16_gemv_batch8,
+            }
+            .0 != 0
+        });
+        let route = if nvfp4_tc && super::twins::nvfp4_tc_supported(self.gamma as u32) {
+            "tensor-core tiers"
+        } else if let Some(tier) = scalar_tier {
+            tier.kernel_name()
+        } else {
+            tracing::warn!(
+                "DFlash NVFP4: no resolved execution tier for γ={} — skipping drafter quantization",
+                self.gamma
+            );
             return Ok(());
-        }
+        };
         let absmax = match gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax") {
             Ok(k) => k,
             Err(e) => {
@@ -28,7 +73,10 @@ impl BlockDiffusionDraftHead {
                 return Ok(());
             }
         };
-        let quant = match gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4") {
+        let quant = match gpu.kernel(
+            "quantize_nvfp4",
+            crate::weight_loader::glm5_mode::weight_quantizer()?,
+        ) {
             Ok(k) => k,
             Err(e) => {
                 tracing::warn!("NVFP4 quant kernel missing: {e}");
@@ -41,8 +89,9 @@ impl BlockDiffusionDraftHead {
         let kv_dim = self.num_kv_heads * self.head_dim;
         let inter = self.intermediate_size;
         tracing::info!(
-            "DFlash NVFP4: quantizing {} layers × 7 GEMMs for w4a16_gemv_batch4",
-            self.layers.len()
+            "DFlash NVFP4: quantizing {} layers × 7 GEMMs for {}",
+            self.layers.len(),
+            route
         );
         // ATLAS_DFLASH_DROP_BF16 parked the dropped projections' twins.
         for (i, layer) in self.layers.iter_mut().enumerate() {
@@ -147,22 +196,16 @@ impl BlockDiffusionDraftHead {
         {
             return Ok(());
         }
+        let nvfp4_kernel = drafter_nvfp4_tier(m).map(|tier| match tier {
+            DrafterNvfp4Tier::Batch4 => self.kernels.w4a16_gemv_batch4,
+            DrafterNvfp4Tier::Batch8 => self.kernels.w4a16_gemv_batch8,
+        });
         if matches!(self.quant, DflashQuantization::Nvfp4Weights)
-            && m <= 4
             && let Some(w) = w_nvfp4
-            && self.kernels.w4a16_gemv_batch4.0 != 0
+            && let Some(k) = nvfp4_kernel
+            && k.0 != 0
         {
-            return ops::w4a16_gemv_batchm(
-                gpu,
-                self.kernels.w4a16_gemv_batch4,
-                src,
-                w,
-                dst,
-                m,
-                n_out,
-                k_in,
-                stream,
-            );
+            return ops::w4a16_gemv_batchm(gpu, k, src, w, dst, m, n_out, k_in, stream);
         }
         if matches!(self.quant, DflashQuantization::Fp8Weights)
             && let Some(fp8) = w_fp8
@@ -187,3 +230,22 @@ impl BlockDiffusionDraftHead {
         self.drafter_dense_gemm(gpu, src, w_bf16, dst, m, n_out, k_in, stream)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drafter_nvfp4_tier_pick() {
+        assert_eq!(drafter_nvfp4_tier(1), Some(DrafterNvfp4Tier::Batch4));
+        assert_eq!(drafter_nvfp4_tier(4), Some(DrafterNvfp4Tier::Batch4));
+        assert_eq!(drafter_nvfp4_tier(5), Some(DrafterNvfp4Tier::Batch8));
+        assert_eq!(drafter_nvfp4_tier(8), Some(DrafterNvfp4Tier::Batch8));
+        assert_eq!(drafter_nvfp4_tier(9), None);
+        assert_eq!(drafter_nvfp4_tier(0), None);
+    }
+}
+
+#[cfg(test)]
+#[path = "nvfp4_install_tests.rs"]
+mod install_tests;

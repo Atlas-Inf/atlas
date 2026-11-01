@@ -170,7 +170,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
             require_tool_call: tool_choice_required,
             tools_present: tools_active,
             suppress_tool_call,
-            disable_mtp: false,
+            disable_mtp: req.disable_mtp,
             grammar_spec: grammar_spec.clone(),
             seed: req.seed.map(|s| s.wrapping_add(choice_idx as u64)),
             top_logprobs,
