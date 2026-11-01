@@ -1660,3 +1660,20 @@ Gate 68b runs next after 68a, the Qwen4 sanitizer boot.
 - 69b: `CUDA_LAUNCH_BLOCKING=1`;
 - 69c: racecheck and initcheck;
 - 69d: 3 plain boots.
+
+## 2026-11-01 18:30 UTC — knob phase 2: agentic A0 vs A6; Qwen4 synth reaches "Server live"
+
+| | A0 main 8c2b67218 | A6 pre-565aa68 MODEL.toml |
+|---|---:|---:|
+| agentic-50 | 47/50 (0, 18, 27), 10.85 s/turn | **50/50**, 11.61 s/turn |
+| BFCL | 87.54 / 85.94 | 88.04 / 88.08 |
+
+- Runs: run-1793552803526224613 / run-1793556958320651694.
+- So 565aa68's policy costs 3/50 agentic and about 2.1 BFCL normalized on single-GB10 FP4-Local. Posted on #271 (issuecomment-6561960206).
+- Knob attribution (A2 `verbatim_prompt`, A1 sampling/presence) continues in jobs 71–74.
+
+**Qwen4 B2:**
+- The ILLEGAL_ADDRESS was the synth checkpoint, not the kernels. With `attn_output_gate`, q_proj must be [2·24·256, 5120] (q + gate fused); the synth had half the rows, so `nvfp4_global_absmax` read about 63 MB past the buffer.
+- Atlas never checked the shape, which is a robustness gap worth a main PR: refuse a projection whose element count doesn't match the expected shape.
+- With the fixed synth, the server boots. MTP fails to load (synth MTP tensor names), and the first prefill faults after the GDN layers. Next: name the faulting kernel.
+- Flash-Next control on the draft is IDENTICAL.
