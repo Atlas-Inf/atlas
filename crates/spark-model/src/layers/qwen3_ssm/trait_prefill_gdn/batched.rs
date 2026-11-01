@@ -108,15 +108,27 @@ impl Qwen3SsmLayer {
         // Mirror the single-stream dispatch ladder. Total tokens per stream
         // is `chunk_len`; the kernel internally processes `batch_size` such
         // streams (grid dim Y).
-        if self.gdn_prefill_wy32_batched_k.0 != 0 && chunk_len > 32 {
+        //
+        // gfx1151 caps a block's dynamic LDS at 64 KiB, and the wy32 / wy4 /
+        // persistent tiers keep the whole 128x128 FP32 state in shared memory
+        // plus their tiles (86,288 / 69,688 / 67,584 bytes at kd = vd = 128).
+        // On HIP those launches fail with hipErrorInvalidValue: strix s174b
+        // (27B, 8 concurrent ST-995 clients) logged 195 "Mixed-batch forward
+        // error ... grid=[48,2,1], block=[128,1,1], shared_mem=86288" in 4 h,
+        // each one a failed step for every sequence in it. Skip what does not
+        // fit; split4 (or the caller's per-stream fallback) takes the batch.
+        let lds_fits = |smem: usize| !cfg!(atlas_hip) || smem <= 64 * 1024;
+        let wy32_smem = kd * vd * 4 + 32 * kd * 2 + 32 * kd * 2 + 32 * 32 * 4 + (4 + 32 + 32) * 4;
+        let wy4_smem = kd * vd * 4 + 8 * kd * 4 + 56;
+        let persistent_smem = kd * vd * 4 + 4 * kd * 4;
+        if self.gdn_prefill_wy32_batched_k.0 != 0 && chunk_len > 32 && lds_fits(wy32_smem) {
             // #110: dynamic smem must cover the FULL kernel layout (H + smem_k +
             // smem_q + smem_warp[4] + smem_kd[C*C] + smem_g[C] + smem_bt[C], C=32).
             // The old `+256` slack under-counted the smem_warp(16)+smem_g(128)+
             // smem_bt(128)=272 trailer by 16 B, so the kernel's smem_bt tail wrote
             // past the requested allocation → CUDA illegal access under live
             // occupancy (compute-sanitizer: Invalid __shared__ write at +0xce0).
-            let smem =
-                (kd * vd * 4 + 32 * kd * 2 + 32 * kd * 2 + 32 * 32 * 4 + (4 + 32 + 32) * 4) as u32;
+            let smem = wy32_smem as u32;
             ops::gdn_prefill_persistent_smem_batched(
                 ctx.gpu,
                 self.gdn_prefill_wy32_batched_k,
@@ -139,8 +151,8 @@ impl Qwen3SsmLayer {
                 smem,
                 stream,
             )?;
-        } else if self.gdn_prefill_persistent_wy4_batched_k.0 != 0 {
-            let smem = (kd * vd * 4 + 8 * kd * 4 + 56) as u32;
+        } else if self.gdn_prefill_persistent_wy4_batched_k.0 != 0 && lds_fits(wy4_smem) {
+            let smem = wy4_smem as u32;
             ops::gdn_prefill_persistent_smem_batched(
                 ctx.gpu,
                 self.gdn_prefill_persistent_wy4_batched_k,
@@ -163,7 +175,9 @@ impl Qwen3SsmLayer {
                 smem,
                 stream,
             )?;
-        } else if (256..=4096).contains(&chunk_len) && self.gdn_prefill_persistent_batched_k.0 != 0
+        } else if (256..=4096).contains(&chunk_len)
+            && self.gdn_prefill_persistent_batched_k.0 != 0
+            && lds_fits(persistent_smem)
         {
             ops::gdn_prefill_persistent_batched(
                 ctx.gpu,
