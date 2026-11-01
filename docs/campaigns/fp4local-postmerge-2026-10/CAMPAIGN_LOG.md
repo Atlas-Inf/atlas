@@ -1565,3 +1565,27 @@ Main 8c2b67218, FP4-Local r1short, agentic iteration 0 on a fresh serve, 2 boots
 - Rates come from phase 2: BFCL + agentic-50 on A0/A6 (jobs 67–70), then on A2/A1 (71–74).
 - Posted on #271 (issuecomment-6553948253).
 - Qwen4 B2: the synth boot passed config parsing and failed on the qwen4_exp guard "0 of 4 layers have routed experts". The draft fix makes the guard check the config-declared FFN kind; the re-boots are queued as short jobs.
+
+## 2026-11-01 08:30 UTC — overnight plan: land the gateable PRs, clean up, knob phase 2
+
+**Open-PR triage** (authoritative `gh pr list`, 08:05 UTC):
+
+| PR | Sparky action |
+|---|---|
+| #303 vision prefix cache (data-angel) | gate in train `integ/train-2026-11-01` |
+| #159 batch2 BF16 LM head | gate in the same train. Job 59 already showed control identical, BFCL 87.54 / 85.94 and agentic 47/50 at 10.68 s/turn, all equal to main 170c3ed3a |
+| #255 DFlash2 warm ctx, #256 GLM video | stale stack bases; ported onto main as `port/255-on-main` and `port/256-on-main` and gated in the train. Sparky has no DFlash2 or GLM checkpoint, so only the default-off neutrality and the unit/GPU tests are covered there |
+| #142 NVFP4-only gate subjects | merge main in, re-test, land (CPU only) |
+| #242, #199 GLM dual-Spark | need reiner + spark2; not gateable on sparky |
+| #149, #194 Strix | not sparky |
+| #160, #100 EXL3 (external) | conflicting; checkpoint not on sparky |
+| #113 (release record, obsolete image), #118 (env ratchet) | need an owner decision |
+| #211 | lands at the end of the night |
+
+**Train gate 68b.** Same base as knob A0 (main 8c2b67218), so A0's job 67 BFCL and job 69 agentic are the main arm. It covers:
+- tests, with the #255 GPU tests and #303's tests confirmed to run;
+- FP4-Local, NVFP4 and 27B controls vs A0;
+- a #303 vision prefix-cache probe: cold vs warm, gate on vs off vs main, and an image chunk after a cached image;
+- agentic-50, BFCL ST-995, and error/panic counts.
+
+Clean, ref-reachable sparky worktrees get pruned; branches are kept.
