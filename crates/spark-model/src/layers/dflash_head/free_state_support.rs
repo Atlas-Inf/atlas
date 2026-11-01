@@ -67,4 +67,3 @@ pub(super) fn fresh_state_inner(gpu: &MockGpuBackend) -> Box<DflashProposerState
         lifecycle: None,
     })
 }
-
