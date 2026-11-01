@@ -1708,3 +1708,16 @@ Gate 68b runs next after 68a, the Qwen4 sanitizer boot.
   - The Flash-Next control on the draft is IDENTICAL.
   - Day-0 perf note: Qwen4 decode will take the tiled HC path; it needs a 4H=20480-capable single-pass HC kernel (PR22's HC work).
 - **#310 (draft)** `weight_map: refuse a projection whose checkpoint shape disagrees with the config`. This is the OOB device read the synth exposed (CWE-125). One-variable controls vs a fresh base build run in job 72c.
+
+## 2026-11-01 20:55 UTC — #310 merged (checkpoint shape guard)
+
+- **#310 merged** as 11972c132.
+- **72c**, one variable vs a fresh build of base 88010baee: `control.py` byte-identical on all three models, 4/4 answered each:
+  - FP4-Local;
+  - Flash-Next NVFP4;
+  - Qwen3.8-27B NVFP4 at K=2 verify.
+- CI is green apart from the repo-wide benchmark-gate red.
+- **Next on sparky:**
+  - 72d: Qwen4 PLE synth boot+gen;
+  - 72e: full-depth 64-layer Qwen4 synth (52 GB BF16): memory, KV, TTFT and decode tok/s, labelled synthetic;
+  - then 73/74: BFCL A2 / A1 knob attribution.
