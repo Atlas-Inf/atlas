@@ -1589,3 +1589,24 @@ Main 8c2b67218, FP4-Local r1short, agentic iteration 0 on a fresh serve, 2 boots
 - agentic-50, BFCL ST-995, and error/panic counts.
 
 Clean, ref-reachable sparky worktrees get pruned; branches are kept.
+
+## 2026-11-01 11:30 UTC — #142 and #304 merged; train #305 opened; knob A0 BFCL
+
+**Merged:**
+- **#142** NVFP4-only gate subjects → 744fab747.
+  - A first merge attempt was built on a stale local branch (4ebe2c4c1, not the PR head 32c10b247). It had given the NVFP4 35B the retired FP8 floors 86.50 / 86.90. Discarded before push.
+  - The landed merge is 32c10b247 + main. The only conflicts were the two video-fidelity comments, where main's newer text was kept.
+  - The tree-pinning `bench_variants` test was updated to the NVFP4 default. CI `cargo test --workspace` passed.
+- **#304** fixes main's rustdoc break (an intra-doc link to the `cfg(test)` `build_msg_entries`) → 5314eb1f2.
+- **#303** landed on main on its own (3bd5d7b1e). Train #305 still gates it on GB10.
+
+**Train #305** (`integ/train-2026-11-01` @ 5ffcd4169, base 8c2b67218): #159 + #303 + ports of #255 and #256.
+
+Review fixes before push:
+- 500-line cap splits (impl_b3_dflash 582, free_state_tests 556, video_decode_ffmpeg 505 were over);
+- `ensure_decoder` dedupe;
+- reverted a GLM single-frame behaviour change and restored the reference pad test. Main's GLM-only refusal test was dropped as superseded; Qwen is unchanged.
+
+Gate 68b runs next after 68a, the Qwen4 sanitizer boot.
+
+**Knob A0 (main 8c2b67218) BFCL ST-995:** 87.54 / 85.94 (run-1793521232941271578), identical to the 170c3ed3a run. A6 (full 565aa68 revert) BFCL is running.
