@@ -394,6 +394,7 @@ fn gif_respects_explicit_aggregate_decode_budget() {
 // ── GLM-5.3: the reference sampler and processor ─────────────────────────
 // (Enntity/atlas f3f3876b.)
 
+#[allow(dead_code)]
 fn glm_cfg() -> VisionConfig {
     VisionConfig {
         is_glm5_next: true,
