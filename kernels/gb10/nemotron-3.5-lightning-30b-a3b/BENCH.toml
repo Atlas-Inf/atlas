@@ -31,8 +31,8 @@
 #
 # ★ NOTHING HERE IS `default = true`. The default subject of each of these
 # gates is already claimed by a Qwen target (bfcl-subset, decode-floor and
-# concurrency-sweep by qwen3.8-27b; the two TTFT guards and
-# ssm-state-poisoning-gate by qwen3.6-35b-a3b), and two defaults refuse to
+# concurrency-sweep and ssm-state-poisoning-gate by qwen3.8-27b; the two TTFT
+# guards by qwen3.6-35b-a3b), and two defaults refuse to
 # assemble at all. Select this checkpoint explicitly:
 #
 #   ATLAS_DFLASH_OPTION_B=1 spark benchmark run <gate> --pull-request-gate \
