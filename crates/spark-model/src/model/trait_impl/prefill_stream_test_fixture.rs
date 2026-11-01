@@ -84,10 +84,8 @@ impl GpuBackend for Gpu {
     }
     fn stream_wait_event(&self, stream: u64, event: u64) -> Result<()> {
         self.record.order.lock().push(Order::Wait(stream, event));
-        anyhow::ensure!(
-            !self.record.wait_failure.swap(false, Ordering::Relaxed),
-            "injected stream wait failure"
-        );
+        let failed = self.record.wait_failure.swap(false, Ordering::Relaxed);
+        anyhow::ensure!(!failed, "injected stream wait failure");
         Ok(())
     }
     fn default_stream(&self) -> u64 {

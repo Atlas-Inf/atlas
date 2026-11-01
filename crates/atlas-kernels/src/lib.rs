@@ -393,9 +393,8 @@ pub struct ModelBehavior {
     /// Atlas's `<tool_call>` logit bias and loop-detector mask on tool-armed
     /// requests. Default `true`; `false` leaves the opener to the model.
     pub tool_call_steering: bool,
-    /// The template gets the client's `reasoning_effort` spelling verbatim
-    /// (`minimal`, `xhigh`, `max`), as vLLM hands it. Default `false`: the
-    /// cross-template tier (`low`/`medium`/`high`/`xhigh`).
+    /// The template gets `reasoning_effort` verbatim (`minimal`, `xhigh`, `max`),
+    /// as vLLM hands it. Default `false`: `low`/`medium`/`high`/`xhigh`.
     pub verbatim_reasoning_effort: bool,
 }
 

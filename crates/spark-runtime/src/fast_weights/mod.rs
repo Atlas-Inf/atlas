@@ -407,24 +407,22 @@ mod expert_filter_tests {
         assert!(loader.should_skip_tensor(target));
     }
 
-    /// FP4-Local: CSF streams and listed MXFP8 modules are located, not
-    /// uploaded; their scalar siblings and every other tensor load as usual.
+    /// FP4-Local: listed MXFP8 modules are located, not uploaded; their scalar
+    /// siblings, the CSF streams (decoded at upload) and every other tensor
+    /// load as usual.
     #[test]
     fn host_decoded_tensors_are_deferred() {
         let mut loader = FastSafetensorsLoader::new();
         let attn = "model.language_model.layers.3.self_attn.q_proj";
         loader.host_decode_modules.insert(attn.to_string());
         let expert = "model.language_model.layers.0.mlp.experts.3.down_proj";
-        for name in [
-            format!("{attn}.weight"),
-            format!("{attn}.weight_scale"),
-            format!("{expert}.weight_scale.nvfp4_csf_fixed"),
-            format!("{expert}.weight_scale.nvfp4_csf_exceptions"),
-        ] {
+        for name in [format!("{attn}.weight"), format!("{attn}.weight_scale")] {
             assert!(loader.should_defer_tensor(&name), "{name}");
         }
         for name in [
             format!("{expert}.weight"),
+            format!("{expert}.weight_scale.nvfp4_csf_fixed"),
+            format!("{expert}.weight_scale.nvfp4_csf_exceptions"),
             format!("{expert}.weight_scale_2"),
             format!("{attn}.weight_scale_2"),
             "model.language_model.layers.3.self_attn.k_proj.weight".to_string(),

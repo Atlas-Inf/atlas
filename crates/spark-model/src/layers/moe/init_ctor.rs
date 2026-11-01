@@ -87,25 +87,9 @@ impl MoeLayer {
             w4a16_gemm: crate::layers::ops::w4a16_gemm_kernel(gpu)?,
             dense_gemm,
             router_f32,
-            router_gemv: if router_f32 {
-                gpu.kernel("gemv", "dense_gemv_bf16_fp32out")?
-            } else {
-                dense_gemv
-            },
-            router_gemm: if router_f32 {
-                gpu.kernel("gemm", "dense_gemm_bf16_f32out")?
-            } else {
-                dense_gemm
-            },
-            dense_gemm_router: super::super::try_kernel(
-                gpu,
-                "gemm",
-                if router_f32 {
-                    "dense_gemm_bf16_router_f32out"
-                } else {
-                    "dense_gemm_bf16_router"
-                },
-            ),
+            router_gemv: init_router::gemv(gpu, router_f32, dense_gemv)?,
+            router_gemm: init_router::gemm(gpu, router_f32, dense_gemm)?,
+            dense_gemm_router: init_router::gemm_batched(gpu, router_f32),
             router_prefill_bn32: router_prefill_bn32::resolve(config, gpu)?,
             dense_gemm_router_m5: super::super::try_kernel_gated(
                 router_f32 && config.model_type == "glm5_next",

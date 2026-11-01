@@ -77,13 +77,13 @@ fn unknown_dtype_is_still_refused() {
 /// FP4-Local's CSF exception streams are U32; they stage as a raw 4-byte
 /// container exactly as the buffered loader maps them.
 #[test]
-fn u32_stages_as_a_raw_four_byte_container() {
+fn a_csf_u32_stream_stages_as_bytes() {
     let mut file = write_safetensors(
         "u32",
         &[("e.weight_scale.nvfp4_csf_exceptions", "U32", &[81], 4)],
     );
     let metas = parse_header(&mut file).unwrap();
-    assert_eq!(metas[0].dtype, WeightDtype::Int32);
+    assert_eq!(metas[0].dtype, WeightDtype::UInt8);
     assert_eq!(metas[0].len, 324);
     assert!(!metas[0].from_f16);
 }
