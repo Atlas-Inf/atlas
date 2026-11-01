@@ -1741,3 +1741,24 @@ Gate 68b runs next after 68a, the Qwen4 sanitizer boot.
    - Fixes since the last entry: PLE `layer_multipliers` and the n-gram metadata are I64 and the norms F32, which explains the 24 B-over-6 B DtoH. synth-64 now has tokenizer files.
 3. 74: BFCL A1.
 4. 75: 27B BFCL on the gate recipe.
+
+## 2026-11-02 00:00 UTC — BFCL A2: verbatim_prompt is the main knob; Qwen4 64-layer synth boots
+
+**Knob results so far:**
+
+| arm | agentic-50 | BFCL overall / norm |
+|---|---|---|
+| A0 main 8c2b67218 | 47/50 | 87.54 / 85.94 |
+| A1 sampling / presence | 49/50 | (job 74) |
+| A2 `verbatim_prompt` off | 50/50 | 87.54 / **87.79** (run-1793576349809849743) |
+| A6 full revert | 50/50 | 88.04 / 88.08 |
+
+- Irrelevance recovers fully in A2: 87.50 → 95.83, the same as A6.
+- Posted on #271 (issuecomment-6565656238), with the minimal-change option: `verbatim_prompt = false` for qwen3.8-flash-next, keeping the rest of 565aa68.
+
+**Qwen4 64-layer synth** (16 attention + 48 GDN, dense 14336, random BF16; local draft b4f2ec5299):
+- Boots in 30 s. 50.1 GB pre-KV, 58.5 GB KV budget at 32K context (51.7 / 53.4 GB with MTP-4).
+- The TTFT/decode probe in 73b had a quoting bug, so no numbers. Lead-authored re-probe queued as 74a.
+- The PLE synth still needs n-gram shards: the loader refuses a PLE layer with no deferred shard table. That's a deliberate guard, not a bug.
+
+Queue: 74 (BFCL A1) → 74a (Qwen4 perf) → 75 (27B gate-recipe BFCL).
