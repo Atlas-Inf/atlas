@@ -356,6 +356,22 @@ pub struct DflashProposerState {
     /// Allocation cap for `ctx_hidden_acc` (in slot count). Mirrors the
     /// `max_seq_len` build arg so we can clamp without re-fetching it.
     pub max_ctx_len: usize,
+    /// Allocation rows for `ctx_hidden_acc`: the dense window only needs
+    /// `max_ctx_len` — decode appends slide before writing and the prefill
+    /// capture slides mid-prefill on overflow.
+    pub ctx_acc_rows: usize,
+    /// Absolute position where this seq's prefill captures began (the
+    /// KV-prefix-match point; 0 on a cold turn). Set by the first
+    /// `try_dflash_prefill_capture_layer` call — chunked prefill calls
+    /// `update_dflash_ctx_len_after_prefill` only after the LAST chunk, so
+    /// per-chunk capture rows must be derived: cursor = ctx_prefill_base +
+    /// (chunk_start - origin).
+    pub ctx_prefill_origin: Option<usize>,
+    /// `ctx_len` snapshot taken at the first capture call — i.e. the carried
+    /// rows adopted before this prefill (0 when no carry adopted). Rows
+    /// `[0..ctx_prefill_base)` keep their carried positions; captures fill
+    /// `[base..)` with positions `origin..`.
+    pub ctx_prefill_base: usize,
     /// Width (bytes) of one `ctx_hidden_acc` slot — `5 * target_hidden * bf16`.
     /// Stored to avoid re-deriving on every append.
     pub ctx_slot_bytes: usize,
@@ -1180,6 +1196,9 @@ impl DraftProposer for BlockDiffusionDraftHead {
             last_num_accepted: 0,
             skip_next_decode_append: false,
             max_ctx_len,
+            ctx_acc_rows: max_ctx_len,
+            ctx_prefill_origin: None,
+            ctx_prefill_base: 0,
             ctx_slot_bytes,
             // Phase 2 Option B: lazily allocated on first propose when
             // Option B is on (the generic default; ATLAS_DFLASH_OPTION_B=0
