@@ -76,7 +76,7 @@ impl TransformerModel {
             return Ok(());
         };
         dstate.note_capture(&plan);
-        return self.dflash_capture_rows(
+        self.dflash_capture_rows(
             plan.src_row(&pass),
             plan.rows(),
             acc_base.offset(plan.dst_slot() * n_capture * h * bf16 + slot_idx * h * bf16),
