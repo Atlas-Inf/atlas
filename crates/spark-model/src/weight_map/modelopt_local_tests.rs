@@ -484,3 +484,6 @@ fn materialize_is_a_no_op_without_fp4_local_tensors() {
 
 #[path = "modelopt_local_tests/tail.rs"]
 mod tail;
+
+#[path = "modelopt_local_native_tests.rs"]
+mod native;

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Single-shard buffered/direct I/O and upload; extracted without changing order.
+use super::shard_readers::ShardReaders;
 use super::{direct_io, header::parse_header};
 use crate::gpu::GpuBackend;
 use crate::weights::nvfp4_csf::{CsfAssembler, csf_part};
@@ -8,17 +9,12 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
-use std::sync::mpsc::sync_channel;
 
 /// Load a single shard with O_DIRECT + pipelined read/copy.
 ///
 /// Pipeline:
-///   reader thread: pread tensor N into aligned buffer → sync_channel ──▶
-///   main thread:   recv → copy_h2d → store tensor
-///
-/// The channel has capacity 1, so at any time the reader is ≤1 tensor
-/// ahead of the copier. Memory overhead per shard: 2 × max_tensor_bytes
-/// (rounded up to O_DIRECT alignment).
+///   reader threads: pread tensors into aligned buffers ([`ShardReaders`]) ──▶
+///   main thread:    recv, in tensor order → copy_h2d → store tensor
 #[allow(clippy::too_many_arguments)]
 pub(super) fn load_shard_fast(
     shard_path: &Path,
@@ -129,26 +125,17 @@ pub(super) fn load_shard_fast(
         advise_prefetch_shard(&buffered_file, shard_path, file_size);
     }
 
-    // Pipelined reader: sends (tensor_index, aligned_buffer, slice_start) to main.
-    type ReadMsg = (usize, direct_io::AlignedBuffer, usize);
-    let (tx, rx) = sync_channel::<Result<ReadMsg>>(1);
-    let tensors_for_reader: Vec<(u64, usize)> =
-        tensors.iter().map(|t| (t.abs_offset, t.len)).collect();
     let raw_fd = {
         use std::os::unix::io::AsRawFd;
         data_fd.as_raw_fd()
     };
 
     let _ = file_size; // retained for future use (tail-fragment buffered read)
-    let reader_handle = std::thread::spawn(move || {
-        for (idx, (abs_offset, len)) in tensors_for_reader.iter().enumerate() {
-            let msg = direct_io::read_tensor_aligned(raw_fd, *abs_offset, *len, using_direct)
-                .map(|(buf, slice_start)| (idx, buf, slice_start));
-            if tx.send(msg).is_err() {
-                break; // receiver dropped
-            }
-        }
-    });
+    let mut readers = ShardReaders::spawn(
+        raw_fd,
+        using_direct,
+        tensors.iter().map(|t| (t.abs_offset, t.len)).collect(),
+    );
 
     // Pack mode (opt-in): one cuMemAlloc per shard, tensors carved out at
     // 4096-byte-aligned interior offsets. Skips the ≥1MB→2MB page rounding
@@ -178,8 +165,9 @@ pub(super) fn load_shard_fast(
         None
     };
 
-    // Copier: drains the channel, does gpu alloc + copy_h2d, inserts into the map.
-    for result in rx {
+    // Copier: drains the reads in order, does gpu alloc + copy_h2d, inserts
+    // into the map.
+    for result in &mut readers {
         let (idx, buf, slice_start) = result?;
         let meta = &tensors[idx];
         let raw = &buf.as_slice()[slice_start..slice_start + meta.len];
@@ -217,27 +205,7 @@ pub(super) fn load_shard_fast(
                 gpu.copy_h2d(src, p)?;
                 p
             }
-            None => match gpu.alloc(meta.len) {
-                Ok(p) => {
-                    gpu.copy_h2d(src, p)?;
-                    p
-                }
-                Err(_) => {
-                    if !*offload_logged {
-                        tracing::warn!(
-                            "GPU alloc failed for {} ({} bytes) — switching to managed (UVM) memory",
-                            meta.name,
-                            meta.len
-                        );
-                        *offload_logged = true;
-                    }
-                    let p = gpu.alloc_managed(meta.len)?;
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(src.as_ptr(), p.0 as *mut u8, meta.len);
-                    }
-                    p
-                }
-            },
+            None => upload(gpu, &meta.name, src, offload_logged)?,
         };
 
         out.insert(
@@ -250,9 +218,7 @@ pub(super) fn load_shard_fast(
         );
     }
 
-    reader_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("reader thread panicked"))?;
+    readers.join()?;
 
     // Release file handles, then advise the kernel to drop any pages we did
     // end up caching on the buffered fallback path. O_DIRECT reads never hit

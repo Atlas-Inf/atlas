@@ -152,7 +152,7 @@ pub(crate) fn load_weight_store(
                 );
             }
             loader.host_decode_modules =
-                spark_model::weight_map::modelopt_local::host_decode_modules(config);
+                spark_model::weight_map::modelopt_local::deferred_modules(config);
             if !loader.host_decode_modules.is_empty() {
                 tracing::info!(
                     "Host-decoded at build, never resident: {} MXFP8 / vision-NVFP4 modules",

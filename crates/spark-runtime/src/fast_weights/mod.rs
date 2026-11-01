@@ -28,6 +28,7 @@ mod deferred_slice;
 mod direct_io;
 mod header;
 mod shard;
+mod shard_readers;
 
 pub use deferred_slice::{SliceAxis, decode_deferred_csf_scale, with_deferred_slice};
 
@@ -149,8 +150,7 @@ pub struct FastSafetensorsLoader {
     /// Modules whose `.weight` and `.weight_scale` are stored in a format the
     /// kernels do not read (MXFP8, or NVFP4 in a tower that runs BF16). They
     /// are DEFERRED — located, not uploaded — and the model build expands
-    /// them on the host, so the originals never occupy device memory. CSF
-    /// scale streams are deferred regardless of this list.
+    /// them on the host, so the originals never occupy device memory.
     pub host_decode_modules: std::collections::HashSet<String>,
 }
 
@@ -391,6 +391,10 @@ impl WeightLoader for FastSafetensorsLoader {
         Ok(store)
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "csf_load_tests.rs"]
+mod csf_load_tests;
 
 #[cfg(test)]
 mod expert_filter_tests {

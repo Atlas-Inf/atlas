@@ -21,11 +21,13 @@
 //!   read them are `const float*`, and the other packs' BF16 norms are
 //!   widened to F32 at layer-load (`dense_keep_f32`).
 //!
-//! The loader DEFERS every source tensor (`FastSafetensorsLoader::
-//! host_decode_modules`, `is_csf_stream`), so the compressed originals are
-//! read from disk here and never occupy device memory; only the expanded
-//! tensor is uploaded. A loader that uploaded them anyway (the non-fast path)
-//! still works: resident sources are read back and freed.
+//! The fast loader decodes CSF streams as it reads them and uploads native
+//! MXFP8 modules like any other tensor: its readers fetch those tensors far
+//! faster than one read each from here. It DEFERS the sources of what is
+//! expanded ([`deferred_modules`]), so they are read from disk here and never
+//! occupy device memory; only the expanded tensor is uploaded. A loader that
+//! uploaded them anyway (the non-fast path) still works: resident sources are
+//! read back and freed.
 //!
 //! The PLE n-gram table's NVFP4 rows are a different consumer (gathered by
 //! row off NVMe) and are handled by the PLE loader, not here.
@@ -87,6 +89,29 @@ fn host_decode_modules_for(config: &ModelConfig, glm: NativePolicy) -> HashSet<S
         .filter(|(_path, spec)| spec.quant_algo.eq_ignore_ascii_case("MXFP8"))
         .map(|(path, _)| path.clone())
         .collect()
+}
+
+/// `ATLAS_FP4LOCAL_EXPAND_MXFP8=1`, A/B only: expand the native MXFP8 set too
+/// (both paths are exact).
+fn force_expand() -> bool {
+    std::env::var("ATLAS_FP4LOCAL_EXPAND_MXFP8").as_deref() == Ok("1")
+}
+
+/// The modules the fast loader leaves on disk for [`materialize`]: every
+/// [`host_decode_modules`] entry but those served as shipped.
+pub fn deferred_modules(config: &ModelConfig) -> HashSet<String> {
+    let mut modules = host_decode_modules(config);
+    if let Some(plan) = ModeloptQuantPlan::from_config(config)
+        && !force_expand()
+    {
+        let natives = native_consumers(&config.model_type);
+        modules.retain(|m| {
+            !plan
+                .format_of(m)
+                .is_some_and(|f| natives.covers(m, &f.algo))
+        });
+    }
+    modules
 }
 
 /// What [`materialize`] did, for the load log and for tests.
@@ -219,30 +244,43 @@ fn decode_one_csf(store: &mut WeightStore, gpu: &dyn GpuBackend, base: &str) -> 
     )
 }
 
-/// Upload one MXFP8 module unchanged: `weight` E4M3 `[n, k]` and
-/// `weight_scale` E8M0 `[n, k / 32]`. `None` when the checkpoint lacks it.
+/// Refuse a pair that is not MXFP8: `weight` E4M3 `[n, k]` and `weight_scale`
+/// E8M0 `[n, k / 32]`.
+fn check_native_mxfp8(
+    module: &str,
+    (w_dtype, w_shape): (WeightDtype, &[usize]),
+    (s_dtype, s_shape): (WeightDtype, &[usize]),
+) -> Result<()> {
+    ensure!(
+        w_dtype == WeightDtype::FP8E4M3
+            && w_shape.len() == 2
+            && w_shape[1] % 32 == 0
+            && s_dtype == WeightDtype::UInt8
+            && s_shape == [w_shape[0], w_shape[1] / 32],
+        "{module}: expected MXFP8 (E4M3 [n, k] + U8 [n, k/32]), got {w_dtype:?} {w_shape:?} + \
+         {s_dtype:?} {s_shape:?}",
+    );
+    Ok(())
+}
+
+/// Put one MXFP8 module on the device unchanged, unless the loader already
+/// did. Returns the bytes uploaded, or `None` when the checkpoint lacks it.
 fn upload_native_mxfp8(
     store: &mut WeightStore,
     gpu: &dyn GpuBackend,
     module: &str,
 ) -> Result<Option<u64>> {
-    let Some(w) = take(store, gpu, &format!("{module}.weight"))? else {
+    let (wname, sname) = (format!("{module}.weight"), format!("{module}.weight_scale"));
+    if let (Ok(w), Ok(s)) = (store.get(&wname), store.get(&sname)) {
+        check_native_mxfp8(module, (w.dtype, &w.shape), (s.dtype, &s.shape))?;
+        return Ok(Some(0));
+    }
+    let Some(w) = take(store, gpu, &wname)? else {
         return Ok(None);
     };
-    let s = take(store, gpu, &format!("{module}.weight_scale"))?
+    let s = take(store, gpu, &sname)?
         .with_context(|| format!("{module}.weight has no weight_scale"))?;
-    ensure!(
-        w.dtype == WeightDtype::FP8E4M3
-            && w.shape.len() == 2
-            && w.shape[1] % 32 == 0
-            && s.dtype == WeightDtype::UInt8
-            && s.shape == [w.shape[0], w.shape[1] / 32],
-        "{module}: expected MXFP8 (E4M3 [n, k] + U8 [n, k/32]), got {:?} {:?} + {:?} {:?}",
-        w.dtype,
-        w.shape,
-        s.dtype,
-        s.shape
-    );
+    check_native_mxfp8(module, (w.dtype, &w.shape), (s.dtype, &s.shape))?;
     let mut n = upload(
         store,
         gpu,
@@ -339,6 +377,7 @@ pub fn materialize(
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
 ) -> Result<Materialized> {
+    let started = std::time::Instant::now();
     let mut done = Materialized::default();
     let plan = ModeloptQuantPlan::from_config(config);
     let natives = native_consumers(&config.model_type);
@@ -361,8 +400,7 @@ pub fn materialize(
     }
     let mut modules: Vec<String> = host_decode_modules(config).into_iter().collect();
     modules.sort();
-    // A/B only: expand the native MXFP8 set too (both paths are exact).
-    let force_expand = std::env::var("ATLAS_FP4LOCAL_EXPAND_MXFP8").as_deref() == Ok("1");
+    let force_expand = force_expand();
     for module in modules {
         let fmt = plan.as_ref().and_then(|p| p.format_of(&module));
         let algo = fmt
@@ -399,13 +437,14 @@ pub fn materialize(
         tracing::info!(
             "FP4-Local: decoded {} CSF scale tensors, kept {} MXFP8 projections native, \
              expanded {} MXFP8 and {} NVFP4 projections to BF16, kept {} F32 norms \
-             native ({:.2} GiB uploaded; compressed originals never resident)",
+             native ({:.2} GiB uploaded in {:.2} s; compressed originals never resident)",
             done.csf_scales,
             done.mxfp8_native,
             done.mxfp8_to_bf16,
             done.nvfp4_to_bf16,
             done.f32_norms_native,
-            done.uploaded_bytes as f64 / (1u64 << 30) as f64
+            done.uploaded_bytes as f64 / (1u64 << 30) as f64,
+            started.elapsed().as_secs_f64()
         );
     }
     Ok(done)
