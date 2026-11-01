@@ -1647,3 +1647,16 @@ Gate 68b runs next after 68a, the Qwen4 sanitizer boot.
 - The dense GEMM kernels (`nvfp4_mmq`, `q4k`, `w4a16`, `w4a4`) now compile into the qwen4-27b target instead of being declared absent.
 - The Flash-Next control on the draft is IDENTICAL.
 - The synth boot now gets past the kernel lookups and faults with ILLEGAL_ADDRESS at full-attention layer 3. Sanitizer job 68g names the kernel.
+
+## 2026-11-01 17:00 UTC — #307 merged (port of #256); #256 and #305 closed
+
+- **#307** merged as 575db42e1: GLM reference video preprocessing on main, every video file byte-identical to the train-gated version.
+  - An intermediate rebuild had dropped #256/#295's two `declared_frames` tests. They were restored before push.
+- **Flake classified:** `hour_tests::probe_timeout_covers_a_blocked_stdout_read` hits `Text file busy` on main b45811df7 too.
+- **Main bug on hosts with ffmpeg:** main fails `a_faststart_mp4…` / `a_moov_at_end_mp4…` under `FfmpegPolicy::default()`. #307 fixes the tests.
+- **#256 closed** (superseded by #307). **#305 closed** (#159 and #307 landed, #303 already on main, #255 held).
+
+**Qwen4 B2:** the no-PLE synth BOOTS under compute-sanitizer memcheck, with 0 invalid accesses (only probe misses and teardown noise). It faults without the sanitizer, which points to a stream-ordering race or an uninitialised buffer. The discriminating jobs are:
+- 69b: `CUDA_LAUNCH_BLOCKING=1`;
+- 69c: racecheck and initcheck;
+- 69d: 3 plain boots.
