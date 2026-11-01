@@ -69,7 +69,8 @@ fn the_agentic_gate_declares_both_variants_in_this_tree() {
     assert!(rows[0].is_default, "the declared subject leads");
     assert_eq!(rows[0].checkpoint, "nvidia/Qwen3.8-27B-NVFP4");
     assert!(
-        rows.iter().all(|r| r.checkpoint != "Qwen/Qwen3.6-35B-A3B-FP8"),
+        rows.iter()
+            .all(|r| r.checkpoint != "Qwen/Qwen3.6-35B-A3B-FP8"),
         "the retired FP8 subject is gone"
     );
     let dense = &rows[0];
