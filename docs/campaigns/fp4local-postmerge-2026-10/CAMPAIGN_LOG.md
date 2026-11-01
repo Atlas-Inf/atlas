@@ -1545,3 +1545,23 @@ culprit and transcripts. Next after it: B2, Qwen4 synthetic-smoke debug (local d
 - BFCL normalized 87.13 → 85.94 between b0df50185 and 170c3ed3a is two observations, not an A/B: live_parallel −12.5, live_multiple −3.8, irrelevance −4.2, non_live +1.5.
 - Posted on #271 (issuecomment-6553486582).
 - In parallel: Qwen4 B2 (job 60 boot failure), short boot jobs slotted between the long runs, local only.
+
+## 2026-11-01 05:45 UTC — 565aa68 knob attribution, phase 1 (job 66)
+
+Main 8c2b67218, FP4-Local r1short, agentic iteration 0 on a fresh serve, 2 boots per arm:
+
+| Arm | Restored to pre-565aa68 | Boot 1 | Boot 2 |
+|---|---|---|---|
+| A0 | none | FAIL | FAIL |
+| A1 | sampling rows (presence 1.5) | — (re-run 66c) | pass |
+| A2 | verbatim_prompt off | pass | pass |
+| A3 | thinking budget | FAIL | FAIL |
+| A4 | eos | FAIL | FAIL |
+| A5 | steering | FAIL | FAIL |
+| A6 | full revert | pass | pass |
+
+- The gate holds. Two knobs each flip the trajectory on their own: the prompt render, and presence 1.5. Under greedy the pick is the argmax of the penalised logits (`fast_greedy.rs` classify_penalties), so presence still steers.
+- This is a trajectory probe, not a rate. The same binary isn't token-identical across boots: A0 1646 vs 1709 ctok.
+- Rates come from phase 2: BFCL + agentic-50 on A0/A6 (jobs 67–70), then on A2/A1 (71–74).
+- Posted on #271 (issuecomment-6553948253).
+- Qwen4 B2: the synth boot passed config parsing and failed on the qwen4_exp guard "0 of 4 layers have routed experts". The draft fix makes the guard check the config-declared FFN kind; the re-boots are queued as short jobs.
