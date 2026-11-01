@@ -1693,3 +1693,18 @@ Gate 68b runs next after 68a, the Qwen4 sanitizer boot.
   - GDN is held at spec (16K·128 / 48V), so `in_proj_qkv` is [10240, 5120].
 - PLE width (10240 vs 4H) is unresolved. The no-PLE synth is the main test.
 - Boot is OK. The first 16-token request returned HTTP 500; iterating.
+
+## 2026-11-01 20:45 UTC — A1 agentic; Qwen4 synth generates; shape-guard PR #310
+
+- **Knob agentic-50:** A0 47/50, A1 (sampling/presence) 49/50 failing iteration 18, A2 (`verbatim_prompt` off) 50/50, A6 50/50. Posted on #271.
+- **Qwen4-27B synth on the local draft** (`b4f2ec5299`): **boots and serves**. The 16-token temp-0 request returned HTTP 200, with MTP draft 4 loaded.
+  - Fixes along the way:
+    - gate-fused q_proj in the synth;
+    - Flash-Next-exact MTP tensor set, at H=5120;
+    - indexer (4+1)·128;
+    - GDN at spec;
+    - `hc_pre_down` routes to the tiled kernel when the HC row (4H·4 B = 80 KB) exceeds the 48 KB shared limit;
+    - kernel-name fault messages.
+  - The Flash-Next control on the draft is IDENTICAL.
+  - Day-0 perf note: Qwen4 decode will take the tiled HC path; it needs a 4H=20480-capable single-pass HC kernel (PR22's HC work).
+- **#310 (draft)** `weight_map: refuse a projection whose checkpoint shape disagrees with the config`. This is the OOB device read the synth exposed (CWE-125). One-variable controls vs a fresh base build run in job 72c.
