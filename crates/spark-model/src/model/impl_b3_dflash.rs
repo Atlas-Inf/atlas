@@ -155,7 +155,6 @@ impl TransformerModel {
         if self.config.model_type == "glm5_next" {
             return self.dflash_glm_prefill_capture(
                 seq,
-                dstate,
                 slot_idx,
                 chunk_start,
                 proc_count,

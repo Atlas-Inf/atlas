@@ -15,12 +15,18 @@ impl TransformerModel {
     pub(super) fn dflash_glm_prefill_capture(
         &self,
         seq: &mut crate::traits::SequenceState,
-        dstate: &mut crate::layers::dflash_head::DflashProposerState,
         slot_idx: usize,
         chunk_start: usize,
         proc_count: usize,
         stream: u64,
     ) -> Result<()> {
+        let Some(dstate) = seq
+            .proposer_state
+            .as_mut()
+            .and_then(|ps| ps.as_any_mut().downcast_mut::<crate::layers::DflashProposerState>())
+        else {
+            return Ok(());
+        };
         if dstate.ctx_hidden_acc.0 == 0
             && let Some(ref proposer) = self.proposer
         {
