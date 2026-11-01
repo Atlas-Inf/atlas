@@ -145,8 +145,7 @@ impl MoeLayer {
             && cfg!(atlas_hip)
             && num_tokens >= 2
             && self.t_rows_eligible(2, ctx)
-            && self.t_rows_eligible(T_ROWS_CHUNK, ctx)
-            && t_rows_scratch_bytes(num_tokens, ctx.config.num_experts_per_tok) <= 32 * 1024;
+            && self.t_rows_eligible(T_ROWS_CHUNK, ctx);
         if !((fast || rows_t)
             && self.use_t_layout_for_prefill()
             && num_tokens > 0
@@ -205,8 +204,15 @@ impl MoeLayer {
         let shared_gate_scratch = ctx.buffers.logits();
         let shared_up_scratch = ctx.buffers.ssm_qkvz();
         let shared_out = ctx.buffers.attn_output();
-        // Union scratch for the rows_t arm, after every token's indices and weights.
-        let u_base = scratch.offset(2 * num_tokens * top_k * 4);
+        // Union scratch for the rows_t arm. NOT in `scratch`: prefill metadata
+        // (positions, slot mapping, block table) is uploaded right after the
+        // routing indices/weights there (prefill_a.rs `meta_offset`), and a
+        // first cut placed the union buffers on top of it — the next attention
+        // layer's reshape_and_cache then wrote through a clobbered slot
+        // mapping (framework f171/f173: hipErrorIllegalAddress). The router
+        // logits buffer is free once every top-k above has read it (same
+        // stream, launched before this loop), and is sized for a whole chunk.
+        let u_base = ctx.buffers.gate_logits();
         let u_slots = T_ROWS_CHUNK * top_k;
         let (u_experts, u_rowmask) = (u_base, u_base.offset(u_slots * 4));
         let u_rowslot = u_base.offset(2 * u_slots * 4);
@@ -442,17 +448,9 @@ fn t_rows_chunk(remaining: usize) -> usize {
     }
 }
 
-/// Routing scratch the rows_t arm needs for `num_tokens` tokens: every token's
-/// indices and weights, then one chunk's union buffers (u_experts, u_rowmask,
-/// u_rowslot at 8 B a slot, u_count).
-fn t_rows_scratch_bytes(num_tokens: usize, top_k: usize) -> usize {
-    let u_slots = T_ROWS_CHUNK * top_k;
-    2 * num_tokens * top_k * 4 + 2 * u_slots * 4 + 8 * u_slots + 4
-}
-
 #[cfg(test)]
 mod rows_t_tail_tests {
-    use super::{t_rows_chunk, t_rows_scratch_bytes};
+    use super::t_rows_chunk;
 
     #[test]
     fn chunks_never_leave_one_row() {
@@ -466,11 +464,5 @@ mod rows_t_tail_tests {
             }
             assert_eq!(total, n);
         }
-    }
-
-    #[test]
-    fn scratch_fits_under_the_grouped_threshold() {
-        // Flash-Next top-10: every sub-256-token piece fits the 32 KiB scratch.
-        assert!(t_rows_scratch_bytes(255, 10) <= 32 * 1024);
     }
 }
