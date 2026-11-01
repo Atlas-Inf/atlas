@@ -448,7 +448,7 @@ fn a_moov_at_end_mp4_probes_and_decodes() {
 fn timing(frame_count: Option<u64>, duration_secs: f32, native_fps: f32) -> ClipTiming {
     ClipTiming {
         duration_secs,
-        native_fps,
+        native_fps: f64::from(native_fps),
         frame_count,
     }
 }

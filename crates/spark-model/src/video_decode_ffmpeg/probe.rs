@@ -111,7 +111,7 @@ pub(super) fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<Clip
 
     Ok(ClipTiming {
         duration_secs,
-        native_fps,
+        native_fps: f64::from(native_fps),
         frame_count,
     })
 }
