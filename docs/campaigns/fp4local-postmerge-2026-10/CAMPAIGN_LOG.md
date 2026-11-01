@@ -1529,3 +1529,19 @@ ffmpeg test fix.
 the same 3 iterations failing deterministically. BFCL normalized also moved 87.13 → 85.94 between those bases, below the
 86.92 floor. Job B1 bisects b0df50185..170c3ed3a on sparky with a targeted repro of iterations 0/18/27, then reports the
 culprit and transcripts. Next after it: B2, Qwen4 synthetic-smoke debug (local draft).
+
+## 2026-11-01 05:00 UTC — agentic 47/50 bisected to 565aa68 (#271); attribution + BFCL pair queued
+
+- Bisect job 65b (iteration 0, fresh serve per step, harness temp 0 / seed 0). Steps:
+  - 3bacfa8, 2cdcc39 and 25c6930 GOOD; 7707946 and 565aa68 BAD;
+  - first bad commit **565aa68** "qwen3.8-flash-next: serve the reference server's behaviour" (#271's MODEL.toml commit).
+- Job 64 was void: no `cargo` on PATH, so every step defaulted to BAD. Discarded.
+- The sampling-row temperature/top_p change is inert for this bench, since it sends temperature 0. The mechanism is undetermined.
+- Job C (main 8c2b67218, fresh `wt-knob`), one-group-at-a-time restores of the pre-565aa68 values, 2 fresh boots each:
+  - A0 control; A1 sampling (incl. presence 1.5); A2 verbatim_prompt; A3 thinking budget; A4 eos; A5 steering;
+  - A6 full revert (positive control);
+  - validity gate: A0 BAD ×2 and A6 GOOD ×2.
+- Phase 2 then runs BFCL ST-995 + agentic-50 on A0 vs A6, plus on the single responsible knob if one exists.
+- BFCL normalized 87.13 → 85.94 between b0df50185 and 170c3ed3a is two observations, not an A/B: live_parallel −12.5, live_multiple −3.8, irrelevance −4.2, non_live +1.5.
+- Posted on #271 (issuecomment-6553486582).
+- In parallel: Qwen4 B2 (job 60 boot failure), short boot jobs slotted between the long runs, local only.
