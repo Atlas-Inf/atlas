@@ -11,13 +11,13 @@ pub(super) fn dispatch_chunk0_vision(
     model: &dyn Model,
     seq: &mut SequenceState,
     vision_slice: Option<VisionSlice>,
-    image_pixels: &[spark_model::VisionItem],
+    has_images: bool,
     req_disable_mtp: bool,
 ) -> Result<()> {
     // Co-dispatch: point this request's chunk-0 splice/MRoPE at its slice of
     // the shared packed buf_out before the worker receives the same slice
     // descriptor. Single-chunk-fit is guaranteed upstream for this path.
-    let vision_enabled = vision_slice.is_some() || !image_pixels.is_empty();
+    let vision_enabled = vision_slice.is_some() || has_images;
     if let Some(s) = vision_slice {
         model.set_vision_slice_base(
             seq,

@@ -224,6 +224,19 @@ impl TransformerModel {
     /// most 2 NCCL ops per chunk-0 cache hit (negligible vs the prefill
     /// compute it unblocks).
     pub(super) fn ep_min_u32(&self, val: u32) -> Result<u32> {
+        self.ep_min_u32_with(val, false)
+    }
+
+    /// [`Self::ep_min_u32`] where rank 0 may arrive long after the others
+    /// (it encoded vision items they only receive: about 20 s per 2048^2
+    /// image). The others take rank 0's word as an idle receive, which the
+    /// slow-collective latch does not count, so a long encode does not mark
+    /// the communicator unhealthy. Same collectives, same order.
+    pub(super) fn ep_min_u32_head_late(&self, val: u32) -> Result<u32> {
+        self.ep_min_u32_with(val, true)
+    }
+
+    fn ep_min_u32_with(&self, val: u32, head_late: bool) -> Result<u32> {
         let Some(comm) = self.comm.as_ref() else {
             return Ok(val);
         };
@@ -243,7 +256,11 @@ impl TransformerModel {
                 comm.broadcast(self.ep_cmd_buf.0, 4, root)?;
                 val
             } else {
-                comm.broadcast(self.ep_cmd_buf.0, 4, root)?;
+                if head_late && root == 0 {
+                    comm.receive_idle_command_word(self.ep_cmd_buf.0)?;
+                } else {
+                    comm.broadcast(self.ep_cmd_buf.0, 4, root)?;
+                }
                 self.gpu.synchronize(stream)?;
                 let mut buf = [0u8; 4];
                 self.gpu.copy_d2h(self.ep_cmd_buf, &mut buf)?;
