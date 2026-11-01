@@ -21,6 +21,7 @@ use super::super::block_mgmt::{
     apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
     extract_layer_refs, reuse_prefix_match_disk_ids,
 };
+use super::super::prefix_share::adopt_prefix_match;
 use super::super::ssm_pool::SsmStatePool;
 use super::super::ssm_snapshot::SsmSnapshotPool;
 use super::super::types::{PinnedMetaStaging, TransformerModel};
@@ -105,6 +106,7 @@ impl TransformerModel {
         } else {
             self.buffers.zero_all(self.gpu.as_ref(), stream)?;
         }
+        self.buffers.note_rows(usize::MAX); // rows unknown to `zero_dirty`
 
         let mut kv_cache = self.kv_cache.lock();
 
@@ -138,7 +140,10 @@ impl TransformerModel {
 
         // ── 1b. Overwrite image_pad token positions with vision encoder embeddings ──
         {
-            let pending = *self.vision_embed_patches.lock();
+            // Per-sequence state: this request's rows (the model holds no
+            // vision state between requests). The two-phase path encodes the
+            // whole prompt in one pass, so every row is resident.
+            let pending = seq.vision.rows_encoded;
             if pending > 0
                 && let Some(ve) = &self.vision_encoder
             {
@@ -146,10 +151,10 @@ impl TransformerModel {
                 let mut img_idx = 0usize;
                 for (i, &tok) in tokens.iter().enumerate() {
                     if tok == image_pad || tok == video_pad {
-                        let src = ve.buf_out.offset(img_idx * ve.out_hidden_size * 2);
+                        let src = ve.out_row().offset(img_idx * ve.out_hidden_size() * 2);
                         let dst = hidden.offset(i * h * fp32);
                         self.gpu
-                            .copy_d2d_async(src, dst, ve.out_hidden_size * 2, stream)?;
+                            .copy_d2d_async(src, dst, ve.out_hidden_size() * 2, stream)?;
                         img_idx += 1;
                     }
                 }
@@ -162,21 +167,12 @@ impl TransformerModel {
             spark_runtime::prefix_cache::PrefixMatch::empty()
         } else {
             self.prefix_cache
-                .lookup(tokens, bs, seq.session_hash, seq.adapter_id)
+                .lookup_whole_blocks(tokens, bs, seq.session_hash, seq.adapter_id)
         };
         let matched = prefix_match.matched_tokens;
-        seq.cached_prefix_tokens = matched;
-        seq.cached_prefix_blocks = prefix_match.matched_blocks.len();
         // Record the original prompt length for cache_sequence bookkeeping.
         seq.prompt_len = tokens.len();
-        for &block_idx in &prefix_match.matched_blocks {
-            kv_cache.inc_ref(block_idx);
-            seq.block_table.push(block_idx);
-        }
-        reuse_prefix_match_disk_ids(
-            &prefix_match.matched_disk_block_ids,
-            &mut seq.disk_block_ids,
-        );
+        adopt_prefix_match(seq, &prefix_match, &mut kv_cache)?;
 
         // Marconi: restore SSM snapshot if available (session-gated).
         // Phase 1b spill-tier fault-in (#6): fold a resident hit with a
@@ -265,8 +261,16 @@ impl TransformerModel {
 
         // If the entire prompt is cached, just process the last token for logits.
         if proc_count == 0 {
-            return self
-                .prefill_full_cache_hit(tokens, seq, hidden, h as u32, bs, total_len, stream);
+            return self.prefill_full_cache_hit(
+                tokens,
+                seq,
+                hidden,
+                h as u32,
+                bs,
+                total_len,
+                eff_snapshot,
+                stream,
+            );
         }
 
         // PLE: warm the row cache ahead of the layer-1 gather — the ids are
@@ -384,18 +388,7 @@ impl TransformerModel {
                 seq.chunked_prefill_meta.as_mut().unwrap().uploaded_blocks = current_blocks;
             }
 
-            let seq_len_val = (proc_start + proc_count) as u32;
-            // SAFETY: exactly `size_of::<u32>()` bytes over the live, fully
-            // initialised `seq_len_val` local on the line above.
-            let seq_len_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &seq_len_val as *const u32 as *const u8,
-                    std::mem::size_of::<u32>(),
-                )
-            };
-            let seq_len_base = seq.chunked_prefill_meta.as_ref().unwrap().seq_len;
-            self.gpu
-                .copy_h2d_async(seq_len_bytes, seq_len_base, stream)?;
+            self.upload_chunk_seq_lens(seq, proc_start, proc_count, stream)?;
 
             let block_table_base = seq.chunked_prefill_meta.as_ref().unwrap().block_table;
             ops::fill_slots_from_block_table(
@@ -445,6 +438,7 @@ impl TransformerModel {
         };
 
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -458,7 +452,7 @@ impl TransformerModel {
             graph_capture: false,
             // Marconi warm hit: GDN layers replay from a restored SSM state
             // and must use the bit-faithful WY4 recurrence (see layer.rs).
-            gdn_exact_replay: marconi_skip,
+            gdn_exact_replay: marconi_skip && !self.grid_replay_is_cold(),
             token_ids: None,
             host_token_ids: None,
             // #30: request slot pairs (None unless routing to a non-active slot).

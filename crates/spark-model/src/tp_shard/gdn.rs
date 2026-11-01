@@ -193,7 +193,7 @@ pub(crate) fn segment_copy_plan(
 /// elements per row (`in_dim`); `elem_bytes` its size (2 = BF16, 4 = FP32).
 /// Returns `(local_ptr, local_total_rows)`. For `tp_size <= 1` returns the
 /// source untouched (no allocation, caller must not double-free).
-fn slice_segments(
+pub(crate) fn slice_segments(
     src: DevicePtr,
     segments: &[usize],
     row_elems: usize,

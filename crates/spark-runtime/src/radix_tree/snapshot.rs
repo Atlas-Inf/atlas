@@ -45,6 +45,9 @@ pub(super) struct SnapshotEntry {
     /// but leased alongside the tail. At most one per session (swept together
     /// with the tail by `insert_tail`).
     pub(super) is_tail_sibling: bool,
+    /// Conversation-chain bookkeeping for chain-aware eviction
+    /// (`ATLAS_GLM_PC_EVICT`); left at its default when the flag is off.
+    pub(super) chain: super::snapshot_chain::ChainMeta,
 }
 
 /// Where a matched snapshot's state currently lives (Phase 1b).
@@ -148,12 +151,18 @@ fn tail_lease_ttl() -> u32 {
 /// clamped to [0, 8] so a runaway env value cannot make depth
 /// recency-insensitive (a depth-pinned analog of the 07-10 hit-pinning).
 /// Default flip requires its own measured A/B: ATLAS_SNAP_EVICT_ALPHA.
-fn snap_evict_alpha() -> f64 {
+pub fn snap_evict_alpha() -> f64 {
     std::env::var("ATLAS_SNAP_EVICT_ALPHA")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .map(|a| a.clamp(0.0, 8.0))
         .unwrap_or(0.0)
+}
+
+/// `ATLAS_SNAP_EVICT_LEGACY` (presence): the old per-entry victim choice
+/// instead of the session-aware one.
+pub fn snap_evict_legacy() -> bool {
+    std::env::var_os("ATLAS_SNAP_EVICT_LEGACY").is_some()
 }
 
 impl SsmSnapshotIndex {
@@ -313,10 +322,17 @@ impl SsmSnapshotIndex {
         let escore = |e: &SnapshotEntry| e.last_access;
 
         // SESSION-AWARE eviction (default ON; ATLAS_SNAP_EVICT_LEGACY=1 → old per-entry).
-        if std::env::var_os("ATLAS_SNAP_EVICT_LEGACY").is_none() {
-            let tail_protect = self.tail_lease_active();
+        // ATLAS_GLM_PC_EVICT=1 replaces the victim choice with the chain-aware
+        // one and takes precedence over ATLAS_SNAP_EVICT_LEGACY and the tail
+        // lease (`snapshot_chain`: a chain frontier is protected anyway).
+        let chain = super::snapshot_chain::glm_pc_evict_enabled();
+        if chain || !snap_evict_legacy() {
             // Skip tiered entries (no HBM slot to free).
-            let victim_idx = self.session_aware_victim(tail_protect, true)?;
+            let victim_idx = if chain {
+                self.chain_victim(true)?
+            } else {
+                self.session_aware_victim(self.tail_lease_active(), true)?
+            };
             let entry = self.entries.swap_remove(victim_idx);
             self.stats.evictions += 1;
             self.evictions_since_lookup = self.evictions_since_lookup.saturating_add(1);

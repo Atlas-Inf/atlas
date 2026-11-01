@@ -14,7 +14,43 @@ use std::sync::OnceLock;
 // Native FP8 (E4M3) GEMM paths live in the `fp8` sibling (≤500 LoC split);
 // re-exported so `spark_runtime::cublaslt::fp8_gemm_*` paths are unchanged.
 mod fp8;
-pub use fp8::{fp8_gemm_act_weight_t_blkscaled, fp8_gemm_act_weight_t_rowwise};
+mod fp8_tensorwise;
+pub use fp8_tensorwise::fp8_gemm_act_weight_t_tensorwise;
+mod grouped;
+pub use fp8::{
+    fp8_blkscaled_pinned_prepare, fp8_gemm_act_weight_t_blkscaled,
+    fp8_gemm_act_weight_t_blkscaled_pinned, fp8_gemm_act_weight_t_mx,
+    fp8_gemm_act_weight_t_mx_pinned, fp8_gemm_act_weight_t_rowwise,
+};
+mod mx_algo;
+pub use grouped::bf16_grouped_gemm_act_weight_t;
+pub use mx_algo::{fp8_gemm_mx_pinned_prepare, fp8_gemm_mx_prepare};
+// The MXFP8 kernel choice's introspection, for tests and benches only.
+#[cfg(any(test, feature = "test-utils"))]
+pub use fp8::fp8_gemm_act_weight_t_mx_candidate;
+#[cfg(any(test, feature = "test-utils"))]
+pub use mx_algo::{MX_CANDIDATES, fp8_gemm_mx_candidate_times, mx_algo_description, mx_per_bucket};
+mod mx_sweep;
+pub use mx_sweep::{MX_SWEEP, MxSweepShape};
+mod tf32;
+pub use tf32::tf32_gemm_act_weight_t;
+mod fixed_algo;
+mod gemm_bf16;
+mod kchain_pin;
+pub use fixed_algo::{bf16_fixed_algo_description, bf16_gemm_act_weight_t_fixed};
+use gemm_bf16::gemm_bf16;
+pub use kchain_pin::{bf16_gemm_act_weight_t_kchain, bf16_gemm_act_weight_t_kchain_any};
+
+// The BF16 Atlas-kernel fallback (installed when cuBLASLt is a stub) lives in
+// the `bf16_fallback` sibling (≤500 LoC split); re-exported so
+// `spark_runtime::cublaslt::*` paths are unchanged.
+mod bf16_fallback;
+pub(crate) use bf16_fallback::{BF16_FALLBACK, FALLBACK_LOGGED};
+pub use bf16_fallback::{
+    Bf16GemmFallback, DENSE_GEMM_BF16_PIPELINED_THREADS, DENSE_GEMM_BF16_PIPELINED_TILE,
+    DENSE_GEMM_BF16_SCALAR_TILE, DENSE_GEMV_BATCHM_MAX_M, DENSE_GEMV_BATCHM_OUTPUTS_PER_BLOCK,
+    DENSE_GEMV_BATCHM_THREADS, install_bf16_fallback, make_bf16_fallback,
+};
 
 #[allow(non_camel_case_types)]
 type cublasLtHandle_t = *mut c_void;
@@ -29,6 +65,7 @@ const CUDA_R_16BF: i32 = 14;
 const CUDA_R_32F: i32 = 0;
 const CUDA_R_8F_E4M3: i32 = 28;
 const CUBLAS_COMPUTE_32F: i32 = 68;
+const CUBLAS_COMPUTE_32F_FAST_TF32: i32 = 77;
 const CUBLAS_OP_N: i32 = 0;
 const CUBLAS_OP_T: i32 = 1;
 const DESC_TRANSA: u32 = 3;
@@ -37,12 +74,16 @@ const DESC_A_SCALE_POINTER: u32 = 17;
 const DESC_B_SCALE_POINTER: u32 = 18;
 const DESC_A_SCALE_MODE: u32 = 31;
 const DESC_B_SCALE_MODE: u32 = 32;
+/// `CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0`: one UE8M0 scale per 32 K
+/// values (MXFP8), in cuBLASLt's tiled scale layout.
+const SCALE_MODE_VEC32_UE8M0: i32 = 2;
 const SCALE_MODE_OUTER_VEC_32F: i32 = 3;
 const SCALE_MODE_VEC128_32F: i32 = 4;
 const SCALE_MODE_BLK128X128_32F: i32 = 5;
 const PREF_MAX_WORKSPACE_BYTES: u32 = 1;
 
 unsafe extern "C" {
+    fn cublasLtGetVersion() -> usize;
     fn cublasLtCreate(handle: *mut cublasLtHandle_t) -> i32;
     fn cublasLtMatmulDescCreate(
         desc: *mut cublasLtMatmulDesc_t,
@@ -62,6 +103,12 @@ unsafe extern "C" {
         rows: u64,
         cols: u64,
         ld: i64,
+    ) -> i32;
+    fn cublasLtMatrixLayoutSetAttribute(
+        layout: cublasLtMatrixLayout_t,
+        attr: u32,
+        buf: *const c_void,
+        size: usize,
     ) -> i32;
     fn cublasLtMatrixLayoutDestroy(layout: cublasLtMatrixLayout_t) -> i32;
     fn cublasLtMatmulPreferenceCreate(pref: *mut cublasLtMatmulPreference_t) -> i32;
@@ -107,6 +154,20 @@ unsafe extern "C" {
     fn cuMemAlloc_v2(dptr: *mut u64, bytesize: usize) -> i32;
     fn cuMemFree_v2(dptr: u64) -> i32;
     fn cuStreamSynchronize(stream: u64) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn cuLaunchKernel(
+        f: u64,
+        grid_x: u32,
+        grid_y: u32,
+        grid_z: u32,
+        block_x: u32,
+        block_y: u32,
+        block_z: u32,
+        shared_mem_bytes: u32,
+        stream: u64,
+        params: *mut *mut c_void,
+        extra: *mut c_void,
+    ) -> i32;
 }
 
 struct Ctx {
@@ -199,6 +260,8 @@ fn chk(status: i32, what: &str) -> Result<()> {
     Ok(())
 }
 
+static CUBLASLT_LIVE_LOGGED: std::sync::Once = std::sync::Once::new();
+
 /// Whether cuBLASLt is usable at all — handle plus the 64 MB workspace.
 ///
 /// Memoised by `ctx()`, so this is one atomic load after the first call. Call
@@ -208,6 +271,16 @@ fn chk(status: i32, what: &str) -> Result<()> {
 /// a per-GEMM `Result` cannot express.
 pub fn available() -> bool {
     ctx().is_ok()
+}
+
+/// The linked cuBLASLt's version, `major * 10000 + minor * 100 + patch`
+/// (130000 for CUDA 13.0's); 0 under the stub shims. Which kernel the
+/// heuristic picks for a shape -- and so the exact bits of the result --
+/// changes between versions: a caller whose output must equal another
+/// kernel's bit for bit gates on the versions it was verified against.
+pub fn version() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| unsafe { cublasLtGetVersion() })
 }
 
 /// Row-major `out[M,N] = act[M,K] @ weight[K,N]`, all BF16 — the NON-transposed
@@ -236,6 +309,9 @@ pub fn bf16_gemm_act_weight_n(
 /// Row-major `out[M,N] = act[M,K] @ weight[N,K]ᵀ`, all BF16 — the standard
 /// projection GEMM (activation × transposed weight). Maps to cuBLASLt's
 /// column-major convention as `D[N,M] = opT(weightᶜ[K,N]) · opN(actᶜ[K,M])`.
+/// Any failure of the cuBLASLt path (stub shim, missing hipBLASLt, or a
+/// rejected shape) routes to the installed Atlas fallback; with none
+/// installed the error propagates.
 pub fn bf16_gemm_act_weight_t(
     act: u64,
     weight: u64,
@@ -245,133 +321,72 @@ pub fn bf16_gemm_act_weight_t(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    gemm_bf16(act, weight, out, m, n, k, CUBLAS_OP_T, stream)
+    match gemm_bf16(act, weight, out, m, n, k, CUBLAS_OP_T, stream) {
+        Ok(()) => {
+            CUBLASLT_LIVE_LOGGED.call_once(|| {
+                tracing::info!(
+                    "cuBLASLt BF16 GEMM live (first matmul status 0 — real library \
+                     answered; on HIP targets this is the hipBLASLt shim)"
+                );
+            });
+            Ok(())
+        }
+        Err(e) => {
+            if let Some(fallback) = BF16_FALLBACK.get() {
+                FALLBACK_LOGGED.call_once(|| {
+                    tracing::info!(
+                        "cuBLASLt unavailable ({e}); BF16 projections route through \
+                         the installed Atlas GEMM fallback"
+                    );
+                });
+                return fallback(act, weight, out, m, n, k, stream);
+            }
+            Err(e)
+        }
+    }
 }
 
-/// Shared body. `op_a` selects the weight's stored layout: `CUBLAS_OP_T` for a
-/// row-major `[N,K]` weight, `CUBLAS_OP_N` for a row-major `[K,N]` one. The A
-/// LAYOUT MUST MATCH: `(k, n, ld=k)` under opT, `(n, k, ld=n)` under opN.
-#[allow(clippy::too_many_arguments)]
-fn gemm_bf16(
-    act: u64,
-    weight: u64,
-    out: u64,
-    m: u32,
-    n: u32,
-    k: u32,
-    op_a: i32,
-    stream: u64,
-) -> Result<()> {
-    let ctx = ctx()?;
-    unsafe {
-        let mut desc: cublasLtMatmulDesc_t = std::ptr::null_mut();
-        chk(
-            cublasLtMatmulDescCreate(&mut desc, CUBLAS_COMPUTE_32F, CUDA_R_32F),
-            "DescCreate",
-        )?;
-        let ta = op_a;
-        let tb = CUBLAS_OP_N;
-        chk(
-            cublasLtMatmulDescSetAttribute(
-                desc,
-                DESC_TRANSA,
-                &ta as *const i32 as *const c_void,
-                4,
-            ),
-            "TRANSA",
-        )?;
-        chk(
-            cublasLtMatmulDescSetAttribute(
-                desc,
-                DESC_TRANSB,
-                &tb as *const i32 as *const c_void,
-                4,
-            ),
-            "TRANSB",
-        )?;
-        // A = weight stored row-major [N,K] == col-major [K,N], ld=K, opT → [N,K]
-        // B = act    stored row-major [M,K] == col-major [K,M], ld=K, opN → [K,M]
-        // D = out    row-major [M,N]        == col-major [N,M], ld=N
-        let mut la: cublasLtMatrixLayout_t = std::ptr::null_mut();
-        let mut lb: cublasLtMatrixLayout_t = std::ptr::null_mut();
-        let mut ld_: cublasLtMatrixLayout_t = std::ptr::null_mut();
-        let (a_rows, a_cols, a_ld) = if op_a == CUBLAS_OP_T {
-            (k as u64, n as u64, k as i64) // row-major [N,K] -> col-major (K,N)
-        } else {
-            (n as u64, k as u64, n as i64) // row-major [K,N] -> col-major (N,K)
-        };
-        chk(
-            cublasLtMatrixLayoutCreate(&mut la, CUDA_R_16BF, a_rows, a_cols, a_ld),
-            "LayoutA",
-        )?;
-        chk(
-            cublasLtMatrixLayoutCreate(&mut lb, CUDA_R_16BF, k as u64, m as u64, k as i64),
-            "LayoutB",
-        )?;
-        chk(
-            cublasLtMatrixLayoutCreate(&mut ld_, CUDA_R_16BF, n as u64, m as u64, n as i64),
-            "LayoutD",
-        )?;
-        let mut pref: cublasLtMatmulPreference_t = std::ptr::null_mut();
-        chk(cublasLtMatmulPreferenceCreate(&mut pref), "PrefCreate")?;
-        let ws_size = ctx.ws_size;
-        chk(
-            cublasLtMatmulPreferenceSetAttribute(
-                pref,
-                PREF_MAX_WORKSPACE_BYTES,
-                &ws_size as *const usize as *const c_void,
-                std::mem::size_of::<usize>(),
-            ),
-            "PrefWorkspace",
-        )?;
-        // cublasLtMatmulHeuristicResult_t = { algo[64B], workspaceSize, state,
-        // wavesCount, reserved[4] } ≈ 96B; algo at offset 0. 128B for margin.
-        let mut result = [0u8; 128];
-        let mut returned: i32 = 0;
-        chk(
-            cublasLtMatmulAlgoGetHeuristic(
-                ctx.handle,
-                desc,
-                la,
-                lb,
-                ld_,
-                ld_,
-                pref,
-                1,
-                result.as_mut_ptr() as *mut c_void,
-                &mut returned,
-            ),
-            "AlgoGetHeuristic",
-        )?;
-        if returned < 1 {
-            bail!("cuBLASLt: no algorithm for {m}x{n}x{k}");
-        }
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
-        let status = cublasLtMatmul(
-            ctx.handle,
-            desc,
-            &alpha as *const f32 as *const c_void,
-            weight as *const c_void,
-            la,
-            act as *const c_void,
-            lb,
-            &beta as *const f32 as *const c_void,
-            out as *const c_void,
-            ld_,
-            out as *mut c_void,
-            ld_,
-            result.as_ptr() as *const c_void,
-            ctx.workspace as *mut c_void,
-            ctx.ws_size,
-            stream as *mut c_void,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Under the CI GPU stubs (`scripts/ci_gpu_stubs.sh`) `cublasLtCreate`
+    /// returns 1, so `ctx()` fails deterministically and
+    /// `bf16_gemm_act_weight_t` must route to the installed fallback with the
+    /// exact (act, weight, out, m, n, k, stream) it was given. On a build
+    /// where real cuBLASLt exists the fallback is never consulted — this
+    /// test only asserts the wiring, which is also exercised on hosts where
+    /// the FFI itself fails to resolve.
+    #[test]
+    fn install_bf16_fallback_first_wins_and_dispatches() {
+        type Call = (u64, u64, u64, u32, u32, u32, u64);
+        static CALLS: Mutex<Vec<Call>> = Mutex::new(Vec::new());
+        let installed = install_bf16_fallback(Box::new(|act, weight, out, m, n, k, stream| {
+            CALLS
+                .lock()
+                .unwrap()
+                .push((act, weight, out, m, n, k, stream));
+            Ok(())
+        }));
+        assert!(installed, "first install_bf16_fallback must succeed");
+        assert!(
+            !install_bf16_fallback(Box::new(|_, _, _, _, _, _, _| {
+                anyhow::bail!("must never run: second install rejected")
+            })),
+            "second install_bf16_fallback must return false"
         );
-        cublasLtMatmulPreferenceDestroy(pref);
-        cublasLtMatrixLayoutDestroy(la);
-        cublasLtMatrixLayoutDestroy(lb);
-        cublasLtMatrixLayoutDestroy(ld_);
-        cublasLtMatmulDescDestroy(desc);
-        chk(status, "Matmul")?;
+        // Only meaningful where ctx() fails (CI stubs / HIP shim). On a host
+        // with a real cuBLASLt this call would attempt a device GEMM instead,
+        // so the assertion is conditional on the error path being reachable.
+        if ctx().is_err() {
+            bf16_gemm_act_weight_t(0xAA, 0xBB, 0xCC, 22, 16384, 2560, 0x11)
+                .expect("fallback must serve the GEMM when ctx() fails");
+            let calls = CALLS.lock().unwrap();
+            assert_eq!(
+                calls.as_slice(),
+                &[(0xAA, 0xBB, 0xCC, 22, 16384, 2560, 0x11)]
+            );
+        }
     }
-    Ok(())
 }

@@ -19,10 +19,16 @@ use super::with_start_end::FsmWithStartEnd;
 /// `complete_fsm`, they record the sub-FSM's size — not the whole
 /// completed FSM. Distinguishing the two is the upstream #600 fix
 /// (`CompactFSMWithStartEndWithSize`, commit 58494db).
+///
+/// A view's nodes are the contiguous range `base .. base + node_num` of
+/// the backing FSM, and `ends` covers only that range (`ends[i]` is node
+/// `base + i`). A view-length bitmap per rule over the whole shared FSM was
+/// O(rules x states) per grammar.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CompactFsmWithStartEnd {
     pub(crate) fsm: CompactFsm,
     pub(crate) start: usize,
+    pub(crate) base: usize,
     pub(crate) ends: Vec<bool>,
     pub(crate) is_dfa: bool,
     node_num: usize,
@@ -38,6 +44,7 @@ impl CompactFsmWithStartEnd {
         Self {
             fsm,
             start,
+            base: 0,
             ends,
             is_dfa: false,
             node_num,
@@ -45,19 +52,23 @@ impl CompactFsmWithStartEnd {
         }
     }
 
-    /// Build a per-rule view onto a shared `complete_fsm`. `node_num`
+    /// Build a per-rule view onto a shared `complete_fsm`: its nodes are
+    /// `base .. base + node_num`, `ends` covers that range, and `node_num`
     /// and `edge_num` are the spliced-in sub-FSM's counts, *not* the
     /// backing FSM's totals (upstream commit 58494db, #600).
     pub fn new_view(
         fsm: CompactFsm,
         start: usize,
+        base: usize,
         ends: Vec<bool>,
         node_num: usize,
         edge_num: usize,
     ) -> Self {
+        debug_assert_eq!(ends.len(), node_num);
         Self {
             fsm,
             start,
+            base,
             ends,
             is_dfa: false,
             node_num,
@@ -75,14 +86,23 @@ impl CompactFsmWithStartEnd {
         self.start
     }
 
-    /// Accepting-state bitmap.
+    /// Accepting-state bitmap over this FSM's nodes: `ends()[i]` is node
+    /// `base() + i`.
     pub fn ends(&self) -> &[bool] {
         &self.ends
     }
 
+    /// First backing node of this FSM (0 unless a per-rule view).
+    pub fn base(&self) -> usize {
+        self.base
+    }
+
     /// True if `state` is accepting.
     pub fn is_end_state(&self, state: usize) -> bool {
-        self.ends[state]
+        state
+            .checked_sub(self.base)
+            .and_then(|i| self.ends.get(i))
+            .is_some_and(|&e| e)
     }
 
     /// Number of states in the logical (sub-)FSM. For a per-rule view
@@ -125,7 +145,7 @@ impl CompactFsmWithStartEnd {
             }
             std::mem::swap(&mut start_states, &mut result_states);
         }
-        start_states.iter().any(|&s| self.ends[s as usize])
+        start_states.iter().any(|&s| self.is_end_state(s as usize))
     }
 
     /// All states reachable from the start state.
@@ -135,12 +155,14 @@ impl CompactFsmWithStartEnd {
 
     /// Expand into the mutable form.
     pub fn to_fsm(&self) -> FsmWithStartEnd {
-        FsmWithStartEnd::new(
-            self.fsm.to_fsm(),
-            self.start,
-            self.ends.clone(),
-            self.is_dfa,
-        )
+        let ends = if self.base == 0 {
+            self.ends.clone()
+        } else {
+            let mut ends = vec![false; self.fsm.num_states()];
+            ends[self.base..self.base + self.ends.len()].copy_from_slice(&self.ends);
+            ends
+        };
+        FsmWithStartEnd::new(self.fsm.to_fsm(), self.start, ends, self.is_dfa)
     }
 
     /// Approximate heap footprint.

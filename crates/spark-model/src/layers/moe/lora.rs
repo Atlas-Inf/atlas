@@ -111,6 +111,7 @@ impl MoeLayer {
         kernels: LoraKernels,
         gpu: &dyn GpuBackend,
     ) -> Result<()> {
+        self.btile_storage.require_legacy()?;
         if router.is_none() && experts.is_empty() {
             self.lora = None;
             return Ok(());

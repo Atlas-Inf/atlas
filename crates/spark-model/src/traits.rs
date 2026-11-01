@@ -82,6 +82,10 @@ pub struct SequenceState {
     pub layer_states: Vec<Box<dyn LayerState>>,
     /// Per-sequence state for speculative decoding proposer (None if no proposer).
     pub proposer_state: Option<Box<dyn ProposerState>>,
+    /// Request-local native-decode fence. When set, model prefill and propose
+    /// hooks must leave shared MTP capture/collective state untouched even
+    /// though the serving model was built with a proposer.
+    pub disable_mtp: bool,
     /// SSM state pool slot index. Used for CUDA graph stability — all sequences
     /// at the same slot_idx use the same fixed GPU addresses. Derived from
     /// `ssm_slot` at claim time (the guard is the authority on release
@@ -152,6 +156,15 @@ pub struct SequenceState {
     /// nodes stay pinned at ref≥2 forever → the pool progressively wedges. Empty
     /// on the common path (no match / success releases over the full `tokens`).
     pub prefix_ref_tokens: Vec<u32>,
+    /// Prefix-cache key of a vision prompt, stamped at chunk 0: the prompt
+    /// with each image/video placeholder replaced by an id derived from its
+    /// item's content hash (`model::vision_cache`). Empty for a text prompt,
+    /// whose tokens are their own key, and for a vision prompt that cannot be
+    /// keyed, which then neither looks up nor inserts.
+    pub vision_cache_key: Vec<u32>,
+    /// The sequence's own vision state (images, grids, hashes, encode
+    /// bookkeeping), held across its prefill chunks (`model::vision_cache`).
+    pub vision: SeqVision,
     /// Whether the chunk-0 prefix-cache lookup already ran for this sequence.
     ///
     /// The lookup is NOT idempotent: it bumps radix refs, `inc_ref`s each
@@ -168,6 +181,15 @@ pub struct SequenceState {
     /// The `skip` half of the chunk-0 lookup's return value, replayed verbatim
     /// when `prefix_lookup_applied` short-circuits a retry.
     pub prefix_lookup_skip: bool,
+    /// Token position of this prefill's planned branch-point SSM checkpoint
+    /// (`ATLAS_GLM_PC_BRANCH`; set by the chunk-0 prefix lookup).
+    pub pc_branch_at: Option<usize>,
+    /// Checkpoint position the head asked this prefill to plant for requests
+    /// that share its prefix (`ATLAS_GLM_PC_INFLIGHT`, [`EP_CMD_PC_PLANT`]).
+    /// Becomes `pc_branch_at` at the first chunk where it is still ahead.
+    pub pc_plant_at: Option<usize>,
+    /// Rolling end-of-turn SSM snapshot (`ATLAS_GLM_PC_FINISH_LEAF`).
+    pub(crate) finish_leaf: crate::model::trait_impl::finish_leaf::LeafCell,
     /// Contiguous prefix length (in tokens, from position 0) whose paged KV is
     /// guaranteed fully written for THIS sequence — either reused from a valid
     /// prefix-cache match or written by a real prefill pass this turn. Updated
@@ -190,6 +212,10 @@ pub struct SequenceState {
     /// (needs a fresh bump so `release` in `free_sequence` leaves the
     /// cache's baseline ref intact). 0 before the first prefill.
     pub prompt_len: usize,
+    /// `min_tokens` for greedy verify heads: end tokens are masked out of
+    /// rows that predict a position below the floor (vLLM semantics), so a
+    /// suppressed end token never reaches the KV cache.
+    pub eos_ban: EosBan,
     /// Disk-block-ID list for `--high-speed-swap` (Phase 6.1.c).
     /// Each entry is a stable disk-side identifier that outlives HBM block
     /// recycling. `disk_block_ids` grows monotonically with the sequence
@@ -281,6 +307,7 @@ impl SequenceState {
             seq_len: 0,
             layer_states: Vec::new(),
             proposer_state: None,
+            disable_mtp: false,
             slot_idx,
             ssm_slot: None,
             marconi_skip_to: 0,
@@ -293,11 +320,17 @@ impl SequenceState {
             cached_prefix_tokens: 0,
             cached_prefix_blocks: 0,
             prefix_ref_tokens: Vec::new(),
+            vision_cache_key: Vec::new(),
+            vision: SeqVision::default(),
             prefix_lookup_applied: false,
             prefix_lookup_skip: false,
+            pc_branch_at: None,
+            pc_plant_at: None,
+            finish_leaf: Default::default(),
             kv_valid_tokens: 0,
             last_decode_ckpt_block: 0,
             prompt_len: 0,
+            eos_ban: EosBan::default(),
             disk_block_ids: Vec::new(),
             disk_last_offloaded_per_layer: Vec::new(),
             collect_prompt_logprobs: None,
@@ -331,6 +364,21 @@ impl SequenceState {
         Ok(self.expected_dspark_owner()?.slot())
     }
 
+    /// The drafter's confidence in each draft of this sequence's last
+    /// propose (log probability of the pick, draft order). Empty when the
+    /// drafter did not measure it. Read once, where the scheduler takes the
+    /// proposal: it holds the drafts' confidences from then on.
+    pub fn dflash_draft_conf(&self) -> &[f32] {
+        self.proposer_state
+            .as_ref()
+            .and_then(|state| {
+                state
+                    .as_any()
+                    .downcast_ref::<crate::layers::DflashProposerState>()
+            })
+            .map_or(&[], |state| &state.last_draft_conf)
+    }
+
     /// SSM-pool slot index for this sequence, if it has GDN/SSM (linear-attn).
     /// layers. Used by the scheduler to order the decode batch by slot so the
     /// batched-recurrent SSM + CUDA-graph contiguity invariant holds
@@ -338,6 +386,16 @@ impl SequenceState {
     #[inline]
     pub fn ssm_slot_idx(&self) -> Option<usize> {
         self.ssm_slot.as_ref().and_then(|g| g.idx())
+    }
+
+    /// Whether the prefill chunk that ends at token `end` computes nothing:
+    /// the snapshot chunk 0's prefix lookup restored covers it
+    /// (`marconi_skip_to`, 0 when nothing was restored) and it is not the
+    /// last chunk, whose final row always runs for the logits. This is when
+    /// `prefill_b_proc_range` returns `EarlyReturn`.
+    #[inline]
+    pub fn prefill_chunk_cached(&self, end: usize, is_last: bool) -> bool {
+        !is_last && self.marconi_skip_to >= end
     }
 
     /// Phase 6.3 sliding-window helper: the absolute logical block index
@@ -379,7 +437,13 @@ impl SequenceState {
 /// `Sync` safety: the model is exclusively accessed from the scheduler
 /// thread. The `unsafe impl Sync` on `TransformerModel` documents this
 /// single-thread invariant — do NOT share `&dyn Model` across threads.
+mod eos_ban;
 mod logprobs;
 mod model;
+mod model_defaults;
+mod seq_vision;
+pub use eos_ban::EosBan;
 pub use logprobs::*;
 pub use model::{BeamReq, Model, padded_batch_n};
+pub use model_defaults::EP_CMD_PC_PLANT;
+pub use seq_vision::SeqVision;

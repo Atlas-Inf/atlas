@@ -36,6 +36,11 @@ impl Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // Sequence-parallel prefill (`layers::glm_sp`, qwen4_exp): a
+        // reduce-scatter into this rank's rows, at `sp.local(out_proj_buf)`.
+        if let Some(sp) = crate::layers::glm_sp::current().filter(|sp| sp.total() == num_tokens) {
+            return sp.reduce_scatter(out_proj_buf, ctx.config.hidden_size, ctx, stream);
+        }
         if ctx.config.tp_world_size > 1
             && let Some(comm) = ctx.comm
         {
@@ -45,6 +50,65 @@ impl Qwen3SsmLayer {
             comm.all_reduce_async(out_proj_buf.0, bytes, stream)?;
         }
         Ok(())
+    }
+
+    /// Whether out_proj's prefill rows do not depend on the rows beside
+    /// them: the dense BF16 arm (the tile kernel, or under the k-chain pin a
+    /// cuBLASLt k-chain kernel with the same bytes per row at every row
+    /// count), or native MXFP8 on W8A8 (`ATLAS_QWEN4EXP_PREFILL_W8A8`:
+    /// per-row activation quant and in-order kernels). Native MXFP8 without
+    /// it is not: a short range takes the GEMV tiers, a tall one the
+    /// expansion and GEMM.
+    pub(super) fn out_proj_rows_independent(&self) -> bool {
+        match &self.mx8 {
+            Some(mx8) => mx8.w8a8.is_some(),
+            None => self.out_proj_dense.is_some(),
+        }
+    }
+
+    /// The out_proj and the SP reduce-scatter of a qwen4_exp chunk, pipelined
+    /// (`ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE`): the GEMM by row ranges, the
+    /// window the peer needs first. Taken only where a range's rows are the
+    /// whole pass's bytes ([`Self::out_proj_rows_independent`]), so every
+    /// byte is the unsplit GEMM + reduce-scatter's.
+    /// `Ok(false)`: not taken, nothing launched.
+    pub(super) fn out_proj_reduce_scatter_piped(
+        &self,
+        ctx: &ForwardContext,
+        normed_out_buf: DevicePtr,
+        out_proj_buf: DevicePtr,
+        [num_tokens, value_dim]: [usize; 2],
+        stream: u64,
+    ) -> Result<bool> {
+        let h = ctx.config.hidden_size;
+        let fp8_rowwise = std::env::var("ATLAS_FP8_ROWWISE").as_deref() == Ok("1")
+            && self.out_proj_fp8w_rowwise.is_some();
+        let Some(sp) = crate::layers::glm_sp::current().filter(|sp| sp.total() == num_tokens)
+        else {
+            return Ok(false);
+        };
+        if fp8_rowwise || ctx.dispatch.cutlass_nvfp4_ssm_out || !self.out_proj_rows_independent() {
+            return Ok(false);
+        }
+        crate::layers::qwen4exp_sp_pipe::compute_and_reduce_scatter(
+            sp,
+            out_proj_buf,
+            h,
+            ctx,
+            stream,
+            |r0, n, s| {
+                self.prefill_out_proj_dispatch(
+                    ctx,
+                    normed_out_buf.offset(r0 * value_dim * 2),
+                    out_proj_buf.offset(r0 * h * 2),
+                    n as u32,
+                    h,
+                    value_dim,
+                    s,
+                )
+            },
+            |_| Ok(()),
+        )
     }
 
     pub(super) fn prefill_out_proj_dispatch(
@@ -57,6 +121,18 @@ impl Qwen3SsmLayer {
         value_dim: usize,
         stream: u64,
     ) -> Result<()> {
+        // Native MXFP8 (FP4-Local): the layer's only out_proj.
+        if let Some(mx8) = self.mx8.as_ref() {
+            return self.mx8_out(
+                mx8,
+                ctx,
+                normed_out_buf,
+                out_proj_buf,
+                k as usize,
+                true,
+                stream,
+            );
+        }
         let force_w8a8 = matches!(std::env::var("ATLAS_FP8_W8A8").ok().as_deref(), Some("1"));
         // PER-ROW FP8 from the checkpoint (`ATLAS_FP8_ROWWISE=1`), dequantised
         // once to BF16 — see the matching arm in `trait_prefill_proj.rs` for
@@ -97,6 +173,7 @@ impl Qwen3SsmLayer {
                 stream,
             )
         } else if ctx.dispatch.cutlass_nvfp4_ssm_out
+            && !self.fp8w_decode_only
             && let Some(ref fp8w) = self.out_proj_fp8w
         {
             ops::log_cutlass_nvfp4_route(ctx.gpu, "ssm_out_fp8pack", k, h as u32, value_dim as u32);
@@ -112,20 +189,66 @@ impl Qwen3SsmLayer {
             )
         } else if let Some(ref dense_out) = self.out_proj_dense {
             // SSM out_proj is kept BF16 dense for accuracy (decode uses FP8
-            // block-scaled, prefill stays BF16). Always routed through the
-            // tensor-core dense_gemm_bf16_pipelined kernel (~40× vs the old
-            // scalar dense_gemm, identical BF16 math, cosine=1.0).
-            ops::dense_gemm_bf16_pipelined(
-                ctx.gpu,
-                self.dense_gemm_pipelined_k,
+            // block-scaled, prefill stays BF16). On native HIP, hipBLASLt
+            // first (2.3x faster than the tile kernel at the Flash-Next
+            // 2560x6144 shape, 2026-10-04) with the tensor-core
+            // dense_gemm_bf16_pipelined kernel (~40x vs the old scalar
+            // dense_gemm, identical BF16 math, cosine=1.0) as fallback.
+            #[cfg(atlas_hip)]
+            return ops::hip_bf16_proj_or(
+                "ssm_out_proj",
                 normed_out_buf,
-                dense_out,
+                dense_out.weight,
                 out_proj_buf,
                 k,
                 h as u32,
                 value_dim as u32,
                 stream,
-            )
+                || {
+                    ops::dense_gemm_bf16_pipelined(
+                        ctx.gpu,
+                        self.dense_gemm_pipelined_k,
+                        normed_out_buf,
+                        dense_out,
+                        out_proj_buf,
+                        k,
+                        h as u32,
+                        value_dim as u32,
+                        stream,
+                    )
+                },
+            );
+            #[cfg(not(atlas_hip))]
+            {
+                // ATLAS_LT_KCHAIN_PIN (qwen4_exp, >= 2048 rows): the tile kernel's
+                // own in-order k-chain on a faster cuBLASLt kernel, byte for byte
+                // (TP2, 16016 x 2560 x 3072: 4.24 -> 3.46 ms a layer).
+                if ctx.config.model_type == "qwen4_exp"
+                    && k >= 2048
+                    && spark_runtime::cublaslt::bf16_gemm_act_weight_t_kchain(
+                        normed_out_buf.0,
+                        dense_out.weight.0,
+                        out_proj_buf.0,
+                        k,
+                        h as u32,
+                        value_dim as u32,
+                        stream,
+                    )?
+                {
+                    return Ok(());
+                }
+                ops::dense_gemm_bf16_pipelined(
+                    ctx.gpu,
+                    self.dense_gemm_pipelined_k,
+                    normed_out_buf,
+                    dense_out,
+                    out_proj_buf,
+                    k,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )
+            }
         } else if force_w8a8
             && let Some(ref fp8w) = self.out_proj_fp8w
             && self.per_token_group_quant_fp8_k.0 != 0

@@ -1,0 +1,10 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "Implement a binary MinHeap class in Python with push, pop, peek and heapify methods. Include docstrings and a short usage example."
+  }
+ ],
+ "max_tokens": 512,
+ "seed": 42
+}

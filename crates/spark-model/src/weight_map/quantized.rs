@@ -62,6 +62,8 @@ pub enum WeightQuantFormat {
     /// native `q2_0_gemv` decode GEMV. Consumed only by that kernel — feeding
     /// these bytes through any other GEMV/GEMM is silent garbage.
     PackedQ2_0,
+    /// ExLlamaV3 EXL3 trellis (mul1 codebook): packed 16x16 tiles + fp16 suh/svh.
+    Exl3,
 }
 
 impl WeightQuantFormat {
@@ -140,6 +142,26 @@ impl QuantizedWeight {
     /// Whether this weight has per-row scale2 (for PRS GEMV dispatch).
     pub fn has_per_row_scale2(&self) -> bool {
         self.weight_scale_2_vec != DevicePtr::NULL
+    }
+
+    /// Rows `first..` of a `[N, k]` weight as a view (pointer offsets, no
+    /// copy): packed E2M1 `k / 2` bytes a row, E4M3 block scales `k / 16`,
+    /// the per-row scale2 when present; the per-tensor scale is shared.
+    pub fn rows_from(&self, first: usize, k: usize) -> Self {
+        let at = |p: DevicePtr, row_bytes: usize| {
+            if p.is_null() {
+                p
+            } else {
+                p.offset(first * row_bytes)
+            }
+        };
+        Self {
+            weight: at(self.weight, k / 2),
+            weight_scale: at(self.weight_scale, k / 16),
+            weight_scale_2: self.weight_scale_2,
+            input_scale: self.input_scale,
+            weight_scale_2_vec: at(self.weight_scale_2_vec, 4),
+        }
     }
 
     /// Whether this weight points to NULL (remote expert placeholder).

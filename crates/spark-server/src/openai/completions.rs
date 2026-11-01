@@ -41,7 +41,7 @@ pub struct CompletionRequest {
     /// token-ID forms bypass tokenization and feed the scheduler verbatim
     /// (see `PromptInput` and the handler in `api/completions.rs`).
     pub prompt: PromptInput,
-    #[serde(default = "default_max_tokens")]
+    #[serde(default = "default_completion_max_tokens")]
     pub max_tokens: usize,
     pub temperature: Option<f32>,
     /// Top-k: keep only the k highest-probability tokens before sampling.
@@ -69,8 +69,17 @@ pub struct CompletionRequest {
     /// Stop sequences (same as chat completions).
     #[serde(default, deserialize_with = "deserialize_stop")]
     pub stop: Vec<String>,
+    /// vLLM `ignore_eos` (same as chat completions).
+    #[serde(default)]
+    pub ignore_eos: bool,
     /// Seed for deterministic sampling (same as chat completions).
     pub seed: Option<u64>,
+    /// Per-request inference deadline in seconds. `None` uses the server's
+    /// `--request-timeout`; zero disables the deadline for this request.
+    /// Keep this aligned with `ChatCompletionRequest::timeout` so long raw
+    /// completions can override the production default too.
+    #[serde(default)]
+    pub timeout: Option<f32>,
     /// Per-request override for the vLLM-anchored token-loop detector
     /// (see `RepetitionDetectionParams` in `chat_request.rs`). None =
     /// use server default.
@@ -330,20 +339,15 @@ impl CompletionChunk {
 
 // ── Tokenize endpoint types ──
 
-/// Request body for POST /tokenize.
-#[derive(Debug, Deserialize)]
-pub struct TokenizeRequest {
-    #[allow(dead_code)]
-    pub model: Option<String>,
-    /// Raw text to tokenize (mutually exclusive with `messages`).
-    pub prompt: Option<String>,
-    /// Chat messages to tokenize via the chat template (mutually exclusive with `prompt`).
-    pub messages: Option<Vec<IncomingMessage>>,
-}
-
 /// Response body for POST /tokenize.
 #[derive(Debug, Serialize)]
 pub struct TokenizeResponse {
     pub tokens: Vec<u32>,
     pub count: usize,
+}
+
+/// `/v1/completions` without `max_tokens`: 4096 (the chat surfaces default to
+/// the rest of the context instead).
+fn default_completion_max_tokens() -> usize {
+    4096
 }

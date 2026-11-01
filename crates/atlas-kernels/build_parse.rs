@@ -56,6 +56,21 @@ pub(super) fn parse_kernel_toml(
     (extra_flags, module_overrides)
 }
 
+/// Parse `[build] base_quant` from a KERNEL.toml: the sibling quant dir this
+/// one composes on. `None` when the dir or key is absent.
+pub(super) fn parse_base_quant(kernel_dir: &std::path::Path) -> Option<String> {
+    let path = kernel_dir.join("KERNEL.toml");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let toml: toml::Value =
+        toml::from_str(&text).unwrap_or_else(|e| panic!("Bad TOML in {}: {e}", path.display()));
+    let base = toml.get("build")?.get("base_quant")?;
+    Some(
+        base.as_str()
+            .unwrap_or_else(|| panic!("{}: base_quant must be a string", path.display()))
+            .to_string(),
+    )
+}
+
 /// Parse `[shadow_exempt]` from a KERNEL.toml: `module = ["kernel", ...]`.
 ///
 /// Declares `(module, kernel)` pairs a model shadow may omit without that being

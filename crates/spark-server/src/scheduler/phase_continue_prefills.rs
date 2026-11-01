@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas 5eeeb1a, f1cc7cb (AGPL-3.0-only, sparkqwen queued-first-chunk series).
 
 //! Phase: continue in-progress chunked prefills. When `active` is empty,
 //! all chunks run back-to-back (TTFT minimisation). When active is
 //! nonempty, exactly one chunk runs per scheduler iteration to bound
 //! TPOT — except when mixed_forward fuses a prefill chunk + decode in a
-//! single pass.
+//! single pass, and with `ATLAS_GLM_WARM_CHUNK_RUN` after a chunk that
+//! computed nothing (`cached_run`).
 //!
 //! Returns `did_mixed_step` so the caller can skip the standalone decode
 //! call (mixed forward already processed decode logits).
@@ -20,13 +22,23 @@
 //!  - `run_batched_mixed`   — Q12 Phase 5 batched mixed (decode+prefill) step.
 //!  - `prefill_waves`       — pure wave planner for `run_batched_prefill`
 //!                            (VARLEN budget capping + geometry grouping).
+//!  - `queued_first`        — a first chunk queued at admission
+//!                            (`ATLAS_PREFILL_QUEUE_FIRST_CHUNK`).
 
+#[path = "phase_continue_prefills/cached_run.rs"]
+mod cached_run;
+#[path = "phase_continue_prefills/decode_share.rs"]
+pub(super) mod decode_share;
 #[path = "phase_continue_prefills/prefill_waves.rs"]
 mod prefill_waves;
+#[path = "phase_continue_prefills/queued_first.rs"]
+mod queued_first;
 #[path = "phase_continue_prefills/run_batched_mixed.rs"]
 mod run_batched_mixed;
 #[path = "phase_continue_prefills/run_batched_prefill.rs"]
 mod run_batched_prefill;
+#[path = "phase_continue_prefills/run_fused.rs"]
+mod run_fused;
 #[path = "phase_continue_prefills/run_standard.rs"]
 mod run_standard;
 
@@ -42,6 +54,40 @@ use crate::scheduling_policy::{ActiveSeqTiming, SchedulingPolicy};
 use run_batched_mixed::run_batched_mixed_step;
 use run_batched_prefill::run_batched_prefill_step;
 use run_standard::run_standard_chunk_loop;
+
+pub(super) use cached_run::follows_first_chunk;
+pub(super) use run_fused::SpecStep;
+
+/// Drop in-progress prefills whose buffered (`stream: false`) caller
+/// disconnected, freeing their slot/KV/EP state through the normal lifecycle
+/// before any further chunk forward. Returns the number retired. Any chunk
+/// forward already issued this tick cannot be undone — this only prevents the
+/// *next* chunk of model work. Streaming cancellation is untouched: it is
+/// signalled via `cancel_flag` and handled at the emit/decode boundaries.
+pub(super) fn retire_disconnected_prefills(
+    model: &dyn Model,
+    prefilling: &mut Vec<PrefillInProgress>,
+) -> usize {
+    let mut retired = 0;
+    let mut i = 0;
+    while i < prefilling.len() {
+        if prefilling[i].sink.receiver_closed() || queued_first::abandoned(&prefilling[i]) {
+            let mut p = prefilling.remove(i);
+            if let Err(e) = model.free_sequence(&mut p.seq) {
+                tracing::error!("phase_continue_prefills: free_sequence (disconnected): {e:#}");
+            }
+            if let Err(e) = model.ep_broadcast_cmd_for_seq(p.seq.slot_idx as u32, 0xFFFFFFF1) {
+                tracing::error!(
+                    "phase_continue_prefills: ep_broadcast free+realloc (disconnected): {e:#}"
+                );
+            }
+            retired += 1;
+            continue;
+        }
+        i += 1;
+    }
+    retired
+}
 
 /// Shared per-chunk InnerQ poll used by every prefill path (standard /
 /// batched-prefill / batched-mixed). `maybe_finalize` is idempotent post
@@ -70,11 +116,14 @@ pub(super) fn continue_in_progress_prefills(
     use_ngram_speculative: bool,
     think_end_token: Option<u32>,
     think_start_token: Option<u32>,
-    code_fence_token: Option<u32>,
     tool_call_start_token: Option<u32>,
     tool_call_end_token: Option<u32>,
     adaptive_sampling: bool,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
+    spec: &SpecStep,
+    // Slots of the owners whose verify rode a prefill chunk this tick; they
+    // sit out its decode step.
+    rode: &mut Vec<usize>,
 ) -> bool {
     let mut did_mixed_step = false;
 
@@ -94,6 +143,12 @@ pub(super) fn continue_in_progress_prefills(
     // active (those step_* paths require active.len()==1 and mixing would
     // double-decode). Computed early because the always-mixed gate below
     // needs it too. (Also reused by the Q12 mixed-batch gate further down.)
+    // Buffered disconnect: retire dead prefills before any further chunk
+    // forward or batched dispatch so we do not schedule GPU work whose result
+    // nobody can observe.
+    if retire_disconnected_prefills(model, prefilling) > 0 {
+        return did_mixed_step;
+    }
     let single_active_with_spec =
         active.len() == 1 && (use_mtp || use_self_speculative || use_ngram_speculative);
 
@@ -147,12 +202,39 @@ pub(super) fn continue_in_progress_prefills(
     } else {
         // Resting production path — unchanged binary gate.
         let do_chunks = active.is_empty() || policy.should_prefill(&timings);
-        if !do_chunks {
+        if !do_chunks || decode_share::hold_chunk(!active.is_empty()) {
             return did_mixed_step;
         }
     }
 
     let mut completed_indices = Vec::new();
+
+    // ATLAS_QWEN4EXP_PREFILL_MULTI: every waiting short prompt in one forward,
+    // before any other path (on a multi-rank model nothing else may run them).
+    if super::prefill_multi::run(
+        model,
+        sched,
+        prefilling,
+        active,
+        &mut completed_indices,
+        max_batch_tokens,
+        prefill_stream,
+        prefill_event,
+    ) {
+        promote_completed_prefills(
+            model,
+            prefilling,
+            completed_indices,
+            active,
+            think_end_token,
+            think_start_token,
+            tool_call_start_token,
+            tool_call_end_token,
+            sched.limits.max_seq_len,
+            sched.limits.glm_tool_boundary,
+        );
+        return did_mixed_step;
+    }
 
     // Q12 batched-prefill paths. Two branches fire when 2+ streams are
     // prefilling concurrently (replaces the FIFO `prefilling.first_mut()`
@@ -227,6 +309,7 @@ pub(super) fn continue_in_progress_prefills(
             tool_call_start_token,
             tool_call_end_token,
             sched.limits.max_seq_len,
+            sched.limits.glm_tool_boundary,
         );
         return did_mixed_step;
     }
@@ -244,7 +327,6 @@ pub(super) fn continue_in_progress_prefills(
             t0_mixed,
             think_end_token,
             think_start_token,
-            code_fence_token,
             tool_call_start_token,
             tool_call_end_token,
             adaptive_sampling,
@@ -261,6 +343,7 @@ pub(super) fn continue_in_progress_prefills(
             tool_call_start_token,
             tool_call_end_token,
             sched.limits.max_seq_len,
+            sched.limits.glm_tool_boundary,
         );
         return did_mixed_step;
     }
@@ -285,7 +368,9 @@ pub(super) fn continue_in_progress_prefills(
         // byte-identical to today (the `active.is_empty()` guard only applies
         // when always-mixed is enabled; otherwise the original two-phase
         // condition is preserved exactly).
-        let use_twophase = (!always_mixed || active.is_empty())
+        // A queued first chunk is the inline one, run late (`queued_first`).
+        let use_twophase = p.queued_first_chunk.is_none()
+            && (!always_mixed || active.is_empty())
             && p.chunk_offset == 0
             && p.prompt_tokens.len() > max_prefill_tokens;
         if use_twophase {
@@ -316,7 +401,10 @@ pub(super) fn continue_in_progress_prefills(
                         p.top_k,
                         p.top_p,
                         p.min_p,
-                        &p.eos_tokens,
+                        &crate::scheduler::min_tokens_ban::first_token_suppress(
+                            &p.eos_tokens,
+                            p.min_tokens,
+                        ),
                         p.grammar_state.as_mut(),
                         &sched.levers.sampling(),
                     ) {
@@ -339,28 +427,53 @@ pub(super) fn continue_in_progress_prefills(
 
         // Standard chunked prefill (also used as fallback if two-phase fails)
         if p.chunk_offset < p.prompt_tokens.len() {
-            run_standard_chunk_loop(
-                model,
-                p,
-                idx,
-                active,
-                max_prefill_tokens,
-                slice_budget,
-                prefill_stream,
-                prefill_event,
-                use_mtp,
-                use_self_speculative,
-                use_ngram_speculative,
-                think_end_token,
-                think_start_token,
-                code_fence_token,
-                tool_call_start_token,
-                tool_call_end_token,
-                adaptive_sampling,
-                sched,
-                &mut completed_indices,
-                &mut did_mixed_step,
-            );
+            cached_run::run(|| {
+                // Cached chunks can repeat within one tick. Recheck before
+                // every chunk, then let the next sweep free this prefill.
+                if p.sink.receiver_closed() {
+                    return false;
+                }
+                let queued = queued_first::run(
+                    model,
+                    p,
+                    idx,
+                    active,
+                    prefill_stream,
+                    prefill_event,
+                    sched,
+                    &mut completed_indices,
+                );
+                if !queued {
+                    run_standard_chunk_loop(
+                        model,
+                        p,
+                        idx,
+                        active,
+                        max_prefill_tokens,
+                        slice_budget,
+                        prefill_stream,
+                        prefill_event,
+                        use_mtp,
+                        use_self_speculative,
+                        use_ngram_speculative,
+                        think_end_token,
+                        think_start_token,
+                        tool_call_start_token,
+                        tool_call_end_token,
+                        adaptive_sampling,
+                        sched,
+                        &mut completed_indices,
+                        &mut did_mixed_step,
+                        max_batch_tokens,
+                        spec,
+                        rode,
+                    );
+                }
+                // A chunk that failed, finished the prompt or carried a
+                // decode step ends the tick like one that computed.
+                let plain = completed_indices.is_empty() && !did_mixed_step && rode.is_empty();
+                plain && cached_run::chunk_was_cached(p)
+            });
         }
     }
 
@@ -375,7 +488,12 @@ pub(super) fn continue_in_progress_prefills(
         tool_call_start_token,
         tool_call_end_token,
         sched.limits.max_seq_len,
+        sched.limits.glm_tool_boundary,
     );
 
     did_mixed_step
 }
+
+#[cfg(test)]
+#[path = "disconnect_prefill_tests.rs"]
+mod disconnect_prefill_tests;

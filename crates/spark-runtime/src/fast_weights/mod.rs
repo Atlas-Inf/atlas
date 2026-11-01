@@ -18,19 +18,36 @@
 
 use crate::gpu::GpuBackend;
 use crate::weights::{
-    WeightLoader, WeightStore, WeightTensor, check_oom_guard, estimate_has_fp8,
-    estimate_load_bytes, evict_page_cache, f16_to_bf16_bytes,
+    WeightLoader, WeightStore, WeightTensor, check_oom_guard, estimate_has_fp8, estimate_load_bytes,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use std::collections::HashMap;
-use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::sync_channel;
 
 mod direct_io;
 mod header;
+mod shard;
 
-use header::{parse_header, resolve_shards};
+use header::{resolve_shards, tensors_routed_to};
+
+/// Run `f` over `len` bytes at `start` within a deferred tensor, read with
+/// `O_DIRECT` when the filesystem allows it (so the bytes never sit in the
+/// page cache on GB10 unified memory), else buffered.
+pub fn with_deferred_bytes<T>(
+    d: &crate::weights::DeferredTensor,
+    start: usize,
+    len: usize,
+    f: impl FnOnce(&[u8]) -> Result<T>,
+) -> Result<T> {
+    use std::os::unix::io::AsRawFd;
+    let (file, direct) = match direct_io::open_direct(&d.path) {
+        Ok(file) => (file, true),
+        Err(_) => (std::fs::File::open(&d.path)?, false),
+    };
+    let (buf, off) =
+        direct_io::read_tensor_aligned(file.as_raw_fd(), d.offset + start as u64, len, direct)?;
+    f(&buf.as_slice()[off..off + len])
+}
 
 /// Pure-Rust InstantTensor-style loader. Same public shape as
 /// [`crate::weights::SafetensorsLoader`].
@@ -38,17 +55,27 @@ pub struct FastSafetensorsLoader {
     pub ep_rank: usize,
     pub ep_world_size: usize,
     pub num_experts: usize,
+    /// Optional layer-name fragment whose expert tensors are loaded only on
+    /// EP rank 0, with all experts replicated there. Used by model-specific
+    /// draft modules that execute entirely on the coordinator rank.
+    pub rank0_only_expert_prefix: Option<String>,
+    /// Optional layer-name fragment whose expert tensors bypass EP filtering
+    /// and are replicated on every rank. Used when a small draft module keeps
+    /// identical local arithmetic while distributing only its output head.
+    pub replicated_expert_prefix: Option<String>,
     pub peak_memory_multiplier: Option<f64>,
-    /// Skip the W4A4 `*.input_scale` activation scales at load.
+    /// Do not upload the W4A4 `*.input_scale` activation scales; defer them
+    /// (every expert's, on every rank) for a model loader that reads them on
+    /// the host.
     ///
     /// ModelOpt NVFP4 checkpoints ship one 0-dim F32 scalar per quantized
     /// projection. On a 512-expert model that is ~74k four-byte allocations,
-    /// each taking a full allocation granule — GBs of padding for values
-    /// Atlas never reads, because it serves w4a16 (BF16 activations) and the
-    /// NVFP4 loader already treats the key as optional.
+    /// each taking a full allocation granule — GBs of padding for scalars a
+    /// loader can read from disk (qwen4_exp's W4A4 prefill tables); the
+    /// NVFP4 loader already treats the uploaded key as optional.
     ///
     /// OPT-IN: `step3p7` reads this key on its own path, so it must stay off
-    /// unless the model's loader is known not to need it.
+    /// unless the model's loader is known not to need it uploaded.
     pub skip_activation_scales: bool,
     /// Skip `mtp.*` tensors at load.
     ///
@@ -60,6 +87,25 @@ pub struct FastSafetensorsLoader {
     /// OPT-IN: a model that DOES build an MTP head must keep them, so this is
     /// set only where `load_mtp_weights` is known to return `None`.
     pub skip_mtp: bool,
+    /// Exact tensor prefix of an unused appended predictor layer; default retains it.
+    pub skip_layer_prefix: Option<String>,
+    /// Skip any tensor whose name starts with one of these prefixes — dead
+    /// namespaces the model's loader never reads (see `SafetensorsLoader::
+    /// skip_prefixes`). Same opt-in contract.
+    pub skip_prefixes: Vec<String>,
+    /// Pack every kept tensor in a shard into ONE `gpu.alloc` per shard,
+    /// each tensor at a 4096-byte-aligned interior offset. Per-tensor
+    /// cuMemAlloc rounds ≥1 MB allocations to 2 MB pages: on NVFP4 MoE
+    /// checkpoints (~1024 packed+scale+scalar tensors per ~1.6 GB shard)
+    /// that waste is ~0.6 GB/shard — ~24 GB across 40 MoE shards on
+    /// Nemotron 3.5 Super VL, i.e. the whole KV budget.
+    ///
+    /// OPT-IN only, via the weight loader's `slab_pack_weights` policy —
+    /// callers must have audited that no `gpu.free` reachable on their
+    /// load path frees a store-owned tensor pointer (interior frees are
+    /// also harmless: the CUDA backend turns them into no-ops once the
+    /// slab is registered). Single-GPU only.
+    pub pack_slab: bool,
     /// When true (default), attempt `O_DIRECT`; fall back to buffered reads if
     /// the filesystem rejects it (tmpfs, overlayfs, some FUSE backends).
     pub try_direct_io: bool,
@@ -93,6 +139,16 @@ pub struct FastSafetensorsLoader {
     /// from here — a name listed without a reader is simply absent from the
     /// store, and the model loader will fail on it by name.
     pub demand_paged_patterns: Vec<String>,
+    /// Expert TP: keep every routed expert (no EP filter) but defer their
+    /// packed weights and block scales, which the model loader reads from
+    /// disk as this rank's slice (see `should_defer_tensor`).
+    pub expert_tp: bool,
+    /// Modules whose `.weight` and `.weight_scale` are stored in a format the
+    /// kernels do not read (MXFP8, or NVFP4 in a tower that runs BF16). They
+    /// are DEFERRED — located, not uploaded — and the model build expands
+    /// them on the host, so the originals never occupy device memory. CSF
+    /// scale streams are deferred regardless of this list.
+    pub host_decode_modules: std::collections::HashSet<String>,
 }
 
 /// Default tensor-count cap for per-shard `O_DIRECT`. Above this, the fast
@@ -115,13 +171,20 @@ impl FastSafetensorsLoader {
             ep_rank: 0,
             ep_world_size: 1,
             num_experts: 0,
+            rank0_only_expert_prefix: None,
+            replicated_expert_prefix: None,
             peak_memory_multiplier: None,
             skip_activation_scales: false,
             skip_mtp: false,
+            skip_layer_prefix: None,
+            skip_prefixes: Vec::new(),
+            pack_slab: false,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
             demand_paged_patterns: Vec::new(),
+            expert_tp: false,
+            host_decode_modules: std::collections::HashSet::new(),
         }
     }
 
@@ -130,13 +193,20 @@ impl FastSafetensorsLoader {
             ep_rank,
             ep_world_size,
             num_experts,
+            rank0_only_expert_prefix: None,
+            replicated_expert_prefix: None,
             peak_memory_multiplier: None,
             skip_activation_scales: false,
             skip_mtp: false,
+            skip_layer_prefix: None,
+            skip_prefixes: Vec::new(),
+            pack_slab: false,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
             demand_paged_patterns: Vec::new(),
+            expert_tp: false,
+            host_decode_modules: std::collections::HashSet::new(),
         }
     }
 }
@@ -160,7 +230,9 @@ impl WeightLoader for FastSafetensorsLoader {
         // uploaded, so counting them here refuses a model that fits. On
         // LongCat-Flash-Lite they are 62.8 of the checkpoint's 138 GB, which
         // is the difference between a 167 GB "peak" and a 98 GB one.
-        let preflight_skip = |name: &str| skip_fn(name) || crate::weights::is_ngram_table(name);
+        let defer_fn = |name: &str| self.should_defer_tensor(name);
+        let preflight_skip =
+            |name: &str| skip_fn(name) || defer_fn(name) || crate::weights::is_ngram_table(name);
         {
             let estimated = estimate_load_bytes(&shard_files, &preflight_skip)?;
             let has_fp8 = estimate_has_fp8(&shard_files, &preflight_skip)?;
@@ -207,12 +279,9 @@ impl WeightLoader for FastSafetensorsLoader {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
-            let tensor_filter: Option<Vec<String>> = tensor_to_shard.as_ref().map(|map| {
-                map.iter()
-                    .filter(|(_, s)| *s == shard_name)
-                    .map(|(t, _)| t.clone())
-                    .collect()
-            });
+            let tensor_filter: Option<Vec<String>> = tensor_to_shard
+                .as_ref()
+                .map(|map| tensors_routed_to(map, model_dir, shard_path));
 
             tracing::info!(
                 "Fast-loading shard {}/{}: {}{}",
@@ -226,14 +295,16 @@ impl WeightLoader for FastSafetensorsLoader {
             );
             crate::progress::shard_start(i + 1, total_shards, shard_name);
 
-            load_shard_fast(
+            shard::load_shard_fast(
                 shard_path,
                 tensor_filter.as_deref(),
                 gpu,
                 &skip_fn,
+                &defer_fn,
                 self.try_direct_io,
                 self.direct_io_tensor_cap,
                 self.prefetch_shards,
+                self.pack_slab,
                 &mut weights,
                 &mut deferred,
                 &mut offload_logged,
@@ -264,19 +335,25 @@ impl WeightLoader for FastSafetensorsLoader {
         }
 
         // Extra weights (e.g. MTP grafted from another quantization).
-        let no_skip = |_: &str| false;
+        let skip_unused = |name: &str| {
+            self.skip_layer_prefix
+                .as_ref()
+                .is_some_and(|prefix| name.starts_with(prefix))
+        };
         let extra = model_dir.join("extra_weights.safetensors");
         if extra.exists() {
             tracing::info!("Fast-loading extra_weights.safetensors");
             let mut extra_offload = false;
-            load_shard_fast(
+            shard::load_shard_fast(
                 &extra,
                 None,
                 gpu,
-                &no_skip,
+                &skip_unused,
+                &|_| false,
                 self.try_direct_io,
                 self.direct_io_tensor_cap,
                 self.prefetch_shards,
+                self.pack_slab,
                 &mut weights,
                 &mut deferred,
                 &mut extra_offload,
@@ -292,209 +369,84 @@ impl WeightLoader for FastSafetensorsLoader {
     }
 }
 
-/// Load a single shard with O_DIRECT + pipelined read/copy.
-///
-/// Pipeline:
-///   reader thread: pread tensor N into aligned buffer → sync_channel ──▶
-///   main thread:   recv → copy_h2d → store tensor
-///
-/// The channel has capacity 1, so at any time the reader is ≤1 tensor
-/// ahead of the copier. Memory overhead per shard: 2 × max_tensor_bytes
-/// (rounded up to O_DIRECT alignment).
-#[allow(clippy::too_many_arguments)]
-fn load_shard_fast(
-    shard_path: &Path,
-    tensor_filter: Option<&[String]>,
-    gpu: &dyn GpuBackend,
-    skip_fn: &dyn Fn(&str) -> bool,
-    try_direct_io: bool,
-    direct_io_tensor_cap: usize,
-    prefetch_shards: bool,
-    out: &mut HashMap<String, WeightTensor>,
-    deferred_out: &mut HashMap<String, crate::weights::DeferredTensor>,
-    offload_logged: &mut bool,
-) -> Result<()> {
-    // Header parsing uses a buffered fd — header is a few KB, cache pollution
-    // is negligible and buffered I/O handles short reads cleanly.
-    let mut meta_file = File::open(shard_path)
-        .with_context(|| format!("Failed to open {}", shard_path.display()))?;
-    let mut tensors = parse_header(&mut meta_file)?;
-    let file_size = meta_file.metadata()?.len();
+#[cfg(test)]
+mod expert_filter_tests {
+    use super::FastSafetensorsLoader;
 
-    // Filter down to tensors we actually want (index filter + EP filter).
-    if let Some(allow) = tensor_filter {
-        let allow_set: std::collections::HashSet<&str> = allow.iter().map(|s| s.as_str()).collect();
-        tensors.retain(|t| allow_set.contains(t.name.as_str()));
+    #[test]
+    fn replicated_prefix_overrides_ep_expert_filter() {
+        let mut loader = FastSafetensorsLoader::with_ep(1, 2, 288);
+        let appended = "model.language_model.layers.45.mlp.experts.1.gate_proj.weight";
+        let target = "model.language_model.layers.44.mlp.experts.1.gate_proj.weight";
+        assert!(loader.should_skip_tensor(appended));
+        loader.replicated_expert_prefix = Some(".layers.45.".into());
+        assert!(!loader.should_skip_tensor(appended));
+        assert!(loader.should_skip_tensor(target));
     }
-    // The n-gram embedding TABLES are never uploaded with the checkpoint —
-    // 63 GB (LongCat-Lite) to ~102 GB (Flash-Next) of BF16 would exhaust a
-    // 121 GB unified box before any quantization could run, and the fallback
-    // on GB10 is managed memory, i.e. Linux swap, i.e. a kernel freeze. They
-    // are recorded with their on-disk location and served either by streaming
-    // per-table quantize-on-load or straight off NVMe by the row cache.
-    let mut deferred_here: Vec<(String, crate::weights::DeferredTensor)> = Vec::new();
-    #[allow(clippy::items_after_statements)]
-    tensors.retain(|t| {
-        if crate::weights::is_ngram_table(&t.name) {
-            deferred_here.push((
-                t.name.clone(),
-                crate::weights::DeferredTensor {
-                    path: shard_path.to_path_buf(),
-                    offset: t.abs_offset,
-                    shape: t.shape.clone(),
-                    dtype: t.dtype,
-                },
-            ));
-            return false;
+
+    /// FP4-Local: CSF streams and listed MXFP8 modules are located, not
+    /// uploaded; their scalar siblings and every other tensor load as usual.
+    #[test]
+    fn host_decoded_tensors_are_deferred() {
+        let mut loader = FastSafetensorsLoader::new();
+        let attn = "model.language_model.layers.3.self_attn.q_proj";
+        loader.host_decode_modules.insert(attn.to_string());
+        let expert = "model.language_model.layers.0.mlp.experts.3.down_proj";
+        for name in [
+            format!("{attn}.weight"),
+            format!("{attn}.weight_scale"),
+            format!("{expert}.weight_scale.nvfp4_csf_fixed"),
+            format!("{expert}.weight_scale.nvfp4_csf_exceptions"),
+        ] {
+            assert!(loader.should_defer_tensor(&name), "{name}");
         }
-        !skip_fn(&t.name)
-    });
-    if !deferred_here.is_empty() {
-        tracing::info!(
-            "Deferred {} n-gram table(s) in {} — served from disk, not uploaded",
-            deferred_here.len(),
-            shard_path.display()
-        );
-        deferred_out.extend(deferred_here);
-    }
-
-    // Per-shard heuristic: above `direct_io_tensor_cap` tensors, O_DIRECT's
-    // per-tensor syscall + 4 KiB alignment overhead costs more than kernel
-    // readahead on the buffered path saves. Skip the direct-open attempt
-    // entirely in that case — keeps the log clean and avoids a wasted fd.
-    let wants_direct = try_direct_io && tensors.len() <= direct_io_tensor_cap;
-    if try_direct_io && !wants_direct {
-        tracing::info!(
-            "  Shard has {} tensors (> {} cap) — using buffered+pipelined path",
-            tensors.len(),
-            direct_io_tensor_cap
-        );
-    }
-
-    // File for data reads. Try O_DIRECT; if it fails, fall through to buffered.
-    let (direct_file, using_direct) = match wants_direct
-        .then(|| direct_io::open_direct(shard_path))
-        .transpose()
-    {
-        Ok(Some(f)) => (Some(f), true),
-        Ok(None) => (None, false),
-        Err(e) => {
-            tracing::warn!(
-                "O_DIRECT open failed for {} ({e}); falling back to buffered reads",
-                shard_path.display()
-            );
-            (None, false)
+        for name in [
+            format!("{expert}.weight"),
+            format!("{expert}.weight_scale_2"),
+            format!("{attn}.weight_scale_2"),
+            "model.language_model.layers.3.self_attn.k_proj.weight".to_string(),
+        ] {
+            assert!(!loader.should_defer_tensor(&name), "{name}");
         }
-    };
-    let buffered_file = File::open(shard_path)?;
-    let data_fd = direct_file.as_ref().unwrap_or(&buffered_file);
-    if prefetch_shards && !using_direct {
-        advise_prefetch_shard(&buffered_file, shard_path, file_size);
     }
 
-    // Pipelined reader: sends (tensor_index, aligned_buffer, slice_start) to main.
-    type ReadMsg = (usize, direct_io::AlignedBuffer, usize);
-    let (tx, rx) = sync_channel::<Result<ReadMsg>>(1);
-    let tensors_for_reader: Vec<(u64, usize)> =
-        tensors.iter().map(|t| (t.abs_offset, t.len)).collect();
-    let raw_fd = {
-        use std::os::unix::io::AsRawFd;
-        data_fd.as_raw_fd()
-    };
-
-    let _ = file_size; // retained for future use (tail-fragment buffered read)
-    let reader_handle = std::thread::spawn(move || {
-        for (idx, (abs_offset, len)) in tensors_for_reader.iter().enumerate() {
-            let msg = direct_io::read_tensor_aligned(raw_fd, *abs_offset, *len, using_direct)
-                .map(|(buf, slice_start)| (idx, buf, slice_start));
-            if tx.send(msg).is_err() {
-                break; // receiver dropped
-            }
+    /// Every expert's activation scales -- a remote one's too -- are deferred,
+    /// never uploaded; the rest of an expert keeps the EP filter.
+    #[test]
+    fn activation_scales_are_deferred_for_every_expert() {
+        let mut loader = FastSafetensorsLoader::with_ep(0, 2, 512);
+        loader.skip_activation_scales = true;
+        for e in [3, 300] {
+            let name =
+                format!("model.language_model.layers.7.mlp.experts.{e}.down_proj.input_scale");
+            assert!(!loader.should_skip_tensor(&name));
+            assert!(loader.should_defer_tensor(&name));
         }
-    });
-
-    // Copier: drains the channel, does gpu alloc + copy_h2d, inserts into the map.
-    for result in rx {
-        let (idx, buf, slice_start) = result?;
-        let meta = &tensors[idx];
-        let raw = &buf.as_slice()[slice_start..slice_start + meta.len];
-        // F16 shards: convert bytes to BF16 before upload (same length,
-        // different bit layout — meta.dtype is already staged as BF16).
-        let converted: Vec<u8>;
-        let src: &[u8] = if meta.from_f16 {
-            converted = f16_to_bf16_bytes(raw);
-            &converted
-        } else {
-            raw
-        };
-
-        let ptr = match gpu.alloc(meta.len) {
-            Ok(p) => {
-                gpu.copy_h2d(src, p)?;
-                p
-            }
-            Err(_) => {
-                if !*offload_logged {
-                    tracing::warn!(
-                        "GPU alloc failed for {} ({} bytes) — switching to managed (UVM) memory",
-                        meta.name,
-                        meta.len
-                    );
-                    *offload_logged = true;
-                }
-                let p = gpu.alloc_managed(meta.len)?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(src.as_ptr(), p.0 as *mut u8, meta.len);
-                }
-                p
-            }
-        };
-
-        out.insert(
-            meta.name.clone(),
-            WeightTensor {
-                ptr,
-                shape: meta.shape.clone(),
-                dtype: meta.dtype,
-            },
-        );
+        let remote = "model.language_model.layers.7.mlp.experts.300.down_proj.weight";
+        assert!(loader.should_skip_tensor(remote));
+        assert!(!loader.should_defer_tensor(remote));
     }
 
-    reader_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("reader thread panicked"))?;
-
-    // Release file handles, then advise the kernel to drop any pages we did
-    // end up caching on the buffered fallback path. O_DIRECT reads never hit
-    // the page cache, so the posix_fadvise is a no-op there but cheap.
-    drop(direct_file);
-    evict_page_cache(&buffered_file);
-    drop(buffered_file);
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn advise_prefetch_shard(file: &File, shard_path: &Path, file_size: u64) {
-    use std::os::unix::io::AsRawFd;
-
-    let fd = file.as_raw_fd();
-    let seq_rc = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
-    let willneed_rc = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_WILLNEED) };
-    if seq_rc == 0 && willneed_rc == 0 {
-        tracing::info!(
-            "  NFS/shard prefetch requested for {} ({:.2} GB)",
-            shard_path.display(),
-            file_size as f64 / (1024.0 * 1024.0 * 1024.0)
-        );
-    } else {
-        tracing::warn!(
-            "  NFS/shard prefetch hint failed for {}: sequential_rc={}, willneed_rc={}",
-            shard_path.display(),
-            seq_rc,
-            willneed_rc
-        );
+    #[test]
+    fn expert_tp_keeps_every_expert_and_defers_only_its_bulk() {
+        let mut loader = FastSafetensorsLoader::with_ep(1, 2, 288);
+        loader.expert_tp = true;
+        loader.rank0_only_expert_prefix = Some(".layers.45.".into());
+        let p = "model.language_model.layers.44.mlp.experts.1.gate_proj";
+        for suffix in ["weight", "weight_scale"] {
+            let name = format!("{p}.{suffix}");
+            assert!(!loader.should_skip_tensor(&name));
+            assert!(loader.should_defer_tensor(&name));
+        }
+        for suffix in ["weight_scale_2", "input_scale"] {
+            let name = format!("{p}.{suffix}");
+            assert!(!loader.should_skip_tensor(&name));
+            assert!(!loader.should_defer_tensor(&name));
+        }
+        let appended = "model.language_model.layers.45.mlp.experts.1.gate_proj.weight";
+        assert!(loader.should_skip_tensor(appended));
+        assert!(!loader.should_defer_tensor(appended));
+        let shared = "model.language_model.layers.44.mlp.shared_experts.gate_proj.weight";
+        assert!(!loader.should_defer_tensor(shared));
     }
 }
-
-#[cfg(not(target_os = "linux"))]
-fn advise_prefetch_shard(_file: &File, _shard_path: &Path, _file_size: u64) {}

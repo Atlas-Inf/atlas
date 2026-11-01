@@ -5,5 +5,9 @@
 
 mod adapter;
 mod basic;
+mod nvme;
+mod nvme_lru;
 mod snapshot;
 mod snapshot_reap;
+mod vision_key;
+mod whole_block;

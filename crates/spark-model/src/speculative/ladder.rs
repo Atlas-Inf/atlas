@@ -198,7 +198,29 @@ fn mtp_ladder_steps() -> &'static [(usize, usize)] {
         // the measured fixed cost is 65.8 ms, only 33% of the 16:2 step.
         // Cutting c is the standing lever, and it is what would let a deeper
         // rung pay again.
-        let mut steps = parsed.unwrap_or_else(|| vec![(4, 3), (8, 3), (16, 1), (32, 1)]);
+        // Lone-sequence passthrough only: `num_drafts` is already
+        // `min(--num-drafts, verify_max_drafts)`, and a model that serves
+        // K>4 exactly (qwen4_exp's ATLAS_QWEN4EXP_MTP_DEPTH=4..7) must not be
+        // held at 3 by a ladder entry written when 3 was every model's
+        // maximum. At n=1 `usize::MAX` clamps to `num_drafts` below, so
+        // models capped at 3 keep 3.
+        // The n=2..4 rung is back at 3: with a ceiling above 3, drafting all
+        // of them at width >1 made each verify wider than it paid back (C4
+        // aggregate 124–128 → 141–144 tok/s on 2×GB10 TP2, Atlas-Inf #220).
+        // The 8/16/32 rungs still step down with concurrency — the ladder's
+        // job is the wide end, not the ceiling.
+        // gfx1151 steps down at n=2: the 4:3 / 8:3 rungs above were measured on
+        // GB10. On Strix Halo a >=2-draft verify at C>=4 is the slow arm (strix s153,
+        // 27B NVFP4, MIN_N 9: C4 drafts 1/2/3 = 28.2 / 20.9 / 20.6 tok/s, C8 28.2 /
+        // 21.4 / 21.3; C1 still prefers depth, 13.9 / 14.8 / 14.4). s154, interleaved
+        // x2, NUM_DRAFTS=3: this ladder vs the default, C1 14.6/14.4 vs 15.3/14.4,
+        // C4 28.2/28.2 vs 21.5/20.6 (+34%), C8 28.1/28.1 vs 21.9/21.9 (+28%).
+        let default_steps = if cfg!(atlas_hip) {
+            vec![(1, usize::MAX), (8, 1), (16, 1), (32, 1)]
+        } else {
+            vec![(1, usize::MAX), (4, 3), (8, 3), (16, 1), (32, 1)]
+        };
+        let mut steps = parsed.unwrap_or(default_steps);
         steps.sort_by_key(|&(n, _)| n);
         steps
     })
@@ -272,7 +294,17 @@ pub fn mtp_max_seqs() -> usize {
             // Pre-ladder baseline (cap=4, binary 472ed410): C=1 25.55
             // (1.80x vLLM) · C=2 35.35 (1.27x) · C=4 54.1 (1.01x) ·
             // C=8/16 MTP-off 73.5/131.0.
-            .unwrap_or(if mtp_ladder_disabled() { 4 } else { 32 })
+            // gfx1151: MTP off above 4 active sequences. At C>4 a 1-draft
+            // verify (2 rows per sequence) costs more on Strix Halo than the
+            // tokens it accepts, for both NVFP4 targets (Gufo protocol, x2):
+            // 27B strix s168 cap 4 vs 32: C1 14.4/14.6, C4 28.7/29.0,
+            // C6 26.5/24.7, C8 34.1/30.2; Flash-Next framework f142 MTP vs
+            // AR: C4 32.2/30.4, C6 28.4/30.1, C8 31.4/34.2.
+            .unwrap_or(if mtp_ladder_disabled() || cfg!(atlas_hip) {
+                4
+            } else {
+                32
+            })
     })
 }
 
@@ -286,6 +318,15 @@ mod tests {
     fn default_ladder_holds_depth_to_the_cap() {
         assert_eq!(mtp_ladder_drafts(1, 3), 3);
         assert_eq!(mtp_ladder_drafts(4, 3), 3);
+        // The passthrough is lone-sequence only: a ceiling above 3
+        // (qwen4_exp MTP_DEPTH 4..7) reaches the verify at n=1, and the
+        // ladder steps down to 3 for n=2..4 and 5..8, then 1 at 16/32.
+        assert_eq!(mtp_ladder_drafts(1, 5), 5);
+        assert_eq!(mtp_ladder_drafts(2, 5), 3);
+        assert_eq!(mtp_ladder_drafts(4, 5), 3);
+        assert_eq!(mtp_ladder_drafts(8, 5), 3);
+        assert_eq!(mtp_ladder_drafts(16, 5), 1);
+        assert_eq!(mtp_ladder_drafts(1, 7), 7);
         assert_eq!(mtp_ladder_drafts(5, 3), 3);
         assert_eq!(mtp_ladder_drafts(8, 3), 3);
         // The 16:1 rung (wave 19): ONE draft (K=2, 2 rows/seq) through n=16.

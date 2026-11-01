@@ -56,6 +56,17 @@ fn warm_quantum() -> usize {
         .unwrap_or(1024)
 }
 
+/// `ATLAS_PLE_WARM_BG=1`: the worker hashes the prompt itself.
+fn warm_bg_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("ATLAS_PLE_WARM_BG").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
 /// `ATLAS_PLE_WARM=0` restores the old behaviour — the gather faults its own
 /// rows on the forward path.
 pub(crate) fn warm_enabled() -> bool {
@@ -112,7 +123,7 @@ pub struct PleWarm {
 
 impl PleWarm {
     fn start(
-        ids: Vec<u64>,
+        ids: impl FnOnce() -> Vec<u64> + Send + 'static,
         covered_from: usize,
         prompt: &[u32],
         table: Arc<Mutex<NgramTable>>,
@@ -202,7 +213,7 @@ impl Drop for PleWarm {
 /// one quantum of fault I/O. Parks when caught up; `advance`/`note` unpark.
 #[allow(clippy::too_many_arguments)]
 fn run(
-    ids: Vec<u64>,
+    ids: impl FnOnce() -> Vec<u64>,
     covered_from: usize,
     heads: usize,
     ahead: usize,
@@ -210,6 +221,7 @@ fn run(
     shared: Arc<WarmShared>,
     table: Arc<Mutex<NgramTable>>,
 ) {
+    let ids = ids();
     let end_pos = covered_from + ids.len() / heads;
     let mut pos = covered_from;
     while pos < end_pos && !shared.done.load(Ordering::Relaxed) {
@@ -276,9 +288,20 @@ impl PleLayer {
             return Ok(());
         }
         let heads = self.dims.ngram_heads();
-        let ids = prompt_rows(&self.dims, prompt, from);
         let ahead = warm_ahead_tokens(self.scratch_tokens);
-        st.warm = PleWarm::start(ids, from, prompt, self.table.clone(), heads, ahead);
+        // `ATLAS_PLE_WARM_BG=1`: hash the prompt's n-grams on the worker,
+        // not on the model thread before the first kernel (~4.5 ms of host
+        // time at 16K on the pair, nsys `sqpf-p3s7-r0`). The ids only steer
+        // the prefetch, never what a gather reads.
+        let table = self.table.clone();
+        st.warm = if warm_bg_requested() {
+            let (dims, prompt_v) = (self.dims.clone(), prompt.to_vec());
+            let ids = move || prompt_rows(&dims, &prompt_v, from);
+            PleWarm::start(ids, from, prompt, table, heads, ahead)
+        } else {
+            let ids = prompt_rows(&self.dims, prompt, from);
+            PleWarm::start(move || ids, from, prompt, table, heads, ahead)
+        };
         Ok(())
     }
 }
@@ -373,5 +396,50 @@ mod tests {
 
         w.shared.finished.store(true, Ordering::Relaxed);
         assert!(!w.covers(&prompt, 6), "a dead worker covers nothing");
+    }
+
+    /// Host cost of the prompt's ids at a 16K prompt with the checkpoint's
+    /// head geometry (16 heads, prime vocabularies): what
+    /// `ATLAS_PLE_WARM_BG` moves off the model thread. Release build:
+    /// `cargo test --release ... prompt_rows_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn prompt_rows_cost_at_16k() {
+        let primes = [
+            100_003u64, 100_019, 100_043, 100_049, 100_057, 100_069, 100_103, 100_109, 100_129,
+            100_151, 100_153, 100_169, 100_183, 100_189, 100_193, 100_207,
+        ];
+        let offsets: Vec<u64> = primes
+            .iter()
+            .scan(0, |o, p| {
+                let at = *o;
+                *o += p;
+                Some(at)
+            })
+            .collect();
+        let d = PleIdDims {
+            ngram_size: 3,
+            heads_per_ngram: 8,
+            multipliers: vec![
+                0x9E37_79B9_7F4A_7C15,
+                0xC2B2_AE3D_27D4_EB4F,
+                0x1656_67B1_9E37_79F9,
+            ],
+            head_vocab_sizes: primes.to_vec(),
+            head_offsets: offsets,
+            eos_token_id: 151_645,
+        };
+        let prompt: Vec<u32> = (0..16046u32)
+            .map(|i| i.wrapping_mul(2_654_435_761) % 151_000)
+            .collect();
+        let t = std::time::Instant::now();
+        let mut n = 0;
+        for _ in 0..5 {
+            n += prompt_rows(&d, &prompt, 0).len();
+        }
+        println!(
+            "prompt_rows at 16046 tokens: {:.2} ms ({n} ids)",
+            t.elapsed().as_secs_f64() * 200.0
+        );
     }
 }

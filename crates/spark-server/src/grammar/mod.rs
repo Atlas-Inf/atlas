@@ -8,6 +8,7 @@
 //! - [`GrammarState`]: per-request state that wraps a [`xgrammar::GrammarMatcher`];
 //!   fills bitmasks, accepts tokens, supports rollback for MTP speculative decode.
 
+mod branch;
 mod compile_misc;
 mod compile_tools;
 mod engine;
@@ -15,7 +16,7 @@ mod schema;
 mod state;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use engine::{GrammarEngine, GrammarError};
 pub use schema::augment_schema_with_tafc_think;

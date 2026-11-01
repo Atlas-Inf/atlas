@@ -123,6 +123,11 @@ pub struct ChatCompletionRequest {
     /// 0 = no minimum (default). Useful for preventing empty responses.
     #[serde(default)]
     pub min_tokens: usize,
+    /// vLLM `ignore_eos`: the model's end tokens do not end the response;
+    /// they are ordinary tokens and generation runs to `max_tokens`
+    /// (benchmark harnesses send it with `min_tokens`). `stop` still applies.
+    #[serde(default)]
+    pub ignore_eos: bool,
     /// Seed for deterministic sampling. When set, stochastic sampling uses this
     /// seed for the RNG, producing reproducible output for the same inputs.
     /// None = non-deterministic (default).
@@ -299,6 +304,10 @@ pub struct ChatTemplateKwargs {
     /// other `chat_template_kwargs` keys in the directive ladder
     /// (vLLM's template gates the effort block on `enable_thinking`).
     pub reasoning_effort: Option<String>,
+    /// vLLM deepseek_r1 kwarg: when the output is all reasoning (unclosed
+    /// think block), return the reasoning text AS content so the response
+    /// body is never empty. Absent = false.
+    pub force_nonempty_content: Option<bool>,
 }
 
 impl ChatCompletionRequest {
@@ -518,8 +527,10 @@ impl ChatCompletionRequest {
     }
 }
 
+/// A chat or Responses request without `max_tokens`: the rest of the context
+/// once the prompt is known (`ir::resolve_max_tokens`), as vLLM.
 pub(super) fn default_max_tokens() -> usize {
-    4096
+    crate::ir::MAX_TOKENS_UNSET
 }
 pub(super) fn default_n() -> usize {
     1
@@ -552,6 +563,21 @@ mod alias_tests {
         format!(
             r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"max_tokens":16{extra}}}"#
         )
+    }
+
+    #[test]
+    fn an_unset_max_tokens_is_the_rest_of_the_context() {
+        // vLLM: `max_model_len - prompt` when the client sends none.
+        let req: ChatCompletionRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
+                .unwrap();
+        assert_eq!(req.max_tokens, crate::ir::MAX_TOKENS_UNSET);
+        let resolve = crate::ir::resolve_max_tokens;
+        assert_eq!(resolve(req.max_tokens, 1_000, 262_144), 261_144);
+        assert_eq!(resolve(16, 1_000, 262_144), 16, "a client's cap stands");
+        assert_eq!(resolve(req.max_tokens, 300_000, 262_144), 0);
+        let req: ChatCompletionRequest = serde_json::from_str(&base("")).unwrap();
+        assert_eq!(req.max_tokens, 16);
     }
 
     #[test]

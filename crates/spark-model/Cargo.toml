@@ -32,6 +32,8 @@ metal-example = ["metal", "dep:tokenizers", "dep:memmap2", "dep:safetensors"]
 # driver symbols — cuGraph*/cuStream*/cuMem* — that aren't available on the
 # CI runner). Build on a real GPU host with `--features gpu-examples`.
 gpu-examples = []
+# The NCCL/RDMA-pair CommBackend, for the two-rank `comm_pair_bench` example.
+nccl = ["cuda", "spark-comm/nccl"]
 
 [dependencies]
 atlas-core = { workspace = true }
@@ -48,13 +50,14 @@ spark-storage = { path = "../spark-storage", default-features = false }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tracing = "0.1"
 half = "2"
 base64 = "0.22"
 # `gif` carries the video path: it is the one genuinely multi-frame container
 # decodable in pure Rust with no system dependency, so the whole temporal
 # pipeline can be proven before committing to an H.264 decoder.
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "ico"] }
 parking_lot = { workspace = true }
 
 # Used by the `metal_qwen35_inference` example only — gated by
@@ -90,6 +93,62 @@ workspace = true
 # `#[ignore]`d integration test — see crates/spark-model/tests/arm2_leg2_*.rs.
 [[example]]
 name = "gdn_cdh_vblock_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "marlin_vs_tc_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "moe_fp4_prefill_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "moe_verify_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "glm_hc_seam_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "qwen4exp_hc_prefill_check"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "lt_kchain_pin_check"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "qwen4exp_row_invariance"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "qwen4exp_rowinv_probe"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "glm_sparse_split_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "kda_verify_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "concurrency_probe"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "comm_pair_bench"
+required-features = ["cuda", "gpu-examples", "nccl"]
+
+[[example]]
+name = "glm_topk_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "gdn_fla_scratch_garbage"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
@@ -146,6 +205,18 @@ required-features = ["cuda", "gpu-examples"]
 
 [[example]]
 name = "w8a16_gemv_batch4_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "mxfp8_proj_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "ngram_nvfp4_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "vit_dq_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
@@ -270,4 +341,8 @@ required-features = ["cuda", "gpu-examples"]
 
 [[example]]
 name = "w4a16_qg_batch_bitparity_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "moe_t_rows_bench"
 required-features = ["cuda", "gpu-examples"]

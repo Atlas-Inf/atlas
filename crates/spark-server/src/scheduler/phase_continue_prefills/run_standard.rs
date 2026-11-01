@@ -6,12 +6,10 @@
 //! (fuses 1 prefill chunk + N decode in one pass). Otherwise falls back
 //! to plain `prefill_chunk` + EP broadcast.
 
-use anyhow::Result;
 use spark_model::traits::{Model, SequenceState};
 use std::time::Instant;
 
 use super::super::decode_logits_step::process_decode_logits;
-use super::super::lifecycle::send_error;
 use super::super::sample_first_token;
 use super::super::types::{ActiveSeq, PrefillInProgress};
 
@@ -30,13 +28,15 @@ pub(super) fn run_standard_chunk_loop(
     use_ngram_speculative: bool,
     think_end_token: Option<u32>,
     think_start_token: Option<u32>,
-    code_fence_token: Option<u32>,
     tool_call_start_token: Option<u32>,
     tool_call_end_token: Option<u32>,
     adaptive_sampling: bool,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
     completed_indices: &mut Vec<(usize, Option<u32>)>,
     did_mixed_step: &mut bool,
+    max_batch_tokens: usize,
+    spec: &super::SpecStep,
+    rode: &mut Vec<usize>,
 ) {
     // TQ+ InnerQ: poll once per chunk to see if calibration has banked
     // enough K² stats to finalize scales. The driver itself is idempotent
@@ -55,7 +55,8 @@ pub(super) fn run_standard_chunk_loop(
     // silently corrupts attention output. Force single-chunk until a
     // paged-MLA prefill kernel lands. Hurts cold TTFT on long MLA
     // prompts but preserves correctness.
-    let effective_max = if model.is_mla() {
+    let force_single_chunk = model.is_mla() && !model.supports_chunked_mla();
+    let effective_max = if force_single_chunk {
         remaining
     } else {
         max_prefill_tokens
@@ -66,7 +67,7 @@ pub(super) fn run_standard_chunk_loop(
     // is a no-op and the chunk cap is unchanged (byte-identical resting path).
     // MLA keeps its forced full-remaining chunk (correctness gate above) — the
     // slice budget never applies there.
-    let cap = if model.is_mla() {
+    let cap = if force_single_chunk {
         effective_max
     } else {
         effective_max.min(slice_budget)
@@ -87,10 +88,14 @@ pub(super) fn run_standard_chunk_loop(
     {
         chunk_len = tb - p.chunk_offset;
     }
+    // R11 fix 5: end non-last chunks on the model's prefill cut grid.
+    chunk_len = model.align_prefill_chunk(p.chunk_offset, chunk_len, p.prompt_tokens.len());
     let is_last = p.chunk_offset + chunk_len >= p.prompt_tokens.len();
     // Align intermediate chunks to GDN WY4 boundary (4 tokens).
-    if !is_last && chunk_len >= 4 {
-        chunk_len = (chunk_len / 4) * 4;
+    if !is_last && chunk_len >= spark_runtime::prefill_chunk_granule() {
+        // (ATLAS_QWEN4EXP_PREFILL_ROWINV: 64, the GDN chunk.)
+        let g = spark_runtime::prefill_chunk_granule();
+        chunk_len = (chunk_len / g) * g;
     }
 
     // ── Mixed forward: fuse prefill chunk + decode in one pass ──
@@ -203,7 +208,10 @@ pub(super) fn run_standard_chunk_loop(
                         p.top_k,
                         p.top_p,
                         p.min_p,
-                        &p.eos_tokens,
+                        &crate::scheduler::min_tokens_ban::first_token_suppress(
+                            &p.eos_tokens,
+                            p.min_tokens,
+                        ),
                         p.grammar_state.as_mut(),
                         &sched.levers.sampling(),
                     ) {
@@ -228,7 +236,6 @@ pub(super) fn run_standard_chunk_loop(
                     t0_mixed,
                     think_end_token,
                     think_start_token,
-                    code_fence_token,
                     tool_call_start_token,
                     tool_call_end_token,
                     adaptive_sampling,
@@ -244,74 +251,43 @@ pub(super) fn run_standard_chunk_loop(
         return;
     }
 
-    // ── Standard path: prefill chunk only, decode separately ──
-    // EP: broadcast chunk tokens to worker (bulk, single NCCL op).
-    let ep_ok = (|| -> Result<()> {
-        model.ep_broadcast_cmd_for_seq(p.seq.slot_idx as u32, 0xFFFFFFF0)?;
-        model.ep_broadcast_cmd(chunk_len as u32)?;
-        model.ep_broadcast_cmd(p.chunk_offset as u32)?;
-        model.ep_broadcast_cmd(p.prompt_tokens.len() as u32)?;
-        model.ep_broadcast_tokens(&p.prompt_tokens)?;
-        Ok(())
-    })();
-    if let Err(e) = ep_ok {
-        tracing::error!("EP broadcast chunk: {e:#}");
-        completed_indices.push((idx, None));
+    // ── Fused: the active DFlash owners' verify rows ride this chunk ──
+    let verify_ctx = sched.verify_logits_ctx(
+        think_end_token,
+        think_start_token,
+        tool_call_start_token,
+        tool_call_end_token,
+    );
+    if super::run_fused::try_fused_chunk(
+        model,
+        p,
+        idx,
+        active,
+        chunk_len,
+        max_batch_tokens,
+        spec,
+        &verify_ctx,
+        sched,
+        completed_indices,
+        rode,
+    ) {
         return;
     }
 
-    // Preempt-and-retry on KV exhaustion, mirroring `decode_step`: a prompt chunk
-    // that cannot allocate should evict a LARGER in-flight sequence rather than
-    // fail this request outright. Safe to retry because
-    // `ensure_blocks_through_prefill` fails during block allocation, BEFORE the
-    // forward pass — no GPU state has been mutated. Victim policy matches
-    // admission control (largest block_table, grammar-active excluded, since
-    // their state is not reconstructible). Falls through to the original
-    // fail-this-sequence behavior when nothing can be evicted.
-    let mut chunk_res = model.prefill_chunk(
+    // ── Standard path: prefill chunk only, decode separately ──
+    // EP: the chunk command is broadcast (and re-sent after each agreed KV
+    // refusal, resuming at recorded progress) by `prefill_preempt`.
+    let chunk_res = super::super::prefill_preempt::prefill_chunk_with_preemption(
+        model,
         &p.prompt_tokens,
         &mut p.seq,
+        p.disable_mtp,
         p.chunk_offset,
-        chunk_len,
+        p.chunk_offset + chunk_len,
         is_last,
         prefill_stream,
+        active,
     );
-    while chunk_res
-        .as_ref()
-        .err()
-        .is_some_and(|e| format!("{e:#}").contains("KV cache exhausted"))
-    {
-        let Some(vi) = active
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| a.grammar_state.is_none())
-            .max_by_key(|(_, a)| a.seq.block_table.len())
-            .map(|(i, _)| i)
-        else {
-            break;
-        };
-        let mut victim = active.remove(vi);
-        tracing::warn!(
-            "KV cache exhausted during prefill chunk: preempting slot={} ({} blocks) \
-             so this prefill can proceed ({} sequence(s) remain)",
-            victim.seq.slot_idx,
-            victim.seq.block_table.len(),
-            active.len(),
-        );
-        send_error(
-            model,
-            &mut victim,
-            "preempted: KV cache exhausted (a prefill needed its blocks)",
-        );
-        chunk_res = model.prefill_chunk(
-            &p.prompt_tokens,
-            &mut p.seq,
-            p.chunk_offset,
-            chunk_len,
-            is_last,
-            prefill_stream,
-        );
-    }
     match chunk_res {
         Ok(logits) => {
             p.chunk_offset += chunk_len;
@@ -320,8 +296,12 @@ pub(super) fn run_standard_chunk_loop(
                 p.chunk_offset,
                 p.prompt_tokens.len(),
             );
-            // Normalize SSM states after EVERY chunk to prevent state drift.
-            if let Err(e) = model.normalize_ssm_states(&p.seq, prefill_stream) {
+            // Normalize SSM states after every chunk to prevent state drift
+            // (R11 fix 4: except chunks wholly below a restored anchor).
+            if model.normalize_after_chunk(&p.seq, p.chunk_offset)
+                && let Err(e) =
+                    super::super::prefill_normalization::continuation(model, &p.seq, prefill_stream)
+            {
                 tracing::warn!("SSM state normalization failed: {e:#}");
             }
             if is_last {
@@ -339,7 +319,10 @@ pub(super) fn run_standard_chunk_loop(
                     p.top_k,
                     p.top_p,
                     p.min_p,
-                    &p.eos_tokens,
+                    &crate::scheduler::min_tokens_ban::first_token_suppress(
+                        &p.eos_tokens,
+                        p.min_tokens,
+                    ),
                     p.grammar_state.as_mut(),
                     &sched.levers.sampling(),
                 ) {

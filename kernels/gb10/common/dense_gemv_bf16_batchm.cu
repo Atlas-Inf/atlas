@@ -56,7 +56,13 @@ extern "C" __global__ void dense_gemv_bf16_batchm(
     const unsigned int lane = threadIdx.x % threads_per_out;
 
     const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+#if defined(__HIP_PLATFORM_AMD__)
+    // The staged loop below has block-wide barriers, so out-of-range outputs
+    // stay until it ends (they load nothing and store nothing).
+    const bool live = n < N;
+#else
     if (n >= N) return;
+#endif
 
     const unsigned int m = (M > MAX_M) ? MAX_M : M;
 
@@ -81,23 +87,61 @@ extern "C" __global__ void dense_gemv_bf16_batchm(
     // a_cur/a_next[MAX_M] register arrays — the static MAX_M=8 arrays spilled
     // to local memory and REGRESSED qkvz 1.24ms -> 3.07ms. Do not prefetch
     // into per-row arrays here; the loads stay per-iteration.
-    for (unsigned int kv = lane; kv < K_VEC; kv += threads_per_out) {
-        uint4 b_data = B_vec[kv];
-        const unsigned int b_raw[4] = {b_data.x, b_data.y, b_data.z, b_data.w};
-
-        for (unsigned int t = 0; t < m; t++) {
-            const uint4* At_vec = (const uint4*)(A + (unsigned long long)t * K);
-            uint4 a_data = At_vec[kv];
+    // A k-tile of every activation row is staged in LDS once per block and
+    // read by all N_PER_BLOCK outputs. Read straight from global memory, the
+    // M rows sit K * 2 bytes apart; when that is a multiple of 4 KiB (K = 4096,
+    // 6144, 8192: Flash-Next's GDN out_proj) all M lines of an iteration land
+    // in one cache set. Framework f147 (M = 8, N = 2560): K 6144 56 GB/s,
+    // K 6400 169 GB/s; at K 6144, M 1 166 GB/s, M 8 56 GB/s. Each thread still
+    // walks kv = lane, lane + 64, ... in the same accumulation order, so the
+    // bytes are unchanged. f148, M 8, staged vs direct, byte-identical C:
+    // N 16384 K 2560 0.524 -> 0.362 ms; N 2560 K 6144 0.565 -> 0.225 ms.
+    // One row has nothing to alias, and the extra barriers cost it ~12%
+    // (f148: K 6144, M 1, 0.183 -> 0.207 ms), so it keeps the direct loads.
+    __shared__ uint4 s_a[MAX_M][BLOCK_SIZE / N_PER_BLOCK];
+    const unsigned int steps = m > 1 ? (K_VEC + threads_per_out - 1) / threads_per_out : 0;
+    if (m == 1 && live) {
+        for (unsigned int kv = lane; kv < K_VEC; kv += threads_per_out) {
+            uint4 b_data = B_vec[kv];
+            uint4 a_data = ((const uint4*)A)[kv];
+            const unsigned int b_raw[4] = {b_data.x, b_data.y, b_data.z, b_data.w};
             const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
-            float a = acc[t];
+            float a = acc[0];
             #pragma unroll
             for (int i = 0; i < 4; i++) {
                 asm volatile("v_dot2_f32_bf16 %0, %1, %2, %0"
                              : "+v"(a) : "v"(a_raw[i]), "v"(b_raw[i]));
             }
-            acc[t] = a;
+            acc[0] = a;
         }
     }
+    for (unsigned int s = 0; s < steps; s++) {
+        const unsigned int kv0 = s * threads_per_out;
+        for (unsigned int i = threadIdx.x; i < m * threads_per_out; i += BLOCK_SIZE) {
+            const unsigned int t = i / threads_per_out, v = i % threads_per_out;
+            if (kv0 + v < K_VEC) s_a[t][v] = ((const uint4*)(A + (unsigned long long)t * K))[kv0 + v];
+        }
+        __syncthreads();
+        const unsigned int kv = kv0 + lane;
+        if (live && kv < K_VEC) {
+            uint4 b_data = B_vec[kv];
+            const unsigned int b_raw[4] = {b_data.x, b_data.y, b_data.z, b_data.w};
+
+            for (unsigned int t = 0; t < m; t++) {
+                uint4 a_data = s_a[t][lane];
+                const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
+                float a = acc[t];
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    asm volatile("v_dot2_f32_bf16 %0, %1, %2, %0"
+                                 : "+v"(a) : "v"(a_raw[i]), "v"(b_raw[i]));
+                }
+                acc[t] = a;
+            }
+        }
+        __syncthreads();
+    }
+    if (!live) return;
 #else
     for (unsigned int kv = lane; kv < K_VEC; kv += threads_per_out) {
         // ONE weight load feeds every row — this is the whole point.

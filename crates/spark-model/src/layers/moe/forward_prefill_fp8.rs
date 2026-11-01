@@ -96,7 +96,7 @@ impl MoeLayer {
             && self.per_token_group_quant_fp8_k.0 != 0;
         let has_shared = shared_inter > 0;
         let bf16_shared = has_shared
-            && self.run_bf16_shared_expert(
+            && self.run_separate_shared_expert(
                 input,
                 n,
                 h,
@@ -105,6 +105,7 @@ impl MoeLayer {
                 ctx.buffers.ssm_qkvz(),
                 ctx.buffers.attn_output(),
                 ctx,
+                false,
                 stream,
             )?;
         if !bf16_shared && has_shared && force_w8a8_sh {

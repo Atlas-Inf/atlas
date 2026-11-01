@@ -168,6 +168,35 @@ pub(crate) fn quantize_to_nvfp4(
     quantize_kernel: spark_runtime::gpu::KernelHandle,
     stream: u64,
 ) -> Result<QuantizedWeight> {
+    quantize_to_nvfp4_scaled_by(
+        bf16_weight,
+        n,
+        k,
+        (bf16_weight.weight, n * k),
+        gpu,
+        absmax_kernel,
+        quantize_kernel,
+        stream,
+    )
+}
+
+/// [`quantize_to_nvfp4`] with the global scale taken from `scale_source`
+/// (`(ptr, elements)`) instead of from the weight itself. A TP rank passes the
+/// full unsharded matrix here, so its shard carries the same `scale2`, and so
+/// the same NVFP4 bytes, as the matching rows of a TP=1 quantization. Blocks
+/// are 16 along K and every shard boundary is a multiple of 16, so the scale
+/// is the only thing that could differ.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn quantize_to_nvfp4_scaled_by(
+    bf16_weight: &DenseWeight,
+    n: usize,
+    k: usize,
+    scale_source: (DevicePtr, usize),
+    gpu: &dyn GpuBackend,
+    absmax_kernel: spark_runtime::gpu::KernelHandle,
+    quantize_kernel: spark_runtime::gpu::KernelHandle,
+    stream: u64,
+) -> Result<QuantizedWeight> {
     use spark_runtime::kernel_args::KernelLaunch;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -189,13 +218,14 @@ pub(crate) fn quantize_to_nvfp4(
     T_ALLOC_MAX.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
     let t = std::time::Instant::now();
-    let grid1 = (total / 256).clamp(1, 1024) as u32;
+    let (scale_ptr, scale_total) = scale_source;
+    let grid1 = (scale_total / 256).clamp(1, 1024) as u32;
     KernelLaunch::new(gpu, absmax_kernel)
         .grid([grid1, 1, 1])
         .block([256, 1, 1])
-        .arg_ptr(bf16_weight.weight)
+        .arg_ptr(scale_ptr)
         .arg_ptr(max_buf)
-        .arg_u32(total as u32)
+        .arg_u32(scale_total as u32)
         .launch(stream)?;
     T_LAUNCH1.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
 

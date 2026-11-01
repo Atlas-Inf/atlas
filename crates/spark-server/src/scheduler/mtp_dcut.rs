@@ -26,10 +26,16 @@
 //!
 //! # v1 scope (deliberate)
 //!
-//! * Every sequence keeps AT LEAST ONE draft. That holds `rows_i` in 2..=4 —
-//!   the exact envelope `can_batch_verify`, the `gdn_decode_wy{2,3,4}` handles
-//!   and the SSM intermediates pools were built and audited for. Dropping a
-//!   sequence to zero drafts (rows_i = 1) is a separate, untested regime.
+//! * Every sequence keeps AT LEAST ONE of its drafts. That holds `rows_i` in
+//!   2..=4 (2..=8 on qwen4_exp's exact lane under `ATLAS_MTP_DYNAMIC_DEPTH`)
+//!   for a sequence that drafted — the envelope `can_batch_verify`, the
+//!   `gdn_decode_wy{2,3,4}` handles and the SSM intermediates pools were built
+//!   and audited for. D-Cut never prunes a sequence to zero drafts; a
+//!   sequence that arrives WITHOUT drafts (a decode row riding the verify,
+//!   `mtp_step/one_forward.rs`) is planned at one row and is not prunable.
+//! * A sequence may hold fewer drafts than the ladder depth (the drafter's
+//!   confidence stop). Its drafts cap its depth: positions it did not draft
+//!   are not rankable, and no assignment may deepen it past them.
 //! * The budget is a FIXED ratio from the discrete bucket set, not a profiled
 //!   cost table. `ATLAS_MTP_DCUT_RATIO` picks it; values snap to the nearest
 //!   bucket so the search space stays the paper's four points.
@@ -141,20 +147,32 @@ pub(super) fn select(
     row_budget: usize,
     ratio: f32,
 ) -> Vec<usize> {
-    let n = confs.len();
-    // Depth 1 is mandatory (see module docs), so only depths 2..=k_drafts are
-    // rankable. Nothing to do at k_drafts <= 1.
-    let mut retained = vec![1usize.min(k_drafts); n];
-    if k_drafts <= 1 || n == 0 {
+    select_capped(confs, &vec![k_drafts; confs.len()], row_budget, ratio)
+}
+
+/// [`select`] over sequences holding `caps[i]` drafts each (`caps[i] <=` the
+/// ladder depth): `retained[i]` is in `1..=caps[i]`, and `0` for a sequence
+/// with no drafts. With every cap equal this is [`select`] exactly.
+pub(super) fn select_capped(
+    confs: &[&[f32]],
+    caps: &[usize],
+    row_budget: usize,
+    ratio: f32,
+) -> Vec<usize> {
+    debug_assert_eq!(confs.len(), caps.len());
+    // Depth 1 is mandatory (see module docs), so only depths 2..=caps[i] are
+    // rankable.
+    let mut retained: Vec<usize> = caps.iter().map(|&c| c.min(1)).collect();
+    let prunable: usize = caps.iter().map(|&c| c.saturating_sub(1)).sum();
+    if prunable == 0 {
         return retained;
     }
-    let prunable = n * (k_drafts - 1);
 
     // Score every prunable position by its log survival (prefix sum).
     let mut ranked: Vec<(f32, usize, usize)> = Vec::with_capacity(prunable);
     for (i, c) in confs.iter().enumerate() {
         let mut acc = 0.0f32;
-        for j in 0..k_drafts {
+        for j in 0..caps[i] {
             // Missing measurement -> 0.0 (certain), which sorts to the top.
             acc += c.get(j).copied().unwrap_or(0.0);
             if j >= 1 {
@@ -173,8 +191,8 @@ pub(super) fn select(
     });
 
     let by_ratio = ((prunable as f32) * ratio).round() as usize;
-    // Rows already committed: one base row + one mandatory draft per sequence.
-    let committed = 2 * n;
+    // Rows already committed: one base row + the mandatory draft per sequence.
+    let committed: usize = retained.iter().map(|r| r + 1).sum();
     let by_budget = row_budget.saturating_sub(committed);
     let keep = by_ratio.min(by_budget).min(prunable);
 
@@ -186,10 +204,23 @@ pub(super) fn select(
     retained
 }
 
+/// One planned verify batch: per-sequence ROW counts in dispatch order, and
+/// whether the depths were assigned canonically (the order `mtp_step` must
+/// re-apply per chunk — see [`assign`]).
+pub(super) struct Planned {
+    pub ks: Vec<usize>,
+    pub canonical: bool,
+}
+
 /// Plan one verify batch: choose the retained draft-count MULTISET from the
 /// drafter's confidences, assign it to the batch's ssm slots in the canonical
 /// order, truncate each sequence's drafts to its assigned prefix, and return
 /// the resulting per-sequence ROW count (`retained + 1`) in dispatch order.
+///
+/// Each sequence's depth is capped by the drafts it holds (at most
+/// `ladder_nd`; fewer after the drafter's confidence stop, none for a decode
+/// row). With every sequence at the ladder depth this is the pre-cap plan
+/// byte for byte.
 ///
 /// ★ The depth→slot ASSIGNMENT is canonical (`verify_key::verify_batch_order`
 /// — depths descending paired with slots ascending), not confidence-ordered,
@@ -212,75 +243,96 @@ pub(super) fn select(
 /// With `ATLAS_NO_MTP_DCUT` set — or the batch wider than [`dcut_width_cap`]
 /// sequences (the D-Cut-at-depth policy: pruning at the 16:2 rung's n=16
 /// measured -9%, so depth-at-width always verifies the uniform shape that
-/// won) — this is the uniform ladder shape and the batch order is untouched:
-/// the caller's downstream path is then byte-identical to the pre-D-Cut one.
+/// won) — every sequence verifies all the drafts it holds and the batch order
+/// is untouched: with uniform drafts the caller's downstream path is then
+/// byte-identical to the pre-D-Cut one.
 pub(super) fn plan(
     active: &mut [ActiveSeq],
     batchable: &mut Vec<usize>,
     ladder_nd: usize,
-    rows: usize,
-) -> Vec<usize> {
-    let mut ks: Vec<usize> = vec![rows; batchable.len()];
+) -> Planned {
+    let caps: Vec<usize> = batchable
+        .iter()
+        .map(|&i| active[i].pending_drafts.len().min(ladder_nd))
+        .collect();
     if !dcut_enabled()
         || ladder_nd < 2
         || batchable.is_empty()
         || batchable.len() > dcut_width_cap()
     {
-        return ks;
+        // Ordered by `mtp_step` (deepest first): with uniform caps that is
+        // the slot order either arm produces.
+        return Planned {
+            ks: caps.iter().map(|c| c + 1).collect(),
+            canonical: false,
+        };
     }
-    let confs: Vec<&[f32]> = batchable
-        .iter()
-        .map(|&i| {
-            let a = &active[i];
-            // Length-matched or nothing: a stale or absent confidence vector
-            // must read as "not measured" (full depth), never as a score.
-            if a.pending_draft_conf.len() == a.pending_drafts.len() {
-                a.pending_draft_conf.as_slice()
-            } else {
-                &[]
-            }
-        })
-        .collect();
-    let retained = select(&confs, ladder_nd, VERIFY_ROW_BUDGET, dcut_ratio());
-    for (pos, r) in retained.iter().enumerate() {
-        ks[pos] = (*r).clamp(1, ladder_nd) + 1;
-    }
-    // Dispatch order + depth assignment, from the ONE ordering rule shared
-    // with the graph key. Canonical: depths descending onto slots ascending,
-    // so `ks_out[p]` is the multiset's p-th deepest row count, NOT
-    // necessarily the confidence-chosen depth of the sequence placed there.
-    // Below `CANONICAL_KEY_MIN_WIDTH` (or with the kill switch set): each
-    // sequence keeps its own depth, deepest-first. This is the ONE place the
-    // assignment is decided, so it is the ONE place the width gate is asked —
-    // `mtp_step` re-applies the ORDER for the same `batchable.len()`.
+    // Length-matched or nothing: a stale or absent confidence vector must
+    // read as "not measured" (full depth), never as a score.
+    let confs: Vec<&[f32]> = batchable.iter().map(|&i| active[i].draft_conf()).collect();
+    let retained = select_capped(&confs, &caps, VERIFY_ROW_BUDGET, dcut_ratio());
     let slots: Vec<usize> = batchable
         .iter()
         .map(|&idx| active[idx].seq.ssm_slot_idx().unwrap_or(usize::MAX))
         .collect();
-    let (order, ks_out) = spark_model::speculative::verify_key::verify_batch_order(
+    // Dispatch order + depth assignment, from the ONE ordering rule shared
+    // with the graph key. This is the ONE place the assignment is decided, so
+    // it is the ONE place the width gate is asked — `mtp_step` re-applies the
+    // ORDER with the `canonical` this returns.
+    let (order, ks_out, canonical) = assign(
         &slots,
-        &ks,
+        &caps,
+        &retained,
         spark_model::speculative::verify_key::canonical_assignment(batchable.len()),
     );
-    // Truncate to the ASSIGNED depth. Every batchable sequence entered the
-    // step with exactly `ladder_nd` drafts (`mtp_step` truncates the surplus)
-    // and `ks_out[p] - 1` is in `1..=ladder_nd`, so this is always a prefix
-    // of what the drafter produced — deepening a sequence past its own drafts
-    // is unrepresentable, not merely unlikely.
+    // Truncate to the ASSIGNED depth — a prefix of what the drafter produced
+    // by construction (`assign` never deepens a sequence past its cap).
     let reordered: Vec<usize> = order.iter().map(|&p| batchable[p]).collect();
     for (idx, &k) in reordered.iter().zip(&ks_out) {
         let a = &mut active[*idx];
         debug_assert!(
-            k >= 2 && k - 1 <= a.pending_drafts.len(),
+            k >= 1 && k - 1 <= a.pending_drafts.len(),
             "assigned depth {k} exceeds the {} drafts proposed",
             a.pending_drafts.len()
         );
         a.pending_drafts.truncate(k - 1);
         a.pending_draft_conf.truncate(k - 1);
     }
-    record(batchable.len() * rows, ks_out.iter().sum(), &ks_out);
+    record(
+        caps.iter().map(|c| c + 1).sum(),
+        ks_out.iter().sum(),
+        &ks_out,
+    );
     *batchable = reordered;
-    ks_out
+    Planned {
+        ks: ks_out,
+        canonical,
+    }
+}
+
+/// Order a planned batch and pair its row counts (`retained + 1`) with it:
+/// `(order, ks, canonical)`. Canonical when `canonical_allowed` and the
+/// canonical pairing (depths descending onto slots ascending) gives no
+/// sequence more rows than its `caps` (drafts held) + 1; otherwise each
+/// sequence keeps its own depth, deepest first — the pre-canonical
+/// arrangement, and the only one that is always a prefix of every
+/// sequence's drafts.
+pub(super) fn assign(
+    slots: &[usize],
+    caps: &[usize],
+    retained: &[usize],
+    canonical_allowed: bool,
+) -> (Vec<usize>, Vec<usize>, bool) {
+    use spark_model::speculative::verify_key::verify_batch_order;
+    let ks: Vec<usize> = retained.iter().map(|r| r + 1).collect();
+    if canonical_allowed {
+        let (order, depths) = verify_batch_order(slots, &ks, true);
+        if order.iter().zip(&depths).all(|(&p, &k)| k <= caps[p] + 1) {
+            return (order, depths, true);
+        }
+    }
+    let (order, depths) = verify_batch_order(slots, &ks, false);
+    (order, depths, false)
 }
 
 /// Split a batch into verify chunks: `[lo, hi)` index ranges over `ks`.
@@ -310,8 +362,8 @@ pub(super) fn chunk_ranges(ks: &[usize]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut lo = 0usize;
     while lo < ks.len() {
-        // Derived, not hardcoded: rows <= 4 is ensured by the ladder clamp,
-        // so the division is well-defined and >= 24.
+        // Derived, not hardcoded: rows <= 8 (the exact lane's deep windows,
+        // `mtp_deep_depth`; 4 elsewhere), so the division is >= 16.
         let seq_cap = VERIFY_ROW_BUDGET / ks[lo].max(1);
         let mut hi = lo;
         let mut r = 0usize;

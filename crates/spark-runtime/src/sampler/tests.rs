@@ -167,6 +167,20 @@ fn test_top_n_sigma_disabled_at_zero() {
 }
 
 #[test]
+fn greedy_breaks_exact_ties_to_the_lowest_index_like_the_gpu_argmax() {
+    // Was LAST-index-wins (`max_by`), the opposite of the GPU kernels and the
+    // verify pick, so an exact top-1 tie made plain decode and a speculative
+    // verify commit different tokens.
+    let mut v = vec![0.0f32; 300_000];
+    v[7] = 3.5;
+    v[200_000] = 3.5;
+    let bytes: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+    let params = SamplingParams::greedy(10);
+    assert_eq!(sample_with_params_seeded(&bytes, &params, &[], None), 7);
+    assert_eq!(argmax_first_wins_f32(&v), 7);
+}
+
+#[test]
 fn test_sample_with_params_seeded_temperature_zero_returns_argmax() {
     // Direct call with temperature=0.0 must NOT divide-by-zero.
     // Should return the argmax of raw logits.

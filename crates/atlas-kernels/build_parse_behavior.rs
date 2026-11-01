@@ -19,6 +19,9 @@ pub(crate) struct ParsedBehavior {
     pub max_thinking_budget: u32,
     /// See `behavior_defaults.rs`: clamp effort levels at the ceiling.
     pub effort_capped_at_ceiling: bool,
+    /// `[behavior].default_reasoning_effort` — qualitative effort string
+    /// the template renders when a request is effort-silent ("" = unset).
+    pub default_reasoning_effort: String,
     pub thinking_default: bool,
     pub fp8_kv_calibration_tokens: usize,
     pub default_kv_dtype: String,
@@ -38,6 +41,10 @@ pub(crate) struct ParsedBehavior {
     /// the model did not choose to end leaves it in a state it cannot continue
     /// from, and the post-close content degenerates into token spam.
     pub enable_think_loop_watchdog: bool,
+    /// Arm the chat stream's SimHash sentence-repeat and token-loop guards
+    /// (default true). They end legitimately repetitive output — counting,
+    /// code with similar lines — so a model can opt out.
+    pub enable_stream_loop_guards: bool,
     /// Honor an EOS the model samples INSIDE a `<think>` block by implicitly
     /// closing the block, instead of discarding the token and forcing the
     /// model to keep reasoning.
@@ -85,6 +92,12 @@ pub(crate) struct ParsedBehavior {
     /// = do not inject the Jinja variable; the model template's own default
     /// applies. See `ModelBehavior::preserve_thinking`.
     pub preserve_thinking: Option<bool>,
+    /// See `ModelBehavior::verbatim_prompt`.
+    pub verbatim_prompt: bool,
+    /// See `ModelBehavior::eos_ends_thinking`.
+    pub eos_ends_thinking: bool,
+    /// See `ModelBehavior::tool_call_steering`.
+    pub tool_call_steering: bool,
 }
 
 impl Default for ParsedBehavior {
@@ -93,6 +106,7 @@ impl Default for ParsedBehavior {
             thinking_in_tools: true,
             max_thinking_budget: DEFAULT_MAX_THINKING_BUDGET,
             effort_capped_at_ceiling: DEFAULT_EFFORT_CAPPED_AT_CEILING,
+            default_reasoning_effort: String::new(),
             thinking_default: false,
             fp8_kv_calibration_tokens: 0,
             default_kv_dtype: String::new(),
@@ -106,6 +120,7 @@ impl Default for ParsedBehavior {
             jinja_template: String::new(),
             enable_loop_watchdog: false,
             enable_think_loop_watchdog: true,
+            enable_stream_loop_guards: true,
             honor_eos_inside_thinking: false,
             cap_thinking_at_max_tokens: true,
             min_p_floor: 0.0,
@@ -124,6 +139,9 @@ impl Default for ParsedBehavior {
             rom_head: String::new(),
             tool_retry: true,
             preserve_thinking: None,
+            verbatim_prompt: false,
+            eos_ends_thinking: false,
+            tool_call_steering: true,
         }
     }
 }
@@ -150,6 +168,11 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.as_integer())
         .map(|v| v as u32)
         .unwrap_or(DEFAULT_MAX_THINKING_BUDGET);
+    let default_reasoning_effort = b
+        .and_then(|v| v.get("default_reasoning_effort"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let effort_capped_at_ceiling = b
         .and_then(|v| v.get("effort_capped_at_ceiling"))
         .and_then(|v| v.as_bool())
@@ -209,6 +232,10 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .unwrap_or(false);
     let enable_think_loop_watchdog = b
         .and_then(|v| v.get("enable_think_loop_watchdog"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let enable_stream_loop_guards = b
+        .and_then(|v| v.get("enable_stream_loop_guards"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
     // Default FALSE: pre-p350 behaviour (discard a mid-think EOS, let the
@@ -299,10 +326,19 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
     let preserve_thinking = b
         .and_then(|v| v.get("preserve_thinking"))
         .and_then(|v| v.as_bool());
+    let flag = |key: &str, default: bool| {
+        b.and_then(|v| v.get(key))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default)
+    };
+    let verbatim_prompt = flag("verbatim_prompt", false);
+    let eos_ends_thinking = flag("eos_ends_thinking", false);
+    let tool_call_steering = flag("tool_call_steering", true);
     ParsedBehavior {
         thinking_in_tools,
         max_thinking_budget,
         effort_capped_at_ceiling,
+        default_reasoning_effort,
         thinking_default,
         fp8_kv_calibration_tokens,
         default_kv_dtype,
@@ -316,6 +352,7 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         jinja_template,
         enable_loop_watchdog,
         enable_think_loop_watchdog,
+        enable_stream_loop_guards,
         honor_eos_inside_thinking,
         cap_thinking_at_max_tokens,
         min_p_floor,
@@ -334,5 +371,8 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         rom_head,
         tool_retry,
         preserve_thinking,
+        verbatim_prompt,
+        eos_ends_thinking,
+        tool_call_steering,
     }
 }

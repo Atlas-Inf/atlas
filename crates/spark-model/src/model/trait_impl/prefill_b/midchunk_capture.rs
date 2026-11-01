@@ -79,13 +79,22 @@ pub(in crate::model) struct MidCapturePlan {
     pub h_dsts_early: Vec<DevicePtr>,
     /// Per-SSM-layer conv_state destination for the `tb - bs` slot.
     pub conv_dsts_early: Vec<DevicePtr>,
+    /// A qwen4_exp in-pass checkpoint (`qwen4exp_ckpt`): registered by its
+    /// own finalize, and compatible with the sequence-parallel split.
+    pub ckpt: bool,
+    /// qwen4_exp checkpoint passes: the capture points after the first
+    /// (dense and branch-point checkpoints), for the layers.
+    pub extra: Vec<crate::layers::qwen4exp_ckpt::CapPoint>,
+    /// qwen4_exp checkpoint passes: every point, the first included, as
+    /// (token, snapshot slot, branch point), in PLE staging order.
+    pub ckpt_points: Vec<(usize, usize, bool)>,
 }
 
 impl TransformerModel {
     /// Reserve a Marconi snapshot slot, reclaiming one from the cache on
     /// exhaustion. Returns `None` only when the pool is full and nothing is
     /// evictable — the caller then degrades gracefully (fewer/no captures).
-    fn reserve_snapshot_slot(
+    pub(super) fn reserve_snapshot_slot(
         &self,
         session_hash: u64,
         kv_cache: &mut PagedKvCache,
@@ -151,6 +160,33 @@ impl TransformerModel {
         // moment the NVIDIA arm captures h_state — the plan is correct, it is
         // the writer that is missing.
         if !cfg!(atlas_scale) {
+            return None;
+        }
+        // Aux-carrying models (PLE n-gram history, QSA indexer keys:
+        // Qwen3.8-Flash-Next) cannot use this capture at all. Their lexical
+        // state is position-exact only at a completed pass end, so a mid-pass
+        // capture is necessarily aux-less, and the restore gate declines
+        // aux-less slots (prefix_lookup.rs / prefill_a.rs). Worse, the
+        // `tb - bs` sibling is indexed under the SAME prefix key as
+        // `prefill_b_save_checkpoint`'s tail-split checkpoint, which DOES
+        // carry aux, so registering the sibling displaced and freed the one
+        // anchor the next turn could restore. Every warm turn then recomputed
+        // the whole prompt (winbox #149 replay, 2026-10-02: "Prefix cache hit:
+        // 20288 tokens ... but no SSM snapshot" on every turn, TTFT within
+        // 5-10% of no-cache). With the plan refused, the tail-split checkpoint
+        // at `tb - bs` is the anchor for both match points (`tb`, `tb - bs`),
+        // the same path non-`atlas_scale` builds (GB10, #69) already take.
+        // On atlas_scale the plan's `h_dsts`/`conv_dsts` exist — but only a
+        // GDN writer (`qwen3_ssm::trait_prefill_recur`) actually fills them.
+        // `nemotron_mamba2` never reads `ctx.midchunk_capture`, so on this SSM
+        // family the tail anchor at `tb` (and its `tb - bs` sibling) would be
+        // registered UNWRITTEN and every subsequent warm hit would resume
+        // from a zeroed/stale recurrent state — the same failure the
+        // cfg!(atlas_scale) guard above documented for the NVIDIA arm.
+        // Refuse unless the SSM family has the writer.
+        if self.requires_aux_state()
+            || !midchunk_capture_writer_exists(self.config.capabilities().ssm_architecture)
+        {
             return None;
         }
         // Reuse gate: capture costs a per-prefill kernel split + D2D copy and
@@ -311,6 +347,9 @@ impl TransformerModel {
             tb_early,
             h_dsts_early,
             conv_dsts_early,
+            ckpt: false,
+            extra: Vec::new(),
+            ckpt_points: Vec::new(),
         })
     }
 
@@ -328,8 +367,17 @@ impl TransformerModel {
         seq: &SequenceState,
         plan: &MidCapturePlan,
     ) {
+        // Register under the content key (`vision_cache`); a placeholder the
+        // key does not cover keeps the captures out of the index.
+        let Some(key) = self.pc_key(seq, tokens) else {
+            self.ssm_snapshots.free(plan.snap_slot);
+            if let Some(slot2) = plan.snap_slot_early {
+                self.ssm_snapshots.free(slot2);
+            }
+            return;
+        };
         for old in self.prefix_cache.insert_tail_snapshot(
-            &tokens[..plan.tb],
+            &key[..plan.tb],
             plan.snap_slot,
             seq.session_hash,
             seq.adapter_id,
@@ -349,7 +397,7 @@ impl TransformerModel {
             // the tail; must follow insert_tail_snapshot (its sweep clears the
             // session's previous tail + sibling).
             if let Some(old) = self.prefix_cache.insert_tail_sibling_snapshot(
-                &tokens[..tb_early],
+                &key[..tb_early],
                 slot2,
                 seq.session_hash,
                 seq.adapter_id,
@@ -362,5 +410,28 @@ impl TransformerModel {
                 slot2
             );
         }
+    }
+}
+
+/// Whether this SSM architecture has a mid-chunk capture WRITER: only the
+/// `qwen3_ssm` (GDN) prefill splits its recurrent/conv kernels at `cap_local`
+/// and fills `h_dsts`/`conv_dsts`. `nemotron_mamba2` (Mamba-2) never reads
+/// `ctx.midchunk_capture`; a model with no SSM has nothing to capture.
+pub(in crate::model) fn midchunk_capture_writer_exists(
+    arch: atlas_core::capabilities::SsmArchitecture,
+) -> bool {
+    matches!(arch, atlas_core::capabilities::SsmArchitecture::Gdn)
+}
+
+#[cfg(test)]
+mod midchunk_writer_tests {
+    use super::midchunk_capture_writer_exists;
+    use atlas_core::capabilities::SsmArchitecture;
+
+    #[test]
+    fn only_gdn_has_a_midchunk_writer() {
+        assert!(midchunk_capture_writer_exists(SsmArchitecture::Gdn));
+        assert!(!midchunk_capture_writer_exists(SsmArchitecture::Mamba2));
+        assert!(!midchunk_capture_writer_exists(SsmArchitecture::None));
     }
 }

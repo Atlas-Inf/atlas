@@ -7,6 +7,8 @@
 #   PORT=9000 MAX_SEQ_LEN=32768 ./serve-amd.sh
 #   DFLASH=1 DRAFT_MODEL=/path/to/dflash2 ./serve-amd.sh   # DFlash2 spec decode
 #   SSM_CKPT_INTERVAL=128 ./serve-amd.sh   # coarser SSM snapshots for long ctx
+#   THINKING=off ./serve-amd.sh            # engine thinking kill switch
+#   THINKING=on  ./serve-amd.sh            # thinking on by server default (per-request still wins)
 #
 # DFLASH=1 swaps MTP for the DFlash2 drafter: it appends --dflash
 # --draft-model (DRAFT_MODEL, default incoai/Qwen3.8-27B-DFlash2) and forces
@@ -155,6 +157,17 @@ SPEC_ARGS=()
 if [ "${NUM_DRAFTS:-3}" -gt 0 ]; then
   SPEC_ARGS=(--speculative --num-drafts "${NUM_DRAFTS:-3}")
 fi
+# THINKING=off pins the engine kill switch (--disable-thinking) for every
+# request; THINKING=on sets the SERVER default to thinking-enabled
+# (--default-chat-template-kwargs) while clients can still turn it off per
+# request. Unset/empty = unchanged.
+THINK_ARGS=()
+case "${THINKING:-}" in
+  off) THINK_ARGS=(--disable-thinking) ;;
+  on)  THINK_ARGS=(--default-chat-template-kwargs '{"enable_thinking":true}') ;;
+  "")  ;;
+  *)   echo "THINKING must be off|on, got '${THINKING}'" >&2; exit 2 ;;
+esac
 # DFlash and MTP --speculative are mutually exclusive on this recipe:
 # DFLASH=1 wins and forces the MTP args off.
 DFLASH_ARGS=()
@@ -187,13 +200,32 @@ echo "serving $MODEL on ${GFX:-AMD} via $HW"
 # resolve to the same thing, kept explicit so LM_HEAD stays a knob). For the
 # unsloth checkpoint use LM_HEAD=bf16 — its lm_head ships per-row FP8 and the
 # frozen accuracy recipe preserves it to BF16.
+# Flash-Next's FP8 GDN decode copy (the gfx1151 default since #275) costs
+# ~1.9 GB on top of the BF16 projections kept for prefill. At MAX_BATCH 1 that
+# is +17% decode for nothing; at MAX_BATCH 8 it left 0.1 GB of KV on a 96 GB
+# GPU and C4/C8 requests ran one at a time (framework f114). So above batch 1
+# the recipe keeps BF16 unless ATLAS_QWEN4EXP_FP8_GDN is set explicitly.
+if [ "${MAX_BATCH:-1}" -gt 1 ]; then
+  export ATLAS_QWEN4EXP_FP8_GDN="${ATLAS_QWEN4EXP_FP8_GDN:-0}"
+  # The qwen4_exp exact batching lane is what batches a Flash-Next multi-sequence
+  # decode step on gfx1151 (without it the mHC multi-seq paths run the MoE a row at
+  # a time). Framework f128/f132: C4 15.3 -> 24.3, C8 15.1 -> 27.9 tok/s (AR), C4
+  # 15.2 -> 25.6, C8 15.0 -> 27.3 (MTP). It also takes over the single-sequence MTP
+  # verify, which costs a lone request ~15% (f132: C1 MTP 20.6 -> 17.5), so the
+  # recipe turns it on only for multi-request serving. Explicit values win.
+  export ATLAS_QWEN4EXP_BATCH_FAST="${ATLAS_QWEN4EXP_BATCH_FAST:-1}"
+  # On top of the lane, the per-row MoE top-k / blend and the GDN decode chain as one launch per
+  # layer (qwen4exp_gdn_decode_fused_rows: the strix-hip port of the gb10 cluster kernel). Framework
+  # f160 (Flash-Next, AR, x2): C4 34.0 -> 35.9, C8 38.2 -> 40.0 tok/s; solo text identical 8/8.
+  export ATLAS_QWEN4EXP_BATCH_SMALL="${ATLAS_QWEN4EXP_BATCH_SMALL:-1}"
+fi
 exec "$BIN" serve "$MODEL" "${NAME_ARG[@]}" \
   --host "${HOST:-0.0.0.0}" --port "${PORT:-8081}" \
   --max-seq-len "$MAX_SEQ_LEN" \
   --max-prefill-tokens "$MAX_PREFILL_TOKENS" \
   --gpu-memory-utilization "$GPU_UTIL" \
   --kv-cache-dtype bf16 --lm-head-dtype "${LM_HEAD:-nvfp4}" --max-batch-size "${MAX_BATCH:-1}" \
-  "${SPEC_ARGS[@]}" "${DFLASH_ARGS[@]}" \
+  "${SPEC_ARGS[@]}" "${DFLASH_ARGS[@]}" "${THINK_ARGS[@]}" \
   --ssm-cache-slots "$SSM_SLOTS" --ssm-checkpoint-interval "$SSM_CKPT_INTERVAL" \
   $ALLOW_FALLBACKS \
   "$@"

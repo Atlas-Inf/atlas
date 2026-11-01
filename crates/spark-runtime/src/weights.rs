@@ -36,10 +36,18 @@ pub(crate) fn evict_page_cache(_file: &std::fs::File) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightDtype {
     BF16,
+    /// Raw IEEE-754 half precision, byte-identical on disk→GPU. Only produced
+    /// for EXL3 scale vectors (see `weights::name_utils::keeps_raw_f16`); all
+    /// other F16 checkpoints still convert to BF16 at upload.
+    FP16,
     FP32,
     FP8E4M3,
     FP8E8M0,
     UInt8,
+    /// EXL3 trellis tensors (safetensors I16).
+    Int16,
+    /// EXL3 `mul1` bookkeeping (safetensors I32).
+    Int32,
     Int64,
     /// Keep-packed PrismML ternary Q2_0 (ggml id 42): raw on-disk blocks stay
     /// 2-bit in VRAM (fp16 scale + 2-bit codes per group of `group` elements),
@@ -60,10 +68,13 @@ impl WeightDtype {
     pub fn byte_size(self) -> usize {
         match self {
             Self::BF16 => 2,
+            Self::FP16 => 2,
             Self::FP32 => 4,
             Self::FP8E4M3 => 1,
             Self::FP8E8M0 => 1,
             Self::UInt8 => 1,
+            Self::Int16 => 2,
+            Self::Int32 => 4,
             Self::Int64 => 8,
             Self::PackedQ2_0 { .. } => 0,
         }
@@ -72,6 +83,14 @@ impl WeightDtype {
     fn from_safetensors(dtype: safetensors::Dtype) -> Result<Self> {
         match dtype {
             safetensors::Dtype::BF16 => Ok(Self::BF16),
+            // F16 stays a caller decision: EXL3 scale vectors keep raw bytes
+            // (`keeps_raw_f16` → FP16), everything else converts to BF16.
+            safetensors::Dtype::I16 => Ok(Self::Int16),
+            safetensors::Dtype::I32 => Ok(Self::Int32),
+            // U32: raw 4-byte container. Only the CSF NVFP4 scale exception
+            // streams (`*.nvfp4_csf_exceptions`) use it, and the loader
+            // decodes those on the host; signedness is never interpreted.
+            safetensors::Dtype::U32 => Ok(Self::Int32),
             safetensors::Dtype::F32 => Ok(Self::FP32),
             safetensors::Dtype::U8 => Ok(Self::UInt8),
             // I8: raw 1-byte container for 4-bit-packed NVFP4 (DeepSeek-V4 MTP
@@ -93,6 +112,10 @@ impl WeightDtype {
         Ok(match s {
             "F32" => Self::FP32,
             "BF16" => Self::BF16,
+            "I16" => Self::Int16,
+            "I32" => Self::Int32,
+            // U32: raw 4-byte container, as on the disk path.
+            "U32" => Self::Int32,
             "U8" => Self::UInt8,
             // I8 is a 1-byte raw container (packed NVFP4); signedness is
             // irrelevant, treat as raw bytes exactly like the disk path.
@@ -100,6 +123,10 @@ impl WeightDtype {
             "F8_E4M3" => Self::FP8E4M3,
             "F8_E8M0" => Self::FP8E8M0,
             "I64" => Self::Int64,
+            // NOTE: "F16" deliberately stays an error here. The RDMA path has
+            // no raw-F16 support (peers stage BF16 only); EXL3's raw-F16 scale
+            // vectors never reach the wire, so the mapping must keep failing
+            // loudly rather than silently reinterpreting bytes.
             other => bail!("Unsupported safetensors dtype '{other}'"),
         })
     }
@@ -166,7 +193,7 @@ impl WeightTensor {
 
 /// All model weights loaded onto the GPU, keyed by HuggingFace name.
 pub struct WeightStore {
-    weights: HashMap<String, WeightTensor>,
+    pub(crate) weights: HashMap<String, WeightTensor>,
     /// Pointers freed early by [`WeightStore::reclaim`], recorded so
     /// `release` does not free them a second time.
     ///
@@ -280,6 +307,21 @@ impl WeightStore {
         gpu.free(t.ptr)
     }
 
+    /// Record tensors another owner has already freed, so `release` skips them.
+    ///
+    /// The unified MoE transpose frees each expert's original weights once its
+    /// K-major copy exists. Those originals are this store's tensors, so without
+    /// this `release` frees them again at teardown: ~147k `status 1` frees on
+    /// Flash-Next (#122). Pointers the store never held are harmless here.
+    pub fn mark_freed_elsewhere(&self, ptrs: &[DevicePtr]) -> Result<()> {
+        let mut seen = self
+            .reclaimed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("weight store reclaim set poisoned"))?;
+        seen.extend(ptrs.iter().filter(|p| !p.is_null()).map(|p| p.0));
+        Ok(())
+    }
+
     /// Bytes released so far by [`Self::reclaim`] — for the load-time memory trace.
     pub fn reclaimed_count(&self) -> usize {
         self.reclaimed.lock().map(|s| s.len()).unwrap_or(0)
@@ -345,6 +387,12 @@ pub struct SafetensorsLoader {
     pub ep_world_size: usize,
     /// Total number of MoE experts in the model (for EP partitioning).
     pub num_experts: usize,
+    /// Optional layer-name fragment whose expert tensors are loaded only on
+    /// EP rank 0, with all experts replicated there.
+    pub rank0_only_expert_prefix: Option<String>,
+    /// Optional layer-name fragment whose expert tensors bypass EP filtering
+    /// and are replicated on every rank.
+    pub replicated_expert_prefix: Option<String>,
     /// Override for the peak memory multiplier in the pre-flight OOM check.
     /// Set from QuantFormat::peak_memory_multiplier() in the caller.
     /// When None, the pre-flight uses its own heuristic (1.3x NVFP4 / 1.5x FP8).
@@ -370,6 +418,29 @@ pub struct SafetensorsLoader {
     /// OPT-IN: a model that DOES build an MTP head must keep them, so this is
     /// set only where `load_mtp_weights` is known to return `None`.
     pub skip_mtp: bool,
+    /// Exact tensor prefix of an unused appended predictor layer; default retains it.
+    pub skip_layer_prefix: Option<String>,
+    /// Skip any tensor whose name starts with one of these prefixes.
+    ///
+    /// Whole dead namespaces — e.g. a vision tower or an MTP head that a
+    /// text-only serve never reads (`nemotron_h_omni` ships ~4.5k such
+    /// tensors: `language_model.mtp.*`, `vision_model.*`, `mlp1.*`,
+    /// `vision_projector.*`). Same contract as `skip_mtp`: only populated
+    /// where the loader is known not to read them.
+    pub skip_prefixes: Vec<String>,
+    /// Pack every kept tensor in a shard into ONE `gpu.alloc` per shard,
+    /// each tensor at a 4096-byte-aligned interior offset. Per-tensor
+    /// cuMemAlloc rounds >=1 MB allocations to 2 MB pages: on NVFP4 MoE
+    /// checkpoints (~1024 packed+scale+scalar tensors per ~1.6 GB shard)
+    /// that waste is ~0.6 GB/shard — ~24 GB across 40 MoE shards on
+    /// Nemotron 3.5 Super VL, i.e. the whole KV budget.
+    ///
+    /// OPT-IN only, via the weight loader's `slab_pack_weights` policy —
+    /// callers must have audited that no `gpu.free` reachable on their
+    /// load path frees a store-owned tensor pointer (interior frees are
+    /// also harmless: the CUDA backend turns them into no-ops once the
+    /// slab is registered). Single-GPU only.
+    pub pack_slab: bool,
 }
 
 impl Default for SafetensorsLoader {
@@ -385,9 +456,14 @@ impl SafetensorsLoader {
             ep_rank: 0,
             ep_world_size: 1,
             num_experts: 0,
+            rank0_only_expert_prefix: None,
+            replicated_expert_prefix: None,
             peak_memory_multiplier: None,
             skip_activation_scales: false,
             skip_mtp: false,
+            skip_layer_prefix: None,
+            skip_prefixes: Vec::new(),
+            pack_slab: false,
         }
     }
 
@@ -397,45 +473,14 @@ impl SafetensorsLoader {
             ep_rank,
             ep_world_size,
             num_experts,
+            rank0_only_expert_prefix: None,
+            replicated_expert_prefix: None,
             peak_memory_multiplier: None,
             skip_activation_scales: false,
             skip_mtp: false,
-        }
-    }
-
-    /// Check if a tensor should be skipped under EP.
-    /// Skips `*.experts.{E}.*` tensors where E is not in local range.
-    /// MTP head experts are never skipped (small, fully replicated).
-    fn should_skip_tensor(&self, name: &str) -> bool {
-        // MTP head weights for a model whose loader does not build one.
-        if self.skip_mtp && name.starts_with("mtp.") {
-            return true;
-        }
-        // W4A4 activation scales: never read on the w4a16 path (the NVFP4
-        // loader falls back to `DevicePtr::NULL`), and 4-byte allocations are
-        // almost pure granule padding at expert scale.
-        if self.skip_activation_scales && name.ends_with(".input_scale") {
-            return true;
-        }
-        if self.ep_world_size <= 1 {
-            return false;
-        }
-        // MTP head experts are small — always replicate, never shard.
-        if name.starts_with("mtp.") {
-            return false;
-        }
-        // Parse expert index from patterns like "*.experts.42.gate_proj*"
-        if let Some(idx) = parse_expert_index(name) {
-            let per_rank = self.num_experts / self.ep_world_size;
-            let local_start = self.ep_rank * per_rank;
-            let local_end = if self.ep_rank == self.ep_world_size - 1 {
-                self.num_experts
-            } else {
-                local_start + per_rank
-            };
-            idx < local_start || idx >= local_end
-        } else {
-            false // Non-expert tensors are always loaded (replicated)
+            skip_layer_prefix: None,
+            skip_prefixes: Vec::new(),
+            pack_slab: false,
         }
     }
 }
@@ -458,13 +503,32 @@ pub(crate) use loader::check_oom_guard;
 #[cfg(unix)]
 pub(crate) use loader::estimate_has_fp8;
 
-mod name_utils;
-pub(crate) use name_utils::split_trailing_index;
-pub use name_utils::{is_ngram_table, parse_expert_index};
+#[cfg(test)]
+#[path = "weights/appended_skip_tests.rs"]
+mod appended_skip_tests;
 
+#[cfg(test)]
+mod expert_filter_tests;
+
+#[cfg(test)]
+mod from_str_tests;
+mod name_utils;
+mod side_files;
+mod store_edit;
+pub(crate) use name_utils::keeps_raw_f16;
+pub(crate) use name_utils::split_trailing_index;
+pub use name_utils::{is_csf_stream, is_ngram_table, parse_expert_index};
+pub(crate) use side_files::merge_exl3_side_files;
+
+#[cfg(test)]
+mod exl3_dtype_tests;
 #[cfg(test)]
 mod packed_q2_tests;
 mod prefix_detect;
+mod skip;
+#[cfg(test)]
+#[path = "weights/store_edit_tests.rs"]
+mod store_edit_tests;
 pub use prefix_detect::auto_detect_weight_prefix;
 
 /// Release every weight tensor.
@@ -504,5 +568,59 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for WeightStore {
     }
 }
 
+/// Byte layout for a packed slab: one device allocation per safetensors
+/// shard, each tensor at a 4096-byte-aligned interior offset. The CUDA
+/// driver's cuMemAlloc rounds ≥1 MB requests to 2 MB granularity, so a
+/// shard of ~4100 small NVFP4 MoE tensors (~1.6 GB of data) costs ~2.2 GB
+/// unpacked — this layout keeps it at the true size plus ≤4 KB of padding
+/// per tensor.
+///
+/// Returns `(offsets, total_bytes)`.
+///
+/// Offset 0 is RESERVED — the first tensor starts one alignment block in.
+/// Store-tensor frees go through `WeightStore::reclaim` mid-load
+/// (`nvfp4_detect` frees FP8 sources after NVFP4 conversion); a tensor at
+/// offset 0 would alias the slab base and its free would cuMemFree the
+/// whole slab. With the reservation, every tensor pointer is strictly
+/// interior, and the backend turns those frees into no-ops.
+pub fn slab_layout(lens: impl Iterator<Item = usize>) -> (Vec<usize>, usize) {
+    const ALIGN: usize = 4096;
+    let mut offsets = Vec::new();
+    let mut cursor = ALIGN; // offset 0 reserved: never alias the slab base
+    for len in lens {
+        offsets.push(cursor);
+        cursor += len.next_multiple_of(ALIGN);
+    }
+    if offsets.is_empty() {
+        return (offsets, 0); // empty shard: no alloc, no region registration
+    }
+    (offsets, cursor)
+}
+
 #[cfg(test)]
 mod teardown_tests;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn slab_layout_aligns_each_tensor_to_4k() {
+        // Offset 0 is reserved so no tensor pointer can alias the slab base —
+        // `WeightStore::reclaim` on an offset-0 tensor would otherwise free
+        // the entire slab mid-load.
+        let (offsets, total) = super::slab_layout([1, 4096, 4097, 5].into_iter());
+        assert_eq!(offsets, vec![4096, 8192, 12288, 20480]);
+        assert_eq!(total, 24576);
+    }
+
+    #[test]
+    fn slab_layout_empty_shard_is_zero() {
+        let (offsets, total) = super::slab_layout(std::iter::empty());
+        assert!(offsets.is_empty() && total == 0);
+    }
+
+    #[test]
+    fn slab_layout_offset_zero_is_reserved() {
+        let (offsets, _) = super::slab_layout([7].into_iter());
+        assert!(offsets[0] >= 4096, "no tensor may alias the slab base");
+    }
+}

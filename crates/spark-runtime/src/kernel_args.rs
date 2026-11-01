@@ -119,16 +119,24 @@ impl<'a> KernelLaunch<'a> {
     /// parameter buffer, so the bytes must land in `ceil(128/8) = 16`
     /// CONSECUTIVE slots contributing ONE param entry. See
     /// `gpu::pack_kernel_args`, and `a_128_byte_arg_is_not_truncated`.
-    pub fn arg_tensormap(mut self, map: &[u8; 128]) -> Self {
-        let slot = self.storage.len() as u32;
-        for c in map.chunks(8) {
-            let mut w = [0u8; 8];
-            w.copy_from_slice(c);
-            self.storage.push(u64::from_le_bytes(w));
+    pub fn arg_tensormap(self, map: &[u8; 128]) -> Self {
+        let mut words = [0u64; 16];
+        for (w, c) in words.iter_mut().zip(map.chunks(8)) {
+            *w = u64::from_le_bytes(c.try_into().expect("8-byte chunk"));
         }
+        self.arg_words(&words)
+    }
+
+    /// Add a by-value struct of 8-byte words (a kernel parameter declared as
+    /// a struct, e.g. a `__grid_constant__` table of pointers): ONE parameter
+    /// entry whose bytes fill `words.len()` CONSECUTIVE slots, as
+    /// [`Self::arg_tensormap`] lays out a descriptor.
+    pub fn arg_words(mut self, words: &[u64]) -> Self {
+        let slot = self.storage.len() as u32;
+        self.storage.extend_from_slice(words);
         self.kinds.push(ArgKind {
             is_buffer: false,
-            byte_len: 128,
+            byte_len: u16::try_from(words.len() * 8).expect("kernel struct argument over 64 KiB"),
             slot,
         });
         self

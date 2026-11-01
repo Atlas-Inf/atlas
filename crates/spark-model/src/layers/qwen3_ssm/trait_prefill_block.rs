@@ -28,22 +28,18 @@
 
 // Same glob the sibling prefill files use — this body was moved verbatim out
 // of `trait_prefill.rs` and resolves the same names it always did.
+use super::trait_prefill_multi::ssm_state_of;
 use super::*;
 
 impl Qwen3SsmLayer {
-    /// Steps 2-10: QKVZ projection, conv1d, gates, the delta-rule recurrence,
-    /// the gated norm, and `out_proj`. Returns the buffer holding
-    /// `out_proj`'s output.
-    ///
-    /// `ssm_layer_idx` is passed in rather than re-fetched: it comes from a
-    /// global call counter that must be bumped exactly once per layer per
-    /// prefill, and both entry paths bump it before calling here.
+    /// [`Self::prefill_block`] over sequences' rows `(row0, rows, state)`
+    /// (`ATLAS_QWEN4EXP_PREFILL_MULTI`): conv and recurrence per sequence.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn prefill_block(
+    pub(super) fn prefill_block_segs(
         &self,
         normed: DevicePtr,
         num_tokens: usize,
-        state: &mut dyn LayerState,
+        segs: &mut [(usize, usize, &mut dyn LayerState)],
         ssm_layer_idx: usize,
         ctx: &ForwardContext,
         stream: u64,
@@ -55,10 +51,10 @@ impl Qwen3SsmLayer {
         #[allow(unused_variables)]
         let fp32 = 4usize;
 
-        let ssm_state = state
-            .as_any_mut()
-            .downcast_mut::<SsmLayerState>()
-            .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState"))?;
+        anyhow::ensure!(
+            segs.len() == 1 || ctx.midchunk_capture.is_none(),
+            "a multi-sequence GDN prefill takes no mid-chunk capture"
+        );
 
         let nk = ctx.config.linear_num_key_heads;
         let kd = ctx.config.linear_key_head_dim;
@@ -150,14 +146,7 @@ impl Qwen3SsmLayer {
         let ba_size = ctx.config.ssm_ba_size(); // 64
         let gates_buf = ctx.buffers.ssm_gates();
         let gate_stride = nv * 2; // FP32 elements per token
-        ops::dense_gemm_ba_gates_prefill(
-            ctx.gpu,
-            self.ba_gates_prefill_k,
-            normed,
-            &self.ssm.in_proj_ba,
-            self.ssm.a_log.weight,
-            self.ssm.dt_bias.weight,
-            gates_buf,
+        let dims = [
             k,
             ba_size as u32,
             h as u32,
@@ -165,8 +154,34 @@ impl Qwen3SsmLayer {
             gate_stride as u32,
             nv as u32,
             vpg as u32,
-            stream,
-        )?;
+        ];
+        let ptrs = [
+            normed,
+            self.ssm.in_proj_ba.weight,
+            self.ssm.a_log.weight,
+            self.ssm.dt_bias.weight,
+            gates_buf,
+        ];
+        // ATLAS_QWEN4EXP_PREFILL_BA_ROWS: the same bytes, two tokens a CTA.
+        if !ops::qwen4exp_prefill::try_ba_gates_rows(ctx.gpu, ptrs, dims, stream)? {
+            ops::dense_gemm_ba_gates_prefill(
+                ctx.gpu,
+                self.ba_gates_prefill_k,
+                normed,
+                &self.ssm.in_proj_ba,
+                self.ssm.a_log.weight,
+                self.ssm.dt_bias.weight,
+                gates_buf,
+                k,
+                ba_size as u32,
+                h as u32,
+                h as u32,
+                gate_stride as u32,
+                nv as u32,
+                vpg as u32,
+                stream,
+            )?;
+        }
         // Bisect tap: the gates as the recurrence will read them,
         // [g(nv), beta(nv)] FP32 per token. Everything upstream of the
         // recurrence except these is already verified, so this is the last
@@ -203,18 +218,25 @@ impl Qwen3SsmLayer {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         });
         // Conv1d — optionally split at cap_local, capturing conv_state @ tb.
-        self.conv1d_prefill_capture(
-            ctx,
-            ssm_state.conv_state,
-            deinterleaved,
-            conv_out_buf,
-            conv_dim,
-            d_conv,
-            k,
-            qkvz_size,
-            midcap_idx,
-            stream,
-        )?;
+        // One launch a sequence, on its own conv state.
+        for (row0, rows, state) in segs.iter_mut() {
+            let ssm_state = ssm_state_of(&mut **state)?;
+            self.conv1d_prefill_capture(
+                ctx,
+                ssm_state.conv_state,
+                deinterleaved.offset(*row0 * qkvz_size * bf16),
+                conv_out_buf.offset(*row0 * conv_dim * bf16),
+                conv_dim,
+                d_conv,
+                *rows as u32,
+                qkvz_size,
+                midcap_idx,
+                stream,
+            )?;
+        }
+        let det = crate::det_trace::on_stream(ctx.gpu, stream);
+        det.tap("x_qkvz", deinterleaved, (0, num_tokens), qkvz_size * bf16);
+        det.tap("x_conv", conv_out_buf, (0, num_tokens), conv_dim * bf16);
         // Bisect tap. The projection matches (cos 0.999998) and
         // `pre_out_proj` does not (cos 0.801), so the fault is conv / gates /
         // recurrence / gated-norm. The gates are COMPUTED above but not
@@ -297,23 +319,28 @@ impl Qwen3SsmLayer {
 
         // Recurrence kernel dispatch hoisted to trait_prefill_recur.rs to
         // keep this file under the 500 LoC cap; behavior identical.
-        self.prefill_gdn_recurrence_staged(
-            ssm_state,
-            q_ptr,
-            k_ptr,
-            v_ptr,
-            gates_buf,
-            gdn_out_buf,
-            k,
-            nk,
-            nv,
-            kd,
-            vd,
-            conv_dim,
-            midcap_idx,
-            ctx,
-            stream,
-        )?;
+        // One recurrence a sequence, from its own state.
+        for (row0, rows, state) in segs.iter_mut() {
+            let ssm_state = ssm_state_of(&mut **state)?;
+            let qkv_off = *row0 * conv_dim * bf16;
+            self.prefill_gdn_recurrence_staged(
+                ssm_state,
+                q_ptr.offset(qkv_off),
+                k_ptr.offset(qkv_off),
+                v_ptr.offset(qkv_off),
+                gates_buf.offset(*row0 * gate_stride * fp32),
+                gdn_out_buf.offset(*row0 * value_dim * bf16),
+                *rows as u32,
+                nk,
+                nv,
+                kd,
+                vd,
+                conv_dim,
+                midcap_idx,
+                ctx,
+                stream,
+            )?;
+        }
 
         // Bisect tap: the RAW recurrence output, before the gated norm.
         //
@@ -353,7 +380,7 @@ impl Qwen3SsmLayer {
         } else {
             None
         };
-
+        det.tap("x_core", gdn_out_buf, (0, num_tokens), value_dim * bf16);
         // ── 9. Gated RMS norm (batched: all tokens × heads in one launch) ──
         let normed_out_buf = conv_out_buf;
         let z_base = deinterleaved.offset((key_dim * 2 + value_dim) * bf16);
@@ -406,10 +433,29 @@ impl Qwen3SsmLayer {
 
         // ── 10. Output projection GEMM: [N, 4096] × [4096, 2048] → [N, 2048] ──
         let out_proj_buf = ctx.buffers.moe_output();
-        self.prefill_out_proj_dispatch(ctx, normed_out_buf, out_proj_buf, k, h, value_dim, stream)?;
-        // GDN HeadParallel: reduce the row-parallel partial out_proj across TP
-        // ranks (num_tokens × h BF16) before the residual add. No-op at tp=1.
-        self.ssm_tp_all_reduce(out_proj_buf, num_tokens, ctx, stream)?;
+        // ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE: under SP, out_proj by row
+        // ranges, the peer's window first, its reduce-scatter on the wire
+        // while the rest is projected (`layers::qwen4exp_sp_pipe`).
+        if !self.out_proj_reduce_scatter_piped(
+            ctx,
+            normed_out_buf,
+            out_proj_buf,
+            [num_tokens, value_dim],
+            stream,
+        )? {
+            self.prefill_out_proj_dispatch(
+                ctx,
+                normed_out_buf,
+                out_proj_buf,
+                k,
+                h,
+                value_dim,
+                stream,
+            )?;
+            // GDN HeadParallel: reduce the row-parallel partial out_proj across TP
+            // ranks (num_tokens × h BF16) before the residual add. No-op at tp=1.
+            self.ssm_tp_all_reduce(out_proj_buf, num_tokens, ctx, stream)?;
+        }
         // ATLAS_GDN_DUMP hook: SSM out_proj output — drift attribution.
         super::debug::maybe_dump_gdn_buf(
             ctx.gpu,

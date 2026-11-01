@@ -8,7 +8,7 @@
 
 use super::*;
 
-fn have_ffmpeg() -> bool {
+pub(super) fn have_ffmpeg() -> bool {
     matches!(probe(&enabled()), Availability::Ready(_))
 }
 
@@ -20,7 +20,7 @@ fn enabled() -> FfmpegPolicy {
 }
 
 /// Encode a short clip and hand back the container bytes.
-fn make_mp4(seconds: u32, fps: u32, size: &str, codec: &str) -> Option<Vec<u8>> {
+pub(super) fn make_mp4(seconds: u32, fps: u32, size: &str, codec: &str) -> Option<Vec<u8>> {
     // Unique per CALL, not per parameter set. Keying the directory on
     // (pid, seconds, fps, codec) collided between tests that differ only in
     // frame size, and since each call ends by removing its directory, one
@@ -126,21 +126,17 @@ fn a_missing_binary_fails_the_decode_by_name() {
 // ── real decoding ────────────────────────────────────────────────────────
 
 #[test]
-fn an_h264_mp4_decodes_to_frames_at_the_requested_rate() {
+fn an_h264_mp4_preserves_every_frame_when_the_cap_can_hold_the_clip() {
     if !have_ffmpeg() {
         eprintln!("skipping: no ffmpeg");
         return;
     }
     let mp4 = make_mp4(3, 10, "320x240", "libx264").expect("encode");
     let frames = decode_frames(&mp4, 2.0, &enabled()).expect("decode");
-    // 3 s at 2 fps. ffmpeg's fps filter can emit an extra boundary frame, so
-    // the assertion is a band rather than an exact count — pinning it exactly
-    // would make the test hostage to a filter-timing detail.
-    assert!(
-        (5..=7).contains(&frames.len()),
-        "expected ~6 frames, got {}",
-        frames.len()
-    );
+    // The clip has only 30 source frames, so the cap can hold every one. The
+    // decoder preserves that source timeline even though the requested rate
+    // is lower; dropping frames is needed only once the cap is exceeded.
+    assert_eq!(frames.len(), 30);
     assert_eq!(frames[0].dimensions(), (320, 240));
 }
 
@@ -151,8 +147,12 @@ fn the_requested_rate_actually_changes_the_frame_count() {
         return;
     }
     let mp4 = make_mp4(4, 10, "160x120", "libx264").expect("encode");
-    let slow = decode_frames(&mp4, 1.0, &enabled()).expect("1 fps");
-    let fast = decode_frames(&mp4, 4.0, &enabled()).expect("4 fps");
+    let policy = FfmpegPolicy {
+        max_frames: 8,
+        ..enabled()
+    };
+    let slow = decode_frames(&mp4, 1.0, &policy).expect("1 fps");
+    let fast = decode_frames(&mp4, 4.0, &policy).expect("4 fps");
     assert!(
         fast.len() > slow.len(),
         "4 fps gave {} frames, 1 fps gave {}",
@@ -194,6 +194,115 @@ fn the_frame_cap_is_honoured() {
     };
     let frames = decode_frames(&mp4, 10.0, &p).expect("decode");
     assert_eq!(frames.len(), 3);
+}
+
+#[test]
+fn decoded_frames_are_area_bounded_without_enlarging_or_distorting_them() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: no ffmpeg");
+        return;
+    }
+    const MAX_AREA: usize = 640 * 640;
+    let cases = [
+        ("1920x1080", 16.0 / 9.0, None),
+        ("3840x2160", 16.0 / 9.0, None),
+        ("2048x256", 8.0, None),
+        ("320x240", 4.0 / 3.0, Some((320, 240))),
+    ];
+    let policy = FfmpegPolicy {
+        max_decoded_pixels: MAX_AREA,
+        ..enabled()
+    };
+    for (size, expected_aspect, expected_dimensions) in cases {
+        let mp4 = make_mp4(1, 1, size, "libx264").expect("encode");
+        let frames = decode_frames(&mp4, 1.0, &policy).expect("decode");
+        assert_eq!(frames.len(), 1, "{size}");
+        let (width, height) = frames[0].dimensions();
+        let area = width as usize * height as usize;
+        assert!(
+            area <= MAX_AREA,
+            "{size} became {width}x{height} ({area} pixels), over {MAX_AREA}"
+        );
+        let aspect = width as f32 / height as f32;
+        assert!(
+            (aspect - expected_aspect).abs() < 0.02,
+            "{size} changed aspect ratio from {expected_aspect:.4} to {aspect:.4}"
+        );
+        if let Some(expected) = expected_dimensions {
+            assert_eq!(
+                (width, height),
+                expected,
+                "small frames must stay native-sized"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_capped_clip_selects_actual_frames_at_the_tail() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: no ffmpeg");
+        return;
+    }
+    // 20 seconds at 10 fps, reduced to four samples. The old `fps=2` plus
+    // `-frames:v 4` path returned only the first two seconds; the timestamp
+    // selector must reach the final scene and report the PTS of each frame it
+    // actually decoded.
+    let mp4 = make_mp4(20, 10, "160x120", "libx264").expect("encode");
+    let policy = FfmpegPolicy {
+        max_frames: 4,
+        ..enabled()
+    };
+    let (frames, times) = decode_with_plan(&mp4, 2.0, &policy).expect("decode");
+    assert_eq!(frames.len(), 4);
+    assert_eq!(times.len(), frames.len());
+    assert!(times[0] < 0.2, "first selected PTS was {:?}", times);
+    assert!(
+        times[1] > 5.0,
+        "middle samples missed the span: {:?}",
+        times
+    );
+    assert!(
+        times[2] > 11.0,
+        "middle samples missed the span: {:?}",
+        times
+    );
+    assert!(
+        times[3] > 19.0,
+        "the capped decode did not reach its late frame: {:?}",
+        times
+    );
+    assert!(times.windows(2).all(|pair| pair[1] > pair[0]), "{times:?}");
+}
+
+#[test]
+fn a_128_frame_plan_keeps_the_late_tail_without_recursive_filter_depth() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: no ffmpeg");
+        return;
+    }
+    // This is deliberately just above the 128-frame cap: it exercises every
+    // term in the flat timestamp selector and proves the tail survives the
+    // bounded decode, rather than only testing a tiny four-frame plan.
+    let mp4 = make_mp4(70, 2, "64x48", "libx264").expect("encode");
+    let policy = FfmpegPolicy {
+        max_frames: 128,
+        ..enabled()
+    };
+    let (frames, times) = decode_with_plan(&mp4, 2.0, &policy).expect("decode");
+    assert_eq!(frames.len(), 128);
+    assert_eq!(times.len(), frames.len());
+    assert!(
+        times[64] > 34.0,
+        "middle samples missed the span: {:?}",
+        times
+    );
+    assert!(
+        times[127] > 68.0,
+        "the 128-frame decode did not reach its late tail: {:?}",
+        times
+    );
+    assert!(times.windows(2).all(|pair| pair[1] > pair[0]), "{times:?}");
 }
 
 #[test]
@@ -247,7 +356,7 @@ fn an_hevc_clip_decodes_too_when_the_encoder_is_available() {
 #[test]
 fn an_empty_stream_splits_to_nothing() {
     assert!(
-        split_png_stream(b"")
+        super::split_png_stream(b"")
             .expect("empty is not an error")
             .is_empty()
     );
@@ -264,7 +373,91 @@ fn a_stream_of_two_pngs_splits_into_two_frames() {
             .expect("encode");
         buf.extend_from_slice(&one);
     }
-    let frames = split_png_stream(&buf).expect("split");
+    let frames = super::split_png_stream(&buf).expect("split");
     assert_eq!(frames.len(), 2);
     assert_eq!(frames[0].dimensions(), (4, 3));
+}
+
+// ── frames by index (GLM-5.3's sampler) ──────────────────────────────────
+
+// ── issue #239: MP4 with moov at the END (no +faststart) ─────────────────
+// `pipe:0` was not seekable, so an MP4 whose moov box follows the media data
+// could not be probed or decoded. `input::SeekableInput` makes the input a
+// private seekable file removed on drop. This MP4 uses ffmpeg's default
+// layout (moov at end) and must decode identically to a faststart one.
+
+fn make_mp4_at(
+    seconds: u32,
+    fps: u32,
+    size: &str,
+    codec: &str,
+    faststart: bool,
+) -> Option<Vec<u8>> {
+    static SEQ2: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SEQ2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "atlas-vid-moov-{}-{n}-{faststart}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).ok()?;
+    let out = dir.join("clip.mp4");
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-y",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("testsrc=size={size}:rate={fps}:duration={seconds}"),
+        "-c:v",
+        codec,
+        "-pix_fmt",
+        "yuv420p",
+    ]);
+    if faststart {
+        cmd.args(["-movflags", "+faststart"]);
+    }
+    cmd.arg(&out).stdout(Stdio::null()).stderr(Stdio::null());
+    if !cmd.status().ok()?.success() {
+        return None;
+    }
+    std::fs::read(&out).ok()
+}
+
+#[test]
+fn a_moov_at_end_mp4_probes_and_decodes() {
+    if !have_ffmpeg() {
+        return;
+    }
+    let clip = make_mp4_at(2, 8, "64x64", "libx264", false).expect("generate MP4");
+    let policy = super::FfmpegPolicy::default();
+    let timing = super::probe::probe_duration(&clip, &policy).expect("moov-at-end probe");
+    assert!(
+        (timing.duration_secs - 2.0).abs() < 0.2,
+        "duration should be ~2s, got {}",
+        timing.duration_secs
+    );
+    let frames = super::decode_frames(&clip, 2.0, &policy).expect("moov-at-end decode");
+    assert!(
+        !frames.is_empty(),
+        "moov-at-end clip should decode to frames"
+    );
+}
+
+#[test]
+fn a_faststart_mp4_probes_and_decodes() {
+    if !have_ffmpeg() {
+        return;
+    }
+    let clip = make_mp4_at(2, 8, "64x64", "libx264", true).expect("generate MP4");
+    let policy = super::FfmpegPolicy::default();
+    let timing = super::probe::probe_duration(&clip, &policy).expect("faststart probe");
+    assert!(
+        (timing.duration_secs - 2.0).abs() < 0.2,
+        "duration should be ~2s, got {}",
+        timing.duration_secs
+    );
+    let frames = super::decode_frames(&clip, 2.0, &policy).expect("faststart decode");
+    assert!(!frames.is_empty(), "faststart clip should decode to frames");
 }

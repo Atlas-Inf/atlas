@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas 5eeeb1a (AGPL-3.0-only, sparkqwen queued-first-chunk series).
 
 //! Scheduler levers, resolved once per run and then carried.
 //!
@@ -36,6 +37,13 @@ pub struct SchedLevers {
     /// Run the full sample pipeline during MTP verify. Ships ON;
     /// `ATLAS_NO_MTP_VERIFY_SAMPLE=1` opts out.
     pub mtp_verify_sample: bool,
+    /// `ATLAS_PREFILL_SRPT=1`: a new multi-chunk prefill joins the queue by
+    /// tokens left (shortest first) instead of by arrival.
+    pub prefill_srpt: bool,
+    /// `ATLAS_PREFILL_QUEUE_FIRST_CHUNK=1` (multi-rank worlds): a new prompt
+    /// admitted behind a prefill in flight waits in the queue for its first
+    /// chunk instead of running it at admission (`phase_start_prefills::queue_first`).
+    pub prefill_queue_first_chunk: bool,
 
     // ── DFlash speculation ──
     pub dflash_masked_verify: bool,
@@ -44,6 +52,12 @@ pub struct SchedLevers {
     pub dflash_serial_append: bool,
     pub dflash_unified_ctx: bool,
     pub dflash_spec_think: bool,
+    /// `ATLAS_GLM_STRICT_SPEC=1`: strict structured-output sequences keep
+    /// DFlash speculation, every verify row grammar-masked at its own position
+    /// (`scheduler::strict_spec`). Off: they decode serially. As for any
+    /// DFlash verify, the verified positions are greedy: the request's
+    /// temperature, top_p/top_k/min_p and penalties do not apply there.
+    pub glm_strict_spec: bool,
     /// Mean accepted drafts below which adaptive speculation suspends.
     pub dflash_adaptive_min: f32,
     /// Serially-decoded tokens between adaptive re-probes.
@@ -67,6 +81,15 @@ pub struct SchedLevers {
     pub decode_timing: bool,
     pub mtp_timing: bool,
     pub mtp_gate_force: bool,
+    /// Per-request K=3/K=5 selection for low-concurrency MTP.
+    pub mtp_single_depth_adapt: bool,
+    /// Per-request deep MTP draft ceiling (`ATLAS_MTP_DYNAMIC_DEPTH=1`,
+    /// `mtp_deep_depth`).
+    pub mtp_dynamic_depth: bool,
+    /// `ATLAS_QWEN_COPY_DRAFTS=1`: prompt/reply copies in place of the MTP
+    /// head's propose where every verify row is serial decode's
+    /// (`copy_drafts::mtp`).
+    pub qwen_copy_drafts: bool,
     pub adadec_diagnostic: bool,
 
     /// Loop watchdog. **Runtime-mutable** — the TUI ops REPL toggles it while
@@ -139,13 +162,18 @@ impl SchedLevers {
             force_temp_zero: opt_in("ATLAS_FORCE_TEMP_ZERO"),
             mtp_minp: on_unless("ATLAS_NO_MTP_MINP"),
             mtp_verify_sample: on_unless("ATLAS_NO_MTP_VERIFY_SAMPLE"),
+            prefill_srpt: opt_in("ATLAS_PREFILL_SRPT"),
+            prefill_queue_first_chunk: opt_in("ATLAS_PREFILL_QUEUE_FIRST_CHUNK"),
 
             dflash_masked_verify: opt_in("ATLAS_DFLASH_MASKED_VERIFY"),
             dflash_seam_serial: opt_in("ATLAS_DFLASH_SEAM_SERIAL"),
             dflash_adaptive: opt_in("ATLAS_DFLASH_ADAPTIVE"),
             dflash_serial_append: opt_in("ATLAS_DFLASH_SERIAL_APPEND"),
             dflash_unified_ctx: on_unless("ATLAS_NO_DFLASH_UNIFIED_CTX"),
-            dflash_spec_think: opt_in("ATLAS_DFLASH_SPEC_THINK"),
+            // The policy applies to every MTP proposer. Keep the old DFlash
+            // spelling as a compatibility alias for existing deployments.
+            dflash_spec_think: opt_in("ATLAS_MTP_SPEC_THINK") || opt_in("ATLAS_DFLASH_SPEC_THINK"),
+            glm_strict_spec: opt_in("ATLAS_GLM_STRICT_SPEC"),
             dflash_adaptive_min: num("ATLAS_DFLASH_ADAPTIVE_MIN", 2.0),
             dflash_adaptive_reprobe: num("ATLAS_DFLASH_ADAPTIVE_REPROBE", 256),
             dflash_resume_guard: num("ATLAS_DFLASH_RESUME_GUARD", 0),
@@ -168,6 +196,9 @@ impl SchedLevers {
             // `--mtp-gate force` is the configured spelling; the env var is
             // the fallback for scripts that predate the flag.
             mtp_gate_force: mtp_gate_force(),
+            mtp_single_depth_adapt: opt_in("ATLAS_MTP_SINGLE_DEPTH_ADAPT"),
+            mtp_dynamic_depth: spark_model::speculative::deep_depth::enabled(),
+            qwen_copy_drafts: opt_in("ATLAS_QWEN_COPY_DRAFTS"),
             adadec_diagnostic: present("ATLAS_ADADEC_DIAGNOSTIC"),
 
             loop_watchdog: AtomicBool::new(false),
@@ -184,12 +215,15 @@ impl SchedLevers {
             force_temp_zero: false,
             mtp_minp: true,
             mtp_verify_sample: true,
+            prefill_srpt: false,
+            prefill_queue_first_chunk: false,
             dflash_masked_verify: false,
             dflash_seam_serial: false,
             dflash_adaptive: false,
             dflash_serial_append: false,
             dflash_unified_ctx: false,
             dflash_spec_think: false,
+            glm_strict_spec: false,
             dflash_adaptive_min: 2.0,
             dflash_adaptive_reprobe: 256,
             dflash_resume_guard: 0,
@@ -200,8 +234,19 @@ impl SchedLevers {
             decode_timing: false,
             mtp_timing: false,
             mtp_gate_force: false,
+            mtp_single_depth_adapt: false,
+            mtp_dynamic_depth: false,
+            qwen_copy_drafts: false,
             adadec_diagnostic: false,
             loop_watchdog: AtomicBool::new(false),
+        }
+    }
+
+    /// The per-request depth controllers' levers.
+    pub fn depth(&self) -> crate::scheduler::mtp_deep_depth::DepthLevers {
+        crate::scheduler::mtp_deep_depth::DepthLevers {
+            adapt: self.mtp_single_depth_adapt,
+            deep: self.mtp_dynamic_depth,
         }
     }
 
@@ -260,7 +305,12 @@ mod tests {
         assert!(!d.force_temp_zero);
         assert!(!d.dflash_masked_verify && !d.dflash_adaptive && !d.dflash_spec_think);
         assert!(!d.disable_watchdogs);
-        assert!(!d.decode_timing && !d.mtp_timing && !d.adadec_diagnostic);
+        assert!(
+            !d.decode_timing && !d.mtp_timing && !d.mtp_single_depth_adapt && !d.adadec_diagnostic
+        );
+        assert!(!d.mtp_dynamic_depth);
+        assert!(!d.prefill_srpt && !d.prefill_queue_first_chunk);
+        assert!(!d.qwen_copy_drafts);
     }
 
     #[test]

@@ -25,26 +25,46 @@
 //!
 //! - **No shell.** Arguments are passed as argv. Nothing is interpolated into
 //!   a command string, so no input can become a flag or a second command.
-//! - **No temp file.** The container goes in over stdin, so there is no path
-//!   to traverse, collide on, or leave behind.
-//! - **`-nostdin`, and stdin is the pipe** — ffmpeg cannot reach for a
-//!   terminal or block waiting on one.
+//! - **Private seekable input.** A uniquely created, owner-only temporary file
+//!   supports tail-index containers and is removed when decoding ends.
+//! - **`-nostdin`** prevents ffmpeg from waiting on a terminal.
 //! - **Frame count** capped with `-frames:v`, so a long clip cannot decode
-//!   forever.
+//!   forever — but the cap is applied to a plan that SPANS the clip
+//!   ([`crate::video_sample`]) rather than to a fixed-rate walk that would
+//!   stop `max_frames / fps` seconds in. See [`decode_frames`].
+//! - **Duration probed first**, with ffprobe, because a plan that covers the
+//!   whole clip has to know where the clip ends. A duration that cannot be
+//!   determined is an ERROR, never a silent fallback to the first frames.
+//! - **Decoded pixel memory** bounded by scaling each frame before it is read
+//!   back: the PNG-size cap bounds what is READ from the pipe, not what the
+//!   returned `Vec<RgbImage>` holds once it is parsed.
 //! - **Output size** capped while reading, and the child is killed the moment
 //!   the cap is passed.
 //! - **Wall clock** capped by a watchdog that kills the child; a decoder that
 //!   hangs must not hold a request thread indefinitely.
 //! - **Protocol whitelist** is moot because the input is a pipe, but
-//!   `-f image2pipe` output and a `pipe:0` input mean ffmpeg is never asked
+//!   `-f image2pipe` output and a seekable private temp input mean ffmpeg is never asked
 //!   to open a URL — the SSRF path that `remote_image` guards for stills
 //!   simply does not exist here.
 
 use anyhow::{Context, Result, bail, ensure};
 use image::RgbImage;
-use std::io::{Read, Write};
+use std::io::Read;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+
+use crate::video_sample::{sample_plan, wanted_frames};
+
+mod probe;
+mod scale;
+mod timestamps;
+use probe::probe_duration;
+use scale::decoded_scale_filter;
+mod input;
+mod png_stream;
+use png_stream::decoded_frame_budget;
+use timestamps::parse_showinfo_timestamps;
 
 /// Operator policy for subprocess decoding.
 #[derive(Debug, Clone)]
@@ -53,21 +73,48 @@ pub struct FfmpegPolicy {
     /// Binary to run. A name is resolved on PATH; an absolute path is used
     /// as given, so a deployment can pin a known build.
     pub binary: String,
+    /// ffprobe binary, used to determine the clip's duration. Defaults to
+    /// `ffprobe`, which ships with ffmpeg; when that is not on PATH a sibling
+    /// of [`Self::binary`] named `ffprobe` is tried before giving up.
+    pub probe_binary: String,
     pub max_frames: usize,
     pub max_output_bytes: usize,
     pub timeout_secs: u64,
+    /// Frames per second to sample at. The plan never exceeds it; a clip short
+    /// enough for the frame cap is sampled at its OWN rate, so motion the cap
+    /// can hold is not discarded.
+    pub fps: f32,
+    /// Ceiling, in pixels, on one decoded frame's area. Each planned frame is
+    /// scaled to fit BEFORE it is read back as RGB, which is what bounds the
+    /// returned frame collection at `max_frames × max_decoded_pixels`.
+    pub max_decoded_pixels: usize,
+    /// Optional aggregate RGB pixel bound, applied before frames leave FFmpeg.
+    /// Long-video profiles use the same total pixel budget as preprocessing.
+    pub max_total_decoded_pixels: Option<usize>,
 }
+
+/// Default decoded-frame area cap: 640×640.
+///
+/// At the 768-frame default this bounds the returned RGB at ~0.9 GiB
+/// (768 × 640 × 640 × 3) where a 3840×2160 clip would otherwise cost ~10 GiB
+/// inside a request. Well above the vision grid the preprocessor builds from
+/// a frame, so it costs no resolution the encoder would have seen.
+const DEFAULT_MAX_DECODED_PIXELS: usize = 640 * 640;
 
 impl Default for FfmpegPolicy {
     fn default() -> Self {
         Self {
             enabled: false,
             binary: "ffmpeg".to_string(),
+            probe_binary: "ffprobe".to_string(),
             max_frames: 768,
             // 768 frames of 1280x720 PNG is comfortably under this; it exists
             // to bound a pathological stream, not to size a normal one.
             max_output_bytes: 512 * 1024 * 1024,
             timeout_secs: 120,
+            fps: 2.0,
+            max_decoded_pixels: DEFAULT_MAX_DECODED_PIXELS,
+            max_total_decoded_pixels: None,
         }
     }
 }
@@ -121,48 +168,205 @@ pub fn probe(policy: &FfmpegPolicy) -> Availability {
     }
 }
 
-/// Decode `bytes` to RGB frames sampled at `target_fps`.
+/// Decode `bytes` to RGB frames that SPAN the clip.
 ///
-/// ffmpeg performs the temporal sampling itself (`-vf fps=`), which is both
-/// faster and more accurate than decoding everything and discarding most of
-/// it — and it means the caller does not have to know the source frame rate.
-/// The returned frames are therefore ALREADY at `target_fps`.
+/// The clip's duration and native frame rate are probed first, a plan is
+/// derived that covers the whole duration at no more than `target_fps`, and
+/// ffmpeg is asked for exactly those frames. The result does not carry
+/// timestamps here — [`decode_with_plan`] is the form callers that need them
+/// (the preprocessor, for the prompt's per-group times) should use.
 pub fn decode_frames(
     bytes: &[u8],
     target_fps: f32,
     policy: &FfmpegPolicy,
 ) -> Result<Vec<RgbImage>> {
+    Ok(decode_with_plan(bytes, target_fps, policy)?.0)
+}
+
+/// What a probe found, or the error that says it could not be determined.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClipTiming {
+    /// Duration in seconds, from the container.
+    pub duration_secs: f32,
+    /// The video stream's own rate: an average when the container declares
+    /// one, otherwise the instantaneous rate. Used only to plan coverage.
+    pub native_fps: f64,
+    /// Declared source frame count (`nb_frames`), when the container names
+    /// it. `None` sizes the plan by duration alone.
+    pub frame_count: Option<u64>,
+}
+
+/// Decode `bytes` to RGB frames spanning the clip, plus the plan that
+/// produced them.
+///
+/// The returned timestamps are the times, in source seconds, of the frames
+/// that came back — indexed exactly like the frames, so callers derive their
+/// own group timestamps from the frames they actually kept rather than from
+/// an assumed constant rate.
+pub fn decode_with_plan(
+    bytes: &[u8],
+    target_fps: f32,
+    policy: &FfmpegPolicy,
+) -> Result<(Vec<RgbImage>, Vec<f32>)> {
     ensure!(
         policy.enabled,
         "this container needs ffmpeg to decode and subprocess decoding is disabled; \
          pass --video-allow-ffmpeg to enable it, or send an animated GIF"
     );
+    // Check the decoder BEFORE probing the clip. Otherwise a missing binary
+    // surfaces as an unprobeable clip, which sends the operator hunting for a
+    // corrupt video when the real fix is to install ffmpeg. `probe` names the
+    // binary and the remedy.
+    if let Availability::Missing(detail) = probe(policy) {
+        anyhow::bail!(
+            "the ffmpeg decoder is not usable: {detail} (no ffmpeg installed at that path, or it \
+             could not run) — install ffmpeg with its ffprobe companion, or point \
+             --video-ffmpeg-path at a usable build"
+        );
+    }
+    // A caller that passes a usable rate wins; anything else falls back to the
+    // policy's, which is the operator's SSOT for video sampling.
+    let policy_fps = crate::video_sample::finite_positive(policy.fps)
+        .unwrap_or(crate::video_preprocess::DEFAULT_FPS);
     let fps = if target_fps.is_finite() && target_fps > 0.0 {
         target_fps
     } else {
-        2.0
+        policy_fps
     };
 
+    let timing = probe_duration(bytes, policy)?;
+    let want = wanted_frames(
+        timing.duration_secs,
+        timing.native_fps as f32,
+        fps,
+        policy.max_frames,
+        fps,
+    );
+    // Enntity/atlas d0cead1: when the cap can hold every declared source
+    // frame, keep the whole clip verbatim — a short CFR or VFR clip is not
+    // warped by an evenly spaced time plan. showinfo still reports the real
+    // PTS of the frames ffmpeg actually emits.
+    let (selection, output_frames) = if let Some(count) = timing
+        .frame_count
+        .filter(|&count| count > 0 && count <= crate::video_sample::MAX_SAMPLE_PLAN as u64)
+        .filter(|&count| want >= count as usize)
+    {
+        ("select=1".to_string(), count as usize)
+    } else {
+        // The plan converts the frame COUNT into evenly spaced positions
+        // across the probed duration — this, and not the frame count, is what
+        // makes the samples cover the whole clip instead of stopping
+        // `cap / fps` seconds in.
+        let mut plan = sample_plan(want, timing.duration_secs)?;
+        // A container's duration usually names the end of its presentation
+        // timeline, while its last frame starts one frame interval earlier.
+        // Rescale the targets to end inside that final interval so the
+        // timestamp selector can actually reach it. The returned time is
+        // still the decoded frame's PTS, captured from ffmpeg below.
+        if plan.len() > 1 {
+            let final_step = timing
+                .frame_count
+                .filter(|&count| count > 1)
+                .map(|count| timing.duration_secs / (count - 1) as f32)
+                .or_else(|| {
+                    crate::video_sample::finite_positive(timing.native_fps as f32)
+                        .map(|rate| 1.0 / rate)
+                })
+                .unwrap_or(1.0 / fps);
+            let old_end = *plan.times.last().expect("a non-empty plan");
+            let new_end = old_end.min((timing.duration_secs - final_step).max(0.0));
+            if new_end < old_end && old_end > 0.0 {
+                for time in &mut plan.times {
+                    *time = *time * new_end / old_end;
+                }
+            }
+        }
+        let output_frames = plan.len();
+        (plan.select_time_filter(), output_frames)
+    };
+    run_ffmpeg(bytes, &selection, output_frames, policy)
+}
+
+/// Spawn ffmpeg with the plan's filter and collect the frames.
+///
+/// Split out so the argument construction (the part with the correctness
+/// claims: `select` instead of a bare `fps`, and a `scale` that bounds decoded
+/// RGB) is readable on its own.
+fn run_ffmpeg(
+    bytes: &[u8],
+    selection: &str,
+    output_frames: usize,
+    policy: &FfmpegPolicy,
+) -> Result<(Vec<RgbImage>, Vec<f32>)> {
+    // `select` first, `scale` after: at most `output_frames` frames are ever
+    // scaled, and the scale is what caps the RGB the returned Vec holds.
+    // Enntity/atlas 6f3d0a71 + 95d20a25: `showinfo` reports each selected
+    // frame's real PTS (VFR-accurate), and the scale bounds by PIXEL AREA,
+    // not per-side (a 1xN strip has a huge side inside any per-side bound).
+    let filter = format!(
+        "{},showinfo,{}",
+        selection,
+        decoded_scale_filter(decoded_frame_budget(policy, output_frames)?),
+    );
+    let (frames, stderr) = spawn_ffmpeg(
+        bytes,
+        &filter,
+        output_frames,
+        &["-fps_mode", "passthrough", "-vcodec", "png"],
+        policy,
+        "info",
+        |stdout| png_stream::read_frames(stdout, output_frames, policy),
+    )?;
+    ensure!(
+        !frames.is_empty(),
+        "the container decoded to zero frames (is there a video stream?)"
+    );
+    let times = parse_showinfo_timestamps(&stderr)?;
+    ensure!(
+        times.len() == frames.len(),
+        "ffmpeg reported {} selected frame timestamps for {} decoded frames",
+        times.len(),
+        frames.len()
+    );
+    Ok((frames, times))
+}
+
+/// Run ffmpeg over `bytes` with `filter`, at most `frames` frames out in the
+/// `output` codec on an image pipe, and hand its stdout to `read`.
+///
+/// A `read` error kills the child before anything else: once the reader
+/// stops, the child blocks writing into a full pipe and never closes stderr,
+/// and a `read_to_string` on stderr would then wait for an EOF only the
+/// watchdog causes. Killing turns a 120-second hang into an immediate error.
+fn spawn_ffmpeg<T>(
+    bytes: &[u8],
+    filter: &str,
+    frames: usize,
+    output: &[&str],
+    policy: &FfmpegPolicy,
+    log_level: &str,
+    read: impl FnOnce(&mut std::process::ChildStdout) -> Result<T>,
+) -> Result<(T, String)> {
+    let input_file = input::SeekableInput::new(bytes)?;
     let mut child = Command::new(&policy.binary)
+        // Never touch a terminal: without `-nostdin` ffmpeg can block on a
+        // prompt when it thinks stdin is interactive.
         .args([
             "-v",
-            "error",
-            // Never touch a terminal: without this ffmpeg can block on a
-            // prompt when it thinks stdin is interactive.
+            log_level,
             "-nostdin",
+            "-protocol_whitelist",
+            "file,pipe",
+            "-format_whitelist",
+            "mov,matroska,webm,avi,mpegts,mpeg,ogg,flv",
             "-i",
-            "pipe:0",
-            "-vf",
-            &format!("fps={fps}"),
-            "-frames:v",
-            &policy.max_frames.to_string(),
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "png",
-            "pipe:1",
         ])
-        .stdin(Stdio::piped())
+        .arg(input_file.path())
+        .args(["-vf", filter])
+        .args(["-frames:v", &frames.to_string()])
+        .args(output)
+        .args(["-f", "image2pipe", "pipe:1"])
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -174,19 +378,20 @@ pub fn decode_frames(
             )
         })?;
 
-    let mut stdin = child.stdin.take().context("no stdin pipe")?;
     let mut stdout = child.stdout.take().context("no stdout pipe")?;
     let mut stderr = child.stderr.take().context("no stderr pipe")?;
 
-    // Feed the container on a thread. It MUST be concurrent with reading:
-    // ffmpeg writes output while still consuming input, so a write-then-read
-    // sequence deadlocks as soon as the output pipe buffer fills.
-    let input = bytes.to_vec();
-    let writer = std::thread::spawn(move || {
-        // A broken pipe here is normal — ffmpeg stops reading once it has the
-        // frames it was asked for — so the error is deliberately dropped.
-        let _ = stdin.write_all(&input);
-        drop(stdin);
+    // `showinfo` emits one stderr line per selected frame under `-v info`:
+    // drain it concurrently or the pipe fills mid-decode and ffmpeg blocks
+    // writing while the stdout reader waits (frames silently truncated).
+    // Enntity/atlas d0cead1's `stderr_reader`.
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr
+            .by_ref()
+            .take(8 * 1024 * 1024)
+            .read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
     });
 
     let child = Arc::new(Mutex::new(child));
@@ -215,10 +420,7 @@ pub fn decode_frames(
     };
 
     // Read with a hard cap. `take` bounds it without trusting the child.
-    let mut out = Vec::new();
-    let read_res = (&mut stdout)
-        .take(policy.max_output_bytes as u64 + 1)
-        .read_to_end(&mut out);
+    let read_res = read(&mut stdout);
 
     // KILL FIRST, then drain stderr. Order matters and getting it wrong
     // deadlocks: once the cap is hit we stop reading stdout, so the child
@@ -227,14 +429,11 @@ pub fn decode_frames(
     // will ever cause. Killing here turns a 120-second hang into an immediate
     // error. (Draining stdout instead would defeat the cap, which is the
     // thing being enforced.)
-    let over_cap = out.len() > policy.max_output_bytes;
-    if over_cap && let Ok(mut g) = child.lock() {
-        let _ = g.kill();
-    }
+    let over_cap = false; // the read closure enforces the cap
 
-    let mut err_text = String::new();
-    let _ = stderr.read_to_string(&mut err_text);
-    let _ = writer.join();
+    let err_text = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("ffmpeg stderr reader panicked"))?;
 
     let status = {
         let mut g = child
@@ -244,7 +443,7 @@ pub fn decode_frames(
     };
     let timed_out = watchdog.join().unwrap_or(false);
 
-    read_res.context("reading decoded frames")?;
+    let out = read_res.context("reading decoded frames")?;
     ensure!(
         !timed_out,
         "decoding exceeded {}s and was stopped",
@@ -259,13 +458,7 @@ pub fn decode_frames(
         let why = err_text.lines().next_back().unwrap_or("no detail").trim();
         bail!("decoder failed: {why}");
     }
-
-    let frames = split_png_stream(&out)?;
-    ensure!(
-        !frames.is_empty(),
-        "the container decoded to zero frames (is there a video stream?)"
-    );
-    Ok(frames)
+    Ok((out, err_text))
 }
 
 /// Split a concatenated PNG stream into images.
@@ -274,6 +467,7 @@ pub fn decode_frames(
 /// payload can legitimately contain the IEND byte pattern, whereas the
 /// 8-byte signature only appears at a file start in a well-formed stream
 /// produced by `image2pipe`.
+#[cfg(test)]
 fn split_png_stream(buf: &[u8]) -> Result<Vec<RgbImage>> {
     let mut starts = Vec::new();
     let mut i = 0usize;
@@ -298,3 +492,7 @@ fn split_png_stream(buf: &[u8]) -> Result<Vec<RgbImage>> {
 #[cfg(test)]
 #[path = "video_decode_ffmpeg_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "video_decode_ffmpeg_hour_tests.rs"]
+mod hour_tests;

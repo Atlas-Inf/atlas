@@ -4,6 +4,19 @@
 
 use super::*;
 
+mod cancel;
+mod think_commit;
+pub(super) use cancel::retire_if_cancelled;
+#[cfg(test)]
+pub(in crate::scheduler) use think_commit::should_suppress_post_think_eos;
+pub(in crate::scheduler) use think_commit::{
+    CommitEnv, EndToken, PickEffects, SpanShadow, advance_thinking, end_token, hard_stop,
+    think_gate, tool_state,
+};
+
+#[cfg(test)]
+mod tests;
+
 /// Emit a token for an active sequence (stream + bookkeeping).
 ///
 /// Per OpenAI spec, stop/EOS tokens are NOT streamed to the client —
@@ -18,6 +31,60 @@ pub fn emit_token(
     logprobs: Option<crate::api::TokenLogprobs>,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
 ) {
+    emit_token_at_position(a, tok, logprobs, sched, a.seq.seq_len);
+}
+
+/// [`emit_token`] for row `row` of a verify span's committed prefix of `rows`
+/// rows, which ends at the current (post-rewind) `seq_len`: the end-token and
+/// context ceilings are checked at the row's own position
+/// ([`think_commit::span_row_position`], as serial decode and the verify
+/// replay check them), not at the prefix's end for every row.
+pub(super) fn emit_span_row(
+    a: &mut ActiveSeq,
+    tok: u32,
+    logprobs: Option<crate::api::TokenLogprobs>,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    row: usize,
+    rows: usize,
+) {
+    let position = think_commit::span_row_position(a.seq.seq_len, rows, row);
+    let prior = a.output_tokens.len();
+    emit_token_at_position(a, tok, logprobs, sched, position);
+    // The final row is the target bonus. Earlier rows are accepted drafts.
+    if row + 1 < rows {
+        accepted_output(a, tok, prior);
+    }
+}
+
+/// Self-speculation emits its accepted drafts without a committed span index.
+pub(super) fn emit_accepted_token(
+    a: &mut ActiveSeq,
+    tok: u32,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+) {
+    let prior = a.output_tokens.len();
+    emit_token(a, tok, None, sched);
+    accepted_output(a, tok, prior);
+}
+
+fn accepted_output(a: &mut ActiveSeq, tok: u32, prior: usize) {
+    // Emission may suppress/pop the token, or append synthetic grammar closes.
+    // Count only this draft, only if it remains at its original output position.
+    if a.output_tokens.get(prior) == Some(&tok) {
+        a.mtp_acct.record_accepted_output(prior);
+    }
+}
+
+/// Emit one already-verified row after its whole target prefix was committed.
+/// The caller supplies the validated logical position for ceiling checks only;
+/// canonical model state and all other emission/accounting semantics stay intact.
+pub(super) fn emit_token_at_position(
+    a: &mut ActiveSeq,
+    tok: u32,
+    logprobs: Option<crate::api::TokenLogprobs>,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    position: usize,
+) {
     // Cooperative cancellation from the streaming pipeline. The
     // stream-side guards (Bug-2 name-run cap, F11 within-dedup, F44
     // perm-fail, loop-watchdog, client stop-sequence match) flip this
@@ -25,130 +92,37 @@ pub fn emit_token(
     // EOS: finalise now (lifecycle derives "stop" — budget not hit —
     // and `handle_done`'s overrides refine it) instead of letting the
     // model keep emitting tokens that just get suppressed.
-    if let Some(ref f) = a.cancel_flag
-        && f.load(std::sync::atomic::Ordering::Acquire)
-    {
-        a.finished = true;
+    if retire_if_cancelled(a) {
         return;
     }
-
-    // ChatML role-boundary HARD stop (`<|im_start|>`).
-    //
-    // Handled BEFORE grammar advance / EOS suppression: if the model
-    // hallucinated a `<|im_start|>` mid-turn, we must end the turn regardless
-    // of grammar / require_tool_call / min_tokens. The regular EOS path at
-    // line ~3020 honors `suppress_eos`, which is true while a tool-call
-    // grammar is active — so if we fell through to it, the tokenizer would
-    // strip `<|im_start|>` (special-token) but the following role literal
-    // (`user` / `assistant` — regular tokens) would stream to the client,
-    // poisoning its context and causing the observed multi-turn drift /
-    // "file was corrupted" hallucinations in opencode.
-    if let Some(ims) = sched.limits.im_start_hard_stop
-        && tok == ims
-    {
-        // Push the hard-stop token to output_tokens so lifecycle.rs reports
-        // `finish_reason="stop"` (because `<|im_start|>` is registered in
-        // `eos_tokens` at startup — see tokenizer_runtime.rs::im_start_id).
-        // Without this push, `last_tok = output_tokens.last()` is the prior
-        // content token, lifecycle's `is_eos` check fails, and the response
-        // is mis-reported as `finish_reason="length"` (Bug 3 from OpenClaw
-        // 2026-05-08 session: "Done: 13 tokens (length) despite max_tokens=
-        // 8192" — clients then misinterpret the truncation as a real
-        // length-limit hit and either retry or surface a wrong error).
-        // The streamed-text path strips stop tokens server-side, so the
-        // client never sees the literal `<|im_start|>` bytes.
-        a.output_tokens.push(tok);
-        a.finished = true;
-        tracing::debug!(
-            "<|im_start|> hard-stop fired (id={ims}); ending turn before grammar/suppress_eos"
+    // A content-loop steer of this pick is counted against the state it was
+    // picked in (`loop_steer`), before the commit changes any of it.
+    if crate::scheduler::loop_steer::note_commit(a) {
+        tracing::warn!(
+            tok,
+            output_len = a.output_tokens.len(),
+            steers = a.loop_steers,
+            max = a.loop_steer_max,
+            "Content-loop steer: the pick skipped the loop's continuation token"
         );
+    }
+
+    let env = CommitEnv::of(sched);
+    // The verify pipeline's effects at the position this token was picked
+    // from (none for a token no verify picked).
+    PickEffects::apply(a, tok);
+    if hard_stop(a, tok, &env) {
+        return;
+    }
+    first_token_thinking::apply_native_tool_boundary(a, tok, &env);
+    if think_gate(a, tok, &env) {
         return;
     }
 
-    // Fix B (2026-06-05, kill-switch): <tool_response> hard stop — the model must
-    // never generate this control token; if it does (post-tool-call runaway), end
-    // the turn. Mirrors the <|im_start|> hard stop above.
-    if tool_response_stop_enabled()
-        && let Some(trs) = sched.limits.tool_response_hard_stop
-        && tok == trs
-    {
-        a.output_tokens.push(tok);
-        a.finished = true;
-        // Name the cut -- MTP twin of the decode_logits_step site.
-        a.guard_stop = Some(GUARD_STOP_TOOL_RESPONSE);
-        tracing::debug!("<tool_response> hard-stop fired (id={trs}); ending turn");
-        return;
-    }
-
-    // Spontaneous <think>: model generates <think> even when thinking was not
-    // requested. Enter thinking mode so EOS is suppressed and thinking content
-    // is stripped. This handles MTP bootstrap/verify paths.
-    if !a.inside_thinking && a.think_start_token == Some(tok) {
-        a.inside_thinking = true;
-        // Re-entering thinking: re-arm the spec-resume guard for the next exit.
-        a.post_think_emitted = 0;
-        a.think_ended = false;
-        a.think_skip_count = 0;
-        a.thinking_budget = Some(a.spontaneous_think_budget);
-        tracing::debug!("Spontaneous <think> detected in emit_token, entering thinking mode");
-        return; // don't emit <think> as content
-    }
-
-    // Silently skip </think> tokens outside thinking mode (same as process_decode_logits).
-    if !a.inside_thinking && a.think_end_token == Some(tok) {
-        a.think_skip_count += 1;
-        if a.think_skip_count >= 50 {
-            a.finished = true;
-            // Name the cut -- MTP twin of the decode_logits_step site; see
-            // `GUARD_STOP_THINK_SKIP` for why an unnamed skip-site finish
-            // wires "stop" and silently ends an agentic run.
-            a.guard_stop = Some(GUARD_STOP_THINK_SKIP);
-            tracing::debug!(
-                "</think> think-skip watchdog hard-stop fired (50 consecutive strays); \
-                 ending turn"
-            );
-        }
-        return;
-    }
-    // Reset skip counter when a real content token is generated — parity with
-    // `decode_logits_step.rs`. Without this the counter is CUMULATIVE on the MTP
-    // path while the non-MTP path counts CONSECUTIVE strays, so a generation
-    // that emits 50 scattered `</think>` across otherwise healthy content is
-    // force-stopped here and not there. The watchdog exists for the degenerate
-    // `</think>` REPETITION seen at long context, which is consecutive by
-    // definition; counting non-adjacent strays is a different, stricter policy
-    // that was never intended.
-    if a.think_ended {
-        a.think_skip_count = 0;
-    }
-
-    // Track <tool_call> token: once seen, legacy tool call requirement is satisfied.
-    // Guard with !inside_thinking — tool calls inside thinking are spurious.
-    if a.require_tool_call && a.tool_call_start_token == Some(tok) && !a.inside_thinking {
-        a.require_tool_call = false;
-        a.tool_call_opened = true;
-    }
-
-    // Tool-body / parameter-body state machine.
-    //
-    // SM1 (2026-05-26): extracted from inline-in-emit_token to the free
-    // function `update_tool_param_state` so the regular non-MTP decode
-    // path (`decode_logits_step.rs`) can call it too. Previously the
-    // state was ONLY updated when `emit_token` ran — which happens from
-    // spec/verify paths but NOT from `process_decode_logits`. With
-    // mtp=false (Qwen3.6 baseline), the state machine never ran and
-    // every dependent gate (A1 rep-penalty toggle, B1 margin detector)
-    // was silently dead code. (The pos-0 close-tag/AM1 logit-bias that
-    // also depended on this state was removed 2026-06-03; the state is
-    // still required for A1/B1 and the adadec_diag dump.)
-    update_tool_param_state(a, tok);
-
-    // Fix A (2026-06-05): mark a tool call complete on `</tool_call>` (outside
-    // thinking) so the EOS-escape gate can lift suppression. Inert unless
-    // `tool_eos_escape_enabled()` (default OFF).
-    if a.tool_call_end_token == Some(tok) && !a.inside_thinking {
-        a.tool_call_completed = true;
-    }
+    // The required-call opener, the tool-body / parameter-body state machine
+    // (SM1, also driven by `process_decode_logits`) and `</tool_call>`'s
+    // completion (Fix A): the commit rule's, which the verify replay runs too.
+    tool_state(a, tok, &env);
 
     // F2 mirror (Iter 46, 2026-06-02): reset the inter-tool prose budget when
     // a tool call opens on the MTP/emit path — parity with the non-MTP reset
@@ -165,11 +139,14 @@ pub fn emit_token(
     // sequence is inside `<think>`…`</think>` so the matcher only
     // sees the final-output token stream.
     let mut disengage_grammar = false;
+    let mut strict_violation = false;
     if !a.inside_thinking
         && let Some(ref mut gs) = a.grammar_state
     {
         let advanced = gs.accept_token(tok);
-        if !advanced {
+        if !advanced && gs.is_strict() {
+            strict_violation = true;
+        } else if !advanced {
             // Grammar/model disagreement (BUG#2 class: e.g. a merged BPE token
             // like `><` or a `</X` content run the qwen3_coder value rule
             // forbids, often surfaced via an under-masked MTP draft). The token
@@ -190,6 +167,10 @@ pub fn emit_token(
             disengage_grammar = true;
         }
     }
+    if strict_violation {
+        fail_strict_grammar(a, tok);
+        return;
+    }
     if disengage_grammar {
         // Drop the matcher: subsequent decode steps see `grammar_state == None`
         // and decode unconstrained. Set after the `ref mut gs` borrow ends.
@@ -201,6 +182,7 @@ pub fn emit_token(
         a.logprobs_data.push(lp);
     }
 
+    let prior = a.output_tokens.len();
     a.output_tokens.push(tok);
 
     // Spec-resume guard bookkeeping: count tokens emitted after `</think>`.
@@ -208,57 +190,19 @@ pub fn emit_token(
     // when it arrives; the transition below sets it). For requests that never
     // think, think_ended starts true, so the guard delays spec by the same N
     // from the response start.
-    if a.think_ended && !a.inside_thinking {
+    let counted_post_think = a.think_ended && !a.inside_thinking;
+    if counted_post_think {
         a.post_think_emitted += 1;
     }
 
-    // §C-1 (DS4F hard-limit lane, 2026-07-21): thinking tokens draw down the
-    // SAME completion budget (`remaining`) as content tokens on the MTP/emit
-    // path too — twin of the non-MTP fix in `decode_logits_step`. A long
-    // `<think>` block can no longer run past `max_tokens`; `thinking_budget`
-    // stays the separate per-block cap (armed below). The `remaining == 0`
-    // force-stop at function end then finishes the sequence even while inside
-    // thinking. No-op for direct-mode (thinking-OFF) turns.
-    // Detect </think> transition. Track thinking token count for budget enforcement.
+    let native_glm_eos = crate::glm_tool_boundary::native_eos_while_thinking(
+        sched.limits.glm_tool_boundary,
+        a.inside_thinking,
+        tok,
+        &a.eos_tokens,
+    );
     if a.inside_thinking {
-        a.consume_generation_budget();
-        if a.think_end_token == Some(tok) {
-            a.inside_thinking = false;
-            // Sticky twin of the decode-path capture — see
-            // decode_logits_step (post-think EOS guard).
-            a.think_force_closed = a.force_end_thinking;
-            a.force_end_thinking = false;
-            a.sentence_defer_count = 0;
-            a.think_ended = true;
-            // One-shot for the next decode step: pin to
-            // tool_call_start_token if require_tool_call (Change 3b).
-            a.think_just_ended = true;
-            tracing::info!(
-                "Thinking ended after {} tokens (budget={:?})",
-                a.thinking_tokens,
-                a.thinking_budget,
-            );
-        } else {
-            a.thinking_tokens += 1;
-            if let Some(budget) = a.thinking_budget
-                && a.thinking_tokens >= budget
-                && !a.force_end_thinking
-            {
-                a.force_end_thinking = true;
-                a.sentence_defer_count = 0;
-                // Twin of the decode_logits_step site: name the source so a
-                // low client budget is distinguishable from a server cap.
-                tracing::info!(
-                    source = if a.enable_thinking {
-                        "request (client budget/effort; scaled by --max-thinking-budget)"
-                    } else {
-                        "spontaneous <think> (--max-thinking-budget / MODEL.toml)"
-                    },
-                    "Thinking budget exhausted ({budget} tokens), arming </think>; \
-                     deferring to next sentence boundary"
-                );
-            }
-        }
+        advance_thinking(a, tok, prior, native_glm_eos, &env);
     } else {
         a.consume_generation_budget();
         // Clear think_just_ended one-shot now that we've consumed the
@@ -309,6 +253,7 @@ pub fn emit_token(
         // = no-op; Qwen3.6-35B-A3B-FP8 sets 1536 in MODEL.toml.
         if !sched.levers.disable_watchdogs
             && a.grammar_state.is_some()
+            && !a.strict_grammar()
             && a.content_tokens > sched.watchdog.max_post_think_content_tokens
         {
             tracing::warn!(
@@ -326,8 +271,12 @@ pub fn emit_token(
         if !sched.levers.disable_watchdogs
             && sched.levers.loop_watchdog()
             && !a.inside_tool_body
+            && !a.strict_grammar()
+            && watchdog_floor_reached(a.output_tokens.len(), a.min_tokens)
             && a.content_tokens >= CONTENT_LOOP_MIN_TOKENS
             && a.content_tokens.is_multiple_of(CONTENT_LOOP_CHECK_STRIDE)
+            // The next pick steers this tail off its loop (`loop_steer`).
+            && !crate::scheduler::loop_steer::will_steer(a)
             && (detect_content_token_loop_with(&a.output_tokens, loop_params)
                 || sched.masks.numeric.as_deref().is_some_and(|m| {
                     detect_content_token_loop_normalized_with(
@@ -393,45 +342,32 @@ pub fn emit_token(
         }
     }
 
-    // EOS handling: grammar-based, legacy, or min_tokens suppression.
-    // Fix A (2026-06-05, kill-switch): in tool_choice="auto" the grammar's
-    // is_terminated() never becomes true after a tool call, so EOS is suppressed
-    // forever — trapping the model into a hallucinated-transcript runaway. When
-    // enabled and a tool call has completed (and we're not inside a tool body /
-    // thinking), lift the grammar suppression so the model's natural EOS ends the
-    // turn. Inert unless ATLAS_TOOL_EOS_ESCAPE=1.
-    let eos_escape = tool_eos_escape_enabled()
-        && a.tool_call_completed
-        && !a.inside_tool_body
-        && !a.inside_thinking;
-    // #192: STOP-LEGALITY based grammar suppression — see the twin gate in
-    // `decode_logits_step::process_decode_logits`. `!is_terminated()` alone
-    // suppressed EOS forever on auto-mode turns with no completed call
-    // (armed-but-unused tools → finish="length"). Evaluated only when the
-    // token IS an EOS token (`grammar_blocks_stop` fills a bitmask).
-    //
-    // `inside_thinking` term: the matcher is PAUSED during `<think>` (tokens
-    // are neither masked nor accepted), so stop-legality is undefined there.
-    // Preserve the historical emit-path behavior — a spurious EOS inside a
-    // thinking span on a grammar-armed turn is discarded, `</think>` is the
-    // only legal exit (the non-MTP path does this via its explicit
-    // `thinking_suppresses_eos` term, which emit_token never had).
-    let grammar_suppresses_eos = a.eos_tokens.contains(&tok)
-        && !eos_escape
-        && ((a.inside_thinking && a.grammar_state.is_some())
-            || crate::grammar::grammar_blocks_stop(a.grammar_state.as_mut(), &a.eos_tokens));
-    let legacy_suppresses_eos = a.require_tool_call;
-    let min_tokens_suppresses = a.output_tokens.len() < a.min_tokens;
-    let suppress_eos = grammar_suppresses_eos || legacy_suppresses_eos || min_tokens_suppresses;
-
-    if a.eos_tokens.contains(&tok) && !suppress_eos {
-        a.finished = true;
-        return;
-    }
-    if a.eos_tokens.contains(&tok) && suppress_eos {
-        // EOS suppressed: grammar not terminated, legacy tool call not yet seen,
-        // or min_tokens not reached. Don't stop — let the model continue generating.
-        return;
+    // The end-token decision is the commit rule's (`think_commit::end_token`),
+    // made the same way by plain decode: grammar stop-legality, an unsatisfied
+    // tool call, the `min_tokens` floor, `<think>` (an honored end token closes
+    // the block instead) and the post-`</think>` tool guard hold it back; a
+    // hard ceiling (budget spent, context full) always stops. A stop is
+    // recorded for the token count but never streamed (OpenAI: the returned
+    // text excludes the stop sequence).
+    match end_token(a, tok, prior, position, native_glm_eos, &env) {
+        EndToken::Stop => {
+            a.finished = true;
+            return;
+        }
+        // Discarded exactly as serial decode discards it: never in the output,
+        // so it never counts toward the min_tokens floor (`min_tokens_eos_tests`).
+        EndToken::Suppressed => {
+            a.output_tokens.pop();
+            // The discarded token is not emitted content: undo the spec-resume
+            // count applied above (serial never records it). `thinking_tokens`
+            // stays advanced — serial's `advance_thinking` also counts the
+            // suppressed token before `end_token` runs.
+            if counted_post_think {
+                a.post_think_emitted = a.post_think_emitted.saturating_sub(1);
+            }
+            return;
+        }
+        EndToken::No => {}
     }
     // OPENCODE FIX: see process_decode_logits — same gate. Suppress streaming
     // of spontaneous-thinking content so it doesn't pollute opencode's history.
@@ -452,7 +388,7 @@ pub fn emit_token(
     // (twin of the non-MTP guard in `decode_logits_step`), so the MTP/emit path
     // also cannot run KV past the context ceiling. No-op when `max_seq_len` is
     // unset (0) or not yet reached.
-    if a.remaining == 0 || seqlen_force_stop(a.seq.seq_len, sched.limits.max_seq_len) {
+    if a.remaining == 0 || seqlen_force_stop(position, sched.limits.max_seq_len) {
         // #144: before the hard length-stop, if a grammar is active and the
         // stop token is not legal at the current position (e.g. mid JSON
         // string), emit the shortest grammar-legal close so the truncated
@@ -537,19 +473,123 @@ pub(crate) fn emit_grammar_close(a: &mut ActiveSeq) {
 // for documentation by
 // `grammar.rs::tests::test_minimax_xml_grammar_masks_trigger_breaking_multibyte_token`.
 
+/// A `response_format` grammar refused an emitted token. Its output must
+/// conform, so end the response with an error (wire finish reason "error",
+/// blocking HTTP 500) rather than disengage and return unconstrained text as
+/// if it were valid. Tool grammars disengage instead (see `emit_token`). The
+/// refused token is neither emitted nor recorded.
+pub(super) fn fail_strict_grammar(a: &mut ActiveSeq, tok: u32) {
+    let msg = strict_refusal(tok, a.output_tokens.len());
+    a.abort_on_engine_error(msg);
+}
+
+/// Logged and returned for every strict-grammar refusal (first token included).
+pub(super) fn strict_refusal(tok: u32, at: usize) -> String {
+    tracing::error!(
+        tok,
+        output_len = at,
+        "response_format grammar refused an emitted token; ending the response with an error"
+    );
+    format!(
+        "structured output: token {tok} at output position {at} violates the response_format grammar"
+    )
+}
+
 /// Compile a grammar state from a grammar specification + engine.
 ///
-/// Returns `Some(GrammarState)` if compilation succeeds, `None` otherwise
-/// (logging a warning on failure so the request falls back to legacy tool_call
-/// suppression). Called once per request during prefill.
+/// Returns `Ok(Some(GrammarState))` if compilation succeeds, `Ok(None)` when
+/// no grammar was requested or a tool grammar failed (logging a warning so the
+/// request falls back to legacy tool_call suppression), except a tool grammar
+/// too large to compile, which is refused like a strict one. Called once per
+/// request during prefill; a panic inside compilation is caught and reported.
+///
+/// A `response_format` grammar is marked strict (`opens_in_thinking`: the
+/// prompt leaves the model inside `<think>`), and failing to arm one is
+/// reported to the client on `sink` as an invalid request (HTTP 400 when
+/// blocking) and returned as `Err`: its output must never come back
+/// unconstrained as if it were valid.
 pub fn compile_grammar_state(
     engine: &mut Option<GrammarEngine>,
     grammar_spec: &Option<GrammarSpec>,
     eos_tokens: &[u32],
-) -> Option<GrammarState> {
-    let spec = grammar_spec.as_ref()?;
-    let engine = engine.as_mut()?;
+    opens_in_thinking: bool,
+    native_opener: Option<u32>,
+    tool_call_start_token: Option<u32>,
+    sink: &mut ResponseSink,
+) -> Result<Option<GrammarState>> {
+    let Some(spec) = grammar_spec.as_ref() else {
+        return Ok(None);
+    };
+    let strict = spec.is_response_format();
+    // Required tool grammars must not force their opener into an explicit
+    // reasoning preamble. Later decode already leaves thinking unmasked.
+    // GLM's native opener can end thinking and retains its existing path.
+    let defer_required_tool = opens_in_thinking
+        && native_opener.is_none()
+        && matches!(
+            spec,
+            GrammarSpec::ToolCall {
+                use_triggers: false,
+                ..
+            }
+        );
+    let native_opener =
+        native_opener.filter(|_| matches!(spec, GrammarSpec::ToolCallOrJson { .. }));
+    let compiled = match engine.as_mut() {
+        // Backstop: nothing a client sends may unwind the scheduler thread.
+        Some(engine) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            compile_spec(engine, spec, eos_tokens)
+        }))
+        .unwrap_or_else(|p| Err(format!("grammar compilation panicked: {}", panic_text(&p)))),
+        None if strict => Err("this model has no grammar engine".to_string()),
+        None => Ok(None),
+    };
+    match compiled {
+        Ok(state) if strict => Ok(state.map(|s| {
+            s.strict_output(opens_in_thinking)
+                .with_native_opener(native_opener)
+        })),
+        Ok(state) if defer_required_tool => {
+            Ok(state.map(|s| s.defer_first_token(tool_call_start_token)))
+        }
+        Ok(state) => Ok(state),
+        // A request the server cannot serve as asked: HTTP 400 for a blocking
+        // client, not a retryable 500. A tool grammar too large to compile is
+        // one too: serving it unconstrained would hide the cause.
+        Err(e) if strict || e.contains(GRAMMAR_TOO_LARGE) => {
+            let what = if strict {
+                "response_format"
+            } else {
+                "the tool grammar"
+            };
+            let msg = format!("{what} cannot be enforced: {e}");
+            tracing::warn!("{msg}");
+            send_invalid_request_to_sink(sink, &msg);
+            anyhow::bail!(msg)
+        }
+        Err(e) => {
+            tracing::warn!("{e}");
+            Ok(None)
+        }
+    }
+}
 
+/// How `xgrammar::CompileError::TooLarge` reads once stringified.
+const GRAMMAR_TOO_LARGE: &str = "grammar too large";
+
+fn panic_text(p: &(dyn std::any::Any + Send)) -> &str {
+    p.downcast_ref::<&str>()
+        .copied()
+        .or_else(|| p.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string payload")
+}
+
+/// `Ok(None)` only when a tool parser opts out of constrained decoding.
+fn compile_spec(
+    engine: &mut GrammarEngine,
+    spec: &GrammarSpec,
+    eos_tokens: &[u32],
+) -> Result<Option<GrammarState>, String> {
     // F69 (2026-04-29): symmetric dispatch via the trait. The parser
     // is the single source of truth for both runtime parsing and
     // grammar compilation; no string match keyed on `parser_name`.
@@ -567,11 +607,26 @@ pub fn compile_grammar_state(
                     "Grammar: parser '{}' opted out of constrained decoding for this request",
                     parser.name(),
                 );
-                return None;
+                return Ok(None);
             }
         },
         GrammarSpec::JsonObject => engine.compile_json_grammar(),
         GrammarSpec::JsonSchema { schema } => engine.compile_json_schema(schema),
+        GrammarSpec::ToolCallOrJson {
+            tools,
+            parser,
+            schema,
+        } => match engine.compile_tool_or_json_grammar(&**parser, tools, schema.as_deref()) {
+            Some(result) => result,
+            None => {
+                tracing::debug!(
+                    "Grammar: parser '{}' has no tool grammar; response_format + tools \
+                     decodes unconstrained",
+                    parser.name(),
+                );
+                return Ok(None);
+            }
+        },
     };
 
     let label = match spec {
@@ -580,30 +635,37 @@ pub fn compile_grammar_state(
         }
         GrammarSpec::JsonObject => "response_format=json_object".to_string(),
         GrammarSpec::JsonSchema { .. } => "response_format=json_schema".to_string(),
+        GrammarSpec::ToolCallOrJson { parser, tools, .. } => format!(
+            "parser={}, tools={} OR response_format",
+            parser.name(),
+            tools.len()
+        ),
     };
 
-    match compiled {
-        Ok(grammar) => {
-            let vocab_size = engine.vocab_size();
-            match GrammarState::new(&grammar, vocab_size) {
-                Ok(state) => {
-                    tracing::info!("Grammar constrained decoding active: {label}");
-                    // Exempt the model's stop/EOS tokens from grammar refusal
-                    // so a legitimate end-of-turn token cannot desync the NPDA
-                    // and truncate the response (see GrammarState::accept_token).
-                    Some(state.with_stop_tokens(eos_tokens))
-                }
-                Err(e) => {
-                    tracing::warn!("Grammar state creation failed: {e}");
-                    None
-                }
-            }
+    let grammar = compiled.map_err(|e| format!("Grammar compilation failed: {e}"))?;
+    let auto_literal_dispatch = matches!(
+        spec,
+        GrammarSpec::ToolCall {
+            use_triggers: true,
+            ..
         }
-        Err(e) => {
-            tracing::warn!("Grammar compilation failed: {e}");
-            None
-        }
-    }
+    );
+    let state = GrammarState::new(&grammar, engine.vocab_size())
+        .map_err(|e| format!("Grammar state creation failed: {e}"))?
+        .with_auto_literal_dispatch(auto_literal_dispatch);
+    tracing::info!("Grammar constrained decoding active: {label}");
+    // Exempt the model's stop/EOS tokens from grammar refusal so a legitimate
+    // end-of-turn token cannot desync the NPDA and truncate the response
+    // (see GrammarState::accept_token).
+    let state = state.with_stop_tokens(eos_tokens);
+    // A union picks its branch by mass at its first token (`grammar::branch`).
+    let GrammarSpec::ToolCallOrJson { schema, .. } = spec else {
+        return Ok(Some(state));
+    };
+    let answer = engine
+        .json_start_mask(schema.as_deref())
+        .map_err(|e| format!("Grammar compilation failed: {e}"))?;
+    Ok(Some(state.with_answer_start(answer)))
 }
 
 /// Result of starting a chunked prefill.
@@ -645,8 +707,10 @@ pub enum StartPrefillResult {
 //  - `a.param_body_chars_emitted` ++ per non-close body token
 //  - `a.finished`                 forced when stuck >MAX_TOOL_BODY_TOKENS
 //
-// Token IDs are Qwen3.6 byte-level BPE (verified via /tokenize 2026-05-25):
-//   27 = `<`, 28 = `=`, 29 = `>`, 510 = `</`, 15704 = `parameter`.
+// Marker tokens are CLASSES of the served tokenizer (`tool_markers`), built at
+// load from decoded vocabulary text: `<` (leading whitespace allowed),
+// `parameter`, starts-with `=` (`=`, `=new`, `=file`), starts-with `>` (`>`,
+// `>\n`), ends-with `</` (`</`, `.</`). They used to be five exact Qwen3.6 ids.
 
 /// Cap on tool-call ENVELOPE tokens (everything inside `<tool_call>…</tool_call>`
 /// that is NOT a parameter-value body). Catches a model that opens `<tool_call>`
@@ -669,7 +733,8 @@ fn advance_envelope_streak(inside_parameter_body: bool, streak: u32) -> (u32, bo
     }
 }
 
-pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
+/// `quiet`: the verify replay's, which must not log a cut the stream never sees.
+pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
     if a.inside_thinking {
         return;
     }
@@ -688,6 +753,13 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
     if !a.inside_tool_body {
         return;
     }
+    // Without the served tokenizer's markers the value body cannot be told
+    // from the envelope, and counting file content as envelope kills large
+    // writes at MAX_TOOL_BODY_TOKENS. Leave both the tracking and the cap off;
+    // `--tool-max-tokens` still bounds a runaway envelope.
+    let Some(m) = super::tool_markers::get() else {
+        return;
+    };
     // CC6 (2026-06-07): count ONLY envelope tokens — tokens of a
     // `<parameter=…>` VALUE (the file content of a `write` call) are exempt,
     // so a legitimately large single-file Write streams without tripping the
@@ -699,19 +771,15 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
         advance_envelope_streak(a.inside_parameter_body, a.tool_body_streak_tokens);
     a.tool_body_streak_tokens = streak;
     if exceeded {
-        tracing::warn!(
-            streak = a.tool_body_streak_tokens,
-            "Stuck in tool-call ENVELOPE for {MAX_TOOL_BODY_TOKENS}+ tokens with no </tool_call> (excludes parameter-value content); ending response (model never closed the envelope — would otherwise burn to max_tokens). Sanitizer will salvage what it can."
-        );
+        if !quiet {
+            tracing::warn!(
+                streak = a.tool_body_streak_tokens,
+                "Stuck in tool-call ENVELOPE for {MAX_TOOL_BODY_TOKENS}+ tokens with no </tool_call> (excludes parameter-value content); ending response (model never closed the envelope — would otherwise burn to max_tokens). Sanitizer will salvage what it can."
+            );
+        }
         a.guard_stop = Some("tool_envelope_stuck");
         a.finished = true;
     }
-
-    const TOK_LT: u32 = 27;
-    const TOK_PARAMETER: u32 = 15704;
-    const TOK_EQ: u32 = 28;
-    const TOK_GT: u32 = 29;
-    const TOK_LT_SLASH: u32 = 510;
 
     if a.inside_parameter_body {
         // P0-1 (2026-07-09): PROVISIONAL close detection. The old code
@@ -730,7 +798,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
         // next exact close still exits.
         match a.param_close_pending {
             0 => {
-                if tok == TOK_LT_SLASH {
+                if m.is_lt_slash(tok) {
                     a.param_close_pending = 1;
                 } else {
                     // Any non-close body token advances the counter. The
@@ -741,7 +809,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
                 }
             }
             1 => {
-                if tok == TOK_PARAMETER {
+                if m.is_parameter(tok) {
                     a.param_close_pending = 2;
                 } else {
                     // `</` was value content (e.g. `</div>`), not a close.
@@ -751,7 +819,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
             }
             _ => {
                 a.param_close_pending = 0;
-                if tok == TOK_GT {
+                if m.is_gt(tok) {
                     // Confirmed `</parameter>` — exit body. Also reset the
                     // envelope streak: a confirmed close IS forward progress
                     // (the doc comment above always claimed this reset; the
@@ -773,7 +841,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
     // Not yet inside_parameter_body: scan for `<parameter=KEY>` opener
     // ending at this `>` (29). Lookback 8 tokens for `[27, 15704, 28]`
     // signature without an intervening close.
-    if tok != TOK_GT {
+    if !m.is_gt(tok) {
         return;
     }
     // Auto-detect whether `tok` is already in output_tokens (caller
@@ -793,7 +861,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
     let window = &a.output_tokens[start..n_for_lookback];
     let mut sig_idx: Option<usize> = None;
     for i in 0..window.len().saturating_sub(2) {
-        if window[i] == TOK_LT && window[i + 1] == TOK_PARAMETER && window[i + 2] == TOK_EQ {
+        if m.is_lt(window[i]) && m.is_parameter(window[i + 1]) && m.is_eq_start(window[i + 2]) {
             sig_idx = Some(i + 3);
         }
     }
@@ -801,9 +869,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
     // Check no intervening `</` or `>` in the KEY span between
     // `<parameter=` and the current `>`.
     let body_segment = &window[after_eq..];
-    let intervening_close = body_segment
-        .iter()
-        .any(|&t| t == TOK_LT_SLASH || t == TOK_GT);
+    let intervening_close = body_segment.iter().any(|&t| m.is_lt_slash(t) || m.is_gt(t));
     if !intervening_close {
         a.inside_parameter_body = true;
         a.param_body_chars_emitted = 0;

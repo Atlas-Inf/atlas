@@ -19,8 +19,8 @@ use super::{
     AtlasCudaBackend, cuCtxGetDevice, cuCtxSetCurrent, cuDeviceGetAttribute, cuEventCreate,
     cuEventDestroy_v2, cuEventRecord, cuEventSynchronize, cuGraphDestroy, cuGraphExecDestroy,
     cuGraphLaunch, cuMemAllocHost_v2, cuMemFreeHost, cuMemGetInfo_v2, cuMemsetD2D8Async,
-    cuMemsetD8Async, cuMemsetD32Async, cuStreamBeginCapture, cuStreamCreate, cuStreamEndCapture,
-    cuStreamSynchronize, cuStreamWaitEvent,
+    cuMemsetD8Async, cuMemsetD32Async, cuStreamBeginCapture, cuStreamCreate, cuStreamDestroy_v2,
+    cuStreamEndCapture, cuStreamSynchronize, cuStreamWaitEvent,
 };
 use crate::gpu::{DevicePtr, GraphHandle};
 
@@ -203,9 +203,13 @@ impl AtlasCudaBackend {
         }
         // On unified memory (GB10), cuMemGetInfo reports Linux "free" memory
         // which excludes reclaimable buff/cache. Use MemAvailable instead.
-        if let Some(mem_available) = super::system_available_memory_bytes() {
-            free = free.max(mem_available);
-        }
+        // Carve-out devices excluded: see `unified_free`.
+        free = super::unified_free(
+            free,
+            total,
+            super::system_meminfo_bytes("MemTotal:"),
+            super::system_available_memory_bytes(),
+        );
         Ok(free)
     }
 
@@ -217,6 +221,16 @@ impl AtlasCudaBackend {
             bail!("cuStreamCreate failed: status {status}");
         }
         Ok(stream)
+    }
+
+    pub(super) fn destroy_stream_cu(&self, stream: u64) -> Result<()> {
+        if stream != 0 {
+            let status = unsafe { cuStreamDestroy_v2(stream) };
+            if status != 0 {
+                bail!("cuStreamDestroy_v2 failed: status {status}");
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn bind_to_thread_cu(&self) -> Result<()> {

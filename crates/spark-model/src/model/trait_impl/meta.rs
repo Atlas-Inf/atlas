@@ -28,6 +28,9 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
+mod grid;
+mod kv_cap;
+
 impl TransformerModel {
     pub(super) fn vocab_size_dispatch(&self) -> usize {
         self.config.vocab_size
@@ -174,6 +177,15 @@ impl TransformerModel {
     ) -> Result<()> {
         use spark_runtime::kernel_args::KernelLaunch;
 
+        // GLM's reference KDA recurrence does not clamp its recurrent state.
+        // Keep the upstream policy unless this semantic experiment explicitly
+        // opts out; never change normalization for another model family.
+        if self.config.model_type == "glm5_next"
+            && std::env::var("ATLAS_GLM_SSM_NORMALIZE").as_deref() == Ok("0")
+        {
+            return Ok(());
+        }
+
         let num_ssm = self.ssm_pool.num_ssm_layers;
         if num_ssm == 0 || self.ssm_state_norm_kernel.0 == 0 {
             return Ok(());
@@ -239,13 +251,15 @@ impl TransformerModel {
         let slot = slot_guard
             .idx()
             .expect("claim_guarded returns a guard owning a slot");
+        // A slot released by its guard (abort, panic) skipped `free`: drop any
+        // commit its last sequence left pending, or a flush would land it on
+        // this one (ATLAS_QWEN4EXP_GDN_COMMIT_FUSE).
+        self.gdn_fuse_drop_slot(slot);
         let t_claim = t_alloc.elapsed();
         // NOTE: `reset_slot` below zeroes h_state + conv_state + intermediates +
         // checkpoints — a strict superset of `zero_slot` (h+conv only). The
         // intervening layer_states construction only assigns pool pointers and
         // never writes the state, so the earlier `zero_slot` was redundant work.
-        let has_mtp = self.proposer.is_some() || self.self_speculative;
-
         // ATLAS_MTP_DRAFTER_PREFILL: a fresh sequence invalidates the
         // whole-prompt hidden capture — without this, a warm-restored prefill
         // (no chunks computed) would pair the NEW prompt's tokens with the
@@ -275,10 +289,12 @@ impl TransformerModel {
                     h_state_checkpoint: None,
                     conv_state_checkpoint: None,
                     h_state_intermediates: Vec::new(),
+                    kda_records: spark_runtime::gpu::DevicePtr::NULL,
                     conv_state_intermediates: Vec::new(),
                     gdn_commit_qkv: DevicePtr(0),
                     gdn_commit_gb: DevicePtr(0),
                     gdn_commit_pending: false,
+                    gdn_fuse_n: DevicePtr::NULL,
                     // A freshly allocated slot has just been zeroed, and zero
                     // is zero in both formats. Which format it then HOLDS is
                     // decided by the pool width, not by the phase: under the
@@ -293,34 +309,8 @@ impl TransformerModel {
                     ple: None,
                 };
 
-                if has_mtp {
-                    // Use pool-based fixed addresses (stable across sequence
-                    // lifetimes → CUDA graph can replay without stale pointers).
-                    ssm_state.h_state_checkpoint =
-                        Some(self.ssm_pool.h_checkpoint(ssm_layer_idx, slot));
-                    ssm_state.conv_state_checkpoint =
-                        Some(self.ssm_pool.conv_checkpoint(ssm_layer_idx, slot));
-
-                    // Tiered pools: H count is per-SLOT (h_inter_count),
-                    // conv count is uniform. The vec lengths are the
-                    // capacity gates every verify arm checks before writing.
-                    for t in 0..self.ssm_pool.h_inter_count(slot) {
-                        ssm_state
-                            .h_state_intermediates
-                            .push(self.ssm_pool.h_intermediate(ssm_layer_idx, slot, t));
-                    }
-                    for t in 0..self.ssm_pool.num_intermediates {
-                        ssm_state
-                            .conv_state_intermediates
-                            .push(self.ssm_pool.conv_intermediate(ssm_layer_idx, slot, t));
-                    }
-                    // Deferred-commit input staging: pool-stable addresses —
-                    // the staging copies run inside captured verify graphs,
-                    // so lazy host alloc there would be wrong twice over
-                    // (capture-illegal and replay-invisible).
-                    ssm_state.gdn_commit_qkv = self.ssm_pool.commit_qkv(ssm_layer_idx, slot);
-                    ssm_state.gdn_commit_gb = self.ssm_pool.commit_gb(ssm_layer_idx, slot);
-                }
+                self.ssm_pool
+                    .attach_verify_rollback(ssm_layer_idx, slot, &mut ssm_state);
 
                 layer_states.push(Box::new(ssm_state));
                 ssm_layer_idx += 1;
@@ -385,6 +375,8 @@ impl TransformerModel {
             );
         }
         Ok(SequenceState {
+            disable_mtp: false,
+            eos_ban: crate::traits::EosBan::default(),
             adapter_id: 0,
             adapter_slot: -1,          // default: defer to installed active adapter
             acquired_adapter_slot: -1, // Task #25: no ref held until prefill acquires
@@ -409,8 +401,13 @@ impl TransformerModel {
             cached_prefix_tokens: 0,
             cached_prefix_blocks: 0,
             prefix_ref_tokens: Vec::new(),
+            vision_cache_key: Vec::new(),
+            vision: Default::default(),
             prefix_lookup_applied: false,
             prefix_lookup_skip: false,
+            pc_branch_at: None,
+            pc_plant_at: None,
+            finish_leaf: Default::default(),
             kv_valid_tokens: 0,
             last_decode_ckpt_block: 0,
             prompt_len: 0,

@@ -33,7 +33,7 @@ fn compile_invalid_ebnf_is_typed_error() {
 fn compile_grammar_data_directly() {
     let c = compiler(1);
     let grammar = crate::grammar::parse_ebnf_default("root ::= \"yes\" | \"no\"\n").unwrap();
-    let cg = c.compile_grammar(grammar);
+    let cg = c.compile_grammar(grammar).unwrap();
     assert!(cg.grammar().optimized);
 }
 

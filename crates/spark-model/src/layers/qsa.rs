@@ -20,11 +20,12 @@
 //! launch scratch is layer-owned and steps serialize on one stream, so a
 //! `QsaSelection` is valid only until the next `decode_select` on this layer.
 //!
-//! CUDA graphs: the default top-k arm is a host sort on the scores (D2H), the
-//! ingest counter is host state, and launch parameters depend on the
-//! position — a layer carrying an indexer vetoes decode-graph capture
-//! entirely. `ATLAS_QSA_DEVICE_TOPK=1` removes the host sort up to
-//! `QSA_SELECT_MAX_BLOCKS` complete blocks; the veto stays.
+//! CUDA graphs: the ingest counter is host state and launch parameters depend
+//! on the position, so an indexer vetoes decode-graph capture, except for an
+//! inert step whose ingest is staged (`qsa_staged.rs`). Top-k runs on the
+//! device by default (`qsa_select_topk_radix`, identical selection to the host
+//! `rank_cmp`) to `QSA_SELECT_MAX_BLOCKS` (every width with
+//! `ATLAS_QWEN4EXP_QSA_TOPK_WIDE=1`); `ATLAS_QSA_DEVICE_TOPK=0`: host sort.
 
 use anyhow::{Context, Result};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -33,18 +34,40 @@ use crate::layers::ops;
 
 #[path = "qsa_aux.rs"]
 mod qsa_aux;
+#[path = "qsa_decode_rows.rs"]
+mod qsa_decode_rows;
+#[path = "qsa_yarn.rs"]
+mod qsa_yarn;
+pub use qsa_decode_rows::{QSA_ROWS_MAX, QsaRowsSelection, draft_share_set};
 #[path = "qsa_decode_select.rs"]
 mod qsa_decode_select;
 #[path = "qsa_free.rs"]
 mod qsa_free;
-
+#[path = "qsa_key_only.rs"]
+mod qsa_key_only;
 #[path = "qsa_select.rs"]
 mod qsa_select;
+#[path = "qsa_select_sp.rs"]
+pub mod qsa_select_sp;
+#[path = "qsa_staged.rs"]
+mod qsa_staged;
+pub use qsa_staged::{CommitEntry, CommitTable, StagedIngest, staged_ingest};
 #[path = "qsa_select_stages.rs"]
 mod qsa_select_stages;
+#[path = "qsa_window.rs"]
+mod qsa_window;
 #[cfg(all(test, feature = "cuda"))]
 #[path = "qsa_tests.rs"]
 mod tests;
+
+/// Kill switch `ATLAS_QSA_NO_PREFILL_SELECT=1` (read once): stage-1 behavior,
+/// dense prefill past the inert bound (decode still selects). It skips the
+/// `ATLAS_QWEN4EXP_PREFILL_QSA_SPLIT` exchanges, so both ranks must agree
+/// (`model::startup_parity`).
+pub fn no_prefill_select() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("ATLAS_QSA_NO_PREFILL_SELECT").as_deref() == Ok("1"))
+}
 
 /// One decode step's selection: contiguous NHD `k/v` scratch + identity table.
 pub struct QsaSelection {
@@ -57,16 +80,20 @@ pub struct QsaSelection {
 }
 
 pub struct QsaSeqState {
-    /// Tokens whose raw keys are in `raw_keys` (contiguous from 0).
+    /// Tokens whose raw keys have been ingested (contiguous from 0).
     ingested: usize,
     /// Complete 4-token blocks pooled into `block_keys`.
     pooled: usize,
     /// Identity block table upload done (needs block_size, known lazily).
     table_len: usize,
-    /// [max_tokens, hd] BF16 — this sequence's raw indexer keys.
-    raw_keys: DevicePtr,
-    /// [max_tokens/ratio, hd] BF16 — this sequence's pooled block keys.
+    /// Positions `block_keys` can hold; grown on demand (`qsa_free.rs`).
+    cap: usize,
+    /// [cap/ratio, hd] BF16 — this sequence's pooled block keys.
     block_keys: DevicePtr,
+    /// Raw keys still to be pooled, plus a rewind margin (`qsa_window.rs`).
+    raw: qsa_window::RawWindow,
+    /// MTP drafter selection reuse (`qsa_draft_share.rs`); `Off` elsewhere.
+    share: qsa_decode_rows::DraftShare,
 }
 
 pub struct QsaIndexer {
@@ -81,6 +108,8 @@ pub struct QsaIndexer {
     block_topk: u32,
     rot: u32,
     theta: f32,
+    yarn_inv_freq: DevicePtr,
+    yarn_attention_factor: f32,
     eps: f32,
     hidden: u32,
     nkv_attn: u32,
@@ -88,6 +117,8 @@ pub struct QsaIndexer {
     max_tokens: usize,
 
     k_pool_k: KernelHandle,
+    /// `qsa_commit_table` (`qsa_staged.rs`), 0 where the target lacks it.
+    k_commit_table_k: KernelHandle,
     k_qprep_k: KernelHandle,
     k_score_k: KernelHandle,
     k_gather_k: KernelHandle,
@@ -112,6 +143,8 @@ pub struct QsaIndexer {
     /// and fails on the first mismatch.
     device_topk: bool,
     topk_verify: bool,
+    /// `ATLAS_QWEN4EXP_QSA_TOPK_WIDE` / `_DECODE_ROWS` (`qsa_decode_rows.rs`).
+    rows: qsa_decode_rows::RowsPath,
     /// `QSA_PA_G` q-heads per block. Same math, one K/V read per group
     /// instead of per head; see `ops::qsa_prefill_attn_grouped_ok`.
     k_prefill_attn_g_k: KernelHandle,
@@ -179,16 +212,15 @@ impl QsaIndexer {
             Some(n) => n,
             None => max_seq_len,
         };
-        let per_seq_bytes = max_tokens * hd * 2 + max_tokens / ratio * hd * 2;
         tracing::info!(
-            "QSA: indexer capacity {} tokens (max_seq_len={}, per-seq {} B)",
-            max_tokens,
-            max_seq_len,
-            per_seq_bytes
+            "QSA: indexer capacity {max_tokens} tokens (max_seq_len={max_seq_len}); \
+             per-seq pooled keys grow on demand, {} B/token",
+            (hd * 2).div_ceil(ratio)
         );
         let block_topk = budget / ratio;
         let qk_width = (n_heads + 1) * hd;
-        let sel_cap = budget + ratio;
+        // + room for a shared draft selection's longer tail.
+        let sel_cap = budget + ratio + qsa_decode_rows::SHARE_MARGIN;
         Ok(Self {
             qk_proj_w,
             q_norm_w,
@@ -200,12 +232,15 @@ impl QsaIndexer {
             block_topk: block_topk as u32,
             rot: rot as u32,
             theta,
+            yarn_inv_freq: DevicePtr::NULL,
+            yarn_attention_factor: 1.0,
             eps,
             hidden: hidden as u32,
             nkv_attn: nkv_attn as u32,
             hd_attn: hd_attn as u32,
             max_tokens,
             k_pool_k: gpu.kernel("qsa_indexer", "qsa_block_pool")?,
+            k_commit_table_k: super::try_kernel(gpu, "qsa_indexer", "qsa_commit_table"),
             k_qprep_k: gpu.kernel("qsa_indexer", "qsa_qprep")?,
             k_score_k: gpu.kernel("qsa_indexer", "qsa_score")?,
             k_gather_k: gpu.kernel("qsa_indexer", "qsa_gather")?,
@@ -217,9 +252,10 @@ impl QsaIndexer {
             k_score_rows_gemm_k: super::try_kernel(gpu, "qsa_indexer", "qsa_score_rows_gemm"),
             k_score_rows_tc_k: super::try_kernel(gpu, "qsa_score_tc", "qsa_score_rows_tc"),
             k_prefill_attn_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn")?,
-            k_select_k: gpu.kernel("qsa_indexer", "qsa_select_topk")?,
-            device_topk: std::env::var("ATLAS_QSA_DEVICE_TOPK").ok().as_deref() == Some("1"),
+            k_select_k: gpu.kernel("qsa_indexer", "qsa_select_topk_radix")?,
+            device_topk: std::env::var("ATLAS_QSA_DEVICE_TOPK").ok().as_deref() != Some("0"),
             topk_verify: std::env::var("ATLAS_QSA_TOPK_VERIFY").ok().as_deref() == Some("1"),
+            rows: qsa_decode_rows::RowsPath::new(n_heads, hd, sel_cap, hd_attn, gpu)?,
             k_prefill_attn_g_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn_g")?,
             k_prefill_attn_l8_k: gpu.kernel("qsa_indexer", "qsa_prefill_attn_l8")?,
             k_prefill_attn_tc_k: super::try_kernel(gpu, "qsa_attn_tc", "qsa_prefill_attn_tc"),
@@ -238,8 +274,6 @@ impl QsaIndexer {
     }
 
     /// The largest visible prefix whose selection is provably all-visible.
-    /// One sequence's indexer carry: counters + raw/pooled key buffers
-    /// (per-seq CONTENT; launch scratch stays layer-owned — steps serialize).
     pub fn inert_bound(&self) -> usize {
         (self.budget + self.ratio - 1) as usize
     }
@@ -272,6 +306,7 @@ impl QsaIndexer {
         if seq_start == 0 {
             st.ingested = 0;
             st.pooled = 0;
+            st.raw.restart_at(0);
         }
         anyhow::ensure!(
             seq_start == st.ingested,
@@ -281,13 +316,7 @@ impl QsaIndexer {
              re-ingest cached prefixes.",
             st.ingested
         );
-        anyhow::ensure!(
-            seq_start + num_tokens <= self.max_tokens,
-            "QSA: {} tokens exceeds the indexer capacity {} — it derives \
-             from --max-seq-len (ATLAS_QSA_MAX_TOKENS overrides)",
-            seq_start + num_tokens,
-            self.max_tokens
-        );
+        self.reserve(st, seq_start + num_tokens, gpu, stream)?;
 
         let hd = self.hd as usize;
         let qkw = self.qk_width();
@@ -304,46 +333,21 @@ impl QsaIndexer {
                 stream,
             )
             .context("QSA qk projection (prefill)")?;
-            // Raw key = the last hd columns of each row.
+            // Raw key = the last hd columns of each row; pooled per slab
+            // (blocks pool independently), so the window holds one slab.
+            self.raw_room(st, ts, gpu, stream)?;
             gpu.copy_d2d_2d_async(
                 self.qk_scratch.offset(self.n_heads as usize * hd * 2),
                 qkw * 2,
-                st.raw_keys.offset((seq_start + off) * hd * 2),
+                self.raw_slot(st, seq_start + off),
                 hd * 2,
                 hd * 2,
                 ts,
                 stream,
             )?;
             off += ts;
-        }
-        st.ingested = seq_start + num_tokens;
-        self.pool_new_blocks(st, gpu, stream)
-    }
-
-    fn pool_new_blocks(
-        &self,
-        st: &mut QsaSeqState,
-        gpu: &dyn GpuBackend,
-        stream: u64,
-    ) -> Result<()> {
-        let complete = st.ingested / self.ratio as usize;
-        if complete > st.pooled {
-            ops::qsa_block_pool(
-                gpu,
-                self.k_pool_k,
-                st.raw_keys,
-                self.k_norm_w,
-                st.block_keys,
-                st.pooled as u32,
-                (complete - st.pooled) as u32,
-                self.ratio,
-                self.hd,
-                self.rot,
-                self.theta,
-                self.eps,
-                stream,
-            )?;
-            st.pooled = complete;
+            st.ingested = seq_start + off;
+            self.pool_new_blocks(st, gpu, stream)?;
         }
         Ok(())
     }
@@ -371,12 +375,7 @@ impl QsaIndexer {
              cache lost sync (prefix-cache skip or a rewound sequence)",
             st.ingested
         );
-        anyhow::ensure!(
-            pos < self.max_tokens,
-            "QSA: pos {pos} >= indexer capacity {} — it derives from \
-             --max-seq-len (ATLAS_QSA_MAX_TOKENS overrides)",
-            self.max_tokens
-        );
+        self.reserve(st, pos + 1, gpu, stream)?;
 
         let hd = self.hd as usize;
         let qkw = self.qk_width();
@@ -391,9 +390,10 @@ impl QsaIndexer {
             stream,
         )
         .context("QSA qk projection (decode)")?;
+        self.raw_room(st, 1, gpu, stream)?;
         gpu.copy_d2d_async(
             self.qk_scratch.offset(self.n_heads as usize * hd * 2),
-            st.raw_keys.offset(pos * hd * 2),
+            self.raw_slot(st, pos),
             hd * 2,
             stream,
         )?;
@@ -407,9 +407,16 @@ impl QsaIndexer {
             return Ok(None); // provably all-visible: dense path is exact
         };
         let (complete, tail_start, n_sel) = (geo.complete, geo.tail_start, geo.n_sel);
+        // ATLAS_QWEN4EXP_MTP_INDEX_SHARE: a draft reuses its propose's blocks.
+        if let Some(n) = self.draft_share_tail(st, visible, gpu, stream)? {
+            let kv = [k_pool, v_pool, block_table_dev];
+            return self
+                .gather_selection(st, n, kv, block_size, gpu, stream)
+                .map(Some);
+        }
 
         // q prep + block scores.
-        ops::qsa_qprep(
+        ops::qsa_qprep_scaled(
             gpu,
             self.k_qprep_k,
             self.qk_scratch,
@@ -421,27 +428,36 @@ impl QsaIndexer {
             pos as u32,
             self.theta,
             self.eps,
+            self.yarn_inv_freq,
+            self.yarn_attention_factor,
             stream,
         )?;
-        ops::qsa_score(
-            gpu,
-            self.k_score_k,
-            self.q_post,
-            st.block_keys,
-            self.scores_dev,
-            complete as u32,
-            self.n_heads,
-            self.hd,
-            stream,
-        )?;
+        if self.rows.decode_rows {
+            // `qsa_score_rows_dec` at one row: the same bytes as qsa_score.
+            self.score_dec_one(st, pos, complete, gpu, stream)?;
+        } else {
+            ops::qsa_score(
+                gpu,
+                self.k_score_k,
+                self.q_post,
+                st.block_keys,
+                self.scores_dev,
+                complete as u32,
+                self.n_heads,
+                self.hd,
+                stream,
+            )?;
+        }
 
         // Block selection. `n_sel` never depends on the scores, only the
-        // CONTENT of `sel_dev` does. Device arm: one kernel writes `sel_dev`
-        // (no D2H, no host sort, no H2D). Host arm (default, and anything
-        // wider than the kernel's flag array): D2H + sort + H2D — decode
+        // CONTENT of `sel_dev` does. Device arm (default): one radix-select
+        // kernel writes `sel_dev` (no D2H, sort or H2D). Host arm (rollback,
+        // and wider than QSA_SELECT_MAX_BLOCKS): D2H + sort + H2D — decode
         // graphs are vetoed whenever an indexer is present, so neither arm
         // ever runs inside a capture.
-        if self.device_topk && complete <= qsa_decode_select::QSA_SELECT_MAX_BLOCKS {
+        if self.device_topk
+            && (complete <= qsa_decode_select::QSA_SELECT_MAX_BLOCKS || self.rows.topk_wide)
+        {
             ops::qsa_select_topk(
                 gpu,
                 self.k_select_k,
@@ -463,38 +479,15 @@ impl QsaIndexer {
             let sel_bytes: Vec<u8> = sel.iter().flat_map(|v| v.to_le_bytes()).collect();
             gpu.copy_h2d_async(&sel_bytes, self.sel_dev, stream)?;
         }
-        ops::qsa_gather(
-            gpu,
-            self.k_gather_k,
-            k_pool,
-            v_pool,
-            block_table_dev,
-            self.sel_dev,
-            self.k_scratch,
-            self.v_scratch,
+        self.draft_share_record(st, tail_start);
+        self.gather_selection(
+            st,
             n_sel,
+            [k_pool, v_pool, block_table_dev],
             block_size,
-            self.nkv_attn,
-            self.hd_attn,
+            gpu,
             stream,
-        )?;
-
-        // Identity table + seq_len for the scratch-as-paged-cache view.
-        let pages = (n_sel as usize).div_ceil(block_size as usize);
-        if st.table_len < pages {
-            let ident: Vec<u8> = (0..pages as i32).flat_map(|v| v.to_le_bytes()).collect();
-            gpu.copy_h2d_async(&ident, self.table_dev, stream)?;
-            st.table_len = pages;
-        }
-        gpu.copy_h2d_async(&(n_sel as i32).to_le_bytes(), self.seq_len_dev, stream)?;
-
-        Ok(Some(QsaSelection {
-            k_scratch: self.k_scratch,
-            v_scratch: self.v_scratch,
-            table_dev: self.table_dev,
-            seq_len_dev: self.seq_len_dev,
-            n_sel,
-            max_blocks: pages as u32,
-        }))
+        )
+        .map(Some)
     }
 }

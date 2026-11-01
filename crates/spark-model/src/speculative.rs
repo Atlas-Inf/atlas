@@ -5,6 +5,8 @@
 //! Defines the [`DraftProposer`] trait for speculative decoding strategies.
 //! MTP implements this first; EAGLE-3 can implement later without engine changes.
 
+pub mod deep_depth;
+pub mod glm_repair_policy;
 pub mod ladder;
 pub mod tree_shape;
 pub mod verify_key;
@@ -27,6 +29,9 @@ use crate::layer::ForwardContext;
 pub trait ProposerState: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
+    /// The request's min_tokens floor (`EosBan::floor`, 0 = none): drafts
+    /// for positions below it should not end the turn. Default: ignored.
+    fn set_end_floor(&mut self, _floor: usize) {}
 }
 
 /// A draft token proposer for speculative decoding.
@@ -296,6 +301,61 @@ pub trait DraftProposer: Send + Sync {
         None
     }
 
+    /// Whether a single-sequence [`Self::propose`] handed `comm` (with a
+    /// grammar mask or not) swaps work with the peer rank
+    /// (`ATLAS_GLM_DRAFT_TP`). The model announces such a propose to the
+    /// worker before it calls it.
+    fn rank_split_ready(&self, _comm: &dyn spark_comm::CommBackend, _grammar: bool) -> bool {
+        false
+    }
+
+    /// The rows a [`Self::propose_batch`] of `n` sequences handed `comm`
+    /// (with a grammar mask or not) swaps halves with the peer rank over
+    /// (`ATLAS_GLM_DRAFT_TP_BATCH`), if it does. The model announces such a
+    /// propose to the worker, with these rows, before it calls it.
+    fn rank_split_batch_rows(
+        &self,
+        _comm: &dyn spark_comm::CommBackend,
+        _n: usize,
+        _grammar: bool,
+    ) -> Option<usize> {
+        None
+    }
+
+    /// `ATLAS_QWEN4EXP_MTP_DRAFT_TP`: the announce word of a
+    /// [`Self::propose_batch`] of `n` sequences and `num_drafts` positions
+    /// handed `comm` (with a grammar mask or not), if the worker serves part
+    /// of it. The model announces such a propose with this word before it
+    /// calls it, and hands it `comm` then and only then. `ctx` is the
+    /// propose's: no announce for a propose that will not run batched.
+    fn draft_tp_word(
+        &self,
+        _comm: &dyn spark_comm::CommBackend,
+        _n: usize,
+        _num_drafts: usize,
+        _grammar: bool,
+        _ctx: &crate::layer::ForwardContext<'_>,
+    ) -> Option<u32> {
+        None
+    }
+
+    /// `ATLAS_GLM_DRAFT_TP_CTX`: the context rows the split propose about to
+    /// be announced over `comm` appends split, packed for the announce
+    /// (`rank_split::announce_word`; 0 = none). `seqs` holds each sequence's
+    /// state, capture row and position as the propose will receive them.
+    /// The proposer keeps the rows for that propose.
+    fn rank_split_ctx(
+        &self,
+        _comm: &dyn spark_comm::CommBackend,
+        _seqs: &[(
+            &dyn ProposerState,
+            Option<spark_runtime::gpu::DevicePtr>,
+            usize,
+        )],
+    ) -> u32 {
+        0
+    }
+
     /// Chain confidence of the most recent `propose` (min top-1 softmax prob
     /// across its drafts), when the proposer computes it (`draft_conf_tau` >
     /// 0). `None` = not computed; callers must not gate on it then.
@@ -535,6 +595,54 @@ pub trait DraftProposer: Send + Sync {
         state: &mut dyn ProposerState,
         stream: u64,
     ) -> Result<()>;
+
+    /// `ATLAS_QWEN4EXP_MTP_ABSORB`: the verify settling this state's drafts
+    /// accepted `tokens` (its first `tokens.len()` drafts), and `streams`
+    /// holds that verify's first `tokens.len()` rows of the target's final
+    /// stream highway (`[rows, hc, hidden]` FP32, the live forward's). A
+    /// proposer that rebuilds its context from the target copies them now —
+    /// the next forward reuses the buffer. Default: no-op.
+    // Ported from Enntity/atlas 166e2b1, e7d4e1a (AGPL-3.0-only).
+    fn stage_absorb(
+        &self,
+        _state: &mut dyn ProposerState,
+        _streams: DevicePtr,
+        _tokens: &[u32],
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// `ATLAS_QWEN4EXP_MTP_PREFILL`: highway rows `hc_row ..` hold the final
+    /// streams of prompt positions `first_pos ..` (`rows` of them), noted at
+    /// a prefill chunk's capture point for [`Self::absorb_prompt`]. Default:
+    /// no-op.
+    fn note_prompt_rows(
+        &self,
+        _state: &mut dyn ProposerState,
+        _first_pos: usize,
+        _rows: usize,
+        _hc_row: usize,
+    ) {
+    }
+
+    /// After a prefill chunk returns (its logits computed, its highway rows
+    /// still live): build the drafter's context over the noted rows of
+    /// `prompt` (the whole prompt's tokens). Default: no-op.
+    fn absorb_prompt(
+        &self,
+        _state: &mut dyn ProposerState,
+        _prompt: &[u32],
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// At a propose, `tokens` the sequence's: hands over the token of a
+    /// prompt row [`Self::absorb_prompt`] left waiting. Default: no-op.
+    fn prompt_tail_token(&self, _state: &mut dyn ProposerState, _tokens: &[u32]) {}
 
     /// Free per-sequence proposer state (KV cache blocks, device buffers, etc.).
     ///

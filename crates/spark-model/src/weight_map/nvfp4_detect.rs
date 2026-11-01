@@ -33,13 +33,19 @@ pub fn detect_nvfp4_variant(
     // `CUDA_ERROR_ILLEGAL_ADDRESS` bug.
     if let Some(qc) = &config.quantization_config {
         match qc.quant_method.as_str() {
-            "modelopt" if atlas_core::config::is_nvfp4_quant_algo(&qc.quant_algo) => {
+            // `modelopt_mixed` is the method label on ModelOpt MIXED_PRECISION
+            // dumps (Nemotron 3.5 Super VL NVFP4) — same map-driven semantics.
+            "modelopt" | "modelopt_mixed"
+                if atlas_core::config::is_nvfp4_quant_algo(&qc.quant_algo) =>
+            {
                 return Nvfp4Variant::Standard;
             }
-            "modelopt" if qc.quant_algo.eq_ignore_ascii_case("FP8") => {
+            "modelopt" | "modelopt_mixed" if qc.quant_algo.eq_ignore_ascii_case("FP8") => {
                 return Nvfp4Variant::Fp8Dequanted;
             }
-            "modelopt" if qc.quant_algo.eq_ignore_ascii_case("MIXED_PRECISION") => {
+            "modelopt" | "modelopt_mixed"
+                if qc.quant_algo.eq_ignore_ascii_case("MIXED_PRECISION") =>
+            {
                 // The per-component `quantized_layers` map is authoritative —
                 // and consulting it here is REQUIRED, not optional: nvidia's
                 // Flash-Next pack carries `weight_scale_inv` on its MTP
@@ -240,6 +246,12 @@ pub(crate) fn quantized_any(
     variant: Nvfp4Variant,
     qctx: QuantizeCtx,
 ) -> Result<QuantizedWeight> {
+    // EXL3-packed linear (routed/shared experts stay packed until the loader
+    // asks): dequantize to a transient BF16 buffer, then run the same runtime
+    // quantization the Bf16Raw arm below performs.
+    if store.contains(&format!("{prefix}.trellis")) {
+        return crate::weight_map::exl3::quantized_from_exl3(store, prefix, n, k, gpu, qctx);
+    }
     let _t_detect = std::time::Instant::now();
     // Per-key fallback (B8 #bugs RedHatAI/Qwen3-Coder-Next-NVFP4): some
     // models that are CompressedTensors overall keep certain projections
@@ -332,7 +344,12 @@ pub(crate) fn quantized_any(
             // `quantized_any`) holds BOTH the ~60GB BF16 experts AND the ~22GB
             // NVFP4 copies → ~109GB pre-KV, no room for KV. Safe + mirrors
             // `quantized_from_fp8` which frees its BF16 intermediate the same way.
-            gpu.free(w.ptr)?;
+            // `reclaim`, not `gpu.free`: the source is a WeightStore tensor, and
+            // a raw free left `WeightStore::release` to free it again at
+            // teardown (#122). This was the residual 72 on GB10 Flash-Next after
+            // the transpose fix: 24 layers ship their shared expert as BF16, 3
+            // tensors each.
+            store.reclaim(gpu, &format!("{prefix}.weight"))?;
             T_FREE.fetch_add(_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let c = N.fetch_add(1, Ordering::Relaxed) + 1;
             if c.is_multiple_of(512) {

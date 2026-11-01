@@ -10,6 +10,11 @@ pub fn bf16_to_f32(lo: u8, hi: u8) -> f32 {
     f32::from_bits(((lo as u32) | ((hi as u32) << 8)) << 16)
 }
 
+mod dflash_seq_policy;
+mod watchdog_floor;
+use dflash_seq_policy::dflash_seq_raw_argmax_policy;
+pub use watchdog_floor::watchdog_floor_reached;
+
 /// Whether a verify path may bypass the canonical logits pipeline.
 /// Official Lightning DSpark is always masked: raw argmax can select forbidden
 /// structural tokens such as `</think>` on plain completions, violating AR
@@ -31,25 +36,24 @@ pub fn dflash_verify_uses_raw_argmax(
 /// branch so the emitted stream follows the request's sampling parameters.
 /// Verify positions are greedy argmax by design (`PositionKind::Verify`),
 /// so a nonzero request temperature does not itself disqualify the raw
-/// path — only transforms that can move the argmax do.
+/// path — only transforms that can move the argmax do. A model whose verify
+/// head writes only argmax ids (`verify_logits_argmax_only`) always takes
+/// the raw path: its logits buffer is partly stale.
 pub fn dflash_seq_uses_raw_argmax(
     raw_requested: bool,
     masked_requested: bool,
-    lightning_product: bool,
-    a: &crate::scheduler::types::ActiveSeq,
+    model: &dyn spark_model::traits::Model,
+    a: &mut crate::scheduler::types::ActiveSeq,
+    argmax_ids: &[u32],
 ) -> bool {
-    dflash_verify_uses_raw_argmax(raw_requested, masked_requested, lightning_product)
-        && a.grammar_state.is_none()
-        && !a.require_tool_call
-        && crate::scheduler::fast_greedy::classify_penalties(
-            &crate::scheduler::sample_step::penalty_params_for(
-                a,
-                crate::scheduler::sample_step::PositionKind::Verify,
-                0.0,
-                None,
-                Vec::new(),
-            ),
-        ) == crate::scheduler::fast_greedy::PenaltyGate::Neutral
+    dflash_seq_raw_argmax_policy(
+        raw_requested,
+        masked_requested,
+        model.is_lightning_dspark_product(),
+        model.verify_logits_argmax_only(),
+        a,
+        argmax_ids,
+    )
 }
 
 #[cfg(test)]
@@ -67,31 +71,6 @@ mod dflash_verify_policy_tests {
         assert!(dflash_verify_uses_raw_argmax(true, false, false));
         assert!(!dflash_verify_uses_raw_argmax(true, true, false));
         assert!(!dflash_verify_uses_raw_argmax(false, false, false));
-    }
-
-    #[test]
-    fn per_sequence_gate_stays_raw_only_for_neutral_greedy() {
-        use super::dflash_seq_uses_raw_argmax;
-        let (mut a, _rx) = crate::scheduler::test_support::test_seq(vec![1, 2, 3], 10, None, 32);
-        // Neutral penalties + no grammar + no tool-call EOS suppression:
-        // the verify pick is provably the raw argmax — shortcut stays on.
-        assert!(dflash_seq_uses_raw_argmax(true, false, false, &a));
-        // The non-thinking preset ships presence_penalty=1.5 — a reduce-only
-        // penalty that CAN flip the argmax against already-emitted tokens.
-        a.presence_penalty = 1.5;
-        assert!(!dflash_seq_uses_raw_argmax(true, false, false, &a));
-        a.presence_penalty = 0.0;
-        a.repetition_penalty = 1.05;
-        assert!(!dflash_seq_uses_raw_argmax(true, false, false, &a));
-        a.repetition_penalty = 1.0;
-        a.dry_multiplier = 0.4;
-        assert!(!dflash_seq_uses_raw_argmax(true, false, false, &a));
-        a.dry_multiplier = 0.0;
-        a.require_tool_call = true;
-        assert!(!dflash_seq_uses_raw_argmax(true, false, false, &a));
-        // Process-wide flag still dominates: raw off stays off per-seq.
-        a.require_tool_call = false;
-        assert!(!dflash_seq_uses_raw_argmax(false, false, false, &a));
     }
 }
 
@@ -418,6 +397,10 @@ pub struct WatchdogParams {
     /// FIRST model's value for every model after it, and its installer runs
     /// after the scheduler thread is already spawned.
     pub honor_eos_inside_thinking: bool,
+    /// An end token inside `<think>` ends the turn (MODEL.toml
+    /// `[behavior].eos_ends_thinking`), outranking
+    /// `honor_eos_inside_thinking`. Default false.
+    pub eos_ends_thinking: bool,
     /// Per-model gate for the THINKING-phase token-loop watchdog. Default
     /// `true` (the behaviour before the flag existed), so a model that does not
     /// opt out is unaffected. Was a `OnceLock`; see the note above.
@@ -459,6 +442,7 @@ const DEFAULT_WATCHDOG_PARAMS: WatchdogParams = WatchdogParams {
     rollback_resteer: true,
     // FALSE = pre-p350 behaviour: a mid-think EOS is discarded, not honored.
     honor_eos_inside_thinking: false,
+    eos_ends_thinking: false,
     enable_think_loop_watchdog: true,
     content_loop_min_repeats: None,
 };
@@ -509,6 +493,7 @@ impl WatchdogParams {
             max_post_think_content_tokens: b.max_post_think_content_tokens,
             rollback_resteer: b.rollback_resteer,
             honor_eos_inside_thinking: b.honor_eos_inside_thinking,
+            eos_ends_thinking: b.eos_ends_thinking,
             enable_think_loop_watchdog: b.enable_think_loop_watchdog,
             content_loop_min_repeats: None,
         };

@@ -15,6 +15,7 @@ use axum::response::{IntoResponse, Json, Response};
 
 use crate::AppState;
 use crate::ir;
+use crate::literal_xml::state_after;
 use crate::tool_parser;
 
 use super::chat_blocking_choice::{build_choice_message, build_logprobs};
@@ -58,6 +59,8 @@ pub(super) struct BlockingPathArgs {
     pub stop_tokens: Vec<u32>,
     pub enable_thinking: bool,
     pub thinking_budget: Option<u32>,
+    /// `chat_template_kwargs.force_nonempty_content`.
+    pub force_nonempty_content: bool,
     pub tools_active: bool,
     pub tool_choice_required: bool,
     pub suppress_tool_call: bool,
@@ -81,7 +84,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         num_beams,
         length_penalty,
         early_stopping,
-        image_pixels,
+        mut image_pixels,
         max_tokens,
         temperature,
         top_k,
@@ -99,6 +102,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         stop_tokens,
         enable_thinking,
         thinking_budget,
+        force_nonempty_content,
         tools_active,
         tool_choice_required,
         suppress_tool_call,
@@ -134,13 +138,17 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
             num_beams,
             length_penalty,
             early_stopping,
-            image_pixels: if choice_idx == 0 {
-                image_pixels.clone()
+            // VisionItem clones share the pixel storage and in-flight permit.
+            // Keep the images present for every serial choice; move the final
+            // vector so n=1 and the last choice avoid an extra Vec clone.
+            image_pixels: if choice_idx + 1 == n {
+                std::mem::take(&mut image_pixels)
             } else {
-                Vec::new()
+                image_pixels.clone()
             },
             max_tokens,
             min_tokens: req.min_tokens,
+            ignore_eos: req.ignore_eos,
             temperature,
             top_k,
             top_p,
@@ -157,6 +165,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
             stop_tokens: stop_tokens.clone(),
             enable_thinking,
             thinking_budget,
+            force_nonempty_content,
             repetition_detection: req.repetition_detection,
             require_tool_call: tool_choice_required,
             tools_present: tools_active,
@@ -181,8 +190,15 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         let response = match rx.await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
+                // A request the scheduler cannot serve as asked is the
+                // client's to fix: 400, which SDKs do not retry.
+                let status = if e.is::<super::InvalidRequestError>() {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
                 return super::chat::ChatOutcome::Http(openai_error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    status,
                     format!("Inference error: {e}"),
                 ));
             }
@@ -207,8 +223,13 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         // n>1 we only charge once (same prompt reused).
         total_cached_prompt_tokens = total_cached_prompt_tokens.max(response.cached_prompt_tokens);
 
-        let (reasoning_content_i, output_text_i) =
-            decode_response_text(&state, &response, enable_thinking);
+        let (reasoning_content_i, output_text_i) = decode_response_text(
+            &state,
+            &response,
+            enable_thinking,
+            tools_active,
+            force_nonempty_content,
+        );
         let (output_text_i, matched_stop) =
             super::inference_impl::strip_stop_sequences_matched(output_text_i, &req.stop);
 
@@ -226,7 +247,9 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         choice.matched_stop = matched_stop;
         choice.finish_reason =
             stop_match_corrected(choice.finish_reason, choice.matched_stop.is_some());
-        choice.logprobs = build_logprobs(&state, &response);
+        if choice.finish_reason != ir::FinishReason::ContentFilter {
+            choice.logprobs = build_logprobs(&state, &response);
+        }
         all_choices.push(choice);
     }
 
@@ -251,41 +274,72 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
 /// init in chat_stream/state.rs and recovers the answer Qwen3.x emits
 /// inside `<think>...</think>` when it ignores a closed-thinking
 /// prefill (issue #40).
-fn decode_response_text(
+pub(super) fn decode_response_text(
     state: &AppState,
     response: &super::inference_types::InferenceResponse,
     enable_thinking: bool,
+    tools_active: bool,
+    force_nonempty_content: bool,
 ) -> (Option<String>, String) {
     let output_tokens =
         output_tokens_without_stop(&response.output_tokens, response.finish_reason.as_str());
-    if let Some(think_tok) = state.think_end_token_id {
-        if let Some((thinking_tokens, content_tokens)) =
+    // GLM's native tool opener also closes reasoning, but belongs to the tool
+    // parser. Prefer the FIRST boundary; a later </think> must not swallow the
+    // tool call. This never scans arbitrary reasoning text for call syntax.
+    let native_split = if enable_thinking && tools_active {
+        state.glm_tool_boundary.and_then(|opener| {
+            output_tokens
+                .iter()
+                .enumerate()
+                .filter(|(_, token)| **token == opener)
+                .find_map(|(pos, _)| {
+                    if output_tokens[..pos]
+                        .iter()
+                        .any(|token| Some(*token) == state.think_end_token_id)
+                    {
+                        return None;
+                    }
+                    let prefix_is_literal = state
+                        .tokenizer
+                        .decode(&output_tokens[..pos])
+                        .ok()
+                        .is_some_and(|prefix| state_after(&prefix).is_literal());
+                    (!prefix_is_literal).then_some((&output_tokens[..pos], &output_tokens[pos..]))
+                })
+        })
+    } else {
+        None
+    };
+    if let Some((thinking_tokens, content_tokens)) = native_split.or_else(|| {
+        state.think_end_token_id.and_then(|think_tok| {
             split_at_first_think_end(output_tokens, think_tok, enable_thinking)
-        {
-            let reasoning = if !thinking_tokens.is_empty() {
-                state
-                    .tokenizer
-                    .decode(thinking_tokens)
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-            } else {
-                None
-            };
-            // The split consumes only the FIRST close. Laguna emits the close
-            // more than once (observed: [19, answer, 19, answer] for a question
-            // it declines to reason about), so scrub any survivor — the
-            // streaming path has always done this, the blocking path did not,
-            // which is why stream:false leaked '</think>' into content while
-            // stream:true did not.
-            let content = super::strip::scrub_think_markers(
-                state
-                    .tokenizer
-                    .decode(content_tokens)
-                    .unwrap_or_default()
-                    .trim_start(),
-            );
-            return (reasoning, content);
-        }
+        })
+    }) {
+        let reasoning = if !thinking_tokens.is_empty() {
+            state
+                .tokenizer
+                .decode(thinking_tokens)
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        } else {
+            None
+        };
+        // The split consumes only the FIRST close. Laguna emits the close
+        // more than once (observed: [19, answer, 19, answer] for a question
+        // it declines to reason about), so scrub any survivor — the
+        // streaming path has always done this, the blocking path did not,
+        // which is why stream:false leaked '</think>' into content while
+        // stream:true did not.
+        let content = super::strip::scrub_think_markers(
+            state
+                .tokenizer
+                .decode(content_tokens)
+                .unwrap_or_default()
+                .trim_start(),
+        );
+        return (reasoning, content);
+    }
+    if state.think_end_token_id.is_some() {
         // Fallback: the exact close TOKEN was not found. That does not mean
         // the model never closed — it routinely spells the close as ordinary
         // BPE tokens instead of id 19, because the scheduler masks id 19:
@@ -301,12 +355,21 @@ fn decode_response_text(
         // think_end_token_id is None), and it handles the unterminated case by
         // routing the chain of thought to reasoning instead of content.
         let text = state.tokenizer.decode(output_tokens).unwrap_or_default();
-        let (reasoning, content) =
-            extract_thinking(&text, enable_thinking, state.reasoning_parser.as_deref());
+        let (reasoning, content) = extract_thinking(
+            &text,
+            enable_thinking,
+            force_nonempty_content,
+            state.reasoning_parser.as_deref(),
+        );
         (reasoning, super::strip::scrub_think_markers(&content))
     } else {
         let text = state.tokenizer.decode(output_tokens).unwrap_or_default();
-        extract_thinking(&text, enable_thinking, state.reasoning_parser.as_deref())
+        extract_thinking(
+            &text,
+            enable_thinking,
+            force_nonempty_content,
+            state.reasoning_parser.as_deref(),
+        )
     }
 }
 
@@ -373,62 +436,13 @@ pub(super) fn merge_hoisted_tool_calls(
     hoisted
 }
 
-/// Core finalization: usage assembly, metrics, and the rate-limit
-/// true-up. Returns the canonical response IR — wire encoding (plus
-/// `store:`/`--dump` handling) happens in the per-surface encoders.
-#[allow(clippy::too_many_arguments)]
-fn finalize_response(
-    state: Arc<AppState>,
-    req_ctx: Option<axum::extract::Extension<crate::rate_limiter::RequestContext>>,
-    all_choices: Vec<ir::Choice>,
-    total_completion_tokens: usize,
-    first_ttft: f64,
-    last_decode_time_ms: f64,
-    total_reasoning_tokens: u32,
-    total_cached_prompt_tokens: u32,
-    total_accepted_prediction_tokens: usize,
-    prompt_len: usize,
-) -> super::chat::ChatOutcome {
-    let tokens_per_second = if last_decode_time_ms > 0.0 && total_completion_tokens > 0 {
-        (total_completion_tokens.saturating_sub(1)) as f64 / (last_decode_time_ms / 1000.0)
-    } else {
-        0.0
-    };
-    let usage = ir::Usage {
-        prompt_tokens: prompt_len,
-        completion_tokens: total_completion_tokens,
-        cached_prompt_tokens: total_cached_prompt_tokens as usize,
-        reasoning_tokens: total_reasoning_tokens as usize,
-        accepted_prediction_tokens: total_accepted_prediction_tokens,
-        time_to_first_token_ms: first_ttft,
-        response_tokens_per_second: tokens_per_second,
-    };
+#[path = "chat_blocking/tail2.rs"]
+mod tail2;
+pub(crate) use tail2::*;
 
-    // REQUESTS_ACTIVE released by the caller's ActiveRequestGuard on return.
-    crate::metrics::PROMPT_TOKENS_TOTAL.inc_by(prompt_len as u64);
-    crate::metrics::GENERATION_TOKENS_TOTAL.inc_by(total_completion_tokens as u64);
-    crate::metrics::TTFT_SECONDS
-        .with_label_values(&[state.model_name.as_str()])
-        .observe(first_ttft / 1000.0);
-
-    // Rate-limit true-up. Middleware admitted with a conservative
-    // reservation of `max_seq_len` tokens; refund the difference.
-    if let Some(axum::extract::Extension(ref ctx)) = req_ctx {
-        let actual = (prompt_len + total_completion_tokens) as u64;
-        let refund = ctx.reserved_tokens.saturating_sub(actual);
-        if refund > 0 {
-            state.rate_limiter.refund_tokens(&ctx.identity, refund);
-        }
-    }
-
-    super::chat::ChatOutcome::Blocking(Box::new(ir::ChatResponse {
-        id: crate::ids::uuid_v4(),
-        model: state.model_name.clone(),
-        created: crate::ids::unix_timestamp(),
-        choices: all_choices,
-        usage,
-    }))
-}
+#[path = "chat_blocking/tail.rs"]
+mod tail;
+pub(crate) use tail::*;
 
 /// OpenAI contract: a response ended by a client stop sequence is
 /// `finish_reason="stop"`, never `"length"`. The blocking path only
@@ -557,3 +571,7 @@ mod tests {
         assert_eq!(calls[0].function.name, "get_weather");
     }
 }
+
+#[cfg(test)]
+#[path = "chat_blocking_vision_tests.rs"]
+mod vision_fanout_tests;

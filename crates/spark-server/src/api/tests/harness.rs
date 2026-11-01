@@ -2,16 +2,14 @@
 
 //! A streaming harness for the content sanitizer.
 //!
-//! `sanitize_content_chunk` holds back up to `tag_max - 1` trailing bytes
-//! so a tag split across a chunk boundary can still fuse. That makes
-//! per-call output an implementation detail: the same legitimate byte can
-//! land in this call's return value or the next one's, depending on how
-//! long the longest marker happens to be.
+//! `sanitize_content_chunk` retains a trailing marker prefix so a tag split
+//! across a chunk boundary can still fuse. Legitimate bytes that resemble
+//! a marker prefix may arrive in this call's return value or the next one's.
 //!
 //! The tests here therefore assert on the WHOLE stream — every chunk plus
 //! the end-of-stream flush — which is what the client actually receives.
-//! Asserting per-call output would pin the tail-retention arithmetic
-//! rather than the suppression behaviour.
+//! The separate `sanitizer_prefix` tests also assert per-call emission where
+//! latency and incomplete-marker withholding are part of the contract.
 
 use crate::api::sanitizer::sanitize_content_chunk;
 use crate::api::stream_guards::flush_content_sanitizer;

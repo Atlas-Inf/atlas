@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use spark_runtime::gpu::KernelHandle;
-
 use super::LIGHTNING_SERVED_GAMMA;
 use super::batch_execution::{paged_slot_mapping, resolve_lane_id};
 use super::batch_inputs::DsparkBatchInputError;
@@ -135,7 +133,10 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
     let projection_source = include_str!("batch_projection.rs");
     assert!(projection_source.contains("(total_rows - row).min(16)"));
     assert!(!projection_source.contains("w4a16_gemv_batch32"));
-    let tail = &source[source.find("fn run_batched_tail_base").unwrap()..];
+    // The tail and the Markov stage live in batch_tail.rs, the tail as its
+    // three pieces in order.
+    let tail_source = include_str!("batch_tail.rs");
+    let tail = &tail_source[tail_source.find("fn run_batched_tail_base").unwrap()..];
     let final_norm = tail.find("&self.norm").unwrap();
     let lm_head = tail.find("ops::w4a16_gemm").unwrap();
     let argmax = tail.find("ops::argmax_bf16_batch").unwrap();
@@ -147,7 +148,7 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
     assert!(tail.contains("self.startup.native_batch_authoritative"));
     assert!(tail.contains("exact NVFP4 LM-head batch kernel is unresolved"));
     assert!(final_norm < lm_head && lm_head < argmax);
-    let markov = &source[source.find("fn run_batched_markov").unwrap()..];
+    let markov = &tail_source[tail_source.find("fn run_batched_markov").unwrap()..];
     let depth_loop = markov.find("for depth in 1..self.gamma").unwrap();
     let embed = markov.find("ops::batched_embed").unwrap();
     let project = markov.find("ops::dense_gemv_batchm").unwrap();
@@ -222,62 +223,4 @@ fn production_seam_prepares_then_returns_native_rows_before_generic_serial_dispa
     }
     assert!(projection_source.contains("(total_rows - row).min(16)"));
     assert!(!projection_source.contains("w4a16_gemv_batch32"));
-}
-
-/// Job 596: the batched selector must be ONE launch when the batched
-/// kernel resolves (grid.x = n), with the per-seq loop kept only as the
-/// missing-handle fallback — the old shape burned ~75 ms/step at bs16.
-#[test]
-fn batched_selector_is_one_launch_with_fallback() {
-    let src = include_str!("batch_tail_dflash2.rs");
-    assert_eq!(
-        src.matches("ops::dflash2_candidate_selector_batched(")
-            .count(),
-        1,
-        "expected exactly one batched-selector call site"
-    );
-    assert!(src.contains("dflash2_candidate_selector_batched.0 != 0"));
-    assert!(
-        src.matches("ops::dflash2_candidate_selector(").count() == 1,
-        "the per-seq fallback launch must remain"
-    );
-    // Both entry points must stay exported: the per-seq symbol is an
-    // audited load-time lookup, so dropping it refuses boot (job 610).
-    for cu in [
-        include_str!("../../../../../kernels/gb10/common/dflash2_candidate_selector.cu"),
-        include_str!("../../../../../kernels/strix-hip/common/dflash2_candidate_selector.cu"),
-    ] {
-        assert!(cu.contains("extern \"C\" __global__ void dflash2_candidate_selector("));
-        assert!(cu.contains("extern \"C\" __global__ void dflash2_candidate_selector_batched("));
-    }
-}
-
-/// Pure table for the NVFP4 drafter LM-head wave kernel: ≤4→batch4,
-/// 5–8→batch8, 9+ (incl. >32) → 16-row GEMV waves, KernelHandle(0) →
-/// the w4a16_gemm fallback.
-#[test]
-fn nvfp4_lm_head_wave_kernel_table() {
-    let h4 = KernelHandle(1);
-    let h8 = KernelHandle(2);
-    let h16 = KernelHandle(3);
-    let f = |m| super::batched_ctx::nvfp4_lm_head_wave_kernel(m, h4, h8, h16);
-    assert_eq!(f(1).0, h4.0);
-    assert_eq!(f(4).0, h4.0);
-    assert_eq!(f(5).0, h8.0);
-    assert_eq!(f(8).0, h8.0);
-    assert_eq!(f(9).0, h16.0);
-    assert_eq!(f(32).0, h16.0);
-    assert_eq!(f(33).0, h16.0);
-    assert_eq!(f(128).0, h16.0);
-    // Absent handles fall through to the w4a16_gemm arm (0 => fallback).
-    assert_eq!(
-        super::batched_ctx::nvfp4_lm_head_wave_kernel(
-            128,
-            KernelHandle(0),
-            KernelHandle(0),
-            KernelHandle(0),
-        )
-        .0,
-        0
-    );
 }

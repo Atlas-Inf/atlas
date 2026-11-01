@@ -176,14 +176,23 @@ impl Model for NllbGpuModel {
         Ok(())
     }
 
-    fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<()> {
+    fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<bool> {
         let old = seq.slot_idx;
+        if old == new_slot {
+            return Ok(true);
+        }
+        // Target must be free (same contract as the SSM pool): moving onto an
+        // owned slot would replace that owner's KV entry in the map.
+        if !self.slots.lock().unwrap().claim_specific(new_slot) {
+            return Ok(false);
+        }
         let mut map = self.kv.lock().unwrap();
         if let Some(kv) = map.remove(&old) {
             map.insert(new_slot, kv);
         }
         seq.slot_idx = new_slot;
-        Ok(())
+        self.slots.lock().unwrap().release(old);
+        Ok(true)
     }
 
     fn detach_slot_for_reuse(&self, seq: &mut SequenceState) {

@@ -60,18 +60,55 @@ impl Dflash2Conv {
         gamma: u32,
         stream: u64,
     ) -> Result<DevicePtr> {
-        let h = self.hidden_size as u32;
-        let total_dynamic_dims = (2 * self.kernel_size * self.num_groups) as u32;
+        self.project_deltas(gemm, input_buf, delta_buf, gamma)?;
+        self.apply_input(
+            gpu,
+            conv_kernel,
+            input_buf,
+            delta_buf,
+            out_buf,
+            gamma,
+            stream,
+        )
+    }
 
+    /// `delta_buf[rows, 2 * kernel_size * num_groups] = input_buf ·
+    /// kernel_projectionᵀ` — the dynamic coefficients of `rows` consecutive
+    /// rows. A batched caller projects every sequence's block in one GEMM
+    /// (the weight read once) and then applies the conv per block.
+    pub fn project_deltas(
+        &self,
+        gemm: &dyn Fn(DevicePtr, &DenseWeight, DevicePtr, u32, u32, u32) -> Result<()>,
+        input_buf: DevicePtr,
+        delta_buf: DevicePtr,
+        rows: u32,
+    ) -> Result<()> {
+        let total_dynamic_dims = (2 * self.kernel_size * self.num_groups) as u32;
         gemm(
             input_buf,
             &self.kernel_projection,
             delta_buf,
-            gamma,
+            rows,
             total_dynamic_dims,
-            h,
-        )?;
+            self.hidden_size as u32,
+        )
+    }
 
+    /// The input-side conv of one `gamma`-row block whose coefficients
+    /// [`Self::project_deltas`] already wrote to `delta_buf`. Returns the
+    /// output-side coefficients for [`Self::finish`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_input(
+        &self,
+        gpu: &dyn GpuBackend,
+        conv_kernel: Option<KernelHandle>,
+        input_buf: DevicePtr,
+        delta_buf: DevicePtr,
+        out_buf: DevicePtr,
+        gamma: u32,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        let h = self.hidden_size as u32;
         let input_base_kernel = self.base_kernel.weight;
         let input_delta = delta_buf;
 

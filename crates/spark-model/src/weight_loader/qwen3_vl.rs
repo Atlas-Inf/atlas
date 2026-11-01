@@ -8,8 +8,9 @@ use spark_runtime::weights::WeightStore;
 
 use super::{ModelWeightLoader, WeightFormat};
 use crate::layer::TransformerLayer;
+use crate::layers::VisionEncoder;
 use crate::layers::vision_encoder::{MergerLayer, ViTBlock};
-use crate::layers::{FfnComponent, MoeLayer, Qwen3AttentionLayer, VisionEncoder};
+use crate::layers::{FfnComponent, MoeLayer, Qwen3AttentionLayer, VisionTower};
 use crate::tp_shard::{TpShardKind, load_qkvo_tp, shard_quantized_nvfp4};
 use crate::weight_map::{
     AttentionWeights, DenseWeight, MtpWeights, dense, detect_nvfp4_variant, load_kv_scales,
@@ -214,7 +215,7 @@ impl ModelWeightLoader for Qwen3VLWeightLoader {
         store: &WeightStore,
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
-    ) -> Result<Option<VisionEncoder>> {
+    ) -> Result<Option<VisionTower>> {
         let vcfg = match &config.vision {
             Some(v) => v.clone(),
             None => return Ok(None),
@@ -236,15 +237,23 @@ impl ModelWeightLoader for Qwen3VLWeightLoader {
             blocks.push(ViTBlock {
                 norm1_w: dense(store, &format!("{bp}.norm1.weight"))?.weight,
                 norm1_b: dense(store, &format!("{bp}.norm1.bias"))?.weight,
-                qkv_w: dense(store, &format!("{bp}.attn.qkv.weight"))?.weight,
+                qkv_w: crate::layers::VitWeight::Bf16(
+                    dense(store, &format!("{bp}.attn.qkv.weight"))?.weight,
+                ),
                 qkv_b: dense(store, &format!("{bp}.attn.qkv.bias"))?.weight,
-                proj_w: dense(store, &format!("{bp}.attn.proj.weight"))?.weight,
+                proj_w: crate::layers::VitWeight::Bf16(
+                    dense(store, &format!("{bp}.attn.proj.weight"))?.weight,
+                ),
                 proj_b: dense(store, &format!("{bp}.attn.proj.bias"))?.weight,
                 norm2_w: dense(store, &format!("{bp}.norm2.weight"))?.weight,
                 norm2_b: dense(store, &format!("{bp}.norm2.bias"))?.weight,
-                fc1_w: dense(store, &format!("{bp}.mlp.linear_fc1.weight"))?.weight,
+                fc1_w: crate::layers::VitWeight::Bf16(
+                    dense(store, &format!("{bp}.mlp.linear_fc1.weight"))?.weight,
+                ),
                 fc1_b: dense(store, &format!("{bp}.mlp.linear_fc1.bias"))?.weight,
-                fc2_w: dense(store, &format!("{bp}.mlp.linear_fc2.weight"))?.weight,
+                fc2_w: crate::layers::VitWeight::Bf16(
+                    dense(store, &format!("{bp}.mlp.linear_fc2.weight"))?.weight,
+                ),
                 fc2_b: dense(store, &format!("{bp}.mlp.linear_fc2.bias"))?.weight,
             });
         }
@@ -255,9 +264,13 @@ impl ModelWeightLoader for Qwen3VLWeightLoader {
             deepstack.push(MergerLayer {
                 norm_w: dense(store, &format!("{mp}.norm.weight"))?.weight,
                 norm_b: dense(store, &format!("{mp}.norm.bias"))?.weight,
-                fc1_w: dense(store, &format!("{mp}.linear_fc1.weight"))?.weight,
+                fc1_w: crate::layers::VitWeight::Bf16(
+                    dense(store, &format!("{mp}.linear_fc1.weight"))?.weight,
+                ),
                 fc1_b: dense(store, &format!("{mp}.linear_fc1.bias"))?.weight,
-                fc2_w: dense(store, &format!("{mp}.linear_fc2.weight"))?.weight,
+                fc2_w: crate::layers::VitWeight::Bf16(
+                    dense(store, &format!("{mp}.linear_fc2.weight"))?.weight,
+                ),
                 fc2_b: dense(store, &format!("{mp}.linear_fc2.bias"))?.weight,
             });
         }
@@ -266,9 +279,13 @@ impl ModelWeightLoader for Qwen3VLWeightLoader {
         let merger = MergerLayer {
             norm_w: dense(store, &format!("{mp}.norm.weight"))?.weight,
             norm_b: dense(store, &format!("{mp}.norm.bias"))?.weight,
-            fc1_w: dense(store, &format!("{mp}.linear_fc1.weight"))?.weight,
+            fc1_w: crate::layers::VitWeight::Bf16(
+                dense(store, &format!("{mp}.linear_fc1.weight"))?.weight,
+            ),
             fc1_b: dense(store, &format!("{mp}.linear_fc1.bias"))?.weight,
-            fc2_w: dense(store, &format!("{mp}.linear_fc2.weight"))?.weight,
+            fc2_w: crate::layers::VitWeight::Bf16(
+                dense(store, &format!("{mp}.linear_fc2.weight"))?.weight,
+            ),
             fc2_b: dense(store, &format!("{mp}.linear_fc2.bias"))?.weight,
         };
 
@@ -298,6 +315,6 @@ impl ModelWeightLoader for Qwen3VLWeightLoader {
             vcfg.num_heads,
             vcfg.deepstack_visual_indexes,
         );
-        Ok(Some(ve))
+        Ok(Some(VisionTower::Qwen(Box::new(ve))))
     }
 }

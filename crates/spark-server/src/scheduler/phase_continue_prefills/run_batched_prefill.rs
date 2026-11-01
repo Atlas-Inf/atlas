@@ -90,8 +90,10 @@ pub(super) fn run_batched_prefill_step(
             let mut chunk_len = remaining.min(effective_max);
             let is_last = p.chunk_offset + chunk_len >= p.prompt_tokens.len();
             // Align intermediate chunks to GDN WY4 boundary (4 tokens).
-            if !is_last && chunk_len >= 4 {
-                chunk_len = (chunk_len / 4) * 4;
+            if !is_last && chunk_len >= spark_runtime::prefill_chunk_granule() {
+                // (ATLAS_QWEN4EXP_PREFILL_ROWINV: 64, the GDN chunk.)
+                let g = spark_runtime::prefill_chunk_granule();
+                chunk_len = (chunk_len / g) * g;
             }
             (chunk_len, is_last)
         };
@@ -215,7 +217,10 @@ pub(super) fn run_batched_prefill_step(
                 p.top_k,
                 p.top_p,
                 p.min_p,
-                &p.eos_tokens,
+                &crate::scheduler::min_tokens_ban::first_token_suppress(
+                    &p.eos_tokens,
+                    p.min_tokens,
+                ),
                 p.grammar_state.as_mut(),
                 &sched.levers.sampling(),
             ) {

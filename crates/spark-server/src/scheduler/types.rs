@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas 5eeeb1a (AGPL-3.0-only, sparkqwen queued-first-chunk series).
 
 //! Shared scheduler-internal type definitions, factored out of `mod.rs`
 //! for the ≤500 LoC cap (refactor wave-4e). Visibility is `pub(super)`
@@ -37,7 +38,7 @@ pub(super) struct PendingQueue {
 pub(super) struct VisionSlice {
     /// First `buf_out` row (post-merge patch) this request owns.
     pub patch_row_offset: usize,
-    /// First `vision_image_grids` index this request owns.
+    /// First per-sequence `vision_grids` index this request owns.
     pub grid_index_offset: usize,
     /// Number of images this request contributed to the batch.
     pub num_images: usize,
@@ -51,8 +52,33 @@ pub(super) enum ResponseSink {
     Streaming(tokio::sync::mpsc::Sender<StreamEvent>),
 }
 
+impl ResponseSink {
+    /// True when the caller can no longer observe a result, so further model
+    /// work for this sequence is wasted. Streaming cancellation is signalled
+    /// cooperatively via `ActiveSeq::cancel_flag`; this covers buffered
+    /// (`stream: false`) callers that aborted the HTTP request and dropped the
+    /// oneshot receiver before the first token was emitted.
+    pub(super) fn receiver_closed(&self) -> bool {
+        match self {
+            // `None` means the sender was already taken by lifecycle teardown;
+            // that path owns cleanup, so do not treat it as live.
+            ResponseSink::Blocking(Some(tx)) => tx.is_closed(),
+            ResponseSink::Blocking(None) | ResponseSink::Streaming(_) => false,
+        }
+    }
+}
+
 /// An in-progress chunked prefill (prompt being processed in chunks).
 pub(super) struct PrefillInProgress {
+    /// Deferred to a multi-sequence prefill pass (`ATLAS_QWEN4EXP_PREFILL_MULTI`):
+    /// its worker ranks got no prefill command, so only that pass may run it
+    /// (`prefill_multi`). Set once, by the deferral in `prefill_a_step`.
+    pub multi: bool,
+    /// `Some(len)`: queued for its first chunk, `len` tokens
+    /// (`ATLAS_PREFILL_QUEUE_FIRST_CHUNK`). Set up at admission, its worker
+    /// ranks got no prefill command yet, so only the continue phase may run
+    /// that chunk, as the head of the queue (`phase_continue_prefills::queued_first`).
+    pub queued_first_chunk: Option<usize>,
     /// Arc-wrapped so the original request, the per-prefill scheduler
     /// state, and any retry path (Tier 5c) can share the read-only
     /// token slice without copying ~40 KB on every long prompt.
@@ -157,6 +183,13 @@ pub(super) const GUARD_STOP_CONTENT_LOOP: &str = "content_loop_watchdog";
 /// The F1 post-`</think>` content cap ended a tool-active response.
 /// It is an early, smarter `max_tokens` — report it as one (`"length"`).
 pub(super) const GUARD_STOP_POST_THINK_CAP: &str = "post_think_content_cap";
+
+/// `ActiveSeq::tool_request` at prefill: a tool grammar or the legacy
+/// tool-call path. A strict (`response_format`) grammar is not a tool request:
+/// its JSON answer is not inter-tool prose and must not be budget-cut.
+pub(super) fn tool_request_for(grammar: Option<&GrammarState>, legacy_tool_call: bool) -> bool {
+    grammar.is_some_and(|g| !g.is_strict()) || legacy_tool_call
+}
 
 /// An in-flight sequence participating in batched decode.
 pub(super) struct ActiveSeq {
@@ -366,6 +399,10 @@ pub(super) struct ActiveSeq {
     pub prose_tokens_since_last_tool: u32,
     /// F10 (2026-04-26): how many times the thinking-loop watchdog has fired.
     pub think_watchdog_fires: u32,
+    /// Content-loop steers committed so far ([`super::loop_steer`]).
+    pub loop_steers: u32,
+    /// Steers this request may make (0 = steering off), fixed at admission.
+    pub loop_steer_max: u32,
     /// Phase-C: how many times a degeneration watchdog has rolled this
     /// sequence back to a boundary and re-steered. Capped at
     /// [`atlas_kernels::ROLLBACK_RESTEER_CAP`]; once the cap is hit the
@@ -386,10 +423,12 @@ pub(super) struct ActiveSeq {
     pub pending_drafts: Vec<u32>,
     /// Top-1 LOG-probability the drafter reported for each entry of
     /// [`Self::pending_drafts`], in the same order (D-Cut's ranking key —
-    /// `mtp_dcut`). EMPTY whenever the drafts came from a path that cannot
-    /// measure confidence (per-sequence propose, N-gram/DFlash drafters), in
-    /// which case D-Cut leaves the sequence at full depth. Truncated in
-    /// lock-step with `pending_drafts` so index `j` always describes draft `j`.
+    /// `mtp_dcut`; the DFlash verify width's — `dflash_conf_width`). EMPTY
+    /// whenever the drafts came from a path that cannot measure confidence
+    /// (MTP per-sequence propose, N-gram; DFlash unless its selector reports
+    /// it), in which case both leave the sequence at full depth. Truncated in
+    /// lock-step with `pending_drafts` so index `j` always describes draft `j`;
+    /// read it through [`Self::draft_conf`].
     pub pending_draft_conf: Vec<f32>,
     /// Timestamp of the last token emission (for TBT deadline tracking).
     pub last_token_time: Instant,
@@ -420,6 +459,49 @@ pub(super) struct ActiveSeq {
 }
 
 impl ActiveSeq {
+    /// The confidences of [`Self::pending_drafts`], or none when they do not
+    /// describe them draft for draft (not measured, or stale).
+    pub(super) fn draft_conf(&self) -> &[f32] {
+        if self.pending_draft_conf.len() == self.pending_drafts.len() {
+            &self.pending_draft_conf
+        } else {
+            &[]
+        }
+    }
+
+    /// Take the pending drafts for verification with their confidences
+    /// ([`Self::draft_conf`]), leaving none pending.
+    pub(super) fn take_drafts(&mut self) -> (Vec<u32>, Vec<f32>) {
+        let conf = self.draft_conf().to_vec();
+        self.pending_draft_conf.clear();
+        (std::mem::take(&mut self.pending_drafts), conf)
+    }
+
+    /// Hold a per-sequence proposal for the next verify, with the
+    /// confidences its drafter reported for it (DFlash's selector,
+    /// `SequenceState::dflash_draft_conf`; none from any other drafter).
+    pub(super) fn set_proposed_drafts(&mut self, drafts: Vec<u32>) {
+        self.pending_draft_conf = self.seq.dflash_draft_conf().to_vec();
+        self.pending_drafts = drafts;
+    }
+
+    /// A `response_format` grammar is engaged. Unless ATLAS_GLM_STRICT_SPEC
+    /// masks its verify row by row (`strict_spec`), such a sequence decodes
+    /// serially: every emitted token must be sampled from logits masked at
+    /// its own position, which the unmasked verify paths cannot guarantee
+    /// (the GLM TP2 vocab-split verify head returns raw argmax ids only —
+    /// `Model::verify_logits_argmax_only` — and rows after a `</think>`
+    /// inside an accepted span are picked as if still thinking).
+    ///
+    /// Its output is also exempt from the tool-turn content guards (the
+    /// post-think content cap and the content-loop watchdog): the grammar
+    /// bounds a JSON answer, and repeated JSON items are not a degenerate loop.
+    pub(super) fn strict_grammar(&self) -> bool {
+        self.grammar_state
+            .as_ref()
+            .is_some_and(GrammarState::is_strict)
+    }
+
     /// Abort the sequence on an ENGINE error: records the cause so the wire
     /// finish reason is "error" (never "stop") and marks it finished.
     pub(super) fn abort_on_engine_error(&mut self, e: impl std::fmt::Display) {
@@ -485,6 +567,8 @@ pub(super) struct SwappedSeq {
     pub output_tokens: Vec<u32>,
     pub remaining: usize,
     pub min_tokens: usize,
+    /// The min_tokens end-token ban; the restored sequence is a fresh one.
+    pub eos_ban: spark_model::traits::EosBan,
     pub eos_tokens: Vec<u32>,
     pub sink: ResponseSink,
     pub temperature: f32,
@@ -538,6 +622,8 @@ pub(super) struct SwappedSeq {
     pub content_tokens: u32,
     pub prose_tokens_since_last_tool: u32,
     pub think_watchdog_fires: u32,
+    pub loop_steers: u32,
+    pub loop_steer_max: u32,
     /// Phase-C: watchdog rollback counter, preserved across snapshot/restore.
     pub rollback_count: u32,
     pub tool_call_start_token: Option<u32>,

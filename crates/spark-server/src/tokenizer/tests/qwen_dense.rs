@@ -103,10 +103,11 @@ const Q36_GOLDEN: &str = "<|im_start|>system\n# Tools\n\nYou have access to the 
 /// Qwen3.8's injected instruction for the `xhigh` tier. Reached by explicit
 /// `xhigh`/`max`, and by explicit `high` (the template remaps `high`→`xhigh`
 /// — checkpoint-owned, so `high` shares this sentence while keeping its own
-/// smaller 2E budget rung in `api/chat/thinking.rs`). NOT reached by an
-/// effort-silent request: since 2026-08-15 the unset fallback is the neutral
-/// `"medium"` (no sentence), not `"high"` — the old fallback silently bought
-/// every silent client this most-expensive directive.
+/// smaller 2E budget rung in `api/chat/thinking.rs`). Also the template's
+/// own default, which an effort-silent render reaches since 2026-10-19 (the
+/// variable is left undefined, as transformers/vLLM leave it); the 27B
+/// targets pin `"medium"` above the renderer with MODEL.toml
+/// `[behavior].default_reasoning_effort`.
 const XHIGH_SENTENCE: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
 const LOW_SENTENCE: &str = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.";
 
@@ -147,22 +148,12 @@ fn with_closed_think_tail(base: &str) -> String {
     )
 }
 
-/// Qwen3.8 render at the XHIGH tier (explicit `xhigh`/`max`/`high`):
-/// Qwen3.6 baseline + xhigh instruction sentence + historical `<think>`
-/// blocks KEPT (3.8 inverts the preserve default). Before 2026-08-15 this
-/// was ALSO the unset-default render; see [`q38_unset_golden`].
+/// Qwen3.8 render at the XHIGH tier (explicit `xhigh`/`max`/`high`, and
+/// the template's default for an effort-silent render): Qwen3.6 baseline +
+/// xhigh instruction sentence + historical `<think>` blocks KEPT (3.8
+/// inverts the preserve default).
 fn q38_golden() -> String {
     with_history_think(&with_effort_sentence(Q36_GOLDEN, XHIGH_SENTENCE))
-}
-
-/// Qwen3.8 render for an effort-SILENT request (the unset default):
-/// the `"medium"` fallback injects NO instruction sentence, so the system
-/// block is byte-identical to the Qwen3.6-era prompt shape; only the
-/// preserve-thinking default (history `<think>` kept) differs. This is
-/// the 2026-08-15 contract change: unset must buy the NEUTRAL tier, not
-/// the most expensive directive (`high`→`xhigh` under the old fallback).
-fn q38_unset_golden() -> String {
-    with_history_think(Q36_GOLDEN)
 }
 
 #[test]
@@ -230,7 +221,7 @@ fn q36_thinking_off_closes_think_tail_only() {
 }
 
 #[test]
-fn q38_default_keeps_history_think_and_injects_no_effort_sentence() {
+fn q38_default_keeps_history_think_and_renders_the_template_default_effort() {
     let r = render_fixture(
         "qwen3.8-27b-unsloth",
         &fixture_messages(),
@@ -238,37 +229,51 @@ fn q38_default_keeps_history_think_and_injects_no_effort_sentence() {
         thinking_on(),
     )
     .unwrap();
-    // CONTRACT CHANGE 2026-08-15: an effort-silent request renders the
-    // NEUTRAL "medium" fallback — no instruction sentence — instead of the
-    // old "high" fallback that the template escalated to the most expensive
-    // xhigh directive. The template's own `default('xhigh')` must stay
-    // unreachable (Atlas always passes an explicit string), and
-    // `preserve_thinking` unset must leave the variable UNDEFINED — Jinja
-    // `none` would flip the default to strip.
-    assert_eq!(r, q38_unset_golden());
+    // An effort-silent render leaves `reasoning_effort` UNDEFINED, so the
+    // template's own `default('xhigh')` applies, as transformers and vLLM
+    // render it (2026-10-19; the 2026-08-15 "medium" fallback moved to
+    // MODEL.toml `default_reasoning_effort` for the targets that want it).
+    // `preserve_thinking` unset must likewise stay UNDEFINED — Jinja `none`
+    // would flip the default to strip.
+    assert_eq!(r, q38_golden());
 }
 
-/// The unset default IS the medium tier: an effort-silent render and an
-/// explicit `"medium"` render must be byte-identical, matching the budget
-/// side where unset and medium both resolve to `max_thinking_budget` (E).
-/// If these ever diverge, the directive and budget paths have split.
+/// The unset render IS the template's default tier, byte for byte.
 #[test]
-fn q38_unset_equals_explicit_medium() {
+fn q38_unset_equals_explicit_xhigh() {
     let msgs = fixture_messages();
     let tools = fixture_tools();
     let unset = render_fixture("qwen3.8-27b-unsloth", &msgs, Some(&tools), thinking_on()).unwrap();
-    let medium = render_fixture(
+    let xhigh = render_fixture(
         "qwen3.8-27b-unsloth",
         &msgs,
         Some(&tools),
         RenderFlags {
             enable_thinking: true,
-            reasoning_effort: Some("medium"),
+            reasoning_effort: Some("xhigh"),
             ..Default::default()
         },
     )
     .unwrap();
-    assert_eq!(unset, medium);
+    assert_eq!(unset, xhigh);
+}
+
+/// A verbatim-prompt model leaves an effort-silent render's
+/// `reasoning_effort` undefined, so the template's own default applies
+/// (Qwen3.8: `xhigh`), as transformers and vLLM render it.
+#[test]
+fn q38_template_effort_default_renders_the_template_tier() {
+    let r = render_fixture(
+        "qwen3.8-27b-unsloth",
+        &fixture_messages(),
+        Some(&fixture_tools()),
+        RenderFlags {
+            template_effort_default: true,
+            ..thinking_on()
+        },
+    )
+    .unwrap();
+    assert_eq!(r, q38_golden());
 }
 
 #[test]
@@ -285,9 +290,8 @@ fn q38_preserve_thinking_false_strips_history_think() {
     )
     .unwrap();
     // preserve=false restores the Qwen3.6-shaped history (prefix-cache
-    // friendly). Effort-silent since 2026-08-15 means the neutral medium
-    // fallback (no sentence), so this render is exactly the Q36 baseline.
-    assert_eq!(r, Q36_GOLDEN);
+    // friendly); effort-silent renders the template's xhigh sentence.
+    assert_eq!(r, with_effort_sentence(Q36_GOLDEN, XHIGH_SENTENCE));
 }
 
 #[test]
@@ -378,6 +382,6 @@ fn q38_string_tool_args_are_normalized_before_strict_validation() {
         thinking_on(),
     )
     .unwrap();
-    // Effort-silent render, so the 2026-08-15 unset golden (no sentence).
-    assert_eq!(r, q38_unset_golden());
+    // Effort-silent render: the template default (xhigh).
+    assert_eq!(r, q38_golden());
 }

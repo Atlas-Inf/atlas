@@ -16,6 +16,7 @@
 // Grid: (num_q_heads, num_seqs, 1)   [or with split-K: (num_q_heads, num_splits, num_seqs)]
 // Block: (256, 1, 1)
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 #define WARP_SIZE 32
@@ -67,6 +68,7 @@ extern "C" __global__ void paged_decode_attn(
     const unsigned int q_stride,              // query.stride(0) in elements
     const unsigned int sliding_window         // 0 = full attention; >0 = only attend to last `sliding_window` KV positions (Gemma-4 hybrid attn)
 ) {
+    atlas_pdl_enter();
     const unsigned int q_head = blockIdx.x;
     const unsigned int seq_idx = blockIdx.y;
     const unsigned int tid = threadIdx.x;

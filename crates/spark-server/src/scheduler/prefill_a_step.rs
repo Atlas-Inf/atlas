@@ -1,8 +1,28 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas 5eeeb1a (AGPL-3.0-only, sparkqwen queued-first-chunk series).
 
 //! start_chunked_prefill (chunked prefill orchestration).
 
 use super::*;
+
+mod vision_dispatch;
+use vision_dispatch::dispatch_chunk0_vision;
+
+/// What `start_chunked_prefill` does with a request's first chunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirstChunk {
+    /// Run it now, and sample the first token when it is the whole prompt.
+    Inline,
+    /// Co-dispatch, VARLEN, always-mixed fuse or multi-prompt prefill: set
+    /// up, and send the EP worker its chunk-0 command now (the batched step
+    /// does not; the multi pass sends its own), but leave the chunk to a
+    /// batched step.
+    Defer,
+    /// `ATLAS_PREFILL_QUEUE_FIRST_CHUNK`: set up, but send no prefill
+    /// command; the continue phase sends and runs the chunk when the prompt
+    /// reaches the head of the queue (`phase_continue_prefills::queued_first`).
+    Queue,
+}
 
 /// Start a chunked prefill: process chunk 0, return result.
 pub fn start_chunked_prefill(
@@ -19,12 +39,13 @@ pub fn start_chunked_prefill(
     prefill_event: u64,
     grammar_engine: &mut Option<GrammarEngine>,
     spontaneous_think_budget: u32,
-    // Co-dispatch: when true, do all per-request setup (grammar/sink/seq
-    // alloc/EP broadcast) but SKIP the inline chunk-0 prefill + first-token
-    // sampling, returning `InProgress { chunk_offset: 0 }` so >=2 concurrent
-    // streams batch into one `run_batched_prefill_step` forward. Vision is
-    // excluded upstream (PrefillInProgress carries no pixel state).
-    defer: bool,
+    // Not `Inline`: do all per-request setup (grammar/sink/seq alloc/EP
+    // setup broadcast) but SKIP the inline chunk-0 prefill + first-token
+    // sampling, returning `InProgress { chunk_offset: 0 }` — `Defer` so >=2
+    // concurrent streams batch into one `run_batched_prefill_step` forward,
+    // `Queue` so the chunk waits for its turn. Vision is excluded upstream
+    // (PrefillInProgress carries no pixel state).
+    first_chunk: FirstChunk,
     // Vision co-dispatch: when Some, this request's images were already encoded
     // (batched with other requests) into the shared buf_out; skip the per-request
     // encode and instead set the per-stream slice base around the chunk-0 splice.
@@ -34,19 +55,15 @@ pub fn start_chunked_prefill(
     // computed (fused with other requests into one batched search by the pre-pass);
     // the beam branch uses it directly. None ⇒ run the search here per-request.
     precomputed_beam_hyp: Option<Vec<u32>>,
+    // Shared-prefix admission: plant a checkpoint at this position for the
+    // requests waiting on this prefill (`shared_prefix`). Sent to the worker
+    // before the chunk-0 command, like the MTP fence.
+    pc_plant: Option<usize>,
 ) -> Result<StartPrefillResult> {
-    // Merge user-supplied stop tokens with model EOS tokens.
-    let stop_tokens = req.take_stop_tokens();
-    let eos_tokens = if stop_tokens.is_empty() {
-        eos_tokens.to_vec()
-    } else {
-        let mut merged = eos_tokens.to_vec();
-        merged.extend(stop_tokens);
-        merged.sort_unstable();
-        merged.dedup();
-        merged
-    };
-    let eos_tokens = &eos_tokens;
+    // This request's end tokens: model EOS + user stop tokens (no model EOS
+    // under `ignore_eos`).
+    let model_eos = eos_tokens;
+    let eos_tokens = &req.take_end_tokens(model_eos);
 
     let top_k = req.top_k();
     let top_p = req.top_p();
@@ -83,7 +100,6 @@ pub fn start_chunked_prefill(
     let req_prompt_logprobs = req.prompt_logprobs();
     let req_timeout_at = req.timeout_at();
     let grammar_spec = req.take_grammar_spec();
-    let mut grammar_state = compile_grammar_state(grammar_engine, &grammar_spec, eos_tokens);
     let (prompt_tokens, max_tokens, mut sink, image_pixels, temperature, cancel_flag) = match req {
         InferenceRequest::Streaming {
             prompt_tokens,
@@ -118,9 +134,35 @@ pub fn start_chunked_prefill(
         ),
     };
 
+    // After the sink exists: a strict grammar that cannot be armed is reported
+    // to the client. Strict grammars start after `</think>` (see
+    // `GrammarState::masks_first_token`).
+    let grammar_state = compile_grammar_state(
+        grammar_engine,
+        &grammar_spec,
+        // The model's EOS passes through the matcher even under `ignore_eos`.
+        &[model_eos, eos_tokens].concat(),
+        req_enable_thinking && think_end_token.is_some(),
+        first_token_thinking::native_opener(
+            sched.limits.glm_tool_boundary,
+            req_tools_present,
+            tool_call_start_token,
+        ),
+        tool_call_start_token,
+        &mut sink,
+    )?;
+
     let request_start = Instant::now();
     let total = prompt_tokens.len();
-    let chunk_len = total.min(max_prefill_tokens);
+    // R11 fix 5: a non-last chunk 0 ends on the model's prefill cut grid.
+    let mut chunk_len = model.align_prefill_chunk(0, total.min(max_prefill_tokens), total);
+    // ATLAS_QWEN4EXP_PREFILL_ROWINV: the next chunk starts on the GDN grid.
+    // A chunk end on the prefill cut grid is unchanged when the grid is a
+    // multiple of the granule (the shipped grids, 1024 and 4096, are).
+    let g = spark_runtime::prefill_chunk_granule();
+    if chunk_len < total && g > 4 && chunk_len >= g {
+        chunk_len -= chunk_len % g;
+    }
     let is_last = chunk_len >= total;
 
     tracing::info!(
@@ -141,6 +183,10 @@ pub fn start_chunked_prefill(
             return Err(e);
         }
     };
+    super::ttft_trace::admit(&prompt_tokens, seq.slot_idx);
+    // Carry the request-local native-decode fence into model-owned state so
+    // prefill hooks cannot touch shared MTP capture/eager-drafter state.
+    seq.disable_mtp = req_disable_mtp;
     seq.session_hash = req_session_hash;
     seq.adapter_slot = req_adapter_slot;
     seq.src_lang_id = req_src_lang;
@@ -181,7 +227,7 @@ pub fn start_chunked_prefill(
         let last = hyp.last().copied().unwrap_or(0);
         let use_legacy_tool_call =
             req_require_tool_call && grammar_state.is_none() && tool_call_start_token.is_some();
-        let tool_request = grammar_state.is_some() || use_legacy_tool_call;
+        let tool_request = tool_request_for(grammar_state.as_ref(), use_legacy_tool_call);
         let now = Instant::now();
         let cached_prompt_tok = seq.cached_prefix_tokens as u32;
         let mut a = ActiveSeq {
@@ -253,6 +299,8 @@ pub fn start_chunked_prefill(
             content_tokens: 0,
             prose_tokens_since_last_tool: 0,
             think_watchdog_fires: 0,
+            loop_steers: 0,
+            loop_steer_max: crate::scheduler::loop_steer::budget_for_new_seq(),
             rollback_count: 0,
             ssm_rollback_ring: SsmDecodeRing::new(model.decode_rollback_ring_slots()),
             tool_call_end_token,
@@ -273,14 +321,42 @@ pub fn start_chunked_prefill(
     // Deferred co-dispatch: setup + EP broadcast, then return InProgress at
     // chunk 0 WITHOUT prefilling — the batched step packs >=2 streams into one
     // forward. Vision is excluded upstream, so no chunk-0 embedding injection.
-    if defer {
+    if first_chunk != FirstChunk::Inline {
         debug_assert!(
             image_pixels.is_empty(),
             "vision must be excluded from co-dispatch"
         );
+        // ATLAS_QWEN4EXP_PREFILL_MULTI: the multi pass sends the worker this
+        // prompt (`super::prefill_multi`), so no prefill command here.
+        let multi = first_chunk == FirstChunk::Defer
+            && super::prefill_multi::eligible(
+                model,
+                prompt_tokens.len(),
+                is_last,
+                req_prompt_logprobs.is_some(),
+                req_adapter_slot,
+            );
+        // Queued: the command goes out when the chunk runs, so the worker
+        // sees every chunk command in the order the head runs the chunks.
+        let queue = first_chunk == FirstChunk::Queue;
         if let Err(e) = (|| -> Result<()> {
             // EP: broadcast chunk 0 to worker (no-op on single-GPU; the batched
-            // step does NOT re-broadcast, so this stays the only broadcast site).
+            // step does NOT re-broadcast, so this stays the only broadcast site
+            // for a deferred chunk; a queued one sends it when it runs).
+            model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, req_disable_mtp)?;
+            model.ep_broadcast_vision_state_for_seq(
+                &seq,
+                seq.slot_idx as u32,
+                false,
+                0,
+                0,
+                0,
+                0,
+            )?;
+            plant_chunk0(model, &mut seq, pc_plant)?;
+            if multi || queue {
+                return Ok(());
+            }
             model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
             model.ep_broadcast_cmd(chunk_len as u32)?;
             model.ep_broadcast_cmd(0)?; // chunk_start
@@ -293,48 +369,54 @@ pub fn start_chunked_prefill(
             if let Err(fe) = model.free_sequence(&mut seq) {
                 tracing::error!("prefill_a_step: free_sequence (deferred broadcast error): {fe:#}");
             }
+            // The worker may hold part of the setup: free its slot too, as
+            // the inline path does after a failed chunk.
+            if let Err(be) = model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF1) {
+                tracing::error!("prefill_a_step: ep_broadcast (deferred broadcast error): {be:#}");
+            }
             return Err(e);
         }
         // chunk_offset = 0 (deferred co-dispatch: nothing prefilled yet).
-        return Ok(StartPrefillResult::InProgress(
-            super::prefill_a_step_params::build_prefill_in_progress(
-                prompt_tokens,
-                req_session_hash,
-                seq,
-                0,
-                max_tokens,
-                req_min_tokens,
-                eos_tokens.to_vec(),
-                sink,
-                cancel_flag,
-                request_start,
-                temperature,
-                top_k,
-                top_p,
-                top_n_sigma,
-                min_p,
-                repetition_penalty,
-                presence_penalty,
-                frequency_penalty,
-                req_lz_penalty,
-                dry_multiplier,
-                dry_base,
-                dry_allowed_length,
-                logit_bias,
-                req_enable_thinking,
-                req_thinking_budget,
-                req_repetition_detection,
-                spontaneous_think_budget,
-                req_require_tool_call,
-                req_tools_present,
-                req_suppress_tool_call,
-                req_disable_mtp,
-                grammar_state,
-                req_seed,
-                req_top_logprobs,
-                req_timeout_at,
-            ),
-        ));
+        let mut p = super::prefill_a_step_params::build_prefill_in_progress(
+            prompt_tokens,
+            req_session_hash,
+            seq,
+            0,
+            max_tokens,
+            req_min_tokens,
+            eos_tokens.to_vec(),
+            sink,
+            cancel_flag,
+            request_start,
+            temperature,
+            top_k,
+            top_p,
+            top_n_sigma,
+            min_p,
+            repetition_penalty,
+            presence_penalty,
+            frequency_penalty,
+            req_lz_penalty,
+            dry_multiplier,
+            dry_base,
+            dry_allowed_length,
+            logit_bias,
+            req_enable_thinking,
+            req_thinking_budget,
+            req_repetition_detection,
+            spontaneous_think_budget,
+            req_require_tool_call,
+            req_tools_present,
+            req_suppress_tool_call,
+            req_disable_mtp,
+            grammar_state,
+            req_seed,
+            req_top_logprobs,
+            req_timeout_at,
+        );
+        p.multi = multi;
+        p.queued_first_chunk = queue.then_some(chunk_len);
+        return Ok(StartPrefillResult::InProgress(p));
     }
 
     // Guard: free SSM slot on any error after allocation.
@@ -344,7 +426,11 @@ pub fn start_chunked_prefill(
         // pre-pass (vision_slice.is_some()) — that path runs ONE encode + fence
         // for the whole tick; here we only set the per-stream slice base below.
         if vision_slice.is_none() && !image_pixels.is_empty() {
-            model.prepare_vision_embed(&image_pixels)?;
+            // A model that caches vision prompts encodes inside the chunk-0
+            // prefix lookup instead, and only the items it does not cover.
+            // The images move onto `seq` (per-sequence vision state): two
+            // image prompts can now interleave prefill chunks.
+            model.prepare_vision_embed_for_chunked(&mut seq, image_pixels.clone())?;
             // prepare_vision_embed() runs the vision encoder asynchronously on
             // the default stream, writing this request's patch embeddings into
             // the encoder's buf_out. The chunk-0 embedding injection inside
@@ -358,6 +444,24 @@ pub fn start_chunked_prefill(
             model.stream_wait_event(prefill_stream, prefill_event)?;
         }
 
+        // Co-dispatch: the batched encode wrote this request's rows into its
+        // slice of the shared buf_out, but the grids/hashes live per-sequence
+        // now — stamp them so MRoPE, the cache key and the worker's wire
+        // state read this request's own items.
+        if let Some(s) = vision_slice {
+            model.stage_vision_grids(&mut seq, &image_pixels);
+            seq.vision.rows_encoded = s.patch_row_count;
+            seq.vision.rows_base = 0;
+        }
+
+        dispatch_chunk0_vision(
+            model,
+            &mut seq,
+            vision_slice,
+            &image_pixels,
+            req_disable_mtp,
+        )?;
+        plant_chunk0(model, &mut seq, pc_plant)?;
         // EP: broadcast chunk 0 tokens to worker.
         // Send full prompt length + all tokens so worker can do
         // identical Marconi prefix-cache lookups (bug #33 fix).
@@ -369,14 +473,7 @@ pub fn start_chunked_prefill(
         model.ep_broadcast_cmd(prompt_tokens.len() as u32)?; // full prompt length
         model.ep_broadcast_tokens(&prompt_tokens)?;
 
-        // Co-dispatch: point this request's chunk-0 splice/MRoPE at its slice of
-        // the shared packed buf_out. Single-chunk-fit is guaranteed upstream, so
-        // the whole prompt (and its full pad run) is consumed in THIS chunk —
-        // set before, reset after (the scheduler admit loop is single-threaded,
-        // so no other request observes the non-zero base).
-        if let Some(s) = vision_slice {
-            model.set_vision_slice_base(s.patch_row_offset, s.grid_index_offset, s.num_images);
-        }
+        super::ttft_trace::mark(seq.slot_idx, super::ttft_trace::Mark::PrefillStart);
         let _pt0 = std::time::Instant::now();
         let chunk_res = model.prefill_chunk(
             &prompt_tokens,
@@ -386,6 +483,7 @@ pub fn start_chunked_prefill(
             is_last,
             prefill_stream,
         );
+        super::ttft_trace::mark(seq.slot_idx, super::ttft_trace::Mark::PrefillSubmitted);
         if std::env::var("ATLAS_VISION_TIMING").is_ok() {
             let _ = model.synchronize(prefill_stream);
             tracing::info!(
@@ -396,16 +494,18 @@ pub fn start_chunked_prefill(
             );
         }
         if vision_slice.is_some() {
-            model.set_vision_slice_base(0, 0, 0);
+            model.set_vision_slice_base(&mut seq, 0, 0, 0, 0);
         }
-        chunk_res
+        let logits = chunk_res?;
+        super::prefill_normalization::initial(model, &seq)?;
+        Ok(logits)
     })();
 
     let logits = match prefill_result {
         Ok(l) => l,
         Err(e) => {
             let msg = format!("prefill_chunk failed: {e:#}");
-            send_error_to_sink(&mut sink, &msg);
+            send_prefill_error_to_sink(&mut sink, &msg, &e);
             if let Err(free_err) = model.free_sequence(&mut seq) {
                 tracing::error!(
                     "prefill_a_step: free_sequence (after prefill error): {free_err:#}"
@@ -430,6 +530,46 @@ pub fn start_chunked_prefill(
         tracing::error!("prefill_a_step: stream_wait_event(default_stream, prefill_event): {e:#}");
     }
 
+    // chunk_offset = chunk_len; DRY comes from the request (api.rs
+    // `sampling_presets.tools.dry_*`), 0.0 leaves it inert.
+    let mut p = super::prefill_a_step_params::build_prefill_in_progress(
+        prompt_tokens,
+        req_session_hash,
+        seq,
+        chunk_len,
+        max_tokens,
+        req_min_tokens,
+        eos_tokens.to_vec(),
+        sink,
+        cancel_flag,
+        request_start,
+        temperature,
+        top_k,
+        top_p,
+        top_n_sigma,
+        min_p,
+        repetition_penalty,
+        presence_penalty,
+        frequency_penalty,
+        req_lz_penalty,
+        dry_multiplier,
+        dry_base,
+        dry_allowed_length,
+        logit_bias,
+        req_enable_thinking,
+        req_thinking_budget,
+        req_repetition_detection,
+        spontaneous_think_budget,
+        req_require_tool_call,
+        req_tools_present,
+        req_suppress_tool_call,
+        req_disable_mtp,
+        grammar_state,
+        req_seed,
+        req_top_logprobs,
+        req_timeout_at,
+    );
+
     if is_last {
         // Single chunk covered the entire prompt — get first token.
         // #131: constrain the FIRST token with the grammar (and advance the
@@ -444,8 +584,8 @@ pub fn start_chunked_prefill(
             top_k,
             top_p,
             min_p,
-            eos_tokens,
-            grammar_state.as_mut(),
+            &crate::scheduler::min_tokens_ban::first_token_suppress(eos_tokens, req_min_tokens),
+            p.grammar_state.as_mut(),
             &sched.levers.sampling(),
         ) {
             Ok(t) => {
@@ -454,14 +594,14 @@ pub fn start_chunked_prefill(
             }
             Err(e) => {
                 let msg = format!("sample_token failed: {e:#}");
-                send_error_to_sink(&mut sink, &msg);
-                if let Err(free_err) = model.free_sequence(&mut seq) {
+                send_error_to_sink(&mut p.sink, &msg);
+                if let Err(free_err) = model.free_sequence(&mut p.seq) {
                     tracing::error!(
                         "prefill_a_step: free_sequence (after sample error): {free_err:#}"
                     );
                 }
                 if let Err(bcast_err) =
-                    model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF1)
+                    model.ep_broadcast_cmd_for_seq(p.seq.slot_idx as u32, 0xFFFFFFF1)
                 {
                     tracing::error!(
                         "prefill_a_step: ep_broadcast (after sample error): {bcast_err:#}"
@@ -472,18 +612,23 @@ pub fn start_chunked_prefill(
         };
 
         let spontaneous_think = !req_enable_thinking && think_start_token == Some(first);
+        super::ttft_trace::mark(
+            p.seq.slot_idx,
+            super::ttft_trace::Mark::FirstSampled(!spontaneous_think && max_tokens > 0),
+        );
         // Legacy echo+logprobs: hand prompt logprobs to a streaming client
         // BEFORE any token event (blocking carries them via finish_sequence).
         if req_prompt_logprobs.is_some()
-            && let ResponseSink::Streaming(ref tx) = sink
+            && let ResponseSink::Streaming(ref tx) = p.sink
         {
-            let lps: Vec<crate::api::TokenLogprobs> = seq
+            let lps: Vec<crate::api::TokenLogprobs> = p
+                .seq
                 .prompt_logprobs
                 .drain(..)
-                .map(|p| crate::api::TokenLogprobs {
-                    token_id: p.token_id,
-                    logprob: p.logprob,
-                    top: p.top,
+                .map(|lp| crate::api::TokenLogprobs {
+                    token_id: lp.token_id,
+                    logprob: lp.logprob,
+                    top: lp.top,
                 })
                 .collect();
             if !super::mod_helpers::bounded_stream_send(
@@ -498,7 +643,7 @@ pub fn start_chunked_prefill(
         // the server (the sampled `first` is discarded below too).
         if !spontaneous_think
             && max_tokens > 0
-            && let ResponseSink::Streaming(ref tx) = sink
+            && let ResponseSink::Streaming(ref tx) = p.sink
             && !super::mod_helpers::bounded_stream_send(
                 tx,
                 StreamEvent::Token(first),
@@ -510,242 +655,44 @@ pub fn start_chunked_prefill(
 
         // When grammar is active, disable legacy require_tool_call (grammar handles EOS).
         let use_legacy_tool_call =
-            req_require_tool_call && grammar_state.is_none() && tool_call_start_token.is_some();
-        // F4: sticky tool-request flag — grammar attached OR legacy tool path.
-        // Computed before `grammar_state` is moved into the ActiveSeq below.
-        let tool_request = grammar_state.is_some() || use_legacy_tool_call;
-
-        let now = Instant::now();
-        let cached_prompt_tok = seq.cached_prefix_tokens as u32;
-        if !spontaneous_think && (eos_tokens.contains(&first) || max_tokens <= 1) {
-            let mut a = ActiveSeq {
-                seq,
-                session_hash: req_session_hash,
-                last_token: first,
-                // max_tokens==0 (scoring-only): the sampled token is
-                // discarded — empty output derives finish_reason="length".
-                output_tokens: if max_tokens == 0 {
-                    Vec::new()
-                } else {
-                    vec![first]
-                },
-                remaining: 0,
-                min_tokens: req_min_tokens,
-                eos_tokens: eos_tokens.to_vec(),
-                finished: true,
-                engine_error: None,
-                guard_stop: None,
-                param_close_pending: 0,
-                sink,
-                cancel_flag: cancel_flag.clone(),
-                temperature,
-                top_k,
-                top_p,
-                top_n_sigma,
-                min_p,
-                repetition_penalty,
-                repetition_penalty_window: 256,
-                presence_penalty,
-                frequency_penalty,
-                lz_penalty: req_lz_penalty,
-                dry_multiplier,
-                dry_base,
-                dry_allowed_length,
-                dry_sequence_breakers: Vec::new(),
-                logit_bias: logit_bias.clone(),
-                pending_drafts: Vec::new(),
-                pending_draft_conf: Vec::new(),
-                inside_thinking: req_enable_thinking && think_end_token.is_some(),
-                enable_thinking: req_enable_thinking,
-                thinking_budget: req_thinking_budget,
-                repetition_detection: req_repetition_detection,
-                spontaneous_think_budget,
-                thinking_tokens: 0,
-                cached_prompt_tokens: cached_prompt_tok,
-                preempt_immune_until_tokens: 0,
-                force_end_thinking: false,
-                think_force_closed: false,
-                sentence_defer_count: 0,
-                consecutive_confident: 0,
-                in_code_fence: false,
-                think_end_token,
-                think_start_token,
-                think_ended: !req_enable_thinking && think_end_token.is_some(),
-                think_just_ended: false,
-                post_think_emitted: 0,
-                spec_adapt: Default::default(),
-                think_skip_count: 0,
-                require_tool_call: use_legacy_tool_call,
-                tool_request,
-                tools_present: req_tools_present,
-                tool_call_start_token,
-                tool_call_opened: false,
-                inside_tool_body: false,
-                tool_call_completed: false,
-                post_completion_tool_opens: 0,
-                tool_body_streak_tokens: 0,
-                inside_parameter_body: false,
-                param_body_chars_emitted: 0,
-                suppress_tool_call: req_suppress_tool_call,
-                disable_mtp: req_disable_mtp,
-                mtp_acct: Default::default(),
-                content_started: false,
-                content_tokens: 0,
-                prose_tokens_since_last_tool: 0,
-                think_watchdog_fires: 0,
-                rollback_count: 0,
-                ssm_rollback_ring: SsmDecodeRing::new(model.decode_rollback_ring_slots()),
-                tool_call_end_token,
-                grammar_state,
-                last_token_time: now,
-                request_start,
-                decode_start: now,
-                seed: req_seed,
-                top_logprobs: req_top_logprobs,
-                logprobs_data: Vec::new(),
-                timeout_at: req_timeout_at,
-                adaptive: crate::adaptive_sampler::AdaptiveSamplingState::new(temperature),
-            };
+            req_require_tool_call && p.grammar_state.is_none() && tool_call_start_token.is_some();
+        let immediate_finish =
+            !spontaneous_think && (eos_tokens.contains(&first) || max_tokens <= 1);
+        if !spontaneous_think {
+            super::ttft_trace::visible_at_prefill(p.seq.slot_idx);
+        }
+        let cached_prompt_tok = p.seq.cached_prefix_tokens as u32;
+        // The promotion constructor builds the ActiveSeq, so a prompt that
+        // fits one chunk decodes under the same min_tokens end-token ban as a
+        // multi-chunk one.
+        let mut a = super::phase_promote_prefills::build_active_seq_from_prefill(
+            p,
+            first,
+            spontaneous_think,
+            use_legacy_tool_call,
+            cached_prompt_tok,
+            immediate_finish,
+            Instant::now(),
+            think_end_token,
+            think_start_token,
+            tool_call_start_token,
+            tool_call_end_token,
+            model.decode_rollback_ring_slots(),
+            sched.limits.glm_tool_boundary,
+        );
+        if immediate_finish {
             finish_sequence(model, &mut a, sched.limits.max_seq_len);
             Ok(StartPrefillResult::Finished)
         } else {
-            Ok(StartPrefillResult::Active(ActiveSeq {
-                seq,
-                session_hash: req_session_hash,
-                last_token: first,
-                output_tokens: if spontaneous_think {
-                    vec![]
-                } else {
-                    vec![first]
-                },
-                remaining: max_tokens - 1,
-                min_tokens: req_min_tokens,
-                eos_tokens: eos_tokens.to_vec(),
-                finished: false,
-                engine_error: None,
-                guard_stop: None,
-                param_close_pending: 0,
-                sink,
-                cancel_flag,
-                temperature,
-                top_k,
-                top_p,
-                top_n_sigma,
-                min_p,
-                repetition_penalty,
-                repetition_penalty_window: 256,
-                presence_penalty,
-                frequency_penalty,
-                lz_penalty: req_lz_penalty,
-                dry_multiplier,
-                dry_base,
-                dry_allowed_length,
-                dry_sequence_breakers: Vec::new(),
-                logit_bias: logit_bias.clone(),
-                pending_drafts: Vec::new(),
-                pending_draft_conf: Vec::new(),
-                inside_thinking: spontaneous_think
-                    || (req_enable_thinking && think_end_token.is_some()),
-                enable_thinking: req_enable_thinking,
-                thinking_budget: if spontaneous_think {
-                    Some(spontaneous_think_budget)
-                } else {
-                    req_thinking_budget
-                },
-                repetition_detection: req_repetition_detection,
-                spontaneous_think_budget,
-                thinking_tokens: 0,
-                cached_prompt_tokens: cached_prompt_tok,
-                preempt_immune_until_tokens: 0,
-                force_end_thinking: false,
-                think_force_closed: false,
-                sentence_defer_count: 0,
-                consecutive_confident: 0,
-                in_code_fence: false,
-                think_end_token,
-                think_start_token,
-                think_ended: if spontaneous_think {
-                    false
-                } else {
-                    !req_enable_thinking && think_end_token.is_some()
-                },
-                think_just_ended: false,
-                post_think_emitted: 0,
-                spec_adapt: Default::default(),
-                think_skip_count: 0,
-                require_tool_call: use_legacy_tool_call,
-                tool_request,
-                tools_present: req_tools_present,
-                tool_call_start_token,
-                tool_call_opened: false,
-                inside_tool_body: false,
-                tool_call_completed: false,
-                post_completion_tool_opens: 0,
-                tool_body_streak_tokens: 0,
-                inside_parameter_body: false,
-                param_body_chars_emitted: 0,
-                suppress_tool_call: req_suppress_tool_call,
-                disable_mtp: req_disable_mtp,
-                mtp_acct: Default::default(),
-                content_started: false,
-                content_tokens: 0,
-                prose_tokens_since_last_tool: 0,
-                think_watchdog_fires: 0,
-                rollback_count: 0,
-                ssm_rollback_ring: SsmDecodeRing::new(model.decode_rollback_ring_slots()),
-                tool_call_end_token,
-                grammar_state,
-                last_token_time: now,
-                request_start,
-                decode_start: now,
-                seed: req_seed,
-                top_logprobs: req_top_logprobs,
-                logprobs_data: Vec::new(),
-                timeout_at: req_timeout_at,
-                adaptive: crate::adaptive_sampler::AdaptiveSamplingState::new(temperature),
-            }))
+            Ok(StartPrefillResult::Active(a))
         }
     } else {
-        // chunk_offset = chunk_len (more chunks to process). DRY comes from
-        // the request (api.rs `sampling_presets.tools.dry_*`); 0.0 leaves it inert.
-        Ok(StartPrefillResult::InProgress(
-            super::prefill_a_step_params::build_prefill_in_progress(
-                prompt_tokens,
-                req_session_hash,
-                seq,
-                chunk_len,
-                max_tokens,
-                req_min_tokens,
-                eos_tokens.to_vec(),
-                sink,
-                cancel_flag,
-                request_start,
-                temperature,
-                top_k,
-                top_p,
-                top_n_sigma,
-                min_p,
-                repetition_penalty,
-                presence_penalty,
-                frequency_penalty,
-                req_lz_penalty,
-                dry_multiplier,
-                dry_base,
-                dry_allowed_length,
-                logit_bias,
-                req_enable_thinking,
-                req_thinking_budget,
-                req_repetition_detection,
-                spontaneous_think_budget,
-                req_require_tool_call,
-                req_tools_present,
-                req_suppress_tool_call,
-                req_disable_mtp,
-                grammar_state,
-                req_seed,
-                req_top_logprobs,
-                req_timeout_at,
-            ),
-        ))
+        Ok(StartPrefillResult::InProgress(p))
     }
+}
+
+/// Plant the requested shared-prefix checkpoint (`shared_prefix`) in a
+/// prefill about to send its chunk-0 command.
+fn plant_chunk0(model: &dyn Model, seq: &mut SequenceState, at: Option<usize>) -> Result<()> {
+    at.map_or(Ok(()), |at| model.pc_plant(seq, at))
 }

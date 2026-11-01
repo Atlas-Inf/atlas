@@ -23,6 +23,7 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.btile_storage.require_legacy()?;
         // LongCat zero-experts are wired only on the single-token decode
         // + prefill paths (v1); this variant would silently mis-route the
         // 384-wide router. Named refusal, not silent wrongness.
@@ -30,7 +31,6 @@ impl MoeLayer {
             self.router_logits_n as usize == ctx.config.num_experts,
             "zero-expert MoE routing is not wired on this dispatch variant yet (forward_token_major)"
         );
-
         // SOLID Incr-4: the token-major fast path has no fold hooks. When a
         // MoE adapter is RESIDENT, delegate to the per-row batched fallback,
         // which folds router + gate/up/down route-agnostically (base rows
@@ -49,7 +49,7 @@ impl MoeLayer {
             && self.weights.shared_expert.up_proj.weight.0 != 0
             && self.weights.shared_expert.down_proj.weight.0 != 0;
         let nvfp4_supported = self.bf16_gate_weight_ptrs.is_none()
-            && !self.has_mixed_bf16_shared_expert()
+            && !self.has_separate_shared_expert()
             && self.fp8_gate_weight_ptrs.is_none()
             && !self.use_t_layout_for_decode()
             && has_shared;
@@ -75,6 +75,16 @@ impl MoeLayer {
                 n,
                 num_experts,
                 h,
+                stream,
+            )?;
+        } else if self.row_invariant_bf16_router {
+            self.wide_rows.dense_rows(
+                ctx.gpu,
+                self.dense_gemv_batchm,
+                router_in,
+                &self.weights.gate,
+                gate_logits,
+                (n, num_experts, h, num_experts),
                 stream,
             )?;
         } else {

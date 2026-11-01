@@ -14,6 +14,35 @@ use crate::gpu::{DevicePtr, GpuBackend};
 /// Upload one tensor's raw on-disk bytes to the store: F16→BF16 convert if
 /// needed, GPU-alloc (managed/UVM fallback on OOM), copy, insert. Shared by the
 /// mmap path (whole-file view) and the Windows streaming path (per-tensor read).
+/// The dtype step of a weight upload: F16 -> BF16 bytes unless the tensor is a
+/// `keeps_raw_f16` EXL3 scale vector; otherwise the raw bytes with the mapped
+/// store dtype. Byte length is preserved either way. Shared by `upload_one`
+/// (per-tensor alloc) and the slab-packed upload in `stream_shard_windows`.
+fn stage_upload_bytes<'a>(
+    name: &str,
+    raw: &'a [u8],
+    st_dtype: safetensors::Dtype,
+) -> Result<(std::borrow::Cow<'a, [u8]>, WeightDtype)> {
+    // F16 shards: convert bytes to BF16 before upload (same length,
+    // different bit layout). EXL3 scale vectors (`keeps_raw_f16`) keep their
+    // raw FP16 bytes. WeightDtype stays closed to store dtypes otherwise.
+    let (data, dtype): (std::borrow::Cow<'a, [u8]>, _) = if st_dtype == safetensors::Dtype::F16 {
+        if crate::weights::keeps_raw_f16(name) {
+            (raw.into(), WeightDtype::FP16)
+        } else {
+            (f16_to_bf16_bytes(raw).into(), WeightDtype::BF16)
+        }
+    } else {
+        (raw.into(), WeightDtype::from_safetensors(st_dtype)?)
+    };
+    debug_assert_eq!(
+        data.len(),
+        raw.len(),
+        "{name}: dtype staging changed length"
+    );
+    Ok((data, dtype))
+}
+
 fn upload_one(
     name: &str,
     raw: &[u8],
@@ -23,15 +52,8 @@ fn upload_one(
     weights: &mut HashMap<String, WeightTensor>,
     offload_logged: &mut bool,
 ) -> Result<()> {
-    // F16 shards: convert bytes to BF16 before upload (same length,
-    // different bit layout). WeightDtype stays closed to store dtypes.
-    let converted: Vec<u8>;
-    let (data, dtype): (&[u8], _) = if st_dtype == safetensors::Dtype::F16 {
-        converted = f16_to_bf16_bytes(raw);
-        (&converted, WeightDtype::BF16)
-    } else {
-        (raw, WeightDtype::from_safetensors(st_dtype)?)
-    };
+    let (data, dtype) = stage_upload_bytes(name, raw, st_dtype)?;
+    let data: &[u8] = &data;
 
     // ATLAS_WEIGHT_MANAGED=1: upload straight into managed (UVM) memory via CPU
     // memcpy, skipping `gpu.alloc`+`copy_h2d`. Diagnostic for the ~2x store
@@ -86,6 +108,7 @@ fn upload_one(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn load_sharded(
     model_dir: &Path,
     index_path: &Path,
@@ -94,10 +117,16 @@ pub(super) fn load_sharded(
     skip_fn: &dyn Fn(&str) -> bool,
     peak_multiplier_override: Option<f64>,
     deferred: &mut HashMap<String, crate::weights::DeferredTensor>,
+    // Only the Windows streaming path reads this; keep the binding alive on
+    // other platforms without a #[allow].
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] pack_slab: bool,
 ) -> Result<HashMap<String, WeightTensor>> {
     let index_json = std::fs::read_to_string(index_path)
         .with_context(|| format!("Failed to read {}", index_path.display()))?;
-    let index: SafetensorsIndex = serde_json::from_str(&index_json)?;
+    let mut index: SafetensorsIndex = serde_json::from_str(&index_json)?;
+    // EXL3 tensors in unindexed side files join the map (no-op otherwise), so
+    // they are grouped into `shard_to_tensors` and estimated below.
+    let _merged = crate::weights::merge_exl3_side_files(model_dir, &mut index.weight_map)?;
 
     let mut offload_logged = false; // Track if we've logged the managed memory fallback
 
@@ -190,6 +219,7 @@ pub(super) fn load_sharded(
                 deferred,
                 &mut skipped,
                 &mut offload_logged,
+                pack_slab,
             )?;
         }
         #[cfg(not(target_os = "windows"))]
@@ -281,6 +311,7 @@ fn stream_shard_windows(
     deferred: &mut HashMap<String, crate::weights::DeferredTensor>,
     skipped: &mut usize,
     offload_logged: &mut bool,
+    pack_slab: bool,
 ) -> Result<()> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -309,62 +340,86 @@ fn stream_shard_windows(
         infos.insert(k, info);
     }
 
+    let plan = super::slab_plan::plan_shard(tensor_names, &infos, skip_fn, data_base)?;
+    for d in plan.deferred {
+        deferred.insert(
+            d.name,
+            crate::weights::DeferredTensor {
+                path: shard_path.to_path_buf(),
+                offset: d.offset,
+                shape: d.shape,
+                dtype: d.dtype,
+            },
+        );
+    }
+    *skipped += plan.skipped;
+
+    // Pack mode (opt-in): one alloc per shard, tensors carved at 4096-byte
+    // interior offsets — same contract as the fast loader's pack_slab (per-
+    // tensor cuMemAlloc rounds >=1 MB to 2 MB pages, ~0.6 GB waste/shard on
+    // NVFP4 MoE). If the slab alloc fails, fall back to per-tensor allocs.
+    let slab = if pack_slab {
+        let (offsets, total) = crate::weights::slab_layout(plan.kept.iter().map(|t| t.len));
+        if total == 0 {
+            None
+        } else {
+            match gpu.alloc(total) {
+                Ok(base) => {
+                    gpu.register_slab(base, total);
+                    Some((base, offsets))
+                }
+                Err(_) => None,
+            }
+        }
+    } else {
+        None
+    };
+
     // Read each tensor into a reusable page-locked staging buffer, then H2D.
     // A pinned source makes `cuMemcpyHtoDAsync` a true DMA; a pageable source
     // would route through the driver's internal staging pool, which on the
     // Windows UMA driver grows to ~the copied size and is not released — that
     // was the second ~20GB phantom (a file-backed mmap had the same effect).
-    let max_len = tensor_names
-        .iter()
-        .filter(|n| !skip_fn(n) && !crate::weights::is_ngram_table(n))
-        .filter_map(|n| infos.get(n.as_str()))
-        .map(|i| i.data_offsets.1.saturating_sub(i.data_offsets.0))
-        .max()
-        .unwrap_or(0);
-    let pinned = gpu.alloc_host_pinned(max_len.max(1))?;
-    let staging = unsafe { std::slice::from_raw_parts_mut(pinned, max_len) };
+    let pinned = gpu.alloc_host_pinned(plan.max_len.max(1))?;
+    let staging = unsafe { std::slice::from_raw_parts_mut(pinned, plan.max_len) };
     let result = (|| -> Result<()> {
-        for name in tensor_names {
-            if skip_fn(name) {
-                *skipped += 1;
-                continue;
-            }
-            let info = infos
-                .get(name.as_str())
-                .with_context(|| format!("tensor {name} missing from shard metadata"))?;
-            let (begin, end) = info.data_offsets;
-            // n-gram TABLES are deferred, not uploaded — same contract as the
-            // mmap path. data_offsets are relative to the data section start.
-            if crate::weights::is_ngram_table(name) {
-                deferred.insert(
-                    name.to_string(),
-                    crate::weights::DeferredTensor {
-                        path: shard_path.to_path_buf(),
-                        offset: data_base + begin as u64,
-                        shape: info.shape.clone(),
-                        dtype: WeightDtype::from_safetensors(info.dtype)?,
-                    },
-                );
-                *skipped += 1;
-                continue;
-            }
-            let len = end.saturating_sub(begin);
-            file.seek(SeekFrom::Start(data_base + begin as u64))?;
-            file.read_exact(&mut staging[..len])
-                .with_context(|| format!("Failed to read tensor {name}"))?;
-            upload_one(
-                name,
-                &staging[..len],
-                info.dtype,
-                info.shape.clone(),
-                gpu,
-                weights,
-                offload_logged,
-            )?;
+        for (i, t) in plan.kept.iter().enumerate() {
+            file.seek(SeekFrom::Start(data_base + t.begin))?;
+            file.read_exact(&mut staging[..t.len])
+                .with_context(|| format!("Failed to read tensor {}", t.name))?;
+            let (data, dtype) = stage_upload_bytes(&t.name, &staging[..t.len], t.dtype)?;
+            debug_assert_eq!(data.len(), t.len);
+            let ptr = match &slab {
+                Some((base, offsets)) => {
+                    gpu.copy_h2d(&data, base.offset(offsets[i]))?;
+                    base.offset(offsets[i])
+                }
+                None => {
+                    // Per-tensor path — identical to the non-slab arm.
+                    upload_one(
+                        &t.name,
+                        &data,
+                        t.dtype,
+                        t.shape.clone(),
+                        gpu,
+                        weights,
+                        offload_logged,
+                    )?;
+                    continue;
+                }
+            };
+            weights.insert(
+                t.name.clone(),
+                WeightTensor {
+                    ptr,
+                    shape: t.shape.clone(),
+                    dtype,
+                },
+            );
         }
         Ok(())
     })();
-    gpu.free_host_pinned(pinned, max_len.max(1))?;
+    gpu.free_host_pinned(pinned, plan.max_len.max(1))?;
     result
 }
 
@@ -384,11 +439,16 @@ pub(super) fn load_single(
             continue;
         }
         let shape: Vec<usize> = view.shape().to_vec();
-        // F16: convert to BF16 at load — see load_sharded above.
+        // F16: convert to BF16 at load — see load_sharded above. EXL3 scale
+        // vectors (`keeps_raw_f16`) keep their raw FP16 bytes.
         let converted: Vec<u8>;
         let (data, dtype): (&[u8], _) = if view.dtype() == safetensors::Dtype::F16 {
-            converted = f16_to_bf16_bytes(view.data());
-            (&converted, WeightDtype::BF16)
+            if crate::weights::keeps_raw_f16(&name) {
+                (view.data(), WeightDtype::FP16)
+            } else {
+                converted = f16_to_bf16_bytes(view.data());
+                (&converted, WeightDtype::BF16)
+            }
         } else {
             (view.data(), WeightDtype::from_safetensors(view.dtype())?)
         };

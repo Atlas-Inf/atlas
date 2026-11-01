@@ -2,7 +2,7 @@
 
 //! Which tensors the fast loader does NOT upload.
 //!
-//! Four independent rules, worth reading together because each one withholds
+//! Five independent rules, worth reading together because each one withholds
 //! bytes a downstream loader might expect:
 //!
 //!   1. **`demand_paged_patterns`** — tensors a model declares it will read by
@@ -10,10 +10,14 @@
 //!      table). Model-declared, so it is checked FIRST and independently of
 //!      expert parallelism.
 //!   2. **EP sharding** — remote experts belong to another rank.
-//!   3. **`skip_activation_scales`** — W4A4 `*.input_scale`, opt-in.
+//!   3. **`skip_activation_scales`** — W4A4 `*.input_scale`, opt-in: not
+//!      uploaded but DEFERRED, every expert's on every rank (the model loader
+//!      reads the scalars from disk).
 //!   4. **`skip_mtp`** — `mtp.*` for a loader that builds no MTP head, opt-in.
 //!
-//! Rules 3 and 4 default OFF and are allow-listed per model, because
+//!   5. **`skip_layer_prefix`** — an unused appended predictor layer, opt-in.
+//!
+//! Rules 3, 4, and 5 default OFF and are allow-listed per model, because
 //! withholding a tensor a loader DOES read is invisible until the output is
 //! subtly wrong. Rule 2 is structural and always active under EP, and rule 1
 //! is only ever populated by a loader that has its own row reader.
@@ -22,7 +26,57 @@ use super::FastSafetensorsLoader;
 use crate::weights::parse_expert_index;
 
 impl FastSafetensorsLoader {
+    /// Tensors located on disk but not uploaded: host-decoded formats and
+    /// expert-TP slices; the activation scales under `skip_activation_scales`
+    /// (one 0-dim F32 per projection, read on the host by a model loader that
+    /// needs them, whichever rank owns the expert). Deferred tensors are also
+    /// left out of the pre-flight.
+    pub(super) fn should_defer_tensor(&self, name: &str) -> bool {
+        (self.skip_activation_scales && name.ends_with(".input_scale"))
+            || self.is_host_decoded(name)
+            || self.is_expert_tp_slice(name)
+    }
+
+    /// CSF scale streams, and the weight/scale pair of every module the model
+    /// build expands on the host (`host_decode_modules`).
+    fn is_host_decoded(&self, name: &str) -> bool {
+        if crate::weights::is_csf_stream(name) {
+            return true;
+        }
+        let module = name
+            .strip_suffix(".weight")
+            .or_else(|| name.strip_suffix(".weight_scale"));
+        module.is_some_and(|m| self.host_decode_modules.contains(m))
+    }
+
+    /// Expert TP: a routed expert's packed weight or block scale, which the
+    /// model loader slices straight from disk. The appended predictor layer
+    /// keeps its own replication rules, and the scalars load as usual.
+    fn is_expert_tp_slice(&self, name: &str) -> bool {
+        self.expert_tp
+            && !name.starts_with("mtp.")
+            && (name.ends_with(".weight") || name.ends_with(".weight_scale"))
+            && parse_expert_index(name).is_some()
+            && ![
+                &self.replicated_expert_prefix,
+                &self.rank0_only_expert_prefix,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|prefix| name.contains(prefix.as_str()))
+    }
+
     pub(super) fn should_skip_tensor(&self, name: &str) -> bool {
+        if debug_layer_dropped(name) {
+            return true;
+        }
+        if self
+            .skip_layer_prefix
+            .as_ref()
+            .is_some_and(|prefix| name.starts_with(prefix))
+        {
+            return true;
+        }
         // Demand-paged first: the model has declared it reads these by row at
         // use time, which is independent of expert parallelism and must hold
         // on a single rank where the EP check below returns early.
@@ -49,11 +103,23 @@ impl FastSafetensorsLoader {
         if self.skip_mtp && name.starts_with("mtp.") {
             return true;
         }
-        // W4A4 activation scales: never read on the w4a16 path (the NVFP4
-        // loader falls back to `DevicePtr::NULL`), and 4-byte allocations are
-        // almost pure granule padding at expert scale.
-        if self.skip_activation_scales && name.ends_with(".input_scale") {
+        // Dead namespaces the model's loader never reads (e.g. the omni
+        // checkpoint's vision tower + latent-MoE MTP head). Applies at EP=1
+        // too — must run BEFORE the `ep_world_size <= 1` early return.
+        if self
+            .skip_prefixes
+            .iter()
+            .any(|p| name.starts_with(p.as_str()))
+        {
             return true;
+        }
+        // W4A4 activation scales: not uploaded -- 4-byte allocations are
+        // almost pure granule padding at expert scale, and the NVFP4 loader
+        // falls back to `DevicePtr::NULL` -- but deferred (`should_defer_tensor`)
+        // for every expert, remote ones included: qwen4_exp's W4A4 prefill
+        // quantizes a layer's input under the max over all of them.
+        if self.skip_activation_scales && name.ends_with(".input_scale") {
+            return false;
         }
         if self.ep_world_size <= 1 {
             return false;
@@ -62,6 +128,23 @@ impl FastSafetensorsLoader {
             return false;
         }
         if let Some(idx) = parse_expert_index(name) {
+            if self
+                .replicated_expert_prefix
+                .as_ref()
+                .is_some_and(|prefix| name.contains(prefix))
+            {
+                return false;
+            }
+            if self
+                .rank0_only_expert_prefix
+                .as_ref()
+                .is_some_and(|prefix| name.contains(prefix))
+            {
+                return self.ep_rank != 0;
+            }
+            if self.expert_tp {
+                return false;
+            }
             let per_rank = self.num_experts / self.ep_world_size;
             let local_start = self.ep_rank * per_rank;
             let local_end = if self.ep_rank == self.ep_world_size - 1 {
@@ -74,4 +157,28 @@ impl FastSafetensorsLoader {
             false
         }
     }
+}
+
+/// `ATLAS_QWEN4EXP_DEBUG_LAYERS=<n>` (debug harness, unset in serving): the
+/// config keeps the first `n` decoder layers (`atlas_core` qwen4_exp parser),
+/// so a decoder tensor of layer `n` or later is never read. `mtp.*` keeps its
+/// own numbering.
+fn debug_layer_dropped(name: &str) -> bool {
+    static KEEP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let Some(keep) = *KEEP.get_or_init(|| {
+        std::env::var("ATLAS_QWEN4EXP_DEBUG_LAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    }) else {
+        return false;
+    };
+    if name.starts_with("mtp.") {
+        return false;
+    }
+    let Some(at) = name.find(".layers.") else {
+        return false;
+    };
+    let rest = &name[at + ".layers.".len()..];
+    let digits = rest.split('.').next().unwrap_or("");
+    digits.parse::<usize>().is_ok_and(|i| i >= keep)
 }

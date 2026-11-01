@@ -183,6 +183,28 @@ __device__ __forceinline__ void gate_up_shared_t_impl(
     }
 }
 
+template<int GS_R, bool E8M0_R, int GS_S, bool E8M0_S>
+__device__ __forceinline__ void gate_up_shared_t_impl_smem(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ gate_packed_t_ptrs,
+    const unsigned long long* __restrict__ gate_scale_t_ptrs,
+    const float* __restrict__ gate_scale2_vals,
+    __nv_bfloat16* __restrict__ gate_out,
+    const unsigned long long* __restrict__ up_packed_t_ptrs,
+    const unsigned long long* __restrict__ up_scale_t_ptrs,
+    const float* __restrict__ up_scale2_vals,
+    __nv_bfloat16* __restrict__ up_out,
+    const unsigned int* __restrict__ expert_indices,
+    const unsigned char* __restrict__ sh_gate_t_packed,
+    const unsigned char* __restrict__ sh_gate_t_scale,
+    float sh_gate_s2,
+    __nv_bfloat16* __restrict__ sh_gate_out,
+    const unsigned char* __restrict__ sh_up_t_packed,
+    const unsigned char* __restrict__ sh_up_t_scale,
+    float sh_up_s2,
+    __nv_bfloat16* __restrict__ sh_up_out,
+    unsigned int N, unsigned int K, unsigned int top_k);
+
 // NVFP4 (default): FP8-E4M3 per-16 scales × per-tensor global.
 extern "C" __global__ void moe_expert_gate_up_shared_t(
     const __nv_bfloat16* __restrict__ A,
@@ -205,7 +227,7 @@ extern "C" __global__ void moe_expert_gate_up_shared_t(
     __nv_bfloat16* __restrict__ sh_up_out,
     unsigned int N, unsigned int K, unsigned int top_k
 ) {
-    gate_up_shared_t_impl<GROUP_SIZE, false, GROUP_SIZE, false>(
+    gate_up_shared_t_impl_smem<GROUP_SIZE, false, GROUP_SIZE, false>(
         A, gate_packed_t_ptrs, gate_scale_t_ptrs, gate_scale2_vals, gate_out,
         up_packed_t_ptrs, up_scale_t_ptrs, up_scale2_vals, up_out, expert_indices,
         sh_gate_t_packed, sh_gate_t_scale, sh_gate_s2, sh_gate_out,
@@ -368,6 +390,23 @@ __device__ __forceinline__ void silu_down_shared_t_impl(
     }
 }
 
+template<int GS_R, bool E8M0_R, int GS_S, bool E8M0_S>
+__device__ __forceinline__ void silu_down_shared_t_impl_smem(
+    const __nv_bfloat16* __restrict__ gate_out,
+    const __nv_bfloat16* __restrict__ up_out,
+    const unsigned long long* __restrict__ packed_t_ptrs,
+    const unsigned long long* __restrict__ scale_t_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,
+    const unsigned int* __restrict__ expert_indices,
+    const __nv_bfloat16* __restrict__ sh_gate_in,
+    const __nv_bfloat16* __restrict__ sh_up_in,
+    const unsigned char* __restrict__ sh_down_t_packed,
+    const unsigned char* __restrict__ sh_down_t_scale,
+    float sh_down_s2,
+    __nv_bfloat16* __restrict__ sh_down_out,
+    unsigned int N, unsigned int K, unsigned int top_k);
+
 // NVFP4 (default): FP8-E4M3 per-16 scales × per-tensor global.
 extern "C" __global__ void moe_expert_silu_down_shared_t(
     const __nv_bfloat16* __restrict__ gate_out,
@@ -385,7 +424,7 @@ extern "C" __global__ void moe_expert_silu_down_shared_t(
     __nv_bfloat16* __restrict__ sh_down_out,
     unsigned int N, unsigned int K, unsigned int top_k
 ) {
-    silu_down_shared_t_impl<GROUP_SIZE, false, GROUP_SIZE, false>(
+    silu_down_shared_t_impl_smem<GROUP_SIZE, false, GROUP_SIZE, false>(
         gate_out, up_out, packed_t_ptrs, scale_t_ptrs, scale2_vals, C,
         expert_indices, sh_gate_in, sh_up_in, sh_down_t_packed, sh_down_t_scale,
         sh_down_s2, sh_down_out, N, K, top_k);
@@ -413,3 +452,731 @@ extern "C" __global__ void moe_expert_silu_down_shared_t_e8m0(
         expert_indices, sh_gate_in, sh_up_in, sh_down_t_packed, sh_down_t_scale,
         sh_down_s2, sh_down_out, N, K, top_k);
 }
+
+// ── Shared-memory tiled impls (S2d): production path ─────────────────────
+// Stage each expert's packed tile into smem via 16 B cooperative loads
+// (double-buffered), then every thread accumulates ITS column in the
+// identical per-output FP32 order. Byte-identical to the scalar loop.
+#define TILE_KH 64u
+#define TILE_STRIDE 48u
+template<int GS_R, bool E8M0_R, int GS_S, bool E8M0_S>
+__device__ __forceinline__ void gate_up_shared_t_impl_smem(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ gate_packed_t_ptrs,
+    const unsigned long long* __restrict__ gate_scale_t_ptrs,
+    const float* __restrict__ gate_scale2_vals,
+    __nv_bfloat16* __restrict__ gate_out,
+    const unsigned long long* __restrict__ up_packed_t_ptrs,
+    const unsigned long long* __restrict__ up_scale_t_ptrs,
+    const float* __restrict__ up_scale2_vals,
+    __nv_bfloat16* __restrict__ up_out,
+    const unsigned int* __restrict__ expert_indices,
+    const unsigned char* __restrict__ sh_gate_t_packed,
+    const unsigned char* __restrict__ sh_gate_t_scale,
+    float sh_gate_s2,
+    __nv_bfloat16* __restrict__ sh_gate_out,
+    const unsigned char* __restrict__ sh_up_t_packed,
+    const unsigned char* __restrict__ sh_up_t_scale,
+    float sh_up_s2,
+    __nv_bfloat16* __restrict__ sh_up_out,
+    unsigned int N, unsigned int K, unsigned int top_k
+) {
+    const unsigned int expert_slot = blockIdx.y;
+    const unsigned int proj = blockIdx.z;
+    const bool is_shared = (expert_slot == top_k);
+    const unsigned char* B_packed; const unsigned char* B_scale; float s2; __nv_bfloat16* C;
+    const unsigned int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (is_shared) {
+        if (proj == 0) {
+            if (sh_gate_t_packed == 0) { if (n < N) sh_gate_out[n] = __float2bfloat16(0.0f); return; }
+            B_packed = sh_gate_t_packed; B_scale = sh_gate_t_scale; s2 = sh_gate_s2; C = sh_gate_out;
+        } else {
+            if (sh_up_t_packed == 0) { if (n < N) sh_up_out[n] = __float2bfloat16(0.0f); return; }
+            B_packed = sh_up_t_packed; B_scale = sh_up_t_scale; s2 = sh_up_s2; C = sh_up_out;
+        }
+    } else {
+        const unsigned int expert_id = expert_indices[expert_slot];
+        if (proj == 0) {
+            B_packed = (const unsigned char*)gate_packed_t_ptrs[expert_id];
+            B_scale = (const unsigned char*)gate_scale_t_ptrs[expert_id];
+            s2 = gate_scale2_vals[expert_id]; C = gate_out;
+        } else {
+            B_packed = (const unsigned char*)up_packed_t_ptrs[expert_id];
+            B_scale = (const unsigned char*)up_scale_t_ptrs[expert_id];
+            s2 = up_scale2_vals[expert_id]; C = up_out;
+        }
+        if (B_packed == 0) { if (n < N) C[(unsigned long long)expert_slot * N + n] = __float2bfloat16(0.0f); return; }
+    }
+
+    const unsigned int lane = threadIdx.x;
+    const unsigned int ns0 = blockIdx.x * blockDim.x;
+    const bool valid = (n < N);
+    __shared__ float s_lut[16];
+    if (lane < 16) s_lut[lane] = E2M1_LUT_T[lane];
+    __shared__ unsigned char s_pk[2][TILE_KH * TILE_STRIDE];
+    __shared__ unsigned char s_sc[2][(TILE_KH / 8) * TILE_STRIDE];
+    __syncthreads();
+
+    const unsigned int r = lane / 2u;
+    const unsigned int off = (lane % 2u) * 16u;
+    auto stage = [&](unsigned int tg, unsigned int buf) {
+        const unsigned int r0 = tg * TILE_KH;
+        _Pragma("unroll")
+        for (unsigned int w = 0; w < TILE_KH / 16u; w++) {
+            unsigned int rr = r + w * 16u;
+            *(uint4*)&s_pk[buf][rr * TILE_STRIDE + off] =
+                *(const uint4*)&B_packed[(unsigned long long)(r0 + rr) * N + ns0 + off];
+        }
+        const unsigned int ng = TILE_KH / 8u;
+        if (lane < ng * 2u) {
+            unsigned int sg = lane / 2u;
+            unsigned int off2 = (lane % 2u) * 16u;
+            *(uint4*)&s_sc[buf][sg * TILE_STRIDE + off2] =
+                *(const uint4*)&B_scale[(unsigned long long)(tg * ng + sg) * N + ns0 + off2];
+        }
+    };
+
+    float acc = 0.0f;
+    const unsigned int ntg = (K / 2u) / TILE_KH;
+    stage(0, 0);
+    for (unsigned int tg = 0; tg < ntg; tg++) {
+        __syncthreads();
+        if (tg + 1u < ntg) stage(tg + 1u, (tg + 1u) & 1u);
+        const unsigned int buf = tg & 1u;
+        if (valid) {
+            #define GU_TILE_ACC(GS_, E8M0_) do { \
+                if constexpr ((GS_) == 16) { \
+                    _Pragma("unroll 8") \
+                    for (unsigned int rr = 0; rr < TILE_KH; rr++) { \
+                        unsigned int k_half = tg * TILE_KH + rr; \
+                        float sc = mx_block_scale<(E8M0_)>(s_sc[buf][(rr >> 3) * TILE_STRIDE + lane], s2); \
+                        unsigned char byte = s_pk[buf][rr * TILE_STRIDE + lane]; \
+                        float a_lo = __bfloat162float(A[k_half * 2]); \
+                        float a_hi = __bfloat162float(A[k_half * 2 + 1]); \
+                        acc += a_lo * (s_lut[byte & 0xFu] * sc) + a_hi * (s_lut[(byte >> 4) & 0xFu] * sc); \
+                    } \
+                } \
+            } while(0)
+            if constexpr (GS_R == GS_S && E8M0_R == E8M0_S) {
+                GU_TILE_ACC(GS_R, E8M0_R);
+            } else {
+                if (is_shared) { GU_TILE_ACC(GS_S, E8M0_S); }
+                else           { GU_TILE_ACC(GS_R, E8M0_R); }
+            }
+            #undef GU_TILE_ACC
+        }
+    }
+    __syncthreads();
+    if (!valid) return;
+    if (is_shared) C[n] = __float2bfloat16(acc);
+    else C[(unsigned long long)expert_slot * N + n] = __float2bfloat16(acc);
+}
+
+template<int GS_R, bool E8M0_R, int GS_S, bool E8M0_S>
+__device__ __forceinline__ void silu_down_shared_t_impl_smem(
+    const __nv_bfloat16* __restrict__ gate_out,
+    const __nv_bfloat16* __restrict__ up_out,
+    const unsigned long long* __restrict__ packed_t_ptrs,
+    const unsigned long long* __restrict__ scale_t_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,
+    const unsigned int* __restrict__ expert_indices,
+    const __nv_bfloat16* __restrict__ sh_gate_in,
+    const __nv_bfloat16* __restrict__ sh_up_in,
+    const unsigned char* __restrict__ sh_down_t_packed,
+    const unsigned char* __restrict__ sh_down_t_scale,
+    float sh_down_s2,
+    __nv_bfloat16* __restrict__ sh_down_out,
+    unsigned int N, unsigned int K, unsigned int top_k
+) {
+    const unsigned int expert_slot = blockIdx.y;
+    const bool is_shared = (expert_slot == top_k);
+    const unsigned char* B_packed; const unsigned char* B_scale; float s2;
+    const __nv_bfloat16* g_ptr; const __nv_bfloat16* u_ptr;
+    const unsigned int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (is_shared) {
+        if (sh_down_t_packed == 0) { if (n < N) sh_down_out[n] = __float2bfloat16(0.0f); return; }
+        B_packed = sh_down_t_packed; B_scale = sh_down_t_scale; s2 = sh_down_s2;
+        g_ptr = sh_gate_in; u_ptr = sh_up_in;
+    } else {
+        const unsigned int expert_id = expert_indices[expert_slot];
+        B_packed = (const unsigned char*)packed_t_ptrs[expert_id];
+        B_scale = (const unsigned char*)scale_t_ptrs[expert_id];
+        s2 = scale2_vals[expert_id];
+        g_ptr = gate_out + (unsigned long long)expert_slot * K;
+        u_ptr = up_out + (unsigned long long)expert_slot * K;
+        if (B_packed == 0) { if (n < N) C[expert_slot * N + n] = __float2bfloat16(0.0f); return; }
+    }
+
+    const unsigned int lane = threadIdx.x;
+    const unsigned int ns0 = blockIdx.x * blockDim.x;
+    const bool valid = (n < N);
+    extern __shared__ float s_act[];
+    for (unsigned int i = lane; i < K; i += blockDim.x) {
+        float gf = __bfloat162float(g_ptr[i]);
+        float uf = __bfloat162float(u_ptr[i]);
+        s_act[i] = (gf / (1.0f + __expf(-gf))) * uf;
+    }
+    __shared__ float s_lut[16];
+    if (lane < 16) s_lut[lane] = E2M1_LUT_T[lane];
+    __shared__ unsigned char s_pk[2][TILE_KH * TILE_STRIDE];
+    __shared__ unsigned char s_sc[2][(TILE_KH / 8) * TILE_STRIDE];
+    __syncthreads();
+
+    const unsigned int r = lane / 2u;
+    const unsigned int off = (lane % 2u) * 16u;
+    auto stage = [&](unsigned int tg, unsigned int buf) {
+        const unsigned int r0 = tg * TILE_KH;
+        _Pragma("unroll")
+        for (unsigned int w = 0; w < TILE_KH / 16u; w++) {
+            unsigned int rr = r + w * 16u;
+            *(uint4*)&s_pk[buf][rr * TILE_STRIDE + off] =
+                *(const uint4*)&B_packed[(unsigned long long)(r0 + rr) * N + ns0 + off];
+        }
+        const unsigned int ng = TILE_KH / 8u;
+        if (lane < ng * 2u) {
+            unsigned int sg = lane / 2u;
+            unsigned int off2 = (lane % 2u) * 16u;
+            *(uint4*)&s_sc[buf][sg * TILE_STRIDE + off2] =
+                *(const uint4*)&B_scale[(unsigned long long)(tg * ng + sg) * N + ns0 + off2];
+        }
+    };
+
+    float acc = 0.0f;
+    const unsigned int ntg = (K / 2u) / TILE_KH;
+    stage(0, 0);
+    for (unsigned int tg = 0; tg < ntg; tg++) {
+        __syncthreads();
+        if (tg + 1u < ntg) stage(tg + 1u, (tg + 1u) & 1u);
+        const unsigned int buf = tg & 1u;
+        if (valid) {
+            #define SD_TILE_ACC(GS_, E8M0_) do { \
+                if constexpr ((GS_) == 16) { \
+                    _Pragma("unroll 8") \
+                    for (unsigned int rr = 0; rr < TILE_KH; rr++) { \
+                        unsigned int k_half = tg * TILE_KH + rr; \
+                        float sc = mx_block_scale<(E8M0_)>(s_sc[buf][(rr >> 3) * TILE_STRIDE + lane], s2); \
+                        unsigned char byte = s_pk[buf][rr * TILE_STRIDE + lane]; \
+                        acc += s_act[k_half * 2] * (s_lut[byte & 0xFu] * sc) \
+                             + s_act[k_half * 2 + 1] * (s_lut[(byte >> 4) & 0xFu] * sc); \
+                    } \
+                } \
+            } while(0)
+            if constexpr (GS_R == GS_S && E8M0_R == E8M0_S) {
+                SD_TILE_ACC(GS_R, E8M0_R);
+            } else {
+                if (is_shared) { SD_TILE_ACC(GS_S, E8M0_S); }
+                else           { SD_TILE_ACC(GS_R, E8M0_R); }
+            }
+            #undef SD_TILE_ACC
+        }
+    }
+    __syncthreads();
+    if (!valid) return;
+    if (is_shared) sh_down_out[n] = __float2bfloat16(acc);
+    else C[(unsigned long long)expert_slot * N + n] = __float2bfloat16(acc);
+}
+
+// ── Multi-row dedup (S7): verify K rows share unique expert reads ────────
+// Union of K rows' top-k ids: unique experts + per-row slot map. One warp.
+#define MOE_MAX_K 8u
+extern "C" __global__ void moe_expert_union_t(
+    const unsigned int* __restrict__ expert_indices, // [K * top_k]
+    unsigned int* __restrict__ u_experts,            // [K * top_k]
+    unsigned int* __restrict__ u_rowmask,            // [K * top_k] bitmask of rows
+    unsigned char* __restrict__ u_rowslot,           // [K * top_k][MOE_MAX_K] slot per row, 0xFF absent
+    unsigned int* __restrict__ u_count,
+    unsigned int K, unsigned int top_k
+) {
+    // Serial fill by lane 0: K*top_k <= 80 slots, trivially cheap on GPU.
+    if (threadIdx.x == 0) {
+        unsigned int U = 0;
+        for (unsigned int t = 0; t < K * top_k; t++) {
+            unsigned int id = expert_indices[t];
+            unsigned int r = t / top_k;
+            unsigned int slot = t % top_k;
+            unsigned int u;
+            for (u = 0; u < U; u++) if (u_experts[u] == id) break;
+            if (u == U) {
+                u_experts[u] = id;
+                u_rowmask[u] = 0;
+                for (unsigned int rr = 0; rr < MOE_MAX_K; rr++)
+                    u_rowslot[u * MOE_MAX_K + rr] = 0xFF;
+                U++;
+            }
+            u_rowmask[u] |= (1u << r);
+            u_rowslot[u * MOE_MAX_K + r] = (unsigned char)slot;
+        }
+        *u_count = U;
+    }
+}
+
+// gate_up over the UNIQUE routed experts of ROWS rows: each expert's packed
+// tile is staged once (smem double-buffer, row stride BS*3/2 bytes), the A
+// k-slice is staged per row, and each thread owns COLS output columns with a
+// register acc[COLS][ROWS]. Every (row, column) keeps the single-row `_t`
+// smem kernel's exact per-element expression and k order — bit-identical to
+// ROWS single-row launches. Masks gate stores only; an unselected row still
+// reads its own in-bounds A row and is never stored.
+// Grid: (N/(BS*COLS), u_count + 1, 2); blockIdx.y == u_count -> shared.
+// The rows kernels stage a CTA's whole COLW-column tile, so when N is not a
+// multiple of COLW the last CTA reads past each weight row: Flash-Next's
+// N = 640 at COLW 256 reads 128 bytes past every row, and past the end of the
+// tensor on its last row. Those columns are never stored (vc[] gates every
+// store), so the staged bytes are dead. On gb10 the read lands in mapped
+// memory. On gfx1151 it faulted (framework f127, grid [3, 41, 2] =
+// ceil(640/256) x (4 rows x top-10 + 1) x {gate, up}), so there the tail
+// chunks are skipped. N is a multiple of 16 for every shape these kernels
+// take (one chunk never straddles N), and the gb10 build is unchanged.
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+#define T_ROWS_TAIL_GUARD(col, N) if ((col) >= (N)) continue;
+#else
+#define T_ROWS_TAIL_GUARD(col, N)
+#endif
+
+template<int ROWS, int BS = 32, int COLS = 1, bool VEC = false>
+__device__ __forceinline__ void gate_up_shared_t_rows_impl(
+    const __nv_bfloat16* __restrict__ A,               // [ROWS, h]
+    const unsigned long long* __restrict__ gate_packed_t_ptrs,
+    const unsigned long long* __restrict__ gate_scale_t_ptrs,
+    const float* __restrict__ gate_scale2_vals,
+    __nv_bfloat16* __restrict__ gate_out,              // [ROWS * top_k, N]
+    const unsigned long long* __restrict__ up_packed_t_ptrs,
+    const unsigned long long* __restrict__ up_scale_t_ptrs,
+    const float* __restrict__ up_scale2_vals,
+    __nv_bfloat16* __restrict__ up_out,
+    const unsigned int* __restrict__ u_experts,
+    const unsigned int* __restrict__ u_rowmask,
+    const unsigned char* __restrict__ u_rowslot,
+    const unsigned int* __restrict__ u_count,
+    const unsigned char* __restrict__ sh_gate_t_packed,
+    const unsigned char* __restrict__ sh_gate_t_scale,
+    float sh_gate_s2,
+    __nv_bfloat16* __restrict__ sh_gate_out,           // [ROWS, N]
+    const unsigned char* __restrict__ sh_up_t_packed,
+    const unsigned char* __restrict__ sh_up_t_scale,
+    float sh_up_s2,
+    __nv_bfloat16* __restrict__ sh_up_out,
+    unsigned int N, unsigned int K, unsigned int top_k, unsigned int h
+) {
+    constexpr unsigned int COLW = BS * COLS;           // columns per CTA
+    constexpr unsigned int STRIDE = COLW + (COLW >= 256 ? 16 : COLW / 2);
+    const unsigned int u = blockIdx.y;
+    const unsigned int proj = blockIdx.z;
+    if (u > *u_count) return;
+    const bool is_shared = (u == *u_count);
+    const unsigned char* B_packed; const unsigned char* B_scale; float s2;
+    if (is_shared) {
+        if (proj == 0) { B_packed = sh_gate_t_packed; B_scale = sh_gate_t_scale; s2 = sh_gate_s2; }
+        else           { B_packed = sh_up_t_packed;   B_scale = sh_up_t_scale;   s2 = sh_up_s2; }
+    } else {
+        const unsigned int eid = u_experts[u];
+        if (proj == 0) {
+            B_packed = (const unsigned char*)gate_packed_t_ptrs[eid];
+            B_scale = (const unsigned char*)gate_scale_t_ptrs[eid];
+            s2 = gate_scale2_vals[eid];
+        } else {
+            B_packed = (const unsigned char*)up_packed_t_ptrs[eid];
+            B_scale = (const unsigned char*)up_scale_t_ptrs[eid];
+            s2 = up_scale2_vals[eid];
+        }
+    }
+
+    const unsigned int lane = threadIdx.x;
+    const unsigned int ns0 = blockIdx.x * (BS * COLS);
+    unsigned int col[COLS]; bool vc[COLS]; bool any = false;
+    _Pragma("unroll")
+    for (unsigned int c = 0; c < COLS; c++) { col[c] = ns0 + lane + c * BS; vc[c] = col[c] < N; any |= vc[c]; }
+    __shared__ float s_lut[16];
+    if (lane < 16) s_lut[lane] = E2M1_LUT_T[lane];
+    __shared__ unsigned char s_pk[2][TILE_KH * STRIDE];
+    __shared__ unsigned char s_sc[2][(TILE_KH / 8) * STRIDE];
+    __shared__ __nv_bfloat16 s_a[2][ROWS * TILE_KH * 2];
+    __syncthreads();
+
+    unsigned int mask = is_shared ? ((1u << ROWS) - 1u) : u_rowmask[u];
+    if (B_packed == 0) {
+        _Pragma("unroll")
+        for (unsigned int c = 0; c < COLS; c++) {
+            if (!vc[c]) continue;
+            _Pragma("unroll")
+            for (unsigned int r = 0; r < ROWS; r++) {
+                if (!(mask & (1u << r))) continue;
+                if (is_shared) { if (proj == 0) sh_gate_out[r * N + col[c]] = __float2bfloat16(0.0f);
+                                 else           sh_up_out[r * N + col[c]] = __float2bfloat16(0.0f); }
+                else {
+                    unsigned int slot = u_rowslot[u * MOE_MAX_K + r];
+                    __nv_bfloat16* C = (proj == 0) ? gate_out : up_out;
+                    C[(unsigned long long)(r * top_k + slot) * N + col[c]] = __float2bfloat16(0.0f);
+                }
+            }
+        }
+        return;
+    }
+
+    auto stage = [&](unsigned int tg, unsigned int buf) {
+        const unsigned int r0 = tg * TILE_KH;
+        _Pragma("unroll")
+        for (unsigned int j = lane; j < TILE_KH * (COLW / 16u); j += BS) {
+            const unsigned int rr = j / (COLW / 16u);
+            const unsigned int cb = (j % (COLW / 16u)) * 16u;
+            T_ROWS_TAIL_GUARD(ns0 + cb, N)
+            *(uint4*)&s_pk[buf][rr * STRIDE + cb] =
+                *(const uint4*)&B_packed[(unsigned long long)(r0 + rr) * N + ns0 + cb];
+        }
+        const unsigned int ng = TILE_KH / 8u;
+        _Pragma("unroll")
+        for (unsigned int j = lane; j < ng * (COLW / 16u); j += BS) {
+            const unsigned int sg = j / (COLW / 16u);
+            const unsigned int cb = (j % (COLW / 16u)) * 16u;
+            T_ROWS_TAIL_GUARD(ns0 + cb, N)
+            *(uint4*)&s_sc[buf][sg * STRIDE + cb] =
+                *(const uint4*)&B_scale[(unsigned long long)(tg * ng + sg) * N + ns0 + cb];
+        }
+        _Pragma("unroll")
+        for (unsigned int j = lane; j < ROWS * (TILE_KH * 2 / 8u); j += BS) {
+            const unsigned int row = j / (TILE_KH * 2 / 8u);
+            const unsigned int chunk = j % (TILE_KH * 2 / 8u);
+            *(uint4*)&s_a[buf][row * TILE_KH * 2 + chunk * 8] =
+                *(const uint4*)&A[(unsigned long long)row * h + tg * TILE_KH * 2 + chunk * 8];
+        }
+    };
+
+    float acc[COLS][ROWS];
+    _Pragma("unroll")
+    for (unsigned int c = 0; c < COLS; c++)
+        _Pragma("unroll")
+        for (unsigned int r = 0; r < ROWS; r++) acc[c][r] = 0.0f;
+    const unsigned int ntg = (K / 2u) / TILE_KH;
+    stage(0, 0);
+    for (unsigned int tg = 0; tg < ntg; tg++) {
+        __syncthreads();
+        if (tg + 1u < ntg) stage(tg + 1u, (tg + 1u) & 1u);
+        const unsigned int buf = tg & 1u;
+        if (any) {
+            if constexpr (VEC) {
+                _Pragma("unroll")
+                for (unsigned int rr4 = 0; rr4 < TILE_KH / 4u; rr4++) {
+                    __nv_bfloat16 av[ROWS][8];
+                    _Pragma("unroll")
+                    for (unsigned int r = 0; r < ROWS; r++)
+                        *(uint4*)&av[r][0] = *(const uint4*)&s_a[buf][r * TILE_KH * 2 + rr4 * 8];
+                    _Pragma("unroll")
+                    for (unsigned int j = 0; j < 4; j++) {
+                        const unsigned int rr = rr4 * 4 + j;
+                        float w_lo[COLS], w_hi[COLS];
+                        _Pragma("unroll")
+                        for (unsigned int c = 0; c < COLS; c++) {
+                            float sc = mx_block_scale<false>(s_sc[buf][(rr >> 3) * STRIDE + lane + c * BS], s2);
+                            unsigned char byte = s_pk[buf][rr * STRIDE + lane + c * BS];
+                            w_lo[c] = s_lut[byte & 0xFu] * sc;
+                            w_hi[c] = s_lut[(byte >> 4) & 0xFu] * sc;
+                        }
+                        _Pragma("unroll")
+                        for (unsigned int r = 0; r < ROWS; r++) {
+                            const float a_lo = __bfloat162float(av[r][2 * j]);
+                            const float a_hi = __bfloat162float(av[r][2 * j + 1]);
+                            _Pragma("unroll")
+                            for (unsigned int c = 0; c < COLS; c++)
+                                acc[c][r] += a_lo * w_lo[c] + a_hi * w_hi[c];
+                        }
+                    }
+                }
+            } else {
+                _Pragma("unroll 8")
+                for (unsigned int rr = 0; rr < TILE_KH; rr++) {
+                    float w_lo[COLS], w_hi[COLS];
+                    _Pragma("unroll")
+                    for (unsigned int c = 0; c < COLS; c++) {
+                        float sc = mx_block_scale<false>(s_sc[buf][(rr >> 3) * STRIDE + lane + c * BS], s2);
+                        unsigned char byte = s_pk[buf][rr * STRIDE + lane + c * BS];
+                        w_lo[c] = s_lut[byte & 0xFu] * sc;
+                        w_hi[c] = s_lut[(byte >> 4) & 0xFu] * sc;
+                    }
+                    _Pragma("unroll")
+                    for (unsigned int r = 0; r < ROWS; r++) {
+                        const float a_lo = __bfloat162float(s_a[buf][r * TILE_KH * 2 + rr * 2]);
+                        const float a_hi = __bfloat162float(s_a[buf][r * TILE_KH * 2 + rr * 2 + 1]);
+                        _Pragma("unroll")
+                        for (unsigned int c = 0; c < COLS; c++)
+                            acc[c][r] += a_lo * w_lo[c] + a_hi * w_hi[c];
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+    _Pragma("unroll")
+    for (unsigned int c = 0; c < COLS; c++) {
+        if (!vc[c]) continue;
+        _Pragma("unroll")
+        for (unsigned int r = 0; r < ROWS; r++) {
+            if (!(mask & (1u << r))) continue;
+            if (is_shared) { if (proj == 0) sh_gate_out[r * N + col[c]] = __float2bfloat16(acc[c][r]);
+                             else           sh_up_out[r * N + col[c]] = __float2bfloat16(acc[c][r]); }
+            else {
+                unsigned int slot = u_rowslot[u * MOE_MAX_K + r];
+                __nv_bfloat16* C = (proj == 0) ? gate_out : up_out;
+                C[(unsigned long long)(r * top_k + slot) * N + col[c]] = __float2bfloat16(acc[c][r]);
+            }
+        }
+    }
+}
+
+// silu_down over the unique routed experts of ROWS rows, COLS columns per
+// thread. The per-(row, slot) gate/up k-slice is staged in smem beside the
+// weight tile; the activation is the single-row s_act expression evaluated
+// on the staged values. An unselected row computes on its slot-0 row and is
+// never stored. Grid: (N/(BS*COLS), u_count + 1).
+template<int ROWS, int BS = 32, int COLS = 1, bool VEC = false>
+__device__ __forceinline__ void silu_down_shared_t_rows_impl(
+    const __nv_bfloat16* __restrict__ gate_out,        // [ROWS * top_k, K]
+    const __nv_bfloat16* __restrict__ up_out,
+    const unsigned long long* __restrict__ packed_t_ptrs,
+    const unsigned long long* __restrict__ scale_t_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,                     // [ROWS * top_k, N]
+    const unsigned int* __restrict__ u_experts,
+    const unsigned int* __restrict__ u_rowmask,
+    const unsigned char* __restrict__ u_rowslot,
+    const unsigned int* __restrict__ u_count,
+    const __nv_bfloat16* __restrict__ sh_gate_in,      // [ROWS, K]
+    const __nv_bfloat16* __restrict__ sh_up_in,
+    const unsigned char* __restrict__ sh_down_t_packed,
+    const unsigned char* __restrict__ sh_down_t_scale,
+    float sh_down_s2,
+    __nv_bfloat16* __restrict__ sh_down_out,           // [ROWS, N]
+    unsigned int N, unsigned int K, unsigned int top_k
+) {
+    constexpr unsigned int COLW = BS * COLS;
+    constexpr unsigned int STRIDE = COLW + (COLW >= 256 ? 16 : COLW / 2);
+    const unsigned int u = blockIdx.y;
+    if (u > *u_count) return;
+    const bool is_shared = (u == *u_count);
+    const unsigned char* B_packed; const unsigned char* B_scale; float s2;
+    if (is_shared) {
+        B_packed = sh_down_t_packed; B_scale = sh_down_t_scale; s2 = sh_down_s2;
+    } else {
+        const unsigned int eid = u_experts[u];
+        B_packed = (const unsigned char*)packed_t_ptrs[eid];
+        B_scale = (const unsigned char*)scale_t_ptrs[eid];
+        s2 = scale2_vals[eid];
+    }
+
+    const unsigned int lane = threadIdx.x;
+    const unsigned int ns0 = blockIdx.x * (BS * COLS);
+    unsigned int col[COLS]; bool vc[COLS]; bool any = false;
+    _Pragma("unroll")
+    for (unsigned int c = 0; c < COLS; c++) { col[c] = ns0 + lane + c * BS; vc[c] = col[c] < N; any |= vc[c]; }
+    __shared__ float s_lut[16];
+    if (lane < 16) s_lut[lane] = E2M1_LUT_T[lane];
+    __shared__ unsigned char s_pk[2][TILE_KH * STRIDE];
+    __shared__ unsigned char s_sc[2][(TILE_KH / 8) * STRIDE];
+    // Activation staged per k-tile as fp32, computed once per element per
+    // CTA (the single-row kernel's s_act precompute, tiled) instead of per
+    // element per column thread. Same bytes budget as the s_g/s_u pair.
+    __shared__ float s_act[2][ROWS * TILE_KH * 2];
+    __syncthreads();
+
+    unsigned int mask = is_shared ? ((1u << ROWS) - 1u) : u_rowmask[u];
+    if (B_packed == 0) {
+        _Pragma("unroll")
+        for (unsigned int c = 0; c < COLS; c++) {
+            if (!vc[c]) continue;
+            _Pragma("unroll")
+            for (unsigned int r = 0; r < ROWS; r++) {
+                if (!(mask & (1u << r))) continue;
+                if (is_shared) sh_down_out[r * N + col[c]] = __float2bfloat16(0.0f);
+                else {
+                    unsigned int slot = u_rowslot[u * MOE_MAX_K + r];
+                    C[(unsigned long long)(r * top_k + slot) * N + col[c]] = __float2bfloat16(0.0f);
+                }
+            }
+        }
+        return;
+    }
+
+    const __nv_bfloat16* g_base[ROWS];
+    const __nv_bfloat16* u_base[ROWS];
+    _Pragma("unroll")
+    for (unsigned int r = 0; r < ROWS; r++) {
+        if (is_shared) {
+            g_base[r] = sh_gate_in + (unsigned long long)r * K;
+            u_base[r] = sh_up_in + (unsigned long long)r * K;
+        } else {
+            unsigned int slot = u_rowslot[u * MOE_MAX_K + r];
+            if (slot == 0xFF) slot = 0;
+            const unsigned long long base = (unsigned long long)(r * top_k + slot) * K;
+            g_base[r] = gate_out + base;
+            u_base[r] = up_out + base;
+        }
+    }
+
+    auto stage = [&](unsigned int tg, unsigned int buf) {
+        const unsigned int r0 = tg * TILE_KH;
+        _Pragma("unroll")
+        for (unsigned int j = lane; j < TILE_KH * (COLW / 16u); j += BS) {
+            const unsigned int rr = j / (COLW / 16u);
+            const unsigned int cb = (j % (COLW / 16u)) * 16u;
+            T_ROWS_TAIL_GUARD(ns0 + cb, N)
+            *(uint4*)&s_pk[buf][rr * STRIDE + cb] =
+                *(const uint4*)&B_packed[(unsigned long long)(r0 + rr) * N + ns0 + cb];
+        }
+        const unsigned int ng = TILE_KH / 8u;
+        _Pragma("unroll")
+        for (unsigned int j = lane; j < ng * (COLW / 16u); j += BS) {
+            const unsigned int sg = j / (COLW / 16u);
+            const unsigned int cb = (j % (COLW / 16u)) * 16u;
+            T_ROWS_TAIL_GUARD(ns0 + cb, N)
+            *(uint4*)&s_sc[buf][sg * STRIDE + cb] =
+                *(const uint4*)&B_scale[(unsigned long long)(tg * ng + sg) * N + ns0 + cb];
+        }
+        _Pragma("unroll")
+        for (unsigned int j = lane; j < ROWS * (TILE_KH * 2 / 8u); j += BS) {
+            const unsigned int row = j / (TILE_KH * 2 / 8u);
+            const unsigned int chunk = j % (TILE_KH * 2 / 8u);
+            const __nv_bfloat16* g8 =
+                (const __nv_bfloat16*)&g_base[row][tg * TILE_KH * 2 + chunk * 8];
+            const __nv_bfloat16* u8 =
+                (const __nv_bfloat16*)&u_base[row][tg * TILE_KH * 2 + chunk * 8];
+            float a8[8];
+            _Pragma("unroll")
+            for (unsigned int i = 0; i < 8; i++) {
+                const float gf = __bfloat162float(g8[i]);
+                const float uf = __bfloat162float(u8[i]);
+                a8[i] = (gf / (1.0f + __expf(-gf))) * uf;
+            }
+            *(float4*)&s_act[buf][row * TILE_KH * 2 + chunk * 8] =
+                make_float4(a8[0], a8[1], a8[2], a8[3]);
+            *(float4*)&s_act[buf][row * TILE_KH * 2 + chunk * 8 + 4] =
+                make_float4(a8[4], a8[5], a8[6], a8[7]);
+        }
+    };
+
+    float acc[COLS][ROWS];
+    _Pragma("unroll")
+    for (unsigned int c = 0; c < COLS; c++)
+        _Pragma("unroll")
+        for (unsigned int r = 0; r < ROWS; r++) acc[c][r] = 0.0f;
+    const unsigned int ntg = (K / 2u) / TILE_KH;
+    stage(0, 0);
+    for (unsigned int tg = 0; tg < ntg; tg++) {
+        __syncthreads();
+        if (tg + 1u < ntg) stage(tg + 1u, (tg + 1u) & 1u);
+        const unsigned int buf = tg & 1u;
+        if (any) {
+            if constexpr (VEC) {
+                _Pragma("unroll")
+                for (unsigned int rr4 = 0; rr4 < TILE_KH / 4u; rr4++) {
+                    float a8[ROWS][8];
+                    _Pragma("unroll")
+                    for (unsigned int r = 0; r < ROWS; r++) {
+                        *(float4*)&a8[r][0] = *(const float4*)&s_act[buf][r * TILE_KH * 2 + rr4 * 8];
+                        *(float4*)&a8[r][4] = *(const float4*)&s_act[buf][r * TILE_KH * 2 + rr4 * 8 + 4];
+                    }
+                    _Pragma("unroll")
+                    for (unsigned int j = 0; j < 4; j++) {
+                        const unsigned int rr = rr4 * 4 + j;
+                        float w_lo[COLS], w_hi[COLS];
+                        _Pragma("unroll")
+                        for (unsigned int c = 0; c < COLS; c++) {
+                            float sc = mx_block_scale<false>(s_sc[buf][(rr >> 3) * STRIDE + lane + c * BS], s2);
+                            unsigned char byte = s_pk[buf][rr * STRIDE + lane + c * BS];
+                            w_lo[c] = s_lut[byte & 0xFu] * sc;
+                            w_hi[c] = s_lut[(byte >> 4) & 0xFu] * sc;
+                        }
+                        _Pragma("unroll")
+                        for (unsigned int r = 0; r < ROWS; r++) {
+                            const float act0 = a8[r][2 * j];
+                            const float act1 = a8[r][2 * j + 1];
+                            _Pragma("unroll")
+                            for (unsigned int c = 0; c < COLS; c++)
+                                acc[c][r] += act0 * w_lo[c] + act1 * w_hi[c];
+                        }
+                    }
+                }
+            } else {
+                _Pragma("unroll 8")
+                for (unsigned int rr = 0; rr < TILE_KH; rr++) {
+                    float w_lo[COLS], w_hi[COLS];
+                    _Pragma("unroll")
+                    for (unsigned int c = 0; c < COLS; c++) {
+                        float sc = mx_block_scale<false>(s_sc[buf][(rr >> 3) * STRIDE + lane + c * BS], s2);
+                        unsigned char byte = s_pk[buf][rr * STRIDE + lane + c * BS];
+                        w_lo[c] = s_lut[byte & 0xFu] * sc;
+                        w_hi[c] = s_lut[(byte >> 4) & 0xFu] * sc;
+                    }
+                    _Pragma("unroll")
+                    for (unsigned int r = 0; r < ROWS; r++) {
+                        const float act0 = s_act[buf][r * TILE_KH * 2 + rr * 2];
+                        const float act1 = s_act[buf][r * TILE_KH * 2 + rr * 2 + 1];
+                        _Pragma("unroll")
+                        for (unsigned int c = 0; c < COLS; c++)
+                            acc[c][r] += act0 * w_lo[c] + act1 * w_hi[c];
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+    _Pragma("unroll")
+    for (unsigned int c = 0; c < COLS; c++) {
+        if (!vc[c]) continue;
+        _Pragma("unroll")
+        for (unsigned int r = 0; r < ROWS; r++) {
+            if (!(mask & (1u << r))) continue;
+            if (is_shared) sh_down_out[r * N + col[c]] = __float2bfloat16(acc[c][r]);
+            else {
+                unsigned int slot = u_rowslot[u * MOE_MAX_K + r];
+                C[(unsigned long long)(r * top_k + slot) * N + col[c]] = __float2bfloat16(acc[c][r]);
+            }
+        }
+    }
+}
+
+#define T_ROWS_GU_ARGS \
+    const __nv_bfloat16* A, const unsigned long long* gpk, \
+    const unsigned long long* gsc, const float* gs2, __nv_bfloat16* gate_out, \
+    const unsigned long long* upk, const unsigned long long* usc, \
+    const float* us2, __nv_bfloat16* up_out, \
+    const unsigned int* u_experts, const unsigned int* u_rowmask, \
+    const unsigned char* u_rowslot, const unsigned int* u_count, \
+    const unsigned char* sgp, const unsigned char* sgs, float sg2, \
+    __nv_bfloat16* sh_gate_out, const unsigned char* sup, \
+    const unsigned char* sus, float su2, __nv_bfloat16* sh_up_out, \
+    unsigned int N, unsigned int K, unsigned int top_k, unsigned int h, \
+    unsigned int num_rows
+#define T_ROWS_SD_ARGS \
+    const __nv_bfloat16* gate_out, const __nv_bfloat16* up_out, \
+    const unsigned long long* pk, const unsigned long long* sc, \
+    const float* s2, __nv_bfloat16* C, \
+    const unsigned int* u_experts, const unsigned int* u_rowmask, \
+    const unsigned char* u_rowslot, const unsigned int* u_count, \
+    const __nv_bfloat16* sh_gate_in, const __nv_bfloat16* sh_up_in, \
+    const unsigned char* sdp, const unsigned char* sds, float sd2, \
+    __nv_bfloat16* sh_down_out, \
+    unsigned int N, unsigned int K, unsigned int top_k, unsigned int num_rows
+
+// Production shape: the measured winner — BS 256, one column per thread,
+// 16 B smem activations loads (VEC), ROWS 2..8 (verify batch depths).
+#define T_ROWS_SHIP(R) \
+extern "C" __global__ void moe_expert_gate_up_shared_t_rows_v3_r##R##_b256(T_ROWS_GU_ARGS) { \
+    (void)num_rows; \
+    gate_up_shared_t_rows_impl<R,256,1,true>(A, gpk, gsc, gs2, gate_out, upk, usc, us2, \
+        up_out, u_experts, u_rowmask, u_rowslot, u_count, sgp, sgs, sg2, \
+        sh_gate_out, sup, sus, su2, sh_up_out, N, K, top_k, h); \
+} \
+extern "C" __global__ void moe_expert_silu_down_shared_t_rows_v3_r##R##_b256(T_ROWS_SD_ARGS) { \
+    (void)num_rows; \
+    silu_down_shared_t_rows_impl<R,256,1,true>(gate_out, up_out, pk, sc, s2, C, \
+        u_experts, u_rowmask, u_rowslot, u_count, sh_gate_in, sh_up_in, \
+        sdp, sds, sd2, sh_down_out, N, K, top_k); \
+}
+
+T_ROWS_SHIP(2)
+T_ROWS_SHIP(3)
+T_ROWS_SHIP(4)
+T_ROWS_SHIP(5)
+T_ROWS_SHIP(6)
+T_ROWS_SHIP(7)
+T_ROWS_SHIP(8)

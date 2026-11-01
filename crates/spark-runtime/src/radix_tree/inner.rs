@@ -7,14 +7,21 @@
 use std::collections::HashMap;
 
 mod evict;
+mod nvme;
+
+pub(super) use nvme::NvmeIndex;
 
 type NodeId = usize;
 
 pub(super) struct RadixNode {
     /// Children keyed by the token chunk (block_size tokens).
     children: HashMap<Vec<u32>, NodeId>,
-    /// Physical KV cache block index stored at this node.
+    /// Physical KV cache block index stored at this node. `u32::MAX` on a
+    /// non-root node means the block is ON DISK at `nvme_slot` (spill tier).
     block_idx: u32,
+    /// NVMe spill-tier record slot; `u32::MAX` when the node has no record.
+    /// A resident node may have one too (a record kept across its restore).
+    nvme_slot: u32,
     /// `--high-speed-swap` disk-block ID (Phase 6.1.e). `u32::MAX` when HSS
     /// is not in use. The cache holds a refcount on this disk_id (bumped
     /// at insert time, dropped at evict time) parallel to its physical-
@@ -32,12 +39,6 @@ pub(super) struct RadixNode {
     parent: Option<NodeId>,
     /// Token chunk that leads from parent to this node (for cleanup).
     parent_key: Option<Vec<u32>>,
-    /// Partial (sub-block) suffix: the last incomplete block in a cached
-    /// sequence. Stores `(partial_tokens, block_idx, disk_block_id)`
-    /// where `partial_tokens.len() < block_size`. `disk_block_id == u32::MAX`
-    /// when HSS isn't in use. Matched after all full blocks to cover the
-    /// trailing remainder.
-    partial_suffix: Option<(Vec<u32>, u32, u32)>,
 }
 
 /// Combine a parent context hash with a token chunk to produce a child context hash.
@@ -68,20 +69,22 @@ pub(super) struct RadixTreeInner {
     /// the pre-LoRA single-root tree.
     roots: HashMap<u64, NodeId>,
     access_counter: u64,
+    /// NVMe spill tier (`None` = off: eviction deletes, the default).
+    pub(super) nvme: Option<NvmeIndex>,
 }
 
 impl RadixTreeInner {
     pub(super) fn new() -> Self {
         let root = RadixNode {
             children: HashMap::new(),
-            block_idx: u32::MAX,     // sentinel — root has no block
+            block_idx: u32::MAX, // sentinel — root has no block
+            nvme_slot: u32::MAX,
             disk_block_id: u32::MAX, // sentinel — root has no disk slot either
             context_hash: 0,         // root context hash is 0
             ref_count: 0,
             last_access: 0,
             parent: None,
             parent_key: None,
-            partial_suffix: None,
         };
         let mut roots = HashMap::new();
         roots.insert(0u64, 0usize); // base / no-adapter root
@@ -90,6 +93,7 @@ impl RadixTreeInner {
             free_nodes: Vec::new(),
             roots,
             access_counter: 0,
+            nvme: None,
         }
     }
 
@@ -114,13 +118,13 @@ impl RadixTreeInner {
         let id = self.alloc_node(RadixNode {
             children: HashMap::new(),
             block_idx: u32::MAX,
+            nvme_slot: u32::MAX,
             disk_block_id: u32::MAX,
             context_hash: 0,
             ref_count: 0,
             last_access: 0,
             parent: None,
             parent_key: None,
-            partial_suffix: None,
         });
         self.roots.insert(adapter_id, id);
         id
@@ -137,12 +141,19 @@ impl RadixTreeInner {
         }
     }
 
-    /// Walk the tree matching block-aligned token chunks.
+    /// Walk the tree matching whole `block_size` token chunks.
     /// Returns (matched_blocks, matched_disk_block_ids, matched_tokens). The
     /// disk-id vec parallels matched_blocks; entries are `u32::MAX` on nodes
     /// that were inserted before HSS engaged (caller's responsibility to
     /// filter / treat MAX as "no disk-side ref to bump"). Snapshot lookup is
     /// now handled by the separate SsmSnapshotIndex after the walk completes.
+    ///
+    /// `matched_tokens` is always a multiple of `block_size`: a match never
+    /// ends inside a cached block. The sequence that acquired such a block
+    /// would write the rest of it (its own decode rows, and every row of a
+    /// speculative verify) under the block's other holders. The trailing
+    /// `tokens.len() % block_size` tokens are recomputed into a block the
+    /// sequence owns alone.
     pub(super) fn walk(
         &self,
         tokens: &[u32],
@@ -165,9 +176,11 @@ impl RadixTreeInner {
             match self.nodes[current].children.get(chunk) {
                 Some(&child)
                     if self.nodes[child].context_hash == expected_hash
-                        && self.nodes[child].ref_count > 0 =>
+                        && self.nodes[child].ref_count > 0
+                        && self.nodes[child].block_idx != u32::MAX =>
                 {
-                    // Context chain matches AND block is still live — safe to reuse.
+                    // Context chain matches AND block is still live (resident,
+                    // not spilled to NVMe) — safe to reuse.
                     matched_blocks.push(self.nodes[child].block_idx);
                     matched_disk.push(self.nodes[child].disk_block_id);
                     matched_tokens += block_size;
@@ -178,59 +191,39 @@ impl RadixTreeInner {
             }
         }
 
-        // Sub-block matching: when remaining tokens don't fill a full block,
-        // check two locations for a match:
-        // 1. A child node whose key starts with the remaining tokens (the child
-        //    covers a full block but we only need a prefix of it).
-        // 2. A partial suffix stored on the current node.
-        // This enables warm-cache TTFT optimization by matching ALL prompt tokens
-        // even when total % block_size != 0.
-        let remainder = tokens.len() - matched_tokens;
-        // ATLAS_PREFIX_SUBBLOCK=0 restricts matching to WHOLE blocks.
-        //
-        // The sub-block arms below return a `matched_tokens` that is NOT
-        // block-aligned, and they do it by reusing a block whose KV was
-        // computed for a LONGER key — i.e. for a different continuation past
-        // our suffix. If any consumer treats `matched_tokens` as a block
-        // boundary, the tail of that block is foreign context the model then
-        // attends to. This lever exists to A/B exactly that.
-        let subblock_ok = std::env::var("ATLAS_PREFIX_SUBBLOCK").as_deref() != Ok("0");
-        if subblock_ok
-            && remainder > 0
-            && remainder < block_size
-            && matched_tokens == num_full_blocks * block_size
-        {
-            let suffix = &tokens[matched_tokens..];
-            let mut found = false;
-            for (key, &child_id) in &self.nodes[current].children {
-                if key.len() >= suffix.len() && &key[..suffix.len()] == suffix {
-                    let expected = context_hash_combine(parent_ctx_hash, key);
-                    if self.nodes[child_id].context_hash == expected
-                        && self.nodes[child_id].ref_count > 0
-                    {
-                        matched_blocks.push(self.nodes[child_id].block_idx);
-                        matched_disk.push(self.nodes[child_id].disk_block_id);
-                        matched_tokens += remainder;
-                        found = true;
-                        break;
-                    }
-                }
-            }
-            if !found
-                && let Some((ref partial_toks, partial_block, partial_disk)) =
-                    self.nodes[current].partial_suffix
-                && partial_toks.len() >= suffix.len()
-                && &partial_toks[..suffix.len()] == suffix
-            {
-                // Partial suffix doesn't have context_hash — only match if parent chain matched.
-                // ref_count check not applicable to partial suffix (it's metadata, not a node).
-                matched_blocks.push(partial_block);
-                matched_disk.push(partial_disk);
-                matched_tokens += remainder;
+        (matched_blocks, matched_disk, matched_tokens)
+    }
+
+    /// Whether the live cached path through the block-aligned prefix
+    /// `tokens[..depth]` continues with a full block other than
+    /// `tokens[depth..depth + block_size]`, i.e. another request diverged
+    /// from this one exactly there. Read-only (no refs, no recency).
+    pub(super) fn forks_at(
+        &self,
+        tokens: &[u32],
+        depth: usize,
+        block_size: usize,
+        adapter_id: u64,
+    ) -> bool {
+        let (Some(mut current), Some(ours)) = (
+            self.root_for_read(adapter_id),
+            tokens.get(depth..depth + block_size),
+        ) else {
+            return false;
+        };
+        if block_size == 0 || !depth.is_multiple_of(block_size) {
+            return false;
+        }
+        for chunk in tokens[..depth].chunks_exact(block_size) {
+            match self.nodes[current].children.get(chunk) {
+                Some(&child) if self.nodes[child].ref_count > 0 => current = child,
+                _ => return false,
             }
         }
-
-        (matched_blocks, matched_disk, matched_tokens)
+        self.nodes[current]
+            .children
+            .iter()
+            .any(|(key, &child)| key.as_slice() != ours && self.nodes[child].ref_count > 0)
     }
 
     /// Increment ref_count on all nodes along the matched path.
@@ -287,8 +280,14 @@ impl RadixTreeInner {
         }
     }
 
-    /// Insert blocks into the tree. Skips blocks that already exist.
-    /// Snapshot storage is handled externally by SsmSnapshotIndex.
+    /// Insert the whole blocks of `tokens` into the tree. Skips blocks that
+    /// already exist. Snapshot storage is handled externally by
+    /// SsmSnapshotIndex.
+    ///
+    /// The block holding the trailing `tokens.len() % block_size` tokens is
+    /// never published: the inserting sequence still writes it, and so would
+    /// any sequence that later acquired it. It enters the cache once every
+    /// position in it is a committed token, through a later insert.
     ///
     /// `matched_tokens` is the prefix length the inserting sequence already
     /// acquired via `lookup()`'s `inc_refs` (those nodes' ref_count was
@@ -308,8 +307,7 @@ impl RadixTreeInner {
         adapter_id: u64,
     ) -> crate::prefix_cache::InsertAcquired {
         let access = self.next_access();
-        let root_id = self.root_for_insert(adapter_id);
-        let mut current = root_id;
+        let mut current = self.root_for_insert(adapter_id);
         let mut parent_ctx_hash: u64 = 0; // root context hash
         let num_full_blocks = tokens.len() / block_size;
         let num_blocks = num_full_blocks.min(block_table.len());
@@ -331,10 +329,9 @@ impl RadixTreeInner {
         // Re-insertion of an already-cached (node, disk_id) pair is NOT an
         // acquisition — the cache's ref already covers it.
         let mut newly_acquired: Vec<u32> = Vec::new();
-        // Blocks the cache starts / stops storing here; the caller takes and
-        // releases exactly one KV ref each. See `InsertAcquired`.
+        // Blocks the cache starts storing here; the caller takes exactly one
+        // KV ref each. See `InsertAcquired`.
         let mut newly_owned_blocks: Vec<u32> = Vec::new();
-        let mut released_blocks: Vec<u32> = Vec::new();
 
         for i in 0..num_blocks {
             let chunk = &tokens[i * block_size..(i + 1) * block_size];
@@ -348,6 +345,11 @@ impl RadixTreeInner {
             };
 
             if let Some(&child) = self.nodes[current].children.get(chunk) {
+                // A node spilled to NVMe takes this sequence's freshly computed
+                // block instead (before its LRU key changes below).
+                if self.nvme_rehome(child, block_table[i], false) {
+                    newly_owned_blocks.push(block_table[i]);
+                }
                 // Node exists — update access time, context_hash, and ensure
                 // the cache's ref is still held (ref_count >= 1).
                 self.nodes[child].last_access = access;
@@ -371,18 +373,16 @@ impl RadixTreeInner {
                 parent_ctx_hash = ctx_hash;
                 current = child;
             } else {
-                // A real child supersedes the partial slot; release its ref.
-                released_blocks.extend(self.nodes[current].partial_suffix.take().map(|p| p.1));
                 let node = RadixNode {
                     children: HashMap::new(),
                     block_idx: block_table[i],
+                    nvme_slot: u32::MAX,
                     disk_block_id: disk_id,
                     context_hash: ctx_hash,
                     ref_count: if is_seq_owned { 2 } else { 1 },
                     last_access: access,
                     parent: Some(current),
                     parent_key: Some(chunk.to_vec()),
-                    partial_suffix: None,
                 };
                 let child_id = self.alloc_node(node);
                 newly_owned_blocks.push(block_table[i]);
@@ -397,42 +397,9 @@ impl RadixTreeInner {
             }
         }
 
-        let remainder = tokens.len() % block_size;
-        if remainder > 0 && block_table.len() > num_full_blocks && current != root_id {
-            let partial_toks = tokens[num_full_blocks * block_size..].to_vec();
-            let partial_block = block_table[num_full_blocks];
-            let partial_disk = if hss_active && disk_block_ids.len() > num_full_blocks {
-                disk_block_ids[num_full_blocks]
-            } else {
-                u32::MAX
-            };
-            // partial_suffix overwrites any prior partial slot. If the prior
-            // slot held a real disk_id distinct from the new one, the cache
-            // is silently dropping a ref to that old id; surface it on the
-            // returned acquisitions only when we actually accept a NEW real
-            // disk_id (matching the same "new acquisition" definition as the
-            // full-block path above). This branch fires rarely — partial
-            // slots are tail-only and typically unique per-prefix.
-            let prior = self.nodes[current].partial_suffix.as_ref().map(|p| p.2);
-            // The cache owns a KV ref on the partial block exactly as it does on
-            // a node's own block — `walk` hands it out and `evict` hands it back,
-            // so an unreferenced one sits on the free list while still cached.
-            // See `InsertAcquired` for the failure this prevents.
-            let prior_block = self.nodes[current].partial_suffix.as_ref().map(|p| p.1);
-            self.nodes[current].partial_suffix = Some((partial_toks, partial_block, partial_disk));
-            if prior_block != Some(partial_block) {
-                newly_owned_blocks.push(partial_block);
-                released_blocks.extend(prior_block);
-            }
-            if hss_active && partial_disk != u32::MAX && prior != Some(partial_disk) {
-                newly_acquired.push(partial_disk);
-            }
-        }
-
         crate::prefix_cache::InsertAcquired {
             disk_block_ids: newly_acquired,
             blocks: newly_owned_blocks,
-            released_blocks,
         }
     }
 }

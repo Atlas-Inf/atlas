@@ -1,0 +1,19 @@
+=== HIDE_NVML=0
+rustc 1.93.1 (01f6ddf75 2026-02-11)
+MemFree:         4501372 kB MemAvailable:   47659040 kB 
+pid 113 no context: Sample { driver: None, host: Some(15413248) }
+context (baseline): Sample { driver: Some(178765824), host: Some(76406784) }
+after allocs: Sample { driver: Some(1076346880), host: Some(178126848) }
+ledger 556.00 MiB -> footprint device 856.00 MiB by driver accounting + host 97.01 MiB = 953.01 MiB
+after frees: Sample { driver: Some(178765824), host: Some(77459456) } -> OwnFootprint { device: 0, device_source: Driver, host: 1052672 }
+OK
+=== HIDE_NVML=1
+rustc 1.93.1 (01f6ddf75 2026-02-11)
+libnvidia-ml.so.1 hidden
+MemFree:         4788156 kB MemAvailable:   47642612 kB 
+pid 114 no context: Sample { driver: None, host: Some(1404928) }
+context (baseline): Sample { driver: None, host: Some(62369792) }
+after allocs: Sample { driver: None, host: Some(164081664) }
+ledger 556.00 MiB -> footprint device 556.00 MiB by allocation ledger + host 97.00 MiB = 653.00 MiB
+after frees: Sample { driver: None, host: Some(63418368) } -> OwnFootprint { device: 0, device_source: Ledger, host: 1048576 }
+OK

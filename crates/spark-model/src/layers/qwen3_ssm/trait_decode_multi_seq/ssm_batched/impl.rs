@@ -1,0 +1,499 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+use super::super::super::*;
+
+fn ssm_tc_proj_min_n() -> Option<usize> {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *N.get_or_init(
+        || match std::env::var("ATLAS_SSM_TC_PROJ").ok().as_deref() {
+            None => Some(9),
+            Some("0") => None,
+            Some("1") => Some(9),
+            Some(v) => v.parse::<usize>().ok().filter(|&x| x >= 2),
+        },
+    )
+}
+
+impl Qwen3SsmLayer {
+    /// Batched-projection SSM mixer for N concurrent decode sequences.
+    ///
+    /// Returns `Ok(false)` (caller falls back to the per-seq loop) unless the
+    /// layer is in the GB10 Holo serving config: sequential-QKVZ dense/NVFP4
+    /// weights + FP32 conv/GDN recurrent kernels. When eligible, the big QKVZ
+    /// and out_proj projections run as a single `[N, ...]` GEMM each (weights
+    /// read ONCE, not N times — the dominant bandwidth cost on LPDDR5X), while
+    /// the recurrent inner (BA/gates → conv1d → GDN → gated-norm) stays a
+    /// per-seq loop using the SAME single-token kernels as `ssm_forward`, so
+    /// the recurrence is byte-identical to the proven path. The per-seq states
+    /// are read straight from each `SsmLayerState`, so no contiguous-slot
+    /// assumption is required.
+    #[allow(clippy::too_many_arguments)]
+    /// `hc` (#753 item B): input rows arrive pre-mixed in `norm_output`
+    /// (hc_pre) and the out_proj rows stay in `moe_output` for the caller's
+    /// hc_post — both norm/residual steps skip; `hidden`/`residual` unused.
+    pub(in crate::layers::qwen3_ssm::trait_decode_multi_seq) fn try_decode_multi_seq_ssm_batched<
+        'a,
+        'b: 'a,
+    >(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        n: usize,
+        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        hc: bool,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        // ATLAS_QWEN4EXP_BATCH_FAST_BISECT: the caller's per-sequence
+        // `ssm_forward` loop, C1's mixer.
+        if ctx.levers.batch_bisect(ops::BISECT_GDN) {
+            return Ok(false);
+        }
+        let use_f32_conv = self.conv1d_l2norm_f32_k.0 != 0;
+        let use_f32_gdn = self.gdn_f32_k.0 != 0 && self.gated_rms_norm_f32_k.0 != 0;
+        // QKVZ via dense-BF16/cuBLASLt, FP8 w8a16 GEMM, or NVFP4 batchm GEMV
+        // (M<=16; tile-GEMM twins `*_nvfp4_t` lift the cap for wide batches
+        // when both twins exist and the TC threshold admits n). Any arm
+        // amortizes the QKVZ/out_proj weight read across the n seqs;
+        // interleaved-QKVZ layouts take the proven per-seq loop.
+        let tc_wide_ok = self.qkvz_nvfp4_t.is_some()
+            && self.out_proj_nvfp4_t.is_some()
+            && ssm_tc_proj_min_n().is_some_and(|min| n >= min);
+        // qkvz_nvfp4.is_none() covers TWO builds: the FP8 build (qkvz_fp8w
+        // Some -> batched w8a16 GEMM, needs w8a16_gemm_k) and the pure
+        // native-BF16 build (both None -> the batched `dense_gemm` fallback
+        // below, which uses dense_gemm_k — loaded with an unconditional `?`
+        // in init.rs:147, so it is always non-zero here). Gate each on the
+        // kernel it actually dispatches so the BF16 build engages the batched
+        // fast path instead of silently dropping to the per-seq loop. The FP8
+        // sub-case (qkvz_fp8w Some) is byte-identical to the old gate.
+        let qkvz_ok = (self.qkvz_nvfp4.is_none()
+            && ((self.qkvz_fp8w.is_some() && self.w8a16_gemm_k.0 != 0)
+                || (self.qkvz_fp8w.is_none() && self.dense_gemm_k.0 != 0)))
+            || (self.qkvz_nvfp4.is_some()
+                && ((self.w4a16_batchm.has_base() && n <= 16) || tc_wide_ok));
+        // Native MXFP8 serves every row count through `exact_rows_proj`.
+        let qkvz_ok = qkvz_ok || self.mx8.is_some();
+        let out_ok = self.out_proj_fp8w.is_some()
+            || self.out_proj_dense.is_some()
+            || self.qkvz_nvfp4.is_some()
+            || self.mx8.is_some();
+        // Tier-1c keep-packed Q2_0 has no batched packed GEMM; decline so the
+        // per-seq fallback (`ssm_forward` → `q2_0_gemv_vec`) handles it.
+        if n < 2
+            || !self.sequential_qkvz
+            || !use_f32_conv
+            || !use_f32_gdn
+            || !qkvz_ok
+            || !out_ok
+            || self.qkvz_q2.is_some()
+        {
+            // Say WHY, once. Declining is silent otherwise, and the fallback
+            // re-streams the ~50 MB QKVZ/out_proj weights once per sequence —
+            // the difference between decode that scales with N and decode that
+            // does not. A whole campaign phase was spent measuring the symptom
+            // (SSM time linear in N) without knowing which condition failed.
+            if n >= 2 {
+                static WHY: std::sync::Once = std::sync::Once::new();
+                let (sq, fc, fg, qk, op) = (
+                    self.sequential_qkvz,
+                    use_f32_conv,
+                    use_f32_gdn,
+                    qkvz_ok,
+                    out_ok,
+                );
+                let nvfp4 = self.qkvz_nvfp4.is_some();
+                let b4 = self.w4a16_batchm.has_base();
+                let tct = self.qkvz_nvfp4_t.is_some() && self.out_proj_nvfp4_t.is_some();
+                WHY.call_once(|| {
+                    tracing::info!(
+                        "SSM batched projections DECLINED (n={n}): sequential_qkvz={sq} \
+                         f32_conv={fc} f32_gdn={fg} qkvz_ok={qk} out_ok={op} \
+                         [qkvz_nvfp4={nvfp4} w4a16_gemv_batch4={b4} tc_twins={tct} \
+                         tc_wide_ok={tc_wide_ok}] — falling back to the \
+                         per-seq loop, which re-reads QKVZ/out_proj weights n times"
+                    );
+                });
+            }
+            return Ok(false);
+        }
+        {
+            static ON: std::sync::Once = std::sync::Once::new();
+            ON.call_once(|| {
+                tracing::info!("SSM batched projections ACTIVE — QKVZ/out_proj read once per step");
+            });
+        }
+
+        let h = ctx.config.hidden_size;
+        let bf16 = 2usize;
+        let eps = ctx.config.rms_norm_eps as f32;
+        let nk = ctx.config.linear_num_key_heads;
+        let kd = ctx.config.linear_key_head_dim;
+        let nv = ctx.config.linear_num_value_heads;
+        let vd = ctx.config.linear_value_head_dim;
+        let vpg = nv / nk;
+        let key_dim = nk * kd;
+        let value_dim = nv * vd;
+        let conv_dim = (key_dim * 2 + value_dim) as u32;
+        let qk_channels = (key_dim * 2) as u32;
+        let d_conv = ctx.config.linear_conv_kernel_dim as u32;
+        let qkvz_size = ctx.config.ssm_qkvz_size();
+        let ba_size = ctx.config.ssm_ba_size() as u32;
+
+        let normed_base = ctx.buffers.norm_output();
+        let deinterleaved = ctx.buffers.ssm_deinterleaved();
+        // normed_out[0..n] (post gated-norm, [N, value_dim] BF16) parks in the
+        // QKVZ scratch — free here because QKVZ projects into `deinterleaved`
+        // and the FP32 conv path uses `ssm_conv_out_f32`, not `ssm_qkvz`.
+        let normed_out_base = ctx.buffers.ssm_qkvz();
+        let ssm_out_base = ctx.buffers.moe_output();
+        let detail_profile = std::env::var("ATLAS_SSM_DETAIL_PROFILE").ok().as_deref() == Some("1")
+            && !ctx.graph_capture;
+        let mut detail_parts: Vec<(&'static str, u128)> = Vec::new();
+        let mut detail_t0 = if detail_profile {
+            ctx.gpu.synchronize(stream).ok();
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        macro_rules! detail_step {
+            ($label:expr) => {
+                if let Some(t0) = detail_t0.take() {
+                    ctx.gpu.synchronize(stream).ok();
+                    detail_parts.push(($label, t0.elapsed().as_micros()));
+                    detail_t0 = Some(std::time::Instant::now());
+                }
+            };
+            ($label:expr, final) => {
+                if let Some(t0) = detail_t0.take() {
+                    ctx.gpu.synchronize(stream).ok();
+                    detail_parts.push(($label, t0.elapsed().as_micros()));
+                }
+            };
+        }
+
+        // ── 1. Batched input RMS norm (hc: hc_pre already normed; skip) ──
+        if !hc {
+            ops::rms_norm_residual(
+                ctx.gpu,
+                self.rms_norm_residual_k,
+                hidden,
+                &self.input_norm,
+                normed_base,
+                residual,
+                n as u32,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        }
+        detail_step!("input_norm");
+
+        // ── 2. Batched QKVZ projection: ONE [N,h]→[N,qkvz] GEMM (weights ×1) ──
+        // FP8 (w8a16) when the decode overlay is installed, else BF16 dense.
+        // Prefer the pipelined (cp.async) w8a16 kernel — bit-identical, ~4.6×
+        // faster than the base w8a16_gemm, which nsys showed as 44.6% of the
+        // C>1 decode step. `.0 == 0` → fall back to the base kernel.
+        let w8a16_pipe = self.w8a16_gemm_pipelined_k.0 != 0;
+        // Weight-streaming block-scaled GEMV for batched decode: avoids the
+        // pipelined kernel's M->128 MMA pad (issue-bound). batch4 (M<=4) for the
+        // common path, batch16 (M<=16) for high-concurrency C=8/16. Bit-identical
+        // per row to w8a16_gemv. Disable with ATLAS_SSM_GEMV_BATCH4=0.
+        // Rows 5..8 take the verify path's 8-row tier (`fp8_verify_gemv_tier`:
+        // the n2 / vl2 twins where linked, all bit-identical to batch16 per
+        // row) instead of computing 16 rows: on gfx1151 the 27B C=8 step ran
+        // batch16 for its 8 rows at 54-91 GB/s (strix s161).
+        let (gemv_batch_k, gemv_div) = if n <= 4 {
+            (self.w8a16_gemv_batch4_k, 4)
+        } else {
+            ops::fp8_verify_gemv_tier(
+                n,
+                ops::gemv_vl2_enabled(),
+                self.w8a16_gemv_batch8_k,
+                self.w8a16_gemv_batch8_dyn_vl2_k,
+                self.w8a16_gemv_batch8_dyn_vl2_n2_k,
+                self.w8a16_gemv_batch16_k,
+            )
+        };
+        let use_batch4 = gemv_batch_k.0 != 0
+            && n <= 16
+            && std::env::var("ATLAS_SSM_GEMV_BATCH4").ok().as_deref() != Some("0");
+        // FP4 sibling: the narrow w4a16_gemv batch{4..8} family (M<=8), else
+        // batch16 (M<=16). Single NVFP4 weight pass for the QKVZ + out_proj
+        // GEMVs (amortizes the weight read). The narrow tiers size acc/smem —
+        // and, because the row loop is unrolled, the CODE — to the real row
+        // count instead of batch16's 16; 0-handle → batch16 as before.
+        let narrow = self.w4a16_batchm.kernel(n as u32);
+        let fp4_gemv_batch_k = if narrow.0 != 0 {
+            narrow
+        } else {
+            self.w4a16_gemv_batch16_k
+        };
+        // ATLAS_QWEN4EXP_BATCH_FAST: serial decode's GEMV arithmetic per row
+        // (`exact_rows.rs`); cuBLASLt and the tile GEMMs below are not.
+        if self.exact_rows_proj(
+            super::super::exact_rows::GdnProj::Qkvz,
+            normed_base,
+            deinterleaved,
+            n,
+            ctx,
+            stream,
+        )? {
+        } else if let Some(ref fp8) = self.qkvz_fp8w {
+            if use_batch4 {
+                ops::w8a16_gemv_batch4_div(
+                    ctx.gpu,
+                    gemv_batch_k,
+                    normed_base,
+                    fp8.weight,
+                    fp8.row_scale,
+                    deinterleaved,
+                    n as u32,
+                    qkvz_size as u32,
+                    h as u32,
+                    gemv_div,
+                    stream,
+                )?;
+            } else if w8a16_pipe {
+                ops::w8a16_gemm_pipelined(
+                    ctx.gpu,
+                    self.w8a16_gemm_pipelined_k,
+                    normed_base,
+                    fp8.weight,
+                    fp8.row_scale,
+                    deinterleaved,
+                    n as u32,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
+                )?;
+            } else {
+                ops::w8a16_gemm(
+                    ctx.gpu,
+                    self.w8a16_gemm_k,
+                    normed_base,
+                    fp8.weight,
+                    fp8.row_scale,
+                    deinterleaved,
+                    n as u32,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
+                )?;
+            }
+        } else if let Some(ref nvfp4) = self.qkvz_nvfp4 {
+            match (ssm_tc_proj_min_n(), self.qkvz_nvfp4_t.as_ref()) {
+                (Some(min_n), Some(nvfp4_t)) if n >= min_n => {
+                    // Tile GEMM on the transposed twin — the same call the SSM
+                    // prefill path makes on this same weight. `ms_proj_gemm`
+                    // picks the 128-row M-tile at wide batches so the weight
+                    // is streamed once instead of ceil(n/64) times.
+                    self.ms_proj_gemm(
+                        ctx.gpu,
+                        normed_base,
+                        nvfp4_t,
+                        deinterleaved,
+                        n as u32,
+                        qkvz_size as u32,
+                        h as u32,
+                        stream,
+                    )?;
+                }
+                // FP4 batched QKVZ: ONE NVFP4 weight pass for all n seqs
+                // (sequential layout writes the deinterleaved buffer directly).
+                // `ssm_fp4_proj` takes the W4A8 DP4A arm first at n==4.
+                _ => self.ssm_fp4_proj(
+                    ctx,
+                    "QKVZ",
+                    fp4_gemv_batch_k,
+                    normed_base,
+                    nvfp4,
+                    deinterleaved,
+                    n as u32,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
+                )?,
+            }
+        } else {
+            // BF16-kept GDN build: scalar `dense_gemm` costs ~1.03 ms/layer
+            // at n=2 (measured) — cuBLASLt tensor-cores it (381 us).
+            ops::cublas_bf16_proj_dense(
+                normed_base,
+                self.ssm.in_proj_qkvz.weight,
+                deinterleaved,
+                n as u32,
+                qkvz_size as u32,
+                h as u32,
+                stream,
+            )?;
+        }
+        detail_step!("qkvz");
+
+        // ── 3. Recurrent inner ──
+        // Default: per-seq, byte-identical to ssm_forward. Experimental path:
+        // use existing batch dimensions for BA/gates, conv, GDN, and gated norm
+        // when the SSM pool states are contiguous slots [0..n).
+        self.decode_ms_ssm_recurrent(
+            states,
+            n,
+            normed_base,
+            deinterleaved,
+            normed_out_base,
+            qkvz_size,
+            key_dim,
+            value_dim,
+            conv_dim,
+            qk_channels,
+            d_conv,
+            nk,
+            nv,
+            kd,
+            vd,
+            vpg,
+            ba_size,
+            h,
+            bf16,
+            eps,
+            detail_profile,
+            &mut detail_parts,
+            &mut detail_t0,
+            ctx,
+            stream,
+        )?;
+        detail_step!("recurrent_total_tail");
+
+        // ── 4. Batched out_proj: ONE [N,value_dim]→[N,h] GEMM (weights ×1) ──
+        // FP8 (w8a16) when the decode overlay is installed, else BF16 dense.
+        if self.exact_rows_proj(
+            super::super::exact_rows::GdnProj::Out,
+            normed_out_base,
+            ssm_out_base,
+            n,
+            ctx,
+            stream,
+        )? {
+        } else if let Some(ref fp8) = self.out_proj_fp8w {
+            if use_batch4 {
+                ops::w8a16_gemv_batch4_div(
+                    ctx.gpu,
+                    gemv_batch_k,
+                    normed_out_base,
+                    fp8.weight,
+                    fp8.row_scale,
+                    ssm_out_base,
+                    n as u32,
+                    h as u32,
+                    value_dim as u32,
+                    gemv_div,
+                    stream,
+                )?;
+            } else if w8a16_pipe {
+                ops::w8a16_gemm_pipelined(
+                    ctx.gpu,
+                    self.w8a16_gemm_pipelined_k,
+                    normed_out_base,
+                    fp8.weight,
+                    fp8.row_scale,
+                    ssm_out_base,
+                    n as u32,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )?;
+            } else {
+                ops::w8a16_gemm(
+                    ctx.gpu,
+                    self.w8a16_gemm_k,
+                    normed_out_base,
+                    fp8.weight,
+                    fp8.row_scale,
+                    ssm_out_base,
+                    n as u32,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )?;
+            }
+        } else if let Some(ref out_proj_dense) = self.out_proj_dense {
+            // Same cuBLASLt swap as the QKVZ arm (513 -> 194 us at n=2).
+            ops::cublas_bf16_proj_dense(
+                normed_out_base,
+                out_proj_dense.weight,
+                ssm_out_base,
+                n as u32,
+                h as u32,
+                value_dim as u32,
+                stream,
+            )?;
+        } else if self.qkvz_nvfp4.is_some() {
+            match (ssm_tc_proj_min_n(), self.out_proj_nvfp4_t.as_ref()) {
+                (Some(min_n), Some(nvfp4_t)) if n >= min_n => {
+                    // Tile GEMM on the transposed twin — mirrors the SSM
+                    // prefill out_proj call on this same weight. `ms_proj_gemm`
+                    // picks the 128-row M-tile at wide batches so the weight
+                    // is streamed once instead of ceil(n/64) times.
+                    self.ms_proj_gemm(
+                        ctx.gpu,
+                        normed_out_base,
+                        nvfp4_t,
+                        ssm_out_base,
+                        n as u32,
+                        h as u32,
+                        value_dim as u32,
+                        stream,
+                    )?;
+                }
+                // FP4 batched out_proj: ONE NVFP4 weight pass for all n seqs.
+                // (qkvz_nvfp4.is_some() ⇒ the NVFP4 SSM build, where
+                // ssm.out_proj is the NVFP4 weight the per-seq path uses.)
+                // `ssm_fp4_proj` takes the W4A8 DP4A arm first at n==4.
+                _ => self.ssm_fp4_proj(
+                    ctx,
+                    "out_proj",
+                    fp4_gemv_batch_k,
+                    normed_out_base,
+                    &self.ssm.out_proj,
+                    ssm_out_base,
+                    n as u32,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )?,
+            }
+        }
+        detail_step!("out_proj");
+
+        // GDN HeadParallel: reduce the row-parallel partial out_proj across TP
+        // ranks (n × h BF16) before the residual add. No-op at tp=1.
+        self.ssm_tp_all_reduce(ssm_out_base, n, ctx, stream)?;
+
+        // ── 5. Residual + post-norm (hc: caller hc_posts moe_output; skip) ──
+        if !hc {
+            ops::residual_add_rms_norm(
+                ctx.gpu,
+                self.residual_add_rms_norm_k,
+                hidden,
+                ssm_out_base,
+                &self.post_attn_norm,
+                normed_base,
+                residual,
+                n as u32,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        }
+        detail_step!("post_norm", final);
+        if detail_profile {
+            let summary = detail_parts
+                .iter()
+                .map(|(label, us)| format!("{label}={us}us"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::info!("ATLAS_SSM_DETAIL n={n}: {summary}");
+        }
+
+        Ok(true)
+    }
+}

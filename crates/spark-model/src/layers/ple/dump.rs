@@ -43,6 +43,12 @@ fn dump_dir() -> Option<&'static str> {
     .as_deref()
 }
 
+/// Whether highway taps are on (`ATLAS_QWEN4EXP_DUMP`): callers that would
+/// reorder highway writes across a tap point stand down.
+pub fn tapping() -> bool {
+    dump_dir().is_some()
+}
+
 /// One-shot: refuse to overwrite a tap that already exists.
 ///
 /// `SSM_LAYER_CALL_COUNTER` is a global that never resets, so the second

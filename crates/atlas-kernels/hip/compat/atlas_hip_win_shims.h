@@ -69,4 +69,12 @@ __device__ __forceinline__ int __all_sync(unsigned long long, int pred) { return
 __device__ __forceinline__ unsigned long long __activemask() { return __ballot(1); }
 #endif
 
+// CUDA's device-side `__trap()` (main's gated_delta_rule_wy17 calls it on its
+// contractual-guard path) is not declared by the TheRock/HIP SDK Windows headers.
+// A macro rather than a function so it can never collide with a header that
+// does declare it.
+#ifndef __trap
+#define __trap() __builtin_trap()
+#endif
+
 #endif  // __HIP_PLATFORM_AMD__ || __HIP__

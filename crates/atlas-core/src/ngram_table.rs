@@ -80,7 +80,7 @@ pub struct NgramTable {
 fn element_bytes(dtype: &str) -> Option<usize> {
     match dtype {
         "F8_E4M3" | "F8_E5M2" | "U8" | "I8" => Some(1),
-        "BF16" | "F16" => Some(2),
+        "BF16" | "F16" | "I16" => Some(2),
         "F32" | "I32" => Some(4),
         _ => None,
     }
@@ -255,7 +255,7 @@ impl NgramTable {
     /// Elements per row, as opposed to [`Self::row_bytes`].
     pub fn head_dim(&self) -> usize {
         match self.dtype.as_str() {
-            "BF16" | "F16" => self.row_bytes / 2,
+            "BF16" | "F16" | "I16" => self.row_bytes / 2,
             "F32" | "I32" => self.row_bytes / 4,
             _ => self.row_bytes,
         }

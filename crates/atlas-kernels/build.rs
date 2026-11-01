@@ -56,6 +56,19 @@ struct ModelTypeMatch {
 }
 
 /// A resolved (hw, model, quant) compilation target.
+impl Target {
+    /// The model-specific source layers over `common/`, base first.
+    fn overlay_dirs(&self) -> Vec<&std::path::Path> {
+        self.base_kernel_dir
+            .as_deref()
+            .into_iter()
+            .chain(std::iter::once(self.model_kernel_dir.as_path()))
+            .chain(self.local_kernel_dir.as_deref())
+            .collect()
+    }
+}
+
+/// A resolved (hw, model, quant) compilation target.
 struct Target {
     hw: String,
     model: String,
@@ -65,6 +78,14 @@ struct Target {
     model_kernel_dir: PathBuf,
     /// Common quant dir (hw_dir/quant/) with shared .cu files.
     common_kernel_dir: Option<PathBuf>,
+    /// Sibling quant dir this target composes on, from `[build] base_quant`
+    /// in the model KERNEL.toml (e.g. `exl3/` on `nvfp4/`). Layered between
+    /// common and the model dir for sources and KERNEL.toml alike, so the
+    /// base quant's own build stays free of the overlay's kernels.
+    base_kernel_dir: Option<PathBuf>,
+    /// Target-local `<model>/<quant>/` dir present alongside a
+    /// `kernel_source` redirect — the last overlay layer.
+    local_kernel_dir: Option<PathBuf>,
     extra_flags: Vec<String>,
     module_overrides: HashMap<String, String>,
     /// `(module, kernel)` pairs declared in `[shadow_exempt]` — kernels this
@@ -87,6 +108,7 @@ struct Target {
     behavior_thinking_in_tools: bool,
     behavior_max_thinking_budget: u32,
     behavior_effort_capped_at_ceiling: bool,
+    behavior_default_reasoning_effort: String,
     behavior_thinking_default: bool,
     behavior_fp8_kv_calibration_tokens: usize,
     behavior_default_kv_dtype: String,
@@ -100,6 +122,7 @@ struct Target {
     behavior_jinja_template: String,
     behavior_enable_loop_watchdog: bool,
     behavior_enable_think_loop_watchdog: bool,
+    behavior_enable_stream_loop_guards: bool,
     behavior_honor_eos_inside_thinking: bool,
     behavior_min_reasoning_floor_tokens: u32,
     behavior_cap_thinking_at_max_tokens: bool,
@@ -118,6 +141,9 @@ struct Target {
     behavior_rom_head: String,
     behavior_tool_retry: bool,
     behavior_preserve_thinking: Option<bool>,
+    behavior_verbatim_prompt: bool,
+    behavior_eos_ends_thinking: bool,
+    behavior_tool_call_steering: bool,
     /// Which `(model_type, hidden_size)` pairs this kernel target supports.
     /// Parsed from `[[model_types]]` in MODEL.toml.
     model_type_matches: Vec<ModelTypeMatch>,
@@ -328,7 +354,7 @@ fn main() {
     for (idx, target) in targets.iter().enumerate() {
         let cu_files = collect_cu_files(
             target.common_kernel_dir.as_deref(),
-            &target.model_kernel_dir,
+            &target.overlay_dirs(),
             source_ext,
         );
         assert!(
@@ -398,7 +424,7 @@ fn main() {
 
         let drops = shadowed_dropped_pairs(
             target.common_kernel_dir.as_deref(),
-            &target.model_kernel_dir,
+            &target.overlay_dirs(),
             source_ext,
             &target.module_overrides,
         );
@@ -442,7 +468,14 @@ fn main() {
         if let Some(ref common) = target.common_kernel_dir {
             println!("cargo:rerun-if-changed={}", common.display());
         }
-        let n_overrides = find_cu_files(&target.model_kernel_dir, source_ext).len();
+        if let Some(ref base) = target.base_kernel_dir {
+            println!("cargo:rerun-if-changed={}", base.display());
+        }
+        let n_overrides: usize = target
+            .overlay_dirs()
+            .iter()
+            .map(|d| find_cu_files(d, source_ext).len())
+            .sum();
         println!(
             "cargo:warning=atlas-kernels: compiled {} kernels for target {} ({}, {}, {}){}",
             cu_files.len(),
@@ -600,7 +633,7 @@ fn closure_attestation(
     for target in targets {
         let sources = collect_cu_files(
             target.common_kernel_dir.as_deref(),
-            &target.model_kernel_dir,
+            &target.overlay_dirs(),
             compute_target.source_extension(),
         );
         if sources.is_empty() {
@@ -613,6 +646,11 @@ fn closure_attestation(
                 .join(&target.hw)
                 .join("HARDWARE.toml"),
             model_dir.map(|d| d.join("MODEL.toml")).unwrap_or_default(),
+            target
+                .base_kernel_dir
+                .as_ref()
+                .map(|d| d.join("KERNEL.toml"))
+                .unwrap_or_default(),
             target.model_kernel_dir.join("KERNEL.toml"),
         ]
         .into_iter()
@@ -705,7 +743,7 @@ fn hip_mirror_source(
             let dst = mirror_dir.join(name);
             let text = std::fs::read_to_string(&p)
                 .unwrap_or_else(|e| panic!("read {} for HIP mirror: {e}", p.display()));
-            let widened = widen_warp_masks(&text);
+            let widened = anchor_relative_includes(&widen_warp_masks(&text), src_dir);
             // Only rewrite when content changed (keeps mtimes stable across
             // incremental builds → no needless hipcc recompiles).
             let needs_write = match std::fs::read_to_string(&dst) {
@@ -721,6 +759,36 @@ fn hip_mirror_source(
     }
 
     mirror_dir.join(src.file_name().unwrap())
+}
+
+/// Rewrite every `#include "../…"` to the absolute path it names from the
+/// ORIGINAL source directory, which is how clang resolves it on the unmirrored
+/// file. The mirror lives under OUT_DIR, so a parent-relative include names
+/// nothing from there: #174's `#include "../../common/atlas_pdl.cuh"` in the
+/// GDN kernel that strix-hip's 35B-A3B and Flash-Next targets share stopped
+/// both from compiling. Sibling includes (`"foo.cuh"`) are left alone, since
+/// the whole directory is mirrored; an include whose target does not exist is
+/// left as written so the compiler reports it.
+fn anchor_relative_includes(src: &str, src_dir: &std::path::Path) -> String {
+    let mut out = String::with_capacity(src.len());
+    for line in src.split_inclusive('\n') {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("#include \"../")
+            && let Some(end) = rest.find('"')
+            && let abs = src_dir.join(format!("../{}", &rest[..end]))
+            && abs.exists()
+        {
+            let indent = &line[..line.len() - t.len()];
+            out.push_str(&format!(
+                "{indent}#include \"{}\"{}",
+                abs.display(),
+                &rest[end + 1..]
+            ));
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
 }
 
 /// Append `ULL` to the warp-mask literal that is the first argument of every
@@ -1067,6 +1135,14 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
         // comes from THIS target's own directory; only the quant kernel
         // dirs are redirected. Chains are refused — a source must own its
         // sources.
+        //
+        // TARGET-LOCAL OVERLAY: if the redirecting target ALSO ships its
+        // own `<model>/<quant>/` dir it compiles too, AFTER the source
+        // dir — precedence target-local > kernel_source > common by stem
+        // (same shadowing machinery/audit as base_quant). The overlay
+        // holds only what the source lacks (e.g. a vision tower one
+        // sibling owns); a same-stem file shadows the source's copy and
+        // is reported the same way.
         let kernel_src_dir = match parse_kernel_source(&model_dir) {
             Some(src) => {
                 let src_dir = hw_dir.join(&src);
@@ -1096,6 +1172,12 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
 
         for quant in &quants {
             let model_kernel_dir = kernel_src_dir.join(quant);
+            // Target-local overlay dir (only meaningful when kernel_source
+            // redirected; for a normal target it IS model_kernel_dir).
+            let local_kernel_dir = {
+                let d = model_dir.join(quant);
+                (kernel_src_dir != model_dir && d.is_dir()).then_some(d)
+            };
             // Shared kernels live in `kernels/<hw>/common/` and apply to
             // every (model, quant) target on this hardware. Most kernels
             // here are dtype-agnostic (BF16 norms/embeds/attn) — the dir
@@ -1137,15 +1219,42 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 module_overrides.extend(m);
                 shadow_exempt.extend(parse_shadow_exempt(&common_kernel_dir));
             }
-            if has_model_dir && model_kernel_dir.join("KERNEL.toml").exists() {
-                let (f, m) = parse_kernel_toml(&model_kernel_dir, &target_vendor);
+            // A quant dir may compose on a sibling (`[build] base_quant`):
+            // `exl3/` = the nvfp4 bundle + the EXL3 kernels, while `nvfp4/`
+            // alone never carries them. The base merges between common and
+            // the model toml, and is itself a plain dir (no chaining).
+            let base_kernel_dir = has_model_dir
+                .then(|| parse_base_quant(&model_kernel_dir))
+                .flatten()
+                .map(|base| {
+                    let dir = kernel_src_dir.join(&base);
+                    assert!(
+                        dir.is_dir() && parse_base_quant(&dir).is_none(),
+                        "({model}, {quant}): base_quant {base:?} must name a sibling \
+                         quant dir without its own base_quant ({})",
+                        dir.display(),
+                    );
+                    dir
+                });
+            for dir in [
+                base_kernel_dir.as_ref(),
+                Some(&model_kernel_dir),
+                local_kernel_dir.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !dir.join("KERNEL.toml").exists() {
+                    continue;
+                }
+                let (f, m) = parse_kernel_toml(dir, &target_vendor);
                 for flag in f {
                     if !extra_flags.contains(&flag) {
                         extra_flags.push(flag);
                     }
                 }
                 module_overrides.extend(m);
-                shadow_exempt.extend(parse_shadow_exempt(&model_kernel_dir));
+                shadow_exempt.extend(parse_shadow_exempt(dir));
             }
             shadow_exempt.sort();
             shadow_exempt.dedup();
@@ -1173,11 +1282,13 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 quant: quant.clone(),
                 arch: arch.clone(),
                 model_kernel_dir,
+                local_kernel_dir,
                 common_kernel_dir: if has_common_dir {
                     Some(common_kernel_dir)
                 } else {
                     None
                 },
+                base_kernel_dir,
                 extra_flags,
                 module_overrides,
                 shadow_exempt,
@@ -1189,6 +1300,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_thinking_in_tools: pb.thinking_in_tools,
                 behavior_max_thinking_budget: pb.max_thinking_budget,
                 behavior_effort_capped_at_ceiling: pb.effort_capped_at_ceiling,
+                behavior_default_reasoning_effort: pb.default_reasoning_effort,
                 behavior_thinking_default: pb.thinking_default,
                 behavior_fp8_kv_calibration_tokens: pb.fp8_kv_calibration_tokens,
                 behavior_default_kv_dtype: pb.default_kv_dtype,
@@ -1203,6 +1315,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_jinja_template: pb.jinja_template,
                 behavior_enable_loop_watchdog: pb.enable_loop_watchdog,
                 behavior_enable_think_loop_watchdog: pb.enable_think_loop_watchdog,
+                behavior_enable_stream_loop_guards: pb.enable_stream_loop_guards,
                 behavior_honor_eos_inside_thinking: pb.honor_eos_inside_thinking,
                 behavior_min_reasoning_floor_tokens: pb.min_reasoning_floor_tokens,
                 behavior_cap_thinking_at_max_tokens: pb.cap_thinking_at_max_tokens,
@@ -1221,6 +1334,9 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_rom_head: pb.rom_head,
                 behavior_tool_retry: pb.tool_retry,
                 behavior_preserve_thinking: pb.preserve_thinking,
+                behavior_verbatim_prompt: pb.verbatim_prompt,
+                behavior_eos_ends_thinking: pb.eos_ends_thinking,
+                behavior_tool_call_steering: pb.tool_call_steering,
                 model_type_matches,
                 match_names,
                 dflash,
@@ -1347,8 +1463,9 @@ mod build_parse;
 #[path = "build_shadow.rs"]
 mod build_shadow;
 use build_parse::{
-    parse_behavior, parse_dflash, parse_expected_absent, parse_kernel_source, parse_kernel_toml,
-    parse_match_names, parse_model_types, parse_sampling_presets, parse_shadow_exempt,
+    parse_base_quant, parse_behavior, parse_dflash, parse_expected_absent, parse_kernel_source,
+    parse_kernel_toml, parse_match_names, parse_model_types, parse_sampling_presets,
+    parse_shadow_exempt,
 };
 use build_shadow::shadowed_missing_symbols;
 
@@ -1358,7 +1475,7 @@ use build_shadow::shadowed_missing_symbols;
 /// NVIDIA, "metal" for Apple).
 fn collect_cu_files(
     common_dir: Option<&std::path::Path>,
-    model_dir: &std::path::Path,
+    overlay_dirs: &[&std::path::Path],
     source_ext: &str,
 ) -> Vec<PathBuf> {
     let mut files: HashMap<String, PathBuf> = HashMap::new();
@@ -1371,11 +1488,24 @@ fn collect_cu_files(
         }
     }
 
-    // Override layer: model-specific kernel files shadow common ones
-    for f in find_cu_files(model_dir, source_ext) {
-        let stem = f.file_stem().unwrap().to_str().unwrap().to_string();
-        files.insert(stem, f);
+    // Override layer: model-specific kernel files shadow common ones. A
+    // composed target's overlay must not shadow its base quant — whole-file
+    // shadowing is exactly the drift `shadowed_dropped_pairs` polices
+    // against common/, so it is refused outright between the two.
+    let mut overlay: HashMap<String, PathBuf> = HashMap::new();
+    for dir in overlay_dirs {
+        for f in find_cu_files(dir, source_ext) {
+            let stem = f.file_stem().unwrap().to_str().unwrap().to_string();
+            if let Some(prev) = overlay.insert(stem, f.clone()) {
+                panic!(
+                    "{} shadows {} from its base quant dir; move the change into the base",
+                    f.display(),
+                    prev.display()
+                );
+            }
+        }
     }
+    files.extend(overlay);
 
     let mut result: Vec<PathBuf> = files.into_values().collect();
     result.sort();
@@ -1437,7 +1567,7 @@ mod build_diagnose;
 /// the one that matters hides among them.
 fn shadowed_dropped_pairs(
     common_dir: Option<&std::path::Path>,
-    model_dir: &std::path::Path,
+    overlay_dirs: &[&std::path::Path],
     source_ext: &str,
     module_overrides: &HashMap<String, String>,
 ) -> Vec<(String, String)> {
@@ -1449,7 +1579,10 @@ fn shadowed_dropped_pairs(
         .map(|f| (f.file_stem().unwrap().to_str().unwrap().to_string(), f))
         .collect();
     let mut out = Vec::new();
-    for f in find_cu_files(model_dir, source_ext) {
+    let overlay = overlay_dirs
+        .iter()
+        .flat_map(|d| find_cu_files(d, source_ext));
+    for f in overlay {
         let stem = f.file_stem().unwrap().to_str().unwrap().to_string();
         let Some(common_f) = common_by_stem.get(&stem) else {
             continue;

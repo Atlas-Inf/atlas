@@ -28,10 +28,17 @@ pub struct SchedLimits {
     /// `<tool_response>` as a single token id, when this tokenizer has one.
     /// Registered but inert unless `SchedLevers::tool_response_stop` is armed.
     pub tool_response_hard_stop: Option<u32>,
+    /// A markdown code fence (```) as one token, when this tokenizer has one.
+    /// Thinking tracks fence parity with it: F2's confidence early-stop holds
+    /// off inside a fenced span (code is near-deterministic, which is not a
+    /// "done reasoning" signal). `None` → no fence tracking.
+    pub code_fence_token: Option<u32>,
     /// Served-context ceiling (`--max-seq-len`), enforced per decode step so a
     /// long think block cannot run past it. `0` = unset → every guard that
     /// reads it becomes a no-op.
     pub max_seq_len: usize,
+    /// Model-qualified native GLM tool opener; per-request tools must also be active.
+    pub glm_tool_boundary: Option<u32>,
 }
 
 impl SchedLimits {
@@ -41,7 +48,9 @@ impl SchedLimits {
     pub const NONE: Self = Self {
         im_start_hard_stop: None,
         tool_response_hard_stop: None,
+        code_fence_token: None,
         max_seq_len: 0,
+        glm_tool_boundary: None,
     };
 }
 

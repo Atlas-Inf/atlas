@@ -83,7 +83,11 @@ impl Qwen3SsmLayer {
             }
         }
 
+        // ATLAS_QWEN4EXP_BATCH_FAST keeps the per-sequence loop: it is
+        // `ssm_forward`'s kernels a row at a time, where the strided batched
+        // GDN+norm kernels are a different launch shape of the recurrence.
         let batched_recurrent = if crate::layers::qwen3_ssm::ssm_batched_recurrent_enabled()
+            && !ctx.levers.qwen4exp_batch_fast
             && self.gdn_f32_strided_k.0 != 0
             && n > 1
         {
@@ -386,7 +390,30 @@ impl Qwen3SsmLayer {
                 detail_step!("recurrent_batched_norm");
             }
         } else {
-            for i in 0..n {
+            // Fused conv+gdn+norm decode kernel (one launch instead of
+            // conv1d_l2norm -> gdn -> norm). Race-free only for head_repeat=2
+            // (Holo: 16 k / 32 v) + 128-dim heads. Skips the standalone conv
+            // when active (the fused kernel does the conv internally).
+            let use_fused_conv = self.gdn_f32_conv_norm_k.0 != 0
+                && nv == nk * 2
+                && kd == 128
+                && vd == 128
+                && std::env::var("ATLAS_GDN_FUSED_CONV").ok().as_deref() == Some("1");
+            // ATLAS_QWEN4EXP_BATCH_SMALL: the loop below as one exact launch
+            // per 8 sequences.
+            let rows_once = !detail_profile
+                && self.gdn_decode_fused_rows(
+                    states,
+                    n,
+                    normed_base,
+                    deinterleaved,
+                    qkvz_size,
+                    normed_out_base,
+                    use_fused_conv,
+                    ctx,
+                    stream,
+                )?;
+            for i in (0..n).filter(|_| !rows_once) {
                 let normed_i = normed_base.offset(i * h * bf16);
                 let deint_i = deinterleaved.offset(i * qkvz_size * bf16);
                 let z_i = deint_i.offset((key_dim * 2 + value_dim) * bf16);
@@ -425,15 +452,6 @@ impl Qwen3SsmLayer {
                 }
 
                 let conv_out = ctx.buffers.ssm_conv_out_f32();
-                // Fused conv+gdn+norm decode kernel (one launch instead of
-                // conv1d_l2norm -> gdn -> norm). Race-free only for head_repeat=2
-                // (Holo: 16 k / 32 v) + 128-dim heads. Skips the standalone conv
-                // when active (the fused kernel does the conv internally).
-                let use_fused_conv = self.gdn_f32_conv_norm_k.0 != 0
-                    && nv == nk * 2
-                    && kd == 128
-                    && vd == 128
-                    && std::env::var("ATLAS_GDN_FUSED_CONV").ok().as_deref() == Some("1");
                 let sub_t0 = if detail_profile {
                     Some(std::time::Instant::now())
                 } else {

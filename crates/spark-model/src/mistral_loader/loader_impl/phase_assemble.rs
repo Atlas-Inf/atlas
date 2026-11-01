@@ -124,6 +124,7 @@ pub(super) fn assemble_layer(
         nope,
         rope,
         v_dim,
+        glm_indexer: None,
         compressor: None,
         attn_sink: spark_runtime::gpu::DevicePtr::NULL,
     };

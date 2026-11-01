@@ -70,6 +70,8 @@ impl TransformerModel {
         }
 
         let mut host = vec![0u8; BATCH_ROWS * v * 2];
+        // ATLAS_GLM_DET_TRACE: one hash over every scored row's logits.
+        let mut det = crate::det_trace::on().then(crate::det_trace::Hasher::new);
         let mut start = 0usize;
         while start < rows_to_score {
             let count = (rows_to_score - start).min(BATCH_ROWS);
@@ -80,6 +82,9 @@ impl TransformerModel {
             self.gpu.synchronize(stream)?;
             let bytes = &mut host[..count * v * 2];
             self.gpu.copy_d2h(self.buffers.logits(), bytes)?;
+            if let Some(det) = det.as_mut() {
+                det.update(bytes);
+            }
             for j in 0..count {
                 let target = tokens[chunk_start + start + j + 1];
                 let row = &bytes[j * v * 2..(j + 1) * v * 2];
@@ -87,6 +92,10 @@ impl TransformerModel {
                     .push(extract_bf16(row, target, k as usize, v));
             }
             start += count;
+        }
+        if let Some(det) = det {
+            let scored = (0, rows_to_score);
+            crate::det_trace::tap_hashed("plogits", scored, rows_to_score * v * 2, det.finish());
         }
         Ok(())
     }

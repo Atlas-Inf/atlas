@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use super::ssm_pool::SsmStatePool;
 use super::ssm_snapshot::SsmSnapshotPool;
-use super::ssm_tier::SnapshotBlobStore;
+use super::ssm_tier::{SnapshotBlobStore, SpillHome};
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
 
@@ -28,12 +28,22 @@ pub struct SsmPools {
     pub(crate) pool: Arc<SsmStatePool>,
     pub(crate) snapshots: SsmSnapshotPool,
     pub(crate) tier_store: Option<Arc<dyn SnapshotBlobStore>>,
+    /// Where `tier_store` keeps its spills (`None` without a tier).
+    pub(crate) tier_home: Option<SpillHome>,
     pub(crate) has_mtp: bool,
     pub(crate) num_intermediates: usize,
     pub(crate) dflash_kgamma: usize,
 }
 
 impl SsmPools {
+    /// Host bytes the snapshot spill tier takes after KV sizing (0 without a
+    /// tier) — see `SpillHome::lazy_host_bytes`.
+    pub(crate) fn tier_lazy_host_bytes(&self) -> usize {
+        self.tier_home.map_or(0, |home| {
+            home.lazy_host_bytes(self.snapshots.spill_blob_bytes())
+        })
+    }
+
     /// Build the pools. Must run before the KV-cache budget snapshot in
     /// `factory::build_model` — see the module doc.
     pub(crate) fn new(
@@ -145,15 +155,17 @@ impl SsmPools {
         )?;
         // Optional SSM snapshot spill tier. `None` (default) keeps the reclaim
         // drop path byte-identical; blob sizing tracks the pool's spill layout.
-        let tier_store = super::impl_a1_init::build_ssm_tier_store(
+        let (tier_store, tier_home) = super::impl_a1_init::build_ssm_tier_store(
             config,
             snapshots.spill_blob_bytes(),
             pool.num_ssm_layers,
-        )?;
+        )?
+        .unzip();
         Ok(Self {
             pool,
             snapshots,
             tier_store,
+            tier_home,
             has_mtp,
             num_intermediates,
             dflash_kgamma,

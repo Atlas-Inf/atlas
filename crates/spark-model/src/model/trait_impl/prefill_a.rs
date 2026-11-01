@@ -23,6 +23,7 @@ use super::super::block_mgmt::{
     apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
     extract_layer_refs, reuse_prefix_match_disk_ids,
 };
+use super::super::prefix_share::adopt_prefix_match;
 use super::super::ssm_pool::SsmStatePool;
 use super::super::ssm_snapshot::SsmSnapshotPool;
 use super::super::types::{PinnedMetaStaging, TransformerModel};
@@ -73,6 +74,7 @@ impl TransformerModel {
         // token counts. The EP=2 CUDA 700 was from the 4MB recv buffer overflow
         // (fixed in 1ae4883); zero_all kept everywhere as defense-in-depth.
         self.buffers.zero_all(self.gpu.as_ref(), stream)?;
+        self.buffers.note_rows(usize::MAX); // rows unknown to `zero_dirty`
 
         let mut kv_cache = self.kv_cache.lock();
 
@@ -82,24 +84,15 @@ impl TransformerModel {
             spark_runtime::prefix_cache::PrefixMatch::empty()
         } else {
             self.prefix_cache
-                .lookup(tokens, bs, seq.session_hash, seq.adapter_id)
+                .lookup_whole_blocks(tokens, bs, seq.session_hash, seq.adapter_id)
         };
         let mut kv_write_start = prefix_match.matched_tokens;
-        seq.cached_prefix_tokens = prefix_match.matched_tokens;
-        seq.cached_prefix_blocks = prefix_match.matched_blocks.len();
         // Record the original prompt length — cache_sequence() uses it later
         // to avoid double-bumping ref_counts on the prompt portion.
         seq.prompt_len = n;
 
         // Reuse cached blocks (inc_ref for shared ownership).
-        for &block_idx in &prefix_match.matched_blocks {
-            kv_cache.inc_ref(block_idx);
-            seq.block_table.push(block_idx);
-        }
-        reuse_prefix_match_disk_ids(
-            &prefix_match.matched_disk_block_ids,
-            &mut seq.disk_block_ids,
-        );
+        adopt_prefix_match(seq, &prefix_match, &mut kv_cache)?;
 
         // Allocate new blocks for the remaining (uncached) tokens.
         let blocks_needed = (n - 1) / bs + 1;
@@ -380,6 +373,7 @@ impl TransformerModel {
         };
 
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -420,6 +414,8 @@ impl TransformerModel {
             kv_write_start
         };
         let diag_prefill = self.profile && proc_count > 1; // Only with --profile
+        // ATLAS_LAYER_H_PREFILL: per-layer hidden sums, eager path only.
+        let probe_hp = std::env::var("ATLAS_LAYER_H_PREFILL").as_deref() == Ok("1");
         for (i, layer) in self.layers.iter().enumerate() {
             layer
                 .prefill(
@@ -448,6 +444,26 @@ impl TransformerModel {
                 proc_count,
                 stream,
             )?;
+            if probe_hp {
+                self.gpu.synchronize(stream).ok();
+                let hs = self.config.hidden_size;
+                let mut hb = vec![0u8; proc_count * hs * 2];
+                if self.gpu.copy_d2h(hidden, &mut hb).is_ok() {
+                    let mut all = 0f64;
+                    let mut last = 0f64;
+                    for (e, c) in hb.chunks_exact(2).enumerate() {
+                        let v =
+                            f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16) as f64;
+                        if v.is_finite() {
+                            all += v.abs();
+                            if e / hs == proc_count - 1 {
+                                last += v.abs();
+                            }
+                        }
+                    }
+                    tracing::warn!("ATLAS_LAYER_HP L{i} last_sabs={last:.6} all_sabs={all:.6}");
+                }
+            }
 
             // MLA diagnostic: dump per-layer hidden state norm (once per model).
             // Per-model latch (see `ModelStats::dumped`) rather than a static: an
@@ -505,14 +521,49 @@ impl TransformerModel {
         // ATLAS_MTP_DRAFTER_PREFILL: capture the processed rows' final-layer
         // hiddens for the whole-prompt drafter prefill. No-op when disabled.
         self.try_mtp_prefill_capture(seq, seq_len_start, proc_count, stream)?;
+        // Ported from Enntity/atlas e7d4e1a (AGPL-3.0-only).
+        self.note_mtp_prompt_rows(seq, seq_len_start, proc_count, 0);
 
         // ── 5. Final norm on LAST token only ──
         let last_hidden = hidden.offset((proc_count - 1) * h * fp32);
         let normed = self.buffers.norm_output();
         self.final_norm_rows(last_hidden, normed, 1, stream)?;
 
+        if std::env::var("ATLAS_LAYER_H_PREFILL").as_deref() == Ok("1") {
+            self.gpu.synchronize(stream)?;
+            let mut hb = vec![0u8; h * 2];
+            if self.gpu.copy_d2h(normed, &mut hb).is_ok() {
+                let mut s_ = 0f64;
+                for c in hb.chunks_exact(2) {
+                    let v = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16) as f64;
+                    if v.is_finite() {
+                        s_ += v.abs();
+                    }
+                }
+                tracing::warn!("ATLAS_LAYER_HP FINAL last_sabs={s_:.6} all_sabs={s_:.6}");
+            }
+        }
+
         // ── 6. LM head on last token → logits ──
         self.lm_head(normed, stream)?;
+
+        if std::env::var("ATLAS_LAYER_H_PREFILL").as_deref() == Ok("1") {
+            self.gpu.synchronize(stream)?;
+            let v_sz = self.config.vocab_size;
+            let mut lb = vec![0u8; v_sz * 2];
+            if self.gpu.copy_d2h(self.decode_logits_ptr(), &mut lb).is_ok() {
+                let mut top: Vec<(u32, f32)> = Vec::with_capacity(5);
+                for (i, c) in lb.chunks_exact(2).enumerate() {
+                    let v = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
+                    if v.is_finite() && (top.len() < 5 || v > top[4].1) {
+                        top.push((i as u32, v));
+                        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                        top.truncate(5);
+                    }
+                }
+                tracing::warn!("ATLAS_LAYER_HP LOGITS top5={top:?}");
+            }
+        }
 
         // ── 7. Update sequence state ──
         seq.tokens.extend_from_slice(tokens);

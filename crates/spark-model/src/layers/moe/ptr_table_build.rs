@@ -13,12 +13,21 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use super::{ExpertPtrTable, Fp8ExpertPtrTable};
 use crate::weight_map::{DenseWeight, ExpertWeight, Fp8ExpertWeight, Fp8Weight, QuantizedWeight};
 
+#[path = "ptr_table_receipt.rs"]
+pub(super) mod receipt;
+
 /// Build a device-side pointer table from pre-transposed QuantizedWeight vec.
 pub(crate) fn build_ptr_table_from_qw(
     weights: &[QuantizedWeight],
     gpu: &dyn GpuBackend,
 ) -> Result<ExpertPtrTable> {
     let n = weights.len();
+    let ptr_bytes = n
+        .checked_mul(8)
+        .ok_or_else(|| anyhow::anyhow!("table extent overflow"))?;
+    let scalar_bytes = n
+        .checked_mul(4)
+        .ok_or_else(|| anyhow::anyhow!("table extent overflow"))?;
     let packed_bytes: Vec<u8> = weights
         .iter()
         .flat_map(|w| w.weight.0.to_le_bytes())
@@ -32,14 +41,23 @@ pub(crate) fn build_ptr_table_from_qw(
         .flat_map(|w| w.weight_scale_2.to_le_bytes())
         .collect();
 
-    let packed_ptrs = gpu.alloc(n * 8)?;
+    let packed_ptrs = gpu.alloc(ptr_bytes)?;
     gpu.copy_h2d(&packed_bytes, packed_ptrs)?;
-    let scale_ptrs = gpu.alloc(n * 8)?;
+    let scale_ptrs = gpu.alloc(ptr_bytes)?;
     gpu.copy_h2d(&scale_bytes, scale_ptrs)?;
-    let scale2_vals = gpu.alloc(n * 4)?;
+    let scale2_vals = gpu.alloc(scalar_bytes)?;
     gpu.copy_h2d(&scale2_bytes, scale2_vals)?;
 
     Ok(ExpertPtrTable {
+        allocation: Some(receipt::TableAllocation::completed(
+            gpu,
+            n,
+            [
+                (packed_ptrs, ptr_bytes),
+                (scale_ptrs, ptr_bytes),
+                (scale2_vals, scalar_bytes),
+            ],
+        )),
         packed_ptrs,
         scale_ptrs,
         scale2_vals,
@@ -53,6 +71,12 @@ pub(crate) fn build_ptr_table(
     gpu: &dyn GpuBackend,
 ) -> Result<ExpertPtrTable> {
     let n = experts.len();
+    let ptr_bytes = n
+        .checked_mul(8)
+        .ok_or_else(|| anyhow::anyhow!("table extent overflow"))?;
+    let scalar_bytes = n
+        .checked_mul(4)
+        .ok_or_else(|| anyhow::anyhow!("table extent overflow"))?;
 
     // Build host-side arrays
     let packed_bytes: Vec<u8> = experts
@@ -69,16 +93,25 @@ pub(crate) fn build_ptr_table(
         .collect();
 
     // Upload to device
-    let packed_ptrs = gpu.alloc(n * 8)?;
+    let packed_ptrs = gpu.alloc(ptr_bytes)?;
     gpu.copy_h2d(&packed_bytes, packed_ptrs)?;
 
-    let scale_ptrs = gpu.alloc(n * 8)?;
+    let scale_ptrs = gpu.alloc(ptr_bytes)?;
     gpu.copy_h2d(&scale_bytes, scale_ptrs)?;
 
-    let scale2_vals = gpu.alloc(n * 4)?;
+    let scale2_vals = gpu.alloc(scalar_bytes)?;
     gpu.copy_h2d(&scale2_bytes, scale2_vals)?;
 
     Ok(ExpertPtrTable {
+        allocation: Some(receipt::TableAllocation::completed(
+            gpu,
+            n,
+            [
+                (packed_ptrs, ptr_bytes),
+                (scale_ptrs, ptr_bytes),
+                (scale2_vals, scalar_bytes),
+            ],
+        )),
         packed_ptrs,
         scale_ptrs,
         scale2_vals,

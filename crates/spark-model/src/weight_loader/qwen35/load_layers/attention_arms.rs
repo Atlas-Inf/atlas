@@ -15,8 +15,8 @@ use crate::layer::TransformerLayer;
 use crate::layers::{FfnComponent, Qwen3AttentionLayer};
 use crate::tp_shard::{TpShardKind, load_qkvo_tp, shard_dense_bf16, shard_quantized_nvfp4};
 use crate::weight_map::{
-    AttentionWeights, DenseWeight, Nvfp4Variant, dense_auto, load_kv_scales, quantize_to_nvfp4,
-    quantized_auto,
+    AttentionWeights, DenseWeight, Nvfp4Variant, dense_auto, free_loader_source, load_kv_scales,
+    quantize_to_nvfp4, quantize_to_nvfp4_scaled_by, quantized_auto,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -146,8 +146,17 @@ pub(crate) fn build_full_attention_nvfp4(
                     }
                 }
                 let __t_q0 = std::time::Instant::now();
-                let q = quantize_to_nvfp4(
-                    &sharded, local_n, local_k, gpu, absmax_k, quantize_k, stream,
+                // The full matrix sets the global scale, so a TP shard holds
+                // exactly the NVFP4 bytes of the matching TP=1 rows.
+                let q = quantize_to_nvfp4_scaled_by(
+                    &sharded,
+                    local_n,
+                    local_k,
+                    (src.weight, full_n * full_k),
+                    gpu,
+                    absmax_k,
+                    quantize_k,
+                    stream,
                 )?;
                 if std::env::var("ATLAS_LOAD_TIMING").is_ok() {
                     tracing::info!(
@@ -157,8 +166,14 @@ pub(crate) fn build_full_attention_nvfp4(
                         __t0.elapsed().as_millis(),
                     );
                 }
+                // Under TP the dense copy handed to the layer must be this
+                // rank's shard: the dense arms (`--attn-proj-dtype bf16`, the
+                // prefill fallbacks, `o_dense_bf16`) size their GEMMs with the
+                // TP-local head count, so the full-width source would make
+                // rank 1 compute rank 0's heads. TP=1 keeps the source as is.
                 if sharded_ptr != src.weight {
-                    gpu.free(sharded_ptr)?;
+                    free_loader_source(store, gpu, &format!("{p}.{name}.weight"), src)?;
+                    return Ok((sharded, q));
                 }
                 Ok((src, q))
             };
@@ -250,7 +265,15 @@ pub(crate) fn build_full_attention_nvfp4(
             .transpose_for_gemm(gpu, h, num_heads * head_dim)?;
         layer.set_prefill_weights(Some(qt), Some(kt), Some(vt), Some(ot));
     }
-    layer.predequant_for_prefill(gpu, config, stream)?;
+    // Native-HIP (atlas_hip) lacks the FP8 *prefill* GEMM kernels
+    // (fp8_gemm_n128 / fp8_gemm_t_blockscaled are inline-PTX, not yet
+    // WMMA-ported). Skip the FP8→FP8 predequant so q/k/v/o prefill falls to
+    // the NVFP4 w4a16 WMMA path (`w4a16_gemm_t_m128` arms in
+    // cache_skip_qkv.rs / paged_qkv.rs / paged_oproj.rs). SCALE/NVIDIA keep
+    // FP8 prefill. Mirrors the sibling guard in linear_attn_arms.rs.
+    if !cfg!(atlas_hip) {
+        layer.predequant_for_prefill(gpu, config, stream)?;
+    }
 
     Ok(Box::new(layer))
 }

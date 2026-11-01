@@ -16,6 +16,15 @@ use atlas_core::config::VisionConfig;
 use crate::ir::{ContentPart, ImageData, MediaKind, Message, Role};
 
 use super::super::compact::openai_error_response;
+use crate::tokenizer::{Glm5VisionPlaceholder, QwenVisionPlaceholder};
+
+mod glm5_vision;
+mod media;
+
+#[path = "msg_entry/tail.rs"]
+pub(super) mod tail;
+#[cfg(test)]
+use glm5_vision::checked_glm5_video_timestamps;
 
 /// What the request path needs to decode a video: the operator's subprocess
 /// policy and the sampling rate. Bundled so the signature does not grow two
@@ -64,6 +73,36 @@ pub(super) struct BuildOut {
     pub(super) cwd_hint: Option<String>,
     pub(super) image_pixels: Vec<spark_model::VisionItem>,
     pub(super) image_pad_counts: Vec<usize>,
+    /// GLM-5-specific placeholder geometry. Empty for Qwen/text families;
+    /// the template renderer uses this to expand GLM's image/video marker
+    /// triples after Jinja rendering.
+    pub(super) vision_placeholders: Vec<Glm5VisionPlaceholder>,
+    /// Qwen3.8-specific placeholder geometry. Empty for GLM/text families;
+    /// the renderer uses this to split each video into timestamped frame
+    /// ranges after Jinja rendering.
+    pub(super) qwen_vision_placeholders: Vec<QwenVisionPlaceholder>,
+}
+
+/// Bytes of data URIs (base64, about 4/3 of the fetched bytes) the remote
+/// fetches of one request may bring in: the size of the largest request
+/// body, so fetching cannot multiply it.
+const REMOTE_FETCH_TOTAL_MAX: usize = 32 << 20;
+
+/// Charge `len` data-URI bytes to a request's remote fetches.
+#[allow(clippy::result_large_err)]
+fn charge_fetched(fetched: &mut usize, len: usize) -> Result<(), Response> {
+    *fetched += len;
+    if *fetched > REMOTE_FETCH_TOTAL_MAX {
+        return Err(openai_error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "this request's media URLs fetch more than {} MiB of data URIs, the \
+                 per-request limit; send fewer or smaller media",
+                REMOTE_FETCH_TOTAL_MAX >> 20
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// One media item on its way to the vision path: what it is, and the
@@ -86,6 +125,7 @@ fn collect_message_media(
     media: &mut Vec<MediaInput>,
     image_pad_counts: &mut Vec<usize>,
     remote: &super::remote_image::RemoteImagePolicy,
+    fetched: &mut usize,
 ) -> Result<(), Response> {
     // ORDER IS A CONTRACT, and the order is the CLIENT'S. The template emits
     // one marker per media item in the order they appear in the content
@@ -103,7 +143,7 @@ fn collect_message_media(
         };
         media.push(MediaInput {
             kind,
-            uri: resolve_media_uri(kind, data, remote)?,
+            uri: resolve_media_uri(kind, data, remote, fetched)?,
         });
         image_pad_counts.push(0);
     }
@@ -119,6 +159,7 @@ fn resolve_media_uri(
     kind: MediaKind,
     data: &ImageData,
     remote: &super::remote_image::RemoteImagePolicy,
+    fetched: &mut usize,
 ) -> Result<String, Response> {
     let noun = match kind {
         MediaKind::Image => "image",
@@ -145,8 +186,15 @@ fn resolve_media_uri(
                     ),
                 ));
             }
-            match super::remote_image::fetch_as_data_uri(url, remote) {
-                Ok(data_uri) => Ok(data_uri),
+            let remote_kind = match kind {
+                MediaKind::Image => super::remote_image::RemoteMediaKind::Image,
+                MediaKind::Video => super::remote_image::RemoteMediaKind::Video,
+            };
+            match super::remote_image::fetch_media_as_data_uri(url, remote, remote_kind) {
+                Ok(data_uri) => {
+                    charge_fetched(fetched, data_uri.len())?;
+                    Ok(data_uri)
+                }
                 Err(why) => {
                     // The reason is surfaced rather than flattened to "could
                     // not fetch": the operator turned this on deliberately,
@@ -163,7 +211,9 @@ fn resolve_media_uri(
     }
 }
 
-#[allow(clippy::result_large_err)]
+/// [`build_msg_entries_admitted`] without vision bounds (tests).
+#[cfg(test)]
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 pub(super) fn build_msg_entries(
     vision_config: Option<&VisionConfig>,
     vision_max_pixels: Option<usize>,
@@ -174,9 +224,46 @@ pub(super) fn build_msg_entries(
     levers: &super::levers::ChatLevers,
     preserve_developer_role: bool,
 ) -> Result<BuildOut, Response> {
+    build_msg_entries_admitted(
+        vision_config,
+        vision_max_pixels,
+        remote_images,
+        video,
+        input,
+        tools_active,
+        levers,
+        preserve_developer_role,
+        super::vision_admit::AdmitCtx::default(),
+    )
+}
+
+/// [`build_msg_entries`] under the server's vision bounds: each item is sized
+/// from its header and admitted (`vision_admit`) before it is decoded.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+pub(super) fn build_msg_entries_admitted(
+    vision_config: Option<&VisionConfig>,
+    vision_max_pixels: Option<usize>,
+    remote_images: &super::remote_image::RemoteImagePolicy,
+    video: &VideoDecode<'_>,
+    input: &[Message],
+    tools_active: bool,
+    levers: &super::levers::ChatLevers,
+    preserve_developer_role: bool,
+    admit: super::vision_admit::AdmitCtx<'_>,
+) -> Result<BuildOut, Response> {
+    // The item count is checked before any media is fetched or read.
+    let parts = || input.iter().flat_map(|m| &m.content);
+    let n_media = parts()
+        .filter(|p| matches!(p, ContentPart::Image(_) | ContentPart::Video(_)))
+        .count();
+    let has_video = parts().any(|p| matches!(p, ContentPart::Video(_)));
+    let admission = super::vision_admit::Admission::begin(admit, n_media, has_video)?;
+    let mut fetched = 0usize;
     let mut messages: Vec<MsgEntry> = Vec::with_capacity(input.len());
     let mut media: Vec<MediaInput> = Vec::new();
     let mut image_pad_counts: Vec<usize> = Vec::new();
+    let mut vision_placeholders: Vec<Glm5VisionPlaceholder> = Vec::new();
+    let mut qwen_vision_placeholders: Vec<QwenVisionPlaceholder> = Vec::new();
     let mut consecutive_tool_errors: u32 = 0;
     // BW1 bash-wandering watchdog: tally tool-call productivity across the
     // conversation so a steering nudge can fire if the agent explores/runs
@@ -189,6 +276,9 @@ pub(super) fn build_msg_entries(
     // injected hints vary with the escalation counter and would break
     // exact-match grouping.
     let mut tool_result_originals: Vec<(usize, String)> = Vec::new();
+    // Atlas's prompt aids below (tool-result markers and hints, the cwd hint,
+    // the content-free system drop); none for a verbatim-prompt model.
+    let aids = !levers.verbatim_prompt;
 
     // F6 (2026-05-26): `last_query_index` was previously used to gate
     // an empty `<think>\n\n</think>\n\n` injection for historical
@@ -203,7 +293,7 @@ pub(super) fn build_msg_entries(
         // success over error text. Rendered here (not in the adapters) so
         // every surface gets identical prompt bytes, and applied before the
         // error-hint scan below so hints see the final text.
-        if m.tool_error {
+        if m.tool_error && aids {
             text = format!("[tool error]\n{text}");
         }
 
@@ -251,7 +341,7 @@ pub(super) fn build_msg_entries(
             // P1-6 (2026-07-09): record the pre-hint original at the
             // index this entry is about to occupy.
             tool_result_originals.push((messages.len(), text.clone()));
-            if crate::hint_injector::looks_like_error(&text) {
+            if aids && crate::hint_injector::looks_like_error(&text) {
                 consecutive_tool_errors += 1;
                 crate::hint_injector::inject_hints(&mut text, consecutive_tool_errors);
             } else {
@@ -265,7 +355,13 @@ pub(super) fn build_msg_entries(
                 media: m.media_kinds(),
                 reasoning_content: None,
             });
-            collect_message_media(m, &mut media, &mut image_pad_counts, remote_images)?;
+            collect_message_media(
+                m,
+                &mut media,
+                &mut image_pad_counts,
+                remote_images,
+                &mut fetched,
+            )?;
             continue;
         }
 
@@ -312,7 +408,13 @@ pub(super) fn build_msg_entries(
                 None
             },
         });
-        collect_message_media(m, &mut media, &mut image_pad_counts, remote_images)?;
+        collect_message_media(
+            m,
+            &mut media,
+            &mut image_pad_counts,
+            remote_images,
+            &mut fetched,
+        )?;
     }
 
     // P1-6 (2026-07-09): duplicate-error observation masking
@@ -325,8 +427,8 @@ pub(super) fn build_msg_entries(
     // ATLAS_NO_ERROR_DEDUP=1 restores verbatim history. MUST run
     // before the vacuous-system removal below — the recorded indices
     // refer to the un-shifted `messages` vec.
-    if tools_active && !error_dedup_disabled() {
-        for (idx, replacement) in duplicate_error_masks(&tool_result_originals) {
+    if tools_active && aids && !error_dedup_disabled() {
+        for (idx, replacement) in tail::duplicate_error_masks(&tool_result_originals) {
             messages[idx].content = replacement;
         }
     }
@@ -354,6 +456,7 @@ pub(super) fn build_msg_entries(
     // Inject CWD hint into the system message (NOT tool definitions —
     // those go to the Jinja template).
     if tools_active
+        && aids
         && !levers.disable_cwd_hint_injection
         && let Some(ref cwd) = cwd_hint
     {
@@ -375,9 +478,10 @@ pub(super) fn build_msg_entries(
     // such a message as absent so a degenerate client prompt can't poison
     // generation. Conservative — only an empty body or a single short
     // bare `Label:` line qualifies; any substantive prompt is untouched.
-    if messages
-        .first()
-        .is_some_and(|m| m.role == "system" && is_vacuous_system_content(&m.content))
+    if aids
+        && messages
+            .first()
+            .is_some_and(|m| m.role == "system" && tail::is_vacuous_system_content(&m.content))
     {
         let removed = messages.remove(0);
         tracing::info!(
@@ -403,63 +507,16 @@ pub(super) fn build_msg_entries(
                 "this model does not accept image or video input (no vision config)".to_string(),
             ));
         };
-        for (idx, input) in media.iter().enumerate() {
-            let item = match input.kind {
-                MediaKind::Image => {
-                    match spark_model::vision_preprocess::preprocess_image_with_max_pixels(
-                        &input.uri,
-                        vcfg,
-                        vision_max_pixels,
-                    ) {
-                        Ok((pixels, grid_h, grid_w)) => {
-                            spark_model::VisionItem::image(pixels, grid_h, grid_w)
-                        }
-                        Err(e) => {
-                            return Err(openai_error_response(
-                                StatusCode::BAD_REQUEST,
-                                format!("Image decode error: {e}"),
-                            ));
-                        }
-                    }
-                }
-                MediaKind::Video => {
-                    match spark_model::video_preprocess::preprocess_video(
-                        &input.uri,
-                        vcfg,
-                        vision_max_pixels,
-                        video.fps,
-                        video.ffmpeg,
-                    ) {
-                        Ok(v) => spark_model::VisionItem {
-                            groups: v.groups,
-                            grid_h: v.grid_h,
-                            grid_w: v.grid_w,
-                        },
-                        Err(e) => {
-                            return Err(openai_error_response(
-                                StatusCode::BAD_REQUEST,
-                                format!("Video decode error: {e:#}"),
-                            ));
-                        }
-                    }
-                }
-            };
-            image_pad_counts[idx] = item.pad_count(vcfg.spatial_merge_size);
-            if input.kind == MediaKind::Video {
-                // Logged at the media index, not a video ordinal: the index
-                // is what lines the clip up with its pad run and its
-                // encoder rows.
-                tracing::info!(
-                    "Video (media item {}): {} temporal groups, {}x{} patches, {} vision tokens",
-                    idx,
-                    item.t_len(),
-                    item.grid_h,
-                    item.grid_w,
-                    image_pad_counts[idx],
-                );
-            }
-            image_pixels.push(item);
-        }
+        image_pixels = media::preprocess_media(
+            &media,
+            vcfg,
+            vision_max_pixels,
+            video,
+            admission,
+            &mut image_pad_counts,
+            &mut vision_placeholders,
+            &mut qwen_vision_placeholders,
+        )?;
     }
 
     // BW1 bash-wandering watchdog: if the agent has run many tool calls with
@@ -467,6 +524,7 @@ pub(super) fn build_msg_entries(
     // tool response (what the model reads just before its next action). Gated
     // by ATLAS_BASH_WANDER_WATCHDOG (PCND, default-off).
     if tools_active
+        && aids
         && let Some(hint) = crate::hint_injector::bash_wander_hint(
             total_tool_calls,
             productive_tool_calls,
@@ -482,6 +540,8 @@ pub(super) fn build_msg_entries(
         cwd_hint,
         image_pixels,
         image_pad_counts,
+        vision_placeholders,
+        qwen_vision_placeholders,
     })
 }
 
@@ -494,21 +554,6 @@ pub(super) fn build_msg_entries(
 ///     of an empty client template (Open WebUI's RAG/context block).
 /// Anything multi-line, or with any text past the colon, is a real
 /// prompt and returns false.
-fn is_vacuous_system_content(content: &str) -> bool {
-    let t = content.trim();
-    if t.is_empty() {
-        return true;
-    }
-    if !t.contains('\n') && t.len() <= 32 && t.ends_with(':') {
-        let label = &t[..t.len() - 1];
-        return !label.is_empty()
-            && label
-                .chars()
-                .all(|c| c.is_ascii_alphabetic() || c == ' ' || c == '_' || c == '-');
-    }
-    false
-}
-
 /// P1-6 (2026-07-09): kill-switch — `ATLAS_NO_ERROR_DEDUP=1` restores
 /// verbatim duplicate-error history (disables the masking pass).
 fn error_dedup_disabled() -> bool {
@@ -526,53 +571,6 @@ fn error_dedup_disabled() -> bool {
 /// trim or Jaccard >= 0.9 over 4-gram shingles (the loop_detector
 /// measure — SSOT). Successful outputs never participate: identical
 /// success observations (e.g. repeated `ls`) are legitimate.
-fn duplicate_error_masks(tool_results: &[(usize, String)]) -> Vec<(usize, String)> {
-    const NEAR_DUP_JACCARD: f64 = 0.9;
-    let errors: Vec<(usize, &str)> = tool_results
-        .iter()
-        .filter(|(_, t)| crate::hint_injector::looks_like_error(t))
-        .map(|(i, t)| (*i, t.trim()))
-        .collect();
-    if errors.len() < 2 {
-        return Vec::new();
-    }
-    let shingle_sets: Vec<_> = errors
-        .iter()
-        .map(|(_, t)| crate::loop_detector::shingle_set(t))
-        .collect();
-    // First-match grouping against each group's first member. Short
-    // errors (< 4 tokens) have empty shingle sets — jaccard() returns
-    // 0.0 for those, so they group via exact-trim match only.
-    let mut groups: Vec<Vec<usize>> = Vec::new(); // indices into `errors`
-    for i in 0..errors.len() {
-        let group = groups.iter_mut().find(|g| {
-            let rep = g[0];
-            errors[rep].1 == errors[i].1
-                || crate::loop_detector::jaccard(&shingle_sets[rep], &shingle_sets[i])
-                    >= NEAR_DUP_JACCARD
-        });
-        match group {
-            Some(g) => g.push(i),
-            None => groups.push(vec![i]),
-        }
-    }
-    let mut masks = Vec::new();
-    for g in &groups {
-        let n = g.len();
-        if n < 2 {
-            continue;
-        }
-        // Keep the LAST (newest) verbatim; mask the earlier ones.
-        for (k, &ei) in g.iter().take(n - 1).enumerate() {
-            masks.push((
-                errors[ei].0,
-                format!("[same error as below, attempt {} of {}]", k + 1, n),
-            ));
-        }
-    }
-    masks
-}
-
 #[cfg(test)]
 #[path = "msg_entry_tests.rs"]
 mod msg_entry_tests;

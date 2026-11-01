@@ -231,6 +231,34 @@ impl QsaIndexer {
             Ok("1") | Ok("true")
         ) && self.k_prefill_attn_tc3_k.0 != 0
             && ops::qsa_prefill_attn_tc3_ok(nq, self.nkv_attn, self.hd_attn);
+        // ATLAS_QWEN4EXP_PREFILL_QSA_{TC2R,LEAN}: tc2's arithmetic on a lean
+        // tile -- two rows per CTA at one kv head (TP2), or tc2's own shape.
+        let tc2_in_force = !tc3
+            && ops::qsa_attn_tc2_enabled()
+            && self.k_prefill_attn_tc2_k.0 != 0
+            && ops::qsa_prefill_attn_tc2_ok(nq, self.nkv_attn, self.hd_attn);
+        let slab = ops::qwen4exp_prefill::QsaAttnSlab {
+            q: q_roped.offset(first_row * q_row * 2),
+            k_cache: k_pool,
+            v_cache: v_pool,
+            block_table: block_table_dev,
+            lists,
+            attn_out: attn_ctx.offset(first_row * q_row * 2),
+            rows: rows as u32,
+            first_pos: first_pos as u32,
+            topk: topk as u32,
+            ratio: self.ratio,
+            block_size,
+            nq,
+            nkv: self.nkv_attn,
+            hd: self.hd_attn,
+            inv_sqrt_d,
+        };
+        if !tc3
+            && ops::qwen4exp_prefill::try_qsa_prefill_attn_lean(gpu, &slab, tc2_in_force, stream)?
+        {
+            return Ok(());
+        }
         if tc3 {
             ops::qsa_prefill_attn_tc3(
                 gpu,
@@ -253,10 +281,7 @@ impl QsaIndexer {
                 stream,
             )?;
         }
-        let tc2 = !tc3
-            && ops::qsa_attn_tc2_enabled()
-            && self.k_prefill_attn_tc2_k.0 != 0
-            && ops::qsa_prefill_attn_tc2_ok(nq, self.nkv_attn, self.hd_attn);
+        let tc2 = tc2_in_force;
         if tc2 {
             ops::qsa_prefill_attn_tc2(
                 gpu,
@@ -307,12 +332,24 @@ impl QsaIndexer {
                 stream,
             )?;
         }
-        let l8 =
-            !tc && matches!(
-                std::env::var("ATLAS_QSA_ATTN_L8").as_deref(),
-                Ok("1") | Ok("true")
-            ) && ops::qsa_prefill_attn_l8_ok(nq, self.nkv_attn, self.hd_attn);
+        // `ATLAS_QSA_ATTN_L8` is refused outright on atlas_scale: the kernel
+        // faults on gfx1151 (winbox p9 gate, 2026-10-06) — see
+        // `ops::qsa_attn_l8_selectable`.
+        let l8_env = std::env::var("ATLAS_QSA_ATTN_L8").ok();
+        let l8 = !tc
+            && ops::qsa_attn_l8_selectable(
+                l8_env.as_deref(),
+                cfg!(atlas_scale),
+                ops::qsa_prefill_attn_l8_ok(nq, self.nkv_attn, self.hd_attn),
+            );
+        let l8_refused = !tc && l8_env.is_some() && !l8 && cfg!(atlas_scale);
         if !PREFILL_ATTN_VARIANT_LOGGED.swap(true, Ordering::Relaxed) {
+            if l8_refused {
+                tracing::warn!(
+                    "ATLAS_QSA_ATTN_L8 refused on this kernel target \
+                     (qsa_prefill_attn_l8 faults on gfx1151)"
+                );
+            }
             let variant = if tc3 {
                 "tc3"
             } else if tc2 {
@@ -359,6 +396,10 @@ impl QsaIndexer {
                 stream,
             )?;
         } else if ops::qsa_prefill_attn_grouped_ok(nq, self.nkv_attn, self.hd_attn) {
+            // ATLAS_QWEN4EXP_PREFILL_QSA_GP: `_g`'s exact twin, rescheduled.
+            if ops::qwen4exp_prefill::try_qsa_prefill_attn_gp(gpu, &slab, stream)? {
+                return Ok(());
+            }
             ops::qsa_prefill_attn_g(
                 gpu,
                 self.k_prefill_attn_g_k,

@@ -14,6 +14,25 @@
 // wire-only for the same reason (PCND: the IR carries exactly what
 // internals read).
 
+/// `max_tokens` of a request that sent none: the rest of the served
+/// context, as vLLM's OpenAI server (`max_model_len - prompt`). Held as this
+/// sentinel until the prompt is tokenized, then [`resolve_max_tokens`].
+/// KV admission reserves the resolved cap (`scheduler/admission.rs`), so a
+/// pool too small for `max_num_seqs` full contexts queues requests unless
+/// `ATLAS_KV_ADMIT_WATERMARK` lets it overcommit (decode-time preemption
+/// then resumes the victims).
+pub const MAX_TOKENS_UNSET: usize = usize::MAX;
+
+/// A request's generation cap once its prompt length is known:
+/// [`MAX_TOKENS_UNSET`] becomes the context left after the prompt.
+pub fn resolve_max_tokens(max_tokens: usize, prompt_len: usize, max_seq_len: usize) -> usize {
+    if max_tokens == MAX_TOKENS_UNSET {
+        max_seq_len.saturating_sub(prompt_len)
+    } else {
+        max_tokens
+    }
+}
+
 /// Provider-agnostic chat request envelope.
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
@@ -25,8 +44,12 @@ pub struct ChatRequest {
     pub tools: Vec<crate::tool_parser::ToolDefinition>,
     pub tool_choice: Option<crate::tool_parser::ToolChoice>,
     pub sampling: SamplingParams,
+    /// Generation cap; [`MAX_TOKENS_UNSET`] until the handler knows the
+    /// prompt length ([`resolve_max_tokens`]).
     pub max_tokens: usize,
     pub min_tokens: usize,
+    /// vLLM `ignore_eos`: model end tokens are ordinary output tokens.
+    pub ignore_eos: bool,
     /// Stop sequences (generation halts when one is produced).
     pub stop: Vec<String>,
     pub stream: bool,
@@ -49,6 +72,11 @@ pub struct ChatRequest {
     /// unset the variable is left undefined so the model template's own
     /// default rules (see `tokenizer/chat_impl.rs`).
     pub preserve_thinking: Option<bool>,
+    /// `chat_template_kwargs.force_nonempty_content` (vLLM deepseek_r1):
+    /// when the model's output is entirely reasoning (unclosed think
+    /// block), return the reasoning text as `content` so the response
+    /// body is never empty. Default false.
+    pub force_nonempty_content: bool,
     /// Per-request token-loop detector override.
     pub repetition_detection: Option<crate::api::inference_types::RepetitionDetectionParams>,
     /// M2 per-request LoRA routing: optional resident adapter NAME for
@@ -79,6 +107,9 @@ pub struct ChatRequest {
     pub timeout_secs: Option<f32>,
     /// Emit sampled token IDs on stream chunks (vLLM extension).
     pub return_token_ids: bool,
+    /// Client conversation id keying SSM snapshot sessions (#209); `None` =
+    /// derive the key from the messages (`session_key`).
+    pub client_session: Option<crate::session_key::ClientSessionId>,
 }
 
 /// Client sampling parameters. `None` = client silent → the server's

@@ -11,6 +11,7 @@
 //
 // Single block, 256 threads. Supports up to 512 experts (2 loads per thread).
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 #define BLOCK_SIZE 256
@@ -27,7 +28,10 @@
 // 2. Block-wide find top-K via parallel warp-shuffle + shared memory reduction
 // 3. Compute softmax over top-K values
 // 4. Write expert_indices and expert_weights
-extern "C" __global__ void moe_topk_softmax(
+//
+// The block body, shared by `moe_topk_softmax` (one token) and
+// `moe_topk_softmax_rows` (a block per token, the same tie-break).
+__device__ __forceinline__ void moe_topk_softmax_block(
     const __nv_bfloat16* __restrict__ gate_logits,  // [num_experts] BF16
     unsigned int* __restrict__ expert_indices,       // [top_k] output
     float* __restrict__ expert_weights,              // [top_k] output
@@ -175,6 +179,42 @@ extern "C" __global__ void moe_topk_softmax(
             }
         }
     }
+}
+
+extern "C" __global__ void moe_topk_softmax(
+    const __nv_bfloat16* __restrict__ gate_logits,  // [num_experts] BF16
+    unsigned int* __restrict__ expert_indices,       // [top_k] output
+    float* __restrict__ expert_weights,              // [top_k] output
+    unsigned int num_experts,
+    unsigned int top_k,
+    unsigned int normalize  // 1 = normalize softmax weights to sum to 1
+) {
+    atlas_pdl_enter();
+    moe_topk_softmax_block(gate_logits, expert_indices, expert_weights, num_experts, top_k,
+                           normalize);
+}
+
+// `moe_topk_softmax` for `gridDim.x` tokens in one launch, a block per token
+// running its exact body (lower-index-wins ties included), so each token's
+// indices and weights are the bytes a launch of `moe_topk_softmax` on that
+// token writes. `moe_topk_softmax_batched` below is not that: on a tie its
+// shuffle and cross-warp reductions keep the candidate already held instead
+// of the lower expert index (ATLAS_QWEN4EXP_BATCH_SMALL).
+//
+// Grid: (N, 1, 1)   Block: (256, 1, 1)
+// gate_logits [N, logits_stride] BF16, expert_indices/_weights [N, top_k].
+extern "C" __global__ void moe_topk_softmax_rows(
+    const __nv_bfloat16* __restrict__ gate_logits,
+    unsigned int* __restrict__ expert_indices,
+    float* __restrict__ expert_weights,
+    unsigned int num_experts,
+    unsigned int top_k,
+    unsigned int normalize,
+    unsigned int logits_stride
+) {
+    const unsigned long long row = blockIdx.x;
+    moe_topk_softmax_block(gate_logits + row * logits_stride, expert_indices + row * top_k,
+                           expert_weights + row * top_k, num_experts, top_k, normalize);
 }
 
 // FP32-input variant of moe_topk_softmax (single token).

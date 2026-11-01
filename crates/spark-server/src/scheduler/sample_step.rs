@@ -96,6 +96,30 @@ pub(super) fn strip_in_tool_opener_bias(
     logit_bias.retain(|&(id, delta)| id != tc_open || delta <= 0.0);
 }
 
+/// Speculative `inside_tool_body` transition for the verify per-row loop —
+/// mirrors the opener/closer rules of `update_tool_param_state` (emit path)
+/// so row i sees the flag serial decode would hold after rows 0..i-1.
+/// Pure over scalars for unit testing; the loop rolls the flag back after
+/// the block, and emit re-advances accepted rows for real.
+pub(super) fn advance_in_tool_flag(
+    inside_thinking: bool,
+    cur: bool,
+    tok: u32,
+    opener: Option<u32>,
+    closer: Option<u32>,
+) -> bool {
+    if inside_thinking {
+        return cur;
+    }
+    if opener == Some(tok) {
+        true
+    } else if closer == Some(tok) {
+        false
+    } else {
+        cur
+    }
+}
+
 /// P1-4 (2026-07-09): the min_p actually handed to the sampler at the sites
 /// that previously passed hardcoded `0.0` literals — the caller's resolved
 /// value (request value, already floored by MODEL.toml `min_p_floor` in
@@ -127,9 +151,12 @@ pub(super) fn effective_min_p(
 ///  * `FinalDecode` → the caller passes the effective `temperature`, the
 ///    per-token `seed` and the base `logit_bias` (`ActiveSeq.logit_bias`,
 ///    cloned) it computed for this step.
-///  * `Verify` → the MTP verify/bootstrap emission is a penalty-aware
-///    greedy ARGMAX, so callers pass `temperature = 0.0`, `seed = None`,
-///    empty base bias.
+///  * `Verify` → the MTP/DFlash verify bootstrap emission is a penalty-aware
+///    greedy ARGMAX, so callers pass `temperature = 0.0`, `seed = None`, and
+///    the sequence's own base bias (`a.logit_bias`) — the same bias vec
+///    FinalDecode would apply at this position. Passing an empty vec used to
+///    suppress the `<tool_call>` opener nudge inside speculative verify and
+///    was the root cause of spec-on != spec-off on tool-call workloads.
 pub(super) fn penalty_params_for(
     a: &ActiveSeq,
     kind: PositionKind,
@@ -137,14 +164,43 @@ pub(super) fn penalty_params_for(
     seed: Option<u64>,
     base_logit_bias: Vec<(u32, f32)>,
 ) -> SamplingParams {
+    penalty_params_for_with_floor(
+        a,
+        kind,
+        temperature,
+        seed,
+        base_logit_bias,
+        min_reasoning_floor(),
+    )
+}
+
+/// The params of a verify or bootstrap position: plain decode's at
+/// temperature 0, the request's `logit_bias` included (verify used to drop
+/// it, so a biased request picked differently speculating than decoding).
+pub(super) fn verify_penalty_params(a: &ActiveSeq) -> SamplingParams {
+    penalty_params_for(a, PositionKind::Verify, 0.0, None, a.logit_bias.clone())
+}
+
+/// Shared parameter construction with the already-resolved model floor.
+/// The production wrapper reads its existing boot-installed value; tests can
+/// exercise another model's policy without changing that process-wide value.
+pub(super) fn penalty_params_for_with_floor(
+    a: &ActiveSeq,
+    kind: PositionKind,
+    temperature: f32,
+    seed: Option<u64>,
+    base_logit_bias: Vec<(u32, f32)>,
+    floor: u32,
+) -> SamplingParams {
     // `Verify` positions are a penalty-aware greedy ARGMAX, so the contract
-    // is temperature 0.0, no seed, no caller-supplied base bias. Pin it so a
-    // future caller can't silently pass stochastic params on the speculative
-    // path. The A4 floor below is appended for BOTH kinds (intended delta).
+    // is temperature 0.0, no seed. The base bias is the sequence's own
+    // (a.logit_bias — must match FinalDecode at the same position). Pin it so
+    // a future caller can't silently pass stochastic params on the
+    // speculative path. The A4 floor below is appended for BOTH kinds
+    // (intended delta).
     debug_assert!(
-        kind != PositionKind::Verify
-            || (temperature == 0.0 && seed.is_none() && base_logit_bias.is_empty()),
-        "Verify positions must pass temperature=0.0, seed=None, empty base bias"
+        kind != PositionKind::Verify || (temperature == 0.0 && seed.is_none()),
+        "Verify positions must pass temperature=0.0, seed=None"
     );
     let in_tool = a.inside_tool_body && !a.inside_thinking;
     let mut logit_bias = base_logit_bias;
@@ -179,7 +235,6 @@ pub(super) fn penalty_params_for(
     // <|im_end|>/<|im_start|> and sampled runs EOS inside think (empty
     // body) or simulate new template turns (measured on qwen4_exp,
     // 2026-08-26, via ATLAS_LOGIT_DUMP).
-    let floor = min_reasoning_floor();
     if floor > 0
         && a.inside_thinking
         && a.thinking_tokens < floor
@@ -355,19 +410,12 @@ pub fn sample_token(
     if temperature == 0.0 {
         // Greedy argmax over FP32.
         //
-        // ★ LAST-WINS on exact ties: `max_by` returns the last of several equal
-        // maxima. The verify path's `argmax_*` kernels resolve ties to the
-        // lowest LANE (see review note 1 on the #23 thread), so at an exact tie
-        // a greedy sample here and a greedy verify pick can differ. Kept as-is
-        // because it matches the record tree — the point of this comment is
-        // that the engine is NOT uniformly first-wins, so a future tie
-        // investigation should not assume it is.
-        let best = f32_logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0);
+        // FIRST-WINS on exact ties: unified with the GPU argmax kernels
+        // (lowest-lane), every verify pick and torch.argmax/vLLM greedy —
+        // BF16 logits tie exactly, and last-wins here made serial decode
+        // emit a different token than verify picked (lossy spec-off != gamma
+        // on tool-call requests, which always take this host path).
+        let best = spark_runtime::sampler::argmax_first_wins_f32(&f32_logits);
         return Ok(best);
     }
     let f32_bytes: &[u8] =
@@ -438,9 +486,15 @@ pub fn sample_token_with_grammar(
     // an argmax that is not in the scoped `history` and has a positive raw
     // logit (proof in `fast_greedy` module docs). `history` here is already
     // the scoped span the slow path feeds to `apply_penalties_and_bias`.
+    // A union's pending branch is chosen by mass over the full row
+    // (`GrammarState::choose_branch`), never by the top token alone.
+    let branch_pending = grammar_state
+        .as_deref()
+        .is_some_and(GrammarState::branch_pending);
     if levers.fast_greedy_grammar
         && suppress_ids.is_empty()
         && (temperature == 0.0 || levers.force_temp_zero)
+        && !branch_pending
     {
         let gate = crate::scheduler::fast_greedy::classify_penalties(penalties);
         if gate != crate::scheduler::fast_greedy::PenaltyGate::Blocked {
@@ -492,21 +546,15 @@ pub fn sample_token_with_grammar(
     // Apply grammar bitmask (when a grammar is active).
     if let Some(gs) = grammar_state {
         gs.fill_bitmask();
+        gs.choose_branch(&f32_logits);
         gs.apply_bitmask_to_logits(&mut f32_logits);
     }
     // SSOT penalties + bias on the post-mask logits, using the seq's
     // output-token history — identical stage to the non-MTP path.
     apply_penalties_and_bias(&mut f32_logits, penalties, history);
     if temperature == 0.0 {
-        // LAST-WINS on exact ties, same as the suppress-ids branch above —
-        // and same caveat: the verify kernels are lowest-lane-wins, so this is
-        // not a shared tie contract across the engine.
-        let best = f32_logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0);
+        // FIRST-WINS — same tie unification as the branch above.
+        let best = spark_runtime::sampler::argmax_first_wins_f32(&f32_logits);
         return Ok(best);
     }
     let f32_bytes: &[u8] =
@@ -589,7 +637,9 @@ pub fn sample_first_token(
     grammar_state: Option<&mut GrammarState>,
     levers: &crate::scheduler::logit_processors::SamplingLevers,
 ) -> Result<u32> {
-    let Some(gs) = grammar_state else {
+    // A strict grammar whose response opens inside `<think>` starts after
+    // `</think>`: this token is reasoning (GrammarState::masks_first_token).
+    let Some(gs) = grammar_state.filter(|gs| gs.masks_first_token()) else {
         return sample_token(
             model,
             logits,
@@ -635,11 +685,14 @@ pub fn sample_first_token(
         &[],
         levers,
     )?;
-    // Advance the matcher past the first token (the emit_step accept_token
-    // only runs for tokens 2..N). A grammar-disallowed first token here would
-    // indicate the mask was not applied — keep going rather than abort; the
-    // emit_step disengage path handles any later desync gracefully.
-    gs.accept_token(tok);
+    // Advance the matcher past the first token (emit_step and the decode loop
+    // accept tokens 2..N). The mask makes a refusal impossible unless it was
+    // bypassed: a strict (response_format) grammar then fails the request like
+    // every other strict refusal; a tool grammar keeps going and the emit-path
+    // disengage handles any later desync.
+    if !gs.accept_token(tok) && gs.is_strict() {
+        anyhow::bail!(crate::scheduler::emit_step::strict_refusal(tok, 0));
+    }
     Ok(tok)
 }
 

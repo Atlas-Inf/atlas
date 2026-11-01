@@ -21,6 +21,27 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.forward_prefill_impl(input, num_tokens, ctx, stream, false)
+    }
+
+    /// Internal entry used by the exact GLM K=5 verifier to leave the shared
+    /// expert blend for the immediately following hyperconnection post-step.
+    /// Normal prefill and every other model always pass `false` through the
+    /// public wrapper above.
+    #[allow(unused_assignments)]
+    pub(super) fn forward_prefill_mode(
+        &self,
+        input: DevicePtr,
+        num_tokens: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+        defer_shared_hc: bool,
+    ) -> Result<()> {
+        self.btile_input_guard(input, num_tokens, ctx, stream)?;
+        anyhow::ensure!(
+            !self.btile_storage.is_published() || self.nvfp4_prequant_moe,
+            "B-tile BF16 grouped reader unsupported"
+        );
         // Native-HIP (gfx1151) has NO ported grouped-GEMM MoE path:
         // moe_fp8_grouped_gemm is a compile stub (kernels/strix-hip/.../
         // moe_fp8_grouped_gemm.cu writes nothing) and the grouped prefill
@@ -84,6 +105,40 @@ impl MoeLayer {
             return self.forward_batched(input, num_tokens, ctx, stream);
         }
 
+        // NVFP4 experts on native HIP: below ATLAS_HIP_MOE_GROUPED_MIN_TOKENS
+        // route to the per-token batched path, like the bf16/fp8 arms above.
+        // cfg gate: NVIDIA byte-unchanged.
+        //
+        // Default 256. It was 1024, from a winbox crossover (2026-09-20) taken when
+        // a grouped call cost ~15 ms nearly flat in N; #155's F16 grouped twins made
+        // it cheap, and the per-token path then cost ~7 s for one 423-row chunk
+        // (one warm agent turn). Cold TTFT, Flash-Next NVFP4, framework gfx1151
+        // Linux, 2026-10-27 (f46), 1024 -> 256: 470 tok 8.36 -> 1.06 s, 649 tok
+        // 11.61 -> 1.30 s; 1035 / 1676 tok unchanged.
+        // Why not lower: 64 also wins below 256 tokens (132 tok 2.50 -> 0.81 s) but
+        // its agentic-webserver runs scored 45/50 and 47/50 webserver_ok, every
+        // failure "no Cargo.toml was written" (f47, f53), against 50/50 at 1024
+        // (f51). 256 scored 49/50 / 50/50 with no such failure, Sigma wall
+        // 15,441 -> 13,049 s and median TTFT 5.08 -> 3.65 s (f57).
+        if cfg!(atlas_hip) {
+            static HIP_NVFP4_GROUPED_MIN_TOKENS: std::sync::OnceLock<usize> =
+                std::sync::OnceLock::new();
+            // Unit tests drive this dispatch through a recording backend and
+            // assert the grouped path (the GB10 dispatch); the production
+            // threshold is a serving choice measured on hardware, so under
+            // cfg(test) the default is 1 (the env var still overrides). With
+            // 1024, six GLM MoE tests failed or hung on HIP builds.
+            let min = *HIP_NVFP4_GROUPED_MIN_TOKENS.get_or_init(|| {
+                std::env::var("ATLAS_HIP_MOE_GROUPED_MIN_TOKENS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(if cfg!(test) { 1 } else { 256 })
+            });
+            if num_tokens < min {
+                return self.forward_batched(input, num_tokens, ctx, stream);
+            }
+        }
+
         // Lazy down_proj transpose: synchronous on the compute stream.
         // (See `kick_off_lazy_transpose` for an attempted overlap path
         // that regressed by 30 % on GB10 — SM contention dominated the
@@ -105,7 +160,7 @@ impl MoeLayer {
         }
 
         let h = ctx.config.hidden_size as u32;
-        let inter = ctx.config.moe_intermediate_size as u32;
+        let inter = ctx.config.routed_inter_local() as u32;
         let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
         let num_experts = ctx.config.num_experts as u32;
         let top_k = ctx.config.num_experts_per_tok as u32;
@@ -141,7 +196,7 @@ impl MoeLayer {
             };
         }
 
-        // ── Shared expert on secondary stream (overlaps with routed path) ──
+        // ── Shared expert ──
         // Shared expert only reads `input` and writes to separate buffers
         // (ssm_deinterleaved, ssm_qkvz, attn_output) — no data conflict
         // with the routed expert path.  In profile mode, run sequentially
@@ -151,22 +206,72 @@ impl MoeLayer {
         // e.g. Qwen3-VL-30B which has no shared_expert_intermediate_size).
         // Launching kernels with N=0 produces CUDA_ERROR_INVALID_VALUE (grid.x=0).
         let has_shared = shared_inter > 0;
-        let use_overlap = false; // disabled: dual-stream contention worsens LPDDR5X bandwidth
-        let aux = if use_overlap {
-            self.prefill_stream
-        } else {
-            stream
+        let is_ep_prefill = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
+        let defer_shared_hc = defer_shared_hc
+            && has_shared
+            && is_ep_prefill
+            && num_tokens == 5
+            && ctx.config.model_type == "glm5_next";
+        // Overlapping shared and routed GEMMs regresses on unified-memory GB10
+        // because both streams compete for LPDDR5X bandwidth. In EP mode there
+        // is a better pairing: defer the shared GEMMs until routed work is done,
+        // then overlap them with the routed-output NCCL all-reduce. Keep graph
+        // capture and profiling sequential; both require deterministic stream
+        // ownership/timing.
+        // Sequence-parallel prefill (`layers::glm_sp`): routed experts run every
+        // row; the shared expert and its blend run only this rank's rows, and
+        // the EP all-reduce becomes a reduce-scatter into them.
+        let sp = crate::layers::glm_sp::current()
+            .filter(|sp| is_ep_prefill && num_tokens == sp.total())
+            .map(|sp| self.q38_sp_rows(sp, h, shared_inter, ctx));
+        // `full_shared` (qwen4_exp): every row, as unsplit; only the blend
+        // takes the local rows (`forward_prefill_finish`).
+        let (shared_in, shared_n) = match sp {
+            Some(sp) if !sp.full_shared => (sp.local(input, h as usize), sp.rows as u32),
+            _ => (input, n),
         };
+        // An MXFP8 shared expert under EP is this rank's slice
+        // (`shared_mxfp8.rs`): its partial over every row joins the routed sum
+        // before the reduce (`split`).
+        let mx_split = has_shared && is_ep_prefill && self.shared_joins_reduce();
+        let overlap_shared_reduce = has_shared
+            && is_ep_prefill
+            && !mx_split
+            && num_tokens > 64
+            && !ctx.graph_capture
+            && !ctx.profile
+            && forward_pair_shared::shared_reduce_overlap_requested();
 
-        if has_shared {
+        // `ATLAS_GLM_SHARED_TP_SPLIT=1`: with rows replicated on both ranks
+        // (decode / verify), each rank computes half the shared expert's
+        // intermediate columns and blends that partial before the EP
+        // all-reduce, which sums the halves; each rank reads half the weights.
+        let split = mx_split
+            || (has_shared
+                && is_ep_prefill
+                && sp.is_none()
+                && !overlap_shared_reduce
+                && !defer_shared_hc
+                && self.shared_split_ready(ctx, n));
+        // Under SP with the reduce-scatter pipe, the shared expert of this
+        // rank's rows runs while that exchange is on the wire
+        // (`forward_prefill_finish`, `defer_shared_to_rs`).
+        let defer_shared =
+            !split && self.defer_shared_to_rs(sp, has_shared, overlap_shared_reduce, h, ctx);
+        if mx_split {
+            // Every row (an SP chunk's too): the slice's partial of each.
+            self.run_shared_expert_prefill(input, n, h, shared_inter, stream, stream, false, ctx)?;
+        } else if split {
+            self.run_shared_split(input, n, h, shared_inter, ctx, stream)?;
+        } else if has_shared && !overlap_shared_reduce && !defer_shared {
             self.run_shared_expert_prefill(
-                input,
-                n,
+                shared_in,
+                shared_n,
                 h,
                 shared_inter,
-                aux,
                 stream,
-                use_overlap,
+                stream,
+                false,
                 ctx,
             )?;
         }
@@ -174,151 +279,55 @@ impl MoeLayer {
 
         // ── Routed expert path on default stream ──
 
-        // Gemma-4 router pre-norm (no-op for other models).
-        let router_in = self.router_input(input, n, h, ctx, stream)?;
-        super::dump::dump_gate_input(ctx.gpu, stream, router_in, n, h)?;
-        // 1. Gate GEMM: [N, H] × [H, num_experts] → [N, num_experts]
+        // ATLAS_GLM_DET_TRACE stages before routing (the rest are in forward_prefill_finish).
+        let det = crate::det_trace::on_stream(ctx.gpu, stream);
+        let (row, route) = (h as usize * 2, top_k as usize * 4);
+        det.tap("moe_in", input, (0, num_tokens), row);
         let gate_logits = ctx.buffers.gate_logits();
-        if let Some(fp8) = self.gate_fp8 {
-            ops::fp8_gemm_n128(
-                ctx.gpu,
-                self.fp8_gemm_k,
-                router_in,
-                fp8,
+        let scratch = ctx.buffers.scratch();
+        let indices_dev = scratch;
+        let weights_dev = scratch.offset(total_expanded as usize * 4);
+        // ATLAS_QWEN4EXP_PREFILL_SP_ROUTE: this rank's rows were routed at the
+        // gather site; gather the peer's (`forward_prefill_route_sp`).
+        let routes = [indices_dev, weights_dev];
+        if !self.take_local_routes(input, num_tokens, routes, ctx, stream)? {
+            // Gemma-4 router pre-norm (no-op for other models).
+            let router_in = self.router_input(input, n, h, ctx, stream)?;
+            super::dump::dump_gate_input(ctx.gpu, stream, router_in, n, h)?;
+            // 1. Gate GEMM: [N, H] × [H, num_experts] → [N, num_experts]
+            self.prefill_gate_gemm(router_in, gate_logits, n, num_experts, h, ctx, stream)?;
+            super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
+            det.tap(
+                "x_gate",
                 gate_logits,
-                n,
-                // = num_experts everywhere except LongCat (zero-expert logits).
-                self.router_logits_n,
-                h,
-                stream,
-            )?;
-        } else if let Some(ref nvfp4) = self.gate_nvfp4 {
-            ops::w4a16_gemm(
-                ctx.gpu,
-                self.w4a16_gemm,
-                router_in,
-                nvfp4,
+                (0, num_tokens),
+                num_experts as usize * 2,
+            );
+            prof_step!("gate_gemm");
+
+            // Feature-1: fold the router (`mlp.gate`) LoRA delta onto the routing
+            // logits BEFORE top-k (reproduces PEFT `mlp.gate`). No-op unless a router
+            // delta is installed (ATLAS_LORA_EXPERTS=1).
+            self.apply_router_lora_prefill(router_in, gate_logits, n, ctx, stream)?;
+
+            // 2. Batched topK dispatch. DeepSeek-V3 / MiniMax-M2 use sigmoid
+            //    + correction bias (detected via `correction_bias_dev`);
+            //    every other model takes the softmax path (no behavior
+            //    change — this is additive).
+            self.prefill_topk(
                 gate_logits,
+                indices_dev,
+                weights_dev,
                 n,
-                self.router_logits_n,
-                h,
-                stream,
-            )?;
-        } else {
-            // Selection numerics — see router_gate_gemm_dense for why this
-            // must stay on the scalar kernel and why ATLAS_CUBLAS_GEMM must
-            // not reroute it either (2026-08-12 BFCL regression: a rerouted
-            // router GEMM flips top-k on borderline tokens deterministically).
-            self.router_gate_gemm_dense(
-                router_in,
-                gate_logits,
-                n,
-                self.router_logits_n,
-                h,
+                num_experts,
+                top_k,
                 ctx,
                 stream,
             )?;
         }
-        super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
-        prof_step!("gate_gemm");
-
-        // Feature-1: fold the router (`mlp.gate`) LoRA delta onto the routing
-        // logits BEFORE top-k (reproduces PEFT `mlp.gate`). No-op unless a router
-        // delta is installed (ATLAS_LORA_EXPERTS=1).
-        self.apply_router_lora_prefill(router_in, gate_logits, n, ctx, stream)?;
-
-        // 2. Batched topK dispatch. DeepSeek-V3 / MiniMax-M2 use sigmoid
-        //    + correction bias (detected via `correction_bias_dev`);
-        //    every other model takes the softmax path (no behavior
-        //    change — this is additive).
-        let scratch = ctx.buffers.scratch();
-        let indices_dev = scratch;
-        let weights_dev = scratch.offset(total_expanded as usize * 4);
-        if let Some(tid2eid) = self.tid2eid_dev {
-            // DeepSeek-V4 hash routing (hash_moe layer): static
-            // `tid2eid[token_id]` selection, sqrtsoftplus-weighted.
-            let token_ids = ctx.token_ids.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "DeepSeek-V4 hash-MoE layer requires ForwardContext.token_ids (prefill grouped)"
-                )
-            })?;
-            ops::moe_hash_route_batched(
-                ctx.gpu,
-                self.moe_hash_route_batched_k,
-                gate_logits,
-                tid2eid,
-                token_ids,
-                indices_dev,
-                weights_dev,
-                num_experts,
-                top_k,
-                ctx.config.norm_topk_prob,
-                ctx.config.routed_scaling_factor as f32,
-                n,
-                stream,
-            )?;
-        } else if let Some(bias) = self.correction_bias_dev {
-            // DeepSeek-V4 scores experts with sqrtsoftplus (NOT sigmoid); the
-            // bias selects experts, weights gather pre-bias scores. Other
-            // sigmoid+bias models (DeepSeek-V3 / MiniMax-M2) keep sigmoid.
-            if ctx.config.scoring_func == "sqrtsoftplus" {
-                ops::moe_topk_sqrtsoftplus_batched(
-                    ctx.gpu,
-                    self.moe_topk_sqrtsoftplus_batched_k,
-                    gate_logits,
-                    bias,
-                    indices_dev,
-                    weights_dev,
-                    num_experts,
-                    top_k,
-                    ctx.config.norm_topk_prob,
-                    ctx.config.routed_scaling_factor as f32,
-                    n,
-                    stream,
-                )?;
-            } else if ctx.config.scoring_func == "softmax" {
-                self.router_softmax_bias_batched(
-                    gate_logits,
-                    bias,
-                    indices_dev,
-                    weights_dev,
-                    num_experts,
-                    top_k,
-                    n,
-                    ctx,
-                    stream,
-                )?;
-            } else {
-                ops::moe_topk_sigmoid_batched(
-                    ctx.gpu,
-                    self.moe_topk_sigmoid_batched_k,
-                    gate_logits,
-                    bias,
-                    indices_dev,
-                    weights_dev,
-                    num_experts,
-                    top_k,
-                    ctx.config.norm_topk_prob,
-                    ctx.config.routed_scaling_factor as f32,
-                    n,
-                    stream,
-                )?;
-            }
-        } else {
-            ops::moe_topk_softmax_batched(
-                ctx.gpu,
-                self.moe_topk_batched,
-                gate_logits,
-                indices_dev,
-                weights_dev,
-                num_experts,
-                top_k,
-                ctx.config.norm_topk_prob,
-                n,
-                stream,
-            )?;
-        }
         super::dump::dump_expert_ids(ctx.gpu, stream, indices_dev, weights_dev, n, top_k)?;
+        det.tap("rt_ids", indices_dev, (0, num_tokens), route);
+        det.tap("rt_w", weights_dev, (0, num_tokens), route);
         prof_step!("topk");
 
         // 3. Sort tokens by expert → L2-optimized ordering.
@@ -387,112 +396,30 @@ impl MoeLayer {
             stream,
         )?;
         let expert_down_out = ctx.buffers.expert_down_out();
-
-        // Feature-1: fold the routed-expert down_proj LoRA deltas onto the sorted
-        // `expert_down_out` BEFORE the unpermute + weighted reduce, so the router
-        // weight multiplies base+delta (PEFT semantics). x = the post-SiLU sorted
-        // activations. No-op unless routed-expert deltas are installed.
-        self.apply_expert_lora_prefill_down(
-            ctx.buffers.expert_gate_out(),
+        self.forward_prefill_finish(
+            input,
             expert_down_out,
             expert_offsets,
             sorted_token_ids,
             total_expanded,
-            ctx,
-            stream,
-        )?;
-
-        // 7. Unpermute + weighted reduce: scatter sorted outputs to token order
-        let output = ctx.buffers.moe_output();
-        ops::moe_unpermute_reduce_indexed(
-            ctx.gpu,
-            self.moe_unpermute_reduce,
-            expert_down_out,
-            output,
             token_to_perm,
+            indices_dev,
             weights_dev,
             h,
             n,
             top_k,
+            num_tokens,
+            has_shared,
+            false,
+            sp,
+            split,
+            overlap_shared_reduce,
+            shared_in,
+            shared_n,
+            defer_shared_hc,
+            ctx,
             stream,
         )?;
-
-        // 8. Blend shared expert: output += sigmoid(dot(input, gate)) * shared
-        // Skip when has_shared == false (no shared expert in this model config).
-        // EP fix: defer shared expert blend until AFTER all-reduce to avoid doubling.
-        let is_ep_prefill = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
-        if has_shared && !is_ep_prefill {
-            let shared_down_out = ctx.buffers.attn_output();
-            if use_overlap {
-                ctx.gpu.stream_wait_event(stream, self.event_b)?;
-            }
-            super::dump::dump_routed_only(ctx.gpu, stream, output, n, h)?;
-            super::dump::dump_shared_out(ctx.gpu, stream, shared_down_out, n, h)?;
-            super::dump::dump_shared_gate(
-                ctx.gpu,
-                stream,
-                input,
-                self.weights.shared_expert_gate.weight,
-                n,
-                h,
-            )?;
-            ops::moe_batched_blend(
-                ctx.gpu,
-                self.moe_batched_blend,
-                output,
-                shared_down_out,
-                input,
-                self.weights.shared_expert_gate.weight,
-                h,
-                n,
-                stream,
-            )?;
-        }
-        super::dump::dump_moe_out(ctx.gpu, stream, output, n, h)?;
-        prof_step!("unpermute_blend");
-
-        // EP all-reduce
-        if let Some(comm) = ctx.comm
-            && ctx.config.ep_world_size > 1
-        {
-            let _t0 = if ctx.profile {
-                ctx.gpu.synchronize(stream)?;
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
-            if ctx.graph_capture {
-                comm.all_reduce(output.0, num_tokens * h as usize * 2)?;
-            } else {
-                comm.all_reduce_async(output.0, num_tokens * h as usize * 2, stream)?;
-            }
-            if let Some(t0) = _t0 {
-                ctx.gpu.synchronize(stream)?;
-                tracing::info!(
-                    "  EP allreduce (moe out) N={}: {}µs",
-                    num_tokens,
-                    t0.elapsed().as_micros(),
-                );
-            }
-            // Add shared expert ONCE after all-reduce (prevents EP doubling)
-            if has_shared {
-                let shared_down_out = ctx.buffers.attn_output();
-                if use_overlap {
-                    ctx.gpu.stream_wait_event(stream, self.event_b)?;
-                }
-                ops::moe_batched_blend(
-                    ctx.gpu,
-                    self.moe_batched_blend,
-                    output,
-                    shared_down_out,
-                    input,
-                    self.weights.shared_expert_gate.weight,
-                    h,
-                    n,
-                    stream,
-                )?;
-            }
-        }
 
         Ok(())
     }

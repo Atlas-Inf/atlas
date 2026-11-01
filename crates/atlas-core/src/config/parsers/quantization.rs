@@ -152,11 +152,26 @@ pub fn parse_quantization_config(raw: &serde_json::Value) -> Option<Quantization
             let Some(algo) = v.get("quant_algo").and_then(|a| a.as_str()) else {
                 continue;
             };
+            let weight_scale_encoding = v
+                .get("weight_scale_encoding")
+                .and_then(|e| e.as_str())
+                .map(str::to_string);
+            let weight_block_size = v
+                .get("weight_block_size")
+                .and_then(|b| b.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|d| d.as_u64().map(|d| d as usize))
+                        .collect()
+                })
+                .unwrap_or_default();
             quantized_layers.insert(
                 k.clone(),
                 QuantLayerSpec {
                     quant_algo: algo.to_string(),
                     group_size: v.get("group_size").and_then(|g| g.as_u64()).unwrap_or(0) as usize,
+                    weight_scale_encoding,
+                    weight_block_size,
                 },
             );
         }
@@ -180,6 +195,15 @@ pub fn parse_quantization_config(raw: &serde_json::Value) -> Option<Quantization
         weight_block_size,
         group_size,
         quantized_layers,
+        // EXL3 carries fields (bits/head_bits/codebook/...) that no other
+        // scheme uses; parse them only for an exl3 block so every other
+        // checkpoint keeps `None` and pays nothing. Case-insensitive to
+        // match `QuantizationConfig::is_exl3`.
+        exl3: qc
+            .get("quant_method")
+            .and_then(Value::as_str)
+            .is_some_and(|m| m.eq_ignore_ascii_case("exl3"))
+            .then(|| super::exl3::parse_exl3_config(qc).map_err(|m| m.to_string())),
     })
 }
 

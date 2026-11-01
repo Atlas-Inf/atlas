@@ -11,87 +11,55 @@ use crate::layer::{
 use crate::layers::FfnComponent;
 
 mod decode_inner;
+mod diag;
 mod multi_seq;
+pub(crate) use multi_seq::{
+    grouped_routed_decode_enabled, grouped_routed_decode_min, pairwise_moe_decode_enabled,
+};
 mod prefill_inner;
+mod prefill_inner_glm;
+pub(super) use diag::diag_norm;
+pub use diag::diag_norm_f32;
 
-/// Debug: read back BF16 GPU tensor and compute L2 norm + first 4 values.
-pub(super) fn diag_norm(
-    gpu: &dyn GpuBackend,
-    ptr: DevicePtr,
-    n_elements: usize,
-    stream: u64,
-    label: &str,
-) {
-    let _ = gpu.synchronize(stream);
-    let mut buf = vec![0u16; n_elements];
-    // SAFETY: `buf` is `vec![0u16; n_elements]` on the line above, so
-    // `buf.len() == n_elements` and `n_elements * 2 == buf.len() *
-    // size_of::<u16>()` — the span is exactly the Vec's buffer, all of it
-    // zero-initialised. `bytes` is the sole reference derived from `buf` while it
-    // is live: it is dead after the `copy_d2h` below, before `buf.iter()` runs.
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, n_elements * 2) };
-    if gpu.copy_d2h(ptr, bytes).is_err() {
-        return;
-    }
-    let vals: Vec<f32> = buf
-        .iter()
-        .map(|&b| f32::from_bits((b as u32) << 16))
-        .collect();
-    let norm: f32 = vals.iter().map(|v| v * v).sum::<f32>().sqrt();
-    let max_abs: f32 = vals.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-    let f4 = if vals.len() >= 4 {
-        format!(
-            "[{:.4},{:.4},{:.4},{:.4}]",
-            vals[0], vals[1], vals[2], vals[3]
-        )
-    } else {
-        format!("{:?}", &vals[..vals.len().min(4)])
-    };
-    tracing::info!("DIAG {label}: norm={norm:.4} max={max_abs:.4} first4={f4} n={n_elements}");
-}
-
-/// Debug: read back FP32 GPU tensor and compute L2 norm + first 4 values.
-/// Used by the DeepSeek-V4 multi-seq decode diagnostic path (post/comb-attn
-/// holographic tensors are FP32). V4-only — no non-V4 caller.
-pub fn diag_norm_f32(
-    gpu: &dyn GpuBackend,
-    ptr: DevicePtr,
-    n_elements: usize,
-    stream: u64,
-    label: &str,
-) {
-    let _ = gpu.synchronize(stream);
-    let mut buf = vec![0f32; n_elements];
-    // SAFETY: `buf` is `vec![0f32; n_elements]` on the line above, so
-    // `buf.len() == n_elements` and `n_elements * 4 == buf.len() *
-    // size_of::<f32>()` — the span is exactly the Vec's buffer, all of it
-    // zero-initialised. `bytes` is the sole reference derived from `buf` while it
-    // is live: it is dead after the `copy_d2h` below, before `buf.iter()` runs.
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, n_elements * 4) };
-    if gpu.copy_d2h(ptr, bytes).is_err() {
-        return;
-    }
-    let norm: f32 = buf.iter().map(|v| v * v).sum::<f32>().sqrt();
-    let max_abs: f32 = buf.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-    let f4 = if buf.len() >= 4 {
-        format!("[{:.4},{:.4},{:.4},{:.4}]", buf[0], buf[1], buf[2], buf[3])
-    } else {
-        format!("{:?}", &buf[..buf.len().min(4)])
-    };
-    tracing::info!(
-        "DIAG {label}: norm={norm:.4} max={max_abs:.4} first4={f4} n={n_elements} (FP32)"
-    );
-}
-
-// The `OnceLock<bool>` static that lived here is now
-// `layers::ops::ModelLevers::gemma4_diag`, resolved when the model is built
-// and carried on `ForwardContext`.
+#[path = "trait_impl/moe_transpose.rs"]
+mod moe_transpose;
+#[path = "trait_impl/state.rs"]
+mod state;
 
 impl TransformerLayer for Qwen3AttentionLayer {
+    fn decode_glm_long_owners(
+        &self,
+        owners: &mut [crate::layer::glm_long_owner::GlmLongOwner<'_>],
+        cache: &mut PagedKvCache,
+        stage: &crate::layer::glm_long_owner::GlmLongStage,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.decode_glm_long_owners_mla(owners, cache, stage, ctx, stream)
+    }
+
+    fn prefill_with_glm_passengers(
+        &self,
+        _hidden: DevicePtr,
+        num_tokens: usize,
+        _state: &mut dyn LayerState,
+        seq_len_start: usize,
+        passengers: &mut [crate::layer::glm_long_owner::GlmLongOwner<'_>],
+        cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.prefill_glm_passengers_mla(num_tokens, seq_len_start, passengers, cache, ctx, stream)
+    }
+
     fn uses_local_mla_prefill(&self) -> bool {
-        self.mla.is_some()
+        // GLM-5 prefill (`prefill_attention_paged_glm_dense`) absorbs Q and
+        // reads the complete paged latent + index history, exactly as chunk 1+
+        // of any long prompt does, so a prefix-cache skip is just a later
+        // chunk start. The other MLA paths attend within the current chunk.
+        self.mla
+            .as_ref()
+            .is_some_and(|mla| mla.glm_indexer.is_none())
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
@@ -104,21 +72,78 @@ impl TransformerLayer for Qwen3AttentionLayer {
             .map(|cal| !cal.is_calibrating())
     }
 
-    /// An indexer vetoes decode-graph capture: its ingest counter is host
-    /// state, its launch parameters depend on the position, the default top-k
-    /// arm sorts on the host — and a graph captured on the dense path would
-    /// replay wrong attention once selection activates.
+    fn supports_mla_kv_only(&self) -> bool {
+        self.mla.as_ref().is_some_and(|mla| mla.rope == 0)
+    }
+
+    fn prefill_mla_kv_only(
+        &self,
+        hidden: DevicePtr,
+        num_tokens: usize,
+        kv_cache: &mut PagedKvCache,
+        slots: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        self.prefill_mla_kv_only_impl(hidden, num_tokens, kv_cache, slots, ctx, stream)
+    }
+
+    /// An indexer vetoes decode-graph capture: host ingest state, position-
+    /// dependent launches, and a dense-path graph replays wrong once it selects.
     fn decode_graph_unsupported(&self) -> bool {
         self.qsa.is_some()
+    }
+
+    /// Inert-step capture (`layers/qsa_staged.rs`): mHC layer, plain BF16 KV,
+    /// device-only metadata, staged ingest; no MLA, adapters or host KV tier.
+    fn qsa_inert_capturable(&self) -> bool {
+        self.qsa_rows_static_ok() && self.lora.is_none()
+    }
+
+    fn qsa_commit_staged(
+        &self,
+        state: &mut dyn LayerState,
+        row: usize,
+        pos: usize,
+        count: usize,
+        pitched: bool,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let qsa = self
+            .qsa
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("qsa_commit_staged without an indexer"))?;
+        let st = super::helpers::qsa_seq_state(qsa, state, gpu)?;
+        qsa.commit_staged_rows(st, row, pos, count, pitched, gpu, stream)
     }
 
     fn has_aux_state(&self) -> bool {
         self.qsa.is_some()
     }
 
-    /// `None` when the batched path can serve an ACTIVE selection per row
-    /// (`multi_seq/qsa_rows.rs`) — the same static allow-list the pre-mutation
-    /// guard applies, so the scheduler and the layer cannot disagree.
+    fn aux_bytes_per_token(&self) -> usize {
+        self.qsa.as_ref().map_or(0, |q| q.bytes_per_token())
+    }
+
+    fn reserve_aux(
+        &self,
+        state: &mut dyn LayerState,
+        tokens: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let Some(qsa) = self.qsa.as_ref() else {
+            return Ok(());
+        };
+        let st = super::helpers::qsa_seq_state(qsa, state, gpu)?;
+        // Callers reserve whole KV blocks; the last one may reach past the
+        // served context, which no position ever will.
+        qsa.reserve(st, tokens.min(qsa.capacity()), gpu, stream)
+    }
+
+    /// `None` when the batched path serves an ACTIVE selection per row
+    /// (`multi_seq/qsa_rows.rs`): the pre-mutation guard's own allow-list.
     fn verify_context_limit(&self) -> Option<usize> {
         if self.qsa_rows_static_ok() {
             return None;
@@ -281,11 +306,12 @@ impl TransformerLayer for Qwen3AttentionLayer {
         )
     }
 
-    /// Q12 Path B: batched-mode attention prefill via `prefill_inner` with
-    /// `batched_meta = Some`. The model-level `prefill_attn_batched_layer`
-    /// calls this method. Per-stream block_table is unused under batched
-    /// mode (block_table_ptrs from batched_meta carries them); we still
-    /// pass an empty Vec to satisfy the signature.
+    fn prefill_multi(&self, pass: &mut crate::layer::MultiPass<'_, '_>) -> Result<()> {
+        self.prefill_multi_hc(pass)
+    }
+
+    /// Q12 Path B: batched prefill via `prefill_inner` with `batched_meta`,
+    /// whose block_table_ptrs replace the per-stream block_table.
     fn prefill_inner_batched_q12(
         &self,
         hidden_stacked: DevicePtr,
@@ -297,20 +323,17 @@ impl TransformerLayer for Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let mut empty_state = EmptyLayerState;
-        let mut empty_block_table: Vec<u32> = Vec::new();
-        let mut empty_disk_block_ids: Vec<u32> = Vec::new();
-        let mut empty_disk_last: Vec<u32> = Vec::new();
         self.prefill_inner(
             hidden_stacked,
             residual_stacked,
             num_tokens,
-            &mut empty_state,
+            // Ported from Enntity/atlas 166e2b1 / 030ec26 (AGPL-3.0-only).
+            &mut EmptyLayerState,
             kv_cache,
             seq_len_start,
-            &mut empty_block_table,
-            &mut empty_disk_block_ids,
-            &mut empty_disk_last,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
             0,
             Some(batched_meta),
             ctx,
@@ -324,7 +347,7 @@ impl TransformerLayer for Qwen3AttentionLayer {
         hidden: DevicePtr,
         residual: DevicePtr,
         num_seqs: usize,
-        _active_seqs: usize,
+        active_seqs: usize,
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
         kv_cache: &mut PagedKvCache,
         seq_lens: &[usize],
@@ -336,6 +359,7 @@ impl TransformerLayer for Qwen3AttentionLayer {
             hidden,
             residual,
             num_seqs,
+            active_seqs,
             states,
             None,
             kv_cache,
@@ -363,6 +387,7 @@ impl TransformerLayer for Qwen3AttentionLayer {
             hidden,
             residual,
             num_rows,
+            num_rows,
             seq_states,
             Some(row_owner),
             kv_cache,
@@ -373,27 +398,22 @@ impl TransformerLayer for Qwen3AttentionLayer {
         )
     }
 
+    fn decode_rows_kv_only(
+        &self,
+        rows: crate::layer::KvRows<'_>,
+        kv: &mut PagedKvCache,
+        ctx: &ForwardContext,
+    ) -> Result<bool> {
+        self.decode_rows_kv_only_inner(rows, kv, ctx)
+    }
+
     fn alloc_state(&self, _gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
         Ok(Box::new(crate::layer::AttnLayerState::default()))
     }
 
-    /// Release the QSA indexer carry: ~2.5 MB per sequence on each of the 12
-    /// full-attention layers, which is the bulk of the ~30 MB per request that
-    /// used to leak (see `TransformerLayer::free_state`).
+    /// Release the per-sequence QSA indexer carry.
     fn free_state(&self, gpu: &dyn GpuBackend, state: &mut dyn LayerState) -> Result<()> {
-        let Some(qsa) = self.qsa.as_ref() else {
-            return Ok(());
-        };
-        let Some(attn) = state
-            .as_any_mut()
-            .downcast_mut::<crate::layer::AttnLayerState>()
-        else {
-            return Ok(());
-        };
-        if let Some(st) = attn.qsa.as_mut() {
-            qsa.free_seq_state(st, gpu)?;
-        }
-        Ok(())
+        state::free_attention_state(self, gpu, state)
     }
 
     fn transpose_moe_for_prefill(
@@ -453,14 +473,15 @@ impl TransformerLayer for Qwen3AttentionLayer {
         &mut self,
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
-    ) -> Result<()> {
+    ) -> Result<Vec<DevicePtr>> {
+        let mut freed = Vec::new();
         if let FfnComponent::Moe(moe) = &mut self.ffn {
-            moe.transpose_for_prefill_unified(gpu, config)?;
+            freed.extend(moe.transpose_for_prefill_unified(gpu, config)?);
         }
         if let Some(FfnComponent::Moe(moe)) = self.moe_ffn.as_mut() {
-            moe.transpose_for_prefill_unified(gpu, config)?;
+            freed.extend(moe.transpose_for_prefill_unified(gpu, config)?);
         }
-        Ok(())
+        Ok(freed)
     }
 
     fn transpose_moe_for_prefill_hybrid(
@@ -468,29 +489,10 @@ impl TransformerLayer for Qwen3AttentionLayer {
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
     ) -> Result<()> {
-        if let FfnComponent::Moe(moe) = &mut self.ffn {
-            moe.transpose_for_prefill_hybrid(gpu, config)?;
-        }
-        if let Some(FfnComponent::Moe(moe)) = self.moe_ffn.as_mut() {
-            moe.transpose_for_prefill_hybrid(gpu, config)?;
-        }
-        Ok(())
+        moe_transpose::transpose_moe_for_prefill_hybrid_inner(self, gpu, config)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use spark_runtime::gpu::mock::MockGpuBackend;
-
-    #[test]
-    fn test_alloc_state_returns_empty() {
-        let gpu = MockGpuBackend::new();
-        assert!(gpu.kernel("norm", "rms_norm").is_ok());
-        assert!(gpu.kernel("rope", "rope_forward").is_ok());
-        assert!(
-            gpu.kernel("paged_decode_fp8", "paged_decode_attn_fp8")
-                .is_ok()
-        );
-    }
-}
+#[path = "trait_impl/state_tests.rs"]
+mod tests;

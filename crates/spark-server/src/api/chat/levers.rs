@@ -45,6 +45,13 @@ pub struct ChatLevers {
     /// family whose native tool syntax plausibly appears in legitimate
     /// reasoning.
     pub in_think_leak_openers: u32,
+    /// MODEL.toml `[behavior] enable_stream_loop_guards` (default true) —
+    /// arm the stream's SimHash sentence-repeat and token-loop guards,
+    /// which end the response on a detected loop.
+    pub stream_loop_guards: bool,
+    /// MODEL.toml `[behavior] verbatim_prompt` — the client's conversation
+    /// reaches the template unedited (`ModelBehavior::verbatim_prompt`).
+    pub verbatim_prompt: bool,
 }
 
 impl Default for ChatLevers {
@@ -67,25 +74,26 @@ impl ChatLevers {
         disable_cwd_hint_injection: false,
         // 1 = cancel on the first opener, the pre-knob behaviour.
         in_think_leak_openers: 1,
+        // Armed, the historical behaviour.
+        stream_loop_guards: true,
+        verbatim_prompt: false,
     };
 
     /// Resolve from the environment plus this model's `[behavior]` table.
     /// Called once, when the server's `AppState` is built.
-    pub fn resolve(
-        tscg: bool,
-        template_owns_tool_definitions: bool,
-        disable_cwd_hint_injection: bool,
-    ) -> Self {
+    pub fn resolve(b: &atlas_kernels::ModelBehavior) -> Self {
         Self {
-            prompt: PromptLevers::new(tscg, template_owns_tool_definitions),
+            prompt: PromptLevers::new(b.tscg, b.template_owns_tool_definitions),
             bash_wander: std::env::var("ATLAS_BASH_WANDER_WATCHDOG").as_deref() == Ok("1"),
             phase_timing: std::env::var("ATLAS_CHAT_PHASE_TIMING").as_deref() == Ok("1"),
-            disable_cwd_hint_injection,
+            disable_cwd_hint_injection: b.disable_cwd_hint_injection,
             in_think_leak_openers: in_think_leak_openers_from(
                 std::env::var("ATLAS_INTHINK_TOOL_LEAK_OPENERS")
                     .ok()
                     .as_deref(),
             ),
+            stream_loop_guards: b.enable_stream_loop_guards,
+            verbatim_prompt: b.verbatim_prompt,
         }
     }
 }
@@ -132,12 +140,45 @@ mod tests {
     fn the_model_behavior_reaches_the_renderer() {
         // `resolve` reads the env for diagnostics but takes prompt decisions
         // from the caller because they are MODEL.toml state.
-        assert!(ChatLevers::resolve(true, false, false).prompt.tscg);
+        let resolve = |b: atlas_kernels::ModelBehavior| ChatLevers::resolve(&b);
+        let off = atlas_kernels::ModelBehavior::default;
         assert!(
-            ChatLevers::resolve(false, true, false)
-                .prompt
-                .template_owns_tool_definitions
+            resolve(atlas_kernels::ModelBehavior {
+                tscg: true,
+                ..off()
+            })
+            .prompt
+            .tscg
         );
-        assert!(ChatLevers::resolve(false, false, true).disable_cwd_hint_injection);
+        assert!(
+            resolve(atlas_kernels::ModelBehavior {
+                template_owns_tool_definitions: true,
+                ..off()
+            })
+            .prompt
+            .template_owns_tool_definitions
+        );
+        assert!(
+            resolve(atlas_kernels::ModelBehavior {
+                disable_cwd_hint_injection: true,
+                ..off()
+            })
+            .disable_cwd_hint_injection
+        );
+        assert!(
+            !resolve(atlas_kernels::ModelBehavior {
+                enable_stream_loop_guards: false,
+                ..off()
+            })
+            .stream_loop_guards
+        );
+        assert!(
+            resolve(atlas_kernels::ModelBehavior {
+                verbatim_prompt: true,
+                ..off()
+            })
+            .verbatim_prompt
+        );
+        const _: () = assert!(ChatLevers::OFF.stream_loop_guards);
     }
 }

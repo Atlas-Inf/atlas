@@ -11,6 +11,9 @@ use super::*;
 pub struct StreamingToolDetector {
     pub(super) buffer: String,
     pub(super) inside_tag: bool,
+    /// Exact opener retained so a non-call XML mention can be returned as
+    /// content byte-for-byte, including namespaced/native opener variants.
+    pub(super) current_tag_open: Option<String>,
     pub(super) inside_dsml: bool,
     /// Whether a bare identifier inside `<tool_call>` is a legitimate
     /// zero-argument call (Poolside v1 only — see
@@ -49,6 +52,9 @@ pub struct StreamingToolDetector {
     /// the current call — tells the close branch to emit only the residual
     /// (closing `}` / backfill / JSON tail) instead of the full args.
     pub(super) incremental_emitted: bool,
+    /// Lexical context for content already emitted by the detector. XML-looking
+    /// markers inside code or quotes remain content and update this state.
+    pub(super) literal_xml_state: crate::literal_xml::LiteralXmlState,
 }
 
 pub enum DetectorOutput {
@@ -78,8 +84,34 @@ pub enum DetectorOutput {
 }
 
 impl StreamingToolDetector {
+    /// Unreleased raw tool syntax, for the API's bounded tool-call guard.
+    pub fn pending_tool_bytes(&self) -> usize {
+        if self.inside_tag || self.inside_dsml || self.current_tc_name.is_some() {
+            self.buffer.len()
+        } else {
+            0
+        }
+    }
+
+    pub(super) fn push_content(&mut self, outputs: &mut Vec<DetectorOutput>, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        self.literal_xml_state.feed(&text);
+        outputs.push(DetectorOutput::Content(text));
+    }
+
+    pub(super) fn marker_is_literal(&self, position: usize) -> bool {
+        let mut state = self.literal_xml_state;
+        state.feed(&self.buffer[..position]);
+        state.is_literal()
+    }
+
     pub(super) fn has_partial_tool_opener(&self) -> bool {
-        !self.buffer.is_empty()
+        // Whitespace is retained until an ambiguous opener is identified.
+        // It must not hide the pending protocol prefix from role-word guards.
+        let pending = self.buffer.trim_start();
+        !pending.is_empty()
             && [
                 "<tool_call>",
                 "<|tool_call>",
@@ -88,13 +120,45 @@ impl StreamingToolDetector {
                 DSML_OPEN,
             ]
             .iter()
-            .any(|tag| tag.starts_with(&self.buffer))
+            .any(|tag| tag.starts_with(pending))
+    }
+
+    pub(super) fn find_tool_opener(&self) -> Option<(usize, usize)> {
+        self.buffer
+            .find("<tool_call>")
+            .map(|p| (p, "<tool_call>".len()))
+            .or_else(|| {
+                self.buffer
+                    .find("<|tool_call>")
+                    .map(|p| (p, "<|tool_call>".len()))
+            })
+            .or_else(|| {
+                self.buffer
+                    .find("<minimax:tool_call>")
+                    .map(|p| (p, "<minimax:tool_call>".len()))
+            })
+            .or_else(|| {
+                self.buffer
+                    .find("<minimax:_call>")
+                    .map(|p| (p, "<minimax:_call>".len()))
+            })
+    }
+
+    pub(super) fn is_registered_tool(&self, name: &str) -> bool {
+        self.tools.is_empty() || self.tools.iter().any(|tool| tool.function.name == name)
     }
 }
 
 /// Extract function name from partial tool call buffer for incremental streaming.
-/// Handles Hermes JSON, Qwen3-Coder XML, Gemma-4, and Mistral native formats.
-pub(super) fn extract_streaming_name(buffer: &str) -> Option<String> {
+/// Handles Poolside v1, Hermes JSON, Qwen3-Coder XML, Gemma-4, and Mistral native.
+pub(super) fn extract_streaming_name(buffer: &str, poolside: bool) -> Option<String> {
+    // The detector has already removed <tool_call>. In Poolside mode the
+    // leading name is complete only when <arg_key> arrives. Never scan a
+    // nested JSON value for a Hermes "name" field in this mode.
+    if poolside {
+        let end = buffer.find("<arg_key>")?;
+        return poolside_v1_name(&buffer[..end]);
+    }
     // Mistral native: [TOOL_CALLS]NAME[ARGS]
     if let Some(start) = buffer.find(MISTRAL_TOOL_CALLS_TAG) {
         let after = &buffer[start + MISTRAL_TOOL_CALLS_TAG.len()..];

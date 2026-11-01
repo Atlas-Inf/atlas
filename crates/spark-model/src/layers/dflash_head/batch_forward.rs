@@ -5,13 +5,40 @@
 //! The caller owns admission and cache-readiness gates. This method mirrors the
 //! serial layer operation order and leaves the next layer input in
 //! `batch_query_embed`; final logits/Markov and returned drafts remain serial.
+//! The layer runs as four pieces in order (attention, projection, MLP,
+//! residual) so the rank-split batched propose (`rank_split_batch`) can put
+//! its swaps around the MLP.
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 
-use super::BlockDiffusionDraftHead;
+use super::{BlockDiffusionDraftHead, DflashLayer};
+use crate::layer::ForwardContext;
+
+/// One batched propose's per-layer arguments.
+#[derive(Clone, Copy)]
+pub(super) struct BatchLayerArgs<'a> {
+    pub batch_rows: u32,
+    pub batch_size: u32,
+    pub max_kv_len: u32,
+    pub serial_block_tables: Option<&'a [u64]>,
+    pub serial_attention_args: Option<DevicePtr>,
+    pub ctx: &'a ForwardContext<'a>,
+    pub stream: u64,
+}
+
+/// A layer's widths and the batch's element counts.
+struct BatchDims {
+    hidden: u32,
+    q_dim: u32,
+    kv_dim: u32,
+    intermediate: u32,
+    hidden_elements: u32,
+    mlp_elements: u32,
+}
 
 impl BlockDiffusionDraftHead {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn run_batched_layer_stage(
         &self,
         layer_idx: usize,
@@ -19,10 +46,30 @@ impl BlockDiffusionDraftHead {
         batch_size: u32,
         max_kv_len: u32,
         serial_block_tables: Option<&[u64]>,
-        serial_attention_args: Option<spark_runtime::gpu::DevicePtr>,
-        ctx: &crate::layer::ForwardContext,
+        serial_attention_args: Option<DevicePtr>,
+        ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        let a = BatchLayerArgs {
+            batch_rows,
+            batch_size,
+            max_kv_len,
+            serial_block_tables,
+            serial_attention_args,
+            ctx,
+            stream,
+        };
+        self.batched_attention(layer_idx, &a)?;
+        self.batched_project(layer_idx, &a)?;
+        self.batched_mlp(layer_idx, &a)?;
+        self.batched_residual(layer_idx, &a)
+    }
+
+    fn batched_layer(
+        &self,
+        layer_idx: usize,
+        batch_rows: u32,
+    ) -> Result<(&DflashLayer, BatchDims)> {
         let layer = self
             .layers
             .get(layer_idx)
@@ -41,7 +88,37 @@ impl BlockDiffusionDraftHead {
         let mlp_elements = batch_rows
             .checked_mul(intermediate)
             .ok_or_else(|| anyhow::anyhow!("DFlash batch MLP elements overflow"))?;
+        let dims = BatchDims {
+            hidden,
+            q_dim,
+            kv_dim,
+            intermediate,
+            hidden_elements,
+            mlp_elements,
+        };
+        Ok((layer, dims))
+    }
 
+    /// Input norm through attention, leaving the attention rows in `batch_attn_out`.
+    pub(super) fn batched_attention(&self, layer_idx: usize, a: &BatchLayerArgs) -> Result<()> {
+        let BatchLayerArgs {
+            batch_rows,
+            batch_size,
+            max_kv_len,
+            serial_block_tables,
+            serial_attention_args,
+            ctx,
+            stream,
+        } = *a;
+        let (
+            layer,
+            BatchDims {
+                hidden,
+                q_dim,
+                kv_dim,
+                ..
+            },
+        ) = self.batched_layer(layer_idx, batch_rows)?;
         crate::layers::ops::rms_norm(
             ctx.gpu,
             self.kernels.rms_norm,
@@ -56,11 +133,13 @@ impl BlockDiffusionDraftHead {
         if let Some(ref conv) = layer.attention_conv {
             self.staged_conv_prepare(conv, self.batch_norm, batch_size, hidden, ctx, stream)?;
         }
-        for (weight, fp8, nvfp4, output, width) in [
+        let mx = layer.mx.as_ref();
+        for (weight, fp8, nvfp4, mx, output, width) in [
             (
                 &layer.q_proj,
                 &layer.q_proj_fp8,
                 &layer.q_proj_nvfp4,
+                mx.map(|mx| &mx.q_proj),
                 self.batch_q,
                 q_dim,
             ),
@@ -68,6 +147,7 @@ impl BlockDiffusionDraftHead {
                 &layer.k_proj,
                 &layer.k_proj_fp8,
                 &layer.k_proj_nvfp4,
+                None,
                 self.batch_k,
                 kv_dim,
             ),
@@ -75,6 +155,7 @@ impl BlockDiffusionDraftHead {
                 &layer.v_proj,
                 &layer.v_proj_fp8,
                 &layer.v_proj_nvfp4,
+                None,
                 self.batch_v,
                 kv_dim,
             ),
@@ -85,6 +166,7 @@ impl BlockDiffusionDraftHead {
                 weight,
                 fp8,
                 nvfp4,
+                mx,
                 output,
                 width,
                 hidden,
@@ -188,12 +270,35 @@ impl BlockDiffusionDraftHead {
             ctx,
             stream,
         )?;
+        Ok(())
+    }
+
+    /// o_proj, the attention residual and the MLP input norm into `batch_norm`.
+    pub(super) fn batched_project(&self, layer_idx: usize, a: &BatchLayerArgs) -> Result<()> {
+        let BatchLayerArgs {
+            batch_rows,
+            batch_size,
+            ctx,
+            stream,
+            ..
+        } = *a;
+        let (
+            layer,
+            BatchDims {
+                hidden,
+                q_dim,
+                hidden_elements,
+                ..
+            },
+        ) = self.batched_layer(layer_idx, batch_rows)?;
+        let mx = layer.mx.as_ref();
         self.run_staged_projection(
             batch_size,
             self.batch_attn_out,
             &layer.o_proj,
             &layer.o_proj_fp8,
             &layer.o_proj_nvfp4,
+            mx.map(|mx| &mx.o_proj),
             self.batch_attn_proj,
             hidden,
             q_dim,
@@ -225,17 +330,40 @@ impl BlockDiffusionDraftHead {
         if let Some(ref conv) = layer.mlp_conv {
             self.staged_conv_prepare(conv, self.batch_norm, batch_size, hidden, ctx, stream)?;
         }
-        for (weight, fp8, nvfp4, output) in [
+        Ok(())
+    }
+
+    /// Gate/up, SiLU and down into `batch_mlp_down`.
+    pub(super) fn batched_mlp(&self, layer_idx: usize, a: &BatchLayerArgs) -> Result<()> {
+        let BatchLayerArgs {
+            batch_size,
+            ctx,
+            stream,
+            ..
+        } = *a;
+        let (
+            layer,
+            BatchDims {
+                hidden,
+                intermediate,
+                mlp_elements,
+                ..
+            },
+        ) = self.batched_layer(layer_idx, a.batch_rows)?;
+        let mx = layer.mx.as_ref();
+        for (weight, fp8, nvfp4, mx, output) in [
             (
                 &layer.gate_proj,
                 &layer.gate_proj_fp8,
                 &layer.gate_proj_nvfp4,
+                mx.map(|mx| &mx.gate_proj),
                 self.batch_mlp_gate,
             ),
             (
                 &layer.up_proj,
                 &layer.up_proj_fp8,
                 &layer.up_proj_nvfp4,
+                mx.map(|mx| &mx.up_proj),
                 self.batch_mlp_up,
             ),
         ] {
@@ -245,6 +373,7 @@ impl BlockDiffusionDraftHead {
                 weight,
                 fp8,
                 nvfp4,
+                mx,
                 output,
                 intermediate,
                 hidden,
@@ -267,12 +396,32 @@ impl BlockDiffusionDraftHead {
             &layer.down_proj,
             &layer.down_proj_fp8,
             &layer.down_proj_nvfp4,
+            mx.map(|mx| &mx.down_proj),
             self.batch_mlp_down,
             hidden,
             intermediate,
             ctx,
             stream,
         )?;
+        Ok(())
+    }
+
+    /// The MLP residual into `batch_query_embed`.
+    pub(super) fn batched_residual(&self, layer_idx: usize, a: &BatchLayerArgs) -> Result<()> {
+        let BatchLayerArgs {
+            batch_size,
+            ctx,
+            stream,
+            ..
+        } = *a;
+        let (
+            layer,
+            BatchDims {
+                hidden,
+                hidden_elements,
+                ..
+            },
+        ) = self.batched_layer(layer_idx, a.batch_rows)?;
         if let Some(ref conv) = layer.mlp_conv {
             self.staged_conv_finish(conv, self.batch_mlp_down, batch_size, hidden, ctx, stream)?;
         }
@@ -284,207 +433,5 @@ impl BlockDiffusionDraftHead {
             hidden_elements,
             stream,
         )
-    }
-
-    /// Stage final norm, shared LM head, and unbiased per-row argmax. The token
-    /// buffer is consumed only by the forthcoming batch-wide Markov stage.
-    pub(super) fn run_batched_tail_base(
-        &self,
-        batch_rows: u32,
-        ctx: &crate::layer::ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        let hidden = u32::try_from(self.hidden_size)
-            .map_err(|_| anyhow::anyhow!("DFlash hidden width exceeds u32"))?;
-        let vocab = u32::try_from(self.vocab_size)
-            .map_err(|_| anyhow::anyhow!("DFlash vocab exceeds u32"))?;
-        crate::layers::ops::rms_norm(
-            ctx.gpu,
-            self.kernels.rms_norm,
-            self.batch_query_embed,
-            &self.norm,
-            self.batch_norm,
-            batch_rows,
-            hidden,
-            self.rms_norm_eps,
-            stream,
-        )?;
-        if let Some(fp8) = self
-            .lm_head_shared_fp8
-            .as_ref()
-            .filter(|_| matches!(self.quant, super::DflashQuantization::Fp8Weights))
-        {
-            crate::layers::ops::fp8_gemm_n128_row_scaled(
-                ctx.gpu,
-                self.kernels.fp8_gemm_n128_row_scaled,
-                self.batch_norm,
-                fp8,
-                self.batch_logits,
-                batch_rows,
-                vocab,
-                hidden,
-                stream,
-            )?;
-        } else if let Some(nvfp4) = self.lm_head_nvfp4.as_ref() {
-            let kernel = super::batched_ctx::nvfp4_lm_head_wave_kernel(
-                batch_rows,
-                self.kernels.w4a16_gemv_batch4,
-                self.kernels.w4a16_gemv_batch8,
-                self.kernels.w4a16_gemv_batch16,
-            );
-            if kernel.0 != 0 {
-                let mut row = 0u32;
-                while row < batch_rows {
-                    let rows = (batch_rows - row).min(16);
-                    crate::layers::ops::w4a16_gemv_batchm(
-                        ctx.gpu,
-                        kernel,
-                        self.batch_norm.offset(row as usize * hidden as usize * 2),
-                        nvfp4,
-                        self.batch_logits.offset(row as usize * vocab as usize * 2),
-                        rows,
-                        vocab,
-                        hidden,
-                        stream,
-                    )?;
-                    row += rows;
-                }
-            } else if self.startup.native_batch_authoritative {
-                anyhow::bail!(
-                    "Lightning DSpark exact NVFP4 LM-head batch kernel is unresolved for rows={batch_rows}; batch4/8/16 with <=16-row waves is mandatory"
-                );
-            } else {
-                anyhow::ensure!(
-                    self.kernels.w4a16_gemm.0 != 0,
-                    "DFlash batched NVFP4 LM head kernel is unresolved"
-                );
-                crate::layers::ops::w4a16_gemm(
-                    ctx.gpu,
-                    self.kernels.w4a16_gemm,
-                    self.batch_norm,
-                    nvfp4,
-                    self.batch_logits,
-                    batch_rows,
-                    vocab,
-                    hidden,
-                    stream,
-                )?;
-            }
-        } else {
-            crate::layers::ops::dense_gemm_bf16_pipelined(
-                ctx.gpu,
-                self.kernels.dense_gemm_pipelined,
-                self.batch_norm,
-                &crate::weight_map::DenseWeight {
-                    weight: self.lm_head_shared,
-                },
-                self.batch_logits,
-                batch_rows,
-                vocab,
-                hidden,
-                stream,
-            )?;
-        }
-        crate::layers::ops::argmax_bf16_batch(
-            ctx.gpu,
-            self.kernels.argmax_batch,
-            self.batch_logits,
-            self.batch_tokens,
-            vocab,
-            batch_rows,
-            vocab,
-            stream,
-        )
-    }
-
-    /// Apply DSpark Markov bias depth-serial and batch-wide. Row 0 remains the
-    /// unbiased anchor; rows 1..gamma are overwritten in `batch_tokens`.
-    pub(super) fn run_batched_markov(
-        &self,
-        batch_size: u32,
-        ctx: &crate::layer::ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        if self.markov_rank == 0 {
-            return Ok(());
-        }
-        let (w1, w2) = self
-            .markov_w1
-            .as_ref()
-            .zip(self.markov_w2.as_ref())
-            .ok_or_else(|| anyhow::anyhow!("DFlash batched Markov weights are missing"))?;
-        anyhow::ensure!(
-            !self.batch_markov_embed.is_null() && !self.batch_markov_bias.is_null(),
-            "DFlash batched Markov scratch is null"
-        );
-        let rank = u32::try_from(self.markov_rank)
-            .map_err(|_| anyhow::anyhow!("DFlash Markov rank exceeds u32"))?;
-        let vocab = u32::try_from(self.vocab_size)
-            .map_err(|_| anyhow::anyhow!("DFlash vocab exceeds u32"))?;
-        let gamma =
-            u32::try_from(self.gamma).map_err(|_| anyhow::anyhow!("DFlash gamma exceeds u32"))?;
-        let row_stride = gamma
-            .checked_mul(vocab)
-            .ok_or_else(|| anyhow::anyhow!("DFlash Markov row stride overflow"))?;
-        for depth in 1..self.gamma {
-            crate::layers::ops::batched_embed(
-                ctx.gpu,
-                self.kernels.batched_embed,
-                self.batch_markov_prev,
-                w1.weight,
-                self.batch_markov_embed,
-                batch_size,
-                rank,
-                stream,
-            )?;
-            crate::layers::ops::dense_gemv_batchm(
-                ctx.gpu,
-                self.kernels.dense_gemv_batchm,
-                self.batch_markov_embed,
-                w2,
-                self.batch_markov_bias,
-                batch_size,
-                vocab,
-                rank,
-                vocab,
-                stream,
-            )?;
-            crate::layers::ops::dflash_batch_add_depth_bias(
-                ctx.gpu,
-                self.kernels.batch_markov_add_bias,
-                self.batch_logits,
-                self.batch_markov_bias,
-                batch_size,
-                gamma,
-                vocab,
-                depth as u32,
-                stream,
-            )?;
-            let logits_offset = depth
-                .checked_mul(self.vocab_size)
-                .and_then(|elements| elements.checked_mul(2))
-                .ok_or_else(|| anyhow::anyhow!("DFlash Markov logits offset overflow"))?;
-            crate::layers::ops::argmax_bf16_batch(
-                ctx.gpu,
-                self.kernels.argmax_batch,
-                self.batch_logits.offset(logits_offset),
-                self.batch_markov_prev,
-                vocab,
-                batch_size,
-                row_stride,
-                stream,
-            )?;
-            crate::layers::ops::dflash_batch_store_depth_tokens(
-                ctx.gpu,
-                self.kernels.batch_markov_store_tokens,
-                self.batch_tokens,
-                self.batch_markov_prev,
-                batch_size,
-                gamma,
-                depth as u32,
-                stream,
-            )?;
-        }
-        Ok(())
     }
 }

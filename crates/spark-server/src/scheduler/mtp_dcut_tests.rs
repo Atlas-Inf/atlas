@@ -257,3 +257,67 @@ fn below_the_gate_the_pairing_is_legacy_but_the_pruning_is_kept() {
     assert_ne!(c_paired, paired);
     assert_eq!(c_depths.iter().sum::<usize>(), 7);
 }
+
+/// A sequence's drafts cap its depth: the confidence stop leaves fewer than
+/// the ladder depth, a decode row riding the verify holds none.
+#[test]
+fn capped_select_never_deepens_past_the_drafts_held() {
+    let c: Vec<Vec<f32>> = vec![vec![-0.01, -0.01, -0.01]; 3];
+    let refs: Vec<&[f32]> = c.iter().map(|v| v.as_slice()).collect();
+    assert_eq!(
+        select_capped(&refs, &[3, 1, 0], VERIFY_ROW_BUDGET, 1.0),
+        vec![3, 1, 0]
+    );
+    // Ratio 0.75 over the 2 rankable positions (the full sequence's depths
+    // 2 and 3) keeps round(1.5) = 2: nothing is pruned, nothing is invented.
+    assert_eq!(
+        select_capped(&refs, &[3, 1, 0], VERIFY_ROW_BUDGET, 0.75),
+        vec![3, 1, 0]
+    );
+}
+
+#[test]
+fn capped_select_at_uniform_caps_is_select() {
+    let c = [
+        vec![-0.01f32, -6.0, -7.0],
+        vec![-0.01f32, -0.02, -4.0],
+        vec![-0.01f32, -0.02, -0.03],
+    ];
+    let refs: Vec<&[f32]> = c.iter().map(|v| v.as_slice()).collect();
+    for ratio in [0.25, 0.5, 0.75, 1.0] {
+        assert_eq!(
+            select_capped(&refs, &[3, 3, 3], VERIFY_ROW_BUDGET, ratio),
+            select(&refs, 3, VERIFY_ROW_BUDGET, ratio)
+        );
+    }
+}
+
+/// Canonical pairing moves the deepest row count onto the lowest slot. When
+/// that slot's sequence holds fewer drafts, the pairing is not a prefix of
+/// its drafts: the batch keeps each sequence's own depth instead.
+#[test]
+fn a_cap_the_canonical_pairing_would_break_keeps_own_depths() {
+    // Slot 0 holds one draft, slot 1 three.
+    let (order, ks, canonical) = assign(&[0, 1], &[1, 3], &[1, 3], true);
+    assert!(!canonical);
+    assert_eq!(order, vec![1, 0], "deepest first");
+    assert_eq!(ks, vec![4, 2]);
+    // Caps that admit the pairing keep it.
+    let (order, ks, canonical) = assign(&[0, 1], &[3, 3], &[1, 3], true);
+    assert!(canonical);
+    assert_eq!(order, vec![0, 1]);
+    assert_eq!(ks, vec![4, 2]);
+}
+
+/// A decode row (no drafts) is one row wherever it lands.
+#[test]
+fn a_decode_row_is_planned_at_one_row() {
+    let (_, ks, canonical) = assign(&[0, 1], &[3, 0], &[3, 0], true);
+    assert!(canonical);
+    assert_eq!(ks, vec![4, 1]);
+    // On the lower slot the canonical pairing would hand it four rows.
+    let (order, ks, canonical) = assign(&[1, 0], &[3, 0], &[3, 0], true);
+    assert!(!canonical);
+    assert_eq!((order, ks), (vec![0, 1], vec![4, 1]));
+    assert_eq!(chunk_ranges(&[4, 2, 1]), vec![(0, 3)], "one chunk");
+}

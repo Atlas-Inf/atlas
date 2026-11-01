@@ -33,7 +33,11 @@ fn loop_suppress_disabled() -> bool {
     std::env::var("ATLAS_LOOP_NO_SUPPRESS").as_deref() == Ok("1")
 }
 
-pub(super) fn check_loops(messages: &[Message], tools_active: bool) -> LoopDetectOut {
+pub(super) fn check_loops(
+    messages: &[Message],
+    tools_active: bool,
+    repeat_run: usize,
+) -> LoopDetectOut {
     let mut suppress_tool_call = false;
     let mut tool_call_repeat_count: usize = 0;
 
@@ -268,11 +272,33 @@ pub(super) fn check_loops(messages: &[Message], tools_active: bool) -> LoopDetec
     }
 
     if spinning {
-        tracing::warn!(
+        // Enntity/atlas 8150f896 + e2fcc5cd (#55): short-prose history is
+        // diagnostic only — never hard-masks <tool_call> and no longer
+        // biases it either (client-supplied history is not provenance;
+        // suppressing/biasing before the model's first call creates the
+        // loop it exists to prevent). Suppress keeps its P1-5 hard mask
+        // (failing/progressing carve-outs).
+        tracing::debug!(
             recent_short,
-            "Spinning detection fired — suppressing <tool_call>"
+            "Short prose history detected; tool availability unchanged"
         );
-        suppress_tool_call = !loop_suppress_disabled();
+    }
+
+    // An identical call answered by an identical result got a repeat
+    // notice and a deeper thinking turn (`prepare.rs`). Keep `<tool_call>`
+    // open and unbiased so the model can act on it: masked, it narrates the
+    // action it cannot take (omp, 2026-10-12: 756 tokens of one paragraph).
+    if repeat_run >= crate::hint_injector::REPEAT_NOTICE_MIN_RUN
+        && (suppress_tool_call || tool_call_repeat_count >= 2)
+    {
+        tracing::warn!(
+            repeat_run,
+            suppress_tool_call,
+            tool_call_repeat_count,
+            "Loop detector → identical repeat: repeat notice instead of <tool_call> mask/bias"
+        );
+        suppress_tool_call = false;
+        tool_call_repeat_count = 0;
     }
 
     LoopDetectOut {

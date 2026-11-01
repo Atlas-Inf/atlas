@@ -139,6 +139,19 @@ impl PleLayer {
                 let (h0, m0, _) = cache.stats();
                 let t0 = std::time::Instant::now();
                 cache.resolve(ids, &mut slots)?;
+                if let Some(spec) = &self.trellis {
+                    let mut raws = Vec::with_capacity(slots.len());
+                    for &slot in &slots {
+                        raws.push(cache.copy_slot(slot)?);
+                    }
+                    let decoded = super::ngram_trellis::decode_rows_bf16(spec, ids, &raws)
+                        .map_err(|e| anyhow::anyhow!("PLE: ngram trellis dequant: {e:#}"))?;
+                    gpu.copy_h2d_async(&decoded, self.emb, stream)?;
+                    // `decoded` is a temporary. Sync before it drops, and so a
+                    // CUDA-graph replay (which must not overwrite `emb`) sees
+                    // the dequant finished. gather_host is already outside capture.
+                    gpu.synchronize(stream)?;
+                }
                 // Prefill-scale gathers log the fault profile at info: the
                 // misses are SERIAL blocking preads today (QD=1 under this
                 // mutex), so miss-count x latency IS the prefill stall.
@@ -189,6 +202,33 @@ impl PleLayer {
                 // produced garbage input embeddings.
                 DevicePtr(va)
             }
+            #[cfg(feature = "cuda")]
+            NgramTable::ResidentNvfp4 {
+                rows,
+                row_base,
+                rows_total,
+                ..
+            } => {
+                // Fully resident packed table: the "slot" IS `row - row_base`
+                // (row_base 0 today), uploaded as u32 like the `Bf16` arm.
+                let bytes: Vec<u8> = ids
+                    .iter()
+                    .map(|r| {
+                        let (base, total) = (*row_base, *rows_total);
+                        anyhow::ensure!(
+                            *r >= base && *r < base + total,
+                            "PLE resident: row id {r} outside [{base}, {})",
+                            base + total
+                        );
+                        Ok((*r - base) as u32)
+                    })
+                    .collect::<Result<Vec<u32>>>()?
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                gpu.copy_h2d_async(&bytes, self.slots_dev, stream)?;
+                *rows
+            }
             NgramTable::Bf16(w) => {
                 // Fully resident table (small fixtures / tests): the "slot" IS
                 // the row id, so upload the ids truncated to u32.
@@ -215,7 +255,12 @@ impl PleLayer {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
-        self.gather_embed_dispatch(table_va, num_tokens, heads, gpu, stream)?;
+        // Trellis and NVFP4 rows are not embeddings. `gather_host` already
+        // wrote the decoded BF16 matrix into `emb`; launching `batched_embed`
+        // would overwrite it with packed bytes interpreted as BF16.
+        if !self.host_decoded() {
+            self.gather_embed_dispatch(table_va, num_tokens, heads, gpu, stream)?;
+        }
         // The pins taken by this gather must outlive THIS kernel: record an event
         // right behind it; `release_prev_pins` waits on it before freeing the slots.
         let mut ev = self

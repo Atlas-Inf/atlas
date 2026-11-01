@@ -456,15 +456,15 @@ impl Qwen3AttentionLayer {
         let eps = ctx.config.rms_norm_eps as f32;
         let hc = self.hc.as_ref().unwrap();
         let hc_mult = hc.hc_mult as u32;
-        // MODEL layer indices, carried on the weights. `attn_layer_idx`
-        // counts ATTENTION layers: it coincides with the model index only on
-        // an all-attention model like DeepSeek-V4. On a 3:1 GDN:attention
-        // interleave `attn_layer_idx == 0` is model layer 3 (the highway
-        // would seed three layers late) and `attn_layer_idx + 1 ==
-        // num_hidden_layers` is `12 == 48` (hc_head would never fire, and on
-        // Qwen the mixer IS the final norm).
-        let is_first_layer = hc.is_first_model_layer;
-        let is_last_layer = hc.is_last_model_layer;
+        // GLM carries its physical block index; upstream mixed models carry model indices.
+        let (is_first_layer, is_last_layer) = if ctx.config.model_type == "glm5_next" {
+            (
+                self.block_idx == 0,
+                self.block_idx + 1 == ctx.config.num_hidden_layers,
+            )
+        } else {
+            (hc.is_first_model_layer, hc.is_last_model_layer)
+        };
         let hc_streams = ctx.buffers.hc_streams();
         let post = ctx.buffers.hc_post();
         let comb = ctx.buffers.hc_comb();
@@ -636,25 +636,38 @@ impl Qwen3AttentionLayer {
                     eps,
                     stream,
                 )?;
+            } else if is_last_layer && ctx.config.model_type == "glm5_next" {
+                ops::hc_contract(
+                    ctx.gpu,
+                    self.hc_contract_k,
+                    hc_streams,
+                    hidden,
+                    1,
+                    h as u32,
+                    hc_mult,
+                    stream,
+                )?;
             }
             return Ok(());
         }
 
-        // Expand attention output back into multi-stream state.
-        ops::hc_post_site(
-            ctx.gpu,
-            self.hc_post_k,
-            hc,
-            attn_out,
-            hc_streams,
-            post,
-            comb,
-            hc_streams,
-            1,
-            h as u32,
-            stream,
-        )?;
+        // Expand attention output back into multi-stream state. Without the
+        // diagnostics between them, the post runs with the FFN site's pre
+        // (`hc_post_pre_site`, fused under ATLAS_QWEN4EXP_DECODE_FUSE).
         if diag_this {
+            ops::hc_post_site(
+                ctx.gpu,
+                self.hc_post_k,
+                hc,
+                attn_out,
+                hc_streams,
+                post,
+                comb,
+                hc_streams,
+                1,
+                h as u32,
+                stream,
+            )?;
             super::diag_norm_f32(
                 ctx.gpu,
                 hc_streams,
@@ -675,21 +688,41 @@ impl Qwen3AttentionLayer {
         }
 
         // ── FFN sublayer ──
-        ops::hc_pre_site(
-            ctx.gpu,
-            self.hc_pre_k,
-            hc_streams,
-            &hc.ffn,
-            hc,
-            hidden,
-            post,
-            comb,
-            ctx.buffers.hc_lowrank_scratch(),
-            1,
-            h as u32,
-            eps,
-            stream,
-        )?;
+        if diag_this {
+            ops::hc_pre_site(
+                ctx.gpu,
+                self.hc_pre_k,
+                hc_streams,
+                &hc.ffn,
+                hc,
+                hidden,
+                post,
+                comb,
+                ctx.buffers.hc_lowrank_scratch(),
+                1,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        } else {
+            ops::hc_post_pre_site(
+                ctx.gpu,
+                self.hc_post_k,
+                self.hc_pre_k,
+                hc,
+                attn_out,
+                hc_streams,
+                &hc.ffn,
+                hidden,
+                post,
+                comb,
+                ctx.buffers.hc_lowrank_scratch(),
+                1,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        }
         if diag_this {
             super::diag_norm(
                 ctx.gpu,
@@ -731,7 +764,18 @@ impl Qwen3AttentionLayer {
             ctx.gpu.copy_d2d_async(hidden, normed2, h * 2, stream)?;
         }
 
-        let ffn_out = self.ffn.forward(normed2, ctx, stream)?;
+        // The MoE may run the low-rank post itself, fused with its last
+        // kernel (ATLAS_QWEN4EXP_DECODE_FUSE), when nothing sits between.
+        let hc_post = (ops::HcVariant::of(hc) == ops::HcVariant::LowRank
+            && !diag_this
+            && self.post_ffn_out_norm.is_none()
+            && self.layer_scalar.is_none())
+        .then_some(ops::qwen4exp_decode_fuse::MoeHcPost {
+            streams: hc_streams,
+            inj: post,
+            hc_mult,
+        });
+        let (ffn_out, posted) = self.ffn.forward_hc_post(normed2, ctx, hc_post, stream)?;
         astage!("ffn");
 
         if let Some(ref post_norm) = self.post_ffn_out_norm {
@@ -752,19 +796,21 @@ impl Qwen3AttentionLayer {
             self.apply_layer_scalar(ctx.gpu, ffn_out, h, scalar, stream)?;
         }
 
-        ops::hc_post_site(
-            ctx.gpu,
-            self.hc_post_k,
-            hc,
-            ffn_out,
-            hc_streams,
-            post,
-            comb,
-            hc_streams,
-            1,
-            h as u32,
-            stream,
-        )?;
+        if !posted {
+            ops::hc_post_site(
+                ctx.gpu,
+                self.hc_post_k,
+                hc,
+                ffn_out,
+                hc_streams,
+                post,
+                comb,
+                hc_streams,
+                1,
+                h as u32,
+                stream,
+            )?;
+        }
         if diag_this {
             super::diag_norm_f32(
                 ctx.gpu,
@@ -805,6 +851,17 @@ impl Qwen3AttentionLayer {
                     &format!("V4-decode L{} hc_head", self.attn_layer_idx),
                 );
             }
+        } else if is_last_layer && ctx.config.model_type == "glm5_next" {
+            ops::hc_contract(
+                ctx.gpu,
+                self.hc_contract_k,
+                hc_streams,
+                hidden,
+                1,
+                h as u32,
+                hc_mult,
+                stream,
+            )?;
         } else if is_last_layer {
             tracing::warn!(
                 "V4-decode L{}: hc_head SKIPPED (no head weights)",

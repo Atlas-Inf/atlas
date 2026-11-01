@@ -69,7 +69,7 @@ fn attn_layer(gpu: &MockGpuBackend, config: &ModelConfig) -> Qwen3AttentionLayer
 
 /// Run `ms_phase_qkv` at `n` verify rows and return how many d2d copies
 /// the phase issued plus every kernel launch it recorded.
-fn qkv_phase_d2d(
+pub(super) fn qkv_phase_d2d(
     gpu: &MockGpuBackend,
     config: &ModelConfig,
     layer: &Qwen3AttentionLayer,
@@ -81,6 +81,7 @@ fn qkv_phase_d2d(
     let levers = crate::layers::ops::ModelLevers::defaults();
     let stats = crate::layers::ops::ModelStats::new();
     let fwd = ForwardContext {
+        ssm_batch: None,
         dispatch: &dispatch,
         derived: &derived,
         levers: &levers,
@@ -99,12 +100,14 @@ fn qkv_phase_d2d(
         midchunk_capture: None,
         moe_lora_route: crate::layer::MoeLoraRoute::Fold,
     };
+    let positions = vec![1; n];
     let c = MultiSeqCtx::new(
         layer,
         &fwd,
         buffers.hidden_states(),
         buffers.residual(),
         n,
+        &positions,
         16,
         0,
     );
@@ -189,3 +192,6 @@ fn fused_qkv_twin_never_reaches_the_base_weight_gemv() {
         );
     }
 }
+
+#[path = "kv_bf16_tests.rs"]
+mod kv_bf16;

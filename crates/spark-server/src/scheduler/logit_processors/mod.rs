@@ -70,6 +70,11 @@ pub struct LogitsContext<'a> {
     pub think_end_token: Option<u32>,
     pub think_start_token: Option<u32>,
     pub tool_call_start_token: Option<u32>,
+    /// Explicit model/tokenizer-scoped implicit thinking boundary (GLM only).
+    pub glm_tool_boundary: Option<u32>,
+    /// The run's hard stops (the verify loop replays the commit rule with
+    /// them between positions).
+    pub limits: crate::scheduler::limits::SchedLimits,
     pub tool_call_end_token: Option<u32>,
     /// `mask[id]` iff token `id` decodes to text ending in a generation
     /// boundary. Vocab-sized and INDEXED BY TOKEN ID, so it is meaningless
@@ -92,6 +97,76 @@ pub struct LogitsContext<'a> {
     /// The run's speculation and drift counters. Shared, so the B1 gauge
     /// counts one model's positions rather than the process's.
     pub stats: std::sync::Arc<crate::scheduler::spec_stats::SpecStats>,
+}
+
+/// Everything in a [`LogitsContext`] except the run's scratch, whose
+/// `RefCell`s make the context neither `Send` nor `Sync`. These parts are
+/// `Sync`, so a rayon fan-out can share them and [`bind`](Self::bind) a
+/// worker's own scratch: the same values the serial context carries.
+#[derive(Debug, Clone)]
+pub struct LogitsCtxParts<'a> {
+    pub dumps: &'a crate::scheduler::dumps::RunDumps,
+    pub think_end_token: Option<u32>,
+    pub think_start_token: Option<u32>,
+    pub tool_call_start_token: Option<u32>,
+    pub glm_tool_boundary: Option<u32>,
+    pub limits: crate::scheduler::limits::SchedLimits,
+    pub tool_call_end_token: Option<u32>,
+    pub boundary_mask: Option<std::sync::Arc<[bool]>>,
+    pub mid_word_mask: Option<std::sync::Arc<[bool]>>,
+    pub sampling: SamplingLevers,
+    pub timing: std::sync::Arc<crate::scheduler::mtp_timing::RunTiming>,
+    pub watchdog: crate::scheduler::helpers::WatchdogParams,
+    pub stats: std::sync::Arc<crate::scheduler::spec_stats::SpecStats>,
+}
+
+impl<'a> LogitsContext<'a> {
+    /// This context minus its scratch.
+    pub fn parts(&self) -> LogitsCtxParts<'a> {
+        LogitsCtxParts {
+            dumps: self.dumps,
+            think_end_token: self.think_end_token,
+            think_start_token: self.think_start_token,
+            tool_call_start_token: self.tool_call_start_token,
+            glm_tool_boundary: self.glm_tool_boundary,
+            limits: self.limits,
+            tool_call_end_token: self.tool_call_end_token,
+            boundary_mask: self.boundary_mask.clone(),
+            mid_word_mask: self.mid_word_mask.clone(),
+            sampling: self.sampling,
+            timing: self.timing.clone(),
+            watchdog: self.watchdog,
+            stats: self.stats.clone(),
+        }
+    }
+}
+
+impl<'a> LogitsCtxParts<'a> {
+    /// The context these parts came from, over `scratch`.
+    pub fn bind<'b>(
+        &self,
+        scratch: &'b crate::scheduler::sched_ctx::DecodeScratch,
+    ) -> LogitsContext<'b>
+    where
+        'a: 'b,
+    {
+        LogitsContext {
+            scratch,
+            dumps: self.dumps,
+            think_end_token: self.think_end_token,
+            think_start_token: self.think_start_token,
+            tool_call_start_token: self.tool_call_start_token,
+            glm_tool_boundary: self.glm_tool_boundary,
+            limits: self.limits,
+            tool_call_end_token: self.tool_call_end_token,
+            boundary_mask: self.boundary_mask.clone(),
+            mid_word_mask: self.mid_word_mask.clone(),
+            sampling: self.sampling,
+            timing: self.timing.clone(),
+            watchdog: self.watchdog,
+            stats: self.stats.clone(),
+        }
+    }
 }
 
 /// The subset of `scheduler::levers::SchedLevers` the pre-sample pipeline
@@ -218,6 +293,10 @@ pub fn run_pipeline_with_path(
 /// call. Replaces the two divergent inline blocks.
 ///
 /// Stages, in order:
+///  0. **min_tokens end-token ban** (qwen4_exp `ATLAS_QWEN4EXP_EOS_BAN`,
+///     `min_tokens_ban`): the banned ids to -inf below the floor; then the
+///     **content-loop steer** (`ATLAS_LOOP_STEER`, `loop_steer`): the token
+///     that would continue a detected loop to -inf.
 ///  1. **ATLAS_FORCE_TEMP_ZERO bypass** (eligible on BOTH kinds): when the
 ///     diagnostic flag is set, return the raw-logit argmax with no pipeline,
 ///     no penalties, no bias — matching vLLM at temperature 0 for
@@ -249,6 +328,11 @@ pub fn process_position_logits(
     penalties: &SamplingParams,
     kind: PositionKind,
 ) -> Option<u32> {
+    // 0. The qwen4_exp min_tokens end-token ban (`min_tokens_ban`): before
+    //    every stage, so no stage, bypass or sampler can pick a banned id.
+    crate::scheduler::min_tokens_ban::mask_row(logits, seq);
+    crate::scheduler::loop_steer::mask_row(logits, seq);
+
     // 1. ATLAS_FORCE_TEMP_ZERO: pure argmax on raw logits — no pipeline, no
     //    penalties, no bias. Eligible on both kinds (the diagnostic's point
     //    is an identical bypass everywhere).

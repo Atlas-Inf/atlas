@@ -75,6 +75,7 @@ Numbers are single-GB10 decode tok/s measured end-to-end through the HTTP API on
 | **Qwen3.8-27B flagship** | `nvidia/Qwen3.8-27B-NVFP4` | 27B dense | GDN + attention hybrid, MTP | `@atlas/qwen3.8-27b-nvfp4` | 23.59 |
 | **Qwen3.8-Flash-Next** | `RadixArk/Qwen3.8-Flash-Next-NVFP4` | ~180B MoE | GDN + attention + MoE, PLE NVMe streaming | `@atlas/qwen3.8-flash-next-nvfp4` | 36.7 |
 | Nemotron-3.5-Lightning + DSpark | `nvidia` checkpoint via recipe | 30B / 3B | Mamba-2 + attention + MoE + DSpark drafter | `@atlas/nemotron-3.5-lightning-30b-a3b-nvfp4-dspark` | sub-10ms/token |
+| **Nemotron-3.5-Super-VL + LiLiCorr** | `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` | 120B / 12B | Mamba-2 + attention + LatentMoE, C-RADIO vision, LiLiCorr drafter (DFlash γ8) | `@atlas/nemotron-3.5-super-vl-120b-a12b-nvfp4-dflash2` | 28 (γ8); also Strix Halo Windows/Linux |
 | Qwen3.5-27B | `Kbenkhaled/Qwen3.5-27B-NVFP4` | 27B dense | Hybrid SSM + attention, dense FFN, MRoPE | | 13 |
 | Qwen3.5-35B-A3B | `Sehyo/Qwen3.5-35B-A3B-NVFP4` | 35B / 3B | GDN + attention + MoE, MTP | | **131** (MTP K=2) |
 | Qwen3.5-122B-A10B | `Sehyo/Qwen3.5-122B-A10B-NVFP4` | 122B / 10B | GDN + attention + MoE, MTP | | 46 (EP=2) |
@@ -143,10 +144,22 @@ Strix Halo is a unified-memory APU, so the validated path is the native binary b
 ```bash
 git clone https://github.com/Atlas-Inf/atlas.git
 cd atlas
+
+# Prerequisites — install Rust first (rust-toolchain.toml pins the version;
+# distro-packaged rustc is too old), plus ROCm's hipcc + headers:
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+sudo apt install rocm-hip-dev
+
 ./build-amd.sh                              # strix-hip backend, all targets, needs ROCm + cargo
 ./serve-amd.sh                              # nvidia/Qwen3.8-27B-NVFP4, validated config
 ./serve-amd.sh unsloth/Qwen3.8-27B-NVFP4    # or the preservation checkpoint
 ```
+
+`./build-amd.sh` preflights hipcc, the HIP headers, and cargo and says what's
+missing instead of failing 120 kernel compiles in (a hipcc with no dev headers
+dies as `'hip/hip_runtime.h' file not found`). If ROCm lives outside
+`/opt/rocm`, point `ATLAS_HIPCC` and `ATLAS_ROCM_HOME` at it.
 
 Defaults are the validated config. K=4 MTP speculative, the W4A8 DP4A decode arm, BF16 KV. `NUM_DRAFTS=0` disables speculation, `LM_HEAD=bf16` switches for the unsloth checkpoint's per-row-FP8 lm_head, and `ATLAS_W4A16_DP4A=0` opts out of DP4A. The `ATLAS_FP8_DEQUANT_*` and `ATLAS_GDN_BF16_WEIGHTS` exports are baked in and required for unsloth.
 
@@ -158,6 +171,11 @@ Measured on a Ryzen AI Max+ 395 with Radeon 8060S under ROCm 7.13 at ~60 GB GTT.
 git clone https://github.com/Atlas-Inf/atlas.git
 cd atlas
 
+# Prerequisites — Rust via rustup (rust-toolchain.toml pins the version;
+# do not use the Store/other distro rust), MSVC Desktop C++, and the
+# ROCm SDK with HIP_PATH set:
+winget install Rustlang.Rustup   # or https://rustup.rs
+
 hf download nvidia/Qwen3.8-27B-NVFP4 `
   --local-dir "$env:USERPROFILE\models\nvidia-Qwen3.8-27B-NVFP4"
 
@@ -167,10 +185,16 @@ hf download nvidia/Qwen3.8-27B-NVFP4 `
 
 # Serve, the fingerprinted fp8d recipe. Native FP8 GDN, K=4 MTP, BF16 KV
 # and lm_head. Preflight hard-fails on non-gfx1151 GPUs.
-.\serve-amd.ps1
+.\serve-amd.ps1                              # Qwen3.8 27B + MTP (default)
+# .\serve-amd.ps1 -Spec dflash2              # 27B + DFlash2 — also needs:
+#   hf download incoai/Qwen3.8-27B-DFlash2 --local-dir "$env:USERPROFILE\models\dflash2"
+# .\serve-amd.ps1 -Model qwen3.8-flash-next  # Flash-Next + MTP — needs VGM 32 GB and:
+#   hf download nvidia/Qwen3.8-Flash-Next-NVFP4 --local-dir "$env:USERPROFILE\models\nvidia-Qwen3.8-Flash-Next-NVFP4"
 ```
 
-Prebuilt instead? Unzip `spark-windows-x86_64-amd-hip` keeping every DLL beside `spark.exe`, set `$env:ATLAS_BIN` to it, and run `.\serve-amd.ps1`. That skips the toolchain check and the build. The script runs a detached smoke probe (`first_run_smoke.log`), and the 64K-context record config is [`win_serve_qwen38_nvfp4.ps1`](scripts/strix-windows/win_serve_qwen38_nvfp4.ps1).
+`.\build-amd.ps1` compiles every strix-hip target once; `serve-amd.ps1` picks the model + speculation mode (`-Model qwen3.8-flash-next -Spec dflash2` is rejected — no Flash-Next drafter exists). Add `-Thinking off|on` to pin `--disable-thinking` or make thinking the server default (issue #146; Linux twin: `THINKING=off|on` on `serve-amd.sh`).
+
+Prebuilt instead? Unzip `spark-windows-x86_64-amd-hip` keeping every DLL beside `spark.exe`, set `$env:ATLAS_BIN` to it, and run `.\serve-amd.ps1`. That skips the toolchain check and the build; the prebuilt zip is built with every target too (`.github/release-matrix.json` row `windows-x86_64-amd-hip` has `target_model: "*"`), so the same `-Model`/`-Spec` options apply. The script runs a detached smoke probe (`first_run_smoke.log`), and the 64K-context record config is [`win_serve_qwen38_nvfp4.ps1`](scripts/strix-windows/win_serve_qwen38_nvfp4.ps1).
 
 Measured on a Framework Desktop (Ryzen AI Max+ 395, Radeon 8060S, Windows 11, ROCm 10.0.0 TheRock, Adrenalin 32.0.31041.1004). **83.32 / 78.70** on the bfcl-subset golden draw with zero faults in 3.6 hours, and **17.25 tok/s** decode with MTP engaged at p1 0.834. Provenance in [`BENCH.toml`](kernels/strix-hip/qwen3.8-27b/BENCH.toml) and [`STRIX_WINDOWS_HIP.md`](docs/porting/STRIX_WINDOWS_HIP.md).
 
@@ -202,6 +226,6 @@ curl http://localhost:8888/v1/chat/completions \
 ## ⚖️ Dual License
 
 - **Community Edition**: Licensed under **AGPLv3**. Free and open for personal use, research, and non-commercial local deployments.
-- **Enterprise Edition**: Commercial licensing for proprietary applications, SaaS hosting without AGPLv3 copyleft obligations, dedicated support, and custom hardware/kernel porting. Contact `debaterishaqui@gmail.com`.
+- **Enterprise Edition**: Commercial licensing for proprietary applications, SaaS hosting without AGPLv3 copyleft obligations, dedicated support, and custom hardware/kernel porting. Contact `azeez@atlasinference.dev`.
 
 <sub><b>Continuity notice.</b> Atlas is continuing. This repository, the <a href="https://github.com/Atlas-Inf">Atlas-Inf</a> GitHub organization, and <a href="https://atlasinference.dev">atlasinference.dev</a> are the replacement official Atlas channels. The existing website and GitHub repository remain disputed Atlas assets that have not been relinquished.</sub>

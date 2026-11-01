@@ -252,6 +252,9 @@ jobs:
             "crates/spark-runtime/src/sampler.rs"
             "crates/spark-server/src/api/chat_blocking.rs"
             "crates/spark-server/src/api/chat_stream/handle_token.rs"
+            # 544 LoC — the function extracted from handle_token.rs above; the
+            # same split, so the same exemption as the parent.
+            "crates/spark-server/src/api/chat_stream/handle_token/inner.rs"
             "crates/spark-server/src/grammar/compile_tools.rs"
             "crates/spark-server/src/scheduler/emit_step.rs"
             "crates/spark-server/src/scheduler/helpers.rs"
@@ -475,6 +478,25 @@ jobs:
             # 501 LoC (was 499) -- paged QKV prefill; +2 lines from the
             # Nemotron-H-Puzzle/Mamba work (#281 content) carried in the stack.
             "crates/spark-model/src/layers/qwen3_attention/prefill/paged_qkv.rs"
+            # ── main→qwen3.8-flash-next TP=2 merge union (#175 + #176) ──
+            # These five crossed 500 only in the merged tree — each side
+            # stayed under on its own. Same shape as the 2026-09-14/15
+            # union entries above: split post-merge, not inside the merge.
+            "crates/spark-model/src/model/impl_a3.rs"
+            "crates/spark-model/src/model/trait_impl/prefill_b/forward_layers.rs"
+            "crates/spark-runtime/src/cuda_backend/gpu_impl.rs"
+            "crates/spark-server/src/scheduler/verify_dflash_step.rs"
+            "crates/spark-server/src/tokenizer/chat_impl.rs"
+            # ── #175 (Nemotron VL + LiLiCorr) carry-overs already >500 on
+            # main itself — landed without an entry; the merge does not grow
+            # them further. Split tracked as follow-up with the others.
+            "crates/spark-model/src/layers/nemotron_mamba2/prefill_proj.rs"
+            "crates/spark-model/src/layers/nemotron_mamba2/trait_impl.rs"
+            "crates/spark-model/src/layers/nemotron_moe/decode_helpers.rs"
+            "crates/spark-model/src/layers/nemotron_moe/prefill_sorted.rs"
+            "crates/spark-model/src/layers/nemotron_moe/union_verify_gpu_tests.rs"
+            "crates/spark-model/src/layers/ops/moe_grouped_a/grouped_prefill.rs"
+            "crates/spark-model/src/weight_loader/nemotron.rs"
           )
 
           violations=0

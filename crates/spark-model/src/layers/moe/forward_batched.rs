@@ -16,6 +16,9 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if ctx.config.expert_tp {
+            return self.forward_prefill(input, num_tokens, ctx, stream);
+        }
         // LongCat zero-experts ARE wired here (softmax+bias arm below); the
         // other scoring functions on this variant are not, and would silently
         // mis-route the 384-wide router. Named refusal, not silent wrongness.
@@ -28,6 +31,9 @@ impl MoeLayer {
                 || (self.correction_bias_dev.is_some() && ctx.config.scoring_func == "softmax"),
             "zero-expert MoE routing is not wired on this dispatch variant yet (forward_batched)"
         );
+        if self.batched_prefill_guards(input, num_tokens, ctx, stream)? {
+            return Ok(());
+        }
 
         // SOLID Incr-4: batched decode folds the routed-expert gate/up + down
         // LoRA delta per token (below) AND the router (mlp.gate) delta on the
@@ -55,23 +61,24 @@ impl MoeLayer {
         let n = num_tokens as u32;
         let bf16 = 2usize;
 
-        // Router width, not expert count — they differ only on LongCat, where
-        // the router also scores the zero-computation experts. This value also
-        // strides `gate_t` below; getting it wrong reads each token's logits
-        // from the wrong offset rather than failing.
+        // Router width, not expert count — they differ only on LongCat, where the router
+        // also scores the zero-computation experts. It strides `gate_t` below; getting it
+        // wrong reads each token's logits from the wrong offset rather than failing.
         let router_n = self.router_logits_n;
-        let (gate_logits, fp32_gate, gate_elem) =
+        let gate =
             self.batched_gate_logits(input, n, h, router_n, row_adapter_base, ctx, stream)?;
+        if self.forward_batched_qwen4exp_fast(input, num_tokens, gate, ctx, stream)? {
+            return Ok(());
+        }
+        let (gate_logits, fp32_gate, gate_elem) = gate;
 
         // Per-token: topK routing + expert dispatch + weighted sum
         let h_usize = h as usize;
         let expert_gate_out = ctx.buffers.expert_gate_out();
         let expert_up_out = ctx.buffers.expert_up_out();
         let expert_down_out = ctx.buffers.expert_down_out();
-        // ⚠ logits buffer aliased — see warning in moe/forward.rs:208-219
-        // and project_batch_decode_corruption.md (bug 2). Concurrent
-        // callers using `buffers.logits()` during the forward loop MUST
-        // offset past `shared_expert_intermediate_size * 2` bytes.
+        // ⚠ logits buffer aliased (moe/forward.rs, project_batch_decode_corruption.md
+        // bug 2): concurrent users offset past `shared_expert_intermediate_size * 2`.
         let shared_gate_scratch = ctx.buffers.logits();
         let shared_up_scratch = ctx.buffers.ssm_qkvz();
 
@@ -148,18 +155,17 @@ impl MoeLayer {
                     stream,
                 )?;
             }
-            // Last-token routing dump (no-op unless ATLAS_DUMP_EXPERT_IDS=1):
-            // the token whose top-K determines the next prediction.
+            // Routing dump of the token that predicts next (no-op unless ATLAS_DUMP_EXPERT_IDS=1).
             if t == num_tokens - 1 {
                 super::dump::dump_expert_ids(ctx.gpu, stream, indices_dev, weights_dev, 1, top_k)?;
             }
 
             let shared_out = ctx.buffers.attn_output();
-            if let (Some(gp), Some(up), Some(dp), Some(shared)) = (
+            if let (Some(gp), Some(up), Some(dp), Some(SeparateSharedExpert::Bf16(shared))) = (
                 self.bf16_gate_weight_ptrs,
                 self.bf16_up_weight_ptrs,
                 self.bf16_down_weight_ptrs,
-                self.bf16_shared_expert,
+                self.separate_shared_expert,
             ) {
                 // BF16 path (FP8-dequant-on-load): same fused kernels as decode.
                 ops::moe_expert_gate_up_shared_bf16(
@@ -266,14 +272,9 @@ impl MoeLayer {
                     top_k,
                     stream,
                 )?;
-            } else if self.use_t_layout_for_prefill() {
+            } else if self.btile_storage.is_published() || self.use_t_layout_for_prefill() {
                 // Phase 8a unified-layout NVFP4 batched prefill — transposed
                 // kernels coalesce well at large N. Hybrid mode lands here too.
-                let gate_t = self
-                    .gate_ptrs_t
-                    .as_ref()
-                    .expect("gate_ptrs_t under unified_t");
-                let up_t = self.up_ptrs_t.as_ref().expect("up_ptrs_t under unified_t");
                 let down_t = self
                     .down_ptrs_t
                     .as_ref()
@@ -291,32 +292,50 @@ impl MoeLayer {
                         "decode fused _e8m0 kernel assumes an NVFP4 shared expert",
                     );
                 }
-                ops::moe_expert_gate_up_shared_t(
-                    ctx.gpu,
-                    self.e8m0_or(
-                        self.moe_expert_gate_up_shared_t_k,
-                        self.moe_expert_gate_up_shared_t_e8m0_k,
-                        "decode gate_up_shared_t",
-                    ),
-                    input_t,
-                    gate_t.packed_ptrs,
-                    gate_t.scale_ptrs,
-                    gate_t.scale2_vals,
-                    expert_gate_out,
-                    up_t.packed_ptrs,
-                    up_t.scale_ptrs,
-                    up_t.scale2_vals,
-                    expert_up_out,
-                    indices_dev,
-                    sh_gate_t,
-                    shared_gate_scratch,
-                    sh_up_t,
-                    shared_up_scratch,
-                    inter,
-                    h,
-                    top_k,
-                    stream,
-                )?;
+                if self.btile_storage.is_published() {
+                    self.dispatch_btile_decode(
+                        ctx,
+                        input_t,
+                        expert_gate_out,
+                        expert_up_out,
+                        indices_dev,
+                        Some((shared_gate_scratch, shared_up_scratch)),
+                        1,
+                        stream,
+                    )?;
+                } else {
+                    let gate_t = self
+                        .gate_ptrs_t
+                        .as_ref()
+                        .expect("gate_ptrs_t under unified_t");
+                    let up_t = self.up_ptrs_t.as_ref().expect("up_ptrs_t under unified_t");
+                    ops::moe_expert_gate_up_shared_t(
+                        ctx.gpu,
+                        self.e8m0_or(
+                            self.moe_expert_gate_up_shared_t_k,
+                            self.moe_expert_gate_up_shared_t_e8m0_k,
+                            "decode gate_up_shared_t",
+                        ),
+                        input_t,
+                        gate_t.packed_ptrs,
+                        gate_t.scale_ptrs,
+                        gate_t.scale2_vals,
+                        expert_gate_out,
+                        up_t.packed_ptrs,
+                        up_t.scale_ptrs,
+                        up_t.scale2_vals,
+                        expert_up_out,
+                        indices_dev,
+                        sh_gate_t,
+                        shared_gate_scratch,
+                        sh_up_t,
+                        shared_up_scratch,
+                        inter,
+                        h,
+                        top_k,
+                        stream,
+                    )?;
+                }
                 // SOLID Incr-4: fold gate/up delta BEFORE the fused silu+down.
                 self.apply_expert_lora_decode_gateup(
                     expert_gate_out,
@@ -426,8 +445,8 @@ impl MoeLayer {
                 stream,
             )?;
 
-            if self.has_mixed_bf16_shared_expert() {
-                self.run_bf16_shared_expert(
+            if self.has_separate_shared_expert() {
+                self.run_separate_shared_expert(
                     input_t,
                     1,
                     h,
@@ -436,17 +455,29 @@ impl MoeLayer {
                     shared_up_scratch,
                     shared_out,
                     ctx,
+                    true,
                     stream,
                 )?;
             }
 
+            // EP fix (same contract as `forward_row_local`): the shared expert
+            // is computed identically on all ranks, so it must stay out of the
+            // pre-reduce blend or the all-reduce sums it once per rank.
+            // (An MXFP8 shared expert's slice blends here: `shared_mxfp8.rs`.)
+            let is_ep =
+                ctx.comm.is_some() && ctx.config.ep_world_size > 1 && !self.shared_joins_reduce();
+            let shared_for_blend = if is_ep && !shared_out.is_null() {
+                self.ep_blend_zero_row(ctx, stream)?
+            } else {
+                shared_out
+            };
             ops::moe_weighted_sum_blend(
                 ctx.gpu,
                 self.moe_weighted_sum_blend,
                 output_t,
                 expert_down_out,
                 weights_dev,
-                shared_out,
+                shared_for_blend,
                 input_t,
                 self.weights.shared_expert_gate.weight,
                 h,
@@ -455,16 +486,9 @@ impl MoeLayer {
                 stream,
             )?;
 
-            // EP all-reduce per-token partial output
-            if let Some(comm) = ctx.comm
-                && ctx.config.ep_world_size > 1
-            {
-                if ctx.graph_capture {
-                    comm.all_reduce(output_t.0, h as usize * 2)?;
-                } else {
-                    comm.all_reduce_async(output_t.0, h as usize * 2, stream)?;
-                }
-            }
+            // EP all-reduce per-token partial output, then the shared expert
+            // added ONCE (`forward_ep_reduce` does both).
+            self.forward_ep_reduce(output_t, shared_out, input_t, 1, None, ctx, stream)?;
         }
 
         Ok(())

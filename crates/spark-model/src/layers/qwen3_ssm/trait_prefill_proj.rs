@@ -35,6 +35,9 @@ impl Qwen3SsmLayer {
         } else {
             ctx.buffers.ssm_qkvz()
         };
+        // A decode-only FP8 copy (`ATLAS_QWEN4EXP_FP8_GDN=1`) is invisible
+        // here: prefill keeps the BF16 GEMM that copy was quantized from.
+        let qkvz_fp8w = self.qkvz_fp8w.as_ref().filter(|_| !self.fp8w_decode_only);
         // One-time dispatch-state dump: which weight copies / kernel handles are
         // populated decides which arm of the ladder below actually runs.
         static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -43,7 +46,7 @@ impl Qwen3SsmLayer {
                 "SSM_QKVZ_DISPATCH fp8w={} fp8w_t={} nvfp4_t={} fp8={} rowwise={} \
                  w8a16={:#x} w8a16_t={:#x} w8a16_pipe={:#x} w4a16_t={:#x} force_bf16_env={} \
                  cutlass_qkvz={} cutlass={} cublas_fp8={} cublas={} w8a8={} M={k} N={qkvz_size} K={h}",
-                self.qkvz_fp8w.is_some(),
+                qkvz_fp8w.is_some(),
                 self.qkvz_fp8w_t.is_some(),
                 self.qkvz_nvfp4_t.is_some(),
                 self.qkvz_fp8.is_some(),
@@ -64,6 +67,10 @@ impl Qwen3SsmLayer {
         // GEMM. Bonsai is `sequential_qkvz`, so `proj_dst == deinterleaved` and
         // no post-deinterleave is needed. Highest priority (all other weight
         // slots are NULL on this path).
+        // Native MXFP8 (FP4-Local): the layer's only copy, sequential layout.
+        if let Some(mx8) = self.mx8.as_ref() {
+            return self.mx8_qkvz(mx8, ctx, normed, proj_dst, k as usize, true, stream);
+        }
         if self.qkvz_q2.is_some() {
             let scratch = ctx.buffers.q2_dequant_scratch();
             let act_q8 = ctx.buffers.q2_act_q8();
@@ -158,7 +165,7 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else if ctx.dispatch.cutlass_nvfp4_qkvz
-            && let Some(ref fp8w) = self.qkvz_fp8w
+            && let Some(fp8w) = qkvz_fp8w
         {
             ops::log_cutlass_nvfp4_route(
                 ctx.gpu,
@@ -178,7 +185,7 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else if ctx.dispatch.cutlass_gemm
-            && let Some(ref fp8w) = self.qkvz_fp8w
+            && let Some(fp8w) = qkvz_fp8w
         {
             ops::cutlass_bf16_proj(
                 ctx.gpu,
@@ -192,7 +199,7 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else if ctx.dispatch.cublas_fp8
-            && let Some(ref fp8w) = self.qkvz_fp8w
+            && let Some(fp8w) = qkvz_fp8w
         {
             ops::cublas_fp8_rowwise_proj(
                 ctx.gpu,
@@ -208,7 +215,7 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else if ctx.dispatch.cublas_gemm
-            && let Some(ref fp8w) = self.qkvz_fp8w
+            && let Some(fp8w) = qkvz_fp8w
         {
             ops::cublas_bf16_proj(
                 ctx.gpu,
@@ -222,19 +229,35 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else if force_bf16 {
-            // HIP has no working cuBLASLt route here; use the same native BF16
-            // pipelined GEMM already used by the dense out projection.
+            // On native HIP, try hipBLASLt first — 2.3x faster than the tile
+            // kernel at this shape (2048x16384x2560 measured 2026-10-04) —
+            // falling back to the same native BF16 pipelined GEMM already
+            // used by the dense out projection. The fallback STAYS: 9fc8e57f1
+            // moved this GEMM off cuBLASLt on an older ROCm whose hipBLASLt
+            // failed here; a regression must degrade, not refuse.
             #[cfg(atlas_hip)]
-            ops::dense_gemm_bf16_pipelined(
-                ctx.gpu,
-                self.dense_gemm_pipelined_k,
+            ops::hip_bf16_proj_or(
+                "gdn_qkvz_bf16",
                 normed,
-                &self.ssm.in_proj_qkvz,
+                self.ssm.in_proj_qkvz.weight,
                 proj_dst,
                 k,
                 qkvz_size as u32,
                 h as u32,
                 stream,
+                || {
+                    ops::dense_gemm_bf16_pipelined(
+                        ctx.gpu,
+                        self.dense_gemm_pipelined_k,
+                        normed,
+                        &self.ssm.in_proj_qkvz,
+                        proj_dst,
+                        k,
+                        qkvz_size as u32,
+                        h as u32,
+                        stream,
+                    )
+                },
             )?;
             #[cfg(not(atlas_hip))]
             {
@@ -264,7 +287,7 @@ impl Qwen3SsmLayer {
                 })?;
             }
         } else if force_w8a8
-            && let Some(ref fp8w) = self.qkvz_fp8w
+            && let Some(fp8w) = qkvz_fp8w
             && self.per_token_group_quant_fp8_k.0 != 0
             && self.fp8_gemm_t_blockscaled_k.0 != 0
         {
@@ -303,7 +326,7 @@ impl Qwen3SsmLayer {
                 h as u32,
                 stream,
             )?;
-        } else if let Some(ref fp8w) = self.qkvz_fp8w
+        } else if let Some(fp8w) = qkvz_fp8w
             && self.w8a16_gemm_pipelined_k.0 != 0
         {
             // Block-scaled W8A16 prefill: matches vLLM's per-128-block FP32
@@ -334,7 +357,7 @@ impl Qwen3SsmLayer {
                     "ssm prefill: QKVZ w8a16_gemm_pipelined failed (M={k}, N={qkvz_size}): {e}"
                 )
             })?;
-        } else if let Some(ref fp8w) = self.qkvz_fp8w
+        } else if let Some(fp8w) = qkvz_fp8w
             && fp8w.scale_format == crate::weight_map::WeightQuantFormat::Fp8BlockScaled
             && (k > 128 || self.qkvz_fp8w_t.is_none())
             && self.w8a16_gemm_n_m128_k.0 != 0
@@ -453,7 +476,7 @@ impl Qwen3SsmLayer {
                     anyhow::anyhow!("ssm prefill: QKVZ GEMM failed (M={k}, N={qkvz_size}): {e}")
                 })?;
             }
-        } else if let Some(ref fp8w) = self.qkvz_fp8w
+        } else if let Some(fp8w) = qkvz_fp8w
             && self.w8a16_gemm_k.0 != 0
         {
             // cp.async-free fallback (gfx1151/HIP): non-pipelined block-scaled
@@ -524,6 +547,11 @@ impl Qwen3SsmLayer {
                 h as u32,
                 stream,
             ) {
+                // A failed launch may have written part of the output: never
+                // rerun it in the scalar kernel.
+                if spark_runtime::cutlass::launch_failed(&e) {
+                    return Err(e);
+                }
                 // Say WHY before falling back: a rejected operand here is the
                 // first sign of the misaligned pointer the scalar kernel then
                 // faults on (chunk 2+ of a chunked prefill, 2026-09-03).

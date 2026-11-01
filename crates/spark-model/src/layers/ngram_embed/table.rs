@@ -26,6 +26,19 @@ pub enum NgramTable {
     /// back tens of GB for KV.
     #[cfg(feature = "cuda")]
     Cached(Box<spark_storage::NgramRowCache>),
+    /// FP4-Local's NVFP4 table held ENTIRELY on device (`ATLAS_PLE_RESIDENT`):
+    /// packed U8 rows `[rows_total, 80]` and their E4M3 block scales
+    /// `[rows_total, 10]`. No row cache, no faulting: the gather kernel
+    /// indexes `rows`/`scales` by `row_id - row_base` exactly as it indexes a
+    /// cache arena by slot. `row_base` exists so a later head-sharded variant
+    /// (rank owns a contiguous head range) is a small change; it is 0 today.
+    #[cfg(feature = "cuda")]
+    ResidentNvfp4 {
+        rows: spark_runtime::gpu::DevicePtr,
+        scales: spark_runtime::gpu::DevicePtr,
+        row_base: u64,
+        rows_total: u64,
+    },
 }
 
 impl NgramTable {

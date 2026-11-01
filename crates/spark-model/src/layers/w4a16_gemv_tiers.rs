@@ -104,6 +104,56 @@ pub fn select_tier(
         .map(|(i, _)| i)
 }
 
+/// `ATLAS_W4A16_TC=1`: serve M=2..=32 with the tensor-core
+/// `w4a16_gemv_tc8/16/32` (DRAM-bound, not bit-identical to the scalar
+/// tiers). Resolved once, when a tier table is first built; [`tc_kernel`] and
+/// [`tc_rows`] are how callers and the launch op pick and recognize them.
+/// Both ranks must run the same value (`model::startup_parity`): the pair's
+/// shared-expert split (`moe::forward_pair_shared`) is taken only with them.
+pub(crate) fn tc_requested() -> bool {
+    std::env::var("ATLAS_W4A16_TC").as_deref() == Ok("1")
+}
+
+static TC: std::sync::OnceLock<[KernelHandle; 3]> = std::sync::OnceLock::new();
+const TC_ROWS: [u32; 3] = [8, 16, 32];
+
+/// The narrowest resolved tensor-core tier covering `m` rows, or a zero handle.
+pub fn tc_kernel(m: u32) -> KernelHandle {
+    let Some(handles) = TC.get() else {
+        return KernelHandle(0);
+    };
+    TC_ROWS
+        .iter()
+        .zip(handles)
+        .find(|&(&rows, h)| m <= rows && h.0 != 0)
+        .map_or(KernelHandle(0), |(_, &h)| h)
+}
+
+/// The tensor-core tiers taking explicit row strides (`w4a16_gemv_tc{8,16,32}_ld`).
+static TC_LD: std::sync::OnceLock<[KernelHandle; 3]> = std::sync::OnceLock::new();
+
+/// The narrowest resolved strided tensor-core tier covering `m` rows, or a
+/// zero handle.
+pub fn tc_ld_kernel(m: u32) -> KernelHandle {
+    let Some(handles) = TC_LD.get() else {
+        return KernelHandle(0);
+    };
+    TC_ROWS
+        .iter()
+        .zip(handles)
+        .find(|&(&rows, h)| m <= rows && h.0 != 0)
+        .map_or(KernelHandle(0), |(_, &h)| h)
+}
+
+/// Row capacity of `kernel` when it is a tensor-core tier.
+pub fn tc_rows(kernel: KernelHandle) -> Option<u32> {
+    let handles = TC.get()?;
+    (kernel.0 != 0)
+        .then(|| handles.iter().position(|h| h.0 == kernel.0))
+        .flatten()
+        .map(|i| TC_ROWS[i])
+}
+
 /// Resolved handles for the narrow `w4a16_gemv_batch{M}` family.
 ///
 /// A zero handle means "this target did not load that tier"; every consumer
@@ -130,10 +180,25 @@ impl W4a16BatchmTiers {
     /// Resolve every tier in the family. Misses are silent zero handles —
     /// tiers 5/6/7 are absent from any target built before they existed, and
     /// dispatch degrades to the pre-existing batch4/batch8 decision.
-    pub fn resolve(gpu: &dyn GpuBackend) -> Self {
+    /// `glm_series` gates the `w4a16_gemv_tc{8,16,32}` tensor-core tiers:
+    /// they compile only into glm-5.3-flash, so probing them for any other
+    /// model leaves a permanently-failed row in the boot audit.
+    pub fn resolve(gpu: &dyn GpuBackend, glm_series: bool) -> Self {
         let mut handles = [KernelHandle(0); W4A16_BATCHM_WIDTHS.len()];
         for (h, w) in handles.iter_mut().zip(W4A16_BATCHM_WIDTHS) {
             *h = super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_batch{w}"));
+        }
+        if glm_series && tc_requested() {
+            TC.get_or_init(|| {
+                TC_ROWS.map(|rows| {
+                    super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_tc{rows}"))
+                })
+            });
+            TC_LD.get_or_init(|| {
+                TC_ROWS.map(|rows| {
+                    super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_tc{rows}_ld"))
+                })
+            });
         }
         Self { handles }
     }
@@ -147,6 +212,18 @@ impl W4a16BatchmTiers {
     /// Narrowest resolved tier covering `m` rows, or `KernelHandle(0)` when
     /// this family cannot serve `m`.
     pub fn kernel(&self, m: u32) -> KernelHandle {
+        let tc = tc_kernel(m);
+        if (2..=8).contains(&m) && tc.0 != 0 {
+            return tc;
+        }
+        self.scalar_kernel(m)
+    }
+
+    /// [`Self::kernel`] without the tensor-core override: always a scalar
+    /// template tier, whose row `r` is byte-identical to `w4a16_gemv` on row
+    /// `r`. The qwen4_exp exact verify (`ATLAS_QWEN4EXP_EXACT_VERIFY`) takes
+    /// this one, so `ATLAS_W4A16_TC=1` cannot break its per-row parity.
+    pub fn scalar_kernel(&self, m: u32) -> KernelHandle {
         select_tier(m, self.present(), exact_m_tiers_enabled())
             .map_or(KernelHandle(0), |i| self.handles[i])
     }

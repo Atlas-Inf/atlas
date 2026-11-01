@@ -34,6 +34,8 @@ pub const DEFAULT_KV_CACHE_DTYPE: &str = "fp8";
 /// Arguments for the `serve` subcommand.
 #[derive(Parser, Debug, Clone, PartialEq)]
 pub struct ServeArgs {
+    #[command(flatten)]
+    pub tool_guard: super::tool_guard_args::ToolGuardArgs,
     /// HuggingFace model ID (e.g. "nvidia/Qwen3-Next-80B-A3B-Instruct-NVFP4")
     /// or a local directory path containing config.json.
     /// Optional: omit both this and `--model-from-path` to boot into the
@@ -157,6 +159,11 @@ pub struct ServeArgs {
     /// Maximum sequence length.
     #[arg(long, default_value_t = 32768)]
     pub max_seq_len: usize,
+
+    /// Opt-in static YaRN extension for Qwen3.8-Flash-Next (2 or 4).
+    /// Does not change checkpoint files or reserve KV for every scheduler slot.
+    #[arg(long)]
+    pub qwen_yarn_factor: Option<u8>,
 
     /// KV cache block size (tokens per block).
     #[arg(long, default_value_t = 16)]
@@ -324,6 +331,12 @@ pub struct ServeArgs {
     /// extended to the rest of the forward. That, not this flag alone, is
     /// what end-to-end spec-on == spec-off would require.
     ///
+    /// Done for qwen4_exp (Qwen3.8-Flash-Next) at K=2/3, one sequence:
+    /// `ATLAS_QWEN4EXP_EXACT_VERIFY=1` turns this chain on for that model and
+    /// moves its remaining row-count-dependent ops (attention K/V, the GDN
+    /// layers' MoE) to serial decode's arithmetic
+    /// (`spark-model/src/model/qwen4exp_exact_verify.rs`).
+    ///
     /// The default verify pass runs the WY-chunkwise / fused BF16-conv arms:
     /// fast, but their BF16-output conv (h-state relL2 ~8.6e-4 per K=4
     /// window, committed into persistent SSM state) plus a ~3.4e-8 chunkwise
@@ -447,13 +460,31 @@ pub struct ServeArgs {
     #[arg(long, visible_alias = "stupify", default_value_t = false)]
     pub disable_thinking: bool,
 
+    /// Serve exactly what the client asked for: the client's sampling
+    /// parameters and nothing else, rendered through the checkpoint's own
+    /// chat template. For benchmark runs whose rules lock sampling and
+    /// prompt handling (MLPerf Endpoints). Turns off, in one switch:
+    /// MODEL.toml sampling clamps (`temperature_max`, `min_p_floor`), the
+    /// `--default-min-p` / `--default-top-n-sigma` defaults (generation_config
+    /// values still apply), preset penalties, the `<tool_call>` logit bias,
+    /// the thinking budget and its caps, the A4 `</think>` floor, tool
+    /// grammar, the parser tool system prompt and CWD hint, jinja overrides
+    /// (implies `--disable-template-overrides`), and every output watchdog
+    /// (implies `ATLAS_DISABLE_WATCHDOGS=1`). Kernels and numerics are
+    /// unchanged. Conflicts with `--disable-thinking` and
+    /// `--max-thinking-budget`.
+    #[arg(long, default_value_t = false)]
+    pub reference_mode: bool,
+
     /// Override MODEL.toml's `[behavior].max_thinking_budget` (tokens).
     /// Sets the per-request ceiling for thinking-block length, and anchors
     /// the client `reasoning_effort` ladder (minimal/low/medium/high/xhigh
     /// = 1/4x, 1/2x, 1x, 2x, 4x of this value). An explicit client token
     /// budget (`thinking.budget_tokens`, `thinking_token_budget`) still
     /// wins outright; the (max_tokens * 9 / 10) safety cap is enforced
-    /// unless MODEL.toml sets `cap_thinking_at_max_tokens = false`.
+    /// unless MODEL.toml sets `cap_thinking_at_max_tokens = false`. 0 = no
+    /// server budget: effort levels are the template's alone and reasoning
+    /// runs until the model closes it (or `max_tokens`).
     #[arg(long)]
     pub max_thinking_budget: Option<u32>,
 
@@ -498,8 +529,9 @@ pub struct ServeArgs {
     /// or `enable_thinking` in the request body). A JSON object with
     /// optional keys: `enable_thinking` (bool), `thinking_budget` (u32),
     /// `reasoning_effort` (none|minimal|low|medium|high|xhigh|max — the
-    /// served default effort tier when clients are silent; unset = the
-    /// neutral "medium"), `preserve_thinking` (bool). Unknown keys or an
+    /// served default effort tier when clients are silent; unset = MODEL.toml
+    /// `[behavior].default_reasoning_effort`, else the template's own
+    /// default), `preserve_thinking` (bool). Unknown keys or an
     /// unknown `reasoning_effort` value abort startup (fail-fast; they
     /// were silently ignored before 2026-08-15).
     ///
@@ -602,6 +634,16 @@ pub struct ServeArgs {
     /// without Marconi snapshots). Block table reuse still avoids allocation.
     #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true")]
     pub enable_prefix_caching: bool,
+
+    /// Make prefix-cache hits on hybrid-SSM models give the same output as
+    /// caching off **with this flag** at temperature 0 (#158). Both arms use
+    /// a fixed 1024-token prefill grid, so a warm turn re-prefills up to one
+    /// grid step past its last cut, and exact-mode outputs differ from
+    /// default-mode outputs. Costs throughput on long agentic replays
+    /// (+3–11% wall at G = 1024 on GB10 Flash-Next, same box). `ATLAS_PREFILL_GRID=N`
+    /// overrides the grid size.
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true")]
+    pub exact_prefix_cache: bool,
 
     /// Dump every /v1/chat/completions, /v1/responses, and
     /// /v1/messages (Anthropic) request — plus the corresponding
@@ -889,9 +931,11 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub fast_load_prefetch_shards: bool,
 
-    /// Vision input AREA bound in pixels, applied before patching. Overrides
-    /// the checkpoint in BOTH directions — it may raise the bound as well as
-    /// lower it.
+    /// Vision input pixel budget, applied before patching. Overrides the
+    /// checkpoint in BOTH directions — it may raise the bound as well as lower
+    /// it. Qwen paths interpret this as spatial H×W; GLM-5.3 interprets it as
+    /// the processor's temporal volume T×H×W and still applies its bounded
+    /// native encoder capacity.
     ///
     /// 0 (the default) means "use the checkpoint's own bound", read from
     /// `preprocessor_config.json` (`size.longest_edge`, or `max_pixels`;
@@ -908,6 +952,36 @@ pub struct ServeArgs {
     /// Also settable with `ATLAS_VISION_MAX_PIXELS`.
     #[arg(long, default_value_t = 0)]
     pub vision_max_pixels: usize,
+
+    /// Vision tokens (merged patches, one prompt placeholder each) one request
+    /// may carry across all its images and videos. A request over it, one of
+    /// more than 8192 items (the rank protocol's limit, applied on every world
+    /// size), or one whose prefill chunks could not encode their images (see
+    /// `spark_model::vision_limits`), is refused at admission with a 400
+    /// naming the counts, instead of failing in prefill where clients retry.
+    /// Images are sized from their headers first, so a refused request is
+    /// never decoded.
+    ///
+    /// The engine encodes each prefill chunk's images separately, so this is
+    /// not an encoder limit; it bounds one request's host memory. Rank 0 holds
+    /// a request's preprocessed pixels (f32) from admission until its prefill
+    /// ends: 24 KiB per vision token on the Qwen tower (18.4 KiB on GLM), so
+    /// the default 32768 (8 images of 2048x2048, or 32 of 1024x1024) is
+    /// 768 MiB. The context (`--max-seq-len`), the engine's own bound and
+    /// `--vision-max-inflight-rows` cap it too. 0 = no operator bound: half the
+    /// in-flight budget (so one request cannot need all of it), or the context.
+    #[arg(long, default_value_t = 32_768)]
+    pub vision_max_request_rows: usize,
+
+    /// Vision tokens whose pixels ALL requests may hold at once, queued and
+    /// prefilling (`spark_model::vision_budget`). Each image takes its share
+    /// before it is decoded and returns it when its prefill ends or the
+    /// request is dropped; while the budget is spent, new image requests get
+    /// a 503 with `Retry-After` (transient, unlike the 400 above). The default
+    /// 65536 is 1.5 GiB of f32 on the Qwen tower (1.15 GiB on GLM), the bound
+    /// on rank 0's pixel memory across the server. 0 = unbounded.
+    #[arg(long, default_value_t = 65_536)]
+    pub vision_max_inflight_rows: usize,
 
     /// Fetch `image_url` parts that carry an http(s) URL, instead of
     /// rejecting them.
@@ -994,6 +1068,19 @@ pub struct ServeArgs {
     /// just over six minutes of clip.
     #[arg(long, default_value_t = 768)]
     pub video_max_frames: usize,
+
+    /// Qwen video pixel volume across all sampled frames, overriding the
+    /// checkpoint's video processor bound. 469762048 is the reference
+    /// hour-video recipe (224K merged tokens). Does not change still images.
+    /// When set, admission reserves the clip's worst-case rows before decode
+    /// and reconciles to its actual groups after (Enntity/atlas d0cead1).
+    #[arg(long)]
+    pub video_max_pixels: Option<usize>,
+
+    /// Qwen video pixel volume across all sampled frames, overriding the
+    /// checkpoint's video processor bound. 469762048 is the reference
+    /// hour-video recipe (224K merged tokens). Does not change still images.
+    #[arg(long)]
 
     /// Wall-clock budget for decoding one video. Bounds a decoder that hangs
     /// on a malformed container; the child is killed when it expires.

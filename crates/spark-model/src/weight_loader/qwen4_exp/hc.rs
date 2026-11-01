@@ -29,7 +29,7 @@ use spark_runtime::kernel_args::KernelLaunch;
 use spark_runtime::weights::WeightStore;
 
 use crate::layers::qwen3_attention::{HcHeadWeights, HcLowRank, HcSiteWeights};
-use crate::weight_map::dense;
+use crate::weight_map::{dense, dense_keep_f32};
 
 /// Flips every `input_mix_weight_up` from the checkpoint's `[hc*H, rank]` to
 /// the `[rank, hc*H]` the collapse kernels read.
@@ -127,8 +127,14 @@ fn load_site(
     let up_w = g("input_mix_weight_up")?;
     tr.apply(up_w)
         .with_context(|| format!("qwen4_exp mHC: transposing {prefix}.input_mix_weight_up"))?;
+    // `hc_norm` feeds kernels declared `const float*`: keep an F32 checkpoint
+    // native (FP4-Local ships it F32) and widen a BF16 one (NVFP4) by zero
+    // extension — exact in both directions.
+    let norm_w = dense_keep_f32(store, &format!("{prefix}.hc_norm.weight"), tr.gpu)
+        .map(|d| d.weight)
+        .with_context(|| format!("qwen4_exp mHC: {prefix}.hc_norm.weight"))?;
     Ok(HcLowRank {
-        norm_w: g("hc_norm")?,
+        norm_w,
         down_w: g("input_mix_weight_down")?,
         up_w,
         inject_w: if with_inject {
@@ -146,6 +152,7 @@ fn load_site(
 fn site(lowrank: HcLowRank) -> HcSiteWeights {
     HcSiteWeights {
         hc_fn: DevicePtr::NULL,
+        hc_fn_bf16: DevicePtr::NULL,
         hc_base: DevicePtr::NULL,
         hc_scale: DevicePtr::NULL,
         lowrank: Some(lowrank),

@@ -30,12 +30,16 @@ mod citation_structured;
 mod cli;
 mod conversation_store;
 mod disk_guard;
+mod display_carveout;
+mod ep_peer_lifeline;
 mod error_hints;
+mod glm_tool_boundary;
 pub mod grammar;
 mod halluc_probe;
 mod hint_injector;
 mod ids;
 mod ir;
+mod literal_xml;
 mod llmlingua;
 mod lookback_lens;
 mod loop_detector;
@@ -57,6 +61,7 @@ mod response_store;
 mod retrieval_heads;
 mod scheduler;
 mod scheduling_policy;
+mod session_key;
 mod session_manager;
 mod symbol_trie;
 mod tokenizer;
@@ -90,6 +95,8 @@ async fn main() -> Result<()> {
         // The benchmark subcommand is a script's entry point: always plain, so
         // nothing here reaches `tui::start` or takes the terminal.
         Command::Benchmark(_) => true,
+        // A launcher that execs its command at once.
+        Command::DisplayCarveout(_) => true,
     };
 
     let tui_channels = if tui::plain_mode(no_tui) {
@@ -124,6 +131,10 @@ async fn main() -> Result<()> {
             // right to flag.
             drop(shutdown_rx);
             cli::bench_run::dispatch(args).await
+        }
+        Command::DisplayCarveout(args) => {
+            drop(shutdown_rx);
+            display_carveout::run(args)
         }
         Command::Serve(args) => {
             let serving = serve(args, tui_channels);

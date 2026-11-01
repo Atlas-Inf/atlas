@@ -31,14 +31,18 @@ use crate::layer::ForwardContext;
 /// as the default-env runs: ST-995 job 464 84.92/84.93 vs job 280 84.72/84.68,
 /// paired McNemar 3 vs 1 discordant, p = 0.625; agentic perf leg job 465
 /// 1007/1007 turns, 73.3 min vs 89.3 min, TPOT median 48.9 vs 63.0 ms, score
-/// 0.491 vs 0.4899. `=0`/`=false` restores the old inert-bound refusal;
-/// gfx1151 (`atlas_scale`) keeps default OFF (unmeasured there).
+/// 0.491 vs 0.4899. `=0`/`=false` restores the old inert-bound refusal.
+/// Native HIP gfx1151 (strix-hip) defaults ON too since 2026-10-28: Flash-Next
+/// MTP1 tg at 8k / 32k cached depth 12.1 -> 18.9 / 18.0 tok/s (framework f55,
+/// main 8863dc5e5), and every gfx1151 ST-995 / agentic gate that week already
+/// ran with `=1` (f05 84.12/81.47, f48 84.52/81.97). SCALE strix keeps OFF
+/// (unmeasured there).
 pub(in crate::layers::qwen3_attention) fn verify_active_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         verify_active_decision(
             std::env::var("ATLAS_QSA_VERIFY_ACTIVE").ok().as_deref(),
-            cfg!(atlas_scale),
+            cfg!(atlas_scale) && !cfg!(atlas_hip),
         )
     })
 }
@@ -70,10 +74,6 @@ pub(super) struct RowsFacts {
     /// Every row belongs to ONE sequence (a verify window). Rows of different
     /// sequences are concurrent decode, which `decode_a2` routes per-sequence.
     pub single_owner: bool,
-    /// Expert/tensor-parallel comm present: `decode_a2` returns into the
-    /// batched path BEFORE its active-QSA gate there, so this guard is the
-    /// only thing between an EP serve and an unaudited path.
-    pub comm: bool,
     /// `--high-speed-swap` engaged: the gather reads the HBM pool.
     pub high_speed_swap: bool,
 }
@@ -91,8 +91,6 @@ impl RowsFacts {
             Some("the KV cache is not plain BF16")
         } else if !self.single_owner {
             Some("the rows span several sequences")
-        } else if self.comm {
-            Some("a parallel comm is present")
         } else if self.high_speed_swap {
             Some("--high-speed-swap is engaged")
         } else {
@@ -148,6 +146,13 @@ pub(super) fn plan_qsa_rows(
     let Some(qsa) = layer.qsa.as_ref() else {
         return Ok(false);
     };
+    // ATLAS_QWEN4EXP_BATCH_FAST_BISECT: every step through the per-row phase.
+    if ctx
+        .levers
+        .batch_bisect(crate::layers::ops::BISECT_ATTN_ROWS)
+    {
+        return Ok(true);
+    }
     // `seq_lens[i]` is row i's 0-based position (`pos + 1` tokens visible).
     let first_active = seq_lens
         .iter()
@@ -159,17 +164,22 @@ pub(super) fn plan_qsa_rows(
         return Ok(false);
     }
     let (k, v) = layer.kv_dtype.kv_pair();
-    let single_owner = match row_owner {
-        Some(map) => map.len() >= num_seqs && map.iter().take(num_seqs).all(|o| *o == map[0]),
-        None => num_seqs == 1,
-    };
+    // ATLAS_QWEN4EXP_BATCH_FAST: rows of several sequences are served too.
+    // Each row selects against ITS owner's indexer at ITS position and
+    // attends bs=1 over that selection, which is that sequence's serial
+    // decode step whichever other rows share the launch; on TP every rank
+    // runs the same rows (replicated selection, its own heads).
+    let single_owner = ctx.levers.qwen4exp_batch_fast
+        || match row_owner {
+            Some(map) => map.len() >= num_seqs && map.iter().take(num_seqs).all(|o| *o == map[0]),
+            None => num_seqs == 1,
+        };
     let facts = RowsFacts {
         switch_on: verify_active_enabled(),
         highway: layer.hc.is_some(),
         mla: layer.mla.is_some(),
         bf16_kv: matches!(k, KvCacheDtype::Bf16) && matches!(v, KvCacheDtype::Bf16),
         single_owner,
-        comm: ctx.comm.is_some(),
         high_speed_swap: layer.high_speed_swap_engaged(kv_cache),
     };
     plan_rows(first_active, qsa.inert_bound(), &facts)
@@ -185,7 +195,6 @@ mod tests {
         mla: false,
         bf16_kv: true,
         single_owner: true,
-        comm: false,
         high_speed_swap: false,
     };
 
@@ -197,7 +206,6 @@ mod tests {
             mla: true,
             bf16_kv: false,
             single_owner: false,
-            comm: true,
             high_speed_swap: true,
         };
         assert!(!plan_rows(None, 2051, &nothing).unwrap());
@@ -208,7 +216,7 @@ mod tests {
     fn an_active_row_is_served_only_by_the_exact_allow_list() {
         assert!(plan_rows(Some((1, 2051)), 2051, &SERVABLE).unwrap());
         // Flip each fact alone: every single one must refuse, with its reason.
-        let cases: [(RowsFacts, &str); 7] = [
+        let cases: [(RowsFacts, &str); 6] = [
             (
                 RowsFacts {
                     switch_on: false,
@@ -243,13 +251,6 @@ mod tests {
                     ..SERVABLE
                 },
                 "several sequences",
-            ),
-            (
-                RowsFacts {
-                    comm: true,
-                    ..SERVABLE
-                },
-                "comm",
             ),
             (
                 RowsFacts {

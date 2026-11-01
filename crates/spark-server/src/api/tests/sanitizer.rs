@@ -10,7 +10,7 @@
 use super::harness::Stream;
 use crate::tool_parser::{LeakMarkers, Qwen3CoderParser, ToolCallParser};
 
-use crate::api::sanitizer::sanitize_content_chunk;
+use crate::api::sanitizer::{sanitize_content_chunk, sanitize_content_chunk_with_literal_state};
 use crate::api::stream_guards::flush_content_sanitizer;
 
 #[path = "sanitizer_holdback_tests.rs"]
@@ -58,6 +58,7 @@ fn a_tag_split_across_chunks_still_matches() {
         first, "abc",
         "only the suffix that could still be a tag prefix is held back"
     );
+    assert_eq!(s.buffered(), "<param");
     assert!(!s.suppressing(), "a partial tag is not yet a leak");
     s.feed("eter=x>body</parameter>tail");
     assert_eq!(s.finish(), "abctail");

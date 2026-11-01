@@ -92,7 +92,7 @@ pub(super) async fn translate_chat_response_to_responses(
     conversation: Option<(Arc<crate::conversation_store::ConversationStore>, String)>,
 ) -> Response {
     let chat = match outcome {
-        super::chat::ChatOutcome::Http(r) => return r,
+        super::chat::ChatOutcome::Http(r) => return input_param(r).await,
         // Unreachable: this encoder serves the non-streaming endpoint.
         super::chat::ChatOutcome::Streaming(_) => {
             return openai_error_response(
@@ -246,4 +246,60 @@ pub(super) async fn translate_chat_response_to_responses(
     }
 
     Json(body).into_response()
+}
+
+/// The chat layer names a message-borne error's field `messages` (e.g. an
+/// over-limit vision request); on the Responses API that field is `input`.
+/// Status and headers (a deferral's `Retry-After`) are kept.
+pub(super) async fn input_param(resp: Response) -> Response {
+    if resp.status().is_success() {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else {
+        return Response::from_parts(parts, axum::body::Body::empty());
+    };
+    let body = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(mut v) if v["error"]["param"] == "messages" => {
+            v["error"]["param"] = "input".into();
+            serde_json::to_vec(&v).unwrap_or_else(|_| bytes.to_vec())
+        }
+        _ => bytes.to_vec(),
+    };
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    Response::from_parts(parts, axum::body::Body::from(body))
+}
+
+#[cfg(test)]
+mod input_param_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_messages_param_becomes_input_and_the_rest_is_kept() {
+        let mut resp = openai_error_response_with_param(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy".into(),
+            Some("messages"),
+            Some("vision_capacity_busy"),
+        );
+        resp.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("2"),
+        );
+        let out = input_param(resp).await;
+        assert_eq!(out.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(out.headers()[axum::http::header::RETRY_AFTER], "2");
+        let bytes = axum::body::to_bytes(out.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["param"], "input");
+        assert_eq!(v["error"]["code"], "vision_capacity_busy");
+        let other = openai_error_response(StatusCode::BAD_REQUEST, "x".into());
+        let bytes = axum::body::to_bytes(input_param(other).await.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["error"]["param"].is_null(), "no param, none added");
+    }
 }

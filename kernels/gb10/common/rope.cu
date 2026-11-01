@@ -74,6 +74,9 @@ extern "C" __global__ void rope_forward(
 
     const unsigned int seq_pos = seq_block * pos_per_block + local_pos;
     if (seq_pos >= seq_len) return;
+    // Threads past the last whole position of this block (rotary_dim/2 not a
+    // divisor of 128) would rotate the next block's first row a second time.
+    if (local_pos >= pos_per_block) return;
 
     // Get absolute position for this token
     const unsigned int abs_pos = positions[batch * seq_len + seq_pos];
@@ -199,6 +202,7 @@ extern "C" __global__ void rope_forward_strided(
 
     const unsigned int seq_pos = seq_block * pos_per_block + local_pos;
     if (seq_pos >= seq_len) return;
+    if (local_pos >= pos_per_block) return;   // see rope_forward
 
     // Get absolute position for this token
     const unsigned int abs_pos = positions[batch * seq_len + seq_pos];
@@ -371,6 +375,7 @@ extern "C" __global__ void rope_forward_yarn(
 
     const unsigned int seq_pos = seq_block * pos_per_block + local_pos;
     if (seq_pos >= seq_len) return;
+    if (local_pos >= pos_per_block) return;   // see rope_forward
 
     const unsigned int abs_pos = positions[batch * seq_len + seq_pos];
 
@@ -432,6 +437,7 @@ extern "C" __global__ void rope_forward_yarn_scaled(
     const unsigned int pair_idx = tid % pairs_per_pos;
     const unsigned int seq_pos = seq_block * pos_per_block + local_pos;
     if (seq_pos >= seq_len) return;
+    if (local_pos >= pos_per_block) return;   // see rope_forward
 
     const unsigned int num_heads = is_q ? num_q_heads : num_kv_heads;
     __nv_bfloat16* ptr = (is_q ? Q : K)
@@ -495,6 +501,7 @@ extern "C" __global__ void rope_forward_yarn_interleaved(
 
     const unsigned int seq_pos = seq_block * pos_per_block + local_pos;
     if (seq_pos >= seq_len) return;
+    if (local_pos >= pos_per_block) return;   // see rope_forward
 
     const unsigned int abs_pos = positions[batch * seq_len + seq_pos];
 
@@ -560,6 +567,7 @@ extern "C" __global__ void rope_forward_yarn_interleaved_inv(
     const unsigned int pair_idx = tid % pairs_per_pos;
     const unsigned int seq_pos = seq_block * pos_per_block + local_pos;
     if (seq_pos >= seq_len) return;
+    if (local_pos >= pos_per_block) return;   // see rope_forward
 
     const unsigned int abs_pos = positions[batch * seq_len + seq_pos];
     const float freq = inv_freq[pair_idx];

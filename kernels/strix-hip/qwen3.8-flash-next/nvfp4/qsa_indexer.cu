@@ -1,0 +1,1 @@
+../../../gb10/qwen3.8-flash-next/nvfp4/qsa_indexer.cu

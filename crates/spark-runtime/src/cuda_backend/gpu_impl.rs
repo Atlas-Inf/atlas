@@ -40,12 +40,16 @@ use super::{
     AtlasCudaBackend, cuMemAlloc_v2, cuMemAllocManaged, cuMemFree_v2, cuMemGetInfo_v2,
     cuMemcpyDtoDAsync_v2, cuMemcpyDtoHAsync_v2, cuStreamSynchronize,
 };
-use crate::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
+use crate::gpu::{DevicePtr, GpuBackend, GraphHandle, HostPitched, KernelHandle};
 
 // The host-side copy helpers live beside this file — see its module doc for
 // why they could not stay (a trait `impl` cannot be split, so only the code
 // OUTSIDE the block can move, and the PR's merge with main needed it).
 use super::host_staging::{d2h_trace_tick, h2d_enqueue, warn_pinned_transient_source};
+
+mod pdl;
+use pdl::pdl_kernel;
+pub use pdl::{configure_pdl, pdl_enabled};
 
 impl GpuBackend for AtlasCudaBackend {
     fn alloc(&self, bytes: usize) -> Result<DevicePtr> {
@@ -62,7 +66,7 @@ impl GpuBackend for AtlasCudaBackend {
                 total as f64 / (1024.0 * 1024.0 * 1024.0),
             );
         }
-        self.record_alloc(DevicePtr(dptr));
+        self.record_alloc(DevicePtr(dptr), bytes);
         Ok(DevicePtr(dptr))
     }
 
@@ -76,19 +80,39 @@ impl GpuBackend for AtlasCudaBackend {
                  Check system swap space: swapon --show"
             );
         }
-        self.record_alloc(DevicePtr(dptr));
+        // Zero bytes: managed memory can sit in swap, so it is owned for the
+        // sweep but is not part of the footprint the ledger vouches for.
+        self.record_alloc(DevicePtr(dptr), 0);
         Ok(DevicePtr(dptr))
     }
 
+    fn register_slab(&self, base: DevicePtr, bytes: usize) {
+        self.slab_regions.lock().push((base.0, bytes as u64));
+    }
+
+    fn is_slab_interior(&self, ptr: DevicePtr) -> bool {
+        AtlasCudaBackend::is_slab_interior(self, ptr.0)
+    }
+
     fn free(&self, ptr: DevicePtr) -> Result<()> {
-        if ptr.is_null() {
+        if ptr.is_null() || super::display_carveout::free(ptr) {
             return Ok(());
         }
+        // Slab interior: the packing loader carved this pointer out of one
+        // shard-level cuMemAlloc, so there is nothing to free here. The slab
+        // base is in the ledger and is reclaimed by teardown/sweep.
+        if self.is_slab_interior(ptr.0) {
+            return Ok(());
+        }
+        // A real free: if this pointer is a slab base, its region must go —
+        // otherwise a later cuMemAlloc inside the stale extent would see its
+        // frees silently no-oped.
+        self.drop_slab_region(ptr.0);
         // Off the ledger BEFORE the free: an entry that survives a successful
         // free would be double-freed at teardown. On a real failure, restore
         // ownership to the backend ledger so `sweep_unreleased` is the final
         // cleanup backstop even if the sequence-local state is dropped.
-        self.forget_alloc(ptr);
+        let bytes = self.forget_alloc(ptr);
         let status = unsafe { cuMemFree_v2(ptr.0) };
         // A context that is already being destroyed reports every free as
         // failing, and at process exit that is the normal case, not an error:
@@ -99,7 +123,7 @@ impl GpuBackend for AtlasCudaBackend {
         // clean exit — the exact species of false alarm this work set out to
         // remove.
         if status != 0 && !atlas_core::registry::is_teardown_noop(status) {
-            self.record_alloc(ptr);
+            self.record_alloc(ptr, bytes.unwrap_or(0));
             bail!(
                 "cuMemFree_v2 failed: status {status}, ptr {ptr}; \
                  pointer restored to backend cleanup ledger"
@@ -110,6 +134,24 @@ impl GpuBackend for AtlasCudaBackend {
 
     fn sweep_unreleased(&self) -> usize {
         AtlasCudaBackend::sweep_unreleased(self)
+    }
+
+    fn carveout_capacity(&self) -> usize {
+        super::display_carveout::capacity()
+    }
+    fn alloc_carveout(&self, bytes: usize) -> Result<DevicePtr> {
+        super::display_carveout::alloc(bytes)
+    }
+
+    fn own_footprint(&self) -> Option<crate::own_footprint::OwnFootprint> {
+        // AMD unified memory (SCALE, HIP shim) runs this backend too, but what
+        // the counters mean there (device memory outside RSS, pinned host
+        // memory in RssShmem) was measured on the NVIDIA GB10 driver only.
+        // Until it is measured on AMD, sizing there uses free memory alone.
+        if cfg!(atlas_scale) {
+            return None;
+        }
+        Some(AtlasCudaBackend::own_footprint(self))
     }
 
     fn copy_h2d(&self, src: &[u8], dst: DevicePtr) -> Result<()> {
@@ -169,7 +211,9 @@ impl GpuBackend for AtlasCudaBackend {
             // see `fault_probe`. This does not change control flow: the caller
             // still receives its error either way.
             super::fault_probe::note_failure("kernel launch", &e.to_string());
-            anyhow::anyhow!("Kernel launch failed: {e}")
+            // Name the kernel: under CUDA_LAUNCH_BLOCKING=1 this is the kernel
+            // that faulted, and grid/block alone do not identify it.
+            anyhow::anyhow!("Kernel launch failed ({}): {e}", kernel_name(raw_func.0))
         })
     }
 
@@ -196,6 +240,14 @@ impl GpuBackend for AtlasCudaBackend {
         let status = unsafe { cuStreamSynchronize(stream) };
         if status != 0 {
             bail!("cuStreamSynchronize failed: {}", cuda_error_text(status));
+        }
+        Ok(())
+    }
+
+    fn synchronize_device(&self) -> Result<()> {
+        let status = unsafe { super::cuCtxSynchronize() };
+        if status != 0 {
+            bail!("cuCtxSynchronize failed: {}", cuda_error_text(status));
         }
         Ok(())
     }
@@ -230,6 +282,9 @@ impl GpuBackend for AtlasCudaBackend {
         match registry.raw_function_cached(&cache, module, func_name) {
             Ok(raw) => {
                 crate::kernel_audit::record(module, func_name, true, site);
+                if pdl_kernel(func_name) {
+                    atlas_core::registry::mark_pdl(raw);
+                }
                 Ok(KernelHandle(raw.0 as u64))
             }
             Err(e) => {
@@ -274,6 +329,10 @@ impl GpuBackend for AtlasCudaBackend {
         h2d_enqueue(src, dst, stream)
     }
 
+    fn host_pitched(&self) -> Option<&dyn HostPitched> {
+        Some(self)
+    }
+
     fn copy_d2d_async(
         &self,
         src: DevicePtr,
@@ -304,9 +363,11 @@ impl GpuBackend for AtlasCudaBackend {
         height: usize,
         stream: u64,
     ) -> Result<()> {
-        // NVIDIA: one pitched copy (cudaMemcpyDeviceToDevice = 3) on the caller's
-        // stream via the cudart runtime, replacing a per-row copy_d2d_async loop.
-        #[cfg(not(atlas_scale))]
+        // NVIDIA and native HIP (strix-hip): one pitched copy
+        // (cudaMemcpyDeviceToDevice = 3) on the caller's stream via the cudart
+        // runtime — on HIP the cudart→HIP shim maps this to hipMemcpy2DAsync —
+        // replacing a per-row copy_d2d_async loop.
+        #[cfg(any(not(atlas_scale), atlas_hip))]
         {
             unsafe extern "C" {
                 fn cudaMemcpy2DAsync(
@@ -337,10 +398,11 @@ impl GpuBackend for AtlasCudaBackend {
             }
             Ok(())
         }
-        // strix/SCALE: no cudart runtime linked (SCALE's libcuda is driver-only).
-        // Fall back to the per-row driver-API loop this pitched copy replaced —
-        // `copy_d2d_async` uses `cuMemcpyDtoDAsync`, which SCALE provides.
-        #[cfg(atlas_scale)]
+        // strix/SCALE (not strix-hip): no cudart runtime linked (SCALE's
+        // libcuda is driver-only). Fall back to the per-row driver-API loop
+        // this pitched copy replaced — `copy_d2d_async` uses
+        // `cuMemcpyDtoDAsync`, which SCALE provides.
+        #[cfg(all(atlas_scale, not(atlas_hip)))]
         {
             for row in 0..height {
                 let s = DevicePtr(src.0 + (row * src_pitch) as u64);
@@ -400,6 +462,9 @@ impl GpuBackend for AtlasCudaBackend {
     fn create_stream(&self) -> Result<u64> {
         self.create_stream_cu()
     }
+    fn destroy_stream(&self, stream: u64) -> Result<()> {
+        self.destroy_stream_cu(stream)
+    }
     fn bind_to_thread(&self) -> Result<()> {
         self.bind_to_thread_cu()
     }
@@ -456,3 +521,7 @@ impl GpuBackend for AtlasCudaBackend {
         self.free_host_pinned_cu(ptr, _bytes)
     }
 }
+
+#[path = "gpu_impl/kernel_name.rs"]
+mod kernel_name;
+use kernel_name::kernel_name;

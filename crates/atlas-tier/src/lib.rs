@@ -35,7 +35,9 @@ mod traits;
 pub mod entropy;
 pub mod hash;
 
-pub use direct_swap::DirectSwapFile;
+pub use direct_swap::{
+    DirectSwapFile, SharedRecordFile, fs_kind, remove_stale_swap_files, unsuitable_swap_fs,
+};
 pub use mem::{MemSwapStore, VecSlotArena};
 pub use residency::Residency;
-pub use traits::{SlotArena, SwapStats, SwapStore};
+pub use traits::{ConcurrentSwapStore, SlotArena, SwapStats, SwapStore};

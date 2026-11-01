@@ -28,6 +28,9 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
+#[path = "verify_a_decode_snapshot.rs"]
+mod decode_snapshot;
+
 impl TransformerModel {
     pub(super) fn decode_verify_dispatch(
         &self,
@@ -73,15 +76,7 @@ impl TransformerModel {
                     let pos = seq.seq_len + t;
                     let bs = kv_cache.block_size();
                     let blocks_needed = (pos / bs) + 1;
-                    ensure_blocks_through_decode(
-                        seq,
-                        blocks_needed - 1,
-                        &mut kv_cache,
-                        self.prefix_cache.as_ref(),
-                        self.gpu.as_ref(),
-                        stream,
-                        self.levers.kv_poison,
-                    )?;
+                    self.reserve_decode_blocks(seq, blocks_needed - 1, &mut kv_cache, stream)?;
 
                     // Upload per-token attention metadata
                     let meta_base = self.buffers.scratch().offset(32768);
@@ -143,6 +138,7 @@ impl TransformerModel {
                     };
 
                     let ctx = ForwardContext {
+                        ssm_batch: None,
                         buffers: &self.buffers,
                         gpu: self.gpu.as_ref(),
                         config: &self.config,
@@ -180,6 +176,7 @@ impl TransformerModel {
             } else {
                 // SSM layers: GEMM-batched via decode_batched override
                 let ctx = ForwardContext {
+                    ssm_batch: None,
                     buffers: &self.buffers,
                     gpu: self.gpu.as_ref(),
                     config: &self.config,
@@ -319,6 +316,34 @@ impl TransformerModel {
     ) -> Result<()> {
         use crate::layer::SsmLayerState;
 
+        // KDA records: the verify left h_state untouched. Fold the accepted
+        // rows in, or on a full reject restore conv alone from its checkpoint.
+        if self.ssm_pool.kda_record_row_bytes != 0 {
+            let stream = self.gpu.default_stream();
+            if num_accepted > 0 {
+                return self.commit_kda_records(seq, 0..num_accepted, true, stream);
+            }
+            let conv_bytes = self.config.ssm_conv_state_bytes();
+            let mut conv_plan = Vec::new();
+            for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
+                if self.config.layer_type(i) != atlas_core::config::LayerType::LinearAttention {
+                    continue;
+                }
+                let ssm = layer_state
+                    .as_any_mut()
+                    .downcast_mut::<SsmLayerState>()
+                    .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState at layer {i}"))?;
+                if let Some(ckpt) = ssm.conv_state_checkpoint {
+                    conv_plan.push(StateCopy {
+                        src: ckpt,
+                        dst: ssm.conv_state,
+                        bytes: conv_bytes,
+                    });
+                }
+            }
+            return run_ssm_state_copies(self.gpu.as_ref(), &[], &conv_plan, stream);
+        }
+
         // PRE-VALIDATION PASS — no GPU work is enqueued until every SSM layer
         // is known to be restorable. Bailing part-way through the copy loop
         // below would leave the first N layers rewound and the rest advanced
@@ -354,12 +379,20 @@ impl TransformerModel {
         let stream = self.gpu.default_stream();
         let mut h_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
         let mut conv_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
+        // ATLAS_QWEN4EXP_EXACT_DEFER: h and conv replayed from H0, one launch.
+        let mut exact_layers = Vec::new();
+        let exact = self.gdn_pending_is_exact();
         for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
             if self.config.layer_type(i) == atlas_core::config::LayerType::LinearAttention {
                 let ssm = layer_state
                     .as_any_mut()
                     .downcast_mut::<SsmLayerState>()
                     .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState at layer {i}"))?;
+                if exact && ssm.gdn_commit_pending && num_accepted > 0 {
+                    ssm.gdn_commit_pending = false;
+                    exact_layers.push(self.gdn_exact_commit_entry(i, ssm));
+                    continue;
+                }
 
                 // Pool h STORAGE width (SSOT: ssm_reserve::ssm_h_stored_bytes).
                 let h_bytes = self.ssm_pool.h_stored_bytes;
@@ -430,60 +463,12 @@ impl TransformerModel {
         // pre-validation pass above already guarantees no bail can happen
         // here, and building the plan first makes that structural rather
         // than argued: a partially-rewound MIXED state is unrepresentable.
+        if !exact_layers.is_empty() {
+            self.commit_gdn_exact(&exact_layers, num_accepted, stream)?;
+        }
         run_ssm_state_copies(self.gpu.as_ref(), &h_plan, &conv_plan, stream)?;
         // No synchronize needed: rollback copies and subsequent operations
         // are on the same CUDA stream, so ordering is guaranteed.
         Ok(())
-    }
-
-    /// Phase-C decode-time boundary snapshot save.
-    ///
-    /// Copies the sequence's live SSM state (the active `SsmStatePool`
-    /// slot `seq.slot_idx`) into the decode-rollback ring slot
-    /// `(seq.slot_idx, ring_slot)` of [`SsmSnapshotPool`]. Reuses the
-    /// same D2D copy primitive Marconi and MTP verify use (SSOT). The
-    /// copies run on the default stream so they are ordered after the
-    /// decode that produced this boundary token and before any later
-    /// decode that would overwrite the pool slot.
-    pub(super) fn save_decode_ssm_snapshot_dispatch(
-        &self,
-        seq: &SequenceState,
-        ring_slot: usize,
-    ) -> Result<()> {
-        if !self.ssm_snapshots.decode_rollback_enabled() {
-            anyhow::bail!("save_decode_ssm_snapshot: decode-rollback region not allocated");
-        }
-        let stream = self.gpu.default_stream();
-        self.ssm_snapshots.save_decode(
-            seq.slot_idx,
-            ring_slot,
-            &self.ssm_pool,
-            self.gpu.as_ref(),
-            stream,
-        )
-    }
-
-    /// Phase-C decode-time boundary snapshot restore.
-    ///
-    /// Inverse of [`Self::save_decode_ssm_snapshot_dispatch`]: copies the
-    /// ring snapshot `(seq.slot_idx, ring_slot)` back into the live
-    /// `SsmStatePool` slot, undoing every recurrent update the dropped
-    /// degenerate tail applied.
-    pub(super) fn restore_decode_ssm_snapshot_dispatch(
-        &self,
-        seq: &SequenceState,
-        ring_slot: usize,
-    ) -> Result<()> {
-        if !self.ssm_snapshots.decode_rollback_enabled() {
-            anyhow::bail!("restore_decode_ssm_snapshot: decode-rollback region not allocated");
-        }
-        let stream = self.gpu.default_stream();
-        self.ssm_snapshots.restore_decode(
-            seq.slot_idx,
-            ring_slot,
-            &self.ssm_pool,
-            self.gpu.as_ref(),
-            stream,
-        )
     }
 }

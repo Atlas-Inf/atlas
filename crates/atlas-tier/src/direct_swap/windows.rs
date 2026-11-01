@@ -35,6 +35,19 @@ impl DirectSwapFile {
         Ok(Self { file, record_bytes })
     }
 
+    /// As [`Self::create`], but the file must not exist (see the unix
+    /// implementation; there is no owner-only mode to set here).
+    pub fn create_new(path: &Path, record_bytes: usize) -> Result<Self> {
+        validate_record_bytes(record_bytes)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
+        Ok(Self { file, record_bytes })
+    }
+
     fn offset(&self, disk_slot: usize) -> u64 {
         disk_slot as u64 * self.record_bytes as u64
     }

@@ -10,12 +10,14 @@ pub(crate) mod middleware;
 pub(crate) mod model_host;
 pub(crate) mod model_swap;
 pub(crate) mod promotion;
+pub(crate) mod reference_mode;
 pub(crate) mod scheduler_supervisor;
 pub(crate) mod serve;
 pub(crate) mod serve_flags;
 pub(crate) mod serve_load;
 pub(crate) mod serve_phases;
 mod serve_router;
+pub(crate) mod vision_processor;
 
 #[cfg(test)]
 mod tests;
@@ -23,3 +25,4 @@ mod tests;
 pub(crate) use app_state::AppState;
 pub(crate) use kv_dtypes::{auto_high_precision_layers, build_layer_kv_dtypes};
 pub(crate) use serve::serve;
+mod processor_pixels;

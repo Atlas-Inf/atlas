@@ -1,0 +1,20 @@
+# Qwen3.8-Flash-Next EXL3 (exllamav3 trellis) checkpoints.
+#
+# An EXL3 checkpoint keeps its non-linear weights (norms, embeddings, router,
+# MoE experts after materialize) on the same kernels as the NVFP4 build, so
+# this target is `nvfp4/` plus the EXL3 kernels in this dir:
+#
+#   common/  ->  nvfp4/  ->  exl3/
+#
+# Sources and KERNEL.toml both layer in that order (`[modules]`, flags and
+# `[shadow_exempt]` from nvfp4/ carry over). A stem here may not shadow one
+# in nvfp4/ — the build refuses it; change the base instead. The nvfp4-only
+# build does not carry these kernels, so an EXL3 checkpoint needs
+# `ATLAS_TARGET_QUANT=exl3` (or `*`).
+#
+#   exl3.cu       vendored exllamav3 reconstruct / Hadamard / hgemm entry
+#                 points
+#   exl3_vendor/  the vendored exllamav3 device headers (see its NOTICE.md)
+
+[build]
+base_quant = "nvfp4"

@@ -21,7 +21,10 @@
 
 #[cfg(test)]
 mod cancel_guard_tests;
+
 mod ctx;
+#[cfg(test)]
+mod glm_tool_boundary_tests;
 mod handle_done;
 mod handle_error;
 mod handle_token;
@@ -29,6 +32,7 @@ mod state;
 mod strip;
 mod token_ids;
 mod tool_handlers;
+mod tool_security;
 
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive};
@@ -64,6 +68,7 @@ pub(crate) async fn run_chat_stream(
     image_pixels: Vec<spark_model::VisionItem>,
     max_tokens: usize,
     min_tokens: usize,
+    ignore_eos: bool,
     temperature: f32,
     top_k: u32,
     top_p: f32,
@@ -78,6 +83,7 @@ pub(crate) async fn run_chat_stream(
     lz_penalty: f32,
     logit_bias: Vec<(u32, f32)>,
     enable_thinking: bool,
+    force_nonempty_content: bool,
     thinking_budget: Option<u32>,
     repetition_detection: Option<crate::api::inference_types::RepetitionDetectionParams>,
     tools_active: bool,
@@ -134,6 +140,7 @@ pub(crate) async fn run_chat_stream(
         image_pixels,
         max_tokens,
         min_tokens,
+        ignore_eos,
         temperature,
         top_k,
         top_p,
@@ -149,6 +156,7 @@ pub(crate) async fn run_chat_stream(
         logit_bias,
         stop_tokens,
         enable_thinking: scheduler_thinking,
+        force_nonempty_content,
         thinking_budget,
         repetition_detection,
         require_tool_call: tool_choice_required,
@@ -184,13 +192,22 @@ pub(crate) async fn run_chat_stream(
     let leak_markers: tool_parser::LeakMarkers = state
         .tool_call_parser
         .as_ref()
-        .map(|p| p.leak_markers())
+        .map(|p| {
+            p.leak_markers()
+                .for_literal_xml(state.tokenizer.glm_tool_markup_as_text)
+        })
         .unwrap_or(tool_parser::LeakMarkers::EMPTY);
 
-    let max_tool_calls_per_response: usize = std::env::var("ATLAS_MAX_TOOL_CALLS_PER_RESPONSE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(12);
+    // `--reference-mode`: no per-response tool-call cap (a reference server
+    // returns every call the model emits).
+    let max_tool_calls_per_response: usize = if state.reference_mode {
+        usize::MAX
+    } else {
+        std::env::var("ATLAS_MAX_TOOL_CALLS_PER_RESPONSE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(12)
+    };
 
     // Cache the hold-back window length once. vLLM's
     // `IncrementalDetokenizer.update` uses
@@ -216,7 +233,8 @@ pub(crate) async fn run_chat_stream(
         prompt_len,
         enable_thinking,
         tool_defs_for_backfill: tool_defs,
-        cwd_for_normalize: cwd_hint,
+        // `--reference-mode`: tool-call paths are returned as generated.
+        cwd_for_normalize: if state.reference_mode { None } else { cwd_hint },
         stop_strings,
         stop_string_buffer_len,
         leak_markers,
@@ -224,7 +242,9 @@ pub(crate) async fn run_chat_stream(
             .tool_call_parser
             .as_ref()
             .is_some_and(|p| p.wants_typed_arguments()),
+        role_literal_leaks: state.tokenizer.filters_bare_role_literals(),
         max_tool_calls_per_response,
+        min_tokens,
         req_return_token_ids,
         req_ctx,
         dump_seq,
@@ -306,6 +326,7 @@ pub(crate) async fn run_chat_stream(
                 )
             }
             StreamEvent::Error(msg) => handle_error::handle_error(&ctx, msg),
+            StreamEvent::InvalidRequest(msg) => handle_error::handle_invalid_request(&ctx, msg),
         };
 
         futures::stream::iter(deltas).boxed()

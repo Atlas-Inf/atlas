@@ -114,3 +114,85 @@ min = 50.0
 
 [benchmarks.metrics.followed_directions]
 min = 49.0
+
+# --- NVIDIA's FP4-Local QAD checkpoint (nvidia/Qwen3.8-Flash-Next-FP4-Local) --
+# Served on its checkpoint-native formats (docs/checkpoints/qwen3.8-flash-next-
+# fp4-local.md). Different weights from the vendor pack above, so its own bars:
+# do NOT carry the pack's numbers across in either direction. Both entries were
+# bootstrapped per the repo protocol (manual drive with `--url/--model`), on
+# sparky (GB10), snapshot b9ce18a6, one profile:
+#   --max-num-seqs 1 --max-batch-size 1 --max-seq-len 32768
+#   --max-prefill-tokens 8192 --kv-cache-dtype bf16 --gpu-memory-utilization 0.9
+#   --enable-prefix-caching --fast-load-prefetch-shards --speculative
+#   --num-drafts 3, reasoning_effort "low", ATLAS_PLE_CACHE_GB=2,
+#   ATLAS_QWEN4EXP_{EXACT_VERIFY,DECODE_FUSE,BATCH_FAST,BATCH_SMALL}=1,
+#   ATLAS_QWEN4EXP_MTP_DEPTH=3 (+ ATLAS_QWEN4EXP_HC_FAST=1 where noted).
+# The recipe named here encodes exactly that profile; it is being added to
+# atlas-recipes alongside this entry.
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/Qwen3.8-Flash-Next-FP4-Local"
+gate = "bfcl-subset"
+recipe = "qwen3.8/qwen3.8-flash-next-fp4-local"
+label = "Qwen3.8-Flash-Next (FP4-Local, nvidia)"
+default = false
+status = "measured"
+note = """\
+Golden ST-995 draw (62/10/10, floor 25, n=995, seed 42, temp 0, no param \
+overrides) — the MLPerf edge-agentic ST leg. REFERENCE RECORDS: \
+(1) run-1792340347555552942, 2026-10-18, binary a78d2fb (sha256 8d566e68), \
+profile without HC_FAST; (2) run-1792488042130537521, 2026-10-20, binary \
+5ddfabb6e (sha256 8294e6b8), profile with HC_FAST. Both scored overall \
+87.44 / normalized 87.32. ★ As with the vendor pack above, that identity is \
+reproducibility across two builds and a lever change, NOT a repeat-spread: \
+the exact-verify and exact-batching lanes are bit-exact against serial decode \
+and the HC_FAST check found 0/256 rows different, so identical scores are what \
+correctness predicts. The 0.4 margin is the dense sibling's documented MTP \
+nondeterminism floor, inherited and labelled as such. Same build and flags \
+with the vendor pack swapped in scored 86.23 / 85.64 (run-1792378038850732185) \
+— one run each, an observation rather than a margin."""
+
+[benchmarks.metrics.samples]
+min = 995.0
+max = 995.0
+
+[benchmarks.metrics.overall_accuracy]
+# Measured 87.44 in both reference records; bar = measured less 0.4.
+min = 87.04
+noise = 0.4
+
+[benchmarks.metrics.normalized_single_turn_score]
+# Measured 87.32 in both reference records; bar = measured less 0.4. Above
+# the MLPerf-edge floor (85.32), which was derived for Qwen3.6-27B and does
+# not transfer across weights either way.
+min = 86.92
+noise = 0.4
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nvidia/Qwen3.8-Flash-Next-FP4-Local"
+gate = "agentic-webserver"
+recipe = "qwen3.8/qwen3.8-flash-next-fp4-local"
+label = "Qwen3.8-Flash-Next (FP4-Local, nvidia)"
+default = false
+status = "measured"
+note = """\
+REFERENCE RECORD: run-1792475013132909319, 2026-10-20, binary d773b218e, \
+profile with HC_FAST, harness iterations=50 max_turns=40 max_tokens=8192 \
+wall_budget_s=100000 — 50/50 webserver_ok, 50/50 followed_directions, 373 \
+turns, 375 tool calls, 98,142 completion tokens, Sigma-wall 4,502 s \
+(11.94 s/turn, decode 22.0 tok/s). ★ SPEED IS NOT GATED, for the reason the \
+vendor-pack entry gives: one record is one tier. The counts are ABSOLUTE \
+correctness bounds at their measured values and take no noise; `iterations` \
+is pinned at exactly 50."""
+
+[benchmarks.metrics.iterations]
+min = 50.0
+max = 50.0
+
+[benchmarks.metrics.webserver_ok]
+min = 50.0
+
+[benchmarks.metrics.followed_directions]
+min = 50.0

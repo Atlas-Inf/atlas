@@ -71,6 +71,11 @@ pub struct ModelConfig {
     /// 1D causal-conv kernel size on the SSM input (typically 3 or 4).
     #[serde(default = "default_conv_kernel")]
     pub linear_conv_kernel_dim: usize,
+    /// Bounded KDA decay-gate lower bound. `0.0` selects the regular GDN
+    /// `-exp(A) * softplus(.)` gate; GLM-5.3 sets `-5.0` and uses
+    /// `lower_bound * sigmoid(exp(A) * (. + dt_bias))` per key channel.
+    #[serde(default)]
+    pub kda_gate_lower_bound: f32,
 
     // ── MoE ──
     #[serde(default)]
@@ -341,15 +346,23 @@ pub struct ModelConfig {
     /// Length equals num_hidden_layers. Empty = all layers full attention.
     #[serde(default)]
     pub compress_ratios: Vec<usize>,
-    /// Number of semantic-indexer heads used by DeepSeek-V4 CSA layers.
+    /// Number of semantic-indexer heads used by sparse-attention layers.
     #[serde(default)]
     pub index_n_heads: usize,
-    /// Per-head dimension of the DeepSeek-V4 semantic indexer.
+    /// Per-head dimension of the semantic indexer.
     #[serde(default)]
     pub index_head_dim: usize,
     /// Maximum compressed-history rows selected per query by the semantic indexer.
     #[serde(default)]
     pub index_topk: usize,
+    /// Number of adjacent raw tokens represented by one GLM-5 indexer pool.
+    /// Zero means the architecture does not use k-pool compression.
+    #[serde(default)]
+    pub index_kpool: usize,
+    /// Whether GLM-5 appends the visible, incomplete k-pool tail to the
+    /// expanded top-k token indices.
+    #[serde(default)]
+    pub index_kpool_always_select_tail: bool,
     /// Indexer compression ratio, recorded WITHOUT populating
     /// `compress_ratios`.
     ///
@@ -462,6 +475,12 @@ pub struct ModelConfig {
     pub ep_rank: usize,
     #[serde(skip)]
     pub ep_world_size: usize,
+    /// Expert TP (`ATLAS_GLM_EXPERT_TP=1`): every EP rank holds all routed
+    /// experts, sliced like Megatron TP (gate/up rows and down columns
+    /// `[r*I/ep, (r+1)*I/ep)`), so every rank reads the same bytes per step
+    /// and the existing all-reduce sums the partial outputs.
+    #[serde(skip)]
+    pub expert_tp: bool,
 
     // ── Tensor Parallelism (set at runtime, not from config.json) ──
     /// TP rank within the TP sub-communicator. 0 if `tp_world_size==1`.
@@ -700,6 +719,12 @@ pub struct QuantizationConfig {
     /// map). This is what distinguishes the nvidia Flash-Next pack: 48 routed-
     /// expert layers at NVFP4, one FP8 PLE table, one FP8_PB_WO MTP block.
     pub quantized_layers: std::collections::BTreeMap<String, QuantLayerSpec>,
+    /// EXL3-only fields, populated when `quant_method == "exl3"` (see
+    /// `parsers/exl3.rs`). `None` for every other scheme; `Some(Err(msg))`
+    /// when an exl3 block is missing/mistyping a required field — the error
+    /// surfaces at the first consumer (`QuantizationConfig::exl3_config`),
+    /// because this parser has no error channel of its own.
+    pub exl3: Option<Result<Exl3QuantConfig, String>>,
 }
 
 /// One `quantized_layers` entry: the algorithm applied to that module path
@@ -708,6 +733,13 @@ pub struct QuantizationConfig {
 pub struct QuantLayerSpec {
     pub quant_algo: String,
     pub group_size: usize,
+    /// ModelOpt scale-stream encoding, e.g. `"csf"` or `"csf_32x2_v1"`.
+    /// `Some` marks the FP4-Local family (compressed scale streams beside
+    /// `weight_scale`); `None` for plain row scales.
+    pub weight_scale_encoding: Option<String>,
+    /// Per-module block-quant tile, e.g. `[1, 32]` (MXFP8's 1×32 group,
+    /// spelled as a tile) or `[128, 128]` (FP8_PB_WO). Empty when absent.
+    pub weight_block_size: Vec<usize>,
 }
 
 /// Whether a ModelOpt `quant_algo` label means NVFP4-packed weights.
@@ -721,64 +753,6 @@ pub struct QuantLayerSpec {
 pub fn is_nvfp4_quant_algo(algo: &str) -> bool {
     let a = algo.trim();
     a.eq_ignore_ascii_case("NVFP4") || a.to_ascii_uppercase().ends_with("_NVFP4")
-}
-
-/// Vision encoder configuration for Qwen3-VL models.
-#[derive(Debug, Clone)]
-pub struct VisionConfig {
-    /// Number of ViT transformer blocks (depth=27).
-    pub depth: usize,
-    /// ViT hidden dimension (1152).
-    pub hidden_size: usize,
-    /// Number of attention heads (16).
-    pub num_heads: usize,
-    /// Spatial patch size in pixels (16).
-    pub patch_size: usize,
-    /// Temporal patch size: still images are replicated this many times (2).
-    pub temporal_patch_size: usize,
-    /// 2×2 spatial merge: this many patch-lengths merged into one token (2).
-    pub spatial_merge_size: usize,
-    /// ViT MLP intermediate size (4304).
-    pub intermediate_size: usize,
-    /// Projection output dimension = LLM hidden_size (2048).
-    pub out_hidden_size: usize,
-    /// Layer indices after which deepstack mergers are applied ([8, 16, 24]).
-    pub deepstack_visual_indexes: Vec<usize>,
-    /// Placeholder token ID that marks where vision embeddings get spliced
-    /// into the text embedding stream. Qwen3-VL uses 151655; Qwen3.6 uses
-    /// 248056. When 0 the runtime falls back to the legacy Qwen3-VL value.
-    pub image_pad_token_id: u32,
-    /// Placeholder token ID for VIDEO frames, the temporal sibling of
-    /// [`Self::image_pad_token_id`]. Qwen3.6/3.8 use 248057. A distinct token
-    /// is what lets the position builder tell a video item from an image one
-    /// in the token stream, which matters because their MRoPE treatment
-    /// differs: an image holds T constant across its whole pad run, a video
-    /// advances T once per temporal group. When 0 the runtime falls back to
-    /// the family default.
-    pub video_pad_token_id: u32,
-    /// Resolved vision AREA bound in pixels: the operator's
-    /// `--vision-max-pixels`, else the checkpoint's `preprocessor_config.json`,
-    /// else `None`.
-    ///
-    /// ★ THE SINGLE SOURCE OF TRUTH, and it exists because there used to be
-    /// two. The CPU preprocessor clamped every image to 1280px on the long
-    /// side while the GPU encoder allocated its buffers for 6400 patches —
-    /// exactly 1280×1280 — with nothing in the code connecting them. They
-    /// agreed only by coincidence, so raising one on 2026-08-14 made every
-    /// image above 1280px fail an H2D copy with `CUDA_ERROR_INVALID_VALUE`
-    /// from deep inside the scheduler.
-    ///
-    /// Both now derive from this field, resolved once at config load, before
-    /// the encoder is constructed. `None` keeps the historical behaviour on
-    /// both sides.
-    pub max_pixels: Option<usize>,
-}
-
-impl VisionConfig {
-    /// Dimension of the merger input (spatial_merge_size² × hidden_size).
-    pub fn merger_input_size(&self) -> usize {
-        self.spatial_merge_size * self.spatial_merge_size * self.hidden_size
-    }
 }
 
 pub(crate) fn default_one() -> usize {
@@ -804,6 +778,7 @@ pub(crate) fn default_conv_kernel() -> usize {
 }
 
 mod dispatch;
+mod dispatch_nemotron;
 mod factory;
 mod gguf;
 mod methods;
@@ -812,19 +787,24 @@ mod ngram_qwen4exp;
 mod parsers;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_glm5_next;
+mod vision;
 
 pub use dispatch::parse_config;
 pub use gguf::{GgufConfigInputs, GgufMeta, config_from_gguf};
 pub use ngram::{NgramDims, ngram_ids, shift_right_ignore_eos, shift_right_ignore_eos_fill};
 pub use ngram_qwen4exp::Qwen4ExpNgram;
 pub use parsers::{
-    PEFT_SUPPORTED_TARGET_MODULES, PeftAdapterConfig, parse_mistral_params,
+    Exl3QuantConfig, PEFT_SUPPORTED_TARGET_MODULES, PeftAdapterConfig, parse_mistral_params,
     parse_peft_adapter_config, parse_quantization_config,
 };
 pub(crate) use parsers::{
-    parse_deepseek_v4, parse_gemma4_params, parse_laguna, parse_longcat_ngram, parse_minimax_m2,
-    parse_qwen4_exp, parse_step3p7, parse_vision_config,
+    parse_deepseek_v4, parse_gemma4_params, parse_glm5_next, parse_glm5_vision_config,
+    parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_qwen4_exp, parse_step3p7,
+    parse_vision_config,
 };
+pub use vision::{OmniVisionConfig, PixelBounds, VisionConfig, VisionTokenBudgets};
 
 pub(crate) fn finalize_config(config: &mut ModelConfig, raw: &serde_json::Value) -> Result<()> {
     if config.quantization_config.is_none() {

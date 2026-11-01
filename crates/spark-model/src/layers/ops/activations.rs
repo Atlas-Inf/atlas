@@ -36,6 +36,29 @@ pub fn silu_mul(
         .launch(stream)
 }
 
+/// SiLU·mul over a `[num_tokens, inter*2]` gate‖up layout — the first `inter`
+/// columns of each row are the gate, the next `inter` the up.
+///
+/// Kernel: `fused_silu_mul` (`dense_gemm_bf16.cu`), module `gemm`.
+pub fn fused_silu_mul(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gate_up: DevicePtr,
+    output: DevicePtr,
+    num_tokens: u32,
+    inter_size: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(num_tokens * inter_size / 2, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(gate_up)
+        .arg_ptr(output)
+        .arg_u32(num_tokens)
+        .arg_u32(inter_size)
+        .launch(stream)
+}
+
 /// Fused SiLU·mul + per-token-group(128) FP8-E4M3 quantization — replaces the
 /// `silu_mul` → `per_token_group_quant_fp8` pair on the W8A8 prefill down-path
 /// without materializing the BF16 intermediate. Bit-identical to the pair
@@ -69,6 +92,35 @@ pub fn silu_mul_quant_fp8(
         .arg_ptr(up)
         .arg_ptr(out_fp8)
         .arg_ptr(a_scale)
+        .arg_ptr(out_bf16)
+        .arg_u32(m)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Fused model-specific SiLU·mul + standard token-major NVFP4 quantization.
+/// The product rounds through BF16, so output is numerically identical to the
+/// separate `silu_mul` -> `quantize_bf16_to_nvfp4(scale2=1)` route.
+#[allow(clippy::too_many_arguments)]
+pub fn silu_mul_quant_nvfp4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gate: DevicePtr,
+    up: DevicePtr,
+    packed_out: DevicePtr,
+    scale_out: DevicePtr,
+    out_bf16: DevicePtr,
+    m: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([m, 1, 1])
+        .block([128, 1, 1])
+        .arg_ptr(gate)
+        .arg_ptr(up)
+        .arg_ptr(packed_out)
+        .arg_ptr(scale_out)
         .arg_ptr(out_bf16)
         .arg_u32(m)
         .arg_u32(k)

@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 
 use super::serve::{
     Prepared, canonicalize_model_quant, describe_quant_source, parse_default_chat_template_kwargs,
-    quant_pair_compatible, resolve_vision_max_pixels,
+    pick_quant_variant, quant_pair_compatible, resolve_vision_max_pixels,
 };
 use crate::api::InferenceRequest;
 use crate::main_modules::AppState;
@@ -36,6 +36,11 @@ use crate::{
     cli, conversation_store, rate_limiter, response_store, scheduler, scheduling_policy,
     session_manager,
 };
+
+mod launch_guards;
+mod vision_module;
+use launch_guards::{ensure_glm_tool_boundary, resolve_validated_prefill};
+use vision_module::{required_vision_module, target_has_required_vision_module};
 
 /// Load a model and build everything derived from it.
 ///
@@ -87,6 +92,14 @@ pub(crate) fn load_model(
     tui_handles_tx: Option<std::sync::mpsc::Sender<crate::tui::RunHandles>>,
     carried: Carried,
 ) -> Result<Option<Prepared>> {
+    // A mistyped drafter switch fails every rank here, before any weight load
+    // (the head that freezes the value is built last, on the head rank only).
+    if args.dflash {
+        spark_model::layers::dflash_head::FirstAppend::from_env()?;
+    }
+    // #158: the exact prefix-cache grid is read once, at model build.
+    spark_runtime::prefill_grid::set_exact_prefix_cache(args.exact_prefix_cache);
+
     // 0. Resolve model directory from HF ID or path
     spark_runtime::progress::phase(1, "model resolve");
     let model_dir = serve_phases::resolve_model_dir(&args)?;
@@ -111,6 +124,16 @@ pub(crate) fn load_model(
     // 1. Load model config (supports HF config.json and Mistral params.json)
     spark_runtime::progress::phase(2, "config");
     let (mut config, config_json) = serve_phases::load_model_config(&model_dir)?;
+    atlas_core::qwen_yarn::configure_context(&mut config, args.qwen_yarn_factor, args.max_seq_len)?;
+    if config.model_type == "qwen4_exp" && config.yarn_factor > 0.0 {
+        tracing::info!(
+            factor = config.yarn_factor,
+            original_context = config.yarn_original_max_position_embeddings,
+            context = args.max_seq_len,
+            attention_factor = config.yarn_attention_factor,
+            "Qwen static YaRN enabled; extended-context quality requires qualification"
+        );
+    }
 
     // CLI `--lm-head-dtype` override (replaces ATLAS_LMHEAD_BF16). Validate eagerly (PCND).
     // Sets both `lm_head_bf16_override` (skip/keep-quantized signal consumed by
@@ -143,7 +166,7 @@ pub(crate) fn load_model(
     // whose TOP LEVEL is already the quantization block.
     serve_phases::merge_sidecar_quant_config(&model_dir, &mut config);
 
-    // Vision area bound, resolved ONCE and installed on the config before
+    // Vision pixel budget, resolved ONCE and installed on the config before
     // anything derived from it exists.
     //
     // Ordering is load-bearing: the vision encoder sizes every device buffer
@@ -152,13 +175,51 @@ pub(crate) fn load_model(
     // preprocessor and the GPU encoder came to hold two different ideas of the
     // maximum image — the preprocessor clamped to 1280px, the encoder
     // allocated for 6400 patches, and nothing connected them.
-    let vision_max_pixels = resolve_vision_max_pixels(&args, &model_dir)?;
+    // Enntity/atlas 0eef4031: both bounds of each modality come from the
+    // checkpoint's processor config — a still below the min is scaled UP,
+    // a clip is sized over its frames.
+    let image = super::processor_pixels::read_declared_pixels(
+        &model_dir,
+        super::processor_pixels::Modality::Image,
+    );
+    let vision_max_pixels = resolve_vision_max_pixels(&args, image.map(|d| d.max_pixels))?;
     if let Some(v) = config.vision.as_mut() {
         v.max_pixels = vision_max_pixels;
+        v.min_pixels = image.and_then(|d| d.min_pixels);
+        v.video_pixels = super::processor_pixels::read_declared_pixels(
+            &model_dir,
+            super::processor_pixels::Modality::Video,
+        )
+        .and_then(|d| {
+            Some(atlas_core::config::PixelBounds {
+                min_pixels: d.min_pixels?,
+                max_pixels: d.max_pixels,
+            })
+        });
+        v.is_qwen3vl_video =
+            super::vision_processor::read_is_qwen3vl_video(&model_dir).unwrap_or_default();
+    }
+    if let Some(pixels) = args.video_max_pixels {
+        anyhow::ensure!(pixels > 0, "--video-max-pixels must be positive");
+        let vision = config
+            .vision
+            .as_mut()
+            .context("--video-max-pixels requires a vision model")?;
+        anyhow::ensure!(
+            !vision.is_glm5_next,
+            "--video-max-pixels is a Qwen video option"
+        );
+        let bounds = vision
+            .video_pixels
+            .as_mut()
+            .context("checkpoint lacks video pixel bounds")?;
+        bounds.max_pixels = pixels;
+        bounds.min_pixels = bounds.min_pixels.min(pixels);
+        tracing::info!("Qwen video pixel volume override: {pixels}");
     }
     match vision_max_pixels {
         Some(px) => tracing::info!(
-            "Vision area bound: {} px ({})",
+            "Vision pixel budget: {} px ({})",
             px,
             if args.vision_max_pixels > 0 {
                 "--vision-max-pixels"
@@ -173,7 +234,7 @@ pub(crate) fn load_model(
             }
         ),
         None => tracing::info!(
-            "Vision area bound: none declared — falling back to the 1280px long-side clamp"
+            "Vision pixel budget: none declared — falling back to the 1280px long-side clamp"
         ),
     }
 
@@ -216,7 +277,13 @@ pub(crate) fn load_model(
         enabled: args.video_allow_ffmpeg,
         binary: args.video_ffmpeg_path.clone(),
         max_frames: args.video_max_frames,
+        max_total_decoded_pixels: args.video_max_pixels,
         timeout_secs: args.video_decode_timeout_s,
+        max_output_bytes: args.video_max_pixels.map_or(512 * 1024 * 1024, |pixels| {
+            pixels
+                .saturating_mul(4)
+                .saturating_add(args.video_max_frames.saturating_mul(1024))
+        }),
         ..Default::default()
     };
     match spark_model::video_decode_ffmpeg::probe(&video_ffmpeg) {
@@ -302,6 +369,22 @@ pub(crate) fn load_model(
                 .collect::<Vec<_>>(),
         )
     })?;
+    // One target can compile several quant variants (qwen3.8-flash-next:
+    // nvfp4, and exl3 composed on it) under the same name, and
+    // `ptx_for_config` resolves by name — so it returns whichever variant
+    // was built first. Serve the one this checkpoint's quant asks for.
+    let ptx_set = {
+        let model_quant = canonicalize_model_quant(&config);
+        let mut variants: Vec<_> = atlas_kernels::available_targets()
+            .into_iter()
+            .filter(|t| t.target.model == ptx_set.target.model)
+            .collect();
+        let quants: Vec<&'static str> = variants.iter().map(|t| t.target.quant).collect();
+        match pick_quant_variant(&quants, &model_quant) {
+            Some(i) => variants.swap_remove(i),
+            None => ptx_set,
+        }
+    };
     let sampling_presets = ptx_set.sampling;
     // Record the RESOLVED target identity for the dashboard's kernel table.
     // It used to re-run resolution from (model_type, hidden_size), but that
@@ -343,21 +426,22 @@ pub(crate) fn load_model(
     );
 
     // Text-only kernel target + a checkpoint that ships a vision tower: honor the
-    // TARGET spec and serve text-only rather than failing the build at
-    // `vision_encoder module not loaded`. Some VL checkpoints (e.g.
-    // Kbenkhaled/Qwen3.5-27B-NVFP4) carry a `vision_config`, but their Atlas
-    // kernel target (qwen3.5-27b) ships no `vision_encoder` PTX module. Drop the
-    // vision tower to text-only; image inputs are unsupported until the target
-    // is rebuilt with vision.
-    if config.vision.is_some()
-        && !ptx_set
-            .modules
-            .iter()
-            .any(|(name, _)| *name == "vision_encoder")
-    {
+    // TARGET spec and serve text-only rather than failing the build at a missing
+    // vision module. Qwen-shaped VL targets use `vision_encoder`; native GLM-
+    // 5.3 uses the separate `glm_vision_encoder` module. Some VL checkpoints
+    // (e.g. Kbenkhaled/Qwen3.5-27B-NVFP4) carry a `vision_config`, but their
+    // Atlas kernel target ships no corresponding PTX module. Drop the vision
+    // tower to text-only; image inputs are unsupported until the target is
+    // rebuilt with vision.
+    let missing_vision_module = config.vision.as_ref().and_then(|vision| {
+        let required = required_vision_module(vision.is_glm5_next);
+        (!target_has_required_vision_module(vision.is_glm5_next, &ptx_set.modules))
+            .then_some(required)
+    });
+    if let Some(required_vision) = missing_vision_module {
         tracing::warn!(
             "Checkpoint declares a vision tower but kernel target {} ships no \
-             vision_encoder module — serving TEXT-ONLY (image inputs ignored). \
+             {required_vision} module — serving TEXT-ONLY (image inputs ignored). \
              Rebuild the target with vision to enable images.",
             ptx_set.target,
         );
@@ -373,16 +457,19 @@ pub(crate) fn load_model(
     // `args.num_drafts` is Some and `args.resolved_num_drafts()` is valid.
     serve_phases::apply_model_default_num_drafts(&mut args, &ptx_set);
 
-    let (gpu, free_mem) = serve_phases::init_gpu_backend(&args, &ptx_set)?;
-
     // ── Pre-load reserve preflight ──
+    let (gpu, free_mem, prepared_topology, reserve) =
+        serve_phases::prepare_reserve(&args, &mut config, || {
+            serve_phases::init_gpu_backend(&args, &ptx_set)
+        })?;
     let serve_phases::ReservePreflight {
         inference_reserve,
         buffer_arena_bytes,
         gdn_two_phase_bytes,
         ssm_prefill_chunk,
         max_batch_tokens_pre,
-    } = serve_phases::preflight_reserve(&args, &config, free_mem)?;
+        resolved_prefill,
+    } = reserve;
     let total_reserve = inference_reserve + buffer_arena_bytes;
 
     // 2a-2. OOM watchdog: background async task that polls GPU memory every 2s.
@@ -415,7 +502,12 @@ pub(crate) fn load_model(
         ep_size,
         tp_rank: _tp_rank,
         ep_rank,
-    } = serve_phases::resolve_topology(&args, &mut config)?;
+    } = match prepared_topology {
+        Some(topology) => topology,
+        None => serve_phases::resolve_topology(&args, &mut config)?,
+    };
+    let resolved_prefill =
+        resolve_validated_prefill(&args, &config, resolved_prefill, ssm_prefill_chunk)?;
     // FP8 KV calibration precedence (highest wins): an explicit
     // --fp8-kv-calibration-tokens ALWAYS wins — including 0, which
     // force-disables calibration on a model whose MODEL.toml enables it
@@ -462,10 +554,16 @@ pub(crate) fn load_model(
     // currently only consulted via `detect_nvfp4_variant`; explicit
     // use at each load site is a follow-up migration.
     let quant_format = spark_model::quant_format::detect_quant_format(&config, &store);
+    // EXL3 has no Nvfp4Variant at all (`base_variant` refuses to guess), so
+    // only ask for it for the formats that do map onto the variant dispatch.
+    let variant = if quant_format.name() == "exl3" {
+        "n/a (exl3)".to_string()
+    } else {
+        format!("{:?}", quant_format.base_variant())
+    };
     tracing::info!(
-        "Quantization format: {} (base variant {:?}), ignored globs = {}",
+        "Quantization format: {} (base variant {variant}), ignored globs = {}",
         quant_format.name(),
-        quant_format.base_variant(),
         match &config.quantization_config {
             Some(qc) => qc.ignore_modules.len(),
             None => 0,
@@ -510,7 +608,7 @@ pub(crate) fn load_model(
         prefill_budget,
         max_batch_tokens,
         spec_tokens: _spec_tokens,
-    } = serve_phases::resolve_prefill_budget(&args, ssm_prefill_chunk);
+    } = resolved_prefill;
     // Every BufferArena region is sized by this. Carry it so the ONE arena
     // that is allocated inside a weight loader — qwen4_exp's PLE scratch —
     // can be sized by it too instead of a standalone constant. Same
@@ -547,8 +645,9 @@ pub(crate) fn load_model(
         &args,
         gpu.as_ref(),
         world_size,
+        prefill_budget,
         max_batch_tokens,
-        config.hidden_size,
+        &config,
     )?;
     // Carried on the config rather than written into the environment: the old
     // `unsafe set_var` claimed "called before any threads are spawned", which
@@ -714,6 +813,13 @@ pub(crate) fn load_model(
     // Phase 6.3 — HSS config built early so the EP worker can install it.
     let early_high_speed_swap_cfg = serve_phases::build_high_speed_swap_config(&args)?;
 
+    // Build EOS token list from generation_config.json (authoritative) or config.json fallback.
+    // Loaded before the worker split: every rank's verify head bans these below a
+    // request's min_tokens floor.
+    let mut eos_tokens = serve_phases::load_eos_tokens(&model_dir, &config);
+    spark_model::traits::EosBan::install_model_end_tokens(&eos_tokens);
+    spark_model::traits::EosBan::install_target_ban(&config.model_type);
+
     // EP worker: rank > 0 enters command loop, returns when head exits.
     let mut model_opt = Some(model);
     if serve_phases::maybe_run_ep_worker(&args, &mut model_opt, &early_high_speed_swap_cfg)? {
@@ -722,9 +828,11 @@ pub(crate) fn load_model(
         return Ok(None);
     }
     let model = model_opt.expect("head retains model on rank 0");
-
-    // Build EOS token list from generation_config.json (authoritative) or config.json fallback
-    let mut eos_tokens = serve_phases::load_eos_tokens(&model_dir, &config);
+    // Read before the scheduler takes the model: the API's admission check
+    // needs the encoder's output window (`spark_model::vision_limits`). A
+    // model whose tower did not load (window 0) serves text only, and the
+    // API refuses media as it does for a text model. Enntity/atlas b060f987.
+    let _ = model.vision_row_limits();
 
     // Read default sampling parameters from generation_config.json.
     let serve_phases::SamplingDefaults {
@@ -742,6 +850,26 @@ pub(crate) fn load_model(
     // The --enable-thinking flag controls OPEN-ENDED vs CLOSED thinking.
     let caps = config.capabilities();
     let supports_thinking = caps.supports_thinking;
+    // `--reference-mode`: one neutralized copy of `[behavior]`, read below by
+    // the watchdogs, the chat levers and AppState alike.
+    let behavior = {
+        let mut b = ptx_set.behavior.clone();
+        if args.reference_mode {
+            crate::main_modules::reference_mode::neutralize_behavior(&mut b);
+            let changes =
+                crate::main_modules::reference_mode::describe_changes(&ptx_set.behavior, &b);
+            tracing::warn!(
+                "REFERENCE MODE: client sampling only, model's own chat template, no injected \
+                 prompt text, all output watchdogs off. [behavior] changes: {}",
+                if changes.is_empty() {
+                    "none".to_string()
+                } else {
+                    changes.join(", ")
+                }
+            );
+        }
+        b
+    };
     let tokenizer = ChatTokenizer::from_model_dir(
         &model_dir,
         eos_tokens[0],
@@ -749,7 +877,8 @@ pub(crate) fn load_model(
         &config.model_type,
         ptx_set.behavior.jinja_template,
         Some(std::path::Path::new(".")), // repo root for override templates
-        args.disable_template_overrides,
+        args.disable_template_overrides || args.reference_mode,
+        ptx_set.behavior.verbatim_prompt,
     )?;
 
     // (AM1 attractor-mask registration removed 2026-06-03 — see
@@ -765,7 +894,6 @@ pub(crate) fn load_model(
         reasoning_parser_box,
         think_end_token,
         think_start_token,
-        code_fence_token,
         tool_call_start_token,
         tool_call_end_token,
         grammar_engine,
@@ -777,6 +905,12 @@ pub(crate) fn load_model(
         supports_thinking,
     );
 
+    ensure_glm_tool_boundary(
+        &config,
+        tokenizer_limits.glm_tool_boundary,
+        tool_call_start_token,
+    )?;
+
     // 7. Create scheduler channel + spawn scheduler
     spark_runtime::progress::phase(9, "scheduler");
     let (request_tx, request_rx) = mpsc::channel::<InferenceRequest>(args.max_num_seqs);
@@ -787,6 +921,17 @@ pub(crate) fn load_model(
     let model_name = serve_phases::resolve_model_name(&args, &config_json, &model_dir);
 
     let scheduler_model = model;
+    // Read before the scheduler takes the model: the API's admission check
+    // needs the encoder's output window (`spark_model::vision_limits`). A
+    // model whose tower did not load (window 0) serves text only, and the
+    // API refuses media as it does for a text model.
+    let (vision_window_rows, vision_request_bound) = scheduler_model.vision_row_limits();
+    let vision_config = config.vision.clone().filter(|_| vision_window_rows > 0);
+    if config.vision.is_some() && vision_config.is_none() {
+        tracing::warn!(
+            "vision config present but no vision tower loaded: image and video input is refused"
+        );
+    }
     let scheduler_eos = eos_tokens;
     // EP gate. v1 single-sequence worker protocol required max_batch_size=1
     // because each cmd targeted one slot and the head's per-token broadcast
@@ -930,7 +1075,7 @@ pub(crate) fn load_model(
     // cap per architecture.
     let scheduler_spontaneous_think_budget = args
         .max_thinking_budget
-        .unwrap_or(ptx_set.behavior.max_thinking_budget);
+        .unwrap_or(behavior.max_thinking_budget);
     // DFlash mode: the drafter proposes on raw argmax, so the verify steps
     // must judge acceptance on the same (GOLD) basis — skipping the
     // rep_pen/DRY pre-sample pipeline — or drafter and verifier disagree by
@@ -948,19 +1093,40 @@ pub(crate) fn load_model(
     // spawns — the installer this replaces ran from `log_behavior_audit`,
     // which is called well after the spawn.
     let watchdog_params = crate::scheduler::WatchdogParams::from_behavior(
-        &ptx_set.behavior,
-        args.max_inter_tool_prose,
+        &behavior,
+        if args.reference_mode {
+            Some(0)
+        } else {
+            args.max_inter_tool_prose
+        },
         args.content_loop_min_repeats,
     );
     // The run's levers. Shared with the dashboard so `/watchdog on|off`
     // toggles this run's flag; the MODEL.toml `[behavior]` value is its
     // starting position.
-    let sched_levers = std::sync::Arc::new(crate::scheduler::levers::SchedLevers::from_env());
+    let sched_levers = std::sync::Arc::new({
+        let mut l = crate::scheduler::levers::SchedLevers::from_env();
+        if args.reference_mode {
+            l.disable_watchdogs = true;
+        }
+        l
+    });
     sched_levers.set_loop_watchdog(crate::scheduler::resolve_content_loop_watchdog(
-        ptx_set.behavior.enable_loop_watchdog,
+        behavior.enable_loop_watchdog,
         std::env::var("ATLAS_CONTENT_LOOP_WATCHDOG").ok().as_deref(),
-        args.content_loop_watchdog,
+        if args.reference_mode {
+            Some(false)
+        } else {
+            args.content_loop_watchdog
+        },
     ));
+    // Content-loop steering (`ATLAS_LOOP_STEER`) rides on the armed watchdog
+    // and its thresholds.
+    crate::scheduler::loop_steer::install(
+        sched_levers.loop_watchdog(),
+        sched_levers.disable_watchdogs,
+        watchdog_params.content_loop_params(None),
+    );
     // The run's snapshot cell, shared with the dashboard for the same reason
     // and by the same route as the levers.
     let sched_snapshot = std::sync::Arc::new(crate::scheduler::snapshot::SnapshotCell::default());
@@ -1023,7 +1189,6 @@ pub(crate) fn load_model(
                 block_size,
                 think_end_token,
                 think_start_token,
-                code_fence_token,
                 tool_call_start_token,
                 tool_call_end_token,
                 grammar_engine,
@@ -1178,7 +1343,14 @@ pub(crate) fn load_model(
         .transpose()?
         .unwrap_or_default();
 
+    let tool_guard = args.tool_guard.policy().map_err(anyhow::Error::msg)?;
+    tracing::info!(
+        enabled = tool_guard.enabled,
+        max_bytes = tool_guard.max_bytes,
+        "tool-call guard configured"
+    );
     let state = Arc::new(AppState {
+        tool_guard,
         tokenizer,
         model_name,
         adapter_name: nllb_adapter_name
@@ -1199,13 +1371,24 @@ pub(crate) fn load_model(
         } else {
             Some(rotation_tx)
         },
-        chat: crate::api::chat::levers::ChatLevers::resolve(
-            ptx_set.behavior.tscg,
-            ptx_set.behavior.template_owns_tool_definitions,
-            ptx_set.behavior.disable_cwd_hint_injection,
-        ),
-        vision_config: config.vision.clone(),
+        chat: crate::api::chat::levers::ChatLevers::resolve(&ptx_set.behavior),
         vision_max_pixels,
+        vision_limits: vision_config.as_ref().map(|_| {
+            spark_model::vision_limits::VisionRowLimits::resolve(
+                vision_window_rows,
+                max_batch_tokens,
+                args.vision_max_request_rows,
+                vision_request_bound,
+                args.vision_max_inflight_rows,
+            )
+        }),
+        vision_budget: vision_config
+            .as_ref()
+            .filter(|_| args.vision_max_inflight_rows > 0)
+            .map(|_| {
+                spark_model::vision_budget::VisionRowBudget::new(args.vision_max_inflight_rows)
+            }),
+        vision_config,
         remote_image_policy,
         video_ffmpeg,
         video_fps: args.video_fps,
@@ -1217,6 +1400,7 @@ pub(crate) fn load_model(
         tool_call_parser,
         reasoning_parser: reasoning_parser_box,
         think_end_token_id: think_end_token,
+        glm_tool_boundary: tokenizer_limits.glm_tool_boundary,
         think_start_token_id: think_start_token,
         tool_max_tokens: args.tool_max_tokens,
         sampling_presets,
@@ -1226,7 +1410,7 @@ pub(crate) fn load_model(
         // Behavior and effective_context from MODEL.toml, embedded at build time.
         effective_context: 0, // TODO: embed effective_context in TargetPtxSet
         behavior: {
-            let mut b = ptx_set.behavior.clone();
+            let mut b = behavior.clone();
             if let Some(cli_budget) = args.max_thinking_budget {
                 b.max_thinking_budget = cli_budget;
             }
@@ -1243,8 +1427,12 @@ pub(crate) fn load_model(
             b
         },
         disable_thinking: args.disable_thinking,
+        reference_mode: args.reference_mode,
         default_thinking: default_kwargs.thinking,
-        default_reasoning_effort: default_kwargs.reasoning_effort,
+        default_reasoning_effort: match default_kwargs.reasoning_effort {
+            Some(effort) => Some(effort),
+            None => super::serve::model_default_reasoning_effort(&ptx_set.behavior)?,
+        },
         response_store,
         rate_limiter,
         conversation_store,

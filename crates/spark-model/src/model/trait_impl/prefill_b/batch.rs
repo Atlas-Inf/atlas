@@ -277,6 +277,7 @@ impl TransformerModel {
                 // forward overwrites the remaining scratch buffers before read.
                 if self.comm.is_some() {
                     self.buffers.zero_all(self.gpu.as_ref(), stream)?;
+                    self.buffers.note_rows(usize::MAX); // rows unknown to `zero_dirty`
                 } else if chunk_start == 0 {
                     self.buffers
                         .zero_prefill_essentials(self.gpu.as_ref(), stream)?;
@@ -287,13 +288,24 @@ impl TransformerModel {
                 // when the kernel-batched path actually reads N streams' worth
                 // of hidden at once; today each stream's layer-loop consumes
                 // offset 0 before the next stream overwrites it.)
-                self.prefill_b_embed_chunk(tokens, chunk_start, chunk_len, stream)?;
+                // Chunks after the first encode their own vision items right
+                // here, before the embed (chunk 0's encode ran inside the
+                // chunk-0 lookup, `vision_cache`).
+                self.vision_encode_chunk_items(
+                    seq,
+                    tokens,
+                    chunk_start,
+                    chunk_start + chunk_len,
+                    stream,
+                )?;
+                self.prefill_b_embed_chunk(seq, tokens, chunk_start, chunk_len, stream)?;
 
                 // Phase 2: prefix-cache + EP-sync + Marconi.
                 let (kv_write_start, marconi_skip) = self.prefill_b_prefix_lookup(
                     tokens,
                     seq,
                     chunk_start,
+                    chunk_len,
                     total,
                     &mut kv_cache,
                     stream,
@@ -365,6 +377,7 @@ impl TransformerModel {
                     chunk_len,
                     proc_start,
                     proc_count,
+                    0,
                     effective_seq_len_start,
                     &kv_cache,
                     stream,
@@ -406,6 +419,7 @@ impl TransformerModel {
                     needs_paged,
                     // Batched path does not do mid-chunk tail capture (single-seq only).
                     None,
+                    None,
                     stream,
                 )?;
 
@@ -442,6 +456,7 @@ impl TransformerModel {
                         proc_count,
                         0,
                         row_base + stream_idx,
+                        None,
                         stream,
                     )?
                 } else {

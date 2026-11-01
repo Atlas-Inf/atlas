@@ -22,14 +22,16 @@ RUN apt-get update -qq && \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 ENV CUDA_HOME=/usr/local/cuda
-# Override rust-toolchain.toml's 1.85 pin: a transitive dep (libloading 0.9)
-# now requires >= 1.88. Using `stable` defers to the toolchain that rustup
-# installed above (currently 1.93).
-ENV RUSTUP_TOOLCHAIN=stable
 
 WORKDIR /build
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+# Build with the toolchain rust-toolchain.toml pins (the one CI uses), installed
+# explicitly. The image used to force `RUSTUP_TOOLCHAIN=stable`, written when the
+# pin was 1.85; once the pin moved to 1.93.1 that override only made the image
+# drift ahead of CI, and a newer stable's `fetch_update` deprecation broke the
+# deny-warnings build on main 428c0f957.
+RUN rustup toolchain install
 COPY crates/ crates/
 COPY vendor/ vendor/
 COPY kernels/ kernels/

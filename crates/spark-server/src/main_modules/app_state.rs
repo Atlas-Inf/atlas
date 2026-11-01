@@ -33,6 +33,9 @@ pub fn resolve_adapter_slot(adapter_names: &[String], adapter: Option<&str>) -> 
 
 /// Shared application state accessible from all HTTP handlers.
 pub struct AppState {
+    /// Operator-only tool-call guard (`cli::ToolGuardArgs`; default on).
+    /// Ported from Enntity/atlas fa5331b2 et seq. (AGPL-3.0-only).
+    pub tool_guard: atlas_tool_guard::Policy,
     pub tokenizer: ChatTokenizer,
     pub model_name: String,
     /// Startup LoRA adapter name (`--lora-adapter NAME=…`). `None` = no
@@ -57,6 +60,13 @@ pub struct AppState {
     pub vision_config: Option<atlas_core::config::VisionConfig>,
     /// Optional vLLM-style image area cap applied before vision patching.
     pub vision_max_pixels: Option<usize>,
+    /// `vision_admit`: the per-request row cap (--vision-max-request-rows)
+    /// and the in-flight budget (--vision-max-inflight-rows; None = no
+    /// limit). Enntity/atlas 7d33dd4c + d85c88d0.
+    pub vision_limits: Option<spark_model::vision_limits::VisionRowLimits>,
+    /// Vision rows whose pixels all requests may hold at once
+    /// (`spark_model::vision_budget`). `None`: unbounded, or a text model.
+    pub vision_budget: Option<std::sync::Arc<spark_model::vision_budget::VisionRowBudget>>,
     /// Whether (and how) to fetch `image_url` parts carrying an http(s) URL.
     /// Default-disabled; see `api::chat::remote_image` for why this one
     /// capability is opt-in rather than default-ON with a kill-switch.
@@ -104,6 +114,8 @@ pub struct AppState {
     pub sampling_presets: atlas_kernels::SamplingPresets,
     /// Token ID for `<tool_call>` — used for logit bias boost when tools are active.
     pub tool_call_start_token_id: Option<u32>,
+    /// Actual GLM native opener, model-scoped at startup; gated by request tools.
+    pub glm_tool_boundary: Option<u32>,
     /// Auto-compact threshold (fraction of max_seq_len). None = disabled.
     pub auto_compact_threshold: Option<f32>,
     /// Default request timeout in seconds. 0 = no timeout.
@@ -119,6 +131,9 @@ pub struct AppState {
     /// thinking is forced OFF regardless of the request body or the
     /// model's MODEL.toml default. Wired from `--disable-thinking`.
     pub disable_thinking: bool,
+    /// `--reference-mode`: no server-side change to sampling or prompt text.
+    /// See `main_modules::reference_mode`.
+    pub reference_mode: bool,
     /// Server-level default thinking directive applied when the client
     /// sends no thinking parameters. Overridden per-request by the request
     /// body. Wired from `--default-chat-template-kwargs` (parsed at the
@@ -127,11 +142,10 @@ pub struct AppState {
     /// Server-level default `reasoning_effort` (template side), applied
     /// in `api/chat/prepare.rs` when the request carries no effort and
     /// thinking is ON. Wired from `--default-chat-template-kwargs`
-    /// `{"reasoning_effort":"..."}`. `None` = the cross-template
-    /// `"medium"` fallback in `tokenizer/chat_render.rs` applies (the
-    /// neutral tier — pre-2026-08 the fallback was `"high"`, which
-    /// Qwen3.8's template escalates to its most expensive `xhigh`
-    /// directive).
+    /// `{"reasoning_effort":"..."}`, else MODEL.toml
+    /// `[behavior].default_reasoning_effort`. `None` = the variable stays
+    /// undefined and the template's own default applies
+    /// (`tokenizer/chat_render.rs`).
     pub default_reasoning_effort: Option<crate::ir::ReasoningEffort>,
     /// Shared in-memory store for stateful Responses API resume
     /// (`previous_response_id`) and opt-in Chat-Completions storage

@@ -13,11 +13,18 @@ use std::sync::Arc;
 
 use atlas_core::registry::AtlasRegistry;
 
+mod display_carveout;
 mod fault_probe;
 mod gpu_copy;
 mod gpu_impl;
+pub use gpu_impl::{configure_pdl, pdl_enabled};
 mod gpu_impl_graph;
 mod host_staging;
+mod meminfo;
+pub(crate) use meminfo::unified_free;
+use meminfo::{system_available_memory_bytes, system_meminfo_bytes};
+#[cfg(unix)]
+mod nvml;
 pub mod tensormap;
 
 // ── Raw CUDA driver API for memory operations ──
@@ -39,6 +46,7 @@ unsafe extern "C" {
     ) -> i32;
     pub(super) fn cuMemcpyDtoDAsync_v2(dst: u64, src: u64, bytes: usize, stream: u64) -> i32;
     pub(super) fn cuStreamSynchronize(stream: u64) -> i32;
+    pub(super) fn cuCtxSynchronize() -> i32;
     pub(super) fn cuStreamQuery(stream: u64) -> i32;
     pub(super) fn cuMemHostGetDevicePointer_v2(
         dptr: *mut u64,
@@ -73,6 +81,14 @@ unsafe extern "C" {
     // minimal and an unresolved extern would break the gfx1151 link.
     #[cfg(not(atlas_scale))]
     pub(super) fn cuStreamIsCapturing(hStream: u64, captureStatus: *mut u32) -> i32;
+    // Kernel name for a CUfunction (driver API 12.3+), used only to name the
+    // kernel in a launch-failure error. NVIDIA libcuda only: neither the SCALE
+    // libcuda nor the strix HIP shim exports it.
+    #[cfg(not(atlas_scale))]
+    pub(super) fn cuFuncGetName(
+        name: *mut *const std::ffi::c_char,
+        hfunc: *mut std::ffi::c_void,
+    ) -> i32;
     pub(super) fn cuStreamEndCapture(hStream: u64, phGraph: *mut u64) -> i32;
     // CUDA-graph instantiate. NVIDIA's libcuda exports the 3-arg
     // `cuGraphInstantiateWithFlags`; SCALE's libcuda (gfx1151) exports only
@@ -93,6 +109,7 @@ unsafe extern "C" {
     fn cuCtxGetCurrent(pctx: *mut u64) -> i32;
     pub(super) fn cuCtxSetCurrent(ctx: u64) -> i32;
     pub(super) fn cuStreamCreate(phStream: *mut u64, flags: u32) -> i32;
+    pub(super) fn cuStreamDestroy_v2(hStream: u64) -> i32;
     // Page-locked host memory for efficient async transfers
     pub(super) fn cuMemAllocHost_v2(pp: *mut *mut c_void, bytesize: usize) -> i32;
     pub(super) fn cuMemFreeHost(p: *mut c_void) -> i32;
@@ -140,7 +157,19 @@ pub struct AtlasCudaBackend {
     /// (`cutlass.rs:246`) and FlashInfer (`flashinfer.rs:145`) call
     /// `cuMemAlloc_v2` directly rather than through this allocator, so freeing
     /// the ledger cannot invalidate a static that outlives the model.
-    live_allocs: parking_lot::Mutex<std::collections::HashSet<u64>>,
+    ///
+    /// Each pointer carries the bytes requested: the sum is the device floor
+    /// of [`crate::own_footprint`], which KV sizing checks its free-memory
+    /// delta against.
+    live_allocs: parking_lot::Mutex<crate::own_footprint::AllocLedger>,
+    /// The process-wide counters as this backend was created, so
+    /// `own_footprint` reports growth over the same span as the free-memory
+    /// baseline (context and kernel modules are already in both).
+    own_baseline: crate::own_footprint::Sample,
+    /// Slab base/extent pairs registered by pack-mode weight loaders.
+    /// Interior `DevicePtr`s passed to `free()` must become no-ops: they
+    /// are not cuMemAlloc'd, so freeing one would be CUDA_ERROR_INVALID_VALUE.
+    slab_regions: parking_lot::Mutex<Vec<(u64, u64)>>,
     /// Default CUDA stream handle (from the process CUDA host).
     default_stream: u64,
     /// CUDA context handle for cross-thread binding.
@@ -176,7 +205,9 @@ impl AtlasCudaBackend {
         );
 
         Ok(Self {
-            live_allocs: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            live_allocs: parking_lot::Mutex::default(),
+            own_baseline: Self::own_sample(),
+            slab_regions: parking_lot::Mutex::new(Vec::new()),
             registry,
             debug_sync_kernels: std::env::var("ATLAS_DEBUG_SYNC_KERNELS").as_deref() == Ok("1"),
             op_cache: crate::op_cache::OpCache::new(),
@@ -187,12 +218,48 @@ impl AtlasCudaBackend {
 
     /// This model's kernel modules, for the paths that need the registry
     /// directly rather than through `GpuBackend`.
-    pub(crate) fn record_alloc(&self, ptr: crate::gpu::DevicePtr) {
-        self.live_allocs.lock().insert(ptr.0);
+    /// True when `ptr` lies strictly inside a registered slab — carved
+    /// interior pointers own no storage and must never reach cuMemFree.
+    pub(crate) fn is_slab_interior(&self, ptr: u64) -> bool {
+        self.slab_regions
+            .lock()
+            .iter()
+            .any(|&(base, len)| ptr > base && ptr < base + len)
     }
 
-    pub(crate) fn forget_alloc(&self, ptr: crate::gpu::DevicePtr) {
-        self.live_allocs.lock().remove(&ptr.0);
+    /// Drop the slab whose BASE is `ptr` (called on a real free of the base).
+    /// Without this the region stays registered after the base is freed, a
+    /// later cuMemAlloc can land inside it, and that fresh allocation's
+    /// `free()` would silently no-op — a leak with no diagnostic.
+    pub(crate) fn drop_slab_region(&self, base: u64) {
+        drop_slab_region(&mut self.slab_regions.lock(), base);
+    }
+
+    pub(crate) fn record_alloc(&self, ptr: crate::gpu::DevicePtr, bytes: usize) {
+        self.live_allocs.lock().record(ptr.0, bytes);
+    }
+
+    /// Drop `ptr` from the ledger, returning the bytes it was recorded with.
+    pub(crate) fn forget_alloc(&self, ptr: crate::gpu::DevicePtr) -> Option<usize> {
+        self.live_allocs.lock().forget(ptr.0)
+    }
+
+    fn own_sample() -> crate::own_footprint::Sample {
+        #[cfg(unix)]
+        let driver = nvml::process_device_bytes();
+        #[cfg(not(unix))]
+        let driver = None;
+        crate::own_footprint::Sample {
+            driver,
+            host: crate::own_footprint::host_bytes(),
+        }
+    }
+
+    /// What this process took since the backend was created, from counters no
+    /// other process can move. See [`crate::own_footprint`].
+    pub(crate) fn own_footprint(&self) -> crate::own_footprint::OwnFootprint {
+        let ledger = self.live_allocs.lock().bytes();
+        crate::own_footprint::since(self.own_baseline, Self::own_sample(), ledger)
     }
 
     /// Free every allocation this backend made and nobody released.
@@ -208,7 +275,10 @@ impl AtlasCudaBackend {
     /// ever sees what those missed — and each `free` here has already been
     /// removed from the ledger by `forget_alloc`, so it cannot double-free.
     pub fn sweep_unreleased(&self) -> usize {
-        let outstanding: Vec<u64> = self.live_allocs.lock().drain().collect();
+        let outstanding = self.live_allocs.lock().drain();
+        // All regions die with the sweep — every outstanding base is being
+        // freed below, and keeping extents would mis-silence future frees.
+        self.slab_regions.lock().clear();
         let count = outstanding.len();
         for raw in outstanding {
             // Bypass `free`: the ledger is already drained, and a failure here
@@ -288,23 +358,13 @@ pub fn cuda_free_memory_bytes() -> Option<usize> {
 
     // On unified memory, also check MemAvailable from /proc/meminfo.
     // This includes reclaimable buff/cache that CUDA doesn't account for.
-    if let Some(mem_available) = system_available_memory_bytes() {
-        free = free.max(mem_available);
-    }
+    free = unified_free(
+        free,
+        total,
+        system_meminfo_bytes("MemTotal:"),
+        system_available_memory_bytes(),
+    );
     Some(free)
-}
-
-/// Read MemAvailable from /proc/meminfo (Linux only).
-/// Returns None on non-Linux or if parsing fails.
-fn system_available_memory_bytes() -> Option<usize> {
-    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in contents.lines() {
-        if line.starts_with("MemAvailable:") {
-            let kb: usize = line.split_whitespace().nth(1)?.parse().ok()?;
-            return Some(kb * 1024);
-        }
-    }
-    None
 }
 
 /// Start a background OOM watchdog that polls GPU memory every `interval`.
@@ -327,6 +387,16 @@ static WATCHDOG_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 pub fn spawn_oom_watchdog(
     threshold_mb: usize,
     interval: std::time::Duration,
+) -> Option<tokio::task::JoinHandle<()>> {
+    spawn_oom_watchdog_with_exit(threshold_mb, interval, legacy_oom_exit)
+}
+
+/// Preserve the same memory watchdog while an explicitly supervised caller
+/// supplies its nonreturning terminal sink. No threshold or polling override.
+pub fn spawn_oom_watchdog_with_exit(
+    threshold_mb: usize,
+    interval: std::time::Duration,
+    on_oom: fn() -> !,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if WATCHDOG_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return None;
@@ -354,8 +424,7 @@ pub fn spawn_oom_watchdog(
                             "OOM watchdog: 3 consecutive readings below threshold. \
                              Terminating to prevent system freeze."
                         );
-                        // Flush logs before exit
-                        std::process::exit(1);
+                        dispatch_oom_exit(on_oom);
                     }
                 } else {
                     consecutive_low = 0;
@@ -365,5 +434,36 @@ pub fn spawn_oom_watchdog(
     }))
 }
 
+fn legacy_oom_exit() -> ! {
+    std::process::exit(1)
+}
+
+fn dispatch_oom_exit(on_oom: fn() -> !) -> ! {
+    on_oom()
+}
+
 #[cfg(test)]
 mod tests;
+
+/// Remove the region whose base is `base`, if any. Pure helper for
+/// `AtlasCudaBackend::drop_slab_region` — kept free-standing so the
+/// bookkeeping is testable without a CUDA context.
+fn drop_slab_region(regions: &mut Vec<(u64, u64)>, base: u64) {
+    regions.retain(|&(b, _)| b != base);
+}
+
+#[cfg(test)]
+mod slab_tests {
+    #[test]
+    fn slab_regions_prune_on_base_free() {
+        let mut r = vec![(0x1000u64, 8192), (0xA000u64, 4096)];
+        super::drop_slab_region(&mut r, 0x1000);
+        assert_eq!(r, vec![(0xA000, 4096)]);
+        // interior pointer of the freed region no longer matches
+        let interior = |p: u64, rs: &[(u64, u64)]| rs.iter().any(|&(b, len)| p > b && p < b + len);
+        assert!(!interior(0x1800, &r));
+        assert!(interior(0xA800, &r));
+        super::drop_slab_region(&mut r, 0xDEAD); // no-op on unknown base
+        assert_eq!(r, vec![(0xA000, 4096)]);
+    }
+}

@@ -37,21 +37,19 @@ impl TransformerModel {
     /// matched is within `interval` blocks → tiny replay tail. Live SSM state
     /// must be canonical at call time (post-commit on the MTP path).
     pub(super) fn decode_marconi_checkpoint_dispatch(&self, seq: &mut SequenceState) {
+        // R11 fix 1: decode-produced state is not on the prefill pass grid;
+        // under the grid no decode checkpoint is registered.
         if !self.ssm_snapshots.is_enabled()
+            || self.prefill_grid() > 0
             || !self.prefix_cache.is_active()
+            || crate::model::mtp_carry::marconi_prefill_only()
             || self.config.num_ssm_layers() == 0
             || seq.hss_window_start() != 0
             || seq.slot_idx == usize::MAX
         {
             return;
         }
-        // Block-count between decode checkpoints. Env-tunable (no rebuild) so
-        // the cadence/drift tradeoff can be swept; default 4 blocks = 64 tok.
-        let interval = std::env::var("ATLAS_DECODE_CKPT_BLOCKS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(4);
+        let interval = crate::model::mtp_carry::decode_ckpt_blocks();
         let mut kv = self.kv_cache.lock();
         let bs = kv.block_size();
         // Derive the block count from tokens.len() (what we slice + cache),
@@ -199,7 +197,10 @@ impl TransformerModel {
     /// argmax flips. No hidden stashed; the exact-hit shortcut skips
     /// hiddenless snapshots (prefix_lookup.rs).
     pub(super) fn finish_leaf_snapshot(&self, seq: &SequenceState) -> Option<usize> {
-        if self.config.num_ssm_layers() == 0 || seq.slot_idx == usize::MAX {
+        if self.config.num_ssm_layers() == 0
+            || seq.slot_idx == usize::MAX
+            || crate::model::mtp_carry::marconi_prefill_only()
+        {
             return None;
         }
         // #155 ROOT CAUSE of the MTP×warm-restore token-stutter: on a turn

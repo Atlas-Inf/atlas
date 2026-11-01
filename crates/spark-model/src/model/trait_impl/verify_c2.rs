@@ -40,6 +40,10 @@ impl TransformerModel {
         _stream: u64,
     ) -> Result<[u32; 4]> {
         let stream = self.gpu.default_stream();
+        // ATLAS_QWEN4EXP_EXACT_VERIFY_CHECK: serial reference rows first,
+        // before the KV lock below (`exact_verify_check.rs`), as at K=2/3.
+        let serial_rows = self.exact_verify_serial_rows(&tokens[..], seq)?;
+        let seq_len_in = seq.seq_len;
         let h = self.config.hidden_size;
         let bf16 = 2usize;
         let fp32 = 2usize;
@@ -69,15 +73,7 @@ impl TransformerModel {
         for t in 0..k {
             let pos = seq.seq_len + t;
             let blocks_needed = (pos / bs) + 1;
-            ensure_blocks_through_decode(
-                seq,
-                blocks_needed - 1,
-                &mut kv_cache,
-                self.prefix_cache.as_ref(),
-                self.gpu.as_ref(),
-                stream,
-                self.levers.kv_poison,
-            )?;
+            self.reserve_decode_blocks(seq, blocks_needed - 1, &mut kv_cache, stream)?;
         }
 
         // 1c. Upload 4-entry attention metadata
@@ -193,6 +189,9 @@ impl TransformerModel {
         let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
         let use_graphs =
             self.comm.is_none() && !hss_engaged && !lora_eager && !k4_diag && !layer_veto;
+        let verify_profile = std::env::var("ATLAS_GLM_VERIFY_PROFILE").ok().as_deref() == Some("1")
+            && self.config.model_type == "glm5_next"
+            && !use_graphs;
 
         // PLE's host half (n-gram hash + NVMe fault-in + slot upload) for the
         // WHOLE draft window, hoisted before capture/replay exactly as
@@ -210,6 +209,7 @@ impl TransformerModel {
         }
 
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -218,7 +218,7 @@ impl TransformerModel {
             levers: &self.levers,
             stats: &self.stats,
             attn_metadata: Some(metadata),
-            profile: false,
+            profile: verify_profile,
             comm: self.comm_ref(),
             graph_capture: use_graphs,
             gdn_exact_replay: false,
@@ -255,13 +255,44 @@ impl TransformerModel {
                 self.gpu.begin_capture(stream)?;
             }
 
+            // qwen4_exp piecewise graphs (`model::decode_pieces`), as in
+            // verify_b/verify_c. `ATLAS_K4_DIAG` keeps the step eager
+            // (`levers.k4_diag` in the admission).
+            let pieces = self.decode_pieces_admitted(use_graphs, &kv_cache, &ctx);
+            let wide = self.decode_piece_wide(pieces, seq, k);
+
             // K4_DIAG per-layer timing (eager mode already syncs each layer —
             // this just records it). Only compiled in when the env is set.
             let mut k4_layer_us = k4_diag.then(Vec::new);
+            let mut attn_us = 0u128;
+            let mut kda_us = 0u128;
+            let mut attn_layers = 0usize;
+            let mut kda_layers = 0usize;
 
             for (layer_idx, layer) in self.layers.iter().enumerate() {
+                if pieces
+                    && self.verify_piece_run(
+                        layer_idx,
+                        k,
+                        wide,
+                        seq,
+                        &mut kv_cache,
+                        &seq_lens_vec,
+                        &block_tables_vec,
+                        &ctx,
+                        stream,
+                    )?
+                {
+                    continue;
+                }
                 let layer_type = self.config.layer_type(layer_idx);
                 let t_layer = k4_diag.then(std::time::Instant::now);
+                let layer_started = if verify_profile {
+                    self.gpu.synchronize(stream)?;
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
 
                 if layer_type == LayerType::FullAttention {
                     if hss_engaged {
@@ -341,6 +372,31 @@ impl TransformerModel {
                         "K4_DIAG: CUDA error after layer {layer_idx} ({layer_type:?}): {e:#}"
                     );
                 }
+                if let Some(started) = layer_started {
+                    self.gpu.synchronize(stream)?;
+                    let elapsed = started.elapsed().as_micros();
+                    if layer_type == LayerType::FullAttention {
+                        attn_us += elapsed;
+                        attn_layers += 1;
+                    } else {
+                        kda_us += elapsed;
+                        kda_layers += 1;
+                    }
+                }
+            }
+
+            if wide {
+                self.qsa_commit_staged_seq(seq, k, stream)?;
+            }
+
+            if verify_profile {
+                tracing::info!(
+                    "GLM K4 layer profile: kda={:.2}ms({}L) mla={:.2}ms({}L)",
+                    kda_us as f64 / 1000.0,
+                    kda_layers,
+                    attn_us as f64 / 1000.0,
+                    attn_layers,
+                );
             }
 
             if let Some(us) = k4_layer_us {
@@ -370,7 +426,7 @@ impl TransformerModel {
             }
 
             // LM head for 4 tokens
-            self.lm_head_batched(normed, k as u32, self.buffers.logits(), stream)?;
+            self.lm_head_batched_tp(normed, k, stream)?;
 
             if k4_diag && let Err(e) = self.gpu.synchronize(stream) {
                 anyhow::bail!("K4_DIAG: CUDA error after lm_head_batched: {e:#}");
@@ -406,6 +462,10 @@ impl TransformerModel {
                     self.gpu.launch_graph(graph, stream)?;
                 }
             }
+        }
+
+        if let Some(rows) = serial_rows {
+            self.exact_verify_compare(rows, seq_len_in)?;
         }
 
         // ── Phase 3: Post-graph (D2H copy only) ──

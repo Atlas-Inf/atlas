@@ -241,3 +241,146 @@ extern "C" __global__ void w8a16_gemv_batch8_dyn_vl2(
 ) {
     w8a16_gemv_batchm_impl<8, 2>(A, B, block_scale, C, M, N, K);
 }
+
+// N2 variant: each physical thread serves TWO outputs (n0, n1 = adjacent
+// columns) on the same two logical lanes — the per-k16 activation loads and
+// bf16 unpacks are shared across both outputs, halving the A-side VMEM/VALU
+// per output. 32 threads per output × VL2; block covers 16 outputs; grid is
+// ceil(N/16). Per-output lane→k16 assignment, accumulate order, and the
+// 32-lane shfl reduction are IDENTICAL to w8a16_gemv_batch8_dyn_vl2, so the
+// output is bit-identical.
+extern "C" __global__ void __launch_bounds__(256) w8a16_gemv_batch8_dyn_vl2_n2(
+    const __nv_bfloat16* A,
+    const unsigned char* B,
+    const float* block_scale,
+    __nv_bfloat16* C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned int local_out = threadIdx.x / 32;            // 0..7
+    const unsigned int lane = threadIdx.x % 32;                 // phys lane
+    const unsigned int n0 = blockIdx.x * 16 + local_out * 2;
+    const unsigned int n1 = n0 + 1;
+    const bool v0 = n0 < N;
+    const bool v1 = n1 < N;
+    const unsigned int k16_count = K / 16;
+    const unsigned int k_blocks = (K + FP8_BLOCK - 1) / FP8_BLOCK;
+
+    __shared__ float e4m3_lut[256];
+    e4m3_lut[threadIdx.x] = atlas_e4m3_to_f32((unsigned char)threadIdx.x);
+    __syncthreads();
+
+    float acc[2][8] = {}; // [vlane][row] for n0
+    float acc_b[2][8] = {}; // [vlane][row] for n1
+    const unsigned int nb0 = n0 / FP8_BLOCK, nb1 = n1 / FP8_BLOCK;
+
+    for (unsigned int k16 = lane; k16 < k16_count; k16 += 64) {
+        const unsigned int k2 = k16 + 32;
+        const bool k2v = k2 < k16_count;
+        const unsigned int base_k = k16 * 16;
+        const float sc0 = v0 ? block_scale[nb0 * k_blocks + base_k / FP8_BLOCK] : 0.f;
+        const float sc1 = v1 ? block_scale[nb1 * k_blocks + base_k / FP8_BLOCK] : 0.f;
+        const uint4 p0 = v0 ? reinterpret_cast<const uint4*>(B + (unsigned long long)n0 * K)[k16] : make_uint4(0,0,0,0);
+        const uint4 p1 = v1 ? reinterpret_cast<const uint4*>(B + (unsigned long long)n1 * K)[k16] : make_uint4(0,0,0,0);
+        float w0[16], w1[16];
+        {
+            const unsigned int w[4] = {p0.x, p0.y, p0.z, p0.w};
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                w0[j*4]   = e4m3_lut[w[j] & 0xffu] * sc0;
+                w0[j*4+1] = e4m3_lut[(w[j] >> 8) & 0xffu] * sc0;
+                w0[j*4+2] = e4m3_lut[(w[j] >> 16) & 0xffu] * sc0;
+                w0[j*4+3] = e4m3_lut[w[j] >> 24] * sc0;
+            }
+        }
+        {
+            const unsigned int w[4] = {p1.x, p1.y, p1.z, p1.w};
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                w1[j*4]   = e4m3_lut[w[j] & 0xffu] * sc1;
+                w1[j*4+1] = e4m3_lut[(w[j] >> 8) & 0xffu] * sc1;
+                w1[j*4+2] = e4m3_lut[(w[j] >> 16) & 0xffu] * sc1;
+                w1[j*4+3] = e4m3_lut[w[j] >> 24] * sc1;
+            }
+        }
+        #pragma unroll
+        for (int row = 0; row < 8; ++row) {
+            if (row >= M) continue;
+            const __nv_bfloat16* arow = A + (unsigned long long)row * K;
+            const uint4 lo = reinterpret_cast<const uint4*>(arow)[k16 * 2];
+            const uint4 hi = reinterpret_cast<const uint4*>(arow)[k16 * 2 + 1];
+            const unsigned int aw[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+            #pragma unroll
+            for (int pair = 0; pair < 8; ++pair) {
+                const float a_lo = atlas_bf16_bits_to_f32(aw[pair] & 0xffffu);
+                const float a_hi = atlas_bf16_bits_to_f32(aw[pair] >> 16);
+                acc[0][row] += a_lo * w0[pair * 2] + a_hi * w0[pair * 2 + 1];
+                acc_b[0][row] += a_lo * w1[pair * 2] + a_hi * w1[pair * 2 + 1];
+            }
+        }
+        if (k2v) {
+            const unsigned int base2 = k2 * 16;
+            const float sc20 = v0 ? block_scale[nb0 * k_blocks + base2 / FP8_BLOCK] : 0.f;
+            const float sc21 = v1 ? block_scale[nb1 * k_blocks + base2 / FP8_BLOCK] : 0.f;
+            const uint4 q0 = v0 ? reinterpret_cast<const uint4*>(B + (unsigned long long)n0 * K)[k2] : make_uint4(0,0,0,0);
+            const uint4 q1 = v1 ? reinterpret_cast<const uint4*>(B + (unsigned long long)n1 * K)[k2] : make_uint4(0,0,0,0);
+            float u0[16], u1[16];
+            {
+                const unsigned int w[4] = {q0.x, q0.y, q0.z, q0.w};
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    u0[j*4]   = e4m3_lut[w[j] & 0xffu] * sc20;
+                    u0[j*4+1] = e4m3_lut[(w[j] >> 8) & 0xffu] * sc20;
+                    u0[j*4+2] = e4m3_lut[(w[j] >> 16) & 0xffu] * sc20;
+                    u0[j*4+3] = e4m3_lut[w[j] >> 24] * sc20;
+                }
+            }
+            {
+                const unsigned int w[4] = {q1.x, q1.y, q1.z, q1.w};
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    u1[j*4]   = e4m3_lut[w[j] & 0xffu] * sc21;
+                    u1[j*4+1] = e4m3_lut[(w[j] >> 8) & 0xffu] * sc21;
+                    u1[j*4+2] = e4m3_lut[(w[j] >> 16) & 0xffu] * sc21;
+                    u1[j*4+3] = e4m3_lut[w[j] >> 24] * sc21;
+                }
+            }
+            #pragma unroll
+            for (int row = 0; row < 8; ++row) {
+                if (row >= M) continue;
+                const __nv_bfloat16* arow = A + (unsigned long long)row * K;
+                const uint4 lo = reinterpret_cast<const uint4*>(arow)[k2 * 2];
+                const uint4 hi = reinterpret_cast<const uint4*>(arow)[k2 * 2 + 1];
+                const unsigned int aw[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+                #pragma unroll
+                for (int pair = 0; pair < 8; ++pair) {
+                    const float a_lo = atlas_bf16_bits_to_f32(aw[pair] & 0xffffu);
+                    const float a_hi = atlas_bf16_bits_to_f32(aw[pair] >> 16);
+                    acc[1][row] += a_lo * u0[pair * 2] + a_hi * u0[pair * 2 + 1];
+                    acc_b[1][row] += a_lo * u1[pair * 2] + a_hi * u1[pair * 2 + 1];
+                }
+            }
+        }
+    }
+
+    // Per output, one warp of 32 physical lanes owns logical lanes p and
+    // p+32 — the same two-half reduce as the VL2 single-out kernel.
+    #pragma unroll
+    for (int row = 0; row < 8; ++row) {
+        if (row >= M) continue;
+        float x0 = acc[0][row], x1 = acc[1][row];
+        float y0 = acc_b[0][row], y1 = acc_b[1][row];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            x0 += __shfl_down_sync(0xffffffffu, x0, off);
+            x1 += __shfl_down_sync(0xffffffffu, x1, off);
+            y0 += __shfl_down_sync(0xffffffffu, y0, off);
+            y1 += __shfl_down_sync(0xffffffffu, y1, off);
+        }
+        if (lane == 0) {
+            if (v0) C[(unsigned long long)row * N + n0] = __float2bfloat16(x0 + x1);
+            if (v1) C[(unsigned long long)row * N + n1] = __float2bfloat16(y0 + y1);
+        }
+    }
+}

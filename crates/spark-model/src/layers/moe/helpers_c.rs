@@ -4,6 +4,12 @@
 
 use super::*;
 
+#[inline]
+fn glm_k5_router_m5_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_K5_ROUTER_M5").as_deref() == Ok("1"))
+}
+
 impl MoeLayer {
     /// Pre-dequant dense (non-expert) NVFP4 weights to FP8 for zero-overhead prefill.
     ///
@@ -15,6 +21,7 @@ impl MoeLayer {
         config: &atlas_core::config::ModelConfig,
         stream: u64,
     ) -> Result<()> {
+        self.btile_storage.require_legacy()?;
         let h = config.hidden_size;
         let shared_inter = config.shared_expert_intermediate_size;
         let num_experts = config.num_experts;
@@ -28,7 +35,7 @@ impl MoeLayer {
 
         // A checkpoint-native BF16 shared expert is the authoritative copy.
         // Do not manufacture an FP8 prefill variant with different numerics.
-        if self.bf16_shared_expert.is_none()
+        if self.separate_shared_expert.is_none()
             && !self.weights.shared_expert.gate_proj.is_null()
             && shared_inter > 0
         {
@@ -69,6 +76,7 @@ impl MoeLayer {
         shared_expert: Fp8ExpertWeight,
         gpu: &dyn GpuBackend,
     ) -> Result<()> {
+        self.btile_storage.require_legacy()?;
         self.fp8_gate_weight_ptrs = Some(build_fp8_ptr_table(experts, |e| &e.gate_proj, gpu)?);
         self.fp8_up_weight_ptrs = Some(build_fp8_ptr_table(experts, |e| &e.up_proj, gpu)?);
         self.fp8_down_weight_ptrs = Some(build_fp8_ptr_table(experts, |e| &e.down_proj, gpu)?);
@@ -95,12 +103,13 @@ impl MoeLayer {
         shared_down: DevicePtr,
         gpu: &dyn GpuBackend,
     ) -> Result<()> {
+        self.btile_storage.require_legacy()?;
         use super::build_bf16_ptr_table;
         self.bf16_gate_weight_ptrs = Some(build_bf16_ptr_table(gate_experts, gpu)?);
         self.bf16_up_weight_ptrs = Some(build_bf16_ptr_table(up_experts, gpu)?);
         self.bf16_down_weight_ptrs = Some(build_bf16_ptr_table(down_experts, gpu)?);
         if shared_gate.is_null() && shared_up.is_null() && shared_down.is_null() {
-            self.bf16_shared_expert = None;
+            self.separate_shared_expert = None;
         } else {
             self.set_bf16_shared_expert(
                 DenseWeight {
@@ -113,128 +122,6 @@ impl MoeLayer {
             )?;
         }
         Ok(())
-    }
-
-    /// Install checkpoint-native BF16 shared-expert weights independently of
-    /// routed-expert precision.
-    pub fn set_bf16_shared_expert(
-        &mut self,
-        gate_proj: DenseWeight,
-        up_proj: DenseWeight,
-        down_proj: DenseWeight,
-    ) -> Result<()> {
-        self.bf16_shared_expert = Some(Bf16SharedExpert::new(gate_proj, up_proj, down_proj)?);
-        Ok(())
-    }
-
-    /// Whether a BF16 shared expert must overwrite the contribution produced
-    /// by a quantized fused routed-expert kernel.
-    pub(super) fn has_mixed_bf16_shared_expert(&self) -> bool {
-        self.bf16_shared_expert.is_some() && self.bf16_gate_weight_ptrs.is_none()
-    }
-
-    /// Evaluate a checkpoint-native BF16 shared expert into `down_out`.
-    ///
-    /// Callers supply scratch buffers because the safe aliases differ between
-    /// decode and prefill. Returns `true` when BF16 weights were installed.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn run_bf16_shared_expert(
-        &self,
-        input: DevicePtr,
-        num_tokens: u32,
-        hidden_size: u32,
-        shared_intermediate: u32,
-        gate_out: DevicePtr,
-        up_out: DevicePtr,
-        down_out: DevicePtr,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<bool> {
-        let Some(shared) = self.bf16_shared_expert else {
-            return Ok(false);
-        };
-        anyhow::ensure!(
-            num_tokens > 0 && shared_intermediate > 0,
-            "BF16 shared expert requires non-zero token and intermediate dimensions"
-        );
-
-        let project = |activation: DevicePtr,
-                       weight: &DenseWeight,
-                       output: DevicePtr,
-                       n: u32,
-                       k: u32|
-         -> Result<()> {
-            if num_tokens == 1 {
-                ops::dense_gemv(
-                    ctx.gpu,
-                    self.dense_gemv,
-                    activation,
-                    weight,
-                    output,
-                    n,
-                    k,
-                    stream,
-                )
-            } else if ctx.dispatch.cublas_gemm {
-                // Multi-token shared expert: cuBLASLt BF16 beats the hand-written
-                // mma.sync GEMM. The single-token arm above stays on the GEMV —
-                // decode-sized shapes do not repay cuBLAS heuristic overhead.
-                ops::cublas_bf16_proj_dense(
-                    activation,
-                    weight.weight,
-                    output,
-                    num_tokens,
-                    n,
-                    k,
-                    stream,
-                )
-            } else {
-                ops::dense_gemm_prefill(
-                    ctx.gpu,
-                    self.dense_gemm,
-                    self.dense_gemm_pipelined,
-                    activation,
-                    weight,
-                    output,
-                    num_tokens,
-                    n,
-                    k,
-                    stream,
-                )
-            }
-        };
-
-        project(
-            input,
-            &shared.gate_proj,
-            gate_out,
-            shared_intermediate,
-            hidden_size,
-        )?;
-        project(
-            input,
-            &shared.up_proj,
-            up_out,
-            shared_intermediate,
-            hidden_size,
-        )?;
-        ops::silu_mul(
-            ctx.gpu,
-            self.moe_act_mul,
-            gate_out,
-            up_out,
-            gate_out,
-            num_tokens * shared_intermediate,
-            stream,
-        )?;
-        project(
-            gate_out,
-            &shared.down_proj,
-            down_out,
-            hidden_size,
-            shared_intermediate,
-        )?;
-        Ok(true)
     }
 
     /// Router gate GEMM for a BF16 (dense) gate weight at prefill:
@@ -273,6 +160,75 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        match glm_router_prefill_gemm(
+            ctx.config.model_type == "glm5_next",
+            num_tokens,
+            ctx.graph_capture,
+            glm_router_prefill_cublas(),
+            glm_router_prefill_cutlass(),
+        ) {
+            Some(RouterPrefillGemm::Cutlass) => {
+                return ops::bf16_gemm(
+                    router_in,
+                    self.weights.gate.weight.0,
+                    gate_logits,
+                    num_tokens,
+                    num_experts,
+                    hidden_size,
+                    stream,
+                );
+            }
+            Some(RouterPrefillGemm::CublasLt) => {
+                return spark_runtime::cublaslt::bf16_gemm_act_weight_t(
+                    router_in.0,
+                    self.weights.gate.weight.0,
+                    gate_logits.0,
+                    num_tokens,
+                    num_experts,
+                    hidden_size,
+                    stream,
+                );
+            }
+            None => {}
+        }
+        // Owner-batched verify rows (9..=32): one tensor-core weight pass.
+        if ctx.config.model_type == "glm5_next"
+            && let tc = ops::dense_tc_kernel(ctx.gpu, num_tokens)
+            && tc.0 != 0
+        {
+            return ops::dense_gemv_bf16_tc(
+                ctx.gpu,
+                tc,
+                router_in,
+                &self.weights.gate,
+                gate_logits,
+                num_tokens,
+                num_experts,
+                hidden_size,
+                num_experts,
+                stream,
+            );
+        }
+        if self.try_router_prefill_bn32(
+            router_in,
+            gate_logits,
+            num_tokens,
+            num_experts,
+            hidden_size,
+            ctx,
+            stream,
+        )? {
+            return Ok(());
+        }
+        if ctx.config.model_type == "glm5_next"
+            && num_tokens == 5
+            && num_experts == 288
+            && hidden_size == 4096
+            && self.dense_gemm_router_m5.0 != 0
+            && glm_k5_router_m5_enabled()
+        {
+            return self.run_router_bn4(router_in, gate_logits, ctx, stream);
+        }
         if self.dense_gemm_router.0 != 0 {
             return ops::dense_gemm_router(
                 ctx.gpu,
@@ -335,5 +291,74 @@ impl MoeLayer {
             stream,
         )?;
         Ok(normed)
+    }
+}
+
+/// Rows from which the opt-in CUTLASS router GEMM replaces cuBLASLt. From
+/// here cuBLASLt runs without split-K (measured every 128 rows to 8196, and
+/// at 12K/16K), which CUTLASS matches bit for bit at 1.7-1.9x. Below it
+/// cuBLASLt splits K for most row counts (3-7 ways; from ~4.1K to ~5.9K rows
+/// it flips between split and unsplit), so CUTLASS there would reorder every
+/// logit's sum to save under 0.1 ms a call (under 15% up to 4096 rows).
+const ROUTER_CUTLASS_MIN_ROWS: u32 = 6144;
+
+#[derive(Debug, PartialEq, Eq)]
+enum RouterPrefillGemm {
+    Cutlass,
+    CublasLt,
+}
+
+/// Tensor-core BF16 GEMM (FP32 accumulation) for a GLM prefill router, in
+/// place of the order-preserving BN32 kernel (~5 TFLOPS); routing arithmetic
+/// then differs from decode's in summation order only. `cublas` is
+/// `ATLAS_GLM_ROUTER_PREFILL_CUBLAS=1`; `cutlass` the opt-in
+/// `ATLAS_GLM_ROUTER_PREFILL_CUTLASS=1` nested under it, which moves chunks of
+/// [`ROUTER_CUTLASS_MIN_ROWS`] or more onto `ops::bf16_gemm`.
+fn glm_router_prefill_gemm(
+    glm: bool,
+    num_tokens: u32,
+    graph_capture: bool,
+    cublas: bool,
+    cutlass: bool,
+) -> Option<RouterPrefillGemm> {
+    if !glm || num_tokens <= 64 || graph_capture || !cublas {
+        None
+    } else if cutlass && num_tokens >= ROUTER_CUTLASS_MIN_ROWS {
+        Some(RouterPrefillGemm::Cutlass)
+    } else {
+        Some(RouterPrefillGemm::CublasLt)
+    }
+}
+
+fn glm_router_prefill_cublas() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_ROUTER_PREFILL_CUBLAS").as_deref() == Ok("1"))
+}
+
+fn glm_router_prefill_cutlass() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_ROUTER_PREFILL_CUTLASS").as_deref() == Ok("1"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RouterPrefillGemm::*, glm_router_prefill_gemm as gemm};
+
+    #[test]
+    fn glm_router_prefill_cutlass_needs_both_flags_and_unsplit_chunks() {
+        // Both flags: only chunks cuBLASLt runs without split-K move.
+        for m in [6144, 8196, 16392] {
+            assert_eq!(gemm(true, m, false, true, true), Some(Cutlass));
+        }
+        for m in [65, 300, 2048, 3692, 4096, 6143] {
+            assert_eq!(gemm(true, m, false, true, true), Some(CublasLt));
+        }
+        // The CUTLASS flag alone changes nothing; nor does it without cuBLAS.
+        assert_eq!(gemm(true, 8196, false, true, false), Some(CublasLt));
+        assert_eq!(gemm(true, 8196, false, false, true), None);
+        // Other models, decode/verify widths and graph capture keep BN32.
+        assert_eq!(gemm(false, 8196, false, true, true), None);
+        assert_eq!(gemm(true, 64, false, true, true), None);
+        assert_eq!(gemm(true, 8196, true, true, true), None);
     }
 }

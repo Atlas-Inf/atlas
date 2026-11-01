@@ -13,14 +13,31 @@
 
 mod cache_skip;
 mod cache_skip_mla;
+mod cache_skip_mla_kv_only;
 mod cache_skip_qkv;
 mod cache_skip_v4;
+mod glm_index;
+mod glm_index_split;
+pub(crate) use glm_index_split::index_split_words;
 mod paged;
 mod paged_attn;
 mod paged_attn_batched;
 mod paged_attn_fp8k;
 mod paged_attn_turbok;
+mod paged_glm;
+pub(in crate::layers::qwen3_attention) use paged_glm::shard::ShardRows;
+pub(crate) use paged_glm::write_floor_legacy;
+pub(in crate::layers::qwen3_attention) use paged_glm::{GlmChunkOwner, glm_chunk_pieces};
 mod paged_mla;
+mod paged_mla_args;
 mod paged_oproj;
 mod paged_qkv;
 mod paged_v4;
+
+/// `ATLAS_ATTN_W4A4` (PRESENCE, read once): the opt-in native FP4 Q/K/V and
+/// o_proj prefill GEMMs. Both ranks must agree (`model::startup_parity`):
+/// the o_proj arm decides whether the SP reduce-scatter is piped.
+pub(crate) fn attn_w4a4_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ATLAS_ATTN_W4A4").is_some())
+}

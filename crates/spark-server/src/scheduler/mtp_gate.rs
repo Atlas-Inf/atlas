@@ -25,12 +25,25 @@
 //!   draft-head resync.
 //! - While in Serial, re-probe MTP after [`reprobe_tokens`] emitted tokens.
 //!   While in Mtp, refresh the serial baseline after
-//!   [`serial_refresh_tokens`] (one window ≈ ≤0.3% overhead bound).
+//!   [`serial_refresh_tokens`] (one window ≈ ≤0.3% overhead bound). Both
+//!   are tokens PER SEQUENCE: the batch's tokens count against the interval
+//!   times the batch-width bucket, so the cadence in STEPS (and with it the
+//!   share of steps spent in the other mode) does not grow with concurrency.
+//!   Counted over the whole batch, a 16-step refresh window came every ~51
+//!   MTP steps at C=8 (1024 tokens at ~20 a step) — about a quarter of all
+//!   steps in plain decode while the gate was in Mtp — and a Serial-mode
+//!   re-probe every 32 decode steps.
 //! - A depth-regime change (factor [`REMEASURE_DEPTH_FACTOR`] = 2, floor
 //!   [`REMEASURE_DEPTH_FLOOR`] = 512) marks both baselines stale and
-//!   pulls the next probe forward (one [`WINDOW_STEPS`] window). A stale
-//!   other-mode EWMA cannot win a switch. This is the shipped gate
-//!   (#337 / #344 / #242 / d6171c4), not a second gate.
+//!   pulls the next probe forward: the current mode first re-measures over
+//!   one full [`WINDOW_STEPS`] window in the new regime, then the probe runs
+//!   one window of the other mode. A one-step window is not a measurement —
+//!   the first in-regime step is where newly admitted sequences bootstrap
+//!   (one token each) and new shapes capture their CUDA graphs; made the
+//!   Mtp baseline, it flipped C=8 to Serial at 33.5 vs ~70 tok/s delivered
+//!   (2026-10-21). A stale EWMA of either mode cannot take part in
+//!   arbitration. This is the shipped gate (#337 / #344 / #242 / d6171c4),
+//!   not a second gate.
 //! - Steps are BATCH steps: a plain decode step over n active sequences
 //!   emits n tokens and is charged as n (2026-08-15 fix — it was charged as
 //!   1, under-reading the serial EWMA ~n× at batch n while the verify side
@@ -72,13 +85,13 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// Serial tokens between MTP re-probes while in Serial mode. Default
-/// matches the proven `ATLAS_DFLASH_ADAPTIVE_REPROBE` policy (256).
+/// Serial tokens (per sequence) between MTP re-probes while in Serial mode.
+/// Default matches the proven `ATLAS_DFLASH_ADAPTIVE_REPROBE` policy (256).
 fn reprobe_tokens() -> usize {
     env_usize("ATLAS_MTP_GATE_REPROBE", 256)
 }
 
-/// MTP tokens between serial-baseline refreshes while in Mtp mode. One
+/// MTP tokens (per sequence) between serial-baseline refreshes in Mtp. One
 /// 16-step window per 1024 tokens bounds refresh overhead at ≤0.3% even if
 /// serial were 18% slower.
 fn serial_refresh_tokens() -> usize {
@@ -149,7 +162,8 @@ pub fn spec_dispatch_eligible(
     // numerics floor can flip a low-margin token mid-reasoning), and the
     // agentic-webserver gate measured the damage as deterministic 8-9/10
     // trajectory failures (2026-08-16 bisect: main+this-hunk fails, main
-    // without it passes 10/10).
+    // without it passes 10/10). A bit-exact verify removes the reason: the
+    // caller passes it in as `spec_think` (`spec_think_for`).
     if inside_thinking && !spec_think {
         return false;
     }
@@ -161,6 +175,46 @@ pub fn spec_dispatch_eligible(
     } else {
         post_think_emitted >= resume_guard
     }
+}
+
+/// The `spec_think` a step dispatches with: the `ATLAS_MTP_SPEC_THINK` /
+/// `ATLAS_DFLASH_SPEC_THINK` opt-in, or a model whose single-sequence verify
+/// is bitwise serial decode (`Model::verify_bit_exact`, qwen4_exp under
+/// `ATLAS_QWEN4EXP_EXACT_VERIFY=1`). The reason speculation stays out of
+/// `<think>` is that batch-K verify is not byte-lossless at T=0; an exact
+/// verify removes it. A concurrent batch verifies through the multi-sequence
+/// path, so it needs that path exact as well (`Model::batch_verify_bit_exact`,
+/// the qwen4_exp exact-batching lane); otherwise only ONE active sequence.
+pub fn spec_think_for(
+    opt_in: bool,
+    verify_bit_exact: bool,
+    batch_verify_bit_exact: bool,
+    active: usize,
+) -> bool {
+    opt_in || (verify_bit_exact && (active == 1 || batch_verify_bit_exact))
+}
+
+/// [`spec_dispatch_eligible`] for one active sequence. A strict
+/// (`response_format`) grammar bars speculation like `disable_mtp` (see
+/// `ActiveSeq::strict_grammar`) unless `strict_spec`: the run masks every
+/// verify row of a strict sequence (`scheduler::strict_spec`).
+pub(super) fn seq_spec_eligible(
+    a: &super::ActiveSeq,
+    spec_think: bool,
+    resume_guard: u32,
+    dflash_raw_argmax: bool,
+    strict_spec: bool,
+) -> bool {
+    spec_dispatch_eligible(
+        a.inside_thinking,
+        a.post_think_emitted,
+        a.output_tokens.len() as u32,
+        a.suppress_tool_call,
+        a.disable_mtp || (a.strict_grammar() && !strict_spec),
+        spec_think,
+        resume_guard,
+        dflash_raw_argmax,
+    )
 }
 
 /// What the gate wants the scheduler to run for the NEXT step.
@@ -242,6 +296,9 @@ pub struct MtpGate {
     win_tokens: f64,
     win_wall: f64,
     win_steps: usize,
+    /// A new batch width needs a full window before cadence can shorten it.
+    /// Bootstrap/capture cost stays charged, but cannot become a one-step EWMA.
+    require_full_window: bool,
     /// Consecutive closed windows where the other mode beat this one by
     /// more than the margin.
     losing_windows: usize,
@@ -300,6 +357,7 @@ impl MtpGate {
             win_tokens: 0.0,
             win_wall: 0.0,
             win_steps: 0,
+            require_full_window: false,
             losing_windows: 0,
             tokens_since_event: 0,
             observed_depth: 0,
@@ -317,7 +375,8 @@ impl MtpGate {
     /// Depth-regime change: mark BOTH baselines stale (economics moved) and
     /// pull the next probe forward — no state wipe. Returns true when a
     /// regime change fired. The early probe is one [`WINDOW_STEPS`] window
-    /// (existing test); it must not dominate a 300–1000 token think.
+    /// (existing test), opened after the current mode's full re-measure
+    /// window; it must not dominate a 300–1000 token think.
     pub fn maybe_remeasure(&mut self, current_depth: usize) -> bool {
         let measured = self.measured_at_depth.max(REMEASURE_DEPTH_FLOOR);
         let live = current_depth.max(REMEASURE_DEPTH_FLOOR);
@@ -388,18 +447,19 @@ impl MtpGate {
     /// depth regime: per-step ±1 churn inside a bucket blends as ordinary
     /// window noise, a bucket change discards the partial (mixed-width)
     /// window, marks BOTH baselines stale and pulls the next probe forward
-    /// — exactly the [`Self::maybe_remeasure`] policy. A stale other-mode
-    /// EWMA cannot win a switch, so the gate re-measures before it re-arbitrates.
+    /// — exactly the [`Self::maybe_remeasure`] policy. A stale EWMA of either
+    /// mode cannot take part in arbitration, so the gate re-measures both
+    /// before it re-arbitrates.
     fn note_width(&mut self, width: usize) {
         let regime = width.next_power_of_two();
         if regime == self.width_regime {
             return;
         }
-        if self.width_regime != 0 {
+        let previous = std::mem::replace(&mut self.width_regime, regime);
+        if previous != 0 {
             tracing::info!(
-                "MTP gate: batch-width regime changed ({} -> {regime}); partial window \
+                "MTP gate: batch-width regime changed ({previous} -> {regime}); partial window \
                  discarded, baselines stale, will re-probe on cadence",
-                self.width_regime,
             );
             self.mtp.stale = true;
             self.serial.stale = true;
@@ -407,10 +467,11 @@ impl MtpGate {
             self.win_tokens = 0.0;
             self.win_wall = 0.0;
             self.win_steps = 0;
+            self.require_full_window = true;
             self.losing_windows = 0;
+            // In the NEW regime's units (`event_interval` scales with it).
             self.tokens_since_event = self.tokens_since_event.max(self.event_interval());
         }
-        self.width_regime = regime;
     }
 
     fn other(m: Mode) -> Mode {
@@ -420,11 +481,14 @@ impl MtpGate {
         }
     }
 
+    /// Batch tokens until the next probe/refresh: the per-sequence interval
+    /// times the batch-width bucket (module docs).
     fn event_interval(&self) -> usize {
-        match self.mode {
+        let per_seq = match self.mode {
             Mode::Mtp => self.refresh,
             Mode::Serial => self.reprobe,
-        }
+        };
+        per_seq.saturating_mul(self.width_regime.max(1))
     }
 
     fn stats_mut(&mut self, m: Mode) -> &mut ModeStats {
@@ -443,9 +507,14 @@ impl MtpGate {
         }
         if self.win_steps >= WINDOW_STEPS {
             self.close_window();
-        } else if !self.probing && self.tokens_since_event >= self.event_interval() {
+        } else if !self.probing
+            && !self.require_full_window
+            && self.tokens_since_event >= self.event_interval()
+        {
             // Time to look at the other mode: finish the current window
-            // early so the probe starts on a clean accumulator.
+            // early so the probe starts on a clean accumulator. Never while
+            // the current mode is stale — its re-measure needs the full
+            // window (module docs).
             self.close_window();
         }
     }
@@ -464,6 +533,7 @@ impl MtpGate {
         self.win_tokens = 0.0;
         self.win_wall = 0.0;
         self.win_steps = 0;
+        self.require_full_window = false;
 
         if self.probing {
             self.probe_windows_left = self.probe_windows_left.saturating_sub(1);
@@ -484,20 +554,29 @@ impl MtpGate {
         self.arbitrate();
     }
 
+    /// A mode's EWMA predates the last regime change: not a measurement of
+    /// this regime, so it may neither win nor lose arbitration until one
+    /// full window has replaced it.
+    fn is_stale(&self, m: Mode) -> bool {
+        match m {
+            Mode::Mtp => self.mtp.stale,
+            Mode::Serial => self.serial.stale,
+        }
+    }
+
     /// Compare mode EWMAs with a hysteresis margin; switch after dwell.
     fn arbitrate(&mut self) {
         let (Some(mtp), Some(serial)) = (self.mtp.tps, self.serial.tps) else {
             return; // need both baselines before any switch
         };
-        // A stale other-mode EWMA is a measurement from a different depth
-        // regime. Switching onto it dumps a long think into serial for a
-        // full reprobe interval — that is the costly failure, not the
-        // one-window early probe `maybe_remeasure` already schedules.
-        let other_stale = match self.mode {
-            Mode::Mtp => self.serial.stale,
-            Mode::Serial => self.mtp.stale,
-        };
-        if other_stale {
+        // Arbitration compares same-regime numbers only: if EITHER
+        // baseline predates the last regime change there is no pair to
+        // compare — wait for the full-window re-measure instead of letting
+        // a fresh other-mode number beat a stale current one. Switching
+        // onto a stale serial number dumps a long think into Serial for a
+        // full reprobe interval — the costly failure this gate exists to
+        // avoid.
+        if self.mtp.stale || self.serial.stale {
             return;
         }
         let (cur, other, other_dev) = match self.mode {
@@ -560,3 +639,6 @@ pub mod qsa_latch;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod regime_tests;

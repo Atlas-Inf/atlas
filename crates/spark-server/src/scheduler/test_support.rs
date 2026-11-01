@@ -34,10 +34,20 @@ pub(super) fn test_seq(
     guard_stop: Option<&'static str>,
     seq_len: usize,
 ) -> (ActiveSeq, RespRx) {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let now = Instant::now();
     let mut seq = SequenceState::host_only(0);
     seq.seq_len = seq_len;
+    test_owned_seq(seq, output_tokens, remaining, guard_stop)
+}
+
+/// Consumes one real owner; never replaces a live state with a placeholder.
+pub(super) fn test_owned_seq(
+    seq: SequenceState,
+    output_tokens: Vec<u32>,
+    remaining: usize,
+    guard_stop: Option<&'static str>,
+) -> (ActiveSeq, RespRx) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let now = Instant::now();
     let a = ActiveSeq {
         seq,
         session_hash: 0,
@@ -104,6 +114,8 @@ pub(super) fn test_seq(
         content_tokens: 0,
         prose_tokens_since_last_tool: 0,
         think_watchdog_fires: 0,
+        loop_steers: 0,
+        loop_steer_max: 0,
         rollback_count: 0,
         ssm_rollback_ring: SsmDecodeRing::new(0),
         grammar_state: None,
@@ -122,3 +134,74 @@ pub(super) fn test_seq(
     };
     (a, rx)
 }
+
+/// Grammar fixtures share one vocabulary: a token per ASCII byte, `<eos>`,
+/// `<think>`, `</think>`, padded to the 2048-token test model's vocabulary.
+pub(super) const GRAMMAR_VOCAB: usize = 2048;
+pub(super) const GRAMMAR_EOS: u32 = 128;
+pub(super) const THINK_START: u32 = 1000;
+pub(super) const THINK_END: u32 = 1001;
+
+pub(super) fn grammar_engine() -> crate::grammar::GrammarEngine {
+    let vocab: Vec<String> = (0..GRAMMAR_VOCAB as u32)
+        .map(|t| match t {
+            0..128 => (t as u8 as char).to_string(),
+            GRAMMAR_EOS => "<eos>".into(),
+            THINK_START => "<think>".into(),
+            THINK_END => "</think>".into(),
+            _ => format!("<pad{t}>"),
+        })
+        .collect();
+    crate::grammar::GrammarEngine::new(&vocab, &[GRAMMAR_EOS as i32]).unwrap()
+}
+
+/// A 3-token, 600-max-token request with neutral sampling; `$extra` supplies
+/// the variant's channel (and a streaming request's cancel flag).
+macro_rules! test_request {
+    ($variant:ident, $($extra:tt)*) => {
+        InferenceRequest::$variant {
+            prompt_tokens: std::sync::Arc::new(vec![1, 2, 3]),
+            session_hash: 0,
+            adapter_slot: -1,
+            src_lang_id: 0,
+            tgt_lang_id: 0,
+            num_beams: 1,
+            length_penalty: 1.0,
+            early_stopping: false,
+            force_nonempty_content: false,
+            image_pixels: vec![],
+            max_tokens: 600,
+            min_tokens: 0,
+            ignore_eos: false,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            top_n_sigma: 0.0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            lz_penalty: 0.0,
+            logit_bias: vec![],
+            stop_tokens: vec![],
+            enable_thinking: false,
+            thinking_budget: None,
+            repetition_detection: None,
+            require_tool_call: false,
+            tools_present: true,
+            suppress_tool_call: false,
+            disable_mtp: false,
+            grammar_spec: None,
+            seed: Some(1),
+            top_logprobs: None,
+            prompt_logprobs: None,
+            echo: false,
+            timeout_at: None,
+            $($extra)*
+        }
+    };
+}
+pub(super) use test_request;

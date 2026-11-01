@@ -34,10 +34,26 @@ pub(super) enum K4Hidden {
     DeferPropose,
 }
 
+/// `ATLAS_QWEN4EXP_MTP_ABSORB`: hand the proposer the live verify rows
+/// `row ..` of the `accepted` drafts (`Model::stage_mtp_absorb`) before
+/// anything reuses the forward's buffers. A failure costs only the absorb.
+// Ported from Enntity/atlas 166e2b1 (AGPL-3.0-only).
+pub(super) fn stage_absorb(model: &dyn Model, a: &mut ActiveSeq, row: usize, accepted: &[u32]) {
+    if let Err(e) = model.stage_mtp_absorb(&mut a.seq, row, accepted) {
+        tracing::error!("stage_mtp_absorb: {e:#}");
+    }
+}
+
 #[inline]
 fn save_hidden(model: &dyn Model, hidden: K4Hidden, na: usize) -> anyhow::Result<()> {
     match hidden {
-        K4Hidden::VerifyRow => model.save_hidden_for_mtp(na, 0),
+        // A drafter reading the PRE-mixer stream highway (qwen4_exp) needs
+        // row `na` staged into row 0 too, as the K=2/3 steppers do, or it
+        // drafts from the first verify row instead of the accepted one. The
+        // stash path restores its stream row in `_from_stash`.
+        K4Hidden::VerifyRow => model
+            .select_mtp_stream_row(na)
+            .and_then(|()| model.save_hidden_for_mtp(na, 0)),
         K4Hidden::Stash(i) => model.save_hidden_for_mtp_from_stash(i, 0),
         // Deferred mode never saves inline (the batched propose reads the
         // stash rows directly; the per-seq fallback re-saves per sequence).
@@ -54,7 +70,7 @@ fn save_hidden(model: &dyn Model, hidden: K4Hidden, na: usize) -> anyhow::Result
 /// (per-row picks incl. the bonus row), `num_accepted` in 0..=nd. At nd=3
 /// this is the verbatim four-branch tail of the pre-refactor
 /// `step_verify_k4`, branch-collapsed; the phase ORDER of each original
-/// branch is preserved exactly (full accept: emit → commit → save → trim →
+/// branch is preserved exactly (full accept: commit → emit → save → trim →
 /// propose; partial/reject: rewind → trim → commit → emit → save → propose).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn k4_apply_verdict(
@@ -77,21 +93,11 @@ pub(super) fn k4_apply_verdict(
 
     if na == nd {
         // ── Full accept: every draft matched; v[nd] is the free bonus. ──
-        for j in 0..nd {
-            emit_token(a, drafts[j], verify_lps.get(j).cloned(), sched);
-            if a.finished {
-                return;
-            }
-        }
-        emit_token(a, v[nd], verify_lps.get(nd).cloned(), sched);
-        if a.finished {
-            return;
-        }
-        a.last_token = v[nd];
-
         // Item #2 (STree-style in-place verify commit). Full accept
         // (num_accepted == k): the verify kernel already wrote the canonical
-        // h_state, so the commit is a no-op.
+        // h_state, so the commit is a no-op, except with KDA records, where
+        // it folds the rows in. Committed before emission for that case: an
+        // emit that finishes the sequence returns (see `verify_dflash_tail`).
         if let Err(e) = model.commit_accepted_prefix(&mut a.seq, k_rows, k_rows) {
             // SSM state is no longer trustworthy — terminate, do not continue.
             tracing::error!("commit_accepted_prefix (K={k_rows} accept-{k_rows}): {e:#}");
@@ -99,13 +105,24 @@ pub(super) fn k4_apply_verdict(
             a.finished = true;
             return;
         }
+        for j in 0..nd {
+            emit_span_row(a, drafts[j], verify_lps.get(j).cloned(), sched, j, k_rows);
+            if a.finished {
+                return;
+            }
+        }
+        emit_span_row(a, v[nd], verify_lps.get(nd).cloned(), sched, nd, k_rows);
+        if a.finished {
+            return;
+        }
+        a.last_token = v[nd];
     } else {
         // ── Partial accept / reject: rewind the rejected tail. ──
         a.seq.seq_len -= nd - na;
         for _ in 0..(nd - na) {
             a.seq.tokens.pop();
         }
-        if let Err(e) = model.trim_proposer_state(&mut a.seq, na, 0) {
+        if let Err(e) = crate::scheduler::copy_drafts::mtp::trim_proposer(model, a, na) {
             tracing::error!("trim_proposer_state: {e:#}");
         }
         // Item #2: rewind live h_state to intermediate[na] (state after the
@@ -120,50 +137,71 @@ pub(super) fn k4_apply_verdict(
             return;
         }
         for j in 0..na {
-            emit_token(a, drafts[j], verify_lps.get(j).cloned(), sched);
+            emit_span_row(a, drafts[j], verify_lps.get(j).cloned(), sched, j, na + 1);
             if a.finished {
                 return;
             }
         }
-        emit_token(a, v[na], verify_lps.get(na).cloned(), sched);
+        emit_span_row(a, v[na], verify_lps.get(na).cloned(), sched, na, na + 1);
         if a.finished {
             return;
         }
         a.last_token = v[na];
     }
 
+    if matches!(hidden, K4Hidden::VerifyRow) {
+        stage_absorb(model, a, 0, &drafts[..na]);
+    }
     if !defer && let Err(e) = save_hidden(model, hidden, na) {
         tracing::error!("save_hidden_for_mtp({na}): {e:#}");
         return;
     }
-    if na == nd {
+    if na == nd && nd > 0 {
         // Full-accept branch trims AFTER the hidden save (original order).
-        if let Err(e) = model.trim_proposer_state(&mut a.seq, na, 0) {
+        // A decode row (nd == 0, batched path only) drafted nothing this
+        // step: there is no drafter row to trim, as on the bootstrap path —
+        // the EP worker skips it by the same rule (`ep_worker_apply_verdict`).
+        if let Err(e) = crate::scheduler::copy_drafts::mtp::trim_proposer(model, a, na) {
             tracing::error!("trim_proposer_state: {e:#}");
         }
     }
     if !defer {
+        // Single sequence: the per-request depth controller picks the next
+        // depth (`ATLAS_MTP_SINGLE_DEPTH_ADAPT`); batched rows keep the step's.
+        let next_drafts = if matches!(hidden, K4Hidden::VerifyRow) {
+            a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth())
+        } else {
+            num_drafts
+        };
         let t_propose = Instant::now();
-        let _mtp_grammar_mask = mtp_grammar_mask_for(a);
-        match model.run_mtp_propose_multi(
-            a.last_token,
-            a.seq.seq_len,
-            num_drafts,
-            &mut a.seq,
-            0,
-            _mtp_grammar_mask.as_deref(),
-        ) {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!("run_mtp_propose_multi: {e:#}");
+        // A copy (`ATLAS_QWEN_COPY_DRAFTS`) drafts in place of the head.
+        if nd == 0 || !crate::scheduler::copy_drafts::mtp::propose(model, sched, a, num_drafts) {
+            let _mtp_grammar_mask = mtp_grammar_mask_for(a);
+            match model.run_mtp_propose_multi(
+                a.last_token,
+                a.seq.seq_len,
+                next_drafts,
+                &mut a.seq,
+                0,
+                _mtp_grammar_mask.as_deref(),
+            ) {
+                Ok(d) if !d.is_empty() => a.pending_drafts = d,
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!("run_mtp_propose_multi: {e:#}");
+                }
             }
         }
+        sched
+            .timing
+            .record(crate::scheduler::mtp_timing::Phase::Propose, t_propose);
         let propose_us = t_propose.elapsed().as_micros();
         tracing::debug!(
             "K{k_rows} ACCEPT-{na}: verify={verify_us}μs propose={propose_us}μs seq_len={}",
             a.seq.seq_len
         );
     }
-    crate::scheduler::verify_k4_step::stats::k4_record_outcome(sched, na, a.seq.seq_len);
+    if nd > 0 {
+        crate::scheduler::verify_k4_step::stats::k4_record_outcome(sched, na, a.seq.seq_len);
+    }
 }

@@ -62,6 +62,12 @@ pub struct Qwen3SsmLayer {
     // FP8 E4M3 checkpoint weights for native FP8 serving (w8a16_gemv LUT kernel)
     qkvz_fp8w: Option<Fp8Weight>,
     out_proj_fp8w: Option<Fp8Weight>,
+    /// The `*_fp8w` copies serve DECODE only: the prefill GEMMs keep reading
+    /// the BF16 `ssm.in_proj_qkvz` / `out_proj_dense` they were derived from,
+    /// and the batched decode out_proj reads FP8 ahead of that BF16 copy.
+    /// Set by `quantize_dense_gdn_to_fp8` (`ATLAS_QWEN4EXP_FP8_GDN=1`); false
+    /// everywhere else, where the dispatch is unchanged.
+    fp8w_decode_only: bool,
     // Transposed [K,N] copies of the block-scaled FP8 weights for the coalesced
     // `w8a16_gemm_t` prefill path — populated by `transpose_fp8_for_prefill`
     // for native-FP8 GDN checkpoints. The non-transposed `*_fp8w` copies stay
@@ -82,6 +88,9 @@ pub struct Qwen3SsmLayer {
     /// block-scaled `w8a16_*` arms).
     qkvz_fp8w_rowwise: Option<Fp8Weight>,
     out_proj_fp8w_rowwise: Option<Fp8Weight>,
+    /// Native MXFP8 `[Q|K|V|Z]` and out_proj (FP4-Local). When set, it is
+    /// the only copy of both projections; see `mx8`.
+    mx8: Option<mx8::Mx8Gdn>,
     /// Tier-1c keep-packed ternary Q2_0 fused in_proj_qkvz (`ATLAS_GGUF_NATIVE_Q2`).
     /// [Q|K|V|Z] rows byte-concatenated from packed `in_proj_qkv` (V-region
     /// row-permuted) + `in_proj_z` (row-permuted) at load, so the 2-bit weight is
@@ -118,6 +127,8 @@ pub struct Qwen3SsmLayer {
     /// all verify rows. `KernelHandle(0)` on kernel sets that lack it →
     /// callers keep the per-token `dense_gemv` / tile-GEMM fallback.
     dense_gemv_batchm_k: KernelHandle,
+    /// Its 16/32-row twins under `ATLAS_QWEN4EXP_BATCH_FAST` (`exact_rows.rs`).
+    wide_rows: ops::Qwen4ExpWideRows,
     /// Per-row-FP8 GEMV siblings for `qkvz_fp8_dense`/`out_proj_fp8_dense`:
     /// M=1 `dense_gemv_fp8w` and the M<=8 batched `dense_gemv_fp8w_batchm`.
     /// `KernelHandle(0)` on kernel sets that lack them → BF16 decode path.
@@ -378,6 +389,10 @@ pub struct Qwen3SsmLayer {
     // twin beat the fixed one at m==8 (475 vs 551 us/call; 47-75 VGPR vs
     // 98-133). Preferred when linked and ATLAS_GEMV_VL2 != 0.
     w8a16_gemv_batch8_dyn_vl2_k: KernelHandle,
+    // n2 twin (2 outputs/thread sharing the activation loads; 16
+    // outputs/block, grid ceil(N/16)) — bit-identical to dyn_vl2, measured
+    // 1.15-1.31x on the verify shapes. Preferred at m<=8 when linked.
+    w8a16_gemv_batch8_dyn_vl2_n2_k: KernelHandle,
     // M<=16 sibling of batch4 for high-concurrency decode (n=5..16): same
     // weight-streaming GEMV, avoids the M-padded MMA at C=8/16.
     w8a16_gemv_batch16_k: KernelHandle,
@@ -405,14 +420,20 @@ pub struct Qwen3SsmLayer {
 // Kernel-selection helpers moved to `kernel_select.rs` (≤500 LoC split).
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
+mod ckpt_capture;
 mod debug;
+mod exact_rows;
 mod fla_dispatch;
+mod gdn_defer;
 pub mod gdn_flags;
+mod gdn_fused_rows;
 mod init;
 mod init_fp8;
 mod init_q2;
 mod kernel_select;
 mod lora;
+pub mod mx8;
+mod ssm_decode_tail;
 mod ssm_forward;
 pub(crate) mod ssm_h_fp16;
 mod trait_decode;
@@ -425,12 +446,14 @@ mod trait_decode_batched_conv_gdn_wyn;
 mod trait_decode_batched_hc;
 mod trait_decode_hc;
 mod trait_decode_multi_seq;
+pub(crate) use trait_decode_multi_seq::moe_legacy_pertoken_decode;
 mod trait_layer;
 mod trait_prefill;
 mod trait_prefill_block;
 mod trait_prefill_gdn;
 mod trait_prefill_hc;
 mod trait_prefill_helper;
+mod trait_prefill_multi;
 mod trait_prefill_phase1;
 mod trait_prefill_phase3;
 mod trait_prefill_proj;
@@ -438,11 +461,13 @@ mod trait_prefill_recur;
 
 pub use gdn_flags::{
     GdnFlags, gdn_fused_norm_enabled, ssm_batched_recurrent_enabled, ssm_h_dtype_bits,
-    ssm_h_f16_pool_enabled, ssm_h_fp16_enabled, verify_exact_enabled,
+    ssm_h_f16_pool_enabled, ssm_h_fp16_enabled, verify_exact_enabled, verify_exact_for,
 };
 
 // ── TransformerLayer impl (delegates to per-file inherent _inner methods) ──
 
+#[cfg(test)]
+mod mx8_tests;
 #[cfg(test)]
 mod tests;
 

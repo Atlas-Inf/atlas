@@ -19,7 +19,7 @@ impl KvCacheDtype {
     ///
     /// Extend this together with [`KvCacheDtype::name`] below — the
     /// non-exhaustive-match error a new variant raises there points here.
-    pub const ALL: [KvCacheDtype; 16] = [
+    pub const ALL: [KvCacheDtype; 17] = [
         KvCacheDtype::Bf16,
         KvCacheDtype::Fp8,
         KvCacheDtype::Nvfp4,
@@ -36,6 +36,7 @@ impl KvCacheDtype {
         KvCacheDtype::Fp8KTurbo3V,
         KvCacheDtype::Bf16KTurbo2V,
         KvCacheDtype::Fp8KTurbo2V,
+        KvCacheDtype::Fp8G128,
     ];
 
     /// The canonical `--kv-cache-dtype` spelling. `Display` delegates here,
@@ -59,6 +60,7 @@ impl KvCacheDtype {
             KvCacheDtype::Fp8KTurbo3V => "fp8k_turbo3v",
             KvCacheDtype::Bf16KTurbo2V => "bf16k_turbo2v",
             KvCacheDtype::Fp8KTurbo2V => "fp8k_turbo2v",
+            KvCacheDtype::Fp8G128 => "fp8_g128",
         }
     }
 }

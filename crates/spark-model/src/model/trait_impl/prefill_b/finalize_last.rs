@@ -18,29 +18,6 @@ use crate::layers::ops;
 use crate::traits::SequenceState;
 
 impl TransformerModel {
-    pub(in crate::model) fn prefill_b_finalize_last(
-        &self,
-        tokens: &[u32],
-        seq: &mut SequenceState,
-        kv_cache: &mut PagedKvCache,
-        chunk_start: usize,
-        chunk_len: usize,
-        proc_count: usize,
-        stream: u64,
-    ) -> Result<DevicePtr> {
-        self.prefill_b_finalize_last_at(
-            tokens,
-            seq,
-            kv_cache,
-            chunk_start,
-            chunk_len,
-            proc_count,
-            0,
-            0,
-            stream,
-        )
-    }
-
     /// Q12 Path B: stream-offset-aware finalize for the kernel-batched
     /// orchestrator. `hidden_stream_offset_tokens` is `b * chunk_len`
     /// where `b` is the stream's index in the batched dispatch.
@@ -55,6 +32,9 @@ impl TransformerModel {
         proc_count: usize,
         hidden_stream_offset_tokens: usize,
         logits_row: usize,
+        // The last row's logits, when the caller projected them already
+        // (`multi`: every sequence's row of a multi-sequence pass at once).
+        logits_in: Option<DevicePtr>,
         stream: u64,
     ) -> Result<DevicePtr> {
         let h = self.config.hidden_size;
@@ -131,6 +111,23 @@ impl TransformerModel {
         let normed = self.buffers.norm_output();
         self.final_norm_rows(last_hidden, normed, 1, stream)?;
 
+        // ATLAS_LAYER_H_PREFILL: post-final-norm sum (pairs with the
+        // per-layer ATLAS_LAYER_HP lines).
+        if std::env::var("ATLAS_LAYER_H_PREFILL").as_deref() == Ok("1") {
+            self.gpu.synchronize(stream)?;
+            let mut hb = vec![0u8; h * 2];
+            if self.gpu.copy_d2h(normed, &mut hb).is_ok() {
+                let mut s_ = 0f64;
+                for c in hb.chunks_exact(2) {
+                    let v = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16) as f64;
+                    if v.is_finite() {
+                        s_ += v.abs();
+                    }
+                }
+                tracing::warn!("ATLAS_LAYER_HP FINAL last_sabs={s_:.6} all_sabs={s_:.6}");
+            }
+        }
+
         // Diagnostic: post-norm hidden state
         if std::env::var("ATLAS_DIAG_GEMMA4").is_ok_and(|v| v == "1" || v == "true") {
             self.gpu.synchronize(stream)?;
@@ -165,6 +162,7 @@ impl TransformerModel {
         //   (1) re-restore the pristine SSM state@N from the snapshot, and
         //   (2) overwrite `normed` with the snapshot's stashed last-token
         //       post-norm hidden so `lm_head` emits the correct first token.
+        //   (3) re-apply its aux state (`exact_direct.rs`).
         // The redundant 1-token forward is otherwise harmless (its KV write
         // duplicates already-cached values).
         if let Some(snap_id) = seq.marconi_exact_snap {
@@ -175,6 +173,7 @@ impl TransformerModel {
                 self.gpu.as_ref(),
                 stream,
             )?;
+            self.exact_hit_reapply_aux(seq, snap_id, stream)?;
             if self.ssm_snapshots.has_hidden(snap_id) {
                 self.ssm_snapshots
                     .restore_hidden(snap_id, normed, self.gpu.as_ref(), stream)?;
@@ -194,7 +193,9 @@ impl TransformerModel {
         // streams' first token collapses to one shared buffer (cross-request
         // contamination). Row 0 (single-stream + batched stream 0) keeps the
         // byte-identical `lm_head` GEMV path; rows >0 write to their own offset.
-        let logits_ptr = if logits_row == 0 {
+        let logits_ptr = if let Some(ptr) = logits_in {
+            ptr
+        } else if logits_row == 0 {
             self.lm_head(normed, stream)?;
             self.decode_logits_ptr()
         } else {
@@ -203,6 +204,32 @@ impl TransformerModel {
             self.lm_head_batched(normed, 1, dst, stream)?;
             dst
         };
+        if !self.use_fp32_logits {
+            // ATLAS_GLM_DET_TRACE: the last prompt position's BF16 logits.
+            let (det, row) = (
+                crate::det_trace::on_stream(self.gpu.as_ref(), stream),
+                (proc_count - 1, 1),
+            );
+            det.tap("logits", logits_ptr, row, self.config.vocab_size * 2);
+        }
+
+        if std::env::var("ATLAS_LAYER_H_PREFILL").as_deref() == Ok("1") {
+            self.gpu.synchronize(stream)?;
+            let v_sz = self.config.vocab_size;
+            let mut lb = vec![0u8; v_sz * 2];
+            if self.gpu.copy_d2h(logits_ptr, &mut lb).is_ok() {
+                let mut top: Vec<(u32, f32)> = Vec::with_capacity(5);
+                for (i, c) in lb.chunks_exact(2).enumerate() {
+                    let v = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
+                    if v.is_finite() && (top.len() < 5 || v > top[4].1) {
+                        top.push((i as u32, v));
+                        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                        top.truncate(5);
+                    }
+                }
+                tracing::warn!("ATLAS_LAYER_HP LOGITS top5={top:?}");
+            }
+        }
 
         // Per-layer divergence dump: full logits vector + top-10 token IDs.
         if let Ok(dir) = std::env::var("ATLAS_NEMO_DUMP")
@@ -266,15 +293,18 @@ impl TransformerModel {
         // complete block past it (e.g. left stale by the `proc_count == 1`
         // last-chunk decode shortcut) is excluded so a future turn never reads
         // donor/zeroed V from it. When the whole prompt's complete blocks are
-        // valid we keep the full token range (preserving the partial-suffix
-        // sub-block TTFT optimization); otherwise we truncate to the
-        // block-aligned valid prefix AND drop the SSM snapshot attach (the
-        // snapshot, keyed at full prompt length, would be unreachable through
-        // the shortened tree and would only orphan a pool slot).
+        // valid we keep the full token range, which keys the leaf snapshot;
+        // the insert publishes its complete blocks only, never the partly
+        // filled frontier block this sequence goes on to decode into.
+        // Otherwise we truncate to the block-aligned valid prefix AND drop the
+        // SSM snapshot attach (the snapshot, keyed at full prompt length,
+        // would be unreachable through the shortened tree and would only
+        // orphan a pool slot).
         let full_blocks = tokens.len() / bs;
         let valid_blocks = seq.kv_valid_tokens / bs;
-        let cache_blocks = full_blocks.min(valid_blocks);
-        let cap_applied = cache_blocks < full_blocks;
+        // R11 fix 1: the pass grid caps this further, with no leaf snapshot.
+        let (cache_blocks, cap_applied, grid_cap) =
+            self.grid_cap_blocks(full_blocks.min(valid_blocks), full_blocks, tokens.len(), bs);
         let cache_tokens_len = if cap_applied {
             cache_blocks * bs
         } else {
@@ -287,7 +317,7 @@ impl TransformerModel {
         } else {
             &seq.disk_block_ids[..cache_blocks.min(seq.disk_block_ids.len())]
         };
-        if cap_applied {
+        if cap_applied && !grid_cap {
             tracing::warn!(
                 "Prefix-cache stale-V cap: caching {} of {} complete blocks \
                  (kv_valid_tokens={} < prompt_len={}); trailing blocks had \
@@ -306,9 +336,11 @@ impl TransformerModel {
         } else if cap_applied {
             // Cap forced — never attach the full-length snapshot to a
             // truncated tree (would be unreachable + leak a pool slot).
-            if !self.tokens_have_vision_pad(cache_tokens) && !self.hss_window_slid(seq) {
+            if let Some(key) = self.pc_key(seq, cache_tokens)
+                && !self.hss_window_slid(seq)
+            {
                 let acquired = self.prefix_cache.insert(
-                    cache_tokens,
+                    &key,
                     cache_block_table,
                     cache_disk_block_ids,
                     bs,
@@ -317,7 +349,9 @@ impl TransformerModel {
                 );
                 super::super::super::block_mgmt::cache_acquires_refs(&acquired, kv_cache);
             }
-        } else if self.ssm_snapshots.is_enabled() {
+        } else if self.ssm_snapshots.is_enabled()
+            && !crate::model::mtp_carry::marconi_prefill_only()
+        {
             if std::env::var("ATLAS_SSM_SAVE_DUMP").is_ok() {
                 self.ssm_pool.debug_state_checksum(
                     seq.slot_idx,
@@ -365,14 +399,10 @@ impl TransformerModel {
                 }
             };
             if let Some(snap_id) = snap_result {
-                if self.tokens_have_vision_pad(tokens) || self.hss_window_slid(seq) {
-                    // Vision-pad: image-tainted snapshot + colliding token key.
-                    // HSS-slid: `block_table` no longer parallels the token
-                    // stream (see `hss_window_slid`). Either way we decline the
-                    // radix insert, and the snapshot is only reachable through
-                    // those nodes — so free it rather than leak a pool slot.
-                    self.ssm_snapshots.free(snap_id);
-                } else {
+                let key = self
+                    .pc_key(seq, tokens)
+                    .filter(|_| !self.hss_window_slid(seq));
+                if let Some(key) = key {
                     tracing::info!(
                         "Saved SSM snapshot {} for {} tokens ({} blocks) [chunk]",
                         snap_id,
@@ -384,7 +414,10 @@ impl TransformerModel {
                     // would serve the previous request's lexical state, so
                     // aux-carrying models decline aux-less slots on restore.
                     let mut aux = self.ssm_snapshots.take_aux(snap_id);
-                    self.collect_aux_states_into(seq, stream, &mut aux)?;
+                    // ATLAS_QWEN4EXP_CKPT_AUX_SHARE: the mid-chunk finalize read these.
+                    if !super::qwen4exp_ckpt::take_pass_aux(seq.slot_idx, seq.seq_len, &mut aux) {
+                        self.collect_aux_states_into(seq, stream, &mut aux)?;
+                    }
                     if !aux.is_empty() {
                         self.ssm_snapshots.set_aux(snap_id, aux);
                     }
@@ -396,7 +429,7 @@ impl TransformerModel {
                     self.ssm_snapshots
                         .save_hidden(snap_id, normed, self.gpu.as_ref(), stream)?;
                     let (displaced, acquired) = self.prefix_cache.insert_with_snapshot(
-                        tokens,
+                        &key,
                         &seq.block_table,
                         &seq.disk_block_ids,
                         bs,
@@ -409,10 +442,21 @@ impl TransformerModel {
                     if let Some(old) = displaced {
                         self.ssm_snapshots.free(old);
                     }
+                } else {
+                    // A placeholder the content key does not cover (an
+                    // image-tainted snapshot under a colliding key), or HSS
+                    // slid (`block_table` no longer parallels the token
+                    // stream, see `hss_window_slid`): either way we decline
+                    // the radix insert, and the snapshot is only reachable
+                    // through those nodes — so free it rather than leak a
+                    // pool slot.
+                    self.ssm_snapshots.free(snap_id);
                 }
-            } else if !self.tokens_have_vision_pad(tokens) && !self.hss_window_slid(seq) {
+            } else if let Some(key) = self.pc_key(seq, tokens)
+                && !self.hss_window_slid(seq)
+            {
                 let acquired = self.prefix_cache.insert(
-                    tokens,
+                    &key,
                     &seq.block_table,
                     &seq.disk_block_ids,
                     bs,
@@ -421,9 +465,11 @@ impl TransformerModel {
                 );
                 super::super::super::block_mgmt::cache_acquires_refs(&acquired, kv_cache);
             }
-        } else if !self.tokens_have_vision_pad(tokens) && !self.hss_window_slid(seq) {
+        } else if let Some(key) = self.pc_key(seq, tokens)
+            && !self.hss_window_slid(seq)
+        {
             let acquired = self.prefix_cache.insert(
-                tokens,
+                &key,
                 &seq.block_table,
                 &seq.disk_block_ids,
                 bs,
@@ -439,3 +485,6 @@ impl TransformerModel {
         Ok(logits_ptr)
     }
 }
+
+#[path = "finalize_last/wrapper.rs"]
+mod wrapper;

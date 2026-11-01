@@ -82,6 +82,35 @@ fn boot_argmax_batch_enabled() -> bool {
     *CACHED.get_or_init(|| std::env::var_os("ATLAS_NO_MTP_BOOT_ARGMAX").is_none())
 }
 
+/// `ATLAS_MTP_DFLASH_CTX_SCOPED=1` (default off): see [`dflash_ctx_serializes`].
+/// Read once per process.
+fn dflash_ctx_scoped() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("ATLAS_MTP_DFLASH_CTX_SCOPED").as_deref() == Ok("1"))
+}
+
+/// Whether the DFlash drafter-context commit modes keep draftless sequences
+/// on the per-sequence bootstrap (no batched bootstrap, no decode rows).
+///
+/// Those modes order a per-sequence ctx append against a per-sequence decode,
+/// which only the DFlash lane has. `dflash_unified_ctx` is ON unless
+/// `ATLAS_NO_DFLASH_UNIFIED_CTX=1`, with or without DFlash, so on the MTP lane
+/// (where `commit_ctx` is a no-op: no DFlash proposer state) it silently kept
+/// every wave's first step at n serial M=1 forwards plus n proposes (280 ms
+/// at C=8 vs ~95 ms for a step) and the one-forward decode rows dead.
+/// `ATLAS_MTP_DFLASH_CTX_SCOPED=1` scopes the modes to the DFlash lane, which
+/// both callers already exclude (`dflash_verify_raw_argmax`).
+pub(super) fn dflash_ctx_serializes(sched: &crate::scheduler::sched_ctx::SchedCtx) -> bool {
+    dflash_ctx_serializes_with(&sched.levers, dflash_ctx_scoped())
+}
+
+fn dflash_ctx_serializes_with(
+    levers: &crate::scheduler::levers::SchedLevers,
+    scoped: bool,
+) -> bool {
+    !scoped && (levers.dflash_unified_ctx || levers.dflash_serial_append)
+}
+
 /// Whether [`step_mtp_bootstrap_batched`] can run for these sequences.
 pub(super) fn can_batch_bootstrap(
     model: &dyn Model,
@@ -93,8 +122,7 @@ pub(super) fn can_batch_bootstrap(
         && !dflash_verify_raw_argmax
         && !bootstrap_batch_disabled()
         && spark_model::speculative::mtp_multi_seq_mode()
-        && !sched.levers.dflash_unified_ctx
-        && !sched.levers.dflash_serial_append
+        && !dflash_ctx_serializes(sched)
         // FP32-lm_head models (Gemma-4 dense) are excluded: `logits_ptr_is_fp32`
         // is an exact-pointer identity against the FP32 scratch buffer, so a
         // per-ROW offset pointer would dispatch as BF16 and read garbage. The
@@ -168,8 +196,8 @@ pub(super) fn step_mtp_bootstrap_batched(
     let elem = if model.decode_logits_fp32() { 4 } else { 2 };
 
     // ── ONE batched argmax readback for the rows that sample greedily ──
-    // Every eligible row's `sample_token_with_grammar` takes its fast-greedy
-    // branch: `argmax_on_device` = ONE single-CTA `argmax_bf16` (grid [1,1,1],
+    // Every eligible row's `pick_row` would take its GPU branch:
+    // `argmax_on_device` = ONE single-CTA `argmax_bf16` (grid [1,1,1],
     // ~100 us at a 248k vocab) plus a BLOCKING 4-byte D2H — n of them,
     // serialized on one stream, each draining the pipeline. `argmax_batch`
     // runs the identical per-row kernel body (one block per row, same tie
@@ -177,36 +205,21 @@ pub(super) fn step_mtp_bootstrap_batched(
     // it is the same call the non-MTP decode step makes
     // (`decode_logits_step.rs`).
     //
-    // Eligibility is a STRICT SUBSET of the fast-greedy branch's own gate
-    // (`sample_step.rs`): greedy temperature, no grammar (its bitmask is
-    // host-side), and EXACTLY-neutral penalties — `PenaltyGate::ReduceOnly`
-    // is excluded because its per-position immunity check needs a per-row
-    // logit read anyway. Any row failing it keeps the per-row call verbatim,
-    // so this can only change WHICH kernel produced an identical token.
+    // Eligibility is the one-row pick's own GPU gate (`fast_greedy::pick_row`):
+    // greedy, no grammar (its bitmask is host-side), and the pipeline provably
+    // keeping the raw argmax (outside `<think>`, neutral penalties, no bias,
+    // no tool-call pin). `pick_row` still redoes a masked id on the host, so
+    // this only changes WHICH kernel produced an identical argmax.
     // `decode_logits_fp32` models never reach here (`can_batch_bootstrap`).
     // Kill switch `ATLAS_NO_MTP_BOOT_ARGMAX` (PRESENCE).
-    let pen: Vec<_> = refs
-        .iter()
-        .map(|a| {
-            crate::scheduler::sample_step::penalty_params_for(
-                a,
-                crate::scheduler::sample_step::PositionKind::Verify,
-                0.0,
-                None,
-                Vec::new(),
-            )
-        })
-        .collect();
     let greedy: Vec<bool> = refs
         .iter()
-        .zip(pen.iter())
-        .map(|(a, p)| {
+        .map(|a| {
             boot_argmax_batch_enabled()
                 && verify_ctx.sampling.fast_greedy_grammar
                 && (a.temperature == 0.0 || verify_ctx.sampling.force_temp_zero)
                 && a.grammar_state.is_none()
-                && crate::scheduler::fast_greedy::classify_penalties(p)
-                    == crate::scheduler::fast_greedy::PenaltyGate::Neutral
+                && crate::scheduler::fast_greedy::raw_argmax_is_pick(a)
         })
         .collect();
     let n_greedy = greedy.iter().filter(|&&g| g).count();
@@ -238,40 +251,16 @@ pub(super) fn step_mtp_bootstrap_batched(
     for (j, a) in refs.iter_mut().enumerate() {
         let row_logits = logits.offset(j * vocab * elem);
         let batched = batch_toks.as_ref().filter(|_| greedy[j]).map(|t| t[j]);
-        let tok = match batched {
-            Some(t) => t,
-            None => {
-                let history = crate::scheduler::sample_step::penalty_history_scope(
-                    &a.output_tokens,
-                    a.tool_call_end_token,
-                )
-                .to_vec();
-                match sample_token_with_grammar(
-                    model,
-                    row_logits,
-                    a.temperature,
-                    a.top_k,
-                    a.top_p,
-                    &[],
-                    a.grammar_state.as_mut(),
-                    &pen[j],
-                    &history,
-                    &verify_ctx.sampling,
-                ) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::error!("batched bootstrap sample error: {e:#}");
-                        a.engine_error = Some(format!("{e:#}"));
-                        a.finished = true;
-                        continue;
-                    }
-                }
+        let (tok, lp) = match crate::scheduler::fast_greedy::pick_row_scored(
+            model, row_logits, a, verify_ctx, batched,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("batched bootstrap sample error: {e:#}");
+                a.engine_error = Some(format!("{e:#}"));
+                a.finished = true;
+                continue;
             }
-        };
-        let lp = if let Some(k) = a.top_logprobs {
-            extract_single_logprobs(model, row_logits, tok, k)
-        } else {
-            None
         };
         emit_token(a, tok, lp, sched);
         if a.finished {
@@ -429,3 +418,7 @@ pub(super) fn step_mtp_bootstrap_batched(
         );
     });
 }
+
+#[cfg(test)]
+#[path = "mtp_bootstrap_step_tests.rs"]
+mod tests;

@@ -6,6 +6,9 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod backend_impl;
+mod carveout;
+
 #[derive(Debug)]
 pub struct MockAlloc {
     pub bytes: usize,
@@ -34,11 +37,25 @@ pub struct MockGpuBackend {
     /// backend regardless of `height`. Counted apart from `d2d` so a test can
     /// assert the SHAPE of the transfer, not just the bytes.
     d2d_2d: AtomicUsize,
+    /// Pitched host↔device copies — ONE enqueue each on the real backend,
+    /// whatever the row count.
+    host_pitched: AtomicUsize,
+    /// `memset_async` calls — one eager launch each on the real backend.
+    memsets: AtomicUsize,
     host_pinned_allocs: AtomicUsize,
     /// Pending `free` failure injections (see [`Self::fail_next_free`]).
     pending_free_failures: AtomicUsize,
+    /// `free` calls on a pointer that is not the base of a live allocation
+    /// (see [`Self::invalid_free_count`]).
+    invalid_frees: AtomicUsize,
     /// `destroy_graph` call counter (see [`Self::destroy_graph_count`]).
     destroyed_graphs: AtomicUsize,
+    /// Streams and events created and not yet destroyed (see
+    /// [`Self::live_streams_and_events`]).
+    live_streams: AtomicUsize,
+    live_events: AtomicUsize,
+    /// Lendable carveout ([`Self::with_carveout`]); `None` = no carveout.
+    carveout: Mutex<Option<super::carveout::CarveoutArena>>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +63,8 @@ pub struct MockLaunch {
     pub func: u64,
     pub grid: [u32; 3],
     pub block: [u32; 3],
+    /// Kernel parameter count (`kernelParams` entries).
+    pub args: usize,
 }
 
 impl Default for MockGpuBackend {
@@ -66,10 +85,25 @@ impl MockGpuBackend {
             d2h_async: AtomicUsize::new(0),
             d2d: AtomicUsize::new(0),
             d2d_2d: AtomicUsize::new(0),
+            host_pitched: AtomicUsize::new(0),
+            memsets: AtomicUsize::new(0),
             host_pinned_allocs: AtomicUsize::new(0),
             pending_free_failures: AtomicUsize::new(0),
+            invalid_frees: AtomicUsize::new(0),
             destroyed_graphs: AtomicUsize::new(0),
+            live_streams: AtomicUsize::new(0),
+            live_events: AtomicUsize::new(0),
+            carveout: Mutex::new(None),
         }
+    }
+
+    /// `(streams, events)` created and not yet destroyed: the leak check of
+    /// whatever owns them.
+    pub fn live_streams_and_events(&self) -> (usize, usize) {
+        (
+            self.live_streams.load(Ordering::Relaxed),
+            self.live_events.load(Ordering::Relaxed),
+        )
     }
 
     /// Queue one `free` failure: the next `free` call returns an error and
@@ -85,6 +119,15 @@ impl MockGpuBackend {
     pub fn destroy_graph_count(&self) -> usize {
         self.destroyed_graphs
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `free` calls whose pointer was not the base of a live allocation: a
+    /// double free, or an offset view into a block. The real backend rejects
+    /// both with `CUDA_ERROR_INVALID_VALUE` and puts the pointer back on its
+    /// cleanup ledger; the mock accepts them silently, so this counter is how
+    /// a teardown test sees them.
+    pub fn invalid_free_count(&self) -> usize {
+        self.invalid_frees.load(Ordering::Relaxed)
     }
 
     pub fn alloc_count(&self) -> usize {
@@ -122,6 +165,16 @@ impl MockGpuBackend {
     /// whatever the row count.
     pub fn d2d_2d_count(&self) -> usize {
         self.d2d_2d.load(Ordering::Relaxed)
+    }
+
+    /// Pitched host↔device copies so far (either direction).
+    pub fn host_pitched_count(&self) -> usize {
+        self.host_pitched.load(Ordering::Relaxed)
+    }
+
+    /// `memset_async` calls so far.
+    pub fn memset_count(&self) -> usize {
+        self.memsets.load(Ordering::Relaxed)
     }
 
     /// `alloc_host_pinned` calls — the tripwire for a staging buffer that is
@@ -196,198 +249,27 @@ fn find_alloc_mut(
     None
 }
 
-impl GpuBackend for MockGpuBackend {
-    fn op_cache(&self) -> &crate::op_cache::OpCache {
-        &self.op_cache
-    }
-
-    fn alloc(&self, bytes: usize) -> Result<DevicePtr> {
-        let mut next = self.next_ptr.lock();
-        let ptr = *next;
-        *next += bytes as u64;
-        // Align to 256 bytes
-        *next = (*next + 255) & !255;
-        self.allocs.lock().insert(
-            ptr,
-            MockAlloc {
-                bytes,
-                data: vec![0u8; bytes],
-            },
-        );
-        Ok(DevicePtr(ptr))
-    }
-
-    fn alloc_managed(&self, bytes: usize) -> Result<DevicePtr> {
-        self.alloc(bytes) // Mock: same as regular alloc
-    }
-
-    fn free(&self, ptr: DevicePtr) -> Result<()> {
-        if self
-            .pending_free_failures
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-            .is_ok()
-        {
-            anyhow::bail!("mock free failed (injected): ptr {ptr}");
+impl HostPitched for MockGpuBackend {
+    fn h2d_retained(&self, src: &[u8], dst: DevicePtr, shape: Pitched, _stream: u64) -> Result<()> {
+        // One tick per call, as `copy_d2d_2d_async`: the rows are emulation.
+        self.host_pitched.fetch_add(1, Ordering::Relaxed);
+        for r in 0..shape.height {
+            let row = &src[r * shape.host_pitch..][..shape.width];
+            self.copy_h2d(row, dst.offset(r * shape.dev_pitch))?;
         }
-        self.allocs.lock().remove(&ptr.0);
         Ok(())
     }
 
-    fn copy_h2d(&self, src: &[u8], dst: DevicePtr) -> Result<()> {
-        let mut allocs = self.allocs.lock();
-        // Support offset pointers: find the allocation containing dst
-        let (offset, alloc) = find_alloc_mut(&mut allocs, dst)
-            .ok_or_else(|| anyhow::anyhow!("copy_h2d: ptr {dst} not allocated"))?;
-        alloc.data[offset..offset + src.len()].copy_from_slice(src);
-        Ok(())
-    }
-
-    fn copy_d2h(&self, src: DevicePtr, dst: &mut [u8]) -> Result<()> {
-        self.d2h_blocking.fetch_add(1, Ordering::Relaxed);
+    fn d2h(&self, src: DevicePtr, dst: &mut [u8], shape: Pitched, _stream: u64) -> Result<()> {
+        self.host_pitched.fetch_add(1, Ordering::Relaxed);
         let allocs = self.allocs.lock();
-        // Support offset pointers: find the allocation containing src
-        let (offset, alloc) = find_alloc(&allocs, src)
-            .ok_or_else(|| anyhow::anyhow!("copy_d2h: ptr {src} not allocated"))?;
-        dst.copy_from_slice(&alloc.data[offset..offset + dst.len()]);
-        Ok(())
-    }
-
-    fn copy_d2h_async(&self, src: DevicePtr, dst: &mut [u8], _stream: u64) -> Result<()> {
-        // Counted separately from `copy_d2h` and NOT delegating to it, so a
-        // test can distinguish the batched shape from the blocking one (the
-        // trait's default impl forwards, which would make them indistinguishable).
-        self.d2h_async.fetch_add(1, Ordering::Relaxed);
-        let allocs = self.allocs.lock();
-        let (offset, alloc) = find_alloc(&allocs, src)
-            .ok_or_else(|| anyhow::anyhow!("copy_d2h_async: ptr {src} not allocated"))?;
-        dst.copy_from_slice(&alloc.data[offset..offset + dst.len()]);
-        Ok(())
-    }
-
-    fn copy_d2d(&self, src: DevicePtr, dst: DevicePtr, bytes: usize) -> Result<()> {
-        self.d2d.fetch_add(1, Ordering::Relaxed);
-        self.blit(src, dst, bytes)
-    }
-
-    fn copy_d2d_async(
-        &self,
-        src: DevicePtr,
-        dst: DevicePtr,
-        bytes: usize,
-        _stream: u64,
-    ) -> Result<()> {
-        // NOT delegating to `copy_d2d`: the trait default forwards, which
-        // would make the two indistinguishable to `d2d_count` consumers only
-        // by accident. Counted here so both forms land in one counter on
-        // purpose.
-        self.d2d.fetch_add(1, Ordering::Relaxed);
-        self.blit(src, dst, bytes)
-    }
-
-    fn copy_d2d_2d_async(
-        &self,
-        src: DevicePtr,
-        src_pitch: usize,
-        dst: DevicePtr,
-        dst_pitch: usize,
-        width_bytes: usize,
-        height: usize,
-        _stream: u64,
-    ) -> Result<()> {
-        // ONE launch on the real backend (`cudaMemcpy2DAsync`), so ONE tick —
-        // the row loop below is emulation, not dispatch, and must not inflate
-        // `d2d_count` (which exists to prove a batched form batched).
-        self.d2d_2d.fetch_add(1, Ordering::Relaxed);
-        if width_bytes > src_pitch || width_bytes > dst_pitch {
-            anyhow::bail!(
-                "copy_d2d_2d_async: width {width_bytes} exceeds pitch \
-                 (src {src_pitch}, dst {dst_pitch}) — rows would overlap"
-            );
+        for r in 0..shape.height {
+            let from = src.offset(r * shape.dev_pitch);
+            let (offset, alloc) = find_alloc(&allocs, from)
+                .ok_or_else(|| anyhow::anyhow!("pitched D2H: ptr {from} not allocated"))?;
+            dst[r * shape.host_pitch..][..shape.width]
+                .copy_from_slice(&alloc.data[offset..offset + shape.width]);
         }
-        for r in 0..height {
-            self.blit(
-                src.offset(r * src_pitch),
-                dst.offset(r * dst_pitch),
-                width_bytes,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn launch(
-        &self,
-        func: KernelHandle,
-        grid: [u32; 3],
-        block: [u32; 3],
-        _shared_mem: u32,
-        _stream: u64,
-        _params: &mut [*mut std::ffi::c_void],
-    ) -> Result<()> {
-        self.launches.lock().push(MockLaunch {
-            func: func.0,
-            grid,
-            block,
-        });
-        Ok(())
-    }
-
-    fn synchronize(&self, _stream: u64) -> Result<()> {
-        self.syncs.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn default_stream(&self) -> u64 {
-        0
-    }
-
-    #[track_caller]
-    fn kernel(&self, _module: &str, _func_name: &str) -> Result<KernelHandle> {
-        Ok(KernelHandle(0xDEAD))
-    }
-
-    fn memset(&self, ptr: DevicePtr, value: u8, bytes: usize) -> Result<()> {
-        let mut allocs = self.allocs.lock();
-        let (offset, alloc) = find_alloc_mut(&mut allocs, ptr)
-            .ok_or_else(|| anyhow::anyhow!("memset: ptr {ptr} not allocated"))?;
-        alloc.data[offset..offset + bytes].fill(value);
-        Ok(())
-    }
-
-    fn memset_async(&self, ptr: DevicePtr, value: u8, bytes: usize, _stream: u64) -> Result<()> {
-        self.memset(ptr, value, bytes)
-    }
-
-    fn alloc_host_pinned(&self, bytes: usize) -> Result<*mut u8> {
-        // Same heap allocation as the trait default (the mock cannot page-lock);
-        // overridden solely to COUNT, so a test can prove a staging buffer is
-        // allocated once and reused rather than per event.
-        self.host_pinned_allocs.fetch_add(1, Ordering::Relaxed);
-        let layout = std::alloc::Layout::from_size_align(bytes, 64)
-            .map_err(|e| anyhow::anyhow!("invalid layout: {e}"))?;
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        if ptr.is_null() {
-            anyhow::bail!("host alloc failed: {bytes} bytes");
-        }
-        Ok(ptr)
-    }
-
-    fn total_memory(&self) -> Result<usize> {
-        Ok(128 * 1024 * 1024 * 1024) // 128 GB
-    }
-
-    fn sm_count(&self) -> Result<u32> {
-        // Rationale (PCND): tests that exercise occupancy-gated dispatch need
-        // SOME machine width; 48 is the GB10 value the model targets, chosen
-        // so mock runs take the same branch production does.
-        Ok(48)
-    }
-
-    fn free_memory(&self) -> Result<usize> {
-        Ok(120 * 1024 * 1024 * 1024) // 120 GB
-    }
-
-    fn destroy_graph(&self, _graph: GraphHandle) -> Result<()> {
-        self.destroyed_graphs.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }

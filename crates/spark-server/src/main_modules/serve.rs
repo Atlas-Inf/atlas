@@ -84,7 +84,7 @@ pub(crate) async fn serve(
             // swap would have nothing to join and would tear down a model with
             // a live scheduler still holding its weights.
             host.set_scheduler(prepared.scheduler);
-            let served = crate::main_modules::serve_router::build_and_serve(
+            let result = crate::main_modules::serve_router::build_and_serve(
                 host.clone(),
                 &prepared.bind,
                 prepared.port,
@@ -93,7 +93,7 @@ pub(crate) async fn serve(
             let h = host.clone();
             tokio::task::spawn_blocking(move || crate::main_modules::model_swap::shutdown(&h))
                 .await?;
-            served
+            result
         }
         Startup::Worker => Ok(()),
         // Nothing to serve YET — but the listener still comes up. Waiting for
@@ -208,8 +208,8 @@ pub(super) struct DefaultChatTemplateKwargs {
     pub thinking: crate::ir::ThinkingDirective,
     /// Template-side default effort string, injected in
     /// `api/chat/prepare.rs` when the request carries none and thinking
-    /// is on. `None` = the cross-template `"medium"` fallback in
-    /// `tokenizer/chat_render.rs` applies.
+    /// is on. `None` = MODEL.toml `[behavior].default_reasoning_effort`
+    /// ([`model_default_reasoning_effort`]), else the template's own default.
     pub reasoning_effort: Option<crate::ir::ReasoningEffort>,
     /// Server-level `preserve_thinking` pin; overrides the MODEL.toml
     /// `[behavior]` value, is overridden per-request.
@@ -281,6 +281,26 @@ pub(super) fn parse_default_chat_template_kwargs(
     })
 }
 
+/// MODEL.toml `[behavior].default_reasoning_effort` as the template effort an
+/// effort-silent request renders with when `--default-chat-template-kwargs`
+/// names none. Template-side only, like the "medium" fallback it replaced:
+/// the thinking budget stays the model's. Fail-fast on a spelling that is not
+/// a thinking-on tier.
+pub(crate) fn model_default_reasoning_effort(
+    behavior: &atlas_kernels::ModelBehavior,
+) -> anyhow::Result<Option<crate::ir::ReasoningEffort>> {
+    match behavior.default_reasoning_effort {
+        "" => Ok(None),
+        v => match crate::ir::parse_wire_effort(v) {
+            Some((effort @ Some(_), _)) => Ok(effort),
+            _ => anyhow::bail!(
+                "MODEL.toml [behavior].default_reasoning_effort {v:?}: expected one of \
+                 minimal, low, medium, high, xhigh, max"
+            ),
+        },
+    }
+}
+
 /// Resolve `--require-auth` / `--auth-tokens-file` / `--auth-token` into an
 /// optional `AuthConfig`. Validates at startup so misconfigurations fail
 /// loudly instead of letting an unauthenticated server run silently.
@@ -322,7 +342,7 @@ pub(super) fn build_auth_config(
     Ok(Some(Arc::new(cfg)))
 }
 
-/// Resolve the vision area bound: operator override, else the checkpoint's
+/// Resolve the vision pixel budget: operator override, else the checkpoint's
 /// own `preprocessor_config.json`, else `None` (preprocessor falls back to
 /// its historical 1280px long-side clamp).
 ///
@@ -334,7 +354,7 @@ pub(super) fn build_auth_config(
 /// checkpoint at the resolution it was built for.
 pub(super) fn resolve_vision_max_pixels(
     args: &cli::ServeArgs,
-    model_dir: &std::path::Path,
+    declared: Option<usize>,
 ) -> Result<Option<usize>> {
     if args.vision_max_pixels > 0 {
         return Ok(Some(args.vision_max_pixels));
@@ -350,7 +370,7 @@ pub(super) fn resolve_vision_max_pixels(
             }
         }
     }
-    Ok(read_preprocessor_max_pixels(model_dir))
+    Ok(declared)
 }
 
 /// Pull the IMAGE area bound out of the checkpoint's processor config, if it
@@ -522,6 +542,18 @@ pub(super) fn quant_pair_compatible(kernel_quant: &str, model_quant: &str) -> bo
         ("bf16", "fp8") |
         ("bf16", "nvfp4")
     )
+}
+
+/// Which of one target's compiled quant variants serves a `model_quant`
+/// checkpoint: the exact quant first, else the first compatible one (an
+/// FP8 checkpoint on a `*` build takes `nvfp4`, not the `exl3` overlay).
+/// `None` leaves the resolved target as is, for the compat check to reject.
+pub(super) fn pick_quant_variant(quants: &[&str], model_quant: &str) -> Option<usize> {
+    quants.iter().position(|q| *q == model_quant).or_else(|| {
+        quants
+            .iter()
+            .position(|q| quant_pair_compatible(q, model_quant))
+    })
 }
 
 #[cfg(test)]

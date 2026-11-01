@@ -140,6 +140,15 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize)
     // the response, so by the caching decision at the end of this function the
     // field is already `None` for blocking clients.
     let engine_failed = a.engine_error.is_some();
+    // One line per server-side cut, whichever guard set it: the single
+    // place every `guard_stop` passes, so a run can count them (an MLPerf
+    // point is invalid if any response was ended by a heuristic).
+    if let Some(guard) = a.guard_stop {
+        tracing::warn!(
+            "GUARD_STOP fired: {guard} (output_tokens={})",
+            a.output_tokens.len()
+        );
+    }
     let reason = if engine_failed {
         "error"
     } else {
@@ -170,7 +179,7 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize)
                     decode_time_ms: decode_ms,
                     reasoning_tokens: a.thinking_tokens,
                     cached_prompt_tokens: a.cached_prompt_tokens,
-                    accepted_prediction_tokens: a.mtp_acct.accepted_total() as usize,
+                    accepted_prediction_tokens: a.mtp_acct.accepted_output_total() as usize,
                     guard_stop: a.guard_stop,
                 },
                 "done frame",
@@ -188,7 +197,8 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize)
                     logprobs: std::mem::take(&mut a.logprobs_data),
                     reasoning_tokens: a.thinking_tokens,
                     cached_prompt_tokens: a.cached_prompt_tokens,
-                    accepted_prediction_tokens: a.mtp_acct.accepted_total() as usize,
+                    accepted_prediction_tokens: a.mtp_acct.accepted_output_total() as usize,
+                    guard_stop: a.guard_stop,
                     prompt_logprobs: std::mem::take(&mut a.seq.prompt_logprobs)
                         .into_iter()
                         .map(|p| crate::api::TokenLogprobs {
@@ -275,17 +285,41 @@ pub fn send_error(model: &dyn Model, a: &mut ActiveSeq, msg: &str) {
 /// an ActiveSeq. Without this the sender is silently dropped, producing
 /// a misleading "Inference cancelled" error on the client side.
 pub fn send_error_to_sink(sink: &mut ResponseSink, msg: &str) {
+    send_sink_error(
+        sink,
+        StreamEvent::Error(msg.to_string()),
+        anyhow::anyhow!("{msg}"),
+    );
+}
+
+/// [`send_error_to_sink`] for a request the server cannot serve as asked
+/// (a blocking client gets HTTP 400 via [`crate::api::InvalidRequestError`]).
+pub fn send_invalid_request_to_sink(sink: &mut ResponseSink, msg: &str) {
+    send_sink_error(
+        sink,
+        StreamEvent::InvalidRequest(msg.to_string()),
+        crate::api::InvalidRequestError(msg.to_string()).into(),
+    );
+}
+
+/// Report a failed prefill: HTTP 400 when the request itself can never fit
+/// (resending the same images fails the same way, #180), otherwise 500.
+pub fn send_prefill_error_to_sink(sink: &mut ResponseSink, msg: &str, e: &anyhow::Error) {
+    if e.is::<spark_model::model::VisionCapacityError>() {
+        send_invalid_request_to_sink(sink, msg);
+    } else {
+        send_error_to_sink(sink, msg);
+    }
+}
+
+fn send_sink_error(sink: &mut ResponseSink, event: StreamEvent, err: anyhow::Error) {
     match sink {
         ResponseSink::Streaming(tx) => {
-            super::mod_helpers::spawn_terminal_send(
-                tx,
-                StreamEvent::Error(msg.to_string()),
-                "pre-seq error frame",
-            );
+            super::mod_helpers::spawn_terminal_send(tx, event, "pre-seq error frame");
         }
         ResponseSink::Blocking(tx) => {
             if let Some(tx) = tx.take()
-                && tx.send(Err(anyhow::anyhow!("{msg}"))).is_err()
+                && tx.send(Err(err)).is_err()
             {
                 tracing::warn!("send_error_to_sink: blocking Error send failed (receiver dropped)");
             }
@@ -297,23 +331,23 @@ pub fn send_error_to_sink(sink: &mut ResponseSink, msg: &str) {
 ///
 /// Removes the sequence at `victim_idx` from `active`, saves its state
 /// to a swap file, frees GPU resources, and returns a `SwappedSeq`.
+///
+/// ORDER: the victim is saved and freed FIRST — releasing its own SSM slot to
+/// the pool — and only then are the survivors compacted. The old order
+/// compacted the swapped-in sequence onto slot `victim_idx` before the save,
+/// as an ownership transfer from the victim. That (a) wrote the survivor's
+/// SSM state over the victim's slot BEFORE `save_sequence_state` read it, so
+/// the swap image carried the wrong recurrent state, and (b) assumed
+/// `slot_idx == position`, so on a non-contiguous active vec it copied onto
+/// a slot owned by a third sequence. `compact_sequence` now only accepts
+/// targets it can claim from the free list, which this order satisfies.
 pub fn swap_out_sequence(
     model: &dyn Model,
     active: &mut Vec<ActiveSeq>,
     victim_idx: usize,
     spill: &mut KvSpillManager,
 ) -> Result<SwappedSeq> {
-    let mut a = active.swap_remove(victim_idx);
-
-    // Compact the swapped-in sequence (same logic as retire path).
-    if victim_idx < active.len() && active[victim_idx].seq.slot_idx != victim_idx {
-        model.compact_sequence(&mut active[victim_idx].seq, victim_idx)?;
-        // Disown the victim's migrated slot BEFORE the fallible save below: sets
-        // the reuse sentinel AND neutralizes the RAII guard so a `?`-early-
-        // return (create_file/save_sequence_state error) that drops `a` cannot
-        // double-release the slot now owned by the swapped-in sequence.
-        model.detach_slot_for_reuse(&mut a.seq);
-    }
+    let a = active.swap_remove(victim_idx);
 
     // Save + free + build moved to `preempt::spill_out_sequence` so the
     // decode-time preemption path (which must NOT reorder/compact the active
@@ -321,13 +355,22 @@ pub fn swap_out_sequence(
     // victim is surfaced to its client and freed here rather than silently
     // dropped (the old path leaked the GPU blocks AND the client saw only
     // "Inference cancelled").
-    match super::preempt::spill_out_sequence(model, a, spill) {
+    let res = match super::preempt::spill_out_sequence(model, a, spill) {
         Ok(s) => Ok(s),
         Err((mut a, e)) => {
             send_error(model, &mut a, &format!("swap-out failed: {e:#}"));
             Err(e)
         }
+    };
+
+    // The victim's slot is back in the pool on both arms above (`free_sequence`
+    // in the spill, or in `send_error`), which is the PRECONDITION of the
+    // shared compaction core. v2 EP keeps slots pinned (same rule as the
+    // retire path).
+    if !model.ep_protocol_v2() {
+        super::mod_helpers::compact_survivors_into_range(model, active);
     }
+    res
 }
 
 /// Resume a swapped-out sequence by restoring its state from disk.
@@ -346,6 +389,11 @@ pub fn resume_swapped_seq(
     model.restore_sequence_state(&mut seq, s.num_blocks, &mut reader)?;
     drop(reader);
     spill.remove_file(s.swap_id)?;
+    // Swap restore allocates a fresh local sequence without rerunning prefill;
+    // carry the native-only fence to both this rank and the worker before the
+    // resumed decode can issue any TP2/EP2 command.
+    seq.disable_mtp = s.disable_mtp;
+    model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, s.disable_mtp)?;
 
     // Restore CPU-side metadata.
     seq.tokens = s.tokens;
@@ -358,6 +406,8 @@ pub fn resume_swapped_seq(
     // remainder of the decode. Stores the freshly resolved index (release keys
     // off it, so the acquire/release stay balanced regardless of any rotate).
     seq.acquired_adapter_slot = model.acquire_adapter_slot(s.adapter_slot);
+    // The fresh sequence carries no min_tokens ban, and its drafter no floor.
+    s.eos_ban.arm(&mut seq);
 
     Ok(ActiveSeq {
         seq,
@@ -418,6 +468,8 @@ pub fn resume_swapped_seq(
         content_tokens: 0,
         prose_tokens_since_last_tool: 0,
         think_watchdog_fires: s.think_watchdog_fires,
+        loop_steers: s.loop_steers,
+        loop_steer_max: s.loop_steer_max,
         think_force_closed: s.think_force_closed,
         rollback_count: s.rollback_count,
         // Decode-rollback SSM snapshots are GPU-resident and not part of

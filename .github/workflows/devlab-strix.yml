@@ -1,0 +1,164 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Strix Halo (gfx1151) jobs on AMD's DevLab Dispatch pool: ephemeral
+# self-hosted runners, one fresh runner per job, selected by the
+# `devlab-dispatch` label (the pool matches on labels only, not runner groups).
+#
+# OWNER-ONLY BY CONSTRUCTION. This is AMD's hardware running our code, so the
+# workflow has exactly one trigger, `workflow_dispatch`, and the `authorize`
+# job refuses any actor other than the repository owner. There is no
+# `pull_request` / `pull_request_target` trigger, so a fork PR cannot reach the
+# pool at all, and nothing here reads a secret.
+#
+# Advisory, not gating: no required check depends on this workflow.
+#
+# Pool facts this file relies on (from other repos' use of the pool, 2026-09/10):
+# - labels: [self-hosted, Linux|Windows, devlab-dispatch, strix-halo]
+# - $HOME is a ~32 GB tmpfs overlay; durable space is under $RUNNER_TOOL_CACHE,
+#   which is where the toolchain cache below lives.
+# - jobs can queue for a long time when the pool is busy, so this workflow
+#   never cancels an in-flight run (`cancel-in-progress: false`).
+
+name: DevLab Strix (owner-only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or SHA to check out"
+        required: false
+        default: main
+        type: string
+      job:
+        description: "probe = runner environment only; build = probe + native strix-hip build; bench = build + run a scripts/devlab/*.sh script on the GPU"
+        required: true
+        default: probe
+        type: choice
+        options: [probe, build, bench]
+      script:
+        description: "bench only: script under scripts/devlab/ (e.g. scripts/devlab/ab_prefill.sh)"
+        required: false
+        default: ""
+        type: string
+      args:
+        description: "bench only: arguments for the script (space-separated; no shell metacharacters)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devlab-strix-${{ inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    name: Authorize (owner only)
+    if: github.repository == 'Atlas-Inf/atlas'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the repository owner
+        env:
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          for a in "$ACTOR" "$TRIGGERING_ACTOR"; do
+            if [ "$a" != "AzeezIsh" ]; then
+              echo "::error::DevLab Strix jobs are owner-only (got: $a)."
+              exit 1
+            fi
+          done
+          echo "Authorized: $ACTOR"
+
+  strix-linux:
+    name: Strix Halo Linux (${{ inputs.job }})
+    needs: authorize
+    runs-on: [self-hosted, Linux, devlab-dispatch, strix-halo]
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Probe runner environment
+        shell: bash
+        run: |
+          set -u
+          {
+            echo "## Strix Halo runner probe"
+            echo '```'
+            echo "host:    $(hostname)   kernel: $(uname -r)   cpus: $(nproc)"
+            grep -m1 PRETTY_NAME /etc/os-release || true
+            echo "rocm:    $(cat /opt/rocm/.info/version 2>/dev/null || echo 'no /opt/rocm/.info/version')"
+            echo "hipcc:   $(command -v hipcc || ls /opt/rocm/bin/hipcc 2>/dev/null || echo missing)"
+            (hipcc --version 2>/dev/null || /opt/rocm/bin/hipcc --version 2>/dev/null) | head -3 || true
+            echo "kfd:     $( [ -r /dev/kfd ] && [ -w /dev/kfd ] && echo rw || echo NOT-accessible)"
+            (rocminfo 2>/dev/null || /opt/rocm/bin/rocminfo 2>/dev/null) | grep -m2 -E 'Name:\s+gfx' || echo "rocminfo: no gfx agent visible"
+            for d in /sys/class/drm/card*/device; do
+              [ -r "$d/mem_info_vram_total" ] || continue
+              echo "$d: vram=$(( $(cat $d/mem_info_vram_total) / 1073741824 )) GiB gtt=$(( $(cat $d/mem_info_gtt_total) / 1073741824 )) GiB"
+            done
+            free -g | head -2
+            df -h "$HOME" "$GITHUB_WORKSPACE" "$RUNNER_TOOL_CACHE" 2>/dev/null
+            echo "HF_ENDPOINT=${HF_ENDPOINT:-unset}  HF_HOME=${HF_HOME:-unset}"
+            for t in cargo rustup docker python3 git ccache cmake clang; do printf '%-8s %s\n' "$t" "$(command -v $t || echo -)"; done
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Rust toolchain (cached under the tool cache)
+        if: inputs.job == 'build' || inputs.job == 'bench'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RUSTUP_HOME="$RUNNER_TOOL_CACHE/atlas/rustup" CARGO_HOME="$RUNNER_TOOL_CACHE/atlas/cargo"
+          mkdir -p "$RUSTUP_HOME" "$CARGO_HOME"
+          if [ ! -x "$CARGO_HOME/bin/cargo" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
+          fi
+          {
+            echo "RUSTUP_HOME=$RUSTUP_HOME"
+            echo "CARGO_HOME=$CARGO_HOME"
+          } >> "$GITHUB_ENV"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Native strix-hip build (all models)
+        if: inputs.job == 'build' || inputs.job == 'bench'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo --version
+          start=$(date +%s)
+          ./build-amd.sh
+          echo "build: $(( $(date +%s) - start ))s, binary $(sha256sum target/release/spark | cut -c1-16)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # bench: run one script from scripts/devlab/ against the build above, on the runner's gfx1151.
+      # Inputs reach the shell only through env (never interpolated into the script text), the path is
+      # pinned to scripts/devlab/*.sh, and args may not carry shell metacharacters.
+      - name: Bench script
+        if: inputs.job == 'bench'
+        shell: bash
+        env:
+          SCRIPT: ${{ inputs.script }}
+          ARGS: ${{ inputs.args }}
+        run: |
+          set -euo pipefail
+          [[ "$SCRIPT" =~ ^scripts/devlab/[A-Za-z0-9_.-]+\.sh$ ]] || { echo "::error::script must be scripts/devlab/<name>.sh (got: $SCRIPT)"; exit 1; }
+          args_re='^[A-Za-z0-9_./:=,@+ -]*$'
+          [[ "$ARGS" =~ $args_re ]] || { echo "::error::args contain disallowed characters"; exit 1; }
+          [ -f "$SCRIPT" ] || { echo "::error::$SCRIPT not found at this ref"; exit 1; }
+          export DEVLAB_OUT="$RUNNER_TEMP/devlab-out"; mkdir -p "$DEVLAB_OUT"
+          read -r -a argv <<< "$ARGS"
+          bash "$SCRIPT" "${argv[@]}" 2>&1 | tee "$DEVLAB_OUT/console.log"
+          { echo "## bench: $SCRIPT $ARGS"; echo '```'; cat "$DEVLAB_OUT/RESULTS.txt" 2>/dev/null || tail -40 "$DEVLAB_OUT/console.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload bench output
+        if: always() && inputs.job == 'bench'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: devlab-bench-${{ github.run_id }}
+          path: ${{ runner.temp }}/devlab-out
+          if-no-files-found: warn

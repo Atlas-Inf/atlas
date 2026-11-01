@@ -44,12 +44,16 @@ use super::strip::strip_thinking_tags;
 use super::inference_types::*;
 use super::sanitizer::*;
 
+#[path = "responses_stream/conv_items.rs"]
+mod conv_items;
+
 pub(super) async fn responses_endpoint_stream(
     CurrentModel(state): CurrentModel,
     mut chat_req: ChatCompletionRequest,
     metadata: Option<std::collections::HashMap<String, String>>,
     store_flag: bool,
     conversation_id: Option<String>,
+    client_session: Option<crate::session_key::ClientSessionId>,
 ) -> Response {
     use axum::response::sse::Event;
     use tokio::sync::mpsc;
@@ -62,37 +66,21 @@ pub(super) async fn responses_endpoint_stream(
     let model = chat_req.model.clone();
     let input_messages = chat_req.messages.clone();
     let state_arc = state.clone();
-
     // Capture the conversation-linked user items (the new turn's user
     // input) before handing chat_req off. We use them to append back
     // to the conversation after the stream finishes.
-    let conv_new_user_items: Vec<serde_json::Value> = if let Some(cid) = conversation_id.as_ref() {
-        let prior = state_arc
-            .conversation_store
-            .get(cid)
-            .map(|s| s.items.len())
-            .unwrap_or(0);
-        input_messages
-            .iter()
-            .skip(prior)
-            .map(|m| {
-                serde_json::json!({
-                    "type": "message",
-                    "role": m.role,
-                    "content": [{"type": "input_text", "text": m.content.text}],
-                })
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let conv_new_user_items: Vec<serde_json::Value> =
+        conv_items::conv_new_user_items(&state_arc, conversation_id.as_ref(), &input_messages);
 
     // Run the chat-completions streaming handler (re-using the full
     // pipeline: scheduler, tool detection, thinking, logprobs, ...).
-    let deltas = match chat_completions_inner(state, None, chat_req.into(), None).await {
+    let ir_req = crate::session_key::with_override(chat_req.into(), client_session);
+    let deltas = match chat_completions_inner(state, None, ir_req, None).await {
         super::chat::ChatOutcome::Streaming(d) => d,
         // Error envelope — forward unchanged.
-        super::chat::ChatOutcome::Http(r) => return r,
+        super::chat::ChatOutcome::Http(r) => {
+            return super::responses_translate::input_param(r).await;
+        }
         // Unreachable by construction: this endpoint lowers with
         // stream=true, so a success is always Streaming.
         super::chat::ChatOutcome::Blocking(_) => {

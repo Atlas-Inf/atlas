@@ -54,7 +54,7 @@ pub(super) fn load_layers(
         let input_norm = dense(store, &format!("{lp}.input_layernorm.weight"))?;
         let post_attn_norm = dense(store, &format!("{lp}.post_attention_layernorm.weight"))?;
         let ffn = if config.mlp_only_layers.contains(&i) {
-            load_dense_ffn(store, gpu, &lp)?
+            load_dense_ffn(store, gpu, &lp, config)?
         } else {
             load_moe_ffn(
                 store,
@@ -96,8 +96,13 @@ fn null_dense_ffn_weights() -> DenseFfnWeights {
     }
 }
 
-fn load_dense_ffn(store: &WeightStore, gpu: &dyn GpuBackend, lp: &str) -> Result<FfnComponent> {
-    let mut layer = DenseFfnLayer::new(null_dense_ffn_weights(), gpu)?;
+fn load_dense_ffn(
+    store: &WeightStore,
+    gpu: &dyn GpuBackend,
+    lp: &str,
+    config: &ModelConfig,
+) -> Result<FfnComponent> {
+    let mut layer = DenseFfnLayer::new(null_dense_ffn_weights(), gpu, &config.model_type)?;
     layer.set_bf16_weights(
         dense_auto(store, &format!("{lp}.mlp.gate_proj.weight"), gpu)?,
         dense_auto(store, &format!("{lp}.mlp.up_proj.weight"), gpu)?,
@@ -162,7 +167,8 @@ fn load_moe_ffn(
     // kernels and their shared contribution is overwritten before blending.
     layer.set_bf16_shared_expert(shared_gate, shared_up, shared_down)?;
     if unified_moe_layout {
-        layer.transpose_for_prefill_unified(gpu, config)?;
+        let freed = layer.transpose_for_prefill_unified(gpu, config)?;
+        store.mark_freed_elsewhere(&freed)?;
     }
     // Native NVFP4 CUTLASS grouped MoE (ATLAS_HOLO_MOE_GROUPED_CUTLASS=1).
     // The routed grouped GEMMs are ~47% of Laguna's C=1 prefill GPU time and

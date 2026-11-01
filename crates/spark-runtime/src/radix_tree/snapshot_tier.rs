@@ -23,7 +23,11 @@ impl SsmSnapshotIndex {
             return None;
         }
         let tail_protect = self.tail_lease_active();
-        let idx = self.session_aware_victim(tail_protect, /*skip_tiered*/ true)?;
+        let idx = if super::snapshot_chain::glm_pc_evict_enabled() {
+            self.chain_victim(/*skip_tiered*/ true)?
+        } else {
+            self.session_aware_victim(tail_protect, /*skip_tiered*/ true)?
+        };
         self.evictions_since_lookup = self.evictions_since_lookup.saturating_add(1);
         let depth = self.entries[idx].token_count;
         if min_tokens > 0 && depth < min_tokens {
@@ -123,6 +127,28 @@ impl SsmSnapshotIndex {
         };
         self.log_stats_if_due();
         result
+    }
+
+    /// Read-only twin of [`Self::lookup_tiered`]'s selection: the deepest
+    /// anchor (resident or spilled) with depth ≤ `limit`, same session gate for
+    /// tails. Touches no LRU, lease or stats state — used to decide whether an
+    /// NVMe KV restore can pay off before doing any I/O. 0 when none.
+    pub(super) fn peek_deepest(
+        &self,
+        tokens: &[u32],
+        limit: usize,
+        session_hash: u64,
+        adapter_id: u64,
+    ) -> usize {
+        let limit = limit.min(tokens.len());
+        self.entries
+            .iter()
+            .filter(|e| e.token_count <= limit)
+            .filter(|e| !e.is_tail || (session_hash != 0 && e.session_hash == session_hash))
+            .filter(|e| hash_token_prefix(tokens, e.token_count, adapter_id) == e.prefix_hash)
+            .map(|e| e.token_count)
+            .max()
+            .unwrap_or(0)
     }
 
     /// **Promote** a spilled entry back to HBM after the caller faulted its

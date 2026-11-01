@@ -18,6 +18,7 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.btile_storage.require_legacy()?;
         // LongCat zero-experts are wired only on the single-token decode
         // + prefill paths (v1); this variant would silently mis-route the
         // 384-wide router. Named refusal, not silent wrongness.
@@ -25,21 +26,24 @@ impl MoeLayer {
             self.router_logits_n as usize == ctx.config.num_experts,
             "zero-expert MoE routing is not wired on this dispatch variant yet (forward_atomic_c4)"
         );
-
         // Feature-1 phase-1: decode does not yet fold the expert delta.
         self.reject_decode_lora(ctx, "forward_atomic_c4_decode")?;
-        let has_shared = self.weights.shared_expert.gate_proj.weight.0 != 0
+        // A checkpoint-native separate shared expert still counts: the fused
+        // kernels NULL-guard it and `shared_down_out` is filled separately.
+        let has_shared = (self.weights.shared_expert.gate_proj.weight.0 != 0
             && self.weights.shared_expert.up_proj.weight.0 != 0
-            && self.weights.shared_expert.down_proj.weight.0 != 0;
+            && self.weights.shared_expert.down_proj.weight.0 != 0)
+            || self.has_separate_shared_expert();
         let nvfp4_supported = num_tokens == 4
             && self.moe_decode_atomic_c4_silu_down_accum_k.0 != 0
             && self.moe_decode_atomic_c4_finalize_k.0 != 0
             && self.bf16_gate_weight_ptrs.is_none()
-            && !self.has_mixed_bf16_shared_expert()
             && self.fp8_gate_weight_ptrs.is_none()
             && !self.use_t_layout_for_decode()
             && self.pre_expert_norm.is_none()
-            && has_shared;
+            && has_shared
+            // Its finalize adds a whole shared expert after the reduce.
+            && !self.shared_joins_reduce();
         if !nvfp4_supported {
             return self.forward_batched(input, num_tokens, ctx, stream);
         }
@@ -62,6 +66,16 @@ impl MoeLayer {
                 n,
                 num_experts,
                 h,
+                stream,
+            )?;
+        } else if self.row_invariant_bf16_router {
+            self.wide_rows.dense_rows(
+                ctx.gpu,
+                self.dense_gemv_batchm,
+                router_in,
+                &self.weights.gate,
+                gate_logits,
+                (n, num_experts, h, num_experts),
                 stream,
             )?;
         } else {
@@ -175,6 +189,24 @@ impl MoeLayer {
             n,
             stream,
         )?;
+
+        // Checkpoint-native separate shared expert: the fused kernels saw
+        // NULL weights (they skip it); fill `shared_down_out` for all 4 rows
+        // before the finalize/blend reads it.
+        if self.has_separate_shared_expert() {
+            self.run_separate_shared_expert(
+                input,
+                n,
+                h,
+                ctx.config.shared_expert_intermediate_size as u32,
+                shared_gate_scratch,
+                shared_up_scratch,
+                shared_down_out,
+                ctx,
+                true,
+                stream,
+            )?;
+        }
 
         let is_ep = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
         ops::moe_decode_atomic_c4_finalize(

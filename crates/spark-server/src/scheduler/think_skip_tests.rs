@@ -38,13 +38,14 @@ const SKIP_LIMIT: u32 = 50;
 /// `finished` flag can only have come from the watchdog and never from
 /// the `remaining == 0` length stop.
 fn content_phase_seq() -> ActiveSeq {
-    let (mut a, _rx) = test_seq(Vec::new(), 5000, None, 10);
+    let (mut a, rx) = test_seq(Vec::new(), 5000, None, 10);
+    // Kept alive: a dropped receiver reads as a client disconnect and retires
+    // the sequence before any guard runs.
+    std::mem::forget(rx);
     a.finished = false;
     a.inside_thinking = false;
     a.think_ended = true;
     a.think_end_token = Some(THINK_END);
-    // `_rx` is dropped: the fixture's sink is Blocking, which `emit_token`
-    // never sends on (only `finish_sequence` does), so no send can fail.
     a
 }
 

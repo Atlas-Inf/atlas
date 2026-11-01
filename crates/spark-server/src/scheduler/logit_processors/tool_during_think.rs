@@ -11,8 +11,8 @@
 //!   strong negative bias (`-12.0`) instead of `-inf` so the model can
 //!   still escape if its evidence for a tool call is overwhelming.
 //!
-//! These two branches are mutually exclusive (`if … else if …`),
-//! matching the original control-flow byte-for-byte.
+//! GLM's configured native opener is itself a reasoning boundary when tools
+//! are active. It remains subject to the explicit tool-loop suppression bias.
 
 use super::{LogitsContext, LogitsProcessor, ProcessorOutcome};
 use crate::scheduler::ActiveSeq;
@@ -26,7 +26,10 @@ impl LogitsProcessor for ToolCallDuringThinkingMask {
         a: &mut ActiveSeq,
         ctx: &LogitsContext,
     ) -> ProcessorOutcome {
-        if a.inside_thinking {
+        let native_boundary = a.tools_present
+            && ctx.glm_tool_boundary.is_some()
+            && ctx.glm_tool_boundary == ctx.tool_call_start_token;
+        if a.inside_thinking && !native_boundary {
             if let Some(tc_start) = ctx.tool_call_start_token {
                 let idx = tc_start as usize;
                 if idx < logits.len() {

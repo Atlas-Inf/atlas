@@ -11,6 +11,7 @@ use axum::response::Response;
 use std::sync::Arc;
 
 use crate::AppState;
+use crate::tokenizer::{Glm5VisionPlaceholder, QwenVisionPlaceholder};
 
 use super::super::compact::{compact_messages, openai_error_response};
 use super::msg_entry::MsgEntry;
@@ -31,27 +32,37 @@ pub(super) fn render_template(
     tools: &[crate::tool_parser::ToolDefinition],
     messages: &[MsgEntry],
     image_pad_counts: &[usize],
+    vision_placeholders: &[Glm5VisionPlaceholder],
+    qwen_vision_placeholders: &[QwenVisionPlaceholder],
     enable_thinking: bool,
     thinking_budget: Option<u32>,
     reasoning_effort: Option<crate::ir::ReasoningEffort>,
     preserve_thinking: Option<bool>,
     tools_active: bool,
+    // `response_format` set: thinking off renders a closed think block
+    // (`RenderFlags::empty_think_off`), so no template-forced thinking.
+    structured_output: bool,
 ) -> Result<TemplateOut, Response> {
     // Use closed thinking when client doesn't explicitly enable it.
     let template_thinking = enable_thinking;
 
     // Build JSON messages with structured tool_calls for Jinja.
-    let json_messages =
+    let mut json_messages =
         build_json_messages_for(messages, state.tokenizer.uses_deepseek_v4_encoding());
     // When TSCG is enabled the parser's `system_prompt()` has already
     // placed the compact tool signatures into messages[0]; passing
     // `tools` to Jinja as well would re-render the full JSON schema and
     // defeat the compaction. Pass `None` so the template's `{% if tools
     // %}` branch falls through — the tool-call format instructions
-    // still come from `system_prompt()`.
-    let jinja_tools: Option<Vec<serde_json::Value>> = if tools_active
-        && (state.tokenizer.uses_deepseek_v4_encoding() || !state.chat.prompt.tscg)
-    {
+    // still come from `system_prompt()`. A verbatim-prompt model renders
+    // the request's tools whenever it has any, `tool_choice: "none"`
+    // included, as the reference server does.
+    let render_tools = if state.chat.verbatim_prompt {
+        !tools.is_empty()
+    } else {
+        tools_active && (state.tokenizer.uses_deepseek_v4_encoding() || !state.chat.prompt.tscg)
+    };
+    let mut jinja_tools: Option<Vec<serde_json::Value>> = if render_tools {
         Some(
             tools
                 .iter()
@@ -61,6 +72,33 @@ pub(super) fn render_template(
     } else {
         None
     };
+
+    // GLM-5 registers its tool-envelope XML as added tokens. Escape matching
+    // markup in incoming message prose before rendering so it remains text;
+    // structured call envelopes are still emitted by the template as native
+    // calls; literal argument values and schema descriptions remain text.
+    let escaped_tool_markup = state.tokenizer.escape_glm_tool_markup(
+        json_messages
+            .iter_mut()
+            .chain(jinja_tools.iter_mut().flatten()),
+    );
+    if escaped_tool_markup > 0 {
+        tracing::info!("{escaped_tool_markup} GLM tool markers in message text encoded as text");
+    }
+
+    // In a request with media only the template's own vision markers may
+    // become placeholders: markers written in message text encode as text
+    // (`tokenizer::vision_markup`).
+    if !image_pad_counts.is_empty() || !vision_placeholders.is_empty() {
+        let escaped = state.tokenizer.escape_vision_markup(
+            json_messages
+                .iter_mut()
+                .chain(jinja_tools.iter_mut().flatten()),
+        );
+        if escaped > 0 {
+            tracing::info!("{escaped} vision markers in message text encoded as text");
+        }
+    }
 
     // Progressive auto-compact (DISABLED BY DEFAULT 2026-04-25 —
     // see project_no_auto_compaction memory feedback).
@@ -78,6 +116,7 @@ pub(super) fn render_template(
                 state.behavior.disable_tool_steering,
                 reasoning_effort.map(crate::ir::ReasoningEffort::as_str),
                 preserve_thinking,
+                structured_output,
             )
             .map(|t| t.len())
             .unwrap_or(0);
@@ -97,6 +136,7 @@ pub(super) fn render_template(
         state.behavior.disable_tool_steering,
         reasoning_effort.map(crate::ir::ReasoningEffort::as_str),
         preserve_thinking,
+        structured_output,
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -107,8 +147,47 @@ pub(super) fn render_template(
         }
     };
 
-    // Expand image pads when needed.
-    let prompt_tokens = if image_pad_counts.iter().any(|&c| c > 1) {
+    // GLM-5's shipped template intentionally emits canonical compact marker
+    // triples. Its checkpoint processor leaves the rendered text unchanged;
+    // expand those triples here so every image/video encoder row has a
+    // matching input token. Other model families keep the legacy pad-only
+    // expansion below.
+    let prompt_tokens = if !vision_placeholders.is_empty() {
+        // Both placeholder families share the rendered-triple contract; the
+        // flag on the first entry picks the checkpoint's expansion family
+        // (homogeneous per request).
+        let expanded = if vision_placeholders.iter().any(|p| p.qwen3vl) {
+            state
+                .tokenizer
+                .expand_qwen3vl_vision_placeholders(prompt_tokens, vision_placeholders)
+        } else {
+            state
+                .tokenizer
+                .expand_glm5_vision_placeholders(prompt_tokens, vision_placeholders)
+        };
+        match expanded {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                return Err(openai_error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("vision placeholder error: {e}"),
+                ));
+            }
+        }
+    } else if !qwen_vision_placeholders.is_empty() {
+        match state
+            .tokenizer
+            .expand_qwen_vision_placeholders(prompt_tokens, qwen_vision_placeholders)
+        {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                return Err(openai_error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("Qwen vision placeholder error: {e}"),
+                ));
+            }
+        }
+    } else if image_pad_counts.iter().any(|&c| c > 1) {
         state
             .tokenizer
             .expand_vision_pads(prompt_tokens, image_pad_counts)
@@ -116,28 +195,14 @@ pub(super) fn render_template(
         prompt_tokens
     };
 
-    // Template-forced thinking detection.
-    let (enable_thinking, thinking_budget) = if let Some(think_start) = state.think_start_token_id {
-        let tail = &prompt_tokens[prompt_tokens.len().saturating_sub(8)..];
-        let last_start = tail.iter().rposition(|t| *t == think_start);
-        let has_unclosed_think = match (last_start, state.think_end_token_id) {
-            (Some(si), Some(end_tok)) => !tail[si + 1..].contains(&end_tok),
-            (Some(_), None) => true,
-            (None, _) => false,
-        };
-        if has_unclosed_think && !enable_thinking {
-            tracing::info!(
-                "Template-forced thinking detected (unclosed \\<think\\> in prompt tail) — \
-                 overriding enable_thinking=true with budget={}",
-                state.behavior.max_thinking_budget,
-            );
-            (true, Some(state.behavior.max_thinking_budget))
-        } else {
-            (enable_thinking, thinking_budget)
-        }
-    } else {
-        (enable_thinking, thinking_budget)
-    };
+    let (enable_thinking, thinking_budget) = reconcile_prompt_thinking(
+        &prompt_tokens,
+        state.think_start_token_id,
+        state.think_end_token_id,
+        enable_thinking,
+        thinking_budget,
+        state.behavior.max_thinking_budget,
+    );
 
     Ok(TemplateOut {
         prompt_tokens,
@@ -145,6 +210,13 @@ pub(super) fn render_template(
         thinking_budget,
     })
 }
+#[path = "template/reconcile.rs"]
+mod reconcile;
+use reconcile::reconcile_prompt_thinking;
+
+#[cfg(test)]
+#[path = "template_thinking_tests.rs"]
+mod thinking_tests;
 
 /// Build the Jinja-facing JSON message array from the processed
 /// [`MsgEntry`] vec. Pure (no tokenizer/state) so it can be
@@ -285,7 +357,7 @@ mod json_message_tests {
             text_msg(Role::User, "thanks"),
         ];
 
-        let out = super::super::msg_entry::build_msg_entries(
+        let out = super::super::msg_entry::build_msg_entries_admitted(
             None,
             None,
             &crate::api::chat::remote_image::RemoteImagePolicy::default(),
@@ -300,6 +372,7 @@ mod json_message_tests {
             true,
             &crate::api::chat::levers::ChatLevers::OFF,
             false,
+            crate::api::chat::vision_admit::AdmitCtx::default(),
         )
         .expect("fixture builds");
         assert_eq!(out.cwd_hint.as_deref(), Some("/tmp/proj"));
