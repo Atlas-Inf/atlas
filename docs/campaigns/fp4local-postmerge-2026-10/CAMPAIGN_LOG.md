@@ -1514,3 +1514,18 @@ Job 62 (train b53c5aaf2 on main 170c3ed3a):
 - 0 errors.
 Not yet attributable: main has moved since b0df50185 (#279 / #282 / #283 …, and #279's own gate reported 87.54 / 86.85 on main).
 Job 63 runs main at 170c3ed3a (the train's base) with agentic 50 + BFCL. No train PR merges before that comparison.
+
+## 2026-11-01 03:40 UTC — train 2026-10-31 is output-neutral on GB10; agentic 47/50 is main's (bisect queued)
+
+Job 63 (main 170c3ed3a, the train's base) vs job 62 (train):
+- BFCL ST-995 87.54 / 85.94 in both arms, **all 15 subsets identical** (run-1793503255896245487 vs run-1793488879414911145);
+- controls identical; agentic 47/50 in both (10.67 vs 10.80 s/turn);
+- the same failed iterations 0 / 18 / 27 ("no Cargo.toml was written"); 0 errors.
+The earlier "dips" vs b0df50185 were moves between main bases. The 7 PRs (#284 #285 #286 #287 #290 #293 #294) had
+already been merged upstream by the parallel session; the GB10 confirmation is posted on each. Main already carries the
+ffmpeg test fix.
+
+**Open single-Spark regression on main:** FP4-Local default agentic was 50/50 at b0df50185 and is 47/50 at 170c3ed3a, with
+the same 3 iterations failing deterministically. BFCL normalized also moved 87.13 → 85.94 between those bases, below the
+86.92 floor. Job B1 bisects b0df50185..170c3ed3a on sparky with a targeted repro of iterations 0/18/27, then reports the
+culprit and transcripts. Next after it: B2, Qwen4 synthetic-smoke debug (local draft).
