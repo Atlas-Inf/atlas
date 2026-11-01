@@ -22,7 +22,6 @@ use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 use super::free_state_support::*;
 use super::lifecycle::*;
 use super::{BlockDiffusionDraftHead, DflashKernels, DflashProposerState, DflashScratch};
-use crate::speculative::DraftProposer;
 use crate::weight_map::DenseWeight;
 
 fn owner(slot: usize, generation: u64) -> SequenceGeneration {

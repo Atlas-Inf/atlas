@@ -3,7 +3,9 @@
 //! The GLM DFlash2 arm of the prefill ctx capture — split out of
 //! `impl_b3_dflash.rs` purely for the 500-LoC cap (no behaviour change).
 
-use super::*;
+use anyhow::Result;
+
+use super::types::TransformerModel;
 
 impl TransformerModel {
     /// The `glm5_next` branch of `try_dflash_prefill_capture_layer`: the

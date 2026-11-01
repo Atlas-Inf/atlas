@@ -10,7 +10,7 @@ impl TransformerModel {
     /// (GLM-5) keep the residual in the FP32 highway and `hidden_states` holds
     /// only the next sublayer's mixed input, so they contract the highway by
     /// stream mean — the reference DFlash target hidden — instead.
-    fn dflash_capture_rows(
+    pub(super) fn dflash_capture_rows(
         &self,
         row0: usize,
         rows: usize,
@@ -215,7 +215,6 @@ impl TransformerModel {
     /// After prefill completes, advance the seq's DFlash `ctx_len` to
     /// `chunk_start + proc_count` so the drafter sees all captured prompt
     /// positions on the first propose() call.
-
     /// DFlash 5-layer hidden capture. Called inside each per-layer loop after
     /// `layer.decode(...)` returns. No-op when DFlash is disabled (the buffer
     /// is `None`) or when `layer_idx` is not in `dflash_capture_layers`.
