@@ -1721,3 +1721,23 @@ Gate 68b runs next after 68a, the Qwen4 sanitizer boot.
   - 72d: Qwen4 PLE synth boot+gen;
   - 72e: full-depth 64-layer Qwen4 synth (52 GB BF16): memory, KV, TTFT and decode tok/s, labelled synthetic;
   - then 73/74: BFCL A2 / A1 knob attribution.
+
+## 2026-11-01 21:10 UTC — main output-neutral since 8c2b67218; 27B BFCL question re-framed
+
+**Main 88010baee vs main 8c2b67218, `control.py` on all three models:** IDENTICAL.
+- FP4-Local, Flash-Next NVFP4, and 27B at K=2.
+- This covers #303 on the text path, #304, #142, #306, #159, #307 and #308.
+- Source: 72c base arm vs 68f A0 arm.
+
+**27B NVFP4 "BFCL collapse" (vet 57d, 83.02 / 71.32, hallucination 39.96) is most likely a recipe mismatch, not a regression.**
+- The vet ran the INTERACTIVE recipe (`disable_thinking: true`).
+- The 27B BFCL gate recipe is `qwen3.8-27b-nvfp4-bfcl`: thinking on, `reasoning_effort` medium. Its 2026-09-19 note records that with thinking off the nvidia 27B emits tool calls where it should abstain: 85.13 / 76.60, hallucination 55.11. With thinking on it scored 87.94 / 88.24 (run-1789419056919283587).
+- Today's thinking-off number (71.32) is about 5 points below September's thinking-off number. That isn't one variable, so it's unexplained for now.
+- Job 75 runs the gate recipe verbatim on the newest main image to settle it.
+
+**Queue tonight:**
+1. 73: BFCL A2.
+2. 73a / 73b: Qwen4 PLE synth and 64-layer synth.
+   - Fixes since the last entry: PLE `layer_multipliers` and the n-gram metadata are I64 and the norms F32, which explains the 24 B-over-6 B DtoH. synth-64 now has tokenizer files.
+3. 74: BFCL A1.
+4. 75: 27B BFCL on the gate recipe.
