@@ -76,27 +76,6 @@ impl TransformerModel {
                 n_capture * h * bf16,
                 stream,
             );
-        }
-        // ATLAS_DFLASH_CTX_CARRY + first-chunk bookkeeping. Adopt BEFORE the
-        // first capture write (rather than in
-        // update_dflash_ctx_len_after_prefill, which the chunked path calls
-        // only after the LAST chunk) so that:
-        //   1. The carried accumulator install happens before any writes —
-        //      captures already in the fresh buffer would be orphaned when
-        //      adopt frees it.
-        //   2. Captures append AFTER the carried window — no row is ever
-        //      claimed by two positions.
-        //   3. `ctx_prefill_origin`/`ctx_prefill_base` snapshot where the
-        //      window's own coverage begins, so every chunk's capture rows
-        //      derive as base + (chunk_start - origin) even though ctx_len
-        //      only advances at the last chunk's update.
-        if dstate.ctx_prefill_origin.is_none() {
-            if let Some(ref proposer) = self.proposer {
-                proposer.adopt_dflash_ctx(self.gpu.as_ref(), dstate, &seq.tokens, chunk_start);
-            }
-            dstate.ctx_prefill_origin = Some(chunk_start);
-            dstate.ctx_prefill_base = dstate.ctx_len;
-        }
     }
     pub(super) fn update_dflash_ctx_len_after_prefill(
         &self,
