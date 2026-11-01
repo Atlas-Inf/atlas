@@ -55,9 +55,9 @@ fn two_rows() -> Vec<VariantRow> {
     ]
 }
 
-/// The committed tree is what the TUI reads, so pin it: the agentic gate is
-/// defined on the 35B MoE (the default, listed first) AND the dense
-/// Qwen3.8-27B, whose own Σ-wall ceiling is the provisional 2500 s.
+/// The committed tree is what the TUI reads, so pin it: since the FP8 gate
+/// subjects were retired (NVFP4-only gates), the agentic gate's default is
+/// the dense Qwen3.8-27B (listed first), beside further declared variants.
 #[test]
 fn the_agentic_gate_declares_both_variants_in_this_tree() {
     let rows = variants_for("agentic-webserver");
@@ -67,12 +67,12 @@ fn the_agentic_gate_declares_both_variants_in_this_tree() {
         rows.iter().map(|r| &r.checkpoint).collect::<Vec<_>>()
     );
     assert!(rows[0].is_default, "the declared subject leads");
-    assert_eq!(rows[0].checkpoint, "Qwen/Qwen3.6-35B-A3B-FP8");
-    let dense = rows
-        .iter()
-        .find(|r| r.checkpoint == "nvidia/Qwen3.8-27B-NVFP4")
-        .expect("the dense variant is declared");
-    assert!(!dense.is_default, "the required subject is unchanged");
+    assert_eq!(rows[0].checkpoint, "nvidia/Qwen3.8-27B-NVFP4");
+    assert!(
+        rows.iter().all(|r| r.checkpoint != "Qwen/Qwen3.6-35B-A3B-FP8"),
+        "the retired FP8 subject is gone"
+    );
+    let dense = &rows[0];
     assert_eq!(
         dense
             .metrics
