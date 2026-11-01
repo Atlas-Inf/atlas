@@ -431,7 +431,7 @@ fn a_moov_at_end_mp4_probes_and_decodes() {
         return;
     }
     let clip = make_mp4_at(2, 8, "64x64", "libx264", false).expect("generate MP4");
-    let policy = super::FfmpegPolicy::default();
+    let policy = enabled();
     let timing = super::probe::probe_duration(&clip, &policy).expect("moov-at-end probe");
     assert!(
         (timing.duration_secs - 2.0).abs() < 0.2,
@@ -451,7 +451,7 @@ fn timing(frame_count: Option<u64>, duration_secs: f32, native_fps: f32) -> Clip
         native_fps: f64::from(native_fps),
         frame_count,
     }
-}
+    let policy = enabled();
 
 #[test]
 fn declared_frames_reads_nb_frames_then_duration_times_rate() {
@@ -471,7 +471,7 @@ fn a_faststart_mp4_probes_and_decodes() {
         return;
     }
     let clip = make_mp4_at(2, 8, "64x64", "libx264", true).expect("generate MP4");
-    let policy = super::FfmpegPolicy::default();
+    let policy = enabled();
     let timing = super::probe::probe_duration(&clip, &policy).expect("faststart probe");
     assert!(
         (timing.duration_secs - 2.0).abs() < 0.2,
