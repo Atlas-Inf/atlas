@@ -82,7 +82,7 @@ impl TransformerModel {
             acc_base.offset(plan.dst_slot() * n_capture * h * bf16 + slot_idx * h * bf16),
             n_capture * h * bf16,
             stream,
-        );
+        )
     }
     pub(super) fn update_dflash_ctx_len_after_prefill(
         &self,
