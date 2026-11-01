@@ -458,3 +458,7 @@ mod tests {
         assert!(vision_splice_plan(&tokens, 3, 5, pad, 0, 0, 0, 2, 2).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "embed_chunk_sim_tests.rs"]
+mod sim_tests;

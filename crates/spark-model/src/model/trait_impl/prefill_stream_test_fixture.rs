@@ -464,7 +464,8 @@ impl Fixture {
     pub fn events(&self) -> Vec<Event> {
         self.record.events.lock().clone()
     }
-    #[allow(dead_code)] // idle receives of rank 0's word so far (worker side)
+    /// Idle receives of rank 0's word so far (worker side).
+    #[allow(dead_code)]
     pub fn idle_receives(&self) -> u32 {
         self.record.idle_receives.load(Ordering::Relaxed)
     }
