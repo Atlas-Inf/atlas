@@ -153,13 +153,7 @@ impl TransformerModel {
             return Ok(()); // ctx conditioning disabled
         }
         if self.config.model_type == "glm5_next" {
-            return self.dflash_glm_prefill_capture(
-                seq,
-                slot_idx,
-                chunk_start,
-                proc_count,
-                stream,
-            );
+            return self.dflash_glm_prefill_capture(seq, slot_idx, chunk_start, proc_count, stream);
         }
         // (ctx_hidden_acc != 0 → no-op); a rejected carry just pooled its
         // buffer, which this pops right back — either way zero device

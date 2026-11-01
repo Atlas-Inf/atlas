@@ -20,11 +20,10 @@ impl TransformerModel {
         proc_count: usize,
         stream: u64,
     ) -> Result<()> {
-        let Some(dstate) = seq
-            .proposer_state
-            .as_mut()
-            .and_then(|ps| ps.as_any_mut().downcast_mut::<crate::layers::DflashProposerState>())
-        else {
+        let Some(dstate) = seq.proposer_state.as_mut().and_then(|ps| {
+            ps.as_any_mut()
+                .downcast_mut::<crate::layers::DflashProposerState>()
+        }) else {
             return Ok(());
         };
         if dstate.ctx_hidden_acc.0 == 0
