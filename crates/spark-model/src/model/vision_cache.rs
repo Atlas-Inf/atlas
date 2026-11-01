@@ -15,9 +15,11 @@
 //! (`EP_CMD_VISION_STATE`), so a worker rebuilds the same key and its radix
 //! walk agrees with the head's before the EP min-sync.
 //!
-//! Only GLM-5 prompts are keyed. Its MRoPE walker rebuilds positions from the
-//! complete prompt, so a prefill that starts after a cached image positions
-//! the rest exactly as a full one would; the generic walker is chunk-local.
+//! Every tower's prompts are keyed. Both MRoPE walkers rebuild positions from
+//! the complete prompt, so a prefill that starts after a cached image
+//! positions the rest exactly as a full one would. A cache path of its own
+//! (qwen4_exp's in-pass checkpoints) must register under the key too
+//! (`pc_key`), or skip the prompt.
 //!
 //! The generated tokens of a vision sequence are not cached: decode writes
 //! them at linear positions while a prefill of the same text writes the
@@ -90,10 +92,7 @@ pub(crate) fn encode_window(
 impl TransformerModel {
     /// Whether vision prompts are keyed for the prefix cache (module docs).
     pub(super) fn vision_prefix_cache_ok(&self) -> bool {
-        self.prefix_cache.is_active()
-            && self.vision_encoder.is_some()
-            && self.config.vision.as_ref().is_some_and(|_| false)
-            && switch_on()
+        self.prefix_cache.is_active() && self.vision_encoder.is_some() && switch_on()
     }
 
     /// Stamp `seq`'s cache key from the sequence's own vision state. Chunk 0

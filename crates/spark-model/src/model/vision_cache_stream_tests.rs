@@ -133,6 +133,25 @@ fn every_tower_encodes_per_chunk_not_at_admission() {
 }
 
 #[test]
+fn every_tower_keys_its_vision_prompts_for_the_prefix_cache() {
+    // The key is content hashes over the placeholder runs, and both MRoPE
+    // walkers position a prefill that starts after a cached image from the
+    // whole prompt: nothing about it is GLM's. A Qwen image prompt was
+    // uncached (every turn of a 75K-token conversation re-prefilled ~22 s).
+    let (mut f, tokens) = staged();
+    let mut qwen = test_tower::config();
+    qwen.is_glm5_next = false;
+    f.model.config.vision = Some(qwen);
+    f.model.prefix_cache = Box::new(spark_runtime::radix_tree::RadixTree::new());
+    f.model.stamp_vision_cache_key(&tokens, &mut f.seq);
+    assert_eq!(f.seq.vision_cache_key.len(), tokens.len());
+    assert!(
+        f.model.pc_key(&f.seq, &tokens).is_some(),
+        "the prompt is cacheable"
+    );
+}
+
+#[test]
 fn a_chunk_over_the_output_window_fails_alone_before_any_launch() {
     // Every rank derives a chunk's rows from the same grids, so a chunk that
     // would overrun `buf_out` must fail request-locally on each of them
