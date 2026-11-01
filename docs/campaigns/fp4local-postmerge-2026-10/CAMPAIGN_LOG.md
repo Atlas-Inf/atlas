@@ -1627,3 +1627,23 @@ Gate 68b runs next after 68a, the Qwen4 sanitizer boot.
 - The A2/A1 BFCL arms (jobs 73/74) will attribute it to a knob. Agentic A0/A6 is next (69/70).
 - 68a (Qwen4 synth under compute-sanitizer): BOOT FAILED, with an unresolved kernel lookup plus 82 sanitizer errors. The draft fix is in progress (local).
 - 68b (train #305 gate) is running.
+
+## 2026-11-01 16:30 UTC — train #305 gated; #159 merged; #255 held; #303 finding
+
+**68b + 68e + 68f**, same base 8c2b67218 vs A0:
+- Controls IDENTICAL: FP4-Local, NVFP4, and 27B at K=2 verify.
+  - 68b's own controls and vision probe were vacuous (missing `control` helper, wrong image names). 68f re-ran both.
+- BFCL 87.54 / 85.94, all subsets identical (run-1793547282491478714).
+- Agentic 47/50 at 10.66 s/turn, same failing iterations as main. 0 errors.
+
+**Outcomes:**
+- **#159 merged** (b45811df7).
+- **Port of #255 held:** its GPU test `a_warm_turn_window_matches_its_cold_prefill_on_the_device` fails on main. Hypothesis: it needs the CTX_CARRY layer.
+- **Port of #256** is being rebuilt standalone on main.
+- **#303** (already merged upstream): on FP4-Local the vision prefix cache engages (432/436 restored), but two-image cold ≠ warm, and cold outputs change with the gate on (vs main and `ATLAS_VISION_PREFIX_CACHE=0`). Posted on #303.
+- **spark-model flake:** `hour_tests::probe_timeout_covers_a_blocked_stdout_read` hit ETXTBSY once on the train. A flake check is running.
+
+**Qwen4 draft 8ba2695df7:**
+- The dense GEMM kernels (`nvfp4_mmq`, `q4k`, `w4a16`, `w4a4`) now compile into the qwen4-27b target instead of being declared absent.
+- The Flash-Next control on the draft is IDENTICAL.
+- The synth boot now gets past the kernel lookups and faults with ILLEGAL_ADDRESS at full-attention layer 3. Sanitizer job 68g names the kernel.
