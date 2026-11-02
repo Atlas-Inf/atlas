@@ -34,6 +34,7 @@ thread_local! {
 }
 
 /// Whether a packed traversal is running on this thread.
+#[inline]
 pub fn active() -> bool {
     ACTIVE.with(Cell::get)
 }

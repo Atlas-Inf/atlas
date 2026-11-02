@@ -128,6 +128,8 @@ impl TransformerModel {
             && self.config.model_type == "glm5_next"
             // The shared MTP prompt capture reads chunk rows from 0.
             && self.mtp_prefill_hidden.is_null()
+            // A packed pass does not feed the native predictor its prompt.
+            && !self.native_glm_mtp
             // The FP32 logits scratch holds one row.
             && !self.use_fp32_logits
             // The row-local fused mHC mixer the pins rely on (`glm_packed_scope`).

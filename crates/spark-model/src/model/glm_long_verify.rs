@@ -118,15 +118,17 @@ impl TransformerModel {
     /// long-context MTP, a 2..=8 row block on the GLM DFlash lane.
     pub(super) fn can_batch_glm_long_verify_impl(&self, owners: usize, rows: usize) -> bool {
         use crate::speculative::glm_repair_policy as policy;
-        let lane = if policy::enabled() {
-            rows == K3_ROWS && policy::long_context_enabled()
-        } else {
-            policy::canonical_target_enabled()
+        let lane = || {
+            if policy::enabled() {
+                rows == K3_ROWS && policy::long_context_enabled()
+            } else {
+                policy::canonical_target_enabled()
+            }
         };
         self.glm_long_stage.is_some()
             && owner::width_supported(owners, rows)
-            && lane
             && self.config.model_type == "glm5_next"
+            && lane()
             && self.config.tp_world_size == 2
             && self.config.ep_world_size == 2
             && self.config.hc_mult == 4

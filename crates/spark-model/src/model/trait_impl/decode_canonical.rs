@@ -61,8 +61,9 @@ impl TransformerModel {
     /// native GLM or GLM on the DFlash prefill-verify lane, the canonical
     /// kernels on, BF16 logits and the MXFP8 split verify head serving.
     pub(super) fn decode_is_canonical_verify(&self) -> bool {
-        self.canonical_glm_target_enabled()
+        self.config.model_type == "glm5_next"
             && crate::layers::canonical_verify::enabled()
+            && self.canonical_glm_target_enabled()
             && (self.native_glm_mtp
                 || crate::speculative::glm_repair_policy::dflash_prefill_verify())
             && !self.use_fp32_logits
