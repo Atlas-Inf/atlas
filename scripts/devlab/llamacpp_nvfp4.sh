@@ -22,7 +22,9 @@ W=${RUNNER_TEMP:-/tmp}/llamacpp-study; mkdir -p "$W"
 S=/mnt/scratch/cache/llamacpp-study; mkdir -p "$S"
 
 # ---- 1. llama.cpp build ------------------------------------------------------------------------------------
-REF=${LLAMA_REF:-$(git ls-remote --tags --refs https://github.com/ggml-org/llama.cpp.git 'b*' | awk -F/ '{print $NF}' | sort -V | tail -1)}
+# Latest published release (the API's tag_name, e.g. b8xxx); a tag-pattern ls-remote picked up a stray non-release tag.
+REF=${LLAMA_REF:-$(curl -s -m 30 https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | python3 -c "import json,sys; print(json.load(sys.stdin)['tag_name'])")}
+[ -n "$REF" ] || { log "could not resolve the latest llama.cpp release"; exit 1; }
 log "llama.cpp ref $REF"
 rm -rf "$W/llama.cpp"
 git clone -q --depth 1 --branch "$REF" https://github.com/ggml-org/llama.cpp.git "$W/llama.cpp" || { log "CLONE FAILED"; exit 1; }
