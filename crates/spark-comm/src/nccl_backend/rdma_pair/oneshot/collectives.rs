@@ -23,15 +23,7 @@ impl OneShot {
         if !add || src != dst {
             return Ok(false);
         }
-        self.launch(
-            src,
-            dst,
-            bytes,
-            false,
-            Land::Sum,
-            self.cfg.timeout_ns,
-            stream,
-        )
+        self.launch(src, dst, bytes, add, Land::Sum, self.cfg.timeout_ns, stream)
     }
 
     /// A chain's all-gather of every rank's `base + rank * stride`

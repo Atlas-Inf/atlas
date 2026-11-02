@@ -1,57 +1,78 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Two-rank microbench + stress for the TP2 decode collectives through the
-//! serving `CommBackend` (`NcclBackend`), one process per Spark (start rank 1
-//! first). The transport comes from the environment, exactly as in serving:
+//! Microbench + stress for the TP decode collectives through the serving
+//! `CommBackend` (`NcclBackend`): two ranks (`--world 2`, the default, one
+//! process per Spark; start rank 1 first) take the RDMA pair, three or four
+//! the RDMA chain. The transport comes from the environment, exactly as in
+//! serving:
 //!
 //! * NCCL:     `ATLAS_RDMA_ALLREDUCE` unset
-//! * RDMA:     `ATLAS_RDMA_ALLREDUCE=1`
+//! * RDMA:     `ATLAS_RDMA_ALLREDUCE=1` (`ATLAS_RDMA_RAILS` for a pair,
+//!   `ATLAS_RDMA_LEFT_RAILS` / `ATLAS_RDMA_RIGHT_RAILS` per rank for a chain)
 //! * one-shot: `ATLAS_RDMA_ALLREDUCE=1 ATLAS_RDMA_ONESHOT=1`
 //!
 //! plus `ATLAS_RDMA_PAIR_CHAIN`, `ATLAS_RDMA_ONESHOT_STRIPE_MIN`, ... Graph
 //! rows need the one-shot channel (`all_reduce_capturable`).
 //!
 //! Per payload of `rows x 4096` BF16: synced latency p10/p50/p90 (one
-//! `all_reduce_async` + stream sync; rank 1 first sleeps `--skew-us`, so rank
-//! 0 reports the early rank and rank 1 the late one), back-to-back mean, and
-//! the per-call mean of a replayed graph of `--calls-per-graph` capturable
-//! all-reduces. Correctness always runs first: small-integer payloads whose
-//! BF16 sums are exact, checked after eager calls and after graph replays
-//! interleaved with eager calls; `--stress N` repeats that N times with a
-//! fresh payload per call. A routing pass then drives every entry point the
-//! model uses (`all_reduce`, `all_reduce_async`, `exchange_async` add and
-//! copy, `peer_exchange_async`, and the capturable pair in one graph) back to
-//! back with one sync, at a one-shot size next to one above the capturable
-//! limit, so the channels interleave on the stream. Exit 1 on any wrong
-//! value, 2 on an error (without NCCL teardown: the peer may be gone), naming
-//! the one-shot fault if the channel stopped.
+//! `all_reduce_async` + stream sync; the last rank first sleeps `--skew-us`,
+//! so the others report early ranks and it a late one), back-to-back mean,
+//! and the per-call mean of a replayed graph of `--calls-per-graph`
+//! capturable all-reduces. Correctness always runs first: small-integer
+//! payloads whose BF16 sums are exact, checked after eager calls and after
+//! graph replays interleaved with eager calls (`--stress N` repeats that N
+//! times with a fresh payload per call), then pseudo-random payloads whose
+//! result's hash every rank must share (the ranks of a TP group must agree
+//! bit for bit), then a broadcast from every root. A pair then checks its
+//! peer exchange and a routing pass that drives every entry point the model
+//! uses (`all_reduce`, `all_reduce_async`, `exchange_async` add and copy,
+//! `peer_exchange_async`, and the capturable pair in one graph) back to back
+//! with one sync, at a one-shot size next to one above the capturable limit,
+//! so the channels interleave on the stream. Exit 1 on any wrong value, 2 on
+//! an error (without NCCL teardown: a peer may be gone), naming the one-shot
+//! fault if the channel stopped.
+//!
+//! `--gather-rows R` (a chain) checks sequence-parallel prefill's gather of R
+//! rows per rank (`CommBackend::gather_async`, rank 0's part on top) and times
+//! it, the chain's reduce-scatter of R rows per rank
+//! (`CommBackend::reduce_scatter_async`, four ranks) and the all-reduce of
+//! all `R x world` rows: a prefill seam's collectives.
 //!
 //! `--cmd-steps N` adds the start of N verify steps as the engine issues it:
-//! rank 0 pauses `--cmd-pause-us` (its drafter pass, rank 1 waiting), sends
-//! slot, command, width and tokens, and both ranks run the step's first
-//! all-reduce. Rank 0 reports first word to landed collective: what the head
-//! waits when the worker learns of the step late. The words take the host
-//! command channel under `ATLAS_GLM_CMD_RDMA=1`, else a broadcast each.
+//! rank 0 pauses `--cmd-pause-us` (its drafter pass, the workers waiting),
+//! sends slot, command, width and tokens, and every rank runs the step's
+//! first all-reduce. Rank 0 reports first word to landed collective: what
+//! the head waits when a worker learns of the step late. The words take the
+//! host command channel under `ATLAS_GLM_CMD_RDMA=1`, else a broadcast each.
 //!
-//! Run (per rank):
-//!   comm_pair_bench --rank R --master 10.100.192.2 [--port 29610]
-//!     [--rows 1,2,4,5,7,8,16,32] [--iters 2000] [--calls-per-graph 87]
-//!     [--skew-us 0] [--stress 0] [--peer-exchange-bytes 128]
-//!     [--cmd-steps 0] [--cmd-pause-us 7000]
+//! `--rank 0,1` runs several ranks in one process, a thread and a stream
+//! each, sharing its CUDA context: ranks in different processes on one GPU
+//! are time-sliced (about 2 ms per switch), so their spinning kernels cannot
+//! meet (NCCL also needs `NCCL_MULTI_RANK_GPU_ENABLE=1` for that).
+//!
+//! Run (per process):
+//!   comm_pair_bench --rank R[,R...] [--world 2] --master 192.0.2.2
+//!     [--port 29610] [--rows 1,2,4,5,7,8,16,32] [--iters 2000]
+//!     [--calls-per-graph 87] [--skew-us 0] [--stress 0]
+//!     [--peer-exchange-bytes 128] [--gather-rows 0] [--cmd-steps 0] [--cmd-pause-us 7000]
 //! Build: ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=glm-5.3-flash
 //!   ATLAS_TARGET_QUANT=nvfp4 cargo build --release -p spark-model
 //!   --features cuda,gpu-examples,nccl --example comm_pair_bench
 
+#[path = "comm_pair_bench/bench.rs"]
+mod bench;
+
 use anyhow::{Context, Result, bail, ensure};
+use bench::Bench;
 use spark_comm::nccl_backend::{ALL_REDUCE_DTYPE_BYTES, required_recv_bytes};
 use spark_comm::{CommBackend, NcclBackend};
 use spark_runtime::cuda_backend::AtlasCudaBackend;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle};
-use std::time::{Duration, Instant};
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 const H: usize = 4096;
 
 struct Args {
-    rank: usize,
+    ranks: Vec<usize>,
+    world: usize,
     master: String,
     port: u16,
     rows: Vec<usize>,
@@ -60,13 +81,19 @@ struct Args {
     skew_us: u64,
     stress: usize,
     peer_exchange_bytes: usize,
+    gather_rows: usize,
     cmd_steps: usize,
     cmd_pause_us: u64,
 }
 
+fn list(v: &str) -> Result<Vec<usize>> {
+    Ok(v.split(',').map(str::parse).collect::<Result<_, _>>()?)
+}
+
 fn parse() -> Result<Args> {
     let mut a = Args {
-        rank: usize::MAX,
+        ranks: Vec::new(),
+        world: 2,
         master: String::new(),
         port: 29610,
         rows: vec![1, 2, 4, 5, 7, 8, 16, 32],
@@ -75,6 +102,7 @@ fn parse() -> Result<Args> {
         skew_us: 0,
         stress: 0,
         peer_exchange_bytes: 128,
+        gather_rows: 0,
         cmd_steps: 0,
         cmd_pause_us: 7000,
     };
@@ -82,354 +110,124 @@ fn parse() -> Result<Args> {
     while let Some(flag) = it.next() {
         let v = it.next().with_context(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
-            "--rank" => a.rank = v.parse()?,
+            "--rank" => a.ranks = list(&v)?,
+            "--world" => a.world = v.parse()?,
             "--master" => a.master = v,
             "--port" => a.port = v.parse()?,
-            "--rows" => a.rows = v.split(',').map(str::parse).collect::<Result<_, _>>()?,
+            "--rows" => a.rows = list(&v)?,
             "--iters" => a.iters = v.parse()?,
             "--calls-per-graph" => a.calls_per_graph = v.parse()?,
             "--skew-us" => a.skew_us = v.parse()?,
             "--stress" => a.stress = v.parse()?,
             "--peer-exchange-bytes" => a.peer_exchange_bytes = v.parse()?,
+            "--gather-rows" => a.gather_rows = v.parse()?,
             "--cmd-steps" => a.cmd_steps = v.parse()?,
             "--cmd-pause-us" => a.cmd_pause_us = v.parse()?,
             _ => bail!("unknown flag {flag}"),
         }
     }
     ensure!(
-        a.rank < 2 && !a.master.is_empty(),
-        "need --rank 0|1 and --master"
+        (2..=4).contains(&a.world)
+            && !a.ranks.is_empty()
+            && a.ranks.iter().all(|&r| r < a.world)
+            && !a.master.is_empty(),
+        "need --rank R[,R...] below --world (2..=4) and --master"
     );
     ensure!(a.peer_exchange_bytes.is_multiple_of(ALL_REDUCE_DTYPE_BYTES));
     Ok(a)
 }
 
-/// Small integers: every rank's value and every two-rank sum is exact in BF16.
-fn value(rank: usize, seq: u64, i: usize) -> f32 {
-    ((rank * 7 + seq as usize * 13 + i * 3) % 61) as f32 - 30.0
-}
-
-fn payload(rank: usize, seq: u64, n: usize, sum: bool) -> Vec<u8> {
-    (0..n)
-        .flat_map(|i| {
-            let v = if sum {
-                value(0, seq, i) + value(1, seq, i)
-            } else {
-                value(rank, seq, i)
-            };
-            ((v.to_bits() >> 16) as u16).to_le_bytes()
-        })
-        .collect()
-}
-
-struct Bench<'a> {
-    g: &'a dyn GpuBackend,
-    comm: &'a NcclBackend,
-    stream: u64,
-    rank: usize,
-    seq: u64,
-}
-
-impl Bench<'_> {
-    fn fetch(&self, p: DevicePtr, bytes: usize) -> Result<Vec<u8>> {
-        let mut v = vec![0u8; bytes];
-        self.g.copy_d2h(p, &mut v)?;
-        Ok(v)
-    }
-
-    /// Load the next payload into each buffer; returns their sequence numbers.
-    fn prepare(&mut self, bufs: &[DevicePtr], bytes: usize) -> Result<Vec<u64>> {
-        bufs.iter()
-            .map(|&b| {
-                self.seq += 1;
-                self.g
-                    .copy_h2d(&payload(self.rank, self.seq, bytes / 2, false), b)?;
-                Ok(self.seq)
-            })
-            .collect()
-    }
-
-    /// Wrong bytes across `bufs` after one all-reduce each.
-    fn wrong(&self, bufs: &[DevicePtr], seqs: &[u64], bytes: usize) -> Result<usize> {
-        self.g.synchronize(self.stream)?;
-        let mut bad = 0;
-        for (&b, &s) in bufs.iter().zip(seqs) {
-            let want = payload(self.rank, s, bytes / 2, true);
-            bad += self
-                .fetch(b, bytes)?
-                .iter()
-                .zip(&want)
-                .filter(|(x, y)| x != y)
-                .count();
-        }
-        Ok(bad)
-    }
-
-    /// Capture one capturable all-reduce per buffer; `None` when unavailable.
-    fn capture(&self, bufs: &[DevicePtr], bytes: usize) -> Result<Option<GraphHandle>> {
-        if self.comm.capturable_all_reduce_max_bytes() < bytes {
-            return Ok(None);
-        }
-        self.g.begin_capture(self.stream)?;
-        for b in bufs {
-            if !self.comm.all_reduce_capturable(b.0, bytes, self.stream)? {
-                self.g.abort_capture_if_active(self.stream);
-                return Ok(None);
-            }
-        }
-        Ok(Some(self.g.end_capture(self.stream)?))
-    }
-
-    /// Eager all-reduces, then graph replays interleaved with eager calls.
-    fn check(&mut self, bytes: usize, rounds: usize) -> Result<usize> {
-        let one = [self.g.alloc(bytes)?];
-        let bufs: Vec<DevicePtr> = (0..8).map(|_| self.g.alloc(bytes)).collect::<Result<_>>()?;
-        let mut bad = 0;
-        let graph = self.capture(&bufs, bytes)?;
-        for _ in 0..rounds {
-            let s = self.prepare(&one, bytes)?;
-            self.comm.all_reduce_async(one[0].0, bytes, self.stream)?;
-            bad += self.wrong(&one, &s, bytes)?;
-            if let Some(h) = graph {
-                let s = self.prepare(&bufs, bytes)?;
-                self.g.launch_graph(h, self.stream)?;
-                bad += self.wrong(&bufs, &s, bytes)?;
-            }
-        }
-        if let Some(h) = graph {
-            self.g.destroy_graph(h)?;
-        }
-        Ok(bad)
-    }
-
-    /// Wrong bytes in `dst` against the peer's payload `seq`.
-    fn wrong_copy(&self, dst: DevicePtr, seq: u64, bytes: usize) -> Result<usize> {
-        let want = payload(1 - self.rank, seq, bytes / 2, false);
-        let got = self.fetch(dst, bytes)?;
-        Ok(got.iter().zip(&want).filter(|(x, y)| x != y).count())
-    }
-
-    /// Every entry point, back to back with one sync per round, per size:
-    /// buffers 0-2 are all-reduced, 3 is sent and lands in 4 and 5.
-    fn routing(&mut self, sizes: [usize; 2], rounds: usize) -> Result<usize> {
-        let (comm, st, mut bad) = (self.comm, self.stream, 0);
-        let mut sets = Vec::new();
-        for bytes in sizes {
-            let b: Vec<DevicePtr> = (0..6).map(|_| self.g.alloc(bytes)).collect::<Result<_>>()?;
-            sets.push((bytes, b));
-        }
-        let graph = if comm.capturable_all_reduce_max_bytes() >= sizes[0] {
-            let (bytes, b) = &sets[0];
-            self.g.begin_capture(st)?;
-            ensure!(comm.all_reduce_capturable(b[0].0, *bytes, st)?);
-            ensure!(comm.peer_exchange_capturable(b[3].0, b[5].0, *bytes, st)?);
-            Some(self.g.end_capture(st)?)
-        } else {
-            None
-        };
-        for _ in 0..rounds {
-            let mut seqs = Vec::new();
-            for (bytes, b) in &sets {
-                seqs.push(self.prepare(&b[..4], *bytes)?);
-            }
-            for (bytes, b) in &sets {
-                let bytes = *bytes;
-                comm.all_reduce(b[0].0, bytes)?;
-                comm.all_reduce_async(b[1].0, bytes, st)?;
-                if !comm.exchange_async(b[2].0, b[2].0, bytes, true, st)? {
-                    comm.all_reduce_async(b[2].0, bytes, st)?;
-                }
-                if !comm.exchange_async(b[3].0, b[4].0, bytes, false, st)? {
-                    comm.peer_exchange_async(b[3].0, b[4].0, bytes, st)?;
-                }
-                comm.peer_exchange_async(b[3].0, b[5].0, bytes, st)?;
-            }
-            for ((bytes, b), s) in sets.iter().zip(&seqs) {
-                bad += self.wrong(&b[..3], &s[..3], *bytes)?;
-                bad += self.wrong_copy(b[4], s[3], *bytes)?;
-                bad += self.wrong_copy(b[5], s[3], *bytes)?;
-            }
-            if let Some(h) = graph {
-                let (bytes, b) = &sets[0];
-                let s = self.prepare(&[b[0], b[3]], *bytes)?;
-                self.g.launch_graph(h, st)?;
-                bad += self.wrong(&b[..1], &s[..1], *bytes)?;
-                bad += self.wrong_copy(b[5], s[1], *bytes)?;
-            }
-        }
-        Ok(bad)
-    }
-
-    fn peer_exchange_check(&mut self, bytes: usize) -> Result<usize> {
-        let (send, recv) = (self.g.alloc(bytes)?, self.g.alloc(bytes)?);
-        let mut bad = 0;
-        for _ in 0..16 {
-            let s = self.prepare(&[send], bytes)?[0];
-            self.comm
-                .peer_exchange_async(send.0, recv.0, bytes, self.stream)?;
-            self.g.synchronize(self.stream)?;
-            bad += self.wrong_copy(recv, s, bytes)?;
-        }
-        Ok(bad)
-    }
-
-    fn barrier(&self) -> Result<()> {
-        self.comm.barrier()?;
-        self.g.synchronize(self.stream)
-    }
-
-    /// Synced per-call latency percentiles (us) of `op`.
-    fn latency(&self, iters: usize, skew_us: u64, op: &dyn Fn() -> Result<()>) -> Result<[f64; 3]> {
-        self.barrier()?;
-        let mut t = Vec::with_capacity(iters);
-        for _ in 0..iters {
-            if self.rank == 1 && skew_us > 0 {
-                std::thread::sleep(Duration::from_micros(skew_us));
-            }
-            let t0 = Instant::now();
-            op()?;
-            self.g.synchronize(self.stream)?;
-            t.push(t0.elapsed().as_secs_f64() * 1e6);
-        }
-        t.sort_by(f64::total_cmp);
-        Ok([t[iters / 10], t[iters / 2], t[iters * 9 / 10]])
-    }
-
-    /// One command message the way the engine moves it (`ep_broadcast_u32`,
-    /// `ep_broadcast_tokens`, the worker's idle first word): rank 0 sends
-    /// `words`, rank 1 receives as many. Returns the message on both.
-    fn command(&self, buf: DevicePtr, words: &[u32], idle: bool) -> Result<Vec<u32>> {
-        let (g, comm, n) = (self.g, self.comm, words.len());
-        if n <= comm.command_words_max() {
-            let mut got = words.to_vec();
-            if self.rank == 0 {
-                g.synchronize(self.stream)?;
-                comm.send_command_words(words)?;
-            } else {
-                comm.recv_command_words(&mut got)?;
-                g.synchronize(self.stream)?;
-            }
-            return Ok(got);
-        }
-        let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        if self.rank == 0 {
-            g.copy_h2d(&bytes, buf)?;
-            comm.broadcast(buf.0, 4 * n, 0)?;
-            return Ok(words.to_vec());
-        }
-        if idle {
-            comm.receive_idle_command_word(buf.0)?;
-        } else {
-            comm.broadcast(buf.0, 4 * n, 0)?;
-        }
-        g.synchronize(self.stream)?;
-        g.copy_d2h(buf, &mut bytes)?;
-        let word = |b: &[u8]| u32::from_le_bytes(b.try_into().unwrap());
-        Ok(bytes.chunks_exact(4).map(word).collect())
-    }
-
-    /// `steps` verify-step starts (see the module doc): us from rank 0's
-    /// first word to its first collective landing (p10/p50/p90), and the
-    /// wrong words rank 1 read.
-    fn command_steps(
-        &mut self,
-        steps: usize,
-        pause_us: u64,
-        bytes: usize,
-    ) -> Result<([f64; 3], usize)> {
-        let (cmd, ar) = (self.g.alloc(64)?, self.g.alloc(bytes)?);
-        let (mut t, mut bad) = (Vec::with_capacity(steps), 0);
-        self.barrier()?;
-        for step in 0..steps as u32 {
-            let k = 2 + step % 7;
-            let tokens: Vec<u32> = (0..k).map(|i| step * 31 + i).collect();
-            if self.rank == 0 {
-                let until = Instant::now() + Duration::from_micros(pause_us);
-                while Instant::now() < until {
-                    std::hint::spin_loop();
-                }
-            }
-            let t0 = Instant::now();
-            let mut got = Vec::new();
-            for (i, word) in [step % 4, 0xffff_fff5, k].into_iter().enumerate() {
-                got.extend(self.command(cmd, &[word], i == 0)?);
-            }
-            got.extend(self.command(cmd, &tokens, false)?);
-            self.comm.all_reduce_async(ar.0, bytes, self.stream)?;
-            self.g.synchronize(self.stream)?;
-            t.push(t0.elapsed().as_secs_f64() * 1e6);
-            bad += usize::from(got[..3] != [step % 4, 0xffff_fff5, k] || got[3..] != tokens[..]);
-        }
-        t.sort_by(f64::total_cmp);
-        Ok(([t[steps / 10], t[steps / 2], t[steps * 9 / 10]], bad))
-    }
-
-    /// Mean us per call of `calls` back-to-back calls of `op`.
-    fn throughput(&self, iters: usize, calls: usize, op: &dyn Fn() -> Result<()>) -> Result<f64> {
-        self.barrier()?;
-        let t0 = Instant::now();
-        for _ in 0..iters {
-            op()?;
-        }
-        self.g.synchronize(self.stream)?;
-        Ok(t0.elapsed().as_secs_f64() * 1e6 / (iters * calls) as f64)
-    }
-}
-
 fn main() -> Result<()> {
-    let a = parse()?;
+    let a = &parse()?;
     let backend = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let g: &dyn GpuBackend = &backend;
-    let stream = g.default_stream();
+    let codes: Vec<i32> = std::thread::scope(|s| {
+        let ranks: Vec<_> = a
+            .ranks
+            .iter()
+            .map(|&rank| s.spawn(move || rank_main(a, g, rank)))
+            .collect();
+        ranks.into_iter().map(|r| r.join().unwrap_or(2)).collect()
+    });
+    // No NCCL teardown on any exit: after a fault a peer may be gone.
+    std::process::exit(codes.into_iter().max().unwrap_or(0))
+}
+
+/// One rank on its own thread: 0 when every check passed, 1 on a wrong
+/// value, 2 on an error.
+fn rank_main(a: &Args, g: &dyn GpuBackend, rank: usize) -> i32 {
+    let (comm, stream) = match connect(a, g, rank) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("rank {rank}: FAILED to connect: {e:#}");
+            return 2;
+        }
+    };
+    match run(a, g, &comm, stream, rank) {
+        Ok(bad) => i32::from(bad != 0),
+        Err(e) => {
+            let fault = comm.oneshot_poisoned();
+            eprintln!("rank {rank}: FAILED: {e:#}; one-shot fault: {fault:?}");
+            2
+        }
+    }
+}
+
+/// The rank's communicator over its stream (the default one when it is the
+/// process's only rank), with the kernels set.
+fn connect(a: &Args, g: &dyn GpuBackend, rank: usize) -> Result<(NcclBackend, u64)> {
+    g.bind_to_thread()?;
+    let stream = if a.ranks.len() == 1 {
+        g.default_stream()
+    } else {
+        g.create_stream()?
+    };
     let max_rows = a.rows.iter().copied().max().unwrap_or(1) * 5;
     let recv = required_recv_bytes(max_rows, H, ALL_REDUCE_DTYPE_BYTES)?;
-    let comm = NcclBackend::new(a.rank, 2, &a.master, a.port, stream, recv)?;
+    let comm = NcclBackend::new(rank, a.world, &a.master, a.port, stream, recv)?;
     comm.set_add_kernel(g.kernel("bf16_add", "bf16_add_inplace")?.0);
-    if let Ok(k) = g.kernel("rdma_oneshot", "rdma_oneshot_bf16") {
+    if let Ok(k) = g.kernel("rdma_oneshot", comm.oneshot_kernel()) {
         comm.set_oneshot_kernel(k.0);
     }
     let env = |k: &str| std::env::var(k).unwrap_or_else(|_| "-".into());
     println!(
-        "rank {}: ATLAS_RDMA_ALLREDUCE={} ATLAS_RDMA_ONESHOT={} CHAIN={} STRIPE_MIN={}; capturable up to {} B",
-        a.rank,
+        "rank {rank}/{}: ATLAS_RDMA_ALLREDUCE={} ATLAS_RDMA_ONESHOT={} CHAIN={} STRIPE_MIN={} \
+         SM_STAGE={} CMD_RDMA={}; kernel {}; capturable up to {} B",
+        a.world,
         env("ATLAS_RDMA_ALLREDUCE"),
         env("ATLAS_RDMA_ONESHOT"),
         env("ATLAS_RDMA_PAIR_CHAIN"),
         env("ATLAS_RDMA_ONESHOT_STRIPE_MIN"),
+        env("ATLAS_RDMA_ONESHOT_SM_STAGE"),
+        env("ATLAS_GLM_CMD_RDMA"),
+        comm.oneshot_kernel(),
         comm.capturable_all_reduce_max_bytes()
     );
-    // No NCCL teardown on either exit: after a fault the peer may be gone.
-    match run(&a, g, &comm, stream, max_rows * H * 2) {
-        Ok(bad) => std::process::exit(i32::from(bad != 0)),
-        Err(e) => {
-            let fault = comm.oneshot_poisoned();
-            eprintln!("rank {}: FAILED: {e:#}; one-shot fault: {fault:?}", a.rank);
-            std::process::exit(2)
-        }
-    }
+    Ok((comm, stream))
 }
 
-/// Wrong bytes over every check; `large` is the biggest payload the backend
-/// was sized for.
+/// Wrong values over every check.
 fn run(
     a: &Args,
     g: &dyn GpuBackend,
     comm: &NcclBackend,
     stream: u64,
-    large: usize,
+    rank: usize,
 ) -> Result<usize> {
     let mut b = Bench {
         g,
         comm,
         stream,
-        rank: a.rank,
+        rank,
+        world: a.world,
         seq: 0,
     };
     let mut bad = 0;
     for &rows in &a.rows {
         let bytes = rows * H * 2;
         let wrong = b.check(bytes, 8.max(a.stress))?;
-        bad += wrong;
+        let differ = b.identity(bytes, 8.max(a.stress / 4))?;
+        bad += wrong + differ;
         let buf = g.alloc(bytes)?.0;
         let eager = || comm.all_reduce_async(buf, bytes, stream);
         let [p10, p50, p90] = b.latency(a.iters, a.skew_us, &eager)?;
@@ -437,48 +235,164 @@ fn run(
         let graph = match b.capture(&vec![DevicePtr(buf); a.calls_per_graph], bytes)? {
             Some(h) => {
                 let replay = || g.launch_graph(h, stream);
-                let per_call = b.throughput(
-                    a.iters / a.calls_per_graph.max(1) + 1,
-                    a.calls_per_graph,
-                    &replay,
-                )?;
+                let iters = a.iters / a.calls_per_graph.max(1) + 1;
+                let per_call = b.throughput(iters, a.calls_per_graph, &replay)?;
                 g.destroy_graph(h)?;
                 format!("{per_call:6.2}")
             }
             None => "   n/a".into(),
         };
         println!(
-            "rank {} rows {rows:2} ({bytes:6} B): synced p10/p50/p90 {p10:6.1}/{p50:6.1}/{p90:6.1} us, \
-             back-to-back {mean:6.2} us, graph {graph} us/call, wrong {wrong}",
-            a.rank
+            "rank {rank} rows {rows:2} ({bytes:6} B): synced p10/p50/p90 {p10:6.1}/{p50:6.1}/{p90:6.1} us, \
+             back-to-back {mean:6.2} us, graph {graph} us/call, wrong {wrong}, hash mismatches {differ}"
         );
     }
-    let pe = a.peer_exchange_bytes;
-    let wrong = b.peer_exchange_check(pe)?;
-    bad += wrong;
-    let (send, recv) = (g.alloc(pe)?.0, g.alloc(pe)?.0);
-    let [p10, p50, p90] = b.latency(a.iters, a.skew_us, &|| {
-        comm.peer_exchange_async(send, recv, pe, stream)
-    })?;
-    println!(
-        "rank {} peer exchange {pe} B: synced p10/p50/p90 {p10:.1}/{p50:.1}/{p90:.1} us, wrong {wrong}",
-        a.rank
-    );
-    let small = a.rows[0] * H * 2;
-    let wrong = b.routing([small, large], 8 + a.stress / 16)?;
-    bad += wrong;
-    println!(
-        "rank {} routing ({small} B next to {large} B, every entry point): wrong {wrong}",
-        a.rank
-    );
+    for bytes in [4, 4096] {
+        let wrong = b.broadcast_check(bytes)?;
+        bad += wrong;
+        let buf = g.alloc(bytes)?.0;
+        let root = a.world - 1;
+        let [p10, p50, p90] =
+            b.latency(a.iters / 4, a.skew_us, &|| comm.broadcast(buf, bytes, root))?;
+        println!(
+            "rank {rank} broadcast {bytes} B from rank {root}: synced p10/p50/p90 \
+             {p10:.1}/{p50:.1}/{p90:.1} us, wrong {wrong} (every root checked)"
+        );
+    }
+    if a.world == 2 {
+        let pe = a.peer_exchange_bytes;
+        let wrong = b.peer_exchange_check(pe)?;
+        bad += wrong;
+        let (send, recv) = (g.alloc(pe)?.0, g.alloc(pe)?.0);
+        let [p10, p50, p90] = b.latency(a.iters, a.skew_us, &|| {
+            comm.peer_exchange_async(send, recv, pe, stream)
+        })?;
+        println!(
+            "rank {rank} peer exchange {pe} B: synced p10/p50/p90 {p10:.1}/{p50:.1}/{p90:.1} us, wrong {wrong}"
+        );
+        let small = a.rows[0] * H * 2;
+        let large = a.rows.iter().copied().max().unwrap_or(1) * 5 * H * 2;
+        let wrong = b.routing([small, large], 8 + a.stress / 16)?;
+        bad += wrong;
+        println!(
+            "rank {rank} routing ({small} B next to {large} B, every entry point): wrong {wrong}"
+        );
+    }
+    if a.world > 2 && a.gather_rows > 0 {
+        let part = a.gather_rows * H * 2;
+        let wrong = b.gather_check(part, 4 + a.stress / 4)?;
+        bad += wrong;
+        let all = g.alloc(part * a.world)?;
+        let top = all.offset((a.world - 1) * part).0;
+        let gather = || {
+            ensure!(comm.gather_async(top, -(part as i64), part, stream)?);
+            Ok(())
+        };
+        let reduce = || comm.all_reduce_async(all.0, part * a.world, stream);
+        let scatter = || {
+            ensure!(comm.reduce_scatter_async(top, -(part as i64), part, stream)?);
+            Ok(())
+        };
+        let iters = (a.iters / 50).max(5);
+        let [_, g50, _] = b.latency(iters, a.skew_us, &gather)?;
+        let [_, r50, _] = b.latency(iters, a.skew_us, &reduce)?;
+        let scatter8 = || {
+            ensure!(comm.reduce_scatter_fp8_async(top, -(part as i64), part, stream)?);
+            Ok(())
+        };
+        // The fused op (ATLAS_RDMA_RS_FUSED_SEG), its rows staged by the copy
+        // producer; an all-reduce between ops (a fused op right after
+        // another is refused).
+        let copy = g.kernel("rdma_oneshot", "rdma_rs_fused_copy").ok();
+        let fused = || {
+            let f = comm
+                .rs_fused_begin(top, -(part as i64), part)?
+                .context("fused reduce-scatter refused")?;
+            spark_runtime::kernel_args::KernelLaunch::new(g, copy.context("no copy producer")?)
+                .grid([32, 1, 1])
+                .block([256, 1, 1])
+                .arg_words(f.plan.words())
+                .launch(stream)?;
+            ensure!(comm.reduce_scatter_fused_async(&f, stream)?);
+            comm.all_reduce_async(all.0, 8192, stream)
+        };
+        let small = || comm.all_reduce_async(all.0, 8192, stream);
+        let rs = if comm.supports_reduce_scatter_async(part) {
+            let [_, s50, _] = b.latency(iters, a.skew_us, &scatter)?;
+            let [_, f50, _] = b.latency(iters, a.skew_us, &scatter8)?;
+            let fused = if copy.is_some() && std::env::var("ATLAS_RDMA_RS_FUSED_SEG").is_ok() {
+                let [_, u50, _] = b.latency(iters, a.skew_us, &fused)?;
+                let [_, a50, _] = b.latency(iters, a.skew_us, &small)?;
+                format!(", fused {:.0} us", u50 - a50)
+            } else {
+                String::new()
+            };
+            format!("{s50:.0} us (FP8 {f50:.0} us{fused})")
+        } else {
+            "n/a".into()
+        };
+        println!(
+            "rank {rank} SP gather {} rows/rank ({part} B parts): p50 {g50:.0} us; \
+             reduce-scatter p50 {rs}; all-reduce of all {} rows: p50 {r50:.0} us; wrong {wrong}",
+            a.gather_rows,
+            a.gather_rows * a.world
+        );
+        g.free(all)?;
+        // The KDA o_proj all-to-all of this chunk (`gather_rows * world`
+        // rows of 2048 E4M3 columns a rank, plus 1x32 scale tiles): its time.
+        if a.world == 4 {
+            let (kl, rows) = (2048usize, a.gather_rows);
+            let (q_part, sf_part, band) = (rows * kl, rows * kl / 32, 16 * 512);
+            let (q, sf) = (g.alloc(4 * q_part)?, g.alloc(4 * sf_part)?);
+            let (aq, asf) = (g.alloc(4 * q_part)?, g.alloc(4 * sf_part)?);
+            let planes = [
+                spark_comm::AllToAllPlane {
+                    src: q.offset(3 * q_part).0,
+                    src_stride: -(q_part as i64),
+                    dst: aq.0,
+                    dst_stride: kl as i64,
+                    rows,
+                    row_bytes: kl,
+                    pitch: 4 * kl,
+                },
+                spark_comm::AllToAllPlane {
+                    src: sf.offset(3 * sf_part).0,
+                    src_stride: -(sf_part as i64),
+                    dst: asf.0,
+                    dst_stride: band as i64,
+                    rows: rows / 128,
+                    row_bytes: band,
+                    pitch: 4 * band,
+                },
+            ];
+            let a2a = || {
+                ensure!(
+                    comm.all_to_all_async(&planes, stream)?,
+                    "all-to-all refused"
+                );
+                Ok(())
+            };
+            if rows.is_multiple_of(128) && comm.all_to_all_async(&planes, stream)? {
+                let [_, x50, _] = b.latency(iters, a.skew_us, &a2a)?;
+                println!(
+                    "rank {rank} KDA o_proj all-to-all {rows} rows x {kl} E4M3 + scales a part \
+                     ({} B a pair): p50 {x50:.0} us",
+                    q_part + sf_part
+                );
+            }
+            for p in [q, sf, aq, asf] {
+                g.free(p)?;
+            }
+        }
+    }
     if a.cmd_steps > 0 {
         let (pause, words) = (a.cmd_pause_us, comm.command_words_max());
+        let small = a.rows[0] * H * 2;
         let ([p10, p50, p90], wrong) = b.command_steps(a.cmd_steps, pause, small)?;
         bad += wrong;
         println!(
-            "rank {} step words ({}) + first collective after a {pause} us pause: \
+            "rank {rank} step words ({}) + first collective after a {pause} us pause: \
              p10/p50/p90 {p10:.1}/{p50:.1}/{p90:.1} us, wrong {wrong}",
-            a.rank,
             if words > 0 {
                 "host channel"
             } else {
@@ -487,8 +401,7 @@ fn run(
         );
     }
     println!(
-        "rank {}: {} ({bad} wrong bytes)",
-        a.rank,
+        "rank {rank}: {} ({bad} wrong)",
         if bad == 0 { "PASS" } else { "FAIL" }
     );
     b.barrier()?;

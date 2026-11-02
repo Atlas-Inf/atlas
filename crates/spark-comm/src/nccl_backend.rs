@@ -85,7 +85,7 @@ mod rdma_pair_bootstrap;
 // topology sibling is present in production. Mount that same source at the
 // test-only parent so `super::super::topology` keeps resolving without verbs.
 #[cfg(all(test, not(atlas_rdma_verbs)))]
-#[allow(dead_code, clippy::needless_range_loop)]
+#[allow(dead_code)]
 #[path = "nccl_backend/rdma_pair/topology.rs"]
 mod topology;
 // Nor does the command ring: its wire is a trait.

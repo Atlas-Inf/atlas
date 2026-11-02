@@ -37,6 +37,10 @@ impl Wire for Copy {
                 len,
             )
         };
+        // A real WRITE has landed when `write` returns, before the next one
+        // (the `tail` after the data) is posted; without this fence a weakly
+        // ordered CPU may show the receiver `tail` before the words.
+        std::sync::atomic::fence(Ordering::Release);
         self.writes.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -327,4 +331,97 @@ fn a_stopped_proxy_fails_the_waiters_but_delivers_what_arrived() {
     assert!(sends[..RING_WORDS / MAX_WORDS].iter().all(Result::is_ok));
     let error = sends.last().unwrap().as_ref().unwrap_err().to_string();
     assert!(error.contains("the proxy stopped"), "{error}");
+}
+
+/// Copies along a chain of regions as the chain's links route them: an
+/// acknowledgement to the rank below, the stream to the rank above.
+struct Route {
+    rank: usize,
+    hosts: Vec<usize>,
+}
+
+impl Wire for Route {
+    fn write(&mut self, src: usize, dst: usize, len: usize) -> Result<()> {
+        let to = if upstream(dst) {
+            self.rank - 1
+        } else {
+            self.rank + 1
+        };
+        let mut copy = Copy {
+            local: self.hosts[self.rank],
+            peer: self.hosts[to],
+            writes: Arc::default(),
+        };
+        copy.write(src, dst, len)
+    }
+}
+
+/// On a chain of four, the head's stream reaches every rank word for word
+/// through the ranks between, each passing on what it reads, over many
+/// wraps; a slow last rank holds the head back only by flow control.
+#[test]
+fn a_chain_relays_the_heads_stream_to_every_rank() {
+    const RANKS: usize = 4;
+    const TOTAL: u64 = 20 * RING_WORDS as u64;
+    let regions: Vec<Region> = (0..RANKS).map(|_| Region::new()).collect();
+    let hosts: Vec<usize> = regions.iter().map(Region::host).collect();
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut rings = Vec::new();
+    let mut proxies = Vec::new();
+    for rank in 0..RANKS {
+        let (ring, mut proxy) = channel(hosts[rank]);
+        rings.push(Arc::new(ring));
+        let mut wire = Route {
+            rank,
+            hosts: hosts.clone(),
+        };
+        let stop = stop.clone();
+        proxies.push(std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                if !proxy.serve(&mut wire).unwrap() {
+                    std::thread::yield_now();
+                }
+            }
+            proxy.close();
+        }));
+    }
+    std::thread::scope(|s| {
+        let head = &rings[0];
+        s.spawn(move || {
+            let (mut at, mut k) = (0u64, 0u64);
+            while at < TOTAL {
+                let n = (1 + mix(k) as u64 % MAX_WORDS as u64).min(TOTAL - at);
+                let words: Vec<u32> = (at..at + n).map(mix).collect();
+                head.send(&words).unwrap();
+                (at, k) = (at + n, k + 1);
+            }
+        });
+        for (rank, ring) in rings.iter().enumerate().skip(1) {
+            s.spawn(move || {
+                let (mut at, mut k) = (0u64, 0u64);
+                while at < TOTAL {
+                    if rank == RANKS - 1 && k % 64 == 0 {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    let n = (1 + mix(!k ^ rank as u64) as u64 % MAX_WORDS as u64).min(TOTAL - at);
+                    let mut words = vec![0u32; n as usize];
+                    ring.recv_relay(&mut words, rank + 1 < RANKS).unwrap();
+                    for (i, &word) in (at..).zip(&words) {
+                        assert_eq!(word, mix(i), "rank {rank} word {i}");
+                    }
+                    (at, k) = (at + n, k + 1);
+                }
+            });
+        }
+    });
+    stop.store(true, Ordering::Release);
+    for proxy in proxies {
+        proxy.join().unwrap();
+    }
+    // Only the head and the ranks that relay wrote a stream.
+    let written: Vec<u64> = rings
+        .iter()
+        .map(|r| r.shared.written.load(Ordering::Acquire))
+        .collect();
+    assert_eq!(written, [TOTAL, TOTAL, TOTAL, 0]);
 }

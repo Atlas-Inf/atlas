@@ -230,9 +230,10 @@ pub(super) const PDL_KERNELS: &[&str] = &[
 /// Qwen3.8-Flash-Next (`ATLAS_QWEN4EXP_PDL=1`): the single-token decode chain
 /// of a GDN layer, an attention layer and the MoE, as `atlas_pdl_enter()`
 /// kernels. Not listed, on purpose: the RDMA one-shot all-reduce
-/// (`rdma_oneshot_bf16`, see its kernel note), the routed-expert GEMVs, the
-/// QSA indexer and cuBLASLt. A kernel after an unlisted one (or after a copy
-/// or memset) simply launches when its predecessor completes.
+/// (`rdma_oneshot_bf16` and `rdma_chain_bf16`, see their kernel note), the
+/// routed-expert GEMVs, the QSA indexer and cuBLASLt. A kernel after an
+/// unlisted one (or after a copy or memset) simply launches when its
+/// predecessor completes.
 pub(super) const QWEN4EXP_PDL_KERNELS: &[&str] = &[
     // The corrected-RNE weight converter of the draft copies enters first.
     "quantize_bf16_to_nvfp4_weight_rne",

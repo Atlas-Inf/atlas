@@ -72,7 +72,7 @@ fn ring_floods_use_all_four_links() {
         }
     }
     assert!(traversals[0][3] > 0 && traversals[3][0] > 0);
-    for rank in 0..4 {
-        assert_eq!(traversals[rank].iter().sum::<usize>(), 3);
+    for row in &traversals {
+        assert_eq!(row.iter().sum::<usize>(), 3);
     }
 }

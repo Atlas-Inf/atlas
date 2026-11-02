@@ -156,8 +156,8 @@ impl OneShot {
         stream: u64,
     ) -> Result<bool> {
         let ranks = self.shape.ranks;
-        // The kernel's `root`: < ranks a broadcast, == ranks the sum (or
-        // the pair's exchange), ranks + 1 a gather `stride` bytes apart.
+        // The kernel's `root`: < ranks a broadcast, == ranks the sum,
+        // ranks + 1 a gather `stride` bytes apart, and so on.
         let (root, stride) = match land {
             Land::Sum => (ranks, 0),
             Land::Root(root) => (root, 0),
@@ -217,7 +217,7 @@ impl OneShot {
             (bytes / 16).div_ceil(THREADS).clamp(1, MAX_BLOCKS)
         } as u32;
         // The kernel's pieces: a reduce-scatter's (`rs_pieces`), else the
-        // flood's or the pair's stripes.
+        // flood's.
         let rails = if rs {
             (MAX_RANKS * rs_per_segment(bytes)) as u32
         } else {
