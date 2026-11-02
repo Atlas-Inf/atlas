@@ -1,0 +1,1778 @@
+# FP4-Local post-merge campaign: running log (autonomous)
+
+**Goal:**
+- Finish FP4-Local (`nvidia/Qwen3.8-Flash-Next-FP4-Local`) after #195: verified on main, recipe vetted, AMD build restored.
+- Then work the owner's ranked list:
+  1. direct exact-hit resume
+  2. resident compressed CSF scales
+  3. independent Qwen branch overlap
+  4. device-side stochastic sampling
+  5. shared scratch planning
+  6. measured-cost scheduler
+- Plus deployment gaps from logs and issues (#172, #180).
+
+**Started:** 2026-10-23 06:00 UTC, for 10 h.
+
+**Boxes:**
+- **sparky** (GB10): all GPU work.
+- **reiner + spark2**: running someone else's v1 gate runs. Hands off.
+- **framework / strix** (gfx1151): AMD builds and soaks.
+
+**Gate for anything that touches FP4-Local:** BFCL golden ST-995 (`bfcl-subset`, no overrides) plus `agentic-webserver` at 50 iterations, on the recipe profile.
+- Recipe profile: r1short, MTP 3 drafts, EXACT_VERIFY / DECODE_FUSE / BATCH_FAST / BATCH_SMALL / HC_FAST, PLE cache 2 GB, prefix caching ON.
+- Reference: 87.44 / 87.32 and 50/50, 50/50.
+
+## Summary (living; updated as legs land)
+
+**FP4-Local is merged, verified and recipe-vetted.**
+- main (#195) + HIP fix: BFCL ST-995 **87.44 / 87.32**; agentic **50/50, 50/50, 12.43 s/turn**.
+- Recipe #21 via sparkrun on `ghcr…:sha-504063a`: BFCL **87.94 / 87.57**; agentic **50/50, 50/50, 12.49 s/turn**.
+- The only blocker on #21 is its `container:` line, which needs a tag that actually has #195.
+
+**PRs opened (Atlas-Inf/atlas):**
+
+| PR | What | Evidence |
+|---|---|---|
+| #204 | HIP build fix (`__float2bfloat16_rn` → `__float2bfloat16`); with #197 restores AMD main | GB10 BFCL + agentic unchanged; strix-hip build OK; strix agentic 50/50 |
+| #205 | #172: blocking refusals keep `content` (also fixes Anthropic `/v1/messages` blocking returning no text) | 60 server tests; gate BFCL 87.44/87.32 + agentic 50/50 12.34 s/turn |
+| #206 | #180: over-capacity vision → typed error → HTTP 400 blocking + `invalid_request_error` streaming | model 5/5; same gate PASS |
+| #207 | **Item 1, direct exact-hit resume**: retries 18 ms TTFT (was ~1.2 s full recompute), 15/15 bit-exact; default `MARCONI_EXACT=1` path 500s on qwen4_exp | arms D/E/F/H/I |
+| #208 | two-phase full-cache hit used embedding logits (latent) | compile/clippy |
+
+Issue #209: session_hash collides for shared tool sets (eviction fairness; cross-conversation tail bleed checked, not reachable).
+
+**Findings (deployment gaps):**
+- **Block-aligned identical retries recompute everything:** the exact hit is declined and nothing falls back to a shallower snapshot, and the log misleadingly says "no SSM snapshot". Unaligned retries already restore the last intermediate checkpoint.
+  - #207 serves exact hits directly, in 18 ms. The fallback branch covers the aligned/aux-less case (pending arm L).
+  - The bigger gap is the **shared prefix with no snapshot at the fork**: agentic first turns, and cold tool requests sharing ~1.2K tokens of tool JSON.
+- **Agentic first turns recompute the shared ~3.5K preamble:** p90 TTFT 3.1 s vs p50 0.64 s. Branch checkpoints exist but are off by default; A/B + gate in queue4.
+- **The container KV pool is 16% smaller than bare metal**, from a 1.6 GB free-memory drop seen only in docker.
+- **Neutral or closed:** PLE pinned-copy sync (27.90 vs 27.91 tok/s); PLE fault wall is cold first touch at the NVMe ceiling; RSS plateaus at ~4.0 GB under BFCL.
+- **CSF resident scales (item 2):** GPU decode byte-identical; 1.39 ms/step (1.25%) at k=10, 4.75 ms at k=40, for 3.2 GiB.
+- **Repo-wide CI:** `cargo deny` red since 10-21 (tool/env); the keepalive test is flaky (#191).
+- **Items 3–6** deferred (item 5: no graphs in the recipe profile).
+
+## Reproduce
+- Bare-metal serve: `~/code/nightq/serve-flashnext.sh fp4local r1short` with `profile-r1short.env` (sparky).
+- Recipe: `sparkrun run fp4l.yaml --solo --hosts localhost --image ghcr.io/atlas-inf/atlas-gb10:sha-504063a`. `fp4l.yaml` is sparkrun-recipes PR #21 at `2cbe348b`.
+- BFCL: `spark benchmark run bfcl-subset --url http://127.0.0.1:8890 --model nvidia/Qwen3.8-Flash-Next-FP4-Local --format json`.
+- Agentic: `spark benchmark run agentic-webserver ... --yes --param iterations=50 --param wall_budget_s=100000`. Needs `~/.cargo/env`.
+
+## Results ledger
+
+| When (UTC) | Build | What | Result | Run id |
+|---|---|---|---|---|
+| 10-20 | 5ddfabb6e (pre-merge) | BFCL ST-995 | 87.44 / 87.32 | run-1792488042130537521 |
+| 10-20 | d773b218e (pre-merge) | agentic 50 | 50/50, 50/50, 11.94 s/turn | run-1792475013132909319 |
+| 10-22 08:57 | main 504063ad4 + HIP fix d2d114c02 | agentic 50 | 50/50, 50/50, 12.43 s/turn (Σwall 4762 s, 379 turns) | run-1792654228906033074 |
+| 10-22 10:26 | same | BFCL ST-995 | **87.44 / 87.32** (identical) | run-1792664799374893012 |
+| 10-22 08:36 | strix #197 fafb7349d + fix, Qwen3.8-27B-NVFP4 | agentic 50 | 50/50, 50/50, 18.735 s/turn (first strix agentic run) | run-1792658188290604510 |
+| 10-22 | framework, main + #197 + fix | strix-hip build | OK (embed_from_argmax .co for t0/t3/t4) | job 077 |
+| 10-23 07:15 | recipe #21 via sparkrun, ghcr sha-504063a | BFCL ST-995 | **87.94 / 87.57** (n=995) | run-1792739730602690285 |
+| 10-23 08:33 | recipe #21 via sparkrun, ghcr sha-504063a | agentic 50 | **50/50, 50/50, 12.489 s/turn** (Σwall 4585 s) | run-1792744391299397436 |
+
+## Iteration log (append-only)
+
+- **10-22.** main was verified post-merge (above). There was a second strix-hip break from #195: `__float2bfloat16_rn` in `batched_embed_nvfp4`, which HIP does not have. Fixed with `__float2bfloat16` (RNE on both) in d2d114c02.
+- **10-22 → 10-23 overnight: about 14 h idle.** Pushing, stopping other workloads and queuing new sparky jobs were all denied by the auto-mode classifier, and no loop was armed. Bypass permissions have been on since 10-23.
+- **10-23 04:10.** Recipe audit:
+  - sparkrun-recipes #21 (FP4-Local, single GB10) is OPEN.
+  - Its flags match the verified r1short profile exactly.
+  - Its `container:` is `azeezish/atlas-gb10:latest` (Docker Hub, 2026-09-23), which predates FP4-Local.
+  - The merged sibling recipes use `ghcr.io/atlas-inf/atlas-gb10:latest`.
+  - `image.yml` builds `sha-<7>` for every main commit but never moves `:latest`; promotion is manual. On 10-23, `:latest` was b9a7eda (#174, built 10-16), so it does not have FP4-Local either.
+- **10-23 04:17.** Recipe #21 served through sparkrun on `sha-504063a`:
+  - Ready in about 2 min with all 7 recipe env vars present in the container.
+  - Smoke: 17×23=391 correct; `get_weather{"city":"Osaka"}` tool call correct; 31.8 tok/s; MTP 66 accepted / 0 rejected.
+  - 04:19: BFCL ST-995 started against the container.
+- **10-23 06:00.** 10-hour queue (`~/code/q10h/queue.sh`, tmux `q10h`), in order:
+  1. recipe BFCL
+  2. agentic on the container
+  3. exact-hit arms A–D
+  4. main + #172 + #180 gate
+- **10-23 06:01.** First unit-test run failed because nvcc was not on PATH (script error). Rerun:
+  - fmt OK.
+  - `spark-model vision_transport`: 5/5.
+  - `spark-server --lib refusal`: 6/6.
+  - clippy `-D warnings` clean.
+  - `spark-server --bin spark` (glm_tool_boundary, chat_blocking, refusal): 43/43, including the new `blocking_refusal_prefix_keeps_content`.
+  - Release build OK (sha256 `3cd769f7d3efbfd2`).
+- **10-23 06:06.** CSF item 2, first experiment (`~/code/csf-micro`):
+  - Layer 0 holds 1,536 CSF tensors. Compressed 81.77 MiB vs decoded 150.00 MiB, a ratio of 0.545, so **3.20 GiB** is saved over 48 layers.
+  - GPU decode is **byte-identical** to the host decoder: 0 of 157,286,400 bytes differ, for both v1 (one block per tensor) and v2 (8 row-split blocks per tensor, u32 in / u64 out, each block patching only its own exceptions).
+  - v2 latency per layer (**measured while BFCL was serving on the same GPU**):
+    - k=10 experts: 30.5 µs, which is 1.46 ms/step over 48 layers, about 1.3% of the 111 ms decode cycle.
+    - k=40 (MTP verify): 5.07 ms/step.
+    - All 512 experts: 72 ms.
+  - A clean rerun is queued after QUEUE DONE (`clean.log`).
+- **10-23 06:12.** PR **#204**: the HIP fix (`fix/hip-embed-nvfp4-bf16`). AMD main needs #197 + #204.
+- **10-23 06:20.** PR **#205**: #172, blocking refusals keep `content`. PR **#206**: #180, over-capacity vision gets a typed `VisionCapacityError` and a 400, not a retryable 500.
+  - Enntity's fork already lifted the cap itself in `92dd5435`.
+  - The live gate for both PRs is queue leg 4.
+- **10-23 06:30.** Exact-hit code read (`prefill_b/prefix_lookup.rs`). The shortcut is bypassed by default because it was suspected of degrading agentic quality (ws ~23% cache-on vs ~60% cache-off). Arms A–D (MARCONI_EXACT 0/1 × MTP on/off) are the correctness gate for direct resume.
+
+- **10-23 07:00.** Log dig on the recipe container's serve log: 20,498 lines, 5 WARN, 0 ERROR.
+  - (a) `copy_h2d_async was handed a PAGE-LOCKED source`. Traced to `ple/verify.rs` gather_host, which uploads slot ids from the layer's own pinned staging buffer, so every gather paid a `cuStreamSynchronize`. That buffer is only rewritten after `release_prev_pins` host-waits (`cuEventSynchronize`) on the event recorded behind the previous gather kernel, so `copy_h2d_async_retained`'s contract holds.
+    - Fix on `perf/ple-slots-retained` (536530e39).
+    - A/B is pending. The decode gain is probably small, because the step already syncs for its readback. It also restores the prefill span overlap that the span loop's comments describe.
+  - (b) KV own-footprint: 3.10 GB more "free memory fell" than Atlas's counters account for, with no co-tenant on the box. Likely the 2 GB pinned PLE row cache plus the CUDA context are not counted, which shrinks the KV pool (8.9 GB, 376,560 tokens). Not yet confirmed.
+  - (c) Vision capacity clamp at 16,384 patches. This is the same cap behind #180.
+  - (d) The final-norm PLACEHOLDER warning is expected (mHC).
+  - (e) Listening on 0.0.0.0 is the recipe's own `host` setting.
+  - NgramRowCache: 96.4% hit rate, 0 evictions, 1.65 M of 22.2 M slots resident. **Fault wall 120.9 s cumulative over ~3 h of BFCL**: serial QD=1 preads under the table mutex, per the code comment. That is a prefill-stall candidate.
+- **10-23 07:10.** Qwen peer review requested on #205 and #206 (pending).
+  - Own check of #205's blast radius: only `openai/encode.rs` reads `Choice.refusal`. The Anthropic `/v1/messages` and non-streaming `/v1/responses` paths never read it. If they build from the same `Choice`, they used to return an empty answer for refusal-prefixed replies, and #205 would fix them too. Not yet confirmed.
+- **10-23 07:15.** **Recipe #21 BFCL ST-995: 87.94 / 87.57** through sparkrun on `ghcr.io/atlas-inf/atlas-gb10:sha-504063a`. Bare metal at the same main gave 87.44 / 87.32. The container is compiled by a different CUDA toolchain, so numerics differ slightly, and at temp 0 that moves a few samples. It passes.
+
+## Open gaps / next
+- Recipe #21: change the container to the ghcr image (`sha-504063a` or a promoted `:latest`), then merge. That needs owner/Devin action.
+- Strix BFCL drift since September: 85.43/78.19 → 84.42/75.22. Not yet filed.
+- A strix-hip build as a required CI check. It is missing, and its absence is why main broke twice.
+
+### Appended 10-23 07:25
+- **PR #21 comment**: posted the vetting result, plus the container blocker. Suggested pinning `ghcr…:sha-504063a` or promoting `:latest`.
+- **PLE fault wall closed as "not a gap"**: the fault pool already runs 64 threads (the GB10 NVMe random-4K ceiling). The cache had 0 evictions, with 1.65 M of 22.2 M slots filled. Every miss is a first touch of a row, so the 120 s is cold-start reads at the hardware limit. Only prefetching rows ahead of need could reduce it.
+- **#205 blast radius confirmed**: Anthropic `/v1/messages` blocking builds text blocks from `c.content` only (`anthropic/translate.rs`). Before #205, refusal-prefixed replies there had no text block at all. Commented on #205.
+- 07:16: leg 1 agentic started on the recipe container.
+- **07:35. KV pool, container vs bare metal (same main):**
+  - Container: Atlas-own 96.2 GB, KV pool 8.9 GB / 376,560 tokens.
+  - Bare metal: Atlas-own 94.6 GB, KV pool 10.5 GB / 445,792 tokens.
+  - Atlas's tracked figure is equal in both (93.1 / 93.3 GB). The container loses about 1.6 GB of free memory during load that bare metal does not, probably container page cache or processes.
+  - Minor for the recipe (1 sequence, 32K context), but it caps how much prefix cache the recipe holds.
+- **07:40. Item 1 design input from PR #163** (external, opt-in `--exact-prefix-cache`):
+  - On main, cache-on ≠ cache-off at temp 0 (12/24 on Flash-Next), because warm replays use a different chunk layout. #163 fixes this with a 1024-token grid, at +10.6% agentic wall.
+  - Arms A/C (`MARCONI_EXACT=0`: full hits recompute everything, same layout as cold) are the control and should be 15/15.
+  - Arms B/D test the stashed-hidden shortcut itself. MTP drafter state is not rebuilt on a hit (that is #163's fix 7), but `EXACT_VERIFY` should keep output equal anyway; B vs D checks that.
+  - Item 1 removes the redundant 1-token forward from the B/D path. It is only worth building if B and D are 15/15.
+- **07:50. Likely root cause of the exact-hit quality loss on qwen4_exp.**
+  - On an exact full-prompt hit (`MARCONI_EXACT=1`) the last prompt token is re-run through every layer.
+  - The `finalize_last` fixup re-restores only the SSM h/conv state (`ssm_snapshots.restore`) and the stashed hidden. It never re-applies the snapshot's **aux** state (PLE n-gram history/conv carry, QSA indexer keys).
+  - The prefix-hit restore does apply aux (`with_aux → apply_aux_states` in prefill_a/prefill_c). The shortcut predates PLE/QSA.
+  - So decode continues from double-advanced PLE/QSA state.
+  - Fix: `fix/exact-hit-restore-aux` (81655d56a) re-applies aux in the fixup.
+  - Remaining unknown: the MTP drafter context carry may also consume the redundant token. That is #163's fix 7.
+- **07:55. PLE prefetch correction.** `PleWarm` (layers/ple/warm.rs) already prefetches the prompt's n-gram rows ahead of the gather. The 120 s fault wall is what is left after that prefetch.
+- **07:20. queue2** (`~/code/q10h/queue2.sh`, tmux `q10h2`) replaces queue.sh legs 3–4. queue.sh stops at "STOP before arm A".
+  - Arms A–D: base binary.
+  - Arms E/F: exp binary = main + PLE retained + aux fix, `MARCONI_EXACT=1`, MTP on/off.
+  - G vs A/A2: PLE retained decode A/B, using `decode_probe.py` (10 × 512-token answers).
+  - Then the fixes gate (BFCL + agentic), then the clean CSF timing.
+- **08:10. Qwen peer review of #205 / #206 received. Triage:**
+  - **Real gap, fixed in #206 (1abf05704):** streaming clients still got `server_error`/500. `send_invalid_request_to_sink` sent the same `StreamEvent::Error`, and `handle_error` always renders 500. #180's client (opencode) streams. Added `StreamEvent::InvalidRequest`, rendered as `invalid_request_error`/400. Only 2 `StreamEvent` consumers exist (chat_stream, completions); responses/messages inherit through chat deltas.
+  - Also fixed: renamed `images` → `grids`, and added a negative test that a stringified error loses its type.
+  - **Rejected with evidence:** TP hang (`validate_state` runs before the command preamble by design); missed entry points (vision state is broadcast only from chunk 0 and prefill_b); #205 double emission (only `openai/encode.rs` reads `refusal`); strict-JSON breakage (grammar-constrained, and there is no server-side `json_object` validation on blocking); "redaction" (streaming never stripped).
+  - Both triages posted as PR comments. Retest on sparky (tmux `retest`, `wt-fixes/retest.log`); the gate binary is rebuilt at the PR head.
+- **07:26 (sparky clock).** Times above marked `~` were corrected; earlier I had written estimates that ran ~30–40 min ahead of the box. From here on, times are taken from `date -u` on sparky.
+- **07:25. Operator error:** `pkill -x cargo` on sparky, used to restart the retest, could have hit the agentic soak's sandbox builds. Checked: run-05 finished at 07:25:34, before the kill, and run-06's `cargo test` passed at 07:26:20, after it. No iteration hit. The 50-iteration verdict will confirm. Rule restated: kill tmux jobs by their own PIDs only.
+- **07:26.** #206 commit amended for rustfmt (fcf3fd30d; it had not been pushed). Retest restarted.
+- **07:30 heartbeat.** sparky: leg 1 agentic on the recipe container at about iteration 6; queue2 armed; retest has passed fmt and the model tests so far.
+  - PRs #204, #205, #206 and recipe #21 have no reviews yet.
+  - #204 CI: `cargo deny`, `kernel shadow structure` and `PR benchmark gate` are red. All three are red identically on #203 (merged), #202 and #198, so they are **repo-wide and not from #204**.
+  - **New gap: `cargo deny` has been red repo-wide since 10-21.** The error is `bug[unresolved-workspace-dependency]` on every `{ workspace = true }` path dependency (atlas-core, atlas-kernels, atlas-rdma). The last green run was 10-20 at 5ddfabb6e.
+    - No manifest changed between then and main, and the action SHA is the same (`3c634983`).
+    - The action rebuilds its Docker image each run, so an unpinned base image or tool inside it probably moved. The advisory/license audit is effectively off until this is fixed.
+    - Owner item; not chased further.
+- **07:45. Strix BFCL drift numbers (85.43/78.19 → 84.42/75.22) not filed.** They come from the 10-22 Qwen summary, and I can find no source for them in BENCH.toml, docs or #197. Filing needs run ids first.
+- **07:50. Latent wrong-logits bug in `prefill_d.rs::prefill_full_cache_hit`.**
+  - Path: two-phase prefill (`prefill_twophase_dispatch`), with an SSM snapshot covering the whole prompt (`proc_count == 0`).
+  - Behavior: it re-embeds the last token and runs final_norm + lm_head **on the embedding**, skipping every layer. It never uses the snapshot's stashed hidden, and it is not gated by `ATLAS_MARCONI_EXACT`.
+  - Reachability: only when `max_prefill_tokens < len ≤ max_batch_tokens`. The recipe has max_batch_tokens = 8193 = max_prefill + 1, so only a prompt of exactly 8193 tokens. Two-phase never ran in the recipe or bare-metal logs (0 lines).
+  - Fix, when picked up: restore the stashed hidden into `normed` the way `finalize_last` does, or decline the skip when the snapshot has no hidden.
+- **07:35. #206 pushed (fcf3fd30d).** Retest: fmt OK, model 5/5, server bin 60/60, clippy clean. Release build running (it is the leg-3 gate binary).
+- **07:36. Qwen review of the aux fix and PLE retained — triage:**
+  - **PLE retained, held.** Real new hazard: the old synchronous copy implicitly ordered the H2D before *any* reader, so a cross-stream reader of `slots_dev` would now race. The main decode path uses one stream for prestage, uploads and replay (decode_a.rs), but batched decode and MTP verify are unproven. Expected gain is small (decode syncs per step anyway).
+    - Plan: let arm G vs A/A2 decide. If neutral, close (neutral switches don't merge). If a win, add a per-copy `copy_done` event (Qwen's design) before a PR.
+  - **Aux fix: necessary, maybe not sufficient.** Qwen lists more state the redundant forward touches.
+    - Checked as harmless: KV at N-1 is a duplicate write; `seq_len` is set to total; mHC streams are per token, not carried across tokens; the decode checkpoint ring saves during decode, not prefill; the aux blob H2D is a transient copy (it syncs if pinned).
+    - Open: QSA counters beyond keys; MTP drafter context (output is still protected by EXACT_VERIFY).
+    - Robust design, the same as item 1: **skip the forward** (restore SSM + aux + hidden → lm_head) rather than undo it. Arms E/F show whether aux alone recovers exactness. Item 1 is the follow-up either way.
+- **07:34. Item 1 prototype: `ATLAS_EXACT_DIRECT=1`** (264361a3d, on `fix/exact-hit-restore-aux`).
+  - On an exact leaf hit whose snapshot has the stashed hidden (last chunk, `proc_count == 1`, no prompt logprobs), skip `prefill_b_forward_layers`. `finalize_last`'s fixup already supplies the hidden for lm_head.
+  - Nothing re-runs, so nothing is double-advanced.
+  - Covers the single-stream path only; the batched/multi paths keep the re-run.
+  - prefill_b.rs is at 499 lines; the predicate lives in the new `prefill_b/exact_direct.rs`.
+  - Known cost: the first MTP draft sees no real hidden context. Acceptance only; output is protected by EXACT_VERIFY.
+  - queue2 restarted (it was only waiting) with arms H/I (exp, `EXACT=1 + DIRECT=1`, MTP on/off). The wt-exp fmt/clippy check runs after the retest build.
+- **08:00 heartbeat.** Recipe agentic at about iteration 25 of 50. wt-exp fmt OK and clippy clean (spark-model). No new PR comments.
+- **08:00. New deployment gap, from the agentic-phase serve log** (4,629 lines since 07:16, 0 WARN/ERROR):
+  - TTFT p50 is 636 ms but p90 is 3,100 ms (n=198).
+  - **51 turns** logged `Prefix cache hit: 3168|3696 tokens … but no SSM snapshot — recomputing all KV`. That is the first turn of every iteration: each new conversation shares the system prompt + tools, the radix cache matches it, but no SSM snapshot exists at that depth. Snapshots sit only at leaves and every 4,096 tokens, and 3,696 < 4,096.
+  - So every new session pays a full ~3.5K-token prefill.
+  - Atlas already has the fix, off by default and with no recorded measurement: `ATLAS_QWEN4EXP_PC_BRANCH=1` + `ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT=1` (from #174) captures an in-pass checkpoint at the fork of a cached path (`qwen4exp_points.rs`, min 1,024 tokens).
+  - Added queue2 arms J (flags on) and K (control) with `preamble_probe.py`: 6 new conversations on one fixed ~3.5K-token preamble. Compare TTFT on conversations 2–6 and per-conversation output equality.
+  - If J wins and matches K, the recipe (and the default) should turn it on.
+- **08:30 heartbeat.** Recipe agentic at iteration 46 of 50. No PR activity.
+  - Wrote the latent two-phase full-hit fix: `fix/twophase-full-hit-hidden` (3c88c09d7). It restores the snapshot's stashed hidden into `normed` before lm_head in `prefill_full_cache_hit`, and warns if there is none.
+  - Compile/test pending (next sparky CPU batch). prefill_c.rs is on the file-size-cap path allowlist.
+- **08:33. Recipe #21 fully vetted: agentic PASS** (50/50, 50/50, 12.489 s/turn vs 12.43 bare metal). This also confirms the 07:25 pkill hit no iteration. Posted on #21 along with the preamble-recompute finding. queue.sh stopped as planned and queue2 started (arm A booting).
+- **09:00. Arm A (base, `MARCONI_EXACT=0`, MTP): 4/15 cold==warm; 0 exact-hit lines.**
+  - Decode probe: 27.71 tok/s median, TTFT median 412 ms.
+  - **Key finding: identical retries are almost never exact hits.** The radix cache matches whole 16-token blocks, so a warm identical prompt matches `floor(len/16)*16` tokens (e.g. 1,296 of 1,305). The leaf snapshot sits at the unaligned end, so there is no snapshot at the match: 27× `Prefix cache hit … no SSM snapshot — recomputing all KV`, i.e. **a full recompute on retry**.
+  - Only the block-aligned prompts (432 and 4,144 tokens) hit fully, and both matched cold. Prompts >4,096 tokens restore from the 4,096-token intermediate checkpoint and replay the rest (12×).
+  - Mismatches are tool/agent cases plus one chat case; known prefix-cache-path variance (FP4-Local doc §3, "optional preamble sentence"; #158/#163 layout).
+  - **Item 1 reframed:** the exact-hit shortcut and direct resume only apply to ~1 in 16 prompt lengths. The retry lever is a checkpoint at or below the last whole block. qwen4_exp's in-pass tail checkpoint (`ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT=1`, 64-row grid) should do that. Arm J (MIDCHUNK + PC_BRANCH) also runs the retry probe, so it measures this too.
+- **08:43. Probe change for arms B onward:** `exact_hit_probe.py` is now block-aligned. Per case it uses `max_tokens=1` trials to find a pad (0–15 " ok" words) that makes `prompt_tokens % 16 == 0`, then runs cold/warm on a fresh fixed-width decimal nonce (Qwen tokenizes digits one per token, so the count is stable).
+  - Every warm send is then a true full-prompt hit that exercises the exact path. It prints "not aligned" when it misses.
+  - Arms A (and C) are the unaligned control. The old probe is kept as `exact_hit_probe.unaligned.py`.
+- **09:05. Arm B (base, `EXACT=1`, MTP): 3/15. Uninformative.** B went live at 08:42:15 and the aligned probe was swapped in at 08:42:43, so B ran the unaligned probe and hit no prompt fully (0 exact lines).
+  - B2 (same arm, aligned probe) is queued in `queue3.sh` (tmux `q10h3`) to run after QUEUE2 DONE.
+  - Arms C onward use the aligned probe.
+- **08:55. Arm C (base, `EXACT=0`, no MTP, aligned): 10/15**, all prompts aligned (`warm_cached == ptok`). Still 0 bypass lines, because the prompt-end snapshot was gone before the retry.
+  - **Root cause of "identical retry recomputes everything":** the lifecycle trace shows `Saved SSM snapshot 9 for 1312 [chunk]` → `Saved finish-leaf SSM snapshot 5 for 1357` → retry `Prefix cache hit: 1312 tokens … no SSM snapshot`.
+  - The finish-leaf goes through `insert_with_snapshot` → `SsmSnapshotIndex::insert_tail`, whose supersede sweep keeps **at most one tail (+sibling) per session**. So the prompt-end snapshot is freed the moment the turn ends.
+  - Continuing conversations are fine (the next turn extends past the leaf). **Identical retries, regenerate, edit-last-message and n-branches always recompute the full prompt.** This is the real gap behind item 1.
+- **08:55. Arm D (base, `EXACT=1`, no MTP): HTTP 500 on the first real exact hit.**
+  ```
+  Marconi SSM cache hit: 1312 tokens skipped (82 blocks), snapshot 9, replaying 0 SSM tokens to reach 1312
+  ERROR Prefill start error: Prefill-as-decode layer 3 failed: QSA: decode at pos 1311 but 1312 tokens ingested — the indexer cache lost sync
+  ```
+  - **On qwen4_exp the `ATLAS_MARCONI_EXACT=1` shortcut fails requests**, not just degrades them: the restored QSA indexer is at N, and the redundant re-run decodes position N-1. The aux fix (E/F) still runs that forward, so it is expected to hit the same error.
+  - **Direct resume (H/I) never runs it.** This confirms item 1's design: skip the forward, don't undo it.
+  - The probe aborted on the 500. It now records errors and continues (swapped before E).
+- **Item 1, revised plan:**
+  - (1) Direct resume, so an exact hit never re-runs the last token.
+  - (2) Keep the prompt-end snapshot when the finish-leaf supersedes it (one extra slot per session, first to be evicted), so retries and branches can restore at all.
+  - Without (2), (1) only fires on the rare retry whose prompt-end snapshot survived.
+- **09:20. CORRECTION: the 08:55 "insert_tail sweep" root cause is WRONG.** The prompt-end snapshot is not deleted. Actual cause, from the code and arm C's trace (a distinct-session chat case with no pool pressure still "lost" it):
+  - `pc_policy.rs::marconi_restorable` declines it: `bypass_exact = snap_tok == matched && matched == total && !marconi_exact()`. That is the default `ATLAS_MARCONI_EXACT` bypass, applied *before* the bypass log line.
+  - The caller then prints the misleading `Prefix cache hit … but no SSM snapshot — recomputing all KV`.
+  - There is **no fallback to a shallower snapshot**. For a 1,312-token prompt the 1,280 intermediate existed; restoring it and replaying 32 tokens would give correct first-token logits with no double advance.
+  - **Unaligned retries** (match = floor(len/16)*16): the deepest snapshot ≤ match is the mid-chunk tail capture (`ssm_tail_midchunk=true`). It carries no aux unless `ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT=1`, and aux-carrying models decline aux-less slots, so it is declined too. Arm J (MIDCHUNK + PC_BRANCH) tests exactly this.
+  - **Fix candidates** for item 1, all small and in `prefix_lookup` / `marconi_restorable`:
+    - (a) When the deepest snapshot is declined (exact bypass, aux-less, session), retry the lookup capped below it and restore the next-shallower snapshot instead of recomputing from 0.
+    - (b) MIDCHUNK_CKPT on by default for qwen4_exp, if J is clean.
+    - (c) Log the decline reason instead of "no SSM snapshot".
+- **09:20. New finding: `session_hash` collides for every tool request.** `compute_session_hash` hashes the first 1,024 prompt tokens, and with tools the chat template puts the tool JSON first. Arm C: **all 70 tool requests share `0x65871a44fdf76528`**; each chat request is distinct.
+  - In multi-user agentic serving, every client with the same tool set (or a system prompt >1,024 tokens) is one "session". Session-aware eviction cannot tell them apart.
+  - The tail-snapshot session gate (whose purpose is to stop cross-conversation tail restores, since "a tail's SSM state bleeds past its advertised token_count") does not separate them. Whether a wrong-state restore is reachable is not checked yet: it needs a tail whose prefix hash matches another conversation's tokens at that count.
+  - A DBG run (debug logs for snapshot lifecycle; 3 cases) is queued in queue3 after QUEUE2 DONE.
+- **09:05. Arm J (base + `MIDCHUNK_CKPT=1` + `PC_BRANCH=1`).**
+  - **Preamble probe:** conv0 (cold, 3,285 tokens) TTFT 2,087 ms; **conv1–5 TTFT 181–186 ms** (cached 3,264), about **11× faster** first-turn TTFT for every new conversation on a shared preamble. Tool picks look sane. Output equality vs control K is pending.
+  - **Aligned retry probe:** 5/15. Chat 5/5 match; tool 0/5 (mismatched in every arm, known); agent 0/5 (5/5 in C), i.e. layout changes from mid-chunk restores (#158/#163 class).
+  - Restores: **55 intermediate hits** (C had 0). Mid-chunk checkpoints now carry aux, which confirms fix candidate (b).
+  - Not a free win: warm ≠ cold on agent prompts, so it needs the BFCL + agentic gate before going into the recipe/default. Queue a J-profile gate after queue2.
+- **09:08. queue4 armed** (tmux `q10h4`, runs after QUEUE3 DONE): J-profile gate. Base d2d114c02 + `MIDCHUNK_CKPT=1` + `PC_BRANCH=1`, agentic 50 then BFCL ST-995.
+  - This decides whether the 11× preamble TTFT goes into the recipe.
+  - Chain on sparky: queue2 (arms K, E/F/H/I, G/A2, then the #205/#206 gate, then CSF clean) → queue3 (DBG snapshot lifecycle, B2) → queue4 (J gate).
+- **09:12. Arm K (control, default flags). CORRECTION to J's "11×".**
+  - The preamble probe is equally fast with no flags: conv1–5 TTFT 181–186 ms (cached 3,264); conv0 cold 2,237 ms.
+  - K restored from **snapshot 7, the default `Intermediate SSM checkpoint saved at token 3264 (block 204)`**, the last-block checkpoint before each prompt end. That carries aux.
+  - The probe's questions are ~20 tokens, so that checkpoint falls *inside* the shared preamble and is reusable. **The probe didn't test the agentic case**, where long first messages put the last-block checkpoint past the fork and nothing exists at the preamble boundary (the 51 misses).
+  - Outputs J vs K: conv1–5 identical tool picks; conv0, cold in both, differs (J `list_dir,search` / K `list_dir`). Either the mid-chunk capture changes cold numerics, or this is run-to-run variance.
+  - K aligned retry probe: 10/15 (same as C). This is the default baseline.
+  - New probe mode `long` (+~200 tokens of distinct context per first message). queue4 now runs **J2** (PC_BRANCH + MIDCHUNK), **K2** (control) and **J3** (MIDCHUNK only) with long questions *before* the J-profile gate.
+- **09:12.** EXP build OK (e0158eda); arms E/F/H/I next.
+- **09:25. Arm E (exp = aux fix, `EXACT=1`, MTP, aligned): 14/15 warm sends hit the exact path and all 14 returned HTTP 500** (`QSA: decode at pos N-1 but N tokens ingested`).
+  - Reproducible on every exact retry with `ATLAS_MARCONI_EXACT=1` on qwen4_exp.
+  - The aux fix alone cannot help: the failure is in the redundant forward. Item 1 = skip the forward; H/I test it.
+  - The aux-fix-only branch is **not PR-worthy on its own**. It folds into direct resume (same branch, 264361a3d/f5dc0fb7d).
+- **09:25. Qwen consult on retry fallback + session_hash — triage:**
+  - **Fallback-to-shallower by default:** agreed. Implement as candidate enumeration with reject reasons (exact bypass / missing aux / session / pin failed), not "decline then give up". Pin the chosen snapshot through restore. Replay with prefill/extend semantics (never decode for a prompt token).
+  - **Direct resume:** opt-in and capability-gated (snapshot has stashed hidden + aux + KV through N; disable with prompt logprobs, which I already did; first MTP step degraded). My prototype matches.
+  - **Cross-session tail bleed (A):** checked, **not reachable with current captures**. The default mid-chunk tail capture saves GDN state *exactly at tb* (split kernels; midchunk_capture.rs), and qwen4_exp in-pass checkpoints capture PLE/QSA aux at that exact row. Physical == logical extent, so a cross-session restore of such a tail is as safe as an exact-prefix snapshot. The "bleeds past token_count" justification in `lookup` describes the older clamp-based `ATLAS_SSM_TAIL_CKPT` path.
+  - **Session-hash collision** stays a real issue, but for eviction fairness and observability, not correctness. Proposed identity: request/conversation id for LRU affinity; prefix hash for correctness (already how non-tail entries work).
+  - **Misleading log:** agreed; part of the fallback change.
+- **09:35. Retry fix written: `fix/marconi-fallback-shallower` (64f33b27a).**
+  - `PrefixCache::snapshot_below` (radix: the deepest resident index entry under a cap) feeds `marconi_fallback` (pc_policy.rs). When the deepest snapshot is declined, it walks down ≤4 candidates until one passes `marconi_restorable`, then the existing intermediate-hit path replays the gap.
+  - Single-rank only. The bypass check now keys on the chosen depth, and the log says "no restorable SSM snapshot".
+  - Unit test `snapshot_below_returns_the_next_shallower_restore_point`. All four touched files stay under the 500-line cap.
+  - sparky: `wt-fallback` = main + fallback + twophase-full-hit fix. fmt/test/clippy/release running (tmux `fbcheck`).
+  - **Arm L** (fallback binary, `EXACT=0`, aligned retry probe) is at the head of queue4.
+  - Expected: warm sends restore at a shallower snapshot, replay < 64 tokens, warm wall time drops. Match rate vs cold should be ≥ C's 10/15 if the replay numerics hold.
+- **09:28. Arm F (exp aux fix, `EXACT=1`, no MTP): 14/14 exact retries → HTTP 500**, same as E. Independent of MTP.
+  - Fallback branch checks on sparky: spark-runtime snapshot tests 75/75 (new test included), clippy clean, release build OK (762bc4a5).
+  - rustfmt wanted the new test's asserts wrapped; amended locally (unpushed; binary unaffected).
+  - Arm L starts once queue2/queue3 drain.
+- **09:45. ITEM 1 RESULT. Arm H (exp, `MARCONI_EXACT=1` + `EXACT_DIRECT=1`, MTP): direct resume works.**
+  - 14/14 exact retries served with **no errors** (E/F: 14/14 HTTP 500). 28 hit/direct lines.
+  - **Warm TTFT 18.1–18.8 ms**, vs 1.1–1.4 s for the full recompute the default does (about 60×).
+  - Warm wall time is lower on every case, e.g. case 13: 2.12 s vs control K 5.41 s.
+  - Cold==warm: **10/15, the same cases as control K** (all chat and agent match; all 5 tool cases mismatch in every arm, the known prefix-path variance). Direct resume adds no divergence.
+  - Correction to my own analysis: cross-arm cold comparisons are invalid, because the probe draws a random nonce per run (E vs H, same binary, agree on only 1/15 cold). Only within-arm cold vs warm counts.
+  - Next: arm I (no MTP), then PR. The PR is `fix/exact-hit-restore-aux` (aux re-apply + `ATLAS_EXACT_DIRECT` opt-in), with the fallback PR alongside.
+- **09:50. Arm I (direct resume, no MTP): 14/14 served, < 100 ms TTFT, 0 errors.**
+- **09:50. RE-SCORE, correcting my own probe bug.** The "tool cases always mismatch" pattern was the **tool-call `id` counter** (`call_…08` vs `call_…09`), not output divergence. With ids excluded:
+  - **C 15/15, K 15/15, H 15/15, I 15/15.** Default full-recompute retries and direct resume are bit-exact against cold, with and without MTP.
+  - E/F 1/15 (14 errors).
+  - **A/B 5/15** (unaligned → partial hit + replay); **J 6/15** (mid-chunk restore + replay).
+  - So the divergence class is "restore partway, then replay with a different pass layout" (#158/#163), and my fallback fix (arm L) will likely sit in it too. Same behavior as every existing agentic intermediate hit, but the PR must state the trade-off.
+- **09:52. PR #207 opened:** direct exact-hit resume (`fix/exact-hit-restore-aux`: aux re-apply + `ATLAS_EXACT_DIRECT`). Exact retries at 18 ms TTFT, bit-exact; the default exact path 500s on qwen4_exp.
+- **09:55.** PR **#208**: two-phase full-hit emits from the stashed hidden (latent; compile/clippy verified, not exercised live). Issue **#209**: session_hash collision for shared tool sets (eviction fairness; tail bleed checked and not reachable with current captures).
+- **10:00. PLE retained-copy A/B: neutral, closed.** Decode probe median: A 27.71, **G (exp, retained) 27.90**, **A2 (base repeat) 27.91** tok/s. TTFT 412/414/413 ms.
+  - The per-gather `cuStreamSynchronize` the startup WARN flags costs nothing measurable on decode, because the step already syncs for readback.
+  - Not PR'd (neutral switches don't merge). `perf/ple-slots-retained` stays local as the record. The WARN is still real but harmless.
+- queue2 now moves to the main + #205 + #206 gate (BFCL ST-995 then agentic), then the clean CSF timing.
+- **10:05. Item 5 scoping (shared scratch across graph shapes).** The recipe-profile serve log (r1short: MTP 3 drafts + EXACT_VERIFY) shows **no CUDA-graph capture lines**. MODEL.toml lists graphs as served, but this profile doesn't exercise them.
+  - The visible scratch in this profile: buffer arena 8,193 tokens × 3.34 GB; one shared MXFP8 BF16 prefill scratch; PLE pinned row cache 2 GB; snapshot pool 16 × 114 MB + decode-rollback 8 × 114 MB.
+  - Item 5's payoff therefore isn't established for FP4-Local. Deferred, per Qwen's P5 ranking. Revisit only if a graph-enabled profile becomes the recipe.
+- 10:00. Fixes gate (main + #205 + #206, binary f3fc512c) booting: BFCL ST-995 (~3 h) then agentic (~1.3 h).
+- **10:15. PR CI sweep** (excluding the three checks red repo-wide):
+  - **#207:** file-size cap failed (`finalize_last.rs` 506 > 500). Fixed in 4529e1a44 by moving the aux re-apply into `exact_direct.rs`; finalize_last back to 499. fmt and clippy clean on sparky. Pushed and commented.
+  - **#207 / #206:** `cargo test --workspace` and `cargo llvm-cov --workspace` failed only on the flaky `spark-storage ngram_cache::keepalive::tests::ticks_only_while_active` (keepalive.rs:201; #191 fixes it). #206's job rerun; #207 re-runs on the new push.
+  - #205 and #208 have no PR-specific failures.
+- **10:30 heartbeat.** Fixes gate BFCL 29 min in (GPU 90%). Its serve log has only the 5 known startup WARNs and 0 errors so far.
+  - #207 `cargo test --workspace` now SUCCESS on rerun (the flaky keepalive test).
+  - No reviews yet on #204–#208 or recipe #21.
+- **10:31.** Started a memory-trend sampler on sparky (tmux `memsample` → `~/code/q10h/memsample.log`, every 60 s: MemAvailable, serve RSS, GPU %). Baseline under BFCL: MemAvailable 12,471 MB, serve RSS 3,939 MB.
+  - Goal: catch growth across the 3 h BFCL + 80 min agentic legs. No long-run memory trend has been recorded for FP4-Local before.
+  - Asked Qwen for production gaps across the whole day's findings (pending).
+- **10:45. Qwen production-gap review — triage against the code:**
+  - **P0 auth/bind:** Atlas already defaults to `--bind 127.0.0.1` and has `--require-auth` + `--auth-tokens-file`, a 32 MB body limit (`ATLAS_MAX_BODY_BYTES`), a rate limiter and a GPU-fault middleware. Recipe #21 sets `host: 0.0.0.0` without auth. Inside a container that is needed for port mapping, so exposure depends on Docker publishing. Recipe note to add.
+  - **Health/metrics:** `/health` (ready = model published), `/health/live`, `/metrics` exist.
+  - **Cancellation:** implemented and unit-tested (`emit_step/cancel.rs`, `cancel_tests.rs`, `receiver_closed` in prefill and admission). Live behaviour is unverified.
+  - **New `prod_probe.py`**, queued in queue4 after arm L as **P** (r1short: cancel at prefill / first chunk / mid-decode; 12 API negative cases; health during a ~30K prefill; metrics scrape) and **P2** (r2, 8 seqs: shorts vs an in-flight 30K prefill; C=2/4/8 shorts).
+  - Not covered today: >32K agentic, crash/restart fault injection, overnight soak (memsample covers the remaining gate legs), MTP at C>1 with temperature.
+- **11:00 heartbeat.** Fixes-gate BFCL 59 min in. No PR or issue activity.
+  - memsample: serve RSS 3,939 → 3,987 MB over 27 min (+1.8 MB/min); MemAvailable flat at 12.46 GB.
+  - The growth matches the PLE pinned row cache filling (1.65 M slots after 3 h in the recipe run; cap 2 GB). Check it plateaus over the remaining legs.
+- **12:00 heartbeat.** Fixes-gate BFCL 1 h 59 min in. memsample: RSS 4,004 MB, plateaued since about 11:15 (+5 MB in 45 min). No leak signal under BFCL. No PR activity.
+- **12:28 heartbeat.** Fixes-gate BFCL 2 h 29 min in. RSS 4,005 MB (flat). No PR activity.
+- **13:00. Fixes gate (main + #205 + #206, binary 64bbdec27bd2ffea): BFCL ST-995 87.44 / 87.32** (run-1792760075267807876). Identical to main, accuracy-neutral. Posted on #205/#206. Agentic leg next.
+- **12:58 heartbeat.** Fixes-gate agentic leg started (3 min in). RSS 4,012 MB. No reviewer activity on #204–#208.
+- **13:10. AMD boxes put back to work** (idle since this morning's AMD soak/build):
+  - **strix job 314 `s20-st995-main197-hipfix`**: build main 504063ad4 + #197 + #204 (b9ab4ed54), then BFCL ST-995 on Qwen3.8-27B-NVFP4 with the s14/s19 profile. This is the AMD train candidate gate.
+    - The strix "drift" source is now found: `s14` measured **84.42 / 75.22** on this profile.
+    - The strix repo lacked main; fetched origin main and bundled the integration branch. Dispatcher started.
+  - **framework job 082 `f05-fnext-st995-main197`**: AMD regression check of #195 (shared qwen4_exp code) on Flash-Next NVFP4, using f22's profile (84.12 / 82.33 on the #197 train), binary main197-hipfix from f03.
+    - Queued **behind another session's job 081-f40-drafter-ab** (submitted 13:07:47, running). Not touched.
+  - FP4-Local itself can't run on framework: not downloaded, and 68 GB free < ~96 GB.
+- 13:00. Fixes-gate agentic leg running on sparky.
+- **13:28 heartbeat. All three boxes busy.**
+  - sparky: fixes-gate agentic, 33 min in. Serve RSS 4,087 MB (+80 MB since agentic began; watch).
+  - strix: s20 binary b9ab4ed54 (sha aaaa3c289775, reused build); BFCL ST-995 started 13:11:50.
+  - framework: f05 Flash-Next ST-995 running (081 from the other session finished).
+  - No PR reviews.
+- **13:58 heartbeat.** Fixes-gate agentic 64 min in. Serve RSS 4,116 MB (+11 MB in 17 min, slowing). strix and framework BFCL running. No PR reviews.
+- **14:13. Fixes gate PASS (main + #205 + #206):** BFCL 87.44 / 87.32 and **agentic 50/50, 50/50, 12.344 s/turn** (Σwall 4,705 s, run-1792764782219366004). Main measured 12.43. Posted on #205/#206.
+- **14:13. CSF clean timing (idle GPU)**, item 2. GPU decode byte-identical (v1 and v2).
+  - v2 per layer: **k=10: 28.9 µs → 1.39 ms/step** (1.25% of a 111 ms cycle); k=20: 2.49 ms; **k=40: 4.75 ms/step**; k=80: 9.39 ms; all 512: 68.5 ms.
+  - The earlier contended numbers held to within ~5%. Saving: 3.20 GiB.
+  - Verdict for item 2: scratch-decode costs 1.3% at one token per step, 4% at an MTP-3 verify. Worth it only when the KV budget binds (longer context or C>1). Fusing the decode into the MoE GEMV is the next step to make it free.
+- queue2 DONE → queue3 (DBG snapshot lifecycle, then B2) → queue4 (L fallback, P/P2 prod probe, J2/K2/J3, J gate).
+- **14:20. CORRECTION from the DBG snapshot-lifecycle run + re-reading arm A: unaligned identical retries DO restore by default.**
+  - DBG: warm 854-token retries (match 848) restored from the `Intermediate SSM checkpoint saved at token 832` (warm prefill ~0.2 s vs ~0.86 s cold). My log extract had dropped the "Marconi intermediate hit" lines because they don't contain "snapshot".
+  - Arm A's "no SSM snapshot" lines are mostly **cold** sends: 15 that matched only the 16/32-token template prefix, and 9 cold tool/agent sends that matched the ~1,184–1,200 tokens of shared tool JSON (the same no-snapshot-at-the-fork gap as the agentic preamble finding).
+  - Arm A's warm unaligned retries: **12 intermediate hits**.
+  - So "retries recompute everything" holds only for **block-aligned** prompts (exact bypass, no fallback; arm C 15/15) and tiny prompts. The fallback fix's scope is aligned prompts (~1/16) plus aux-less snapshots.
+  - PR #207 body and the fallback PR draft corrected.
+  - The real big-ticket item remains the shared-preamble/tool-JSON prefix with no snapshot at the fork (agentic first turns, cold tool requests). That is the J2/K2/J3 + J-gate work in queue4.
+- **14:30. Arm B2 (unmodified main, `MARCONI_EXACT=1`, MTP, aligned): 14/14 exact retries → HTTP 500.** Confirms the bug is main's, not the aux branch. Posted on #207. queue3 DONE → queue4 next (arm L fallback).
+- **14:30. Arm L (fallback-to-shallower, `EXACT=0`, aligned retries) — works, but NOT shipped as default.**
+  - All 15 declined exact hits fell back one checkpoint (e.g. @1312 → @1280, @144 → @112) and replayed 32 SSM tokens. 14 intermediate restores, 0 errors.
+  - Warm wall time drops on long prompts: case 12 9.25 → 5.62 s (K: 9.71 → 9.49); case 10 5.66 → 3.03 (K: 5.27 → 5.00).
+  - **Output equality vs cold: 2/15** (ids stripped). The full recompute it replaces (C/K) and direct resume (#207) are both 15/15. Replaying through a different pass layout changes greedy output on most prompts (the #158/#163 class; cf. arm A 5/15, J 6/15).
+  - Decision: **no PR as default.** It would turn a bit-exact retry into a different answer ~87% of the time to save TTFT on ~1/16 of prompt lengths. `fix/marconi-fallback-shallower` stays local with this result. The exact way to get partial restores is #163's fixed prefill grid. #207 covers exact hits, fast and exact.
+  - The same data makes another point: **the default already diverges on every unaligned retry** (intermediate restore + replay; arm A 5/15). That is existing #158 behaviour, worth noting on #163.
+- **14:40. Production probe P (r1short, main d2d114c02) — mostly clean.**
+  - **Cancellation:** stream closed during a 24K prefill / after the first chunk / mid-decode. In each case the next request is normal (0.69–0.74 s vs 0.74 s baseline) and health is 200. The live behaviour matches the cancel code.
+  - **API negatives** (all answered in 0.0 s): malformed JSON 400; max_tokens 0 → 400 "must be at least 1"; −1 → 400; empty messages 400; content-not-string 400; invalid tool schema 400; corrupt image 400 ("unrecognized image format; send JPEG, PNG…"); 33 MB body **413**. Unicode/zero-width and multi-token stop strings are fine. The server stays healthy throughout.
+  - **Health:** `/health` answered in 0.0 s five times during the 24K prefill.
+  - **Gaps:**
+    - (1) An **unknown model name returns 200** and is served. That is a routing/compat risk when several models sit behind one gateway.
+    - (2) An **invalid role ("wizard") reaches the Jinja template**: the client gets 400 "Tokenization error: Failed to render Jinja chat template…" and the server logs `ERROR spark::tokenizer::chat_render`. It should be a validation 400 naming the role.
+    - (3) `/metrics` has `atlas_requests_active` but **no queue-depth / waiting metric**.
+  - Gap triage:
+    - (2) Not fixed. `ir::Role::Other` deliberately passes unknown roles to the template, because some templates use `developer`/`function`/`ipython`, so a hard allow-list could break them. The client already gets a 400; only the message wording and the server-side ERROR level are rough.
+    - (1) Accepting any model name is common for single-model servers (vLLM returns 404). Note only.
+    - (3) The missing queue-depth metric is a real ops gap for C>1 deployments. Candidate follow-up.
+- **14:50. Production probe P2 (r2 profile: 8 seqs, MTP 1 draft, ATLAS_MTP_MAX_SEQS=8).**
+  - **Concurrency scaling for short requests is poor:** C=1 0.89–0.97 s each; C=2 1.52–1.60 s; C=4 2.73–2.95 s; **C=8 5.6–6.05 s each**. Aggregate throughput gain at C=8 is only ~1.3× over serial. All 200s; no errors or hangs.
+    - For multi-user FP4-Local deployments, batching barely helps short interactive requests on this profile.
+    - Next to check: whether prefills serialize (one chunked prefill at a time) or the batched decode step itself is slow.
+  - **Head-of-line test invalid (my probe):** the "long" prompt (2,000 facts ≈ 34K tokens) exceeded max-seq-len 32,768 and got an instant 400 on both P and P2. So "6 shorts during long prefill" (4.0–4.3 s) was really 6-way concurrency, and P's "health during long prefill" ran against a rejected request.
+    - Rerun queued: `queue5.sh` / `prod_probe_hol.py`, 1,200 facts ≈ 20K tokens, after QUEUE4 DONE.
+  - Also invalidated by the oversized prompt: P's "cancel during prefill" and "health during long prefill" (both ran against a rejected request). P's after-first-chunk and mid-decode cancellations are valid. queue5's HOL rerun covers prefill-time health and blocking; a prefill-cancel rerun is not yet queued.
+- **15:00. Long-question shared-preamble A/B: the agentic first-turn case.** 6 new conversations, one ~3.3K-token system+tools preamble, ~700 tokens of distinct context per question (prompts ~3,970 tokens).
+  - **J2 (`PC_BRANCH=1` + `MIDCHUNK_CKPT=1`):** conv0 cold 2,654 ms; conv1 2,555 ms (`pc branch checkpoint planned` at the fork); **conv2–5 735–782 ms** (4× `Marconi SSM cache hit`).
+  - **K2 (default):** conv0 2,782 ms; **conv1–5 2,624–2,690 ms**, all 5 `no SSM snapshot — recomputing all KV`.
+  - **≈3.4× faster first-turn TTFT for every new conversation after the first sibling.** This closes the 08:00 gap (agentic p90 TTFT 3.1 s).
+  - **Outputs:** conv2–5 J2 (restored) == K2 (full recompute), **4/4 identical**. conv0–1 differ; those are the passes where J2 captured in-pass. Either the capture changes numerics, or it is run-to-run variance (6 samples can't tell).
+  - The J-profile BFCL + agentic gate (queue4, next) is the accuracy decision for the recipe. J3 (MIDCHUNK only) is next, to see whether PC_BRANCH itself is needed.
+- **15:15. J3 (`MIDCHUNK_CKPT=1` only, no PC_BRANCH):** conv0 2,658 ms, **conv1–5 2,510–2,559 ms**, 5× `no SSM snapshot`. **No speedup without PC_BRANCH**: PC_BRANCH is the lever, and MIDCHUNK is only its prerequisite.
+  - **Outputs:** J3 == J2 on conv0/1 (the capture passes), and both ≠ K2 there. On conv3 J3 ≠ J2 ≠ K2. conv2/4/5 all equal.
+  - So **MIDCHUNK's in-pass capture deterministically changes greedy output on ~3/6 prompts vs default** (not run-to-run noise: J2 and J3 agree with each other). Restores from the branch checkpoint reproduce the default's output.
+  - Recipe decision: PC_BRANCH needs MIDCHUNK, so the numerics change comes with the 3.4× first-turn TTFT. The **J-profile gate** (BFCL + agentic, starting now) decides whether it costs accuracy.
+- **14:58 (sparky clock; the ~15:00/15:15 stamps above ran ~15 min ahead).** J-profile gate agentic started 14:38 (~80 min), then BFCL (~3 h, ~19:00). strix and framework AMD BFCL ~1.5 h in. No PR reviews. The 10-hour window ends 16:00; the final report goes out then, with the J-profile BFCL and AMD results marked pending.
+- **15:28 heartbeat.** J-profile agentic 49 min in (RSS 3,843 MB). strix/framework AMD BFCL 2 h 17 min in. No PR reviews.
+- **15:58. J-profile gate, agentic leg: PASS. 50/50, 50/50, 12.115 s/turn** (Σwall 4,521 s, run-1792770855397417305). Default: 12.34–12.49.
+  - Serve log: 50 `pc branch checkpoint planned` (one per new conversation) and 286 restores (vs ~145 in default runs).
+  - **TTFT p50 500 ms / p90 2,241 ms**, vs default 636 / 3,100 ms (p90 −28%).
+  - BFCL leg running (~19:00). This is the remaining accuracy check before recommending `PC_BRANCH=1 + MIDCHUNK_CKPT=1` for recipe #21.
+- **16:00. 10-hour window closed.** Final report delivered.
+  - Still running, with watchers armed: J-profile BFCL (sparky), strix s20 AMD candidate BFCL, framework f05 Flash-Next regression BFCL, then queue5 (HOL rerun).
+- **17:12. strix s20 (main + #197 + #204): BFCL ST-995 84.12 / 74.65** (run-1792775551367679462, 0 faults) vs s14 84.42 / 75.22. Within variance; the AMD candidate does not regress. Posted on #204 and #197.
+- **17:37. framework f05 (Flash-Next NVFP4, main + #197 + #204): BFCL ST-995 84.12 / 81.47** (run-1792777040459298748, 0 faults) vs f22 (#197 train) 84.12 / 82.33. Overall identical, normalized −0.86. #195's shared qwen4_exp changes show no AMD regression.
+
+- **10-23 18:47.** J-profile BFCL ST-995 (PC_BRANCH + MIDCHUNK, d2d114c02): **87.64 / 87.38** (run-1792781263471144759), vs default 87.44 / 87.32. With agentic 50/50 at 12.115 s/turn, the J profile passes both gates. Posted the table on sparkrun-recipes #21 as an optional env and left the bake-in decision to the owner. queue5 HOL rerun (P3, r2) booted at 18:48.
+
+- **10-23 18:49. P3 head-of-line rerun** (r2 profile, ~20K-token long prompt, fits max-seq-len):
+  - Short request alone: 0.88–0.96 s.
+  - **6 shorts sent during the long prefill: all finish at 18.18–18.35 s; the long finishes at 18.7 s.** So shorts wait out the whole long prefill: full head-of-line blocking on the default scheduler.
+  - Concurrency (shorts only): C=2 1.60 s, C=4 2.95 s, C=8 5.65 s per request, about 1.16×, 1.26× and 1.32× aggregate over serial. Shorts are close to serialized.
+  - The code has opt-in knobs aimed at this: `ATLAS_PREFILL_VARLEN` (ragged batched prefill that a late arrival can join), `ATLAS_HOLO_ALWAYS_MIXED` (fuse prefill chunks into active decode), `ATLAS_PREFILL_CODISPATCH`. queue6 A/Bs VARLEN, MIXED and both on the same probe (18:51).
+
+- **10-23 18:57. queue6, scheduler knobs on the HOL probe: no change.** VARLEN: shorts during long 17.8–18.6 s, C=8 5.64 s. ALWAYS_MIXED: 18.2–18.4 s, C=8 5.72 s. Both: 17.7–18.5 s, C=8 5.87 s. Baseline: 18.2–18.35 s, C=8 5.65 s.
+- **Why, from the serve logs (P3 and hol-varlen):**
+  1. *HOL.* The long prompt (20,622 tokens) runs in 8,200-token chunks. Chunk 0 runs inline in `phase_start_prefills` (18:49:18.7 → 23.9). Shorts that arrived at 19.19 are admitted only after chunk 1 (29.48), then prefill one by one (~360 ms each). They **do not decode until the long's last chunk finishes** (35.03), and finish at 37.4. So each 48-token request waited ~18 s: two long chunks, its own prefill, and a third long chunk.
+  2. *Server TTFT omits queue wait.* Those shorts log `TTFT=360 ms` after waiting ~10 s to be admitted. The long logs 16.3 s. Server-side TTFT can't see head-of-line blocking (a production-metric gap, alongside the missing queue-depth metric).
+  3. *C=8.* The 8 requests arrive within 3 ms. Under VARLEN only the first two are deferred, and even those take `run_standard`, not the batched path. The rest prefill inline one at a time at ~360 ms each (≈2.9 s), then decode at width 8 for ~2.3 s. Batched prefill never engages: `want_varlen_defer` needs `active.is_empty()`, and the first finished short makes `active` non-empty.
+  4. *A 48-token prefill costs ~360 ms*, split into two forwards by the tail checkpoint at token 16 (~150 ms + ~200 ms). That's about 5–6 decode steps for 48 tokens, so there's a large fixed term. queue7 sweeps prompt length 8–4000 with and without `ATLAS_SSM_TAIL_MIDCHUNK=0` (18:59).
+
+- **10-23 19:03. queue7, prefill vs prompt length** (r2, max_tokens=1, thinking off; server TTFT ≈ client wall):
+
+  | prompt tokens | 34 | 58 | 126 | 276 | 527 | 1027 | 2027 | 4027 |
+  |---|---|---|---|---|---|---|---|---|
+  | TTFT ms (default) | 300 | 368 | 410 | 469 | 617 | 865 | 1402 | 2650 |
+  | `ATLAS_SSM_TAIL_MIDCHUNK=0` | 295 | 368 | 413 | 467 | 611 | 869 | 1394 | 2647 |
+
+  Marginal ≈ 0.58 ms/token above 500 tokens, with a **~300 ms intercept**: a fixed prefill cost worth ~1,700 tokens. The tail checkpoint is not it. That term sets C=8 short-request throughput (8 serial prefills ≈ 2.9 s) and every short agentic turn's floor.
+- queue8 (HOL: SLAI, max-prefill 2048, ±SLAI/MIXED) and queue9 (fixed-cost A/B: drafter context off, spec off, plus an nsys capture of 32-token prefills) are queued behind it. `serve-flashnext.sh` now honours `MAX_PREFILL` (default 8192, backup `.bak-q8`).
+
+- **10-23 19:11. queue8, HOL levers: none fix it.** 6 shorts behind the 20.6K prompt / long wall:
+
+  | arm | shorts (s) | long (s) | C=8 (s) |
+  |---|---|---|---|
+  | baseline (8192 chunk, FIFO) | 18.2–18.35 | 18.7 | 5.65 |
+  | `--scheduling-policy slai` | 18.1–18.3 | 18.8 | 5.69 |
+  | `--max-prefill-tokens 2048` | 19.5–20.3 | 21.4 | 5.63 |
+  | 2048 + slai | 16.2–16.3 | 21.4 | 5.67 |
+  | 2048 + ALWAYS_MIXED | 19.5–20.3 | 21.3 | 5.77 |
+
+  With 2048-token chunks the shorts are admitted and prefilled after chunk 1 (19:05:54–56), then **advance one decode step per chunk** (one chunk per tick, ~1.9 s each) and finish just after the long. The design is "one chunk per scheduler iteration to bound TPOT", but a qwen4_exp chunk is 1.9–5.5 s, so a 16-token reply needs ~16 chunks. Smaller chunks only add per-chunk fixed cost (+2.7 s on the long). SLAI alternates one chunk with one decode, the same ratio.
+- **Prototype** `perf/decode-steps-per-chunk` (sparky `~/code/wt-dshare`, from d2d114c0): `ATLAS_DECODE_STEPS_PER_CHUNK=k` holds a continued chunk until k standalone decode steps have run while sequences are decoding. Default 0 = byte-identical. New `phase_continue_prefills/decode_share.rs` + a 1-line gate + a 1-line counter in mod.rs. Building.
+
+- **10-23 19:15. queue9, the ~300 ms prefill floor is not MTP:** `ATLAS_NO_MTP_DRAFTER_CONTEXT=1`: 300 / 375 / 422 / 907 ms at 34 / 58 / 126 / 1027 tokens. Spec off: 303 / 377 / 422 / 907 ms. Default: 300 / 368 / 410 / 865 ms.
+- **10-23 19:24. nsys of short prefills** (58-token prompts, max_tokens 1; 7 requests by lm_head count; `~/code/q10h/nsys-short-3792654.nsys-rep`): **339 ms GPU kernel time per request**, which matches the ~370 ms TTFT, so the floor is GPU time, not host. MoE kernels take 183 ms/request (`moe_w4a16_fused_gate_up_t_k64` 0.95 ms avg, grouped GEMM 0.52 ms, `w4a16_gemm` 0.39 ms, per layer). The native MXFP8 projections take 115 ms/request (`mxfp8_proj_batchm`). Even 58 tokens × top-k route to most experts, so a prefill streams most expert weights once. Inferred: bandwidth-bound weight reads, which batching amortises and scheduling can't.
+  - So for C=8, the lever is **batching the short prefills into one forward** (one weight sweep instead of eight). VARLEN batched prefill exists but never engages here: `want_varlen_defer` requires `active.is_empty()`, and the burst of 8 arrives as the first one turns active.
+- **10-23 19:20. queue10, decode-steps-per-chunk v1: no effect (bug).** The counter started at `usize::MAX` and reset only on chunks that ran beside decoders, so the long prompt's last chunk (the first beside decoders) always passed. Fixed: the counter resets on every continued chunk and starts at 0. Rebuilt; queue11 runs k=8 and k=32.
+
+- **10-23 19:35. queue11, decode-share v2 (counter fixed)** — 6 shorts / long: **k=32 → 14.46–14.57 s / 19.0 s**; k=8 → 15.2 s (4 shorts) and 18.75 s (2) / 19.8 s. Baseline 18.2 / 18.7. C=2/4/8 unchanged. The rest of the wait sits before admission: chunk 0 runs inline in `phase_start_prefills` and chunk 1 runs in the same tick (no decoders, so no hold), ~10.8 s before anything new is admitted. The scheduler already ends the tick after a new prompt's first chunk under EP (`head_just_started`). v3 extends that to non-EP when the knob is on. Built; queue13 (k=32, k=8) runs after queue12. queue12's last two arms ran beside the nice'd v3 build (-j8).
+
+- **10-23 19:40. queue12, clean burst of 8 shorts** (6.1 s per batch on default). VARLEN 6.07–6.08 s (its first rep was 9.9 s, a cold/JIT outlier); CODISPATCH 6.3 s. **Zero "Varlen prefill waves" lines in any arm**: batched prefill never engages on a burst either.
+- **10-23 19:42. queue13, decode-share v3:** k=32 14.45–14.65 s / long 19.2. The tick break works (shorts admitted at +5.2 s instead of +11 s), but the hold didn't: decode steps from earlier requests left the counter above k, and the long's inline chunk 0 never passes `hold_chunk`. So the shorts sat through chunk 1 again. v4 resets the counter on every tick with nothing decoding (`note_idle`). Rebuilt; queue14.
+
+- **10-23 19:58. queue14, decode-share v4: works.** 6 shorts behind the 20.6K prompt:
+
+  | arm | shorts (s) | long (s) |
+  |---|---|---|
+  | baseline | 18.2–18.35 | 18.7 |
+  | **v4 k=32** | **9.75–9.87** | 20.0 (+1.3) |
+  | v4 k=8 | 8.9 (4 of them), 14.6 (2) | 19.1 (+0.4) |
+
+  k=8 releases a chunk before the slowest shorts finish their 16 tokens (MTP ~1.8 tok/step, 6 streams), so 2 of them wait out another chunk. A time- or completion-based release would be cleaner than a fixed k. What's left of the ~9.8 s: chunk 0 (~5.2 s, already running when the shorts arrive), 6 serial short prefills (~2.2 s), and ~2 s of decode. PREFILL_MULTI should collapse the 2.2 s (queue15). C=2/4/8 unchanged, as expected.
+  - Diff, all behind `ATLAS_DECODE_STEPS_PER_CHUNK` (default 0, byte-identical):
+    - new `phase_continue_prefills/decode_share.rs`;
+    - a 1-line gate in `phase_continue_prefills.rs`;
+    - 3 lines in `scheduler/mod.rs`: decode counter, idle reset, and `head_just_started` extended to the knob.
+
+- **10-23 19:57. queue15/16: ROWINV, PREFILL_MULTI.** MULTI is ignored without `ATLAS_QWEN4EXP_PREFILL_ROWINV=1` (it WARNs at boot; queue15 was a no-op).
+
+  | arm | burst of 8 (batch wall) | burst of 4 | TTFT 58 / 1027 / 4027 tok |
+  |---|---|---|---|
+  | default | 6.1 s | ~3.1 s | 368 / 865 / 2650 ms |
+  | ROWINV | **5.18 s** | 2.66 s | **258 / 795 / 2475 ms** |
+  | ROWINV + MULTI | 5.18 s | 2.65 s | 258 / 798 / 2470 ms |
+  | ROWINV + MULTI + CODISPATCH | 5.13 s | 2.62 s | 271 / 813 / 2477 ms |
+
+  - **ROWINV on its own makes short prefills 30% faster** (−110 ms at 58 tokens; −175 ms at 4K) and the C=8 burst 15% faster. It also makes chunked, batched and restored prefills bitwise-equal (its purpose). It's a candidate default for FP4-Local, pending the BFCL/agentic gates.
+  - **MULTI engages but doesn't amortise.** CODISPATCH gathers the whole burst ("8 prompts, 488 rows, 2273.6 ms"), yet that's 284 ms a prompt, the same as solo ROWINV prefills (258 ms). A single 1027-row prompt takes 795 ms. So the ~260 ms term scales with prompts, not rows.
+  - **This corrects the 19:24 entry.** The floor is not shared weight streaming, or MULTI would have paid it once. It's per-sequence work. queue17 takes an nsys of the multi passes to name it.
+
+- **10-23 20:05. Why MULTI doesn't amortise (nsys, prefill only).** `nsys-multi-3862343`: max_tokens 1, ROWINV+MULTI+CODISPATCH, 1 warm prefill + 3 passes of 8.
+  - Kernels: `dense_gemv_bf16` (lm_head) 25×, and the prefill MoE kernels 1200× = 25 × 48 layers. So **every prompt runs all 48 layers alone**, even though the log says "Multi-sequence prefill: 8 prompts, 488 rows".
+  - Cause (`prefill_b/multi.rs`): a prompt that shares cached KV blocks leaves the pass and prefills alone afterwards, unless `ATLAS_QWEN4EXP_PREFILL_MULTI_CACHED=1`. Every chat request shares the template's leading ~32 tokens (2 blocks: "Prefix cache hit: 32 tokens"), so on a warm server **no real request ever rides the pass**.
+  - GPU time: 2.29 s per 8-prompt "pass", the same as the wall. MoE prefill dominates: fused gate_up 1.87 ms + grouped 1.0 ms + w4a16 0.42 ms per layer per prompt.
+  - queue19 tests `MULTI_CACHED=1`.
+
+- **10-23 20:08. queue19, `MULTI_CACHED=1`: batching works.** ROWINV + MULTI + MULTI_CACHED + CODISPATCH:
+
+  | | default | ROWINV only | **+MULTI+MULTI_CACHED+CODISPATCH** |
+  |---|---|---|---|
+  | 8-prompt prefill pass | n/a (serial) | 2.3 s (ejected → serial) | **0.61 s** |
+  | burst 8, max_tokens 1 | n/a | 2.35 s | **0.65 s** |
+  | burst 8, max_tokens 16 | 6.1 s | 5.18 s | **3.45 s** (−43%) |
+  | burst 4, max_tokens 16 | ~3.1 s | 2.66 s | **1.89 s** |
+
+  The 8-prompt pass costs about 2.3× a single short prefill, not 8×. So once the prompts really share a forward, the weights are streamed once. The bandwidth reading holds for the pass; the earlier "doesn't amortise" was the ejection.
+- **10-23 20:10. queue20 launched:** gate of this profile on r1short (the recipe profile): agentic 50 (prefix cache on), then BFCL ST-995. Label `nq-fp4l-multiprofile-d2d114c02`. Default reference: BFCL 87.44 / 87.32; agentic 50/50 at 12.43 s/turn.
+
+## 2026-10-23 21:45 UTC — queue20 gate: multi profile loses warm-turn prefix reuse
+
+Profile `ROWINV + MULTI + MULTI_CACHED + CODISPATCH` (r1short, prefix cache on), agentic-webserver 50:
+
+| run | webserver_ok | s/turn | turns | agentic TTFT median / p90 (first 380 reqs) | decode med tok/s |
+|---|---|---|---|---|---|
+| default (`nq-fp4l-main`) | 50/50 | 12.43 | 379 | 632 / 3010 ms | 25.6 |
+| J-profile | 50/50 | 12.12 | 370 | — | — |
+| multi profile (queue20) | 50/50 | **13.97** | 354 | **3062 / 3423 ms** | 25.5 |
+
+Decode is unchanged, so the +12% s/turn comes entirely from TTFT. The serve log shows **0** SSM
+checkpoint saves and **0** Marconi intermediate hits (default: 1338 saves, 299 hits). Every warm
+turn logs "Prefix cache hit … but no SSM snapshot — recomputing all KV".
+
+Cause (code, d2d114c0): `prefill_b.rs` sets `split_disabled = tail_split_disabled() || rowinv::on()`,
+because a 16-token block-grid cut is off ROWINV's 64-token GDN grid. The comment says so outright:
+"without the in-pass checkpoint the last chunk stays whole". The tail checkpoints therefore never
+land. `pc_policy` restores under ROWINV also need `snap_tok % 64 == 0`. The intended pairing is
+`ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT=1`, which places the in-pass checkpoint on the 64 grid
+(`qwen4exp_pass_points`). queue20 was missing it. This is a config error, not an engine bug. It is
+still a trap: ROWINV alone silently turns the agentic prefix cache into a no-op, and nothing warns.
+
+I stopped queue20's BFCL leg at 21:42 because that profile is already disqualified. queue21
+re-gates the profile with `+ ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT=1` (label `nq-fp4l-multickpt-d2d114c02`).
+Follow-up worth a PR: WARN at boot when ROWINV is on, the prefix cache is on and MIDCHUNK_CKPT is off.
+
+## 2026-10-23 22:56 UTC — queue21 agentic: multi profile + MIDCHUNK_CKPT passes, fastest so far
+
+Profile `ROWINV + MULTI + MULTI_CACHED + CODISPATCH + MIDCHUNK_CKPT` (r1short, prefix cache on), agentic-webserver 50:
+
+| run | webserver_ok | followed | s/turn | turns | TTFT median / p90 | Σ TTFT | decode med tok/s |
+|---|---|---|---|---|---|---|---|
+| default | 50/50 | 50/50 | 12.43 | 379 | 632 / 3010 ms | 428 s | 25.6 |
+| J-profile | 50/50 | 50/50 | 12.12 | 370 | — | — | — |
+| multi, no ckpt (q20) | 50/50 | 50/50 | 13.97 | 354 | 3062 / 3423 ms | 1079 s | 25.5 |
+| **multi + MIDCHUNK_CKPT (q21)** | **50/50** | **50/50** | **11.76** | 357 | **510 / 2252 ms** | **284 s** | 25.4 |
+
+Checkpoint resumes are back: 307 intermediate hits, 49 "no SSM snapshot" (q20: 0 / 384). s/turn is −5.4% vs the
+default and Σ TTFT −34%. At C=1 the agentic soak never issues a multi pass, so this gain comes from ROWINV's
+cheaper short prefill and the in-pass checkpoint. Multi batching only adds to it under bursts (−43% on the
+8-prompt burst, queue19). BFCL ST-995 started 22:56.
+
+## 2026-10-24 01:50 UTC — queue21 BFCL ST-995: multi + MIDCHUNK_CKPT within noise
+
+| subset (n) | default | J-profile | multi+ckpt | Δ vs default |
+|---|---|---|---|---|
+| **overall** | 87.44 | 87.64 | **87.34** | −0.10 |
+| **normalized single-turn** | 87.32 | 87.38 | **86.50** | −0.82 |
+| irrelevance (24; 1 item = 4.17) | 95.83 | 95.83 | 91.67 | −1 item |
+| live_irrelevance | 90.91 | 89.77 | 89.77 | −1 item |
+| live_parallel (16; 1 item = 6.25) | 81.25 | 68.75 | 75.00 | −1 item |
+| live_parallel_multiple (12) | 66.67 | 66.67 | 75.00 | +1 item |
+| simple_javascript (31) | 70.97 | 77.42 | 67.74 | −1 item |
+| multiple | 91.13 | 93.55 | 92.74 | +2 items |
+| live / non_live category | 82.94 / 85.65 | 82.94 / 86.39 | 82.94 / 85.85 | 0 / +0.20 |
+
+The normalized drop is a one-item swing in each of a few small subsets. The J-profile, already accepted
+as neutral, swings just as much (live_parallel −2 items). Multi passes: 0, as expected, because r1short
+runs one sequence. ROWINV changes prefill numerics, so the greedy output differs on some prompts, as with
+the J-profile.
+
+**Verdict:** the profile `ATLAS_QWEN4EXP_PREFILL_ROWINV=1 ATLAS_QWEN4EXP_PREFILL_MULTI=1
+ATLAS_QWEN4EXP_PREFILL_MULTI_CACHED=1 ATLAS_PREFILL_CODISPATCH=1 ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT=1`
+passes both gates the owner cares about. Agentic is 50/50 at 11.76 s/turn (−5.4%), BFCL is neutral, and a
+burst of 8 short requests takes 3.45 s instead of 6.1 s (−43%). MIDCHUNK_CKPT is mandatory with ROWINV
+(see the 21:45 entry).
+
+## 2026-10-24 — PR #210: WARN for ROWINV without MIDCHUNK_CKPT
+
+Branch `fix/rowinv-needs-midchunk-ckpt` (1d51b6db, from main 504063ad). `pc_policy::rowinv_tail_unsplit` warns once at the tail-split site. fmt, clippy -D warnings and the pc_policy tests (11) pass. Live check (queue22): ROWINV alone → 1 warning, 0 intermediate hits; with MIDCHUNK_CKPT → 0 warnings, 1 hit.
+
+## 2026-10-24 02:10 UTC — queue23: concurrency with the gated multi+ckpt profile (r2, prod_probe_hol)
+
+| r2 probe | default (P3) | multi+ckpt | multi+ckpt + decode-share k=8 (wt-dshare 16b73e22) |
+|---|---|---|---|
+| 6 shorts behind 20.6K long | 18.2 s | 16.8–16.9 s | **7.3 s (3) / 13.0 s (3)** |
+| long prompt | 18.7 s | 17.4 s | 17.2 s |
+| C=2 shorts | 1.60 s | 1.22 s | 1.22 s |
+| C=4 shorts | 2.95 s | **1.88 s** | 1.88 s |
+| C=8 shorts | 5.65 s | **3.31 s** (−41%) | 3.34 s |
+
+- **The profile alone** cuts concurrent short-request latency 24–41%, because the shorts now share one prefill pass. Head-of-line blocking stays essentially unchanged, since the long prefill's chunks still serialize decodes.
+- **With decode-share added**, the shorts complete in two waves of 3, which is the multi pass grouping arrivals. The long prompt pays nothing (17.2 vs 17.4 s); on the default profile it paid +0.4–1.3 s. Uncontended C=N is unchanged.
+- The two levers stack. decode-share is still a fixed k; a time-based release (hold until about X ms of decode has run since the last chunk) would remove the step-count tuning. That's next on the prototype.
+
+## 2026-10-24 02:50 UTC — time-based decode share tried and dropped (queue24–27)
+
+`ATLAS_DECODE_SHARE_PCT=p` held each continued chunk until decoding had had p% of the wall time since the
+last chunk, so the hold would scale with chunk cost instead of a step count. On the gated multi+ckpt profile
+(r2, 6 shorts behind a 20.6K prompt):
+
+| setting | shorts | long |
+|---|---|---|
+| k=8 (step count) | **7.3 s (3) / 13.0 s (3)** | 17.2 s |
+| pct 20 / 33 / 50 (v1) | 16.0 / 13.0 / 12.8 s | 17.1–17.3 s |
+| pct 33 / 50, idle tick timed from its start | 12.8 / 13.6 s | 17.2 / 17.9 s |
+| pct 33 / 50, longest idle tick | 12.8 / 14.1 s | 17.2 / 18.5 s |
+
+The debug trace (queue27) shows why none of these held the first window. In the tick after the long
+prompt's inline first chunk, the release goes to the short prompts' batched prefill (`prefill_multi` runs in
+the continue phase), not to a long chunk. Decode was therefore owed 0.46 s (that pass) instead of 5.2 s
+(the chunk), and the next 5.5 s long chunk went through after about 2 decode steps. From the second window
+on, the hold was right (owed 5547 ms, held until wave 1 finished), but by then wave 1 had already waited one
+chunk. Fixing this needs a timing hook where the first chunk runs (`phase_start_prefills`), and that buys
+nothing over k=8, which already gives decoders about 2 s per chunk on this model. Dropped and reverted on
+`perf/decode-steps-per-chunk` (b0c452fb). The tree is byte-identical to the k-only 16b73e22, and the binary
+is rebuilt from it.
+
+## 2026-10-24 06:57 UTC — queue28 gate (collected 10-27): decode-share k=8 on the multi+ckpt profile passes
+
+The session that launched queue28 ended at 04:02 UTC (API error) before the result arrived. Recovered from sparky
+`~/code/q10h/queue28.log` on 10-27. Binary `~/code/wt-dshare` b0c452fb (d2d114c02 + `ATLAS_DECODE_STEPS_PER_CHUNK`),
+r1short, PLE cache 2 GB, prefix cache on, NQENV = multi+ckpt profile + `ATLAS_DECODE_STEPS_PER_CHUNK=8`.
+
+| run | agentic 50 | s/turn | turns | intermediate hits / no-snapshot | BFCL ST-995 | run ids |
+|---|---|---|---|---|---|---|
+| default (main + HIP fix) | 50/50, 50/50 | 12.43 | 379 | 299 / — | 87.44 / 87.32 | run-1792654228906033074, run-1792664799374893012 |
+| multi+ckpt (q21) | 50/50, 50/50 | 11.76 | 357 | 307 / 49 | 87.34 / 86.50 | run-1792796159549090251, run-1792806584366445361 |
+| **multi+ckpt + dshare k=8 (q28)** | **50/50, 50/50** | **11.74** | 350 | 300 / 49 | **87.34 / 86.50** | run-1792814374289258605, run-1792825067944442327 |
+
+r1short serves one sequence, so decode-share should be inert here (it only holds a chunk while other sequences
+decode). q28 matches q21 on BFCL exactly and on agentic within one sample. This is the no-regression gate, not a
+speed claim. Multi passes: 0 (expected at one sequence). Open: q21/q28 normalized 86.50 sits below the committed
+FP4-Local bfcl-subset floor 86.92. The previous session called it a one-item swing per small subset. That is not yet
+established with repeats; it matters if recipe #21 adopts this profile.
+
+## 2026-10-27 — overnight plan (owner-approved), resumed after a 3-day gap
+
+Owner decisions (10-27 ~06:00 UTC):
+- **Merge train.** Verified PRs merge as ONE integration train once it passes the gate: `integ/train-2026-10-27` =
+  main 504063ad4 + #191 #192 #204 #196 #205 #206 #207 #208 #210 (each `--no-ff`). Gate on sparky: control 4/4 vs
+  main, then agentic 50 + BFCL ST-995 on the default recipe profile. Pass = 50/50 + 50/50, s/turn in line with
+  main's 12.34–12.49, BFCL ≥ the committed floors 87.04 / 86.92, no panics.
+- **Recipe #21.** Gate the best single-GB10 profile (multi+ckpt + `ATLAS_QWEN4EXP_PC_BRANCH=1`) on the train binary.
+  If it passes, update #21's env, pin its container to a ghcr sha that contains #195 + the train, and fix the `\"`
+  quoting. The owner merges #21.
+- **Night focus after the gates:** S7 MoE verify-row dedup (decode speed) on the GPU, with the repo-wide cargo-deny
+  red investigated CPU-side in parallel.
+- New PR: decode-share (`ATLAS_DECODE_STEPS_PER_CHUNK`), with a knob-off identity control and an n=3 HOL A/B.
+
+Box-side engine: the nightq runner on sparky (`~/code/nightq/queue/*.sh`, one job at a time, per-job TIMEOUT, cron
+health check every 5 min with stall kill), re-armed 10-27. Queue: 10-train-gate → 20-dshare-hol → 30-combo-gate →
+90/91 agentic repeats (run-to-run variance for the s/turn comparisons above). Mac mirror:
+`~/code/fp4local-night/` (STATUS.md, RESULTS.md, perf/) every 15 min.
+
+## 2026-10-27 06:00–06:45 UTC — queue29 checks, train + decode-share PRs opened, runner live
+
+**queue29** (sparky, r1short, PLE 2 GB; log `~/code/q10h/queue29.log`):
+- Decode-share knob OFF = unchanged: 4-request T=0 control identical between d2d114c02 (main + #204) and b0c452fb
+  (same + the knob), 4/4.
+- PC_BRANCH engages under ROWINV. Long-question shared-preamble probe, binary b0c452fb. P = multi+ckpt + k=8:
+
+  | conv | P (C0) TTFT | P + `ATLAS_QWEN4EXP_PC_BRANCH=1` (C1) TTFT |
+  |---|---|---|
+  | 0 (cold) | 2659 ms | 2659 ms |
+  | 1 | 2534 ms | 2507 ms (branch checkpoint planned) |
+  | 2–5 | 2512–2527 ms (5× "no SSM snapshot") | **720–734 ms** (4× Marconi SSM cache hit) |
+
+  Outputs C1 == C0 on conv2–5, 4/4. The feared `snap_tok % 64` decline doesn't happen: the planned point sits on
+  the pass granule (pc_policy.rs `is_multiple_of(PASS_GRANULE)`). One sample per conv, so TTFT is indicative. The
+  ~3.5× matches J2 (735–782 ms) without ROWINV.
+
+**PRs:**
+- #210 updated → d221f72fe: @maplepaladin73's truth-table + warn-once tests, applied verbatim, co-authored.
+  `rowinv` 3 passed, `pc_policy` 13 passed.
+- **#212 integration train** `integ/train-2026-10-27` c3bf9aa25 = main + #191 #192 #204 #196 #205 #206 #207 #208
+  #210 (`--no-ff`). Zero conflicts; prefill_b.rs 499 lines. sparky tests: spark-server bin 2731, spark-model lib
+  1875, spark-storage keepalive 3, all passed. Comment on every constituent PR + #172 + #180.
+- **#213 decode-share** `perf/decode-steps-per-chunk` e05c6c325 (one commit on main; scheduler only). Draft until the
+  n=3 HOL A/B (job 20) reports.
+- **#211** this log, as a draft docs PR.
+
+**Runner** re-armed (pid 3007477, ARMED = current boot). Queue: 10-train-gate (started 06:25:55; builds c3bf9aa25 in
+`~/code/wt-train-1027`, control vs d2d114c02, #196 Nemotron smoke, agentic 50, BFCL) → 20-dshare-hol (builds
+e05c6c325; 3 alternating off/k=8 pairs, r2) → 30-combo-gate (train binary, multi+ckpt + PC_BRANCH, r1short; the
+recipe #21 candidate) → 90/91 agentic repeats (default / combo).
+
+## 2026-10-27 07:00–07:30 UTC — train gate legs 1–2 pass; cargo-deny fix #215; S7 + #208 jobs queued
+
+**#212 train gate (job 10), legs 1–2:**
+- Control (default r1short): byte-identical to main + #204 (d2d114c02).
+- #196 smoke on NVIDIA Nemotron-3.5-Super-VL-120B-A12B-NVFP4: marker classes resolved from the served tokenizer;
+  both tool-repro cases finish `tool_calls` at 3,240 completion tokens (past the old 1024-token cut); 0
+  `tool_envelope_stuck`.
+- Agentic leg started 06:35:32, then BFCL (~3 h).
+
+**#215 cargo deny** (lockfile only). The action image pins cargo-deny 0.20.2, reproduced locally. The red is the
+three advisories: webpki-roots 1.0.6 → 1.0.10 (RUSTSEC-2026-0381), rustls-webpki → 0.103.16 (-0382), tokio
+1.52.3 → 1.53.3 (-0386 `AsyncFd` unsound; no patched 1.52.x exists). Every fixed version is ≥ 7 days old. The 14
+`bug[unresolved-workspace-dependency]` lines are a 0.20.2 quirk on `{ workspace = true }` path deps and non-fatal
+(bans/licenses/sources ok). No ignores; deny.toml untouched. tokio is the runtime, so #215 gets a GB10 gate in the
+next train.
+
+**S7 (MoE verify-row dedup):**
+- 8aa12c36c cherry-picks cleanly onto main (`perf/fp4l-moe-t-rows-dedup`). Correction to the 10-19 note: the
+  `_t_rows` kernels already stage through smem (double-buffered 16-byte loads, TILE_KH=64). The K=1 slowdown is the
+  per-row mask loop + the union launch; wiring uses rows ≥ 2 only.
+- Bench rework 944aa9fd1: cold rotation over 48 layer tables; routing to an exact union of 19/26/33 of 40 slots at
+  K=4 (the measured p10/mean/p90 for 4 rows × top-10). Note: the bench prints `union=26/40`, where 40 means slots,
+  not experts (FP4-Local has 512).
+- Job 15 = the microbench. Stage-2 gate, fixed now: every row byte-identical; K=4 union 26 ≤ 0.80× the time of 4
+  single-row launches; K=2/3 ≤ 1.00×.
+- Job 25 (self-deciding on job 15's lines): wiring in `forward_rows_t.rs` on the train tip; in-situ byte identity
+  (control, EXACT_VERIFY_CHECK = 0 rows, NVFP4 control); 3 alternating speed pairs (ab_stream + decode_probe).
+
+**#208 live repro (job 16).** Reachability is traced in source. Two-phase needs `len > max_prefill_tokens` with no
+active decode; `proc_count == 0` needs a block-aligned prompt with a snapshot at exactly its length. Only the
+chunked path's `[chunk]` save stashes the hidden, so the cold send runs beside a decoy decode with
+`ATLAS_HOLO_ALWAYS_MIXED=1`, and the warm identical send runs alone. Serve: `MAX_PREFILL=4096
+ATLAS_MAX_BATCH_TOKENS=8192`, r2. A/B: d2d114c02 (pre-fix) vs the train binary. `reasoning_effort: none` so
+content is compared, not two empty strings.
+
+**Queue order** (renamed so the recipe gate runs earlier): 10 → 15 → 16 → 18-combo-gate → 20-dshare-hol →
+25-s7-gates → 90/91.
+
+## 2026-10-27 07:56 UTC — #212 train gate, agentic leg: 50/50, 50/50, 12.60 s/turn
+
+run-1793087766586885957, train c3bf9aa25, default r1short, 380 turns, Σwall 4,833 s, harness decode 22.06 tok/s.
+Main + #204 (run-1792654228906033074): 12.43 s/turn, 379 turns, Σwall 4,762 s, 21.98 tok/s, TTFT p50/p90 631/3,000 ms,
+Σ TTFT 428 s. Train: TTFT p50/p90 648/3,017 ms, Σ TTFT 433 s. Server decode and TTFT agree within ~1–3%. The +71 s
+Σwall is ~5 s TTFT; the rest is one extra turn plus harness-side time. Single run per arm: observation, not a
+regression verdict. Job 90 repeats this binary. BFCL running.
+
+## 2026-10-27 10:51–11:10 UTC — #212 train MERGED (da7985ca4); train 2 = #217; S7 kernels miss the gate
+
+**#212 gate, final:** BFCL ST-995 **87.44 / 87.32** (run-1793098282379875687), identical to main on all 15 subsets.
+Agentic 50/50, 50/50, 12.60 s/turn (run-1793087766586885957). Control byte-identical; Nemotron #196 smoke 2/2;
+serve log 0 ERROR / 0 panic. CI: only the repo-wide PR-benchmark-gate + cargo-deny reds (kernel shadow green via
+#192). Merged with a merge commit as **da7985ca4**. #191 #192 #196 #204 #205 #206 #207 #208 #210 show MERGED;
+#172 auto-closed; #180 closed by hand.
+
+**Train 2 #217** (`integ/train-2026-10-27b` 32d6622a1) = da7985ca4 + #213 + #215, no conflicts. Gate = job 30
+(control, agentic 50, BFCL). #213 also needs job 20 (n=3 HOL A/B) before merging.
+
+**S7 job 15 (cold microbench, `~/code/nightq/logs/15-s7-bench.log`): byte-identical in every case, but slower in
+every case.** `union` = unique experts among rows × top-10 slots:
+
+| rows | union | K × single-row | `_t_rows` | ratio |
+|---|---|---|---|---|
+| 1 | 10 | 297 µs (93 GB/s) | 523 µs (58 GB/s) | 1.76 |
+| 2 | 19 | 589 µs | 1,031 µs | 1.75 |
+| 3 | 19 / 26 | 836 / 870 µs | 1,357 / 1,462 µs | 1.62 / 1.68 |
+| 4 | 19 / 26 / 33 | 1,090 / 1,135 / 1,156 µs | 1,662 / 1,715 / 1,908 µs | 1.53 / 1.51 / 1.65 |
+
+rows=1 reads the same bytes as the single-row kernel and is still 1.76× slower, so this is the kernel, not the
+dedup idea. Cause in source: the inner loop indexes `acc[r]` with a runtime `__ffs` row (local-memory accumulators,
+a data-dependent branch per byte) and reads A from global per row. Stage 1b (in progress): compile-time ROWS
+templates, all rows computed unconditionally with the mask applied only at the store (byte identity unchanged:
+same per-row expression and order), A staged in smem. Re-bench = job 19b. Job 25 skips itself until a bench
+passes the gate.
+
+**#208 repro, job 16: invalid run.** Calibration started at ~8.7K tokens and only padded upward, so it never entered
+(4096, 8192]. Fixed (steers toward ~6K) and re-queued as job 19.
+
+**Queue:** 18-combo-gate (running since 10:56) → 19-twophase-208 → 19b-s7-bench2 → 20-dshare-hol → 25-s7-gates →
+30-train2-gate → 40-recipe21-vet → 90/91.
+
+## 2026-10-27 15:02 UTC — combo profile gate (job 18): agentic win, BFCL below floor → recipe #21 gets the J profile
+
+Same binary c3bf9aa25 (= main da7985ca4 tree), r1short, only the env differs:
+
+| profile | BFCL ST-995 | agentic 50 | s/turn | turns | TTFT p50/p90 | Σ TTFT (380 req) | hits / nosnap / pcbranch |
+|---|---|---|---|---|---|---|---|
+| default (job 10) | 87.44 / 87.32 | 50/50, 50/50 | 12.60 | 380 | 648 / 3,018 ms | 433 s | 299 / 987 / 0 |
+| combo (job 18) | 87.34 / **86.50** | 50/50, 50/50 | **11.55** | 360 | **514 / 925 ms** | **218 s** | 477 / 868 / 11 |
+
+Run ids: job 18 agentic + BFCL run-1793113303376550894; job 10 run-1793087766586885957 / run-1793098282379875687.
+Every ROWINV profile now lands on exactly 87.34 / 86.50 on three binaries (q21 d2d114c02, q28 b0c452fb, job 18
+c3bf9aa25). That is a deterministic output change from ROWINV numerics. Normalized 86.50 < the committed floor
+86.92, so the pre-set criterion fails. The J profile (MIDCHUNK + PC_BRANCH, no ROWINV; 10-23, d2d114c02) scored
+87.64 / 87.38 with agentic 50/50 at 12.12 s/turn. **Recipe #21 → J profile + container sha-da7985c**
+(sparkrun-recipes local commit 66b5fb0, not pushed). Vet through sparkrun on that image = job 22.
+
+**S7 job 19b (ROWS templates + smem A):** rows=1 1.01× (was 1.76×), so the local-memory accumulator was the K=1
+cost. Multi-row is still slower: rows=2 1.11×, rows=3 1.03 / 1.31×, rows=4 1.13 / 1.40 / 1.68× at union 19 / 26 / 33
+of 40 slots. Every case byte-identical. Per-expert time roughly doubles from 1 to 4 rows (28 → 59 µs), so the kernel
+is now instruction/latency-bound in the per-row inner loop, not bandwidth-bound. Gate not met; job 25 skips again.
+
+## 2026-10-27 15:10–16:30 UTC — decode-share confirmed at n=3; OOM incident; S7 V1 progress; #208 repro still unreached
+
+**#213 decode-share, job 20 (head e05c6c325, r2, multi+ckpt env, 3 alternating fresh-boot pairs):** 6 shorts behind a
+20.6K prompt: off 16.70–17.23 s; k=8 first wave 7.24–7.79 s, second wave 12.94–13.49 s. Long prompt: off 17.4 / 17.5 /
+17.7 s, k=8 17.6 / 17.7 / 17.2 s. C=8 burst 3.31–3.32 s in both arms. Posted on #213; marked ready; rides train 2 #217.
+
+**OOM on sparky at 15:35:41.** The OOM killer took tailscaled, fwupd and user-slice processes. The tmux server went
+with them, so the runner and mem watchdog died; the health cron restarted both within the minute, and the runner moved
+on to job 22. Cause: `moe_t_rows_bench.rs` allocates ~5.3 GB of expert tables per case and never frees them. The
+variant run (job 21) reached ~20 cases ≈ 106 GB. Fix in progress: allocate once, plus a MemAvailable ≥ 20 GB guard.
+Lesson: every GPU microbench needs a memory guard; the runner only protects against overlapping jobs, not leaks.
+
+**S7 job 21 (partial, up to the OOM), ratio = `_t_rows` / K × single-row, cold:**
+
+| variant | rows=2 u19 | rows=3 u19 / u26 | rows=4 u19 / u26 / u33 | identical |
+|---|---|---|---|---|
+| v0 (ROWS templates, smem A) | 1.10 | 1.03 / 1.25 | 1.13 / 1.37 / 1.69 | yes |
+| v1 (+ 16-byte A loads) | 1.07 | 0.97 / 1.20 | 0.97 / 1.20 / 1.48 | yes |
+| v2_b64 (64 columns per CTA) | 0.93 | 0.94 / 1.22 | 0.97 / 1.19 | **no** (indexing bug) |
+
+The gate (rows=4 u26 ≤ 0.80) is still unmet. Next: fix or drop V2; V4 = 2 or 4 output columns per thread (A reused
+across columns, independent accumulator chains, each column's k-order unchanged).
+
+**#208, job 21b (`ATLAS_MARCONI_EXACT=1`):** main and train give the same cold and the same warm output, so the
+full-hit path probably still wasn't reached. Log analysis pending; no further attempt queued.
+
+**Job 22** (recipe #21 J profile via sparkrun on ghcr sha-da7985c) running since 15:35.
+
+## 2026-10-27 16:27 UTC — recipe vet (job 22) stopped as invalid; re-queued as job 26
+
+Job 22 served the WRONG env and its agentic leg never ran:
+- The job called `make_recipe.py <yaml> <img>`, but that script's signature is `<out.yaml> <tag>`. It rendered its own
+  7-var template over `~/code/q10h/recipe21-fp4l.yaml`, and the container served 7 ATLAS_ vars, not the J profile's 9
+  (`RECIPE ENV COUNT: 7`).
+- The agentic bench ran without `~/.cargo/env`: `elapsed_s` 1, no metrics. The job went on to BFCL anyway.
+
+I killed it by process group at 16:27 (runner: FAILED rc=143), ran `sparkrun stop --all`, and memory was back to 116 GB.
+The YAML on sparky is restored from sparkrun-recipes 66b5fb0 (9 vars) and set read-only. The re-queued vet (job 26,
+output `nq-recipe21-vet2`) copies the YAML verbatim, asserts the container env equals the YAML's 9 keys before any
+benchmark, and aborts if agentic yields no metrics. The smoke from the invalid run (tool call OK, needle) is not
+counted. The invalid run's artifacts stay in `~/code/perf/nq-recipe21-vet/` as a record.
+#208: live-repro notes posted on the PR; no further GPU time.
+
+## 2026-10-27 16:29 UTC — S7 bench4 (job 23): v3_b128 at 0.818×, byte-identical; v4 fixed and re-queued
+
+The leak fix held (MemAvailable 116 GB at start, full 64-case run). Gate case rows=4 union=26 of 40 slots, ratio vs
+4 single-row launches (cold):
+
+| v0 | v1 | v2_b64 | v2_b128 | v3_b64 | v3_b128 | v4 | v4c4 |
+|---|---|---|---|---|---|---|---|
+| 1.386 | 1.124 | 1.020 | 0.906 | 0.917 | **0.818** | 0.828 ✗ | 0.800 ✗ |
+
+✗ = not byte-identical. The V2 stride fix made v2/v3 identical everywhere. v4's staging copied BS bytes per k-row while
+COLS > 1 spans BS×COLS columns; fixed in 1415284c1 and re-benched as job 24. The gate stays at ≤ 0.80 (pre-set), so
+job 25 printed `S7 GATE NOT MET`. ptxas: 56–96 registers, 64-byte stack frames on the COLS variants, 9–32 KB smem, no
+spills flagged. A self-deciding job 24b (after 24) wires whichever variant passes (v4c4 → v4 → v3_b128 preference)
+and runs the in-situ legs (control, EXACT_VERIFY_CHECK, NVFP4 control, 3 speed pairs).
+
+## 2026-10-27 16:30–16:40 UTC — job 24 (v4 fixed): v3_b128 still best at 0.821×; jobs 26/30 script bugs fixed; queue reordered
+
+**Job 24 bench5 (all identical after the COLW fix), rows=4 union=26:** v3_b128 0.821, v2_b128 0.921, v3_b64 0.948,
+v4 1.222, v4c4 2.319. The COLS=4 variant spills: ptxas reported 64-byte stack frames, and it is 2.3–2.8× slower
+everywhere. Job 24b: `S7 GATE NOT MET`. v3_b128 = 0.818 / 0.821 over two runs, just over the pre-set 0.80. The gate
+stays. Next: one exploratory in-situ run of v3_b128 (job 31, labelled exploratory, not a gate pass) and one more
+variant bench (job 27: BS=256, occupancy, wider scale staging).
+
+**Script failures, fixed by me:**
+- Job 30 (train 2): `cargo build --release -p spark`, and no package is named `spark` (same bug as job 14). Fixed to a
+  plain workspace build.
+- Job 26 (recipe vet 2): the env assertion grepped `ATLAS_*` from the whole YAML, including a comment that names
+  ROWINV, so it reported a false "missing" var. The container actually had exactly the 9 recipe vars. Now parsed from the
+  YAML `env:` mapping; output `nq-recipe21-vet3`.
+
+Job 90 (filler) was killed 2 min in so the deliverables run first, then re-queued. Queue: 26 (running since 16:37)
+→ 27-s7-bench6 → 30-train2-gate → 31-s7-insitu-v3b128 → 90 → 91.
+
+## 2026-10-27 18:20 UTC — S7 v3_b256 MEETS the microbench gate; recipe vet killed by the stall watchdog, re-queued
+
+**Job 27 bench6** (80 cases, all byte-identical): rows=4 union=26 **v3_b256 0.764×** (v3_b128 0.829, v3lb_b128 0.818,
+v3_b64 0.902). v3_b256 also: rows=2 0.908, rows=3 0.791 / 0.814, so every pre-set condition is met. Scale staging was
+already 16-byte; the launch-bounds variant gave no extra gain. Next: a clean PR branch `perf/fp4l-moe-verify-dedup` with
+ONLY the union kernel + v3_b256 rows kernels + wiring (no variant zoo). Job 30b gates exactly that branch: slim bench
+identity guard, then control vs job 10, EXACT_VERIFY_CHECK = 0 mismatches with the arm engaged, NVFP4 control, 3
+alternating speed pairs vs the train binary. The exploratory v3_b128 run is superseded.
+
+**Job 26 (recipe vet 3):** env check passed (9/9 recipe vars in the container), control 4/4, tool call OK, needle PASS.
+Then health.sh's 75-min stall check killed it mid-agentic: the container's serve log isn't under `$NQ/logs`, so health
+saw no progress. No metrics were produced. Re-queued as job 30c with `docker logs -f` into `$NQ/logs` (keepalive +
+TTFT source). Queue: 30-train2-gate (running since 17:58) → 30b-s7-gate-v3b256 → 30c-recipe21-vet → 90 → 91.
+
+## 2026-10-27 19:21 UTC — train 2 (#217) gate: control identical, agentic 50/50 at 12.43 s/turn; clean S7 branch verified
+
+Job 30 (32d6622a1 = da7985ca4 + #213 + #215 with the tokio 1.53.3 runtime bump): control byte-identical to train 1;
+agentic 50/50, 50/50, 12.43 s/turn, 381 turns, 22.05 tok/s (run-1793128886445013968). Default-profile s/turn so far:
+12.43 (main), 12.34 (#205+#206), 12.60 (train 1), 12.43 (train 2), roughly a ±1.1% spread across builds. BFCL running.
+
+Clean S7 branch `perf/fp4l-moe-verify-dedup` 87b28ea0f (on da7985ca4, 13 files, all S7). The kernel diff vs bench6's
+8edc3c383 only removes the variant instantiations and adds the `<R,256,1,true>` ship macro (ROWS 2..8); the impl
+template bodies are unchanged, so it ships the code job 27 measured. Union + rows lookups are `try_kernel_gated`. Job
+30b gates this tip (slim-bench identity/ratio guard, then the in-situ legs).
+
+Note: main moved to 8863dc5e5 (the AMD session merged #197, #187, #188). #217 and the S7 branch will need a merge or
+rebase onto it; no file overlap expected.
+
+## 2026-10-27 22:18–23:15 UTC — train 2 MERGED (b7af7fa81); S7 passes in situ, +4.5% decode, byte-identical → PR #219
+
+**#217 train 2 gate, final:** BFCL ST-995 **87.44 / 87.32** (run-1793139494136338474), identical to train 1 on every
+subset; agentic 50/50, 50/50, 12.43 s/turn (run-1793128886445013968); control identical; 0 ERROR/panic. Merged as
+**b7af7fa81**, so #213 (decode-share) and #215 (cargo-deny lockfile; `cargo deny` now green) are on main.
+
+**S7 v3_b256 in situ (job 30b, clean branch 87b28ea0f vs base c3bf9aa25, default r1short, MTP 3):**
+- control byte-identical; EXACT_VERIFY_CHECK **0 mismatches** with the arm engaged; NVFP4 control identical.
+- 3 alternating fresh-boot pairs, ab_stream fixed prompts, identical completion lengths in both arms:
+  short medians 25.98 → **27.20** tok/s (n=9), agent (~17K-token prompt) 23.41 → **24.46** tok/s (n=9). Per prompt:
+  +4.0% to +4.7%. Within-arm spread ≤ 0.1 tok/s.
+- That's about +4.5% decode, below what the microbench ratio implied, because only the verify-row part of routed
+  gate_up/silu_down (~13 of ~30 ms/token in the 10-19 profile) is affected.
+- PR **#219** opened. Its merge-with-main GB10 gate (`refs/pull/219/merge`: control, agentic 50, BFCL) is queued as job 35.
+
+**Job 30c (recipe vet 4):** env 9/9, control 4/4, tool call OK. `docker logs -f` produced an EMPTY file: the
+container's spark output doesn't go to container stdout, so the 75-min stall check would have killed it again. Added
+an external heartbeat (`~/code/q10h/vet4-heartbeat.sh`) that appends container-up + `atlas_requests_total` to
+`$NQ/logs/nq-recipe21-vet4.serve.log` every 4 min while the job runs. Lesson for container jobs: the runner's stall
+detector needs a host-side progress line.
+
+Also fixed: job 30's BFCL marker never printed (`bfcl_res.py` called without its TAG argument); fixed in job 35.
+Queue: 30c (running since 23:08) → 35-s7pr-gate → 90 → 91.
+
+## 2026-10-28 03:21 UTC — recipe #21 vetted through sparkrun and pushed (66b5fb0)
+
+Job 30c, sparkrun on ghcr sha-da7985c (image sha256:63f2e1e1c091…, revision label da7985c), J-profile recipe:
+- env 9/9 asserted against the YAML keys; control 4/4; tool call OK; needle PASS.
+- agentic 50/50, 50/50, **12.28 s/turn** (run-1793147348923138592).
+- BFCL ST-995 **87.84 / 87.48** (run-1793157682433576890), above the 87.04 / 86.92 floors. References: J profile bare metal 87.64 / 87.38; main default 87.44 / 87.32.
+- Container stopped, MemAvailable back to 118 GB.
+
+Pushed to sparkrun-recipes `recipe/qwen38-flash-next-fp4-local` (fast-forward 2cbe348 → 66b5fb0) and commented on #21.
+The owner merges. Job 35 (#219 merge gate) started at 03:21.
+
+## 2026-10-28 04:41 UTC — #219 merge gate agentic: 11.99 s/turn (main 12.43); next = decode re-profile
+
+Job 35 (`refs/pull/219/merge` 949fa6b72 = #219 on main b7af7fa81): control byte-identical; agentic 50/50, 50/50,
+**11.99 s/turn**, harness decode 22.92 tok/s (run-1793162479652381763). Train 2 / main tree: 12.43 s/turn, 22.05 tok/s.
+Single run per arm, consistent with the fixed-prompt +4.5%. BFCL running.
+
+Next iteration, queued as job 36: nsys decode profile, main vs main + S7, top-20 kernels per generated token, idle gaps,
+achieved GB/s. Code recon so far:
+- `mxfp8_proj_batchm` already batches all verify rows into one launch (`qwen3_ssm/exact_rows.rs:43`), so the S7
+  dedup idea doesn't transfer; any win there has to come from inside that kernel.
+- No CUDA graphs on this path: zero "graph" lines in any FP4-Local r1short serve log, so decode/verify runs fully
+  eager. If job 36 shows idle gaps large, the next task is finding qwen4_exp's capture gate.
+
+## 2026-10-28 05:30 UTC — 12.5 h of queued work on sparky; S7 exactness check must be re-run non-vacuously
+
+Owner asked for 12 h of unattended iteration. Queue (runner + health cron, every job self-contained):
+35 (#219 merge gate, BFCL leg) → 36 nsys decode profile (main vs main + S7) → **37 S7 exactness** → 38 long context
+32K–240K (main vs S7) → 39 NVFP4-pack engagement + speed → 40/41/42 agentic 50 on main + S7 (default / J recipe
+profile / ROWINV combo) → 90/91 agentic repeats on train 1 (variance). Expected to finish around 18:00 UTC.
+
+**Correction to the job-30b exactness claim.** The 30b EXACT_VERIFY_CHECK run (160 tokens, ~55 verify steps) printed
+only the "armed" line. The summary line prints every `SUMMARY_EVERY` steps (`exact_verify_check.rs` ~276), and the
+old counter greps for "differ", which also matches "0 rows differ". Zero per-row differ warnings is consistent with
+exactness, but with no summary line it isn't a positive proof that steps were checked. Job 37 fixes that:
+- r1short with EXACT_VERIFY_CHECK at 800 tokens;
+- r2 at C=4 and C=8 with BATCH_FAST_CHECK + EXACT_VERIFY_CHECK (multi-sequence rows also reach `forward_rows`);
+- PASS requires ≥ 1 summary line, every summary "0 rows differ", zero per-row warnings, and the arm engaged.
+#219 merges only after jobs 35 and 37 both pass.
+
+## 2026-10-28 05:45 UTC — unattended watchers armed (10+ h)
+
+| watcher | where | cadence | what it does |
+|---|---|---|---|
+| nightq runner | sparky tmux `nightq` | continuous | runs `~/code/nightq/queue/*.sh` one at a time, per-job TIMEOUT; currently 9 jobs ≈ 12.5 h |
+| health.sh | sparky cron */5 | 5 min | restarts a dead runner + mem watchdog (same boot only), kills a job with 75 min of no log progress, writes STATUS.md |
+| refill.sh | sparky cron */20 | 20 min | if the queue empties: queues one agentic-50 variance filler on the newest gated binary (max 4 a day). Stop: `~/code/q10h/REFILL_STOP` |
+| nightwatch.sh | Mac cron */10 | 10 min | every newly finished job → raw result lines posted as a PR comment (#219 for S7 jobs, else #211) + appended to `~/code/fp4local-night/AUTOLOG.md`; one-time alert on #211 if the runner is down, paused or idle. Never merges. Stop: `~/code/fp4local-night/NIGHTWATCH_STOP` |
+| rsync mirror | Mac cron */15 | 15 min | STATUS.md, RESULTS.md, runner.log, `perf/nq-*` → `~/code/fp4local-night/` |
+
+Merges stay with the lead session: #219 after jobs 35 (BFCL) and 37 (exactness) both pass.
+
+## 2026-10-28 07:00 UTC — owner: no re-runs, no unnecessary ablations → queue pruned
+
+Kept only jobs with a decision attached:
+- 35 (#219 merge gate, BFCL leg, running);
+- 36 (nsys decode profile, which picks the next lever);
+- 37 (S7 exactness: single-sequence + C=4/C=8 summary-line checks; merge-blocking for #219). Its C>1 throughput A/B was
+  removed.
+
+Parked, not deleted, in sparky `~/code/q10h/parked-20261028/`: 38 long context, 39 NVFP4 pack, 40/41/42 agentic
+profile stacking, 90/91 agentic repeats. `refill.sh` disabled (`~/code/q10h/REFILL_STOP`), since its fillers are
+re-runs. nightwatch keeps relaying results. After 37, the GPU stays idle until there is a new code change worth
+measuring.
+
+## 2026-10-28 07:30–08:10 UTC — #219 passes every gate; decode profile names the next lever; cap red inherited from main
+
+**#219 gates, all passed:**
+- Merge gate (job 35, 949fa6b72): BFCL **87.44 / 87.32** (run-1793172763024546566), all 15 subsets identical to main;
+  agentic 50/50, 50/50, **11.99 s/turn** (main 12.43); TTFT unchanged (p50 637 ms both).
+- Exactness (job 37), summary-line verdicts: single sequence 512 rows, C=4 1,468 rows, C=8 2,944 rows, all
+  **0 rows differ, 0 argmax flips**, with the arm engaged.
+- Smoke after the init.rs split (job 38b, 5b8350c50): control identical, engaged.
+
+**Merge blocked on the 500-LoC cap.** `moe/init.rs` is 510 lines on the PR merge ref because main's own init.rs is
+504 since #197 (AMD train, c3774309e). Main's cap check has been red since then. Fix in progress: merge main into
+#219 and move one existing cluster out of init.rs (target ≤ 495), then smoke (job 38c), then merge.
+
+**Decode profile (job 36, nsys, 3 × 1,024 tokens per arm, identical code-gen prompts, `reasoning_effort: none`;
+single capture per arm, so preliminary).** The export first raced the report write and I re-exported the captures
+offline. Per generated token:
+
+| | main | main + S7 |
+|---|---|---|
+| burst wall | 28.02 ms (35.7 tok/s) | 27.00 ms (37.0 tok/s) |
+| GPU busy / idle | 23.09 / 4.92 ms (17.6% idle) | 22.52 / 4.48 ms (16.6%) |
+| routed gate_up | 7.41 (`_t`) | 3.57 (`_t_rows`) |
+| routed silu_down | 3.28 (`_t`) | **6.55** (`_t_rows`) |
+| `mxfp8_proj_batchm` + `_gemv` | 3.32 + 1.40 | 3.90 + 0.23 (the separate shared expert now batches its rows) |
+| union | — | 0.31 |
+| LM head (`dense_gemv_bf16` + `_batchm`) | 1.65 + 1.25 | 1.70 + 1.28 |
+| hc_pre down + finish | 2.10 | 2.20 |
+
+**Next lever (S7.1):** `silu_down_t_rows` is ~2× slower than per-row on half of gate_up's bytes. In source, it recomputes
+`silu(g)·u` (2 × `__expf` + divide) per element, per row, in all 256 column threads. The single-row kernel computes
+`s_act` once per CTA into smem. A byte-exact fix (same expression, fp32 smem) is in development
+(`perf/fp4l-moe-verify-dedup-act`): microbench vs the current rows kernel in one job (39b), then a self-deciding in-situ
+job (39c). Upper bound if silu_down_rows reaches gate_up_rows' bytes-per-ms: about 4–5 ms/token (preliminary).
+Second lever: 4.5 ms/token of GPU idle, since this path captures no CUDA graphs.
+
+## 2026-10-28 08:10–08:40 UTC — #219 cap fixed (main merged, init.rs 491); vacuous bench gates found and fixed; S7.1 in situ
+
+- #219 @ 62554db05: main merged (no conflicts), and batched/token-major/atomic lookups moved to `init_batched.rs`
+  (pure move, `glm5_next` gating passed through). The workflow's cap loop shows 0 violations; CI's cap check is green.
+  Smoke (job 38c): control identical, engaged, 0 errors.
+- **Vacuous gates:** the #219 slim bench example called the unshipped `_r1_b256` kernel and crashed. Job 30b's
+  microbench guard and job 39b's S7.1 verdict both printed PASS with 0 parsed lines. #219's decision doesn't rest on
+  them (in-situ control, job 37 summary-line exactness and the job 35 BFCL did). Fixed: the example runs rows 2..4
+  (139efbd07), and every verdict now fails on 0 parsed lines or a non-zero bench exit. Job 40 is the first real slim-
+  bench run (#219 vs S7.1, one job).
+- S7.1 (`perf/fp4l-moe-verify-dedup-act`, 86c11d766: silu activation computed once per element per CTA in smem):
+  in-situ job 39c (control, EXACT_VERIFY_CHECK + BATCH_FAST_CHECK summary verdicts, 3 speed pairs vs #219) running
+  since 08:15. It started on the vacuous 39b PASS, but it's the decisive test anyway.
+
+## 2026-10-28 08:45–09:00 UTC — #219 MERGED (db442e2d4); S7.1 = +25% short / +10% agent decode, byte-identical → PR #228
+
+**S7.1 in situ (job 39c, 86c11d766 vs #219 139efbd07, default r1short, 3 alternating fresh-boot pairs, ab_stream fixed
+prompts, identical completion lengths):** control identical; EXACT_VERIFY_CHECK 512 rows and BATCH_FAST_CHECK C=4
+(4 summaries) both **0 rows differ**, engaged.
+- short: 27.76/27.72/27.75 → 34.87/34.92/34.92 (A), 27.27/27.28/27.30 → 34.22/34.20/34.30 (B), 26.62/26.57/26.65 →
+  33.52/33.41/33.58 (C). Medians 27.28 → **34.22 tok/s (+25.4%)**.
+- agent (~17K-token prompt): medians 24.52 → **27.06 tok/s (+10.4%)**.
+- Vs main before S7 (25.98 / 23.41 on the same prompts): about +32% short, +16% agent decode.
+
+**Microbench (job 40, the first real slim-bench run; parsed-line counts printed, all identical):** rows=4 union 26/40
+ratio 0.771 (#219) → **0.479** (S7.1); silu_down rows 328 → 142 µs. The single-row reference drifted ~15% between the
+two builds' runs, so it's directional only.
+
+**#219 merged** as db442e2d4 after jobs 35/37/38c/40 + CI (only the repo-wide benchmark gate red; the file-size cap
+fixed for main too). **#228** (S7.1) retargeted to main; its GB10 gate (job 41: control, agentic 50, BFCL) has been
+running since 08:48.
+
+## 2026-10-28 09:30 UTC — next lever after S7.1: GPU idle (~4.5 ms/token) is a structural CUDA-graph veto
+
+Code read (no GPU):
+- Single-sequence MTP verify on qwen4_exp enters `verify_c2.rs`. Its per-step capture decision (~l.191) is
+  `use_graphs = comm.is_none() && !hss_engaged && !lora_eager && !k4_diag && !layer_veto`.
+- `layer_veto` is true on EVERY layer of this model. `Qwen3SsmLayer::decode_graph_unsupported` returns
+  `ple.is_some()` (PLE host n-gram hash + NVMe fault-in, `trait_layer.rs:416`). `Qwen3AttentionLayer` returns
+  `qsa.is_some()` (QSA indexer host ingest counter + position-dependent launch params, `trait_impl.rs:95`).
+- The same veto sits in verify_b/verify_c/verify_e/decode_a2. No env knob overrides it, and bypassing it would hit
+  illegal-capture faults (900/901).
+- The pieces infrastructure (`decode_pieces.rs` keys, the PLE host-half hoist in `verify_c2`) already exists.
+  `layers/qsa_staged.rs` has an inert-step staged QSA, but only for the plain-BF16-KV highway path.
+
+Options, with estimates from the job-36 idle distribution (preliminary):
+1. Prestage QSA + run PLE's host half before capture, then capture the verify_c2 layer chain as pieces. Removes most of
+   the ~4.5 ms/token idle. Real engineering.
+2. PLE-only (still QSA-vetoed): ~2–2.5 ms/token at best.
+3. Drafter-only piece: < 1 ms/token.
+Proposed as the next work item for the owner. Not started overnight (large, design-level change).
+
+## 2026-10-28 10:03 UTC — #228 (S7.1) gate agentic: 11.19 s/turn
+
+Job 41 (86c11d766): control identical; agentic 50/50, 50/50, **11.19 s/turn**, harness decode 24.81 tok/s
+(run-1793181820586414906). Same default profile, by build: main 12.43 s/turn / 22.05 tok/s → #219 11.99 / 22.92 →
+#228 11.19 / 24.81. Single run per build, consistent with the fixed-prompt A/Bs. BFCL running (~13:00).
+
+## 2026-10-28 12:50 UTC — #228 (S7.1) MERGED (87df79b2f)
+
+Job 41 final: BFCL ST-995 **87.44 / 87.32** (run-1793191492360335768), all 15 subsets identical to main; agentic 50/50,
+50/50, 11.19 s/turn, 24.81 tok/s; control identical; TTFT p50/p90 639/3,026 ms (unchanged); 0 ERROR/panic. Merged.
+
+Main (default FP4-Local recipe profile, single GB10) over this campaign, same harness:
+
+| main | agentic s/turn | harness decode tok/s | short-prompt decode (fixed prompts) | ~17K agent decode |
+|---|---|---|---|---|
+| b7af7fa81 (before S7) | 12.43 | 22.05 | 25.98 | 23.41 |
+| db442e2d4 (+ #219) | 11.99 | 22.92 | 27.20 | 24.46 |
+| **87df79b2f (+ #228)** | **11.19** | **24.81** | **34.22** | **27.06** |
+
+BFCL 87.44 / 87.32 unchanged throughout. Every decode change was byte-identical (control, EXACT_VERIFY_CHECK and
+BATCH_FAST_CHECK all 0 rows differ). The per-build s/turn values are single runs; the decode columns are 3-pair medians.
+
+## 2026-10-28 13:00 UTC — decode profile of main 87df79b2f (S7 + S7.1) and the next levers
+
+Job 42 (nsys, same probe as job 36; this capture caught 2 of the 3 requests, so whole-step tok/s from it is unreliable;
+the per-kernel ms/token of unchanged kernels agrees with job 36 within 1–3%). Its export raced the report write again
+(0-byte `.nsys-rep` at export time); I exported offline after the write finished.
+- silu_down rows: 6.55 → **1.69 ms/token**. That confirms the S7.1 mechanism (the per-column `__expf` recompute was the cost).
+- Remaining shares on main: GPU idle ≈ 20% of wall (the structural CUDA-graph veto, previous entry);
+  `mxfp8_proj_batchm` ≈ 4.0 ms/token; `_t_rows` gate_up ≈ 3.6; LM head (`dense_gemv_bf16` + `_batchm`) ≈ 3.0;
+  `hc_pre_down/finish` ≈ 2.2; silu_down rows 1.7; union 0.3.
+
+Proposed next work, all byte-exact, owner to pick:
+1. CUDA graphs on the verify path: prestage QSA + PLE host half, capture `verify_c2` layer pieces (~4.5 ms/token of idle).
+2. `mxfp8_proj_batchm` kernel efficiency (already one launch for all rows, so this is kernel-internal work).
+3. gate_up rows at union 33 (still 0.60× in the microbench; the stage loop may have the same kind of per-thread
+   redundancy).
+4. LM head ~3 ms/token.
+
+## Night summary (2026-10-27 06:00 → 2026-10-28 13:00 UTC)
+- Merged to main: train 1 #212 (#191 #192 #196 #204 #205 #206 #207 #208 #210), train 2 #217 (#213 decode-share, #215
+  cargo-deny green), #219 S7 verify-row dedup, #228 S7.1 silu activation. Issues #172, #180 closed.
+- FP4-Local on one GB10, default recipe profile, main before → after: agentic **12.43 → 11.19 s/turn**; short-prompt
+  decode **25.98 → 34.22 tok/s**; ~17K-token agent decode **23.41 → 27.06 tok/s**. BFCL ST-995 unchanged at
+  87.44 / 87.32. All decode changes were byte-identical.
+- sparkrun-recipes #21: J profile + ghcr sha-da7985c, vetted through sparkrun (agentic 50/50 12.28 s/turn, BFCL
+  87.84 / 87.48). Awaiting the owner's merge; it can be re-pinned to an image with #219/#228 after its own re-vet.
+- Not shipped: ROWINV combo profile (BFCL normalized 86.50 < 86.92 floor, deterministic across 3 binaries); #208 live
+  repro (path unreachable in 3 attempts).
+
+## 2026-10-28 13:15 UTC — recipe #21 merged; new focus: PREFILL (owner)
+
+sparkrun-recipes #21 merged (squash, 76f69cc66): FP4-Local single GB10, J profile, ghcr sha-da7985c.
+
+**What we know about FP4-Local prefill (older builds, to be re-measured on main 87df79b2f):**
+- ~17K-token cold agent prompt: Atlas TTFT ~14.4 s (13.7 s with opt-in resident PLE scales) vs vLLM 9.2 s on the same
+  box (ab_stream, 10-18).
+- Short prompts: ~300 ms fixed cost (58 tokens 368 ms; marginal ~0.58 ms/token above 500 tokens). nsys 10-23: 339 ms
+  of GPU per 58-token request, MoE 183 ms, MXFP8 projections 115 ms. Even 58 tokens × top-10 touch most experts.
+- 17K prefill attribution (10-19, s4f2): MoE 25%, QSA attn 18%, hc 15%, GEMM 11%, GDN 11%, gaps ~16%. A large part of
+  cold TTFT was GPU idle waiting on PLE n-gram faults (host NVMe I/O; mitigated by 64 fault threads + opt-in resident
+  scales).
+- Agentic: Σ TTFT ≈ 430 s of ≈ 4,800 s wall at default; p90 3.0 s from first turns. The J profile (now in the recipe)
+  takes p90 to 2.2 s.
+
+**Plan:**
+1. Fresh nsys prefill attribution on main, prefill-only requests (max_tokens 1) at ~60 / ~1.3K (BFCL-like with tools) /
+   ~4K / ~17K tokens, distinct prompts (no cache hits). Per request: wall, GPU busy/idle, kernels grouped by family,
+   PLE fault-wall lines. Fix the nsys export race by waiting for the report size to settle.
+2. From that, pick byte-exact levers, the same way S7.1 was found: profile, then look in source for redundant work.
+3. Gate any change: control identical + exactness, TTFT A/B (fixed prompts, alternating fresh boots), then agentic + BFCL.
+
+## 2026-10-28 20:55 UTC — prefill profile of main 87df79b2f (job 43, nsys, default r1short, prefill-only requests)
+
+| request | prompt tokens | TTFT | GPU busy | GPU idle in burst |
+|---|---|---|---|---|
+| P60 ×3 | ~28 | ~218 ms | 190 ms | ~18 ms |
+| P1300a/b (tools) | 2,805 / 2,987 | 2,246 / 2,231 ms | 1,910 / 2,036 ms | 326 / 146 ms |
+| P4K | 4,569 | 3,637 ms | 2,979 ms | 614 ms |
+| P17K | 19,172 | **15,764 ms** | 12,842 ms | 2,903 ms (18%) |
+
+Kernel ms by family at P17K: MoE 3,707 (`moe_w4a16_fused_gate_up_t_k64` 1,990 ×192, `grouped_gemm_ptrtable_t_k64`
+1,184), QSA 2,536 (`qsa_prefill_attn_tc2` 1,987, `qsa_score_rows_exact` 441), dense GEMM 1,732 (cuBLAS nvjet 968), hc
+1,674 (`hc_post_vec` 738, `hc_pre_stage_bf16` 545), GDN 991, MXFP8 157, PLE 48. At ~2.9K tokens MoE is ~40% of
+kernel time. Call counts show one extra forward per prefill on this default profile (96 MoE calls at 2.9K = 1 chunk +
+the tail-checkpoint split; 192 at 19K = 3 chunks + tail). The recipe's MIDCHUNK_CKPT removes that extra forward.
+
+**Host side (CUDA driver API, whole capture):** `cuMemcpyDtoHAsync` 1,048 calls / 20.3 s (≈150 blocking readbacks per
+request); `cuMemFree` 229,277 calls / 5.0 s; `cuStreamSynchronize` 1,111 / 80 ms. (The first summary searched for runtime
+`cuda*` names and reported zero.) Attribution in progress (CPU-only, existing capture): readback sizes and call sites,
+per-layer placement, the free storm's source, and the idle each causes. Candidate byte-exact lever: remove per-layer
+host readbacks / frees in prefill.
+
+## 2026-10-28 21:30 UTC — prefill host stalls attributed; lever sizes
+
+From job 43's capture (CPU-only):
+- The blocking readbacks are a **2,052-byte D2H per layer per forward** (512 × 4 B per-expert token counts: the grouped
+  MoE `moe_sort_by_expert` path sizes its grouped-GEMM launch on the host), plus one PLE token-id readback per forward
+  (`layers/ple/layer.rs:300`, host n-gram hash; its comment says it's illegal under capture).
+- At P17K, idle within 0.5 ms of a D2H = **1,254 ms of 2,903 ms** idle. The 229K `cuMemFree` calls are boot-time
+  (~0 inside requests).
+- Recoverable by device-side offsets / a fixed-grid grouped GEMM + token-id prestage (byte-exact): est. **0.4–1.2 s at
+  P17K** (3–8% of TTFT), only ~10–40 ms at ~2.9K tokens.
+
+Achieved MoE prefill throughput at P17K (FLOPs = tokens × top-10 × 48 layers × 6.55 / 3.28 MFLOP for gate_up / down):
+`fused_gate_up_t_k64` ≈ 30 TFLOP/s, `grouped_gemm_ptrtable_t_k64` ≈ 25 TFLOP/s, i.e. W4A16 (dequant to BF16 + BF16
+MMA). Earlier measurements on this box: cuBLAS reaches 75–206 TFLOP/s; vLLM's NVFP4 MoE uses native FP4 MMA. MoE is
+~40% of prefill kernel time at ~3K tokens and 3.7 of 12.8 s busy at 19K. **This is the big prefill lever, but it
+changes numerics (accumulation order / FP4 MMA), so it needs BFCL gating.** The byte-exact levers are each ≤ ~5–8%: host
+readbacks, and hc kernels (`hc_post_vec` + `hc_pre_stage` ≈ 1.3 s at P17K, ~2× under bandwidth by estimate). QSA
+attention (2.4 s at P17K) is latency-bound per earlier work.
+
+## 2026-10-28 21:45 UTC — owner: MoE prefill GEMM throughput first
+
+Phase 1 (in progress): read both production kernels (`moe_w4a16_fused_gate_up_t_k64`,
+`moe_w4a16_grouped_gemm_ptrtable_t_k64`): grid/tiles/MMA/pipelining, dequant placement, small-M handling,
+per-element K order. Then an isolated microbench at FP4-Local shapes (T = 2.9K / 19.2K, top-10 of 512) against on-box
+ceilings (cuBLAS BF16 at equivalent shapes, a pure NVFP4 weight-streaming read), plus dequant-only / MMA-only
+diagnostic variants. Key question: can a re-tiled W4A16 kernel keep the same MMA instruction and per-element K order?
+If so it stays byte-identical (lighter gating than native-FP4 W4A4, which changes activation numerics).
+
+## 2026-10-28 22:10 UTC — MoE prefill kernels: source read (S1)
+
+Both kernels are in `kernels/gb10/qwen3.8-flash-next/nvfp4/moe_w4a16_grouped_gemm.cu` (symlinked to other targets):
+`fused_gate_up_t_k64` (~l.748; gate+up in one launch over 2N) and `grouped_gemm_ptrtable_t_k64` (~l.455; down,
+device pointer table). Structure:
+- Grid: z = expert, x = N-tile, y = persistent M-tile stride. CTA tile M64 × N128 × K64, 256 threads.
+- cp.async 2-stage double buffer: A (BF16) + packed nibbles + g16 scales. Weights are dequantized via an E2M1 LUT into
+  **FP8 E4M3** smem once per K-tile per CTA, i.e. repeated for every M-tile of the same expert.
+- MMA: `mma.sync.m16n8k32 f32.e4m3.e4m3`. So despite the "w4a16" name, the math is e4m3 × e4m3 with fp32
+  accumulation.
+- Rows are gathered per expert via `expert_offsets` + `sorted_token_ids`. grid.y is host-sized (~2× the average
+  expert). Each output element accumulates K in ascending K64 tiles, so any re-tile / re-pipeline that keeps that order
+  and the same MMA instruction stays **byte-exact**; split-K would not.
+- In-tree alternatives: `_k64_fp4` native-FP4 clones (~l.1511 / ~l.1833; earlier note: a wash), `moe_w4a4_prequant` +
+  tile worklist (GLM-only), FP8-weight variant (~l.1282). No cuBLAS in the MoE path.
+
+Byte-exact design options, pending the isolated bench (job 44, branch `bench/moe-prefill-gemm` 1b19b96a3):
+1. Retile / deeper pipeline (est. 40–60 TFLOP/s).
+2. Weight-stationary persistent CTA per (expert, N-tile): dequantize each B tile once, reuse it across that expert's
+   M-tiles.
+3. Warp-specialized TMA/mbarrier pipeline (est. 60–100 TFLOP/s, high effort).
+
+## 2026-10-29 — MoE prefill kernels are occupancy/latency-bound (isolated bench, branch bench/moe-prefill-gemm cf70977a3)
+
+Production wrappers, skewed top-10 of 512 routing, cold 48-layer weight rotation. The numbers match job 43's in-situ
+per-call times, so the bench reproduces production:
+
+| kernel | T | ms | TFLOP/s | weight GB/s |
+|---|---|---|---|---|
+| fused_gate_up_t_k64 | 2,900 | 9.36 | 20.3 | ~100 |
+| grouped_gemm_ptrtable_t_k64 | 2,900 | 5.35 | 17.8 | ~88 |
+| fused_gate_up_t_k64 | 19,200 | 38.0 | 33.1 | ~25 |
+| grouped_gemm_ptrtable_t_k64 | 19,200 | 22.0 | 28.6 | ~21 |
+
+On-box ceiling: dense cuBLASLt FP8 e4m3 at the gate_up shape (29,000 × 1,280 × 2,560) ≈ **228 TFLOP/s**. The MoE kernels
+sit at 9–15% of it and far below DRAM bandwidth, so they are neither compute- nor bandwidth-bound: occupancy/latency.
+Likely contributors: ~37 KB static smem (2 CTAs/SM), the strided-M grid with many empty CTAs (grid.z = 512), and
+dequantizing every weight tile again for each M-tile.
+
+Next (byte-exact, same MMA + per-element K order):
+1. Occupancy: N_TILE 128 → 64 and/or trimmed B staging, as new kernel symbols, compared against production in one
+   bench run.
+2. Persistent work queue over (expert, M-tile) pairs instead of grid.y striding.
+3. Weight-stationary reuse across an expert's M-tiles.
+
+## 2026-10-29 — MoE prefill occupancy probe: registers bind, not smem → persistent work queue next (K2a)
+
+- Bench pitfall fixed: in multi-target builds `atlas_kernels::ptx_modules()` aliases target 0 (`build_codegen.rs`
+  ~86–95). The bench now loads the qwen3.8-flash-next target set. The production baseline re-measured there matches the
+  earlier numbers (gate_up 9.0 / 38.1 ms, down 5.5 / 22.0 ms at T = 2,900 / 19,200).
+- ptxas (sm_121a): production 39,360 B smem / 128 regs; register-capped at 4 CTAs/SM (128 regs × 128 threads). An
+  N64 tile cuts smem to 29.6 KB but stays register-capped, and the "N64" variant wasn't a real retile (the MMA unroll
+  is hard-wired for N128; the sanitizer caught the OOB). So the occupancy path is a dead end.
+- **K2a:** persistent CTAs (SMs × 4) pull (expert, M-tile, N-tile) items from a device-built, hot-expert-first work
+  list. Same tile body and per-element K order, so byte-exact. Gate: identical + sanitizer clean + gate_up ≥ 1.3× at
+  T = 2,900, with down not slower. If it wins, the per-layer expert-count readback may become removable too.
+
+## 2026-10-29 — K2a bench: stale embedded PTX caught; readback confirmed removable with the work queue
+
+Jobs 47/47b ran a binary with the OLD embedded PTX (`strings`: `_v64` present, `_wq` absent) even after
+`cargo clean -p atlas-kernels`. Same class as the AGENTS.md stale-artifact warning. Rule for this workstream: every
+kernel bench/gate builds in a brand-new worktree with a fresh `target/` at the exact SHA, and checks with `strings` that
+the new symbols are present and the removed ones absent before timing. Their production baselines still hold
+(gate_up 9.0 ms, down 5.3 ms at T = 2,900). Confirmed in source: the per-layer 2,052-byte expert-offset D2H
+(`forward_prefill_routed.rs:110`) only feeds `max_m_tiles` (grid sizing), so a device-built work queue makes it
+unnecessary. Re-run as job 47c.
+
+## 2026-10-29 — K2a `_wq`: misaligned shared write (open)
+
+`_wq` and the device work-list builder embed correctly (strings guard). The sanitizer reports
+`Invalid __shared__ write of size 16` in `fused_gate_up_t_k64_wq+0x9a0` at smem offset 0x888 (8 mod 16), across 4 layout
+tweaks of the work-item slot. Next: `-lineinfo` + a device backtrace to name the store, explicit `__align__(16)` on
+every staging array, and a single shared `__device__` tile body for the production and `_wq` kernels. Capped at 2 more
+attempts, then reassess. Branch `perf/moe-prefill-occupancy` eab4134d8 (local).
+
+## 2026-10-29 — K2a persistent work queue: byte-identical but SLOWER → bound is inside the tile body
+
+Job 47j (sanitizer clean, all identical). The fault fix was `__align__(16)` on every shared declaration: adding a small
+shared declaration ahead of them had reshuffled the uchar/bf16 array bases.
+
+| case | production | `_wq` | ratio |
+|---|---|---|---|
+| gate_up T=2,900 | 9.10 ms | 9.64 ms | 0.95× |
+| down T=2,900 | 5.32 ms | 5.89 ms | 0.90× |
+| gate_up T=19,200 | 34.8 ms | 40.4 ms | 0.86× |
+| down T=19,200 | 22.7 ms | 24.9 ms | 0.90× |
+
+Gate not met; K2a dropped. Work distribution isn't the binder. With ~10% of the FP8 ceiling, ~100 GB/s, and no grid
+starvation, the cost is the tile body's serial chain: LUT dequant → smem_B_fp8 store → ldmatrix → MMA, in a 2-stage
+pipeline, 4 CTAs/SM (register-capped). Next, K3 (byte-exact): dequantize K-tile k+1 while the MMAs of tile k run
+(double-buffered B_fp8) plus deeper cp.async stages, and trim registers toward 5 CTAs/SM. Branch
+`perf/moe-prefill-occupancy` b81f29199 (local).
+
+## 2026-10-29 — K3 prep: the kernel documents its own serialization; price the dequant first
+
+`moe_w4a16_grouped_gemm.cu` (~l.580) says the K-step pipeline runs MMA → barrier → DEQUANT → barrier → MMA, so the
+FP4→FP8 conversion is serialized with the tensor cores ("the leading suspect", 39 vs 156 TFLOP/s vs cuBLAS in its
+note). An in-tree compile-time probe, `MOE_PROBE_CHEAP_DEQUANT`, stubs the conversion to price it. Next: bench the
+production kernels built with and without the probe (numbers only, not identity: the probe changes math). That bounds
+what the K3 software pipeline (double-buffered `smem_B_fp8`, dequant k+1 under MMA k, 3-stage cp.async) can win before
+it's written. `_wq` removed from the branch. Kept rule: new shared declarations must not precede unaligned uchar/bf16
+arrays (or everything gets `__align__(16)`).
+
+## 2026-10-29 — dequant priced: 31–50% of MoE prefill kernel time (job 48b, `MOE_PROBE_CHEAP_DEQUANT`)
+
+| kernel | T | normal ms (TFLOP/s) | probe ms (TFLOP/s) | dequant share |
+|---|---|---|---|---|
+| gate_up | 2,900 | 9.11 (20.9) | 5.61 (33.9) | 38% |
+| down | 2,900 | 5.30 (17.9) | 3.66 (25.9) | 31% |
+| gate_up | 19,200 | 35.14 (35.8) | 17.42 (72.2) | 50% |
+| down | 19,200 | 22.88 (27.5) | 14.84 (42.4) | 35% |
+
+Arm A reproduces the production baseline; arm B is the probe (its math differs; identity not expected). Overlapping
+the dequant with the MMAs is bounded at ~1.6× (gate_up, 2.9K) to ~2× (19.2K). That is the K3 target: dequant of
+K-tile k+1 under the MMAs of tile k, double-buffered `smem_B_fp8`, 3-stage cp.async, byte-exact. Branch
+`perf/moe-prefill-occupancy` fef8b78d1.
+
+## 2026-10-29 — K3 software pipeline: no-go (job 49)
+
+Production vs `_sp` (3-stage cp.async + double-buffered `smem_B_fp8`): gate_up 9.00 → 8.86 ms (2.9K) and 39.5 → 34.4 ms
+(19.2K), but NOT identical (the fused 2N clone broke the up path). Down got slower: 5.39 → 9.36 ms and 25.3 → 40.3 ms
+(identical). Extra waits/barriers and ~24 KB more smem (likely 3 vs 4 CTAs/SM) cost more than the overlap recovers.
+The pipeline is dropped. A third failed restructure (after occupancy and K2a): the kernels stay at ~20–36 TFLOP/s
+against a 228 TFLOP/s FP8 ceiling. Next hypothesis to PRICE before more surgery: the activation-side bf16→e4m3
+conversion (`moe_bf16x4_to_e4m3x4`, done per MMA from smem inside `K64_COMPUTE_MMA`). If it's large, convert A once
+per tile into smem as e4m3 (byte-exact if it's the same conversion). Branch `perf/moe-prefill-occupancy` 3093686e2.
+
+## 2026-10-29 — A-side conversion is ~free (job 50); the weight dequant + MMA structure are the binders
+
+| kernel | T | normal | ACONV probe | both probes |
+|---|---|---|---|---|
+| gate_up | 2,900 | 9.09 ms | 9.01 | 5.59 |
+| down | 2,900 | 5.39 | 5.48 | 3.54 |
+| gate_up | 19,200 | 34.80 | 34.67 | 17.25 |
+| down | 19,200 | 22.78 | 22.66 | 14.85 |
+
+`moe_bf16x4_to_e4m3x4` costs 1–3%. The weight dequant is 38–50%. Even with both probes the kernels reach only ~32% of
+the FP8 ceiling, so the MMA issue structure is a second, stacked limit. Next byte-exact candidates, in one bench:
+- K_STEP 64 → 128: the same ascending sequence of `m16n8k32` MMAs into each accumulator, so the same per-element order;
+  half the barriers per K, dequant amortized over 2× MMA work. More smem; watch CTAs/SM.
+- A LUT-free FP4 decode (`__byte_perm` / arithmetic) producing the same e4m3 bytes.
+Warp-specialized dequant/MMA warps are the bigger fallback.
+
+## 2026-10-29 — K128 and LUT-free decode: identical but much slower (job 51f). K-series summary.
+
+| case | production | `_nolut` | `_k128` |
+|---|---|---|---|
+| gate_up T=2,900 | 9.00 ms | 15.41 (0.58×) | — |
+| down T=2,900 | 5.41 | 8.80 (0.61×) | 15.38 (0.35×) |
+| gate_up T=19,200 | 34.7 | 61.0 (0.57×) | — |
+| down T=19,200 | 22.8 | 35.8 (0.64×) | 63.3 (0.36×) |
+
+All byte-identical and sanitizer-clean. The branchy arithmetic decode loses to a 16-byte smem LUT read. K128's doubled
+staging (64–75 KB smem → 2–3 CTAs/SM) plus longer serial chains cost far more than halving the barriers saves.
+
+**Byte-exact restructures tried on the production tile body, none faster:** occupancy (register-capped), persistent
+work queue (0.86–0.95×), 3-stage software pipeline (down 0.6×), K_STEP 128 (0.35×), LUT-free decode (0.6×). The probes
+put the weight dequant at 31–50% and the MMA issue structure well off peak (~32% of FP8 even with free dequant). What
+remains: a warp-specialized producer/consumer rewrite (big; byte-exact possible), a numerics-changing native-FP4 path
+(BFCL-gated; an earlier note says it was a wash), or other prefill levers. Owner decision. Branch
+`perf/moe-prefill-occupancy` e986d79cc (local; bench + probes).
+
+## 2026-10-29 — owner: warp-specialized rewrite of the MoE prefill GEMM (W1)
+
+Design (byte-exact target), starting with the down kernel (`grouped_gemm_ptrtable_t_k64`, the simpler one):
+- Same CTA tile (M64 × N128 per (expert, M-tile, N-tile)), same grid/striding, same epilogue, same per-element MMA
+  order (`m16n8k32 e4m3`, ascending K).
+- **Producer warps** (e.g. 2): cp.async A / packed / scales for K-tile k+s, then the LUT dequant into a ring of S
+  `smem_B_fp8` stages, then signal "full[s]".
+- **Consumer warps** (4, which own the accumulators): wait "full[s]", run the MMAs for that K-tile, signal "empty[s]".
+- Sync with named barriers (`bar.sync`/`bar.arrive` with explicit ids and counts) or mbarriers if sm_121 supports them
+  cleanly. No CTA-wide `__syncthreads` in the K loop.
+- `__align__(16)` on all shared arrays; ring depth S = 2–3 within ~48 KB smem; check regs (consumers ~64 accumulator regs
+  each) and CTAs/SM.
+- Gate per kernel: identical outputs, sanitizer clean (memcheck + racecheck), ≥ 1.25× at T = 2,900, not slower at
+  19,200. Then gate_up with its 2N gate/up handling unchanged. Then wiring (+ dropping the per-layer expert-count D2H if
+  it becomes unnecessary) and the full gate (control, prefill TTFT A/B, agentic, BFCL).
+
+## 2026-10-29 06:16 UTC — W1 `_ws` down kernel: built, first sanitizer bug fixed, job 52d timed out in racecheck
+
+`moe_w4a16_grouped_gemm_ptrtable_t_k64_ws` (branch `perf/moe-prefill-occupancy` e01e7a38e): 2 producer warps
+(loads + LUT dequant into a 2-stage ring) + 4 consumer warps (production MMA/epilogue), named `bar.arrive`/`bar.sync`
+(ids 1–4, 192-thread counts), no CTA-wide barrier in the K loop. Memcheck caught producers using the 128-thread row
+stride (OOB on `smem_tok`/`smem_Bp`); fixed. Job 52d was killed at its 60-min timeout inside racecheck before timing
+ran. Next: timing + identity first, memcheck at small T, and racecheck on a minimal config (1–2 experts, 1 iteration)
+in its own job.
+
+## 2026-10-29 — W1 (named-barrier warp specialization) attempt 1: negative
+
+Jobs 53/54, down kernel `_ws`:
+- memcheck clean.
+- racecheck **139K+ hazards** (cap hit): consumers read `smem_A` / `smem_B_fp8` while producers write. Either named
+  `bar.arrive`/`bar.sync` doesn't order the cp.async writes as used, or there's a ring-index bug.
+- `identical=false` (epilogue bound the wrong accumulator array; fixed in a1ea22ddd, re-run 53b pending).
+- **2.5× slower** (13.6 / 57.0 ms vs 5.4 / 22.8 ms at T = 2,900 / 19,200).
+Splitting dequant onto producer warps with 2 barrier round-trips per K-tile and a 2-stage ring adds latency without
+hiding the MMA idle. A correct design needs phase-tagged mbarriers (and likely TMA / deeper rings), a substantially
+larger rewrite. Paused pending the owner's call. Branch `perf/moe-prefill-occupancy` a1ea22ddd (local).
+
+## 2026-10-29 — W1 attempt 1 negative; owner re-prioritizes single-Spark deployments
+
+W1 (named-barrier warp specialization, down kernel): memcheck clean, but racecheck 139K+ hazards (consumers read
+smem_A/smem_B_fp8 while producers write), identical=false (epilogue bug, fixed a1ea22ddd), and 2.5× slower. A correct
+design needs phase-tagged mbarriers / TMA, a much larger rewrite. **Parked** on branch `perf/moe-prefill-occupancy`
+(local) with the bench + probes.
+
+**New goal (owner):** single-GB10 deployments of the top-priority checkpoints are tested, merged and documented on
+their PRs, on current main 87df79b2f (#219 + #228): **nvidia/Qwen3.8-27B-NVFP4** and **Qwen3.8-Flash-Next
+NVFP4 / FP4-Local**.
+1. FP4-Local: re-pin sparkrun-recipes' recipe to the main image with #219/#228 and vet through sparkrun (agentic 50 +
+   BFCL ST-995). PR + results.
+2. Flash-Next NVFP4 (nvidia/Qwen3.8-Flash-Next-NVFP4): its single-GB10 recipe on the main image, the same vet. Check
+   whether S7/S7.1 engage on this pack.
+3. Qwen3.8-27B-NVFP4 (dense): its single-GB10 recipe on the main image, the same vet.
+Each vet's results go on its sparkrun-recipes PR, and a recipe-pin PR is opened when the image changes.
+
+## 2026-10-29 — single-Spark deployment vets queued (≈ 3 × 4.5 h)
+
+`ghcr.io/atlas-inf/atlas-gb10:sha-87df79b` (main with #219 + #228) exists, and all three checkpoints are cached on sparky.
+Queued on sparky, each a sparkrun vet of the recipe YAML verbatim with only the container re-pinned to `sha-87df79b`.
+Each run: env-key assertion, smoke (control / tool call / needle), agentic-webserver 50, BFCL ST-995, and a heartbeat
+against the stall kill:
+- job 55: `recipes/qwen3.8/qwen3.8-flash-next-fp4-local.yaml` (was sha-da7985c);
+- job 56: `recipes/qwen3.8/qwen3.8-flash-next-nvfp4.yaml` (was `:latest`);
+- job 57: `recipes/qwen3.8/qwen3.8-27b-nvfp4.yaml` (was `:latest`).
+Re-pin commits are ready locally (`vet/fp4local-main-pin` c018fa2, `vet/fnext-main-pin` 8bcec90, `vet/27b-main-pin`
+c136a26). Each gets pushed as a sparkrun-recipes PR with its vet results once its vet passes. The nightwatch cron
+relays each job's raw results as they land.
+
+## 2026-10-30 08:20 UTC — #257 / #163 gates; recipe #22 merged; main baseline refresh
+
+- sparkrun-recipes **#22 merged**: FP4-Local recipe pinned to `sha-87df79b`. Vet job 55: env 9/9, control 4/4, tool
+  call OK, agentic 50/50 + 50/50 (25.4 tok/s, run-1793259986118470148), BFCL ST-995 **87.84 / 87.48**
+  (run-1793269409528598043).
+- Owner priority: **#257** (session key for #209), then **#163** (`--exact-prefix-cache`, #158).
+- Job 50a (`refs/pull/257/merge` 47b767d0d): `session_key` tests 11/11; agentic 50/50 + 50/50, 11.83 s/turn, 337 turns
+  (run-1793341506832517369); BFCL running. Its control DIFFERS from job 10's reference, but main has moved 219
+  commits past 87df79b2f (#265–#272, including #271's qwen3.8-flash-next reference-server `[behavior]` defaults and #267's
+  MTP drafter changes). So that reference is stale, and the diff isn't attributable to #257. Added job 50a2: main at
+  #257's merge base, same profile, with control, agentic 50 and BFCL. That gives the one-variable #257 A/B and the new
+  control reference for #163's gate (50b).
+- Jobs 56/57 (Flash-Next NVFP4, 27B NVFP4 vets) failed on a script bug (polled port 8890; those recipes bind
+  8889/8888). Fixed (port read from the YAML) and re-queued as 56b/57b.
+- Queue: 50a (running) → 50a2 → 50b → 56b → 57b, ≈ 22 h.
+
+## 2026-10-30 — #257 MERGED (a7a1f35db; fixes #209)
+
+One-variable A/B at merge base b0df50185 (job 50a2 vs job 50a):
+- control byte-identical;
+- agentic 11.82 vs 11.83 s/turn (338 vs 337 turns), both 50/50 + 50/50;
+- BFCL ST-995 87.64 / 87.13 in both arms, every subset identical
+  (run-1793365805020178746 / run-1793351507833439068);
+- the session key engaged on the PR arm only (1,341 lines vs 0); 0 errors.
+Main's #273/#274 touch only unrelated lines of the same files. The 50a2 control
+(`~/code/perf/nq-main-base-b0df50185/control`) is the new reference. #163's gate (job 50b) runs against it.
+
+## 2026-10-30 17:40 UTC — #163 MERGED (8eb907260, opt-in `--exact-prefix-cache`)
+
+Job 50b (same base b0df50185 as 50a2):
+- tests 5/5; flag OFF control byte-identical to main (default unchanged);
+- flag ON: agentic 50/50 + 50/50 at 11.25 s/turn, 345 turns (different trajectories); BFCL 87.84 / 86.94 vs main
+  87.64 / 87.13 (floor 86.92); 0 errors.
+- Exact-hit probe: 10/15 in both arms, and every "mismatch" is only the sequential tool-call id. So on FP4-Local, main
+  already gives cold == warm, and the flag's benefit isn't observable here. The flag moves prefill chunk boundaries, so it
+  changes numerics.
+Merged as opt-in, with these findings on the PR. The CLA check was a transient failure (re-run passed; all commits by
+maplepaladin73).
+
+Recipe vets: jobs 56/57 and their first re-runs failed on job-script bugs (port nested under `defaults.port`; an empty
+env-key list made the env diff fail). Both are fixed. Queue: 56d Flash-Next NVFP4 vet (running) → 57d 27B NVFP4 vet → 58
+FP4-Local recipe vet on `sha-8eb9072` (main after #163; waits up to 2 h for the image). ≈ 13 h.
+
+## 2026-10-31 — Qwen4-27B day-0 prep (owner priority; dual-Spark stack paused)
+
+Source: analytics-zoo/vllm-xpu-kernels PR #22 ("Enable Qwen3.8-flash-next 8 cards fp8 & int4 and optimize
+qwen4-27b"), merged Oct 23 into a private downstream branch; the repo now 404s. Its 10 commits (5ccce89..265bbe2) are
+still reachable through the public fork hzjane/vllm-xpu-kernels and are saved locally in `~/code/qwen4-prework/`
+(branch `saved/pr22-head-265bbe2`, full patch, git bundle), plus the Wayback capture of the PR page. The companion
+vLLM model PR (head 5c37e9b) isn't publicly reachable.
+
+Architecture so far (owner-confirmed + the PR text): **dense** model on the Qwen4Exp (`qwen4_exp`) backbone; hidden 5120;
+HC4 hyper-connections; GDN layers with fused dual projections (QKVZ / BA) and gated outputs; QSA attention with
+Q12 / KV2 GQA per TP2 rank (24 Q / 4 KV heads); ngram/PLE short-conv; MTP draft 4; the KV cache doesn't shrink vs
+Qwen3.8. Intel validated TP2 FP8 and TP1/TP2 INT4 (no real QSA checkpoint).
+
+Work (local, not pushed):
+1. Extract every shape from the saved patch plus public references (llama.cpp#31072, TensorFold#1244 RFC, vLLM Qwen4Exp
+   / #53909) into `~/code/qwen4-prework/QWEN4-27B-SPEC.md`, with per-field confidence.
+2. Atlas draft branch `draft/qwen4-27b-dense`: dense-MLP qwen4_exp variant, shape-generic kernels for H=5120 / 24Q /
+   4KV, a `qwen4-27b` kernel target, loader support. Tests: a synthetic 2–4-layer random-weight checkpoint smoke on
+   sparky (incl. MTP draft 4), plus a Flash-Next control that must stay identical.
+Then resume the dual-Spark stack (#198 → #242 → #253 → #254 → #255).
+
+Vets on `sha-87df79b`: Flash-Next NVFP4 PASS (agentic 50/50 + 50/50 at 15.79 s/turn, BFCL 86.53 / 85.69). 27B NVFP4: agentic
+50/50 + 50/50 at 8.92 s/turn, BFCL 83.02 / **71.32**. Normalized collapses because the hallucination category is 39.96
+(irrelevance 45.83, live_irrelevance 34.09), i.e. tool-call discipline; it's under investigation before its re-pin.
+
+## 2026-10-31 — Qwen4-27B draft up (local); stack resumed, sparky-only
+
+Draft `draft/qwen4-27b-dense` 3100e292d (local, not pushed):
+- dense-FFN arm for the qwen4_exp layers + the MTP drafter (`num_experts == 0`);
+- `hyper_connection.cu` QHC_PS_DPT 4 → 5 so H = 5120 is covered (dead iterations below; Flash-Next bit-identical);
+- `kernels/gb10/qwen4-27b/` target (`(qwen4_exp, 5120)` dispatch key coexisting with Flash-Next's 2560);
+- stdlib synthetic-checkpoint writer.
+SPEC updated from llama.cpp#31072: GDN 48V / 16K × 128 (QKVZ, BA96/48 per TP1/TP2); attention 24Q / 4KV × 256 with a sigmoid
+output gate; HC4 / lr320; FFN intermediate likely 14336; MTP draft 4. Open until the checkpoint: layer count / mix,
+`model_type`, GDN packed ordering. Sparky jobs 60 (synthetic smoke, MTP draft 4) and 61 (Flash-Next control on the draft)
+are queued.
+
+Stack (#198 → stack/vision-probe → #242 → #253 → #254 → #255 → #256), owner constraint: **sparky only**
+(reiner + spark2 are in use elsewhere). Plan: S1, check the chain and resolve conflicts with main via merge commits,
+reviewed before push. S2, gate the stack tip on sparky: workspace tests, FP4-Local control / agentic 50 / BFCL vs a
+same-base main, plus Flash-Next NVFP4 and 27B NVFP4 controls. The dual-node paths can't be gated from sparky, and the
+merge notes will say so.
+
+## 2026-10-31 19:00 UTC — the stack is being re-cut by another session; switching to a GB10 train gate
+
+- A parallel AzeezIsh session is porting the stack onto main and merging it: #198 and #237 merged; #253 superseded by
+  #279 (merged, pair-gated); #254 landed in #282 (merged). New ports are open: #284 #285 #286 #287 #290 #293 (SparkQwen
+  0.4.0) and #294 (data-angel). My local stack merges (43 conflicts resolved) stay local and unpushed, to avoid colliding.
+- Sparky's role: the GB10 single-Spark gate for those open PRs, batched as `integ/train-2026-10-31` (main + #285 + #284 + #287
+  + #290 + #293 + #294 + #286). Job 62: tests, FP4-Local control / agentic 50 / BFCL vs main at the same base, plus Flash-Next
+  NVFP4 and 27B NVFP4 controls. Results go on each PR, and each merges if the gate passes.
+- Qwen4 draft: job 61 Flash-Next control IDENTICAL on the draft branch; job 60's synthetic-checkpoint boot FAILED. That
+  debugging is parked until after the train.
+
+## 2026-10-31 23:30 UTC — train 2026-10-31 (#284 #285 #286 #287 #290 #293 #294) gate: mixed → same-base attribution queued
+
+Job 62 (train b53c5aaf2 on main 170c3ed3a):
+- tests: spark-server 3002/0. spark-model 2000/3, all three `video_decode_ffmpeg` (#287's chain added the `enabled` gate
+  without setting it in its tests). They pass on main; a test-only fix is on the train (05185b837).
+- controls (train vs same-base main): FP4-Local IDENTICAL, Flash-Next NVFP4 IDENTICAL; 27B not run (no single-box 27B serve
+  script; coverage gap).
+- agentic 50: **47/50**, 47/50, 10.80 s/turn, 369 turns (run-1793478986972058487). Base reference 11.82 (older base).
+- BFCL ST-995: **87.54 / 85.94** (run-1793488879414911145): below the 86.92 floor. Live category −4.12 vs the older
+  b0df50185 base (live_parallel −12.5, live_multiple −3.8), non_live +1.48.
+- 0 errors.
+Not yet attributable: main has moved since b0df50185 (#279 / #282 / #283 …, and #279's own gate reported 87.54 / 86.85 on main).
+Job 63 runs main at 170c3ed3a (the train's base) with agentic 50 + BFCL. No train PR merges before that comparison.
+
+## 2026-11-01 03:40 UTC — train 2026-10-31 is output-neutral on GB10; agentic 47/50 is main's (bisect queued)
+
+Job 63 (main 170c3ed3a, the train's base) vs job 62 (train):
+- BFCL ST-995 87.54 / 85.94 in both arms, **all 15 subsets identical** (run-1793503255896245487 vs run-1793488879414911145);
+- controls identical; agentic 47/50 in both (10.67 vs 10.80 s/turn);
+- the same failed iterations 0 / 18 / 27 ("no Cargo.toml was written"); 0 errors.
+The earlier "dips" vs b0df50185 were moves between main bases. The 7 PRs (#284 #285 #286 #287 #290 #293 #294) had
+already been merged upstream by the parallel session; the GB10 confirmation is posted on each. Main already carries the
+ffmpeg test fix.
+
+**Open single-Spark regression on main:** FP4-Local default agentic was 50/50 at b0df50185 and is 47/50 at 170c3ed3a, with
+the same 3 iterations failing deterministically. BFCL normalized also moved 87.13 → 85.94 between those bases, below the
+86.92 floor. Job B1 bisects b0df50185..170c3ed3a on sparky with a targeted repro of iterations 0/18/27, then reports the
+culprit and transcripts. Next after it: B2, Qwen4 synthetic-smoke debug (local draft).
+
+## 2026-11-01 05:00 UTC — agentic 47/50 bisected to 565aa68 (#271); attribution + BFCL pair queued
+
+- Bisect job 65b (iteration 0, fresh serve per step, harness temp 0 / seed 0). Steps:
+  - 3bacfa8, 2cdcc39 and 25c6930 GOOD; 7707946 and 565aa68 BAD;
+  - first bad commit **565aa68** "qwen3.8-flash-next: serve the reference server's behaviour" (#271's MODEL.toml commit).
+- Job 64 was void: no `cargo` on PATH, so every step defaulted to BAD. Discarded.
+- The sampling-row temperature/top_p change is inert for this bench, since it sends temperature 0. The mechanism is undetermined.
+- Job C (main 8c2b67218, fresh `wt-knob`), one-group-at-a-time restores of the pre-565aa68 values, 2 fresh boots each:
+  - A0 control; A1 sampling (incl. presence 1.5); A2 verbatim_prompt; A3 thinking budget; A4 eos; A5 steering;
+  - A6 full revert (positive control);
+  - validity gate: A0 BAD ×2 and A6 GOOD ×2.
+- Phase 2 then runs BFCL ST-995 + agentic-50 on A0 vs A6, plus on the single responsible knob if one exists.
+- BFCL normalized 87.13 → 85.94 between b0df50185 and 170c3ed3a is two observations, not an A/B: live_parallel −12.5, live_multiple −3.8, irrelevance −4.2, non_live +1.5.
+- Posted on #271 (issuecomment-6553486582).
+- In parallel: Qwen4 B2 (job 60 boot failure), short boot jobs slotted between the long runs, local only.
+
+## 2026-11-01 05:45 UTC — 565aa68 knob attribution, phase 1 (job 66)
+
+Main 8c2b67218, FP4-Local r1short, agentic iteration 0 on a fresh serve, 2 boots per arm:
+
+| Arm | Restored to pre-565aa68 | Boot 1 | Boot 2 |
+|---|---|---|---|
+| A0 | none | FAIL | FAIL |
+| A1 | sampling rows (presence 1.5) | — (re-run 66c) | pass |
+| A2 | verbatim_prompt off | pass | pass |
+| A3 | thinking budget | FAIL | FAIL |
+| A4 | eos | FAIL | FAIL |
+| A5 | steering | FAIL | FAIL |
+| A6 | full revert | pass | pass |
+
+- The gate holds. Two knobs each flip the trajectory on their own: the prompt render, and presence 1.5. Under greedy the pick is the argmax of the penalised logits (`fast_greedy.rs` classify_penalties), so presence still steers.
+- This is a trajectory probe, not a rate. The same binary isn't token-identical across boots: A0 1646 vs 1709 ctok.
+- Rates come from phase 2: BFCL + agentic-50 on A0/A6 (jobs 67–70), then on A2/A1 (71–74).
+- Posted on #271 (issuecomment-6553948253).
+- Qwen4 B2: the synth boot passed config parsing and failed on the qwen4_exp guard "0 of 4 layers have routed experts". The draft fix makes the guard check the config-declared FFN kind; the re-boots are queued as short jobs.
+
+## 2026-11-01 08:30 UTC — overnight plan: land the gateable PRs, clean up, knob phase 2
+
+**Open-PR triage** (authoritative `gh pr list`, 08:05 UTC):
+
+| PR | Sparky action |
+|---|---|
+| #303 vision prefix cache (data-angel) | gate in train `integ/train-2026-11-01` |
+| #159 batch2 BF16 LM head | gate in the same train. Job 59 already showed control identical, BFCL 87.54 / 85.94 and agentic 47/50 at 10.68 s/turn, all equal to main 170c3ed3a |
+| #255 DFlash2 warm ctx, #256 GLM video | stale stack bases; ported onto main as `port/255-on-main` and `port/256-on-main` and gated in the train. Sparky has no DFlash2 or GLM checkpoint, so only the default-off neutrality and the unit/GPU tests are covered there |
+| #142 NVFP4-only gate subjects | merge main in, re-test, land (CPU only) |
+| #242, #199 GLM dual-Spark | need reiner + spark2; not gateable on sparky |
+| #149, #194 Strix | not sparky |
+| #160, #100 EXL3 (external) | conflicting; checkpoint not on sparky |
+| #113 (release record, obsolete image), #118 (env ratchet) | need an owner decision |
+| #211 | lands at the end of the night |
+
+**Train gate 68b.** Same base as knob A0 (main 8c2b67218), so A0's job 67 BFCL and job 69 agentic are the main arm. It covers:
+- tests, with the #255 GPU tests and #303's tests confirmed to run;
+- FP4-Local, NVFP4 and 27B controls vs A0;
+- a #303 vision prefix-cache probe: cold vs warm, gate on vs off vs main, and an image chunk after a cached image;
+- agentic-50, BFCL ST-995, and error/panic counts.
+
+Clean, ref-reachable sparky worktrees get pruned; branches are kept.
+
+## 2026-11-01 11:30 UTC — #142 and #304 merged; train #305 opened; knob A0 BFCL
+
+**Merged:**
+- **#142** NVFP4-only gate subjects → 744fab747.
+  - A first merge attempt was built on a stale local branch (4ebe2c4c1, not the PR head 32c10b247). It had given the NVFP4 35B the retired FP8 floors 86.50 / 86.90. Discarded before push.
+  - The landed merge is 32c10b247 + main. The only conflicts were the two video-fidelity comments, where main's newer text was kept.
+  - The tree-pinning `bench_variants` test was updated to the NVFP4 default. CI `cargo test --workspace` passed.
+- **#304** fixes main's rustdoc break (an intra-doc link to the `cfg(test)` `build_msg_entries`) → 5314eb1f2.
+- **#303** landed on main on its own (3bd5d7b1e). Train #305 still gates it on GB10.
+
+**Train #305** (`integ/train-2026-11-01` @ 5ffcd4169, base 8c2b67218): #159 + #303 + ports of #255 and #256.
+
+Review fixes before push:
+- 500-line cap splits (impl_b3_dflash 582, free_state_tests 556, video_decode_ffmpeg 505 were over);
+- `ensure_decoder` dedupe;
+- reverted a GLM single-frame behaviour change and restored the reference pad test. Main's GLM-only refusal test was dropped as superseded; Qwen is unchanged.
+
+Gate 68b runs next after 68a, the Qwen4 sanitizer boot.
+
+**Knob A0 (main 8c2b67218) BFCL ST-995:** 87.54 / 85.94 (run-1793521232941271578), identical to the 170c3ed3a run. A6 (full 565aa68 revert) BFCL is running.
+
+## 2026-11-01 11:40 UTC — knob phase 2: BFCL A0 vs A6 (one variable: Flash-Next MODEL.toml)
+
+| | A0 main 8c2b67218 | A6 pre-565aa68 MODEL.toml | Δ |
+|---|---:|---:|---:|
+| overall | 87.54 | 88.04 | +0.50 |
+| normalized | 85.94 | 88.08 | +2.14 |
+| hallucination | 91.48 | 95.64 | +4.16 |
+| live | 79.41 | 82.35 | +2.94 |
+| non_live | 86.93 | 86.26 | −0.67 |
+
+- Runs: run-1793521232941271578 / run-1793531962246711760.
+- One run per arm, so this is an observation, not cross-validated.
+- Posted on #271 (issuecomment-6557256069).
+- The A2/A1 BFCL arms (jobs 73/74) will attribute it to a knob. Agentic A0/A6 is next (69/70).
+- 68a (Qwen4 synth under compute-sanitizer): BOOT FAILED, with an unresolved kernel lookup plus 82 sanitizer errors. The draft fix is in progress (local).
+- 68b (train #305 gate) is running.
+
+## 2026-11-01 16:30 UTC — train #305 gated; #159 merged; #255 held; #303 finding
+
+**68b + 68e + 68f**, same base 8c2b67218 vs A0:
+- Controls IDENTICAL: FP4-Local, NVFP4, and 27B at K=2 verify.
+  - 68b's own controls and vision probe were vacuous (missing `control` helper, wrong image names). 68f re-ran both.
+- BFCL 87.54 / 85.94, all subsets identical (run-1793547282491478714).
+- Agentic 47/50 at 10.66 s/turn, same failing iterations as main. 0 errors.
+
+**Outcomes:**
+- **#159 merged** (b45811df7).
+- **Port of #255 held:** its GPU test `a_warm_turn_window_matches_its_cold_prefill_on_the_device` fails on main. Hypothesis: it needs the CTX_CARRY layer.
+- **Port of #256** is being rebuilt standalone on main.
+- **#303** (already merged upstream): on FP4-Local the vision prefix cache engages (432/436 restored), but two-image cold ≠ warm, and cold outputs change with the gate on (vs main and `ATLAS_VISION_PREFIX_CACHE=0`). Posted on #303.
+- **spark-model flake:** `hour_tests::probe_timeout_covers_a_blocked_stdout_read` hit ETXTBSY once on the train. A flake check is running.
+
+**Qwen4 draft 8ba2695df7:**
+- The dense GEMM kernels (`nvfp4_mmq`, `q4k`, `w4a16`, `w4a4`) now compile into the qwen4-27b target instead of being declared absent.
+- The Flash-Next control on the draft is IDENTICAL.
+- The synth boot now gets past the kernel lookups and faults with ILLEGAL_ADDRESS at full-attention layer 3. Sanitizer job 68g names the kernel.
+
+## 2026-11-01 17:00 UTC — #307 merged (port of #256); #256 and #305 closed
+
+- **#307** merged as 575db42e1: GLM reference video preprocessing on main, every video file byte-identical to the train-gated version.
+  - An intermediate rebuild had dropped #256/#295's two `declared_frames` tests. They were restored before push.
+- **Flake classified:** `hour_tests::probe_timeout_covers_a_blocked_stdout_read` hits `Text file busy` on main b45811df7 too.
+- **Main bug on hosts with ffmpeg:** main fails `a_faststart_mp4…` / `a_moov_at_end_mp4…` under `FfmpegPolicy::default()`. #307 fixes the tests.
+- **#256 closed** (superseded by #307). **#305 closed** (#159 and #307 landed, #303 already on main, #255 held).
+
+**Qwen4 B2:** the no-PLE synth BOOTS under compute-sanitizer memcheck, with 0 invalid accesses (only probe misses and teardown noise). It faults without the sanitizer, which points to a stream-ordering race or an uninitialised buffer. The discriminating jobs are:
+- 69b: `CUDA_LAUNCH_BLOCKING=1`;
+- 69c: racecheck and initcheck;
+- 69d: 3 plain boots.
+
+## 2026-11-01 18:30 UTC — knob phase 2: agentic A0 vs A6; Qwen4 synth reaches "Server live"
+
+| | A0 main 8c2b67218 | A6 pre-565aa68 MODEL.toml |
+|---|---:|---:|
+| agentic-50 | 47/50 (0, 18, 27), 10.85 s/turn | **50/50**, 11.61 s/turn |
+| BFCL | 87.54 / 85.94 | 88.04 / 88.08 |
+
+- Runs: run-1793552803526224613 / run-1793556958320651694.
+- So 565aa68's policy costs 3/50 agentic and about 2.1 BFCL normalized on single-GB10 FP4-Local. Posted on #271 (issuecomment-6561960206).
+- Knob attribution (A2 `verbatim_prompt`, A1 sampling/presence) continues in jobs 71–74.
+
+**Qwen4 B2:**
+- The ILLEGAL_ADDRESS was the synth checkpoint, not the kernels. With `attn_output_gate`, q_proj must be [2·24·256, 5120] (q + gate fused); the synth had half the rows, so `nvfp4_global_absmax` read about 63 MB past the buffer.
+- Atlas never checked the shape, which is a robustness gap worth a main PR: refuse a projection whose element count doesn't match the expected shape.
+- With the fixed synth, the server boots. MTP fails to load (synth MTP tensor names), and the first prefill faults after the GDN layers. Next: name the faulting kernel.
+- Flash-Next control on the draft is IDENTICAL.
+
+## 2026-11-01 19:35 UTC — knob phase 2: A2 agentic (verbatim_prompt off only)
+
+- **A2:** 50/50 at 11.60 s/turn (run-1793561389183871850). That matches A6's 50/50 at 11.61, against A0's 47/50 at 10.85.
+- On this deployment, `verbatim_prompt` accounts for the whole agentic difference (observed, one run per arm). Posted on #271 (issuecomment-6562815714).
+- Running next: A1 agentic (72), then BFCL A2 and A1 (73, 74).
+
+**Qwen4 synth:**
+- `--verify-against` now checks every tensor against the Flash-Next index with per-family scaling, and passes.
+- Fixes since the last entry:
+  - MTP `fc_embedding` / `fc_hidden` are H×H;
+  - `pre_fc_norm_hidden` is 4H;
+  - indexer `index_qk_proj` is (4+1)·128;
+  - GDN is held at spec (16K·128 / 48V), so `in_proj_qkv` is [10240, 5120].
+- PLE width (10240 vs 4H) is unresolved. The no-PLE synth is the main test.
+- Boot is OK. The first 16-token request returned HTTP 500; iterating.
+
+## 2026-11-01 20:45 UTC — A1 agentic; Qwen4 synth generates; shape-guard PR #310
+
+- **Knob agentic-50:** A0 47/50, A1 (sampling/presence) 49/50 failing iteration 18, A2 (`verbatim_prompt` off) 50/50, A6 50/50. Posted on #271.
+- **Qwen4-27B synth on the local draft** (`b4f2ec5299`): **boots and serves**. The 16-token temp-0 request returned HTTP 200, with MTP draft 4 loaded.
+  - Fixes along the way:
+    - gate-fused q_proj in the synth;
+    - Flash-Next-exact MTP tensor set, at H=5120;
+    - indexer (4+1)·128;
+    - GDN at spec;
+    - `hc_pre_down` routes to the tiled kernel when the HC row (4H·4 B = 80 KB) exceeds the 48 KB shared limit;
+    - kernel-name fault messages.
+  - The Flash-Next control on the draft is IDENTICAL.
+  - Day-0 perf note: Qwen4 decode will take the tiled HC path; it needs a 4H=20480-capable single-pass HC kernel (PR22's HC work).
+- **#310 (draft)** `weight_map: refuse a projection whose checkpoint shape disagrees with the config`. This is the OOB device read the synth exposed (CWE-125). One-variable controls vs a fresh base build run in job 72c.
+
+## 2026-11-01 20:55 UTC — #310 merged (checkpoint shape guard)
+
+- **#310 merged** as 11972c132.
+- **72c**, one variable vs a fresh build of base 88010baee: `control.py` byte-identical on all three models, 4/4 answered each:
+  - FP4-Local;
+  - Flash-Next NVFP4;
+  - Qwen3.8-27B NVFP4 at K=2 verify.
+- CI is green apart from the repo-wide benchmark-gate red.
+- **Next on sparky:**
+  - 72d: Qwen4 PLE synth boot+gen;
+  - 72e: full-depth 64-layer Qwen4 synth (52 GB BF16): memory, KV, TTFT and decode tok/s, labelled synthetic;
+  - then 73/74: BFCL A2 / A1 knob attribution.
+
+## 2026-11-01 21:10 UTC — main output-neutral since 8c2b67218; 27B BFCL question re-framed
+
+**Main 88010baee vs main 8c2b67218, `control.py` on all three models:** IDENTICAL.
+- FP4-Local, Flash-Next NVFP4, and 27B at K=2.
+- This covers #303 on the text path, #304, #142, #306, #159, #307 and #308.
+- Source: 72c base arm vs 68f A0 arm.
+
+**27B NVFP4 "BFCL collapse" (vet 57d, 83.02 / 71.32, hallucination 39.96) is most likely a recipe mismatch, not a regression.**
+- The vet ran the INTERACTIVE recipe (`disable_thinking: true`).
+- The 27B BFCL gate recipe is `qwen3.8-27b-nvfp4-bfcl`: thinking on, `reasoning_effort` medium. Its 2026-09-19 note records that with thinking off the nvidia 27B emits tool calls where it should abstain: 85.13 / 76.60, hallucination 55.11. With thinking on it scored 87.94 / 88.24 (run-1789419056919283587).
+- Today's thinking-off number (71.32) is about 5 points below September's thinking-off number. That isn't one variable, so it's unexplained for now.
+- Job 75 runs the gate recipe verbatim on the newest main image to settle it.
+
+**Queue tonight:**
+1. 73: BFCL A2.
+2. 73a / 73b: Qwen4 PLE synth and 64-layer synth.
+   - Fixes since the last entry: PLE `layer_multipliers` and the n-gram metadata are I64 and the norms F32, which explains the 24 B-over-6 B DtoH. synth-64 now has tokenizer files.
+3. 74: BFCL A1.
+4. 75: 27B BFCL on the gate recipe.
+
+## 2026-11-02 00:00 UTC — BFCL A2: verbatim_prompt is the main knob; Qwen4 64-layer synth boots
+
+**Knob results so far:**
+
+| arm | agentic-50 | BFCL overall / norm |
+|---|---|---|
+| A0 main 8c2b67218 | 47/50 | 87.54 / 85.94 |
+| A1 sampling / presence | 49/50 | (job 74) |
+| A2 `verbatim_prompt` off | 50/50 | 87.54 / **87.79** (run-1793576349809849743) |
+| A6 full revert | 50/50 | 88.04 / 88.08 |
+
+- Irrelevance recovers fully in A2: 87.50 → 95.83, the same as A6.
+- Posted on #271 (issuecomment-6565656238), with the minimal-change option: `verbatim_prompt = false` for qwen3.8-flash-next, keeping the rest of 565aa68.
+
+**Qwen4 64-layer synth** (16 attention + 48 GDN, dense 14336, random BF16; local draft b4f2ec5299):
+- Boots in 30 s. 50.1 GB pre-KV, 58.5 GB KV budget at 32K context (51.7 / 53.4 GB with MTP-4).
+- The TTFT/decode probe in 73b had a quoting bug, so no numbers. Lead-authored re-probe queued as 74a.
+- The PLE synth still needs n-gram shards: the loader refuses a PLE layer with no deferred shard table. That's a deliberate guard, not a bug.
+
+Queue: 74 (BFCL A1) → 74a (Qwen4 perf) → 75 (27B gate-recipe BFCL).
+
+## 2026-11-02 02:40 UTC — knob attribution complete
+
+| arm (vs main 8c2b67218) | agentic-50 | BFCL overall / norm |
+|---|---|---|
+| A0 main (565aa68 policy) | 47/50 | 87.54 / 85.94 |
+| A1 sampling rows (presence 1.5) | 49/50 | 87.74 / 86.81 (run-1793586397429843659) |
+| A2 `verbatim_prompt` off | 50/50 | 87.54 / 87.79 |
+| A6 full revert | 50/50 | 88.04 / 88.08 |
+
+- `verbatim_prompt` carries most of the cost; presence 1.5 is a smaller lever that partly overlaps it.
+- Final table posted on #271. The policy decision is left to the maintainers.
+- Qwen4 day-0 status is kept locally (`~/code/qwen4-prework/QWEN4-27B-SPEC.md`). The 64-layer synth boots and serves on the draft.
+- Running now: 75, the 27B NVFP4 BFCL gate recipe on the newest main image.
