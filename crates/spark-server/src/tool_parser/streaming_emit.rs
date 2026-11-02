@@ -299,13 +299,37 @@ impl StreamingToolDetector {
     /// showed total request latency is unchanged (+1.4 ms), so it improves
     /// responsiveness and reported TTFT, NOT wall.
     pub(super) fn process_bare_function(&mut self, outputs: &mut Vec<DetectorOutput>) -> bool {
-        let Some(func_pos) = self.buffer.find("<function") else {
+        // Search only complete marker prefixes. A literal example such as
+        // `<function=demo>` must be consumed as content before the normal
+        // bare-function path can mistake it for a call. Keep the marker
+        // forms in one list so split chunks still wait for a complete prefix.
+        const FUNCTION_MARKERS: [&str; 6] = [
+            "<function>",
+            "<function=",
+            "<function ",
+            "<|function>",
+            "<|function=",
+            "<|function ",
+        ];
+        let Some((func_pos, marker)) = FUNCTION_MARKERS
+            .iter()
+            .filter_map(|marker| self.buffer.find(marker).map(|position| (position, *marker)))
+            .min_by_key(|(position, _)| *position)
+        else {
             return false;
         };
         if func_pos > 0 {
             let before = self.buffer[..func_pos].to_string();
             self.buffer = self.buffer[func_pos..].to_string();
-            outputs.push(DetectorOutput::Content(before));
+            self.push_content(outputs, before);
+        }
+
+        if self.marker_is_literal(0) {
+            // Preserve the marker itself and continue scanning the remainder
+            // of this buffer for a later real bare-function call.
+            self.buffer = self.buffer[marker.len()..].to_string();
+            self.push_content(outputs, marker.to_string());
+            return true;
         }
 
         if let Some(end) = bare_function_end(&self.buffer) {

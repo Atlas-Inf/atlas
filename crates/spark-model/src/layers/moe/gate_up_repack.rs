@@ -57,6 +57,9 @@ mod validity_tests;
 #[cfg(test)]
 pub(crate) use model_fixture::model_fixture;
 #[cfg(test)]
+#[path = "forward_rows_t_tests.rs"]
+mod forward_rows_t_tests;
+#[cfg(test)]
 #[path = "gate_up_btile_launch_tests.rs"]
 mod launch_tests;
 #[path = "gate_up_native_source.rs"]
@@ -66,7 +69,7 @@ mod native_source;
 mod qwen4exp_fast_tests;
 #[cfg(test)]
 #[path = "gate_up_btile_test_gpu.rs"]
-mod recording;
+pub(crate) mod recording;
 #[cfg(test)]
 #[path = "gate_up_btile_shared_tests.rs"]
 mod shared_tests;

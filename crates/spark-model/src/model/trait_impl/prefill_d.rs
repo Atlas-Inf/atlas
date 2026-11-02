@@ -31,6 +31,7 @@ impl TransformerModel {
         h: u32,
         bs: usize,
         total_len: usize,
+        snap: Option<usize>,
         stream: u64,
     ) -> Result<DevicePtr> {
         seq.tokens.extend_from_slice(tokens);
@@ -67,6 +68,19 @@ impl TransformerModel {
         // Run final norm + LM head on the single re-embedded token.
         let normed = self.buffers.norm_output();
         self.final_norm_rows(hidden, normed, 1, stream)?;
+        // The re-embedded token went through no layers, so its final norm is
+        // not the prompt's last hidden. The snapshot that made this a full hit
+        // stashed that hidden (as `finalize_last`'s exact-hit fixup uses it).
+        match snap {
+            Some(id) if self.ssm_snapshots.has_hidden(id) => {
+                self.ssm_snapshots
+                    .restore_hidden(id, normed, self.gpu.as_ref(), stream)?;
+            }
+            _ => tracing::warn!(
+                "two-phase full cache hit without a stashed hidden — first-token \
+                 logits come from the last token's embedding"
+            ),
+        }
         self.lm_head(normed, stream)?;
         // Prefix cache insert (no new snapshot needed — SSM state unchanged).
         if !self.tokens_have_vision_pad(tokens) && !self.hss_window_slid(seq) {

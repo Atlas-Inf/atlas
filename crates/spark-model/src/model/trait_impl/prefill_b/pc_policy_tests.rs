@@ -5,7 +5,7 @@
 
 use super::{
     Agreed, agree_restore, branch_checkpoint_at, branch_split_at, layer_write_floor, replay_floor,
-    tail_cut,
+    rowinv_tail_unsplit_with, tail_cut,
 };
 
 const BS: usize = 16;
@@ -206,4 +206,45 @@ fn replay_floor_covers_the_replayed_matched_rows() {
     assert_eq!(replay_floor(true, 320, 256, 256, 40), 40);
     assert_eq!(replay_floor(true, 256, 256, 256, 100), 0);
     assert_eq!(replay_floor(false, 64, 0, 0, 70), 0);
+}
+
+/// `ATLAS_QWEN4EXP_PREFILL_ROWINV` decides alone whether the last chunk
+/// runs unsplit; `in_pass` only gates the warning, which fires for ROWINV
+/// without the in-pass checkpoint and at most once per guard.
+#[test]
+fn rowinv_tail_unsplit_truth_table_and_warn_once() {
+    use std::cell::Cell;
+    use std::sync::Once;
+    for (rowinv, in_pass, unsplit, warns) in [
+        (false, false, false, 0),
+        (false, true, false, 0),
+        (true, true, true, 0),
+        (true, false, true, 1),
+    ] {
+        let guard = Once::new();
+        let fired = Cell::new(0);
+        for _ in 0..3 {
+            let got =
+                rowinv_tail_unsplit_with(rowinv, in_pass, &guard, || fired.set(fired.get() + 1));
+            assert_eq!(got, unsplit, "rowinv={rowinv} in_pass={in_pass}");
+        }
+        assert_eq!(fired.get(), warns, "rowinv={rowinv} in_pass={in_pass}");
+    }
+}
+
+/// The once-guard is shared across `in_pass` values: a warning already
+/// given is not repeated, and an `in_pass` call never consumes it.
+#[test]
+fn rowinv_tail_unsplit_warn_guard_is_shared() {
+    use std::cell::Cell;
+    use std::sync::Once;
+    let guard = Once::new();
+    let fired = Cell::new(0);
+    let bump = || fired.set(fired.get() + 1);
+    assert!(rowinv_tail_unsplit_with(true, true, &guard, bump));
+    assert!(!guard.is_completed());
+    assert!(rowinv_tail_unsplit_with(true, false, &guard, bump));
+    assert!(rowinv_tail_unsplit_with(true, true, &guard, bump));
+    assert!(rowinv_tail_unsplit_with(true, false, &guard, bump));
+    assert_eq!(fired.get(), 1);
 }

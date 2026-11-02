@@ -36,6 +36,8 @@ use crate::layers::ops;
 mod qsa_aux;
 #[path = "qsa_decode_rows.rs"]
 mod qsa_decode_rows;
+#[path = "qsa_yarn.rs"]
+mod qsa_yarn;
 pub use qsa_decode_rows::{QSA_ROWS_MAX, QsaRowsSelection, draft_share_set};
 #[path = "qsa_decode_select.rs"]
 mod qsa_decode_select;
@@ -106,6 +108,8 @@ pub struct QsaIndexer {
     block_topk: u32,
     rot: u32,
     theta: f32,
+    yarn_inv_freq: DevicePtr,
+    yarn_attention_factor: f32,
     eps: f32,
     hidden: u32,
     nkv_attn: u32,
@@ -228,6 +232,8 @@ impl QsaIndexer {
             block_topk: block_topk as u32,
             rot: rot as u32,
             theta,
+            yarn_inv_freq: DevicePtr::NULL,
+            yarn_attention_factor: 1.0,
             eps,
             hidden: hidden as u32,
             nkv_attn: nkv_attn as u32,
@@ -410,7 +416,7 @@ impl QsaIndexer {
         }
 
         // q prep + block scores.
-        ops::qsa_qprep(
+        ops::qsa_qprep_scaled(
             gpu,
             self.k_qprep_k,
             self.qk_scratch,
@@ -422,6 +428,8 @@ impl QsaIndexer {
             pos as u32,
             self.theta,
             self.eps,
+            self.yarn_inv_freq,
+            self.yarn_attention_factor,
             stream,
         )?;
         if self.rows.decode_rows {

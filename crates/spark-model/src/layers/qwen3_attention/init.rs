@@ -126,7 +126,7 @@ impl Qwen3AttentionLayer {
         } = GlmIndexSelection::from_config(config, &probes)?;
         // Short gate flags so each GLM/hyper-connection lookup stays one line.
         let (glm, hc) = (probes.glm_kpool_indexer, probes.hyper_connection);
-        let layer = Self {
+        let mut layer = Self {
             input_norm,
             attn,
             post_attn_norm,
@@ -177,9 +177,11 @@ impl Qwen3AttentionLayer {
             v_weight: v_nvfp4.map(QuantWeight::Nvfp4),
             o_weight: None,
             o_dense_bf16: None,
+            mx8_rt: None,
             mla: None,
             mla_mx: Vec::new(),
             mla_q4: Vec::new(),
+            mla_native: Default::default(),
             // ── DeepSeek-V4 Manifold-Constrained Hyper-Connections (mHC) ──
             // `hc` stays None for non-V4 models; the V4 loader attaches real
             // HcWeights after this constructor. Kernel handles are lazy (null
@@ -306,7 +308,7 @@ impl Qwen3AttentionLayer {
                 .kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")
                 .unwrap_or(KernelHandle(0)),
             dense_gemv_batch5_k: gate(
-                probes.glm_series,
+                probes.glm_mla,
                 gpu,
                 "dense_gemv_bf16_batchm",
                 "dense_gemv_bf16_batch5",
@@ -368,6 +370,7 @@ impl Qwen3AttentionLayer {
             ),
             rope_yarn_k: super::super::try_kernel(gpu, "rope", "rope_forward_yarn"),
             rope_yarn_scaled_k: super::super::try_kernel(gpu, "rope", "rope_forward_yarn_scaled"),
+            rope_yarn_mrope_k: spark_runtime::gpu::KernelHandle(0),
             // Interleaved (GPT-J / is_neox_style=False) YaRN RoPE — DeepSeek-V4 MLA.
             rope_yarn_interleaved_k: super::super::try_kernel(
                 gpu,
@@ -604,10 +607,10 @@ impl Qwen3AttentionLayer {
             ),
             dense_gemm_tc_k: super::super::try_kernel(gpu, "gemm_tc", "dense_gemm_tc"),
             mxfp8_gemv_k: ["mxfp8_gemv_tc8", "mxfp8_gemv_tc16", "mxfp8_gemv_tc32"]
-                .map(|name| gate(probes.glm_series, gpu, "mxfp8_gemv", name)),
+                .map(|name| gate(probes.glm_mla, gpu, "mxfp8_gemv", name)),
             mxfp8_gemv_grouped_k: ["mxfp8_gemv_tc8_grouped", "mxfp8_gemv_tc16_grouped"]
-                .map(|name| gate(probes.glm_series, gpu, "mxfp8_gemv", name)),
-            mxfp8_quantize_k: gate(probes.glm_series, gpu, "mxfp8_gemv", "mxfp8_quantize_bf16"),
+                .map(|name| gate(probes.glm_mla, gpu, "mxfp8_gemv", name)),
+            mxfp8_quantize_k: gate(probes.glm_mla, gpu, "mxfp8_gemv", "mxfp8_quantize_bf16"),
             paged_decode_splitk_k: match kv_dtype {
                 KvCacheDtype::Nvfp4 => {
                     Some(gpu.kernel("paged_decode_nvfp4", "paged_decode_attn_splitk_nvfp4")?)
@@ -713,7 +716,7 @@ impl Qwen3AttentionLayer {
             w4a16_gemm_t_k: crate::layers::tgemm_kernel(gpu),
             w4a16_gemm_t_k64_k: crate::layers::k64_kernel(gpu)?,
             w4a16_gemm_t_k64_n64_k: crate::layers::k64_n64_kernel(gpu),
-            w4a16_gemm_t_m128_k: gpu.kernel("w4a16", "w4a16_gemm_t_m128")?,
+            w4a16_gemm_t_m128_k: crate::layers::ops::w4a16_m128_kernel_required(gpu)?,
             w4a16_gemm_t_m128_bf16_k: super::super::try_kernel(
                 gpu,
                 "w4a16",
@@ -920,6 +923,7 @@ impl Qwen3AttentionLayer {
                 None
             },
         };
+        layer.configure_qwen_yarn(config, gpu)?;
         if independent {
             layer.validate_independent_kernels()?;
         }

@@ -25,11 +25,17 @@
 //! positions the sequence then fills with other tokens.
 
 use super::Qwen4ExpMtpProposerState;
+// Ported from Enntity/atlas 166e2b1 (AGPL-3.0-only).
+use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype};
 
-/// `ATLAS_QWEN4EXP_MTP_KV_KEEP=1`, read once.
+/// `ATLAS_QWEN4EXP_MTP_KV_KEEP=1`, read once. The absorb
+/// (`ATLAS_QWEN4EXP_MTP_ABSORB=1`) implies it: it appends after row 0.
 pub(crate) fn keep_committed() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_MTP_KV_KEEP").as_deref() == Ok("1"))
+    *ON.get_or_init(|| {
+        std::env::var("ATLAS_QWEN4EXP_MTP_KV_KEEP").as_deref() == Ok("1")
+            || super::qwen4exp_mtp_absorb::enabled()
+    })
 }
 
 /// Rows of the last propose (`drafted`, at least 1) kept after a verdict
@@ -48,6 +54,7 @@ pub(crate) fn after_verdict(st: &mut Qwen4ExpMtpProposerState, accepted: usize) 
     let keep = kept_rows(drafted, accepted, keep_committed());
     st.seq_len = st.seq_len.saturating_sub(drafted - keep);
     st.awaiting_verdict = false;
+    st.absorb.verdict = Some(accepted);
 }
 
 /// Before a propose: drafts the scheduler dropped unverified count as
@@ -57,6 +64,31 @@ pub(crate) fn settle_unverified(st: &mut Qwen4ExpMtpProposerState) {
         after_verdict(st, 0);
     }
     st.awaiting_verdict = false;
+}
+
+/// The drafter's KV geometry: `slot` placeholder layer slots, then the one
+/// layer it writes. The placeholders exist only so the body's
+/// `attn_idx = slot` lands on a real pool; they are never read or written,
+/// so they get the smallest geometry the allocator accepts (one 1-wide head,
+/// 32 B per block) instead of a full layer each. Full layers there cost
+/// 12/13 of the pool: 6.5 GB at --max-seq-len 262144 where 0.5 GB is used.
+pub(super) fn drafter_kv_config(
+    slot: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> KvCacheConfig {
+    let mut layer_dims = vec![(1, 1); slot];
+    layer_dims.push((num_kv_heads, head_dim));
+    KvCacheConfig {
+        block_size: 16,
+        num_kv_heads,
+        head_dim,
+        num_layers: slot + 1,
+        dtype: KvCacheDtype::Bf16,
+        layer_dtypes: vec![],
+        layer_dims,
+        cache_blocks_per_seq: None,
+    }
 }
 
 #[cfg(test)]

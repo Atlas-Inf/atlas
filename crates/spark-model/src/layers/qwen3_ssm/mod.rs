@@ -88,6 +88,9 @@ pub struct Qwen3SsmLayer {
     /// block-scaled `w8a16_*` arms).
     qkvz_fp8w_rowwise: Option<Fp8Weight>,
     out_proj_fp8w_rowwise: Option<Fp8Weight>,
+    /// Native MXFP8 `[Q|K|V|Z]` and out_proj (FP4-Local). When set, it is
+    /// the only copy of both projections; see `mx8`.
+    mx8: Option<mx8::Mx8Gdn>,
     /// Tier-1c keep-packed ternary Q2_0 fused in_proj_qkvz (`ATLAS_GGUF_NATIVE_Q2`).
     /// [Q|K|V|Z] rows byte-concatenated from packed `in_proj_qkv` (V-region
     /// row-permuted) + `in_proj_z` (row-permuted) at load, so the 2-bit weight is
@@ -429,6 +432,7 @@ mod init_fp8;
 mod init_q2;
 mod kernel_select;
 mod lora;
+pub mod mx8;
 mod ssm_decode_tail;
 mod ssm_forward;
 pub(crate) mod ssm_h_fp16;
@@ -462,6 +466,8 @@ pub use gdn_flags::{
 
 // ── TransformerLayer impl (delegates to per-file inherent _inner methods) ──
 
+#[cfg(test)]
+mod mx8_tests;
 #[cfg(test)]
 mod tests;
 

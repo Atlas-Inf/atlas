@@ -27,6 +27,9 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16): every
+        // entry of this decode (`TransformerLayer::decode`).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         // DeepSeek-V4: Manifold-Constrained Hyper-Connections (mHC).
         // When HC is enabled, the persistent multi-stream state lives in
         // `hc_streams`; `hidden` is used as a single-stream scratch buffer.

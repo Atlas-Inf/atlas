@@ -8,7 +8,7 @@ use anyhow::Result;
 use spark_runtime::radix_tree::{glm_pc_evict_enabled, snap_evict_alpha, snap_evict_legacy};
 
 use crate::layer::glm_long_owner;
-use crate::layers::dflash_head::rank_split;
+use crate::layers::dflash_head::{ConvTwinKind, rank_split};
 use crate::layers::qwen3_attention::{
     glm_mla_multi_seq_enabled, glm_multi_seq_sparse_enabled, glm_multi_seq_sparse_graphs_enabled,
     grouped_routed_decode_enabled, grouped_routed_decode_min, index_split_words,
@@ -35,6 +35,14 @@ const GLM: &str = "glm5_next";
 /// The settings read in this crate: name, and this process's value from the
 /// feature's own parser. One entry per setting.
 pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
+    ("ATLAS_QWEN4EXP_SERVING_MODE", || {
+        use crate::weight_loader::qwen4_exp::mode::{ServingMode, selected};
+        Ok(match selected()? {
+            None => 0,
+            Some(ServingMode::Strict) => 1,
+            Some(ServingMode::Spark) => 2,
+        })
+    }),
     // A rank that would only warn beside one that fails.
     (
         "ATLAS_STARTUP_PARITY=warn",
@@ -280,6 +288,7 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
             rank_split::requested()?,
             rank_split::batch_requested()?,
             rank_split::ctx_requested()?,
+            rank_split::topk_requested()?,
         ))
     }),
     // The draft head a qwen4_exp worker builds and the swaps of each batched
@@ -447,6 +456,21 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_PREFILL_MOE_BF16", || {
         Ok(moe::tcp_requested() as u64)
     }),
+    // Drafter work splits across ranks under ATLAS_QWEN4EXP_MTP_DRAFT_TP:
+    // absorb/prompt-row writes must match row for row.
+    ("ATLAS_QWEN4EXP_MTP_ABSORB", || {
+        Ok(crate::layers::qwen4exp_mtp::qwen4exp_mtp_absorb::enabled() as u64)
+    }),
+    ("ATLAS_QWEN4EXP_MTP_PREFILL", || {
+        Ok(crate::layers::qwen4exp_mtp::qwen4exp_mtp_prompt::window() as u64)
+    }),
+    // The decision window and start steer every rank's verify depth.
+    ("ATLAS_MTP_DEEP_WINDOW/_START", || {
+        while_on(crate::speculative::deep_depth::enabled(), || {
+            (crate::speculative::deep_depth::decision_window() as usize) << 8
+                | crate::speculative::deep_depth::deep_start().unwrap_or(0)
+        })
+    }),
     // Both apply only through the vectorized collapse (`_HC_FAST`).
     ("ATLAS_QWEN4EXP_HC_MMA", || {
         while_on(ops::hc_fast(), || ops::hc_mma() as usize)
@@ -458,6 +482,15 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     // verify) and the check's serial steps (their collectives).
     ("ATLAS_QWEN4EXP_EXACT_VERIFY", || {
         Ok(qwen4exp_exact_verify::requested() as u64)
+    }),
+    ("ATLAS_GLM_DENSE_TP_SPLIT", || {
+        Ok(layers::dense_ffn::dense_tp_split_requested()? as u64)
+    }),
+    ("ATLAS_GLM_MOE_ROUTE_FUSE", || {
+        Ok(moe::route_fuse_requested()? as u64)
+    }),
+    ("ATLAS_GLM_KDA_COMMIT_CTAS", || {
+        Ok(ops::kda_commit_ctas()? as u64)
     }),
 ];
 

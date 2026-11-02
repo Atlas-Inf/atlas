@@ -24,9 +24,13 @@ use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+mod deferred_slice;
 mod direct_io;
 mod header;
 mod shard;
+mod shard_readers;
+
+pub use deferred_slice::{SliceAxis, decode_deferred_csf_scale, with_deferred_slice};
 
 use header::resolve_shards;
 
@@ -64,16 +68,18 @@ pub struct FastSafetensorsLoader {
     /// identical local arithmetic while distributing only its output head.
     pub replicated_expert_prefix: Option<String>,
     pub peak_memory_multiplier: Option<f64>,
-    /// Skip the W4A4 `*.input_scale` activation scales at load.
+    /// Do not upload the W4A4 `*.input_scale` activation scales; defer them
+    /// (every expert's, on every rank) for a model loader that reads them on
+    /// the host.
     ///
     /// ModelOpt NVFP4 checkpoints ship one 0-dim F32 scalar per quantized
     /// projection. On a 512-expert model that is ~74k four-byte allocations,
-    /// each taking a full allocation granule — GBs of padding for values
-    /// Atlas never reads, because it serves w4a16 (BF16 activations) and the
-    /// NVFP4 loader already treats the key as optional.
+    /// each taking a full allocation granule — GBs of padding for scalars a
+    /// loader can read from disk (qwen4_exp's W4A4 prefill tables); the
+    /// NVFP4 loader already treats the uploaded key as optional.
     ///
     /// OPT-IN: `step3p7` reads this key on its own path, so it must stay off
-    /// unless the model's loader is known not to need it.
+    /// unless the model's loader is known not to need it uploaded.
     pub skip_activation_scales: bool,
     /// Skip `mtp.*` tensors at load.
     ///
@@ -141,6 +147,11 @@ pub struct FastSafetensorsLoader {
     /// packed weights and block scales, which the model loader reads from
     /// disk as this rank's slice (see `should_defer_tensor`).
     pub expert_tp: bool,
+    /// Modules whose `.weight` and `.weight_scale` are stored in a format the
+    /// kernels do not read (MXFP8, or NVFP4 in a tower that runs BF16). They
+    /// are DEFERRED — located, not uploaded — and the model build expands
+    /// them on the host, so the originals never occupy device memory.
+    pub host_decode_modules: std::collections::HashSet<String>,
 }
 
 /// Default tensor-count cap for per-shard `O_DIRECT`. Above this, the fast
@@ -176,6 +187,7 @@ impl FastSafetensorsLoader {
             prefetch_shards: false,
             demand_paged_patterns: Vec::new(),
             expert_tp: false,
+            host_decode_modules: std::collections::HashSet::new(),
         }
     }
 
@@ -197,6 +209,7 @@ impl FastSafetensorsLoader {
             prefetch_shards: false,
             demand_paged_patterns: Vec::new(),
             expert_tp: false,
+            host_decode_modules: std::collections::HashSet::new(),
         }
     }
 }
@@ -261,6 +274,23 @@ impl WeightLoader for FastSafetensorsLoader {
         let total_shards = shard_files.len();
         let initial_free = gpu.free_memory()?;
         let mut offload_logged = false;
+        let mut csf = crate::weights::nvfp4_csf::CsfAssembler::new();
+
+        // Index entries grouped by the shard path they name, ONCE, keyed by
+        // `model_dir.join(<index string>)` — the very expression
+        // `resolve_shards` built `shard_files` from, so the lookup below is
+        // exact whatever the index spells (FP4-Local's
+        // `tensors/model-00001-of-00021.safetensors` keeps its shards in a
+        // subdirectory). Matching the index string to the bare FILE NAME
+        // instead found nothing for such a checkpoint and silently loaded
+        // zero tensors from every shard.
+        let mut by_shard: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        for (t, s) in tensor_to_shard.iter().flatten() {
+            by_shard
+                .entry(model_dir.join(s))
+                .or_default()
+                .push(t.clone());
+        }
 
         for (i, shard_path) in shard_files.iter().enumerate() {
             // When an index is present, only load the tensors it routes here;
@@ -269,12 +299,9 @@ impl WeightLoader for FastSafetensorsLoader {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
-            let tensor_filter: Option<Vec<String>> = tensor_to_shard.as_ref().map(|map| {
-                map.iter()
-                    .filter(|(_, s)| *s == shard_name)
-                    .map(|(t, _)| t.clone())
-                    .collect()
-            });
+            let tensor_filter: Option<Vec<String>> = tensor_to_shard
+                .as_ref()
+                .map(|_| by_shard.remove(shard_path).unwrap_or_default());
 
             tracing::info!(
                 "Fast-loading shard {}/{}: {}{}",
@@ -301,6 +328,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 &mut weights,
                 &mut deferred,
                 &mut offload_logged,
+                &mut csf,
             )?;
 
             let free_now = gpu.free_memory().unwrap_or(0);
@@ -350,8 +378,10 @@ impl WeightLoader for FastSafetensorsLoader {
                 &mut weights,
                 &mut deferred,
                 &mut extra_offload,
+                &mut csf,
             )?;
         }
+        csf.finish(|n| crate::weights::loaded_shape(&weights, &deferred, n))?;
 
         tracing::info!("Fast-loaded {} weight tensors", weights.len());
         let mut store = WeightStore::from_map(weights);
@@ -361,6 +391,10 @@ impl WeightLoader for FastSafetensorsLoader {
         Ok(store)
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "csf_load_tests.rs"]
+mod csf_load_tests;
 
 #[cfg(test)]
 mod expert_filter_tests {
@@ -377,13 +411,59 @@ mod expert_filter_tests {
         assert!(loader.should_skip_tensor(target));
     }
 
+    /// FP4-Local: listed MXFP8 modules are located, not uploaded; their scalar
+    /// siblings, the CSF streams (decoded at upload) and every other tensor
+    /// load as usual.
+    #[test]
+    fn host_decoded_tensors_are_deferred() {
+        let mut loader = FastSafetensorsLoader::new();
+        let attn = "model.language_model.layers.3.self_attn.q_proj";
+        loader.host_decode_modules.insert(attn.to_string());
+        let expert = "model.language_model.layers.0.mlp.experts.3.down_proj";
+        for name in [format!("{attn}.weight"), format!("{attn}.weight_scale")] {
+            assert!(loader.should_defer_tensor(&name), "{name}");
+        }
+        for name in [
+            format!("{expert}.weight"),
+            format!("{expert}.weight_scale.nvfp4_csf_fixed"),
+            format!("{expert}.weight_scale.nvfp4_csf_exceptions"),
+            format!("{expert}.weight_scale_2"),
+            format!("{attn}.weight_scale_2"),
+            "model.language_model.layers.3.self_attn.k_proj.weight".to_string(),
+        ] {
+            assert!(!loader.should_defer_tensor(&name), "{name}");
+        }
+    }
+
+    /// Every expert's activation scales -- a remote one's too -- are deferred,
+    /// never uploaded; the rest of an expert keeps the EP filter.
+    #[test]
+    fn activation_scales_are_deferred_for_every_expert() {
+        let mut loader = FastSafetensorsLoader::with_ep(0, 2, 512);
+        loader.skip_activation_scales = true;
+        for e in [3, 300] {
+            let name =
+                format!("model.language_model.layers.7.mlp.experts.{e}.down_proj.input_scale");
+            assert!(!loader.should_skip_tensor(&name));
+            assert!(loader.should_defer_tensor(&name));
+        }
+        let remote = "model.language_model.layers.7.mlp.experts.300.down_proj.weight";
+        assert!(loader.should_skip_tensor(remote));
+        assert!(!loader.should_defer_tensor(remote));
+    }
+
     #[test]
     fn expert_tp_keeps_every_expert_and_defers_only_its_bulk() {
         let mut loader = FastSafetensorsLoader::with_ep(1, 2, 288);
         loader.expert_tp = true;
         loader.rank0_only_expert_prefix = Some(".layers.45.".into());
         let p = "model.language_model.layers.44.mlp.experts.1.gate_proj";
-        for suffix in ["weight", "weight_scale"] {
+        for suffix in [
+            "weight",
+            "weight_scale",
+            "weight_scale.csf32_codes",
+            "weight_scale.nvfp4_csf_fixed",
+        ] {
             let name = format!("{p}.{suffix}");
             assert!(!loader.should_skip_tensor(&name));
             assert!(loader.should_defer_tensor(&name));

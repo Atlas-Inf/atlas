@@ -23,6 +23,9 @@ pub(super) struct TestModel {
 #[derive(Default)]
 pub(super) struct VerifyScript {
     pub picks: Vec<u32>,
+    pub is_ep: bool,
+    pub fail_candidates: bool,
+    pub fail_full_rows: bool,
     pub log: std::sync::Mutex<Vec<String>>,
 }
 
@@ -49,6 +52,42 @@ fn scripted<T>(ptr: DevicePtr, f: impl FnOnce(usize, &[Vec<f32>]) -> T) -> Optio
         let s = s.as_ref()?;
         Some(f(s.cursor * 2048 + ptr.0 as usize / 2, &s.rows))
     })
+}
+
+/// Candidates per scripted rank.
+pub(super) const SPLIT_CANDIDATES: usize = 16;
+
+/// `row` (BF16-exact) as two ranks' candidates would leave it.
+fn split_row(row: &[f32], temperature: f32, specials: &[u32]) -> spark_model::model::SplitRow {
+    let half = row.len() / 2;
+    let mut present: Vec<(u32, f32)> = Vec::new();
+    let mut bound = (f32::NEG_INFINITY, u32::MAX);
+    let mut mass = 0.0f64;
+    for r in 0..2 {
+        let mut ids: Vec<usize> = (r * half..(r + 1) * half).collect();
+        ids.sort_by(|&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
+        let (best, rest) = ids.split_at(SPLIT_CANDIDATES);
+        present.extend(best.iter().map(|&i| (i as u32, row[i])));
+        let last = best[SPLIT_CANDIDATES - 1];
+        if row[last] > bound.0 || (row[last] == bound.0 && (last as u32) < bound.1) {
+            bound = (row[last], last as u32);
+        }
+        for &i in rest {
+            if specials.contains(&(i as u32)) {
+                present.push((i as u32, row[i]));
+            } else {
+                mass += ((row[i] / temperature) as f64).exp();
+            }
+        }
+    }
+    spark_model::model::SplitRow {
+        present,
+        absent: Some(spark_runtime::sampler::Absent {
+            bound: bound.0,
+            bound_id: bound.1,
+            log_mass: mass.ln() as f32,
+        }),
+    }
 }
 
 impl TestModel {
@@ -220,14 +259,53 @@ impl Model for TestModel {
         Ok(())
     }
     fn compact_sequence(&self, _: &mut SequenceState, _: usize) -> Result<bool> {
-        Ok(true)
+        Ok(false)
     }
     fn detach_slot_for_reuse(&self, _: &mut SequenceState) {}
     fn save_hidden_for_mtp(&self, _: usize, _: u64) -> Result<()> {
         Ok(())
     }
+    fn is_ep(&self) -> bool {
+        self.verify.as_ref().is_some_and(|v| v.is_ep)
+    }
+    fn begin_glm_long_owner_tail(&self, _: u32, owner: usize, _: &[u32]) -> Result<()> {
+        anyhow::ensure!(self.verify.is_some(), "no scripted owner tail");
+        self.log(format!("owner {owner}"));
+        Ok(())
+    }
     fn verify_logits_argmax_only(&self) -> bool {
         self.verify.is_some()
+    }
+    /// A scripted split head (`split_rows` tests): two ranks of the scripted
+    /// rows from the cursor on, each sending its best [`SPLIT_CANDIDATES`].
+    fn verify_split_sampling(&self) -> bool {
+        self.verify.is_some() && SCRIPT.with(|s| s.borrow().is_some())
+    }
+    fn verify_split_candidates(
+        &self,
+        rows: usize,
+        temperature: f32,
+        specials: &[u32],
+    ) -> Result<Vec<spark_model::model::SplitRow>> {
+        self.log(format!("candidates {rows}"));
+        anyhow::ensure!(
+            !self.verify.as_ref().is_some_and(|v| v.fail_candidates),
+            "injected split-candidate exchange failure"
+        );
+        scripted(DevicePtr::NULL, |at, all| {
+            (0..rows)
+                .map(|r| split_row(&all[at / 2048 + r], temperature, specials))
+                .collect()
+        })
+        .ok_or_else(|| anyhow::anyhow!("no scripted rows"))
+    }
+    fn verify_split_full_rows(&self, rows: usize, out: &mut [u8]) -> Result<()> {
+        self.log(format!("full {rows}"));
+        anyhow::ensure!(
+            !self.verify.as_ref().is_some_and(|v| v.fail_full_rows),
+            "injected split-full-row exchange failure"
+        );
+        self.copy_logits_to_host(DevicePtr::NULL, out)
     }
     fn ep_broadcast_cmd_for_seq(&self, _: u32, cmd: u32) -> Result<()> {
         self.log(format!("seq_cmd {cmd:#x}"));

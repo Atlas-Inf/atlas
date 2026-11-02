@@ -13,12 +13,16 @@ use std::sync::Arc;
 
 use atlas_core::registry::AtlasRegistry;
 
+mod display_carveout;
 mod fault_probe;
 mod gpu_copy;
 mod gpu_impl;
 pub use gpu_impl::{configure_pdl, pdl_enabled};
 mod gpu_impl_graph;
 mod host_staging;
+mod meminfo;
+pub(crate) use meminfo::unified_free;
+use meminfo::{system_available_memory_bytes, system_meminfo_bytes};
 #[cfg(unix)]
 mod nvml;
 pub mod tensormap;
@@ -212,8 +216,6 @@ impl AtlasCudaBackend {
         })
     }
 
-    /// This model's kernel modules, for the paths that need the registry
-    /// directly rather than through `GpuBackend`.
     /// True when `ptr` lies strictly inside a registered slab — carved
     /// interior pointers own no storage and must never reach cuMemFree.
     pub(crate) fn is_slab_interior(&self, ptr: u64) -> bool {
@@ -354,23 +356,13 @@ pub fn cuda_free_memory_bytes() -> Option<usize> {
 
     // On unified memory, also check MemAvailable from /proc/meminfo.
     // This includes reclaimable buff/cache that CUDA doesn't account for.
-    if let Some(mem_available) = system_available_memory_bytes() {
-        free = free.max(mem_available);
-    }
+    free = unified_free(
+        free,
+        total,
+        system_meminfo_bytes("MemTotal:"),
+        system_available_memory_bytes(),
+    );
     Some(free)
-}
-
-/// Read MemAvailable from /proc/meminfo (Linux only).
-/// Returns None on non-Linux or if parsing fails.
-fn system_available_memory_bytes() -> Option<usize> {
-    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in contents.lines() {
-        if line.starts_with("MemAvailable:") {
-            let kb: usize = line.split_whitespace().nth(1)?.parse().ok()?;
-            return Some(kb * 1024);
-        }
-    }
-    None
 }
 
 /// Start a background OOM watchdog that polls GPU memory every `interval`.

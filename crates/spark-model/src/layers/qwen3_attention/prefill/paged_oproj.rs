@@ -36,9 +36,9 @@ impl Qwen3AttentionLayer {
             ops::bf16_gemm(attn_out, w.0, o_out, n, h, nq * hd, stream)?;
             return Ok(o_out);
         }
-        // Keep-packed Q2_0 (Tier-1c): transient-dequant o_proj then dense GEMM.
+        // Native MXFP8 / keep-packed Q2_0: not GEMM-ready as stored.
         if let Some(r) =
-            self.try_q2_prefill(ctx, self.o_weight.as_ref(), attn_out, o_out, n, stream)
+            self.try_unpacked_prefill(ctx, self.o_weight.as_ref(), attn_out, o_out, n, stream)
         {
             r?;
             return Ok(o_out);

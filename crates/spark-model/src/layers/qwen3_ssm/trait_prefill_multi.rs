@@ -107,7 +107,9 @@ impl Qwen3SsmLayer {
                 )?;
             }
         }
-        // ── GDN sublayer ── (the previous layer's deferred post fused in)
+        // ── GDN sublayer ── (the previous layer's deferred post fused in;
+        // its qkvz input also as MXFP8 under ATLAS_QWEN4EXP_PREFILL_W8A8)
+        let mx = self.w8a8_producer(ctx, hidden, total, 0, total)?;
         if !ops::qwen4exp_prefill_seam::pre_with_pending(
             ctx.gpu,
             self.hc_post_k,
@@ -137,6 +139,9 @@ impl Qwen3SsmLayer {
                 eps,
                 stream,
             )?;
+        }
+        if let Some(p) = mx {
+            p.finish();
         }
         crate::det_trace::on_stream(ctx.gpu, stream).tap("in", hidden, (0, total), h * 2);
         let mut rows: Vec<(usize, usize, &mut dyn LayerState)> = segs

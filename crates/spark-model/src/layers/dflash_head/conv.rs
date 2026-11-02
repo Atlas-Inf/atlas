@@ -13,12 +13,22 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
-use crate::weight_map::DenseWeight;
+use crate::weight_map::{DenseWeight, Mxfp8Weight, QuantizedWeight};
+
+/// A smaller copy of `kernel_projection` the delta GEMM reads instead
+/// (`ATLAS_DFLASH_CONV_TWIN`, `twins.rs`). It changes drafts only.
+#[derive(Clone, Copy, Debug)]
+pub enum ConvTwin {
+    Nvfp4(QuantizedWeight),
+    Mxfp8(Mxfp8Weight),
+}
 
 #[derive(Clone)]
 pub struct Dflash2Conv {
     pub base_kernel: DenseWeight,
     pub kernel_projection: DenseWeight,
+    /// `kernel_projection`'s twin, when one was installed.
+    pub twin: Option<ConvTwin>,
     pub num_groups: usize,
     pub group_size: usize,
     pub kernel_size: usize,
@@ -37,6 +47,7 @@ impl Dflash2Conv {
         Self {
             base_kernel,
             kernel_projection,
+            twin: None,
             num_groups,
             group_size,
             kernel_size,

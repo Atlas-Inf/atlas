@@ -68,7 +68,7 @@ impl VisionEncoder {
         self.vit_gemm_bias(
             gpu,
             self.buf_merge_in,
-            m.fc1_w,
+            self.vit_weight_ptr(gpu, &m.fc1_w, stream)?,
             m.fc1_b,
             self.buf_merge_fc1,
             merged_p,
@@ -87,7 +87,7 @@ impl VisionEncoder {
         self.vit_gemm_bias(
             gpu,
             self.buf_merge_fc1,
-            m.fc2_w,
+            self.vit_weight_ptr(gpu, &m.fc2_w, stream)?,
             m.fc2_b,
             out_slice,
             merged_p,

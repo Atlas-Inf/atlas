@@ -26,8 +26,10 @@ mod decode_a3;
 mod decode_a_diag;
 mod decode_b;
 mod decode_b2;
+mod decode_canonical;
 mod decode_checkpoint;
 mod decode_graph_key;
+mod drafter_anchor;
 pub(super) mod drafter_prefill;
 mod entry;
 mod ep_misc;
@@ -36,7 +38,9 @@ mod exact_verify_check;
 pub(crate) mod finish_leaf;
 pub(crate) mod gdn_commit_fuse;
 mod graph_borrow;
+mod kda_commit;
 mod lm_head_batched;
+pub(crate) use lm_head_batched::lm_head_batch_gemv_enabled;
 mod lm_head_dp4a;
 mod meta;
 mod meta_argmax;
@@ -65,6 +69,23 @@ impl Model for TransformerModel {
         self.glm_verify_logits_argmax_only()
     }
 
+    fn verify_split_sampling(&self) -> bool {
+        self.glm_verify_sample_supported()
+    }
+
+    fn verify_split_candidates(
+        &self,
+        rows: usize,
+        temperature: f32,
+        specials: &[u32],
+    ) -> Result<Vec<crate::model::SplitRow>> {
+        self.glm_verify_candidates(rows, temperature, specials)
+    }
+
+    fn verify_split_full_rows(&self, rows: usize, out: &mut [u8]) -> Result<()> {
+        self.glm_verify_full_rows(rows, out)
+    }
+
     fn lightning_dspark_product_policy(
         &self,
     ) -> Option<&crate::layers::dflash_head::LightningDsparkProductPolicy> {
@@ -86,8 +107,27 @@ impl Model for TransformerModel {
         }
     }
 
-    fn prepare_vision_embed(&self, images: &[crate::VisionItem]) -> Result<()> {
-        self.prepare_vision_embed_dispatch(images)
+    fn vision_row_limits(&self) -> (usize, usize) {
+        let b = self.vision_row_bounds();
+        (b.window, b.request)
+    }
+
+    fn prepare_vision_embed(
+        &self,
+        seq: &mut SequenceState,
+        images: Vec<crate::VisionItem>,
+    ) -> Result<()> {
+        self.prepare_vision_embed_dispatch(seq, images)
+    }
+    fn prepare_vision_embed_for_chunked(
+        &self,
+        seq: &mut SequenceState,
+        images: Vec<crate::VisionItem>,
+    ) -> Result<()> {
+        self.prepare_vision_embed_deferred_dispatch(seq, images)
+    }
+    fn stage_vision_grids(&self, seq: &mut SequenceState, images: &[crate::VisionItem]) {
+        self.stage_vision_grids_dispatch(seq, images);
     }
     fn prepare_vision_embed_batched(
         &self,
@@ -97,15 +137,17 @@ impl Model for TransformerModel {
     }
     fn set_vision_slice_base(
         &self,
+        seq: &mut SequenceState,
         row_base: usize,
         grid_base: usize,
         owned_images: usize,
         slice_rows: usize,
     ) {
-        self.set_vision_slice_base_entry(row_base, grid_base, owned_images, slice_rows);
+        Self::set_vision_slice_base_entry(seq, row_base, grid_base, owned_images, slice_rows);
     }
     fn ep_broadcast_vision_state_for_seq(
         &self,
+        seq: &SequenceState,
         seq_id: u32,
         enabled: bool,
         row_base: usize,
@@ -114,6 +156,7 @@ impl Model for TransformerModel {
         slice_rows: usize,
     ) -> Result<()> {
         self.ep_broadcast_vision_state_for_seq_dispatch(
+            seq,
             seq_id,
             enabled,
             row_base,
@@ -230,6 +273,8 @@ impl Model for TransformerModel {
             self.gpu.abort_capture_if_active(self.gpu.default_stream());
         }
         let out = r?;
+        // Ported from Enntity/atlas 166e2b1, e7d4e1a (AGPL-3.0-only).
+        self.try_mtp_prompt_absorb(prefill_seq, prefill_tokens, stream);
         self.try_eager_drafter_prefill(prefill_seq, prefill_is_last, stream)?;
         Ok(out)
     }
@@ -337,6 +382,31 @@ impl Model for TransformerModel {
     fn normalize_ssm_states(&self, seq: &SequenceState, stream: u64) -> Result<()> {
         self.gdn_fuse_flush_all()?;
         self.normalize_ssm_states_dispatch(seq, stream)
+    }
+
+    fn align_prefill_chunk(&self, offset: usize, len: usize, total: usize) -> usize {
+        if self.prefill_grid() == 0
+            || offset + len >= total
+            || std::env::var("ATLAS_PREFILL_CHUNK_ALIGN").as_deref() == Ok("0")
+        {
+            return len;
+        }
+        spark_runtime::prefill_grid::cuts().align_chunk(offset, len, total)
+    }
+
+    fn normalize_after_chunk(&self, seq: &SequenceState, chunk_end: usize) -> bool {
+        // The cold run clamp-normalizes the SSM state at every scheduler chunk
+        // end. A warm run restored at `marconi_skip_to` must not normalize at
+        // chunk ends BELOW the anchor: the restored state already holds those
+        // (it was saved by a cold run that applied them), so normalizing again
+        // changes it. A chunk ending exactly at the anchor still normalizes —
+        // the snapshot there was saved before the cold run's normalize.
+        // `ATLAS_NORM_ALL_CHUNKS=1` restores the old always-normalize.
+        // Only under the grid (`--exact-prefix-cache`); otherwise main's
+        // always-normalize.
+        self.prefill_grid() == 0
+            || chunk_end >= seq.marconi_skip_to
+            || std::env::var("ATLAS_NORM_ALL_CHUNKS").as_deref() == Ok("1")
     }
     fn bind_gpu_to_thread(&self) -> Result<()> {
         self.bind_gpu_to_thread_dispatch()
@@ -700,6 +770,14 @@ impl Model for TransformerModel {
 
     fn select_mtp_stream_row(&self, row: usize) -> Result<()> {
         self.select_mtp_stream_row_dispatch(row)
+    }
+    fn stage_mtp_absorb(
+        &self,
+        seq: &mut SequenceState,
+        row: usize,
+        accepted: &[u32],
+    ) -> Result<()> {
+        self.stage_mtp_absorb_dispatch(seq, row, accepted)
     }
     fn save_hidden_for_mtp(&self, token_idx: usize, _stream: u64) -> Result<()> {
         self.save_hidden_for_mtp_dispatch(token_idx, _stream)

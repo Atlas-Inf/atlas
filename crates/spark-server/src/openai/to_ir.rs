@@ -128,6 +128,7 @@ impl From<ChatCompletionRequest> for ir::ChatRequest {
             max_tokens: req.max_tokens,
             min_tokens: req.min_tokens,
             ignore_eos: req.ignore_eos,
+            disable_mtp: req.disable_mtp,
             stop: req.stop,
             stream: req.stream,
             n: req.n,
@@ -148,6 +149,11 @@ impl From<ChatCompletionRequest> for ir::ChatRequest {
             seed: req.seed,
             timeout_secs: req.timeout,
             return_token_ids: req.return_token_ids,
+            client_session: crate::session_key::from_openai_body(
+                req.prompt_cache_key.as_deref(),
+                req.metadata.as_ref(),
+                req.user.as_deref(),
+            ),
         }
     }
 }
@@ -419,6 +425,24 @@ mod tests {
         assert!(ir.ignore_eos);
         assert_eq!(ir.min_tokens, 32);
         assert!(!body(serde_json::json!({})).ignore_eos);
+    }
+
+    #[test]
+    fn chat_disable_mtp_survives_wire_to_ir_for_both_response_modes() {
+        for stream in [false, true] {
+            for flag in [None, Some(false), Some(true)] {
+                let mut body = serde_json::json!({
+                    "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                    "stream": stream
+                });
+                if let Some(value) = flag {
+                    body["disable_mtp"] = serde_json::json!(value);
+                }
+                let ir = ir::ChatRequest::from(wire(body));
+                assert_eq!(ir.disable_mtp, flag.unwrap_or(false));
+                assert_eq!(ir.stream, stream);
+            }
+        }
     }
 
     #[test]

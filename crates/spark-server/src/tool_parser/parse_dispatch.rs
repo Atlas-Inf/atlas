@@ -3,6 +3,8 @@
 
 use super::*;
 
+use crate::literal_xml::{LiteralXmlState, first_marker_outside_literal};
+
 /// #192: bound the salvageable region of an UNTERMINATED trailing
 /// `<tool_call>` body (no `</tool_call>` close anywhere after it).
 ///
@@ -64,6 +66,7 @@ fn parse_tool_calls_impl(text: &str, promote_bare_names: bool) -> (Option<String
             return parsed;
         }
     }
+    let original_content = text;
     // MiniMax uses `<minimax:tool_call>` as the outer wrapper (different
     // tag from Qwen's `<tool_call>`). Normalize both wrappers to the
     // same outer form so the scanning loop below doesn't need
@@ -97,6 +100,7 @@ fn parse_tool_calls_impl(text: &str, promote_bare_names: bool) -> (Option<String
     let mut content_parts = Vec::new();
     let mut rest = text;
     let mut idx = 0u32;
+    let mut literal_state = LiteralXmlState::default();
 
     // Returns the byte offset of the next `</tool_call>` close that is NOT
     // inside a `<parameter=...>...</parameter>` block. Qwen3-Coder tool
@@ -136,19 +140,40 @@ fn parse_tool_calls_impl(text: &str, promote_bare_names: bool) -> (Option<String
     }
 
     loop {
-        match rest.find("<tool_call>") {
-            Some(start) => {
-                let before = rest[..start].trim();
+        match first_marker_outside_literal(rest, literal_state, &["<tool_call>"]) {
+            Some((start, opener_len)) => {
+                let before_raw = &rest[..start];
+                let before = before_raw.trim();
                 if !before.is_empty() {
                     content_parts.push(before.to_string());
                 }
-                rest = &rest[start + 11..];
+                literal_state.feed(before_raw);
+                let opener = rest[start..start + opener_len].to_string();
+                rest = &rest[start + opener_len..];
                 match find_unescaped_tool_call_close(rest) {
                     Some(end) => {
+                        // A malformed first envelope can contain a later
+                        // real opener before its close (common after an
+                        // unfinished `<arg_key>`). Treat the first block as
+                        // prose and restart at that later opener instead of
+                        // handing both blocks to the single-call parser.
+                        if let Some((next, _)) = first_marker_outside_literal(
+                            &rest[..end],
+                            literal_state,
+                            &["<tool_call>"],
+                        ) && rest[..next].contains("<arg_key>")
+                        {
+                            content_parts.push(format!("{opener}{}", &rest[..next]));
+                            rest = &rest[next..];
+                            continue;
+                        }
                         if let Some(tc) = parse_complete_call(&rest[..end], idx, promote_bare_names)
                         {
                             calls.push(tc);
                             idx += 1;
+                        } else {
+                            let block = format!("{opener}{}</tool_call>", &rest[..end]);
+                            content_parts.push(block);
                         }
                         rest = &rest[end + 12..];
                     }
@@ -170,13 +195,26 @@ fn parse_tool_calls_impl(text: &str, promote_bare_names: bool) -> (Option<String
                         // truncated emission identically. Hermes JSON tails are
                         // unaffected (contained downstream by parse_one_call's
                         // balanced-JSON-prefix repair).
+                        // A malformed opener must not swallow a later real
+                        // call. Once the first envelope has no close, preserve
+                        // it as prose up to the next opener and resume the
+                        // normal scan. The malformed body is opaque: do not
+                        // feed it into the lexical state, or a quote inside
+                        // that body could hide the later candidate.
+                        if let Some((next, _)) =
+                            first_marker_outside_literal(rest, literal_state, &["<tool_call>"])
+                        {
+                            content_parts.push(format!("{opener}{}", &rest[..next]));
+                            rest = &rest[next..];
+                            continue;
+                        }
                         let contained = contain_unterminated_call_tail(rest);
                         if rest.contains("<arg_key>") {
-                            content_parts.push(format!("<tool_call>{rest}"));
+                            content_parts.push(format!("{opener}{rest}"));
                         } else if let Some(tc) = parse_one_call(contained.trim(), idx) {
                             calls.push(tc);
                         } else {
-                            content_parts.push(format!("<tool_call>{rest}"));
+                            content_parts.push(format!("{opener}{rest}"));
                         }
                         break;
                     }
@@ -406,6 +444,13 @@ fn parse_tool_calls_impl(text: &str, promote_bare_names: bool) -> (Option<String
             let content = if clean.is_empty() { None } else { Some(clean) };
             return (content, json_calls);
         }
+    }
+
+    // A failed structural parse must not reflow ordinary prose or normalize
+    // its literal tag spelling. Only join segments after removing a real call.
+    if calls.is_empty() {
+        let content = original_content.trim();
+        return ((!content.is_empty()).then(|| content.to_string()), calls);
     }
 
     let content = if content_parts.is_empty() {

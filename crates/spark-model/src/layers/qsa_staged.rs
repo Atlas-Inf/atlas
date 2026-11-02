@@ -247,7 +247,7 @@ impl QsaIndexer {
         );
         self.reserve(st, pos + count, gpu, stream)?;
         self.raw_room(st, count, gpu, stream)?;
-        if collecting() && self.k_commit_table_k.0 != 0 {
+        if self.yarn_inv_freq.is_null() && collecting() && self.k_commit_table_k.0 != 0 {
             let complete = (pos + count) / self.ratio as usize;
             let entry = CommitEntry {
                 kernel: self.k_commit_table_k,

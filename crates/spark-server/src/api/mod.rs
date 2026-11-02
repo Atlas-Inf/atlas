@@ -57,6 +57,8 @@ pub mod strip;
 pub mod stubs;
 
 #[cfg(test)]
+pub(crate) mod test_app_state;
+#[cfg(test)]
 mod tests;
 
 // Re-exports to preserve the original `crate::api::*` import surface.
@@ -95,3 +97,6 @@ pub use stubs::{
     audio_stub, batch_get_stub, batch_list_stub, batches_stub, files_stub, images_stub,
     moderations_stub,
 };
+
+#[cfg(test)]
+mod refusal_content_tests;

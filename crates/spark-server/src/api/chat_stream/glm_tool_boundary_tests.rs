@@ -9,16 +9,46 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
 
 const END: u32 = 2;
 const TOOL: u32 = 3;
 const CALL: &[u32] = &[3, 4, 5, 6, 7, 8, 9, 10, 11];
+const BACKTICK: u32 = 15;
+const ORDINARY: u32 = 16;
+const OPS: u32 = 40;
+const OPS_VALUE: u32 = 41;
+/// Neither alphabetical nor schema-sorted: delivery must keep this order.
+const ORDERED_OPS: &str = r#"[{"url": "u", "headers": {"b": 1, "a": 2}}, {"command": "c"}]"#;
+const LITERAL_CONTENT: [&str; 4] = [
+    "The tag is `<tool_call>` and this is prose. END.",
+    "The tag is \"<tool_call>\" and this is prose. END.",
+    "The delimiter <tool_call> opens a tool invocation. END.",
+    "```xml\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>\n```\nEND",
+];
 
+#[path = "glm_boundary_case_tests.rs"]
+mod glm_boundary_case_tests;
+#[path = "glm_literal_xml_tests.rs"]
+mod glm_literal_xml_tests;
+#[path = "glm_tool_args_tests.rs"]
+mod glm_tool_args_tests;
+#[path = "qwen_literal_xml_tests.rs"]
+mod qwen_literal_xml_tests;
 #[path = "reasoning_done_tests.rs"]
 mod reasoning_done_tests;
+#[path = "tool_security_tests.rs"]
+mod tool_security_tests;
+#[path = "vision_admission_refusal_tests.rs"]
+mod vision_admission_refusal_tests;
 
 fn app(glm: bool) -> Arc<AppState> {
+    app_for_model(
+        if glm { "glm5_next" } else { "qwen3" },
+        tool_parser::ToolCallFormat::PoolsideV1,
+    )
+}
+
+fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<AppState> {
     let dir = tempfile::tempdir().unwrap();
     let words = [
         "[UNK]",
@@ -36,6 +66,35 @@ fn app(glm: bool) -> Arc<AppState> {
         "unknown_tool",
         "<think>",
         "42",
+        "`",
+        "ordinary",
+        LITERAL_CONTENT[0],
+        LITERAL_CONTENT[1],
+        LITERAL_CONTENT[2],
+        LITERAL_CONTENT[3],
+        "The closing tag is `</tool_call>`. </tool_call> END.",
+        "<|im_start|>",
+        "The tag is `",
+        "</",
+        "tool",
+        "_call>",
+        "` and this is prose. END.",
+        "The delimiter ",
+        " opens a tool invocation. END.",
+        "<",
+        "<function=get_weather><parameter=city>Oslo</parameter></function>",
+        "`<tool_call><function=get_weather><parameter=not_a_parameter>BAD</parameter></function></tool_call>` END.",
+        "<tool_call><function=not_registered><parameter=value>42</parameter></function></tool_call> END.",
+        "<tool_call><function=not_registered><parameter=value>42",
+        "get_weather<arg_key>not_a_parameter</arg_key><arg_value>BAD</arg_value></tool_call> END.",
+        "get_weather<arg_key>city</arg_key><arg_value>http://169.254.169.254/</arg_value></tool_call>",
+        "<function=get_weather><parameter=city>http://169.254.169.254/</parameter></function></tool_call>",
+        "<function=get_url><parameter=url>http://169.254.169.254/</parameter></function></tool_call>",
+        "get_url<arg_key>url</arg_key><arg_value>http://169.254.169.254/</arg_value></tool_call>",
+        "ops",
+        ORDERED_OPS,
+        "```xml",
+        "\n",
     ];
     let vocab = words
         .iter()
@@ -56,9 +115,10 @@ fn app(glm: bool) -> Arc<AppState> {
         dir.path(),
         0,
         true,
-        "glm5_next",
+        model_type,
         "",
         None,
+        false,
         false,
     )
     .unwrap();
@@ -66,71 +126,15 @@ fn app(glm: bool) -> Arc<AppState> {
         tokenizer.decode(CALL).unwrap(),
         "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>"
     );
-    let (request_tx, _) = tokio::sync::mpsc::channel(1);
     Arc::new(AppState {
-        tokenizer,
         model_name: "display-name-is-not-model-type".into(),
-        adapter_name: None,
-        adapter_names: vec![],
-        active_adapter: Arc::default(),
-        max_seq_len: 4096,
-        request_tx,
-        reference_mode: false,
-        rotation_tx: None,
-        vision_config: None,
-        vision_max_pixels: None,
-        remote_image_policy: Default::default(),
-        video_ffmpeg: Default::default(),
-        video_fps: 1.0,
-        default_temperature: 0.0,
-        default_top_k: 0,
-        default_top_p: 1.0,
-        default_top_n_sigma: 0.0,
-        default_min_p: 0.0,
-        tool_call_parser: Some(Arc::from(
-            tool_parser::ToolCallFormat::PoolsideV1.into_parser(),
-        )),
-        chat: Default::default(),
+        tool_call_parser: Some(Arc::from(format.into_parser())),
         reasoning_parser: Some(crate::reasoning_parser::ReasoningFormat::Qwen.into_parser()),
         think_end_token_id: Some(END),
         think_start_token_id: Some(13),
-        tool_max_tokens: 192,
-        sampling_presets: Default::default(),
         tool_call_start_token_id: Some(TOOL),
-        glm_tool_boundary: crate::glm_tool_boundary::native_opener(
-            if glm { "glm5_next" } else { "qwen3" },
-            true,
-            Some(TOOL),
-        ),
-        auto_compact_threshold: None,
-        request_timeout: 0,
-        effective_context: 0,
-        behavior: Default::default(),
-        disable_thinking: false,
-        default_thinking: Default::default(),
-        default_reasoning_effort: None,
-        response_store: crate::response_store::ResponseStore::with_config(
-            1,
-            Duration::from_secs(60),
-        ),
-        conversation_store: crate::conversation_store::ConversationStore::with_config(
-            1,
-            Duration::from_secs(60),
-        ),
-        rate_limiter: crate::rate_limiter::RateLimiter::with_config(
-            crate::rate_limiter::RateLimitConfig {
-                rpm: 0,
-                tpm: 0,
-                burst_rpm: 1,
-                burst_tpm: 1,
-            },
-        ),
-        dump_writer: None,
-        lora_stageable: Default::default(),
-        lora_peer_addr: None,
-        promotion: None,
-        promoted_slots: Arc::default(),
-        lora_disk_stageable: Default::default(),
+        glm_tool_boundary: crate::glm_tool_boundary::native_opener(model_type, true, Some(TOOL)),
+        ..crate::api::test_app_state::app_state(tokenizer)
     })
 }
 
@@ -156,6 +160,7 @@ fn response(tokens: Vec<u32>) -> crate::api::inference_types::InferenceResponse 
         cached_prompt_tokens: 0,
         accepted_prediction_tokens: 0,
         prompt_logprobs: vec![],
+        guard_stop: None,
     }
 }
 
@@ -222,8 +227,24 @@ fn stream_tokens_with_context(
     tools: bool,
     tokens: Vec<u32>,
 ) -> (StreamCtx, StreamState, Vec<ir::StreamDelta>) {
-    let state = app(glm);
-    let defs = if tools { request().tools } else { vec![] };
+    stream_for_app(app(glm), tools, tokens)
+}
+
+fn stream_for_app(
+    state: Arc<AppState>,
+    tools: bool,
+    tokens: Vec<u32>,
+) -> (StreamCtx, StreamState, Vec<ir::StreamDelta>) {
+    stream_for_request(state, tools, tokens, request())
+}
+
+fn stream_for_request(
+    state: Arc<AppState>,
+    tools: bool,
+    tokens: Vec<u32>,
+    request: ir::ChatRequest,
+) -> (StreamCtx, StreamState, Vec<ir::StreamDelta>) {
+    let defs = if tools { request.tools } else { vec![] };
     let ctx = StreamCtx {
         _active_guard: crate::metrics::ActiveRequestGuard::new(),
         state: state.clone(),
@@ -241,7 +262,13 @@ fn stream_tokens_with_context(
         max_tokens: 192,
         timeout_at: None,
         stop_string_buffer_len: 0,
-        leak_markers: state.tool_call_parser.as_ref().unwrap().leak_markers(),
+        leak_markers: state
+            .tool_call_parser
+            .as_ref()
+            .unwrap()
+            .leak_markers()
+            .for_literal_xml(state.tokenizer.glm_tool_markup_as_text),
+        role_literal_leaks: state.tokenizer.filters_bare_role_literals(),
         wants_typed_arguments: true,
         max_tool_calls_per_response: 12,
         min_tokens: 0,
@@ -252,7 +279,12 @@ fn stream_tokens_with_context(
     let cancel = Arc::new(AtomicBool::new(false));
     let mut stream = StreamState::new(tools, true, cancel, defs);
     if let Some(detector) = stream.detector.as_mut() {
-        detector.set_promote_bare_names(true);
+        detector.set_promote_bare_names(
+            state
+                .tool_call_parser
+                .as_ref()
+                .is_some_and(|p| p.name() == "poolside_v1"),
+        );
     }
     let mut deltas = vec![];
     for token in tokens {
@@ -376,4 +408,62 @@ fn glm_native_tool_boundary_keeps_request_model_and_name_guards() {
         );
         assert_eq!(choice.tool_calls.len(), usize::from(!glm));
     }
+}
+
+#[test]
+fn glm_native_literal_opener_stays_reasoning_and_next_real_call_still_binds() {
+    let literal = vec![1, BACKTICK, TOOL, ORDINARY, BACKTICK];
+    let (stream, deltas) = stream_tokens(true, true, literal.clone());
+    assert!(!stream.thinking_done, "model=true; {deltas:?}");
+    assert!(!stream.cancel_flag.load(Ordering::Acquire));
+    let reasoning: String = deltas
+        .iter()
+        .filter_map(|delta| match delta {
+            ir::StreamDelta::Reasoning { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(reasoning.contains("<tool_call>"), "model=true; {deltas:?}");
+    assert!(
+        !deltas
+            .iter()
+            .any(|delta| { matches!(delta, ir::StreamDelta::ToolCallStart { .. }) })
+    );
+
+    let mut with_call = literal.clone();
+    with_call.extend_from_slice(CALL);
+    let (stream, deltas) = stream_tokens(true, true, with_call);
+    assert!(stream.thinking_done, "model=true; {deltas:?}");
+    assert_eq!(
+        deltas
+            .iter()
+            .filter(|delta| matches!(delta, ir::StreamDelta::ToolCallStart { .. }))
+            .count(),
+        1,
+        "model=true; {deltas:?}"
+    );
+}
+
+#[test]
+fn glm_native_literal_opener_is_preserved_by_blocking_decode() {
+    let state = app(true);
+    let response = response(vec![1, BACKTICK, TOOL, ORDINARY, BACKTICK]);
+    let (reasoning, content) =
+        crate::api::chat_blocking::decode_response_text(&state, &response, true, true, false);
+    let combined = format!("{}{}", reasoning.as_deref().unwrap_or_default(), content);
+    assert!(combined.contains("<tool_call>"), "combined={combined:?}");
+    let choice = crate::api::chat_blocking_choice::build_choice_message(
+        &state,
+        &request(),
+        &response,
+        reasoning,
+        content,
+        true,
+        None,
+        0,
+    );
+    assert!(
+        choice.tool_calls.is_empty(),
+        "literal must not become a call"
+    );
 }

@@ -320,6 +320,20 @@ int cublasLtMatmulPreferenceDestroy(hipblasLtMatmulPreference_t pref) {
 // attributes; hipBLASLt's differ, so the shim reports none and the pin keeps
 // the heuristic's first result.
 int cublasLtMatmulAlgoConfigGetAttribute(const void*, int, void*, size_t, size_t*) { return STUB; }
+// Layout attributes (batch count / strided batch offset) are used only by the
+// GLM head-batched MLA GEMM, behind ATLAS_GLM_PAGED_PREFILL_MLA_GEMM; hipBLASLt's
+// attribute numbering differs and no AMD target reaches it, so refuse.
+int cublasLtMatrixLayoutSetAttribute(hipblasLtMatrixLayout_t, unsigned, const void*, size_t) {
+    return UNSUPPORTED;
+}
+// The fixed-algorithm pin (spark-runtime cublaslt/fixed_algo.rs) carries a
+// cuBLASLt algo blob that hipBLASLt cannot validate; a nonzero status makes the
+// caller fall back to its tile kernel.
+int cublasLtMatmulAlgoCheck(hipblasLtHandle_t, hipblasLtMatmulDesc_t, hipblasLtMatrixLayout_t,
+                            hipblasLtMatrixLayout_t, hipblasLtMatrixLayout_t, hipblasLtMatrixLayout_t,
+                            const void*, void*) {
+    return STUB;
+}
 
 int cublasLtMatmulAlgoGetHeuristic(hipblasLtHandle_t handle, hipblasLtMatmulDesc_t desc,
                                    hipblasLtMatrixLayout_t a, hipblasLtMatrixLayout_t b,

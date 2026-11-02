@@ -66,32 +66,3 @@ pub fn extract_verify_logprobs(
         })
         .collect()
 }
-
-/// Extract logprobs for a single token from the BF16 logits buffer on GPU.
-///
-/// Copies `[1, vocab_size]` BF16 logits D2H, converts to FP32, and extracts
-/// top-K logprobs. Returns None on copy failure.
-pub fn extract_single_logprobs(
-    model: &dyn Model,
-    logits: DevicePtr,
-    sampled_token: u32,
-    k_logprobs: u8,
-) -> Option<crate::api::TokenLogprobs> {
-    let vocab = model.vocab_size();
-    let mut buf = vec![0u8; vocab * 2]; // BF16
-    if model.copy_logits_to_host(logits, &mut buf).is_err() {
-        return None;
-    }
-    let f32_logits: Vec<f32> = (0..vocab)
-        .map(|j| {
-            let lo = buf[j * 2];
-            let hi = buf[j * 2 + 1];
-            bf16_to_f32(lo, hi)
-        })
-        .collect();
-    Some(extract_logprobs_from_f32(
-        &f32_logits,
-        sampled_token,
-        k_logprobs as usize,
-    ))
-}

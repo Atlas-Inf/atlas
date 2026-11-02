@@ -31,6 +31,9 @@ pub(super) struct ArchProbes {
     /// `kv_lora_rank` IS the compressed-KV latent dimension: 0 means the model
     /// has no latent cache, so nothing can dispatch an MLA kernel.
     pub mla: bool,
+    /// GLM MLA projection tiers/twins: only the GLM loader and batched MLA
+    /// paths install/consume these, not Qwen GQA or other MLA architectures.
+    pub glm_mla: bool,
     /// Manifold-Constrained Hyper-Connections (DeepSeek-V4, `hc_mult` = 4).
     /// 0 on every other model.
     pub hyper_connection: bool,
@@ -61,6 +64,7 @@ impl ArchProbes {
     pub(super) fn from_config(config: &ModelConfig) -> Self {
         Self {
             mla: config.kv_lora_rank > 0,
+            glm_mla: config.model_type == "glm5_next" && config.kv_lora_rank > 0,
             hyper_connection: config.hc_mult > 0,
             compressed_attn: config.compress_ratios.iter().any(|&r| r > 0),
             wide_head_dim: config.head_dim > 256 || config.kv_lora_rank > 0,

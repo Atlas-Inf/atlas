@@ -31,14 +31,18 @@ use crate::layer::ForwardContext;
 /// as the default-env runs: ST-995 job 464 84.92/84.93 vs job 280 84.72/84.68,
 /// paired McNemar 3 vs 1 discordant, p = 0.625; agentic perf leg job 465
 /// 1007/1007 turns, 73.3 min vs 89.3 min, TPOT median 48.9 vs 63.0 ms, score
-/// 0.491 vs 0.4899. `=0`/`=false` restores the old inert-bound refusal;
-/// gfx1151 (`atlas_scale`) keeps default OFF (unmeasured there).
+/// 0.491 vs 0.4899. `=0`/`=false` restores the old inert-bound refusal.
+/// Native HIP gfx1151 (strix-hip) defaults ON too since 2026-10-28: Flash-Next
+/// MTP1 tg at 8k / 32k cached depth 12.1 -> 18.9 / 18.0 tok/s (framework f55,
+/// main 8863dc5e5), and every gfx1151 ST-995 / agentic gate that week already
+/// ran with `=1` (f05 84.12/81.47, f48 84.52/81.97). SCALE strix keeps OFF
+/// (unmeasured there).
 pub(in crate::layers::qwen3_attention) fn verify_active_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         verify_active_decision(
             std::env::var("ATLAS_QSA_VERIFY_ACTIVE").ok().as_deref(),
-            cfg!(atlas_scale),
+            cfg!(atlas_scale) && !cfg!(atlas_hip),
         )
     })
 }

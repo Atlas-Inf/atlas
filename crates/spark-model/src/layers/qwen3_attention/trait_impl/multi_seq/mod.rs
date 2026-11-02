@@ -23,16 +23,22 @@ mod guard;
 mod hc_ffn;
 mod hc_generic;
 mod hc_pre_site;
+// Ported from Enntity/atlas 166e2b1 (AGPL-3.0-only).
+mod kv_bf16;
+mod kv_only;
 mod mla;
 mod mla_gemv;
 mod mla_glm;
 mod mla_glm_sparse;
 mod mla_independent;
+#[cfg(test)]
+mod mx8_tests;
 mod nemotron_serial;
 mod qkv;
 mod qkv_dp4a;
 mod qkv_exact4;
 mod qkv_fp8;
+mod qkv_mx8;
 mod qsa_rows;
 #[cfg(test)]
 mod tests;
@@ -57,6 +63,9 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16): every
+        // entry of this decode (`decode_multi_seq`, `decode_multi_seq_rows`).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         if self.try_nemotron_attention_serial(
             hidden,
             residual,

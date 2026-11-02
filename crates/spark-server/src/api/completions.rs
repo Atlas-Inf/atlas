@@ -340,7 +340,7 @@ pub(super) async fn completions_stream(
         // Completions API defines no tools — multi-tool-call continuation off.
         tools_present: false,
         suppress_tool_call: false,
-        disable_mtp: false,
+        disable_mtp: req.disable_mtp,
         grammar_spec: None,
         seed: req.seed,
         top_logprobs: logprobs_k,
@@ -465,7 +465,7 @@ pub(super) async fn completions_stream(
                     )]
                 }
             }
-            StreamEvent::Error(msg) => {
+            StreamEvent::Error(msg) | StreamEvent::InvalidRequest(msg) => {
                 vec![Ok(Event::default().data(format!(r#"{{"error":"{msg}"}}"#)))]
             }
         };

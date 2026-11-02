@@ -486,9 +486,15 @@ pub fn sample_token_with_grammar(
     // an argmax that is not in the scoped `history` and has a positive raw
     // logit (proof in `fast_greedy` module docs). `history` here is already
     // the scoped span the slow path feeds to `apply_penalties_and_bias`.
+    // A union's pending branch is chosen by mass over the full row
+    // (`GrammarState::choose_branch`), never by the top token alone.
+    let branch_pending = grammar_state
+        .as_deref()
+        .is_some_and(GrammarState::branch_pending);
     if levers.fast_greedy_grammar
         && suppress_ids.is_empty()
         && (temperature == 0.0 || levers.force_temp_zero)
+        && !branch_pending
     {
         let gate = crate::scheduler::fast_greedy::classify_penalties(penalties);
         if gate != crate::scheduler::fast_greedy::PenaltyGate::Blocked {
@@ -540,6 +546,7 @@ pub fn sample_token_with_grammar(
     // Apply grammar bitmask (when a grammar is active).
     if let Some(gs) = grammar_state {
         gs.fill_bitmask();
+        gs.choose_branch(&f32_logits);
         gs.apply_bitmask_to_logits(&mut f32_logits);
     }
     // SSOT penalties + bias on the post-mask logits, using the seq's
@@ -632,17 +639,28 @@ pub fn sample_first_token(
 ) -> Result<u32> {
     // A strict grammar whose response opens inside `<think>` starts after
     // `</think>`: this token is reasoning (GrammarState::masks_first_token).
-    let Some(gs) = grammar_state.filter(|gs| gs.masks_first_token()) else {
-        return sample_token(
-            model,
-            logits,
-            temperature,
-            top_k,
-            top_p,
-            min_p,
-            suppress_ids,
-            levers,
-        );
+    let gs = match grammar_state {
+        Some(gs) if gs.masks_first_token() => gs,
+        reasoning => {
+            let tok = sample_token(
+                model,
+                logits,
+                temperature,
+                top_k,
+                top_p,
+                min_p,
+                suppress_ids,
+                levers,
+            )?;
+            // A native tool opener ends that reasoning as the grammar's first
+            // output token (`GrammarState::opens_output`): the matcher sees it.
+            if let Some(gs) = reasoning.filter(|gs| gs.opens_output(tok))
+                && !gs.accept_token(tok)
+            {
+                anyhow::bail!(crate::scheduler::emit_step::strict_refusal(tok, 0));
+            }
+            return Ok(tok);
+        }
     };
     let neutral = SamplingParams {
         temperature,

@@ -21,18 +21,38 @@ use crate::tool_parser;
 /// formed — the caller's hold-back buffer retains real partials, so the
 /// only way one reaches here is a desync dump, where dropping it is correct).
 pub(crate) fn scrub_tool_tags(text: &str, markers: &tool_parser::LeakMarkers) -> String {
+    scrub_tool_tags_with_literal_state(
+        text,
+        crate::literal_xml::LiteralXmlState::default(),
+        markers,
+    )
+}
+
+pub(crate) fn scrub_tool_tags_with_literal_state(
+    text: &str,
+    literal_state: crate::literal_xml::LiteralXmlState,
+    markers: &tool_parser::LeakMarkers,
+) -> String {
     if text.is_empty() || (markers.orphan_open.is_empty() && markers.close.is_empty()) {
         return text.to_string();
     }
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
+    let marker_refs: Vec<&str> = markers
+        .close
+        .iter()
+        .chain(markers.orphan_open.iter())
+        .copied()
+        .collect();
+    let masked =
+        crate::literal_xml::mask_literal_markers_with_state(text, literal_state, &marker_refs);
+    let bytes = masked.as_bytes();
+    let mut out = String::with_capacity(masked.len());
     let mut i = 0;
-    'outer: while i < text.len() {
+    'outer: while i < masked.len() {
         if bytes[i] == b'<' {
             // Exact full-tag markers (close tags + full-tag opens that
             // already carry their own `>`).
             for m in markers.close.iter().chain(markers.orphan_open.iter()) {
-                if m.ends_with('>') && text[i..].starts_with(m) {
+                if m.ends_with('>') && masked[i..].starts_with(m) {
                     i += m.len();
                     continue 'outer;
                 }
@@ -40,8 +60,8 @@ pub(crate) fn scrub_tool_tags(text: &str, markers: &tool_parser::LeakMarkers) ->
             // Attribute-prefix opens (e.g. `<function=`, `<parameter=`,
             // `<param=`): remove from the prefix through the next `>`.
             for m in markers.orphan_open.iter() {
-                if !m.ends_with('>') && text[i..].starts_with(m) {
-                    match text[i..].find('>') {
+                if !m.ends_with('>') && masked[i..].starts_with(m) {
+                    match masked[i..].find('>') {
                         Some(gt) => {
                             i += gt + 1;
                             continue 'outer;
@@ -53,9 +73,13 @@ pub(crate) fn scrub_tool_tags(text: &str, markers: &tool_parser::LeakMarkers) ->
                 }
             }
         }
-        let ch_len = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-        out.push_str(&text[i..i + ch_len]);
+        let ch_len = masked[i..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
+        out.push_str(&masked[i..i + ch_len]);
         i += ch_len;
     }
-    out
+    crate::literal_xml::unmask_literal_markers(&out)
 }

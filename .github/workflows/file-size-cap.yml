@@ -252,6 +252,9 @@ jobs:
             "crates/spark-runtime/src/sampler.rs"
             "crates/spark-server/src/api/chat_blocking.rs"
             "crates/spark-server/src/api/chat_stream/handle_token.rs"
+            # 544 LoC — the function extracted from handle_token.rs above; the
+            # same split, so the same exemption as the parent.
+            "crates/spark-server/src/api/chat_stream/handle_token/inner.rs"
             "crates/spark-server/src/grammar/compile_tools.rs"
             "crates/spark-server/src/scheduler/emit_step.rs"
             "crates/spark-server/src/scheduler/helpers.rs"

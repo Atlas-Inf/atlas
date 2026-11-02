@@ -64,7 +64,7 @@ pub(super) enum SmallMArm {
 /// tiers also need `k % 8 == 0`.
 pub(super) fn small_m_arm(enabled: bool, batchm: bool, tc: bool, m: u32, k: u32) -> SmallMArm {
     let tc = enabled && tc && k.is_multiple_of(8);
-    if enabled && batchm && (1..=DENSE_GEMV_BATCHM_MAX_M).contains(&m) {
+    if use_small_m_gemv(enabled, batchm, m) {
         SmallMArm::BatchM
     } else if tc && (1..=DENSE_GEMV_TC_MAX_M).contains(&m) {
         SmallMArm::TensorCore
@@ -77,7 +77,20 @@ pub(super) fn small_m_arm(enabled: bool, batchm: bool, tc: bool, m: u32, k: u32)
 
 /// Pure decision (kept for callers that only ask about the batch-M arm).
 pub(super) fn use_small_m_gemv(enabled: bool, handle_nonzero: bool, m: u32) -> bool {
-    small_m_arm(enabled, handle_nonzero, false, m, 0) == SmallMArm::BatchM
+    enabled && handle_nonzero && (1..=DENSE_GEMV_BATCHM_MAX_M).contains(&m)
+}
+
+/// Below this M the pipelined GEMM stays — cuBLASLt's win is at the
+/// wide staged-verify rows (M≈B·γ up to 128); small-M serial calls are
+/// already cheap and KEEP today's kernel byte-for-byte.
+pub(super) const DRAFTER_CUBLAS_MIN_M: u32 = 32;
+
+/// Pure decision: cuBLASLt iff the lever resolved at construction and
+/// `m` clears the wide-verify threshold. Layout is `bf16_gemm_act_weight_t`
+/// (`out[M,N] = act[M,K] @ W[N,K]ᵀ`) — the same `[N,K]` weight layout
+/// `dense_gemm_bf16_pipelined` consumes.
+pub(super) fn use_drafter_cublas(lever_on: bool, m: u32) -> bool {
+    lever_on && m >= DRAFTER_CUBLAS_MIN_M
 }
 
 impl BlockDiffusionDraftHead {
@@ -139,6 +152,11 @@ impl BlockDiffusionDraftHead {
                     stream,
                 )
             }
+            SmallMArm::Pipelined if use_drafter_cublas(self.drafter_cublas, m) => {
+                spark_runtime::cublaslt::bf16_gemm_act_weight_t(
+                    src.0, w.weight.0, dst.0, m, n, k, stream,
+                )
+            }
             SmallMArm::Pipelined => ops::dense_gemm_bf16_pipelined(
                 gpu,
                 kernels.dense_gemm_pipelined,
@@ -195,6 +213,19 @@ fn ensure_bf16_present(w: &DenseWeight, m: u32, n: u32, k: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drafter_cublas_decision() {
+        // Lever on: m >= 32 routes cuBLASLt; below keeps the pipelined
+        // kernel (C=1 serial at M=γ+1 untouched). Lever off: inert.
+        assert!(use_drafter_cublas(true, 32));
+        assert!(use_drafter_cublas(true, 128));
+        assert!(!use_drafter_cublas(true, 31));
+        assert!(!use_drafter_cublas(true, 9));
+        assert!(!use_drafter_cublas(false, 128));
+        // Construction resolves `available()`; on non-CUDA stub builds it
+        // returns false, so the field (hence the route) is always off.
+    }
 
     #[test]
     fn small_m_gemv_decision() {

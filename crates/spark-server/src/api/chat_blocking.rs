@@ -15,6 +15,7 @@ use axum::response::{IntoResponse, Json, Response};
 
 use crate::AppState;
 use crate::ir;
+use crate::literal_xml::state_after;
 use crate::tool_parser;
 
 use super::chat_blocking_choice::{build_choice_message, build_logprobs};
@@ -83,7 +84,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         num_beams,
         length_penalty,
         early_stopping,
-        image_pixels,
+        mut image_pixels,
         max_tokens,
         temperature,
         top_k,
@@ -137,10 +138,13 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
             num_beams,
             length_penalty,
             early_stopping,
-            image_pixels: if choice_idx == 0 {
-                image_pixels.clone()
+            // VisionItem clones share the pixel storage and in-flight permit.
+            // Keep the images present for every serial choice; move the final
+            // vector so n=1 and the last choice avoid an extra Vec clone.
+            image_pixels: if choice_idx + 1 == n {
+                std::mem::take(&mut image_pixels)
             } else {
-                Vec::new()
+                image_pixels.clone()
             },
             max_tokens,
             min_tokens: req.min_tokens,
@@ -166,7 +170,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
             require_tool_call: tool_choice_required,
             tools_present: tools_active,
             suppress_tool_call,
-            disable_mtp: false,
+            disable_mtp: req.disable_mtp,
             grammar_spec: grammar_spec.clone(),
             seed: req.seed.map(|s| s.wrapping_add(choice_idx as u64)),
             top_logprobs,
@@ -243,7 +247,9 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         choice.matched_stop = matched_stop;
         choice.finish_reason =
             stop_match_corrected(choice.finish_reason, choice.matched_stop.is_some());
-        choice.logprobs = build_logprobs(&state, &response);
+        if choice.finish_reason != ir::FinishReason::ContentFilter {
+            choice.logprobs = build_logprobs(&state, &response);
+        }
         all_choices.push(choice);
     }
 
@@ -282,15 +288,24 @@ pub(super) fn decode_response_text(
     // tool call. This never scans arbitrary reasoning text for call syntax.
     let native_split = if enable_thinking && tools_active {
         state.glm_tool_boundary.and_then(|opener| {
-            let pos = output_tokens.iter().position(|&token| token == opener)?;
-            if output_tokens[..pos]
+            output_tokens
                 .iter()
-                .any(|token| Some(*token) == state.think_end_token_id)
-            {
-                None
-            } else {
-                Some((&output_tokens[..pos], &output_tokens[pos..]))
-            }
+                .enumerate()
+                .filter(|(_, token)| **token == opener)
+                .find_map(|(pos, _)| {
+                    if output_tokens[..pos]
+                        .iter()
+                        .any(|token| Some(*token) == state.think_end_token_id)
+                    {
+                        return None;
+                    }
+                    let prefix_is_literal = state
+                        .tokenizer
+                        .decode(&output_tokens[..pos])
+                        .ok()
+                        .is_some_and(|prefix| state_after(&prefix).is_literal());
+                    (!prefix_is_literal).then_some((&output_tokens[..pos], &output_tokens[pos..]))
+                })
         })
     } else {
         None
@@ -421,62 +436,13 @@ pub(super) fn merge_hoisted_tool_calls(
     hoisted
 }
 
-/// Core finalization: usage assembly, metrics, and the rate-limit
-/// true-up. Returns the canonical response IR — wire encoding (plus
-/// `store:`/`--dump` handling) happens in the per-surface encoders.
-#[allow(clippy::too_many_arguments)]
-fn finalize_response(
-    state: Arc<AppState>,
-    req_ctx: Option<axum::extract::Extension<crate::rate_limiter::RequestContext>>,
-    all_choices: Vec<ir::Choice>,
-    total_completion_tokens: usize,
-    first_ttft: f64,
-    last_decode_time_ms: f64,
-    total_reasoning_tokens: u32,
-    total_cached_prompt_tokens: u32,
-    total_accepted_prediction_tokens: usize,
-    prompt_len: usize,
-) -> super::chat::ChatOutcome {
-    let tokens_per_second = if last_decode_time_ms > 0.0 && total_completion_tokens > 0 {
-        (total_completion_tokens.saturating_sub(1)) as f64 / (last_decode_time_ms / 1000.0)
-    } else {
-        0.0
-    };
-    let usage = ir::Usage {
-        prompt_tokens: prompt_len,
-        completion_tokens: total_completion_tokens,
-        cached_prompt_tokens: total_cached_prompt_tokens as usize,
-        reasoning_tokens: total_reasoning_tokens as usize,
-        accepted_prediction_tokens: total_accepted_prediction_tokens,
-        time_to_first_token_ms: first_ttft,
-        response_tokens_per_second: tokens_per_second,
-    };
+#[path = "chat_blocking/tail2.rs"]
+mod tail2;
+pub(crate) use tail2::*;
 
-    // REQUESTS_ACTIVE released by the caller's ActiveRequestGuard on return.
-    crate::metrics::PROMPT_TOKENS_TOTAL.inc_by(prompt_len as u64);
-    crate::metrics::GENERATION_TOKENS_TOTAL.inc_by(total_completion_tokens as u64);
-    crate::metrics::TTFT_SECONDS
-        .with_label_values(&[state.model_name.as_str()])
-        .observe(first_ttft / 1000.0);
-
-    // Rate-limit true-up. Middleware admitted with a conservative
-    // reservation of `max_seq_len` tokens; refund the difference.
-    if let Some(axum::extract::Extension(ref ctx)) = req_ctx {
-        let actual = (prompt_len + total_completion_tokens) as u64;
-        let refund = ctx.reserved_tokens.saturating_sub(actual);
-        if refund > 0 {
-            state.rate_limiter.refund_tokens(&ctx.identity, refund);
-        }
-    }
-
-    super::chat::ChatOutcome::Blocking(Box::new(ir::ChatResponse {
-        id: crate::ids::uuid_v4(),
-        model: state.model_name.clone(),
-        created: crate::ids::unix_timestamp(),
-        choices: all_choices,
-        usage,
-    }))
-}
+#[path = "chat_blocking/tail.rs"]
+mod tail;
+pub(crate) use tail::*;
 
 /// OpenAI contract: a response ended by a client stop sequence is
 /// `finish_reason="stop"`, never `"length"`. The blocking path only
@@ -605,3 +571,7 @@ mod tests {
         assert_eq!(calls[0].function.name, "get_weather");
     }
 }
+
+#[cfg(test)]
+#[path = "chat_blocking_vision_tests.rs"]
+mod vision_fanout_tests;

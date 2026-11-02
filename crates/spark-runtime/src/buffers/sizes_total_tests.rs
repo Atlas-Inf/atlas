@@ -104,3 +104,41 @@ fn buffer_total_matches_actual_mock_allocations_with_grouped_o_and_adapters() {
     );
     assert_actual_arena_total(&config, 5);
 }
+
+#[test]
+fn fp8_act_scale_holds_an_mxfp8_tile_image_of_every_row_count() {
+    // The cuBLASLt MXFP8 scale image pads rows up to a 128-row tile and the
+    // per-row scale count (K/32) up to 4; a 16390-row pass once overran it.
+    let config = ModelConfig::qwen3_next_80b_nvfp4();
+    let k = config
+        .hidden_size
+        .max(config.num_attention_heads * config.head_dim);
+    for rows in [1, 127, 128, 129, 16384, 16390] {
+        let sizes = BufferSizes::from_config(&config, rows, 256, 16, 4);
+        let tiled = rows.next_multiple_of(128) * (k / 32).next_multiple_of(4);
+        assert!(
+            sizes.fp8_act_scale >= tiled,
+            "{rows} rows: fp8_act_scale {} < tiled MXFP8 scales {tiled}",
+            sizes.fp8_act_scale
+        );
+    }
+}
+
+#[test]
+fn qwen_extended_context_reserves_the_full_selection_slab() {
+    let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+    config.index_n_heads = 4;
+    config.index_head_dim = 128;
+    config.index_compress_ratio = 4;
+    config.index_topk = 2048;
+    for (context, expected) in [(524_288, 1_084_751_872), (1_000_000, 2_059_010_048)] {
+        let sizes = BufferSizes::from_config(&config, 16384, context, 16, 4);
+        assert_eq!(sizes.qsa_select_scratch, expected);
+        // Preflight uses total_bytes() to subtract this from the KV budget.
+        // Disabling the indexer leaves only its 256-byte placeholder.
+        let mut without_indexer = config.clone();
+        without_indexer.index_topk = 0;
+        let small = BufferSizes::from_config(&without_indexer, 16384, context, 16, 4);
+        assert_eq!(sizes.total_bytes() - small.total_bytes(), expected - 256);
+    }
+}

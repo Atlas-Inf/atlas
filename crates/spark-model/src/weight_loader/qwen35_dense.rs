@@ -17,8 +17,9 @@ use crate::tp_shard::{
 use crate::weight_map::{
     AttentionWeights, DenseWeight, Fp8Weight, MtpWeights, Nvfp4Variant, PackedQ2Weight, SsmWeights,
     dense, dense_auto, dense_f32_safe, dense_keep_f32, dequant_nvfp4_to_bf16, detect_nvfp4_variant,
-    gpu_concat_rows, interleave_ba, load_dense_ffn, load_fp8_block_scaled_as_fp8weight,
-    load_kv_scales, load_mtp, quantize_to_nvfp4, quantized_auto,
+    ensure_checkpoint_shape, gpu_concat_rows, interleave_ba, load_dense_ffn,
+    load_fp8_block_scaled_as_fp8weight, load_kv_scales, load_mtp, quantize_to_nvfp4,
+    quantized_auto,
 };
 
 /// True when `{prefix}.weight` is FP8 E4M3 on disk with a 2D block scale
@@ -696,6 +697,17 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                                     )?;
                                     return Ok((null_dense, qw));
                                 }
+                                ensure_checkpoint_shape(
+                                    store,
+                                    &weight_key,
+                                    full_n,
+                                    full_k,
+                                    if config.attn_gated && name == "q_proj" {
+                                        "attn_output_gate doubles q rows"
+                                    } else {
+                                        "attention projection dims from the config"
+                                    },
+                                )?;
                                 let src = dense_auto(store, &weight_key, gpu)?;
                                 let (sharded_ptr, local_n, local_k) = shard_dense_bf16(
                                     src.weight, full_n, full_k, kind, tp_rank, tp_size, gpu,
@@ -764,6 +776,17 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                                  full_k: usize,
                                  kind: TpShardKind|
                                  -> Result<DenseWeight> {
+                                    ensure_checkpoint_shape(
+                                        store,
+                                        &format!("{p}.{name}.weight"),
+                                        full_n,
+                                        full_k,
+                                        if config.attn_gated && name == "q_proj" {
+                                            "attn_output_gate doubles q rows"
+                                        } else {
+                                            "attention projection dims from the config"
+                                        },
+                                    )?;
                                     let src =
                                         dense_auto(store, &format!("{p}.{name}.weight"), gpu)?;
                                     if tp_size == 1 {

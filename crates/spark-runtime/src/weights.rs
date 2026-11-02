@@ -87,6 +87,10 @@ impl WeightDtype {
             // (`keeps_raw_f16` → FP16), everything else converts to BF16.
             safetensors::Dtype::I16 => Ok(Self::Int16),
             safetensors::Dtype::I32 => Ok(Self::Int32),
+            // U32: raw 4-byte container. Only the CSF NVFP4 scale exception
+            // streams (`*.nvfp4_csf_exceptions`) use it, and the loader
+            // decodes those on the host; signedness is never interpreted.
+            safetensors::Dtype::U32 => Ok(Self::Int32),
             safetensors::Dtype::F32 => Ok(Self::FP32),
             safetensors::Dtype::U8 => Ok(Self::UInt8),
             // I8: raw 1-byte container for 4-bit-packed NVFP4 (DeepSeek-V4 MTP
@@ -110,6 +114,8 @@ impl WeightDtype {
             "BF16" => Self::BF16,
             "I16" => Self::Int16,
             "I32" => Self::Int32,
+            // U32: raw 4-byte container, as on the disk path.
+            "U32" => Self::Int32,
             "U8" => Self::UInt8,
             // I8 is a 1-byte raw container (packed NVFP4); signedness is
             // irrelevant, treat as raw bytes exactly like the disk path.
@@ -218,6 +224,19 @@ pub struct DeferredTensor {
     pub offset: u64,
     pub shape: Vec<usize>,
     pub dtype: WeightDtype,
+}
+
+/// The shape of tensor `name` in a load's uploaded or deferred maps, for
+/// [`nvfp4_csf::CsfAssembler::finish`]'s scale-vs-weight check.
+pub(crate) fn loaded_shape(
+    uploaded: &HashMap<String, WeightTensor>,
+    deferred: &HashMap<String, DeferredTensor>,
+    name: &str,
+) -> Option<Vec<usize>> {
+    uploaded
+        .get(name)
+        .map(|t| t.shape.clone())
+        .or_else(|| deferred.get(name).map(|d| d.shape.clone()))
 }
 
 impl WeightStore {
@@ -507,11 +526,13 @@ mod expert_filter_tests;
 #[cfg(test)]
 mod from_str_tests;
 mod name_utils;
+pub mod nvfp4_csf;
+pub mod nvfp4_csf32;
 mod side_files;
 mod store_edit;
 pub(crate) use name_utils::keeps_raw_f16;
 pub(crate) use name_utils::split_trailing_index;
-pub use name_utils::{is_ngram_table, parse_expert_index};
+pub use name_utils::{is_csf_stream, is_ngram_table, parse_expert_index};
 pub(crate) use side_files::merge_exl3_side_files;
 
 #[cfg(test)]
@@ -618,3 +639,7 @@ mod tests {
         assert!(offsets[0] >= 4096, "no tensor may alias the slab base");
     }
 }
+
+#[cfg(test)]
+#[path = "weights/csf_load_tests.rs"]
+pub(crate) mod csf_load_tests;

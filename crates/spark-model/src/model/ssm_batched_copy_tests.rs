@@ -406,6 +406,10 @@ fn dflash_pools_size_h_intermediates_uniformly() {
     // Counterfactual: identical geometry without the capture layers keeps
     // the tiered ladder — proves the assertion above discriminates, and
     // pins the MTP dummy's always-full-width invariant at the same time.
+    // Since 171f532fa the shallowest ladder rung passes the model's draft
+    // ceiling through (n<=4 -> num_drafts), so slot 0 — which can host a
+    // full K=8 verify — sizes at the full K-1; the 16-rung step-down still
+    // tiers slot 15 to 1.
     let tiered = SsmStatePool::new(
         &tiny_config(),
         16,
@@ -418,7 +422,7 @@ fn dflash_pools_size_h_intermediates_uniformly() {
         &gpu,
     )
     .unwrap();
-    assert_eq!(tiered.h_inter_count(0), 3);
+    assert_eq!(tiered.h_inter_count(0), 7);
     assert_eq!(tiered.h_inter_count(15), 1);
     assert_eq!(tiered.h_inter_count(tiered.mtp_slots), 7);
 }

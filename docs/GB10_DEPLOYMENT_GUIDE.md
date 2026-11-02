@@ -83,6 +83,7 @@ at conc=1; it trades against batch size and KV dtype (see §4).
 | Model | HuggingFace id | Params (total/active) | Quant | Topology | ~tok/s | Notes |
 |-------|----------------|----------------------|-------|----------|--------|-------|
 | **Qwen3.5-122B-A10B** | `Sehyo/Qwen3.5-122B-A10B-NVFP4` | 122B / 10B | NVFP4 | single (tight) **or** EP=2 | ~33 single / ~51 EP=2 | 256 experts; MTP K=2. Single-node needs the tight-KV recipe (§4) |
+| **GLM-5.3-Flash** | `nvidia/GLM-5.3-Flash-NVFP4` | 320B / 18B | NVFP4 | **TP2/EP2, 2 nodes** | — | [Native build and rank commands](../docker/gb10/glm-5.3-flash/nvfp4/README.md); FP8 g128 KV, 32K/session and 32K shared initial cap, optional DFlash2 |
 | **MiniMax-M2.7** | `lukealonso/MiniMax-M2.7-NVFP4` | 229B / ~10B | NVFP4 | **EP=2** (2 nodes, TP=1) | — | 256-expert sigmoid MoE; BF16 KV bring-up, no MTP; registry-only |
 | **Qwen3.5-397B-A17B** | `nvidia/Qwen3.5-397B-A17B-NVFP4` | 397B / 17B | NVFP4 | **EP=4 (4 nodes) only** | — | ~200 GB weights; single/2-node OOM at preflight |
 
@@ -268,9 +269,10 @@ Failure modes:
 
 Topology quick pick: **EP=2** (`--ep-size 2 --tp-size 1`) for MoE expert sharding
 across two nodes — this is what the 122B and MiniMax-M2.7 recipes use. **TP+EP**
-(`--tp-size 2 --ep-size 2`, a 4-rank layout) is only for a model that must shard
-*both* attention and experts; none of the current 2-node recipes need it. Pure TP=2
-is rare and OOM-prone for these models. The 397B needs **EP=4** (4 nodes).
+shards both attention and experts. GLM uses overlapping groups with
+`--world-size 2 --tp-size 2 --ep-size 2` on **two** Sparks; a four-rank orthogonal
+mesh is a different topology. Follow the model's explicit recipe rather than
+multiplying TP and EP unconditionally. The 397B needs **EP=4** (4 nodes).
 
 ---
 

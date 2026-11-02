@@ -38,6 +38,17 @@
 //! prose nsys profile, 2026-10-03). The head announces those rows with the
 //! propose and walks them as the first swaps of the plan.
 //!
+//! `ATLAS_GLM_DRAFT_TP_TOPK=1` (with the head split, default off) swaps
+//! each rank's candidate lists instead of its logits in a single-sequence
+//! propose (`Swap::Candidates`): each rank reduces its share of the
+//! vocabulary to every row's exact top-16 on the device
+//! (`dflash2_selector_topk`), the worker sends its lists (1 KiB at gamma 8,
+//! where the logits half is 1.2 MiB and crosses the pair through the host),
+//! and the head merges the two lists of each row and walks the selector
+//! chain (`dflash2_selector_walk`). Each list is exact in the selector's
+//! total order, so the drafts are the unsplit selector's. A batched propose
+//! keeps the logits swap: its selector reads the joined logits.
+//!
 //! Prior art: splitting the drafter across both ranks follows MiaAI-Lab's
 //! `DFLASH_DRAFT_TP=2` (<https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks>
 //! `.env.example`, `start.sh`; vLLM `draft_tensor_parallel_size`). Idea only,
@@ -66,6 +77,10 @@ pub struct Parts {
     /// The vocabulary head.
     pub head: bool,
 }
+
+/// Bytes per row of a `Swap::Candidates` payload: one row's top-K list, f32
+/// values and u32 ids (`ops::dflash2_selector_lists_bytes`).
+const CANDIDATE_ROW_BYTES: usize = 8 * crate::layers::ops::DFLASH2_SELECTOR_MAX_TOP_K;
 
 impl Parts {
     /// `1` = every part, else a comma list of `mlp` and `head`; unset, empty
@@ -122,11 +137,26 @@ pub fn batch_requested() -> Result<bool> {
     parse_batch(std::env::var("ATLAS_GLM_DRAFT_TP_BATCH").ok().as_deref())
 }
 
+/// `ATLAS_GLM_DRAFT_TP_TOPK`: `1` swaps candidate lists instead of logits;
+/// unset, empty or `0` = off; anything else is refused.
+pub(crate) fn parse_topk(value: Option<&str>) -> Result<bool> {
+    match value.map(str::trim) {
+        None | Some("") | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => bail!("ATLAS_GLM_DRAFT_TP_TOPK must be 0 or 1, got '{other}'"),
+    }
+}
+
+/// `ATLAS_GLM_DRAFT_TP_TOPK`, from the profile both ranks share.
+pub fn topk_requested() -> Result<bool> {
+    parse_topk(std::env::var("ATLAS_GLM_DRAFT_TP_TOPK").ok().as_deref())
+}
+
 /// The value both ranks must agree on: [`Parts::word`], plus bit 2 for the
-/// batched split and bit 3 for the context split (so the word is unchanged
-/// with them off).
-pub(crate) fn parity_word(parts: Option<Parts>, batch: bool, ctx: bool) -> u64 {
-    Parts::word(parts) | (batch as u64) << 2 | (ctx as u64) << 3
+/// batched split, bit 3 for the context split and bit 4 for the candidate
+/// swap (so the word is unchanged with them off).
+pub(crate) fn parity_word(parts: Option<Parts>, batch: bool, ctx: bool, topk: bool) -> u64 {
+    Parts::word(parts) | (batch as u64) << 2 | (ctx as u64) << 3 | (topk as u64) << 4
 }
 
 /// Where a propose's whole rows live on a rank: the MLP input and final-norm
@@ -175,6 +205,8 @@ pub(crate) enum Swap {
     Hidden,
     /// Each rank's half of the vocabulary logits; the head keeps both.
     Logits,
+    /// The worker's top-K candidate lists of its half, to the head.
+    Candidates,
     /// Context append `i`'s input rows, head to worker.
     CtxInput(usize),
     /// Each rank's half of its `fc` rows; both keep both.
@@ -204,7 +236,11 @@ pub(crate) enum Piece {
     Norm,
     /// This rank's half of the vocabulary projection.
     Vocab,
-    /// Draft selection over the joined logits (head only).
+    /// Every row's top-K candidates of this rank's half (the head also
+    /// projects the selector's hidden rows).
+    TopK,
+    /// Draft selection over the joined logits, or over both ranks'
+    /// candidate lists (head only).
     Select,
     /// This rank's half of context append `i`'s `fc` projection.
     CtxFc(usize),
@@ -235,6 +271,9 @@ pub(crate) struct Geometry {
     pub ctx_kv: usize,
     /// The context rows of the current propose's appends.
     pub ctx: CtxRows,
+    /// `ATLAS_GLM_DRAFT_TP_TOPK`: the head split swaps candidate lists, not
+    /// logits (single-sequence proposes only).
+    pub topk: bool,
 }
 
 /// Output rows a tensor-core GEMV CTA owns. A half starts on a CTA boundary,
@@ -251,10 +290,11 @@ pub(crate) fn half(n: usize, rank: usize) -> (usize, usize) {
 
 impl Geometry {
     /// This plan for a propose of `rows` rows (`gamma` is the rows of a
-    /// propose: a batched one runs B×gamma).
+    /// propose: a batched one runs B×gamma, and swaps logits).
     pub(crate) fn with_rows(&self, rows: usize) -> Self {
         Self {
             gamma: rows,
+            topk: self.topk && rows == self.gamma,
             ..*self
         }
     }
@@ -291,6 +331,7 @@ impl Geometry {
             Swap::Activation(_) => half(self.inter, 1).1,
             Swap::Output(_) => half(self.hidden, 1).1,
             Swap::Logits => half(self.vocab, 1).1,
+            Swap::Candidates => CANDIDATE_ROW_BYTES / 2,
             Swap::CtxInput(_) => self.ctx_in,
             Swap::CtxHidden(_) => half(self.hidden, 1).1,
             Swap::CtxKv(_) => half(self.ctx_kv, 1).1,
@@ -353,7 +394,12 @@ impl Geometry {
         own(&mut steps, Norm);
         swap(&mut steps, Swap::Hidden);
         both(&mut steps, Vocab);
-        swap(&mut steps, Swap::Logits);
+        if self.topk {
+            both(&mut steps, TopK);
+            swap(&mut steps, Swap::Candidates);
+        } else {
+            swap(&mut steps, Swap::Logits);
+        }
         own(&mut steps, Select);
         steps
     }

@@ -34,7 +34,7 @@ use crate::layers::ops;
 /// Strict `== "1"` on an `ATLAS_NO_*` name, not a presence check — presence
 /// flags in this codebase are ENABLED by `=0`. Read once; this is a per-step
 /// site.
-pub(super) fn lm_head_batch_gemv_enabled() -> bool {
+pub(crate) fn lm_head_batch_gemv_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_NO_LM_HEAD_BATCH_GEMV").as_deref() != Ok("1"))
 }

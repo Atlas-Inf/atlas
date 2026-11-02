@@ -290,7 +290,13 @@ impl BlockDiffusionDraftHead {
             .chain((0..self.gamma).map(|i| (position + i) as i32))
             .collect();
         let pos_bytes: Vec<u8> = pos_host.iter().flat_map(|p| p.to_le_bytes()).collect();
-        gpu.copy_h2d(&pos_bytes, scratch.position_ids)?;
+        // ATLAS_DFLASH_ASYNC_UPLOADS=1 (`twins.rs`): this propose's uploads go
+        // in stream order without draining the stream first.
+        let upload = |bytes: &[u8], dst: DevicePtr| match self.twins.async_uploads {
+            true => gpu.copy_h2d_async(bytes, dst, stream),
+            false => gpu.copy_h2d(bytes, dst),
+        };
+        upload(&pos_bytes, scratch.position_ids)?;
         if debug_dump {
             tracing::info!(
                 "DFLASH DUMP positions: eff_ctx={} ctx_total={} position={} pos_ids[0..min(8,n_attn)]={:?}",
@@ -333,7 +339,7 @@ impl BlockDiffusionDraftHead {
             .iter()
             .flat_map(|t| t.to_le_bytes())
             .collect();
-        gpu.copy_h2d(&tid_bytes, scratch.draft_tokens_dev)?;
+        upload(&tid_bytes, scratch.draft_tokens_dev)?;
         ops::batched_embed(
             gpu,
             self.kernels.batched_embed,
@@ -410,7 +416,7 @@ impl BlockDiffusionDraftHead {
                 b[8..12].copy_from_slice(&q_rope_pos.to_ne_bytes());
                 b
             };
-            gpu.copy_h2d(&indirect_bytes, scratch.option_b_indirect_args_dev)?;
+            upload(&indirect_bytes, scratch.option_b_indirect_args_dev)?;
             Some(scratch.slot_mapping_dev)
         } else {
             None
@@ -882,7 +888,12 @@ impl BlockDiffusionDraftHead {
         if let Some((split, comm)) = rank_split {
             let args =
                 |layer_idx: usize| make_paged_args(layer_idx).expect("option_b args available");
+            let plan = split.plan();
             let select = || {
+                if plan.topk {
+                    return self
+                        .select_split_lists(split, last_token, ban_depth, gpu, stream, scratch);
+                }
                 self.argmax_block_logits(
                     last_token,
                     ban_depth,
@@ -906,7 +917,7 @@ impl BlockDiffusionDraftHead {
                 select: &select,
             };
             let graph_key = graph_eligible.then(graph_identity).transpose()?;
-            self.walk_split(&split.geometry.layer_steps(0), &walker, graph_key)?;
+            self.walk_split(&plan.layer_steps(0), &walker, graph_key)?;
         } else if graph_eligible && option_b_on {
             // Subgraph slot layout: [pre_0, post_0, ..., pre_{N-1}, post_{N-1}, tail].
             // 2 × num_layers + 1 slots total.

@@ -278,3 +278,164 @@ pub fn fp8_gemm_act_weight_t_blkscaled(
     }
     Ok(())
 }
+
+/// MXFP8 W8A8 `out[M,N] = act[M,K] @ weight[N,K]ᵀ` → BF16 (FP32 accumulate),
+/// both operands E4M3 with one UE8M0 scale per 32 K values
+/// (`CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0` on A and B; TN only on GB10).
+/// GB10, FP4-Local's TP2 prefill shapes (`mxfp8_gemm_bench_gpu.rs` in
+/// spark-model, 2026-10-15): ~150-172 TFLOPS, against 57-60 for the BF16
+/// cuBLASLt heuristic on 13.0.0 (the runtime image's) and 80-94 on 13.1.1.
+///
+/// Layouts (row-major, 16-byte aligned):
+/// * `weight_fp8` `[N, K]`, `act_fp8` `[M, K]` E4M3; `out` `[M, N]` BF16.
+/// * `weight_sf`, `act_sf`: cuBLASLt's tiled scale layout for `[N, K/32]` /
+///   `[M, K/32]` (`kernels/gb10/common/mxfp8_act_quant.cuh`), `round_up(rows,
+///   128) * round_up(K/32, 4)` bytes, columns past K/32 zero.
+///
+/// `K % 32 == 0`. The kernel is a tuned in-order one (`mx_algo`), per row
+/// bucket for a shape the invariance sweep passed on this cuBLASLt, else one
+/// for every row count: the first call of a key (or one its kernel refuses)
+/// times the candidates on these operands and synchronizes `stream` (or call
+/// [`fp8_gemm_mx_prepare`](super::fp8_gemm_mx_prepare) at load).
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_act_weight_t_mx(
+    act_fp8: u64,
+    act_sf: u64,
+    weight_fp8: u64,
+    weight_sf: u64,
+    out: u64,
+    [m, n, k]: [u32; 3],
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        m > 0 && n > 0 && k > 0 && k.is_multiple_of(32),
+        "cuBLASLt MXFP8: {m}x{n}x{k} (K % 32 != 0 or an empty dimension)"
+    );
+    let ctx = ctx()?;
+    let p = super::fixed_algo::Problem::with(
+        m,
+        n,
+        k,
+        super::fixed_algo::Operands::Mxfp8 { weight_sf, act_sf },
+    )?;
+    let ptrs = [weight_fp8, act_fp8, out];
+    let algo = super::mx_algo::select(ctx, &p, [m, n, k], ptrs, stream)?;
+    super::mx_algo::matmul(ctx, &p, &algo, ptrs, stream)
+}
+
+/// [`fp8_gemm_act_weight_t_mx`] on ONE kernel for every row count, chosen
+/// once without timing (`mx_algo::pinned`): what a packed GLM prefill runs,
+/// so a prompt's rows get the same bytes alone and packed.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_act_weight_t_mx_pinned(
+    act_fp8: u64,
+    act_sf: u64,
+    weight_fp8: u64,
+    weight_sf: u64,
+    out: u64,
+    [m, n, k]: [u32; 3],
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        m > 0 && n > 0 && k > 0 && k.is_multiple_of(32),
+        "cuBLASLt MXFP8: {m}x{n}x{k} (K % 32 != 0 or an empty dimension)"
+    );
+    let ctx = ctx()?;
+    let ops = super::fixed_algo::Operands::Mxfp8 { weight_sf, act_sf };
+    let p = super::fixed_algo::Problem::with(m, n, k, ops)?;
+    let algo = super::mx_algo::pinned(ctx, n, k, ops)?;
+    anyhow::ensure!(
+        super::mx_algo::takes(ctx, &p, &algo),
+        "cuBLASLt MXFP8 {m}x{n}x{k}: the pinned kernel refuses {m} rows"
+    );
+    super::mx_algo::matmul(ctx, &p, &algo, [weight_fp8, act_fp8, out], stream)
+}
+
+/// Choose (once) the pinned kernel [`fp8_gemm_act_weight_t_blkscaled_pinned`]
+/// would run for `n x k`, without launching anything: `Err` when this
+/// cuBLASLt cannot run block FP8 on this GPU (e.g. cuBLASLt 13.0 on sm_121
+/// answers the VEC128 / BLK128x128 scale modes with NOT_SUPPORTED), so a
+/// loader can pick another prefill path at load instead of failing mid-pass.
+/// `weight_sf` / `act_sf` are any device pointers (the heuristic reads none).
+pub fn fp8_blkscaled_pinned_prepare(weight_sf: u64, act_sf: u64, n: u32, k: u32) -> Result<()> {
+    anyhow::ensure!(
+        n > 0 && k > 0 && k.is_multiple_of(128),
+        "cuBLASLt block FP8: {n}x{k}"
+    );
+    let ctx = ctx()?;
+    let ops = super::fixed_algo::Operands::Blk128 { weight_sf, act_sf };
+    super::mx_algo::pinned(ctx, n, k, ops).map(|_| ())
+}
+
+/// Block FP8 `out[m, n] = act[m, k] x weight[n, k]^T` (BF16) on ONE in-order
+/// cuBLASLt kernel per `(n, k)`, chosen once without timing and never retuned
+/// (`mx_algo::pinned`): the weight with its f32 `[n/128, k/128]` grid, the
+/// activation with per-token, per-128 f32 scales (`[m, k/128]`, as
+/// `per_token_group_quant_fp8` writes them). `m` must be a multiple of 16
+/// (the caller pads). Each output row is one in-order accumulation of its
+/// own inputs, so a row's bytes do not depend on the pass height. Errors
+/// rather than switching kernels when the pinned one refuses a height.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_act_weight_t_blkscaled_pinned(
+    act_fp8: u64,
+    act_scale: u64,
+    weight_fp8: u64,
+    weight_block_scale: u64,
+    out: u64,
+    [m, n, k]: [u32; 3],
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        m > 0 && m.is_multiple_of(16) && n > 0 && k > 0 && k.is_multiple_of(128),
+        "cuBLASLt block FP8: {m}x{n}x{k} (m % 16, k % 128 or an empty dimension)"
+    );
+    let ctx = ctx()?;
+    let ops = super::fixed_algo::Operands::Blk128 {
+        weight_sf: weight_block_scale,
+        act_sf: act_scale,
+    };
+    let p = super::fixed_algo::Problem::with(m, n, k, ops)?;
+    let algo = super::mx_algo::pinned(ctx, n, k, ops)?;
+    anyhow::ensure!(
+        super::mx_algo::takes(ctx, &p, &algo),
+        "cuBLASLt block FP8 {m}x{n}x{k}: the pinned kernel refuses {m} rows"
+    );
+    super::mx_algo::matmul(ctx, &p, &algo, [weight_fp8, act_fp8, out], stream)
+}
+
+/// [`fp8_gemm_act_weight_t_mx`] on the heuristic's `index`-th candidate for
+/// exactly these `m` rows (tests and benches: the tuned pick is not
+/// consulted or cached); `in_order_only` asks the heuristic for no-split-K
+/// kernels only, as tuning does. `Ok(None)`: no such candidate, or it
+/// refuses the problem; nothing launched. `Some((description, in_order))`
+/// otherwise.
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_act_weight_t_mx_candidate(
+    act_fp8: u64,
+    act_sf: u64,
+    weight_fp8: u64,
+    weight_sf: u64,
+    out: u64,
+    [m, n, k]: [u32; 3],
+    index: usize,
+    in_order_only: bool,
+    stream: u64,
+) -> Result<Option<(String, bool)>> {
+    use super::mx_algo::{candidates, description, in_order, matmul, takes};
+    let ctx = ctx()?;
+    let p = super::fixed_algo::Problem::with(
+        m,
+        n,
+        k,
+        super::fixed_algo::Operands::Mxfp8 { weight_sf, act_sf },
+    )?;
+    let Some(algo) = candidates(ctx, &p, in_order_only)?.get(index).copied() else {
+        return Ok(None);
+    };
+    if !takes(ctx, &p, &algo) {
+        return Ok(None);
+    }
+    matmul(ctx, &p, &algo, [weight_fp8, act_fp8, out], stream)?;
+    Ok(Some((description(&algo), in_order(&algo))))
+}

@@ -41,6 +41,18 @@
 //! only. Prefetches only, so the same bytes. A target lacking any of the
 //! `_l2pf` twins keeps the stream kernels.
 //!
+//! `ATLAS_GLM_MOE_DECODE_PERSIST=1` (with `ATLAS_GLM_MOE_DECODE_L2PF=1` and
+//! the zero-row skip) launches the prefetching pair's persistent twins: one
+//! CTA per SM, each striding over the worklist's (expert, column tile) items
+//! and asking its next item's first stages into L2 while it finishes the
+//! last, so fewer experts' tables stream at once and an item's start is
+//! hidden. Each item's loads, MMAs and epilogue are the grid kernels', so the
+//! same bytes (glm_moe_decode_stream.cuh). A target lacking any of them keeps
+//! the prefetching twins. With them come the four-slab persistent pair
+//! (`m64s`), which takes every routed FFN of 33..=[`WIDE_MAX_ROWS`] rows the
+//! two-slab pair cannot (owner-batched verifies of five to eight streams);
+//! without it those keep the K128W grid.
+//!
 //! `ATLAS_GLM_MOE_STREAM_NOSYNC=1` (with the stream twins) skips the exact
 //! M64 tile count (`ATLAS_MOE_PREFILL_EXACT_TILES`, default on for NVFP4) for
 //! the batches the stream twins take ([`MoeLayer::offsets_unread`]). That
@@ -59,6 +71,9 @@ pub(super) const MAX_ROWS: u32 = 16;
 /// Rows the two-slab stream twins cover.
 pub(super) const STREAM_MAX_ROWS: u32 = 2 * MAX_ROWS;
 
+/// Rows the four-slab persistent twins cover.
+pub(super) const WIDE_MAX_ROWS: u32 = 4 * MAX_ROWS;
+
 /// Widest batch whose tile choice is logged: an owner-batched verify.
 const NOTE_ROWS: u32 = crate::layer::glm_long_owner::MAX_ROWS as u32;
 
@@ -71,142 +86,64 @@ pub(super) struct DecodeM16 {
     gate_up_silu: KernelHandle,
     down: KernelHandle,
     wide: [KernelHandle; 2],
+    /// The four-slab persistent pair (null unless the persistent twins are
+    /// loaded and the target ships it).
+    wide4: [KernelHandle; 2],
+    /// The persistent twins' W4A16 pairs, one, two and four slabs
+    /// (`ATLAS_GLM_FP4L_DECODE_A16` with the persistent twins loaded; all
+    /// or none).
+    a16: Option<[[KernelHandle; 2]; 3]>,
     zskip: bool,
     k128w: bool,
     /// `ATLAS_GLM_MOE_STREAM_NOSYNC`.
     nosync: bool,
+    /// CTAs of the persistent twins (`ATLAS_GLM_MOE_DECODE_PERSIST`, the
+    /// SMs), 0 for the grid kernels.
+    ctas: u32,
 }
 
 impl DecodeM16 {
-    pub(super) fn new(
-        gpu: &dyn GpuBackend,
-        config: &atlas_core::config::ModelConfig,
-    ) -> Result<Self> {
-        let toggle = |name: &str| match std::env::var(name).as_deref() {
-            Err(_) | Ok("0") => Ok(false),
-            Ok("1") => Ok(true),
-            Ok(value) => anyhow::bail!("{name} requires 0 or 1, got {value:?}"),
-        };
-        let requested = toggle("ATLAS_GLM_MOE_DECODE_M16")?;
-        let zskip = toggle("ATLAS_GLM_MOE_DOWN_ZSKIP")?;
-        let stream = toggle("ATLAS_GLM_MOE_DECODE_STREAM")?;
-        // Some(whether the downs prefetch too).
-        let l2pf = match std::env::var("ATLAS_GLM_MOE_DECODE_L2PF").as_deref() {
-            Err(_) | Ok("0") => None,
-            Ok("1") => Some(true),
-            Ok("2") => Some(false),
-            Ok(value) => {
-                anyhow::bail!("ATLAS_GLM_MOE_DECODE_L2PF requires 0, 1 or 2, got {value:?}")
-            }
-        };
-        let glm = config.model_type == "glm5_next";
-        let on = requested && glm;
-        let kernel = |on, name: &str| super::super::try_kernel_gated(on, gpu, "moe_w4a16", name);
-        // A family's fused gate/up and (zero-skipping) down.
-        let pair = |on, family: &str, suffix: &str| {
-            let skip = if zskip { "_zskip" } else { "" };
-            [
-                kernel(
-                    on,
-                    &format!("glm_moe_decode_{family}_gate_up_silu_k128w{suffix}"),
-                ),
-                kernel(on, &format!("glm_moe_decode_{family}_k128w{skip}{suffix}")),
-            ]
-        };
-        // A set of twins of both slabs, all or none: a target lacking any of
-        // the stream twins runs the M16 pair, as without the flag, and one
-        // lacking any of their prefetching twins the stream twins.
-        let twins = |on, suffix| {
-            let twins = [pair(on, "m16s", suffix), pair(on, "m32s", suffix)];
-            twins.iter().flatten().all(|k| k.0 != 0).then_some(twins)
-        };
-        let streams = twins(on && stream, "");
-        let prefetch = twins(streams.is_some() && l2pf.is_some(), "_l2pf");
-        let [[mut gate_up_silu, mut down], mut wide] =
-            streams.unwrap_or_else(|| [pair(on, "m16", ""), [KernelHandle(0); 2]]);
-        if let Some([[gate_up16, down16], [gate_up32, down32]]) = prefetch {
-            [gate_up_silu, wide[0]] = [gate_up16, gate_up32];
-            if l2pf == Some(true) {
-                [down, wide[1]] = [down16, down32];
-            }
-        }
-        let mut this = Self {
-            gate_up_silu,
-            down,
-            wide,
-            zskip,
-            k128w: toggle("ATLAS_GLM_MOE_DECODE_K128W")? && glm,
-            nosync: toggle("ATLAS_GLM_MOE_STREAM_NOSYNC")? && glm,
-        };
-        if !this.loaded() {
-            // Both or neither: half a pair never launches.
-            this.gate_up_silu = KernelHandle(0);
-        }
-        if this.nosync && gpu.op_cache().once("moe:stream_nosync") {
-            if this.stream() {
-                tracing::info!(
-                    "ATLAS_GLM_MOE_STREAM_NOSYNC: no expert-offset read for the stream twins' batches"
-                );
-            } else {
-                tracing::warn!(
-                    "ATLAS_GLM_MOE_STREAM_NOSYNC=1 ignored: it needs the stream twins (ATLAS_GLM_MOE_DECODE_M16=1 ATLAS_GLM_MOE_DECODE_STREAM=1)"
-                );
-            }
-        }
-        if (requested || zskip || stream || l2pf.is_some()) && gpu.op_cache().once("moe:decode_m16")
-        {
-            if this.loaded() {
-                tracing::info!(
-                    "ATLAS_GLM_MOE_DECODE_M16: M16 routed gate/up+SiLU and down for verify decode (zero-row skip: {zskip})"
-                );
-                if stream && this.stream() {
-                    tracing::info!(
-                        "ATLAS_GLM_MOE_DECODE_STREAM: stream-loaded M16 twins for every routed FFN of up to {STREAM_MAX_ROWS} rows"
-                    );
-                } else if stream {
-                    tracing::warn!(
-                        "ATLAS_GLM_MOE_DECODE_STREAM=1 ignored: target lacks the stream kernels"
-                    );
-                }
-                if let Some(downs) = l2pf {
-                    if prefetch.is_some() {
-                        tracing::info!(
-                            "ATLAS_GLM_MOE_DECODE_L2PF: stream twins with the L2 row prefetch (gate/up, downs: {downs})"
-                        );
-                    } else {
-                        tracing::warn!(
-                            "ATLAS_GLM_MOE_DECODE_L2PF ignored: needs the stream twins and the target's _l2pf twins"
-                        );
-                    }
-                }
-            } else if on {
-                tracing::warn!("ATLAS_GLM_MOE_DECODE_M16=1 ignored: target lacks the M16 kernels");
-            } else if !requested {
-                tracing::warn!(
-                    "ATLAS_GLM_MOE_DOWN_ZSKIP / _DECODE_STREAM / _DECODE_L2PF ignored: they need ATLAS_GLM_MOE_DECODE_M16=1"
-                );
-            }
-        }
-        Ok(this)
-    }
-
     fn loaded(&self) -> bool {
         self.gate_up_silu.0 != 0 && self.down.0 != 0
     }
 
     /// Whether the stream twins are loaded: then they take every batch they
-    /// fit, up to [`STREAM_MAX_ROWS`] rows.
+    /// fit, up to [`Self::max_rows`] rows.
     fn stream(&self) -> bool {
         self.wide[0].0 != 0
     }
 
+    /// The widest batch the loaded twins take: one slab's rows, two slabs'
+    /// with the stream twins, four with the four-slab pair.
+    fn max_rows(&self) -> u32 {
+        if self.wide4[0].0 != 0 {
+            WIDE_MAX_ROWS
+        } else if self.stream() {
+            STREAM_MAX_ROWS
+        } else {
+            MAX_ROWS
+        }
+    }
+
     /// The fused gate/up and down kernels of a batch of `rows` rows: one slab
-    /// up to [`MAX_ROWS`], else the stream pair's two.
-    fn pair(&self, rows: u32) -> [KernelHandle; 2] {
+    /// up to [`MAX_ROWS`], the stream pair's two up to [`STREAM_MAX_ROWS`],
+    /// else the four-slab pair; their W4A16 twins for an `a16` batch.
+    fn pair(&self, rows: u32, a16: bool) -> [KernelHandle; 2] {
+        if let Some(sets) = self.a16.filter(|_| a16) {
+            return sets[if rows <= MAX_ROWS {
+                0
+            } else if rows <= STREAM_MAX_ROWS {
+                1
+            } else {
+                2
+            }];
+        }
         if rows <= MAX_ROWS {
             [self.gate_up_silu, self.down]
-        } else {
+        } else if rows <= STREAM_MAX_ROWS {
             self.wide
+        } else {
+            self.wide4
         }
     }
 
@@ -264,9 +201,22 @@ impl MoeLayer {
     /// then [`Self::prequant_tiles`] taking [`Self::decode_m16_grid`], whose
     /// gate/up and down both launch over its grid.
     pub(super) fn offsets_unread(&self, rows: u32, h: u32, inter: u32) -> bool {
-        self.decode_m16.nosync
-            && self.decode_m16.stream()
-            && self.m16_grid_fits(rows, STREAM_MAX_ROWS, h, inter)
+        self.decode_m16.nosync && self.stream_m16_prequant(rows, h, inter)
+    }
+
+    /// Whether a routed FFN of `rows` rows can take the stream twins' W4A16
+    /// kernels (`ATLAS_GLM_FP4L_DECODE_A16`): loaded, and the batch one the
+    /// stream twins take.
+    pub(super) fn a16_stream_fits(&self, rows: u32, h: u32, inter: u32) -> bool {
+        self.decode_m16.a16.is_some()
+            && rows <= WIDE_MAX_ROWS
+            && self.stream_m16_prequant(rows, h, inter)
+    }
+
+    /// Whether a routed FFN of `rows` rows takes the stream twins' prequant path.
+    pub(super) fn stream_m16_prequant(&self, rows: u32, h: u32, inter: u32) -> bool {
+        self.decode_m16.stream()
+            && self.m16_grid_fits(rows, self.decode_m16.max_rows(), h, inter)
             && !self.nvfp4_mmq_layout
             && !(super::forward_prefill_routed::grouped_cutlass_gate_up_enabled()
                 && self.cutlass_grouped_host.is_some())
@@ -274,7 +224,7 @@ impl MoeLayer {
             && self.up_ptrs_t.is_some()
             && self.down_ptrs_t.is_some()
             && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
-            && self.nvfp4_prequant_moe
+            && self.prequant_moe()
             && self.moe_w4a4_prequant_t_k64.0 != 0
     }
 
@@ -304,6 +254,7 @@ impl MoeLayer {
         [rows, top_k]: [u32; 2],
         [h, inter]: [u32; 2],
         num_experts: u32,
+        prerouted: bool,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<(Option<CompactMoeWorklist>, Option<MtileGrid>)> {
@@ -326,6 +277,7 @@ impl MoeLayer {
                 total_expanded,
                 [h, inter],
                 num_experts,
+                prerouted,
                 ctx,
                 stream,
             )?
@@ -393,6 +345,7 @@ impl MoeLayer {
     /// "prefix" is the compact worklist scratch with one N tile per routed
     /// local expert, which the twins index by grid row. The grid bound is
     /// host-static: there are at most `total_expanded` routed experts.
+    /// `prerouted`: `glm_moe_route_select` already built that worklist.
     #[allow(clippy::too_many_arguments)]
     fn decode_m16_grid(
         &self,
@@ -402,16 +355,12 @@ impl MoeLayer {
         total_expanded: u32,
         [h, inter]: [u32; 2],
         num_experts: u32,
+        prerouted: bool,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<Option<MtileGrid>> {
         let k = self.decode_m16;
-        let max_rows = if k.stream() {
-            STREAM_MAX_ROWS
-        } else {
-            MAX_ROWS
-        };
-        if !self.m16_grid_fits(rows, max_rows, h, inter) {
+        if !self.m16_grid_fits(rows, k.max_rows(), h, inter) {
             return Ok(None);
         }
         let total_tiles = ctx.buffers.moe_router_in_f32();
@@ -419,31 +368,49 @@ impl MoeLayer {
             ctx.buffers.sizes().moe_router_in_f32 >= 16 + total_expanded as usize * 8,
             "M16 decode worklist exceeds router scratch"
         );
-        ops::moe_build_tile_worklist(
-            ctx.gpu,
-            self.moe_build_tile_worklist_k,
-            expert_offsets,
-            local_ptrs,
-            total_tiles.offset(16),
-            total_tiles,
-            num_experts,
-            1,
-            64,
-            stream,
-        )?;
+        if !prerouted {
+            ops::moe_build_tile_worklist(
+                ctx.gpu,
+                self.moe_build_tile_worklist_k,
+                expert_offsets,
+                local_ptrs,
+                total_tiles.offset(16),
+                total_tiles,
+                num_experts,
+                1,
+                64,
+                stream,
+            )?;
+        }
         let grid_only = |grid| ops::K128wKernel {
             grid,
             persist: KernelHandle(0),
         };
-        let [gate_up_silu, down] = k.pair(rows);
-        Ok(Some(MtileGrid {
-            prefix: total_tiles,
-            schedule: ops::K128wSchedule::Grid {
+        let [gate_up_silu, down] = k.pair(rows, self.a16_stream());
+        // The persistent twins stride over the worklist's items themselves.
+        let schedule = match k.ctas {
+            0 => ops::K128wSchedule::Grid {
                 bound: total_expanded.min(num_experts),
             },
+            ctas => ops::K128wSchedule::Stride { ctas },
+        };
+        Ok(Some(MtileGrid {
+            prefix: total_tiles,
+            schedule,
             rows: total_expanded,
             gate_up_silu: grid_only(gate_up_silu),
             down: grid_only(down),
         }))
     }
 }
+
+#[path = "decode_m16_load.rs"]
+mod load;
+
+#[cfg(test)]
+#[path = "decode_m16_pair_tests.rs"]
+mod pair_tests;
+
+#[cfg(test)]
+#[path = "decode_m16_test_gpu.rs"]
+mod gpu_tests;

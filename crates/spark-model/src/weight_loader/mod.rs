@@ -39,6 +39,7 @@ pub use dflash_loader::{
 };
 pub use gemma4::Gemma4WeightLoader;
 pub use glm5::Glm5WeightLoader;
+pub use glm5::mode as glm5_mode;
 pub use laguna::LagunaWeightLoader;
 pub use longcat::LongcatWeightLoader;
 pub use minimax::MinimaxM2WeightLoader;
@@ -47,6 +48,7 @@ pub use nllb::NllbWeightLoader;
 pub use qwen3::Qwen3WeightLoader;
 pub use qwen3_vl::Qwen3VLWeightLoader;
 pub use qwen4_exp::Qwen4ExpWeightLoader;
+pub use qwen4_exp::mode as qwen4exp_mode;
 pub use qwen35::Qwen35WeightLoader;
 pub use qwen35_dense::Qwen35DenseWeightLoader;
 pub use step3p7::Step3p7WeightLoader;

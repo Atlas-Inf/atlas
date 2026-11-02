@@ -23,7 +23,9 @@ impl TransformerModel {
         chunk_len: usize,
         stream: u64,
     ) -> Result<()> {
-        if !self.ssm_snapshots.is_enabled() {
+        if !self.ssm_snapshots.is_enabled()
+            || (self.prefill_grid() > 0 && !self.prefix_cache.is_active())
+        {
             return Ok(());
         }
         let bs = kv_cache.block_size();
@@ -63,9 +65,19 @@ impl TransformerModel {
         // and is deliberately NOT made here; it needs its own measured A/B.
         let on_interval = self.ssm_checkpoint_interval > 0
             && end_block.is_multiple_of(self.ssm_checkpoint_interval);
-        // ATLAS_GLM_PC_BRANCH: the planned branch checkpoint (`pc_policy`).
-        let is_branch = seq.pc_branch_at == Some(end_token);
-        if end_block == 0 || !(is_prompt_tail || on_interval || is_branch) {
+        // R11 fix 1: under the pass grid, checkpoint ONLY at the last two grid
+        // points below the prompt end (the passes there are full grid passes
+        // in every run, so the anchor state is layout-independent). A planned
+        // branch checkpoint (ATLAS_GLM_PC_BRANCH, `pc_policy`) sits at an
+        // arbitrary token, so the grid declines it.
+        let grid = self.prefill_grid();
+        let is_branch = grid == 0 && seq.pc_branch_at == Some(end_token);
+        let wanted = if grid > 0 {
+            spark_runtime::prefill_grid::cuts().is_checkpoint(end_token, tokens.len())
+        } else {
+            is_prompt_tail || on_interval || is_branch
+        };
+        if end_block == 0 || !wanted {
             return Ok(());
         }
         // Stale-V cap (mirrors finalize_last): never checkpoint-cache a block
@@ -155,6 +167,8 @@ impl TransformerModel {
         if !aux.is_empty() {
             self.ssm_snapshots.set_aux(snap_id, aux);
         }
+        // R11 fix 7: the MTP drafter's hidden rows [0, end_token) ride along.
+        self.mtp_anchor_save(seq, tokens, snap_id, end_token, stream);
 
         if !self
             .register_intermediate_checkpoint(tokens, seq, kv_cache, end_token, snap_id, is_branch)
@@ -174,7 +188,8 @@ impl TransformerModel {
     /// checkpoint of `tokens[..end_token]`, with the prefix-cache blocks
     /// under it. `false` (snapshot freed): the boundary cannot be cached
     /// (the KV is not valid that far, the sliding window has begun, or the
-    /// prefix holds a vision placeholder).
+    /// prefix holds a vision placeholder its content key does not cover).
+    /// A keyed vision prefix registers under its key (`vision_cache`).
     pub(in crate::model) fn register_intermediate_checkpoint(
         &self,
         tokens: &[u32],
@@ -198,14 +213,15 @@ impl TransformerModel {
             return false;
         }
         let boundary_blocks = &seq.block_table[..end_block];
-        // Vision chunks: skip both the radix insert and the SSM snapshot
-        // attach — the placeholder token stream is identical for distinct
-        // images of the same prompt, so a future hit would resurrect the
-        // prior image's state.
-        if self.tokens_have_vision_pad(boundary_tokens) {
+        // Vision chunks insert under their content key (`vision_cache`). A
+        // placeholder the key does not cover skips both the radix insert and
+        // the SSM snapshot attach: the placeholder stream is identical for
+        // distinct images, so a future hit would resurrect another image's
+        // state.
+        let Some(boundary_key) = self.pc_key(seq, boundary_tokens) else {
             self.ssm_snapshots.free(snap_id);
             return false;
-        }
+        };
         let boundary_disk = if seq.disk_block_ids.len() >= end_block {
             &seq.disk_block_ids[..end_block]
         } else {
@@ -219,7 +235,7 @@ impl TransformerModel {
         // the cache's baseline ref by +1 per checkpointed block after the
         // eventual release().
         let acquired = self.prefix_cache.insert(
-            boundary_tokens,
+            &boundary_key,
             boundary_blocks,
             boundary_disk,
             bs,
@@ -228,7 +244,7 @@ impl TransformerModel {
         );
         super::super::super::block_mgmt::cache_acquires_refs(&acquired, kv_cache);
         if let Some(old) = self.prefix_cache.insert_intermediate_snapshot(
-            boundary_tokens,
+            &boundary_key,
             boundary_blocks,
             boundary_disk,
             bs,
@@ -241,7 +257,7 @@ impl TransformerModel {
         }
         if is_branch {
             self.prefix_cache
-                .mark_branch_snapshot(boundary_tokens, seq.adapter_id);
+                .mark_branch_snapshot(&boundary_key, seq.adapter_id);
         }
         true
     }

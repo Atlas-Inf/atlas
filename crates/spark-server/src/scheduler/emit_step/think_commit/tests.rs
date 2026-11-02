@@ -253,3 +253,39 @@ fn a_bare_tool_request_does_not_hold_a_post_think_end_token() {
     assert!(a.finished);
     assert_eq!(*a.output_tokens.last().unwrap(), END);
 }
+
+#[test]
+fn spontaneous_thinking_and_reentry_preserve_a_zero_server_ceiling() {
+    let sched = SchedCtx::for_test();
+    for fires in [0, 1, 7] {
+        let mut a = seq(false);
+        a.spontaneous_think_budget = 0;
+        a.think_watchdog_fires = fires;
+        for _ in 0..2 {
+            emit_token(&mut a, THINK_START, None, &sched);
+            assert!(a.inside_thinking);
+            assert_eq!(a.thinking_budget, None);
+            for _ in 0..12 {
+                emit_token(&mut a, LOW, None, &sched);
+            }
+            assert!(!a.force_end_thinking, "no hidden eight-token cap");
+            emit_token(&mut a, THINK_END, None, &sched);
+            assert!(!a.inside_thinking);
+        }
+    }
+}
+
+#[test]
+fn spontaneous_thinking_keeps_nonzero_ceiling_decay_and_floor() {
+    let sched = SchedCtx::for_test();
+    for ceiling in [4, 64] {
+        for fires in [0, 1, 7] {
+            let mut a = seq(false);
+            a.spontaneous_think_budget = ceiling;
+            a.think_watchdog_fires = fires;
+            emit_token(&mut a, THINK_START, None, &sched);
+            assert!(a.inside_thinking);
+            assert_eq!(a.thinking_budget, Some((ceiling >> fires.min(4)).max(8)));
+        }
+    }
+}

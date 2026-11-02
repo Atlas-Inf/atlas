@@ -101,7 +101,19 @@ pub fn step_verify_k4(
     let (v0_argmax, v1_argmax, v2_argmax, v3_argmax) =
         (result_vec[0], result_vec[1], result_vec[2], result_vec[3]);
 
-    let (v0, v1, v2, v3) = if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
+    let Ok(scored) =
+        super::verify_pipeline_helper::scored::requested(model, 4, a, verify_ctx, 0, None)
+    else {
+        return;
+    };
+    let (v0, v1, v2, v3) = if let Some(s) = &scored {
+        (
+            s.tokens.first().copied().unwrap_or(v0_argmax),
+            s.tokens.get(1).copied().unwrap_or(v1_argmax),
+            s.tokens.get(2).copied().unwrap_or(v2_argmax),
+            s.tokens.get(3).copied().unwrap_or(v3_argmax),
+        )
+    } else if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
         dflash_verify_raw_argmax,
         sched.levers.dflash_masked_verify,
         model,
@@ -162,7 +174,9 @@ pub fn step_verify_k4(
     // SINGLE-sequence step, i.e. the n=1 row of the same table the batched
     // step fills for n>=2.
     crate::scheduler::mtp_accept_debug::record(1, 3, drafts[0] == v0, num_accepted);
-    if !dflash_verify_raw_argmax {
+    // A copy round (`copy_drafts::mtp`) says nothing about the head.
+    let copied = crate::scheduler::copy_drafts::mtp::settle(a, 3, num_accepted);
+    if !dflash_verify_raw_argmax && !copied {
         a.mtp_acct
             .record_depth_verify(3, num_accepted, num_drafts, sched.levers.depth());
     }
@@ -185,12 +199,7 @@ pub fn step_verify_k4(
         }
     }
 
-    // Extract logprobs from verify logits buffer (K=4 positions) when requested.
-    let verify_lps = if let Some(top_logprobs) = a.top_logprobs {
-        extract_verify_logprobs(model, &[v0, v1, v2, v3], top_logprobs, 0)
-    } else {
-        Vec::new()
-    };
+    let verify_lps = scored.map(|s| s.logprobs).unwrap_or_default();
 
     // EP: broadcast num_accepted to worker.
     if let Err(e) = model.ep_broadcast_cmd(num_accepted as u32) {

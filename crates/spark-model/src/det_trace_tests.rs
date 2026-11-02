@@ -102,7 +102,7 @@ fn device_line_hashes_exactly_the_named_rows_across_segments() {
     gpu.copy_h2d(&data, ptr).unwrap();
     // Rows 2..7 of a [10, 48] tensor.
     let want = hash_bytes(&data[2 * 48..7 * 48]);
-    let line = device_line(AT, &gpu, 0, "out", ptr.offset(2 * 48), (2, 5), 48);
+    let line = device_line(AT, &gpu, 0, "out", ptr.offset(2 * 48), (2, 5), 48, None);
     assert_eq!(
         line,
         format!("DET r=1 q=7 c=8192 L=12 s=out r0=2 n=5 b=240 h={want:016x}")
@@ -127,6 +127,7 @@ fn taps_outside_a_traced_chunk_touch_nothing() {
     let gpu = MockGpuBackend::new();
     let ptr = gpu.alloc(64).unwrap();
     on_stream(&gpu, 0).tap("out", ptr, (0, 1), 64);
+    on_stream(&gpu, 0).tap_floats("out", ptr, (0, 1), 64, 4);
     tap_hashed("plogits", (0, 1), 64, 1);
     set_layer(3);
     assert_eq!(gpu.sync_count(), 0);

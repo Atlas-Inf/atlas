@@ -1,0 +1,2222 @@
+{
+  "schema": 2,
+  "integration_preserved": "d72505cb15c09a95ff6933342cefe432b039ca06",
+  "stack": [
+    {
+      "branch": "review/glm53-native-core",
+      "base": "7ffd183f210708d5b1afba1e046049f14ad498c7",
+      "head": "ae0443fa93e19c6873bc741ba9030926d184c5a1",
+      "diff": "1126 files changed, 160808 insertions(+), 8687 deletions(-)",
+      "status": "local review boundary; not submitted or a new qualification"
+    },
+    {
+      "branch": "review/glm53-context-rc2",
+      "base": "ae0443fa93e19c6873bc741ba9030926d184c5a1",
+      "head": "30efeb04da3a35609f1c4958666923c1faa9b0e0",
+      "diff": "169 files changed, 12160 insertions(+), 1280 deletions(-)",
+      "status": "local review boundary; not submitted or a new qualification"
+    },
+    {
+      "branch": "review/glm53-decode-rc4",
+      "base": "30efeb04da3a35609f1c4958666923c1faa9b0e0",
+      "head": "88457f28cd1613d281267dac6274761c3dc34e79",
+      "diff": "119 files changed, 10678 insertions(+), 1086 deletions(-)",
+      "status": "local review boundary; not submitted or a new qualification"
+    },
+    {
+      "branch": "review/glm53-native-mtp",
+      "base": "88457f28cd1613d281267dac6274761c3dc34e79",
+      "head": "d72505cb15c09a95ff6933342cefe432b039ca06",
+      "diff": "87 files changed, 5071 insertions(+), 883 deletions(-)",
+      "status": "local review boundary; not submitted or a new qualification"
+    }
+  ],
+  "scope_limit": "The reduced core is still substantial. GLM MoE/MLA/KDA, loading, optional DFlash and coupled scheduler/cache ownership remain for explicit cross-model review.",
+  "authorship": "AI-assisted integration and validation tooling; original human contributors and source licenses retained. No claim of personal human review beyond documented evidence.",
+  "external_clearance": "Public CLA evidence for imported Enntity contributions remains unresolved; no agreement signed or message sent.",
+  "publication": "Nothing pushed. These refs are local preparation, not published PRs.",
+  "independent_prerequisite": {
+    "branch": "review/glm53-shared-grammar",
+    "base": "7ffd183f210708d5b1afba1e046049f14ad498c7",
+    "head": "f58831e7af6fc74e355d85dc18848bde9c4ffcc8",
+    "code_files": 17,
+    "code_additions": 800,
+    "code_deletions": 116,
+    "scope": "Exact shared compiler extraction. Now applied under pr/glm53-grammar-compiler beneath the reduced native core. Server limits/error propagation remain in core.",
+    "tests": "832 unit tests, 2 doctests; clippy, formatting, rustdoc, license, typos and file caps passed."
+  },
+  "later_integration_corrections": [
+    {
+      "commit": "aec2ecd132ff27ca56991989a684b6f11f23bfb7",
+      "fix": "Scope mandatory GLM EP kernel loading to GLM; generic Qwen MoE construction must succeed without that symbol.",
+      "scope": "Included in corrected submission/* candidates; historical review refs are unchanged.",
+      "propagation": "Carried into submission/* candidates; historical review/* refs retained unchanged."
+    },
+    {
+      "commit": "fc21d7dcbc9b6b4f4d090b0b5226653ee654cda6",
+      "fix": "Scope 16 optional GLM-only kernel probes to GLM, including the inherited K128 prequant flag. Preserve common optimizations and GLM strict audit visibility.",
+      "scope": "Included in corrected submission/* candidates; historical review refs are unchanged.",
+      "propagation": "Carried into submission/* candidates; historical review/* refs retained unchanged."
+    },
+    {
+      "commit": "5e483b06256887c8a90dc14700c43a96a6fd2203",
+      "fix": "Carry ordered image/video input for every blocking choice; fixes a pre-existing Atlas-base bug exposed by the vision gate.",
+      "scope": "Separate API correction, included in corrected submission stack; does not alter model kernels or gate thresholds.",
+      "propagation": "Carried into submission/* candidates; historical review/* refs retained unchanged."
+    }
+  ],
+  "corrected_submission_candidates": [
+    {
+      "branch": "submission/glm53-native-core",
+      "head": "65706c9b045cdc3569ddb0b1857406a683528017",
+      "parent_branch": "Atlas-Inf/main@7ffd183f",
+      "base": "7ffd183f210708d5b1afba1e046049f14ad498c7",
+      "historical_branch": "review/glm53-native-core",
+      "historical_head": "ae0443fa93e19c6873bc741ba9030926d184c5a1",
+      "git_commit_parents": [
+        "fc8c3d5b925c5ac8e6013947aabc052c9333a8e4"
+      ],
+      "diff_against_corrected_predecessor": {
+        "files": 1128,
+        "insertions": 161116,
+        "deletions": 8692,
+        "shortstat": "1128 files changed, 161116 insertions(+), 8692 deletions(-)"
+      },
+      "correction_diff_against_historical_head": {
+        "files": 9,
+        "insertions": 336,
+        "deletions": 33,
+        "shortstat": "9 files changed, 336 insertions(+), 33 deletions(-)"
+      },
+      "correction_files": [
+        "crates/spark-model/src/layers/moe/ep_prefill.rs",
+        "crates/spark-model/src/layers/moe/gate_up_btile_test_gpu.rs",
+        "crates/spark-model/src/layers/moe/gate_up_repack.rs",
+        "crates/spark-model/src/layers/moe/init.rs",
+        "crates/spark-model/src/layers/moe/init_optional.rs",
+        "crates/spark-model/src/layers/moe/init_optional_tests.rs",
+        "crates/spark-server/src/api/chat_blocking.rs",
+        "crates/spark-server/src/api/chat_stream/blocking_vision_choices_tests.rs",
+        "crates/spark-server/src/api/chat_stream/glm_tool_boundary_tests.rs"
+      ],
+      "incremental_file_set_matches_historical_stage": false,
+      "clean_worktree": true,
+      "qualified": false,
+      "historical_stage_difference": "Core introduces the two new corrective regression-test files; later stages preserve their original incremental file sets."
+    },
+    {
+      "branch": "submission/glm53-context-rc2",
+      "head": "cb74ee4af8b968b86b9c41dc994776b6043f24bd",
+      "parent_branch": "submission/glm53-native-core",
+      "base": "65706c9b045cdc3569ddb0b1857406a683528017",
+      "historical_branch": "review/glm53-context-rc2",
+      "historical_head": "30efeb04da3a35609f1c4958666923c1faa9b0e0",
+      "git_commit_parents": [
+        "30efeb04da3a35609f1c4958666923c1faa9b0e0",
+        "65706c9b045cdc3569ddb0b1857406a683528017"
+      ],
+      "diff_against_corrected_predecessor": {
+        "files": 169,
+        "insertions": 12160,
+        "deletions": 1280,
+        "shortstat": "169 files changed, 12160 insertions(+), 1280 deletions(-)"
+      },
+      "correction_diff_against_historical_head": {
+        "files": 9,
+        "insertions": 336,
+        "deletions": 33,
+        "shortstat": "9 files changed, 336 insertions(+), 33 deletions(-)"
+      },
+      "correction_files": [
+        "crates/spark-model/src/layers/moe/ep_prefill.rs",
+        "crates/spark-model/src/layers/moe/gate_up_btile_test_gpu.rs",
+        "crates/spark-model/src/layers/moe/gate_up_repack.rs",
+        "crates/spark-model/src/layers/moe/init.rs",
+        "crates/spark-model/src/layers/moe/init_optional.rs",
+        "crates/spark-model/src/layers/moe/init_optional_tests.rs",
+        "crates/spark-server/src/api/chat_blocking.rs",
+        "crates/spark-server/src/api/chat_stream/blocking_vision_choices_tests.rs",
+        "crates/spark-server/src/api/chat_stream/glm_tool_boundary_tests.rs"
+      ],
+      "incremental_file_set_matches_historical_stage": true,
+      "clean_worktree": true,
+      "qualified": false
+    },
+    {
+      "branch": "submission/glm53-decode-rc4",
+      "head": "7b2bfe516d609053e9b9cd9b0603b74ed6fffb06",
+      "parent_branch": "submission/glm53-context-rc2",
+      "base": "cb74ee4af8b968b86b9c41dc994776b6043f24bd",
+      "historical_branch": "review/glm53-decode-rc4",
+      "historical_head": "88457f28cd1613d281267dac6274761c3dc34e79",
+      "git_commit_parents": [
+        "88457f28cd1613d281267dac6274761c3dc34e79",
+        "cb74ee4af8b968b86b9c41dc994776b6043f24bd"
+      ],
+      "diff_against_corrected_predecessor": {
+        "files": 119,
+        "insertions": 10678,
+        "deletions": 1086,
+        "shortstat": "119 files changed, 10678 insertions(+), 1086 deletions(-)"
+      },
+      "correction_diff_against_historical_head": {
+        "files": 9,
+        "insertions": 336,
+        "deletions": 33,
+        "shortstat": "9 files changed, 336 insertions(+), 33 deletions(-)"
+      },
+      "correction_files": [
+        "crates/spark-model/src/layers/moe/ep_prefill.rs",
+        "crates/spark-model/src/layers/moe/gate_up_btile_test_gpu.rs",
+        "crates/spark-model/src/layers/moe/gate_up_repack.rs",
+        "crates/spark-model/src/layers/moe/init.rs",
+        "crates/spark-model/src/layers/moe/init_optional.rs",
+        "crates/spark-model/src/layers/moe/init_optional_tests.rs",
+        "crates/spark-server/src/api/chat_blocking.rs",
+        "crates/spark-server/src/api/chat_stream/blocking_vision_choices_tests.rs",
+        "crates/spark-server/src/api/chat_stream/glm_tool_boundary_tests.rs"
+      ],
+      "incremental_file_set_matches_historical_stage": true,
+      "clean_worktree": true,
+      "qualified": false
+    },
+    {
+      "branch": "submission/glm53-native-mtp",
+      "head": "ad77877b40ea44f8d8445856ab5d88951b68e8fb",
+      "parent_branch": "submission/glm53-decode-rc4",
+      "base": "7b2bfe516d609053e9b9cd9b0603b74ed6fffb06",
+      "historical_branch": "review/glm53-native-mtp",
+      "historical_head": "d72505cb15c09a95ff6933342cefe432b039ca06",
+      "git_commit_parents": [
+        "d72505cb15c09a95ff6933342cefe432b039ca06",
+        "7b2bfe516d609053e9b9cd9b0603b74ed6fffb06"
+      ],
+      "diff_against_corrected_predecessor": {
+        "files": 87,
+        "insertions": 5071,
+        "deletions": 883,
+        "shortstat": "87 files changed, 5071 insertions(+), 883 deletions(-)"
+      },
+      "correction_diff_against_historical_head": {
+        "files": 9,
+        "insertions": 336,
+        "deletions": 33,
+        "shortstat": "9 files changed, 336 insertions(+), 33 deletions(-)"
+      },
+      "correction_files": [
+        "crates/spark-model/src/layers/moe/ep_prefill.rs",
+        "crates/spark-model/src/layers/moe/gate_up_btile_test_gpu.rs",
+        "crates/spark-model/src/layers/moe/gate_up_repack.rs",
+        "crates/spark-model/src/layers/moe/init.rs",
+        "crates/spark-model/src/layers/moe/init_optional.rs",
+        "crates/spark-model/src/layers/moe/init_optional_tests.rs",
+        "crates/spark-server/src/api/chat_blocking.rs",
+        "crates/spark-server/src/api/chat_stream/blocking_vision_choices_tests.rs",
+        "crates/spark-server/src/api/chat_stream/glm_tool_boundary_tests.rs"
+      ],
+      "incremental_file_set_matches_historical_stage": true,
+      "clean_worktree": true,
+      "qualified": false
+    }
+  ],
+  "corrected_stack_evidence": {
+    "schema": 1,
+    "status": "Unqualified historical-derived local submission candidates; no publication or qualification inferred from tree equality.",
+    "reference_integration": "5e483b06256887c8a90dc14700c43a96a6fd2203",
+    "historical_integration_preserved": "d72505cb15c09a95ff6933342cefe432b039ca06",
+    "fix_mapping": [
+      {
+        "original": "aec2ecd132ff27ca56991989a684b6f11f23bfb7",
+        "corrected_core_commit": "c4604b0dc169d4cccdc364e345fb08a677d6651f",
+        "original_subject": "fix(moe): scope sparse EP kernel loading to GLM",
+        "cherry_pick_x_trailer": true
+      },
+      {
+        "original": "fc21d7dcbc9b6b4f4d090b0b5226653ee654cda6",
+        "corrected_core_commit": "fc8c3d5b925c5ac8e6013947aabc052c9333a8e4",
+        "original_subject": "Scope optional GLM MoE kernel probes to GLM targets",
+        "cherry_pick_x_trailer": true
+      },
+      {
+        "original": "5e483b06256887c8a90dc14700c43a96a6fd2203",
+        "corrected_core_commit": "65706c9b045cdc3569ddb0b1857406a683528017",
+        "original_subject": "spark-server: preserve media for every blocking choice",
+        "cherry_pick_x_trailer": true
+      }
+    ],
+    "new_commit_metadata": [
+      {
+        "author_name": "Reiner Schmidt",
+        "author_email": "reinermschmidt@gmail.com",
+        "author_date": "2026-10-13T02:30:00-05:00",
+        "committer_name": "Reiner Schmidt",
+        "committer_email": "reinermschmidt@gmail.com",
+        "committer_date": "2026-10-13T02:30:00-05:00",
+        "commit": "c4604b0dc169d4cccdc364e345fb08a677d6651f"
+      },
+      {
+        "author_name": "Reiner Schmidt",
+        "author_email": "reinermschmidt@gmail.com",
+        "author_date": "2026-10-13T02:30:00-05:00",
+        "committer_name": "Reiner Schmidt",
+        "committer_email": "reinermschmidt@gmail.com",
+        "committer_date": "2026-10-13T02:30:00-05:00",
+        "commit": "fc8c3d5b925c5ac8e6013947aabc052c9333a8e4"
+      },
+      {
+        "author_name": "Reiner Schmidt",
+        "author_email": "reinermschmidt@gmail.com",
+        "author_date": "2026-10-13T02:30:00-05:00",
+        "committer_name": "Reiner Schmidt",
+        "committer_email": "reinermschmidt@gmail.com",
+        "committer_date": "2026-10-13T02:30:00-05:00",
+        "commit": "65706c9b045cdc3569ddb0b1857406a683528017"
+      },
+      {
+        "author_name": "Reiner Schmidt",
+        "author_email": "reinermschmidt@gmail.com",
+        "author_date": "2026-10-13T02:30:00-05:00",
+        "committer_name": "Reiner Schmidt",
+        "committer_email": "reinermschmidt@gmail.com",
+        "committer_date": "2026-10-13T02:30:00-05:00",
+        "commit": "cb74ee4af8b968b86b9c41dc994776b6043f24bd"
+      },
+      {
+        "author_name": "Reiner Schmidt",
+        "author_email": "reinermschmidt@gmail.com",
+        "author_date": "2026-10-13T02:30:00-05:00",
+        "committer_name": "Reiner Schmidt",
+        "committer_email": "reinermschmidt@gmail.com",
+        "committer_date": "2026-10-13T02:30:00-05:00",
+        "commit": "7b2bfe516d609053e9b9cd9b0603b74ed6fffb06"
+      },
+      {
+        "author_name": "Reiner Schmidt",
+        "author_email": "reinermschmidt@gmail.com",
+        "author_date": "2026-10-13T02:30:00-05:00",
+        "committer_name": "Reiner Schmidt",
+        "committer_email": "reinermschmidt@gmail.com",
+        "committer_date": "2026-10-13T02:30:00-05:00",
+        "commit": "ad77877b40ea44f8d8445856ab5d88951b68e8fb"
+      }
+    ],
+    "scope_limit": "Core remains oversized: broad shared scheduler, grammar, memory and DFlash changes remain. This propagation adds only the three corrective changes and does not resolve original scope or licensing issues.",
+    "shared_grammar": "review/glm53-shared-grammar remains untouched and independent; it is not rebased beneath this stack.",
+    "conflict_decisions": [
+      {
+        "operation": "cherry-pick 5e483b06 onto corrected core",
+        "path": "crates/spark-server/src/api/chat_stream/glm_tool_boundary_tests.rs",
+        "decision": "Register blocking_vision_choices_tests after reasoning_done_tests. Do not import disable_mtp_tests, which does not yet exist in native core."
+      },
+      {
+        "operation": "merge corrected RC4 into historical MTP",
+        "path": "crates/spark-server/src/api/chat_stream/glm_tool_boundary_tests.rs",
+        "decision": "Retain both existing disable_mtp_tests and corrected blocking_vision_choices_tests, in that order; exact final file matches 5e483b06."
+      }
+    ],
+    "runtime_tree_equivalence": {
+      "reference": "5e483b06256887c8a90dc14700c43a96a6fd2203",
+      "candidate": "ad77877b40ea44f8d8445856ab5d88951b68e8fb",
+      "paths": [
+        "crates",
+        "kernels",
+        "Cargo.toml",
+        "Cargo.lock",
+        "vendor",
+        "jinja-templates",
+        "rust-toolchain.toml",
+        "docker",
+        ".dockerignore",
+        "third_party",
+        "tests/fixtures",
+        "LICENSE",
+        ".cargo"
+      ],
+      "matching_git_tree_entries": 3789,
+      "manifest_sha256": "168ed7fa7aaa1a6a0b61403afe07464d92b65599e7cd74b32a5fdab93a242da4",
+      "git_ls_tree_mode_type_blob_path_equal": true,
+      "git_diff_empty": true,
+      "docker_copy_inputs_covered": true,
+      "meaning": "Source/build-input identity only. Runtime behavior and required gates are not measured on these new commit identities.",
+      "all_other_tree_differences": [
+        "M\tdocs/porting/GLM_5_3_FLASH.md",
+        "M\tdocs/porting/GLM_5_3_FLASH_NATIVE_MTP.md",
+        "M\tdocs/porting/GLM_5_3_FLASH_REVIEW.md",
+        "M\tdocs/porting/glm53-validation/README.md",
+        "M\tdocs/porting/glm53-validation/history-map.json",
+        "D\tdocs/porting/glm53-validation/native-mtp-latency.json",
+        "D\tdocs/porting/glm53-validation/readiness-results.json",
+        "D\tdocs/porting/glm53-validation/rights-audit.json",
+        "D\tdocs/porting/glm53-validation/submission-stack.json",
+        "D\tdocs/porting/glm53-validation/timestamp-map.json",
+        "D\tscripts/dev/glm53_native/benchmark_mtp.py",
+        "D\tscripts/dev/glm53_native/cross_model_probe.py"
+      ]
+    },
+    "validation": {
+      "branch_ancestry_verified": true,
+      "all_new_commit_identities_and_dates_verified": true,
+      "all_four_worktrees_clean": true,
+      "gpu_tests_run_on_submission_refs": false,
+      "publication": "Nothing pushed.",
+      "later_stage_file_sets_preserved": true,
+      "formatting_and_diff_checks": "Passed in all four isolated worktrees; no builds or GPU qualification run there."
+    }
+  },
+  "active_local_stack": "scope_reduced_candidates",
+  "scope_reduced_candidates": [
+    {
+      "branch": "pr/glm53-kernel-flags",
+      "base": "7ffd183f210708d5b1afba1e046049f14ad498c7",
+      "source_commit": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 6,
+        "additions": 157,
+        "deletions": 10
+      },
+      "code_head": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "status": "CPU evidence in branch-cpu-results.json; full-stack GPU campaign pending. Intermediate branches retain independent formal qualification requirements.",
+      "branch_head": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-kernel-flags",
+      "pre_mmq_actual_head": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "head_snapshot_before_hip": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip.",
+      "head_snapshot_before_final_test_fix": "6a9d04bd2771b0321ab37c630eec036095b55f04"
+    },
+    {
+      "branch": "pr/glm53-arena-accounting",
+      "base": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "source_commit": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 3,
+        "additions": 142,
+        "deletions": 6
+      },
+      "code_head": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "status": "CPU evidence in branch-cpu-results.json; full-stack GPU campaign pending. Intermediate branches retain independent formal qualification requirements.",
+      "branch_head": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-arena-accounting",
+      "pre_mmq_actual_head": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "head_snapshot_before_hip": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip.",
+      "head_snapshot_before_final_test_fix": "62836b3ba1775dcce2a5996cc77ee7017c4b34de"
+    },
+    {
+      "branch": "pr/glm53-swap-records",
+      "base": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "source_commit": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 8,
+        "additions": 728,
+        "deletions": 6
+      },
+      "code_head": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "status": "CPU evidence in branch-cpu-results.json; full-stack GPU campaign pending. Intermediate branches retain independent formal qualification requirements.",
+      "branch_head": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-swap-records",
+      "pre_mmq_actual_head": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "head_snapshot_before_hip": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip.",
+      "head_snapshot_before_final_test_fix": "ce147310083af5d70978db6144b05e9caa21e04d"
+    },
+    {
+      "branch": "pr/glm53-memory-accounting",
+      "base": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "source_commit": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 7,
+        "additions": 515,
+        "deletions": 15
+      },
+      "code_head": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "status": "CPU evidence in branch-cpu-results.json; full-stack GPU campaign pending. Intermediate branches retain independent formal qualification requirements.",
+      "branch_head": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-memory-accounting",
+      "pre_mmq_actual_head": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "head_snapshot_before_hip": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip.",
+      "head_snapshot_before_final_test_fix": "891f01159a76e072d90f3829735e6aee4e375afd"
+    },
+    {
+      "branch": "pr/glm53-pair-transport",
+      "base": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "source_commit": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 30,
+        "additions": 5714,
+        "deletions": 87
+      },
+      "code_head": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "status": "CPU evidence in branch-cpu-results.json; full-stack GPU campaign pending. Intermediate branches retain independent formal qualification requirements.",
+      "branch_head": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-pair-transport",
+      "pre_mmq_actual_head": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "head_snapshot_before_hip": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip.",
+      "head_snapshot_before_final_test_fix": "cf958ab1bc7292e5f604927181177e9801dff82e"
+    },
+    {
+      "branch": "pr/glm53-native-kda",
+      "base": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "source_commit": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 15,
+        "additions": 2542,
+        "deletions": 1
+      },
+      "code_head": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "status": "CPU evidence in branch-cpu-results.json; full-stack GPU campaign pending. Intermediate branches retain independent formal qualification requirements.",
+      "branch_head": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-native-kda",
+      "pre_mmq_actual_head": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "head_snapshot_before_hip": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip.",
+      "head_snapshot_before_final_test_fix": "e70b41b118fa55ff07c4dc76c1cd88aae522091e"
+    },
+    {
+      "branch": "pr/glm53-grammar-compiler",
+      "base": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "source_commit": "f58831e7af6fc74e355d85dc18848bde9c4ffcc8",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 18,
+        "additions": 951,
+        "deletions": 116
+      },
+      "code_head": "ad5d97a66aa90d94fd053ece43d76d823d4d1d76",
+      "status": "CPU evidence in branch-cpu-results.json; full-stack GPU campaign pending. Intermediate branches retain independent formal qualification requirements.",
+      "branch_head": "ad5d97a66aa90d94fd053ece43d76d823d4d1d76",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-grammar-compiler",
+      "pre_mmq_actual_head": "ad5d97a66aa90d94fd053ece43d76d823d4d1d76",
+      "head_snapshot_before_hip": "ad5d97a66aa90d94fd053ece43d76d823d4d1d76",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip.",
+      "head_snapshot_before_final_test_fix": "ad5d97a66aa90d94fd053ece43d76d823d4d1d76"
+    },
+    {
+      "branch": "pr/glm53-streaming",
+      "base": "ad5d97a66aa90d94fd053ece43d76d823d4d1d76",
+      "source_commit": "c8eaa608ac39e50ef2be1ab4decf29c22026823f",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 13,
+        "additions": 663,
+        "deletions": 122
+      },
+      "code_head": "3c9807a32369f379e08b7e1c323ead09d63185e0",
+      "status": "CPU evidence in branch-cpu-results.json; full-stack GPU campaign pending. Intermediate branches retain independent formal qualification requirements.",
+      "branch_head": "3c9807a32369f379e08b7e1c323ead09d63185e0",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-streaming",
+      "pre_mmq_actual_head": "3c9807a32369f379e08b7e1c323ead09d63185e0",
+      "head_snapshot_before_hip": "3c9807a32369f379e08b7e1c323ead09d63185e0",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip.",
+      "head_snapshot_before_final_test_fix": "3c9807a32369f379e08b7e1c323ead09d63185e0"
+    },
+    {
+      "branch": "pr/glm53-request-media",
+      "base": "3c9807a32369f379e08b7e1c323ead09d63185e0",
+      "source_commit": "b2d9f1bc020b17c87daf3b8d3a720d820b762067",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 10,
+        "additions": 311,
+        "deletions": 16
+      },
+      "code_head": "6b13e37256cf4dde871b3f5a113a183a0be5898b",
+      "status": "CPU evidence in branch-cpu-results.json; full-stack GPU campaign pending. Intermediate branches retain independent formal qualification requirements.",
+      "branch_head": "6b13e37256cf4dde871b3f5a113a183a0be5898b",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-request-media",
+      "pre_mmq_actual_head": "6b13e37256cf4dde871b3f5a113a183a0be5898b",
+      "head_snapshot_before_hip": "6b13e37256cf4dde871b3f5a113a183a0be5898b",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip.",
+      "head_snapshot_before_final_test_fix": "6b13e37256cf4dde871b3f5a113a183a0be5898b"
+    },
+    {
+      "branch": "pr/glm53-native-core",
+      "base": "6b13e37256cf4dde871b3f5a113a183a0be5898b",
+      "source_commit": "8e2ea922de58c52b497223935f41867dc58938b8",
+      "kind": "native-core",
+      "diff": {
+        "files": 975,
+        "additions": 130710,
+        "deletions": 8221
+      },
+      "code_head": "30700d86336b4244eb21ac6c9378643cd22e5fb6",
+      "status": "CPU evidence in branch-cpu-results.json; full-stack GPU campaign pending. Intermediate branches retain independent formal qualification requirements.",
+      "branch_head": "30700d86336b4244eb21ac6c9378643cd22e5fb6",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-native-core",
+      "pre_mmq_actual_head": "f873fee48e9f88907ecfe8ac8b1330e172ee9c4c",
+      "head_snapshot_before_hip": "d6f0a31d81102c6a91ddc6039314e7081967e1da",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip.",
+      "head_snapshot_before_final_test_fix": "0e77245d38e7115769d57084f03143cd74cdd366"
+    },
+    {
+      "branch": "pr/glm53-context-storage",
+      "base": "30700d86336b4244eb21ac6c9378643cd22e5fb6",
+      "source_commit": "65706c9b045cdc3569ddb0b1857406a683528017",
+      "kind": "context-followup",
+      "diff": {
+        "files": 85,
+        "additions": 11646,
+        "deletions": 431
+      },
+      "code_head": "5cced145f3dc5709c88db6f550d54b41431218ae",
+      "status": "CPU evidence in branch-cpu-results.json; full-stack GPU campaign pending. Intermediate branches retain independent formal qualification requirements.",
+      "branch_head": "5cced145f3dc5709c88db6f550d54b41431218ae",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-context-storage",
+      "pre_mmq_actual_head": "0909d99fafff16feb1513696c9e2b9012e06a474",
+      "head_snapshot_before_hip": "1e83fd752c298f29570d2c27ea55715eac83d29e",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip.",
+      "head_snapshot_before_final_test_fix": "eb00b856367c02deeed02bb37e9ab2472a7a0def"
+    },
+    {
+      "branch": "pr/glm53-benchmark-tools",
+      "base": "5cced145f3dc5709c88db6f550d54b41431218ae",
+      "source_commit": "65706c9b045cdc3569ddb0b1857406a683528017",
+      "kind": "developer-followup",
+      "diff": {
+        "files": 29,
+        "additions": 8265,
+        "deletions": 0
+      },
+      "code_head": "5b2a33bec20e64112c91020ca170e03381749fba",
+      "status": "CPU evidence in branch-cpu-results.json; full-stack GPU campaign pending. Intermediate branches retain independent formal qualification requirements.",
+      "branch_head": "5b2a33bec20e64112c91020ca170e03381749fba",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-benchmark-tools",
+      "pre_mmq_actual_head": "a904448ebcc2d9a99355972a73c511d1a404e506",
+      "head_snapshot_before_hip": "67380df286cbf8f4ac9f6608c30a29adad92d3d6",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip.",
+      "head_snapshot_before_final_test_fix": "a0699296dc3faa635cc11eaafa59ee69b83e27fa"
+    },
+    {
+      "branch": "pr/glm53-context-rc2",
+      "base": "5b2a33bec20e64112c91020ca170e03381749fba",
+      "source_commit": "cb74ee4af8b968b86b9c41dc994776b6043f24bd",
+      "kind": "optional-followup",
+      "diff": {
+        "files": 171,
+        "additions": 12174,
+        "deletions": 1292
+      },
+      "code_head": "1cbbfddf12ac79fa21666493f8b0fc470b61c503",
+      "status": "CPU evidence in branch-cpu-results.json; full-stack GPU campaign pending. Intermediate branches retain independent formal qualification requirements.",
+      "branch_head": "1cbbfddf12ac79fa21666493f8b0fc470b61c503",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-context-rc2",
+      "pre_mmq_actual_head": "d4a27f15b9472b63ad7dd91e8c181e8499c7c576",
+      "head_snapshot_before_hip": "8809b96893024c0e2b667ed9afc55665879b01d5",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip.",
+      "head_snapshot_before_final_test_fix": "a803b4e3b1b815a7b397da9c5dcc239cac9212be"
+    },
+    {
+      "branch": "pr/glm53-decode-rc4",
+      "base": "1cbbfddf12ac79fa21666493f8b0fc470b61c503",
+      "source_commit": "7b2bfe516d609053e9b9cd9b0603b74ed6fffb06",
+      "kind": "optional-followup",
+      "diff": {
+        "files": 119,
+        "additions": 10677,
+        "deletions": 1085
+      },
+      "code_head": "97479b71a6b1497dd9e56648276501539c3081d7",
+      "status": "CPU evidence in branch-cpu-results.json; full-stack GPU campaign pending. Intermediate branches retain independent formal qualification requirements.",
+      "branch_head": "97479b71a6b1497dd9e56648276501539c3081d7",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-decode-rc4",
+      "pre_mmq_actual_head": "86b4de6d9666d27a9574054dd184318e6d0ec2ab",
+      "head_snapshot_before_hip": "a782d1080b244837bd105032b1f9205457c8effd",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip.",
+      "head_snapshot_before_final_test_fix": "1bd9aac3a9232a2ff7e03332cdcf61e2b6651fb6"
+    },
+    {
+      "branch": "pr/glm53-native-mtp",
+      "base": "97479b71a6b1497dd9e56648276501539c3081d7",
+      "source_commit": "7ceb9c748e2ac7dad69d10be758b6dc373a49584",
+      "kind": "optional-followup",
+      "diff": {
+        "files": 116,
+        "additions": 19581,
+        "deletions": 1148
+      },
+      "code_head": "cc2d49ccdda284cca25ceed9570d13875fd5d36f",
+      "status": "CPU evidence in branch-cpu-results.json; full-stack GPU campaign pending. Intermediate branches retain independent formal qualification requirements.",
+      "branch_head": "cc2d49ccdda284cca25ceed9570d13875fd5d36f",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-native-mtp",
+      "pre_mmq_actual_head": "049b42054fb9e75c0f22565c54f122ecaed1b02c",
+      "head_snapshot_before_hip": "15768df3e6c75cb650320a3b87bed3b08dd4c26f",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip.",
+      "head_snapshot_before_final_test_fix": "dcf3d033fd924a54864b1b00feb1eee8992bf442"
+    }
+  ],
+  "scope_reduction": {
+    "original_corrected_core": "65706c9b045cdc3569ddb0b1857406a683528017",
+    "original_diff": {
+      "files": 1128,
+      "additions": 161116,
+      "deletions": 8692
+    },
+    "reduced_core": "f873fee48e9f88907ecfe8ac8b1330e172ee9c4c",
+    "reduced_core_diff": {
+      "files": 971,
+      "additions": 130280,
+      "deletions": 8215
+    },
+    "comparison": "Original corrected core versus Atlas base; reduced core versus its explicit shared prerequisites.",
+    "code_head_semantics": "Records identify code boundaries. Branches may carry later documentation-and-records commits; qualification does not transfer to intermediate stages.",
+    "preserved_refs": "All historical review/* and corrected submission/* refs are unchanged.",
+    "deferred_features": [
+      "Initial token-sharded KV and optional NVMe prefix storage",
+      "Developer performance harnesses with their example declarations",
+      "Existing RC2, RC4 and optional native MTP followups"
+    ],
+    "retained_safety": [
+      "SSM-only startup backing fingerprint and restore-depth agreement",
+      "Anonymous SSM swap-file cleanup",
+      "Rank-minimum cache capacity, allocation rollback and shared KV ownership",
+      "Native KDA/sparse prefill, numerical oracles, model tests and source/license notices"
+    ],
+    "policy_boundary": "Server schema/cache limits stay with strict-output refusal/error propagation. The standalone compiler prerequisite retains Atlas base server error-fallback behavior; it does not promise fail-closed HTTP handling.",
+    "scope_limit": "The reduced core is still substantial. GLM MoE/MLA/KDA, loading, optional DFlash and coupled scheduler/cache ownership remain for explicit cross-model review.",
+    "final_source_equality": {
+      "source": "5e483b06256887c8a90dc14700c43a96a6fd2203",
+      "prepared_tip": "e32dfe232f2de0ab274c03c04cae52cc19985ef3",
+      "equal": true,
+      "entries": 3816,
+      "paths": [
+        "crates",
+        "kernels",
+        "Cargo.toml",
+        "Cargo.lock",
+        "vendor",
+        "jinja-templates",
+        "rust-toolchain.toml",
+        "docker",
+        ".dockerignore",
+        "third_party",
+        "test_data",
+        "tests",
+        ".cargo",
+        "LICENSE"
+      ],
+      "method": "Compare full Git tree entries (file mode, blob object id and path), including symlinks, for runtime/build/deployment/native-license/test inputs",
+      "qualification": "Source equality only; no new intermediate-stage GPU qualification",
+      "status": "Historical pre-correction equality; later four-file ownership fix changes the current source"
+    },
+    "validation_report": "scope-reduction-results.json",
+    "publication": "Local only. No push, PR submission, service deployment or GPU requalification performed for this decomposition.",
+    "previous_reduced_core": "77152c6884346900006e5d2b4b3c282594621c1b",
+    "current_main_full_equality": {
+      "main": "b91729efa1ffefbb7cb998ed078bc333d51556f0",
+      "full": "6447f929aa692c440186abffef203a7eb6aca4bc",
+      "equal": true,
+      "meaning": "Git source equality, not GPU qualification"
+    }
+  },
+  "scope_reduced_candidates_before_checkpoint_fix": [
+    {
+      "branch": "pr/glm53-kernel-flags",
+      "base": "7ffd183f210708d5b1afba1e046049f14ad498c7",
+      "source_commit": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 6,
+        "additions": 157,
+        "deletions": 10
+      },
+      "code_head": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "status": "Local dependency boundary; no publication or independent GPU qualification"
+    },
+    {
+      "branch": "pr/glm53-arena-accounting",
+      "base": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "source_commit": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 3,
+        "additions": 142,
+        "deletions": 6
+      },
+      "code_head": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "status": "Local dependency boundary; no publication or independent GPU qualification"
+    },
+    {
+      "branch": "pr/glm53-swap-records",
+      "base": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "source_commit": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 8,
+        "additions": 728,
+        "deletions": 6
+      },
+      "code_head": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "status": "Local dependency boundary; no publication or independent GPU qualification"
+    },
+    {
+      "branch": "pr/glm53-memory-accounting",
+      "base": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "source_commit": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 7,
+        "additions": 515,
+        "deletions": 15
+      },
+      "code_head": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "status": "Local dependency boundary; no publication or independent GPU qualification"
+    },
+    {
+      "branch": "pr/glm53-pair-transport",
+      "base": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "source_commit": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 30,
+        "additions": 5714,
+        "deletions": 87
+      },
+      "code_head": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "status": "Local dependency boundary; no publication or independent GPU qualification"
+    },
+    {
+      "branch": "pr/glm53-native-kda",
+      "base": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "source_commit": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 15,
+        "additions": 2542,
+        "deletions": 1
+      },
+      "code_head": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "status": "Local dependency boundary; no publication or independent GPU qualification"
+    },
+    {
+      "branch": "pr/glm53-grammar-compiler",
+      "base": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "source_commit": "f58831e7af6fc74e355d85dc18848bde9c4ffcc8",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 18,
+        "additions": 951,
+        "deletions": 116
+      },
+      "code_head": "ad5d97a66aa90d94fd053ece43d76d823d4d1d76",
+      "status": "Local dependency boundary; no publication or independent GPU qualification"
+    },
+    {
+      "branch": "pr/glm53-streaming",
+      "base": "ad5d97a66aa90d94fd053ece43d76d823d4d1d76",
+      "source_commit": "c8eaa608ac39e50ef2be1ab4decf29c22026823f",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 13,
+        "additions": 663,
+        "deletions": 122
+      },
+      "code_head": "3c9807a32369f379e08b7e1c323ead09d63185e0",
+      "status": "Local dependency boundary; no publication or independent GPU qualification"
+    },
+    {
+      "branch": "pr/glm53-request-media",
+      "base": "3c9807a32369f379e08b7e1c323ead09d63185e0",
+      "source_commit": "b2d9f1bc020b17c87daf3b8d3a720d820b762067",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 10,
+        "additions": 311,
+        "deletions": 16
+      },
+      "code_head": "6b13e37256cf4dde871b3f5a113a183a0be5898b",
+      "status": "Local dependency boundary; no publication or independent GPU qualification"
+    },
+    {
+      "branch": "pr/glm53-native-core",
+      "base": "6b13e37256cf4dde871b3f5a113a183a0be5898b",
+      "source_commit": "8e2ea922de58c52b497223935f41867dc58938b8",
+      "kind": "native-core",
+      "diff": {
+        "files": 970,
+        "additions": 129964,
+        "deletions": 8215
+      },
+      "code_head": "77152c6884346900006e5d2b4b3c282594621c1b",
+      "status": "Local dependency boundary; no publication or independent GPU qualification"
+    },
+    {
+      "branch": "pr/glm53-context-storage",
+      "base": "77152c6884346900006e5d2b4b3c282594621c1b",
+      "source_commit": "65706c9b045cdc3569ddb0b1857406a683528017",
+      "kind": "context-followup",
+      "diff": {
+        "files": 85,
+        "additions": 11646,
+        "deletions": 430
+      },
+      "code_head": "02d6c00b3af6150461785d564ebd18554042c85e",
+      "status": "Local dependency boundary; no publication or independent GPU qualification"
+    },
+    {
+      "branch": "pr/glm53-benchmark-tools",
+      "base": "02d6c00b3af6150461785d564ebd18554042c85e",
+      "source_commit": "65706c9b045cdc3569ddb0b1857406a683528017",
+      "kind": "developer-followup",
+      "diff": {
+        "files": 29,
+        "additions": 8265,
+        "deletions": 0
+      },
+      "code_head": "92e2d18b398a4a40369ab4c97fc3862a08eb6957",
+      "status": "Local dependency boundary; no publication or independent GPU qualification"
+    },
+    {
+      "branch": "pr/glm53-context-rc2",
+      "base": "92e2d18b398a4a40369ab4c97fc3862a08eb6957",
+      "source_commit": "cb74ee4af8b968b86b9c41dc994776b6043f24bd",
+      "kind": "optional-followup",
+      "diff": {
+        "files": 168,
+        "additions": 12160,
+        "deletions": 1279
+      },
+      "code_head": "62394df366921a62b22be1d907511bd1f7d6cebb",
+      "status": "Local dependency boundary; no publication or independent GPU qualification"
+    },
+    {
+      "branch": "pr/glm53-decode-rc4",
+      "base": "62394df366921a62b22be1d907511bd1f7d6cebb",
+      "source_commit": "7b2bfe516d609053e9b9cd9b0603b74ed6fffb06",
+      "kind": "optional-followup",
+      "diff": {
+        "files": 119,
+        "additions": 10678,
+        "deletions": 1086
+      },
+      "code_head": "40450b85c4e25d9f695094406656d88bdb36a6e1",
+      "status": "Local dependency boundary; no publication or independent GPU qualification"
+    },
+    {
+      "branch": "pr/glm53-native-mtp",
+      "base": "40450b85c4e25d9f695094406656d88bdb36a6e1",
+      "source_commit": "7ceb9c748e2ac7dad69d10be758b6dc373a49584",
+      "kind": "optional-followup",
+      "diff": {
+        "files": 102,
+        "additions": 12051,
+        "deletions": 1095
+      },
+      "code_head": "e32dfe232f2de0ab274c03c04cae52cc19985ef3",
+      "status": "Local dependency boundary; no publication or independent GPU qualification"
+    }
+  ],
+  "checkpoint_ownership_correction": {
+    "status": "bounded_local_technical_campaign_complete_publication_and_rights_pending",
+    "main": "b91729efa1ffefbb7cb998ed078bc333d51556f0",
+    "core": "f873fee48e9f88907ecfe8ac8b1330e172ee9c4c",
+    "full": "6447f929aa692c440186abffef203a7eb6aca4bc",
+    "main_full_tree_equal": true,
+    "delta": {
+      "files": 4,
+      "additions": 317,
+      "deletions": 1
+    },
+    "changed_files": [
+      "crates/spark-model/src/weight_loader/glm5/retirement_dense.rs",
+      "crates/spark-model/src/weight_loader/glm5/retirement_dense_tests.rs",
+      "crates/spark-model/src/weight_loader/glm5/retirement_loader_tests.rs",
+      "crates/spark-model/src/weight_loader/glm5/retirement_reuse_tests.rs"
+    ],
+    "behavior": "Capture native checkpoint ownership before conversion and retire owned source allocations through WeightStore::reclaim. Derived allocations keep direct free. Record attempted source retirement before freeing so failed frees are not retried by store cleanup; retained source identity prevents a reused address from changing ownership.",
+    "focused_tests": {
+      "core": {
+        "passed": 18,
+        "log": "teardown-integration/core-tests-with-stubs.log"
+      },
+      "full_fix_worktree": {
+        "passed": 18,
+        "log": "teardown-regression-final.log"
+      },
+      "scope": "CPU/mock regression tests, not successful CUDA shutdown evidence."
+    },
+    "fresh_full_cpu": {
+      "status": "passed",
+      "revision": "6447f929aa692c440186abffef203a7eb6aca4bc",
+      "counts": {
+        "successful_suites": 87,
+        "passed": 7172,
+        "failed": 0,
+        "ignored": 147,
+        "failed_suites": []
+      },
+      "receipt": "checkpoint-correction-results.json#cpu",
+      "supplemental": "Default CUDA Clippy passes; exact all-features command fails on inherited Apple-only objc2 on Linux. Offline cargo-deny passes all four categories with pinned cached October12 RustSec DB. See checkpoint-correction-results.json."
+    },
+    "fresh_gpu": {
+      "core_full": "Fresh no-cache Docker serving passes; no observed invalid-free/model-teardown errors; fallback owner warnings retained.",
+      "receipt": "checkpoint-correction-results.json#corrected_paired_runs",
+      "mtp": "Bounded corrected 8K/C1 native-MTP7/7 exact text/reasoning pairs, needle/disconnect recovery and invalid-free teardown checks pass; owner fallback warnings remain. See checkpoint-correction-results.json#native_mtp.",
+      "prefix": "Corrected full resident, synchronous NVMe and fast/keep NVMe9/9 requests each pass with both-rank actual restore evidence; no invalid-free/model-teardown errors. Fallback ownership warnings retained.",
+      "formal_gates": "All ten formal gates PASS at measured full6447f929; raw identities unchanged.",
+      "configuration_count": 6,
+      "nemotron_comparison": {
+        "status": "bounded same-worker true-base/current PASS; not an additional formal gate",
+        "base": "7ffd183f210708d5b1afba1e046049f14ad498c7",
+        "candidate": "6447f929aa692c440186abffef203a7eb6aca4bc",
+        "cases_per_revision": 12,
+        "exact_answers_prompts_and_token_counts_equal": true,
+        "receipt": "checkpoint-correction-results.json#current_nemotron_comparison",
+        "limits": "FP8 default1.0 scale and 12,301 fallback allocation warnings retained; no broad quality/context/performance claim."
+      },
+      "worker_loss_restart": {
+        "status": "PASS_WITH_LIMITS",
+        "receipt": "checkpoint-correction-results.json#current_worker_loss_restart",
+        "scope": "One worker-only SIGKILL; peer head exits, active stream fails before DONE, fresh whole pair returns42+DONE with same configuration and exits0/0. Fallback warnings retained; no in-process or capacity claim."
+      }
+    },
+    "promotion_receipt": "teardown-integration/promotion.json",
+    "equality_receipt": "teardown-integration/main-equality.json",
+    "completed_build_provenance": "checkpoint-correction-results.json#build_provenance",
+    "formal_record_delivery": "Final documentation-and-records commit includes ten byte-preserved .benchmarks gate records measured at6447f929aa; no engine source or baseline change. Final commit identity is recorded separately."
+  },
+  "reviewer_navigation": {
+    "current_stack": "scope_reduced_candidates + hip_selector_correction",
+    "historical_only": [
+      "stack",
+      "corrected_submission_candidates",
+      "scope_reduced_candidates_before_checkpoint_fix",
+      "scope_reduced_candidates_before_mmq_fix",
+      "checkpoint_ownership_correction",
+      "scope_reduction",
+      "scope_reduced_candidates_before_core_test_adaptation",
+      "mmq_readiness_correction",
+      "core_test_compatibility_adaptation",
+      "formal_gate_state_before_final_qualification"
+    ],
+    "meaning": "Use the active candidate list as an immutable review/source snapshot, not a live-ref inventory. Later documentation-only commits may move branch tips. Historical maps and measurements retain their original identities; only GB10 inputs match the frozen f82 build, not the whole engine tree.",
+    "current_qualification": "mmq_current_qualification"
+  },
+  "revision_semantics": "Branch names identify review units. All base, code_head, branch_head and head values are immutable source/review snapshots captured before later documentation-only commits; they are not assertions about live Git refs. Measured receipts retain their original source IDs. HIP selector source differs from measured f82b1a74 while GB10 inputs remain unchanged. The actual checker still invalidates all ten formal gates; new records are required.",
+  "scope_reduced_candidates_before_mmq_fix": [
+    {
+      "branch": "pr/glm53-kernel-flags",
+      "base": "7ffd183f210708d5b1afba1e046049f14ad498c7",
+      "source_commit": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 6,
+        "additions": 157,
+        "deletions": 10
+      },
+      "code_head": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "status": "The test receipts above retain their measured extraction revisions. Full-stack GPU evidence is supporting coverage only; this prerequisite has not independently run the complete GPU gate suite.",
+      "branch_head": "6a9d04bd2771b0321ab37c630eec036095b55f04"
+    },
+    {
+      "branch": "pr/glm53-arena-accounting",
+      "base": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "source_commit": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 3,
+        "additions": 142,
+        "deletions": 6
+      },
+      "code_head": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "status": "The test receipts above retain their measured extraction revisions. Full-stack GPU evidence is supporting coverage only; this prerequisite has not independently run the complete GPU gate suite.",
+      "branch_head": "62836b3ba1775dcce2a5996cc77ee7017c4b34de"
+    },
+    {
+      "branch": "pr/glm53-swap-records",
+      "base": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "source_commit": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 8,
+        "additions": 728,
+        "deletions": 6
+      },
+      "code_head": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "status": "The test receipts above retain their measured extraction revisions. Full-stack GPU evidence is supporting coverage only; this prerequisite has not independently run the complete GPU gate suite.",
+      "branch_head": "ce147310083af5d70978db6144b05e9caa21e04d"
+    },
+    {
+      "branch": "pr/glm53-memory-accounting",
+      "base": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "source_commit": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 7,
+        "additions": 515,
+        "deletions": 15
+      },
+      "code_head": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "status": "The test receipts above retain their measured extraction revisions. Full-stack GPU evidence is supporting coverage only; this prerequisite has not independently run the complete GPU gate suite.",
+      "branch_head": "891f01159a76e072d90f3829735e6aee4e375afd"
+    },
+    {
+      "branch": "pr/glm53-pair-transport",
+      "base": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "source_commit": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 30,
+        "additions": 5714,
+        "deletions": 87
+      },
+      "code_head": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "status": "The test receipts above retain their measured extraction revisions. Full-stack GPU evidence is supporting coverage only; this prerequisite has not independently run the complete GPU gate suite.",
+      "branch_head": "cf958ab1bc7292e5f604927181177e9801dff82e"
+    },
+    {
+      "branch": "pr/glm53-native-kda",
+      "base": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "source_commit": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 15,
+        "additions": 2542,
+        "deletions": 1
+      },
+      "code_head": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "status": "The test receipts above retain their measured extraction revisions. Full-stack GPU evidence is supporting coverage only; this prerequisite has not independently run the complete GPU gate suite.",
+      "branch_head": "e70b41b118fa55ff07c4dc76c1cd88aae522091e"
+    },
+    {
+      "branch": "pr/glm53-grammar-compiler",
+      "base": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "source_commit": "f58831e7af6fc74e355d85dc18848bde9c4ffcc8",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 18,
+        "additions": 951,
+        "deletions": 116
+      },
+      "code_head": "ad5d97a66aa90d94fd053ece43d76d823d4d1d76",
+      "status": "The test receipts above retain their measured extraction revisions. Full-stack GPU evidence is supporting coverage only; this prerequisite has not independently run the complete GPU gate suite.",
+      "branch_head": "ad5d97a66aa90d94fd053ece43d76d823d4d1d76"
+    },
+    {
+      "branch": "pr/glm53-streaming",
+      "base": "ad5d97a66aa90d94fd053ece43d76d823d4d1d76",
+      "source_commit": "c8eaa608ac39e50ef2be1ab4decf29c22026823f",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 13,
+        "additions": 663,
+        "deletions": 122
+      },
+      "code_head": "3c9807a32369f379e08b7e1c323ead09d63185e0",
+      "status": "The test receipts above retain their measured extraction revisions. Full-stack GPU evidence is supporting coverage only; this prerequisite has not independently run the complete GPU gate suite.",
+      "branch_head": "3c9807a32369f379e08b7e1c323ead09d63185e0"
+    },
+    {
+      "branch": "pr/glm53-request-media",
+      "base": "3c9807a32369f379e08b7e1c323ead09d63185e0",
+      "source_commit": "b2d9f1bc020b17c87daf3b8d3a720d820b762067",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 10,
+        "additions": 311,
+        "deletions": 16
+      },
+      "code_head": "6b13e37256cf4dde871b3f5a113a183a0be5898b",
+      "status": "The test receipts above retain their measured extraction revisions. Full-stack GPU evidence is supporting coverage only; this prerequisite has not independently run the complete GPU gate suite.",
+      "branch_head": "6b13e37256cf4dde871b3f5a113a183a0be5898b"
+    },
+    {
+      "branch": "pr/glm53-native-core",
+      "base": "6b13e37256cf4dde871b3f5a113a183a0be5898b",
+      "source_commit": "8e2ea922de58c52b497223935f41867dc58938b8",
+      "kind": "native-core",
+      "diff": {
+        "files": 971,
+        "additions": 130280,
+        "deletions": 8215
+      },
+      "code_head": "f873fee48e9f88907ecfe8ac8b1330e172ee9c4c",
+      "status": "Corrected core has its own bounded serving and shutdown receipts. The ten formal Qwen passes belong to assembled full `6447f929`, not this core binary.",
+      "branch_head": "f873fee48e9f88907ecfe8ac8b1330e172ee9c4c"
+    },
+    {
+      "branch": "pr/glm53-context-storage",
+      "base": "f873fee48e9f88907ecfe8ac8b1330e172ee9c4c",
+      "source_commit": "65706c9b045cdc3569ddb0b1857406a683528017",
+      "kind": "context-followup",
+      "diff": {
+        "files": 85,
+        "additions": 11646,
+        "deletions": 430
+      },
+      "code_head": "0909d99fafff16feb1513696c9e2b9012e06a474",
+      "status": "This exact intermediate branch has not independently rerun GPU qualification. Full `6447f929` supplies bounded serving/storage coverage and ten formal regression passes; historical receipts retain their measured source pins.",
+      "branch_head": "0909d99fafff16feb1513696c9e2b9012e06a474"
+    },
+    {
+      "branch": "pr/glm53-benchmark-tools",
+      "base": "0909d99fafff16feb1513696c9e2b9012e06a474",
+      "source_commit": "65706c9b045cdc3569ddb0b1857406a683528017",
+      "kind": "developer-followup",
+      "diff": {
+        "files": 29,
+        "additions": 8265,
+        "deletions": 0
+      },
+      "code_head": "a904448ebcc2d9a99355972a73c511d1a404e506",
+      "status": "This exact intermediate branch has not independently rerun GPU qualification. Full `6447f929` supplies bounded serving/storage coverage and ten formal regression passes; historical receipts retain their measured source pins.",
+      "branch_head": "a904448ebcc2d9a99355972a73c511d1a404e506"
+    },
+    {
+      "branch": "pr/glm53-context-rc2",
+      "base": "a904448ebcc2d9a99355972a73c511d1a404e506",
+      "source_commit": "cb74ee4af8b968b86b9c41dc994776b6043f24bd",
+      "kind": "optional-followup",
+      "diff": {
+        "files": 168,
+        "additions": 12160,
+        "deletions": 1279
+      },
+      "code_head": "d4a27f15b9472b63ad7dd91e8c181e8499c7c576",
+      "status": "This exact intermediate branch has not independently rerun GPU qualification. Full `6447f929` supplies bounded serving/storage coverage and ten formal regression passes; historical receipts retain their measured source pins.",
+      "branch_head": "d4a27f15b9472b63ad7dd91e8c181e8499c7c576"
+    },
+    {
+      "branch": "pr/glm53-decode-rc4",
+      "base": "d4a27f15b9472b63ad7dd91e8c181e8499c7c576",
+      "source_commit": "7b2bfe516d609053e9b9cd9b0603b74ed6fffb06",
+      "kind": "optional-followup",
+      "diff": {
+        "files": 119,
+        "additions": 10678,
+        "deletions": 1086
+      },
+      "code_head": "86b4de6d9666d27a9574054dd184318e6d0ec2ab",
+      "status": "This exact intermediate branch has not independently rerun GPU qualification. Full `6447f929` supplies bounded serving/storage coverage and ten formal regression passes; historical receipts retain their measured source pins.",
+      "branch_head": "86b4de6d9666d27a9574054dd184318e6d0ec2ab"
+    },
+    {
+      "branch": "pr/glm53-native-mtp",
+      "base": "86b4de6d9666d27a9574054dd184318e6d0ec2ab",
+      "source_commit": "7ceb9c748e2ac7dad69d10be758b6dc373a49584",
+      "kind": "optional-followup",
+      "diff": {
+        "files": 102,
+        "additions": 12051,
+        "deletions": 1095
+      },
+      "code_head": "9b22c2bbd59e32f6ce97f379af97533b028dfcc2",
+      "status": "Planned bounded local technical qualification completed at measured full6447f929: ten formal Qwen gates, six GLM configurations, same-worker base/current Nemotron checks, and worker-loss/whole-pair restart all pass within their recorded limits. Publication and imported-contributor additional-rights resolution remain pending. Platform, ownership, capacity and intermediate-branch limits are retained.",
+      "branch_head": "6447f929aa692c440186abffef203a7eb6aca4bc"
+    }
+  ],
+  "mmq_readiness_correction": {
+    "snapshot_utc": "2026-10-13T18:37:19.210389+00:00",
+    "status": "source_fixes_reviewed_fresh_runtime_and_formal_qualification_pending",
+    "core": "989233e14dd5c27f8b8d615f7d14b18fc677d336",
+    "full_build_source": "f82b1a74a5d1df23c556705e359b3f11de395a1e",
+    "full_last_perf_input_commit": "85ac7746f3e881eda11838242abb6ca4dfd9f1d6",
+    "full_tree": "24e167d86cd3f4a24019169cd99936457affdb25",
+    "equivalent_reviewed_full_source": "d4a3cbeae4625ef2a5aa7d85e0cf3bb35e2a8ae6",
+    "tree_equality_is_not_measurement": true,
+    "original_full_source_fix": "a9607e1d41ca0e00596063981bf95311edf4b215",
+    "core_source_fix": "989233e14dd5c27f8b8d615f7d14b18fc677d336",
+    "archive_ref_prefix": "archive/mmq-readiness-20261013/",
+    "behavior": [
+      "Reject expert-TP plus NVFP4 MMQ before expert allocation and before GPU repacking; sharded MMQ is unsupported.",
+      "Retire each original WeightStore payload and scale ownership before freeing it during MMQ repacking; preserve backend cleanup as final failure backstop."
+    ],
+    "documentation": [
+      "Correct core history, paths and bounded qualification claims.",
+      "Distribute existing imported notices in Docker/release staging.",
+      "Label local-only archive pins, expose pinned upstream originals, disclose HIP scope and proposed unmeasured MTP acceptance criterion."
+    ],
+    "qualification": "Required gates must be evaluated at corrected source; retained6447 records are historical and have not been relabeled. Root qualification campaign is in progress; no build/runtime result inferred here.",
+    "remaining": [
+      "Exact corrected source GPU and formal gates",
+      "Intermediate submission-boundary qualification",
+      "Native release-platform and changed HIP selector qualification",
+      "Imported-contributor additional CLA/relicensing evidence",
+      "Experimental MTP useful-workload acceptance measurement and reviewable scope agreement"
+    ]
+  },
+  "scope_reduced_candidates_before_core_test_adaptation": [
+    {
+      "branch": "pr/glm53-kernel-flags",
+      "base": "7ffd183f210708d5b1afba1e046049f14ad498c7",
+      "source_commit": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 6,
+        "additions": 157,
+        "deletions": 10
+      },
+      "code_head": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "status": "Source and ref unchanged by MMQ correction; existing extraction receipts retain their measured pins. Independent required GPU gates remain pending.",
+      "branch_head": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-kernel-flags",
+      "pre_mmq_actual_head": "6a9d04bd2771b0321ab37c630eec036095b55f04"
+    },
+    {
+      "branch": "pr/glm53-arena-accounting",
+      "base": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "source_commit": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 3,
+        "additions": 142,
+        "deletions": 6
+      },
+      "code_head": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "status": "Source and ref unchanged by MMQ correction; existing extraction receipts retain their measured pins. Independent required GPU gates remain pending.",
+      "branch_head": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-arena-accounting",
+      "pre_mmq_actual_head": "62836b3ba1775dcce2a5996cc77ee7017c4b34de"
+    },
+    {
+      "branch": "pr/glm53-swap-records",
+      "base": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "source_commit": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 8,
+        "additions": 728,
+        "deletions": 6
+      },
+      "code_head": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "status": "Source and ref unchanged by MMQ correction; existing extraction receipts retain their measured pins. Independent required GPU gates remain pending.",
+      "branch_head": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-swap-records",
+      "pre_mmq_actual_head": "ce147310083af5d70978db6144b05e9caa21e04d"
+    },
+    {
+      "branch": "pr/glm53-memory-accounting",
+      "base": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "source_commit": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 7,
+        "additions": 515,
+        "deletions": 15
+      },
+      "code_head": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "status": "Source and ref unchanged by MMQ correction; existing extraction receipts retain their measured pins. Independent required GPU gates remain pending.",
+      "branch_head": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-memory-accounting",
+      "pre_mmq_actual_head": "891f01159a76e072d90f3829735e6aee4e375afd"
+    },
+    {
+      "branch": "pr/glm53-pair-transport",
+      "base": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "source_commit": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 30,
+        "additions": 5714,
+        "deletions": 87
+      },
+      "code_head": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "status": "Source and ref unchanged by MMQ correction; existing extraction receipts retain their measured pins. Independent required GPU gates remain pending.",
+      "branch_head": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-pair-transport",
+      "pre_mmq_actual_head": "cf958ab1bc7292e5f604927181177e9801dff82e"
+    },
+    {
+      "branch": "pr/glm53-native-kda",
+      "base": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "source_commit": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 15,
+        "additions": 2542,
+        "deletions": 1
+      },
+      "code_head": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "status": "Source and ref unchanged by MMQ correction; existing extraction receipts retain their measured pins. Independent required GPU gates remain pending.",
+      "branch_head": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-native-kda",
+      "pre_mmq_actual_head": "e70b41b118fa55ff07c4dc76c1cd88aae522091e"
+    },
+    {
+      "branch": "pr/glm53-grammar-compiler",
+      "base": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "source_commit": "f58831e7af6fc74e355d85dc18848bde9c4ffcc8",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 18,
+        "additions": 951,
+        "deletions": 116
+      },
+      "code_head": "ad5d97a66aa90d94fd053ece43d76d823d4d1d76",
+      "status": "Source and ref unchanged by MMQ correction; existing extraction receipts retain their measured pins. Independent required GPU gates remain pending.",
+      "branch_head": "ad5d97a66aa90d94fd053ece43d76d823d4d1d76",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-grammar-compiler",
+      "pre_mmq_actual_head": "ad5d97a66aa90d94fd053ece43d76d823d4d1d76"
+    },
+    {
+      "branch": "pr/glm53-streaming",
+      "base": "ad5d97a66aa90d94fd053ece43d76d823d4d1d76",
+      "source_commit": "c8eaa608ac39e50ef2be1ab4decf29c22026823f",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 13,
+        "additions": 663,
+        "deletions": 122
+      },
+      "code_head": "3c9807a32369f379e08b7e1c323ead09d63185e0",
+      "status": "Source and ref unchanged by MMQ correction; existing extraction receipts retain their measured pins. Independent required GPU gates remain pending.",
+      "branch_head": "3c9807a32369f379e08b7e1c323ead09d63185e0",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-streaming",
+      "pre_mmq_actual_head": "3c9807a32369f379e08b7e1c323ead09d63185e0"
+    },
+    {
+      "branch": "pr/glm53-request-media",
+      "base": "3c9807a32369f379e08b7e1c323ead09d63185e0",
+      "source_commit": "b2d9f1bc020b17c87daf3b8d3a720d820b762067",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 10,
+        "additions": 311,
+        "deletions": 16
+      },
+      "code_head": "6b13e37256cf4dde871b3f5a113a183a0be5898b",
+      "status": "Source and ref unchanged by MMQ correction; existing extraction receipts retain their measured pins. Independent required GPU gates remain pending.",
+      "branch_head": "6b13e37256cf4dde871b3f5a113a183a0be5898b",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-request-media",
+      "pre_mmq_actual_head": "6b13e37256cf4dde871b3f5a113a183a0be5898b"
+    },
+    {
+      "branch": "pr/glm53-native-core",
+      "base": "6b13e37256cf4dde871b3f5a113a183a0be5898b",
+      "source_commit": "8e2ea922de58c52b497223935f41867dc58938b8",
+      "kind": "native-core",
+      "diff": {
+        "files": 975,
+        "additions": 130651,
+        "deletions": 8215
+      },
+      "code_head": "989233e14dd5c27f8b8d615f7d14b18fc677d336",
+      "status": "MMQ source corrections propagated. Historical f873/6447 measurements remain evidence only; fresh exact-source and intermediate-boundary qualification pending.",
+      "branch_head": "989233e14dd5c27f8b8d615f7d14b18fc677d336",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-native-core",
+      "pre_mmq_actual_head": "f873fee48e9f88907ecfe8ac8b1330e172ee9c4c"
+    },
+    {
+      "branch": "pr/glm53-context-storage",
+      "base": "989233e14dd5c27f8b8d615f7d14b18fc677d336",
+      "source_commit": "65706c9b045cdc3569ddb0b1857406a683528017",
+      "kind": "context-followup",
+      "diff": {
+        "files": 85,
+        "additions": 11646,
+        "deletions": 431
+      },
+      "code_head": "28d4ad1ff9d6c834299995eaff3a0a5d45379673",
+      "status": "MMQ source corrections propagated. Historical f873/6447 measurements remain evidence only; fresh exact-source and intermediate-boundary qualification pending.",
+      "branch_head": "28d4ad1ff9d6c834299995eaff3a0a5d45379673",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-context-storage",
+      "pre_mmq_actual_head": "0909d99fafff16feb1513696c9e2b9012e06a474"
+    },
+    {
+      "branch": "pr/glm53-benchmark-tools",
+      "base": "28d4ad1ff9d6c834299995eaff3a0a5d45379673",
+      "source_commit": "65706c9b045cdc3569ddb0b1857406a683528017",
+      "kind": "developer-followup",
+      "diff": {
+        "files": 29,
+        "additions": 8265,
+        "deletions": 0
+      },
+      "code_head": "ba77a278a2065f87a7f2f0a3387bd1af234f33fa",
+      "status": "MMQ source corrections propagated. Historical f873/6447 measurements remain evidence only; fresh exact-source and intermediate-boundary qualification pending.",
+      "branch_head": "ba77a278a2065f87a7f2f0a3387bd1af234f33fa",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-benchmark-tools",
+      "pre_mmq_actual_head": "a904448ebcc2d9a99355972a73c511d1a404e506"
+    },
+    {
+      "branch": "pr/glm53-context-rc2",
+      "base": "ba77a278a2065f87a7f2f0a3387bd1af234f33fa",
+      "source_commit": "cb74ee4af8b968b86b9c41dc994776b6043f24bd",
+      "kind": "optional-followup",
+      "diff": {
+        "files": 168,
+        "additions": 12157,
+        "deletions": 1275
+      },
+      "code_head": "1c7e399b19f5e81d42808533a4fc6527da2fa777",
+      "status": "MMQ source corrections propagated. Historical f873/6447 measurements remain evidence only; fresh exact-source and intermediate-boundary qualification pending.",
+      "branch_head": "1c7e399b19f5e81d42808533a4fc6527da2fa777",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-context-rc2",
+      "pre_mmq_actual_head": "d4a27f15b9472b63ad7dd91e8c181e8499c7c576"
+    },
+    {
+      "branch": "pr/glm53-decode-rc4",
+      "base": "1c7e399b19f5e81d42808533a4fc6527da2fa777",
+      "source_commit": "7b2bfe516d609053e9b9cd9b0603b74ed6fffb06",
+      "kind": "optional-followup",
+      "diff": {
+        "files": 119,
+        "additions": 10677,
+        "deletions": 1085
+      },
+      "code_head": "a3a2d456078fd284c35664966ebbb569938d66aa",
+      "status": "MMQ source corrections propagated. Historical f873/6447 measurements remain evidence only; fresh exact-source and intermediate-boundary qualification pending.",
+      "branch_head": "a3a2d456078fd284c35664966ebbb569938d66aa",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-decode-rc4",
+      "pre_mmq_actual_head": "86b4de6d9666d27a9574054dd184318e6d0ec2ab"
+    },
+    {
+      "branch": "pr/glm53-native-mtp",
+      "base": "a3a2d456078fd284c35664966ebbb569938d66aa",
+      "source_commit": "7ceb9c748e2ac7dad69d10be758b6dc373a49584",
+      "kind": "optional-followup",
+      "diff": {
+        "files": 114,
+        "additions": 18200,
+        "deletions": 1148
+      },
+      "code_head": "85ac7746f3e881eda11838242abb6ca4dfd9f1d6",
+      "status": "MMQ source corrections propagated. Historical f873/6447 measurements remain evidence only; fresh exact-source and intermediate-boundary qualification pending.",
+      "branch_head": "f82b1a74a5d1df23c556705e359b3f11de395a1e",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-native-mtp",
+      "pre_mmq_actual_head": "049b42054fb9e75c0f22565c54f122ecaed1b02c"
+    }
+  ],
+  "core_test_compatibility_adaptation": {
+    "snapshot_utc": "2026-10-13T18:53:38.156725+00:00",
+    "status": "ref_and_test_compatibility_update_no_new_measurements",
+    "previous_core": "989233e14dd5c27f8b8d615f7d14b18fc677d336",
+    "core": "d6f0a31d81102c6a91ddc6039314e7081967e1da",
+    "changed_core_files": [
+      "crates/spark-model/src/layers/moe/mmq_layout_tests.rs"
+    ],
+    "core_behavior": "Use the byte recorder already present on reduced core; runtime implementation unchanged.",
+    "rc2_test_restore": "8809b96893024c0e2b667ed9afc55665879b01d5",
+    "rc2_behavior": "Restore the carved-out test implementation already present in frozen full buildf82b1a74.",
+    "previous_full_snapshot": "4c7af0480685187013eb1e7c1cb799c037d5da52",
+    "full_snapshot": "49dc89763a692d555449942c297a9aa24ffd6760",
+    "full_tree": "9df63f8a32765c8d8374e4368330f94c82a9af13",
+    "full_tree_equal_to_previous": true,
+    "retained_build_source": "f82b1a74a5d1df23c556705e359b3f11de395a1e",
+    "full_perf_inputs_unchanged_from_build_source": true,
+    "perf_paths": [
+      "crates",
+      "kernels",
+      "Cargo.toml",
+      "Cargo.lock",
+      "vendor",
+      "jinja-templates",
+      "rust-toolchain.toml",
+      "3rdparty_patches"
+    ],
+    "latest_perf_input_commit": "a36a572cc55defa8ccfff7ef760a3b1da4fd2dc2",
+    "evidence_boundary": "No measurement is relabeled or added. Full build/runtime receipts must keepf82b1a74; core and other intermediate boundaries retain their own qualification requirements.",
+    "replay_map_audit": "core-test-replay.json"
+  },
+  "mmq_current_qualification": {
+    "receipt": "mmq-correction-results.json",
+    "measured_full_source": "f82b1a74a5d1df23c556705e359b3f11de395a1e",
+    "measured_core_source": "989233e14dd5c27f8b8d615f7d14b18fc677d336",
+    "status": "Native builds and bounded MMQ/paired-GLM checks retain their measured sources. All fifteen CPU boundaries are covered; all ten fresh full-stack formal gates pass at cc2d49cc. See branch and final qualification receipts for limits.",
+    "remaining": [
+      "Intermediate branch qualification",
+      "AMD GPU numerical/graph validation and full platform builds",
+      "Imported-contributor additional rights evidence",
+      "MTP natural-stop acceptance campaign and maintainer scope agreement"
+    ],
+    "previous_marker_is_historical": true,
+    "hip_receipt": "hip-correction-results.json",
+    "final_formal_receipt": "final-qualification-results.json"
+  },
+  "hip_selector_correction": {
+    "snapshot_utc": "2026-10-13T20:27:02.844435+00:00",
+    "core": "0e77245d38e7115769d57084f03143cd74cdd366",
+    "full": "dcf3d033fd924a54864b1b00feb1eee8992bf442",
+    "mirror": "cb613e6e",
+    "replay_map": {
+      "d6f0a31d81102c6a91ddc6039314e7081967e1da": "0e77245d38e7115769d57084f03143cd74cdd366",
+      "1e83fd752c298f29570d2c27ea55715eac83d29e": "eb00b856367c02deeed02bb37e9ab2472a7a0def",
+      "67380df286cbf8f4ac9f6608c30a29adad92d3d6": "a0699296dc3faa635cc11eaafa59ee69b83e27fa",
+      "d5ff48e7b606c9434b90b4d7d83746cd1efaf9e0": "be8b99259efc1728100e6b31586918bf44b4f99c",
+      "8809b96893024c0e2b667ed9afc55665879b01d5": "a803b4e3b1b815a7b397da9c5dcc239cac9212be",
+      "a782d1080b244837bd105032b1f9205457c8effd": "1bd9aac3a9232a2ff7e03332cdcf61e2b6651fb6",
+      "a36a572cc55defa8ccfff7ef760a3b1da4fd2dc2": "95e4e6369b7ef3ff249df64b4d7db5da0b289a13",
+      "e571af797b128d738e9ebae7d1dc4f4e85bf2791": "c8c94a40756947907a40f96079c57b0fb2b59762",
+      "cda84e1fd78951c787d96ed7b7e7fb8c14912898": "990ca3a38065365985cd7fc1e1817a3f34e1df50",
+      "49dc89763a692d555449942c297a9aa24ffd6760": "9a6d0fe73b958be52f6351c1df315f32768aadd0",
+      "15768df3e6c75cb650320a3b87bed3b08dd4c26f": "dcf3d033fd924a54864b1b00feb1eee8992bf442"
+    },
+    "receipt": "hip-correction-results.json",
+    "source_change": "kernels/strix-hip/common/dflash2_candidate_selector.cu",
+    "change": "Replace CUDA-only __ldcg scratch loads with HIP agent-scope relaxed atomic loads; keep existing synchronization/ticket protocol.",
+    "native_compilation": "Eight exact formatted-source gfx1151 selector configurations compile with native ROCm; no GPU execution.",
+    "gb10_inputs_unchanged_from": "f82b1a74a5d1df23c556705e359b3f11de395a1e",
+    "all_engine_inputs_unchanged": false,
+    "gate_applicability": "The actual checker invalidates all ten old records at dcf3d033. Eight f82 passes remain historical; old BFCL runs were operator-aborted as superseded. Fresh ARM build passed; new ten-gate campaign running, results pending.",
+    "limits": [
+      "No AMD GPU numerics/graph replay/performance",
+      "Not a whole-crate or full Windows SDK build",
+      "Baseline stock Linux sync-intrinsic gap outside this selector fix remains"
+    ],
+    "counts": {
+      "core": {
+        "files": 975,
+        "additions": 130659,
+        "deletions": 8215
+      },
+      "full_diff_against_atlas": "1288 files changed, 201471 insertions(+), 9558 deletions(-)",
+      "selector_core": "334\t42\tkernels/strix-hip/common/dflash2_candidate_selector.cu",
+      "selector_full": "789\t43\tkernels/strix-hip/common/dflash2_candidate_selector.cu"
+    }
+  },
+  "current_formal_gate_decision": {
+    "checked_source": "cc2d49ccdda284cca25ceed9570d13875fd5d36f",
+    "status": "ALL_TEN_REQUIRED_GATES_PASS",
+    "required_new_passes": 0,
+    "fresh_campaign": "qualification-cc2d49cc",
+    "fresh_campaign_status": "COMPLETE: all ten fresh records pass the canonical checker; original service restored and verified.",
+    "policy": "New records retain their measured source. Full-stack passes do not independently qualify intermediate branches.",
+    "invalidation_audit_log": "final-package-20261014/post-test-fix-stale-check.log",
+    "invalidation_audit_log_sha256": "895d5339c5255decf5b8916ef76a8eaef4b11aa81b33a9f82c7bda9cfe69b34b",
+    "campaign_launches": [
+      {
+        "role": "head",
+        "time_utc": "2026-10-14T17:32:55.007247+00:00",
+        "argv": [
+          "ssh",
+          "-i",
+          "/home/abc/.ssh/id_ed25519_spark",
+          "-o",
+          "BatchMode=yes",
+          "mangokid@192.168.8.181",
+          "systemd-run --user --unit=atlas-formal-cc2d49cc-head --property=Type=exec --property=MemorySwapMax=0 --property=KillMode=control-group --property=StandardOutput=append:/home/mangokid/atlas-glm53-dev/audit/qualification-cc2d49cc/formal-gates/head-outer.log --property=StandardError=inherit python3 /home/mangokid/atlas-glm53-dev/audit/qualification-cc2d49cc/formal-gates/campaign.py head"
+        ],
+        "launch_returncode": 0,
+        "stdout": "",
+        "stderr": "Running as unit: atlas-formal-cc2d49cc-head.service; invocation ID: d49a484b1bfb4ba280b600061aa29f64\n"
+      },
+      {
+        "role": "worker",
+        "time_utc": "2026-10-14T17:32:55.337291+00:00",
+        "argv": [
+          "ssh",
+          "-i",
+          "/home/abc/.ssh/id_ed25519_spark",
+          "-o",
+          "BatchMode=yes",
+          "mangokid@192.168.8.187",
+          "systemd-run --user --unit=atlas-formal-cc2d49cc-worker --property=Type=exec --property=MemorySwapMax=0 --property=KillMode=control-group --property=StandardOutput=append:/home/mangokid/atlas-glm53-dev/audit/qualification-cc2d49cc/formal-gates/worker-outer.log --property=StandardError=inherit python3 /home/mangokid/atlas-glm53-dev/audit/qualification-cc2d49cc/formal-gates/campaign.py worker"
+        ],
+        "launch_returncode": 0,
+        "stdout": "",
+        "stderr": "Running as unit: atlas-formal-cc2d49cc-worker.service; invocation ID: 79b1ff246a9c4445a065e3ee442e5f37\n"
+      }
+    ],
+    "supervisor": "atlas-qualification-supervisor-cc2d49cc",
+    "fresh_native_arm_build": {
+      "revision": "cc2d49ccdda284cca25ceed9570d13875fd5d36f",
+      "bundle_sha256": "a86d50cae07ee45e2cdc2aa5973f487a9b301d50638a51d4231dc58824e94300",
+      "builder_image": "sha256:0bdd5f775c98320c899e5df62e91a16bdf823df489cd723eadc757713fb625d8",
+      "build_argv": [
+        "docker",
+        "run",
+        "--name",
+        "atlas-arm-release-cc2d49cc",
+        "--memory=24g",
+        "--memory-swap=24g",
+        "--cpus=4",
+        "--mount",
+        "type=bind,src=/home/mangokid/atlas-glm53-dev/audit/qualification-cc2d49cc/native-arm,dst=/qualification",
+        "--mount",
+        "type=bind,src=/home/mangokid/atlas-glm53-dev/audit/qualification-cc2d49cc/source,dst=/source,readonly",
+        "-e",
+        "CARGO_TARGET_DIR=/qualification/target",
+        "-e",
+        "CARGO_BUILD_JOBS=4",
+        "-e",
+        "ATLAS_TARGET_MODEL=*",
+        "-e",
+        "ATLAS_TARGET_QUANT=*",
+        "-e",
+        "CUDARC_CUDA_VERSION=13000",
+        "-e",
+        "ATLAS_GIT_SHA=cc2d49ccdda284cca25ceed9570d13875fd5d36f",
+        "-w",
+        "/source",
+        "--entrypoint",
+        "bash",
+        "sha256:0bdd5f775c98320c899e5df62e91a16bdf823df489cd723eadc757713fb625d8",
+        "-c",
+        "unset ATLAS_SKIP_BUILD CUTLASS_HOME; cargo build --locked --release -p spark-server --target aarch64-unknown-linux-gnu --no-default-features --features cuda"
+      ],
+      "build_returncode": 0,
+      "started_unix": 1791998830.840272,
+      "completed_unix": 1791999059.3281975,
+      "architecture": "aarch64 CUDA13 sm_121f",
+      "binary_build": "fresh CUDA-only wildcard release; no CUTLASS_HOME/NCCL",
+      "not_qualified_yet": true,
+      "binary_sha256": "7ae7b36400d33a240d8b67ffd5be493edb766b692607b1f0fd60bd60f2891874",
+      "binary_bytes": 115899000,
+      "targets_verified": [
+        "qwen3.6-35b-a3b",
+        "qwen3.6-27b",
+        "qwen3.8-27b"
+      ]
+    },
+    "measured_source": "cc2d49ccdda284cca25ceed9570d13875fd5d36f",
+    "final_receipt": "final-qualification-results.json",
+    "portable_evidence": {
+      "archive": "final-qualification-evidence.tar.gz",
+      "bytes": 1643473,
+      "sha256": "4f5cc13dadd0554d65017682695ba8c2d5cdd9e91de1d4e2736a2eed5bbb7640",
+      "index_sha256": "da7d0dd061890960ba861711104b21990568638e07ff4628dfd09a4e33850e57",
+      "payload_files": 769
+    },
+    "build_manifest_semantics": "Immutable build-time observation; subsequent qualification is recorded separately above."
+  },
+  "snapshot_identity_semantics": "Branch names identify review units. All base, code_head, branch_head and head values are immutable source/review snapshots captured before later documentation-only commits; they are not assertions about live Git refs. Measured receipts retain their original source IDs.",
+  "formal_gate_state_before_final_qualification": {
+    "checked_source": "dcf3d033fd924a54864b1b00feb1eee8992bf442",
+    "status": "ALL_TEN_REQUIRED_RECORDS_MISSING_AFTER_HIP_CHANGE",
+    "required_new_passes": 10,
+    "existing_f82_passes_historical": 8,
+    "superseded_bfcl": "Old supervisor stopped first, both f82 BFCL units stopped; parent process exit code 1 is operator abort of superseded work, not a completed benchmark result.",
+    "fresh_campaign": "qualification-dcf3d033",
+    "fresh_campaign_status": "RUNNING: fresh ARM release build passed; both campaign parents launched successfully; durable supervisor monitoring; new formal results pending.",
+    "audit_log": "next-readiness-20261013/hip-gate-coverage.log",
+    "audit_log_sha256": "15ad7e2a36956748b08559cd1a9096329a481907af40f9751540db875d10a8b8",
+    "policy": "No applicability waiver from unchanged GB10 inputs; never relabel historical records.",
+    "superseded_stop_receipt": "qualification-dcf3d033/superseded-campaign-stop.json",
+    "campaign_launches": [
+      {
+        "role": "head",
+        "time_utc": "2026-10-13T20:35:43.886585+00:00",
+        "launch_returncode": 0
+      },
+      {
+        "role": "worker",
+        "time_utc": "2026-10-13T20:35:44.211172+00:00",
+        "launch_returncode": 0
+      }
+    ],
+    "supervisor": "atlas-qualification-supervisor-dcf3d033",
+    "launch_receipt": "/home/abc/storage/models/atlas-glm53-port-audit/qualification-dcf3d033/campaign-launches.json",
+    "fresh_native_arm_build": {
+      "source": "dcf3d033fd924a54864b1b00feb1eee8992bf442",
+      "result": "PASS_NATIVE_BUILD_ONLY",
+      "binary_sha256": "7ae7b36400d33a240d8b67ffd5be493edb766b692607b1f0fd60bd60f2891874",
+      "configuration": "Fresh native aarch64 CUDA-only release; wildcard model/quant targets, ATLAS_SKIP_BUILD unset.",
+      "receipt": "/home/abc/storage/models/atlas-glm53-port-audit/qualification-dcf3d033/native-arm-evidence/build-manifest.json",
+      "receipt_sha256": "c2bb364618daef61cb34a14d8f0fb041067fae08554fda248773bd9d438d44ad",
+      "binary_comparison": "Deterministic hash match with prior GB10 binary; this was a fresh build, not relabeled evidence."
+    }
+  },
+  "qualification_source_availability": {
+    "expected_commit": "cc2d49ccdda284cca25ceed9570d13875fd5d36f",
+    "measured_is_ancestor_of_submission": true,
+    "extra_historical_qualification_ref_required": false,
+    "clean_clone_checker": {
+      "status": "PASS",
+      "receipt": "clean-clone-results.json",
+      "checked_revision": "d0fe219bcb3eddf4111349cf50a400a91e574f2f",
+      "measured_revision": "cc2d49ccdda284cca25ceed9570d13875fd5d36f",
+      "original_workspace_visible": false
+    },
+    "historical_tag": "qualification/glm53-dcf3d033",
+    "historical_tag_scope": "Preserves the prior campaign source locally; not required for the new current campaign."
+  },
+  "scope_reduced_candidates_before_final_test_fix": [
+    {
+      "branch": "pr/glm53-kernel-flags",
+      "base": "7ffd183f210708d5b1afba1e046049f14ad498c7",
+      "source_commit": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 6,
+        "additions": 157,
+        "deletions": 10
+      },
+      "code_head": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "status": "Source and ref unchanged by MMQ correction; existing extraction receipts retain their measured pins. Independent required GPU gates remain pending.",
+      "branch_head": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-kernel-flags",
+      "pre_mmq_actual_head": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "head_snapshot_before_hip": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip."
+    },
+    {
+      "branch": "pr/glm53-arena-accounting",
+      "base": "6a9d04bd2771b0321ab37c630eec036095b55f04",
+      "source_commit": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 3,
+        "additions": 142,
+        "deletions": 6
+      },
+      "code_head": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "status": "Source and ref unchanged by MMQ correction; existing extraction receipts retain their measured pins. Independent required GPU gates remain pending.",
+      "branch_head": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-arena-accounting",
+      "pre_mmq_actual_head": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "head_snapshot_before_hip": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip."
+    },
+    {
+      "branch": "pr/glm53-swap-records",
+      "base": "62836b3ba1775dcce2a5996cc77ee7017c4b34de",
+      "source_commit": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 8,
+        "additions": 728,
+        "deletions": 6
+      },
+      "code_head": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "status": "Source and ref unchanged by MMQ correction; existing extraction receipts retain their measured pins. Independent required GPU gates remain pending.",
+      "branch_head": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-swap-records",
+      "pre_mmq_actual_head": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "head_snapshot_before_hip": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip."
+    },
+    {
+      "branch": "pr/glm53-memory-accounting",
+      "base": "ce147310083af5d70978db6144b05e9caa21e04d",
+      "source_commit": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 7,
+        "additions": 515,
+        "deletions": 15
+      },
+      "code_head": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "status": "Source and ref unchanged by MMQ correction; existing extraction receipts retain their measured pins. Independent required GPU gates remain pending.",
+      "branch_head": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-memory-accounting",
+      "pre_mmq_actual_head": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "head_snapshot_before_hip": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip."
+    },
+    {
+      "branch": "pr/glm53-pair-transport",
+      "base": "891f01159a76e072d90f3829735e6aee4e375afd",
+      "source_commit": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 30,
+        "additions": 5714,
+        "deletions": 87
+      },
+      "code_head": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "status": "Source and ref unchanged by MMQ correction; existing extraction receipts retain their measured pins. Independent required GPU gates remain pending.",
+      "branch_head": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-pair-transport",
+      "pre_mmq_actual_head": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "head_snapshot_before_hip": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip."
+    },
+    {
+      "branch": "pr/glm53-native-kda",
+      "base": "cf958ab1bc7292e5f604927181177e9801dff82e",
+      "source_commit": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 15,
+        "additions": 2542,
+        "deletions": 1
+      },
+      "code_head": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "status": "Source and ref unchanged by MMQ correction; existing extraction receipts retain their measured pins. Independent required GPU gates remain pending.",
+      "branch_head": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-native-kda",
+      "pre_mmq_actual_head": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "head_snapshot_before_hip": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip."
+    },
+    {
+      "branch": "pr/glm53-grammar-compiler",
+      "base": "e70b41b118fa55ff07c4dc76c1cd88aae522091e",
+      "source_commit": "f58831e7af6fc74e355d85dc18848bde9c4ffcc8",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 18,
+        "additions": 951,
+        "deletions": 116
+      },
+      "code_head": "ad5d97a66aa90d94fd053ece43d76d823d4d1d76",
+      "status": "Source and ref unchanged by MMQ correction; existing extraction receipts retain their measured pins. Independent required GPU gates remain pending.",
+      "branch_head": "ad5d97a66aa90d94fd053ece43d76d823d4d1d76",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-grammar-compiler",
+      "pre_mmq_actual_head": "ad5d97a66aa90d94fd053ece43d76d823d4d1d76",
+      "head_snapshot_before_hip": "ad5d97a66aa90d94fd053ece43d76d823d4d1d76",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip."
+    },
+    {
+      "branch": "pr/glm53-streaming",
+      "base": "ad5d97a66aa90d94fd053ece43d76d823d4d1d76",
+      "source_commit": "c8eaa608ac39e50ef2be1ab4decf29c22026823f",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 13,
+        "additions": 663,
+        "deletions": 122
+      },
+      "code_head": "3c9807a32369f379e08b7e1c323ead09d63185e0",
+      "status": "Source and ref unchanged by MMQ correction; existing extraction receipts retain their measured pins. Independent required GPU gates remain pending.",
+      "branch_head": "3c9807a32369f379e08b7e1c323ead09d63185e0",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-streaming",
+      "pre_mmq_actual_head": "3c9807a32369f379e08b7e1c323ead09d63185e0",
+      "head_snapshot_before_hip": "3c9807a32369f379e08b7e1c323ead09d63185e0",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip."
+    },
+    {
+      "branch": "pr/glm53-request-media",
+      "base": "3c9807a32369f379e08b7e1c323ead09d63185e0",
+      "source_commit": "b2d9f1bc020b17c87daf3b8d3a720d820b762067",
+      "kind": "prerequisite",
+      "diff": {
+        "files": 10,
+        "additions": 311,
+        "deletions": 16
+      },
+      "code_head": "6b13e37256cf4dde871b3f5a113a183a0be5898b",
+      "status": "Source and ref unchanged by MMQ correction; existing extraction receipts retain their measured pins. Independent required GPU gates remain pending.",
+      "branch_head": "6b13e37256cf4dde871b3f5a113a183a0be5898b",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-request-media",
+      "pre_mmq_actual_head": "6b13e37256cf4dde871b3f5a113a183a0be5898b",
+      "head_snapshot_before_hip": "6b13e37256cf4dde871b3f5a113a183a0be5898b",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip."
+    },
+    {
+      "branch": "pr/glm53-native-core",
+      "base": "6b13e37256cf4dde871b3f5a113a183a0be5898b",
+      "source_commit": "8e2ea922de58c52b497223935f41867dc58938b8",
+      "kind": "native-core",
+      "diff": {
+        "files": 975,
+        "additions": 130659,
+        "deletions": 8215
+      },
+      "code_head": "0e77245d38e7115769d57084f03143cd74cdd366",
+      "status": "HIP-local selector correction propagated; GB10 runtime/build inputs match this branch's pre-HIP counterpart. The full stack alone retains measured f82 GB10 inputs. Native HIP compile checks, requirement to rerun all ten formal gates after actual checker invalidation and intermediate-boundary runtime coverage remain distinct.",
+      "branch_head": "0e77245d38e7115769d57084f03143cd74cdd366",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-native-core",
+      "pre_mmq_actual_head": "f873fee48e9f88907ecfe8ac8b1330e172ee9c4c",
+      "head_snapshot_before_hip": "d6f0a31d81102c6a91ddc6039314e7081967e1da",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip."
+    },
+    {
+      "branch": "pr/glm53-context-storage",
+      "base": "0e77245d38e7115769d57084f03143cd74cdd366",
+      "source_commit": "65706c9b045cdc3569ddb0b1857406a683528017",
+      "kind": "context-followup",
+      "diff": {
+        "files": 85,
+        "additions": 11646,
+        "deletions": 431
+      },
+      "code_head": "eb00b856367c02deeed02bb37e9ab2472a7a0def",
+      "status": "HIP-local selector correction propagated; GB10 runtime/build inputs match this branch's pre-HIP counterpart. The full stack alone retains measured f82 GB10 inputs. Native HIP compile checks, requirement to rerun all ten formal gates after actual checker invalidation and intermediate-boundary runtime coverage remain distinct.",
+      "branch_head": "eb00b856367c02deeed02bb37e9ab2472a7a0def",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-context-storage",
+      "pre_mmq_actual_head": "0909d99fafff16feb1513696c9e2b9012e06a474",
+      "head_snapshot_before_hip": "1e83fd752c298f29570d2c27ea55715eac83d29e",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip."
+    },
+    {
+      "branch": "pr/glm53-benchmark-tools",
+      "base": "eb00b856367c02deeed02bb37e9ab2472a7a0def",
+      "source_commit": "65706c9b045cdc3569ddb0b1857406a683528017",
+      "kind": "developer-followup",
+      "diff": {
+        "files": 29,
+        "additions": 8265,
+        "deletions": 0
+      },
+      "code_head": "a0699296dc3faa635cc11eaafa59ee69b83e27fa",
+      "status": "HIP-local selector correction propagated; GB10 runtime/build inputs match this branch's pre-HIP counterpart. The full stack alone retains measured f82 GB10 inputs. Native HIP compile checks, requirement to rerun all ten formal gates after actual checker invalidation and intermediate-boundary runtime coverage remain distinct.",
+      "branch_head": "a0699296dc3faa635cc11eaafa59ee69b83e27fa",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-benchmark-tools",
+      "pre_mmq_actual_head": "a904448ebcc2d9a99355972a73c511d1a404e506",
+      "head_snapshot_before_hip": "67380df286cbf8f4ac9f6608c30a29adad92d3d6",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip."
+    },
+    {
+      "branch": "pr/glm53-context-rc2",
+      "base": "a0699296dc3faa635cc11eaafa59ee69b83e27fa",
+      "source_commit": "cb74ee4af8b968b86b9c41dc994776b6043f24bd",
+      "kind": "optional-followup",
+      "diff": {
+        "files": 169,
+        "additions": 12172,
+        "deletions": 1290
+      },
+      "code_head": "a803b4e3b1b815a7b397da9c5dcc239cac9212be",
+      "status": "HIP-local selector correction propagated; GB10 runtime/build inputs match this branch's pre-HIP counterpart. The full stack alone retains measured f82 GB10 inputs. Native HIP compile checks, requirement to rerun all ten formal gates after actual checker invalidation and intermediate-boundary runtime coverage remain distinct.",
+      "branch_head": "a803b4e3b1b815a7b397da9c5dcc239cac9212be",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-context-rc2",
+      "pre_mmq_actual_head": "d4a27f15b9472b63ad7dd91e8c181e8499c7c576",
+      "head_snapshot_before_hip": "8809b96893024c0e2b667ed9afc55665879b01d5",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip."
+    },
+    {
+      "branch": "pr/glm53-decode-rc4",
+      "base": "a803b4e3b1b815a7b397da9c5dcc239cac9212be",
+      "source_commit": "7b2bfe516d609053e9b9cd9b0603b74ed6fffb06",
+      "kind": "optional-followup",
+      "diff": {
+        "files": 119,
+        "additions": 10677,
+        "deletions": 1085
+      },
+      "code_head": "1bd9aac3a9232a2ff7e03332cdcf61e2b6651fb6",
+      "status": "HIP-local selector correction propagated; GB10 runtime/build inputs match this branch's pre-HIP counterpart. The full stack alone retains measured f82 GB10 inputs. Native HIP compile checks, requirement to rerun all ten formal gates after actual checker invalidation and intermediate-boundary runtime coverage remain distinct.",
+      "branch_head": "1bd9aac3a9232a2ff7e03332cdcf61e2b6651fb6",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-decode-rc4",
+      "pre_mmq_actual_head": "86b4de6d9666d27a9574054dd184318e6d0ec2ab",
+      "head_snapshot_before_hip": "a782d1080b244837bd105032b1f9205457c8effd",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip."
+    },
+    {
+      "branch": "pr/glm53-native-mtp",
+      "base": "1bd9aac3a9232a2ff7e03332cdcf61e2b6651fb6",
+      "source_commit": "7ceb9c748e2ac7dad69d10be758b6dc373a49584",
+      "kind": "optional-followup",
+      "diff": {
+        "files": 115,
+        "additions": 19319,
+        "deletions": 1148
+      },
+      "code_head": "95e4e6369b7ef3ff249df64b4d7db5da0b289a13",
+      "status": "HIP-local selector correction propagated; GB10 runtime/build inputs match this branch's pre-HIP counterpart. The full stack alone retains measured f82 GB10 inputs. Native HIP compile checks, requirement to rerun all ten formal gates after actual checker invalidation and intermediate-boundary runtime coverage remain distinct.",
+      "branch_head": "dcf3d033fd924a54864b1b00feb1eee8992bf442",
+      "diff_basis": "actual branch snapshot including documentation; not a measurement",
+      "pre_mmq_archive_ref": "archive/mmq-readiness-20261013/glm53-native-mtp",
+      "pre_mmq_actual_head": "049b42054fb9e75c0f22565c54f122ecaed1b02c",
+      "head_snapshot_before_hip": "15768df3e6c75cb650320a3b87bed3b08dd4c26f",
+      "identity_semantics": "Immutable review/source snapshot before documentation finalization; resolve the branch separately to inspect a later live tip."
+    }
+  ],
+  "formal_gate_state_before_final_test_fix": {
+    "checked_source": "dcf3d033fd924a54864b1b00feb1eee8992bf442",
+    "status": "ALL_TEN_REQUIRED_GATES_PASS",
+    "required_new_passes": 0,
+    "existing_f82_passes_historical": 8,
+    "superseded_bfcl": "Old supervisor stopped first, both f82 BFCL units stopped; parent process exit code 1 is operator abort of superseded work, not a completed benchmark result.",
+    "fresh_campaign": "qualification-dcf3d033",
+    "fresh_campaign_status": "COMPLETE: all ten new records pass; canonical checker accepts the assembled submission; original service restored and verified.",
+    "policy": "Measured dcf3d033 record identities are unchanged; full-stack passes do not qualify intermediate branch sources.",
+    "superseded_stop_receipt": "qualification-dcf3d033/superseded-campaign-stop.json",
+    "campaign_launches": [
+      {
+        "role": "head",
+        "time_utc": "2026-10-13T20:35:43.886585+00:00",
+        "launch_returncode": 0
+      },
+      {
+        "role": "worker",
+        "time_utc": "2026-10-13T20:35:44.211172+00:00",
+        "launch_returncode": 0
+      }
+    ],
+    "supervisor": "atlas-qualification-supervisor-dcf3d033",
+    "launch_receipt": "/home/abc/storage/models/atlas-glm53-port-audit/qualification-dcf3d033/campaign-launches.json",
+    "fresh_native_arm_build": {
+      "source": "dcf3d033fd924a54864b1b00feb1eee8992bf442",
+      "result": "PASS_NATIVE_BUILD_ONLY",
+      "binary_sha256": "7ae7b36400d33a240d8b67ffd5be493edb766b692607b1f0fd60bd60f2891874",
+      "configuration": "Fresh native aarch64 CUDA-only release; wildcard model/quant targets, ATLAS_SKIP_BUILD unset.",
+      "receipt": "/home/abc/storage/models/atlas-glm53-port-audit/qualification-dcf3d033/native-arm-evidence/build-manifest.json",
+      "receipt_sha256": "c2bb364618daef61cb34a14d8f0fb041067fae08554fda248773bd9d438d44ad",
+      "binary_comparison": "Deterministic hash match with prior GB10 binary; this was a fresh build, not relabeled evidence."
+    },
+    "final_receipt": "final-qualification-results.json",
+    "historical_invalidation_audit_log": "next-readiness-20261013/hip-gate-coverage.log",
+    "historical_invalidation_audit_log_sha256": "15ad7e2a36956748b08559cd1a9096329a481907af40f9751540db875d10a8b8"
+  },
+  "final_test_correction": {
+    "snapshot_utc": "2026-10-14T17:28:28.753897+00:00",
+    "frozen_full_source": "cc2d49ccdda284cca25ceed9570d13875fd5d36f",
+    "core": "30700d86336b4244eb21ac6c9378643cd22e5fb6",
+    "replay_map": {
+      "0e77245d38e7115769d57084f03143cd74cdd366": "30700d86336b4244eb21ac6c9378643cd22e5fb6",
+      "eb00b856367c02deeed02bb37e9ab2472a7a0def": "5cced145f3dc5709c88db6f550d54b41431218ae",
+      "a0699296dc3faa635cc11eaafa59ee69b83e27fa": "5b2a33bec20e64112c91020ca170e03381749fba",
+      "be8b99259efc1728100e6b31586918bf44b4f99c": "e900a75f27c7a8113bdec56ca7e2b9dc58e72b6a",
+      "a803b4e3b1b815a7b397da9c5dcc239cac9212be": "1cbbfddf12ac79fa21666493f8b0fc470b61c503",
+      "1bd9aac3a9232a2ff7e03332cdcf61e2b6651fb6": "97479b71a6b1497dd9e56648276501539c3081d7",
+      "95e4e6369b7ef3ff249df64b4d7db5da0b289a13": "8aea7308dd7745ad224e880b972f390ead46eec9",
+      "c8c94a40756947907a40f96079c57b0fb2b59762": "45781f6eb05c93cb242bca0ef1a06336eafd6f20",
+      "990ca3a38065365985cd7fc1e1817a3f34e1df50": "9039a2454566f11d81f9bd8860b8f8c35365b53d",
+      "9a6d0fe73b958be52f6351c1df315f32768aadd0": "04ce6a25e2d74ed8c1c3132fd2561802311f558e",
+      "8ae524925877e4955b124ed55cbbbb4a94c3cc5f": "dbf308352a1caf69c14dd237de834feca50af37d",
+      "dcf3d033fd924a54864b1b00feb1eee8992bf442": "4cb82b8ca076a8082707a7faeab0faf0f125589f",
+      "362dd0c9ad46f3f69f894612f898f138fc13d2fb": "cc2d49ccdda284cca25ceed9570d13875fd5d36f"
+    },
+    "receipt": "branch-cpu-results.json",
+    "changes": [
+      "Share the MMQ test recorder once at the MoE test-module parent on core/storage/benchmark boundaries.",
+      "Permit only the exact HIP coherent-load adapter when comparing selector algorithms; reject memory-scope, ordering and algorithm drift."
+    ],
+    "production_source_unchanged_from": "362dd0c9ad46f3f69f894612f898f138fc13d2fb",
+    "full_source_diff": [
+      "crates/spark-model/tests/dflash2_selector_bounds.rs"
+    ],
+    "cpu": "All six affected full workspace suites, fmt, Clippy, MMQ and selector checks pass; full cargo doc passes. Earlier branch outcomes/retries remain in the CPU receipt.",
+    "formal": "All ten fresh source-pinned gates pass at cc2d49cc; prior dcf3 records remain historical."
+  },
+  "qualification_source_availability_before_final_test_fix": {
+    "tag": "qualification/glm53-dcf3d033",
+    "expected_commit": "dcf3d033fd924a54864b1b00feb1eee8992bf442",
+    "local_only": true,
+    "reason": "Keep measured source available after review-stack replay; never relabel benchmark records.",
+    "publication_contract": [
+      "Push the selected submission branch and this qualification tag together after publication is authorized.",
+      "A fork-only tag is not automatically available to upstream PR CI. Arrange upstream evidence-tag publication or an explicit SHA-verified fetch before checking records.",
+      "Do not check out or execute code from the evidence ref; fetch the commit object for tree comparison only."
+    ],
+    "checker_behavior": "Accepts nonancestor identical inputs; missing measured commit fails closed.",
+    "ci_checkout": "Existing benchmark-gate checkout already uses fetch-depth:0; no CI source changed."
+  },
+  "fresh_campaign_launch_state": {
+    "checked_source": "cc2d49ccdda284cca25ceed9570d13875fd5d36f",
+    "status": "FRESH_RECORDS_REQUIRED_AFTER_SELECTOR_TEST_FIX",
+    "required_new_passes": 10,
+    "fresh_campaign": "qualification-cc2d49cc",
+    "fresh_campaign_status": "RUNNING: both campaigns launched; supervisor monitors and restores original service.",
+    "policy": "Actual checker invalidates all ten dcf3 records after the test-only source correction; records and thresholds remain unchanged.",
+    "invalidation_audit_log": "final-package-20261014/post-test-fix-stale-check.log",
+    "invalidation_audit_log_sha256": "895d5339c5255decf5b8916ef76a8eaef4b11aa81b33a9f82c7bda9cfe69b34b",
+    "campaign_launches": [
+      {
+        "role": "head",
+        "time_utc": "2026-10-14T17:32:55.007247+00:00",
+        "argv": [
+          "ssh",
+          "-i",
+          "/home/abc/.ssh/id_ed25519_spark",
+          "-o",
+          "BatchMode=yes",
+          "mangokid@192.168.8.181",
+          "systemd-run --user --unit=atlas-formal-cc2d49cc-head --property=Type=exec --property=MemorySwapMax=0 --property=KillMode=control-group --property=StandardOutput=append:/home/mangokid/atlas-glm53-dev/audit/qualification-cc2d49cc/formal-gates/head-outer.log --property=StandardError=inherit python3 /home/mangokid/atlas-glm53-dev/audit/qualification-cc2d49cc/formal-gates/campaign.py head"
+        ],
+        "launch_returncode": 0,
+        "stdout": "",
+        "stderr": "Running as unit: atlas-formal-cc2d49cc-head.service; invocation ID: d49a484b1bfb4ba280b600061aa29f64\n"
+      },
+      {
+        "role": "worker",
+        "time_utc": "2026-10-14T17:32:55.337291+00:00",
+        "argv": [
+          "ssh",
+          "-i",
+          "/home/abc/.ssh/id_ed25519_spark",
+          "-o",
+          "BatchMode=yes",
+          "mangokid@192.168.8.187",
+          "systemd-run --user --unit=atlas-formal-cc2d49cc-worker --property=Type=exec --property=MemorySwapMax=0 --property=KillMode=control-group --property=StandardOutput=append:/home/mangokid/atlas-glm53-dev/audit/qualification-cc2d49cc/formal-gates/worker-outer.log --property=StandardError=inherit python3 /home/mangokid/atlas-glm53-dev/audit/qualification-cc2d49cc/formal-gates/campaign.py worker"
+        ],
+        "launch_returncode": 0,
+        "stdout": "",
+        "stderr": "Running as unit: atlas-formal-cc2d49cc-worker.service; invocation ID: 79b1ff246a9c4445a065e3ee442e5f37\n"
+      }
+    ],
+    "supervisor": "atlas-qualification-supervisor-cc2d49cc",
+    "fresh_native_arm_build": {
+      "revision": "cc2d49ccdda284cca25ceed9570d13875fd5d36f",
+      "bundle_sha256": "a86d50cae07ee45e2cdc2aa5973f487a9b301d50638a51d4231dc58824e94300",
+      "builder_image": "sha256:0bdd5f775c98320c899e5df62e91a16bdf823df489cd723eadc757713fb625d8",
+      "build_argv": [
+        "docker",
+        "run",
+        "--name",
+        "atlas-arm-release-cc2d49cc",
+        "--memory=24g",
+        "--memory-swap=24g",
+        "--cpus=4",
+        "--mount",
+        "type=bind,src=/home/mangokid/atlas-glm53-dev/audit/qualification-cc2d49cc/native-arm,dst=/qualification",
+        "--mount",
+        "type=bind,src=/home/mangokid/atlas-glm53-dev/audit/qualification-cc2d49cc/source,dst=/source,readonly",
+        "-e",
+        "CARGO_TARGET_DIR=/qualification/target",
+        "-e",
+        "CARGO_BUILD_JOBS=4",
+        "-e",
+        "ATLAS_TARGET_MODEL=*",
+        "-e",
+        "ATLAS_TARGET_QUANT=*",
+        "-e",
+        "CUDARC_CUDA_VERSION=13000",
+        "-e",
+        "ATLAS_GIT_SHA=cc2d49ccdda284cca25ceed9570d13875fd5d36f",
+        "-w",
+        "/source",
+        "--entrypoint",
+        "bash",
+        "sha256:0bdd5f775c98320c899e5df62e91a16bdf823df489cd723eadc757713fb625d8",
+        "-c",
+        "unset ATLAS_SKIP_BUILD CUTLASS_HOME; cargo build --locked --release -p spark-server --target aarch64-unknown-linux-gnu --no-default-features --features cuda"
+      ],
+      "build_returncode": 0,
+      "started_unix": 1791998830.840272,
+      "completed_unix": 1791999059.3281975,
+      "architecture": "aarch64 CUDA13 sm_121f",
+      "binary_build": "fresh CUDA-only wildcard release; no CUTLASS_HOME/NCCL",
+      "not_qualified_yet": true,
+      "binary_sha256": "7ae7b36400d33a240d8b67ffd5be493edb766b692607b1f0fd60bd60f2891874",
+      "binary_bytes": 115899000,
+      "targets_verified": [
+        "qwen3.6-35b-a3b",
+        "qwen3.6-27b",
+        "qwen3.8-27b"
+      ]
+    }
+  }
+}

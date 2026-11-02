@@ -61,6 +61,7 @@ pub(super) fn bootstrap_one(
                 if n_active >= 2 && !dspark_batch_verify_disabled() {
                     return true;
                 }
+                crate::scheduler::copy_drafts::offer(a);
                 let (init, conf) = a.take_drafts();
                 if dflash_verify_raw_argmax || glm_repaired_narrow {
                     step_verify_dflash(
@@ -162,21 +163,15 @@ pub(super) fn bootstrap_one(
     // the GPU argmax only where the pipeline provably keeps it, otherwise the
     // full pipeline — inside `<think>` and right after it included, where the
     // raw argmax used to be taken unmasked.
-    let tok = match crate::scheduler::fast_greedy::pick_row(model, logits, a, verify_ctx, None) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!("bootstrap sample error: {e:#}");
-            mark_engine_error(a, format!("bootstrap sampling failed: {e:#}"));
-            return false;
-        }
-    };
-
-    // Extract logprobs from bootstrap decode logits (single position).
-    let lp = if let Some(k) = a.top_logprobs {
-        extract_single_logprobs(model, logits, tok, k)
-    } else {
-        None
-    };
+    let (tok, lp) =
+        match crate::scheduler::fast_greedy::pick_row_scored(model, logits, a, verify_ctx, None) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("bootstrap sample error: {e:#}");
+                mark_engine_error(a, format!("bootstrap sampling failed: {e:#}"));
+                return false;
+            }
+        };
 
     emit_token(a, tok, lp, sched);
     if a.finished {

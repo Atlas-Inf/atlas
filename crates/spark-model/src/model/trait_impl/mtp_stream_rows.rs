@@ -6,6 +6,8 @@
 use anyhow::Result;
 
 use super::super::types::TransformerModel;
+// Ported from Enntity/atlas 166e2b1 (AGPL-3.0-only).
+use crate::traits::SequenceState;
 
 impl TransformerModel {
     /// Stream-highway stash slot `slots[j]` -> `hc_streams` row `j`: where a
@@ -33,5 +35,35 @@ impl TransformerModel {
             )?;
         }
         Ok(())
+    }
+
+    /// `Model::stage_mtp_absorb`: highway rows `row ..` of the live forward
+    /// to `seq`'s proposer. No-op without a proposer, a highway or a state.
+    pub(super) fn stage_mtp_absorb_dispatch(
+        &self,
+        seq: &mut SequenceState,
+        row: usize,
+        accepted: &[u32],
+    ) -> Result<()> {
+        let (Some(proposer), Some(row_bytes)) =
+            (self.proposer.as_ref(), self.mtp_stream_row_bytes())
+        else {
+            return Ok(());
+        };
+        let Some(state) = seq.proposer_state.as_mut() else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            (row + accepted.len()) * row_bytes <= self.buffers.sizes().hc_streams,
+            "stage_mtp_absorb: rows {row}+{} exceed hc_streams",
+            accepted.len()
+        );
+        proposer.stage_absorb(
+            state.as_mut(),
+            self.buffers.hc_streams().offset(row * row_bytes),
+            accepted,
+            self.gpu.as_ref(),
+            self.gpu.default_stream(),
+        )
     }
 }

@@ -24,9 +24,80 @@ fn lone(conf: &[f32]) -> usize {
 fn bins_cover_the_confidence_range_in_order() {
     assert_eq!(bin(f32::NEG_INFINITY), 0);
     assert_eq!(bin(-1.5), 1);
-    assert_eq!(bin(-0.02), BINS - 2);
-    assert_eq!(bin(0.0), BINS - 1);
-    assert!(PRIOR.windows(2).all(|w| w[0] < w[1]));
+    assert_eq!(bin(-0.02), COPY_BIN - 2);
+    assert_eq!(bin(0.0), COPY_BIN - 1);
+    assert!(PRIOR[..COPY_BIN].windows(2).all(|w| w[0] < w[1]));
+    // Copied drafts bin apart from every drafter confidence, by source.
+    assert_eq!(bin(COPY_CONF), COPY_BIN);
+    assert_eq!(bin(COPY_REPLY_CONF), COPY_REPLY_BIN);
+    assert_eq!(COPY_REPLY_BIN, BINS - 1);
+    assert!(is_copy(&[COPY_CONF]) && is_copy(&[COPY_REPLY_CONF]));
+    assert!(!is_copy(&[SURE]) && !is_copy(&[]) && !is_copy(&[f32::NAN]));
+}
+
+#[test]
+fn the_copy_priors_verify_a_prompt_copy_whole_and_a_reply_copy_narrow() {
+    // Per-draft rates that keep 74% and 23% of five drafts.
+    let kept = |p: f32| (1..=5).map(|j| p.powi(j)).sum::<f32>() / 5.0;
+    assert!((kept(PRIOR[COPY_BIN]) - 0.74).abs() < 0.01);
+    assert!((kept(PRIOR[COPY_REPLY_BIN]) - 0.23).abs() < 0.01);
+    assert_eq!(lone(&[COPY_CONF; 7]), 7);
+    assert_eq!(lone(&[COPY_REPLY_CONF; 7]), 2);
+}
+
+#[test]
+fn copied_drafts_are_measured_and_calibrate_only_their_own_bin() {
+    let mut policy = Policy::default();
+    // The drafter's bins hold evidence, which copy rounds must not move.
+    for _ in 0..30 {
+        policy.calibration.record(&[SURE; 7], 7, 4);
+        policy.calibration.record(&[-0.04; 7], 7, 2);
+    }
+    let drafter =
+        |policy: &Policy| [SURE, -0.04, UNSURE].map(|c| policy.calibration.survival(&[c; 7]));
+    let before = drafter(&policy);
+    let reply_before = policy.calibration.survival(&[COPY_REPLY_CONF; 7]);
+    let copies = [COPY_CONF; 7];
+    for _ in 0..50 {
+        policy.calibration.record(&copies, 7, 0);
+    }
+    // Rejected copies lower the prompt copies' survival, not the drafter's
+    // nor the reply copies'.
+    assert_eq!(drafter(&policy), before);
+    assert_eq!(
+        policy.calibration.survival(&[COPY_REPLY_CONF; 7]),
+        reply_before
+    );
+    assert!(policy.calibration.survival(&copies)[0] < PRIOR[COPY_BIN] / 2.0);
+    assert_eq!(choose(&mut policy, &[&copies[..]], 7, NO_PROBE), Some(2));
+    // Drafter rounds leave the copies' evidence where it is.
+    let copies_after = policy.calibration.survival(&copies);
+    for _ in 0..200 {
+        policy.calibration.record(&[SURE; 7], 7, 7);
+    }
+    assert_eq!(policy.calibration.survival(&copies), copies_after);
+}
+
+#[test]
+fn copy_rounds_do_not_move_the_drafters_probe() {
+    let params = Params {
+        tau: DEFAULT_PARAMS.tau,
+        probe: 4,
+    };
+    let mut policy = Policy::default();
+    let unsure: &[f32] = &[UNSURE; 7];
+    let copies: &[f32] = &[COPY_REPLY_CONF; 7];
+    let mut widths = Vec::new();
+    for _ in 0..4 {
+        widths.push(choose(&mut policy, &[unsure], 7, params).unwrap());
+        // A copy round between every drafter round: probed on its own count.
+        choose(&mut policy, &[copies], 7, params).unwrap();
+    }
+    assert_eq!(widths, [2, 2, 2, 7]);
+    assert_eq!((policy.steps, policy.copy_steps), (4, 4));
+    // A batch with any drafter owner is the drafter's step.
+    choose(&mut policy, &[copies, unsure], 7, params).unwrap();
+    assert_eq!((policy.steps, policy.copy_steps), (5, 4));
 }
 
 #[test]
@@ -162,7 +233,7 @@ fn min_tokens_bans_fall_back_and_recalibrate() {
 fn record_observes_only_reached_positions() {
     let mut cal = Calibration::default();
     let conf = [SURE; 7];
-    let top = BINS - 1;
+    let top = bin(SURE);
     // Three drafts verified, the first accepted: position 0 accepted,
     // position 1 rejected, position 2 never reached, 3.. never verified.
     cal.record(&conf, 3, 1);

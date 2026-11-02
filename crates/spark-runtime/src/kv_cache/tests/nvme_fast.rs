@@ -323,14 +323,14 @@ fn a_leaked_staging_ring_fails_the_batch_instead_of_hanging() {
     let (mut c, store) = fast_cache(&gpu, 8);
     fill(&c, &gpu, 1, 0x11);
     // No free chunk and no write in flight: nothing will ever free one.
-    let ring = std::mem::take(&mut c.nvme.as_mut().unwrap().fast.as_mut().unwrap().free);
+    let ring = std::mem::take(&mut c.nvme[0].fast.as_mut().unwrap().free);
     let orders = [order(1, 0), order(2, 1)];
     assert_eq!(c.nvme_write(&orders, &gpu, 0), orders.to_vec());
     assert_eq!(store.writes.load(Ordering::Relaxed), 0);
     // A restore attempts nothing (the records stay planned for a recompute).
     assert_eq!(c.nvme_read(&[disk(0)], &mut [5], &gpu, 0), (0, false));
     // With the ring back the tier works again.
-    c.nvme.as_mut().unwrap().fast.as_mut().unwrap().free = ring;
+    c.nvme[0].fast.as_mut().unwrap().free = ring;
     assert!(c.nvme_write(&orders[..1], &gpu, 0).is_empty());
     assert_eq!(c.nvme_read(&[disk(0)], &mut [5], &gpu, 0), (1, false));
     assert_eq!(dump(&c, &gpu, 5), dump(&c, &gpu, 1));

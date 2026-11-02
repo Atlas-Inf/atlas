@@ -101,35 +101,35 @@ pub(super) fn build_choice_message(
             if let Some(cwd) = cwd_hint {
                 tool_parser::normalize_paths(&mut tool_calls_i, cwd);
             }
+            if let Some(reason) = tool_calls_i
+                .iter()
+                .find_map(|tc| state.tool_guard.inspect(&tc.function.arguments).err())
+            {
+                tracing::warn!(reason = reason.code(), "tool-call guard blocked a response");
+                return ir::Choice {
+                    index: choice_idx,
+                    content: Some(atlas_tool_guard::REFUSAL.into()),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    refusal: None,
+                    finish_reason: ir::FinishReason::ContentFilter,
+                    guard_stop: Some(atlas_tool_guard::GUARD_STOP),
+                    matched_stop: None,
+                    logprobs: None,
+                };
+            }
             let validated = tool_parser::validate_tool_calls(tool_calls_i, &tools_ref);
             if !validated.errors.is_empty() {
                 for err in &validated.errors {
                     tracing::warn!("Tool call validation error: {err}");
                 }
             }
-            // Strip orphan tool call XML tags + ```lang fences from content
-            // (Qwen3-Coder pattern: emits markdown narration AND structured
-            // tool_call for the same payload).
-            let content = content.map(|mut c| {
-                for tag in &["</parameter>", "</function>", "</tool_call>", "<tool_call>"] {
-                    c = c.replace(tag, "");
-                }
-                while let Some(start) = c.find("<function=") {
-                    let end = c[start..]
-                        .find('>')
-                        .map(|p| start + p + 1)
-                        .unwrap_or(c.len());
-                    c = format!("{}{}", &c[..start], &c[end..]);
-                }
-                while let Some(start) = c.find("```") {
-                    let after_open = start + 3;
-                    let Some(rel_close) = c[after_open..].find("```") else {
-                        break;
-                    };
-                    let close_end = after_open + rel_close + 3;
-                    c = format!("{}{}", &c[..start], &c[close_end..]);
-                }
-                c.trim().to_string()
+            // Strip orphan tool-call XML tags from narration while preserving
+            // the same bytes when they occur in a quoted/code example.
+            let content = content.map(|c| {
+                super::strip::strip_tool_markup_preserving_literals(&c)
+                    .trim()
+                    .to_string()
             });
             msg_content = content;
             if !validated.valid.is_empty() {
@@ -160,14 +160,17 @@ pub(super) fn build_choice_message(
     }
 
     // Refusal classifier: when the model's assistant text opens with
-    // a known refusal pattern AND no tool call fired, populate
-    // `refusal` and null out `content` per the OpenAI spec.
+    // a known refusal pattern AND no tool call fired, populate `refusal`.
+    // `content` is kept: the classifier is a prefix heuristic, and a reply
+    // like "I cannot verify that, but here is ..." carries a real answer
+    // after its first sentence. The streamed path sends every content piece
+    // and appends the refusal delta at the end, so blocking now matches it
+    // (#172: 27/200 blocking replies came back with `content: null`).
     if msg_tool_calls.is_none()
         && let Some(content_text) = msg_content.as_deref()
         && let Some(refusal_sentence) = crate::refusal::detect(content_text)
     {
         msg_refusal = Some(refusal_sentence);
-        msg_content = None;
     }
 
     // Validated wire tool calls → IR (arguments are serde-normalized
@@ -192,6 +195,7 @@ pub(super) fn build_choice_message(
         finish_reason: ir::FinishReason::from(finish_reason_i.as_str()),
         matched_stop: None, // caller fills
         logprobs: None,     // caller fills
+        guard_stop: response.guard_stop,
     }
 }
 

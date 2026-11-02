@@ -139,7 +139,7 @@ impl MoeLayer {
                 anyhow::ensure!(
                     self.bf16_gate_weight_ptrs.is_none()
                         && self.fp8_gate_weight_ptrs.is_none()
-                        && self.bf16_shared_expert.is_none()
+                        && self.separate_shared_expert.is_none()
                         && self.fp8_shared_expert.is_none()
                         && self.gate_fp8.is_none()
                         && self.shared_gate_fp8.is_none()

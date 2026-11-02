@@ -155,7 +155,7 @@ impl QsaIndexer {
     ) -> Result<()> {
         let complete = st.ingested / self.ratio as usize;
         if complete > st.pooled {
-            ops::qsa_block_pool(
+            ops::qsa_block_pool_scaled(
                 gpu,
                 self.k_pool_k,
                 self.raw_origin(st),
@@ -168,6 +168,8 @@ impl QsaIndexer {
                 self.rot,
                 self.theta,
                 self.eps,
+                self.yarn_inv_freq,
+                self.yarn_attention_factor,
                 stream,
             )?;
             st.pooled = complete;

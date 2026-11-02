@@ -20,8 +20,8 @@
 //! under a confidence stop a deep ceiling costs drafter and verify rows only
 //! on confident runs, so the controller steers what it costs when it binds.
 //!
-//! Every [`WINDOW`] verifies at one ceiling, with at least [`MIN_DRAFTED`]
-//! observations of position `d`:
+//! Every [`WINDOW`] verifies at one ceiling (`ATLAS_MTP_DEEP_WINDOW`), with
+//! at least [`MIN_DRAFTED`] (a quarter) observations of position `d`:
 //!
 //! | a_d | step |
 //! |---|---|
@@ -31,7 +31,8 @@
 //! | < 0.25 | -1 |
 //!
 //! (the thresholds of the RecoverSSM/vLLM K=3..7 recipe). A request starts at
-//! the floor, so the first deep rows are earned, not assumed. Fewer than
+//! the floor, so the first deep rows are earned, not assumed
+//! (`ATLAS_MTP_DEEP_START` moves the start). Fewer than
 //! [`MIN_DRAFTED`] observations hold the ceiling: the confidence stop rarely
 //! reaches it, so it rarely costs anything.
 
@@ -87,12 +88,33 @@ fn step_for(a: f32) -> isize {
     }
 }
 
+/// Observations of the deepest position a decision over `window` verifies
+/// needs (`ATLAS_MTP_DEEP_WINDOW`): [`MIN_DRAFTED`] of the default
+/// [`WINDOW`], a quarter of any other.
+pub(super) fn min_drafted(window: u16) -> u16 {
+    if window == WINDOW {
+        MIN_DRAFTED
+    } else {
+        window / 4
+    }
+}
+
 impl DeepDepth {
     /// Draft ceiling under `floor..=max`.
     pub fn drafts(&self, floor: usize, max: usize) -> usize {
+        self.drafts_from(
+            spark_model::speculative::deep_depth::deep_start(),
+            floor,
+            max,
+        )
+    }
+
+    /// [`Self::drafts`] for a request that starts at `start` (unset = the
+    /// floor; `ATLAS_MTP_DEEP_START`).
+    fn drafts_from(&self, start: Option<usize>, floor: usize, max: usize) -> usize {
         let floor = floor.clamp(1, max.max(1));
         if self.depth == 0 {
-            floor
+            start.map_or(floor, |s| s.clamp(floor, max.max(1)))
         } else {
             (self.depth as usize).clamp(floor, max.max(1))
         }
@@ -100,18 +122,39 @@ impl DeepDepth {
 
     /// Feed one verify that verified `drafts` drafts and accepted `accepted`.
     pub fn record(&mut self, drafts: usize, accepted: usize, floor: usize, max: usize) {
-        let cur = self.drafts(floor, max);
+        use spark_model::speculative::deep_depth::{decision_window, deep_start};
+        self.record_in(
+            drafts,
+            accepted,
+            floor,
+            max,
+            decision_window(),
+            deep_start(),
+        );
+    }
+
+    /// [`Self::record`] with the decision window and start ceiling given.
+    fn record_in(
+        &mut self,
+        drafts: usize,
+        accepted: usize,
+        floor: usize,
+        max: usize,
+        window: u16,
+        start: Option<usize>,
+    ) {
+        let cur = self.drafts_from(start, floor, max);
         self.depth = cur as u8;
         self.steps += 1;
         if drafts >= cur {
             self.drafted += 1;
             self.hits += u16::from(accepted >= cur);
         }
-        if self.steps < WINDOW {
+        if self.steps < window {
             return;
         }
         let a = self.hits as f32 / self.drafted.max(1) as f32;
-        let next = if self.drafted < MIN_DRAFTED {
+        let next = if self.drafted < min_drafted(window) {
             cur
         } else {
             let lo = floor.clamp(1, max.max(1)) as isize;

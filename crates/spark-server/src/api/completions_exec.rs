@@ -111,7 +111,7 @@ pub(super) async fn run_blocking(
                 require_tool_call: false,
                 tools_present: false,
                 suppress_tool_call: false,
-                disable_mtp: false,
+                disable_mtp: req.disable_mtp,
                 grammar_spec: None,
                 // Distinct choices need distinct sampling streams; same
                 // offset scheme as chat_blocking's n>1 loop.
@@ -226,3 +226,7 @@ pub(super) async fn run_blocking(
     ))
     .into_response()
 }
+
+#[cfg(test)]
+#[path = "completions_spec_policy_tests.rs"]
+mod spec_policy_tests;

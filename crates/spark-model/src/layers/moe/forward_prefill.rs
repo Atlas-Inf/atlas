@@ -37,6 +37,27 @@ impl MoeLayer {
         stream: u64,
         defer_shared_hc: bool,
     ) -> Result<()> {
+        // ATLAS_GLM_FP4L_DECODE_A16: a prompt chunk with verify rows runs
+        // each half on its own lane; decode and verify rows take W4A16 (BF16
+        // activations), as the reference's non-prompt rows.
+        if self.forward_prefill_mixed(input, num_tokens, ctx, stream, defer_shared_hc)? {
+            return Ok(());
+        }
+        let _a16 = super::decode_a16::A16Scope::enter(self.a16_stream_fits(
+            num_tokens as u32,
+            ctx.config.hidden_size as u32,
+            ctx.config.routed_inter_local() as u32,
+        ));
+        if super::decode_a16::A16Scope::lane() == super::decode_a16::Activations::A16Grouped
+            && ctx
+                .gpu
+                .op_cache()
+                .first_shape("moe:decode_a16_grouped", num_tokens as u32, 0, 0)
+        {
+            tracing::info!(
+                "ATLAS_GLM_FP4L_DECODE_A16: rows={num_tokens} on the grouped W4A16 path (the stream twins do not take them)"
+            );
+        }
         self.btile_input_guard(input, num_tokens, ctx, stream)?;
         anyhow::ensure!(
             !self.btile_storage.is_published() || self.nvfp4_prequant_moe,
@@ -105,29 +126,34 @@ impl MoeLayer {
             return self.forward_batched(input, num_tokens, ctx, stream);
         }
 
-        // NVFP4 experts on native HIP: the grouped path pays off only for
-        // long prefills — at small N every expert block still walks the full
-        // K loop for ≤1 real row (2026-09-20 GPU-timed winbox trace: grouped
-        // GEMMs = 1,754 of 2,754 ms GPU in a 44-token prefill, ~15 ms/call
-        // nearly flat in N). Below ATLAS_HIP_MOE_GROUPED_MIN_TOKENS route to
-        // the per-token batched path like the bf16/fp8 arms above. cfg gate:
-        // NVIDIA byte-unchanged.
+        // NVFP4 experts on native HIP: below ATLAS_HIP_MOE_GROUPED_MIN_TOKENS
+        // route to the per-token batched path, like the bf16/fp8 arms above.
+        // cfg gate: NVIDIA byte-unchanged.
         //
-        // Default 1024 = measured crossover, serial arm, hipBLASLt live,
-        // temp 0, winbox 2026-09-20 (TTFT ms, grouped vs batched):
-        //   20 tok   2053 vs ~600      44 tok  2946 vs ~1000
-        //  266 tok   7027 vs ~4196    708 tok 10825 vs ~9795
-        // 1150 tok  14347 vs 15594  <- grouped wins
-        // Batched leads through 708 and loses at 1150; crossover ~900,
-        // rounded to the nearest power of two.
+        // Default 256. It was 1024, from a winbox crossover (2026-09-20) taken when
+        // a grouped call cost ~15 ms nearly flat in N; #155's F16 grouped twins made
+        // it cheap, and the per-token path then cost ~7 s for one 423-row chunk
+        // (one warm agent turn). Cold TTFT, Flash-Next NVFP4, framework gfx1151
+        // Linux, 2026-10-27 (f46), 1024 -> 256: 470 tok 8.36 -> 1.06 s, 649 tok
+        // 11.61 -> 1.30 s; 1035 / 1676 tok unchanged.
+        // Why not lower: 64 also wins below 256 tokens (132 tok 2.50 -> 0.81 s) but
+        // its agentic-webserver runs scored 45/50 and 47/50 webserver_ok, every
+        // failure "no Cargo.toml was written" (f47, f53), against 50/50 at 1024
+        // (f51). 256 scored 49/50 / 50/50 with no such failure, Sigma wall
+        // 15,441 -> 13,049 s and median TTFT 5.08 -> 3.65 s (f57).
         if cfg!(atlas_hip) {
             static HIP_NVFP4_GROUPED_MIN_TOKENS: std::sync::OnceLock<usize> =
                 std::sync::OnceLock::new();
+            // Unit tests drive this dispatch through a recording backend and
+            // assert the grouped path (the GB10 dispatch); the production
+            // threshold is a serving choice measured on hardware, so under
+            // cfg(test) the default is 1 (the env var still overrides). With
+            // 1024, six GLM MoE tests failed or hung on HIP builds.
             let min = *HIP_NVFP4_GROUPED_MIN_TOKENS.get_or_init(|| {
                 std::env::var("ATLAS_HIP_MOE_GROUPED_MIN_TOKENS")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(1024)
+                    .unwrap_or(if cfg!(test) { 1 } else { 256 })
             });
             if num_tokens < min {
                 return self.forward_batched(input, num_tokens, ctx, stream);
@@ -203,6 +229,7 @@ impl MoeLayer {
         let has_shared = shared_inter > 0;
         let is_ep_prefill = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
         let defer_shared_hc = defer_shared_hc
+            && !crate::layers::canonical_verify::enabled()
             && has_shared
             && is_ep_prefill
             && num_tokens == 5
@@ -225,8 +252,13 @@ impl MoeLayer {
             Some(sp) if !sp.full_shared => (sp.local(input, h as usize), sp.rows as u32),
             _ => (input, n),
         };
+        // An MXFP8 shared expert under EP is this rank's slice
+        // (`shared_mxfp8.rs`): its partial over every row joins the routed sum
+        // before the reduce (`split`).
+        let mx_split = has_shared && is_ep_prefill && self.shared_joins_reduce();
         let overlap_shared_reduce = has_shared
             && is_ep_prefill
+            && !mx_split
             && num_tokens > 64
             && !ctx.graph_capture
             && !ctx.profile
@@ -236,18 +268,28 @@ impl MoeLayer {
         // (decode / verify), each rank computes half the shared expert's
         // intermediate columns and blends that partial before the EP
         // all-reduce, which sums the halves; each rank reads half the weights.
-        let split = has_shared
+        let split_eligible = has_shared
             && is_ep_prefill
             && sp.is_none()
             && !overlap_shared_reduce
-            && !defer_shared_hc
-            && self.shared_split_ready(ctx, n);
+            && !defer_shared_hc;
+        // ATLAS_GLM_FP4L_SHARED_FP8: the native split on the FP8 block twins.
+        let native_split = split_eligible && self.shared_native_split_ready(ctx, n, shared_inter);
+        let split = mx_split
+            || native_split
+            || (split_eligible && self.shared_native.is_none() && self.shared_split_ready(ctx, n));
         // Under SP with the reduce-scatter pipe, the shared expert of this
         // rank's rows runs while that exchange is on the wire
         // (`forward_prefill_finish`, `defer_shared_to_rs`).
         let defer_shared =
             !split && self.defer_shared_to_rs(sp, has_shared, overlap_shared_reduce, h, ctx);
-        if split {
+        if mx_split {
+            // Every row (an SP chunk's too): the slice's partial of each.
+            self.run_shared_expert_prefill(input, n, h, shared_inter, stream, stream, false, ctx)?;
+        } else if native_split {
+            let touch = self.router_touch(n, h, inter, ctx);
+            self.run_shared_native_split(input, n, h, shared_inter, touch, ctx, stream)?;
+        } else if split {
             self.run_shared_split(input, n, h, shared_inter, ctx, stream)?;
         } else if has_shared && !overlap_shared_reduce && !defer_shared {
             self.run_shared_expert_prefill(
@@ -267,76 +309,19 @@ impl MoeLayer {
 
         // ATLAS_GLM_DET_TRACE stages before routing (the rest are in forward_prefill_finish).
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
-        let (row, route) = (h as usize * 2, top_k as usize * 4);
+        let row = h as usize * 2;
         det.tap("moe_in", input, (0, num_tokens), row);
-        let gate_logits = ctx.buffers.gate_logits();
-        let scratch = ctx.buffers.scratch();
-        let indices_dev = scratch;
-        let weights_dev = scratch.offset(total_expanded as usize * 4);
-        // ATLAS_QWEN4EXP_PREFILL_SP_ROUTE: this rank's rows were routed at the
-        // gather site; gather the peer's (`forward_prefill_route_sp`).
-        let routes = [indices_dev, weights_dev];
-        if !self.take_local_routes(input, num_tokens, routes, ctx, stream)? {
-            // Gemma-4 router pre-norm (no-op for other models).
-            let router_in = self.router_input(input, n, h, ctx, stream)?;
-            super::dump::dump_gate_input(ctx.gpu, stream, router_in, n, h)?;
-            // 1. Gate GEMM: [N, H] × [H, num_experts] → [N, num_experts]
-            self.prefill_gate_gemm(router_in, gate_logits, n, num_experts, h, ctx, stream)?;
-            super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
-            det.tap(
-                "x_gate",
-                gate_logits,
-                (0, num_tokens),
-                num_experts as usize * 2,
-            );
-            prof_step!("gate_gemm");
-
-            // Feature-1: fold the router (`mlp.gate`) LoRA delta onto the routing
-            // logits BEFORE top-k (reproduces PEFT `mlp.gate`). No-op unless a router
-            // delta is installed (ATLAS_LORA_EXPERTS=1).
-            self.apply_router_lora_prefill(router_in, gate_logits, n, ctx, stream)?;
-
-            // 2. Batched topK dispatch. DeepSeek-V3 / MiniMax-M2 use sigmoid
-            //    + correction bias (detected via `correction_bias_dev`);
-            //    every other model takes the softmax path (no behavior
-            //    change — this is additive).
-            self.prefill_topk(
-                gate_logits,
-                indices_dev,
-                weights_dev,
-                n,
-                num_experts,
-                top_k,
-                ctx,
-                stream,
-            )?;
-        }
-        super::dump::dump_expert_ids(ctx.gpu, stream, indices_dev, weights_dev, n, top_k)?;
-        det.tap("rt_ids", indices_dev, (0, num_tokens), route);
-        det.tap("rt_w", weights_dev, (0, num_tokens), route);
-        prof_step!("topk");
-
-        // 3. Sort tokens by expert → L2-optimized ordering.
-        let te = total_expanded as usize;
-        let ne = num_experts as usize;
-        let sorted_token_ids = gate_logits;
-        let sorted_expert_ids = gate_logits.offset(te * 4);
-        let expert_offsets = gate_logits.offset(te * 4 * 2);
-        let token_to_perm = gate_logits.offset(te * 4 * 2 + (ne + 1) * 4);
-        ops::moe_sort_by_expert(
-            ctx.gpu,
-            self.moe_sort_by_expert,
-            indices_dev,
+        // 1-3. Router GEMM, top-k, sort by expert (route_fuse.rs).
+        let routes = self.route_and_sort(input, [n, h, inter], det, ctx, stream)?;
+        let super::route_fuse::Routes {
+            indices: indices_dev,
+            weights: weights_dev,
             sorted_token_ids,
-            sorted_expert_ids,
             expert_offsets,
             token_to_perm,
-            total_expanded,
-            num_experts,
-            top_k,
-            stream,
-        )?;
-        prof_step!("sort");
+            prerouted,
+        } = routes;
+        prof_step!("route");
 
         // 3.5. Pre-expert norm: norm the input for expert dispatch (Gemma-4 26B).
         // Router already used the raw input for routing; now norm for experts.
@@ -376,7 +361,8 @@ impl MoeLayer {
             num_experts,
             top_k,
             num_tokens,
-            ne,
+            num_experts as usize,
+            prerouted,
             &mut t0,
             ctx,
             stream,

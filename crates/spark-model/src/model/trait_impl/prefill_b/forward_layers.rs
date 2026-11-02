@@ -153,7 +153,13 @@ impl TransformerModel {
             // and must use the bit-faithful WY4 recurrence (see layer.rs).
             // ATLAS_QWEN4EXP_PREFILL_ROWINV keeps the chunked scan: a restore
             // sits on its 64-token grid, so the replay is the cold pass's.
-            gdn_exact_replay: marconi_skip && !crate::layers::ops::qwen4exp_rowinv::on(),
+            // R11 fix 6: under the prefill grid a warm replay pass IS a cold
+            // pass (same start, same length), so the cold run's FLA kernel is
+            // the bit-faithful one; forcing the exact-replay kernel there
+            // (register-resident, or WY4 if that is off) made warm != cold.
+            gdn_exact_replay: marconi_skip
+                && !crate::layers::ops::qwen4exp_rowinv::on()
+                && !self.grid_replay_is_cold(),
             // Hash-MoE: this chunk's token IDs (uploaded in prefill_b_embed_chunk
             // to the stable buffer, in chunk order matching the MoE loop).
             token_ids: Some(self.buffers.token_ids().offset(skip * 4)),
@@ -325,7 +331,7 @@ impl TransformerModel {
             if let Some(t) = t_pf {
                 t_in_prefill += t.elapsed();
             }
-            det.tap("out", ctx.buffers.hc_streams(), det_out, hc_row);
+            det.tap_floats("out", ctx.buffers.hc_streams(), det_out, hc_row, hc_elem);
             if let Some(p) = qsp.filter(|p| p.check) {
                 let split = sp.is_some();
                 self.qwen4exp_sp_check(p, effective_seq_len_start, Some(i), split, stream);
@@ -503,6 +509,11 @@ impl TransformerModel {
         }
         crate::det_trace::set_layer(self.layers.len());
         det.tap("final", hidden, (0, proc_count), h * 2);
+        // ATLAS_QWEN4EXP_MTP_PREFILL: the final highway rows this rank holds
+        // (of a split chunk, rank 0's half at row 0), for the drafter.
+        // Ported from Enntity/atlas e7d4e1a (AGPL-3.0-only).
+        let held = sp.map_or(proc_count, |s| if s.row0 == 0 { s.rows } else { 0 });
+        self.note_mtp_prompt_rows(seq, effective_seq_len_start, held, 0);
         self.prefill_b_forward_layers_profile_tail(
             seq,
             effective_seq_len_start,

@@ -75,9 +75,14 @@ __device__ __forceinline__ unsigned int silu_nvfp4_quantize_e2m1(float v) {
 }
 
 // The E4M3 scale byte of a 16-value group with absolute maximum `group_max`
-// and the reciprocal of its decoded value (0 for a zero scale).
-__device__ __forceinline__ unsigned char silu_nvfp4_group_scale(float group_max, float* inv) {
-    const unsigned char fp8 = silu_nvfp4_float_to_e4m3(group_max / 6.0f);
+// under activation global scale `g` (ModelOpt's 1 / input_scale; 1 for none),
+// and the multiplier taking a value to its E2M1 code, g / decoded (0 for a
+// zero scale): sf = e4m3(amax * g / 6), q = e2m1(x * g / sf), as the
+// reference NVFP4 quantizer (b12x quantize_block_fp4). g = 1 is bit for bit
+// the unscaled form.
+__device__ __forceinline__ unsigned char silu_nvfp4_group_scale(float group_max, float* inv,
+                                                                float g = 1.0f) {
+    const unsigned char fp8 = silu_nvfp4_float_to_e4m3(group_max * g / 6.0f);
     const unsigned int exp = (fp8 >> 3) & 0xF;
     const unsigned int man = fp8 & 0x7;
     float decoded;
@@ -88,6 +93,6 @@ __device__ __forceinline__ unsigned char silu_nvfp4_group_scale(float group_max,
     } else {
         decoded = __uint_as_float((exp + 120u) << 23 | (man << 20));
     }
-    *inv = decoded > 0.0f ? 1.0f / decoded : 0.0f;
+    *inv = decoded > 0.0f ? g / decoded : 0.0f;
     return fp8;
 }

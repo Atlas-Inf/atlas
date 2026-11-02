@@ -18,12 +18,18 @@
 //! SwiGLU kernel chain. This binary is the parallel of
 //! `metal_layer3_attention` for the vision-tower side.
 
+#[cfg(target_os = "macos")]
 use anyhow::{Context, Result};
+#[cfg(target_os = "macos")]
 use safetensors::SafeTensors;
+#[cfg(target_os = "macos")]
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelArg};
+#[cfg(target_os = "macos")]
 use spark_runtime::metal_backend::MetalGpuBackend;
+#[cfg(target_os = "macos")]
 use std::time::Instant;
 
+#[cfg(target_os = "macos")]
 fn bf16_slice_to_bytes(values: &[half::bf16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(values.len() * 2);
     for v in values {
@@ -32,6 +38,7 @@ fn bf16_slice_to_bytes(values: &[half::bf16]) -> Vec<u8> {
     out
 }
 
+#[cfg(target_os = "macos")]
 fn bytes_to_bf16_vec(bytes: &[u8]) -> Vec<half::bf16> {
     let mut out = Vec::with_capacity(bytes.len() / 2);
     for chunk in bytes.chunks_exact(2) {
@@ -40,6 +47,7 @@ fn bytes_to_bf16_vec(bytes: &[u8]) -> Vec<half::bf16> {
     out
 }
 
+#[cfg(target_os = "macos")]
 fn main() -> Result<()> {
     let model_dir = std::env::var("ATLAS_MLX_MODEL_DIR").unwrap_or_else(|_| {
         let home = std::env::var("HOME").expect("$HOME unset");
@@ -301,4 +309,9 @@ fn main() -> Result<()> {
     println!();
     println!("✓ metal vision-tower block forward succeeded");
     Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn main() -> anyhow::Result<()> {
+    anyhow::bail!("metal_vision_block_forward requires macOS and the Metal backend")
 }

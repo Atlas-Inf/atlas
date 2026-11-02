@@ -173,12 +173,14 @@ mod glm5_vision_tests {
                 pad_count: 4,
                 per_frame_pad_count: 4,
                 timestamps: vec![],
+                qwen3vl: false,
             },
             Glm5VisionPlaceholder {
                 kind: Glm5VisionKind::Image,
                 pad_count: 2,
                 per_frame_pad_count: 2,
                 timestamps: vec![],
+                qwen3vl: false,
             },
         ];
         assert_eq!(
@@ -195,6 +197,7 @@ mod glm5_vision_tests {
             pad_count: 8,
             per_frame_pad_count: 4,
             timestamps: vec![0.0, 1.0],
+            qwen3vl: false,
         };
         assert_eq!(
             expand(&input, &[p]),

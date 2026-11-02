@@ -30,6 +30,13 @@ impl GlmChunkOwner {
         floor.saturating_sub(self.row0).min(self.rows)
     }
 
+    /// The owner's causal extent: one past its last row's position.
+    pub(super) fn end(&self) -> anyhow::Result<usize> {
+        self.seq_len_start
+            .checked_add(self.rows)
+            .ok_or_else(|| anyhow::anyhow!("GLM prefill sequence length overflow"))
+    }
+
     /// Dense attention over the owner's whole causal history is exact: its
     /// sequence ends within `index_topk`, so it selects nothing.
     pub(super) fn dense_is_exact(&self, index_topk: usize) -> bool {
@@ -161,11 +168,12 @@ pub(in crate::layers::qwen3_attention) fn glm_chunk_pieces(
 }
 
 /// An `fp8_g128` owner's latents dequantized to BF16 in the arena scratch,
-/// addressed through an identity block table.
+/// addressed through an identity block table of `blocks` entries.
 #[derive(Clone, Copy)]
 pub(super) struct Bf16LatentView {
     pub(super) latents: DevicePtr,
     pub(super) identity_table: DevicePtr,
+    pub(super) blocks: usize,
 }
 
 impl Qwen3AttentionLayer {
@@ -173,6 +181,8 @@ impl Qwen3AttentionLayer {
     /// rows), when the scratch holds every row; `None` projects per owner.
     /// `solo` also batches a single owner, whose queries are then ready
     /// before its selection (the same projections, in a different order).
+    /// `keys`: project the index keys and gates (not when the fused front
+    /// already updated the index cache with them).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn glm_owner_projections(
         &self,
@@ -182,6 +192,7 @@ impl Qwen3AttentionLayer {
         rows: usize,
         nq: usize,
         solo: bool,
+        keys: bool,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<Option<GlmOwnerProjections>> {
@@ -210,9 +221,12 @@ impl Qwen3AttentionLayer {
             return Ok(None);
         }
         let n = rows as u32;
+        let project_keys = keys;
         let keys = ctx.buffers.ssm_qkvz();
         let gates = keys.offset(rows * key_row);
-        self.glm_index_project_keys(normed, n, keys, gates, ctx, stream)?;
+        if project_keys {
+            self.glm_index_project_keys(normed, n, keys, gates, ctx, stream)?;
+        }
         let q_absorbed = ctx.buffers.ssm_deinterleaved();
         // Short-context batches (every owner dense) skip wq_b and weights_proj.
         let index = if any_owner_selects(owners, c.index_topk) {
@@ -285,6 +299,7 @@ impl Qwen3AttentionLayer {
         Ok(Some(Bf16LatentView {
             latents,
             identity_table,
+            blocks: capacity / 16,
         }))
     }
 }

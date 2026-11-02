@@ -102,10 +102,31 @@ def entry_points(target: str) -> dict[str, set[str]]:
                 continue
             seen_stems.add(stem)
             module = mods.get(stem, stem)
-            src = open(os.path.realpath(shown), encoding="utf-8").read()
+            src = translation_unit(os.path.realpath(shown))
             found[module].update(declared_kernels(src))
             found[module].update(macro_kernels(src))
     return found
+
+
+def translation_unit(path: str, depth: int = 0) -> str:
+    """`path` with its quoted `#include "....cu"` files spliced in.
+
+    A shadow may extend its common namesake by inclusion: this target's
+    `quantize_bf16_to_nvfp4.cu` is `#include "../../common/
+    quantize_bf16_to_nvfp4.cu"` plus one entry point. Reading only the file
+    itself reports every included entry point as MISSING. Only `.cu` includes
+    are followed (headers declare no entry points this script reads); the
+    depth bound stops a cycle.
+    """
+    src = open(path, encoding="utf-8").read()
+    if depth >= 4:
+        return src
+    here = os.path.dirname(path)
+    for inc in re.findall(r'^\s*#include\s+"([^"]+\.cu)"', src, flags=re.M):
+        target = os.path.realpath(os.path.join(here, inc))
+        if os.path.exists(target):
+            src += "\n" + translation_unit(target, depth + 1)
+    return src
 
 
 def _paged_concat_suffixes() -> set[str]:

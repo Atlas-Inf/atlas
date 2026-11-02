@@ -4,6 +4,8 @@
 
 use super::*;
 
+pub(in crate::scheduler) mod admission;
+
 /// Self-speculative step: draft via layer-skipping, verify with full model.
 /// Combines bootstrap + verify in one step (no pipeline).
 ///
@@ -131,7 +133,7 @@ pub fn step_self_spec(
 
     for i in 0..n_drafts {
         if draft_tokens[i] == verified[i] {
-            emit_token(a, draft_tokens[i], None, sched);
+            emit_accepted_token(a, draft_tokens[i], sched);
             if a.finished {
                 return;
             }

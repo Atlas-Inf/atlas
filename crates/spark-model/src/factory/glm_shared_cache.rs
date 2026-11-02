@@ -90,7 +90,22 @@ pub(super) fn initialize(
     for layer in layers.iter_mut() {
         infos.push(inspect(layer.as_mut())?.0);
     }
-    let ordinals = cache_ordinals(config, &infos)?;
+    let mut ordinals = cache_ordinals(config, &infos)?;
+    // A native FP8 block shared expert (ATLAS_GLM_FP4L_SHARED_FP8) keeps no
+    // NVFP4 copy to predecode and needs no cache.
+    let mut native = Vec::new();
+    for &ordinal in &ordinals {
+        if let (_, FfnComponent::Moe(moe)) = inspect(layers[ordinal].as_mut())?
+            && moe.has_shared_native()
+        {
+            native.push(ordinal);
+        }
+    }
+    ordinals.retain(|o| !native.contains(o));
+    if ordinals.is_empty() {
+        tracing::info!("GLM deferred shared FP8: every target layer is native, no cache");
+        return Ok(());
+    }
     let total = reserve.remaining_bytes(ordinals.len())?;
     let free = gpu.free_memory()?;
     reserve.check(free, total)?;

@@ -148,6 +148,17 @@ impl TransformerModel {
             "dense_gemv_fp8w_batch2",
             "dense_gemv_fp8w_batch2",
         );
+        // BF16 dual-GEMV (batch=2) for the K=2 verify lm_head on a BF16 LM
+        // head. Every build's kernel is bit-identical to two `dense_gemv_bf16`
+        // calls: the strix-hip pair walks 32 lanes per row, the gb10/strix
+        // (NVIDIA) pair 64 lanes per row with the same smem pair-sum, and in
+        // both the second token is only an extra accumulator. Absent kernel ->
+        // handle 0 -> the two-GEMV fallback.
+        let dense_gemv_bf16_batch2_kernel = crate::layers::try_kernel(
+            gpu.as_ref(),
+            "dense_gemv_bf16_batch2",
+            "dense_gemv_bf16_batch2",
+        );
         let dense_gemm_kernel = gpu.kernel("gemm", "dense_gemm_bf16")?;
         let dense_gemv_batchm_kernel = gpu
             .kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")
@@ -689,6 +700,7 @@ impl TransformerModel {
             w4a16_gemv_batch16_kernel,
             dense_gemv_fp8w_kernel,
             dense_gemv_fp8w_batch2_kernel,
+            dense_gemv_bf16_batch2_kernel,
             lm_head_dp4a_gemv_kernel,
             lm_head_dp4a_quant_kernel,
             dense_gemm_kernel,
@@ -748,6 +760,8 @@ impl TransformerModel {
             dflash_hidden_save,
             dflash_hidden_save_rows,
             dflash_hidden_save_nseq,
+            // `build_model` installs the reserved store (`set_dflash_warm_store`).
+            dflash_warm_store: crate::layers::dflash_head::WarmCtxStore::disabled(),
             dflash_capture_layers,
             verify2_graph: Mutex::new(std::collections::HashMap::new()),
             verify3_graph: Mutex::new(std::collections::HashMap::new()),
@@ -775,12 +789,6 @@ impl TransformerModel {
             last_mtp_hidden_idx: std::sync::atomic::AtomicUsize::new(0),
             verify_row_masks: Default::default(),
             vision_encoder,
-            vision_embed_patches: Mutex::new(0),
-            vision_image_grids: Mutex::new(Vec::new()),
-            vision_row_base: Mutex::new(0),
-            vision_grid_base: Mutex::new(0),
-            vision_owned_images: Mutex::new(0),
-            vision_slice_rows: Mutex::new(0),
             pinned_staging,
             ssm_checkpoint_interval,
             ssm_state_norm_kernel: ssm_norm_k,

@@ -27,7 +27,7 @@ pub fn bf16_fixed_algo_description(n: u32, k: u32, ref_m: u32) -> Option<String>
 
 unsafe extern "C" {
     #[allow(clippy::too_many_arguments)]
-    fn cublasLtMatmulAlgoCheck(
+    pub(super) fn cublasLtMatmulAlgoCheck(
         handle: cublasLtHandle_t,
         desc: cublasLtMatmulDesc_t,
         a: cublasLtMatrixLayout_t,
@@ -41,15 +41,49 @@ unsafe extern "C" {
 
 /// Descriptor and layouts of `out[m, n] = act[m, k] @ weight[n, k]^T`;
 /// destroyed on drop.
-struct Problem {
-    desc: cublasLtMatmulDesc_t,
-    la: cublasLtMatrixLayout_t,
-    lb: cublasLtMatrixLayout_t,
-    ld: cublasLtMatrixLayout_t,
+pub(super) struct Problem {
+    pub(super) desc: cublasLtMatmulDesc_t,
+    pub(super) la: cublasLtMatrixLayout_t,
+    pub(super) lb: cublasLtMatrixLayout_t,
+    pub(super) ld: cublasLtMatrixLayout_t,
+}
+
+/// Operand types and scaling of a [`Problem`].
+#[derive(Clone, Copy)]
+pub(super) enum Operands {
+    /// BF16 x BF16.
+    Bf16,
+    /// E4M3 x E4M3, each with UE8M0 scales per 32 K values in cuBLASLt's
+    /// tiled layout (device pointers).
+    Mxfp8 { weight_sf: u64, act_sf: u64 },
+    /// E4M3 x E4M3, the weight with one f32 per 128 x 128 block
+    /// (`[n/128, k/128]`), the activation with one f32 per token and 128 K
+    /// values (VEC128, as `per_token_group_quant_fp8` writes them): block FP8
+    /// (DeepSeek / vLLM FP8_BLOCK_SCALES, ModelOpt FP8_PB_WO).
+    Blk128 { weight_sf: u64, act_sf: u64 },
+}
+
+impl Operands {
+    /// The kind, without the pointers (a cache key).
+    pub(super) fn kind(self) -> u8 {
+        match self {
+            Self::Bf16 => 0,
+            Self::Mxfp8 { .. } => 1,
+            Self::Blk128 { .. } => 2,
+        }
+    }
 }
 
 impl Problem {
     fn new(m: u32, n: u32, k: u32) -> Result<Self> {
+        Self::with(m, n, k, Operands::Bf16)
+    }
+
+    pub(super) fn with(m: u32, n: u32, k: u32, ops: Operands) -> Result<Self> {
+        let ab = match ops {
+            Operands::Bf16 => CUDA_R_16BF,
+            Operands::Mxfp8 { .. } | Operands::Blk128 { .. } => CUDA_R_8F_E4M3,
+        };
         let mut p = Problem {
             desc: std::ptr::null_mut(),
             la: std::ptr::null_mut(),
@@ -82,12 +116,57 @@ impl Problem {
                 ),
                 "TRANSB",
             )?;
+            let scaled = match ops {
+                Operands::Bf16 => None,
+                Operands::Mxfp8 { weight_sf, act_sf } => Some((
+                    SCALE_MODE_VEC32_UE8M0,
+                    SCALE_MODE_VEC32_UE8M0,
+                    weight_sf,
+                    act_sf,
+                )),
+                Operands::Blk128 { weight_sf, act_sf } => Some((
+                    SCALE_MODE_BLK128X128_32F,
+                    SCALE_MODE_VEC128_32F,
+                    weight_sf,
+                    act_sf,
+                )),
+            };
+            if let Some((a_mode, b_mode, weight_sf, act_sf)) = scaled {
+                for (attr, val, what) in [
+                    (
+                        DESC_A_SCALE_MODE,
+                        &a_mode as *const i32 as *const c_void,
+                        "A_SCALE_MODE",
+                    ),
+                    (
+                        DESC_B_SCALE_MODE,
+                        &b_mode as *const i32 as *const c_void,
+                        "B_SCALE_MODE",
+                    ),
+                ] {
+                    chk(cublasLtMatmulDescSetAttribute(p.desc, attr, val, 4), what)?;
+                }
+                for (attr, ptr, what) in [
+                    (DESC_A_SCALE_POINTER, &weight_sf, "A_SCALE_POINTER"),
+                    (DESC_B_SCALE_POINTER, &act_sf, "B_SCALE_POINTER"),
+                ] {
+                    chk(
+                        cublasLtMatmulDescSetAttribute(
+                            p.desc,
+                            attr,
+                            ptr as *const u64 as *const c_void,
+                            8,
+                        ),
+                        what,
+                    )?;
+                }
+            }
             chk(
-                cublasLtMatrixLayoutCreate(&mut p.la, CUDA_R_16BF, k as u64, n as u64, k as i64),
+                cublasLtMatrixLayoutCreate(&mut p.la, ab, k as u64, n as u64, k as i64),
                 "LayoutA",
             )?;
             chk(
-                cublasLtMatrixLayoutCreate(&mut p.lb, CUDA_R_16BF, k as u64, m as u64, k as i64),
+                cublasLtMatrixLayoutCreate(&mut p.lb, ab, k as u64, m as u64, k as i64),
                 "LayoutB",
             )?;
             chk(

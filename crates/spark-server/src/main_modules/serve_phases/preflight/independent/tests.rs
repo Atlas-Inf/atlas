@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use super::*;
+
+#[path = "qwen_mode_tests.rs"]
+mod qwen_modes;
 use clap::Parser;
 
 #[path = "long_context_tests.rs"]

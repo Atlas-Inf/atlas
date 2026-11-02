@@ -104,7 +104,7 @@ impl MoeLayer {
         self.btile_input_guard(input, 1, ctx, stream)?;
         // Expert TP slices the routed width, which the fused routed+shared
         // decode kernels assume equals the shared expert's; take the grouped path.
-        if self.routed_scales_released || ctx.config.expert_tp {
+        if self.routed_scales_released || self.grouped_only(ctx) {
             self.forward_prefill(input, 1, ctx, stream)?;
             return Ok((ctx.buffers.moe_output(), false));
         }
@@ -150,9 +150,12 @@ impl MoeLayer {
         }
 
         let output = ctx.buffers.moe_output();
-        // The shared expert's down output, kept until the EP reduce adds it.
-        let shared_out = ctx.buffers.attn_output();
+        // The shared expert's down output, kept until the EP reduce adds it
+        // (an MXFP8 one's partial on the side lane when it forked there).
+        let side = self.fork_mxfp8_shared(input, 1, ctx, stream)?;
+        let shared_out = side.unwrap_or(ctx.buffers.attn_output());
         self.forward_row_local(input, output, shared_out, single_seq_decode, ctx, stream)?;
+        self.end_mxfp8_shared_fork(ctx, stream)?;
         let posted = self.forward_ep_reduce(output, shared_out, input, 1, hc_post, ctx, stream)?;
 
         if tracing::enabled!(tracing::Level::DEBUG) && !ctx.graph_capture {
@@ -243,7 +246,7 @@ impl MoeLayer {
                 } else {
                     ops::dense_gemv(
                         ctx.gpu,
-                        self.dense_gemv,
+                        self.router_gemv,
                         router_in,
                         &self.weights.gate,
                         gate_logits,
@@ -430,11 +433,11 @@ impl MoeLayer {
         let shared_gate_scratch = ctx.buffers.logits();
         let shared_up_scratch = ctx.buffers.ssm_qkvz();
 
-        if let (Some(gp), Some(up), Some(dp), Some(shared)) = (
+        if let (Some(gp), Some(up), Some(dp), Some(SeparateSharedExpert::Bf16(shared))) = (
             self.bf16_gate_weight_ptrs,
             self.bf16_up_weight_ptrs,
             self.bf16_down_weight_ptrs,
-            self.bf16_shared_expert,
+            self.separate_shared_expert,
         ) {
             // BF16 path: FP8-dequant-on-load. Eliminates the per-layer 0.989
             // FP8 cosine ceiling by serving experts as BF16 end-to-end.
@@ -730,8 +733,8 @@ impl MoeLayer {
             )?;
         }
 
-        if self.has_mixed_bf16_shared_expert() {
-            self.run_bf16_shared_expert(
+        if self.has_separate_shared_expert() {
+            self.run_separate_shared_expert(
                 input,
                 1,
                 h,
@@ -740,6 +743,7 @@ impl MoeLayer {
                 shared_up_scratch,
                 shared_out,
                 ctx,
+                true,
                 stream,
             )?;
         }
@@ -776,7 +780,9 @@ impl MoeLayer {
         // times. Solution: pass NULL shared_out for EP, all-reduce the routed sum,
         // then add shared_out once after all-reduce.
         let is_ep = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
-        let shared_for_blend = if is_ep && !shared_out.is_null() {
+        // An MXFP8 shared expert's slice joins the blend under EP too: the
+        // all-reduce sums the partials with the routed sum.
+        let shared_for_blend = if is_ep && !shared_out.is_null() && !self.shared_joins_reduce() {
             // EP: exclude shared expert from blend (will add after all-reduce).
             self.ep_blend_zero_row(ctx, stream)?
         } else {
@@ -853,7 +859,7 @@ impl MoeLayer {
             // Using moe_batched_blend with num_tokens=1 computes the gate and blends correctly.
             // BUG #41 fix: previous code used residual_add (ignoring the gate), producing
             // wrong output that compounded across 48 layers into gibberish.
-            if !shared_out.is_null() {
+            if !shared_out.is_null() && !self.shared_joins_reduce() {
                 if self.weights.shared_expert_gate.weight.0 == 0 {
                     // No gate weight (e.g., Mistral): shared expert always at full strength.
                     ops::residual_add(

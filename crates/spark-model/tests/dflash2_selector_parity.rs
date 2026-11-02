@@ -81,7 +81,7 @@ struct Case {
 
 fn run_case(c: &Case) -> Result<()> {
     let (gpu, stream) = setup()?;
-    let kernel = gpu.kernel("dflash2_candidate_selector", "dflash2_candidate_selector")?;
+    let kernel = gpu.kernel("dflash2_candidate_selector", ops::DFLASH2_SELECTOR_SYMBOL)?;
     let mut rng = Rng(c.seed);
 
     // ── inputs ──────────────────────────────────────────────────────────

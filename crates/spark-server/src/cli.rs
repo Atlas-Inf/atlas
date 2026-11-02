@@ -12,6 +12,7 @@ pub mod bench_run;
 mod bench_selfstart;
 pub(crate) mod flag_values;
 mod serve_args;
+mod tool_guard_args;
 mod validate;
 pub use bench_args::BenchmarkArgs;
 pub use serve_args::{DEFAULT_DFLASH_GAMMA, DEFAULT_KV_CACHE_DTYPE, DEFAULT_NUM_DRAFTS, ServeArgs};
@@ -42,6 +43,9 @@ pub enum Command {
     Serve(ServeArgs),
     /// Run and inspect the benchmark suite, without the dashboard.
     Benchmark(BenchmarkArgs),
+    /// Run a command (`spark serve ...`) with the GB10 display carveout as
+    /// extra KV memory.
+    DisplayCarveout(crate::display_carveout::DisplayCarveoutArgs),
 }
 
 #[cfg(test)]

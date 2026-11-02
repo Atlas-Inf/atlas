@@ -103,3 +103,22 @@ fn an_impossible_overhead_is_refused() {
     // contain even one of them.
     assert!(check_proportional(plane, 3 * plane, 5 * plane, plane).is_none());
 }
+
+/// Qwen3-VL's nested form: each group costs plane + per-group text (the
+/// timestamp string and inner marker pair). (75, 132, 246) at plane 49:
+/// d21 = 57 = 49 + 8, so k=8, unit_groups=1, overhead = 75 - 57 = 18.
+#[test]
+fn a_qwen3vl_timestamped_group_resolves_with_its_text_overhead() {
+    let r = check_proportional(75, 132, 246, 49).expect("qwen3vl resolves");
+    assert_eq!(r.unit_groups, 1);
+    assert_eq!(r.per_group_text, 8);
+    assert_eq!(r.overhead, 18);
+}
+
+/// A step that fits no k in 0..=MAX_GROUP_TEXT is refused: 66 = 49 + 17 is
+/// one past the allowed per-group text, so no decomposition exists.
+#[test]
+fn a_step_beyond_the_per_group_text_bound_is_refused() {
+    let d21 = 49 + MAX_GROUP_TEXT + 1;
+    assert!(check_proportional(100, 100 + d21, 100 + 3 * d21, 49).is_none());
+}

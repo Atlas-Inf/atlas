@@ -48,7 +48,31 @@ pub(super) fn emit_span_row(
     rows: usize,
 ) {
     let position = think_commit::span_row_position(a.seq.seq_len, rows, row);
+    let prior = a.output_tokens.len();
     emit_token_at_position(a, tok, logprobs, sched, position);
+    // The final row is the target bonus. Earlier rows are accepted drafts.
+    if row + 1 < rows {
+        accepted_output(a, tok, prior);
+    }
+}
+
+/// Self-speculation emits its accepted drafts without a committed span index.
+pub(super) fn emit_accepted_token(
+    a: &mut ActiveSeq,
+    tok: u32,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+) {
+    let prior = a.output_tokens.len();
+    emit_token(a, tok, None, sched);
+    accepted_output(a, tok, prior);
+}
+
+fn accepted_output(a: &mut ActiveSeq, tok: u32, prior: usize) {
+    // Emission may suppress/pop the token, or append synthetic grammar closes.
+    // Count only this draft, only if it remains at its original output position.
+    if a.output_tokens.get(prior) == Some(&tok) {
+        a.mtp_acct.record_accepted_output(prior);
+    }
 }
 
 /// Emit one already-verified row after its whole target prefix was committed.
@@ -483,18 +507,36 @@ pub(super) fn strict_refusal(tok: u32, at: usize) -> String {
 /// prompt leaves the model inside `<think>`), and failing to arm one is
 /// reported to the client on `sink` as an invalid request (HTTP 400 when
 /// blocking) and returned as `Err`: its output must never come back
-/// unconstrained as if it were valid.
+/// unconstrained as if it were valid. One with a tool branch also learns the
+/// `native_opener` that can end reasoning as its first output token
+/// (`first_token_thinking::native_opener`).
 pub fn compile_grammar_state(
     engine: &mut Option<GrammarEngine>,
     grammar_spec: &Option<GrammarSpec>,
     eos_tokens: &[u32],
     opens_in_thinking: bool,
+    native_opener: Option<u32>,
+    tool_call_start_token: Option<u32>,
     sink: &mut ResponseSink,
 ) -> Result<Option<GrammarState>> {
     let Some(spec) = grammar_spec.as_ref() else {
         return Ok(None);
     };
     let strict = spec.is_response_format();
+    // Required tool grammars must not force their opener into an explicit
+    // reasoning preamble. Later decode already leaves thinking unmasked.
+    // GLM's native opener can end thinking and retains its existing path.
+    let defer_required_tool = opens_in_thinking
+        && native_opener.is_none()
+        && matches!(
+            spec,
+            GrammarSpec::ToolCall {
+                use_triggers: false,
+                ..
+            }
+        );
+    let native_opener =
+        native_opener.filter(|_| matches!(spec, GrammarSpec::ToolCallOrJson { .. }));
     let compiled = match engine.as_mut() {
         // Backstop: nothing a client sends may unwind the scheduler thread.
         Some(engine) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -505,7 +547,13 @@ pub fn compile_grammar_state(
         None => Ok(None),
     };
     match compiled {
-        Ok(state) if strict => Ok(state.map(|s| s.strict_output(opens_in_thinking))),
+        Ok(state) if strict => Ok(state.map(|s| {
+            s.strict_output(opens_in_thinking)
+                .with_native_opener(native_opener)
+        })),
+        Ok(state) if defer_required_tool => {
+            Ok(state.map(|s| s.defer_first_token(tool_call_start_token)))
+        }
         Ok(state) => Ok(state),
         // A request the server cannot serve as asked: HTTP 400 for a blocking
         // client, not a retryable 500. A tool grammar too large to compile is
@@ -566,6 +614,21 @@ fn compile_spec(
         },
         GrammarSpec::JsonObject => engine.compile_json_grammar(),
         GrammarSpec::JsonSchema { schema } => engine.compile_json_schema(schema),
+        GrammarSpec::ToolCallOrJson {
+            tools,
+            parser,
+            schema,
+        } => match engine.compile_tool_or_json_grammar(&**parser, tools, schema.as_deref()) {
+            Some(result) => result,
+            None => {
+                tracing::debug!(
+                    "Grammar: parser '{}' has no tool grammar; response_format + tools \
+                     decodes unconstrained",
+                    parser.name(),
+                );
+                return Ok(None);
+            }
+        },
     };
 
     let label = match spec {
@@ -574,16 +637,37 @@ fn compile_spec(
         }
         GrammarSpec::JsonObject => "response_format=json_object".to_string(),
         GrammarSpec::JsonSchema { .. } => "response_format=json_schema".to_string(),
+        GrammarSpec::ToolCallOrJson { parser, tools, .. } => format!(
+            "parser={}, tools={} OR response_format",
+            parser.name(),
+            tools.len()
+        ),
     };
 
     let grammar = compiled.map_err(|e| format!("Grammar compilation failed: {e}"))?;
+    let auto_literal_dispatch = matches!(
+        spec,
+        GrammarSpec::ToolCall {
+            use_triggers: true,
+            ..
+        }
+    );
     let state = GrammarState::new(&grammar, engine.vocab_size())
-        .map_err(|e| format!("Grammar state creation failed: {e}"))?;
+        .map_err(|e| format!("Grammar state creation failed: {e}"))?
+        .with_auto_literal_dispatch(auto_literal_dispatch);
     tracing::info!("Grammar constrained decoding active: {label}");
     // Exempt the model's stop/EOS tokens from grammar refusal so a legitimate
     // end-of-turn token cannot desync the NPDA and truncate the response
     // (see GrammarState::accept_token).
-    Ok(Some(state.with_stop_tokens(eos_tokens)))
+    let state = state.with_stop_tokens(eos_tokens);
+    // A union picks its branch by mass at its first token (`grammar::branch`).
+    let GrammarSpec::ToolCallOrJson { schema, .. } = spec else {
+        return Ok(Some(state));
+    };
+    let answer = engine
+        .json_start_mask(schema.as_deref())
+        .map_err(|e| format!("Grammar compilation failed: {e}"))?;
+    Ok(Some(state.with_answer_start(answer)))
 }
 
 /// Result of starting a chunked prefill.
@@ -625,8 +709,10 @@ pub enum StartPrefillResult {
 //  - `a.param_body_chars_emitted` ++ per non-close body token
 //  - `a.finished`                 forced when stuck >MAX_TOOL_BODY_TOKENS
 //
-// Token IDs are Qwen3.6 byte-level BPE (verified via /tokenize 2026-05-25):
-//   27 = `<`, 28 = `=`, 29 = `>`, 510 = `</`, 15704 = `parameter`.
+// Marker tokens are CLASSES of the served tokenizer (`tool_markers`), built at
+// load from decoded vocabulary text: `<` (leading whitespace allowed),
+// `parameter`, starts-with `=` (`=`, `=new`, `=file`), starts-with `>` (`>`,
+// `>\n`), ends-with `</` (`</`, `.</`). They used to be five exact Qwen3.6 ids.
 
 /// Cap on tool-call ENVELOPE tokens (everything inside `<tool_call>…</tool_call>`
 /// that is NOT a parameter-value body). Catches a model that opens `<tool_call>`
@@ -669,6 +755,20 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
     if !a.inside_tool_body {
         return;
     }
+    // Without the served tokenizer's markers the value body cannot be told
+    // from the envelope, and counting file content as envelope kills large
+    // writes at MAX_TOOL_BODY_TOKENS. Leave both the tracking and the cap off;
+    // `--tool-max-tokens` still bounds a runaway envelope.
+    let Some(m) = super::tool_markers::get() else {
+        return;
+    };
+    if let Some(inside) = m.native_value_transition(a.inside_parameter_body, tok) {
+        // A value opening or closing is forward progress.
+        a.inside_parameter_body = inside;
+        a.param_body_chars_emitted = 0;
+        a.tool_body_streak_tokens = 0;
+        return;
+    }
     // CC6 (2026-06-07): count ONLY envelope tokens — tokens of a
     // `<parameter=…>` VALUE (the file content of a `write` call) are exempt,
     // so a legitimately large single-file Write streams without tripping the
@@ -689,12 +789,14 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
         a.guard_stop = Some("tool_envelope_stuck");
         a.finished = true;
     }
-
-    const TOK_LT: u32 = 27;
-    const TOK_PARAMETER: u32 = 15704;
-    const TOK_EQ: u32 = 28;
-    const TOK_GT: u32 = 29;
-    const TOK_LT_SLASH: u32 = 510;
+    if m.has_native_values() {
+        // Native markers own value tracking; the `<parameter=` scan below
+        // would match unrelated tokens in this vocabulary.
+        if a.inside_parameter_body {
+            a.param_body_chars_emitted = a.param_body_chars_emitted.saturating_add(1);
+        }
+        return;
+    }
 
     if a.inside_parameter_body {
         // P0-1 (2026-07-09): PROVISIONAL close detection. The old code
@@ -713,7 +815,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
         // next exact close still exits.
         match a.param_close_pending {
             0 => {
-                if tok == TOK_LT_SLASH {
+                if m.is_lt_slash(tok) {
                     a.param_close_pending = 1;
                 } else {
                     // Any non-close body token advances the counter. The
@@ -724,7 +826,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
                 }
             }
             1 => {
-                if tok == TOK_PARAMETER {
+                if m.is_parameter(tok) {
                     a.param_close_pending = 2;
                 } else {
                     // `</` was value content (e.g. `</div>`), not a close.
@@ -734,7 +836,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
             }
             _ => {
                 a.param_close_pending = 0;
-                if tok == TOK_GT {
+                if m.is_gt(tok) {
                     // Confirmed `</parameter>` — exit body. Also reset the
                     // envelope streak: a confirmed close IS forward progress
                     // (the doc comment above always claimed this reset; the
@@ -756,7 +858,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
     // Not yet inside_parameter_body: scan for `<parameter=KEY>` opener
     // ending at this `>` (29). Lookback 8 tokens for `[27, 15704, 28]`
     // signature without an intervening close.
-    if tok != TOK_GT {
+    if !m.is_gt(tok) {
         return;
     }
     // Auto-detect whether `tok` is already in output_tokens (caller
@@ -776,7 +878,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
     let window = &a.output_tokens[start..n_for_lookback];
     let mut sig_idx: Option<usize> = None;
     for i in 0..window.len().saturating_sub(2) {
-        if window[i] == TOK_LT && window[i + 1] == TOK_PARAMETER && window[i + 2] == TOK_EQ {
+        if m.is_lt(window[i]) && m.is_parameter(window[i + 1]) && m.is_eq_start(window[i + 2]) {
             sig_idx = Some(i + 3);
         }
     }
@@ -784,9 +886,7 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
     // Check no intervening `</` or `>` in the KEY span between
     // `<parameter=` and the current `>`.
     let body_segment = &window[after_eq..];
-    let intervening_close = body_segment
-        .iter()
-        .any(|&t| t == TOK_LT_SLASH || t == TOK_GT);
+    let intervening_close = body_segment.iter().any(|&t| m.is_lt_slash(t) || m.is_gt(t));
     if !intervening_close {
         a.inside_parameter_body = true;
         a.param_body_chars_emitted = 0;

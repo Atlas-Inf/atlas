@@ -36,6 +36,58 @@ pub fn silu_mul(
         .launch(stream)
 }
 
+/// [`silu_mul`] through the GLM `moe_silu_mul_touch` twin: the same bytes,
+/// and during its PDL wait it asks `touch` (`rows` rows of `row_bytes`, and
+/// an f32 `[rows]` vector) into L2 for a launch that follows it.
+#[allow(clippy::too_many_arguments)]
+pub fn silu_mul_touch(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gate: DevicePtr,
+    up: DevicePtr,
+    output: DevicePtr,
+    num_elements: u32,
+    touch: (DevicePtr, DevicePtr, u32, u32),
+    stream: u64,
+) -> Result<()> {
+    let (rows_ptr, vector, rows, row_bytes) = touch;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(num_elements, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(gate)
+        .arg_ptr(up)
+        .arg_ptr(output)
+        .arg_u32(num_elements)
+        .arg_ptr(rows_ptr)
+        .arg_ptr(vector)
+        .arg_u32(rows)
+        .arg_u32(row_bytes)
+        .launch(stream)
+}
+
+/// SiLU·mul over a `[num_tokens, inter*2]` gate‖up layout — the first `inter`
+/// columns of each row are the gate, the next `inter` the up.
+///
+/// Kernel: `fused_silu_mul` (`dense_gemm_bf16.cu`), module `gemm`.
+pub fn fused_silu_mul(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gate_up: DevicePtr,
+    output: DevicePtr,
+    num_tokens: u32,
+    inter_size: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(num_tokens * inter_size / 2, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(gate_up)
+        .arg_ptr(output)
+        .arg_u32(num_tokens)
+        .arg_u32(inter_size)
+        .launch(stream)
+}
+
 /// Fused SiLU·mul + per-token-group(128) FP8-E4M3 quantization — replaces the
 /// `silu_mul` → `per_token_group_quant_fp8` pair on the W8A8 prefill down-path
 /// without materializing the BF16 intermediate. Bit-identical to the pair
@@ -101,6 +153,36 @@ pub fn silu_mul_quant_nvfp4(
         .arg_ptr(out_bf16)
         .arg_u32(m)
         .arg_u32(k)
+        .launch(stream)
+}
+
+/// [`silu_mul_quant_nvfp4`] over `m` rows sorted by expert (`expert_offsets`,
+/// `num_experts + 1` starts), each row under its expert's activation global
+/// scale `a2_gscale[e]` (`silu_mul_quant_nvfp4_by_expert`).
+#[allow(clippy::too_many_arguments)]
+pub fn silu_mul_quant_nvfp4_by_expert(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    [gate, up]: [DevicePtr; 2],
+    [packed_out, scale_out, out_bf16]: [DevicePtr; 3],
+    [m, k]: [u32; 2],
+    [expert_offsets, a2_gscale]: [DevicePtr; 2],
+    num_experts: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([m, 1, 1])
+        .block([128, 1, 1])
+        .arg_ptr(gate)
+        .arg_ptr(up)
+        .arg_ptr(packed_out)
+        .arg_ptr(scale_out)
+        .arg_ptr(out_bf16)
+        .arg_u32(m)
+        .arg_u32(k)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(a2_gscale)
+        .arg_u32(num_experts)
         .launch(stream)
 }
 

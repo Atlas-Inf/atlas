@@ -1,0 +1,126 @@
+{
+  "checked_at_utc": "2026-10-12T17:52:19.966149+00:00",
+  "scope": "Public record and local provenance audit. No contact, signature, repository edits, or claim to grant rights on behalf of other authors.",
+  "local_head": "d72505cb15c09a95ff6933342cefe432b039ca06",
+  "conclusion": "Public AGPL source and retained permissive device-kernel licenses are documented. No public Atlas CLA signature or explicit commercial-relicensing grant was found for Jason McCartney/data-angel in the checked records. This is an unresolved contribution-policy/rights clearance item, not proof that no private agreement exists.",
+  "atlas_required_grant": {
+    "url": "https://github.com/Atlas-Inf/atlas/blob/7ffd183f210708d5b1afba1e046049f14ad498c7/CLA.md",
+    "relevant_sections": [
+      "2: copyright sublicense/distribution and explicit commercial/proprietary relicensing",
+      "3: patent grant",
+      "5: authority and employer permission representations"
+    ],
+    "workflow_url": "https://github.com/Atlas-Inf/atlas/blob/7ffd183f210708d5b1afba1e046049f14ad498c7/.github/workflows/cla.yml"
+  },
+  "public_signature_record": {
+    "url": "https://github.com/Atlas-Inf/atlas/blob/508602415ac137174033bc560a999bec21952a02/signatures/version1/cla.json",
+    "branch_tip": "508602415ac137174033bc560a999bec21952a02",
+    "blob_sha": "d7f2b3c146391e4613ac60580ef128897f634828",
+    "signed_names": [
+      "andrew-vogulkin",
+      "AzeezIsh",
+      "Marker689",
+      "maplepaladin73",
+      "vcruz305"
+    ],
+    "searched_identities": [
+      "data-angel",
+      "jmacAJ",
+      "Enntity",
+      "Mango-kid"
+    ],
+    "matched_signatures": [],
+    "matched_main_allowlist": [],
+    "limitation": "Only public ledger and current workflow allowlist were inspected; private agreements cannot be excluded."
+  },
+  "jason_identity": {
+    "name": "Jason McCartney",
+    "github_login": "data-angel",
+    "github_id": 1806419,
+    "verified_via": "https://github.com/Enntity/atlas/commit/0b515eec96a9c6f637d60d9d910b18c7e7a6cb94"
+  },
+  "public_submission_evidence": {
+    "atlas_pr_author_searches": {
+      "data-angel": 0,
+      "jmacAJ": 0,
+      "Enntity": 0
+    },
+    "queries": [
+      "https://api.github.com/search/issues?q=repo:Atlas-Inf/atlas+is:pr+author:data-angel",
+      "https://api.github.com/search/issues?q=repo:Atlas-Inf/atlas+is:pr+author:jmacAJ",
+      "https://api.github.com/search/issues?q=repo:Atlas-Inf/atlas+is:pr+author:Enntity"
+    ],
+    "upstream_intent_comment": "https://github.com/Atlas-Inf/atlas/issues/59#issuecomment-5927563724",
+    "interpretation": "Comment announces preliminary fork support and eventual PR intent; it contains neither the CLA signing phrase nor an explicit additional commercial grant. A CLA document present in a fork is not evidence of signature.",
+    "enntity_cla_signature_branch_http_status": 404,
+    "enntity_pr_list_count": 0
+  },
+  "material_classes": [
+    {
+      "material": "Jason McCartney / Enntity Atlas engine and adapted native integration",
+      "license": "AGPL-3.0-only; some mixed AGPL-3.0-only AND MIT source",
+      "source_pin": "0b515eec96a9c6f637d60d9d910b18c7e7a6cb94",
+      "license_url": "https://github.com/Enntity/atlas/blob/0b515eec96a9c6f637d60d9d910b18c7e7a6cb94/LICENSE",
+      "local_evidence": [
+        "docs/glm-prior-art.md",
+        "docs/porting/GLM_5_3_FLASH_RC4.md",
+        "docs/porting/glm53-validation/rc4-import-map.json",
+        "third_party/glm_prefill/provenance.json"
+      ],
+      "unresolved": "Atlas-specific commercial-relicensing/CLA authority for imported author-owned contributions; preserving credits does not establish this additional grant."
+    },
+    {
+      "material": "MoonshotAI FlashKDA device headers",
+      "license": "MIT",
+      "source_pin": "1ce47ea3bb22c84eb9cc665028399cf35e8ffb0b",
+      "license_url": "https://github.com/MoonshotAI/FlashKDA/blob/1ce47ea3bb22c84eb9cc665028399cf35e8ffb0b/LICENSE",
+      "local_evidence": "crates/spark-runtime/cuda/glm_kda/vendor/provenance.json",
+      "finding": "Public permissive license explicitly permits sublicense/sale subject to retained notice; license and adapted-source provenance are retained. Distinct from rights in AGPL integration modifications."
+    },
+    {
+      "material": "NVIDIA sparse MLA SM120 device headers distributed through FlashInfer",
+      "license": "BSD-3-Clause",
+      "source_pin": "8eccd0c1352165302840c0e19066bc42d36dbd7a",
+      "license_url": "https://github.com/flashinfer-ai/flashinfer/blob/8eccd0c1352165302840c0e19066bc42d36dbd7a/include/flashinfer/attention/sparse_mla_sm120/prefill_kernel.cuh",
+      "verified_header_sha256": "d6ac1a639c0129d980283765a0619be9358d934d894c3cc5625cd96ecaa665ba",
+      "local_evidence": "third_party/nvidia_sparse_mla_sm120/provenance.json",
+      "finding": "Pinned upstream header retains NVIDIA BSD notice; public bytes match local inventory. Source/binary notice and non-endorsement requirements remain. Distinct from AGPL integration modifications."
+    },
+    {
+      "material": "knapcio EDGES/PRIOR table data",
+      "license": "MIT",
+      "source_pin": "d80f4fd",
+      "source_url": "https://github.com/knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4/blob/d80f4fd/overlay/glm_bav_table_seg.json",
+      "local_evidence": "docs/glm-prior-art.md",
+      "finding": "Local provenance retains MIT notice; this audit did not freshly verify full upstream table inventory."
+    },
+    {
+      "material": "Target/DFlash model weights",
+      "finding": "Not redistributed by this source PR; separate model terms and optional download decisions are not resolved by engine CLA or this audit."
+    }
+  ],
+  "action_required": "Before representing the entire import as covered by Atlas enterprise relicensing, obtain maintainer-recognized evidence from the actual rightsholder (CLA covering imported contributions, or explicit equivalent grant/accepted treatment). Reiner can attest only to rights he actually owns or is authorized to grant; do not substitute attribution or an AGPL repository link for this evidence.",
+  "latest_public_ledger_check": {
+    "checked_at_utc": "2026-10-14T16:27:09.675750+00:00",
+    "atlas_main": "7ffd183f210708d5b1afba1e046049f14ad498c7",
+    "branch_tip": "a3b7e2d69d14184e8d0640abc43cf5ced8dd3fb3",
+    "url": "https://github.com/Atlas-Inf/atlas/blob/a3b7e2d69d14184e8d0640abc43cf5ced8dd3fb3/signatures/version1/cla.json",
+    "blob_sha": "547f1ba322e63aba0acfcedcf3cc19f1807756c6",
+    "signed_names": [
+      "andrew-vogulkin",
+      "AzeezIsh",
+      "Marker689",
+      "maplepaladin73",
+      "vcruz305",
+      "AdamSWS"
+    ],
+    "searched_identities": [
+      "data-angel",
+      "jmacAJ",
+      "Enntity",
+      "Mango-kid"
+    ],
+    "matched_signatures": [],
+    "conclusion": "Ledger gained AdamSWS; no searched imported-contributor identity appears. Additional-rights conclusion unchanged; private agreements remain outside this public-record check."
+  }
+}

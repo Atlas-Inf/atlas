@@ -9,6 +9,7 @@ use super::*;
 /// prefill MoE.
 pub(crate) fn k5_grouped_moe_requested() -> bool {
     std::env::var("ATLAS_GLM_K5_GROUPED_MOE").as_deref() == Ok("1")
+        && !crate::layers::canonical_verify::enabled()
 }
 
 /// `ATLAS_GLM_K5_FUSED_MOE_HC=1`: on that grouped pass the shared expert is
@@ -18,6 +19,7 @@ pub(crate) fn k5_grouped_moe_requested() -> bool {
 /// half beside the other's whole.
 pub(crate) fn k5_fused_moe_hc_requested() -> bool {
     std::env::var("ATLAS_GLM_K5_FUSED_MOE_HC").as_deref() == Ok("1")
+        && !crate::layers::canonical_verify::enabled()
 }
 
 impl MoeLayer {
@@ -97,7 +99,9 @@ impl MoeLayer {
         // to E4M3 on chip for FP8 MMA; unlike NVFP4 MMQ, it does not quantize and
         // stage the verifier activations in FP4. This preserves acceptance while
         // amortizing routed weights across the verifier batch.
-        if self.use_btile_or_t_prefill() && k5_grouped_moe_requested() {
+        // Expert TP slices the routed width: only the grouped path serves it
+        // (as forward_k2 / forward_k3), with or without the K=5 switch.
+        if self.grouped_only(ctx) || (self.use_btile_or_t_prefill() && k5_grouped_moe_requested()) {
             self.forward_prefill(input, 5, ctx, stream)?;
             return Ok(ctx.buffers.moe_output());
         }
@@ -105,7 +109,7 @@ impl MoeLayer {
         let optimized = self.lora.is_none()
             && self.bf16_gate_weight_ptrs.is_none()
             && self.fp8_gate_weight_ptrs.is_none()
-            && !self.has_mixed_bf16_shared_expert()
+            && !self.has_separate_shared_expert()
             && matches!(
                 self.experts_scale_kind,
                 crate::weight_map::WeightQuantFormat::Nvfp4
@@ -196,10 +200,20 @@ impl MoeLayer {
                 h,
                 stream,
             )?;
+        } else if self.row_invariant_bf16_router {
+            self.wide_rows.dense_rows(
+                ctx.gpu,
+                self.dense_gemv_batchm,
+                router_in,
+                &self.weights.gate,
+                gate_logits,
+                (5, num_experts, h, num_experts),
+                stream,
+            )?;
         } else {
             ops::dense_gemm(
                 ctx.gpu,
-                self.dense_gemm,
+                self.router_gemm,
                 router_in,
                 &self.weights.gate,
                 gate_logits,

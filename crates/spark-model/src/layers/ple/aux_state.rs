@@ -202,6 +202,27 @@ impl PleLayer {
         // Dispatch on the PRESENCE OF THE SCALE, not a dtype flag: it keeps
         // "the bytes are E4M3" and "there is something to multiply by" from
         // being able to disagree.
+        if let Some(nv) = &self.nvfp4 {
+            // `PleLayer::new` checked the cache's stride against its layout.
+            let (scale_va, row_stride, scale_stride) =
+                nv.geom.gather_planes(table_va, self.block_scale_va);
+            return ops::batched_embed_nvfp4(
+                gpu,
+                self.embed_nvfp4_k,
+                self.slots_dev,
+                DevicePtr(table_va),
+                DevicePtr(scale_va),
+                nv.geom.global,
+                self.emb,
+                (num_tokens * heads) as u32,
+                nv.geom.dim as u32,
+                nv.geom.group as u32,
+                row_stride as u32,
+                scale_stride as u32,
+                stream,
+            )
+            .context("PLE row gather (nvfp4)");
+        }
         match self.scale_va {
             Some(scale) => ops::batched_embed_fp8(
                 gpu,

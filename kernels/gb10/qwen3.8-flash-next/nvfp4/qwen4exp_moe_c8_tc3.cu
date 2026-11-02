@@ -54,7 +54,8 @@ static_assert(C8_ROWS_MAX <= TC3_RMAX, "shared unit bucket");
 // units (gate pointer non-null, and the shared unit) before remote ones.
 extern "C" __global__ void __launch_bounds__(1024) qwen4exp_moe_c8_tc3_plan(
     const unsigned int* __restrict__ expert_indices, const unsigned long long* __restrict__ gate_packed_ptrs,
-    unsigned int* __restrict__ ws, unsigned int top_k, unsigned int rows
+    unsigned int* __restrict__ ws, unsigned int top_k, unsigned int rows,
+    unsigned int has_shared
 ) {
     constexpr unsigned NEXP = 512, NB = TC3_RMAX + 2;  // buckets: local 1..64 by n, 65 remote
     __shared__ unsigned s_cnt[NEXP], s_off[NEXP], s_bucket[NB], s_base[NB], s_wsum[16];
@@ -91,7 +92,7 @@ extern "C" __global__ void __launch_bounds__(1024) qwen4exp_moe_c8_tc3_plan(
     }
     __syncthreads();
     if (threadIdx.x < slots) ws[C8_WS_ROWS + s_off[e] + at] = threadIdx.x;
-    const bool is_e = threadIdx.x < NEXP, is_sh = threadIdx.x == NEXP;
+    const bool is_e = threadIdx.x < NEXP, is_sh = has_shared && threadIdx.x == NEXP;
     const unsigned total = is_e ? s_cnt[threadIdx.x] : 0u;
     const bool remote = is_e && total && gate_packed_ptrs[threadIdx.x] == 0;
     const auto bucket = [&](unsigned n) { return remote ? TC3_RMAX + 1 : n; };

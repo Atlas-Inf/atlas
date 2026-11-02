@@ -13,14 +13,18 @@ use super::*;
 impl MoeLayer {
     /// Unpermute this chunk into `ptrs[1]` and reduce-scatter it, the peer's
     /// window first. `ptrs` = [expert_down_out, output, token_to_perm,
-    /// topk_ids, topk_weights]; `dims` = [hidden, top_k]. `Ok(false)`: not
-    /// taken (switch off, the q38 unpermute does not serve, or the pair cannot
-    /// pipeline); nothing was launched.
+    /// topk_ids, topk_weights]; `dims` = [hidden, top_k]. With `blend` (the
+    /// MoE input), each row range also takes its shared-expert partial from
+    /// `attn_output` (`moe_batched_blend`, a block per row) before it leaves.
+    /// `Ok(false)`: not taken (switch off, the q38 unpermute does not serve,
+    /// or the pair cannot pipeline); nothing was launched.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn q38_unpermute_reduce_scatter(
         &self,
         sp: crate::layers::glm_sp::SpRows,
         ptrs: [DevicePtr; 5],
         dims: [u32; 2],
+        blend: Option<DevicePtr>,
         ctx: &ForwardContext,
         stream: u64,
         on_wire: impl FnOnce(u64) -> Result<()>,
@@ -49,7 +53,21 @@ impl MoeLayer {
                     s,
                 )?;
                 anyhow::ensure!(served, "q38 unpermute refused a row range it served");
-                Ok(())
+                let Some(input) = blend else {
+                    return Ok(());
+                };
+                let row = r0 * hidden as usize * 2;
+                ops::moe_batched_blend(
+                    ctx.gpu,
+                    self.moe_batched_blend,
+                    output.offset(row),
+                    ctx.buffers.attn_output().offset(row),
+                    input.offset(row),
+                    self.weights.shared_expert_gate.weight,
+                    hidden,
+                    n as u32,
+                    s,
+                )
             },
             on_wire,
         )

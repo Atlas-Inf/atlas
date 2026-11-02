@@ -21,6 +21,20 @@
 //! This file holds the record format and the synchronous path (one `pwrite`
 //! per record, one small copy per region per block). `ATLAS_GLM_NVME_FAST=1`
 //! moves the SAME records through `nvme_fast.rs` instead.
+//!
+//! **Latent shard** (`ATLAS_GLM_KV_SHARD=1`, `latent_shard.rs`): this rank
+//! stores only the latents of the blocks whose id residue is its rank, at
+//! local slot `b / world`; the index pools stay full. The tree splits its
+//! record slots into one class per residue (`NvmePrefixTier::enable_classes`;
+//! slot `s` holds a block with `b % world == s % world`, which is the block's
+//! logical index residue on every rank), and the cache keeps one LANE — one
+//! record store, layout and staging — per class:
+//!
+//! * own class (`class == rank`): the record above, K read at the local slot;
+//! * peer class: the index regions only (the peer spills the latents).
+//!
+//! A lane addresses its store by `slot / world`. Unsharded there is one lane
+//! of class 0 and every record and address is what it always was.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,9 +44,9 @@ use atlas_tier::ConcurrentSwapStore;
 
 use super::PagedKvCache;
 use super::nvme_fast::{self, FastIo};
-use super::nvme_sync::{read_batch, write_batch};
+use super::nvme_lanes::NvmeGeometry;
 use crate::gpu::{DevicePtr, GpuBackend};
-use crate::prefix_cache::{DiskRef, SpillOrder};
+use crate::prefix_cache::SpillOrder;
 
 /// Spill writes that failed (process-wide), for throttled logging.
 static WRITE_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -41,18 +55,37 @@ const MAGIC: u64 = u64::from_le_bytes(*b"ATLKVNV1");
 const TRAILER: usize = 3 * std::mem::size_of::<u64>();
 const RECORD_ALIGN: usize = 4096;
 /// Records staged per gather/scatter round (one stream sync per round).
-const STAGING_RECORDS: usize = 32;
+pub(super) const STAGING_RECORDS: usize = 32;
 
-/// One per-block device region: block `b` lives at `base + b·stride`.
+/// One per-block device region: block `b` lives at `base + (b / div)·stride`
+/// (`div` = the shard's world for a latent pool that holds only this rank's
+/// blocks at their local slots, else 1).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Segment {
     pub(super) base: DevicePtr,
     pub(super) stride: usize,
+    pub(super) div: usize,
+}
+
+impl Segment {
+    /// Where `block`'s bytes of this region live.
+    pub(super) fn at(&self, block: u32) -> DevicePtr {
+        self.base.offset(block as usize / self.div * self.stride)
+    }
+
+    /// Device bytes between two blocks `step` ids apart (a lane's blocks
+    /// share one residue mod `step`).
+    pub(super) fn pitch(&self, step: usize) -> usize {
+        step / self.div * self.stride
+    }
 }
 
 pub(super) struct NvmeSpill {
     pub(super) store: Arc<dyn ConcurrentSwapStore>,
     pub(super) segments: Vec<Segment>,
+    /// Block-id distance between neighbours of this lane: 1, or the shard's
+    /// world (a lane's blocks share one residue).
+    pub(super) step: usize,
     pub(super) payload: usize,
     pub(super) record: usize,
     pub(super) staging: *mut u8,
@@ -60,7 +93,7 @@ pub(super) struct NvmeSpill {
     /// `ATLAS_GLM_NVME_FAST`: write-behind / pipelined I/O over the staging
     /// ring. `None` = the synchronous path below.
     pub(super) fast: Option<FastIo>,
-    io: NvmeIoStats,
+    pub(super) io: NvmeIoStats,
 }
 
 /// What the tier's I/O has cost the SERVING thread so far, and how
@@ -88,6 +121,20 @@ pub struct NvmeIoStats {
 }
 
 impl NvmeIoStats {
+    /// Two lanes' counters together.
+    fn plus(self, other: Self) -> Self {
+        Self {
+            fast: self.fast,
+            spilled_blocks: self.spilled_blocks + other.spilled_blocks,
+            spill_micros: self.spill_micros + other.spill_micros,
+            spill_wait_micros: self.spill_wait_micros + other.spill_wait_micros,
+            flush_micros: self.flush_micros + other.flush_micros,
+            restored_blocks: self.restored_blocks + other.restored_blocks,
+            gather_runs: self.gather_runs + other.gather_runs,
+            scatter_runs: self.scatter_runs + other.scatter_runs,
+        }
+    }
+
     /// What was added since `earlier` (an older reading of the same cache).
     pub fn since(self, earlier: Self) -> Self {
         Self {
@@ -171,28 +218,69 @@ impl NvmeSpill {
     }
 }
 
+fn record_for(payload: usize) -> usize {
+    (payload + TRAILER).next_multiple_of(RECORD_ALIGN)
+}
+
 impl PagedKvCache {
-    fn nvme_segments(&self) -> Vec<Segment> {
+    /// The regions of slot class `class`'s records, in record order (see the
+    /// module docs): every region unsharded; under a latent shard the latent
+    /// pool (at local slots) only in this rank's own class.
+    fn nvme_segments(&self, class: usize) -> Vec<Segment> {
+        let (own, div) = match &self.latent_shard {
+            Some(shard) => (class == shard.spec.rank, shard.spec.world),
+            None => (true, 1),
+        };
         let mut segs = Vec::new();
         for l in &self.layers {
-            let mut push = |base: DevicePtr, stride: usize| {
+            let mut push = |base: DevicePtr, stride: usize, div: usize| {
                 if !base.is_null() && stride > 0 {
-                    segs.push(Segment { base, stride });
+                    segs.push(Segment { base, stride, div });
                 }
             };
-            push(l.k_pool, l.k_block_stride);
-            push(l.owned_v_pool(), l.v_block_stride);
-            push(l.sparse_index_values, l.sparse_index_values_block_stride);
-            push(l.sparse_index_scales, l.sparse_index_scales_block_stride);
+            if own {
+                push(l.k_pool, l.k_block_stride, div);
+                push(l.owned_v_pool(), l.v_block_stride, div);
+            }
+            push(l.sparse_index_values, l.sparse_index_values_block_stride, 1);
+            push(l.sparse_index_scales, l.sparse_index_scales_block_stride, 1);
         }
         segs
     }
 
-    /// Bytes of one spill record for this cache's current layout (attach the
-    /// sparse index FIRST). Size the store's records with this.
+    /// Slot classes, one record lane each: 1, or the latent shard's world.
+    pub fn nvme_classes(&self) -> usize {
+        self.latent_shard.map_or(1, |s| s.spec.world)
+    }
+
+    /// Bytes of one spill record of slot class `class` for this cache's
+    /// current layout (attach the sparse index FIRST). Size that class's
+    /// store with this.
+    pub fn nvme_class_record_bytes(&self, class: usize) -> usize {
+        record_for(self.nvme_segments(class).iter().map(|s| s.stride).sum())
+    }
+
+    /// [`Self::nvme_class_record_bytes`] of a block whose latents this rank
+    /// stores (every block unsharded).
     pub fn nvme_record_bytes(&self) -> usize {
-        let payload: usize = self.nvme_segments().iter().map(|s| s.stride).sum();
-        (payload + TRAILER).next_multiple_of(RECORD_ALIGN)
+        self.nvme_class_record_bytes(self.latent_shard.map_or(0, |s| s.spec.rank))
+    }
+
+    /// Disk bytes per restored or spilled block, averaged over the classes
+    /// (a latent shard's blocks alternate between them): for throughput logs.
+    pub fn nvme_block_record_bytes(&self) -> usize {
+        let g = self.nvme_geometry();
+        g.row_bytes() / g.classes()
+    }
+
+    /// Every class's record size (see [`NvmeGeometry`]).
+    pub fn nvme_geometry(&self) -> NvmeGeometry {
+        NvmeGeometry {
+            own: self.nvme_record_bytes(),
+            peer: self
+                .latent_shard
+                .map(|s| self.nvme_class_record_bytes((s.spec.rank + 1) % s.spec.world)),
+        }
     }
 
     /// [`Self::nvme_record_bytes`] for a cache that is not built yet: KV
@@ -202,6 +290,17 @@ impl PagedKvCache {
         v_aliases_k: bool,
         index: Option<super::SparseIndexCacheConfig>,
     ) -> usize {
+        Self::nvme_geometry_for(config, v_aliases_k, index, false).own
+    }
+
+    /// [`Self::nvme_geometry`] for a cache that is not built yet,
+    /// `latent_sharded` over a pair or not.
+    pub fn nvme_geometry_for(
+        config: &super::KvCacheConfig,
+        v_aliases_k: bool,
+        index: Option<super::SparseIndexCacheConfig>,
+        latent_sharded: bool,
+    ) -> NvmeGeometry {
         let bs = config.block_size;
         let index = index.map_or(0, |i| i.values_block_bytes(bs) + i.scales_block_bytes(bs));
         let payload: usize = (0..config.num_layers)
@@ -214,7 +313,10 @@ impl PagedKvCache {
                 config.k_block_bytes_for_layer(l) + v + index
             })
             .sum();
-        (payload + TRAILER).next_multiple_of(RECORD_ALIGN)
+        NvmeGeometry {
+            own: record_for(payload),
+            peer: latent_sharded.then(|| record_for(config.num_layers * index)),
+        }
     }
 
     /// Pinned staging the tier allocates for a record of `record` bytes.
@@ -227,8 +329,10 @@ impl PagedKvCache {
         record * records
     }
 
-    /// Attach the spill store (records of [`Self::nvme_record_bytes`]) on the
-    /// synchronous path.
+    /// Attach the spill store of the next slot class (records of
+    /// [`Self::nvme_class_record_bytes`]; unsharded, the one class's
+    /// [`Self::nvme_record_bytes`]) on the synchronous path. A latent-sharded
+    /// cache takes one store per class, in class order.
     pub fn attach_nvme_spill(
         &mut self,
         store: Box<dyn atlas_tier::SwapStore>,
@@ -238,7 +342,8 @@ impl PagedKvCache {
     }
 
     /// Attach a store that takes concurrent requests, on the fast path
-    /// (`nvme_fast.rs`: pitched copies, run-sized I/O, write-behind).
+    /// (`nvme_fast.rs`: pitched copies, run-sized I/O, write-behind), for the
+    /// next slot class as [`Self::attach_nvme_spill`].
     pub fn attach_nvme_fast(
         &mut self,
         store: Arc<dyn ConcurrentSwapStore>,
@@ -253,18 +358,31 @@ impl PagedKvCache {
         gpu: &dyn GpuBackend,
         fast: bool,
     ) -> Result<()> {
-        ensure!(self.nvme.is_none(), "NVMe spill store already attached");
+        let class = self.nvme.len();
+        ensure!(
+            class < self.nvme_classes(),
+            "NVMe spill store already attached"
+        );
+        ensure!(
+            self.nvme
+                .first()
+                .is_none_or(|lane| lane.fast.is_some() == fast),
+            "NVMe spill tier: every slot class must use the same I/O path"
+        );
         ensure!(
             self.config.cache_blocks_per_seq.is_none(),
             "the NVMe prefix spill tier cannot be combined with --high-speed-swap"
         );
-        let segments = self.nvme_segments();
+        let segments = self.nvme_segments(class);
         let payload: usize = segments.iter().map(|s| s.stride).sum();
-        let record = self.nvme_record_bytes();
-        ensure!(payload > 0, "KV cache has no per-block regions to spill");
+        let record = self.nvme_class_record_bytes(class);
+        ensure!(
+            payload > 0 || class != self.latent_shard.map_or(0, |s| s.spec.rank),
+            "KV cache has no per-block regions to spill"
+        );
         if store.record_bytes() != record {
             bail!(
-                "NVMe spill store record size {} != KV record size {record}",
+                "NVMe spill store record size {} != KV record size {record} (slot class {class})",
                 store.record_bytes()
             );
         }
@@ -280,6 +398,7 @@ impl PagedKvCache {
         let mut spill = NvmeSpill {
             store,
             segments,
+            step: self.nvme_classes(),
             payload,
             record,
             staging,
@@ -299,125 +418,47 @@ impl PagedKvCache {
                 }
             }
         }
-        self.nvme = Some(spill);
+        self.nvme.push(spill);
         Ok(())
     }
 
     pub fn nvme_io_stats(&self) -> NvmeIoStats {
-        self.nvme
-            .as_ref()
-            .map_or_else(NvmeIoStats::default, |s| s.io)
+        let mut lanes = self.nvme.iter().map(|s| s.io);
+        let first = lanes.next().unwrap_or_default();
+        lanes.fold(first, NvmeIoStats::plus)
     }
 
     /// Spill writes that failed since the last report (fast path: a write
     /// fails after `nvme_write` returned). The tree must drop those nodes.
     pub fn nvme_take_failed(&mut self) -> Vec<SpillOrder> {
-        let fast = self.nvme.as_mut().and_then(|s| s.fast.as_mut());
-        fast.map_or_else(Vec::new, FastIo::take_failed)
+        let classes = self.nvme.len() as u32;
+        let mut failed = Vec::new();
+        for (class, lane) in self.nvme.iter_mut().enumerate() {
+            if let Some(fast) = lane.fast.as_mut() {
+                let lost = fast.take_failed();
+                failed.extend(lost.into_iter().map(|o| SpillOrder {
+                    slot: o.slot * classes + class as u32,
+                    ..o
+                }));
+            }
+        }
+        failed
     }
 
+    /// Every slot class has its store.
     pub fn nvme_attached(&self) -> bool {
-        self.nvme.is_some()
+        !self.nvme.is_empty() && self.nvme.len() == self.nvme_classes()
     }
 
     /// Prefix-cache blocks to evict per allocation miss: one without the
     /// tier (unchanged); a staging batch with it, so a spill pays its two
     /// stream syncs once per batch instead of once per block.
     pub fn evict_batch(&self) -> usize {
-        if self.nvme.is_some() {
+        if !self.nvme.is_empty() {
             STAGING_RECORDS
         } else {
             1
         }
-    }
-
-    /// Write each order's block to its record. Must run BEFORE the blocks go
-    /// back to the free list. Returns the orders that did NOT reach disk (the
-    /// tree must drop those nodes). Work in flight on EVERY stream is drained
-    /// first (a device-wide sync); cached blocks are complete and never
-    /// rewritten after that.
-    pub fn nvme_write(
-        &mut self,
-        orders: &[SpillOrder],
-        gpu: &dyn GpuBackend,
-        stream: u64,
-    ) -> Vec<SpillOrder> {
-        let Some(mut spill) = self.nvme.take() else {
-            return orders.to_vec();
-        };
-        let t0 = std::time::Instant::now();
-        let mut failed = Vec::new();
-        let mut io = spill.io;
-        if let Some(mut fast) = spill.fast.take() {
-            failed = nvme_fast::write(&spill, (&mut fast, &mut io), orders, gpu, stream);
-            spill.fast = Some(fast);
-        } else {
-            io.gather_runs += orders.len() as u64;
-            for batch in orders.chunks(STAGING_RECORDS) {
-                if let Err(e) = write_batch(&mut spill, batch, gpu, stream, &mut failed) {
-                    // Nothing of this batch reached disk (writes follow the gather).
-                    tracing::warn!("NVMe KV spill: gather failed ({e:#}); dropping batch");
-                    failed.extend_from_slice(batch);
-                }
-            }
-        }
-        io.spilled_blocks += orders.len() as u64;
-        io.spill_micros += t0.elapsed().as_micros() as u64;
-        spill.io = io;
-        self.nvme = Some(spill);
-        failed
-    }
-
-    /// Read `disk[i]` into freshly allocated `blocks[i]` (in order), verifying
-    /// every trailer. Returns how many leading blocks hold verified bytes and
-    /// whether the next one FAILED (I/O error or bad record) — as opposed to
-    /// simply not being attempted. Scatter completes before returning. The
-    /// fast path re-orders `blocks` (ascending) before pairing them up.
-    pub fn nvme_read(
-        &mut self,
-        disk: &[DiskRef],
-        blocks: &mut [u32],
-        gpu: &dyn GpuBackend,
-        stream: u64,
-    ) -> (usize, bool) {
-        let Some(mut spill) = self.nvme.take() else {
-            return (0, false);
-        };
-        let mut io = spill.io;
-        if let Some(mut fast) = spill.fast.take() {
-            let r = nvme_fast::read(&spill, (&mut fast, &mut io), disk, blocks, gpu, stream);
-            io.restored_blocks += r.0 as u64;
-            spill.fast = Some(fast);
-            spill.io = io;
-            self.nvme = Some(spill);
-            return r;
-        }
-        let n = disk.len().min(blocks.len());
-        let mut done = 0;
-        let mut failed = false;
-        while done < n && !failed {
-            let end = (done + STAGING_RECORDS).min(n);
-            match read_batch(
-                &mut spill,
-                &disk[done..end],
-                &blocks[done..end],
-                gpu,
-                stream,
-            ) {
-                Ok(k) => {
-                    failed = k < end - done;
-                    done += k;
-                }
-                Err(e) => {
-                    tracing::warn!("NVMe KV restore: scatter failed ({e:#})");
-                    failed = true;
-                }
-            }
-        }
-        spill.io.restored_blocks += done as u64;
-        spill.io.scatter_runs += done as u64;
-        self.nvme = Some(spill);
-        (done, failed)
     }
 }
 

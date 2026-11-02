@@ -87,7 +87,7 @@ impl MoeLayer {
             fp8_cache: self.shared_gate_fp8.is_some()
                 || self.shared_up_fp8.is_some()
                 || self.shared_down_fp8.is_some(),
-            bf16_override: self.bf16_shared_expert.is_some(),
+            bf16_override: self.separate_shared_expert.is_some(),
             // Hook is after the earlier exact-M5 GEMV arm returned.
             exact_gemv: false,
         };

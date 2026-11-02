@@ -8,6 +8,35 @@
 
 use super::*;
 
+/// Whether the unified transposes run in place (`ATLAS_MOE_INPLACE_TRANSPOSE`,
+/// default on). In place keeps every expert's original allocation, which on
+/// GB10 costs kernel slab per live allocation (about 1.5 GB of unreclaimable
+/// slab for GLM-5.3-Flash's experts, all of it out of the KV pool); `0` takes
+/// the consolidated path: one transposed slab per projection and layer, the
+/// per-expert originals freed.
+pub(super) fn enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse(std::env::var("ATLAS_MOE_INPLACE_TRANSPOSE").ok().as_deref()))
+}
+
+fn parse(raw: Option<&str>) -> bool {
+    !matches!(raw, Some("0" | "false"))
+}
+
+#[cfg(test)]
+#[test]
+fn inplace_is_the_default_and_zero_or_false_consolidates() {
+    for (raw, inplace) in [
+        (None, true),
+        (Some("1"), true),
+        (Some(""), true),
+        (Some("0"), false),
+        (Some("false"), false),
+    ] {
+        assert_eq!(parse(raw), inplace, "{raw:?}");
+    }
+}
+
 /// Grow-only pair of device buffers used as the transpose destination.
 /// Allocated at most once per needed size for the whole pass.
 pub(super) struct TransposeScratch {

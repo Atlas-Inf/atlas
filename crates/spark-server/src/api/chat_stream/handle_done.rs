@@ -6,8 +6,8 @@
 use crate::ir::StreamDelta;
 use crate::tool_parser;
 
-use super::super::sanitizer::sanitize_content_chunk;
-use super::super::stream_guards::flush_content_sanitizer;
+use super::super::sanitizer::sanitize_content_chunk_with_literal_state;
+use super::super::stream_guards::flush_content_sanitizer_with_literal_state;
 use super::ctx::StreamCtx;
 use super::state::StreamState;
 use super::tool_handlers::{
@@ -49,12 +49,29 @@ pub(super) fn handle_done(
         response_tokens_per_second: tps,
     };
 
+    // A truncated native call must never be salvaged into an executable call.
+    if ctx.state.tool_guard.enabled
+        && !state.buffered_tool_chunks.is_empty()
+        && state.guard_stop.is_none()
+        && !state.stop_string_triggered
+    {
+        super::tool_security::reject(state, atlas_tool_guard::BlockReason::IncompleteCall);
+    }
     let (deltas, fr) = finalization::finalize_done(
         state,
         &finish_reason,
         usage,
         ctx.req_return_token_ids,
-        |state| flush_pending_output(state, ctx),
+        |state| {
+            let deltas = flush_pending_output(state, ctx);
+            if ctx.state.tool_guard.enabled
+                && !state.stop_string_triggered
+                && !state.buffered_tool_chunks.is_empty()
+            {
+                super::tool_security::reject(state, atlas_tool_guard::BlockReason::IncompleteCall);
+            }
+            deltas
+        },
     );
 
     // Metrics. (REQUESTS_ACTIVE is released by the ActiveRequestGuard in
@@ -126,9 +143,10 @@ fn flush_pending_output(state: &mut StreamState, ctx: &StreamCtx) -> DeltaVec {
     // channel instead of losing it or treating it as final answer content.
     // finalize_done skips this entire flush for rejected output.
     if ctx.enable_thinking && !state.reasoning_xml_leak_detected {
-        let tail = flush_content_sanitizer(
+        let tail = flush_content_sanitizer_with_literal_state(
             &mut state.reasoning_tag_scan_buf,
             &mut state.reasoning_suppressing_leak,
+            &mut state.reasoning_literal_xml_state,
             &ctx.leak_markers,
         );
         if !tail.is_empty() {
@@ -161,11 +179,12 @@ fn flush_pending_output(state: &mut StreamState, ctx: &StreamCtx) -> DeltaVec {
                 for output in outputs {
                     match output {
                         tool_parser::DetectorOutput::Content(text) => {
-                            let sanitized = sanitize_content_chunk(
+                            let sanitized = sanitize_content_chunk_with_literal_state(
                                 &text,
                                 &mut state.tag_scan_buf,
                                 &mut state.suppressing_param_leak,
                                 &mut state.inside_envelope,
+                                &mut state.literal_xml_state,
                                 &ctx.leak_markers,
                             );
                             if !sanitized.is_empty() {
@@ -192,16 +211,17 @@ fn flush_pending_output(state: &mut StreamState, ctx: &StreamCtx) -> DeltaVec {
                             handle_tool_call_args_fragment(state, ctx, fragment, idx, &mut deltas);
                         }
                         tool_parser::DetectorOutput::ToolCallEnd { idx } => {
-                            handle_tool_call_end(state, ctx, idx);
+                            handle_tool_call_end(state, ctx, idx, &mut deltas);
                         }
                     }
                 }
             } else {
-                let sanitized = sanitize_content_chunk(
+                let sanitized = sanitize_content_chunk_with_literal_state(
                     &tail,
                     &mut state.tag_scan_buf,
                     &mut state.suppressing_param_leak,
                     &mut state.inside_envelope,
+                    &mut state.literal_xml_state,
                     &ctx.leak_markers,
                 );
                 if !sanitized.is_empty() {
@@ -226,11 +246,12 @@ fn flush_pending_output(state: &mut StreamState, ctx: &StreamCtx) -> DeltaVec {
         for output in outputs {
             match output {
                 tool_parser::DetectorOutput::Content(text) => {
-                    let sanitized = sanitize_content_chunk(
+                    let sanitized = sanitize_content_chunk_with_literal_state(
                         &text,
                         &mut state.tag_scan_buf,
                         &mut state.suppressing_param_leak,
                         &mut state.inside_envelope,
+                        &mut state.literal_xml_state,
                         &ctx.leak_markers,
                     );
                     if !sanitized.is_empty() {
@@ -257,16 +278,17 @@ fn flush_pending_output(state: &mut StreamState, ctx: &StreamCtx) -> DeltaVec {
                     handle_tool_call_args_fragment(state, ctx, fragment, idx, &mut deltas);
                 }
                 tool_parser::DetectorOutput::ToolCallEnd { idx } => {
-                    handle_tool_call_end(state, ctx, idx);
+                    handle_tool_call_end(state, ctx, idx, &mut deltas);
                 }
             }
         }
     }
 
     // ── Sanitizer tail flush ────────────────────────────────────────
-    let tail = flush_content_sanitizer(
+    let tail = flush_content_sanitizer_with_literal_state(
         &mut state.tag_scan_buf,
         &mut state.suppressing_param_leak,
+        &mut state.literal_xml_state,
         &ctx.leak_markers,
     );
     if !tail.is_empty() {
@@ -332,7 +354,9 @@ fn resolve_wire_finish_reason<'a>(
     stop_string_matched: bool,
     stream_guard_stop: Option<&'static str>,
 ) -> &'a str {
-    if scheduler_reason == crate::ir::FINISH_REASON_TIMEOUT {
+    if stream_guard_stop == Some(atlas_tool_guard::GUARD_STOP) {
+        "content_filter"
+    } else if scheduler_reason == crate::ir::FINISH_REASON_TIMEOUT {
         scheduler_reason
     } else if tool_loop_capped {
         "length"

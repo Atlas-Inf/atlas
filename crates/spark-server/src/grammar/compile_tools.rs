@@ -706,14 +706,37 @@ impl GrammarEngine {
     /// Compile Laguna's native Poolside v1 tool-call grammar.
     ///
     /// Format: `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`.
-    /// The shared short trigger locks decoding as soon as the model commits to
-    /// `<tool_call>`, preventing malformed or repeated tag fragments while
-    /// preserving ordinary free text in automatic tool-choice mode.
+    /// Automatic tool choice uses the complete per-tool opener as its trigger.
+    /// A shared `<tool_call>` trigger would claim that marker when it appears
+    /// inside ordinary prose or code, before the tool name proves intent.
+    /// A forced call (`use_triggers=false`) also decodes `enum`/`const`
+    /// values from their set (`poolside_values`); should that grammar not
+    /// compile, the call keeps the open value grammar rather than failing.
     pub fn compile_poolside_v1_tool_grammar(
         &mut self,
         tools: &[ToolDefinition],
         use_triggers: bool,
         value_close: &str,
+    ) -> Result<CompiledGrammar, GrammarError> {
+        if !use_triggers {
+            match self.compile_poolside_v1_grammar(tools, false, value_close, true) {
+                Err(GrammarError::NoTools) => return Err(GrammarError::NoTools),
+                Err(error) => tracing::warn!(
+                    "Poolside closed argument values did not compile ({error}); \
+                     the forced call keeps open values"
+                ),
+                compiled => return compiled,
+            }
+        }
+        self.compile_poolside_v1_grammar(tools, use_triggers, value_close, false)
+    }
+
+    fn compile_poolside_v1_grammar(
+        &mut self,
+        tools: &[ToolDefinition],
+        use_triggers: bool,
+        value_close: &str,
+        closed_values: bool,
     ) -> Result<CompiledGrammar, GrammarError> {
         if tools.is_empty() {
             return Err(GrammarError::NoTools);
@@ -754,23 +777,45 @@ impl GrammarEngine {
                 _ => "paramname ::= [a-zA-Z_] [a-zA-Z_0-9]*".to_string(),
             };
             let value_ladder = ebnf_until_close_ladder(value_close);
+            let pair_rules = param_names
+                .as_deref()
+                .filter(|_| closed_values)
+                .and_then(|names| {
+                    super::poolside_values::closed_pair_rules(&schema, names, value_close)
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "pair_body ::= paramname \"</arg_key><arg_value>\" value \"{value_close}\"\n\
+                         {paramname_rule}"
+                    )
+                });
             let content = if has_no_parameters {
                 serde_json::json!({"type": "const_string", "value": ""})
             } else {
                 let body_ebnf = format!(
-                    "root ::= pair pair*\n\
-                     pair ::= \"<arg_key>\" paramname \"</arg_key><arg_value>\" value \"{value_close}\"\n\
-                     {paramname_rule}\n\
+                    "root ::= first_pair pair*\n\
+                     first_pair ::= \"arg_key>\" pair_body\n\
+                     pair ::= \"<arg_key>\" pair_body\n\
+                     {pair_rules}\n\
                      value ::= value_part*\n\
                      value_part ::= {value_ladder}"
                 );
                 serde_json::json!({"type": "grammar", "grammar": body_ebnf})
             };
+            // Include the delimiter after the tool name in the tag begin so
+            // names such as `foo` and `foobar` produce prefix-free triggers.
+            // The first `<` is consumed here; the grammar's first pair starts
+            // at `arg_key>`, while the zero-argument end consumes `tool_call>`.
+            let (begin, end) = if has_no_parameters {
+                (format!("<tool_call>{name}</"), "tool_call>".to_string())
+            } else {
+                (format!("<tool_call>{name}<"), "</tool_call>".to_string())
+            };
             tag_entries.push(serde_json::json!({
                 "type": "tag",
-                "begin": format!("<tool_call>{name}"),
+                "begin": begin,
                 "content": content,
-                "end": "</tool_call>",
+                "end": end,
             }));
         }
 
@@ -778,12 +823,22 @@ impl GrammarEngine {
             return Err(GrammarError::NoTools);
         }
 
-        self.compile_structural_tag_raw(
-            &["<tool_call>".to_string()],
-            &tag_entries,
-            !use_triggers,
-            !use_triggers,
-        )
+        // In automatic mode, wait until the registered tool name follows
+        // the opener. This keeps a quoted/code literal `<tool_call>` in free
+        // text while still engaging the grammar before the first argument.
+        let triggers = if use_triggers {
+            let mut seen = HashMap::<String, bool>::new();
+            tag_entries
+                .iter()
+                .filter_map(|entry| entry.get("begin").and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .filter(|trigger| seen.insert(trigger.clone(), true).is_none())
+                .collect::<Vec<_>>()
+        } else {
+            vec!["<tool_call>".to_string()]
+        };
+
+        self.compile_structural_tag_raw(&triggers, &tag_entries, !use_triggers, !use_triggers)
     }
 
     /// Compile a grammar for Gemma-4 native tool calls.

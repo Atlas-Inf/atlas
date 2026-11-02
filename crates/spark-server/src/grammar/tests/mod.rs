@@ -7,6 +7,7 @@ use crate::tool_parser::ToolDefinition;
 
 mod engine_state;
 mod gemma4_required;
+mod literal_dispatch;
 mod minimax;
 mod misc;
 mod parallel_calls;
@@ -15,6 +16,7 @@ mod poolside;
 mod qwen3_coder_required;
 mod sanitize;
 pub(crate) mod schema_limits;
+mod tool_or_json;
 mod tools_basic;
 
 /// Build a minimal vocabulary for testing.

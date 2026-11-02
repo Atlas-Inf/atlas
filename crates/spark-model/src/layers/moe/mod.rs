@@ -12,13 +12,15 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 use crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers;
-use crate::weight_map::{DenseWeight, Fp8ExpertWeight, MoeWeights, QuantizedWeight};
+use crate::weight_map::{DenseWeight, Fp8ExpertWeight, MoeWeights, Mxfp8Proj, QuantizedWeight};
 mod btile_model_owners;
 pub(crate) use btile_model_owners::{
     bind as bind_resident_btile_arenas, invalidate as invalidate_resident_btile_readers,
 };
 #[cfg(test)]
 pub(crate) use gate_up_repack::model_fixture as btile_model_fixture;
+#[cfg(test)]
+pub(crate) use gate_up_repack::recording as kernel_recording;
 
 /// Device-side pointer table for one projection across all experts.
 ///
@@ -33,6 +35,19 @@ pub(crate) struct ExpertPtrTable {
     pub(crate) scale_ptrs: DevicePtr,
     /// `[num_experts]` f32 per-expert scale2 values.
     pub(crate) scale2_vals: DevicePtr,
+}
+
+impl ExpertPtrTable {
+    /// This table's weights with other per-expert `scale2_vals` (owned by
+    /// the caller; the pointer arrays stay this table's).
+    pub(crate) fn with_scale2(&self, scale2_vals: DevicePtr) -> Self {
+        Self {
+            allocation: None,
+            packed_ptrs: self.packed_ptrs,
+            scale_ptrs: self.scale_ptrs,
+            scale2_vals,
+        }
+    }
 }
 
 /// Device-resident top-k routing results that can be sliced across fused
@@ -80,6 +95,42 @@ impl Bf16SharedExpert {
             down_proj,
         })
     }
+}
+
+/// A shared expert kept outside the fused routed-expert kernels and run as
+/// its own gate/up → silu_mul → down chain over the same scratch contract.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SeparateSharedExpert {
+    /// Checkpoint-native BF16 (Laguna).
+    Bf16(Bf16SharedExpert),
+    /// FP4-Local's checkpoint-native MXFP8: E4M3 weights + E8M0 scales,
+    /// projected by `mxfp8_proj.cu` — no BF16 expansion, no NVFP4 requant.
+    Mxfp8 {
+        gate_proj: Mxfp8Proj,
+        up_proj: Mxfp8Proj,
+        down_proj: Mxfp8Proj,
+        /// Gate‖up row-concatenated `[2*inter, h]` twin plus its
+        /// `[32, 2*inter]` BF16 landing buffer: one `mxfp8_proj` launch then
+        /// `fused_silu_mul` per row-band ≤ 32 (the batchm arm's span).
+        gate_up: Option<Mxfp8GateUp>,
+        kernels: ops::Mxfp8ProjKernels,
+        scratch: ops::Mxfp8Scratch,
+    },
+    /// The same checkpoint bytes as SparkQwen serves them
+    /// (`ATLAS_QWEN4EXP_MXFP8_SHARED=1`, `shared_mxfp8.rs`): tensor-core
+    /// SwiGLU tiers, W8A8 prefill, and under EP this rank's slice.
+    Mxfp8Native(Mxfp8SharedExpert),
+}
+
+/// The fused small-row arm of a [`SeparateSharedExpert::Mxfp8`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Mxfp8GateUp {
+    /// `[2*inter, h]` — gate rows then up rows.
+    pub proj: Mxfp8Proj,
+    /// `[32, 2*inter]` BF16 — one batchm-chunk's gate|up activations.
+    pub gate_up_out: DevicePtr,
+    /// `fused_silu_mul` (`dense_gemm_bf16.cu`); `0` resolves to the unfused path.
+    pub silu_mul: KernelHandle,
 }
 
 /// Unified expert pointer table for any quantization format.
@@ -144,6 +195,7 @@ pub(crate) use lora::MoeLoraWeights;
 mod forward_atomic_c4;
 mod forward_batched;
 mod forward_batched_gate;
+mod forward_batched_guards;
 mod forward_c2;
 mod forward_c4;
 mod forward_independent;
@@ -173,11 +225,23 @@ mod forward_prefill_q38_rs;
 mod forward_prefill_route;
 pub(crate) mod forward_prefill_route_sp;
 mod forward_prefill_routed;
+#[cfg(all(test, feature = "cuda"))]
+#[path = "router_determinism_gpu_tests.rs"]
+mod router_determinism_gpu_tests;
 pub(crate) use forward_prefill_routed::{grouped_cutlass_gate_up_enabled, prefill_fp8_down};
 mod forward_prefill_router;
 mod forward_prefill_tcp;
 pub(crate) use forward_prefill_tcp::tcp_requested;
+mod forward_prefill_w4a4;
+pub(crate) use forward_prefill_w4a4::requested as w4a4_requested;
+mod w4a4_scales;
+pub(crate) use w4a4_scales::W4a4Scales;
+mod decode_a16;
+pub(crate) use decode_a16::{DecodeRows, PromptRows, requested as decode_a16_requested};
+mod input_scales;
+pub(crate) use input_scales::{InputScales, requested as input_scales_requested};
 mod forward_rows;
+mod forward_rows_t;
 mod forward_token_major;
 mod gate_up_m16;
 mod gate_up_repack;
@@ -186,6 +250,10 @@ mod gate_up_repack_test_gpu;
 mod helpers_a;
 mod helpers_b;
 mod helpers_c;
+mod helpers_shared;
+mod shared_mxfp8;
+pub(crate) use shared_mxfp8::{Mxfp8SharedExpert, requested as shared_mxfp8_requested};
+mod helpers_shared_only;
 mod route_dump;
 mod shared_fp8_cache;
 mod shared_fp8_cache_load;
@@ -193,24 +261,34 @@ mod shared_fp8_cache_output;
 #[cfg(test)]
 mod shared_fp8_cache_test_gpu;
 mod shared_fp8_origin;
+pub(crate) mod shared_native;
 pub(crate) use gate_up_m16::validate_m16_gate_up_graphs;
 pub(crate) use shared_fp8_cache::SharedFp8Reserve;
 pub(crate) use shared_fp8_cache::validate_shared_fp8_cache_factory_reserve;
 pub use shared_fp8_cache::{validate_shared_fp8_cache_graphs, validate_shared_fp8_cache_profile};
 pub(crate) use shared_fp8_origin::load_glm_shared_fp8_weight;
 mod init;
+mod init_batched;
+mod init_ctor;
 mod init_optional;
+mod init_router;
+mod init_t_rows;
 mod inplace_transpose;
 mod m5_projection_oracle;
 mod m5_projections;
 mod mmq_layout;
+mod route_fuse;
 mod router_bn4;
+pub(crate) use route_fuse::route_fuse_requested;
 mod router_prefill_bn32;
 mod shared_fp8_cache_bytes;
 mod shared_m16;
 pub(crate) use m5_projections::validate_m5_projection_graphs;
 #[cfg(test)]
 mod mod_tests;
+#[cfg(test)]
+#[path = "mxfp8_exact_tests.rs"]
+mod mxfp8_exact_tests;
 mod prequant_fp4;
 mod prequant_fp4_c3;
 mod prequant_fp4_down;

@@ -83,6 +83,7 @@ fn delta_to_payloads(d: &StreamDelta, model: &str, id: &str, include_usage: bool
             reason,
             usage,
             token_ids,
+            guard_stop,
         } => {
             let wire_usage = wire_usage(usage);
             if include_usage {
@@ -94,14 +95,25 @@ fn delta_to_payloads(d: &StreamDelta, model: &str, id: &str, include_usage: bool
                 vec![
                     chunk_json(ChatCompletionChunk::usage_only_chunk(model, id, wire_usage)),
                     chunk_json(
-                        ChatCompletionChunk::final_chunk_no_usage(model, id, reason.as_wire())
-                            .with_token_ids(token_ids.clone()),
+                        ChatCompletionChunk::final_chunk_no_usage(
+                            model,
+                            id,
+                            reason.as_wire(),
+                            guard_stop.as_ref().copied(),
+                        )
+                        .with_token_ids(token_ids.clone()),
                     ),
                 ]
             } else {
                 vec![chunk_json(
-                    ChatCompletionChunk::done_chunk(model, id, reason.as_wire(), wire_usage)
-                        .with_token_ids(token_ids.clone()),
+                    ChatCompletionChunk::done_chunk(
+                        model,
+                        id,
+                        reason.as_wire(),
+                        guard_stop.as_ref().copied(),
+                        wire_usage,
+                    )
+                    .with_token_ids(token_ids.clone()),
                 )]
             }
         }
@@ -292,6 +304,7 @@ mod tests {
             reason: FinishReason::Stop,
             usage,
             token_ids: vec![7],
+            guard_stop: None,
         };
 
         // include_usage=true: usage-only chunk (`choices:[]`) FIRST,

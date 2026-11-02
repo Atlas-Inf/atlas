@@ -297,3 +297,151 @@ fn test_top_n_sigma_filters_extreme_outliers() {
         );
     }
 }
+
+/// A BF16-valued row (ties are common, as in a real head) of `n` logits.
+fn bf16_row(n: usize, seed: u64, spread: f32) -> Vec<f32> {
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    (0..n)
+        .map(|_| {
+            let v: f32 = rng.r#gen::<f32>() * spread - spread / 2.0;
+            f32::from_bits(v.to_bits() & 0xFFFF_0000)
+        })
+        .collect()
+}
+
+/// `row` as a vocabulary split over `ranks` would leave it: each rank's best
+/// `c` logits (value descending, then the lower index) present, the rest NaN,
+/// with the absent tokens' bound and log-mass at `temperature`.
+fn split_view(row: &[f32], ranks: usize, c: usize, temperature: f32) -> (Vec<f32>, Absent) {
+    let shard = row.len() / ranks;
+    let mut view = vec![f32::NAN; row.len()];
+    let mut bound = (f32::NEG_INFINITY, u32::MAX);
+    let mut mass = 0.0f64;
+    for r in 0..ranks {
+        let mut ids: Vec<usize> = (r * shard..(r + 1) * shard).collect();
+        ids.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap().then(a.cmp(&b)));
+        for &i in &ids[..c] {
+            view[i] = row[i];
+        }
+        let last = (row[ids[c - 1]], ids[c - 1] as u32);
+        if last.0 > bound.0 || (last.0 == bound.0 && last.1 < bound.1) {
+            bound = last;
+        }
+        mass += ids[c..]
+            .iter()
+            .map(|&i| ((row[i] / temperature) as f64).exp())
+            .sum::<f64>();
+    }
+    (
+        view,
+        Absent {
+            bound: bound.0,
+            bound_id: bound.1,
+            log_mass: mass.ln() as f32,
+        },
+    )
+}
+
+/// The known entries of a split view.
+fn present(view: &[f32]) -> Vec<(u32, f32)> {
+    (0..view.len() as u32)
+        .filter(|&i| !view[i as usize].is_nan())
+        .map(|i| (i, view[i as usize]))
+        .collect()
+}
+
+fn f32_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+/// The split verify head's exactness claim: whenever the candidates decide
+/// the pick, it is the full row's pick for the same seed; and the common
+/// filters (top-k, a min-p floor, a top-p nucleus inside the candidates)
+/// decide it. Covers top-n-sigma with and without a pipeline mask.
+#[test]
+fn a_split_rows_candidates_pick_what_the_full_row_picks() {
+    let (n, ranks, c) = (8192, 4, 64);
+    // (temperature, top_k, top_p, min_p, top_n_sigma, spread, expect decided)
+    let configs: [(f32, u32, f32, f32, f32, f32, bool); 7] = [
+        (0.7, 20, 0.95, 0.08, 1.0, 24.0, true),
+        (1.0, 20, 0.95, 0.0, 0.0, 24.0, true),
+        (1.0, 0, 1.0, 0.1, 0.0, 400.0, true),
+        (0.5, 0, 0.95, 0.0, 0.0, 400.0, true),
+        (0.7, 64 * 4, 0.95, 0.0, 0.0, 24.0, false),
+        (1.0, 0, 1.0, 0.0, 0.0, 24.0, false),
+        (1.0, 0, 0.95, 0.0, 1.0, 40.0, false),
+    ];
+    for (cfg, &(t, top_k, top_p, min_p, sigma, spread, decided)) in configs.iter().enumerate() {
+        let mut params = SamplingParams::greedy(1);
+        (params.temperature, params.top_k, params.top_p) = (t, top_k, top_p);
+        (params.min_p, params.top_n_sigma) = (min_p, sigma);
+        let mut some = 0;
+        for trial in 0..200u64 {
+            let mut row = bf16_row(n, 1000 * cfg as u64 + trial, spread);
+            if trial % 2 == 1 {
+                row[5] = f32::NEG_INFINITY; // a pipeline mask
+            }
+            let (view, absent) = split_view(&row, ranks, c, t);
+            let seed = Some(77 + trial);
+            let full = sample_with_params_seeded(&f32_bytes(&row), &params, &[], seed);
+            if let Some(pick) = sample_with_absent(&present(&view), n, &params, seed, absent) {
+                assert_eq!(pick, full, "config {cfg} trial {trial}");
+                some += 1;
+            }
+        }
+        if decided {
+            assert_eq!(some, 200, "config {cfg} should always be decided");
+        } else {
+            assert!(some < 200, "config {cfg} cannot always be decided");
+        }
+    }
+}
+
+/// With nothing absent the split view is the row itself.
+#[test]
+fn a_row_without_absent_tokens_samples_as_before() {
+    let row = bf16_row(4096, 5, 20.0);
+    let mut params = SamplingParams::greedy(1);
+    (params.temperature, params.top_p, params.top_k) = (0.8, 0.9, 0);
+    let none = Absent {
+        bound: f32::NEG_INFINITY,
+        bound_id: 0,
+        log_mass: f32::NEG_INFINITY,
+    };
+    for s in 0..100 {
+        assert_eq!(
+            sample_with_absent(&present(&row), row.len(), &params, Some(s), none),
+            Some(sample_with_params_seeded(
+                &f32_bytes(&row),
+                &params,
+                &[],
+                Some(s)
+            ))
+        );
+    }
+}
+
+/// Exact ties fall to the lower index wherever they sit in the row, so the
+/// same seed picks the same token from any arrangement of the candidates.
+#[test]
+fn tied_logits_are_drawn_in_index_order() {
+    let mut row = vec![-20.0f32; 1000];
+    for i in [900, 3, 500] {
+        row[i] = 4.0;
+    }
+    let mut params = SamplingParams::greedy(1);
+    (params.temperature, params.top_k) = (1.0, 3);
+    let picks: Vec<u32> = (0..3u64)
+        .map(|s| sample_with_params_seeded(&f32_bytes(&row), &params, &[], Some(s)))
+        .collect();
+    // StdRng's first f32 for seeds 0..3 lands in each third in turn.
+    let thirds: Vec<u32> = (0..3u64)
+        .map(|s| {
+            use rand::{Rng, SeedableRng};
+            let u: f32 = rand::rngs::StdRng::seed_from_u64(s).r#gen();
+            [3, 500, 900][((u * 3.0) as usize).min(2)]
+        })
+        .collect();
+    assert_eq!(picks, thirds);
+}

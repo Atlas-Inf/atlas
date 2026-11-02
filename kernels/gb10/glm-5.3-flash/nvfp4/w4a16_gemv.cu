@@ -1935,6 +1935,74 @@ __device__ __forceinline__ void w4a16_tc_mma(
     }
 }
 
+// ATLAS_GLM_CANONICAL_VERIFY runs 9..32 rows through this 8-row tier as
+// NT = ceil(rows / 8) activation tiles against ONE sweep of the CTA's weight
+// block. Each tile sees exactly w4a16_gemv_tc8's chunk order, MMA sequence
+// and cross-warp epilogue, so its rows come out bit-identical to an 8-row
+// launch of them: a row's bits never depend on the rows beside it, whatever
+// the width 1..32. The shared weight chunk is double-buffered; each tile's
+// activations (L1/L2-resident, every CTA reads them) are loaded at use.
+// On GB10 this beats the 64-wide-K tc16/tc32 at their own widths (cold
+// 4096 x 4096: 53 vs 70 us at 16 rows, 66 vs 80 at 32).
+template <int NT>
+__device__ __forceinline__ void w4a16_tc8_sweep(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* w0p, const unsigned char* w1p,
+    const unsigned char* s0p, const unsigned char* s1p, const unsigned int* s_pair,
+    float (*s_red)[WARP_SIZE][4], __nv_bfloat16* __restrict__ C, float scale2,
+    unsigned int r0, unsigned int r1, unsigned int M, unsigned int N, unsigned int K,
+    bool v0, bool v1
+) {
+    const unsigned int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
+    const unsigned int g = lane >> 2, c = lane & 3u;
+    const unsigned int chunks = (K + 127u) / 128u;
+    float acc[NT][4];
+    #pragma unroll
+    for (int t = 0; t < NT; t++) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.0f;
+    // Weights only (vm = false); a tile's activations join them at use.
+    W4a16TcChunk cur, nxt;
+    unsigned int ch = warp;
+    if (ch < chunks) w4a16_tc_load(cur, w0p, w1p, s0p, s1p, A, ch * 128u + 32u * c, K, v0, v1, false);
+    for (; ch < chunks; ch += W4A16_TC_WARPS) {
+        const unsigned int next = ch + W4A16_TC_WARPS;
+        if (next < chunks)
+            w4a16_tc_load(nxt, w0p, w1p, s0p, s1p, A, next * 128u + 32u * c, K, v0, v1, false);
+        const unsigned int kb = ch * 128u + 32u * c;
+        #pragma unroll
+        for (int t = 0; t < NT; t++) {
+            // The activation half of w4a16_tc_load for row 8t + g.
+            const unsigned int row = 8u * t + g;
+            W4a16TcChunk x = cur;
+            const uint4 z = make_uint4(0u, 0u, 0u, 0u);
+            x.x[0] = z; x.x[1] = z; x.x[2] = z; x.x[3] = z;
+            if (row < M && kb < K) {
+                const uint4* xp = (const uint4*)(A + (unsigned long long)row * K + kb);
+                x.x[0] = xp[0]; x.x[1] = xp[1];
+                if (kb + 16u < K) { x.x[2] = xp[2]; x.x[3] = xp[3]; }
+            }
+            w4a16_tc_mma(acc[t], x, s_pair);
+        }
+        cur = nxt;
+    }
+    #pragma unroll
+    for (int t = 0; t < NT; t++) {
+        if (t > 0) __syncthreads();  // warp 0 has read tile t-1's partials
+        #pragma unroll
+        for (int i = 0; i < 4; i++) s_red[warp][lane][i] = acc[t][i];
+        __syncthreads();
+        if (warp == 0) {
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                float v = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < W4A16_TC_WARPS; w++) v += s_red[w][lane][i];
+                const unsigned int n = (i < 2) ? r0 : r1;
+                const unsigned int m = 8u * t + 2u * c + (i & 1u);
+                if (n < N && m < M) C[(unsigned long long)m * N + n] = __float2bfloat16(v * scale2);
+            }
+        }
+    }
+}
+
 // `ld_half` / `ld_groups`: bytes between weight rows and between scale rows
 // (K/2 and K/16 for a whole weight; larger for a K-slice of a wider one).
 __device__ __forceinline__ void w4a16_gemv_tc8_impl(
@@ -1969,6 +2037,14 @@ __device__ __forceinline__ void w4a16_gemv_tc8_impl(
     const unsigned char* s1p = B_scale + (unsigned long long)(v1 ? r1 : 0u) * ld_groups;
     const __nv_bfloat16* ap = A + (unsigned long long)(vm ? g : 0u) * K;
 
+    if (M > 8u) {  // ATLAS_GLM_CANONICAL_VERIFY: 9..32 rows (w4a16_tc8_sweep)
+        switch ((M + 7u) / 8u) {
+            case 2: w4a16_tc8_sweep<2>(A, w0p, w1p, s0p, s1p, s_pair, s_red, C, scale2, r0, r1, M, N, K, v0, v1); break;
+            case 3: w4a16_tc8_sweep<3>(A, w0p, w1p, s0p, s1p, s_pair, s_red, C, scale2, r0, r1, M, N, K, v0, v1); break;
+            default: w4a16_tc8_sweep<4>(A, w0p, w1p, s0p, s1p, s_pair, s_red, C, scale2, r0, r1, M, N, K, v0, v1); break;
+        }
+        return;
+    }
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     const unsigned int chunks = (K + 127u) / 128u;
     W4a16TcChunk cur, nxt;

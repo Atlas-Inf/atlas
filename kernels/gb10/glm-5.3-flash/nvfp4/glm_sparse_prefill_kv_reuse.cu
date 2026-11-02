@@ -100,12 +100,13 @@ __device__ __forceinline__ void glm_kvp_load_tile(
     }
 }
 
-// SPLIT: CTA z covers the z-th contiguous run of 32-key tiles of the selected
-// IDs and writes its normalized FP32 output and natural LSE (-inf when empty)
-// for glm_sparse_decode_split_merge, instead of the BF16 output. Few-row
-// callers (verify owners) then fill the GPU; one split is the unsplit kernel.
-// `row_counts` (SPLIT, may be null): row `r` selects only its first
-// `row_counts[r]` IDs (glm_kv_shard_localize_compact), and the splits
+// SPLIT: the CTA of partition `split` of `splits` (the split entry points pass
+// blockIdx.z of gridDim.z) covers the split-th contiguous run of 32-key tiles
+// of the selected IDs and writes its normalized FP32 output and natural LSE
+// (-inf when empty) for glm_sparse_decode_split_merge, instead of the BF16
+// output. Few-row callers (verify owners) then fill the GPU; one split is the
+// unsplit kernel. `row_counts` (SPLIT, may be null): row `r` selects only its
+// first `row_counts[r]` IDs (glm_kv_shard_localize_compact), and the splits
 // partition that prefix instead of the whole `index_width`.
 template <bool FP8, bool SPLIT>
 __device__ __forceinline__ void glm_kv_pad_body(
@@ -122,7 +123,9 @@ __device__ __forceinline__ void glm_kv_pad_body(
     float inv_sqrt_d,
     float* __restrict__ part_o,     // SPLIT: [splits, rows, heads, 512]
     float* __restrict__ part_lse,   // SPLIT: [splits, rows, heads]
-    const unsigned int* __restrict__ row_counts = nullptr  // SPLIT: [rows]
+    const unsigned int* __restrict__ row_counts,  // SPLIT: [rows], or null
+    const unsigned int split,       // SPLIT: this CTA's partition...
+    const unsigned int splits       // ...of this many
 ) {
     const unsigned int token_row = blockIdx.y;
     const unsigned int head_start = blockIdx.x * 32;
@@ -140,8 +143,8 @@ __device__ __forceinline__ void glm_kv_pad_body(
         const unsigned int width =
             row_counts != nullptr ? min(row_counts[token_row], index_width) : index_width;
         const unsigned int tiles = (width + BC_512 - 1) / BC_512;
-        const unsigned int per = (tiles + gridDim.z - 1) / gridDim.z;
-        kv_begin = min(blockIdx.z * per * BC_512, width);
+        const unsigned int per = (tiles + splits - 1) / splits;
+        kv_begin = min(split * per * BC_512, width);
         kv_len = min(kv_begin + per * BC_512, width);
     }
     const int* indices = token_indices + (unsigned long long)token_row * index_width;
@@ -376,7 +379,7 @@ __device__ __forceinline__ void glm_kv_pad_body(
 
         if constexpr (SPLIT) {
             const unsigned long long part =
-                ((unsigned long long)blockIdx.z * rows + token_row) * num_heads + head_start;
+                ((unsigned long long)split * rows + token_row) * num_heads + head_start;
             float* po = part_o + part * head_dim;
             #pragma unroll
             for(int nt=0;nt<N_TILES_PER_WARP_512;nt++){
@@ -429,25 +432,27 @@ __device__ __forceinline__ void glm_kv_pad_body(
 #ifndef GLM_KV_SHARD_MODULE
 extern "C" __global__ void glm_sparse_mla_prefill_bf16_head32_tc_kv_pad(GLM_KV_PAD_ARGS) {
     (void)V_cache;
-    glm_kv_pad_body<false, false>(GLM_KV_PAD_FORWARD, nullptr, nullptr);
+    glm_kv_pad_body<false, false>(GLM_KV_PAD_FORWARD, nullptr, nullptr, nullptr, 0u, 1u);
 }
 
 extern "C" __global__ void glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad(GLM_KV_PAD_ARGS) {
     (void)V_cache;
-    glm_kv_pad_body<true, false>(GLM_KV_PAD_FORWARD, nullptr, nullptr);
+    glm_kv_pad_body<true, false>(GLM_KV_PAD_FORWARD, nullptr, nullptr, nullptr, 0u, 1u);
 }
 
 // Split variants: grid (ceil(heads/32), rows, splits); O is unused.
 extern "C" __global__ void glm_sparse_mla_prefill_bf16_head32_tc_kv_pad_split(
     GLM_KV_PAD_ARGS, float* __restrict__ part_o, float* __restrict__ part_lse) {
     (void)V_cache;
-    glm_kv_pad_body<false, true>(GLM_KV_PAD_FORWARD, part_o, part_lse);
+    glm_kv_pad_body<false, true>(GLM_KV_PAD_FORWARD, part_o, part_lse, nullptr, blockIdx.z,
+                                 gridDim.z);
 }
 
 extern "C" __global__ void glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split(
     GLM_KV_PAD_ARGS, float* __restrict__ part_o, float* __restrict__ part_lse) {
     (void)V_cache;
-    glm_kv_pad_body<true, true>(GLM_KV_PAD_FORWARD, part_o, part_lse);
+    glm_kv_pad_body<true, true>(GLM_KV_PAD_FORWARD, part_o, part_lse, nullptr, blockIdx.z,
+                                 gridDim.z);
 }
 
 // Opt-in pipelined fp8_g128 variant (ATLAS_GLM_SPARSE_PREFILL_PIPE=1), bit-identical to the above.

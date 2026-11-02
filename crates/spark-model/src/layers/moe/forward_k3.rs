@@ -35,13 +35,17 @@ impl MoeLayer {
             !ctx.config.expert_tp,
             "expert TP runs K=3 on the grouped path"
         );
+        anyhow::ensure!(
+            !include_shared || self.shared_native.is_none(),
+            "a native shared expert runs K=3 on the grouped path"
+        );
         self.btile_input_guard(input, 3, ctx, stream)?;
         if !include_shared {
             anyhow::ensure!(
                 self.lora.is_none()
                     && self.bf16_gate_weight_ptrs.is_none()
                     && self.fp8_gate_weight_ptrs.is_none()
-                    && !self.has_mixed_bf16_shared_expert()
+                    && !self.has_separate_shared_expert()
                     && matches!(
                         self.experts_scale_kind,
                         crate::weight_map::WeightQuantFormat::Nvfp4
@@ -69,7 +73,7 @@ impl MoeLayer {
         // Mixed NVFP4-routed / BF16-shared (Laguna): batch the routed half
         // through the _t kernels and run the shared expert as one batched BF16
         // pass afterwards. See forward_k2 for the rationale.
-        let mixed_bf16_shared = self.has_mixed_bf16_shared_expert();
+        let mixed_bf16_shared = self.has_separate_shared_expert();
         if mixed_bf16_shared
             && !(self.use_btile_or_t_decode()
                 && self.moe_expert_gate_up_shared_batch3_t_k.0 != 0
@@ -302,7 +306,7 @@ impl MoeLayer {
             }
             if mixed_bf16_shared {
                 let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
-                self.run_bf16_shared_expert(
+                self.run_separate_shared_expert(
                     input,
                     3,
                     h,
@@ -311,6 +315,7 @@ impl MoeLayer {
                     shared_up_scratch,
                     shared_down_out,
                     ctx,
+                    true,
                     stream,
                 )?;
             }

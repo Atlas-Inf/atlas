@@ -182,6 +182,10 @@ impl Qwen3SsmLayer {
         // this collapse.
         // ATLAS_QWEN4EXP_PREFILL_SP_PIPE: the gather goes out slab by slab
         // while the collapse runs (`layers::qwen4exp_sp_pipe`).
+        // ATLAS_QWEN4EXP_PREFILL_W8A8: the collapse also writes its rows of the
+        // qkvz input as MXFP8 where it can (`mx8.rs`).
+        let row0 = sp.map_or(0, |sp| sp.row0);
+        let mx = self.w8a8_producer(ctx, hidden, num_tokens, row0, n as usize)?;
         crate::layers::qwen4exp_sp_pipe::collapse_and_gather(
             sp,
             hidden,
@@ -224,6 +228,9 @@ impl Qwen3SsmLayer {
                 Ok(())
             },
         )?;
+        if let Some(p) = mx {
+            p.finish();
+        }
         stage!("hc_pre_attn");
         // ATLAS_GLM_DET_TRACE stages (this rank's seam rows under SP).
         let det = crate::det_trace::on_stream(ctx.gpu, stream);

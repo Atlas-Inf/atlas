@@ -57,6 +57,15 @@ fn the_first_token_is_masked_and_consumed_by_a_strict_grammar() {
     assert_eq!(gs.num_history_steps(), 1);
 }
 
+/// GLM's native tool opener ends the reasoning as the union's first output
+/// token: the matcher must see it (RAW_TOP is the fixture `<tool_call>`).
+#[test]
+fn a_native_opener_first_token_inside_think_is_consumed_by_the_union() {
+    let mut gs = super::tool_or_json::union(true);
+    assert_eq!(first(Some(&mut gs), &[2047]).unwrap(), RAW_TOP);
+    assert_eq!(gs.num_history_steps(), 1, "the matcher saw the opener");
+}
+
 #[test]
 fn a_first_token_inside_think_is_neither_masked_nor_consumed() {
     let mut gs = compile(GrammarSpec::JsonObject, true).unwrap();

@@ -110,6 +110,15 @@ impl GrammarCompiler {
             .map_err(|e| e.to_string())
     }
 
+    /// [`Self::compile_grammar`] for a grammar embedding a JSON schema,
+    /// bounded like [`Self::compile_json_schema`]
+    /// ([`Self::set_max_schema_grammar_bytes`]).
+    pub fn compile_schema_grammar(&mut self, grammar: &Grammar) -> Result<CompiledGrammar, String> {
+        self.inner
+            .compile_schema_grammar(grammar.data().clone())
+            .map_err(|e| e.to_string())
+    }
+
     /// Compile a grammar from a structural-tag JSON document. Port of
     /// the vendored `GrammarCompiler::compile_structural_tag` (raw-JSON
     /// form).

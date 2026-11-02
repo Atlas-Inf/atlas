@@ -139,7 +139,7 @@ fn k128w_launches(rows: u32) -> Vec<(u64, usize, usize)> {
     .unwrap();
     let memsets = gpu.memset_count();
     ops::moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w(
-        &gpu, gate_up, p, p, [p; 3], [p; 3], p, p, p, p, 288, 2048, 4096, p, schedule, 0,
+        &gpu, gate_up, p, p, [p; 3], [p; 3], [p; 3], p, p, 288, 2048, 4096, p, schedule, 0,
     )
     .unwrap();
     let launches = gpu.launches_snapshot();
@@ -156,14 +156,14 @@ fn k128w_launches(rows: u32) -> Vec<(u64, usize, usize)> {
 #[test]
 fn k128w_chunks_below_the_persistent_floor_launch_the_grid_kernels() {
     // A 4K-token chunk (a short prompt, warmup, a long prompt's tail chunk)
-    // with the persistent twins loaded: the grid kernels and their 12 / 17
+    // with the persistent twins loaded: the grid kernels and their 12 / 18
     // parameters, no counter.
-    assert_eq!(k128w_launches(32768), vec![(1, 12, 0), (3, 17, 0)]);
-    assert_eq!(k128w_launches(65535), vec![(1, 12, 0), (3, 17, 0)]);
+    assert_eq!(k128w_launches(32768), vec![(1, 12, 0), (3, 18, 0)]);
+    assert_eq!(k128w_launches(65535), vec![(1, 12, 0), (3, 18, 0)]);
 }
 
 #[test]
 fn k128w_serving_chunks_launch_the_persistent_twins_with_their_counter() {
     // An 8K-token chunk: the twins, one extra parameter, one 4-byte memset.
-    assert_eq!(k128w_launches(65536), vec![(2, 13, 1), (4, 18, 1)]);
+    assert_eq!(k128w_launches(65536), vec![(2, 13, 1), (4, 19, 1)]);
 }

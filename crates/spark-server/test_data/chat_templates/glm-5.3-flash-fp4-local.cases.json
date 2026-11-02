@@ -1,0 +1,2748 @@
+[
+ {
+  "name": "single/plain/no_flag",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/plain/enable_thinking_false",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "enable_thinking": false
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/plain/kwargs_enable_thinking_false",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   }
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/plain/kwargs_enable_thinking_true",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "chat_template_kwargs": {
+    "enable_thinking": true
+   }
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/plain/kwargs_effort_high",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "chat_template_kwargs": {
+    "reasoning_effort": "high"
+   }
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: High<|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/plain/effort_low_kwargs_enable_thinking_false",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "low",
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   }
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Low<|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/plain/effort_none",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "none"
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/plain/effort_minimal",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "minimal"
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/plain/effort_low",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "low"
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Low<|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/plain/effort_medium",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "medium"
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/plain/effort_high",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "high"
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: High<|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/plain/effort_max",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "max"
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/plain/effort_xhigh",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "xhigh"
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/plain/response_format",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "answer",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "answer": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "answer"
+      ]
+     }
+    }
+   }
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/tools/no_flag",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/tools/enable_thinking_false",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "enable_thinking": false,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/tools/kwargs_enable_thinking_false",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   },
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/tools/kwargs_enable_thinking_true",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "chat_template_kwargs": {
+    "enable_thinking": true
+   },
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/tools/kwargs_effort_high",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "chat_template_kwargs": {
+    "reasoning_effort": "high"
+   },
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: High<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/tools/effort_low_kwargs_enable_thinking_false",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "low",
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   },
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Low<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/tools/effort_none",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "none",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/tools/effort_minimal",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "minimal",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/tools/effort_low",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "low",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Low<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/tools/effort_medium",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "medium",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/tools/effort_high",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "high",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: High<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/tools/effort_max",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "max",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/tools/effort_xhigh",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "xhigh",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "single/tools/response_format",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    }
+   ],
+   "max_tokens": 64,
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "answer",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "answer": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "answer"
+      ]
+     }
+    }
+   },
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>"
+ },
+ {
+  "name": "multi/tools/no_flag",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "Two lookups; call both tools.",
+     "tool_calls": [
+      {
+       "id": "call_a",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"
+       }
+      },
+      {
+       "id": "call_b",
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "arguments": "{\"city\": \"Oslo\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_b",
+     "content": "14:05"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_a",
+     "content": "{\"temp\": 18}"
+    },
+    {
+     "role": "assistant",
+     "content": "Paris is 18 C; Oslo is 14:05.",
+     "reasoning_content": "Both results are in."
+    },
+    {
+     "role": "user",
+     "content": "Thanks. And tomorrow?"
+    }
+   ],
+   "max_tokens": 64,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>Two lookups; call both tools.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>unit</arg_key><arg_value>c</arg_value></tool_call><tool_call>get_time<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call><|observation|><tool_response>{\"temp\": 18}</tool_response><tool_response>14:05</tool_response><|assistant|><think>Both results are in.</think>Paris is 18 C; Oslo is 14:05.<|user|>Thanks. And tomorrow?<|assistant|><think>"
+ },
+ {
+  "name": "multi/tools/enable_thinking_false",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "Two lookups; call both tools.",
+     "tool_calls": [
+      {
+       "id": "call_a",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"
+       }
+      },
+      {
+       "id": "call_b",
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "arguments": "{\"city\": \"Oslo\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_b",
+     "content": "14:05"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_a",
+     "content": "{\"temp\": 18}"
+    },
+    {
+     "role": "assistant",
+     "content": "Paris is 18 C; Oslo is 14:05.",
+     "reasoning_content": "Both results are in."
+    },
+    {
+     "role": "user",
+     "content": "Thanks. And tomorrow?"
+    }
+   ],
+   "max_tokens": 64,
+   "enable_thinking": false,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>Two lookups; call both tools.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>unit</arg_key><arg_value>c</arg_value></tool_call><tool_call>get_time<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call><|observation|><tool_response>{\"temp\": 18}</tool_response><tool_response>14:05</tool_response><|assistant|><think>Both results are in.</think>Paris is 18 C; Oslo is 14:05.<|user|>Thanks. And tomorrow?<|assistant|><think>"
+ },
+ {
+  "name": "multi/tools/kwargs_enable_thinking_false",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "Two lookups; call both tools.",
+     "tool_calls": [
+      {
+       "id": "call_a",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"
+       }
+      },
+      {
+       "id": "call_b",
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "arguments": "{\"city\": \"Oslo\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_b",
+     "content": "14:05"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_a",
+     "content": "{\"temp\": 18}"
+    },
+    {
+     "role": "assistant",
+     "content": "Paris is 18 C; Oslo is 14:05.",
+     "reasoning_content": "Both results are in."
+    },
+    {
+     "role": "user",
+     "content": "Thanks. And tomorrow?"
+    }
+   ],
+   "max_tokens": 64,
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   },
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>Two lookups; call both tools.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>unit</arg_key><arg_value>c</arg_value></tool_call><tool_call>get_time<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call><|observation|><tool_response>{\"temp\": 18}</tool_response><tool_response>14:05</tool_response><|assistant|><think>Both results are in.</think>Paris is 18 C; Oslo is 14:05.<|user|>Thanks. And tomorrow?<|assistant|><think>"
+ },
+ {
+  "name": "multi/tools/kwargs_enable_thinking_true",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "Two lookups; call both tools.",
+     "tool_calls": [
+      {
+       "id": "call_a",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"
+       }
+      },
+      {
+       "id": "call_b",
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "arguments": "{\"city\": \"Oslo\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_b",
+     "content": "14:05"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_a",
+     "content": "{\"temp\": 18}"
+    },
+    {
+     "role": "assistant",
+     "content": "Paris is 18 C; Oslo is 14:05.",
+     "reasoning_content": "Both results are in."
+    },
+    {
+     "role": "user",
+     "content": "Thanks. And tomorrow?"
+    }
+   ],
+   "max_tokens": 64,
+   "chat_template_kwargs": {
+    "enable_thinking": true
+   },
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>Two lookups; call both tools.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>unit</arg_key><arg_value>c</arg_value></tool_call><tool_call>get_time<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call><|observation|><tool_response>{\"temp\": 18}</tool_response><tool_response>14:05</tool_response><|assistant|><think>Both results are in.</think>Paris is 18 C; Oslo is 14:05.<|user|>Thanks. And tomorrow?<|assistant|><think>"
+ },
+ {
+  "name": "multi/tools/kwargs_effort_high",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "Two lookups; call both tools.",
+     "tool_calls": [
+      {
+       "id": "call_a",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"
+       }
+      },
+      {
+       "id": "call_b",
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "arguments": "{\"city\": \"Oslo\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_b",
+     "content": "14:05"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_a",
+     "content": "{\"temp\": 18}"
+    },
+    {
+     "role": "assistant",
+     "content": "Paris is 18 C; Oslo is 14:05.",
+     "reasoning_content": "Both results are in."
+    },
+    {
+     "role": "user",
+     "content": "Thanks. And tomorrow?"
+    }
+   ],
+   "max_tokens": 64,
+   "chat_template_kwargs": {
+    "reasoning_effort": "high"
+   },
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: High<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>Two lookups; call both tools.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>unit</arg_key><arg_value>c</arg_value></tool_call><tool_call>get_time<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call><|observation|><tool_response>{\"temp\": 18}</tool_response><tool_response>14:05</tool_response><|assistant|><think>Both results are in.</think>Paris is 18 C; Oslo is 14:05.<|user|>Thanks. And tomorrow?<|assistant|><think>"
+ },
+ {
+  "name": "multi/tools/effort_low_kwargs_enable_thinking_false",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "Two lookups; call both tools.",
+     "tool_calls": [
+      {
+       "id": "call_a",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"
+       }
+      },
+      {
+       "id": "call_b",
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "arguments": "{\"city\": \"Oslo\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_b",
+     "content": "14:05"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_a",
+     "content": "{\"temp\": 18}"
+    },
+    {
+     "role": "assistant",
+     "content": "Paris is 18 C; Oslo is 14:05.",
+     "reasoning_content": "Both results are in."
+    },
+    {
+     "role": "user",
+     "content": "Thanks. And tomorrow?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "low",
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   },
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Low<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>Two lookups; call both tools.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>unit</arg_key><arg_value>c</arg_value></tool_call><tool_call>get_time<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call><|observation|><tool_response>{\"temp\": 18}</tool_response><tool_response>14:05</tool_response><|assistant|><think>Both results are in.</think>Paris is 18 C; Oslo is 14:05.<|user|>Thanks. And tomorrow?<|assistant|><think>"
+ },
+ {
+  "name": "multi/tools/effort_none",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "Two lookups; call both tools.",
+     "tool_calls": [
+      {
+       "id": "call_a",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"
+       }
+      },
+      {
+       "id": "call_b",
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "arguments": "{\"city\": \"Oslo\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_b",
+     "content": "14:05"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_a",
+     "content": "{\"temp\": 18}"
+    },
+    {
+     "role": "assistant",
+     "content": "Paris is 18 C; Oslo is 14:05.",
+     "reasoning_content": "Both results are in."
+    },
+    {
+     "role": "user",
+     "content": "Thanks. And tomorrow?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "none",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>Two lookups; call both tools.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>unit</arg_key><arg_value>c</arg_value></tool_call><tool_call>get_time<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call><|observation|><tool_response>{\"temp\": 18}</tool_response><tool_response>14:05</tool_response><|assistant|><think>Both results are in.</think>Paris is 18 C; Oslo is 14:05.<|user|>Thanks. And tomorrow?<|assistant|><think>"
+ },
+ {
+  "name": "multi/tools/effort_minimal",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "Two lookups; call both tools.",
+     "tool_calls": [
+      {
+       "id": "call_a",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"
+       }
+      },
+      {
+       "id": "call_b",
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "arguments": "{\"city\": \"Oslo\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_b",
+     "content": "14:05"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_a",
+     "content": "{\"temp\": 18}"
+    },
+    {
+     "role": "assistant",
+     "content": "Paris is 18 C; Oslo is 14:05.",
+     "reasoning_content": "Both results are in."
+    },
+    {
+     "role": "user",
+     "content": "Thanks. And tomorrow?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "minimal",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>Two lookups; call both tools.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>unit</arg_key><arg_value>c</arg_value></tool_call><tool_call>get_time<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call><|observation|><tool_response>{\"temp\": 18}</tool_response><tool_response>14:05</tool_response><|assistant|><think>Both results are in.</think>Paris is 18 C; Oslo is 14:05.<|user|>Thanks. And tomorrow?<|assistant|><think>"
+ },
+ {
+  "name": "multi/tools/effort_low",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "Two lookups; call both tools.",
+     "tool_calls": [
+      {
+       "id": "call_a",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"
+       }
+      },
+      {
+       "id": "call_b",
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "arguments": "{\"city\": \"Oslo\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_b",
+     "content": "14:05"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_a",
+     "content": "{\"temp\": 18}"
+    },
+    {
+     "role": "assistant",
+     "content": "Paris is 18 C; Oslo is 14:05.",
+     "reasoning_content": "Both results are in."
+    },
+    {
+     "role": "user",
+     "content": "Thanks. And tomorrow?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "low",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Low<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>Two lookups; call both tools.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>unit</arg_key><arg_value>c</arg_value></tool_call><tool_call>get_time<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call><|observation|><tool_response>{\"temp\": 18}</tool_response><tool_response>14:05</tool_response><|assistant|><think>Both results are in.</think>Paris is 18 C; Oslo is 14:05.<|user|>Thanks. And tomorrow?<|assistant|><think>"
+ },
+ {
+  "name": "multi/tools/effort_medium",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "Two lookups; call both tools.",
+     "tool_calls": [
+      {
+       "id": "call_a",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"
+       }
+      },
+      {
+       "id": "call_b",
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "arguments": "{\"city\": \"Oslo\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_b",
+     "content": "14:05"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_a",
+     "content": "{\"temp\": 18}"
+    },
+    {
+     "role": "assistant",
+     "content": "Paris is 18 C; Oslo is 14:05.",
+     "reasoning_content": "Both results are in."
+    },
+    {
+     "role": "user",
+     "content": "Thanks. And tomorrow?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "medium",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>Two lookups; call both tools.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>unit</arg_key><arg_value>c</arg_value></tool_call><tool_call>get_time<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call><|observation|><tool_response>{\"temp\": 18}</tool_response><tool_response>14:05</tool_response><|assistant|><think>Both results are in.</think>Paris is 18 C; Oslo is 14:05.<|user|>Thanks. And tomorrow?<|assistant|><think>"
+ },
+ {
+  "name": "multi/tools/effort_high",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "Two lookups; call both tools.",
+     "tool_calls": [
+      {
+       "id": "call_a",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"
+       }
+      },
+      {
+       "id": "call_b",
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "arguments": "{\"city\": \"Oslo\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_b",
+     "content": "14:05"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_a",
+     "content": "{\"temp\": 18}"
+    },
+    {
+     "role": "assistant",
+     "content": "Paris is 18 C; Oslo is 14:05.",
+     "reasoning_content": "Both results are in."
+    },
+    {
+     "role": "user",
+     "content": "Thanks. And tomorrow?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "high",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: High<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>Two lookups; call both tools.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>unit</arg_key><arg_value>c</arg_value></tool_call><tool_call>get_time<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call><|observation|><tool_response>{\"temp\": 18}</tool_response><tool_response>14:05</tool_response><|assistant|><think>Both results are in.</think>Paris is 18 C; Oslo is 14:05.<|user|>Thanks. And tomorrow?<|assistant|><think>"
+ },
+ {
+  "name": "multi/tools/effort_max",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "Two lookups; call both tools.",
+     "tool_calls": [
+      {
+       "id": "call_a",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"
+       }
+      },
+      {
+       "id": "call_b",
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "arguments": "{\"city\": \"Oslo\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_b",
+     "content": "14:05"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_a",
+     "content": "{\"temp\": 18}"
+    },
+    {
+     "role": "assistant",
+     "content": "Paris is 18 C; Oslo is 14:05.",
+     "reasoning_content": "Both results are in."
+    },
+    {
+     "role": "user",
+     "content": "Thanks. And tomorrow?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "max",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>Two lookups; call both tools.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>unit</arg_key><arg_value>c</arg_value></tool_call><tool_call>get_time<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call><|observation|><tool_response>{\"temp\": 18}</tool_response><tool_response>14:05</tool_response><|assistant|><think>Both results are in.</think>Paris is 18 C; Oslo is 14:05.<|user|>Thanks. And tomorrow?<|assistant|><think>"
+ },
+ {
+  "name": "multi/tools/effort_xhigh",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "Two lookups; call both tools.",
+     "tool_calls": [
+      {
+       "id": "call_a",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"
+       }
+      },
+      {
+       "id": "call_b",
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "arguments": "{\"city\": \"Oslo\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_b",
+     "content": "14:05"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_a",
+     "content": "{\"temp\": 18}"
+    },
+    {
+     "role": "assistant",
+     "content": "Paris is 18 C; Oslo is 14:05.",
+     "reasoning_content": "Both results are in."
+    },
+    {
+     "role": "user",
+     "content": "Thanks. And tomorrow?"
+    }
+   ],
+   "max_tokens": 64,
+   "reasoning_effort": "xhigh",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>Two lookups; call both tools.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>unit</arg_key><arg_value>c</arg_value></tool_call><tool_call>get_time<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call><|observation|><tool_response>{\"temp\": 18}</tool_response><tool_response>14:05</tool_response><|assistant|><think>Both results are in.</think>Paris is 18 C; Oslo is 14:05.<|user|>Thanks. And tomorrow?<|assistant|><think>"
+ },
+ {
+  "name": "multi/tools/response_format",
+  "request": {
+   "model": "glm",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris and the time in Oslo?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "Two lookups; call both tools.",
+     "tool_calls": [
+      {
+       "id": "call_a",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"
+       }
+      },
+      {
+       "id": "call_b",
+       "type": "function",
+       "function": {
+        "name": "get_time",
+        "arguments": "{\"city\": \"Oslo\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_b",
+     "content": "14:05"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_a",
+     "content": "{\"temp\": 18}"
+    },
+    {
+     "role": "assistant",
+     "content": "Paris is 18 C; Oslo is 14:05.",
+     "reasoning_content": "Both results are in."
+    },
+    {
+     "role": "user",
+     "content": "Thanks. And tomorrow?"
+    }
+   ],
+   "max_tokens": 64,
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "answer",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "answer": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "answer"
+      ]
+     }
+    }
+   },
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the user's current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City <name>"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the user's current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City <name>\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"get_time\", \"description\": \"Local time in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are terse.<|user|>What's the weather in Paris and the time in Oslo?<|assistant|><think>Two lookups; call both tools.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>unit</arg_key><arg_value>c</arg_value></tool_call><tool_call>get_time<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call><|observation|><tool_response>{\"temp\": 18}</tool_response><tool_response>14:05</tool_response><|assistant|><think>Both results are in.</think>Paris is 18 C; Oslo is 14:05.<|user|>Thanks. And tomorrow?<|assistant|><think>"
+ }
+]

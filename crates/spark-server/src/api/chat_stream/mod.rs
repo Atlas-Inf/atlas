@@ -32,6 +32,7 @@ mod state;
 mod strip;
 mod token_ids;
 mod tool_handlers;
+mod tool_security;
 
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive};
@@ -68,6 +69,7 @@ pub(crate) async fn run_chat_stream(
     max_tokens: usize,
     min_tokens: usize,
     ignore_eos: bool,
+    disable_mtp: bool,
     temperature: f32,
     top_k: u32,
     top_p: f32,
@@ -161,7 +163,7 @@ pub(crate) async fn run_chat_stream(
         require_tool_call: tool_choice_required,
         tools_present: tools_active,
         suppress_tool_call,
-        disable_mtp: false,
+        disable_mtp,
         grammar_spec,
         seed,
         top_logprobs,
@@ -191,7 +193,10 @@ pub(crate) async fn run_chat_stream(
     let leak_markers: tool_parser::LeakMarkers = state
         .tool_call_parser
         .as_ref()
-        .map(|p| p.leak_markers())
+        .map(|p| {
+            p.leak_markers()
+                .for_literal_xml(state.tokenizer.glm_tool_markup_as_text)
+        })
         .unwrap_or(tool_parser::LeakMarkers::EMPTY);
 
     // `--reference-mode`: no per-response tool-call cap (a reference server
@@ -234,6 +239,7 @@ pub(crate) async fn run_chat_stream(
         stop_strings,
         stop_string_buffer_len,
         leak_markers,
+        role_literal_leaks: state.tokenizer.filters_bare_role_literals(),
         wants_typed_arguments: state
             .tool_call_parser
             .as_ref()
@@ -321,6 +327,7 @@ pub(crate) async fn run_chat_stream(
                 )
             }
             StreamEvent::Error(msg) => handle_error::handle_error(&ctx, msg),
+            StreamEvent::InvalidRequest(msg) => handle_error::handle_invalid_request(&ctx, msg),
         };
 
         futures::stream::iter(deltas).boxed()

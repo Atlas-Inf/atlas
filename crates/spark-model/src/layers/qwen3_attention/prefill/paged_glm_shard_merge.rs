@@ -20,7 +20,7 @@ type Swap = (DevicePtr, DevicePtr, usize);
 /// The query swap of a merge-form owner of `rows` rows: this rank's heads'
 /// absorbed `query` out, the peer's into the merge scratch at `work`.
 fn query_swap(work: DevicePtr, query: DevicePtr, rows: u32) -> Swap {
-    let m = MergeLayout::new(rows, shard::merge_splits(rows));
+    let m = MergeLayout::new(rows, shard::MERGE_SPLITS);
     let bytes = rows as usize * (HEADS * LATENT) as usize * 2;
     (query, work.offset(m.q_peer), bytes)
 }
@@ -53,32 +53,31 @@ pub(super) struct ShardMerge<'a> {
     /// This rank's latent pool of the layer.
     pub pool: DevicePtr,
     pub scale: f32,
-    /// `ATLAS_GLM_KV_SHARD_COMPACT=1`.
-    pub compact: bool,
     /// Where the exchanges overlap compute (never under graph capture).
     pub lane: Option<ExchangeLane>,
 }
 
 impl ShardMerge<'_> {
     /// This rank's heads' attention over the selected tokens of both ranks
-    /// into `output` (`[rows, 32, 512]` BF16).
+    /// into `output` (`[rows, 32, 512]` BF16). Every launch is one the
+    /// canonical form of an unsharded pair runs for the same heads
+    /// (`ops::glm_sparse_canonical`), so the bits match it.
     pub(super) fn run(&self, a: ShardRows, output: DevicePtr, stream: u64) -> Result<()> {
-        let (gpu, comm, s) = (self.gpu, self.comm, &self.shard);
-        let (compact, lane) = (self.compact, self.lane);
-        let splits = shard::merge_splits(a.rows);
+        let (gpu, comm, s, lane) = (self.gpu, self.comm, &self.shard, self.lane);
+        let splits = shard::MERGE_SPLITS;
         let m = MergeLayout::new(a.rows, splits);
         ensure!(
             m.total <= self.work_bytes,
             "GLM KV shard merge scratch overflow"
         );
         let at = |offset: usize| s.scratch.offset(self.work + offset);
-        let rows = a.rows as usize;
-        let part = rows * (HEADS * LATENT) as usize * 4;
-        let lse = rows * HEADS as usize * 4;
-        // Compact: each row's owned IDs first, their number in `counts`.
-        let counts = compact.then(|| at(m.counts(a.rows, splits)));
-        // Selected IDs -> local token IDs; the peer's tokens become -1.
+        let part = a.rows as usize * (HEADS * LATENT) as usize * 4;
+        // Each row's IDs this rank stores, packed to the front and counted.
+        let counts = at(m.counts(a.rows, splits));
         let localize = || {
+            if a.localized {
+                return Ok(());
+            }
             ops::glm_kv_shard_localize(
                 gpu,
                 a.selected,
@@ -124,53 +123,52 @@ impl ShardMerge<'_> {
             block_size: 16,
             scale: self.scale,
         };
-        // 3. The peer's heads over this rank's tokens: one FP32 partial + LSE.
+        // 3. Both heads' partitions over this rank's tokens; the peer's heads'
+        //    merged to one FP32 partial + LSE.
         let send = at(m.send);
-        let peer_heads = tc(queries.1);
-        if splits == 1 {
-            let send_lse = send.offset(part);
-            ops::launch_sparse_partials(gpu, &peer_heads, 1, counts, send, send_lse, stream)?;
-        } else {
-            let (po, pl) = (at(m.peer_o), at(m.peer_lse));
-            ops::launch_sparse_partials(gpu, &peer_heads, splits, counts, po, pl, stream)?;
-            ops::launch_merge_f32(gpu, po, pl, send, send.offset(part), a.rows, splits, stream)?;
-        }
-        // 4. Swap the partials; this rank's heads' own partitions (beside the
-        //    swap when overlapping) need nothing from the peer.
-        let recv = at(m.recv);
-        let partials: Swap = (send, recv, MergeLayout::partial_bytes(a.rows));
-        let (own_o, own_lse) = (at(m.own_o), at(m.own_lse));
-        let own = || {
-            ops::launch_sparse_partials(gpu, &tc(a.query), splits, counts, own_o, own_lse, stream)
+        let own = [at(m.own_o), at(m.own_lse)];
+        let peer = [at(m.peer_o), at(m.peer_lse)];
+        let group = |query: DevicePtr, [part_o, part_lse]: [DevicePtr; 2]| ops::PartialGroup {
+            query,
+            indices: at(m.ids),
+            counts,
+            part_o,
+            part_lse,
         };
+        let partials = |query: DevicePtr, [o, l]: [DevicePtr; 2]| {
+            ops::launch_sparse_partials(gpu, &tc(query), splits, Some(counts), o, l, stream)
+        };
+        // Without an overlap both heads' partitions go in one launch; with
+        // one, this rank's heads' partitions run beside the partial swap.
+        if lane.is_none() {
+            let groups = [group(a.query, own), group(queries.1, peer)];
+            ops::launch_sparse_partial_pair(gpu, &tc(a.query), splits, groups, stream)?;
+        } else {
+            partials(queries.1, peer)?;
+        }
+        let [po, pl] = peer;
+        ops::launch_merge_f32(gpu, po, pl, send, send.offset(part), a.rows, splits, stream)?;
+        // 4. Swap the partials.
+        let recv = at(m.recv);
+        let swap: Swap = (send, recv, MergeLayout::partial_bytes(a.rows));
         match lane {
-            Some(lane) => shard::overlapped_exchange(gpu, comm, lane, partials, stream, |_| own())?,
-            None => {
-                shard::pair_exchange(comm, partials.0, partials.1, partials.2, stream)?;
-                own()?;
-            }
+            Some(lane) => shard::overlapped_exchange(gpu, comm, lane, swap, stream, |_| {
+                partials(a.query, own)
+            })?,
+            None => shard::pair_exchange(comm, swap.0, swap.1, swap.2, stream)?,
         }
-        // 5. One LSE merge to BF16 with the peer's partial as partition
-        //    `splits`: where it landed (compact), else copied behind the own.
-        let out_lse = at(m.out_lse);
-        if compact {
-            return ops::launch_merge_extra(
-                gpu, own_o, own_lse, output, out_lse, a.rows, splits, recv, stream,
-            );
-        }
-        let tail = splits as usize;
-        gpu.copy_d2d_async(recv, own_o.offset(tail * part), part, stream)?;
-        gpu.copy_d2d_async(recv.offset(part), own_lse.offset(tail * lse), lse, stream)?;
-        ops::launch_merge(
+        // 5. One LSE merge to BF16 with the peer's partial, where it landed,
+        //    as partition `splits`.
+        let [own_o, own_lse] = own;
+        ops::launch_merge_extra(
             gpu,
-            ops::merge_kernel(gpu)?,
             own_o,
             own_lse,
             output,
-            out_lse,
+            at(m.out_lse),
             a.rows,
-            a.rows * HEADS,
-            splits + 1,
+            splits,
+            recv,
             stream,
         )
     }
@@ -179,3 +177,7 @@ impl ShardMerge<'_> {
 #[cfg(test)]
 #[path = "paged_glm_shard_merge_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "paged_glm_shard_merge_gpu_tests.rs"]
+mod gpu_tests;

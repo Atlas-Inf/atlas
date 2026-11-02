@@ -61,6 +61,17 @@ pub(crate) fn build_full_attention_nvfp4(
                 let src = if store.contains(&format!("{prefix}.weight_packed")) {
                     quantized_auto(store, &prefix, gpu, variant)?
                 } else {
+                    crate::weight_map::ensure_checkpoint_shape(
+                        store,
+                        &format!("{prefix}.weight"),
+                        full_n,
+                        full_k,
+                        if config.attn_gated && name == "q_proj" {
+                            "attn_output_gate doubles q rows"
+                        } else {
+                            "attention projection dims from the config"
+                        },
+                    )?;
                     let dense_bf16 = dense_auto(store, &format!("{prefix}.weight"), gpu)?;
                     quantize_to_nvfp4(
                         &dense_bf16,
@@ -112,6 +123,17 @@ pub(crate) fn build_full_attention_nvfp4(
                 crate::weight_map::QuantizedWeight,
             )> {
                 let __t0 = std::time::Instant::now();
+                crate::weight_map::ensure_checkpoint_shape(
+                    store,
+                    &format!("{p}.{name}.weight"),
+                    full_n,
+                    full_k,
+                    if config.attn_gated && name == "q_proj" {
+                        "attn_output_gate doubles q rows"
+                    } else {
+                        "attention projection dims from the config"
+                    },
+                )?;
                 let src = dense_auto(store, &format!("{p}.{name}.weight"), gpu)?;
                 let __t_dq_ms = __t0.elapsed().as_millis();
                 let (sharded_ptr, local_n, local_k) =
@@ -265,7 +287,15 @@ pub(crate) fn build_full_attention_nvfp4(
             .transpose_for_gemm(gpu, h, num_heads * head_dim)?;
         layer.set_prefill_weights(Some(qt), Some(kt), Some(vt), Some(ot));
     }
-    layer.predequant_for_prefill(gpu, config, stream)?;
+    // Native-HIP (atlas_hip) lacks the FP8 *prefill* GEMM kernels
+    // (fp8_gemm_n128 / fp8_gemm_t_blockscaled are inline-PTX, not yet
+    // WMMA-ported). Skip the FP8→FP8 predequant so q/k/v/o prefill falls to
+    // the NVFP4 w4a16 WMMA path (`w4a16_gemm_t_m128` arms in
+    // cache_skip_qkv.rs / paged_qkv.rs / paged_oproj.rs). SCALE/NVIDIA keep
+    // FP8 prefill. Mirrors the sibling guard in linear_attn_arms.rs.
+    if !cfg!(atlas_hip) {
+        layer.predequant_for_prefill(gpu, config, stream)?;
+    }
 
     Ok(Box::new(layer))
 }

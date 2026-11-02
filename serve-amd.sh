@@ -80,7 +80,14 @@ export ATLAS_MTP_GATE_REPROBE=64  # re-probe the MTP accept gate every 64 tokens
 # The actual default is resolved below the DFLASH block — DFlash needs a
 # smaller one (see below).
 GPU_UTIL="${GPU_UTIL:-}"
-SSM_SLOTS="${SSM_SLOTS:-0}"
+# SSM_SLOTS: Marconi snapshot slots (the engine raises the count to cover MAX_SEQ_LEN). 0 DISABLES the pool,
+# and a hybrid model (27B, Flash-Next: GDN layers) can then never restore a cached prefix: every prefix-cache hit
+# is dropped ("Prefix cache hit: N tokens but no SSM snapshot -- recomputing all KV"). Default 8 (2026-11-01):
+#   Flash-Next, framework f165/f168 (1 user, MTP): TTFT after 8k of context 10.0 -> 3.15 s, after 16k 21.3 -> 5.8 s
+#   27B, strix s177 (1 user, MTP): TTFT after 8k 35.3 -> 9.25 s, after 16k 68.7 -> 10.5 s
+# at the cost of a cold prompt (Flash-Next 2k: 1.82 -> 2.34 s; 27B 2k: 5.7 -> 6.6 s). Agentic leg with it on:
+# 45/50 (f167; earlier slots-8 gates 46-48/50). SSM_SLOTS=0 restores the old behaviour.
+SSM_SLOTS="${SSM_SLOTS:-8}"
 # SSM_CKPT_INTERVAL: tokens between Marconi snapshots; default 16 (=256
 # tok/snapshot, the certified warm-prefill recipe). The engine raises
 # --ssm-cache-slots to cover MAX_SEQ_LEN at that granularity, so at 24K ctx
@@ -200,6 +207,25 @@ echo "serving $MODEL on ${GFX:-AMD} via $HW"
 # resolve to the same thing, kept explicit so LM_HEAD stays a knob). For the
 # unsloth checkpoint use LM_HEAD=bf16 — its lm_head ships per-row FP8 and the
 # frozen accuracy recipe preserves it to BF16.
+# Flash-Next's FP8 GDN decode copy (the gfx1151 default since #275) costs
+# ~1.9 GB on top of the BF16 projections kept for prefill. At MAX_BATCH 1 that
+# is +17% decode for nothing; at MAX_BATCH 8 it left 0.1 GB of KV on a 96 GB
+# GPU and C4/C8 requests ran one at a time (framework f114). So above batch 1
+# the recipe keeps BF16 unless ATLAS_QWEN4EXP_FP8_GDN is set explicitly.
+if [ "${MAX_BATCH:-1}" -gt 1 ]; then
+  export ATLAS_QWEN4EXP_FP8_GDN="${ATLAS_QWEN4EXP_FP8_GDN:-0}"
+  # The qwen4_exp exact batching lane is what batches a Flash-Next multi-sequence
+  # decode step on gfx1151 (without it the mHC multi-seq paths run the MoE a row at
+  # a time). Framework f128/f132: C4 15.3 -> 24.3, C8 15.1 -> 27.9 tok/s (AR), C4
+  # 15.2 -> 25.6, C8 15.0 -> 27.3 (MTP). It also takes over the single-sequence MTP
+  # verify, which costs a lone request ~15% (f132: C1 MTP 20.6 -> 17.5), so the
+  # recipe turns it on only for multi-request serving. Explicit values win.
+  export ATLAS_QWEN4EXP_BATCH_FAST="${ATLAS_QWEN4EXP_BATCH_FAST:-1}"
+  # On top of the lane, the per-row MoE top-k / blend and the GDN decode chain as one launch per
+  # layer (qwen4exp_gdn_decode_fused_rows: the strix-hip port of the gb10 cluster kernel). Framework
+  # f160 (Flash-Next, AR, x2): C4 34.0 -> 35.9, C8 38.2 -> 40.0 tok/s; solo text identical 8/8.
+  export ATLAS_QWEN4EXP_BATCH_SMALL="${ATLAS_QWEN4EXP_BATCH_SMALL:-1}"
+fi
 exec "$BIN" serve "$MODEL" "${NAME_ARG[@]}" \
   --host "${HOST:-0.0.0.0}" --port "${PORT:-8081}" \
   --max-seq-len "$MAX_SEQ_LEN" \

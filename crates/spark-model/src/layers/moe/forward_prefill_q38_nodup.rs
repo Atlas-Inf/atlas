@@ -32,6 +32,9 @@
 //!
 //! `ATLAS_QWEN4EXP_PREFILL_MOE_CHECK` compares against the default chain on
 //! the K-major copy, so it does not run under the switch.
+//!
+//! `ATLAS_QWEN4EXP_PREFILL_W4A4` reads the same planes
+//! (`forward_prefill_w4a4`), so it skips the copy too.
 
 use super::*;
 
@@ -42,10 +45,12 @@ pub(crate) fn nodup_requested() -> bool {
 }
 
 /// Whether the startup transpose pass leaves `config`'s routed experts in
-/// their checkpoint layout: the switch, the q38 prefill arm that reads them,
-/// and this model.
+/// their checkpoint layout: the q38 prefill arm that reads them so (this
+/// switch, or `ATLAS_QWEN4EXP_PREFILL_W4A4`), and this model.
 pub(crate) fn skips_routed_transpose(config: &atlas_core::config::ModelConfig) -> bool {
-    nodup_requested() && super::q38_requested() && config.model_type == "qwen4_exp"
+    super::q38_requested()
+        && (nodup_requested() || super::w4a4_requested())
+        && config.model_type == "qwen4_exp"
 }
 
 /// The q38 routed entry `name` (after the W2 choice), or its N-major twin.
@@ -63,7 +68,8 @@ pub(super) fn routed_entry(name: &'static str, nm: bool) -> &'static str {
 impl MoeLayer {
     /// The (gate, up, down) tables the q38 routed chain reads, and whether
     /// they are the checkpoint's N-major planes: the K-major copy when the
-    /// transpose pass built it, else the originals under the switch. The
+    /// transpose pass built it, else the originals under the switch (or
+    /// `_PREFILL_W4A4`, whose kernels read them). The
     /// N-major kernels load 64-byte packed and 8-byte scale runs of four K
     /// steps, so they need both K (hidden and `inter`) to be multiples of
     /// 128 (the startup pass checked the planes' alignment).
@@ -75,7 +81,9 @@ impl MoeLayer {
         match (&self.gate_ptrs_t, &self.up_ptrs_t, &self.down_ptrs_t) {
             (Some(g), Some(u), Some(d)) => Some(([g, u, d], false)),
             (None, None, None)
-                if nodup_requested() && h.is_multiple_of(128) && inter.is_multiple_of(128) =>
+                if (nodup_requested() || super::w4a4_requested())
+                    && h.is_multiple_of(128)
+                    && inter.is_multiple_of(128) =>
             {
                 Some(([&self.gate_ptrs, &self.up_ptrs, &self.down_ptrs], true))
             }
@@ -83,13 +91,14 @@ impl MoeLayer {
         }
     }
 
-    /// The startup check behind [`Self::q38_routed_tables`]' N-major arm:
-    /// every local expert's packed planes 16-byte and scale planes 8-byte
-    /// aligned (the kernels' cp.async sizes), NVFP4 scales.
+    /// The startup check behind [`Self::q38_routed_tables`]' N-major arm
+    /// (this switch or `_PREFILL_W4A4`): every local expert's packed planes
+    /// 16-byte and scale planes 8-byte aligned (the kernels' cp.async sizes),
+    /// NVFP4 scales.
     pub(super) fn check_q38_nodup_planes(&self) -> Result<()> {
         anyhow::ensure!(
             self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4,
-            "ATLAS_QWEN4EXP_PREFILL_MOE_NODUP: routed experts are not NVFP4"
+            "qwen4_exp N-major routed prefill: routed experts are not NVFP4"
         );
         for (e, expert) in self.weights.experts.iter().enumerate() {
             if expert.gate_proj.is_null() {
@@ -98,7 +107,7 @@ impl MoeLayer {
             for w in [&expert.gate_proj, &expert.up_proj, &expert.down_proj] {
                 anyhow::ensure!(
                     w.weight.0 % 16 == 0 && w.weight_scale.0 % 8 == 0,
-                    "ATLAS_QWEN4EXP_PREFILL_MOE_NODUP: expert {e} planes misaligned \
+                    "qwen4_exp N-major routed prefill: expert {e} planes misaligned \
                      (packed {:#x}, scales {:#x})",
                     w.weight.0,
                     w.weight_scale.0

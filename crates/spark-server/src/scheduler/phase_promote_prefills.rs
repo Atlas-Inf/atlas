@@ -53,6 +53,14 @@ pub(super) fn promote_completed_prefills(
             continue;
         };
         let spontaneous_think = !p.enable_thinking && think_start_token == Some(first);
+        let slot = p.seq.slot_idx;
+        super::ttft_trace::mark(
+            slot,
+            super::ttft_trace::Mark::FirstSampled(!spontaneous_think && p.max_tokens > 0),
+        );
+        if !spontaneous_think {
+            super::ttft_trace::visible_at_prefill(slot);
+        }
         // Legacy echo+logprobs: prompt logprobs precede any token event.
         if p.seq.collect_prompt_logprobs.is_some()
             && let ResponseSink::Streaming(ref tx) = p.sink
@@ -197,7 +205,7 @@ pub(super) fn build_active_seq_from_prefill(
         inside_thinking: thinking.inside_thinking,
         enable_thinking: p.enable_thinking,
         thinking_budget: if !immediate_finish && spontaneous_think {
-            Some(p.spontaneous_think_budget)
+            atlas_kernels::thinking_ceiling(p.spontaneous_think_budget)
         } else {
             p.thinking_budget
         },

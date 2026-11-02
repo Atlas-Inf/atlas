@@ -89,9 +89,10 @@ pub fn gdn_decode_rows(
             table[i] = h.0;
             table[GDN_ROWS_MAX + i] = conv.0;
         }
+        let (grid_x, block) = super::qwen4exp_decode_fuse::gdn_grid_x_block(nv);
         KernelLaunch::new(gpu, k)
-            .grid([nv, states.len() as u32, 1])
-            .block([GDN_D, 1, 1])
+            .grid([grid_x, states.len() as u32, 1])
+            .block([block, 1, 1])
             .arg_words(&table)
             .arg_ptr(b.qkvz.offset(first * b.qkvz_stride as usize * bf16))
             .arg_ptr(b.conv_w)

@@ -26,6 +26,9 @@
 pub(crate) mod block_mgmt;
 mod block_table_upload;
 pub(crate) mod decode_pieces;
+mod dflash_capture_batch;
+pub(crate) mod dflash_ctx_window;
+mod dflash_warm_ctx;
 mod draft_assist;
 pub(crate) mod qsa_commit_table;
 pub use draft_assist::DraftAssist;
@@ -39,10 +42,13 @@ pub(crate) mod glm_k3_head;
 mod glm_long_verify;
 mod glm_prefill_sp;
 mod glm_verify_masks;
+mod glm_verify_sample;
 mod glm_vocab_split;
 mod qwen4exp_prefill_sp;
 pub use glm_verify_masks::MASKED_VERIFY;
 pub(crate) use glm_verify_masks::prepare as prepare_glm_verify_masks;
+pub use glm_verify_sample::SplitRow;
+pub(crate) use glm_verify_sample::prepare as prepare_glm_verify_sample;
 pub(crate) mod graph_flags;
 pub(crate) use glm_vocab_split::prepare_shard_mxfp8 as prepare_glm_head_mxfp8;
 pub(crate) mod dspark_generation;
@@ -101,7 +107,9 @@ pub(crate) mod token_overlay;
 pub(crate) mod trait_impl;
 pub(crate) mod types;
 pub(crate) mod verify_pieces;
+mod vision_cache;
 pub(crate) mod vision_transport;
+pub use vision_transport::VisionCapacityError;
 mod warm_turn;
 
 // Served NLLB-200 / M2M-100 encoder-decoder model (CUDA/GB10 serving path).
@@ -116,3 +124,7 @@ pub use types::TransformerModel;
 pub fn ep_protocol_v2_requested() -> bool {
     matches!(std::env::var("ATLAS_EP_PROTOCOL").as_deref(), Ok("v2"))
 }
+
+#[cfg(test)]
+#[path = "impl_a2/idle_command_fixture.rs"]
+mod test_fixture;

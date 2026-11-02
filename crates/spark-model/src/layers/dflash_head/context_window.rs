@@ -9,9 +9,12 @@ impl BlockDiffusionDraftHead {
     /// Rows of the per-sequence context accumulator: the drafter window,
     /// capped at `max_seq_len`.
     pub(super) fn ctx_window_len(&self) -> usize {
-        self.window_size
-            .unwrap_or(self.max_seq_len)
-            .min(self.max_seq_len)
+        let capacity = self.ctx_window.min(self.max_seq_len);
+        if self.query_causal {
+            capacity
+        } else {
+            self.window_size.unwrap_or(capacity).min(capacity)
+        }
     }
 
     /// SWA window in tokens for the paged attention kernel. 0 = no window.
@@ -28,5 +31,36 @@ impl BlockDiffusionDraftHead {
             return 0;
         }
         self.window_size.unwrap_or(0) as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::free_state_tests::zero_head;
+
+    #[test]
+    fn causal_context_retains_the_configured_budget() {
+        let mut head = zero_head();
+        head.max_seq_len = 524_288;
+        head.ctx_window = 16_384;
+        head.window_size = Some(2_048);
+        head.query_causal = true;
+        assert_eq!(head.ctx_window_len(), 16_384);
+        assert_eq!(head.attn_sliding_window(), 2_048);
+    }
+
+    #[test]
+    fn noncausal_window_never_exceeds_scratch_or_sequence_capacity() {
+        let mut head = zero_head();
+        head.max_seq_len = 524_288;
+        head.ctx_window = 4_096;
+        head.window_size = Some(2_048);
+        head.query_causal = false;
+        assert_eq!(head.ctx_window_len(), 2_048);
+        assert_eq!(head.attn_sliding_window(), 0);
+        head.ctx_window = 1_024;
+        assert_eq!(head.ctx_window_len(), 1_024);
+        head.max_seq_len = 512;
+        assert_eq!(head.ctx_window_len(), 512);
     }
 }

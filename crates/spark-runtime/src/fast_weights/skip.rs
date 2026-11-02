@@ -10,7 +10,9 @@
 //!      table). Model-declared, so it is checked FIRST and independently of
 //!      expert parallelism.
 //!   2. **EP sharding** — remote experts belong to another rank.
-//!   3. **`skip_activation_scales`** — W4A4 `*.input_scale`, opt-in.
+//!   3. **`skip_activation_scales`** — W4A4 `*.input_scale`, opt-in: not
+//!      uploaded but DEFERRED, every expert's on every rank (the model loader
+//!      reads the scalars from disk).
 //!   4. **`skip_mtp`** — `mtp.*` for a loader that builds no MTP head, opt-in.
 //!
 //!   5. **`skip_layer_prefix`** — an unused appended predictor layer, opt-in.
@@ -21,13 +23,37 @@
 //! is only ever populated by a loader that has its own row reader.
 
 use super::FastSafetensorsLoader;
+use crate::weights::nvfp4_csf::csf_part;
 use crate::weights::parse_expert_index;
 
 impl FastSafetensorsLoader {
+    /// Tensors located on disk but not uploaded: host-decoded formats and
+    /// expert-TP slices; the activation scales under `skip_activation_scales`
+    /// (one 0-dim F32 per projection, read on the host by a model loader that
+    /// needs them, whichever rank owns the expert). Deferred tensors are also
+    /// left out of the pre-flight. A CSF-compressed scale defers as its
+    /// components (judged by the scale's name), decoded per slice by
+    /// `with_deferred_slice`.
+    pub(super) fn should_defer_tensor(&self, name: &str) -> bool {
+        let name = csf_part(name).map_or(name, |(scale, _)| scale);
+        (self.skip_activation_scales && name.ends_with(".input_scale"))
+            || self.is_host_decoded(name)
+            || self.is_expert_tp_slice(name)
+    }
+
+    /// The weight/scale pair of every module the model build expands on the
+    /// host (`host_decode_modules`).
+    fn is_host_decoded(&self, name: &str) -> bool {
+        let module = name
+            .strip_suffix(".weight")
+            .or_else(|| name.strip_suffix(".weight_scale"));
+        module.is_some_and(|m| self.host_decode_modules.contains(m))
+    }
+
     /// Expert TP: a routed expert's packed weight or block scale, which the
     /// model loader slices straight from disk. The appended predictor layer
     /// keeps its own replication rules, and the scalars load as usual.
-    pub(super) fn should_defer_tensor(&self, name: &str) -> bool {
+    fn is_expert_tp_slice(&self, name: &str) -> bool {
         self.expert_tp
             && !name.starts_with("mtp.")
             && (name.ends_with(".weight") || name.ends_with(".weight_scale"))
@@ -88,11 +114,13 @@ impl FastSafetensorsLoader {
         {
             return true;
         }
-        // W4A4 activation scales: never read on the w4a16 path (the NVFP4
-        // loader falls back to `DevicePtr::NULL`), and 4-byte allocations are
-        // almost pure granule padding at expert scale.
+        // W4A4 activation scales: not uploaded -- 4-byte allocations are
+        // almost pure granule padding at expert scale, and the NVFP4 loader
+        // falls back to `DevicePtr::NULL` -- but deferred (`should_defer_tensor`)
+        // for every expert, remote ones included: qwen4_exp's W4A4 prefill
+        // quantizes a layer's input under the max over all of them.
         if self.skip_activation_scales && name.ends_with(".input_scale") {
-            return true;
+            return false;
         }
         if self.ep_world_size <= 1 {
             return false;

@@ -8,6 +8,7 @@ pub(in crate::weight_loader::glm5) struct LoadedDense<'a> {
     store: &'a WeightStore,
     log: Option<&'a RetirementLog<'a>>,
     origin: Option<Origin>,
+    checkpoint: Option<Identity>,
     bytes: usize,
 }
 
@@ -19,6 +20,24 @@ impl<'a> LoadedDense<'a> {
         log: Option<&'a RetirementLog<'a>>,
         keep_f32: bool,
     ) -> Result<Self> {
+        // The production loader has no construction log. Capture ownership
+        // before conversion: a later allocation may reuse a retired address.
+        let checkpoint = if log.is_none() {
+            ensure!(
+                !store.was_reclaimed(name),
+                "checkpoint already reclaimed: {name}"
+            );
+            let source = Identity::read(store, name)?;
+            (source.dtype
+                == if keep_f32 {
+                    WeightDtype::FP32
+                } else {
+                    WeightDtype::BF16
+                })
+            .then_some(source)
+        } else {
+            None
+        };
         let origin = log.map(|log| log.capture(store, name, gpu)).transpose()?;
         let native = origin.as_ref().is_some_and(|origin| {
             origin.identity.dtype
@@ -49,6 +68,12 @@ impl<'a> LoadedDense<'a> {
         } else {
             crate::weight_map::dense_auto(store, name, gpu)?
         };
+        if let Some(source) = &checkpoint {
+            ensure!(
+                source.ptr == dense.weight,
+                "native dense source changed address"
+            );
+        }
         let origin = if native {
             ensure!(
                 origin
@@ -68,6 +93,7 @@ impl<'a> LoadedDense<'a> {
             store,
             log,
             origin,
+            checkpoint,
             bytes,
         })
     }
@@ -78,7 +104,25 @@ impl<'a> LoadedDense<'a> {
             (Some(log), None) => {
                 log.release_derived(self.store, self.dense.weight, self.bytes, gpu)
             }
-            (None, None) => gpu.free(self.dense.weight),
+            (None, None) => match self.checkpoint {
+                Some(source) => {
+                    source.matches(self.store)?;
+                    ensure!(
+                        source.ptr == self.dense.weight,
+                        "checkpoint release changed address"
+                    );
+                    ensure!(
+                        !self.store.was_reclaimed(&source.name),
+                        "checkpoint already reclaimed: {}",
+                        source.name
+                    );
+                    // Record the retirement attempt before freeing, including
+                    // ambiguous failures. Store cleanup must not retry it;
+                    // the backend retains its own failed-free cleanup ledger.
+                    self.store.reclaim(gpu, &source.name)
+                }
+                None => gpu.free(self.dense.weight),
+            },
             (None, Some(_)) => unreachable!("origin requires construction log"),
         }
     }
@@ -103,6 +147,7 @@ impl<'a> LoadedDense<'a> {
             store,
             log,
             origin: None,
+            checkpoint: None,
             bytes,
         })
     }
@@ -115,3 +160,7 @@ impl<'a> LoadedDense<'a> {
 #[cfg(test)]
 #[path = "retirement_dense_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "retirement_reuse_tests.rs"]
+mod reuse_tests;

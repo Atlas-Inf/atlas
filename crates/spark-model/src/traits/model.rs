@@ -145,6 +145,32 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// Whether a sampled verify on that argmax-only head can still pick from
+    /// the target's distribution: [`Self::verify_split_candidates`] and
+    /// [`Self::verify_split_full_rows`] serve.
+    fn verify_split_sampling(&self) -> bool {
+        false
+    }
+
+    /// Head only, between a verify's forward and its verdict word: every
+    /// rank's best logits of verify rows `[0, rows)` at `temperature`, with
+    /// the logits of `specials` (the tokens the host pipeline may mask) and
+    /// what the rest of each row adds up to (`spark_model::model::SplitRow`).
+    fn verify_split_candidates(
+        &self,
+        _rows: usize,
+        _temperature: f32,
+        _specials: &[u32],
+    ) -> Result<Vec<crate::model::SplitRow>> {
+        bail!("this model has no split verify head")
+    }
+
+    /// Head only, like [`Self::verify_split_candidates`]: verify rows
+    /// `[0, rows)` whole, `rows * vocab` BF16 logits into `out`.
+    fn verify_split_full_rows(&self, _rows: usize, _out: &mut [u8]) -> Result<()> {
+        bail!("this model has no split verify head")
+    }
+
     /// Run beam search to completion for each request, returning each one's
     /// winning hypothesis token ids (EOS-terminated). Called from the prefill
     /// path for `num_beams > 1` requests, bypassing the token-by-token decode
@@ -350,6 +376,19 @@ pub trait Model: Send + Sync {
             decode_logits,
             prefill_logits,
         })
+    }
+
+    /// R11 fix 5: shrink a NON-last scheduler prefill chunk so it ends on the
+    /// model's prefill cut grid (no stray 1-token passes where a chunk end and
+    /// a grid cut sit one token apart). Default: unchanged.
+    fn align_prefill_chunk(&self, _offset: usize, len: usize, _total: usize) -> usize {
+        len
+    }
+
+    /// R11 fix 4: whether the scheduler should run `normalize_ssm_states`
+    /// after a prefill chunk ending at `chunk_end`. Default: always.
+    fn normalize_after_chunk(&self, _seq: &SequenceState, _chunk_end: usize) -> bool {
+        true
     }
 
     /// Normalize SSM h_state norms to prevent catastrophic state explosion
@@ -1014,6 +1053,21 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
+    /// `ATLAS_QWEN4EXP_MTP_ABSORB`: hand `seq`'s proposer the live verify
+    /// forward's stream-highway rows `row .. row + accepted.len()` with the
+    /// drafts they accepted, so the drafter can rebuild those positions from
+    /// the target (`DraftProposer::stage_absorb`). Call after the verify and
+    /// before anything reuses its buffers. Default: no-op.
+    // Ported from Enntity/atlas 166e2b1 (AGPL-3.0-only).
+    fn stage_mtp_absorb(
+        &self,
+        _seq: &mut SequenceState,
+        _row: usize,
+        _accepted: &[u32],
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// ATLAS_MTP_CATCHUP: ring-capture a serially decoded token's final
     /// hidden at `pos` for the drafter catch-up feed. Default no-op.
     fn save_hidden_for_catchup(&self, _token_idx: usize, _pos: usize) -> Result<()> {
@@ -1148,10 +1202,46 @@ pub trait Model: Send + Sync {
     /// Each tuple is `(pixels: Vec<f32>, grid_h: usize, grid_w: usize)`.
     /// Pixels are laid out [P, C×T×Hp×Wp] matching `vision_preprocess::preprocess_image`.
     /// Must be called before `prefill_chunk` when the prompt contains `<|image_pad|>` tokens.
+    /// The embeddings, grids and hashes land on `seq` (per-sequence vision
+    /// state) — the model holds none between requests.
     ///
     /// Default: no-op (text-only models).
-    fn prepare_vision_embed(&self, _images: &[crate::VisionItem]) -> Result<()> {
+    fn prepare_vision_embed(
+        &self,
+        _seq: &mut crate::traits::SequenceState,
+        _images: Vec<crate::VisionItem>,
+    ) -> Result<()> {
         Ok(())
+    }
+
+    /// `(window, request)`: the merged vision rows one encode may write (the
+    /// encoder output window, which one prefill chunk's items must fit) and
+    /// the rows one request may carry (`vision_limits`). Default `(0, 0)`.
+    fn vision_row_limits(&self) -> (usize, usize) {
+        (0, 0)
+    }
+
+    /// `prepare_vision_embed` for a request whose chunk 0 goes through
+    /// `prefill_chunk`: a model that prefix-caches vision prompts may stage
+    /// the images on `seq` and encode, inside the chunk-0 prefix lookup, only
+    /// those the cache does not cover. Default: encode now.
+    fn prepare_vision_embed_for_chunked(
+        &self,
+        seq: &mut crate::traits::SequenceState,
+        images: Vec<crate::VisionItem>,
+    ) -> Result<()> {
+        self.prepare_vision_embed(seq, images)
+    }
+
+    /// Derive `seq`'s per-item post-merge grids and content hashes from
+    /// `images` WITHOUT encoding: the co-dispatch path's rows are already in
+    /// the shared `buf_out` slice, but MRoPE, the cache key and the worker's
+    /// wire state need the geometry. Default: no-op (text models).
+    fn stage_vision_grids(
+        &self,
+        _seq: &mut crate::traits::SequenceState,
+        _images: &[crate::VisionItem],
+    ) {
     }
 
     /// Batched vision encode across N requests' images in ONE `forward_batched`
@@ -1166,12 +1256,13 @@ pub trait Model: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Set the co-dispatched batched-ViT slice for the NEXT prefill_chunk
-    /// (row offset into buf_out, grid index offset, image count and row count
-    /// owned). Pass all zeroes to reset to the legacy single-request
+    /// Set the co-dispatched batched-ViT slice for the NEXT prefill_chunk of
+    /// `seq` (row offset into buf_out, grid index offset, image count and row
+    /// count owned). Pass all zeroes to reset to the legacy single-request
     /// behaviour. Default: no-op.
     fn set_vision_slice_base(
         &self,
+        _seq: &mut crate::traits::SequenceState,
         _row_base: usize,
         _grid_base: usize,
         _owned_images: usize,
@@ -1188,6 +1279,7 @@ pub trait Model: Send + Sync {
     /// packed slice. Text-only models keep the default no-op implementation.
     fn ep_broadcast_vision_state_for_seq(
         &self,
+        _seq: &crate::traits::SequenceState,
         _seq_id: u32,
         _enabled: bool,
         _row_base: usize,

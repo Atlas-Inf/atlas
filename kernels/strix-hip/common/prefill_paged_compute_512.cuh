@@ -55,6 +55,16 @@ __device__ __forceinline__ float sw_exp_512(float x) {
 #define BR_512   32
 #define BC_512   32
 #define HDIM_512 512
+
+// The KV-tile loader macro lives in inferspark_prefill_paged_512.cu, which this
+// target links from gb10 (symlink). gb10 now stores its Q/K/V tiles XOR-swizzled
+// and indexes them through SWZ512 (00a3750bf, #309). This header reads the tiles
+// linearly (smem_K[row * HDIM_512 + col]), so on strix-hip SWZ512 is the linear
+// index the loader used before #309; without it the target does not compile
+// ("use of undeclared identifier 'SWZ512'", DevLab run 41365776429).
+#ifndef SWZ512
+#define SWZ512(row, col) ((row) * HDIM_512 + (col))
+#endif
 #define PAD_P_512 8
 #define K16_512 16
 #define WMMA_K_STEPS_512 (HDIM_512 / K16_512)   // 32 (QK^T contraction)

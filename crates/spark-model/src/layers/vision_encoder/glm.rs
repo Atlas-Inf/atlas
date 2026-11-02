@@ -17,6 +17,9 @@ mod forward;
 #[path = "glm/forward_tests.rs"]
 mod forward_tests;
 mod ops;
+#[cfg(test)]
+#[path = "glm/test_tower.rs"]
+pub(crate) mod test_tower;
 
 /// Queries per flash-attention block (four warps of 16 rows).
 const FLASH_QUERY_ROWS: u32 = 64;

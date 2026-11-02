@@ -27,8 +27,30 @@ mod dispatch_config;
 mod dispatch_helpers;
 #[path = "ops/dispatch_proj.rs"]
 mod dispatch_proj;
+#[path = "ops/fp8b.rs"]
+mod fp8b;
 #[path = "ops/mxfp8.rs"]
 mod mxfp8;
+#[path = "ops/mxfp8_act.rs"]
+mod mxfp8_act;
+#[path = "ops/mxfp8_proj.rs"]
+mod mxfp8_proj;
+#[cfg(test)]
+#[path = "ops/mxfp8_proj32_tests.rs"]
+mod mxfp8_proj32_tests;
+#[cfg(test)]
+#[path = "ops/mxfp8_proj_rowinv_tests.rs"]
+mod mxfp8_proj_rowinv_tests;
+#[cfg(test)]
+#[path = "ops/mxfp8_proj_tc_tests.rs"]
+mod mxfp8_proj_tc_tests;
+#[path = "ops/mxfp8_w8a8.rs"]
+mod mxfp8_w8a8;
+#[cfg(test)]
+#[path = "ops/mxfp8_w8a8_test_gpu.rs"]
+mod mxfp8_w8a8_test_gpu;
+#[path = "ops/qwen4exp_w8a8.rs"]
+pub mod qwen4exp_w8a8;
 // Row-wise FP8 routing, split out when it took dispatch_proj.rs over the cap.
 #[path = "ops/dispatch_proj_rowwise.rs"]
 mod dispatch_proj_rowwise;
@@ -44,6 +66,8 @@ mod fp8_moe;
 mod fp8_moe_batch_a;
 #[path = "ops/fp8_moe_batch_b.rs"]
 mod fp8_moe_batch_b;
+#[path = "ops/fp8_moe_rows.rs"]
+mod fp8_moe_rows;
 #[path = "ops/gdn_flashinfer.rs"]
 // The FlashInfer GDN bridge uses dlopen/dlsym, which do not exist on Windows.
 // The absent variant is mounted at the SAME module path so both call sites
@@ -66,6 +90,10 @@ mod gemm_fp4;
 pub mod model_stats;
 #[path = "ops/moe_gate_up_repack.rs"]
 pub(crate) mod moe_gate_up_repack;
+#[path = "ops/strix_f16.rs"]
+mod strix_f16;
+#[path = "ops/yarn_mrope.rs"]
+mod yarn_mrope;
 pub use model_stats::ModelStats;
 
 #[path = "ops/exl3_ops.rs"]
@@ -92,10 +120,19 @@ mod glm_indexer;
 mod glm_indexer_dynamic;
 #[path = "ops/glm_kv_shard.rs"]
 mod glm_kv_shard;
+#[path = "ops/glm_mla_fuse.rs"]
+mod glm_mla_fuse;
 #[path = "ops/glm_router_bn4.rs"]
 mod glm_router_bn4;
+#[path = "ops/glm_sparse_canonical.rs"]
+mod glm_sparse_canonical;
+#[path = "ops/glm_sparse_native.rs"]
+mod glm_sparse_native;
 #[path = "ops/glm_sparse_prefill_tc.rs"]
 mod glm_sparse_prefill_tc;
+#[cfg(atlas_hip)]
+#[path = "ops/hip_fp8_blas.rs"]
+mod hip_fp8_blas;
 pub use glm_router_bn4::glm_router_bn4;
 #[path = "ops/hyper_connection.rs"]
 mod hyper_connection;
@@ -105,6 +142,9 @@ mod hyper_connection_dispatch;
 mod hyper_connection_lowrank;
 #[path = "ops/kda.rs"]
 mod kda;
+#[cfg(all(test, feature = "cuda"))]
+#[path = "ops/kda_commit_tests.rs"]
+mod kda_commit_tests;
 #[path = "ops/kda_indexed.rs"]
 mod kda_indexed;
 // Raw-GEMM plumbing for the lowrank path, split for the 500-LoC cap.
@@ -201,6 +241,8 @@ mod qsa;
 mod qsa_prefill_attn;
 #[path = "ops/qsa_rows.rs"]
 mod qsa_rows;
+#[path = "ops/qsa_yarn.rs"]
+mod qsa_yarn;
 #[path = "ops/quant_dispatch.rs"]
 mod quant_dispatch;
 pub mod qwen4exp;
@@ -268,6 +310,8 @@ mod ssm_mamba_snap;
 mod ssm_preproc;
 #[path = "ops/ssm_ssd.rs"]
 mod ssm_ssd;
+#[path = "ops/strix_s64.rs"]
+mod strix_s64;
 pub mod token_overlay;
 #[path = "ops/wide_prefill.rs"]
 mod wide_prefill;
@@ -288,6 +332,8 @@ pub use fp8_gemv_batch::*;
 pub use fp8_moe::*;
 pub use fp8_moe_batch_a::*;
 pub use fp8_moe_batch_b::*;
+pub use fp8_moe_rows::*;
+pub use fp8b::*;
 pub use gemm_dense::*;
 pub use gemm_dense_int8::*;
 pub use gemm_dense_router::*;
@@ -298,13 +344,16 @@ pub use gemv_q2::*;
 pub use gemv_q2_vec::*;
 pub use gemv_sw::*;
 pub use gemv_touch::{
-    GemvTouch, Twin, gemv_touch, gemv_touch_resolve, mxfp8_tc_twin, w4a16_pair_touch,
+    GemvTouch, Twin, gemv_touch, gemv_touch_resolve, mxfp8_tc_twin, native_touch, w4a16_pair_touch,
     w4a16_tc_twin, w4a16_verify_touch,
 };
 pub use glm_hc_prefill::*;
 pub use glm_indexer::*;
 pub use glm_indexer_dynamic::*;
 pub use glm_kv_shard::*;
+pub use glm_mla_fuse::*;
+pub use glm_sparse_canonical::*;
+pub use glm_sparse_native::*;
 pub use glm_sparse_prefill_tc::*;
 pub use hyper_connection::*;
 pub use hyper_connection_dispatch::*;
@@ -319,7 +368,7 @@ pub use marlin_nvfp4::*;
 pub use marlin_nvfp4_pack::marlin_pack_nvfp4;
 pub use model_levers::{
     BISECT_ATTN_PROJ, BISECT_ATTN_ROWS, BISECT_GDN, BISECT_HC, BISECT_HEAD, BISECT_MOE_FORWARD,
-    BISECT_MOE_ROWS, ModelLevers,
+    BISECT_MOE_ROWS, BISECT_MOE_T_ROWS, ModelLevers,
 };
 pub use moe_atomic_c4::*;
 pub use moe_expert::*;
@@ -334,6 +383,9 @@ pub use moe_lora_grouped::*;
 pub use moe_nvfp4_mmq::*;
 pub use moe_prefill::*;
 pub use mxfp8::*;
+pub use mxfp8_act::*;
+pub use mxfp8_proj::*;
+pub use mxfp8_w8a8::*;
 pub use norm::*;
 pub use nvfp4_mmq::*;
 pub use ple::*;
@@ -349,6 +401,7 @@ pub use q4k_mmq::*;
 pub use qsa::*;
 pub use qsa_prefill_attn::*;
 pub use qsa_rows::*;
+pub use qsa_yarn::*;
 pub use quant_dispatch::*;
 pub use qwen4exp_moe::*;
 pub use qwen4exp_moe_rows::*;
@@ -366,4 +419,7 @@ pub use ssm_mamba::*;
 pub use ssm_mamba_snap::*;
 pub use ssm_preproc::*;
 pub use ssm_ssd::*;
+pub use strix_f16::*;
+pub use strix_s64::*;
 pub use wide_prefill::*;
+pub use yarn_mrope::*;

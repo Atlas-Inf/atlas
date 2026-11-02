@@ -35,6 +35,7 @@ Atlas ships XGrammar as a **pure-Rust in-tree crate**, `crates/xgrammar` — a f
 
 - **Tool calls** — when the request includes `tools: [...]`, Atlas derives an XGrammar grammar from the function schemas + the model's tool-call format (Hermes JSON, Qwen3-coder XML, Mistral JSON). The grammar enforces: opening delimiter → valid function name → opening args bracket → schema-conforming JSON/XML → closing delimiter. `--tool-max-tokens` caps the total argument-generation length.
 - **Response-format structured output** — OpenAI-compatible `response_format: {type: json_schema, json_schema: {...}}`. Atlas compiles the schema into an XGrammar grammar and constrains the entire response.
+- **Both at once** — `tools` plus a `response_format` under `tool_choice: "auto"` (or unset) get the union of the two grammars: the first output token picks a tool call or the bare JSON answer (no fences, no prose), as OpenAI and vLLM do. `"required"` or a named function keeps the tool grammar alone; `"none"` keeps the schema alone.
 - **Reasoning boundaries** — the reasoning parser uses a lightweight grammar to enforce that `<think>...</think>` blocks close cleanly when `--max-thinking-budget` kicks in, preventing the unclosed-think bug that blocked Claude Code compatibility on Qwen3.6.
 
 At the sampling step:

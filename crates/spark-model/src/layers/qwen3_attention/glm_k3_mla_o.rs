@@ -167,13 +167,29 @@ impl StagePlan {
         );
         Ok(self.input.offset(i * ROW))
     }
+    /// Whether the scalar comparison is on (it reads the BF16 weight).
+    pub(in crate::layers::qwen3_attention) fn comparing(&self) -> bool {
+        self.comparison.is_some()
+    }
+
+    /// The batched O projection of the staged rows: `native(input, output,
+    /// rows)` first (the layer's FP8 block twin, `false` without one), else
+    /// the BF16 batch-M GEMV.
     pub(in crate::layers::qwen3_attention) fn project(
         self,
         gpu: &dyn GpuBackend,
         kernel: KernelHandle,
         weight: &DenseWeight,
+        native: impl FnOnce(DevicePtr, DevicePtr, u32) -> Result<bool>,
         stream: u64,
     ) -> Result<()> {
+        if native(
+            self.input,
+            self.comparison.unwrap_or(self.output),
+            self.rows as u32,
+        )? {
+            return Ok(());
+        }
         validate_weight(weight.weight, 4096, 8192)?;
         ensure!(kernel.0 != 0, "{FLAG}: batchm kernel unavailable");
         ops::dense_gemv_batchm(

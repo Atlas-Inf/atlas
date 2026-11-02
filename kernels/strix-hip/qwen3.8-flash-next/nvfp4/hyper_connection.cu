@@ -142,7 +142,7 @@ extern "C" __global__ void hc_expand(
 
 __device__ __forceinline__ void qhc_collapse(
     const float* __restrict__ streams,
-    const __nv_bfloat16* __restrict__ hc_norm_w,
+    const float* __restrict__ hc_norm_w,
     const __nv_bfloat16* __restrict__ down_w,
     const __nv_bfloat16* __restrict__ up_w,
     const __nv_bfloat16* __restrict__ inject_w,
@@ -191,7 +191,7 @@ __device__ __forceinline__ void qhc_collapse(
 
     // ── stage normed = x * rms * (1 + w) once ──
     for (unsigned int i = tid; i < hc_dim; i += blockDim.x) {
-        smem_normed[i] = x[i] * smem_rms[i / H] * (1.0f + (float)hc_norm_w[i]);
+        smem_normed[i] = x[i] * smem_rms[i / H] * (1.0f + hc_norm_w[i]);
     }
     __syncthreads();
 
@@ -250,7 +250,7 @@ __device__ __forceinline__ void qhc_collapse(
 // streams [T, hc, H] -> y_out [T, H] collapsed, inj_out [T, hc].
 extern "C" __global__ void hc_pre(
     const float* __restrict__ streams,
-    const __nv_bfloat16* __restrict__ hc_norm_w,  // [hc*H]
+    const float* __restrict__ hc_norm_w,  // [hc*H]
     const __nv_bfloat16* __restrict__ down_w,     // [rank, hc*H]
     const __nv_bfloat16* __restrict__ up_w,       // [rank, hc*H]
     const __nv_bfloat16* __restrict__ inject_w,   // [hc, hc*H]
@@ -272,7 +272,7 @@ extern "C" __global__ void hc_pre(
 // role.
 extern "C" __global__ void hc_head(
     const float* __restrict__ streams,
-    const __nv_bfloat16* __restrict__ hc_norm_w,
+    const float* __restrict__ hc_norm_w,
     const __nv_bfloat16* __restrict__ down_w,
     const __nv_bfloat16* __restrict__ up_w,
     __nv_bfloat16* __restrict__ y_out,
@@ -328,7 +328,7 @@ extern "C" __global__ void hc_post(
 // Stage 1: normed = x * rms * (1 + w) -> global scratch [T, hc*H].
 extern "C" __global__ void hc_pre_stage(
     const float* __restrict__ streams,
-    const __nv_bfloat16* __restrict__ hc_norm_w,
+    const float* __restrict__ hc_norm_w,
     float* __restrict__ normed_out,            // [T, hc*H]
     const unsigned int hidden_size,
     const unsigned int hc,
@@ -368,7 +368,7 @@ extern "C" __global__ void hc_pre_stage(
         __syncthreads();
     }
     for (unsigned int i = tid; i < hc_dim; i += blockDim.x) {
-        out[i] = x[i] * smem_rms[i / H] * (1.0f + (float)hc_norm_w[i]);
+        out[i] = x[i] * smem_rms[i / H] * (1.0f + hc_norm_w[i]);
     }
 }
 
@@ -729,7 +729,7 @@ extern "C" __global__ void hc_pre_finish_x4(
 
 extern "C" __global__ void hc_pre_stage_bf16(
     const float* __restrict__ streams,
-    const __nv_bfloat16* __restrict__ hc_norm_w,
+    const float* __restrict__ hc_norm_w,
     __nv_bfloat16* __restrict__ normed_out,    // [T, hc*H] BF16
     const unsigned int hidden_size,
     const unsigned int hc,
@@ -770,7 +770,7 @@ extern "C" __global__ void hc_pre_stage_bf16(
     }
     for (unsigned int i = tid; i < hc_dim; i += blockDim.x) {
         out[i] = __float2bfloat16(
-            x[i] * smem_rms[i / H] * (1.0f + (float)hc_norm_w[i]));
+            x[i] * smem_rms[i / H] * (1.0f + hc_norm_w[i]));
     }
 }
 

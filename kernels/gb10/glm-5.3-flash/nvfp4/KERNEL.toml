@@ -3,6 +3,14 @@
 # Do NOT pass -DHDIM globally; common paged-decode kernels only support 128/256/320.
 extra_nvcc_flags = ["--fmad=false"]
 
+# Cache preparation preserves the measured byte-exact quantization contract.
+# Only NVIDIA's imported attention device implementation uses fast math.
+[build.kernel_nvcc_flags]
+glm_sparse_native_attention = ["--use_fast_math", "--fmad=true"]
+glm_sparse_native_prep = ["--prec-div=true", "--ftz=false"]
+glm_sparse_native_split = ["--prec-div=true", "--ftz=false"]
+glm_sparse_native_merge = ["--prec-div=true", "--ftz=false"]
+
 # Module name overrides — matching Mistral Small 4 for MLA compatibility.
 # Unlisted .cu files use their file stem as the module name.
 [modules]

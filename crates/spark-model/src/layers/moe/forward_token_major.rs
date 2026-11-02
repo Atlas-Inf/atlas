@@ -49,7 +49,7 @@ impl MoeLayer {
             && self.weights.shared_expert.up_proj.weight.0 != 0
             && self.weights.shared_expert.down_proj.weight.0 != 0;
         let nvfp4_supported = self.bf16_gate_weight_ptrs.is_none()
-            && !self.has_mixed_bf16_shared_expert()
+            && !self.has_separate_shared_expert()
             && self.fp8_gate_weight_ptrs.is_none()
             && !self.use_t_layout_for_decode()
             && has_shared;
@@ -77,10 +77,20 @@ impl MoeLayer {
                 h,
                 stream,
             )?;
+        } else if self.row_invariant_bf16_router {
+            self.wide_rows.dense_rows(
+                ctx.gpu,
+                self.dense_gemv_batchm,
+                router_in,
+                &self.weights.gate,
+                gate_logits,
+                (n, num_experts, h, num_experts),
+                stream,
+            )?;
         } else {
             ops::dense_gemm(
                 ctx.gpu,
-                self.dense_gemm,
+                self.router_gemm,
                 router_in,
                 &self.weights.gate,
                 gate_logits,

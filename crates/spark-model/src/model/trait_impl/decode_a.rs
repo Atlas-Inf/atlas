@@ -48,6 +48,10 @@ impl TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<DevicePtr> {
+        // ATLAS_GLM_CANONICAL_VERIFY: the row a one-row verify would compute.
+        if let Some(logits) = self.decode_canonical_dispatch(token, seq, _stream)? {
+            return Ok(logits);
+        }
         // Use backend's own stream (non-default, required for CUDA graph capture).
         let stream = self.gpu.default_stream();
         // ATLAS_SSM_H_FP16: narrow this sequence's SSM h-state to FP16 exactly

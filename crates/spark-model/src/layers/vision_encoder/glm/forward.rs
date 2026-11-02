@@ -77,7 +77,7 @@ impl GlmVisionEncoder {
                 !item.groups.is_empty(),
                 "GLM vision item has no temporal groups"
             );
-            for group in &item.groups {
+            for group in item.groups.iter() {
                 sequences.push((group.as_slice(), item.grid_h, item.grid_w));
             }
         }

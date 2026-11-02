@@ -1,0 +1,10 @@
+FlashKDA device kernels
+Copyright (c) 2026 MoonshotAI. MIT license; see LICENSE.
+Upstream: https://github.com/MoonshotAI/FlashKDA
+Revision: 1ce47ea3bb22c84eb9cc665028399cf35e8ffb0b
+
+Atlas imports only the three device-code headers named in provenance.json.
+Atlas owns the host launch, buffer contract and canonical state layout.
+Credit to Jason McCartney / Enntity for SparkGLM GLM prefill integration
+and state-layout qualification, and to Mango-kid / Atlas contributors.
+No SparkGLM adapter ABI, FlashKDA Python API or external library is used.

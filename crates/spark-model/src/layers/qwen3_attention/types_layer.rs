@@ -55,10 +55,9 @@ pub struct Qwen3AttentionLayer {
     pub(crate) k_eq_v: bool,
     /// Ones-filled BF16 weight buffer for the pure-RMSNorm v_norm path.
     pub(crate) v_norm_weight: Option<DenseWeight>,
-    /// Per-head attention gate weight (Step 3.7 g_proj).
-    /// Shape: [num_q_heads, hidden_size] BF16. Applied as:
-    /// attn_out = attn_out * sigmoid(g_proj @ hidden_states)
-    /// with broadcast over head_dim.
+    /// Per-head attention gate weight (Step 3.7 g_proj), shape
+    /// [num_q_heads, hidden_size] BF16. Applied as
+    /// attn_out *= sigmoid(g_proj @ hidden_states), broadcast over head_dim.
     pub(crate) head_gate_weight: Option<DenseWeight>,
     pub(crate) head_gate_activation: HeadGateActivation,
     /// Kernel handle for per-head sigmoid gate broadcast multiply.
@@ -67,7 +66,7 @@ pub struct Qwen3AttentionLayer {
     /// Optional YaRN frequencies for standard (non-MLA) attention.
     pub(crate) yarn_inv_freq: DevicePtr,
     pub(crate) yarn_attention_factor: f32,
-    /// Post-attention output norm (Gemma-4).  
+    /// Post-attention output norm (Gemma-4).
     pub(crate) post_attn_out_norm: Option<DenseWeight>,
     /// Post-FFN output norm (Gemma-4).
     pub(crate) post_ffn_out_norm: Option<DenseWeight>,
@@ -104,15 +103,17 @@ pub struct Qwen3AttentionLayer {
     /// NVFP4 path (`attn.o_proj`). Used by Gemma-4 dense which honors
     /// Nvidia ModelOpt's official ignore list.
     pub(super) o_dense_bf16: Option<DenseWeight>,
+    /// MXFP8 kernels + prefill scratch for `QuantWeight::Mxfp8` (`mx8.rs`).
+    pub(super) mx8_rt: Option<super::mx8::Mx8AttnRt>,
     // ── MLA (Multi-head Latent Attention) — 2-step decode ──
     pub(crate) mla: Option<MlaWeights>,
-    /// MXFP8 twins of MLA weights keyed by the BF16 weight pointer, with the
-    /// `[n, k]` they were quantized as: verify rows and paged prefill chunks
-    /// that short (<= 32) read half the bytes; longer chunks keep BF16.
+    /// MXFP8 twins of MLA weights keyed by the BF16 pointer, with their `[n, k]`:
+    /// rows of short (<= 32) calls read half the bytes; longer keep BF16.
     pub(crate) mla_mx: Vec<(DevicePtr, [usize; 2], crate::weight_map::Mxfp8Weight)>,
-    /// NVFP4 twins of the same projections (`ATLAS_GLM_MLA_NVFP4=1`, LOSSY
-    /// opt-in: ~half the MXFP8 bytes) on the W4A16 tensor-core tier.
+    /// NVFP4 twins (`ATLAS_GLM_MLA_NVFP4=1`, LOSSY) on the W4A16 TC tier.
     pub(crate) mla_q4: Vec<(DevicePtr, crate::weight_map::QuantizedWeight)>,
+    /// The checkpoint's FP8 block q_a / q_b / kv_a / o (`mla_native.rs`).
+    pub(crate) mla_native: super::mla_native::MlaNative,
     // ── Manifold-Constrained Hyper-Connections (mHC) — DeepSeek-V4 ──
     /// Per-block HC parameters. `Some` only for DeepSeek-V4 (`hc_mult > 0`),
     /// in which case the attn/ffn residual sites use `hc_pre`/`hc_post`
@@ -228,6 +229,7 @@ pub struct Qwen3AttentionLayer {
     /// YaRN RoPE kernel using pre-computed inv_freq table (Mistral, etc.)
     pub(super) rope_yarn_k: KernelHandle,
     pub(super) rope_yarn_scaled_k: KernelHandle,
+    pub(super) rope_yarn_mrope_k: KernelHandle,
     /// Interleaved (GPT-J / is_neox_style=False) YaRN RoPE kernel — DeepSeek MLA.
     pub(super) rope_yarn_interleaved_k: KernelHandle,
     /// Conjugate (negated-sin) interleaved YaRN RoPE — DeepSeek-V4 attention

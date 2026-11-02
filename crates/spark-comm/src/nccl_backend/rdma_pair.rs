@@ -46,6 +46,7 @@ pub(super) mod bootstrap;
 pub(super) mod cmd_ring;
 mod gid;
 mod oneshot;
+mod pin;
 mod proxy;
 use cmd_ring::CmdRing;
 use oneshot::OneShot;
@@ -272,6 +273,7 @@ impl RdmaPair {
             std::thread::Builder::new()
                 .name("atlas-rdma-pair".into())
                 .spawn(move || {
+                    pin::pin_proxy();
                     let peer = Peer {
                         base: peer_base,
                         rkeys: peer_rkeys,

@@ -65,10 +65,52 @@ pub fn bf16_gemm_tuned(
     config: u32,
     stream: u64,
 ) -> Result<()> {
+    tuned(
+        false,
+        [act, weight, out],
+        [m, n, k, lda, ldc, config],
+        stream,
+    )
+}
+
+/// [`bf16_gemm_tuned`] with an FP32 `out`: the same tiles and mainloop, the
+/// accumulator stored unrounded (GLM-5's FP32 router logits).
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_gemm_tuned_f32out(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    lda: u32,
+    ldc: u32,
+    config: u32,
+    stream: u64,
+) -> Result<()> {
+    tuned(
+        true,
+        [act, weight, out],
+        [m, n, k, lda, ldc, config],
+        stream,
+    )
+}
+
+fn tuned(
+    f32_out: bool,
+    [act, weight, out]: [u64; 3],
+    [m, n, k, lda, ldc, config]: [u32; 6],
+    stream: u64,
+) -> Result<()> {
     #[cfg(atlas_cutlass)]
     {
+        let launch = if f32_out {
+            atlas_cutlass_bf16_gemm_tuned_f32out
+        } else {
+            atlas_cutlass_bf16_gemm_tuned
+        };
         let status = drained("bf16_gemm_tuned", unsafe {
-            atlas_cutlass_bf16_gemm_tuned(
+            launch(
                 act as *const c_void,
                 weight as *const c_void,
                 out as *mut c_void,
@@ -84,14 +126,14 @@ pub fn bf16_gemm_tuned(
         if status != 0 {
             return Err(super::status_error(
                 status,
-                format!("CUTLASS tuned bf16 GEMM {m}x{n}x{k} config {config}"),
+                format!("CUTLASS tuned bf16 GEMM {m}x{n}x{k} config {config} (f32 out {f32_out})"),
             ));
         }
         Ok(())
     }
     #[cfg(not(atlas_cutlass))]
     {
-        let _ = (act, weight, out, m, n, k, lda, ldc, config, stream);
+        let _ = (f32_out, act, weight, out, m, n, k, lda, ldc, config, stream);
         Err(anyhow::Error::new(super::RejectedBeforeLaunch)
             .context("CUTLASS support was not built; set CUTLASS_HOME when building"))
     }
@@ -197,5 +239,55 @@ pub fn nvfp4_gemm_bf16_act_weight_t(
             stream,
         );
         bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
+    }
+}
+
+/// W8A8 block FP8 `out[M,N] = act[M,K] @ weight[N,K]^T` (BF16 out), all
+/// row-major: `act` E4M3 with `act_sf` `[M, K/128]` FP32 (per-token-group),
+/// `weight` E4M3 with `weight_sf` `[N/128, K/128]` FP32 (FP8_PB_WO), the
+/// group partials scaled in FP32 (`cuda/cutlass_fp8_blockwise_gemm.cu`).
+/// `N % 128 == 0`, `K % 128 == 0`. A [`RejectedBeforeLaunch`](super::RejectedBeforeLaunch) error launched
+/// nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_blockwise_gemm_act_weight_t(
+    act: u64,
+    act_sf: u64,
+    weight: u64,
+    weight_sf: u64,
+    out: u64,
+    [m, n, k]: [u32; 3],
+    stream: u64,
+) -> Result<()> {
+    #[cfg(atlas_cutlass)]
+    {
+        let ctx = ctx()?;
+        let status = drained("fp8_blockwise_gemm_act_weight_t", unsafe {
+            atlas_cutlass_fp8_blockwise_gemm_act_weight_t(
+                act as *const c_void,
+                act_sf as *const c_void,
+                weight as *const c_void,
+                weight_sf as *const c_void,
+                out as *mut c_void,
+                m as i32,
+                n as i32,
+                k as i32,
+                ctx.workspace as *mut c_void,
+                ctx.ws_size,
+                stream as *mut c_void,
+            )
+        });
+        if status != 0 {
+            return Err(status_error(
+                status,
+                format!("CUTLASS block FP8 GEMM {m}x{n}x{k}"),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(atlas_cutlass))]
+    {
+        let _ = (act, act_sf, weight, weight_sf, out, m, n, k, stream);
+        Err(anyhow::Error::new(super::RejectedBeforeLaunch)
+            .context("CUTLASS support was not built; set CUTLASS_HOME when building"))
     }
 }

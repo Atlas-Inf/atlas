@@ -367,8 +367,17 @@ impl TransformerModel {
         seq: &SequenceState,
         plan: &MidCapturePlan,
     ) {
+        // Register under the content key (`vision_cache`); a placeholder the
+        // key does not cover keeps the captures out of the index.
+        let Some(key) = self.pc_key(seq, tokens) else {
+            self.ssm_snapshots.free(plan.snap_slot);
+            if let Some(slot2) = plan.snap_slot_early {
+                self.ssm_snapshots.free(slot2);
+            }
+            return;
+        };
         for old in self.prefix_cache.insert_tail_snapshot(
-            &tokens[..plan.tb],
+            &key[..plan.tb],
             plan.snap_slot,
             seq.session_hash,
             seq.adapter_id,
@@ -388,7 +397,7 @@ impl TransformerModel {
             // the tail; must follow insert_tail_snapshot (its sweep clears the
             // session's previous tail + sibling).
             if let Some(old) = self.prefix_cache.insert_tail_sibling_snapshot(
-                &tokens[..tb_early],
+                &key[..tb_early],
                 slot2,
                 seq.session_hash,
                 seq.adapter_id,

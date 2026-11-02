@@ -58,7 +58,8 @@ use anyhow::Result;
 use parking_lot::Mutex;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
-use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
+// Ported from Enntity/atlas 166e2b1, e7d4e1a (AGPL-3.0-only).
+use spark_runtime::kv_cache::PagedKvCache;
 
 use crate::layer::{AttnMetadataDev, ForwardContext, LayerState};
 use crate::layers::mtp_meta::{MTP_META_OFFSET, pack_mtp_attn_meta};
@@ -82,6 +83,8 @@ pub struct Qwen4ExpMtpProposerState {
     /// Drafts for positions below it skip the end tokens (the target ban's
     /// min_tokens floor, `qwen4exp_mtp_ban.rs`; 0 = none).
     pub end_floor: usize,
+    /// The verified rows to absorb (`qwen4exp_mtp_absorb.rs`).
+    pub absorb: qwen4exp_mtp_absorb::Absorb,
 }
 
 impl ProposerState for Qwen4ExpMtpProposerState {
@@ -156,157 +159,12 @@ pub struct Qwen4ExpMtpHead {
     /// `ATLAS_QWEN4EXP_MTP_DRAFT_TP`: the worker projects half of the draft
     /// head of each batched propose the model announces (`draft_tp`).
     tp: Option<draft_tp::DraftTp>,
+    /// `ATLAS_QWEN4EXP_MTP_ABSORB` (`qwen4exp_mtp_absorb.rs`).
+    absorb: qwen4exp_mtp_absorb::AbsorbBufs,
 }
 
-impl Qwen4ExpMtpHead {
-    pub fn new(
-        module: Qwen4ExpMtpModule,
-        embed_tokens: DenseWeight,
-        lm_head: DenseWeight,
-        gpu: &dyn GpuBackend,
-        mtp_vocab_size: u32,
-        max_seq_len: usize,
-    ) -> Result<Self> {
-        // The config the body was built with (the TP=1 view), so the cache
-        // holds every KV head the unsharded body writes.
-        let config = &module.config;
-        let h = config.hidden_size;
-        let hc = config.hc_mult.max(1);
-
-        // The drafter's attention writes its OWN cache, never the target's.
-        // Shape matches a target full-attention layer so the reused body's
-        // `write_kv_cache` / paged decode land at the right strides. The body
-        // was built with `attn_idx = <number of target full-attention layers>`
-        // and indexes the pool at THAT index, so the pool needs that many + 1
-        // layer slots even though only the last is ever written.
-        let target_attn_layers = config
-            .layer_types
-            .iter()
-            .filter(|t| matches!(t, atlas_core::config::LayerType::FullAttention))
-            .count();
-        let kv_config = drafter_kv_config(
-            target_attn_layers,
-            config.num_key_value_heads,
-            config.head_dim,
-        );
-        let num_blocks = max_seq_len / kv_config.block_size + 1;
-        let block_size = kv_config.block_size;
-        let kv_cache = PagedKvCache::new(kv_config, num_blocks, gpu)?;
-
-        let rows = qwen4exp_mtp_batch::PROPOSE_BATCH_MAX;
-        let bf16 = |n: usize| -> Result<DevicePtr> { gpu.alloc(rows * n * 2) };
-        // Every block a `max_seq_len` drafter sequence can reference, + 1 for
-        // the row being written (the allocator's `seq_len / bs + 1`).
-        let batch_slab_blocks = max_seq_len / block_size + 1;
-        let draft = crate::layers::qwen4exp_draft_head::DraftHead::build(
-            &lm_head,
-            config.vocab_size,
-            h,
-            mtp_vocab_size,
-            gpu,
-        )?;
-        let conf_stop = crate::layers::qwen4exp_draft_head::conf_stop_from(
-            std::env::var("ATLAS_QWEN4EXP_MTP_CONFIDENCE").ok(),
-        )?;
-
-        Ok(Self {
-            module,
-            embed_tokens,
-            lm_head,
-            mtp_vocab_size,
-            draft,
-            conf_stop,
-            kv_cache: Mutex::new(kv_cache),
-            embed_buf: bf16(h)?,
-            normed_e: bf16(h)?,
-            e_branch: bf16(h)?,
-            normed_h: bf16(hc * h)?,
-            h_streams: bf16(hc * h)?,
-            h_out: bf16(h)?,
-            argmax_out: gpu.alloc(4)?,
-            // Offset-from-1 RMSNorm, matching `hc_norm` in the shadowed mHC
-            // kernel. NOT `rms_norm_vanilla` — that would apply `w` instead of
-            // `1 + w` and silently shift every drafted logit.
-            rms_norm_k: gpu.kernel("norm", "rms_norm")?,
-            rms_norm_f32_k: gpu.kernel("norm", "rms_norm_f32")?,
-            rms_norm_f32_grouped_k: super::try_kernel_gated(
-                std::env::var("ATLAS_QWEN4EXP_MTP_GROUPED_NORM").as_deref() == Ok("1"),
-                gpu,
-                "norm",
-                "rms_norm_f32_grouped",
-            ),
-            f32_residual_add_k: gpu.kernel("norm", "f32_residual_add")?,
-            dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
-            hc_expand_k: gpu.kernel("hyper_connection", "hc_expand")?,
-            hc_head_k: gpu.kernel("hyper_connection", "hc_head")?,
-            argmax_k: gpu.kernel("argmax", "argmax_bf16")?,
-            dense_gemv_batchm_k: super::try_kernel(
-                gpu,
-                "dense_gemv_bf16_batchm",
-                "dense_gemv_bf16_batchm",
-            ),
-            wide_rows: super::ops::Qwen4ExpWideRows::resolve(gpu, "qwen4_exp"),
-            batched_embed_k: super::try_kernel(gpu, "embed_from_argmax", "batched_embed"),
-            argmax_batch_k: super::try_kernel(gpu, "argmax", "argmax_bf16_batch"),
-            argmax_batch_lp_k: super::try_kernel(gpu, "argmax", "argmax_bf16_batch_lp"),
-            batch_slab: gpu.alloc(qwen4exp_mtp_batch::slab_bytes(batch_slab_blocks))?,
-            batch_slab_blocks,
-            tp: None,
-        })
-    }
-
-    pub fn alloc_state_inner(&self, gpu: &dyn GpuBackend) -> Result<Qwen4ExpMtpProposerState> {
-        Ok(Qwen4ExpMtpProposerState {
-            block_table: Vec::new(),
-            seq_len: 0,
-            last_num_drafted: 0,
-            awaiting_verdict: false,
-            body_state: self.module.body.alloc_state(gpu)?,
-            end_floor: 0,
-        })
-    }
-
-    /// `residual[i] += bf16(src[i])` over `n` elements — the BF16 branch
-    /// accumulating onto the FP32 stream highway.
-    fn f32_add_bf16(
-        &self,
-        gpu: &dyn GpuBackend,
-        residual: DevicePtr,
-        src: DevicePtr,
-        n: u32,
-        stream: u64,
-    ) -> Result<()> {
-        let block = 256u32;
-        KernelLaunch::new(gpu, self.f32_residual_add_k)
-            .grid([n.div_ceil(block), 1, 1])
-            .block([block, 1, 1])
-            .arg_ptr(residual)
-            .arg_ptr(src)
-            .arg_u32(n)
-            .launch(stream)
-    }
-}
-
-/// The drafter's KV geometry: `slot` placeholder layer slots, then the one
-/// layer it writes. The placeholders exist only so the body's
-/// `attn_idx = slot` lands on a real pool; they are never read or written,
-/// so they get the smallest geometry the allocator accepts (one 1-wide head,
-/// 32 B per block) instead of a full layer each. Full layers there cost
-/// 12/13 of the pool: 6.5 GB at --max-seq-len 262144 where 0.5 GB is used.
-fn drafter_kv_config(slot: usize, num_kv_heads: usize, head_dim: usize) -> KvCacheConfig {
-    let mut layer_dims = vec![(1, 1); slot];
-    layer_dims.push((num_kv_heads, head_dim));
-    KvCacheConfig {
-        block_size: 16,
-        num_kv_heads,
-        head_dim,
-        num_layers: slot + 1,
-        dtype: KvCacheDtype::Bf16,
-        layer_dtypes: vec![],
-        layer_dims,
-        cache_blocks_per_seq: None,
-    }
-}
+#[path = "qwen4exp_mtp_new.rs"]
+mod qwen4exp_mtp_new;
 
 #[path = "qwen4exp_mtp_forward.rs"]
 mod qwen4exp_mtp_forward;
@@ -316,6 +174,16 @@ mod qwen4exp_mtp_batch;
 
 #[path = "qwen4exp_mtp_kv.rs"]
 mod qwen4exp_mtp_kv;
+use qwen4exp_mtp_kv::drafter_kv_config;
+
+#[path = "qwen4exp_mtp_absorb.rs"]
+pub mod qwen4exp_mtp_absorb;
+
+#[path = "qwen4exp_mtp_rows.rs"]
+mod qwen4exp_mtp_rows;
+
+#[path = "qwen4exp_mtp_prompt.rs"]
+pub mod qwen4exp_mtp_prompt;
 
 #[path = "qwen4exp_mtp_ban.rs"]
 mod qwen4exp_mtp_ban;
@@ -348,6 +216,7 @@ impl DraftProposer for Qwen4ExpMtpHead {
             .ok_or_else(|| anyhow::anyhow!("Invalid qwen4_exp MTP proposer state"))?;
 
         qwen4exp_mtp_kv::settle_unverified(st);
+        self.absorb_before_propose(&mut [&mut *st], &[position], 1, ctx, stream)?;
         crate::layers::qsa::draft_share_set(st.body_state.as_mut(), true); // MTP_INDEX_SHARE
         let mut drafts = Vec::with_capacity(num_drafts);
         let mut current_token = last_token;
@@ -476,6 +345,41 @@ impl DraftProposer for Qwen4ExpMtpHead {
         Ok(())
     }
 
+    fn stage_absorb(
+        &self,
+        state: &mut dyn ProposerState,
+        streams: DevicePtr,
+        tokens: &[u32],
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        self.stage_absorb_impl(state, streams, tokens, gpu, stream)
+    }
+
+    fn note_prompt_rows(
+        &self,
+        state: &mut dyn ProposerState,
+        first_pos: usize,
+        rows: usize,
+        hc_row: usize,
+    ) {
+        self.note_prompt_rows_impl(state, first_pos, rows, hc_row)
+    }
+
+    fn absorb_prompt(
+        &self,
+        state: &mut dyn ProposerState,
+        prompt: &[u32],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.absorb_prompt_impl(state, prompt, ctx, stream)
+    }
+
+    fn prompt_tail_token(&self, state: &mut dyn ProposerState, tokens: &[u32]) {
+        self.prompt_tail_token_impl(state, tokens)
+    }
+
     fn free_state(
         &self,
         _gpu: &dyn GpuBackend,
@@ -490,6 +394,7 @@ impl DraftProposer for Qwen4ExpMtpHead {
             self.kv_cache.lock().free_blocks(&st.block_table);
             st.block_table.clear();
         }
+        self.absorb.release(&mut st.absorb);
         st.seq_len = 0;
         Ok(())
     }

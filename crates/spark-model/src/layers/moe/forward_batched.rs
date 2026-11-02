@@ -16,7 +16,7 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        if ctx.config.expert_tp {
+        if self.grouped_only(ctx) {
             return self.forward_prefill(input, num_tokens, ctx, stream);
         }
         // LongCat zero-experts ARE wired here (softmax+bias arm below); the
@@ -31,17 +31,8 @@ impl MoeLayer {
                 || (self.correction_bias_dev.is_some() && ctx.config.scoring_func == "softmax"),
             "zero-expert MoE routing is not wired on this dispatch variant yet (forward_batched)"
         );
-        self.btile_input_guard(input, num_tokens, ctx, stream)?;
-        // The equal-memory NVFP4 MMQ repack replaces the checkpoint-native
-        // expert payloads. Only the grouped dispatcher understands that block
-        // layout; the per-token fused kernels below expect the original packed
-        // weights. Small speculative-verification batches reach this entry
-        // through the K2/K3/K5 fallbacks, so route them through the same MMQ
-        // pipeline as ordinary prefill rather than interpreting repacked bytes
-        // with the old-layout kernels. `forward_prefill` does not bounce MMQ
-        // layers back here, so this cannot recurse.
-        if self.nvfp4_mmq_layout || self.routed_scales_released {
-            return self.forward_prefill(input, num_tokens, ctx, stream);
+        if self.batched_prefill_guards(input, num_tokens, ctx, stream)? {
+            return Ok(());
         }
 
         // SOLID Incr-4: batched decode folds the routed-expert gate/up + down
@@ -170,11 +161,11 @@ impl MoeLayer {
             }
 
             let shared_out = ctx.buffers.attn_output();
-            if let (Some(gp), Some(up), Some(dp), Some(shared)) = (
+            if let (Some(gp), Some(up), Some(dp), Some(SeparateSharedExpert::Bf16(shared))) = (
                 self.bf16_gate_weight_ptrs,
                 self.bf16_up_weight_ptrs,
                 self.bf16_down_weight_ptrs,
-                self.bf16_shared_expert,
+                self.separate_shared_expert,
             ) {
                 // BF16 path (FP8-dequant-on-load): same fused kernels as decode.
                 ops::moe_expert_gate_up_shared_bf16(
@@ -454,8 +445,8 @@ impl MoeLayer {
                 stream,
             )?;
 
-            if self.has_mixed_bf16_shared_expert() {
-                self.run_bf16_shared_expert(
+            if self.has_separate_shared_expert() {
+                self.run_separate_shared_expert(
                     input_t,
                     1,
                     h,
@@ -464,17 +455,29 @@ impl MoeLayer {
                     shared_up_scratch,
                     shared_out,
                     ctx,
+                    true,
                     stream,
                 )?;
             }
 
+            // EP fix (same contract as `forward_row_local`): the shared expert
+            // is computed identically on all ranks, so it must stay out of the
+            // pre-reduce blend or the all-reduce sums it once per rank.
+            // (An MXFP8 shared expert's slice blends here: `shared_mxfp8.rs`.)
+            let is_ep =
+                ctx.comm.is_some() && ctx.config.ep_world_size > 1 && !self.shared_joins_reduce();
+            let shared_for_blend = if is_ep && !shared_out.is_null() {
+                self.ep_blend_zero_row(ctx, stream)?
+            } else {
+                shared_out
+            };
             ops::moe_weighted_sum_blend(
                 ctx.gpu,
                 self.moe_weighted_sum_blend,
                 output_t,
                 expert_down_out,
                 weights_dev,
-                shared_out,
+                shared_for_blend,
                 input_t,
                 self.weights.shared_expert_gate.weight,
                 h,
@@ -483,16 +486,9 @@ impl MoeLayer {
                 stream,
             )?;
 
-            // EP all-reduce per-token partial output
-            if let Some(comm) = ctx.comm
-                && ctx.config.ep_world_size > 1
-            {
-                if ctx.graph_capture {
-                    comm.all_reduce(output_t.0, h as usize * 2)?;
-                } else {
-                    comm.all_reduce_async(output_t.0, h as usize * 2, stream)?;
-                }
-            }
+            // EP all-reduce per-token partial output, then the shared expert
+            // added ONCE (`forward_ep_reduce` does both).
+            self.forward_ep_reduce(output_t, shared_out, input_t, 1, None, ctx, stream)?;
         }
 
         Ok(())

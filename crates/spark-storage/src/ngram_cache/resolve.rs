@@ -48,6 +48,7 @@ impl NgramRowCache {
         if let Some(k) = &self.keepalive {
             k.touch();
         }
+        self.maybe_log_stats();
         if let Some(out) = out_slots.as_deref_mut() {
             out.clear();
             out.reserve(row_ids.len());
@@ -69,12 +70,13 @@ impl NgramRowCache {
                     self.rows_total
                 );
             }
-            let slot = match self.map.get(&id) {
+            let slot = match self.map.get(&(id as u32)) {
                 Some(&s) => {
                     self.hits += 1;
                     self.refbit[s as usize] = true;
-                    if pin {
+                    if pin && !self.pinned[s as usize] {
                         self.pinned[s as usize] = true;
+                        self.pinned_list.push(s);
                     }
                     s
                 }
@@ -94,11 +96,12 @@ impl NgramRowCache {
                             return Err(e);
                         }
                     };
-                    self.map.insert(id, s);
-                    self.slot_row[s as usize] = id;
+                    self.map.insert(id as u32, s);
+                    self.slot_row[s as usize] = id as u32;
                     self.refbit[s as usize] = true;
-                    if pin {
+                    if pin && !self.pinned[s as usize] {
                         self.pinned[s as usize] = true;
+                        self.pinned_list.push(s);
                     }
                     faults.push(Fault { id, slot: s });
                     s
@@ -121,7 +124,10 @@ impl NgramRowCache {
         // slot handed out above is pinned, and `victim` skips pinned slots), so
         // the arena writes are disjoint, and `read_exact_at` is positional so a
         // shared `&File` has no cursor to race on.
-        if let Err(e) = self.fetch_many(&faults) {
+        let ft = std::time::Instant::now();
+        let r = self.fetch_many(&faults);
+        self.fault_us += ft.elapsed().as_micros() as u64;
+        if let Err(e) = r {
             // A partially-written slot must not stay claimed as resident: a
             // wrong n-gram row reads as fluent output with wrong logits, which
             // is the failure mode this cache exists to avoid. Drop the WHOLE
@@ -143,11 +149,11 @@ impl NgramRowCache {
     /// symptom would be a wrong n-gram row rather than a crash.
     fn drop_reservations(&mut self, faults: &[Fault]) {
         for f in faults {
-            if self.map.get(&f.id) == Some(&f.slot) {
-                self.map.remove(&f.id);
+            if self.map.get(&(f.id as u32)) == Some(&f.slot) {
+                self.map.remove(&(f.id as u32));
             }
-            if self.slot_row[f.slot as usize] == f.id {
-                self.slot_row[f.slot as usize] = u64::MAX;
+            if self.slot_row[f.slot as usize] == f.id as u32 {
+                self.slot_row[f.slot as usize] = u32::MAX;
             }
         }
     }
@@ -164,13 +170,23 @@ impl NgramRowCache {
             base_offset: self.base_offset,
             segments: self.segments.as_ref(),
             row_stride: self.row_stride,
-            scale_file: self.scales.as_ref().and_then(|sc| sc.file.as_ref()),
+            scale_stride: self.scales.as_ref().map_or(0, |sc| sc.stride),
+            scale_src: self.scales.as_ref().and_then(|sc| match &sc.src {
+                super::ScaleSrc::Constant => None,
+                super::ScaleSrc::PerRowFile(f) => Some(ScaleSource::Flat { file: f }),
+                super::ScaleSrc::Segmented(seg) => Some(ScaleSource::Segmented {
+                    seg,
+                    resident: sc.resident.as_ref().map(|v| v.as_slice()),
+                }),
+            }),
         };
         let ptrs = ArenaPtrs {
             rows: self.arena.slot_host_ptr(0, 0)?,
-            scales: match self.scales.as_ref().filter(|sc| sc.file.is_some()) {
-                Some(sc) => Some(sc.arena.slot_host_ptr(0, 0)?),
-                None => None,
+            scales: match self.scales.as_ref() {
+                Some(sc) if !matches!(sc.src, super::ScaleSrc::Constant) => {
+                    Some(sc.arena.slot_host_ptr(0, 0)?)
+                }
+                _ => None,
             },
         };
 
@@ -219,7 +235,11 @@ impl NgramRowCache {
 
     /// Release the batch's pins (call after the gather kernels are issued).
     pub fn end_batch(&mut self) {
-        self.pinned.fill(false);
+        // O(pins), not O(slots) — a multi-GB cache has tens of millions of
+        // slots and a fill(false) sweep would dominate a decode step.
+        for s in self.pinned_list.drain(..) {
+            self.pinned[s as usize] = false;
+        }
     }
 
     /// CLOCK second-chance victim among the unpinned slots.
@@ -234,7 +254,7 @@ impl NgramRowCache {
                 self.refbit[s] = false;
                 continue;
             }
-            if self.slot_row[s] != u64::MAX {
+            if self.slot_row[s] != u32::MAX {
                 let old = self.slot_row[s];
                 self.map.remove(&old);
                 self.evictions += 1;

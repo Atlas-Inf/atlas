@@ -46,6 +46,9 @@ impl MoeLayer {
         top_k: u32,
         num_tokens: usize,
         ne: usize,
+        // `route_and_sort` already wrote the M16 worklist and the NVFP4
+        // input (`ATLAS_GLM_MOE_ROUTE_FUSE`).
+        prerouted: bool,
         t0: &mut Option<std::time::Instant>,
         ctx: &ForwardContext,
         stream: u64,
@@ -203,6 +206,7 @@ impl MoeLayer {
         // 16 KiB even for a one-row arena: enough for the K=5 gate/up worklist
         // (640 items + counter) without allocations.
         let compact_k5 = std::env::var("ATLAS_GLM_K5_COMPACT_MOE").as_deref() == Ok("1")
+            && !crate::layers::canonical_verify::enabled()
             && ctx.config.model_type == "glm5_next"
             && n == 5
             && total_expanded == 40
@@ -210,7 +214,7 @@ impl MoeLayer {
             && h == 4096
             && inter == 2048
             && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
-            && self.nvfp4_prequant_moe
+            && self.prequant_moe()
             && self.moe_w4a4_prequant_t_k64.0 != 0
             && self.moe_w4a4_prequant_t_k64_compact.0 != 0
             && self.moe_build_tile_worklist_k.0 != 0;
@@ -337,7 +341,7 @@ impl MoeLayer {
                         max_m_tiles,
                         stream,
                     )?;
-                } else if self.nvfp4_prequant_moe && self.moe_w4a4_prequant_t_k64.0 != 0 {
+                } else if self.prequant_moe() && self.moe_w4a4_prequant_t_k64.0 != 0 {
                     // Verify-decode batches take the M16 row tiles when
                     // selected (ATLAS_GLM_MOE_DECODE_M16), else the compact
                     // M64 worklist; any other batch the K128W grid.
@@ -349,9 +353,14 @@ impl MoeLayer {
                         [n, top_k],
                         [h, inter],
                         num_experts,
+                        prerouted,
                         ctx,
                         stream,
                     )?;
+                    anyhow::ensure!(
+                        wide.is_some() || !prerouted,
+                        "fused MoE routing: {n} rows left the M16 grid it built a worklist for"
+                    );
                     silu_done = self.prequant_fp4_gate_up(
                         expert_input,
                         gp,
@@ -367,6 +376,7 @@ impl MoeLayer {
                         max_m_tiles,
                         compact,
                         wide,
+                        prerouted,
                         ctx,
                         stream,
                     )?;
@@ -428,6 +438,31 @@ impl MoeLayer {
                             inter,
                             h,
                             max_m_tiles_m128,
+                            stream,
+                        )?;
+                    } else if self.moe_f16_prefill {
+                        // gfx1151 F16-operand twin (moe_w4a16_fused_gate_up_t_f16a):
+                        // same signature as the base kernel and a 64-row
+                        // blockIdx.y M tile with NO striding, so the n128
+                        // launcher passes max_m_tiles, not grid_m_strided.
+                        ops::moe_w4a16_fused_gate_up_n128(
+                            ctx.gpu,
+                            self.moe_fused_gate_up_t,
+                            expert_input,
+                            gp.packed_ptrs,
+                            gp.scale_ptrs,
+                            gp.scale2_vals,
+                            up.packed_ptrs,
+                            up.scale_ptrs,
+                            up.scale2_vals,
+                            expert_gate_out,
+                            expert_up_out,
+                            expert_offsets,
+                            sorted_token_ids,
+                            num_experts,
+                            inter,
+                            h,
+                            max_m_tiles,
                             stream,
                         )?;
                     } else {
@@ -543,7 +578,7 @@ impl MoeLayer {
                     .cutlass_grouped_host
                     .as_ref()
                     .is_some_and(|t| t.down.is_some());
-            let fused_nvfp4_down = self.nvfp4_prequant_moe
+            let fused_nvfp4_down = self.prequant_moe()
                 && self.nvfp4_fused_silu_quant
                 && self.silu_mul_quant_nvfp4_k.0 != 0
                 && !cutlass_down;
@@ -556,6 +591,7 @@ impl MoeLayer {
                     expert_up_out,
                     total_expanded,
                     inter,
+                    [expert_offsets.0, num_experts as u64],
                     ctx,
                     stream,
                 )?;
@@ -626,8 +662,13 @@ impl MoeLayer {
                         max_m_tiles,
                         stream,
                     )?;
-                } else if self.nvfp4_prequant_moe && self.moe_w4a4_prequant_t_k64.0 != 0 {
+                } else if self.prequant_moe() && self.moe_w4a4_prequant_t_k64.0 != 0 {
                     if !fused_nvfp4_down {
+                        anyhow::ensure!(
+                            self.input_scales.is_none(),
+                            "ATLAS_GLM_FP4L_INPUT_SCALES needs the fused SiLU quantization \
+                             (ATLAS_NVFP4_FUSED_SILU_QUANT=1)"
+                        );
                         let a_packed = expert_up_out;
                         let a_scale = a_packed.offset(total_expanded as usize * inter as usize / 2);
                         ops::quantize_bf16_to_nvfp4(
@@ -710,6 +751,27 @@ impl MoeLayer {
                         ops::moe_w4a16_grouped_gemm_ptrtable_k64_m32_n128(
                             ctx.gpu,
                             self.moe_grouped_gemm_t_k64_m32,
+                            expert_gate_out,
+                            dp.packed_ptrs,
+                            dp.scale_ptrs,
+                            dp.scale2_vals,
+                            expert_down_out,
+                            expert_offsets,
+                            DevicePtr(0),
+                            num_experts,
+                            h,
+                            inter,
+                            max_m_tiles,
+                            stream,
+                        )?;
+                    } else if self.moe_f16_prefill {
+                        // gfx1151 F16-operand twin
+                        // (moe_w4a16_grouped_gemm_ptrtable_t_f16a): same
+                        // signature as the base kernel and a 64-row blockIdx.y
+                        // M tile with NO striding -> max_m_tiles.
+                        ops::moe_w4a16_grouped_gemm_ptrtable_n128(
+                            ctx.gpu,
+                            self.moe_grouped_gemm_t,
                             expert_gate_out,
                             dp.packed_ptrs,
                             dp.scale_ptrs,

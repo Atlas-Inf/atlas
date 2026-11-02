@@ -17,8 +17,21 @@ mod fp8;
 mod fp8_tensorwise;
 pub use fp8_tensorwise::fp8_gemm_act_weight_t_tensorwise;
 mod grouped;
-pub use fp8::{fp8_gemm_act_weight_t_blkscaled, fp8_gemm_act_weight_t_rowwise};
+pub use fp8::{
+    fp8_blkscaled_pinned_prepare, fp8_gemm_act_weight_t_blkscaled,
+    fp8_gemm_act_weight_t_blkscaled_pinned, fp8_gemm_act_weight_t_mx,
+    fp8_gemm_act_weight_t_mx_pinned, fp8_gemm_act_weight_t_rowwise,
+};
+mod mx_algo;
 pub use grouped::bf16_grouped_gemm_act_weight_t;
+pub use mx_algo::{fp8_gemm_mx_pinned_prepare, fp8_gemm_mx_prepare};
+// The MXFP8 kernel choice's introspection, for tests and benches only.
+#[cfg(any(test, feature = "test-utils"))]
+pub use fp8::fp8_gemm_act_weight_t_mx_candidate;
+#[cfg(any(test, feature = "test-utils"))]
+pub use mx_algo::{MX_CANDIDATES, fp8_gemm_mx_candidate_times, mx_algo_description, mx_per_bucket};
+mod mx_sweep;
+pub use mx_sweep::{MX_SWEEP, MxSweepShape};
 mod tf32;
 pub use tf32::tf32_gemm_act_weight_t;
 mod fixed_algo;
@@ -61,6 +74,9 @@ const DESC_A_SCALE_POINTER: u32 = 17;
 const DESC_B_SCALE_POINTER: u32 = 18;
 const DESC_A_SCALE_MODE: u32 = 31;
 const DESC_B_SCALE_MODE: u32 = 32;
+/// `CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0`: one UE8M0 scale per 32 K
+/// values (MXFP8), in cuBLASLt's tiled scale layout.
+const SCALE_MODE_VEC32_UE8M0: i32 = 2;
 const SCALE_MODE_OUTER_VEC_32F: i32 = 3;
 const SCALE_MODE_VEC128_32F: i32 = 4;
 const SCALE_MODE_BLK128X128_32F: i32 = 5;
@@ -328,6 +344,36 @@ pub fn bf16_gemm_act_weight_t(
             Err(e)
         }
     }
+}
+
+/// [`bf16_gemm_act_weight_t`] with an FP32 `out[M,N]`: the FP32 accumulator
+/// unrounded (GLM-5's `moe_router_dtype: float32` router logits, the
+/// reference's `torch.mm(x, w.T, out_dtype=float32)`). No BF16 fallback.
+pub fn bf16_gemm_act_weight_t_f32out(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    let pick = if kchain_pin::applies(m, n, true) {
+        kchain_pin::Pick::Pin
+    } else {
+        kchain_pin::Pick::First
+    };
+    gemm_bf16::gemm_bf16_pick(
+        act,
+        weight,
+        out,
+        [m, n, k],
+        CUBLAS_OP_T,
+        pick,
+        CUDA_R_32F,
+        stream,
+    )
+    .map(|_| ())
 }
 
 #[cfg(test)]

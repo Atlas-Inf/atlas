@@ -64,6 +64,7 @@ impl TransformerModel {
                     seq,
                     0,
                     tokens.len(),
+                    tokens.len(),
                     &mut kv,
                     stream,
                     None,
@@ -148,10 +149,11 @@ impl TransformerModel {
         // `prefill_b_proc_range` below, as the single path's are.
         let first = picked[0];
         let (t0, r0) = (seqs[first].0, rows[first]);
-        let pre = self.prefill_b_zero_and_embed(true, &t0[start[first]..], 0, r0, stream)?;
+        let pre =
+            self.prefill_b_zero_and_embed(seqs[first].1, true, &t0[start[first]..], 0, r0, stream)?;
         for &k in &picked[1..] {
             let dst = hidden.offset(row0[k] * h * 2);
-            self.prefill_b_embed_chunk_at(seqs[k].0, start[k], rows[k], dst, stream)?;
+            self.prefill_b_embed_chunk_at(seqs[k].1, seqs[k].0, start[k], rows[k], dst, stream)?;
         }
         let _ = super::embed_chunk::take_staged_ids();
         self.buffers.note_rows(total);
@@ -361,6 +363,8 @@ impl TransformerModel {
             let (len, from, count) = (tokens.len(), start[k], rows[k]);
             let src = hidden.offset(row0[k] * h * 2);
             self.try_mtp_prefill_capture_from(seq, from, count, src, stream)?;
+            // Ported from Enntity/atlas e7d4e1a (AGPL-3.0-only).
+            self.note_mtp_prompt_rows(seq, from, count, row0[k]);
             let mut kv = self.kv_cache.lock();
             let bs = kv.block_size();
             seq.tokens.extend_from_slice(tokens);
@@ -394,6 +398,11 @@ impl TransformerModel {
             }
             logits[k] = row;
             self.try_eager_drafter_prefill(seq, true, stream)?;
+        }
+        // After every sequence's logits: the drafter reuses the activations.
+        for &k in &picked {
+            let (tokens, seq) = &mut seqs[k];
+            self.try_mtp_prompt_absorb(seq, tokens, stream);
         }
         let layout: Vec<(usize, usize, usize)> = picked
             .iter()

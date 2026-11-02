@@ -6,80 +6,16 @@
 //! restore planning / promotion and subtree drops. No I/O happens here.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, VecDeque};
 
+use super::nvme_index::{NO_OWNER, slot_class};
 use super::{NodeId, RadixTreeInner};
 use crate::prefix_cache::nvme::{DiskRef, NvmeStats, RestorePlan, SpillOrder};
 
-const NO_OWNER: NodeId = usize::MAX;
 /// Spill candidates gathered per full scan of the node arena. The scan is
 /// O(nodes) and nodes include every on-disk block, so it is amortised over
 /// this many evictions instead of paid per block (the legacy delete path
 /// rescans per block; with 10^5-10^6 on-disk nodes that would dominate).
 const VICTIM_BATCH: usize = 256;
-
-pub(in crate::radix_tree) struct NvmeIndex {
-    max_slots: u32,
-    next_slot: u32,
-    free: Vec<u32>,
-    /// slot → owning node (`NO_OWNER` when free).
-    owner: Vec<NodeId>,
-    /// slot → tag stamped into the record at spill.
-    tags: Vec<u64>,
-    /// Every on-disk node, keyed by its `last_access` (kept exact). Ties
-    /// (a whole chain shares one access stamp) order the higher node id
-    /// first — children are allocated after their parents, so the leaf a
-    /// budget drop needs is found without walking the chain's interior.
-    lru: BTreeSet<(u64, Reverse<NodeId>)>,
-    epoch: u64,
-    /// Cached spill candidates `(node, last_access)`, oldest first; each is
-    /// re-validated when popped (the access stamp doubles as a generation).
-    victims: VecDeque<(NodeId, u64)>,
-    /// A restored node keeps its record (it is then RESIDENT with a slot, and
-    /// evicting it again needs no write). See `set_keep_restored`.
-    pub(in crate::radix_tree) keep_restored: bool,
-    pub(in crate::radix_tree) stats: NvmeStats,
-}
-
-impl NvmeIndex {
-    pub(in crate::radix_tree) fn new(max_slots: u32) -> Self {
-        Self {
-            max_slots,
-            next_slot: 0,
-            free: Vec::new(),
-            owner: Vec::new(),
-            tags: Vec::new(),
-            lru: BTreeSet::new(),
-            epoch: 0,
-            victims: VecDeque::new(),
-            keep_restored: false,
-            stats: NvmeStats {
-                max_slots,
-                ..NvmeStats::default()
-            },
-        }
-    }
-
-    fn take_free_slot(&mut self) -> Option<u32> {
-        if let Some(s) = self.free.pop() {
-            return Some(s);
-        }
-        if self.next_slot >= self.max_slots {
-            return None;
-        }
-        let s = self.next_slot;
-        self.next_slot += 1;
-        self.owner.push(NO_OWNER);
-        self.tags.push(0);
-        Some(s)
-    }
-
-    fn release_slot(&mut self, slot: u32) {
-        self.owner[slot as usize] = NO_OWNER;
-        self.free.push(slot);
-        self.stats.slots_used -= 1;
-    }
-}
 
 /// Record tag: binds a record to the node's causal-prefix hash and to the
 /// spill that wrote it, so a stale or misdirected record never restores.
@@ -158,29 +94,34 @@ impl RadixTreeInner {
         }
     }
 
-    /// A record slot for a node last accessed at `cold_access`, dropping the
-    /// LRU on-disk leaf when the budget is full. `None` when every droppable
-    /// on-disk block is hotter than the candidate (or none is droppable).
-    fn alloc_slot(&mut self, cold_access: u64) -> Option<u32> {
-        if let Some(s) = self.nvme.as_mut()?.take_free_slot() {
+    /// A record slot of `class` for a node last accessed at `cold_access`,
+    /// dropping the LRU on-disk leaf of that class when the class is full.
+    /// `None` when every droppable on-disk block of the class is hotter than
+    /// the candidate (or none is droppable).
+    ///
+    /// With several classes a chain's last block of `class` may sit just
+    /// above a leaf of another class (a latent shard's chains alternate): it
+    /// is droppable together with those leaves, so a full class can always
+    /// trim a chain's tail.
+    fn alloc_slot(&mut self, cold_access: u64, class: u32) -> Option<u32> {
+        if let Some(s) = self.nvme.as_mut()?.take_free_slot(class) {
             return Some(s);
         }
-        let victim = self
-            .nvme
-            .as_ref()?
-            .lru
-            .iter()
-            .copied()
-            .find(|&(_, Reverse(id))| {
-                self.nodes[id].children.is_empty() && self.nodes[id].ref_count <= 1
-            });
+        let idx = self.nvme.as_ref()?;
+        let leaf = |id: NodeId| self.nodes[id].children.is_empty();
+        let victim = idx.lru.iter().copied().find(|&(_, Reverse(id))| {
+            let n = &self.nodes[id];
+            let tail = leaf(id) || (idx.classes > 1 && n.children.values().all(|&c| leaf(c)));
+            tail && n.ref_count <= 1 && slot_class(n.nvme_slot, idx.classes) == class
+        });
         match victim {
             Some((access, Reverse(id))) if access <= cold_access => {
+                let nodes = 1 + self.nodes[id].children.len() as u64;
                 let freed = self.drop_subtree(id);
-                debug_assert!(freed.is_empty(), "on-disk leaf held resident blocks");
+                debug_assert!(freed.is_empty(), "on-disk tail held resident blocks");
                 let idx = self.nvme.as_mut()?;
-                idx.stats.disk_drops += 1;
-                idx.take_free_slot()
+                idx.stats.disk_drops += nodes;
+                idx.take_free_slot(class)
             }
             _ => None,
         }
@@ -215,7 +156,8 @@ impl RadixTreeInner {
             let slot = if orphan {
                 None
             } else {
-                self.alloc_slot(access)
+                let classes = self.nvme.as_ref().map_or(1, |idx| idx.classes);
+                self.alloc_slot(access, slot_class(self.nodes[id].block_idx, classes))
             };
             let Some(slot) = slot else {
                 if !orphan && let Some(idx) = self.nvme.as_mut() {
@@ -294,7 +236,7 @@ impl RadixTreeInner {
             return true;
         };
         idx.lru.remove(&(access, Reverse(id)));
-        let half_free = u64::from(idx.stats.slots_used) * 2 <= u64::from(idx.max_slots);
+        let half_free = idx.half_free(slot_class(slot, idx.classes));
         if !(restored && idx.keep_restored && half_free) {
             self.nodes[id].nvme_slot = u32::MAX;
             idx.release_slot(slot);

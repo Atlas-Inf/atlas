@@ -6,6 +6,11 @@
 //! and issues no collective: the ranks then agree on the match (F83) and, with
 //! the tier on, on the Marconi restore depth (`prefill_b/pc_policy.rs`).
 //!
+//! Under a latent shard (`ATLAS_GLM_KV_SHARD=1`) each rank restores its own
+//! blocks' latents and every block's index rows; the agreed match covers only
+//! blocks BOTH ranks restored, so the merge-form attention never meets a
+//! logical block whose latents its owner lacks.
+//!
 //! Only the per-stream prefill (`prefill_b_prefix_lookup`) restores. The
 //! batched admission (`prefill_b_reserve_batched_prefix_matches`, single-rank
 //! worlds only) looks the tree up as it is: concurrent arrivals whose prefix
@@ -156,7 +161,7 @@ impl TransformerModel {
             s.spill_failures + s.restore_failures,
             ms(r.evict_micros),
             read_ms,
-            (r.restored * kv_cache.nvme_record_bytes()) as f64 / 1e3 / read_ms.max(1e-3),
+            (r.restored * kv_cache.nvme_block_record_bytes()) as f64 / 1e3 / read_ms.max(1e-3),
             if io.fast { "fast" } else { "sync" },
             io.spilled_blocks,
             ms(io.spill_micros),
@@ -302,8 +307,10 @@ pub(crate) fn restore_prefix(
     let io0 = kv_cache.nvme_io_stats();
     let t0 = std::time::Instant::now();
     let mut blocks = Vec::with_capacity(wanted);
-    // Each block's index in the sequence (the tier is refused beside a latent
-    // shard, whose allocator draws by it: `factory::build::glm::shard_plan`).
+    // Each block's index in the sequence: a latent-sharded cache draws an id
+    // whose residue is its index's, which is also the residue of the record
+    // slot the block spilled to — the restored block takes its record's
+    // ownership on every rank (`kv_cache/nvme_lanes.rs`).
     let first = plan.resident_tokens / bs;
     while blocks.len() < wanted {
         match alloc_block_evicting(kv_cache, prefix_cache, gpu, first + blocks.len()) {
@@ -355,6 +362,9 @@ pub(crate) fn restore_prefix(
 #[cfg(test)]
 #[path = "kv_nvme_keep_tests.rs"]
 mod keep_tests;
+#[cfg(test)]
+#[path = "kv_nvme_shard_tests.rs"]
+mod shard_tests;
 #[cfg(test)]
 #[path = "kv_nvme_tests.rs"]
 mod tests;

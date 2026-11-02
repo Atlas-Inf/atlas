@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 
 use super::block_trace::BlockTrace;
 use super::free_blocks::FreeBlocks;
-use super::{KvCacheConfig, KvCacheDtype, LayerPool, PagedKvCache};
+use super::{KvBuffer, KvCacheConfig, KvCacheDtype, KvPlacement, LayerPool, PagedKvCache};
 use crate::gpu::{DevicePtr, GpuBackend};
 
 impl PagedKvCache {
@@ -26,7 +26,19 @@ impl PagedKvCache {
         gpu: &dyn GpuBackend,
         v_aliases_k: bool,
     ) -> Result<Self> {
-        Self::new_with_k_slots(config, num_blocks, num_blocks, gpu, v_aliases_k)
+        Self::new_placed(config, num_blocks, gpu, v_aliases_k, KvPlacement::default())
+    }
+
+    /// [`Self::new_with_v_alias`] with the pools `placement` names allocated
+    /// from the backend's carveout (and the sparse index's, once attached).
+    pub fn new_placed(
+        config: KvCacheConfig,
+        num_blocks: usize,
+        gpu: &dyn GpuBackend,
+        v_aliases_k: bool,
+        placement: KvPlacement,
+    ) -> Result<Self> {
+        Self::new_with_k_slots(config, num_blocks, num_blocks, gpu, v_aliases_k, placement)
     }
 
     /// [`Self::new_with_v_alias`] with `k_slots` K-pool block slots per layer
@@ -37,6 +49,7 @@ impl PagedKvCache {
         k_slots: usize,
         gpu: &dyn GpuBackend,
         v_aliases_k: bool,
+        placement: KvPlacement,
     ) -> Result<Self> {
         let mut layers = Vec::with_capacity(config.num_layers);
         let mut total_bytes: usize = 0;
@@ -47,22 +60,21 @@ impl PagedKvCache {
             // allocation that would result from a single MAX-sized stride.
             let k_block_bytes = config.k_block_bytes_for_layer(i);
             let k_pool_bytes = k_slots * k_block_bytes;
-            // A failed alloc frees the pools this call already claimed, so a
-            // caller can release memory and retry (build_model's reserve
-            // balloon fallback) without the first attempt's layers leaking.
+            // Preserve allocation-failure rollback for both ordinary K/V pools
+            // and GLM's shared latent pool. An alias owns only one allocation.
             let release = |layers: &[LayerPool]| {
-                for l in layers {
-                    let _ = gpu.free(l.k_pool);
-                    if l.v_pool != l.k_pool {
-                        let _ = gpu.free(l.v_pool);
+                for layer in layers {
+                    let _ = gpu.free(layer.k_pool);
+                    if layer.v_pool != layer.k_pool {
+                        let _ = gpu.free(layer.v_pool);
                     }
                 }
             };
-            let k_pool = match gpu.alloc(k_pool_bytes) {
-                Ok(p) => p,
-                Err(e) => {
+            let k_pool = match placement.alloc(gpu, KvBuffer::K(i), k_pool_bytes) {
+                Ok(ptr) => ptr,
+                Err(error) => {
                     release(&layers);
-                    return Err(e);
+                    return Err(error);
                 }
             };
             let (v_pool, v_block_bytes, v_pool_bytes) = if v_aliases_k {
@@ -70,14 +82,15 @@ impl PagedKvCache {
             } else {
                 let v_block_bytes = config.v_block_bytes_for_layer(i);
                 let v_pool_bytes = num_blocks * v_block_bytes;
-                match gpu.alloc(v_pool_bytes) {
-                    Ok(p) => (p, v_block_bytes, v_pool_bytes),
-                    Err(e) => {
+                let v_pool = match placement.alloc(gpu, KvBuffer::V(i), v_pool_bytes) {
+                    Ok(ptr) => ptr,
+                    Err(error) => {
                         let _ = gpu.free(k_pool);
                         release(&layers);
-                        return Err(e);
+                        return Err(error);
                     }
-                }
+                };
+                (v_pool, v_block_bytes, v_pool_bytes)
             };
             total_bytes += k_pool_bytes + v_pool_bytes;
             layers.push(LayerPool {
@@ -132,8 +145,9 @@ impl PagedKvCache {
             sparse_index_config: None,
             tail_slots: None,
             trace: BlockTrace::new(num_blocks),
-            nvme: None,
+            nvme: Vec::new(),
             latent_shard: None,
+            placement,
         })
     }
 

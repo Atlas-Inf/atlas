@@ -47,7 +47,7 @@ impl MoeLayer {
     /// Whether [`Self::forward_rows`] can serve this layer: `forward`'s own
     /// fused decode arm (not one of its grouped-prefill early returns).
     fn forward_rows_eligible(&self, ctx: &ForwardContext) -> bool {
-        !(self.routed_scales_released || ctx.config.expert_tp || self.decode_via_grouped_arm())
+        !(self.routed_scales_released || self.grouped_only(ctx) || self.decode_via_grouped_arm())
     }
 
     /// Whether `forward_row_local` takes the originals-layout NVFP4 arm with
@@ -74,7 +74,6 @@ impl MoeLayer {
             && self.lora.is_none()
             && self.pre_expert_norm.is_none()
             && self.weights.router_pre_norm.is_none()
-            && !self.has_mixed_bf16_shared_expert()
             && self.tid2eid_dev.is_none()
             && self.correction_bias_dev.is_none()
             && self.router_logits_n as usize == ctx.config.num_experts
@@ -123,9 +122,21 @@ impl MoeLayer {
             self.reject_decode_lora(ctx, "forward_rows")?;
         }
         let output = ctx.buffers.moe_output();
-        let shared_out = ctx.buffers.attn_output();
+        // An MXFP8 shared expert's rows run on the side lane, forked here.
+        let side = self.fork_mxfp8_shared(input, rows, ctx, stream)?;
+        let shared_out = side.unwrap_or(ctx.buffers.attn_output());
         if self.rows_pair_eligible(rows, ctx) {
             self.forward_rows_pair(input, rows, output, shared_out, ctx, stream)?;
+        } else if self.t_rows_eligible(rows, ctx) {
+            self.forward_rows_t(
+                input,
+                rows,
+                output,
+                shared_out,
+                single_seq_decode,
+                ctx,
+                stream,
+            )?;
         } else {
             for r in 0..rows {
                 let off = r * h * bf16;
@@ -139,6 +150,7 @@ impl MoeLayer {
                 )?;
             }
         }
+        self.end_mxfp8_shared_fork(ctx, stream)?;
         let posted =
             self.forward_ep_reduce(output, shared_out, input, rows, hc_post, ctx, stream)?;
         Ok(Some((output, posted)))
@@ -239,6 +251,9 @@ impl MoeLayer {
         let (h32, inter32, top_k32, rows32) = (h as u32, inter as u32, top_k as u32, rows as u32);
         let table = |t: &ExpertPtrTable| (t.packed_ptrs, t.scale_ptrs, t.scale2_vals);
         let shared = &self.weights.shared_expert;
+        // `shared` is NULL under a checkpoint-native separate shared expert —
+        // the fused kernels skip it and the separate chain fills `shared_out`
+        // for the same rows below.
         if k.units_ready() {
             // A launch takes up to QWEN4EXP_MOE_UNITS_MAX_ROWS rows; each row's
             // bytes are the same in any chunk (and under ATLAS_QWEN4EXP_MOE_TC
@@ -285,9 +300,25 @@ impl MoeLayer {
             )?;
         }
 
+        if self.has_separate_shared_expert() {
+            self.run_separate_shared_expert(
+                input,
+                rows32,
+                h32,
+                ctx.config.shared_expert_intermediate_size as u32,
+                ctx.buffers.logits(),
+                ctx.buffers.ssm_qkvz(),
+                shared_out,
+                ctx,
+                true,
+                stream,
+            )?;
+        }
+
         // Each row's blend, as `forward_row_local` runs it: under EP against a
         // zeroed shared row (the EP reduce adds the shared expert once).
-        let is_ep = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
+        let is_ep =
+            ctx.comm.is_some() && ctx.config.ep_world_size > 1 && !self.shared_joins_reduce();
         let zero_row = if is_ep {
             self.ep_blend_zero_row(ctx, stream)?
         } else {

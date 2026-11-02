@@ -251,7 +251,7 @@ impl QsaIndexer {
             stream,
         )
         .context("QSA qk projection (prefill select)")?;
-        ops::qsa_qprep_rows(
+        ops::qsa_qprep_rows_scaled(
             gpu,
             self.k_qprep_rows_k,
             qk_buf,
@@ -265,6 +265,8 @@ impl QsaIndexer {
             self.rot,
             self.theta,
             self.eps,
+            self.yarn_inv_freq,
+            self.yarn_attention_factor,
             stream,
         )?;
         let n_blocks_max = (first_pos + rows) / ratio; // last row's complete

@@ -170,10 +170,12 @@ pub struct CompressorWeights {
 /// Both share the `[T, hc_mult, H]` highway and `hc_mult`, so the presence of
 /// this struct — not the model name — is what selects the kernel.
 ///
-/// All BF16, matching the checkpoint. See `bench/qwen4_exp/ARCHITECTURE.md` §1.
+/// All BF16 except `norm_w` (F32). See `bench/qwen4_exp/ARCHITECTURE.md` §1.
 #[derive(Clone, Copy)]
 pub struct HcLowRank {
-    /// `hc_norm` `[hc_mult*hidden]`. A GROUPED RMSNorm scale: the streams
+    /// `hc_norm` `[hc_mult*hidden]` **F32** — every consumer kernel is
+    /// declared `const float*`; the loader (`dense_keep_f32`) guarantees the
+    /// dtype. A GROUPED RMSNorm scale: the streams
     /// normalize independently inside the vector, `group_size = hidden`.
     pub norm_w: DevicePtr,
     /// `input_mix_weight_down` `[rank, hc_mult*hidden]`.

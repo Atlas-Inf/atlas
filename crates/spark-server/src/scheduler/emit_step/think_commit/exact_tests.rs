@@ -37,6 +37,7 @@ const MID: std::ops::RangeInclusive<u32> = 65..=90;
 #[derive(Clone, Copy, Debug)]
 struct Case {
     honor_eos_in_think: bool,
+    eos_ends_thinking: bool,
     presence: f32,
     budget_after: Option<u32>,
     seed: u64,
@@ -52,6 +53,7 @@ fn sched(c: Case) -> SchedCtx {
         confidence_early_stop: true,
         confidence_run_length: 3,
         honor_eos_inside_thinking: c.honor_eos_in_think,
+        eos_ends_thinking: c.eos_ends_thinking,
         ..Default::default()
     };
     let limits = crate::scheduler::limits::SchedLimits {
@@ -226,10 +228,12 @@ fn check(c: Case) {
 #[test]
 fn verify_spans_commit_exactly_what_serial_decode_commits() {
     for seed in 1..=24 {
-        for honor_eos_in_think in [true, false] {
+        for (honor_eos_in_think, eos_ends_thinking) in [(true, false), (false, false), (true, true)]
+        {
             for (presence, budget_after) in [(0.0, None), (0.0, Some(6)), (0.5, Some(12))] {
                 check(Case {
                     honor_eos_in_think,
+                    eos_ends_thinking,
                     presence,
                     budget_after,
                     seed,
@@ -248,6 +252,7 @@ fn the_stream_reaches_the_cases_it_is_built_for() {
     for seed in 1..=24 {
         let c = Case {
             honor_eos_in_think: true,
+            eos_ends_thinking: false,
             presence: 0.0,
             budget_after: Some(6),
             seed,
@@ -267,5 +272,38 @@ fn the_stream_reaches_the_cases_it_is_built_for() {
     assert!(
         closed > 12 && armed > 4 && content > 8,
         "{closed} {armed} {content}"
+    );
+}
+
+#[test]
+fn an_end_token_inside_thinking_ends_the_turn_when_the_model_says_so() {
+    // `eos_ends_thinking`: the reference engines stop at an end token wherever
+    // it falls. Over the seeds some turn must end inside `<think>`, on the
+    // end token, and none may have gone on to write an answer after it.
+    let mut ended_in_think = 0;
+    for seed in 1..=24 {
+        let c = Case {
+            honor_eos_in_think: true,
+            eos_ends_thinking: true,
+            presence: 0.0,
+            budget_after: None,
+            seed,
+        };
+        SCRIPT.with(|s| {
+            *s.borrow_mut() = Some(Script {
+                rows: rows(seed, 160),
+                cursor: 0,
+            })
+        });
+        let (a, _) = serial(c, 160);
+        if a.finished && a.inside_thinking {
+            ended_in_think += 1;
+            assert_eq!(a.content_tokens, 0, "seed {seed}");
+        }
+    }
+    SCRIPT.with(|s| *s.borrow_mut() = None);
+    assert!(
+        ended_in_think > 0,
+        "no seed ends on an end token in <think>"
     );
 }

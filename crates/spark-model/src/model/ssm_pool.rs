@@ -272,6 +272,7 @@ impl SsmStatePool {
         let gdn_fuse_words =
             if gdn_deferred_commit && has_mtp && super::trait_impl::gdn_commit_fuse::requested() {
                 let p = gpu.alloc(total_slots * 4)?;
+                allocations.push(p);
                 gpu.memset(p, 0, total_slots * 4)?;
                 p
             } else {

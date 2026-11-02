@@ -132,7 +132,7 @@ fn mk_state(gpu: &MockGpuBackend, layer: &Qwen3SsmLayer, n_inter: usize) -> SsmL
 
 /// Drive the batched verify body at ragged ks through `decode_verify_multi`
 /// (the verify_e.rs entry point) and return the result.
-fn run_batched_verify(
+pub(super) fn run_batched_verify(
     gpu: &MockGpuBackend,
     config: &ModelConfig,
     layer: &Qwen3SsmLayer,
@@ -210,14 +210,15 @@ fn native_fp8_gdn_batched_verify_r7_dispatches_w8a16_gemv() {
     // Pin the arm identity at R=7: the batched `w8a16_gemv_*` arm sits AHEAD
     // of the `num_tokens > 4 → w8a16_gemm*` fallback for 5..=16 rows. Under
     // the mock every kernel resolves, so `fp8_verify_gemv_tier` picks the
-    // M<=8 tier: the `w8a16_gemv_batch8_dyn_vl2` twin (8 outputs/block, grid
-    // [ceil(N/8),1,1]) unless ATLAS_GEMV_VL2=0, else `w8a16_gemv_batch8`
-    // (grid [ceil(N/4),1,1]). Block is [256,1,1] either way. The vl2 lookup
-    // is only issued on atlas_hip (the twin exists only in strix-hip), so
-    // every other build takes the batch8 arm.
+    // M<=8 tier: the `w8a16_gemv_batch8_dyn_vl2_n2` twin (16 outputs/block,
+    // grid [ceil(N/16),1,1], preferred over `_dyn_vl2`'s 8 since #156) unless
+    // ATLAS_GEMV_VL2=0, else `w8a16_gemv_batch8` (grid [ceil(N/4),1,1]).
+    // Block is [256,1,1] either way. The vl2 lookups are only issued on
+    // atlas_hip (the twins exist only in strix-hip), so every other build
+    // takes the batch8 arm.
     // QKVZ N=12288, out_proj N=2048.
     let per_block = if cfg!(atlas_hip) && crate::layers::ops::gemv_vl2_enabled() {
-        8
+        16
     } else {
         4
     };
@@ -347,6 +348,7 @@ fn active_row_without_ple_carry_is_refused() {
         1,
         1,
         None,
+        None,
         &gpu,
     )
     .unwrap();
@@ -395,7 +397,7 @@ fn active_row_without_ple_carry_is_refused() {
 }
 
 /// Grid/block pairs of every launch recorded by the mock.
-fn gpu_launch_grids(gpu: &MockGpuBackend) -> Vec<([u32; 3], [u32; 3])> {
+pub(super) fn gpu_launch_grids(gpu: &MockGpuBackend) -> Vec<([u32; 3], [u32; 3])> {
     gpu.launches_snapshot()
         .into_iter()
         .map(|l| (l.grid, l.block))

@@ -41,8 +41,15 @@ pub(super) fn attach_qsa(
                 .with_context(|| format!("qwen4_exp layer {i}: indexer {name}"))?
                 .ptr)
         };
-        let qsa = crate::layers::qsa::QsaIndexer::new(
-            up("index_qk_proj.weight")?,
+        // The projection through `dense_auto`, not the raw store pointer:
+        // FP4-Local ships it MXFP8, and the indexer kernels read BF16. On the
+        // BF16 releases `dense_auto` returns the store's own buffer, as before.
+        let qk_name = format!("{lp}.self_attn.indexer.index_qk_proj.weight");
+        let index_qk = crate::weight_map::dense_auto(store, &qk_name, gpu)
+            .with_context(|| format!("qwen4_exp layer {i}: indexer {qk_name}"))?
+            .weight;
+        let mut qsa = crate::layers::qsa::QsaIndexer::new(
+            index_qk,
             up("q_layernorm.weight")?,
             up("k_layernorm.weight")?,
             config.index_n_heads,
@@ -62,11 +69,13 @@ pub(super) fn attach_qsa(
         let any = layer
             .as_any_mut()
             .ok_or_else(|| anyhow::anyhow!("qwen4_exp layer {i}: no as_any_mut for QSA"))?;
-        any.downcast_mut::<crate::layers::Qwen3AttentionLayer>()
+        let attention = any
+            .downcast_mut::<crate::layers::Qwen3AttentionLayer>()
             .ok_or_else(|| {
                 anyhow::anyhow!("qwen4_exp layer {i}: indexer on a non-attention layer")
-            })?
-            .set_qsa(qsa);
+            })?;
+        qsa.set_yarn_rope(attention.yarn_inv_freq, config.yarn_attention_factor, gpu)?;
+        attention.set_qsa(qsa);
     }
     Ok(())
 }
