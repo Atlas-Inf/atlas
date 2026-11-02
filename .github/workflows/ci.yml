@@ -116,6 +116,16 @@ jobs:
       # violation. Stdlib-only; the runner's system python3 suffices.
       - run: python3 scripts/check_kernel_shadows.py
 
+  env-budget:
+    name: ATLAS_* env budget (ratchet)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Distinct "ATLAS_*" literals across crates/**/*.rs may only go down
+      # (#117). A new knob must retire an old one or become a CLI flag /
+      # MODEL.toml field. Stdlib-only; system python3.
+      - run: python3 scripts/check_env_budget.py
+
   harvest-triage:
     name: harvest triage decision table
     runs-on: ubuntu-latest

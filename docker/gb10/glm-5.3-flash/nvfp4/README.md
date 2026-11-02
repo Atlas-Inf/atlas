@@ -11,15 +11,16 @@ option requiring separately obtained draft weights; the commands do not enable
 native MTP or require a converted NVIDIA checkpoint.
 
 The initial limit is **32,768 tokens per session and 32,768 aggregate KV tokens
-shared by four slots**, including generated tokens. The actual negotiated pool
-can be smaller. This is a bounded starting configuration, not a maximum-context
-claim. [Validation receipts](../../../../docs/porting/glm53-validation/README.md)
+with one plain-decode slot, or shared by four slots with DFlash2**, including
+generated tokens. The actual negotiated pool can be smaller. This is a bounded
+starting configuration, not a maximum-context claim. [Validation receipts](../../../../docs/porting/glm53-validation/README.md)
 identify the measured revisions and profiles; the no-drafter option below is not
 a claim of fresh output parity with the qualified DFlash profile.
-Keep the four configured slots even when testing a single client: with this
-recipe's 4096-token prefill chunk, they provide the native path's required
-4100-row workspace. A single active request does not require a single-slot
-server configuration.
+The recipe explicitly reserves a 4100-row workspace with
+`ATLAS_MAX_BATCH_TOKENS=4100`. The native sparse prefill path needs that capacity
+even for one plain-decode slot; a 4096-token chunk plus one slot would otherwise
+allocate only 4097 rows. With DFlash2, keep all four configured slots even when
+benchmarking one active client.
 
 ## Build from this checkout
 
@@ -86,6 +87,7 @@ DOCKER_ARGS=(
   --env-file scripts/dev/glm53_native/rc2-candidate.env
   --env-file scripts/dev/glm53_native/rc4-candidate.env
   -e ATLAS_KV_MAX_BLOCKS=2048
+  -e ATLAS_MAX_BATCH_TOKENS=4100
   -e "NCCL_SOCKET_IFNAME=$IFACE" -e "GLOO_SOCKET_IFNAME=$IFACE"
   -e "NCCL_IB_HCA=$HCA" -e "ATLAS_RDMA_RAILS=$HCA"
   -e NCCL_IB_ADDR_FAMILY=AF_INET -e NCCL_IB_ROCE_VERSION_NUM=2
@@ -101,7 +103,7 @@ SERVE_ARGS=(
   --kernel-target=glm-5.3-flash --world-size=2 --tp-size=2 --ep-size=2
   --master-addr="$HEAD_FABRIC_IP" --master-port=29610 --gpu-ordinal=0
   --max-seq-len=32768 --max-prefill-tokens=4096
-  --max-batch-size=4 --max-num-seqs=4 --block-size=16
+  --block-size=16
   --kv-cache-dtype=fp8_g128 --ssm-h-dtype=f32 --ssm-rollback-mode=records
   --gpu-memory-utilization=0.88 --oom-guard-mb=12288
   --ssm-cache-slots=0 --ssm-checkpoint-interval=0 --enable-prefix-caching=false
@@ -112,8 +114,13 @@ SERVE_ARGS=(
 # Ordinary decode: override the inherited DFlash-specific switches together.
 DRAFT_ENV=(-e ATLAS_GLM_DFLASH=0 -e ATLAS_GLM_MTP_LONG_CONTEXT=0
            -e ATLAS_DFLASH_COPY_DRAFTS=0)
-DRAFT_ARGS=()
+DECODE_ARGS=(--max-batch-size=1 --max-num-seqs=1)
 ```
+
+Plain decode uses one active/admitted sequence at 32K with FP8 KV. Merely
+setting `ATLAS_GLM_C4_DECODE=1` does not enable this same profile at C4: that
+separate lane requires BF16 KV and a smaller context, plus its other policy
+settings. Use the DFlash2 option below for this recipe's four-slot profile.
 
 These environment files retain explicit disabled experimental settings and the
 conservative stream-ordered launch policy. They enable native KDA and sparse
@@ -154,8 +161,9 @@ DRAFT_ENV=(
   -e ATLAS_GLM_DFLASH=1 -e ATLAS_GLM_MTP_LONG_CONTEXT=1
   -e ATLAS_DFLASH_COPY_DRAFTS=1
 )
-DRAFT_ARGS=(--dflash --draft-model=/draft --dflash-gamma=8
-            --dflash-window-size=2048 --mtp-gate=force)
+DECODE_ARGS=(--max-batch-size=4 --max-num-seqs=4
+             --dflash --draft-model=/draft --dflash-gamma=8
+             --dflash-window-size=2048 --mtp-gate=force)
 ```
 
 The inherited draft optimizations remain those of the full profile. The
@@ -173,7 +181,7 @@ command in their prepared shells. Port 29610 must be reachable over the fabric.
 ```bash
 docker run --name atlas-glm53-r1 "${DOCKER_ARGS[@]}" "${DRAFT_ENV[@]}" \
   atlas-glm53-flash:local serve /model "${SERVE_ARGS[@]}" \
-  "${DRAFT_ARGS[@]}" --rank=1 --port=18994
+  "${DECODE_ARGS[@]}" --rank=1 --port=18994
 ```
 
 **Head / rank 0:**
@@ -181,7 +189,7 @@ docker run --name atlas-glm53-r1 "${DOCKER_ARGS[@]}" "${DRAFT_ENV[@]}" \
 ```bash
 docker run --name atlas-glm53-r0 "${DOCKER_ARGS[@]}" "${DRAFT_ENV[@]}" \
   atlas-glm53-flash:local serve /model "${SERVE_ARGS[@]}" \
-  "${DRAFT_ARGS[@]}" --rank=0 --port=18993
+  "${DECODE_ARGS[@]}" --rank=0 --port=18993
 ```
 
 Only rank 0 serves clients, at `http://127.0.0.1:18993/v1`. In another head shell,
