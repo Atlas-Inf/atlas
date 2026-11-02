@@ -88,6 +88,17 @@ llama_up() { # port parallel ctx-per-slot model [extra llama-server args...]
   ENGINE_DOWN() { kill -INT "$LPID" 2>/dev/null; sleep 8; kill -9 "$LPID" 2>/dev/null; cp "$OUT/llama-server.log" "$1" 2>/dev/null; true; }
 }
 
+atlas_up() { # port model [KEY=VAL env...] -- Atlas through serve-amd.sh at this ref (the binary the workflow just built)
+  local port=$1 m=$2; shift 2
+  ( exec env RUST_LOG=info ATLAS_BIN="$PWD/target/release/spark" PORT="$port" HOST=127.0.0.1 MODEL_NAME=m "$@" \
+      ./serve-amd.sh "$m" --disable-thinking --request-timeout 0 ) > "$OUT/atlas-server.log" 2>&1 &
+  APID=$!
+  ENGINE_ALIVE() { kill -0 "$APID" 2>/dev/null; }
+  ENGINE_DOWN() { kill -INT "$APID" 2>/dev/null; for _ in $(seq 1 90); do kill -0 "$APID" 2>/dev/null || break; sleep 2; done
+    kill -9 "$APID" 2>/dev/null; cp "$OUT/atlas-server.log" "$1" 2>/dev/null
+    for _ in $(seq 1 60); do [ "$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)" -gt 40000 ] && break; sleep 2; done; true; }
+}
+
 wait_ready() { # port -> MID (served model id); 0 when a 2-token chat answers
   local port=$1
   for _ in $(seq 1 360); do
