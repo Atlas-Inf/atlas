@@ -19,7 +19,10 @@
 #define __global__ __device__ __forceinline__
 #define __launch_bounds__(...)
 #define __grid_constant__
+#pragma nv_diagnostic push
+#pragma nv_diag_suppress 177
 #include "../../../../third_party/nvidia_sparse_mla_sm120/prefill_kernel.cuh"
+#pragma nv_diagnostic pop
 #pragma pop_macro("__grid_constant__")
 #pragma pop_macro("__launch_bounds__")
 #pragma pop_macro("__global__")
