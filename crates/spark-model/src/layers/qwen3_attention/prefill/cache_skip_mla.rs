@@ -50,6 +50,11 @@ impl Qwen3AttentionLayer {
         if self.mla_native_rows(ctx, weight, input, output, m, n, k, stream)? {
             return Ok(());
         }
+        // A packed prefill (`glm_packed_scope`): the BF16 GEMM at every row
+        // count, which is row-invariant there; none of the short-batch twins.
+        if crate::layers::glm_packed_scope::active() && ctx.dispatch.cublas_gemm {
+            return ops::cublas_bf16_proj_dense(input, weight.weight, output, m, n, k, stream);
+        }
         let tc = crate::layers::w4a16_gemv_tiers::tc_kernel(m);
         if m <= 32
             && tc.0 != 0

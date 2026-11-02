@@ -213,6 +213,29 @@ pub(in crate::model) fn tail_split_disabled() -> bool {
     std::env::var("ATLAS_NO_TAIL_SPLIT").as_deref() == Ok("1")
 }
 
+/// `ATLAS_TAIL_SPLIT_MIN_TOKENS` (default 0): a prompt under this many tokens
+/// runs its last chunk as one pass, losing only the tail checkpoint.
+pub(in crate::model) fn tail_split_min_tokens() -> usize {
+    parse_tail_split_min_tokens(std::env::var("ATLAS_TAIL_SPLIT_MIN_TOKENS").ok().as_deref())
+}
+
+pub(super) fn parse_tail_split_min_tokens(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// Whether the last chunk `[chunk_start, total)` splits at `cut`
+/// (`ATLAS_NO_TAIL_SPLIT` = `disabled`, [`tail_split_min_tokens`]).
+pub(super) fn tail_split_at(
+    total: usize,
+    chunk_start: usize,
+    cut: usize,
+    disabled: bool,
+    min_tokens: usize,
+) -> bool {
+    !disabled && total >= min_tokens && cut > chunk_start && cut < total
+}
+
 /// `ATLAS_QWEN4EXP_PREFILL_ROWINV=1`: the last chunk runs unsplit, since
 /// a block-grid cut is off the GDN grid. Without the in-pass checkpoint
 /// (`_MIDCHUNK_CKPT`, `in_pass`) no tail checkpoint is saved at all, so

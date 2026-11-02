@@ -161,6 +161,12 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        let shape = [num_tokens, num_experts, hidden_size];
+        // A packed prefill (`glm_packed_scope`): the BF16 GEMM, row-invariant
+        // there, at every row count.
+        if crate::layers::glm_packed_scope::active() && ctx.config.model_type == "glm5_next" {
+            return self.router_bf16_gemm(router_in, gate_logits, shape, stream);
+        }
         match glm_router_prefill_gemm(
             ctx.config.model_type == "glm5_next",
             num_tokens,
@@ -169,20 +175,7 @@ impl MoeLayer {
             glm_router_prefill_cutlass(),
         ) {
             Some(RouterPrefillGemm::Cutlass) => {
-                let gemm = if self.router_f32 {
-                    ops::bf16_gemm_f32out
-                } else {
-                    ops::bf16_gemm
-                };
-                return gemm(
-                    router_in,
-                    self.weights.gate.weight.0,
-                    gate_logits,
-                    num_tokens,
-                    num_experts,
-                    hidden_size,
-                    stream,
-                );
+                return self.router_bf16_gemm(router_in, gate_logits, shape, stream);
             }
             Some(RouterPrefillGemm::CublasLt) => {
                 let lt = if self.router_f32 {
@@ -276,6 +269,32 @@ impl MoeLayer {
             num_tokens,
             num_experts,
             hidden_size,
+            stream,
+        )
+    }
+
+    /// `ops::bf16_gemm` for the router, into BF16 logits or, under
+    /// [`Self::router_f32`], FP32 ones (`ops::bf16_gemm_f32out`: the same
+    /// tiles, the accumulator unrounded).
+    pub(super) fn router_bf16_gemm(
+        &self,
+        router_in: DevicePtr,
+        gate_logits: DevicePtr,
+        [m, n, k]: [u32; 3],
+        stream: u64,
+    ) -> Result<()> {
+        let gemm = if self.router_f32 {
+            ops::bf16_gemm_f32out
+        } else {
+            ops::bf16_gemm
+        };
+        gemm(
+            router_in,
+            self.weights.gate.weight.0,
+            gate_logits,
+            m,
+            n,
+            k,
             stream,
         )
     }

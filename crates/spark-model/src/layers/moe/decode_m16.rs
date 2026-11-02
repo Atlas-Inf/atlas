@@ -215,7 +215,9 @@ impl MoeLayer {
 
     /// Whether a routed FFN of `rows` rows takes the stream twins' prequant path.
     pub(super) fn stream_m16_prequant(&self, rows: u32, h: u32, inter: u32) -> bool {
-        self.decode_m16.stream()
+        // A packed prefill keeps the K128W grid at every row count.
+        !crate::layers::glm_packed_scope::active()
+            && self.decode_m16.stream()
             && self.m16_grid_fits(rows, self.decode_m16.max_rows(), h, inter)
             && !self.nvfp4_mmq_layout
             && !(super::forward_prefill_routed::grouped_cutlass_gate_up_enabled()
@@ -269,21 +271,22 @@ impl MoeLayer {
                 stream,
             )
         };
-        let m16 = if decode || self.decode_m16.stream() {
-            self.decode_m16_grid(
-                expert_offsets,
-                local_ptrs,
-                rows,
-                total_expanded,
-                [h, inter],
-                num_experts,
-                prerouted,
-                ctx,
-                stream,
-            )?
-        } else {
-            None
-        };
+        let m16 =
+            if !crate::layers::glm_packed_scope::active() && (decode || self.decode_m16.stream()) {
+                self.decode_m16_grid(
+                    expert_offsets,
+                    local_ptrs,
+                    rows,
+                    total_expanded,
+                    [h, inter],
+                    num_experts,
+                    prerouted,
+                    ctx,
+                    stream,
+                )?
+            } else {
+                None
+            };
         self.decode_m16.note(ctx.gpu, rows, m16.is_some());
         if m16.is_some() {
             return Ok((None, m16));

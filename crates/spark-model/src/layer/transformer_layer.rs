@@ -90,6 +90,22 @@ pub trait TransformerLayer: Send + Sync {
         anyhow::bail!("GLM fused prefill + verify is unsupported for this layer")
     }
 
+    /// Packed multi-prompt prefill (`glm_packed`): `owners` tile arena rows
+    /// `[0, total)`, each a whole new prompt. Row-local work runs once over
+    /// every row; each prompt advances only its own state. Unsupported layers
+    /// refuse before any work.
+    fn prefill_glm_packed(
+        &self,
+        _hidden: DevicePtr,
+        _total: usize,
+        _owners: &mut [super::glm_packed::GlmPackedOwner<'_>],
+        _cache: &mut PagedKvCache,
+        _ctx: &ForwardContext<'_>,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("GLM packed prefill is unsupported for this layer")
+    }
+
     /// True when this layer's PREFILL attends only over the tokens it is
     /// handed, so a prefix-cache skip would hide the cached prefix from
     /// attention entirely. MLA layers on the paged path do; everything else

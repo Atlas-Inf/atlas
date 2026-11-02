@@ -651,6 +651,23 @@ impl Model for TransformerModel {
     fn has_shared_prompt_capture(&self) -> bool {
         self.has_shared_prompt_capture_impl()
     }
+    fn packed_prefill_admits(&self, prompt: &[u32], adapter_id: u64) -> bool {
+        self.glm_packed_admits(prompt, adapter_id)
+    }
+    fn packed_prefill_capacity(&self) -> (usize, usize) {
+        if self.glm_packed_supported() {
+            self.glm_packed_capacity()
+        } else {
+            (0, 0)
+        }
+    }
+    fn prefill_packed(
+        &self,
+        prompts: &[&[u32]],
+        seqs: &mut [&mut SequenceState],
+    ) -> Result<Vec<DevicePtr>> {
+        self.prefill_packed_impl(prompts, seqs)
+    }
     fn can_fuse_glm_prefill_verify(
         &self,
         prompt: &[u32],

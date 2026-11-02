@@ -93,7 +93,7 @@ impl TransformerModel {
 
     /// The multi-rank zero before a chunk: the whole arena, or with
     /// `ATLAS_GLM_ZERO_ROWS` what may be dirty (`ZeroRows`).
-    fn warm_zero_arena(&self, stream: u64) -> Result<()> {
+    pub(in crate::model) fn warm_zero_arena(&self, stream: u64) -> Result<()> {
         let (gpu, arena) = (self.gpu.as_ref(), &self.buffers);
         match self.warm.zero_rows {
             ZeroRows::Off => arena.zero_all(gpu, stream),

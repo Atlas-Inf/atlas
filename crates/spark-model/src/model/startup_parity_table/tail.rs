@@ -5,12 +5,19 @@ use anyhow::Result;
 use super::while_on;
 use crate::layers::dflash_head::ConvTwinKind;
 use crate::layers::{self, ops};
+use crate::model::trait_impl::prefill_b::pc_policy as pc;
 use crate::model::{graph_flags, qwen4exp_batch_fast, qwen4exp_exact_verify, qwen4exp_mtp_depth};
 
 /// The table's trailing entries, split for the 500-LoC cap. The caller
 /// chains them after [`super::SETTINGS`], so the gathered order is
 /// unchanged.
 pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
+    ("ATLAS_GLM_STRICT_NATIVE_MTP", || {
+        Ok(crate::weight_loader::glm5_mode::strict_native_mtp() as u64)
+    }),
+    ("ATLAS_TAIL_SPLIT_MIN_TOKENS", || {
+        Ok(pc::tail_split_min_tokens() as u64)
+    }),
     ("ATLAS_GLM_SERVING_MODE", || {
         use crate::weight_loader::glm5_mode::{ServingMode, selected};
         Ok(match selected()? {

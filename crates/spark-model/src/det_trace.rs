@@ -42,7 +42,17 @@
 //! `ATLAS_GLM_DET_FINITE=1` adds NaN/infinity counts and the first bad element
 //! for known BF16/FP32 stages, with an additional host read. Integer stages
 //! remain hash-only. Unset, the taps return on one cached flag.
+//!
+//! `ATLAS_GLM_DET_DUMP=<dir>` also writes every traced tensor's bytes to
+//! `<dir>/r<rank>_q<request>_c<chunk start>_L<layer>_<stage>_r<first row>_n<rows>.bin`.
+//!
+//! A DFlash verify block is traced too, as the chunk at its first row's
+//! position: per layer its MLA prefill taps and `v_out` (the layer's output
+//! rows), then `v_final` (normed hidden) and, where the whole vocab head runs
+//! here, `v_logits`.
 
+#[path = "det_trace_dump.rs"]
+mod dump;
 #[path = "det_trace_finite.rs"]
 mod finite;
 
@@ -425,6 +435,15 @@ impl Taps<'_> {
                 row_bytes,
                 element_bytes,
             ));
+            dump::dump(
+                at,
+                self.gpu,
+                self.stream,
+                stage,
+                ptr,
+                rows,
+                rows.1 * row_bytes,
+            );
         }
     }
 }

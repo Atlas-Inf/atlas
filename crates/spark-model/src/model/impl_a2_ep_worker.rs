@@ -171,6 +171,9 @@ impl TransformerModel {
         if cmd == super::glm_fused_chunk::EP_CMD_GLM_FUSED_CHUNK {
             return self.glm_fused_receive(seq_id, slots).map(Some);
         }
+        if cmd == super::glm_packed_prefill::EP_CMD_GLM_PACKED_PREFILL {
+            return self.glm_packed_receive(slots).map(Some);
+        }
         if cmd == super::draft_assist::EP_CMD_DRAFT_ASSIST {
             return self.draft_assist_serve(seq_id).map(Some);
         }

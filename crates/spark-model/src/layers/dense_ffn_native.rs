@@ -108,7 +108,7 @@ impl DenseFfnLayer {
             ctx.buffers.moe_output(),
         );
         let kernels = native_kernels(ctx.gpu);
-        let gemv = rows <= DENSE_NATIVE_GEMV_ROWS;
+        let gemv = rows <= DENSE_NATIVE_GEMV_ROWS && !crate::layers::glm_packed_scope::active();
         let proj = super::tp_split::SplitProj::Mxfp8(&native);
         if gemv && self.glm_verify_rows_split(input, rows as u32, proj, ctx, stream)? {
             return Ok(true);

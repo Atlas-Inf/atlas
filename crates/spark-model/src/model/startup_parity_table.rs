@@ -48,9 +48,6 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
         "ATLAS_STARTUP_PARITY=warn",
         || Ok(super::warn_only() as u64),
     ),
-    ("ATLAS_GLM_STRICT_NATIVE_MTP", || {
-        Ok(crate::weight_loader::glm5_mode::strict_native_mtp() as u64)
-    }),
     // The head's command words.
     ("ATLAS_EP_PROTOCOL=v2", || {
         Ok(crate::model::ep_protocol_v2_requested() as u64)

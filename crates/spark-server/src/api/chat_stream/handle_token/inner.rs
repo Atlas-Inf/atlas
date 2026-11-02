@@ -461,6 +461,9 @@ pub(crate) fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: 
 
     // Fork: detector-active vs pure-content path.
     if state.detector.is_some() {
+        if super::super::tool_security::check_pending(state, ctx, delta.len()) {
+            return deltas;
+        }
         // Drain the detector outputs into a local Vec so we can drop
         // the &mut borrow on `state.detector` before the helpers below
         // (which take other &mut state fields) run.

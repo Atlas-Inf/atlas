@@ -52,7 +52,8 @@ impl MoeLayer {
     }
 
     pub(super) fn glm_c2_grouped(&self, ctx: &ForwardContext, rows: u32) -> bool {
-        self.c2_compact_moe
+        !crate::layers::glm_packed_scope::active()
+            && self.c2_compact_moe
             && rows == 2
             && ctx.levers.max_decode_seqs == 4
             && ctx.attn_metadata.is_some_and(|m| m.num_seqs == 2)

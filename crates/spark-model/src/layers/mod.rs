@@ -12,6 +12,7 @@ pub mod glm5_mtp;
 pub(crate) mod glm5_mtp_cursor;
 pub mod glm_kv_shard;
 pub mod glm_native;
+pub mod glm_packed_scope;
 pub mod glm_sp;
 pub mod glm_sp_overlap;
 pub mod glm_sp_uneven;

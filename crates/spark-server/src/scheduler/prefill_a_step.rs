@@ -22,6 +22,9 @@ pub enum FirstChunk {
     /// command; the continue phase sends and runs the chunk when the prompt
     /// reaches the head of the queue (`phase_continue_prefills::queued_first`).
     Queue,
+    /// `ATLAS_GLM_PACKED_PREFILL`: set up, but send no prefill command; the
+    /// packed pass owns the worker's prompt dispatch (`phase_start_prefills::packed`).
+    Packed,
 }
 
 /// Start a chunked prefill: process chunk 0, return result.
@@ -360,7 +363,7 @@ pub fn start_chunked_prefill(
                 0,
             )?;
             plant_chunk0(model, &mut seq, pc_plant)?;
-            if multi || queue {
+            if multi || queue || first_chunk == FirstChunk::Packed {
                 return Ok(());
             }
             model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
