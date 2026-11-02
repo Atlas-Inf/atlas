@@ -36,6 +36,11 @@ COPY crates/ crates/
 COPY vendor/ vendor/
 COPY kernels/ kernels/
 COPY jinja-templates/ jinja-templates/
+# Vendored third-party kernel sources (#309): the GLM sparse-MLA and prefill
+# kernels `#include` them from kernels/gb10/, so without this line the image
+# build fails at nvcc ("third_party/nvidia_sparse_mla_sm120/prefill_kernel.cuh:
+# No such file or directory").
+COPY third_party/ third_party/
 # quick-speed-bench (atlas-plugin) include_str!'s its ISL prompt fixtures from
 # tests/fixtures — without this line the release build fails in-container
 # ("couldn't read ../../tests/fixtures/bench_prompt_128.txt") while every
@@ -80,6 +85,9 @@ RUN apt-get update -qq && \
 COPY --from=builder /build/target/release/spark /usr/local/bin/spark
 COPY --from=builder /build/jinja-templates/ /jinja-templates/
 COPY LICENSE /LICENSE
+# The binary embeds PTX compiled from those sources: ship their licences and
+# notices with it (Apache-2.0, MIT, BSD-3-Clause).
+COPY --from=builder /build/third_party/ /licenses/third_party/
 COPY README.md /README.md
 
 ENV RUST_LOG=info
