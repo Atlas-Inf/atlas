@@ -58,9 +58,8 @@ fn four_ranks_refuse_every_failing_lane_at_once() {
         ("ATLAS_KDA_FLASH_PREFILL", ""),
     ];
     let said = refusal(check(4, env(&set)));
-    for named in ["ATLAS_GLM_KV_SHARD_OVERLAP=1"] {
-        assert!(said.contains(named), "{named} missing: {said}");
-    }
+    let named = "ATLAS_GLM_KV_SHARD_OVERLAP=1";
+    assert!(said.contains(named), "{named} missing: {said}");
     for unnamed in [
         "PREFILL_SP",
         "C4_DECODE",
