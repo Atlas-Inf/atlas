@@ -1784,3 +1784,10 @@ Queue: 74 (BFCL A1) → 74a (Qwen4 perf) → 75 (27B gate-recipe BFCL).
   - #309 (data-angel) landed SparkGLM 0.2.0, so #199 is merged and #242 is closed;
   - #314 fixed a #308 FP4-Local decode regression. Text controls didn't show it; the 72c base included #308.
 - **#255:** the CTX_CARRY impls (`adopt_dflash_ctx` / `acquire_ctx_acc`) were added in 4c50f0fd9 (09-23) and removed in b9a7edad8 (#174, 10-16). That's consistent with #255's GPU-test failure. Suggested restoring them as their own PR; see #255.
+
+## 2026-11-02 03:30 UTC — #317 merged; 27B gate-recipe BFCL re-run natively
+
+- **#317 merged** as bce5dd904 (PLE host-readback dtype guard). Job 76, one variable vs a fresh f506e923f build: controls byte-identical on FP4-Local (PLE path), NVFP4 and 27B.
+- **Job 75** (27B `-bfcl` recipe through sparkrun on `sha-11972c1`) **never came up**, and sparkrun removed the container, so there are no logs.
+  - Hypothesis: the recipe is the only 27B recipe with `default_chat_template_kwargs`, and the launch passes it unquoted (`{"reasoning_effort":"medium"}` → `{reasoning_effort:medium}`). The CLI then aborts on invalid JSON at startup.
+  - Job 77 tests this (step 0) and then runs the recipe's flags natively, properly quoted, with BFCL ST-995, on a fresh main f506e923f build.
