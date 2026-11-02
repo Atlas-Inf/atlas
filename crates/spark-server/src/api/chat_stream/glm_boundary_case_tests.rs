@@ -268,3 +268,40 @@ fn text_of(deltas: &[ir::StreamDelta]) -> String {
         })
         .collect()
 }
+
+#[test]
+fn a_call_that_validation_rejects_finishes_stop() {
+    // A declared write whose path carries whitespace fails validation, so no
+    // call reaches the client and the stream must not claim a tool turn.
+    let write = vec![1, END, TOOL, 44, 5, 45, 7, 8, 46, 10, 11];
+    let (_, deltas) = stream_tokens_for_write(write.clone());
+    assert!(tool_names(&deltas).is_empty());
+    assert!(
+        text_of(&deltas).contains("[atlas] Tool call rejected"),
+        "{deltas:?}"
+    );
+    assert_eq!(
+        finish_reason(write, write_request()),
+        ir::FinishReason::Stop
+    );
+    assert_eq!(
+        finish_reason(tokens(true, true), request()),
+        ir::FinishReason::ToolCalls
+    );
+}
+
+fn stream_tokens_for_write(tokens: Vec<u32>) -> (StreamState, Vec<ir::StreamDelta>) {
+    let (_, state, deltas) = stream_for_request(app(true), true, tokens, write_request());
+    (state, deltas)
+}
+
+fn write_request() -> ir::ChatRequest {
+    let wire: crate::openai::ChatCompletionRequest = serde_json::from_value(json!({
+        "model":"fixture", "messages":[{"role":"user","content":"save"}],
+        "tools":[{"type":"function","function":{"name":"write",
+            "parameters":{"type":"object","properties":{"path":{"type":"string"}},
+                "required":["path"]}}}], "max_tokens":192
+    }))
+    .unwrap();
+    wire.into()
+}

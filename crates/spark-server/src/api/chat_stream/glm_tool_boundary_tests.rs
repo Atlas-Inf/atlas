@@ -95,6 +95,9 @@ fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<A
         ORDERED_OPS,
         "```xml",
         "\n",
+        "write",
+        "path",
+        "/tmp/a b",
     ];
     let vocab = words
         .iter()
