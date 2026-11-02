@@ -210,7 +210,7 @@ impl TransformerModel {
         // before touching the paired path, proposer state, or retained
         // capture so a request-local fallback cannot accidentally run a
         // drafter through an eager-prefill call.
-        if seq.disable_mtp {
+        if self.native_glm_mtp || seq.disable_mtp {
             return Ok(());
         }
         if !is_last || eager_drafter_disabled() || self.mtp_prefill_hidden.is_null() {

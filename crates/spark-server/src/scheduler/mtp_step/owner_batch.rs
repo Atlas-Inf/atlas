@@ -18,6 +18,9 @@ pub(super) fn verify_owner_batch(
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
 ) {
+    // E9 stages every owner's final normalized hidden rows and full logits;
+    // EA restores them before that owner's canonical commit and private repair.
+    let native = model.native_mtp_enabled();
     // Owner-batched GLM verify: grammarless owners with the same draft width
     // verify in ONE target traversal instead of one traversal per owner —
     // two drafts on the repaired long-context K3 lane, the most common width
@@ -70,7 +73,7 @@ pub(super) fn verify_owner_batch(
     } else if let Some(width) = adaptive_width {
         // Cost-aware width: every owner holds at least `width` drafts.
         Some(width)
-    } else if dflash_verify_raw_argmax {
+    } else if dflash_verify_raw_argmax || native {
         // Owners with at least `w` drafts can verify together at width `w`;
         // take the width that verifies the most rows.
         let lens: Vec<usize> = serial_idxs
@@ -99,7 +102,7 @@ pub(super) fn verify_owner_batch(
             .filter(|&i| {
                 let len = active[i].pending_drafts.len();
                 active[i].grammar_state.is_none()
-                    && (len == width || (dflash_verify_raw_argmax && len > width))
+                    && (len == width || ((dflash_verify_raw_argmax || native) && len > width))
             })
             .collect();
         let min_group = std::env::var("ATLAS_GLM_LONG_BATCH_MIN")

@@ -31,6 +31,10 @@ pub struct SsmPools {
     /// Where `tier_store` keeps its spills (`None` without a tier).
     pub(crate) tier_home: Option<SpillHome>,
     pub(crate) has_mtp: bool,
+    /// Native GLM MTP was validated from rank-symmetric marker/head weights.
+    /// This remains distinct from the generic MTP and DFlash flags: native
+    /// GLM uses the canonical target verifier without setting DFlash env.
+    pub(crate) native_glm_mtp: bool,
     pub(crate) num_intermediates: usize,
     pub(crate) dflash_kgamma: usize,
 }
@@ -44,13 +48,43 @@ impl SsmPools {
         })
     }
 
-    /// Build the pools. Must run before the KV-cache budget snapshot in
-    /// `factory::build_model` — see the module doc.
+    /// Compatibility constructor for callers that have no external native
+    /// MTP capability to report.
     pub(crate) fn new(
         config: &ModelConfig,
         max_batch_size: usize,
         self_speculative: bool,
         use_speculative: bool,
+        mtp_weights_empty: bool,
+        draft_lm_head_nvfp4_present: bool,
+        num_drafts: usize,
+        ssm_cache_slots: usize,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Self> {
+        Self::new_with_native(
+            config,
+            max_batch_size,
+            self_speculative,
+            use_speculative,
+            false,
+            mtp_weights_empty,
+            draft_lm_head_nvfp4_present,
+            num_drafts,
+            ssm_cache_slots,
+            gpu,
+        )
+    }
+
+    /// Build the pools. Must run before the KV-cache budget snapshot in
+    /// `factory::build_model` — see the module doc. `native_mtp` is a
+    /// rank-symmetric capability bit for architectures whose proposer body is
+    /// loaded outside the generic `MtpWeights` bundle (currently native GLM).
+    pub(crate) fn new_with_native(
+        config: &ModelConfig,
+        max_batch_size: usize,
+        self_speculative: bool,
+        use_speculative: bool,
+        native_mtp: bool,
         mtp_weights_empty: bool,
         draft_lm_head_nvfp4_present: bool,
         num_drafts: usize,
@@ -82,6 +116,7 @@ impl SsmPools {
         let has_mtp = self_speculative
             || (use_speculative && !mtp_weights_empty && draft_lm_head_nvfp4_present)
             || external_mtp_module
+            || native_mtp
             || dflash_kgamma > 0;
         let num_intermediates = if has_mtp {
             (num_drafts + 1).max(dflash_kgamma)
@@ -167,6 +202,7 @@ impl SsmPools {
             tier_store,
             tier_home,
             has_mtp,
+            native_glm_mtp: native_mtp && config.model_type == "glm5_next",
             num_intermediates,
             dflash_kgamma,
         })

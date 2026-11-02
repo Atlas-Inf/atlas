@@ -41,6 +41,10 @@ impl MoeLayer {
         Ok(())
     }
     pub(super) fn independent_grouped(&self, ctx: &ForwardContext, rows: u32) -> bool {
+        // A packed prefill keeps the generic grouped path (`glm_packed_scope`).
+        if crate::layers::glm_packed_scope::active() {
+            return false;
+        }
         // ATLAS_GLM_CANONICAL_VERIFY: a verify block keeps the arms of every
         // width; only the nonspeculative independent lane takes these.
         if crate::layers::canonical_verify::enabled()

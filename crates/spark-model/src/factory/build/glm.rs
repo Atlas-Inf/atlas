@@ -11,6 +11,12 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, SparseIndexCacheConfig, TailSlotPlan};
 use spark_runtime::weights::WeightStore;
 
+#[path = "glm_native_mtp.rs"]
+mod native_mtp;
+pub(super) use native_mtp::{
+    ensure_native_mtp_target_prerequisites, native_mtp_capability, native_mtp_requested,
+};
+
 use crate::layer::TransformerLayer;
 use crate::layers::glm_kv_shard as shard;
 use crate::layers::moe::SharedFp8Reserve;
@@ -20,9 +26,10 @@ pub(super) fn ensure_expert_tp_drafter(
     config: &ModelConfig,
     use_speculative: bool,
     no_dflash: bool,
+    native_glm_mtp: bool,
 ) -> Result<()> {
     anyhow::ensure!(
-        !(config.expert_tp && use_speculative && no_dflash),
+        !(config.expert_tp && use_speculative && no_dflash && !native_glm_mtp),
         "ATLAS_GLM_EXPERT_TP=1 serves with the DFlash drafter only: sliced routed \
          experts have no whole-expert MTP path"
     );

@@ -37,6 +37,10 @@ impl TransformerModel {
         if k == 0 {
             return Ok(Vec::new());
         }
+        anyhow::ensure!(
+            !self.native_glm_mtp || self.native_canonical_target_ready(),
+            "native GLM MTP requires canonical BF16 HC, TP2/EP2 or TP4/EP4, and a prepared MXFP8 split head"
+        );
         let ban = seq.eos_ban;
         let ban_rows = ban.row_mask(seq.seq_len, k);
         if self.lightning_dspark_identity.policy().is_some()
@@ -170,8 +174,9 @@ impl TransformerModel {
         // next block, which re-finalizes the pools it touches. KDA layers keep
         // the verify path that snapshots per-row recurrent state.
         let glm_prefill_ctx = (self.config.model_type == "glm5_next"
-            && crate::speculative::glm_repair_policy::dflash_enabled()
-            && crate::speculative::glm_repair_policy::dflash_prefill_verify()
+            && self.canonical_glm_target_enabled()
+            && (self.native_glm_mtp
+                || crate::speculative::glm_repair_policy::dflash_prefill_verify())
             && !hss_engaged
             && !use_graphs
             // ATLAS_GLM_CANONICAL_VERIFY: one row too, so a lone row runs the
@@ -254,7 +259,21 @@ impl TransformerModel {
                     || pieces::diagnostics_sync(),
             );
 
+            // ATLAS_GLM_DET_TRACE: this block is the chunk at its first row
+            // (eager only: a tap synchronizes the stream).
+            let rank = self.comm.as_ref().map_or(0, |c| c.rank());
+            let _det = (!use_graphs)
+                .then(|| crate::det_trace::enter(rank, seq.slot_idx, seq.seq_len))
+                .flatten();
+            let det_on = _det.is_some();
+            let det = crate::det_trace::on_stream(self.gpu.as_ref(), stream);
+            if det_on {
+                tracing::warn!("DETV r={rank} c={} k={k} tokens={tokens:?}", seq.seq_len);
+            }
             for (layer_idx, layer) in self.layers.iter().enumerate() {
+                if det_on {
+                    crate::det_trace::set_layer(layer_idx);
+                }
                 if pieces && self.kgamma_kda_run(layer_idx, k, seq, &mut kv_cache, &ctx, stream)? {
                     continue;
                 }
@@ -344,6 +363,9 @@ impl TransformerModel {
                     )?;
                 }
                 self.trace_lightning_hidden_rows("k4", seq.seq_len, layer_idx, hidden, k, stream)?;
+                if det_on {
+                    det.tap("v_out", hidden, (0, k), h * bf16);
+                }
                 self.kgamma_dflash_capture(layer_idx, k, stream)?;
                 if let Some(started) = layer_started {
                     self.gpu.synchronize(stream)?;
@@ -388,24 +410,33 @@ impl TransformerModel {
             // Final norm [K, H]
             let normed = self.buffers.norm_output();
             self.final_norm_rows(hidden, normed, k as u32, stream)?;
+            if det_on {
+                crate::det_trace::set_layer(self.layers.len());
+                det.tap("v_final", normed, (0, k), h * bf16);
+            }
 
             // LM head + argmax for K tokens, inside the graph (fixed scratch
             // addresses — graph-safe).
             let argmax_out = self.buffers.scratch();
-            if !self.glm_split_head_argmax(
-                normed,
-                k,
-                argmax_out,
-                (ban_rows, &ban),
-                allow,
-                stream,
-            )? {
+            let split_argmax =
+                self.glm_split_head_argmax(normed, k, argmax_out, (ban_rows, &ban), allow, stream)?;
+            if split_argmax && self.native_glm_mtp {
+                self.glm_split_head_full_rows(k, stream)?;
+            }
+            if !split_argmax {
+                anyhow::ensure!(
+                    !self.native_glm_mtp,
+                    "native GLM MTP requires the released MXFP8 split target head"
+                );
                 anyhow::ensure!(
                     allow.is_none(),
                     "masked verify needs the GLM vocab-split head, which declined"
                 );
                 self.lm_head_batched(normed, k as u32, self.buffers.logits(), stream)?;
                 let vocab = self.config.vocab_size;
+                if det_on {
+                    det.tap("v_logits", self.buffers.logits(), (0, k), vocab * bf16);
+                }
                 for t in 0..k {
                     let logits_t = self.buffers.logits().offset(t * vocab * bf16);
                     let out_t = argmax_out.offset(t * 4);

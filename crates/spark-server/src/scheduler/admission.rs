@@ -33,6 +33,9 @@
 
 use super::*;
 
+#[path = "admission_native.rs"]
+mod native;
+
 /// Resolve the admission watermark once at scheduler start.
 pub(super) fn resolve_admit_watermark(max_seq_len: usize) -> usize {
     let default = if max_seq_len > 0 {
@@ -219,6 +222,9 @@ pub(super) fn gate_admissions(
     } else {
         new_reqs
     };
+    if new_reqs.is_empty() {
+        return new_reqs;
+    }
     let mut demands: Vec<SeqDemand> =
         Vec::with_capacity(active.len() + prefilling.len() + swapped.len() + preempted.len());
     demands.extend(active.iter().map(|a| SeqDemand {
@@ -238,12 +244,25 @@ pub(super) fn gate_admissions(
         current_tokens: p.tokens.len() + 1,
         budget_tokens: p.a.remaining,
     }));
-    let committed = committed_blocks(&demands, watermark, max_seq_len, block_size);
+    let committed = if model.native_mtp_enabled() {
+        native::resident_commitment(
+            &demands,
+            active
+                .iter()
+                .map(|a| &a.seq)
+                .chain(prefilling.iter().map(|p| &p.seq)),
+            watermark,
+            max_seq_len,
+            block_size,
+        )
+    } else {
+        committed_blocks(&demands, watermark, max_seq_len, block_size)
+    };
     let infos: Vec<(usize, usize)> = new_reqs
         .iter()
         .map(|r| (r.prompt_len(), r.max_tokens()))
         .collect();
-    let (admit, forced) = admit_count(
+    let (mut admit, forced) = admit_count(
         total_blocks,
         committed,
         &infos,
@@ -251,6 +270,19 @@ pub(super) fn gate_admissions(
         max_seq_len,
         block_size,
     );
+    if admit == 0 && swapped.is_empty() && preempted.is_empty() {
+        admit = usize::from(native::admit_follower(
+            model,
+            &new_reqs[0],
+            active,
+            prefilling,
+            committed,
+            total_blocks,
+            watermark,
+            max_seq_len,
+            block_size,
+        ));
+    }
     if forced {
         tracing::warn!(
             "admitting a request whose reservation exceeds the whole KV pool \
@@ -293,3 +325,7 @@ pub(super) fn gate_admissions(
 #[cfg(test)]
 #[path = "admission_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "admission_native_tests.rs"]
+mod native_tests;

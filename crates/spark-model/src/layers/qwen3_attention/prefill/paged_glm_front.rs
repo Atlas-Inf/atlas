@@ -238,6 +238,7 @@ impl Qwen3AttentionLayer {
             (Some((q_shape, q)), Some((kv_shape, kv)))
                 if matches!(ctx.config.tp_world_size, 2 | 4)
                     && ctx.config.ep_world_size == ctx.config.tp_world_size
+                    && !crate::layers::glm_packed_scope::active()
                     && !q.tiled
                     && !kv.tiled
                     && args.h.is_multiple_of(128)

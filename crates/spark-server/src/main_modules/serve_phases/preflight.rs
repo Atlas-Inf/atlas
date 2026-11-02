@@ -11,6 +11,7 @@ use crate::cli;
 mod glm_chain;
 mod gpu_init;
 mod independent;
+mod native_mtp;
 mod ssm_h_fp16;
 pub(crate) use gpu_init::{init_gpu_backend, post_load_memory_audit};
 pub(crate) use independent::prepare_reserve;
@@ -73,9 +74,8 @@ pub(crate) fn preflight_reserve(
     // domain, with the topology resolved before any reserve (`independent.rs`).
     let long_context = spark_model::speculative::glm_repair_policy::long_context_enabled();
     anyhow::ensure!(
-        !long_context
-            || (args.dflash && spark_model::speculative::glm_repair_policy::dflash_enabled()),
-        "GLM long-context verification requires the GLM DFlash lane"
+        !long_context || native_mtp::long_context_lane(args),
+        "GLM long-context verification requires the GLM DFlash lane or explicit strict native MTP"
     );
     // The long-context lane retains TP-local topology and the exact row budget.
     let bounded = long_context;
@@ -164,9 +164,11 @@ pub(crate) fn preflight_reserve(
             config.index_topk,
         );
         anyhow::ensure!(
-            !(args.speculative || args.self_speculative || args.ngram_speculative),
-            "GLM-5 speculative decoding is served through --dflash; its native MTP layer \
-             and self/n-gram speculation are not supported"
+            !(args.self_speculative || args.ngram_speculative)
+                && (!args.speculative || native_mtp::admitted(args, ep_v2)),
+            "GLM-5 speculative decoding is served through --dflash, or explicit strict native MTP \
+             at TP2/EP2 or TP4/EP4 and C1..C4 with equal active/admitted limits; self/n-gram \
+             speculation is not supported"
         );
     }
     let h_state_bytes = config.ssm_h_state_bytes();
@@ -325,12 +327,15 @@ pub(crate) fn preflight_reserve(
             * config.num_ssm_layers()
             * (h_state_bytes + conv_state_bytes)
     };
-    let cuda_headroom: usize =
-        if args.speculative || args.self_speculative || args.ngram_speculative {
-            4 * 1024 * 1024 * 1024
-        } else {
-            512 * 1024 * 1024
-        };
+    let native_preallocated = native_mtp::preallocated(args, config, long_context)?;
+    let cuda_headroom: usize = if (args.speculative && !native_preallocated)
+        || args.self_speculative
+        || args.ngram_speculative
+    {
+        4 * 1024 * 1024 * 1024
+    } else {
+        512 * 1024 * 1024
+    };
     let gdn_two_phase_bytes: usize = {
         let key_dim = config.linear_num_key_heads * config.linear_key_head_dim;
         let value_dim = config.linear_num_value_heads * config.linear_value_head_dim;

@@ -153,7 +153,7 @@ impl TransformerModel {
     pub(crate) fn glm_verify_logits_argmax_only(&self) -> bool {
         // Native MTP completes every split row before returning from verify,
         // so its target logits support the ordinary processor/logprob path.
-        self.glm_split_head_decline(1).is_none()
+        !self.native_glm_mtp && self.glm_split_head_decline(1).is_none()
     }
 
     /// Project `normed` [rows, H] and write global argmax IDs to `out` [rows].

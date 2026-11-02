@@ -364,3 +364,7 @@ required-features = ["cuda", "gpu-examples"]
 [[example]]
 name = "moe_t_rows_bench"
 required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "glm_fp4l_native_bench"
+required-features = ["cuda", "gpu-examples"]

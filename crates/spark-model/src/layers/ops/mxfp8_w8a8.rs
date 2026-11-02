@@ -142,7 +142,7 @@ impl MxW8a8 {
         // rows do not depend on the pass height or on which heights were
         // tuned first; passes taller than the heights it was checked at run
         // in chunks.
-        if self.pinned {
+        if self.pinned || crate::layers::glm_packed_scope::active() {
             for row0 in (0..m).step_by(MX_PINNED_MAX_ROWS) {
                 let rows = (m - row0).min(MX_PINNED_MAX_ROWS);
                 let a = act.rows_from(row0, self.k)?;

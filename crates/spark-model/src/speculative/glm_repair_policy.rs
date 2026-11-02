@@ -16,6 +16,12 @@ pub fn dflash_enabled() -> bool {
     std::env::var("ATLAS_GLM_DFLASH").as_deref() == Ok("1")
 }
 
+/// Both proposers verify against the same canonical GLM target. This does not
+/// select DFlash capture, sampling or draft-weight behavior for native MTP.
+pub fn canonical_target_enabled() -> bool {
+    dflash_enabled() || crate::weight_loader::glm5::mode::strict_native_mtp()
+}
+
 /// The DFlash lane verifies a block through the multi-row prefill path;
 /// `ATLAS_GLM_DFLASH_PREFILL_VERIFY=0` reverts to one decode chain per row.
 pub fn dflash_prefill_verify() -> bool {
@@ -32,7 +38,7 @@ pub fn mtp_distributed() -> bool {
 
 /// A retained long-context GLM verify owner is active: repaired MTP or DFlash.
 pub fn long_lane_enabled() -> bool {
-    enabled() || dflash_enabled()
+    enabled() || canonical_target_enabled()
 }
 
 /// Widest DFlash block the GLM long-context verify admits (bonus + drafts).
@@ -74,8 +80,15 @@ pub fn repair_context(context: usize) -> usize {
 /// repair and long-context mode are both enabled for GLM. Repair-off DFlash
 /// leaves this result at served context and does not allocate the native MTP
 /// prompt-capture buffer; its own multi-layer capture has separate sizing.
-pub fn arena_context(model_type: &str, repair_long_enabled: bool, served_context: usize) -> usize {
-    if model_type == "glm5_next" && repair_long_enabled {
+/// Native appended MTP has per-request incremental state and uses the full
+/// served context, independently of the repaired-DFlash rollout window.
+pub fn arena_context(
+    model_type: &str,
+    repair_long_enabled: bool,
+    native_mtp: bool,
+    served_context: usize,
+) -> usize {
+    if model_type == "glm5_next" && repair_long_enabled && !native_mtp {
         repair_context(served_context)
     } else {
         served_context
@@ -345,14 +358,21 @@ mod tests {
         assert_eq!(repair_context(MAX_LONG_CONTEXT + 4096), MAX_LONG_CONTEXT);
     }
     #[test]
+    fn native_mtp_keeps_full_served_context() {
+        for context in [32_768, 65_536, 262_144, 1_048_576] {
+            assert_eq!(arena_context("glm5_next", true, true, context), context);
+            assert_eq!(arena_context("glm5_next", false, true, context), context);
+        }
+    }
+    #[test]
     fn arena_context_only_bounds_selected_glm_repair() {
         for context in [2048, 32768, 36864, 262144, 524288] {
             assert_eq!(
-                arena_context("glm5_next", true, context),
+                arena_context("glm5_next", true, false, context),
                 context.min(32768)
             );
-            assert_eq!(arena_context("glm5_next", false, context), context);
-            assert_eq!(arena_context("qwen3", true, context), context);
+            assert_eq!(arena_context("glm5_next", false, false, context), context);
+            assert_eq!(arena_context("qwen3", true, false, context), context);
         }
     }
 }

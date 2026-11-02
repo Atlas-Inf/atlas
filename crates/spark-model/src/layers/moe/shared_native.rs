@@ -191,6 +191,7 @@ impl MoeLayer {
             && super::forward_pair_shared::shared_split_ranks(ctx)
                 .is_some_and(|ranks| (inter as usize).is_multiple_of(ranks * FP8_BLOCK))
             && rows <= SHARED_NATIVE_GEMV_ROWS
+            && !crate::layers::glm_packed_scope::active()
     }
 
     /// The whole shared expert over `n` rows of `input` (`[n, h]`) into
@@ -214,7 +215,8 @@ impl MoeLayer {
         );
         let (n, h, inter) = (n as usize, h as usize, inter as usize);
         let kernels = native_kernels(ctx.gpu);
-        let gemv = n <= SHARED_NATIVE_GEMV_ROWS as usize;
+        let gemv =
+            n <= SHARED_NATIVE_GEMV_ROWS as usize && !crate::layers::glm_packed_scope::active();
         if gemv {
             ops::mx_multi_rows(
                 ctx.gpu,

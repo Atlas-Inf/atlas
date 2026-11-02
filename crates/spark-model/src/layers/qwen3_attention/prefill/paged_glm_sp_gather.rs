@@ -168,6 +168,7 @@ impl Qwen3AttentionLayer {
             && !diag
             && !ctx.graph_capture
             && !crate::det_trace::on()
+            && !crate::layers::glm_packed_scope::active()
             && self.qsa.is_none()
             && self
                 .hc

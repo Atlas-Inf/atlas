@@ -115,7 +115,9 @@ impl MoeLayer {
     /// routed GEMV to the established prequantized native-FP4 grouped path.
     pub(super) fn glm_c3_grouped(&self, ctx: &ForwardContext, rows: u32) -> bool {
         // ATLAS_GLM_CANONICAL_VERIFY: no K=3-only arm (router, shared, tiles).
+        // A packed prefill keeps the generic grouped path (`glm_packed_scope`).
         !crate::layers::canonical_verify::enabled()
+            && !crate::layers::glm_packed_scope::active()
             && std::env::var("ATLAS_GLM_C3_GROUPED_MOE").as_deref() == Ok("1")
             && c3_grouped_shape(ctx.config, rows, ctx.levers.max_decode_seqs)
             && self.glm_grouped_resources(ctx)
@@ -123,7 +125,8 @@ impl MoeLayer {
     }
 
     pub(super) fn glm_c4_grouped(&self, ctx: &ForwardContext, rows: u32) -> bool {
-        crate::model::glm_c4::enabled(&ctx.config.model_type)
+        !crate::layers::glm_packed_scope::active()
+            && crate::model::glm_c4::enabled(&ctx.config.model_type)
             && super::forward_c4::c4_grouped_requested()
             && c4_grouped_shape(ctx.config, rows, ctx.levers.max_decode_seqs)
             && ctx.attn_metadata.is_some_and(|m| m.num_seqs == 4)

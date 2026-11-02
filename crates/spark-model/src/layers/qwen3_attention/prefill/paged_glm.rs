@@ -128,6 +128,11 @@ impl Qwen3AttentionLayer {
             "unsupported GLM MLA geometry: kv_lora={kv_lora}, nope={nope}, v={v_dim}, hd={hd}"
         );
 
+        // ATLAS_PROFILE_PREFILL parts of prefill_inner_hc's `attn` step.
+        let mut prof = crate::layers::prefill_profile::start(ctx, stream)?;
+        let step = |prof: &mut Option<std::time::Instant>, label: &str| {
+            crate::layers::prefill_profile::step(ctx, stream, prof, "MLA", label)
+        };
         // ATLAS_GLM_SP_MLA_QUANT_GATHER: the input arrived cast; the index
         // projections run on this rank's rows and gather beside the front.
         let cast = sp_gather::cast_input();
@@ -143,6 +148,7 @@ impl Qwen3AttentionLayer {
         if gathered_index.is_some() {
             crate::layers::glm_sp_overlap::join_beside(ctx, stream)?;
         }
+        step(&mut prof, "attn.q_kv_a")?;
         let (q_latent, wf) = (front.q_latent, front.write_floor);
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
 
@@ -183,6 +189,7 @@ impl Qwen3AttentionLayer {
             ctx,
             stream,
         )?;
+        step(&mut prof, "attn.owner_proj")?;
         for o in owners {
             let on = o.rows as u32;
             let octx = ForwardContext {
@@ -236,6 +243,7 @@ impl Qwen3AttentionLayer {
             let ready = batched.map(|b| rows_of(b.q_absorbed, latent_row));
             let (sparse_indices, queries_swapped) =
                 self.glm_shard_swap_queries_during(kv_cache, &octx, o.rows, ready, stream, select)?;
+            step(&mut prof, "attn.index")?;
             // The BF16 dense and native kernels read an fp8_g128 owner through
             // a dequantized view; long owners and verify rows read FP8 directly,
             // as do, under the pipelined kernel, sparse pieces native declines.
@@ -286,6 +294,7 @@ impl Qwen3AttentionLayer {
                     q_absorbed
                 }
             };
+            step(&mut prof, "attn.q_b_absorb")?;
             // ATLAS_GLM_INDEX_SPLIT_BESIDE: the selection's gathers landed.
             crate::layers::glm_sp_overlap::join_beside(ctx, stream)?;
             det.tap("x_q_abs", q_absorbed, (o.row0, o.rows), latent_row);
@@ -421,6 +430,7 @@ impl Qwen3AttentionLayer {
                 )?;
             }
 
+            step(&mut prof, "attn.sparse")?;
             det.tap("x_attn_lat", attn_latent, (o.row0, o.rows), latent_row);
             // Convert the latent attention result back to each head's value
             // width, then apply the row-parallel output projection.
@@ -452,6 +462,7 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             }
+            step(&mut prof, "attn.uv_o")?;
         }
 
         if let Some(sp) = a2a {
@@ -473,6 +484,7 @@ impl Qwen3AttentionLayer {
                 stream,
                 accelerated,
             )?;
+            step(&mut prof, "attn.uv_o")?;
         }
         Ok(o_out)
     }

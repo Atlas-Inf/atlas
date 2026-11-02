@@ -284,3 +284,18 @@ fn rowinv_tail_unsplit_warn_guard_is_shared() {
     assert!(rowinv_tail_unsplit_with(true, false, &guard, bump));
     assert_eq!(fired.get(), 1);
 }
+
+#[test]
+fn tail_split_min_tokens_keeps_a_short_prompt_to_one_pass() {
+    assert_eq!(parse_tail_split_min_tokens(None), 0);
+    assert_eq!(parse_tail_split_min_tokens(Some(" 512 ")), 512);
+    assert_eq!(parse_tail_split_min_tokens(Some("x")), 0);
+    // Unset: exactly the old rule.
+    assert!(tail_split_at(100, 0, 64, false, 0));
+    assert!(!tail_split_at(100, 64, 64, false, 0));
+    assert!(!tail_split_at(100, 0, 100, false, 0));
+    assert!(!tail_split_at(100, 0, 64, true, 0));
+    // Set: only a prompt of at least that many tokens splits.
+    assert!(!tail_split_at(100, 0, 64, false, 101));
+    assert!(tail_split_at(101, 0, 64, false, 101));
+}

@@ -137,3 +137,119 @@ fn long_context_lane_refuses_without_dflash() {
         .unwrap_err();
     assert!(format!("{err:#}").contains("GLM DFlash lane"), "{err:#}");
 }
+
+#[test]
+fn strict_native_mtp_retains_c4_full_context_and_prefix_cache() {
+    if isolated(
+        "long_context::strict_native_mtp_retains_c4_full_context_and_prefix_cache",
+        &[
+            ("ATLAS_GLM_MTP_LONG_CONTEXT", "1"),
+            ("ATLAS_GLM_STRICT_NATIVE_MTP", "1"),
+            ("ATLAS_GLM_SERVING_MODE", "strict"),
+            ("ATLAS_GLM_FP4L_NATIVE", "1"),
+            ("ATLAS_GLM_FP4L_MLA_FP8", "1"),
+            ("ATLAS_GLM_FP4L_DENSE_MXFP8", "1"),
+            ("ATLAS_GLM_FP4L_KDA_W8A8_PREFILL", "1"),
+            ("ATLAS_GLM_FP4L_INPUT_SCALES", "1"),
+            ("ATLAS_GLM_FP4L_FP8_PREFILL", "w8a8"),
+            ("ATLAS_GLM_LM_HEAD_MXFP8", "1"),
+            ("ATLAS_GLM_FP4L_KDA_TILED_TWIN", "0"),
+            ("ATLAS_GLM_FP4L_SHARED_FP8", "1"),
+            ("ATLAS_GLM_FP4L_KDA_MXFP8_DECODE", "1"),
+            ("ATLAS_GLM_FP4L_DECODE_A16", "1"),
+        ],
+    ) {
+        return;
+    }
+    for rank in 0..2 {
+        let mut a = args(4, rank);
+        a.speculative = true;
+        a.num_drafts = Some(6);
+        a.max_seq_len = 1_048_576;
+        a.max_prefill_tokens = 8192;
+        a.enable_prefix_caching = true;
+        let (topology, reserve) = prepare_reserve(&a, &mut config(), 128usize << 30).unwrap();
+        assert_eq!(topology.unwrap().tp_rank, rank);
+        assert_eq!(
+            reserve.inference_reserve,
+            reserve.gdn_two_phase_bytes + (512usize << 20)
+        );
+        // Mixing speculative families must not gain the native exception.
+        a.speculative = false;
+        a.dflash = true;
+        assert!(prepare_reserve(&a, &mut config(), 128usize << 30).is_err());
+        a.speculative = true;
+        a.dflash = false;
+        a.max_num_seqs = 5;
+        assert!(prepare_reserve(&a, &mut config(), 128usize << 30).is_err());
+        a.max_num_seqs = 4;
+        a.max_seq_len += 1;
+        assert!(prepare_reserve(&a, &mut config(), 128usize << 30).is_err());
+    }
+}
+
+#[test]
+fn strict_native_tp4_resolves_all_ranks_for_c1_through_c4_full_context() {
+    if isolated(
+        "long_context::strict_native_tp4_resolves_all_ranks_for_c1_through_c4_full_context",
+        &[
+            ("ATLAS_GLM_MTP_LONG_CONTEXT", "1"),
+            ("ATLAS_GLM_STRICT_NATIVE_MTP", "1"),
+            ("ATLAS_GLM_SERVING_MODE", "strict"),
+            ("ATLAS_RDMA_ALLREDUCE", "1"),
+            ("ATLAS_RDMA_ONESHOT", "1"),
+            ("ATLAS_RDMA_PAIR_CHAIN", "1"),
+        ],
+    ) {
+        return;
+    }
+    for capacity in 1..=4 {
+        for rank in 0..4 {
+            let mut a = args(capacity, rank);
+            a.world_size = 4;
+            a.tp_size = 4;
+            a.ep_size = 4;
+            a.speculative = true;
+            a.num_drafts = Some(6);
+            a.max_seq_len = 1_048_576;
+            a.max_prefill_tokens = 8192;
+            a.enable_prefix_caching = true;
+            let mut cfg = config();
+            let (topology, reserve) = prepare_reserve(&a, &mut cfg, 128usize << 30)
+                .unwrap_or_else(|error| panic!("TP4 rank {rank} C{capacity}: {error:#}"));
+            let topology = topology.unwrap();
+            assert_eq!(
+                (topology.world_size, topology.tp_size, topology.ep_size),
+                (4, 4, 4)
+            );
+            assert_eq!((topology.tp_rank, topology.ep_rank), (rank, rank));
+            assert_eq!((cfg.num_attention_heads, cfg.num_key_value_heads), (16, 16));
+            assert_eq!(
+                (cfg.linear_num_key_heads, cfg.linear_num_value_heads),
+                (16, 16)
+            );
+            let rows = a.max_prefill_tokens + capacity;
+            assert_eq!(reserve.max_batch_tokens_pre, rows);
+            assert_eq!(
+                reserve.buffer_arena_bytes,
+                spark_runtime::buffers::BufferSizes::from_config(
+                    &cfg,
+                    rows,
+                    a.max_seq_len,
+                    16,
+                    capacity
+                )
+                .total_bytes()
+            );
+            assert_eq!(
+                reserve.inference_reserve,
+                reserve.gdn_two_phase_bytes + (512usize << 20)
+            );
+            let total = reserve.inference_reserve + reserve.buffer_arena_bytes;
+            assert!(prepare_reserve(&a, &mut config(), total).is_ok());
+            assert!(prepare_reserve(&a, &mut config(), total - 1).is_err());
+            a.max_num_seqs = capacity + 1;
+            assert!(prepare_reserve(&a, &mut config(), 128usize << 30).is_err());
+        }
+    }
+}

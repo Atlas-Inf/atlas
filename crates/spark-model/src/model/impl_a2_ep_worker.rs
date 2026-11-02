@@ -160,11 +160,19 @@ impl TransformerModel {
         cmd: u32,
         slots: &mut [Option<SequenceState>],
     ) -> Result<Option<bool>> {
+        if cmd == super::native_mtp_prefix::EP_CMD_NATIVE_PREFIX_PROBE {
+            return self
+                .native_prefix_receive_probe(slots.get(seq_id as usize).and_then(Option::as_ref))
+                .map(Some);
+        }
         if cmd == super::glm_long_verify::EP_CMD_GLM_LONG_VERIFY {
             return self.glm_long_receive_verify(slots).map(Some);
         }
         if cmd == super::glm_fused_chunk::EP_CMD_GLM_FUSED_CHUNK {
             return self.glm_fused_receive(seq_id, slots).map(Some);
+        }
+        if cmd == super::glm_packed_prefill::EP_CMD_GLM_PACKED_PREFILL {
+            return self.glm_packed_receive(slots).map(Some);
         }
         if cmd == super::draft_assist::EP_CMD_DRAFT_ASSIST {
             return self.draft_assist_serve(seq_id).map(Some);

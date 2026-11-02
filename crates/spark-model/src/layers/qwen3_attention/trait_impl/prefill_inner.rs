@@ -567,6 +567,11 @@ impl Qwen3AttentionLayer {
         let diag_all =
             std::env::var("ATLAS_DIAG_V4_ALL_LAYERS").is_ok_and(|v| v == "1" || v == "true");
         let diag_this = diag_all;
+        // ATLAS_PROFILE_PREFILL steps; `attn` also logs `attn.*` parts.
+        let mut prof = crate::layers::prefill_profile::start(ctx, stream)?;
+        let step = |prof: &mut Option<std::time::Instant>, label: &str| {
+            crate::layers::prefill_profile::step(ctx, stream, prof, "MLA", label)
+        };
 
         anyhow::ensure!(
             sp.is_none() || !(is_first_layer || (is_last_layer && hc.head.is_none())),
@@ -743,6 +748,8 @@ impl Qwen3AttentionLayer {
             }
         }
 
+        step(&mut prof, "hc_attn_norm")?;
+
         // QSA indexer ingest: park this chunk's raw indexer keys (the
         // indexer consumes the same block input the attention does). Decode
         // steps select against these; prefill queries beyond the inert bound
@@ -795,6 +802,7 @@ impl Qwen3AttentionLayer {
         };
 
         drop(cast_scope);
+        step(&mut prof, "attn")?;
         det.tap("attn", attn_out, (0, num_tokens), h * 2);
         // ATLAS_GLM_SP_GATHER_OVERLAP: reduce, post + pre, norm and gather a
         // row block at a time (GLM's attention output is `norm_output`, the
@@ -850,6 +858,7 @@ impl Qwen3AttentionLayer {
             let bytes = num_tokens * h * 2;
             comm.all_reduce_async(attn_out.0, bytes, stream)?;
         }
+        step(&mut prof, "tp_reduce")?;
         det.tap("attn_red", local(attn_out), det_rows, h * 2);
 
         if batched_meta.is_some() && self.high_speed_swap_engaged(kv_cache) {
@@ -980,6 +989,7 @@ impl Qwen3AttentionLayer {
                 );
             }
 
+            step(&mut prof, "hc_attn_post")?;
             crate::layers::ple::dump::tap_highway(
                 ctx.gpu,
                 hc_streams,
@@ -1062,6 +1072,7 @@ impl Qwen3AttentionLayer {
             }
         }
 
+        step(&mut prof, "hc_ffn_norm")?;
         let dense_out = match sp {
             Some(sp) => self.ffn.forward_prefill_sp(normed2, sp, ctx, stream),
             None => self
@@ -1071,6 +1082,7 @@ impl Qwen3AttentionLayer {
         }
         .map_err(|e| anyhow::anyhow!("ffn.forward_prefill (HC) failed: {e}"))?;
 
+        step(&mut prof, "ffn")?;
         // A pending MoE output seam (`layers::glm_sp_moe_seam`) runs whole
         // unless this layer leaves its post to the next one too.
         if diag_this || is_last_layer || self.post_ffn_out_norm.is_some() {
@@ -1132,6 +1144,7 @@ impl Qwen3AttentionLayer {
             );
         }
 
+        step(&mut prof, "hc_ffn_post")?;
         if is_last_layer && let Some(ref head) = hc.head {
             // Under SP: this rank's rows of the contracted `hidden`, which
             // the model all-gathers after the last layer.

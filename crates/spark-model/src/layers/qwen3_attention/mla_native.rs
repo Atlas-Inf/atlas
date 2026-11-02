@@ -10,7 +10,8 @@
 //! stages. Calls of up to 64 rows (32 a launch) run the
 //! `fp8b_gemv_tc{8,16,32}` tiers, whose row bits do not depend on the launch
 //! width: a decode row equals the same row verified. Longer prefill chunks
-//! run the prefill GEMM `ATLAS_GLM_FP4L_FP8_PREFILL` picks (W8A8 by
+//! (and every row of a packed prefill, which needs one family at every
+//! height) run the prefill GEMM `ATLAS_GLM_FP4L_FP8_PREFILL` picks (W8A8 by
 //! default, NVIDIA's vLLM recipe; W8A16 exact; or the BF16 copy). Unless the
 //! BF16 copy serves prefill, the loader frees it and leaves a unique, never
 //! mapped address as the lookup key: a reader this module does not route
@@ -118,7 +119,8 @@ impl Qwen3AttentionLayer {
             "GLM MLA native: twin [{tn}, {tk}] for a [{n}, {k}] projection"
         );
         let kernels = ops::native_kernels(ctx.gpu);
-        if m <= NATIVE_GEMV_MAX_ROWS {
+        let packed = crate::layers::glm_packed_scope::active();
+        if m <= NATIVE_GEMV_MAX_ROWS && !packed {
             ops::fp8b_gemv_rows(ctx.gpu, &kernels.fp8b, w, input, output, m, n, k, n, stream)?;
             return Ok(true);
         }
@@ -148,6 +150,7 @@ impl Qwen3AttentionLayer {
         self.mla_native_twin(weight.weight)
             .is_some_and(|(_, w)| !w.tiled)
             && m > NATIVE_GEMV_MAX_ROWS
+            && !crate::layers::glm_packed_scope::active()
             && self.mla_native.prefill == Some(Fp8bPrefill::W8a8)
     }
 
@@ -207,7 +210,10 @@ impl Qwen3AttentionLayer {
         ) else {
             return Ok(false);
         };
-        if m as usize > NATIVE_GEMV_MAX_ROWS || a.tiled != b.tiled {
+        if m as usize > NATIVE_GEMV_MAX_ROWS
+            || crate::layers::glm_packed_scope::active()
+            || a.tiled != b.tiled
+        {
             return Ok(false);
         }
         ensure!(

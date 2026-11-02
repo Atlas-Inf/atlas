@@ -161,6 +161,12 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        let shape = [num_tokens, num_experts, hidden_size];
+        // A packed prefill (`glm_packed_scope`): the BF16 GEMM, row-invariant
+        // there, at every row count.
+        if crate::layers::glm_packed_scope::active() && ctx.config.model_type == "glm5_next" {
+            return self.router_bf16_gemm(router_in, gate_logits, shape, stream);
+        }
         match glm_router_prefill_gemm(
             ctx.config.model_type == "glm5_next",
             num_tokens,
@@ -169,20 +175,7 @@ impl MoeLayer {
             glm_router_prefill_cutlass(),
         ) {
             Some(RouterPrefillGemm::Cutlass) => {
-                let gemm = if self.router_f32 {
-                    ops::bf16_gemm_f32out
-                } else {
-                    ops::bf16_gemm
-                };
-                return gemm(
-                    router_in,
-                    self.weights.gate.weight.0,
-                    gate_logits,
-                    num_tokens,
-                    num_experts,
-                    hidden_size,
-                    stream,
-                );
+                return self.router_bf16_gemm(router_in, gate_logits, shape, stream);
             }
             Some(RouterPrefillGemm::CublasLt) => {
                 let lt = if self.router_f32 {
@@ -394,7 +387,8 @@ impl MoeLayer {
         ctx: &ForwardContext,
     ) -> bool {
         // An arm `prefill_gate_gemm` takes before the dense router.
-        let other_arm = self.gate_fp8.is_some()
+        let other_arm = crate::layers::glm_packed_scope::active()
+            || self.gate_fp8.is_some()
             || self.gate_nvfp4.is_some()
             || (n <= crate::layers::canonical_verify::MAX_ROWS
                 && crate::layers::canonical_verify::enabled())

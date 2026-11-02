@@ -252,12 +252,15 @@ impl MoeLayer {
             Some(sp) if !sp.full_shared => (sp.local(input, h as usize), sp.rows as u32),
             _ => (input, n),
         };
+        // Not in a packed prefill (`glm_packed_scope`): a choice made from the
+        // pass height, kept off so a lone prompt and a pack run alike.
         // An MXFP8 shared expert under EP is this rank's slice
         // (`shared_mxfp8.rs`): its partial over every row joins the routed sum
         // before the reduce (`split`).
         let mx_split = has_shared && is_ep_prefill && self.shared_joins_reduce();
         let overlap_shared_reduce = has_shared
             && is_ep_prefill
+            && !crate::layers::glm_packed_scope::active()
             && !mx_split
             && num_tokens > 64
             && !ctx.graph_capture
@@ -269,6 +272,7 @@ impl MoeLayer {
         // intermediate columns and blends that partial before the EP
         // all-reduce, which sums the halves; each rank reads half the weights.
         let split_eligible = has_shared
+            && !crate::layers::glm_packed_scope::active()
             && is_ep_prefill
             && sp.is_none()
             && !overlap_shared_reduce

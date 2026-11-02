@@ -211,6 +211,7 @@ impl Qwen3AttentionLayer {
         let latent_row = nq * kv_lora * 2;
         let sizes = ctx.buffers.sizes();
         if !on
+            || crate::layers::glm_packed_scope::active()
             || owners.len() < if solo { 1 } else { 2 }
             || rows > 64
             || sizes.ssm_qkvz < 2 * rows * key_row

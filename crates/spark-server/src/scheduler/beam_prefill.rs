@@ -34,3 +34,31 @@ pub(super) fn resolve_beam_hyp(
         .pop()
         .unwrap_or_default())
 }
+
+/// Group beam requests by adapter — the model's single global LoRA gate forces
+/// one adapter per fused batch — then pack each group into chunks whose summed
+/// beam count does not exceed `cap`. `items` is `(req_idx, adapter_slot,
+/// num_beams)`; returns chunks of `req_idx` (adapter order is deterministic).
+pub(super) fn pack_beam_chunks(items: &[(usize, i32, usize)], cap: usize) -> Vec<Vec<usize>> {
+    let mut groups: std::collections::BTreeMap<i32, Vec<(usize, usize)>> =
+        std::collections::BTreeMap::new();
+    for &(idx, adapter, nb) in items {
+        groups.entry(adapter).or_default().push((idx, nb));
+    }
+    let mut chunks: Vec<Vec<usize>> = Vec::new();
+    for reqs in groups.into_values() {
+        let (mut chunk, mut beams) = (Vec::new(), 0usize);
+        for (idx, nb) in reqs {
+            if !chunk.is_empty() && beams + nb > cap {
+                chunks.push(std::mem::take(&mut chunk));
+                beams = 0;
+            }
+            chunk.push(idx);
+            beams += nb;
+        }
+        if !chunk.is_empty() {
+            chunks.push(chunk);
+        }
+    }
+    chunks
+}

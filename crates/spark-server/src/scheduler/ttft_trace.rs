@@ -7,7 +7,7 @@
 //! `<think>` from the prefill is not streamed, so for GLM that is usually the
 //! first decode step):
 //!
-//! `TTFT_TRACE slot=<s> prompt=<n> cohort=<k> queue=<ms> setup=<ms>
+//! `TTFT_TRACE slot=<s> prompt=<n> cohort=<k> pack=<prompts>x<rows> queue=<ms> setup=<ms>
 //! pf_submit=<ms> pf_sync=<ms> to_step=<ms> steps=<n> step=<ms> ttft=<ms>
 //! first=<think|token|none>`
 //!
@@ -16,15 +16,20 @@
 //!   `start_chunked_prefill`. Includes every earlier prompt's prefill in the
 //!   same tick and any decode steps run before this prompt was drained.
 //! * `cohort`: prompts `start_new_requests` admitted in the same tick.
+//! * `pack`: the packed prefill it ran in (`ATLAS_GLM_PACKED_PREFILL`):
+//!   prompts x rows; `-` for an ordinary prefill. `pf_submit` then covers
+//!   the whole packed pass.
 //! * `setup`: admission to the `prefill_chunk` call (grammar, EP broadcast).
 //! * `pf_submit`: the `prefill_chunk` call (host submission; it returns before
 //!   the GPU finishes unless the model syncs inside).
 //! * `pf_sync`: `prefill_chunk` return to the first token sampled (the sampler
 //!   reads the token back, so this ends when the prefill's GPU work does).
-//! * `to_step`: first token sampled to the start of the decode dispatch that
-//!   produced the first visible token (other prompts' prefills in between).
-//! * `steps`, `step`: decode dispatches this request was in until then, and
-//!   the wall time of the last one.
+//! * `to_step`: first token sampled to the start of this request's first
+//!   decode dispatch (other prompts' prefills in between).
+//! * `steps`, `step`: decode dispatches this request was in until its first
+//!   visible token, and the wall time of the last one (the first step holds
+//!   the DFlash first propose: drafter block table, context precompute and,
+//!   past the warm-up, its per-sequence graph capture).
 //! * `ttft`: queue arrival to the end of that decode dispatch.
 //!
 //! A multi-chunk prompt reports `pf_submit`/`pf_sync` for chunk 0 only.
@@ -119,6 +124,18 @@ pub(super) fn mark(slot: usize, what: Mark) {
     });
 }
 
+/// `slot`'s prompt ran in a packed prefill of `prompts` prompts, `rows` rows.
+pub(super) fn packed(slot: usize, prompts: usize, rows: usize) {
+    if !enabled() {
+        return;
+    }
+    SEQS.with(|s| {
+        if let Some(r) = s.borrow_mut().get_mut(&slot) {
+            r.packed = Some((prompts, rows));
+        }
+    });
+}
+
 /// Start of a decode dispatch; `None` when disarmed.
 pub(super) fn step_begin() -> Option<Instant> {
     enabled().then(Instant::now)
@@ -135,8 +152,8 @@ pub(super) fn step_end(t0: Option<Instant>, active: &[ActiveSeq]) {
             let slot = a.seq.slot_idx;
             let Some(r) = s.get_mut(&slot) else { continue };
             r.steps += 1;
+            r.first_step_start.get_or_insert(t0);
             if a.output_tokens.is_empty() {
-                r.first_step_start.get_or_insert(t0);
                 continue;
             }
             r.last_step = (t0, now);
@@ -180,6 +197,8 @@ struct Rec {
     first_step_start: Option<Instant>,
     steps: u32,
     last_step: (Instant, Instant),
+    /// `(prompts, rows)` of the packed prefill it ran in.
+    packed: Option<(usize, usize)>,
 }
 
 fn ms(a: Option<Instant>, b: Option<Instant>) -> String {
@@ -202,6 +221,7 @@ impl Rec {
             first_step_start: None,
             steps: 0,
             last_step: (admit, admit),
+            packed: None,
         }
     }
 
@@ -226,7 +246,7 @@ impl Rec {
             ("-".to_string(), "-".to_string(), sampled.unwrap_or(step1))
         } else {
             (
-                ms(sampled, Some(step0)),
+                ms(sampled, self.first_step_start),
                 ms(Some(step0), Some(step1)),
                 step1,
             )
@@ -236,9 +256,12 @@ impl Rec {
             Some((_, false)) => "think",
             None => "none",
         };
+        let pack = self
+            .packed
+            .map_or("-".to_string(), |(n, rows)| format!("{n}x{rows}"));
         format!(
-            "TTFT_TRACE slot={slot} prompt={} cohort={} queue={} setup={} pf_submit={} \
-             pf_sync={} to_step={to_step} steps={} step={step} ttft={} first={first}",
+            "TTFT_TRACE slot={slot} prompt={} cohort={} pack={pack} queue={} setup={} \
+             pf_submit={} pf_sync={} to_step={to_step} steps={} step={step} ttft={} first={first}",
             self.prompt,
             self.cohort,
             ms(Some(self.arrival), Some(self.admit)),
@@ -267,12 +290,15 @@ mod tests {
         r.mark(Mark::PrefillSubmitted, at(t0, 170));
         r.mark(Mark::FirstSampled(false), at(t0, 330));
         r.mark(Mark::PrefillStart, at(t0, 999)); // first stamp wins
-        r.steps = 1;
+        r.steps = 2;
+        r.packed = Some((3, 160));
+        r.first_step_start = Some(at(t0, 800));
         r.last_step = (at(t0, 900), at(t0, 1000));
         assert_eq!(
             r.line(5),
-            "TTFT_TRACE slot=5 prompt=87 cohort=3 queue=100.0 setup=2.0 pf_submit=68.0 \
-             pf_sync=160.0 to_step=570.0 steps=1 step=100.0 ttft=1000.0 first=think"
+            "TTFT_TRACE slot=5 prompt=87 cohort=3 pack=3x160 queue=100.0 setup=2.0 \
+             pf_submit=68.0 pf_sync=160.0 to_step=470.0 steps=2 step=100.0 ttft=1000.0 \
+             first=think"
         );
     }
 

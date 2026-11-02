@@ -22,7 +22,9 @@ fn glm_head_twin<'a>(
     [rows, g, k, n]: [u32; 4],
 ) -> Option<&'a Mxfp8Weight> {
     let shape = [g as usize * n as usize, k as usize];
-    let servable = rows <= ops::MXFP8_GROUPED_MAX_M && tiers.iter().all(|t| t.0 != 0);
+    let servable = rows <= ops::MXFP8_GROUPED_MAX_M
+        && tiers.iter().all(|t| t.0 != 0)
+        && !crate::layers::glm_packed_scope::active();
     twins
         .iter()
         .find(|&&(w, s, mx)| servable && !mx.tiled && w == weight && s == shape)

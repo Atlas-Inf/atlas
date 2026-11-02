@@ -22,6 +22,9 @@ pub enum FirstChunk {
     /// command; the continue phase sends and runs the chunk when the prompt
     /// reaches the head of the queue (`phase_continue_prefills::queued_first`).
     Queue,
+    /// `ATLAS_GLM_PACKED_PREFILL`: set up, but send no prefill command; the
+    /// packed pass owns the worker's prompt dispatch (`phase_start_prefills::packed`).
+    Packed,
 }
 
 /// Start a chunked prefill: process chunk 0, return result.
@@ -160,21 +163,15 @@ pub fn start_chunked_prefill(
     // A chunk end on the prefill cut grid is unchanged when the grid is a
     // multiple of the granule (the shipped grids, 1024 and 4096, are).
     let g = spark_runtime::prefill_chunk_granule();
-    if chunk_len < total && g > 4 && chunk_len >= g {
-        chunk_len -= chunk_len % g;
+    // TP4's sequence-parallel prefill splits the rows over every rank: a chunk
+    // off its row multiple would keep it off (`chunk_alignment`).
+    let multiple = model.prefill_row_multiple();
+    if chunk_len < total && (g > 4 || multiple > 1) {
+        chunk_len = super::chunk_align(chunk_len, multiple);
     }
     let mut is_last = chunk_len >= total;
-    let multiple = model.prefill_row_multiple();
     if is_last {
         (chunk_len, is_last) = super::sp_final_cut(chunk_len, multiple);
-    }
-    // On the chain a first chunk that is not the prompt's last lands on the
-    // sequence-parallel row multiple like every later one (`run_standard`):
-    // the idle budget is the arena, `max_prefill_tokens + max_batch_size`, and
-    // an odd one (TP4's one sequence: 8193) would keep sequence-parallel
-    // prefill, which splits the rows over every rank, off the chunk.
-    if !is_last && multiple > 1 {
-        chunk_len = super::chunk_align(chunk_len, multiple);
     }
 
     tracing::info!(
@@ -366,7 +363,7 @@ pub fn start_chunked_prefill(
                 0,
             )?;
             plant_chunk0(model, &mut seq, pc_plant)?;
-            if multi || queue {
+            if multi || queue || first_chunk == FirstChunk::Packed {
                 return Ok(());
             }
             model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;

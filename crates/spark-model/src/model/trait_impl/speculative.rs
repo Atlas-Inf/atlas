@@ -117,6 +117,9 @@ impl TransformerModel {
         ctx: &ForwardContext,
         stream: u64,
     ) -> anyhow::Result<()> {
+        if self.native_glm_mtp {
+            return self.ensure_native_mtp_context(proposer, seq, ctx, stream);
+        }
         // Disjoint field borrows: the proposer state is mutated while the
         // token slice is read. Destructuring is what makes that legal, and it
         // avoids cloning a 12k-token vector on every propose.

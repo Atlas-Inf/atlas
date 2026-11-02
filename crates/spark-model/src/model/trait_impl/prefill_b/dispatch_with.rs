@@ -96,6 +96,7 @@ impl TransformerModel {
             // That is the OTHER way to satisfy the invariant — always one pass — and
             // it keeps the single-pass numerics, at the cost of the warm-turn tail
             // checkpoint this split exists to create.
+            // `ATLAS_TAIL_SPLIT_MIN_TOKENS` keeps a short prompt to one pass.
             // ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT: one pass, checkpoint in-pass.
             let in_pass = self.qwen4exp_ckpt_takes_tail();
             // ATLAS_QWEN4EXP_PREFILL_ROWINV: a block-grid cut is off the GDN
@@ -348,6 +349,7 @@ impl TransformerModel {
         if !self.prefill_b_exact_direct(seq, chunk_start + chunk_len, is_last_chunk, proc_count) {
             self.prefill_b_forward_layers(
                 seq,
+                tokens,
                 &mut kv_cache,
                 chunk_start,
                 chunk_len,
@@ -391,6 +393,16 @@ impl TransformerModel {
                 chunk_start + chunk_len,
                 t_fwd.saturating_sub(t_meta),
                 _fs.elapsed(),
+            );
+        }
+        if spark_runtime::host_sync_trace::enabled() {
+            self.gpu.synchronize(stream)?;
+            tracing::info!(
+                "host waits in chunk {}..{} ({:.1} ms wall): {}",
+                chunk_start,
+                chunk_start + chunk_len,
+                tp.elapsed().as_secs_f64() * 1e3,
+                spark_runtime::host_sync_trace::take_report(15)
             );
         }
         if profile {

@@ -32,8 +32,10 @@ use spark_runtime::gpu::DevicePtr;
 
 mod diag;
 mod ep;
+mod meta;
 use diag::write_window_aliases;
 pub(super) use diag::{oracle_enabled, serial_diagnostic};
+use meta::MetaLayout;
 pub(super) const EP_CMD_GLM_LONG_VERIFY: u32 = 0xFFFF_FFE9;
 pub(super) const EP_CMD_GLM_LONG_TAIL: u32 = 0xFFFF_FFEA;
 
@@ -56,33 +58,6 @@ const _: () = assert!(
 
 fn align(bytes: usize) -> usize {
     bytes.div_ceil(256) * 256
-}
-
-/// Scratch layout of one call's metadata: the joint block for every row at
-/// `META_BASE`, then one block per owner.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct MetaLayout {
-    joint_bytes: usize,
-    owner_bytes: usize,
-    owners: usize,
-}
-
-impl MetaLayout {
-    fn new(owners: usize, rows: usize, max_blocks: usize) -> Self {
-        Self {
-            joint_bytes: align(META_BLOCK_TABLE + owners * rows * max_blocks * 4),
-            owner_bytes: align(META_BLOCK_TABLE + rows * max_blocks * 4),
-            owners,
-        }
-    }
-    /// Scratch offset of owner `o`'s metadata block.
-    fn owner_offset(&self, o: usize) -> usize {
-        META_BASE + self.joint_bytes + o * self.owner_bytes
-    }
-    /// Scratch bytes the layout ends at.
-    fn end(&self) -> usize {
-        self.owner_offset(self.owners)
-    }
 }
 
 /// Whether owner index `owner` exists in a call of `rows` rows per owner.
@@ -119,10 +94,12 @@ impl TransformerModel {
     /// long-context MTP, a 2..=8 row block on the GLM DFlash lane.
     pub(super) fn can_batch_glm_long_verify_impl(&self, owners: usize, rows: usize) -> bool {
         use crate::speculative::glm_repair_policy as policy;
-        let lane = if policy::enabled() {
-            rows == K3_ROWS && policy::long_context_enabled()
-        } else {
-            policy::dflash_enabled()
+        let lane = || {
+            if policy::enabled() {
+                rows == K3_ROWS && policy::long_context_enabled()
+            } else {
+                policy::canonical_target_enabled()
+            }
         };
         self.glm_long_stage.is_some()
             && owner::width_supported(owners, rows)
@@ -130,7 +107,7 @@ impl TransformerModel {
             // The call's metadata (block tables of every row) fits scratch.
             && MetaLayout::new(owners, rows, self.max_blocks_per_seq as usize).end()
                 <= self.buffers.sizes().scratch
-            && lane
+            && lane()
             && self.config.model_type == "glm5_next"
             && crate::layers::ops::glm_sparse_tc_rank(&self.config)
             && self.config.hc_mult == 4
@@ -448,7 +425,16 @@ impl TransformerModel {
             stream,
         )?;
         let argmax = self.buffers.scratch();
-        if !self.glm_split_head_argmax(normed, total, argmax, (ban_rows, &ban), None, stream)? {
+        let split =
+            self.glm_split_head_argmax(normed, total, argmax, (ban_rows, &ban), None, stream)?;
+        if split && self.native_glm_mtp {
+            self.glm_split_head_full_rows(total, stream)?;
+        }
+        if !split {
+            ensure!(
+                !self.native_glm_mtp,
+                "native GLM MTP requires the MXFP8 split target head"
+            );
             self.lm_head_batched(normed, total as u32, self.buffers.logits(), stream)?;
             let vocab = self.config.vocab_size;
             for r in 0..total {

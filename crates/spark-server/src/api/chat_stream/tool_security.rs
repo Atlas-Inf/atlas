@@ -45,3 +45,17 @@ pub(super) fn check_size(state: &mut StreamState, ctx: &StreamCtx, additional: u
         false
     }
 }
+
+/// Unreleased raw tool syntax that `additional` more bytes would take past the
+/// guard's bound: refuse it before the detector buffers more.
+pub(super) fn check_pending(state: &mut StreamState, ctx: &StreamCtx, additional: usize) -> bool {
+    let bound = ctx.state.tool_guard.max_bytes;
+    let over = ctx.state.tool_guard.enabled
+        && state.detector.as_ref().is_some_and(|d| {
+            d.pending_tool_bytes() > 0 && d.pending_tool_bytes().saturating_add(additional) > bound
+        });
+    if over {
+        reject(state, BlockReason::ArgumentsTooLarge);
+    }
+    over
+}

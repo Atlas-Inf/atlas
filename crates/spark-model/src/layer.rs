@@ -14,6 +14,7 @@ use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 pub mod glm_long_owner;
+pub mod glm_packed;
 mod prefill_pieces;
 pub mod ssm_batch;
 pub use prefill_pieces::{
@@ -494,7 +495,6 @@ pub enum MoeLoraRoute {
 /// 1. Pre-norm -> attention/SSM -> residual add
 /// 2. Post-norm -> FFN/MoE -> residual add
 ///
-/// The generic model loop iterates `layers` without knowing whether
-/// each is attention, SSM, MoE, or dense FFN.
+/// The generic model loop iterates `layers` whatever each one is.
 #[cfg(test)]
 mod tests;

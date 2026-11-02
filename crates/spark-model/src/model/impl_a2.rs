@@ -458,6 +458,7 @@ impl TransformerModel {
     /// - 0xFFFFFFF2/3/4: verify K=2/3/4 → K tokens, then accept/num_accepted
     /// - 0xFFFFFFF5/6/7, 0xFFFFFFE1, 0xFFFFFFEB/EC: GLM/vision extensions (`impl_a2_ep_worker`)
     /// - 0xFFFFFFE6: batched multi-sequence verify (`trait_impl/ep_verify_batch.rs`)
+    /// - 0xFFFFFFE8: packed multi-prompt prefill (`glm_packed_prefill`)
     /// - 0xFFFFFFF8: cache this slot's sequence (`trait_impl::finish_leaf`)
     /// - 0xFFFFFFED: plant a prefix checkpoint → position (`prefill_b::pc_inflight`)
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored; applies to the whole worker)
