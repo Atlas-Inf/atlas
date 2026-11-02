@@ -46,8 +46,9 @@ impl Relay {
             self.sizes[seq as usize % SIZES]
         };
         let (bytes, kind) = decode_size(code);
+        // The send path's eligibility: only a flood runs below four ranks.
         ensure!(
-            self.fits(code),
+            self.fits(code) && (kind == OpKind::Flood || self.shape.ranks == MAX_RANKS),
             "RDMA one-shot: rank {o}'s op {seq} has an ineligible size {bytes}"
         );
         let route = if kind == OpKind::Flood {

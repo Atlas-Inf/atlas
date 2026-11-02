@@ -350,7 +350,12 @@ fn proxy_loop(
     cmd_at: usize,
     stop: &AtomicBool,
 ) -> Result<()> {
-    let end = serve(&mut links, &mut relays, &mut cmd, host, cmd_at, stop);
+    // A panic takes the error path too: every relay is failed, so no rank
+    // spins on a broadcast that this proxy will never forward.
+    let end = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        serve(&mut links, &mut relays, &mut cmd, host, cmd_at, stop)
+    }))
+    .unwrap_or_else(|_| Err(anyhow::anyhow!("RDMA chain proxy panicked")));
     if end.is_err() {
         for relay in &relays {
             relay.fail();
