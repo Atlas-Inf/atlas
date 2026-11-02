@@ -348,3 +348,15 @@ required-features = ["cuda", "gpu-examples"]
 [[example]]
 name = "moe_t_rows_bench"
 required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "glm_fp4l_native_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "glm_sparse_heads_check"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "w4a16_kda_shard_check"
+required-features = ["cuda", "gpu-examples"]
