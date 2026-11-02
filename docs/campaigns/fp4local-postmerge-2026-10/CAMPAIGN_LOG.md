@@ -1791,3 +1791,15 @@ Queue: 74 (BFCL A1) → 74a (Qwen4 perf) → 75 (27B gate-recipe BFCL).
 - **Job 75** (27B `-bfcl` recipe through sparkrun on `sha-11972c1`) **never came up**, and sparkrun removed the container, so there are no logs.
   - Hypothesis: the recipe is the only 27B recipe with `default_chat_template_kwargs`, and the launch passes it unquoted (`{"reasoning_effort":"medium"}` → `{reasoning_effort:medium}`). The CLI then aborts on invalid JSON at startup.
   - Job 77 tests this (step 0) and then runs the recipe's flags natively, properly quoted, with BFCL ST-995, on a fresh main f506e923f build.
+
+## 2026-11-02 05:00 UTC — maintainer decisions; PR pass-through; log lands
+
+- **Decision:** `verbatim_prompt = false` for qwen3.8-flash-next (the #271 attribution). PR to follow, gated on sparky with agentic-50 + BFCL ST-995 on FP4-Local and Flash-Next NVFP4.
+- **Pass-through of the open PRs:**
+  - **#316 merged:** GLM plain-decode recipe docs. Checked against `kv_cache.rs`: one slot plus a 4096-token chunk gives 4097 rows, and the override to 4100 is accepted.
+  - **#149 merged:** Windows Flash-Next launcher with prefix caching on; script only.
+  - **#255** is already on main via d56fa8ea1 / #309. Its base is a stack branch, so GitHub kept it open.
+  - **#113:** the 3fcf8ff image was never published. Docker Hub `:latest` is still `sha-c8b88c6` (2026-09-23), so the record is obsolete.
+  - **#194** (conflicts with main's newer devlab `bench` mode) and **#118** (stale budget) need rework.
+  - **#160, #100, #11** are external, heavily conflicting, and have no checkpoint on sparky. #11 also lacks a CLA signature.
+- This log merges with this entry. Later results go on the PRs they belong to.
