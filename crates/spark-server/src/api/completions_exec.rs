@@ -192,12 +192,13 @@ pub(super) async fn run_blocking(
                 0.0
             };
 
-            choices.push(CompletionChoice {
-                index: prompt_i * n + n_i,
+            choices.push(assemble_choice(
+                req,
+                prompt_i * n + n_i,
                 text,
-                finish_reason: response.finish_reason,
                 logprobs,
-            });
+                response,
+            ));
         }
     }
 
@@ -226,6 +227,29 @@ pub(super) async fn run_blocking(
     ))
     .into_response()
 }
+
+/// Assemble after text processing, retaining the scheduler's exact IDs when
+/// requested. Generated IDs never include an echoed prompt or reconstructed
+/// text, which can omit special tokens or merge byte pieces.
+fn assemble_choice(
+    req: &CompletionRequest,
+    index: usize,
+    text: String,
+    logprobs: Option<crate::openai::CompletionLogprobs>,
+    response: super::inference_types::InferenceResponse,
+) -> CompletionChoice {
+    CompletionChoice {
+        index,
+        text,
+        finish_reason: response.finish_reason,
+        token_ids: req.return_token_ids.then_some(response.output_tokens),
+        logprobs,
+    }
+}
+
+#[cfg(test)]
+#[path = "completions_token_ids_tests.rs"]
+mod token_ids_tests;
 
 #[cfg(test)]
 #[path = "completions_spec_policy_tests.rs"]

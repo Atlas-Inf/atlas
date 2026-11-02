@@ -469,4 +469,20 @@ mod tests {
             ["--speculative or --dflash"]
         );
     }
+
+    #[test]
+    fn the_vision_pixel_bound_is_compared() {
+        // It sizes the encoder's capacity and output window on each rank.
+        let args = crate::cli::ServeArgs::parse_from(["spark", "some/model"]);
+        let a = super::rank_settings(&args, false, 8192, 8196, Some(16_777_216));
+        let b = super::rank_settings(&args, false, 8192, 8196, Some(1_048_576));
+        let differ: Vec<_> = a
+            .iter()
+            .zip(&b)
+            .filter(|(x, y)| x != y)
+            .map(|(x, _)| x.0)
+            .collect();
+        assert_eq!(differ.len(), 1);
+        assert!(differ[0].starts_with("vision max pixels"), "{differ:?}");
+    }
 }
