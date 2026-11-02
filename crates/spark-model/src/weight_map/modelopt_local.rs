@@ -21,13 +21,14 @@
 //!   read them are `const float*`, and the other packs' BF16 norms are
 //!   widened to F32 at layer-load (`dense_keep_f32`).
 //!
-//! The fast loader decodes CSF streams as it reads them and uploads native
-//! MXFP8 modules like any other tensor: its readers fetch those tensors far
-//! faster than one read each from here. It DEFERS the sources of what is
-//! expanded ([`deferred_modules`]), so they are read from disk here and never
-//! occupy device memory; only the expanded tensor is uploaded. A loader that
-//! uploaded them anyway (the non-fast path) still works: resident sources are
-//! read back and freed.
+//! The fast loader decodes CSF streams as it reads them. It DEFERS every
+//! [`host_decode_modules`] entry ([`deferred_modules`]), native MXFP8 ones
+//! included, so they are read from disk here and never occupy device memory:
+//! an expanded module uploads only its expansion, and a native one is put on
+//! the device unchanged in its own allocation. Served from inside a shard
+//! slab instead, the native set decoded about 1% slower on qwen4_exp (#308
+//! bisect). A loader that uploaded them anyway (the non-fast path) still
+//! works: resident sources are read back and freed.
 //!
 //! The PLE n-gram table's NVFP4 rows are a different consumer (gathered by
 //! row off NVMe) and are handled by the PLE loader, not here.
@@ -98,20 +99,11 @@ fn force_expand() -> bool {
 }
 
 /// The modules the fast loader leaves on disk for [`materialize`]: every
-/// [`host_decode_modules`] entry but those served as shipped.
+/// [`host_decode_modules`] entry. The native MXFP8 set stays deferred too, so
+/// [`materialize`] gives each its own allocation: from a shard slab they
+/// decoded about 1% slower on qwen4_exp (#308 bisect).
 pub fn deferred_modules(config: &ModelConfig) -> HashSet<String> {
-    let mut modules = host_decode_modules(config);
-    if let Some(plan) = ModeloptQuantPlan::from_config(config)
-        && !force_expand()
-    {
-        let natives = native_consumers(&config.model_type);
-        modules.retain(|m| {
-            !plan
-                .format_of(m)
-                .is_some_and(|f| natives.covers(m, &f.algo))
-        });
-    }
-    modules
+    host_decode_modules(config)
 }
 
 /// What [`materialize`] did, for the load log and for tests.

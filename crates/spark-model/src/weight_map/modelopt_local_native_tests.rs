@@ -1,23 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Native MXFP8 modules through the fast loader: left to the shard path, and
-//! checked where they already sit.
+//! Native MXFP8 modules through the fast loader: deferred to `materialize`,
+//! which gives each its own allocation, and checked where they already sit
+//! when a loader uploaded them anyway.
 
 use super::*;
 
-/// Native modules load through the shard path like any other tensor: only
-/// what the build must expand stays deferred.
+/// Native modules stay deferred with everything the build expands, so they
+/// never land inside a shard slab (#308 bisect: about 1% slower decode there).
 #[test]
-fn deferred_modules_leave_native_modules_to_the_shard_path() {
+fn deferred_modules_keep_native_modules_off_the_slab() {
     const INDEXER: &str = "model.language_model.layers.3.self_attn.indexer.index_qk_proj";
     let mut config = fp4_local_config();
     let qc = config.quantization_config.as_mut().unwrap();
     qc.quantized_layers
         .insert(INDEXER.into(), spec("MXFP8", 32));
     let got = deferred_modules(&config);
-    let want: HashSet<String> = [INDEXER.to_string()].into_iter().collect();
-    assert_eq!(got, want);
-    assert!(host_decode_modules(&config).contains(GDN_OUT));
+    assert_eq!(got, host_decode_modules(&config));
+    assert!(got.contains(INDEXER));
+    assert!(got.contains(GDN_OUT));
     assert!(deferred_modules(&ModelConfig::qwen3_next_80b_nvfp4()).is_empty());
 }
 
