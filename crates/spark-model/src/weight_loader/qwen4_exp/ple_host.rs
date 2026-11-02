@@ -7,6 +7,25 @@ use anyhow::{Context, Result, ensure};
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
+/// The host readback size and decode are chosen from the EXPECTED dtype, not
+/// from the tensor — a mis-typed checkpoint tensor (e.g. BF16 where I64 is
+/// needed) would otherwise be read `n*8` bytes off a `n*2` allocation
+/// (CWE-125). One check, shared by every PLE host read.
+fn expect_dtype(
+    t: &spark_runtime::weights::WeightTensor,
+    name: &str,
+    dt: WeightDtype,
+) -> Result<()> {
+    ensure!(
+        t.dtype == dt,
+        "PLE: {name} is {:?} {:?}, expected {:?} — refusing to read {dt:?}-sized bytes off it",
+        t.dtype,
+        t.shape,
+        dt,
+    );
+    Ok(())
+}
+
 /// Read a small I64 device tensor back to the host.
 ///
 /// `layer_multipliers` and the two per-head tables are 3 and 16 elements —
@@ -15,6 +34,7 @@ use spark_runtime::weights::{WeightDtype, WeightStore};
 /// 280 bytes.
 pub(super) fn i64_host(store: &WeightStore, name: &str, gpu: &dyn GpuBackend) -> Result<Vec<u64>> {
     let t = store.get(name).with_context(|| format!("PLE: {name}"))?;
+    expect_dtype(t, name, WeightDtype::Int64)?;
     let n = t.num_elements();
     let mut raw = vec![0u8; n * 8];
     gpu.copy_d2h(t.ptr, &mut raw)
@@ -31,6 +51,7 @@ pub(super) fn i64_host(store: &WeightStore, name: &str, gpu: &dyn GpuBackend) ->
 /// dtype BF16 — rather than as a per-row scale file.
 pub(super) fn bf16_scalar(store: &WeightStore, name: &str, gpu: &dyn GpuBackend) -> Result<f32> {
     let t = store.get(name).with_context(|| format!("PLE: {name}"))?;
+    expect_dtype(t, name, WeightDtype::BF16)?;
     anyhow::ensure!(
         t.num_elements() == 1,
         "PLE: {name} has {} elements, expected 1 (a per-tensor scale)",
@@ -64,11 +85,7 @@ pub(super) fn fp16_host(
         "PLE: {name} has {} elements, expected {n}",
         t.num_elements()
     );
-    anyhow::ensure!(
-        matches!(t.dtype, spark_runtime::weights::WeightDtype::FP16),
-        "PLE: {name} is {:?}, expected FP16 (raw head_bias)",
-        t.dtype
-    );
+    expect_dtype(t, name, WeightDtype::FP16)?;
     let mut raw = vec![0u8; n * 2];
     gpu.copy_d2h(t.ptr, &mut raw)
         .with_context(|| format!("PLE: reading {name} back to host"))?;
@@ -97,4 +114,42 @@ pub(super) fn f32_scalar(store: &WeightStore, name: &str, gpu: &dyn GpuBackend) 
         "PLE nvfp4: {name} is {v}, not a dequant scale"
     );
     Ok(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spark_runtime::gpu::mock::MockGpuBackend;
+    use spark_runtime::weights::WeightTensor;
+    use std::collections::HashMap;
+
+    fn store(name: &str, shape: &[usize], dtype: WeightDtype) -> (WeightStore, MockGpuBackend) {
+        let gpu = MockGpuBackend::new();
+        let n: usize = shape.iter().product();
+        let bytes = n * dtype.byte_size().max(2);
+        let mut map = HashMap::new();
+        map.insert(
+            name.to_string(),
+            WeightTensor {
+                ptr: gpu.alloc(bytes).unwrap(),
+                shape: shape.to_vec(),
+                dtype,
+            },
+        );
+        (WeightStore::from_map(map), gpu)
+    }
+
+    /// A BF16 `layer_multipliers` (the Qwen4 synth bug) must fail before the
+    /// DtoH read, naming the expected vs actual dtype — not as
+    /// `cuMemcpyDtoHAsync: invalid value` on a 6 B alloc.
+    #[test]
+    fn i64_host_rejects_a_bf16_multipliers_tensor() {
+        let name = "model.language_model.layers.1.ple.ple_embedding.layer_multipliers";
+        let (store, gpu) = store(name, &[3], WeightDtype::BF16);
+        let err = i64_host(&store, name, &gpu).unwrap_err().to_string();
+        assert!(
+            err.contains("BF16") && err.contains("Int64") && err.contains(name),
+            "unexpected message: {err}"
+        );
+    }
 }
