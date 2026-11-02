@@ -1776,3 +1776,11 @@ Queue: 74 (BFCL A1) → 74a (Qwen4 perf) → 75 (27B gate-recipe BFCL).
 - Final table posted on #271. The policy decision is left to the maintainers.
 - Qwen4 day-0 status is kept locally (`~/code/qwen4-prework/QWEN4-27B-SPEC.md`). The 64-layer synth boots and serves on the draft.
 - Running now: 75, the 27B NVFP4 BFCL gate recipe on the newest main image.
+
+## 2026-11-02 02:50 UTC — #317 (PLE dtype guard); #199 and #242 landed upstream via #309; #255 dependency traced
+
+- **#317 (draft):** the qwen4_exp PLE host readers check dtype before sizing the DtoH. This is the 24 B-over-6 B OOB the PLE synth exposed. Job 76 runs one-variable controls vs a fresh f506e923f build after 75.
+- **Upstream since the last entry:**
+  - #309 (data-angel) landed SparkGLM 0.2.0, so #199 is merged and #242 is closed;
+  - #314 fixed a #308 FP4-Local decode regression. Text controls didn't show it; the 72c base included #308.
+- **#255:** the CTX_CARRY impls (`adopt_dflash_ctx` / `acquire_ctx_acc`) were added in 4c50f0fd9 (09-23) and removed in b9a7edad8 (#174, 10-16). That's consistent with #255's GPU-test failure. Suggested restoring them as their own PR; see #255.
