@@ -245,7 +245,7 @@ fn chain_loopback_reduce_scatter_fused() {
             .enumerate()
             .map(|(r, c)| {
                 let top = step.buf[r] + (3 * seg) as u64;
-                c.rs_fused_begin(top, -(seg as i64), seg)
+                c.rs_fused_begin(top, -(seg as i64), seg, 16)
                     .unwrap()
                     .expect("fused op refused")
             })
@@ -271,7 +271,7 @@ fn chain_loopback_reduce_scatter_fused() {
             let top = step.buf[r] + (3 * seg) as u64;
             assert!(
                 chain
-                    .rs_fused_begin(top, -(seg as i64), seg)
+                    .rs_fused_begin(top, -(seg as i64), seg, 16)
                     .unwrap()
                     .is_none()
             );

@@ -235,8 +235,9 @@ impl CommBackend for NcclBackend {
         seg0: u64,
         stride: i64,
         bytes: usize,
+        unit: usize,
     ) -> Result<Option<crate::RsFused>> {
-        self.try_chain_rs_fused_begin(seg0, stride, bytes)
+        self.try_chain_rs_fused_begin(seg0, stride, bytes, unit)
     }
 
     fn reduce_scatter_fused_async(&self, fused: &crate::RsFused, stream: u64) -> Result<bool> {

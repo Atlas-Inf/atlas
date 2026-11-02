@@ -82,3 +82,24 @@ pub(in crate::nccl_backend::rdma_pair) fn forwarded(rank: usize) -> Option<(usiz
 pub(in crate::nccl_backend::rdma_pair) fn code(bytes: usize) -> usize {
     super::RS_BIT | super::FUSED_BIT | (bytes / 512) << 3
 }
+
+/// A fused op's split of `seg`-byte segments (at most `cap`): pieces a
+/// segment and piece bytes, the reduce-scatter's ([`super::rs_per_segment`]),
+/// when every piece is whole `unit`-byte producer rows and the kernel's
+/// 16-byte vectors; `None` otherwise.
+pub(in crate::nccl_backend::rdma_pair) fn split(
+    seg: usize,
+    cap: usize,
+    unit: usize,
+) -> Option<(usize, usize)> {
+    let bytes = super::MAX_RANKS * seg;
+    let k = super::rs_per_segment(bytes);
+    let piece = seg / k;
+    (seg != 0
+        && seg <= cap
+        && bytes.is_multiple_of(super::RS_PIECES * 64)
+        && piece.is_multiple_of(16)
+        && unit != 0
+        && piece.is_multiple_of(unit))
+    .then_some((k, piece))
+}

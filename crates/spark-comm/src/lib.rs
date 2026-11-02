@@ -227,9 +227,17 @@ pub trait CommBackend: Send + Sync {
     /// piece as it finishes (`rdma_rs_fused.cuh`). Enqueues nothing; after
     /// `Some` the caller must launch the producer (stream-ordered after every
     /// earlier collective) and [`Self::reduce_scatter_fused_async`]. Same
-    /// sums as the reduce-scatter. `None` when unavailable (off, too large,
-    /// or right after another fused op): fall back to the plain one.
-    fn rs_fused_begin(&self, _seg0: u64, _stride: i64, _bytes: usize) -> Result<Option<RsFused>> {
+    /// sums as the reduce-scatter. The producer writes whole `unit`-byte
+    /// rows, so every piece must be whole rows. `None` when unavailable (off,
+    /// too large, pieces that split a row, or right after another fused op):
+    /// fall back to the plain one.
+    fn rs_fused_begin(
+        &self,
+        _seg0: u64,
+        _stride: i64,
+        _bytes: usize,
+        _unit: usize,
+    ) -> Result<Option<RsFused>> {
         Ok(None)
     }
 

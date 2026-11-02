@@ -366,3 +366,22 @@ fn chain_completion_words_follow_payload_parity_without_changing_pair_layout() {
         }
     }
 }
+
+#[test]
+fn a_fused_op_cuts_whole_producer_rows_or_declines() {
+    let row = 4096 * 2;
+    // 1356 rows a rank cut eight ways is 169.5 rows a piece: the producer
+    // could not write it, so the seam reduces a block at a time instead.
+    assert_eq!(fused::split(1356 * row, RS_FUSED_SEG, row), None);
+    assert_eq!(
+        fused::split(1352 * row, RS_FUSED_SEG, row),
+        Some((8, 169 * row))
+    );
+    // A byte-granular producer (the copy) keeps every split.
+    assert_eq!(
+        fused::split(1356 * row, RS_FUSED_SEG, 16),
+        Some((8, 1356 * row / 8))
+    );
+    assert_eq!(fused::split(RS_FUSED_SEG + row, RS_FUSED_SEG, row), None);
+    assert_eq!(fused::split(0, RS_FUSED_SEG, row), None);
+}

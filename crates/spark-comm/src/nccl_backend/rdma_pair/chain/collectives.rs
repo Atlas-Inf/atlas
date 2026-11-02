@@ -201,8 +201,9 @@ impl RdmaChain {
         seg0: u64,
         stride: i64,
         bytes: usize,
+        unit: usize,
     ) -> Result<Option<crate::RsFused>> {
-        self.oneshot[0].rs_fused_begin(seg0, stride, bytes)
+        self.oneshot[0].rs_fused_begin(seg0, stride, bytes, unit)
     }
 
     /// The chain kernel of a begun fused op, on channel 0.

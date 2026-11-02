@@ -94,12 +94,13 @@ impl NcclBackend {
         seg0: u64,
         stride: i64,
         bytes: usize,
+        unit: usize,
     ) -> Result<Option<crate::RsFused>> {
         #[cfg(atlas_rdma_verbs)]
         if let Some(chain) = &self.chain {
-            return chain.rs_fused_begin(seg0, stride, bytes);
+            return chain.rs_fused_begin(seg0, stride, bytes, unit);
         }
-        let _ = (seg0, stride, bytes);
+        let _ = (seg0, stride, bytes, unit);
         Ok(None)
     }
 

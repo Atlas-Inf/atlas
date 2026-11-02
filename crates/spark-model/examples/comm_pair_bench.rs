@@ -306,7 +306,7 @@ fn run(
         let copy = g.kernel("rdma_oneshot", "rdma_rs_fused_copy").ok();
         let fused = || {
             let f = comm
-                .rs_fused_begin(top, -(part as i64), part)?
+                .rs_fused_begin(top, -(part as i64), part, 16)?
                 .context("fused reduce-scatter refused")?;
             spark_runtime::kernel_args::KernelLaunch::new(g, copy.context("no copy producer")?)
                 .grid([32, 1, 1])

@@ -112,24 +112,24 @@ impl OneShot {
     /// pieces in the order the producer finishes them (at the ends the raw
     /// segments as `relay::rs_role` sends them, farthest first; in the
     /// middle the segments it sums on, then its raw one; its own last). `None` off channel 0 of a four-rank
-    /// chain with a fused region, for a segment beyond its capacity or of
-    /// misaligned pieces, and right after another fused op.
+    /// chain with a fused region, for a segment beyond its capacity, of
+    /// misaligned pieces or of pieces not whole `unit`-byte producer rows
+    /// ([`fused::split`]), and right after another fused op.
     pub(in crate::nccl_backend) fn rs_fused_begin(
         &self,
         seg0: u64,
         stride: i64,
         seg: usize,
+        unit: usize,
     ) -> Result<Option<crate::RsFused>> {
         let Some(f) = self.fused else {
             return Ok(None);
         };
+        let Some((k, piece)) = fused::split(seg, f.cap, unit) else {
+            return Ok(None);
+        };
         let bytes = MAX_RANKS * seg;
-        let k = rs_per_segment(bytes);
         if self.kernel.load(Ordering::Relaxed) == 0
-            || seg == 0
-            || seg > f.cap
-            || !bytes.is_multiple_of(RS_PIECES * 64)
-            || !(seg / k).is_multiple_of(16)
             || !seg0.is_multiple_of(16)
             || stride % 16 != 0
             || (stride.unsigned_abs() as usize) < seg
@@ -137,7 +137,6 @@ impl OneShot {
         {
             return Ok(None);
         }
-        let piece = seg / k;
         let rank = self.shape.rank;
         let role = relay::rs_role(rank);
         let ctrl = self.dev + ctrl_off(self.cfg.max, self.shape.origins()) as u64;

@@ -115,7 +115,7 @@ pub fn begin(
     let fused = match ctx.comm.filter(|_| fusable) {
         Some(comm) => {
             let (seg0, stride, bytes) = sp.chain_segments(out, h, (0, sp.rows));
-            comm.rs_fused_begin(seg0, stride, bytes)?
+            comm.rs_fused_begin(seg0, stride, bytes, h * 2)?
         }
         None => None,
     };
