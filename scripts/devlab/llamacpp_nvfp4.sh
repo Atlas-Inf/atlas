@@ -38,8 +38,10 @@ B="$W/llama.cpp/build/bin"
 
 # ---- 2. convert NVIDIA's NVFP4 checkpoint ------------------------------------------------------------------
 python3 -m venv "$W/venv" && . "$W/venv/bin/activate" && pip install -q --upgrade pip >/dev/null 2>&1
-pip install -q -r "$W/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt" huggingface_hub > "$OUT/pip.log" 2>&1 \
+pip install -q -r "$W/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt" huggingface_hub hf_transfer > "$OUT/pip.log" 2>&1 \
   || log "pip install of convert requirements failed: $(tail -2 "$OUT/pip.log")"
+# The checkpoint has single shards past huggingface_hub's plain-download limit ("Use hf_transfer or hf_xet", run 41406025913).
+export HF_HUB_ENABLE_HF_TRANSFER=1
 t0=$(date +%s)
 SRC=$(python3 -c "import sys; from huggingface_hub import snapshot_download; print(snapshot_download(sys.argv[1]))" "$MODEL" 2>"$OUT/download.log") \
   || { log "MODEL DOWNLOAD FAILED: $(tail -2 "$OUT/download.log")"; exit 1; }
