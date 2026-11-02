@@ -6,7 +6,8 @@ use anyhow::{Context, Result};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use super::super::{
-    GlmVisionEncoder, GlmVisionWeights, MergerLayer, PATCH_DIM, ViTBlock, VisionEncoder, VitWeight,
+    GlmCapacity, GlmVisionEncoder, GlmVisionWeights, MergerLayer, PATCH_DIM, ViTBlock,
+    VisionEncoder, VitWeight,
 };
 
 /// Encoder capacity, in patches, when nothing bounds the image.
@@ -279,11 +280,12 @@ impl VisionEncoder {
     /// Construct the distinct GLM-5.3 visual tower while retaining the
     /// historical `VisionEncoder` wrapper used by model prefill/splicing.
     pub(crate) fn new_glm(
-        weights: GlmVisionWeights,
+        weights: Option<GlmVisionWeights>,
         config: &atlas_core::config::VisionConfig,
+        capacity: GlmCapacity,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
-        let glm = GlmVisionEncoder::new(weights, config, gpu)?;
+        let glm = GlmVisionEncoder::new(weights, config, capacity, gpu)?;
         let glm_buf_out = glm.buf_out;
         let glm_p_max = glm.p_max;
         Ok(Self {

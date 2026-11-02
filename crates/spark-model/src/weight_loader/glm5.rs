@@ -42,6 +42,17 @@ impl ModelWeightLoader for Glm5WeightLoader {
         true
     }
 
+    /// A rank that only receives vision rows never reads the tower.
+    fn dead_namespaces(&self, config: &ModelConfig) -> Vec<String> {
+        if crate::layers::vision_encoder::vision_receive_only(config) {
+            ["model.visual.", "model.language_model.visual."]
+                .map(String::from)
+                .to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
     fn load_layers(
         &self,
         store: &WeightStore,

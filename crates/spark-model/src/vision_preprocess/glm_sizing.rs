@@ -44,7 +44,6 @@ pub(crate) fn glm_pixel_budget(
 /// `t_bar × h × w` with `t_bar >= temporal_patch_size`, so no sequence holds
 /// more than `max_pixels / (temporal_patch_size × patch²)` patches; the native
 /// tower sizes its per-sequence buffers from this.
-#[cfg(test)]
 pub(crate) fn glm_max_sequence_patches(vcfg: &VisionConfig) -> usize {
     let patch_volume = vcfg.temporal_patch_size * vcfg.patch_size * vcfg.patch_size;
     let image = glm_pixel_budget(vcfg, vcfg.max_pixels, false).1;
@@ -57,7 +56,6 @@ pub(crate) fn glm_max_sequence_patches(vcfg: &VisionConfig) -> usize {
 /// frame count to whole temporal groups half-to-even, while the frames are
 /// padded up to `grid_t` groups: five frames budget two groups and encode
 /// three, so a video can carry half again its token budget.
-#[cfg(test)]
 pub(crate) fn glm_max_item_tokens(vcfg: &VisionConfig) -> usize {
     let tp = vcfg.temporal_patch_size.max(1);
     let cell = vcfg.patch_size * vcfg.spatial_merge_size;

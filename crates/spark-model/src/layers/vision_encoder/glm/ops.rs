@@ -205,21 +205,19 @@ impl GlmVisionEncoder {
             .launch(stream)
     }
 
-    /// The merger's 2x2 stride-2 Conv2d as one GEMM: reorder each merge
-    /// block's four rows into the weight's `(c, ih, iw)` K order, then
-    /// multiply by the `[out, hidden * 4]` view of the weight. `scratch` holds
-    /// `patches * hidden` BF16 elements.
+    /// The merger's 2x2 stride-2 Conv2d over `tokens` merge blocks as one
+    /// GEMM: reorder each block's four rows into the weight's `(c, ih, iw)`
+    /// K order, then multiply by the `[out, hidden * 4]` view of the weight.
+    /// `scratch` holds `tokens * 4 * hidden` BF16 elements.
     pub(super) fn conv2d(
         &self,
         gpu: &dyn GpuBackend,
         input: DevicePtr,
         scratch: DevicePtr,
         output: DevicePtr,
-        grid_h: usize,
-        grid_w: usize,
+        tokens: usize,
         stream: u64,
     ) -> Result<()> {
-        let tokens = (grid_h / 2) * (grid_w / 2);
         KernelLaunch::new(gpu, self.k_merge_reorder)
             .grid([div_ceil((tokens * 4 * self.hidden_size) as u32, 256), 1, 1])
             .block([256, 1, 1])
