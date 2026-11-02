@@ -15,10 +15,9 @@ use axum::response::{IntoResponse, Json, Response};
 
 use crate::AppState;
 use crate::ir;
-use crate::literal_xml::state_after;
 use crate::tool_parser;
 
-use super::chat_blocking_choice::{build_choice_message, build_logprobs};
+use super::chat_blocking_choice::{build_choice_message, build_logprobs, native_opener_opens_call};
 use super::compact::openai_error_response;
 use super::inference_impl::{extract_thinking, strip_stop_sequences};
 use super::inference_types::{GrammarSpec, InferenceRequest};
@@ -299,12 +298,8 @@ pub(super) fn decode_response_text(
                     {
                         return None;
                     }
-                    let prefix_is_literal = state
-                        .tokenizer
-                        .decode(&output_tokens[..pos])
-                        .ok()
-                        .is_some_and(|prefix| state_after(&prefix).is_literal());
-                    (!prefix_is_literal).then_some((&output_tokens[..pos], &output_tokens[pos..]))
+                    native_opener_opens_call(state, output_tokens, pos)
+                        .then_some((&output_tokens[..pos], &output_tokens[pos..]))
                 })
         })
     } else {

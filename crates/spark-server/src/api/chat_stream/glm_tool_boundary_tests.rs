@@ -380,7 +380,8 @@ fn glm_native_tool_boundary_keeps_request_model_and_name_guards() {
         let (stream, _) = stream(glm, tools, false, true);
         assert!(!stream.thinking_done);
     }
-    // Opening a native tool phase does not authorize an unregistered name.
+    // A native call keeps its own unregistered name: it goes to the client,
+    // which answers it, and is never repaired onto a declared tool.
     let state = app(true);
     let req = request();
     let response = response(tokens(false, false));
@@ -389,13 +390,17 @@ fn glm_native_tool_boundary_keeps_request_model_and_name_guards() {
     let choice = crate::api::chat_blocking_choice::build_choice_message(
         &state, &req, &response, reasoning, content, true, None, 0,
     );
-    assert!(choice.tool_calls.is_empty());
+    let names: Vec<_> = choice.tool_calls.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["unknown_tool"]);
     let (_, deltas) = stream(true, true, false, false);
-    assert!(
-        !deltas
-            .iter()
-            .any(|d| matches!(d, ir::StreamDelta::ToolCallStart { .. }))
-    );
+    let starts: Vec<_> = deltas
+        .iter()
+        .filter_map(|d| match d {
+            ir::StreamDelta::ToolCallStart { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(starts, ["unknown_tool"]);
     // Exact-name admission is GLM-scoped, including conventional post-think
     // calls. Other models retain the existing blocking fuzzy-name behavior.
     for glm in [false, true] {
@@ -406,7 +411,8 @@ fn glm_native_tool_boundary_keeps_request_model_and_name_guards() {
         let choice = crate::api::chat_blocking_choice::build_choice_message(
             &state, &req, &response, reasoning, content, true, None, 0,
         );
-        assert_eq!(choice.tool_calls.len(), usize::from(!glm));
+        let names: Vec<_> = choice.tool_calls.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, [if glm { "unknown_tool" } else { "get_weather" }]);
     }
 }
 

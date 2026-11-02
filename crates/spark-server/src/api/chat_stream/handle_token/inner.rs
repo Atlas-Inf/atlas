@@ -26,10 +26,8 @@ pub(crate) fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: 
             .decode(&state.all_toks[..state.all_toks.len() - 1])
             .ok()
             .is_some_and(|prefix| state_after(&prefix).is_literal());
-    let implicit_tool = !state.thinking_done
-        && state.detector.is_some()
-        && ctx.state.glm_tool_boundary == Some(tok)
-        && !native_marker_is_literal;
+    let native_call = ctx.state.glm_tool_boundary == Some(tok) && !native_marker_is_literal;
+    let implicit_tool = !state.thinking_done && state.detector.is_some() && native_call;
     // ── Thinking-phase: token-ID based boundary detection ──────────
     if !state.thinking_done && (ctx.state.think_end_token_id == Some(tok) || implicit_tool) {
         // Keep the opener out of a residual reasoning delta's token IDs;
@@ -330,6 +328,10 @@ pub(crate) fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: 
             }
         }
         return deltas;
+    }
+    // A native opener is a call, so even an undeclared name reaches validation.
+    if let Some(det) = state.detector.as_mut().filter(|_| native_call) {
+        det.note_native_opener();
     }
 
     // ── Content phase: full-decode + slice (matches reasoning path) ──

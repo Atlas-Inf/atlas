@@ -20,13 +20,10 @@ fn poolside_holds_headers_until_complete_on_every_model() {
             "Poolside headers must wait for a complete validated call"
         );
     }
-    // Explicitly closing reasoning must not bypass GLM name admission either.
+    // Explicitly closing reasoning keeps an undeclared native call's own name:
+    // it is never mapped onto the request's sole declared tool.
     let (_, deltas) = stream(true, true, true, false);
-    assert!(
-        !deltas
-            .iter()
-            .any(|d| matches!(d, ir::StreamDelta::ToolCallStart { .. }))
-    );
+    assert_eq!(tool_names(&deltas), ["unknown_tool"]);
 }
 
 #[test]
@@ -180,4 +177,94 @@ fn base64_encode(b: &[u8]) -> String {
         }
     }
     out
+}
+
+#[test]
+fn glm_native_call_to_undeclared_tool_reaches_the_client() {
+    // The native opener is a call, not prose. An undeclared name reaches the
+    // client unchanged (never mapped onto a declared tool), whose own
+    // unknown-tool result lets an agent's turn continue.
+    for explicit_close in [true, false] {
+        let (state, deltas) = stream(true, true, explicit_close, false);
+        assert_eq!(
+            tool_names(&deltas),
+            ["unknown_tool"],
+            "explicit={explicit_close}"
+        );
+        assert!(!text_of(&deltas).contains("<tool_call>"), "{deltas:?}");
+        assert!(!state.stop_string_triggered);
+        let blocking = blocking_choice(tokens(explicit_close, false));
+        assert_eq!(blocking.tool_calls.len(), 1, "{blocking:?}");
+        assert_eq!(blocking.tool_calls[0].name, "unknown_tool");
+        assert_eq!(blocking.tool_calls[0].arguments["city"], "Oslo");
+        assert_eq!(blocking.finish_reason, ir::FinishReason::ToolCalls);
+    }
+    assert_eq!(
+        finish_reason(tokens(true, false), request()),
+        ir::FinishReason::ToolCalls
+    );
+    // The same envelope spelled without the native opener stays prose.
+    let mut spelled = vec![1, END, 30, 25, 26];
+    spelled.extend_from_slice(&tokens(true, false)[3..]);
+    let (state, deltas) = stream_tokens(true, true, spelled.clone());
+    assert_eq!(
+        text_of(&deltas),
+        "<tool_call>unknown_tool<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>"
+    );
+    assert!(tool_names(&deltas).is_empty());
+    assert!(!state.stop_string_triggered);
+    assert!(blocking_choice(spelled).tool_calls.is_empty());
+}
+
+/// The wire finish reason after a stream ends on its scheduler "stop".
+fn finish_reason(tokens: Vec<u32>, request: ir::ChatRequest) -> ir::FinishReason {
+    let len = tokens.len();
+    let (ctx, mut state, _) = stream_for_request(app(true), true, tokens, request);
+    let done = crate::api::chat_stream::handle_done::handle_done(
+        &mut state,
+        &ctx,
+        "stop".into(),
+        len,
+        1.0,
+        1.0,
+        0,
+        0,
+        0,
+    );
+    done.into_iter()
+        .find_map(|d| match d {
+            ir::StreamDelta::Finish { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .expect("a finish delta")
+}
+
+fn blocking_choice(tokens: Vec<u32>) -> ir::Choice {
+    let (state, req) = (app(true), request());
+    let response = response(tokens);
+    let (reasoning, content) =
+        crate::api::chat_blocking::decode_response_text(&state, &response, true, true, false);
+    crate::api::chat_blocking_choice::build_choice_message(
+        &state, &req, &response, reasoning, content, true, None, 0,
+    )
+}
+
+fn tool_names(deltas: &[ir::StreamDelta]) -> Vec<&str> {
+    deltas
+        .iter()
+        .filter_map(|d| match d {
+            ir::StreamDelta::ToolCallStart { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn text_of(deltas: &[ir::StreamDelta]) -> String {
+    deltas
+        .iter()
+        .filter_map(|d| match d {
+            ir::StreamDelta::Content { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
