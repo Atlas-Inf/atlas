@@ -30,11 +30,11 @@ on:
         default: main
         type: string
       job:
-        description: "probe = runner environment only; build = probe + native strix-hip build; bench = build + run a scripts/devlab/*.sh script on the GPU"
+        description: "probe = runner environment only; build = probe + native strix-hip build; bench = build + run a scripts/devlab/*.sh script on the GPU; validate = build + unit slice + smoke; eval = model serve gates on a home-runner box"
         required: true
         default: probe
         type: choice
-        options: [probe, build, bench]
+        options: [probe, build, bench, validate, eval]
       script:
         description: "bench only: script under scripts/devlab/ (e.g. scripts/devlab/ab_prefill.sh)"
         required: false
@@ -44,6 +44,16 @@ on:
         description: "bench only: arguments for the script (space-separated; no shell metacharacters)"
         required: false
         default: ""
+        type: string
+      model:
+        description: "eval only: model id to serve"
+        required: false
+        default: "nvidia/Qwen3.8-27B-NVFP4"
+        type: string
+      legs:
+        description: "eval only: space-separated gate legs (subtest identity nemotron st995 perf)"
+        required: false
+        default: "identity nemotron"
         type: string
 
 permissions:
@@ -76,6 +86,7 @@ jobs:
   strix-linux:
     name: Strix Halo Linux (${{ inputs.job }})
     needs: authorize
+    if: inputs.job != 'eval'
     runs-on: [self-hosted, Linux, devlab-dispatch, strix-halo]
     timeout-minutes: 360
     steps:
@@ -110,7 +121,7 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Rust toolchain (cached under the tool cache)
-        if: inputs.job == 'build' || inputs.job == 'bench'
+        if: inputs.job == 'build' || inputs.job == 'bench' || inputs.job == 'validate'
         shell: bash
         run: |
           set -euo pipefail
@@ -126,7 +137,7 @@ jobs:
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Native strix-hip build (all models)
-        if: inputs.job == 'build' || inputs.job == 'bench'
+        if: inputs.job == 'build' || inputs.job == 'bench' || inputs.job == 'validate'
         shell: bash
         run: |
           set -euo pipefail
@@ -134,6 +145,15 @@ jobs:
           start=$(date +%s)
           ./build-amd.sh
           echo "build: $(( $(date +%s) - start ))s, binary $(sha256sum target/release/spark | cut -c1-16)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate (unit slice + smoke)
+        if: inputs.job == 'validate'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/spark --version | tee -a "$GITHUB_STEP_SUMMARY"
+          ATLAS_SKIP_BUILD=1 cargo test -p atlas-kernels --lib 2>&1 | tail -5 | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "validate: PASS" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # bench: run one script from scripts/devlab/ against the build above, on the runner's gfx1151.
       # Inputs reach the shell only through env (never interpolated into the script text), the path is
@@ -162,3 +182,32 @@ jobs:
           name: devlab-bench-${{ github.run_id }}
           path: ${{ runner.temp }}/devlab-out
           if-no-files-found: warn
+
+  eval:
+    name: Home-box eval gates (${{ inputs.model }})
+    needs: authorize
+    if: inputs.job == 'eval'
+    runs-on: [self-hosted, atlas-home]
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Submit model gates to the box queue
+        shell: bash
+        env:
+          GATE_REF: ${{ inputs.ref }}
+          GATE_MODEL: ${{ inputs.model }}
+          GATE_LEGS: ${{ inputs.legs }}
+        run: |
+          set -euo pipefail
+          echo "ref=$GATE_REF model=$GATE_MODEL legs=$GATE_LEGS"
+          # Same character policy as the bench args check: letters, digits,
+          # dot/underscore/slash/dash and spaces only.
+          name_re='^[A-Za-z0-9._/ -]+$'
+          [[ "$GATE_MODEL" =~ $name_re ]] || { echo "::error::model contains disallowed characters (got: $GATE_MODEL)"; exit 1; }
+          [[ "$GATE_LEGS"  =~ $name_re ]] || { echo "::error::legs contains disallowed characters (got: $GATE_LEGS)"; exit 1; }
+          # gate.sh on the box must read GATE_MODEL / GATE_LEGS.
+          GATE_MODEL="$GATE_MODEL" GATE_LEGS="$GATE_LEGS" ~/jobqueue/bin/qctl sub ci-eval-$GITHUB_RUN_ID --file ~/jobqueue/staged/gate.sh || { echo "no qctl gate.sh on this box"; exit 1; }
+          echo "queued: leg scripts drive the box serially; verdicts land in ~/ovn-out" | tee -a "$GITHUB_STEP_SUMMARY"
