@@ -310,6 +310,20 @@ int rs_poll(struct rs_conn *c, uint64_t *out_wr_id) {
     }
 }
 
+// Non-blocking `rs_poll`: the number of completions reaped (0 or 1), with the
+// work request's id and `ibv_wc_status` in *out_wr_id / *out_status, or -1 on
+// a poll error. Lets one thread keep several QPs' writes in flight and reap
+// them as they complete.
+int rs_try_poll(struct rs_conn *c, uint64_t *out_wr_id, int *out_status) {
+    struct ibv_wc wc;
+    int n = ibv_poll_cq(c->cq, 1, &wc);
+    if (n == 1) {
+        *out_wr_id = wc.wr_id;
+        *out_status = (int)wc.status;
+    }
+    return n < 0 ? -1 : n;
+}
+
 void rs_destroy(struct rs_conn *c) {
     if (!c) {
         return;

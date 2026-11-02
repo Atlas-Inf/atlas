@@ -33,8 +33,7 @@
 //! here. `ATLAS_GLM_CMD_RDMA=1` adds the host command ring ([`cmd_ring`]),
 //! last in the region. The proxy serves every channel from one loop.
 
-use anyhow::{Context, Result, ensure};
-use atlas_rdma::{Gid, Verbs};
+use anyhow::{Result, ensure};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -43,14 +42,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub(super) mod bootstrap;
+pub(super) mod chain;
 pub(super) mod cmd_ring;
 mod gid;
 mod oneshot;
 mod pin;
 mod proxy;
+mod rails;
+mod topology;
 use cmd_ring::CmdRing;
-use oneshot::OneShot;
+pub(super) use oneshot::OneShot;
 use proxy::{CmdLink, proxy_loop};
+use rails::{Rails, connect_rails, pinned, rail_names};
 
 unsafe extern "C" {
     fn cuMemHostAlloc(pp: *mut *mut c_void, bytesize: usize, flags: u32) -> i32;
@@ -87,11 +90,6 @@ const READY: usize = 0;
 const ARRIVED: usize = 64;
 const FLAG_SRC: usize = 128;
 const FLAG_PAGE: usize = 4096;
-
-/// Bootstrap identity: the region base, then per rail QPN, PSN, GID and
-/// region rkey.
-const BASE_WIRE: usize = 8;
-const RAIL_WIRE: usize = 4 + 4 + 16 + 4;
 
 struct Job {
     seq: u64,
@@ -154,9 +152,9 @@ fn cu(status: i32, what: &str) -> Result<()> {
 }
 
 impl RdmaPair {
-    /// Whether `ATLAS_RDMA_ALLREDUCE=1`.
+    /// Whether `ATLAS_RDMA_ALLREDUCE=1` ([`crate::rdma_requested`]).
     pub(super) fn requested() -> bool {
-        std::env::var("ATLAS_RDMA_ALLREDUCE").as_deref() == Ok("1")
+        crate::rdma_requested()
     }
 
     /// Bring up one RC QP per rail (`ATLAS_RDMA_RAILS`, else the NCCL HCA
@@ -181,38 +179,14 @@ impl RdmaPair {
         let os_cfg = oneshot::Config::from_env();
         let os_base = region_bytes(capacity);
         let cmd_on = cmd_ring::requested();
-        let cmd_base = os_base + os_cfg.map_or(0, |c| oneshot::region_bytes(c.max));
+        let cmd_base = os_base + os_cfg.map_or(0, |c| oneshot::region_bytes(c.max, 1));
         let bytes = cmd_base + if cmd_on { cmd_ring::REGION_BYTES } else { 0 };
-        let mut host: *mut c_void = std::ptr::null_mut();
-        cu(
-            unsafe { cuMemHostAlloc(&mut host, bytes, CU_MEMHOSTALLOC_PORTABLE_DEVICEMAP) },
-            "cuMemHostAlloc(RDMA pair)",
-        )?;
-        unsafe { std::ptr::write_bytes(host as *mut u8, 0, bytes) };
-        let mut dev = 0u64;
-        cu(
-            unsafe { cuMemHostGetDevicePointer_v2(&mut dev, host, 0) },
-            "cuMemHostGetDevicePointer(RDMA pair)",
-        )?;
-
-        let psn = (0x5a5a00 + rank as u32 * 0x1111) & 0xff_ffff;
-        let mut verbs = Vec::with_capacity(rails.len());
-        let mut local = (host as u64).to_le_bytes().to_vec();
-        let mut lkeys = Vec::with_capacity(rails.len());
-        for name in &rails {
-            let gid_idx = gid_override.map_or_else(|| gid::pick(name, link.own_v4(rank)), Ok)?;
-            let mut v = Verbs::create(name, gid_idx, psn)
-                .with_context(|| format!("RDMA pair rail {name} (gid index {gid_idx})"))?;
-            // SAFETY: the region outlives the Verbs (freed in Drop after the
-            // proxy, which owns the Verbs, has joined).
-            let keys = unsafe { v.reg_mr_rw(host, bytes) }?;
-            local.extend_from_slice(&v.qpn().to_le_bytes());
-            local.extend_from_slice(&v.psn().to_le_bytes());
-            local.extend_from_slice(&v.gid());
-            local.extend_from_slice(&keys.rkey.to_le_bytes());
-            lkeys.push(keys.lkey);
-            verbs.push(v);
-        }
+        let (host, dev) = pinned(bytes, "RDMA pair")?;
+        let Rails {
+            mut verbs,
+            lkeys,
+            ident: local,
+        } = Rails::open(&rails, gid_override, link.own_v4(rank), rank, host, bytes)?;
 
         let head = bootstrap::Head {
             rank,
@@ -224,18 +198,7 @@ impl RdmaPair {
             cmd: cmd_ring::wire(cmd_on),
         };
         let (mut stream, remote) = bootstrap::open(&head, &local, link)?;
-        let peer_base = u64::from_le_bytes(remote[..BASE_WIRE].try_into()?);
-        let mut peer_rkeys = Vec::with_capacity(rails.len());
-        for (v, w) in verbs
-            .iter_mut()
-            .zip(remote[BASE_WIRE..].chunks_exact(RAIL_WIRE))
-        {
-            let qpn = u32::from_le_bytes(w[0..4].try_into()?);
-            let rpsn = u32::from_le_bytes(w[4..8].try_into()?);
-            let gid: Gid = w[8..24].try_into()?;
-            peer_rkeys.push(u32::from_le_bytes(w[24..28].try_into()?));
-            v.connect(qpn, rpsn, &gid)?;
-        }
+        let (peer_base, peer_rkeys) = connect_rails(&mut verbs, &remote)?;
         // Barrier: both ends are RTS before either posts a WRITE.
         stream.write_all(&[1]).map_err(bootstrap::io("barrier"))?;
         stream
@@ -246,7 +209,7 @@ impl RdmaPair {
             .map(|c| {
                 OneShot::new(
                     c,
-                    rails.len(),
+                    oneshot::Shape::pair(rank, rails.len()),
                     host as usize + os_base,
                     dev + os_base as u64,
                 )
@@ -417,32 +380,12 @@ struct Peer {
     rkeys: Vec<u32>,
 }
 
-/// Rail device names: `ATLAS_RDMA_RAILS`, else `NCCL_IB_HCA` without NCCL's
-/// `^`/`=` match prefixes and `:port` suffixes, else the first GB10 port.
-fn rail_names(rails: Option<String>, nccl: Option<String>) -> Vec<String> {
-    let list = rails.or(nccl).unwrap_or_else(|| "rocep1s0f0".into());
-    list.trim_start_matches(['^', '='])
-        .split(',')
-        .filter_map(|s| s.split(':').next())
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
 #[cfg(test)]
 mod cmd_ring_nic_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rails_prefer_explicit_then_nccl_list() {
-        let own = |v: &str| Some(v.to_owned());
-        assert_eq!(rail_names(own("a,b"), own("c")), ["a", "b"]);
-        assert_eq!(rail_names(None, own("=c:1,d:1")), ["c", "d"]);
-        assert_eq!(rail_names(None, None), ["rocep1s0f0"]);
-    }
 
     #[test]
     fn large_staged_payloads_split_into_aligned_segments() {
