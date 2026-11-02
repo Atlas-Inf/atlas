@@ -14,10 +14,10 @@ pub(crate) use glm::{
     GlmCapacity, GlmVisionBlockWeights, GlmVisionEncoder, GlmVisionMergerWeights, GlmVisionWeights,
 };
 
-/// A GLM-5 world past the pair: its tower holds the processor's budgets and
-/// its workers no vision weights. A pair keeps its bounded tower.
+/// A multi-rank GLM-5 world: its tower holds the processor's budgets and its
+/// workers no vision weights. A single rank keeps its bounded tower.
 fn glm_budget_tower(config: &atlas_core::config::ModelConfig) -> bool {
-    config.tp_world_size.max(config.ep_world_size) > 2
+    config.tp_world_size.max(config.ep_world_size) > 1
 }
 
 /// Whether this rank only receives encoded vision rows: a worker of a GLM-5
@@ -215,7 +215,7 @@ mod receive_only_tests {
     }
 
     #[test]
-    fn only_a_glm_worker_past_the_pair_skips_the_vision_weights() {
+    fn only_a_glm_worker_skips_the_vision_weights() {
         let mut c = ModelConfig::qwen3_next_80b_nvfp4();
         (c.tp_world_size, c.ep_world_size) = (4, 4);
         c.tp_rank = 1;
@@ -229,7 +229,9 @@ mod receive_only_tests {
         c.ep_rank = 1;
         assert!(vision_receive_only(&c), "an orthogonal-mesh worker");
         (c.tp_world_size, c.ep_world_size) = (2, 2);
-        assert!(!vision_receive_only(&c), "a pair keeps its tower");
+        assert!(vision_receive_only(&c), "a pair worker only receives too");
+        (c.tp_world_size, c.ep_world_size) = (1, 1);
+        assert!(!vision_receive_only(&c), "a single rank keeps its tower");
         (c.tp_world_size, c.ep_world_size) = (4, 4);
         c.vision.as_mut().unwrap().is_glm5_next = false;
         assert!(!vision_receive_only(&c), "other towers keep their weights");
