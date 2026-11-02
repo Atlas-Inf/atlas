@@ -202,12 +202,11 @@ pub(super) fn load_kda_weights(
     let dt_bias = dt_bias_full
         .replaced(dt_bias, dt_len * 4, gpu)?
         .into_dense();
-    // ATLAS_GLM_SP_KDA_QUANT_GATHER: beta is per head, so the gather moves
-    // every head's beta of each rank's rows: an owned copy of the whole
-    // b_proj, taken before the shard's load releases the checkpoint bytes.
-    let b_proj_full = if dims.tp_size == 4
-        && std::env::var("ATLAS_GLM_SP_KDA_QUANT_GATHER").as_deref() == Ok("1")
-    {
+    // The four-rank KDA quant gather (`glm5_kda::sp_quant_gather`): beta is
+    // per head, so the gather moves every head's beta of each rank's rows: an
+    // owned copy of the whole b_proj, taken before the shard's load releases
+    // the checkpoint bytes.
+    let b_proj_full = if dims.tp_size == 4 {
         let whole = load("b_proj")?;
         let bytes = dims.full_nk * dims.h * 2;
         let copy = gpu.alloc(bytes)?;

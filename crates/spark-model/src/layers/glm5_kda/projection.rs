@@ -66,7 +66,7 @@ pub struct Glm5KdaWeights {
     /// (`ATLAS_GLM_SP_KDA_OPROJ_A2A`, `sp_oproj_a2a.rs`).
     pub o_proj_full: Option<ops::MxW8a8>,
     /// The whole b_proj (every rank's heads), for the quantized gather's
-    /// beta of this rank's rows (`ATLAS_GLM_SP_KDA_QUANT_GATHER`,
+    /// beta of this rank's rows (the four-rank chain,
     /// `sp_quant_gather.rs`).
     pub b_proj_full: Option<DenseWeight>,
 }

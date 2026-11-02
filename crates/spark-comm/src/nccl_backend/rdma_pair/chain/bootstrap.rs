@@ -47,13 +47,10 @@ const FIELDS: [(&str, &str); 8] = [
         "check ATLAS_RDMA_ONESHOT_SM_STAGE on every node",
     ),
     ("command ring", "check ATLAS_GLM_CMD_RDMA on every node"),
-    (
-        "all-reduce split",
-        "check ATLAS_RDMA_CHAIN_AR_SPLIT_MIN on every node",
-    ),
+    ("all-reduce split", "run the same build on every node"),
     (
         "fused reduce-scatter segment",
-        "check ATLAS_RDMA_RS_FUSED_SEG on every node",
+        "run the same build on every node",
     ),
     ("topology", "check ATLAS_RDMA_TOPOLOGY on every node"),
 ];

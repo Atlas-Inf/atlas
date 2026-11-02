@@ -314,7 +314,8 @@ glm_sparse_mla_prefill_fp8g128_head16_tc_pipe(GLM_KV_PAD_ARGS) {
                       head_dim, index_width, cache_block_size, inv_sqrt_d);
 }
 
-// ATLAS_GLM_SPARSE_PIPE_WG2 (TP4's 16 local heads, opt-in, not bit-exact):
+// The wg2 pipe (TP4's 16 local heads, not bit-exact, so not served; the
+// glm_sparse_heads_check example measures it against the served pipe):
 // two warpgroups of glm_pipe_body<16> in one 512-thread CTA, each over half
 // of the token's key tiles with its own K tile, running max, row sum and
 // accumulators, merged at the end as flash-decoding merges splits. The pipe
@@ -333,7 +334,7 @@ glm_sparse_mla_prefill_fp8g128_head16_tc_pipe(GLM_KV_PAD_ARGS) {
 #define GLM_WG2_L        (GLM_WG2_SUM + 16 * 16 * 4)
 #define GLM_WG2_WG_BYTES (GLM_WG2_L + 16 * 4)
 #define GLM_WG2_SMEM     (GLM_WG2_OFF_WG + 2 * GLM_WG2_WG_BYTES)
-static_assert(GLM_WG2_SMEM == 96768, "kernel_spec (glm_sparse_prefill_tc.rs) launches the wg2 pipe with 96768 bytes");
+static_assert(GLM_WG2_SMEM == 96768, "glm_sparse_heads_check launches the wg2 pipe with 96768 bytes");
 
 __device__ __forceinline__ void glm_wg2_bar(unsigned int wg) {
     asm volatile("bar.sync %0, 256;" :: "r"(wg + 1) : "memory");

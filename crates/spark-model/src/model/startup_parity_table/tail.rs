@@ -5,7 +5,6 @@ use anyhow::Result;
 use super::while_on;
 use crate::layers::dflash_head::ConvTwinKind;
 use crate::layers::{self, ops};
-use crate::model::trait_impl::prefill_b::pc_policy as pc;
 use crate::model::{graph_flags, qwen4exp_batch_fast, qwen4exp_exact_verify, qwen4exp_mtp_depth};
 
 /// The table's trailing entries, split for the 500-LoC cap. The caller
@@ -14,9 +13,6 @@ use crate::model::{graph_flags, qwen4exp_batch_fast, qwen4exp_exact_verify, qwen
 pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_GLM_STRICT_NATIVE_MTP", || {
         Ok(crate::weight_loader::glm5_mode::strict_native_mtp() as u64)
-    }),
-    ("ATLAS_TAIL_SPLIT_MIN_TOKENS", || {
-        Ok(pc::tail_split_min_tokens() as u64)
     }),
     ("ATLAS_GLM_SERVING_MODE", || {
         use crate::weight_loader::glm5_mode::{ServingMode, selected};
@@ -52,11 +48,6 @@ pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
     // partial sums round alike.
     ("ATLAS_GLM_MOE_DOWN_E4M3", || {
         Ok(layers::moe::down_e4m3_requested() as u64)
-    }),
-    // The 16-head sparse prefill's key-tile split, so every rank's heads sum
-    // in one order.
-    ("ATLAS_GLM_SPARSE_PIPE_WG2", || {
-        Ok(ops::glm_sparse_pipe_wg2_requested("glm5_next")? as u64)
     }),
     // The routed experts' activation scales and the non-prompt rows' A16
     // lane: the rows both ranks reduce.

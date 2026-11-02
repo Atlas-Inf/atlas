@@ -26,7 +26,7 @@ impl TransformerModel {
             let ffn_us = crate::layers::qwen3_attention::take_ffn_host_us();
             let ph = crate::layers::qwen3_attention::take_attn_phase_us();
             // Exact-tile expert-offset reads: host time spent waiting for the
-            // device inside the loop (`ATLAS_MOE_PREFILL_ROW_BOUND`).
+            // device inside the loop (`moe::prefill_offset_read`).
             let (moe_wait_us, moe_reads) = crate::layers::moe::take_offset_read_wait();
             // loop_wall is the host's own elapsed time across the whole layer
             // dispatch. `in_prefill` is time inside layer.prefill() itself,

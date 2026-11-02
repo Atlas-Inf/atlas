@@ -213,13 +213,6 @@ pub(in crate::model) fn tail_split_disabled() -> bool {
     std::env::var("ATLAS_NO_TAIL_SPLIT").as_deref() == Ok("1")
 }
 
-#[path = "pc_tail_split.rs"]
-mod tail_split;
-#[cfg(test)]
-pub(super) use tail_split::parse_tail_split_min_tokens;
-pub(super) use tail_split::tail_split_at;
-pub(in crate::model) use tail_split::tail_split_min_tokens;
-
 /// `ATLAS_QWEN4EXP_PREFILL_ROWINV=1`: the last chunk runs unsplit, since
 /// a block-grid cut is off the GDN grid. Without the in-pass checkpoint
 /// (`_MIDCHUNK_CKPT`, `in_pass`) no tail checkpoint is saved at all, so

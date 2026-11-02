@@ -92,7 +92,7 @@ impl FfnComponent {
 
     /// Whether the SP prefill FFN over `sp` reads only this rank's rows of
     /// its normed input, gathering what it needs of the others itself
-    /// (`ATLAS_GLM_SP_MOE_QUANT_GATHER`): the seam before it then gathers no
+    /// (`moe::sp_quant_gather`): the seam before it then gathers no
     /// BF16 rows.
     pub fn sp_gathers_own_input(&self, sp: glm_sp::SpRows, ctx: &ForwardContext) -> bool {
         matches!(self, Self::Moe(m) if m.sp_quant_gather(sp, ctx))
@@ -100,20 +100,14 @@ impl FfnComponent {
 
     /// The routed MoE's quantized input as a seam's per-block gather
     /// (`qwen3_attention::SeamGather`): its staged rows `(ptr, width)`, when
-    /// [`Self::sp_gathers_own_input`] and `ATLAS_GLM_SP_MOE_GATHER_BLOCKS` is
-    /// not `0`.
+    /// [`Self::sp_gathers_own_input`].
     pub fn sp_route_staging(
         &self,
         sp: glm_sp::SpRows,
         ctx: &ForwardContext,
     ) -> Result<Option<(DevicePtr, usize)>> {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let on = *ON
-            .get_or_init(|| std::env::var("ATLAS_GLM_SP_MOE_GATHER_BLOCKS").as_deref() != Ok("0"));
         match self {
-            Self::Moe(m) if on && m.sp_quant_gather(sp, ctx) => {
-                m.sp_route_staging(sp, ctx).map(Some)
-            }
+            Self::Moe(m) if m.sp_quant_gather(sp, ctx) => m.sp_route_staging(sp, ctx).map(Some),
             _ => Ok(None),
         }
     }
@@ -180,17 +174,10 @@ impl FfnComponent {
     }
 }
 
-/// Seam blocks one per-block gather of the MoE's quantized input covers
-/// (`ATLAS_GLM_SP_MOE_GATHER_GROUP`, default 2): pf10.sqlite measured four
-/// one-block gathers at ~0.65 ms each against ~0.55 ms of mHC a block, so a
-/// gather a block queued behind the last and ran ~1 ms past the seam.
-pub(crate) fn ffn_glm_gather_group() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("ATLAS_GLM_SP_MOE_GATHER_GROUP")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n: &usize| n > 0)
-            .unwrap_or(2)
-    })
-}
+/// Seam blocks one per-block gather of a quantized seam input covers (the
+/// four-rank chain's MoE, KDA and MLA quant gathers; the pair has none): one,
+/// the four-rank profile's. pf10.sqlite measured four one-block gathers at
+/// ~0.65 ms each against ~0.55 ms of mHC a block, so a gather a block queued
+/// behind the last and ran ~1 ms past the seam; the quantized gathers since
+/// move far fewer bytes.
+pub(crate) const SEAM_GATHER_GROUP: usize = 1;

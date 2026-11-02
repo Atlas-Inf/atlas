@@ -243,7 +243,7 @@ extern "C" __global__ void moe_batched_blend(
 // token_to_perm always describe the same permutation. Consumers must address
 // rows only through sorted_token_ids / token_to_perm and treat each row on its
 // own; a bytewise comparison or hash of a route-major buffer is not meaningful.
-// Dead verify rows (ATLAS_DFLASH_DEAD_ROWS): every route of a row whose
+// Dead verify rows (the TP4 chain's owner verify): every route of a row whose
 // `row_live` word is 0 becomes expert `num_experts`, past every expert. The
 // sorts (moe_sort_by_expert, moe_sort_by_expert_scan) place those routes after
 // expert_offsets[num_experts], so no routed GEMM reads them and no weight is

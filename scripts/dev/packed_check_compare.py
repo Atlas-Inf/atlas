@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Compare `ATLAS_GLM_PACKED_PREFILL_CHECK=1` lines between serve logs.
+"""Compare `PACKED_CHECK` lines (under `ATLAS_GLM_DET_TRACE`) between serve logs.
 
 With the packed prefill on (`ATLAS_GLM_PACKED_PREFILL=1`), every packed pass
 logs one line per prompt and rank
@@ -51,7 +51,7 @@ def main(argv):
         return 2
     seen = read(argv[1:])
     if not seen:
-        print("no PACKED_CHECK lines (ATLAS_GLM_PACKED_PREFILL_CHECK=1 unset?)")
+        print("no PACKED_CHECK lines (ATLAS_GLM_DET_TRACE unset?)")
         return 2
     compared = differing = 0
     for (rank, prompt, tokens), runs in sorted(seen.items()):

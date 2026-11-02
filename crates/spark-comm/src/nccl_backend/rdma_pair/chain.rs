@@ -82,17 +82,9 @@ fn chunks(bytes: usize, max: usize, unit: usize) -> impl Iterator<Item = (usize,
 }
 
 /// All-reduces of at least this many bytes run as a reduce-scatter and an
-/// all-gather on four ranks (`ATLAS_RDMA_CHAIN_AR_SPLIT_MIN`, default 4 MiB;
-/// 0 keeps every all-reduce a flood). Every rank must read the same value.
-fn ar_split_min() -> usize {
-    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MIN.get_or_init(|| {
-        std::env::var("ATLAS_RDMA_CHAIN_AR_SPLIT_MIN")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .map_or(4 << 20, |v: usize| if v == 0 { usize::MAX } else { v })
-    })
-}
+/// all-gather on four ranks. Every rank must use the same value (the chain
+/// head carries it).
+const AR_SPLIT_MIN: usize = 4 << 20;
 
 /// The rail lists of `rank`'s links, below and above (empty where there is
 /// no rank), from `var`. Each is required where the link exists.
@@ -205,7 +197,7 @@ impl RdmaChain {
                 w
             },
             cmd: cmd_ring::wire(cmd_on),
-            ar_split: ar_split_min() as u64,
+            ar_split: AR_SPLIT_MIN as u64,
             rs_fused: fused_cap as u64,
             topology,
         };

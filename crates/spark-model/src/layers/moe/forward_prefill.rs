@@ -316,7 +316,7 @@ impl MoeLayer {
         let row = h as usize * 2;
         det.tap("moe_in", input, (0, num_tokens), row);
         // 1-3. Router GEMM, top-k, sort by expert (route_fuse.rs), or under
-        // ATLAS_GLM_SP_MOE_QUANT_GATHER this rank's rows routed and quantized,
+        // the four-rank chain's quant gather, this rank's rows routed and quantized,
         // then gathered (sp_quant_gather.rs).
         let quant_gather = crate::layers::glm_sp::current()
             .filter(|&sp| num_tokens == sp.total() && self.sp_quant_gather(sp, ctx));

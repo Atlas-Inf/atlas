@@ -3,17 +3,6 @@
 use super::*;
 
 #[test]
-fn max_tokens_defaults_to_512_and_stays_below_flash_kda() {
-    assert_eq!(parse_max_tokens(None), 512);
-    assert_eq!(parse_max_tokens(Some("256")), 256);
-    assert_eq!(parse_max_tokens(Some(" 1024 ")), 1024);
-    assert_eq!(parse_max_tokens(Some("x")), 512);
-    assert_eq!(parse_max_tokens(Some("0")), 2);
-    assert_eq!(parse_max_tokens(Some("4096")), MAX_TOKENS_CAP);
-    const { assert!(MAX_TOKENS_CAP < 2048) };
-}
-
-#[test]
 fn prompts_sit_back_to_back() {
     assert_eq!(row_offsets(&[50]), vec![0]);
     assert_eq!(row_offsets(&[50, 7, 3, 512]), vec![0, 50, 57, 60]);

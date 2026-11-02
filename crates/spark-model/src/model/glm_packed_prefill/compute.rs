@@ -12,14 +12,8 @@ use crate::layer::glm_packed::GlmPackedOwner;
 use crate::layer::{AttnMetadataDev, ForwardContext, LayerState};
 use crate::traits::{Model, SequenceState};
 
-/// `ATLAS_GLM_PACKED_PREFILL_CHECK=1`: per-prompt hash lines.
-fn check_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ATLAS_GLM_PACKED_PREFILL_CHECK").as_deref() == Ok("1"))
-}
-
 impl TransformerModel {
-    /// `ATLAS_GLM_PACKED_PREFILL_CHECK`: the exact bytes at `ptr`, hashed
+    /// `PACKED_CHECK` (under `ATLAS_GLM_DET_TRACE`): the exact bytes at `ptr`, hashed
     /// (synchronizes `stream`).
     fn packed_check_hash(&self, ptr: DevicePtr, bytes: usize, stream: u64) -> Result<u64> {
         crate::det_trace::device_hash(self.gpu.as_ref(), stream, ptr, bytes, 32 << 20)
@@ -208,7 +202,9 @@ impl TransformerModel {
         };
 
         // ── Layers ──
-        let check = check_enabled();
+        // The determinism tracer also proves the packing exact: one hash line
+        // per prompt (`PACKED_CHECK`).
+        let check = crate::det_trace::on();
         let mut layer_hash = vec![0u64; seqs.len()];
         let hc_row =
             self.config.hc_mult * h * crate::layers::ops::hc_elem_bytes(&self.config.model_type);

@@ -4,47 +4,11 @@
 //! two-rank restore-depth agreement.
 
 use super::{
-    Agreed, agree_restore, branch_checkpoint_at, branch_split_at, layer_write_floor,
-    parse_tail_split_min_tokens, replay_floor, rowinv_tail_unsplit_with, tail_cut, tail_split_at,
+    Agreed, agree_restore, branch_checkpoint_at, branch_split_at, layer_write_floor, replay_floor,
+    rowinv_tail_unsplit_with, tail_cut,
 };
 
 const BS: usize = 16;
-
-/// `ATLAS_TAIL_SPLIT_MIN_TOKENS`: unset or 0 splits exactly as before; a
-/// prompt under the minimum runs one pass; at or above it, and on a warm or
-/// multi-chunk last chunk of such a prompt, the split is unchanged.
-#[test]
-fn tail_split_min_tokens_keeps_short_prompts_to_one_pass() {
-    assert_eq!(parse_tail_split_min_tokens(None), 0);
-    assert_eq!(parse_tail_split_min_tokens(Some("512")), 512);
-    assert_eq!(parse_tail_split_min_tokens(Some(" 256 ")), 256);
-    assert_eq!(parse_tail_split_min_tokens(Some("x")), 0);
-    let split = |total: usize, start: usize, disabled, min| {
-        tail_split_at(total, start, tail_cut(total, BS), disabled, min)
-    };
-    // Default: every prompt past 32 tokens splits (cold, start 0).
-    for n in [27, 32, 33, 80, 150, 511, 512, 40_000] {
-        assert_eq!(split(n, 0, false, 0), n > 32, "n={n}");
-    }
-    // With a 512-token minimum the mixed8 prompts run one pass ...
-    for n in [60, 80, 150, 511] {
-        assert!(!split(n, 0, false, 512), "n={n}");
-    }
-    // ... and longer ones split exactly as before, cold or warm.
-    for (n, start) in [(512, 0), (2_000, 0), (40_000, 32_768), (40_000, 39_952)] {
-        assert_eq!(
-            split(n, start, false, 512),
-            split(n, start, false, 0),
-            "n={n}"
-        );
-        assert!(split(n, start, false, 512), "n={n} start={start}");
-    }
-    // ATLAS_NO_TAIL_SPLIT still wins.
-    assert!(!split(40_000, 0, true, 0));
-    assert!(!split(40_000, 0, true, 512));
-    // Restored at or past the cut: nothing to split, whatever the minimum.
-    assert!(!split(40_000, tail_cut(40_000, BS), false, 0));
-}
 
 /// The warm-turn tail checkpoint sits one block below the last block
 /// boundary strictly under the prompt end: for a prompt of `n` tokens,
@@ -283,19 +247,4 @@ fn rowinv_tail_unsplit_warn_guard_is_shared() {
     assert!(rowinv_tail_unsplit_with(true, true, &guard, bump));
     assert!(rowinv_tail_unsplit_with(true, false, &guard, bump));
     assert_eq!(fired.get(), 1);
-}
-
-#[test]
-fn tail_split_min_tokens_keeps_a_short_prompt_to_one_pass() {
-    assert_eq!(parse_tail_split_min_tokens(None), 0);
-    assert_eq!(parse_tail_split_min_tokens(Some(" 512 ")), 512);
-    assert_eq!(parse_tail_split_min_tokens(Some("x")), 0);
-    // Unset: exactly the old rule.
-    assert!(tail_split_at(100, 0, 64, false, 0));
-    assert!(!tail_split_at(100, 64, 64, false, 0));
-    assert!(!tail_split_at(100, 0, 100, false, 0));
-    assert!(!tail_split_at(100, 0, 64, true, 0));
-    // Set: only a prompt of at least that many tokens splits.
-    assert!(!tail_split_at(100, 0, 64, false, 101));
-    assert!(tail_split_at(101, 0, 64, false, 101));
 }

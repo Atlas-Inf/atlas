@@ -56,7 +56,7 @@ thread_local! {
     static ROW_LIVE: std::cell::Cell<(u64, u32)> = const { std::cell::Cell::new((0, 0)) };
 }
 
-/// While held (an owner-batched DFlash verify, `ATLAS_DFLASH_DEAD_ROWS`),
+/// While held (an owner-batched DFlash verify with dead rows, the chain),
 /// a routed FFN over all `rows` rows routes those whose `row_live` word
 /// (device `[rows]` u32) is 0 to no expert: their routed output is 0 and no
 /// expert weight is read for them (`moe_route_mask_rows`). A routed FFN of

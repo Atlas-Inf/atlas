@@ -151,12 +151,12 @@ pub(super) const LONE_TWO_ROWS_MS: f32 = 10.3;
 /// four and eight concurrent streams of mixed code / prose / structured /
 /// counting, 2026-10-18; 1470 verifies). Every (owners, rows) cell with ten
 /// or more verifies lies within 6% of the fit; to 56 rows (five to eight owners of
-/// five to seven, `ATLAS_GLM_LONG_BATCH_MAX_ROWS=64`) within 8%. Past the
-/// chain's verify budget it is infinite.
+/// five to seven, a 64-row budget then) within 8%. Past the verify budget
+/// (`glm_long_owner::ROW_BUDGET`) it is infinite.
 pub(super) fn chain_step_ms(owners: usize, rows: usize) -> f32 {
     const BASE: [f32; 8] = [19.0, 30.0, 37.0, 50.0, 56.0, 62.8, 66.8, 68.0];
     let owners = owners.clamp(1, 8);
-    if owners * rows > spark_model::layer::glm_long_owner::chain_row_budget() {
+    if owners * rows > spark_model::layer::glm_long_owner::ROW_BUDGET {
         return f32::INFINITY;
     }
     let lone_two = if owners == 1 && rows <= 2 {
@@ -170,7 +170,7 @@ pub(super) fn chain_step_ms(owners: usize, rows: usize) -> f32 {
 /// [`chain_step_ms`]'s cost per owner-row, by owner count.
 const PER_OWNER_ROW: [f32; 8] = [4.35, 2.7, 2.5, 2.0, 2.1, 2.1, 2.1, 2.0];
 
-/// What a dead row (`ATLAS_DFLASH_DEAD_ROWS`) still costs: a row's work
+/// What a dead row (`glm_long_owner::DEAD_ROW`) still costs: a row's work
 /// besides its routed experts, which a dead row skips. Not yet measured on
 /// the chain; kindling's TP4 step model (`experimental/adaptive-k`,
 /// `VLLM_ADAPTIVE_K_MODEL` 27.0,0.635,0.542) charges 0.54 ms a token besides
@@ -263,20 +263,16 @@ pub(crate) fn choose<'a>(
     enabled().then(|| best(owners.map(|(survival, _)| survival), max))
 }
 
-/// With dead rows (`ATLAS_DFLASH_DEAD_ROWS`, the chain): the batch width
+/// With dead rows (the chain; `glm_long_owner::DEAD_ROW`): the batch width
 /// and each owner's verified drafts (1..=width, in `owners` order), from the
 /// drafter's confidence (`dflash_conf_width::choose_live`). `None` leaves
-/// [`choose`] in place: dead rows off, a pinned width, or unmeasured drafts.
+/// [`choose`] in place: off the chain, a pinned width, or unmeasured drafts.
 pub(crate) fn choose_live<'a>(
     owners: impl ExactSizeIterator<Item = &'a [f32]> + Clone,
     max: usize,
 ) -> Option<(usize, Vec<usize>)> {
     let max = max.min(MAX_DRAFTS);
-    if max == 0
-        || fixed().is_some()
-        || !on_chain()
-        || !spark_model::layer::glm_long_owner::dead_rows_enabled()
-    {
+    if max == 0 || fixed().is_some() || !on_chain() {
         return None;
     }
     super::dflash_conf_width::choose_live(owners, max)

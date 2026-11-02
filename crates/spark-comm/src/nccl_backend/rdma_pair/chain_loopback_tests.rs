@@ -15,15 +15,15 @@
 //!
 //!   ATLAS_ONESHOT_CUBIN_DIR=<cubins> ATLAS_RDMA_ONESHOT=1 ATLAS_RDMA_PAIR_CHAIN=1 \
 //!   ATLAS_RDMA_LEFT_RAILS=rocep1s0f1,roceP2p1s0f1 ATLAS_RDMA_RIGHT_RAILS=rocep1s0f1,roceP2p1s0f1 \
-//!   ATLAS_RDMA_RS_BLOCKS=16 [ATLAS_RDMA_ONESHOT_SM_STAGE=1 ATLAS_RDMA_ONESHOT_PDL=0] \
+//!   [ATLAS_RDMA_ONESHOT_SM_STAGE=1 ATLAS_RDMA_ONESHOT_PDL=0] \
 //!     cargo test -p spark-comm chain_loopback -- --ignored --nocapture
 //!
 //! With SM staging keep PDL off here: four ranks share one GPU, and under
 //! PDL each kernel lets its successor be scheduled before it waits, so a
 //! replayed graph's later kernels can fill the GPU before every rank's
 //! current one is resident (one rank per GPU, as in serving, cannot). For
-//! the same reason the reduce-scatter's grid stays at 16 blocks here
-//! (`ATLAS_RDMA_RS_BLOCKS`): four ranks of 48 would not all be resident.
+//! the same reason the reduce-scatter's grid is 16 blocks under test
+//! (`oneshot::RS_BLOCKS`): four ranks of 48 would not all be resident.
 
 use super::*;
 use crate::nccl_backend::rdma_pair::bootstrap::chain::Rendezvous;

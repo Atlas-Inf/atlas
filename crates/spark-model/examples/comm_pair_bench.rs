@@ -300,7 +300,7 @@ fn run(
             ensure!(comm.reduce_scatter_fp8_async(top, -(part as i64), part, stream)?);
             Ok(())
         };
-        // The fused op (ATLAS_RDMA_RS_FUSED_SEG), its rows staged by the copy
+        // The fused op (the four-rank chain's), its rows staged by the copy
         // producer; an all-reduce between ops (a fused op right after
         // another is refused).
         let copy = g.kernel("rdma_oneshot", "rdma_rs_fused_copy").ok();
@@ -320,7 +320,8 @@ fn run(
         let rs = if comm.supports_reduce_scatter_async(part) {
             let [_, s50, _] = b.latency(iters, a.skew_us, &scatter)?;
             let [_, f50, _] = b.latency(iters, a.skew_us, &scatter8)?;
-            let fused = if copy.is_some() && std::env::var("ATLAS_RDMA_RS_FUSED_SEG").is_ok() {
+            // The chain's fused segment holds 16 MiB a rank.
+            let fused = if copy.is_some() && a.world == 4 && part <= 16 << 20 {
                 let [_, u50, _] = b.latency(iters, a.skew_us, &fused)?;
                 let [_, a50, _] = b.latency(iters, a.skew_us, &small)?;
                 format!(", fused {:.0} us", u50 - a50)

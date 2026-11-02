@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `ATLAS_GLM_SP_MLA_QUANT_GATHER=1`: a four-rank sequence-parallel GLM MLA
-//! layer gathers its attention input already cast for the W8A8 q_a / kv_a.
+//! A four-rank sequence-parallel GLM MLA layer gathers its attention input
+//! already cast for the W8A8 q_a / kv_a (the chain always; the pair gathers
+//! BF16 rows).
 //!
 //! The attention seam all-gathers the BF16 normed rows (8 KiB a row at
 //! hidden 4096). Their readers are q_a and kv_a, whose native FP8 block
@@ -31,11 +32,6 @@ use crate::layer::ForwardContext;
 use crate::layers::glm_sp::SpRows;
 use crate::layers::{glm_sp_overlap, ops};
 use crate::weight_map::FP8_BLOCK;
-
-fn requested() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ATLAS_GLM_SP_MLA_QUANT_GATHER").as_deref() == Ok("1"))
-}
 
 /// The gathered cast rows of a chunk: E4M3 `[total, h]` and f32
 /// `[total, h / 128]` group scales (`ops::Fp8bRows::Cast`).
@@ -160,8 +156,7 @@ impl Qwen3AttentionLayer {
                         .all(|&(_, n)| row_bytes.iter().all(|b| c.supports_gather_async(n * b)))
                 })
         });
-        let on = requested()
-            && ctx.config.model_type == "glm5_next"
+        let on = ctx.config.model_type == "glm5_next"
             && sp.ranks > 2
             && even
             && num_tokens == total
@@ -187,7 +182,7 @@ impl Qwen3AttentionLayer {
         let (act, scale) = super::a2a::fp8_image(ctx, "glm_sp_mla_cast", total, h)?;
         if ctx.gpu.op_cache().once("glm:sp_mla_quant_gather") {
             tracing::info!(
-                "ATLAS_GLM_SP_MLA_QUANT_GATHER: MLA attention input gathered as FP8 block rows + scales ({} rows a part{})",
+                "GLM SP MLA quant gather: MLA attention input gathered as FP8 block rows + scales ({} rows a part{})",
                 sp.rows,
                 match glm_sp_overlap::blocks(sp, ctx) {
                     Some(b) => format!(", {} seam blocks", b.len()),

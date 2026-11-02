@@ -63,13 +63,7 @@ impl Glm5MtpHead {
             .context("native MTP target hidden row size overflows")?;
         let result = (|| -> Result<()> {
             if start > 0 {
-                self.project_eh_rows(
-                    &tokens[..1],
-                    state.target_hidden,
-                    prefill::zero_first_embedding_at(self.zero_first_embed, committed),
-                    stream,
-                    ctx,
-                )?;
+                self.project_eh_rows(&tokens[..1], state.target_hidden, stream, ctx)?;
                 self.write_kv_rows(1, committed, start, state, ctx, stream)?;
             }
             if tokens.len() > 1 {

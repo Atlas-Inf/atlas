@@ -13,8 +13,7 @@
 //!
 //! # What runs
 //!
-//! New prompts of at most `ATLAS_GLM_PACKED_PREFILL_MAX_TOKENS` tokens
-//! (default 512) with no restorable prefix-cache state are laid out back to
+//! New prompts of at most [`MAX_TOKENS`] tokens with no restorable prefix-cache state are laid out back to
 //! back in the arena (`layer::glm_packed`). Each prompt gets exactly the
 //! metadata, block reservation, embedding, DFlash capture and last-row LM
 //! head a cold single-prompt prefill gives it; the layers run their row-local
@@ -28,8 +27,8 @@
 //! packed with others (C4/C8), and every row-count dependent choice inside a
 //! packed pass is made from the prompt's own row count or pinned
 //! (`packed_scope`), so its output does not depend on its company.
-//! `ATLAS_GLM_PACKED_PREFILL_CHECK=1` logs one hash line per prompt to prove
-//! it on hardware (`PACKED_CHECK`).
+//! Under the determinism tracer (`ATLAS_GLM_DET_TRACE`) every packed pass
+//! logs one hash line per prompt to prove it on hardware (`PACKED_CHECK`).
 //!
 //! # EP
 //!
@@ -47,11 +46,12 @@ mod compute;
 
 pub(super) const EP_CMD_GLM_PACKED_PREFILL: u32 = 0xFFFF_FFE8;
 
-/// Largest prompt the packing takes by default.
-pub const DEFAULT_MAX_TOKENS: usize = 512;
+/// Largest prompt the packing takes.
+pub const MAX_TOKENS: usize = 512;
 /// The FlashKDA recurrence starts at 2048 rows and borrows the packed
 /// buffer; a packed prompt stays below it.
 pub const MAX_TOKENS_CAP: usize = 2047;
+const _: () = assert!(MAX_TOKENS <= MAX_TOKENS_CAP && MAX_TOKENS_CAP < 2048);
 /// Most prompts in one packed pass.
 pub const MAX_PROMPTS: usize = 16;
 
@@ -59,24 +59,6 @@ pub const MAX_PROMPTS: usize = 16;
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_GLM_PACKED_PREFILL").as_deref() == Ok("1"))
-}
-
-/// `ATLAS_GLM_PACKED_PREFILL_MAX_TOKENS` (default 512, at most 2047).
-pub fn max_tokens() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        parse_max_tokens(
-            std::env::var("ATLAS_GLM_PACKED_PREFILL_MAX_TOKENS")
-                .ok()
-                .as_deref(),
-        )
-    })
-}
-
-pub(crate) fn parse_max_tokens(raw: Option<&str>) -> usize {
-    raw.and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_MAX_TOKENS)
-        .clamp(2, MAX_TOKENS_CAP)
 }
 
 /// Arena rows of each prompt: back to back from row 0.
@@ -141,7 +123,7 @@ impl TransformerModel {
     /// the ordinary path, which restores it).
     pub(super) fn glm_packed_admits(&self, prompt: &[u32], adapter_id: u64) -> bool {
         self.glm_packed_supported()
-            && (2..=max_tokens()).contains(&prompt.len())
+            && (2..=MAX_TOKENS).contains(&prompt.len())
             && !self.tokens_have_vision_pad(prompt)
             && !self.glm_packed_restorable(prompt, adapter_id)
     }

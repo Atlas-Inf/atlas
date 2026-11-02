@@ -96,22 +96,13 @@ impl TransformerModel {
             // That is the OTHER way to satisfy the invariant — always one pass — and
             // it keeps the single-pass numerics, at the cost of the warm-turn tail
             // checkpoint this split exists to create.
-            // `ATLAS_TAIL_SPLIT_MIN_TOKENS` keeps a short prompt to one pass.
             // ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT: one pass, checkpoint in-pass.
             let in_pass = self.qwen4exp_ckpt_takes_tail();
             // ATLAS_QWEN4EXP_PREFILL_ROWINV: a block-grid cut is off the GDN
             // grid; without the in-pass checkpoint the last chunk stays whole.
             let split_disabled =
                 pc_policy::tail_split_disabled() || pc_policy::rowinv_tail_unsplit(in_pass);
-            // `ATLAS_TAIL_SPLIT_MIN_TOKENS` keeps a short prompt to one pass.
-            let min_tokens = if self.config.model_type == "qwen4_exp" {
-                0
-            } else {
-                pc_policy::tail_split_min_tokens()
-            };
-            if !in_pass
-                && pc_policy::tail_split_at(total, chunk_start, cut, split_disabled, min_tokens)
-            {
+            if !split_disabled && !in_pass && cut > chunk_start && cut < total {
                 anyhow::ensure!(
                     passengers.is_none(),
                     "GLM fused chunk cannot take the tail-checkpoint split"
@@ -369,16 +360,6 @@ impl TransformerModel {
             )?;
         }
         let t_fwd = tp.elapsed();
-        if spark_runtime::host_sync_trace::enabled() {
-            self.gpu.synchronize(stream)?;
-            tracing::info!(
-                "host waits in chunk {}..{} ({:.1} ms wall): {}",
-                chunk_start,
-                chunk_start + chunk_len,
-                tp.elapsed().as_secs_f64() * 1e3,
-                spark_runtime::host_sync_trace::take_report(15)
-            );
-        }
         self.warm_trace_sync(stream)?;
         let marks = [t_lookup, t_prefix, t_blocks, t_meta, tp.elapsed()];
         // Measure the forward's true GPU execution: the launches are async, so
@@ -393,16 +374,6 @@ impl TransformerModel {
                 chunk_start + chunk_len,
                 t_fwd.saturating_sub(t_meta),
                 _fs.elapsed(),
-            );
-        }
-        if spark_runtime::host_sync_trace::enabled() {
-            self.gpu.synchronize(stream)?;
-            tracing::info!(
-                "host waits in chunk {}..{} ({:.1} ms wall): {}",
-                chunk_start,
-                chunk_start + chunk_len,
-                tp.elapsed().as_secs_f64() * 1e3,
-                spark_runtime::host_sync_trace::take_report(15)
             );
         }
         if profile {

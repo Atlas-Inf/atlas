@@ -140,21 +140,17 @@ const _: () = assert!(
 );
 const MAX_BLOCKS: usize = 16;
 
-/// The reduce-scatter's and the all-to-all's grid (`ATLAS_RDMA_RS_BLOCKS`,
-/// default 48, 1..=256; local, as the split of an op's pieces over blocks
-/// changes no value). Their kernels stage and land every piece through the
-/// pinned buffers: at 16 blocks the SP seam's 64 MB reduce-scatter took
-/// 4009 us (FP8 3953), at 48 3857 us (FP8 3495; four nodes, 2026-10-18).
-fn rs_blocks() -> usize {
-    static BLOCKS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *BLOCKS.get_or_init(|| {
-        std::env::var("ATLAS_RDMA_RS_BLOCKS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|b| (1..=256).contains(b))
-            .unwrap_or(48)
-    })
-}
+/// The reduce-scatter's and the all-to-all's grid (the four-rank chain's
+/// only; local, as the split of an op's pieces over blocks changes no
+/// value). Their kernels stage and land every piece through the pinned
+/// buffers: at 16 blocks the SP seam's 64 MB reduce-scatter took 4009 us
+/// (FP8 3953), at 48 3857 us (FP8 3495; four nodes, 2026-10-18). The
+/// four-rank profile (`4x1m-tp4`) serves at 24, which leaves SMs to the
+/// unpermute producing the next seam block beside it. The NIC loopback
+/// tests run 16: their four ranks (and two channels) share one GPU, and
+/// every block of an op waits on blocks of the others, so all must be
+/// resident at once (three blocks an SM, `rdma_chain_bf16`).
+const RS_BLOCKS: usize = if cfg!(test) { 16 } else { 24 };
 
 /// Pieces a chain op may cut its payload into, one flag line each per
 /// origin (`ONESHOT_ORIGIN_LINES` in the kernel); a pair's rails take the
@@ -352,7 +348,7 @@ pub(in crate::nccl_backend) struct OneShot {
     /// staged-block counter (u32 at 24).
     state: u64,
     kernel: AtomicU64,
-    /// Channel 0 of a chain with `ATLAS_RDMA_RS_FUSED_SEG`: the fused
+    /// Channel 0 of a four-rank chain (`config::RS_FUSED_SEG`): the fused
     /// region and its completion words.
     fused: Option<FusedRegion>,
     /// Fused ops begun (each op's `epoch`), and whether the channel has
@@ -465,6 +461,8 @@ mod ops;
 pub(super) mod relay;
 pub(super) use channel::Channel;
 pub(super) use config::Config;
+#[cfg(test)]
+pub(super) use config::RS_FUSED_SEG;
 pub(super) use ops::RS_BIT;
 use ops::*;
 pub(in crate::nccl_backend) use ops::{A2a, A2aPlane};

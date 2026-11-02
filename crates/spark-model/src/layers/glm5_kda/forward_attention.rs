@@ -66,7 +66,7 @@ impl Glm5KdaLayer {
             (sp.map_or(0, |sp| sp.row0), m_hc as usize),
             h as usize * bf16,
         );
-        // ATLAS_GLM_SP_KDA_QUANT_GATHER: the rows are gathered cast and
+        // The four-rank KDA quant gather: the rows are gathered cast and
         // side-projected below instead (`sp_quant_gather.rs`).
         let quant_gather = sp.filter(|&sp| self.sp_kda_quant_gather(sp, ctx));
         let projected = ctx.buffers.qkv_output();
@@ -88,7 +88,7 @@ impl Glm5KdaLayer {
             ptr,
             width,
             also: None,
-            group: crate::layers::ffn_glm_gather_group(),
+            group: crate::layers::SEAM_GATHER_GROUP,
             rows: &stage,
         });
         // ATLAS_GLM_SP_GATHER_OVERLAP: pre, norm and gather a row block at a time.
@@ -251,7 +251,7 @@ impl Glm5KdaLayer {
             ptr,
             width,
             also: None,
-            group: crate::layers::ffn_glm_gather_group(),
+            group: crate::layers::SEAM_GATHER_GROUP,
             rows: &route,
         });
         let overlapped = !fused_tp_hc

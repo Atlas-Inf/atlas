@@ -452,7 +452,7 @@ extern "C" __global__ void glm_index_topk_expand_dynamic(
 }
 
 // The index split's compact selected rows (`glm_index_split.rs`,
-// ATLAS_GLM_INDEX_SPLIT_COMPACT): glm_index_topk_expand writes each selected
+// the TP4 chain's gathers): glm_index_topk_expand writes each selected
 // pool p as the run p * pool_size + i (i < pool_size) and leaves every other
 // run -1, then up to pool_size - 1 causal tail ids. A compact row keeps each
 // run's first id and the tail slots verbatim: topk / pool_size +

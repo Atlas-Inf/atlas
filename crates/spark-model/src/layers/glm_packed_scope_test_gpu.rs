@@ -9,7 +9,7 @@
 //!
 //!   cargo test --release -p spark-model --lib packed_pin -- --ignored --nocapture
 //!
-//! End to end, `ATLAS_GLM_PACKED_PREFILL_CHECK=1` logs per-prompt hashes of
+//! End to end, `ATLAS_GLM_DET_TRACE` logs per-prompt hashes of
 //! every layer's highway rows, the final hidden rows and the logits
 //! (`PACKED_CHECK`), which `scripts/dev/packed_check_compare.py` compares
 //! between a C1 and a C4/C8 run.

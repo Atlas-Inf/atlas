@@ -62,7 +62,7 @@ impl Qwen3AttentionLayer {
         // ATLAS_GLM_DET_TRACE: the latents written to the cache.
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
         let lat = |width: u32| width as usize * bf16;
-        // ATLAS_GLM_SP_MLA_QUANT_GATHER: q_a and kv_a on the gathered cast rows.
+        // The four-rank MLA quant gather: q_a and kv_a on the gathered cast rows.
         let cast = super::sp_gather::cast_input();
         let fused = match cast {
             Some(_) => None,

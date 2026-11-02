@@ -205,7 +205,7 @@ pub(super) fn step_ms(owners: usize, rows: usize) -> f32 {
         return chain_step_ms(owners, rows);
     }
     let owners = owners.max(1);
-    if owners * rows > spark_model::layer::glm_long_owner::PAIR_MAX_ROWS {
+    if owners * rows > spark_model::layer::glm_long_owner::ROW_BUDGET {
         return f32::INFINITY;
     }
     if owners == 1 && rows == 2 {

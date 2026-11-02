@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `ATLAS_GLM_SP_MLA_OPROJ_AHEAD=1`: a four-rank sequence-parallel GLM MLA
-//! layer's row-parallel o_proj runs a seam block at a time, each block's
-//! reduce-scatter right behind it (`glm_sp_overlap::reduce_ahead`).
+//! A four-rank sequence-parallel GLM MLA layer's row-parallel o_proj runs a
+//! seam block at a time, each block's reduce-scatter right behind it
+//! (`glm_sp_overlap::reduce_ahead`; the chain always, the pair never).
 //!
 //! The o_proj made every row's BF16 partial in one GEMM, and the FFN seam's
 //! reduce-scatter started only after it: its first block's link time sat
@@ -24,11 +24,6 @@ use crate::layer::ForwardContext;
 use crate::layers::glm_sp::{self, SpRows};
 use crate::layers::{glm_sp_overlap, ops};
 
-fn requested() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ATLAS_GLM_SP_MLA_OPROJ_AHEAD").as_deref() == Ok("1"))
-}
-
 impl Qwen3AttentionLayer {
     /// This chunk's SP rows and the FFN seam's blocks when its o_proj runs
     /// ahead a block at a time (never with the all-to-all o_proj).
@@ -39,8 +34,7 @@ impl Qwen3AttentionLayer {
     ) -> Option<(SpRows, Vec<(usize, usize)>)> {
         let mla = self.mla.as_ref()?;
         let sp = glm_sp::current().filter(|sp| {
-            requested()
-                && sp.ranks > 2
+            sp.ranks > 2
                 && num_tokens == sp.total()
                 && self.post_attn_out_norm.is_none()
                 && !ctx.graph_capture
@@ -71,7 +65,7 @@ impl Qwen3AttentionLayer {
         let (q, sf) = super::a2a::fp8_image(ctx, super::a2a::SRC_IMAGE, sp.total(), kl)?;
         if ctx.gpu.op_cache().once("glm:sp_mla_oproj_ahead") {
             tracing::info!(
-                "ATLAS_GLM_SP_MLA_OPROJ_AHEAD: MLA o_proj a seam block at a time ({} blocks), each reduced behind it",
+                "GLM SP MLA o_proj ahead: MLA o_proj a seam block at a time ({} blocks), each reduced behind it",
                 blocks.len()
             );
         }

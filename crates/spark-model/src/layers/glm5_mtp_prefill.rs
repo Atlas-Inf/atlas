@@ -13,29 +13,6 @@ use crate::layers::mtp_meta::MTP_META_OFFSET;
 
 const PREFILL_ROWS: usize = 128;
 
-/// Opt-in: zero the MTP position-0 embedding row before `enorm`, matching the
-/// reference fused EH norm. Strictly `0`/`1`; unset defaults off.
-pub(super) const ENV_ZERO_FIRST_EMBED: &str = "ATLAS_GLM_NATIVE_MTP_ZERO_FIRST_EMBED";
-
-/// Parse [`ENV_ZERO_FIRST_EMBED`]. Unset or `0` disables, `1` enables; any
-/// other value (including non-UTF-8) is a hard error.
-pub(super) fn parse_zero_first_embedding_env() -> Result<bool> {
-    parse_zero_first_embedding(std::env::var_os(ENV_ZERO_FIRST_EMBED).as_deref())
-}
-
-fn parse_zero_first_embedding(value: Option<&std::ffi::OsStr>) -> Result<bool> {
-    match value {
-        None => Ok(false),
-        Some(value) if value == "0" => Ok(false),
-        Some(value) if value == "1" => Ok(true),
-        Some(_) => anyhow::bail!("{ENV_ZERO_FIRST_EMBED} must be unset, 0, or 1"),
-    }
-}
-
-pub(super) fn zero_first_embedding_at(enabled: bool, base: usize) -> bool {
-    enabled && base == 0
-}
-
 impl Glm5MtpHead {
     pub fn alloc_state_inner(&self, gpu: &dyn GpuBackend) -> Result<Glm5MtpProposerState> {
         let body_state = self.module.body.alloc_state(gpu)?;
@@ -77,7 +54,6 @@ impl Glm5MtpHead {
         &self,
         tokens: &[u32],
         hiddens: DevicePtr,
-        zero_first_embedding: bool,
         stream: u64,
         ctx: &ForwardContext,
     ) -> Result<usize> {
@@ -103,9 +79,6 @@ impl Glm5MtpHead {
                 row_bytes,
                 stream,
             )?;
-        }
-        if zero_first_embedding {
-            ctx.gpu.memset_async(embed, 0, row_bytes, stream)?;
         }
         let norm_embed = self.arena.attn_output();
         let norm_hidden = self.arena.residual();
@@ -238,7 +211,6 @@ impl Glm5MtpHead {
                 self.project_eh_rows(
                     token_slice,
                     hiddens.offset(done * self.draft_config.hidden_size * 2),
-                    zero_first_embedding_at(self.zero_first_embed, done),
                     stream,
                     ctx,
                 )?;
@@ -318,13 +290,7 @@ impl Glm5MtpHead {
             while done < rows_total {
                 let rows = (rows_total - done).min(PREFILL_ROWS);
                 let token_slice = &tokens[done + 1..done + rows + 1];
-                self.project_eh_rows(
-                    token_slice,
-                    hiddens.offset(done * row_bytes),
-                    zero_first_embedding_at(self.zero_first_embed, row_base + done),
-                    stream,
-                    ctx,
-                )?;
+                self.project_eh_rows(token_slice, hiddens.offset(done * row_bytes), stream, ctx)?;
                 self.write_kv_rows(rows, row_base + done, pos_base + done, state, ctx, stream)?;
                 done += rows;
             }
@@ -359,45 +325,7 @@ impl Glm5MtpHead {
             state.seq_len.checked_add(1) == Some(position),
             "GLM-5 MTP repair position must follow its committed cache"
         );
-        // Repair rows are always positions > 0: never masked.
-        self.project_eh_rows(
-            std::slice::from_ref(&token),
-            target_hidden,
-            false,
-            stream,
-            ctx,
-        )?;
+        self.project_eh_rows(std::slice::from_ref(&token), target_hidden, stream, ctx)?;
         self.write_kv_rows(1, state.seq_len, position, state, ctx, stream)
-    }
-}
-
-#[cfg(test)]
-mod zero_first_tests {
-    use super::*;
-    use std::ffi::OsStr;
-
-    #[test]
-    fn zero_first_selector_is_strict() {
-        assert!(!parse_zero_first_embedding(None).unwrap());
-        assert!(!parse_zero_first_embedding(Some(OsStr::new("0"))).unwrap());
-        assert!(parse_zero_first_embedding(Some(OsStr::new("1"))).unwrap());
-        for value in ["", "true", "01", " 1", "2"] {
-            assert!(parse_zero_first_embedding(Some(OsStr::new(value))).is_err());
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStringExt;
-            let value = std::ffi::OsString::from_vec(vec![255]);
-            assert!(parse_zero_first_embedding(Some(&value)).is_err());
-        }
-    }
-
-    #[test]
-    fn zero_first_mask_does_not_repeat_at_chunk_boundaries() {
-        assert!(zero_first_embedding_at(true, 0));
-        for base in [1, 127, 128, 129, 256, usize::MAX] {
-            assert!(!zero_first_embedding_at(true, base));
-        }
-        assert!(!zero_first_embedding_at(false, 0));
     }
 }

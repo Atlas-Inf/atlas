@@ -192,7 +192,7 @@ pub fn fp8b_cutlass_requested() -> Result<bool> {
 /// pass into the FP8 scratch (`per_token_group_quant_fp8`), or rows already
 /// cast to that kernel's bytes: E4M3 `act` (`[m, k]`) and f32 `scale`
 /// (`[m, k / 128]`), both row-major, so any row block casts on its own
-/// (`ATLAS_GLM_SP_MLA_QUANT_GATHER`).
+/// (the four-rank MLA quant gather, `paged_glm_sp_gather.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fp8bRows {
     Bf16(DevicePtr),

@@ -2,7 +2,7 @@
 
 //! GPU test (`#[ignore]` per repo convention; a GB10 and a glm-5.3-flash
 //! kernel build): `glm_index_topk_expand` rows packed compact
-//! (`ATLAS_GLM_INDEX_SPLIT_COMPACT`) and expanded again are the same words,
+//! (the chain's index split gathers, `glm_index_split::compact`) and expanded again are the same words,
 //! for selections past the top-k budget (with tied scores) and within it.
 //!
 //!   cargo test --release -p spark-model --lib index_split_compact -- --ignored --nocapture

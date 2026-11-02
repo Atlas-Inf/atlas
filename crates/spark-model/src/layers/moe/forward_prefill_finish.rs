@@ -107,7 +107,7 @@ impl MoeLayer {
                 .op_cache()
                 .kernel(ctx.gpu, "moe", "moe_unpermute_reduce_indexed_ep_vec8")
                 .is_ok_and(|k| k.0 == self.moe_unpermute_reduce_ep.0);
-            let ctas = crate::layers::glm_sp_moe_seam::unpermute_ctas().filter(|_| vec8);
+            let ctas = vec8.then_some(crate::layers::glm_sp_moe_seam::UNPERMUTE_CTAS);
             let e4m3 = e4m3_scales.filter(|_| self.down_e4m3.is_some());
             // The unpermute kernels' producers of a fused reduce-scatter.
             let fused_kernel = (vec8 || e4m3.is_some())

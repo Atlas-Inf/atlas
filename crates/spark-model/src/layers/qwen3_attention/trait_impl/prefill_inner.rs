@@ -615,7 +615,7 @@ impl Qwen3AttentionLayer {
         let attn_norm = (block_norm && !diag_this)
             .then(|| self.hc_prefill_norm(&self.input_norm, local(normed), ctx))
             .flatten();
-        // ATLAS_GLM_SP_MLA_QUANT_GATHER: the rows are gathered cast for q_a
+        // The four-rank MLA quant gather: the rows are gathered cast for q_a
         // and kv_a instead (`prefill/paged_glm_sp_gather.rs`), each block as
         // the seam norms it.
         let cast = match sp {
@@ -632,7 +632,7 @@ impl Qwen3AttentionLayer {
                 ptr,
                 width,
                 also: Some(also),
-                group: crate::layers::ffn_glm_gather_group(),
+                group: crate::layers::SEAM_GATHER_GROUP,
                 rows: &cast_rows,
             }
         });
@@ -825,7 +825,7 @@ impl Qwen3AttentionLayer {
             ptr,
             width,
             also: None,
-            group: crate::layers::ffn_glm_gather_group(),
+            group: crate::layers::SEAM_GATHER_GROUP,
             rows: &route,
         });
         let ffn_overlapped = !self.ffn.is_none()
@@ -846,7 +846,7 @@ impl Qwen3AttentionLayer {
         if ffn_overlapped || whole {
             // GLM's seam includes the reduction and the FFN input gather.
         } else if crate::layers::glm_sp_overlap::join_ahead_of(attn_out, ctx, stream)? {
-            // ATLAS_GLM_SP_MLA_OPROJ_AHEAD: the o_proj reduced its blocks
+            // The four-rank o_proj ahead: the o_proj reduced its blocks
             // already (`prefill/paged_glm_oproj_ahead.rs`).
         } else if let Some(sp) = sp {
             if !rs_offer.is_some_and(|o| o.taken()) {

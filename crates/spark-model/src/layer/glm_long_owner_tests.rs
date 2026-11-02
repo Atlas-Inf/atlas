@@ -35,15 +35,13 @@ fn widths_admit_up_to_eight_owners_within_the_row_budget() {
     for (owners, rows) in [(8, 9), (0, K3_ROWS), (MAX_OWNERS + 1, 2)] {
         assert!(!width_supported(owners, rows), "{owners}x{rows}");
     }
-    // The pair admits 32 rows (8x4), the chain as much by default and up to
-    // every owner's whole block when asked.
-    if std::env::var_os("ATLAS_GLM_LONG_BATCH_MAX_ROWS").is_none() {
-        assert_eq!((row_budget(2), row_budget(1), row_budget(4)), (32, 32, 32));
-    }
-    assert_eq!(max_rows_per_owner(8, row_budget(2)), 4);
+    // The pair and the chain admit 32 rows (8x4); the buffers hold every
+    // owner's whole block.
+    assert_eq!(ROW_BUDGET, 32);
+    assert_eq!(max_rows_per_owner(8, ROW_BUDGET), 4);
     assert_eq!(max_rows_per_owner(8, MAX_ROWS), 8);
-    assert_eq!(max_rows_per_owner(3, row_budget(2)), 8);
-    assert_eq!(max_rows_per_owner(9, row_budget(4)), 0);
+    assert_eq!(max_rows_per_owner(3, ROW_BUDGET), 8);
+    assert_eq!(max_rows_per_owner(9, ROW_BUDGET), 0);
 }
 
 #[test]

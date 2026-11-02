@@ -574,22 +574,6 @@ impl Qwen3AttentionLayer {
                     NUM_SMS / current_ctas
                 };
 
-                // DIAGNOSTIC (ATLAS_ATTN_DBG): split-K reduction structure for the
-                // active row depends on `num_seqs` (co-batched count) via num_splits.
-                // Print only when co-batched (num_seqs>1) to confirm whether a
-                // serial-looking workload ever shares a batch (root-cause probe for
-                // batch>1 temp-0 nondeterminism).
-                if num_seqs != 1 && std::env::var("ATLAS_ATTN_DBG").is_ok() {
-                    tracing::debug!(
-                        "ATTN_DBG L{} num_seqs={} num_splits={} (NUM_SMS={} nq={})",
-                        self.attn_layer_idx,
-                        num_seqs,
-                        num_splits,
-                        NUM_SMS,
-                        num_q_heads
-                    );
-                }
-
                 let (k_scale, v_scale) = self.effective_fp8_scales();
                 let sliding = self.sliding_window.unwrap_or(0);
 

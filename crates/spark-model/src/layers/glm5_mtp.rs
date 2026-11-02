@@ -70,7 +70,6 @@ pub struct Glm5MtpHead {
     dense_gemm_k: KernelHandle,
     bf16_concat_k: KernelHandle,
     argmax_k: KernelHandle,
-    zero_first_embed: bool,
     confidence: ConfidencePlan,
 }
 impl Glm5MtpHead {
@@ -92,17 +91,10 @@ impl Glm5MtpHead {
             "GLM-5 MTP requires a stateless ordinary MLA body"
         );
         // Publisher head values are expanded to BF16 by the loader. Native MTP
-        // does not create a quantized twin of either embeddings or output head.
-        anyhow::ensure!(
-            std::env::var_os("ATLAS_GLM_NATIVE_MTP_HEAD").is_none_or(|v| v == "bf16"),
-            "native GLM MTP supports only the publisher head expanded to BF16"
-        );
-        anyhow::ensure!(
-            std::env::var_os("ATLAS_GLM_NATIVE_MTP_FINAL_NORM").is_none_or(|v| v == "bf16_sum"),
-            "native GLM MTP supports only bf16_sum final norm"
-        );
-        let zero_first_embed = prefill::parse_zero_first_embedding_env()?;
-        let confidence = ConfidencePlan::from_env(gpu)?;
+        // does not create a quantized twin of either embeddings or output
+        // head, and its final norm is the BF16 sum.
+        let confidence =
+            ConfidencePlan::new(gpu, crate::weight_loader::glm5_mode::strict_native_mtp())?;
         let mla_shape = crate::model::glm_cache_plan::GlmMlaShape::for_model(
             &draft_config.model_type,
             draft_config.kv_lora_rank,
@@ -153,7 +145,6 @@ impl Glm5MtpHead {
             dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
             bf16_concat_k: gpu.kernel("residual_add", "bf16_concat")?,
             argmax_k: gpu.kernel("argmax", "argmax_bf16")?,
-            zero_first_embed,
             confidence,
         })
     }

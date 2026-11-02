@@ -84,7 +84,7 @@ pub enum FfnComponent {
 
 mod ffn_c4;
 mod ffn_glm;
-pub(crate) use ffn_glm::ffn_glm_gather_group;
+pub(crate) use ffn_glm::SEAM_GATHER_GROUP;
 
 impl FfnComponent {
     pub fn is_none(&self) -> bool {

@@ -89,27 +89,15 @@ fn parse_settings(var: impl Fn(&str) -> Option<String>) -> Result<Option<Setting
     }))
 }
 
-/// `ATLAS_GLM_INDEX_SPLIT_BESIDE=1`: a chain's gathers of the selected rows
-/// run on the SP seams' side stream, beside the owner's q_b and absorb
-/// (`paged_glm.rs` joins them before the attention). The same ops in the
-/// same order on every rank either way.
-fn beside_requested() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ATLAS_GLM_INDEX_SPLIT_BESIDE").as_deref() == Ok("1"))
-}
-
-/// `ATLAS_GLM_INDEX_SPLIT_COMPACT=1`: a chain's gathers move the selected
-/// rows compact (`ops::GlmSelCompact`, ~1/4 of the bytes at GLM's top-k of
-/// 2048 tokens in pools of 4), expanded back to the same words after.
+/// A chain's gathers move the selected rows compact (`ops::GlmSelCompact`,
+/// ~1/4 of the bytes at GLM's top-k of 2048 tokens in pools of 4), expanded
+/// back to the same words after; the pair's swaps move them whole.
 pub(super) fn compact(
     gpu: &dyn spark_runtime::gpu::GpuBackend,
     topk: u32,
     pool: u32,
     width: u32,
 ) -> Option<ops::GlmSelCompact> {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let on =
-        *ON.get_or_init(|| std::env::var("ATLAS_GLM_INDEX_SPLIT_COMPACT").as_deref() == Ok("1"));
     let kernel = |f| crate::layers::try_kernel(gpu, "glm_indexer", f);
     let c = ops::GlmSelCompact {
         pack: kernel("glm_index_sel_pack"),
@@ -118,11 +106,7 @@ pub(super) fn compact(
         pool,
         width,
     };
-    (on && pool > 0
-        && topk.is_multiple_of(pool)
-        && width >= topk
-        && c.pack.0 != 0
-        && c.unpack.0 != 0)
+    (pool > 0 && topk.is_multiple_of(pool) && width >= topk && c.pack.0 != 0 && c.unpack.0 != 0)
         .then_some(c)
 }
 
@@ -299,9 +283,11 @@ impl IndexSplit {
     }
 
     /// Swap this rank's finished rows of `rows.selected` for the peer's
-    /// (on a chain: gather every rank's; `beside` on the side stream, until
-    /// `glm_sp_overlap::join_beside`, under `ATLAS_GLM_INDEX_SPLIT_BESIDE=1`;
-    /// as `compact` rows, packed before and expanded after, when given).
+    /// (on a chain: gather every rank's; `beside` on the SP seams' side
+    /// stream, beside the owner's q_b and absorb, until
+    /// `glm_sp_overlap::join_beside`; as `compact` rows, packed before and
+    /// expanded after, when given). The same ops in the same order on every
+    /// rank either way.
     /// Under the check, then compare every row with the replicated rows.
     pub(super) fn exchange(
         &self,
@@ -347,7 +333,7 @@ impl IndexSplit {
                     None => Ok(()),
                 }
             };
-            return match beside && beside_requested() {
+            return match beside {
                 true => crate::layers::glm_sp_overlap::beside(ctx, stream, gather),
                 false => gather(stream),
             };

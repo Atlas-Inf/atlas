@@ -3,7 +3,7 @@
 //! Tiny real-device/file check: one GPU exercises every TP4 rank geometry.
 //! No model, collectives, or inference kernels are needed.
 //!
-//! ATLAS_NVME_TEST_DIR=/nvme cargo test -p spark-runtime --lib \
+//! ATLAS_KV_NVME_DIR=/nvme cargo test -p spark-runtime --lib \
 //!   tp4_nvme_device_file_round_trip -- --ignored --nocapture
 
 use super::*;
@@ -18,11 +18,11 @@ impl Drop for Scratch {
 }
 
 #[test]
-#[ignore = "requires a CUDA device and ATLAS_NVME_TEST_DIR on a real O_DIRECT filesystem"]
+#[ignore = "requires a CUDA device and ATLAS_KV_NVME_DIR on a real O_DIRECT filesystem"]
 fn tp4_nvme_device_file_round_trip() {
+    // The serving NVMe tier's own directory setting names the test's disk.
     let root = std::path::PathBuf::from(
-        std::env::var_os("ATLAS_NVME_TEST_DIR")
-            .expect("set ATLAS_NVME_TEST_DIR to an NVMe directory"),
+        std::env::var_os("ATLAS_KV_NVME_DIR").expect("set ATLAS_KV_NVME_DIR to an NVMe directory"),
     );
     assert!(root.is_dir(), "test directory must already exist");
     assert_eq!(atlas_tier::unsuitable_swap_fs(&root), None);

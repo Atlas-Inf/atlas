@@ -17,22 +17,7 @@ pub(crate) fn native_mtp_requested(
 /// rank-symmetric capabilities is missing.  Keep this check before NCCL-side
 /// model construction completes so every rank fails with the same reason.
 pub(crate) fn ensure_native_mtp_target_prerequisites(config: &ModelConfig) -> Result<()> {
-    anyhow::ensure!(
-        config.model_type == "glm5_next",
-        "native GLM MTP target prerequisites require glm5_next (got {})",
-        config.model_type
-    );
-    anyhow::ensure!(
-        crate::weight_loader::glm5_mode::supported_parallelism(
-            config.ep_world_size,
-            config.tp_world_size,
-            config.ep_world_size,
-        ) && config.tp_rank == config.ep_rank
-            && config.tp_rank < config.tp_world_size,
-        "native GLM MTP target prerequisites require aligned TP2/EP2 or TP4/EP4 (got TP{} / EP{})",
-        config.tp_world_size,
-        config.ep_world_size
-    );
+    ensure_native_mtp_topology(config)?;
     anyhow::ensure!(
         crate::layers::canonical_verify::enabled(),
         "native GLM MTP requires ATLAS_GLM_CANONICAL_VERIFY=1 with ATLAS_W4A16_TC=1"
@@ -48,6 +33,28 @@ pub(crate) fn ensure_native_mtp_target_prerequisites(config: &ModelConfig) -> Re
     anyhow::ensure!(
         std::env::var("ATLAS_GLM_LM_HEAD_MXFP8").as_deref() == Ok("1"),
         "native GLM MTP requires ATLAS_GLM_LM_HEAD_MXFP8=1"
+    );
+    Ok(())
+}
+
+/// The model and the rank geometry native GLM MTP serves: `glm5_next` on
+/// aligned TP2/EP2 or TP4/EP4, this rank inside it.
+fn ensure_native_mtp_topology(config: &ModelConfig) -> Result<()> {
+    anyhow::ensure!(
+        config.model_type == "glm5_next",
+        "native GLM MTP target prerequisites require glm5_next (got {})",
+        config.model_type
+    );
+    anyhow::ensure!(
+        crate::weight_loader::glm5_mode::supported_parallelism(
+            config.ep_world_size,
+            config.tp_world_size,
+            config.ep_world_size,
+        ) && config.tp_rank == config.ep_rank
+            && config.tp_rank < config.tp_world_size,
+        "native GLM MTP target prerequisites require aligned TP2/EP2 or TP4/EP4 (got TP{} / EP{})",
+        config.tp_world_size,
+        config.ep_world_size
     );
     Ok(())
 }
@@ -130,35 +137,7 @@ fn validate_full_bf16_head(name: &str, weight: &WeightTensor, config: &ModelConf
 mod tests {
     use super::*;
     #[test]
-    fn native_target_prerequisites_cover_every_pair_and_four_rank_member() {
-        const CHILD: &str = "ATLAS_NATIVE_MTP_TOPOLOGY_TEST_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-            for (name, _) in std::env::vars_os() {
-                if name.to_string_lossy().starts_with("ATLAS_") {
-                    command.env_remove(name);
-                }
-            }
-            let result = command
-                .arg("--exact")
-                .arg("factory::build::glm::native_mtp::tests::native_target_prerequisites_cover_every_pair_and_four_rank_member")
-                .arg("--nocapture")
-                .env(CHILD, "1")
-                .env("ATLAS_GLM_CANONICAL_VERIFY", "1")
-                .env("ATLAS_W4A16_TC", "1")
-                .env("ATLAS_GLM_HC_BF16", "1")
-                .env("ATLAS_GLM_VERIFY_VOCAB_SPLIT", "1")
-                .env("ATLAS_GLM_LM_HEAD_MXFP8", "1")
-                .output().unwrap();
-            assert!(
-                result.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&result.stdout),
-                String::from_utf8_lossy(&result.stderr)
-            );
-            assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
-            return;
-        }
+    fn native_target_topology_covers_every_pair_and_four_rank_member() {
         let mut config = ModelConfig::qwen3_next_80b_nvfp4();
         config.model_type = "glm5_next".into();
         for world in [2, 4] {
@@ -167,20 +146,20 @@ mod tests {
             for rank in 0..world {
                 config.tp_rank = rank;
                 config.ep_rank = rank;
-                ensure_native_mtp_target_prerequisites(&config).unwrap();
+                ensure_native_mtp_topology(&config).unwrap();
                 config.ep_rank = (rank + 1) % world;
-                assert!(ensure_native_mtp_target_prerequisites(&config).is_err());
+                assert!(ensure_native_mtp_topology(&config).is_err());
             }
             config.tp_rank = world;
             config.ep_rank = world;
-            assert!(ensure_native_mtp_target_prerequisites(&config).is_err());
+            assert!(ensure_native_mtp_topology(&config).is_err());
         }
         config.tp_rank = 0;
         config.ep_rank = 0;
         for (tp, ep) in [(1, 1), (2, 4), (4, 2), (8, 8)] {
             config.tp_world_size = tp;
             config.ep_world_size = ep;
-            assert!(ensure_native_mtp_target_prerequisites(&config).is_err());
+            assert!(ensure_native_mtp_topology(&config).is_err());
         }
     }
 

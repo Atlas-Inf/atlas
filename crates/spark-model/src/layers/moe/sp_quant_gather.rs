@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `ATLAS_GLM_SP_MOE_QUANT_GATHER=1`: a four-rank sequence-parallel MoE
-//! gathers its input already routed and quantized.
+//! A four-rank sequence-parallel MoE gathers its input already routed and
+//! quantized (the chain always; the pair gathers BF16 rows).
 //!
 //! The seam before a chain MoE all-gathers the BF16 normed rows (8 KiB a row
 //! at hidden 4096) so that every rank can route and quantize all of them.
@@ -20,12 +20,6 @@ use super::*;
 use crate::layers::glm_sp::SpRows;
 use std::cell::Cell;
 
-/// Whether the switch is on.
-fn requested() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ATLAS_GLM_SP_MOE_QUANT_GATHER").as_deref() == Ok("1"))
-}
-
 /// The bytes of one gathered row: packed NVFP4 (`h / 2`), group scales
 /// (`h / 16`), top-k ids and weights (`top_k * 4` each), in that order.
 fn staged_row(h: usize, top_k: usize) -> [usize; 4] {
@@ -39,8 +33,7 @@ impl MoeLayer {
     pub fn sp_quant_gather(&self, sp: SpRows, ctx: &ForwardContext) -> bool {
         let (n, h) = (sp.total() as u32, ctx.config.hidden_size as u32);
         let inter = ctx.config.routed_inter_local() as u32;
-        requested()
-            && sp.ranks > 2
+        sp.ranks > 2
             && !sp.full_shared
             && ctx.config.model_type == "glm5_next"
             && ctx.comm.is_some()
@@ -197,7 +190,7 @@ impl MoeLayer {
         let ahead = ROUTED_AHEAD.with(Cell::take);
         if ctx.gpu.op_cache().once("glm:sp_moe_quant_gather") {
             tracing::info!(
-                "ATLAS_GLM_SP_MOE_QUANT_GATHER: MoE input gathered as NVFP4 rows + routes ({} rows a part, {})",
+                "GLM SP MoE quant gather: MoE input gathered as NVFP4 rows + routes ({} rows a part, {})",
                 sp.rows,
                 if ahead {
                     "per seam block"

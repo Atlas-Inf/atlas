@@ -107,9 +107,7 @@ fn the_chain_step_costs_track_its_measured_steps() {
         );
     }
     // The chain's default 32-row verify budget, and the lone two-row path.
-    if std::env::var_os("ATLAS_GLM_LONG_BATCH_MAX_ROWS").is_none() {
-        assert!(chain_step_ms(8, 4).is_finite() && chain_step_ms(8, 5).is_infinite());
-    }
+    assert!(chain_step_ms(8, 4).is_finite() && chain_step_ms(8, 5).is_infinite());
     assert!(chain_step_ms(1, 2) > chain_step_ms(1, 3));
     // A step costs more with every owner and every row.
     for n in 1..8 {

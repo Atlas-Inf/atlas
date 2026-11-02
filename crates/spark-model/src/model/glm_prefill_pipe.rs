@@ -44,11 +44,10 @@ pub fn requested() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_GLM_PREFILL_PIPE2").as_deref() == Ok("1"))
 }
 
-/// `ATLAS_GLM_PREFILL_PIPE2_TRACE=1`: log every pass's choice and, for a
-/// pipelined one, when each half finished (host clock, syncing at the end).
+/// At DEBUG (`RUST_LOG`): log every pass's choice and, for a pipelined one,
+/// when each half finished (host clock, syncing at the end).
 fn trace() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ATLAS_GLM_PREFILL_PIPE2_TRACE").as_deref() == Ok("1"))
+    tracing::enabled!(tracing::Level::DEBUG)
 }
 
 /// The second half-chunk's arena, stream and the fence between the halves.
@@ -198,7 +197,7 @@ impl TransformerModel {
                         )
                     });
                     if trace() {
-                        tracing::info!("PIPE2 pass of {proc_count} rows: pipelined");
+                        tracing::debug!("PIPE2 pass of {proc_count} rows: pipelined");
                     }
                     return Some((a, b));
                 }
@@ -206,7 +205,7 @@ impl TransformerModel {
             }
         };
         if trace() {
-            tracing::info!("PIPE2 pass of {proc_count} rows: whole ({why})");
+            tracing::debug!("PIPE2 pass of {proc_count} rows: whole ({why})");
         }
         None
     }
@@ -359,7 +358,7 @@ impl TransformerModel {
             gpu.event_synchronize(pipe.a_moe[layers - 1])?;
             let a = t0.elapsed();
             gpu.event_synchronize(pipe.b_done)?;
-            tracing::info!(
+            tracing::debug!(
                 "PIPE2 {proc_count} rows: issued {:.1} ms, half A done {:.1} ms, half B done {:.1} ms",
                 issued.as_secs_f64() * 1e3,
                 a.as_secs_f64() * 1e3,

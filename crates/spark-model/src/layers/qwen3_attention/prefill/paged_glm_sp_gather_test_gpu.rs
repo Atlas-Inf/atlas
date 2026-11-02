@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! GPU test (`#[ignore]` per repo convention; a GB10 and a glm-5.3-flash
-//! kernel build): what `ATLAS_GLM_SP_MLA_QUANT_GATHER` feeds q_a, kv_a and
+//! kernel build): what the four-rank MLA quant gather feeds q_a, kv_a and
 //! the semantic indexer gives their outputs the whole chunk's bytes.
 //!
 //! - The per-token-group cast of each quarter and sixteenth of a chunk (a
@@ -10,7 +10,7 @@
 //!   (`Fp8bRows::Cast`) writes the BF16 rows' output: on the probed path
 //!   and on both of the in-tree hand paths, with an FP8 scratch that takes
 //!   the chunk in one pass and one that takes it in passes with a tail; the
-//!   o_proj's (`ATLAS_GLM_SP_MLA_OPROJ_AHEAD`) also a seam block a call.
+//!   o_proj's (`paged_glm_oproj_ahead.rs`) also a seam block a call.
 //! - The indexer's BF16 GEMM of an owner's rows, run at the owner's height
 //!   on an input of which only one rank's part is set (the rest NaN),
 //!   writes that part's rows as on the whole input.

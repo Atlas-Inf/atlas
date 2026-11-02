@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `ATLAS_GLM_SP_KDA_QUANT_GATHER=1`: a four-rank sequence-parallel KDA layer
-//! gathers its attention input already cast and side-projected.
+//! A four-rank sequence-parallel KDA layer gathers its attention input
+//! already cast and side-projected (the chain always; the pair gathers BF16
+//! rows).
 //!
 //! The attention seam all-gathers the BF16 normed rows (8 KiB a row at
 //! hidden 4096). On the W8A8 prefill path every reader of a peer row is
@@ -20,11 +21,6 @@
 use super::*;
 use crate::layers::glm_sp::SpRows;
 
-fn requested() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ATLAS_GLM_SP_KDA_QUANT_GATHER").as_deref() == Ok("1"))
-}
-
 /// One gathered block: `(rows' first byte, bytes a row)` of each piece, in
 /// staging order.
 type Pieces = [(DevicePtr, usize); 5];
@@ -33,8 +29,7 @@ impl Glm5KdaLayer {
     /// Whether this prefill over `sp` gathers its attention input cast and
     /// side-projected: the seam then gathers no BF16 rows.
     pub(super) fn sp_kda_quant_gather(&self, sp: SpRows, ctx: &ForwardContext) -> bool {
-        requested()
-            && sp.ranks > 2
+        sp.ranks > 2
             && sp.rows * (sp.ranks - 1) == sp.peer_rows
             && sp.rows.is_multiple_of(ops::MX_LT_TILE_ROWS)
             && !ctx.graph_capture
@@ -117,7 +112,7 @@ impl Glm5KdaLayer {
         }
         if ctx.gpu.op_cache().once("glm:sp_kda_block_gather") {
             tracing::info!(
-                "ATLAS_GLM_SP_KDA_QUANT_GATHER: KDA attention input cast and gathered per seam block ({} blocks)",
+                "GLM SP KDA quant gather: KDA attention input cast and gathered per seam block ({} blocks)",
                 blocks.len()
             );
         }
@@ -258,7 +253,7 @@ impl Glm5KdaLayer {
     ) -> Result<()> {
         if ctx.gpu.op_cache().once("glm:sp_kda_quant_gather") {
             tracing::info!(
-                "ATLAS_GLM_SP_KDA_QUANT_GATHER: KDA attention input gathered as MXFP8 rows + side planes ({} rows a part)",
+                "GLM SP KDA quant gather: KDA attention input gathered as MXFP8 rows + side planes ({} rows a part)",
                 sp.rows
             );
         }

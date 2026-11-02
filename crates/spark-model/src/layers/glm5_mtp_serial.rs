@@ -95,9 +95,6 @@ impl Glm5MtpHead {
         );
         ctx.gpu
             .copy_d2d_async(embed_src, embed, row_bytes, stream)?;
-        if self.zero_first_embed && state.seq_len == 0 {
-            ctx.gpu.memset_async(embed, 0, row_bytes, stream)?;
-        }
         let eh_input = self.arena.ssm_qkvz();
         ops::rms_norm(
             ctx.gpu,

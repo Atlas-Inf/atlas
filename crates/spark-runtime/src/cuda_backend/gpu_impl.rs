@@ -160,16 +160,12 @@ impl GpuBackend for AtlasCudaBackend {
 
     fn copy_d2h(&self, src: DevicePtr, dst: &mut [u8]) -> Result<()> {
         d2h_trace_tick();
-        crate::host_sync_trace::traced("copy_d2h", || {
-            AtlasCudaBackend::copy_d2h_impl(self, src, dst)
-        })
+        AtlasCudaBackend::copy_d2h_impl(self, src, dst)
     }
 
     fn copy_d2h_on_stream(&self, src: DevicePtr, dst: &mut [u8], stream: u64) -> Result<()> {
         d2h_trace_tick();
-        crate::host_sync_trace::traced("copy_d2h_on_stream", || {
-            AtlasCudaBackend::copy_d2h_on_stream_impl(self, src, dst, stream)
-        })
+        AtlasCudaBackend::copy_d2h_on_stream_impl(self, src, dst, stream)
     }
 
     fn copy_d2h_async(&self, src: DevicePtr, dst: &mut [u8], stream: u64) -> Result<()> {
@@ -241,9 +237,7 @@ impl GpuBackend for AtlasCudaBackend {
     }
 
     fn synchronize(&self, stream: u64) -> Result<()> {
-        let status = crate::host_sync_trace::traced("synchronize", || unsafe {
-            cuStreamSynchronize(stream)
-        });
+        let status = unsafe { cuStreamSynchronize(stream) };
         if status != 0 {
             bail!("cuStreamSynchronize failed: {}", cuda_error_text(status));
         }
@@ -251,9 +245,7 @@ impl GpuBackend for AtlasCudaBackend {
     }
 
     fn synchronize_device(&self) -> Result<()> {
-        let status = crate::host_sync_trace::traced("synchronize_device", || unsafe {
-            super::cuCtxSynchronize()
-        });
+        let status = unsafe { super::cuCtxSynchronize() };
         if status != 0 {
             bail!("cuCtxSynchronize failed: {}", cuda_error_text(status));
         }
@@ -486,7 +478,7 @@ impl GpuBackend for AtlasCudaBackend {
         self.stream_wait_event_cu(stream, event)
     }
     fn event_synchronize(&self, event: u64) -> Result<()> {
-        crate::host_sync_trace::traced("event_synchronize", || self.event_synchronize_cu(event))
+        self.event_synchronize_cu(event)
     }
     fn destroy_event(&self, event: u64) -> Result<()> {
         self.destroy_event_cu(event)

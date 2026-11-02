@@ -91,15 +91,6 @@ impl Glm5KdaLayer {
         let p = self.heads * self.dim;
         let p_u32 = p as u32;
         let bf16 = 2usize;
-        let profile = std::env::var("ATLAS_GLM_KDA_MS_PROFILE").ok().as_deref() == Some("1")
-            && !ctx.graph_capture;
-        let mixer_t0 = if profile {
-            ctx.gpu.synchronize(stream)?;
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
         // mHC is batch-aware. Keeping the highway in [N, hc, H] layout also
         // fixes the generic fallback's scratch reuse between distinct rows.
         if self.layer_idx == 0 {
@@ -296,18 +287,6 @@ impl Glm5KdaLayer {
         }
         self.hc_post(normed, m, ctx, stream)?;
 
-        let mixer_us = if let Some(t0) = mixer_t0 {
-            ctx.gpu.synchronize(stream)?;
-            t0.elapsed().as_micros()
-        } else {
-            0
-        };
-        let ffn_t0 = if profile {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
         // Keep mixer and FFN batching independently switchable for diagnosis.
         // Atlas's K=3 FFN path emits a contiguous [N,H] result, so mHC can
         // consume the entire batch once.
@@ -384,15 +363,6 @@ impl Glm5KdaLayer {
             )?;
         }
 
-        if let Some(t0) = ffn_t0 {
-            ctx.gpu.synchronize(stream)?;
-            tracing::info!(
-                "ATLAS_GLM_KDA_MS_PROFILE n={n} layer={} mixer={}us ffn={}us",
-                self.layer_idx,
-                mixer_us,
-                t0.elapsed().as_micros(),
-            );
-        }
         Ok(())
     }
 }

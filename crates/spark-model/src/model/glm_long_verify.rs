@@ -103,7 +103,7 @@ impl TransformerModel {
         };
         self.glm_long_stage.is_some()
             && owner::width_supported(owners, rows)
-            && owners * rows <= owner::row_budget(self.config.tp_world_size)
+            && owners * rows <= owner::ROW_BUDGET
             // The call's metadata (block tables of every row) fits scratch.
             && MetaLayout::new(owners, rows, self.max_blocks_per_seq as usize).end()
                 <= self.buffers.sizes().scratch

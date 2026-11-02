@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 // The MoE output seam's unpermute as the producer of a fused chain
-// reduce-scatter (`ATLAS_GLM_SP_MOE_SEAM` with `ATLAS_RDMA_RS_FUSED_SEG`,
+// reduce-scatter (the four-rank chain's MoE output seam,
 // `layers::glm_sp_moe_seam`): the `_vec8` unpermute kernels' rows
 // (glm_moe_unpermute_row.cuh), computed piece by piece in the plan's order
 // and written where the op wants them -- a raw piece straight into its

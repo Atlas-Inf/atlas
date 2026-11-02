@@ -5,8 +5,8 @@
 
 use super::*;
 
-/// The KDA o_proj exchange of an `n`-row chunk (`ATLAS_ONESHOT_A2A_ROWS`,
-/// default 8192): each rank holds `[n, 2048]` E4M3 rows of its heads and
+/// The KDA o_proj exchange of an `n`-row chunk (8192, a chunk at
+/// `--max-prefill-tokens=8192`): each rank holds `[n, 2048]` E4M3 rows of its heads and
 /// their tiled UE8M0 scales (128 x 4 per 512-byte tile); part `d` of the rows
 /// belongs to rank `3 - d`, which lands every origin's part as the K slice
 /// `[o * 2048, ..)` of its `[n / 4, 8192]` operand and the scale tiles at
@@ -17,10 +17,7 @@ fn chain_loopback_all_to_all() {
     let Some((g, chains)) = ranks() else {
         return;
     };
-    let n: usize = std::env::var("ATLAS_ONESHOT_A2A_ROWS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8192);
+    let n = 8192usize;
     let (kl, rows) = (2048usize, n / RANKS);
     let (q_part, sf_part) = (rows * kl, rows * kl / 32);
     let tile_row = 16 * 512; // one 128-row band of a 2048-column slice
@@ -226,8 +223,8 @@ fn chain_loopback_reduce_scatter_fp8() {
 /// plain reduce-scatter's words, its completion words show the op's epoch,
 /// over seams of several sizes with an all-reduce between them (a fused op
 /// right after another is refused), the producer and the chain kernel on
-/// two streams with nothing ordering them. Needs ATLAS_RDMA_RS_FUSED_SEG
-/// (skipped without).
+/// two streams with nothing ordering them, up to the chain's whole segment
+/// (`oneshot::config::RS_FUSED_SEG`).
 #[test]
 #[ignore = "needs a GPU, an RDMA device and ATLAS_ONESHOT_CUBIN_DIR"]
 fn chain_loopback_reduce_scatter_fused() {
@@ -237,14 +234,7 @@ fn chain_loopback_reduce_scatter_fused() {
     let producer = load("rdma_oneshot.cubin", "rdma_rs_fused_copy");
     let streams = [g.stream, new_stream(), new_stream(), new_stream()];
     let sides = [new_stream(), new_stream(), new_stream(), new_stream()];
-    let cap: usize = std::env::var("ATLAS_RDMA_RS_FUSED_SEG")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    if cap == 0 {
-        eprintln!("ATLAS_RDMA_RS_FUSED_SEG unset: skipped");
-        return;
-    }
+    let cap = crate::nccl_backend::rdma_pair::oneshot::RS_FUSED_SEG;
     let mut wrong = 0;
     for (k, seg) in [65_536usize, 1 << 20, cap / 2, cap].into_iter().enumerate() {
         let k = k as u64 * 7 + 3;

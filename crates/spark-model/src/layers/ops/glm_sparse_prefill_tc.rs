@@ -60,33 +60,18 @@ const PIPE: &str = "ATLAS_GLM_SPARSE_PREFILL_PIPE";
 /// requires 16-token cache blocks and returns without writing otherwise.
 const PIPE_SLOTS: u32 = 2080;
 
-/// Opt-in (not bit-exact) two-warpgroup 16-head pipe: each warpgroup takes
-/// half of a token's key tiles, merged at the end (`_pipe_wg2`).
-const PIPE_WG2: &str = "ATLAS_GLM_SPARSE_PIPE_WG2";
-
 /// The 16-head body of a 32-head entry point, for a TP4 rank's local heads,
 /// with its threads and shared bytes (`None`: the entry point's): the
 /// 32-head kernel's first 16 heads bit for bit, its work spread over every
-/// warp, or with `wg2` two warpgroups over halves of the key tiles. The
-/// other kernels serve 16 heads masked (a spread kv_pad body measured no
-/// faster: it waits on its single-buffered tile loads).
-fn for_heads(symbol: &'static str, heads: u32, wg2: bool) -> (&'static str, u32, Option<u32>) {
-    match (symbol, heads, wg2) {
-        ("glm_sparse_mla_prefill_fp8g128_head32_tc_pipe", 16, false) => {
+/// warp. The other kernels serve 16 heads masked (a spread kv_pad body
+/// measured no faster: it waits on its single-buffered tile loads).
+fn for_heads(symbol: &'static str, heads: u32) -> (&'static str, u32, Option<u32>) {
+    match (symbol, heads) {
+        ("glm_sparse_mla_prefill_fp8g128_head32_tc_pipe", 16) => {
             ("glm_sparse_mla_prefill_fp8g128_head16_tc_pipe", 256, None)
         }
-        ("glm_sparse_mla_prefill_fp8g128_head32_tc_pipe", 16, true) => (
-            "glm_sparse_mla_prefill_fp8g128_head16_tc_pipe_wg2",
-            512,
-            Some(96768),
-        ),
         _ => (symbol, 256, None),
     }
-}
-
-/// `ATLAS_GLM_SPARSE_PIPE_WG2` as set (glm5_next only).
-pub fn glm_sparse_pipe_wg2_requested(model: &str) -> Result<bool> {
-    enabled(model, PIPE_WG2)
 }
 
 fn kernel_spec(
@@ -272,8 +257,7 @@ fn launch(
     grid_rows: u32,
 ) -> Result<()> {
     let (module, symbol, shared_mem) = kernel_spec(kv_reuse, a.dtype, pipe);
-    let wg2 = glm_sparse_pipe_wg2_requested(&a.config.model_type)?;
-    let (symbol, threads, heads_shared) = for_heads(symbol, a.heads, wg2);
+    let (symbol, threads, heads_shared) = for_heads(symbol, a.heads);
     let kernel = gpu.kernel(module, symbol)?;
     ensure!(kernel.0 != 0, "GLM sparse TC prefill kernel is unavailable");
     KernelLaunch::new(gpu, kernel)

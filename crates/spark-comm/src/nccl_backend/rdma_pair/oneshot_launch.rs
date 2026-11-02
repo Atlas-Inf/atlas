@@ -212,7 +212,7 @@ impl OneShot {
         };
         let fence = self.stage_on_stream(stage, src, bytes, sm, stream)?;
         let blocks = if rs {
-            rs_blocks()
+            RS_BLOCKS
         } else {
             (bytes / 16).div_ceil(THREADS).clamp(1, MAX_BLOCKS)
         } as u32;

@@ -1272,7 +1272,7 @@ extern "C" __global__ void rdma_oneshot_bf16(
 // Three 256-thread blocks an SM (at most 85 registers): two channels of four
 // ranks sharing one GPU (the NIC loopback test) need 8 x 16 blocks resident
 // at once, and every block of an op waits on blocks of the others (so that
-// test runs the reduce-scatter's grid at ATLAS_RDMA_RS_BLOCKS=16, not 48).
+// test runs the reduce-scatter's grid at 16 blocks, oneshot.rs's RS_BLOCKS).
 extern "C" __global__ void __launch_bounds__(256, 3) rdma_chain_bf16(
     __nv_bfloat16* dst, const unsigned char* recv, uint64_t slot_stride, uint32_t bytes,
     uint32_t add, const uint64_t* flags, uint32_t rails, uint64_t* state, uint32_t* stage,

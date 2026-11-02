@@ -101,14 +101,12 @@ pub fn load_glm5_mtp_module(
     for name in glm5_mtp_marker_names(config) {
         ensure!(store.contains(&name), "native GLM MTP missing {name}");
     }
-    // Neither private attention projections nor the shared head may acquire
-    // optional lower-precision twins in strict mode.
-    for name in ["ATLAS_GLM_MTP_NVFP4_WO", "ATLAS_GLM_MTP_NVFP4_EH"] {
-        ensure!(
-            std::env::var(name).as_deref() != Ok("1"),
-            "native strict MTP refuses {name}=1"
-        );
-    }
+    // The private attention projections may not acquire an optional
+    // lower-precision twin in strict mode (the shared head never has one).
+    ensure!(
+        std::env::var("ATLAS_GLM_MTP_NVFP4_WO").as_deref() != Ok("1"),
+        "native strict MTP refuses ATLAS_GLM_MTP_NVFP4_WO=1"
+    );
     let draft = glm5_mtp_draft_config(config)?;
     let idx = config.num_hidden_layers;
     let lp = config.layer_prefix(idx);

@@ -133,7 +133,7 @@ impl Qwen3AttentionLayer {
         let step = |prof: &mut Option<std::time::Instant>, label: &str| {
             crate::layers::prefill_profile::step(ctx, stream, prof, "MLA", label)
         };
-        // ATLAS_GLM_SP_MLA_QUANT_GATHER: the input arrived cast; the index
+        // The four-rank MLA quant gather: the input arrived cast; the index
         // projections run on this rank's rows and gather beside the front.
         let cast = sp_gather::cast_input();
         let gathered_index = match cast {
@@ -162,7 +162,7 @@ impl Qwen3AttentionLayer {
         // ATLAS_GLM_SP_MLA_OPROJ_A2A: each owner's rows cast for the
         // all-to-all o_proj after the last owner (`paged_glm_a2a.rs`).
         let a2a = self.glm_oproj_a2a(num_tokens, ctx);
-        // ATLAS_GLM_SP_MLA_OPROJ_AHEAD: the o_proj a seam block at a time,
+        // The four-rank o_proj ahead: the o_proj a seam block at a time,
         // each block reduced behind it, after the last owner; the owners'
         // W_uv rows are cast for it as they are for the all-to-all.
         let ahead = match a2a {
@@ -295,7 +295,7 @@ impl Qwen3AttentionLayer {
                 }
             };
             step(&mut prof, "attn.q_b_absorb")?;
-            // ATLAS_GLM_INDEX_SPLIT_BESIDE: the selection's gathers landed.
+            // The chain's index split gathers ran beside: they landed.
             crate::layers::glm_sp_overlap::join_beside(ctx, stream)?;
             det.tap("x_q_abs", q_absorbed, (o.row0, o.rows), latent_row);
             if merge_form {

@@ -17,16 +17,15 @@
 //! A pending seam is never lost: whatever needs the reduced output or the
 //! posted highway before the next attention seam runs it whole first
 //! ([`flush`]) -- a capture layer, an attention seam that does not overlap, a
-//! layer that cannot defer its post (the last). Opt-in,
-//! `ATLAS_GLM_SP_MOE_SEAM=1`: on four nodes (integ27, 32K, four overlap
+//! layer that cannot defer its post (the last). The four-rank chain always
+//! runs it (the pair never does): on four nodes (integ27, 32K, four overlap
 //! blocks) it measured 3521 tok/s against 3633 off, exact either way -- the
 //! blocked reduce-scatter took ~8 ms where the whole one took ~5.6, more
 //! than the unpermute it hid; with its unpermute on a 32-block grid
-//! (`ATLAS_GLM_SP_MOE_SEAM_CTAS=32`) it measured 4255 against 4200 off
-//! (job 51, 32K).
+//! ([`UNPERMUTE_CTAS`]) it measured 4255 against 4200 off (job 51, 32K).
 //!
-//! With `ATLAS_RDMA_RS_FUSED_SEG` the chain runs the seam's reduce-scatter
-//! as one fused op instead of one a block: the unpermute
+//! The chain runs the seam's reduce-scatter as one fused op (its 16 MiB
+//! segment, `spark_comm`'s chain) instead of one a block: the unpermute
 //! (`moe_unpermute_rs_fused_vec8`) writes every row straight to where the op
 //! reads it and publishes it piece by piece, so the network starts on the
 //! first finished piece, and each block of the next attention seam runs once
@@ -70,27 +69,18 @@ thread_local! {
     static PENDING: Cell<Option<Pending>> = const { Cell::new(None) };
 }
 
-/// Whether a MoE layer on `sp` may leave its output seam pending: the
-/// four-rank chain (the pair keeps its own seam), when opted in.
+/// Whether a MoE layer on `sp` leaves its output seam pending: the
+/// four-rank chain (the pair keeps its own seam).
 pub fn enabled(sp: SpRows) -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    sp.ranks > 2 && *ON.get_or_init(|| std::env::var("ATLAS_GLM_SP_MOE_SEAM").as_deref() == Ok("1"))
+    sp.ranks > 2
 }
 
-/// The grid of each unpermute launch of a seam reduced ahead
-/// (`ATLAS_GLM_SP_MOE_SEAM_CTAS`; unset or 0: one block a token). A capped
-/// grid leaves SMs to the reduce-scatter running beside it: seam1.sqlite's
-/// first two reduce-scatter ops took ~3 ms each beside the whole-grid
-/// unpermute, against ~1.3 ms alone.
-pub fn unpermute_ctas() -> Option<u32> {
-    static CTAS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-    *CTAS.get_or_init(|| {
-        std::env::var("ATLAS_GLM_SP_MOE_SEAM_CTAS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n: &u32| n > 0)
-    })
-}
+/// The grid of each unpermute launch of a seam reduced ahead (the `_vec8`
+/// kernel strides it over its tokens). A capped grid leaves SMs to the
+/// reduce-scatter running beside it: seam1.sqlite's first two
+/// reduce-scatter ops took ~3 ms each beside the whole-grid unpermute,
+/// against ~1.3 ms alone.
+pub const UNPERMUTE_CTAS: u32 = 32;
 
 /// What [`begin`] asks its producer for: the unpermute of a row block of
 /// every rank's part, or of every row as the producer of a fused chain
@@ -102,7 +92,7 @@ pub enum Produce<'a> {
 
 /// Reduce `out` ahead over `blocks` and leave the blend and the post
 /// pending. When `fusable` (the producer has a fused kernel) and the chain
-/// offers it (`ATLAS_RDMA_RS_FUSED_SEG`), one fused reduce-scatter whose
+/// offers it (the payload fits its fused segment), one fused reduce-scatter whose
 /// producer writes every row (`Produce::Fused`); else a reduce-scatter a
 /// block, `produce(Produce::Block(block))` writing each block of every
 /// rank's part first.
@@ -131,9 +121,9 @@ pub fn begin(
     };
     if ctx.gpu.op_cache().once("glm:sp_moe_seam") {
         tracing::info!(
-            "ATLAS_GLM_SP_MOE_SEAM: MoE output seam reduced ahead in {} blocks (unpermute grid {:?}, {})",
+            "GLM SP MoE seam: MoE output seam reduced ahead in {} blocks (unpermute grid {}, {})",
             blocks.len(),
-            unpermute_ctas(),
+            UNPERMUTE_CTAS,
             match &fused {
                 Some(f) => format!(
                     "one fused reduce-scatter, {} pieces of {} B",

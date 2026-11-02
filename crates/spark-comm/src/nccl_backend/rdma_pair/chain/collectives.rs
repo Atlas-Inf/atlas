@@ -26,7 +26,7 @@ impl RdmaChain {
         // sums in its tree; the gather copies).
         let quarter = bytes / MAX_RANKS;
         if self.oneshot().ranks() == MAX_RANKS
-            && bytes >= ar_split_min()
+            && bytes >= AR_SPLIT_MIN
             && bytes.is_multiple_of(MAX_RANKS * 128)
             && ptr.is_multiple_of(16)
             && self.reduce_scatter(ptr, quarter as i64, quarter, false, stream)?

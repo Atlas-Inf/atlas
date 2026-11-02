@@ -4,6 +4,12 @@
 
 use super::{MAX_LIMIT, MIN_MAX, RS_BIT, SPLIT_MIN};
 
+/// The fused reduce-scatter's segment capacity on the four-rank chain: 16
+/// MiB (whole 64 KiB), the four-rank profile's. Each rank pins
+/// `fused::entries` of these after its command ring.
+pub(in crate::nccl_backend::rdma_pair) const RS_FUSED_SEG: usize = 16 << 20;
+const _: () = assert!(RS_FUSED_SEG.is_multiple_of(64 << 10));
+
 /// One-shot settings; read from the shared profile, and checked equal on both
 /// ranks at bootstrap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,9 +33,9 @@ pub(in crate::nccl_backend::rdma_pair) struct Config {
     /// Launch the kernel with programmatic dependent launch under `sm_stage`
     /// (`ATLAS_RDMA_ONESHOT_PDL`, default 1); local only.
     pub(in crate::nccl_backend::rdma_pair) pdl: bool,
-    /// The fused reduce-scatter's segment capacity in bytes
-    /// (`ATLAS_RDMA_RS_FUSED_SEG`, whole 64 KiB; 0 = off): a chain region of
-    /// `fused::entries` of these. Every rank must agree (the chain head).
+    /// The fused reduce-scatter's segment capacity in bytes ([`RS_FUSED_SEG`];
+    /// 0 = off): a chain region of `fused::entries` of these. Every rank must
+    /// agree (the chain head).
     pub(in crate::nccl_backend::rdma_pair) fused_seg: usize,
 }
 
@@ -64,7 +70,7 @@ impl Config {
                 _ => 0,
             },
             pdl: var("ATLAS_RDMA_ONESHOT_PDL").as_deref() != Some("0"),
-            fused_seg: num("ATLAS_RDMA_RS_FUSED_SEG", 0) / (64 << 10) * (64 << 10),
+            fused_seg: RS_FUSED_SEG,
         })
     }
 
