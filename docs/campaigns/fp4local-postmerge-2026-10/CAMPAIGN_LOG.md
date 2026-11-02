@@ -1762,3 +1762,17 @@ Gate 68b runs next after 68a, the Qwen4 sanitizer boot.
 - The PLE synth still needs n-gram shards: the loader refuses a PLE layer with no deferred shard table. That's a deliberate guard, not a bug.
 
 Queue: 74 (BFCL A1) → 74a (Qwen4 perf) → 75 (27B gate-recipe BFCL).
+
+## 2026-11-02 02:40 UTC — knob attribution complete
+
+| arm (vs main 8c2b67218) | agentic-50 | BFCL overall / norm |
+|---|---|---|
+| A0 main (565aa68 policy) | 47/50 | 87.54 / 85.94 |
+| A1 sampling rows (presence 1.5) | 49/50 | 87.74 / 86.81 (run-1793586397429843659) |
+| A2 `verbatim_prompt` off | 50/50 | 87.54 / 87.79 |
+| A6 full revert | 50/50 | 88.04 / 88.08 |
+
+- `verbatim_prompt` carries most of the cost; presence 1.5 is a smaller lever that partly overlaps it.
+- Final table posted on #271. The policy decision is left to the maintainers.
+- Qwen4 day-0 status is kept locally (`~/code/qwen4-prework/QWEN4-27B-SPEC.md`). The 64-layer synth boots and serves on the draft.
+- Running now: 75, the 27B NVFP4 BFCL gate recipe on the newest main image.
