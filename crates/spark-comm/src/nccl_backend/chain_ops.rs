@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The RDMA chain's side of [`NcclBackend`]: connecting it and reaching its
-//! collectives (`rdma_pair::chain`). Everything is `false` or empty off the
-//! chain, so two ranks and NCCL never come here on a fast path.
+//! collectives (`rdma_pair::chain`). Off the chain everything here is `false`
+//! or empty.
 
 use super::NcclBackend;
 #[cfg(atlas_rdma_verbs)]
