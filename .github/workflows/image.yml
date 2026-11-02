@@ -30,6 +30,7 @@ on:
       - 'kernels/**'
       - 'vendor/**'
       - 'jinja-templates/**'
+      - 'third_party/**'
       - 'docker/gb10/Dockerfile'
       - 'Cargo.toml'
       - 'Cargo.lock'
