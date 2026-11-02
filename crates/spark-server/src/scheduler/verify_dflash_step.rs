@@ -373,7 +373,9 @@ pub(super) fn verify_dflash_tail(
     // recurrent state. The worker rank has already committed these rows (it
     // acts on the verdict word above), so a head that returned first kept a
     // state that matched neither `seq.tokens` nor the other rank.
-    let k_verify = drafts.len() + 1;
+    // The rows the target verified: an owner of a batch with dead rows
+    // judges fewer drafts than it verified rows.
+    let k_verify = tokens.len();
     let total_accepted = num_accepted + 1; // bonus is always "accepted"
     if let Err(e) = model.commit_accepted_prefix(&mut a.seq, total_accepted, k_verify) {
         tracing::error!("commit_accepted_prefix (dflash): {e:#}");

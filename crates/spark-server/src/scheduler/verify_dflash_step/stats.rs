@@ -20,6 +20,9 @@ pub(super) fn record(
         drafts.first() == verified.first(),
         num_accepted,
     );
+    crate::metrics::SPEC_DECODE_NUM_DRAFTS.inc();
+    crate::metrics::SPEC_DECODE_NUM_DRAFT_TOKENS.inc_by(drafts.len() as u64);
+    crate::metrics::SPEC_DECODE_NUM_ACCEPTED_TOKENS.inc_by(num_accepted.min(drafts.len()) as u64);
     if !dflash_verify_raw_argmax {
         // Ceiling 0: DFlash widths are not the MTP dynamic depth's.
         a.mtp_acct

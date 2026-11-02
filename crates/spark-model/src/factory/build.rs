@@ -697,6 +697,15 @@ pub fn build_model(
         ssm_cache_slots,
         gpu.as_ref(),
     )?;
+    // ATLAS_DFLASH_WARM_CTX=restore: the drafter window store, reserved here
+    // so the KV budget below sees it as used (nothing otherwise).
+    let dflash_warm_store = crate::layers::dflash_head::WarmCtxStore::for_build(
+        gpu.as_ref(),
+        config.dflash_capture_layers.len(),
+        config.hidden_size,
+        config.dflash_ctx_window,
+        comm.as_deref().is_none_or(|c| c.rank() == 0),
+    )?;
 
     // Materialize the inference reserve as a "balloon" allocation held across
     // KV residual sizing, then freed right after the KV pool claims its
@@ -1131,6 +1140,7 @@ pub fn build_model(
         ssm_checkpoint_interval,
         ssm_pools,
     )?;
+    model.set_dflash_warm_store(dflash_warm_store);
     if let Some(arena) = pipe_arena {
         model.set_prefill_pipe(arena)?;
     }
