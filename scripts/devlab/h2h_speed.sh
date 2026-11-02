@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# DevLab Strix bench: engine head-to-head speed, on the protocol Atlas's headline uses (gufo_bench.py: pp ~2048 / tg128 at
+# depth 0/8192/16384, then C 1/4/8 steady aggregate decode), so rows compare directly with the Atlas numbers.
+#
+#   scripts/devlab/h2h_speed.sh <gufo|llamacpp> <27b|fnext> [KEY=VAL ...]     KEYS: SESSIONS (8), CONTEXT (32768)
+# gufo arms:     ar, and its speculative leg (DFlash2 for 27B, MTP for Flash-Next) -- each engine's own performance leg
+# llamacpp arms: nvfp4 (NVIDIA's checkpoint through llama.cpp's own converter, if it converts) and q4 (the Unsloth
+#                UD-Q4_K_XL Gufo uses); stock llama.cpp has no speculative leg for these models.
+set -uo pipefail
+ENGINE=${1:?gufo|llamacpp}; MK=${2:?27b|fnext}
+for kv in "${@:3}"; do [[ "$kv" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9_./:,+-]*$ ]] && export "$kv"; done
+SESSIONS=${SESSIONS:-8}; CONTEXT=${CONTEXT:-32768}; PORT=18086
+OUT=${DEVLAB_OUT:-$PWD/devlab-out}; mkdir -p "$OUT"; RES="$OUT/RESULTS.txt"
+HERE=$(cd "$(dirname "$0")" && pwd); . "$HERE/lib_engines.sh"
+model_spec "$MK" || exit 1; pyhf
+t0=$(date +%s); Q4D=$(hf_get "$Q4_REPO" "$Q4_PAT" "$Q4_REV") || { log "Q4 DOWNLOAD FAILED: $(tail -2 "$OUT/download.log")"; exit 1; }
+Q4=$(first_gguf "$Q4D" "$Q4_PAT"); log "$MK q4: $Q4_REPO $(basename "$Q4") ($(du -shL "$Q4" | cut -f1)) in $(( $(date +%s) - t0 ))s"
+
+bench_arm() { # arm-name
+  if ! wait_ready $PORT; then log "$1 SERVE FAILED:"; ENGINE_DOWN "$OUT/serve-$1.log"; grep -aiE "error|fail|memory|alloc" "$OUT/serve-$1.log" | tail -5 | tee -a "$RES"; return 1; fi
+  log "$1 serving (model id $MID)"
+  python3 "$HERE/gufo_bench.py" $PORT "$1" "$OUT/$1.json" --depths 0,8192,16384 --cs 1,4,8 --kinds mixed 2>&1 | grep -aE "^\s+\[" | tee -a "$RES"
+  ENGINE_DOWN "$OUT/serve-$1.log"
+}
+
+case $ENGINE in
+gufo)
+  gufo_build || exit 1
+  gufo_up $PORT "$SESSIONS" "$CONTEXT" "$Q4"; bench_arm gufo_ar
+  if [ -n "$DRAFT_REPO" ]; then
+    DD=$(hf_get "$DRAFT_REPO" "$DRAFT_PAT") && DR=$(first_gguf "$DD" "$DRAFT_PAT")
+    [ -n "${DR:-}" ] && { gufo_up $PORT "$SESSIONS" "$CONTEXT" "$Q4" --speculative dflash2 --dflash-model "$DR"; bench_arm gufo_dflash2; } || log "draft download failed"
+  else
+    MD=$(hf_get "$Q4_REPO" "MTP/*" "$Q4_REV") && MT=$(first_gguf "$MD" "MTP/*.gguf")
+    [ -n "${MT:-}" ] && { gufo_up $PORT "$SESSIONS" "$CONTEXT" "$Q4" --speculative mtp --mtp-model "$MT"; bench_arm gufo_mtp; }
+  fi ;;
+llamacpp)
+  llama_build || exit 1
+  if llama_convert_nvfp4 "$NVFP4_REPO"; then
+    llama_up $PORT "$SESSIONS" "$CONTEXT" "$NVFP4_GGUF"; bench_arm llamacpp_nvfp4
+    "$LB/llama-bench" -m "$NVFP4_GGUF" -ngl 99 -p 2048 -n 128 -r 2 -o md 2>"$OUT/bench-nvfp4.err" | tee -a "$RES" || tail -3 "$OUT/bench-nvfp4.err" | tee -a "$RES"
+  fi
+  llama_up $PORT "$SESSIONS" "$CONTEXT" "$Q4"; bench_arm llamacpp_q4
+  "$LB/llama-bench" -m "$Q4" -ngl 99 -p 2048 -n 128 -r 2 -o md 2>"$OUT/bench-q4.err" | tee -a "$RES" || tail -3 "$OUT/bench-q4.err" | tee -a "$RES" ;;
+*) log "unknown engine $ENGINE"; exit 1 ;;
+esac
+log "DONE"
