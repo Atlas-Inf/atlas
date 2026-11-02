@@ -54,13 +54,15 @@ for arm in ar mtp; do
     --sessions "$SESSIONS" --context "$CONTEXT" $extra > /dev/null
   ok=0
   for _ in $(seq 1 240); do
-    curl -s -m 60 "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
-      -d '{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":2}' 2>/dev/null | grep -q choices && { ok=1; break; }
+    # Gufo serves the model under its own id (a request for "m" is a 404 model_not_found): ask /v1/models first.
+    MID=$(curl -s -m 10 "http://127.0.0.1:$PORT/v1/models" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['data'][0]['id'])" 2>/dev/null)
+    [ -n "$MID" ] && curl -s -m 60 "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
+      -d "{\"model\":\"$MID\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":2}" 2>/dev/null | grep -q choices && { ok=1; break; }
     docker ps -q -f name=gufo-fn | grep -q . || break; sleep 5
   done
   docker logs gufo-fn > "$OUT/serve-$arm.log" 2>&1
   if [ $ok != 1 ]; then log "$arm SERVE FAILED:"; grep -aiE "error|fail|memory|alloc" "$OUT/serve-$arm.log" | tail -6 | tee -a "$RES"; docker rm -f gufo-fn >/dev/null 2>&1; continue; fi
-  log "$arm serving"
+  log "$arm serving (model id $MID)"
   python3 "$HERE/gufo_bench.py" $PORT "gufo_${arm}" "$OUT/gufo-$arm.json" --depths 0,8192,16384 --cs 1,4,8 --kinds mixed 2>&1 \
     | grep -aE "^\s+\[" | tee -a "$RES"
   docker logs gufo-fn > "$OUT/serve-$arm.log" 2>&1; docker rm -f gufo-fn >/dev/null 2>&1
