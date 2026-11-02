@@ -21,7 +21,7 @@ fn glm_budget_tower(config: &atlas_core::config::ModelConfig) -> bool {
 }
 
 /// Whether this rank only receives encoded vision rows: a worker of a GLM-5
-/// world past the pair. Rank 0 encodes every item and broadcasts its rows
+/// multi-rank world. Rank 0 encodes every item and broadcasts its rows
 /// (`EP_CMD_VISION_STATE`), so a worker loads no vision weights and allocates
 /// only the row buffer. Decided from the configuration alone, so the weight
 /// loader and the model builder agree.

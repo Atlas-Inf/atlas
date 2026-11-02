@@ -104,7 +104,7 @@ impl GlmCapacity {
         }
     }
 
-    /// The tower of `config`'s world: past the pair, the budgets.
+    /// The tower of `config`'s world: on many ranks, the budgets.
     pub(crate) fn of_world(
         config: &atlas_core::config::ModelConfig,
         vision: &VisionConfig,
