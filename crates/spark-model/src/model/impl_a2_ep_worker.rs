@@ -160,6 +160,11 @@ impl TransformerModel {
         cmd: u32,
         slots: &mut [Option<SequenceState>],
     ) -> Result<Option<bool>> {
+        if cmd == super::native_mtp_prefix::EP_CMD_NATIVE_PREFIX_PROBE {
+            return self
+                .native_prefix_receive_probe(slots.get(seq_id as usize).and_then(Option::as_ref))
+                .map(Some);
+        }
         if cmd == super::glm_long_verify::EP_CMD_GLM_LONG_VERIFY {
             return self.glm_long_receive_verify(slots).map(Some);
         }

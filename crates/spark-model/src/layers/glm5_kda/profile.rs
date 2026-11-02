@@ -4,13 +4,7 @@ use anyhow::Result;
 
 use crate::layer::ForwardContext;
 
-pub(super) fn start(ctx: &ForwardContext, stream: u64) -> Result<Option<std::time::Instant>> {
-    if !ctx.profile {
-        return Ok(None);
-    }
-    ctx.gpu.synchronize(stream)?;
-    Ok(Some(std::time::Instant::now()))
-}
+pub(super) use crate::layers::prefill_profile::start;
 
 pub(super) fn step(
     ctx: &ForwardContext,
@@ -18,14 +12,5 @@ pub(super) fn step(
     timer: &mut Option<std::time::Instant>,
     label: &str,
 ) -> Result<()> {
-    let Some(started) = timer.take() else {
-        return Ok(());
-    };
-    ctx.gpu.synchronize(stream)?;
-    tracing::info!(
-        "  GLM KDA prefill [{label}]: {}us",
-        started.elapsed().as_micros()
-    );
-    *timer = Some(std::time::Instant::now());
-    Ok(())
+    crate::layers::prefill_profile::step(ctx, stream, timer, "KDA", label)
 }

@@ -126,9 +126,12 @@ impl TransformerModel {
         // layer's per-row phase applies (`verify_context_limit` is unbounded).
         let qsa_rows_in_batch =
             self.levers.qwen4exp_batch_fast && self.verify_context_limit().is_none();
-        let hc_perseq = self.config.hc_mult > 0
-            && ((qsa_active && !qsa_rows_in_batch)
-                || std::env::var("ATLAS_HC_PERSEQ_DECODE").as_deref() == Ok("1"));
+        // Native strict serial controls must use the same canonical one-row
+        // verifier as speculative verification, including with several owners.
+        let hc_perseq = self.native_glm_mtp
+            || (self.config.hc_mult > 0
+                && ((qsa_active && !qsa_rows_in_batch)
+                    || std::env::var("ATLAS_HC_PERSEQ_DECODE").as_deref() == Ok("1")));
         // Parallel comm: the batched forward has no per-row QSA hook under EP
         // (`multi_seq/guard.rs` refuses an active row with comm present), so a
         // highway batch with an ACTIVE selection takes the per-seq loop below,
@@ -424,6 +427,12 @@ impl TransformerModel {
             for (i, seq) in seqs.iter_mut().enumerate() {
                 seq.tokens.push(tokens[i]);
                 seq.seq_len += 1;
+                self.capture_native_mtp_serial(
+                    seq,
+                    tokens[i],
+                    self.buffers.norm_output().offset(i * h * 2),
+                    stream,
+                )?;
             }
             if let Some(rows) = serial_check {
                 self.batch_fast_compare(rows, self.decode_logits_ptr())?;
@@ -678,6 +687,12 @@ impl TransformerModel {
         for (i, seq) in seqs.iter_mut().enumerate() {
             seq.tokens.push(tokens[i]);
             seq.seq_len += 1;
+            self.capture_native_mtp_serial(
+                seq,
+                tokens[i],
+                self.buffers.norm_output().offset(i * h * 2),
+                stream,
+            )?;
         }
         if let Some(rows) = serial_check {
             self.batch_fast_compare(rows, self.decode_logits_ptr())?;

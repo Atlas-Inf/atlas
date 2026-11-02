@@ -72,3 +72,53 @@ fn long_context_lane_refuses_without_dflash() {
         .unwrap_err();
     assert!(format!("{err:#}").contains("GLM DFlash lane"), "{err:#}");
 }
+
+#[test]
+fn strict_native_mtp_retains_c4_full_context_and_prefix_cache() {
+    if isolated(
+        "long_context::strict_native_mtp_retains_c4_full_context_and_prefix_cache",
+        &[
+            ("ATLAS_GLM_MTP_LONG_CONTEXT", "1"),
+            ("ATLAS_GLM_STRICT_NATIVE_MTP", "1"),
+            ("ATLAS_GLM_SERVING_MODE", "strict"),
+            ("ATLAS_GLM_FP4L_NATIVE", "1"),
+            ("ATLAS_GLM_FP4L_MLA_FP8", "1"),
+            ("ATLAS_GLM_FP4L_DENSE_MXFP8", "1"),
+            ("ATLAS_GLM_FP4L_KDA_W8A8_PREFILL", "1"),
+            ("ATLAS_GLM_FP4L_INPUT_SCALES", "1"),
+            ("ATLAS_GLM_FP4L_FP8_PREFILL", "w8a8"),
+            ("ATLAS_GLM_LM_HEAD_MXFP8", "1"),
+            ("ATLAS_GLM_FP4L_KDA_TILED_TWIN", "0"),
+            ("ATLAS_GLM_FP4L_SHARED_FP8", "1"),
+            ("ATLAS_GLM_FP4L_KDA_MXFP8_DECODE", "1"),
+            ("ATLAS_GLM_FP4L_DECODE_A16", "1"),
+        ],
+    ) {
+        return;
+    }
+    for rank in 0..2 {
+        let mut a = args(4, rank);
+        a.speculative = true;
+        a.num_drafts = Some(6);
+        a.max_seq_len = 1_048_576;
+        a.max_prefill_tokens = 8192;
+        a.enable_prefix_caching = true;
+        let (topology, reserve) = prepare_reserve(&a, &mut config(), 128usize << 30).unwrap();
+        assert_eq!(topology.unwrap().tp_rank, rank);
+        assert_eq!(
+            reserve.inference_reserve,
+            reserve.gdn_two_phase_bytes + (512usize << 20)
+        );
+        // Mixing speculative families must not gain the native exception.
+        a.speculative = false;
+        a.dflash = true;
+        assert!(prepare_reserve(&a, &mut config(), 128usize << 30).is_err());
+        a.speculative = true;
+        a.dflash = false;
+        a.max_num_seqs = 5;
+        assert!(prepare_reserve(&a, &mut config(), 128usize << 30).is_err());
+        a.max_num_seqs = 4;
+        a.max_seq_len += 1;
+        assert!(prepare_reserve(&a, &mut config(), 128usize << 30).is_err());
+    }
+}

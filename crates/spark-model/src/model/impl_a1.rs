@@ -225,6 +225,7 @@ impl TransformerModel {
         let ssm_snapshots = ssm_pools.snapshots;
         let ssm_tier_store = ssm_pools.tier_store;
         let has_mtp = ssm_pools.has_mtp;
+        let native_glm_mtp = ssm_pools.native_glm_mtp;
         let dflash_kgamma = ssm_pools.dflash_kgamma;
         if ssm_checkpoint_interval > 0 && ssm_cache_slots > 0 {
             tracing::info!(
@@ -737,6 +738,7 @@ impl TransformerModel {
             profile,
             profile_first_pending: std::sync::atomic::AtomicBool::new(profile_first),
             proposer,
+            native_glm_mtp,
             draft_assist: None,
             lightning_dspark_identity: Default::default(),
             mtp_hidden_save,
@@ -756,6 +758,7 @@ impl TransformerModel {
             mtp_prefill_capture_gen: std::sync::atomic::AtomicU64::new(0),
             dspark_sequence_generation: std::sync::atomic::AtomicU64::new(0),
             mtp_carry: parking_lot::Mutex::new(None),
+            native_mtp_prefix: parking_lot::Mutex::new(Vec::new()),
             mtp_store_range: parking_lot::Mutex::new((0, 0)),
             dflash_hidden_save,
             dflash_hidden_save_rows,

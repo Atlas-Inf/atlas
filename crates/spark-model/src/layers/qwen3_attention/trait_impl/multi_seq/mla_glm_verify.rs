@@ -21,7 +21,8 @@ impl Qwen3AttentionLayer {
         let rows_ok = if policy::enabled() {
             c.n == 3
         } else {
-            policy::dflash_enabled() && (2..=policy::MAX_DFLASH_VERIFY_ROWS).contains(&c.n)
+            policy::canonical_target_enabled()
+                && (2..=policy::MAX_DFLASH_VERIFY_ROWS).contains(&c.n)
         };
         ensure!(
             rows_ok

@@ -34,7 +34,7 @@ impl Qwen3AttentionLayer {
             self.block_idx != 0 && self.block_idx + 1 != ctx.config.num_hidden_layers,
             "GLM long owner batch MLA cannot be the first or last layer"
         );
-        if crate::speculative::glm_repair_policy::dflash_enabled() {
+        if crate::speculative::glm_repair_policy::canonical_target_enabled() {
             return self.glm_long_owners_mla_chunk(owners, kv_cache, stage, ctx, stream);
         }
         let rows = long_owner::owner_rows(owners)?;

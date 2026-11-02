@@ -20,6 +20,7 @@ impl TransformerModel {
     pub(super) fn prefill_b_forward_layers(
         &self,
         seq: &mut SequenceState,
+        tokens: &[u32],
         kv_cache: &mut PagedKvCache,
         chunk_start: usize,
         chunk_len: usize,
@@ -514,6 +515,14 @@ impl TransformerModel {
         // Ported from Enntity/atlas e7d4e1a (AGPL-3.0-only).
         let held = sp.map_or(proc_count, |s| if s.row0 == 0 { s.rows } else { 0 });
         self.note_mtp_prompt_rows(seq, effective_seq_len_start, held, 0);
+        self.capture_native_mtp_prefill(
+            seq,
+            tokens,
+            effective_seq_len_start,
+            proc_count,
+            hidden,
+            stream,
+        )?;
         self.prefill_b_forward_layers_profile_tail(
             seq,
             effective_seq_len_start,

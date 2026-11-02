@@ -121,7 +121,7 @@ impl TransformerModel {
         let lane = if policy::enabled() {
             rows == K3_ROWS && policy::long_context_enabled()
         } else {
-            policy::dflash_enabled()
+            policy::canonical_target_enabled()
         };
         self.glm_long_stage.is_some()
             && owner::width_supported(owners, rows)
@@ -415,7 +415,16 @@ impl TransformerModel {
             stream,
         )?;
         let argmax = self.buffers.scratch();
-        if !self.glm_split_head_argmax(normed, total, argmax, (ban_rows, &ban), None, stream)? {
+        let split =
+            self.glm_split_head_argmax(normed, total, argmax, (ban_rows, &ban), None, stream)?;
+        if split && self.native_glm_mtp {
+            self.glm_split_head_full_rows(total, stream)?;
+        }
+        if !split {
+            ensure!(
+                !self.native_glm_mtp,
+                "native GLM MTP requires the MXFP8 split target head"
+            );
             self.lm_head_batched(normed, total as u32, self.buffers.logits(), stream)?;
             let vocab = self.config.vocab_size;
             for r in 0..total {

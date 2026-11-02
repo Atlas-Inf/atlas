@@ -160,10 +160,16 @@ pub fn start_chunked_prefill(
     // A chunk end on the prefill cut grid is unchanged when the grid is a
     // multiple of the granule (the shipped grids, 1024 and 4096, are).
     let g = spark_runtime::prefill_chunk_granule();
-    if chunk_len < total && g > 4 && chunk_len >= g {
-        chunk_len -= chunk_len % g;
+    // TP4's sequence-parallel prefill splits the rows over every rank: a chunk
+    // off its row multiple would keep it off (`chunk_alignment`).
+    let multiple = model.prefill_row_multiple();
+    if chunk_len < total && (g > 4 || multiple > 1) {
+        chunk_len = super::chunk_align(chunk_len, multiple);
     }
-    let is_last = chunk_len >= total;
+    let mut is_last = chunk_len >= total;
+    if is_last {
+        (chunk_len, is_last) = super::sp_final_cut(chunk_len, multiple);
+    }
 
     tracing::info!(
         "Chunked prefill start: {} prompt tokens, chunk_size={}, max_tokens={max_tokens}",

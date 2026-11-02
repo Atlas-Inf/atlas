@@ -96,7 +96,8 @@ pub(super) fn plan_verify(
     // DSpark is included unless ATLAS_NO_DFLASH_BATCH_VERIFY (presence). MTP
     // still uses !dflash via the model self-gate (`dflash_hidden_save`).
     let dspark_batch_ok = !dflash_verify_raw_argmax || !dspark_batch_verify_disabled();
-    if spark_model::speculative::glm_repair_policy::enabled()
+    if model.native_mtp_enabled()
+        || spark_model::speculative::glm_repair_policy::enabled()
         || !spark_model::speculative::mtp_multi_seq_mode()
         || !dspark_batch_ok
         || batch_verify_disabled()

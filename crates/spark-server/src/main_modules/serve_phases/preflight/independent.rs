@@ -39,10 +39,12 @@ fn prepare_topology(args: &cli::ServeArgs, config: &mut ModelConfig) -> Result<O
     }
     if spark_model::speculative::glm_repair_policy::long_context_enabled() {
         anyhow::ensure!(
-            args.dflash
-                && spark_model::speculative::glm_repair_policy::dflash_enabled()
+            ((args.dflash && spark_model::speculative::glm_repair_policy::dflash_enabled())
+                || (args.speculative
+                    && !args.dflash
+                    && spark_model::weight_loader::glm5_mode::strict_native_mtp()))
                 && config.model_type == "glm5_next",
-            "long-context GLM preparation requires the GLM DFlash lane"
+            "long-context GLM preparation requires the GLM DFlash lane or explicit strict native MTP"
         );
         let topology = resolve_topology(args, config)?;
         anyhow::ensure!(

@@ -448,3 +448,6 @@ pub(super) fn compact_survivors_into_range(model: &dyn Model, survivors: &mut [A
 mod admission_hold;
 mod send;
 pub use send::*;
+
+mod chunk_alignment;
+pub(super) use chunk_alignment::{chunk_align, sp_final_cut};

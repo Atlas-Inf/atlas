@@ -125,7 +125,9 @@ impl TransformerModel {
     /// The split head serves GLM verifies, which then leave half of the
     /// logits buffer stale: verify picks must stay on the raw argmax.
     pub(crate) fn glm_verify_logits_argmax_only(&self) -> bool {
-        self.glm_split_head_decline(1).is_none()
+        // Native MTP completes every split row before returning from verify,
+        // so its target logits support the ordinary processor/logprob path.
+        !self.native_glm_mtp && self.glm_split_head_decline(1).is_none()
     }
 
     /// Project `normed` [rows, H] and write global argmax IDs to `out` [rows].

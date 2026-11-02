@@ -37,6 +37,10 @@ impl TransformerModel {
         if k == 0 {
             return Ok(Vec::new());
         }
+        anyhow::ensure!(
+            !self.native_glm_mtp || self.native_canonical_target_ready(),
+            "native GLM MTP requires canonical BF16 HC, TP2/EP2 or TP4/EP4, and a prepared MXFP8 split head"
+        );
         let ban = seq.eos_ban;
         let ban_rows = ban.row_mask(seq.seq_len, k);
         if self.lightning_dspark_identity.policy().is_some()
@@ -170,8 +174,9 @@ impl TransformerModel {
         // next block, which re-finalizes the pools it touches. KDA layers keep
         // the verify path that snapshots per-row recurrent state.
         let glm_prefill_ctx = (self.config.model_type == "glm5_next"
-            && crate::speculative::glm_repair_policy::dflash_enabled()
-            && crate::speculative::glm_repair_policy::dflash_prefill_verify()
+            && self.canonical_glm_target_enabled()
+            && (self.native_glm_mtp
+                || crate::speculative::glm_repair_policy::dflash_prefill_verify())
             && !hss_engaged
             && !use_graphs
             // ATLAS_GLM_CANONICAL_VERIFY: one row too, so a lone row runs the
@@ -392,14 +397,16 @@ impl TransformerModel {
             // LM head + argmax for K tokens, inside the graph (fixed scratch
             // addresses — graph-safe).
             let argmax_out = self.buffers.scratch();
-            if !self.glm_split_head_argmax(
-                normed,
-                k,
-                argmax_out,
-                (ban_rows, &ban),
-                allow,
-                stream,
-            )? {
+            let split_argmax =
+                self.glm_split_head_argmax(normed, k, argmax_out, (ban_rows, &ban), allow, stream)?;
+            if split_argmax && self.native_glm_mtp {
+                self.glm_split_head_full_rows(k, stream)?;
+            }
+            if !split_argmax {
+                anyhow::ensure!(
+                    !self.native_glm_mtp,
+                    "native GLM MTP requires the released MXFP8 split target head"
+                );
                 anyhow::ensure!(
                     allow.is_none(),
                     "masked verify needs the GLM vocab-split head, which declined"

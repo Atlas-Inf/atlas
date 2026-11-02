@@ -8,6 +8,17 @@ use crate::layer::ForwardContext;
 use crate::layers::glm_sp::{self, SpRows};
 
 impl TransformerModel {
+    /// Rows a long prefill chunk is cut to a multiple of so its split lands on
+    /// whole tiles of 128 rows a rank; 1 on the pair and off the split.
+    pub(super) fn glm_sp_row_multiple(&self) -> usize {
+        let ranks = self.comm.as_ref().map_or(1, |c| c.world_size());
+        if glm_sp::requested() && self.config.model_type == "glm5_next" && ranks > 2 {
+            128 * ranks
+        } else {
+            1
+        }
+    }
+
     /// This rank's rows when the chunk runs sequence-parallel. Every input is
     /// mirrored on both ranks, so both reach the same answer.
     pub(super) fn glm_prefill_sp_rows(
