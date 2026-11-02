@@ -4,7 +4,7 @@
 #
 #   scripts/devlab/llamacpp_nvfp4.sh <hf-model> [KEY=VAL ...]
 #   e.g.  scripts/devlab/llamacpp_nvfp4.sh nvidia/Qwen3.8-Flash-Next-NVFP4
-#   KEYS: LLAMA_REF (default: latest release tag), FALLBACK_GGUF (repo:file-glob to bench if NVFP4 conversion fails)
+#   KEYS: LLAMA_REF (default: latest release tag), CONVERT_ARGS (extra convert_hf_to_gguf.py flags, e.g. --no-mtp), FALLBACK_GGUF (repo:file-glob to bench if NVFP4 conversion fails)
 #
 # Steps, each logged to $DEVLAB_OUT/RESULTS.txt with its outcome:
 #   1. build llama.cpp (release tag) with the HIP backend for gfx1151 (stock flags: GGML_HIP=ON, AMDGPU_TARGETS=gfx1151)
@@ -48,7 +48,8 @@ SRC=$(python3 -c "import sys; from huggingface_hub import snapshot_download; pri
 log "model ready in $(( $(date +%s) - t0 ))s at $SRC ($(du -shL "$SRC" | cut -f1))"
 GG="$S/$(basename "$MODEL")-from-nvfp4.gguf"; rm -f "$GG"
 t0=$(date +%s)
-if python3 "$W/llama.cpp/convert_hf_to_gguf.py" "$SRC" --outtype auto --outfile "$GG" > "$OUT/convert.log" 2>&1; then
+log "convert args: --outtype auto ${CONVERT_ARGS:-}"
+if python3 "$W/llama.cpp/convert_hf_to_gguf.py" "$SRC" --outtype auto ${CONVERT_ARGS:-} --outfile "$GG" > "$OUT/convert.log" 2>&1; then
   log "CONVERT OK in $(( $(date +%s) - t0 ))s: $(du -h "$GG" | cut -f1)"
   python3 - "$GG" <<'PY' | tee -a "$RES"
 import sys, collections
