@@ -7,6 +7,27 @@ use spark_runtime::gpu::DevicePtr;
 
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 
+/// GLM-5.3 k-pool semantic-indexer weights.
+///
+/// The indexer scores groups of `index_kpool` history tokens independently
+/// from the main MLA projections, then expands the selected pools into raw
+/// token indices for sparse attention.
+pub struct GlmIndexerWeights {
+    /// `[index_n_heads * index_head_dim, q_lora_rank]`.
+    pub wq_b: DenseWeight,
+    /// `[index_head_dim, hidden]`.
+    pub wk: DenseWeight,
+    /// `[index_n_heads, hidden]`.
+    pub weights_proj: DenseWeight,
+    /// `[index_head_dim, hidden]`.
+    pub kpool_gate: DenseWeight,
+    /// `[index_kpool, index_head_dim]`.
+    pub kpool_ape: DenseWeight,
+    /// Standard LayerNorm affine parameters for projected history keys.
+    pub k_norm_weight: DenseWeight,
+    pub k_norm_bias: DenseWeight,
+}
+
 /// MLA (Multi-head Latent Attention) weight components for 2-step decode.
 ///
 /// Instead of a single Q GEMV: `input × Q_expanded → Q[n_heads*hd]`,
@@ -77,6 +98,8 @@ pub struct MlaWeights {
     pub nope: usize,
     pub rope: usize,
     pub v_dim: usize,
+    /// GLM-5.3 semantic indexer. `None` for other MLA architectures.
+    pub glm_indexer: Option<GlmIndexerWeights>,
     /// DeepSeek Sparse Attention compressor (CSA ratio-4 / HCA ratio-128).
     /// `None` for full-attention layers (`compress_ratios[L]` == 0).
     pub compressor: Option<CompressorWeights>,
@@ -147,10 +170,12 @@ pub struct CompressorWeights {
 /// Both share the `[T, hc_mult, H]` highway and `hc_mult`, so the presence of
 /// this struct — not the model name — is what selects the kernel.
 ///
-/// All BF16, matching the checkpoint. See `bench/qwen4_exp/ARCHITECTURE.md` §1.
+/// All BF16 except `norm_w` (F32). See `bench/qwen4_exp/ARCHITECTURE.md` §1.
 #[derive(Clone, Copy)]
 pub struct HcLowRank {
-    /// `hc_norm` `[hc_mult*hidden]`. A GROUPED RMSNorm scale: the streams
+    /// `hc_norm` `[hc_mult*hidden]` **F32** — every consumer kernel is
+    /// declared `const float*`; the loader (`dense_keep_f32`) guarantees the
+    /// dtype. A GROUPED RMSNorm scale: the streams
     /// normalize independently inside the vector, `group_size = hidden`.
     pub norm_w: DevicePtr,
     /// `input_mix_weight_down` `[rank, hc_mult*hidden]`.
@@ -182,6 +207,13 @@ pub struct HcSiteWeights {
     /// Mix projection `fn`: `[mix_hc, hc_mult*hidden]` f32, where
     /// `mix_hc = (2 + hc_mult) * hc_mult`.
     pub hc_fn: DevicePtr,
+    /// The checkpoint's own `fn` when it is stored as BF16 (then `hc_fn` is
+    /// its exact widening): read by the decode seam's BF16-weight partial
+    /// (`ATLAS_GLM_HC_SEAM_ILP`). A weight-store pointer, never allocated
+    /// here: valid while the store keeps that checkpoint tensor (for the
+    /// model's life today; a loader that retires consumed checkpoint tensors
+    /// must keep it or set this NULL). NULL otherwise.
+    pub hc_fn_bf16: DevicePtr,
     /// Mix bias `base`: `[mix_hc]` f32.
     pub hc_base: DevicePtr,
     /// Mix scale: `[3]` f32 (pre / post / comb scalars).
@@ -235,4 +267,10 @@ pub struct HcWeights {
     /// an UNNORMALIZED one, since `hyper_connection_mixer` is the model's
     /// final norm and the checkpoint ships no `model.norm.weight`.
     pub is_last_model_layer: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HeadGateActivation {
+    Sigmoid,
+    Softplus,
 }

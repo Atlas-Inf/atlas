@@ -39,7 +39,7 @@ use super::sanitizer::*;
 
 pub(crate) fn strip_thinking_tags(text: &str) -> String {
     let default_parser = crate::reasoning_parser::ReasoningFormat::Qwen.into_parser();
-    extract_thinking(text, false, Some(&*default_parser)).1
+    extract_thinking(text, false, false, Some(&*default_parser)).1
 }
 
 /// Residual thinking-marker scrub for the assistant `content` channel.
@@ -115,20 +115,24 @@ mod scrub_think_tests {
     }
 }
 
-/// Truncate assistant `content` at the first tool-call opener.
-///
-/// This model (and other tool-trained models) sometimes emit a
-/// `<tool_call>…` block after a normal answer even when the request defined NO
-/// tools — observed live: `…the story you keep telling yourself."<tool_call>catch_error({…})`.
-/// When tools ARE active the tool parser extracts and strips these; when they
-/// are NOT active nothing runs, so the raw markup lands in `content`.
-///
-/// `<tool_call>` (token id 25) and `<function=` are control markers, not prose,
-/// so their presence in content is always spurious here. Everything from the
-/// first one onward is the orphan tool block; cut it and trim. Apply ONLY when
-/// no real tool call was produced (otherwise the tool parser already handled
-/// the content).
+/// Remove an unparsed tool-shaped suffix when no real call was produced.
+/// A bare opener in prose is not enough: require call syntax after it, and
+/// preserve quoted/code examples. This also runs for requests without tools.
 pub(crate) fn strip_orphan_tool_markup(text: &str) -> String {
+    strip_orphan_tool_markup_with_literal_state(
+        text,
+        &crate::literal_xml::LiteralXmlState::default(),
+    )
+}
+
+/// Streaming variant of [`strip_orphan_tool_markup`]. The caller owns the
+/// lexical state and feeds the accepted text through the normal sanitizer
+/// afterward; this helper only classifies opener positions and never mutates
+/// the state itself.
+pub(crate) fn strip_orphan_tool_markup_with_literal_state(
+    text: &str,
+    literal_state: &crate::literal_xml::LiteralXmlState,
+) -> String {
     const OPENERS: [&str; 2] = ["<tool_call>", "<function="];
     // Trim ONLY when an orphan opener was actually found and cut. The no-match
     // path must pass the text through byte-identical: this function runs
@@ -139,10 +143,74 @@ pub(crate) fn strip_orphan_tool_markup(text: &str) -> String {
     // one line. The blocking path calls this once over the whole message where
     // the trim was harmless; per-delta it is destructive. Regression from
     // #473 (680b3a568). Pinned by orphan_tool_tests below.
-    match OPENERS.iter().filter_map(|op| text.find(op)).min() {
-        Some(cut) => text[..cut].trim_end().to_string(),
-        None => text.to_string(),
+    let mut state = *literal_state;
+    let mut remaining = text;
+    let mut offset = 0;
+    while let Some((position, len)) =
+        crate::literal_xml::first_marker_outside_literal(remaining, state, &OPENERS)
+    {
+        let tail = remaining[position + len..].trim_start();
+        let function_marker = remaining[position..].starts_with("<function=");
+        let name_end = tail
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':')))
+            .unwrap_or(tail.len());
+        let after_name = tail[name_end..].trim_start();
+        let call_syntax = function_marker
+            || tail.starts_with("<function")
+            || tail.starts_with("<invoke ")
+            || tail.starts_with('{')
+            || (name_end > 0
+                && ["<arg_key>", "</tool_call>", "(", "{"]
+                    .iter()
+                    .any(|suffix| after_name.starts_with(suffix)));
+        if call_syntax {
+            return text[..offset + position].trim_end().to_string();
+        }
+        let consumed = position + len;
+        state.feed(&remaining[..consumed]);
+        remaining = &remaining[consumed..];
+        offset += consumed;
     }
+    text.to_string()
+}
+
+/// Remove structural XML fragments left around a validated call while
+/// preserving the same markers when they occur in quoted or fenced examples.
+pub(crate) fn strip_tool_markup_preserving_literals(text: &str) -> String {
+    let masked = crate::literal_xml::mask_literal_markers(
+        text,
+        &[
+            "<tool_call>",
+            "</tool_call>",
+            "<function=",
+            "<function ",
+            "<|function=",
+            "<|function ",
+            "<parameter=",
+            "</function>",
+            "</parameter>",
+        ],
+    );
+    let mut cleaned = masked;
+    for tag in ["</parameter>", "</function>", "</tool_call>", "<tool_call>"] {
+        cleaned = cleaned.replace(tag, "");
+    }
+    for opener in [
+        "<function=",
+        "<function ",
+        "<|function=",
+        "<|function ",
+        "<parameter=",
+    ] {
+        while let Some(start) = cleaned.find(opener) {
+            let end = cleaned[start..]
+                .find('>')
+                .map(|position| start + position + 1)
+                .unwrap_or(cleaned.len());
+            cleaned = format!("{}{}", &cleaned[..start], &cleaned[end..]);
+        }
+    }
+    crate::literal_xml::unmask_literal_markers(&cleaned)
 }
 
 #[cfg(test)]
@@ -164,6 +232,41 @@ mod orphan_tool_tests {
         assert_eq!(
             strip_orphan_tool_markup("Here you go.<function=foo>{}</function>"),
             "Here you go."
+        );
+    }
+
+    #[test]
+    fn leaves_quoted_and_fenced_markers_untouched() {
+        let quoted = "The tag is `<tool_call>` and this is prose.";
+        assert_eq!(strip_orphan_tool_markup(quoted), quoted);
+        let fenced = "```xml\n<tool_call>\n```";
+        assert_eq!(strip_orphan_tool_markup(fenced), fenced);
+    }
+
+    #[test]
+    fn finds_real_opener_after_literal_marker() {
+        let text = "The tag is `<tool_call>`; <tool_call>real</tool_call>";
+        assert_eq!(strip_orphan_tool_markup(text), "The tag is `<tool_call>`;");
+    }
+
+    #[test]
+    fn structured_scrub_keeps_literal_xml_when_real_call_is_present() {
+        let text = "The example is `<tool_call>`; <tool_call><function=real>\
+                    <parameter=x>ok</parameter></function></tool_call>";
+        assert_eq!(
+            super::strip_tool_markup_preserving_literals(text),
+            "The example is `<tool_call>`; ok"
+        );
+    }
+
+    #[test]
+    fn preserves_unquoted_bare_marker_and_later_prose() {
+        let text = "The delimiter <tool_call> opens a tool invocation. END.";
+        assert_eq!(strip_orphan_tool_markup(text), text);
+        assert_eq!(strip_orphan_tool_markup("<tool_call>"), "<tool_call>");
+        assert_eq!(
+            strip_orphan_tool_markup("Mention <tool_call> here; <tool_call>real</tool_call>"),
+            "Mention <tool_call> here;"
         );
     }
 

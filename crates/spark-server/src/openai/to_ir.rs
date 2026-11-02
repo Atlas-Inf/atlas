@@ -85,6 +85,11 @@ impl From<ChatCompletionRequest> for ir::ChatRequest {
             .chat_template_kwargs
             .as_ref()
             .and_then(|kw| kw.preserve_thinking);
+        let force_nonempty_content = req
+            .chat_template_kwargs
+            .as_ref()
+            .and_then(|kw| kw.force_nonempty_content)
+            .unwrap_or(false);
         let top_logprobs = resolve_top_logprobs(req.logprobs, req.top_logprobs);
         // Logit bias: OpenAI's string-keyed map → typed pairs. Keys that
         // don't parse as token ids are dropped (historical behavior).
@@ -122,12 +127,15 @@ impl From<ChatCompletionRequest> for ir::ChatRequest {
             },
             max_tokens: req.max_tokens,
             min_tokens: req.min_tokens,
+            ignore_eos: req.ignore_eos,
+            disable_mtp: req.disable_mtp,
             stop: req.stop,
             stream: req.stream,
             n: req.n,
             response_format,
             thinking,
             reasoning_effort,
+            force_nonempty_content,
             preserve_thinking,
             repetition_detection: req.repetition_detection,
             adapter: req.adapter,
@@ -141,6 +149,11 @@ impl From<ChatCompletionRequest> for ir::ChatRequest {
             seed: req.seed,
             timeout_secs: req.timeout,
             return_token_ids: req.return_token_ids,
+            client_session: crate::session_key::from_openai_body(
+                req.prompt_cache_key.as_deref(),
+                req.metadata.as_ref(),
+                req.user.as_deref(),
+            ),
         }
     }
 }
@@ -393,6 +406,43 @@ mod tests {
         assert_eq!(ir.n, 2);
         assert!(ir.tools.is_empty());
         assert!(ir.response_format.is_none());
+    }
+
+    #[test]
+    fn envelope_carries_ignore_eos() {
+        let body = |extra: serde_json::Value| {
+            let mut b = serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "min_tokens": 32
+            });
+            b.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            ir::ChatRequest::from(wire(b))
+        };
+        let ir = body(serde_json::json!({"ignore_eos": true}));
+        assert!(ir.ignore_eos);
+        assert_eq!(ir.min_tokens, 32);
+        assert!(!body(serde_json::json!({})).ignore_eos);
+    }
+
+    #[test]
+    fn chat_disable_mtp_survives_wire_to_ir_for_both_response_modes() {
+        for stream in [false, true] {
+            for flag in [None, Some(false), Some(true)] {
+                let mut body = serde_json::json!({
+                    "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                    "stream": stream
+                });
+                if let Some(value) = flag {
+                    body["disable_mtp"] = serde_json::json!(value);
+                }
+                let ir = ir::ChatRequest::from(wire(body));
+                assert_eq!(ir.disable_mtp, flag.unwrap_or(false));
+                assert_eq!(ir.stream, stream);
+            }
+        }
     }
 
     #[test]

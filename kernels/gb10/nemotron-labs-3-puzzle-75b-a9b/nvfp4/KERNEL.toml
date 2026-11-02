@@ -70,3 +70,11 @@ paged_decode_attn_turbo3k_turbo8v_128 = "paged_decode_turbo3k_turbo8v_128"
 paged_decode_attn_fp8k_turbo3v = "paged_decode_fp8k_turbo3v"
 paged_decode_attn_fp8k_turbo4v = "paged_decode_fp8k_turbo4v"
 paged_decode_attn_fp8k_turbo2v = "paged_decode_fp8k_turbo2v"
+
+# qwen4_exp-only optional kernel this shadow legitimately lacks:
+# rms_norm_f32_grouped is resolved with try_kernel only under
+# ATLAS_QWEN4EXP_MTP_GROUPED_NORM=1 (the qwen4exp MTP drafter); a null
+# handle falls back to per-row rms_norm_f32, so this model's decode chain
+# never reaches it.
+[shadow_exempt]
+norm = ["rms_norm_f32_grouped"]

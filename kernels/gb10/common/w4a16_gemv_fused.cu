@@ -15,6 +15,7 @@
 //   Eliminates separate silu_mul kernel entirely.
 //   Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -154,6 +155,7 @@ extern "C" __global__ void w4a16_gemv_dual(
     unsigned int N,
     unsigned int K
 ) {
+    atlas_pdl_enter();
     const unsigned int proj = blockIdx.z;
     const unsigned char* B_packed = proj == 0 ? B1_packed : B2_packed;
     const unsigned char* B_scale = proj == 0 ? B1_scale : B2_scale;

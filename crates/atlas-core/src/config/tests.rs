@@ -645,6 +645,19 @@ fn expert_parallelism_partitions_experts_without_dropping_remainder() {
 }
 
 #[test]
+fn expert_tp_makes_every_expert_local_at_a_sliced_width() {
+    let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+    cfg.ep_rank = 1;
+    cfg.ep_world_size = 2;
+    cfg.moe_intermediate_size = 2048;
+    assert_eq!(cfg.routed_inter_local(), 2048);
+    cfg.expert_tp = true;
+    assert_eq!(cfg.local_expert_range(), (0, cfg.num_experts));
+    assert!(cfg.is_local_expert(0));
+    assert_eq!(cfg.routed_inter_local(), 1024);
+}
+
+#[test]
 fn test_tensor_parallelism_range() {
     let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
 
@@ -1298,4 +1311,109 @@ fn nvfp4_quant_algo_label_family() {
     ] {
         assert!(!is_nvfp4_quant_algo(algo), "{algo} must NOT classify NVFP4");
     }
+}
+
+/// Nemotron 3.5 Super VL (`nemotron_h_omni`): the language model is a stock
+/// nemotron_h backbone nested under `llm_config`. The fixture is the real
+/// `llm_config` block of the NVFP4 drop (byte-identical to the GA
+/// candidate's, verified 2026-10-08) under a minimal omni wrapper.
+#[test]
+fn nemotron_h_omni_real_config_parses_backbone() {
+    let json = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/test_data/nemotron_h_omni_config.json"
+    ));
+    let cfg = parse_config(json).unwrap();
+    assert_eq!(cfg.model_type, "nemotron_h_omni");
+    assert_eq!(cfg.num_hidden_layers, 88);
+    assert_eq!(cfg.layer_types.len(), 88);
+    assert_eq!(cfg.num_ssm_layers(), 40);
+    assert_eq!(cfg.num_moe_layers(), 40);
+    assert_eq!(cfg.num_attention_layers(), 8);
+    assert_eq!(cfg.hidden_size, 4096);
+    assert_eq!(cfg.num_attention_heads, 32);
+    assert_eq!(cfg.num_key_value_heads, 2);
+    assert_eq!(cfg.head_dim, 128);
+    assert_eq!(cfg.num_experts, 512);
+    assert_eq!(cfg.num_experts_per_tok, 22);
+    assert_eq!(cfg.moe_latent_size, 1024);
+    assert_eq!(cfg.shared_expert_intermediate_size, 5376);
+    assert_eq!(cfg.moe_intermediate_size, 2688);
+    assert_eq!(cfg.vocab_size, 131072);
+    assert_eq!(cfg.weight_prefix, "language_model.backbone");
+    assert_eq!(cfg.eos_token_id, 11);
+    // The omni latent-MoE MTP head is not loaded; DFlash is the
+    // speculative path.
+    assert_eq!(cfg.mtp_num_hidden_layers, 0);
+    assert!(!cfg.tie_word_embeddings);
+    // Text-only serve: the omni vision tower is never loaded.
+    assert!(cfg.vision.is_none());
+    // `layer_norm_epsilon` -> `norm_eps` -> `rms_norm_eps`.
+    assert_eq!(cfg.rms_norm_eps, 1e-5);
+    // Top-level quantization_config carried down for quant detection.
+    assert!(cfg.quantization_config.is_some());
+}
+
+#[test]
+fn is_nemotron_h_omni_survives_vision_drop() {
+    let json = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/test_data/nemotron_h_omni_config.json"
+    ));
+    let mut cfg = parse_config(json).unwrap();
+    assert_eq!(cfg.model_type, "nemotron_h_omni");
+    assert!(cfg.is_nemotron_h_omni());
+    // The text-only drop strix-hip performs must NOT flip the lever.
+    cfg.vision = None;
+    assert!(cfg.is_nemotron_h_omni());
+    // A plain nemotron_h must not take the omni arm.
+    cfg.model_type = "nemotron_h".to_string();
+    assert!(!cfg.is_nemotron_h_omni());
+}
+
+#[test]
+fn nemotron_omni_is_mamba2_and_gdn_models_are_gdn() {
+    use crate::capabilities::SsmArchitecture;
+    let json = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/test_data/nemotron_h_omni_config.json"
+    ));
+    let cfg = parse_config(json).unwrap();
+    assert_eq!(cfg.model_type, "nemotron_h_omni");
+    assert_eq!(cfg.capabilities().ssm_architecture, SsmArchitecture::Mamba2);
+    // GDN family (qwen3-next / qwen3.5): LinearAttention layers without
+    // mamba dims must derive Gdn — the midchunk writer exists there.
+    let gdn = crate::config::ModelConfig::qwen3_next_80b_nvfp4();
+    assert_eq!(gdn.capabilities().ssm_architecture, SsmArchitecture::Gdn);
+}
+
+/// A `layer_norm_epsilon` other than the checkpoint's 1e-5 must map through
+/// the same path (proves the eps rewrite is not a hard-coded constant).
+#[test]
+fn nemotron_h_omni_layer_norm_epsilon_mapping() {
+    let json = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/test_data/nemotron_h_omni_config.json"
+    ));
+    let mut raw: serde_json::Value = serde_json::from_str(json).unwrap();
+    raw["llm_config"]["layer_norm_epsilon"] = serde_json::json!(1e-6);
+    let cfg = parse_config(&serde_json::to_string(&raw).unwrap()).unwrap();
+    assert_eq!(cfg.rms_norm_eps, 1e-6);
+}
+
+#[test]
+fn nemotron_h_omni_missing_llm_config_fails() {
+    let json = r#"{"model_type": "nemotron_h_omni", "eos_token_id": 11}"#;
+    let err = parse_config(json).unwrap_err();
+    assert!(err.to_string().contains("llm_config"), "{err}");
+}
+
+#[test]
+fn nemotron_h_omni_wrong_inner_model_type_fails() {
+    let json = r#"{
+        "model_type": "nemotron_h_omni",
+        "llm_config": {"model_type": "qwen3", "layers_block_type": []}
+    }"#;
+    let err = parse_config(json).unwrap_err();
+    assert!(err.to_string().contains("nemotron_h"), "{err}");
 }

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Ported from Enntity/atlas 7fd2412 (AGPL-3.0-only, sparkqwen queued-first-chunk series).
 
 //! Tests for decode-time KV preemption with resume (`preempt.rs`).
 //!
@@ -11,17 +12,28 @@
 //! `StreamEvent` channel): a preempted victim's channel must stay OPEN and
 //! EMPTY — no `StreamEvent::Error`, no premature `Done`.
 
+use super::lifecycle::resume_swapped_seq;
 use super::preempt::{
-    PREEMPT_IMMUNITY_TOKENS, choose_decode_victim, decode_batch_with_preemption, preempt_requeue,
-    resume_preempted_seq, resume_preempted_seqs,
+    PREEMPT_IMMUNITY_TOKENS, decode_batch_with_preemption, preempt_requeue, resume_preempted_seq,
+    resume_preempted_seqs, spill_out_sequence, spill_pool_enabled,
 };
 use super::test_support::test_seq;
 use super::types::{ActiveSeq, ResponseSink};
 use anyhow::Result;
+use spark_model::model::kv_admission::{KvAdmissionRefused, after_partial_step};
 use spark_model::traits::{Model, SequenceState};
 use spark_runtime::gpu::DevicePtr;
+use spark_runtime::kv_spill::KvSpillManager;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+mod chunk_retry;
+mod kv_refusal;
+mod min_tokens_ban;
+mod queue_first_chunk;
+mod resume;
+mod shared_prefix_admit;
+mod victim_policy;
 
 /// Scripted stub: `decode_batch` fails with the KV-exhausted error for the
 /// first `fail_decodes` calls, then succeeds. Records every free/cache/
@@ -39,6 +51,23 @@ struct PreemptStubModel {
     free_blocks: AtomicUsize,
     total_blocks: usize,
     reclaimable: AtomicUsize,
+    /// `prefill_chunk` records `(start, len)` and refuses (agreed) the first
+    /// `refuse_chunks` calls, completing a split half up to `split_cut` first;
+    /// `refusal_is_final` makes the refusal non-retryable.
+    chunk_calls: Mutex<Vec<(usize, usize)>>,
+    refuse_chunks: AtomicUsize,
+    split_cut: usize,
+    refusal_is_final: bool,
+    /// Every EP command word the head sends.
+    wire: Mutex<Vec<u32>>,
+    /// `decode_batch` fails with an agreed, retryable refusal raised after
+    /// this many sequences of a per-sequence loop already ran.
+    partial_refusal_after: Option<usize>,
+    /// Shared-prefix admission: `pc_inflight_min_tokens`, and a multi-rank
+    /// world with 16-token blocks when set.
+    inflight_min: Option<usize>,
+    /// A multi-rank world without shared-prefix admission.
+    ep: bool,
 }
 
 impl PreemptStubModel {
@@ -64,24 +93,63 @@ impl Model for PreemptStubModel {
     }
     fn prefill_chunk(
         &self,
-        _t: &[u32],
-        _s: &mut SequenceState,
-        _cs: usize,
-        _cl: usize,
+        t: &[u32],
+        s: &mut SequenceState,
+        cs: usize,
+        cl: usize,
         _last: bool,
         _st: u64,
     ) -> Result<DevicePtr> {
-        anyhow::bail!("unused in preempt tests")
+        self.chunk_calls.lock().unwrap().push((cs, cl));
+        if let Some(msg) = self.hard_error {
+            anyhow::bail!("{msg}");
+        }
+        let refuse = (self.refuse_chunks)
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        let split = cs < self.split_cut && self.split_cut < cs + cl;
+        let stop = match (refuse, split) {
+            (false, _) => cs + cl,
+            (true, true) => self.split_cut,
+            (true, false) => cs,
+        };
+        s.tokens.extend_from_slice(&t[cs..stop]);
+        (s.seq_len, s.prompt_len) = (stop, t.len());
+        let (by_peer, retryable) = (true, !self.refusal_is_final);
+        anyhow::ensure!(
+            !refuse,
+            KvAdmissionRefused {
+                by_peer,
+                retryable,
+                decode: false
+            }
+        );
+        Ok(DevicePtr::NULL)
+    }
+    fn ep_broadcast_cmd(&self, word: u32) -> Result<()> {
+        self.wire.lock().unwrap().push(word);
+        Ok(())
+    }
+    fn ep_broadcast_cmd_for_seq(&self, _seq: u32, cmd: u32) -> Result<()> {
+        self.ep_broadcast_cmd(cmd)
     }
     fn decode_batch(
         &self,
         _t: &[u32],
-        _s: &mut [&mut SequenceState],
+        s: &mut [&mut SequenceState],
         _st: u64,
     ) -> Result<DevicePtr> {
         self.decode_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(msg) = self.hard_error {
             anyhow::bail!("{msg}");
+        }
+        if let Some(advanced) = self.partial_refusal_after {
+            let refused = KvAdmissionRefused {
+                by_peer: false,
+                retryable: true,
+                decode: true,
+            };
+            return Err(after_partial_step(refused.into(), advanced, s.len()));
         }
         if self
             .fail_decodes
@@ -192,12 +260,30 @@ impl Model for PreemptStubModel {
     fn cache_sequence(&self, _s: &SequenceState) {
         self.cached_seqs.fetch_add(1, Ordering::SeqCst);
     }
+    fn save_sequence_state(
+        &self,
+        _s: &SequenceState,
+        _writer: &mut dyn std::io::Write,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn restore_sequence_state(
+        &self,
+        _s: &mut SequenceState,
+        _num_blocks: usize,
+        _reader: &mut dyn std::io::Read,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn swap_resumable(&self) -> bool {
+        true
+    }
     fn free_sequence(&self, s: &mut SequenceState) -> Result<()> {
         self.freed_slots.lock().unwrap().push(s.slot_idx);
         Ok(())
     }
-    fn compact_sequence(&self, _s: &mut SequenceState, _slot: usize) -> Result<()> {
-        Ok(())
+    fn compact_sequence(&self, _s: &mut SequenceState, _slot: usize) -> Result<bool> {
+        Ok(true)
     }
     fn detach_slot_for_reuse(&self, _s: &mut SequenceState) {}
     fn save_hidden_for_mtp(&self, _i: usize, _st: u64) -> Result<()> {
@@ -213,6 +299,15 @@ impl Model for PreemptStubModel {
     }
     fn num_total_blocks(&self) -> usize {
         self.total_blocks
+    }
+    fn pc_inflight_min_tokens(&self) -> Option<usize> {
+        self.inflight_min
+    }
+    fn kv_block_size(&self) -> Option<usize> {
+        self.inflight_min.map(|_| 16)
+    }
+    fn is_ep(&self) -> bool {
+        self.ep || self.inflight_min.is_some()
     }
     fn reclaim_prefix_blocks(&self, num_blocks: usize) -> usize {
         let take = num_blocks.min(self.reclaimable.load(Ordering::SeqCst));
@@ -310,6 +405,28 @@ fn non_kv_error_still_fails_the_whole_batch() {
 }
 
 #[test]
+fn a_refusal_after_part_of_the_batch_ran_fails_it_without_a_retry() {
+    // The per-sequence highway loop: sequence 0 already ran this step when
+    // sequence 1's block was refused. Preempting a victim and re-running the
+    // batch would feed sequence 0 its last token a second time.
+    let model = PreemptStubModel {
+        partial_refusal_after: Some(1),
+        ..Default::default()
+    };
+    let (a0, mut rx0) = active_seq(0, 3);
+    let (a1, mut rx1) = active_seq(1, 4);
+    let mut active = vec![a0, a1];
+    let (mut swapped, mut preempted) = (Vec::new(), Vec::new());
+    let logits =
+        decode_batch_with_preemption(&model, &mut active, None, &mut swapped, &mut preempted);
+    assert!(logits.is_none());
+    assert_eq!(model.decode_calls.load(Ordering::SeqCst), 1);
+    assert!(active.is_empty() && preempted.is_empty() && swapped.is_empty());
+    assert!(rx0.try_recv().expect("response sent").is_err());
+    assert!(rx1.try_recv().expect("response sent").is_err());
+}
+
+#[test]
 fn single_sequence_exhaustion_is_not_preemptible() {
     // With one sequence, preemption cannot free anything the survivor
     // needs — the existing terminal path is kept.
@@ -327,155 +444,21 @@ fn single_sequence_exhaustion_is_not_preemptible() {
     assert!(rx0.try_recv().expect("response sent").is_err());
 }
 
-// ── choose_decode_victim ─────────────────────────────────────────────────
-
 #[test]
-fn victim_policy_least_progress_wins() {
-    let model = PreemptStubModel::default();
-    let (a0, _r0) = active_seq(0, 7);
-    let (a1, _r1) = active_seq(1, 3);
-    let (a2, _r2) = active_seq(2, 12);
-    let active = vec![a0, a1, a2];
-    assert_eq!(choose_decode_victim(&model, &active, false), Some(1));
-}
-
-#[test]
-fn victim_policy_starvation_guard_skips_resumed_until_progress() {
-    let model = PreemptStubModel::default();
-    let (mut a0, _r0) = active_seq(0, 3);
-    // Just resumed: 3 generated, immune until 3 + PREEMPT_IMMUNITY_TOKENS.
-    a0.preempt_immune_until_tokens = a0.output_tokens.len() + PREEMPT_IMMUNITY_TOKENS;
-    let (a1, _r1) = active_seq(1, 9);
-    let active = vec![a0, a1];
-    // The immune least-progress seq is skipped; the other is chosen.
-    assert_eq!(choose_decode_victim(&model, &active, false), Some(1));
-
-    // Once it has generated PREEMPT_IMMUNITY_TOKENS more, immunity lapses.
-    let (mut a0, _r0) = active_seq(0, 3 + PREEMPT_IMMUNITY_TOKENS);
-    a0.preempt_immune_until_tokens = 3 + PREEMPT_IMMUNITY_TOKENS;
-    let (a1, _r1) = active_seq(1, 200);
-    let active = vec![a0, a1];
-    assert_eq!(choose_decode_victim(&model, &active, false), Some(0));
-}
-
-#[test]
-fn victim_policy_all_immune_still_yields_a_victim() {
-    // Immunity must never convert a recoverable exhaustion into a
-    // batch-wide error: with every candidate immune, one is chosen anyway.
-    let model = PreemptStubModel::default();
-    let (mut a0, _r0) = active_seq(0, 4);
-    a0.preempt_immune_until_tokens = usize::MAX;
-    let (mut a1, _r1) = active_seq(1, 2);
-    a1.preempt_immune_until_tokens = usize::MAX;
-    let active = vec![a0, a1];
-    assert_eq!(choose_decode_victim(&model, &active, false), Some(1));
-}
-
-#[test]
-fn victim_policy_vision_requeue_excluded_but_spill_allowed() {
-    const PAD: u32 = 999;
-    let model = PreemptStubModel {
-        vision_pad: Some(PAD),
-        ..Default::default()
+fn spill_pool_runs_only_for_models_that_resume_a_swap() {
+    let resumable = PreemptStubModel::default();
+    assert!(spill_pool_enabled(&resumable, 3));
+    assert!(!spill_pool_enabled(&resumable, 0));
+    // The trait default, which TransformerModel also reports for a GLM
+    // semantic-index cache: its spill image carries no index pools or tails,
+    // so a swapped-in sequence would select over another owner's keys.
+    // Admission then waits for blocks and decode preemption requeues.
+    let cannot = super::cancel_test_model::TestModel {
+        tokens: vec![],
+        host_logits: false,
+        cancel_after_sampling: None,
+        cancel_after_row_commit: None,
+        verify: None,
     };
-    let (mut a0, _r0) = active_seq(0, 2);
-    a0.seq.tokens.insert(2, PAD); // image KV: not re-prefillable from tokens
-    let (a1, _r1) = active_seq(1, 8);
-    let active = vec![a0, a1];
-    // Requeue (no spill): the vision seq is ineligible despite least progress.
-    assert_eq!(choose_decode_victim(&model, &active, false), Some(1));
-    // Spill saves KV verbatim: the vision seq is eligible again.
-    assert_eq!(choose_decode_victim(&model, &active, true), Some(0));
-}
-
-// ── requeue → resume round trip ──────────────────────────────────────────
-
-#[test]
-fn resume_reprefills_exact_history_and_preserves_stream_state() {
-    let model = PreemptStubModel::default();
-    let (a, _rx) = active_seq(3, 6);
-    let last_token = a.last_token;
-    let out_before = a.output_tokens.clone();
-    let remaining_before = a.remaining;
-    let history = a.seq.tokens.clone();
-
-    let p = preempt_requeue(&model, a);
-    assert_eq!(p.tokens, history);
-    assert_eq!(*model.freed_slots.lock().unwrap(), vec![3]);
-
-    let resumed = resume_preempted_seq(&model, p).expect("resume succeeds");
-    // The re-prefill processed EXACTLY the retained history — the pending
-    // last_token is decoded next, not re-prefilled and never re-emitted.
-    assert_eq!(*model.prefilled.lock().unwrap(), vec![history.clone()]);
-    assert_eq!(resumed.seq.tokens, history);
-    assert_eq!(resumed.seq.seq_len, history.len());
-    assert_eq!(resumed.last_token, last_token);
-    assert_eq!(resumed.output_tokens, out_before);
-    assert_eq!(resumed.remaining, remaining_before);
-    assert!(!resumed.finished);
-    // Starvation guard armed.
-    assert_eq!(
-        resumed.preempt_immune_until_tokens,
-        out_before.len() + PREEMPT_IMMUNITY_TOKENS
-    );
-}
-
-#[test]
-fn resume_loop_gates_on_blocks_and_reclaims_from_prefix_cache() {
-    let model = PreemptStubModel {
-        total_blocks: 100,
-        free_blocks: AtomicUsize::new(0),
-        reclaimable: AtomicUsize::new(50),
-        ..Default::default()
-    };
-    let (a, _rx) = active_seq(0, 4);
-    let p = {
-        let mut history_seq = a;
-        history_seq.seq.tokens = (0..32).collect(); // 32-token history
-        preempt_requeue(&model, history_seq)
-    };
-    let mut preempted = vec![p];
-    let mut active = Vec::new();
-    // block_size 16 → needs 32/16+1 = 3 blocks (+1 headroom = 4): free 0,
-    // but 50 reclaimable → the loop must ASK the prefix cache and resume.
-    resume_preempted_seqs(&model, &mut active, &mut preempted, 8, 16);
-    assert_eq!(active.len(), 1);
-    assert!(preempted.is_empty());
-
-    // With nothing free AND nothing reclaimable, it stays parked (no error).
-    let model2 = PreemptStubModel {
-        total_blocks: 100,
-        ..Default::default()
-    };
-    let (a2, mut rx2) = active_seq(0, 4);
-    let p2 = preempt_requeue(&model2, a2);
-    let mut preempted2 = vec![p2];
-    let mut active2 = Vec::new();
-    resume_preempted_seqs(&model2, &mut active2, &mut preempted2, 8, 16);
-    assert!(active2.is_empty());
-    assert_eq!(preempted2.len(), 1);
-    assert!(matches!(
-        rx2.try_recv(),
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-    ));
-}
-
-#[test]
-fn resume_loop_errors_out_a_sequence_that_can_never_fit() {
-    let model = PreemptStubModel {
-        total_blocks: 2, // pool smaller than the history
-        ..Default::default()
-    };
-    let (a, mut rx) = active_seq(0, 4);
-    let p = {
-        let mut s = a;
-        s.seq.tokens = (0..64).collect();
-        preempt_requeue(&model, s)
-    };
-    let mut preempted = vec![p];
-    let mut active = Vec::new();
-    resume_preempted_seqs(&model, &mut active, &mut preempted, 8, 16);
-    assert!(preempted.is_empty() && active.is_empty());
-    // The client is told, not left hanging forever.
-    assert!(rx.try_recv().expect("error delivered").is_err());
+    assert!(!spill_pool_enabled(&cannot, 3));
 }

@@ -21,7 +21,11 @@ use super::types::*;
 /// response back into Anthropic format. The Anthropic-specific surface
 /// is strictly format conversion — no policy or sampling decisions are
 /// made here.
-pub async fn messages(CurrentModel(state): CurrentModel, body: axum::body::Bytes) -> Response {
+pub async fn messages(
+    CurrentModel(state): CurrentModel,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
     // 1. Parse the Anthropic request.
     let req: MessagesRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -73,7 +77,9 @@ pub async fn messages(CurrentModel(state): CurrentModel, body: axum::body::Bytes
     //    sampling preset, and prompt mutation logic lives there.
     //    Anthropic has no echo-only wire fields (service_tier / store /
     //    stream_options), so the echo context stays default.
-    let outcome = crate::api::chat_completions_inner(state.clone(), None, req.into(), None).await;
+    let ir_req =
+        crate::session_key::with_override(req.into(), crate::session_key::from_headers(&headers));
+    let outcome = crate::api::chat_completions_inner(state.clone(), None, ir_req, None).await;
 
     // 5. Encode back to Anthropic shape. Non-streaming success arrives
     //    as the response IR — no body re-parse; a malformed inner body
@@ -97,30 +103,11 @@ pub async fn messages(CurrentModel(state): CurrentModel, body: axum::body::Bytes
     };
 
     if !chat_resp.status().is_success() {
-        // Forward the error envelope. Translate the JSON body into
-        // Anthropic's error shape if it's an OpenAI-style envelope; else
-        // pass bytes through.
-        let (parts, body) = chat_resp.into_parts();
-        let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
-            Ok(b) => b,
-            Err(e) => {
-                return anthropic_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    format!("Error body collect: {e}"),
-                );
-            }
-        };
-        let err_msg = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-            .ok()
-            .and_then(|v| {
-                v.get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(|m| m.as_str())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| String::from_utf8_lossy(&body_bytes).into_owned());
-        return anthropic_error(parts.status, "api_error", err_msg);
+        // Forward the error envelope in Anthropic's shape with its status. A
+        // client error is an `invalid_request_error`: a 400 such as an
+        // over-limit vision request must not read as a server fault, which
+        // clients retry.
+        return openai_error_to_anthropic(chat_resp).await;
     }
 
     // Unreachable in practice: Http outcomes are error envelopes (both
@@ -158,25 +145,39 @@ pub async fn count_tokens(
     // rendered through the non-openai Jinja variant, so counts drifted
     // from real usage.
     let mut ir_req = crate::ir::ChatRequest::from(req);
-    // Counting must not require the vision encoder: strip image parts
+    // Counting must not require the vision encoder: strip image and video parts
     // (they contributed 0 tokens in the old count too — pad expansion
     // needs real pixel grids, which a count endpoint can't produce).
     for m in &mut ir_req.messages {
-        m.content
-            .retain(|p| !matches!(p, crate::ir::ContentPart::Image(_)));
+        m.content.retain(|p| {
+            !matches!(
+                p,
+                crate::ir::ContentPart::Image(_) | crate::ir::ContentPart::Video(_)
+            )
+        });
     }
     // Same treatment as the chat handler: the Jinja render + tokenize inside
     // `prepare_chat_prompt` is CPU-bound (measured 13 ms at 12931 prompt tokens)
     // and must not hold an async worker. `ir_req` is not read after this point,
     // so it is simply moved in rather than handed back.
     let state_for_prepare = state.clone();
+    // Counts captured before `ir_req` moves into the closure so the
+    // failure path below can still say what shape was rejected.
+    let req_msg_count = ir_req.messages.len();
     let prepared = match tokio::task::spawn_blocking(move || {
         crate::api::chat::prepare::prepare_chat_prompt(&state_for_prepare, &mut ir_req)
     })
     .await
     {
         Ok(Ok(p)) => p,
-        Ok(Err(resp)) => return openai_error_to_anthropic(resp).await,
+        Ok(Err(resp)) => {
+            // Same contract as the OpenAI path: a prepare failure must log.
+            tracing::warn!(
+                "count_tokens prepare rejected: status={} messages={req_msg_count}",
+                resp.status(),
+            );
+            return openai_error_to_anthropic(resp).await;
+        }
         Err(join_err) => {
             tracing::error!("count_tokens prepare panicked: {join_err}");
             return anthropic_error(
@@ -209,10 +210,47 @@ async fn openai_error_to_anthropic(resp: Response) -> Response {
             .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned()),
         Err(e) => format!("Error body collect: {e}"),
     };
-    let error_type = if parts.status.is_client_error() {
-        "invalid_request_error"
-    } else {
-        "api_error"
-    };
-    anthropic_error(parts.status, error_type, message)
+    let mut resp = anthropic_error(parts.status, anthropic_error_type(parts.status), message);
+    // A deferral's `Retry-After` (a spent vision budget) tells the client
+    // when. Enntity/atlas 060199eb.
+    if let Some(after) = parts.headers.get(axum::http::header::RETRY_AFTER) {
+        resp.headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, after.clone());
+    }
+    resp
+}
+
+/// Anthropic's `error.type` for an HTTP status (its documented error kinds).
+/// Enntity/atlas 060199eb.
+fn anthropic_error_type(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        503 | 529 => "overloaded_error",
+        400..=499 => "invalid_request_error",
+        _ => "api_error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_client_error_forwards_as_an_invalid_request_error() {
+        let openai = serde_json::json!({"error": {"message": "too many images", "type": "invalid_request_error"}});
+        let resp = (StatusCode::BAD_REQUEST, Json(openai)).into_response();
+        let out = openai_error_to_anthropic(resp).await;
+        assert_eq!(out.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(out.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["message"], "too many images");
+    }
 }

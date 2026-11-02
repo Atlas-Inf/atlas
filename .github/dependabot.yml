@@ -8,7 +8,9 @@ updates:
       day: monday
       time: "06:00"
       timezone: UTC
-    open-pull-requests-limit: 5
+    # Version-update PRs are off (maintainer decision 2026-09-27: open-PR bloat).
+    # Security updates still arrive; bumps are taken in one deliberate batch.
+    open-pull-requests-limit: 0
     labels:
       - dependencies
       - rust
@@ -30,7 +32,7 @@ updates:
       day: monday
       time: "06:00"
       timezone: UTC
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 0
     labels:
       - dependencies
       - github-actions

@@ -153,7 +153,7 @@ impl TransformerModel {
                 if evicted.is_empty() {
                     break;
                 }
-                super::super::super::block_mgmt::apply_evicted_blocks(evicted, &mut kv_cache);
+                self.apply_evicted(evicted, &mut kv_cache);
             }
             let free = kv_cache.num_free_blocks();
             if free < needed {
@@ -183,6 +183,7 @@ impl TransformerModel {
         // Zero shared buffers once (instead of N times in per-stream).
         if self.comm.is_some() {
             self.buffers.zero_all(self.gpu.as_ref(), stream)?;
+            self.buffers.note_rows(usize::MAX); // rows unknown to `zero_dirty`
         } else if streams[0].chunk_start == 0 {
             self.buffers
                 .zero_prefill_essentials(self.gpu.as_ref(), stream)?;
@@ -280,7 +281,12 @@ impl TransformerModel {
                 0
             };
             if embed_skip < cl {
+                // Chunks after the first encode their own vision items right
+                // here, before the embed (chunk 0's encode ran inside the
+                // chunk-0 lookup, `vision_cache`).
+                self.vision_encode_chunk_items(seq, tokens, chunk_start, chunk_start + cl, stream)?;
                 self.prefill_b_embed_chunk_at(
+                    seq,
                     tokens,
                     chunk_start + embed_skip,
                     cl - embed_skip,
@@ -300,6 +306,7 @@ impl TransformerModel {
                 tokens,
                 seq,
                 chunk_start,
+                cl,
                 total,
                 &mut kv_cache,
                 stream,
@@ -528,6 +535,7 @@ impl TransformerModel {
         // intentionally None — layers read BatchedAttnMetadata directly
         // through the model-level dispatcher arguments.
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -632,6 +640,7 @@ impl TransformerModel {
                     // Shifted clear of the decode lanes in a mixed step; `b`
                     // alone would land on decode lane `b`'s logits row.
                     row_base + b,
+                    None,
                     stream,
                 )?
             } else {

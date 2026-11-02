@@ -83,6 +83,35 @@ pub fn rms_norm_f32(
         .launch(stream)
 }
 
+/// [`rms_norm_f32`] over `num_rows` rows whose weights cycle with period
+/// `weight_period` (row `r` uses weight row `r % weight_period`): the
+/// per-stream norms of an mHC highway in one launch. Each block is
+/// `rms_norm_f32`'s (`rms_norm_f32_row` in `common/rms_norm.cu`).
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_f32_grouped(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: DevicePtr,
+    output: DevicePtr,
+    num_rows: u32,
+    hidden_size: u32,
+    eps: f32,
+    weight_period: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_rows, 1, 1])
+        .block([hidden_size.min(1024), 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight)
+        .arg_ptr(output)
+        .arg_u32(hidden_size)
+        .arg_f32(eps)
+        .arg_u32(weight_period)
+        .launch(stream)
+}
+
 pub fn rms_norm(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -99,6 +128,35 @@ pub fn rms_norm(
         .block([hidden_size.min(1024), 1, 1])
         .arg_ptr(input)
         .arg_ptr(weight.weight)
+        .arg_ptr(output)
+        .arg_u32(hidden_size)
+        .arg_f32(eps)
+        .launch(stream)
+}
+
+/// GLM MTP: build `[enorm(embed[token]), hnorm(target_hidden)]` directly.
+#[allow(clippy::too_many_arguments)]
+pub fn glm_mtp_eh_norm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    embed_table: DevicePtr,
+    token: u32,
+    target_hidden: DevicePtr,
+    enorm: &DenseWeight,
+    hnorm: &DenseWeight,
+    output: DevicePtr,
+    hidden_size: u32,
+    eps: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([2, 1, 1])
+        .block([hidden_size.min(1024), 1, 1])
+        .arg_ptr(embed_table)
+        .arg_u32(token)
+        .arg_ptr(target_hidden)
+        .arg_ptr(enorm.weight)
+        .arg_ptr(hnorm.weight)
         .arg_ptr(output)
         .arg_u32(hidden_size)
         .arg_f32(eps)

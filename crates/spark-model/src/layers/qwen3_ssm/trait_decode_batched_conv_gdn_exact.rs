@@ -167,7 +167,8 @@ impl Qwen3SsmLayer {
         static LOGGED: std::sync::Once = std::sync::Once::new();
         LOGGED.call_once(|| {
             tracing::info!(
-                "EXACT MTP verify ENGAGED (#435 route (a), opt-in --exact-verify): \
+                "EXACT MTP verify ENGAGED (#435 route (a), opt-in --exact-verify or \
+                 ATLAS_QWEN4EXP_EXACT_VERIFY=1): \
                  per-token sequential-decode kernel chain (f32_conv={use_f32_conv}, \
                  fused_gdn_norm={fused_gdn_norm}, snap_twin={snap}, \
                  fused_f32_conv={fused_conv}); omit the flag for the default WY arms"

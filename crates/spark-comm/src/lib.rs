@@ -13,6 +13,11 @@
 
 use anyhow::Result;
 
+mod broadcast;
+#[cfg(test)]
+mod idle_command_tests;
+pub mod peer_lifeline;
+
 // NCCL FFI + the multi-GPU `NcclBackend` are gated on the `nccl`
 // feature because they `#[link(name = "nccl")]`. `nccl` is separate
 // from `cuda` so SCALE/AMD (gfx1151) builds can use the CUDA compute
@@ -43,6 +48,40 @@ pub trait CommBackend: Send + Sync {
     /// Broadcast from root rank to all ranks.
     fn broadcast(&self, ptr: u64, bytes: usize, root: usize) -> Result<()>;
 
+    /// Receive exactly the first four-byte word of an outer worker command
+    /// from rank zero. Only non-root ranks of a multi-rank communicator may
+    /// call this, with an aligned, live device word. This explicit boundary
+    /// may wait for a future command: NCCL excludes that idle duration from
+    /// its post-completion slow-broadcast latch, but keeps all error checks.
+    /// Subsequent words and payloads must use ordinary [Self::broadcast].
+    /// Other backends retain their ordinary broadcast behavior by default.
+    fn receive_idle_command_word(&self, ptr: u64) -> Result<()> {
+        broadcast::validate_idle_receiver(self.rank(), self.world_size(), ptr)?;
+        self.broadcast(ptr, 4, 0)
+    }
+
+    /// Words one [`Self::send_command_words`] / [`Self::recv_command_words`]
+    /// call may carry between the two ranks' hosts, or 0 when the backend has
+    /// no host command channel. It depends only on configuration the ranks
+    /// agree on at startup, so both take the same path for a given count.
+    fn command_words_max(&self) -> usize {
+        0
+    }
+
+    /// Send command words to the other rank's host, in order behind every
+    /// earlier call and on no stream: the peer reads them with
+    /// [`Self::recv_command_words`] without a device kernel, a stream sync or
+    /// a copy back. At most [`Self::command_words_max`] words, at least one.
+    fn send_command_words(&self, _words: &[u32]) -> Result<()> {
+        anyhow::bail!("command words are not supported by this CommBackend")
+    }
+
+    /// Receive the peer's next `words.len()` command words, waiting for them
+    /// (a worker waits here for its next command, however long that takes).
+    fn recv_command_words(&self, _words: &mut [u32]) -> Result<()> {
+        anyhow::bail!("command words are not supported by this CommBackend")
+    }
+
     /// Barrier: block until all ranks reach this point.
     fn barrier(&self) -> Result<()>;
 
@@ -54,6 +93,91 @@ pub trait CommBackend: Send + Sync {
     fn all_reduce_async(&self, ptr: u64, bytes: usize, compute_stream: u64) -> Result<()> {
         let _ = compute_stream;
         self.all_reduce(ptr, bytes)
+    }
+
+    /// Asynchronously exchange one BF16 payload with the other rank.
+    ///
+    /// Unlike an all-reduce, `recv_ptr` receives the peer's unmodified payload.
+    /// This lets a consumer fuse Atlas's established local reduction arithmetic
+    /// with its immediately-dependent kernel without materialising an
+    /// intermediate reduced buffer. Only available on backends that explicitly
+    /// support the two-rank event-ordered path.
+    fn peer_exchange_async(
+        &self,
+        _send_ptr: u64,
+        _recv_ptr: u64,
+        _bytes: usize,
+        _compute_stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("peer_exchange_async is not supported by this CommBackend")
+    }
+
+    /// Whether [`Self::peer_exchange_async`] is available for this communicator.
+    fn supports_peer_exchange_async(&self) -> bool {
+        false
+    }
+
+    /// Two-rank stream-ordered exchange: send `bytes` from `send` and land the
+    /// peer's `bytes` in `dst`, added in place (BF16) when `add`, else copied.
+    /// With equal halves this is a reduce-scatter (`add`) or an all-gather
+    /// step. Both ranks must call it with the same `bytes`. Returns `false`
+    /// (nothing enqueued) when unavailable for this call.
+    fn exchange_async(
+        &self,
+        _send: u64,
+        _dst: u64,
+        _bytes: usize,
+        _add: bool,
+        _compute_stream: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Graph-capturable BF16 sum all-reduce in place on `stream`: only device
+    /// work goes on the stream (no host sync, no per-call host state), into
+    /// persistent registered buffers, with a device-resident sequence the
+    /// kernel advances -- so a CUDA graph may capture it and replay it any
+    /// number of times, interleaved with eager collectives. Eager calls may
+    /// use it too. `Ok(false)` (nothing enqueued) when unavailable for this
+    /// size; the answer depends only on `bytes` and configuration, so both
+    /// ranks agree. Both ranks must issue capturable collectives in the same
+    /// order and one at a time on the GPU: the sequence is shared by every
+    /// stream, so calls on different streams (decode on the default stream,
+    /// prefill on the scheduler's prefill stream) must be serialized by the
+    /// caller with events or syncs, as for [`Self::all_reduce_async`] over
+    /// the RDMA pair.
+    fn all_reduce_capturable(&self, _ptr: u64, _bytes: usize, _stream: u64) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Graph-capturable [`Self::peer_exchange_async`]: `recv_ptr` receives the
+    /// peer's unmodified payload. Same contract as
+    /// [`Self::all_reduce_capturable`].
+    fn peer_exchange_capturable(
+        &self,
+        _send_ptr: u64,
+        _recv_ptr: u64,
+        _bytes: usize,
+        _stream: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Largest payload [`Self::all_reduce_capturable`] and
+    /// [`Self::peer_exchange_capturable`] accept (0 when unavailable). Where
+    /// available, [`Self::exchange_async`] is capturable up to this size too.
+    fn capturable_all_reduce_max_bytes(&self) -> usize {
+        0
+    }
+
+    /// Provide the kernel handle for the capturable collectives
+    /// (`rdma_oneshot_bf16`); loaded by the model layer like
+    /// [`Self::set_add_kernel`].
+    fn set_oneshot_kernel(&self, _handle: u64) {}
+
+    /// Whether [`Self::exchange_async`] can serve payloads up to `bytes`.
+    fn supports_exchange_async(&self, _bytes: usize) -> bool {
+        false
     }
 
     /// Pre-register a GPU buffer with the communication backend.
@@ -215,6 +339,33 @@ mod tests {
         comm.group_end().unwrap();
         assert!(comm.is_healthy());
         comm.attempt_reconnect().unwrap();
+    }
+
+    #[test]
+    fn capturable_collectives_default_to_unavailable() {
+        // The contract callers (graph capture policies) rely on: a backend
+        // without them enqueues nothing and reports no capacity.
+        let comm = SingleGpuBackend;
+        assert!(!comm.all_reduce_capturable(0x1000, 8192, 0).unwrap());
+        assert!(
+            !comm
+                .peer_exchange_capturable(0x1000, 0x2000, 8192, 0)
+                .unwrap()
+        );
+        assert_eq!(comm.capturable_all_reduce_max_bytes(), 0);
+        comm.set_oneshot_kernel(0x1234);
+        assert_eq!(comm.capturable_all_reduce_max_bytes(), 0);
+    }
+
+    #[test]
+    fn command_words_default_to_unavailable() {
+        // The contract the model's command path relies on: a backend without
+        // a host command channel reports no capacity and moves nothing, so
+        // every word stays on the broadcast path.
+        let comm = SingleGpuBackend;
+        assert_eq!(comm.command_words_max(), 0);
+        assert!(comm.send_command_words(&[1]).is_err());
+        assert!(comm.recv_command_words(&mut [0]).is_err());
     }
 
     #[test]

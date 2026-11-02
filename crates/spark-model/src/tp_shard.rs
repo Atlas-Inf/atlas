@@ -29,7 +29,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use crate::weight_map::DenseWeight;
 
 /// Bytes per BF16 element.
-const BF16_BYTES: usize = 2;
+pub(crate) const BF16_BYTES: usize = 2;
 
 /// TP shard kind for a 2D BF16 weight `[out_dim, in_dim]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +63,26 @@ pub fn shard_dense_bf16(
     tp_size: usize,
     gpu: &dyn GpuBackend,
 ) -> Result<(DevicePtr, usize, usize)> {
+    shard_dense_bytes(
+        src, out_dim, in_dim, BF16_BYTES, kind, tp_rank, tp_size, gpu,
+    )
+}
+
+/// Byte-generic core of [`shard_dense_bf16`]: a 2D `[out_dim, in_dim]` weight
+/// of `elem_bytes`-wide elements. `ColumnParallel` takes a contiguous row
+/// slice; `RowParallel` a per-row column slice. BF16 callers keep
+/// byte-identical behavior through the wrapper above.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn shard_dense_bytes(
+    src: DevicePtr,
+    out_dim: usize,
+    in_dim: usize,
+    elem_bytes: usize,
+    kind: TpShardKind,
+    tp_rank: usize,
+    tp_size: usize,
+    gpu: &dyn GpuBackend,
+) -> Result<(DevicePtr, usize, usize)> {
     if tp_size <= 1 || kind == TpShardKind::Replicated {
         return Ok((src, out_dim, in_dim));
     }
@@ -75,7 +95,7 @@ pub fn shard_dense_bf16(
                 "ColumnParallel: out_dim {out_dim} not divisible by tp_size {tp_size}",
             );
             let local_out = out_dim / tp_size;
-            let row_bytes = in_dim * BF16_BYTES;
+            let row_bytes = in_dim * elem_bytes;
             let local_bytes = local_out * row_bytes;
             let dst = gpu.alloc(local_bytes)?;
             let src_offset = tp_rank * local_out * row_bytes;
@@ -89,8 +109,8 @@ pub fn shard_dense_bf16(
                 "RowParallel: in_dim {in_dim} not divisible by tp_size {tp_size}",
             );
             let local_in = in_dim / tp_size;
-            let local_row_bytes = local_in * BF16_BYTES;
-            let src_row_bytes = in_dim * BF16_BYTES;
+            let local_row_bytes = local_in * elem_bytes;
+            let src_row_bytes = in_dim * elem_bytes;
             let local_bytes = out_dim * local_row_bytes;
             let dst = gpu.alloc(local_bytes)?;
             // Per-row strided copy: row r of dst comes from row r of src,
@@ -98,7 +118,7 @@ pub fn shard_dense_bf16(
             let col_offset_bytes = tp_rank * local_row_bytes;
             tracing::debug!(
                 target: "spark_model::tp_shard",
-                out_dim, in_dim, local_in, src_row_bytes, local_row_bytes,
+                out_dim, in_dim, local_in, src_row_bytes, local_row_bytes, elem_bytes,
                 tp_rank, tp_size, src = src.0,
                 "dense row-parallel shard (per-row strided)"
             );
@@ -334,7 +354,11 @@ impl TpMoeDims {
 }
 
 mod gdn;
+pub(crate) use gdn::slice_segments;
 pub use gdn::*;
+
+mod mxfp8;
+pub use mxfp8::*;
 
 mod quant_shard;
 pub use quant_shard::{shard_fp8_block_scaled, shard_quantized_nvfp4};

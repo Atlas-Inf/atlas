@@ -370,6 +370,9 @@ impl ComputeTarget for HipTarget {
             format!("-I{compat}"),
             "-include".into(),
             "hip/hip_runtime.h".into(),
+            // CUDA cache-hint loads HIP lacks (`__ldcg`); see the header.
+            "-include".into(),
+            "atlas_hip_cache_hints.h".into(),
         ];
         // The Windows HIP SDK (ROCm 6.4 clang) lacks the CUDA mask-arg warp
         // intrinsics (__shfl_*_sync/__any_sync/__all_sync/__activemask) that

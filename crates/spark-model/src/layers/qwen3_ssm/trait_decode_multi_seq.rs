@@ -29,6 +29,13 @@ mod ssm_dp4a;
 /// double weight read was only part of the win, the kernel is simply better per
 /// pass. 5 is the default; 4 is a measured regression; 9 was the conservative
 /// first guess.
+///
+/// gfx1151 crosses over the other way: there the tile GEMM at M=8 is the slow
+/// arm (f119: the 48 GDN-layer MLPs on `w4a16_gemm_t` were 35.6% of a C8 decode
+/// window), and MIN_N=9 keeps M 5..8 on the batched GEMV (`try_forward_km`,
+/// the arm the attention layers' MLPs already take). Framework f120 (27B AR,
+/// Gufo protocol, 2 interleaved rounds): C8 34.4 -> 49.2 tok/s (+43%), C1 and
+/// C4 unchanged. So the default is 9 on `atlas_hip` and 5 elsewhere.
 fn ssm_ffn_prefill_min_n() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -36,8 +43,18 @@ fn ssm_ffn_prefill_min_n() -> usize {
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&v| v >= 2)
-            .unwrap_or(5)
+            .unwrap_or(if cfg!(atlas_hip) { 9 } else { 5 })
     })
+}
+
+/// `ATLAS_MOE_LEGACY_PERTOKEN_DECODE=1`: the MoE of a batched decode step a
+/// row at a time, so one EP reduce a row instead of one over every row.
+/// Every rank must run the same value (`model::startup_parity`).
+pub(crate) fn moe_legacy_pertoken_decode() -> bool {
+    std::env::var("ATLAS_MOE_LEGACY_PERTOKEN_DECODE")
+        .ok()
+        .as_deref()
+        == Some("1")
 }
 
 fn ssm_ffn_prefill_enabled() -> bool {
@@ -338,11 +355,7 @@ impl Qwen3SsmLayer {
                         (n * h) as u32,
                         stream,
                     )?;
-                } else if std::env::var("ATLAS_MOE_LEGACY_PERTOKEN_DECODE")
-                    .ok()
-                    .as_deref()
-                    != Some("1")
-                {
+                } else if !moe_legacy_pertoken_decode() {
                     // Token-major N-token MoE decode — DEFAULT for n>=4. Packs
                     // (token, expert) into blockIdx.y so all N tokens' experts run
                     // in ~3 batched kernel launches/layer instead of the legacy

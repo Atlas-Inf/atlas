@@ -48,6 +48,14 @@ pub struct ModelLevers {
     pub gdn_wy17: bool,
     /// WY-N GDN recurrence variant. Ships ON; `ATLAS_GDN_WYN=0` opts out.
     pub gdn_wyn: bool,
+    /// Deferred SSM commit. Ships ON; `ATLAS_GDN_DEFERRED_COMMIT=0` opts out:
+    /// wyN verify writes no per-token Hi_t snapshots nor the final H;
+    /// `gated_delta_rule_commit` replays the accepted prefix from the live
+    /// H0 instead. Cuts ~(K-1)×64 KB of state writes per (seq, v-head,
+    /// layer) at accept-count ~2; kernel entry is load-fixed so verify
+    /// CUDA-graph capture is unaffected. Same outputs, same committed
+    /// state bit-for-bit — replay shares `gated_delta_rule_wyn_impl`.
+    pub gdn_deferred_commit: bool,
 
     // ── FFN / MoE ──
     /// Lossless single-warp decode GEMV (`w4a16_gemv_sw`, `w4a16_gemv_dual_sw`).
@@ -73,6 +81,42 @@ pub struct ModelLevers {
     /// Official Lightning product: use the scalar W8A16 input projection per
     /// verify row. The existing batch4 kernel is not byte-identical at K=4.
     pub lightning_mamba_scalar_in_proj: bool,
+    /// qwen4_exp: every K-row verify row runs the kernels serial decode runs,
+    /// bit for bit (`ATLAS_QWEN4EXP_EXACT_VERIFY=1`; design in
+    /// `model/qwen4exp_exact_verify.rs`). Not from the environment directly:
+    /// `TransformerModel::new` sets it for a qwen4_exp model only.
+    pub qwen4exp_exact_verify: bool,
+    /// qwen4_exp: the MTP verify ceiling in drafts (`ATLAS_QWEN4EXP_MTP_DEPTH`,
+    /// `model/qwen4exp_mtp_depth.rs`), overriding the GDN layers' default 1.
+    /// Set by `TransformerModel::new` for a qwen4_exp model only.
+    pub qwen4exp_mtp_depth: Option<usize>,
+    /// qwen4_exp: every row of a batched multi-sequence step runs the kernels
+    /// single-sequence decode runs, bit for bit, with the per-row collectives
+    /// batched (`ATLAS_QWEN4EXP_BATCH_FAST=1`; design in
+    /// `model/qwen4exp_batch_fast.rs`). Set by `TransformerModel::new` for a
+    /// qwen4_exp model only.
+    pub qwen4exp_batch_fast: bool,
+    /// `ATLAS_QWEN4EXP_BATCH_FAST_BISECT` (diagnostic, 0 = off): components of
+    /// the exact batching lane forced back to one single-row launch per row
+    /// (`model/qwen4exp_batch_fast.rs`, `BISECT_*`). Set with the lane.
+    pub qwen4exp_batch_bisect: u32,
+    /// qwen4_exp, under `qwen4exp_batch_fast`: the small per-row kernels of a
+    /// batched step (MoE top-k and weighted-sum blend, the GDN mixer's four
+    /// small kernels per sequence) as one multi-row launch each, every row's
+    /// bytes the single-row kernel's (`ATLAS_QWEN4EXP_BATCH_SMALL=1`; design
+    /// in `model/qwen4exp_batch_fast.rs`). Set with the lane.
+    pub qwen4exp_batch_small: bool,
+    /// Exact persistent K-row Mamba-2 verify (`mamba2_ssm_verify_exact_
+    /// persistent`): decode's own column mapping, ±200 clamp and reduction
+    /// order, with H held in shared memory across the K loop. Opt-in via
+    /// ATLAS_MAMBA_VERIFY_EXACT, or armed by proposer-install policy for
+    /// targets that disable the fused kernel.
+    pub mamba_verify_exact: bool,
+    /// Fused K-row Mamba-2 verify (`mamba2_ssm_verify`). Opt-out:
+    /// `ATLAS_NO_MAMBA_VERIFY_FUSED` (presence-gated), or cleared at
+    /// proposer install for targets whose fused verify isn't bit-exact
+    /// (nemotron_h_omni).
+    pub mamba_verify_fused: bool,
 
     // ── LoRA ──
     /// Apply LoRA eagerly at load instead of at each forward.
@@ -117,6 +161,27 @@ pub struct ModelLevers {
     pub drafter: crate::model::drafter_context::DrafterContext,
 }
 
+/// `ATLAS_QWEN4EXP_BATCH_FAST_BISECT` bits: each forces one component of a
+/// batched step to single-row launches, one per row, as C1 runs them.
+/// MoE experts per row (`forward_row_local`), the EP reduce still batched.
+pub const BISECT_MOE_ROWS: u32 = 1;
+/// MoE through `forward` per row: per-row experts AND per-row all-reduce.
+pub const BISECT_MOE_FORWARD: u32 = 2;
+/// mHC collapse (`hc_pre`, `hc_head`) one row a launch.
+pub const BISECT_HC: u32 = 4;
+/// GDN mixer through `ssm_forward` per sequence (projections, recurrence,
+/// per-row TP all-reduce), the C1 mixer.
+pub const BISECT_GDN: u32 = 8;
+/// Attention Q/K/V and o_proj: the single-row GEMVs per row.
+pub const BISECT_ATTN_PROJ: u32 = 16;
+/// Attention core: the per-row phase (`qsa_rows.rs`, bs=1 a row).
+pub const BISECT_ATTN_ROWS: u32 = 32;
+/// LM head: `dense_gemv_bf16` per row.
+pub const BISECT_HEAD: u32 = 64;
+/// Verify-row MoE dedup (`forward_rows_t`): per-row expert launches on the
+/// transposed tables instead of the `_t_rows` union kernels.
+pub const BISECT_MOE_T_ROWS: u32 = 128;
+
 /// Opt-IN: off unless the variable is exactly `1`.
 fn opt_in(var: &str) -> bool {
     std::env::var(var).ok().as_deref() == Some("1")
@@ -133,10 +198,26 @@ fn opt_in_truthy(var: &str) -> bool {
 }
 
 impl ModelLevers {
+    /// `ATLAS_QWEN4EXP_BATCH_FAST_BISECT` bit `bit` is set (lane on).
+    pub fn batch_bisect(&self, bit: u32) -> bool {
+        self.qwen4exp_batch_fast && self.qwen4exp_batch_bisect & bit != 0
+    }
+
+    /// Rows one launch of a multi-row mHC collapse may take under the exact
+    /// batching lane (0: unchunked, the lane off): the split path's 8, or one
+    /// row a launch under `BISECT_HC`.
+    pub fn qwen4exp_hc_rows(&self) -> u32 {
+        match (self.qwen4exp_batch_fast, self.batch_bisect(BISECT_HC)) {
+            (false, _) => 0,
+            (true, true) => 1,
+            (true, false) => super::HC_SPLIT_MAX_ROWS,
+        }
+    }
+
     /// Resolve from the environment. Called once, when the model is built.
     pub fn from_env() -> Self {
         let lightning_lossless_target = opt_in("ATLAS_LIGHTNING_LOSSLESS_TARGET");
-        Self {
+        let levers = Self {
             max_decode_seqs: 1,
             shadow_topk: crate::speculative::shadow_topk(),
             kv_poison: std::env::var("ATLAS_KV_POISON").as_deref() == Ok("1"),
@@ -149,6 +230,7 @@ impl ModelLevers {
             // Opt-OUT — these three ship ON.
             gdn_wy17: opt_out("ATLAS_GDN_WY17"),
             gdn_wyn: opt_out("ATLAS_GDN_WYN"),
+            gdn_deferred_commit: opt_out("ATLAS_GDN_DEFERRED_COMMIT"),
             ffn_small_m: opt_out("ATLAS_FFN_SMALLM"),
             gemv_sw: super::gemv_sw::gemv_sw_from(
                 std::env::var("ATLAS_NO_GEMV_SW").ok().as_deref(),
@@ -163,6 +245,15 @@ impl ModelLevers {
             // diagnostic lets a no-spec control use identical target arithmetic.
             lightning_mamba_exact_recurrence: lightning_lossless_target,
             lightning_mamba_scalar_in_proj: lightning_lossless_target,
+            // Model-specific: `TransformerModel::new` sets it.
+            qwen4exp_exact_verify: false,
+            qwen4exp_mtp_depth: None,
+            qwen4exp_batch_fast: false,
+            qwen4exp_batch_bisect: 0,
+            qwen4exp_batch_small: false,
+            // Presence-gated: any value disables.
+            mamba_verify_fused: std::env::var_os("ATLAS_NO_MAMBA_VERIFY_FUSED").is_none(),
+            mamba_verify_exact: opt_in("ATLAS_MAMBA_VERIFY_EXACT"),
             lora_eager: opt_in_truthy("ATLAS_LORA_EAGER"),
             lora_rotate: opt_in_truthy("ATLAS_LORA_ROTATE"),
             k4_diag: opt_in("ATLAS_K4_DIAG"),
@@ -170,7 +261,13 @@ impl ModelLevers {
             gemma4_diag: opt_in_truthy("ATLAS_DIAG_GEMMA4"),
             // Presence-gated, not value-gated: any value enables it.
             bf16_tc_proj: std::env::var_os("ATLAS_BF16_TC_PROJ").is_some(),
+        };
+        if levers.gdn_deferred_commit {
+            tracing::info!(
+                "GDN deferred commit on (default; ATLAS_GDN_DEFERRED_COMMIT=0 opts out):                  wyN verify stores nothing; accepted prefix replayed from H0"
+            );
         }
+        levers
     }
 
     /// What a build resolves to with no `ATLAS_*` set — every opt-in off, the
@@ -187,6 +284,8 @@ impl ModelLevers {
             gdn_wyn: true,
             ffn_small_m: true,
             gemv_sw: true,
+            gdn_deferred_commit: true,
+            mamba_verify_fused: true,
             ..Self::default()
         }
     }
@@ -199,7 +298,7 @@ mod tests {
     #[test]
     fn the_opt_out_lever_is_on_by_default_and_every_opt_in_is_off() {
         let d = ModelLevers::defaults();
-        // Five levers ship ON. Getting one of these senses backwards is a
+        // Six levers ship ON. Getting one of these senses backwards is a
         // silent behaviour change, which is why they are pinned here.
         assert!(d.gdn_regresident, "PR #369 folded this default-on");
         assert!(d.gdn_wy17 && d.gdn_wyn, "opt-OUT via =0");
@@ -212,6 +311,10 @@ mod tests {
         assert!(!d.decode_ffn_via_gemm);
         assert!(!d.lora_eager);
         assert!(!d.k4_diag);
+        assert!(
+            d.gdn_deferred_commit,
+            "ATLAS_GDN_DEFERRED_COMMIT ships ON; =0 opts out"
+        );
     }
 
     #[test]

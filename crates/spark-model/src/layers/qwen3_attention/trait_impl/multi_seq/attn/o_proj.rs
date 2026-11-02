@@ -90,6 +90,31 @@ impl Qwen3AttentionLayer {
                     nq, // gate rows are nq BF16 elements apart
                     stream,
                 )?;
+            } else if n > 8
+                && fwd.levers.mamba_verify_exact
+                && self.dense_gemv_batchm_k.0 != 0
+                && super::super::qkv::bf16_batchm_enabled()
+            {
+                // Exact-verify (γ=8 → n=9 exceeds MAX_M=8): chunked batchm —
+                // the twin reproduces serial GEMV per row, so chunking at 8
+                // is byte-identical.
+                let mut c0 = 0usize;
+                while c0 < n {
+                    let m = (n - c0).min(8);
+                    ops::dense_gemv_batchm(
+                        fwd.gpu,
+                        self.dense_gemv_batchm_k,
+                        normed.offset(c0 * h * bf16),
+                        g_proj,
+                        gate_buf.offset(c0 * (nq as usize) * bf16),
+                        m as u32,
+                        nq,
+                        h as u32,
+                        nq,
+                        stream,
+                    )?;
+                    c0 += m;
+                }
             } else {
                 ops::dense_gemm_tc(
                     fwd.gpu,
@@ -130,7 +155,18 @@ impl Qwen3AttentionLayer {
         }
 
         let o_out = fwd.buffers.moe_output();
-        if let Some(q2) = self.o_weight.as_ref().and_then(|w| w.as_packed_q2()) {
+        if let Some(r) = self.try_mx8(
+            fwd,
+            self.o_weight.as_ref(),
+            attn_out,
+            o_out,
+            n,
+            true,
+            stream,
+        ) {
+            // Native MXFP8 (FP4-Local): contiguous [n, q_dim] -> [n, h].
+            r?;
+        } else if let Some(q2) = self.o_weight.as_ref().and_then(|w| w.as_packed_q2()) {
             // Keep-packed Q2_0 (Tier-1c): per-token 2-bit o_proj GEMV.
             for i in 0..n {
                 let attn_out_i = attn_out.offset(i * q_dim as usize * bf16);
@@ -164,6 +200,30 @@ impl Qwen3AttentionLayer {
                     h as u32, // o_out rows are h BF16 elements apart
                     stream,
                 )?;
+            } else if n > 8
+                && fwd.levers.mamba_verify_exact
+                && self.dense_gemv_batchm_k.0 != 0
+                && super::super::qkv::bf16_batchm_enabled()
+            {
+                // Exact-verify: chunked batchm (byte-identical to serial GEMV
+                // per row) instead of the scalar dense_gemm tile path.
+                let mut c0 = 0usize;
+                while c0 < n {
+                    let m = (n - c0).min(8);
+                    ops::dense_gemv_batchm(
+                        fwd.gpu,
+                        self.dense_gemv_batchm_k,
+                        attn_out.offset(c0 * nq as usize * hd as usize * bf16),
+                        o_bf16,
+                        o_out.offset(c0 * h * bf16),
+                        m as u32,
+                        h as u32,
+                        nq * hd,
+                        h as u32,
+                        stream,
+                    )?;
+                    c0 += m;
+                }
             } else {
                 ops::dense_gemm(
                     fwd.gpu,
@@ -178,13 +238,22 @@ impl Qwen3AttentionLayer {
                 )?;
             }
         } else if let Some(o_fp8) = self.o_weight.as_ref().and_then(|w| w.as_fp8()) {
-            let batch_kernel = if n <= 4 {
-                self.w8a16_gemv_batch4_k
+            // Rows 5..8 take the 8-row tier (bit-identical per row to batch16),
+            // as the SSM projections do (`ssm_batched/impl.rs`).
+            let (batch_kernel, div) = if n <= 4 {
+                (self.w8a16_gemv_batch4_k, 4)
             } else {
-                self.w8a16_gemv_batch16_k
+                ops::fp8_verify_gemv_tier(
+                    n,
+                    ops::gemv_vl2_enabled(),
+                    self.w8a16_gemv_batch8_k,
+                    self.w8a16_gemv_batch8_dyn_vl2_k,
+                    self.w8a16_gemv_batch8_dyn_vl2_n2_k,
+                    self.w8a16_gemv_batch16_k,
+                )
             };
             if (2..=16).contains(&n) && batch_kernel.0 != 0 {
-                ops::w8a16_gemv_batch4(
+                ops::w8a16_gemv_batch4_div(
                     fwd.gpu,
                     batch_kernel,
                     attn_out,
@@ -194,6 +263,7 @@ impl Qwen3AttentionLayer {
                     n as u32,
                     h as u32,
                     nq * hd,
+                    div,
                     stream,
                 )?;
             } else {
@@ -213,6 +283,20 @@ impl Qwen3AttentionLayer {
                     )?;
                 }
             }
+        } else if fwd.levers.batch_bisect(ops::BISECT_ATTN_PROJ) && !self.attn.o_proj.is_null() {
+            // ATLAS_QWEN4EXP_BATCH_FAST_BISECT: the single-row GEMV per row.
+            for i in 0..n {
+                self.nvfp4_decode_gemv(
+                    fwd.gpu,
+                    fwd.levers.gemv_sw,
+                    attn_out.offset(i * q_dim as usize * bf16),
+                    &self.attn.o_proj,
+                    o_out.offset(i * h * bf16),
+                    h as u32,
+                    nq * hd,
+                    stream,
+                )?;
+            }
         } else if n == 3 && !self.attn.o_proj.is_null() {
             ops::w4a16_gemv_batch3(
                 fwd.gpu,
@@ -231,6 +315,25 @@ impl Qwen3AttentionLayer {
                 attn_out,
                 &self.attn.o_proj,
                 o_out,
+                h as u32,
+                nq * hd,
+                stream,
+            )?;
+        } else if n == 4
+            && fwd.levers.qwen4exp_exact_verify
+            && !self.attn.o_proj.is_null()
+            && self.w4a16_batchm.scalar_kernel(4).0 != 0
+        {
+            // qwen4_exp exact K=4 verify: the scalar batch4 template, whose
+            // rows equal serial decode's `w4a16_gemv[_sw]`. The wide arm below
+            // may take DP4A or the tensor-core tier, which do not.
+            ops::w4a16_gemv_batchm(
+                fwd.gpu,
+                self.w4a16_batchm.scalar_kernel(4),
+                attn_out,
+                &self.attn.o_proj,
+                o_out,
+                4,
                 h as u32,
                 nq * hd,
                 stream,

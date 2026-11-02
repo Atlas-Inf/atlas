@@ -349,3 +349,43 @@ fn unified_flag_default_off_preserves_todays_policies() {
         "flag OFF: drop-on-full unchanged"
     );
 }
+
+/// Defect 3 regression: the swap file is anonymous once open, and same-tag
+/// leftovers (a dead process, or a build that never unlinked) are swept —
+/// other tags' files are not ours to touch.
+#[cfg(unix)]
+#[test]
+fn swap_file_is_unlinked_and_stale_same_tag_files_are_swept() {
+    let dir = std::env::temp_dir().join(format!("atlas-ssm-swap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("atlas-ssm-marconi-host.1.swap"), b"stale").unwrap();
+    std::fs::write(dir.join("atlas-ssm-other.1.swap"), b"not ours").unwrap();
+    let path = dir.to_string_lossy().into_owned();
+    let (mut swap, backing) = build_unified_swap_in(Some(path), 4096, "marconi-host");
+    if backing == SwapBacking::ODirect {
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            ["atlas-ssm-other.1.swap"],
+            "only the other tag is left"
+        );
+        // The unlinked file still works.
+        swap.write_record(2, &[7u8; 4096]).unwrap();
+        let mut out = [0u8; 4096];
+        swap.read_record(2, &mut out).unwrap();
+        assert_eq!(out, [7u8; 4096]);
+    } // else: this filesystem refuses O_DIRECT (tmpfs) — host-RAM swap, no file.
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn no_swap_dir_means_host_ram_swap() {
+    let (_, backing) = build_unified_swap_in(None, 4096, "marconi-host");
+    assert_eq!(backing, SwapBacking::HostRam);
+    let (_, backing) = build_unified_swap_in(Some("/tmp".into()), 1000, "marconi-host");
+    assert_eq!(backing, SwapBacking::HostRam, "not a 4 KiB blob");
+}

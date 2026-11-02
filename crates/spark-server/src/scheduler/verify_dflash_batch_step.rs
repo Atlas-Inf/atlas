@@ -127,11 +127,12 @@ pub(super) fn step_verify_dflash_batched(
         let a = &mut batch[i];
         let drafts = &drafts_per_seq[i];
         let raw = &results[off[i]..off[i + 1]];
-        let verified: Vec<u32> = if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
+        let mut verified: Vec<u32> = if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
             dflash_verify_raw_argmax,
             sched.levers.dflash_masked_verify,
-            model.is_lightning_dspark_product(),
+            model,
             a,
+            raw,
         ) {
             raw.to_vec()
         } else {
@@ -139,17 +140,13 @@ pub(super) fn step_verify_dflash_batched(
                 model, raw, a, verify_ctx, off[i],
             )
         };
-        let mut num_accepted = 0usize;
-        for j in 0..drafts.len() {
-            if j + 1 >= verified.len() {
-                break;
-            }
-            if drafts[j] == verified[j] {
-                num_accepted += 1;
-            } else {
-                break;
-            }
-        }
+        let num_accepted = super::verify_dflash_step::accept_with_forced_think_end(
+            a,
+            verify_ctx.think_end_token,
+            verify_ctx.boundary_mask.as_deref(),
+            drafts,
+            &mut verified,
+        );
         accepts.push(num_accepted);
         verifieds.push(verified);
     }
@@ -441,8 +438,19 @@ pub(super) fn apply_dflash_accept(
         tracing::error!("commit_ctx (kgamma batched): {e:#}");
     }
 
+    // Committed before emission (see `verify_dflash_tail`): an emit that
+    // finishes the sequence returns, and finish caches the committed state.
+    let k_verify = drafts.len() + 1;
+    let total_accepted = num_accepted + 1;
+    if let Err(e) = model.commit_accepted_prefix(&mut a.seq, total_accepted, k_verify) {
+        tracing::error!("commit_accepted_prefix (dflash batched): {e:#}");
+        a.engine_error = Some(format!("{e:#}"));
+        a.finished = true;
+        return;
+    }
+
     for i in 0..num_accepted {
-        emit_token(a, drafts[i], None, sched);
+        emit_span_row(a, drafts[i], None, sched, i, total_accepted);
         if a.finished {
             return;
         }
@@ -450,7 +458,7 @@ pub(super) fn apply_dflash_accept(
     let bonus_idx = num_accepted;
     if bonus_idx < verified.len() {
         let bonus = verified[bonus_idx];
-        emit_token(a, bonus, None, sched);
+        emit_span_row(a, bonus, None, sched, bonus_idx, total_accepted);
         if a.finished {
             return;
         }
@@ -468,14 +476,6 @@ pub(super) fn apply_dflash_accept(
         ])
         .inc();
 
-    let k_verify = drafts.len() + 1;
-    let total_accepted = num_accepted + 1;
-    if let Err(e) = model.commit_accepted_prefix(&mut a.seq, total_accepted, k_verify) {
-        tracing::error!("commit_accepted_prefix (dflash batched): {e:#}");
-        a.engine_error = Some(format!("{e:#}"));
-        a.finished = true;
-        return;
-    }
     let bonus_token_idx = total_accepted.saturating_sub(1);
     if let Err(e) = model.save_hidden_for_mtp(bonus_token_idx, 0) {
         tracing::error!("save_hidden_for_mtp (dflash batched): {e:#}");

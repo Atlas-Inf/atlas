@@ -108,6 +108,20 @@ impl SlotAlloc {
     fn release(&mut self, slot: usize) {
         self.free.push(slot);
     }
+    /// Claim a SPECIFIC slot if nobody owns it (on the free list, or never
+    /// handed out), returning whether it was claimed.
+    fn claim_specific(&mut self, slot: usize) -> bool {
+        if let Some(pos) = self.free.iter().position(|&s| s == slot) {
+            self.free.swap_remove(pos);
+            true
+        } else if slot >= self.next {
+            self.free.extend(self.next..slot);
+            self.next = slot + 1;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl NllbGpuModel {

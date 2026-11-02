@@ -351,6 +351,7 @@ fn choice() -> crate::ir::Choice {
         finish_reason: crate::ir::FinishReason::Stop,
         matched_stop: None,
         logprobs: None,
+        guard_stop: None,
     }
 }
 

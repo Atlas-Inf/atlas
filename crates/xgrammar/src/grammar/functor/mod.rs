@@ -50,6 +50,7 @@ pub use mutator::{GrammarMutator, MutatorState};
 pub use normalizer::{GrammarNormalizer, RootRuleRenamer, SingleElementExprEliminator};
 pub use optimizer::{
     ByteStringFuser, DeadCodeEliminator, GrammarOptimizer, RepetitionNormalizer, RuleInliner,
+    check_fsm_limits,
 };
 pub use structure_normalizer::StructureNormalizer;
 

@@ -78,7 +78,7 @@ pub struct EarleyParser {
     /// state pruning (Tier 3a). Computed once from the grammar's FSM
     /// topology; consulted with O(1) bitset lookups after every advance.
     /// See `prune.rs`.
-    pub(crate) productivity: ProductivityTable,
+    pub(crate) productivity: std::sync::Arc<ProductivityTable>,
 }
 
 impl EarleyParser {
@@ -113,7 +113,7 @@ impl EarleyParser {
             initial_state
         };
 
-        let productivity = ProductivityTable::build(&grammar);
+        let productivity = grammar.productivity();
         let mut parser = Self {
             grammar,
             is_completed: Vec::new(),

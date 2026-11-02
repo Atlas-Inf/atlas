@@ -33,6 +33,18 @@ impl Qwen3SsmLayer {
         (k.0 != 0).then_some(k)
     }
 
+    /// Deferred-commit eligibility: lever on, wyN band (K=5..16), and both
+    /// `_defer`/`commit` kernels resolved — else the storing path runs.
+    /// Pure + `pub(super)` so the host-side decision is unit-tested.
+    pub(super) fn gdn_defer_active(
+        lever_on: bool,
+        num_tokens: usize,
+        defer_k: KernelHandle,
+        commit_k: KernelHandle,
+    ) -> bool {
+        lever_on && (5..=16).contains(&num_tokens) && defer_k.0 != 0 && commit_k.0 != 0
+    }
+
     /// Fused pool-layout WY verify arm for K = `args.num_tokens`:
     /// conv1d+L2norm epilogue (single fused launch writing every rollback
     /// snapshot inline when `gdn_verify_fused_conv_kn` is present and the
@@ -147,6 +159,63 @@ impl Qwen3SsmLayer {
         let gate_ptr = gates_buf;
         let beta_ptr = gates_buf.offset(nv * fp32);
         let inter_stride_floats = (h_bytes / 4) as u32;
+
+        // ATLAS_GDN_DEFERRED_COMMIT (wyN K=5..16 only): launch the `_defer`
+        // twin — identical outputs, no Hi_t/final-H stores, `h_state` stays
+        // H0 — and stash the verify rows' conv-out + gate/beta into
+        // per-slot staging so `gated_delta_rule_commit` can replay the
+        // accepted prefix after accept. `h_state_intermediates` are unused
+        // under defer (arg kept for the signature; the MODE-1 kernel never
+        // reads it).
+        // `!fp16` mirrors the host-side `gdn_deferred_wyn` gate — wyN has
+        // no FP16-h-state twin, and the flag must never disagree with what
+        // actually launched.
+        let defer = Self::gdn_defer_active(
+            ctx.levers.gdn_deferred_commit && !super::ssm_h_fp16_enabled(),
+            num_tokens,
+            if (5..=16).contains(&num_tokens) {
+                self.gdn_wyn_defer_k[num_tokens - 5]
+            } else {
+                KernelHandle(0)
+            },
+            self.gdn_commit_k,
+        );
+        if defer {
+            // Staging copies into pool-stable per-slot buffers — they MAY
+            // run inside a captured verify graph: pool pointers are
+            // replay-stable and a captured memcpy re-copies on replay, so
+            // replays re-stage correctly. `gdn_commit_pending` is NOT set
+            // here: host code does not run on replay, so the flag is
+            // assigned at the verify dispatch entry instead
+            // (`mark_gdn_deferred_commit`).
+            anyhow::ensure!(
+                !ssm_state.gdn_commit_qkv.is_null() && !ssm_state.gdn_commit_gb.is_null(),
+                "deferred commit staging missing — the pool was built without                  ATLAS_GDN_DEFERRED_COMMIT"
+            );
+            ctx.gpu.copy_d2d_async(
+                conv_out_buf,
+                ssm_state.gdn_commit_qkv,
+                num_tokens * conv_dim * bf16,
+                stream,
+            )?;
+            ctx.gpu.copy_d2d_async(
+                gates_buf,
+                ssm_state.gdn_commit_gb,
+                num_tokens * nv * 2 * fp32,
+                stream,
+            )?;
+        }
+        let wy_kernel = if defer {
+            self.gdn_wyn_defer_k[num_tokens - 5]
+        } else {
+            wy_kernel
+        };
+        let inter_base = if defer {
+            spark_runtime::gpu::DevicePtr(0)
+        } else {
+            ssm_state.h_state_intermediates[0]
+        };
+        let inter_stride = if defer { 0 } else { inter_stride_floats };
         ops::gdn_decode_wyn(
             ctx.gpu,
             wy_kernel,
@@ -157,8 +226,8 @@ impl Qwen3SsmLayer {
             gate_ptr,
             beta_ptr,
             gdn_out_buf,
-            ssm_state.h_state_intermediates[0],
-            inter_stride_floats,
+            inter_base,
+            inter_stride,
             1, // batch_size
             nk as u32,
             nv as u32,

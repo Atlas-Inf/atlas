@@ -18,11 +18,14 @@ use std::collections::HashMap;
 use std::ffi::{CString, c_void};
 use std::sync::{Arc, OnceLock};
 
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig};
+use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream};
 use cudarc::nvrtc::Ptx;
 
 pub use crate::cuda_host::{CudaHost, host, release};
 use crate::error::{AtlasError, Result};
+
+mod launch;
+pub use launch::mark_pdl;
 
 // Raw CUDA driver API
 unsafe extern "C" {
@@ -416,77 +419,6 @@ impl AtlasRegistry {
             return Err(AtlasError::KernelLaunch(format!(
                 "cuStreamSynchronize failed: {}",
                 cuda_error_text(status)
-            )));
-        }
-        Ok(())
-    }
-
-    /// Launch a kernel on a specified raw CUDA stream.
-    ///
-    /// When `stream_ptr` comes from the caller (e.g. `torch.cuda.current_stream().cuda_stream`),
-    /// this ensures kernels are captured during CUDA graph recording.
-    ///
-    /// # Safety
-    /// - `kernel_params` must contain valid pointers to arguments matching the kernel signature.
-    /// - `stream_ptr` must be a valid CUstream handle (or 0 to use Atlas's own stream).
-    /// - `raw_func` must be a valid CUfunction obtained from `raw_function_cached`.
-    pub unsafe fn launch_on_stream(
-        &self,
-        raw_func: RawCudaFunc,
-        cfg: LaunchConfig,
-        stream_ptr: u64,
-        kernel_params: &mut [*mut c_void],
-    ) -> Result<()> {
-        // Always use the caller's stream directly. When stream_ptr=0, CUDA
-        // treats it as the legacy default stream which has implicit
-        // synchronization with all other streams in the same context.
-        // Never fall back to Atlas's private stream — that breaks ordering
-        // with PyTorch operations and prevents CUDA graph capture.
-        let stream = stream_ptr;
-        // Opt in to >48KB dynamic shared memory when requested.
-        if cfg.shared_mem_bytes > 48 * 1024 {
-            const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
-            let attr_status = unsafe {
-                cuFuncSetAttribute(
-                    raw_func.0,
-                    CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    cfg.shared_mem_bytes as i32,
-                )
-            };
-            if attr_status != 0 {
-                return Err(AtlasError::KernelLaunch(format!(
-                    "cuFuncSetAttribute(MAX_DYNAMIC_SHARED={}) failed: {}",
-                    cfg.shared_mem_bytes,
-                    cuda_error_text(attr_status)
-                )));
-            }
-        }
-        let status = unsafe {
-            cuLaunchKernel(
-                raw_func.0,
-                cfg.grid_dim.0,
-                cfg.grid_dim.1,
-                cfg.grid_dim.2,
-                cfg.block_dim.0,
-                cfg.block_dim.1,
-                cfg.block_dim.2,
-                cfg.shared_mem_bytes,
-                stream as *mut c_void,
-                kernel_params.as_mut_ptr(),
-                std::ptr::null_mut(),
-            )
-        };
-        if status != 0 {
-            return Err(AtlasError::KernelLaunch(format!(
-                "cuLaunchKernel failed: {} (grid=[{},{},{}], block=[{},{},{}], shared_mem={})",
-                cuda_error_text(status),
-                cfg.grid_dim.0,
-                cfg.grid_dim.1,
-                cfg.grid_dim.2,
-                cfg.block_dim.0,
-                cfg.block_dim.1,
-                cfg.block_dim.2,
-                cfg.shared_mem_bytes
             )));
         }
         Ok(())

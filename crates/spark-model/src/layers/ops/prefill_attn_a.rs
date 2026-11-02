@@ -371,3 +371,70 @@ pub fn paged_decode_attn_fp8(
         .arg_u32(sliding_window)
         .launch(stream)
 }
+
+/// Experimental GLM paged-prefill head GEMMs; decode keeps its existing path.
+#[allow(clippy::too_many_arguments)]
+pub fn glm_paged_grouped_gemm_mla(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    model: &str,
+    a: DevicePtr,
+    b: DevicePtr,
+    c: DevicePtr,
+    m: u32,
+    g: u32,
+    k_g: u32,
+    n_g: u32,
+    a_stride: u32,
+    c_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    let enabled = if model == "glm5_next" {
+        match std::env::var("ATLAS_GLM_PAGED_PREFILL_MLA_GEMM") {
+            Ok(value) => parse_glm_mla_gemm(Some(&value))?,
+            Err(std::env::VarError::NotPresent) => false,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        false
+    };
+    if enabled && super::bf16_gemm_cutlass_rows(m) {
+        // Head-batched CUTLASS (bench: ~1.12 ms vs cuBLASLt's 1.65 ms at
+        // 4096 rows, both head shapes).
+        return spark_runtime::cutlass::bf16_grouped_gemm_act_weight_t(
+            a.0, b.0, c.0, m, g, n_g, k_g, a_stride, c_stride, stream,
+        );
+    }
+    if enabled {
+        return spark_runtime::cublaslt::bf16_grouped_gemm_act_weight_t(
+            a.0, b.0, c.0, m, g, n_g, k_g, a_stride, c_stride, stream,
+        );
+    }
+    grouped_gemm_mla(
+        gpu, kernel, a, b, c, m, g, k_g, n_g, a_stride, c_stride, stream,
+    )
+}
+
+fn parse_glm_mla_gemm(value: Option<&str>) -> Result<bool> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => {
+            anyhow::bail!("ATLAS_GLM_PAGED_PREFILL_MLA_GEMM must be 0 or 1, got {other:?}")
+        }
+    }
+}
+
+#[cfg(test)]
+mod glm_mla_gemm_tests {
+    use super::parse_glm_mla_gemm;
+    #[test]
+    fn explicit_paged_mla_opt_in() {
+        assert!(!parse_glm_mla_gemm(None).unwrap());
+        assert!(!parse_glm_mla_gemm(Some("0")).unwrap());
+        assert!(parse_glm_mla_gemm(Some("1")).unwrap());
+        for bad in ["", "true", "2", " 1"] {
+            assert!(parse_glm_mla_gemm(Some(bad)).is_err());
+        }
+    }
+}

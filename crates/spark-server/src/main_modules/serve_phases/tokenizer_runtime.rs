@@ -12,14 +12,6 @@ pub(crate) struct TokenizerRuntime {
     pub(crate) reasoning_parser_box: Option<Box<dyn crate::reasoning_parser::ReasoningParser>>,
     pub(crate) think_end_token: Option<u32>,
     pub(crate) think_start_token: Option<u32>,
-    /// Token ID for a markdown code fence (```). Used to suppress the
-    /// confidence-based thinking early-stop (F2) while the model is
-    /// productively emitting a fenced code block inside `<think>`:
-    /// code tokens are near-deterministic (top-1 prob ≥ 0.95 for long
-    /// runs) but that is NOT a "done reasoning" signal. `None` =
-    /// tokenizer has no atomic fence token → guard disabled (fail-open,
-    /// F2 keeps its prior behaviour).
-    pub(crate) code_fence_token: Option<u32>,
     pub(crate) tool_call_start_token: Option<u32>,
     pub(crate) tool_call_end_token: Option<u32>,
     pub(crate) grammar_engine: Option<crate::grammar::GrammarEngine>,
@@ -295,6 +287,18 @@ pub(crate) fn resolve_tokenizer_runtime(
     if let Some(tid) = tool_call_end_token {
         tracing::info!("Tool call end token: {} ({})", tid, tc_end_str);
     }
+    // qwen3_coder XML parameter markers for the envelope-stuck guard, from
+    // THIS tokenizer (they were hard-coded to Qwen3.6 ids; Nemotron's differ).
+    let tool_markers =
+        crate::scheduler::tool_markers::ToolMarkers::from_tokenizer(tokenizer.inner());
+    match &tool_markers {
+        Some(m) => tracing::info!("Tool parameter marker classes: {}", m.summary()),
+        None => tracing::warn!(
+            "Tool parameter markers unresolved for this tokenizer: parameter-value \
+             tracking and the envelope-stuck cap are off (--tool-max-tokens still applies)"
+        ),
+    }
+    crate::scheduler::tool_markers::set(tool_markers);
 
     let grammar_engine = {
         let stop_ids: Vec<i32> = eos_tokens.iter().map(|&id| id as i32).collect();
@@ -321,13 +325,18 @@ pub(crate) fn resolve_tokenizer_runtime(
         limits: crate::scheduler::limits::SchedLimits {
             im_start_hard_stop: im_start_id,
             tool_response_hard_stop: tool_response_id,
+            code_fence_token,
             max_seq_len: 0,
+            glm_tool_boundary: crate::glm_tool_boundary::native_opener(
+                &config.model_type,
+                true,
+                tokenizer.inner().token_to_id("<tool_call>"),
+            ),
         },
         vocab_masks,
         reasoning_parser_box,
         think_end_token,
         think_start_token,
-        code_fence_token,
         tool_call_start_token,
         tool_call_end_token,
         grammar_engine,

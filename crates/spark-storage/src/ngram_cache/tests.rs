@@ -6,6 +6,16 @@
 use super::segmented::plan_shard_files;
 use super::*;
 
+/// The pinned arena behind every `NgramRowCache` needs a CURRENT CUDA context
+/// (`cuMemAllocHost` fails with 3, NOT_INITIALIZED, otherwise), so each
+/// `--ignored` GPU test below holds one for its duration.
+#[cfg(feature = "cuda")]
+fn cuda_ctx() -> crate::cuda_min::CudaCtx {
+    crate::cuda_min::CudaCtx::new(0).expect("CUDA context")
+}
+#[cfg(not(feature = "cuda"))]
+fn cuda_ctx() {}
+
 #[test]
 fn aligned_scratch_is_4k_aligned_and_two_blocks() {
     let mut b = AlignedBlock::new();
@@ -110,6 +120,7 @@ fn one_file_stays_one_descriptor() {
 #[test]
 #[ignore]
 fn multi_file_rows_are_byte_identical() {
+    let _ctx = cuda_ctx();
     use std::io::Write;
 
     const STRIDE: usize = 160; // FP8 row: head_dim 160 x 1 byte
@@ -245,6 +256,7 @@ fn scratch_table(stride: usize, rows: u64) -> (std::path::PathBuf, std::path::Pa
 #[test]
 #[ignore]
 fn prefetch_then_resolve_is_all_hits() {
+    let _ctx = cuda_ctx();
     const STRIDE: usize = 160;
     let (dir, path) = scratch_table(STRIDE, 64);
     let mut cache = NgramRowCache::open(&path, None, 64, STRIDE, 32).expect("cache");
@@ -279,6 +291,7 @@ fn prefetch_then_resolve_is_all_hits() {
 #[test]
 #[ignore]
 fn prefetched_rows_stay_evictable() {
+    let _ctx = cuda_ctx();
     const STRIDE: usize = 160;
     let (dir, path) = scratch_table(STRIDE, 64);
     let mut cache = NgramRowCache::open(&path, None, 64, STRIDE, 8).expect("cache");
@@ -298,11 +311,62 @@ fn prefetched_rows_stay_evictable() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// **The unpadded-tail regression.** A real table file ends wherever its last
+/// row ends, so the last rows' 4 KiB O_DIRECT block runs past EOF. The fetch
+/// used to demand the whole block and failed ("read row N: positional read hit
+/// EOF after 3637 of 4096 bytes") on the first long prompt that touched one —
+/// RadixArk's Flash-Next PLE, row 10000032. No tail pad here, unlike
+/// `scratch_table`: the last row ends exactly at EOF, and the row before it
+/// straddles into the final partial block.
+#[test]
+#[ignore]
+fn last_rows_of_an_unpadded_file_are_readable() {
+    let _ctx = cuda_ctx();
+    use std::io::Write;
+    const STRIDE: usize = 160;
+    const ROWS: u64 = 64; // 10240 bytes: the file's last block is partial
+    let dir = std::env::temp_dir().join(format!("ngram_tail_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("tmpdir");
+    let path = dir.join("table.bin");
+    let mut fh = std::fs::File::create(&path).expect("create");
+    for r in 0..ROWS {
+        let row: Vec<u8> = (0..STRIDE)
+            .map(|i| (r as u8).wrapping_mul(31).wrapping_add(i as u8))
+            .collect();
+        fh.write_all(&row).expect("row");
+    }
+    drop(fh);
+    assert_ne!(
+        ROWS as usize * STRIDE % BLOCK,
+        0,
+        "the tail must be partial"
+    );
+
+    let mut cache = NgramRowCache::open(&path, None, ROWS, STRIDE, 16).expect("cache");
+    let ids: Vec<u64> = vec![ROWS - 1, ROWS - 2, 51, 0];
+    let mut slots = Vec::new();
+    cache
+        .resolve(&ids, &mut slots)
+        .expect("rows near EOF must resolve");
+    for (id, slot) in ids.iter().zip(&slots) {
+        let want: Vec<u8> = (0..STRIDE)
+            .map(|i| (*id as u8).wrapping_mul(31).wrapping_add(i as u8))
+            .collect();
+        assert_eq!(
+            cache.slot_bytes(*slot).expect("slot bytes"),
+            &want[..],
+            "row {id}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A repeated id inside one prefetch is one fault and one slot — the same
 /// decide-time dedup `resolve` relies on.
 #[test]
 #[ignore]
 fn prefetch_dedups_repeated_ids() {
+    let _ctx = cuda_ctx();
     const STRIDE: usize = 160;
     let (dir, path) = scratch_table(STRIDE, 64);
     let mut cache = NgramRowCache::open(&path, None, 64, STRIDE, 16).expect("cache");

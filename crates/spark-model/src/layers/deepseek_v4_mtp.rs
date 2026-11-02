@@ -319,6 +319,7 @@ impl DeepseekV4MtpHead {
         // host-built per call and the H2D uploads above are illegal under
         // capture).
         let mtp_ctx = ForwardContext {
+            ssm_batch: None,
             buffers: ctx.buffers,
             gpu: ctx.gpu,
             config: ctx.config,

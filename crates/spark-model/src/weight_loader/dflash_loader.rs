@@ -26,169 +26,16 @@
 //! (`MTP loads ALL experts on every rank — no EP all_reduce needed`).
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::WeightStore;
 
-use crate::weight_map::{DenseWeight, dense_auto};
+use crate::weight_map::{DenseWeight, QuantizedWeight, dense_auto};
 
-/// Drafter HF `config.json` (subset Atlas consumes). Mirrors
-/// `z-lab/Qwen3.6-35B-A3B-DFlash/config.json` field names verbatim so
-/// `serde_json::from_str` works directly on the raw file.
-#[derive(Debug, Clone, Deserialize)]
-pub struct DflashConfig {
-    pub hidden_size: usize,
-    pub num_hidden_layers: usize,
-    pub intermediate_size: usize,
-    pub num_attention_heads: usize,
-    pub num_key_value_heads: usize,
-    pub head_dim: usize,
-    pub vocab_size: usize,
-    /// HF architecture identities; absent on older generic DFlash configs.
-    #[serde(default)]
-    pub architectures: Option<Vec<String>>,
-    #[serde(default)]
-    pub draft_vocab_size: Option<usize>,
-    #[serde(default)]
-    pub tie_word_embeddings: bool,
-    /// Lightning DSpark's required anchor/sampling declarations.
-    #[serde(default)]
-    pub dspark_bonus_anchor: Option<bool>,
-    #[serde(default)]
-    pub sample_from_anchor: Option<bool>,
-    #[serde(default)]
-    pub attention_sink_bias: Option<bool>,
-    #[serde(default)]
-    pub dspark_markov_rank: Option<usize>,
-    #[serde(default)]
-    pub target_layer_ids: Option<Vec<usize>>,
-    #[serde(
-        default,
-        alias = "dspark_confidence_head",
-        alias = "enable_confidence_head"
-    )]
-    pub confidence_head: Option<bool>,
-    #[serde(default, alias = "dspark_adaptive", alias = "adaptive_verification")]
-    pub adaptive: Option<bool>,
-    #[serde(default)]
-    pub quantization_config: Option<DflashQuantizationConfig>,
-    /// Block size γ. Qwen3.6-DFlash ships `block_size: 16`.
-    #[serde(default = "default_block_size")]
-    pub block_size: usize,
-    /// DFlash-specific nested config object.
-    #[serde(default)]
-    pub dflash_config: Option<DflashSubConfig>,
-    /// Drafter base RoPE θ. Defaults to 10M (matches Qwen3.6-DFlash).
-    #[serde(default = "default_rope_theta")]
-    pub rope_theta: f32,
-    /// HF-style `rope_scaling` block. `None` ⇒ plain RoPE (the v2 2026-04-27
-    /// Qwen3.6-DFlash drafter ships `rope_scaling: null`). When present and
-    /// `rope_type == "yarn"`, the drafter's YaRN parameters are used to
-    /// build the inv_freq table at construction time.
-    #[serde(default)]
-    pub rope_scaling: Option<DflashRopeScaling>,
-    /// DSpark Markov rank. `None` / 0 = DFlash-only (no sequential fixup).
-    #[serde(default)]
-    pub markov_rank: Option<usize>,
-}
+mod config;
+mod own_head;
 
-fn default_rope_theta() -> f32 {
-    10_000_000.0
-}
-
-/// Subset of HF `rope_scaling` block consumed by Atlas. Mirrors the field
-/// names in `transformers`' Qwen3 config so `serde_json::from_str` works
-/// directly on the drafter's `config.json`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct DflashRopeScaling {
-    /// Currently only `"yarn"` is recognised; anything else falls back to
-    /// plain RoPE with a warning logged at construction time.
-    #[serde(default)]
-    pub rope_type: Option<String>,
-    #[serde(default)]
-    pub factor: Option<f32>,
-    #[serde(default)]
-    pub beta_fast: Option<f32>,
-    #[serde(default)]
-    pub beta_slow: Option<f32>,
-    #[serde(default)]
-    pub original_max_position_embeddings: Option<f32>,
-}
-
-/// Minimal nested quantization metadata needed for runtime admission.
-#[derive(Debug, Clone, Deserialize)]
-pub struct DflashQuantizationConfig {
-    #[serde(default)]
-    pub kv_cache_quant_algo: Option<String>,
-}
-
-fn default_block_size() -> usize {
-    16
-}
-
-/// Nested `dflash_config` block in the drafter's `config.json`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct DflashSubConfig {
-    /// Token id used to fill the γ "to-be-predicted" positions during draft
-    /// inference. `248070` for Qwen3.6-DFlash and Qwen3.8-DFlash2.
-    pub mask_token_id: u32,
-    /// Target-model layer indices to capture intermediate hidden states from.
-    /// `[1, 10, 19, 28, 37]` for Qwen3.6-35B-A3B-DFlash; `[5, 19, 33, 47, 61]` for Qwen3.8-27B.
-    pub target_layer_ids: Vec<usize>,
-    /// When `Some(true)`, every drafter layer uses causal γ-block attention.
-    #[serde(default)]
-    pub causal: Option<bool>,
-    /// Force sliding-window attention on every drafter layer.
-    #[serde(default)]
-    pub use_swa: Option<bool>,
-    /// Sliding-window size when `use_swa` or `layer_types` request SWA.
-    #[serde(default)]
-    pub swa_window_size: Option<usize>,
-    /// When `Some(true)`, each layer must ship `self_attn.attention_sink_bias`.
-    #[serde(default)]
-    pub attention_sink_bias: Option<bool>,
-    #[serde(default)]
-    pub sample_from_anchor: Option<bool>,
-    #[serde(
-        default,
-        alias = "dspark_confidence_head",
-        alias = "enable_confidence_head"
-    )]
-    pub confidence_head: Option<bool>,
-    #[serde(default, alias = "dspark_adaptive", alias = "adaptive_verification")]
-    pub adaptive: Option<bool>,
-    /// DFlash2 nested block size γ (typically 8).
-    #[serde(default)]
-    pub block_size: Option<usize>,
-    /// Channels sharing a dynamic convolution kernel in DFlash2 (16).
-    #[serde(default)]
-    pub conv_group_size: Option<usize>,
-    /// Convolution kernel size in DFlash2 (2 taps).
-    #[serde(default)]
-    pub conv_kernel_size: Option<usize>,
-    /// Codebook embedding rank in DFlash2 CandidateSelector (256).
-    #[serde(default)]
-    pub selector_rank: Option<usize>,
-    /// Candidate pool size evaluated by DFlash2 CandidateSelector (16).
-    #[serde(default)]
-    pub selector_top_k: Option<usize>,
-}
-
-impl DflashConfig {
-    pub fn block_size(&self) -> usize {
-        self.dflash_config
-            .as_ref()
-            .and_then(|c| c.block_size)
-            .unwrap_or(self.block_size)
-    }
-
-    pub fn is_dflash2(&self) -> bool {
-        self.architectures
-            .as_deref()
-            .map(|a| a.iter().any(|name| name == "DFlash2DraftModel"))
-            .unwrap_or(false)
-    }
-}
+pub use config::*;
+pub(crate) use own_head::own_lm_head_present;
 
 /// DFlash2 2-tap grouped dynamic convolution weights.
 #[derive(Clone)]
@@ -221,6 +68,9 @@ pub struct DflashWeights {
     pub markov_rank: usize,
     pub embed_tokens: Option<DenseWeight>,
     pub candidate_selector: Option<DflashCandidateSelectorWeights>,
+    /// Own NVFP4 lm_head (LiLiCorr-style drafters, `has_own_lm_head: true`).
+    /// `None` on generic DFlash — the head shares the target's.
+    pub lm_head: Option<QuantizedWeight>,
 }
 
 /// Per-drafter-layer raw weights (BF16).
@@ -250,14 +100,6 @@ pub struct DflashLayerWeights {
 /// bare layout (verified against commit 42d3b34, May 2026).
 pub fn store_has_dflash_weights(store: &WeightStore) -> bool {
     store.contains("fc.weight") || store.contains("model.fc.weight")
-}
-
-/// Parse a DFlash drafter's `config.json` into a [`DflashConfig`]. Used by
-/// `main.rs` after fetching the drafter's HF metadata to size the runtime
-/// `BlockDiffusionDraftHead` (layer count, head_dim, vocab_size, the
-/// `target_layer_ids` capture indices).
-pub fn parse_dflash_config(json: &str) -> Result<DflashConfig> {
-    serde_json::from_str(json).context("Parsing DFlash drafter config.json")
 }
 
 /// Load DFlash drafter weights from a separate [`WeightStore`] pointing at
@@ -329,6 +171,12 @@ pub fn load_dflash_weights(
     let layer_count = drafter_config.num_hidden_layers;
     let mut layers = Vec::with_capacity(layer_count);
     let mut sink_layers = 0usize;
+    // Projections `ATLAS_DFLASH_DROP_BF16` already moved to NVFP4 twins.
+    let projection = |name: &str| match super::dflash_preshrink::dropped_weight(drafter_store, name)
+    {
+        Some(dropped) => Ok(dropped),
+        None => dense_auto(drafter_store, name, gpu),
+    };
     for i in 0..layer_count {
         let lp = format!("{prefix}layers.{i}");
         let sink_name = format!("{lp}.self_attn.attention_sink_bias");
@@ -377,15 +225,15 @@ pub fn load_dflash_weights(
                 &format!("{lp}.post_attention_layernorm.weight"),
                 gpu,
             )?,
-            q_proj: dense_auto(drafter_store, &format!("{lp}.self_attn.q_proj.weight"), gpu)?,
+            q_proj: projection(&format!("{lp}.self_attn.q_proj.weight"))?,
             k_proj: dense_auto(drafter_store, &format!("{lp}.self_attn.k_proj.weight"), gpu)?,
             v_proj: dense_auto(drafter_store, &format!("{lp}.self_attn.v_proj.weight"), gpu)?,
-            o_proj: dense_auto(drafter_store, &format!("{lp}.self_attn.o_proj.weight"), gpu)?,
+            o_proj: projection(&format!("{lp}.self_attn.o_proj.weight"))?,
             q_norm: dense_auto(drafter_store, &format!("{lp}.self_attn.q_norm.weight"), gpu)?,
             k_norm: dense_auto(drafter_store, &format!("{lp}.self_attn.k_norm.weight"), gpu)?,
-            gate_proj: dense_auto(drafter_store, &format!("{lp}.mlp.gate_proj.weight"), gpu)?,
-            up_proj: dense_auto(drafter_store, &format!("{lp}.mlp.up_proj.weight"), gpu)?,
-            down_proj: dense_auto(drafter_store, &format!("{lp}.mlp.down_proj.weight"), gpu)?,
+            gate_proj: projection(&format!("{lp}.mlp.gate_proj.weight"))?,
+            up_proj: projection(&format!("{lp}.mlp.up_proj.weight"))?,
+            down_proj: projection(&format!("{lp}.mlp.down_proj.weight"))?,
             attention_sink_bias,
             attention_conv,
             mlp_conv,
@@ -448,6 +296,33 @@ pub fn load_dflash_weights(
         None
     };
 
+    let lm_head = if own_lm_head_present(drafter_store, prefix, drafter_config.has_own_lm_head)? {
+        tracing::info!("DFlash drafter: own NVFP4 lm_head ({prefix}lm_head.weight)");
+        Some(
+            crate::weight_map::quantized(drafter_store, &format!("{prefix}lm_head"), gpu)
+                .context("DFlash drafter: load own lm_head")?,
+        )
+    } else {
+        None
+    };
+
+    // NVIDIA LiLiCorr drafters also ship a `lilicorr.*` candidate re-ranker.
+    // Its forward code is unavailable, so name the skipped tensors: drafts
+    // run on the drafter's own argmax and acceptance will be below NVIDIA's
+    // reference.
+    let lilicorr_prefix = format!("{prefix}lilicorr.");
+    let lilicorr_count = drafter_store
+        .names()
+        .filter(|n| n.starts_with(lilicorr_prefix.as_str()))
+        .count();
+    if lilicorr_count > 0 {
+        tracing::warn!(
+            "DFlash drafter ships {lilicorr_count} lilicorr.* tensors: the LiLiCorr \
+             candidate re-ranker is not implemented — drafts use the drafter's own \
+             argmax, so acceptance will be below NVIDIA's reference"
+        );
+    }
+
     if let Ok(fc_meta) = drafter_store.get(&format!("{prefix}fc.weight"))
         && fc_meta.dtype == spark_runtime::weights::WeightDtype::UInt8
         && fc_meta.shape.len() == 2
@@ -488,6 +363,7 @@ pub fn load_dflash_weights(
         markov_rank,
         embed_tokens,
         candidate_selector,
+        lm_head,
     }))
 }
 

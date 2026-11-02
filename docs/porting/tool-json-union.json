@@ -1,0 +1,77 @@
+{
+  "title": "Native tool-call or response-format JSON union",
+  "original_author": {
+    "name": "Jason McCartney",
+    "email": "jmac@theroot.org",
+    "project": "Enntity / SparkGLM"
+  },
+  "integration_by": {
+    "name": "Reiner Schmidt",
+    "email": "reinermschmidt@gmail.com"
+  },
+  "license": "AGPL-3.0-only; existing Atlas and XGrammar notices retained",
+  "source_repository": "https://github.com/Enntity/atlas",
+  "source_ref": "refs/remotes/research-enntity/sparkglm",
+  "source_head": "b3b016ab7e91b73bea220b7280c9e9aa1a2cfb13",
+  "sources": [
+    {
+      "commit": "1921b33f704000d2f7f66fd5840f8348fe74d3de",
+      "url": "https://github.com/Enntity/atlas/commit/1921b33f704000d2f7f66fd5840f8348fe74d3de",
+      "contribution": "shared: xgrammar Grammar::union and a schema-bounded grammar compile"
+    },
+    {
+      "commit": "66218e8849ca951e39b80d8ba57bc3747c2718d4",
+      "url": "https://github.com/Enntity/atlas/commit/66218e8849ca951e39b80d8ba57bc3747c2718d4",
+      "contribution": "shared: grammar engine compiles a tool-call-or-JSON union"
+    },
+    {
+      "commit": "98a3fa2183890ac10e541928d650fcdd211d12f4",
+      "url": "https://github.com/Enntity/atlas/commit/98a3fa2183890ac10e541928d650fcdd211d12f4",
+      "contribution": "api: tools + response_format under tool_choice auto get the union grammar"
+    },
+    {
+      "commit": "9061ddad3e7fcffd725bdba9e8f93604e4b028ab",
+      "url": "https://github.com/Enntity/atlas/commit/9061ddad3e7fcffd725bdba9e8f93604e4b028ab",
+      "contribution": "scheduler: a tool-call-or-JSON union takes GLM's native opener as output"
+    },
+    {
+      "commit": "ece58a9e2a0f5bff45a58b60f58f0264302f238d",
+      "url": "https://github.com/Enntity/atlas/commit/ece58a9e2a0f5bff45a58b60f58f0264302f238d",
+      "contribution": "api: tools_rfmt_probe.py, a live tools + response_format check"
+    },
+    {
+      "commit": "5db3b6156adda227bdf1f6e40a1c4101fa9b1699",
+      "url": "https://github.com/Enntity/atlas/commit/5db3b6156adda227bdf1f6e40a1c4101fa9b1699",
+      "contribution": "api: a tool-call-or-JSON union takes no <tool_call> boost"
+    },
+    {
+      "commit": "aaa09c293067ae641a9086c9ac48763a3423bb49",
+      "url": "https://github.com/Enntity/atlas/commit/aaa09c293067ae641a9086c9ac48763a3423bb49",
+      "contribution": "shared: a tool-call-or-JSON union picks its branch by mass"
+    },
+    {
+      "commit": "9f075c4688dd9aa370640e5d5e8da344fb2c794d",
+      "url": "https://github.com/Enntity/atlas/commit/9f075c4688dd9aa370640e5d5e8da344fb2c794d",
+      "contribution": "scheduler: a union's branch token is never picked in a verify row"
+    }
+  ],
+  "native_integration": [
+    "The existing Rust XGrammar compiler builds the bounded union; no external repository, library or subprocess is needed for inference.",
+    "Auto/unset tool_choice plus response_format permits tool calls or a bare JSON answer. Required/named choices retain the tool grammar; none retains the response-format grammar.",
+    "The first output token uses tool-branch versus other-token probability mass. Explicit tool-call bias is omitted for the union while repeat-call penalties remain.",
+    "The GLM native tool opener may end reasoning and is consumed by the union matcher. The branch-selection token uses host logits and cannot be selected by a speculative verify row.",
+    "Existing main model-specific sampling presets, runtime timing, scheduler lifecycle and CPU contracts remain in place.",
+    "A parser without tool-grammar support is rejected as HTTP400 for a union request, preserving Atlas strict response_format behavior instead of silently generating unconstrained output.",
+    "The schema byte limit is checked on EBNF cache hits as well as new compilations, so a prior unbounded compile cannot bypass it."
+  ],
+  "validation_scope": "CPU grammar/API/scheduler tests; live two-turn probe supplied for subsequent GPU validation. No GPU claim is made by this port.",
+  "validation": {
+    "xgrammar": "833 unit tests and 2 doctests passed; 1 doctest ignored",
+    "spark_server": "2771 unit tests passed; 13 existing tests ignored (network/timing/other opt-in tests)",
+    "clippy": "cargo clippy --locked --offline -p xgrammar -p spark-server --tests --all-features -- -D warnings passed",
+    "rustdoc": "RUSTDOCFLAGS=\"-D warnings\" cargo doc --locked --offline -p xgrammar -p spark-server --no-deps passed",
+    "static": "cargo fmt, SPDX, changed-file typos, existing file-size workflow, git diff --check, Python syntax passed",
+    "regressions": "Unsupported-parser strict response format and cached schema-size limit tests were observed failing before the integration fixes and passed afterwards.",
+    "environment": "ATLAS_SKIP_BUILD=1, CUDARC_CUDA_VERSION=13000; existing fail-fast CPU link stubs. NO_COLOR cleared and COLORTERM=truecolor for inherited TUI tests. No native GPU code executed."
+  }
+}

@@ -1,0 +1,88 @@
+{
+  "limitations": [
+    "Configured FP8 cache and bounded aggregate KV pool emit advisory warnings.",
+    "Teardown/backend allocation sweeps reclaim unregistered allocations; retained as an ownership-accounting limitation, not claimed absent. All measured models exited0 and GPU idle was verified.",
+    "No broader model-quality, enlarged capacity, kernel-specific dispatch, or sustained leak-freedom claim.",
+    "Fresh parity covers C1/C4 and C4 repeats with DFlash enabled; no fresh DFlash-versus-plain decode equivalence claim.",
+    "Disconnect/reuse and chunk progress are observed; no per-allocation or per-request retirement trace is claimed."
+  ],
+  "measured_source_revision": "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e",
+  "note": "Raw harness qualification fields are preserved. The separate rank-log review supports only its explicitly bounded scope.",
+  "scope": "Bounded API/schema/tools, C1/C4 repeated parity, disconnect/reuse,6404-token multichunk needle and actual resident/NVMe restoration; both ranks exit0/no fatal diagnostics/no swap and verified original-service restoration.",
+  "summaries": {
+    "runs/followon-full-cb45065c-20261015/api/summary.json": {
+      "passed": true,
+      "results": [
+        {
+          "case": "json-schema",
+          "passed": true
+        },
+        {
+          "case": "tool",
+          "passed": true
+        },
+        {
+          "case": "post-cancel-reuse",
+          "passed": true
+        }
+      ]
+    },
+    "runs/followon-full-cb45065c-20261015/cancel/summary.json": {
+      "http_checks_completed": true,
+      "mode": "cancel",
+      "qualification_pass": null,
+      "reason": "Correlate rank logs, process identity and memory cleanup; HTTP success alone is insufficient."
+    },
+    "runs/followon-full-cb45065c-20261015/long-prefill/summary.json": {
+      "disconnect_prompt_tokens": 6403,
+      "exact_recall_passed": true,
+      "followup_42_passed": true,
+      "http_checks_completed": true,
+      "native_dispatch_qualification": "pending server evidence",
+      "prefill_retirement_qualification": "pending server evidence",
+      "qualification_pass": null,
+      "reason": "Correlate both rank logs, request admission/prefill cursor, retirement and memory; do not infer native kernel dispatch or prefill cancellation from HTTP results alone.",
+      "recall_prompt_tokens": 6404
+    },
+    "runs/followon-full-cb45065c-20261015/parity/summary.json": {
+      "c1_equals_c4": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "c4_repeat_matches": [
+        true,
+        true,
+        true,
+        true
+      ]
+    },
+    "runs/followon-nvme-fast-keep-cb45065c-20261015/prefix/summary.json": {
+      "http_passed": true,
+      "qualified": false,
+      "reason": "Run verify with both full rank logs to prove restore paths."
+    },
+    "runs/followon-nvme-sync-cb45065c-20261015/prefix/summary.json": {
+      "http_passed": true,
+      "qualified": false,
+      "reason": "Run verify with both full rank logs to prove restore paths."
+    },
+    "runs/followon-resident-cb45065c-20261015/long-prefill/summary.json": {
+      "disconnect_prompt_tokens": 6403,
+      "exact_recall_passed": true,
+      "followup_42_passed": true,
+      "http_checks_completed": true,
+      "native_dispatch_qualification": "pending server evidence",
+      "prefill_retirement_qualification": "pending server evidence",
+      "qualification_pass": null,
+      "reason": "Correlate both rank logs, request admission/prefill cursor, retirement and memory; do not infer native kernel dispatch or prefill cancellation from HTTP results alone.",
+      "recall_prompt_tokens": 6404
+    },
+    "runs/followon-resident-cb45065c-20261015/prefix/summary.json": {
+      "http_passed": true,
+      "qualified": false,
+      "reason": "Run verify with both full rank logs to prove restore paths."
+    }
+  }
+}

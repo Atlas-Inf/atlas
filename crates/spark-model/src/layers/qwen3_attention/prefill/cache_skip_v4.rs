@@ -47,7 +47,7 @@ impl Qwen3AttentionLayer {
         let use_tc = self.dense_gemm_tc_k.0 != 0;
         let diag_all =
             std::env::var("ATLAS_DIAG_V4_ALL_LAYERS").is_ok_and(|v| v == "1" || v == "true");
-        let diag_this = self.attn_layer_idx == 0 || diag_all;
+        let diag_this = diag_all;
 
         // Per-token NaN scan of `normed` (post hc_pre + input_norm) — localizes
         // whether the K-FULL NaN originates upstream (hc_pre) or in the kv proj.

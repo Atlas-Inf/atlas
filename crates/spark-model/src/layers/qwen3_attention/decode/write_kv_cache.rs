@@ -460,13 +460,11 @@ impl Qwen3AttentionLayer {
                     _ => unreachable!(),
                 }
             }
-            KvCacheDtype::Bf16 => ops::reshape_and_cache(
+            KvCacheDtype::Bf16 | KvCacheDtype::Fp8G128 => self.write_kv_cache_bf16_latent(
                 gpu,
-                self.reshape_cache_k,
                 k,
                 v,
-                kv_cache.k_pool_ptr(self.attn_layer_idx),
-                kv_cache.v_pool_ptr(self.attn_layer_idx),
+                kv_cache,
                 slot,
                 num_tokens,
                 num_kv_heads,
@@ -474,7 +472,6 @@ impl Qwen3AttentionLayer {
                 block_size,
                 key_stride,
                 value_stride,
-                kv_cache.cache_stride() as u64,
                 stream,
             ),
             _ => {

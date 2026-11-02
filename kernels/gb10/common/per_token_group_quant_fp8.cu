@@ -94,3 +94,51 @@ extern "C" __global__ void per_token_group_quant_fp8(
 #endif
     }
 }
+
+extern "C" __global__ void per_token_group_quant_fp8_warp(
+    const __nv_bfloat16* __restrict__ A,   // [M, K] BF16 activations
+    unsigned char* __restrict__ A_fp8,     // [M, K] FP8 E4M3
+    float* __restrict__ a_scale,           // [M, K/128] FP32 scale
+    unsigned int M,
+    unsigned int K
+) {
+    // per_token_group_quant_fp8 with one warp per (token, K-group): lane l
+    // owns elements 4l..4l+3 of the group. The group max is exact in any
+    // order and each element's divide and E4M3 encode are the per-element
+    // ones, so the bytes are per_token_group_quant_fp8's. Grid
+    // (ceil(M * K/128 / 8), 1, 1), block (256, 1, 1): eight groups a CTA
+    // instead of one, the 128-thread CTA per group being launch-bound.
+    const unsigned int groups = K / FP8_GROUP_K;
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned long long q = (unsigned long long)blockIdx.x * (blockDim.x / 32u) + (threadIdx.x >> 5);
+    if (q >= (unsigned long long)M * groups) return;
+    const unsigned int m = (unsigned int)(q / groups), kg = (unsigned int)(q % groups);
+    const unsigned int k0 = kg * FP8_GROUP_K + lane * 4u;
+    float x[4];
+    float my_abs = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        x[i] = k0 + i < K ? __bfloat162float(A[(unsigned long long)m * K + k0 + i]) : 0.0f;
+        my_abs = fmaxf(my_abs, fabsf(x[i]));
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        my_abs = fmaxf(my_abs, __shfl_xor_sync(0xFFFFFFFF, my_abs, off));
+    // Scale so that max maps to FP8 E4M3 max. Floor to avoid div-by-zero.
+    float scale = my_abs / FP8_E4M3_MAX;
+    if (scale < 1e-12f) scale = 1e-12f;
+    if (lane == 0) a_scale[(unsigned long long)m * groups + kg] = scale;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        if (k0 + i >= K) continue;
+        float v = x[i] / scale;
+        // Saturating clamp + E4M3 round-to-nearest.
+        v = fmaxf(fminf(v, FP8_E4M3_MAX), -FP8_E4M3_MAX);
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+        A_fp8[(unsigned long long)m * K + k0 + i] = scl_enc_fp8(v);
+#else
+        __nv_fp8_storage_t fp8_v = __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
+        A_fp8[(unsigned long long)m * K + k0 + i] = (unsigned char)fp8_v;
+#endif
+    }
+}

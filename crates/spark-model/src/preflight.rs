@@ -82,7 +82,16 @@ fn check_quant_method(config: &ModelConfig) -> Result<()> {
     if qc.quant_method.is_empty() {
         return Ok(());
     }
-    const KNOWN_METHODS: &[&str] = &["compressed-tensors", "modelopt", "fp8"];
+    // `modelopt_mixed` is the ModelOpt label on MIXED_PRECISION dumps
+    // (Nemotron 3.5 Super VL NVFP4 ships it with a per-component
+    // `quantized_layers` map — same semantics as `modelopt`).
+    const KNOWN_METHODS: &[&str] = &[
+        "compressed-tensors",
+        "modelopt",
+        "modelopt_mixed",
+        "fp8",
+        "exl3",
+    ];
     if !KNOWN_METHODS.contains(&qc.quant_method.as_str()) {
         bail!(
             "Pre-flight: checkpoint declares quant_method={:?} which Atlas doesn't \
@@ -291,6 +300,7 @@ fn check_mtp_consumability(config: &ModelConfig) -> Result<()> {
         "holo3_1_moe",
         "qwen3_vl_moe",
         "qwen3_coder_next",
+        "glm5_next",
     ];
     if MTP_SUPPORTED_MODEL_TYPES.contains(&config.model_type.as_str()) {
         return Ok(());
@@ -339,3 +349,7 @@ fn check_correction_bias_shape(store: &WeightStore, config: &ModelConfig) -> Res
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "preflight_exl3_tests.rs"]
+mod exl3_tests;

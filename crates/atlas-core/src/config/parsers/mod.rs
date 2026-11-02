@@ -4,7 +4,9 @@
 //! budget.
 
 mod deepseek_v4;
+mod exl3;
 mod gemma4;
+mod glm5_next;
 mod laguna;
 mod longcat;
 mod lora;
@@ -16,7 +18,9 @@ mod step3p7;
 mod vision;
 
 pub(crate) use deepseek_v4::parse_deepseek_v4;
+pub use exl3::Exl3QuantConfig;
 pub(crate) use gemma4::parse_gemma4_params;
+pub(crate) use glm5_next::parse_glm5_next;
 pub(crate) use laguna::parse_laguna;
 pub(crate) use longcat::parse_longcat_ngram;
 pub use lora::{PEFT_SUPPORTED_TARGET_MODULES, PeftAdapterConfig, parse_peft_adapter_config};
@@ -25,4 +29,4 @@ pub use mistral::parse_mistral_params;
 pub use quantization::parse_quantization_config;
 pub(crate) use qwen4_exp::parse_qwen4_exp;
 pub(crate) use step3p7::parse_step3p7;
-pub(crate) use vision::parse_vision_config;
+pub(crate) use vision::{parse_glm5_vision_config, parse_vision_config};

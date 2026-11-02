@@ -54,3 +54,23 @@ fn carried_uses_the_process_limiter_rather_than_minting_its_own() {
         "the host's limiter IS the one the model's AppState will hold"
     );
 }
+
+#[test]
+fn glm_vision_guard_requires_the_native_glm_module() {
+    let glm = [("glm_vision_encoder", &[][..])];
+    let qwen = [("vision_encoder", &[][..])];
+
+    assert_eq!(required_vision_module(true), "glm_vision_encoder");
+    assert!(target_has_required_vision_module(true, &glm));
+    assert!(!target_has_required_vision_module(true, &qwen));
+}
+
+#[test]
+fn qwen_vision_guard_keeps_the_generic_module_name() {
+    let qwen = [("vision_encoder", &[][..])];
+    let glm = [("glm_vision_encoder", &[][..])];
+
+    assert_eq!(required_vision_module(false), "vision_encoder");
+    assert!(target_has_required_vision_module(false, &qwen));
+    assert!(!target_has_required_vision_module(false, &glm));
+}

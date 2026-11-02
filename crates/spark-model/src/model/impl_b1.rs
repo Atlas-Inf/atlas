@@ -446,6 +446,7 @@ impl TransformerModel {
         } else {
             // Suppress per-op profiling by creating a non-profile context
             &ForwardContext {
+                ssm_batch: None,
                 buffers: ctx.buffers,
                 gpu: ctx.gpu,
                 config: ctx.config,
@@ -521,19 +522,7 @@ impl TransformerModel {
         // Final norm + LM head
         let t0 = Instant::now();
         let normed = self.buffers.norm_output();
-        let h = self.config.hidden_size as u32;
-        let eps = self.config.rms_norm_eps as f32;
-        ops::rms_norm(
-            self.gpu.as_ref(),
-            self.rms_norm_kernel,
-            hidden,
-            &self.final_norm,
-            normed,
-            1,
-            h,
-            eps,
-            stream,
-        )?;
+        self.final_norm_rows(hidden, normed, 1, stream)?;
         self.lm_head(normed, stream)?;
         self.gpu.synchronize(stream)?;
         let head_us = t0.elapsed().as_micros() as u64;
@@ -595,15 +584,7 @@ impl TransformerModel {
         // 2. Pre-allocate KV cache blocks + upload attention metadata
         let bs = kv_cache.block_size();
         let blocks_needed = (seq.seq_len / bs) + 1;
-        ensure_blocks_through_decode(
-            seq,
-            blocks_needed - 1,
-            &mut kv_cache,
-            self.prefix_cache.as_ref(),
-            self.gpu.as_ref(),
-            stream,
-            self.levers.kv_poison,
-        )?;
+        self.reserve_decode_blocks(seq, blocks_needed - 1, &mut kv_cache, stream)?;
 
         let meta_base = self.buffers.scratch().offset(32768);
         let max_blocks = seq.block_table.len() as u32;
@@ -657,6 +638,7 @@ impl TransformerModel {
         };
 
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -697,19 +679,7 @@ impl TransformerModel {
 
         // Final norm + LM head
         let normed = self.buffers.norm_output();
-        let h = self.config.hidden_size as u32;
-        let eps = self.config.rms_norm_eps as f32;
-        ops::rms_norm(
-            self.gpu.as_ref(),
-            self.rms_norm_kernel,
-            hidden,
-            &self.final_norm,
-            normed,
-            1,
-            h,
-            eps,
-            stream,
-        )?;
+        self.final_norm_rows(hidden, normed, 1, stream)?;
         self.lm_head(normed, stream)?;
 
         seq.tokens.push(token);

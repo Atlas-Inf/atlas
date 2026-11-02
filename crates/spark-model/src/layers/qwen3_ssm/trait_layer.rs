@@ -12,6 +12,48 @@ use super::Qwen3SsmLayer;
 use crate::layer::{ForwardContext, GdnPrefillBuffers, LayerState, TransformerLayer};
 
 impl TransformerLayer for Qwen3SsmLayer {
+    fn gdn_commit_kernel(&self) -> spark_runtime::gpu::KernelHandle {
+        self.gdn_commit_k
+    }
+
+    fn gdn_deferred_wyn(
+        &self,
+        levers: &crate::layers::ops::ModelLevers,
+        num_tokens: usize,
+    ) -> bool {
+        // Mirrors the conditions every wyN arm checks before dispatching
+        // (verify-exact bypasses the arm entirely; wyN has no FP16-h-state
+        // twin). The intermediates-layout requirement is per-SEQUENCE and
+        // checked by the caller (`SsmLayerState::h_inter_pool_layout`).
+        !super::verify_exact_for(levers)
+            && !super::ssm_h_fp16_enabled()
+            && self.wyn_kernel(num_tokens, levers.gdn_wyn).is_some()
+            && Self::gdn_defer_active(
+                levers.gdn_deferred_commit,
+                num_tokens,
+                if (5..=16).contains(&num_tokens) {
+                    self.gdn_wyn_defer_k[num_tokens - 5]
+                } else {
+                    spark_runtime::gpu::KernelHandle(0)
+                },
+                self.gdn_commit_k,
+            )
+    }
+
+    fn gdn_exact_defer(
+        &self,
+        gpu: &dyn GpuBackend,
+        levers: &crate::layers::ops::ModelLevers,
+        config: &atlas_core::config::ModelConfig,
+        num_tokens: usize,
+    ) -> bool {
+        self.exact_defer_arm(gpu, levers, config, num_tokens)
+    }
+
+    fn gdn_conv_weight(&self) -> DevicePtr {
+        self.ssm.conv1d.weight
+    }
+
     // ── MoE layout transposes ───────────────────────────────────────────
     // qwen4_exp is 36 gated-delta-net layers + 12 full-attention layers, and
     // EVERY one of them carries a 512-expert MoE block. Only
@@ -72,11 +114,11 @@ impl TransformerLayer for Qwen3SsmLayer {
         &mut self,
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
-    ) -> Result<()> {
+    ) -> Result<Vec<DevicePtr>> {
         if let crate::layers::FfnComponent::Moe(moe) = &mut self.ffn {
-            moe.transpose_for_prefill_unified(gpu, config)?;
+            return moe.transpose_for_prefill_unified(gpu, config);
         }
-        Ok(())
+        Ok(Vec::new())
     }
 
     fn transpose_moe_for_prefill_hybrid(
@@ -162,6 +204,24 @@ impl TransformerLayer for Qwen3SsmLayer {
         if self.hc.is_none() || self.ffn.is_dense() {
             return None;
         }
+        // The ceiling this returns is already tunable: `ATLAS_MTP_MAX_DRAFTS`
+        // below (default 1 = two verify rows) lifts it without a rebuild, and
+        // the scheduler's own `--num-drafts` / `ATLAS_MTP_K_LADDER` decide how
+        // many drafts are actually proposed. So the only thing that ever made
+        // K>=4 unreachable was the MoE arm refusing the width — see
+        // `trait_decode_batched_hc`, which now routes K=4..8 through
+        // `forward_batched` instead of bailing. A verify error there finishes
+        // the request, so the previous refusal silently truncated answers
+        // rather than merely speculating less.
+        //
+        // Everything below this line was measured on ONE GB10 with 256-TOKEN
+        // COMPLETIONS. That regime is where the ceiling came from: `fwd` grows
+        // +29.78 ms from K=2 to K=3 there, out of a 786.9 us/layer verify, and
+        // that growth is what made K=3 lose. At long context the forward
+        // instead measures flat in row count (`fwd` ~= 106 ms at both 3 and 12
+        // rows), so the row penalty that decided that comparison is the part
+        // least likely to transfer. Re-measure on the target workload before
+        // treating any of it as a recommendation.
         // ONE draft (K=2 verify rows), not two. Two reasons, both measured on
         // one GB10 with 256-token completions, agg tok/s:
         //
@@ -589,6 +649,10 @@ impl TransformerLayer for Qwen3SsmLayer {
             ctx,
             stream,
         )
+    }
+
+    fn prefill_multi(&self, pass: &mut crate::layer::MultiPass<'_, '_>) -> Result<()> {
+        self.prefill_multi_hc(pass)
     }
 
     fn is_ssm_layer(&self) -> bool {

@@ -17,6 +17,7 @@
 //   M-tile row owned at store element e by this lane = warp_m_offset + 2*e + (l>>4).
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
 typedef __bf16 v16bf __attribute__((ext_vector_type(16)));
@@ -92,6 +93,15 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable(
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;
+    // Idle-warp skip: dead-work removal for warps whose 16-row M slab lies
+    // entirely beyond M_expert (their results were discarded by the epilogue
+    // bounds check anyway). Measured outcome (2026-09-20 winbox, N=20 prefill):
+    // grouped_gate_up phase total fell only 1383->1320 ms over 48 layers (-4.6%)
+    // and gpu_exec stayed ~77 ms of a ~2.8 s submit-bound prefill — the phase is
+    // launch/submit-serialization-bound, not MMA-bound. Kept as verified
+    // bit-identical dead-work removal; see docs/porting/QWEN38_FLASHNEXT_STRIX_WINDOWS.md.
+    // Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
+    const bool warp_active = (int)(cta_m_local + warp_m_offset) < M_expert;
 
     __shared__ __nv_bfloat16 smem_A[M_TILE][K_STEP + PAD];
     __shared__ __nv_bfloat16 smem_B[K_STEP][N_TILE_SM + PAD];
@@ -147,15 +157,17 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable(
         }
         __syncthreads();
 
-        v16bf a;
-        #pragma unroll
-        for (int i = 0; i < 16; i++) a[i] = (__bf16)(float)smem_A[warp_m_offset + (lane_id & 15)][i];
-        #pragma unroll
-        for (int nb = 0; nb < 4; nb++) {
-            v16bf b;
+        if (warp_active) {
+            v16bf a;
             #pragma unroll
-            for (int k = 0; k < 16; k++) b[k] = (__bf16)(float)smem_B[k][nb * 16 + (lane_id & 15)];
-            acc[nb] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc[nb]);
+            for (int i = 0; i < 16; i++) a[i] = (__bf16)(float)smem_A[warp_m_offset + (lane_id & 15)][i];
+            #pragma unroll
+            for (int nb = 0; nb < 4; nb++) {
+                v16bf b;
+                #pragma unroll
+                for (int k = 0; k < 16; k++) b[k] = (__bf16)(float)smem_B[k][nb * 16 + (lane_id & 15)];
+                acc[nb] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc[nb]);
+            }
         }
         __syncthreads();
     }
@@ -205,6 +217,15 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t(
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;
+    // Idle-warp skip: dead-work removal for warps whose 16-row M slab lies
+    // entirely beyond M_expert (their results were discarded by the epilogue
+    // bounds check anyway). Measured outcome (2026-09-20 winbox, N=20 prefill):
+    // grouped_gate_up phase total fell only 1383->1320 ms over 48 layers (-4.6%)
+    // and gpu_exec stayed ~77 ms of a ~2.8 s submit-bound prefill — the phase is
+    // launch/submit-serialization-bound, not MMA-bound. Kept as verified
+    // bit-identical dead-work removal; see docs/porting/QWEN38_FLASHNEXT_STRIX_WINDOWS.md.
+    // Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
+    const bool warp_active = (int)(cta_m_local + warp_m_offset) < M_expert;
 
     __shared__ __nv_bfloat16 smem_A[2][M_TILE][K_STEP_T + PAD_T];
     __shared__ unsigned char smem_Bp[2][K_STEP_T / 2][N_TILE_LG + BP_PAD];
@@ -305,13 +326,13 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t(
     for (unsigned int k_base = K_STEP_T; k_base < K; k_base += K_STEP_T) {
         int nxt = 1 - cur;
         MOE_ISSUE_LOADS(nxt, k_base);
-        MOE_COMPUTE_MMA(cur);
+        if (warp_active) MOE_COMPUTE_MMA(cur);
         __syncthreads();
         MOE_DEQUANT(nxt);
         __syncthreads();
         cur = nxt;
     }
-    MOE_COMPUTE_MMA(cur);
+    if (warp_active) MOE_COMPUTE_MMA(cur);
 
     #undef MOE_ISSUE_LOADS
     #undef MOE_DEQUANT
@@ -362,6 +383,15 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64(
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;
+    // Idle-warp skip: dead-work removal for warps whose 16-row M slab lies
+    // entirely beyond M_expert (their results were discarded by the epilogue
+    // bounds check anyway). Measured outcome (2026-09-20 winbox, N=20 prefill):
+    // grouped_gate_up phase total fell only 1383->1320 ms over 48 layers (-4.6%)
+    // and gpu_exec stayed ~77 ms of a ~2.8 s submit-bound prefill — the phase is
+    // launch/submit-serialization-bound, not MMA-bound. Kept as verified
+    // bit-identical dead-work removal; see docs/porting/QWEN38_FLASHNEXT_STRIX_WINDOWS.md.
+    // Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
+    const bool warp_active = (int)(cta_m_local + warp_m_offset) < M_expert;
 
     __shared__ __nv_bfloat16 smem_A_k64[2][M_TILE][K_STEP_T64 + PAD_T64];
     __shared__ unsigned char smem_Bp_k64[2][K_STEP_T64 / 2][N_TILE_LG + BP_PAD];
@@ -480,13 +510,13 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64(
     for (unsigned int k_base = K_STEP_T64; k_base < K; k_base += K_STEP_T64) {
         int nxt = 1 - cur;
         K64_ISSUE_LOADS(nxt, k_base);
-        K64_COMPUTE_MMA(cur);
+        if (warp_active) K64_COMPUTE_MMA(cur);
         __syncthreads();
         K64_DEQUANT(nxt);
         __syncthreads();
         cur = nxt;
     }
-    K64_COMPUTE_MMA(cur);
+    if (warp_active) K64_COMPUTE_MMA(cur);
 
     #undef K64_ISSUE_LOADS
     #undef K64_DEQUANT
@@ -556,6 +586,15 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64(
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;
+    // Idle-warp skip: dead-work removal for warps whose 16-row M slab lies
+    // entirely beyond M_expert (their results were discarded by the epilogue
+    // bounds check anyway). Measured outcome (2026-09-20 winbox, N=20 prefill):
+    // grouped_gate_up phase total fell only 1383->1320 ms over 48 layers (-4.6%)
+    // and gpu_exec stayed ~77 ms of a ~2.8 s submit-bound prefill — the phase is
+    // launch/submit-serialization-bound, not MMA-bound. Kept as verified
+    // bit-identical dead-work removal; see docs/porting/QWEN38_FLASHNEXT_STRIX_WINDOWS.md.
+    // Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
+    const bool warp_active = (int)(cta_m_local + warp_m_offset) < M_expert;
 
     __shared__ __nv_bfloat16 smem_A_fgu64[2][M_TILE][K_STEP_T64 + PAD_T64];
     __shared__ unsigned char smem_Bp_fgu64[2][K_STEP_T64 / 2][N_TILE_LG + BP_PAD];
@@ -674,13 +713,13 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t_k64(
     for (unsigned int k_base = K_STEP_T64; k_base < K; k_base += K_STEP_T64) {
         int nxt = 1 - cur;
         FGU64_ISSUE_LOADS(nxt, k_base);
-        FGU64_COMPUTE_MMA(cur);
+        if (warp_active) FGU64_COMPUTE_MMA(cur);
         __syncthreads();
         FGU64_DEQUANT(nxt);
         __syncthreads();
         cur = nxt;
     }
-    FGU64_COMPUTE_MMA(cur);
+    if (warp_active) FGU64_COMPUTE_MMA(cur);
 
     #undef FGU64_ISSUE_LOADS
     #undef FGU64_DEQUANT
@@ -750,6 +789,15 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t(
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;
+    // Idle-warp skip: dead-work removal for warps whose 16-row M slab lies
+    // entirely beyond M_expert (their results were discarded by the epilogue
+    // bounds check anyway). Measured outcome (2026-09-20 winbox, N=20 prefill):
+    // grouped_gate_up phase total fell only 1383->1320 ms over 48 layers (-4.6%)
+    // and gpu_exec stayed ~77 ms of a ~2.8 s submit-bound prefill — the phase is
+    // launch/submit-serialization-bound, not MMA-bound. Kept as verified
+    // bit-identical dead-work removal; see docs/porting/QWEN38_FLASHNEXT_STRIX_WINDOWS.md.
+    // Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
+    const bool warp_active = (int)(cta_m_local + warp_m_offset) < M_expert;
 
     __shared__ __nv_bfloat16 smem_A[2][M_TILE][K_STEP_T + PAD_T];
     __shared__ unsigned char smem_Bp[2][K_STEP_T / 2][N_TILE_LG + BP_PAD];
@@ -850,13 +898,13 @@ extern "C" __global__ void moe_w4a16_fused_gate_up_t(
     for (unsigned int k_base = K_STEP_T; k_base < K; k_base += K_STEP_T) {
         int nxt = 1 - cur;
         FGU_ISSUE_LOADS(nxt, k_base);
-        FGU_COMPUTE_MMA(cur);
+        if (warp_active) FGU_COMPUTE_MMA(cur);
         __syncthreads();
         FGU_DEQUANT(nxt);
         __syncthreads();
         cur = nxt;
     }
-    FGU_COMPUTE_MMA(cur);
+    if (warp_active) FGU_COMPUTE_MMA(cur);
 
     #undef FGU_ISSUE_LOADS
     #undef FGU_DEQUANT
@@ -908,6 +956,15 @@ extern "C" __global__ void moe_fp8_grouped_gemm_ptrtable_t(
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
     const unsigned int warp_m_offset = warp_id * 16;
+    // Idle-warp skip: dead-work removal for warps whose 16-row M slab lies
+    // entirely beyond M_expert (their results were discarded by the epilogue
+    // bounds check anyway). Measured outcome (2026-09-20 winbox, N=20 prefill):
+    // grouped_gate_up phase total fell only 1383->1320 ms over 48 layers (-4.6%)
+    // and gpu_exec stayed ~77 ms of a ~2.8 s submit-bound prefill — the phase is
+    // launch/submit-serialization-bound, not MMA-bound. Kept as verified
+    // bit-identical dead-work removal; see docs/porting/QWEN38_FLASHNEXT_STRIX_WINDOWS.md.
+    // Loads/dequant/__syncthreads stay unconditional; only MMA is gated.
+    const bool warp_active = (int)(cta_m_local + warp_m_offset) < M_expert;
 
     __shared__ unsigned char smem_Af2[2][M_TILE][K_STEP_T];
     __shared__ unsigned char smem_Bp2[2][K_STEP_T / 2][N_TILE_LG + BP_PAD];
@@ -1006,13 +1063,13 @@ extern "C" __global__ void moe_fp8_grouped_gemm_ptrtable_t(
     for (unsigned int k_base = K_STEP_T; k_base < K; k_base += K_STEP_T) {
         int nxt = 1 - cur;
         MOE_FF_LOADS(nxt, k_base);
-        MOE_FF_COMPUTE(cur);
+        if (warp_active) MOE_FF_COMPUTE(cur);
         __syncthreads();
         MOE_FF_DEQUANT(nxt);
         __syncthreads();
         cur = nxt;
     }
-    MOE_FF_COMPUTE(cur);
+    if (warp_active) MOE_FF_COMPUTE(cur);
 
     #undef MOE_FF_LOADS
     #undef MOE_FF_DEQUANT
@@ -1027,4 +1084,258 @@ extern "C" __global__ void moe_fp8_grouped_gemm_ptrtable_t(
             if ((int)(row_local + cta_m_local) < M_expert && c < N)
                 C[(cta_m + row_local) * N + c] = __float2bfloat16(acc[nb][e]);
         }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// moe_w4a16_fused_gate_up_t_f16a / moe_w4a16_grouped_gemm_ptrtable_t_f16a —
+// F16-operand drop-in twins of the routed-expert prefill kernels (gfx1151).
+// Same signatures, grid, token gather and per-expert pointer tables. Two
+// changes vs the BF16 kernels (688 instructions per 32-K step, 16 WMMA):
+//   1. the exact F16 dequant described above w4a16_gemm_t_m128_f16a;
+//   2. the w4a16_gemm_t_m128 pipeline the BF16 MoE kernels never received:
+//      register prefetch, dequant from registers into a double-buffered LDS
+//      tile, one barrier per K-step, 32-byte fragment loads (the BF16 kernels
+//      build WMMA operands one element at a time through a bf16->f32->bf16
+//      round trip and dequant through an LDS lookup table).
+// Hot loop: 293 instructions per 32-K step. Per-expert scale2 in the epilogue.
+// ═══════════════════════════════════════════════════════════════════
+typedef _Float16 v16h __attribute__((ext_vector_type(16)));
+typedef _Float16 v2h  __attribute__((ext_vector_type(2)));
+
+#define F16_M_TILE 64
+#define F16_N_TILE 128
+#define F16_K_STEP 32
+#define F16_PAD_T 8
+#define F16_GROUP 16
+
+// Four E2M1 codes (one per byte, low nibble) -> four f16 HIGH bytes. The low byte
+// of f16(v) is 0x00 for every E2M1 value: 0.5=0x3800 1=0x3C00 1.5=0x3E00 2=0x4000
+// 3=0x4200 4=0x4400 6=0x4600. One v_perm over an 8-entry table plus the sign bit.
+__device__ __forceinline__ unsigned int e2m1x4_f16hi(unsigned int codes) {
+    const unsigned int mag = __builtin_amdgcn_perm(0x46444240u, 0x3E3C3800u, codes & 0x07070707u);
+    return mag | ((codes & 0x08080808u) << 4);
+}
+
+// Two E4M3 scale bytes (b0 in bits 7:0, b1 in bits 15:8) -> packed f16 pair. The
+// E4M3 bits shifted into the f16 field (exp aligned to bit 10, mantissa to bit 7)
+// read as an f16 equal to |e4m3| * 2^-8, subnormals included, so * 256 is exact.
+__device__ __forceinline__ v2h e4m3x2_f16(unsigned int b01) {
+    const unsigned int w = (b01 & 0xFFu) | ((b01 & 0xFF00u) << 8);     // [b0,0,b1,0]
+    const unsigned int bits = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+    v2h h;
+    __builtin_memcpy(&h, &bits, 4);
+    return h * (v2h){(_Float16)256.0f, (_Float16)256.0f};
+}
+
+
+// 8 bf16 (one uint4) -> 8 f16 (one uint4). bf16 has 7 mantissa bits and f16 10,
+// so every in-range value converts EXACTLY and round-toward-zero equals RNE;
+// |x| > 65504 saturates to +/-65504 (rtz) instead of becoming inf, and values
+// below f16's subnormal range flush toward zero. Two values per v_cvt_pk_rtz.
+__device__ __forceinline__ uint4 bf16x8_to_f16x8(uint4 v) {
+    const unsigned int w[4] = {v.x, v.y, v.z, v.w};
+    unsigned int o[4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const float lo = __uint_as_float(w[i] << 16), hi = __uint_as_float(w[i] & 0xFFFF0000u);
+        const auto h = __builtin_amdgcn_cvt_pkrtz(lo, hi);
+        __builtin_memcpy(&o[i], &h, 4);
+    }
+    return uint4{o[0], o[1], o[2], o[3]};
+}
+
+#define MOEF_M_TILE 64
+#define MOEF_N_TILE 128
+// K_STEP 64: each warp holds one 16-row accumulator set, so a 32-wide K step issued
+// only 16 WMMA between its two barriers (the dense m128 kernel issues 32). At 64 the
+// barrier and staging cost per WMMA halves; LDS is ~28 KB, still 4 CTAs per WGP. Each
+// output still accumulates its 16-wide K blocks in the same order: bit-identical.
+// Warps whose 16 rows all lie past M_expert skip their (never-stored) WMMA too.
+// strix in-process bench at Flash-Next routing (512 experts, s79): 1.09-1.17x at
+// ~40 and ~160 rows/expert, 100% bit-equal.
+#define MOEF_K_STEP 64
+#define MOEF_GROUP 16
+#define MOEF_B_ROW 72
+#define MOEF_B_OFF(n) ((n) * MOEF_B_ROW + ((n) >> 4) * 8)
+
+// Shared body. `B_expert`/`S_expert`/`scale2`/`C` are resolved by the caller.
+template <bool A_BF16>
+__device__ __forceinline__ void moef_body(
+    const unsigned short* __restrict__ A, const unsigned char* __restrict__ B_expert,
+    const unsigned char* __restrict__ S_expert, float scale2, __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ sorted_token_ids, int m_start, int M_expert, int cta_m_local,
+    unsigned int cta_n, unsigned int N, unsigned int K)
+{
+    const unsigned int cta_m = m_start + cta_m_local;
+    const unsigned int warp_id = threadIdx.x / 32;
+    const unsigned int lane_id = threadIdx.x % 32;
+    const unsigned int warp_m_offset = warp_id * 16;
+
+    __shared__ __align__(16) _Float16 smem_A[1][MOEF_M_TILE][MOEF_K_STEP + 8];
+    __shared__ __align__(16) _Float16 smem_B[1][MOEF_B_OFF(MOEF_N_TILE)];
+    __shared__ int smem_tok[MOEF_M_TILE];
+
+    if (threadIdx.x < MOEF_M_TILE) {
+        const int r = threadIdx.x;
+        smem_tok[r] = (sorted_token_ids && (cta_m_local + r) < M_expert)
+            ? sorted_token_ids[cta_m + r] : (int)(cta_m + r);
+    }
+    __syncthreads();
+
+    v8f acc[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) acc[i] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
+    const bool warp_live = (cta_m_local + (int)warp_m_offset) < M_expert;
+
+    // K_STEP 64: A is 64 rows x 64 cols f16 = 4 uint4 per thread (rows r, r+16, r+32, r+48);
+    // B is 32 k-pairs x 128 n = two uint4 per thread (k-pairs kp and kp + 16).
+    const unsigned int a_row_base = threadIdx.x >> 3;
+    const unsigned int a_col = (threadIdx.x & 7) << 3;
+    const unsigned int b_kp = threadIdx.x >> 3;
+    const unsigned int b_ns = (threadIdx.x & 7) << 4;
+    unsigned int a_row[4]; bool a_ok[4];
+    #pragma unroll
+    for (int q = 0; q < 4; q++) {
+        a_row[q] = (unsigned int)smem_tok[16 * q + a_row_base];
+        a_ok[q] = (cta_m_local + 16 * q + (int)a_row_base) < M_expert;
+    }
+
+    #define MOEF_LOAD(kb, ra, rb, rs) do { \
+        const unsigned int gc = (kb) + a_col; \
+        _Pragma("unroll") \
+        for (int q = 0; q < 4; q++) \
+            (ra)[q] = (a_ok[q] && gc + 7 < K) ? *(const uint4*)&A[(unsigned long long)a_row[q] * K + gc] : uint4{0, 0, 0, 0}; \
+        const unsigned int gns = cta_n + b_ns; \
+        _Pragma("unroll") \
+        for (int hh2 = 0; hh2 < 2; hh2++) { \
+            const unsigned int kp = b_kp + 16u * hh2; \
+            const unsigned int gke = (kb) + (kp << 1); \
+            (rb)[hh2] = ((gke + 1 <= K) && (gns + 15 < N)) \
+                ? *(const uint4*)&B_expert[(unsigned long long)(gke >> 1) * N + gns] : uint4{0, 0, 0, 0}; \
+            const unsigned int sg = (kb) / MOEF_GROUP + (kp >> 3); \
+            (rs)[hh2] = (gns + 15 < N && gke < K) ? *(const uint4*)&S_expert[(unsigned long long)sg * N + gns] : uint4{0, 0, 0, 0}; \
+        } \
+    } while (0)
+
+    #define MOEF_STORE(buf, ra, rb, rs) do { \
+        _Pragma("unroll") \
+        for (int q = 0; q < 4; q++) \
+            *(uint4*)&smem_A[(buf)][16 * q + a_row_base][a_col] = A_BF16 ? bf16x8_to_f16x8((ra)[q]) : (ra)[q]; \
+        _Pragma("unroll") \
+        for (int hh2 = 0; hh2 < 2; hh2++) { \
+        const unsigned int kp = b_kp + 16u * hh2; \
+        const unsigned int* pw = (const unsigned int*)&(rb)[hh2]; \
+        const unsigned int* ps = (const unsigned int*)&(rs)[hh2]; \
+        _Pragma("unroll") \
+        for (int d = 0; d < 4; d++) { \
+            const unsigned int hl = e2m1x4_f16hi(pw[d] & 0x0F0F0F0Fu); \
+            const unsigned int hh = e2m1x4_f16hi((pw[d] >> 4) & 0x0F0F0F0Fu); \
+            const v2h s01 = e4m3x2_f16(ps[d] & 0xFFFFu); \
+            const v2h s23 = e4m3x2_f16(ps[d] >> 16); \
+            _Pragma("unroll") \
+            for (int j = 0; j < 4; j++) { \
+                const unsigned int sel = 0x0Cu | ((unsigned)j << 8) | (0x0Cu << 16) | ((4u + j) << 24); \
+                const unsigned int wb = __builtin_amdgcn_perm(hh, hl, sel); \
+                v2h w; __builtin_memcpy(&w, &wb, 4); \
+                const _Float16 s = (j == 0) ? s01.x : (j == 1) ? s01.y : (j == 2) ? s23.x : s23.y; \
+                w = w * (v2h){s, s}; \
+                *(v2h*)&smem_B[(buf)][MOEF_B_OFF(b_ns + d * 4 + j) + kp * 2] = w; \
+            } \
+        } \
+        } \
+    } while (0)
+
+    #define MOEF_COMPUTE(buf) if (warp_live) do { \
+        const unsigned int m_row = warp_m_offset + (lane_id & 15); \
+        _Pragma("unroll") \
+        for (int h = 0; h < 4; h++) { \
+            v16h a; __builtin_memcpy(&a, &smem_A[(buf)][m_row][h * 16], 32); \
+            _Pragma("unroll") \
+            for (int nb = 0; nb < 8; nb++) { \
+                v16h b; __builtin_memcpy(&b, &smem_B[(buf)][MOEF_B_OFF(nb * 16 + (lane_id & 15)) + h * 16], 32); \
+                acc[nb] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc[nb]); \
+            } \
+        } \
+    } while (0)
+
+    uint4 ra[4], rb[2], rs[2];
+    MOEF_LOAD(0, ra, rb, rs);
+    MOEF_STORE(0, ra, rb, rs);
+    __syncthreads();
+    // One LDS buffer (31 -> ~15.6 KB per CTA, so twice the CTAs fit per WGP; the
+    // double-buffered kernel was LDS-occupancy-bound). The register prefetch still
+    // overlaps the next tile's global loads with this tile's WMMA; the price is a
+    // second barrier per K-step. Same operands in the same order: bit-identical.
+    for (unsigned int kb = MOEF_K_STEP; kb < K; kb += MOEF_K_STEP) {
+        MOEF_LOAD(kb, ra, rb, rs);
+        MOEF_COMPUTE(0);
+        __syncthreads();
+        MOEF_STORE(0, ra, rb, rs);
+        __syncthreads();
+    }
+    MOEF_COMPUTE(0);
+    #undef MOEF_LOAD
+    #undef MOEF_STORE
+    #undef MOEF_COMPUTE
+
+    #pragma unroll
+    for (int nb = 0; nb < 8; nb++)
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            const unsigned int rl = warp_m_offset + 2 * e + (lane_id >> 4);
+            const unsigned int c = cta_n + nb * 16 + (lane_id & 15);
+            if ((int)(rl + cta_m_local) < M_expert && c < N)
+                C[(unsigned long long)(cta_m + rl) * N + c] = __float2bfloat16(acc[nb][e] * scale2);
+        }
+}
+
+// Drop-in twins of the production MoE kernels: SAME signatures (bf16 A).
+extern "C" __global__ __launch_bounds__(128)
+void moe_w4a16_fused_gate_up_t_f16a(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ gate_packed_ptrs,
+    const unsigned long long* __restrict__ gate_scale_ptrs,
+    const float* __restrict__ gate_scale2_vals,
+    const unsigned long long* __restrict__ up_packed_ptrs,
+    const unsigned long long* __restrict__ up_scale_ptrs,
+    const float* __restrict__ up_scale2_vals,
+    __nv_bfloat16* __restrict__ C_gate, __nv_bfloat16* __restrict__ C_up,
+    const int* __restrict__ expert_offsets, const int* __restrict__ sorted_token_ids,
+    unsigned int num_experts, unsigned int N, unsigned int K)
+{
+    const unsigned int e = blockIdx.z;
+    if (e >= num_experts) return;
+    const int m_start = expert_offsets[e], M_expert = expert_offsets[e + 1] - m_start;
+    if (M_expert <= 0) return;
+    const int cta_m_local = blockIdx.y * MOEF_M_TILE;
+    if (cta_m_local >= M_expert) return;
+    const unsigned int gn = blockIdx.x * MOEF_N_TILE;
+    const bool up = gn >= N;
+    const unsigned char* B = (const unsigned char*)(up ? up_packed_ptrs[e] : gate_packed_ptrs[e]);
+    if (B == 0) return;
+    moef_body<true>((const unsigned short*)A, B, (const unsigned char*)(up ? up_scale_ptrs[e] : gate_scale_ptrs[e]),
+              up ? up_scale2_vals[e] : gate_scale2_vals[e], up ? C_up : C_gate,
+              sorted_token_ids, m_start, M_expert, cta_m_local, up ? gn - N : gn, N, K);
+}
+
+extern "C" __global__ __launch_bounds__(128)
+void moe_w4a16_grouped_gemm_ptrtable_t_f16a(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ packed_ptrs,
+    const unsigned long long* __restrict__ scale_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ expert_offsets, const int* __restrict__ sorted_token_ids,
+    unsigned int num_experts, unsigned int N, unsigned int K)
+{
+    const unsigned int e = blockIdx.z;
+    if (e >= num_experts) return;
+    const int m_start = expert_offsets[e], M_expert = expert_offsets[e + 1] - m_start;
+    if (M_expert <= 0) return;
+    const int cta_m_local = blockIdx.y * MOEF_M_TILE;
+    if (cta_m_local >= M_expert) return;
+    const unsigned char* B = (const unsigned char*)packed_ptrs[e];
+    if (B == 0) return;
+    moef_body<true>((const unsigned short*)A, B, (const unsigned char*)scale_ptrs[e], scale2_vals[e], C,
+              sorted_token_ids, m_start, M_expert, cta_m_local, blockIdx.x * MOEF_N_TILE, N, K);
 }

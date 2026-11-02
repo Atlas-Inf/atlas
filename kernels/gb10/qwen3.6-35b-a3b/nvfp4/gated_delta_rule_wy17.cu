@@ -27,7 +27,9 @@
 // Reduction primitives match per-token baseline bit-exactly.
 
 #include <cuda_bf16.h>
-#include "../../common/gdn_reduce.cuh"
+// Same-dir spelling (via the gdn_reduce.cuh symlink beside this file): the
+// HIP mirror flattens each source dir, so a ../../ quoted include escapes.
+#include "gdn_reduce.cuh"
 #define BLOCK_SIZE 128
 #define K_TOKENS 17
 

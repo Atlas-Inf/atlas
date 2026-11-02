@@ -293,6 +293,9 @@ impl Qwen3AttentionLayer {
                     dequant_turbo3_block_to_bf16(&k_raw, bs_us, nkv_us, hd_us, &mut k_host);
                     dequant_turbo3_block_to_bf16(&v_raw, bs_us, nkv_us, hd_us, &mut v_host);
                 }
+                KvCacheDtype::Fp8G128 => {
+                    anyhow::bail!("--kv-cache-dtype fp8_g128 does not support --high-speed-swap")
+                }
                 KvCacheDtype::Turbo8 => {
                     let mut k_raw = vec![0u8; layer_block_bytes];
                     let mut v_raw = vec![0u8; layer_block_bytes];

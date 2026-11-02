@@ -13,9 +13,17 @@ use atlas_core::config::ModelConfig;
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
+pub mod glm_long_owner;
+mod prefill_pieces;
+pub mod ssm_batch;
+pub use prefill_pieces::{
+    PREFILL_ATTENTION_ROWS, PREFILL_MAX_SUB_CHUNKS, prefill_attention_pieces,
+};
+mod multi_seg;
+pub use multi_seg::{MultiPass, MultiSeg};
 mod transformer_layer;
 pub use transformer_layer::{
-    TransformerLayer, VERIFY_WY_LAYER_STRIDE_BYTES, VERIFY_WY_TABLE_SEQS,
+    KvRows, TransformerLayer, VERIFY_WY_LAYER_STRIDE_BYTES, VERIFY_WY_TABLE_SEQS,
     VERIFY_WY_TABLE_STRIDE_BYTES, VERIFY_WY_TABLES_PER_LAYER,
 };
 
@@ -77,6 +85,29 @@ pub struct SsmLayerState {
     pub h_state_intermediates: Vec<DevicePtr>,
     /// Intermediate conv_state snapshots during batched verification.
     pub conv_state_intermediates: Vec<DevicePtr>,
+    /// Deferred-commit input staging (ATLAS_GDN_DEFERRED_COMMIT): the
+    /// verify-row conv-out q/k/v (`[K_cap][conv_dim]` BF16) and gate/beta
+    /// (`[K_cap][2*nv]` FP32) rows the wyN kernel consumed, copied here so
+    /// `gated_delta_rule_commit` can replay the accepted prefix after the
+    /// shared ctx.buffers scratch is reused. POOL-STABLE per (layer, slot)
+    /// — repointed at slot-bind alongside `h_state`; `DevicePtr(0)` when
+    /// the lever is off.
+    pub gdn_commit_qkv: DevicePtr,
+    pub gdn_commit_gb: DevicePtr,
+    /// Set at the VERIFY DISPATCH entry (host side — never inside a
+    /// captured forward) when this layer's wyN verify ran deferred:
+    /// `h_state` still holds H0 and the accept path must commit via
+    /// `gated_delta_rule_commit` rather than the intermediates index-select.
+    /// Cleared at commit / rollback.
+    pub gdn_commit_pending: bool,
+    /// `ATLAS_QWEN4EXP_GDN_COMMIT_FUSE`: this slot's pending-commit word,
+    /// which the deferred verify reads (`qwen4exp_gdn_verify_defer_rows`);
+    /// POOL-STABLE per slot like the staging. NULL when off.
+    pub gdn_fuse_n: DevicePtr,
+    /// GLM KDA fold records of a verify (`--ssm-rollback-mode records`): the
+    /// verify leaves `h_state` untouched and the commit folds the accepted
+    /// rows into it (NULL, with snapshots in `h_state_intermediates`, off).
+    pub kda_records: DevicePtr,
     /// Storage dtype of `h_state`: `false` = FP32, `true` = FP16
     /// (`--ssm-h-dtype f16`).
     ///
@@ -110,6 +141,26 @@ pub struct SsmLayerState {
     /// only on the layer that hosts a `PleLayer` (Avarok #753 item B: one per
     /// in-flight sequence, lazily created on the sequence's first pass).
     pub ple: Option<crate::layers::ple::PleSeqState>,
+}
+
+impl SsmLayerState {
+    /// Whether this sequence's `h_state_intermediates` back a wyN launch
+    /// at `num_tokens = k`: needs ≥ k−1 entries at the pool-contiguous
+    /// `h_bytes` stride the kernel assumes (`Hi_t` at
+    /// `base + t·h_bytes`). Shared SSOT — the layer's dispatch filter and
+    /// the host-side `mark_gdn_deferred_commit` must agree exactly, or the
+    /// pending flag and the launched kernel diverge under graph replay.
+    pub fn h_inter_pool_layout(&self, k: usize, h_bytes: usize) -> bool {
+        if self.h_state_intermediates.len() < k.saturating_sub(1) || k < 2 {
+            return false;
+        }
+        let h_base = self.h_state_intermediates[0];
+        self.h_state_intermediates
+            .iter()
+            .take(k - 1)
+            .enumerate()
+            .all(|(t, p)| p.0 == h_base.0 + (t * h_bytes) as u64)
+    }
 }
 
 impl LayerState for SsmLayerState {
@@ -310,6 +361,9 @@ pub struct ForwardContext<'a> {
     pub stats: &'a crate::layers::ops::ModelStats,
     /// Pre-uploaded attention metadata (None if no attention layers).
     pub attn_metadata: Option<AttnMetadataDev>,
+    /// Independent live FP32 SSM rows, validated and refreshed before replay.
+    /// None for prefill, temporal verification, and unsupported decode scopes.
+    pub ssm_batch: Option<ssm_batch::SsmBatchView<'a>>,
     /// Profile mode: sync+time per-operation within layers.
     pub profile: bool,
     /// Communication backend for expert parallelism (EP) all-reduce.
@@ -326,6 +380,8 @@ pub struct ForwardContext<'a> {
     /// cached K/V, and the replay range [snap_tok, matched) is rewritten
     /// into SHARED prefix-cache blocks — non-exact recompute poisons them
     /// and the drift ratchets across turns (2026-06-10 warm-hit stutter).
+    /// Exact path: register-resident token-sequential kernel (default), WY4
+    /// fallback. Off under the prefill grid (see `grid_replay_is_cold`).
     pub gdn_exact_replay: bool,
     /// Device `[num_tokens]` u32 token IDs for the tokens being processed this
     /// pass, in the SAME order the per-token MoE loop visits them. Required by
@@ -399,6 +455,8 @@ pub struct MidchunkCapture<'a> {
     pub h_dsts_early: &'a [DevicePtr],
     /// Per-SSM-layer conv_state dst for the `tb - block_size` slot.
     pub conv_dsts_early: &'a [DevicePtr],
+    /// qwen4_exp only: more points of the pass (`layers::qwen4exp_ckpt`).
+    pub extra: &'a [crate::layers::qwen4exp_ckpt::CapPoint],
 }
 
 /// Feature-1 MoE-LoRA fold decision for a single forward pass.

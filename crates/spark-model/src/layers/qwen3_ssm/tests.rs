@@ -116,9 +116,14 @@ fn mk_state(gpu: &MockGpuBackend, layer: &Qwen3SsmLayer, n_inter: usize) -> SsmL
         h_state_checkpoint: None,
         conv_state_checkpoint: None,
         h_state_intermediates: (0..n_inter).map(|i| h_slab.offset(i * h_bytes)).collect(),
+        kda_records: spark_runtime::gpu::DevicePtr::NULL,
         conv_state_intermediates: (0..n_inter)
             .map(|i| conv_slab.offset(i * conv_bytes))
             .collect(),
+        gdn_commit_qkv: DevicePtr(0),
+        gdn_commit_gb: DevicePtr(0),
+        gdn_commit_pending: false,
+        gdn_fuse_n: DevicePtr::NULL,
         h_is_f16: false,
         h_prefill_stage: None,
         ple: None,
@@ -127,7 +132,7 @@ fn mk_state(gpu: &MockGpuBackend, layer: &Qwen3SsmLayer, n_inter: usize) -> SsmL
 
 /// Drive the batched verify body at ragged ks through `decode_verify_multi`
 /// (the verify_e.rs entry point) and return the result.
-fn run_batched_verify(
+pub(super) fn run_batched_verify(
     gpu: &MockGpuBackend,
     config: &ModelConfig,
     layer: &Qwen3SsmLayer,
@@ -139,6 +144,7 @@ fn run_batched_verify(
     let levers = crate::layers::ops::ModelLevers::defaults();
     let stats = crate::layers::ops::ModelStats::new();
     let ctx = ForwardContext {
+        ssm_batch: None,
         dispatch: &dispatch,
         derived: &derived,
         levers: &levers,
@@ -196,27 +202,36 @@ fn run_batched_verify(
 /// (device 700 in production; here the fail-fast guards turn it into Err,
 /// so `is_ok` is the load-bearing assertion).
 #[test]
-fn native_fp8_gdn_batched_verify_r7_dispatches_w8a16_batch16() {
+fn native_fp8_gdn_batched_verify_r7_dispatches_w8a16_gemv() {
     let config = ModelConfig::qwen3_next_80b_nvfp4();
     let gpu = MockGpuBackend::new();
     let layer = native_fp8_gdn_layer(&gpu, &config, true, true);
     run_batched_verify(&gpu, &config, &layer, &[4, 3]).unwrap();
-    // Pin the arm identity at R=7: the `w8a16_gemv_batch16` arm sits AHEAD
-    // of the `num_tokens > 4 → w8a16_gemm*` fallback for 5..=16 rows (the
-    // narrowest tier covering them — strix PR8 stack). Under the mock every
-    // kernel resolves, so batch16 always wins regardless of target.
-    // `w8a16_gemv_batch4` launch geometry: grid [ceil(N/4), 1, 1], block
-    // [256,1,1] — QKVZ (N=12288) → [3072,1,1]; out_proj (N=2048) → [512,1,1].
+    // Pin the arm identity at R=7: the batched `w8a16_gemv_*` arm sits AHEAD
+    // of the `num_tokens > 4 → w8a16_gemm*` fallback for 5..=16 rows. Under
+    // the mock every kernel resolves, so `fp8_verify_gemv_tier` picks the
+    // M<=8 tier: the `w8a16_gemv_batch8_dyn_vl2_n2` twin (16 outputs/block,
+    // grid [ceil(N/16),1,1], preferred over `_dyn_vl2`'s 8 since #156) unless
+    // ATLAS_GEMV_VL2=0, else `w8a16_gemv_batch8` (grid [ceil(N/4),1,1]).
+    // Block is [256,1,1] either way. The vl2 lookups are only issued on
+    // atlas_hip (the twins exist only in strix-hip), so every other build
+    // takes the batch8 arm.
+    // QKVZ N=12288, out_proj N=2048.
+    let per_block = if cfg!(atlas_hip) && crate::layers::ops::gemv_vl2_enabled() {
+        16
+    } else {
+        4
+    };
     let launches = (0..gpu.launch_count()).count();
     assert!(launches > 0);
     let seen = gpu_launch_grids(&gpu);
     assert!(
-        seen.contains(&([3072, 1, 1], [256, 1, 1])),
-        "QKVZ w8a16_gemv_batch16 launch missing; grids seen: {seen:?}"
+        seen.contains(&([12288 / per_block, 1, 1], [256, 1, 1])),
+        "QKVZ batched w8a16 GEMV launch missing; grids seen: {seen:?}"
     );
     assert!(
-        seen.contains(&([512, 1, 1], [256, 1, 1])),
-        "out_proj w8a16_gemv_batch16 launch missing; grids seen: {seen:?}"
+        seen.contains(&([2048 / per_block, 1, 1], [256, 1, 1])),
+        "out_proj batched w8a16 GEMV launch missing; grids seen: {seen:?}"
     );
 }
 
@@ -284,12 +299,14 @@ fn active_row_without_ple_carry_is_refused() {
     layer.set_hc_weights(crate::layers::qwen3_attention::HcWeights {
         attn: crate::layers::qwen3_attention::HcSiteWeights {
             hc_fn: DevicePtr::NULL,
+            hc_fn_bf16: DevicePtr::NULL,
             hc_base: DevicePtr::NULL,
             hc_scale: DevicePtr::NULL,
             lowrank: None,
         },
         ffn: crate::layers::qwen3_attention::HcSiteWeights {
             hc_fn: DevicePtr::NULL,
+            hc_fn_bf16: DevicePtr::NULL,
             hc_base: DevicePtr::NULL,
             hc_scale: DevicePtr::NULL,
             lowrank: None,
@@ -330,6 +347,8 @@ fn active_row_without_ple_carry_is_refused() {
         crate::layers::ngram_embed::NgramTable::Bf16(dw(2)),
         1,
         1,
+        None,
+        None,
         &gpu,
     )
     .unwrap();
@@ -357,6 +376,7 @@ fn active_row_without_ple_carry_is_refused() {
         gdn_exact_replay: false,
         token_ids: None,
         host_token_ids: Some(&[42]),
+        ssm_batch: None,
         routed_lora_layers: None,
         midchunk_capture: None,
         moe_lora_route: crate::layer::MoeLoraRoute::Fold,
@@ -377,7 +397,7 @@ fn active_row_without_ple_carry_is_refused() {
 }
 
 /// Grid/block pairs of every launch recorded by the mock.
-fn gpu_launch_grids(gpu: &MockGpuBackend) -> Vec<([u32; 3], [u32; 3])> {
+pub(super) fn gpu_launch_grids(gpu: &MockGpuBackend) -> Vec<([u32; 3], [u32; 3])> {
     gpu.launches_snapshot()
         .into_iter()
         .map(|l| (l.grid, l.block))
@@ -514,6 +534,7 @@ fn single_verify_k4_d2d(
     let levers = crate::layers::ops::ModelLevers::defaults();
     let stats = crate::layers::ops::ModelStats::new();
     let ctx = ForwardContext {
+        ssm_batch: None,
         dispatch: &dispatch,
         derived: &derived,
         levers: &levers,
@@ -592,4 +613,18 @@ fn fused_conv_k4_skips_conv_snapshot_copies() {
         3,
         "fused arm must remove exactly the K-1 conv snapshots: fused={fused} fallback={fallback}"
     );
+}
+
+#[test]
+fn gdn_defer_active_gates_on_lever_band_and_handles() {
+    let h = |v: u64| spark_runtime::gpu::KernelHandle(v);
+    for k in [5usize, 8, 9, 12, 16] {
+        assert!(Qwen3SsmLayer::gdn_defer_active(true, k, h(1), h(1)));
+        assert!(!Qwen3SsmLayer::gdn_defer_active(false, k, h(1), h(1)));
+        assert!(!Qwen3SsmLayer::gdn_defer_active(true, k, h(0), h(1)));
+        assert!(!Qwen3SsmLayer::gdn_defer_active(true, k, h(1), h(0)));
+    }
+    for k in [1usize, 4, 17] {
+        assert!(!Qwen3SsmLayer::gdn_defer_active(true, k, h(1), h(1)));
+    }
 }

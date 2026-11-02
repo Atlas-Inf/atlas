@@ -3,6 +3,8 @@
 //!
 //! Same POD-array-to-byte-slice `unsafe` pattern as `verify_c.rs`; see
 //! that file's module docs for the full safety contract.
+//!
+//! Ported from Enntity/atlas (AGPL-3.0-only, sparkqwen drafter series).
 
 #![allow(unused_imports, dead_code, clippy::too_many_arguments)]
 
@@ -186,15 +188,7 @@ impl TransformerModel {
         // 2a. Allocate KV blocks for decode sequences
         for seq in decode_seqs.iter_mut() {
             let blocks_needed = (seq.seq_len / bs) + 1;
-            ensure_blocks_through_decode(
-                seq,
-                blocks_needed - 1,
-                &mut kv_cache,
-                self.prefix_cache.as_ref(),
-                self.gpu.as_ref(),
-                stream,
-                self.levers.kv_poison,
-            )?;
+            self.reserve_decode_blocks(seq, blocks_needed - 1, &mut kv_cache, stream)?;
         }
 
         // 2b. Allocate KV blocks for prefill sequence
@@ -261,7 +255,18 @@ impl TransformerModel {
         let proc_start = prefill_chunk_start;
         let proc_count = n_prefill;
         let effective_seq_len_start = prefill_chunk_start;
-        let moe_scratch_bytes = proc_count * self.config.num_experts_per_tok * 4 * 2;
+        // The fused layer loop runs the DECODE portion first each layer, and its
+        // MoE routing (top-k ids + weights, `padded_n * k * 8` bytes) also lives
+        // at scratch[0..]. Sizing the guard from `proc_count` alone let a short
+        // prefill chunk's positions/slots sit inside that region: a 21-token tail
+        // mixed with 31 decodes (1,344 B vs 2,048 B) had its slots clobbered
+        // every layer, and the next `reshape_and_cache_flash` wrote K/V through
+        // garbage slots → CUDA 700, context destroyed (GB10, Qwen3.6-35B,
+        // MLPerf C=36, 2026-10-03). Chunks of >= padded_n rows were unaffected.
+        // (The opt-in ATLAS_MOE_ATOMIC_C4_DECODE arm also stages an fp32 accum
+        // in scratch and is not covered — it is a diagnostic arm.)
+        let k_bytes = self.config.num_experts_per_tok * 4 * 2;
+        let moe_scratch_bytes = proc_count.max(padded_n) * k_bytes;
         let meta_offset = (moe_scratch_bytes + 7) & !7;
         let prefill_meta_base = self.buffers.scratch().offset(meta_offset);
         let slot_offset = (proc_count * 4 + 7) & !7;
@@ -331,18 +336,7 @@ impl TransformerModel {
                     .uploaded_blocks = current_blocks;
             }
 
-            let seq_len_val = (proc_start + proc_count) as u32;
-            // SAFETY: exactly `size_of::<u32>()` bytes over the live, fully
-            // initialised `seq_len_val` local on the line above.
-            let seq_len_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &seq_len_val as *const u32 as *const u8,
-                    std::mem::size_of::<u32>(),
-                )
-            };
-            let seq_len_base = prefill_seq.chunked_prefill_meta.as_ref().unwrap().seq_len;
-            self.gpu
-                .copy_h2d_async(seq_len_bytes, seq_len_base, stream)?;
+            self.upload_chunk_seq_lens(prefill_seq, proc_start, proc_count, stream)?;
 
             let block_table_base = prefill_seq
                 .chunked_prefill_meta
@@ -408,6 +402,7 @@ impl TransformerModel {
         // cache for the second sub-call. This halves memory bandwidth vs
         // the sequential decode_batch + prefill_chunk approach.
         let decode_ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -429,6 +424,7 @@ impl TransformerModel {
         };
 
         let prefill_ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -521,6 +517,7 @@ impl TransformerModel {
             prefill_hidden,
             stream,
         )?;
+        self.note_mtp_prompt_rows(prefill_seq, effective_seq_len_start, proc_count, padded_n);
 
         // Restore decode layer_states to sequences
         for (seq, ls) in decode_seqs

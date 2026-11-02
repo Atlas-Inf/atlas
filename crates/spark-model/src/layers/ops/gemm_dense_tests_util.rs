@@ -11,6 +11,8 @@
 //! kernel or launcher that changes shape produces a LOUD failure telling you to
 //! re-read the guard — never a silently vacuous pass.
 
+#![allow(dead_code)] // shared by several #[path] test modules; each uses a subset
+
 use std::path::{Path, PathBuf};
 
 /// Every `.cu` file in the repo's kernel tree.

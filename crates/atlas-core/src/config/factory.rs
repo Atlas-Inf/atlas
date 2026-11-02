@@ -24,6 +24,7 @@ impl ModelConfig {
             linear_num_value_heads: 32,
             linear_value_head_dim: 128,
             linear_conv_kernel_dim: 4,
+            kda_gate_lower_bound: 0.0,
             num_experts: 512,
             num_experts_per_tok: 10,
             moe_intermediate_size: 512,
@@ -63,6 +64,7 @@ impl ModelConfig {
             weight_prefix: String::new(),
             ep_rank: 0,
             ep_world_size: 1,
+            expert_tp: false,
             tp_rank: 0,
             tp_world_size: 1,
             hybrid_override_pattern: String::new(),
@@ -113,6 +115,8 @@ impl ModelConfig {
             index_n_heads: 0,
             index_head_dim: 0,
             index_topk: 0,
+            index_kpool: 0,
+            index_kpool_always_select_tail: false,
             num_hash_layers: 0,
             yarn_factor: 0.0,
             yarn_beta_slow: 0.0,
@@ -129,11 +133,13 @@ impl ModelConfig {
             // base Qwen3-Next-80B template behaves identically to before.
             scoring_func: String::new(),
             use_routing_bias: false,
+            router_logits_f32: false,
             qk_norm_type: String::new(),
             num_mtp_modules: 0,
             mtp_transformer_layers: 0,
             rotary_dim: 0,
             dflash_capture_layers: Vec::new(),
+            dflash_ctx_window: None,
             adapter_max_rank: 0,
             // No n-gram embeddings: the trio is opt-in per checkpoint.
             // No PLE tower: `ple_layer_ids` empty is the gate.

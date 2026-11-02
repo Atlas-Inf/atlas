@@ -444,7 +444,10 @@ impl MtpHead {
                 "dense_gemv_bf16_batchm",
                 "dense_gemv_bf16_batchm",
             ),
-            w4a16_batchm: crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu),
+            w4a16_batchm: crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(
+                gpu,
+                config.model_type == "glm5_next",
+            ),
             w4a16_gemv_batch16_k: crate::layers::try_kernel(
                 gpu,
                 "w4a16_gemv",

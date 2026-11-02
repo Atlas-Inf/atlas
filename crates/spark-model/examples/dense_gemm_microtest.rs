@@ -137,6 +137,8 @@ fn grid_block(name: &str, m: u32, n: u32) -> Result<([u32; 3], [u32; 3])> {
     Ok(match name {
         // Production scalar kernel: 16×16 tile, one thread per output element.
         "dense_gemm_bf16" => ([n.div_ceil(16), m.div_ceil(16), 1], [16u32, 16, 1]),
+        "dense_gemm_bf16_router" => ([n.div_ceil(64), m.div_ceil(16), 1], [16u32, 16, 1]),
+        "dense_gemm_bf16_router_m5" => ([n.div_ceil(16), 1, 1], [16u32, 5, 1]),
         // Fix-E pipelined rewrite: 128×N_TILE tile (M×N), 256-thread block (8
         // warps). N_TILE defaults to 128 (the shipped geometry); a sweep can
         // override it via DM_N_TILE_SWEEP to match a `-DDM_N_TILE=` rebuild
@@ -257,6 +259,11 @@ fn main() -> Result<()> {
     }
     let cosine = dot / (ng.sqrt() * nc.sqrt());
     let mean_rel = sum_rel / (m * n) as f64;
+    let bit_diffs = c_gpu
+        .iter()
+        .zip(&c_cpu)
+        .filter(|(gpu, cpu)| gpu != cpu)
+        .count();
 
     // ── rough throughput (wall-clock, includes launch overhead; relative A/B) ──
     let iters = 50;
@@ -318,6 +325,7 @@ fn main() -> Result<()> {
     }
 
     println!("cosine={cosine:.6}  mean_rel={mean_rel:.2e}  max_rel={max_rel:.2e}");
+    println!("bit_diffs={bit_diffs}/{}", m * n);
     println!(
         "perf: {:.3} ms/iter  ~{tflops:.2} TFLOP/s (wall-clock incl. launch)",
         per_iter_s * 1e3
@@ -327,12 +335,13 @@ fn main() -> Result<()> {
         kernel_s * 1e3
     );
 
-    if cosine >= COSINE_GATE && cosine.is_finite() {
+    let exact_router = kernel.starts_with("dense_gemm_bf16_router");
+    if cosine >= COSINE_GATE && cosine.is_finite() && (!exact_router || bit_diffs == 0) {
         println!("RESULT: PASS (cosine {cosine:.6} >= {COSINE_GATE})");
         Ok(())
     } else {
         eprintln!(
-            "RESULT: FAIL (cosine {cosine:.6} < {COSINE_GATE}) — layout/accumulation mismatch"
+            "RESULT: FAIL (cosine={cosine:.6}, gate={COSINE_GATE}, bit_diffs={bit_diffs}, exact_router={exact_router}) — layout/accumulation mismatch"
         );
         std::process::exit(1);
     }

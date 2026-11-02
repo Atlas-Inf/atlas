@@ -211,6 +211,11 @@ impl NgramEmbedding {
                 )?,
                 #[cfg(feature = "cuda")]
                 NgramTable::Cached(_) => unreachable!("resolved above"),
+                #[cfg(feature = "cuda")]
+                NgramTable::ResidentNvfp4 { .. } => anyhow::bail!(
+                    "ngram embed: the resident NVFP4 table is PLE-only; this \
+                     model's n-gram tables gather BF16/FP8 rows"
+                ),
             }
             ops::dense_gemm_bf16_pipelined(
                 gpu,

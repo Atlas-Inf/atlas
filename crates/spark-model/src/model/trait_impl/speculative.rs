@@ -27,6 +27,9 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
+#[path = "mtp_hidden.rs"]
+mod mtp_hidden;
+
 impl TransformerModel {
     pub(super) fn generate_speculative_dispatch(
         &self,
@@ -113,7 +116,7 @@ impl TransformerModel {
         seq: &mut SequenceState,
         ctx: &ForwardContext,
         stream: u64,
-    ) {
+    ) -> anyhow::Result<()> {
         // Disjoint field borrows: the proposer state is mutated while the
         // token slice is read. Destructuring is what makes that legal, and it
         // avoids cloning a 12k-token vector on every propose.
@@ -125,8 +128,11 @@ impl TransformerModel {
             ..
         } = seq;
         let Some(prop_state) = proposer_state.as_mut() else {
-            return;
+            return Ok(());
         };
+        // ATLAS_QWEN4EXP_MTP_PREFILL: the sampled token of the prompt's last row.
+        // Ported from Enntity/atlas e7d4e1a (AGPL-3.0-only).
+        proposer.prompt_tail_token(prop_state.as_mut(), seq_tokens);
         let prompt_len = *prompt_len;
         // ATLAS_MTP_DRAFTER_PREFILL: on the FIRST propose of a sequence,
         // batch-prefill the drafter's KV over the prompt (fresh-state check
@@ -193,6 +199,7 @@ impl TransformerModel {
                 }
             }
         }
+        Ok(())
     }
 
     /// ATLAS_MTP_CARRY_DRAFTER: give the drafter this turn's prompt context on
@@ -290,14 +297,19 @@ impl TransformerModel {
     ) -> Result<()> {
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
-        // Residual stream is always BF16, so the saved hidden is BF16.
-        let fp32 = 2usize;
-        // Save the RAW hidden state (before final_norm), not norm_output.
-        // The MTP head applies its own pre_fc_norm_hidden — passing norm_output
-        // would double-normalize and degrade prediction accuracy.
-        let src = self.buffers.hidden_states().offset(token_idx * h * fp32);
-        self.gpu
-            .copy_d2d_async(src, self.mtp_hidden_save, h * fp32, stream)?;
+        // GLM consumes post-final-norm; other families retain raw hidden.
+        // The verifier's SSM commit touches only state-pool H/conv storage,
+        // so both source tensors are still live when this copy is queued.
+        mtp_hidden::copy_target_hidden_row(
+            self.gpu.as_ref(),
+            &self.config.model_type,
+            self.buffers.hidden_states(),
+            self.buffers.norm_output(),
+            self.mtp_hidden_save,
+            h,
+            token_idx,
+            stream,
+        )?;
         self.last_mtp_hidden_idx
             .store(token_idx, std::sync::atomic::Ordering::Relaxed);
         Ok(())
@@ -331,11 +343,11 @@ impl TransformerModel {
         Ok(())
     }
 
-    /// Batched-verify Phase 2: copy the raw-hidden row `rows[i]` (the
+    /// Batched-verify Phase 2: copy the model-specific hidden row `rows[i]` (the
     /// accepted position of sequence i in the just-run batched verify
     /// forward) into stash slot i, BEFORE any propose clobbers the shared
     /// `hidden_states` buffer (every drafter `forward_one` writes into it —
-    /// mtp_multi.rs). Same RAW-hidden (pre-final-norm) contract as
+    /// mtp_multi.rs). Same model-specific representation contract as
     /// `save_hidden_for_mtp_dispatch`.
     pub(super) fn stash_verify_hidden_rows_dispatch(
         &self,
@@ -354,11 +366,19 @@ impl TransformerModel {
         );
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
-        let bf16 = 2usize; // residual stream is BF16
+        let bf16 = 2usize; // both target representations are BF16
         for (i, &row) in rows.iter().enumerate() {
-            let src = self.buffers.hidden_states().offset(row * h * bf16);
             let dst = self.verify_hidden_stash.offset(i * h * bf16);
-            self.gpu.copy_d2d_async(src, dst, h * bf16, stream)?;
+            mtp_hidden::copy_target_hidden_row(
+                self.gpu.as_ref(),
+                &self.config.model_type,
+                self.buffers.hidden_states(),
+                self.buffers.norm_output(),
+                dst,
+                h,
+                row,
+                stream,
+            )?;
         }
         // Same rows, the stream highway. Staged together with the hiddens and
         // restored together, so the two inputs can never name different
@@ -396,12 +416,15 @@ impl TransformerModel {
     /// buffer is NULL for it — including that stash. Gating the LIVE row
     /// selection on the stash silently disabled the whole fix on the only
     /// model that needs it. Stash callers check the pointer themselves.
-    fn mtp_stream_row_bytes(&self) -> Option<usize> {
+    pub(super) fn mtp_stream_row_bytes(&self) -> Option<usize> {
         let hc = self.config.hc_mult.max(self.config.hc_count);
         if hc == 0 || std::env::var("ATLAS_MTP_STREAM_ROW_FIX").ok().as_deref() == Some("0") {
             return None;
         }
-        Some(hc * self.config.hidden_size * 4)
+        Some(
+            hc * self.config.hidden_size
+                * crate::layers::ops::hc_elem_bytes(&self.config.model_type),
+        )
     }
 
     /// Batched-verify Phase 3: stash slot `idx` → `mtp_hidden_save` (the MTP
@@ -429,14 +452,7 @@ impl TransformerModel {
             .copy_d2d_async(src, self.mtp_hidden_save, h * bf16, stream)?;
         // Restore this sequence's stream row into `hc_streams` row 0, which is
         // where a pre-mixer drafter reads its input from.
-        if let Some(row_bytes) = self.mtp_stream_row_bytes()
-            && !self.verify_stream_stash.is_null()
-        {
-            let ssrc = self.verify_stream_stash.offset(idx * row_bytes);
-            self.gpu
-                .copy_d2d_async(ssrc, self.buffers.hc_streams(), row_bytes, stream)?;
-        }
-        Ok(())
+        self.restore_stream_rows_from_stash(&[idx])
     }
 
     /// ATLAS_MTP_CATCHUP: ring-capture the final hidden of a serially
@@ -539,6 +555,7 @@ impl TransformerModel {
         }
         let stream = self.gpu.default_stream();
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -563,7 +580,7 @@ impl TransformerModel {
         // First-propose drafter context (cold-turn prefill); fast no-op on
         // every later call — same as the per-seq path.
         for seq in seqs.iter_mut() {
-            self.ensure_drafter_context(proposer, seq, &ctx, stream);
+            self.ensure_drafter_context(proposer, seq, &ctx, stream)?;
         }
         let h = self.config.hidden_size;
         // DFlash drafts from the 5-layer target stack: read the seq's own
@@ -602,10 +619,14 @@ impl TransformerModel {
                     })
                     .collect::<Result<Vec<_>>>()?
             }
-            _ => stash_idx
-                .iter()
-                .map(|&i| self.verify_hidden_stash.offset(i * h * 2))
-                .collect(),
+            _ => {
+                // A pre-mixer drafter reads its rows' streams, not the hidden.
+                self.restore_stream_rows_from_stash(stash_idx)?;
+                stash_idx
+                    .iter()
+                    .map(|&i| self.verify_hidden_stash.offset(i * h * 2))
+                    .collect()
+            }
         };
         let mut states: Vec<&mut dyn crate::speculative::ProposerState> = Vec::new();
         let mut expected_owners = Vec::with_capacity(seqs.len());
@@ -633,6 +654,32 @@ impl TransformerModel {
                 None => return Ok(None),
             }
         }
+        // ATLAS_GLM_DRAFT_TP_BATCH: a batched propose that swaps halves with
+        // the worker carries the communicator, and is announced with its rows
+        // right before it runs.
+        let grammar = grammar_bitmasks.is_some_and(|m| m.iter().any(Option::is_some));
+        let split = self.draft_split_batch(proposer, tokens.len(), grammar);
+        if let Some((comm, rows)) = split {
+            // ATLAS_GLM_DRAFT_TP_CTX: with the rows ride its context rows.
+            let seqs: Vec<_> = states
+                .iter()
+                .zip(&hiddens)
+                .zip(positions)
+                .map(|((state, &stack), &position)| (&**state, Some(stack), position))
+                .collect();
+            let ctx_rows = proposer.rank_split_ctx(comm, &seqs);
+            self.announce_draft_split_rows(rows, ctx_rows)?;
+        }
+        // ATLAS_QWEN4EXP_MTP_DRAFT_TP: a qwen4_exp batched propose whose draft
+        // head the worker shares, announced with its plan.
+        let tp = match split {
+            Some(_) => None,
+            None => self.announce_draft_tp(proposer, tokens.len(), num_drafts, grammar, &ctx)?,
+        };
+        let ctx = ForwardContext {
+            comm: split.map(|(comm, _)| comm).or(tp),
+            ..ctx
+        };
         proposer.propose_batch(
             tokens,
             &hiddens,
@@ -679,6 +726,8 @@ impl TransformerModel {
                     .validate_access(expected)?;
             }
             proposer.after_verify(num_accepted, Some(expected), state.as_mut(), stream)?;
+            // The verify left this sequence's own rows in the capture buffer.
+            crate::layers::dflash_head::note_own_capture(state.as_mut());
         }
         Ok(())
     }

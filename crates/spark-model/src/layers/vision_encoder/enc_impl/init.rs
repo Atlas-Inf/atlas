@@ -2,10 +2,12 @@
 
 //! `VisionEncoder::new` constructor.
 
-use anyhow::Result;
-use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use anyhow::{Context, Result};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
-use super::super::{MergerLayer, PATCH_DIM, ViTBlock, VisionEncoder};
+use super::super::{
+    GlmVisionEncoder, GlmVisionWeights, MergerLayer, PATCH_DIM, ViTBlock, VisionEncoder, VitWeight,
+};
 
 /// Encoder capacity, in patches, when nothing bounds the image.
 ///
@@ -142,6 +144,32 @@ impl VisionEncoder {
         let buf_scores = gpu.alloc(attn_max * attn_max * 4)?; // [seq, seq] f32
         let buf_probs = gpu.alloc(attn_max * attn_max * 2)?; // [seq, seq] bf16
         let buf_o_stage = gpu.alloc(p_max * head_dim * 2)?; // [seq, D] bf16
+        // Weight-dequant scratch: the largest quantized projection's BF16
+        // expansion (~10 MB for fc1 [4304,1152]). Owned by the encoder; never
+        // aliased with LM scratch.
+        let all_weights = || {
+            blocks
+                .iter()
+                .flat_map(|b| [b.qkv_w, b.proj_w, b.fc1_w, b.fc2_w])
+                .chain(
+                    deepstack
+                        .iter()
+                        .flat_map(|m| [m.fc1_w, m.fc2_w])
+                        .chain([merger.fc1_w, merger.fc2_w]),
+                )
+        };
+        // Lookup the dequant kernels ONLY when a loaded projection is that
+        // dtype: a BF16-only vision tree never registers them, so the boot
+        // audit has nothing to miss (the FP4-Local regression that failed
+        // every non-flash-next vision model).
+        let has_nvfp4_w = all_weights().any(|w| matches!(w, VitWeight::Nvfp4 { .. }));
+        let has_mxfp8_w = all_weights().any(|w| matches!(w, VitWeight::Mxfp8(_)));
+        let max_w_bytes = all_weights().map(|w| w.bf16_bytes()).max().unwrap_or(0);
+        let buf_vit_dq = if max_w_bytes > 0 {
+            gpu.alloc(max_w_bytes)?
+        } else {
+            DevicePtr::NULL
+        };
 
         // Download pos_embed weight to host as f32 so we can bilinear-
         // interpolate it per image (HF: `fast_pos_embed_interpolate`).
@@ -167,6 +195,7 @@ impl VisionEncoder {
             .collect();
 
         Ok(Self {
+            glm: None,
             patch_embed_w,
             patch_embed_b,
             pos_embed,
@@ -201,6 +230,22 @@ impl VisionEncoder {
             k_merge: gpu.kernel("vision_encoder", "vision_spatial_merge")?,
             k_f32_bf16: gpu.kernel("vision_encoder", "vision_f32_to_bf16")?,
             k_copy: gpu.kernel("vision_encoder", "vision_bf16_copy")?,
+            // Dequants for checkpoint-native quantized ViT projections:
+            // resolved ONLY when a loaded weight is that dtype (hard error
+            // if the kernel is missing then — the weight cannot decode
+            // without it). BF16-only trees never even issue the lookup.
+            k_nvfp4_dq: if has_nvfp4_w {
+                gpu.kernel("dequant_nvfp4_bf16", "dequant_nvfp4_to_bf16")
+                    .context("NVFP4 vision weight needs dequant_nvfp4_to_bf16")?
+            } else {
+                KernelHandle(0)
+            },
+            k_mx8_dq: if has_mxfp8_w {
+                gpu.kernel("mxfp8_proj", "mxfp8_proj_dequant")
+                    .context("MXFP8 vision weight needs mxfp8_proj_dequant")?
+            } else {
+                KernelHandle(0)
+            },
             hidden_size,
             num_heads,
             head_dim,
@@ -225,8 +270,81 @@ impl VisionEncoder {
             buf_scores,
             buf_probs,
             buf_o_stage,
+            buf_vit_dq,
             pos_embed_host_f32,
             rope_inv_freq,
+        })
+    }
+
+    /// Construct the distinct GLM-5.3 visual tower while retaining the
+    /// historical `VisionEncoder` wrapper used by model prefill/splicing.
+    pub(crate) fn new_glm(
+        weights: GlmVisionWeights,
+        config: &atlas_core::config::VisionConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Self> {
+        let glm = GlmVisionEncoder::new(weights, config, gpu)?;
+        let glm_buf_out = glm.buf_out;
+        let glm_p_max = glm.p_max;
+        Ok(Self {
+            glm: Some(Box::new(glm)),
+            patch_embed_w: DevicePtr::NULL,
+            patch_embed_b: DevicePtr::NULL,
+            pos_embed: DevicePtr::NULL,
+            blocks: Vec::new(),
+            deepstack: Vec::new(),
+            deepstack_indexes: Vec::new(),
+            merger: MergerLayer {
+                norm_w: DevicePtr::NULL,
+                norm_b: DevicePtr::NULL,
+                fc1_w: super::super::VitWeight::Bf16(DevicePtr::NULL),
+                fc1_b: DevicePtr::NULL,
+                fc2_w: super::super::VitWeight::Bf16(DevicePtr::NULL),
+                fc2_b: DevicePtr::NULL,
+            },
+            k_gemm: KernelHandle(0),
+            k_gemm_pipelined: KernelHandle(0),
+            k_add_bias: KernelHandle(0),
+            k_norm: KernelHandle(0),
+            k_add: KernelHandle(0),
+            k_gelu: KernelHandle(0),
+            k_attn: KernelHandle(0),
+            k_rope_deint: KernelHandle(0),
+            k_softmax: KernelHandle(0),
+            k_scatter_head: KernelHandle(0),
+            k_gemm_f32: KernelHandle(0),
+            k_merge: KernelHandle(0),
+            k_f32_bf16: KernelHandle(0),
+            k_copy: KernelHandle(0),
+            k_nvfp4_dq: KernelHandle(0),
+            k_mx8_dq: KernelHandle(0),
+            hidden_size: config.hidden_size,
+            num_heads: config.num_heads,
+            head_dim: config.hidden_size / config.num_heads,
+            spatial_merge_size: config.spatial_merge_size,
+            out_hidden_size: config.out_hidden_size,
+            intermediate_size: config.intermediate_size,
+            p_max: glm_p_max,
+            num_grid_per_side: 0,
+            buf_f32: DevicePtr::NULL,
+            buf_h1: DevicePtr::NULL,
+            buf_h2: DevicePtr::NULL,
+            buf_wide: DevicePtr::NULL,
+            buf_vit_dq: DevicePtr::NULL,
+            buf_merge_in: DevicePtr::NULL,
+            buf_merge_fc1: DevicePtr::NULL,
+            buf_out: glm_buf_out,
+            buf_pos_resampled: DevicePtr::NULL,
+            buf_rope_cos: DevicePtr::NULL,
+            buf_rope_sin: DevicePtr::NULL,
+            buf_qr: DevicePtr::NULL,
+            buf_kr: DevicePtr::NULL,
+            buf_vt: DevicePtr::NULL,
+            buf_scores: DevicePtr::NULL,
+            buf_probs: DevicePtr::NULL,
+            buf_o_stage: DevicePtr::NULL,
+            pos_embed_host_f32: Vec::new(),
+            rope_inv_freq: Vec::new(),
         })
     }
 }

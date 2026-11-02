@@ -4,6 +4,8 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime_api.h>
 
+#include "atlas_stale_cuda_error.h"
+
 #include "cute/tensor.hpp"
 #include "cutlass/bfloat16.h"
 #include "cutlass/cutlass.h"
@@ -325,8 +327,7 @@ static int nvfp4_gemm_single_tile(
   if (status != cutlass::Status::kSuccess) {
     return static_cast<int>(status);
   }
-  status = gemm(stream);
-  return static_cast<int>(status);
+  return atlas_launch_status(static_cast<int>(gemm(stream)));
 #else
   (void)act_bf16;
   (void)weight_packed_t;
@@ -363,6 +364,7 @@ extern "C" int atlas_cutlass_nvfp4_gemm_bf16_act_weight_t(
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
   const int M_TILE = 4096;
   if (m <= M_TILE) {
     return nvfp4_gemm_single_tile(act_bf16, weight_packed_t, weight_scale_t,
@@ -408,6 +410,7 @@ extern "C" int atlas_cutlass_transpose_nvfp4_packed_kton(
     int n,
     int k,
     cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
   if (n <= 0 || k <= 0 || (k % 16) != 0) {
     return -1;
   }
@@ -461,6 +464,7 @@ extern "C" int atlas_cutlass_nvfp4_grouped_gate_up(
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
   if (n <= 0 || k <= 0 || (k % 16) != 0 || num_experts <= 0) {
     return -1;
@@ -517,6 +521,7 @@ extern "C" int atlas_cutlass_pack_bf16_weight_to_nvfp4_t(
     int n,
     int k,
     cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
   if (n <= 0 || k <= 0 || (k % 16) != 0) {
     return -1;

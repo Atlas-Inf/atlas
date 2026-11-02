@@ -26,6 +26,7 @@ fn entry(
         tiered: false,
         is_tail: false,
         is_tail_sibling: false,
+        chain: Default::default(),
     }
 }
 

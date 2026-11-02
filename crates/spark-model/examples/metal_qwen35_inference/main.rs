@@ -22,30 +22,47 @@
 //!     cargo run --release -p spark-model --example metal_qwen35_inference \
 //!         --features metal-example --no-default-features
 
+#[cfg(target_os = "macos")]
 use anyhow::{Context, Result, bail};
+#[cfg(target_os = "macos")]
 use safetensors::SafeTensors;
+#[cfg(target_os = "macos")]
 use spark_model::forward::qwen3_5::{
     self, LayerKvCache, LinearAttentionState, Qwen35ForwardConfig, Qwen35Kernels,
 };
+#[cfg(target_os = "macos")]
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelArg};
+#[cfg(target_os = "macos")]
 use spark_runtime::metal_backend::MetalGpuBackend;
+#[cfg(target_os = "macos")]
 use spark_runtime::weights::mlx_int8::MlxInt8Weight;
+#[cfg(target_os = "macos")]
 use std::time::Instant;
+#[cfg(target_os = "macos")]
 use tokenizers::Tokenizer;
 
+#[cfg(target_os = "macos")]
 mod alloc;
+#[cfg(target_os = "macos")]
 mod eval_io;
+#[cfg(target_os = "macos")]
 mod full_attention;
+#[cfg(target_os = "macos")]
 mod linear_attention;
 
+#[cfg(target_os = "macos")]
 use alloc::{
     alloc_full_attention_scratch, alloc_linear_attention_scratch, alloc_linear_attention_state,
 };
+#[cfg(target_os = "macos")]
 use full_attention::FullAttentionLayer;
+#[cfg(target_os = "macos")]
 use linear_attention::LinearAttentionLayer;
 
+#[cfg(target_os = "macos")]
 pub const CFG: Qwen35ForwardConfig = Qwen35ForwardConfig::qwen3_5_4b_mlx_int8();
 
+#[cfg(target_os = "macos")]
 fn main() -> Result<()> {
     let prompt =
         std::env::var("PROMPT").unwrap_or_else(|_| "What is the capital of France?".to_string());
@@ -453,4 +470,9 @@ fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn main() -> anyhow::Result<()> {
+    anyhow::bail!("metal_qwen35_inference requires macOS and the Metal backend")
 }

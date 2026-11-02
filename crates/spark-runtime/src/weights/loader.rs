@@ -121,6 +121,7 @@ impl WeightLoader for SafetensorsLoader {
 
         // Locations of tensors deliberately NOT uploaded (the n-gram tables).
         let mut deferred: HashMap<String, crate::weights::DeferredTensor> = HashMap::new();
+        let mut csf = super::nvfp4_csf::CsfAssembler::new();
         let mut weight_map = if use_index {
             load_sharded(
                 model_dir,
@@ -130,15 +131,17 @@ impl WeightLoader for SafetensorsLoader {
                 &skip_fn,
                 self.peak_memory_multiplier,
                 &mut deferred,
+                self.pack_slab,
+                &mut csf,
             )?
         } else if shard_files.len() == 1 {
-            load_single(&shard_files[0], gpu, oom_reserve_bytes, &skip_fn)?
+            load_single(&shard_files[0], gpu, oom_reserve_bytes, &skip_fn, &mut csf)?
         } else {
             tracing::info!("Loading {} unindexed safetensor shards", shard_files.len());
             let initial_free = gpu.free_memory()?;
             let mut combined = HashMap::new();
             for (i, shard) in shard_files.iter().enumerate() {
-                let map = load_single(shard, gpu, oom_reserve_bytes, &skip_fn)?;
+                let map = load_single(shard, gpu, oom_reserve_bytes, &skip_fn, &mut csf)?;
                 let free_now = gpu.free_memory().unwrap_or(0);
                 let used = initial_free.saturating_sub(free_now);
                 tracing::info!(
@@ -159,17 +162,25 @@ impl WeightLoader for SafetensorsLoader {
         };
 
         // Load extra weight files (e.g. MTP weights grafted from another quantization).
-        // Extra weights (MTP) are always fully loaded — they have their own expert lists.
-        let no_skip = |_: &str| false;
+        // Extra weights keep their own expert lists, but a predictor the caller
+        // explicitly does not build must not be reintroduced by an extra file.
+        let skip_unused = |name: &str| {
+            self.skip_layer_prefix
+                .as_ref()
+                .is_some_and(|prefix| name.starts_with(prefix))
+        };
         let extra = model_dir.join("extra_weights.safetensors");
         if extra.exists() {
-            let extra_weights = load_single(&extra, gpu, oom_reserve_bytes, &no_skip)?;
+            let extra_weights =
+                load_single(&extra, gpu, oom_reserve_bytes, &skip_unused, &mut csf)?;
             tracing::info!(
                 "Loaded {} extra weight tensors from extra_weights.safetensors",
                 extra_weights.len()
             );
             weight_map.extend(extra_weights);
         }
+
+        csf.finish(|n| super::loaded_shape(&weight_map, &deferred, n))?;
 
         let mut store = WeightStore::from_map(weight_map);
         for (name, d) in deferred {
@@ -227,6 +238,7 @@ pub(crate) fn read_safetensor_header(
             "F16" => safetensors::Dtype::F16,
             "BF16" => safetensors::Dtype::BF16,
             "I32" => safetensors::Dtype::I32,
+            "U32" => safetensors::Dtype::U32,
             "I16" => safetensors::Dtype::I16,
             "I8" => safetensors::Dtype::I8,
             "U8" => safetensors::Dtype::U8,
@@ -258,6 +270,13 @@ pub(crate) fn estimate_load_bytes(
     for path in files {
         for (name, shape, dtype) in read_safetensor_header(path)? {
             if skip_fn(&name) {
+                continue;
+            }
+            // A CSF scale lands DECODED, 2.1x the compressed bytes on Qwen
+            // FP4-Local (3.6 GB on disk, 7.5 GB on device). Count the one
+            // component that sizes it at that size and the others at zero.
+            if let Some((_, part)) = super::nvfp4_csf::csf_part(&name) {
+                total += super::nvfp4_csf::decoded_len(part, &shape).unwrap_or(0);
                 continue;
             }
             let numel: usize = shape.iter().product();
@@ -349,4 +368,8 @@ pub(crate) fn check_oom_guard(
     Ok(())
 }
 mod load_fns;
+// shard planning is exercised only by the cfg(windows) streaming loader and
+// by unit tests.
+#[cfg(any(target_os = "windows", test))]
+mod slab_plan;
 use load_fns::{load_sharded, load_single};

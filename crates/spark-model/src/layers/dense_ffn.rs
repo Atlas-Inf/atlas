@@ -17,6 +17,14 @@ use crate::weight_map::{
 
 #[path = "dense_ffn_dp4a.rs"]
 mod dp4a_decode;
+#[path = "dense_ffn_native.rs"]
+mod native;
+#[path = "dense_ffn_prefill_bf16.rs"]
+mod prefill_bf16;
+#[path = "dense_ffn_tp_split.rs"]
+mod tp_split;
+pub use native::DenseNative;
+pub(crate) use tp_split::dense_tp_split_requested;
 
 pub struct DenseFfnWeights {
     pub gate_proj: QuantizedWeight,
@@ -131,6 +139,15 @@ pub struct DenseFfnLayer {
     /// Runtime-row-guarded batch4 DP4A GEMVs for the m == 2..3 verify rows.
     dp4a_gemv_batch4_dyn_k: KernelHandle,
     dp4a_dual_batch4_dyn_k: KernelHandle,
+    /// DP4A batch8 GEMVs: FIXED8 for m == 8, runtime-guarded for m in 5..7.
+    dp4a_gemv_batch8_k: KernelHandle,
+    dp4a_dual_batch8_k: KernelHandle,
+    dp4a_gemv_batch8_dyn_k: KernelHandle,
+    dp4a_dual_batch8_dyn_k: KernelHandle,
+    /// vl2 dual twin (2 virtual lanes/thread, 8 outputs/block) — dyn only;
+    /// the single-GEMV arm stays vl1 (at K=17408 the fixed vl1 is already
+    /// roofline-bound). Preferred when linked and ATLAS_GEMV_VL2 != 0.
+    dp4a_dual_batch8_dyn_vl2_k: KernelHandle,
     /// Narrow `w4a16_gemv_batch{M}` family (M=4..8) for the K=4 verify FFN and
     /// the K=5..8 chain verify. SSOT for the M -> tier decision; individual
     /// tiers are 0-handles when the target did not load them.
@@ -191,6 +208,9 @@ pub struct DenseFfnLayer {
     // (no requant), BF16 activations quantized to NVFP4 each call into ffn_act_a/scale.
     // KernelHandle(0) on miss → arm never taken (default-off byte-identical).
     w4a4_gemm_k: KernelHandle,
+    // M-fast W4A4 schedule keeps weight panels resident in L2 across the
+    // 128-token M tiles. Prefer it for long prefills when the target ships it.
+    w4a4_gemm_mfast_k: KernelHandle,
     quantize_nvfp4_k: KernelHandle,
     // Q4_K MMQ prefill (ATLAS_FFN_MMQ): vendored llama Q4_K W4A8 GEMM. Weights
     // materialized NVFP4→bf16→Q4_K once (lazy, cached in the OnceLocks); activations
@@ -242,6 +262,7 @@ pub struct DenseFfnLayer {
     /// NVFP4 attention drift on greedy code generation (the fib test's
     /// broken-indentation pattern).
     bf16_weights: Option<DenseFfnWeightsBf16>,
+    prefill_bf16_weights: Option<DenseFfnWeightsBf16>,
     dense_gemv_bf16_k: KernelHandle,
     dense_gemv_bf16_batch2_k: KernelHandle,
     dense_gemm_bf16_k: KernelHandle,
@@ -279,6 +300,9 @@ pub struct DenseFfnLayer {
     /// it is unaffected). M0: stored only — compute reads land in M1.
     #[allow(dead_code)]
     lora: Option<ops::lora_delta::LoraFfnWeights>,
+    /// The checkpoint's MXFP8 projections (`ATLAS_GLM_FP4L_DENSE_MXFP8`,
+    /// `dense_ffn_native.rs`): when set, every row runs on them.
+    native: Option<DenseNative>,
 
     /// Native keep-packed ternary Q2_0 dense MLP weights (`ATLAS_GGUF_NATIVE_Q2`).
     /// When installed via `set_q2_weights`, decode dispatches `q2_0_gemv_vec`
@@ -348,14 +372,17 @@ fn mmq_tile64_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_NO_MMQ_TILE64").as_deref() != Ok("1"))
 }
 impl DenseFfnLayer {
-    pub fn new(weights: DenseFfnWeights, gpu: &dyn GpuBackend) -> Result<Self> {
-        Self::new_with_activation(weights, FfnActivation::SiLU, gpu)
+    /// `model_type` gates the optional `w4a16_gemv_tc*` tier probes (GLM
+    /// series only) inside `W4a16BatchmTiers::resolve`.
+    pub fn new(weights: DenseFfnWeights, gpu: &dyn GpuBackend, model_type: &str) -> Result<Self> {
+        Self::new_with_activation(weights, FfnActivation::SiLU, gpu, model_type)
     }
 
     pub fn new_with_activation(
         weights: DenseFfnWeights,
         activation: FfnActivation,
         gpu: &dyn GpuBackend,
+        model_type: &str,
     ) -> Result<Self> {
         let act_mul = match activation {
             FfnActivation::SiLU => gpu.kernel("moe_silu_mul", "moe_silu_mul")?,
@@ -444,9 +471,40 @@ impl DenseFfnLayer {
                 "w4a16_gemv_dp4a",
                 "w4a16_gemv_dp4a_dual_batch4_d4_dyn",
             ),
-            w4a16_batchm: W4a16BatchmTiers::resolve(gpu),
+            dp4a_gemv_batch8_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
+                gpu,
+                "w4a16_gemv_dp4a",
+                "w4a16_gemv_dp4a_batch8_d4",
+            ),
+            dp4a_dual_batch8_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
+                gpu,
+                "w4a16_gemv_dp4a",
+                "w4a16_gemv_dp4a_dual_batch8_d4",
+            ),
+            dp4a_gemv_batch8_dyn_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
+                gpu,
+                "w4a16_gemv_dp4a",
+                "w4a16_gemv_dp4a_batch8_d4_dyn",
+            ),
+            dp4a_dual_batch8_dyn_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
+                gpu,
+                "w4a16_gemv_dp4a",
+                "w4a16_gemv_dp4a_dual_batch8_d4_dyn",
+            ),
+
+            dp4a_dual_batch8_dyn_vl2_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
+                gpu,
+                "w4a16_gemv_dp4a",
+                "w4a16_gemv_dp4a_dual_batch8_d4_dyn_vl2",
+            ),
+            w4a16_batchm: W4a16BatchmTiers::resolve(gpu, model_type == "glm5_next"),
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
-            w4a16_gemm_t_m128_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128"),
+            w4a16_gemm_t_m128_k: super::ops::w4a16_m128_kernel(gpu),
             w4a16_gemm_t_m128_k16_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128_k16"),
             w4a16_gemm_t_m128_v2_k: super::w4a16_v2_kernel(gpu),
             w4a16_gemm_t_m128_bf16_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128_bf16"),
@@ -464,6 +522,7 @@ impl DenseFfnLayer {
             int8_up: std::sync::OnceLock::new(),
             int8_down: std::sync::OnceLock::new(),
             w4a4_gemm_k: super::try_kernel(gpu, "w4a4", "w4a4_gemm"),
+            w4a4_gemm_mfast_k: super::try_kernel(gpu, "w4a4", "w4a4_gemm_mfast"),
             quantize_nvfp4_k: super::try_kernel(gpu, "quantize_nvfp4", "quantize_bf16_to_nvfp4"),
             q4k_mmq_nc_k: super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_nc"),
             q4k_mmq_wc_k: super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_wc"),
@@ -496,6 +555,7 @@ impl DenseFfnLayer {
             w4a16_gemm_t_k64_k: super::k64_kernel(gpu).unwrap_or(KernelHandle(0)),
             act_mul,
             bf16_weights: None,
+            prefill_bf16_weights: None,
             dense_gemv_bf16_k,
             dense_gemv_bf16_batch2_k,
             dense_gemm_bf16_k,
@@ -512,6 +572,7 @@ impl DenseFfnLayer {
             ),
             w8a16_gemm_t_m128_k: super::try_kernel(gpu, "w8a16_gemm_t_m128", "w8a16_gemm_t_m128"),
             lora: None,
+            native: None,
             q2_weights: None,
             // Winner of the decode-GEMV bench: candidate B (vectorized code loads
             // + smem A-stage, 1 warp/row × 8 rows/CTA). ~268 GB/s (98% of the
@@ -935,6 +996,9 @@ impl DenseFfnLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        if self.try_native(input, 1, ctx, stream)? {
+            return Ok(ctx.buffers.moe_output());
+        }
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.intermediate_size as u32;
 
@@ -1409,6 +1473,9 @@ impl DenseFfnLayer {
     /// K=2 speculative: read-once batched GEMV for two tokens.
     /// Native BF16 uses separate gate/up batch2 launches; NVFP4 keeps its fused path.
     pub fn forward_k2(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
+        if self.try_glm_canonical_rows(input, 2, ctx, stream)? {
+            return Ok(());
+        }
         // Packed-Q2: NVFP4 fallback weights are NULL, so the NVFP4 batch2 GEMVs
         // below would fault. Route to the keep-packed batchm FFN (m=2).
         if let Some(ref q2w) = self.q2_weights {
@@ -1521,6 +1588,9 @@ impl DenseFfnLayer {
     /// K=3 speculative: batched GEMV for 3 tokens.
     /// 3 launches: dual batch3 (gate+up) + silu_mul + batch3 (down).
     pub fn forward_k3(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
+        if self.try_glm_canonical_rows(input, 3, ctx, stream)? {
+            return Ok(());
+        }
         // Packed-Q2: route to the keep-packed batchm FFN (m=3); NVFP4 weights null.
         if let Some(ref q2w) = self.q2_weights {
             return self.forward_km_q2(q2w, input, ctx, 3, stream);
@@ -1618,6 +1688,9 @@ impl DenseFfnLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.try_glm_canonical_rows(input, m as usize, ctx, stream)? {
+            return Ok(());
+        }
         if self.forward_dp4a_batch(input, m, ctx, stream)? {
             return Ok(());
         }
@@ -1812,6 +1885,11 @@ impl DenseFfnLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.try_glm_canonical_rows(input, num_tokens, ctx, stream)?
+            || self.try_glm_prefill_bf16(input, num_tokens, ctx, stream)?
+        {
+            return Ok(());
+        }
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.intermediate_size as u32;
         let m = num_tokens as u32;
@@ -2283,7 +2361,7 @@ impl DenseFfnLayer {
         // W4A4 native-FP4 prefill (ATLAS_FP4_PREFILL) — HIGHEST priority. NVFP4 weights
         // used directly (no requant); BF16 activations quantized to NVFP4 each GEMM into
         // the shared scratch. Native FP4 tensor cores (sm_121a). Lossy (cos ~0.99 vs fp32).
-        let fp4_prefill = self.w4a4_gemm_k.0 != 0
+        let fp4_prefill = (self.w4a4_gemm_mfast_k.0 != 0 || self.w4a4_gemm_k.0 != 0)
             && self.quantize_nvfp4_k.0 != 0
             && std::env::var_os("ATLAS_FP4_PREFILL").is_some();
         if fp4_prefill {
@@ -2294,7 +2372,7 @@ impl DenseFfnLayer {
             // through the call path to prevent one repeated INFO line.
             if ctx.stats.once("log:ffn_fp4_prefill") {
                 tracing::info!(
-                    "[atlas] ATLAS_FP4_PREFILL=1: dense-FFN prefill via w4a4_gemm (native FP4 MMA sm_121a, W4A4)"
+                    "[atlas] ATLAS_FP4_PREFILL=1: dense-FFN prefill via native W4A4 GEMM (M-fast schedule when available, sm_121a)"
                 );
             }
         }
@@ -2414,18 +2492,33 @@ impl DenseFfnLayer {
                     // native NVFP4 weight `$w` (no requant). sm_121a FP4 MMA.
                     _ if fp4_prefill => {
                         let _ = $in;
-                        ops::w4a4_gemm(
-                            ctx.gpu,
-                            self.w4a4_gemm_k,
-                            nvfp4_a_packed,
-                            nvfp4_a_scale,
-                            $w,
-                            $out,
-                            m,
-                            $n,
-                            $k,
-                            stream,
-                        )?;
+                        if self.w4a4_gemm_mfast_k.0 != 0 {
+                            ops::w4a4_gemm_mfast(
+                                ctx.gpu,
+                                self.w4a4_gemm_mfast_k,
+                                nvfp4_a_packed,
+                                nvfp4_a_scale,
+                                $w,
+                                $out,
+                                m,
+                                $n,
+                                $k,
+                                stream,
+                            )?;
+                        } else {
+                            ops::w4a4_gemm(
+                                ctx.gpu,
+                                self.w4a4_gemm_k,
+                                nvfp4_a_packed,
+                                nvfp4_a_scale,
+                                $w,
+                                $out,
+                                m,
+                                $n,
+                                $k,
+                                stream,
+                            )?;
+                        }
                     }
                     // int8 W4A8 fast prefill (ATLAS_INT8_PREFILL) — next priority.
                     // Independent of `$wt`/the transposed copies: requant reads the

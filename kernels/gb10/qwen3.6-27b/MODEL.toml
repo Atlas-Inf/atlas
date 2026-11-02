@@ -234,5 +234,20 @@ if mfast is ported."""
 # absent by design and handle 0 keeps the full m-tile grid. The lookup is
 # issued unconditionally by MoeLayer::new (moe/init.rs), which every MoE
 # model_type this target serves constructs.
+# The gfx1151 port (main #9/#33) added a `try_kernel` probe for a Strix-only
+# w4a16 variant inside the shared dense_ffn constructor, which this gb10 model
+# instantiates too. The site is `handle != 0`-gated, so sm_121 dispatches the
+# compiled w4a16_gemm_t_m128 / w4a16_gemm arms. Same declaration as
+# gb10/qwen3.8-27b/MODEL.toml (6f52a7d0), which shares this kernel tree via
+# `kernel_source`; without it the resolution audit refuses to boot
+# unsloth/Qwen3.6-27B-NVFP4 on GB10 (1 unresolved lookup, dense_ffn.rs:450).
+
+[expected_absent.w4a16]
+w4a16_gemm_t_m128_k16 = """
+K16-tile w4a16 GEMM variant, exists only in
+strix-hip/qwen3.6-27b/nvfp4/w4a16_gemm.cu — and even there it only runs under
+ATLAS_W4A16_K16=1 (a gfx1151 occupancy A/B lever). gb10 uses the compiled
+w4a16_gemm_t_m128 / w4a16_gemm arms; handle!=0 gated."""
+
 [expected_absent.moe_persist_marker]
 moe_w4a16_k64_strides_m_tiles = "Capability marker issued by MoeLayer::new on every MoeLayer MoE model; only targets whose k64 prefill kernels were measured to stride m-tiles ship it (qwen3.8-flash-next). Absent here by design: handle 0 keeps the full m-tile grid."

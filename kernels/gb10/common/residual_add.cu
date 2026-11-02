@@ -5,6 +5,7 @@
 // Used in the transformer loop after attention/SSM and FFN blocks.
 // Operates in-place on the residual stream.
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 extern "C" __global__ void bf16_residual_add(
@@ -12,6 +13,7 @@ extern "C" __global__ void bf16_residual_add(
     const __nv_bfloat16* __restrict__ src,  // [n]
     unsigned int n
 ) {
+    atlas_pdl_enter();
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         float r = __bfloat162float(residual[i]);
@@ -99,6 +101,7 @@ extern "C" __global__ void sigmoid_gate_mul(
     __nv_bfloat16* __restrict__ output,        // [n]
     unsigned int n
 ) {
+    atlas_pdl_enter();
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         float x = __bfloat162float(input[i]);

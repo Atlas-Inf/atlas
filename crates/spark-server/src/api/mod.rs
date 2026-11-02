@@ -40,6 +40,7 @@ pub mod completions_exec;
 pub mod completions_logprobs;
 pub mod conversations;
 pub mod inference_impl;
+mod inference_repair;
 pub mod inference_types;
 pub mod lora_control;
 pub mod misc_handlers;
@@ -55,6 +56,8 @@ pub mod stream_guards;
 pub mod strip;
 pub mod stubs;
 
+#[cfg(test)]
+pub(crate) mod test_app_state;
 #[cfg(test)]
 mod tests;
 
@@ -76,7 +79,8 @@ pub use conversations::{
     get_conversation_item, list_conversation_items, update_conversation,
 };
 pub use inference_types::{
-    GrammarSpec, InferenceRequest, InferenceResponse, StreamEvent, TokenLogprobs,
+    GrammarSpec, InferenceRequest, InferenceResponse, InvalidRequestError, StreamEvent,
+    TokenLogprobs,
 };
 pub use lora_control::{load_lora_into_slot, set_active_lora};
 #[allow(unused_imports)]
@@ -93,3 +97,6 @@ pub use stubs::{
     audio_stub, batch_get_stub, batch_list_stub, batches_stub, files_stub, images_stub,
     moderations_stub,
 };
+
+#[cfg(test)]
+mod refusal_content_tests;

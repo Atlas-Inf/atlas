@@ -158,7 +158,8 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else {
-            let use_br64 = n >= 256;
+            // ATLAS_QWEN4EXP_PREFILL_ROWINV: one kernel at every width.
+            let use_br64 = n >= 256 || crate::layers::ops::qwen4exp_rowinv::active();
             let (fp8_k_scale, fp8_v_scale) = self.effective_fp8_scales();
             match (self.kv_dtype, use_br64) {
                 (KvCacheDtype::Nvfp4, true) => ops::prefill_attention_paged_nvfp4_64(

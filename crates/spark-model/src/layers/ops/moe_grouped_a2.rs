@@ -174,6 +174,40 @@ pub fn moe_unpermute_reduce_indexed(
         .launch(stream)
 }
 
+/// EP-aware unpermute. Remote experts are ignored, so their output rows do not
+/// need to be initialized before the local expert kernels run.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_unpermute_reduce_indexed_ep(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    expert_output: DevicePtr,
+    output: DevicePtr,
+    token_to_perm: DevicePtr,
+    topk_ids: DevicePtr,
+    topk_weights: DevicePtr,
+    hidden_size: u32,
+    num_tokens: u32,
+    topk: u32,
+    local_expert_start: u32,
+    local_expert_end: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_tokens, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(expert_output)
+        .arg_ptr(output)
+        .arg_ptr(token_to_perm)
+        .arg_ptr(topk_ids)
+        .arg_ptr(topk_weights)
+        .arg_u32(hidden_size)
+        .arg_u32(num_tokens)
+        .arg_u32(topk)
+        .arg_u32(local_expert_start)
+        .arg_u32(local_expert_end)
+        .launch(stream)
+}
+
 /// Batched sigmoid blend: output += sigmoid(dot(normed, gate_weight)) * shared_out.
 ///
 /// Grid: (num_tokens, 1, 1)  Block: (256, 1, 1)
@@ -216,6 +250,9 @@ pub fn moe_batched_blend(
 /// blocks the host until the GPU drains — halving them halves that stall.
 pub fn moe_grouped_gate_up_cutlass(
     gpu: &dyn GpuBackend,
+    // Reuse the exact-grid host snapshot when the caller already fetched it.
+    // Otherwise this helper performs the one D2H needed by CUTLASS.
+    eoff_cached: Option<&[i32]>,
     host: &MoeCutlassHostTables,
     a: DevicePtr,
     sorted_token_ids: DevicePtr,
@@ -227,15 +264,18 @@ pub fn moe_grouped_gate_up_cutlass(
     stream: u64,
 ) -> Result<Vec<i32>> {
     let num_experts = host.gate_packed.len();
-    let mut off_raw = vec![0u8; (num_experts + 1) * 4];
-    gpu.copy_d2h_on_stream(expert_offsets, &mut off_raw, stream)?;
-    // The offsets host copy is needed by the C entry before it can launch —
-    // make sure the async D2H has landed.
-    gpu.synchronize(stream)?;
-    let eoff: Vec<i32> = off_raw
-        .chunks_exact(4)
-        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
+    let eoff: Vec<i32> = if let Some(e) = eoff_cached {
+        e.to_vec()
+    } else {
+        let mut off_raw = vec![0u8; (num_experts + 1) * 4];
+        // CUDA's copy_d2h_on_stream is synchronous by contract, so no second
+        // explicit stream synchronization is required here.
+        gpu.copy_d2h_on_stream(expert_offsets, &mut off_raw, stream)?;
+        off_raw
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    };
 
     spark_runtime::cutlass::nvfp4_grouped_gate_up_fused(
         a.0,
@@ -283,7 +323,6 @@ pub fn moe_grouped_down_cutlass(
     } else {
         let mut off_raw = vec![0u8; (num_experts + 1) * 4];
         gpu.copy_d2h_on_stream(expert_offsets, &mut off_raw, stream)?;
-        gpu.synchronize(stream)?;
         off_raw
             .chunks_exact(4)
             .map(|c| i32::from_le_bytes(c.try_into().expect("4")))

@@ -356,6 +356,55 @@ pub fn gdn_decode_wyn(
         .launch(stream)
 }
 
+/// GDN deferred-commit replay (`gated_delta_rule_commit`,
+/// `gated_delta_rule_wyn.cu`): replays tokens `0..accepted_count` of the
+/// staged verify inputs (conv-out q/k/v rows + gate/beta rows) against the
+/// live H0 in `h_state`, writing only `H_{a}` in place — bit-identical to
+/// the storing verify's `intermediates[a-1]` / final H because it runs the
+/// same `gated_delta_rule_wyn_impl` arithmetic with the same op order.
+/// Grid (num_v_heads, 1, 1); single-sequence per launch — batched accept
+/// loops it per sequence (a launch per seq×layer still replaces ~K−1
+/// state-blob writes with one).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_commit_accepted(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    accepted_count: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gb_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, 1, 1])
+        .block([128, 1, 1])
+        .arg_ptr(h_state)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_u32(accepted_count)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(qk_stride)
+        .arg_u32(v_stride)
+        .arg_u32(gb_stride)
+        .launch(stream)
+}
+
 /// Fused 2-token conv1d sliding window update + SiLU.
 ///
 /// Each thread handles one channel independently. The 2-token dependency

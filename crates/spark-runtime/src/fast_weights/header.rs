@@ -55,7 +55,10 @@ pub(super) fn resolve_shards(
     if let Some(ip) = actual_index {
         let json = std::fs::read_to_string(&ip)
             .with_context(|| format!("Failed to read {}", ip.display()))?;
-        let index: SafetensorsIndex = serde_json::from_str(&json)?;
+        let mut index: SafetensorsIndex = serde_json::from_str(&json)?;
+        // EXL3 tensors in unindexed side files join the map (no-op otherwise),
+        // so they become shard files below.
+        let _merged = crate::weights::merge_exl3_side_files(model_dir, &mut index.weight_map)?;
         let mut shards: Vec<String> = index
             .weight_map
             .values()
@@ -121,23 +124,33 @@ pub(super) fn parse_header(file: &mut File) -> Result<Vec<TensorMeta>> {
         }
         let dtype_str = info["dtype"].as_str().unwrap_or("BF16");
         let (dtype, from_f16) = match dtype_str {
-            "F32" => (WeightDtype::FP32, false),
-            "BF16" => (WeightDtype::BF16, false),
             // F16 is not store-legal (WeightDtype is closed to store dtypes):
             // stage as BF16 and mark for byte conversion in the copy loop.
             // centml modelopt W4A4 exports ship all unquantized tensors as F16.
-            "F16" => (WeightDtype::BF16, true),
-            "U8" => (WeightDtype::UInt8, false),
-            // I8 is a 1-byte raw container; DeepSeek-V4-Flash-NVFP4 ships its MTP
-            // experts' 4-bit-packed weights as I8 (vs U8 for the main layers).
-            // Signedness is irrelevant for packed FP4 — the dequant kernel extracts
-            // nibbles by bit ops — so treat I8 as raw bytes (UInt8), matching the
-            // NVFP4 expert path.
-            "I8" => (WeightDtype::UInt8, false),
-            "F8_E4M3" => (WeightDtype::FP8E4M3, false),
-            "F8_E8M0" => (WeightDtype::FP8E8M0, false),
-            "I64" => (WeightDtype::Int64, false),
-            other => bail!("Unsupported safetensors dtype '{other}' for tensor {name}"),
+            // EXL3 scale vectors are the exception: keep the raw bytes (FP16).
+            "F16" => {
+                if crate::weights::keeps_raw_f16(name) {
+                    (WeightDtype::FP16, false)
+                } else {
+                    (WeightDtype::BF16, true)
+                }
+            }
+            // CSF component streams (slab exception words; csf_32x2_v1 page
+            // origins, prefixes and records). Never stored: the copy loop
+            // hands every CSF part to `CsfAssembler`, which re-derives the
+            // element width from byte length against shape. `UInt8` is only
+            // the staging container here; U16/U32 anywhere else is still
+            // refused below.
+            "U16" | "U32" if crate::weights::nvfp4_csf::csf_part(name).is_some() => {
+                (WeightDtype::UInt8, false)
+            }
+            // Every other dtype maps exactly as on the buffered and RDMA paths:
+            // one table (`from_safetensors_str`), so the loaders cannot drift.
+            other => (
+                WeightDtype::from_safetensors_str(other)
+                    .with_context(|| format!("tensor {name}"))?,
+                false,
+            ),
         };
         let shape: Vec<usize> = info["shape"]
             .as_array()
@@ -169,3 +182,7 @@ pub(super) fn parse_header(file: &mut File) -> Result<Vec<TensorMeta>> {
     out.sort_by_key(|t| t.abs_offset);
     Ok(out)
 }
+
+#[cfg(test)]
+#[path = "header_tests.rs"]
+mod tests;

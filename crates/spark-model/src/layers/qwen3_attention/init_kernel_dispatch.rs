@@ -22,6 +22,20 @@
 
 use spark_runtime::kv_cache::KvCacheDtype;
 
+/// BF16 absorbed-MLA module, selected separately from the unabsorbed Q head.
+pub(super) fn mla_bf16_module(
+    model_type: &str,
+    kv_lora_rank: usize,
+    rope_dim: usize,
+) -> anyhow::Result<&'static str> {
+    if let Some(shape) =
+        crate::model::glm_cache_plan::GlmMlaShape::for_model(model_type, kv_lora_rank, rope_dim)?
+    {
+        return Ok(shape.bf16_decode_module());
+    }
+    Ok("paged_decode_mla")
+}
+
 /// Module + function name 4-tuple consumed by `Qwen3AttentionLayer::new_with_gating`:
 /// `(reshape_mod, reshape_fn, decode_mod, decode_fn)`. The reshape pair feeds
 /// `self.reshape_cache_k`; the decode pair feeds `self.paged_decode_k`.
@@ -171,12 +185,66 @@ pub(super) fn kernel_modules_for_dtype(
             "paged_decode_fp8",
             "paged_decode_attn_fp8",
         ),
+        // GLM latent only (validated at build): its readers are the GLM MLA
+        // kernels; the generic decode pair is bound but never dispatched.
+        KvCacheDtype::Fp8G128 => (
+            "reshape_and_cache",
+            "glm_latent_cache_write_fp8g128",
+            "paged_decode",
+            "paged_decode_attn",
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glm_mla_512_uses_exact_latent_width() {
+        assert_eq!(
+            mla_bf16_module("glm5_next", 512, 0).unwrap(),
+            "paged_decode_attn_512"
+        );
+    }
+
+    #[test]
+    fn glm_mla_rejects_unsupported_latent_geometry() {
+        for (rank, rope) in [(0, 0), (256, 0), (512, 64), (576, 0), (usize::MAX, 1)] {
+            assert!(mla_bf16_module("glm5_next", rank, rope).is_err());
+        }
+    }
+
+    #[test]
+    fn glm_mla_fix_preserves_other_model_bindings() {
+        for (model, rank, rope) in [
+            ("deepseek_v4", 512, 64),
+            ("mistral3", 256, 64),
+            ("qwen3", 0, 0),
+            ("other", 512, 0),
+        ] {
+            assert_eq!(
+                mla_bf16_module(model, rank, rope).unwrap(),
+                "paged_decode_mla"
+            );
+        }
+    }
+
+    #[test]
+    fn glm_mla_512_source_and_alias_match_the_binding() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../kernels/gb10/deepseek-v4-flash/nvfp4/paged_decode_attn_512.cu"
+        ));
+        let manifest = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../kernels/gb10/deepseek-v4-flash/nvfp4/KERNEL.toml"
+        ));
+        assert!(source.contains("#define HDIM 512"));
+        assert!(source.contains("void paged_decode_attn("));
+        assert!(source.contains("const unsigned int sliding_window"));
+        assert!(manifest.contains("paged_decode_attn_512 = \"paged_decode_attn_512\""));
+    }
 
     /// Every variant the enum advertises must be in the dispatch table.
     /// The match in `kernel_modules_for_dtype` is exhaustive (no `_` arm),

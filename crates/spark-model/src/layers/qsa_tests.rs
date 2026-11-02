@@ -153,9 +153,12 @@ fn qsa_matches_reference() {
     g.synchronize(stream).unwrap();
 
     let want_raw = f32s("raw_keys");
+    // The raw-key window (`qsa_window.rs`) has not slid at this length: it
+    // still holds every position from 0.
+    assert_eq!(qst.raw.base(), 0);
     compare(
         "raw_keys",
-        &dl_bf16(g, qst.raw_keys, t_pre * hd),
+        &dl_bf16(g, qsa.raw_slot(&qst, 0), t_pre * hd),
         &want_raw[..t_pre * hd],
         0.05,
     );
@@ -268,6 +271,8 @@ fn qsa_matches_reference() {
 mod prefill;
 #[path = "qsa_tests_prefill_b.rs"]
 mod prefill_b;
+#[path = "qsa_tests_prefill_gp.rs"]
+mod prefill_gp;
 
 // Device top-k contract (every gathered id is written by the launch).
 #[path = "qsa_tests_topk.rs"]

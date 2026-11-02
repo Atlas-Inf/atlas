@@ -1,0 +1,17 @@
+MemAvailable:   46880648 kB
+pid 1: 8192 MiB in 64 MiB blocks; deltas in MiB since start (negative MemAvailable = memory consumed); fields under 8 MiB omitted
+control 0 (idle 2 s)               driver     +0.0  MemAvailable    -29.3  cuFree    -14.4  MemFree -29.5  AnonPages +13.1
+control 1 (idle 2 s)               driver     +0.0  MemAvailable    -23.6  cuFree     -8.8  MemFree -23.9
+control 2 (idle 2 s)               driver     +0.0  MemAvailable    -24.5  cuFree     -9.7  MemFree -24.8
+cycle 1: allocated                 driver  +8192.0  MemAvailable  -8231.0  cuFree   -533.6  MemFree -540.5  Cached -7644.5  SUnreclaim +31.5  SReclaimable -33.4
+cycle 1: allocated + 2 s           driver  +8192.0  MemAvailable  -8193.6  cuFree   -561.8  MemFree -578.4  Cached -7644.8  SUnreclaim +31.9  SReclaimable -33.7
+cycle 1: freed                     driver     +0.0  MemAvailable   +114.0  cuFree  +7744.4  MemFree +7729.2  Cached -7644.8  Slab -33.1  SReclaimable -33.7
+cycle 1: freed + 2 s more          driver     +0.0  MemAvailable   +113.4  cuFree  +7743.8  MemFree +7728.6  Cached -7644.7  Slab -33.4  SReclaimable -33.7
+cycle 1: freed + 4 s more          driver     +0.0  MemAvailable    -31.8  cuFree  +7598.4  MemFree +7583.2  Cached -7644.6  Slab -33.4  SReclaimable -33.7
+cycle 2: allocated                 driver  +8192.0  MemAvailable  -7523.4  cuFree   -689.8  MemFree -706.3  Cached -7644.5  SUnreclaim +33.6  SReclaimable -33.7
+cycle 2: allocated + 2 s           driver  +8192.0  MemAvailable  -7513.9  cuFree   -682.5  MemFree -697.4  Cached -7644.5  SUnreclaim +33.6  SReclaimable -33.9
+cycle 2: freed                     driver     +0.0  MemAvailable   +800.7  cuFree  +7631.9  MemFree +7617.3  Cached -7644.4  Slab -33.4  SReclaimable -33.9
+cycle 2: freed + 2 s more          driver     +0.0  MemAvailable   +823.7  cuFree  +7655.4  MemFree +7640.3  Cached -7644.4  Slab -33.4  SReclaimable -33.9
+cycle 2: freed + 4 s more          driver     +0.0  MemAvailable   +842.6  cuFree  +7673.9  MemFree +7659.0  Cached -7644.3  Slab -33.4  SReclaimable -33.9
+context destroyed + 2 s            MemAvailable  +1075.6
+MemAvailable:   47745508 kB

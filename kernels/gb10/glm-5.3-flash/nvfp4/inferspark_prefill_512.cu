@@ -1,0 +1,1 @@
+../../deepseek-v4-flash/nvfp4/inferspark_prefill_512.cu

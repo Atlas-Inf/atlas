@@ -18,15 +18,26 @@ use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 use crate::weight_map::{DenseWeight, Fp8Weight, NemotronSsmWeights, QuantizedWeight};
 
+#[cfg(all(test, target_os = "linux"))]
+mod decode_oracle_gpu_tests;
+#[cfg(all(test, atlas_hip))]
+mod dense_tiled_gpu_tests;
+pub(crate) mod l0_dump;
 mod prefill;
 mod prefill_proj;
 mod prefill_proj_exact;
 #[cfg(test)]
 mod prefill_proj_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod ssd_chunk_gpu_tests;
 mod trait_decode_batched;
 mod trait_decode_multi_seq;
 mod trait_decode_verify_multi;
 mod trait_impl;
+#[cfg(all(test, target_os = "linux"))]
+mod verify_exact_gpu_tests;
+#[cfg(all(test, atlas_hip))]
+mod w8a16_tiled_gpu_tests;
 
 #[allow(dead_code)]
 pub struct NemotronMamba2Layer {
@@ -73,6 +84,7 @@ pub struct NemotronMamba2Layer {
     // Native FP8 block-scaled prefill GEMM (paired with in_proj_fp8/out_proj_fp8).
     w8a16_gemm_k: KernelHandle,
     w8a16_gemm_pipelined_k: KernelHandle,
+    w8a16_gemm_n_m128_k: KernelHandle,
     w4a16_gemm_t_k: KernelHandle,
     w4a16_gemm_t_m128_k: KernelHandle,
     fp8_gemm_t_k: KernelHandle,
@@ -80,6 +92,13 @@ pub struct NemotronMamba2Layer {
     // Native-BF16 projection kernels (paired with in_proj_bf16/out_proj_bf16).
     dense_gemm_bf16_k: KernelHandle,
     dense_gemv_bf16_k: KernelHandle,
+    /// Bit-identical M<=8 twin of `dense_gemv_bf16` — exact-verify in/out_proj.
+    dense_gemv_bf16_batchm_k: KernelHandle,
+    /// Bit-identical batch twin of the NVFP4 decode GEMV — the exact-verify
+    /// in/out_proj fallback when the weights are NVFP4 (never on omni, whose
+    /// SSM projections are native FP8; kept so a non-FP8 omni variant fails
+    /// into the per-row loop rather than a 0-handle launch).
+    w4a16_gemv_batch16_k: KernelHandle,
     bf16_to_fp8_k: KernelHandle,
     w4a4_gemm_k: KernelHandle,
     quantize_nvfp4_k: KernelHandle,
@@ -87,6 +106,9 @@ pub struct NemotronMamba2Layer {
     conv1d_prefill_tp_k: KernelHandle,
     mamba2_ssm_prefill_k: KernelHandle,
     mamba2_ssm_prefill_persistent_k: KernelHandle,
+    /// Omni overlay register-resident prefill scan (3.5x the smem variant at
+    /// seq 8192, byte-identical); 0 on targets that don't ship it.
+    mamba2_ssm_prefill_reg_k: KernelHandle,
     mamba2_ssm_verify_k: KernelHandle,
     mamba2_ssm_verify_exact_k: KernelHandle,
     // SSD chunked prefill scan (tensor-core; ceil(T/64) serial links instead of T).
@@ -153,12 +175,24 @@ impl NemotronMamba2Layer {
                 "w8a16_gemm_pipelined",
                 "w8a16_gemm_pipelined",
             ),
+            w8a16_gemm_n_m128_k: super::try_kernel_gated(
+                cfg!(atlas_hip),
+                gpu,
+                "w8a16_gemm_n_m128",
+                "w8a16_gemm_n_m128",
+            ),
             w4a16_gemm_t_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t"),
             w4a16_gemm_t_m128_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128"),
             fp8_gemm_t_k: super::try_kernel(gpu, "w4a16", "fp8_gemm_t_m128_mfast"),
             fp8_fp8_gemm_t_k: super::try_kernel(gpu, "w4a16", "fp8_fp8_gemm_t_m128_mfast"),
             dense_gemm_bf16_k: super::try_kernel(gpu, "gemm", "dense_gemm_bf16_pipelined"),
             dense_gemv_bf16_k: super::try_kernel(gpu, "gemv", "dense_gemv_bf16"),
+            dense_gemv_bf16_batchm_k: super::try_kernel(
+                gpu,
+                "dense_gemv_bf16_batchm",
+                "dense_gemv_bf16_batchm",
+            ),
+            w4a16_gemv_batch16_k: super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch16"),
             bf16_to_fp8_k: super::try_kernel(gpu, "w4a16", "bf16_to_fp8"),
             w4a4_gemm_k: super::try_kernel(gpu, "w4a4", "w4a4_gemm_mfast"),
             quantize_nvfp4_k: super::try_kernel(gpu, "quantize_nvfp4", "quantize_bf16_to_nvfp4"),
@@ -176,6 +210,11 @@ impl NemotronMamba2Layer {
                 gpu,
                 "mamba2_ssm",
                 "mamba2_ssm_prefill_persistent",
+            ),
+            mamba2_ssm_prefill_reg_k: super::try_kernel(
+                gpu,
+                "mamba2_ssm_prefill_reg",
+                "mamba2_ssm_prefill_reg",
             ),
             mamba2_ssm_verify_k: super::try_kernel(gpu, "mamba2_ssm", "mamba2_ssm_verify"),
             mamba2_ssm_verify_exact_k: super::try_kernel(

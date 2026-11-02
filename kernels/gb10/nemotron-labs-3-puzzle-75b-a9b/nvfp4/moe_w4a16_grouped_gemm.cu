@@ -352,6 +352,10 @@ __device__ __forceinline__ void moe_w4a16_grouped_gemm_ptrtable_impl(
 
     const unsigned int cta_m = m_start + cta_m_local;
     const unsigned int cta_n = blockIdx.x * N_TILE_PT;
+    // Hosts may launch ceil(N/64) grid.x against the 128-wide N tile; blocks
+    // fully past N gather, mma, and store nothing. Exit before smem init so the
+    // whole CTA skips uniformly — output is unchanged either way.
+    if (cta_n >= N) return;
 
     // Per-expert weight pointers from device tables
     const unsigned char* B_expert = (const unsigned char*)B_packed_ptrs[expert_id];

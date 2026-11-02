@@ -263,6 +263,18 @@ Invariants an agent must not violate:
 - **Report what you measured, separately from what you inferred.** A precise
   negative result is worth more than a confident guess.
 
+### Opt-in switches: a neutral result doesn't merge
+
+A new opt-in arm, whether an `ATLAS_*` env var, a flag, or an alternative kernel,
+merges only if its A/B shows a win. If it measures neutral or worse, post the
+numbers in the `[job]` issue, which is where the finding belongs, and close the
+PR. Main already reads hundreds of `ATLAS_*` variables, and each neutral arm
+adds code, kernel clones across symlinked targets, and a lever nobody flips.
+
+An arm that wins either becomes the default in the same PR, or states the
+measurement that will flip it. Fixes, correctness changes, and default-path
+wins are not affected by this rule.
+
 ### Authorship, and why we ask
 
 Atlas is an **AI-first codebase**, and the PR template's Authorship field is not

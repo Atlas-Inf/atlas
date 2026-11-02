@@ -325,3 +325,55 @@ fn padded_twin_stride_is_16_byte_aligned() {
         "expected exactly one padded-twin construction site in impl_a1.rs"
     );
 }
+
+/// Launcher/kernel ARITY pin for the GDN deferred-commit entries
+/// (`ATLAS_GDN_DEFERRED_COMMIT`): `gated_delta_rule_wy{K}` and
+/// `gated_delta_rule_wy{K}_defer` share the `gdn_decode_wyn` launcher by
+/// design (identical 18-param signature), and `gated_delta_rule_commit` is
+/// packed by `gdn_commit_accepted`. The `_defer` entry is macro-
+/// instantiated, so a broken macro never reaches nvcc until a GPU build —
+/// this is the CPU-side stand-in, like the ldb pin above.
+#[test]
+fn gdn_wyn_launcher_arg_count_matches_kernel_param_count() {
+    let launchers = include_str!("ssm_gdn_b.rs");
+    assert_eq!(
+        util::launcher_arg_count(launchers, "gdn_decode_wyn"),
+        Some(18),
+        "gdn_decode_wyn must pack 18 kernel args"
+    );
+    assert_eq!(
+        util::launcher_arg_count(launchers, "gdn_commit_accepted"),
+        Some(14),
+        "gdn_commit_accepted must pack 14 kernel args"
+    );
+
+    let mut checked = 0usize;
+    for p in &cu_files() {
+        let src = std::fs::read_to_string(p).unwrap();
+        // gb10 only: the strix-hip wyN is an independently-named port
+        // (17-param signature, no pointer-table form) with its own
+        // launchers — a different contract, not a divergence.
+        if !src.contains("gated_delta_rule_wyn_impl") || !util::rel(p).contains("gb10/") {
+            continue;
+        }
+        // Macro-instantiated entries: the literal name in each signature is
+        // `gated_delta_rule_wy##K` / `gated_delta_rule_wy##K##_defer`.
+        for (name, want) in [
+            ("gated_delta_rule_wy##K", 18),
+            ("gated_delta_rule_wy##K##_defer", 18),
+            ("gated_delta_rule_commit", 14),
+        ] {
+            let (sig, _) = util::kernel_sig_body(&src, name)
+                .unwrap_or_else(|| panic!("{}:: no `void {name}(` entry", util::rel(p)));
+            let n = util::param_count(&sig);
+            assert_eq!(
+                n,
+                want,
+                "{}::{name} compiles {n} params; its launcher packs {want}",
+                util::rel(p)
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 3, "only {checked} wyn entries checked");
+}

@@ -41,26 +41,17 @@ fn qkv_os_enabled() -> bool {
 
 impl Qwen3AttentionLayer {
     pub(super) fn ms_phase_qkv(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
-        let MultiSeqCtx {
-            fwd,
-            n,
-            stream,
-            h,
-            nq,
-            nkv,
-            hd,
-            eps,
-            bf16,
-            q_dim,
-            q_proj_dim,
-            q_proj_bytes,
-            per_seq_qkv,
-            normed,
-            qkv_buf,
-            ..
-        } = *c;
+        let MultiSeqCtx { fwd, n, eps, .. } = *c;
 
-        if n == 3
+        // ATLAS_QWEN4EXP_BATCH_FAST_BISECT: the sequential per-row arm.
+        if fwd.levers.batch_bisect(ops::BISECT_ATTN_PROJ) {
+            self.ms_qkv_seq_rows(c)?;
+        } else if self.ms_qkv_batch_mx8(c)? {
+            // Native MXFP8 (FP4-Local): `qkv_mx8.rs`.
+        } else if self.ms_qkv_exact4(c)? {
+            // qwen4_exp exact K=4 verify: serial decode's arithmetic per row
+            // (`qkv_exact4.rs`).
+        } else if n == 3
             && self.q_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
             && self.k_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
             && self.v_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
@@ -83,7 +74,9 @@ impl Qwen3AttentionLayer {
             self.ms_qkv_batchn(c)?;
         } else if (2..=16).contains(&n)
             && ((n <= 4 && self.w8a16_gemv_batch4_k.0 != 0)
-                || (n > 4 && self.w8a16_gemv_batch16_k.0 != 0))
+                || (n > 4
+                    && (self.w8a16_gemv_batch16_k.0 != 0
+                        || (n <= 8 && self.w8a16_gemv_batch8_k.0 != 0))))
             && self.q_weight.as_ref().and_then(|w| w.as_fp8()).is_some()
             && self.k_weight.as_ref().and_then(|w| w.as_fp8()).is_some()
             && self.v_weight.as_ref().and_then(|w| w.as_fp8()).is_some()
@@ -109,15 +102,7 @@ impl Qwen3AttentionLayer {
             // Never branch on the unpadded seqs.len() here.
             self.ms_qkv_batchm_bf16(c)?;
         } else {
-            for i in 0..n {
-                let normed_i = normed.offset(i * h * bf16);
-                let q_out_i = qkv_buf.offset(i * per_seq_qkv);
-                let k_out_i = q_out_i.offset(q_proj_bytes);
-                let v_out_i = k_out_i.offset((nkv * hd) as usize * bf16);
-
-                self.ms_qkv_seq_q(fwd, normed_i, q_out_i, q_proj_dim, q_dim, nq, hd, h, stream)?;
-                self.ms_qkv_seq_kv(fwd, normed_i, k_out_i, v_out_i, nkv, hd, h, stream)?;
-            }
+            self.ms_qkv_seq_rows(c)?;
         }
 
         // ── Per-request Q/K/V LoRA delta (batched bgmv), pre-norm. No-op when no
@@ -142,6 +127,36 @@ impl Qwen3AttentionLayer {
     /// True when q/k/v are plain dense BF16 — no NVFP4 and no FP8 sidecar — so
     /// the projection actually reads `self.attn.{q,k,v}_proj`. Laguna ships
     /// attention unquantized in the checkpoint and it stays that way.
+    /// Sequential per-token Q/K/V: each row through the single-row GEMVs.
+    fn ms_qkv_seq_rows(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
+        let MultiSeqCtx {
+            fwd,
+            n,
+            stream,
+            h,
+            nq,
+            nkv,
+            hd,
+            bf16,
+            q_dim,
+            q_proj_dim,
+            q_proj_bytes,
+            per_seq_qkv,
+            normed,
+            qkv_buf,
+            ..
+        } = *c;
+        for i in 0..n {
+            let normed_i = normed.offset(i * h * bf16);
+            let q_out_i = qkv_buf.offset(i * per_seq_qkv);
+            let k_out_i = q_out_i.offset(q_proj_bytes);
+            let v_out_i = k_out_i.offset((nkv * hd) as usize * bf16);
+            self.ms_qkv_seq_q(fwd, normed_i, q_out_i, q_proj_dim, q_dim, nq, hd, h, stream)?;
+            self.ms_qkv_seq_kv(fwd, normed_i, k_out_i, v_out_i, nkv, hd, h, stream)?;
+        }
+        Ok(())
+    }
+
     fn qkv_is_dense_bf16(&self) -> bool {
         let dense = |w: &Option<crate::weight_map::QuantWeight>| {
             w.as_ref()
@@ -208,7 +223,7 @@ impl Qwen3AttentionLayer {
         Ok(())
     }
 
-    fn q_lora_active(&self) -> bool {
+    pub(super) fn q_lora_active(&self) -> bool {
         self.lora.as_ref().and_then(|lw| lw.q.as_ref()).is_some()
     }
 
@@ -313,7 +328,8 @@ impl Qwen3AttentionLayer {
     /// Shared q/k RMS-norm pass over the per-seq `qkv_buf` regions. Extracted
     /// so all projection branches (seq / batch2 / batch3 / batchn) defer norms
     /// to one place, after the pre-norm K/V LoRA delta.
-    fn ms_qkv_norms(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
+    // Ported from Enntity/atlas 73c19db (AGPL-3.0-only).
+    pub(super) fn ms_qkv_norms(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
         let MultiSeqCtx {
             fwd,
             n,
@@ -468,17 +484,8 @@ impl Qwen3AttentionLayer {
         let kv_bytes = kv_dim as usize * bf16;
         let k_scratch = fwd.buffers.attn_output();
         let v_scratch = k_scratch.offset(3 * kv_bytes);
-        ops::w4a16_gemv_dual_batch3(
-            fwd.gpu,
-            self.w4a16_gemv_dual_batch3_k,
-            normed,
-            k_nvfp4,
-            k_scratch,
-            v_nvfp4,
-            v_scratch,
-            kv_dim,
-            h as u32,
-            stream,
+        self.ms_kv_batch3(
+            fwd, normed, k_nvfp4, k_scratch, v_nvfp4, v_scratch, kv_dim, h, stream,
         )?;
 
         for i in 0..3usize {
@@ -501,6 +508,102 @@ impl Qwen3AttentionLayer {
         // delta in `ms_phase_qkv`).
         let _ = (nq, eps);
         Ok(())
+    }
+
+    /// The K and V projections of a 2-row NVFP4 step, one weight pass each.
+    ///
+    /// `w4a16_gemv_dual_batch2` reads both weights in one launch, but it is
+    /// not the arithmetic serial decode's `w4a16_gemv_dual` runs (K split
+    /// across lanes differently, scale applied per element instead of per
+    /// block): ~1 output in 1000 differs by a BF16 ULP, and that K/V is
+    /// written to the cache serial decode reads afterwards. Under
+    /// `ATLAS_QWEN4EXP_EXACT_VERIFY` each projection takes
+    /// `w4a16_gemv_batch2` instead, whose rows are byte-identical to
+    /// `w4a16_gemv`, i.e. to `w4a16_gemv_dual` per projection
+    /// (`scripts/dev/qwen4exp_exact_verify_bench.cu`; +5 us a layer on GB10).
+    #[allow(clippy::too_many_arguments)]
+    fn ms_kv_batch2(
+        &self,
+        fwd: &crate::layer::ForwardContext<'_>,
+        normed: spark_runtime::gpu::DevicePtr,
+        k_nvfp4: &crate::weight_map::QuantizedWeight,
+        k_out: spark_runtime::gpu::DevicePtr,
+        v_nvfp4: &crate::weight_map::QuantizedWeight,
+        v_out: spark_runtime::gpu::DevicePtr,
+        kv_dim: u32,
+        h: usize,
+        stream: u64,
+    ) -> Result<()> {
+        if fwd.levers.qwen4exp_exact_verify || fwd.levers.qwen4exp_batch_fast {
+            for (w, out) in [(k_nvfp4, k_out), (v_nvfp4, v_out)] {
+                ops::w4a16_gemv_batch2(
+                    fwd.gpu,
+                    self.w4a16_gemv_batch2_k,
+                    normed,
+                    w,
+                    out,
+                    kv_dim,
+                    h as u32,
+                    stream,
+                )?;
+            }
+            return Ok(());
+        }
+        ops::w4a16_gemv_dual_batch2(
+            fwd.gpu,
+            self.w4a16_gemv_dual_batch2_k,
+            normed,
+            k_nvfp4,
+            k_out,
+            v_nvfp4,
+            v_out,
+            kv_dim,
+            h as u32,
+            stream,
+        )
+    }
+
+    /// [`Self::ms_kv_batch2`] at 3 rows.
+    #[allow(clippy::too_many_arguments)]
+    fn ms_kv_batch3(
+        &self,
+        fwd: &crate::layer::ForwardContext<'_>,
+        normed: spark_runtime::gpu::DevicePtr,
+        k_nvfp4: &crate::weight_map::QuantizedWeight,
+        k_out: spark_runtime::gpu::DevicePtr,
+        v_nvfp4: &crate::weight_map::QuantizedWeight,
+        v_out: spark_runtime::gpu::DevicePtr,
+        kv_dim: u32,
+        h: usize,
+        stream: u64,
+    ) -> Result<()> {
+        if fwd.levers.qwen4exp_exact_verify || fwd.levers.qwen4exp_batch_fast {
+            for (w, out) in [(k_nvfp4, k_out), (v_nvfp4, v_out)] {
+                ops::w4a16_gemv_batch3(
+                    fwd.gpu,
+                    self.w4a16_gemv_batch3_k,
+                    normed,
+                    w,
+                    out,
+                    kv_dim,
+                    h as u32,
+                    stream,
+                )?;
+            }
+            return Ok(());
+        }
+        ops::w4a16_gemv_dual_batch3(
+            fwd.gpu,
+            self.w4a16_gemv_dual_batch3_k,
+            normed,
+            k_nvfp4,
+            k_out,
+            v_nvfp4,
+            v_out,
+            kv_dim,
+            h as u32,
+            stream,
+        )
     }
 
     /// n=2 NVFP4 batched path.
@@ -558,17 +661,8 @@ impl Qwen3AttentionLayer {
         let kv_bytes = kv_dim as usize * bf16;
         let k_scratch = fwd.buffers.attn_output();
         let v_scratch = k_scratch.offset(2 * kv_bytes);
-        ops::w4a16_gemv_dual_batch2(
-            fwd.gpu,
-            self.w4a16_gemv_dual_batch2_k,
-            normed,
-            k_nvfp4,
-            k_scratch,
-            v_nvfp4,
-            v_scratch,
-            kv_dim,
-            h as u32,
-            stream,
+        self.ms_kv_batch2(
+            fwd, normed, k_nvfp4, k_scratch, v_nvfp4, v_scratch, kv_dim, h, stream,
         )?;
 
         for i in 0..2usize {
@@ -629,6 +723,39 @@ impl Qwen3AttentionLayer {
         // same weight-streaming bandwidth, no M>4 cliff). m=9..16 (batched
         // DFlash verify) falls back to `w4a16_gemv_batch16`; the family caps
         // there, so wider verifies (DFlash γ=16, M=17) keep the GEMM.
+        // ATLAS_QWEN4EXP_BATCH_FAST past the widest GEMV tier: 16 rows a
+        // launch of the same exact template rather than the tile GEMM.
+        // ATLAS_QWEN4EXP_W4_ROWS_WIDE: past 8 rows, one exact wide launch
+        // (falls back to the chunking below on its own if it cannot launch).
+        if c.fwd.levers.qwen4exp_batch_fast && self.wide_rows.w4_wide_serves(m, k) {
+            return self.wide_rows.w4a16_rows(
+                gpu,
+                &self.w4a16_batchm,
+                input,
+                w_base,
+                output,
+                (m, n, k),
+                stream,
+            );
+        }
+        if c.fwd.levers.qwen4exp_batch_fast && m > 16 && self.w4a16_gemv_batch16_k.0 != 0 {
+            let (in_row, out_row) = (k as usize * 2, n as usize * 2);
+            for first in (0..m).step_by(16) {
+                let rows = (m - first).min(16);
+                ops::w4a16_gemv_batchm(
+                    gpu,
+                    self.w4a16_gemv_batch16_k,
+                    input.offset(first as usize * in_row),
+                    w_base,
+                    output.offset(first as usize * out_row),
+                    rows,
+                    n,
+                    k,
+                    stream,
+                )?;
+            }
+            return Ok(());
+        }
         let mut batchm = self.w4a16_batchm.kernel(m);
         if batchm.0 == 0 && m <= 16 {
             batchm = self.w4a16_gemv_batch16_k;
@@ -636,88 +763,10 @@ impl Qwen3AttentionLayer {
         if batchm.0 != 0 {
             return ops::w4a16_gemv_batchm(gpu, batchm, input, w_base, output, m, n, k, stream);
         }
-        if let Some(wt) = w_t {
-            // Small-M routing (w4a16_m17_bench): at M<=64 the M64-tile
-            // `w4a16_gemm_t` beats the M128-tile kernels (87% of an M128
-            // tile is padding at M=17), and `w4a16_gemm_t_k64` wins deep-K
-            // shapes. Mirrors dense_ffn::w4a16_prefill_gemm; same
-            // ATLAS_FFN_SMALLM=0 kill-switch.
-            // The `OnceLock<bool>` static that lived here is now a field on
-            // `layers::ops::ModelLevers` — resolved when the model is built and carried
-            // on `ForwardContext`, because a static outlives the model whose flags it
-            // encodes.
-            if m <= 64 && k.is_multiple_of(32) && c.fwd.levers.ffn_small_m {
-                if k >= crate::layers::w4a16_k64_min_k()
-                    && k.is_multiple_of(64)
-                    && self.w4a16_gemm_t_k64_k.0 != 0
-                {
-                    // Narrow-N deep-K twin: bit-identical, and 1.42x at the
-                    // o_proj shape (N=5120, K=6144 -> 40 CTAs on 48 SMs).
-                    if self.w4a16_gemm_t_k64_n64_k.0 != 0 && crate::layers::k64_n64_wins(m, n) {
-                        return ops::w4a16_gemm(
-                            gpu,
-                            self.w4a16_gemm_t_k64_n64_k,
-                            input,
-                            wt,
-                            output,
-                            m,
-                            n,
-                            k,
-                            stream,
-                        );
-                    }
-                    return ops::w4a16_gemm_n128(
-                        gpu,
-                        self.w4a16_gemm_t_k64_k,
-                        input,
-                        wt,
-                        output,
-                        m,
-                        n,
-                        k,
-                        stream,
-                    );
-                }
-                if self.w4a16_gemm_t_k.0 != 0 {
-                    return ops::w4a16_gemm_n128(
-                        gpu,
-                        self.w4a16_gemm_t_k,
-                        input,
-                        wt,
-                        output,
-                        m,
-                        n,
-                        k,
-                        stream,
-                    );
-                }
-            }
-            if self.w4a16_gemm_t_m128_v2_k.0 != 0 {
-                return ops::w4a16_gemm_n128_m128_v2(
-                    gpu,
-                    self.w4a16_gemm_t_m128_v2_k,
-                    input,
-                    wt,
-                    output,
-                    m,
-                    n,
-                    k,
-                    stream,
-                );
-            }
-            if self.w4a16_gemm_t_m128_k.0 != 0 {
-                return ops::w4a16_gemm_n128_m128(
-                    gpu,
-                    self.w4a16_gemm_t_m128_k,
-                    input,
-                    wt,
-                    output,
-                    m,
-                    n,
-                    k,
-                    stream,
-                );
-            }
+        if let Some(wt) = w_t
+            && self.transposed_verify_gemm(c, input, wt, output, m, n, k)?
+        {
+            return Ok(());
         }
         ops::w4a16_gemm(
             gpu,
@@ -730,6 +779,114 @@ impl Qwen3AttentionLayer {
             k,
             stream,
         )
+    }
+
+    /// The transposed-layout (`w4a16_gemm_t*`) arms of
+    /// [`Self::wide_verify_gemm`]. `Ok(false)` when no transposed kernel
+    /// applies; the caller picks the fallback. The fused [q|k|v] twin
+    /// exists ONLY in this layout, so `ms_qkv_batchn` dispatches it here
+    /// directly and it can never reach a base-weight arm (GEMV / DP4A /
+    /// base GEMM), which would read q_proj at the fused N.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn transposed_verify_gemm(
+        &self,
+        c: &MultiSeqCtx<'_>,
+        input: spark_runtime::gpu::DevicePtr,
+        wt: &crate::weight_map::QuantizedWeight,
+        output: spark_runtime::gpu::DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<bool> {
+        let gpu = c.fwd.gpu;
+        let stream = c.stream;
+        // Small-M routing (w4a16_m17_bench): at M<=64 the M64-tile
+        // `w4a16_gemm_t` beats the M128-tile kernels (87% of an M128
+        // tile is padding at M=17), and `w4a16_gemm_t_k64` wins deep-K
+        // shapes. Mirrors dense_ffn::w4a16_prefill_gemm; same
+        // ATLAS_FFN_SMALLM=0 kill-switch.
+        // The `OnceLock<bool>` static that lived here is now a field on
+        // `layers::ops::ModelLevers` — resolved when the model is built and carried
+        // on `ForwardContext`, because a static outlives the model whose flags it
+        // encodes.
+        if m <= 64 && k.is_multiple_of(32) && c.fwd.levers.ffn_small_m {
+            if k >= crate::layers::w4a16_k64_min_k()
+                && k.is_multiple_of(64)
+                && self.w4a16_gemm_t_k64_k.0 != 0
+            {
+                // Narrow-N deep-K twin: bit-identical, and 1.42x at the
+                // o_proj shape (N=5120, K=6144 -> 40 CTAs on 48 SMs).
+                if self.w4a16_gemm_t_k64_n64_k.0 != 0 && crate::layers::k64_n64_wins(m, n) {
+                    return ops::w4a16_gemm(
+                        gpu,
+                        self.w4a16_gemm_t_k64_n64_k,
+                        input,
+                        wt,
+                        output,
+                        m,
+                        n,
+                        k,
+                        stream,
+                    )
+                    .map(|()| true);
+                }
+                return ops::w4a16_gemm_n128(
+                    gpu,
+                    self.w4a16_gemm_t_k64_k,
+                    input,
+                    wt,
+                    output,
+                    m,
+                    n,
+                    k,
+                    stream,
+                )
+                .map(|()| true);
+            }
+            if self.w4a16_gemm_t_k.0 != 0 {
+                return ops::w4a16_gemm_n128(
+                    gpu,
+                    self.w4a16_gemm_t_k,
+                    input,
+                    wt,
+                    output,
+                    m,
+                    n,
+                    k,
+                    stream,
+                )
+                .map(|()| true);
+            }
+        }
+        if self.w4a16_gemm_t_m128_v2_k.0 != 0 {
+            return ops::w4a16_gemm_n128_m128_v2(
+                gpu,
+                self.w4a16_gemm_t_m128_v2_k,
+                input,
+                wt,
+                output,
+                m,
+                n,
+                k,
+                stream,
+            )
+            .map(|()| true);
+        }
+        if self.w4a16_gemm_t_m128_k.0 != 0 {
+            return ops::w4a16_gemm_n128_m128(
+                gpu,
+                self.w4a16_gemm_t_m128_k,
+                input,
+                wt,
+                output,
+                m,
+                n,
+                k,
+                stream,
+            )
+            .map(|()| true);
+        }
+        Ok(false)
     }
 
     /// Wide-verify (n>3) NVFP4 batched QKV. Reads each of Q/K/V ONCE for all
@@ -772,12 +929,34 @@ impl Qwen3AttentionLayer {
         // q/k/v share one `weight_scale_2`.
         // Kill switch: ATLAS_NO_FUSED_QKV=1.
         let fused_n = q_proj_dim as usize + 2 * kv_dim_e;
-        // n > 8 is REQUIRED, not an optimisation: `wide_verify_gemm` early-returns
-        // on the batched-GEMV arms for m <= 8 using the BASE (non-transposed)
-        // weight and ignoring `w_t` entirely, so a fused N would read past the
-        // q_proj weight. Only at m > 8 is the transposed tile GEMM guaranteed.
+        // The fused twin exists only in the TRANSPOSED tile-GEMM layout, so
+        // it dispatches to `transposed_verify_gemm` directly and can never
+        // reach `wide_verify_gemm`'s base-weight arms — d6e1a9212 widened
+        // that GEMV arm to m<=16 while this arm was gated at n>8, so
+        // n=9..16 ran batch16 over q_proj at the fused N and read past it.
+        // n>8 is now purely a routing choice (n<=8 prefers the strided `_os`
+        // GEMVs). `use_fused` records whether the fused GEMM launched; when
+        // no transposed kernel resolved, the three separate projections run.
         // n varies as sequences finish, so this is hit at every concurrency.
-        let use_fused = fused_qkv_enabled() && self.qkv_nvfp4_t.is_some() && n > 8;
+        // per_seq_qkv == q_proj_bytes + 2*kv_bytes == fused_n*bf16, so the
+        // fused GEMM's [n, fused_n] output IS the qkv_buf layout byte for
+        // byte. Write straight into it and skip the scatter entirely —
+        // that removes 3 GEMMs AND 48 D2D copies per attention layer.
+        // ATLAS_QWEN4EXP_BATCH_FAST: the tile GEMM is not the GEMV's
+        // arithmetic; wide batches keep the exact GEMV tiers instead.
+        let use_fused = match self.qkv_nvfp4_t.as_ref() {
+            Some(qkv_t) if fused_qkv_enabled() && n > 8 && !fwd.levers.qwen4exp_batch_fast => self
+                .transposed_verify_gemm(
+                    c,
+                    normed,
+                    qkv_t,
+                    qkv_buf,
+                    n as u32,
+                    fused_n as u32,
+                    h as u32,
+                )?,
+            _ => false,
+        };
 
         // STRIDED-WRITE arm (n in 4..=8): the `*_os` GEMV variants write row
         // t at `C[t*C_stride + col]`, so each projection lands straight in
@@ -808,22 +987,7 @@ impl Qwen3AttentionLayer {
             } else {
                 os_gemv.0 != 0
             };
-        if use_fused {
-            // per_seq_qkv == q_proj_bytes + 2*kv_bytes == fused_n*bf16, so the
-            // fused GEMM's [n, fused_n] output IS the qkv_buf layout byte for
-            // byte. Write straight into it and skip the scatter entirely —
-            // that removes 3 GEMMs AND 48 D2D copies per attention layer.
-            self.wide_verify_gemm(
-                c,
-                normed,
-                q_nvfp4,
-                self.qkv_nvfp4_t.as_ref(),
-                qkv_buf,
-                n as u32,
-                fused_n as u32,
-                h as u32,
-            )?;
-        } else if use_os && dp4a_ready {
+        if use_os && dp4a_ready {
             self.dp4a_quant_input(c, normed, n as u32, h as u32)?;
             self.dp4a_gemv_prequant_os(
                 c, q_nvfp4, qkv_buf, n as u32, q_proj_dim, h as u32, os_stride,
@@ -855,7 +1019,7 @@ impl Qwen3AttentionLayer {
             gemv(q_nvfp4, qkv_buf, q_proj_dim)?;
             gemv(k_nvfp4, qkv_buf.offset(q_proj_bytes), kv_dim)?;
             gemv(v_nvfp4, qkv_buf.offset(q_proj_bytes + kv_bytes), kv_dim)?;
-        } else {
+        } else if !use_fused {
             self.wide_verify_gemm(
                 c,
                 normed,
@@ -944,7 +1108,7 @@ impl Qwen3AttentionLayer {
 
     /// Sequential per-token Q projection (handles gated and ungated).
     #[allow(clippy::too_many_arguments)]
-    fn ms_qkv_seq_q(
+    pub(super) fn ms_qkv_seq_q(
         &self,
         fwd: &crate::layer::ForwardContext<'_>,
         normed_i: spark_runtime::gpu::DevicePtr,
@@ -1089,7 +1253,7 @@ impl Qwen3AttentionLayer {
 
     /// Sequential per-token K + V projections.
     #[allow(clippy::too_many_arguments)]
-    fn ms_qkv_seq_kv(
+    pub(super) fn ms_qkv_seq_kv(
         &self,
         fwd: &crate::layer::ForwardContext<'_>,
         normed_i: spark_runtime::gpu::DevicePtr,

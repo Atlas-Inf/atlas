@@ -57,7 +57,6 @@ impl TransformerModel {
 
         let h = self.config.hidden_size;
         let v = self.config.vocab_size;
-        let eps = self.config.rms_norm_eps as f32;
         let elem = 2usize; // BF16 hidden rows (matches finalize_last)
         let hidden = self.buffers.hidden_states();
 
@@ -71,26 +70,21 @@ impl TransformerModel {
         }
 
         let mut host = vec![0u8; BATCH_ROWS * v * 2];
+        // ATLAS_GLM_DET_TRACE: one hash over every scored row's logits.
+        let mut det = crate::det_trace::on().then(crate::det_trace::Hasher::new);
         let mut start = 0usize;
         while start < rows_to_score {
             let count = (rows_to_score - start).min(BATCH_ROWS);
             let batch_hidden = hidden.offset((start) * h * elem);
             let normed = self.buffers.norm_output();
-            ops::rms_norm(
-                self.gpu.as_ref(),
-                self.rms_norm_kernel,
-                batch_hidden,
-                &self.final_norm,
-                normed,
-                count as u32,
-                h as u32,
-                eps,
-                stream,
-            )?;
+            self.final_norm_rows(batch_hidden, normed, count as u32, stream)?;
             self.lm_head_batched(normed, count as u32, self.buffers.logits(), stream)?;
             self.gpu.synchronize(stream)?;
             let bytes = &mut host[..count * v * 2];
             self.gpu.copy_d2h(self.buffers.logits(), bytes)?;
+            if let Some(det) = det.as_mut() {
+                det.update(bytes);
+            }
             for j in 0..count {
                 let target = tokens[chunk_start + start + j + 1];
                 let row = &bytes[j * v * 2..(j + 1) * v * 2];
@@ -98,6 +92,10 @@ impl TransformerModel {
                     .push(extract_bf16(row, target, k as usize, v));
             }
             start += count;
+        }
+        if let Some(det) = det {
+            let scored = (0, rows_to_score);
+            crate::det_trace::tap_hashed("plogits", scored, rows_to_score * v * 2, det.finish());
         }
         Ok(())
     }

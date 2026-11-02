@@ -1,0 +1,194 @@
+{
+  "date_utc": "2026-10-10",
+  "upstream_engine": "f2b805e73d36a7e5527622e24f2f8199052e01e6",
+  "native_source": "919adb4fa4c632f0d5fd8c9d40f95743c3115e25",
+  "binary_sha256": "e6c6e33324a99412c4f1bf8105ccf3dd52588ad430f4817c7cf568f48ab60c5c",
+  "hosts": {
+    "count": 2,
+    "gpu": "GB10",
+    "driver": "580.126.09",
+    "cuda": "13.0.88",
+    "rust": "1.93.1"
+  },
+  "configuration": {
+    "target": "NVIDIA GLM-5.3-Flash-NVFP4",
+    "draft": "IncoAI GLM-5.3-Flash-DFlash2",
+    "tp": 2,
+    "ep": 2,
+    "sequence_slots": 4,
+    "session_limit": 32768,
+    "logical_kv_blocks": 8192,
+    "block_size": 16,
+    "aggregate_token_capacity": 131072,
+    "kv_dtype": "fp8_g128",
+    "kda_state_dtype": "f32",
+    "pdl": false,
+    "decode_gemv_batch": false,
+    "kv_sharding": true,
+    "canonical_verify": true,
+    "persistent_moe": true,
+    "prompt_copy_drafts": true,
+    "tracing": false,
+    "display_carveout": false,
+    "prefix_caching": false,
+    "swap_gb": 0,
+    "oom_guard_mib": 12288
+  },
+  "cpu_checks": [
+    "workspace tests",
+    "workspace clippy --tests",
+    "format",
+    "rustdoc",
+    "typos",
+    "license headers",
+    "kernel shadows",
+    "file-size policy",
+    "git diff --check"
+  ],
+  "gpu_tests": [
+    {
+      "filter": "canonical_prefill_chain_needs_no_host_barriers",
+      "exit_code": 0,
+      "elapsed_s": 0.8809603420086205,
+      "passed": true
+    },
+    {
+      "filter": "canonical_w4a16_rows_do_not_depend_on_the_width",
+      "exit_code": 0,
+      "elapsed_s": 1.0962039430160075,
+      "passed": true
+    },
+    {
+      "filter": "canonical_dense_rows_do_not_depend_on_the_width",
+      "exit_code": 0,
+      "elapsed_s": 0.7387681700056419,
+      "passed": true
+    },
+    {
+      "filter": "kda_commit_layer_batched_byte_identical",
+      "exit_code": 0,
+      "elapsed_s": 0.8178166979923844,
+      "passed": true
+    },
+    {
+      "filter": "persistent_twins_match_the_grid_twins",
+      "exit_code": 0,
+      "elapsed_s": 6.955489109968767,
+      "passed": true
+    },
+    {
+      "filter": "persistent_rows_do_not_depend_on_the_batch",
+      "exit_code": 0,
+      "elapsed_s": 1.3440272770239972,
+      "passed": true
+    },
+    {
+      "filter": "canonical_matches_the_shard_bitwise",
+      "exit_code": 0,
+      "elapsed_s": 6.574615858960897,
+      "passed": true
+    },
+    {
+      "filter": "canonical_and_shard_are_history_free",
+      "exit_code": 0,
+      "elapsed_s": 26.109389988007024,
+      "passed": true
+    },
+    {
+      "filter": "a_row_does_not_depend_on_the_rows_beside_it",
+      "exit_code": 0,
+      "elapsed_s": 4.889233578986023,
+      "passed": true
+    },
+    {
+      "filter": "canonical_dense_chains_need_no_host_barriers",
+      "exit_code": 0,
+      "elapsed_s": 1.011959340015892,
+      "passed": true
+    },
+    {
+      "filter": "persistent_moe_chain_needs_no_host_barriers",
+      "exit_code": 0,
+      "elapsed_s": 35.550029890961014,
+      "passed": true
+    }
+  ],
+  "model_checks": {
+    "arithmetic": {
+      "input_tokens": 27,
+      "answer": "391",
+      "passed": true
+    },
+    "concurrency": {
+      "requests": 12,
+      "completed": 12,
+      "c1_equals_c4": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "c4_repeat_matches": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "single_stream_cases": [
+        {
+          "prompt": "What is 17 times 23? Reply with only the number.",
+          "message": {
+            "role": "assistant",
+            "reasoning_content": "17*23=391",
+            "content": "391"
+          }
+        },
+        {
+          "prompt": "Extract the city and code from this record: city Oslo; code Q7. Return only a JSON object.",
+          "message": {
+            "role": "assistant",
+            "reasoning_content": "Simple.",
+            "content": "```json\n{\"city\": \"Oslo\", \"code\": \"Q7\"}\n```"
+          }
+        },
+        {
+          "prompt": "A bus leaves at 14:35 and takes 1 hour 50 minutes. A connecting train leaves at 16:40 and takes 35 minutes. Same day, same time zone, no delays. State the final arrival time and the waiting time in one sentence.",
+          "message": {
+            "role": "assistant",
+            "reasoning_content": "Bus arrives 16:25, wait 15 min, train arrives 17:15.",
+            "content": "The bus arrives at 16:25, you wait 15 minutes for the train, and the train arrives at 17:15."
+          }
+        },
+        {
+          "prompt": "In 70 to 100 words, explain why a backup should be tested by restoring a file. Use a practical example. Avoid headings.",
+          "message": {
+            "role": "assistant",
+            "content": "A backup is only useful if it can actually be restored, and many backups fail silently due to corruption, misconfiguration, or incomplete data. Testing by restoring a file verifies the entire chain: the backup exists, the media is readable, the software works, and the data is intact. For example, a business might back up its accounting database nightly, but when a server crashes, they discover the backups were saving empty files due to a broken connection. Had they tested by restoring a file monthly, they would have caught the problem early and avoided losing critical financial records."
+          }
+        }
+      ]
+    },
+    "retrieval": {
+      "input_tokens": 18658,
+      "output_tokens": 80,
+      "records": 4,
+      "recovered": 4,
+      "exact_mapping": {
+        "LARK": "brass-orchid-7319",
+        "FERN": "cobalt-harbor-4826",
+        "IBIS": "velvet-spruce-9054",
+        "REED": "amber-quartz-2671"
+      },
+      "request_sha256": "3e429ac8707f7f2d95a7f673b3db331dbde077327a89040d9e0f49f00d2c047d",
+      "elapsed_s": 9.578600935055874
+    }
+  },
+  "limits": [
+    "Dependent launch produced nonfinite prefill values in the two-machine configuration; its cause remains unresolved. It is disabled in the candidate profile.",
+    "PDL-enabled isolated GPU tests do not qualify PDL-enabled full-model serving.",
+    "No RC2 throughput comparison or million-token accuracy/capacity qualification.",
+    "Display carveout and sharded disk prefix-cache runtime round trips were not exercised on this pair.",
+    "No new RC2 Docker image or other-model GPU matrix qualification; rebuild image before opening the PR.",
+    "Concurrency identity is within this native build, not cross-engine output parity."
+  ]
+}

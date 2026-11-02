@@ -80,6 +80,23 @@ pub fn qsa_score_rows_exact(
     hd: u32,
     stream: u64,
 ) -> Result<()> {
+    // ATLAS_QWEN4EXP_PREFILL_QSA_SCORE: the same scores, byte for byte.
+    if super::qwen4exp_prefill::try_qsa_score_v4(
+        gpu,
+        [q, block_keys, scores],
+        [
+            rows,
+            n_blocks_max,
+            first_pos,
+            score_stride,
+            ratio,
+            n_heads,
+            hd,
+        ],
+        stream,
+    )? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([
             rows.div_ceil(QSA_SE_BM),

@@ -222,9 +222,9 @@ impl Model for MockModel {
         Ok(())
     }
 
-    fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<()> {
+    fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<bool> {
         seq.slot_idx = new_slot;
-        Ok(())
+        Ok(true)
     }
 
     fn detach_slot_for_reuse(&self, seq: &mut SequenceState) {

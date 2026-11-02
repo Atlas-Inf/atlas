@@ -127,6 +127,14 @@ pub enum QuantWeight {
     /// 2-bit resident. Decode dispatches `q2_0_gemv_vec`; prefill transient-
     /// dequants to BF16 then runs `dense_gemm`. Tier-1c attention path.
     PackedQ2(PackedQ2Weight),
+
+    /// EXL3 trellis (mul1 codebook). Reconstruct + GEMM lands in M3.
+    Exl3(super::exl3::Exl3Weight),
+
+    /// MXFP8 as the checkpoint ships it (E4M3 + E8M0 per 32 inputs).
+    /// Kernels: `mxfp8_proj.cu` through `ops::mxfp8_proj`, which needs a
+    /// scratch for prefill, so the generic `quant_gemv`/`quant_gemm` refuse it.
+    Mxfp8(super::Mxfp8Proj),
 }
 
 impl QuantWeight {
@@ -142,6 +150,8 @@ impl QuantWeight {
             Self::Fp8(w) => w.weight.is_null(),
             Self::Dense(w) => w.weight.is_null(),
             Self::PackedQ2(w) => w.is_null(),
+            Self::Exl3(w) => w.is_null(),
+            Self::Mxfp8(p) => p.w.data.is_null(),
         }
     }
 
@@ -149,6 +159,22 @@ impl QuantWeight {
     pub fn as_packed_q2(&self) -> Option<&PackedQ2Weight> {
         match self {
             Self::PackedQ2(w) => Some(w),
+            _ => None,
+        }
+    }
+
+    /// Extract as EXL3, if this weight is that variant.
+    pub fn as_exl3(&self) -> Option<&super::exl3::Exl3Weight> {
+        match self {
+            Self::Exl3(w) => Some(w),
+            _ => None,
+        }
+    }
+
+    /// Extract as MXFP8, if this weight is that variant.
+    pub fn as_mxfp8(&self) -> Option<&super::Mxfp8Proj> {
+        match self {
+            Self::Mxfp8(p) => Some(p),
             _ => None,
         }
     }
@@ -199,6 +225,12 @@ impl From<DenseWeight> for QuantWeight {
 impl From<PackedQ2Weight> for QuantWeight {
     fn from(w: PackedQ2Weight) -> Self {
         Self::PackedQ2(w)
+    }
+}
+
+impl From<super::exl3::Exl3Weight> for QuantWeight {
+    fn from(w: super::exl3::Exl3Weight) -> Self {
+        Self::Exl3(w)
     }
 }
 

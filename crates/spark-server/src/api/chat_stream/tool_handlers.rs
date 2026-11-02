@@ -8,19 +8,35 @@
 use crate::ir::StreamDelta;
 use crate::tool_parser;
 
-use super::super::stream_guards::{bump_f12_tool_call_count, flush_content_sanitizer};
+use super::super::stream_guards::{
+    bump_f12_tool_call_count, flush_content_sanitizer_with_literal_state,
+};
 use super::ctx::StreamCtx;
 use super::state::{PendingRetry, StreamState};
 
 type DeltaVec = Vec<StreamDelta>;
 
+/// Whether this stream holds a tool call's deltas until the call validates:
+/// under tool retry, and for Poolside v1, whose detector buffers a call's
+/// arguments until `</tool_call>` anyway. Holding its header too means the
+/// client never sees a call start that the blocking path would not return:
+/// an unregistered name (rejected at validation) or an envelope the response
+/// cuts off before `</tool_call>` (never validated, so never flushed).
+fn holds_tool_deltas(state: &StreamState, ctx: &StreamCtx) -> bool {
+    ctx.state.tool_guard.enabled
+        || ctx.tool_retry_enabled
+        || state
+            .detector
+            .as_ref()
+            .is_some_and(|d| d.promotes_bare_names())
+}
+
 /// Tier 5c (2026-05-26): emit `delta` to either the client stream OR a
-/// per-tool-call-index buffer in `StreamState`. When tool retry is
-/// enabled we hold all tool_call deltas until `handle_tool_call_delta`
+/// per-tool-call-index buffer in `StreamState`. When the stream holds tool
+/// deltas ([`holds_tool_deltas`]) they wait until `handle_tool_call_delta`
 /// runs validation; on pass the buffered deltas flush to the client, on
-/// fail they're discarded and the retry fires at `handle_done`. When
-/// tool retry is disabled this is a direct emit (preserves the existing
-/// real-time streaming behaviour).
+/// fail they're discarded. Otherwise this is a direct emit (real-time
+/// streaming).
 fn emit_or_buffer_tool_delta(
     state: &mut StreamState,
     ctx: &StreamCtx,
@@ -28,12 +44,19 @@ fn emit_or_buffer_tool_delta(
     delta: StreamDelta,
     deltas: &mut DeltaVec,
 ) {
-    if ctx.tool_retry_enabled {
-        state
-            .buffered_tool_chunks
-            .entry(idx)
-            .or_default()
-            .push(delta);
+    if holds_tool_deltas(state, ctx) {
+        // The guard inspects the completed JSON, so buffer the args as one
+        // string rather than a fragment run.
+        let chunks = state.buffered_tool_chunks.entry(idx).or_default();
+        if let StreamDelta::ToolCallArgs { fragment, .. } = &delta
+            && let Some(StreamDelta::ToolCallArgs {
+                fragment: previous, ..
+            }) = chunks.last_mut()
+        {
+            previous.push_str(fragment);
+        } else {
+            chunks.push(delta);
+        }
     } else {
         deltas.push(delta);
     }
@@ -62,9 +85,10 @@ pub(super) fn handle_complete_tool_call(
     deltas: &mut DeltaVec,
 ) {
     // Content → Tool boundary: flush sanitiser tail.
-    let pre_tool_tail = flush_content_sanitizer(
+    let pre_tool_tail = flush_content_sanitizer_with_literal_state(
         &mut state.tag_scan_buf,
         &mut state.suppressing_param_leak,
+        &mut state.literal_xml_state,
         &ctx.leak_markers,
     );
     if !pre_tool_tail.is_empty() {
@@ -73,12 +97,21 @@ pub(super) fn handle_complete_tool_call(
             token_ids: state.take_ids_if(ctx.req_return_token_ids),
         });
     }
-    tool_parser::backfill_required_params(std::slice::from_mut(tc), &ctx.tool_defs_for_backfill);
+    // `--reference-mode`: never invent arguments the model did not emit.
+    if !ctx.state.reference_mode {
+        tool_parser::backfill_required_params(
+            std::slice::from_mut(tc),
+            &ctx.tool_defs_for_backfill,
+        );
+    }
     if ctx.wants_typed_arguments {
         tool_parser::coerce_all(std::slice::from_mut(tc), &ctx.tool_defs_for_backfill);
     }
     if let Some(ref cwd) = ctx.cwd_for_normalize {
         tool_parser::normalize_paths(std::slice::from_mut(tc), cwd);
+    }
+    if super::tool_security::check(state, ctx, &tc.function.arguments) {
+        return;
     }
     // Typed severity (was a fragile `contains("non-empty")` sniff): soft =
     // MissingParam (2026-07-03 ST-collapse class) + EmptyRequired (2026-05-25
@@ -167,9 +200,10 @@ pub(super) fn handle_complete_tool_call(
                 });
             }
         }
-    } else if state
-        .tool_arg_dedup
-        .check(&tc.function.name, &tc.function.arguments)
+    } else if !ctx.state.reference_mode
+        && state
+            .tool_arg_dedup
+            .check(&tc.function.name, &tc.function.arguments)
     {
         tracing::warn!(
             tool = %tc.function.name,
@@ -185,7 +219,7 @@ pub(super) fn handle_complete_tool_call(
         // runaway loops in the complete-tool-call path that
         // tool_arg_dedup misses because of args drift.
         let run_len = advance_name_run(&mut state.name_run, &tc.function.name);
-        if run_len >= MAX_CONSEC_SAME_NAME_CALLS {
+        if run_len >= MAX_CONSEC_SAME_NAME_CALLS && !ctx.state.reference_mode {
             tracing::warn!(
                 tool = %tc.function.name,
                 run = run_len,
@@ -232,9 +266,16 @@ pub(super) fn handle_tool_call_start(
     idx: usize,
     deltas: &mut DeltaVec,
 ) {
-    let pre_tool_tail = flush_content_sanitizer(
+    if state.guard_stop == Some(atlas_tool_guard::GUARD_STOP) {
+        return;
+    }
+    if super::tool_security::check_size(state, ctx, name.len().saturating_add(tc_id.len())) {
+        return;
+    }
+    let pre_tool_tail = flush_content_sanitizer_with_literal_state(
         &mut state.tag_scan_buf,
         &mut state.suppressing_param_leak,
+        &mut state.literal_xml_state,
         &ctx.leak_markers,
     );
     if !pre_tool_tail.is_empty() {
@@ -284,6 +325,12 @@ pub(super) fn handle_tool_call_delta(
     idx: usize,
     deltas: &mut DeltaVec,
 ) {
+    if state.guard_stop == Some(atlas_tool_guard::GUARD_STOP) {
+        return;
+    }
+    if super::tool_security::check_size(state, ctx, args.len()) {
+        return;
+    }
     let mut emit_args = args.clone();
     if let Some(entry) = state.streaming_tool_args.get_mut(&idx) {
         let name = entry.0.clone();
@@ -375,6 +422,8 @@ pub(super) fn handle_tool_call_delta(
                 });
                 state.stop_string_triggered = true;
                 entry.1.push_str(&args);
+                // A held header never reaches the client for a rejected call.
+                drop_buffered_tool_chunks(state, idx);
                 return;
             }
         } else {
@@ -390,13 +439,12 @@ pub(super) fn handle_tool_call_delta(
             fragment: emit_args,
             token_ids: Vec::new(),
         };
-        // Either flush previously-buffered start + this args delta
-        // together (success path under retry), or emit directly (retry
-        // disabled). When retry is disabled the start delta was already
-        // emitted in real time, so `emit_or_buffer_tool_delta` just adds
-        // the args delta.
+        // Either flush the held start + this args delta together (the call
+        // validated), or emit directly when the stream does not hold tool
+        // deltas: the start delta was already emitted in real time, so
+        // `emit_or_buffer_tool_delta` just adds the args delta.
         emit_or_buffer_tool_delta(state, ctx, idx, frag, deltas);
-        if ctx.tool_retry_enabled {
+        if !ctx.state.tool_guard.enabled {
             flush_buffered_tool_chunks(state, idx, deltas);
         }
     }
@@ -411,150 +459,34 @@ pub(super) fn handle_tool_call_delta(
 /// must precede its arguments).
 pub(super) fn handle_tool_call_args_fragment(
     state: &mut StreamState,
-    _ctx: &StreamCtx,
+    ctx: &StreamCtx,
     fragment: String,
     idx: usize,
     deltas: &mut DeltaVec,
 ) {
+    if state.guard_stop == Some(atlas_tool_guard::GUARD_STOP) {
+        return;
+    }
+    if super::tool_security::check_size(state, ctx, fragment.len()) {
+        return;
+    }
     let Some(entry) = state.streaming_tool_args.get_mut(&idx) else {
         return;
     };
     entry.1.push_str(&fragment);
-    deltas.push(StreamDelta::ToolCallArgs {
-        index: idx,
-        fragment,
-        token_ids: Vec::new(),
-    });
+    emit_or_buffer_tool_delta(
+        state,
+        ctx,
+        idx,
+        StreamDelta::ToolCallArgs {
+            index: idx,
+            fragment,
+            token_ids: Vec::new(),
+        },
+        deltas,
+    );
 }
 
-/// Advance the same-name run counter for a completed call, returning the new
-/// run length. Pure over the `Option` state so the #192 parallel fan-out
-/// contract (N same-name calls with distinct args below the cap must NOT be
-/// treated as a doom loop) is unit-testable without a `StreamState`.
-fn advance_name_run(name_run: &mut Option<(String, u32)>, name: &str) -> u32 {
-    let run_len = match name_run {
-        Some((prev, n)) if prev == name => *n + 1,
-        _ => 1,
-    };
-    *name_run = Some((name.to_string(), run_len));
-    run_len
-}
-
-/// `DetectorOutput::ToolCallEnd` — F11 within-response dedup +
-/// F44 cross-turn permanent-failure check + Bug-2 name-run cap.
-///
-/// Bug-2 cap (`MAX_CONSEC_SAME_NAME_CALLS`): trips when the same tool
-/// name fires N times in a row regardless of args. F11 keys on
-/// `(name, canonical_args)` and is defeated by runaway loops where
-/// the model rolls a fresh timestamp / sequence number / id into the
-/// payload each iteration; the F12 total cap (default 12) is the
-/// only other server-side circuit, but a runaway can already have
-/// flooded the SSE channel before F12 fires. The name-run cap is
-/// strictly tighter than F11 and F12 for the runaway pattern.
-///
-/// A3 (2026-05-26): tightened from 6 → 3 to match opencode's
-/// `DOOM_LOOP_THRESHOLD = 3`. Live Wave-1/3 traces showed the model
-/// emitting 4-6 same-name bash calls with drifted args before any
-/// guard tripped, by which point ~MB-long degenerate commands had
-/// already flooded the stream and the .git/ artifact pollution was
-/// already created. Three same-name calls is the empirical threshold
-/// at which opencode itself bails to the user for permission. Atlas
-/// matching this means we end the response slightly before opencode
-/// would surrender, giving the outer retry loop a clean signal.
-///
-/// #192 (2026-07-02): relaxed 3 → 8. A3's premise predates parallel tool
-/// calls: back then one response could not legitimately contain 3 same-name
-/// calls (generation hard-stopped at the first `</tool_call>`), so a run of
-/// 3 was proof of degeneration. Post-#192 the same-name run IS the designed
-/// shape of a parallel fan-out (BFCL `parallel`: get_weather × 3 cities —
-/// live 2026-07-02 the cap flipped that clean turn to finish="length").
-/// 8 mirrors the scheduler's own parallel bound
-/// (`MAX_POST_COMPLETION_TOOL_OPENS = 8`, decode_logits_step.rs): a real
-/// runaway still trips it an order of magnitude below the F12 total cap,
-/// while any plausible legit fan-out stays under it. Identical-args loops
-/// are still caught earlier by the F11 within-response dedup.
-const MAX_CONSEC_SAME_NAME_CALLS: u32 = 8;
-
-pub(super) fn handle_tool_call_end(state: &mut StreamState, _ctx: &StreamCtx, idx: usize) {
-    if let Some((name, args_json)) = state.streaming_tool_args.remove(&idx) {
-        if state.tool_arg_dedup_within.check(&name, &args_json) {
-            tracing::warn!(
-                tool = %name,
-                "F11 within-response dedup tripped: 2+ identical streaming tool calls; ending response"
-            );
-            state.stop_string_triggered = true;
-            state.tool_loop_capped = true;
-        }
-        let run_len = advance_name_run(&mut state.name_run, &name);
-        if run_len >= MAX_CONSEC_SAME_NAME_CALLS && !state.stop_string_triggered {
-            tracing::warn!(
-                tool = %name,
-                run = run_len,
-                "Bug-2 name-run cap tripped: {run_len} successive `{name}` tool calls; ending response (F11 missed because args drift)"
-            );
-            state.stop_string_triggered = true;
-            state.tool_loop_capped = true;
-        }
-        if !state.stop_string_triggered {
-            // Successful streaming tool call — log + metric to match the
-            // blocking and complete-call paths.
-            let preview: String = args_json.chars().take(120).collect();
-            let s = if args_json.len() > preview.len() {
-                "…"
-            } else {
-                ""
-            };
-            tracing::info!("Tool call: {name}({preview}{s})");
-            crate::metrics::TOOL_CALLS_TOTAL.inc();
-        }
-    }
-}
-
-#[cfg(test)]
-mod name_run_cap_tests {
-    //! #192: the Bug-2 same-name run cap vs parallel fan-outs. A BFCL
-    //! `parallel`-shape response (get_weather x 3 cities) must NOT be
-    //! classified as a doom loop (live 2026-07-02: the old cap of 3 flipped a
-    //! clean 3-call hermes turn to finish_reason="length"); a genuine
-    //! same-name runaway must still trip the cap before the F12 total cap.
-    use super::{MAX_CONSEC_SAME_NAME_CALLS, advance_name_run};
-
-    #[test]
-    fn three_call_parallel_fanout_stays_under_cap() {
-        let mut run = None;
-        for i in 1..=3u32 {
-            let len = advance_name_run(&mut run, "get_weather");
-            assert_eq!(len, i);
-            assert!(
-                len < MAX_CONSEC_SAME_NAME_CALLS,
-                "a 3-call same-name parallel fan-out must not trip the doom-loop cap"
-            );
-        }
-    }
-
-    #[test]
-    fn runaway_same_name_run_still_trips() {
-        let mut run = None;
-        let mut tripped_at = None;
-        for i in 1..=12u32 {
-            if advance_name_run(&mut run, "bash") >= MAX_CONSEC_SAME_NAME_CALLS {
-                tripped_at = Some(i);
-                break;
-            }
-        }
-        assert_eq!(
-            tripped_at,
-            Some(MAX_CONSEC_SAME_NAME_CALLS),
-            "cap must fire below the F12 total cap (12)"
-        );
-    }
-
-    #[test]
-    fn different_name_resets_run() {
-        let mut run = None;
-        assert_eq!(advance_name_run(&mut run, "get_weather"), 1);
-        assert_eq!(advance_name_run(&mut run, "get_weather"), 2);
-        assert_eq!(advance_name_run(&mut run, "get_time"), 1);
-        assert_eq!(advance_name_run(&mut run, "get_weather"), 1);
-    }
-}
+#[path = "tool_handlers/tail.rs"]
+mod tail;
+pub(crate) use tail::*;

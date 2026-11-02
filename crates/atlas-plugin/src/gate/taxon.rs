@@ -153,6 +153,7 @@ pub fn configs(root: &Path, target: &Target) -> Vec<PathBuf> {
     let hw_dir = root.join("kernels").join(&target.hardware);
     [
         hw_dir.join("HARDWARE.toml"),
+        hw_dir.join("common").join("KERNEL.toml"),
         hw_dir.join(&target.model).join("MODEL.toml"),
         hw_dir
             .join(&target.model)

@@ -34,7 +34,7 @@ use crate::layers::ops;
 /// Strict `== "1"` on an `ATLAS_NO_*` name, not a presence check — presence
 /// flags in this codebase are ENABLED by `=0`. Read once; this is a per-step
 /// site.
-pub(super) fn lm_head_batch_gemv_enabled() -> bool {
+pub(crate) fn lm_head_batch_gemv_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_NO_LM_HEAD_BATCH_GEMV").as_deref() != Ok("1"))
 }
@@ -72,7 +72,7 @@ impl TransformerModel {
     /// `v` is read from `self.config.vocab_size` rather than passed: it is the
     /// same number at both call sites and a parameter would be a second place
     /// for it to be wrong.
-    pub(super) fn lm_head_project_batched(
+    pub(in crate::model) fn lm_head_project_batched(
         &self,
         normed: DevicePtr,
         padded_n: usize,

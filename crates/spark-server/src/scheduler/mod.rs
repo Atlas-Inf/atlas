@@ -16,17 +16,23 @@ mod adaptive_rung;
 mod adaptive_spec;
 mod admission;
 mod beam_prefill;
+#[cfg(test)]
+mod cancel_test_model;
 mod confidence;
+pub(crate) mod copy_drafts;
 mod decode_logits_content;
 mod decode_logits_seq;
 mod decode_logits_step;
 mod decode_step;
+mod dflash_conf_width;
+mod dflash_width;
 #[cfg(test)]
 mod dspark_fail_closed_tests;
 mod emit_step;
 mod fast_greedy;
 #[cfg(test)]
 mod finish_guard_tests;
+mod first_token_thinking;
 mod helpers;
 mod lifecycle;
 #[cfg(test)]
@@ -36,6 +42,8 @@ mod lifecycle_tests;
 mod logit_dump;
 mod logit_processors;
 mod logprobs;
+pub mod loop_steer;
+mod min_tokens_ban;
 mod mod_helpers;
 pub use mod_helpers::capture_runtime_handle;
 pub mod dumps;
@@ -44,8 +52,11 @@ pub mod limits;
 mod mtp_accept_debug;
 mod mtp_bootstrap_step;
 mod mtp_dcut;
+mod mtp_deep_depth;
+mod mtp_depth_ladder;
 mod mtp_gate;
 mod mtp_step;
+mod mtp_step_trace;
 pub(crate) mod mtp_timing;
 #[cfg(test)]
 mod ngram_accounting_tests;
@@ -58,21 +69,35 @@ mod preempt_tests;
 mod prefill_a_step;
 mod prefill_a_step_params;
 mod prefill_b_step;
+mod prefill_burst;
+mod prefill_multi;
+mod prefill_normalization;
+mod prefill_preempt;
 mod repetition;
 mod rollback;
 mod sample_step;
 pub mod sched_ctx;
+mod shared_prefix;
+#[cfg(test)]
+mod slot_compaction_tests;
 pub mod snapshot;
 mod spec_capacity;
 pub mod spec_stats;
 mod spec_step;
 mod ssm_decode_ring;
+mod strict_spec;
 mod teardown;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
 mod think_skip_tests;
+pub(crate) mod tool_markers;
+mod ttft_trace;
 mod types;
+#[cfg(test)]
+mod verify_bias_tests;
+#[cfg(test)]
+mod verify_commit_tests;
 mod verify_dflash_batch_step;
 mod verify_dflash_step;
 mod verify_k2_step;
@@ -81,6 +106,7 @@ mod verify_k4_batch_step;
 mod verify_k4_step;
 mod verify_k4_verdict;
 mod verify_pipeline_helper;
+mod vision_release;
 pub mod vocab_masks;
 
 use beam_prefill::resolve_beam_hyp;
@@ -100,7 +126,7 @@ use logprobs::*;
 use mod_helpers::*;
 use mtp_bootstrap_step::*;
 use mtp_step::*;
-use phase_continue_prefills::continue_in_progress_prefills;
+use phase_continue_prefills::{SpecStep, continue_in_progress_prefills};
 use phase_start_prefills::start_new_requests;
 use prefill_a_step::*;
 use prefill_b_step::*;
@@ -242,7 +268,6 @@ pub fn run(
     block_size: usize,
     think_end_token: Option<u32>,
     think_start_token: Option<u32>,
-    code_fence_token: Option<u32>,
     tool_call_start_token: Option<u32>,
     tool_call_end_token: Option<u32>,
     mut grammar_engine: Option<GrammarEngine>,
@@ -348,6 +373,8 @@ pub fn run(
     // context ceiling, i.e. reserve each request's own max_tokens; see
     // `admission` module docs and ATLAS_KV_ADMIT_WATERMARK).
     let admit_watermark = admission::resolve_admit_watermark(sched.limits.max_seq_len);
+    let mut prefix_admit = shared_prefix::SharedPrefix::default();
+    let mut burst = prefill_burst::PrefillBurst::new(prefill_burst::BurstConfig::from_env());
 
     let pending = Arc::new((
         Mutex::new(PendingQueue {
@@ -363,6 +390,9 @@ pub fn run(
     std::thread::spawn(move || {
         let mut rx = request_rx;
         while let Some(req) = rx.blocking_recv() {
+            if ttft_trace::enabled() {
+                ttft_trace::arrive(&req.prompt_tokens_arc());
+            }
             p.0.lock().requests.push(req);
             p.1.notify_one();
         }
@@ -394,7 +424,8 @@ pub fn run(
     let mut prefilling: Vec<PrefillInProgress> = Vec::new();
     let mut swapped: Vec<SwappedSeq> = Vec::new();
     let mut preempted: Vec<PreemptedSeq> = Vec::new();
-    let mut spill_manager: Option<KvSpillManager> = if swap_space_gb > 0 {
+    let spill_pool = preempt::spill_pool_enabled(&*model, swap_space_gb);
+    let mut spill_manager: Option<KvSpillManager> = if spill_pool {
         let max_bytes = swap_space_gb as u64 * 1024 * 1024 * 1024;
         // Per-PROCESS directory. `KvSpillManager::new` wipes stale `swap_*` files
         // on construction, which is correct for a restart and correct across a
@@ -457,6 +488,7 @@ pub fn run(
             &prefilling,
             &*policy,
             max_batch_size,
+            model.has_shared_prompt_capture(),
             // Parked sequences (spilled or requeued) are waiting on blocks,
             // not on new requests — never block on the request condvar while
             // any exist, or an empty active set would strand them forever.
@@ -475,6 +507,17 @@ pub fn run(
             admit_watermark,
             sched.limits.max_seq_len,
             block_size,
+        );
+        // ── Shared-prefix admission: hold requests that share a long prefix
+        // with a prefill in flight until it plants a checkpoint there
+        // (`ATLAS_GLM_PC_INFLIGHT`; a no-op otherwise). ──
+        let (new_reqs, pc_plants) = shared_prefix::admit(
+            &*model,
+            &pending,
+            new_reqs,
+            &mut prefilling,
+            chunked,
+            &mut prefix_admit,
         );
         sched.timing.record(mtp_timing::Phase::LoopDrain, t_loop);
 
@@ -629,12 +672,20 @@ pub fn run(
             }
         }
 
+        // Every finished prefill passed through `active`: its pixels (and
+        // their in-flight vision permits) are no longer needed.
+        vision_release::release_prefilled_pixels(&mut active);
+
         // ── Start new requests ──
         let t_loop = std::time::Instant::now();
+        let prefill_queue_was_empty = prefilling.is_empty();
+        let in_flight_before = active.len() + prefilling.len();
+        ttft_trace::begin_tick();
         start_new_requests(
             &*model,
             &sched,
             new_reqs,
+            pc_plants,
             chunked,
             always_mixed,
             max_prefill_tokens,
@@ -652,33 +703,75 @@ pub fn run(
             &mut prefilling,
         );
         sched.timing.record(mtp_timing::Phase::LoopAdmit, t_loop);
+        // ── ATLAS_PREFILL_BURST: more short prompts already waiting → drain
+        // them before this tick's decode (`prefill_burst`; off by default). ──
+        if burst.enabled() {
+            let (pending_n, pending_tokens) = prefill_burst::pending_load(&pending);
+            let in_flight = active.len() + prefilling.len();
+            let view = prefill_burst::TickView {
+                admitted: in_flight.saturating_sub(in_flight_before),
+                pending: pending_n,
+                pending_tokens,
+                prefilling: prefilling.len(),
+                in_flight,
+                max_batch: max_batch_size,
+            };
+            if burst.hold(Instant::now(), &view) {
+                continue;
+            }
+        }
 
         // ── Continue in-progress prefills ──
         let t_loop = std::time::Instant::now();
-        let did_mixed_step = continue_in_progress_prefills(
-            &*model,
-            &*policy,
-            &mut active,
-            &mut prefilling,
-            max_prefill_tokens,
-            max_batch_tokens,
-            always_mixed,
-            prefill_stream,
-            prefill_event,
-            use_mtp,
-            use_self_speculative,
-            use_ngram_speculative,
-            think_end_token,
-            think_start_token,
-            code_fence_token,
-            tool_call_start_token,
-            tool_call_end_token,
-            adaptive_sampling,
-            &sched,
-        );
+        let mut step_trace = mtp_step_trace::begin(&active);
+        let mut rode: Vec<usize> = Vec::new();
+        let spec_step = SpecStep {
+            num_drafts: model
+                .verify_max_drafts()
+                .map_or(num_drafts, |max| num_drafts.min(max)),
+            dflash_verify_raw_argmax: use_mtp && dflash_verify_raw_argmax,
+        };
+        // Under EP a new prompt's first chunk ran inline just above. End
+        // the tick before its second chunk: decoders get their step, and
+        // prompts that arrived during the first chunk are admitted at the
+        // next boundary (two back-to-back 8K chunks held both ~6 s).
+        // (ATLAS_GLM_WARM_CHUNK_RUN: not when that chunk computed nothing.)
+        let head_just_started = (model.is_ep() || phase_continue_prefills::decode_share::enabled())
+            && prefill_queue_was_empty
+            && prefilling
+                .first()
+                .is_some_and(|p| !phase_continue_prefills::follows_first_chunk(p));
+        let did_mixed_step = !head_just_started
+            && continue_in_progress_prefills(
+                &*model,
+                &*policy,
+                &mut active,
+                &mut prefilling,
+                max_prefill_tokens,
+                max_batch_tokens,
+                always_mixed,
+                prefill_stream,
+                prefill_event,
+                use_mtp,
+                use_self_speculative,
+                use_ngram_speculative,
+                think_end_token,
+                think_start_token,
+                tool_call_start_token,
+                tool_call_end_token,
+                adaptive_sampling,
+                &sched,
+                &spec_step,
+                &mut rode,
+            );
         sched.timing.record(mtp_timing::Phase::LoopPrefill, t_loop);
+        if did_mixed_step {
+            mtp_step_trace::note_kind("mixed");
+        }
+        mtp_step_trace::note_rode(&rode);
 
         if active.is_empty() {
+            phase_continue_prefills::decode_share::note_idle();
             // Every sequence can be parked (decode-preempted/spilled) with
             // nothing new admitted; the resume passes at the tail of the
             // loop sit AFTER decode, which this `continue` skips — so give
@@ -698,8 +791,23 @@ pub fn run(
             }
         }
 
+        // Owners whose verify rode this tick's prefill chunk already stepped;
+        // they rejoin before retirement.
+        let rode_seqs: Vec<ActiveSeq> = if rode.is_empty() {
+            Vec::new()
+        } else {
+            let (rode_seqs, rest) = std::mem::take(&mut active)
+                .into_iter()
+                .partition(|a| rode.contains(&a.seq.slot_idx));
+            active = rest;
+            rode_seqs
+        };
+
         // Skip decode when mixed_forward already processed decode logits.
-        if !did_mixed_step {
+        mtp_step_trace::mark_decode(&mut step_trace, &active);
+        let ttft_step = ttft_trace::step_begin();
+        if !did_mixed_step && !active.is_empty() {
+            phase_continue_prefills::decode_share::note_decode_step();
             // Ensure any in-flight prefill work on the prefill stream is complete
             // before decode starts on the default stream.
             if !prefilling.is_empty() {
@@ -714,20 +822,12 @@ pub fn run(
             // think-end/pin-tool-call/forced-token/grammar). Without
             // this context the MTP/spec verify path emits unmasked
             // GPU-argmax tokens (Phase C-2 root cause, 2026-05-24).
-            let verify_ctx = crate::scheduler::logit_processors::LogitsContext {
-                watchdog: sched.watchdog,
-                scratch: &sched.scratch,
-                dumps: &sched.dumps,
-                stats: sched.stats.clone(),
+            let verify_ctx = sched.verify_logits_ctx(
                 think_end_token,
                 think_start_token,
                 tool_call_start_token,
                 tool_call_end_token,
-                boundary_mask: sched.masks.boundary.clone(),
-                mid_word_mask: sched.masks.mid_word.clone(),
-                sampling: sched.levers.sampling(),
-                timing: sched.timing.clone(),
-            };
+            );
             // Spec-resume guard (ATLAS_DFLASH_RESUME_GUARD=N, default 0 = off):
             // keep the first N post-`</think>` tokens on plain serial decode.
             // The T=0 verify-vs-decode low-margin flips measured 2026-07-07
@@ -739,8 +839,21 @@ pub fn run(
             // inside `<think>`. Standard MTP already verifies during think.
             // DFlash raw-argmax does not run ForcedThinkEnd, so it stays
             // serial-in-think unless this lever is on. Resume guard still
-            // serial-decodes the spec-entry window.
-            let dflash_spec_think = sched.levers.dflash_spec_think;
+            // serial-decodes the spec-entry window. A bit-exact verify
+            // (`ATLAS_QWEN4EXP_EXACT_VERIFY=1`) counts as the opt-in for a
+            // single sequence: speculating there is lossless.
+            let dflash_spec_think = mtp_gate::spec_think_for(
+                sched.levers.dflash_spec_think,
+                model.verify_bit_exact(),
+                model.batch_verify_bit_exact(),
+                active.len(),
+            );
+            // ATLAS_GLM_STRICT_SPEC=1: strict structured-output sequences
+            // speculate too, on the DFlash lane whose verify the GLM split head
+            // grammar-masks row by row (`strict_spec`). Anywhere else they stay
+            // serial.
+            let strict_spec =
+                strict_spec::enabled(&sched.levers, &*model, dflash_verify_raw_argmax);
             // Spec dispatch additionally requires every active sequence's
             // SSM slot to be covered by the MTP verify state pools
             // (intermediates + checkpoints), which are sized to
@@ -826,15 +939,17 @@ pub fn run(
             // `--ngram-speculative` still falls through to MTP.
             if use_ngram_speculative
                 && active.len() == 1
-                && !(spec_slots_covered
-                    && active[0].grammar_state.is_none()
-                    && active[0].temperature == 0.0
-                    && verify_ctx_limit_batched.is_none_or(|lim| active[0].seq.seq_len + 4 <= lim))
+                && !spec_step::admission::ngram(
+                    &active[0],
+                    spec_slots_covered,
+                    verify_ctx_limit_batched,
+                )
             {
                 tracing::debug!(
-                    "ngram declined: grammar={} temp={} slots_covered={} seq_len={} lim={}",
+                    "ngram declined: grammar={} temp={} logprobs={:?} slots_covered={} seq_len={} lim={}",
                     active[0].grammar_state.is_some(),
                     active[0].temperature,
+                    active[0].top_logprobs,
                     spec_slots_covered,
                     active[0].seq.seq_len,
                     verify_ctx_limit_batched.unwrap_or(0),
@@ -842,10 +957,11 @@ pub fn run(
             }
             if use_ngram_speculative
                 && active.len() == 1
-                && spec_slots_covered
-                && active[0].grammar_state.is_none()
-                && active[0].temperature == 0.0
-                && verify_ctx_limit_batched.is_none_or(|lim| active[0].seq.seq_len + 4 <= lim)
+                && spec_step::admission::ngram(
+                    &active[0],
+                    spec_slots_covered,
+                    verify_ctx_limit_batched,
+                )
             {
                 // N-gram speculative: CPU proposer + CUDA-graphed K=2 verify.
                 if let Some(ref mut proposer) = ngram_proposer {
@@ -858,8 +974,8 @@ pub fn run(
                     // is what made the 2026-09-15 nvidia pack read "engages,
                     // accepts ~nothing" while the lane's own debug lines
                     // showed na=1 on 93 of 143 proposals (jobqueue 074). It
-                    // also feeds `usage.completion_tokens_details.
-                    // accepted_prediction_tokens`.
+                    // is raw verify telemetry. Completion usage separately
+                    // counts accepted draft tokens retained by emission.
                     //
                     // Deliberately NOT `mtp_accept_debug::record`: that
                     // histogram steers `adaptive_rung`'s MTP dispatch width,
@@ -879,8 +995,7 @@ pub fn run(
                 }
             } else if use_self_speculative
                 && active.len() == 1
-                && spec_slots_covered
-                && active[0].grammar_state.is_none()
+                && spec_step::admission::self_spec(&active[0], spec_slots_covered)
             {
                 // Self-speculative: draft via layer-skipping, verify with full model.
                 // Clamped to the active slot's tiered verify capacity, like
@@ -919,15 +1034,12 @@ pub fn run(
                     // serial-decodes the spec-entry window. EVERY active
                     // sequence must be eligible, not just active[0].
                     active.iter().all(|a| {
-                        mtp_gate::spec_dispatch_eligible(
-                            a.inside_thinking,
-                            a.post_think_emitted,
-                            a.output_tokens.len() as u32,
-                            a.suppress_tool_call,
-                            a.disable_mtp,
+                        mtp_gate::seq_spec_eligible(
+                            a,
                             dflash_spec_think,
                             dflash_resume_guard,
                             dflash_verify_raw_argmax,
+                            strict_spec,
                         )
                     })
                 )
@@ -984,13 +1096,13 @@ pub fn run(
                     } else {
                         match gate.next_step() {
                             mtp_gate::GateStep::MeasureDecode => {
+                                mtp_step_trace::note_kind("gate");
                                 let t0 = std::time::Instant::now();
                                 step_decode_only(
                                     &*model,
                                     &mut active,
                                     think_end_token,
                                     think_start_token,
-                                    code_fence_token,
                                     tool_call_start_token,
                                     tool_call_end_token,
                                     adaptive_sampling,
@@ -1134,7 +1246,6 @@ pub fn run(
                     &mut active,
                     think_end_token,
                     think_start_token,
-                    code_fence_token,
                     tool_call_start_token,
                     tool_call_end_token,
                     adaptive_sampling,
@@ -1149,6 +1260,19 @@ pub fn run(
             }
         }
 
+        // A speculative step refused for KV (agreed, rolled back on every
+        // rank) preempts a victim here instead of failing its sequences.
+        preempt::requeue_kv_refusals(
+            &*model,
+            &mut active,
+            spill_manager.as_mut(),
+            &mut swapped,
+            &mut preempted,
+        );
+        active.extend(rode_seqs);
+        mtp_step_trace::finish(step_trace, &active);
+        ttft_trace::step_end(ttft_step, &active);
+
         let t_loop = std::time::Instant::now();
         // Deadline sweep BEFORE retirement, so a timed-out sequence retires
         // on this same iteration. Placed here rather than in a decode step
@@ -1160,6 +1284,7 @@ pub fn run(
         // ── Swap-in: resume swapped sequences when blocks free up ──
         let t_loop = std::time::Instant::now();
         if let Some(ref mut spill) = spill_manager {
+            preempt::discard_disconnected_swapped(&mut swapped, spill);
             let mut resumed_any = true;
             while resumed_any && !swapped.is_empty() && active.len() < max_batch_size {
                 resumed_any = false;
@@ -1171,7 +1296,11 @@ pub fn run(
                 // BEFORE restoring, so it has to ask. Without this a swapped-out
                 // sequence waits forever on capacity that is reclaimable but not
                 // free — the scheduler goes idle with clients still connected.
-                if let Some(smallest) = swapped.iter().map(|s| s.num_blocks).min()
+                if let Some(smallest) = swapped
+                    .iter()
+                    .filter(|s| !s.sink.receiver_closed())
+                    .map(|s| s.num_blocks)
+                    .min()
                     && smallest > free
                 {
                     // Evicting N radix nodes frees FEWER than N blocks whenever a
@@ -1199,7 +1328,10 @@ pub fn run(
                         );
                     }
                 }
-                if let Some(idx) = swapped.iter().position(|s| s.num_blocks <= free) {
+                if let Some(idx) = swapped
+                    .iter()
+                    .position(|s| !s.sink.receiver_closed() && s.num_blocks <= free)
+                {
                     let s = swapped.remove(idx);
                     match resume_swapped_seq(think_end_token, think_start_token, &*model, s, spill)
                     {
@@ -1263,6 +1395,7 @@ pub fn run(
         let _ = model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF1);
     }
     // Shutdown applies to every slot the worker has; seq_id is ignored.
+    crate::ep_peer_lifeline::expect_peer_exit();
     let _ = model.ep_broadcast_cmd_for_seq(0, 0xFFFFFFFF);
 
     // Release the model's device memory HERE, in order and able to report a

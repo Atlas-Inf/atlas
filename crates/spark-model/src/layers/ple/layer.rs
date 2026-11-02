@@ -29,7 +29,7 @@ const VERIFY_SNAP_SLOTS: usize = 9;
 /// Bisection hatch: `ATLAS_PLE_VERIFY_SNAPSHOTS=0` restores the single batched
 /// conv launch, which leaves nothing for `rollback_verify` to restore — the
 /// PLE carry then keeps rejected drafts. Debug only.
-fn verify_snapshots_enabled() -> bool {
+pub(crate) fn verify_snapshots_enabled() -> bool {
     std::env::var("ATLAS_PLE_VERIFY_SNAPSHOTS").ok().as_deref() != Some("0")
 }
 
@@ -61,6 +61,17 @@ pub struct PleLayer {
     /// Device VA of the table's per-slot f32 dequant scale array, `None` for a
     /// BF16 table. Its presence is what selects the FP8 gather.
     scale_va: Option<u64>,
+    /// NVFP4 gather kernel (`Some` when `nvfp4` is set).
+    embed_nvfp4_k: KernelHandle,
+    /// Device VA of the cache's `[slots, dim/group]` E4M3 block-scale arena;
+    /// `None` for interleaved NVFP4 rows, which carry their own scales.
+    block_scale_va: Option<u64>,
+    /// Packed EXL3 n-gram rows. Host-dequanted into `emb` before the GEMM.
+    trellis: Option<ngram_trellis::NgramTrellis>,
+    /// NVFP4 n-gram rows (FP4-Local): codes + block scales (split arenas, or
+    /// interleaved rows) stay in the pinned cache and decode inside
+    /// `batched_embed_nvfp4`.
+    nvfp4: Option<ngram_nvfp4::NgramNvfp4>,
     gemm_k: KernelHandle,
     gate_k: KernelHandle,
     conv_k: KernelHandle,
@@ -94,6 +105,12 @@ pub struct PleLayer {
 }
 
 impl PleLayer {
+    /// Rows decoded on the host into `emb` (EXL3 trellis, FP4-Local NVFP4)
+    /// rather than gathered by the embedding kernel.
+    pub(super) fn host_decoded(&self) -> bool {
+        self.trellis.is_some()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         dims: PleIdDims,
@@ -107,6 +124,8 @@ impl PleLayer {
         table: NgramTable,
         max_tokens: usize,
         scratch_tokens: usize,
+        trellis: Option<ngram_trellis::NgramTrellis>,
+        nvfp4: Option<ngram_nvfp4::NgramNvfp4>,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
         dims.validate()?;
@@ -129,8 +148,23 @@ impl PleLayer {
         if let NgramTable::Cached(cache) = &table {
             let stride = cache.row_stride();
             let scaled = cache.scale_dev_va()?.is_some();
-            gather_matches_element_size(stride, head_dim, scaled)?;
+            if let Some(n) = nvfp4.as_ref() {
+                ngram_nvfp4::check_packed_stride(stride, &n.geom, scaled)?;
+            } else if let Some(t) = trellis.as_ref() {
+                ngram_trellis::check_packed_stride(stride, t, scaled)?;
+            } else {
+                gather_matches_element_size(stride, head_dim, scaled)?;
+            }
         }
+        #[cfg(feature = "cuda")]
+        if let NgramTable::ResidentNvfp4 { .. } = &table {
+            anyhow::ensure!(
+                nvfp4.is_some(),
+                "PLE: the resident table is the NVFP4 U8 pack; this checkpoint \
+                 has no NVFP4 n-gram geometry"
+            );
+        }
+        let is_nvfp4 = nvfp4.is_some();
         Ok(Self {
             dims,
             head_dim,
@@ -151,13 +185,32 @@ impl PleLayer {
             // table mutex on every gather.
             scale_va: match &table {
                 #[cfg(feature = "cuda")]
-                NgramTable::Cached(c) => c.scale_dev_va()?,
+                NgramTable::Cached(c) => match c.scale_dev_va()? {
+                    // A segmented block-scale arena is the NVFP4 table's, not
+                    // an FP8 row-scale array — it must not select the FP8 arm.
+                    Some(_) if is_nvfp4 => None,
+                    other => other,
+                },
                 _ => None,
             },
+            block_scale_va: match &table {
+                #[cfg(feature = "cuda")]
+                NgramTable::Cached(c) => c.block_scale_dev_va()?,
+                #[cfg(feature = "cuda")]
+                NgramTable::ResidentNvfp4 { scales, .. } => Some(scales.0),
+                _ => None,
+            },
+            trellis,
+            nvfp4,
             embed_fp8_k: gpu.kernel("embed_from_argmax", "batched_embed_fp8")?,
+            embed_nvfp4_k: if is_nvfp4 {
+                gpu.kernel("embed_from_argmax", "batched_embed_nvfp4")?
+            } else {
+                KernelHandle(0)
+            },
             table: std::sync::Arc::new(std::sync::Mutex::new(table)),
             embed_k: gpu.kernel("embed_from_argmax", "batched_embed")?,
-            gemm_k: gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?,
+            gemm_k: projection_gemm(gpu)?,
             gate_k: gpu.kernel("ple", "ple_gate")?,
             conv_k: gpu.kernel("ple", "ple_conv")?,
             add_k: gpu.kernel("ple", "ple_add_highway")?,
@@ -197,9 +250,9 @@ impl PleLayer {
     // Marconi aux-state (snapshot_aux / restore_aux) moved to
     // `aux_state.rs` (≤500 LoC split).
 
-    // The public forward entry points (`forward`, `forward_row`,
-    // `forward_rows`) live in `forward.rs` (≤500 LoC split); they all funnel
-    // into `forward_with_ids` below.
+    // The public forward entry points (`forward`, `forward_rows`) live in
+    // `forward.rs` and the multi-sequence `forward_seqs` with the shared
+    // stages in `batch.rs` (≤500 LoC split).
 
     #[allow(clippy::too_many_arguments)]
     fn forward_with_ids(
@@ -295,21 +348,7 @@ impl PleLayer {
                  pageable slot upload would invalidate the recording (901); \
                  the scheduler must call decode_prestage every step"
             );
-            // history ++ tokens, hashed together, then keep the new tokens'
-            // rows — the same slice the reference takes with
-            // `[:, -input_ids.shape[1]:]`.
-            // Same bookkeeping as `prestage` — see `rollback_verify`.
-            st.history_ckpt = st.history.clone();
-            st.verify_tokens = tokens.clone();
-            let mut window = st.history.clone();
-            window.extend_from_slice(&tokens);
-            let all = ple_ngram_ids(&self.dims, &window);
-            let rows = &all[all.len() - num_tokens..];
-            flat = rows.iter().flat_map(|r| r.iter().copied()).collect();
-
-            // Carry the last `context_len` tokens for the next step.
-            let keep = self.dims.context_len();
-            st.history = window[window.len() - keep..].to_vec();
+            flat = self.stage_window(st, &tokens);
         }
 
         // The pipeline runs in `scratch_tokens` spans — the bounded
@@ -320,7 +359,6 @@ impl PleLayer {
         // conv, whose carry lives in `st.conv` and threads across calls —
         // the per-row verify path already relies on that composability.
         // A span's NVMe fault-in also overlaps the previous span's kernels.
-        let cb = self.conv_bytes();
         let mut base = 0;
         while base < num_tokens {
             let n = (num_tokens - base).min(self.scratch_tokens);
@@ -340,104 +378,16 @@ impl PleLayer {
                 }
             }
 
-            // Projections off the concatenated n-gram embedding.
-            //
-            // `dense_gemm_bf16_pipelined`, NOT `dense_gemm`: the ops wrapper and
-            // the kernel are a PAIR. `dense_gemm` launches grid
-            // [ceil(n,16), ceil(m,16)] block 16x16 for the scalar kernel, while
-            // the pipelined one wants [ceil(n,128), ceil(m,128)] block 256.
-            // Handing the pipelined kernel to the scalar launcher reads far out
-            // of bounds and produced NaN through the whole highway.
-            ops::dense_gemm_bf16_pipelined(
+            self.project(n, gpu, stream)?;
+            self.inject(
+                st,
+                highway.offset(base * c * 4),
+                (0, Some(base)),
+                n,
+                num_tokens,
                 gpu,
-                self.gemm_k,
-                self.emb,
-                &self.key_proj,
-                self.key,
-                n as u32,
-                c as u32,
-                self.hidden as u32,
-                stream,
-            )
-            .context("PLE key_proj")?;
-            ops::dense_gemm_bf16_pipelined(
-                gpu,
-                self.gemm_k,
-                self.emb,
-                &self.value_proj,
-                self.value,
-                n as u32,
-                self.hidden as u32,
-                self.hidden as u32,
-                stream,
-            )
-            .context("PLE value_proj")?;
-
-            let hspan = highway.offset(base * c * 4);
-            ops::ple_gate(
-                gpu,
-                self.gate_k,
-                hspan,
-                self.key,
-                self.value,
-                self.norm_query.weight,
-                self.norm_key.weight,
-                self.norm_conv.weight,
-                self.gated,
-                self.gated_normed,
-                n as u32,
-                self.hidden as u32,
-                self.hc_mult as u32,
-                self.eps,
                 stream,
             )?;
-            // The conv carry is the one piece of PLE state a speculative verify
-            // has to be able to rewind, so at verify widths the launch is split
-            // per row and each row's resulting carry is parked. At prefill widths
-            // that would be thousands of launches for a carry nothing rolls back,
-            // so the batched form stays and `verify_snap_rows` says "no snapshots".
-            // The check is on the WHOLE forward's width, not the span's: a
-            // verify never spans (scratch >= VERIFY_SNAP_SLOTS) and a spanning
-            // forward snapshots nothing — same as before.
-            if num_tokens < VERIFY_SNAP_SLOTS && verify_snapshots_enabled() {
-                gpu.copy_d2d_async(st.conv, st.verify_snaps, cb, stream)?;
-                for t in 0..n {
-                    let row = t * c * 4; // [T, c] FP32
-                    ops::ple_conv(
-                        gpu,
-                        self.conv_k,
-                        self.gated_normed.offset(row),
-                        self.gated.offset(row),
-                        self.conv1d.weight,
-                        st.conv,
-                        self.out.offset(row),
-                        1,
-                        c as u32,
-                        self.k_size as u32,
-                        self.dilation as u32,
-                        stream,
-                    )?;
-                    gpu.copy_d2d_async(st.conv, st.verify_snaps.offset((t + 1) * cb), cb, stream)?;
-                }
-                st.verify_snap_rows = num_tokens;
-            } else {
-                ops::ple_conv(
-                    gpu,
-                    self.conv_k,
-                    self.gated_normed,
-                    self.gated,
-                    self.conv1d.weight,
-                    st.conv,
-                    self.out,
-                    n as u32,
-                    c as u32,
-                    self.k_size as u32,
-                    self.dilation as u32,
-                    stream,
-                )?;
-                st.verify_snap_rows = 0;
-            }
-            ops::ple_add_highway(gpu, self.add_k, self.out, hspan, (n * c) as u32, stream)?;
             base += n;
         }
 
@@ -455,7 +405,9 @@ pub(crate) fn bounded_scratch(scratch: usize, max_tokens: usize) -> usize {
     scratch.clamp(VERIFY_SNAP_SLOTS.min(max_tokens), max_tokens)
 }
 
-/// The dense weights of one PLE site.
+/// The dense weights of one PLE site. The three norms are **F32** — `ple_gate`
+/// is declared `const float*` and the loader (`dense_keep_f32`) guarantees the
+/// dtype; everything else is BF16.
 pub struct PleWeights {
     pub key_proj: DenseWeight,
     pub value_proj: DenseWeight,
@@ -468,8 +420,14 @@ pub struct PleWeights {
 // Child module (not sibling): the aux fns read PleLayer private
 // fields, and only a CHILD module sees them. Same #[path] trick
 // qsa.rs uses for its tests.
+#[path = "ckpt.rs"]
+mod ckpt;
 #[path = "verify.rs"]
 mod verify;
+
+#[path = "batch.rs"]
+mod batch;
+pub use batch::PleSeqRows;
 
 #[path = "aux_state.rs"]
 mod aux_state;
@@ -485,5 +443,31 @@ pub(crate) mod warm;
 
 #[path = "gather_guard.rs"]
 mod gather_guard;
+#[path = "ngram_nvfp4.rs"]
+pub(crate) mod ngram_nvfp4;
+#[path = "ngram_trellis.rs"]
+pub(crate) mod ngram_trellis;
 #[cfg(feature = "cuda")]
 use gather_guard::gather_matches_element_size;
+
+/// `ATLAS_QWEN4EXP_PREFILL_GEMM_RASTER=1`: the key/value projections run
+/// `dense_gemm_bf16_pipelined_g8`, the default GEMM with its output tiles
+/// visited in groups of 8 M-tiles. The key projection's weight ([4 x hidden,
+/// hidden], 52 MB) is wider than L2, and the default order re-streams it from
+/// DRAM once per M-tile: 20.6 -> 7.6 ms at an 8192-row PLE pass on GB10
+/// (`scripts/dev/qwen4exp_ple_gemm_bench.cu`). Every tile is the default's
+/// tile body, so every output byte is the default's; rank-local.
+fn projection_gemm(gpu: &dyn GpuBackend) -> Result<KernelHandle> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON
+        .get_or_init(|| std::env::var("ATLAS_QWEN4EXP_PREFILL_GEMM_RASTER").as_deref() == Ok("1"));
+    let g8 = if on {
+        crate::layers::try_kernel(gpu, "gemm", "dense_gemm_bf16_pipelined_g8")
+    } else {
+        KernelHandle(0)
+    };
+    if g8.0 != 0 {
+        return Ok(g8);
+    }
+    gpu.kernel("gemm", "dense_gemm_bf16_pipelined")
+}

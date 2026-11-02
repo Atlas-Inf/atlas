@@ -125,7 +125,11 @@ impl NemotronMoeLayer {
         let expert_up_out = ctx.buffers.expert_up_out();
         ops::moe_expert_gemv(
             ctx.gpu,
-            self.moe_expert_gemv_k,
+            if self.moe_expert_gemv_pf_k.0 != 0 {
+                self.moe_expert_gemv_pf_k
+            } else {
+                self.moe_expert_gemv_k
+            },
             normed,
             self.up_ptrs.packed_ptrs,
             self.up_ptrs.scale_ptrs,
@@ -180,7 +184,6 @@ impl NemotronMoeLayer {
         // Use ssm_deinterleaved (NOT attn_output) — attn_output is used by
         // Mamba-2 SSM y_ptr. MoE writing here during M-E prefill corrupts SSM output.
         let shared_down_out = ctx.buffers.ssm_deinterleaved();
-        let smem = (shared_inter.max(inter) as usize) * 4;
 
         // Native-FP8 shared down_proj. The fused kernel below only speaks NVFP4
         // (E2M1 LUT, per-group u8 scale, one f32 scale_2), so rather than teach
@@ -212,16 +215,27 @@ impl NemotronMoeLayer {
                 stream,
             )?;
         }
-        let fused_slots = if native_shared_down.is_some() {
-            top_k
+        // Smem split: routed slots need only inter*4 (10.75KB at omni);
+        // the shared slot needs shared_inter*4 (21.5KB). Two launches keep
+        // routed blocks off the 21.5KB reservation (occupancy), same math.
+        let (fused_slots, fused_smem, split_shared) = super::down_launch_plan(
+            top_k,
+            inter,
+            shared_inter,
+            self.split_shared_down,
+            native_shared_down.is_some(),
+        );
+        let fused_n = if fused_slots == top_k + 1 {
+            h
+        } else if self.moe_latent_size > 0 {
+            self.moe_latent_size as u32
         } else {
-            top_k + 1
+            h
         };
-
         KernelLaunch::new(ctx.gpu, self.relu2_down_shared_k)
-            .grid([div_ceil(h, 8), fused_slots, 1])
+            .grid([div_ceil(fused_n, 8), fused_slots, 1])
             .block([128, 1, 1])
-            .shared_mem(smem as u32)
+            .shared_mem(fused_smem)
             .arg_ptr(expert_up_out)
             .arg_ptr(self.down_ptrs.packed_ptrs)
             .arg_ptr(self.down_ptrs.scale_ptrs)
@@ -239,6 +253,20 @@ impl NemotronMoeLayer {
             .arg_u32(h)
             .arg_u32(top_k)
             .launch(stream)?;
+        if split_shared {
+            KernelLaunch::new(ctx.gpu, self.relu2_down_shared_slot_k)
+                .grid([div_ceil(h, 8), 1, 1])
+                .block([128, 1, 1])
+                .shared_mem(shared_inter * 4)
+                .arg_ptr(shared_up_out)
+                .arg_ptr(self.weights.shared_down.weight)
+                .arg_ptr(self.weights.shared_down.weight_scale)
+                .arg_f32(self.weights.shared_down.weight_scale_2)
+                .arg_ptr(shared_down_out)
+                .arg_u32(h)
+                .arg_u32(shared_inter)
+                .launch(stream)?;
+        }
 
         // Weighted sum + residual add
         let output = ctx.buffers.moe_output();
@@ -299,7 +327,11 @@ impl NemotronMoeLayer {
         let expert_up_out = ctx.buffers.expert_up_out();
         ops::moe_expert_gemv(
             ctx.gpu,
-            self.moe_expert_gemv_k,
+            if self.moe_expert_gemv_pf_k.0 != 0 {
+                self.moe_expert_gemv_pf_k
+            } else {
+                self.moe_expert_gemv_k
+            },
             latent_buf,
             self.up_ptrs.packed_ptrs,
             self.up_ptrs.scale_ptrs,
@@ -356,7 +388,6 @@ impl NemotronMoeLayer {
         // Mamba-2 SSM y_ptr. MoE writing here during M-E prefill corrupts SSM output.
         let shared_down_out = ctx.buffers.ssm_deinterleaved();
         let max_n = h.max(latent);
-        let smem = (shared_inter.max(inter) as usize) * 4;
 
         // LatentMoE is the live path on Puzzle (`hybrid_mamba2_latent_moe_...`),
         // so it needs the same native-FP8 shared_down substitution as the direct
@@ -386,16 +417,21 @@ impl NemotronMoeLayer {
                 stream,
             )?;
         }
-        let fused_slots = if native_shared_down.is_some() {
-            top_k
-        } else {
-            top_k + 1
-        };
-
+        let (fused_slots, fused_smem, split_shared) = super::down_launch_plan(
+            top_k,
+            inter,
+            shared_inter,
+            self.split_shared_down,
+            native_shared_down.is_some(),
+        );
+        // Routed-only launch (split_shared): slots output `latent`, so
+        // grid.x past div_ceil(latent,8) is 384 empty blocks/slot/layer.
+        // Fused top_k+1 still needs the shared slot's h.
+        let grid_x = div_ceil(if split_shared { latent } else { max_n }, 8);
         KernelLaunch::new(ctx.gpu, self.relu2_down_shared_k)
-            .grid([div_ceil(max_n, 8), fused_slots, 1])
+            .grid([grid_x, fused_slots, 1])
             .block([128, 1, 1])
-            .shared_mem(smem as u32)
+            .shared_mem(fused_smem)
             .arg_ptr(expert_up_out)
             .arg_ptr(self.down_ptrs.packed_ptrs)
             .arg_ptr(self.down_ptrs.scale_ptrs)
@@ -413,6 +449,20 @@ impl NemotronMoeLayer {
             .arg_u32(h) // N_shared: shared output dim = hidden_size
             .arg_u32(top_k)
             .launch(stream)?;
+        if split_shared {
+            KernelLaunch::new(ctx.gpu, self.relu2_down_shared_slot_k)
+                .grid([div_ceil(h, 8), 1, 1])
+                .block([128, 1, 1])
+                .shared_mem(shared_inter * 4)
+                .arg_ptr(shared_up_out)
+                .arg_ptr(self.weights.shared_down.weight)
+                .arg_ptr(self.weights.shared_down.weight_scale)
+                .arg_f32(self.weights.shared_down.weight_scale_2)
+                .arg_ptr(shared_down_out)
+                .arg_u32(h)
+                .arg_u32(shared_inter)
+                .launch(stream)?;
+        }
 
         // 5. Weighted sum in latent space: [top_k, L] → combined [L]
         //    Use latent_buf (ssm_ba, consumed by step 2) as output.

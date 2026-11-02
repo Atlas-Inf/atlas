@@ -11,10 +11,19 @@ use atlas_tier::{DirectSwapFile, Residency, SwapStore, VecSlotArena};
 /// A real-filesystem dir for O_DIRECT (tmpfs/overlay EINVALs on O_DIRECT —
 /// tolerated as a skip so containerized CI doesn't break).
 fn o_direct_file(record_bytes: usize, tag: &str) -> Option<(DirectSwapFile, std::path::PathBuf)> {
+    o_direct_file_with(record_bytes, tag, DirectSwapFile::create)
+}
+
+fn o_direct_file_with(
+    record_bytes: usize,
+    tag: &str,
+    create: fn(&Path, usize) -> anyhow::Result<DirectSwapFile>,
+) -> Option<(DirectSwapFile, std::path::PathBuf)> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/atlas-tier-tests");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("dsf-{tag}-{}.swap", std::process::id()));
-    match DirectSwapFile::create(&path, record_bytes) {
+    let _ = std::fs::remove_file(&path);
+    match create(&path, record_bytes) {
         Ok(f) => Some((f, path)),
         Err(e) => {
             // Opt-in enforcement: CI on a real disk sets this so a silent skip
@@ -34,6 +43,35 @@ fn o_direct_file(record_bytes: usize, tag: &str) -> Option<(DirectSwapFile, std:
 fn page_aligned(storage: &mut [u8], len: usize) -> &mut [u8] {
     let pad = (4096 - (storage.as_ptr() as usize & 0xfff)) & 0xfff;
     &mut storage[pad..pad + len]
+}
+
+/// `create_new`: the one open a tier holding private records needs — refuses
+/// an existing file or a planted symlink, owner-only, fully usable.
+#[test]
+fn create_new_is_exclusive_and_owner_only() {
+    let rb = 4096usize;
+    let Some((mut f, path)) = o_direct_file_with(rb, "new", DirectSwapFile::create_new) else {
+        return;
+    };
+    assert!(DirectSwapFile::create_new(&path, rb).is_err(), "exists");
+    assert!(DirectSwapFile::create_new(&path, 1000).is_err());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "no group/other access: {mode:o}");
+        let link = path.with_extension("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(DirectSwapFile::create_new(&link, rb).is_err());
+        let _ = std::fs::remove_file(&link);
+    }
+    let rec = vec![0x5Au8; rb];
+    f.write_record(2, &rec).unwrap();
+    let mut out = vec![0u8; rb];
+    f.read_record(2, &mut out).unwrap();
+    assert_eq!(out, rec);
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -169,5 +207,38 @@ fn direct_swap_file_grows_on_first_write() {
     // Sparse addressing: a high slot sets i_size to (slot + 1) * record_bytes.
     f.write_record(4, &vec![0x7D; rb]).unwrap();
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 5 * rb as u64);
+    let _ = std::fs::remove_file(path);
+}
+
+/// `read_records` returns consecutive records in slot order through both the
+/// aligned single-`pread` path and the unaligned per-record fallback, and a
+/// run reaching past the written end of the file is an error, not zeros.
+#[test]
+fn direct_swap_file_reads_consecutive_record_runs() {
+    let rb = 4096usize;
+    let Some((mut f, path)) = o_direct_file(rb, "runs") else {
+        return;
+    };
+    let mut src = vec![0u8; rb + 4096];
+    for slot in 0..4usize {
+        let rec = page_aligned(&mut src, rb);
+        rec.fill(0x10 + slot as u8);
+        f.write_record(slot, rec).unwrap();
+    }
+    let mut storage = vec![0u8; 3 * rb + 4096];
+    let aligned = page_aligned(&mut storage, 3 * rb);
+    f.read_records(1, aligned).unwrap();
+    for (i, rec) in aligned.chunks_exact(rb).enumerate() {
+        assert!(
+            rec.iter().all(|&b| b == 0x11 + i as u8),
+            "aligned record {i}"
+        );
+    }
+    let mut unaligned = vec![0u8; 2 * rb + 1];
+    f.read_records(2, &mut unaligned[1..]).unwrap();
+    assert!(unaligned[1..=rb].iter().all(|&b| b == 0x12));
+    assert!(unaligned[rb + 1..].iter().all(|&b| b == 0x13));
+    let mut past = vec![0u8; 2 * rb + 4096];
+    assert!(f.read_records(3, page_aligned(&mut past, 2 * rb)).is_err());
     let _ = std::fs::remove_file(path);
 }

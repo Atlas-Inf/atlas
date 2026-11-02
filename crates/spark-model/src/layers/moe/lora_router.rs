@@ -80,6 +80,11 @@ impl MoeLayer {
         if !self.moe_route_gate(ctx, "router")? {
             return Ok(());
         }
+        anyhow::ensure!(
+            !self.router_f32,
+            "MoE LoRA router fold requires BF16 gate_logits; this model's router keeps FP32 \
+             logits (moe_router_dtype float32)"
+        );
         apply_router_lora(
             ctx.gpu,
             &l.kernels,

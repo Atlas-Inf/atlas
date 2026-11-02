@@ -11,10 +11,16 @@ use atlas_core::config::ModelConfig;
 
 mod accessors;
 pub mod decode_meta;
+mod glm_latent;
+mod release;
 mod sizes;
 mod sizes_q12;
 mod sizes_q2;
-pub use decode_meta::{DECODE_META_MAX_ROWS, DECODE_META_MIN_ROWS, DecodeMetaLayout};
+mod verify_masks;
+pub use decode_meta::{
+    DECODE_BATCH_RUNGS, DECODE_META_MAX_ROWS, DECODE_META_MIN_ROWS, DecodeMetaLayout,
+    padded_batch_rung,
+};
 pub use sizes::{
     BufferSizes, HC_SCRATCH_ALIGN, HcPreScratchLayout, QSA_SELECT_SCRATCH_ROWS,
     hc_pre_scratch_layout,
@@ -132,8 +138,25 @@ pub struct BufferArena {
     /// (`ATLAS_GGUF_NATIVE_Q2_MMQ`). Shared by every kept-packed projection;
     /// each seam quantizes its activation here then runs the packed MMQ GEMM.
     q2_act_q8: DevicePtr,
+    /// BF16 view of one owner's GLM `fp8_g128` latents `[tokens, 512]`, read
+    /// through `glm_identity_table` by the BF16 dense/native prefill kernels.
+    /// NULL unless attached (see [`BufferArena::attach_glm_latent_scratch`]).
+    glm_latent_bf16: DevicePtr,
+    /// `u32[tokens / 16]` identity block table over `glm_latent_bf16`.
+    glm_identity_table: DevicePtr,
+    /// Token capacity of `glm_latent_bf16` (not an allocation).
+    glm_latent_tokens: usize,
+    /// Per-row grammar masks of a strict structured-output verify on the GLM
+    /// TP2 split head. NULL unless attached
+    /// (see [`BufferArena::attach_verify_masks`]).
+    verify_masks: DevicePtr,
+    /// Bytes of `verify_masks` (not an allocation).
+    verify_masks_bytes: usize,
     /// Maximum batch tokens this arena was sized for.
     max_batch_tokens: usize,
+    /// Rows a pass may have written since the arena was last all zero
+    /// (`accessors`, `zero_dirty`); `usize::MAX` when unknown.
+    dirty_rows: std::sync::atomic::AtomicUsize,
     /// Derived batched-decode metadata layout (rows = max(32, serve
     /// max_batch_size)); byte-identical to the legacy fixed 32-row gaps for
     /// every bs <= 32. SSOT consumed by `upload_batch_metadata_fixed`/`_at`.
@@ -310,175 +333,20 @@ impl BufferArena {
             lora_hact,
             lora_seq_slot,
             q2_act_q8,
+            glm_latent_bf16: DevicePtr::NULL,
+            glm_identity_table: DevicePtr::NULL,
+            glm_latent_tokens: 0,
+            verify_masks: DevicePtr::NULL,
+            verify_masks_bytes: 0,
             max_batch_tokens,
+            dirty_rows: std::sync::atomic::AtomicUsize::new(usize::MAX),
             decode_meta,
             sizes,
         })
     }
 }
 
-/// Release every buffer this arena owns.
-///
-/// The destructure below is **exhaustive on purpose — no `..`**. A buffer added
-/// to `BufferArena` without a matching free is a leak that only shows up as the
-/// next model failing to fit, so the compiler is made to refuse the addition
-/// instead. If this line stops compiling, the fix is to free the new field, not
-/// to add a wildcard.
-impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
-    fn label(&self) -> &'static str {
-        "buffer arena"
-    }
-
-    fn release(&mut self, gpu: &dyn GpuBackend) -> anyhow::Result<()> {
-        let Self {
-            // Not allocations — named rather than wildcarded so the
-            // exhaustiveness check above keeps its teeth.
-            sizes: _,
-            max_batch_tokens: _,
-            // Layout, not an allocation — derived from `--max-batch-size`.
-            decode_meta: _,
-            hidden_states,
-            residual,
-            norm_output,
-            qkv_output,
-            attn_output,
-            gate_logits,
-            gate_logits_f32,
-            moe_router_in_f32,
-            moe_output,
-            logits,
-            ssm_qkvz,
-            ssm_ba,
-            ssm_deinterleaved,
-            ssm_gates,
-            ssm_conv_out_f32,
-            scratch,
-            expert_gate_out,
-            expert_up_out,
-            expert_down_out,
-            splitk_workspace,
-            o_latent,
-            norm_unit_w,
-            hc_streams,
-            hc_post,
-            hc_comb,
-            hc_lowrank_scratch,
-            qsa_select_scratch,
-            gdn_fla_scratch,
-            ssd_scratch,
-            token_ids,
-            ffn_act_q8,
-            ffn_act_a,
-            ffn_act_scale,
-            fp8_act,
-            fp8_act_scale,
-            lora_xa,
-            lora_delta,
-            lora_hact,
-            lora_seq_slot,
-            q2_dequant_scratch,
-            q2_act_q8,
-        } = self;
-        // Every pointer, then NULL it: `release` must be idempotent because a
-        // `Drop` backstop may call it again, and `free` already no-ops on NULL.
-        let owned = [
-            *hidden_states,
-            *residual,
-            *norm_output,
-            *qkv_output,
-            *attn_output,
-            *gate_logits,
-            *gate_logits_f32,
-            *moe_router_in_f32,
-            *moe_output,
-            *logits,
-            *ssm_qkvz,
-            *ssm_ba,
-            *ssm_deinterleaved,
-            *ssm_gates,
-            *ssm_conv_out_f32,
-            *scratch,
-            *expert_gate_out,
-            *expert_up_out,
-            *expert_down_out,
-            *splitk_workspace,
-            *o_latent,
-            *norm_unit_w,
-            *hc_streams,
-            *hc_lowrank_scratch,
-            *qsa_select_scratch,
-            *hc_post,
-            *hc_comb,
-            *gdn_fla_scratch,
-            *ssd_scratch,
-            *token_ids,
-            *ffn_act_q8,
-            *ffn_act_a,
-            *ffn_act_scale,
-            *fp8_act,
-            *fp8_act_scale,
-            *lora_xa,
-            *lora_delta,
-            *lora_hact,
-            *lora_seq_slot,
-            *q2_dequant_scratch,
-            *q2_act_q8,
-        ];
-        let mut first_error = None;
-        for ptr in owned {
-            if let Err(e) = gpu.free(ptr)
-                && first_error.is_none()
-            {
-                first_error = Some(e);
-            }
-        }
-        *hidden_states = DevicePtr::NULL;
-        *residual = DevicePtr::NULL;
-        *norm_output = DevicePtr::NULL;
-        *qkv_output = DevicePtr::NULL;
-        *attn_output = DevicePtr::NULL;
-        *gate_logits = DevicePtr::NULL;
-        *gate_logits_f32 = DevicePtr::NULL;
-        *moe_router_in_f32 = DevicePtr::NULL;
-        *moe_output = DevicePtr::NULL;
-        *logits = DevicePtr::NULL;
-        *ssm_qkvz = DevicePtr::NULL;
-        *ssm_ba = DevicePtr::NULL;
-        *ssm_deinterleaved = DevicePtr::NULL;
-        *ssm_gates = DevicePtr::NULL;
-        *ssm_conv_out_f32 = DevicePtr::NULL;
-        *scratch = DevicePtr::NULL;
-        *expert_gate_out = DevicePtr::NULL;
-        *expert_up_out = DevicePtr::NULL;
-        *expert_down_out = DevicePtr::NULL;
-        *splitk_workspace = DevicePtr::NULL;
-        *o_latent = DevicePtr::NULL;
-        *norm_unit_w = DevicePtr::NULL;
-        *hc_streams = DevicePtr::NULL;
-        *hc_lowrank_scratch = DevicePtr::NULL;
-        *qsa_select_scratch = DevicePtr::NULL;
-        *hc_post = DevicePtr::NULL;
-        *hc_comb = DevicePtr::NULL;
-        *gdn_fla_scratch = DevicePtr::NULL;
-        *ssd_scratch = DevicePtr::NULL;
-        *token_ids = DevicePtr::NULL;
-        *ffn_act_q8 = DevicePtr::NULL;
-        *ffn_act_a = DevicePtr::NULL;
-        *ffn_act_scale = DevicePtr::NULL;
-        *fp8_act = DevicePtr::NULL;
-        *fp8_act_scale = DevicePtr::NULL;
-        *lora_xa = DevicePtr::NULL;
-        *lora_delta = DevicePtr::NULL;
-        *lora_hact = DevicePtr::NULL;
-        *lora_seq_slot = DevicePtr::NULL;
-        *q2_dequant_scratch = DevicePtr::NULL;
-        *q2_act_q8 = DevicePtr::NULL;
-        match first_error {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod zero_dirty_tests;

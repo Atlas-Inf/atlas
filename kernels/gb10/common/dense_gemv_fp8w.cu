@@ -18,6 +18,7 @@
 // Design: same as dense_gemv_bf16 — N_PER_BLOCK=4 outputs per block,
 // 64 threads (2 warps) per output, cross-warp shared memory reduction.
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -136,6 +137,7 @@ extern "C" __global__ void dense_gemv_fp8w(
     unsigned int N,
     unsigned int K
 ) {
+    atlas_pdl_enter();
     const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
     const unsigned int local_out = threadIdx.x / threads_per_out;
     const unsigned int lane = threadIdx.x % threads_per_out;

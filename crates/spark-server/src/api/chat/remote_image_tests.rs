@@ -198,6 +198,36 @@ fn a_non_image_content_type_is_refused() {
     assert!(err.contains("not an image"), "{err}");
 }
 
+#[test]
+fn image_fetcher_still_refuses_video_content() {
+    let url = one_shot(http_response("video/mp4", b"mp4bytes"));
+    let err = fetch_as_data_uri(&url, &enabled()).unwrap_err();
+    assert!(err.contains("not an image"), "{err}");
+}
+
+#[test]
+fn video_fetcher_accepts_video_content() {
+    let url = one_shot(http_response("video/mp4", b"mp4bytes"));
+    let uri = fetch_media_as_data_uri(&url, &enabled(), RemoteMediaKind::Video)
+        .expect("video MIME is allowed for video media");
+    assert!(uri.starts_with("data:video/mp4;base64,"), "{uri}");
+}
+
+#[test]
+fn video_fetcher_accepts_animated_gif_content() {
+    let url = one_shot(http_response("image/gif", b"gifbytes"));
+    let uri = fetch_media_as_data_uri(&url, &enabled(), RemoteMediaKind::Video)
+        .expect("animated GIF MIME is allowed for video media");
+    assert!(uri.starts_with("data:image/gif;base64,"), "{uri}");
+}
+
+#[test]
+fn video_fetcher_rejects_unrelated_content() {
+    let url = one_shot(http_response("image/png", b"pngbytes"));
+    let err = fetch_media_as_data_uri(&url, &enabled(), RemoteMediaKind::Video).unwrap_err();
+    assert!(err.contains("not a video"), "{err}");
+}
+
 /// ★ The cap is enforced on BYTES READ, and the case that needs it is a
 /// response that declares NO length: the body then runs until the peer closes,
 /// so nothing but our own limit bounds it. `.take(cap + 1)` is what stops it,

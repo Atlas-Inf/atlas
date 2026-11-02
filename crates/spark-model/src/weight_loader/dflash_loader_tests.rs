@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::*;
+use spark_runtime::weights::WeightDtype;
 
 /// Smoke-test the DFlash drafter `config.json` parser against the live
 /// `z-lab/Qwen3.6-35B-A3B-DFlash` checkpoint downloaded into the user's
@@ -140,4 +141,242 @@ fn test_live_qwen38_dflash2_safetensors_keys() {
         assert!(map.contains_key(&format!("layers.{l}.mlp_conv.base_kernel")));
         assert!(map.contains_key(&format!("layers.{l}.mlp_conv.kernel_projection.weight")));
     }
+}
+
+/// `incoai/GLM-5.3-Flash-DFlash2` config.json (transformers 5): rope_theta
+/// only inside `rope_parameters`, block_size only inside `dflash_config`,
+/// eps 1e-5, and the window via `use_sliding_window` + `layer_types`.
+const GLM53_DFLASH2_CONFIG_JSON: &str = r#"{
+  "architectures": ["DFlash2DraftModel"],
+  "attention_bias": false,
+  "dflash_config": {
+    "block_size": 8,
+    "conv_group_size": 16,
+    "conv_kernel_size": 2,
+    "mask_token_id": 154856,
+    "selector_rank": 256,
+    "selector_top_k": 16,
+    "target_layer_ids": [5, 14, 24, 33, 42]
+  },
+  "dtype": "bfloat16",
+  "eos_token_id": [154820, 154827, 154829],
+  "head_dim": 128,
+  "hidden_act": "silu",
+  "hidden_size": 4096,
+  "intermediate_size": 12288,
+  "is_causal": false,
+  "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention",
+                  "sliding_attention", "sliding_attention"],
+  "max_position_embeddings": 1048576,
+  "model_type": "qwen3",
+  "num_attention_heads": 32,
+  "num_hidden_layers": 5,
+  "num_key_value_heads": 8,
+  "num_target_layers": 45,
+  "rms_norm_eps": 1e-05,
+  "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+  "sliding_window": 2048,
+  "tie_word_embeddings": false,
+  "transformers_version": "5.7.0",
+  "use_sliding_window": true,
+  "vocab_size": 154880
+}"#;
+
+#[test]
+fn parse_glm53_dflash2_config() {
+    let config = parse_dflash_config(GLM53_DFLASH2_CONFIG_JSON).expect("parse GLM DFlash2");
+    assert!(config.is_dflash2());
+    assert_eq!(config.hidden_size, 4096);
+    assert_eq!(config.num_key_value_heads, 8);
+    assert_eq!(config.vocab_size, 154880);
+    assert_eq!(
+        config.block_size, 8,
+        "nested block_size folds into the root"
+    );
+    assert_eq!(config.block_size(), 8);
+    assert_eq!(config.rope_theta, 10_000.0, "theta from rope_parameters");
+    assert!(
+        config.rope_scaling.is_none(),
+        "rope_type=default is plain RoPE"
+    );
+    assert_eq!(config.rms_norm_eps, 1e-5);
+    assert!(!config.query_causal());
+    assert_eq!(config.sliding_window(), Some(2048));
+    let sub = config.dflash_config.as_ref().expect("dflash_config");
+    assert_eq!(sub.mask_token_id, 154856);
+    assert_eq!(sub.target_layer_ids, vec![5, 14, 24, 33, 42]);
+}
+
+/// Root keys keep precedence over the transformers-5 / nested fallbacks, and
+/// a v1-style config without them keeps the historical defaults.
+#[test]
+fn dflash_config_fallbacks_keep_v1_defaults() {
+    let base = serde_json::json!({
+        "hidden_size": 2048, "num_hidden_layers": 8, "intermediate_size": 6144,
+        "num_attention_heads": 32, "num_key_value_heads": 4, "head_dim": 128,
+        "vocab_size": 248320,
+        "layer_types": ["full_attention"], "use_sliding_window": false, "sliding_window": 4096,
+        "dflash_config": {"mask_token_id": 248070, "target_layer_ids": [1, 10]}
+    });
+    let v1 = parse_dflash_config(&base.to_string()).unwrap();
+    assert!(!v1.is_dflash2());
+    assert_eq!(v1.block_size, 16);
+    assert_eq!(v1.rope_theta, 10_000_000.0);
+    assert_eq!(v1.rms_norm_eps, 1e-6);
+    assert!(!v1.query_causal());
+    assert_eq!(v1.sliding_window(), None);
+
+    let mut root = base.clone();
+    root["block_size"] = 16.into();
+    root["rope_theta"] = 5e6.into();
+    root["is_causal"] = true.into();
+    root["rope_parameters"] = serde_json::json!({
+        "rope_theta": 1e4, "rope_type": "yarn", "factor": 4.0
+    });
+    root["dflash_config"]["block_size"] = 8.into();
+    root["dflash_config"]["causal"] = false.into();
+    let root = parse_dflash_config(&root.to_string()).unwrap();
+    assert_eq!(
+        root.block_size, 8,
+        "nested block_size wins, as in block_size()"
+    );
+    assert_eq!(root.rope_theta, 5e6);
+    assert!(
+        root.query_causal(),
+        "is_causal wins over dflash_config.causal"
+    );
+    let scaling = root
+        .rope_scaling
+        .expect("yarn rope_parameters fold into rope_scaling");
+    assert_eq!(scaling.rope_type.as_deref(), Some("yarn"));
+    assert_eq!(scaling.factor, Some(4.0));
+}
+
+/// NVIDIA LiLiCorr drafter config (the public `config.json`):
+/// parses SWA, lilicorr markers, has_own_lm_head, and — critically — must
+/// NOT admit to the Lightning DSpark path (generic DFlash admission).
+#[test]
+fn parse_lilicorr_drafter_config() {
+    let json = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test_data/lilicorr_drafter_config.json"
+    ));
+    let config = parse_dflash_config(json).expect("parse LiLiCorr drafter config");
+    assert_eq!(
+        config.architectures.as_deref(),
+        Some(&["LiLiCorrDraftModel".to_string()][..])
+    );
+    assert!(!config.is_dflash2());
+    assert_eq!(config.block_size(), 8);
+    assert_eq!(config.hidden_size, 4096);
+    assert_eq!(config.num_hidden_layers, 5);
+    assert_eq!(config.num_attention_heads, 32);
+    assert_eq!(config.num_key_value_heads, 8);
+    assert_eq!(config.head_dim, 128);
+    assert_eq!(config.intermediate_size, 12288);
+    assert_eq!(config.vocab_size, 131072);
+    assert_eq!(config.has_own_lm_head, Some(true));
+    assert!(!config.tie_word_embeddings);
+    // Public drafter: plain RoPE, sliding-window attention over 8192 positions.
+    assert!(config.rope_scaling.is_none());
+    let sub = config.dflash_config.expect("dflash_config");
+    assert_eq!(sub.mask_token_id, 990);
+    assert_eq!(sub.target_layer_ids, vec![1, 22, 43, 64, 85]);
+    assert_eq!(sub.causal, Some(false));
+    assert_eq!(sub.projector_type.as_deref(), Some("lilicorr"));
+    assert_eq!(sub.lilicorr_enabled, Some(true));
+    assert_eq!(sub.conv_kernel_size, Some(2));
+    assert_eq!(sub.conv_group_size, Some(16));
+    assert_eq!(sub.use_swa, Some(true));
+    assert_eq!(sub.swa_window_size, Some(8192));
+}
+
+/// The LiLiCorr drafter must never reach the Lightning DSpark admission —
+/// `admit_lightning_dspark_build` returns Ok(None) for non-Lightning
+/// architectures, leaving the generic DFlash path to take it.
+#[test]
+fn lilicorr_config_takes_generic_dflash_admission_path() {
+    use crate::factory::{DflashBuildArgs, admit_lightning_dspark_build};
+    use atlas_core::config::ModelConfig;
+    use spark_runtime::kv_cache::KvCacheDtype;
+    let json = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test_data/lilicorr_drafter_config.json"
+    ));
+    let store = WeightStore::empty();
+    let args = DflashBuildArgs {
+        drafter_store: &store,
+        drafter_config: parse_dflash_config(json).expect("parse LiLiCorr config"),
+        gamma: Some(8),
+        window_size: Some(0),
+    };
+    let target = ModelConfig::qwen3_next_80b_nvfp4();
+    let admitted = admit_lightning_dspark_build(&args, &target, 1, 16, KvCacheDtype::Bf16)
+        .expect("generic admission must not error");
+    assert!(
+        admitted.is_none(),
+        "LiLiCorr is not Lightning — generic DFlash"
+    );
+}
+
+/// Own-lm_head policy: only `has_own_lm_head: true` + an NVFP4-packed
+/// (U8) `lm_head.weight` with both scale siblings selects the drafter's
+/// own head; every other shape shares the target's or fails closed.
+#[test]
+fn own_lm_head_policy() {
+    use spark_runtime::gpu::DevicePtr;
+    use spark_runtime::weights::WeightTensor;
+    use std::collections::HashMap;
+
+    let tensor = |dtype: WeightDtype| WeightTensor {
+        ptr: DevicePtr::NULL,
+        shape: vec![2, 2],
+        dtype,
+    };
+
+    // Default / false → shared, even if a stray lm_head tensor exists.
+    let mut weights = HashMap::new();
+    weights.insert("lm_head.weight".to_owned(), tensor(WeightDtype::UInt8));
+    weights.insert(
+        "lm_head.weight_scale".to_owned(),
+        tensor(WeightDtype::FP8E4M3),
+    );
+    weights.insert(
+        "lm_head.weight_scale_2".to_owned(),
+        tensor(WeightDtype::FP32),
+    );
+    let store = WeightStore::from_map(weights);
+    assert!(!own_lm_head_present(&store, "", None).unwrap());
+    assert!(!own_lm_head_present(&store, "", Some(false)).unwrap());
+
+    // Some(true) + packed NVFP4 triple → own head.
+    assert!(own_lm_head_present(&store, "", Some(true)).unwrap());
+
+    // Some(true) + missing tensor → bail.
+    let empty = WeightStore::empty();
+    assert!(own_lm_head_present(&empty, "", Some(true)).is_err());
+
+    // Some(true) + non-U8 dtype → bail.
+    let mut bad = HashMap::new();
+    bad.insert("lm_head.weight".to_owned(), tensor(WeightDtype::BF16));
+    bad.insert(
+        "lm_head.weight_scale".to_owned(),
+        tensor(WeightDtype::FP8E4M3),
+    );
+    bad.insert(
+        "lm_head.weight_scale_2".to_owned(),
+        tensor(WeightDtype::FP32),
+    );
+    let bad_store = WeightStore::from_map(bad);
+    assert!(own_lm_head_present(&bad_store, "", Some(true)).is_err());
+
+    // Some(true) + missing scale_2 → bail.
+    let mut no_scale2 = HashMap::new();
+    no_scale2.insert("lm_head.weight".to_owned(), tensor(WeightDtype::UInt8));
+    no_scale2.insert(
+        "lm_head.weight_scale".to_owned(),
+        tensor(WeightDtype::FP8E4M3),
+    );
+    let no_scale2 = WeightStore::from_map(no_scale2);
+    assert!(own_lm_head_present(&no_scale2, "", Some(true)).is_err());
 }

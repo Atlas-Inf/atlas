@@ -46,6 +46,7 @@ fn collect(m: &Message) -> (Vec<(MediaKind, String)>, usize) {
         &mut media,
         &mut pads,
         &crate::api::chat::remote_image::RemoteImagePolicy::default(),
+        &mut 0,
     )
     .expect("base64 URIs need no fetch policy");
     (
@@ -123,11 +124,23 @@ fn media_accumulates_across_messages_in_order() {
     let mut media = Vec::new();
     let mut pads = Vec::new();
     let policy = crate::api::chat::remote_image::RemoteImagePolicy::default();
-    collect_message_media(&first, &mut media, &mut pads, &policy).expect("first");
-    collect_message_media(&second, &mut media, &mut pads, &policy).expect("second");
+    collect_message_media(&first, &mut media, &mut pads, &policy, &mut 0).expect("first");
+    collect_message_media(&second, &mut media, &mut pads, &policy, &mut 0).expect("second");
     assert_eq!(
         media.iter().map(|i| i.kind).collect::<Vec<_>>(),
         vec![MediaKind::Video, MediaKind::Image]
     );
     assert_eq!(pads.len(), 2);
+}
+
+#[test]
+fn remote_fetches_are_capped_per_request_in_data_uri_bytes() {
+    let mut fetched = 0;
+    assert!(super::charge_fetched(&mut fetched, super::REMOTE_FETCH_TOTAL_MAX - 1).is_ok());
+    assert!(
+        super::charge_fetched(&mut fetched, 1).is_ok(),
+        "exactly the cap"
+    );
+    let resp = super::charge_fetched(&mut fetched, 1).unwrap_err();
+    assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
 }

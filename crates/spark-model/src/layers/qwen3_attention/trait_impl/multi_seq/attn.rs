@@ -54,7 +54,11 @@ impl Qwen3AttentionLayer {
         if self.rope_disabled {
             return Ok(());
         }
-        if n > 1 && self.rope_strided_k.0 != 0 && rope_strided_enabled() {
+        if self.yarn_inv_freq.is_null()
+            && n > 1
+            && self.rope_strided_k.0 != 0
+            && rope_strided_enabled()
+        {
             let stride_e = (per_seq_qkv / bf16) as u32;
             return ops::rope_strided(
                 fwd.gpu,
@@ -97,20 +101,19 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             } else {
-                ops::rope_yarn_scaled(
+                self.apply_scaled_rope(
                     fwd.gpu,
-                    self.rope_yarn_scaled_k,
                     q_out_i,
                     k_out_i,
                     pos_i,
+                    meta.positions_h.offset(i * 4),
+                    meta.positions_w.offset(i * 4),
                     1,
                     nq,
                     nkv,
                     hd,
                     self.rotary_dim_override
                         .unwrap_or(fwd.config.rotary_dim() as u32),
-                    self.yarn_inv_freq,
-                    self.yarn_attention_factor,
                     stream,
                 )?;
             }

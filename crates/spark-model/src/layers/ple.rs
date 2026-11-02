@@ -51,6 +51,11 @@ pub mod ids;
 #[path = "ple/tests.rs"]
 mod tests;
 
+/// GPU parity test for `NgramTable::ResidentNvfp4` (real CUDA + files).
+#[cfg(all(test, feature = "cuda"))]
+#[path = "ple/resident_tests.rs"]
+mod resident_tests;
+
 #[path = "ple/dump.rs"]
 pub mod dump;
 
@@ -66,4 +71,12 @@ pub use ids::{PleIdDims, ple_ngram_ids};
 pub(crate) use layer::bounded_scratch;
 #[cfg_attr(not(feature = "cuda"), allow(unused_imports))]
 pub(crate) use layer::warm::warm_ahead_tokens;
-pub use layer::{PleLayer, PleSeqState, PleWeights};
+pub use layer::{PleLayer, PleSeqRows, PleSeqState, PleWeights};
+// Agreed across ranks at startup (`model::startup_parity`).
+pub(crate) use layer::verify_snapshots_enabled;
+// The weight loader builds an EXL3 trellis spec. Non-CUDA builds do not
+// construct PLE layers, so the import is unused there.
+#[cfg_attr(not(feature = "cuda"), allow(unused_imports))]
+pub(crate) use layer::ngram_nvfp4;
+#[cfg_attr(not(feature = "cuda"), allow(unused_imports))]
+pub(crate) use layer::ngram_trellis;

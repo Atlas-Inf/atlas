@@ -50,7 +50,8 @@ fn the_options_picker_names_the_flag_and_marks_the_current_value() {
 }
 
 #[test]
-fn a_sixteen_row_option_list_scrolls_rather_than_clips() {
+fn a_long_option_list_scrolls_rather_than_clips() {
+    use spark_runtime::kv_cache::KvCacheDtype;
     let mut a = form();
     select_row(&mut a, "kv_cache_dtype");
     press(&mut a, KeyCode::Enter);
@@ -58,8 +59,10 @@ fn a_sixteen_row_option_list_scrolls_rather_than_clips() {
     // 30 rows is plenty of frame; the constrained dimension is the pane, so
     // force the squeeze with a short terminal instead.
     let rows = screen(&a, 100, 14);
+    let last = KvCacheDtype::ALL[KvCacheDtype::ALL.len() - 1].name();
+    let count = KvCacheDtype::ALL.len();
     assert!(
-        has(&rows, "fp8k_turbo2v"),
+        has(&rows, last),
         "the cursor's row is inside the window at the bottom:\n{rows:#?}"
     );
     assert!(
@@ -67,7 +70,7 @@ fn a_sixteen_row_option_list_scrolls_rather_than_clips() {
         "the top of the list scrolled out:\n{rows:#?}"
     );
     assert!(
-        has(&rows, "16/16"),
+        has(&rows, &format!("{count}/{count}")),
         "the clipped list says where you are:\n{rows:#?}"
     );
 }

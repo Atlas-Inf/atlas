@@ -32,71 +32,74 @@ fn device_topk_writes_every_id_the_gather_reads() {
         spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &set.modules).expect("CUDA backend");
     let g: &dyn GpuBackend = &gpu;
     let stream = g.default_stream();
-    let kernel = g.kernel("qsa_indexer", "qsa_select_topk").unwrap();
+    // Both device arms: the O(n^2) rank kernel and the radix-select default.
+    for kname in ["qsa_select_topk", "qsa_select_topk_radix"] {
+        let kernel = g.kernel("qsa_indexer", kname).unwrap();
 
-    let (ratio, topk, tail) = (4usize, 8usize, 2usize);
-    let nan = f32::NAN;
-    let cases: [(&str, Vec<f32>); 6] = [
-        ("distinct", (0..12).map(|b| ((b * 7) % 12) as f32).collect()),
-        ("all tied at zero", vec![0.0; 12]),
-        (
-            "signed zeros",
-            vec![
-                -0.0, 0.0, -0.0, 0.0, 1.0, 1.0, -0.0, 0.0, 2.0, 0.0, -0.0, 0.0,
-            ],
-        ),
-        (
-            "+inf",
-            vec![
-                1.0,
-                f32::INFINITY,
-                0.5,
-                f32::INFINITY,
-                0.0,
-                0.0,
-                3.0,
-                0.0,
-                0.0,
-                2.0,
-                0.0,
-                0.0,
-            ],
-        ),
-        // 5 real scores for 8 slots: three NaN blocks MUST be taken, by index.
-        (
-            "some NaN",
-            vec![nan, 0.5, nan, 0.25, nan, 1.0, nan, nan, 0.75, nan, 2.0, nan],
-        ),
-        ("all NaN", vec![nan; 12]),
-    ];
-    for (name, scores) in cases {
-        let complete = scores.len();
-        let tail_start = complete * ratio;
-        let visible = tail_start + tail;
-        let n_sel = topk * ratio + tail;
-        let bytes: Vec<u8> = scores.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let scores_dev = upload(g, &bytes);
-        // Every entry starts as -1: one the kernel does not write stays -1.
-        let sel_dev = upload(g, &vec![0xFFu8; n_sel * 4]);
-        crate::layers::ops::qsa_select_topk(
-            g,
-            kernel,
-            scores_dev,
-            sel_dev,
-            complete as u32,
-            topk as u32,
-            ratio as u32,
-            tail_start as u32,
-            visible as u32,
-            stream,
-        )
-        .unwrap();
-        let got = dl_i32(g, sel_dev, n_sel);
-        assert!(
-            got.iter().all(|t| *t >= 0 && (*t as usize) < visible),
-            "{name}: the gather would read an unwritten or out-of-range id: {got:?}"
-        );
-        let want = expand_selection(&select_blocks(&scores, topk), ratio, tail_start, visible);
-        assert_eq!(got, want, "{name}: device and host arms disagree");
+        let (ratio, topk, tail) = (4usize, 8usize, 2usize);
+        let nan = f32::NAN;
+        let cases: [(&str, Vec<f32>); 6] = [
+            ("distinct", (0..12).map(|b| ((b * 7) % 12) as f32).collect()),
+            ("all tied at zero", vec![0.0; 12]),
+            (
+                "signed zeros",
+                vec![
+                    -0.0, 0.0, -0.0, 0.0, 1.0, 1.0, -0.0, 0.0, 2.0, 0.0, -0.0, 0.0,
+                ],
+            ),
+            (
+                "+inf",
+                vec![
+                    1.0,
+                    f32::INFINITY,
+                    0.5,
+                    f32::INFINITY,
+                    0.0,
+                    0.0,
+                    3.0,
+                    0.0,
+                    0.0,
+                    2.0,
+                    0.0,
+                    0.0,
+                ],
+            ),
+            // 5 real scores for 8 slots: three NaN blocks MUST be taken, by index.
+            (
+                "some NaN",
+                vec![nan, 0.5, nan, 0.25, nan, 1.0, nan, nan, 0.75, nan, 2.0, nan],
+            ),
+            ("all NaN", vec![nan; 12]),
+        ];
+        for (name, scores) in cases {
+            let complete = scores.len();
+            let tail_start = complete * ratio;
+            let visible = tail_start + tail;
+            let n_sel = topk * ratio + tail;
+            let bytes: Vec<u8> = scores.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let scores_dev = upload(g, &bytes);
+            // Every entry starts as -1: one the kernel does not write stays -1.
+            let sel_dev = upload(g, &vec![0xFFu8; n_sel * 4]);
+            crate::layers::ops::qsa_select_topk(
+                g,
+                kernel,
+                scores_dev,
+                sel_dev,
+                complete as u32,
+                topk as u32,
+                ratio as u32,
+                tail_start as u32,
+                visible as u32,
+                stream,
+            )
+            .unwrap();
+            let got = dl_i32(g, sel_dev, n_sel);
+            assert!(
+                got.iter().all(|t| *t >= 0 && (*t as usize) < visible),
+                "{kname} {name}: the gather would read an unwritten or out-of-range id: {got:?}"
+            );
+            let want = expand_selection(&select_blocks(&scores, topk), ratio, tail_start, visible);
+            assert_eq!(got, want, "{kname} {name}: device and host arms disagree");
+        }
     }
 }

@@ -1,0 +1,14 @@
+[package]
+name = "atlas-tool-guard"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+description = "Bounded CPU-only checks for suspicious model-generated tool calls"
+
+[dependencies]
+serde_json.workspace = true
+url = "2"
+shlex = "1.3"
+
+[lints]
+workspace = true

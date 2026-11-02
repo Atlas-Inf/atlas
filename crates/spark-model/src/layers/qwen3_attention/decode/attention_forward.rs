@@ -96,7 +96,23 @@ impl Qwen3AttentionLayer {
 
         if self.gated {
             // Q+Gate projection with inline deinterleave (output is [Q_all | Gate_all])
-            if let Some(q2) = self.q_weight.as_ref().and_then(|w| w.as_packed_q2()) {
+            if let Some(r) =
+                self.try_mx8(ctx, self.q_weight.as_ref(), normed, q_out, 1, true, stream)
+            {
+                // Native MXFP8 (FP4-Local): raw interleaved [Q|gate], then split.
+                r?;
+                self.apply_q_lora(ctx, normed, q_out, stream)?;
+                ops::deinterleave_qg(
+                    ctx.gpu,
+                    self.deinterleave_qg_k,
+                    q_out,
+                    1,
+                    nq,
+                    hd,
+                    nq * hd * 2,
+                    stream,
+                )?;
+            } else if let Some(q2) = self.q_weight.as_ref().and_then(|w| w.as_packed_q2()) {
                 // Keep-packed Q2_0 (Tier-1c): 2-bit GEMV → gated [Q|Gate], then
                 // the same deinterleave the dense fallback uses.
                 ops::q2_0_gemv_vec(ctx.gpu, self.q2_0_gemv_k, normed, q2, q_out, stream)?;
@@ -201,7 +217,11 @@ impl Qwen3AttentionLayer {
             }
         } else {
             // Ungated: Q projection only (no gate)
-            if let Some(q2) = self.q_weight.as_ref().and_then(|w| w.as_packed_q2()) {
+            if let Some(r) =
+                self.try_mx8(ctx, self.q_weight.as_ref(), normed, q_out, 1, true, stream)
+            {
+                r?;
+            } else if let Some(q2) = self.q_weight.as_ref().and_then(|w| w.as_packed_q2()) {
                 ops::q2_0_gemv_vec(ctx.gpu, self.q2_0_gemv_k, normed, q2, q_out, stream)?;
             } else if let Some(fp8) = self.q_weight.as_ref().and_then(|w| w.as_fp8()) {
                 ops::w8a16_gemv(
@@ -447,20 +467,19 @@ impl Qwen3AttentionLayer {
         } else if self.rope_disabled {
             // Nemotron-H: no RoPE in attention (position lives in Mamba).
         } else if !self.yarn_inv_freq.is_null() {
-            ops::rope_yarn_scaled(
+            self.apply_scaled_rope(
                 ctx.gpu,
-                self.rope_yarn_scaled_k,
                 q_out,
                 k_out,
                 meta.positions,
+                meta.positions_h,
+                meta.positions_w,
                 1,
                 nq,
                 nkv,
                 hd,
                 self.rotary_dim_override
                     .unwrap_or(ctx.config.rotary_dim() as u32),
-                self.yarn_inv_freq,
-                self.yarn_attention_factor,
                 stream,
             )?;
         } else if self.rope_proportional && self.rope_proportional_k.0 != 0 {
@@ -622,19 +641,30 @@ impl Qwen3AttentionLayer {
             // sits at position `seq_len` — verified live: a 35-token
             // prompt's first decode arrives with seq_len=35 and 35 raw
             // keys already ingested by prefill.
-            let qsa_st =
-                crate::layers::qwen3_attention::helpers::qsa_seq_state(qsa, state, ctx.gpu)?;
-            qsa.decode_select(
-                qsa_st,
-                normed,
-                seq_len,
-                kv_cache.k_pool_ptr(self.attn_layer_idx),
-                kv_cache.v_pool_ptr(self.attn_layer_idx),
-                meta.block_table,
-                bs as u32,
-                ctx.gpu,
-                stream,
-            )?
+            if crate::layers::qsa::staged_ingest() {
+                // Inside a staged run (`qsa_staged.rs`, inert steps only):
+                // the projection here, the rest of the ingest after the run.
+                anyhow::ensure!(
+                    !qsa.is_active_at(seq_len),
+                    "QSA staged ingest at active pos {seq_len}"
+                );
+                qsa.stage_row(normed, 0, ctx.gpu, stream)?;
+                None
+            } else {
+                let qsa_st =
+                    crate::layers::qwen3_attention::helpers::qsa_seq_state(qsa, state, ctx.gpu)?;
+                qsa.decode_select(
+                    qsa_st,
+                    normed,
+                    seq_len,
+                    kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    meta.block_table,
+                    bs as u32,
+                    ctx.gpu,
+                    stream,
+                )?
+            }
         } else {
             None
         };

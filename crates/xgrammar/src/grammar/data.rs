@@ -92,9 +92,62 @@ pub struct GrammarData {
     /// Per-rule `(original_state_id, new_state_id)` mapping produced
     /// alongside the hash by `GrammarFSMHasher`.
     pub per_rule_fsm_new_state_ids: Vec<Vec<(i32, i32)>>,
+    /// The Earley dead-state pruning table ([`Self::productivity`]),
+    /// built on first use. `GrammarFsmBuilder` resets it with the FSMs.
+    pub(crate) productivity: std::sync::OnceLock<std::sync::Arc<crate::earley::ProductivityTable>>,
 }
 
 impl GrammarData {
+    /// The per-rule FSM productivity table for Earley dead-state pruning,
+    /// built once per grammar and shared by every parser over it.
+    ///
+    /// A parser is built for every adaptive token mask the matcher computes,
+    /// and building the table walks every rule's FSM, so rebuilding it per
+    /// parser made each mask cost O(grammar): a strict object of N required
+    /// properties (one rule chain per property) decoded in O(N) per token,
+    /// ~130 ms/token at N = 32 on a 248K vocabulary.
+    pub(crate) fn productivity(&self) -> std::sync::Arc<crate::earley::ProductivityTable> {
+        self.productivity
+            .get_or_init(|| std::sync::Arc::new(crate::earley::ProductivityTable::build(self)))
+            .clone()
+    }
+
+    /// Approximate heap footprint in bytes: rules, expressions, the shared
+    /// FSM (counted once), every rule's view of it, the FSM hashes and state
+    /// maps, and the pruning table once built.
+    pub fn memory_size(&self) -> usize {
+        use std::mem::size_of;
+        let rules: usize = self
+            .rules
+            .iter()
+            .map(|r| size_of::<Rule>() + r.name.len())
+            .sum();
+        let exprs = (self.expr_data.len() + self.expr_indptr.len()) * size_of::<i32>();
+        let views: usize = self
+            .per_rule_fsms
+            .iter()
+            .map(|v| {
+                size_of::<Option<CompactFsmWithStartEnd>>()
+                    + v.as_ref().map_or(0, |v| v.ends().len())
+            })
+            .sum();
+        let hashes = self.per_rule_fsm_hashes.len() * size_of::<Option<u64>>();
+        let state_maps: usize = self
+            .per_rule_fsm_new_state_ids
+            .iter()
+            .map(|m| size_of::<Vec<(i32, i32)>>() + m.len() * size_of::<(i32, i32)>())
+            .sum();
+        let pruning = self.productivity.get().map_or(0, |p| p.memory_size());
+        rules
+            + exprs
+            + self.allow_empty_rule_ids.len() * size_of::<i32>()
+            + self.complete_fsm.memory_size()
+            + views
+            + hashes
+            + state_maps
+            + pruning
+    }
+
     /// An empty grammar with no root.
     pub fn new() -> Self {
         Self {

@@ -28,7 +28,7 @@ impl GrammarFsmBuilder {
         // counts captured before splicing — needed so the per-rule
         // `CompactFsmWithStartEnd` reports the sub-FSM size rather than
         // the whole `complete_fsm` (upstream commit 58494db, #600).
-        let mut per_rule: Vec<Option<(FsmWithStartEnd, usize, usize)>> =
+        let mut per_rule: Vec<Option<(Splice, usize, usize)>> =
             Vec::with_capacity(num_rules as usize);
 
         for i in 0..num_rules {
@@ -51,11 +51,12 @@ impl GrammarFsmBuilder {
         let final_per_rule: Vec<Option<CompactFsmWithStartEnd>> = per_rule
             .into_iter()
             .map(|opt| {
-                opt.map(|(view, node_num, edge_num)| {
+                opt.map(|(splice, node_num, edge_num)| {
                     CompactFsmWithStartEnd::new_view(
                         compact_complete.clone(),
-                        view.start(),
-                        view.ends().to_vec(),
+                        splice.start,
+                        splice.base,
+                        splice.ends,
                         node_num,
                         edge_num,
                     )
@@ -63,23 +64,43 @@ impl GrammarFsmBuilder {
             })
             .collect();
 
+        // Rule-local analyses (pruning, reachability) rely on every edge
+        // staying within its rule's own nodes.
+        debug_assert!(final_per_rule.iter().flatten().all(|v| {
+            (v.base()..v.base() + v.num_states()).all(|n| {
+                v.fsm()
+                    .edges(n)
+                    .iter()
+                    .all(|e| (v.base()..v.base() + v.num_states()).contains(&(e.target as usize)))
+            })
+        }));
         grammar.complete_fsm = compact_complete;
         grammar.per_rule_fsms = final_per_rule;
+        // The pruning table is derived from the FSMs just replaced.
+        grammar.productivity = Default::default();
     }
 }
 
-/// Splice `sub` into `complete`, returning a view whose start/ends point
-/// at the spliced-in states.
-fn splice_into(complete: &mut Fsm, sub: &FsmWithStartEnd) -> FsmWithStartEnd {
+/// Where a rule's FSM landed in `complete_fsm`: its nodes are
+/// `base .. base + ends.len()`, `ends[i]` marks node `base + i`.
+struct Splice {
+    start: usize,
+    base: usize,
+    ends: Vec<bool>,
+}
+
+/// Splice `sub` into `complete` (appended, so its nodes are contiguous).
+/// Copies nothing of `complete`: a whole-FSM copy per rule made building
+/// O(rules x states).
+fn splice_into(complete: &mut Fsm, sub: &FsmWithStartEnd) -> Splice {
+    let base = complete.num_states();
     let mapping = complete.add_fsm(sub.fsm());
-    let new_start = mapping[sub.start()];
-    let mut new_ends = vec![false; complete.num_states()];
-    for s in 0..sub.num_states() {
-        if sub.is_end_state(s) {
-            new_ends[mapping[s]] = true;
-        }
+    debug_assert!(mapping.iter().enumerate().all(|(s, &m)| m == base + s));
+    Splice {
+        start: mapping[sub.start()],
+        base,
+        ends: (0..sub.num_states()).map(|s| sub.is_end_state(s)).collect(),
     }
-    FsmWithStartEnd::new(complete.clone(), new_start, new_ends, false)
 }
 
 /// FSM for a `RuleRef` element: a single rule-ref edge.

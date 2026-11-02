@@ -22,6 +22,7 @@
 // Each block copies one token's K and V (num_kv_heads * head_dim BF16 elements each)
 // to the correct paged cache location.
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 // V-only paged cache write. Used by the fused K-path so the K side stays
@@ -76,6 +77,7 @@ extern "C" __global__ void reshape_and_cache_flash(
     const unsigned int key_stride,               // key.stride(0) in elements (may differ from n_elems for non-contiguous views)
     const unsigned int value_stride              // value.stride(0) in elements
 ) {
+    atlas_pdl_enter();
     const unsigned int token_idx = blockIdx.x;
     const long long slot = slot_mapping[token_idx];
 

@@ -13,7 +13,7 @@ use spark_runtime::weights::WeightStore;
 use crate::mistral_loader::MistralWeightLoader;
 use crate::weight_loader::LongcatWeightLoader;
 use crate::weight_loader::{
-    DeepSeekV4WeightLoader, DflashConfig, Gemma4WeightLoader, LagunaWeightLoader,
+    DeepSeekV4WeightLoader, DflashConfig, Gemma4WeightLoader, Glm5WeightLoader, LagunaWeightLoader,
     MinimaxM2WeightLoader, ModelWeightLoader, NemotronHWeightLoader, NllbWeightLoader,
     Qwen3VLWeightLoader, Qwen3WeightLoader, Qwen4ExpWeightLoader, Qwen35DenseWeightLoader,
     Qwen35WeightLoader, Step3p7WeightLoader,
@@ -102,8 +102,11 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
         // not during weight loading.
         "qwen3_6_moe" | "holo3_1_moe" => Ok(Box::new(Qwen35WeightLoader)),
         // Nemotron-H family (Mamba-2 + MoE + Attention), including Puzzle
-        // (heterogeneous per-block MoE intermediate / top-k).
-        "nemotron_h" | "nemotron_h_puzzle" => Ok(Box::new(NemotronHWeightLoader)),
+        // (heterogeneous per-block MoE intermediate / top-k) and the 3.5
+        // Super VL omni wrapper (same backbone under `language_model.`).
+        "nemotron_h" | "nemotron_h_puzzle" | "nemotron_h_omni" => {
+            Ok(Box::new(NemotronHWeightLoader))
+        }
         // NLLB / M2M-100 encoder-decoder translation family.
         "m2m_100" | "nllb" => Ok(Box::new(NllbWeightLoader)),
         // Gemma-4 family (pure attention, GeGLU, sliding + full attention)
@@ -126,9 +129,10 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
         "laguna" => Ok(Box::new(LagunaWeightLoader)),
         // DeepSeek-V4 family (Flash) — MLA + MoE + CSA/HCA hybrid attention + mHC.
         "deepseek_v4" => Ok(Box::new(DeepSeekV4WeightLoader)),
+        "glm5_next" => Ok(Box::new(Glm5WeightLoader)),
         _ => bail!(
             "Unsupported model type: '{}' (normalized: '{}'). \
-             Supported: qwen3_next, qwen3_5_moe, qwen3_5, qwen3_6_moe, holo3_1_moe, qwen3_vl_moe, qwen4_exp, nemotron_h, nemotron_h_puzzle, gemma4, mistral, minimax_m2, step3p7, laguna, deepseek_v4, m2m_100",
+             Supported: qwen3_next, qwen3_5_moe, qwen3_5, qwen3_6_moe, holo3_1_moe, qwen3_vl_moe, qwen4_exp, nemotron_h, nemotron_h_puzzle, nemotron_h_omni, gemma4, mistral, minimax_m2, step3p7, laguna, deepseek_v4, m2m_100",
             config.model_type,
             normalized,
         ),
@@ -136,6 +140,10 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
 }
 
 mod build;
+pub(crate) mod glm_dense_cache;
+mod glm_hc_prewarm;
+mod glm_shared_cache;
+mod glm_sparse_decode;
 mod lm_head_setup;
 mod m2_setup;
 
@@ -198,6 +206,9 @@ mod tests {
         assert!(loader_for_config(&config).is_ok());
 
         config.model_type = "nemotron_h".to_string();
+        assert!(loader_for_config(&config).is_ok());
+
+        config.model_type = "nemotron_h_omni".to_string();
         assert!(loader_for_config(&config).is_ok());
 
         config.model_type = "holo3_1_moe".to_string();

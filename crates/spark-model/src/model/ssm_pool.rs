@@ -26,6 +26,9 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
+mod kda_records;
+mod specific_claim;
+
 /// Pre-allocated contiguous GPU memory pool for SSM layer states.
 ///
 /// Each pool slot has fixed GPU addresses for h_state and conv_state across
@@ -103,7 +106,29 @@ pub(crate) struct SsmStatePool {
     /// Empty in snapshot mode. Allocated so boot sizing is honest; the
     /// capture that would fill it is not wired yet.
     pub(super) replay_input_rings: Vec<DevicePtr>,
+    /// Deferred-commit input staging (ATLAS_GDN_DEFERRED_COMMIT): per
+    /// (layer, slot) copies of the wyN verify's conv-out q/k/v rows
+    /// (`16 × conv_dim` BF16) and gate/beta rows (`16 × 2·nv` FP32).
+    /// Pool-stable addresses — the staging copies run inside captured
+    /// verify forwards, so they must not be lazily allocated. Empty when
+    /// the lever is off.
+    pub(super) gdn_commit_qkv_pools: Vec<DevicePtr>,
+    pub(super) gdn_commit_gb_pools: Vec<DevicePtr>,
+    /// Per-slot byte sizes of the two staging pools above.
+    pub(super) commit_qkv_slot_bytes: usize,
+    pub(super) commit_gb_slot_bytes: usize,
+    /// `ATLAS_QWEN4EXP_GDN_COMMIT_FUSE`: one u32 a slot, the accepted tokens
+    /// of the commit the slot's next deferred verify lands first
+    /// (`trait_impl/async_chkpt/gdn_commit_fuse.rs`). NULL when off.
+    pub(super) gdn_fuse_words: DevicePtr,
+    /// GLM KDA fold records (`--ssm-rollback-mode records`); layout in `kda_records`.
+    pub(super) kda_record_pools: Vec<DevicePtr>,
+    pub(super) kda_record_row_bytes: usize,
     pub(super) free_slots: Mutex<Vec<usize>>,
+    /// Every device allocation behind the pools above, and nothing else.
+    /// `alloc_layer_pools` hands out per-layer offset VIEWS into one block, so
+    /// the pool vectors are not frees-able; teardown frees exactly these.
+    pub(super) allocations: Vec<DevicePtr>,
 }
 
 /// Prefix-sum layout for tiered per-slot H intermediates: returns
@@ -133,8 +158,12 @@ fn h_inter_layout(counts: &[usize]) -> (Vec<usize>, usize) {
 /// detector declines, and the copies run as the same per-layer loop they
 /// always did. Bytes allocated, and the addresses every accessor derives, are
 /// identical either way.
+///
+/// Each real allocation (the block, or each fallback region) is pushed onto
+/// `allocations` — the returned views are never freed individually.
 fn alloc_layer_pools(
     gpu: &dyn GpuBackend,
+    allocations: &mut Vec<DevicePtr>,
     num_ssm_layers: usize,
     bytes: usize,
 ) -> Result<Vec<DevicePtr>> {
@@ -144,6 +173,7 @@ fn alloc_layer_pools(
     if let Some(total) = bytes.checked_mul(num_ssm_layers)
         && let Ok(base) = gpu.alloc(total)
     {
+        allocations.push(base);
         gpu.memset(base, 0, total)?;
         return Ok((0..num_ssm_layers)
             .map(|l| base.offset(l * bytes))
@@ -157,6 +187,7 @@ fn alloc_layer_pools(
     let mut pools = Vec::with_capacity(num_ssm_layers);
     for _ in 0..num_ssm_layers {
         let p = gpu.alloc(bytes)?;
+        allocations.push(p);
         gpu.memset(p, 0, bytes)?;
         pools.push(p);
     }
@@ -175,6 +206,7 @@ impl SsmStatePool {
         num_drafts: usize,
         h_f16_pool: bool,
         rollback_mode: crate::ssm_reserve::SsmRollbackMode,
+        gdn_deferred_commit: bool,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
         let _d_conv = config.linear_conv_kernel_dim;
@@ -199,8 +231,53 @@ impl SsmStatePool {
         let mut h_checkpoint_pools = Vec::new();
         let mut conv_checkpoint_pools = Vec::new();
 
-        let h_state_pools = alloc_layer_pools(gpu, num_ssm_layers, total_slots * h_stored_bytes)?;
-        let conv_state_pools = alloc_layer_pools(gpu, num_ssm_layers, total_slots * conv_bytes)?;
+        let mut allocations = Vec::new();
+        let h_state_pools = alloc_layer_pools(
+            gpu,
+            &mut allocations,
+            num_ssm_layers,
+            total_slots * h_stored_bytes,
+        )?;
+        let conv_state_pools = alloc_layer_pools(
+            gpu,
+            &mut allocations,
+            num_ssm_layers,
+            total_slots * conv_bytes,
+        )?;
+
+        // Deferred-commit staging pools (lever-gated): 16-row verify window
+        // of conv-out q/k/v + gate/beta per slot — sized so K=16 fits.
+        let conv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
+            + config.linear_num_value_heads * config.linear_value_head_dim;
+        let commit_qkv_slot_bytes = 16 * conv_dim * 2;
+        let commit_gb_slot_bytes = 16 * config.linear_num_value_heads * 2 * 4;
+        let (gdn_commit_qkv_pools, gdn_commit_gb_pools) = if gdn_deferred_commit && has_mtp {
+            (
+                alloc_layer_pools(
+                    gpu,
+                    &mut allocations,
+                    num_ssm_layers,
+                    total_slots * commit_qkv_slot_bytes,
+                )?,
+                alloc_layer_pools(
+                    gpu,
+                    &mut allocations,
+                    num_ssm_layers,
+                    total_slots * commit_gb_slot_bytes,
+                )?,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let gdn_fuse_words =
+            if gdn_deferred_commit && has_mtp && super::trait_impl::gdn_commit_fuse::requested() {
+                let p = gpu.alloc(total_slots * 4)?;
+                allocations.push(p);
+                gpu.memset(p, 0, total_slots * 4)?;
+                p
+            } else {
+                DevicePtr::NULL
+            };
 
         // Stage-3 f16-SIZED pool: the FP32 prefill staging arena. Allocated
         // ONLY when the h slots actually narrowed — an FP32-sized pool needs
@@ -215,6 +292,7 @@ impl SsmStatePool {
                 None
             } else {
                 let p = gpu.alloc(bytes)?;
+                allocations.push(p);
                 gpu.memset(p, 0, bytes)?;
                 tracing::info!(
                     "SSM f16-sized h pool: FP32 prefill staging arena {} MB ({total_slots} slots × {h_bytes} B)",
@@ -283,14 +361,39 @@ impl SsmStatePool {
         };
         let (h_inter_offsets, h_inter_total) = h_inter_layout(&h_inter_counts);
         let mut replay_input_rings = Vec::new();
+        let records = has_mtp && rollback_mode == crate::ssm_reserve::SsmRollbackMode::Records;
+        let (kda_record_row_bytes, h_inter_held) =
+            kda_records::plan(records, config, h_stored_bytes, h_bytes, h_inter_total)?;
+        let mut kda_record_pools = Vec::new();
         if has_mtp {
             let ni = num_intermediates;
             let mtp_total = mtp_slots + 1;
-            if !replay {
-                h_intermediate_pools =
-                    alloc_layer_pools(gpu, num_ssm_layers, h_inter_total * h_stored_bytes)?;
-                conv_intermediate_pools =
-                    alloc_layer_pools(gpu, num_ssm_layers, mtp_total * ni * conv_bytes)?;
+            if records {
+                kda_record_pools = alloc_layer_pools(
+                    gpu,
+                    &mut allocations,
+                    num_ssm_layers,
+                    mtp_total * ni * kda_record_row_bytes,
+                )?;
+                conv_intermediate_pools = alloc_layer_pools(
+                    gpu,
+                    &mut allocations,
+                    num_ssm_layers,
+                    mtp_total * ni * conv_bytes,
+                )?;
+            } else if !replay {
+                h_intermediate_pools = alloc_layer_pools(
+                    gpu,
+                    &mut allocations,
+                    num_ssm_layers,
+                    h_inter_total * h_stored_bytes,
+                )?;
+                conv_intermediate_pools = alloc_layer_pools(
+                    gpu,
+                    &mut allocations,
+                    num_ssm_layers,
+                    mtp_total * ni * conv_bytes,
+                )?;
             } else {
                 // Replay: verify-window INPUT rows instead of state
                 // snapshots — (mtp_total slots incl. dummy) × (K-1)
@@ -301,18 +404,29 @@ impl SsmStatePool {
                     config.linear_num_value_heads,
                 );
                 let ring = crate::ssm_reserve::ssm_replay_ring_bytes(1, row, ni, mtp_total);
-                replay_input_rings = alloc_layer_pools(gpu, num_ssm_layers, ring)?;
+                replay_input_rings =
+                    alloc_layer_pools(gpu, &mut allocations, num_ssm_layers, ring)?;
             }
 
             // 1 checkpoint per slot per layer (BOTH modes: replay's
             // reconstruction base is exactly this blob).
-            h_checkpoint_pools =
-                alloc_layer_pools(gpu, num_ssm_layers, mtp_total * h_stored_bytes)?;
-            conv_checkpoint_pools = alloc_layer_pools(gpu, num_ssm_layers, mtp_total * conv_bytes)?;
+            h_checkpoint_pools = alloc_layer_pools(
+                gpu,
+                &mut allocations,
+                num_ssm_layers,
+                mtp_total * h_stored_bytes,
+            )?;
+            conv_checkpoint_pools = alloc_layer_pools(
+                gpu,
+                &mut allocations,
+                num_ssm_layers,
+                mtp_total * conv_bytes,
+            )?;
 
             let mtp_mb = num_ssm_layers
-                * (h_inter_total * h_stored_bytes
-                    + mtp_total * (ni * conv_bytes + h_stored_bytes + conv_bytes))
+                * (h_inter_held * h_stored_bytes
+                    + mtp_total
+                        * (ni * (conv_bytes + kda_record_row_bytes) + h_stored_bytes + conv_bytes))
                 / (1024 * 1024);
             // Baseline for the log: FULL-WIDTH UNIFORM sizing at today's
             // per-slot shape ((ni-1) H + ni conv + checkpoint).
@@ -368,7 +482,15 @@ impl SsmStatePool {
             h_inter_offsets,
             rollback_mode,
             replay_input_rings,
+            gdn_commit_qkv_pools,
+            gdn_commit_gb_pools,
+            commit_qkv_slot_bytes,
+            commit_gb_slot_bytes,
+            gdn_fuse_words,
+            kda_record_pools,
+            kda_record_row_bytes,
             free_slots: Mutex::new(free_slots),
+            allocations,
         })
     }
 
@@ -420,18 +542,32 @@ impl SsmStatePool {
 
     pub(super) fn release_slot(&self, idx: usize) {
         let mut free = self.free_slots.lock();
-        debug_assert!(
-            !free.contains(&idx),
-            "release_slot: slot {idx} already free (double-release hands it to two seqs)"
-        );
+        // UNCONDITIONAL (was a `debug_assert!`, compiled out of release
+        // builds): a slot pushed twice stays on the free list twice for the
+        // life of the process, and `claim_slot` then hands it to two sequences
+        // on every later overlap. Dropping the second push turns a slot
+        // double-ownership bug into a one-request fault instead of a
+        // process-lifetime one. `max_slots` is small, so the scan is free.
+        if free.contains(&idx) {
+            tracing::error!(
+                "release_slot: slot {idx} already free — double release ignored \
+                 (two sequences owned this slot; their SSM state was shared)"
+            );
+            return;
+        }
         free.push(idx);
     }
 
     /// Remove a SPECIFIC slot from the free list if present, returning whether
-    /// it was. Used by `compact_sequence` to claim a known-free migration
-    /// target EXCLUSIVELY, so a slot is never simultaneously owned and free —
-    /// the bug-2 invariant (an owned-and-free slot gets handed to two sequences
+    /// it was. Used by `compact_sequence` to claim its migration target
+    /// EXCLUSIVELY, so a slot is never simultaneously owned and free — the
+    /// bug-2 invariant (an owned-and-free slot gets handed to two sequences
     /// by `claim_slot`, sharing GDN state → cross-stream corruption).
+    ///
+    /// `false` means the slot is OWNED by a live sequence (active, prefilling,
+    /// anything): the caller must NOT copy onto it. The free list is the only
+    /// source of truth for that — the scheduler's active list does not see
+    /// sequences that are still prefilling.
     pub(super) fn claim_specific(&self, slot: usize) -> bool {
         let mut free = self.free_slots.lock();
         if let Some(pos) = free.iter().position(|&s| s == slot) {
@@ -488,6 +624,32 @@ impl SsmStatePool {
 
     pub(super) fn conv_state(&self, ssm_layer_idx: usize, slot: usize) -> DevicePtr {
         self.conv_state_pools[ssm_layer_idx].offset(slot * self.conv_bytes)
+    }
+
+    /// Deferred-commit input staging for (layer, slot): conv-out rows and
+    /// gate/beta rows. `DevicePtr(0)` when the lever is off (pools empty).
+    pub(super) fn commit_qkv(&self, ssm_layer_idx: usize, slot: usize) -> DevicePtr {
+        self.gdn_commit_qkv_pools
+            .get(ssm_layer_idx)
+            .map_or(DevicePtr(0), |p| {
+                p.offset(slot * self.commit_qkv_slot_bytes)
+            })
+    }
+
+    /// `slot`'s pending-commit word (NULL when the fuse is off).
+    pub(super) fn fuse_word(&self, slot: usize) -> DevicePtr {
+        if self.gdn_fuse_words.is_null() {
+            DevicePtr::NULL
+        } else {
+            self.gdn_fuse_words.offset(slot * 4)
+        }
+    }
+
+    /// See [`Self::commit_qkv`].
+    pub(super) fn commit_gb(&self, ssm_layer_idx: usize, slot: usize) -> DevicePtr {
+        self.gdn_commit_gb_pools
+            .get(ssm_layer_idx)
+            .map_or(DevicePtr(0), |p| p.offset(slot * self.commit_gb_slot_bytes))
     }
 
     /// DEBUG (env-gated): PER-LAYER fingerprint of h_state + conv_state for a
@@ -807,7 +969,7 @@ impl SsmStatePool {
                 // is lossless. The intermediates are per-verify-step scratch
                 // regardless — nothing in them survives a step — so even a
                 // truncated copy could not lose live state.
-                for t in 0..self.h_inter_count(from).min(self.h_inter_count(to)) {
+                for t in 0..self.h_snapshot_count(from).min(self.h_snapshot_count(to)) {
                     gpu.copy_d2d_async(
                         self.h_intermediate(i, from, t),
                         self.h_intermediate(i, to, t),
@@ -917,40 +1079,6 @@ impl Drop for SlotGuard {
     }
 }
 
-/// Release every per-layer state pool.
-///
-/// The intermediate and checkpoint pools are only allocated when MTP is on, so
-/// the vectors are empty otherwise — draining handles both without a branch.
-impl atlas_core::scope::ModelResource<dyn GpuBackend> for SsmStatePool {
-    fn label(&self) -> &'static str {
-        "ssm state pool"
-    }
-
-    fn release(&mut self, gpu: &dyn GpuBackend) -> anyhow::Result<()> {
-        let mut first_error = None;
-        for pool in [
-            &mut self.h_state_pools,
-            &mut self.conv_state_pools,
-            &mut self.h_intermediate_pools,
-            &mut self.conv_intermediate_pools,
-            &mut self.h_checkpoint_pools,
-            &mut self.conv_checkpoint_pools,
-        ] {
-            for ptr in pool.drain(..) {
-                if let Err(e) = gpu.free(ptr)
-                    && first_error.is_none()
-                {
-                    first_error = Some(e);
-                }
-            }
-        }
-        match first_error {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod h_inter_layout_tests {
     use super::h_inter_layout;
@@ -1004,6 +1132,7 @@ mod h_stored_geometry_tests {
             3,
             h_f16_pool,
             crate::ssm_reserve::SsmRollbackMode::Snapshot,
+            false,
             &gpu,
         )
         .unwrap()
@@ -1083,6 +1212,7 @@ mod h_stored_geometry_tests {
             3,
             false,
             crate::ssm_reserve::SsmRollbackMode::Replay,
+            false,
             &gpu,
         )
         .unwrap();
@@ -1194,7 +1324,7 @@ mod slot_guard_tests {
     /// (`free_slots`/`max_slots`). All GPU pointer vectors are empty; the guard
     /// path and `claim_slot`/`release_slot` never dereference them, so no GPU is
     /// required to validate the exactly-once release invariant.
-    fn bare_pool(max_slots: usize) -> Arc<SsmStatePool> {
+    pub(super) fn bare_pool(max_slots: usize) -> Arc<SsmStatePool> {
         Arc::new(SsmStatePool {
             h_state_pools: Vec::new(),
             conv_state_pools: Vec::new(),
@@ -1215,7 +1345,15 @@ mod slot_guard_tests {
             h_inter_offsets: Vec::new(),
             rollback_mode: crate::ssm_reserve::SsmRollbackMode::Snapshot,
             replay_input_rings: Vec::new(),
+            gdn_commit_qkv_pools: Vec::new(),
+            gdn_commit_gb_pools: Vec::new(),
+            commit_qkv_slot_bytes: 0,
+            commit_gb_slot_bytes: 0,
+            gdn_fuse_words: DevicePtr::NULL,
+            kda_record_pools: Vec::new(),
+            kda_record_row_bytes: 0,
             free_slots: Mutex::new((0..max_slots).rev().collect()),
+            allocations: Vec::new(),
         })
     }
 
@@ -1291,6 +1429,46 @@ mod slot_guard_tests {
         let mut sorted = free.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, vec![0, 1], "both slots free exactly once, no dupes");
+    }
+
+    #[test]
+    fn double_release_is_ignored_in_every_build() {
+        // The guard is unconditional (not a `debug_assert!`): a second release
+        // of the same index must not put it on the free list twice, or
+        // `claim_slot` would hand it to two sequences from then on.
+        let pool = bare_pool(2);
+        let a = pool.claim_slot().unwrap();
+        assert_eq!(a, 0);
+        pool.release_slot(a);
+        pool.release_slot(a); // double release: logged, NOT pushed
+        assert_eq!(free_count(&pool), 2, "slot 0 must be free exactly once");
+        // Two concurrent claims therefore still get DISTINCT slots.
+        let x = pool.claim_slot().unwrap();
+        let y = pool.claim_slot().unwrap();
+        assert_ne!(x, y, "a duplicated free entry hands one slot to two seqs");
+        assert!(pool.claim_slot().is_err(), "no phantom third slot");
+    }
+
+    #[test]
+    fn claim_specific_refuses_an_owned_slot() {
+        // The prefill-overlap collision: L (still prefilling) owns slot 0, S
+        // (active) owns slot 1, and compaction wants S on slot 0. The claim
+        // must FAIL so `compact_sequence` never copies onto L's state.
+        let pool = bare_pool(4);
+        let l = pool.claim_guarded().unwrap(); // slot 0
+        let s = pool.claim_guarded().unwrap(); // slot 1
+        assert_eq!((l.idx(), s.idx()), (Some(0), Some(1)));
+        assert!(!pool.claim_specific(0), "slot 0 is owned, not free");
+        assert_eq!(free_count(&pool), 2, "a refused claim changes nothing");
+        // Once L is gone its slot IS a legal target, claimable exactly once.
+        drop(l);
+        assert!(pool.claim_specific(0));
+        assert!(!pool.claim_specific(0));
+        pool.release_slot(0); // undo the bare claim above
+        drop(s);
+        let mut sorted = pool.free_slots.lock().clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2, 3], "every slot free exactly once");
     }
 
     #[test]

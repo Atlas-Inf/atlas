@@ -17,7 +17,7 @@ use crate::tp_shard::{
 };
 use crate::weight_map::{
     DenseWeight, Fp8Weight, Nvfp4Variant, QuantizedWeight, SsmWeights, WeightQuantFormat,
-    dense_auto, dense_f32_safe, dense_keep_f32, gpu_concat_rows, interleave_ba,
+    dense_auto, dense_f32_safe, dense_keep_f32, free_loader_source, gpu_concat_rows, interleave_ba,
     load_fp8_block_scaled_as_fp8weight, load_ssm_qwen35, quantize_to_nvfp4,
 };
 
@@ -219,6 +219,35 @@ pub(crate) fn build_linear_attention_dense_bf16(
     post_attn_norm: DenseWeight,
     ffn: FfnComponent,
 ) -> Result<Box<dyn TransformerLayer>> {
+    Ok(Box::new(dense_bf16_layer(
+        layer_idx,
+        store,
+        lp,
+        gpu,
+        variant,
+        config,
+        h,
+        input_norm,
+        post_attn_norm,
+        ffn,
+    )?))
+}
+
+/// The BF16 GDN build as its concrete layer, for callers that add to it
+/// before boxing (`qwen4_exp`'s FP8 decode copy).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dense_bf16_layer(
+    layer_idx: usize,
+    store: &WeightStore,
+    lp: &str,
+    gpu: &dyn GpuBackend,
+    variant: Nvfp4Variant,
+    config: &ModelConfig,
+    h: usize,
+    input_norm: DenseWeight,
+    post_attn_norm: DenseWeight,
+    ffn: FfnComponent,
+) -> Result<Qwen3SsmLayer> {
     // GDN HeadParallel: `config` already holds per-rank-LOCAL linear head
     // counts (topology.rs divided them by tp_size). `TpGdnDims::from_config`
     // multiplies back up to the full pre-shard sizes the on-disk weights use;
@@ -248,11 +277,24 @@ pub(crate) fn build_linear_attention_dense_bf16(
     )?;
     // `gpu_concat_rows` allocates an independent combined buffer (alloc +
     // copy_d2d), so the per-projection BF16 expansions of in_proj_qkv /
-    // in_proj_z are dead after this point. They are freshly-allocated
-    // FP8→BF16 dequant outputs (not WeightStore aliases), ~50 MB/layer ×
-    // ~30 GDN layers ≈ 1.5 GB. Free them here — identical numerics.
-    let _ = gpu.free(ssm35.in_proj_qkv.weight);
-    let _ = gpu.free(ssm35.in_proj_z.weight);
+    // in_proj_z are dead after this point (~50 MB/layer × ~30 GDN layers ≈
+    // 1.5 GB). On FP8 checkpoints they are fresh FP8→BF16 dequant outputs; on
+    // BF16 checkpoints `dense_auto` returned the WeightStore's own buffers, and
+    // a plain free would be repeated by the store at teardown.
+    // `free_loader_source` tells the two apart — identical numerics.
+    let la = format!("{lp}.linear_attn");
+    let _ = free_loader_source(
+        store,
+        gpu,
+        &format!("{la}.in_proj_qkv.weight"),
+        ssm35.in_proj_qkv,
+    );
+    let _ = free_loader_source(
+        store,
+        gpu,
+        &format!("{la}.in_proj_z.weight"),
+        ssm35.in_proj_z,
+    );
     let (qkvz_ptr, _, _) = shard_gdn_qkvz_rows(qkvz_full.weight, &dims, gpu)?;
     if tp_size > 1 {
         let _ = gpu.free(qkvz_full.weight);
@@ -291,6 +333,11 @@ pub(crate) fn build_linear_attention_dense_bf16(
     // axis read past the [vd] buffer → cuMemcpyDtoDAsync INVALID_VALUE at load.)
     let norm_ptr = ssm35.norm.weight;
     let (out_proj_ptr, _, _) = shard_gdn_out_proj_row_parallel(ssm35.out_proj.weight, &dims, gpu)?;
+    if tp_size > 1 {
+        // The rank's row-parallel slice is a copy; nothing reads the full
+        // [h, value_dim] BF16 source again (31.5 MB/layer on qwen4_exp).
+        free_loader_source(store, gpu, &format!("{la}.out_proj.weight"), ssm35.out_proj)?;
+    }
 
     let ssm = SsmWeights {
         in_proj_qkvz: qkvz_dense,
@@ -333,7 +380,7 @@ pub(crate) fn build_linear_attention_dense_bf16(
         layer.set_fp8_decode_weights(Some(qkvz_fp8), Some(out_fp8));
         tracing::info!("Layer {layer_idx}: SSM FP8 decode overlay installed (BF16 prefill kept)");
     }
-    Ok(Box::new(layer))
+    Ok(layer)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -415,6 +462,15 @@ pub(crate) fn build_linear_attention_nvfp4(
     // out_proj is row-parallel: slice its input (value_dim) to local, then
     // quantize the LOCAL [h, local_value_dim] weight.
     let (out_proj_ptr, _, _) = shard_gdn_out_proj_row_parallel(ssm35.out_proj.weight, &dims, gpu)?;
+    if tp_size > 1 {
+        // Everything below reads the local slice, not the full source.
+        free_loader_source(
+            store,
+            gpu,
+            &format!("{lp}.linear_attn.out_proj.weight"),
+            ssm35.out_proj,
+        )?;
+    }
     let out_proj_local = DenseWeight {
         weight: out_proj_ptr,
     };

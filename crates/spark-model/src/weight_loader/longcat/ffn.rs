@@ -38,7 +38,7 @@ pub(super) fn build_dense_ffn(
         up_proj_t: None,
         down_proj_t: None,
     };
-    let mut layer = DenseFfnLayer::new(weights, gpu)?;
+    let mut layer = DenseFfnLayer::new(weights, gpu, &config.model_type)?;
 
     // Precision lever, mirroring `ATLAS_NVFP4_MLA=0` on the attention side.
     // LongCat ships plain BF16 with no calibration metadata, so these three
@@ -268,6 +268,8 @@ fn quant_expert_fp8(
     let q = crate::weight_map::quantize_to_fp8_blockscaled(&bf16, n, k, gpu, quantize_k, stream)?;
     // The kernel reads the BF16 source on `stream`; the free must not race it.
     gpu.synchronize(stream)?;
-    gpu.free(w.ptr)?;
+    // `reclaim` (free + record): the source is a WeightStore tensor, and a raw
+    // free left teardown to free it again (#122).
+    store.reclaim(gpu, &format!("{prefix}.weight"))?;
     Ok(q)
 }

@@ -32,9 +32,17 @@ use crate::scheduler::ActiveSeq;
 /// Rolling accept window + suspend state, embedded in [`ActiveSeq`].
 #[derive(Default)]
 pub(crate) struct AdaptState {
+    /// Per-position draft acceptance for the verify width choice.
+    pub(crate) survival: super::dflash_width::DraftSurvival,
+    /// Copy drafts' index and outcomes (`ATLAS_DFLASH_COPY_DRAFTS`,
+    /// `ATLAS_QWEN_COPY_DRAFTS`).
+    pub(crate) copy: super::copy_drafts::CopyState,
     window: Vec<u32>,
     suspended: bool,
     serial_tokens: u32,
+    /// The current verify span's per-position pipeline effects, applied as
+    /// each picked token is committed (`emit_step::PickEffects`).
+    pub(in crate::scheduler) pick_effects: crate::scheduler::emit_step::PickEffects,
 }
 
 const WINDOW: usize = 12;

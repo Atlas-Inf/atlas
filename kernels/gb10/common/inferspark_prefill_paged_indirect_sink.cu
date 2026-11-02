@@ -42,6 +42,6 @@
     __syncthreads();                                                            \
     kv_len = s_indirect[0];                                                     \
     q_offset = s_indirect[1];                                                   \
-    unsigned int q_rope_pos = s_indirect[2];
+    [[maybe_unused]] unsigned int q_rope_pos = s_indirect[2];
 
 #include "prefill_paged_compute.cuh"

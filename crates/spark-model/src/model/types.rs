@@ -13,6 +13,9 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::ssm_pool::SsmStatePool;
+#[cfg(test)]
+#[path = "btile_teardown_tests.rs"]
+mod btile_teardown_tests;
 use super::ssm_snapshot::SsmSnapshotPool;
 use crate::layer::{
     AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
@@ -64,6 +67,10 @@ pub struct TransformerModel {
     /// nothing beside a transformer forward.
     pub(super) ngram_embed: Option<std::sync::Mutex<crate::layers::ngram_embed::NgramEmbedding>>,
     pub(super) final_norm: DenseWeight,
+    /// The final norm is the identity: qwen4_exp's hyper-connection mixer (run
+    /// in the last layer) is the final normalization and the reference feeds
+    /// its output straight to lm_head. See `final_norm_rows`.
+    pub(super) final_norm_identity: bool,
     pub(super) lm_head_weight: DenseWeight,
     pub(super) lm_head_nvfp4: Option<QuantizedWeight>,
     /// TRANSPOSED `[K/2, ldb]` twin of `lm_head_nvfp4` + its PADDED row stride.
@@ -92,6 +99,9 @@ pub struct TransformerModel {
     /// layer structs; kept here as the owner of the pool/tables and for
     /// status introspection.
     pub(super) lora: Option<crate::lora::LoraWeights>,
+    /// Sticky diagnostic ownership proof: a failed install or later detach
+    /// may leave layer fields installed even when the pool owner is absent.
+    pub(super) lora_install_attempted: bool,
     /// True when runtime adapter rotation is ARMED: `ATLAS_LORA_ROTATE=1`, or
     /// `$ATLAS_LORA_PEER` set. Armed ⇒ decode runs eager (no CUDA-graph
     /// capture) so a `set_active_lora` re-point is immediately live
@@ -143,6 +153,9 @@ pub struct TransformerModel {
     /// verify tokens. Bit-identical to two `dense_gemv_fp8w` calls; halves the
     /// FP8 weight bandwidth for the lm_head on the MTP verify path.
     pub(super) dense_gemv_fp8w_batch2_kernel: KernelHandle,
+    /// BF16 dual-GEMV (batch=2) for a BF16 LM head at K=2 verify;
+    /// bit-identical to two `dense_gemv_bf16` calls (see `impl_a1.rs`).
+    pub(super) dense_gemv_bf16_batch2_kernel: KernelHandle,
     /// W4A8 DP4A LM-head GEMV (M<=4) and its int8 activation quantizer.
     ///
     /// The NVFP4 LM head is exactly the layout the DP4A path consumes
@@ -158,6 +171,8 @@ pub struct TransformerModel {
     /// at decode: reads the ~617 MB vocab weight once with coalesced uint4
     /// loads, vs the scalar dense_gemm_bf16 (16x16 FFMA, ~89 GB/s). 0 = absent.
     pub(super) dense_gemv_batchm_kernel: KernelHandle,
+    /// Its 16/32-row twins under `ATLAS_QWEN4EXP_BATCH_FAST` (the exact head).
+    pub(super) qwen4exp_wide_rows: crate::layers::ops::Qwen4ExpWideRows,
     pub(super) argmax_kernel: KernelHandle,
     /// Batched argmax (one block per row). 0 when the kernel set lacks it.
     pub(super) argmax_batch_kernel: KernelHandle,
@@ -221,6 +236,10 @@ pub struct TransformerModel {
     pub(super) suppress_graphs: std::sync::atomic::AtomicBool,
     /// MTP draft proposer (built from mtp_weights at init).
     pub(super) proposer: Option<Arc<dyn DraftProposer>>,
+    /// `ATLAS_GLM_DRAFT_TP` / `ATLAS_QWEN4EXP_MTP_DRAFT_TP`: the worker
+    /// rank's copy of the drafter, which serves its part of a split propose
+    /// (`draft_assist`). `None` on the head and when the split is off.
+    pub(super) draft_assist: Option<Arc<dyn super::draft_assist::DraftAssist>>,
     /// Immutable typed identity for the admitted official Lightning product.
     /// `None` for generic DFlash, MTP, and non-speculative models.
     pub(super) lightning_dspark_identity: LightningDsparkIdentityLatch,
@@ -240,6 +259,9 @@ pub struct TransformerModel {
     /// `verify_hidden_stash`, for drafters consuming the PRE-mixer
     /// highway. NULL without a proposer or without a highway.
     pub(super) verify_stream_stash: DevicePtr,
+    /// Owner-batched long-context K3 verify staging (`glm_long_owner`);
+    /// `None` unless that opt-in lane is configured.
+    pub(super) glm_long_stage: Option<crate::layer::glm_long_owner::GlmLongStage>,
     /// ATLAS_MTP_CATCHUP: circular per-position final-hidden ring captured
     /// during serial-decode stretches (BF16 rows, slot = position % ring
     /// len). Feeds the drafter catch-up on the next propose. NULL when the
@@ -307,6 +329,10 @@ pub struct TransformerModel {
     pub(super) dflash_hidden_save_rows: usize,
     /// How many sequences the capture buffer is strided for (1 = C=1 layout).
     pub(super) dflash_hidden_save_nseq: usize,
+    /// `ATLAS_DFLASH_WARM_CTX=restore`: drafter windows saved with prefill
+    /// checkpoints (rank 0; `build_model` reserves the slab before KV
+    /// sizing). Enntity/atlas d3953211.
+    pub(super) dflash_warm_store: crate::layers::dflash_head::WarmCtxStore,
     /// Cached CUDA graphs for K=2 verification, **keyed by `seq.slot_idx`**.
     /// Same rationale as `decode_graph`: the captured graph has SSM
     /// h_state/conv_state pointers baked in as kernel arguments, so replay for
@@ -353,6 +379,10 @@ pub struct TransformerModel {
     /// Kill switch `ATLAS_NO_VERIFY_WY_CACHE` (PRESENCE) restores the
     /// unconditional re-stage.
     pub(super) verify_wy_cache: Mutex<Option<Vec<u64>>>,
+    /// `ATLAS_QWEN4EXP_VERIFY_BT_PINNED=1`: page-locked staging for the
+    /// batched verify's block-table image (`model/pinned_upload.rs`). Empty
+    /// until the first such upload; freed in `Drop`.
+    pub(super) verify_bt_stage: Mutex<super::pinned_upload::PinnedUpload>,
     /// Cached CUDA graphs for DFlash K=γ verification, keyed by
     /// `(seq.slot_idx, K)`. K is `tokens.len()` (γ+1 typically). One graph
     /// per (slot, K) — different γ values coexist via the K dimension.
@@ -362,12 +392,23 @@ pub struct TransformerModel {
     /// Replaces the separate `decode_graph` (M=1) + `verify{k}_graph` (M=k)
     /// on the DFlash path with a single M-row weight sweep.
     pub(super) fused_graph: Mutex<std::collections::HashMap<(usize, usize), GraphHandle>>,
+    /// Piecewise-captured KDA runs of the GLM DFlash verify
+    /// (`ATLAS_GLM_VERIFY_GRAPH=1`); see `model::verify_pieces`.
+    pub(super) verify_pieces: super::verify_pieces::VerifyPieces,
+    /// Piecewise-captured GDN runs of the qwen4_exp decode and verify
+    /// (`ATLAS_QWEN4EXP_DECODE_GRAPH=1`); see `model::decode_pieces`.
+    pub(super) decode_pieces: super::verify_pieces::Pieces<super::decode_pieces::DecodePieceKey>,
+    /// Staging of the qwen4_exp TP2 vocabulary-split LM head
+    /// (`ATLAS_QWEN4EXP_LMHEAD_SPLIT=1`); see `model::qwen4exp_lmhead_split`.
+    pub(super) lmhead_split: Option<super::qwen4exp_lmhead_split::HeadSplit>,
     /// Prefix cache for KV block reuse across requests.
     pub(super) prefix_cache: Box<dyn spark_runtime::prefix_cache::PrefixCache>,
     /// Secondary CUDA stream for pipelining checkpoint D2D with MTP propose.
     pub(super) secondary_stream: u64,
     /// CUDA event for GPU-side inter-stream synchronization (avoids CPU-blocking sync).
     pub(super) secondary_event: u64,
+    /// `ATLAS_QWEN4EXP_GDN_COMMIT_FUSE`: commits left for the next verify.
+    pub(super) gdn_fuse: super::trait_impl::gdn_commit_fuse::GdnFuse,
     /// CUDA event ordering SSM-snapshot SAVES (on the default stream) before a
     /// later warm Marconi RESTORE (on the prefill stream). Marconi saves
     /// (`decode_marconi_checkpoint`, `finish_leaf_snapshot`, prefill-time
@@ -384,6 +425,8 @@ pub struct TransformerModel {
     pub(super) comm: Option<std::sync::Arc<dyn spark_comm::CommBackend>>,
     /// Small GPU buffer for EP token broadcast (4 bytes).
     pub(super) ep_cmd_buf: DevicePtr,
+    /// Warm-turn switches and their state (`model::warm_turn`).
+    pub(super) warm: super::warm_turn::WarmTurn,
     /// EP wire-protocol version. When true, the seq_id-preamble protocol
     /// extension from atlas#99 is active — every command broadcast is
     /// preceded by a `seq_id` broadcast so the worker can dispatch
@@ -395,33 +438,10 @@ pub struct TransformerModel {
     pub(super) self_speculative: bool,
     /// Last token index passed to save_hidden_for_mtp (for EP broadcast to rank 1).
     pub(super) last_mtp_hidden_idx: std::sync::atomic::AtomicUsize,
+    /// Row masks of a strict structured-output verify (`glm_verify_masks`).
+    pub(super) verify_row_masks: super::glm_verify_masks::VerifyRowMasks,
     /// Optional vision encoder for VL models (Qwen3-VL).
-    pub(super) vision_encoder: Option<crate::layers::VisionEncoder>,
-    /// Number of patches encoded by the last prepare_vision_embed() call.
-    /// 0 means no vision embeddings pending.
-    pub(super) vision_embed_patches: Mutex<usize>,
-    /// Per-ITEM `(t_len, grid_h_post_merge, grid_w_post_merge)` from the most
-    /// recent prepare_vision_embed() call. Used by MRoPE prefill to assign
-    /// correct (t, h, w) position IDs to each vision pad token. Empty when no
-    /// vision input is pending.
-    ///
-    /// `t_len` is the number of TEMPORAL GROUPS the item spans: 1 for a still
-    /// image, `frames / temporal_patch_size` for a video. It is per item and
-    /// not per encoder row on purpose — a video feeds `t_len` rows to the ViT
-    /// but occupies ONE contiguous pad run, and the position builder has to
-    /// treat that run as a single item whose T advances rather than as
-    /// `t_len` unrelated images (which would restart T and mis-advance the
-    /// running position for everything after it).
-    pub(super) vision_image_grids: Mutex<Vec<(usize, usize, usize)>>,
-    /// Co-dispatched batched-ViT slice base for the NEXT prefill_chunk. When a
-    /// tick batches >=2 image requests into one buf_out, each request's chunk-0
-    /// splice/MRoPE must read its OWN slice: `vision_row_base` = first buf_out
-    /// row, `vision_grid_base` = first vision_image_grids index, and
-    /// `vision_owned_images` bounds the grid scan. All 0 ⇒ legacy (read from
-    /// row 0 / grid 0). Set right before prefill_chunk, reset to 0 right after.
-    pub(super) vision_row_base: Mutex<usize>,
-    pub(super) vision_grid_base: Mutex<usize>,
-    pub(super) vision_owned_images: Mutex<usize>,
+    pub(super) vision_encoder: Option<crate::layers::VisionTower>,
     /// Page-locked host staging for batched metadata H2D transfers.
     /// Allocated once at init via cuMemAllocHost, freed in Drop.
     ///
@@ -601,9 +621,9 @@ unsafe impl Sync for TransformerModel {}
 /// because it attempts every resource even after one fails: a half-torn-down
 /// GPU is worse than a reported error.
 ///
-/// NOT released here: the weights. `build_model` takes `store: &WeightStore`
-/// and the layers only copy pointers out of it, so this model does not own
-/// them — the host that retained the store releases it after this returns.
+/// The builder transfers its owned WeightStore through `adopt_weight_store`.
+/// Its remaining checkpoint allocations are released here after the pools;
+/// published resident readers are invalidated before any owner is freed.
 impl TransformerModel {
     /// Hand the model the ledger of its own weights, for teardown.
     pub fn adopt_weight_store(&mut self, store: spark_runtime::weights::WeightStore) {
@@ -611,6 +631,7 @@ impl TransformerModel {
     }
 
     pub(super) fn release_pools(&mut self) -> anyhow::Result<()> {
+        crate::layers::moe::invalidate_resident_btile_readers(&self.config, &mut self.layers);
         use atlas_core::scope::ModelResource;
 
         let gpu: &dyn GpuBackend = self.gpu.as_ref();

@@ -38,7 +38,15 @@ impl TransformerModel {
         use_graphs: bool,
         stream: u64,
     ) -> Result<()> {
+        // qwen4_exp piecewise graphs (`model::decode_pieces`): runs of GDN
+        // layers replay captured; QSA attention and PLE stay eager below,
+        // unless the step is wide (attention captured, its ingest staged).
+        let pieces = !probe_layers && self.decode_pieces_admitted(use_graphs, kv_cache, ctx);
+        let wide = self.decode_piece_wide(pieces, seq, 1);
         for (i, layer) in self.layers.iter().enumerate() {
+            if pieces && self.decode_piece_run(i, wide, seq, kv_cache, ctx, stream)? {
+                continue;
+            }
             layer.decode(
                 hidden,
                 residual,
@@ -76,6 +84,9 @@ impl TransformerModel {
             // hashmap-free position() probe over a 5-element vec.
             self.try_dflash_capture(i, 0, stream)?;
         }
+        if wide {
+            self.qsa_commit_staged_seq(seq, 1, stream)?;
+        }
         // MLA absorbed attention: defensive sync before final norm in eager
         // mode. Skipped under graph capture because cuStreamSynchronize is
         // illegal inside a capture region (CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED,
@@ -98,22 +109,11 @@ impl TransformerModel {
         }
 
         let normed = self.buffers.norm_output();
-        let h = self.config.hidden_size as u32;
-        let eps = self.config.rms_norm_eps as f32;
-        ops::rms_norm(
-            self.gpu.as_ref(),
-            self.rms_norm_kernel,
-            hidden,
-            &self.final_norm,
-            normed,
-            1,
-            h,
-            eps,
-            stream,
-        )?;
+        self.final_norm_rows(hidden, normed, 1, stream)?;
 
-        // LM head reads from normed directly (no D2D copy needed)
-        self.lm_head(normed, stream)?;
+        // LM head reads from normed directly (no D2D copy needed); split
+        // over the pair under `ATLAS_QWEN4EXP_LMHEAD_SPLIT=1`.
+        self.lm_head_tp(normed, stream)?;
         Ok(())
     }
 }

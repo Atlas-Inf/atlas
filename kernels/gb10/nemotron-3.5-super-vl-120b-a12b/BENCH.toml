@@ -1,0 +1,99 @@
+# Benchmarks for Nemotron-3.5-Super-VL-120B-A12B NVFP4 (`nemotron_h_omni`),
+# and the thresholds its gate records must meet.
+#
+# ★ EVERY ENTRY HERE IS `status = "unmeasured"`. This model has never been
+# gated — the entries baseline. Per the convention in
+# kernels/gb10/nemotron-3.5-lightning-30b-a3b/BENCH.toml, an unmeasured entry
+# carries NO [benchmarks.metrics] table on purpose: a guessed threshold a run
+# could clear would report PASS for something nobody measured. Thresholds land
+# in a follow-up commit taken from the records the first runs write.
+#
+# ★ AN UNMEASURED ENTRY CANNOT SELF-START, AND THAT IS BY DESIGN. The first
+# pass runs against an operator-started server. Serve line (the exact gate
+# profile, verbatim; `spark` built at the pinned commit):
+#
+#   spark serve <target_dir> --model-name nemotron-3.5-super-vl \
+#     --bind 127.0.0.1 --port <port> --no-tui \
+#     --max-seq-len 32768 --max-prefill-tokens 8192 \
+#     --kv-cache-dtype bf16 --gpu-memory-utilization 0.92 \
+#     --max-num-seqs 1 --max-batch-size 1 \
+#     --enable-prefix-caching true --disable-thinking
+#   # + for the DFlash entries:
+#   --dflash --draft-model <drafter_dir> --dflash-gamma 8
+#
+#   spark benchmark run bfcl-subset --url http://127.0.0.1:<port> \
+#     --model nemotron-3.5-super-vl --no-fail-on-verdict --format json
+#
+# That produces numbers in ~/.atlas/runs but NO committed record. The second
+# pass — thresholds set from those numbers, status flipped to "measured" — is
+# what makes any of this a gate rather than a measurement.
+#
+# Recipe: sparkrun `@atlas/nemotron-3.5-super-vl-120b-a12b-nvfp4-dflash2`
+# (same flags as scripts/serve-nemotron-gb10.sh).
+#
+# ★ NOTHING HERE IS `default = true`. Defaults are claimed by existing
+# targets; select this checkpoint explicitly with --pull-request-gate
+# --hardware gb10 --checkpoint <name>.
+#
+# ★ bfcl-subset's `intended_for` family warning (`wrong_family`) is expected
+# and correct — this checkpoint has no recorded BFCL baseline, which is what
+# these entries exist to create.
+#
+# ★ DFLASH γ=8 IS THE PRODUCT CONFIGURATION: --dflash with the LiLiCorr draft
+# model at gamma=8, the pairing NVIDIA ships for this target. The spec-off
+# entry exists as the A/B control — a BFCL regression that only appears with
+# the drafter indicts the speculative path; a regression in both arms is the
+# checkpoint, not the port.
+#
+# ★ THINKING IS OFF in the gate recipe (`--disable-thinking`): thinking-on
+# with this template emits trailing whitespace after `<think>` and the
+# measured bring-up coherence was verified under thinking-off; thinking-on is
+# untested at gate quality.
+
+# ── ST-995: the golden n=995 MLPerf-edge BFCL draw ──────────────────────────
+# The single-turn tool-calling leg — the gate that matters for this port:
+# the LiLiCorr drafter changes proposal numerics and therefore acceptance,
+# and a subtly wrong speculative path shows up as tool-argument damage long
+# before incoherence. Scores are NOT comparable to Lightning's baseline —
+# same draw, different architecture and weights — and this entry inherits no
+# bar from it.
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nemotron-3.5-super-vl"
+gate = "bfcl-subset"
+label = "Nemotron-3.5-Super-VL-120B-A12B (NVFP4 + DFlash gamma=8)"
+default = false
+status = "unmeasured"
+note = """\
+  ★ First attempt (2026-10-08, commit 669a25a3e, util 0.92) never measured the
+  gate: the staged host-MemAvailable watchdog fired on single-sample dips —
+  the df8 legs at boot (per-tensor alloc granularity; fixed by M1 slab
+  packing) and the spec-off leg 35 min in (transient dip mid-request).
+  The recorded overall=19.2 from that truncated run is an artifact of ~775
+  never-served samples; do NOT quote it. Restaged at util 0.85 with a
+  sustained-breach watchdog (~10 s below 2200 MB). Result TBD.
+
+DFlash gamma=8 arm. Values TBD from the first staged run \
+(n35vl-st995-df8, jobs 2021-rerun)."""
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "nemotron-3.5-super-vl"
+gate = "bfcl-subset"
+label = "Nemotron-3.5-Super-VL-120B-A12B (NVFP4, speculation off)"
+default = false
+status = "unmeasured"
+note = """\
+Speculation-off control arm — same serve profile minus --dflash. Values TBD \
+from the first staged run (n35vl-st995-off)."""
+
+# ── Perf leg: the 2.5h MLPerf-edge agentic workload ─────────────────────────
+# Not a bfcl-subset benchmark entry — run via ~/code/endpoints-client's
+# `inference-endpoint benchmark from-config` against
+# examples/10_Edge_Agentic_Example/online_agentic_2.5h_fnext_gb10_fix111b.yaml
+# (model name / tokenizer / port / report_dir patched). Pass bar:
+# 1007/1007 turns issued and successful, 0 failed, compliance OVERALL PASS
+# within the 4h cap (14400000 ms). Reference: job 2018 Flash-Next on main —
+# 1007 turns in 5210 s, ~70.7 output tokens/turn, TTFT median 1.17 s.
+# Staged as job n35vl-perf25h-df8; wall-time estimate TBD in the porting doc.

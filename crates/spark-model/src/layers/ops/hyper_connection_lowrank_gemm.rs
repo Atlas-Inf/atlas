@@ -45,6 +45,53 @@ pub(crate) fn hc_finish_x4() -> bool {
     *X4.get_or_init(|| std::env::var("ATLAS_HC_FIN_X4").as_deref() != Ok("0"))
 }
 
+/// `ATLAS_HC_MT=1`: token-fused decode collapse (`hc_pre_down_mt` +
+/// `hc_pre_finish_x4_mt`) for T <= 4. Bit-identical to the per-token kernels,
+/// so the flag only picks launch shape. Off by default: on gfx1151 the pair
+/// measured SLOWER than the per-token kernels (strix job 146: 0.91x at T=1,
+/// 0.69x at T=2; #154 closed on it), and it is unmeasured on GB10.
+/// Never on under HIP: the strix-hip twin of `hyper_connection.cu` does not
+/// carry these kernels, and the dispatch looks them up per call, so a default-on
+/// HIP arm made the first decode step abort in the kernel audit. Read once per
+/// process.
+pub(crate) fn hc_token_fused() -> bool {
+    static MT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MT.get_or_init(|| !cfg!(atlas_hip) && std::env::var("ATLAS_HC_MT").as_deref() == Ok("1"))
+}
+
+/// `ATLAS_QWEN4EXP_HC_FAST=1`: the vectorized decode collapse
+/// (`hc_pre_stage_vec` + `hc_pre_down_vec` + `hc_pre_finish_vec`, T <= 4;
+/// their `_vec8` twins at T = 5..8, the multi-sequence batches) and
+/// `hc_post_vec` (every T). Bit-identical to the default kernels -- each
+/// output is the same IEEE operation sequence, only the load shape and grid
+/// change; `scripts/dev/qwen4exp_hc_decode_bench.cu` compares every byte --
+/// and measured 1.6x per mHC site at T=1 on GB10 (stage + down + finish +
+/// post 124 -> 76 us; 1.48x at T=4, 124 -> 84 us; 1.25x at T=8, 131 ->
+/// 105 us). Default off until A/B'd end to end.
+/// Never on under HIP: the strix-hip twin of `hyper_connection.cu` does not
+/// carry these kernels. Read once per process.
+pub(crate) fn hc_fast() -> bool {
+    static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FAST.get_or_init(|| {
+        !cfg!(atlas_hip) && std::env::var("ATLAS_QWEN4EXP_HC_FAST").as_deref() == Ok("1")
+    })
+}
+
+/// `ATLAS_QWEN4EXP_HC_WIDE=1` (read once, default off): 25..32-token
+/// collapses take `hc_pre_down_vec_wide` — the same chains as
+/// `hc_pre_down_vec_rows`, four per thread instead of two, so the four
+/// 8-token groups fit one wave — and run the stage over 2 blocks a token
+/// instead of 8 (pure geometry: each block's RMS is the same 1024-thread
+/// reduction). scripts/dev/qwen4exp_hc_wide_bench.cu: byte-identical, site
+/// ~177 -> ~125 us at T = 32 (stage 20.5 -> 11.4, down ~105 -> ~64). The
+/// padded last group reads `normed` rows past the batch (below row 32): in
+/// bounds by `hc_pre_split`'s scratch LAYOUT, whose `normed` spans 64 rows
+/// before `low` (no host check of the buffer's size beyond that layout).
+pub(crate) fn hc_wide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_HC_WIDE").as_deref() == Ok("1"))
+}
+
 pub(crate) fn hc_finish_block() -> u32 {
     static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -96,9 +143,19 @@ pub(crate) fn hc_gemm(
     sm_count: u32,
     stream: u64,
 ) -> Result<()> {
-    if n.div_ceil(128) * m.div_ceil(128) < sm_count {
+    // ATLAS_QWEN4EXP_PREFILL_ROWINV: one cuBLASLt configuration at any height.
+    if super::qwen4exp_rowinv::try_bf16_gemm(a, w.0, out, [m, n, k], stream)? {
+        return Ok(());
+    }
+    // On native HIP the machine-fill test stays for NVIDIA: hipBLASLt wins
+    // at EVERY shape on gfx1151 (measured 2026-10-04: 2.3-2.6x the tile
+    // kernel incl. the wide up-projection), so try it unconditionally; any
+    // Err lands on the same warn-once + gemm_raw fallback.
+    if cfg!(atlas_hip) || n.div_ceil(128) * m.div_ceil(128) < sm_count {
         match crate::layers::ops::cublas_bf16_proj_dense(a, w, out, m, n, k, stream) {
             Ok(()) => return Ok(()),
+            // A failed launch may have written part of `out`: never rerun it.
+            Err(e) if spark_runtime::cutlass::launch_failed(&e) => return Err(e),
             Err(e) => {
                 static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
                 if WARNED.set(()).is_ok() {
@@ -111,6 +168,12 @@ pub(crate) fn hc_gemm(
                 }
             }
         }
+    }
+    // ATLAS_LT_KCHAIN_PIN: the tile kernel's own in-order k-chain on a faster
+    // cuBLASLt kernel, byte for byte (`cublaslt::kchain_pin`; the mHC down
+    // GEMM of a full 2048-row slab, 2048x320x10240: 0.43 -> 0.31 ms).
+    if spark_runtime::cublaslt::bf16_gemm_act_weight_t_kchain(a.0, w.0, out.0, m, n, k, stream)? {
+        return Ok(());
     }
     gemm_raw(gpu, kernel, a, w, out, m, n, k, stream)
 }

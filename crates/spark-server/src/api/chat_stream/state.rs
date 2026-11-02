@@ -15,6 +15,10 @@ use std::collections::HashMap;
 use crate::tool_parser;
 
 pub(super) struct StreamState {
+    /// Total sampled completion tokens, including reasoning tokens. Unlike
+    /// `all_toks`, this counter is not reset at the `</think>` boundary, so
+    /// request-level `min_tokens` applies to the complete generation.
+    pub(super) generated_tokens: usize,
     /// Token IDs accumulated since the last reset (cleared at the
     /// `</think>` boundary so post-thinking content decodes cleanly).
     pub(super) all_toks: Vec<u32>,
@@ -78,11 +82,15 @@ pub(super) struct StreamState {
     pub(super) reasoning_inside_envelope: bool,
     /// Tag-scan buffer for the content sanitiser.
     pub(super) tag_scan_buf: String,
+    /// Quote/code context for content XML markers, retained across chunks.
+    pub(super) literal_xml_state: crate::literal_xml::LiteralXmlState,
     /// Sanitiser state for reasoning content (parallel to
     /// `suppressing_param_leak` above).
     pub(super) reasoning_suppressing_leak: bool,
     /// Tag-scan buffer for the reasoning sanitiser.
     pub(super) reasoning_tag_scan_buf: String,
+    /// Quote/code context for reasoning XML markers, retained across chunks.
+    pub(super) reasoning_literal_xml_state: crate::literal_xml::LiteralXmlState,
     /// Repetition-loop watchdog: tail buffer for line-level
     /// duplicate detection.
     pub(super) loop_scan_buf: String,
@@ -167,15 +175,17 @@ pub(super) struct StreamState {
     /// `ChatLevers::in_think_leak_openers` to decide when stripping
     /// escalates to cancellation.
     pub(super) reasoning_xml_opener_hits: u32,
+    /// Lexical state at the start of `reasoning_xml_scan_buf`, so a marker
+    /// split across deltas is still classified inside the right quote/code span.
+    pub(super) reasoning_xml_scan_state: crate::literal_xml::LiteralXmlState,
     /// Streaming tool-call detector (`Some` iff `tools_active`).
     pub(super) detector: Option<tool_parser::StreamingToolDetector>,
     /// True iff the reasoning/`<think>` phase has finished. Starts
     /// `true` when the request did not enable thinking.
     pub(super) thinking_done: bool,
-    /// Dead after the tool-call retry stack was removed (`tool_retry_enabled`
-    /// is now constant `false`, so deltas are always streamed in real time
-    /// and this map stays empty). Retained so the buffering helpers in
-    /// `tool_handlers.rs` still type-check.
+    /// A tool call's deltas held until the call validates, by index: for
+    /// Poolside v1 streams (`tool_handlers::holds_tool_deltas`). Anything
+    /// still held when the stream ends is dropped, never sent.
     pub(super) buffered_tool_chunks: std::collections::HashMap<usize, Vec<crate::ir::StreamDelta>>,
     /// Dead after the tool-call retry stack was removed; never set now that
     /// `tool_retry_enabled` is constant `false`.
@@ -205,6 +215,7 @@ impl StreamState {
         tool_defs: Vec<tool_parser::ToolDefinition>,
     ) -> Self {
         Self {
+            generated_tokens: 0,
             all_toks: Vec::new(),
             emitted: 0,
             content_decoded: String::new(),
@@ -221,8 +232,10 @@ impl StreamState {
             inside_envelope: false,
             reasoning_inside_envelope: false,
             tag_scan_buf: String::new(),
+            literal_xml_state: crate::literal_xml::LiteralXmlState::default(),
             reasoning_suppressing_leak: false,
             reasoning_tag_scan_buf: String::new(),
+            reasoning_literal_xml_state: crate::literal_xml::LiteralXmlState::default(),
             loop_scan_buf: String::new(),
             loop_watchdog_triggered: false,
             salvaged_tool_call: false,
@@ -242,6 +255,7 @@ impl StreamState {
             reasoning_xml_scan_buf: String::new(),
             reasoning_xml_leak_detected: false,
             reasoning_xml_opener_hits: 0,
+            reasoning_xml_scan_state: crate::literal_xml::LiteralXmlState::default(),
             detector: if tools_active {
                 Some(tool_parser::StreamingToolDetector::new_with_tools(
                     tool_defs,

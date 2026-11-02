@@ -172,7 +172,16 @@ impl TransformerModel {
         Ok(())
     }
 
+    /// Order the default stream after the verdict's commit, for a reader of
+    /// the committed SSM state: under `ATLAS_QWEN4EXP_GDN_COMMIT_FUSE` that
+    /// first lands any commit left for a next verify (`gdn_commit_fuse`).
     pub(super) fn sync_secondary_dispatch(&self) -> Result<()> {
+        self.gdn_fuse_flush_all()?;
+        self.wait_secondary_dispatch()
+    }
+
+    /// The wait alone, for the verify that may take a pending commit.
+    pub(super) fn wait_secondary_dispatch(&self) -> Result<()> {
         // GPU-side event sync: make the default stream wait for the secondary
         // event. Zero CPU cost — the GPU scheduler handles the dependency.
         self.gpu
@@ -272,10 +281,32 @@ impl TransformerModel {
             }
         }
 
-        // Full accept: the verify kernel's final h_state/conv_state is
-        // already the canonical committed state — nothing to do.
-        if num_accepted == k {
+        // KDA records: the verify left h_state untouched, so every accept
+        // (full included) folds its rows in; conv still rewinds by snapshot.
+        if self.ssm_pool.kda_record_row_bytes != 0 {
+            anyhow::ensure!(
+                num_accepted > 0,
+                "commit_accepted_prefix: num_accepted == 0 (k={k}) with KDA records"
+            );
+            let stream = self.secondary_stream;
+            self.commit_kda_records_with_leaf(seq, num_accepted, k, stream)?;
+            self.gpu.record_event(self.secondary_event, stream)?;
             return Ok(());
+        }
+
+        // Full accept: the verify kernel's final h_state/conv_state is
+        // already the canonical committed state — nothing to do — UNLESS a
+        // layer ran the deferred-commit verify (`gdn_commit_pending`), in
+        // which case `h_state` still holds H0 and must be committed below.
+        if num_accepted == k
+            && !seq.layer_states.iter().any(|ls| {
+                ls.as_any()
+                    .downcast_ref::<crate::layer::SsmLayerState>()
+                    .is_some_and(|s| s.gdn_commit_pending)
+            })
+        {
+            // ATLAS_QWEN4EXP_FINISH_LEAF: the leaf at the step's end.
+            return self.qwen4exp_leaf_after_commit(seq, num_accepted);
         }
 
         // `num_accepted == 0` has no representable rewind target here: the
@@ -307,6 +338,10 @@ impl TransformerModel {
         // (src, dst, bytes) triples, the per-layer loop issued.
         let mut h_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
         let mut conv_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
+        // ATLAS_QWEN4EXP_EXACT_DEFER: replayed from H0, h and conv, one launch.
+        let mut exact_layers = Vec::new();
+        let mut exact_idx = Vec::new();
+        let exact = self.gdn_pending_is_exact();
         for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
             if self.config.layer_type(i) != LayerType::LinearAttention {
                 continue;
@@ -315,6 +350,13 @@ impl TransformerModel {
                 .as_any_mut()
                 .downcast_mut::<SsmLayerState>()
                 .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState at layer {i}"))?;
+            if exact && ssm.gdn_commit_pending {
+                ssm.gdn_commit_pending = false;
+                exact_layers.push(self.gdn_exact_commit_entry(i, ssm));
+                exact_idx.push(i);
+                ssm_layer_idx += 1;
+                continue;
+            }
 
             // Pool h STORAGE width (SSOT: ssm_reserve::ssm_h_stored_bytes).
             let h_bytes = self.ssm_pool.h_stored_bytes;
@@ -328,6 +370,29 @@ impl TransformerModel {
             // intermediate (state after token `num_accepted-1`).
             let slot = seq.slot_idx;
             let inter_idx = num_accepted - 1;
+            if ssm.gdn_commit_pending {
+                // ATLAS_GDN_DEFERRED_COMMIT: `h_state` still holds H0 (the
+                // `_defer` verify stored nothing); replay the accepted
+                // prefix through the shared wyN update loop. Same result
+                // as intermediates[inter_idx], bit-for-bit.
+                ssm.gdn_commit_pending = false;
+                self.commit_gdn_deferred(i, ssm, num_accepted, stream)?;
+                // Conv side still uses the intermediates — but only on a
+                // PARTIAL accept: the fused conv path never writes index
+                // k-1 (the final conv state is already canonical), so a
+                // full accept must not read the unwritten slot.
+                if num_accepted < k {
+                    conv_plan.push(StateCopy {
+                        src: self
+                            .ssm_pool
+                            .conv_intermediate(ssm_layer_idx, slot, inter_idx),
+                        dst: ssm.conv_state,
+                        bytes: conv_bytes,
+                    });
+                }
+                ssm_layer_idx += 1;
+                continue;
+            }
             h_plan.push(StateCopy {
                 src: self.ssm_pool.h_intermediate(ssm_layer_idx, slot, inter_idx),
                 dst: ssm.h_state,
@@ -343,8 +408,63 @@ impl TransformerModel {
 
             ssm_layer_idx += 1;
         }
+        if !exact_layers.is_empty() {
+            // ATLAS_QWEN4EXP_GDN_COMMIT_FUSE: or left for the next verify.
+            self.gdn_commit_or_defer(seq, exact_idx, exact_layers, num_accepted, stream)?;
+        }
         run_ssm_state_copies(self.gpu.as_ref(), &h_plan, &conv_plan, stream)?;
         self.gpu.record_event(self.secondary_event, stream)?;
-        Ok(())
+        self.qwen4exp_leaf_after_commit(seq, num_accepted)
+    }
+
+    /// Deferred-commit accept: replay tokens `0..num_accepted` of this
+    /// layer's staged verify inputs from the live H0 in `h_state`
+    /// (`gated_delta_rule_commit` — same `gated_delta_rule_wyn_impl`
+    /// arithmetic as the storing verify, so the result is bit-identical to
+    /// `h_state_intermediates[num_accepted - 1]` or the final H). Covers
+    /// partial AND full accepts — under defer a full accept is not a
+    /// no-op because `h_state` was never written.
+    ///
+    /// Conv state is NOT touched here — conv intermediates are written and
+    /// restored exactly as on the snapshot path.
+    pub(super) fn commit_gdn_deferred(
+        &self,
+        layer_idx: usize,
+        ssm: &crate::layer::SsmLayerState,
+        num_accepted: usize,
+        stream: u64,
+    ) -> Result<()> {
+        let nk = self.config.linear_num_key_heads;
+        let nv = self.config.linear_num_value_heads;
+        let kd = self.config.linear_key_head_dim;
+        let vd = self.config.linear_value_head_dim;
+        let key_dim = nk * kd;
+        let conv_dim = key_dim * 2 + nv * vd;
+        let commit_k = self.layers[layer_idx].gdn_commit_kernel();
+        anyhow::ensure!(
+            commit_k.0 != 0,
+            "deferred commit pending but gated_delta_rule_commit unresolved (layer {layer_idx})"
+        );
+        ops::gdn_commit_accepted(
+            self.gpu.as_ref(),
+            commit_k,
+            ssm.h_state,
+            ssm.gdn_commit_qkv,
+            ssm.gdn_commit_qkv.offset(key_dim * 2),
+            ssm.gdn_commit_qkv.offset(key_dim * 2 * 2),
+            ssm.gdn_commit_gb,
+            ssm.gdn_commit_gb.offset(nv * 4),
+            num_accepted as u32,
+            nk as u32,
+            nv as u32,
+            kd as u32,
+            vd as u32,
+            conv_dim as u32, // qk_stride
+            conv_dim as u32, // v_stride
+            (nv * 2) as u32, // gb_stride
+            stream,
+        )
     }
 }
+
+mod gdn_exact_commit;

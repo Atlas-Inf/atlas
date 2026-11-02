@@ -113,6 +113,23 @@ fn tier_capacity_default_ladder_shape() {
 }
 
 #[test]
+fn tier_capacity_under_the_dynamic_depth() {
+    // ATLAS_MTP_DYNAMIC_DEPTH: every slot a <= 8-wide batch can hold gets
+    // the full --num-drafts 7 (K=8); wider rungs keep the ladder's tiers.
+    use crate::speculative::deep_depth::ceiling_with;
+    let ceiling = |n: usize| ceiling_with(true, 8, n, 7, default_ladder(n).min(7));
+    for slot in 0..8 {
+        assert_eq!(verify_slot_drafts_with(slot, 32, 7, ceiling), 7);
+    }
+    for slot in 8..32 {
+        assert_eq!(
+            verify_slot_drafts_with(slot, 32, 7, ceiling),
+            verify_slot_drafts_with(slot, 32, 7, default_ladder)
+        );
+    }
+}
+
+#[test]
 fn k_minus_1_shrink_and_kill_switch_shape() {
     // The K-1 h-intermediate shrink applies EVERYWHERE (it removes a
     // slot that is never written or read, not a policy tier): every
@@ -451,4 +468,25 @@ fn rollback_mode_parses_and_rejects() {
     // Fail fast on anything else — the CLI relies on THIS parse (SSOT).
     assert!(SsmRollbackMode::from_str("Replay").is_err());
     assert!(SsmRollbackMode::from_str("").is_err());
+}
+
+/// GLM-5.3 Flash TP2 KDA: 32 local heads, so a 2 MiB FP32 state per layer
+/// folds from 48 KiB of records per verify row.
+#[test]
+fn kda_record_row_is_three_vectors_per_head() {
+    let h_bytes = 32 * 128 * 128 * 4;
+    assert_eq!(kda_record_row_bytes(h_bytes), 32 * 384 * 4);
+    assert_eq!(kda_record_row_bytes(h_bytes) * 128 / 3, h_bytes);
+}
+
+/// Records mode reserves K record rows + K conv snapshots + the checkpoint
+/// blob per verify slot, instead of K-1 H snapshots.
+#[test]
+fn records_reserve_replaces_h_snapshots_with_k_record_rows() {
+    let reserve =
+        |mode| ssm_pool_reserve_bytes(4, H_BLOB, CONV_BLOB, true, ND, 4, true, false, mode);
+    let records = reserve(SsmRollbackMode::Records);
+    let per_slot = (ND + 1) * (kda_record_row_bytes(H_BLOB) + CONV_BLOB) + BLOB;
+    assert_eq!(records, 4 * BLOB + 4 * per_slot);
+    assert!(records < reserve(SsmRollbackMode::Snapshot));
 }

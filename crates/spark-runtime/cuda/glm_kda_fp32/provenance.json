@@ -1,0 +1,90 @@
+{
+  "repository": "https://github.com/MoonshotAI/FlashKDA",
+  "revision": "1ce47ea3bb22c84eb9cc665028399cf35e8ffb0b",
+  "cutlass_submodule": "5c149f52a436782210263fb2f19b354443a61c6a",
+  "license": "MIT (upstream) AND AGPL-3.0-only (SparkGLM patches and bridges)",
+  "patches": [
+    {
+      "name": "flash_kda_sm121_slots.patch",
+      "sha256": "5c453a58b9152c89e1c8e9ebf2f514d664bff007f72636a406c68906aa278d13"
+    },
+    {
+      "name": "flash_kda_tma_swizzle.patch",
+      "sha256": "efdc05c9f3ad62528b57e804369e2281271b6cb45a5b557e251e9f2fa03ca542"
+    },
+    {
+      "name": "flash_kda_fp32_recurrence.patch",
+      "sha256": "e7b75b56af7e405f8734a98ac9223cb306ef9160ebde997d25991f4d1c7e7a81"
+    }
+  ],
+  "patch_source": "SparkGLM 0.2.0 install/flash_kda/ (PINS.sha256 sha256 79769e6fcb9b7fbfe2f3016a43e689808e90c733122862ae4df97533c3ab800b)",
+  "files": [
+    {
+      "path": "flashkda/fwd.h",
+      "upstream_path": "csrc/fwd.h",
+      "upstream_sha256": "462afefb5c1bfe89428166cd81fc70954606049a41a4b67376025a2b2f91d7cc",
+      "sha256": "aaf1428e34a6b917b63d52c91128ed473645c8a6ec102b0c81603fb4c3d3b4f0",
+      "changes": [
+        "The three patches above, applied in order."
+      ]
+    },
+    {
+      "path": "flashkda/fwd_launch.cu",
+      "upstream_path": "csrc/smxx/fwd_launch.cu",
+      "upstream_sha256": "dbaf9ba867fc8c799cf147b7e17bd2aba4a08b1b63c5f7df0cca1173a0df5562",
+      "sha256": "189dc1c1b6a6e2a85e474c097df98759174c9c81833b3b0957701f47247570dd",
+      "changes": [
+        "The three patches above, applied in order."
+      ]
+    },
+    {
+      "path": "flashkda/fwd_kernel1.cuh",
+      "upstream_path": "csrc/smxx/fwd_kernel1.cuh",
+      "upstream_sha256": "e0f369b51753d5e1a62b8435f0b692fdc856d87e52eb27d012c22b6575a0370f",
+      "sha256": "ea5ac6abf9e8ec242ac82dfbf13a4183cdc5fee023fae2c1f0ec238b852bf990",
+      "changes": [
+        "The three patches above, applied in order."
+      ]
+    },
+    {
+      "path": "flashkda/fwd_kernel2.cuh",
+      "upstream_path": "csrc/smxx/fwd_kernel2.cuh",
+      "upstream_sha256": "f8a634154ca26a18855adbd3db17d6208a874b16f173d0eb9814bfefff03b9b9",
+      "sha256": "d907e465318916580bc727f916750c999283f94575f5e828305ddb8b2d13b525",
+      "changes": [
+        "The three patches above, applied in order."
+      ]
+    },
+    {
+      "path": "flashkda/utils.cuh",
+      "upstream_path": "csrc/smxx/utils.cuh",
+      "upstream_sha256": "211cc28d910758e2658a53f5bcda779f1076df281ff75c09ce9bd1638a54151a",
+      "sha256": "b024316b6df0dc105ae68da0f0f63918b828ce29213b661875ca9793b4c4c878",
+      "changes": [
+        "The three patches above, applied in order."
+      ]
+    },
+    {
+      "path": "bridge.cu",
+      "origin": "SparkGLM 0.2.0 install/flash_kda/atlas_flash_kda_bridge.cu",
+      "sha256": "472bf5d97d5d57f9c0895221fb8dd5590c1aae7917272775efede77c70f4ac92",
+      "changes": []
+    },
+    {
+      "path": "runtime_bridge.cu",
+      "origin": "Enntity/atlas c87f27906016c874d5a356429e7816987f5b1cc6 research/flash-kda-prefill/runtime_bridge.cu",
+      "sha256": "d4c5301ab8b4f6f781fc1214c013c688142666889d63c1bff14efeccab1c0f3c",
+      "changes": []
+    },
+    {
+      "path": "adapter.cuh",
+      "origin": "Enntity/atlas c87f27906016c874d5a356429e7816987f5b1cc6 research/flash-kda-prefill/adapter.cuh",
+      "sha256": "e0e02032d4204109d0a6cab870ad1baa35ae688ff5aec387bcdbc1b2ac873336",
+      "changes": []
+    }
+  ],
+  "build_flags": {
+    "kernels.cu": "SparkGLM rebuild.sh: -std=c++17 -O3 -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__ --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math",
+    "runtime_bridge.cu": "SparkGLM build-native.sh: -std=c++17 -O3 --fmad=false"
+  }
+}
