@@ -282,18 +282,20 @@ fn the_pair_keeps_its_bounded_tower_and_one_launch_per_stage() {
 }
 
 #[test]
-fn a_world_past_the_pair_holds_the_budgets() {
+fn a_multi_rank_world_holds_the_budgets() {
     use atlas_core::config::ModelConfig;
     let vision = config();
     let mut world = ModelConfig::qwen3_next_80b_nvfp4();
-    (world.tp_world_size, world.ep_world_size) = (2, 2);
+    (world.tp_world_size, world.ep_world_size) = (1, 1);
     assert_eq!(
         GlmCapacity::of_world(&world, &vision),
         GlmCapacity::bounded(&vision)
     );
-    (world.tp_world_size, world.ep_world_size) = (4, 4);
-    assert_eq!(
-        GlmCapacity::of_world(&world, &vision),
-        GlmCapacity::budgets(&vision)
-    );
+    for ranks in [2, 4] {
+        (world.tp_world_size, world.ep_world_size) = (ranks, ranks);
+        assert_eq!(
+            GlmCapacity::of_world(&world, &vision),
+            GlmCapacity::budgets(&vision)
+        );
+    }
 }
