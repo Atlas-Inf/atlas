@@ -41,7 +41,7 @@ fn plans(layers: usize, spec: LatentShardSpec, slotted: bool) -> (GlmCachePlan, 
 
 #[test]
 fn a_sharded_block_costs_half_its_latents_and_keeps_its_index() {
-    let spec = crate::layers::glm_kv_shard::spec(0, &config(11), 524_288, 8256);
+    let spec = crate::layers::glm_kv_shard::spec((0, 2), &config(11), 524_288, 8256);
     let (base, sharded) = plans(11, spec, true);
     // Per 16-token block: 11 layers x (16 x 528 fp8_g128 latent + 16 / 4
     // pooled keys x 128 x 2 B) + a u32 tail-slot entry. Per token 6,512.25 B
@@ -67,7 +67,7 @@ fn the_sharded_plan_covers_every_allocation() {
     let shape = GlmMlaShape::new(512, 0).unwrap();
     let index = shape.bf16_index(4, 128).unwrap();
     for rank in 0..2 {
-        let spec = crate::layers::glm_kv_shard::spec(rank, &config(3), 2048, 64);
+        let spec = crate::layers::glm_kv_shard::spec((rank, 2), &config(3), 2048, 64);
         let (_, plan) = plans(3, spec, false);
         for blocks in [1, 2, 7, 64, 129, 130] {
             let gpu = MockGpuBackend::new();

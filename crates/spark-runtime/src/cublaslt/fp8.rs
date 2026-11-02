@@ -128,7 +128,7 @@ pub fn fp8_gemm_act_weight_t_rowwise(
             out as *mut c_void,
             ld_,
             result.as_ptr() as *const c_void,
-            ctx.workspace as *mut c_void,
+            ctx.workspace()? as *mut c_void,
             ctx.ws_size,
             stream as *mut c_void,
         );
@@ -265,7 +265,7 @@ pub fn fp8_gemm_act_weight_t_blkscaled(
             out as *mut c_void,
             ld_,
             result.as_ptr() as *const c_void,
-            ctx.workspace as *mut c_void,
+            ctx.workspace()? as *mut c_void,
             ctx.ws_size,
             stream as *mut c_void,
         );

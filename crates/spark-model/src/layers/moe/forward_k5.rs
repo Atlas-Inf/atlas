@@ -71,7 +71,7 @@ impl MoeLayer {
             && self.use_btile_or_t_prefill()
             && k5_grouped_moe_requested()
             && ctx.config.model_type == "glm5_next"
-            && ctx.config.ep_world_size == 2
+            && matches!(ctx.config.ep_world_size, 2 | 4)
             && ctx.comm.is_some()
             && ctx.config.shared_expert_intermediate_size > 0;
         if defer {

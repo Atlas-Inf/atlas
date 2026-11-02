@@ -203,15 +203,24 @@ pub(super) fn shard_plan(
     }
     let plan = plan.context("ATLAS_GLM_KV_SHARD=1 shards the GLM-5 NoPE MLA latent cache only")?;
     let comm = comm
-        .filter(|c| c.world_size() == 2)
-        .context("ATLAS_GLM_KV_SHARD=1 needs a two-rank communicator")?;
+        .filter(|c| matches!(c.world_size(), 2 | 4))
+        .context("ATLAS_GLM_KV_SHARD=1 needs a two- or four-rank communicator")?;
+    let world = comm.world_size();
     ensure!(
         // Serving topology has already converted this to local heads.
-        config.tp_world_size == 2 && config.num_attention_heads == 32,
-        "ATLAS_GLM_KV_SHARD=1 needs TP2 over 64 attention heads (32 per rank); \
+        config.tp_world_size == world
+            && config.num_attention_heads as u32 == shard::local_heads(world),
+        "ATLAS_GLM_KV_SHARD=1 needs TP{world} over {} attention heads ({} per rank); \
          got tp_world_size={} num_attention_heads={}",
+        shard::TOTAL_HEADS,
+        shard::local_heads(world),
         config.tp_world_size,
         config.num_attention_heads
+    );
+    ensure!(
+        world == 2 || !tuning.overlap,
+        "ATLAS_GLM_KV_SHARD_OVERLAP=1 overlaps the pair's swaps; beyond two ranks the shard \
+         all-gathers on the compute stream"
     );
     ensure!(
         kv_config.cache_blocks_per_seq.is_none(),
@@ -242,7 +251,12 @@ pub(super) fn shard_plan(
     // A cache write carries at most one chunk of rows (plus verify slack).
     let spec = spark_runtime::kv_cache::LatentShardSpec {
         lane: tuning.overlap,
-        ..shard::spec(comm.rank(), kv_config, max_seq_len, max_batch_tokens + 64)
+        ..shard::spec(
+            (comm.rank(), world),
+            kv_config,
+            max_seq_len,
+            max_batch_tokens + 64,
+        )
     };
     Ok(Some(plan.latent_sharded(kv_config, spec)))
 }

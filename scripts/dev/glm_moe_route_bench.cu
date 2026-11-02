@@ -89,13 +89,37 @@ static void chain(const Bufs& b, const bf* gate, unsigned m) {
            1.0f, m, H);
 }
 
-static void fused(const Bufs& b, const bf* gate, unsigned m) {
+static void router_quant(const Bufs& b, const bf* gate, unsigned m) {
     const unsigned router_ctas = (E + 15) / 16, quant = (m * (H / 16) + 255) / 256;
     launch(glm_moe_router_quant, dim3(router_ctas + quant), 256u, (const bf*)b.x, (const u8*)gate,
-           (const u8*)b.bias, b.logits, b.packed, b.packed + m * H / 2, m, E, H, router_ctas, E);
+           (const u8*)b.bias, b.logits, b.packed, b.packed + m * H / 2, m, E, H, router_ctas, E, 1.0f);
+}
+
+static void select(const Bufs& b, unsigned m) {
     launch(glm_moe_route_select, dim3(1), 256u, (const bf*)b.logits, (const float*)b.bias, b.ids,
            b.wts, b.sorted_tokens, b.sorted_experts, b.offsets, b.perm,
-           (const unsigned long long*)b.ptrs, b.worklist + 4, b.total, m, E, TOPK, 1u, 2.5f, 1u, 64u);
+           (const unsigned long long*)b.ptrs, b.worklist + 4, b.total, m, E, TOPK, 1u, 2.5f, 1u, 64u,
+           (const unsigned*)nullptr);
+}
+
+static void fused(const Bufs& b, const bf* gate, unsigned m) {
+    router_quant(b, gate, m);
+    select(b, m);
+}
+
+static unsigned int* g_done;
+static float* g_partials;
+
+// glm_moe_route_one: the router and the select in one launch (rows <= 8),
+// the router's warp shares ROUTE_ONE_VW to a CTA.
+static void one(const Bufs& b, const bf* gate, unsigned m) {
+    const unsigned router_ctas = ((E + 15) / 16 * 8 + ROUTE_ONE_VW - 1) / ROUTE_ONE_VW;
+    const unsigned quant = (m * (H / 16) + 255) / 256;
+    launch(glm_moe_route_one, dim3(router_ctas + quant), 256u, (const bf*)b.x, (const u8*)gate,
+           (const u8*)b.bias, b.logits, g_partials, b.packed, b.packed + m * H / 2, router_ctas, E,
+           b.ids, b.wts, b.sorted_tokens, b.sorted_experts, b.offsets, b.perm,
+           (const unsigned long long*)b.ptrs, b.worklist + 4, b.total, m, E, H, TOPK, 1u, 2.5f, 1u,
+           64u, g_done, (const unsigned*)nullptr, 1.0f);
 }
 
 int main(int argc, char** argv) {
@@ -136,7 +160,8 @@ int main(int argc, char** argv) {
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0));
     CK(cudaEventCreate(&e1));
-    // arm 0: spin -> nop; 1: spin -> chain -> nop; 2: spin -> fused -> nop.
+    // arm 0: spin -> nop; 1: spin -> chain -> nop; 2: spin -> fused -> nop;
+    // 3: the router alone; 4: the select alone (on the last logits).
     auto run = [&](int arm, unsigned m) {
         std::vector<float> t;
         for (int r = 0; r < reps + 1; r++) {
@@ -146,6 +171,9 @@ int main(int argc, char** argv) {
                 launch(spin, dim3(1), 32u, tab, spin_iters);
                 if (arm == 1) chain(b, gates[l], m);
                 if (arm == 2) fused(b, gates[l], m);
+                if (arm == 3) router_quant(b, gates[l], m);
+                if (arm == 4) select(b, m);
+                if (arm == 5) one(b, gates[l], m);
                 launch(nop, dim3(48), 256u, tab);
             }
             CK(cudaEventRecord(e1));
@@ -157,10 +185,34 @@ int main(int argc, char** argv) {
         std::sort(t.begin(), t.end());
         return t[t.size() / 2];
     };
-    printf("rows  base_us  chain_us  fused_us  saved_us/layer  saved_ms/step(42)\n");
+    CK(cudaMalloc(&g_done, 4));
+    CK(cudaMalloc(&g_partials, (E + 15) / 16 * 8 * 32 * 16));
+    CK(cudaMemset(g_done, 0, 4));
+    // The one-launch kernel's words against the two launches' (rows <= 8).
+    for (unsigned m : {1u, 3u, 8u}) {
+        auto read = [&](std::vector<unsigned>& out) {
+            out.clear();
+            for (auto [p, n] : {std::pair<const void*, size_t>{b.ids, m * TOPK}, {b.wts, m * TOPK},
+                                {b.offsets, E + 1}, {b.total, 1}, {b.worklist + 4, 2 * m * TOPK},
+                                {b.packed, m * H * 9 / 16 / 4}}) {
+                std::vector<unsigned> v(n);
+                CK(cudaMemcpy(v.data(), p, n * 4, cudaMemcpyDeviceToHost));
+                out.insert(out.end(), v.begin(), v.end());
+            }
+        };
+        std::vector<unsigned> want, got;
+        fused(b, gates[0], m); CK(cudaDeviceSynchronize()); read(want);
+        CK(cudaMemset(b.ids, 0xa5, m * TOPK * 4)); CK(cudaMemset(b.offsets, 0xa5, (E + 1) * 4));
+        one(b, gates[0], m); CK(cudaDeviceSynchronize()); read(got);
+        printf("rows %u: one-launch routing %s the two launches\n", m, want == got ? "matches" : "DIFFERS from");
+    }
+    printf("rows  base_us  chain_us  fused_us  router_us  select_us  one_us  saved_us/layer  saved_ms/step(42)\n");
     for (unsigned m : {1u, 2u, 3u, 4u, 5u, 8u, 16u, 32u}) {
         const float base = run(0, m), c = run(1, m) - base, f = run(2, m) - base;
-        printf("%4u  %7.1f  %8.1f  %8.1f  %14.1f  %17.2f\n", m, base, c, f, c - f, (c - f) * 42 / 1000);
+        const float r = run(3, m) - base, s = run(4, m) - base;
+        const float o = m <= 8 ? run(5, m) - base : 0.0f;
+        printf("%4u  %7.1f  %8.1f  %8.1f  %9.1f  %9.1f  %6.1f  %14.1f  %17.2f\n", m, base, c, f, r, s, o,
+               c - f, (c - f) * 42 / 1000);
     }
     return 0;
 }

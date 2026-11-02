@@ -15,8 +15,16 @@ fn compare_is_strict_and_requires_the_staged_route() {
 #[test]
 fn comparison_output_requires_capacity_and_independent_storage() {
     assert_eq!(output_bytes(3), OUTPUT);
-    let plan =
-        StagePlan::new(3, DevicePtr(0x1000), 49664, DevicePtr(0x20000), OUTPUT, &[]).unwrap();
+    let plan = StagePlan::new(
+        3,
+        8192,
+        DevicePtr(0x1000),
+        49664,
+        DevicePtr(0x20000),
+        OUTPUT,
+        &[],
+    )
+    .unwrap();
     plan.with_compare(DevicePtr(0x30000), OUTPUT, &[]).unwrap();
     for (ptr, size) in [
         (0, OUTPUT),
@@ -40,6 +48,7 @@ fn comparison_output_scales_with_rows() {
         let scratch = scratch_bytes(rows);
         let plan = StagePlan::new(
             rows,
+            8192,
             DevicePtr(0x1000),
             scratch,
             DevicePtr(0x40000),

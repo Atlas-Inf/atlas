@@ -7,6 +7,7 @@ extra_nvcc_flags = ["--fmad=false"]
 # Only NVIDIA's imported attention device implementation uses fast math.
 [build.kernel_nvcc_flags]
 glm_sparse_native_attention = ["--use_fast_math", "--fmad=true"]
+glm_sparse_native_attention_sg16 = ["--use_fast_math", "--fmad=true"]
 glm_sparse_native_prep = ["--prec-div=true", "--ftz=false"]
 glm_sparse_native_split = ["--prec-div=true", "--ftz=false"]
 glm_sparse_native_merge = ["--prec-div=true", "--ftz=false"]

@@ -127,7 +127,7 @@ impl DenseFfnLayer {
         {
             return Ok(false);
         }
-        // ATLAS_GLM_DENSE_TP_SPLIT: half the columns on each rank.
+        // ATLAS_GLM_DENSE_TP_SPLIT: 1/n of the columns on each rank.
         let proj = super::tp_split::SplitProj::Nvfp4 { weights: w, tc };
         if self.glm_verify_rows_split(input, rows, proj, ctx, stream)? {
             return Ok(true);

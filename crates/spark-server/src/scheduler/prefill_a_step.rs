@@ -163,7 +163,19 @@ pub fn start_chunked_prefill(
     if chunk_len < total && g > 4 && chunk_len >= g {
         chunk_len -= chunk_len % g;
     }
-    let is_last = chunk_len >= total;
+    let mut is_last = chunk_len >= total;
+    let multiple = model.prefill_row_multiple();
+    if is_last {
+        (chunk_len, is_last) = super::sp_final_cut(chunk_len, multiple);
+    }
+    // On the chain a first chunk that is not the prompt's last lands on the
+    // sequence-parallel row multiple like every later one (`run_standard`):
+    // the idle budget is the arena, `max_prefill_tokens + max_batch_size`, and
+    // an odd one (TP4's one sequence: 8193) would keep sequence-parallel
+    // prefill, which splits the rows over every rank, off the chunk.
+    if !is_last && multiple > 1 {
+        chunk_len = super::chunk_align(chunk_len, multiple);
+    }
 
     tracing::info!(
         "Chunked prefill start: {} prompt tokens, chunk_size={}, max_tokens={max_tokens}",

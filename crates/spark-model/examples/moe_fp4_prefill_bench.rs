@@ -4,9 +4,11 @@
 //! `[K/2, N]` expert weights, prequantized NVFP4 activations).
 //!
 //! Synthetic EP2 rank at a 4K chunk, launched as in serving: a grid over all
-//! 288 experts, of which the second 144 are remote (NULL weights) but still
-//! own sorted rows; 16384 routed rows on the 144 local experts with a
+//! 288 experts, of which all but the first 144 are remote (NULL weights) but
+//! still own sorted rows; 16384 routed rows on the 144 local experts with a
 //! hot-expert skew, gate (N=2048, K=4096) and down (N=4096, K=2048).
+//! `MOE_BENCH_EXPERTS=288 MOE_BENCH_ROWS=65536 MOE_BENCH_INTER=512`: a TP4
+//! expert-TP rank (ATLAS_GLM_EXPERT_TP) at an 8K chunk.
 //! Every candidate kernel in `CANDIDATES` must reproduce the reference
 //! output bit for bit (same per-element K accumulation order).
 //!
@@ -29,7 +31,8 @@ use gates::{gate_up_silu, tile_worklist};
 const MODULE: &str = "moe_w4a16";
 const REFERENCE: &str = "moe_w4a4_grouped_gemm_prequant_t_k64_vecscale";
 /// (kernel, CTA N tile, threads per CTA, reads K-major `[N, K/2]` weights,
-/// compact row-tile grid over `moe_mtile_prefix`).
+/// compact row-tile grid over `moe_mtile_prefix`; a `_persist` twin takes
+/// two CTAs per SM and a zeroed work counter instead of the grid).
 const CANDIDATES: &[(&str, u32, u32, bool, bool)] = &[
     (
         "moe_w4a4_grouped_gemm_prequant_t_k128",
@@ -46,6 +49,13 @@ const CANDIDATES: &[(&str, u32, u32, bool, bool)] = &[
         true,
     ),
     (
+        "moe_w4a4_grouped_gemm_prequant_t_k128w_compact_persist",
+        256,
+        256,
+        false,
+        true,
+    ),
+    (
         "moe_w4a4_grouped_gemm_prequant_nk_k128",
         128,
         256,
@@ -53,9 +63,23 @@ const CANDIDATES: &[(&str, u32, u32, bool, bool)] = &[
         false,
     ),
 ];
-/// Local experts; the grid covers twice as many (the remote rank's half).
-const EXPERTS: usize = 144;
-const GRID_EXPERTS: usize = 2 * EXPERTS;
+/// Local experts, the grid's first: 144, or `MOE_BENCH_EXPERTS`.
+fn experts() -> usize {
+    std::env::var("MOE_BENCH_EXPERTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(144)
+}
+/// The routed experts' intermediate width on this rank: 2048, or
+/// `MOE_BENCH_INTER` (512: an expert-TP rank of four).
+fn inter() -> u32 {
+    std::env::var("MOE_BENCH_INTER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2048)
+}
+/// The routed experts of every rank (GLM's 288).
+const GRID_EXPERTS: usize = 288;
 /// Routed rows on one EP2 rank: 16384 at a 4K chunk (top-8 over two ranks);
 /// `MOE_BENCH_ROWS` overrides (32768 = an 8K chunk).
 fn rows_total() -> usize {
@@ -84,7 +108,7 @@ fn up(g: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
 
 /// Expert row counts: a Zipf-like skew (hottest ~3K rows), summing to rows_total().
 fn expert_rows() -> Vec<usize> {
-    let weights: Vec<f64> = (0..EXPERTS)
+    let weights: Vec<f64> = (0..experts())
         .map(|e| 1.0 / (1.0 + e as f64).powf(0.9))
         .collect();
     let total: f64 = weights.iter().sum();
@@ -93,11 +117,11 @@ fn expert_rows() -> Vec<usize> {
         .map(|w| (w / total * rows_total() as f64) as usize)
         .collect();
     let short = rows_total() - rows.iter().sum::<usize>();
-    rows[EXPERTS - 1] += short;
+    rows[experts() - 1] += short;
     rows
 }
 
-/// Per-expert weight tables for `EXPERTS` local experts (the remote half
+/// Per-expert weight tables for `experts()` local experts (the remote ones
 /// NULL): Atlas transposed `[K/2, N]` + `[K/16, N]`, and the same bytes
 /// K-major `[N, K/2]` + `[N, K/16]` (each byte keeps its k-pair). Returns
 /// (packed, scales, packed K-major, scales K-major) pointer tables and the
@@ -110,7 +134,7 @@ fn expert_tables(
 ) -> Result<([DevicePtr; 4], Vec<DevicePtr>)> {
     let mut tables = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     let mut owned = Vec::new();
-    for _ in 0..EXPERTS {
+    for _ in 0..experts() {
         let w: Vec<u8> = (0..n * k / 2).map(|_| rng.next() as u8).collect();
         let s: Vec<u8> = (0..n * k / 16)
             .map(|_| 0x30 + (rng.next() % 16) as u8)
@@ -191,22 +215,26 @@ fn main() -> Result<()> {
     let max_m_tiles = rows.iter().map(|r| r.div_ceil(64)).max().unwrap_or(1) as u32;
     // Remote experts mirror the local histogram; their rows follow the local ones.
     let mut offsets = vec![0i32];
-    for r in rows.iter().chain(rows.iter()) {
+    for r in rows.iter().cycle().take(GRID_EXPERTS) {
         offsets.push(offsets.last().unwrap() + *r as i32);
     }
-    let all_rows = 2 * rows_total();
+    // Buffers cover the local rows only: they come first, and nothing reads
+    // or writes a remote expert's (NULL weights).
+    let all_rows = rows_total();
     // Compact grid bound as served without an offsets download: every local
     // row in M64 tiles plus one partial tile per local expert.
-    let tile_bound = (rows_total().div_ceil(64) + EXPERTS) as u32;
+    let tile_bound = (rows_total().div_ceil(64) + experts()) as u32;
     let prefix_k = g.kernel(MODULE, "moe_mtile_prefix")?;
     let d_prefix = g.alloc((GRID_EXPERTS + 1) * 4)?;
     let off_bytes: Vec<u8> = offsets.iter().flat_map(|v| v.to_le_bytes()).collect();
     let d_off = up(g, &off_bytes)?;
     let mut rng = Lcg(0xF4F4);
     let mut fail = false;
+    let inter = inter();
+    let d_next = g.alloc(16)?;
     for (name, n, k) in [
-        ("gate [2048 x 4096]", 2048u32, 4096u32),
-        ("down [4096 x 2048]", 4096, 2048),
+        (format!("gate [{inter} x 4096]"), inter, 4096u32),
+        (format!("down [4096 x {inter}]"), 4096, inter),
     ] {
         let (nu, ku) = (n as usize, k as usize);
         // A: packed E2M1 rows + UE4M3 group scales in a sane exponent range.
@@ -266,6 +294,23 @@ fn main() -> Result<()> {
                     .arg_ptr(d_prefix)
                     .arg_u32(GRID_EXPERTS as u32)
                     .launch(0)?;
+                if kname.ends_with("_persist") {
+                    // The counter is zeroed on the launch stream, as served.
+                    g.memset_async(d_next, 0, 4, 0)?;
+                    let mut l = KernelLaunch::new(g, kernel)
+                        .grid([2 * g.sm_count()?, 1, 1])
+                        .block([threads, 1, 1]);
+                    for p in &a {
+                        l = l.arg_ptr(*p);
+                    }
+                    return l
+                        .arg_u32(GRID_EXPERTS as u32)
+                        .arg_u32(n)
+                        .arg_u32(k)
+                        .arg_ptr(d_prefix)
+                        .arg_ptr(d_next)
+                        .launch(0);
+                }
                 launch(
                     g,
                     kernel,
@@ -297,6 +342,9 @@ fn main() -> Result<()> {
                     format!("MISMATCH {diff} values")
                 }
             );
+        }
+        if n == 4096 {
+            fail |= gates::down_e4m3(g, &args(c_new), &want, [n, k], tile_bound, flop)?;
         }
         for p in owned.into_iter().chain([d_a, d_as, d_s2, c_ref, c_new]) {
             g.free(p)?;

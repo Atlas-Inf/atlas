@@ -16,6 +16,7 @@
 // Output is at a fixed stride per head in the output buffer.
 
 #include <cuda_bf16.h>
+#include "../../common/atlas_pdl.cuh"
 
 #define BLOCK_SIZE 256
 #define N_PER_BLOCK 4
@@ -294,6 +295,8 @@ extern "C" __global__ void mla_cache_assemble_batched(
     unsigned int rope,
     unsigned int mla_cache_dim                       // kv_lora + rope
 ) {
+    // PDL entry (a no-op without the launch attribute; GLM-5.3-Flash lists it).
+    atlas_pdl_enter();
     unsigned int t = blockIdx.x;
     unsigned long long k_off = (unsigned long long)t * mla_cache_dim;
     unsigned long long lat_off = (unsigned long long)t * kv_lora;

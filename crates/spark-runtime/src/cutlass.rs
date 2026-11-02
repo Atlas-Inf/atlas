@@ -349,8 +349,26 @@ pub(crate) fn drained(wrapper: &str, status: i32) -> i32 {
 
 #[cfg(atlas_cutlass)]
 pub(crate) struct Ctx {
-    pub(crate) workspace: u64,
+    lanes: crate::lane::LaneWorkspace,
     pub(crate) ws_size: usize,
+}
+
+#[cfg(atlas_cutlass)]
+impl Ctx {
+    /// The calling thread's scratch lane's workspace (`crate::lane`).
+    pub(crate) fn workspace(&self) -> Result<u64> {
+        self.lanes.get()
+    }
+}
+
+#[cfg(atlas_cutlass)]
+fn alloc_workspace(bytes: usize) -> Result<u64> {
+    let mut workspace = 0u64;
+    let status = unsafe { cuMemAlloc_v2(&mut workspace, bytes) };
+    if status != 0 {
+        bail!("cuMemAlloc CUTLASS workspace failed: {status}");
+    }
+    Ok(workspace)
 }
 
 #[cfg(atlas_cutlass)]
@@ -392,8 +410,22 @@ pub(crate) fn ctx() -> Result<&'static Ctx> {
     if status != 0 {
         bail!("cuMemAlloc CUTLASS workspace failed: {status}");
     }
-    let _ = CTX.set(Ctx { workspace, ws_size });
+    let _ = CTX.set(Ctx {
+        lanes: crate::lane::LaneWorkspace::new(ws_size, workspace, alloc_workspace),
+        ws_size,
+    });
     Ok(CTX.get().unwrap())
+}
+
+/// Allocate the shared CUTLASS workspace now, so the first prefill does not
+/// pay its lazy cuMemAlloc (28 ms inside the first 32K TP-4 prefill's MLA
+/// FP8 GEMM, rank-0 nsys 2026-10-18). Failure is logged, never fatal: the
+/// first GEMM retries it.
+pub fn prewarm() {
+    #[cfg(atlas_cutlass)]
+    if let Err(e) = ctx() {
+        tracing::warn!("CUTLASS prewarm: {e:#}");
+    }
 }
 
 #[cfg(test)]

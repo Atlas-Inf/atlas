@@ -11,6 +11,7 @@ mod glm5_kda;
 pub mod glm_kv_shard;
 pub mod glm_native;
 pub mod glm_sp;
+pub mod glm_sp_moe_seam;
 pub mod glm_sp_overlap;
 pub mod glm_sp_uneven;
 pub mod moe;
@@ -79,6 +80,7 @@ pub enum FfnComponent {
 
 mod ffn_c4;
 mod ffn_glm;
+pub(crate) use ffn_glm::ffn_glm_gather_group;
 
 impl FfnComponent {
     pub fn is_none(&self) -> bool {

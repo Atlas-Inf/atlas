@@ -321,3 +321,40 @@ fn confidences_travel_with_the_drafts() {
     assert!(a.pending_draft_conf.is_empty());
     assert_eq!(a.take_drafts(), (vec![8, 9], Vec::new()));
 }
+
+#[test]
+fn dead_rows_widen_the_sure_owners_and_keep_the_unsure_short() {
+    // Four owners within the chain's 32-row budget: two sure of all seven
+    // drafts, two unsure of every one.
+    let (sure, unsure) = ([SURE; 7], [UNSURE; 7]);
+    let owners: [&[f32]; 4] = [&sure, &unsure, &sure, &unsure];
+    let (width, counts) = Policy::default()
+        .choose_live(owners.iter().copied(), 7, NO_PROBE)
+        .unwrap();
+    assert_eq!(width, 7);
+    assert_eq!((counts[0], counts[2]), (7, 7));
+    assert!(counts[1] <= 2 && counts[3] <= 2, "{counts:?}");
+    // Every owner verifies at least its first draft, at most the width.
+    assert!(counts.iter().all(|&c| (1..=width).contains(&c)));
+}
+
+#[test]
+fn dead_rows_probe_verifies_every_draft() {
+    let unsure = [UNSURE; 3];
+    let owners: [&[f32]; 2] = [&unsure, &unsure];
+    let params = Params {
+        probe: 1,
+        ..NO_PROBE
+    };
+    assert_eq!(
+        Policy::default().choose_live(owners.iter().copied(), 3, params),
+        Some((3, vec![3, 3]))
+    );
+    // Unmeasured drafts leave the caller's policy.
+    let short = [SURE; 2];
+    let owners: [&[f32]; 2] = [&short, &unsure];
+    assert_eq!(
+        Policy::default().choose_live(owners.iter().copied(), 3, NO_PROBE),
+        None
+    );
+}

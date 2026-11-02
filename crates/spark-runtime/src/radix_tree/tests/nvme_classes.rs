@@ -146,6 +146,92 @@ fn a_full_class_trims_a_chain_tail_across_classes() {
     tree.complete_restore(&chain, BS, 0, &plan, &[], false);
 }
 
+#[test]
+fn tp4_full_classes_trim_up_to_three_descendants() {
+    for class in 0..4 {
+        let tree = RadixTree::new();
+        assert!(tree.enable_classes(2, 4));
+        let chain = toks(0, 8);
+        cache(&tree, &chain, &[0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(tree.evict(8).spill.len(), 8);
+        // The cold chain's last record in class 0/1 is more than one edge
+        // above its leaf. It must yield to this newer record of that class.
+        let newer = toks(9000, 1);
+        cache(&tree, &newer, &[8 + class]);
+        let ev = tree.evict(1);
+        assert_eq!(ev.spill.len(), 1, "class={class}");
+        assert_eq!(ev.spill[0].slot % 4, class);
+        let s = tree.nvme_stats();
+        assert_eq!((s.disk_drops, s.cold_drops), (4 - u64::from(class), 0));
+        let plan = tree.plan_restore(&chain, BS, 0);
+        assert_eq!(plan.disk.len(), 4 + class as usize);
+        tree.complete_restore(&chain, BS, 0, &plan, &[], false);
+    }
+}
+
+#[test]
+fn tp4_pinned_tail_survives_a_full_class() {
+    let tree = RadixTree::new();
+    assert!(tree.enable_classes(1, 4));
+    let chain = toks(0, 4);
+    cache(&tree, &chain, &[0, 1, 2, 3]);
+    assert_eq!(tree.evict(4).spill.len(), 4);
+    let pin = tree.plan_restore(&chain, BS, 0);
+    let newer = toks(9000, 1);
+    cache(&tree, &newer, &[8]);
+    assert!(
+        tree.evict(1).spill.is_empty(),
+        "cannot drop a pinned disk tail"
+    );
+    assert_eq!(tree.nvme_stats().slots_used, 4);
+    tree.complete_restore(&chain, BS, 0, &pin, &[], false);
+    cache(&tree, &newer, &[8]);
+    assert_eq!(tree.evict(1).spill.len(), 1, "reclaimable after unpin");
+    assert_eq!(tree.nvme_stats().disk_drops, 4);
+}
+
+#[test]
+fn tp4_branched_tail_counts_every_dropped_record() {
+    let tree = RadixTree::new();
+    assert!(tree.enable_classes(2, 4));
+    let left = toks(0, 4);
+    let mut right = left[..2 * BS].to_vec();
+    right.extend(toks(5000, 2));
+    cache(&tree, &left, &[0, 1, 2, 3]);
+    cache(&tree, &right, &[0, 1, 6, 7]);
+    let other = toks(8000, 1);
+    cache(&tree, &other, &[4]);
+    assert_eq!(tree.evict(7).spill.len(), 7);
+    let newer = toks(9000, 1);
+    cache(&tree, &newer, &[8]);
+    assert_eq!(tree.evict(1).spill.len(), 1);
+    // The colder class-0 record owns the six-node branch, not just its
+    // immediate child; all six disk slots must be returned and counted.
+    assert_eq!(tree.nvme_stats().disk_drops, 6);
+    assert_eq!(tree.nvme_stats().slots_used, 2);
+}
+
+#[test]
+fn tp4_rewritten_blocks_release_only_their_kept_records() {
+    let tree = RadixTree::new();
+    assert!(tree.enable_classes(4, 4));
+    tree.set_keep_restored(true);
+    let t = toks(0, 8);
+    spill_and_restore(
+        &tree,
+        &t,
+        &[0, 1, 2, 3, 4, 5, 6, 7],
+        &[16, 17, 18, 19, 20, 21, 22, 23],
+    );
+    assert_eq!(tree.nvme_stats().slots_used, 8);
+    tree.forget_kept(&t, BS, 0, 1..6);
+    assert_eq!(tree.nvme_stats().slots_used, 3);
+    let ev = tree.evict(8);
+    let rewritten: Vec<u32> = ev.spill.iter().map(|o| o.block).collect();
+    assert_eq!(rewritten, [21, 20, 19, 18, 17]);
+    assert_eq!(tree.nvme_stats().clean_evictions, 3);
+}
+
 /// Kept records (`set_keep_restored`) count against their own class: a
 /// class past half full gives a restored record back while the other class,
 /// at half, keeps its own.

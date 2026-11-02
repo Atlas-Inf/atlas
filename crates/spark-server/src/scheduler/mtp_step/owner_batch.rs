@@ -22,6 +22,8 @@ pub(super) fn verify_owner_batch(
     // verify in ONE target traversal instead of one traversal per owner —
     // two drafts on the repaired long-context K3 lane, the most common width
     // on the DFlash lane. Everything else keeps the per-sequence path.
+    // With dead rows, each chosen owner's verified drafts (`(owner, drafts)`).
+    let mut live: Vec<(usize, usize)> = Vec::new();
     let adaptive_width = if dflash_verify_raw_argmax {
         let owners: Vec<usize> = serial_idxs
             .iter()
@@ -37,16 +39,29 @@ pub(super) fn verify_owner_batch(
             .rev()
             .find(|&w| model.can_batch_glm_long_verify_rows(owners.len(), w + 1));
         let max = fits.unwrap_or(0);
-        (owners.len() >= 2)
+        let chosen = (owners.len() >= 2)
             .then(|| {
-                super::dflash_width::choose(
-                    owners
-                        .iter()
-                        .map(|&i| (&active[i].spec_adapt.survival, active[i].draft_conf())),
+                super::dflash_width::choose_live(
+                    owners.iter().map(|&i| active[i].draft_conf()),
                     max,
                 )
             })
-            .flatten()
+            .flatten();
+        if let Some((width, counts)) = chosen {
+            live = owners.iter().copied().zip(counts).collect();
+            Some(width)
+        } else {
+            (owners.len() >= 2)
+                .then(|| {
+                    super::dflash_width::choose(
+                        owners
+                            .iter()
+                            .map(|&i| (&active[i].spec_adapt.survival, active[i].draft_conf())),
+                        max,
+                    )
+                })
+                .flatten()
+        }
     } else {
         None
     };
@@ -99,9 +114,22 @@ pub(super) fn verify_owner_batch(
                 active[i].pending_drafts.truncate(width);
                 active[i].pending_draft_conf.truncate(width);
             }
-            super::dflash_width::log_verify(group.len(), width);
             let mut sorted = group.clone();
             sorted.sort_unstable();
+            // Empty: every owner verifies every draft (no dead rows).
+            let verified: Vec<usize> = if live.is_empty() {
+                Vec::new()
+            } else {
+                sorted
+                    .iter()
+                    .map(|i| {
+                        live.iter()
+                            .find(|(o, _)| o == i)
+                            .map_or(width, |&(_, d)| d.min(width))
+                    })
+                    .collect()
+            };
+            super::dflash_width::log_verify(group.len(), width, &verified);
             let mut batch: Vec<&mut ActiveSeq> = active
                 .iter_mut()
                 .enumerate()
@@ -115,6 +143,7 @@ pub(super) fn verify_owner_batch(
                 num_drafts,
                 verify_ctx,
                 dflash_verify_raw_argmax,
+                &verified,
             );
         }
     }

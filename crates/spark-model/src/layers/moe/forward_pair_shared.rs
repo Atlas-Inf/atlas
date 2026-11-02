@@ -10,22 +10,22 @@ pub(crate) fn shared_tp_split_requested() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_GLM_SHARED_TP_SPLIT").as_deref() == Ok("1"))
 }
 
-/// `ATLAS_MOE_SHARED_REDUCE_OVERLAP=1`: run the shared expert on the prefill
-/// stream while the EP all-reduce is in flight. A chunk that overlaps does
-/// not take the TP split, so this must match across the ranks too.
-pub(crate) fn shared_reduce_overlap_requested() -> bool {
-    std::env::var("ATLAS_MOE_SHARED_REDUCE_OVERLAP").as_deref() == Ok("1")
-}
-
-/// The ranks a replicated row's native shared expert splits over under
-/// [`shared_tp_split_requested`] (`shared_native.rs`): the EP2 pair or the
-/// EP4 chain, each rank running its `1/ranks` of the intermediate columns.
+/// The ranks a replicated row's shared expert splits over under
+/// [`shared_tp_split_requested`]: the EP2 pair or the EP4 chain, each rank
+/// running its `1/ranks` of the intermediate columns.
 pub(super) fn shared_split_ranks(ctx: &ForwardContext) -> Option<usize> {
     let ranks = ctx.config.ep_world_size;
     (shared_tp_split_requested()
         && matches!(ranks, 2 | 4)
         && ctx.comm.is_some_and(|c| c.world_size() == ranks))
     .then_some(ranks)
+}
+
+/// `ATLAS_MOE_SHARED_REDUCE_OVERLAP=1`: run the shared expert on the prefill
+/// stream while the EP all-reduce is in flight. A chunk that overlaps does
+/// not take the TP split, so this must match across the ranks too.
+pub(crate) fn shared_reduce_overlap_requested() -> bool {
+    std::env::var("ATLAS_MOE_SHARED_REDUCE_OVERLAP").as_deref() == Ok("1")
 }
 
 impl MoeLayer {
@@ -94,15 +94,13 @@ impl MoeLayer {
     }
 
     /// Whether the shared expert can run TP-split for `rows` replicated rows
-    /// (`ATLAS_GLM_SHARED_TP_SPLIT=1`, EP2, NVFP4 shared weights with scalar
-    /// scale2, strided tensor-core tiers for `rows`).
+    /// ([`shared_split_ranks`], NVFP4 shared weights with scalar scale2, a
+    /// slice on the 16-value scale groups, strided tensor-core tiers for
+    /// `rows`).
     pub(super) fn shared_split_ready(&self, ctx: &ForwardContext, rows: u32) -> bool {
         let shared = &self.weights.shared_expert;
         let inter = ctx.config.shared_expert_intermediate_size;
-        shared_tp_split_requested()
-            && ctx.config.ep_world_size == 2
-            && ctx.comm.is_some_and(|c| c.world_size() == 2)
-            && inter.is_multiple_of(32)
+        shared_split_ranks(ctx).is_some_and(|ranks| inter.is_multiple_of(16 * ranks))
             && self.shared_experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
             && [&shared.gate_proj, &shared.up_proj, &shared.down_proj]
                 .iter()
@@ -111,10 +109,11 @@ impl MoeLayer {
             && crate::layers::w4a16_gemv_tiers::tc_ld_kernel(rows).0 != 0
     }
 
-    /// This rank's half of the shared expert: intermediate columns
-    /// `[rank * inter/2, +inter/2)` — gate/up rows (a pointer offset) and the
-    /// matching K-slice of down (strided tier). `attn_output` then holds this
-    /// rank's partial of the shared output; the EP all-reduce sums the two.
+    /// This rank's part of the shared expert: intermediate columns
+    /// `[rank * part, +part)`, `part = inter / ranks` — gate/up rows (a
+    /// pointer offset) and the matching K-slice of down (strided tier).
+    /// `attn_output` then holds this rank's partial of the shared output; the
+    /// EP all-reduce sums the ranks'.
     pub(super) fn run_shared_split(
         &self,
         input: DevicePtr,
@@ -125,8 +124,8 @@ impl MoeLayer {
         stream: u64,
     ) -> Result<()> {
         let shared = &self.weights.shared_expert;
-        let half = inter / 2;
-        let col0 = (ctx.config.ep_rank as u32 * half) as usize;
+        let part = inter / ctx.config.ep_world_size as u32;
+        let col0 = (ctx.config.ep_rank as u32 * part) as usize;
         let gate_up_rows = |w: &QuantizedWeight| QuantizedWeight {
             weight: w.weight.offset(col0 * h as usize / 2),
             weight_scale: w.weight_scale.offset(col0 * h as usize / 16),
@@ -150,11 +149,11 @@ impl MoeLayer {
         let gate_up = [(&gate, gate_out), (&up, up_out)];
         // ATLAS_GLM_DECODE_GEMV_BATCH: gate and up in one launch of the tc
         // body, both touched during the PDL wait (`ops::gemv_touch`).
-        match ops::w4a16_pair_touch(ctx.gpu, tc, input, gate_up, rows, half, h, stream) {
+        match ops::w4a16_pair_touch(ctx.gpu, tc, input, gate_up, rows, part, h, stream) {
             Some(done) => done?,
             None => {
                 for (weight, out) in gate_up {
-                    ops::w4a16_gemv_batchm(ctx.gpu, tc, input, weight, out, rows, half, h, stream)?;
+                    ops::w4a16_gemv_batchm(ctx.gpu, tc, input, weight, out, rows, part, h, stream)?;
                 }
             }
         }
@@ -164,16 +163,17 @@ impl MoeLayer {
             gate_out,
             up_out,
             gate_out,
-            rows * half,
+            rows * part,
             stream,
         )?;
-        let (ld_half, ld_groups) = (inter / 2, inter / 16);
+        // down's row strides: packed bytes and scale groups of a whole row.
+        let (ld_bytes, ld_groups) = (inter / 2, inter / 16);
         let touch = crate::layers::w4a16_gemv_tiers::tc_rows(tc)
             .and_then(ops::w4a16_tc_twin)
             .and_then(ops::gemv_touch);
         if let Some(touch) = touch {
             return touch.w4a16_tc(
-                ctx.gpu, gate_out, &down_cols, down_out, rows, h, half, ld_half, ld_groups, stream,
+                ctx.gpu, gate_out, &down_cols, down_out, rows, h, part, ld_bytes, ld_groups, stream,
             );
         }
         ops::w4a16_gemv_tc_ld(
@@ -184,8 +184,8 @@ impl MoeLayer {
             down_out,
             rows,
             h,
-            half,
-            ld_half,
+            part,
+            ld_bytes,
             ld_groups,
             stream,
         )

@@ -40,6 +40,7 @@ mod glm_fused_chunk;
 pub mod glm_independent;
 pub(crate) mod glm_k3_head;
 mod glm_long_verify;
+pub(crate) mod glm_prefill_pipe;
 mod glm_prefill_sp;
 mod glm_verify_masks;
 mod glm_verify_sample;

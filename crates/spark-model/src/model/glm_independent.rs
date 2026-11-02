@@ -170,8 +170,7 @@ pub fn ffn_rows_selected(ctx: &ForwardContext, rows: usize) -> Result<bool> {
     }
     Ok(crate::speculative::glm_repair_policy::dflash_enabled()
         && ctx.config.model_type == "glm5_next"
-        && ctx.config.tp_world_size == 2
-        && ctx.config.ep_world_size == 2
+        && crate::layers::moe::glm_tp_ep(ctx.config)
         && (2..=crate::speculative::glm_repair_policy::MAX_DFLASH_VERIFY_ROWS).contains(&rows))
 }
 

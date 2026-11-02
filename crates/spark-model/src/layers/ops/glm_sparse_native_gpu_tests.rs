@@ -57,14 +57,14 @@ fn run(host: &Host) -> Result<(Vec<u8>, Vec<u8>)> {
             anyhow::anyhow!("build the GLM CUDA target; ATLAS_SKIP_BUILD must be unset")
         })?;
     let gpu = AtlasCudaBackend::new(0, &target.modules)?;
-    dispatch::resolve(&gpu)?;
+    dispatch::resolve(&gpu, 32)?;
     ensure!(
         gpu.free_memory()? > 4 * 1024 * 1024 * 1024,
         "GPU requires4GiB free; run only in an exclusive maintenance window"
     );
     let stream = Stream(&gpu, gpu.create_stream()?);
     let (required, metadata) =
-        plan::required_bytes(ROWS, END, BLOCKS, END / 16).map_err(anyhow::Error::msg)?;
+        plan::required_bytes(ROWS, END, BLOCKS, END / 16, 32).map_err(anyhow::Error::msg)?;
     ensure!(
         required.iter().sum::<usize>() + 512 * 10 < 1024 * 1024 * 1024,
         "fixture exceeds1GiB"
@@ -89,8 +89,8 @@ fn run(host: &Host) -> Result<(Vec<u8>, Vec<u8>)> {
         ptr: buffers[i].ptr().0,
         bytes: buffers[i].bytes,
     });
-    let plan =
-        Plan::new(ROWS, START, BLOCKS, END / 16, spans, stream.1).map_err(anyhow::Error::msg)?;
+    let plan = Plan::new(ROWS, START, BLOCKS, END / 16, 32, spans, stream.1)
+        .map_err(anyhow::Error::msg)?;
     // Exactly the serving implementation, including capability checks and
     // per-source typed KernelLaunch calls. No duplicated dispatch or host ABI.
     dispatch::execute(&plan, &gpu)?;

@@ -77,10 +77,10 @@ impl MoeLayer {
                 && self.independent_grouped(ctx, rows as u32)
                 && !self.is_dflash_capture_layer
                 && input == ctx.buffers.norm_output()
-                && ctx
-                    .comm
-                    .is_some_and(|c| c.world_size() == 2 && c.rank() == ctx.config.ep_rank),
-            "independent MoE requires native-T exact live rows and local EP2 context"
+                && ctx.comm.is_some_and(|c| {
+                    c.world_size() == ctx.config.ep_world_size && c.rank() == ctx.config.ep_rank
+                }),
+            "independent MoE requires native-T exact live rows and this EP rank's context"
         );
         self.validate_independent_handles()?;
         super::forward_c4::validate_independent_moe_arenas(ctx.config, ctx.buffers.sizes(), rows)?;

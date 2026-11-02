@@ -17,18 +17,32 @@ use crate::prefix_cache::{DiskRef, SpillOrder};
 /// Record sizes of the tier's slot classes on this rank (see the module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NvmeGeometry {
+    /// One unsharded, or one per latent-shard rank.
+    pub classes: usize,
     /// A record of a block whose latents this rank stores: every block
     /// unless latent-sharded.
     pub own: usize,
-    /// Latent-sharded: a record of a block the peer stores (its index rows
+    /// Latent-sharded: a record of a block another rank stores (its index rows
     /// only). `None` unsharded.
     pub peer: Option<usize>,
 }
 
 impl NvmeGeometry {
-    /// Slot classes (= record lanes): 1, or the shard's world (a pair).
+    /// Slot classes (= record lanes): 1, or the shard's world.
     pub fn classes(&self) -> usize {
-        if self.peer.is_some() { 2 } else { 1 }
+        self.classes
+    }
+
+    /// Invalid geometry must fail before division, reservation or rank agreement.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            matches!(self.classes, 1 | 2 | 4)
+                && self.peer.is_some() == (self.classes > 1)
+                && self.own > 0
+                && self.peer.is_none_or(|p| p > 0),
+            "invalid NVMe record geometry: {self:?}"
+        );
+        Ok(())
     }
 
     /// Record bytes of class `class` on rank `rank`.
@@ -42,15 +56,16 @@ impl NvmeGeometry {
     /// Disk bytes of one slot of EVERY class: what a budget is divided by to
     /// get the slots per class.
     pub fn row_bytes(&self) -> usize {
-        self.own + self.peer.unwrap_or(0)
+        self.own + self.classes.saturating_sub(1) * self.peer.unwrap_or(0)
     }
 
     /// Pinned staging of every lane (see [`PagedKvCache::nvme_staging_bytes`]).
     pub fn staging_bytes(&self, fast: bool) -> usize {
         PagedKvCache::nvme_staging_bytes(self.own, fast)
-            + self
-                .peer
-                .map_or(0, |p| PagedKvCache::nvme_staging_bytes(p, fast))
+            + self.classes.saturating_sub(1)
+                * self
+                    .peer
+                    .map_or(0, |p| PagedKvCache::nvme_staging_bytes(p, fast))
     }
 }
 

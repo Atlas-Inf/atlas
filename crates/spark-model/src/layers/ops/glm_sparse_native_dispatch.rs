@@ -8,13 +8,30 @@ use spark_runtime::kernel_args::KernelLaunch;
 use super::plan::{Metadata, Plan};
 
 const FLAG: &str = "ATLAS_GLM_SPARSE_NATIVE";
-const SYMBOLS: [(&str, &str); 5] = [
-    ("glm_sparse_native_prep", "glm_sparse_native_prep_q"),
-    ("glm_sparse_native_prep", "glm_sparse_native_prep_kv"),
-    ("glm_sparse_native_split", "glm_sparse_native_split"),
-    ("glm_sparse_native_attention", "glm_sparse_native_attention"),
-    ("glm_sparse_native_merge", "glm_sparse_native_merge"),
-];
+/// Attention entries by local head count: `(entry, block shared bytes)`.
+/// TP2's 32 heads take NVIDIA's two-group kernel, TP4's 16 its single-group
+/// one (the same heads-to-kernel choice as NVIDIA's own prefill dispatch).
+pub(super) fn attention_entry(heads: u32) -> Result<(&'static str, u32)> {
+    match heads {
+        32 => Ok(("glm_sparse_native_attention", 91920)),
+        16 => Ok(("glm_sparse_native_attention_sg16", 84368)),
+        _ => bail!("native sparse requires 16 or 32 local heads, got {heads}"),
+    }
+}
+
+fn symbols(heads: u32) -> Result<[(&'static str, &'static str); 5]> {
+    Ok([
+        ("glm_sparse_native_prep", "glm_sparse_native_prep_q"),
+        ("glm_sparse_native_prep", "glm_sparse_native_prep_kv"),
+        ("glm_sparse_native_split", "glm_sparse_native_split"),
+        // Each attention entry is its own module, named by the entry.
+        {
+            let (entry, _) = attention_entry(heads)?;
+            (entry, entry)
+        },
+        ("glm_sparse_native_merge", "glm_sparse_native_merge"),
+    ])
+}
 
 pub(super) fn parse(value: Option<&str>) -> Result<bool> {
     match value {
@@ -32,9 +49,11 @@ pub(super) fn enabled() -> Result<bool> {
     }
 }
 
-pub(super) fn resolve(gpu: &dyn GpuBackend) -> Result<[KernelHandle; 5]> {
+/// Only the attention entry of `heads` local heads: TP2 does not load the
+/// TP4 kernel's symbol.
+pub(super) fn resolve(gpu: &dyn GpuBackend, heads: u32) -> Result<[KernelHandle; 5]> {
     let mut handles = [KernelHandle(0); 5];
-    for (handle, (module, symbol)) in handles.iter_mut().zip(SYMBOLS) {
+    for (handle, (module, symbol)) in handles.iter_mut().zip(symbols(heads)?) {
         *handle = gpu.kernel(module, symbol)?;
         ensure!(
             handle.0 != 0,
@@ -47,20 +66,22 @@ pub(super) fn resolve(gpu: &dyn GpuBackend) -> Result<[KernelHandle; 5]> {
 pub(super) fn execute(plan: &Plan, gpu: &dyn GpuBackend) -> Result<()> {
     // Resolve every symbol and derive every subspan before the first write.
     // A missing capability must never leave half-prepared scratch contents.
-    let [q, kv, split, attention, merge] = resolve(gpu)?;
     let a = &plan.operands;
-    let metadata = Metadata::new(a.rows as usize).map_err(anyhow::Error::msg)?;
+    let [q, kv, split, attention, merge] = resolve(gpu, a.heads)?;
+    let (_, attention_smem) = attention_entry(a.heads)?;
+    let metadata = Metadata::new(a.rows as usize, a.heads as usize).map_err(anyhow::Error::msg)?;
     let m = metadata
         .offsets
         .map(|offset| DevicePtr(a.metadata + offset as u64));
     let rows = a.rows;
     let end = a.seq_start + rows;
     KernelLaunch::new(gpu, q)
-        .grid([(rows * 32 * 576).div_ceil(256), 1, 1])
+        .grid([(rows * a.heads * 576).div_ceil(256), 1, 1])
         .block([256, 1, 1])
         .arg_ptr(DevicePtr(a.q))
         .arg_ptr(DevicePtr(a.qpad))
         .arg_u32(rows)
+        .arg_u32(a.heads)
         .launch(a.stream)?;
     KernelLaunch::new(gpu, kv)
         .grid([end.div_ceil(64) * 64, 1, 1])
@@ -89,7 +110,7 @@ pub(super) fn execute(plan: &Plan, gpu: &dyn GpuBackend) -> Result<()> {
         KernelLaunch::new(gpu, attention)
             .grid([rows, 1, 1])
             .block([384, 1, 1])
-            .shared_mem(91920)
+            .shared_mem(attention_smem)
             .arg_ptr(DevicePtr(a.qpad))
             .arg_ptr(DevicePtr(a.packed_kv))
             .arg_ptr(indices)
@@ -100,7 +121,7 @@ pub(super) fn execute(plan: &Plan, gpu: &dyn GpuBackend) -> Result<()> {
             .launch(a.stream)?;
     }
     KernelLaunch::new(gpu, merge)
-        .grid([rows, 32, 1])
+        .grid([rows, a.heads, 1])
         .block([256, 1, 1])
         .arg_ptr(DevicePtr(a.main_out))
         .arg_ptr(DevicePtr(a.tail_out))
@@ -110,6 +131,6 @@ pub(super) fn execute(plan: &Plan, gpu: &dyn GpuBackend) -> Result<()> {
         .arg_ptr(DevicePtr(a.out))
         .arg_ptr(m[7])
         .arg_u32(rows)
-        .arg_u32(32)
+        .arg_u32(a.heads)
         .launch(a.stream)
 }

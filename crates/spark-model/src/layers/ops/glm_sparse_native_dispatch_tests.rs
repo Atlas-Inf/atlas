@@ -51,7 +51,11 @@ impl GpuBackend for Capture {
             ("glm_sparse_native_attention", "glm_sparse_native_attention"),
             ("glm_sparse_native_merge", "glm_sparse_native_merge"),
         ];
-        assert_eq!((module, symbol), expected[index % 5]);
+        // TP4's attention entry is its own module.
+        let tp4 = ("glm_sparse_native_attention_sg16", symbol);
+        if index % 5 != 3 || (module, symbol) != tp4 {
+            assert_eq!((module, symbol), expected[index % 5]);
+        }
         Ok(KernelHandle(if self.fail_kernel == Some(index) {
             0
         } else {
@@ -120,7 +124,7 @@ fn plan() -> Plan {
         ptr: (i as u64 + 1) * 0x100000000,
         bytes: 1 << 29,
     });
-    Plan::new(2048, 16384, 1155, 1152, spans, 19).unwrap()
+    Plan::new(2048, 16384, 1155, 1152, 32, spans, 19).unwrap()
 }
 #[test]
 fn all_symbols_resolve_before_any_sparse_write() {
@@ -156,7 +160,7 @@ fn six_native_launches_use_owned_stream_and_exact_geometry() {
     let args = gpu.arguments.lock().unwrap();
     assert_eq!(
         args.iter().map(Vec::len).collect::<Vec<_>>(),
-        [3, 4, 8, 7, 7, 9]
+        [4, 4, 8, 7, 7, 9]
     );
     assert_eq!(args[0][0], (0x100000000u64).to_ne_bytes());
     assert_eq!(args[0][1], (0x500000000u64).to_ne_bytes());
@@ -201,9 +205,42 @@ fn submission_failure_stops_without_fallback_or_further_writes() {
     }
 }
 #[test]
+fn tp4_launches_the_single_group_kernel_over_sixteen_heads() {
+    assert_eq!(
+        dispatch::attention_entry(16).unwrap(),
+        ("glm_sparse_native_attention_sg16", 84368)
+    );
+    assert_eq!(
+        dispatch::attention_entry(32).unwrap(),
+        ("glm_sparse_native_attention", 91920)
+    );
+    assert!(dispatch::attention_entry(8).is_err());
+    let spans = std::array::from_fn(|i| Span {
+        ptr: (i as u64 + 1) * 0x100000000,
+        bytes: 1 << 29,
+    });
+    let plan = Plan::new(2048, 16384, 1155, 1152, 16, spans, 19).unwrap();
+    let gpu = Capture::default();
+    dispatch::execute(&plan, &gpu).unwrap();
+    assert_eq!(
+        *gpu.launches.lock().unwrap(),
+        vec![
+            (1, [73728, 1, 1], [256, 1, 1], 0, 19),
+            (2, [18432, 1, 1], [128, 1, 1], 0, 19),
+            (3, [2048, 1, 1], [256, 1, 1], 0, 19),
+            (4, [2048, 1, 1], [384, 1, 1], 84368, 19),
+            (4, [2048, 1, 1], [384, 1, 1], 84368, 19),
+            (5, [2048, 16, 1], [256, 1, 1], 0, 19),
+        ]
+    );
+    let args = gpu.arguments.lock().unwrap();
+    assert_eq!(args[0][3], 16u32.to_ne_bytes());
+    assert_eq!(args[5][8], 16u32.to_ne_bytes());
+}
+#[test]
 fn preloading_resolves_without_allocation_or_launch() {
     let gpu = Capture::default();
-    dispatch::resolve(&gpu).unwrap();
+    dispatch::resolve(&gpu, 32).unwrap();
     assert_eq!(gpu.lookups.load(std::sync::atomic::Ordering::Relaxed), 5);
     assert!(gpu.launches.lock().unwrap().is_empty());
     assert_eq!(gpu.inner.alloc_count(), 0);

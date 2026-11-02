@@ -8,6 +8,7 @@ use atlas_core::config::ModelConfig;
 
 use crate::cli;
 
+mod glm_chain;
 mod gpu_init;
 mod independent;
 mod ssm_h_fp16;
@@ -22,10 +23,6 @@ pub(crate) struct ReservePreflight {
     pub(crate) ssm_prefill_chunk: usize,
     pub(crate) max_batch_tokens_pre: usize,
     pub(crate) resolved_prefill: Option<super::PrefillBudget>,
-}
-
-fn glm5_dual_spark_parallelism(world: usize, tp: usize, ep: usize) -> bool {
-    world == 2 && ep == 2 && matches!(tp, 1 | 2)
 }
 
 fn glm5_concurrency_supported(
@@ -87,6 +84,15 @@ pub(crate) fn preflight_reserve(
         std::env::var("ATLAS_GLM_C4_SPARSE").ok().as_deref(),
     )?;
     if config.model_type == "glm5_next" {
+        // The parallelism and, beyond two ranks, the two-rank lanes first:
+        // later checks assume a supported topology.
+        glm_chain::parallelism_supported(
+            args.world_size,
+            args.tp_size,
+            args.ep_size,
+            spark_comm::rdma_requested(),
+        )?;
+        glm_chain::check(args.world_size, |name| std::env::var(name).ok())?;
         let sparse_decode =
             spark_model::layers::qwen3_attention::glm_multi_seq_sparse_enabled(&config.model_type);
         anyhow::ensure!(
@@ -161,10 +167,6 @@ pub(crate) fn preflight_reserve(
             !(args.speculative || args.self_speculative || args.ngram_speculative),
             "GLM-5 speculative decoding is served through --dflash; its native MTP layer \
              and self/n-gram speculation are not supported"
-        );
-        anyhow::ensure!(
-            glm5_dual_spark_parallelism(args.world_size, args.tp_size, args.ep_size),
-            "GLM-5 dual-Spark support requires --world-size 2 --ep-size 2 and either --tp-size 1 (EP fallback) or --tp-size 2 (overlapping TP+EP)"
         );
     }
     let h_state_bytes = config.ssm_h_state_bytes();

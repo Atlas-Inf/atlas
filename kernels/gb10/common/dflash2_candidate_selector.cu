@@ -721,6 +721,75 @@ extern "C" __global__ void dflash2_selector_topk(
         out_lists + row * DF2_SEL_MAX_TOP_K, out_ids + row * DF2_SEL_MAX_TOP_K, sh);
 }
 
+// The most vocabulary shares `dflash2_selector_walk_ranks` merges: the TP4
+// chain's.
+#define DF2_SEL_MAX_LISTS 4
+
+// Steps 2-4 over `lists` (at most L) lists `dflash2_selector_topk` launches
+// wrote for complementary shares of the vocabulary, list k at `list_of(k)`:
+// each row's lists merge by rank into its top-k, then the walk. A candidate
+// counts the lists * K of its row that precede it (equal sentinels by slot,
+// slots in list order), so the merge does not depend on how many lists
+// there are. One block.
+template <unsigned int L, typename ListOf>
+__device__ __forceinline__ void df2_sel_walk_merged(
+    ListOf list_of,
+    unsigned int lists,
+    const __nv_bfloat16* __restrict__ projected_hidden,
+    const __nv_bfloat16* __restrict__ pred_codebook,
+    const __nv_bfloat16* __restrict__ succ_codebook,
+    unsigned int* __restrict__ out_tokens,
+    const unsigned int* __restrict__ anchor,
+    const unsigned int* __restrict__ ban_depth,
+    unsigned int gamma,
+    unsigned int vocab_size,
+    unsigned int rank,
+    unsigned int top_k,
+    unsigned int end0,
+    unsigned int end1,
+    unsigned int end2,
+    unsigned int end3
+) {
+    // A row's lists, back to back, then its merged top-k.
+    __shared__ float s_v[DF2_SEL_WALK_ROWS * L * DF2_SEL_MAX_TOP_K];
+    __shared__ unsigned int s_i[DF2_SEL_WALK_ROWS * L * DF2_SEL_MAX_TOP_K];
+    __shared__ Df2SelWalkShared w;
+
+    if (!df2_sel_shape_ok(rank, top_k) || gridDim.x != 1 || lists == 0 || lists > L) return;
+    const unsigned int banned_to = ban_depth ? *ban_depth : 0u;
+    const unsigned int n = gamma * DF2_SEL_MAX_TOP_K;
+    const unsigned int row_slots = lists * DF2_SEL_MAX_TOP_K;
+    auto load = [&](unsigned int r0, unsigned int rows) {
+        for (unsigned int g = threadIdx.x; g < rows * row_slots; g += blockDim.x) {
+            const unsigned int t = g % row_slots;
+            const float* list = list_of(t / DF2_SEL_MAX_TOP_K);
+            const unsigned int at = (r0 + g / row_slots) * DF2_SEL_MAX_TOP_K + t % DF2_SEL_MAX_TOP_K;
+            s_v[g] = list[at];
+            s_i[g] = reinterpret_cast<const unsigned int*>(list + n)[at];
+        }
+        __syncthreads();
+        for (unsigned int g = threadIdx.x; g < rows * row_slots; g += blockDim.x) {
+            const unsigned int t = g % row_slots, base = g - t;
+            const float v = s_v[g];
+            const unsigned int i = s_i[g];
+            unsigned int at = 0;
+            for (unsigned int s = 0; s < row_slots; s++) {
+                const float sv = s_v[base + s];
+                const unsigned int si = s_i[base + s];
+                at += (df2_sel_before(sv, si, v, i) || (s < t && sv == v && si == i)) ? 1u : 0u;
+            }
+            if (at < DF2_SEL_MAX_TOP_K) {
+                w.rows_v[g / row_slots * DF2_SEL_MAX_TOP_K + at] = v;
+                w.rows_i[g / row_slots * DF2_SEL_MAX_TOP_K + at] = i;
+            }
+        }
+        __syncthreads();
+    };
+    df2_sel_walk(load, projected_hidden, pred_codebook, succ_codebook, out_tokens, *anchor,
+                 banned_to, gamma, vocab_size, rank, top_k, end0, end1, end2, end3,
+                 w);
+}
+
 // Steps 2-4 over the lists two `dflash2_selector_topk` launches wrote for
 // complementary shares of the vocabulary (`lists_a`, `lists_b`): each row's
 // two lists merge by rank into its top-k, then the walk. One block.
@@ -742,46 +811,37 @@ extern "C" __global__ void dflash2_selector_walk(
     unsigned int end2,
     unsigned int end3
 ) {
-    // A row's two lists, back to back, then its merged top-k.
-    __shared__ float s_v[DF2_SEL_WALK_ROWS * 2 * DF2_SEL_MAX_TOP_K];
-    __shared__ unsigned int s_i[DF2_SEL_WALK_ROWS * 2 * DF2_SEL_MAX_TOP_K];
-    __shared__ Df2SelWalkShared w;
+    df2_sel_walk_merged<2>(
+        [&](unsigned int k) { return k == 0 ? lists_a : lists_b; }, 2, projected_hidden,
+        pred_codebook, succ_codebook, out_tokens, anchor, ban_depth, gamma, vocab_size, rank,
+        top_k, end0, end1, end2, end3);
+}
 
-    if (!df2_sel_shape_ok(rank, top_k) || gridDim.x != 1) return;
-    const unsigned int banned_to = ban_depth ? *ban_depth : 0u;
-    const unsigned int n = gamma * DF2_SEL_MAX_TOP_K;
-    // Every staged row's two lists merge at once: a candidate counts the 2K
-    // of its row that precede it (equal sentinels by slot).
-    constexpr unsigned int pair = 2 * DF2_SEL_MAX_TOP_K;
-    auto load = [&](unsigned int r0, unsigned int rows) {
-        for (unsigned int g = threadIdx.x; g < rows * pair; g += blockDim.x) {
-            const unsigned int t = g % pair;
-            const float* lists = t < DF2_SEL_MAX_TOP_K ? lists_a : lists_b;
-            const unsigned int at = (r0 + g / pair) * DF2_SEL_MAX_TOP_K + t % DF2_SEL_MAX_TOP_K;
-            s_v[g] = lists[at];
-            s_i[g] = reinterpret_cast<const unsigned int*>(lists + n)[at];
-        }
-        __syncthreads();
-        for (unsigned int g = threadIdx.x; g < rows * pair; g += blockDim.x) {
-            const unsigned int t = g % pair, base = g - t;
-            const float v = s_v[g];
-            const unsigned int i = s_i[g];
-            unsigned int at = 0;
-            for (unsigned int s = 0; s < pair; s++) {
-                const float sv = s_v[base + s];
-                const unsigned int si = s_i[base + s];
-                at += (df2_sel_before(sv, si, v, i) || (s < t && sv == v && si == i)) ? 1u : 0u;
-            }
-            if (at < DF2_SEL_MAX_TOP_K) {
-                w.rows_v[g / pair * DF2_SEL_MAX_TOP_K + at] = v;
-                w.rows_i[g / pair * DF2_SEL_MAX_TOP_K + at] = i;
-            }
-        }
-        __syncthreads();
-    };
-    df2_sel_walk(load, projected_hidden, pred_codebook, succ_codebook, out_tokens, *anchor,
-                 banned_to, gamma, vocab_size, rank, top_k, end0, end1, end2, end3,
-                 w);
+// The same over `count` (at most DF2_SEL_MAX_LISTS) ranks' lists, rank k's at
+// `lists + k * list_stride` floats: the TP4 chain's gathered shares.
+extern "C" __global__ void dflash2_selector_walk_ranks(
+    const float* __restrict__ lists,
+    unsigned int list_stride,
+    unsigned int count,
+    const __nv_bfloat16* __restrict__ projected_hidden,
+    const __nv_bfloat16* __restrict__ pred_codebook,
+    const __nv_bfloat16* __restrict__ succ_codebook,
+    unsigned int* __restrict__ out_tokens,
+    const unsigned int* __restrict__ anchor,
+    const unsigned int* __restrict__ ban_depth,
+    unsigned int gamma,
+    unsigned int vocab_size,
+    unsigned int rank,
+    unsigned int top_k,
+    unsigned int end0,
+    unsigned int end1,
+    unsigned int end2,
+    unsigned int end3
+) {
+    df2_sel_walk_merged<DF2_SEL_MAX_LISTS>(
+        [&](unsigned int k) { return lists + (unsigned long long)k * list_stride; }, count,
+        projected_hidden, pred_codebook, succ_codebook, out_tokens, anchor, ban_depth, gamma,
+        vocab_size, rank, top_k, end0, end1, end2, end3);
 }
 
 #ifndef DF2_SEL_CONF

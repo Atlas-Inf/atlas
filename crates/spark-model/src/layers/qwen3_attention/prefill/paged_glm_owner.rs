@@ -232,7 +232,7 @@ impl Qwen3AttentionLayer {
         let index = if any_owner_selects(owners, c.index_topk) {
             let query = q_absorbed.offset(rows * latent_row);
             let weights = ctx.buffers.ssm_gates();
-            self.glm_index_project_query(q_latent, normed, n, query, weights, ctx, stream)?;
+            self.glm_index_project_query(q_latent, Some(normed), n, query, weights, ctx, stream)?;
             Some((query, weights))
         } else {
             None

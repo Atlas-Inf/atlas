@@ -199,7 +199,7 @@ impl IndexSplit {
     /// Whether this rank received `row` from its peer.
     fn receives(&self, row: usize) -> bool {
         let quarter = |s: &super::Swap| (s.peer..s.peer + s.rows).contains(&row);
-        self.swaps.iter().any(quarter)
+        self.swaps().iter().any(quarter)
     }
 
     /// Compare every row of `rows.selected` with the replicated rows in

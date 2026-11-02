@@ -450,8 +450,9 @@ impl TransformerModel {
             Some(save)
         };
 
-        // EP command buffer for token broadcast (4 bytes, u32)
-        let ep_cmd_buf = gpu.alloc(4)?;
+        // EP command buffer for token broadcast (a u32 at 0), and one u32
+        // per rank 64 bytes apart for `ep_min_u32`'s gather.
+        let ep_cmd_buf = gpu.alloc(super::types::EP_CMD_BUF_BYTES)?;
 
         // SOLID Incr-4: dedicated fixed-address buffer for the batched-decode MoE
         // per-row fold map. max_batch_size i32 rows (e.g. 32·4 = 128 B). Allocated
@@ -685,6 +686,7 @@ impl TransformerModel {
             lm_head_fp8,
             layers,
             buffers,
+            prefill_pipe: None,
             lora: None,
             lora_install_attempted: false,
             lora_rotatable: false,

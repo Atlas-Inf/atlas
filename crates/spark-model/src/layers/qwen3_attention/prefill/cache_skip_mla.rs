@@ -81,6 +81,30 @@ impl Qwen3AttentionLayer {
                 ctx.gpu, kernel, input, mx.data, mx.scales, output, m, n, k, n, stream,
             );
         }
+        // An owner-batched verify of 33..=64 rows (the TP4 chain): the same
+        // row-invariant tiers, 32 rows a launch.
+        if m <= crate::layers::canonical_verify::MAX_ROWS
+            && let Some((.., mx)) = self.mla_mx.iter().find(|(w, ..)| *w == weight.weight)
+        {
+            for first in (0..m).step_by(ops::MXFP8_MAX_ROWS) {
+                let rows = (m - first).min(ops::MXFP8_MAX_ROWS as u32);
+                let kernel = ops::mxfp8_kernel(ctx.gpu, mx, &self.mxfp8_gemv_k, rows);
+                ops::mxfp8_gemv(
+                    ctx.gpu,
+                    kernel,
+                    input.offset((first * k) as usize * 2),
+                    mx.data,
+                    mx.scales,
+                    output.offset((first * n) as usize * 2),
+                    rows,
+                    n,
+                    k,
+                    n,
+                    stream,
+                )?;
+            }
+            return Ok(());
+        }
         if ctx.config.model_type == "glm5_next"
             && m <= crate::layers::canonical_verify::MAX_ROWS
             && crate::layers::canonical_verify::enabled()

@@ -100,7 +100,7 @@ pub fn build_model(
         kv_dtype,
         &layer_dtypes,
     )?;
-    crate::layers::ops::preload_glm_sparse_native(gpu.as_ref())?;
+    crate::layers::ops::preload_glm_sparse_native(gpu.as_ref(), config.num_attention_heads)?;
     crate::layers::ops::initialize_glm_sparse_prefill_pipe(gpu.as_ref(), &config)?;
     crate::layers::ops::initialize_glm_kv_canonical(gpu.as_ref(), &config, kv_dtype)?;
     crate::layers::ops::initialize_glm_mla_fuse(gpu.as_ref(), &config)?;
@@ -475,6 +475,22 @@ pub fn build_model(
         max_batch_size,
         gpu.as_ref(),
     )?;
+    // ATLAS_GLM_PREFILL_PIPE2: the second half-chunk's arena, sized with
+    // the model's before the KV pool.
+    let glm_latent_tokens = (kv_dtype == spark_runtime::kv_cache::KvCacheDtype::Fp8G128
+        && config.model_type == "glm5_next")
+        .then(|| {
+            crate::layers::ops::GLM_LATENT_BF16_VIEW_TOKENS.min(max_seq_len.next_multiple_of(16))
+        });
+    let pipe_arena = crate::model::glm_prefill_pipe::arena(
+        &config,
+        max_batch_tokens,
+        max_seq_len,
+        kv_block_size,
+        max_batch_size,
+        glm_latent_tokens,
+        gpu.as_ref(),
+    )?;
     glm::init_arena_consumers(
         &config,
         &store,
@@ -704,7 +720,7 @@ pub fn build_model(
         &kv_config,
         glm_cache_plan.is_some(),
         sparse_index,
-        glm_cache_plan.and_then(|p| p.shard()).is_some(),
+        glm_cache_plan.and_then(|p| p.shard()).map(|s| s.world),
     );
     // ATLAS_QWEN4EXP_SNAPSHOT_SLOTS / _AUX_MB: the snapshots' host aux
     // (`ssm_snapshot_budget`), 0 by default.
@@ -1037,6 +1053,9 @@ pub fn build_model(
         ssm_checkpoint_interval,
         ssm_pools,
     )?;
+    if let Some(arena) = pipe_arena {
+        model.set_prefill_pipe(arena)?;
+    }
 
     // ── Step 6b: DeepSeek-V4 MTP proposer (optional, post-construction) ──
     //
@@ -1209,26 +1228,26 @@ pub fn build_model(
                     &model.config_ref().model_type,
                     startup,
                 )?;
-                // ATLAS_GLM_DRAFT_TP: on the TP2 pair both ranks hold the
-                // drafter and swap halves of a propose; the worker's copy
-                // serves its half and proposes nothing.
-                let (rank, pair) = {
+                // ATLAS_GLM_DRAFT_TP: on the TP2 pair or the TP4 chain every
+                // rank holds the drafter and computes its share of a propose;
+                // a worker's copy serves its share and proposes nothing.
+                let (rank, ranks, split_ranks) = {
                     let c = model.config_ref();
-                    (c.ep_rank, c.tp_world_size == 2 && c.ep_world_size == 2)
+                    (c.ep_rank, c.ep_world_size, crate::layers::moe::glm_tp_ep(c))
                 };
                 let split = crate::layers::dflash_head::rank_split::requested()?
-                    .filter(|_| pair && !lightning_dspark_admitted);
+                    .filter(|_| split_ranks && !lightning_dspark_admitted);
                 if let Some(parts) = split {
                     let batch = crate::layers::dflash_head::rank_split::batch_requested()?;
                     let ctx = crate::layers::dflash_head::rank_split::ctx_requested()?;
                     let topk = crate::layers::dflash_head::rank_split::topk_requested()?;
-                    head.enable_rank_split(parts, batch, ctx, topk, model.gpu_backend())?;
+                    head.enable_rank_split(parts, batch, ctx, topk, ranks, model.gpu_backend())?;
                 }
                 if rank != 0 {
                     anyhow::ensure!(
                         split.is_some(),
                         "rank {rank} loaded a drafter it cannot use: ATLAS_GLM_DRAFT_TP \
-                         needs the generic DFlash drafter on the TP2 pair"
+                         needs the generic DFlash drafter on the TP2 pair or the TP4 chain"
                     );
                     model.set_draft_assist(std::sync::Arc::new(head));
                     tracing::info!(

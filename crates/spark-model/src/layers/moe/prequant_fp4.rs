@@ -50,9 +50,17 @@ pub(super) fn glm_grouped_shape(config: &atlas_core::config::ModelConfig) -> boo
         && config.shared_expert_intermediate_size == 2048
         && config.num_experts == 288
         && config.num_experts_per_tok == 8
-        && config.tp_world_size == 2
-        && config.ep_world_size == 2
+        && glm_tp_ep(config)
         && config.scoring_func == "sigmoid"
+}
+
+/// Whether the ranks split GLM-5 as the TP2/EP2 pair or the TP4/EP4 chain
+/// do: one TP rank per EP rank. Each rank holds its 1/ep of the routed
+/// experts (or, under expert TP, of every expert's width), so every routed
+/// and shared lane serves the same rows on every rank and the one all-reduce
+/// sums the ranks' partials, at two ranks or four.
+pub(crate) fn glm_tp_ep(config: &atlas_core::config::ModelConfig) -> bool {
+    config.tp_world_size == config.ep_world_size && matches!(config.ep_world_size, 2 | 4)
 }
 
 /// Row tiles of the K128W kernels over `rows` sorted rows: the device prefix

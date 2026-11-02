@@ -352,7 +352,7 @@ pub trait DraftProposer: Send + Sync {
             Option<spark_runtime::gpu::DevicePtr>,
             usize,
         )],
-    ) -> u32 {
+    ) -> u64 {
         0
     }
 
@@ -367,6 +367,12 @@ pub trait DraftProposer: Send + Sync {
     /// 0 = unknown / not applicable (catch-up is skipped).
     fn drafter_rows(&self, _state: &mut dyn ProposerState) -> usize {
         0
+    }
+
+    /// Whether the first native proposal requires a verified prompt-context
+    /// prefill. Legacy drafters retain their permissive empty-context fallback.
+    fn requires_prompt_prefill(&self) -> bool {
+        false
     }
 
     /// Sequence-space pair key of the newest drafter row (`None` = untracked;
@@ -404,6 +410,64 @@ pub trait DraftProposer: Send + Sync {
     /// Release drafter KV blocks that no proposer state owns (a carried entry
     /// being replaced or dropped).
     fn free_drafter_kv(&self, _blocks: &[u32]) {}
+
+    /// Consume newly computed canonical target rows into private native MTP
+    /// context. `start` and the retained boundary are exclusive target lengths.
+    fn append_native_target_context(
+        &self,
+        _tokens: &[u32],
+        _start: usize,
+        _norm_hiddens: DevicePtr,
+        _state: &mut dyn ProposerState,
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("native target context is unsupported")
+    }
+
+    /// Retain only the final canonical target hidden after speculative commit;
+    /// accepted-token repair owns the private KV writes separately.
+    fn retain_native_target_hidden(
+        &self,
+        _hidden: DevicePtr,
+        _end: usize,
+        _state: &mut dyn ProposerState,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("native target hidden retention is unsupported")
+    }
+
+    /// Last normalized target row and its exclusive sequence end.
+    fn native_target_hidden(
+        &self,
+        _state: &dyn ProposerState,
+    ) -> Result<Option<(usize, DevicePtr)>> {
+        Ok(None)
+    }
+
+    /// Clone an immutable native predictor prefix including its boundary hidden.
+    /// Implementations share sealed blocks and copy the mutable final block.
+    fn clone_prefix_state(
+        &self,
+        _state: &dyn ProposerState,
+        _rows: usize,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<Option<Box<dyn ProposerState>>> {
+        Ok(None)
+    }
+
+    /// Available blocks in the private predictor pool, for prefix eviction.
+    fn native_prefix_free_blocks(&self) -> Option<usize> {
+        None
+    }
+
+    /// Drop abandoned private drafts before catching up a fresh proposal.
+    /// Never called while a scheduler-staged proposal awaits verification.
+    fn prepare_drafter_catchup(&self, state: &mut dyn ProposerState) -> Result<usize> {
+        Ok(self.drafter_rows(state))
+    }
 
     /// DFlash ctx carry (the Option-B drafter analogue of
     /// `take_drafter_kv`): move this sequence's drafter ctx — hidden
@@ -575,6 +639,22 @@ pub trait DraftProposer: Send + Sync {
     ) -> Result<usize> {
         let _ = (prompt_tokens, hiddens, state, ctx, stream);
         Ok(0)
+    }
+
+    /// Repair the accepted draft pair before the next proposal. Native GLM
+    /// uses this to append `(embed(accepted_draft), verified_hidden)` through
+    /// its KV-only MLA path; all existing drafters keep the no-op default.
+    #[allow(clippy::too_many_arguments)]
+    fn repair_after_verify(
+        &self,
+        _accepted_draft: u32,
+        _position: usize,
+        _target_hidden: DevicePtr,
+        _state: &mut dyn ProposerState,
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Read the draft token ID stored on GPU by the last `propose()` call

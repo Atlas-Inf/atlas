@@ -163,10 +163,9 @@ fn validate_config(c: &ModelConfig) -> Result<()> {
             && c.num_hidden_layers == 45
             && c.num_experts == 288
             && c.num_experts_per_tok == 8
-            && c.tp_world_size == 2
-            && c.ep_world_size == 2
+            && super::glm_tp_ep(c)
             && c.adapter_max_rank == 0,
-        "shared FP8 cache requires exact target GLM TP2/EP2 native geometry without adapters"
+        "shared FP8 cache requires exact target GLM TP2/EP2 or TP4/EP4 native geometry without adapters"
     );
     ensure!(
         c.mlp_only_layers == [0, 1, 2],

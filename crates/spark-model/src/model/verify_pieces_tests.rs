@@ -5,9 +5,10 @@ use spark_runtime::gpu::mock::MockGpuBackend;
 
 const S: u64 = 7;
 
-/// The real communicator: logs what actually ran.
+/// The real communicator: logs what actually ran. `.1` is the rank count
+/// past the pair (0: the TP2 pair).
 #[derive(Default)]
-struct Log(Mutex<Vec<String>>);
+struct Log(Mutex<Vec<String>>, usize);
 
 impl Log {
     fn take(&self) -> Vec<String> {
@@ -56,11 +57,21 @@ impl CommBackend for Log {
     fn recv_from(&self, _: u64, _: usize, _: usize, _: u64) -> Result<()> {
         Ok(())
     }
+    fn gather_async(&self, base: u64, stride: i64, bytes: usize, stream: u64) -> Result<bool> {
+        if !self.supports_gather_async(bytes) {
+            return Ok(false);
+        }
+        self.push(format!("ga {base} {stride} {bytes} {stream}"))?;
+        Ok(true)
+    }
+    fn supports_gather_async(&self, bytes: usize) -> bool {
+        bytes <= 256
+    }
     fn rank(&self) -> usize {
         0
     }
     fn world_size(&self) -> usize {
-        2
+        self.1.max(2)
     }
 }
 
@@ -241,6 +252,49 @@ fn capturable_collectives_stay_in_the_graph() {
     // 128-byte async reduce went into the open graph.
     assert_eq!(kinds, "gcgcgcg");
     assert_eq!(comm.take(), ["cap 3 128 7"]);
+}
+
+#[test]
+fn gathers_split_and_replay_and_unserved_ones_decline() {
+    let (gpu, comm, pieces) = (
+        MockGpuBackend::new(),
+        Log::default(),
+        VerifyPieces::default(),
+    );
+    let body = |c: &dyn CommBackend| -> Result<()> {
+        ensure!(c.gather_async(8, -16, 16, S)?);
+        // Past the communicator's size: declined, the caller's fallback runs.
+        ensure!(!c.gather_async(9, 512, 512, S)?);
+        c.all_reduce(4, 32)
+    };
+    for _ in 0..4 {
+        pieces.run((0, 2, 0), &gpu, &comm, S, body).unwrap();
+        assert_eq!(comm.take(), ["ga 8 -16 16 7", "ar 4 32"]);
+    }
+}
+
+#[test]
+fn the_glm_verify_captures_collectives_on_the_chain_only() {
+    for (world, captured) in [(0, false), (4, true)] {
+        let (gpu, comm, pieces) = (
+            MockGpuBackend::new(),
+            Log(Mutex::default(), world),
+            VerifyPieces::default(),
+        );
+        for _ in 0..2 {
+            pieces.run((0, 5, 0), &gpu, &comm, S, layer).unwrap();
+            comm.take();
+        }
+        // The capture pass's replay: the one-shot went into the graph on
+        // the chain and splits on the pair.
+        let replay = ["px 1 2 64 7", "ar 4 32"];
+        pieces.run((0, 5, 0), &gpu, &comm, S, layer).unwrap();
+        if captured {
+            assert_eq!(comm.take(), replay, "world {world}");
+        } else {
+            assert_eq!(comm.take(), EAGER, "world {world}");
+        }
+    }
 }
 
 #[test]

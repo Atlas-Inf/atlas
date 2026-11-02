@@ -35,6 +35,10 @@ use crate::weight_map::{DenseWeight, Fp8DenseWeight, MtpWeights, QuantizedWeight
 /// Rows in the drafter catch-up hidden ring (see `mtp_catchup_ring`):
 /// 512 covers the gate's 256-token serial re-probe interval with 2x margin.
 pub(super) const MTP_CATCHUP_RING_ROWS: usize = 512;
+/// The EP command buffer: a u32 at 0 (command words), and for `ep_min_u32`
+/// one u32 per rank `EP_MIN_STRIDE` bytes apart (up to four ranks).
+pub(super) const EP_CMD_BUF_BYTES: usize = 256;
+pub(super) const EP_MIN_STRIDE: usize = 64;
 
 pub struct TransformerModel {
     pub(super) config: ModelConfig,
@@ -93,6 +97,9 @@ pub struct TransformerModel {
     pub(super) lm_head_fp8: Option<Fp8DenseWeight>,
     pub(super) layers: Vec<Box<dyn TransformerLayer>>,
     pub(super) buffers: BufferArena,
+    /// `ATLAS_GLM_PREFILL_PIPE2`: the second half-chunk's arena and stream
+    /// (`model::glm_prefill_pipe`).
+    pub(super) prefill_pipe: Option<super::glm_prefill_pipe::PrefillPipe>,
     /// Startup-static LoRA adapter (pool + per-layer pairs + M2 pointer
     /// tables). `None` = no adapter. Installed post-construction via
     /// `set_lora_weights`, which also copies the per-layer pairs into the

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Sampled verify picks on the GLM vocabulary-split head (the TP2 pair).
+//! Sampled verify picks on the GLM vocabulary-split head (TP2 pair, TP4 chain).
 //!
 //! The split head (`glm_vocab_split`) leaves each rank only its part of every
 //! verify row's logits, which serves an argmax but not a sample. A sampled
@@ -160,9 +160,13 @@ impl TransformerModel {
             && self.glm_verify_logits_argmax_only()
             && self.candidates_kernel().0 != 0
             && self.comm.as_ref().is_some_and(|c| {
-                c.world_size() == 2
-                    && c.supports_peer_exchange_async()
-                    && self.buffers.sizes().moe_output >= self.config.vocab_size * 2
+                if c.world_size() == 2 {
+                    c.supports_peer_exchange_async()
+                        && self.buffers.sizes().moe_output >= self.config.vocab_size * 2
+                } else {
+                    c.supports_gather_async(RANK_BYTES)
+                        && c.supports_gather_async(self.config.vocab_size * 2 / c.world_size())
+                }
             })
     }
 
@@ -238,8 +242,8 @@ impl TransformerModel {
         self.exchange_candidates(&words).map(|_| ())
     }
 
-    /// Both ranks: this rank's records of the rows `words` describe, then
-    /// both ranks' on each. Returns the records' base and rank count.
+    /// Every rank: this rank's records of the rows `words` describe, then
+    /// every rank's on every rank. Returns the records' base and rank count.
     fn exchange_candidates(&self, words: &[u32]) -> Result<(DevicePtr, usize)> {
         let rows = words[0] as usize;
         ensure!(
@@ -267,8 +271,16 @@ impl TransformerModel {
             .arg_u32(words[4])
             .arg_u32(words[5])
             .launch(stream)?;
-        let peer = base.offset((1 - rank) * RANK_BYTES);
-        comm.peer_exchange_async(local.0, peer.0, rows * REC_WORDS * 4, stream)?;
+        let bytes = rows * REC_WORDS * 4;
+        if ranks == 2 {
+            let peer = base.offset((1 - rank) * RANK_BYTES);
+            comm.peer_exchange_async(local.0, peer.0, bytes, stream)?;
+        } else {
+            ensure!(
+                comm.gather_async(base.0, RANK_BYTES as i64, bytes, stream)?,
+                "GLM sampled verify: the chain declined the records gather"
+            );
+        }
         Ok((base, ranks))
     }
 }

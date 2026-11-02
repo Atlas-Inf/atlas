@@ -26,11 +26,13 @@ impl Qwen3AttentionLayer {
         ensure!(
             rows_ok
                 && c.seq_lens.len() == c.n
-                && c.fwd.config.tp_world_size == 2
-                && c.fwd.config.ep_world_size == 2
+                && matches!(
+                    (c.fwd.config.tp_world_size, c.fwd.config.ep_world_size),
+                    (2, 2) | (4, 4)
+                )
                 && !c.fwd.graph_capture
                 && !c.fwd.gpu.stream_is_capturing(c.stream),
-            "GLM long verify requires repaired eager K3 or the DFlash lane, TP2/EP2"
+            "GLM long verify requires repaired eager K3 or the DFlash lane, TP2/EP2 or TP4/EP4"
         );
         let mla = self.mla.as_ref().expect("MLA dispatch owns weights");
         ensure!(
@@ -41,7 +43,7 @@ impl Qwen3AttentionLayer {
                 && mla.q_lora_rank == 1536
                 && c.h == 4096
                 && c.hd == 256
-                && matches!(c.nq, 32 | 64)
+                && matches!(c.nq, 16 | 32 | 64)
                 && c.fwd.config.index_topk == 2048
                 && c.fwd.config.index_kpool == 4
                 && c.fwd.config.index_head_dim == 128
@@ -105,8 +107,8 @@ impl Qwen3AttentionLayer {
             return Ok(());
         }
         ensure!(
-            c.nq == 32 && c.bs == 16,
-            "GLM split requires local32 heads/block16 before cache writes"
+            ops::glm_sparse_tc_heads(c.nq) && c.bs == 16,
+            "GLM split requires local16 or local32 heads/block16 before cache writes"
         );
         let b = c.fwd.buffers;
         let s = b.sizes();

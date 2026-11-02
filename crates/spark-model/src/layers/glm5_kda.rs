@@ -17,7 +17,9 @@ mod profile;
 mod projection;
 mod recurrent;
 mod shared_cache;
+mod sp_oproj_a2a;
 mod sp_overlap;
+mod sp_quant_gather;
 
 use std::mem::size_of;
 

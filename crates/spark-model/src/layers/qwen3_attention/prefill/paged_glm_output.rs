@@ -56,7 +56,7 @@ impl Qwen3AttentionLayer {
     /// Per-head MLA GEMM `c[:, h*n..] = a[:, h*k..] · weight_hᵀ` over `g`
     /// heads: its MXFP8 twin (`ATLAS_GLM_MLA_KVB_MXFP8=1`, see
     /// `glm_head_twin`), else the BF16 grouped GEMM.
-    fn glm_head_gemm(
+    pub(super) fn glm_head_gemm(
         &self,
         a: DevicePtr,
         weight: DevicePtr,

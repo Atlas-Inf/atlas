@@ -276,6 +276,7 @@ impl PagedKvCache {
     /// Every class's record size (see [`NvmeGeometry`]).
     pub fn nvme_geometry(&self) -> NvmeGeometry {
         NvmeGeometry {
+            classes: self.nvme_classes(),
             own: self.nvme_record_bytes(),
             peer: self
                 .latent_shard
@@ -290,16 +291,16 @@ impl PagedKvCache {
         v_aliases_k: bool,
         index: Option<super::SparseIndexCacheConfig>,
     ) -> usize {
-        Self::nvme_geometry_for(config, v_aliases_k, index, false).own
+        Self::nvme_geometry_for(config, v_aliases_k, index, None).own
     }
 
     /// [`Self::nvme_geometry`] for a cache that is not built yet,
-    /// `latent_sharded` over a pair or not.
+    /// `shard_world` is the latent shard's world, or `None` unsharded.
     pub fn nvme_geometry_for(
         config: &super::KvCacheConfig,
         v_aliases_k: bool,
         index: Option<super::SparseIndexCacheConfig>,
-        latent_sharded: bool,
+        shard_world: Option<usize>,
     ) -> NvmeGeometry {
         let bs = config.block_size;
         let index = index.map_or(0, |i| i.values_block_bytes(bs) + i.scales_block_bytes(bs));
@@ -314,8 +315,9 @@ impl PagedKvCache {
             })
             .sum();
         NvmeGeometry {
+            classes: shard_world.unwrap_or(1),
             own: record_for(payload),
-            peer: latent_sharded.then(|| record_for(config.num_layers * index)),
+            peer: shard_world.map(|_| record_for(config.num_layers * index)),
         }
     }
 

@@ -121,15 +121,12 @@ fn canonical_verify_accuracy() -> Result<()> {
     let want = exact(&rows, &dense_w, n as usize, k as usize);
     for ((module, name), width) in [
         (("gemm", "dense_gemm_bf16_router"), 8),
-        (("gemm", "dense_gemm_bf16_router_rows"), 8),
-        (("gemm", "dense_gemm_bf16_router_m5"), 5),
         (("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm"), 8),
         (("dense_gemv_bf16_batchm", "dense_gemv_bf16_tc8"), 8),
         (("dense_gemv_bf16_batchm", "dense_gemv_bf16_tc16"), 16),
         (("dense_gemv_bf16_batchm", "dense_gemv_bf16_tc32"), 32),
     ] {
         let mut sub = rows.clone();
-        // The M5 kernel only runs exactly five rows.
         sub.truncate(rows.len() / width * width);
         let got = chunked(gpu, &sub, n, width, |a, c, m| {
             launch_dense(gpu, (module, name), &gate, a, c, m, n, k)

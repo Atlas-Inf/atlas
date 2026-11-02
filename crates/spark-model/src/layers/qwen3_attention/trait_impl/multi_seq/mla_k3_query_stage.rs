@@ -23,7 +23,7 @@ impl Qwen3AttentionLayer {
         ensure!(
             rows_supported(c.n)
                 && c.h == HIDDEN
-                && c.nq == 32
+                && crate::layers::ops::glm_sparse_tc_heads(c.nq)
                 && c.hd == 256
                 && c.bf16 == BF16
                 && c.bs > 0
@@ -109,7 +109,7 @@ impl Qwen3AttentionLayer {
             (b.ssm_conv_out_f32(), s.ssm_conv_out_f32),
             (b.ssm_qkvz(), s.ssm_qkvz),
             (mla.wq_a.weight, Q_LORA * HIDDEN * BF16),
-            (mla.wq_b.weight, Q_DIM * Q_LORA * BF16),
+            (mla.wq_b.weight, (c.nq * c.hd) as usize * Q_LORA * BF16),
             (mla.q_a_norm.weight, Q_LORA * BF16),
             (indexer.wq_b.weight, INDEX_DIM * Q_LORA * BF16),
         ];

@@ -65,13 +65,16 @@ pub(crate) fn resolve_topology(
     };
     config.tp_rank = tp_rank;
     config.tp_world_size = tp_size;
+    // The DFlash verify widths are priced by this topology's step costs.
+    crate::scheduler::set_verify_ranks(tp_size);
     config.ep_rank = ep_rank;
     config.ep_world_size = ep_size;
     // Every rank must resolve the same value (`rank_settings`): with it each
-    // rank holds a slice of every routed expert, without it half of them.
+    // rank holds a 1/ep slice of every routed expert, without it 1/ep of the
+    // experts. The pair (EP2) and the chain (EP4) slice alike.
     config.expert_tp = std::env::var("ATLAS_GLM_EXPERT_TP").as_deref() == Ok("1")
         && config.model_type == "glm5_next"
-        && ep_size == 2
+        && matches!(ep_size, 2 | 4)
         && tp_size == ep_size
         && world_size == ep_size;
     if tp_size > 1 {

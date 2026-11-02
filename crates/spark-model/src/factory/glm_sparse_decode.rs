@@ -29,10 +29,7 @@ impl BuildPolicy<'_> {
         let dflash_lane = self.dflash && !self.self_speculative && dflash_lane_enabled;
         ensure!(
             self.config.model_type == "glm5_next"
-                && self.config.tp_world_size == 2
-                && self.config.ep_world_size == 2
-                // Serving topology has already converted this to local heads.
-                && self.config.num_attention_heads == 32
+                && crate::layers::ops::glm_sparse_tc_rank(self.config)
                 && (2049..=crate::speculative::glm_repair_policy::max_long_context())
                     .contains(&self.context)
                 && self.block_size == 16
@@ -40,7 +37,7 @@ impl BuildPolicy<'_> {
                 && self.layer_dtypes.iter().all(|d| *d == self.kv_dtype)
                 && dflash_lane
                 && long_context,
-            "GLM sparse decode TC requires the GLM DFlash lane, TP2/EP2 local32 heads and BF16 or fp8_g128 block16 caches"
+            "GLM sparse decode TC requires the GLM DFlash lane, TP2/EP2 local32 or TP4/EP4 local16 heads and BF16 or fp8_g128 block16 caches"
         );
         Ok(())
     }

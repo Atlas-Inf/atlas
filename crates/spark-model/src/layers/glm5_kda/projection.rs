@@ -62,6 +62,13 @@ pub struct Glm5KdaWeights {
     pub dt_bias: DenseWeight,
     pub o_norm: DenseWeight,
     pub o_proj: Glm5Projection,
+    /// The whole o_proj over every rank's heads, for this rank's rows
+    /// (`ATLAS_GLM_SP_KDA_OPROJ_A2A`, `sp_oproj_a2a.rs`).
+    pub o_proj_full: Option<ops::MxW8a8>,
+    /// The whole b_proj (every rank's heads), for the quantized gather's
+    /// beta of this rank's rows (`ATLAS_GLM_SP_KDA_QUANT_GATHER`,
+    /// `sp_quant_gather.rs`).
+    pub b_proj_full: Option<DenseWeight>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

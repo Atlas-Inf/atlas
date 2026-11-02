@@ -384,6 +384,10 @@ impl Model for TransformerModel {
         self.normalize_ssm_states_dispatch(seq, stream)
     }
 
+    fn prefill_row_multiple(&self) -> usize {
+        self.glm_sp_row_multiple()
+    }
+
     fn align_prefill_chunk(&self, offset: usize, len: usize, total: usize) -> usize {
         if self.prefill_grid() == 0
             || offset + len >= total

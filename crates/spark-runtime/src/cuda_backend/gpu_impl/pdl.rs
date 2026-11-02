@@ -77,6 +77,7 @@ pub(super) fn pdl_kernel(func_name: &str) -> bool {
 pub(super) const PDL_KERNELS: &[&str] = &[
     "w4a16_gemv_tc8",
     "w4a16_gemv_tc8_ld",
+    "w4a16_gemv_tc8_parts",
     "w4a16_gemv_tc8_touch",
     "w4a16_gemv_tc16_touch",
     "w4a16_gemv_tc32_touch",
@@ -164,6 +165,7 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "moe_sort_by_expert",
     "moe_sort_by_expert_scan",
     "moe_route_mask_rows",
+    "mla_cache_assemble_batched",
     "reshape_and_cache_flash",
     "glm_latent_cache_write_fp8g128",
     "glm_latent_dequant_fp8g128",
@@ -214,6 +216,8 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "moe_unpermute_reduce_indexed_ep",
     "moe_unpermute_reduce_indexed_ep_vec8",
     "moe_unpermute_reduce_indexed_ep_vec8_e4m3",
+    "moe_unpermute_rs_fused_vec8",
+    "moe_unpermute_rs_fused_vec8_e4m3",
     "moe_batched_blend",
     "moe_unpermute_blend_ep_vec8",
     "glm_hc_moe_blend_post_bf16",
@@ -225,6 +229,9 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "kda_commit_records",
     "kda_commit_records_stride",
     "kda_sigmoid_gated_rms_norm",
+    // The rank-split drafter's and dense TP split's joins after a chain
+    // gather (18 a prose step).
+    "rank_split_join_bf16",
 ];
 
 /// Qwen3.8-Flash-Next (`ATLAS_QWEN4EXP_PDL=1`): the single-token decode chain

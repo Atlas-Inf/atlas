@@ -7,7 +7,9 @@
 //! (weights read once for the whole batch), then one
 //! `dflash2_candidate_selector` launch per sequence — the chain is sequential
 //! within a sequence, so it never merges across boundaries. Only the device
-//! kernel is supported here; the host fallback stays serial-only.
+//! kernel is supported here; the host fallback stays serial-only. A batched
+//! rank-split propose with the candidate swap (`ATLAS_GLM_DRAFT_TP_TOPK`)
+//! walks each sequence over every rank's lists in place of that launch.
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
@@ -16,11 +18,14 @@ use super::BlockDiffusionDraftHead;
 use crate::layers::ops;
 
 impl BlockDiffusionDraftHead {
+    /// `lists`: the batched split propose's candidate lists, when it swapped
+    /// them (`rank_split_topk`); the logits are then not joined.
     pub(super) fn run_batched_dflash2_tail(
         &self,
         batch_size: u32,
         last_tokens: &[u32],
         has_end_ban: bool,
+        lists: Option<&super::rank_split::TopkSelect>,
         ctx: &crate::layer::ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -141,6 +146,29 @@ impl BlockDiffusionDraftHead {
         // Anchors and min_tokens ban depths were uploaded beside each other
         // in batch_markov_prev (`batch_ban_depth`).
         let end_ids = crate::traits::EosBan::model_end_ids();
+        if let Some(t) = lists {
+            for sequence in 0..batch_size as usize {
+                let anchor = super::selector::SelectorAnchor {
+                    token: last_tokens[sequence],
+                    token_dev: self.batch_markov_prev.offset(sequence * 4),
+                    ban_depth: 0,
+                    ban_depth_dev: self.batch_ban_depth().offset(sequence * 4),
+                    end_ids,
+                };
+                selector.walk_lists(
+                    anchor,
+                    t.sequence(sequence),
+                    self.batch_dflash2_projected
+                        .offset(sequence * seq_projected_bytes),
+                    self.batch_tokens.offset(sequence * seq_token_bytes),
+                    gamma as usize,
+                    ctx.gpu,
+                    t.walk,
+                    stream,
+                )?;
+            }
+            return Ok(());
+        }
         for sequence in 0..batch_size as usize {
             ops::dflash2_candidate_selector(
                 ctx.gpu,

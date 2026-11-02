@@ -136,6 +136,15 @@ pub(crate) fn shard_dense_bytes(
     }
 }
 
+/// The TP2 rank whose shard holds `tp_rank`'s slice at `tp_size` > 2 ranks
+/// (`None` at one or two). A projection re-quantized to NVFP4 per shard
+/// takes the global scale of that TP2 shard, so its bytes are the matching
+/// rows (or columns) of the TP2 quantization serving runs on: a shard's own
+/// scale changes the NVFP4 bytes with the TP size.
+pub fn pair_scale_rank(tp_rank: usize, tp_size: usize) -> Option<usize> {
+    (tp_size > 2 && tp_size.is_multiple_of(2)).then(|| tp_rank * 2 / tp_size)
+}
+
 /// Shard a 1D BF16 vector `[dim]` (e.g. q_norm_full, gate_proj bias) on
 /// dim 0. Used for per-output vectors that pair with column-parallel GEMMs.
 pub fn shard_dense_1d_bf16(

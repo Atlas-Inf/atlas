@@ -38,6 +38,22 @@ pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_GLM_FP8B_CUTLASS", || {
         Ok(ops::fp8b_cutlass_requested()? as u64)
     }),
+    ("ATLAS_TAIL_SPLIT_MIN_TOKENS", || {
+        Ok(super::pc::tail_split_min_tokens() as u64)
+    }),
+    ("ATLAS_GLM_PREFILL_PIPE2", || {
+        Ok(crate::model::glm_prefill_pipe::requested() as u64)
+    }),
+    // The routed down rows' format (lossy E4M3 or BF16), so every rank's
+    // partial sums round alike.
+    ("ATLAS_GLM_MOE_DOWN_E4M3", || {
+        Ok(layers::moe::down_e4m3_requested() as u64)
+    }),
+    // The 16-head sparse prefill's key-tile split, so every rank's heads sum
+    // in one order.
+    ("ATLAS_GLM_SPARSE_PIPE_WG2", || {
+        Ok(ops::glm_sparse_pipe_wg2_requested("glm5_next")? as u64)
+    }),
     // The routed experts' activation scales and the non-prompt rows' A16
     // lane: the rows both ranks reduce.
     ("ATLAS_GLM_FP4L_INPUT_SCALES", || {

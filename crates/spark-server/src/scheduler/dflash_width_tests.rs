@@ -81,3 +81,39 @@ fn width_params_parse_with_an_optional_burst_floor() {
     let five = parse_params(Some("0.98,0.6,3,0.2,0"));
     assert_eq!((five.prior_h, five.burst_h), (0.6, 0.0));
 }
+
+#[test]
+fn the_chain_step_costs_track_its_measured_steps() {
+    // Median rank-0 step interval by (owners, rows), cells with ten or more
+    // verifies (4x1m-tp4, four and eight streams, 2026-10-18).
+    for (owners, rows, ms) in [
+        (1, 3, 32.1),
+        (2, 2, 40.8),
+        (2, 3, 47.8),
+        (2, 4, 52.8),
+        (3, 8, 99.0),
+        (4, 3, 73.6),
+        (4, 4, 83.3),
+        (4, 8, 117.5),
+        (5, 6, 119.3),
+        (6, 5, 125.8),
+        (7, 4, 125.6),
+        (8, 4, 132.1),
+    ] {
+        let fit = chain_step_ms(owners, rows);
+        assert!(
+            (fit - ms).abs() / ms < 0.06,
+            "{owners} x {rows}: fit {fit} vs measured {ms}"
+        );
+    }
+    // The chain's default 32-row verify budget, and the lone two-row path.
+    if std::env::var_os("ATLAS_GLM_LONG_BATCH_MAX_ROWS").is_none() {
+        assert!(chain_step_ms(8, 4).is_finite() && chain_step_ms(8, 5).is_infinite());
+    }
+    assert!(chain_step_ms(1, 2) > chain_step_ms(1, 3));
+    // A step costs more with every owner and every row.
+    for n in 1..8 {
+        assert!(chain_step_ms(n + 1, 3) > chain_step_ms(n, 3));
+        assert!(chain_step_ms(n, 4) > chain_step_ms(n, 3));
+    }
+}

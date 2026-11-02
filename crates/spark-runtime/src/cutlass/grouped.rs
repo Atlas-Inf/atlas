@@ -122,7 +122,7 @@ pub fn nvfp4_grouped_gate_up(
                 num_experts as i32,
                 n as i32,
                 k as i32,
-                ctx.workspace as *mut c_void,
+                ctx.workspace()? as *mut c_void,
                 ctx.ws_size,
                 stream as *mut c_void,
             )
@@ -213,7 +213,7 @@ pub fn nvfp4_grouped_gate_up_fused(
                 num_experts as i32,
                 n as i32,
                 k as i32,
-                ctx.workspace as *mut c_void,
+                ctx.workspace()? as *mut c_void,
                 ctx.ws_size,
                 stream as *mut c_void,
             )
@@ -286,7 +286,7 @@ pub fn nvfp4_grouped_down(
                 num_experts as i32,
                 n as i32,
                 k as i32,
-                ctx.workspace as *mut c_void,
+                ctx.workspace()? as *mut c_void,
                 ctx.ws_size,
                 stream as *mut c_void,
             )

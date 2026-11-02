@@ -59,7 +59,7 @@ pub(super) fn lone_dflash_width(
         drafts.truncate(width);
     }
     if dflash_verify_raw_argmax {
-        super::dflash_width::log_verify(1, drafts.len());
+        super::dflash_width::log_verify(1, drafts.len(), &[]);
     }
 }
 

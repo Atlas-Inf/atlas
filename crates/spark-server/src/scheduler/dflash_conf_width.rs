@@ -197,12 +197,15 @@ pub(crate) const DEFAULT_PARAMS: Params = Params {
 /// keep four's per-row cost. A lone owner's 2-row verify takes the slower
 /// path the 2026-09-28 sweep measured (10.3 ms over its 3-row one); a batch
 /// past the 32-row verify budget never runs. Only differences between widths
-/// at one owner count decide a width.
+/// at one owner count decide a width. On the TP4 chain the chain's measured
+/// costs price the rows (`dflash_width::chain_step_ms`).
 pub(super) fn step_ms(owners: usize, rows: usize) -> f32 {
-    const ROW_BUDGET: usize = 32;
-    const LONE_TWO_ROWS_MS: f32 = 10.3;
+    use super::dflash_width::{LONE_TWO_ROWS_MS, chain_step_ms, on_chain};
+    if on_chain() {
+        return chain_step_ms(owners, rows);
+    }
     let owners = owners.max(1);
-    if owners * rows > ROW_BUDGET {
+    if owners * rows > spark_model::layer::glm_long_owner::PAIR_MAX_ROWS {
         return f32::INFINITY;
     }
     if owners == 1 && rows == 2 {
@@ -240,18 +243,7 @@ impl Policy {
         params: Params,
     ) -> Option<usize> {
         let max = max.min(MAX_DRAFTS);
-        let measured =
-            |conf: &[f32]| conf.len() >= max && conf[..max].iter().all(|c| c.is_finite());
-        if max == 0 || owners.len() == 0 || !owners.clone().all(measured) {
-            return None;
-        }
-        let steps = if owners.clone().all(is_copy) {
-            &mut self.copy_steps
-        } else {
-            &mut self.steps
-        };
-        *steps += 1;
-        if params.probe > 0 && steps.is_multiple_of(params.probe) {
+        if self.probe(owners.clone(), max, params)? {
             return Some(max);
         }
         let n = owners.len();
@@ -269,6 +261,75 @@ impl Policy {
             }
         }
         Some(width)
+    }
+
+    /// Count one verify of these owners; `Some(true)` when it is a
+    /// full-width probe, `None` when any owner's first `max` drafts are not
+    /// measured (the caller's policy stands).
+    fn probe<'a>(
+        &mut self,
+        mut owners: impl ExactSizeIterator<Item = &'a [f32]> + Clone,
+        max: usize,
+        params: Params,
+    ) -> Option<bool> {
+        let measured =
+            |conf: &[f32]| conf.len() >= max && conf[..max].iter().all(|c| c.is_finite());
+        if max == 0 || owners.len() == 0 || !owners.clone().all(measured) {
+            return None;
+        }
+        let steps = if owners.all(is_copy) {
+            &mut self.copy_steps
+        } else {
+            &mut self.steps
+        };
+        *steps += 1;
+        Some(params.probe > 0 && steps.is_multiple_of(params.probe))
+    }
+
+    /// With dead rows (the chain): the batch width and each owner's drafts.
+    /// Each owner verifies its first draft; its later drafts are admitted
+    /// best survival first while the step's expected tokens per millisecond
+    /// ([`super::dflash_width::chain_step_ms_live`]) grow, and the width is
+    /// the most any owner verifies. A draft past an owner's count is a dead
+    /// row: it costs the batch little more than its share of the width.
+    pub(crate) fn choose_live<'a>(
+        &mut self,
+        owners: impl ExactSizeIterator<Item = &'a [f32]> + Clone,
+        max: usize,
+        params: Params,
+    ) -> Option<(usize, Vec<usize>)> {
+        use super::dflash_width::chain_step_ms_live;
+        let max = max.min(MAX_DRAFTS);
+        let n = owners.len();
+        if self.probe(owners.clone(), max, params)? {
+            return Some((max, vec![max; n]));
+        }
+        let survival: Vec<[f32; MAX_DRAFTS]> = owners
+            .map(|conf| self.calibration.survival(&conf[..max]))
+            .collect();
+        // Owner-major, depth ascending; a stable sort keeps an owner's equal
+        // survivals in depth order, so every owner admits a prefix.
+        let mut slots: Vec<(usize, usize)> =
+            (0..n).flat_map(|o| (1..max).map(move |d| (o, d))).collect();
+        slots.sort_by(|a, b| survival[b.0][b.1].total_cmp(&survival[a.0][a.1]));
+        let mut counts = vec![1; n];
+        let mut expected = n as f32 + survival.iter().map(|s| s[0]).sum::<f32>();
+        let rate = |counts: &[usize], expected: f32| {
+            let width = counts.iter().copied().max().unwrap_or(1);
+            let live = counts.iter().sum::<usize>() + n;
+            expected / chain_step_ms_live(n, width + 1, live)
+        };
+        let mut best = (rate(&counts, expected), counts.clone());
+        for (o, d) in slots {
+            counts[o] += 1;
+            expected += survival[o][d];
+            let r = rate(&counts, expected);
+            if r > best.0 {
+                best = (r, counts.clone());
+            }
+        }
+        let width = best.1.iter().copied().max().unwrap_or(1);
+        Some((width, best.1))
     }
 }
 
@@ -319,6 +380,17 @@ pub(crate) fn choose<'a>(
         return None;
     }
     policy().choose(owners, max, params())
+}
+
+/// [`Policy::choose_live`] on the serving policy; `None` with the rule off.
+pub(crate) fn choose_live<'a>(
+    owners: impl ExactSizeIterator<Item = &'a [f32]> + Clone,
+    max: usize,
+) -> Option<(usize, Vec<usize>)> {
+    if !enabled() {
+        return None;
+    }
+    policy().choose_live(owners, max, params())
 }
 
 /// Feed one owner's verify outcome to the calibration (`conf` is the

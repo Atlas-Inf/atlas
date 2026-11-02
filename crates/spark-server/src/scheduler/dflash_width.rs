@@ -124,11 +124,75 @@ impl DraftSurvival {
     }
 }
 
+/// The tensor-parallel ranks the verify runs on, set once at startup
+/// ([`set_verify_ranks`]); unset is the pair.
+static VERIFY_RANKS: OnceLock<usize> = OnceLock::new();
+
+/// Record the ranks a verify step runs on, which select the measured step
+/// costs the widths are priced by: the TP2 pair's or the TP4 chain's.
+pub(crate) fn set_verify_ranks(ranks: usize) {
+    let _ = VERIFY_RANKS.set(ranks);
+}
+
+/// Whether the verify runs on the chain (more than two ranks).
+pub(super) fn on_chain() -> bool {
+    VERIFY_RANKS.get().is_some_and(|&ranks| ranks > 2)
+}
+
+/// A lone owner's 2-row verify takes a slower path than its 3-row one: the
+/// pair's 2026-09-28 sweep measured it 10.3 ms slower. The chain has not
+/// measured it; it is priced the same.
+pub(super) const LONE_TWO_ROWS_MS: f32 = 10.3;
+
+/// Verify step cost in ms on the TP4 chain for `owners` owners of `rows`
+/// rows each: per owner count, a fixed part and a cost per owner-row, fitted
+/// to the median scheduler step interval by (owners, rows) of the chain's
+/// rank 0 (integ ba843fb33, recipe 4x1m-tp4 16161cb, `ATLAS_DFLASH_WIDTH_LOG`,
+/// four and eight concurrent streams of mixed code / prose / structured /
+/// counting, 2026-10-18; 1470 verifies). Every (owners, rows) cell with ten
+/// or more verifies lies within 6% of the fit; to 56 rows (five to eight owners of
+/// five to seven, `ATLAS_GLM_LONG_BATCH_MAX_ROWS=64`) within 8%. Past the
+/// chain's verify budget it is infinite.
+pub(super) fn chain_step_ms(owners: usize, rows: usize) -> f32 {
+    const BASE: [f32; 8] = [19.0, 30.0, 37.0, 50.0, 56.0, 62.8, 66.8, 68.0];
+    let owners = owners.clamp(1, 8);
+    if owners * rows > spark_model::layer::glm_long_owner::chain_row_budget() {
+        return f32::INFINITY;
+    }
+    let lone_two = if owners == 1 && rows <= 2 {
+        LONE_TWO_ROWS_MS
+    } else {
+        0.0
+    };
+    BASE[owners - 1] + PER_OWNER_ROW[owners - 1] * (owners * rows) as f32 + lone_two
+}
+
+/// [`chain_step_ms`]'s cost per owner-row, by owner count.
+const PER_OWNER_ROW: [f32; 8] = [4.35, 2.7, 2.5, 2.0, 2.1, 2.1, 2.1, 2.0];
+
+/// What a dead row (`ATLAS_DFLASH_DEAD_ROWS`) still costs: a row's work
+/// besides its routed experts, which a dead row skips. Not yet measured on
+/// the chain; kindling's TP4 step model (`experimental/adaptive-k`,
+/// `VLLM_ADAPTIVE_K_MODEL` 27.0,0.635,0.542) charges 0.54 ms a token besides
+/// the experts it touches.
+const DEAD_ROW_MS: f32 = 0.55;
+
+/// [`chain_step_ms`] when only `live` of the `owners * rows` rows are live,
+/// the rest dead rows.
+pub(super) fn chain_step_ms_live(owners: usize, rows: usize, live: usize) -> f32 {
+    let dead = (owners * rows).saturating_sub(live) as f32;
+    let saved = PER_OWNER_ROW[owners.clamp(1, 8) - 1] - DEAD_ROW_MS;
+    chain_step_ms(owners, rows) - dead * saved.max(0.0)
+}
+
 /// Measured verify step cost in ms for `owners` sequences of `rows` rows
 /// each: median scheduler step interval (verify + re-propose) on GLM-5.3
 /// Flash TP2 GB10, prose, 2026-09-28 (`ATLAS_DFLASH_FIXED_WIDTH` sweeps; 5..=8
-/// owners on the eight-sequence profile).
+/// owners on the eight-sequence profile); on the chain, [`chain_step_ms`].
 fn step_ms(owners: usize, rows: usize) -> f32 {
+    if on_chain() {
+        return chain_step_ms(owners, rows.clamp(2, 8));
+    }
     // Rows 2..=8, owners 1..=8. A lone owner's 2-row verify takes a slower
     // path than 3 rows. Owners x rows past the 32-row verify budget never
     // run (infinite cost).
@@ -151,11 +215,20 @@ pub(crate) fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_DFLASH_ADAPTIVE_WIDTH").as_deref() == Ok("1"))
 }
 
-/// `ATLAS_DFLASH_WIDTH_LOG=1`: one line per verify (cost sweeps).
-pub(crate) fn log_verify(owners: usize, drafts: usize) {
+/// `ATLAS_DFLASH_WIDTH_LOG=1`: one line per verify (cost sweeps), with each
+/// owner's verified drafts when some rows are dead (`verified`).
+pub(crate) fn log_verify(owners: usize, drafts: usize, verified: &[usize]) {
     static ON: OnceLock<bool> = OnceLock::new();
     if *ON.get_or_init(|| std::env::var("ATLAS_DFLASH_WIDTH_LOG").as_deref() == Ok("1")) {
-        tracing::info!("DFLASH VERIFY owners={owners} rows={}", drafts + 1);
+        if verified.iter().any(|&d| d < drafts) {
+            tracing::info!(
+                "DFLASH VERIFY owners={owners} rows={} live={}",
+                drafts + 1,
+                verified.iter().map(|d| d + 1).sum::<usize>()
+            );
+        } else {
+            tracing::info!("DFLASH VERIFY owners={owners} rows={}", drafts + 1);
+        }
     }
 }
 
@@ -188,6 +261,25 @@ pub(crate) fn choose<'a>(
         return Some(w);
     }
     enabled().then(|| best(owners.map(|(survival, _)| survival), max))
+}
+
+/// With dead rows (`ATLAS_DFLASH_DEAD_ROWS`, the chain): the batch width
+/// and each owner's verified drafts (1..=width, in `owners` order), from the
+/// drafter's confidence (`dflash_conf_width::choose_live`). `None` leaves
+/// [`choose`] in place: dead rows off, a pinned width, or unmeasured drafts.
+pub(crate) fn choose_live<'a>(
+    owners: impl ExactSizeIterator<Item = &'a [f32]> + Clone,
+    max: usize,
+) -> Option<(usize, Vec<usize>)> {
+    let max = max.min(MAX_DRAFTS);
+    if max == 0
+        || fixed().is_some()
+        || !on_chain()
+        || !spark_model::layer::glm_long_owner::dead_rows_enabled()
+    {
+        return None;
+    }
+    super::dflash_conf_width::choose_live(owners, max)
 }
 
 /// The width maximizing the owners' expected tokens per step millisecond.

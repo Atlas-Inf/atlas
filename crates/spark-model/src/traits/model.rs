@@ -378,6 +378,13 @@ pub trait Model: Send + Sync {
         })
     }
 
+    /// Rows a long final prefill chunk is cut to a multiple of so it runs
+    /// sequence-parallel (GLM-5 over the four-rank chain); the few rows past
+    /// the cut run as one more chunk. 1 when nothing asks.
+    fn prefill_row_multiple(&self) -> usize {
+        1
+    }
+
     /// R11 fix 5: shrink a NON-last scheduler prefill chunk so it ends on the
     /// model's prefill cut grid (no stray 1-token passes where a chunk end and
     /// a grid cut sit one token apart). Default: unchanged.

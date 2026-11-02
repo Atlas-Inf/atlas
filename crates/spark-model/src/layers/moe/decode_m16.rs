@@ -228,6 +228,34 @@ impl MoeLayer {
             && self.moe_w4a4_prequant_t_k64.0 != 0
     }
 
+    /// Whether a prefill routed FFN of `rows` tokens takes the K128W
+    /// prequant path in both projections (`prequant_tiles` handing back the
+    /// K128W grid, `prequant_fp4_gate_up` / `prequant_grouped` launching over
+    /// it), which sizes its work from the device prefix and never reads the
+    /// hottest expert's tile count: the exact-tile host read is dead there.
+    pub(super) fn k128w_prequant(&self, rows: u32, h: u32, inter: u32, decode_batch: bool) -> bool {
+        // The batches another lane takes.
+        let cutlass = (super::forward_prefill_routed::grouped_cutlass_gate_up_enabled()
+            && self.cutlass_grouped_host.is_some())
+            || super::forward_prefill_routed::grouped_cutlass_down_enabled();
+        let elsewhere = decode_batch
+            || self.stream_m16_prequant(rows, h, inter)
+            || self.btile_storage.is_published()
+            || self.nvfp4_mmq_layout
+            || cutlass;
+        !elsewhere
+            && self.gate_ptrs_t.is_some()
+            && self.up_ptrs_t.is_some()
+            && self.down_ptrs_t.is_some()
+            && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
+            && self.prequant_moe()
+            && self.moe_w4a4_prequant_t_k64.0 != 0
+            && self.moe_w4a4_prequant_t_k128w.grid.0 != 0
+            && self.moe_mtile_prefix_k.0 != 0
+            && h.is_multiple_of(256)
+            && inter.is_multiple_of(256)
+    }
+
     /// Whether the M16 kernels can take `rows` routed rows (at most
     /// `max_rows`): loaded, the shape tiled, the worklist builder present and
     /// the fused SiLU quantization the one serving would run.

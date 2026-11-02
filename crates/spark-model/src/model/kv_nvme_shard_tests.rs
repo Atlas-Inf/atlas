@@ -8,6 +8,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use atlas_core::scope::ModelResource;
 use spark_runtime::gpu::mock::MockGpuBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kv_cache::{
@@ -24,6 +25,10 @@ const BS: usize = 16;
 const POOL: usize = 8;
 
 fn sharded_kv(gpu: &MockGpuBackend, rank: usize, fast: bool) -> PagedKvCache {
+    sharded_kv_world(gpu, rank, 2, fast)
+}
+
+fn sharded_kv_world(gpu: &MockGpuBackend, rank: usize, world: usize, fast: bool) -> PagedKvCache {
     let cfg = KvCacheConfig {
         block_size: BS,
         num_kv_heads: 1,
@@ -36,7 +41,7 @@ fn sharded_kv(gpu: &MockGpuBackend, rank: usize, fast: bool) -> PagedKvCache {
     };
     let spec = LatentShardSpec {
         rank,
-        world: 2,
+        world,
         scratch_bytes: 4096,
         view_blocks: 8,
         write_rows: 4,
@@ -58,8 +63,12 @@ fn sharded_kv(gpu: &MockGpuBackend, rank: usize, fast: bool) -> PagedKvCache {
 }
 
 fn classed_tree(per_class: u32) -> RadixTree {
+    classed_tree_world(per_class, 2)
+}
+
+fn classed_tree_world(per_class: u32, world: usize) -> RadixTree {
     let tree = RadixTree::new();
-    assert!(tree.enable_classes(per_class, 2));
+    assert!(tree.enable_classes(per_class, world as u32));
     tree
 }
 
@@ -100,8 +109,9 @@ fn fill(kv: &PagedKvCache, gpu: &MockGpuBackend, b: u32, seed: u8) {
 /// Churn the free lists in a rank-specific order, so the ranks' ids for the
 /// same logical blocks differ from here on (as on hardware).
 fn diverge(kv: &mut PagedKvCache, rank: usize) {
-    let mut held: Vec<u32> = (0..4).map(|l| kv.alloc_block_at(l).unwrap()).collect();
-    if rank == 1 {
+    let mut held: Vec<u32> = (0..POOL).map(|l| kv.alloc_block_at(l).unwrap()).collect();
+    held.rotate_left(rank);
+    if rank % 2 == 1 {
         held.reverse();
     }
     kv.free_blocks(&held);
@@ -127,7 +137,8 @@ fn cache_request_on(
     let n = tokens.len() / BS;
     let blocks: Vec<u32> = (0..n).map(|l| kv.alloc_block_at(l).unwrap()).collect();
     for (l, &b) in blocks.iter().enumerate() {
-        assert_eq!(b as usize % 2, l % 2, "drawn at its logical index");
+        let world = kv.latent_shard().unwrap().spec.world;
+        assert_eq!(b as usize % world, l % world, "drawn at its logical index");
         fill(kv, gpu, b, 0x40 + l as u8);
     }
     let acquired = tree.insert(tokens, &blocks, &[], BS, 0, 0);
@@ -311,5 +322,77 @@ fn kept_records_cost_no_write_in_either_lane() {
             assert_eq!(dump(&kv, &gpu, b), want[l], "rank {rank} block {l}");
         }
         tree.release(&t, BS, 0);
+    }
+}
+
+#[test]
+fn tp4_restore_and_keep_preserve_bytes_and_refs_on_every_rank() {
+    let t: Vec<u32> = (0..5 * BS as u32).collect();
+    for fast in [false, true] {
+        for keep in [false, true] {
+            let mut first = None;
+            for rank in 0..4 {
+                let gpu = MockGpuBackend::new();
+                let mut kv = sharded_kv_world(&gpu, rank, 4, fast);
+                let tree = classed_tree_world(64, 4);
+                tree.set_keep_restored(keep);
+                diverge(&mut kv, rank);
+                let want = cache_request(&mut kv, &tree, &gpu, &t);
+                pressure(&mut kv, &tree, &gpu);
+                let plan = planned(&tree, &t);
+                if let Some(first) = &first {
+                    assert_eq!(&plan, first, "all four owners agree on slots and tags");
+                } else {
+                    first = Some(plan);
+                }
+                for round in 0..2 {
+                    let r =
+                        restore_prefix(&tree, &mut kv, &gpu, &t, 0, 0, |p| p.disk.len()).unwrap();
+                    assert_eq!((r.restored, r.failed), (5, false));
+                    let m = tree.lookup(&t, BS, 0, 0);
+                    for (l, &b) in m.matched_blocks.iter().enumerate() {
+                        assert_eq!(b as usize % 4, l % 4);
+                        assert_eq!(
+                            dump(&kv, &gpu, b),
+                            want[l],
+                            "rank={rank} fast={fast} keep={keep}"
+                        );
+                    }
+                    tree.release(&t, BS, 0);
+                    pressure(&mut kv, &tree, &gpu);
+                    assert_eq!(kv.num_free_in_all(), POOL, "no leaked references");
+                    if keep {
+                        assert_eq!(kv.nvme_io_stats().spilled_blocks, 5);
+                        assert_eq!(tree.nvme_stats().clean_evictions, 5 * (round + 1));
+                    }
+                }
+                kv.release(&gpu).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn tp4_partial_restore_caps_every_owner_to_the_common_prefix() {
+    let t: Vec<u32> = (0..5 * BS as u32).collect();
+    for rank in 0..4 {
+        let gpu = MockGpuBackend::new();
+        let mut kv = sharded_kv_world(&gpu, rank, 4, true);
+        let tree = classed_tree_world(64, 4);
+        let want = cache_request(&mut kv, &tree, &gpu, &t);
+        pressure(&mut kv, &tree, &gpu);
+        let restored = [5, 4, 3, 2][rank];
+        let r = restore_prefix(&tree, &mut kv, &gpu, &t, 0, 0, |_| restored).unwrap();
+        assert_eq!(r.restored, restored);
+        let local = tree.lookup_whole_blocks(&t, BS, 0, 0);
+        let capped = cap_prefix_match(&tree, &t, BS, 0, 0, local, 2 * BS);
+        assert_eq!(capped.matched_tokens, 2 * BS);
+        for (l, &b) in capped.matched_blocks.iter().enumerate() {
+            assert_eq!(dump(&kv, &gpu, b), want[l]);
+        }
+        tree.release_matched(&t, BS, 2 * BS, 0);
+        pressure(&mut kv, &tree, &gpu);
+        assert_eq!(kv.num_free_in_all(), POOL);
+        kv.release(&gpu).unwrap();
     }
 }

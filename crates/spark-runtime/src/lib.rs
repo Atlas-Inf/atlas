@@ -30,11 +30,13 @@ pub mod gpu;
 #[path = "gpu_args.rs"]
 mod gpu_args;
 mod gpu_pitched;
+pub mod host_sync_trace;
 pub mod kernel_args;
 pub mod kernel_audit;
 pub mod kv_cache;
 pub mod kv_dequant;
 pub mod kv_spill;
+pub mod lane;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal_backend;
 pub mod op_cache;

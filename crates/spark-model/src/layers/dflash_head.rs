@@ -778,6 +778,13 @@ pub struct BlockDiffusionDraftHead {
     /// One extra-lane stream may serve several seqs (n > lanes); the lane
     /// itself never moves for a seq.
     pub next_lane: std::sync::atomic::AtomicUsize,
+    /// Finished sequences' ctx accumulators, `(bytes, ptr)`, kept for the
+    /// next `alloc_state` (re-zeroed there) instead of freed: the
+    /// accumulator's cuMemAlloc was 3.2 ms of every request's TTFT on GB10
+    /// (rank-0 nsys 2026-10-18). At most `acc_pool_cap` (0: none, freed as
+    /// before).
+    pub acc_pool: Mutex<Vec<(usize, DevicePtr)>>,
+    pub acc_pool_cap: usize,
     /// Entry-ordering event: recorded on the default stream at the top of
     /// the multi-lane `propose_batch`; every extra lane waits on it so
     /// drafter-ctx precompute / `after_verify` writes enqueued on the
@@ -1475,7 +1482,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
         &self,
         comm: &dyn spark_comm::CommBackend,
         seqs: &[rank_split::CtxSeq<'_>],
-    ) -> u32 {
+    ) -> u64 {
         self.split_ctx_rows(comm, seqs)
     }
 

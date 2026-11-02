@@ -45,8 +45,8 @@ fn admission_excludes_first_chunk_short_rows_verify_and_capture() {
 
 #[test]
 fn maximum_layout_has_three_lengths_and_three_lse_arrays() {
-    let p = Plan::new(4100, 28668, 8196, 2048, storage(), 19).unwrap();
-    let (required, metadata) = required_bytes(4100, 32768, 8196, 2048).unwrap();
+    let p = Plan::new(4100, 28668, 8196, 2048, 32, storage(), 19).unwrap();
+    let (required, metadata) = required_bytes(4100, 32768, 8196, 2048, 32).unwrap();
     assert_eq!(
         metadata.offsets,
         [
@@ -67,39 +67,64 @@ fn maximum_layout_has_three_lengths_and_three_lse_arrays() {
     assert_eq!(p.operands.block_table_count, 2048);
     assert_eq!(p.operands.metadata_bytes, 68798720);
     assert_eq!(p.operands.stream, 19);
+    assert_eq!(p.operands.heads, 32);
 }
 
 #[test]
 fn every_short_owner_and_live_operand_overlap_is_rejected() {
-    let (required, _) = required_bytes(4100, 32768, 8196, 2048).unwrap();
+    let (required, _) = required_bytes(4100, 32768, 8196, 2048, 32).unwrap();
     for i in 0..10 {
         let mut s = storage();
         s[i].bytes = required[i] - 1;
         assert!(
-            Plan::new(4100, 28668, 8196, 2048, s, 0).is_err(),
+            Plan::new(4100, 28668, 8196, 2048, 32, s, 0).is_err(),
             "owner {i}"
         );
         let mut s = storage();
         s[i].ptr = 0;
-        assert!(Plan::new(4100, 28668, 8196, 2048, s, 0).is_err());
+        assert!(Plan::new(4100, 28668, 8196, 2048, 32, s, 0).is_err());
         let mut s = storage();
         s[i].ptr = u64::MAX - 255;
-        assert!(Plan::new(4100, 28668, 8196, 2048, s, 0).is_err());
+        assert!(Plan::new(4100, 28668, 8196, 2048, 32, s, 0).is_err());
         for j in 0..i {
             let mut s = storage();
             s[i].ptr = s[j].ptr;
-            assert!(Plan::new(4100, 28668, 8196, 2048, s, 0).is_err());
+            assert!(Plan::new(4100, 28668, 8196, 2048, 32, s, 0).is_err());
         }
     }
 }
 
 #[test]
 fn packing_rounds_only_logical_history_and_requires_its_block_table() {
-    let (required, _) = required_bytes(3515, 15807, 8196, 2048).unwrap();
+    let (required, _) = required_bytes(3515, 15807, 8196, 2048, 32).unwrap();
     assert_eq!(required[5], 15808 * 656);
-    assert!(Plan::new(3515, 12292, 8196, 987, storage(), 7).is_err());
-    assert!(Plan::new(3515, 12292, 0, 2048, storage(), 7).is_err());
+    assert!(Plan::new(3515, 12292, 8196, 987, 32, storage(), 7).is_err());
+    assert!(Plan::new(3515, 12292, 0, 2048, 32, storage(), 7).is_err());
     let mut s = storage();
     s[4].ptr += 16;
-    assert!(Plan::new(3515, 12292, 8196, 2048, s, 7).is_err());
+    assert!(Plan::new(3515, 12292, 8196, 2048, 32, s, 7).is_err());
+}
+
+#[test]
+fn tp4_layout_uses_sixteen_heads_without_shrinking_shared_metadata() {
+    let (pair, _) = required_bytes(4100, 32768, 8196, 2048, 32).unwrap();
+    let (four, meta) = required_bytes(4100, 32768, 8196, 2048, 16).unwrap();
+    for i in [0, 4, 7, 8, 9] {
+        assert_eq!(four[i] * 2, pair[i], "head-dependent owner {i}");
+    }
+    for i in [1, 2, 3, 5] {
+        assert_eq!(four[i], pair[i], "shared owner {i}");
+    }
+    assert_eq!(meta.offsets[5], 67224320);
+    assert_eq!(meta.bytes, 68011520);
+    let spans = std::array::from_fn(|i| Span {
+        bytes: four[i],
+        ..storage()[i]
+    });
+    let p = Plan::new(4100, 28668, 8196, 2048, 16, spans, 0).unwrap();
+    assert_eq!(p.operands.heads, 16);
+    assert!(Plan::new(4100, 28668, 8196, 2048, 32, spans, 0).is_err());
+    for heads in [0, 1, 8, 15, 17, 31, 64, usize::MAX] {
+        assert!(required_bytes(4100, 32768, 8196, 2048, heads).is_err());
+    }
 }

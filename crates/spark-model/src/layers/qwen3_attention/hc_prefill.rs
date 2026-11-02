@@ -153,7 +153,7 @@ pub(crate) fn hc_pre_prefill_mix(
 }
 
 /// The highway, post and comb rows from this rank's row `row0` on.
-fn hc_rows(ctx: &ForwardContext, row0: usize) -> (DevicePtr, DevicePtr, DevicePtr) {
+pub(crate) fn hc_rows(ctx: &ForwardContext, row0: usize) -> (DevicePtr, DevicePtr, DevicePtr) {
     let b = ctx.buffers;
     let highway_row = 4 * ctx.config.hidden_size * ops::hc_elem_bytes(&ctx.config.model_type);
     (

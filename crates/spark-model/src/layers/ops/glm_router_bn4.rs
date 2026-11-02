@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Exact GLM M5 router ABI, distinct from the old BN16 launch geometry.
+//! Exact GLM M5 router ABI (FP32 logits), distinct from the old BN16 launch
+//! geometry.
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
@@ -19,7 +20,7 @@ pub fn glm_router_bn4(
             && !output.is_null()
             && input.0.is_multiple_of(8)
             && weight.0.is_multiple_of(8)
-            && output.0.is_multiple_of(2),
+            && output.0.is_multiple_of(4),
         "GLM BN4 router launch alignment/handle"
     );
     KernelLaunch::new(gpu, kernel)

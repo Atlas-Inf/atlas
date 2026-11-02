@@ -161,10 +161,15 @@ impl K128wSchedule {
             .block([256, 1, 1]))
     }
 
-    fn finish(self, launch: KernelLaunch<'_>, stream: u64) -> Result<()> {
-        match self {
-            Self::Grid { .. } | Self::Stride { .. } => launch.launch(stream),
-            Self::Persistent { next_work, .. } => launch.arg_ptr(next_work).launch(stream),
+    /// Append the schedule's own argument, then `tail` when given.
+    fn finish(self, launch: KernelLaunch<'_>, tail: Option<DevicePtr>, stream: u64) -> Result<()> {
+        let launch = match self {
+            Self::Grid { .. } | Self::Stride { .. } => launch,
+            Self::Persistent { next_work, .. } => launch.arg_ptr(next_work),
+        };
+        match tail {
+            Some(p) => launch.arg_ptr(p).launch(stream),
+            None => launch.launch(stream),
         }
     }
 }
@@ -192,6 +197,37 @@ pub fn moe_w4a4_grouped_gemm_prequant_k128w(
     schedule: K128wSchedule,
     stream: u64,
 ) -> Result<()> {
+    moe_w4a4_grouped_gemm_prequant_k128w_into(
+        gpu,
+        kernel,
+        [a_packed, a_scale],
+        [b_packed_ptrs, b_scale_ptrs, scale2_vals],
+        output,
+        None,
+        [expert_offsets, sorted_token_ids, prefix],
+        [num_experts, n_out, k],
+        schedule,
+        stream,
+    )
+}
+
+/// `moe_w4a4_grouped_gemm_prequant_k128w` with the E4M3 output of its
+/// `_e4m3` twins (`kernel`) when `c_scale` is given: E4M3 bytes
+/// `[rows, n_out]` in `output` and FP32 scales `[rows, n_out / 64]` in
+/// `c_scale` (lossy, ATLAS_GLM_MOE_DOWN_E4M3).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_w4a4_grouped_gemm_prequant_k128w_into(
+    gpu: &dyn GpuBackend,
+    kernel: K128wKernel,
+    [a_packed, a_scale]: [DevicePtr; 2],
+    [b_packed_ptrs, b_scale_ptrs, scale2_vals]: [DevicePtr; 3],
+    output: DevicePtr,
+    c_scale: Option<DevicePtr>,
+    [expert_offsets, sorted_token_ids, prefix]: [DevicePtr; 3],
+    [num_experts, n_out, k]: [u32; 3],
+    schedule: K128wSchedule,
+    stream: u64,
+) -> Result<()> {
     let launch = schedule
         .launch(gpu, kernel, n_out / 256, stream)?
         .arg_ptr(a_packed)
@@ -206,7 +242,7 @@ pub fn moe_w4a4_grouped_gemm_prequant_k128w(
         .arg_u32(n_out)
         .arg_u32(k)
         .arg_ptr(prefix);
-    schedule.finish(launch, stream)
+    schedule.finish(launch, c_scale, stream)
 }
 
 /// K128W gate and up projections of `n_out` intermediate columns with the
@@ -253,7 +289,7 @@ pub fn moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w(
         .arg_ptr(out_packed)
         .arg_ptr(out_scale)
         .arg_ptr(a2_gscale);
-    schedule.finish(launch, stream)
+    schedule.finish(launch, None, stream)
 }
 
 /// Native-FP4 prequant GEMM over a compact `(expert, m_tile, n_tile)`

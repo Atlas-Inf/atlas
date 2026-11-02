@@ -27,11 +27,7 @@ const ON: Settings = Settings {
 };
 
 pub(super) fn split(rows: usize, rank: usize, check: bool) -> IndexSplit {
-    IndexSplit {
-        swaps: IndexSplit::zigzag(rows, rank),
-        rows,
-        check,
-    }
+    IndexSplit::new(rows, rank, 2, check)
 }
 
 /// One exchange as the peer saw it: `(send, dst, add, sent bytes)`.
@@ -177,7 +173,7 @@ fn every_row_is_selected_here_or_received() {
         for rank in 0..2 {
             let s = split(rows, rank, false);
             let mut seen = vec![0u8; rows];
-            let received = s.swaps.map(|w| w.peer..w.peer + w.rows);
+            let received = s.swaps().map(|w| w.peer..w.peer + w.rows);
             for r in s.own().into_iter().chain(received) {
                 seen[r].iter_mut().for_each(|c| *c += 1);
             }
@@ -198,6 +194,37 @@ fn own_rows_merge_into_two_ranges_with_the_tail_on_both_ranks() {
     assert_eq!(own(2050, 1), [512..1536, 2048..2050]);
     assert_eq!(own(3001, 0), [0..750, 2250..3001]);
     assert_eq!(own(3001, 1), [750..2250, 3000..3001]);
+}
+
+#[test]
+fn chain_parts_tile_the_owner_once_with_balanced_work() {
+    for rows in ROWS {
+        let splits: Vec<_> = (0..4).map(|r| IndexSplit::new(rows, r, 4, false)).collect();
+        let mut seen = vec![0usize; rows];
+        let whole = 8 * (rows / 8);
+        for s in &splits {
+            for row in s.own().into_iter().flatten() {
+                seen[row] += 1;
+            }
+        }
+        assert!(seen[..whole].iter().all(|&c| c == 1), "rows {rows}");
+        assert!(seen[whole..].iter().all(|&c| c == 4), "rows {rows}");
+        // Part r and part 7 - r: the same causal work on every rank.
+        let work = |s: &IndexSplit| -> usize {
+            s.own()
+                .into_iter()
+                .flatten()
+                .filter(|&r| r < whole)
+                .map(|r| r + 1)
+                .sum()
+        };
+        assert!(
+            splits.iter().all(|s| work(s) == work(&splits[0])),
+            "rows {rows}"
+        );
+    }
+    let s = IndexSplit::new(4096, 1, 4, false);
+    assert_eq!(s.own(), [512..1024, 3072..3584]);
 }
 
 #[test]
@@ -340,7 +367,7 @@ fn exchange_swaps_the_zigzag_pairs_in_the_same_order_on_both_ranks() {
                 inputs: [(sel, 0); 2],
             };
             split(rows, rank, false)
-                .exchange(&owner, 0, ctx, 7)
+                .exchange(&owner, 0, false, None, ctx, 7)
                 .unwrap();
             let got: Vec<_> = pair
                 .calls()

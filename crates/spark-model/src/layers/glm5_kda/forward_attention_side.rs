@@ -19,6 +19,8 @@ impl Glm5KdaLayer {
         decode: bool,
         verify_proj: bool,
         capture_verify_intermediates: bool,
+        // b / f_a / g_a are already in their planes (`sp_quant_gather.rs`).
+        side_done: bool,
         profile_timer: &mut Option<std::time::Instant>,
         ctx: &ForwardContext,
         stream: u64,
@@ -49,7 +51,12 @@ impl Glm5KdaLayer {
             && (2..=ops::DENSE_GEMV_BATCHM_MAX_M).contains(&m)
             && self.dense_gemv_batchm_triple_n_k.0 != 0
             && self.dense_gemv_batchm_dual_k.0 != 0;
-        if canonical && verify_proj {
+        if side_done {
+            anyhow::ensure!(
+                self.side_proj_rows_serve(m, verify_proj),
+                "GLM KDA side projections left done off their prefill path"
+            );
+        } else if canonical && verify_proj {
             // One canonical launch for the three side projections.
             let (heads, dim) = (self.heads as u32, self.dim as u32);
             crate::layers::canonical_verify::dense_planes(
@@ -97,33 +104,8 @@ impl Glm5KdaLayer {
                 stream,
             )?;
             profile::step(ctx, stream, profile_timer, "beta_f_a_g_a")?;
-        } else if !verify_proj
-            && m > 1
-            && self.dense_gemm_pipelined_k.0 != 0
-            && self.dense_gemm_pipelined_triple_n_k.0 != 0
-        {
-            // The three pipelined launches `project_dense` would make, in one
-            // grid, or their bytes from one GEMM over the packed weights.
-            if decode
-                || ctx.graph_capture
-                || !self.side_proj_packed(normed, [beta, fa, ga], m, ctx, stream)?
-            {
-                ops::dense_gemm_pipelined_triple_n(
-                    ctx.gpu,
-                    self.dense_gemm_pipelined_triple_n_k,
-                    normed,
-                    [
-                        &self.weights.b_proj,
-                        &self.weights.f_a_proj,
-                        &self.weights.g_a_proj,
-                    ],
-                    [beta, fa, ga],
-                    m,
-                    [self.heads as u32, self.dim as u32],
-                    h,
-                    stream,
-                )?;
-            }
+        } else if self.side_proj_rows_serve(m, verify_proj) {
+            self.side_proj_rows(normed, [beta, fa, ga], m, decode, ctx, stream)?;
             profile::step(ctx, stream, profile_timer, "beta_f_a_g_a")?;
         } else {
             if verify_proj {
@@ -308,6 +290,47 @@ impl Glm5KdaLayer {
     /// the weights the loader stored back to back, staged in
     /// `ssm_deinterleaved` (g1 / g2 are written only after). `false`: off,
     /// not packed, or CUTLASS declined; nothing launched.
+    /// Whether a non-verify block of `m` rows takes [`Self::side_proj_rows`].
+    pub(super) fn side_proj_rows_serve(&self, m: u32, verify_proj: bool) -> bool {
+        !verify_proj
+            && m > 1
+            && self.dense_gemm_pipelined_k.0 != 0
+            && self.dense_gemm_pipelined_triple_n_k.0 != 0
+    }
+
+    /// b / f_a / g_a of `m` rows of `normed` into `outputs`: the three
+    /// pipelined launches `project_dense` would make, in one grid, or their
+    /// bytes from one GEMM over the packed weights. Each row's bytes are the
+    /// same at any `m`.
+    pub(super) fn side_proj_rows(
+        &self,
+        normed: DevicePtr,
+        outputs: [DevicePtr; 3],
+        m: u32,
+        decode: bool,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        if decode || ctx.graph_capture || !self.side_proj_packed(normed, outputs, m, ctx, stream)? {
+            ops::dense_gemm_pipelined_triple_n(
+                ctx.gpu,
+                self.dense_gemm_pipelined_triple_n_k,
+                normed,
+                [
+                    &self.weights.b_proj,
+                    &self.weights.f_a_proj,
+                    &self.weights.g_a_proj,
+                ],
+                outputs,
+                m,
+                [self.heads as u32, self.dim as u32],
+                self.hidden_size as u32,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
     fn side_proj_packed(
         &self,
         normed: DevicePtr,

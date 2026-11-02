@@ -668,7 +668,7 @@ impl TransformerModel {
                 .map(|((state, &stack), &position)| (&**state, Some(stack), position))
                 .collect();
             let ctx_rows = proposer.rank_split_ctx(comm, &seqs);
-            self.announce_draft_split_rows(rows, ctx_rows)?;
+            self.announce_draft_split_rows(rows, tokens.len(), ctx_rows)?;
         }
         // ATLAS_QWEN4EXP_MTP_DRAFT_TP: a qwen4_exp batched propose whose draft
         // head the worker shares, announced with its plan.

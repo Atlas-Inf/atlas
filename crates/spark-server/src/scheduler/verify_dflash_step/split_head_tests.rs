@@ -52,6 +52,7 @@ fn unsupported_owner_group_is_rejected_before_traversal() {
         1,
         &ctx,
         true,
+        &[],
         &mut |_, _, _| {
             traversed = true;
             Ok(vec![])
@@ -127,6 +128,7 @@ fn failed_exchange(operation: &str, is_ep: bool, owners: bool) {
             1,
             &ctx,
             true,
+            &[],
             &mut |rows, tokens, seqs| {
                 for (owner, seq) in seqs.iter_mut().enumerate() {
                     seq.seq_len += rows;

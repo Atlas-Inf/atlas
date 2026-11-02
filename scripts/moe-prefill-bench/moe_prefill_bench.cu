@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Standalone GLM-5.3-Flash routed-MoE prefill microbenchmark (GB10, EP2 rank 0).
+// Standalone GLM-5.3-Flash routed-MoE prefill microbenchmark (GB10, EP2 rank 0;
+// the defines below take other ranks' shapes).
 //
 // One prefill chunk of T tokens, top-8 of 288 experts, the local 144 experts
 // holding random NVFP4 weights, launched exactly as serving launches them:
@@ -34,7 +35,15 @@
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); exit(2); } } while (0)
 
-static const unsigned E = 288, LOCAL = 144, TOPK = 8, H = 4096, I = 2048;
+// -DMOE_PREFILL_LOCAL=72 is an EP4 rank's experts; -DMOE_PREFILL_LOCAL=288
+// -DMOE_PREFILL_I=1024 (512) an expert-TP rank of the pair (the chain).
+#ifndef MOE_PREFILL_LOCAL
+#define MOE_PREFILL_LOCAL 144
+#endif
+#ifndef MOE_PREFILL_I
+#define MOE_PREFILL_I 2048
+#endif
+static const unsigned E = 288, LOCAL = MOE_PREFILL_LOCAL, TOPK = 8, H = 4096, I = MOE_PREFILL_I;
 
 struct Lcg {
     unsigned long long s;

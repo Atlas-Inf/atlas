@@ -2,25 +2,32 @@
 
 //! Rank-split propose (`ATLAS_GLM_DRAFT_TP`, default off).
 //!
-//! The drafter runs on the head rank while the worker waits for the next
+//! The drafter runs on the head rank while the workers wait for the next
 //! verify. A propose is the read of the drafter's NVFP4 weights, so with this
-//! switch the worker reads half of the largest ones: each rank computes a
-//! contiguous half of the OUTPUT rows of a layer's gate/up and down
-//! projections and of the vocabulary head, with the unchanged tensor-core
-//! GEMV over a row range of the same twin, and the halves are swapped over
-//! the pair exchange. A GEMV output row depends only on its weight row and
+//! switch every rank reads its share of the largest ones: each of the
+//! `ranks` ranks (the TP2 pair or the TP4 chain) computes a contiguous share
+//! of the OUTPUT rows of a layer's gate/up and down projections and of the
+//! vocabulary head, with the unchanged tensor-core GEMV over a row range of
+//! the same twin, and the shares are swapped over the pair exchange or
+//! gathered over the chain (the head's rows go out the same way, or by the
+//! chain's broadcast). A GEMV output row depends only on its weight row and
 //! the input, so every value is the one the unsplit launch writes and the
 //! drafts are bit-identical.
 //!
-//! Both ranks walk `Geometry::steps` of their own rank. The swaps are the
-//! same list in the same order with the same sizes on both
+//! Every rank walks `Geometry::steps` of its own rank. The swaps are the
+//! same list in the same order with the same sizes on every rank
 //! (`Geometry::swaps`); only the local pieces between them differ. Pieces
 //! are stream work with no host sync, so the head captures each run of pieces
 //! between two swaps as one CUDA graph and the worker enqueues its whole walk
 //! at once.
 //!
-//! `ATLAS_GLM_DRAFT_TP=1` splits every part; `mlp` or `head` (comma separated)
-//! selects parts for an A/B. Both ranks must run the same value
+//! `ATLAS_GLM_DRAFT_TP=1` splits the MLP and the head; `mlp`, `head` or
+//! `attn` (comma separated) selects parts. `attn` (with `mlp`) also shares
+//! each layer's q/k/v and o projections the same way: the head swaps the
+//! normed rows out, every rank projects its share of the output rows, the
+//! head joins them and runs the rest of attention alone, swaps the attention
+//! rows out for o_proj, and joins that (four more swaps a layer for most of
+//! the head's remaining weight reads). Both ranks must run the same value
 //! (`model::startup_parity`).
 //!
 //! `ATLAS_GLM_DRAFT_TP_BATCH=1` (with the switch above, default off) splits
@@ -39,15 +46,16 @@
 //! propose and walks them as the first swaps of the plan.
 //!
 //! `ATLAS_GLM_DRAFT_TP_TOPK=1` (with the head split, default off) swaps
-//! each rank's candidate lists instead of its logits in a single-sequence
-//! propose (`Swap::Candidates`): each rank reduces its share of the
-//! vocabulary to every row's exact top-16 on the device
-//! (`dflash2_selector_topk`), the worker sends its lists (1 KiB at gamma 8,
-//! where the logits half is 1.2 MiB and crosses the pair through the host),
-//! and the head merges the two lists of each row and walks the selector
-//! chain (`dflash2_selector_walk`). Each list is exact in the selector's
-//! total order, so the drafts are the unsplit selector's. A batched propose
-//! keeps the logits swap: its selector reads the joined logits.
+//! each rank's candidate lists instead of its logits (`Swap::Candidates`):
+//! each rank reduces its share of the vocabulary to every row's exact top-16
+//! on the device (`dflash2_selector_topk`, one launch a sequence), the
+//! workers send their lists (1 KiB a rank at gamma 8, where the logits half
+//! is 1.2 MiB and crosses the pair through the host), and the head merges
+//! every rank's lists of each row and walks each sequence's selector chain
+//! (`dflash2_selector_walk`, `_ranks` on the chain). Each list is exact in
+//! the selector's total order, so the drafts are the unsplit selector's. A
+//! batched propose (`ATLAS_GLM_DRAFT_TP_BATCH`) swaps its B sequences' lists
+//! the same way, and its selector walks them in place of the joined logits.
 //!
 //! Prior art: splitting the drafter across both ranks follows MiaAI-Lab's
 //! `DFLASH_DRAFT_TP=2` (<https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks>
@@ -55,109 +63,27 @@
 //! no code. The output-row share on 16-row CTA boundaries, swapped over the
 //! RDMA pair with bit-identical drafts, is ours (docs/glm-prior-art.md).
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle};
 
 #[path = "rank_split_exec.rs"]
 mod exec;
 pub use exec::RankSplit;
-pub(crate) use exec::{CtxSeq, CtxTurn};
+pub(crate) use exec::{CtxSeq, CtxTurn, TopkSelect};
 
 #[path = "rank_split_ctx.rs"]
 mod ctx;
 pub(crate) use ctx::CtxRows;
 use ctx::ctx_steps;
-pub use ctx::{announce_word, ctx_requested};
+pub use ctx::{announce_extra, announce_word, ctx_requested, extra_follows};
 
-/// What the worker shares.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Parts {
-    /// Each layer's gate/up and down projections.
-    pub mlp: bool,
-    /// The vocabulary head.
-    pub head: bool,
-}
-
-/// Bytes per row of a `Swap::Candidates` payload: one row's top-K list, f32
-/// values and u32 ids (`ops::dflash2_selector_lists_bytes`).
-const CANDIDATE_ROW_BYTES: usize = 8 * crate::layers::ops::DFLASH2_SELECTOR_MAX_TOP_K;
-
-impl Parts {
-    /// `1` = every part, else a comma list of `mlp` and `head`; unset, empty
-    /// or `0` = off. Anything else is refused: a typo must not run unsplit
-    /// on one rank.
-    pub(crate) fn parse(value: Option<&str>) -> Result<Option<Self>> {
-        let all = Self {
-            mlp: true,
-            head: true,
-        };
-        match value.map(str::trim) {
-            None | Some("") | Some("0") => Ok(None),
-            Some("1") => Ok(Some(all)),
-            Some(list) => {
-                let mut parts = Self {
-                    mlp: false,
-                    head: false,
-                };
-                for part in list.split(',') {
-                    match part.trim() {
-                        "mlp" => parts.mlp = true,
-                        "head" => parts.head = true,
-                        other => bail!("ATLAS_GLM_DRAFT_TP: unknown part '{other}' in '{list}'"),
-                    }
-                }
-                Ok(Some(parts))
-            }
-        }
-    }
-
-    /// The value both ranks must agree on (0 = off).
-    pub(crate) fn word(parts: Option<Self>) -> u64 {
-        parts.map_or(0, |p| p.mlp as u64 | (p.head as u64) << 1)
-    }
-}
-
-/// `ATLAS_GLM_DRAFT_TP`, from the profile both ranks share.
-pub fn requested() -> Result<Option<Parts>> {
-    Parts::parse(std::env::var("ATLAS_GLM_DRAFT_TP").ok().as_deref())
-}
-
-/// `ATLAS_GLM_DRAFT_TP_BATCH`: `1` splits batched proposes too; unset, empty
-/// or `0` = off; anything else is refused.
-pub(crate) fn parse_batch(value: Option<&str>) -> Result<bool> {
-    match value.map(str::trim) {
-        None | Some("") | Some("0") => Ok(false),
-        Some("1") => Ok(true),
-        Some(other) => bail!("ATLAS_GLM_DRAFT_TP_BATCH must be 0 or 1, got '{other}'"),
-    }
-}
-
-/// `ATLAS_GLM_DRAFT_TP_BATCH`, from the profile both ranks share.
-pub fn batch_requested() -> Result<bool> {
-    parse_batch(std::env::var("ATLAS_GLM_DRAFT_TP_BATCH").ok().as_deref())
-}
-
-/// `ATLAS_GLM_DRAFT_TP_TOPK`: `1` swaps candidate lists instead of logits;
-/// unset, empty or `0` = off; anything else is refused.
-pub(crate) fn parse_topk(value: Option<&str>) -> Result<bool> {
-    match value.map(str::trim) {
-        None | Some("") | Some("0") => Ok(false),
-        Some("1") => Ok(true),
-        Some(other) => bail!("ATLAS_GLM_DRAFT_TP_TOPK must be 0 or 1, got '{other}'"),
-    }
-}
-
-/// `ATLAS_GLM_DRAFT_TP_TOPK`, from the profile both ranks share.
-pub fn topk_requested() -> Result<bool> {
-    parse_topk(std::env::var("ATLAS_GLM_DRAFT_TP_TOPK").ok().as_deref())
-}
-
-/// The value both ranks must agree on: [`Parts::word`], plus bit 2 for the
-/// batched split, bit 3 for the context split and bit 4 for the candidate
-/// swap (so the word is unchanged with them off).
-pub(crate) fn parity_word(parts: Option<Parts>, batch: bool, ctx: bool, topk: bool) -> u64 {
-    Parts::word(parts) | (batch as u64) << 2 | (ctx as u64) << 3 | (topk as u64) << 4
-}
+#[path = "rank_split_parts.rs"]
+mod parts;
+use parts::CANDIDATE_ROW_BYTES;
+pub(crate) use parts::parity_word;
+pub use parts::{Parts, batch_requested, requested, topk_requested};
+#[cfg(test)]
+pub(crate) use parts::{parse_batch, parse_topk};
 
 /// Where a propose's whole rows live on a rank: the MLP input and final-norm
 /// rows (`norm`), the gated activation (`inter`), the down projection the
@@ -176,6 +102,13 @@ pub(crate) struct Frame {
     pub ctx_in: DevicePtr,
     pub ctx_fc: DevicePtr,
     pub ctx_kv: DevicePtr,
+    /// The `attn` part: where the head's q/k/v projections land, the
+    /// attention rows o_proj reads, and o_proj's output.
+    pub q: DevicePtr,
+    pub k: DevicePtr,
+    pub v: DevicePtr,
+    pub attn: DevicePtr,
+    pub attn_proj: DevicePtr,
 }
 
 impl Frame {
@@ -188,6 +121,11 @@ impl Frame {
             ctx_in: DevicePtr::NULL,
             ctx_fc: scratch.fc_proj,
             ctx_kv: scratch.fused_kv_out,
+            q: scratch.q_buf,
+            k: scratch.k_buf,
+            v: scratch.v_buf,
+            attn: scratch.attn_out,
+            attn_proj: scratch.stream_acc,
         }
     }
 }
@@ -197,22 +135,30 @@ impl Frame {
 pub(crate) enum Swap {
     /// Layer input of the MLP (the post-attention norm), head to worker.
     Input(usize),
-    /// Each rank's half of the SiLU-gated activation.
+    /// Each rank's share of the SiLU-gated activation.
     Activation(usize),
-    /// Each rank's half of the down projection; the head keeps both.
+    /// Each rank's share of the down projection; the head keeps them all.
     Output(usize),
     /// The final-norm rows, head to worker.
     Hidden,
-    /// Each rank's half of the vocabulary logits; the head keeps both.
+    /// Each rank's share of the vocabulary logits; the head keeps them all.
     Logits,
-    /// The worker's top-K candidate lists of its half, to the head.
+    /// The workers' top-K candidate lists of their shares, to the head.
     Candidates,
     /// Context append `i`'s input rows, head to worker.
     CtxInput(usize),
-    /// Each rank's half of its `fc` rows; both keep both.
+    /// Each rank's share of its `fc` rows; every rank keeps them all.
     CtxHidden(usize),
-    /// Each rank's half of its fused K/V rows; the head keeps both.
+    /// Each rank's share of its fused K/V rows; the head keeps them all.
     CtxKv(usize),
+    /// `attn`: the layer's normed input rows, head to worker.
+    AttnIn(usize),
+    /// `attn`: each rank's shares of q, k and v; the head keeps them all.
+    Qkv(usize),
+    /// `attn`: the attention rows o_proj reads, head to worker.
+    AttnOut(usize),
+    /// `attn`: each rank's share of o_proj; the head keeps them all.
+    OProj(usize),
 }
 
 /// Stream work between two swaps.
@@ -224,9 +170,9 @@ pub(crate) enum Piece {
     Post(usize),
     /// o_proj, residual and the MLP input norm (head only).
     Project(usize),
-    /// This rank's half of gate and up, SiLU-gated.
+    /// This rank's share of gate and up, SiLU-gated.
     GateUp(usize),
-    /// This rank's half of the down projection.
+    /// This rank's share of the down projection.
     Down(usize),
     /// The MLP residual (head only).
     Residual(usize),
@@ -234,20 +180,30 @@ pub(crate) enum Piece {
     Tail,
     /// The final norm (head only).
     Norm,
-    /// This rank's half of the vocabulary projection.
+    /// This rank's share of the vocabulary projection.
     Vocab,
-    /// Every row's top-K candidates of this rank's half (the head also
+    /// Every row's top-K candidates of this rank's share (the head also
     /// projects the selector's hidden rows).
     TopK,
     /// Draft selection over the joined logits, or over both ranks'
     /// candidate lists (head only).
     Select,
-    /// This rank's half of context append `i`'s `fc` projection.
+    /// This rank's share of context append `i`'s `fc` projection.
     CtxFc(usize),
-    /// `hidden_norm` over the joined `fc` rows (both ranks).
+    /// `hidden_norm` over the joined `fc` rows (every rank).
     CtxNorm(usize),
-    /// This rank's half of context append `i`'s fused K/V projection.
+    /// This rank's share of context append `i`'s fused K/V projection.
     CtxKv(usize),
+    /// `attn`: the input norm and attention conv (head only).
+    AttnPre(usize),
+    /// `attn`: this rank's shares of the q, k and v projections.
+    Qkv(usize),
+    /// `attn`: q/k norms, RoPE, the cache write and attention (head only).
+    AttnCore(usize),
+    /// `attn`: this rank's share of o_proj.
+    OProj(usize),
+    /// `attn`: o_proj's residual and the MLP input norm (head only).
+    ProjectRest(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,7 +212,7 @@ pub(crate) enum Step {
     Swap(Swap),
 }
 
-/// The shapes a split is planned from; identical on both ranks.
+/// The shapes a split is planned from; identical on every rank.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Geometry {
     pub gamma: usize,
@@ -274,27 +230,44 @@ pub(crate) struct Geometry {
     /// `ATLAS_GLM_DRAFT_TP_TOPK`: the head split swaps candidate lists, not
     /// logits (single-sequence proposes only).
     pub topk: bool,
+    /// The ranks sharing the propose: 2 (the pair) or 4 (the chain).
+    pub ranks: usize,
+    /// The attention projections' widths (`attn`).
+    pub q_dim: usize,
+    pub kv_dim: usize,
 }
 
-/// Output rows a tensor-core GEMV CTA owns. A half starts on a CTA boundary,
+/// Output rows a tensor-core GEMV CTA owns. A share starts on a CTA boundary,
 /// so its launch runs exactly the CTAs the unsplit launch runs for its rows.
 const CTA_ROWS: usize = 16;
 
-/// Rank `rank`'s contiguous share of `n` output rows: `(first, rows)`. Rank 0
-/// takes the rows below the largest CTA boundary at or under `n / 2`, rank 1
-/// the rest.
-pub(crate) fn half(n: usize, rank: usize) -> (usize, usize) {
-    let cut = n / 2 / CTA_ROWS * CTA_ROWS;
-    if rank == 0 { (0, cut) } else { (cut, n - cut) }
+/// Rank `rank`'s contiguous share of `n` output rows of `ranks`: `(first,
+/// rows)`. Rank `r` starts at the largest CTA boundary at or under `r * n /
+/// ranks` and the last takes the rest (on the pair: rank 0 the rows below
+/// the boundary at or under `n / 2`, rank 1 the rest).
+pub(crate) fn share(n: usize, rank: usize, ranks: usize) -> (usize, usize) {
+    let cut = |r: usize| {
+        if r == ranks {
+            n
+        } else {
+            n * r / ranks / CTA_ROWS * CTA_ROWS
+        }
+    };
+    (cut(rank), cut(rank + 1) - cut(rank))
+}
+
+/// The widest of the `ranks` shares of `n` rows.
+pub(crate) fn widest(n: usize, ranks: usize) -> usize {
+    (0..ranks).map(|r| share(n, r, ranks).1).max().unwrap_or(n)
 }
 
 impl Geometry {
     /// This plan for a propose of `rows` rows (`gamma` is the rows of a
-    /// propose: a batched one runs B×gamma, and swaps logits).
+    /// propose: a batched one runs B×gamma).
     pub(crate) fn with_rows(&self, rows: usize) -> Self {
         Self {
             gamma: rows,
-            topk: self.topk && rows == self.gamma,
+            topk: self.topk && rows.is_multiple_of(self.gamma),
             ..*self
         }
     }
@@ -307,35 +280,63 @@ impl Geometry {
             "ATLAS_GLM_DRAFT_TP: nothing to split ({self:?})"
         );
         ensure!(
+            matches!(self.ranks, 2 | 4),
+            "ATLAS_GLM_DRAFT_TP splits over the pair or the chain ({self:?})"
+        );
+        ensure!(
             self.hidden.is_multiple_of(32) && self.inter.is_multiple_of(32),
             "ATLAS_GLM_DRAFT_TP needs hidden and intermediate sizes in multiples of 32 ({self:?})"
         );
         ensure!(
-            self.vocab >= 2 * CTA_ROWS,
-            "ATLAS_GLM_DRAFT_TP: drafter vocabulary too small to split ({})",
-            self.vocab
+            !self.parts.attn
+                || self.parts.mlp
+                    && self.q_dim.is_multiple_of(32)
+                    && self.kv_dim.is_multiple_of(32)
+                    && self.q_dim >= self.ranks * CTA_ROWS
+                    && self.kv_dim >= self.ranks * CTA_ROWS,
+            "ATLAS_GLM_DRAFT_TP attn needs mlp and projections the shares can serve ({self:?})"
+        );
+        let shares = self.ranks * CTA_ROWS;
+        ensure!(
+            self.vocab >= shares && self.hidden >= shares && self.inter >= shares,
+            "ATLAS_GLM_DRAFT_TP: drafter too small to split {} ways ({self:?})",
+            self.ranks
         );
         ensure!(
             (self.ctx_in, self.ctx_kv) == (0, 0)
-                || self.ctx_in > 0 && self.ctx_in.is_multiple_of(32) && self.ctx_kv >= 2 * CTA_ROWS,
+                || self.ctx_in > 0 && self.ctx_in.is_multiple_of(32) && self.ctx_kv >= shares,
             "ATLAS_GLM_DRAFT_TP_CTX: context projections the shares cannot serve ({self:?})"
         );
         Ok(())
     }
 
-    /// BF16 values per row of a swap's payload: both ranks send the larger
-    /// share's width (the smaller share's tail is unused).
+    /// BF16 values per row of a swap's payload: every rank sends the widest
+    /// share's width (a narrower share's tail is unused).
     fn width(&self, swap: Swap) -> usize {
+        let widest = |n| widest(n, self.ranks);
         match swap {
             Swap::Input(_) | Swap::Hidden => self.hidden,
-            Swap::Activation(_) => half(self.inter, 1).1,
-            Swap::Output(_) => half(self.hidden, 1).1,
-            Swap::Logits => half(self.vocab, 1).1,
+            Swap::Activation(_) => widest(self.inter),
+            Swap::Output(_) => widest(self.hidden),
+            Swap::Logits => widest(self.vocab),
             Swap::Candidates => CANDIDATE_ROW_BYTES / 2,
             Swap::CtxInput(_) => self.ctx_in,
-            Swap::CtxHidden(_) => half(self.hidden, 1).1,
-            Swap::CtxKv(_) => half(self.ctx_kv, 1).1,
+            Swap::CtxHidden(_) => widest(self.hidden),
+            Swap::CtxKv(_) => widest(self.ctx_kv),
+            Swap::AttnIn(_) => self.hidden,
+            Swap::Qkv(_) => widest(self.q_dim) + 2 * widest(self.kv_dim),
+            Swap::AttnOut(_) => self.q_dim,
+            Swap::OProj(_) => widest(self.hidden),
         }
+    }
+
+    /// Whether `swap` carries the head's rows out (the pair's one-way
+    /// exchange, the chain's broadcast) rather than every rank's share.
+    pub(crate) fn from_head(swap: Swap) -> bool {
+        matches!(
+            swap,
+            Swap::Input(_) | Swap::Hidden | Swap::CtxInput(_) | Swap::AttnIn(_) | Swap::AttnOut(_)
+        )
     }
 
     /// The rows a swap carries: a context append's own, else the propose's.
@@ -360,7 +361,7 @@ impl Geometry {
     }
 
     /// Rank `rank`'s walk of the layers and tail. Rank 0 runs the whole
-    /// propose forward; rank 1 only its halves.
+    /// propose forward; the other ranks only their shares.
     pub(crate) fn layer_steps(&self, rank: usize) -> Vec<Step> {
         use Piece::*;
         let head = rank == 0;
@@ -374,12 +375,26 @@ impl Geometry {
         let both = |steps: &mut Vec<Step>, piece| steps.push(Step::Run(piece));
         let swap = |steps: &mut Vec<Step>, swap| steps.push(Step::Swap(swap));
         for l in 0..self.layers {
-            own(&mut steps, Attention(l));
+            if self.parts.attn {
+                own(&mut steps, AttnPre(l));
+                swap(&mut steps, Swap::AttnIn(l));
+                both(&mut steps, Qkv(l));
+                swap(&mut steps, Swap::Qkv(l));
+                own(&mut steps, AttnCore(l));
+                swap(&mut steps, Swap::AttnOut(l));
+                both(&mut steps, OProj(l));
+                swap(&mut steps, Swap::OProj(l));
+                own(&mut steps, ProjectRest(l));
+            } else {
+                own(&mut steps, Attention(l));
+            }
             if !self.parts.mlp {
                 own(&mut steps, Post(l));
                 continue;
             }
-            own(&mut steps, Project(l));
+            if !self.parts.attn {
+                own(&mut steps, Project(l));
+            }
             swap(&mut steps, Swap::Input(l));
             both(&mut steps, GateUp(l));
             swap(&mut steps, Swap::Activation(l));
@@ -404,7 +419,7 @@ impl Geometry {
         steps
     }
 
-    /// The swaps of a propose, in order: the same list on both ranks.
+    /// The swaps of a propose, in order: the same list on every rank.
     pub(crate) fn swaps(&self) -> Vec<Swap> {
         swaps_of(&self.steps(1))
     }
@@ -420,73 +435,9 @@ pub(crate) fn swaps_of(steps: &[Step]) -> Vec<Swap> {
         .collect()
 }
 
-/// What a walk does at each step.
-pub(crate) trait SplitOps {
-    fn piece(&self, piece: Piece) -> Result<()>;
-    fn swap(&self, swap: Swap) -> Result<()>;
-}
-
-/// How the runs of pieces between swaps execute.
-pub(crate) enum Graphs<'a> {
-    /// Launch every piece.
-    Eager,
-    /// Capture each run as one graph (pushed here) and launch it.
-    Capture(&'a mut Vec<GraphHandle>),
-    /// Launch the graph captured for each run (a zero handle runs eagerly).
-    Replay(&'a [GraphHandle]),
-}
-
-/// Graphs a walk of `steps` captures: one per swap, plus one.
-pub(crate) fn run_count(steps: &[Step]) -> usize {
-    swaps_of(steps).len() + 1
-}
-
-/// Walk `steps` on `stream`: each run of pieces, then the swap after it.
-/// Swaps are never captured (the pair exchange refuses a capturing stream).
-pub(crate) fn walk(
-    steps: &[Step],
-    mut graphs: Graphs<'_>,
-    gpu: &dyn GpuBackend,
-    stream: u64,
-    ops: &dyn SplitOps,
-) -> Result<()> {
-    let eager = |run: &[Step]| -> Result<()> {
-        run.iter().try_for_each(|s| match s {
-            Step::Run(piece) => ops.piece(*piece),
-            Step::Swap(_) => unreachable!("a run holds pieces only"),
-        })
-    };
-    // `split` drops the separators: swap `index - 1` precedes run `index`.
-    let swaps = swaps_of(steps);
-    for (index, run) in steps.split(|s| matches!(s, Step::Swap(_))).enumerate() {
-        if index > 0 {
-            ops.swap(swaps[index - 1])?;
-        }
-        match &mut graphs {
-            Graphs::Eager => eager(run)?,
-            Graphs::Replay(handles) => match handles.get(index) {
-                Some(g) if g.0 != 0 => gpu.launch_graph(*g, stream)?,
-                _ => eager(run)?,
-            },
-            Graphs::Capture(out) => {
-                gpu.begin_capture(stream)?;
-                if let Err(e) = eager(run) {
-                    gpu.abort_capture_if_active(stream);
-                    return Err(e);
-                }
-                let graph = gpu.end_capture(stream)?;
-                out.push(graph);
-                // An empty capture replays eagerly, as the unsplit path does.
-                if graph.0 != 0 {
-                    gpu.launch_graph(graph, stream)?;
-                } else {
-                    eager(run)?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
+#[path = "rank_split_walk.rs"]
+mod walk;
+pub(crate) use walk::{Graphs, SplitOps, run_count, walk};
 
 #[cfg(test)]
 #[path = "rank_split_tests.rs"]

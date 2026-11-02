@@ -55,16 +55,25 @@ fn glm_sparse_decode_build_accepts_only_the_long_context_dflash_lane() {
 
 #[test]
 fn glm_sparse_decode_build_rejects_wrong_rank_geometry() {
-    for variant in 0..4 {
+    for variant in 0..6 {
         let mut c = config();
         match variant {
             0 => c.model_type = "other".into(),
             1 => c.tp_world_size = 1,
             2 => c.ep_world_size = 1,
+            3 => c.num_attention_heads = 16,
+            4 => (c.tp_world_size, c.ep_world_size) = (4, 4),
             _ => c.num_attention_heads = 64,
         }
         assert!(policy(&c).validate(true, true).is_err());
     }
+}
+
+#[test]
+fn glm_sparse_decode_build_accepts_the_tp4_chain() {
+    let mut c = config();
+    (c.tp_world_size, c.ep_world_size, c.num_attention_heads) = (4, 4, 16);
+    assert!(policy(&c).validate(true, true).is_ok());
 }
 
 #[test]

@@ -10,18 +10,20 @@ use super::super::super::types::TransformerModel;
 use crate::layer::ForwardContext;
 use crate::traits::SequenceState;
 
-/// Admission of the piecewise path. `eager_only` folds every reason the step
-/// must stay eager or already takes a whole-step graph; all inputs are
-/// rank-identical (shared profile, broadcast width, model config).
+/// Admission of the piecewise path: the TP2 pair or the TP4 chain.
+/// `eager_only` folds every reason the step must stay eager or already takes
+/// a whole-step graph; all inputs are rank-identical (shared profile,
+/// broadcast width, model config).
 pub(super) fn admitted(requested: bool, model_type: &str, tp: usize, eager_only: bool) -> bool {
-    requested && model_type == "glm5_next" && tp == 2 && !eager_only
+    requested && model_type == "glm5_next" && matches!(tp, 2 | 4) && !eager_only
 }
 
 /// Rank-local diagnostics that sync or read back inside a KDA run, which
 /// would refuse every key: the DFlash capture trace and the MoE's
 /// `tracing` DEBUG readbacks (they key on `ctx.graph_capture`, which pieces
-/// leave false). Rank-local is safe: collectives are never captured, so a
-/// rank that stays eager still issues the same collective calls.
+/// leave false). Rank-local is safe: a rank that stays eager still issues the
+/// same collective calls (a captured one is the one-shot its eager call
+/// takes).
 pub(super) fn diagnostics_sync() -> bool {
     tracing::level_filters::LevelFilter::current() >= tracing::Level::DEBUG
         || std::env::var("ATLAS_DFLASH_CAPTURE_TRACE").as_deref() == Ok("1")
@@ -126,11 +128,13 @@ mod tests {
     use super::admitted;
 
     #[test]
-    fn opt_in_glm_tp2_only() {
-        assert!(admitted(true, "glm5_next", 2, false));
-        assert!(!admitted(false, "glm5_next", 2, false));
-        assert!(!admitted(true, "glm5_next", 2, true));
-        for tp in [1, 4] {
+    fn opt_in_glm_tp2_and_tp4_only() {
+        for tp in [2, 4] {
+            assert!(admitted(true, "glm5_next", tp, false));
+            assert!(!admitted(false, "glm5_next", tp, false));
+            assert!(!admitted(true, "glm5_next", tp, true));
+        }
+        for tp in [1, 8] {
             assert!(!admitted(true, "glm5_next", tp, false));
         }
         for model in ["qwen3", "deepseek_v4", ""] {

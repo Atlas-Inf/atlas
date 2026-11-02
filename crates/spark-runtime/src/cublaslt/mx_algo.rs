@@ -223,7 +223,7 @@ pub(super) fn matmul(
             out as *mut c_void,
             p.ld,
             algo.as_ptr() as *const c_void,
-            ctx.workspace as *mut c_void,
+            ctx.workspace()? as *mut c_void,
             ctx.ws_size,
             stream as *mut c_void,
         )

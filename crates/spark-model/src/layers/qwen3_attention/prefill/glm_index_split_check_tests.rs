@@ -69,7 +69,7 @@ fn check(
             scratch,
             inputs: [(query, 7), (weights, 7)],
         };
-        split(ROWS, 1, true).exchange(&owner, 3, ctx, 7)
+        split(ROWS, 1, true).exchange(&owner, 3, false, None, ctx, 7)
     });
     let sent = pair.calls().into_iter().skip(2);
     let sent = sent.map(|(send, dst, add, sent)| {

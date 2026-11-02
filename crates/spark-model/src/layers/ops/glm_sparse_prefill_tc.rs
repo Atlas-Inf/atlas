@@ -60,6 +60,35 @@ const PIPE: &str = "ATLAS_GLM_SPARSE_PREFILL_PIPE";
 /// requires 16-token cache blocks and returns without writing otherwise.
 const PIPE_SLOTS: u32 = 2080;
 
+/// Opt-in (not bit-exact) two-warpgroup 16-head pipe: each warpgroup takes
+/// half of a token's key tiles, merged at the end (`_pipe_wg2`).
+const PIPE_WG2: &str = "ATLAS_GLM_SPARSE_PIPE_WG2";
+
+/// The 16-head body of a 32-head entry point, for a TP4 rank's local heads,
+/// with its threads and shared bytes (`None`: the entry point's): the
+/// 32-head kernel's first 16 heads bit for bit, its work spread over every
+/// warp, or with `wg2` two warpgroups over halves of the key tiles. The
+/// other kernels serve 16 heads masked (a spread kv_pad body measured no
+/// faster: it waits on its single-buffered tile loads).
+fn for_heads(symbol: &'static str, heads: u32, wg2: bool) -> (&'static str, u32, Option<u32>) {
+    match (symbol, heads, wg2) {
+        ("glm_sparse_mla_prefill_fp8g128_head32_tc_pipe", 16, false) => {
+            ("glm_sparse_mla_prefill_fp8g128_head16_tc_pipe", 256, None)
+        }
+        ("glm_sparse_mla_prefill_fp8g128_head32_tc_pipe", 16, true) => (
+            "glm_sparse_mla_prefill_fp8g128_head16_tc_pipe_wg2",
+            512,
+            Some(96768),
+        ),
+        _ => (symbol, 256, None),
+    }
+}
+
+/// `ATLAS_GLM_SPARSE_PIPE_WG2` as set (glm5_next only).
+pub fn glm_sparse_pipe_wg2_requested(model: &str) -> Result<bool> {
+    enabled(model, PIPE_WG2)
+}
+
 fn kernel_spec(
     kv_reuse: bool,
     dtype: KvCacheDtype,
@@ -183,16 +212,36 @@ fn validate_config(config: &ModelConfig) -> Result<()> {
     Ok(())
 }
 
+/// Whether one CTA of the GLM sparse TC kernels serves `heads` local heads:
+/// TP2's 32, or TP4's 16 (every kernel masks the rows past `heads`).
+pub fn glm_sparse_tc_heads(heads: u32) -> bool {
+    matches!(heads, 16 | 32)
+}
+
+/// Whether `config` (already converted to local heads) is a GLM-5 rank the
+/// sparse TC lanes serve: the TP2/EP2 pair's 32 local heads, or the TP4/EP4
+/// chain's 16.
+pub fn glm_sparse_tc_rank(config: &ModelConfig) -> bool {
+    matches!(
+        (
+            config.tp_world_size,
+            config.ep_world_size,
+            config.num_attention_heads
+        ),
+        (2, 2, 32) | (4, 4, 16)
+    )
+}
+
 fn validate_geometry(a: &GlmSparsePrefillTc<'_>) -> Result<()> {
     validate_config(a.config)?;
     ensure!(
         matches!(a.dtype, KvCacheDtype::Bf16 | KvCacheDtype::Fp8G128)
-            && a.heads == 32
+            && glm_sparse_tc_heads(a.heads)
             && a.head_dim == 512
             && a.index_width == 2051
             && a.block_size == 16
             && a.scale == 0.0625,
-        "GLM sparse TC requires BF16 or fp8_g128, 32 heads, 2051 selected slots, block16 and scale1/16"
+        "GLM sparse TC requires BF16 or fp8_g128, 16 or 32 heads, 2051 selected slots, block16 and scale1/16"
     );
     Ok(())
 }
@@ -223,12 +272,14 @@ fn launch(
     grid_rows: u32,
 ) -> Result<()> {
     let (module, symbol, shared_mem) = kernel_spec(kv_reuse, a.dtype, pipe);
+    let wg2 = glm_sparse_pipe_wg2_requested(&a.config.model_type)?;
+    let (symbol, threads, heads_shared) = for_heads(symbol, a.heads, wg2);
     let kernel = gpu.kernel(module, symbol)?;
     ensure!(kernel.0 != 0, "GLM sparse TC prefill kernel is unavailable");
     KernelLaunch::new(gpu, kernel)
         .grid([1, grid_rows, 1])
-        .block([256, 1, 1])
-        .shared_mem(shared_mem)
+        .block([threads, 1, 1])
+        .shared_mem(heads_shared.unwrap_or(shared_mem))
         .arg_ptr(a.query)
         .arg_ptr(a.k_cache)
         .arg_ptr(a.v_cache)
@@ -318,6 +369,9 @@ pub fn initialize_glm_sparse_prefill_pipe(
         "{PIPE}=1 requires ATLAS_GLM_SPARSE_PREFILL_TC=1"
     );
     warm(gpu, config, KvCacheDtype::Fp8G128, true)?;
+    if config.num_attention_heads == 16 {
+        warm_heads(gpu, config, KvCacheDtype::Fp8G128, true, 16)?;
+    }
     tracing::info!("{PIPE}=1: pipelined fp8_g128 sparse prefill warmed before KV sizing");
     Ok(())
 }
@@ -330,6 +384,17 @@ fn initialize_decode(gpu: &dyn GpuBackend, config: &ModelConfig, enabled: bool) 
 }
 
 fn warm(gpu: &dyn GpuBackend, config: &ModelConfig, dtype: KvCacheDtype, pipe: bool) -> Result<()> {
+    warm_heads(gpu, config, dtype, pipe, 32)
+}
+
+/// [`warm`] of the kernel serving `heads` local heads.
+fn warm_heads(
+    gpu: &dyn GpuBackend,
+    config: &ModelConfig,
+    dtype: KvCacheDtype,
+    pipe: bool,
+    heads: u32,
+) -> Result<()> {
     validate_config(config)?;
     let empty = GlmSparsePrefillTc {
         config,
@@ -342,7 +407,7 @@ fn warm(gpu: &dyn GpuBackend, config: &ModelConfig, dtype: KvCacheDtype, pipe: b
         output: DevicePtr::NULL,
         block_table: DevicePtr::NULL,
         rows: 0,
-        heads: 32,
+        heads,
         head_dim: 512,
         index_width: 2051,
         block_size: 16,

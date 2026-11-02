@@ -102,7 +102,15 @@ impl TransformerModel {
             // grid; without the in-pass checkpoint the last chunk stays whole.
             let split_disabled =
                 pc_policy::tail_split_disabled() || pc_policy::rowinv_tail_unsplit(in_pass);
-            if !split_disabled && !in_pass && cut > chunk_start && cut < total {
+            // `ATLAS_TAIL_SPLIT_MIN_TOKENS` keeps a short prompt to one pass.
+            let min_tokens = if self.config.model_type == "qwen4_exp" {
+                0
+            } else {
+                pc_policy::tail_split_min_tokens()
+            };
+            if !in_pass
+                && pc_policy::tail_split_at(total, chunk_start, cut, split_disabled, min_tokens)
+            {
                 anyhow::ensure!(
                     passengers.is_none(),
                     "GLM fused chunk cannot take the tail-checkpoint split"
@@ -359,6 +367,16 @@ impl TransformerModel {
             )?;
         }
         let t_fwd = tp.elapsed();
+        if spark_runtime::host_sync_trace::enabled() {
+            self.gpu.synchronize(stream)?;
+            tracing::info!(
+                "host waits in chunk {}..{} ({:.1} ms wall): {}",
+                chunk_start,
+                chunk_start + chunk_len,
+                tp.elapsed().as_secs_f64() * 1e3,
+                spark_runtime::host_sync_trace::take_report(15)
+            );
+        }
         self.warm_trace_sync(stream)?;
         let marks = [t_lookup, t_prefix, t_blocks, t_meta, tp.elapsed()];
         // Measure the forward's true GPU execution: the launches are async, so
