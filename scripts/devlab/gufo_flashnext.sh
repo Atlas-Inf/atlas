@@ -14,7 +14,7 @@ CONTEXT=${CONTEXT:-32768}; SESSIONS=${SESSIONS:-8}
 OUT=${DEVLAB_OUT:-$PWD/devlab-out}; mkdir -p "$OUT"; RES="$OUT/RESULTS.txt"
 log() { echo "[$(date -u +%H:%M:%SZ)] $*" | tee -a "$RES"; }
 HERE=$(cd "$(dirname "$0")" && pwd)
-M=/mnt/scratch/cache/gufo-models/qwen3.8-flash-next; mkdir -p "$M"
+# Models land in the runner's HF cache ($HF_HOME; /mnt/scratch/cache itself is not writable), shared with llamacpp_gguf.sh.
 REV=38bb39ee97821de2c9009abb7e93950eec396e66
 
 # ---- build Gufo (nix in a container) -----------------------------------------------------------------------
@@ -33,12 +33,10 @@ log "gufo store path: $P"
 # ---- model (README-pinned revision, through the runner's HF mirror) ----------------------------------------
 python3 -c "import huggingface_hub" 2>/dev/null || python3 -m pip install --user -q --break-system-packages huggingface_hub
 t0=$(date +%s)
-python3 - "$M" "$REV" > "$OUT/download.log" 2>&1 <<'PY' || { log "MODEL DOWNLOAD FAILED: $(tail -2 "$OUT/download.log")"; exit 1; }
-import sys
-from huggingface_hub import snapshot_download
-snapshot_download("unsloth/Qwen3.8-Flash-Next-GGUF", revision=sys.argv[2], local_dir=sys.argv[1],
-                  allow_patterns=["UD-Q4_K_XL/*", "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"])
-PY
+python3 -c "import hf_transfer" 2>/dev/null || python3 -m pip install --user -q --break-system-packages hf_transfer
+export HF_HUB_ENABLE_HF_TRANSFER=1
+M=$(python3 -c 'import sys; from huggingface_hub import snapshot_download; print(snapshot_download("unsloth/Qwen3.8-Flash-Next-GGUF", revision=sys.argv[1], allow_patterns=["UD-Q4_K_XL/*", "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"]))' "$REV" 2>"$OUT/download.log") \
+  || { log "MODEL DOWNLOAD FAILED: $(tail -2 "$OUT/download.log")"; exit 1; }
 TGT=$(ls "$M"/UD-Q4_K_XL/*.gguf | sort | head -1); MTP="$M/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
 log "model ready in $(( $(date +%s) - t0 ))s: target $(du -shL "$M/UD-Q4_K_XL" | cut -f1) ($(basename "$TGT")), mtp $(du -shL "$MTP" 2>/dev/null | cut -f1)"
 GR=$(getent group render | cut -d: -f3); GV=$(getent group video | cut -d: -f3)
@@ -48,11 +46,11 @@ docker run --rm -v gufo-nix:/nix --device /dev/kfd --device /dev/dri --group-add
 # ---- serve + bench, AR and MTP -----------------------------------------------------------------------------
 PORT=18083
 for arm in ar mtp; do
-  extra=""; [ $arm = mtp ] && extra="--speculative mtp --mtp-model /models/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
+  extra=""; [ $arm = mtp ] && extra="--speculative mtp --mtp-model $MTP"
   docker rm -f gufo-fn >/dev/null 2>&1
   docker run -d --name gufo-fn --network host --device /dev/kfd --device /dev/dri --group-add "$GV" --group-add "$GR" \
-    --security-opt seccomp=unconfined -v gufo-nix:/nix -v "$M":/models nixos/nix:2.30.2 \
-    "$P/bin/gufo" serve --host 127.0.0.1 --port $PORT llm --think off --model "/models/UD-Q4_K_XL/$(basename "$TGT")" \
+    --security-opt seccomp=unconfined -v gufo-nix:/nix -v "${HF_HOME:-$HOME/.cache/huggingface}":"${HF_HOME:-$HOME/.cache/huggingface}":ro nixos/nix:2.30.2 \
+    "$P/bin/gufo" serve --host 127.0.0.1 --port $PORT llm --think off --model "$TGT" \
     --sessions "$SESSIONS" --context "$CONTEXT" $extra > /dev/null
   ok=0
   for _ in $(seq 1 240); do
