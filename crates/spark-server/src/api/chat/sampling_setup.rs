@@ -392,6 +392,18 @@ pub(super) fn build_sampling(
         }
     }
 
+    // A request that declares no tools bans the `<tool_call>` opener outright:
+    // a tool-describing system prompt (a client without native function
+    // calling) can otherwise make the model answer with literal markup nobody
+    // can execute — the model should answer in prose instead.
+    if !tools_active
+        && !state.reference_mode
+        && state.behavior.ban_tool_call_without_tools
+        && let Some(tc_id) = state.tool_call_start_token_id
+    {
+        logit_bias.push((tc_id, f32::NEG_INFINITY));
+    }
+
     // max_tokens cap when tools are active. Same ceiling as thinking
     // resolution (#517) — do not recompute min() here.
     let max_tokens =

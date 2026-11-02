@@ -246,4 +246,78 @@ mod tests {
             assert_eq!(tool_call_bias(9, union), -10.0);
         }
     }
+
+    /// A request declaring NO tools bans the `<tool_call>` opener when the
+    /// model opts in (`ban_tool_call_without_tools`): the model answers in
+    /// prose instead of literal markup nobody can execute.
+    #[test]
+    fn ban_tool_call_without_tools_bans_the_opener_without_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let vocab = [("[UNK]".to_string(), 0), ("<tool_call>".to_string(), 1)];
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(vocab.into_iter().collect())
+            .unk_token("[UNK]".into())
+            .build()
+            .unwrap();
+        tokenizers::Tokenizer::new(model)
+            .save(dir.path().join("tokenizer.json"), false)
+            .unwrap();
+        let no_tools: crate::ir::ChatRequest =
+            serde_json::from_value::<crate::openai::ChatCompletionRequest>(serde_json::json!({
+                "model": "fixture",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .unwrap()
+            .into();
+        let with_tools: crate::ir::ChatRequest =
+            serde_json::from_value::<crate::openai::ChatCompletionRequest>(serde_json::json!({
+                "model": "fixture",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {"name": "f",
+                    "parameters": {"type": "object", "properties": {}}}}],
+            }))
+            .unwrap()
+            .into();
+        let bias = |req: &crate::ir::ChatRequest, tools: bool, reference: bool| {
+            let tokenizer = crate::tokenizer::ChatTokenizer::from_model_dir(
+                dir.path(),
+                0,
+                false,
+                "qwen4_exp",
+                "",
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+            let mut state = crate::api::test_app_state::app_state(tokenizer);
+            state.tool_call_start_token_id = Some(1);
+            state.behavior.ban_tool_call_without_tools = true;
+            state.reference_mode = reference;
+            let state = std::sync::Arc::new(state);
+            super::super::build_sampling(&state, req, false, tools, false, 0)
+                .expect("sampling setup")
+                .logit_bias
+        };
+        assert_eq!(bias(&no_tools, false, false), [(1, f32::NEG_INFINITY)]);
+        assert!(
+            !bias(&with_tools, true, false)
+                .iter()
+                .any(|(_, b)| b.is_infinite())
+        );
+        assert!(
+            !bias(&no_tools, false, true)
+                .iter()
+                .any(|(_, b)| b.is_infinite())
+        );
+    }
+
+    /// The qwen3.8-flash-next target ships the opt-in on.
+    #[test]
+    fn qwen38_flash_next_target_bans_the_tool_call_opener_without_tools() {
+        const TARGET: &str = "../../kernels/gb10/qwen3.8-flash-next";
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(TARGET);
+        let b = crate::api::test_app_state::build_behavior::parse_behavior(&dir);
+        assert!(b.ban_tool_call_without_tools);
+    }
 }

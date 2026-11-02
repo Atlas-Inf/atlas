@@ -440,3 +440,10 @@ max_inter_tool_prose = 0
 # other engines; clients bound it there.
 enable_loop_watchdog = false
 enable_stream_loop_guards = false
+
+# 2026-11-02: on the pair (job tcrepro), a request declaring NO tools whose
+# system prompt describes tool abilities — clients without native function
+# calling — produced literal `<tool_call>` content 8/8 on rc16 and 6/8 in
+# spark mode. Banning the opener restores a prose answer. vLLM does not do
+# this.
+ban_tool_call_without_tools = true

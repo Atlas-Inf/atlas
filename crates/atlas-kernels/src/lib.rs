@@ -396,6 +396,10 @@ pub struct ModelBehavior {
     /// The template gets `reasoning_effort` verbatim (`minimal`, `xhigh`, `max`),
     /// as vLLM hands it. Default `false`: `low`/`medium`/`high`/`xhigh`.
     pub verbatim_reasoning_effort: bool,
+    /// A request that declares no tools bans the `<tool_call>` start token, so
+    /// a tool-describing system prompt cannot make the model answer with
+    /// literal markup nobody can execute. Default `false`.
+    pub ban_tool_call_without_tools: bool,
 }
 
 /// The server's thinking ceiling for a `max_thinking_budget`: 0 means none,
@@ -474,6 +478,7 @@ impl Default for ModelBehavior {
             eos_ends_thinking: false,
             tool_call_steering: true,
             verbatim_reasoning_effort: false,
+            ban_tool_call_without_tools: false,
         }
     }
 }
