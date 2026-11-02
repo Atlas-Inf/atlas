@@ -198,7 +198,9 @@ fn sh_probe(script: &str) -> Result<(Vec<u8>, String, std::process::ExitStatus)>
 #[test]
 fn a_probe_that_floods_stdout_is_killed_at_the_bound() {
     let began = std::time::Instant::now();
-    let err = sh_probe("yes").unwrap_err();
+    // `exec`, so the probe is one process as ffprobe is: dash would fork `yes`,
+    // and the orphan would hold the pipes open after `sh` is killed.
+    let err = sh_probe("exec yes").unwrap_err();
     assert!(err.to_string().contains("64 KiB"), "{err:#}");
     assert!(began.elapsed() < std::time::Duration::from_secs(4));
 }
