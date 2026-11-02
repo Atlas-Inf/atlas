@@ -3,14 +3,14 @@
 # DevLab Strix bench: stock llama.cpp on a GGUF quant of a model, on the same serving protocol Atlas and Gufo are measured
 # with (scripts/devlab/gufo_bench.py: pp ~2048 / tg128 at depth 0/8192/16384, C 1/4/8), plus llama-bench.
 #
-#   scripts/devlab/llamacpp_gguf.sh <hf-gguf-repo> <file-glob> [KEY=VAL ...]
-#   e.g.  scripts/devlab/llamacpp_gguf.sh unsloth/Qwen3.8-Flash-Next-GGUF 'UD-Q4_K_XL/*'
+#   scripts/devlab/llamacpp_gguf.sh <hf-gguf-repo> <quant-subdir> [KEY=VAL ...]
+#   e.g.  scripts/devlab/llamacpp_gguf.sh unsloth/Qwen3.8-Flash-Next-GGUF UD-Q4_K_XL   (the workflow's args filter allows no '*')
 #   KEYS: LLAMA_REF (default latest release), REV (repo revision), CTX (default 32768), PARALLEL (default 8), OT (an -ot override;
 #         default: none, then per_layer_token_embd=CPU if the all-GPU load fails)
 # Flash-Next's n-gram embedding table (per_layer_token_embd) alone is ~100 GB in BF16; a GGUF quant plus that table may exceed
 # the 100 GB this runner maps to the GPU, so the script first tries everything on the GPU and then the CPU-resident table.
 set -uo pipefail
-REPO=${1:?gguf repo}; GLOB=${2:?file glob}
+REPO=${1:?gguf repo}; SUB=${2:?quant subdir}; GLOB="$SUB/*.gguf"
 for kv in "${@:3}"; do [[ "$kv" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9_./:,*=+-]*$ ]] && export "$kv"; done
 CTX=${CTX:-32768}; PARALLEL=${PARALLEL:-8}
 OUT=${DEVLAB_OUT:-$PWD/devlab-out}; mkdir -p "$OUT"; RES="$OUT/RESULTS.txt"
