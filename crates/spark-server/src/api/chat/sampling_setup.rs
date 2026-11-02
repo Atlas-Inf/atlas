@@ -94,6 +94,70 @@ fn tool_grammar_escape_applies(disable_tool_grammar: bool, tool_choice_required:
     disable_tool_grammar && !tool_choice_required
 }
 
+/// The `<tool_call>` logit bias by how often the same call already repeated.
+/// A tool-call-or-JSON union never takes the boost: the model's own mass
+/// picks its branch (`grammar::branch`), and a boost after a call pulls the
+/// next token toward yet another call instead of the answer.
+fn tool_call_bias(repeat_count: usize, union: bool) -> f32 {
+    match repeat_count {
+        0 | 1 if union => 0.0,
+        0 | 1 => 3.0,
+        2 => 0.0,
+        3 => -5.0,
+        _ => -10.0,
+    }
+}
+
+/// The grammar a request is decoded under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrammarChoice {
+    None,
+    /// Tools armed, tool grammar off (`tool_grammar_escape_applies`).
+    EscapeHatch,
+    /// The response_format JSON alone.
+    ResponseFormat,
+    /// The tool-call grammar alone.
+    ToolCall,
+    /// Tool calls OR the response_format JSON (`GrammarSpec::ToolCallOrJson`).
+    ToolCallOrResponseFormat,
+}
+
+/// response_format + tools coexistence. OpenAI's API allows both fields in
+/// the same request; agentic pipelines routinely set both (the model emits a
+/// tool call on turn N, then a schema-shaped final answer on turn N+1), and
+/// OpenAI and vLLM enforce the schema on that answer while still allowing
+/// tool calls:
+///   * `tool_choice="none"` (or no tools) → the response_format alone
+///     (without one, `"none"` keeps the triggered tool grammar, as ever)
+///   * `"required"`/named (or a parser-required format) → the tool grammar
+///     alone: the answer must be a call
+///   * `"auto"`/unset → their union: the first output token picks a tool
+///     call or the JSON. Enforcing only the tool grammar here let GLM wrap
+///     a correct JSON answer in ```json fences, which strict clients reject.
+///
+/// The wire's `{"type":"text"}` was mapped to `None` at the edge, so
+/// presence alone means a real constraint. The escape hatch keeps auto-mode
+/// requests unconstrained, response_format or not.
+fn grammar_choice(
+    tools_active: bool,
+    has_response_format: bool,
+    tool_choice_none: bool,
+    tool_choice_required: bool,
+    escape_hatch: bool,
+) -> GrammarChoice {
+    if has_response_format && (!tools_active || tool_choice_none) {
+        GrammarChoice::ResponseFormat
+    } else if !tools_active {
+        GrammarChoice::None
+    } else if escape_hatch {
+        GrammarChoice::EscapeHatch
+    } else if has_response_format && !tool_choice_required {
+        GrammarChoice::ToolCallOrResponseFormat
+    } else {
+        GrammarChoice::ToolCall
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::result_large_err)]
 pub(super) fn build_sampling(
@@ -293,6 +357,25 @@ pub(super) fn build_sampling(
         req.logit_bias.clone()
     };
 
+    // Tool-choice + parser-driven required mode.
+    let tool_choice_required = tool_choice_required_for_parser(
+        tools_active,
+        req.tool_choice.as_ref(),
+        state.tool_call_parser.as_ref().map(|p| p.name()),
+    );
+
+    let tool_choice_none = req
+        .tool_choice
+        .as_ref()
+        .is_some_and(|tc| matches!(tc, tool_parser::ToolChoice::Mode(m) if m == "none"));
+    let choice = grammar_choice(
+        tools_active,
+        req.response_format.is_some(),
+        tool_choice_none,
+        tool_choice_required,
+        tool_grammar_escape_applies(state.behavior.disable_tool_grammar, tool_choice_required),
+    );
+
     // Exponential `<tool_call>` bias decay. Skipped under ATLAS_FORCE_TEMP_ZERO
     // so the argmax is determined purely by raw logits (matches vLLM's path).
     if !force_temp_zero
@@ -302,12 +385,8 @@ pub(super) fn build_sampling(
         && !suppress_tool_call
         && let Some(tc_id) = state.tool_call_start_token_id
     {
-        let bias = match tool_call_repeat_count {
-            0 | 1 => 3.0,
-            2 => 0.0,
-            3 => -5.0,
-            _ => -10.0,
-        };
+        let union = choice == GrammarChoice::ToolCallOrResponseFormat;
+        let bias = tool_call_bias(tool_call_repeat_count, union);
         if bias != 0.0 {
             logit_bias.push((tc_id, bias));
         }
@@ -339,72 +418,45 @@ pub(super) fn build_sampling(
     // (post-completion open cap, prose budget, loop detectors) bound run-on.
     let stop_tokens = tokenize_stop_sequences(&state.tokenizer, &req.stop);
 
-    // Tool-choice + parser-driven required mode.
-    let tool_choice_required = tool_choice_required_for_parser(
-        tools_active,
-        req.tool_choice.as_ref(),
-        state.tool_call_parser.as_ref().map(|p| p.name()),
-    );
-
-    // response_format + tools coexistence.
-    //
-    // OpenAI's API allows both fields in the same request; agentic pipelines
-    // routinely set both (the model emits a tool call on turn N, then a
-    // schema-shaped final answer on turn N+1). XGrammar's structural-tag
-    // grammar enforces *one* shape per request, so we pick which one wins:
-    //   * `tool_choice="none"` → tools won't be called, enforce response_format
-    //   * any other tool_choice → enforce tool-call grammar; the schema text
-    //     is conventionally embedded in the user/system message by the
-    //     caller, and capable models (Qwen3.6, etc.) follow it without
-    //     server-side enforcement on free-text turns.
-    // The wire's `{"type":"text"}` was mapped to `None` at the edge, so
-    // presence alone means a real constraint.
-    let has_response_format = req.response_format.is_some();
-    let tool_choice_none = req
-        .tool_choice
-        .as_ref()
-        .is_some_and(|tc| matches!(tc, tool_parser::ToolChoice::Mode(m) if m == "none"));
-    let response_format_only = has_response_format && (!tools_active || tool_choice_none);
-
-    // Grammar spec (XGrammar structural-tag enforcement).
-    let use_triggers = !tool_choice_required;
-    let grammar_spec: Option<GrammarSpec> = if response_format_only {
-        match req.response_format.as_ref().unwrap() {
-            crate::ir::ResponseFormat::JsonObject => Some(GrammarSpec::JsonObject),
-            crate::ir::ResponseFormat::JsonSchema { schema, .. } => Some(GrammarSpec::JsonSchema {
-                schema: schema.to_string(),
-            }),
-        }
-    } else if tools_active
-        && tool_grammar_escape_applies(state.behavior.disable_tool_grammar, tool_choice_required)
-    {
+    if choice == GrammarChoice::EscapeHatch {
         // Structure-snowballing escape hatch (arXiv:2604.06066): this
         // model tool-calls more reliably unconstrained. Tool calls are
         // still parsed from the output — just not grammar-enforced.
         // Scoped to auto-mode requests; `required`/specific keep the
         // grammar that enforces them (see `tool_grammar_escape_applies`).
         tracing::info!("MODEL.toml [behavior].disable_tool_grammar=true — tool-call grammar OFF");
-        None
-    } else if tools_active {
-        if has_response_format {
-            tracing::info!(
-                "response_format + tools both set; enforcing tool-call grammar. \
-                 Schema-shape compliance falls to the model (embed schema text in \
-                 the user/system message for best results)."
-            );
-        }
-        let parser = state.tool_call_parser.as_ref().map(std::sync::Arc::clone);
+    }
+    let schema = || match req.response_format.as_ref() {
+        Some(crate::ir::ResponseFormat::JsonSchema { schema, .. }) => Some(schema.to_string()),
+        _ => None,
+    };
+    let tools = || {
         let mut tools = req.tools.clone();
         if let Some(tool_parser::ToolChoice::Specific { ref function }) = req.tool_choice {
             tools.retain(|t| t.function.name == function.name);
         }
-        parser.map(|p| GrammarSpec::ToolCall {
-            tools,
-            parser: p,
-            use_triggers,
-        })
-    } else {
-        None
+        tools
+    };
+    let parser = state.tool_call_parser.as_ref().map(Arc::clone);
+    // Grammar spec (XGrammar structural-tag enforcement).
+    let grammar_spec: Option<GrammarSpec> = match choice {
+        GrammarChoice::None | GrammarChoice::EscapeHatch => None,
+        GrammarChoice::ResponseFormat => Some(match schema() {
+            Some(schema) => GrammarSpec::JsonSchema { schema },
+            None => GrammarSpec::JsonObject,
+        }),
+        GrammarChoice::ToolCall => parser.map(|parser| GrammarSpec::ToolCall {
+            tools: tools(),
+            parser,
+            use_triggers: !tool_choice_required,
+        }),
+        GrammarChoice::ToolCallOrResponseFormat => {
+            parser.map(|parser| GrammarSpec::ToolCallOrJson {
+                tools: tools(),
+                parser,
+                schema: schema(),
+            })
+        }
     };
 
     // Timeout deadline (SSOT: AppState::request_deadline).

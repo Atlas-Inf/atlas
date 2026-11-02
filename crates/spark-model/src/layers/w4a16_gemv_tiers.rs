@@ -117,6 +117,29 @@ pub(crate) fn tc_requested() -> bool {
 static TC: std::sync::OnceLock<[KernelHandle; 3]> = std::sync::OnceLock::new();
 const TC_ROWS: [u32; 3] = [8, 16, 32];
 
+/// The function name of the tensor-core tier of `rows` (8, 16 or 32) rows,
+/// `suffix` naming a twin (`""`, `"_ld"`, `"_touch"`, `"_pair_touch"`).
+/// Under `ATLAS_GLM_CANONICAL_VERIFY` every tier is `w4a16_gemv_tc8`, which
+/// runs 9..32 rows as 8-row tiles of its own arithmetic
+/// (`layers::canonical_verify`), so a row's bits do not follow the width.
+pub fn tc_name(rows: u32, suffix: &str, canonical_target: bool) -> String {
+    let rows = if canonical_target && super::canonical_verify::requested() {
+        8
+    } else {
+        rows
+    };
+    format!("w4a16_gemv_tc{rows}{suffix}")
+}
+
+/// The loaded GLM kernel set provides the canonical 32-row sweep. A common
+/// or unrelated target must retain its original tier widths even when the
+/// process-wide canonical-verify setting is enabled. Probe only at startup.
+pub(super) fn canonical_target(gpu: &dyn GpuBackend) -> bool {
+    super::canonical_verify::requested()
+        && super::try_kernel(gpu, "kda", "kda_commit_records").0 != 0
+        && super::try_kernel(gpu, "dense_gemv_bf16_batchm", "dense_gemv_bf16_tc8_planes").0 != 0
+}
+
 /// The narrowest resolved tensor-core tier covering `m` rows, or a zero handle.
 pub fn tc_kernel(m: u32) -> KernelHandle {
     let Some(handles) = TC.get() else {
@@ -145,11 +168,12 @@ pub fn tc_ld_kernel(m: u32) -> KernelHandle {
         .map_or(KernelHandle(0), |(_, &h)| h)
 }
 
-/// Row capacity of `kernel` when it is a tensor-core tier.
+/// Row capacity of `kernel` when it is a tensor-core tier: the widest tier
+/// it serves (all three under `ATLAS_GLM_CANONICAL_VERIFY`).
 pub fn tc_rows(kernel: KernelHandle) -> Option<u32> {
     let handles = TC.get()?;
     (kernel.0 != 0)
-        .then(|| handles.iter().position(|h| h.0 == kernel.0))
+        .then(|| handles.iter().rposition(|h| h.0 == kernel.0))
         .flatten()
         .map(|i| TC_ROWS[i])
 }
@@ -189,14 +213,15 @@ impl W4a16BatchmTiers {
             *h = super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_batch{w}"));
         }
         if glm_series && tc_requested() {
+            let canonical_target = canonical_target(gpu);
             TC.get_or_init(|| {
                 TC_ROWS.map(|rows| {
-                    super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_tc{rows}"))
+                    super::try_kernel(gpu, "w4a16_gemv", &tc_name(rows, "", canonical_target))
                 })
             });
             TC_LD.get_or_init(|| {
                 TC_ROWS.map(|rows| {
-                    super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_tc{rows}_ld"))
+                    super::try_kernel(gpu, "w4a16_gemv", &tc_name(rows, "_ld", canonical_target))
                 })
             });
         }

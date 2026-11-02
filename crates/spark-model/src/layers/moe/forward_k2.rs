@@ -22,7 +22,7 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        if ctx.config.expert_tp {
+        if self.grouped_only(ctx) {
             return self.forward_prefill(input, 2, ctx, stream);
         }
         self.forward_k2_impl(input, ctx, stream, true, true, None)
@@ -63,6 +63,10 @@ impl MoeLayer {
         anyhow::ensure!(
             !ctx.config.expert_tp,
             "expert TP runs K=2 on the grouped path"
+        );
+        anyhow::ensure!(
+            !include_shared || self.shared_native.is_none(),
+            "a native shared expert runs K=2 on the grouped path"
         );
         self.btile_input_guard(input, 2, ctx, stream)?;
         if !include_shared {

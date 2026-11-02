@@ -117,6 +117,19 @@ pub(super) const GDN_D: u32 = 128;
 const GDN_REPEAT: u32 = 3;
 const GDN_DCONV: u32 = 4;
 
+/// Launch geometry of the fused GDN kernels for `nv` value heads: on gb10 a
+/// `GDN_D`-thread block per value head, grouped into clusters of `GDN_REPEAT`
+/// by `__cluster_dims__`; gfx1151 has no clusters, so its port
+/// (kernels/strix-hip/.../qwen4exp_decode_fuse.cu) runs each cluster as one
+/// `GDN_REPEAT * GDN_D`-thread block.
+pub(super) fn gdn_grid_x_block(nv: u32) -> (u32, u32) {
+    if cfg!(atlas_hip) {
+        (nv / GDN_REPEAT, GDN_REPEAT * GDN_D)
+    } else {
+        (nv, GDN_D)
+    }
+}
+
 /// `qwen4exp_gdn_decode_fused` in place of the BA gates, conv, recurrence and
 /// gated-norm launches of one decode token, when the GDN group is on and the
 /// shape fits. Returns whether it launched; on `false` nothing was launched.
@@ -147,9 +160,10 @@ pub fn gdn_decode(
     if !fits {
         return Ok(false);
     }
+    let (grid_x, block) = gdn_grid_x_block(nv);
     KernelLaunch::new(gpu, k)
-        .grid([nv, 1, 1])
-        .block([GDN_D, 1, 1])
+        .grid([grid_x, 1, 1])
+        .block([block, 1, 1])
         .arg_ptr(b.h_state)
         .arg_ptr(b.conv_state)
         .arg_ptr(b.qkvz)

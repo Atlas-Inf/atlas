@@ -19,6 +19,8 @@ pub(crate) use btile_model_owners::{
 };
 #[cfg(test)]
 pub(crate) use gate_up_repack::model_fixture as btile_model_fixture;
+#[cfg(test)]
+pub(crate) use gate_up_repack::recording as kernel_recording;
 
 /// Device-side pointer table for one projection across all experts.
 ///
@@ -234,6 +236,10 @@ mod forward_prefill_w4a4;
 pub(crate) use forward_prefill_w4a4::requested as w4a4_requested;
 mod w4a4_scales;
 pub(crate) use w4a4_scales::W4a4Scales;
+mod decode_a16;
+pub(crate) use decode_a16::{DecodeRows, PromptRows, requested as decode_a16_requested};
+mod input_scales;
+pub(crate) use input_scales::{InputScales, requested as input_scales_requested};
 mod forward_rows;
 mod forward_rows_t;
 mod forward_token_major;
@@ -247,6 +253,7 @@ mod helpers_c;
 mod helpers_shared;
 mod shared_mxfp8;
 pub(crate) use shared_mxfp8::{Mxfp8SharedExpert, requested as shared_mxfp8_requested};
+mod helpers_shared_only;
 mod route_dump;
 mod shared_fp8_cache;
 mod shared_fp8_cache_load;
@@ -254,6 +261,7 @@ mod shared_fp8_cache_output;
 #[cfg(test)]
 mod shared_fp8_cache_test_gpu;
 mod shared_fp8_origin;
+pub(crate) mod shared_native;
 pub(crate) use gate_up_m16::validate_m16_gate_up_graphs;
 pub(crate) use shared_fp8_cache::SharedFp8Reserve;
 pub(crate) use shared_fp8_cache::validate_shared_fp8_cache_factory_reserve;
@@ -263,12 +271,15 @@ mod init;
 mod init_batched;
 mod init_ctor;
 mod init_optional;
+mod init_router;
 mod init_t_rows;
 mod inplace_transpose;
 mod m5_projection_oracle;
 mod m5_projections;
 mod mmq_layout;
+mod route_fuse;
 mod router_bn4;
+pub(crate) use route_fuse::route_fuse_requested;
 mod router_prefill_bn32;
 mod shared_fp8_cache_bytes;
 mod shared_m16;

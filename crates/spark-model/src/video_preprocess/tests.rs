@@ -11,10 +11,12 @@ use crate::video_decode_ffmpeg::FfmpegPolicy;
 
 /// The default: no subprocess. Every GIF case must pass without it, which is
 /// the guarantee that the pure-Rust path is not quietly depending on ffmpeg.
+#[allow(dead_code)]
 fn no_ffmpeg() -> FfmpegPolicy {
     FfmpegPolicy::default()
 }
 
+#[allow(dead_code)]
 fn cfg() -> VisionConfig {
     VisionConfig {
         is_glm5_next: false,
@@ -179,6 +181,7 @@ fn glm5_sampling_plans_whole_temporal_groups() {
 // ── decode + grouping, against a real generated GIF ──────────────────────
 
 /// Build an animated GIF of `n` solid-color frames at `size`x`size`.
+#[allow(dead_code)]
 fn make_gif(n: u16, size: u16) -> String {
     use image::codecs::gif::GifEncoder;
     use image::{Delay, Frame, RgbaImage};
@@ -240,6 +243,35 @@ fn grouping_produces_correctly_shaped_buffers() {
     for (i, g) in v.groups.iter().enumerate() {
         assert_eq!(g.len(), expect, "group {i} is the wrong length");
     }
+}
+
+#[test]
+fn qwen_odd_clip_repeats_only_the_final_temporal_slot() {
+    let uri = make_gif(3, 64);
+    let v = preprocess_video(&uri, &cfg(), None, 10.0, &no_ffmpeg()).expect("preprocess");
+    assert_eq!(
+        v.grid_t, 2,
+        "Qwen patchify pads 3 frames to two temporal groups"
+    );
+    assert_eq!(v.groups.len(), 2);
+    let ps = 16usize;
+    let last = &v.groups[1];
+    assert_eq!(
+        last[0],
+        last[ps * ps],
+        "only the final temporal slot is padded"
+    );
+    assert!((v.timestamps[1] - 0.2).abs() < 0.001, "{:?}", v.timestamps);
+}
+
+#[test]
+fn qwen_video_timestamps_average_each_temporal_pair() {
+    let uri = make_gif(4, 64);
+    let v = preprocess_video(&uri, &cfg(), None, 10.0, &no_ffmpeg()).expect("preprocess");
+    assert_eq!(v.grid_t, 2);
+    assert_eq!(v.timestamps.len(), 2);
+    assert!((v.timestamps[0] - 0.05).abs() < 0.001, "{:?}", v.timestamps);
+    assert!((v.timestamps[1] - 0.25).abs() < 0.001, "{:?}", v.timestamps);
 }
 
 /// Token accounting, which is what the prompt-side pad run must match.
@@ -320,16 +352,6 @@ fn an_mp4_is_refused_by_name_with_a_conversion_hint() {
 }
 
 #[test]
-fn a_single_frame_gif_is_refused_rather_than_treated_as_a_still() {
-    let uri = make_gif(1, 64);
-    let err = format!(
-        "{:#}",
-        preprocess_video(&uri, &cfg(), None, 10.0, &no_ffmpeg()).unwrap_err()
-    );
-    assert!(err.contains("temporal group"), "{err}");
-}
-
-#[test]
 fn garbage_is_an_error_not_a_panic() {
     assert!(decode_frames("data:video/gif;base64,bm90LWEtZ2lm", 10.0, &no_ffmpeg()).is_err());
     assert!(decode_frames("!!! not base64 !!!", 10.0, &no_ffmpeg()).is_err());
@@ -344,4 +366,77 @@ fn invalid_geometry_is_refused_before_dividing_by_it() {
     let mut c = cfg();
     c.patch_size = 0;
     assert!(preprocess_video(&uri, &c, None, 10.0, &no_ffmpeg()).is_err());
+}
+
+#[test]
+fn gif_respects_explicit_aggregate_decode_budget() {
+    let uri = make_gif(4, 64);
+    let mut policy = no_ffmpeg();
+    policy.max_total_decoded_pixels = Some(4 * 64 * 64);
+    assert!(decode_frames(&uri, 10.0, &policy).is_ok());
+    policy.max_total_decoded_pixels = Some(4 * 64 * 64 - 1);
+    let error = format!("{:#}", decode_frames(&uri, 10.0, &policy).unwrap_err());
+    assert!(error.contains("decoded-image budget"), "{error}");
+}
+
+// ── GLM-5.3: the reference sampler and processor ─────────────────────────
+// (Enntity/atlas f3f3876b.)
+
+fn glm_cfg() -> VisionConfig {
+    VisionConfig {
+        is_glm5_next: true,
+        patch_size: 14,
+        ..cfg()
+    }
+}
+
+/// The reference pads one sampled frame into a temporal pair rather than
+/// refusing it; Qwen keeps the short-clip refusal above.
+#[test]
+fn a_glm_single_sample_is_padded_to_a_temporal_group() {
+    let video = preprocess_video(&make_gif(1, 64), &glm_cfg(), None, 10.0, &no_ffmpeg())
+        .expect("the reference pads a sampled frame");
+    assert_eq!(video.grid_t, 1);
+    assert_eq!(video.timestamps, vec![0.0]);
+}
+
+/// A 2.5 s GIF at 10 fps samples frames [0, 6, 12, 18, 24] (the reference
+/// returns them with the last repeated to fill the third pair), resized as one
+/// five-frame volume: 64x64 is under the 16-token minimum, so it is upscaled
+/// onto an 84x84 canvas. Each group is stamped with its first frame's whole
+/// second.
+#[test]
+fn a_glm_clip_takes_the_reference_frames_canvas_and_timestamps() {
+    let v = preprocess_video(&make_gif(25, 64), &glm_cfg(), None, 2.0, &no_ffmpeg()).unwrap();
+    assert_eq!((v.grid_t, v.grid_h, v.grid_w), (3, 6, 6));
+    assert_eq!(v.timestamps, vec![0.0, 1.0, 2.0]);
+    let last = &v.groups[2];
+    // Frame 24 twice: each patch's two temporal slices are equal.
+    let patch_dim = 3 * 2 * 14 * 14;
+    for patch in last.chunks(patch_dim) {
+        for c in 0..3 {
+            let slice = |t: usize| &patch[c * 392 + t * 196..c * 392 + (t + 1) * 196];
+            assert_eq!(slice(0), slice(1));
+        }
+    }
+    // Under one second still samples (one frame, padded to a pair); under
+    // half a second samples nothing, as in the reference.
+    let short = preprocess_video(&make_gif(9, 64), &glm_cfg(), None, 2.0, &no_ffmpeg()).unwrap();
+    assert_eq!(
+        (short.grid_t, short.grid_h, short.timestamps.len()),
+        (1, 12, 1)
+    );
+    let err = preprocess_video(&make_gif(3, 64), &glm_cfg(), None, 2.0, &no_ffmpeg()).unwrap_err();
+    assert!(format!("{err:#}").contains("too short"), "{err:#}");
+}
+
+#[test]
+fn glm_video_volume_bound_counts_the_padded_final_group() {
+    let uri = make_gif(25, 64);
+    let mut policy = no_ffmpeg();
+    policy.max_total_decoded_pixels = Some(6 * 84 * 84);
+    assert!(preprocess_video(&uri, &glm_cfg(), None, 2.0, &policy).is_ok());
+    policy.max_total_decoded_pixels = Some(6 * 84 * 84 - 1);
+    let error = preprocess_video(&uri, &glm_cfg(), None, 2.0, &policy).unwrap_err();
+    assert!(error.to_string().contains("volume bound"), "{error:#}");
 }

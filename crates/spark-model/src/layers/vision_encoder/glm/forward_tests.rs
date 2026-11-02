@@ -11,15 +11,11 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 
 use anyhow::Result;
-use atlas_core::config::VisionConfig;
 use spark_runtime::gpu::mock::MockGpuBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
-use super::{
-    GLM_MAX_OUTPUT_ROWS, GlmVisionBlockWeights, GlmVisionEncoder, GlmVisionMergerWeights,
-    GlmVisionWeights,
-};
-use crate::VisionItem;
+use super::GLM_MAX_OUTPUT_ROWS;
+use super::test_tower::{HEADS, encoder, image};
 
 /// Mock backend that hands out one handle per requested kernel name.
 #[derive(Default)]
@@ -100,81 +96,6 @@ impl GpuBackend for NamedGpu {
     fn sm_count(&self) -> Result<u32> {
         self.inner.sm_count()
     }
-}
-
-const PATCH: usize = 14;
-const TEMPORAL: usize = 2;
-const PATCH_DIM: usize = 3 * TEMPORAL * PATCH * PATCH;
-const HEADS: usize = 2;
-
-/// A two-block tower with the checkpoint's head width and patch geometry but
-/// tiny hidden sizes, capped at 16x16 input patches.
-fn encoder(gpu: &NamedGpu) -> GlmVisionEncoder {
-    let config = VisionConfig {
-        is_qwen3vl_video: false,
-        is_glm5_next: true,
-        in_channels: 3,
-        depth: 2,
-        hidden_size: 64 * HEADS,
-        num_heads: HEADS,
-        patch_size: PATCH,
-        temporal_patch_size: TEMPORAL,
-        spatial_merge_size: 2,
-        intermediate_size: 96,
-        out_hidden_size: 32,
-        projection_intermediate_size: 48,
-        rms_norm_eps: 1e-5,
-        swiglu_limit: 10.0,
-        deepstack_visual_indexes: Vec::new(),
-        image_pad_token_id: 0,
-        video_pad_token_id: 0,
-        image_start_token_id: 0,
-        image_end_token_id: 0,
-        video_start_token_id: 0,
-        video_end_token_id: 0,
-        max_pixels: Some(256 * TEMPORAL * PATCH * PATCH),
-        token_budgets: Default::default(),
-        min_pixels: None,
-        video_pixels: None,
-        omni: None,
-    };
-    let w = DevicePtr(0x1000);
-    let block = GlmVisionBlockWeights {
-        norm1_w: w,
-        qkv_w: w,
-        qkv_b: w,
-        q_norm_w: w,
-        k_norm_w: w,
-        proj_w: w,
-        proj_b: w,
-        norm2_w: w,
-        gate_up_w: w,
-        gate_up_b: w,
-        down_w: w,
-        down_b: w,
-    };
-    let weights = GlmVisionWeights {
-        patch_embed_w: w,
-        patch_embed_b: w,
-        blocks: vec![block; config.depth],
-        post_layernorm_w: w,
-        downsample_w: w,
-        downsample_b: w,
-        merger: GlmVisionMergerWeights {
-            proj_w: w,
-            post_norm_w: w,
-            post_norm_b: w,
-            gate_up_w: w,
-            down_w: w,
-        },
-    };
-    let encoder = GlmVisionEncoder::new(weights, &config, gpu).unwrap();
-    assert_eq!(encoder.p_max, 256);
-    encoder
-}
-
-fn image(grid: usize) -> VisionItem {
-    VisionItem::image(vec![0.0; grid * grid * PATCH_DIM], grid, grid)
 }
 
 #[test]

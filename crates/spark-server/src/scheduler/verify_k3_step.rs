@@ -9,101 +9,42 @@ const K3_SUMMARY_PERIOD: u64 = 100;
 
 // Verify observes draft2's match even when draft1 rejection short-circuits acceptance.
 
-#[inline]
-fn k3_record_positional(
+#[path = "verify_k3_step/record.rs"]
+mod record;
+use record::*;
+
+/// A K=3 verdict's re-propose from `token`: a copy in place of the head
+/// (`ATLAS_QWEN_COPY_DRAFTS`, `copy_drafts::mtp`), else the head at the
+/// request's own depth.
+fn k3_propose(
+    model: &dyn Model,
+    a: &mut ActiveSeq,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
-    d1_match: bool,
-    d2_match: bool,
-    seq_len: usize,
+    token: u32,
+    num_drafts: usize,
 ) {
-    sched
-        .stats
-        .k3_steps
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if d1_match {
-        sched
-            .stats
-            .k3_d1_match
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if d2_match {
-            sched
-                .stats
-                .k3_d2_match_cond
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if crate::scheduler::copy_drafts::mtp::propose(model, sched, a, num_drafts) {
+        return;
+    }
+    let _mtp_grammar_mask = mtp_grammar_mask_for(a);
+    match model.run_mtp_propose_multi(
+        token,
+        a.seq.seq_len,
+        crate::scheduler::spec_step::effective_drafts_under_grammar(
+            a,
+            a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth()),
+        ),
+        &mut a.seq,
+        0,
+        _mtp_grammar_mask.as_deref(),
+    ) {
+        Ok(d) if !d.is_empty() => a.pending_drafts = d,
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!("run_mtp_propose_multi: {e:#}");
         }
     }
-    if d2_match {
-        sched
-            .stats
-            .k3_d2_match_uncond
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    if sched
-        .stats
-        .k3_steps
-        .load(std::sync::atomic::Ordering::Relaxed)
-        >= K3_SUMMARY_PERIOD
-    {
-        let steps = sched
-            .stats
-            .k3_steps
-            .swap(0, std::sync::atomic::Ordering::Relaxed)
-            .max(1);
-        let d1 = sched
-            .stats
-            .k3_d1_match
-            .swap(0, std::sync::atomic::Ordering::Relaxed);
-        let d2u = sched
-            .stats
-            .k3_d2_match_uncond
-            .swap(0, std::sync::atomic::Ordering::Relaxed);
-        let d2c = sched
-            .stats
-            .k3_d2_match_cond
-            .swap(0, std::sync::atomic::Ordering::Relaxed);
-        let p1 = (d1 as f64) / (steps as f64);
-        let p2_uncond = (d2u as f64) / (steps as f64);
-        let p2_cond = if d1 > 0 {
-            (d2c as f64) / (d1 as f64)
-        } else {
-            f64::NAN
-        };
-        tracing::info!(
-            "K3 positional: steps={steps} p1={p1:.3} p2_uncond={p2_uncond:.3} \
-             p2_cond={p2_cond:.3} (d1={d1} d2u={d2u} d2c={d2c}) seq_len={seq_len} \
-             [p2_uncond ~= p2_cond => position 2 genuinely worse; \
-              p2_uncond ~= p1 => p2_cond is survivorship]"
-        );
-    }
 }
-
-#[inline]
-fn k3_record_outcome(
-    sched: &crate::scheduler::sched_ctx::SchedCtx,
-    num_accepted: usize,
-    seq_len: usize,
-) {
-    let counter = match num_accepted {
-        2 => &sched.stats.k3_accept[2],
-        1 => &sched.stats.k3_accept[1],
-        _ => &sched.stats.k3_accept[0],
-    };
-    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let total = sched.stats.k3_accept[2].load(std::sync::atomic::Ordering::Relaxed)
-        + sched.stats.k3_accept[1].load(std::sync::atomic::Ordering::Relaxed)
-        + sched.stats.k3_accept[0].load(std::sync::atomic::Ordering::Relaxed);
-    if total >= K3_SUMMARY_PERIOD {
-        let a2 = sched.stats.k3_accept[2].swap(0, std::sync::atomic::Ordering::Relaxed);
-        let a1 = sched.stats.k3_accept[1].swap(0, std::sync::atomic::Ordering::Relaxed);
-        let a0 = sched.stats.k3_accept[0].swap(0, std::sync::atomic::Ordering::Relaxed);
-        let total = (a2 + a1 + a0).max(1);
-        let mean = (2 * a2 + a1) as f64 / total as f64;
-        tracing::info!(
-            "K3 summary: {a2} accept-2 / {a1} accept-1 / {a0} reject in last {total} steps (mean accepted={mean:.2}) seq_len={seq_len}"
-        );
-    }
-}
-
 /// K=3 verify: [last_token, draft1, draft2] → [v0, v1, v2]. Three outcomes.
 ///
 /// `verify_ctx` carries the tokenizer special-token IDs the
@@ -189,7 +130,18 @@ pub fn step_verify_k3(
         a,
         &result_vec,
     );
-    let (v0, v1, v2) = if use_raw {
+    let Ok(scored) =
+        super::verify_pipeline_helper::scored::requested(model, 3, a, verify_ctx, 0, None)
+    else {
+        return;
+    };
+    let (v0, v1, v2) = if let Some(s) = &scored {
+        (
+            s.tokens.first().copied().unwrap_or(v0_argmax),
+            s.tokens.get(1).copied().unwrap_or(v1_argmax),
+            s.tokens.get(2).copied().unwrap_or(v2_argmax),
+        )
+    } else if use_raw {
         // DFlash drafter proposes on raw argmax; verify on the SAME (GOLD)
         // basis so verifier/drafter judge identically. No rep_pen/DRY here.
         (v0_argmax, v1_argmax, v2_argmax)
@@ -216,13 +168,13 @@ pub fn step_verify_k3(
     } else {
         2
     };
-    if !dflash_verify_raw_argmax {
+    // A copy round (`copy_drafts::mtp`) says nothing about the head.
+    let copied = crate::scheduler::copy_drafts::mtp::settle(a, 2, num_accepted);
+    if !dflash_verify_raw_argmax && !copied {
         a.mtp_acct
             .record_depth_verify(2, num_accepted, num_drafts, sched.levers.depth());
     }
 
-    // Shadow top-k target line (ATLAS_MTP_SHADOW_TOPK): joins offline with
-    // the drafter's SHADOW_TOPK lines — draft i (drafter pos base+i) vs v_i.
     // `base` is seq_len at step entry = the propose-time position of draft 0.
     if sched.levers.shadow_topk > 0 {
         tracing::info!(
@@ -287,12 +239,7 @@ pub fn step_verify_k3(
         }
     }
 
-    // Extract logprobs from verify logits buffer (K=3 positions) when requested.
-    let verify_lps = if let Some(top_logprobs) = a.top_logprobs {
-        extract_verify_logprobs(model, &[v0, v1, v2], top_logprobs, 0)
-    } else {
-        Vec::new()
-    };
+    let verify_lps = scored.map(|s| s.logprobs).unwrap_or_default();
 
     // EP: always broadcast num_accepted to worker (prevents deadlock on EOS).
     if let Err(e) = model.ep_broadcast_cmd(num_accepted as u32) {
@@ -348,7 +295,7 @@ pub fn step_verify_k3(
             tracing::error!("save_hidden_for_mtp(2): {e:#}");
             return;
         }
-        if let Err(e) = model.trim_proposer_state(&mut a.seq, 2, 0) {
+        if let Err(e) = crate::scheduler::copy_drafts::mtp::trim_proposer(model, a, 2) {
             tracing::error!("trim_proposer_state: {e:#}");
         }
         let t_propose = Instant::now();
@@ -382,7 +329,7 @@ pub fn step_verify_k3(
     } else if num_accepted == 1 {
         a.seq.seq_len -= 1;
         a.seq.tokens.pop();
-        if let Err(e) = model.trim_proposer_state(&mut a.seq, 1, 0) {
+        if let Err(e) = crate::scheduler::copy_drafts::mtp::trim_proposer(model, a, 1) {
             tracing::error!("trim_proposer_state: {e:#}");
         }
         // Item #2 (STree-style in-place K=3 verify commit). Partial accept
@@ -443,7 +390,7 @@ pub fn step_verify_k3(
         a.seq.seq_len -= 2;
         a.seq.tokens.pop();
         a.seq.tokens.pop();
-        if let Err(e) = model.trim_proposer_state(&mut a.seq, 0, 0) {
+        if let Err(e) = crate::scheduler::copy_drafts::mtp::trim_proposer(model, a, 0) {
             tracing::error!("trim_proposer_state: {e:#}");
         }
         // Item #2 (STree-style in-place K=3 verify commit). Partial accept

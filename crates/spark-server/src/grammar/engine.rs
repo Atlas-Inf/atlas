@@ -24,6 +24,9 @@ use super::extract_ordered_vocab;
 pub struct GrammarEngine {
     pub(super) compiler: GrammarCompiler,
     vocab_size: usize,
+    /// Set only while [`Self::compile_tool_or_json_grammar`] runs: the JSON
+    /// branch every structural-tag tool grammar is unioned with.
+    pub(super) json_alternative: Option<xgrammar::Grammar>,
 }
 
 // SAFETY: GrammarEngine is initialized on the main thread and moved to the
@@ -157,6 +160,7 @@ impl GrammarEngine {
         Ok(Self {
             compiler,
             vocab_size,
+            json_alternative: None,
         })
     }
 

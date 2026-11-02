@@ -56,6 +56,10 @@ fn a_drag_highlights_what_it_covers_and_a_click_highlights_nothing() {
     use crate::tui::selection::Selection;
     let mut a = app();
     a.section = Section::Main;
+    // Other tests write to the process-global log ring in parallel. Keep the
+    // log pane empty across these two frames so its live contents cannot mask
+    // the property under test: selection changes styling, never symbols.
+    a.log_filter = "selection-render-fixture-no-matching-logs".into();
 
     // A click (no movement) must not paint anything — otherwise every click
     // flashes a one-cell highlight.

@@ -38,6 +38,10 @@ pub struct ToolMarkers {
     eq_start: Vec<u32>,
     gt_start: Vec<u32>,
     lt_slash_end: Vec<u32>,
+    /// The single `<arg_value>` / `</arg_value>` tokens of a format that
+    /// carries each value between them (GLM-5.3's Poolside v1). When present
+    /// they own value tracking; the `<parameter=` scan does not apply.
+    native_value: Option<(u32, u32)>,
 }
 
 fn has(set: &[u32], tok: u32) -> bool {
@@ -64,8 +68,24 @@ impl ToolMarkers {
         has(&self.lt_slash_end, tok)
     }
 
+    /// The value-body state after `tok` under native value markers, or `None`
+    /// when the format has none or `tok` is not a transition (an open inside
+    /// a value or a close outside one is content).
+    pub fn native_value_transition(&self, inside: bool, tok: u32) -> Option<bool> {
+        match (self.native_value?, inside) {
+            ((open, _), false) if tok == open => Some(true),
+            ((_, close), true) if tok == close => Some(false),
+            _ => None,
+        }
+    }
+
+    pub fn has_native_values(&self) -> bool {
+        self.native_value.is_some()
+    }
+
     /// Build the classes from `(id, decoded text)` for every vocabulary entry.
-    /// `None` when any class is empty.
+    /// `None` when any class is empty and the vocabulary has no single-token
+    /// native value markers.
     pub fn from_vocab<'a>(vocab: impl IntoIterator<Item = (u32, &'a str)>) -> Option<Self> {
         let mut m = Self {
             lt: Vec::new(),
@@ -73,8 +93,15 @@ impl ToolMarkers {
             eq_start: Vec::new(),
             gt_start: Vec::new(),
             lt_slash_end: Vec::new(),
+            native_value: None,
         };
+        let (mut value_open, mut value_close) = (Vec::new(), Vec::new());
         for (id, text) in vocab {
+            match text {
+                "<arg_value>" => value_open.push(id),
+                "</arg_value>" => value_close.push(id),
+                _ => {}
+            }
             if text.trim_start() == "<" {
                 m.lt.push(id);
             }
@@ -110,7 +137,10 @@ impl ToolMarkers {
         ]
         .iter()
         .all(|v| !v.is_empty());
-        complete.then_some(m)
+        if let ([open], [close]) = (value_open.as_slice(), value_close.as_slice()) {
+            m.native_value = Some((*open, *close));
+        }
+        (complete || m.native_value.is_some()).then_some(m)
     }
 
     /// Build from a Hugging Face tokenizer: decode every id once.
@@ -125,12 +155,13 @@ impl ToolMarkers {
     /// Class sizes, for the load log.
     pub fn summary(&self) -> String {
         format!(
-            "< x{} parameter x{} =* x{} >* x{} *</ x{}",
+            "< x{} parameter x{} =* x{} >* x{} *</ x{}; native <arg_value> {:?}",
             self.lt.len(),
             self.parameter.len(),
             self.eq_start.len(),
             self.gt_start.len(),
-            self.lt_slash_end.len()
+            self.lt_slash_end.len(),
+            self.native_value
         )
     }
 
@@ -143,6 +174,7 @@ impl ToolMarkers {
             eq_start: vec![28],
             gt_start: vec![29],
             lt_slash_end: vec![510],
+            native_value: None,
         }
     }
 }

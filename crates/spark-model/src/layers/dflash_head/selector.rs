@@ -95,6 +95,61 @@ impl Dflash2CandidateSelector {
         })
     }
 
+    /// The selector's first step: `projected_hidden_buf [γ, rank] =
+    /// hidden_buf [γ, H] @ hidden_projectionᵀ [rank, H]`. `gemm` is
+    /// `drafter_dense_gemm`: γ rows fit the batched GEMV arm.
+    pub fn project_hidden(
+        &self,
+        hidden_buf: DevicePtr,
+        projected_hidden_buf: DevicePtr,
+        gamma: usize,
+        gemm: &dyn Fn(DevicePtr, &DenseWeight, DevicePtr, u32, u32, u32) -> Result<()>,
+    ) -> Result<()> {
+        gemm(
+            hidden_buf,
+            &self.hidden_projection,
+            projected_hidden_buf,
+            gamma as u32,
+            self.rank as u32,
+            self.hidden_size as u32,
+        )
+    }
+
+    /// The rank split's walk (`ATLAS_GLM_DRAFT_TP_TOPK`): the chain over
+    /// the two ranks' top-K `lists` and the hidden rows `project_hidden`
+    /// already projected — the picks `select_candidates` makes over the
+    /// joined logits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn walk_lists(
+        &self,
+        anchor: SelectorAnchor,
+        lists: [DevicePtr; 2],
+        projected_hidden_buf: DevicePtr,
+        draft_tokens_dev: DevicePtr,
+        gamma: usize,
+        gpu: &dyn GpuBackend,
+        walk_kernel: KernelHandle,
+        stream: u64,
+    ) -> Result<()> {
+        ops::dflash2_selector_walk(
+            gpu,
+            walk_kernel,
+            lists,
+            projected_hidden_buf,
+            self.predecessor_codebook.weight,
+            self.successor_codebook.weight,
+            draft_tokens_dev,
+            anchor.token_dev,
+            anchor.ban_depth_dev,
+            anchor.end_ids,
+            gamma as u32,
+            self.vocab_size as u32,
+            self.rank as u32,
+            self.top_k as u32,
+            stream,
+        )
+    }
+
     /// Select candidate tokens using the bilinear codebook path walk.
     pub fn select_candidates(
         &self,
@@ -111,19 +166,9 @@ impl Dflash2CandidateSelector {
         stream: u64,
     ) -> Result<()> {
         let r = self.rank as u32;
-        let h = self.hidden_size as u32;
         let g = gamma as u32;
 
-        // 1. GEMM: projected_hidden_buf [γ, rank] = hidden_buf [γ, H] @ hidden_projection^T [rank, H]
-        //    `gemm` is `drafter_dense_gemm`: γ-row fits the batched GEMV arm.
-        gemm(
-            hidden_buf,
-            &self.hidden_projection,
-            projected_hidden_buf,
-            g,
-            r,
-            h,
-        )?;
+        self.project_hidden(hidden_buf, projected_hidden_buf, gamma, gemm)?;
 
         // 2. On-Device GPU Candidate Selector (Zero D2H, Zero CPU Loop, <0.05ms)
         if let Some(kernel) = candidate_selector_kernel {
@@ -185,7 +230,7 @@ impl Dflash2CandidateSelector {
             let mut top_candidates = topk_unary(&logits_row, self.top_k);
             // Below the min_tokens floor an end token only truncates the
             // chain; score it out like the kernel does.
-            if mask_row <= anchor.ban_depth as usize {
+            if ops::DFLASH2_SELECTOR_BANS_END_TOKENS && mask_row <= anchor.ban_depth as usize {
                 for (value, id) in top_candidates.iter_mut() {
                     if anchor.end_ids.contains(&(*id as u32)) {
                         *value = f32::NEG_INFINITY;

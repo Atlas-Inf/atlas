@@ -16,10 +16,10 @@ pub(super) struct BuildPolicy<'a> {
     pub dflash: bool,
 }
 
-/// The sparse verifier has a bounded indexed domain. The serving context may
-/// be larger because requests beyond that domain are admitted to the native
-/// lane with speculation disabled; startup must still validate the verifier
-/// against its own bounded domain.
+/// Context used only by the sparse-decode kernel startup policy. Keep this
+/// probe bounded at 32K even when serving a larger context. It neither sizes
+/// the target KV pool nor disables DFlash above the probe: runtime verification
+/// validates positions against the model limit, block tables and scratch.
 pub(super) fn repair_context(context: usize) -> usize {
     context.min(crate::speculative::glm_repair_policy::MAX_LONG_CONTEXT)
 }

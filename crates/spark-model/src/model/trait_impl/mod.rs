@@ -26,6 +26,7 @@ mod decode_a3;
 mod decode_a_diag;
 mod decode_b;
 mod decode_b2;
+mod decode_canonical;
 mod decode_checkpoint;
 mod decode_graph_key;
 mod drafter_anchor;
@@ -37,6 +38,7 @@ mod exact_verify_check;
 pub(crate) mod finish_leaf;
 pub(crate) mod gdn_commit_fuse;
 mod graph_borrow;
+mod kda_commit;
 mod lm_head_batched;
 pub(crate) use lm_head_batched::lm_head_batch_gemv_enabled;
 mod lm_head_dp4a;
@@ -67,6 +69,23 @@ impl Model for TransformerModel {
         self.glm_verify_logits_argmax_only()
     }
 
+    fn verify_split_sampling(&self) -> bool {
+        self.glm_verify_sample_supported()
+    }
+
+    fn verify_split_candidates(
+        &self,
+        rows: usize,
+        temperature: f32,
+        specials: &[u32],
+    ) -> Result<Vec<crate::model::SplitRow>> {
+        self.glm_verify_candidates(rows, temperature, specials)
+    }
+
+    fn verify_split_full_rows(&self, rows: usize, out: &mut [u8]) -> Result<()> {
+        self.glm_verify_full_rows(rows, out)
+    }
+
     fn lightning_dspark_product_policy(
         &self,
     ) -> Option<&crate::layers::dflash_head::LightningDsparkProductPolicy> {
@@ -93,8 +112,22 @@ impl Model for TransformerModel {
         (b.window, b.request)
     }
 
-    fn prepare_vision_embed(&self, images: &[crate::VisionItem]) -> Result<()> {
-        self.prepare_vision_embed_dispatch(images)
+    fn prepare_vision_embed(
+        &self,
+        seq: &mut SequenceState,
+        images: Vec<crate::VisionItem>,
+    ) -> Result<()> {
+        self.prepare_vision_embed_dispatch(seq, images)
+    }
+    fn prepare_vision_embed_for_chunked(
+        &self,
+        seq: &mut SequenceState,
+        images: Vec<crate::VisionItem>,
+    ) -> Result<()> {
+        self.prepare_vision_embed_deferred_dispatch(seq, images)
+    }
+    fn stage_vision_grids(&self, seq: &mut SequenceState, images: &[crate::VisionItem]) {
+        self.stage_vision_grids_dispatch(seq, images);
     }
     fn prepare_vision_embed_batched(
         &self,
@@ -104,15 +137,17 @@ impl Model for TransformerModel {
     }
     fn set_vision_slice_base(
         &self,
+        seq: &mut SequenceState,
         row_base: usize,
         grid_base: usize,
         owned_images: usize,
         slice_rows: usize,
     ) {
-        self.set_vision_slice_base_entry(row_base, grid_base, owned_images, slice_rows);
+        Self::set_vision_slice_base_entry(seq, row_base, grid_base, owned_images, slice_rows);
     }
     fn ep_broadcast_vision_state_for_seq(
         &self,
+        seq: &SequenceState,
         seq_id: u32,
         enabled: bool,
         row_base: usize,
@@ -121,6 +156,7 @@ impl Model for TransformerModel {
         slice_rows: usize,
     ) -> Result<()> {
         self.ep_broadcast_vision_state_for_seq_dispatch(
+            seq,
             seq_id,
             enabled,
             row_base,

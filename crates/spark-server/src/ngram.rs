@@ -60,9 +60,13 @@ pub struct NgramProposer {
 }
 
 fn hash_ngram(ctx: &[u32]) -> u64 {
-    // FNV-1a over the token ids.
+    hash_tokens(ctx.iter().copied())
+}
+
+/// FNV-1a over token ids (also keys `scheduler::copy_drafts`' index).
+pub(crate) fn hash_tokens(tokens: impl IntoIterator<Item = u32>) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
-    for &t in ctx {
+    for t in tokens {
         h ^= t as u64;
         h = h.wrapping_mul(0x100000001b3);
     }

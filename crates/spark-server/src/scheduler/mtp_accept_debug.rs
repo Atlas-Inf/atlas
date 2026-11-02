@@ -186,12 +186,14 @@ pub(super) fn record(n: usize, k_drafts: usize, d1_match: bool, num_accepted: us
 /// (`p1`, `mean_na`, `tok_step = 1 + mean_na`), plus serial-vs-MTP step
 /// fraction and depth-regime re-probe count for the Done-line.
 /// Not a new telemetry product — the request-finished line is the sink.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct RequestAccept {
     serial_steps: u64,
     mtp_steps: u64,
     d1: u64,
     na: u64,
+    /// Sorted output positions of retained drafts, for exact rollback accounting.
+    accepted_output: Vec<usize>,
     /// Verifies that accepted at least `i + 1` drafts (the per-position
     /// survival curve that sizes the draft cap).
     survive: [u64; SURVIVAL_POSITIONS],
@@ -363,12 +365,28 @@ impl RequestAccept {
         self.depth_k3_accepts = 0;
     }
 
-    /// Total draft tokens ACCEPTED for this request — the per-request quantity
-    /// `usage.completion_tokens_details.accepted_prediction_tokens` reports.
-    /// Raw count, not a rate: the wire field's meaning is "predicted tokens
-    /// that matched generation", and `na` is exactly that sum.
+    /// Raw accepted model-prefix count, including rows beyond an output stop.
+    /// Retained for acceptance/depth telemetry; not completion usage.
     pub fn accepted_total(&self) -> u64 {
         self.na
+    }
+
+    /// Count one accepted draft only after its original token survives emission.
+    pub fn record_accepted_output(&mut self, position: usize) {
+        self.accepted_output.push(position);
+    }
+
+    /// Accepted draft tokens included in completion_tokens (excludes bonuses).
+    pub fn accepted_output_total(&self) -> u64 {
+        self.accepted_output.len() as u64
+    }
+
+    /// Remove only draft positions discarded by a real output-buffer rollback.
+    pub fn truncate_accepted_output(&mut self, keep_len: usize) {
+        let kept = self
+            .accepted_output
+            .partition_point(|&position| position < keep_len);
+        self.accepted_output.truncate(kept);
     }
 
     pub fn note_regime_reprobe(&mut self) {
@@ -409,7 +427,7 @@ impl RequestAccept {
         if self.mtp_steps == 0 {
             0.0
         } else {
-            self.na as f64 / self.mtp_steps as f64
+            self.accepted_total() as f64 / self.mtp_steps as f64
         }
     }
 

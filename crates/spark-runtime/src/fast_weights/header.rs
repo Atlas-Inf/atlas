@@ -32,24 +32,6 @@ pub(super) struct TensorMeta {
     pub(super) len: usize,
 }
 
-/// The tensors an index routes to `shard_path`.
-///
-/// Compared as PATHS under `model_dir`, not by file name: an index may name
-/// its shards with a directory (nvidia's FP4-Local pack routes every tensor to
-/// `tensors/model-000NN-of-00021.safetensors`), and a bare-name comparison then
-/// matches nothing — every shard "loads" zero tensors and the build fails far
-/// from the cause, on a missing embedding.
-pub(super) fn tensors_routed_to(
-    map: &HashMap<String, String>,
-    model_dir: &Path,
-    shard_path: &Path,
-) -> Vec<String> {
-    map.iter()
-        .filter(|(_, s)| model_dir.join(s.as_str()) == shard_path)
-        .map(|(t, _)| t.clone())
-        .collect()
-}
-
 /// Discover which safetensor files to load. Mirrors the resolution order in
 /// `crate::weights::SafetensorsLoader::load`.
 ///
@@ -152,6 +134,15 @@ pub(super) fn parse_header(file: &mut File) -> Result<Vec<TensorMeta>> {
                 } else {
                     (WeightDtype::BF16, true)
                 }
+            }
+            // CSF component streams (slab exception words; csf_32x2_v1 page
+            // origins, prefixes and records). Never stored: the copy loop
+            // hands every CSF part to `CsfAssembler`, which re-derives the
+            // element width from byte length against shape. `UInt8` is only
+            // the staging container here; U16/U32 anywhere else is still
+            // refused below.
+            "U16" | "U32" if crate::weights::nvfp4_csf::csf_part(name).is_some() => {
+                (WeightDtype::UInt8, false)
             }
             // Every other dtype maps exactly as on the buffered and RDMA paths:
             // one table (`from_safetensors_str`), so the loaders cannot drift.

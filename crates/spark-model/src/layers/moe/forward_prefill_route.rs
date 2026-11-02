@@ -54,6 +54,29 @@ impl MoeLayer {
                     stream,
                 )?;
             }
+        } else if ctx.config.model_type == "glm5_next"
+            && n <= crate::layers::canonical_verify::MAX_ROWS
+            && crate::layers::canonical_verify::enabled()
+        {
+            // ATLAS_GLM_CANONICAL_VERIFY: one tensor-core family for every
+            // verify width, so near-tied experts do not flip with the width
+            // (its FP32-output twin for FP32 router logits).
+            let canonical = if self.router_f32 {
+                crate::layers::canonical_verify::dense_f32
+            } else {
+                crate::layers::canonical_verify::dense
+            };
+            canonical(
+                ctx.gpu,
+                router_in,
+                &self.weights.gate,
+                gate_logits,
+                n,
+                self.router_logits_n,
+                h,
+                self.router_logits_n,
+                stream,
+            )?;
         } else if self.independent_grouped(ctx, n) {
             self.independent_router_logits(router_in, gate_logits, n as usize, ctx, stream)?;
         } else if self.glm_c3_grouped(ctx, n) {

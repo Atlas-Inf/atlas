@@ -152,3 +152,21 @@ fn terminal_done_keeps_existing_finish_precedence_and_tool_history() {
         assert_finish_only(&deltas, expected);
     }
 }
+
+#[test]
+fn terminal_done_refusal_annotation_preserves_full_content() {
+    let _guard = crate::refusal::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let text = "I cannot help with that request. Here is a safe alternative.";
+    let mut s = state();
+    s.tag_scan_buf = text.into();
+    s.refusal_scan_buf = text.into();
+    let (deltas, reason) = finalize_done(&mut s, "stop", usage(), false, flush_sanitizer);
+    assert_eq!(reason, "stop");
+    assert!(matches!(&deltas[..], [
+        StreamDelta::Content { text: content, .. },
+        StreamDelta::Refusal { text: refusal },
+        StreamDelta::Finish { reason: crate::ir::FinishReason::Stop, .. }
+    ] if content == text && refusal == "I cannot help with that request."));
+}

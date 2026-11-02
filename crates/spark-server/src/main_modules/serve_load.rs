@@ -96,6 +96,11 @@ pub(crate) fn load_model(
     // (the head that freezes the value is built last, on the head rank only).
     if args.dflash {
         spark_model::layers::dflash_head::FirstAppend::from_env()?;
+        // ATLAS_DFLASH_WARM_CTX=restore (Enntity/atlas 5573f4d5): check the
+        // slots count only when the restore arm is on.
+        if spark_model::layers::dflash_head::WarmCtx::from_env()?.restores() {
+            spark_model::layers::dflash_head::warm_ctx::store_slots_from_env()?;
+        }
     }
     // #158: the exact prefix-cache grid is read once, at model build.
     spark_runtime::prefill_grid::set_exact_prefix_cache(args.exact_prefix_cache);
@@ -185,6 +190,9 @@ pub(crate) fn load_model(
     let vision_max_pixels = resolve_vision_max_pixels(&args, image.map(|d| d.max_pixels))?;
     if let Some(v) = config.vision.as_mut() {
         v.max_pixels = vision_max_pixels;
+        if v.is_glm5_next {
+            v.token_budgets = super::processor_pixels::read_glm_token_budgets(&model_dir);
+        }
         v.min_pixels = image.and_then(|d| d.min_pixels);
         v.video_pixels = super::processor_pixels::read_declared_pixels(
             &model_dir,
@@ -198,6 +206,24 @@ pub(crate) fn load_model(
         });
         v.is_qwen3vl_video =
             super::vision_processor::read_is_qwen3vl_video(&model_dir).unwrap_or_default();
+    }
+    if let Some(pixels) = args.video_max_pixels {
+        anyhow::ensure!(pixels > 0, "--video-max-pixels must be positive");
+        let vision = config
+            .vision
+            .as_mut()
+            .context("--video-max-pixels requires a vision model")?;
+        anyhow::ensure!(
+            !vision.is_glm5_next,
+            "--video-max-pixels is a Qwen video option"
+        );
+        let bounds = vision
+            .video_pixels
+            .as_mut()
+            .context("checkpoint lacks video pixel bounds")?;
+        bounds.max_pixels = pixels;
+        bounds.min_pixels = bounds.min_pixels.min(pixels);
+        tracing::info!("Qwen video pixel volume override: {pixels}");
     }
     match vision_max_pixels {
         Some(px) => tracing::info!(
@@ -255,12 +281,23 @@ pub(crate) fn load_model(
     // that enabled video and has no ffmpeg is misconfigured, and the operator
     // should learn that from the startup log rather than from a user's failed
     // request an hour later.
+    let glm_vision = config.vision.as_ref().is_some_and(|v| v.is_glm5_next);
+    let video_max_frames = args.video_max_frames.unwrap_or(if glm_vision {
+        spark_model::video_sample::GLM_DEFAULT_MAX_FRAMES
+    } else {
+        spark_model::video_preprocess::DEFAULT_MAX_FRAMES
+    });
     let video_ffmpeg = spark_model::video_decode_ffmpeg::FfmpegPolicy {
         enabled: args.video_allow_ffmpeg,
         binary: args.video_ffmpeg_path.clone(),
-        max_frames: args.video_max_frames,
+        max_frames: video_max_frames,
         max_total_decoded_pixels: args.video_max_pixels,
         timeout_secs: args.video_decode_timeout_s,
+        max_output_bytes: args.video_max_pixels.map_or(512 * 1024 * 1024, |pixels| {
+            pixels
+                .saturating_mul(4)
+                .saturating_add(video_max_frames.saturating_mul(1024))
+        }),
         ..Default::default()
     };
     match spark_model::video_decode_ffmpeg::probe(&video_ffmpeg) {
@@ -269,7 +306,7 @@ pub(crate) fn load_model(
             args.video_ffmpeg_path,
             v,
             args.video_fps,
-            args.video_max_frames,
+            video_max_frames,
         ),
         // WARN, not a hard failure: the server still serves text and images
         // perfectly well, and refusing to boot would turn a video
@@ -809,7 +846,7 @@ pub(crate) fn load_model(
     // needs the encoder's output window (`spark_model::vision_limits`). A
     // model whose tower did not load (window 0) serves text only, and the
     // API refuses media as it does for a text model. Enntity/atlas b060f987.
-    let (vision_window_rows, vision_request_bound) = model.vision_row_limits();
+    let _ = model.vision_row_limits();
 
     // Read default sampling parameters from generation_config.json.
     let serve_phases::SamplingDefaults {
@@ -898,6 +935,17 @@ pub(crate) fn load_model(
     let model_name = serve_phases::resolve_model_name(&args, &config_json, &model_dir);
 
     let scheduler_model = model;
+    // Read before the scheduler takes the model: the API's admission check
+    // needs the encoder's output window (`spark_model::vision_limits`). A
+    // model whose tower did not load (window 0) serves text only, and the
+    // API refuses media as it does for a text model.
+    let (vision_window_rows, vision_request_bound) = scheduler_model.vision_row_limits();
+    let vision_config = config.vision.clone().filter(|_| vision_window_rows > 0);
+    if config.vision.is_some() && vision_config.is_none() {
+        tracing::warn!(
+            "vision config present but no vision tower loaded: image and video input is refused"
+        );
+    }
     let scheduler_eos = eos_tokens;
     // EP gate. v1 single-sequence worker protocol required max_batch_size=1
     // because each cmd targeted one slot and the head's per-token broadcast
@@ -1337,35 +1385,24 @@ pub(crate) fn load_model(
         } else {
             Some(rotation_tx)
         },
-        chat: {
-            let mut c = crate::api::chat::levers::ChatLevers::resolve(&ptx_set.behavior);
-            if args.reference_mode {
-                // The in-think tool-leak guard ends a response early.
-                c.in_think_leak_openers = 0;
-            }
-            c
-        },
-        vision_config: config.vision.clone(),
+        chat: crate::api::chat::levers::ChatLevers::resolve(&ptx_set.behavior),
         vision_max_pixels,
-        vision_limits: if args.vision_max_request_rows > 0 {
-            let (window_rows, request_bound) = (vision_window_rows, vision_request_bound);
-            Some(spark_model::vision_limits::VisionRowLimits::resolve(
-                window_rows,
+        vision_limits: vision_config.as_ref().map(|_| {
+            spark_model::vision_limits::VisionRowLimits::resolve(
+                vision_window_rows,
                 max_batch_tokens,
                 args.vision_max_request_rows,
-                request_bound,
+                vision_request_bound,
                 args.vision_max_inflight_rows,
-            ))
-        } else {
-            None
-        },
-        vision_budget: if args.vision_max_inflight_rows > 0 {
-            Some(spark_model::vision_budget::VisionRowBudget::new(
-                args.vision_max_inflight_rows,
-            ))
-        } else {
-            None
-        },
+            )
+        }),
+        vision_budget: vision_config
+            .as_ref()
+            .filter(|_| args.vision_max_inflight_rows > 0)
+            .map(|_| {
+                spark_model::vision_budget::VisionRowBudget::new(args.vision_max_inflight_rows)
+            }),
+        vision_config,
         remote_image_policy,
         video_ffmpeg,
         video_fps: args.video_fps,
@@ -1406,7 +1443,10 @@ pub(crate) fn load_model(
         disable_thinking: args.disable_thinking,
         reference_mode: args.reference_mode,
         default_thinking: default_kwargs.thinking,
-        default_reasoning_effort: default_kwargs.reasoning_effort,
+        default_reasoning_effort: match default_kwargs.reasoning_effort {
+            Some(effort) => Some(effort),
+            None => super::serve::model_default_reasoning_effort(&ptx_set.behavior)?,
+        },
         response_store,
         rate_limiter,
         conversation_store,

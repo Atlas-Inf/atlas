@@ -62,7 +62,7 @@ pub(crate) fn encode_chat_response(
                 )
             };
             // URL-citation annotations are derived from the FINAL
-            // content (post tool-XML strip / refusal null), so offsets
+            // content (after tool-XML stripping), so offsets
             // always index into the text the client actually receives.
             let annotations = c.content.as_deref().and_then(merged_annotations);
             ChatChoice {

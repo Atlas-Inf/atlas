@@ -9,12 +9,12 @@ use std::sync::{
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Arg {
+pub(crate) enum Arg {
     Ptr(DevicePtr),
     Bytes(Vec<u8>),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Event {
+pub(crate) enum Event {
     Lookup(String, String),
     Alloc(DevicePtr, usize),
     H2d(DevicePtr, usize),
@@ -25,7 +25,7 @@ pub(super) enum Event {
     Memset(DevicePtr, usize),
     Launch(u64, [u32; 3], [u32; 3], u32, u64, Vec<Arg>),
 }
-pub(super) struct Gpu {
+pub(crate) struct Gpu {
     cache: spark_runtime::op_cache::OpCache,
     pub events: Arc<Mutex<Vec<Event>>>,
     memory: Mutex<BTreeMap<u64, (usize, Vec<u8>)>>,

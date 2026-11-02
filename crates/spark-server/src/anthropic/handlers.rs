@@ -103,30 +103,11 @@ pub async fn messages(
     };
 
     if !chat_resp.status().is_success() {
-        // Forward the error envelope. Translate the JSON body into
-        // Anthropic's error shape if it's an OpenAI-style envelope; else
-        // pass bytes through.
-        let (parts, body) = chat_resp.into_parts();
-        let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
-            Ok(b) => b,
-            Err(e) => {
-                return anthropic_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    format!("Error body collect: {e}"),
-                );
-            }
-        };
-        let err_msg = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-            .ok()
-            .and_then(|v| {
-                v.get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(|m| m.as_str())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| String::from_utf8_lossy(&body_bytes).into_owned());
-        return anthropic_error(parts.status, "api_error", err_msg);
+        // Forward the error envelope in Anthropic's shape with its status. A
+        // client error is an `invalid_request_error`: a 400 such as an
+        // over-limit vision request must not read as a server fault, which
+        // clients retry.
+        return openai_error_to_anthropic(chat_resp).await;
     }
 
     // Unreachable in practice: Http outcomes are error envelopes (both
@@ -164,12 +145,16 @@ pub async fn count_tokens(
     // rendered through the non-openai Jinja variant, so counts drifted
     // from real usage.
     let mut ir_req = crate::ir::ChatRequest::from(req);
-    // Counting must not require the vision encoder: strip image parts
+    // Counting must not require the vision encoder: strip image and video parts
     // (they contributed 0 tokens in the old count too — pad expansion
     // needs real pixel grids, which a count endpoint can't produce).
     for m in &mut ir_req.messages {
-        m.content
-            .retain(|p| !matches!(p, crate::ir::ContentPart::Image(_)));
+        m.content.retain(|p| {
+            !matches!(
+                p,
+                crate::ir::ContentPart::Image(_) | crate::ir::ContentPart::Video(_)
+            )
+        });
     }
     // Same treatment as the chat handler: the Jinja render + tokenize inside
     // `prepare_chat_prompt` is CPU-bound (measured 13 ms at 12931 prompt tokens)
@@ -247,5 +232,25 @@ fn anthropic_error_type(status: StatusCode) -> &'static str {
         503 | 529 => "overloaded_error",
         400..=499 => "invalid_request_error",
         _ => "api_error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_client_error_forwards_as_an_invalid_request_error() {
+        let openai = serde_json::json!({"error": {"message": "too many images", "type": "invalid_request_error"}});
+        let resp = (StatusCode::BAD_REQUEST, Json(openai)).into_response();
+        let out = openai_error_to_anthropic(resp).await;
+        assert_eq!(out.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(out.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["message"], "too many images");
     }
 }

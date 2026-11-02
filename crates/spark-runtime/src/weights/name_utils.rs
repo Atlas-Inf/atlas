@@ -64,8 +64,9 @@ pub fn is_ngram_table(name: &str) -> bool {
 
 /// A CSF-compressed NVFP4 block-scale stream (`weight_scale_encoding: "csf"`).
 ///
-/// Never uploaded: the loader defers both halves and the model build decodes
-/// them into a plain E4M3 `weight_scale` (see `atlas_core::modelopt_codec`).
+/// Never uploaded as it is: the fast loader decodes each pair into a plain
+/// E4M3 `weight_scale` as it reads them, and the model build does the same for
+/// any other loader's (see `atlas_core::modelopt_codec`).
 pub fn is_csf_stream(name: &str) -> bool {
     name.ends_with(".nvfp4_csf_fixed") || name.ends_with(".nvfp4_csf_exceptions")
 }

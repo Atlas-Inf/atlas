@@ -15,7 +15,11 @@ pub(super) use behavior::*;
 pub(super) fn parse_kernel_toml(
     kernel_dir: &std::path::Path,
     vendor: &str,
-) -> (Vec<String>, HashMap<String, String>) {
+) -> (
+    Vec<String>,
+    HashMap<String, String>,
+    super::build_kernel_flags::KernelFlags,
+) {
     let kernel_toml_path = kernel_dir.join("KERNEL.toml");
     let kernel_toml: toml::Value = toml::from_str(
         &std::fs::read_to_string(&kernel_toml_path)
@@ -53,7 +57,9 @@ pub(super) fn parse_kernel_toml(
         })
         .unwrap_or_default();
 
-    (extra_flags, module_overrides)
+    let kernel_flags = super::build_kernel_flags::parse(&kernel_toml, vendor)
+        .unwrap_or_else(|e| panic!("{}: {e}", kernel_toml_path.display()));
+    (extra_flags, module_overrides, kernel_flags)
 }
 
 /// Parse `[build] base_quant` from a KERNEL.toml: the sibling quant dir this

@@ -16,8 +16,8 @@ fn the_batch_switch_is_0_or_1_and_sets_its_own_parity_bit() {
     }
     // Off, both ranks compare the split's own word; on, a word of its own.
     for parts in [None, Some(MLP), Some(HEAD), Some(ALL)] {
-        assert_eq!(parity_word(parts, false, false), Parts::word(parts));
-        assert_ne!(parity_word(parts, true, false), Parts::word(parts));
+        assert_eq!(parity_word(parts, false, false, false), Parts::word(parts));
+        assert_ne!(parity_word(parts, true, false, false), Parts::word(parts));
     }
 }
 
@@ -89,6 +89,7 @@ fn a_batched_propose_swaps_its_rows_through_the_batch_frame() {
             Swap::CtxInput(_) | Swap::CtxHidden(_) | Swap::CtxKv(_) => {
                 unreachable!("no context append was announced")
             }
+            Swap::Candidates => unreachable!("a batched propose swaps logits"),
         }
     }
     // Same sizes, same order, both ranks: the plan at B×gamma rows.

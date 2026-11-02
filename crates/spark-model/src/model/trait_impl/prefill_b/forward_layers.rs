@@ -331,7 +331,7 @@ impl TransformerModel {
             if let Some(t) = t_pf {
                 t_in_prefill += t.elapsed();
             }
-            det.tap("out", ctx.buffers.hc_streams(), det_out, hc_row);
+            det.tap_floats("out", ctx.buffers.hc_streams(), det_out, hc_row, hc_elem);
             if let Some(p) = qsp.filter(|p| p.check) {
                 let split = sp.is_some();
                 self.qwen4exp_sp_check(p, effective_seq_len_start, Some(i), split, stream);

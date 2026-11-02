@@ -20,6 +20,10 @@ use crate::layers::ops;
 #[path = "paged_glm_projection.rs"]
 mod projection;
 
+#[path = "paged_glm_canonical.rs"]
+pub(in crate::layers::qwen3_attention) mod canonical;
+#[path = "paged_glm_front.rs"]
+mod front;
 #[path = "paged_glm_output.rs"]
 mod output;
 #[path = "paged_glm_owner.rs"]
@@ -81,7 +85,7 @@ impl Qwen3AttentionLayer {
             nkv: _,
             hd,
             kv_dim: _,
-            eps,
+            eps: _,
             bf16,
             bs,
             stream,
@@ -119,97 +123,9 @@ impl Qwen3AttentionLayer {
         );
 
         // Joint: q_a (+ norm), kv_a (+ norm) and the cache write.
-        let q_latent = ctx.buffers.ssm_ba();
-        self.paged_glm_projection(
-            normed,
-            &mla.wq_a,
-            q_latent,
-            n,
-            q_lora,
-            h,
-            ctx,
-            stream,
-            accelerated,
-        )?;
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_w_k,
-            q_latent,
-            &mla.q_a_norm,
-            q_latent,
-            n,
-            q_lora,
-            eps,
-            stream,
-        )?;
-        let kv_latent = ctx.buffers.expert_gate_out();
-        self.paged_glm_projection(
-            normed,
-            &mla.wkv_a,
-            kv_latent,
-            n,
-            kv_lora,
-            h,
-            ctx,
-            stream,
-            accelerated,
-        )?;
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_w_k,
-            kv_latent,
-            &mla.kv_a_norm,
-            kv_latent,
-            n,
-            kv_lora,
-            eps,
-            stream,
-        )?;
-        let k_entries = ctx.buffers.ssm_qkvz();
-        let v_entries = k_entries.offset(num_tokens * kv_lora as usize * bf16);
-        ops::mla_cache_assemble_batched(
-            ctx.gpu,
-            self.mla_cache_assemble_batched_k,
-            kv_latent,
-            DevicePtr::NULL,
-            k_entries,
-            v_entries,
-            n,
-            kv_lora,
-            0,
-            kv_lora,
-            stream,
-        )?;
-        let joint = ctx
-            .attn_metadata
-            .expect("GLM paged prefill requires metadata");
-        let wf =
-            owner::checked_write_floor(owners, kv_write_floor, num_tokens, ctx.config.index_kpool)?;
-        if wf < num_tokens {
-            let skip = wf * kv_lora as usize * bf16;
-            self.write_kv_cache(
-                ctx.gpu,
-                k_entries.offset(skip),
-                v_entries.offset(skip),
-                kv_cache,
-                // slot_mapping entries are int64 (8 bytes each)
-                joint.slot.offset(wf * 8),
-                n - wf as u32,
-                1,
-                kv_lora,
-                bs,
-                kv_lora,
-                kv_lora,
-                stream,
-                ctx.graph_capture,
-            )?;
-        }
-        // ATLAS_GLM_DET_TRACE: the latents written to the cache; below, each
-        // piece's selected token ids (`x_` stages: see `det_trace`).
+        let front = self.glm_chunk_front(owners, kv_cache, ctx, args, kv_write_floor, mla)?;
+        let (q_latent, wf) = (front.q_latent, front.write_floor);
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
-        let lat = |width: u32| width as usize * bf16;
-        det.tap("kv_lat", k_entries, (0, num_tokens), lat(kv_lora));
-        det.tap("x_q_lat", q_latent, (0, num_tokens), lat(q_lora));
 
         // Per owner: semantic index, q_b + absorb, attention.
         let attn_latent = ctx.buffers.attn_output();
@@ -231,6 +147,7 @@ impl Qwen3AttentionLayer {
             num_tokens,
             nq as usize,
             self.glm_shard_lane(kv_cache, ctx).is_some(),
+            !front.indexed,
             ctx,
             stream,
         )?;
@@ -241,24 +158,25 @@ impl Qwen3AttentionLayer {
                 midchunk_capture: None,
                 ..*ctx
             };
-            let sequence_end = o
-                .seq_len_start
-                .checked_add(o.rows)
-                .ok_or_else(|| anyhow::anyhow!("GLM prefill sequence length overflow"))?;
+            let sequence_end = o.end()?;
             let use_dense = o.dense_is_exact(ctx.config.index_topk);
             let o_normed = normed.offset(o.row0 * h as usize * bf16);
             let o_latent = q_latent.offset(o.row0 * q_lora as usize * bf16);
             let rows_of = |base: DevicePtr, row_bytes: usize| base.offset(o.row0 * row_bytes);
             let select = |octx: &ForwardContext| {
-                self.glm_index_prefill_cache_update(
-                    o_normed,
-                    on,
-                    o.write_skip(wf),
-                    kv_cache,
-                    octx,
-                    stream,
-                    batched.map(|b| (rows_of(b.keys, b.key_row), rows_of(b.gates, b.key_row))),
-                )?;
+                if !front.indexed {
+                    let keys =
+                        batched.map(|b| (rows_of(b.keys, b.key_row), rows_of(b.gates, b.key_row)));
+                    self.glm_index_prefill_cache_update(
+                        o_normed,
+                        on,
+                        o.write_skip(wf),
+                        kv_cache,
+                        octx,
+                        stream,
+                        keys,
+                    )?;
+                }
                 if use_dense {
                     return Ok(None);
                 }
@@ -278,24 +196,26 @@ impl Qwen3AttentionLayer {
             // a dequantized view; long owners and verify rows read FP8 directly,
             // as do, under the pipelined kernel, sparse pieces native declines.
             let sparse_view = ops::glm_sparse_owner_needs_view(&ctx.config.model_type, on, || {
-                Ok(false) // no out-of-tree native kernel in this tree
+                ops::glm_sparse_native_admits(&octx, on, o.seq_len_start, false, stream)
             })?;
-            // Sharded latents (`ATLAS_GLM_KV_SHARD=1`): few rows merge each rank's
-            // attention over its own tokens; larger owners read an assembled view.
+            // Few rows merge per-rank attention under a shard (`ATLAS_GLM_KV_SHARD=1`),
+            // the canonical form's bits unsharded; larger sharded owners read a view.
             let latents = self.glm_owner_latents(kv_cache, &octx, o, sequence_end, stream)?;
             let merge_form = latents.is_none();
+            let canonical = self.glm_canonical_rank(kv_cache, ctx, nq, o.rows)?;
             let [k_source, v_source, table_source] = latents.unwrap_or([DevicePtr::NULL; 3]);
+            let reads_pool = !merge_form && canonical.is_none();
             let view = self.glm_owner_bf16_view(
                 k_source,
                 table_source,
                 sequence_end,
-                !merge_form && (use_dense || sparse_view),
+                reads_pool && (use_dense || sparse_view),
                 bs,
                 ctx,
                 stream,
             )?;
             ensure!(
-                merge_form || !use_dense || self.kv_dtype == KvCacheDtype::Bf16 || view.is_some(),
+                !reads_pool || !use_dense || self.kv_dtype == KvCacheDtype::Bf16 || view.is_some(),
                 "GLM dense prefill has no BF16 view of the fp8_g128 cache"
             );
             let (k_cache, v_cache, block_table, cache_dtype) = match view {
@@ -328,11 +248,14 @@ impl Qwen3AttentionLayer {
                     kv_cache,
                     &octx,
                     o,
-                    (q_absorbed, queries_swapped),
+                    (q_absorbed, queries_swapped, front.localized),
                     sparse_indices,
                     attn_latent,
                     stream,
                 )?;
+            } else if let Some(rank) = canonical {
+                let rows = canonical::owner_rows(o, q_absorbed, sparse_indices, &octx, stream);
+                self.glm_canonical_attention(kv_cache, &octx, rank, rows, attn_latent, stream)?;
             } else if let Some((indices, index_width)) = sparse_indices {
                 det.tap("sel", indices, (o.row0, o.rows), index_width as usize * 4);
                 let mut profile = super::glm_index::profile_start(&octx, stream)?;
@@ -355,15 +278,41 @@ impl Qwen3AttentionLayer {
                     block_size: bs,
                     scale: self.effective_attn_scale(hd),
                 };
+                let (physical_blocks, table_blocks, block_bytes) = match view {
+                    Some(v) => (v.blocks, v.blocks, 16 * 512 * 2),
+                    None => (
+                        kv_cache.num_blocks(),
+                        o.meta.max_blocks_per_seq as usize,
+                        kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx),
+                    ),
+                };
+                // Atlas native sparse-MLA prefill (`ATLAS_GLM_SPARSE_NATIVE=1`)
+                // requires the qualified BF16 cache geometry. Sharded latents
+                // must supply an assembled BF16 view for this kernel path.
+                let native = cache_dtype == KvCacheDtype::Bf16
+                    && (view.is_some() || kv_cache.latent_shard().is_none())
+                    && ops::try_glm_sparse_native(
+                        &octx,
+                        &sparse_args,
+                        o.seq_len_start,
+                        physical_blocks,
+                        table_blocks,
+                        block_bytes,
+                        // This caller is ordinary continued prefill. Repaired K3
+                        // verification has a separate multi-sequence attention path.
+                        false,
+                        stream,
+                    )?;
                 // Few-row owners (verify) split over the selected IDs; the MoE
                 // expert scratch is dead until this layer's FFN.
-                let accelerated = ops::try_glm_sparse_prefill_tc_split(
-                    ctx.gpu,
-                    &sparse_args,
-                    ctx.buffers.expert_gate_out(),
-                    ctx.buffers.sizes().expert_gate_out,
-                    stream,
-                )?;
+                let accelerated = native
+                    || ops::try_glm_sparse_prefill_tc_split(
+                        ctx.gpu,
+                        &sparse_args,
+                        ctx.buffers.expert_gate_out(),
+                        ctx.buffers.sizes().expert_gate_out,
+                        stream,
+                    )?;
                 if !accelerated {
                     ensure!(
                         cache_dtype == KvCacheDtype::Bf16,

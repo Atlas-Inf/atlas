@@ -4,6 +4,7 @@
 // implementation). Split out of `sampler.rs` to keep the parent file
 // under the 500-line cap. The parent re-exports these via `pub use`.
 
+use super::absent::Absent;
 use super::{SamplingParams, apply_penalties_and_bias, argmax_first_wins_f32, record_entropy};
 
 pub fn sample_with_params_history(
@@ -22,11 +23,18 @@ pub fn sample_with_params_seeded(
     token_history: &[u32],
     seed: Option<u64>,
 ) -> u32 {
+    // A whole row always decides the pick.
+    sample_core(data, params, token_history, seed).unwrap_or(0)
+}
+
+fn sample_core(
+    data: &[u8],
+    params: &SamplingParams,
+    token_history: &[u32],
+    seed: Option<u64>,
+) -> Option<u32> {
     let n = data.len() / 4;
-    let top_k = params.top_k as usize;
-    let top_p = params.top_p;
     let top_n_sigma = params.top_n_sigma;
-    let min_p = params.min_p;
 
     // Read raw logits into a mutable vec for in-place modifications.
     // Penalties (repetition / presence / frequency / LZ / DRY) and
@@ -70,13 +78,7 @@ pub fn sample_with_params_seeded(
     // quantized logits tie often, so one rule is what lets a speculative
     // verify commit exactly the tokens this pick would.
     if params.temperature <= 0.0 {
-        // FIRST-index-wins: unifies the tie-break with the GPU argmax kernel
-        // (argmax_bf16, lowest-lane), every verify pick (CPU argmax_first_wins,
-        // fast-greedy row picks) and torch.argmax/vLLM greedy. Logits are BF16
-        // so exact ties are common; under the old LAST-wins rule the CPU host
-        // path and verify disagreed at ties and speculative decode emitted
-        // divergent tokens (lossy spec-off != gamma, tool-call args/order).
-        return argmax_first_wins_f32(&raw_logits);
+        return Some(argmax_first_wins_f32(&raw_logits));
     }
     let temperature = params.temperature;
 
@@ -98,7 +100,7 @@ pub fn sample_with_params_seeded(
     }
 
     // ── 2. Temperature scaling ──
-    let mut logits: Vec<(u32, f32)> = raw_logits
+    let logits: Vec<(u32, f32)> = raw_logits
         .iter()
         .enumerate()
         .filter(|(_, v)| v.is_finite()) // Skip -inf tokens from top-n-sigma
@@ -107,8 +109,30 @@ pub fn sample_with_params_seeded(
 
     if logits.is_empty() {
         // Fallback: if top-n-sigma filtered everything, use argmax of original
-        return argmax_first_wins_f32(&raw_logits);
+        return Some(argmax_first_wins_f32(&raw_logits));
     }
+    draw(logits, params, seed, None)
+}
+
+/// Steps 3 on of the sampler over the scaled, finite `logits`. With
+/// `absent` (and top-n-sigma's guaranteed keep, when its filter ran on the
+/// full row), `None` when the present tokens do not decide the pick.
+pub(super) fn draw(
+    mut logits: Vec<(u32, f32)>,
+    params: &SamplingParams,
+    seed: Option<u64>,
+    absent: Option<(Absent, Option<usize>)>,
+) -> Option<u32> {
+    let (top_k, top_p, min_p) = (params.top_k as usize, params.top_p, params.min_p);
+    let sigma_kept = absent.and_then(|(_, kept)| kept);
+    let absent = absent.map(|(a, _)| a);
+    // Every absent token's scaled logit is at most `bound_scaled` (division
+    // by a positive temperature is monotone; it keeps distinct BF16 logits
+    // distinct, so the order is the raw one).
+    let bound_scaled = absent.map(|a| a.bound / params.temperature);
+    let beats_absent = |logit: f32, id: u32| {
+        absent.is_none_or(|a| a.beaten_by(bound_scaled.unwrap_or(a.bound), logit, id))
+    };
 
     // ── 3. Rank-dependent filtering (top-k / min-p / top-p) ──
     // These need descending order — but a full O(n·log n) sort of the whole
@@ -117,14 +141,38 @@ pub fn sample_with_params_seeded(
     // an O(n) quickselect to isolate the top-k, then sort only those k. Pure
     // temperature sampling (no top_k/top_p/min_p) needs no ordering at all —
     // the multinomial draw below is order-independent — so skip sorting.
-    let cmp_desc =
-        |a: &(u32, f32), b: &(u32, f32)| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal);
+    //
+    // The order is total: value descending, then the lower index, so exact
+    // ties (frequent in BF16 logits) fall the same way on every run and on a
+    // split verify head's candidates as on the full row.
+    let cmp_desc = |a: &(u32, f32), b: &(u32, f32)| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    };
+    // Whether absent tokens are still candidates (no top-k / min-p cut yet).
+    let mut open = absent.is_some();
     let sorted = if top_k > 0 && top_k < logits.len() {
         // Quickselect the top-k into [0, top_k) (O(n)), drop the rest, then
         // sort just the k survivors (O(k·log k)). Identical result to
         // full-sort-then-truncate; min-p/top-p below run over these k.
         logits.select_nth_unstable_by(top_k, cmp_desc);
         logits.truncate(top_k);
+        logits.sort_unstable_by(cmp_desc);
+        // The k present survivors are the row's top k when the last beats
+        // every absent token.
+        let (id, logit) = logits[top_k - 1];
+        if !beats_absent(logit, id) {
+            return None;
+        }
+        open = false;
+        true
+    } else if open {
+        // A top-k past the present tokens, or none with no min-p/top-p:
+        // absent tokens stay in the draw.
+        if top_k > 0 || (min_p <= 0.0 && top_p >= 1.0) {
+            return None;
+        }
         logits.sort_unstable_by(cmp_desc);
         true
     } else if min_p > 0.0 || top_p < 1.0 {
@@ -151,9 +199,12 @@ pub fn sample_with_params_seeded(
         .iter()
         .map(|&(idx, logit)| (idx, (logit - max_val).exp()))
         .collect();
+    // An absent token's probability is at most this.
+    let absent_prob = bound_scaled.map(|b| (b - max_val).exp());
 
     // ── 4b. Entropy: H = -Σ p·ln(p) over the post-softmax distribution ──
-    {
+    // (a row with absent tokens has no whole distribution to report)
+    if absent.is_none() {
         let sum: f32 = probs.iter().map(|p| p.1).sum();
         if sum > 0.0 {
             let inv = 1.0 / sum;
@@ -172,20 +223,43 @@ pub fn sample_with_params_seeded(
     if min_p > 0.0 {
         let max_prob = probs[0].1; // Already sorted descending
         let threshold = min_p * max_prob;
+        if open {
+            // Every absent token must fall below the floor.
+            if absent_prob.is_some_and(|p| p >= threshold) {
+                return None;
+            }
+            open = false;
+        }
         probs.retain(|p| p.1 >= threshold);
+    }
+    // The tokens the top-p cut and the draw see must all survive the full
+    // row's top-n-sigma filter.
+    if sigma_kept.is_some_and(|kept| open || probs.len() > kept) {
+        return None;
     }
 
     // ── 6. Top-p (nucleus) ──
     if top_p < 1.0 {
-        let sum: f32 = probs.iter().map(|p| p.1).sum();
+        let tail = match absent {
+            Some(a) if open => (a.log_mass - max_val).exp(),
+            _ => 0.0,
+        };
+        let sum: f32 = probs.iter().map(|p| p.1).sum::<f32>() + tail;
         let mut cumsum = 0.0f32;
         let mut cutoff = probs.len();
+        let mut cut = false;
         for (i, &(_, prob)) in probs.iter().enumerate() {
             cumsum += prob / sum;
             if cumsum >= top_p {
                 cutoff = i + 1;
+                cut = true;
                 break;
             }
+        }
+        // With absent tokens still in, the nucleus must close on a present
+        // token that beats every absent one (`probs` is a prefix of `logits`).
+        if open && !(cut && beats_absent(logits[cutoff - 1].1, logits[cutoff - 1].0)) {
+            return None;
         }
         probs.truncate(cutoff);
     }
@@ -205,10 +279,10 @@ pub fn sample_with_params_seeded(
     for &(idx, prob) in &probs {
         cumsum += prob;
         if cumsum >= threshold {
-            return idx;
+            return Some(idx);
         }
     }
-    probs.last().map_or(0, |p| p.0)
+    Some(probs.last().map_or(0, |p| p.0))
 }
 
 /// Greedy pick with `max_by(partial_cmp.unwrap_or(Equal))` semantics —

@@ -104,3 +104,33 @@ fn verify_triples_refuse_a_grid_wider_than_the_load_ahead_limit() {
     }
     assert_eq!(gpu.launch_count(), launched);
 }
+
+/// The packed side projections' split: row r of the `[m, 32 + 128 + 128]`
+/// GEMM output lands at row r of each dense plane, column for column.
+#[test]
+fn packed_triple_split_lands_each_column_block_in_its_plane() {
+    let gpu = MockGpuBackend::new();
+    let (m, widths) = (5usize, [32u32, 128, 128]);
+    let n: usize = widths.iter().map(|&w| w as usize).sum();
+    let src_bytes: Vec<u8> = (0..m * n * 2).map(|i| (i * 7 + i / 251) as u8).collect();
+    let src = gpu.alloc(src_bytes.len()).unwrap();
+    gpu.copy_h2d(&src_bytes, src).unwrap();
+    let outs = widths.map(|w| gpu.alloc(m * w as usize * 2).unwrap());
+    split_columns(&gpu, src, outs, m as u32, widths, 0).unwrap();
+    assert_eq!(gpu.d2d_2d_count(), 3);
+    let mut col = 0;
+    for (out, w) in outs.into_iter().zip(widths) {
+        let w = w as usize * 2;
+        let mut got = vec![0u8; m * w];
+        gpu.copy_d2h(out, &mut got).unwrap();
+        for r in 0..m {
+            let row = &src_bytes[r * n * 2 + col..r * n * 2 + col + w];
+            assert_eq!(
+                &got[r * w..(r + 1) * w],
+                row,
+                "plane at column {col}, row {r}"
+            );
+        }
+        col += w;
+    }
+}

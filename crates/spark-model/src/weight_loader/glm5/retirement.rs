@@ -97,8 +97,12 @@ fn backend(gpu: &dyn GpuBackend) -> usize {
 
 impl<'s> RetirementLog<'s> {
     pub(crate) fn new(store: &'s WeightStore, gpu: &'s dyn GpuBackend) -> Result<Self> {
+        // Live owners only: a tensor already reclaimed (FP4-Local frees GBs
+        // of expanded sources mid-load) owns no memory, and its old address
+        // may now belong to a derived allocation.
         let mut index = store
             .names()
+            .filter(|name| !store.was_reclaimed(name))
             .map(|name| Identity::read(store, name))
             .collect::<Result<Vec<_>>>()?;
         index.sort_unstable_by_key(|owner| owner.ptr.0);
@@ -348,8 +352,9 @@ impl OwnershipReceipt {
             "failed GLM construction: {:?}",
             state.failure
         );
+        let live_names = || store.names().filter(|name| !store.was_reclaimed(name));
         ensure!(
-            store.len() == self.index.len(),
+            live_names().count() == self.index.len(),
             "changed checkpoint ownership count"
         );
         for owner in &self.index {
@@ -362,8 +367,8 @@ impl OwnershipReceipt {
                 "unknown checkpoint free outcome"
             );
         }
-        let mut live = HashMap::with_capacity(store.len() - state.attempts.len());
-        for name in store.names() {
+        let mut live = HashMap::with_capacity(self.index.len() - state.attempts.len());
+        for name in live_names() {
             if state.attempts.contains_key(name) {
                 continue;
             }

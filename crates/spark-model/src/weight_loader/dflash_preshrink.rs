@@ -53,7 +53,10 @@ pub fn preshrink(store: &mut WeightStore, layers: usize, gpu: &dyn GpuBackend) -
          (ATLAS_DFLASH_NVFP4_TC=1, ATLAS_W4A16_TC=1, no drafter FP8, Option B)"
     );
     let absmax = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
-    let quant = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
+    let quant = gpu.kernel(
+        "quantize_nvfp4",
+        crate::weight_loader::glm5_mode::weight_quantizer()?,
+    )?;
     let prefix = if store.contains("model.fc.weight") {
         "model."
     } else {

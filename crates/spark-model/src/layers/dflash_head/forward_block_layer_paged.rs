@@ -199,7 +199,9 @@ impl BlockDiffusionDraftHead {
         if let Some(ref conv) = layer.attention_conv {
             conv.prepare(
                 gpu,
-                &|src, w, dst, m, n, k| self.drafter_dense_gemm(gpu, src, w, dst, m, n, k, stream),
+                &|src, w, dst, m, n, k| {
+                    self.conv_delta_gemm(gpu, conv, src, w, dst, m, n, k, stream)
+                },
                 self.kernels.dflash2_conv,
                 scratch.norm_buf,
                 scratch.dflash2_conv_delta,
@@ -940,7 +942,9 @@ impl BlockDiffusionDraftHead {
         if let Some(ref conv) = layer.mlp_conv {
             conv.prepare(
                 gpu,
-                &|src, w, dst, m, n, k| self.drafter_dense_gemm(gpu, src, w, dst, m, n, k, stream),
+                &|src, w, dst, m, n, k| {
+                    self.conv_delta_gemm(gpu, conv, src, w, dst, m, n, k, stream)
+                },
                 self.kernels.dflash2_conv,
                 scratch.norm_buf,
                 scratch.dflash2_conv_delta,

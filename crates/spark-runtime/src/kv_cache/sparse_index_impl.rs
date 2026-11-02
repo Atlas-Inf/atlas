@@ -4,7 +4,7 @@
 
 use anyhow::{Result, bail};
 
-use super::{KvCacheConfig, PagedKvCache, SparseIndexCacheConfig};
+use super::{KvBuffer, KvCacheConfig, PagedKvCache, SparseIndexCacheConfig};
 use crate::gpu::{DevicePtr, GpuBackend};
 
 impl PagedKvCache {
@@ -31,45 +31,58 @@ impl PagedKvCache {
         }
         spec.block_bytes(self.config.block_size)?;
         let tails = tail_slots
-            .map(|plan| super::tail_slots::TailSlots::new(self.num_blocks, plan, gpu))
+            .map(|plan| {
+                super::tail_slots::TailSlots::new(self.num_blocks, plan, gpu, &self.placement)
+            })
             .transpose()?;
         let tail_entries = tails.as_ref().map_or(self.num_blocks, |t| t.capacity());
+        let tail_map = tails.as_ref().map_or(DevicePtr::NULL, |t| t.map);
         let values_stride = spec.values_block_bytes(self.config.block_size);
         let scales_stride = spec.scales_block_bytes(self.config.block_size);
         let tail_stride = spec.tail_block_bytes(self.config.block_size);
         let mut allocations: Vec<(DevicePtr, DevicePtr, DevicePtr)> =
             Vec::with_capacity(self.layers.len());
-        for _ in 0..self.layers.len() {
-            let values = match gpu.alloc(self.num_blocks * values_stride) {
+        let placement = &self.placement;
+        for layer in 0..self.layers.len() {
+            let values = match placement.alloc(
+                gpu,
+                KvBuffer::IndexValues(layer),
+                self.num_blocks * values_stride,
+            ) {
                 Ok(ptr) => ptr,
                 Err(error) => {
-                    free_allocations(gpu, allocations);
+                    free_allocations(gpu, allocations, tail_map);
                     return Err(error);
                 }
             };
             let scales = if scales_stride == 0 {
                 DevicePtr::NULL
             } else {
-                match gpu.alloc(self.num_blocks * scales_stride) {
+                match placement.alloc(
+                    gpu,
+                    KvBuffer::IndexScales(layer),
+                    self.num_blocks * scales_stride,
+                ) {
                     Ok(ptr) => ptr,
                     Err(error) => {
                         let _ = gpu.free(values);
-                        free_allocations(gpu, allocations);
+                        free_allocations(gpu, allocations, tail_map);
                         return Err(error);
                     }
                 }
             };
-            let tail = match gpu.alloc(tail_entries * tail_stride) {
+            let tail = match placement.alloc(
+                gpu,
+                KvBuffer::IndexTail(layer),
+                tail_entries * tail_stride,
+            ) {
                 Ok(ptr) => ptr,
                 Err(error) => {
                     let _ = gpu.free(values);
                     if !scales.is_null() {
                         let _ = gpu.free(scales);
                     }
-                    free_allocations(gpu, allocations);
-                    if let Some(tails) = tails {
-                        let _ = gpu.free(tails.map);
-                    }
+                    free_allocations(gpu, allocations, tail_map);
                     return Err(error);
                 }
             };
@@ -147,7 +160,11 @@ impl PagedKvCache {
     }
 }
 
-fn free_allocations(gpu: &dyn GpuBackend, allocations: Vec<(DevicePtr, DevicePtr, DevicePtr)>) {
+fn free_allocations(
+    gpu: &dyn GpuBackend,
+    allocations: Vec<(DevicePtr, DevicePtr, DevicePtr)>,
+    tail_map: DevicePtr,
+) {
     for (values, scales, tail) in allocations {
         let _ = gpu.free(values);
         if !scales.is_null() {
@@ -155,4 +172,11 @@ fn free_allocations(gpu: &dyn GpuBackend, allocations: Vec<(DevicePtr, DevicePtr
         }
         let _ = gpu.free(tail);
     }
+    if !tail_map.is_null() {
+        let _ = gpu.free(tail_map);
+    }
 }
+
+#[cfg(test)]
+#[path = "sparse_index_failure_tests.rs"]
+mod failure_tests;

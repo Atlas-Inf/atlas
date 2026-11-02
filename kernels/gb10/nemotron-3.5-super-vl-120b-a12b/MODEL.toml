@@ -101,6 +101,3 @@ resolves from common w4a16."""
 fp8_fp8_gemm_t_m128_mfast = "Same family — the pre-cast-A fp8 path falls back to the bf16-A arm that resolves."
 fp8_gemm_t_row_scaled = "Optional FP8 drafter probe (Phase G); only reached under ATLAS_DFLASH_DRAFTER_FP8=1, the BF16 drafter path is the default."
 fp8_gemm_t_row_scaled_m16 = "Optional small-M FP8 drafter twin; same opt-in Phase G gate, BF16 drafter fallback."
-
-
-

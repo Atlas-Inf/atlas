@@ -86,6 +86,10 @@ pub struct SchedLevers {
     /// Per-request deep MTP draft ceiling (`ATLAS_MTP_DYNAMIC_DEPTH=1`,
     /// `mtp_deep_depth`).
     pub mtp_dynamic_depth: bool,
+    /// `ATLAS_QWEN_COPY_DRAFTS=1`: prompt/reply copies in place of the MTP
+    /// head's propose where every verify row is serial decode's
+    /// (`copy_drafts::mtp`).
+    pub qwen_copy_drafts: bool,
     pub adadec_diagnostic: bool,
 
     /// Loop watchdog. **Runtime-mutable** — the TUI ops REPL toggles it while
@@ -194,6 +198,7 @@ impl SchedLevers {
             mtp_gate_force: mtp_gate_force(),
             mtp_single_depth_adapt: opt_in("ATLAS_MTP_SINGLE_DEPTH_ADAPT"),
             mtp_dynamic_depth: spark_model::speculative::deep_depth::enabled(),
+            qwen_copy_drafts: opt_in("ATLAS_QWEN_COPY_DRAFTS"),
             adadec_diagnostic: present("ATLAS_ADADEC_DIAGNOSTIC"),
 
             loop_watchdog: AtomicBool::new(false),
@@ -231,6 +236,7 @@ impl SchedLevers {
             mtp_gate_force: false,
             mtp_single_depth_adapt: false,
             mtp_dynamic_depth: false,
+            qwen_copy_drafts: false,
             adadec_diagnostic: false,
             loop_watchdog: AtomicBool::new(false),
         }
@@ -304,6 +310,7 @@ mod tests {
         );
         assert!(!d.mtp_dynamic_depth);
         assert!(!d.prefill_srpt && !d.prefill_queue_first_chunk);
+        assert!(!d.qwen_copy_drafts);
     }
 
     #[test]

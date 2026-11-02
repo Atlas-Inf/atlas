@@ -95,6 +95,7 @@ pub(super) async fn dispatch_streaming(
         max_tokens,
         req.min_tokens,
         req.ignore_eos,
+        req.disable_mtp,
         temperature,
         top_k,
         top_p,

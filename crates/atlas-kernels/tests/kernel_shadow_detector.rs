@@ -319,23 +319,26 @@ fn lightning_target_inherits_the_nano_hidden2688_shadows() {
     );
 }
 
-/// The qwen4_exp draft copies under `ATLAS_QWEN4EXP_SERVING_MODE` resolve
+/// The draft copies under a serving mode (`ATLAS_QWEN4EXP_SERVING_MODE`,
+/// `ATLAS_GLM_SERVING_MODE`) resolve
 /// `quantize_nvfp4::quantize_bf16_to_nvfp4_weight_rne`
-/// (`weight_loader/qwen4_exp/mode.rs`). Its target's shadow must declare it
-/// beside every common entry point the activation path resolves.
+/// (`weight_loader/{qwen4_exp,glm5}/mode.rs`). Each target's shadow must
+/// declare it beside every common entry point the activation path resolves.
 #[test]
-fn qwen4exp_target_ships_the_rne_weight_quantizer() {
+fn mode_targets_ship_the_rne_weight_quantizer() {
     let root = kernels_root().join("gb10");
-    let shadow = root.join("qwen3.8-flash-next/nvfp4/quantize_bf16_to_nvfp4.cu");
-    let found = entry_points(&shadow);
-    assert!(
-        found.contains("quantize_bf16_to_nvfp4_weight_rne"),
-        "{} must declare quantize_bf16_to_nvfp4_weight_rne, found {found:?}",
-        shadow.display()
-    );
     let common = entry_points(&root.join("common/quantize_bf16_to_nvfp4.cu"));
-    assert!(
-        common.is_subset(&found),
-        "{found:?} drops one of {common:?}"
-    );
+    for target in ["qwen3.8-flash-next", "glm-5.3-flash"] {
+        let shadow = root.join(target).join("nvfp4/quantize_bf16_to_nvfp4.cu");
+        let found = entry_points(&shadow);
+        assert!(
+            found.contains("quantize_bf16_to_nvfp4_weight_rne"),
+            "{} must declare quantize_bf16_to_nvfp4_weight_rne, found {found:?}",
+            shadow.display()
+        );
+        assert!(
+            common.is_subset(&found),
+            "{found:?} drops one of {common:?}"
+        );
+    }
 }

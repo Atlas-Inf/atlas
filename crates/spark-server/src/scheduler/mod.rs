@@ -19,6 +19,7 @@ mod beam_prefill;
 #[cfg(test)]
 mod cancel_test_model;
 mod confidence;
+pub(crate) mod copy_drafts;
 mod decode_logits_content;
 mod decode_logits_seq;
 mod decode_logits_step;
@@ -91,6 +92,7 @@ mod test_support;
 #[cfg(test)]
 mod think_skip_tests;
 pub(crate) mod tool_markers;
+mod ttft_trace;
 mod types;
 #[cfg(test)]
 mod verify_bias_tests;
@@ -104,6 +106,7 @@ mod verify_k4_batch_step;
 mod verify_k4_step;
 mod verify_k4_verdict;
 mod verify_pipeline_helper;
+mod vision_release;
 pub mod vocab_masks;
 
 use beam_prefill::resolve_beam_hyp;
@@ -387,6 +390,9 @@ pub fn run(
     std::thread::spawn(move || {
         let mut rx = request_rx;
         while let Some(req) = rx.blocking_recv() {
+            if ttft_trace::enabled() {
+                ttft_trace::arrive(&req.prompt_tokens_arc());
+            }
             p.0.lock().requests.push(req);
             p.1.notify_one();
         }
@@ -666,10 +672,15 @@ pub fn run(
             }
         }
 
+        // Every finished prefill passed through `active`: its pixels (and
+        // their in-flight vision permits) are no longer needed.
+        vision_release::release_prefilled_pixels(&mut active);
+
         // ── Start new requests ──
         let t_loop = std::time::Instant::now();
         let prefill_queue_was_empty = prefilling.is_empty();
         let in_flight_before = active.len() + prefilling.len();
+        ttft_trace::begin_tick();
         start_new_requests(
             &*model,
             &sched,
@@ -794,6 +805,7 @@ pub fn run(
 
         // Skip decode when mixed_forward already processed decode logits.
         mtp_step_trace::mark_decode(&mut step_trace, &active);
+        let ttft_step = ttft_trace::step_begin();
         if !did_mixed_step && !active.is_empty() {
             phase_continue_prefills::decode_share::note_decode_step();
             // Ensure any in-flight prefill work on the prefill stream is complete
@@ -927,15 +939,17 @@ pub fn run(
             // `--ngram-speculative` still falls through to MTP.
             if use_ngram_speculative
                 && active.len() == 1
-                && !(spec_slots_covered
-                    && active[0].grammar_state.is_none()
-                    && active[0].temperature == 0.0
-                    && verify_ctx_limit_batched.is_none_or(|lim| active[0].seq.seq_len + 4 <= lim))
+                && !spec_step::admission::ngram(
+                    &active[0],
+                    spec_slots_covered,
+                    verify_ctx_limit_batched,
+                )
             {
                 tracing::debug!(
-                    "ngram declined: grammar={} temp={} slots_covered={} seq_len={} lim={}",
+                    "ngram declined: grammar={} temp={} logprobs={:?} slots_covered={} seq_len={} lim={}",
                     active[0].grammar_state.is_some(),
                     active[0].temperature,
+                    active[0].top_logprobs,
                     spec_slots_covered,
                     active[0].seq.seq_len,
                     verify_ctx_limit_batched.unwrap_or(0),
@@ -943,10 +957,11 @@ pub fn run(
             }
             if use_ngram_speculative
                 && active.len() == 1
-                && spec_slots_covered
-                && active[0].grammar_state.is_none()
-                && active[0].temperature == 0.0
-                && verify_ctx_limit_batched.is_none_or(|lim| active[0].seq.seq_len + 4 <= lim)
+                && spec_step::admission::ngram(
+                    &active[0],
+                    spec_slots_covered,
+                    verify_ctx_limit_batched,
+                )
             {
                 // N-gram speculative: CPU proposer + CUDA-graphed K=2 verify.
                 if let Some(ref mut proposer) = ngram_proposer {
@@ -959,8 +974,8 @@ pub fn run(
                     // is what made the 2026-09-15 nvidia pack read "engages,
                     // accepts ~nothing" while the lane's own debug lines
                     // showed na=1 on 93 of 143 proposals (jobqueue 074). It
-                    // also feeds `usage.completion_tokens_details.
-                    // accepted_prediction_tokens`.
+                    // is raw verify telemetry. Completion usage separately
+                    // counts accepted draft tokens retained by emission.
                     //
                     // Deliberately NOT `mtp_accept_debug::record`: that
                     // histogram steers `adaptive_rung`'s MTP dispatch width,
@@ -980,8 +995,7 @@ pub fn run(
                 }
             } else if use_self_speculative
                 && active.len() == 1
-                && spec_slots_covered
-                && active[0].grammar_state.is_none()
+                && spec_step::admission::self_spec(&active[0], spec_slots_covered)
             {
                 // Self-speculative: draft via layer-skipping, verify with full model.
                 // Clamped to the active slot's tiered verify capacity, like
@@ -1257,6 +1271,7 @@ pub fn run(
         );
         active.extend(rode_seqs);
         mtp_step_trace::finish(step_trace, &active);
+        ttft_trace::step_end(ttft_step, &active);
 
         let t_loop = std::time::Instant::now();
         // Deadline sweep BEFORE retirement, so a timed-out sequence retires

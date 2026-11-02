@@ -67,8 +67,11 @@ impl GpuBackend for TestGpu {
             // The latent shard's kernels (`mla_shard_tests.rs`).
             return Ok(KernelHandle(match symbol {
                 "glm_kv_shard_map_slots" => 830,
-                "glm_kv_shard_localize" => 831,
+                "glm_kv_shard_localize_compact" => 831,
                 "glm_kv_shard_copy_blocks" => 832,
+                "glm_kv_canonical_partition" => 834,
+                s if s.ends_with("_split_counted_pair") => 835,
+                "glm_sparse_decode_split_merge_pair" => 836,
                 _ => 833,
             }));
         }

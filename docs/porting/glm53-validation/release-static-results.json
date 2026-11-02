@@ -1,0 +1,113 @@
+{
+  "revision": "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e",
+  "tree": "4027d7a9cde20bf7bc68c05d58f0ecfb0e58b1b5",
+  "repo": "/home/abc/storage/models/atlas-glm53-release-no-mtp",
+  "started_utc": "2026-10-15T15:36:45.908984+00:00",
+  "clean_before": true,
+  "status": "PASS",
+  "checks": [
+    {
+      "name": "mdbook",
+      "command": [
+        "/home/abc/storage/models/atlas-glm53-port-audit/tools/bin/mdbook",
+        "build",
+        "book",
+        "--dest-dir",
+        "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/release-final-cb45065c-20261015/static-checks/book"
+      ],
+      "cwd": "/home/abc/storage/models/atlas-glm53-release-no-mtp",
+      "exit_code": 0,
+      "elapsed_seconds": 0.26596903800964355,
+      "log": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/release-final-cb45065c-20261015/static-checks/mdbook.log",
+      "log_sha256": "e3a71a25d94b6d3a0fb00fc6cf1608958a991ab3454de85c0a77c4a979d07ad0",
+      "error": null
+    },
+    {
+      "name": "kernel-shadows",
+      "command": [
+        "python3",
+        "scripts/check_kernel_shadows.py"
+      ],
+      "cwd": "/home/abc/storage/models/atlas-glm53-release-no-mtp",
+      "exit_code": 0,
+      "elapsed_seconds": 0.11656951904296875,
+      "log": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/release-final-cb45065c-20261015/static-checks/kernel-shadows.log",
+      "log_sha256": "8a0b1c07f5e75142c684ce43a04be8f1131f8e16b348642d8b980dc3f244cc6e",
+      "error": null
+    },
+    {
+      "name": "typos",
+      "command": [
+        "/home/abc/storage/models/atlas-glm53-port-audit/tools/bin/typos"
+      ],
+      "cwd": "/home/abc/storage/models/atlas-glm53-release-no-mtp",
+      "exit_code": 0,
+      "elapsed_seconds": 0.5659115314483643,
+      "log": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/release-final-cb45065c-20261015/static-checks/typos.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "error": null
+    },
+    {
+      "name": "headers",
+      "command": [
+        "bash",
+        "scripts/check-license-headers.sh"
+      ],
+      "cwd": "/home/abc/storage/models/atlas-glm53-release-no-mtp",
+      "exit_code": 0,
+      "elapsed_seconds": 9.74590253829956,
+      "log": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/release-final-cb45065c-20261015/static-checks/headers.log",
+      "log_sha256": "7831d2f6f43fc56e0f282949308c8316c2048a11e49bc1de56dc59032df41562",
+      "error": null
+    },
+    {
+      "name": "file-size",
+      "command": [
+        "bash",
+        "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/release-final-cb45065c-20261015/static-checks/file-size-workflow.sh"
+      ],
+      "cwd": "/home/abc/storage/models/atlas-glm53-release-no-mtp",
+      "exit_code": 0,
+      "elapsed_seconds": 13.704329490661621,
+      "log": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/release-final-cb45065c-20261015/static-checks/file-size.log",
+      "log_sha256": "c8c6808fd4d71f83535a934aa2e2d0969c4be0a026cb72127cef898f4c14c57e",
+      "error": null
+    }
+  ],
+  "input_sha256": {
+    ".github/workflows/file-size-cap.yml": "d1b716825f7b3df37d6f32974187b4362452b6ad1b7695916295c0e00f6a635e",
+    "scripts/check_kernel_shadows.py": "0a24977b3b208e3aa61d864280d7df12e6380e96d0727bcc298227e408fe2adc",
+    "scripts/check-license-headers.sh": "e55424fc1ebf486e8bedd8fbbc9040b9be64553318950d01f09375f590f460e2",
+    ".licenserc.yaml": "8bbce9dc27a3dc189fd2cf1162dd0aa37e851061440ee9afdc8f9ed8bcf0833f"
+  },
+  "extracted_workflow_sha256": "f732982df2ea51f9923662f76def7a034593c2ca07ca185bad7fa490d74afeba",
+  "tools": {
+    "typos": {
+      "path": "/home/abc/storage/models/atlas-glm53-port-audit/tools/bin/typos",
+      "sha256": "ddc34e594c4626757740eb872f7d07e4eeb61155fe2921662697fbab2461ed49",
+      "version": "typos-cli 1.49.0",
+      "returncode": 0
+    },
+    "mdbook": {
+      "path": "/home/abc/storage/models/atlas-glm53-port-audit/tools/bin/mdbook",
+      "sha256": "dd131662665dd91880c8c23d867d36f6a8554286216c3a849b53a27d1a676917",
+      "version": "mdbook v0.4.40",
+      "returncode": 0
+    }
+  },
+  "license_engine_before": {
+    "returncode": 0,
+    "stdout": "[\n    {\n        \"Id\": \"sha256:80c44d92740ae6ad87b7c4fafdfd7cba01ec1c0ffa265493010d112336f62291\",\n        \"RepoTags\": [\n            \"ghcr.io/apache/skywalking-eyes/license-eye:latest\"\n        ],\n        \"RepoDigests\": [\n            \"ghcr.io/apache/skywalking-eyes/license-eye@sha256:80c44d92740ae6ad87b7c4fafdfd7cba01ec1c0ffa265493010d112336f62291\"\n        ],\n        \"Comment\": \"buildkit.dockerfile.v0\",\n        \"Created\": \"2026-08-24T10:48:03.712997138Z\",\n        \"Config\": {\n            \"Env\": [\n                \"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\n            ],\n            \"Entrypoint\": [\n                \"/bin/license-eye\"\n            ],\n            \"WorkingDir\": \"/github/workspace/\"\n        },\n        \"Architecture\": \"amd64\",\n        \"Os\": \"linux\",\n        \"Size\": 17457946,\n        \"RootFS\": {\n            \"Type\": \"layers\",\n            \"Layers\": [\n                \"sha256:34884abbe92863fce933ed7c39c0e045631af0ed86d5cc0dfbdf9fdca426ce3c\",\n                \"sha256:d8199737daa423965107dbcbef92c5bfa7d9facbb58f50a8a13765617d4a8e6f\",\n                \"sha256:9f2aaa438fcf627be1e2d7ac0ac0cc69c7a9395184a4050d139dcfdc5531c303\"\n            ]\n        },\n        \"Metadata\": {\n            \"LastTagTime\": \"2026-08-27T04:06:41.830358474Z\"\n        },\n        \"Descriptor\": {\n            \"mediaType\": \"application/vnd.oci.image.index.v1+json\",\n            \"digest\": \"sha256:80c44d92740ae6ad87b7c4fafdfd7cba01ec1c0ffa265493010d112336f62291\",\n            \"size\": 1607\n        }\n    }\n]\n",
+    "stderr": ""
+  },
+  "head_after": "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e",
+  "tree_after": "4027d7a9cde20bf7bc68c05d58f0ecfb0e58b1b5",
+  "status_after": "",
+  "license_engine_after": {
+    "returncode": 0,
+    "stdout": "[\n    {\n        \"Id\": \"sha256:80c44d92740ae6ad87b7c4fafdfd7cba01ec1c0ffa265493010d112336f62291\",\n        \"RepoTags\": [\n            \"ghcr.io/apache/skywalking-eyes/license-eye:latest\"\n        ],\n        \"RepoDigests\": [\n            \"ghcr.io/apache/skywalking-eyes/license-eye@sha256:80c44d92740ae6ad87b7c4fafdfd7cba01ec1c0ffa265493010d112336f62291\"\n        ],\n        \"Comment\": \"buildkit.dockerfile.v0\",\n        \"Created\": \"2026-08-24T10:48:03.712997138Z\",\n        \"Config\": {\n            \"Env\": [\n                \"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\n            ],\n            \"Entrypoint\": [\n                \"/bin/license-eye\"\n            ],\n            \"WorkingDir\": \"/github/workspace/\"\n        },\n        \"Architecture\": \"amd64\",\n        \"Os\": \"linux\",\n        \"Size\": 17457946,\n        \"RootFS\": {\n            \"Type\": \"layers\",\n            \"Layers\": [\n                \"sha256:34884abbe92863fce933ed7c39c0e045631af0ed86d5cc0dfbdf9fdca426ce3c\",\n                \"sha256:d8199737daa423965107dbcbef92c5bfa7d9facbb58f50a8a13765617d4a8e6f\",\n                \"sha256:9f2aaa438fcf627be1e2d7ac0ac0cc69c7a9395184a4050d139dcfdc5531c303\"\n            ]\n        },\n        \"Metadata\": {\n            \"LastTagTime\": \"2026-08-27T04:06:41.830358474Z\"\n        },\n        \"Descriptor\": {\n            \"mediaType\": \"application/vnd.oci.image.index.v1+json\",\n            \"digest\": \"sha256:80c44d92740ae6ad87b7c4fafdfd7cba01ec1c0ffa265493010d112336f62291\",\n            \"size\": 1607\n        }\n    }\n]\n",
+    "stderr": ""
+  },
+  "finished_utc": "2026-10-15T15:36:59.832100+00:00",
+  "clean_after": true
+}

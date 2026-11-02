@@ -122,35 +122,52 @@ fn two_images_each_advance_the_running_position() {
 
 // ── video ────────────────────────────────────────────────────────────────
 
-/// ★ The rule video exists for. Three temporal groups over a 2×2 grid: T
-/// advances once per GROUP while H and W restart each group, and the item
-/// advances the running position by max(3, 2, 2) = 3.
+/// Qwen3.8 splits a video into timestamped frame ranges. Each range has
+/// `grid_t=1`, so T starts at that range's base; the timestamp and marker
+/// boundaries advance the ordinary text position between planes.
 #[test]
-fn a_video_advances_t_once_per_temporal_group() {
+fn a_qwen_video_uses_one_mrope_range_per_timestamped_frame() {
     let tokens = [
-        TXT, VID, VID, VID, VID, VID, VID, VID, VID, VID, VID, VID, VID, TXT,
+        TXT, 8, 9, 11, VID, VID, VID, VID, 12, 8, 9, 11, VID, VID, VID, VID, 12, 8, 9, 11, VID,
+        VID, VID, VID, 12, TXT,
     ];
     let (t, h, w) = run(&tokens, &[(3, 2, 2)], 0);
 
-    // base = 1. Group g gets T = 1 + g, four tokens each.
+    // Timestamp/vision boundaries are ordinary positions. Each four-token
+    // frame plane starts at the current base and advances by max(2, 2) = 2.
     assert_eq!(
         t,
-        vec![0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4],
-        "T must step per group"
+        vec![
+            0, 1, 2, 3, 4, 4, 4, 4, 6, 7, 8, 9, 10, 10, 10, 10, 12, 13, 14, 15, 16, 16, 16, 16, 18,
+            19
+        ],
+        "T must restart at each timestamp-separated frame"
     );
-    // H and W repeat their 2x2 pattern in every group.
-    assert_eq!(h, vec![0, 1, 1, 2, 2, 1, 1, 2, 2, 1, 1, 2, 2, 4]);
-    assert_eq!(w, vec![0, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 4]);
-    // Trailing text at 1 + max(3, 2, 2) = 4.
-    assert_eq!(*t.last().unwrap(), 4);
+    assert_eq!(
+        h,
+        vec![
+            0, 1, 2, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 10, 11, 11, 12, 13, 14, 15, 16, 16, 17, 17, 18,
+            19
+        ]
+    );
+    assert_eq!(
+        w,
+        vec![
+            0, 1, 2, 3, 4, 5, 4, 5, 6, 7, 8, 9, 10, 11, 10, 11, 12, 13, 14, 15, 16, 17, 16, 17, 18,
+            19
+        ]
+    );
+    assert_eq!(
+        *t.last().unwrap(),
+        19,
+        "trailing text follows the final frame"
+    );
 }
 
-/// A clip longer than it is wide must advance by its TEMPORAL extent. If the
-/// advance assumed the spatial pair dominates, a long video would overlap the
-/// text that follows it — every subsequent token sharing positions with the
-/// tail of the clip.
+/// Each Qwen timestamp-separated frame is a one-group vision range. A long
+/// clip therefore advances by its spatial extent once per frame.
 #[test]
-fn a_long_clip_advances_by_its_temporal_extent() {
+fn a_long_clip_advances_by_one_spatial_extent_per_qwen_frame() {
     let t_len = 10usize;
     let mut tokens = vec![TXT];
     tokens.extend(std::iter::repeat_n(VID, t_len)); // 1x1 grid
@@ -377,4 +394,72 @@ fn qwen3vl_chunk_boundary_mid_video_slices_correctly() {
     assert_eq!(&t[7..11], &[5, 5, 5, 5]);
     assert_eq!(t[11], 7);
     let _ = (h, w);
+}
+
+// ── resumed prefill (cache hit / later chunk) ────────────────────────────
+
+/// `walk_rows` over `rows`, as three vectors.
+fn rows_of(
+    walk: Walk,
+    tokens: &[u32],
+    grids: &[(usize, usize, usize)],
+    rows: std::ops::Range<usize>,
+) -> [Vec<u32>; 3] {
+    let (mut t, mut h, mut w) = (Vec::new(), Vec::new(), Vec::new());
+    walk_rows(
+        walk,
+        tokens,
+        grids,
+        0,
+        grids.len(),
+        (IMG, VID),
+        rows,
+        [&mut t, &mut h, &mut w],
+    )
+    .unwrap();
+    [t, h, w]
+}
+
+#[test]
+fn every_row_range_is_positioned_as_the_whole_prompt_positions_it() {
+    // Text, a 2x3 image, text, a 2x2 image, text. A prefill resuming after a
+    // cached prefix (or any later chunk) computes rows `[a, b)`: their
+    // positions must equal the full prompt's, or a cache hit would feed the
+    // layers different rotary positions than the miss it replaces. The
+    // chunk-local walk restarted at the linear position `a` and at item 0.
+    let tokens: Vec<u32> = std::iter::repeat_n(TXT, 3)
+        .chain(std::iter::repeat_n(IMG, 6))
+        .chain(std::iter::repeat_n(TXT, 2))
+        .chain(std::iter::repeat_n(IMG, 4))
+        .chain(std::iter::repeat_n(TXT, 3))
+        .collect();
+    let grids = [(1, 2, 3), (1, 2, 2)];
+    for walk in [Walk::Generic, Walk::Qwen3vl] {
+        let full = rows_of(walk, &tokens, &grids, 0..tokens.len());
+        for a in 0..tokens.len() {
+            for b in a + 1..=tokens.len() {
+                let got = rows_of(walk, &tokens, &grids, a..b);
+                for s in 0..3 {
+                    assert_eq!(got[s], full[s][a..b], "stream {s}, rows {a}..{b}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_row_range_past_the_prompt_fails_its_request_only() {
+    let (mut t, mut h, mut w) = (Vec::new(), Vec::new(), Vec::new());
+    let err = walk_rows(
+        Walk::Generic,
+        &[TXT, IMG],
+        &[(1, 1, 1)],
+        0,
+        1,
+        (IMG, VID),
+        1..3,
+        [&mut t, &mut h, &mut w],
+    )
+    .unwrap_err();
+    assert!(crate::request_local::is_request_local(&err));
 }

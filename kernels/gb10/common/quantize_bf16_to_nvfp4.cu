@@ -167,6 +167,66 @@ extern "C" __global__ void nvfp4_global_absmax(
     }
 }
 
+// One 16-element group `g` of a row: its E4M3 scale and its 8 packed bytes.
+// Groups are independent, so any group-to-thread mapping writes the same
+// bytes (glm_moe_route.cu quantizes the MoE input with it beside the router).
+__device__ __forceinline__ void nvfp4_quantize_group(
+    const __nv_bfloat16* __restrict__ row_in,
+    unsigned char* __restrict__ row_packed,
+    unsigned char* __restrict__ row_scale,
+    unsigned int g,
+    float scale2,
+    float inv_scale2
+) {
+    unsigned int base = g * GROUP_SIZE;
+
+    // Find group max absolute value
+    float group_max = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < GROUP_SIZE; i++) {
+        float v = fabsf(__bfloat162float(row_in[base + i]));
+        if (v > group_max) group_max = v;
+    }
+
+    // Compute FP8 scale: fp8_val ≈ group_max / 6.0 / scale2
+    // Use software float→E4M3 conversion (SM121 hardware cast may fail)
+    float fp8_float = (group_max > 0.0f) ? (group_max * inv_scale2 / 6.0f) : 0.0f;
+    unsigned char fp8_byte = float_to_fp8_e4m3(fp8_float);
+    row_scale[g] = fp8_byte;
+
+    // Effective scale for quantization — dequant the FP8 scale back to float
+    // using the E4M3 LUT (or recompute from bits)
+    unsigned int fp8_sign = (fp8_byte >> 7) & 1;
+    unsigned int fp8_exp = (fp8_byte >> 3) & 0xF;
+    unsigned int fp8_man = fp8_byte & 0x7;
+    float fp8_decoded;
+    if (fp8_exp == 0) {
+        fp8_decoded = (float)fp8_man * 0.001953125f;  // 2^(-9) per mantissa unit
+    } else if (fp8_exp == 15 && fp8_man == 7) {
+        fp8_decoded = 0.0f;  // NaN → 0
+    } else {
+        unsigned int f32_bits = ((fp8_exp + 120u) << 23) | (fp8_man << 20);
+        fp8_decoded = __uint_as_float(f32_bits);
+    }
+    if (fp8_sign) fp8_decoded = -fp8_decoded;
+
+    float effective_scale = fp8_decoded * scale2;
+    float inv_eff = (effective_scale > 0.0f) ? (1.0f / effective_scale) : 0.0f;
+
+    // Quantize 16 elements → 8 packed bytes
+    #pragma unroll
+    for (int i = 0; i < GROUP_SIZE; i += 2) {
+        float v0 = __bfloat162float(row_in[base + i]) * inv_eff;
+        float v1 = __bfloat162float(row_in[base + i + 1]) * inv_eff;
+
+        unsigned int n0 = quantize_e2m1(v0);
+        unsigned int n1 = quantize_e2m1(v1);
+
+        // Pack: low nibble = even position, high nibble = odd position
+        row_packed[g * 8 + i / 2] = (unsigned char)((n1 << 4) | (n0 & 0xF));
+    }
+}
+
 // ── Phase 2: Quantize BF16 → NVFP4 ──
 //
 // Grid: (N, 1, 1)  Block: (256, 1, 1)
@@ -193,53 +253,6 @@ extern "C" __global__ void quantize_bf16_to_nvfp4(
     float inv_scale2 = (scale2 > 0.0f) ? (1.0f / scale2) : 0.0f;
     unsigned int num_groups = K / GROUP_SIZE;
 
-    for (unsigned int g = threadIdx.x; g < num_groups; g += blockDim.x) {
-        unsigned int base = g * GROUP_SIZE;
-
-        // Find group max absolute value
-        float group_max = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < GROUP_SIZE; i++) {
-            float v = fabsf(__bfloat162float(row_in[base + i]));
-            if (v > group_max) group_max = v;
-        }
-
-        // Compute FP8 scale: fp8_val ≈ group_max / 6.0 / scale2
-        // Use software float→E4M3 conversion (SM121 hardware cast may fail)
-        float fp8_float = (group_max > 0.0f) ? (group_max * inv_scale2 / 6.0f) : 0.0f;
-        unsigned char fp8_byte = float_to_fp8_e4m3(fp8_float);
-        row_scale[g] = fp8_byte;
-
-        // Effective scale for quantization — dequant the FP8 scale back to float
-        // using the E4M3 LUT (or recompute from bits)
-        unsigned int fp8_sign = (fp8_byte >> 7) & 1;
-        unsigned int fp8_exp = (fp8_byte >> 3) & 0xF;
-        unsigned int fp8_man = fp8_byte & 0x7;
-        float fp8_decoded;
-        if (fp8_exp == 0) {
-            fp8_decoded = (float)fp8_man * 0.001953125f;  // 2^(-9) per mantissa unit
-        } else if (fp8_exp == 15 && fp8_man == 7) {
-            fp8_decoded = 0.0f;  // NaN → 0
-        } else {
-            unsigned int f32_bits = ((fp8_exp + 120u) << 23) | (fp8_man << 20);
-            fp8_decoded = __uint_as_float(f32_bits);
-        }
-        if (fp8_sign) fp8_decoded = -fp8_decoded;
-
-        float effective_scale = fp8_decoded * scale2;
-        float inv_eff = (effective_scale > 0.0f) ? (1.0f / effective_scale) : 0.0f;
-
-        // Quantize 16 elements → 8 packed bytes
-        #pragma unroll
-        for (int i = 0; i < GROUP_SIZE; i += 2) {
-            float v0 = __bfloat162float(row_in[base + i]) * inv_eff;
-            float v1 = __bfloat162float(row_in[base + i + 1]) * inv_eff;
-
-            unsigned int n0 = quantize_e2m1(v0);
-            unsigned int n1 = quantize_e2m1(v1);
-
-            // Pack: low nibble = even position, high nibble = odd position
-            row_packed[g * 8 + i / 2] = (unsigned char)((n1 << 4) | (n0 & 0xF));
-        }
-    }
+    for (unsigned int g = threadIdx.x; g < num_groups; g += blockDim.x)
+        nvfp4_quantize_group(row_in, row_packed, row_scale, g, scale2, inv_scale2);
 }

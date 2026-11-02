@@ -61,6 +61,7 @@ fn projections(gpu: &MockGpuBackend, config: &ModelConfig) -> ([Mxfp8Proj; 4], M
     let kv_dim = config.num_key_value_heads * config.head_dim;
     let proj = |n: usize, k: usize| Mxfp8Proj {
         w: Mxfp8Weight {
+            tiled: false,
             data: gpu.alloc(n * k).unwrap(),
             scales: gpu.alloc(n * k / 32).unwrap(),
         },

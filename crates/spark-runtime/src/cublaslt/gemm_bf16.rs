@@ -23,11 +23,14 @@ pub(super) fn gemm_bf16(
     } else {
         kchain_pin::Pick::First
     };
-    gemm_bf16_pick(act, weight, out, [m, n, k], op_a, pick, stream).map(|_| ())
+    gemm_bf16_pick(act, weight, out, [m, n, k], op_a, pick, CUDA_R_16BF, stream).map(|_| ())
 }
 
-/// [`gemm_bf16`] with the algorithm choice explicit (`kchain_pin::Pick`);
-/// `Ok(false)`: `Pick::Force` found no k-chain kernel and launched nothing.
+/// [`gemm_bf16`] with the algorithm choice explicit (`kchain_pin::Pick`) and
+/// the output element `out_type` (`CUDA_R_16BF`, or `CUDA_R_32F` for the
+/// FP32 accumulator unrounded); `Ok(false)`: `Pick::Force` found no k-chain
+/// kernel and launched nothing.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn gemm_bf16_pick(
     act: u64,
     weight: u64,
@@ -35,6 +38,7 @@ pub(super) fn gemm_bf16_pick(
     [m, n, k]: [u32; 3],
     op_a: i32,
     pick: kchain_pin::Pick,
+    out_type: i32,
     stream: u64,
 ) -> Result<bool> {
     let ctx = ctx()?;
@@ -84,7 +88,7 @@ pub(super) fn gemm_bf16_pick(
             "LayoutB",
         )?;
         chk(
-            cublasLtMatrixLayoutCreate(&mut ld_, CUDA_R_16BF, n as u64, m as u64, n as i64),
+            cublasLtMatrixLayoutCreate(&mut ld_, out_type, n as u64, m as u64, n as i64),
             "LayoutD",
         )?;
         let mut pref: cublasLtMatmulPreference_t = std::ptr::null_mut();

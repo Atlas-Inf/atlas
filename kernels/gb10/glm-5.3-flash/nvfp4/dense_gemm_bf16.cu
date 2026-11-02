@@ -42,7 +42,9 @@ extern "C" __global__ void dense_gemm_bf16_pipelined_triple_n(
 // keeps one thread per real (row, column) output, raises the grid from five to
 // eighteen CTAs for GLM's N=288 router, and retains the identical scalar
 // k=0..K-1 FP32 accumulation chain. This translation unit is compiled with
-// --fmad=false, so no FMA reassociation is introduced.
+// --fmad=false, so no FMA reassociation is introduced. The logits are FP32
+// (the checkpoint's `moe_router_dtype: float32`), as are those of the GLM
+// router kernels below.
 //
 // Grid: (ceil(N/16), 1, 1)  Block: (16, 5, 1). Dispatch is shape-guarded.
 #define R5_M 5
@@ -52,7 +54,7 @@ extern "C" __global__ void dense_gemm_bf16_pipelined_triple_n(
 extern "C" __global__ void dense_gemm_bf16_router_m5(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
-    __nv_bfloat16* __restrict__ C,
+    float* __restrict__ C,
     unsigned int M,
     unsigned int N,
     unsigned int K
@@ -113,7 +115,7 @@ extern "C" __global__ void dense_gemm_bf16_router_m5(
         __syncthreads();
     }
 
-    if (col < N) C[(size_t)row * N + col] = __float2bfloat16(acc);
+    if (col < N) C[(size_t)row * N + col] = acc;
 }
 
 #undef R5_BK
@@ -129,7 +131,7 @@ extern "C" __global__ void dense_gemm_bf16_router_m5(
 // a [<=16, 288] router product only 18 or 5 blocks. Here one warp owns one
 // output column n and lane m owns C[m, n]: every lane accumulates in strict
 // k = 0..K-1 order with the same separate FMUL/FADD (--fmad=false) as the
-// scalar kernel, so each output is BIT-IDENTICAL to dense_gemm_bf16, while
+// scalar kernel, so each output is BIT-IDENTICAL to dense_gemm_bf16_f32out, while
 // all M*N accumulators run concurrently. The warp first stages its weight row
 // in shared memory with coalesced loads, so the sequential chain reads the
 // weight as a shared-memory broadcast instead of one dependent global load
@@ -141,7 +143,7 @@ extern "C" __global__ void dense_gemm_bf16_router_m5(
 extern "C" __global__ void __launch_bounds__(128) dense_gemm_bf16_router_rows(
     const __nv_bfloat16* __restrict__ A,  // [M, K]
     const __nv_bfloat16* __restrict__ B,  // [N, K]
-    __nv_bfloat16* __restrict__ C,        // [M, N]
+    float* __restrict__ C,                // [M, N] FP32 logits
     unsigned int M,
     unsigned int N,
     unsigned int K
@@ -194,5 +196,5 @@ extern "C" __global__ void __launch_bounds__(128) dense_gemm_bf16_router_rows(
     for (; k < K; ++k) {
         acc += __bfloat162float(a[k]) * __bfloat162float(b[k]);
     }
-    C[(unsigned long long)lane * N + n] = __float2bfloat16(acc);
+    C[(unsigned long long)lane * N + n] = acc;
 }

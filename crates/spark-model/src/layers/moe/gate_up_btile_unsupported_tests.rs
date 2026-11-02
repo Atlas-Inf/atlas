@@ -29,7 +29,7 @@ fn actual_native_converters_refuse_published_storage_without_work() {
                 .map(|_| ()),
             3 => layer.transpose_for_prefill_hybrid(&gpu, &config),
             4 => layer.build_cutlass_grouped_sfb(&gpu, &config, 91),
-            5 => layer.repack_nvfp4_mmq_unified(&gpu, &config),
+            5 => layer.repack_nvfp4_mmq_unified(&gpu, &config, &store),
             6 => layer.forward_atomic_c4_decode(arena.norm_output(), 4, &ctx, 91),
             _ => layer.forward_token_major_decode(arena.norm_output(), 4, &ctx, 91),
         };

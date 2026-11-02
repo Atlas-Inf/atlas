@@ -66,6 +66,7 @@ impl TransformerModel {
     /// + layer forward before read. Saves 7 memsets × (chunks-1) per prefill.
     pub(super) fn prefill_b_zero_and_embed(
         &self,
+        seq: &SequenceState,
         run: bool,
         tokens: &[u32],
         chunk_start: usize,
@@ -85,7 +86,7 @@ impl TransformerModel {
         self.warm_trace_sync(stream)?;
         let zero = t0.elapsed();
         // ── Phase 1+1b: embed chunk + vision pad overlay ──
-        self.prefill_b_embed_chunk(tokens, chunk_start, chunk_len, stream)?;
+        self.prefill_b_embed_chunk(seq, tokens, chunk_start, chunk_len, stream)?;
         self.warm_trace_sync(stream)?;
         Ok([zero, t0.elapsed() - zero])
     }

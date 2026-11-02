@@ -14,6 +14,24 @@ use crate::weight_map::DenseWeight;
 use spark_runtime::gpu::DevicePtr;
 
 impl BlockDiffusionDraftHead {
+    /// The selector's anchor and min_tokens ban for this propose, in the
+    /// device slots `seed_markov_prev` wrote.
+    pub(super) fn selector_anchor(
+        last_token: u32,
+        ban_depth: u32,
+        scratch: &DflashScratch,
+    ) -> super::selector::SelectorAnchor {
+        super::selector::SelectorAnchor {
+            token: last_token,
+            token_dev: scratch.markov_prev_dev,
+            ban_depth,
+            ban_depth_dev: scratch
+                .markov_prev_dev
+                .offset(super::MARKOV_BAN_DEPTH_OFFSET),
+            end_ids: crate::traits::EosBan::model_end_ids(),
+        }
+    }
+
     /// Argmax each γ row. When Markov weights are bound, add the sequential
     /// transition bias first using `last_token` as the position-0 previous.
     /// A DFlash2 selector walks from the anchor seeded in `markov_prev_dev`
@@ -31,17 +49,8 @@ impl BlockDiffusionDraftHead {
     ) -> Result<()> {
         let bf16 = 2usize;
         if let Some(ref selector) = self.candidate_selector {
-            let anchor = super::selector::SelectorAnchor {
-                token: last_token,
-                token_dev: scratch.markov_prev_dev,
-                ban_depth,
-                ban_depth_dev: scratch
-                    .markov_prev_dev
-                    .offset(super::MARKOV_BAN_DEPTH_OFFSET),
-                end_ids: crate::traits::EosBan::model_end_ids(),
-            };
             return selector.select_candidates(
-                anchor,
+                Self::selector_anchor(last_token, ban_depth, scratch),
                 hidden_buf,
                 scratch.logits,
                 scratch.dflash2_projected_hidden,

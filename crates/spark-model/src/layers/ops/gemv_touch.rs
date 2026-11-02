@@ -136,11 +136,51 @@ fn settings() -> Option<(u64, u32)> {
     })
 }
 
+/// `(touch_rows, touch_ctas)` for a native GEMV launch (`ops::fp8b`: the FP8
+/// block tiers, their K-slice tiers and the multi-projection launches, which
+/// are PDL-entered and carry the touch themselves) of `m` rows over weights
+/// of `n` rows of `row_bytes` (values plus scales) on `grid_x` CTAs a
+/// projection: the twins' geometry with `ATLAS_GLM_DECODE_GEMV_BATCH=1` under
+/// PDL, up to 16 rows (the 32-row tiers lost time to the touch,
+/// scripts/dev/glm_decode_gemv_touch_bench.cu); `(0, 0)`, plain PDL entry,
+/// otherwise.
+pub fn native_touch(m: u32, n: u32, row_bytes: u32, grid_x: u32) -> (u32, u32) {
+    match settings() {
+        Some((bytes, ctas)) if m <= 16 && spark_runtime::cuda_backend::pdl_enabled() => (
+            (bytes / u64::from(row_bytes.max(1))).min(u64::from(n)) as u32,
+            ctas.min(grid_x),
+        ),
+        _ => (0, 0),
+    }
+}
+
+/// The function a twin resolves: its `TWINS` name, except that the W4A16
+/// tensor-core twins follow the tier they stand in for
+/// (`w4a16_gemv_tiers::tc_name`: all `tc8` under `ATLAS_GLM_CANONICAL_VERIFY`).
+fn twin_func(func: &str, canonical_target: bool) -> String {
+    let w4_tc =
+        |rows, suffix| crate::layers::w4a16_gemv_tiers::tc_name(rows, suffix, canonical_target);
+    match func {
+        "w4a16_gemv_tc8_touch" => w4_tc(8, "_touch"),
+        "w4a16_gemv_tc16_touch" => w4_tc(16, "_touch"),
+        "w4a16_gemv_tc32_touch" => w4_tc(32, "_touch"),
+        "w4a16_gemv_tc8_pair_touch" => w4_tc(8, "_pair_touch"),
+        "w4a16_gemv_tc16_pair_touch" => w4_tc(16, "_pair_touch"),
+        "w4a16_gemv_tc32_pair_touch" => w4_tc(32, "_pair_touch"),
+        _ => func.to_string(),
+    }
+}
+
 /// The twin handles, in [`Twin`] order, when `on`: looked up with the kernels
 /// around them so the boot audit sees them before it seals. No lookup when
 /// off, so a target without the twins leaves no failed row in the audit.
 fn twin_table(gpu: &dyn GpuBackend, on: bool) -> Option<[KernelHandle; TWINS.len()]> {
-    on.then(|| TWINS.map(|(module, func)| crate::layers::try_kernel(gpu, module, func)))
+    on.then(|| {
+        let canonical_target = crate::layers::w4a16_gemv_tiers::canonical_target(gpu);
+        TWINS.map(|(module, func)| {
+            crate::layers::try_kernel(gpu, module, &twin_func(func, canonical_target))
+        })
+    })
 }
 
 static RESOLVED: OnceLock<Option<[KernelHandle; TWINS.len()]>> = OnceLock::new();

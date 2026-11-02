@@ -1,0 +1,82 @@
+{
+  "base": "7ffd183f210708d5b1afba1e046049f14ad498c7",
+  "development_history": [
+    {
+      "branch": "submit/glm53-runtime-prerequisites",
+      "revision": "b04eb39c42138462640e0bebfdc0734759145b48",
+      "role": "Development navigation only; not an independent PR or qualification requirement",
+      "scope": "runtime-prerequisites",
+      "tree": "6d2bc826bcd5698127cc2b3b40473f636698d58b"
+    },
+    {
+      "branch": "submit/glm53-api-compiler",
+      "revision": "20ac7ce5271e61399b9e06076611d224ed394b6e",
+      "role": "Development navigation only; not an independent PR or qualification requirement",
+      "scope": "api-compiler",
+      "tree": "9ebdb923cd3428390f64601c195967ae30500902"
+    },
+    {
+      "branch": "submit/glm53-native-core",
+      "revision": "465e34fcc18ab928cb1534d327f027ae09112254",
+      "role": "Development navigation only; not an independent PR or qualification requirement",
+      "scope": "native-core",
+      "tree": "806df49cbc6480bc947239ff92c89519ad7e9b8c"
+    },
+    {
+      "branch": "submit/glm53-context-storage",
+      "revision": "64eb146c8c03bd35881d2c7d8478b84fecd21500",
+      "role": "Development navigation only; not an independent PR or qualification requirement",
+      "scope": "context-storage",
+      "tree": "273235e33cd63ec3de198d079c8823e3bd81002a"
+    },
+    {
+      "branch": "submit/glm53-benchmark-tools",
+      "revision": "a15f9f2278b10c58c73b4b0a23d8ac35a7ffe80c",
+      "role": "Development navigation only; not an independent PR or qualification requirement",
+      "scope": "benchmark-tools",
+      "tree": "102a4f56f6c5ea7cc66bf38972f3d575fe8cb90a"
+    },
+    {
+      "branch": "submit/glm53-context-rc2",
+      "revision": "d3606ef4399a6e87e47989a0c725eb3ebdff8dbc",
+      "role": "Development navigation only; not an independent PR or qualification requirement",
+      "scope": "context-rc2",
+      "tree": "2a024d13e523950b906c4db059190a438193860e"
+    },
+    {
+      "branch": "submit/glm53-decode-rc4",
+      "revision": "9269a2fbbb9131ba66a3b45c7b977d5ccd341bcf",
+      "role": "Development navigation only; not an independent PR or qualification requirement",
+      "scope": "decode-rc4",
+      "tree": "6cf96cb8073bb1d8da24af3579ec0e0d4cb0d1a3"
+    }
+  ],
+  "excluded": [
+    "Checkpoint-native GLM MTP and its later telemetry fix",
+    "New AMD Strix Halo support and qualification"
+  ],
+  "historical_manifest": "submission-stack-history-20261014.json",
+  "qualification_policy": "Only final combined release source is checked. Historical intermediate checks and incomplete attempts remain historical, never relabeled.",
+  "release_targets": [
+    "NVIDIA GB10 / two DGX Sparks"
+  ],
+  "schema": 4,
+  "security_update": {
+    "dependency": "rustls",
+    "revision": "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e",
+    "scope": "Cargo.lock only",
+    "version": "0.23.46"
+  },
+  "submission": {
+    "base_branch": "main",
+    "head_branch": "release/glm53-nvfp4",
+    "measured_source_candidate": "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e",
+    "pr_count": 1,
+    "qualification": "Final-source CPU/static, ten canonical GPU gates and bounded paired GLM checks passed; see release-summary.json for limits.",
+    "tree": "4027d7a9cde20bf7bc68c05d58f0ecfb0e58b1b5"
+  },
+  "superseded_campaign": {
+    "reason": "Interrupted for requested rustls security update; old results are not reused.",
+    "revision": "9269a2fbbb9131ba66a3b45c7b977d5ccd341bcf"
+  }
+}

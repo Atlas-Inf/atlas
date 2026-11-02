@@ -16,6 +16,10 @@
 //   nvcc -arch=sm_121a -O3 --fmad=false scripts/dev/dflash2_selector_conf_bitcheck.cu \
 //        -o dflash2_selector_conf_bitcheck
 //   ./dflash2_selector_conf_bitcheck [blocks=24]
+// With -DCHECK_EDGE=0.6f (or 0.8f) the twin is the edge-weight twin
+// (glm_dflash2_selector_conf_e06/_e08, DF2_SEL_EDGE): picks and confidences
+// are checked against a host replay scoring unary + CHECK_EDGE * edge, and
+// the picks are not required to equal the production kernel's.
 // Prints one line per block and "PASS" or "FAIL"; exit status 0 on PASS.
 // Device memory: about 170 MB. Runs in a few seconds.
 #include <cuda_bf16.h>
@@ -29,11 +33,20 @@ namespace base {
 #include "../../kernels/gb10/common/dflash2_candidate_selector.cu"
 }
 #define DF2_SEL_CONF 1
+#ifdef CHECK_EDGE
+#define DF2_SEL_EDGE CHECK_EDGE
+#endif
 #define dflash2_candidate_selector dflash2_candidate_selector_conf
+// The rank split's entries are extern "C" too: rename them so the two
+// namespaces do not define one symbol twice.
+#define dflash2_selector_topk dflash2_selector_topk_conf
+#define dflash2_selector_walk dflash2_selector_walk_conf
 namespace conf {
 #include "../../kernels/gb10/common/dflash2_candidate_selector.cu"
 }
 #undef dflash2_candidate_selector
+#undef dflash2_selector_topk
+#undef dflash2_selector_walk
 
 #define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { \
     fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); exit(1); } } while (0)
@@ -87,6 +100,9 @@ int main(int argc, char** argv) {
     CK(cudaMemcpy(d_succ, h_succ.data(), h_succ.size() * 2, cudaMemcpyHostToDevice));
 
     int bad = 0;
+#ifdef CHECK_EDGE
+    int differ = 0;
+#endif
     double worst = 0.0;
     for (int block = 0; block < blocks; block++) {
         // Logits: a broad field, plus per row a cluster of near-ties (and one
@@ -133,7 +149,11 @@ int main(int argc, char** argv) {
         }
         int fail = 0;
         fail |= memcmp(out[0], out[1], sizeof out[0]) != 0;                         // relaunch repeats
+#ifndef CHECK_EDGE
         fail |= memcmp(out[0][0], out[0][1], GAMMA * 4) != 0;                       // same picks
+#else
+        for (unsigned r = 1; r < GAMMA; r++) differ += out[0][0][r] != out[0][1][r];
+#endif
         for (unsigned w = GAMMA; w < 3 * GAMMA; w++) fail |= out[0][0][w] != GUARD;   // base: gamma words
         for (unsigned w = 2 * GAMMA; w < 3 * GAMMA; w++) fail |= out[0][1][w] != GUARD;
 
@@ -166,7 +186,12 @@ int main(int argc, char** argv) {
                     for (unsigned l = 0; l < off; l++) lane[l] += lane[l + off];
                 const bool banned = r <= ban && (ids[c] == end_ids[0] || ids[c] == end_ids[1] ||
                                                  ids[c] == end_ids[2] || ids[c] == end_ids[3]);
+#ifdef CHECK_EDGE
+                volatile float edge = CHECK_EDGE * lane[0];
+                score[c] = banned ? -INFINITY : vals[c] + edge;
+#else
                 score[c] = banned ? -INFINITY : vals[c] + lane[0];
+#endif
                 if (c == 0 || score[c] > best) { best = score[c]; pick = ids[c]; }
             }
             double mass = 0.0;
@@ -183,6 +208,9 @@ int main(int argc, char** argv) {
         printf("block %2d ban=%u %s tokens %s  min conf %.4f  max |conf - host| %.2e\n", block, ban,
                peaked ? "peaked" : "spread", fail ? "MISMATCH" : "equal", min_conf, block_worst);
     }
+#ifdef CHECK_EDGE
+    printf("edge %.2f: %d of %d drafts differ from the weight-1 picks\n", (double)CHECK_EDGE, differ, blocks * (GAMMA - 1));
+#endif
     printf("%s: %d blocks, %d bad, worst |conf - host| %.2e\n", bad ? "FAIL" : "PASS", blocks, bad, worst);
     return bad ? 1 : 0;
 }

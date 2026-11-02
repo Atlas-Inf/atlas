@@ -33,7 +33,8 @@ fn the_worker_orders_a_plain_decode_after_the_verify_commit() {
 /// the slot copy on the default stream must come after that commit.
 #[test]
 fn freeing_and_compacting_a_slot_come_after_the_verify_commit() {
-    let f = Fixture::new(1, 1, 0);
+    // Slot 1 must be an unowned live slot, not the pool's reserved dummy.
+    let f = Fixture::with_slots(1, 1, 0, 2);
     let event = f.model.secondary_event;
     let mut seq = f.model.alloc_sequence().unwrap();
     f.order();
@@ -44,7 +45,36 @@ fn freeing_and_compacting_a_slot_come_after_the_verify_commit() {
     let mut seq = f.model.alloc_sequence().unwrap();
     let to = seq.slot_idx + 1;
     f.order();
-    f.model.compact_sequence(&mut seq, to).unwrap();
+    assert!(f.model.compact_sequence(&mut seq, to).unwrap());
     // Likewise the slot copy.
     assert!(after_commit(&f.order(), event, &Order::Sync(DEFAULT)));
+}
+
+#[test]
+fn a_failed_commit_wait_releases_the_compaction_target_for_retry() {
+    let f = Fixture::with_slots(1, 1, 0, 2);
+    let mut seq = f.model.alloc_sequence().unwrap();
+    let original = seq.slot_idx;
+    let target = original + 1;
+    assert!(f.model.ssm_pool.slot_is_free(target));
+    f.order();
+    f.fail_next_wait();
+    let error = f.model.compact_sequence(&mut seq, target).unwrap_err();
+    assert!(error.to_string().contains("injected stream wait failure"));
+    assert_eq!(
+        f.order(),
+        vec![Order::Wait(DEFAULT, f.model.secondary_event)]
+    );
+    assert_eq!(seq.slot_idx, original);
+    assert!(!f.model.ssm_pool.slot_is_free(original));
+    assert!(
+        f.model.ssm_pool.slot_is_free(target),
+        "failed wait leaked the claimed target"
+    );
+    assert!(f.model.compact_sequence(&mut seq, target).unwrap());
+    assert_eq!(seq.slot_idx, target);
+    assert!(f.model.ssm_pool.slot_is_free(original));
+    assert!(!f.model.ssm_pool.slot_is_free(target));
+    f.model.free_sequence(&mut seq).unwrap();
+    assert!(f.model.ssm_pool.slot_is_free(target));
 }

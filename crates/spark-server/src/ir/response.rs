@@ -79,7 +79,7 @@ pub struct Usage {
     /// Completion tokens spent inside the thinking block
     /// (OpenAI `completion_tokens_details.reasoning_tokens`).
     pub reasoning_tokens: usize,
-    /// Speculative-decode draft tokens the verify step ACCEPTED (MTP path)
+    /// Accepted speculative draft tokens retained in the completion (MTP path)
     /// (OpenAI `completion_tokens_details.accepted_prediction_tokens` — the
     /// field's meaning is "predicted tokens that matched generation", which
     /// Atlas's self-drafted MTP predictions are). 0 when speculation is off.

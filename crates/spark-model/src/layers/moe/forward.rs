@@ -104,7 +104,7 @@ impl MoeLayer {
         self.btile_input_guard(input, 1, ctx, stream)?;
         // Expert TP slices the routed width, which the fused routed+shared
         // decode kernels assume equals the shared expert's; take the grouped path.
-        if self.routed_scales_released || ctx.config.expert_tp {
+        if self.routed_scales_released || self.grouped_only(ctx) {
             self.forward_prefill(input, 1, ctx, stream)?;
             return Ok((ctx.buffers.moe_output(), false));
         }
@@ -246,7 +246,7 @@ impl MoeLayer {
                 } else {
                     ops::dense_gemv(
                         ctx.gpu,
-                        self.dense_gemv,
+                        self.router_gemv,
                         router_in,
                         &self.weights.gate,
                         gate_logits,

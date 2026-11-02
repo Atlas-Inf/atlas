@@ -9,12 +9,12 @@ use super::inner::NvmeIndex;
 use crate::prefix_cache::nvme::{NvmePrefixTier, NvmeStats, RestorePlan, SpillOrder};
 
 impl NvmePrefixTier for RadixTree {
-    fn enable(&self, max_slots: u32) -> bool {
+    fn enable_classes(&self, per_class: u32, classes: u32) -> bool {
         let mut inner = self.inner.lock();
-        if inner.nvme.is_some() || max_slots == 0 {
+        if inner.nvme.is_some() || per_class == 0 || classes == 0 {
             return false;
         }
-        inner.nvme = Some(NvmeIndex::new(max_slots));
+        inner.nvme = Some(NvmeIndex::new(per_class, classes));
         true
     }
 

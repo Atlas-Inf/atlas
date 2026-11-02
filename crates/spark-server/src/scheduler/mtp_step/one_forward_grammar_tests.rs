@@ -21,6 +21,8 @@ fn strict_grammar() -> crate::grammar::GrammarState {
         &Some(crate::api::GrammarSpec::JsonObject),
         &[crate::scheduler::test_support::GRAMMAR_EOS],
         false,
+        None,
+        None,
         &mut sink,
     )
     .unwrap()

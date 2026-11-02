@@ -148,7 +148,8 @@ impl MoeLayer {
     /// layers x ~3.2 ms of cold prefill (the real payload of the mprof
     /// "sort_by_expert" bucket), so the 2x is ~65 ms per 4.5k-token prefill.
     /// Falls back to the scalar kernel when the variant is absent from a
-    /// model's gemm module.
+    /// model's gemm module. Under [`Self::router_f32`] (GLM-5) every arm
+    /// writes FP32 logits through its FP32-output twin.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn router_gate_gemm_dense(
         &self,
@@ -168,7 +169,12 @@ impl MoeLayer {
             glm_router_prefill_cutlass(),
         ) {
             Some(RouterPrefillGemm::Cutlass) => {
-                return ops::bf16_gemm(
+                let gemm = if self.router_f32 {
+                    ops::bf16_gemm_f32out
+                } else {
+                    ops::bf16_gemm
+                };
+                return gemm(
                     router_in,
                     self.weights.gate.weight.0,
                     gate_logits,
@@ -179,7 +185,12 @@ impl MoeLayer {
                 );
             }
             Some(RouterPrefillGemm::CublasLt) => {
-                return spark_runtime::cublaslt::bf16_gemm_act_weight_t(
+                let lt = if self.router_f32 {
+                    spark_runtime::cublaslt::bf16_gemm_act_weight_t_f32out
+                } else {
+                    spark_runtime::cublaslt::bf16_gemm_act_weight_t
+                };
+                return lt(
                     router_in.0,
                     self.weights.gate.weight.0,
                     gate_logits.0,
@@ -196,6 +207,20 @@ impl MoeLayer {
             && let tc = ops::dense_tc_kernel(ctx.gpu, num_tokens)
             && tc.0 != 0
         {
+            if self.router_f32 {
+                // The FP32 twin of the same tier (tc16 / tc32).
+                return crate::layers::canonical_verify::dense_f32(
+                    ctx.gpu,
+                    router_in,
+                    &self.weights.gate,
+                    gate_logits,
+                    num_tokens,
+                    num_experts,
+                    hidden_size,
+                    num_experts,
+                    stream,
+                );
+            }
             return ops::dense_gemv_bf16_tc(
                 ctx.gpu,
                 tc,
@@ -244,7 +269,7 @@ impl MoeLayer {
         }
         ops::dense_gemm(
             ctx.gpu,
-            self.dense_gemm,
+            self.router_gemm,
             router_in,
             &self.weights.gate,
             gate_logits,

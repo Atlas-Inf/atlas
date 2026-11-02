@@ -530,6 +530,15 @@ jobs:
           [ "${{ matrix.os }}" = windows ] && bin="$bin.exe"
           cp "$bin" "$staging/"
           cp LICENSE README.md "$staging/" 2>/dev/null || true
+          # Keep the notices for imported GLM code/data beside every binary.
+          # This shared staging step runs before both the Windows ZIP and Unix tar.
+          mkdir -p "$staging/notices/flashkda" "$staging/notices/nvidia-sparse-mla"
+          cp docs/glm-prior-art.md "$staging/notices/glm-prior-art.md"
+          cp crates/spark-runtime/cuda/glm_kda/vendor/LICENSE \
+             crates/spark-runtime/cuda/glm_kda/vendor/NOTICE \
+             crates/spark-runtime/cuda/glm_kda/vendor/provenance.json "$staging/notices/flashkda/"
+          cp third_party/nvidia_sparse_mla_sm120/LICENSE \
+             third_party/nvidia_sparse_mla_sm120/provenance.json "$staging/notices/nvidia-sparse-mla/"
           # Native-HIP Windows target: bundle the runtime shim + HIP runtime DLL
           # so spark.exe can drive the AMD GPU (cudarc dlopens nvcuda.dll, which
           # imports amdhip64.dll). Built/staged into atlas-kernels' OUT_DIR by

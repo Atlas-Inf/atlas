@@ -101,6 +101,7 @@ pub(super) fn build(
         "MXFP8 GDN layer {layer_idx}: local rows {qkv_lrows}+{z_lrows} != {local_qkv}+{local_z}"
     );
     let qkvz = Mxfp8Weight {
+        tiled: false,
         data: concat(gpu, (qkv_l[0], local_qkv), (z_l[0], local_z), h)?,
         scales: concat(gpu, (qkv_l[1], local_qkv), (z_l[1], local_z), h / MX8_GROUP)?,
     };
@@ -188,6 +189,7 @@ pub(super) fn build(
     };
     let out = Mxfp8Proj {
         w: Mxfp8Weight {
+            tiled: false,
             data: out_l[0],
             scales: out_l[1],
         },

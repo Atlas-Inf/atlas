@@ -31,7 +31,7 @@ pub(super) fn write_batch(
         for (i, o) in batch.iter().enumerate() {
             let mut off = i * record;
             for s in &spill.segments {
-                let src = s.base.offset(o.block as usize * s.stride);
+                let src = s.at(o.block);
                 gpu.copy_d2h_async(src, &mut staging[off..off + s.stride], stream)?;
                 off += s.stride;
             }
@@ -105,7 +105,7 @@ pub(super) fn read_batch(
         for (&b, &p) in blocks[..ok].iter().zip(&pos) {
             let mut off = p * record;
             for s in &spill.segments {
-                let dst = s.base.offset(b as usize * s.stride);
+                let dst = s.at(b);
                 gpu.copy_h2d_async_retained(&staging[off..off + s.stride], dst, stream)?;
                 off += s.stride;
             }

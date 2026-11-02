@@ -4,6 +4,7 @@
 //! stub model that records every target forward it is asked for.
 
 use super::super::step_mtp;
+use crate::scheduler::levers::SchedLevers;
 use crate::scheduler::sched_ctx::SchedCtx;
 use crate::scheduler::test_support::{RespRx, test_seq};
 use crate::scheduler::types::ActiveSeq;
@@ -21,12 +22,17 @@ struct Seen {
     other: Vec<&'static str>,
     /// `trim_proposer_state` calls.
     trims: usize,
+    /// Head proposes, batched or per sequence.
+    proposes: usize,
     /// `commit_accepted_prefix` calls as `(num_accepted, k)`.
     commits: Vec<(usize, usize)>,
 }
 
-/// Bonus pick of batch member `i`; the scripted verify accepts every draft.
+/// Bonus pick of batch member `i`; the scripted verify accepts every draft
+/// but [`REFUSED`].
 const BONUS: u32 = 900;
+/// A draft the target never picks: member `i`'s row there picks `BONUS + i`.
+const REFUSED: u32 = 666;
 /// The drafter proposes this token at every depth.
 const DRAFT: u32 = 700;
 /// What a standalone decode picks.
@@ -34,8 +40,13 @@ const DECODED: u32 = 800;
 
 struct Stub {
     /// Admit decode rows (`ks[i] == 1`), windows of up to 8 rows and a lone
-    /// window past 4 rows, as qwen4_exp's exact lane does.
+    /// window past 4 rows, as qwen4_exp's exact lane does (and say its rows
+    /// are serial decode's, `batch_verify_bit_exact`).
     decode_rows: bool,
+    fail_logits: bool,
+    bootstrap_rows: Vec<Vec<f32>>,
+    fp32: bool,
+    fail_row: Option<usize>,
     seen: Mutex<Seen>,
 }
 
@@ -43,6 +54,10 @@ impl Stub {
     fn new(decode_rows: bool) -> Self {
         Self {
             decode_rows,
+            fail_logits: false,
+            bootstrap_rows: Vec::new(),
+            fp32: false,
+            fail_row: None,
             seen: Mutex::new(Seen::default()),
         }
     }
@@ -73,8 +88,13 @@ impl Model for Stub {
             let window = &tokens[off..off + k];
             seq.tokens.extend_from_slice(window);
             seq.seq_len += k;
-            picks.extend_from_slice(&window[1..]);
-            picks.push(BONUS + i as u32);
+            let bonus = BONUS + i as u32;
+            picks.extend(
+                window[1..]
+                    .iter()
+                    .map(|&t| if t == REFUSED { bonus } else { t }),
+            );
+            picks.push(bonus);
             off += k;
         }
         let mut seen = self.seen.lock().unwrap();
@@ -86,6 +106,9 @@ impl Model for Stub {
     }
     fn save_hidden_for_mtp_from_stash(&self, _i: usize, _st: u64) -> Result<()> {
         Ok(())
+    }
+    fn batch_verify_bit_exact(&self) -> bool {
+        self.decode_rows
     }
     fn mtp_propose_batch_max(&self) -> usize {
         8
@@ -104,6 +127,7 @@ impl Model for Stub {
         if let Some(c) = out_conf {
             *c = vec![vec![0.0; num_drafts]; tokens.len()];
         }
+        self.seen.lock().unwrap().proposes += 1;
         Ok(Some(vec![vec![DRAFT; num_drafts]; tokens.len()]))
     }
     fn prefill(&self, _t: &[u32], _s: &mut SequenceState, _st: u64) -> Result<DevicePtr> {
@@ -194,6 +218,7 @@ impl Model for Stub {
         _st: u64,
         _bm: Option<&[i32]>,
     ) -> Result<Vec<u32>> {
+        self.seen.lock().unwrap().proposes += 1;
         Ok(vec![DRAFT; n])
     }
     fn trim_proposer_state(&self, _s: &mut SequenceState, _n: usize, _st: u64) -> Result<()> {
@@ -201,7 +226,10 @@ impl Model for Stub {
         Ok(())
     }
     fn vocab_size(&self) -> usize {
-        0
+        self.bootstrap_rows.first().map_or(0, Vec::len)
+    }
+    fn decode_logits_fp32(&self) -> bool {
+        self.fp32
     }
     fn bind_gpu_to_thread(&self) -> Result<()> {
         Ok(())
@@ -209,8 +237,11 @@ impl Model for Stub {
     fn alloc_sequence(&self) -> Result<SequenceState> {
         Ok(SequenceState::host_only(0))
     }
-    fn copy_logits_to_host(&self, _p: DevicePtr, _d: &mut [u8]) -> Result<()> {
-        Ok(())
+    fn copy_logits_to_host(&self, p: DevicePtr, d: &mut [u8]) -> Result<()> {
+        if self.fail_logits {
+            bail!("injected score read failure");
+        }
+        self.copy_bootstrap_logits(p, d)
     }
     fn logits_buffer_ptr(&self) -> DevicePtr {
         DevicePtr::NULL
@@ -360,7 +391,11 @@ fn decode_rows_never_make_a_verify_on_their_own() {
 
 /// A step under `ATLAS_MTP_DYNAMIC_DEPTH` with a 7-draft ceiling.
 fn deep_step(model: &Stub, active: &mut [ActiveSeq]) {
-    let mut levers = crate::scheduler::levers::SchedLevers::defaults();
+    deep_step_with(model, active, SchedLevers::defaults());
+}
+
+/// [`deep_step`] on `levers`, with the dynamic depth set on them.
+fn deep_step_with(model: &Stub, active: &mut [ActiveSeq], mut levers: SchedLevers) {
     levers.mtp_dynamic_depth = true;
     let sched = SchedCtx::new(
         crate::scheduler::vocab_masks::VocabMasks::default(),
@@ -445,5 +480,12 @@ fn deep_members_verify_their_own_ceiling_within_the_row_budget() {
     assert!(ks[1] <= 4, "the floor member stays at its ceiling: {ks:?}");
 }
 
+#[path = "one_forward_tests/copy.rs"]
+mod copy;
 #[path = "one_forward_grammar_tests.rs"]
 mod grammar;
+#[path = "one_forward_logprob_tests.rs"]
+mod logprob_tests;
+
+#[path = "bootstrap_score_tests.rs"]
+mod bootstrap_score_tests;

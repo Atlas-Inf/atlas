@@ -13,8 +13,9 @@ use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
 use super::from_weights_kernels::*;
 use super::{
-    BlockDiffusionDraftHead, DflashKernels, DflashLane, DflashLayer, DflashQuantization,
-    DflashScratch, DsparkStartupExecution, LIGHTNING_TARGET_HIDDEN_SIZE, MARKOV_PREV_BYTES,
+    BlockDiffusionDraftHead, CTX_ACC_POOL, DflashKernels, DflashLane, DflashLayer,
+    DflashQuantization, DflashScratch, DsparkStartupExecution, LIGHTNING_TARGET_HIDDEN_SIZE,
+    MARKOV_PREV_BYTES,
 };
 use crate::layers::ops;
 use crate::weight_loader::DflashWeights;
@@ -35,6 +36,7 @@ impl BlockDiffusionDraftHead {
         target_model_type: &str,
         mut startup: DsparkStartupExecution,
     ) -> Result<Self> {
+        super::selector_platform::validate_requested_features(startup.diagnostics.draft_conf)?;
         let embed_tokens_shared = weights
             .embed_tokens
             .as_ref()
@@ -60,6 +62,15 @@ impl BlockDiffusionDraftHead {
         // (GLM-5.3's DFlash2 declares its 2048 window only through them).
         let query_causal = weights.config.query_causal();
         let window_size = window_size.or_else(|| weights.config.sliding_window());
+        // Resolved early: the drafter paged-KV pool must cover every ctx
+        // slot the accumulator can retain. The accumulator cap follows
+        // ctx_window — NOT the SWA window_size — because the paged-attention
+        // path panics when ctx_count exceeds the ctx_window-sized scratch.
+        let ctx_window: usize = std::env::var("ATLAS_DFLASH_CTX_WINDOW")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4096);
+        let ctx_capacity = ctx_window.min(max_seq_len);
 
         if target_layer_ids.is_empty() {
             anyhow::bail!(
@@ -88,9 +99,9 @@ impl BlockDiffusionDraftHead {
         let vocab_size = target_vocab_size.min(weights.config.vocab_size);
         let gamma_val = gamma.unwrap_or(weights.config.block_size());
 
-        // Allocate the drafter's paged FP8 KV cache. One multi-layer cache,
-        // sized for `max_seq_len + γ + 1` positions (prompt + γ drafts +
-        // 1 bonus). Block size 16 matches the rest of Atlas.
+        // Allocate the drafter's paged BF16 KV cache. Per-sequence capacity
+        // follows ctx_capacity plus γ drafts and one bonus, not the full
+        // session length. Block size 16 matches the target.
         let block_size = 16;
         let kv_config = KvCacheConfig {
             block_size,
@@ -109,7 +120,7 @@ impl BlockDiffusionDraftHead {
             layer_dims: vec![],
             cache_blocks_per_seq: None,
         };
-        let per_seq_blocks = (window_size.unwrap_or(max_seq_len) + gamma_val + 1) / block_size + 1;
+        let per_seq_blocks = (ctx_capacity + gamma_val + 1) / block_size + 1;
         let num_blocks = per_seq_blocks * max_batch_size.max(1);
         tracing::info!(
             "DFlash KV pool: {} blocks ({} per seq × batch {})",
@@ -159,6 +170,11 @@ impl BlockDiffusionDraftHead {
                 .kernel("dflash2_conv", "dflash2_grouped_dynamic_causal_conv")
                 .ok(),
             dflash2_candidate_selector: selector_kernel,
+            dflash2_candidate_selector_batched: crate::layers::try_kernel(
+                gpu,
+                "dflash2_candidate_selector",
+                "dflash2_candidate_selector_batched",
+            ),
             // Qwen3.6-DFlash uses yarn RoPE — confirmed in the drafter
             // `config.json:rope_scaling.rope_type="yarn"`. Atlas's yarn
             // kernel is `rope::rope_forward_yarn`.
@@ -301,10 +317,9 @@ impl BlockDiffusionDraftHead {
         // precompute_ctx_kv borrows mlp_intermediate as all_k_stage
         // [L×n×kv_dim ≈ 21 MB]); fused_kv_out ≈ 42 MB. logits is γ-rows
         // only (see alloc below). Total scratch ≈ 250 MB per head.
-        let ctx_window: usize = std::env::var("ATLAS_DFLASH_CTX_WINDOW")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(4096);
+        // ctx_window is resolved near the top of this fn — it also caps the
+        // per-seq ctx accumulator (max_ctx_len) and sizes the drafter paged
+        // KV pool, so all three stay consistent.
         tracing::info!(
             "DFlash ctx_window = {} (set ATLAS_DFLASH_CTX_WINDOW to override; \
              drafter trained on full captured prefix — larger is better, \
@@ -317,6 +332,10 @@ impl BlockDiffusionDraftHead {
         // One scratch set per propose lane: the piecewise graphs bake these
         // pointers at capture, so each lane needs its own. γ rows only for
         // logits (see the per-field note below).
+        // #58: max carve-outs inside one propose = n seqs × one chunked
+        // precompute region (l_total × ctx_window i32) each; the tail chunk
+        // count is ≤ ctx_len/ctx_window and overflow falls back to sync.
+        let ctx_positions_pinned_bytes = max_batch_size.max(1) * num_layers * ctx_window * 4;
         let selector_bytes = ops::dflash2_selector_scratch_bytes(g);
         let draft_record_bytes =
             super::draft_conf::record_bytes(gamma_val, startup.diagnostics.draft_conf);
@@ -373,6 +392,15 @@ impl BlockDiffusionDraftHead {
                 markov_prev_host_pinned: std::sync::atomic::AtomicPtr::new(
                     gpu.alloc_host_pinned(MARKOV_PREV_BYTES)?,
                 ),
+                // #58: l_total × ctx_window × 4B per precompute call × the
+                // max calls inside one propose (n seqs, each ≤ ctx_window
+                // tail rows). Carve-out overflow falls back to the sync
+                // copy — see ctx_positions_region.
+                ctx_positions_host_pinned: std::sync::atomic::AtomicPtr::new(
+                    gpu.alloc_host_pinned(ctx_positions_pinned_bytes)?,
+                ),
+                ctx_positions_pinned_bytes,
+                ctx_positions_cursor: std::sync::atomic::AtomicUsize::new(0),
                 position_ids: gpu.alloc(n_attn * 4)?,
                 dflash2_conv_delta: gpu.alloc(n_attn * 4 * (hidden_size / 16).max(1) * bf16)?,
                 dflash2_conv_out: gpu.alloc(n_attn * hidden_size * bf16)?,
@@ -463,6 +491,20 @@ impl BlockDiffusionDraftHead {
         // applied to each seq's logits rows 0/1 in the staged tail (#102).
         let batch_grammar_bitmask =
             gpu.alloc(batch_capacity * ops::grammar_bitmask_words(vocab_size as u32) * 4)?;
+        // #58: pinned mirror of batch_grammar_bitmask — one slot per
+        // sequence, shipped with copy_h2d_async_retained (no per-seq drain).
+        let batch_grammar_masks_pinned_bytes =
+            batch_capacity * ops::grammar_bitmask_words(vocab_size as u32) * 4;
+        let batch_grammar_masks_host_pinned = std::sync::atomic::AtomicPtr::new(
+            gpu.alloc_host_pinned(batch_grammar_masks_pinned_bytes)?,
+        );
+        // #58 batched ctx-precompute staging: per-sequence tails are
+        // accepted+1 rows (γ+1 worst); chunks larger than the per-seq cap
+        // (post-prefill commits) just fall back to per-sequence GEMMs.
+        let batch_ctx_rows = batch_capacity * super::batched_ctx::BATCH_CTX_ROWS_PER_SEQ;
+        let batch_ctx_in = gpu.alloc(batch_ctx_rows * batch_target_bytes / batch_capacity)?;
+        let batch_ctx_fc = gpu.alloc(batch_ctx_rows * hidden_size * bf16)?;
+        let batch_ctx_fused = gpu.alloc(batch_ctx_rows * num_layers * 2 * kv_dim * bf16)?;
         let batch_tokens = gpu.alloc(batch_capacity * draft_record_bytes)?;
         // `[capacity]` anchors, then `[capacity]` banned draft depths.
         let batch_markov_prev = gpu.alloc(batch_capacity * MARKOV_PREV_BYTES)?;
@@ -876,6 +918,27 @@ impl BlockDiffusionDraftHead {
             batch_mlp_down,
             batch_logits,
             batch_grammar_bitmask,
+            batch_grammar_masks_host_pinned,
+            batch_grammar_masks_pinned_bytes,
+            batch_ctx_in,
+            batch_ctx_fc,
+            batch_ctx_fused,
+            batch_ctx_rows,
+            drafter_cublas: {
+                let on = std::env::var("ATLAS_DFLASH_DRAFTER_CUBLAS").as_deref() == Ok("1")
+                    && spark_runtime::cublaslt::available();
+                if std::env::var("ATLAS_DFLASH_DRAFTER_CUBLAS").as_deref() == Ok("1") {
+                    tracing::info!(
+                        "DFlash drafter cuBLASLt route: {}",
+                        if on {
+                            "engaged for m >= 32"
+                        } else {
+                            "requested but cuBLASLt unavailable — inert"
+                        }
+                    );
+                }
+                on
+            },
             batch_tokens,
             batch_markov_prev,
             batch_markov_embed,
@@ -902,8 +965,32 @@ impl BlockDiffusionDraftHead {
             quant: DflashQuantization::Bf16,
             twins: Default::default(),
             startup,
+            ctx_carry: Mutex::new(None),
             rank_split: None,
         };
+
+        // Fallback pool prime for build paths that skipped the early
+        // `factory::build` prime (which runs before the residual KV-pool
+        // sizing and is the one that actually beats fragmentation). One
+        // buffer guarantees the first request; a warm turn's acc comes back
+        // through carry adoption, and any further demand falls to the lazy
+        // path. A failure only forfeits the optimization — request-time
+        // still allocs.
+        if head.can_pool_ctx_acc() && ctx_capacity > 0 && CTX_ACC_POOL.lock().is_empty() {
+            let acc_bytes = ctx_capacity
+                .saturating_mul(head.target_layer_ids.len())
+                .saturating_mul(target_hidden_size)
+                .saturating_mul(2);
+            match gpu.alloc(acc_bytes) {
+                Ok(ptr) => CTX_ACC_POOL.lock().push(ptr),
+                Err(e) => {
+                    tracing::warn!(
+                        "DFlash ctx acc pool prime: alloc of {acc_bytes} B failed ({e}); \
+                         request-time path will allocate on demand"
+                    );
+                }
+            }
+        }
 
         tracing::info!(
             "BlockDiffusionDraftHead loaded: {} layers, hidden={}, intermediate={}, \

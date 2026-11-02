@@ -67,8 +67,15 @@ pub(super) fn initialize(
         "dense BF16 cache requires exactly45 target layers"
     );
     // Validate all identities before allocating even the first projection.
+    let mut native = [false; 3];
     for (ordinal, layer) in layers.iter_mut().take(3).enumerate() {
-        dense_target(layer.as_mut(), ordinal)?;
+        native[ordinal] = dense_target(layer.as_mut(), ordinal)?.has_native();
+    }
+    // A native MXFP8 dense MLP (ATLAS_GLM_FP4L_DENSE_MXFP8) keeps no NVFP4 to
+    // dequantize; it expands its own bytes or runs W8A8.
+    if native.iter().all(|&n| n) {
+        tracing::info!("GLM dense BF16 prefill cache: every dense layer is native, no cache");
+        return Ok(());
     }
     let arena = spark_runtime::buffers::BufferSizes::from_config(
         config,
@@ -90,7 +97,9 @@ pub(super) fn initialize(
             gpu.free_memory()? >= protected + remaining,
             "dense BF16 cache memory changed during deferred allocation"
         );
-        dense_target(layer.as_mut(), ordinal)?.cache_glm_prefill_bf16(config, gpu)?;
+        if !native[ordinal] {
+            dense_target(layer.as_mut(), ordinal)?.cache_glm_prefill_bf16(config, gpu)?;
+        }
     }
     ensure!(
         gpu.free_memory()? >= protected,

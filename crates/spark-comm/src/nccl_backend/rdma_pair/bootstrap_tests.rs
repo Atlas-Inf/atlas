@@ -37,7 +37,7 @@ fn head(rank: usize) -> Head {
         chain: false,
         segments: 4,
         capacity: 1 << 20,
-        oneshot: [1 << 20, 1 << 20],
+        oneshot: [1 << 20, 1 << 20, 1],
         cmd: 1024,
     }
 }
@@ -80,7 +80,7 @@ fn matching_ranks_swap_identities() {
 #[test]
 fn each_differing_field_is_named_on_both_sides() {
     type Edit = fn(&mut Head);
-    let cases: [(Edit, &str, &str); 7] = [
+    let cases: [(Edit, &str, &str); 8] = [
         (
             |h| h.rails = 1,
             "rail count: here 2, peer 1 - check ATLAS_RDMA_RAILS on both nodes",
@@ -110,6 +110,11 @@ fn each_differing_field_is_named_on_both_sides() {
             |h| h.oneshot[1] = 0,
             "one-shot stripe min: here 1048576, peer 0 - check ATLAS_RDMA_ONESHOT_STRIPE_MIN",
             "one-shot stripe min: here 0, peer 1048576",
+        ),
+        (
+            |h| h.oneshot[2] = 0,
+            "one-shot SM staging: here 1, peer 0 - check ATLAS_RDMA_ONESHOT_SM_STAGE",
+            "one-shot SM staging: here 0, peer 1",
         ),
         (
             |h| h.cmd = 0,

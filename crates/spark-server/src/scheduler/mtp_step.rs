@@ -173,6 +173,13 @@ pub fn step_mtp(
         }
     }
     verify_idxs.extend(late_dflash);
+    // Copy drafts (`ATLAS_DFLASH_COPY_DRAFTS`) before any width is chosen. The
+    // MTP lane's copies (`copy_drafts::mtp`) were proposed after the last verify.
+    if dflash_verify_raw_argmax {
+        for &idx in &verify_idxs {
+            crate::scheduler::copy_drafts::offer(&mut active[idx]);
+        }
+    }
 
     // ── Phase B: Verify with pipelined checkpoint ──
     //
@@ -324,6 +331,7 @@ pub fn step_mtp(
     );
     for &idx in &serial_idxs {
         let a = &mut active[idx];
+        crate::scheduler::copy_drafts::mtp::begin_verify(model, sched, a);
         // Confidences travel with the taken drafts and are cut with them.
         let (mut drafts, mut conf) = a.take_drafts();
         if drafts.is_empty() {

@@ -20,13 +20,20 @@
 //!
 //! Default: 100 iterations + 10 warmup.
 
+#[cfg(target_os = "macos")]
 use anyhow::{Context, Result};
+#[cfg(target_os = "macos")]
 use safetensors::SafeTensors;
+#[cfg(target_os = "macos")]
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelArg};
+#[cfg(target_os = "macos")]
 use spark_runtime::metal_backend::MetalGpuBackend;
+#[cfg(target_os = "macos")]
 use spark_runtime::weights::mlx_int8::MlxInt8Weight;
+#[cfg(target_os = "macos")]
 use std::time::Instant;
 
+#[cfg(target_os = "macos")]
 fn bf16_slice_to_bytes(values: &[half::bf16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(values.len() * 2);
     for v in values {
@@ -35,6 +42,7 @@ fn bf16_slice_to_bytes(values: &[half::bf16]) -> Vec<u8> {
     out
 }
 
+#[cfg(target_os = "macos")]
 fn main() -> Result<()> {
     let n_iters: usize = std::env::var("ATLAS_METAL_BENCH_ITERS")
         .ok()
@@ -428,4 +436,9 @@ fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn main() -> anyhow::Result<()> {
+    anyhow::bail!("metal_layer3_bench requires macOS and the Metal backend")
 }

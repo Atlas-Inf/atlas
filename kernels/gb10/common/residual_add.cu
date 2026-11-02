@@ -13,6 +13,7 @@ extern "C" __global__ void bf16_residual_add(
     const __nv_bfloat16* __restrict__ src,  // [n]
     unsigned int n
 ) {
+    atlas_pdl_enter();
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         float r = __bfloat162float(residual[i]);

@@ -10,6 +10,7 @@
 /// GLM's rule: the floor of the first kept frame's time in each group. The
 /// pinned GLM processor formats these `"{:.1f} seconds"` and takes one per
 /// temporal pair.
+#[allow(dead_code)]
 pub(super) fn glm_group_timestamps(
     grid_t: usize,
     temporal_patch_size: usize,
@@ -26,6 +27,7 @@ pub(super) fn glm_group_timestamps(
 /// mean of the first and last kept frame's source time within each group. A
 /// short final group repeats the last kept frame's time, as HF extends the
 /// index list.
+#[allow(dead_code)]
 pub(super) fn hf_group_timestamps(
     grid_t: usize,
     temporal_patch_size: usize,

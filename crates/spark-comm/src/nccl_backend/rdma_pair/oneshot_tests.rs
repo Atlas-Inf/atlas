@@ -23,6 +23,8 @@ fn off_unless_requested_and_defaults_cover_decode_payloads() {
     assert_eq!(c.stripe_min, SPLIT_MIN);
     assert_eq!(c.timeout_ns, 30_000_000_000);
     assert!(!c.stage_fence);
+    assert_eq!(c.sm_stage, 0);
+    assert!(c.pdl);
     let c = cfg(&[
         ("ATLAS_RDMA_ONESHOT", "1"),
         ("ATLAS_RDMA_ONESHOT_MAX", "600000"),
@@ -33,6 +35,20 @@ fn off_unless_requested_and_defaults_cover_decode_payloads() {
     .unwrap();
     assert_eq!((c.max, c.stripe_min, c.timeout_ns), (600_000, 16384, 0));
     assert!(c.stage_fence);
+    let sm = |v: &str| {
+        cfg(&[
+            ("ATLAS_RDMA_ONESHOT", "1"),
+            ("ATLAS_RDMA_ONESHOT_SM_STAGE", v),
+            ("ATLAS_RDMA_ONESHOT_PDL", "0"),
+        ])
+        .unwrap()
+    };
+    assert_eq!(
+        (sm("1").sm_stage, sm("2").sm_stage, sm("7").sm_stage),
+        (1, 2, 0)
+    );
+    assert_eq!(sm("x").sm_stage, 0);
+    assert!(!sm("1").pdl);
     let big = cfg(&[
         ("ATLAS_RDMA_ONESHOT", "1"),
         ("ATLAS_RDMA_ONESHOT_MAX", "999999999"),
@@ -59,13 +75,25 @@ fn eligibility_depends_only_on_size() {
 #[test]
 fn wire_distinguishes_configs() {
     let c = cfg(&[("ATLAS_RDMA_ONESHOT", "1")]);
-    assert_eq!(Config::wire(None), [0; 2]);
+    assert_eq!(Config::wire(None), [0; 3]);
     assert_ne!(Config::wire(c), Config::wire(None));
     let d = cfg(&[
         ("ATLAS_RDMA_ONESHOT", "1"),
         ("ATLAS_RDMA_ONESHOT_STRIPE_MIN", "1"),
     ]);
     assert_ne!(Config::wire(c), Config::wire(d));
+    let e = cfg(&[
+        ("ATLAS_RDMA_ONESHOT", "1"),
+        ("ATLAS_RDMA_ONESHOT_SM_STAGE", "1"),
+    ]);
+    assert_ne!(Config::wire(c), Config::wire(e));
+    // PDL and the stage fence are local choices.
+    let f = cfg(&[
+        ("ATLAS_RDMA_ONESHOT", "1"),
+        ("ATLAS_RDMA_ONESHOT_PDL", "0"),
+        ("ATLAS_RDMA_ONESHOT_STAGE_FENCE", "1"),
+    ]);
+    assert_eq!(Config::wire(c), Config::wire(f));
 }
 
 #[test]

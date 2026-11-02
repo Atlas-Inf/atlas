@@ -208,8 +208,8 @@ pub(super) struct DefaultChatTemplateKwargs {
     pub thinking: crate::ir::ThinkingDirective,
     /// Template-side default effort string, injected in
     /// `api/chat/prepare.rs` when the request carries none and thinking
-    /// is on. `None` = the cross-template `"medium"` fallback in
-    /// `tokenizer/chat_render.rs` applies.
+    /// is on. `None` = MODEL.toml `[behavior].default_reasoning_effort`
+    /// ([`model_default_reasoning_effort`]), else the template's own default.
     pub reasoning_effort: Option<crate::ir::ReasoningEffort>,
     /// Server-level `preserve_thinking` pin; overrides the MODEL.toml
     /// `[behavior]` value, is overridden per-request.
@@ -279,6 +279,26 @@ pub(super) fn parse_default_chat_template_kwargs(
         reasoning_effort,
         preserve_thinking: kw.preserve_thinking,
     })
+}
+
+/// MODEL.toml `[behavior].default_reasoning_effort` as the template effort an
+/// effort-silent request renders with when `--default-chat-template-kwargs`
+/// names none. Template-side only, like the "medium" fallback it replaced:
+/// the thinking budget stays the model's. Fail-fast on a spelling that is not
+/// a thinking-on tier.
+pub(crate) fn model_default_reasoning_effort(
+    behavior: &atlas_kernels::ModelBehavior,
+) -> anyhow::Result<Option<crate::ir::ReasoningEffort>> {
+    match behavior.default_reasoning_effort {
+        "" => Ok(None),
+        v => match crate::ir::parse_wire_effort(v) {
+            Some((effort @ Some(_), _)) => Ok(effort),
+            _ => anyhow::bail!(
+                "MODEL.toml [behavior].default_reasoning_effort {v:?}: expected one of \
+                 minimal, low, medium, high, xhigh, max"
+            ),
+        },
+    }
 }
 
 /// Resolve `--require-auth` / `--auth-tokens-file` / `--auth-token` into an

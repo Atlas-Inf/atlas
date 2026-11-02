@@ -10,7 +10,7 @@
 use super::harness::Stream;
 use crate::tool_parser::{LeakMarkers, Qwen3CoderParser, ToolCallParser};
 
-use crate::api::sanitizer::sanitize_content_chunk;
+use crate::api::sanitizer::{sanitize_content_chunk, sanitize_content_chunk_with_literal_state};
 use crate::api::stream_guards::flush_content_sanitizer;
 
 #[path = "sanitizer_holdback_tests.rs"]

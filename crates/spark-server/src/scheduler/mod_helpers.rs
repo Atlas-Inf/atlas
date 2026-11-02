@@ -236,6 +236,16 @@ pub(super) fn drain_pending_requests(
         taken.push((idx, g.requests.remove(idx)));
     }
 
+    // Why the rest wait, on change only (`admission_hold`).
+    admission_hold::log_on_change(
+        g.requests.len(),
+        selected.len(),
+        cap,
+        active.len(),
+        prefilling.len(),
+        max_batch_size,
+    );
+
     // Re-sort into policy-selected order.
     let mut result = Vec::with_capacity(selected.len());
     for &sel_idx in &selected {
@@ -435,5 +445,6 @@ pub(super) fn compact_survivors_into_range(model: &dyn Model, survivors: &mut [A
     }
 }
 
+mod admission_hold;
 mod send;
 pub use send::*;

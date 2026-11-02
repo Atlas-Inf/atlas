@@ -188,7 +188,8 @@ impl TransformerModel {
     /// checkpoint of `tokens[..end_token]`, with the prefix-cache blocks
     /// under it. `false` (snapshot freed): the boundary cannot be cached
     /// (the KV is not valid that far, the sliding window has begun, or the
-    /// prefix holds a vision placeholder).
+    /// prefix holds a vision placeholder its content key does not cover).
+    /// A keyed vision prefix registers under its key (`vision_cache`).
     pub(in crate::model) fn register_intermediate_checkpoint(
         &self,
         tokens: &[u32],
@@ -212,14 +213,15 @@ impl TransformerModel {
             return false;
         }
         let boundary_blocks = &seq.block_table[..end_block];
-        // Vision chunks: skip both the radix insert and the SSM snapshot
-        // attach — the placeholder token stream is identical for distinct
-        // images of the same prompt, so a future hit would resurrect the
-        // prior image's state.
-        if self.tokens_have_vision_pad(boundary_tokens) {
+        // Vision chunks insert under their content key (`vision_cache`). A
+        // placeholder the key does not cover skips both the radix insert and
+        // the SSM snapshot attach: the placeholder stream is identical for
+        // distinct images, so a future hit would resurrect another image's
+        // state.
+        let Some(boundary_key) = self.pc_key(seq, boundary_tokens) else {
             self.ssm_snapshots.free(snap_id);
             return false;
-        }
+        };
         let boundary_disk = if seq.disk_block_ids.len() >= end_block {
             &seq.disk_block_ids[..end_block]
         } else {
@@ -233,7 +235,7 @@ impl TransformerModel {
         // the cache's baseline ref by +1 per checkpointed block after the
         // eventual release().
         let acquired = self.prefix_cache.insert(
-            boundary_tokens,
+            &boundary_key,
             boundary_blocks,
             boundary_disk,
             bs,
@@ -242,7 +244,7 @@ impl TransformerModel {
         );
         super::super::super::block_mgmt::cache_acquires_refs(&acquired, kv_cache);
         if let Some(old) = self.prefix_cache.insert_intermediate_snapshot(
-            boundary_tokens,
+            &boundary_key,
             boundary_blocks,
             boundary_disk,
             bs,
@@ -255,7 +257,7 @@ impl TransformerModel {
         }
         if is_branch {
             self.prefix_cache
-                .mark_branch_snapshot(boundary_tokens, seq.adapter_id);
+                .mark_branch_snapshot(&boundary_key, seq.adapter_id);
         }
         true
     }

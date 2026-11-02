@@ -82,11 +82,15 @@ pub(super) struct StreamState {
     pub(super) reasoning_inside_envelope: bool,
     /// Tag-scan buffer for the content sanitiser.
     pub(super) tag_scan_buf: String,
+    /// Quote/code context for content XML markers, retained across chunks.
+    pub(super) literal_xml_state: crate::literal_xml::LiteralXmlState,
     /// Sanitiser state for reasoning content (parallel to
     /// `suppressing_param_leak` above).
     pub(super) reasoning_suppressing_leak: bool,
     /// Tag-scan buffer for the reasoning sanitiser.
     pub(super) reasoning_tag_scan_buf: String,
+    /// Quote/code context for reasoning XML markers, retained across chunks.
+    pub(super) reasoning_literal_xml_state: crate::literal_xml::LiteralXmlState,
     /// Repetition-loop watchdog: tail buffer for line-level
     /// duplicate detection.
     pub(super) loop_scan_buf: String,
@@ -171,6 +175,9 @@ pub(super) struct StreamState {
     /// `ChatLevers::in_think_leak_openers` to decide when stripping
     /// escalates to cancellation.
     pub(super) reasoning_xml_opener_hits: u32,
+    /// Lexical state at the start of `reasoning_xml_scan_buf`, so a marker
+    /// split across deltas is still classified inside the right quote/code span.
+    pub(super) reasoning_xml_scan_state: crate::literal_xml::LiteralXmlState,
     /// Streaming tool-call detector (`Some` iff `tools_active`).
     pub(super) detector: Option<tool_parser::StreamingToolDetector>,
     /// True iff the reasoning/`<think>` phase has finished. Starts
@@ -225,8 +232,10 @@ impl StreamState {
             inside_envelope: false,
             reasoning_inside_envelope: false,
             tag_scan_buf: String::new(),
+            literal_xml_state: crate::literal_xml::LiteralXmlState::default(),
             reasoning_suppressing_leak: false,
             reasoning_tag_scan_buf: String::new(),
+            reasoning_literal_xml_state: crate::literal_xml::LiteralXmlState::default(),
             loop_scan_buf: String::new(),
             loop_watchdog_triggered: false,
             salvaged_tool_call: false,
@@ -246,6 +255,7 @@ impl StreamState {
             reasoning_xml_scan_buf: String::new(),
             reasoning_xml_leak_detected: false,
             reasoning_xml_opener_hits: 0,
+            reasoning_xml_scan_state: crate::literal_xml::LiteralXmlState::default(),
             detector: if tools_active {
                 Some(tool_parser::StreamingToolDetector::new_with_tools(
                     tool_defs,

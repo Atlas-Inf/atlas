@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! GLM prefill-only order-preserving router with 32-column output tiles.
+//! GLM prefill-only order-preserving router with 32-column output tiles and
+//! FP32 logits.
 use super::*;
 use anyhow::ensure;
 use atlas_core::config::ModelConfig;
@@ -24,8 +25,8 @@ pub(super) fn resolve(config: &ModelConfig, gpu: &dyn GpuBackend) -> Result<Kern
         return Ok(KernelHandle(0));
     }
     ensure!(
-        config.hidden_size == 4096 && config.num_experts == 288,
-        "GLM BN32 router requires N288/K4096"
+        config.hidden_size == 4096 && config.num_experts == 288 && config.router_logits_f32,
+        "GLM BN32 router requires N288/K4096 and FP32 router logits"
     );
     let kernel = gpu.kernel("gemm", "dense_gemm_bf16_router_bn32")?;
     ensure!(kernel.0 != 0, "GLM BN32 router kernel missing");
@@ -65,7 +66,7 @@ impl MoeLayer {
             "GLM BN32 router geometry mismatch"
         );
         let output_bytes = (m as usize)
-            .checked_mul(288 * 2)
+            .checked_mul(288 * 4)
             .ok_or_else(|| anyhow::anyhow!("GLM BN32 router output overflow"))?;
         ensure!(
             output == ctx.buffers.gate_logits() && output_bytes <= ctx.buffers.sizes().gate_logits,

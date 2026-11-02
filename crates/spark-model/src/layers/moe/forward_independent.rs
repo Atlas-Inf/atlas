@@ -41,6 +41,13 @@ impl MoeLayer {
         Ok(())
     }
     pub(super) fn independent_grouped(&self, ctx: &ForwardContext, rows: u32) -> bool {
+        // ATLAS_GLM_CANONICAL_VERIFY: a verify block keeps the arms of every
+        // width; only the nonspeculative independent lane takes these.
+        if crate::layers::canonical_verify::enabled()
+            && !crate::model::glm_independent::selected(ctx, rows as usize).unwrap_or(false)
+        {
+            return false;
+        }
         // The public entry performs fallible validation before entering prefill.
         crate::model::glm_independent::ffn_rows_selected(ctx, rows as usize).unwrap_or(false)
             && super::prequant_fp4::glm_grouped_shape(ctx.config)

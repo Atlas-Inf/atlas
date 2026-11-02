@@ -26,7 +26,17 @@ impl Glm5KdaLayer {
         let fused_qkv = capture_verify_intermediates
             && m == 5
             && self.w4a16_gemv_batch5_qkv_k.0 != 0
-            && verify_fused_qkv_enabled();
+            && verify_fused_qkv_enabled()
+            && !crate::layers::canonical_verify::enabled()
+            && !self.has_mxfp8_projections();
+        // ATLAS_GLM_FP4L_KDA_MXFP8_DECODE: Q, K and V of a decode or verify
+        // block in one MXFP8 launch (`projection_mx`), bit-identical to three.
+        if (decode || capture_verify_intermediates)
+            && self.try_project_qkv_mxfp8(normed, projected, plane_bytes, m, p, h, ctx, stream)?
+        {
+            profile::step(ctx, stream, profile_timer, "q_proj")?;
+            return Ok(());
+        }
         // Whether Q took the Lt FP8 route, leaving `normed` cast in scratch.
         let mut q_fp8 = false;
         if fused_qkv {

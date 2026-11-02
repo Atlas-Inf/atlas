@@ -177,6 +177,20 @@ fn an_oversized_schema_grammar_is_refused_and_never_cached() {
     assert!(c.cache_size_bytes() > 0);
 }
 
+/// A grammar embedding a schema (a union with one) keeps the schema bound;
+/// a plain grammar does not.
+#[test]
+fn a_schema_grammar_is_bounded_like_its_schema() {
+    use crate::schema::{SchemaConverterOptions, json_schema_to_ebnf};
+    let mut c = compiler(1);
+    c.set_max_schema_grammar_bytes(16 << 10);
+    let ebnf = json_schema_to_ebnf(&keyed_object(32), &SchemaConverterOptions::default()).unwrap();
+    let grammar = || crate::grammar::parse_ebnf(&ebnf, "root").unwrap();
+    assert!(c.compile_schema_grammar(grammar()).is_err());
+    assert_eq!(c.cache_size_bytes(), 0, "a refused grammar is not cached");
+    assert!(c.compile_grammar(grammar()).is_ok());
+}
+
 #[test]
 fn grammar_memory_counts_views_maps_and_pruning() {
     let cg = compile(16);

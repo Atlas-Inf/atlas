@@ -18,6 +18,9 @@ use crate::weight_map::QuantizedWeight;
 #[path = "rank_split_ctx_exec.rs"]
 mod ctx_exec;
 pub(crate) use ctx_exec::{CtxSeq, CtxTurn};
+#[path = "rank_split_topk.rs"]
+mod topk;
+pub(crate) use topk::TopkSelect;
 #[path = "rank_split_worker.rs"]
 mod worker;
 
@@ -57,6 +60,8 @@ pub struct RankSplit {
     ctx: AtomicU32,
     pub(super) announced: AtomicU32,
     pub(super) ctx_next: AtomicUsize,
+    /// `ATLAS_GLM_DRAFT_TP_TOPK`: the candidate swap's lists and kernels.
+    pub(crate) topk: Option<TopkSelect>,
 }
 
 impl RankSplit {
@@ -115,6 +120,7 @@ impl RankSplit {
             ctx: AtomicU32::new(0),
             announced: AtomicU32::new(0),
             ctx_next: AtomicUsize::new(0),
+            topk: None,
         })
     }
 
@@ -174,6 +180,12 @@ impl RankSplit {
             Swap::Activation(_) => (self.gate, self.activation_peer),
             Swap::Output(_) => (self.down, self.down_peer),
             Swap::Logits => (self.logits, self.logits_peer),
+            // One way, worker to head.
+            Swap::Candidates => match &self.topk {
+                Some(t) if rank == 0 => (self.sink, t.lists_peer),
+                Some(t) => (t.lists, self.sink),
+                None => (self.sink, self.sink),
+            },
             // One way, head to worker: the head's rows to the worker's landing.
             Swap::CtxInput(_) if rank == 0 => (frame.ctx_in, self.sink),
             Swap::CtxInput(_) => (self.sink, frame.ctx_in),
@@ -290,8 +302,14 @@ impl BlockDiffusionDraftHead {
         parts: Parts,
         batch: bool,
         ctx: bool,
+        topk: bool,
         gpu: &dyn GpuBackend,
     ) -> Result<()> {
+        // ATLAS_GLM_DRAFT_TP_TOPK feeds the DFlash2 selector's walk.
+        ensure!(
+            !topk || (parts.head && self.candidate_selector.is_some()),
+            "ATLAS_GLM_DRAFT_TP_TOPK needs the head split and a DFlash2 candidate selector"
+        );
         let tier = crate::layers::w4a16_gemv_tiers::tc_kernel(self.gamma as u32);
         let layers_ok = self.twins.nvfp4_tc
             && self.layers.iter().all(|l| {
@@ -336,6 +354,7 @@ impl BlockDiffusionDraftHead {
             ctx_in,
             ctx_kv,
             ctx: CtxRows::default(),
+            topk,
         };
         // A batched propose runs B×gamma rows through the batch buffers.
         let capacity = if batch {
@@ -347,13 +366,18 @@ impl BlockDiffusionDraftHead {
             !ctx || capacity <= ROWS_MAX,
             "ATLAS_GLM_DRAFT_TP_CTX announces at most {ROWS_MAX} batched rows, not {capacity}"
         );
-        let split = RankSplit::new(geometry, capacity, gpu)?;
+        let mut split = RankSplit::new(geometry, capacity, gpu)?;
+        let conf = self.startup.diagnostics.draft_conf;
+        split.topk = topk
+            .then(|| TopkSelect::new(self.gamma, conf, gpu))
+            .transpose()?;
         tracing::info!(
-            "DFlash rank split: {parts:?}, {} swaps per propose, largest {} bytes; up to {capacity} rows (largest swap {} bytes); context appends {}",
+            "DFlash rank split: {parts:?}, {} swaps per propose, largest {} bytes; up to {capacity} rows (largest swap {} bytes); context appends {}; selector swaps {}",
             geometry.swaps().len(),
             split.max_bytes(),
             split.max_bytes_at(capacity),
-            if ctx { "split" } else { "on the head" }
+            if ctx { "split" } else { "on the head" },
+            if topk { "candidate lists" } else { "logits" }
         );
         self.rank_split = Some(split);
         Ok(())
@@ -462,6 +486,7 @@ impl BlockDiffusionDraftHead {
                 rank,
                 stream,
             ),
+            Piece::TopK => split.topk_piece(rank, gpu, stream),
             Piece::CtxFc(_) | Piece::CtxNorm(_) | Piece::CtxKv(_) => {
                 self.ctx_piece(split, piece, rank, gpu, frame, stream)
             }

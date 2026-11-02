@@ -53,3 +53,27 @@ __device__ __forceinline__ __nv_fp8_storage_t glm_fp8g128_quantize(
     *scale = __fmul_rn(m, static_cast<float>(1.0 / 448.0));
     return __nv_cvt_float_to_fp8(v / *scale, __NV_SATFINITE, __NV_E4M3);
 }
+
+// One token's latent `src` (512 BF16) into cache slot `slot` (>= 0):
+// glm_latent_cache_write_fp8g128's body. `amax` holds blockDim.x floats.
+// `GUARD`: a CTA wider than 128 threads (glm_mla_fuse.cu), whose threads past
+// the first 128 take part in the reduction's barriers with zeros the
+// reduction never reads.
+template <bool GUARD>
+__device__ __forceinline__ void glm_latent_cache_write_fp8g128_row(
+    const __nv_bfloat16* src, unsigned char* cache, long long slot, unsigned int block_size,
+    float* amax) {
+    const unsigned int physical = (unsigned int)(slot / block_size);
+    const unsigned int offset = (unsigned int)(slot % block_size);
+    unsigned char* values = const_cast<unsigned char*>(glm_fp8g128_values(cache, physical, offset, block_size));
+    float* scales = const_cast<float*>(glm_fp8g128_scales(cache, physical, offset, block_size));
+    const int tid = threadIdx.x;
+    const bool on = !GUARD || tid < 128;
+    for (int g = 0; g < 4; ++g) {
+        float sc;
+        const __nv_fp8_storage_t q =
+            glm_fp8g128_quantize(on ? __bfloat162float(src[g * 128 + tid]) : 0.0f, amax, &sc);
+        if (on) values[g * 128 + tid] = q;
+        if (tid == 0) scales[g] = sc;
+    }
+}

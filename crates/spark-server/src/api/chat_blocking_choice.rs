@@ -124,29 +124,12 @@ pub(super) fn build_choice_message(
                     tracing::warn!("Tool call validation error: {err}");
                 }
             }
-            // Strip orphan tool call XML tags + ```lang fences from content
-            // (Qwen3-Coder pattern: emits markdown narration AND structured
-            // tool_call for the same payload).
-            let content = content.map(|mut c| {
-                for tag in &["</parameter>", "</function>", "</tool_call>", "<tool_call>"] {
-                    c = c.replace(tag, "");
-                }
-                while let Some(start) = c.find("<function=") {
-                    let end = c[start..]
-                        .find('>')
-                        .map(|p| start + p + 1)
-                        .unwrap_or(c.len());
-                    c = format!("{}{}", &c[..start], &c[end..]);
-                }
-                while let Some(start) = c.find("```") {
-                    let after_open = start + 3;
-                    let Some(rel_close) = c[after_open..].find("```") else {
-                        break;
-                    };
-                    let close_end = after_open + rel_close + 3;
-                    c = format!("{}{}", &c[..start], &c[close_end..]);
-                }
-                c.trim().to_string()
+            // Strip orphan tool-call XML tags from narration while preserving
+            // the same bytes when they occur in a quoted/code example.
+            let content = content.map(|c| {
+                super::strip::strip_tool_markup_preserving_literals(&c)
+                    .trim()
+                    .to_string()
             });
             msg_content = content;
             if !validated.valid.is_empty() {

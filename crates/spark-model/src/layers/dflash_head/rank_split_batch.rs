@@ -85,7 +85,7 @@ impl BlockDiffusionDraftHead {
             a,
         };
         walk(
-            &split.geometry.layer_steps(0),
+            &split.plan().layer_steps(0),
             Graphs::Eager,
             a.ctx.gpu,
             a.stream,
@@ -118,7 +118,7 @@ impl SplitOps for BatchWalk<'_> {
             Piece::Norm => head.batched_final_norm(a.batch_rows, a.ctx, a.stream),
             Piece::Tail => head.run_batched_tail_base(a.batch_rows, a.ctx, a.stream),
             Piece::Select => head.batched_argmax(a.batch_rows, a.ctx, a.stream),
-            Piece::GateUp(_) | Piece::Down(_) | Piece::Vocab => {
+            Piece::GateUp(_) | Piece::Down(_) | Piece::Vocab | Piece::TopK => {
                 head.split_piece(self.split, piece, 0, a.ctx.gpu, &self.frame, a.stream)
             }
             Piece::CtxFc(_) | Piece::CtxNorm(_) | Piece::CtxKv(_) => {

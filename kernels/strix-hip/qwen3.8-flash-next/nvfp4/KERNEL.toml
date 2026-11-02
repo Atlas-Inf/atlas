@@ -3,6 +3,8 @@
 #
 # qsa_attn_tc2.cu is a native HIP file (not a symlink): the gfx1151 WMMA twin of
 # gb10's tensor-core QSA attention, same entry name and arguments.
+# qwen4exp_decode_fuse.cu is a native HIP port of the gb10 file: its fused GDN
+# decode kernels used thread-block clusters, so here each cluster is one block.
 #
 # .cu overrides in this dir (relative symlinks): hyper_connection, ple and
 # qsa_indexer come from the gb10 Flash-Next shadow; gated_delta_rule_wy17 from

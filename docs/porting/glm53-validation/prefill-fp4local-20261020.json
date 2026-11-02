@@ -1,0 +1,750 @@
+{
+  "schema_version": 1,
+  "status": "PASS_BOUNDED_FP4LOCAL_OFF_ON",
+  "date": "2026-10-20",
+  "runtime_revision": "5d652f8e0835231ead3bcac91d66e22632c08cbe",
+  "image": "sha256:2d7ee3e9ca756014c57e84eb777b78a66278505fe9d378d1abb7d90da5744cd2",
+  "checkpoint": {
+    "repository": "nvidia/GLM-5.3-Flash-FP4-Local",
+    "revision": "76348ddb2be2e35e39ecfc00e75dc07703f4f3d5"
+  },
+  "settings": {
+    "tp": 2,
+    "ep": 2,
+    "target_kv_dtype": "fp8_g128",
+    "kda_dtype": "f32",
+    "aggregate_kv_token_cap": 32768,
+    "max_sequence_tokens": 32768,
+    "slots": 4,
+    "prefill_chunk_tokens": 4096,
+    "prefix_caching": false,
+    "draft": "incoai/GLM-5.3-Flash-DFlash2",
+    "draft_gamma": 8,
+    "draft_window_tokens": 2048,
+    "only_changed_environment": [
+      "ATLAS_GLM_HC_PREFILL_FUSE2",
+      "ATLAS_GLM_KDA_CONV_PLANES",
+      "ATLAS_GLM_KDA_SIDE_PROJ_LT",
+      "ATLAS_GLM_SP_GATHER_OVERLAP"
+    ]
+  },
+  "correctness": {
+    "identical_answer_and_reasoning_pairs": 13,
+    "api_text_tools_strict_json_concurrency": [
+      1,
+      4
+    ],
+    "positive_vision_colors": [
+      "red",
+      "blue"
+    ],
+    "two_turn_tool_or_json_cases_per_setting": 3,
+    "client_disconnect_then_reuse": true
+  },
+  "comparison_rows": [
+    {
+      "label": "prose-r0",
+      "same_prompt": true,
+      "answer_equal": true,
+      "reasoning_equal": true,
+      "off": {
+        "prompt_tokens": 10007,
+        "output_tokens": 512,
+        "client_ttft_s": 5.000761651899666,
+        "server_decode_tok_s": 44.23593505288915,
+        "prefill_ttft_proxy_tok_s": 2001.0951724121041
+      },
+      "on": {
+        "prompt_tokens": 10007,
+        "output_tokens": 512,
+        "client_ttft_s": 4.965403621084988,
+        "server_decode_tok_s": 43.91662455401845,
+        "prefill_ttft_proxy_tok_s": 2015.3447259567138
+      }
+    },
+    {
+      "label": "prose-r1",
+      "same_prompt": true,
+      "answer_equal": true,
+      "reasoning_equal": true,
+      "off": {
+        "prompt_tokens": 10007,
+        "output_tokens": 512,
+        "client_ttft_s": 5.08424146915786,
+        "server_decode_tok_s": 44.24517083323029,
+        "prefill_ttft_proxy_tok_s": 1968.2385387682093
+      },
+      "on": {
+        "prompt_tokens": 10007,
+        "output_tokens": 512,
+        "client_ttft_s": 5.011901592137292,
+        "server_decode_tok_s": 44.746607647501236,
+        "prefill_ttft_proxy_tok_s": 1996.6473435350476
+      }
+    },
+    {
+      "label": "code-r0",
+      "same_prompt": true,
+      "answer_equal": true,
+      "reasoning_equal": true,
+      "off": {
+        "prompt_tokens": 10012,
+        "output_tokens": 512,
+        "client_ttft_s": 5.10761691397056,
+        "server_decode_tok_s": 56.66394815368947,
+        "prefill_ttft_proxy_tok_s": 1960.2096571915513
+      },
+      "on": {
+        "prompt_tokens": 10012,
+        "output_tokens": 512,
+        "client_ttft_s": 5.02021670807153,
+        "server_decode_tok_s": 56.87244900869811,
+        "prefill_ttft_proxy_tok_s": 1994.3362173793525
+      }
+    },
+    {
+      "label": "code-r1",
+      "same_prompt": true,
+      "answer_equal": true,
+      "reasoning_equal": true,
+      "off": {
+        "prompt_tokens": 10012,
+        "output_tokens": 512,
+        "client_ttft_s": 5.051925040083006,
+        "server_decode_tok_s": 57.77848772274814,
+        "prefill_ttft_proxy_tok_s": 1981.8187959169516
+      },
+      "on": {
+        "prompt_tokens": 10012,
+        "output_tokens": 512,
+        "client_ttft_s": 5.047177254920825,
+        "server_decode_tok_s": 58.057648234333776,
+        "prefill_ttft_proxy_tok_s": 1983.6830557592646
+      }
+    },
+    {
+      "label": "structured-r0",
+      "same_prompt": true,
+      "answer_equal": true,
+      "reasoning_equal": true,
+      "off": {
+        "prompt_tokens": 10005,
+        "output_tokens": 512,
+        "client_ttft_s": 5.04525281698443,
+        "server_decode_tok_s": 71.26634557684864,
+        "prefill_ttft_proxy_tok_s": 1983.0522598033122
+      },
+      "on": {
+        "prompt_tokens": 10005,
+        "output_tokens": 512,
+        "client_ttft_s": 4.980396118015051,
+        "server_decode_tok_s": 71.28806532238315,
+        "prefill_ttft_proxy_tok_s": 2008.8763549971438
+      }
+    },
+    {
+      "label": "structured-r1",
+      "same_prompt": true,
+      "answer_equal": true,
+      "reasoning_equal": true,
+      "off": {
+        "prompt_tokens": 10005,
+        "output_tokens": 512,
+        "client_ttft_s": 5.006703068036586,
+        "server_decode_tok_s": 71.26190140605094,
+        "prefill_ttft_proxy_tok_s": 1998.321023643915
+      },
+      "on": {
+        "prompt_tokens": 10005,
+        "output_tokens": 512,
+        "client_ttft_s": 4.992593951988965,
+        "server_decode_tok_s": 71.34531412966167,
+        "prefill_ttft_proxy_tok_s": 2003.9682970841593
+      }
+    },
+    {
+      "label": "vision-blue",
+      "same_prompt": true,
+      "answer_equal": true,
+      "reasoning_equal": true,
+      "off": {
+        "prompt_tokens": 87,
+        "output_tokens": 5,
+        "client_ttft_s": 0.38667245977558196,
+        "server_decode_tok_s": 53.924293985059116,
+        "prefill_ttft_proxy_tok_s": 224.99662906040246
+      },
+      "on": {
+        "prompt_tokens": 87,
+        "output_tokens": 5,
+        "client_ttft_s": 0.38960339804179966,
+        "server_decode_tok_s": 54.3758348135002,
+        "prefill_ttft_proxy_tok_s": 223.30400719622565
+      }
+    },
+    {
+      "label": "vision-red",
+      "same_prompt": true,
+      "answer_equal": true,
+      "reasoning_equal": true,
+      "off": {
+        "prompt_tokens": 87,
+        "output_tokens": 5,
+        "client_ttft_s": 0.3914408250711858,
+        "server_decode_tok_s": 31.871194225838376,
+        "prefill_ttft_proxy_tok_s": 222.2558160206681
+      },
+      "on": {
+        "prompt_tokens": 87,
+        "output_tokens": 5,
+        "client_ttft_s": 0.4288043030537665,
+        "server_decode_tok_s": 31.58251602650828,
+        "prefill_ttft_proxy_tok_s": 202.88975502442972
+      }
+    },
+    {
+      "label": "random-c1-0",
+      "same_prompt": true,
+      "answer_equal": true,
+      "reasoning_equal": true,
+      "off": {
+        "prompt_tokens": 10000,
+        "output_tokens": 512,
+        "client_ttft_s": 5.068960472941399,
+        "server_decode_tok_s": 95.14135246808469,
+        "prefill_ttft_proxy_tok_s": 1972.7910788377553
+      },
+      "on": {
+        "prompt_tokens": 10000,
+        "output_tokens": 512,
+        "client_ttft_s": 5.148950478993356,
+        "server_decode_tok_s": 94.7559267335789,
+        "prefill_ttft_proxy_tok_s": 1942.1433631568052
+      }
+    },
+    {
+      "label": "random-c4-0",
+      "same_prompt": true,
+      "answer_equal": true,
+      "reasoning_equal": true,
+      "off": {
+        "prompt_tokens": 1000,
+        "output_tokens": 512,
+        "client_ttft_s": 0.8190938278567046,
+        "server_decode_tok_s": 41.317521742295895,
+        "prefill_ttft_proxy_tok_s": 1220.8613543294136
+      },
+      "on": {
+        "prompt_tokens": 1000,
+        "output_tokens": 512,
+        "client_ttft_s": 3.263545938069001,
+        "server_decode_tok_s": 50.91004678040611,
+        "prefill_ttft_proxy_tok_s": 306.4151750815211
+      }
+    },
+    {
+      "label": "random-c4-1",
+      "same_prompt": true,
+      "answer_equal": true,
+      "reasoning_equal": true,
+      "off": {
+        "prompt_tokens": 1000,
+        "output_tokens": 512,
+        "client_ttft_s": 3.281306558055803,
+        "server_decode_tok_s": 51.243489277147184,
+        "prefill_ttft_proxy_tok_s": 304.7566517504865
+      },
+      "on": {
+        "prompt_tokens": 1000,
+        "output_tokens": 512,
+        "client_ttft_s": 2.4739384029526263,
+        "server_decode_tok_s": 47.17807925170737,
+        "prefill_ttft_proxy_tok_s": 404.2137826901865
+      }
+    },
+    {
+      "label": "random-c4-2",
+      "same_prompt": true,
+      "answer_equal": true,
+      "reasoning_equal": true,
+      "off": {
+        "prompt_tokens": 1000,
+        "output_tokens": 512,
+        "client_ttft_s": 1.6098308840300888,
+        "server_decode_tok_s": 44.87643449535059,
+        "prefill_ttft_proxy_tok_s": 621.183262117929
+      },
+      "on": {
+        "prompt_tokens": 1000,
+        "output_tokens": 512,
+        "client_ttft_s": 1.6799982951488346,
+        "server_decode_tok_s": 44.69840208096146,
+        "prefill_ttft_proxy_tok_s": 595.2386992817799
+      }
+    },
+    {
+      "label": "random-c4-3",
+      "same_prompt": true,
+      "answer_equal": true,
+      "reasoning_equal": true,
+      "off": {
+        "prompt_tokens": 1000,
+        "output_tokens": 512,
+        "client_ttft_s": 2.488008657004684,
+        "server_decode_tok_s": 48.61266777086412,
+        "prefill_ttft_proxy_tok_s": 401.9278619407622
+      },
+      "on": {
+        "prompt_tokens": 1000,
+        "output_tokens": 512,
+        "client_ttft_s": 0.8168318551033735,
+        "server_decode_tok_s": 41.5593131457605,
+        "prefill_ttft_proxy_tok_s": 1224.2421665514573
+      }
+    }
+  ],
+  "random_groups": {
+    "off": {
+      "1": {
+        "label": "random-c1",
+        "passed": true,
+        "workload": "uniform seeded valid base-vocabulary integer IDs excluding all added tokens; not coherent text",
+        "input_tokens_each": 10000,
+        "output_tokens_each": 512,
+        "concurrency": 1,
+        "aggregate_end_to_end_tok_s": 49.03040496772126,
+        "aggregate_decode_window_tok_s": 95.14322416906231,
+        "shared_end_to_end_s": 10.442499920958653,
+        "shared_decode_window_s": 5.37085015210323,
+        "streams": [
+          {
+            "label": "random-c1-0",
+            "client_ttft_s": 5.068960472941399,
+            "prefill_ttft_proxy_tok_s": 1972.7910788377553,
+            "client_decode_tok_s": 95.14322416906231,
+            "server_decode_tok_s": 95.14135246808469,
+            "output_tokens": 512,
+            "request_sha256": "04d49c48ce97812bd8b7ba747662a55d13d126f98fd8e453aba374458d5d9f1b",
+            "answer_sha256": "0a55e540ed48269aa5d8e4a959c417016e96edb1f74424f53be05b92025c0fa8"
+          }
+        ],
+        "metric_definition": "Per-stream decode=(output-1)/(last_content-first_content); aggregate decode uses same numerator/shared first-to-last interval and equals stream decode at C1. Aggregate end-to-end=total output/shared request-start-to-completion interval; includes prefill."
+      },
+      "4": {
+        "label": "random-c4",
+        "passed": true,
+        "workload": "uniform seeded valid base-vocabulary integer IDs excluding all added tokens; not coherent text",
+        "input_tokens_each": 1000,
+        "output_tokens_each": 512,
+        "concurrency": 4,
+        "aggregate_end_to_end_tok_s": 154.4847774848516,
+        "aggregate_decode_window_tok_s": 164.3831296933389,
+        "shared_end_to_end_s": 13.256969607900828,
+        "shared_decode_window_s": 12.434366007102653,
+        "streams": [
+          {
+            "label": "random-c4-0",
+            "client_ttft_s": 0.8190938278567046,
+            "prefill_ttft_proxy_tok_s": 1220.8613543294136,
+            "client_decode_tok_s": 41.336503866941925,
+            "server_decode_tok_s": 41.317521742295895,
+            "output_tokens": 512,
+            "request_sha256": "fe5e9cd4253b59ca9fbcf033042ef4da888e909ccd504cf4d0ed8e28a44ffd99",
+            "answer_sha256": "08e0a39a75190cf98e0b83ae1c5b0ed8c06db2922792ca63374cea8331a9f819"
+          },
+          {
+            "label": "random-c4-1",
+            "client_ttft_s": 3.281306558055803,
+            "prefill_ttft_proxy_tok_s": 304.7566517504865,
+            "client_decode_tok_s": 51.24461418148453,
+            "server_decode_tok_s": 51.243489277147184,
+            "output_tokens": 512,
+            "request_sha256": "3166669a191105ffa04e2d2a456ca9ad3a71e1e9a6baddbead52ba463bbe6ea6",
+            "answer_sha256": "9e47aa2da04ff03198c19e128709295e6b798b2b81f792b1fe3748ebe573e7b5"
+          },
+          {
+            "label": "random-c4-2",
+            "client_ttft_s": 1.6098308840300888,
+            "prefill_ttft_proxy_tok_s": 621.183262117929,
+            "client_decode_tok_s": 44.90816967291181,
+            "server_decode_tok_s": 44.87643449535059,
+            "output_tokens": 512,
+            "request_sha256": "43eddca57c6260873f6362064baa8a3048fa9974f506185235e3c1633a813bac",
+            "answer_sha256": "c3b725e8392ddfc7e632465121612ff7795ca8d9eca923123bb4f97232649a05"
+          },
+          {
+            "label": "random-c4-3",
+            "client_ttft_s": 2.488008657004684,
+            "prefill_ttft_proxy_tok_s": 401.9278619407622,
+            "client_decode_tok_s": 48.660586267144474,
+            "server_decode_tok_s": 48.61266777086412,
+            "output_tokens": 512,
+            "request_sha256": "8bb5beb80130ee0d18765176572401dadf166d71272f5c879015caa21372ea4b",
+            "answer_sha256": "51e2f8e96c76bfb8240252f52dacce8a24df4418d158f8902b25ee22609a2e00"
+          }
+        ],
+        "metric_definition": "Per-stream decode=(output-1)/(last_content-first_content); aggregate decode uses same numerator/shared first-to-last interval and equals stream decode at C1. Aggregate end-to-end=total output/shared request-start-to-completion interval; includes prefill."
+      }
+    },
+    "on": {
+      "1": {
+        "label": "random-c1",
+        "passed": true,
+        "workload": "uniform seeded valid base-vocabulary integer IDs excluding all added tokens; not coherent text",
+        "input_tokens_each": 10000,
+        "output_tokens_each": 512,
+        "concurrency": 1,
+        "aggregate_end_to_end_tok_s": 48.556781512789875,
+        "aggregate_decode_window_tok_s": 94.75059622781869,
+        "shared_end_to_end_s": 10.544356195954606,
+        "shared_decode_window_s": 5.393105904804543,
+        "streams": [
+          {
+            "label": "random-c1-0",
+            "client_ttft_s": 5.148950478993356,
+            "prefill_ttft_proxy_tok_s": 1942.1433631568052,
+            "client_decode_tok_s": 94.75059622781869,
+            "server_decode_tok_s": 94.7559267335789,
+            "output_tokens": 512,
+            "request_sha256": "04d49c48ce97812bd8b7ba747662a55d13d126f98fd8e453aba374458d5d9f1b",
+            "answer_sha256": "0a55e540ed48269aa5d8e4a959c417016e96edb1f74424f53be05b92025c0fa8"
+          }
+        ],
+        "metric_definition": "Per-stream decode=(output-1)/(last_content-first_content); aggregate decode uses same numerator/shared first-to-last interval and equals stream decode at C1. Aggregate end-to-end=total output/shared request-start-to-completion interval; includes prefill."
+      },
+      "4": {
+        "label": "random-c4",
+        "passed": true,
+        "workload": "uniform seeded valid base-vocabulary integer IDs excluding all added tokens; not coherent text",
+        "input_tokens_each": 1000,
+        "output_tokens_each": 512,
+        "concurrency": 4,
+        "aggregate_end_to_end_tok_s": 153.41418981489562,
+        "aggregate_decode_window_tok_s": 163.68236086684706,
+        "shared_end_to_end_s": 13.349482225021347,
+        "shared_decode_window_s": 12.487600919092074,
+        "streams": [
+          {
+            "label": "random-c4-0",
+            "client_ttft_s": 3.263545938069001,
+            "prefill_ttft_proxy_tok_s": 306.4151750815211,
+            "client_decode_tok_s": 50.90715185740891,
+            "server_decode_tok_s": 50.91004678040611,
+            "output_tokens": 512,
+            "request_sha256": "fe5e9cd4253b59ca9fbcf033042ef4da888e909ccd504cf4d0ed8e28a44ffd99",
+            "answer_sha256": "08e0a39a75190cf98e0b83ae1c5b0ed8c06db2922792ca63374cea8331a9f819"
+          },
+          {
+            "label": "random-c4-1",
+            "client_ttft_s": 2.4739384029526263,
+            "prefill_ttft_proxy_tok_s": 404.2137826901865,
+            "client_decode_tok_s": 47.19240972914071,
+            "server_decode_tok_s": 47.17807925170737,
+            "output_tokens": 512,
+            "request_sha256": "3166669a191105ffa04e2d2a456ca9ad3a71e1e9a6baddbead52ba463bbe6ea6",
+            "answer_sha256": "9e47aa2da04ff03198c19e128709295e6b798b2b81f792b1fe3748ebe573e7b5"
+          },
+          {
+            "label": "random-c4-2",
+            "client_ttft_s": 1.6799982951488346,
+            "prefill_ttft_proxy_tok_s": 595.2386992817799,
+            "client_decode_tok_s": 44.736255426373916,
+            "server_decode_tok_s": 44.69840208096146,
+            "output_tokens": 512,
+            "request_sha256": "43eddca57c6260873f6362064baa8a3048fa9974f506185235e3c1633a813bac",
+            "answer_sha256": "c3b725e8392ddfc7e632465121612ff7795ca8d9eca923123bb4f97232649a05"
+          },
+          {
+            "label": "random-c4-3",
+            "client_ttft_s": 0.8168318551033735,
+            "prefill_ttft_proxy_tok_s": 1224.2421665514573,
+            "client_decode_tok_s": 41.58691584449173,
+            "server_decode_tok_s": 41.5593131457605,
+            "output_tokens": 512,
+            "request_sha256": "8bb5beb80130ee0d18765176572401dadf166d71272f5c879015caa21372ea4b",
+            "answer_sha256": "51e2f8e96c76bfb8240252f52dacce8a24df4418d158f8902b25ee22609a2e00"
+          }
+        ],
+        "metric_definition": "Per-stream decode=(output-1)/(last_content-first_content); aggregate decode uses same numerator/shared first-to-last interval and equals stream decode at C1. Aggregate end-to-end=total output/shared request-start-to-completion interval; includes prefill."
+      }
+    }
+  },
+  "ranks": [
+    {
+      "mode": "off",
+      "rank": 0,
+      "minimum_available_gib": 12.184093475341797,
+      "zero_swap": true,
+      "severity_error_count": 0,
+      "warnings": [
+        "2026-10-20T13:48:10.946506Z  WARN spark::main_modules::serve_phases::kv_cache: KV cache dtype: fp8_g128 (user override). MODEL.toml recommends 'bf16' for this model \u2014 mismatched KV dtype is a known cause of decode-path corruption (e.g. gemma `<unused>` collapse, mistral character-token loops on NVFP4 KV). Pass --kv-cache-dtype bf16 to use the recommended value.",
+        "2026-10-20T13:48:10.946522Z  WARN spark::main_modules::serve_phases::kv_cache: \u26a0 --kv-high-precision-layers is 0: all KV cache layers use fp8_g128 precision. NVFP4 models may hallucinate or lose coherence at long context. Consider --kv-high-precision-layers max (or 2-5) for better quality.",
+        "2026-10-20T13:49:50.326051Z  WARN spark_model::factory::build::kv_budget: KV own-footprint: free memory fell by 99.56 GB but Atlas's own counters account for 96.99 GB \u2014 2.57 GB was taken by something else during the load, or is Atlas memory the counters miss; keeping the larger figure (the KV pool may be smaller than it needs to be)",
+        "2026-10-20T13:49:50.326365Z  WARN spark_model::factory::build: KV OVERCOMMIT: pool fits 1 seq(s) at full --max-seq-len=32768 but --max-batch-size=4 requested (2048 block(s)/seq, 2048 block(s) total). Paged KV allocates on demand; long-context bursts are back-pressured at the block allocator, not refused at boot.",
+        "2026-10-20T13:49:51.551417Z  WARN spark::scheduler: --mtp-gate force: MTP throughput gate DISARMED (diagnostic; verify runs even where the gate would measure it net-negative)",
+        "2026-10-20T13:49:53.387955Z  WARN spark_runtime::cuda_backend::host_staging: copy_h2d_async was handed a PAGE-LOCKED source. That copy is genuinely asynchronous, so the promise that the caller may drop the buffer on return is now being paid for with a cuStreamSynchronize on every such call. If the source outlives the next sync, switch the call site to copy_h2d_async_retained; if it does not, this sync is what keeps it from being a use-after-free.",
+        "2026-10-20T13:52:11.265920Z  WARN spark_model::model::types: teardown swept 75784 allocation(s) that no ModelResource released \u2014 they are reclaimed, but each one is memory whose owner is unaccounted for"
+      ],
+      "cleanup_confirmed": true
+    },
+    {
+      "mode": "off",
+      "rank": 1,
+      "minimum_available_gib": 12.888877868652344,
+      "zero_swap": true,
+      "severity_error_count": 0,
+      "warnings": [
+        "2026-10-20T13:48:10.897314Z  WARN spark::main_modules::serve_phases::kv_cache: KV cache dtype: fp8_g128 (user override). MODEL.toml recommends 'bf16' for this model \u2014 mismatched KV dtype is a known cause of decode-path corruption (e.g. gemma `<unused>` collapse, mistral character-token loops on NVFP4 KV). Pass --kv-cache-dtype bf16 to use the recommended value.",
+        "2026-10-20T13:48:10.897330Z  WARN spark::main_modules::serve_phases::kv_cache: \u26a0 --kv-high-precision-layers is 0: all KV cache layers use fp8_g128 precision. NVFP4 models may hallucinate or lose coherence at long context. Consider --kv-high-precision-layers max (or 2-5) for better quality.",
+        "2026-10-20T13:49:45.996275Z  WARN spark_model::factory::build::kv_budget: KV own-footprint: free memory fell by 100.43 GB but Atlas's own counters account for 96.99 GB \u2014 3.44 GB was taken by something else during the load, or is Atlas memory the counters miss; keeping the larger figure (the KV pool may be smaller than it needs to be)",
+        "2026-10-20T13:49:50.337767Z  WARN spark_model::factory::build: KV OVERCOMMIT: pool fits 1 seq(s) at full --max-seq-len=32768 but --max-batch-size=4 requested (2048 block(s)/seq, 2048 block(s) total). Paged KV allocates on demand; long-context bursts are back-pressured at the block allocator, not refused at boot.",
+        "2026-10-20T13:52:11.538485Z  WARN spark_runtime::cuda_backend: backend drop reclaimed 149307 allocation(s) that no owner released \u2014 expected if a load was abandoned part-way, otherwise an unregistered owner"
+      ],
+      "cleanup_confirmed": true
+    },
+    {
+      "mode": "on",
+      "rank": 0,
+      "minimum_available_gib": 12.215896606445312,
+      "zero_swap": true,
+      "severity_error_count": 0,
+      "warnings": [
+        "2026-10-20T13:53:05.179946Z  WARN spark::main_modules::serve_phases::kv_cache: KV cache dtype: fp8_g128 (user override). MODEL.toml recommends 'bf16' for this model \u2014 mismatched KV dtype is a known cause of decode-path corruption (e.g. gemma `<unused>` collapse, mistral character-token loops on NVFP4 KV). Pass --kv-cache-dtype bf16 to use the recommended value.",
+        "2026-10-20T13:53:05.179963Z  WARN spark::main_modules::serve_phases::kv_cache: \u26a0 --kv-high-precision-layers is 0: all KV cache layers use fp8_g128 precision. NVFP4 models may hallucinate or lose coherence at long context. Consider --kv-high-precision-layers max (or 2-5) for better quality.",
+        "2026-10-20T13:54:47.110177Z  WARN spark_model::factory::build::kv_budget: KV own-footprint: free memory fell by 99.69 GB but Atlas's own counters account for 96.99 GB \u2014 2.70 GB was taken by something else during the load, or is Atlas memory the counters miss; keeping the larger figure (the KV pool may be smaller than it needs to be)",
+        "2026-10-20T13:54:47.110396Z  WARN spark_model::factory::build: KV OVERCOMMIT: pool fits 1 seq(s) at full --max-seq-len=32768 but --max-batch-size=4 requested (2048 block(s)/seq, 2048 block(s) total). Paged KV allocates on demand; long-context bursts are back-pressured at the block allocator, not refused at boot.",
+        "2026-10-20T13:54:48.440675Z  WARN spark::scheduler: --mtp-gate force: MTP throughput gate DISARMED (diagnostic; verify runs even where the gate would measure it net-negative)",
+        "2026-10-20T13:54:59.096867Z  WARN spark_runtime::cuda_backend::host_staging: copy_h2d_async was handed a PAGE-LOCKED source. That copy is genuinely asynchronous, so the promise that the caller may drop the buffer on return is now being paid for with a cuStreamSynchronize on every such call. If the source outlives the next sync, switch the call site to copy_h2d_async_retained; if it does not, this sync is what keeps it from being a use-after-free.",
+        "2026-10-20T13:57:17.449250Z  WARN spark_model::model::types: teardown swept 75784 allocation(s) that no ModelResource released \u2014 they are reclaimed, but each one is memory whose owner is unaccounted for"
+      ],
+      "cleanup_confirmed": true
+    },
+    {
+      "mode": "on",
+      "rank": 1,
+      "minimum_available_gib": 12.783096313476562,
+      "zero_swap": true,
+      "severity_error_count": 0,
+      "warnings": [
+        "2026-10-20T13:53:05.189683Z  WARN spark::main_modules::serve_phases::kv_cache: KV cache dtype: fp8_g128 (user override). MODEL.toml recommends 'bf16' for this model \u2014 mismatched KV dtype is a known cause of decode-path corruption (e.g. gemma `<unused>` collapse, mistral character-token loops on NVFP4 KV). Pass --kv-cache-dtype bf16 to use the recommended value.",
+        "2026-10-20T13:53:05.189700Z  WARN spark::main_modules::serve_phases::kv_cache: \u26a0 --kv-high-precision-layers is 0: all KV cache layers use fp8_g128 precision. NVFP4 models may hallucinate or lose coherence at long context. Consider --kv-high-precision-layers max (or 2-5) for better quality.",
+        "2026-10-20T13:54:39.411738Z  WARN spark_model::factory::build::kv_budget: KV own-footprint: free memory fell by 99.74 GB but Atlas's own counters account for 97.01 GB \u2014 2.73 GB was taken by something else during the load, or is Atlas memory the counters miss; keeping the larger figure (the KV pool may be smaller than it needs to be)",
+        "2026-10-20T13:54:47.118659Z  WARN spark_model::factory::build: KV OVERCOMMIT: pool fits 1 seq(s) at full --max-seq-len=32768 but --max-batch-size=4 requested (2048 block(s)/seq, 2048 block(s) total). Paged KV allocates on demand; long-context bursts are back-pressured at the block allocator, not refused at boot.",
+        "2026-10-20T13:57:17.787386Z  WARN spark_runtime::cuda_backend: backend drop reclaimed 149239 allocation(s) that no owner released \u2014 expected if a load was abandoned part-way, otherwise an unregistered owner"
+      ],
+      "cleanup_confirmed": true
+    }
+  ],
+  "limits": [
+    "Two chat repeats and one random run per setting; no statistical superiority claim.",
+    "No cross-checkpoint output equality claim.",
+    "Client-disconnect/reuse probe passed; no per-kernel tracing or prolonged stability qualification.",
+    "Only a 32K aggregate pool was tested here; the 64K request is separate.",
+    "Chat prompts are repetitive synthetic prose, code and structured records, two repetitions each; they are not uniformly random token prompts.",
+    "The chat template forces thinking with a 256-token budget; 512 output tokens include reasoning.",
+    "TTFT-derived prefill includes API and first-token overhead; it is not isolated kernel throughput.",
+    "Each random C1/C4 group was measured once; cross-checkpoint timing changes can depend on different generated outputs and speculative acceptance."
+  ],
+  "raw_artifact_hashes": {
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/container-rank.py": "1a0c425e45b10c16339b432728c592e969f65f8c18b4f48699442ede09b9a629",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/rank0.json": "436beb5959ea9817b189ccab960e8ec20774e23bc4ff6a0214812629db8ca1a9",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/rank1.json": "eef53637d6ec56db3ce65b34fd58bbb603f6d4780cc4222ee1bb9ff65219dc81",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/plan.json": "b4aedcc49bd0afc5a3bb96cbfcf2dbdaab5ad91aff5ce8ff0a8a083c0c6ab40b",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/agent-review.json": "1b8fa1c305eea62b7b8f003609acd9c9c2f82052148a79f41084ca5e5e241672",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/harness.json": "5b810828b390ac6fd3d836552ca24a01bb4baa4b0d96be929724644b6c6495ad",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/warmup-request.json": "7466a9ccd528ea7c0df5cf9b027027ec6a0c5b0ae2ab23782993ab88d7896353",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/warmup-result.json": "41eb934b10ca924241089da58b561ae7b4d7817d4c9df3f2d08c8c89f554e444",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c1-text-0-request.json": "c14a11401616ff4c36347f1300d9529f440e8eac16e316bbec5f62e15c4b0e1c",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c1-text-0-response.json": "d62aa60803d4794906c304ccc6c3c58f626241b58fe35aa4a10d6abbb65d7002",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c1-schema-0-request.json": "09df0a97176110de248ec884433a10322b4cfd97632b93210ac84b6fe21968d1",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c1-schema-0-response.json": "42a757555ddbb6aa990811827e27cbbce111f47bbadeb85552130d60a4e4ec63",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c1-tool-0-request.json": "6bf3c398de736c9a9f6a1075b94648c224b8100fcb9475a093b7a02a1f4866f6",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c1-tool-0-response.json": "4715a06e21ba8e1b02e92ef2b0615e26565873b76ca413aa8d64d79947e09ae5",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-text-0-request.json": "c14a11401616ff4c36347f1300d9529f440e8eac16e316bbec5f62e15c4b0e1c",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-text-1-request.json": "c14a11401616ff4c36347f1300d9529f440e8eac16e316bbec5f62e15c4b0e1c",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-text-2-request.json": "c14a11401616ff4c36347f1300d9529f440e8eac16e316bbec5f62e15c4b0e1c",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-text-3-request.json": "c14a11401616ff4c36347f1300d9529f440e8eac16e316bbec5f62e15c4b0e1c",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-text-2-response.json": "4c460cbdfdeaaccafa3020ac727b6af4f41f4e420031b61ffc44b77e7bcddabe",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-text-3-response.json": "23e8a67accf0c013702bb42f8d30feac9857bc2e43488a1a16217e3f3c14d991",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-text-0-response.json": "e00b3ada3c4f0c5fa22ee410c31138753e048c060ed9a0b5d197873320b08382",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-text-1-response.json": "d408b97a5d59caff8a78c16fdd0a485044471731d778faf7d9df61f15a4701cb",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-schema-0-request.json": "09df0a97176110de248ec884433a10322b4cfd97632b93210ac84b6fe21968d1",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-schema-1-request.json": "09df0a97176110de248ec884433a10322b4cfd97632b93210ac84b6fe21968d1",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-schema-2-request.json": "09df0a97176110de248ec884433a10322b4cfd97632b93210ac84b6fe21968d1",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-schema-3-request.json": "09df0a97176110de248ec884433a10322b4cfd97632b93210ac84b6fe21968d1",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-schema-3-response.json": "7389e111ddec83e63fa96a1c0f54a9ea244ac16b3d18f0f4924bb67b4e4e0591",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-schema-1-response.json": "051c64008eb0bc28f13c87cc073ecba12d9bd21c622f8ca27694e5b753da1725",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-schema-0-response.json": "805985f9989f04a116130352a143350b75fe0e954aed2551cd4d5580562429f4",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-schema-2-response.json": "8c07693d99ec316d109f7d1305654823c30f61eabd9964c97fa56ad001d25d3f",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-tool-0-request.json": "6bf3c398de736c9a9f6a1075b94648c224b8100fcb9475a093b7a02a1f4866f6",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-tool-1-request.json": "6bf3c398de736c9a9f6a1075b94648c224b8100fcb9475a093b7a02a1f4866f6",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-tool-2-request.json": "6bf3c398de736c9a9f6a1075b94648c224b8100fcb9475a093b7a02a1f4866f6",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-tool-3-request.json": "6bf3c398de736c9a9f6a1075b94648c224b8100fcb9475a093b7a02a1f4866f6",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-tool-3-response.json": "00ee4d6962194a016b769efca8bb05093723d5850ec999ae778108829d136755",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-tool-2-response.json": "2035d2e6d91ba5d6ea47918d7dfebc87f150273337985bb319bd8f4f598ebb42",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-tool-1-response.json": "6ef93be96d1f35bad254268886939ed4f1aaa99b47d77ba0c76e89ce99d9fee6",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/api-c4-tool-0-response.json": "0fab4a0f3d19468929b6b2bd3694dee57d1ac029a668922f1aca3e760853bfb1",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/red.png": "9f0bec9d1ffa063a0eae133fb0da9cd1198ac7a0f94435d1fe0ac486465ca8c4",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/vision-red-request.json": "57706ae6e1bd18ad546e486f8f5be1f3e99ebf887599780158f6c422ab3947f0",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/vision-red-result.json": "fc2bc72b13d0c42c23fa07f6b34b3cf09298e3af3f9714716b14ed42ce6cfb01",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/blue.png": "8a2d1594f68bf749a488d355b350ad91a0fbb4835cf219353bf252fe56326f2c",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/vision-blue-request.json": "fbdc451acfb10f859c1d015f84308926b8a0bb16d4f1e8cba63977158518651a",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/vision-blue-result.json": "07df0b34e5022441dc7e9901337b639236c154aab2ca0c81c3550967ba15ab86",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/cancel-request.json": "2deb5c25fb1a97914189abc7cc0a747376e11e01208a0d2de2fce3452b6c9128",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/after-cancel-request.json": "c14a11401616ff4c36347f1300d9529f440e8eac16e316bbec5f62e15c4b0e1c",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/after-cancel-response.json": "597466187d3fb71fa4642d8f4bf04b0ee9155633265b95f46bfe27c4dc76ba74",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/cancel-result.json": "099a97f19635e5c6d8f6edbef20e4c61c95bb598a8b4bbdc3287944eb89ffff5",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/random-token-pool-binding.json": "7dfc5c3403a89483b3625680a605847a5428b21eeba8e9f5a056a6e778340d7c",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/random-c1-0-request.json": "81b01ef5f31a75b844a1d38ce4f2d25efc3b22c2de5ce0b2b54afd0d2f6025f3",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/random-c1-0-result.json": "8284260efd7579553e14d17236d2671745497c6b2950639194a2dbb70913de0b",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/random-c1-summary.json": "00b9d07cb6852da8a037bd0275e918a26dfc5192f7ce8616a3ed8054cd5dab74",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/random-c4-3-request.json": "a723b2a6360b5f407c31c126ab0991f4ad0f15b3375ae21d3be92340aaf59240",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/random-c4-2-request.json": "d17b385a982573a3f6103028c0bb10fc06fda1e1a1bff5f256893c125d1667d8",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/random-c4-0-request.json": "40d74a251b820f787af248eb7a6a48546101e0c756505916ad7c661474f45b61",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/random-c4-1-request.json": "cc5e0853790754c4ca19a13df48542a937eecea0eb289254b31db29a824ff7d0",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/random-c4-2-result.json": "6949c20642db65a2b9a975906d9a050f29d1470aa844adabf62c394723ecd705",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/random-c4-3-result.json": "c260da9b059eabc6d35eccdea14c678d744351b746ab2c3dbf5ca2f9049cd9ad",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/random-c4-0-result.json": "901bc85107867e7ae3282cefe768ad8f7db0306dea24c817388e37a300a0e69a",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/random-c4-1-result.json": "c9ac128d530f6c3e1f9935c794d29c6f02934f49e52752ad360112f8824820e8",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/random-c4-summary.json": "3916436998be9be05323633b99e76ba3cf3540a37c43b0fd7cee3330bc87c0c8",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/prose-calibration.json": "f6f21414e264f0096b636ff670e373bd95f1e9b71f2e56776b2929b3a8f59044",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/prose-r0-request.json": "60d78ad9d2dd7ab4b639d86d7508e7d57374b3c2e64a802f2d5beb359aa3c14f",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/prose-r0-result.json": "bc0d192295cbfa2a1720d71f7af1312b725bbed14c570d938de99050f88e6186",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/prose-r1-request.json": "60d78ad9d2dd7ab4b639d86d7508e7d57374b3c2e64a802f2d5beb359aa3c14f",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/prose-r1-result.json": "3564cfcaf34a81845c69b22baffe9b49a9f5f87c184000ad77f4090ca37fd920",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/code-calibration.json": "68394851ff5dd27d97cc3218d84474067327ed69f516f17acf8b25299ca66f4d",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/code-r0-request.json": "4c34fd141ecc002bd953c7c7f93d95f8e5d7d934419b69fa75515aa75864e868",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/code-r0-result.json": "95dd11054e2ae7c32d4a92ca923e604c95163a78bf94c2939d34355615af268e",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/code-r1-request.json": "4c34fd141ecc002bd953c7c7f93d95f8e5d7d934419b69fa75515aa75864e868",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/code-r1-result.json": "2ee48b8ab3e4da148fce063f22d3e285b037cc7ed83c7fab97c2fcc0b636f075",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/structured-calibration.json": "43eaa5aea462a82b1fc4989a9a95149c1d7b087791d7099be6d349759bba2fb1",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/structured-r0-request.json": "a1706102d3d5fb82e4811b0d746cd10694a3854b7d8f54cb0ad521e2f9e83205",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/structured-r0-result.json": "5f0eaa94fecf97b653d3439984c7806db3df33e2d092b3e4c39a9131acb458b6",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/structured-r1-request.json": "a1706102d3d5fb82e4811b0d746cd10694a3854b7d8f54cb0ad521e2f9e83205",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/structured-r1-result.json": "3afc8e206b5c6a841823f36b491fcb667f3fa589d396b81b45dba636cf3fd3c5",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/http/summary.json": "b5222595cc851c3cda6cf8b27f6a14a06e1b149077dd10ac990eeabfe841d11b",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank1/cleanup.json": "b60a36378d36b8f6b1c496b483be5cd1d9f9214ee7adbc6803abebe660b25e16",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank1/commands.jsonl": "99510e17b9d13944cf1b5f3fa8c9e5df767070191b06cc5b7405979396673767",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank1/config.json": "eef53637d6ec56db3ce65b34fd58bbb603f6d4780cc4222ee1bb9ff65219dc81",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank1/container.cid": "feb6309e8b4d8bc3c28c57cd6200dd36ee61b77146e876067253470bdbaa0f60",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank1/container.json": "df809a3dad7df1d15642d61d635ae46390a1df56609db56023d8b9bd47ec74c2",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank1/image.json": "935e86b00610cf4308a8c8aad84e3140c01a53e0592d48354dcb895693f94df2",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank1/invocation.json": "27555f172979f43c2d398934e475e6b5992df3d8e1be60ddb398a4e99f38f599",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank1/memory.jsonl": "615ff46cca4689fb605f99b71f1bbef87a1a5abe1b3927e72af07ef389c6ccbc",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank1/owner.json": "18bfa0127b135bb733435cb255a57f1f27351db284b2b7fc0fa1a93927f792b6",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank1/rank.log": "99e389b945eef547ece4e5a04784c5b24dae0d627795e90ffa050ac1f8ae63a5",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank1/result.json": "a97b480df7551f99f3d317347a7e7bbdf406b66679ab21bcda9d26d0eab418b0",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank0/cleanup.json": "d8aaaf94218337cb9e0e43918707fa4eac90cdf885134ffbcef77bb58845fe23",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank0/commands.jsonl": "5417f827792f37c2c40c0b70fe78ef82361c2ba13212f81f7d3a92826e861a24",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank0/config.json": "436beb5959ea9817b189ccab960e8ec20774e23bc4ff6a0214812629db8ca1a9",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank0/container.cid": "5cecadca8c6fcc13bbebbe400961d1aa0cb81065a9887f2f8cf6c97a33d93c52",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank0/container.json": "9974a610f8c08f38a974bd558e7c23e72068489d305f11b8809e30228d13f137",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank0/image.json": "2af68ddc89c5a5d7ece7d9ca9827ba6af58fa500ddd3d265d99fb45ce7eb957b",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank0/invocation.json": "7f8267f092c94a29b8d127479e6c8c3e2bc202fc0c96544bb29feb9b8bbbfddc",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank0/memory.jsonl": "0834c45b6d3ed39792346df0e05a7b1f7476eba57acd40613bbfea062a606ea2",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank0/owner.json": "4bf4f78e483043cccf89b69f96687da3c257fa2f449feeb86dffd1725710a361",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank0/rank.log": "41cbdc893f72cdb9d524365dc385caa3c7068b3b9c195cc21055dd75560fc5c7",
+    "ab-5d652f8e/runs/fp4local-off-32k-5d652f8e-ab/collected-rank0/result.json": "3831b2193cad95771b43040972b5ffb83594fbecc0902dab90b1d17f990ac42e",
+    "fp4local-fp4local-off-32k-union.log": "ebccdd81732e072d74175dd0535b46c34213fa57a2e286b1d5bc7a2d2cf6c0a9",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/container-rank.py": "1a0c425e45b10c16339b432728c592e969f65f8c18b4f48699442ede09b9a629",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/rank0.json": "c3ca792959c0c78696addf3cd45854b1c5ff8ea49b31fd184afa960d27eadc20",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/rank1.json": "7e16ca66831ed988c2dcc36a13a91eb2243d3508b0d416f287d37cdd0f631090",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/plan.json": "4fab11ab3bbe40375afaf9d1e6ffc61f5c15c6de98b03d40fe1e88e86021a330",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/agent-review.json": "533e46c0ef179cd4496c71b82d1f45f9fd7020f0a485c73982963507190e1b2c",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/harness.json": "b7827a2bf8a73f92ddc1f3a72c45856374a7cebb6c78c29a429d5d5ceb605a99",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/warmup-request.json": "7466a9ccd528ea7c0df5cf9b027027ec6a0c5b0ae2ab23782993ab88d7896353",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/warmup-result.json": "477959bc4cdeb7708e0be08167d1cdf440cf59fd8d35c0d654f9b8f578e02d9e",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c1-text-0-request.json": "c14a11401616ff4c36347f1300d9529f440e8eac16e316bbec5f62e15c4b0e1c",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c1-text-0-response.json": "5dd54f446cda2de155ac3dc3ca8294aa58d243b7e6381fd8ea6877f39c23f25c",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c1-schema-0-request.json": "09df0a97176110de248ec884433a10322b4cfd97632b93210ac84b6fe21968d1",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c1-schema-0-response.json": "2475ad975ffcb6ff7617c7d3710bf6ec475618e8757ee6f3b6eb03eec55f7c0f",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c1-tool-0-request.json": "6bf3c398de736c9a9f6a1075b94648c224b8100fcb9475a093b7a02a1f4866f6",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c1-tool-0-response.json": "d105a9082f7f018c8fd090ba0e72dea9783e4832f2d920996062648332f651fa",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-text-0-request.json": "c14a11401616ff4c36347f1300d9529f440e8eac16e316bbec5f62e15c4b0e1c",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-text-1-request.json": "c14a11401616ff4c36347f1300d9529f440e8eac16e316bbec5f62e15c4b0e1c",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-text-2-request.json": "c14a11401616ff4c36347f1300d9529f440e8eac16e316bbec5f62e15c4b0e1c",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-text-3-request.json": "c14a11401616ff4c36347f1300d9529f440e8eac16e316bbec5f62e15c4b0e1c",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-text-0-response.json": "eb3c71e2149057d9e77a7be8604dbac03451e8efd9c38eecdd87098a2f318957",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-text-3-response.json": "98cb98689d7810c0c2deb7985c48029a8b76d9ae09bfa0af2f8c33378d3b1daa",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-text-1-response.json": "8ead7bfb54536b7618af53f5af100bb67f4c319991b8a99d9b8879d55cbb1e45",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-text-2-response.json": "e4e9d142a1b9885a62daedd35c88faf74dca43a8350a125e8f73e3323d95dbb9",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-schema-0-request.json": "09df0a97176110de248ec884433a10322b4cfd97632b93210ac84b6fe21968d1",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-schema-1-request.json": "09df0a97176110de248ec884433a10322b4cfd97632b93210ac84b6fe21968d1",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-schema-2-request.json": "09df0a97176110de248ec884433a10322b4cfd97632b93210ac84b6fe21968d1",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-schema-3-request.json": "09df0a97176110de248ec884433a10322b4cfd97632b93210ac84b6fe21968d1",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-schema-3-response.json": "87d69ee193c06751d479503ec090dc499a9756f2e0e41685752c945a6548e426",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-schema-1-response.json": "3e7aa777c31277497946b4a19c6aef1803145e28ca9db5a37aa353f0dbeb1b61",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-schema-2-response.json": "f7de93997a12433b7ca2fa038311e5c2c8841b5554151a250ae577a08a2657a4",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-schema-0-response.json": "7d6c79876d4a2f25cd63d2dbaa488da98eedd306403a04f5fae5602cc35d5edf",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-tool-0-request.json": "6bf3c398de736c9a9f6a1075b94648c224b8100fcb9475a093b7a02a1f4866f6",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-tool-1-request.json": "6bf3c398de736c9a9f6a1075b94648c224b8100fcb9475a093b7a02a1f4866f6",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-tool-2-request.json": "6bf3c398de736c9a9f6a1075b94648c224b8100fcb9475a093b7a02a1f4866f6",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-tool-3-request.json": "6bf3c398de736c9a9f6a1075b94648c224b8100fcb9475a093b7a02a1f4866f6",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-tool-3-response.json": "9852083743870a28f524c8e7c05f7c19274b1b3f2d7ca6ab8ce6dca29fe89bbb",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-tool-2-response.json": "0cc9cc8b6783061276d19476d8a9f2317599d281dd048f0f502874652bfdb479",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-tool-0-response.json": "8427406ec29b24fcaa66e966fa18fc9f1cdd4875665fd05486b5b6b6dd1cfa40",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/api-c4-tool-1-response.json": "1826f63554c9e0af84e723afb5d3625054152e8bfd417b8314de037d2062a696",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/red.png": "9f0bec9d1ffa063a0eae133fb0da9cd1198ac7a0f94435d1fe0ac486465ca8c4",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/vision-red-request.json": "57706ae6e1bd18ad546e486f8f5be1f3e99ebf887599780158f6c422ab3947f0",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/vision-red-result.json": "5a25fee047b4492634bddb74a2dcca5817216c9e8d671a516cc47fb9773d16b9",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/blue.png": "8a2d1594f68bf749a488d355b350ad91a0fbb4835cf219353bf252fe56326f2c",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/vision-blue-request.json": "fbdc451acfb10f859c1d015f84308926b8a0bb16d4f1e8cba63977158518651a",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/vision-blue-result.json": "ba039e9a63c005d99fcf67259274f87b970b08d7f8faf2b974f882ed459658ab",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/cancel-request.json": "2deb5c25fb1a97914189abc7cc0a747376e11e01208a0d2de2fce3452b6c9128",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/after-cancel-request.json": "c14a11401616ff4c36347f1300d9529f440e8eac16e316bbec5f62e15c4b0e1c",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/after-cancel-response.json": "6017efd8e29950d3a256fcc6995d0d2335941440ef3c821454824754e1930da1",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/cancel-result.json": "099a97f19635e5c6d8f6edbef20e4c61c95bb598a8b4bbdc3287944eb89ffff5",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/random-token-pool-binding.json": "7dfc5c3403a89483b3625680a605847a5428b21eeba8e9f5a056a6e778340d7c",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/random-c1-0-request.json": "81b01ef5f31a75b844a1d38ce4f2d25efc3b22c2de5ce0b2b54afd0d2f6025f3",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/random-c1-0-result.json": "284ce86226896d815fddbb56b118bb30a397a151943b6660167c1d31fb465842",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/random-c1-summary.json": "5a9ffb10d84d7c468f680f146dd3cba488978891a66f16c4207f6378675ba4b9",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/random-c4-3-request.json": "a723b2a6360b5f407c31c126ab0991f4ad0f15b3375ae21d3be92340aaf59240",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/random-c4-2-request.json": "d17b385a982573a3f6103028c0bb10fc06fda1e1a1bff5f256893c125d1667d8",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/random-c4-0-request.json": "40d74a251b820f787af248eb7a6a48546101e0c756505916ad7c661474f45b61",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/random-c4-1-request.json": "cc5e0853790754c4ca19a13df48542a937eecea0eb289254b31db29a824ff7d0",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/random-c4-3-result.json": "796cbc9614a00aca732d369b82f822e67200d4355f94e470d1677995e1713980",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/random-c4-2-result.json": "0849cf81a9c57fa7824661b9a6e0e0f70ede035ff34082773373131193a0ba1f",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/random-c4-0-result.json": "ad5251cefee74622baa5991476616a041e156550ccbe6b788f5721eaf242d0cf",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/random-c4-1-result.json": "fc10c237982d758bb489a651077288ca4e8a9cf16940c314544809f60478504c",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/random-c4-summary.json": "cf4d84997913fb68d2a8894a07562f250ab59996097457084b4393e395ec8392",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/prose-calibration.json": "f6f21414e264f0096b636ff670e373bd95f1e9b71f2e56776b2929b3a8f59044",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/prose-r0-request.json": "60d78ad9d2dd7ab4b639d86d7508e7d57374b3c2e64a802f2d5beb359aa3c14f",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/prose-r0-result.json": "4ad8f1f36dd52ec924d9d0cabbcb21d9861d44d6ac377d6118c62af9ddfe0f4f",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/prose-r1-request.json": "60d78ad9d2dd7ab4b639d86d7508e7d57374b3c2e64a802f2d5beb359aa3c14f",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/prose-r1-result.json": "5a10a515c7398a33f89e76ec73f849108be6cbaa88ec3633ad91532ddf3d11fd",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/code-calibration.json": "68394851ff5dd27d97cc3218d84474067327ed69f516f17acf8b25299ca66f4d",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/code-r0-request.json": "4c34fd141ecc002bd953c7c7f93d95f8e5d7d934419b69fa75515aa75864e868",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/code-r0-result.json": "5c6d22e1d425f20461a5b80f8716eca3d21a0ff65e54747563ec4e2ca6d92bd1",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/code-r1-request.json": "4c34fd141ecc002bd953c7c7f93d95f8e5d7d934419b69fa75515aa75864e868",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/code-r1-result.json": "676df55bffbde6024d901ee7ca67dcc062d9b18fc815ea688630d7b3e262cf3d",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/structured-calibration.json": "43eaa5aea462a82b1fc4989a9a95149c1d7b087791d7099be6d349759bba2fb1",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/structured-r0-request.json": "a1706102d3d5fb82e4811b0d746cd10694a3854b7d8f54cb0ad521e2f9e83205",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/structured-r0-result.json": "e435da4e95056d19634ebcdd7e3b17f5f6533669f208df74793d8241b632dff0",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/structured-r1-request.json": "a1706102d3d5fb82e4811b0d746cd10694a3854b7d8f54cb0ad521e2f9e83205",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/structured-r1-result.json": "aa38ec192d5e4fc5bf66b2b8a37ce6dcc64fa7e8a43b8632591f6ae697d2fd32",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/http/summary.json": "b115258adc22e11c82d049531137aa29c7d08da5426ff946c374075cee78d54f",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank1/cleanup.json": "12a47ccc7783fb134c5622d1f14ac28c3ea19679853019f6629871d4bedb67d3",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank1/commands.jsonl": "4576abb8ac4d92758088fce198ee788a3ccb882db3daeb8ceab35eccdddada9f",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank1/config.json": "7e16ca66831ed988c2dcc36a13a91eb2243d3508b0d416f287d37cdd0f631090",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank1/container.cid": "6b1887c1a87b89b7bdb9c87aa1508b663045d17e0a003835c08e5f20b276e991",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank1/container.json": "00353333fdda145fd06b4d710aff740f0d1b944915182672655c1d636d4cfd40",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank1/image.json": "935e86b00610cf4308a8c8aad84e3140c01a53e0592d48354dcb895693f94df2",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank1/invocation.json": "ef781d14c36684870c5b450c933cdbdd86fe938e8fd9e74d170186d114a06083",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank1/memory.jsonl": "78bf86bf13cc017151534c1a8f42a014fc37ad939c2d5ee81c1a3418ba95191d",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank1/owner.json": "b20865e72b3fa204ea7fa262f4b51bc7da5dc125ada4744758ec4f7fea2c25c6",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank1/rank.log": "8784dadb75ca970c63b13a07195e78522a3b77f56723c502057b6b7647048b5b",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank1/result.json": "93b02c664accafe519a60f77a7b9b92c0a32d21e375322ecb4f971686d1340af",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank0/cleanup.json": "c58017cb12ce25632b42424bd5c0a0cd08860d2e6d703a3f2bd6561c244de942",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank0/commands.jsonl": "2caa2f92b145449d4b241351f926527f8e4c4763727c2a2605f3691511463e45",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank0/config.json": "c3ca792959c0c78696addf3cd45854b1c5ff8ea49b31fd184afa960d27eadc20",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank0/container.cid": "b5ea85f4257e654a0d7d6520dab3000d7e9eac5bfc3e67a181f992bf98123408",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank0/container.json": "15427592f751bed0328757d64bcd7bc34f9f1c2bc443afffd75daa05640ae8b0",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank0/image.json": "2af68ddc89c5a5d7ece7d9ca9827ba6af58fa500ddd3d265d99fb45ce7eb957b",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank0/invocation.json": "843072efa49d0b3396131f035b7140c852b9664ef80bb7a1880bb2652be5a37d",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank0/memory.jsonl": "60313e964fce9663a654cd1cd2b146b21c4ab2526970383884614fc1205e94a7",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank0/owner.json": "3e81ae5a88d7d8cb3e7b97b34ca86784a39256707aabe825429cbb30730799ee",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank0/rank.log": "054bdb2b202c67393d4c85576f81c2c633b8fd9f66b345d8f17cd6d333f5e186",
+    "ab-5d652f8e/runs/fp4local-on-32k-5d652f8e-ab/collected-rank0/result.json": "78b8dc18cfefa3a2ee8a7e7cd03c70ff49f046ee6b43007fed01b5cfb997d5c8",
+    "fp4local-fp4local-on-32k-union.log": "ebccdd81732e072d74175dd0535b46c34213fa57a2e286b1d5bc7a2d2cf6c0a9"
+  }
+}

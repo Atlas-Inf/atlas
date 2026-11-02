@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 pub mod aux_d2h;
+pub mod canonical_verify;
 pub mod deepseek_v4_mtp;
 pub mod dense_ffn;
 pub mod dflash_head;
@@ -8,7 +9,9 @@ pub mod ep_dispatch;
 pub mod fp8_calibration;
 mod glm5_kda;
 pub mod glm_kv_shard;
+pub mod glm_native;
 pub mod glm_sp;
+pub mod glm_sp_overlap;
 pub mod glm_sp_uneven;
 pub mod moe;
 mod moe_grouped_decode;
@@ -42,7 +45,8 @@ pub use dflash_head::{
 };
 pub use glm5_kda::{Glm5KdaLayer, Glm5KdaWeights, Glm5Projection};
 pub(crate) use glm5_kda::{
-    kda_batched_ffn_enabled, kda_multi_seq_enabled, verify_fused_tp_hc_enabled,
+    kda_batched_ffn_enabled, kda_conv_planes_enabled, kda_flash_prefill_word,
+    kda_multi_seq_enabled, kda_side_proj_lt_enabled, verify_fused_tp_hc_enabled,
 };
 pub use moe::MoeLayer;
 pub use moe_grouped_decode::{
@@ -303,3 +307,6 @@ impl FfnComponent {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod glm_gpu_test_backend;

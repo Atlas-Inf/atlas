@@ -180,7 +180,7 @@ fn default_kwargs_reasoning_effort_sets_both_halves() {
     let kw = parse_default_chat_template_kwargs(r#"{"reasoning_effort":"xhigh"}"#).unwrap();
     // The template string AND the budget directive come from one parse,
     // so effort-silent requests get the same tier on both paths.
-    assert_eq!(kw.reasoning_effort, Some(ReasoningEffort::Max));
+    assert_eq!(kw.reasoning_effort, Some(ReasoningEffort::XHigh));
     assert_eq!(kw.thinking, ThinkingDirective::OnEffort(EffortLevel::XHigh));
     assert_eq!(kw.preserve_thinking, None);
 
@@ -188,6 +188,28 @@ fn default_kwargs_reasoning_effort_sets_both_halves() {
     let kw = parse_default_chat_template_kwargs(r#"{"reasoning_effort":"none"}"#).unwrap();
     assert_eq!(kw.reasoning_effort, None);
     assert_eq!(kw.thinking, ThinkingDirective::Off);
+}
+
+#[test]
+fn model_default_effort_is_template_only_and_fails_fast() {
+    use crate::ir::ReasoningEffort;
+    let with = |e: &'static str| atlas_kernels::ModelBehavior {
+        default_reasoning_effort: e,
+        ..Default::default()
+    };
+    // Unset: the template's own default applies.
+    assert_eq!(model_default_reasoning_effort(&with("")).unwrap(), None);
+    assert_eq!(
+        model_default_reasoning_effort(&with("medium")).unwrap(),
+        Some(ReasoningEffort::Medium)
+    );
+    assert_eq!(
+        model_default_reasoning_effort(&with("max")).unwrap(),
+        Some(ReasoningEffort::Max)
+    );
+    // Not a thinking-on tier, or not a tier at all: refuse to boot.
+    assert!(model_default_reasoning_effort(&with("none")).is_err());
+    assert!(model_default_reasoning_effort(&with("hihg")).is_err());
 }
 
 #[test]

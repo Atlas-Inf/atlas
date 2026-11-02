@@ -58,6 +58,7 @@ fn mx8(gpu: &MockGpuBackend, config: &ModelConfig) -> Mx8Gdn {
     let value_dim = config.linear_num_value_heads * config.linear_value_head_dim;
     let proj = |n: usize, k: usize| Mxfp8Proj {
         w: Mxfp8Weight {
+            tiled: false,
             data: gpu.alloc(n * k).unwrap(),
             scales: gpu.alloc(n * k / 32).unwrap(),
         },

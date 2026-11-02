@@ -79,6 +79,18 @@ fn parses_the_flash_next_map() {
     );
 }
 
+/// The parser stores an absent encoding as `Some("")`; a plain ModelOpt map
+/// must not read as FP4-Local.
+#[test]
+fn an_empty_scale_encoding_is_not_the_fp4_local_marker() {
+    let mut mx = spec("MXFP8");
+    mx.group_size = 32;
+    mx.weight_scale_encoding = Some(String::new());
+    let cfg = cfg_with(&[("model.language_model.layers.0.self_attn.q_proj", mx)]);
+    let plan = ModeloptQuantPlan::from_config(&cfg).unwrap();
+    assert!(!plan.is_fp4_local());
+}
+
 /// The other family's spellings: MXFP8 as `weight_block_size [1,32]`,
 /// `FP8_PB_WO` with `[128,128]`, and `csf_32x2_v1` — all parsed, none
 /// guessed at.

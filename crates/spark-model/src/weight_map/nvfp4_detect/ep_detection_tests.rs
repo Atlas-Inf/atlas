@@ -271,3 +271,21 @@ fn mixed_precision_w4a16_nvfp4_labels_resolve_standard() {
          must resolve Standard — the FP8 arm cannot read uint8-packed FP4"
     );
 }
+
+/// nvidia FP4-Local's map puts 438 MXFP8 entries on the compute path (GDN,
+/// attention, shared experts) beside 48 CSF NVFP4 expert entries. MXFP8 is
+/// not an `FP8*` label and must not pull the global variant off Standard: the
+/// routed experts are standard ModelOpt NVFP4 once their scales are decoded,
+/// and the MXFP8 tensors are served per key by the FP8 -> BF16 funnel.
+#[test]
+fn fp4_local_mixed_map_resolves_standard() {
+    let cfg = atlas_core::config::parse_config(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test_data/qwen4_exp_flash_next_fp4local_config.json"
+    )))
+    .unwrap();
+    assert_eq!(
+        detect_nvfp4_variant(&WeightStore::empty(), &cfg),
+        Nvfp4Variant::Standard
+    );
+}

@@ -17,6 +17,7 @@ fn proj(gpu: &MockGpuBackend, n: usize, k: usize) -> Mxfp8Proj {
         w: Mxfp8Weight {
             data: gpu.alloc(n * k).unwrap(),
             scales: gpu.alloc(n * k / 32).unwrap(),
+            tiled: false,
         },
         n: n as u32,
         k: k as u32,

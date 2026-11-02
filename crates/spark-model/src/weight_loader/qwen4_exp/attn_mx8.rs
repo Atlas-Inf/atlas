@@ -84,6 +84,7 @@ pub(super) fn build(
         }
         Ok(Mxfp8Proj {
             w: Mxfp8Weight {
+                tiled: false,
                 data: local[0],
                 scales: local[1],
             },

@@ -16,6 +16,7 @@ mod evicted;
 mod no_caching;
 pub mod nvme;
 mod tier_evict;
+pub mod vision_key;
 pub use evicted::EvictedBlocks;
 pub use no_caching::NoPrefixCaching;
 pub use nvme::{

@@ -39,6 +39,7 @@ pub use dflash_loader::{
 };
 pub use gemma4::Gemma4WeightLoader;
 pub use glm5::Glm5WeightLoader;
+pub use glm5::mode as glm5_mode;
 pub use laguna::LagunaWeightLoader;
 pub use longcat::LongcatWeightLoader;
 pub use minimax::MinimaxM2WeightLoader;

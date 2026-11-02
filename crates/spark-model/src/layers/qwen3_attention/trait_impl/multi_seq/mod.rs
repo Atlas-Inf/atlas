@@ -63,6 +63,9 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16): every
+        // entry of this decode (`decode_multi_seq`, `decode_multi_seq_rows`).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         if self.try_nemotron_attention_serial(
             hidden,
             residual,

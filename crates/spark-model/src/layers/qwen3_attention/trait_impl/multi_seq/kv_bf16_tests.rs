@@ -70,6 +70,7 @@ fn kv_bf16_requires_plain_qwen_weights_and_kernel() {
             w: crate::weight_map::Mxfp8Weight {
                 data: DevicePtr(0x2000),
                 scales: DevicePtr(0x3000),
+                tiled: false,
             },
             n: 256,
             k: 2560,

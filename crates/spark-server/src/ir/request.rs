@@ -14,6 +14,25 @@
 // wire-only for the same reason (PCND: the IR carries exactly what
 // internals read).
 
+/// `max_tokens` of a request that sent none: the rest of the served
+/// context, as vLLM's OpenAI server (`max_model_len - prompt`). Held as this
+/// sentinel until the prompt is tokenized, then [`resolve_max_tokens`].
+/// KV admission reserves the resolved cap (`scheduler/admission.rs`), so a
+/// pool too small for `max_num_seqs` full contexts queues requests unless
+/// `ATLAS_KV_ADMIT_WATERMARK` lets it overcommit (decode-time preemption
+/// then resumes the victims).
+pub const MAX_TOKENS_UNSET: usize = usize::MAX;
+
+/// A request's generation cap once its prompt length is known:
+/// [`MAX_TOKENS_UNSET`] becomes the context left after the prompt.
+pub fn resolve_max_tokens(max_tokens: usize, prompt_len: usize, max_seq_len: usize) -> usize {
+    if max_tokens == MAX_TOKENS_UNSET {
+        max_seq_len.saturating_sub(prompt_len)
+    } else {
+        max_tokens
+    }
+}
+
 /// Provider-agnostic chat request envelope.
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
@@ -25,10 +44,14 @@ pub struct ChatRequest {
     pub tools: Vec<crate::tool_parser::ToolDefinition>,
     pub tool_choice: Option<crate::tool_parser::ToolChoice>,
     pub sampling: SamplingParams,
+    /// Generation cap; [`MAX_TOKENS_UNSET`] until the handler knows the
+    /// prompt length ([`resolve_max_tokens`]).
     pub max_tokens: usize,
     pub min_tokens: usize,
     /// vLLM `ignore_eos`: model end tokens are ordinary output tokens.
     pub ignore_eos: bool,
+    /// Request serial target decoding instead of speculative decoding.
+    pub disable_mtp: bool,
     /// Stop sequences (generation halts when one is produced).
     pub stop: Vec<String>,
     pub stream: bool,
@@ -168,11 +191,18 @@ pub enum EffortLevel {
     XHigh,
 }
 
+/// The wire `reasoning_effort` spelling, `none` excepted (that is thinking
+/// off). Each spelling stays distinct so a template that owns its effort
+/// vocabulary can be handed exactly what the client sent
+/// ([`wire_str`](Self::wire_str)); [`as_str`](Self::as_str) is the
+/// cross-template tier every other template consumes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningEffort {
+    Minimal,
     Low,
     Medium,
     High,
+    XHigh,
     Max,
 }
 
@@ -189,10 +219,23 @@ impl ReasoningEffort {
     ///   (unchanged behavior; "high" and thinking-off "none" still pass).
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Minimal | Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh | Self::Max => "xhigh",
+        }
+    }
+
+    /// The spelling the client sent, which vLLM hands every chat template
+    /// verbatim (MODEL.toml `[behavior].verbatim_reasoning_effort`).
+    pub fn wire_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
-            Self::Max => "xhigh",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
         }
     }
 }
@@ -221,7 +264,7 @@ pub fn parse_wire_effort(s: &str) -> Option<(Option<ReasoningEffort>, ThinkingDi
     Some(match s {
         "none" => (None, ThinkingDirective::Off),
         "minimal" => (
-            Some(ReasoningEffort::Low),
+            Some(ReasoningEffort::Minimal),
             ThinkingDirective::OnEffort(EffortLevel::Minimal),
         ),
         "low" => (
@@ -236,7 +279,11 @@ pub fn parse_wire_effort(s: &str) -> Option<(Option<ReasoningEffort>, ThinkingDi
             Some(ReasoningEffort::High),
             ThinkingDirective::OnEffort(EffortLevel::High),
         ),
-        "xhigh" | "max" => (
+        "xhigh" => (
+            Some(ReasoningEffort::XHigh),
+            ThinkingDirective::OnEffort(EffortLevel::XHigh),
+        ),
+        "max" => (
             Some(ReasoningEffort::Max),
             ThinkingDirective::OnEffort(EffortLevel::XHigh),
         ),

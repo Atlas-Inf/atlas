@@ -17,16 +17,16 @@ mod prefill_stream_tests;
 
 impl TransformerModel {
     pub(super) fn set_vision_slice_base_entry(
-        &self,
+        seq: &mut SequenceState,
         row_base: usize,
         grid_base: usize,
         owned_images: usize,
         slice_rows: usize,
     ) {
-        *self.vision_row_base.lock() = row_base;
-        *self.vision_grid_base.lock() = grid_base;
-        *self.vision_owned_images.lock() = owned_images;
-        *self.vision_slice_rows.lock() = slice_rows;
+        seq.vision.row_base = row_base;
+        seq.vision.grid_base = grid_base;
+        seq.vision.owned_images = owned_images;
+        seq.vision.slice_rows = slice_rows;
     }
 
     pub(super) fn prefill_entry(
@@ -64,6 +64,11 @@ impl TransformerModel {
             stream
         };
         self.stamp_overlay_route(seq.adapter_slot);
+        // Chunk 0 keys a vision prompt for the prefix cache (`vision_cache`);
+        // a retried chunk 0 keeps the key its lookup used.
+        if chunk_start == 0 && !seq.prefix_lookup_applied {
+            self.stamp_vision_cache_key(tokens, seq);
+        }
 
         (|| {
             let logits = self.prefill_chunk_dispatch(
@@ -76,6 +81,10 @@ impl TransformerModel {
             )?;
             self.try_mtp_prompt_absorb(seq, tokens, stream);
             self.try_eager_drafter_prefill(seq, is_last_chunk, stream)?;
+            // The prompt is in: its pixels are done (`SeqVision::items`).
+            if is_last_chunk {
+                seq.vision.items = Vec::new();
+            }
             Ok(logits)
         })()
     }

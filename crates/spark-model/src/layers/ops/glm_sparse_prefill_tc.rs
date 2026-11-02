@@ -111,7 +111,7 @@ pub fn try_glm_sparse_prefill_tc(
 }
 
 /// Whether a sparse owner of `rows` reads an `fp8_g128` cache through the
-/// BF16 view. The native library reads only the view; every other 2048+-row
+/// BF16 view. The native kernel path reads only the view; every other 2048+-row
 /// piece runs BF16 kv_pad on it, which the pipelined kernel reproduces bit for
 /// bit from the FP8 cache, so under the pipe only native pieces need it.
 pub fn glm_sparse_owner_needs_view(

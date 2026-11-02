@@ -106,12 +106,16 @@ pub(super) fn run(
     true
 }
 
-/// A queued prompt whose streaming client is gone: nothing ran for it and
-/// nobody reads its tokens, so it leaves the queue before its first chunk
-/// (a buffered caller is caught by `ResponseSink::receiver_closed`). Prompts
-/// already prefilling keep today's streaming contract (`cancel_flag`, read
-/// at the emit and decode boundaries).
+/// A queued prompt whose streaming client is gone or cancelled: nothing ran
+/// for it and nobody reads its tokens, so it leaves the queue before its
+/// first chunk (a buffered caller is caught by `ResponseSink::receiver_closed`).
+/// Prompts already prefilling keep today's streaming contract (`cancel_flag`,
+/// read at the emit and decode boundaries).
 pub(super) fn abandoned(p: &PrefillInProgress) -> bool {
+    let cancelled = p
+        .cancel_flag
+        .as_ref()
+        .is_some_and(|f| f.load(std::sync::atomic::Ordering::Acquire));
     p.queued_first_chunk.is_some()
-        && matches!(&p.sink, ResponseSink::Streaming(tx) if tx.is_closed())
+        && (cancelled || matches!(&p.sink, ResponseSink::Streaming(tx) if tx.is_closed()))
 }

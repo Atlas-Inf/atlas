@@ -81,6 +81,31 @@ impl DenseFfnLayer {
 
     /// SiLU FFN over `rows` verify rows on the W4A16 tensor-core tier for that
     /// width; false when the tier or a scalar-scale NVFP4 weight is missing.
+    /// `ATLAS_GLM_CANONICAL_VERIFY`: a GLM dense FFN of 1..=32 verify rows on
+    /// the canonical tensor-core rows below, whichever entry the width takes
+    /// (one row's prefill GEMM, the scalar K2 / K3 GEMVs, the batch-M tiers,
+    /// the owner-batched rows), so a row's bits do not follow the width.
+    pub(super) fn try_glm_canonical_rows(
+        &self,
+        input: DevicePtr,
+        rows: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        // ATLAS_GLM_FP4L_DENSE_MXFP8: every row count (`dense_ffn_native.rs`).
+        if self.try_native(input, rows, ctx, stream)? {
+            return Ok(true);
+        }
+        if ctx.config.model_type != "glm5_next"
+            || !crate::layers::canonical_verify::enabled()
+            || !(1..=crate::layers::canonical_verify::MAX_ROWS as usize).contains(&rows)
+            || self.q2_weights.is_some()
+        {
+            return Ok(false);
+        }
+        self.glm_verify_rows_tc(input, rows as u32, ctx, stream)
+    }
+
     fn glm_verify_rows_tc(
         &self,
         input: DevicePtr,
@@ -101,6 +126,11 @@ impl DenseFfnLayer {
                 .all(usable)
         {
             return Ok(false);
+        }
+        // ATLAS_GLM_DENSE_TP_SPLIT: half the columns on each rank.
+        let proj = super::tp_split::SplitProj::Nvfp4 { weights: w, tc };
+        if self.glm_verify_rows_split(input, rows, proj, ctx, stream)? {
+            return Ok(true);
         }
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.intermediate_size as u32;

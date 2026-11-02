@@ -17,9 +17,23 @@ fn with_kda_ffn(
     run: impl FnOnce(&Gpu, &atlas_core::config::ModelConfig, &Glm5KdaLayer),
 ) {
     let gpu = Gpu::new();
-    let (_store, mut config, mut ffn) = resident_tests::setup(&gpu, rank);
+    let (config, layer) = kda_layer(&gpu, rank, pair, |_| {});
+    run(&gpu, &config, &layer.unwrap());
+}
+
+/// The real constructor over mock weights, after `edit` changes them.
+fn kda_layer(
+    gpu: &Gpu,
+    rank: usize,
+    pair: bool,
+    edit: impl FnOnce(&mut Glm5KdaWeights),
+) -> (
+    atlas_core::config::ModelConfig,
+    anyhow::Result<Glm5KdaLayer>,
+) {
+    let (_store, mut config, mut ffn) = resident_tests::setup(gpu, rank);
     let ffn = if pair {
-        ffn.transpose_for_prefill_unified_keep_shared(&gpu, &config)
+        ffn.transpose_for_prefill_unified_keep_shared(gpu, &config)
             .unwrap();
         ffn.unified_layout = true;
         ffn.nvfp4_fused_silu_quant = true;
@@ -55,6 +69,8 @@ fn with_kda_ffn(
             weight_scale_2_vec: DevicePtr::NULL,
         },
         prefill_nvfp4_t: None,
+        mxfp8: None,
+        w8a8: None,
     };
     let site = || HcSiteWeights {
         hc_fn: gpu.alloc(24 * 4 * 4096 * 4).unwrap(),
@@ -63,7 +79,7 @@ fn with_kda_ffn(
         hc_scale: gpu.alloc(12).unwrap(),
         lowrank: None,
     };
-    let weights = Glm5KdaWeights {
+    let mut weights = Glm5KdaWeights {
         q_proj: projection(),
         k_proj: projection(),
         v_proj: projection(),
@@ -78,6 +94,7 @@ fn with_kda_ffn(
         dt_bias: dense(4096 * 4),
         o_norm: dense(4096 * 2),
     };
+    edit(&mut weights);
     let layer = Glm5KdaLayer::new(
         dense(8192),
         dense(8192),
@@ -95,10 +112,37 @@ fn with_kda_ffn(
         },
         0,
         &config,
-        &gpu,
-    )
-    .unwrap();
-    run(&gpu, &config, &layer);
+        gpu,
+    );
+    (config, layer)
+}
+
+/// q/k/v/o must all carry the MXFP8 decode twin and the W8A8 operand, or
+/// none: the shared activation scratch and the null-NVFP4 lane assume it.
+pub(super) fn mixed_kda_twins_are_refused() {
+    let twin = |gpu: &Gpu| crate::weight_map::Mxfp8Weight::alloc(gpu, 4096, 4096).unwrap();
+    let gpu = Gpu::new();
+    let (_, all) = kda_layer(&gpu, 0, false, |w| {
+        for p in [&mut w.q_proj, &mut w.k_proj, &mut w.v_proj, &mut w.o_proj] {
+            p.mxfp8 = Some(twin(&gpu));
+        }
+    });
+    assert!(all.is_ok(), "{:?}", all.err());
+    let gpu = Gpu::new();
+    let (_, mixed) = kda_layer(&gpu, 0, false, |w| w.k_proj.mxfp8 = Some(twin(&gpu)));
+    let err = format!("{:#}", mixed.err().expect("mixed twins accepted"));
+    assert!(err.contains("disagree"), "{err}");
+    let gpu = Gpu::new();
+    let (_, mixed) = kda_layer(&gpu, 0, false, |w| {
+        w.o_proj.w8a8 = Some(crate::layers::ops::MxW8a8 {
+            pinned: false,
+            data: DevicePtr(0x100),
+            sf: DevicePtr(0x200),
+            n: 4096,
+            k: 4096,
+        })
+    });
+    assert!(mixed.is_err(), "mixed W8A8 accepted");
 }
 
 pub(super) fn actual_kda_rows() {
@@ -147,15 +191,15 @@ pub(super) fn actual_kda_rows() {
                         Box::new(SsmLayerState {
                             h_state: h[0].offset(i as usize * 2097152),
                             conv_state: conv[0].offset(i as usize * 196608),
+                            gdn_commit_qkv: spark_runtime::gpu::DevicePtr::NULL,
+                            gdn_commit_gb: spark_runtime::gpu::DevicePtr::NULL,
+                            gdn_commit_pending: false,
+                            gdn_fuse_n: DevicePtr::NULL,
                             h_is_f16: false,
                             h_state_checkpoint: None,
                             conv_state_checkpoint: None,
                             h_state_intermediates: vec![],
                             kda_records: spark_runtime::gpu::DevicePtr::NULL,
-                            gdn_commit_qkv: DevicePtr(0),
-                            gdn_commit_gb: DevicePtr(0),
-                            gdn_commit_pending: false,
-                            gdn_fuse_n: DevicePtr::NULL,
                             conv_state_intermediates: vec![],
                             h_prefill_stage: None,
                             ple: None,

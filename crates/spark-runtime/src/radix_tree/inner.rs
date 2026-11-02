@@ -8,8 +8,9 @@ use std::collections::HashMap;
 
 mod evict;
 mod nvme;
+mod nvme_index;
 
-pub(super) use nvme::NvmeIndex;
+pub(super) use nvme_index::NvmeIndex;
 
 type NodeId = usize;
 

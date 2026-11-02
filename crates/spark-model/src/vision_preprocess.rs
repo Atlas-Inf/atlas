@@ -382,7 +382,6 @@ pub fn image_pad_count(grid_h: usize, grid_w: usize, spatial_merge_size: usize) 
 
 mod probe;
 pub use probe::{ProbedImage, decode_gated, probe_image};
-#[cfg(test)]
 pub mod fixtures;
 
 #[cfg(test)]

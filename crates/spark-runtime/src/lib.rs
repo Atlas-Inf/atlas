@@ -25,6 +25,7 @@ pub mod flashinfer;
 #[cfg(not(feature = "cuda"))]
 #[path = "flashinfer_metal_stub.rs"]
 pub mod flashinfer;
+pub mod glm_kda;
 pub mod gpu;
 #[path = "gpu_args.rs"]
 mod gpu_args;
@@ -34,7 +35,7 @@ pub mod kernel_audit;
 pub mod kv_cache;
 pub mod kv_dequant;
 pub mod kv_spill;
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal_backend;
 pub mod op_cache;
 pub mod own_footprint;

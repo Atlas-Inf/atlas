@@ -132,3 +132,67 @@ fn a_never_closed_envelope_is_still_cut() {
     assert!(finished);
     assert_eq!(guard, Some("tool_envelope_stuck"));
 }
+
+const GLM_TOOL_CALL: u32 = 154_841;
+const GLM_TOOL_CALL_END: u32 = 154_842;
+const GLM_KEY: (u32, u32) = (154_847, 154_848);
+const GLM_VALUE: (u32, u32) = (154_849, 154_850);
+
+/// GLM-5.3 (Poolside v1): each value sits between the single tokens
+/// `<arg_value>` / `</arg_value>`, which the `<parameter=` scan never sees.
+fn glm() -> ToolMarkers {
+    ToolMarkers::from_vocab([
+        (27, "<"),
+        (28, "="),
+        (29, ">"),
+        (510, "</"),
+        (15704, "parameter"),
+        (GLM_VALUE.0, "<arg_value>"),
+        (GLM_VALUE.1, "</arg_value>"),
+    ])
+    .unwrap()
+}
+
+/// `<tool_call>write_file<arg_key>path</arg_key><arg_value>p</arg_value>`
+/// `<arg_key>content</arg_key><arg_value>` + body + `</arg_value></tool_call>`.
+fn glm_write(body_tokens: usize) -> Vec<u32> {
+    let mut t = vec![GLM_TOOL_CALL, 7];
+    t.extend([GLM_KEY.0, 9, GLM_KEY.1, GLM_VALUE.0, 11, GLM_VALUE.1]);
+    t.extend([GLM_KEY.0, 12, GLM_KEY.1, GLM_VALUE.0]);
+    body(&mut t, body_tokens, [510, 611, 29]); // </div> every 50
+    t.extend([GLM_VALUE.1, GLM_TOOL_CALL_END]);
+    t
+}
+
+#[test]
+fn glm_native_value_markers_let_a_large_write_finish() {
+    let (finished, guard, inside) = run(
+        Some(glm()),
+        GLM_TOOL_CALL,
+        GLM_TOOL_CALL_END,
+        &glm_write(1500),
+    );
+    assert!(!finished, "guard fired: {guard:?}");
+    assert!(!inside, "</tool_call> should close the body");
+    // Without them every value token counted as envelope.
+    let (finished, guard, _) = run(
+        Some(qwen()),
+        GLM_TOOL_CALL,
+        GLM_TOOL_CALL_END,
+        &glm_write(1500),
+    );
+    assert!(finished);
+    assert_eq!(guard, Some("tool_envelope_stuck"));
+}
+
+#[test]
+fn glm_native_values_resolve_alone_and_a_runaway_envelope_is_still_cut() {
+    let native_only =
+        ToolMarkers::from_vocab([(GLM_VALUE.0, "<arg_value>"), (GLM_VALUE.1, "</arg_value>")]);
+    assert!(native_only.is_some());
+    let mut t = vec![GLM_TOOL_CALL];
+    t.extend(std::iter::repeat_n(41_199u32, 1100));
+    let (finished, guard, _) = run(native_only, GLM_TOOL_CALL, GLM_TOOL_CALL_END, &t);
+    assert!(finished);
+    assert_eq!(guard, Some("tool_envelope_stuck"));
+}

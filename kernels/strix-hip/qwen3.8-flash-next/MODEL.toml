@@ -621,6 +621,11 @@ min_reasoning_floor_tokens = 0
 # closes into <|im_start|>user template simulation.
 honor_eos_inside_thinking = true
 max_thinking_budget = 2048
+# Effort-silent requests render the template's "medium" tier (no directive
+# sentence), the tier this target's budget was tuned with; the checkpoint
+# template's own default is xhigh. Clients and --default-chat-template-kwargs
+# still pick any tier.
+default_reasoning_effort = "medium"
 # Guards carried over from the Atlas-Inf side of the merge: cap the think
 # budget at the request's own max_tokens rather than letting a 2048-token
 # reasoning block starve the answer, and keep the repetition watchdog on --

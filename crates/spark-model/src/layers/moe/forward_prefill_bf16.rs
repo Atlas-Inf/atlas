@@ -73,7 +73,14 @@ impl MoeLayer {
             self.router_gate_gemm_dense(router_in, gate_logits, n, num_experts, h, ctx, stream)?;
         }
 
-        super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
+        super::dump::dump_gate_logits(
+            ctx.gpu,
+            stream,
+            gate_logits,
+            n,
+            num_experts,
+            self.router_f32,
+        )?;
 
         // Feature-1: fold the router (`mlp.gate`) LoRA delta onto the routing
         // logits BEFORE top-k (device-clean, no capture guard). No-op unless a

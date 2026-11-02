@@ -47,6 +47,7 @@ fn a_prefill_set_finds_its_operand_by_the_projection_weight() {
         w: crate::weight_map::Mxfp8Weight {
             data: DevicePtr(data),
             scales: DevicePtr(data + 0x80),
+            tiled: false,
         },
         n,
         k,

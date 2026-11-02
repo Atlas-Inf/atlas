@@ -45,8 +45,8 @@ pub struct RepetitionDetectionParams {
 
 /// Grammar specification for constrained decoding.
 ///
-/// Either tool-call grammar (Hermes/Qwen3-Coder format) or response-format
-/// grammar (generic JSON or JSON-schema).
+/// Tool-call grammar (Hermes/Qwen3-Coder format), response-format grammar
+/// (generic JSON or JSON-schema), or the union of the two.
 #[derive(Clone)]
 pub enum GrammarSpec {
     /// Tool-call constrained decoding: tools, parser instance, use_triggers flag.
@@ -68,6 +68,17 @@ pub enum GrammarSpec {
     JsonObject,
     /// Response format: JSON matching a specific schema.
     JsonSchema { schema: String },
+    /// `tool_choice="auto"` with a `response_format`: the output is EITHER
+    /// tool calls in the parser's format OR the response_format JSON — the
+    /// first output token picks the branch (OpenAI and vLLM enforce the
+    /// schema on the final answer while still allowing tool calls). A
+    /// response_format grammar ([`Self::is_response_format`]).
+    ToolCallOrJson {
+        tools: Vec<tool_parser::ToolDefinition>,
+        parser: std::sync::Arc<dyn tool_parser::ToolCallParser>,
+        /// The JSON schema; `None` for `json_object` (any JSON).
+        schema: Option<String>,
+    },
 }
 
 /// The scheduler rejected the request as asked (e.g. a `response_format` it
@@ -79,7 +90,10 @@ pub struct InvalidRequestError(pub String);
 impl GrammarSpec {
     /// A `response_format` grammar, whose output must conform.
     pub fn is_response_format(&self) -> bool {
-        matches!(self, Self::JsonObject | Self::JsonSchema { .. })
+        matches!(
+            self,
+            Self::JsonObject | Self::JsonSchema { .. } | Self::ToolCallOrJson { .. }
+        )
     }
 }
 
@@ -346,8 +360,8 @@ pub struct InferenceResponse {
     /// Number of prompt tokens served by the prefix cache (no prefill compute
     /// cost). Reported as `usage.prompt_tokens_details.cached_tokens`.
     pub cached_prompt_tokens: u32,
-    /// Speculative-decode draft tokens ACCEPTED for this request (MTP verify
-    /// path, `RequestAccept::accepted_total`). Reported to clients as
+    /// Accepted speculative draft tokens retained in this completion
+    /// (`RequestAccept::accepted_output_total`). Reported to clients as
     /// `usage.completion_tokens_details.accepted_prediction_tokens` — the
     /// OpenAI field's meaning (predicted tokens that matched generation),
     /// carried by Atlas's self-drafted MTP predictions. 0 when speculation is

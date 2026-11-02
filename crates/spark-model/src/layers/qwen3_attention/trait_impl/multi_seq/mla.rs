@@ -215,12 +215,26 @@ impl Qwen3AttentionLayer {
                 query_stage.map(|p| p.row(i)).transpose()?,
             )?;
             if let Some(plan) = o_stage {
+                anyhow::ensure!(
+                    !plan.comparing() || !self.mla_is_native(&mla.wo),
+                    "the K3 O comparison needs the BF16 o_proj a native MLA layer frees"
+                );
                 plan.capture_scalar(c.fwd.gpu, self.dense_gemv_k, &mla.wo, i, stream)?;
             }
         }
 
         if let Some(plan) = o_stage {
-            plan.project(c.fwd.gpu, self.dense_gemv_batchm_k, &mla.wo, stream)?;
+            plan.project(
+                c.fwd.gpu,
+                self.dense_gemv_batchm_k,
+                &mla.wo,
+                |input, output, rows| {
+                    self.mla_native_gemv(
+                        c.fwd.gpu, &mla.wo, input, output, rows, 4096, 8192, stream,
+                    )
+                },
+                stream,
+            )?;
             plan.finish_compare(c.fwd.gpu, stream, self.attn_layer_idx, c.fwd.config.tp_rank)?;
         }
 

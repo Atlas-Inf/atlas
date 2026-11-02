@@ -171,3 +171,22 @@ fn ep_zero_capacity_rejects_even_a_single_request() {
     assert!(reject_oversized(vec![request], 0, 262144, 262144, 16).is_empty());
     assert!(response_rx.try_recv().unwrap().is_err());
 }
+
+// Vision state is per-sequence (`model::vision_cache`), so admission no
+// longer serializes image prefills: the gate's only concern is KV. Two image
+// prompts — each long enough to chunk over several ticks — are admitted in
+// the same tick whenever their KV fits, and their prefill chunks interleave.
+#[test]
+fn two_chunked_image_requests_are_admitted_in_the_same_tick() {
+    // Two 47K-token image prompts (the race repro shape) against a pool that
+    // holds both: both admitted, neither queued behind the other.
+    let image_prompt = 47_000;
+    let reqs = vec![(image_prompt, MAX_TOK), (image_prompt, MAX_TOK)];
+    let (n, forced) = admit_count(POOL_BLOCKS, 0, &reqs, MAX_SEQ_LEN, MAX_SEQ_LEN, BS);
+    assert_eq!(n, 2, "both image requests fit — no vision hold");
+    assert!(!forced);
+    // And a third arrives behind them only on KV grounds, the same as text.
+    let reqs = vec![(image_prompt, MAX_TOK); 3];
+    let (n, _) = admit_count(POOL_BLOCKS, 0, &reqs, MAX_SEQ_LEN, MAX_SEQ_LEN, BS);
+    assert_eq!(n, 2, "the third waits for pool capacity, not for vision");
+}

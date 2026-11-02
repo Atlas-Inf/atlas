@@ -92,6 +92,7 @@ fn mxfp8_shared_expert_runs_at_decode_verify_and_prefill_rows() {
     let (h, inter) = (config.hidden_size, config.shared_expert_intermediate_size);
     let proj = |n: usize, k: usize, ptr: u64| Mxfp8Proj {
         w: crate::weight_map::Mxfp8Weight {
+            tiled: false,
             data: DevicePtr(ptr),
             scales: DevicePtr(ptr + 0x1000),
         },

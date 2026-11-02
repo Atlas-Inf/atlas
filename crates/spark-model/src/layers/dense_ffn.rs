@@ -17,8 +17,14 @@ use crate::weight_map::{
 
 #[path = "dense_ffn_dp4a.rs"]
 mod dp4a_decode;
+#[path = "dense_ffn_native.rs"]
+mod native;
 #[path = "dense_ffn_prefill_bf16.rs"]
 mod prefill_bf16;
+#[path = "dense_ffn_tp_split.rs"]
+mod tp_split;
+pub use native::DenseNative;
+pub(crate) use tp_split::dense_tp_split_requested;
 
 pub struct DenseFfnWeights {
     pub gate_proj: QuantizedWeight,
@@ -294,6 +300,9 @@ pub struct DenseFfnLayer {
     /// it is unaffected). M0: stored only — compute reads land in M1.
     #[allow(dead_code)]
     lora: Option<ops::lora_delta::LoraFfnWeights>,
+    /// The checkpoint's MXFP8 projections (`ATLAS_GLM_FP4L_DENSE_MXFP8`,
+    /// `dense_ffn_native.rs`): when set, every row runs on them.
+    native: Option<DenseNative>,
 
     /// Native keep-packed ternary Q2_0 dense MLP weights (`ATLAS_GGUF_NATIVE_Q2`).
     /// When installed via `set_q2_weights`, decode dispatches `q2_0_gemv_vec`
@@ -563,6 +572,7 @@ impl DenseFfnLayer {
             ),
             w8a16_gemm_t_m128_k: super::try_kernel(gpu, "w8a16_gemm_t_m128", "w8a16_gemm_t_m128"),
             lora: None,
+            native: None,
             q2_weights: None,
             // Winner of the decode-GEMV bench: candidate B (vectorized code loads
             // + smem A-stage, 1 warp/row × 8 rows/CTA). ~268 GB/s (98% of the
@@ -986,6 +996,9 @@ impl DenseFfnLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        if self.try_native(input, 1, ctx, stream)? {
+            return Ok(ctx.buffers.moe_output());
+        }
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.intermediate_size as u32;
 
@@ -1460,6 +1473,9 @@ impl DenseFfnLayer {
     /// K=2 speculative: read-once batched GEMV for two tokens.
     /// Native BF16 uses separate gate/up batch2 launches; NVFP4 keeps its fused path.
     pub fn forward_k2(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
+        if self.try_glm_canonical_rows(input, 2, ctx, stream)? {
+            return Ok(());
+        }
         // Packed-Q2: NVFP4 fallback weights are NULL, so the NVFP4 batch2 GEMVs
         // below would fault. Route to the keep-packed batchm FFN (m=2).
         if let Some(ref q2w) = self.q2_weights {
@@ -1572,6 +1588,9 @@ impl DenseFfnLayer {
     /// K=3 speculative: batched GEMV for 3 tokens.
     /// 3 launches: dual batch3 (gate+up) + silu_mul + batch3 (down).
     pub fn forward_k3(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
+        if self.try_glm_canonical_rows(input, 3, ctx, stream)? {
+            return Ok(());
+        }
         // Packed-Q2: route to the keep-packed batchm FFN (m=3); NVFP4 weights null.
         if let Some(ref q2w) = self.q2_weights {
             return self.forward_km_q2(q2w, input, ctx, 3, stream);
@@ -1669,6 +1688,9 @@ impl DenseFfnLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.try_glm_canonical_rows(input, m as usize, ctx, stream)? {
+            return Ok(());
+        }
         if self.forward_dp4a_batch(input, m, ctx, stream)? {
             return Ok(());
         }
@@ -1863,7 +1885,9 @@ impl DenseFfnLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        if self.try_glm_prefill_bf16(input, num_tokens, ctx, stream)? {
+        if self.try_glm_canonical_rows(input, num_tokens, ctx, stream)?
+            || self.try_glm_prefill_bf16(input, num_tokens, ctx, stream)?
+        {
             return Ok(());
         }
         let h = ctx.config.hidden_size as u32;

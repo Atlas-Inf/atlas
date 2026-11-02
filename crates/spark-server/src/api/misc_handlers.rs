@@ -257,8 +257,12 @@ pub async fn tokenize(
         let mut ir_req = crate::ir::ChatRequest::from(chat);
         // Counting must not require the vision encoder (see count_tokens).
         for m in &mut ir_req.messages {
-            m.content
-                .retain(|p| !matches!(p, crate::ir::ContentPart::Image(_)));
+            m.content.retain(|p| {
+                !matches!(
+                    p,
+                    crate::ir::ContentPart::Image(_) | crate::ir::ContentPart::Video(_)
+                )
+            });
         }
         let state_for_prepare = state.clone();
         match tokio::task::spawn_blocking(move || {

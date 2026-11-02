@@ -116,4 +116,90 @@ mod tests {
         let c = bash_wander_hint_inner(10, 0).expect("should fire");
         assert!(c.contains("CRITICAL"));
     }
+
+    mod repeat_notice {
+        use super::super::super::*;
+        use crate::ir::message::ToolCall;
+        use crate::ir::{ContentPart, Message, Role};
+
+        fn msg(role: Role, t: &str) -> Message {
+            Message {
+                role,
+                content: vec![ContentPart::Text(t.into())],
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                reasoning: None,
+                tool_error: false,
+            }
+        }
+
+        fn call(id: &str, cmd: &str) -> Message {
+            let mut m = msg(Role::Assistant, "");
+            m.tool_calls = vec![ToolCall {
+                id: id.into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({ "command": cmd }),
+            }];
+            m
+        }
+
+        fn round(conv: &mut Vec<Message>, id: &str, cmd: &str, out: &str) {
+            conv.push(call(id, cmd));
+            conv.push(msg(Role::Tool, out));
+        }
+
+        #[test]
+        fn counts_identical_trailing_rounds_ignoring_call_ids() {
+            let mut conv = vec![msg(Role::User, "find the MTP docs")];
+            round(&mut conv, "a", "ls docs", "REPRODUCE.md");
+            for id in ["b", "c", "d"] {
+                round(&mut conv, id, "grep -rn MTP docs/REPRODUCE.md", "===");
+            }
+            assert_eq!(identical_tool_round_run(&conv), 3);
+        }
+
+        #[test]
+        fn a_changed_result_or_call_breaks_the_run() {
+            let mut conv = vec![msg(Role::User, "build it")];
+            round(&mut conv, "a", "cargo check", "error[E0425]");
+            round(&mut conv, "b", "cargo check", "warning: unused");
+            assert_eq!(
+                identical_tool_round_run(&conv),
+                1,
+                "progressing results are not a loop"
+            );
+            round(&mut conv, "c", "cargo test", "warning: unused");
+            assert_eq!(
+                identical_tool_round_run(&conv),
+                1,
+                "a different call starts a new run"
+            );
+        }
+
+        #[test]
+        fn zero_unless_the_conversation_ends_on_a_tool_result() {
+            let mut conv = vec![msg(Role::User, "x")];
+            round(&mut conv, "a", "ls", "a.txt");
+            round(&mut conv, "b", "ls", "a.txt");
+            conv.push(msg(Role::User, "thanks"));
+            assert_eq!(identical_tool_round_run(&conv), 0);
+        }
+
+        #[test]
+        fn repeated_errors_are_left_to_the_error_hints() {
+            let mut conv = vec![msg(Role::User, "x")];
+            round(&mut conv, "a", "cat nope", "Error: ENOENT: no such file");
+            round(&mut conv, "b", "cat nope", "Error: ENOENT: no such file");
+            assert_eq!(identical_tool_round_run(&conv), 0);
+        }
+
+        #[test]
+        fn notice_names_the_run_and_keeps_tools_open() {
+            let n = repeat_notice(3);
+            assert!(n.contains("3 times"));
+            assert!(n.contains("different"));
+            assert!(n.starts_with("\n\n"));
+        }
+    }
 }

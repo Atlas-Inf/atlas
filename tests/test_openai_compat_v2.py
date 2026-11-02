@@ -230,11 +230,11 @@ try:
         max_completion_tokens=30,
     )
     msg = r.choices[0].message
-    if msg.refusal is not None and (msg.content in (None, "")):
-        record("refusal populated + content nulled", PASS, f"refusal={msg.refusal!r}")
+    if msg.refusal is not None and bool(msg.content):
+        record("refusal populated + content preserved", PASS, f"refusal={msg.refusal!r}")
     else:
         record(
-            "refusal populated + content nulled",
+            "refusal populated + content preserved",
             FAIL,
             f"content={msg.content!r} refusal={msg.refusal!r}",
         )

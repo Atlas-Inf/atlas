@@ -41,7 +41,7 @@ impl BlockDiffusionDraftHead {
             .and_then(|n| n.checked_mul(2))
             .ok_or_else(|| anyhow::anyhow!("DFlash conv delta row bytes overflow"))?;
         let gemm = |src, w: &crate::weight_map::DenseWeight, dst, m, n, k| {
-            self.drafter_dense_gemm(ctx.gpu, src, w, dst, m, n, k, stream)
+            self.conv_delta_gemm(ctx.gpu, conv, src, w, dst, m, n, k, stream)
         };
         let total_rows = batch_size * self.gamma as u32;
         let joint = matches!(

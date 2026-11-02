@@ -140,7 +140,10 @@ impl TransformerModel {
 
         // ── 1b. Overwrite image_pad token positions with vision encoder embeddings ──
         {
-            let pending = *self.vision_embed_patches.lock();
+            // Per-sequence state: this request's rows (the model holds no
+            // vision state between requests). The two-phase path encodes the
+            // whole prompt in one pass, so every row is resident.
+            let pending = seq.vision.rows_encoded;
             if pending > 0
                 && let Some(ve) = &self.vision_encoder
             {

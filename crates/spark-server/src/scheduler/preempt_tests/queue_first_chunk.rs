@@ -424,6 +424,27 @@ fn a_finally_refused_queued_first_chunk_fails_only_its_request() {
     );
 }
 
+/// A queued streaming request whose client cancelled (`cancel_flag`) leaves
+/// the queue without a chunk, like one whose client went away.
+#[test]
+fn a_cancelled_queued_stream_is_freed_without_a_chunk() {
+    let model = multi_rank();
+    let mut t = Tick::new(&model, true, false);
+    let (a, _ra) = streaming(40);
+    let (b, _rb) = streaming(36);
+    t.admit(vec![a]);
+    t.admit(vec![b]);
+    let flag = t.prefilling[1].cancel_flag.clone().expect("streaming flag");
+    flag.store(true, Ordering::Release);
+    t.step();
+    assert_eq!(t.queue(), vec![(40, 16, None)]);
+    t.step();
+    assert_eq!(
+        wire(&model),
+        vec![CHUNK, 16, 0, 40, RELEASE, CHUNK, 16, 16, 40]
+    );
+}
+
 /// A queued prompt with a shared-prefix plant: the plant reaches the worker
 /// at admission (the setup), the chunk command only when the head runs it.
 #[test]

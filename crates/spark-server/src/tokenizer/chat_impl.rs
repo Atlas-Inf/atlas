@@ -7,7 +7,10 @@ use std::path::Path;
 use tokenizers::Tokenizer;
 
 mod glm5_vision;
+mod glm_tool_markup;
 mod qwen3vl_vision;
+mod qwen_vision;
+mod vision_markup;
 
 use super::{
     ChatEncoding, ChatTokenizer, StreamingDecoder, autoclose_assistant_think,
@@ -42,156 +45,27 @@ pub(crate) fn preprocess_for_render(
 }
 
 impl ChatTokenizer {
-    pub fn from_model_dir(
-        model_dir: &Path,
-        eos_token_id: u32,
-        supports_thinking: bool,
-        model_type: &str,
-        // MODEL.toml `[behavior].jinja_template`; empty = derive from
-        // `model_type`.
-        template_override: &str,
-        repo_root: Option<&Path>,
-        disable_template_overrides: bool,
-        // MODEL.toml `[behavior].verbatim_prompt`: `tojson` spaced like
-        // Python's `json.dumps`, as transformers renders it (otherwise the
-        // process-wide `ATLAS_USE_HF_REF_JSON_DUMPS` choice), and an
-        // effort-silent render keeps the template's own effort default.
-        verbatim_prompt: bool,
-    ) -> Result<Self> {
-        let tokenizer_path = model_dir.join("tokenizer.json");
-        let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
-        tokenizer
-            .with_truncation(None)
-            .map_err(|e| anyhow::anyhow!("Failed to disable tokenizer truncation: {e}"))?;
-
-        // Template-source priority.
-        //
-        // Conceptually the default is now MODEL-FIRST: render off the
-        // model's OWN `chat_template.jinja` / `tokenizer_config.json`.
-        // Atlas's cross-cutting behaviors (autoclose-think,
-        // think-control, F76 arg-parse) are applied in Rust
-        // message-preprocessing (see `preprocess_for_render`), so a model
-        // no longer needs a bespoke `jinja-templates/{model_type}.jinja`
-        // override that is otherwise a byte-copy of its own template.
-        // This is what makes `holo3_1_moe.jinja` REDUNDANT: Holo renders
-        // correctly off its own template + Rust behaviors. (The override
-        // file itself is still present for now only because
-        // `tokenizer/tests.rs::render_holo_template_*` reads it directly;
-        // it goes away together with those tests.)
-        //
-        // A `jinja-templates/{model_type}.jinja` override is OPT-IN by
-        // FILE PRESENCE: dropping the file in is the explicit signal that
-        // this model genuinely needs a template fix the Rust preprocessing
-        // can't express (MiniMax's `_args.items()`, Gemma-4's
-        // `strip_thinking`, etc.). We deliberately do NOT prefer the
-        // model's own template when such a file exists — that would
-        // silently undo those fixes. Instead, the operator opts OUT of all
-        // overrides with `--disable-template-overrides`, which forces
-        // every model onto its own template (relying purely on the Rust
-        // behaviors).
-        //
-        // Priority (high → low):
-        //   1. jinja-templates/<template> override, where <template> is
-        //      MODEL.toml [behavior].jinja_template when set and
-        //      {model_type}.jinja otherwise
-        //      (opt-in: file present AND overrides not disabled)
-        //   2. tokenizer_config.json / chat_template.jinja (the MODEL's own)
-        //   3. Default ChatML fallback
-        let override_tmpl = if disable_template_overrides {
-            None
-        } else {
-            super::jinja_helpers::load_override_template(model_type, template_override, repo_root)
-        };
-        let chat_template = if let Some(override_tmpl) = override_tmpl {
-            override_tmpl
-        } else if let Some(config_tmpl) = super::jinja_helpers::load_config_template(model_dir)? {
-            config_tmpl
-        } else {
-            tracing::warn!("No chat template found — using default ChatML");
-            super::jinja_helpers::default_chatml_template(supports_thinking)
-        };
-
-        let build_env = |t: &str| {
-            if verbatim_prompt {
-                super::jinja_helpers::build_jinja_env_with(
-                    t,
-                    super::jinja_helpers::ToolJsonStyle::HfSpaced,
-                )
-            } else {
-                super::jinja_helpers::build_jinja_env(t)
-            }
-        };
-        let jinja_env = build_env(&chat_template)?;
-
-        // Load OpenAI-variant template if it exists (jinja-templates/openai/{model_type}.jinja).
-        // This variant gates historical <think> wrappers on enable_thinking, preventing
-        // spontaneous thinking during tool-use when thinking is disabled.
-        //
-        // It lives under `jinja-templates/` too, so `--disable-template-overrides`
-        // skips it: the flag promises the MODEL's own template, and the chat
-        // completions path renders through this variant whenever it exists. Before
-        // this, Qwen3.6-35B kept the qwen3_5_moe variant under the flag — and that
-        // variant ignores `preserve_thinking`, dropping prior-turn reasoning.
-        let openai_jinja_env = if disable_template_overrides {
-            None
-        } else {
-            super::jinja_helpers::load_openai_template(model_type, repo_root).and_then(|tmpl| {
-                tracing::info!("Loaded OpenAI-variant Jinja template for {model_type}");
-                build_env(&tmpl).ok()
-            })
-        };
-        let chat_encoding = if model_type == "deepseek_v4" {
-            tracing::info!("Using checkpoint-native DeepSeek-V4 message encoding");
-            ChatEncoding::DeepseekV4
-        } else {
-            ChatEncoding::Jinja
-        };
-
-        // nemotron_h_omni: `<image>`(18) placeholders expand to
-        // `<img>`(19) + N x id-18 + `</img>`(20) per the checkpoint's
-        // processing_nemotron_h_omni.py. Resolve the three ids once.
-        let omni_image_tokens = if model_type == "nemotron_h_omni" {
-            let e = |t: &str| -> Option<u32> {
-                tokenizer.encode(t, false).ok().and_then(|enc| {
-                    let ids = enc.get_ids();
-                    (ids.len() == 1).then(|| ids[0])
-                })
-            };
-            match (e("<image>"), e("<img>"), e("</img>")) {
-                (Some(img), Some(start), Some(end)) => Some((img, start, end)),
-                _ => anyhow::bail!(
-                    "nemotron_h_omni tokenizer is missing <image>/<img>/</img> special tokens"
-                ),
-            }
-        } else {
-            None
-        };
-
-        tracing::info!("Loaded tokenizer from {}", tokenizer_path.display());
-        Ok(Self {
-            tokenizer,
-            eos_token_id,
-            supports_thinking,
-            chat_encoding,
-            omni_image_tokens,
-            chat_template,
-            jinja_env,
-            openai_jinja_env,
-            verbatim_prompt,
-        })
-    }
-
     /// Returns a borrowed reference to the underlying HF tokenizer (for
     /// callers that need to drive low-level encode/decode directly).
     pub fn inner(&self) -> &tokenizers::Tokenizer {
         &self.tokenizer
     }
 
+    /// Bare-role literal filtering applies only when the model does NOT
+    /// encode tool markup as text (Enntity/atlas 1c1a8fee, AGPL-3.0-only).
+    pub(crate) fn filters_bare_role_literals(&self) -> bool {
+        !self.glm_tool_markup_as_text && self.tokenizer.token_to_id("<|im_start|>").is_some()
+    }
+
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        let encoding = self
-            .tokenizer
-            .encode(text, false)
+        // HF's normalized splits/offsets can consume hundreds of MiB for a
+        // long prompt. Acquire before touching the tokenizer and retain the
+        // permit until the Encoding is dropped, including on error/unwind.
+        let _permit = self
+            .large_encode_gate
+            .as_ref()
+            .and_then(|gate| gate.acquire(text.len()));
+        let encoding = super::ids_only::encode(&self.tokenizer, text, self.ids_only)
             .map_err(|e| anyhow::anyhow!("Tokenizer encode error: {e}"))?;
         Ok(encoding.get_ids().to_vec())
     }
@@ -317,7 +191,6 @@ impl ChatTokenizer {
                 template_effort_default: self.verbatim_prompt,
                 preserve_thinking,
                 allow_continue_final: true,
-                empty_think_off: false,
             },
         )?;
 
@@ -332,7 +205,7 @@ impl ChatTokenizer {
             );
         }
 
-        self.encode(&rendered)
+        self.encode_rendered(&rendered)
     }
 
     /// Apply the OpenAI-variant template (if available), falling back to the default.
@@ -352,12 +225,9 @@ impl ChatTokenizer {
             disable_tool_steering,
             None,
             None,
-            false,
         )
     }
 
-    /// `empty_think_off`: see `chat_render::RenderFlags::empty_think_off`
-    /// (OpenAI-variant templates only).
     pub fn apply_chat_template_openai_with_effort(
         &self,
         messages: &[serde_json::Value],
@@ -366,7 +236,6 @@ impl ChatTokenizer {
         disable_tool_steering: bool,
         reasoning_effort: Option<&str>,
         preserve_thinking: Option<bool>,
-        empty_think_off: bool,
     ) -> Result<Vec<u32>> {
         if self.chat_encoding == ChatEncoding::DeepseekV4 {
             return self.apply_chat_template_jinja_with_effort(
@@ -393,11 +262,10 @@ impl ChatTokenizer {
                     template_effort_default: self.verbatim_prompt,
                     preserve_thinking,
                     allow_continue_final: false,
-                    empty_think_off,
                 },
             )
             .map_err(|e| anyhow::anyhow!("Failed to render OpenAI Jinja template: {e}"))?;
-            self.encode(&rendered)
+            self.encode_rendered(&rendered)
         } else {
             self.apply_chat_template_jinja_with_effort(
                 messages,
@@ -513,32 +381,9 @@ impl ChatTokenizer {
     }
 }
 
-/// nemotron_h_omni: each bare `<image>`(img) -> `<img>` + N×img + `</img>`.
-/// `pad_counts[i]` is the i-th image's token count (target_patches /
-/// downsample²), matching the checkpoint processor's `num_tokens`.
-/// Refuse-not-truncate is enforced downstream: a pad run that would
-/// not fit the sequence budget makes the request fail rather than
-/// being cut mid-image.
-pub(crate) fn expand_omni_pads(
-    tokens: Vec<u32>,
-    pad_counts: &[usize],
-    img: u32,
-    start: u32,
-    end: u32,
-) -> Vec<u32> {
-    let mut out = Vec::with_capacity(tokens.len() + pad_counts.iter().sum::<usize>());
-    let mut idx = 0usize;
-    for t in tokens {
-        if t == img && idx < pad_counts.len() {
-            out.push(start);
-            for _ in 0..pad_counts[idx].max(1) {
-                out.push(img);
-            }
-            out.push(end);
-            idx += 1;
-        } else {
-            out.push(t);
-        }
-    }
-    out
-}
+#[path = "chat_impl/load.rs"]
+mod load;
+
+#[path = "chat_impl/omni_pads.rs"]
+mod omni_pads;
+pub(crate) use omni_pads::*;

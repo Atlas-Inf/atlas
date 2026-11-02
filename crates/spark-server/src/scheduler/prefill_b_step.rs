@@ -103,6 +103,12 @@ pub fn prefill_request(
         // The model's EOS passes through the matcher even under `ignore_eos`.
         &[model_eos, eos_tokens].concat(),
         req_enable_thinking && think_end_token.is_some(),
+        first_token_thinking::native_opener(
+            sched.limits.glm_tool_boundary,
+            req_tools_present,
+            tool_call_start_token,
+        ),
+        tool_call_start_token,
         &mut sink,
     )?;
 
@@ -256,17 +262,20 @@ pub fn prefill_request(
     }
 
     // Guard: free SSM slot on any error after allocation (Bug #16).
+    let mut image_pixels = image_pixels;
+    let has_images = !image_pixels.is_empty();
     let prefill_result = (|| -> Result<u32> {
         // Vision: encode images and store embeddings for prefill token overwrite.
-        if !image_pixels.is_empty() {
-            model.prepare_vision_embed(&image_pixels)?;
+        if has_images {
+            model.prepare_vision_embed(&mut seq, std::mem::take(&mut image_pixels))?;
         }
 
         // EP: broadcast prefill command + tokens to worker (bulk, single NCCL op).
         model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, req_disable_mtp)?;
         model.ep_broadcast_vision_state_for_seq(
+            &seq,
             seq.slot_idx as u32,
-            !image_pixels.is_empty(),
+            has_images,
             0,
             0,
             0,

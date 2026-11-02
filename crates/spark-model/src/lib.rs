@@ -35,6 +35,7 @@ mod radio_encoder_pipe_tests;
 mod radio_encoder_tests;
 pub mod radio_preprocess;
 pub mod radio_tower;
+pub mod request_local;
 pub mod speculative;
 pub mod ssm_reserve;
 pub mod tp_shard;

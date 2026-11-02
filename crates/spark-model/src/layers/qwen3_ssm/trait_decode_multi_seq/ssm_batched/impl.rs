@@ -199,10 +199,21 @@ impl Qwen3SsmLayer {
         // pipelined kernel's M->128 MMA pad (issue-bound). batch4 (M<=4) for the
         // common path, batch16 (M<=16) for high-concurrency C=8/16. Bit-identical
         // per row to w8a16_gemv. Disable with ATLAS_SSM_GEMV_BATCH4=0.
-        let gemv_batch_k = if n <= 4 {
-            self.w8a16_gemv_batch4_k
+        // Rows 5..8 take the verify path's 8-row tier (`fp8_verify_gemv_tier`:
+        // the n2 / vl2 twins where linked, all bit-identical to batch16 per
+        // row) instead of computing 16 rows: on gfx1151 the 27B C=8 step ran
+        // batch16 for its 8 rows at 54-91 GB/s (strix s161).
+        let (gemv_batch_k, gemv_div) = if n <= 4 {
+            (self.w8a16_gemv_batch4_k, 4)
         } else {
-            self.w8a16_gemv_batch16_k
+            ops::fp8_verify_gemv_tier(
+                n,
+                ops::gemv_vl2_enabled(),
+                self.w8a16_gemv_batch8_k,
+                self.w8a16_gemv_batch8_dyn_vl2_k,
+                self.w8a16_gemv_batch8_dyn_vl2_n2_k,
+                self.w8a16_gemv_batch16_k,
+            )
         };
         let use_batch4 = gemv_batch_k.0 != 0
             && n <= 16
@@ -230,7 +241,7 @@ impl Qwen3SsmLayer {
         )? {
         } else if let Some(ref fp8) = self.qkvz_fp8w {
             if use_batch4 {
-                ops::w8a16_gemv_batch4(
+                ops::w8a16_gemv_batch4_div(
                     ctx.gpu,
                     gemv_batch_k,
                     normed_base,
@@ -240,6 +251,7 @@ impl Qwen3SsmLayer {
                     n as u32,
                     qkvz_size as u32,
                     h as u32,
+                    gemv_div,
                     stream,
                 )?;
             } else if w8a16_pipe {
@@ -363,7 +375,7 @@ impl Qwen3SsmLayer {
         )? {
         } else if let Some(ref fp8) = self.out_proj_fp8w {
             if use_batch4 {
-                ops::w8a16_gemv_batch4(
+                ops::w8a16_gemv_batch4_div(
                     ctx.gpu,
                     gemv_batch_k,
                     normed_out_base,
@@ -373,6 +385,7 @@ impl Qwen3SsmLayer {
                     n as u32,
                     h as u32,
                     value_dim as u32,
+                    gemv_div,
                     stream,
                 )?;
             } else if w8a16_pipe {
