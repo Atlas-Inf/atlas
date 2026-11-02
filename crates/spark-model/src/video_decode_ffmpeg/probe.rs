@@ -99,8 +99,8 @@ pub(super) fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<Clip
         .into_iter()
         .find_map(field)
         .and_then(|v| parse_rate(&v))
-        .and_then(crate::video_sample::finite_positive)
-        .unwrap_or(policy.fps);
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .unwrap_or(f64::from(policy.fps));
 
     // Declared source frames (`nb_frames`): the decoder keeps the whole clip
     // verbatim when the cap can hold it, instead of warping a CFR/VFR clip
@@ -111,19 +111,23 @@ pub(super) fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<Clip
 
     Ok(ClipTiming {
         duration_secs,
-        native_fps: f64::from(native_fps),
+        native_fps,
         frame_count,
     })
 }
 
 /// Parse ffprobe's `num/den` frame-rate form. Returns `None` for `0/0` and
 /// other degenerate rates rather than dividing by zero.
-fn parse_rate(s: &str) -> Option<f32> {
+pub(super) fn parse_rate(s: &str) -> Option<f64> {
     let (num, den) = s.trim().split_once('/')?;
-    let num: f32 = num.trim().parse().ok()?;
-    let den: f32 = den.trim().parse().ok()?;
+    let num: f64 = num.trim().parse().ok()?;
+    let den: f64 = den.trim().parse().ok()?;
     (den != 0.0).then(|| num / den)
 }
+
+/// Bytes of an ffprobe report on either pipe: a few `key=value` lines, so
+/// anything past this is not one.
+const PROBE_REPORT_BYTES: u64 = 64 * 1024;
 
 /// Read a probe child to completion under the same deadline the decoder
 /// uses: a hung process is killed and reported, never held forever
@@ -160,16 +164,33 @@ pub(super) fn read_probe(
             }
         })
     };
+    // Both pipes are bounded and drained at once: a child filling stderr
+    // while stdout is read would otherwise sit until the watchdog fired.
+    let errors = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr
+            .by_ref()
+            .take(PROBE_REPORT_BYTES)
+            .read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
     let mut out = Vec::new();
-    let read_res = stdout.read_to_end(&mut out);
-    let mut err_text = String::new();
-    let _ = stderr.read_to_string(&mut err_text);
+    let read_res = stdout
+        .by_ref()
+        .take(PROBE_REPORT_BYTES + 1)
+        .read_to_end(&mut out);
+    let oversized = out.len() as u64 > PROBE_REPORT_BYTES;
+    if read_res.is_err() || oversized {
+        let _ = child.lock().unwrap().kill();
+    }
+    let err_text = errors.join().unwrap_or_default();
     let killed = watchdog.join().unwrap_or(true);
     ensure!(
         !killed,
         "probing the clip's duration exceeded {timeout_secs}s and was stopped"
     );
     read_res.context("reading the ffprobe report")?;
+    ensure!(!oversized, "ffprobe report exceeded the 64 KiB bound");
     let status = child
         .lock()
         .unwrap()

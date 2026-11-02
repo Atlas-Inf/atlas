@@ -169,3 +169,95 @@ fn short_clips_sample_at_source_rate_and_long_ones_at_the_cap() {
         assert!(wanted_frames(2.0, native, 0.0, 32, 2.0) >= 1);
     }
 }
+
+/// `(total_frames, fps, duration, max_frames) -> (count, first, last, sum)`
+/// from the serving processor's `glm_sample_frame_indices` (fps_interval 2,
+/// temporal pairs), run on the reference Python: dense clips re-spread by
+/// linspace, short clips by floor positions, clips under half a second empty,
+/// long clips at the 2048-frame cap, and the deployed 32-frame cap.
+#[allow(clippy::type_complexity)]
+const GLM_SAMPLER_PARITY: [(
+    (usize, f64, f64, Option<usize>),
+    (usize, &[usize], &[usize], usize),
+); 16] = [
+    (
+        (1800, 30.0, 60.0, None),
+        (120, &[0, 15, 30, 45, 60, 75], &[1768, 1783, 1799], 107884),
+    ),
+    (
+        (300, 30.0, 10.0, None),
+        (20, &[0, 15, 31, 47, 62, 78], &[267, 283, 299], 2981),
+    ),
+    ((15, 30.0, 0.5, None), (2, &[0, 0], &[0, 0], 0)),
+    ((12, 30.0, 0.4, None), (0, &[], &[], 0)),
+    (
+        (40, 10.0, 4.0, None),
+        (8, &[0, 5, 11, 16, 22, 27], &[27, 33, 39], 153),
+    ),
+    (
+        (5, 1.0, 5.0, None),
+        (6, &[0, 1, 2, 3, 4, 4], &[3, 4, 4], 14),
+    ),
+    (
+        (7, 2.0, 3.5, None),
+        (8, &[0, 1, 2, 3, 4, 5], &[5, 6, 6], 27),
+    ),
+    (
+        (36000, 30.0, 1200.0, None),
+        (
+            2048,
+            &[0, 17, 35, 52, 70, 87],
+            &[35963, 35981, 35999],
+            36861953,
+        ),
+    ),
+    (
+        (129600, 30.0, 4320.0, None),
+        (
+            2048,
+            &[0, 63, 126, 189, 253, 316],
+            &[129472, 129535, 129599],
+            132708353,
+        ),
+    ),
+    (
+        (1798, 29.97002997002997, 59.99326666666667, None),
+        (120, &[0, 15, 30, 45, 60, 76], &[1781, 1797, 1797], 108660),
+    ),
+    (
+        (50, 25.0, 0.0, None),
+        (6, &[0, 9, 19, 29, 39, 49], &[29, 39, 49], 145),
+    ),
+    (
+        (240, 24.0, 10.0, None),
+        (20, &[0, 12, 25, 37, 50, 62], &[213, 226, 239], 2381),
+    ),
+    (
+        (9, 3.0, 3.0, None),
+        (6, &[0, 1, 3, 4, 6, 8], &[4, 6, 8], 22),
+    ),
+    (
+        (1800, 30.0, 60.0, Some(32)),
+        (32, &[0, 58, 116, 174, 232, 290], &[1682, 1740, 1799], 28769),
+    ),
+    (
+        (600, 60.0, 10.0, None),
+        (20, &[0, 31, 63, 94, 126, 157], &[535, 567, 599], 5981),
+    ),
+    (
+        (100, 7.5, 13.333333333333334, None),
+        (26, &[0, 3, 7, 11, 15, 19], &[91, 95, 99], 1275),
+    ),
+];
+
+#[test]
+fn glm_frame_sampling_matches_the_reference_processor() {
+    for ((total, fps, duration, cap), (count, first, last, sum)) in GLM_SAMPLER_PARITY {
+        let got = glm_sample_frame_indices(total, fps, duration, None, cap, 2);
+        let case = format!("{total} frames at {fps} fps over {duration} s, cap {cap:?}");
+        assert_eq!(got.len(), count, "{case}");
+        assert_eq!(&got[..first.len()], first, "{case}");
+        assert_eq!(&got[got.len() - last.len()..], last, "{case}");
+        assert_eq!(got.iter().sum::<usize>(), sum, "{case}");
+    }
+}
