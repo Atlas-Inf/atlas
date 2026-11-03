@@ -244,7 +244,20 @@ fn no_request_form_gets_a_thinking_budget_or_a_tool_call_bias() {
             0,
         )
         .unwrap_or_else(|_| panic!("{}: sampling setup", case.name));
-        assert!(sampling.logit_bias.is_empty(), "{}: logit bias", case.name);
+        // No steering bias; a request without tools carries only the hard ban
+        // on the `<tool_call>` opener (`ban_tool_call_without_tools`).
+        if prepared.tools_active {
+            assert!(sampling.logit_bias.is_empty(), "{}: logit bias", case.name);
+        } else {
+            assert!(
+                sampling
+                    .logit_bias
+                    .iter()
+                    .all(|&(_, delta)| delta == f32::NEG_INFINITY),
+                "{}: logit bias",
+                case.name
+            );
+        }
     }
 }
 
