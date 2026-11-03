@@ -39,7 +39,8 @@ gufo)
   gufo_up $PORT "$SESSIONS" "$CONTEXT" "$Q4"; bench_arm gufo_ar
   if [ -n "$DRAFT_REPO" ]; then
     DD=$(hf_get "$DRAFT_REPO" "$DRAFT_PAT") && DR=$(first_gguf "$DD" "$DRAFT_PAT")
-    [ -n "${DR:-}" ] && { gufo_up $PORT "$SESSIONS" "$CONTEXT" "$Q4" --speculative dflash2 --dflash-model "$DR"; bench_arm gufo_dflash2; } || log "draft download failed"
+    if [ -n "${DR:-}" ]; then gufo_up $PORT "$SESSIONS" "$CONTEXT" "$Q4" --speculative dflash2 --dflash-model "$DR"; bench_arm gufo_dflash2
+    else log "draft download failed: $(tail -2 "$OUT/download.log")"; fi
   else
     MD=$(hf_get "$Q4_REPO" "MTP/*" "$Q4_REV") && MT=$(first_gguf "$MD" "MTP/*.gguf")
     [ -n "${MT:-}" ] && { gufo_up $PORT "$SESSIONS" "$CONTEXT" "$Q4" --speculative mtp --mtp-model "$MT"; bench_arm gufo_mtp; }
