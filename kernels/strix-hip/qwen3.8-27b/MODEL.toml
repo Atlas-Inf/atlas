@@ -188,6 +188,10 @@ default_kv_dtype = "bf16"
 # 74.58 vs 81.79. gb10/qwen3.8-flash-next dropped the same steering in 565aa68bc.
 tool_call_steering = false
 max_inter_tool_prose = 0
+# The prompt is the checkpoint template's render and nothing else (no Atlas tool
+# prompt on top of the template's own tool block, no hints, tojson spaced as
+# transformers renders it), as on the reference server and gb10 Flash-Next.
+verbatim_prompt = true
 
 # Upstream reports model_type = "qwen3_5". The MRoPE -> "qwen3_6_moe"
 # dispatch rewrite fires only for MoE checkpoints (is_moe gate in
