@@ -20,12 +20,16 @@ model_spec() {
   esac
 }
 
-pyhf() { # ensure huggingface_hub + hf_transfer for the system python
-  python3 -c "import huggingface_hub, hf_transfer" 2>/dev/null || python3 -m pip install --user -q --break-system-packages huggingface_hub hf_transfer
+pyhf() { # -> PY, a python with huggingface_hub + hf_transfer (system python if it has pip; else a venv, e.g. the qctl boxes)
+  PY=python3
+  if ! python3 -c "import huggingface_hub, hf_transfer" 2>/dev/null; then
+    if python3 -m pip --version >/dev/null 2>&1; then python3 -m pip install --user -q --break-system-packages huggingface_hub hf_transfer
+    else local v=$HOME/.cache/h2h-venv; [ -x "$v/bin/python" ] || python3 -m venv "$v"; "$v/bin/python" -c "import huggingface_hub, hf_transfer" 2>/dev/null || "$v/bin/pip" install -q huggingface_hub hf_transfer; PY=$v/bin/python; fi
+  fi
   export HF_HUB_ENABLE_HF_TRANSFER=1
 }
 hf_get() { # repo pattern [rev] -> prints the snapshot dir
-  python3 -c 'import sys; from huggingface_hub import snapshot_download as s; print(s(sys.argv[1], revision=(sys.argv[3] or None), allow_patterns=([sys.argv[2]] if sys.argv[2] else None)))' "$1" "$2" "${3:-}" 2>>"$OUT/download.log"
+  "${PY:-python3}" -c 'import sys; from huggingface_hub import snapshot_download as s; print(s(sys.argv[1], revision=(sys.argv[3] or None), allow_patterns=([sys.argv[2]] if sys.argv[2] else None)))' "$1" "$2" "${3:-}" 2>>"$OUT/download.log"
 }
 first_gguf() { ls "$1"/$2 2>/dev/null | sort | head -1; }
 
