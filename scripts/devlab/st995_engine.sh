@@ -16,6 +16,9 @@ for kv in "${ARGS[@]}"; do [[ "$kv" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9_./:,+-]*$ ]] 
 WEIGHTS=${WEIGHTS:-q4}; CTX=${CTX:-32768}; PORT=18085
 OUT=${DEVLAB_OUT:-$PWD/devlab-out}; mkdir -p "$OUT"; RES="$OUT/RESULTS.txt"
 HERE=$(cd "$(dirname "$0")" && pwd); . "$HERE/lib_engines.sh"
+# The BFCL venv pip install hit "No space left on device" on the runner (41607542609): keep pip's temp and cache on the scratch disk.
+export TMPDIR=${RUNNER_TEMP:-/tmp}/st995-tmp PIP_CACHE_DIR=${RUNNER_TEMP:-/tmp}/st995-pipcache; mkdir -p "$TMPDIR" "$PIP_CACHE_DIR"
+log "disk: $(df -h "$HOME" /tmp "${RUNNER_TEMP:-/tmp}" 2>/dev/null | awk 'NR>1 {print $6"="$4" free"}' | sort -u | tr '\n' ' ')"
 model_spec "$MK" || exit 1; pyhf
 if [ "$ENGINE" != atlas ]; then # the GGUF engines' weights; atlas serves NVIDIA's NVFP4 directly
   Q4D=$(hf_get "$Q4_REPO" "$Q4_PAT" "$Q4_REV") || { log "MODEL DOWNLOAD FAILED: $(tail -2 "$OUT/download.log")"; exit 1; }
