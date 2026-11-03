@@ -67,7 +67,10 @@ pub(super) enum PenaltyGate {
 /// fast-path eligibility. `SamplingParams.logit_bias` must be empty for
 /// anything but `Blocked`: bias entries are additive and can be positive.
 pub(super) fn classify_penalties(p: &SamplingParams) -> PenaltyGate {
-    if !p.logit_bias.is_empty() || p.lz_penalty != 0.0 || p.dry_multiplier != 0.0 {
+    if !crate::scheduler::min_tokens_ban::bias_is_hard_bans_only(&p.logit_bias)
+        || p.lz_penalty != 0.0
+        || p.dry_multiplier != 0.0
+    {
         return PenaltyGate::Blocked;
     }
     if p.repetition_penalty == 1.0 && p.presence_penalty == 0.0 && p.frequency_penalty == 0.0 {
@@ -264,6 +267,17 @@ mod tests {
     fn logit_bias_blocks() {
         let mut p = params(1.0, 0.0, 0.0, 0.0, 0.0);
         p.logit_bias.push((42, -8.0));
+        assert_eq!(classify_penalties(&p), PenaltyGate::Blocked);
+    }
+
+    /// A hard ban (`-inf`) is masked by `min_tokens_ban` on the fast paths,
+    /// so it alone does not block them; any other entry beside it still does.
+    #[test]
+    fn hard_ban_bias_keeps_the_fast_path() {
+        let mut p = params(1.0, 0.0, 0.0, 0.0, 0.0);
+        p.logit_bias.push((42, f32::NEG_INFINITY));
+        assert_ne!(classify_penalties(&p), PenaltyGate::Blocked);
+        p.logit_bias.push((7, -8.0));
         assert_eq!(classify_penalties(&p), PenaltyGate::Blocked);
     }
 
