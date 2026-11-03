@@ -23,9 +23,9 @@ use crate::gpu::{DevicePtr, GpuBackend};
 /// Topology and scratch of a latent shard, fixed at construction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LatentShardSpec {
-    /// This rank (0 or 1).
+    /// This rank (`0..world`).
     pub rank: usize,
-    /// Ranks sharing the latents (only a pair is supported).
+    /// Ranks sharing the latents: a pair, or the four of a TP4 chain.
     pub world: usize,
     /// Bytes of the one device scratch allocation the model carves for its
     /// exchange buffers (see `layers::glm_kv_shard`).
@@ -184,8 +184,8 @@ impl LatentShard {
 
 impl PagedKvCache {
     /// [`Self::new_with_v_alias`] (V aliasing K) with the latents sharded
-    /// over a pair per [`LatentShardSpec`]: each layer's K pool holds
-    /// `ceil(num_blocks / 2)` block slots, plus one scratch allocation.
+    /// over the ranks of [`LatentShardSpec`]: each layer's K pool holds
+    /// `ceil(num_blocks / world)` block slots, plus one scratch allocation.
     pub fn new_latent_sharded(
         config: KvCacheConfig,
         num_blocks: usize,
@@ -208,8 +208,8 @@ impl PagedKvCache {
         placement: KvPlacement,
     ) -> Result<Self> {
         ensure!(
-            spec.world == 2 && spec.rank < spec.world && num_blocks > 0,
-            "latent shard supports a rank pair and a non-empty pool (rank {} of {}, {num_blocks} blocks)",
+            matches!(spec.world, 2 | 4) && spec.rank < spec.world && num_blocks > 0,
+            "latent shard supports two or four ranks and a non-empty pool (rank {} of {}, {num_blocks} blocks)",
             spec.rank,
             spec.world
         );

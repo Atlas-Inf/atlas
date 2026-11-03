@@ -32,16 +32,19 @@ use spark_runtime::gpu::DevicePtr;
 
 mod diag;
 mod ep;
+mod meta;
 use diag::write_window_aliases;
 pub(super) use diag::{oracle_enabled, serial_diagnostic};
+use meta::MetaLayout;
 pub(super) const EP_CMD_GLM_LONG_VERIFY: u32 = 0xFFFF_FFE9;
 pub(super) const EP_CMD_GLM_LONG_TAIL: u32 = 0xFFFF_FFEA;
 
-/// Byte offsets of one verify metadata block (same layout as `verify_d`).
-const META_SEQ_SLOT: usize = 128;
-const META_SLOTS: usize = 256;
-const META_SEQ_LENS: usize = 512;
-pub(super) const META_BLOCK_TABLE: usize = 768;
+/// Byte offsets of one verify metadata block (`verify_d`'s layout, each
+/// region sized for `MAX_ROWS` rows).
+const META_SEQ_SLOT: usize = 4 * MAX_ROWS;
+const META_SLOTS: usize = 8 * MAX_ROWS;
+const META_SEQ_LENS: usize = 16 * MAX_ROWS;
+pub(super) const META_BLOCK_TABLE: usize = 24 * MAX_ROWS;
 /// verify_d's metadata base, after the MTP metadata reservation.
 const META_BASE: usize = 32768;
 // The fixed per-row regions (u32 positions, seq slots, i64 slots, i32
@@ -55,33 +58,6 @@ const _: () = assert!(
 
 fn align(bytes: usize) -> usize {
     bytes.div_ceil(256) * 256
-}
-
-/// Scratch layout of one call's metadata: the joint block for every row at
-/// `META_BASE`, then one block per owner.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct MetaLayout {
-    joint_bytes: usize,
-    owner_bytes: usize,
-    owners: usize,
-}
-
-impl MetaLayout {
-    fn new(owners: usize, rows: usize, max_blocks: usize) -> Self {
-        Self {
-            joint_bytes: align(META_BLOCK_TABLE + owners * rows * max_blocks * 4),
-            owner_bytes: align(META_BLOCK_TABLE + rows * max_blocks * 4),
-            owners,
-        }
-    }
-    /// Scratch offset of owner `o`'s metadata block.
-    fn owner_offset(&self, o: usize) -> usize {
-        META_BASE + self.joint_bytes + o * self.owner_bytes
-    }
-    /// Scratch bytes the layout ends at.
-    fn end(&self) -> usize {
-        self.owner_offset(self.owners)
-    }
 }
 
 /// Whether owner index `owner` exists in a call of `rows` rows per owner.
@@ -118,17 +94,22 @@ impl TransformerModel {
     /// long-context MTP, a 2..=8 row block on the GLM DFlash lane.
     pub(super) fn can_batch_glm_long_verify_impl(&self, owners: usize, rows: usize) -> bool {
         use crate::speculative::glm_repair_policy as policy;
-        let lane = if policy::enabled() {
-            rows == K3_ROWS && policy::long_context_enabled()
-        } else {
-            policy::dflash_enabled()
+        let lane = || {
+            if policy::enabled() {
+                rows == K3_ROWS && policy::long_context_enabled()
+            } else {
+                policy::canonical_target_enabled()
+            }
         };
         self.glm_long_stage.is_some()
             && owner::width_supported(owners, rows)
-            && lane
+            && owners * rows <= owner::ROW_BUDGET
+            // The call's metadata (block tables of every row) fits scratch.
+            && MetaLayout::new(owners, rows, self.max_blocks_per_seq as usize).end()
+                <= self.buffers.sizes().scratch
+            && lane()
             && self.config.model_type == "glm5_next"
-            && self.config.tp_world_size == 2
-            && self.config.ep_world_size == 2
+            && crate::layers::ops::glm_sparse_tc_rank(&self.config)
             && self.config.hc_mult == 4
             && self.lora.is_none()
             && self.multi_rank_protocol_active()
@@ -216,6 +197,21 @@ impl TransformerModel {
             self.can_batch_glm_long_verify_impl(n, rows) && tokens.len() == n * rows,
             "GLM long owner verify refused for {n} owners x {rows} rows"
         );
+        // Dead rows (`owner::DEAD_ROW`) run unmarked, their routed FFN skipped.
+        let dead_rows = tokens.iter().any(|&t| t & owner::DEAD_ROW != 0);
+        // Whether each row is live, kept only when one is dead.
+        let dead_row_words: Vec<bool> = if dead_rows {
+            tokens.iter().map(|&t| t & owner::DEAD_ROW == 0).collect()
+        } else {
+            Vec::new()
+        };
+        let unmarked: Vec<u32>;
+        let tokens = if dead_rows {
+            unmarked = tokens.iter().map(|&t| t & !owner::DEAD_ROW).collect();
+            &unmarked[..]
+        } else {
+            tokens
+        };
         // Owner o's rows sit at o * rows; its min_tokens floor masks them there.
         let ban = seqs.first().map(|s| s.eos_ban).unwrap_or_default();
         let ban_rows = seqs.iter().enumerate().fold(0u64, |mask, (o, seq)| {
@@ -337,6 +333,19 @@ impl TransformerModel {
                     .collect::<Result<Vec<_>>>()
             })
             .transpose()?;
+        let _dead_rows = if dead_rows {
+            let bytes: Vec<u8> = dead_row_words
+                .iter()
+                .flat_map(|&live| u32::from(live).to_le_bytes())
+                .collect();
+            self.gpu.copy_h2d_async(&bytes, stage.live, stream)?;
+            Some(crate::layers::moe::DeadRows::enter(
+                stage.live,
+                total as u32,
+            ))
+        } else {
+            None
+        };
         let verify_profile = std::env::var("ATLAS_GLM_VERIFY_PROFILE").as_deref() == Ok("1");
         let (mut kda_us, mut mla_us) = (0u128, 0u128);
         for (li, layer) in self.layers.iter().enumerate() {
@@ -402,6 +411,7 @@ impl TransformerModel {
             );
         }
 
+        drop(_dead_rows);
         let normed = self.buffers.norm_output();
         ops::rms_norm(
             self.gpu.as_ref(),
@@ -415,7 +425,16 @@ impl TransformerModel {
             stream,
         )?;
         let argmax = self.buffers.scratch();
-        if !self.glm_split_head_argmax(normed, total, argmax, (ban_rows, &ban), None, stream)? {
+        let split =
+            self.glm_split_head_argmax(normed, total, argmax, (ban_rows, &ban), None, stream)?;
+        if split && self.native_glm_mtp {
+            self.glm_split_head_full_rows(total, stream)?;
+        }
+        if !split {
+            ensure!(
+                !self.native_glm_mtp,
+                "native GLM MTP requires the MXFP8 split target head"
+            );
             self.lm_head_batched(normed, total as u32, self.buffers.logits(), stream)?;
             let vocab = self.config.vocab_size;
             for r in 0..total {

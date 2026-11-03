@@ -148,7 +148,7 @@ pub(super) fn gemm_bf16_pick(
             out as *mut c_void,
             ld_,
             result[algo_off..].as_ptr() as *const c_void,
-            ctx.workspace as *mut c_void,
+            ctx.workspace()? as *mut c_void,
             ctx.ws_size,
             stream as *mut c_void,
         );

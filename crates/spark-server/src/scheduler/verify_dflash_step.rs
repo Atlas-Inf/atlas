@@ -5,6 +5,7 @@
 use super::*;
 
 mod glm_owner;
+mod native_mtp;
 mod split_head;
 mod stats;
 mod think_end;
@@ -33,6 +34,10 @@ pub fn step_verify_dflash(
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
 ) {
+    if model.native_mtp_enabled() && dflash_verify_raw_argmax {
+        a.abort_on_engine_error("native GLM MTP cannot use the DFlash raw-argmax verifier lane");
+        return;
+    }
     step_verify_dflash_inner(
         model,
         a,
@@ -114,7 +119,13 @@ fn step_verify_dflash_inner(
     // verify (target M=1+γ forward) vs propose (drafter forward, tail below).
     // The ledger never had this split — it guessed "FFN + double sweep". This
     // measures it. Gated so the hot path pays nothing when the env is unset.
-    let step_timing = std::env::var("ATLAS_DFLASH_STEP_TIMING").ok().as_deref() == Some("1");
+    // Native MTP and DFlash have separate timing switches.
+    let timing_env = if model.native_mtp_enabled() {
+        "ATLAS_MTP_TIMING"
+    } else {
+        "ATLAS_DFLASH_STEP_TIMING"
+    };
+    let step_timing = std::env::var(timing_env).ok().as_deref() == Some("1");
     let t_verify = std::time::Instant::now();
     let verified_argmax = match model.decode_verify_dflash(&tokens, &mut a.seq, 0) {
         Ok(v) => v,
@@ -174,6 +185,7 @@ pub(super) fn verify_dflash_tail(
     // it says nothing about the drafter.
     record_stats: bool,
 ) -> Option<usize> {
+    let native_mtp = model.native_mtp_enabled();
     let raw_trace = if std::env::var("ATLAS_LIGHTNING_VERIFY_TOKEN_TRACE").as_deref() == Ok("1") {
         Some(verified_argmax.clone())
     } else {
@@ -335,17 +347,19 @@ pub(super) fn verify_dflash_tail(
     // Unified ctx commit (ATLAS_DFLASH_UNIFIED_CTX=1): ONE unconditional
     // commit at the K=gamma point — rows 0..=num_accepted at RoPE base
     // pre_verify_len. Structural replacement for dflash_eagle_kgamma_append.
-    if sched.levers.dflash_unified_ctx {
-        if let Err(e) = model.commit_ctx(&mut a.seq, num_accepted + 1, pre_verify_len) {
-            tracing::error!("commit_ctx (kgamma): {e:#}");
-        }
-    } else {
-        let eagle_fix = std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref() == Some("1");
-        if eagle_fix
-            && let Err(e) =
-                model.dflash_eagle_kgamma_append(&mut a.seq, num_accepted, pre_verify_len)
-        {
-            tracing::error!("dflash_eagle_kgamma_append: {e:#}");
+    if !native_mtp {
+        if sched.levers.dflash_unified_ctx {
+            if let Err(e) = model.commit_ctx(&mut a.seq, num_accepted + 1, pre_verify_len) {
+                tracing::error!("commit_ctx (kgamma): {e:#}");
+            }
+        } else {
+            let eagle_fix = std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref() == Some("1");
+            if eagle_fix
+                && let Err(e) =
+                    model.dflash_eagle_kgamma_append(&mut a.seq, num_accepted, pre_verify_len)
+            {
+                tracing::error!("dflash_eagle_kgamma_append: {e:#}");
+            }
         }
     }
 
@@ -359,7 +373,9 @@ pub(super) fn verify_dflash_tail(
     // recurrent state. The worker rank has already committed these rows (it
     // acts on the verdict word above), so a head that returned first kept a
     // state that matched neither `seq.tokens` nor the other rank.
-    let k_verify = drafts.len() + 1;
+    // The rows the target verified: an owner of a batch with dead rows
+    // judges fewer drafts than it verified rows.
+    let k_verify = tokens.len();
     let total_accepted = num_accepted + 1; // bonus is always "accepted"
     if let Err(e) = model.commit_accepted_prefix(&mut a.seq, total_accepted, k_verify) {
         tracing::error!("commit_accepted_prefix (dflash): {e:#}");
@@ -413,26 +429,16 @@ pub(super) fn verify_dflash_tail(
         a.seq.seq_len,
     );
 
-    // DFlash hidden is captured per-layer inside the verify graph
-    // (verify_d.rs try_dflash_capture at position k-1), mirroring verify_b.rs.
-    // No post-loop save needed; calling save_dflash_hidden_for_propose here
-    // would overwrite the correct per-layer intermediates with a repeated
-    // final-layer hidden, collapsing all 5 slots to the same value.
     let bonus_token_idx = total_accepted.saturating_sub(1);
-    if let Err(e) = model.save_hidden_for_mtp(bonus_token_idx, 0) {
-        tracing::error!("save_hidden_for_mtp (dflash): {e:#}");
-        if spark_model::speculative::glm_repair_policy::enabled() {
-            a.finished = true;
-            return None;
-        }
-    }
-
-    if let Err(e) = model.trim_proposer_state(&mut a.seq, num_accepted, 0) {
-        tracing::error!("trim_proposer_state: {e:#}");
-        if spark_model::speculative::glm_repair_policy::enabled() {
-            a.finished = true;
-            return None;
-        }
+    if !native_mtp::save_and_repair(
+        model,
+        a,
+        drafts,
+        num_accepted,
+        pre_verify_len,
+        bonus_token_idx,
+    ) {
+        return None;
     }
 
     // Re-propose for next step — unless adaptive speculation just suspended
@@ -493,6 +499,10 @@ pub(super) fn verify_dflash_tail(
         match proposal {
             Ok(d) if !d.is_empty() => a.set_proposed_drafts(d),
             Ok(_) => {
+                if native_mtp {
+                    a.abort_on_engine_error("native GLM MTP re-propose returned no drafts");
+                    return None;
+                }
                 // Lightning product fail-closed boundary: an empty
                 // re-propose is an admission violation, not a silent
                 // serial-decode fallback on the next bootstrap.
@@ -506,6 +516,12 @@ pub(super) fn verify_dflash_tail(
                 }
             }
             Err(e) => {
+                if native_mtp {
+                    a.abort_on_engine_error(format_args!(
+                        "native GLM MTP re-propose failed: {e:#}"
+                    ));
+                    return None;
+                }
                 tracing::error!("run_mtp_propose_multi (dflash): {e:#}");
                 crate::scheduler::helpers::handle_dspark_repropose_failure(
                     model,
@@ -524,7 +540,8 @@ pub(super) fn verify_dflash_tail(
     if step_timing {
         let propose_ms = t_propose.elapsed().as_secs_f64() * 1000.0;
         tracing::info!(
-            "DFLASH STEP_TIMING: verify={:.1}ms propose={:.1}ms (K={}, accepted={})",
+            "{} STEP_TIMING: verify={:.1}ms propose={:.1}ms (K={}, accepted={})",
+            if native_mtp { "MTP" } else { "DFLASH" },
             verify_ms,
             propose_ms,
             tokens.len(),

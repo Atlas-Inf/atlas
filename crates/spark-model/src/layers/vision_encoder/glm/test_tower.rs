@@ -7,7 +7,9 @@
 use atlas_core::config::VisionConfig;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
-use super::{GlmVisionBlockWeights, GlmVisionEncoder, GlmVisionMergerWeights, GlmVisionWeights};
+use super::{
+    GlmCapacity, GlmVisionBlockWeights, GlmVisionEncoder, GlmVisionMergerWeights, GlmVisionWeights,
+};
 use crate::VisionItem;
 
 pub(crate) const PATCH: usize = 14;
@@ -81,9 +83,14 @@ pub(crate) fn weights() -> GlmVisionWeights {
     }
 }
 
+/// What the tiny tower holds.
+pub(crate) fn capacity() -> GlmCapacity {
+    GlmCapacity::budgets(&config())
+}
+
 /// The tower itself.
 pub(crate) fn encoder(gpu: &dyn GpuBackend) -> GlmVisionEncoder {
-    let encoder = GlmVisionEncoder::new(weights(), &config(), gpu).unwrap();
+    let encoder = GlmVisionEncoder::new(Some(weights()), &config(), capacity(), gpu).unwrap();
     assert_eq!(encoder.p_max, 256);
     encoder
 }

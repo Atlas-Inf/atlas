@@ -510,6 +510,14 @@ impl TransformerModel {
         // mixed layout is [decode rows | prefill rows] and capturing from the
         // head would store DECODE hiddens as this sequence's prompt hiddens
         // (poison, not blindness).
+        self.capture_native_mtp_prefill(
+            prefill_seq,
+            prefill_tokens,
+            effective_seq_len_start,
+            proc_count,
+            prefill_hidden,
+            stream,
+        )?;
         self.try_mtp_prefill_capture_from(
             prefill_seq,
             effective_seq_len_start,
@@ -546,6 +554,12 @@ impl TransformerModel {
         for (i, seq) in decode_seqs.iter_mut().enumerate() {
             seq.tokens.push(decode_tokens[i]);
             seq.seq_len += 1;
+            self.capture_native_mtp_serial(
+                seq,
+                decode_tokens[i],
+                self.buffers.norm_output().offset(i * h * 2),
+                stream,
+            )?;
         }
         prefill_seq.tokens.extend_from_slice(
             &prefill_tokens[prefill_chunk_start..prefill_chunk_start + n_prefill],

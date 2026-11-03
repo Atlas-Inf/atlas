@@ -16,6 +16,34 @@ pub(super) fn grow_prefill_window(
     fresh: &mut Vec<u32>,
 ) -> Result<()> {
     let cap = kv_cache.config().cache_blocks_per_seq.map(|c| c as usize);
+    // How many block_table entries this call must end with (in-window means
+    // `abs_block_idx < ws + bt_len`). The sequence already holds
+    // `seq.block_table.len()`; everything above that is fresh allocation.
+    let ws = seq.hss_window_start();
+    // `abs_block_idx` can be below a retained HSS window after a retry.  The
+    // old loop returns (or grows) based on the guarded comparison below; this
+    // bookkeeping must never turn that valid state into usize underflow.
+    let target_len = abs_block_idx.saturating_add(1).saturating_sub(ws);
+    let needed = target_len.saturating_sub(seq.block_table.len());
+    // Prefill appends contiguously, so one bulk reclaim up front pays the
+    // victim scan once instead of once per block. Only NON-NVMe pools: the
+    // spill tier keeps its own per-miss staging batch (`evict_batch`).
+    // Latent-sharded pools have per-residue free lists: an arbitrary radix
+    // eviction may free a physical block that cannot satisfy this logical
+    // position. Leave those pools on the existing per-allocation path.
+    if needed > 0 && !kv_cache.nvme_attached() && kv_cache.latent_shard().is_none() {
+        let shortfall = needed.saturating_sub(kv_cache.num_free_blocks());
+        if shortfall > 0 {
+            // Reclaim exactly the shortfall: one eviction pass, all of it
+            // applied immediately. A node still held by a live sequence frees
+            // nothing, so the per-block `alloc_block_evicting` fallback below
+            // still covers any residue that this bulk pass could not free.
+            let evicted = prefix_cache.evict(shortfall);
+            if !evicted.is_empty() {
+                apply_evicted_blocks(evicted, kv_cache, prefix_cache, gpu);
+            }
+        }
+    }
     loop {
         let ws = seq.hss_window_start();
         let bt_len = seq.block_table.len();

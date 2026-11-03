@@ -7,11 +7,14 @@
 //!
 //! `ATLAS_GLM_DECODE_FUSE_MASK` (default 31) selects groups for bisection:
 //!
-//! * `1` HC post: `hc_post_bf16` / `hc_post_bf16_add_bf16` over 1..=32 rows
+//! * `1` HC post: `hc_post_bf16` / `hc_post_bf16_add_bf16` at any row count
 //!   as `glm_hc_decode_post_bf16`. Every GLM BF16-highway post goes through
 //!   [`super::hc_post`] / [`super::hc_post_bf16_add`]: attention and FFN
 //!   sites of KDA, MLA and dense layers, in verify, one-row decode and
-//!   prefill chunks of up to 32 rows.
+//!   prefill (the sequence-parallel MoE seam's 512-row blocks: 188 against
+//!   220 us; 8192 rows: 2.74 against 3.12 ms, cold L2 on one GB10). That
+//!   seam's blend and post run as one `glm_hc_moe_blend_post_bf16`
+//!   ([`moe_blend_post`]; 512 gated rows 246 against 283 us).
 //! * `2` HC partial: the decode seam's `glm_hc_decode_{post_,}partial_bf16`
 //!   as the `_rows_bf16` twins, wherever `ATLAS_GLM_HC_DECODE_SEAM=1` runs
 //!   (1..=32 rows).
@@ -127,7 +130,7 @@ fn aligned16(ptrs: &[DevicePtr]) -> bool {
 
 /// `hc_post` (`peer` null) or `hc_post_bf16_add` as `glm_hc_decode_post_bf16`
 /// when the HC post group is on and `kernel` is the GLM BF16-highway kernel
-/// for an in-place post of 1..=32 rows. `ptrs`: block output, peer block
+/// for an in-place post of one row or more. `ptrs`: block output, peer block
 /// output, residual, post, comb, out. Returns whether it launched.
 pub(super) fn hc_post(
     gpu: &dyn GpuBackend,
@@ -149,7 +152,7 @@ fn hc_post_for(
 ) -> Result<bool> {
     let [block_out, peer, residual, post, comb, out] = ptrs;
     if groups & HC_POST == 0
-        || !(1..=32).contains(&tokens)
+        || tokens == 0
         || hidden_size != 4096
         || hc_mult != 4
         || residual != out
@@ -178,6 +181,66 @@ fn hc_post_for(
         .arg_ptr(block_out)
         .arg_ptr(peer)
         .arg_ptr(out)
+        .arg_ptr(post)
+        .arg_ptr(comb)
+        .arg_u32(tokens)
+        .launch(stream)?;
+    Ok(true)
+}
+
+/// The MoE output seam's blend and post of `tokens` rows
+/// (`moe_batched_blend` of `routed` with `shared` and `normed . gate`, then
+/// `hc_post_bf16` in place on `streams`) as `glm_hc_moe_blend_post_bf16`,
+/// which writes the same highway bytes and skips storing the blended rows,
+/// when the HC post group is on, `blend` / `post` are the GLM kernels and
+/// the rows are 16-byte aligned. `ptrs`: routed, shared, normed, gate (may be
+/// null), streams, post, comb. Returns whether it launched.
+pub fn moe_blend_post(
+    gpu: &dyn GpuBackend,
+    [blend, post]: [KernelHandle; 2],
+    ptrs: [DevicePtr; 7],
+    dims: [u32; 3],
+    stream: u64,
+) -> Result<bool> {
+    moe_blend_post_for(groups()?, gpu, [blend, post], ptrs, dims, stream)
+}
+
+fn moe_blend_post_for(
+    groups: u32,
+    gpu: &dyn GpuBackend,
+    [blend, post_k]: [KernelHandle; 2],
+    ptrs: [DevicePtr; 7],
+    [tokens, hidden_size, hc_mult]: [u32; 3],
+    stream: u64,
+) -> Result<bool> {
+    let [routed, shared, normed, gate, streams, post, comb] = ptrs;
+    if groups & HC_POST == 0
+        || tokens == 0
+        || hidden_size != 4096
+        || hc_mult != 4
+        || !aligned16(&[routed, shared, streams])
+    {
+        return Ok(false);
+    }
+    let cache = gpu.op_cache();
+    let (Ok(glm_blend), Ok(glm_post), Some(twin)) = (
+        cache.kernel(gpu, "moe", "moe_batched_blend"),
+        cache.kernel(gpu, "hyper_connection", "hc_post_bf16"),
+        shipped(gpu, "glm_hc_moe_blend_post_bf16"),
+    ) else {
+        return Ok(false);
+    };
+    if blend.0 != glm_blend.0 || post_k.0 != glm_post.0 {
+        return Ok(false);
+    }
+    KernelLaunch::new(gpu, twin)
+        .grid([tokens, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(routed)
+        .arg_ptr(shared)
+        .arg_ptr(normed)
+        .arg_ptr(gate)
+        .arg_ptr(streams)
         .arg_ptr(post)
         .arg_ptr(comb)
         .arg_u32(tokens)

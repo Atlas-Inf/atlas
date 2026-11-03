@@ -10,6 +10,7 @@ fn fixture_model(model: &str, run: impl FnOnce(&mut MoeLayer, &ForwardContext, &
     let mut config = ModelConfig::qwen3_next_80b_nvfp4();
     config.router_logits_f32 = model == "glm5_next";
     config.model_type = model.into();
+    config.router_logits_f32 = model == "glm5_next";
     config.hidden_size = 4096;
     config.num_experts = 288;
     config.num_experts_per_tok = 8;

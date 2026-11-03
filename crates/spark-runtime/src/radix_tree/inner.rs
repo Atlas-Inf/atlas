@@ -404,3 +404,6 @@ impl RadixTreeInner {
         }
     }
 }
+
+#[cfg(test)]
+mod evict_tests;

@@ -19,7 +19,10 @@
 //! (the qwen4_exp pieces' `ATLAS_QWEN4EXP_DECODE_GRAPH_COLLECTIVES=1`)
 //! [`Recorder`]'s `all_reduce_async` first offers the call to the
 //! communicator's capturable one-shot, which enqueues it into the open
-//! capture; only a refusal splits. The GLM verify cache keeps it off.
+//! capture; only a refusal splits. The GLM verify cache keeps it off on the
+//! TP2 pair and turns it on beyond two ranks, where the chain's one-shot is
+//! the reduce its eager `all_reduce_async` would run, so each KDA run is one
+//! graph.
 //!
 //! The cache is generic over its key so the qwen4_exp decode and verify
 //! pieces (`model/decode_pieces.rs`) reuse it with a slot-vector key;
@@ -59,6 +62,12 @@ pub(crate) enum CommOp {
         bytes: usize,
         stream: u64,
     },
+    GatherAsync {
+        base: u64,
+        stride: i64,
+        bytes: usize,
+        stream: u64,
+    },
 }
 
 impl CommOp {
@@ -74,6 +83,18 @@ impl CommOp {
                 bytes,
                 stream,
             } => comm.peer_exchange_async(send, recv, bytes, stream),
+            Self::GatherAsync {
+                base,
+                stride,
+                bytes,
+                stream,
+            } => {
+                ensure!(
+                    comm.gather_async(base, stride, bytes, stream)?,
+                    "piecewise graph replay: the gather it recorded was refused"
+                );
+                Ok(())
+            }
         }
     }
 }
@@ -151,96 +172,8 @@ fn unsupported<T>(what: &str) -> Result<T> {
     bail!("piecewise verify capture does not record {what}")
 }
 
-impl CommBackend for Recorder<'_> {
-    fn all_reduce(&self, ptr: u64, bytes: usize) -> Result<()> {
-        self.split(CommOp::AllReduce { ptr, bytes })
-    }
-    /// With `capture_collectives`, the capturable one-shot records the reduce
-    /// INTO the open graph. It is the operation the eager `all_reduce_async`
-    /// would have enqueued (both try the one-shot first, under the same
-    /// size-only eligibility), so replay stays lossless and both ranks
-    /// execute the same collective sequence whatever each rank captured. A
-    /// refusal (size, channel off) splits as usual.
-    fn all_reduce_async(&self, ptr: u64, bytes: usize, stream: u64) -> Result<()> {
-        if self.capture_collectives
-            && stream == self.stream
-            && self.inner.all_reduce_capturable(ptr, bytes, stream)?
-        {
-            return Ok(());
-        }
-        self.on_stream(stream, CommOp::AllReduceAsync { ptr, bytes, stream })
-    }
-    fn peer_exchange_async(&self, send: u64, recv: u64, bytes: usize, stream: u64) -> Result<()> {
-        let op = CommOp::PeerExchangeAsync {
-            send,
-            recv,
-            bytes,
-            stream,
-        };
-        self.on_stream(stream, op)
-    }
-    fn supports_peer_exchange_async(&self) -> bool {
-        self.inner.supports_peer_exchange_async()
-    }
-    fn supports_exchange_async(&self, bytes: usize) -> bool {
-        self.inner.supports_exchange_async(bytes)
-    }
-    fn exchange_async(&self, _: u64, _: u64, _: usize, _: bool, _: u64) -> Result<bool> {
-        unsupported("exchange_async")
-    }
-    fn all_gather(&self, _: u64, _: u64, _: usize) -> Result<()> {
-        unsupported("all_gather")
-    }
-    fn reduce_scatter(&self, _: u64, _: u64, _: usize) -> Result<()> {
-        unsupported("reduce_scatter")
-    }
-    fn broadcast(&self, _: u64, _: usize, _: usize) -> Result<()> {
-        unsupported("broadcast")
-    }
-    fn receive_idle_command_word(&self, _: u64) -> Result<()> {
-        unsupported("receive_idle_command_word")
-    }
-    fn barrier(&self) -> Result<()> {
-        unsupported("barrier")
-    }
-    fn register_buffer(&self, _: u64, _: usize) -> Result<u64> {
-        unsupported("register_buffer")
-    }
-    fn deregister_buffer(&self, _: u64) -> Result<()> {
-        unsupported("deregister_buffer")
-    }
-    fn symmetric_alloc(&self, _: usize) -> Result<u64> {
-        unsupported("symmetric_alloc")
-    }
-    fn symmetric_free(&self, _: u64) -> Result<()> {
-        unsupported("symmetric_free")
-    }
-    fn set_add_kernel(&self, _: u64) {}
-    fn send_to(&self, _: u64, _: usize, _: usize, _: u64) -> Result<()> {
-        unsupported("send_to")
-    }
-    fn recv_from(&self, _: u64, _: usize, _: usize, _: u64) -> Result<()> {
-        unsupported("recv_from")
-    }
-    fn group_start(&self) -> Result<()> {
-        unsupported("group_start")
-    }
-    fn group_end(&self) -> Result<()> {
-        unsupported("group_end")
-    }
-    fn is_healthy(&self) -> bool {
-        self.inner.is_healthy()
-    }
-    fn attempt_reconnect(&self) -> Result<()> {
-        unsupported("attempt_reconnect")
-    }
-    fn rank(&self) -> usize {
-        self.inner.rank()
-    }
-    fn world_size(&self) -> usize {
-        self.inner.world_size()
-    }
-}
+#[path = "verify_pieces_recorder.rs"]
+mod recorder;
 
 fn destroy(steps: &[Step], gpu: &dyn GpuBackend) {
     for step in steps {
@@ -332,7 +265,7 @@ impl VerifyPieces {
     }
 
     /// [`Pieces::run_with`] with the TP communicator the GLM verify always
-    /// has.
+    /// has, capturing its collectives beyond two ranks (the chain).
     pub(crate) fn run(
         &self,
         key: PieceKey,
@@ -341,7 +274,8 @@ impl VerifyPieces {
         stream: u64,
         mut body: impl FnMut(&dyn CommBackend) -> Result<()>,
     ) -> Result<()> {
-        self.run_with(key, gpu, Some(comm), stream, |c| match c {
+        let collectives = self.capture_collectives || comm.world_size() > 2;
+        self.run_capturing(key, gpu, Some(comm), stream, collectives, |c| match c {
             Some(c) => body(c),
             None => bail!("piecewise verify graph: the communicator went missing"),
         })
@@ -378,6 +312,19 @@ impl<K: Eq + Hash + Debug> Pieces<K> {
         gpu: &dyn GpuBackend,
         comm: Option<&dyn CommBackend>,
         stream: u64,
+        body: impl FnMut(Option<&dyn CommBackend>) -> Result<()>,
+    ) -> Result<()> {
+        self.run_capturing(key, gpu, comm, stream, self.capture_collectives, body)
+    }
+
+    /// [`Self::run_with`], capturing collectives when `collectives`.
+    fn run_capturing(
+        &self,
+        key: K,
+        gpu: &dyn GpuBackend,
+        comm: Option<&dyn CommBackend>,
+        stream: u64,
+        collectives: bool,
         mut body: impl FnMut(Option<&dyn CommBackend>) -> Result<()>,
     ) -> Result<()> {
         {
@@ -404,7 +351,7 @@ impl<K: Eq + Hash + Debug> Pieces<K> {
         let captured = gpu.begin_capture(stream).and_then(|()| match comm {
             Some(comm) => {
                 let mut recorder = Recorder::new(comm, gpu, stream);
-                recorder.capture_collectives = self.capture_collectives;
+                recorder.capture_collectives = collectives;
                 match body(Some(&recorder)) {
                     Ok(()) => recorder.finish(),
                     Err(e) => {

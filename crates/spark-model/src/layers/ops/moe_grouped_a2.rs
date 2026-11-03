@@ -190,10 +190,51 @@ pub fn moe_unpermute_reduce_indexed_ep(
     topk: u32,
     local_expert_start: u32,
     local_expert_end: u32,
+    e4m3_scales: Option<DevicePtr>,
     stream: u64,
 ) -> Result<()> {
-    KernelLaunch::new(gpu, kernel)
-        .grid([num_tokens, 1, 1])
+    moe_unpermute_reduce_indexed_ep_grid(
+        gpu,
+        kernel,
+        expert_output,
+        output,
+        token_to_perm,
+        topk_ids,
+        topk_weights,
+        hidden_size,
+        num_tokens,
+        topk,
+        local_expert_start,
+        local_expert_end,
+        num_tokens,
+        e4m3_scales,
+        stream,
+    )
+}
+
+/// [`moe_unpermute_reduce_indexed_ep`] on a grid of at most `ctas` blocks,
+/// for the `_vec8` kernels only (their blocks stride over the tokens; the
+/// same bytes at any grid).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_unpermute_reduce_indexed_ep_grid(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    expert_output: DevicePtr,
+    output: DevicePtr,
+    token_to_perm: DevicePtr,
+    topk_ids: DevicePtr,
+    topk_weights: DevicePtr,
+    hidden_size: u32,
+    num_tokens: u32,
+    topk: u32,
+    local_expert_start: u32,
+    local_expert_end: u32,
+    ctas: u32,
+    e4m3_scales: Option<DevicePtr>,
+    stream: u64,
+) -> Result<()> {
+    let launch = KernelLaunch::new(gpu, kernel)
+        .grid([ctas.clamp(1, num_tokens.max(1)), 1, 1])
         .block([256, 1, 1])
         .arg_ptr(expert_output)
         .arg_ptr(output)
@@ -204,8 +245,13 @@ pub fn moe_unpermute_reduce_indexed_ep(
         .arg_u32(num_tokens)
         .arg_u32(topk)
         .arg_u32(local_expert_start)
-        .arg_u32(local_expert_end)
-        .launch(stream)
+        .arg_u32(local_expert_end);
+    // The `_e4m3` reduce (ATLAS_GLM_MOE_DOWN_E4M3) reads E4M3 rows and their
+    // FP32 scales.
+    match e4m3_scales {
+        Some(p) => launch.arg_ptr(p).launch(stream),
+        None => launch.launch(stream),
+    }
 }
 
 /// Batched sigmoid blend: output += sigmoid(dot(normed, gate_weight)) * shared_out.

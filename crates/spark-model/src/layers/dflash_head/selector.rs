@@ -123,7 +123,7 @@ impl Dflash2CandidateSelector {
     pub fn walk_lists(
         &self,
         anchor: SelectorAnchor,
-        lists: [DevicePtr; 2],
+        lists: ops::SelectorLists,
         projected_hidden_buf: DevicePtr,
         draft_tokens_dev: DevicePtr,
         gamma: usize,

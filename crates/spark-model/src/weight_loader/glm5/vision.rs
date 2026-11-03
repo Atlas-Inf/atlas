@@ -11,6 +11,7 @@ use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
+use crate::layers::vision_encoder::GlmCapacity;
 use crate::layers::{
     GlmVisionBlockWeights, GlmVisionMergerWeights, GlmVisionWeights, VisionEncoder,
 };
@@ -178,6 +179,11 @@ pub(crate) fn load(
         vcfg.is_glm5_next,
         "GLM-5 loader received a non-GLM vision config"
     );
+    let capacity = GlmCapacity::of_world(config, vcfg);
+    if crate::layers::vision_encoder::vision_receive_only(config) {
+        tracing::info!("GLM vision: rank receives encoded rows; vision weights not loaded");
+        return Ok(Some(VisionEncoder::new_glm(None, vcfg, capacity, gpu)?));
+    }
     let vp = if store.contains("model.visual.patch_embed.proj.weight") {
         "model.visual"
     } else if store.contains("model.language_model.visual.patch_embed.proj.weight") {
@@ -235,7 +241,7 @@ pub(crate) fn load(
         downsample_b: dense_ptr(store, &format!("{vp}.downsample.bias"))?,
         merger,
     };
-    let encoder = VisionEncoder::new_glm(weights, vcfg, gpu)?;
+    let encoder = VisionEncoder::new_glm(Some(weights), vcfg, capacity, gpu)?;
     // The tower holds BF16 copies of FP4-Local's quantized linears now.
     let mut released = 0;
     for stem in linear_stems(vp, vcfg.depth) {

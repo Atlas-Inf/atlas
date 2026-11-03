@@ -3,18 +3,8 @@
 //! GLM-5 launch-limit predicate tests. Split from `preflight.rs` (500-LoC cap).
 
 use super::{
-    glm5_concurrency_supported, glm5_context_supported, glm5_dual_spark_parallelism,
-    glm5_long_context_concurrency_supported,
+    glm5_concurrency_supported, glm5_context_supported, glm5_long_context_concurrency_supported,
 };
-
-#[test]
-fn glm5_accepts_ep_fallback_and_overlapping_tp2_only() {
-    assert!(glm5_dual_spark_parallelism(2, 1, 2));
-    assert!(glm5_dual_spark_parallelism(2, 2, 2));
-    assert!(!glm5_dual_spark_parallelism(2, 2, 1));
-    assert!(!glm5_dual_spark_parallelism(4, 2, 2));
-    assert!(!glm5_dual_spark_parallelism(2, 4, 2));
-}
 
 #[test]
 fn glm5_concurrency_is_bounded_and_requires_ep_v2() {

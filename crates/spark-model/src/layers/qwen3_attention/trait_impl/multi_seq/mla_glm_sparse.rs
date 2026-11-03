@@ -88,7 +88,7 @@ impl Qwen3AttentionLayer {
             config.model_type == "glm5_next"
                 && c.h == 4096
                 && c.hd == 256
-                && matches!(c.nq, 32 | 64)
+                && matches!(c.nq, 16 | 32 | 64)
                 && mla.nope == 256
                 && mla.v_dim == 256
                 && mla.kv_lora_rank == 512

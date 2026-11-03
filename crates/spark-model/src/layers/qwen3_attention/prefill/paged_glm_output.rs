@@ -22,7 +22,9 @@ fn glm_head_twin<'a>(
     [rows, g, k, n]: [u32; 4],
 ) -> Option<&'a Mxfp8Weight> {
     let shape = [g as usize * n as usize, k as usize];
-    let servable = rows <= ops::MXFP8_GROUPED_MAX_M && tiers.iter().all(|t| t.0 != 0);
+    let servable = rows <= ops::MXFP8_GROUPED_MAX_M
+        && tiers.iter().all(|t| t.0 != 0)
+        && !crate::layers::glm_packed_scope::active();
     twins
         .iter()
         .find(|&&(w, s, mx)| servable && !mx.tiled && w == weight && s == shape)
@@ -56,7 +58,7 @@ impl Qwen3AttentionLayer {
     /// Per-head MLA GEMM `c[:, h*n..] = a[:, h*k..] · weight_hᵀ` over `g`
     /// heads: its MXFP8 twin (`ATLAS_GLM_MLA_KVB_MXFP8=1`, see
     /// `glm_head_twin`), else the BF16 grouped GEMM.
-    fn glm_head_gemm(
+    pub(super) fn glm_head_gemm(
         &self,
         a: DevicePtr,
         weight: DevicePtr,

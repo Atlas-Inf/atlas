@@ -165,8 +165,16 @@ __device__ __forceinline__ void glm_kv_pad_body(
     const unsigned int group_id     = lane_id >> 2;
     const unsigned int tid_in_group = lane_id & 3;
     const unsigned int qk_warp_m    = (warp_id & 1) * 16;          // warps 0-1
-    const unsigned int pv_warp_m    = (warp_id & 1) * 16;          // pair: rows 0-15/16-31
-    const unsigned int pv_n_start   = (warp_id >> 1) * N_TILES_PER_WARP_512;
+    // At most 16 heads (TP4's 16 per rank): rows 16-31 are padding, so warp 1
+    // skips its QK^T and every warp runs the PV of rows 0-15 over its own
+    // eighth of the columns. Each output element sees the same rescales and
+    // MMAs in the same order, only on another warp: the same words.
+    const bool half = q_tile_len <= 16;
+    const bool qk_warp = warp_id == 0 || (warp_id == 1 && !half);
+    const unsigned int pv_warp_m    = half ? 0u : (warp_id & 1) * 16;  // pair: rows 0-15/16-31
+    const unsigned int pv_n_start   = half ? warp_id * (N_TILES_PER_WARP_512 / 2)
+                                           : (warp_id >> 1) * N_TILES_PER_WARP_512;
+    const unsigned int pv_n_tiles   = half ? N_TILES_PER_WARP_512 / 2 : N_TILES_PER_WARP_512;
     const unsigned int p_smem_stride = BC_512 + PAD_P_512;
 
     float acc_o[N_TILES_PER_WARP_512][4];
@@ -205,7 +213,7 @@ __device__ __forceinline__ void glm_kv_pad_body(
 
         // QK and PV consume the same loaded latent tile. No second V load.
         float acc_s[4][4];
-        if (warp_id < 2) {
+        if (qk_warp) {
             #pragma unroll
             for (int i=0;i<4;i++){acc_s[i][0]=0;acc_s[i][1]=0;acc_s[i][2]=0;acc_s[i][3]=0;}
             const unsigned short* sQ = (const unsigned short*)smem_Q;
@@ -308,8 +316,8 @@ __device__ __forceinline__ void glm_kv_pad_body(
         asm volatile("cp.async.wait_group 0;");
         __syncthreads();
 
-        // Warps 2-7 rescale to current m before PV
-        if(warp_id>=2){
+        // Warps 2-7 (and warp 1 at <= 16 heads) rescale to current m before PV
+        if(!qk_warp){
             unsigned int r0=pv_warp_m+group_id, r1=r0+8;
             float cm0=smem_ml[r0*2], cm1=smem_ml[r1*2];
             if (cm0 != m_r0) {
@@ -341,6 +349,7 @@ __device__ __forceinline__ void glm_kv_pad_body(
                 unsigned int a3=*(const unsigned int*)&sP[ar1*p_smem_stride+ac1];
                 #pragma unroll
                 for(int nt=0;nt<N_TILES_PER_WARP_512;nt++){
+                if ((unsigned int)nt >= pv_n_tiles) continue;
                     unsigned int nc=(pv_n_start+nt)*8+group_id, k0=ko+tid_in_group*2, k1=k0+8;
                     unsigned int b0=((unsigned int)sV[(k0+1)*GLM_KVP_STRIDE+nc]<<16)|(unsigned int)sV[k0*GLM_KVP_STRIDE+nc];
                     unsigned int b1=((unsigned int)sV[(k1+1)*GLM_KVP_STRIDE+nc]<<16)|(unsigned int)sV[k1*GLM_KVP_STRIDE+nc];
@@ -368,7 +377,7 @@ __device__ __forceinline__ void glm_kv_pad_body(
     {
         unsigned int r0=pv_warp_m+group_id, r1=r0+8;
         float il0,il1;
-        if(warp_id<2){
+        if(qk_warp){
             il0=(l_r0>0)?(1.f/l_r0):0;
             il1=(l_r1>0)?(1.f/l_r1):0;
         } else {
@@ -383,13 +392,14 @@ __device__ __forceinline__ void glm_kv_pad_body(
             float* po = part_o + part * head_dim;
             #pragma unroll
             for(int nt=0;nt<N_TILES_PER_WARP_512;nt++){
+                if ((unsigned int)nt >= pv_n_tiles) continue;
                 const unsigned int c0 = (pv_n_start+nt)*8 + tid_in_group*2;
                 if (r0 < q_tile_len)
                     *(float2*)&po[r0*q_seq_stride+c0] = make_float2(acc_o[nt][0]*il0, acc_o[nt][1]*il0);
                 if (r1 < q_tile_len)
                     *(float2*)&po[r1*q_seq_stride+c0] = make_float2(acc_o[nt][2]*il1, acc_o[nt][3]*il1);
             }
-            if (warp_id < 2 && tid_in_group == 0) {
+            if (qk_warp && tid_in_group == 0) {
                 const unsigned int w0 = qk_warp_m + group_id, w1 = w0 + 8;
                 if (w0 < q_tile_len)
                     part_lse[part + w0] = l_r0 > 0.f ? m_r0 + logf(l_r0) : -INFINITY;
@@ -401,6 +411,7 @@ __device__ __forceinline__ void glm_kv_pad_body(
         __nv_bfloat16* ob = O;
         #pragma unroll
         for(int nt=0;nt<N_TILES_PER_WARP_512;nt++){
+                if ((unsigned int)nt >= pv_n_tiles) continue;
             unsigned int c0 = (pv_n_start+nt)*8 + tid_in_group*2;
             unsigned int gr0 = q_start+r0, gr1 = q_start+r1;
             if(gr0<q_len && r0<q_tile_len && c0<head_dim){

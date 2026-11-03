@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 
 use super::super::ctx::{CTX_MAX_ROWS, ROWS_MAX, parse_ctx, read_announce};
 use super::*;
+use super::{announce_extra, extra_follows};
 
 /// The test drafter with a context append: 96 input columns, 80 K/V rows.
 fn ctx_geometry() -> Geometry {
@@ -18,7 +19,7 @@ fn ctx_geometry() -> Geometry {
     }
 }
 
-const ROWS: CtxRows = CtxRows([3, 0, 2, 0]);
+const ROWS: CtxRows = CtxRows([3, 0, 2, 0, 0, 0, 0, 0]);
 
 #[test]
 fn the_ctx_switch_is_0_or_1_and_sets_its_own_parity_bit() {
@@ -43,16 +44,33 @@ fn the_announce_carries_the_rows_and_the_context_rows() {
     assert_eq!(announce_word(0, 0).unwrap(), 0);
     assert_eq!(announce_word(96, 0).unwrap(), 96);
     assert_eq!(announce_word(1 << 20, 0).unwrap(), 1 << 20);
-    assert_eq!(read_announce(1 << 20, false), (1 << 20, CtxRows::default()));
+    assert_eq!(
+        read_announce(1 << 20, None, false),
+        (1 << 20, CtxRows::default())
+    );
     // With them, both fields come back on a pair with the switch.
     for (rows, ctx) in [
         (0, CtxRows::single(7)),
         (32, ROWS),
-        (ROWS_MAX, CtxRows([31; 4])),
+        (ROWS_MAX, CtxRows([31, 31, 31, 31, 0, 0, 0, 0])),
     ] {
         let word = announce_word(rows, ctx.pack()).unwrap();
-        assert_eq!(read_announce(word, true), (rows, ctx));
+        assert_eq!(read_announce(word, None, true), (rows, ctx));
     }
+    // Eight sequences: the last four appends ride the second word, which
+    // follows only a context-split propose of more than four sequences.
+    let eight = CtxRows([9, 1, 31, 0, 4, 9, 0, 31]);
+    let (word, extra) = (
+        announce_word(64, eight.pack()).unwrap(),
+        announce_extra(eight.pack()),
+    );
+    assert_eq!(read_announce(word, Some(extra), true), (64, eight));
+    assert_eq!(
+        read_announce(word, None, true).1,
+        CtxRows([9, 1, 31, 0, 0, 0, 0, 0])
+    );
+    assert!(extra_follows(5, true) && extra_follows(8, true));
+    assert!(!extra_follows(4, true) && !extra_follows(8, false));
     assert!(announce_word(ROWS_MAX + 1, ROWS.pack()).is_err());
     assert_eq!(CtxRows::unpack(ROWS.pack()), ROWS);
     assert_eq!(ROWS.appends().collect::<Vec<_>>(), [0, 2]);
@@ -89,7 +107,7 @@ fn context_appends_lead_both_walks_with_the_same_swaps() {
     // An append's swaps carry its own rows: input rows, then the halves.
     assert_eq!(g.bytes(Swap::CtxInput(0)), 3 * 96 * 2);
     assert_eq!(g.bytes(Swap::CtxHidden(2)), 2 * 32 * 2);
-    assert_eq!(g.bytes(Swap::CtxKv(0)), 3 * half(80, 1).1 * 2);
+    assert_eq!(g.bytes(Swap::CtxKv(0)), 3 * share(80, 1, 2).1 * 2);
     assert_eq!(g.bytes(Swap::Input(0)), g.gamma * 64 * 2);
     // No context rows: the walk is the layers alone.
     assert_eq!(ctx_geometry().steps(1), ctx_geometry().layer_steps(1));
@@ -156,8 +174,8 @@ fn context_halves_land_where_the_unsplit_projections_write_whole_rows() {
 
     // Both ranks hold the whole `fc` rows, rank 0's half first.
     let fc = plan.bytes(Swap::CtxHidden(0));
-    r0.fill(r0.split.ctx_own, fc, 0x71);
-    r1.fill(r1.split.ctx_own, fc, 0x72);
+    r0.fill(r0.split.own(Swap::CtxHidden(0), 0), fc, 0x71);
+    r1.fill(r1.split.own(Swap::CtxHidden(0), 1), fc, 0x72);
     let (a0, a1) = run(Swap::CtxHidden(0));
     let whole = joined(3, 64, &a0, &a1);
     assert_eq!(r0.read(r0.scratch.fc_proj, whole.len()), whole);
@@ -165,8 +183,8 @@ fn context_halves_land_where_the_unsplit_projections_write_whole_rows() {
 
     // The head holds the whole fused K/V rows; the worker keeps its own.
     let kv = plan.bytes(Swap::CtxKv(0));
-    r0.fill(r0.split.ctx_own, kv, 0x81);
-    r1.fill(r1.split.ctx_own, kv, 0x82);
+    r0.fill(r0.split.own(Swap::CtxKv(0), 0), kv, 0x81);
+    r1.fill(r1.split.own(Swap::CtxKv(0), 1), kv, 0x82);
     r1.fill(r1.scratch.fused_kv_out, 3 * 80 * 2, 0x8f);
     let (k0, k1) = run(Swap::CtxKv(0));
     assert_eq!(

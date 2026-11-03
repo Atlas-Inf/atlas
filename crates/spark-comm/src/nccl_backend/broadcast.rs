@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Real NCCL adapter for the shared synchronous broadcast runner.
+//! Real NCCL adapter for the shared synchronous broadcast runner (on an RDMA
+//! chain, broadcasts take its one-shot channel instead).
 use super::{COLLECTIVE_TIMEOUT_SECS, NcclBackend};
 use crate::broadcast::{Classification, Operations, run};
 use crate::nccl::{self, NcclComm, NcclDataType};
@@ -20,6 +21,18 @@ impl Operations for NcclBroadcast<'_> {
         Instant::now()
     }
     fn launch(&mut self) -> Result<()> {
+        // On a chain every broadcast rides the one-shot channel, an idle
+        // command word's included: the route depends on nothing but the
+        // size, so the root's send and a worker's idle receive always meet.
+        // Like ncclBroadcast, it waits without a limit (`OneShot::broadcast`).
+        if self.backend.try_chain_broadcast(
+            self.ptr,
+            self.bytes,
+            self.root,
+            self.backend.legacy_stream,
+        )? {
+            return Ok(());
+        }
         let comm = *self.backend.comm.lock();
         self.comm = Some(comm);
         // SAFETY: Same owned buffer, communicator and legacy stream contract as
@@ -52,9 +65,11 @@ impl Operations for NcclBroadcast<'_> {
         self.backend.unhealthy.store(true, Ordering::Release);
     }
     fn check_async_error(&mut self) {
-        // run() reaches this only after the successful launch and stream sync.
-        self.backend
-            .check_async_error(self.comm.expect("broadcast launched before async check"));
+        // run() reaches this only after the successful launch and stream sync;
+        // a broadcast over the chain took no NCCL communicator.
+        if let Some(comm) = self.comm {
+            self.backend.check_async_error(comm);
+        }
     }
 }
 

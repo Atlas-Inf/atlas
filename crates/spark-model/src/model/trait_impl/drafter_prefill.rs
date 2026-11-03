@@ -109,7 +109,8 @@ impl TransformerModel {
         // Native-only sequences must not touch the single shared capture
         // buffer; doing so would make a plain fallback mutate the next repair
         // owner's input.
-        if self.mtp_prefill_hidden.is_null()
+        if self.native_glm_mtp
+            || self.mtp_prefill_hidden.is_null()
             || proc_count == 0
             || seq.disable_mtp
             || seq.proposer_state.is_none()
@@ -210,7 +211,7 @@ impl TransformerModel {
         // before touching the paired path, proposer state, or retained
         // capture so a request-local fallback cannot accidentally run a
         // drafter through an eager-prefill call.
-        if seq.disable_mtp {
+        if self.native_glm_mtp || seq.disable_mtp {
             return Ok(());
         }
         if !is_last || eager_drafter_disabled() || self.mtp_prefill_hidden.is_null() {

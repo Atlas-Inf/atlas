@@ -45,6 +45,15 @@
 //! scheduler's prefill stream) must be serialized by the caller with events
 //! or syncs, as they are for the legacy channel.
 //!
+//! A chain of up to [`MAX_RANKS`] ranks ([`Shape`], `rdma_chain_bf16`) runs
+//! the same protocol with a receive slot pair and a flag line per piece
+//! ([`pieces`]) for every other rank: each rank stages once and its proxy sends `S` to both
+//! neighbours, which forward it on ([`relay`]), so every rank lands the same
+//! sum of all payloads. The two-slot argument holds per origin: a rank only
+//! stages `seq + 2` after its kernel `seq + 1`, which waited on every rank's
+//! flag `seq + 1`, each staged after that rank's kernel `seq` and forwarded
+//! by every rank in between after it arrived there.
+//!
 //! Nothing hangs on a fault; the poison word names it and the kernel traps.
 //! The kernel poisons on a size mismatch at a sequence number, a flag more
 //! than one op ahead (the peer cannot stage `seq + 2` before our flag
@@ -67,12 +76,12 @@
 //! arx one-shot all-reduce (<https://github.com/mmastrac/glm-5.3-flash-4x-gx10>,
 //! `experimental/arx/arx_vllm.cu`, PR #4; unlicensed, so idea only).
 
+pub(super) use super::bootstrap::{MAX_RAILS, MAX_RANKS};
 use super::{SPLIT_MIN, cu, cuMemcpyAsync};
 use crate::nccl_backend::{cuLaunchKernel, cuMemAlloc_v2, cuMemFree_v2};
-use anyhow::{Result, ensure};
-use atlas_rdma::Verbs;
+use anyhow::{Context, Result, ensure};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// `CUlaunchAttribute` / `CUlaunchConfig` (driver API), as in atlas-core's
 /// `registry/launch.rs`.
@@ -108,26 +117,67 @@ unsafe extern "C" {
 }
 
 const CU_STREAM_WAIT_VALUE_EQ: u32 = 0x1;
-/// Payload sizes ride in the low 24 bits of a flag word.
+const CU_STREAM_WAIT_VALUE_GEQ: u32 = 0x0;
+/// Payload sizes ride in the low 24 bits of a flag word (on a chain, below
+/// [`RS_BIT`]: [`Config::for_chain`]).
 const MAX_LIMIT: usize = (1 << 24) - 64;
 /// The capture contract promises at least this much (8 decode rows x 5 x
 /// 4096 BF16 on the k5 route is 320 KiB).
 const MIN_MAX: usize = 512 << 10;
-const MAX_RAILS: usize = 8;
+/// A chain payload of this many bytes per piece is cut finer ([`pieces`]).
+const PIECE: usize = 128 << 10;
 const THREADS: usize = 256;
 /// Kernel state in device memory (see `rdma_oneshot.cu`): seq, finished
-/// blocks, go, staged blocks.
-const STATE_BYTES: usize = 32;
+/// blocks, go, staged blocks, then the reduce-scatter's per-piece writer
+/// counts.
+const STATE_BYTES: usize = 1024;
+/// The fused reduce-scatter's producer counters (u32 a piece) and published
+/// pieces (u64 a piece) in the state (`ONESHOT_STATE_PRODUCED`, `_OWN`).
+const STATE_PRODUCED: usize = 256;
+const STATE_OWN: usize = 512;
+const _: () = assert!(
+    STATE_PRODUCED + 4 * MAX_PIECES <= STATE_OWN && STATE_OWN + 8 * MAX_PIECES <= STATE_BYTES
+);
 const MAX_BLOCKS: usize = 16;
 
-/// Control page after `S` and the two receive slots, one 64-byte line per
-/// word: `stage` (u32, GPU -> proxy), `poison` (kernel -> host), one flag per
-/// rail (peer NIC -> kernel) and one flag source word per rail (proxy -> NIC).
+/// The reduce-scatter's and the all-to-all's grid (the four-rank chain's
+/// only; local, as the split of an op's pieces over blocks changes no
+/// value). Their kernels stage and land every piece through the pinned
+/// buffers: at 16 blocks the SP seam's 64 MB reduce-scatter took 4009 us
+/// (FP8 3953), at 48 3857 us (FP8 3495; four nodes, 2026-10-18). The
+/// four-rank profile (`4x1m-tp4`) serves at 24, which leaves SMs to the
+/// unpermute producing the next seam block beside it. The NIC loopback
+/// tests run 16: their four ranks (and two channels) share one GPU, and
+/// every block of an op waits on blocks of the others, so all must be
+/// resident at once (three blocks an SM, `rdma_chain_bf16`).
+const RS_BLOCKS: usize = if cfg!(test) { 16 } else { 24 };
+
+/// Pieces a chain op may cut its payload into, one flag line each per
+/// origin (`ONESHOT_ORIGIN_LINES` in the kernel); a pair's rails take the
+/// first [`MAX_RAILS`] lines.
+pub(super) const MAX_PIECES: usize = 32;
+
+/// Control page after `S` and the receive slots, one 64-byte line per word:
+/// `stage` (u32, GPU -> proxy), `poison` (kernel -> host), per origin one
+/// flag per piece (neighbour NIC -> kernel), one flag source word per piece
+/// for our own sends and, on a chain, per origin one per piece for the sends
+/// that forward it (proxy -> NIC).
 const STAGE: usize = 0;
 const POISON: usize = 64;
 const FLAGS: usize = 128;
-const FLAG_SRC: usize = FLAGS + 64 * MAX_RAILS;
-const CTRL_PAGE: usize = 4096;
+const ORIGIN_LINES: usize = 64 * MAX_PIECES;
+const FLAG_SRC: usize = FLAGS + ORIGIN_LINES * (MAX_RANKS - 1);
+const FWD_SRC: usize = FLAG_SRC + 64 * MAX_PIECES;
+/// The pipelined ops' ready words, one u64 per piece (kernel -> proxy: the
+/// op whose staged or computed piece is in `S`); `ONESHOT_READY` in
+/// `rdma_oneshot.cu`.
+const READY: usize = FWD_SRC + ORIGIN_LINES * (MAX_RANKS - 1);
+const CTRL_PAGE: usize = 16384;
+/// A pair's control page: one origin of [`MAX_RAILS`] flag lines, then their
+/// source words.
+const PAIR_FLAG_SRC: usize = FLAGS + 64 * MAX_RAILS;
+const PAIR_CTRL_PAGE: usize = 4096;
+const _: () = assert!(READY == 14464 && READY + 8 * MAX_PIECES <= CTRL_PAGE);
 /// Poison reasons (high bits) over the op's sequence number; the kernel
 /// writes the top three, the host the others.
 const POISON_LAUNCH: u64 = 1 << 59;
@@ -136,88 +186,83 @@ const POISON_DESYNC: u64 = 1 << 61;
 const POISON_TIMEOUT: u64 = 1 << 62;
 const POISON_MISMATCH: u64 = 1 << 63;
 
-/// One-shot settings; read from the shared profile, and checked equal on both
-/// ranks at bootstrap.
+/// Where a rank sits: one of two (a pair), or on a chain where every
+/// payload reaches every rank through the ranks in between.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Config {
-    /// Largest one-shot payload in bytes (`ATLAS_RDMA_ONESHOT_MAX`, 1 MiB,
-    /// at least 512 KiB).
-    pub(super) max: usize,
-    /// Payloads from this size stripe over every rail
-    /// (`ATLAS_RDMA_ONESHOT_STRIPE_MIN`, default the legacy split size).
-    pub(super) stripe_min: usize,
-    /// Kernel wait limit (`ATLAS_RDMA_ONESHOT_TIMEOUT_MS`, 30 s; 0 = none).
-    pub(super) timeout_ns: u64,
-    /// Publish `stage` with a fenced stream memop rather than from the
-    /// kernel (`ATLAS_RDMA_ONESHOT_STAGE_FENCE=1`); local only, and ignored
-    /// under `sm_stage`.
-    pub(super) stage_fence: bool,
-    /// The kernel stages the payload (`ATLAS_RDMA_ONESHOT_SM_STAGE`): 0 =
-    /// copy engine (default), 1 = write-through SM stores, 2 = plain SM
-    /// stores (stress-test control only).
-    pub(super) sm_stage: u32,
-    /// Launch the kernel with programmatic dependent launch under `sm_stage`
-    /// (`ATLAS_RDMA_ONESHOT_PDL`, default 1); local only.
-    pub(super) pdl: bool,
+pub(super) struct Shape {
+    pub(super) ranks: usize,
+    pub(super) rank: usize,
+    /// Rails of the link to the rank below and to the one above; 0 where
+    /// there is none. A pair's one link is both.
+    pub(super) rails: [usize; 2],
 }
 
-impl Config {
-    /// `None` unless `ATLAS_RDMA_ONESHOT=1`.
-    pub(super) fn from_env() -> Option<Self> {
-        Self::parse(|key| std::env::var(key).ok())
-    }
-
-    fn parse(var: impl Fn(&str) -> Option<String>) -> Option<Self> {
-        if var("ATLAS_RDMA_ONESHOT").as_deref() != Some("1") {
-            return None;
+impl Shape {
+    pub(super) fn pair(rank: usize, rails: usize) -> Self {
+        Self {
+            ranks: 2,
+            rank,
+            rails: [rails; 2],
         }
-        let num = |key: &str, default: usize| {
-            var(key)
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(default)
-        };
-        Some(Self {
-            max: num("ATLAS_RDMA_ONESHOT_MAX", 1 << 20)
-                .clamp(MIN_MAX, MAX_LIMIT)
-                .next_multiple_of(64),
-            stripe_min: num("ATLAS_RDMA_ONESHOT_STRIPE_MIN", SPLIT_MIN),
-            timeout_ns: (num("ATLAS_RDMA_ONESHOT_TIMEOUT_MS", 30_000) as u64)
-                .saturating_mul(1_000_000),
-            stage_fence: var("ATLAS_RDMA_ONESHOT_STAGE_FENCE").as_deref() == Some("1"),
-            sm_stage: match var("ATLAS_RDMA_ONESHOT_SM_STAGE").as_deref() {
-                Some("1") => 1,
-                Some("2") => 2,
-                _ => 0,
-            },
-            pdl: var("ATLAS_RDMA_ONESHOT_PDL").as_deref() != Some("0"),
-        })
     }
 
-    /// Whether a payload takes the one-shot path. Rank-invariant by
-    /// construction: it looks at nothing but the size (never at addresses).
-    pub(super) fn eligible(&self, bytes: usize) -> bool {
-        bytes > 0 && bytes <= self.max && bytes.is_multiple_of(2)
+    /// Receive slot pairs: one per other rank.
+    pub(super) fn origins(&self) -> usize {
+        self.ranks - 1
     }
 
-    /// Bootstrap form, `max`, `stripe_min` and `sm_stage`: both ranks must
-    /// send the same.
-    pub(super) fn wire(cfg: Option<Self>) -> [u64; 3] {
-        cfg.map_or([0; 3], |c| {
-            [c.max as u64, c.stripe_min as u64, u64::from(c.sm_stage)]
-        })
+    pub(super) fn check(&self) -> Result<()> {
+        ensure!(
+            (2..=MAX_RANKS).contains(&self.ranks) && self.rank < self.ranks,
+            "RDMA one-shot: rank {} of {} (supported: 2..={MAX_RANKS} ranks)",
+            self.rank,
+            self.ranks
+        );
+        let used = [self.rank > 0, self.rank + 1 < self.ranks];
+        for (side, (&rails, used)) in ["below", "above"].iter().zip(self.rails.iter().zip(used)) {
+            ensure!(
+                !used || (1..=MAX_RAILS).contains(&rails),
+                "RDMA one-shot supports 1..={MAX_RAILS} rails, got {rails} to the rank {side}"
+            );
+        }
+        Ok(())
     }
+}
+
+/// Origin slot of rank `origin`'s payload at rank `at`: ranks in order,
+/// skipping `at`. A payload keeps its slot index along its way: it moves
+/// away from its origin, so every rank it passes is on the same side of it.
+pub(super) fn origin_slot(origin: usize, at: usize) -> usize {
+    origin - usize::from(origin > at)
 }
 
 /// Bytes of pinned region the one-shot channel appends: `S`, two receive
-/// slots and the control page.
-pub(super) fn region_bytes(max: usize) -> usize {
-    3 * max + CTRL_PAGE
+/// slots per origin and the control page.
+pub(super) fn region_bytes(max: usize, origins: usize) -> usize {
+    let page = if origins == 1 {
+        PAIR_CTRL_PAGE
+    } else {
+        CTRL_PAGE
+    };
+    ctrl_off(max, origins) + page
 }
-fn recv_off(max: usize, slot: usize) -> usize {
-    (1 + slot) * max
+fn recv_off(max: usize, origin: usize, slot: usize) -> usize {
+    (1 + 2 * origin + slot) * max
 }
-fn ctrl_off(max: usize) -> usize {
-    3 * max
+fn ctrl_off(max: usize, origins: usize) -> usize {
+    (1 + 2 * origins) * max
+}
+/// The flag line of `origin`'s rail `rail` in the control page.
+fn flag_line(origin: usize, rail: usize) -> usize {
+    FLAGS + ORIGIN_LINES * origin + 64 * rail
+}
+
+/// Multi-rank completion words match the payload's two parity slots. Ring
+/// flood and specialized collectives can deliver one origin over different
+/// QPs, so seq+1 may arrive before seq: it must not publish seq's completion
+/// or overwrite its flag. The pair retains its original single-word ABI.
+fn chain_flag_line(origin: usize, piece: usize, seq: u64) -> usize {
+    flag_line(origin, piece) + 8 * (seq as usize & 1)
 }
 
 /// `(offset, len)` per rail: one rail below `stripe_min`, else split over all
@@ -230,6 +275,21 @@ pub(super) fn stripes(bytes: usize, rails: usize, stripe_min: usize) -> Vec<(usi
         .take_while(|&off| off < bytes)
         .map(|off| (off, part.min(bytes - off)))
         .collect()
+}
+
+/// A chain's `(offset, len)` pieces: one below `stripe_min`, else two (one
+/// per rail of a two-rail link), and payloads of several [`PIECE`]s one per
+/// `PIECE`, at most one per flag line; 64-byte aligned. Piece `p` goes on rail
+/// `p % rails` of every link, so the layout does not depend on the rails and
+/// a rank forwards each piece as soon as it lands: the hops of a large
+/// payload overlap.
+pub(super) fn pieces(bytes: usize, stripe_min: usize) -> Vec<(usize, usize)> {
+    let n = if bytes >= stripe_min {
+        (bytes / PIECE).clamp(2, MAX_PIECES)
+    } else {
+        1
+    };
+    stripes(bytes, n, 0)
 }
 
 /// The flag the proxy writes for op `seq` of `bytes` (see the kernel).
@@ -265,10 +325,21 @@ fn poison_host(ctrl: usize, word: u64) {
     let _ = poison.compare_exchange(0, word, Ordering::AcqRel, Ordering::Relaxed);
 }
 
+/// A proxy that is going away, with `served` ops sent, leaves nothing to
+/// clear `stage` again: poison the channel with control page `ctrl`, then
+/// release a stream blocked in the stage wait so it reaches a kernel, which
+/// traps on the poison.
+fn fail_at(ctrl: usize, served: u64) {
+    poison_host(ctrl, POISON_PROXY | (served + 1));
+    // SAFETY: the control page lives in the pinned region for the channel's
+    // lifetime; `stage` is written by the GPU (stream memop) and the proxy.
+    unsafe { &*((ctrl + STAGE) as *const AtomicU32) }.store(0, Ordering::Release);
+}
+
 /// Enqueue side, owned by the backend.
 pub(in crate::nccl_backend) struct OneShot {
     cfg: Config,
-    rails: usize,
+    shape: Shape,
     /// Host and device addresses of the channel's part of the pinned region.
     host: usize,
     dev: u64,
@@ -277,14 +348,29 @@ pub(in crate::nccl_backend) struct OneShot {
     /// staged-block counter (u32 at 24).
     state: u64,
     kernel: AtomicU64,
+    /// Channel 0 of a four-rank chain (`config::RS_FUSED_SEG`): the fused
+    /// region and its completion words.
+    fused: Option<FusedRegion>,
+    /// Fused ops begun (each op's `epoch`), and whether the channel has
+    /// run no op since the last that every rank hears from its neighbours
+    /// (`fused` module doc).
+    epoch: AtomicU32,
+    fused_last: AtomicBool,
+}
+
+/// This rank's fused region (`fused` module): host and device addresses,
+/// the segment capacity, and the u32 completion word of each piece of its
+/// own segment (device memory).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct FusedRegion {
+    pub(super) dev: u64,
+    pub(super) cap: usize,
+    pub(super) done: u64,
 }
 
 impl OneShot {
-    pub(super) fn new(cfg: Config, rails: usize, host: usize, dev: u64) -> Result<Self> {
-        ensure!(
-            (1..=MAX_RAILS).contains(&rails),
-            "RDMA one-shot supports 1..={MAX_RAILS} rails, got {rails}"
-        );
+    pub(super) fn new(cfg: Config, shape: Shape, host: usize, dev: u64) -> Result<Self> {
+        shape.check()?;
         let (mut state, zero) = (0u64, [0u8; STATE_BYTES]);
         cu(
             unsafe { cuMemAlloc_v2(&mut state, STATE_BYTES) },
@@ -296,17 +382,44 @@ impl OneShot {
         )?;
         Ok(Self {
             cfg,
-            rails,
+            shape,
             host,
             dev,
             state,
             kernel: AtomicU64::new(0),
+            fused: None,
+            epoch: AtomicU32::new(0),
+            fused_last: AtomicBool::new(false),
         })
     }
 
-    /// Provide `rdma_oneshot_bf16`; the channel is unavailable until then.
+    /// Give channel 0 of a four-rank chain the fused region at device
+    /// address `dev` (`fused::entries` slots of `cap` bytes).
+    pub(super) fn with_fused(mut self, dev: u64, cap: usize) -> Result<Self> {
+        let mut done = 0u64;
+        let bytes = 4 * MAX_PIECES;
+        cu(
+            unsafe { cuMemAlloc_v2(&mut done, bytes) },
+            "cuMemAlloc(fused done)",
+        )?;
+        let zero = [0u8; 4 * MAX_PIECES];
+        cu(
+            unsafe { cuMemcpyHtoD_v2(done, zero.as_ptr().cast(), bytes) },
+            "cuMemcpyHtoD(fused done)",
+        )?;
+        self.fused = Some(FusedRegion { dev, cap, done });
+        Ok(self)
+    }
+
+    /// Provide the kernel (`oneshot_kernel_name`); the channel is
+    /// unavailable until then.
     pub(in crate::nccl_backend) fn set_kernel(&self, handle: u64) {
         self.kernel.store(handle, Ordering::Relaxed);
+    }
+
+    /// Ranks of the channel.
+    pub(in crate::nccl_backend) fn ranks(&self) -> usize {
+        self.shape.ranks
     }
 
     /// Largest payload [`Self::enqueue`] accepts (0 while unavailable).
@@ -320,133 +433,39 @@ impl OneShot {
 
     /// Why the channel stopped (the kernel trapped or will), if it did.
     pub(in crate::nccl_backend) fn poisoned(&self) -> Option<String> {
-        poison_at(self.host + ctrl_off(self.cfg.max))
+        poison_at(self.ctrl())
+    }
+
+    /// Host address of the control page.
+    fn ctrl(&self) -> usize {
+        self.host + ctrl_off(self.cfg.max, self.shape.origins())
     }
 }
 
 impl Drop for OneShot {
     fn drop(&mut self) {
         unsafe { cuMemFree_v2(self.state) };
+        if let Some(f) = self.fused {
+            unsafe { cuMemFree_v2(f.done) };
+        }
     }
 }
 
-/// Proxy side: sends each staged op.
-pub(super) struct Channel {
-    cfg: Config,
-    host: usize,
-    /// The peer's address of its one-shot region.
-    peer: u64,
-    served: u64,
-}
-
-impl Channel {
-    pub(super) fn new(cfg: Config, host: usize, peer: u64) -> Self {
-        Self {
-            cfg,
-            host,
-            peer,
-            served: 0,
-        }
-    }
-
-    /// The proxy is going away and nothing will clear `stage` again: poison
-    /// the channel, then release a stream blocked in the stage wait so it
-    /// reaches a kernel, which traps on the poison.
-    pub(super) fn fail(&self) {
-        let ctrl = self.host + ctrl_off(self.cfg.max);
-        poison_host(ctrl, POISON_PROXY | (self.served + 1));
-        // SAFETY: as in `serve`.
-        unsafe { &*((ctrl + STAGE) as *const AtomicU32) }.store(0, Ordering::Release);
-    }
-
-    /// Send the staged op, if any: data then flag per rail, chained in one
-    /// post when `chain` (same-QP WRITEs land in order without relaxed
-    /// ordering), else each flag after the data completions. `false` when
-    /// nothing is staged.
-    pub(super) fn serve(
-        &mut self,
-        rails: &mut [Verbs],
-        lkeys: &[u32],
-        rkeys: &[u32],
-        chain: bool,
-    ) -> Result<bool> {
-        let ctrl = self.host + ctrl_off(self.cfg.max);
-        // SAFETY: the control page lives in the pinned region for the pair's
-        // lifetime; `stage` is written by the GPU (stream memop) and here.
-        let stage = unsafe { &*((ctrl + STAGE) as *const AtomicU32) };
-        let bytes = stage.load(Ordering::Acquire) as usize;
-        if bytes == 0 {
-            return Ok(false);
-        }
-        // Only our own stream writes `stage`, with an eligible size; refuse
-        // anything else rather than WRITE past the peer's receive slot.
-        ensure!(
-            self.cfg.eligible(bytes),
-            "RDMA one-shot: staged size {bytes} is not eligible"
-        );
-        let seq = self.served + 1;
-        let parts = stripes(bytes, rails.len(), self.cfg.stripe_min);
-        let recv = self.peer + recv_off(self.cfg.max, (seq & 1) as usize) as u64;
-        let flag = |r: usize| {
-            (
-                ctrl + FLAG_SRC + 64 * r,
-                self.peer + (ctrl_off(self.cfg.max) + FLAGS + 64 * r) as u64,
-            )
-        };
-        for (r, &(off, len)) in parts.iter().enumerate() {
-            let (src_flag, dst_flag) = flag(r);
-            // SAFETY: our flag source word; its previous WRITE was reaped
-            // before the previous serve returned.
-            unsafe { (src_flag as *mut u64).write_volatile(flag_word(seq, bytes)) };
-            let data = (self.host + off) as *mut c_void;
-            let (dst, len) = (recv + off as u64, u32::try_from(len)?);
-            // SAFETY: `S` and the flag word lie in the registered region and
-            // stay unmodified until these WRITEs are reaped below (the GPU
-            // only restages after `stage` is cleared).
-            unsafe {
-                if chain {
-                    rails[r].post_write_flag(
-                        data,
-                        lkeys[r],
-                        dst,
-                        rkeys[r],
-                        len,
-                        src_flag as *mut c_void,
-                        dst_flag,
-                        seq,
-                    )
-                } else {
-                    rails[r].post_write(data, lkeys[r], dst, rkeys[r], len, seq)
-                }
-            }?;
-        }
-        if !chain {
-            for rail in rails.iter_mut().take(parts.len()) {
-                rail.poll()?;
-            }
-            for (r, rail) in rails.iter_mut().enumerate().take(parts.len()) {
-                let (src_flag, dst_flag) = flag(r);
-                // SAFETY: as above.
-                unsafe {
-                    rail.post_write(
-                        src_flag as *mut c_void,
-                        lkeys[r],
-                        dst_flag,
-                        rkeys[r],
-                        8,
-                        seq,
-                    )
-                }?;
-            }
-        }
-        for rail in rails.iter_mut().take(parts.len()) {
-            rail.poll()?;
-        }
-        self.served = seq;
-        stage.store(0, Ordering::Release);
-        Ok(true)
-    }
-}
+mod channel;
+mod collectives;
+mod config;
+pub(super) mod fused;
+#[path = "oneshot_launch.rs"]
+mod launch;
+mod ops;
+pub(super) mod relay;
+pub(super) use channel::Channel;
+pub(super) use config::Config;
+#[cfg(test)]
+pub(super) use config::RS_FUSED_SEG;
+pub(super) use ops::RS_BIT;
+use ops::*;
+pub(in crate::nccl_backend) use ops::{A2a, A2aPlane};
 
 #[cfg(test)]
 #[path = "oneshot_gpu_tests.rs"]
@@ -455,6 +474,3 @@ mod gpu_tests;
 #[cfg(test)]
 #[path = "oneshot_tests.rs"]
 mod tests;
-
-#[path = "oneshot_launch.rs"]
-mod launch;

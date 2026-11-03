@@ -50,6 +50,11 @@ impl Qwen3AttentionLayer {
         if self.mla_native_rows(ctx, weight, input, output, m, n, k, stream)? {
             return Ok(());
         }
+        // A packed prefill (`glm_packed_scope`): the BF16 GEMM at every row
+        // count, which is row-invariant there; none of the short-batch twins.
+        if crate::layers::glm_packed_scope::active() && ctx.dispatch.cublas_gemm {
+            return ops::cublas_bf16_proj_dense(input, weight.weight, output, m, n, k, stream);
+        }
         let tc = crate::layers::w4a16_gemv_tiers::tc_kernel(m);
         if m <= 32
             && tc.0 != 0
@@ -80,6 +85,30 @@ impl Qwen3AttentionLayer {
             return ops::mxfp8_gemv(
                 ctx.gpu, kernel, input, mx.data, mx.scales, output, m, n, k, n, stream,
             );
+        }
+        // An owner-batched verify of 33..=64 rows (the TP4 chain): the same
+        // row-invariant tiers, 32 rows a launch.
+        if m <= crate::layers::canonical_verify::MAX_ROWS
+            && let Some((.., mx)) = self.mla_mx.iter().find(|(w, ..)| *w == weight.weight)
+        {
+            for first in (0..m).step_by(ops::MXFP8_MAX_ROWS) {
+                let rows = (m - first).min(ops::MXFP8_MAX_ROWS as u32);
+                let kernel = ops::mxfp8_kernel(ctx.gpu, mx, &self.mxfp8_gemv_k, rows);
+                ops::mxfp8_gemv(
+                    ctx.gpu,
+                    kernel,
+                    input.offset((first * k) as usize * 2),
+                    mx.data,
+                    mx.scales,
+                    output.offset((first * n) as usize * 2),
+                    rows,
+                    n,
+                    k,
+                    n,
+                    stream,
+                )?;
+            }
+            return Ok(());
         }
         if ctx.config.model_type == "glm5_next"
             && m <= crate::layers::canonical_verify::MAX_ROWS

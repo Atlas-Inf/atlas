@@ -253,4 +253,25 @@ mod tests {
         assert_eq!(v["error"]["type"], "invalid_request_error");
         assert_eq!(v["error"]["message"], "too many images");
     }
+
+    #[test]
+    fn each_status_maps_to_its_anthropic_error_type() {
+        for (status, kind) in [
+            (400, "invalid_request_error"),
+            (401, "authentication_error"),
+            (403, "permission_error"),
+            (404, "not_found_error"),
+            (413, "request_too_large"),
+            (422, "invalid_request_error"),
+            (429, "rate_limit_error"),
+            (500, "api_error"),
+            (503, "overloaded_error"),
+        ] {
+            assert_eq!(
+                anthropic_error_type(StatusCode::from_u16(status).unwrap()),
+                kind,
+                "{status}"
+            );
+        }
+    }
 }

@@ -5,20 +5,46 @@ const ROW_COUNTS: [usize; 3] = [2, 3, MAX_ROWS];
 fn staging_preserves_index_prefix_and_all_three_rows() {
     // The repaired K3 lane keeps its original byte partition.
     assert_eq!((scratch_bytes(3), output_bytes(3)), (49664, 24576));
-    let p = StagePlan::new(3, DevicePtr(0x1000), 49664, DevicePtr(0x20000), 24576, &[]).unwrap();
+    let p = StagePlan::new(
+        3,
+        8192,
+        DevicePtr(0x1000),
+        49664,
+        DevicePtr(0x20000),
+        24576,
+        &[],
+    )
+    .unwrap();
     assert_eq!(p.row(0).unwrap(), DevicePtr(0x1200));
     assert_eq!(p.row(1).unwrap(), DevicePtr(0x5200));
     assert_eq!(p.row(2).unwrap(), DevicePtr(0x9200));
     assert!(p.row(3).is_err());
-    StagePlan::new(3, DevicePtr(0x1000), 49664, DevicePtr(0x20002), 24576, &[]).unwrap();
+    StagePlan::new(
+        3,
+        8192,
+        DevicePtr(0x1000),
+        49664,
+        DevicePtr(0x20002),
+        24576,
+        &[],
+    )
+    .unwrap();
     assert_eq!(p.row(2).unwrap().0 + 16384, 0x1000 + 49664);
 }
 #[test]
 fn staging_scales_rows_and_rejects_unsupported_counts() {
     for rows in ROW_COUNTS {
         let (bytes, out) = (scratch_bytes(rows), output_bytes(rows));
-        let p =
-            StagePlan::new(rows, DevicePtr(0x1000), bytes, DevicePtr(0x40000), out, &[]).unwrap();
+        let p = StagePlan::new(
+            rows,
+            8192,
+            DevicePtr(0x1000),
+            bytes,
+            DevicePtr(0x40000),
+            out,
+            &[],
+        )
+        .unwrap();
         for i in 0..rows {
             assert_eq!(p.row(i).unwrap().0, 0x1200 + (i * ROW) as u64);
         }
@@ -31,6 +57,7 @@ fn staging_scales_rows_and_rejects_unsupported_counts() {
             assert!(
                 StagePlan::new(
                     rows,
+                    8192,
                     DevicePtr(0x1000),
                     capacity,
                     DevicePtr(0x40000),
@@ -45,6 +72,7 @@ fn staging_scales_rows_and_rejects_unsupported_counts() {
         assert!(
             StagePlan::new(
                 rows,
+                8192,
                 DevicePtr(0x1000),
                 bytes,
                 DevicePtr(0x40000),
@@ -55,6 +83,7 @@ fn staging_scales_rows_and_rejects_unsupported_counts() {
         );
         StagePlan::new(
             rows,
+            8192,
             DevicePtr(0x1000),
             bytes,
             DevicePtr(0x40000),
@@ -64,12 +93,21 @@ fn staging_scales_rows_and_rejects_unsupported_counts() {
         .unwrap();
         // Output directly after the whole scratch span is adjacent, not aliased.
         let adjacent = DevicePtr(0x1000 + bytes as u64);
-        StagePlan::new(rows, DevicePtr(0x1000), bytes, adjacent, out, &[]).unwrap();
+        StagePlan::new(rows, 8192, DevicePtr(0x1000), bytes, adjacent, out, &[]).unwrap();
     }
     let (bytes, out) = (scratch_bytes(MAX_ROWS + 1), output_bytes(MAX_ROWS + 1));
     for rows in [0, 1, MAX_ROWS + 1] {
         assert!(
-            StagePlan::new(rows, DevicePtr(0x1000), bytes, DevicePtr(0x40000), out, &[]).is_err()
+            StagePlan::new(
+                rows,
+                8192,
+                DevicePtr(0x1000),
+                bytes,
+                DevicePtr(0x40000),
+                out,
+                &[]
+            )
+            .is_err()
         );
     }
 }
@@ -85,11 +123,23 @@ fn staging_rejects_short_alias_unaligned_and_overflow_ranges() {
         (0x1000, 49664, u64::MAX - 1, 24576),
         (0, 49664, 0x20000, 24576),
     ] {
-        assert!(StagePlan::new(3, DevicePtr(ptr), bytes, DevicePtr(out), outbytes, &[]).is_err());
+        assert!(
+            StagePlan::new(
+                3,
+                8192,
+                DevicePtr(ptr),
+                bytes,
+                DevicePtr(out),
+                outbytes,
+                &[]
+            )
+            .is_err()
+        );
     }
     assert!(
         StagePlan::new(
             3,
+            8192,
             DevicePtr(0x1000),
             49664,
             DevicePtr(0x20000),
@@ -101,6 +151,7 @@ fn staging_rejects_short_alias_unaligned_and_overflow_ranges() {
     // Exactly adjacent index scratch and output boundaries do not overlap.
     StagePlan::new(
         3,
+        8192,
         DevicePtr(0x1000),
         49664,
         DevicePtr(0xd200),

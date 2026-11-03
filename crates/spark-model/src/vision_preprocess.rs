@@ -13,7 +13,10 @@ use image::{DynamicImage, ImageDecoder, ImageReader, Limits, Rgb, RgbImage};
 mod glm_sizing;
 mod qwen_sizing;
 pub(crate) use glm_sizing::glm_pixel_budget;
-pub(crate) use glm_sizing::{derive_glm_max_patches, glm_resize_or_pad, glm_target_size};
+pub(crate) use glm_sizing::{
+    derive_glm_max_patches, glm_max_item_tokens, glm_max_sequence_patches, glm_resize_or_pad,
+    glm_target_size,
+};
 pub(crate) use qwen_sizing::qwen_fit;
 
 /// SigLIP normalization — matches HF's Qwen2VLImageProcessor

@@ -62,7 +62,13 @@ impl Qwen3AttentionLayer {
         // ATLAS_GLM_DET_TRACE: the latents written to the cache.
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
         let lat = |width: u32| width as usize * bf16;
-        if let Some(localized) = self.glm_front_fused(owners, kv_cache, ctx, args, mla, wf)? {
+        // The four-rank MLA quant gather: q_a and kv_a on the gathered cast rows.
+        let cast = super::sp_gather::cast_input();
+        let fused = match cast {
+            Some(_) => None,
+            None => self.glm_front_fused(owners, kv_cache, ctx, args, mla, wf)?,
+        };
+        if let Some(localized) = fused {
             det.tap("kv_lat", kv_latent, (0, num_tokens), lat(kv_lora));
             det.tap("x_q_lat", q_latent, (0, num_tokens), lat(q_lora));
             return Ok(GlmFront {
@@ -73,21 +79,40 @@ impl Qwen3AttentionLayer {
             });
         }
         let accelerated = super::projection::enabled(&ctx.config.model_type)?;
-        let project = |weight: &DenseWeight, out: DevicePtr, width: u32| {
-            self.paged_glm_projection(normed, weight, out, n, width, h, ctx, stream, accelerated)
+        let project = |weight: &DenseWeight, out: DevicePtr, width: u32| match cast {
+            Some(cast) => self.mla_native_cast_rows(
+                ctx,
+                weight,
+                cast.rows(),
+                out,
+                [n as usize, width as usize, h as usize],
+                stream,
+            ),
+            None => self.paged_glm_projection(
+                normed,
+                weight,
+                out,
+                n,
+                width,
+                h,
+                ctx,
+                stream,
+                accelerated,
+            ),
         };
         // ATLAS_GLM_FP4L_MLA_FP8: q_a and kv_a in one launch (`mla_native`).
-        let paired = self.mla_native_pair(
-            ctx.gpu,
-            [
-                (&mla.wq_a, q_latent, q_lora),
-                (&mla.wkv_a, kv_latent, kv_lora),
-            ],
-            normed,
-            n,
-            h,
-            stream,
-        )?;
+        let paired = cast.is_none()
+            && self.mla_native_pair(
+                ctx.gpu,
+                [
+                    (&mla.wq_a, q_latent, q_lora),
+                    (&mla.wkv_a, kv_latent, kv_lora),
+                ],
+                normed,
+                n,
+                h,
+                stream,
+            )?;
         if !paired {
             project(&mla.wq_a, q_latent, q_lora)?;
         }
@@ -213,6 +238,7 @@ impl Qwen3AttentionLayer {
             (Some((q_shape, q)), Some((kv_shape, kv)))
                 if matches!(ctx.config.tp_world_size, 2 | 4)
                     && ctx.config.ep_world_size == ctx.config.tp_world_size
+                    && !crate::layers::glm_packed_scope::active()
                     && !q.tiled
                     && !kv.tiled
                     && args.h.is_multiple_of(128)

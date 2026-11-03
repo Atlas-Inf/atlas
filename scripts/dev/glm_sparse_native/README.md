@@ -1,5 +1,11 @@
 # Atlas native sparse GPU checks
 
+TP2 attends 32 local heads through NVIDIA's two-group kernel
+(`glm_sparse_native_attention`), TP4 16 through its single-group kernel
+(`glm_sparse_native_attention_sg16`), the choice NVIDIA's prefill dispatch makes.
+The checks below run the 32-head target; the 16-head entry has only the host
+launch-geometry test (`tp4_launches_the_single_group_kernel_over_sixteen_heads`).
+
 These ignored tests run the actual `AtlasCudaBackend`, checked Rust `Plan`, and
 production `dispatch::execute` against the embedded GLM CUDA target. They do not
 load a sparse-prefill shared library or model weights. They require the

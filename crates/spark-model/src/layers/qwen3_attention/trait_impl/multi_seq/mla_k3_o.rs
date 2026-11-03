@@ -21,7 +21,7 @@ impl Qwen3AttentionLayer {
             glm_k3_mla_o::rows_supported(c.n)
                 && c.h == 4096
                 && c.bf16 == 2
-                && c.nq == 32
+                && ops::glm_sparse_tc_heads(c.nq)
                 && mla.v_dim == 256
                 && mla.rope == 0
                 && mla.o_lora_rank == 0
@@ -62,8 +62,10 @@ impl Qwen3AttentionLayer {
             // Last entry becomes candidate output only after every causal row ends.
             (b.attn_output(), s.attn_output),
         ];
+        let width = c.nq as usize * mla.v_dim;
         let mut plan = glm_k3_mla_o::StagePlan::new(
             c.n,
+            width,
             b.ssm_qkvz(),
             s.ssm_qkvz,
             output,
@@ -79,7 +81,7 @@ impl Qwen3AttentionLayer {
             // Only diagnostic mode allocates this small host list. Include the resident
             // matrix to prove that the alternate output cannot overwrite the operand.
             let mut comparison_live = other_live.to_vec();
-            comparison_live.push((mla.wo.weight, 4096 * 8192 * 2));
+            comparison_live.push((mla.wo.weight, 4096 * width * 2));
             plan = plan.with_compare(candidate.0, candidate.1, &comparison_live)?;
         }
         Ok(Some(plan))

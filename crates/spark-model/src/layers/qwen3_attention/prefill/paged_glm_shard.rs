@@ -17,7 +17,7 @@ use crate::layers::ops;
 /// One merge-form owner: `rows` query rows of one sequence.
 #[derive(Clone, Copy)]
 pub(in crate::layers::qwen3_attention) struct ShardRows {
-    /// This rank's heads' absorbed queries `[rows, 32, 512]` BF16.
+    /// This rank's heads' absorbed queries `[rows, 64 / world, 512]` BF16.
     pub query: DevicePtr,
     /// Selected IDs `[rows, 2051]`; `None` attends causally, row `r` to
     /// tokens `[0, causal_start + r + 1)`.
@@ -39,6 +39,9 @@ pub(in crate::layers::qwen3_attention) struct ShardRows {
 #[path = "paged_glm_shard_merge.rs"]
 mod merge;
 
+#[path = "paged_glm_shard_chain.rs"]
+mod chain;
+
 fn owner_rank(s: &LatentShard) -> ops::ShardRank {
     ops::ShardRank {
         rank: s.spec.rank as u32,
@@ -46,7 +49,8 @@ fn owner_rank(s: &LatentShard) -> ops::ShardRank {
     }
 }
 
-/// The shard, the pair communicator of this rank and the scratch layout.
+/// The shard, the communicator of this rank over the shard's ranks and the
+/// scratch layout.
 fn pair<'a>(
     kv_cache: &PagedKvCache,
     ctx: &ForwardContext<'a>,
@@ -56,8 +60,8 @@ fn pair<'a>(
         .context("GLM KV shard attention on an unsharded cache")?;
     let comm = ctx
         .comm
-        .filter(|c| c.world_size() == 2 && c.rank() == s.spec.rank)
-        .context("GLM KV shard attention needs this rank's TP-pair communicator")?;
+        .filter(|c| c.world_size() == s.spec.world && c.rank() == s.spec.rank)
+        .context("GLM KV shard attention needs this rank's TP communicator")?;
     Ok((s, comm, ScratchLayout::of(&s, kv_cache.config())?))
 }
 
@@ -105,11 +109,26 @@ impl Qwen3AttentionLayer {
         const BROKEN: u64 = 1 << 63;
         let verdict = s.check_table(table);
         let ours = table.len() as u64 | if verdict.is_err() { BROKEN } else { 0 };
-        gpu.copy_h2d_async(&ours.to_le_bytes(), words, stream)?;
-        shard::pair_exchange(comm, words, words.offset(8), 8, stream)?;
-        let mut peer = [0u8; 8];
-        gpu.copy_d2h_on_stream(words.offset(8), &mut peer, stream)?;
-        let peer = u64::from_le_bytes(peer);
+        let world = s.spec.world;
+        let peer = if world == 2 {
+            gpu.copy_h2d_async(&ours.to_le_bytes(), words, stream)?;
+            shard::pair_exchange(comm, words, words.offset(8), 8, stream)?;
+            let mut peer = [0u8; 8];
+            gpu.copy_d2h_on_stream(words.offset(8), &mut peer, stream)?;
+            u64::from_le_bytes(peer)
+        } else {
+            // Every rank's word; the first that differs from ours stands in
+            // for "the peer".
+            let own = words.offset(8 * s.spec.rank);
+            gpu.copy_h2d_async(&ours.to_le_bytes(), own, stream)?;
+            shard::gather(comm, words, 8, 8, stream)?;
+            let mut all = vec![0u8; 8 * world];
+            gpu.copy_d2h_on_stream(words, &mut all, stream)?;
+            all.chunks_exact(8)
+                .map(|w| u64::from_le_bytes(w.try_into().unwrap()))
+                .find(|&w| w != ours)
+                .unwrap_or(ours)
+        };
         verdict.with_context(|| format!("attention layer {}", self.attn_layer_idx))?;
         ensure!(
             peer == ours,
@@ -231,6 +250,20 @@ impl Qwen3AttentionLayer {
             self.glm_shard_check(&s, comm, gpu, words, &table, stream)?;
         }
         let hd = self.mla.as_ref().map_or(0, |m| m.nope) as u32;
+        if s.spec.world > 2 {
+            return chain::ChainMerge {
+                gpu,
+                comm,
+                config: ctx.config,
+                shard: s,
+                work: layout.work,
+                work_bytes: layout.total - layout.work,
+                dtype: self.kv_dtype,
+                pool: kv_cache.latent_pool_ptr(self.attn_layer_idx),
+                scale: self.effective_attn_scale(hd),
+            }
+            .run(a, output, stream);
+        }
         merge::ShardMerge {
             gpu,
             comm,
@@ -341,6 +374,17 @@ impl Qwen3AttentionLayer {
             bytes,
             stream,
         )?;
+        if s.spec.world > 2 {
+            let parts = chain::ViewParts {
+                pool,
+                view,
+                mine_slot,
+                blocks,
+                block_bytes: bytes,
+            };
+            parts.gather(gpu, comm, &s, &layout, stream)?;
+            return Ok((view, s.identity));
+        }
         // Both ranks derive the same rounds from the same table.
         let rounds = mine.max(peer);
         let send = at(layout.work);
@@ -373,8 +417,12 @@ impl Qwen3AttentionLayer {
             .latent_shard()
             .context("GLM KV shard localization on an unsharded cache")?;
         let layout = ScratchLayout::of(&s, kv_cache.config())?;
-        let m = shard::MergeLayout::new(rows, shard::MERGE_SPLITS);
         let at = |offset: usize| s.scratch.offset(layout.work + offset);
+        if s.spec.world > 2 {
+            let m = shard::ChainLayout::new(rows, s.spec.world);
+            return Ok((at(m.ids), at(m.counts)));
+        }
+        let m = shard::MergeLayout::new(rows, shard::MERGE_SPLITS);
         Ok((at(m.ids), at(m.counts(rows, shard::MERGE_SPLITS))))
     }
 

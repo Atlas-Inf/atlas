@@ -19,10 +19,10 @@ fn validate_geometry(c: &ModelConfig) -> Result<()> {
         c.model_type == "glm5_next"
             && c.hidden_size == 4096
             && c.hc_mult == 4
-            && c.tp_world_size == 2
-            && c.ep_world_size == 2
-            && c.num_attention_heads == 32
-            && c.num_key_value_heads == 32
+            && matches!(c.tp_world_size, 2 | 4)
+            && c.ep_world_size == c.tp_world_size
+            && c.num_attention_heads == 64 / c.tp_world_size
+            && c.num_key_value_heads == c.num_attention_heads
             && c.head_dim == 256
             && c.kv_lora_rank == 512
             && c.qk_rope_head_dim == 0
@@ -30,7 +30,7 @@ fn validate_geometry(c: &ModelConfig) -> Result<()> {
             && c.index_kpool == 4
             && c.index_n_heads == 32
             && c.index_head_dim == 128,
-        "native sparse requires GLM TP2/EP2 H4096/HC4,32heads,NoPE512,index2048/pool4"
+        "native sparse requires GLM TP2/EP2 or TP4/EP4 H4096/HC4,64 total heads,NoPE512,index2048/pool4"
     );
     Ok(())
 }
@@ -61,8 +61,8 @@ fn validate_startup(
         "native sparse requires a >=4100-row arena,32K context,C4,block16,BF16/fp8_g128 cache"
     );
     let sizes = BufferSizes::from_config(c, rows, seq, block, active);
-    let (required, _) =
-        plan::required_bytes(rows, seq, 1, seq / block).map_err(anyhow::Error::msg)?;
+    let (required, _) = plan::required_bytes(rows, seq, 1, seq / block, c.num_attention_heads)
+        .map_err(anyhow::Error::msg)?;
     let capacities = [
         sizes.ssm_deinterleaved,
         sizes.expert_down_out,
@@ -139,9 +139,12 @@ pub fn initialize_glm_sparse_native(
 
 /// Resolve every native CUDA entry on this serving context before KV sizing.
 /// Does not allocate, launch, or synchronize. Call after profile validation.
-pub fn preload_glm_sparse_native(gpu: &dyn spark_runtime::gpu::GpuBackend) -> Result<()> {
+pub fn preload_glm_sparse_native(
+    gpu: &dyn spark_runtime::gpu::GpuBackend,
+    heads: usize,
+) -> Result<()> {
     if dispatch::enabled()? {
-        dispatch::resolve(gpu)?;
+        dispatch::resolve(gpu, heads as u32)?;
         tracing::info!("Atlas GLM sparse kernels resolved before KV sizing");
     }
     Ok(())
@@ -167,7 +170,7 @@ pub fn try_glm_sparse_native(
     ensure!(
         a.dtype == KvCacheDtype::Bf16
             && a.identical_kv_latent
-            && a.heads == 32
+            && a.heads as usize == ctx.config.num_attention_heads
             && a.head_dim == 512
             && a.index_width == 2051
             && a.block_size == 16
@@ -195,6 +198,7 @@ pub fn try_glm_sparse_native(
         seq_start,
         physical_blocks,
         block_table_count,
+        a.heads as usize,
         [
             span(a.query, s.ssm_deinterleaved),
             span(a.k_cache, cache_bytes),

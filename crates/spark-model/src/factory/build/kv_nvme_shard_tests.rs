@@ -10,14 +10,59 @@ use super::*;
 
 /// GLM-5.3's record per rank, unsharded.
 pub(super) const GLM: NvmeGeometry = NvmeGeometry {
+    classes: 1,
     own: 106_496,
     peer: None,
 };
 /// The same under a latent shard: the peer's blocks keep their index rows.
 pub(super) const GLM_SHARD: NvmeGeometry = NvmeGeometry {
+    classes: 2,
     own: 106_496,
     peer: Some(12_288),
 };
+
+#[test]
+fn tp4_budget_and_reserve_cover_all_four_classes() {
+    use spark_runtime::prefix_cache::NVME_HOST_BYTES_PER_BLOCK;
+    let g = NvmeGeometry {
+        classes: 4,
+        ..GLM_SHARD
+    };
+    let cfg = tier("24", true);
+    let per_class = slots_per_class(cfg.budget_bytes, g).unwrap();
+    assert_eq!(g.row_bytes(), 143_360);
+    assert_eq!(per_class as u64, cfg.budget_bytes / 143_360);
+    assert!(u64::from(per_class) * 143_360 <= cfg.budget_bytes);
+    assert_eq!(
+        reserve_for(Some(&cfg), g, 5000),
+        128 * 143_360 + 4 * per_class as usize * NVME_HOST_BYTES_PER_BLOCK + 5000
+    );
+    assert!(slots_per_class(143_359, g).is_err());
+    for classes in [0, 1, 3, 5] {
+        assert!(slots_per_class(cfg.budget_bytes, NvmeGeometry { classes, ..g }).is_err());
+    }
+}
+
+#[test]
+fn tp4_rank_word_rejects_mixed_classes_and_equal_total_but_different_records() {
+    let cfg = tier("24", true);
+    let g = NvmeGeometry {
+        classes: 4,
+        ..GLM_SHARD
+    };
+    let word = word_for(Some(&cfg), g, DISK, true).unwrap();
+    let pair = word_for(Some(&cfg), GLM_SHARD, DISK, true).unwrap();
+    assert_ne!(word, pair);
+    assert!(verify_ranks(Ok(word), &[word, word, pair, word]).is_err());
+    let different = NvmeGeometry {
+        own: g.own + 3 * 4096,
+        peer: Some(g.peer.unwrap() - 4096),
+        ..g
+    };
+    assert_eq!(g.row_bytes(), different.row_bytes());
+    assert_ne!(word, word_for(Some(&cfg), different, DISK, true).unwrap());
+    assert!(verify_ranks(Ok(word), &[word; 4]).is_ok());
+}
 
 #[test]
 fn a_shard_buys_slots_of_both_classes_within_the_budget() {
@@ -92,6 +137,14 @@ fn host_reserve_covers_staging_index_and_the_ssm_tier() {
 }
 
 fn sharded_glm_kv(gpu: &spark_runtime::gpu::mock::MockGpuBackend, rank: usize) -> PagedKvCache {
+    sharded_glm_kv_world(gpu, rank, 2)
+}
+
+fn sharded_glm_kv_world(
+    gpu: &spark_runtime::gpu::mock::MockGpuBackend,
+    rank: usize,
+    world: usize,
+) -> PagedKvCache {
     use spark_runtime::kv_cache::{
         KvCacheConfig, KvCacheDtype, LatentShardSpec, SparseIndexCacheConfig,
     };
@@ -107,7 +160,7 @@ fn sharded_glm_kv(gpu: &spark_runtime::gpu::mock::MockGpuBackend, rank: usize) -
     };
     let spec = LatentShardSpec {
         rank,
-        world: 2,
+        world,
         scratch_bytes: 4096,
         view_blocks: 8,
         write_rows: 4,
@@ -124,11 +177,17 @@ fn sharded_glm_kv(gpu: &spark_runtime::gpu::mock::MockGpuBackend, rank: usize) -
 #[test]
 fn a_sharded_rank_attaches_a_file_per_class() {
     use spark_runtime::prefix_cache::{DiskRef, NvmePrefixTier, SpillOrder};
-    for (rank, fast) in [(0, true), (1, false)] {
+    for (world, rank, fast) in [2, 4].into_iter().flat_map(|world| {
+        (0..world).flat_map(move |rank| {
+            [false, true]
+                .into_iter()
+                .map(move |fast| (world, rank, fast))
+        })
+    }) {
         let gpu = spark_runtime::gpu::mock::MockGpuBackend::new();
-        let mut kv = sharded_glm_kv(&gpu, rank);
+        let mut kv = sharded_glm_kv_world(&gpu, rank, world);
         let tree = spark_runtime::radix_tree::RadixTree::new();
-        let Some(dir) = disk_scratch_dir(&format!("shard{rank}")) else {
+        let Some(dir) = disk_scratch_dir(&format!("shard{world}-{rank}-{fast}")) else {
             return;
         };
         let cfg = NvmeKvConfig {
@@ -138,10 +197,10 @@ fn a_sharded_rank_attaches_a_file_per_class() {
             keep: false,
         };
         let geometry = kv.nvme_geometry();
-        assert_eq!(geometry.classes(), 2);
+        assert_eq!(geometry.classes(), world);
         let slots = setup_local(Some(cfg), rank, geometry, &mut kv, &tree, &gpu).unwrap();
         let per_class = slots_per_class(64 << 20, geometry).unwrap();
-        assert_eq!(slots, 2 * per_class);
+        assert_eq!(slots, world as u32 * per_class);
         assert!(kv.nvme_attached());
         assert_eq!(tree.nvme_stats().max_slots, slots);
         assert!(!tree.enable_classes(1, 2), "enabled once, with classes");
@@ -158,7 +217,7 @@ fn a_sharded_rank_attaches_a_file_per_class() {
         }
         let order = |block: u32| SpillOrder {
             block,
-            slot: block % 2,
+            slot: block % world as u32,
             tag: 40 + u64::from(block),
         };
         assert!(
@@ -166,7 +225,7 @@ fn a_sharded_rank_attaches_a_file_per_class() {
                 .is_empty()
         );
         let disk = |block: u32| DiskRef {
-            slot: block % 2,
+            slot: block % world as u32,
             tag: 40 + u64::from(block),
         };
         let mut back = [
@@ -201,5 +260,30 @@ fn a_tier_sized_for_one_class_refuses_a_sharded_cache() {
     };
     let e = setup_local(Some(cfg), 0, GLM, &mut kv, &tree, &gpu).unwrap_err();
     assert!(format!("{e:#}").contains("record class"), "{e:#}");
+    assert!(!kv.nvme_attached());
+}
+
+#[test]
+fn tp4_setup_refuses_wrong_owner_or_equal_row_but_wrong_layout_before_io() {
+    let gpu = spark_runtime::gpu::mock::MockGpuBackend::new();
+    let mut kv = sharded_glm_kv_world(&gpu, 3, 4);
+    let tree = spark_runtime::radix_tree::RadixTree::new();
+    let g = kv.nvme_geometry();
+    let cfg = || NvmeKvConfig {
+        dir: PathBuf::from("/nonexistent-never-created"),
+        budget_bytes: 64 << 20,
+        fast: true,
+        keep: false,
+    };
+    let e = setup_local(Some(cfg()), 0, g, &mut kv, &tree, &gpu).unwrap_err();
+    assert!(format!("{e:#}").contains("latent-shard owner"), "{e:#}");
+    let wrong = NvmeGeometry {
+        own: g.own - 3,
+        peer: Some(g.peer.unwrap() + 1),
+        ..g
+    };
+    assert_eq!(wrong.row_bytes(), g.row_bytes());
+    let e = setup_local(Some(cfg()), 3, wrong, &mut kv, &tree, &gpu).unwrap_err();
+    assert!(format!("{e:#}").contains("record class geometry"), "{e:#}");
     assert!(!kv.nvme_attached());
 }

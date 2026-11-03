@@ -18,8 +18,8 @@
 //!   `ATLAS_GLM_DENSE_PREFILL_BF16=2` dequantizes NVFP4 per call) and run the
 //!   BF16 GEMM: exact weights on BF16 activations.
 //!
-//! `ATLAS_GLM_DENSE_TP_SPLIT=1` splits the GEMV rows over the pair
-//! (`dense_ffn_tp_split.rs`): half of these projections per rank.
+//! `ATLAS_GLM_DENSE_TP_SPLIT=1` splits the GEMV rows over the TP ranks
+//! (`dense_ffn_tp_split.rs`): 1/n of these projections per rank.
 //!
 //! Decode bytes per rank per step (3 layers x 151 M params): 467 MB at 1.031
 //! B/param against NVFP4's 255 MB; resident +~225 MB.
@@ -108,7 +108,7 @@ impl DenseFfnLayer {
             ctx.buffers.moe_output(),
         );
         let kernels = native_kernels(ctx.gpu);
-        let gemv = rows <= DENSE_NATIVE_GEMV_ROWS;
+        let gemv = rows <= DENSE_NATIVE_GEMV_ROWS && !crate::layers::glm_packed_scope::active();
         let proj = super::tp_split::SplitProj::Mxfp8(&native);
         if gemv && self.glm_verify_rows_split(input, rows as u32, proj, ctx, stream)? {
             return Ok(true);

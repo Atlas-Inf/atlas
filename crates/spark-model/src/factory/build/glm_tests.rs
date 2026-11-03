@@ -74,7 +74,7 @@ fn plan(rank: usize, sharded: bool) -> GlmCachePlan {
         .unwrap()
         .aliased_v(&cfg);
     if sharded {
-        plan.latent_sharded(&cfg, shard::spec(rank, &cfg, 65_536, 8256))
+        plan.latent_sharded(&cfg, shard::spec((rank, 2), &cfg, 65_536, 8256))
     } else {
         plan
     }

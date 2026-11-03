@@ -943,62 +943,46 @@ it, a block is written once for as long as its record is kept.
 
 ## 13. Under the latent shard (`ATLAS_GLM_KV_SHARD=1`)
 
-The shard (`glm-kv-shard.md`) stores block `b`'s latents on rank `b % 2`
-only, at local slot `b / 2`, and draws the block for logical index `l` with
-`b % 2 == l % 2`, so both ranks agree which rank owns logical block `l` while
-their physical ids differ. The index pools stay full on both ranks. The tier
-used to be refused beside it; it now runs with it, as follows.
+TP2 and TP4 use the same record format and storage classes. With `world`
+ranks, block `b`'s latents belong to rank `b % world`, at local slot
+`b / world`. A block drawn for logical index `l` satisfies
+`b % world == l % world`, so every rank agrees on the logical owner even
+when its physical block IDs differ. Every rank retains the full index pools.
 
-- **Two record classes.** The tree splits its slots into two classes
-  (`NvmePrefixTier::enable_classes`): a node spilled from block `b` takes a
-  slot `s` with `s % 2 == b % 2`. That residue is the node's logical index
-  residue, so the class of every node, and every slot the tree hands out,
-  is the same on both ranks (the trees see the same operations; only the ids
-  differ, and the classes do not read them beyond their residue).
-- **One record file (lane) per class and rank**
-  (`kv_cache/nvme_lanes.rs`), `atlas-kv-prefix.<pid>.r<rank>.c<class>.swap`,
-  record `s / 2` of class `s % 2`:
-  - the rank's OWN class (`class == rank`): the full record of §4, the
-    latents gathered from the local slot;
-  - the PEER class: the index rows only (GLM-5.3: 11 × 1024 B + trailer =
-    12 288 B per block, against 106 496 B for a full record).
-  Each rank thus spills and restores only the latents it stores, and every
-  block's index rows (sparse-index values and scales; raw tails are never in
-  a record, as unsharded).
-- **Budget.** `ATLAS_KV_NVME_GB` buys `budget / (own + peer record)` slots of
-  EACH class, so the two files together stay within it. On GLM-5.3 that is
-  ~59 KB per block per rank instead of 106 KB: ~1.8× the tokens per GiB.
-  The host reserve counts both lanes' staging and every slot of both classes;
-  the rank word fingerprints the total slots and `own + peer`, so a shard rank
-  and an unsharded rank do not start together (the shard settings themselves
-  are agreed in the same word).
-- **Budget drops per class.** A full class drops the coldest on-disk tail of
-  ITS class: a leaf, or (shard only) a node of the class whose children are
-  all leaves of the other class — a chain alternates classes, so this is what
-  lets a full class trim a chain whose leaf is in the other class. A victim
-  colder than every droppable record of its class is deleted (cold drop) even
-  when the other class has room. The rules read only the classes and the
-  access order, so both ranks drop the same records.
-- **Restore placement.** `restore_prefix` already allocates each restored
-  block at its logical index, so its residue is its record's class on both
-  ranks. `nvme_read` splits the run by class, reads each lane, and returns the
-  shortest verified prefix over both (a failure in either lane ends the
-  restore there). The fast path sorts a lane's blocks for pitched copies;
-  within a lane they share a residue, so every block keeps its position's
-  residue. Pitched runs step two ids at a time: the latents at their local
-  slots (pitch = one block), the index rows at a doubled pitch.
-- **Rank agreement.** Unchanged and sufficient: a restore is rank-local, and
-  the F83 minimum caps both ranks to the blocks both of them hold, so the
-  merge-form attention never meets a logical block whose owner lacks its
-  latents. The Marconi depth agreement (`pc_agree_restore`) and the SSM
-  snapshot tier work as unsharded (snapshots are per-rank state the shard does
-  not touch).
-- **Checks.** A spill order whose block residue is not its slot's class is
-  reported failed (the node is dropped); a restore target off its slot's
-  class ends the restore in front of it. Neither can happen with blocks drawn
-  at their logical index.
-- **Shard off.** One class, one lane, `.r<rank>.swap`, the same slots, the
-  same records, the same rank word and the same reserve as before.
+- **One record class per rank.** A block spills to slot `s` with
+  `s % world == b % world`. Its lane stores record `s / world` in
+  `atlas-kv-prefix.<pid>.r<rank>.c<class>.swap`. The own class carries latents
+  and pooled index rows; each other class carries index rows only. Raw tails
+  are never spilled. The files remain process-local and unlinked.
+- **Budget and staging.** `ATLAS_KV_NVME_GB` buys
+  `budget / (own + (world - 1) * peer)` slots of each class. For GLM-5.3,
+  own records are 106,496 B and peer records 12,288 B: a row of classes costs
+  118,784 B at TP2 and 143,360 B at TP4. That is about 1.8× and 3× the
+  unsharded token capacity per GiB, respectively. Host reserve includes every
+  lane's staging and every slot's index. The startup fingerprint includes
+  class count, own and peer record sizes, total slots, SSM home, FAST and KEEP;
+  incompatible rank configurations fail before serving.
+- **Per-class eviction.** A full class reclaims its coldest droppable on-disk
+  tail, up to `world - 1` edges above the leaves. This includes branched tails,
+  but excludes every resident or pinned descendant. All dropped records are
+  counted. If the candidate is colder than every droppable record of its
+  class, it is discarded for recomputation even if another class has room.
+- **Restore placement.** Targets are allocated at their logical index. Each
+  lane restores only to blocks of its residue; fast I/O may sort those targets
+  within that residue. Pitched runs step `world` physical IDs at a time:
+  latent pitch is one local block, index pitch is `world` blocks. A stale,
+  missing, or misclassified record stops adoption at the earliest unverified
+  logical block, even if other lanes read farther.
+- **Rank agreement.** Restores remain local. The existing F83 minimum covers
+  every communicator rank and caps the match to the prefix all owners hold.
+  Marconi restore-depth agreement and per-rank SSM snapshot tiers are unchanged.
+  KEEP retains clean restored records; replay or copy-on-write invalidation
+  releases the affected records so later evictions write the current bytes.
+- **Compatibility.** TP2 slot placement, record bytes, budgets and I/O are
+  unchanged; its startup fingerprint now also distinguishes own/peer layouts
+  with equal total size. Unsharded records, filenames, fingerprint and reserve
+  are unchanged. No persistent record migration is needed.
 
-Not supported under the shard: nothing beyond what the shard already refuses
-(`--high-speed-swap`, and the lanes in `glm-kv-shard.md`).
+The shard's other restrictions still apply (`--high-speed-swap` and the
+lanes listed in `glm-kv-shard.md`). TP4 supports the synchronous and FAST
+paths, with KEEP either enabled or disabled.

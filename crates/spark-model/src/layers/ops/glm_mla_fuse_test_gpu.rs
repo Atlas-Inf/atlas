@@ -9,7 +9,7 @@
 //! `glm_index_tail_write_bf16`, `glm_index_kpool_finalize_bf16` and
 //! `glm_kv_shard_localize_compact`) at GLM-5.3's shape, for every block of
 //! 1..=32 rows, starting mid-pool and mid-block, unsharded and on each rank
-//! of a sharded pair: the same q and kv latents, index keys and gates, fp8
+//! of a sharded pair or four-rank topology: the same q and kv latents, index keys and gates, fp8
 //! latent pool, raw tails, pooled keys and localized IDs, byte for byte.
 //!
 //!   cargo test --release -p spark-model --lib glm_mla_fuse -- --ignored --nocapture
@@ -27,7 +27,7 @@ const WIDTH: u32 = 2051;
 /// Logical blocks of the test sequence ([`physical`] places them): a
 /// whole dense-selection context (2048 tokens).
 const BLOCKS: u32 = 128;
-const PHYS: u32 = 3 * BLOCKS + 2;
+const PHYS: u32 = 5 * BLOCKS + 8;
 const TAIL_STRIDE: u64 = (2 * BS * ID * 2) as u64;
 const POOL_STRIDE: u64 = (BS / 4 * ID * 2) as u64;
 const LATENT_BLOCK: usize = (BS * 528) as usize;
@@ -35,7 +35,7 @@ const LATENT_BLOCK: usize = (BS * 528) as usize;
 /// Logical block `l`'s physical block: distinct, and with the residue of `l`
 /// (the shard allocator's invariant).
 fn physical(l: u32) -> u32 {
-    3 * l + 2 * (l % 2)
+    5 * l + 4 * (l % 3)
 }
 
 struct Rng(u64);
@@ -368,8 +368,12 @@ fn compare_front(fp8_block: bool) -> Result<()> {
         ShardRank { rank: 0, world: 1 },
         ShardRank { rank: 0, world: 2 },
         ShardRank { rank: 1, world: 2 },
+        ShardRank { rank: 0, world: 4 },
+        ShardRank { rank: 1, world: 4 },
+        ShardRank { rank: 2, world: 4 },
+        ShardRank { rank: 3, world: 4 },
     ];
-    for rows in (1..=32).filter(|r| *r <= 8 || r % 4 == 0 || [9, 17, 31].contains(r)) {
+    for rows in 1..=32 {
         let (a, b) = (Run::new(gpu, rows)?, Run::new(gpu, rows)?);
         // Mid-pool and mid-block starts, and a block ending at 2048.
         for start in [29u32, 64, 126, 2016 - rows.min(16)] {
@@ -417,7 +421,7 @@ fn compare_front(fp8_block: bool) -> Result<()> {
         b.free(gpu)?;
     }
     eprintln!(
-        "fused MLA front == twelve launches: rows 1..=32 x 4 starts x unsharded/rank 0/rank 1"
+        "fused MLA front == twelve launches: rows 1..=32 x 4 starts x unsharded/all TP2 ranks/all TP4 ranks"
     );
     Ok(())
 }

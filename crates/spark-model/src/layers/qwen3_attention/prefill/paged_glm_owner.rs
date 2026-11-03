@@ -211,6 +211,7 @@ impl Qwen3AttentionLayer {
         let latent_row = nq * kv_lora * 2;
         let sizes = ctx.buffers.sizes();
         if !on
+            || crate::layers::glm_packed_scope::active()
             || owners.len() < if solo { 1 } else { 2 }
             || rows > 64
             || sizes.ssm_qkvz < 2 * rows * key_row
@@ -232,7 +233,7 @@ impl Qwen3AttentionLayer {
         let index = if any_owner_selects(owners, c.index_topk) {
             let query = q_absorbed.offset(rows * latent_row);
             let weights = ctx.buffers.ssm_gates();
-            self.glm_index_project_query(q_latent, normed, n, query, weights, ctx, stream)?;
+            self.glm_index_project_query(q_latent, Some(normed), n, query, weights, ctx, stream)?;
             Some((query, weights))
         } else {
             None

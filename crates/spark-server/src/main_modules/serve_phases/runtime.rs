@@ -51,6 +51,20 @@ pub(crate) struct SamplingDefaults {
     pub(crate) min_p: f32,
 }
 
+/// The preset behind the server's own defaults. GLM-5.3's card pins its
+/// filters off for every request it serves, and its requests read these
+/// defaults rather than the preset (`use_sampling_presets_for_core` is off).
+/// Other cards' `top_n_sigma` governs the requests their presets serve only.
+pub(crate) fn server_default_preset(
+    model_type: &str,
+    mut preset: atlas_kernels::SamplingCategory,
+) -> atlas_kernels::SamplingCategory {
+    if model_type != "glm5_next" {
+        preset.top_n_sigma = None;
+    }
+    preset
+}
+
 pub(crate) fn load_sampling_defaults(
     model_dir: &Path,
     args: &cli::ServeArgs,
@@ -88,16 +102,15 @@ pub(crate) fn load_sampling_defaults(
 /// penalties, and a missing config must not silently mean "someone's idea of
 /// typical" when the model ships its own numbers.
 ///
-/// `min_p` is three-tier because the preset carries it only when MODEL.toml
-/// says so: config → preset (`Some`) → `--default-min-p`. A model card that
-/// specifies `min_p = 0` previously had no way to express it — the server's
-/// 0.08 default reached every request regardless, and `[behavior].min_p_floor`
-/// can only raise min_p, never pin it. A preset that stays silent (`None`)
-/// leaves the CLI default owning the field exactly as before.
-///
-/// `top_n_sigma` remains CLI-only: it is not carried by any model card we
-/// serve, and it is separately suspected of being a no-op on several targets,
-/// so giving it a MODEL.toml voice would advertise a knob that does nothing.
+/// `min_p` and `top_n_sigma` are three-tier because the preset carries them
+/// only when MODEL.toml says so: config → preset (`Some`) → `--default-min-p`
+/// / `--default-top-n-sigma`. A model card that specifies `min_p = 0`
+/// previously had no way to express it — the server's 0.08 default reached
+/// every request regardless, and `[behavior].min_p_floor` can only raise
+/// min_p, never pin it. A model served as its reference engine serves it
+/// (GLM-5.3: generation_config.json's temperature/top_p and no other filter)
+/// pins both to 0. A preset that stays silent (`None`) leaves the CLI default
+/// owning the field exactly as before.
 pub(crate) fn resolve_sampling_defaults(
     gen_cfg: Option<&serde_json::Value>,
     args: &cli::ServeArgs,
@@ -120,6 +133,11 @@ pub(crate) fn resolve_sampling_defaults(
     let top_n_sigma = gen_cfg
         .and_then(|v| v.get("top_n_sigma")?.as_f64())
         .map(|s| s as f32)
+        .or(if args.reference_mode {
+            None
+        } else {
+            preset.top_n_sigma
+        })
         .unwrap_or(if args.reference_mode {
             0.0
         } else {
@@ -396,103 +414,5 @@ pub(crate) fn resolve_tool_call_parser(
 }
 
 #[cfg(test)]
-mod sampling_defaults_tests {
-    use clap::Parser;
-
-    use super::resolve_sampling_defaults;
-    use crate::cli;
-
-    /// A preset with values distinct from both the old hard-coded constants
-    /// (0.6 / 20 / 0.95) and the CLI defaults, so a wrong fallback source is
-    /// unmistakable in every assertion below.
-    fn preset() -> atlas_kernels::SamplingCategory {
-        atlas_kernels::SamplingCategory {
-            temperature: 0.7,
-            top_p: 0.8,
-            top_k: 40,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            repetition_penalty: 1.0,
-            dry_multiplier: 0.0,
-            dry_base: 1.75,
-            dry_allowed_length: 2,
-            lz_penalty: 0.0,
-            min_p: None,
-            top_n_sigma: None,
-        }
-    }
-
-    fn args() -> cli::ServeArgs {
-        cli::ServeArgs::parse_from(["spark", "org/model"])
-    }
-
-    #[test]
-    fn missing_config_falls_back_to_preset_not_constants() {
-        let d = resolve_sampling_defaults(None, &args(), &preset());
-        assert_eq!(d.temperature, 0.7, "preset, not the old 0.6 literal");
-        assert_eq!(d.top_k, 40, "preset, not the old 20 literal");
-        assert_eq!(d.top_p, 0.8, "preset, not the old 0.95 literal");
-        assert!(d.temperature > 0.0, "absent config must never mean greedy");
-    }
-
-    #[test]
-    fn present_config_overrides_preset() {
-        let cfg = serde_json::json!({"temperature": 1.1, "top_k": 64, "top_p": 0.9});
-        let d = resolve_sampling_defaults(Some(&cfg), &args(), &preset());
-        assert_eq!(d.temperature, 1.1);
-        assert_eq!(d.top_k, 64);
-        assert_eq!(d.top_p, 0.9);
-    }
-
-    #[test]
-    fn partial_config_backfills_per_field() {
-        let cfg = serde_json::json!({"top_k": 64});
-        let d = resolve_sampling_defaults(Some(&cfg), &args(), &preset());
-        assert_eq!(d.top_k, 64, "present field honored");
-        assert_eq!(d.temperature, 0.7, "absent field from preset");
-        assert_eq!(d.top_p, 0.8, "absent field from preset");
-    }
-
-    #[test]
-    fn explicit_temperature_zero_is_honored() {
-        // A config that is PRESENT and asks for greedy gets greedy — the
-        // preset guard only backfills absent fields, it never overrides.
-        let cfg = serde_json::json!({"temperature": 0.0});
-        let d = resolve_sampling_defaults(Some(&cfg), &args(), &preset());
-        assert_eq!(d.temperature, 0.0);
-    }
-
-    #[test]
-    fn sigma_and_min_p_fall_back_to_cli_args() {
-        // top_n_sigma is CLI-owned outright; min_p is CLI-owned only while
-        // the preset stays silent (`min_p: None`), which `preset()` is.
-        let a = args();
-        let d = resolve_sampling_defaults(None, &a, &preset());
-        assert_eq!(d.top_n_sigma, a.default_top_n_sigma);
-        assert_eq!(d.min_p, a.default_min_p);
-    }
-
-    #[test]
-    fn model_declared_min_p_zero_beats_the_cli_default() {
-        // The reason this field exists. A card that specifies min_p = 0 must
-        // get 0, not the server's 0.08 — and 0.0 is exactly the value a
-        // non-Option field could not distinguish from "unset".
-        let a = args();
-        assert!(a.default_min_p > 0.0, "guard: CLI default must be nonzero");
-        let mut p = preset();
-        p.min_p = Some(0.0);
-        let d = resolve_sampling_defaults(None, &a, &p);
-        assert_eq!(d.min_p, 0.0, "model preset must win over --default-min-p");
-    }
-
-    #[test]
-    fn generation_config_still_outranks_a_declared_min_p() {
-        // Same precedence as temperature/top_k/top_p: the checkpoint's own
-        // generation_config.json is the most specific source and wins.
-        let cfg = serde_json::json!({"min_p": 0.31});
-        let mut p = preset();
-        p.min_p = Some(0.0);
-        let d = resolve_sampling_defaults(Some(&cfg), &args(), &p);
-        assert_eq!(d.min_p, 0.31);
-    }
-}
+#[path = "runtime/sampling_defaults_tests.rs"]
+mod sampling_defaults_tests;

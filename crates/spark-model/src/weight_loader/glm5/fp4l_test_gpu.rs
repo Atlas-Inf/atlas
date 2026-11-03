@@ -200,7 +200,10 @@ fn assert_nvfp4_close(
 fn qctx(gpu: &dyn GpuBackend) -> Result<QuantizeCtx> {
     Ok(QuantizeCtx {
         absmax_k: gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?,
-        quantize_k: gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?,
+        quantize_k: gpu.kernel(
+            "quantize_nvfp4",
+            crate::weight_loader::glm5::layers::WEIGHT_QUANTIZER,
+        )?,
         stream: gpu.default_stream(),
     })
 }

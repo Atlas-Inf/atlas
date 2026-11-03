@@ -6,7 +6,7 @@
 use super::*;
 use crate::layers::glm_sp::SpRows;
 use crate::layers::qwen3_attention::{
-    HcNorm, HcSiteWeights, hc_prefill_fuse2_enabled, hc_seam_overlapped,
+    HcNorm, HcSiteWeights, SeamGather, hc_prefill_fuse2_enabled, hc_seam_overlapped,
 };
 
 impl Glm5KdaLayer {
@@ -19,6 +19,8 @@ impl Glm5KdaLayer {
         site: &HcSiteWeights,
         norm_weight: &DenseWeight,
         post_gather: (bool, bool),
+        reduced: bool,
+        extra: Option<SeamGather<'_>>,
         hidden: DevicePtr,
         normed: DevicePtr,
         sp: Option<SpRows>,
@@ -30,6 +32,8 @@ impl Glm5KdaLayer {
             &self.hc,
             site,
             post_gather,
+            reduced,
+            extra,
             hidden,
             normed,
             sp,

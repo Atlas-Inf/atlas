@@ -17,6 +17,10 @@
 //               (glm_moe_decode_stream.cuh; =2 is their gate/up only)
 //   m16s+persist, m32s+persist  ATLAS_GLM_MOE_DECODE_PERSIST=1: the l2pf
 //               twins as persistent kernels, one CTA per SM
+//   a16+persist ATLAS_GLM_FP4L_DECODE_A16: the persistent prefetching twins'
+//               W4A16 kernels (BF16 activations, one, two or four slabs as the
+//               rows need), checked against a host W4A16 reference instead of
+//               the A4 production bytes
 //   read-only   the same weight bytes read once and nothing else: "tables" in
 //               the kernels' grid of static per-expert slices, "chunked" in
 //               64 KB chunks taken in order by all SMs (the DRAM ceiling)
@@ -348,7 +352,7 @@ int main(int argc, char** argv) {
         auto gate_up_w = [&](const Route& rt) {
             moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w<<<dim3(I / 128, bound), 256>>>(
                 d_a, d_as, gate.pp, gate.sp, gate.s2, nullptr, rt.off, rt.sorted, E, I, H, d_prefix,
-                upt.pp, upt.sp, upt.s2, q, q + qb);
+                upt.pp, upt.sp, upt.s2, q, q + qb, nullptr);
         };
         auto down_w = [&](const Route& rt) {
             moe_w4a4_grouped_gemm_prequant_t_k128w_compact<<<dim3(H / 256, bound), 256>>>(
@@ -366,7 +370,7 @@ int main(int argc, char** argv) {
         auto gate_up_m16 = [&](const Route& rt) {
             glm_moe_decode_m16_gate_up_silu_k128w<<<dim3(I / 128, bound16), 256>>>(
                 d_a, d_as, gate.pp, gate.sp, gate.s2, nullptr, rt.off, rt.sorted, E, I, H, d_work16,
-                upt.pp, upt.sp, upt.s2, q, q + qb);
+                upt.pp, upt.sp, upt.s2, q, q + qb, nullptr);
         };
         auto down_m16 = [&](const Route& rt) {
             glm_moe_decode_m16_k128w<<<dim3(H / 256, bound16), 256>>>(
@@ -390,33 +394,37 @@ int main(int argc, char** argv) {
         // pf: the L2 prefetch twins (ATLAS_GLM_MOE_DECODE_L2PF).
         // persist: the persistent prefetching twins (ATLAS_GLM_MOE_DECODE_PERSIST),
         // one CTA per SM.
-        auto gate_up_s = [&](bool m32, bool pf = false, bool persist = false) -> Launch {
-            return [&, m32, pf, persist](const Route& rt) {
+        // m64: the four-slab persistent twins (persist only).
+        auto gate_up_s = [&](bool m32, bool pf = false, bool persist = false, bool m64 = false) -> Launch {
+            return [&, m32, pf, persist, m64](const Route& rt) {
                 const dim3 grid = persist ? dim3(sms) : dim3(I / 128, bound16);
-                (persist ? (m32 ? glm_moe_decode_m32s_gate_up_silu_k128w_l2pf_p : glm_moe_decode_m16s_gate_up_silu_k128w_l2pf_p)
+                (m64 ? glm_moe_decode_m64s_gate_up_silu_k128w_l2pf_p
+                 : persist ? (m32 ? glm_moe_decode_m32s_gate_up_silu_k128w_l2pf_p : glm_moe_decode_m16s_gate_up_silu_k128w_l2pf_p)
                  : m32 ? (pf ? glm_moe_decode_m32s_gate_up_silu_k128w_l2pf : glm_moe_decode_m32s_gate_up_silu_k128w)
                        : (pf ? glm_moe_decode_m16s_gate_up_silu_k128w_l2pf : glm_moe_decode_m16s_gate_up_silu_k128w))
                     <<<grid, 256>>>(d_a, d_as, gate.pp, gate.sp, gate.s2, nullptr, rt.off,
-                    rt.sorted, E, I, H, d_work16, upt.pp, upt.sp, upt.s2, q, q + qb);
+                    rt.sorted, E, I, H, d_work16, upt.pp, upt.sp, upt.s2, q, q + qb, nullptr);
             };
         };
-        auto down_s = [&](bool m32, bool zskip, bool pf = false, bool persist = false) -> Launch {
-            return [&, m32, zskip, pf, persist](const Route& rt) {
+        auto down_s = [&](bool m32, bool zskip, bool pf = false, bool persist = false, bool m64 = false) -> Launch {
+            return [&, m32, zskip, pf, persist, m64](const Route& rt) {
                 decltype(&glm_moe_decode_m16s_k128w) const k[2][2][2] = {   // [m32][zskip][pf]
                     {{glm_moe_decode_m16s_k128w, glm_moe_decode_m16s_k128w_l2pf},
                      {glm_moe_decode_m16s_k128w_zskip, glm_moe_decode_m16s_k128w_zskip_l2pf}},
                     {{glm_moe_decode_m32s_k128w, glm_moe_decode_m32s_k128w_l2pf},
                      {glm_moe_decode_m32s_k128w_zskip, glm_moe_decode_m32s_k128w_zskip_l2pf}}};
                 const dim3 grid = persist ? dim3(sms) : dim3(H / 256, bound16);
-                (persist ? (m32 ? glm_moe_decode_m32s_k128w_zskip_l2pf_p : glm_moe_decode_m16s_k128w_zskip_l2pf_p)
+                (m64 ? glm_moe_decode_m64s_k128w_zskip_l2pf_p
+                 : persist ? (m32 ? glm_moe_decode_m32s_k128w_zskip_l2pf_p : glm_moe_decode_m16s_k128w_zskip_l2pf_p)
                          : k[m32][zskip][pf])<<<grid, 256>>>(q, q + qb, dn.pp, dn.sp, dn.s2, c_down, rt.off,
                     nullptr, E, H, I, d_work16);
             };
         };
-        auto stream_variant = [&](const char* name, bool m32, bool zskip, bool pf = false, bool persist = false) {
+        auto stream_variant = [&](const char* name, bool m32, bool zskip, bool pf = false, bool persist = false,
+                                  bool m64 = false) {
             variants.push_back({name, {
-                {"worklist", prefix16, 0}, {pf ? "gate_up_silu stream pf" : "gate_up_silu stream", gate_up_s(m32, pf, persist), gu_bytes},
-                {zskip ? (pf ? "down stream zskip pf" : "down stream zskip") : "down stream", down_s(m32, zskip, pf, persist),
+                {"worklist", prefix16, 0}, {pf ? "gate_up_silu stream pf" : "gate_up_silu stream", gate_up_s(m32, pf, persist, m64), gu_bytes},
+                {zskip ? (pf ? "down stream zskip pf" : "down stream zskip") : "down stream", down_s(m32, zskip, pf, persist, m64),
                  dn_bytes}, {"unpermute", unperm, 0}}});
         };
         if (max_rows <= 16) {
@@ -431,6 +439,29 @@ int main(int argc, char** argv) {
             stream_variant("m32s+l2pf", true, true, true);
             stream_variant("m32s+persist", true, true, true, true);
         }
+        if (max_rows <= 64) stream_variant("m64s+persist", false, true, true, true, true);
+        // The W4A16 twins over BF16 input rows; their SiLU·mul rows in c_gate.
+        std::vector<__nv_bfloat16> xa((size_t)T * H);
+        for (auto& v : xa) v = __float2bfloat16((r.unit() - 0.5f) * 4.0f);
+        __nv_bfloat16* d_x = up(xa);
+        unsigned char* mid = (unsigned char*)c_gate;
+        auto gate_up_a16 = [&](const Route& rt) {
+            (max_rows <= 16 ? glm_moe_decode_m16s_a16_gate_up_silu_k128w_l2pf_p
+             : max_rows <= 32 ? glm_moe_decode_m32s_a16_gate_up_silu_k128w_l2pf_p
+                              : glm_moe_decode_m64s_a16_gate_up_silu_k128w_l2pf_p)<<<sms, 256>>>(
+                (const unsigned char*)d_x, nullptr, gate.pp, gate.sp, gate.s2, nullptr, rt.off, rt.sorted,
+                E, I, H, d_work16, upt.pp, upt.sp, upt.s2, mid, nullptr, nullptr);
+        };
+        auto down_a16 = [&](const Route& rt) {
+            (max_rows <= 16 ? glm_moe_decode_m16s_a16_k128w_l2pf_p
+             : max_rows <= 32 ? glm_moe_decode_m32s_a16_k128w_l2pf_p
+                              : glm_moe_decode_m64s_a16_k128w_l2pf_p)<<<sms, 256>>>(
+                mid, nullptr, dn.pp, dn.sp, dn.s2, c_down, rt.off, nullptr, E, H, I, d_work16);
+        };
+        if (max_rows <= 64)
+            variants.push_back({"a16+persist", {
+                {"worklist", prefix16, 0}, {"gate_up_silu a16", gate_up_a16, gu_bytes},
+                {"down a16", down_a16, dn_bytes}, {"unpermute", unperm, 0}}});
         // Read-only rooflines over the same weight bytes (timing only): the
         // kernels' grid of static table slices, and the chunked ceiling.
         unsigned* d_roof = dev<unsigned>(1);
@@ -506,6 +537,7 @@ int main(int argc, char** argv) {
                    100.0 * zero / (2.0 * qb * ring), 100.0 * skip / rows_kp);
         }
         for (size_t vi = 1; vi < roofline; ++vi) {
+            if (strncmp(variants[vi].name, "a16", 3) == 0) continue;   // checked below
             size_t bad_q = 0, bad_c = 0, bad_o = 0;
             float diff = 0.f;
             for (unsigned ri = 0; ri < ring; ++ri) {
@@ -521,6 +553,89 @@ int main(int argc, char** argv) {
             printf("  %-12s vs production over %u routes: NVFP4 down-input bytes differing %zu, down bf16 differing %zu, "
                    "layer out bf16 differing %zu (max abs diff %g)\n", variants[vi].name, ring, bad_q, bad_c, bad_o, diff);
             bad_total += (bad_q || bad_c || bad_o);
+        }
+
+        for (size_t vi = 1; vi < variants.size(); ++vi) {
+            if (strncmp(variants[vi].name, "a16", 3) != 0) continue;
+            // The W4A16 twins against a host W4A16 reference on the first
+            // routing: FP64 sums of BF16 inputs times exact dequantized
+            // weights, the BF16 gate/up, clamped SiLU·mul and down roundings
+            // of the kernels. The down is checked on the kernel's own SiLU·mul
+            // rows, so each projection's error is its own.
+            const Route& rt = routes[0];
+            run(variants[vi], rt);
+            const auto got_mid = down((const __nv_bfloat16*)mid, (size_t)TE * I);
+            const auto got_dn = down(c_down, (size_t)TE * H);
+            const auto offs = down(rt.off, E + 1), sorted = down(rt.sorted, TE);
+            auto host_table = [&](const ExpertTable& t, unsigned e, size_t pbytes, size_t sbytes) {
+                const auto pp = down(t.pp, E), sp = down(t.sp, E);
+                return std::make_pair(down((const unsigned char*)pp[e], pbytes),
+                                      down((const unsigned char*)sp[e], sbytes));
+            };
+            auto e4m3 = [](unsigned char b) {
+                const int ex = (b >> 3) & 15, m = b & 7;
+                const double v = ex ? std::ldexp(1.0 + m / 8.0, ex - 7) : std::ldexp(m / 8.0, -6);
+                return b & 0x80 ? -v : v;
+            };
+            static const double e2m1[16] = {0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6};
+            // [N] outputs of one row against the [K/2, N] / [K/16, N] tables.
+            auto gemv = [&](const std::pair<std::vector<unsigned char>, std::vector<unsigned char>>& w,
+                            unsigned n_out, unsigned k, const std::function<float(unsigned)>& x) {
+                std::vector<double> o(n_out, 0.0);
+                for (unsigned kk = 0; kk < k; ++kk) {
+                    const double xv = x(kk);
+                    if (xv == 0.0) continue;
+                    for (unsigned n = 0; n < n_out; ++n) {
+                        const unsigned char b = w.first[(size_t)(kk / 2) * n_out + n];
+                        o[n] += xv * e2m1[kk & 1 ? b >> 4 : b & 15] * e4m3(w.second[(size_t)(kk / 16) * n_out + n]);
+                    }
+                }
+                return o;
+            };
+            const auto s2g = down(gate.s2, E), s2u = down(upt.s2, E), s2d = down(dn.s2, E);
+            auto bf = [](double v) { return __bfloat162float(__float2bfloat16((float)v)); };
+            double mid_err = 0, dn_err = 0;
+            size_t mid_diff = 0, dn_diff = 0;
+            for (unsigned e = 0; e < E; ++e) {
+                if (offs[e + 1] == offs[e]) continue;
+                const auto wg = host_table(gate, e, (size_t)H / 2 * I, (size_t)H / 16 * I);
+                const auto wu = host_table(upt, e, (size_t)H / 2 * I, (size_t)H / 16 * I);
+                const auto wd = host_table(dn, e, (size_t)I / 2 * H, (size_t)I / 16 * H);
+                for (int p = offs[e]; p < offs[e + 1]; ++p) {
+                    const int tok = sorted[p];
+                    auto xin = [&](unsigned kk) { return __bfloat162float(xa[(size_t)tok * H + kk]); };
+                    const auto g = gemv(wg, I, H, xin), u = gemv(wu, I, H, xin);
+                    double peak = 0;
+                    std::vector<double> want(I);
+                    for (unsigned n = 0; n < I; ++n) {
+                        double gv = std::min((double)bf(g[n] * s2g[e]), 10.0);
+                        const double uv = std::min(std::max((double)bf(u[n] * s2u[e]), -10.0), 10.0);
+                        want[n] = bf(gv / (1.0 + std::exp(-gv)) * uv);
+                        peak = std::max(peak, std::fabs(want[n]));
+                    }
+                    for (unsigned n = 0; n < I; ++n) {
+                        const double d = std::fabs(__bfloat162float(got_mid[(size_t)p * I + n]) - want[n]);
+                        mid_diff += d != 0;
+                        mid_err = std::max(mid_err, d / (peak + 1e-30));
+                    }
+                    auto xm = [&](unsigned kk) { return __bfloat162float(got_mid[(size_t)p * I + kk]); };
+                    const auto dv = gemv(wd, H, I, xm);
+                    peak = 0;
+                    for (unsigned n = 0; n < H; ++n) peak = std::max(peak, std::fabs(dv[n] * s2d[e]));
+                    for (unsigned n = 0; n < H; ++n) {
+                        const double d = std::fabs(__bfloat162float(got_dn[(size_t)p * H + n]) - bf(dv[n] * s2d[e]));
+                        dn_diff += d != 0;
+                        dn_err = std::max(dn_err, d / (peak + 1e-30));
+                    }
+                }
+            }
+            // FP32 accumulation in the MMAs' order against FP64: a few BF16
+            // roundings may land one ulp apart (2^-8 of a value), no more.
+            const bool ok = mid_err < 1.0 / 64 && dn_err < 1.0 / 64;
+            printf("  %-12s vs host W4A16 reference: SiLU·mul bf16 differing %zu of %zu (max |diff| / row peak %.2e), "
+                   "down bf16 differing %zu of %zu (%.2e) %s\n", variants[vi].name, mid_diff, (size_t)TE * I, mid_err,
+                   dn_diff, (size_t)TE * H, dn_err, ok ? "ok" : "FAIL");
+            bad_total += !ok;
         }
 
         if (max_rows <= 32) {
@@ -654,7 +769,7 @@ int main(int argc, char** argv) {
         }
         CK(cudaFree(d_prefix)); CK(cudaFree(d_roof)); CK(cudaFree(d_next)); CK(cudaFree(d_work16));
         for (auto& rt : routes) { CK(cudaFree(rt.off)); CK(cudaFree(rt.sorted)); CK(cudaFree(rt.t2p)); CK(cudaFree(rt.ids)); CK(cudaFree(rt.w)); CK(cudaFree(rt.work)); CK(cudaFree(rt.active)); }
-        CK(cudaFree(d_a)); CK(cudaFree(d_as)); CK(cudaFree(c_gate)); CK(cudaFree(c_up)); CK(cudaFree(c_down)); CK(cudaFree(out));
+        CK(cudaFree(d_a)); CK(cudaFree(d_as)); CK(cudaFree(d_x)); CK(cudaFree(c_gate)); CK(cudaFree(c_up)); CK(cudaFree(c_down)); CK(cudaFree(out));
     }
     return bad_total ? 1 : 0;
 }

@@ -4,14 +4,16 @@ use super::*;
 use crate::scheduler::cancel_test_model::{SCRIPT, Script, TestModel, VerifyScript};
 use crate::scheduler::sched_ctx::SchedCtx;
 use crate::scheduler::test_support::test_seq;
+use std::sync::Arc;
 
 #[test]
 fn processed_scores_match_serial_with_history_and_batched_row_offset() {
-    for row_base in [0, 1] {
+    for split in [false, true] {
         for temperature in [0.0, 0.7] {
             let mut row = vec![0.0f32; 2048];
             row[300] = 8.0;
             row[1500] = 7.0;
+            let row_base = usize::from(!split);
             let mut rows = vec![vec![20.0; 2048]; row_base];
             rows.extend([row.clone(), row.clone()]);
             SCRIPT.with(|s| *s.borrow_mut() = Some(Script { rows, cursor: 0 }));
@@ -20,7 +22,7 @@ fn processed_scores_match_serial_with_history_and_batched_row_offset() {
                 host_logits: false,
                 cancel_after_sampling: None,
                 cancel_after_row_commit: None,
-                verify: None,
+                verify: split.then(|| Arc::new(VerifyScript::default())),
             };
             let (mut a, _rx) = test_seq(vec![], 1, None, 8);
             let (mut serial, _serial_rx) = test_seq(vec![], 1, None, 8);
@@ -105,7 +107,6 @@ fn unrequested_scoring_performs_no_model_read_or_pick() {
 }
 
 use crate::scheduler::verify_dflash_step::step_verify_dflash;
-use std::sync::Arc;
 
 fn model(script: Arc<VerifyScript>) -> TestModel {
     TestModel {

@@ -33,15 +33,16 @@ impl Qwen3AttentionLayer {
             return Ok(false);
         }
 
-        if super::super::glm_long_context::enabled(&ctx.config.model_type) {
+        // KV-only writes are also used by native short-context GLM MTP. The
+        // semantic index must follow the actual attached MLA capability, not
+        // the unrelated long-context scheduler toggle.
+        let indexed_glm = mla.glm_indexer.is_some()
+            && kv_cache.sparse_index_config().is_some()
+            && self.kv_dtype == spark_runtime::kv_cache::KvCacheDtype::Bf16;
+        if indexed_glm {
             anyhow::ensure!(
-                crate::speculative::glm_repair_policy::long_lane_enabled()
-                    && !ctx.graph_capture
-                    && !ctx.gpu.stream_is_capturing(stream)
-                    && mla.glm_indexer.is_some()
-                    && kv_cache.sparse_index_config().is_some()
-                    && self.kv_dtype == spark_runtime::kv_cache::KvCacheDtype::Bf16,
-                "GLM long MTP KV writer requires eager repaired BF16 indexed MLA"
+                !ctx.graph_capture && !ctx.gpu.stream_is_capturing(stream),
+                "GLM MTP KV writer requires eager BF16 indexed MLA"
             );
         }
         let n = num_tokens as u32;
@@ -107,7 +108,7 @@ impl Qwen3AttentionLayer {
             stream,
             false,
         )?;
-        if super::super::glm_long_context::enabled(&ctx.config.model_type) {
+        if indexed_glm {
             // The KV-only caller owns explicit slots but intentionally has no
             // attention metadata. Index population consumes only slot + rows.
             let index_ctx = ForwardContext {

@@ -302,6 +302,9 @@ pub struct MoeLayer {
     /// CTAs of the persistent K128W twins when `ATLAS_GLM_MOE_PREFILL_PERSIST=1`
     /// resolved every needed one above, else 0 (row-tile grid only).
     pub(super) k128w_persist_ctas: u32,
+    /// `ATLAS_GLM_MOE_DOWN_E4M3=1` (lossy): the K128W down's E4M3 twins and
+    /// the sparse EP reduce that reads them, when all resolved.
+    pub(super) down_e4m3: Option<super::init_optional::DownE4m3>,
     /// Compact-worklist twins of the prequantized native-FP4 MoE kernel.
     /// Optional and used only for guarded K=5 gate/up verification.
     pub(super) moe_w4a4_prequant_t_k64_compact: KernelHandle,

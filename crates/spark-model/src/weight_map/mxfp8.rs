@@ -77,7 +77,7 @@ impl Mxfp8Weight {
 }
 
 /// UE8M0 scale bytes as f32 multipliers, refusing any that would make the
-/// BF16 expansion inexact (see [`EXACT_E8M0`]; 0xFF is the NaN code).
+/// BF16 expansion inexact (see `EXACT_E8M0`; 0xFF is the NaN code).
 pub(crate) fn mxfp8_scales_f32(scales: &[u8]) -> Result<Vec<f32>> {
     if let Some(at) = scales.iter().position(|e| !EXACT_E8M0.contains(e)) {
         bail!(

@@ -153,11 +153,11 @@ fn alloc(bytes: usize) -> u64 {
 /// A one-shot channel over a fresh pinned region (no NIC).
 fn channel(g: &Gpu, cfg: Config, rails: usize) -> OneShot {
     let (mut host, mut dev) = (std::ptr::null_mut(), 0u64);
-    let bytes = region_bytes(cfg.max);
+    let bytes = region_bytes(cfg.max, 1);
     ck!(cuMemHostAlloc(&mut host, bytes, 0x3));
     unsafe { std::ptr::write_bytes(host.cast::<u8>(), 0, bytes) };
     ck!(cuMemHostGetDevicePointer_v2(&mut dev, host, 0));
-    let os = OneShot::new(cfg, rails, host as usize, dev).unwrap();
+    let os = OneShot::new(cfg, Shape::pair(0, rails), host as usize, dev).unwrap();
     os.set_kernel(g.oneshot);
     os
 }
@@ -180,16 +180,16 @@ enum Peer {
 /// Run the stand-in proxy + peer until `stop`; returns staged-payload
 /// mismatches (bytes of `S` that were not this op's payload).
 fn spawn_peer(os: &OneShot, mode: Peer, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<u64> {
-    let (cfg, rails, host) = (os.cfg, os.rails, os.host);
+    let (cfg, rails, host) = (os.cfg, os.shape.rails[1], os.host);
     std::thread::spawn(move || {
-        let ctrl = host + ctrl_off(cfg.max);
+        let ctrl = host + ctrl_off(cfg.max, 1);
         // SAFETY: the region outlives the thread (joined before it is dropped).
         let stage = unsafe { &*((ctrl + STAGE) as *const AtomicU32) };
         let flag = |r: usize| unsafe { &*((ctrl + FLAGS + 64 * r) as *const AtomicU64) };
         let deliver = |seq: u64, bytes: usize, data: bool| {
             if data {
                 let peer = peer_payload(seq, bytes / 2);
-                let slot = (host + recv_off(cfg.max, (seq & 1) as usize)) as *mut u8;
+                let slot = (host + recv_off(cfg.max, 0, (seq & 1) as usize)) as *mut u8;
                 unsafe { std::ptr::copy_nonoverlapping(bytes_of(&peer).as_ptr(), slot, bytes) };
             }
             let word = match mode {
@@ -332,6 +332,7 @@ fn test_cfg(stripe_min: usize) -> Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
         pdl: std::env::var("ATLAS_RDMA_ONESHOT_PDL").as_deref() != Ok("0"),
+        fused_seg: 0,
     }
 }
 
@@ -459,7 +460,7 @@ fn oneshot_trap_poisons_instead_of_hanging() {
     upload(&g, buf, &local_payload(1, 4096));
     let proxy = Channel::new(os.cfg, os.host, 0);
     // SAFETY: the region outlives the test.
-    let stage = unsafe { &*((os.host + ctrl_off(os.cfg.max) + STAGE) as *const AtomicU32) };
+    let stage = unsafe { &*((os.host + ctrl_off(os.cfg.max, 1) + STAGE) as *const AtomicU32) };
     match fault.as_str() {
         "proxy" => proxy.fail(),
         // An earlier send the proxy never finishes.

@@ -10,7 +10,8 @@
 //! stages. Calls of up to 64 rows (32 a launch) run the
 //! `fp8b_gemv_tc{8,16,32}` tiers, whose row bits do not depend on the launch
 //! width: a decode row equals the same row verified. Longer prefill chunks
-//! run the prefill GEMM `ATLAS_GLM_FP4L_FP8_PREFILL` picks (W8A8 by
+//! (and every row of a packed prefill, which needs one family at every
+//! height) run the prefill GEMM `ATLAS_GLM_FP4L_FP8_PREFILL` picks (W8A8 by
 //! default, NVIDIA's vLLM recipe; W8A16 exact; or the BF16 copy). Unless the
 //! BF16 copy serves prefill, the loader frees it and leaves a unique, never
 //! mapped address as the lookup key: a reader this module does not route
@@ -42,6 +43,9 @@ pub(crate) struct MlaNative {
     pub twins: Vec<(DevicePtr, [usize; 2], Fp8BlockWeight)>,
     /// `None`: no twins (the layer is not native).
     pub prefill: Option<Fp8bPrefill>,
+    /// The whole o_proj over every rank's heads (`ATLAS_GLM_SP_MLA_OPROJ_A2A`,
+    /// `prefill/paged_glm_a2a.rs`).
+    pub o_full: Option<Fp8BlockWeight>,
 }
 
 /// A stand-in key for a freed BF16 MLA weight: 16-byte aligned, non-null and
@@ -57,10 +61,12 @@ impl Qwen3AttentionLayer {
         &mut self,
         twins: Vec<(DevicePtr, [usize; 2], Fp8BlockWeight)>,
         prefill: Fp8bPrefill,
+        o_full: Option<Fp8BlockWeight>,
     ) {
         self.mla_native = MlaNative {
             twins,
             prefill: Some(prefill),
+            o_full,
         };
     }
 
@@ -74,6 +80,14 @@ impl Qwen3AttentionLayer {
             .iter()
             .find(|(key, ..)| *key == weight)
             .map(|(_, nk, w)| (*nk, w))
+    }
+
+    /// This rank's native o_proj twin, with its `[n, k]`.
+    pub(crate) fn mla_native_o_twin(
+        &self,
+        mla: &super::MlaWeights,
+    ) -> Option<([usize; 2], &Fp8BlockWeight)> {
+        self.mla_native_twin(mla.wo.weight)
     }
 
     /// Whether `weight` is served natively (no BF16 kernel may read it).
@@ -105,7 +119,8 @@ impl Qwen3AttentionLayer {
             "GLM MLA native: twin [{tn}, {tk}] for a [{n}, {k}] projection"
         );
         let kernels = ops::native_kernels(ctx.gpu);
-        if m <= NATIVE_GEMV_MAX_ROWS {
+        let packed = crate::layers::glm_packed_scope::active();
+        if m <= NATIVE_GEMV_MAX_ROWS && !packed {
             ops::fp8b_gemv_rows(ctx.gpu, &kernels.fp8b, w, input, output, m, n, k, n, stream)?;
             return Ok(true);
         }
@@ -129,6 +144,52 @@ impl Qwen3AttentionLayer {
         Ok(true)
     }
 
+    /// Whether `weight`'s `m`-row prefill runs the W8A8 block FP8 GEMM, which
+    /// takes its rows already cast ([`Self::mla_native_cast_rows`]).
+    pub(crate) fn mla_native_cast_serves(&self, weight: &DenseWeight, m: usize) -> bool {
+        self.mla_native_twin(weight.weight)
+            .is_some_and(|(_, w)| !w.tiled)
+            && m > NATIVE_GEMV_MAX_ROWS
+            && !crate::layers::glm_packed_scope::active()
+            && self.mla_native.prefill == Some(Fp8bPrefill::W8a8)
+    }
+
+    /// [`Self::mla_native_rows`] of `m` rows already cast for the W8A8
+    /// prefill (`ops::Fp8bRows::Cast`): the GEMM passes the BF16 rows would
+    /// run, on the cast's bytes. Callers check [`Self::mla_native_cast_serves`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn mla_native_cast_rows(
+        &self,
+        ctx: &ForwardContext,
+        weight: &DenseWeight,
+        rows: ops::Fp8bRows,
+        output: DevicePtr,
+        [m, n, k]: [usize; 3],
+        stream: u64,
+    ) -> Result<()> {
+        ensure!(
+            self.mla_native_cast_serves(weight, m),
+            "GLM MLA native: cast rows for a projection the W8A8 prefill does not serve"
+        );
+        let ([tn, tk], w) = self
+            .mla_native_twin(weight.weight)
+            .expect("checked by mla_native_cast_serves");
+        ensure!(
+            [tn, tk] == [n, k],
+            "GLM MLA native: twin [{tn}, {tk}] for a [{n}, {k}] projection"
+        );
+        ops::fp8b_w8a8_gemm(
+            ctx.gpu,
+            &ops::native_kernels(ctx.gpu),
+            ops::Fp8ActScratch::of(ctx.buffers),
+            w,
+            rows,
+            output,
+            [m, n, k],
+            stream,
+        )
+    }
+
     /// q_a and kv_a of the same `m` rows of `input` (`[m, k]`) in one
     /// `fp8b_gemv_tc*_multi` launch (each CTA its own projection's tier body:
     /// the same words as two launches); `false`, nothing launched, unless both
@@ -149,7 +210,10 @@ impl Qwen3AttentionLayer {
         ) else {
             return Ok(false);
         };
-        if m as usize > NATIVE_GEMV_MAX_ROWS || a.tiled != b.tiled {
+        if m as usize > NATIVE_GEMV_MAX_ROWS
+            || crate::layers::glm_packed_scope::active()
+            || a.tiled != b.tiled
+        {
             return Ok(false);
         }
         ensure!(

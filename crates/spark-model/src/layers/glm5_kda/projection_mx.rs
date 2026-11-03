@@ -159,4 +159,14 @@ impl Glm5KdaLayer {
     pub(in crate::layers::glm5_kda) fn has_mxfp8_projections(&self) -> bool {
         self.weights.q_proj.mxfp8.is_some()
     }
+
+    /// Whether Q, K and V each take the W8A8 prefill GEMM of `normed`'s one
+    /// MXFP8 image (`try_project_w8a8`).
+    pub(in crate::layers::glm5_kda) fn qkv_w8a8(&self) -> bool {
+        let w = &self.weights;
+        self.mx_quant_k.0 != 0
+            && [&w.q_proj, &w.k_proj, &w.v_proj]
+                .iter()
+                .all(|p| p.w8a8.is_some())
+    }
 }

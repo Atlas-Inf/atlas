@@ -67,30 +67,36 @@ fn a_single_sequence_swaps_candidate_lists_where_it_swapped_logits() {
         g.bytes(Swap::Candidates),
         ops::dflash2_selector_lists_bytes(g.gamma)
     );
-    // The same plan at a sequence's rows; a batched propose swaps logits.
+    // The same plan at a sequence's rows; a batched propose swaps its B
+    // sequences' lists, one block a sequence.
     assert!(g.with_rows(g.gamma).topk);
     let batched = g.with_rows(2 * g.gamma);
-    assert!(!batched.topk);
-    assert!(batched.swaps().contains(&Swap::Logits));
-    assert!(!batched.swaps().contains(&Swap::Candidates));
+    assert!(batched.topk);
+    assert!(!batched.swaps().contains(&Swap::Logits));
+    assert_eq!(
+        batched.bytes(Swap::Candidates),
+        2 * ops::dflash2_selector_lists_bytes(g.gamma)
+    );
+    // Rows that are not whole sequences keep the logits.
+    assert!(!g.with_rows(g.gamma + 1).topk);
 }
 
 #[test]
 fn the_worker_lists_reach_the_head_and_nothing_else_moves() {
     let g = topk(ALL);
     let (mut r0, mut r1) = (Rank::new(g), Rank::new(g));
-    r0.split.topk = Some(TopkSelect::new(g.gamma, false, &r0.gpu).unwrap());
-    r1.split.topk = Some(TopkSelect::new(g.gamma, true, &r1.gpu).unwrap());
+    r0.split.topk = Some(TopkSelect::new(g.gamma, g.gamma, false, 2, &r0.gpu).unwrap());
+    r1.split.topk = Some(TopkSelect::new(g.gamma, g.gamma, true, 2, &r1.gpu).unwrap());
     let (p0, p1) = (Pair::new(&r0.gpu, 0), Pair::new(&r1.gpu, 1));
     let bytes = g.bytes(Swap::Candidates);
-    let lists = |r: &Rank| {
+    let lists = |r: &Rank, rank: usize| {
         r.split
             .topk
             .as_ref()
-            .map(|t| (t.lists, t.lists_peer))
+            .map(|t| (t.lists.of(rank), t.lists.of(1)))
             .unwrap()
     };
-    let ((own0, peer0), (own1, _)) = (lists(&r0), lists(&r1));
+    let ((own0, peer0), (own1, _)) = (lists(&r0, 0), lists(&r1, 1));
     r0.fill(own0, bytes, 0x61);
     r1.fill(own1, bytes, 0x62);
     let (head_own, worker_own) = (r0.read(own0, bytes), r1.read(own1, bytes));
@@ -122,7 +128,7 @@ fn the_worker_lists_reach_the_head_and_nothing_else_moves() {
 fn each_rank_reduces_its_own_share_of_the_logits() {
     let g = topk(ALL);
     let mut r = Rank::new(g);
-    r.split.topk = Some(TopkSelect::new(g.gamma, false, &r.gpu).unwrap());
+    r.split.topk = Some(TopkSelect::new(g.gamma, g.gamma, false, 2, &r.gpu).unwrap());
     r.split.begin(g.gamma, CtxRows::default()).unwrap();
     for rank in 0..2 {
         let before = r.gpu.launches_snapshot().len();
@@ -139,4 +145,32 @@ fn each_rank_reduces_its_own_share_of_the_logits() {
             "rank {rank}"
         );
     }
+}
+
+#[test]
+fn a_batched_propose_reduces_each_sequence_into_its_own_block() {
+    let g = topk(ALL);
+    let mut r = Rank::with_capacity(g, 3 * g.gamma);
+    let t = TopkSelect::new(g.gamma, 3 * g.gamma, false, 2, &r.gpu).unwrap();
+    let blocks: Vec<_> = (0..3)
+        .map(|s| match t.sequence(s) {
+            ops::SelectorLists::Pair([own, _]) => own,
+            other => panic!("the pair walks two lists, not {other:?}"),
+        })
+        .collect();
+    r.split.topk = Some(t);
+    r.split.begin(3 * g.gamma, CtxRows::default()).unwrap();
+    let before = r.gpu.launches_snapshot().len();
+    r.split.topk_piece(0, &r.gpu, 0).unwrap();
+    let launches = r.gpu.launches_snapshot();
+    // One top-k launch a sequence, each at a sequence's rows.
+    assert_eq!(launches.len(), before + 3);
+    assert!(
+        launches[before..]
+            .iter()
+            .all(|l| l.grid[1] == g.gamma as u32)
+    );
+    let lists = ops::dflash2_selector_lists_bytes(g.gamma) as u64;
+    assert_eq!(blocks[1].0 - blocks[0].0, lists);
+    assert_eq!(blocks[2].0 - blocks[1].0, lists);
 }

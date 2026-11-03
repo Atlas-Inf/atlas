@@ -71,6 +71,10 @@ impl GlmVisionEncoder {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<Vec<(usize, usize, usize)>> {
+        ensure!(
+            self.encodes,
+            "this rank receives vision rows from rank 0 and holds no vision weights"
+        );
         let mut sequences = Vec::new();
         for item in items {
             ensure!(
@@ -140,6 +144,9 @@ impl GlmVisionEncoder {
         Ok(out)
     }
 
+    /// One attention sequence into `output`. Attention reads the whole
+    /// sequence's Q/K/V; the token-local stages around it (patch embed, the
+    /// block MLPs, the merger) run in `row_chunk`-row launches.
     fn forward_sequence(
         &self,
         pixels: &[f32],
@@ -150,29 +157,35 @@ impl GlmVisionEncoder {
         stream: u64,
     ) -> Result<()> {
         let patches = grid_h * grid_w;
-        // SAFETY: reinterpreting a live `&[f32]` as its exact byte span; u8 has
-        // alignment 1.
-        let pixel_bytes =
-            unsafe { std::slice::from_raw_parts(pixels.as_ptr() as *const u8, pixels.len() * 4) };
-        gpu.copy_h2d_async(pixel_bytes, self.buf_f32, stream)?;
-        KernelLaunch::new(gpu, self.k_f32_bf16)
-            .grid([div_ceil((patches * self.patch_dim) as u32, 256), 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(self.buf_f32)
-            .arg_ptr(self.buf_pixels)
-            .arg_u32((patches * self.patch_dim) as u32)
-            .launch(stream)?;
-        self.gemm_bias(
-            gpu,
-            self.buf_pixels,
-            self.patch_embed_w,
-            self.patch_embed_b,
-            self.buf_h1,
-            patches,
-            self.hidden_size,
-            self.patch_dim,
-            stream,
-        )?;
+        let (hidden, row) = (self.hidden_size, |rows: usize, width: usize| {
+            rows * width * 2
+        });
+        for (start, rows) in chunks(patches, self.row_chunk) {
+            let span = &pixels[start * self.patch_dim..(start + rows) * self.patch_dim];
+            // SAFETY: reinterpreting a live `&[f32]` as its exact byte span;
+            // u8 has alignment 1.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(span.as_ptr() as *const u8, span.len() * 4) };
+            gpu.copy_h2d_async(bytes, self.buf_f32, stream)?;
+            KernelLaunch::new(gpu, self.k_f32_bf16)
+                .grid([div_ceil((rows * self.patch_dim) as u32, 256), 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(self.buf_f32)
+                .arg_ptr(self.buf_pixels)
+                .arg_u32((rows * self.patch_dim) as u32)
+                .launch(stream)?;
+            self.gemm_bias(
+                gpu,
+                self.buf_pixels,
+                self.patch_embed_w,
+                self.patch_embed_b,
+                self.buf_h1.offset(row(start, hidden)),
+                rows,
+                hidden,
+                self.patch_dim,
+                stream,
+            )?;
+        }
         let (cos, sin) = rope_table(grid_h, grid_w, self.head_dim);
         gpu.copy_h2d_async(&cos, self.buf_rope_cos, stream)?;
         gpu.copy_h2d_async(&sin, self.buf_rope_sin, stream)?;
@@ -183,7 +196,7 @@ impl GlmVisionEncoder {
                 block.norm1_w,
                 self.buf_norm,
                 patches,
-                self.hidden_size,
+                hidden,
                 stream,
             )?;
             self.gemm_bias(
@@ -193,10 +206,12 @@ impl GlmVisionEncoder {
                 block.qkv_b,
                 self.buf_wide,
                 patches,
-                3 * self.hidden_size,
-                self.hidden_size,
+                3 * hidden,
+                hidden,
                 stream,
             )?;
+            // The norm is consumed: attention writes there, and its
+            // projection lands in the consumed QKV.
             self.attention(
                 gpu,
                 self.buf_wide,
@@ -204,74 +219,67 @@ impl GlmVisionEncoder {
                 block.k_norm_w,
                 self.buf_rope_cos,
                 self.buf_rope_sin,
-                self.buf_attn,
+                self.buf_norm,
                 patches,
                 stream,
             )?;
             self.gemm_bias(
                 gpu,
-                self.buf_attn,
+                self.buf_norm,
                 block.proj_w,
                 block.proj_b,
-                self.buf_norm,
+                self.buf_wide,
                 patches,
-                self.hidden_size,
-                self.hidden_size,
+                hidden,
+                hidden,
                 stream,
             )?;
-            self.add(
-                gpu,
-                self.buf_h1,
-                self.buf_norm,
-                patches * self.hidden_size,
-                stream,
-            )?;
+            self.add(gpu, self.buf_h1, self.buf_wide, patches * hidden, stream)?;
             self.rms_norm(
                 gpu,
                 self.buf_h1,
                 block.norm2_w,
                 self.buf_norm,
                 patches,
-                self.hidden_size,
+                hidden,
                 stream,
             )?;
-            self.gemm_bias(
-                gpu,
-                self.buf_norm,
-                block.gate_up_w,
-                block.gate_up_b,
-                self.buf_wide,
-                patches,
-                2 * self.intermediate_size,
-                self.hidden_size,
-                stream,
-            )?;
-            self.swiglu(
-                gpu,
-                self.buf_wide,
-                self.buf_act,
-                patches,
-                self.intermediate_size,
-                stream,
-            )?;
-            self.gemm_bias(
-                gpu,
-                self.buf_act,
-                block.down_w,
-                block.down_b,
-                self.buf_norm,
-                patches,
-                self.hidden_size,
-                self.intermediate_size,
-                stream,
-            )?;
-            self.add(
-                gpu,
-                self.buf_h1,
-                self.buf_norm,
-                patches * self.hidden_size,
-                stream,
-            )?;
+            // Each chunk's down projection overwrites the norm rows its own
+            // gate/up already read.
+            for (start, rows) in chunks(patches, self.row_chunk) {
+                let norm = self.buf_norm.offset(row(start, hidden));
+                self.gemm_bias(
+                    gpu,
+                    norm,
+                    block.gate_up_w,
+                    block.gate_up_b,
+                    self.buf_wide,
+                    rows,
+                    2 * self.intermediate_size,
+                    hidden,
+                    stream,
+                )?;
+                self.swiglu(
+                    gpu,
+                    self.buf_wide,
+                    self.buf_act,
+                    rows,
+                    self.intermediate_size,
+                    stream,
+                )?;
+                self.gemm_bias(
+                    gpu,
+                    self.buf_act,
+                    block.down_w,
+                    block.down_b,
+                    norm,
+                    rows,
+                    hidden,
+                    self.intermediate_size,
+                    stream,
+                )?;
+            }
+            self.add(gpu, self.buf_h1, self.buf_norm, patches * hidden, stream)?;
         }
         self.rms_norm(
             gpu,
@@ -279,68 +287,80 @@ impl GlmVisionEncoder {
             self.post_layernorm_w,
             self.buf_norm,
             patches,
-            self.hidden_size,
+            hidden,
             stream,
         )?;
+        // Merged rows are spatial-merge blocks of four consecutive patch
+        // rows (`rope_table`'s order), so the merger chunks by blocks.
         let merged = (grid_h / 2) * (grid_w / 2);
-        self.conv2d(
-            gpu,
-            self.buf_norm,
-            self.buf_wide,
-            self.buf_conv,
-            grid_h,
-            grid_w,
-            stream,
-        )?;
-        self.gemm(
-            gpu,
-            self.buf_conv,
-            self.merger.proj_w,
-            self.buf_merger,
-            merged,
-            self.out_hidden_size,
-            self.out_hidden_size,
-            stream,
-        )?;
-        self.layer_norm(
-            gpu,
-            self.buf_merger,
-            self.merger.post_norm_w,
-            self.merger.post_norm_b,
-            merged,
-            self.out_hidden_size,
-            stream,
-        )?;
-        self.gelu(gpu, self.buf_merger, merged * self.out_hidden_size, stream)?;
-        self.gemm(
-            gpu,
-            self.buf_merger,
-            self.merger.gate_up_w,
-            self.buf_wide,
-            merged,
-            2 * self.projection_intermediate_size,
-            self.out_hidden_size,
-            stream,
-        )?;
-        self.swiglu(
-            gpu,
-            self.buf_wide,
-            self.buf_act,
-            merged,
-            self.projection_intermediate_size,
-            stream,
-        )?;
-        self.gemm(
-            gpu,
-            self.buf_act,
-            self.merger.down_w,
-            output,
-            merged,
-            self.out_hidden_size,
-            self.projection_intermediate_size,
-            stream,
-        )
+        let out_hidden = self.out_hidden_size;
+        for (start, rows) in chunks(merged, super::merged_chunk(self.row_chunk)) {
+            self.conv2d(
+                gpu,
+                self.buf_norm.offset(row(4 * start, hidden)),
+                self.buf_wide,
+                self.buf_conv,
+                rows,
+                stream,
+            )?;
+            self.gemm(
+                gpu,
+                self.buf_conv,
+                self.merger.proj_w,
+                self.buf_merger,
+                rows,
+                out_hidden,
+                out_hidden,
+                stream,
+            )?;
+            self.layer_norm(
+                gpu,
+                self.buf_merger,
+                self.merger.post_norm_w,
+                self.merger.post_norm_b,
+                rows,
+                out_hidden,
+                stream,
+            )?;
+            self.gelu(gpu, self.buf_merger, rows * out_hidden, stream)?;
+            self.gemm(
+                gpu,
+                self.buf_merger,
+                self.merger.gate_up_w,
+                self.buf_wide,
+                rows,
+                2 * self.projection_intermediate_size,
+                out_hidden,
+                stream,
+            )?;
+            self.swiglu(
+                gpu,
+                self.buf_wide,
+                self.buf_act,
+                rows,
+                self.projection_intermediate_size,
+                stream,
+            )?;
+            self.gemm(
+                gpu,
+                self.buf_act,
+                self.merger.down_w,
+                output.offset(row(start, out_hidden)),
+                rows,
+                out_hidden,
+                self.projection_intermediate_size,
+                stream,
+            )?;
+        }
+        Ok(())
     }
+}
+
+/// `(start, len)` row spans of at most `chunk` rows covering `rows`.
+fn chunks(rows: usize, chunk: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..rows)
+        .step_by(chunk)
+        .map(move |start| (start, chunk.min(rows - start)))
 }
 
 #[cfg(test)]

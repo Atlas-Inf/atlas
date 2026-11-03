@@ -12,7 +12,25 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::Ordering;
 
+/// The capturable collectives' kernel for `world_size` ranks (module
+/// `rdma_oneshot`): `rdma_oneshot_bf16` for two, `rdma_chain_bf16` beyond.
+pub(super) fn oneshot_kernel_name(world_size: usize) -> &'static str {
+    if world_size > 2 {
+        "rdma_chain_bf16"
+    } else {
+        "rdma_oneshot_bf16"
+    }
+}
+
 impl NcclBackend {
+    /// The one-shot channel (`rdma_pair::oneshot`) of the RDMA pair or chain,
+    /// when `ATLAS_RDMA_ONESHOT=1`.
+    #[cfg(atlas_rdma_verbs)]
+    pub(super) fn oneshot(&self) -> Option<&rdma_pair::OneShot> {
+        let pair = self.rdma.as_ref().and_then(|r| r.oneshot());
+        pair.or_else(|| self.chain.as_ref().map(|c| c.oneshot()))
+    }
+
     /// `dst[i] += src[i]` over `count` BF16 values on `stream`.
     pub(super) fn launch_add(&self, dst: u64, src: u64, count: usize, stream: u64) -> Result<()> {
         let kernel = self.add_kernel.load(Ordering::Relaxed);
@@ -119,47 +137,68 @@ impl NcclBackend {
     /// Largest one-shot payload (0 when the channel is unavailable).
     pub(super) fn oneshot_max_bytes(&self) -> usize {
         #[cfg(atlas_rdma_verbs)]
-        if let Some(oneshot) = self.rdma.as_ref().and_then(|r| r.oneshot()) {
+        if let Some(oneshot) = self.oneshot() {
             return oneshot.max_bytes();
         }
         0
     }
 
-    /// Provide `rdma_oneshot_bf16` to the one-shot channel, if it is up.
+    /// Provide the one-shot kernel ([`oneshot_kernel_name`]) to the channel,
+    /// if it is up.
     pub(super) fn set_oneshot_kernel_handle(&self, handle: u64) {
         #[cfg(atlas_rdma_verbs)]
         if let Some(oneshot) = self.rdma.as_ref().and_then(|r| r.oneshot()) {
             oneshot.set_kernel(handle);
             tracing::info!("RDMA one-shot kernel set (graph-capturable collectives enabled)");
+        } else if let Some(chain) = &self.chain {
+            for oneshot in chain.channels() {
+                oneshot.set_kernel(handle);
+            }
+            tracing::info!(
+                "RDMA chain one-shot kernel set on {} channel(s)",
+                chain.channels().len()
+            );
         }
         let _ = handle;
     }
 
-    /// Why the one-shot channel stopped (the peer never arrived, the ranks
+    /// Why the one-shot channel stopped (a peer never arrived, the ranks
     /// diverged, or the host could no longer serve it), if it did.
     pub fn oneshot_poisoned(&self) -> Option<String> {
         #[cfg(atlas_rdma_verbs)]
         if let Some(oneshot) = self.rdma.as_ref().and_then(|r| r.oneshot()) {
             return oneshot.poisoned();
         }
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(chain) = &self.chain {
+            return chain.channels().iter().find_map(|o| o.poisoned());
+        }
         None
     }
 
-    /// The RDMA pair's host command ring, when `ATLAS_GLM_CMD_RDMA=1` (see
-    /// `rdma_pair::cmd_ring`): the words a message may carry, else 0.
+    /// The host command ring of the RDMA pair or chain, when
+    /// `ATLAS_GLM_CMD_RDMA=1` (see `rdma_pair::cmd_ring`): the words a
+    /// message may carry, else 0.
     pub(super) fn cmd_ring_max_words(&self) -> usize {
         #[cfg(atlas_rdma_verbs)]
-        if self.rdma.as_ref().and_then(|r| r.cmd()).is_some() {
+        if self.rdma.as_ref().and_then(|r| r.cmd()).is_some()
+            || self.chain.as_ref().and_then(|c| c.cmd()).is_some()
+        {
             return rdma_pair::cmd_ring::MAX_WORDS;
         }
         0
     }
 
-    /// Send `words` to the peer over the command ring.
+    /// Send `words` to the peer (on a chain: down the chain) over the
+    /// command ring.
     pub(super) fn cmd_ring_send(&self, words: &[u32]) -> Result<()> {
         #[cfg(atlas_rdma_verbs)]
         if let Some(ring) = self.rdma.as_ref().and_then(|r| r.cmd()) {
             return ring.send(words);
+        }
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(chain) = &self.chain {
+            return chain.send_command_words(words);
         }
         anyhow::bail!(
             "no command ring for {} command words (ATLAS_GLM_CMD_RDMA)",
@@ -167,11 +206,16 @@ impl NcclBackend {
         )
     }
 
-    /// Receive the peer's next `words.len()` words from the command ring.
+    /// Receive the peer's next `words.len()` words from the command ring (on
+    /// a chain also passing them on to the rank above).
     pub(super) fn cmd_ring_recv(&self, words: &mut [u32]) -> Result<()> {
         #[cfg(atlas_rdma_verbs)]
         if let Some(ring) = self.rdma.as_ref().and_then(|r| r.cmd()) {
             return ring.recv(words);
+        }
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(chain) = &self.chain {
+            return chain.recv_command_words(words);
         }
         anyhow::bail!(
             "no command ring for {} command words (ATLAS_GLM_CMD_RDMA)",
@@ -216,7 +260,7 @@ impl NcclBackend {
                 recv_capacity.next_multiple_of(64),
             )?)
         } else {
-            if rdma_pair::cmd_ring::requested() {
+            if world_size == 2 && rdma_pair::cmd_ring::requested() {
                 tracing::warn!(
                     "ATLAS_GLM_CMD_RDMA=1 needs the RDMA pair (two ranks, ATLAS_RDMA_ALLREDUCE=1): \
                      command words stay on NCCL broadcasts"

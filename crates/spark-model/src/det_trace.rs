@@ -42,6 +42,11 @@
 //! `ATLAS_GLM_DET_FINITE=1` adds NaN/infinity counts and the first bad element
 //! for known BF16/FP32 stages, with an additional host read. Integer stages
 //! remain hash-only. Unset, the taps return on one cached flag.
+//!
+//! A DFlash verify block is traced too, as the chunk at its first row's
+//! position: per layer its MLA prefill taps and `v_out` (the layer's output
+//! rows), then `v_final` (normed hidden) and, where the whole vocab head runs
+//! here, `v_logits`.
 
 #[path = "det_trace_finite.rs"]
 mod finite;

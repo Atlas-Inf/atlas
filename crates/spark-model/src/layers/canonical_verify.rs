@@ -40,7 +40,9 @@
 //! these templates fix every other step of a row's sum (warp chunking,
 //! prefetch, cross-warp order) independently of the row count and the row's
 //! slot, so rows 1..32 come out bit-identical
-//! (`canonical_verify_gpu_tests.rs`). The family needs `ATLAS_W4A16_TC=1`
+//! (`canonical_verify_gpu_tests.rs`). Wider batches (the TP4 chain's owner
+//! verify of up to 64 rows) run as launches of at most [`LAUNCH_ROWS`] rows,
+//! each row in a launch of the same family, so they keep that contract. The family needs `ATLAS_W4A16_TC=1`
 //! (the tensor-core tiers); without it the switch is inert. Both ranks must
 //! run the same value (`model::startup_parity`): the shared expert's TP split
 //! follows it.
@@ -51,8 +53,20 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use super::ops;
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 
-/// Widest row count of one canonical launch (an owner-batched verify).
-pub const MAX_ROWS: u32 = 32;
+/// Widest batch the canonical kernels serve: an owner-batched verify
+/// (`glm_long_owner::MAX_ROWS`).
+pub const MAX_ROWS: u32 = crate::layer::glm_long_owner::MAX_ROWS as u32;
+
+/// Widest row count of one canonical launch (the tiers' four 8-row tiles).
+pub const LAUNCH_ROWS: u32 = 32;
+
+/// `(first row, rows)` of the launches serving `m` rows: at most
+/// [`LAUNCH_ROWS`] each.
+fn launches(m: u32) -> impl Iterator<Item = (u32, u32)> {
+    (0..m)
+        .step_by(LAUNCH_ROWS as usize)
+        .map(move |first| (first, (m - first).min(LAUNCH_ROWS)))
+}
 
 /// `ATLAS_GLM_CANONICAL_VERIFY` as set: anything but `0` is on. Read once.
 pub fn requested() -> bool {
@@ -66,8 +80,8 @@ pub fn enabled() -> bool {
 }
 
 /// `C[m, n] = A[m, k] · W[n, k]ᵀ` (NVFP4 `W`) on the canonical tensor-core
-/// tier (`w4a16_gemv_tc8`, 1..=32 rows), through its PDL touch twin when that
-/// is armed (`ATLAS_GLM_DECODE_GEMV_BATCH`, same body).
+/// tier (`w4a16_gemv_tc8`, 1..=[`LAUNCH_ROWS`] rows a launch), through its PDL
+/// touch twin when that is armed (`ATLAS_GLM_DECODE_GEMV_BATCH`, same body).
 #[allow(clippy::too_many_arguments)]
 pub fn w4a16(
     gpu: &dyn GpuBackend,
@@ -79,18 +93,31 @@ pub fn w4a16(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    let tier = super::w4a16_gemv_tiers::tc_kernel(m);
     ensure!(
-        (1..=MAX_ROWS).contains(&m) && tier.0 != 0,
+        (1..=MAX_ROWS).contains(&m),
         "canonical W4A16 GEMV: no tensor-core tier for {m} rows"
     );
-    let touch = super::w4a16_gemv_tiers::tc_rows(tier)
-        .and_then(ops::w4a16_tc_twin)
-        .and_then(ops::gemv_touch);
-    match touch {
-        Some(touch) => touch.w4a16_tc(gpu, input, weight, output, m, n, k, k / 2, k / 16, stream),
-        None => ops::w4a16_gemv_batchm(gpu, tier, input, weight, output, m, n, k, stream),
+    for (first, m) in launches(m) {
+        let tier = super::w4a16_gemv_tiers::tc_kernel(m);
+        ensure!(
+            tier.0 != 0,
+            "canonical W4A16 GEMV: no tensor-core tier for {m} rows"
+        );
+        let (input, output) = (
+            input.offset((first * k) as usize * 2),
+            output.offset((first * n) as usize * 2),
+        );
+        let touch = super::w4a16_gemv_tiers::tc_rows(tier)
+            .and_then(ops::w4a16_tc_twin)
+            .and_then(ops::gemv_touch);
+        match touch {
+            Some(touch) => {
+                touch.w4a16_tc(gpu, input, weight, output, m, n, k, k / 2, k / 16, stream)?
+            }
+            None => ops::w4a16_gemv_batchm(gpu, tier, input, weight, output, m, n, k, stream)?,
+        }
     }
+    Ok(())
 }
 
 /// The canonical BF16 tensor-core GEMV tier for `m` rows
@@ -115,7 +142,7 @@ fn dense_tier(gpu: &dyn GpuBackend, m: u32, suffix: &str) -> KernelHandle {
     match m {
         1..=8 => tiers[twin][0],
         9..=16 => tiers[twin][1],
-        17..=MAX_ROWS => tiers[twin][2],
+        17..=LAUNCH_ROWS => tiers[twin][2],
         _ => KernelHandle(0),
     }
 }
@@ -124,7 +151,8 @@ fn dense_tier(gpu: &dyn GpuBackend, m: u32, suffix: &str) -> KernelHandle {
 /// the plain tiers with FP32 output (the MoE router's FP32 logits).
 const DENSE_TWINS: [&str; 4] = ["", "_grouped", "_planes", "_f32"];
 
-/// The canonical BF16 tensor-core GEMV tier for `m` rows, or a zero handle.
+/// The canonical BF16 tensor-core GEMV tier for `m` rows (one launch, at
+/// most [`LAUNCH_ROWS`]), or a zero handle.
 pub fn dense_kernel(gpu: &dyn GpuBackend, m: u32) -> KernelHandle {
     dense_tier(gpu, m, "")
 }
@@ -146,6 +174,7 @@ pub fn dense(
     dense_out(
         gpu,
         "",
+        2,
         input,
         weight,
         output,
@@ -171,6 +200,7 @@ pub fn dense_f32(
     dense_out(
         gpu,
         "_f32",
+        4,
         input,
         weight,
         output,
@@ -179,24 +209,37 @@ pub fn dense_f32(
     )
 }
 
-/// [`dense`] on the `twin` tiers.
+/// [`dense`] on the `twin` tiers, whose output elements are `out_bytes` wide.
+#[allow(clippy::too_many_arguments)]
 fn dense_out(
     gpu: &dyn GpuBackend,
     twin: &str,
+    out_bytes: usize,
     input: DevicePtr,
     weight: &DenseWeight,
     output: DevicePtr,
     [m, n, k, out_stride]: [u32; 4],
     stream: u64,
 ) -> Result<()> {
-    let tier = dense_tier(gpu, m, twin);
     ensure!(
-        tier.0 != 0 && k.is_multiple_of(8),
-        "canonical BF16 GEMV: no tensor-core tier{twin} for {m} rows (k={k})"
+        (1..=MAX_ROWS).contains(&m),
+        "canonical BF16 GEMV: no tensor-core tier for {m} rows (k={k})"
     );
-    ops::dense_gemv_bf16_tc(
-        gpu, tier, input, weight, output, m, n, k, out_stride, stream,
-    )
+    for (first, m) in launches(m) {
+        let tier = dense_tier(gpu, m, twin);
+        ensure!(
+            tier.0 != 0 && k.is_multiple_of(8),
+            "canonical BF16 GEMV: no tensor-core tier{twin} for {m} rows (k={k})"
+        );
+        let (input, output) = (
+            input.offset((first * k) as usize * 2),
+            output.offset((first * out_stride) as usize * out_bytes),
+        );
+        ops::dense_gemv_bf16_tc(
+            gpu, tier, input, weight, output, m, n, k, out_stride, stream,
+        )?;
+    }
+    Ok(())
 }
 
 /// Per-head `c[:, h*n..] = a[:, h*k..] · W[h]ᵀ` over `g` heads of a BF16
@@ -212,23 +255,30 @@ pub fn dense_grouped(
     [m, g, k, n, a_stride, c_stride]: [u32; 6],
     stream: u64,
 ) -> Result<()> {
-    let tier = dense_tier(gpu, m, "_grouped");
     ensure!(
-        tier.0 != 0 && k.is_multiple_of(8) && a_stride.is_multiple_of(8),
+        (1..=MAX_ROWS).contains(&m),
         "canonical grouped BF16 GEMV: no tier for {m} rows (k={k}, lda={a_stride})"
     );
-    spark_runtime::kernel_args::KernelLaunch::new(gpu, tier)
-        .grid([n.div_ceil(16), 1, g])
-        .block([256, 1, 1])
-        .arg_ptr(a)
-        .arg_ptr(weight)
-        .arg_ptr(c)
-        .arg_u32(m)
-        .arg_u32(n)
-        .arg_u32(k)
-        .arg_u32(a_stride)
-        .arg_u32(c_stride)
-        .launch(stream)
+    for (first, m) in launches(m) {
+        let tier = dense_tier(gpu, m, "_grouped");
+        ensure!(
+            tier.0 != 0 && k.is_multiple_of(8) && a_stride.is_multiple_of(8),
+            "canonical grouped BF16 GEMV: no tier for {m} rows (k={k}, lda={a_stride})"
+        );
+        spark_runtime::kernel_args::KernelLaunch::new(gpu, tier)
+            .grid([n.div_ceil(16), 1, g])
+            .block([256, 1, 1])
+            .arg_ptr(a.offset((first * a_stride) as usize * 2))
+            .arg_ptr(weight)
+            .arg_ptr(c.offset((first * c_stride) as usize * 2))
+            .arg_u32(m)
+            .arg_u32(n)
+            .arg_u32(k)
+            .arg_u32(a_stride)
+            .arg_u32(c_stride)
+            .launch(stream)?;
+    }
+    Ok(())
 }
 
 /// Up to three BF16 projections `out_z [m, n_z] = in_z [m, k_z] · W_z ᵀ` in
@@ -240,39 +290,55 @@ pub fn dense_planes(
     m: u32,
     stream: u64,
 ) -> Result<()> {
-    let tier = dense_tier(gpu, m, "_planes");
     ensure!(
-        tier.0 != 0
-            && (1..=3).contains(&planes.len())
-            && planes.iter().all(|&(.., k)| k.is_multiple_of(8)),
+        (1..=MAX_ROWS).contains(&m) && (1..=3).contains(&planes.len()),
         "canonical BF16 planes GEMV: no tier for {m} rows or {} planes",
         planes.len()
     );
-    let plane = |i: usize| planes[i.min(planes.len() - 1)];
-    let grid_x = planes
-        .iter()
-        .map(|&(_, _, _, n, _)| n.div_ceil(16))
-        .max()
-        .unwrap_or(0);
-    let mut launch = spark_runtime::kernel_args::KernelLaunch::new(gpu, tier)
-        .grid([grid_x, 1, planes.len() as u32])
-        .block([256, 1, 1]);
-    for i in 0..3 {
-        launch = launch.arg_ptr(plane(i).0);
+    for (first, m) in launches(m) {
+        let tier = dense_tier(gpu, m, "_planes");
+        ensure!(
+            tier.0 != 0 && planes.iter().all(|&(.., k)| k.is_multiple_of(8)),
+            "canonical BF16 planes GEMV: no tier for {m} rows or {} planes",
+            planes.len()
+        );
+        // Plane z's rows from `first` on: inputs `k_z`, outputs `n_z` apart.
+        let plane = |i: usize| {
+            let (input, w, output, n, k) = planes[i.min(planes.len() - 1)];
+            (
+                input.offset((first * k) as usize * 2),
+                w,
+                output.offset((first * n) as usize * 2),
+                n,
+                k,
+            )
+        };
+        let grid_x = planes
+            .iter()
+            .map(|&(_, _, _, n, _)| n.div_ceil(16))
+            .max()
+            .unwrap_or(0);
+        let mut launch = spark_runtime::kernel_args::KernelLaunch::new(gpu, tier)
+            .grid([grid_x, 1, planes.len() as u32])
+            .block([256, 1, 1]);
+        for i in 0..3 {
+            launch = launch.arg_ptr(plane(i).0);
+        }
+        for i in 0..3 {
+            launch = launch.arg_ptr(plane(i).1.weight);
+        }
+        for i in 0..3 {
+            launch = launch.arg_ptr(plane(i).2);
+        }
+        for i in 0..3 {
+            launch = launch.arg_u32(plane(i).3);
+        }
+        for i in 0..3 {
+            launch = launch.arg_u32(plane(i).4);
+        }
+        launch.arg_u32(m).launch(stream)?;
     }
-    for i in 0..3 {
-        launch = launch.arg_ptr(plane(i).1.weight);
-    }
-    for i in 0..3 {
-        launch = launch.arg_ptr(plane(i).2);
-    }
-    for i in 0..3 {
-        launch = launch.arg_u32(plane(i).3);
-    }
-    for i in 0..3 {
-        launch = launch.arg_u32(plane(i).4);
-    }
-    launch.arg_u32(m).launch(stream)
+    Ok(())
 }
 
 #[cfg(test)]

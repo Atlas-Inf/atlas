@@ -65,6 +65,18 @@ pub fn bf16_gemm_act_weight_t(
     unreachable!("cublaslt::bf16_gemm_act_weight_t is cuda-only (not built for metal)")
 }
 
+pub fn bf16_gemm_act_weight_t_f32out(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    _m: u32,
+    _n: u32,
+    _k: u32,
+    _stream: u64,
+) -> Result<()> {
+    unreachable!("cublaslt::bf16_gemm_act_weight_t_f32out is cuda-only (not built for metal)")
+}
+
 pub fn tf32_gemm_act_weight_t(
     _act: u64,
     _weight: u64,

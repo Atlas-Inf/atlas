@@ -398,7 +398,9 @@ pub fn glm_paged_grouped_gemm_mla(
     } else {
         false
     };
-    if enabled && super::bf16_gemm_cutlass_rows(m) {
+    // A packed prefill (`glm_packed_scope`): the CUTLASS tiles (fixed config,
+    // no split-K) at every row count.
+    if enabled && (super::bf16_gemm_cutlass_rows(m) || crate::layers::glm_packed_scope::active()) {
         // Head-batched CUTLASS (bench: ~1.12 ms vs cuBLASLt's 1.65 ms at
         // 4096 rows, both head shapes).
         return spark_runtime::cutlass::bf16_grouped_gemm_act_weight_t(

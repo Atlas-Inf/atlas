@@ -10,7 +10,9 @@ type OwnerTraverse<'a> =
 
 /// Owner-batched GLM verify (repaired K3 or DFlash block): one target
 /// traversal for every owner, then each owner's ordinary tail in order, each
-/// preceded by restoring that owner's verify rows on both ranks.
+/// preceded by restoring that owner's verify rows on both ranks. Owner `o`
+/// verifies its first `verified[o]` drafts (all when `verified` is empty);
+/// its rows past them are dead (`glm_long_owner::DEAD_ROW`).
 pub fn step_verify_glm_long_batched(
     model: &dyn Model,
     group: &mut [&mut ActiveSeq],
@@ -18,6 +20,7 @@ pub fn step_verify_glm_long_batched(
     num_drafts: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
+    verified: &[usize],
 ) {
     step_verify_glm_long_with(
         model,
@@ -26,7 +29,25 @@ pub fn step_verify_glm_long_batched(
         num_drafts,
         verify_ctx,
         dflash_verify_raw_argmax,
-        &mut |rows, tokens, seqs| model.decode_verify_glm_long_owner_rows(rows, tokens, seqs),
+        verified,
+        &mut |rows, tokens, seqs| {
+            if verified.is_empty() {
+                return model.decode_verify_glm_long_owner_rows(rows, tokens, seqs);
+            }
+            let marked: Vec<u32> = tokens
+                .iter()
+                .enumerate()
+                .map(|(row, &t)| {
+                    let kept = verified.get(row / rows).map_or(rows, |&d| d + 1);
+                    if row % rows < kept {
+                        t
+                    } else {
+                        t | spark_model::layer::glm_long_owner::DEAD_ROW
+                    }
+                })
+                .collect();
+            model.decode_verify_glm_long_owner_rows(rows, &marked, seqs)
+        },
     );
 }
 
@@ -44,6 +65,7 @@ pub fn step_verify_glm_long_with(
     num_drafts: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
+    verified: &[usize],
     traverse: &mut OwnerTraverse<'_>,
 ) {
     // Admission precedes the traversal (including a fused prompt chunk),
@@ -68,6 +90,8 @@ pub fn step_verify_glm_long_with(
     let (drafts, confs): (Vec<Vec<u32>>, Vec<Vec<f32>>) =
         group.iter_mut().map(|a| a.take_drafts()).unzip();
     let rows = drafts[0].len() + 1;
+    // The drafts each owner's verdict judges: a dead row's draft is none.
+    let kept = |o: usize| verified.get(o).map_or(rows - 1, |&d| d.clamp(1, rows - 1));
     let tokens: Vec<Vec<u32>> = group
         .iter()
         .zip(&drafts)
@@ -146,8 +170,8 @@ pub fn step_verify_glm_long_with(
             model,
             a,
             sched,
-            &drafts[owner],
-            &confs[owner],
+            &drafts[owner][..kept(owner)],
+            &confs[owner][..kept(owner).min(confs[owner].len())],
             num_drafts,
             verify_ctx,
             dflash_verify_raw_argmax,

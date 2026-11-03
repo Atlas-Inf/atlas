@@ -11,6 +11,9 @@ use crate::model::{graph_flags, qwen4exp_batch_fast, qwen4exp_exact_verify, qwen
 /// chains them after [`super::SETTINGS`], so the gathered order is
 /// unchanged.
 pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
+    ("ATLAS_GLM_STRICT_NATIVE_MTP", || {
+        Ok(crate::weight_loader::glm5_mode::strict_native_mtp() as u64)
+    }),
     ("ATLAS_GLM_SERVING_MODE", || {
         use crate::weight_loader::glm5_mode::{ServingMode, selected};
         Ok(match selected()? {
@@ -37,6 +40,14 @@ pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
     // from the in-tree kernel, so ranks that disagree serve a mix of both.
     ("ATLAS_GLM_FP8B_CUTLASS", || {
         Ok(ops::fp8b_cutlass_requested()? as u64)
+    }),
+    ("ATLAS_GLM_PREFILL_PIPE2", || {
+        Ok(crate::model::glm_prefill_pipe::requested() as u64)
+    }),
+    // The routed down rows' format (lossy E4M3 or BF16), so every rank's
+    // partial sums round alike.
+    ("ATLAS_GLM_MOE_DOWN_E4M3", || {
+        Ok(layers::moe::down_e4m3_requested() as u64)
     }),
     // The routed experts' activation scales and the non-prompt rows' A16
     // lane: the rows both ranks reduce.

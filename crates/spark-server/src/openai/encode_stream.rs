@@ -379,4 +379,27 @@ mod tests {
         let p = delta_to_payloads(&d, "m", "id-1", false);
         assert_eq!(p, vec![msg.to_string()]);
     }
+    #[test]
+    fn guard_stop_survives_both_stream_finish_layouts() {
+        for guard_stop in [None, Some("inter_tool_prose_budget")] {
+            let delta = StreamDelta::Finish {
+                reason: crate::ir::FinishReason::Length,
+                usage: crate::ir::Usage::default(),
+                token_ids: vec![],
+                guard_stop,
+            };
+            for include_usage in [false, true] {
+                let payloads = delta_to_payloads(&delta, "model", "id", include_usage);
+                let last: serde_json::Value =
+                    serde_json::from_str(payloads.last().unwrap()).unwrap();
+                assert_eq!(last["choices"][0]["finish_reason"], "length");
+                assert_eq!(
+                    last["choices"][0]
+                        .get("guard_stop")
+                        .and_then(|v| v.as_str()),
+                    guard_stop
+                );
+            }
+        }
+    }
 }

@@ -17,23 +17,28 @@ impl BlockDiffusionDraftHead {
     /// `stream`. No host sync: the swaps order it against the head. `word`
     /// is the announce's preamble word (`announce_word`): a batched
     /// propose's B×gamma rows (0: a single sequence's gamma) and, with
-    /// `ATLAS_GLM_DRAFT_TP_CTX`, its context appends' rows.
+    /// `ATLAS_GLM_DRAFT_TP_CTX`, its context appends' rows; `extra` the
+    /// second announce word, when [`Self::rank_split_extra_follows`].
     pub fn rank_split_serve(
         &self,
         gpu: &dyn GpuBackend,
         comm: &dyn CommBackend,
         stream: u64,
         word: u32,
+        extra: Option<u32>,
     ) -> Result<()> {
         let split = self
             .rank_split
             .as_ref()
             .context("rank-split propose announced to a head without the split")?;
+        let rank = comm.rank();
         ensure!(
-            comm.rank() == 1 && comm.world_size() == 2,
-            "rank-split propose serves on rank 1 of 2"
+            rank > 0 && comm.world_size() == split.geometry.ranks,
+            "rank-split propose serves on a worker of its {} ranks (rank {rank} of {})",
+            split.geometry.ranks,
+            comm.world_size()
         );
-        let (rows, ctx) = read_announce(word, split.geometry.ctx_in > 0);
+        let (rows, ctx) = read_announce(word, extra, split.geometry.ctx_in > 0);
         // The joined `fc` rows land in the scratch window, as on the head.
         ensure!(
             ctx.appends().all(|i| ctx.get(i) <= self.ctx_window),
@@ -55,11 +60,31 @@ impl BlockDiffusionDraftHead {
             gpu,
             comm,
             stream,
+            rank,
         };
-        let walked = walk(&split.plan().steps(1), Graphs::Eager, gpu, stream, &worker);
+        let walked = walk(
+            &split.plan().steps(rank),
+            Graphs::Eager,
+            gpu,
+            stream,
+            &worker,
+        );
         // The head is already walking these swaps: issue them all.
         let drained = split.finish(comm, stream);
         walked.and(drained)
+    }
+}
+
+impl BlockDiffusionDraftHead {
+    /// Worker: whether a second announce word follows the command of the
+    /// split propose announced by `word` (`rank_split::extra_follows`).
+    pub fn rank_split_extra_follows(&self, word: u32) -> bool {
+        let Some(split) = self.rank_split.as_ref() else {
+            return false;
+        };
+        let ctx_split = split.geometry.ctx_in > 0;
+        let (rows, _) = read_announce(word, None, ctx_split);
+        super::super::ctx::extra_follows(rows / self.gamma, ctx_split)
     }
 }
 
@@ -70,15 +95,28 @@ struct Worker<'a> {
     gpu: &'a dyn GpuBackend,
     comm: &'a dyn CommBackend,
     stream: u64,
+    rank: usize,
 }
 
 impl SplitOps for Worker<'_> {
     fn piece(&self, piece: Piece) -> Result<()> {
-        self.head
-            .split_piece(self.split, piece, 1, self.gpu, &self.frame, self.stream)
+        self.head.split_piece(
+            self.split,
+            piece,
+            self.rank,
+            self.gpu,
+            &self.frame,
+            self.stream,
+        )
     }
     fn swap(&self, swap: Swap) -> Result<()> {
-        self.split
-            .swap(swap, 1, self.gpu, self.comm, &self.frame, self.stream)
+        self.split.swap(
+            swap,
+            self.rank,
+            self.gpu,
+            self.comm,
+            &self.frame,
+            self.stream,
+        )
     }
 }

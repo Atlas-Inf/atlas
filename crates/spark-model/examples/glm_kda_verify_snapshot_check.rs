@@ -286,7 +286,7 @@ fn main() -> Result<()> {
     let backend = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let gpu: &dyn GpuBackend = &backend;
     let stream = gpu.create_stream()?;
-    let mut rng = Rng(0x53_F1A5_A5);
+    let mut rng = Rng(0x53F1_A5A5);
     println!("=== GLM K=5 inline snapshot exactness ===");
     check_conv(gpu, stream, &mut rng)?;
     check_recurrent(gpu, stream, &mut rng)?;

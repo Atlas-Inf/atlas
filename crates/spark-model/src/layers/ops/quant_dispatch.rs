@@ -200,6 +200,56 @@ pub fn w4a16_gemv_batch3(
         .launch(stream)
 }
 
+/// `w4a16_gemv_tc8_parts`: up to three tensor-core GEMVs of one `[m, k]`
+/// input (`m` <= 32, whole `[n_p, k]` NVFP4 weights) in one launch, part p
+/// writing `out_p[m, n_p] = input · W_pᵀ` exactly as its own
+/// `w4a16_gemv_tc8` launch does. `Ok(false)` when this build lacks it.
+pub fn w4a16_gemv_tc8_parts(
+    gpu: &dyn GpuBackend,
+    input: DevicePtr,
+    parts: &[(&QuantizedWeight, DevicePtr, u32)],
+    m: u32,
+    k: u32,
+    stream: u64,
+) -> Result<bool> {
+    anyhow::ensure!(
+        (1..=3).contains(&parts.len()) && (1..=32).contains(&m) && k.is_multiple_of(16),
+        "w4a16_gemv_tc8_parts: {} parts, m={m}, k={k}",
+        parts.len()
+    );
+    let Ok(kernel) = gpu
+        .op_cache()
+        .kernel(gpu, "w4a16_gemv", "w4a16_gemv_tc8_parts")
+    else {
+        return Ok(false);
+    };
+    let ctas = |p: usize| parts.get(p).map_or(0, |&(_, _, n)| div_ceil(n, 16));
+    let starts = [0, ctas(0), ctas(0) + ctas(1)];
+    let mut launch = KernelLaunch::new(gpu, kernel)
+        .grid([starts[2] + ctas(2), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_u32(m)
+        .arg_u32(k);
+    for (p, start) in starts.into_iter().enumerate() {
+        let (packed, scales, scale2, out, n) = parts.get(p).map_or(
+            (DevicePtr(0), DevicePtr(0), 0.0, DevicePtr(0), 0),
+            |&(w, out, n)| (w.weight, w.weight_scale, w.weight_scale_2, out, n),
+        );
+        launch = launch
+            .arg_ptr(packed)
+            .arg_ptr(scales)
+            .arg_f32(scale2)
+            .arg_ptr(out)
+            .arg_u32(n);
+        if p > 0 {
+            launch = launch.arg_u32(start);
+        }
+    }
+    launch.launch(stream)?;
+    Ok(true)
+}
+
 /// W4A16 batched GEMV (M<=MAX_M) — the NVFP4 sibling of `w8a16_gemv_batch4/16`.
 ///
 /// Reads the NVFP4 weight matrix ONCE and computes `m` outputs (one per seq),

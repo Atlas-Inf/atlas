@@ -13,7 +13,8 @@ pub(in crate::scheduler) struct ScoredPicks {
 }
 
 /// The opt-in reporting path. No logits I/O or selection for ordinary requests.
-/// Dense batched requests read only this sequence's rows. Never rescore raw rows
+/// Split FULL_ROWS requests run while workers await the accepted-count verdict;
+/// dense batched requests read only this sequence's rows. Never rescore raw rows
 /// or replay the processors after SpanShadow has restored the sequence.
 pub(in crate::scheduler) fn requested(
     model: &dyn Model,
@@ -44,7 +45,15 @@ fn select(
 ) -> anyhow::Result<ScoredPicks> {
     let vocab = model.vocab_size();
     let mut buf = HostRows::take(&ctx.scratch.host_bytes, rows * vocab * 2);
-    super::selection::copy_rows(model, row_base, ctx, &mut buf)?;
+    if model.verify_logits_argmax_only() {
+        anyhow::ensure!(
+            row_base == 0,
+            "split verify scoring requires restored owner rows"
+        );
+        model.verify_split_full_rows(rows, &mut buf)?;
+    } else {
+        super::selection::copy_rows(model, row_base, ctx, &mut buf)?;
+    }
     let mut row = Vec::with_capacity(vocab);
     let mut logprobs = Vec::with_capacity(rows);
     let tokens = super::selection::span_picks(rows, a, ctx, drafts, |i, a| {

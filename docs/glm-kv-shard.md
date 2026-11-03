@@ -493,6 +493,36 @@ owners take the tensor-core split kernel over causal ids instead of the BF16
 dense kernel. Prompt-logprob and greedy-text references taken on the older
 unsharded engine change once, to the shard's new values.
 
+## Beyond the pair: the TP4 chain
+
+On four ranks (`--world-size 4 --tp-size 4` over the RDMA chain) block `l` is
+stored by rank `l % 4` (the same allocator and device rule at `world` 4) and
+each rank holds 16 of the 64 heads. The pair's swaps become the chain's
+in-place all-gather (`CommBackend::gather_async`, `glm_kv_shard::gather`;
+`paged_glm_shard_chain.rs`):
+
+- **Merge form**: the ranks gather their heads' absorbed queries
+  (`rows x 16 x 512` BF16 each); each rank regroups them into the pair's two
+  32-head groups and runs the same paired counted split over the tokens it
+  stores (all 64 heads, the pair's kernel work), merges each group's
+  partitions to one FP32 partial + LSE (`_f32`), and the ranks gather those
+  (`rows x 64 x 513 x 4` bytes each). Each rank then merges its 16 heads'
+  partial from every rank as the 4 partitions of one exact LSE merge to BF16.
+  Its bits are not TP2's (a different merge tree), and there is no canonical
+  form beyond the pair; GPU test `chain_shard_merge_matches_attention` holds
+  every rank's heads to double-precision softmax attention (worst error at
+  0.13-0.20 of the pair test's tolerance), including rows one rank stores
+  none of.
+- **View form**: the ranks gather their history blocks in logical order in
+  rounds of 1,024 per rank; rank `o`'s `k`-th is logical block `o + 4k`
+  (`chain_shard_view_assembles_the_history`: bitwise).
+- The table check gathers every rank's 8-byte verdict.
+
+Per MLA layer a verify owner gathers `rows x 16 KiB` of queries and
+`rows x 131 KiB` of partials per rank (the latter carries all 64 heads, of
+which each receiver keeps 16). Graphs stay off under the shard, as on the
+pair.
+
 ## Supported / not supported
 
 Supported (implemented): prefill chunks (incl. sequence-parallel prefill,
@@ -509,8 +539,10 @@ from its peer's, a shard variable that is not 0 or 1, a tuning or the check
 without the shard, the environment lanes listed under "Startup refusals"
 (multi-sequence sparse decode, the repaired MTP, C4 and independent decode
 lanes, the long-verify serial diagnostic), `--high-speed-swap`, a world
-other than a TP2 pair with 32 heads per rank, a latent dtype other than BF16
-or `fp8_g128`.
+other than a TP2 pair with 32 heads per rank or a TP4 chain with 16, a latent
+dtype other than BF16 or `fp8_g128`; beyond the pair also the overlap, which
+is the pair's. The NVMe tier supports TP2 and TP4 with one record class per
+rank: own latent-plus-index records and index-only records for every peer.
 
 Not supported and not selected by a variable a shard could refuse (the
 production profile sets `ATLAS_GLM_MLA_MULTI_SEQ=1`), so still failing closed

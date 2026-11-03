@@ -77,12 +77,13 @@ impl Qwen3AttentionLayer {
     }
 
     /// Semantic-index queries (`[n, heads * dim]`) and per-head weights
-    /// (`[n, heads]`) of `n` rows.
+    /// (`[n, heads]`) of `n` rows; no weights without `normed` (they are
+    /// projected already).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn glm_index_project_query(
         &self,
         q_latent: spark_runtime::gpu::DevicePtr,
-        normed: spark_runtime::gpu::DevicePtr,
+        normed: Option<spark_runtime::gpu::DevicePtr>,
         n: u32,
         index_query: spark_runtime::gpu::DevicePtr,
         weights: spark_runtime::gpu::DevicePtr,
@@ -105,6 +106,9 @@ impl Qwen3AttentionLayer {
             ctx,
             stream,
         )?;
+        let Some(normed) = normed else {
+            return Ok(());
+        };
         // BF16 is sufficient for the first functional selector. A later
         // measured refinement will retain this projection's FP32 accumulator,
         // matching upstream's near-tie ranking treatment.
@@ -277,7 +281,7 @@ impl Qwen3AttentionLayer {
             Some(p) => p,
             None => {
                 let (q, w) = (ctx.buffers.ssm_deinterleaved(), ctx.buffers.ssm_gates());
-                self.glm_index_project_query(q_latent, normed, n, q, w, ctx, stream)?;
+                self.glm_index_project_query(q_latent, Some(normed), n, q, w, ctx, stream)?;
                 (q, w)
             }
         };
@@ -376,7 +380,11 @@ impl Qwen3AttentionLayer {
                     (weights, n as usize * weights_row_bytes),
                 ],
             };
-            split.exchange(&owner, self.attn_layer_idx, ctx, stream)?;
+            // Beside the owner's q_b unless a sharded cache swaps queries
+            // meanwhile.
+            let beside = kv_cache.latent_shard().is_none();
+            let compact = glm_index_split::compact(ctx.gpu, topk, pool_size, output_width);
+            split.exchange(&owner, self.attn_layer_idx, beside, compact, ctx, stream)?;
         }
         let exchange_us = profile_lap(ctx, stream, &mut profile)?;
         if profile.is_some() {

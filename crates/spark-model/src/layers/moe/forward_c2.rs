@@ -41,10 +41,10 @@ impl MoeLayer {
             self.glm_c2_grouped(ctx, 2)
                 && !self.is_dflash_capture_layer
                 && input == ctx.buffers.norm_output()
-                && ctx
-                    .comm
-                    .is_some_and(|c| c.world_size() == 2 && c.rank() == ctx.config.ep_rank),
-            "C2 compact requires independent active4 TP2/EP2 GLM native-T resources"
+                && ctx.comm.is_some_and(|c| {
+                    c.world_size() == ctx.config.ep_world_size && c.rank() == ctx.config.ep_rank
+                }),
+            "C2 compact requires independent active4 TP=EP GLM native-T resources"
         );
         super::forward_c4::validate_independent_moe_arenas(ctx.config, ctx.buffers.sizes(), 2)?;
         self.forward_prefill(input, 2, ctx, stream)?;
@@ -52,7 +52,8 @@ impl MoeLayer {
     }
 
     pub(super) fn glm_c2_grouped(&self, ctx: &ForwardContext, rows: u32) -> bool {
-        self.c2_compact_moe
+        !crate::layers::glm_packed_scope::active()
+            && self.c2_compact_moe
             && rows == 2
             && ctx.levers.max_decode_seqs == 4
             && ctx.attn_metadata.is_some_and(|m| m.num_seqs == 2)

@@ -9,6 +9,7 @@
 #include <math.h>
 
 #include "glm_indexer_rows.cuh"
+#include "../../common/atlas_pdl.cuh"
 
 extern "C" __global__ void glm_index_layernorm_bf16(
     __nv_bfloat16* __restrict__ values,
@@ -448,6 +449,53 @@ extern "C" __global__ void glm_index_topk_expand_dynamic(
     }
     glm_index_topk_expand_impl(logits, output, 1, length, logits_stride,
         topk_tokens, pool_size, output_width);
+}
+
+// The index split's compact selected rows (`glm_index_split.rs`,
+// the TP4 chain's gathers): glm_index_topk_expand writes each selected
+// pool p as the run p * pool_size + i (i < pool_size) and leaves every other
+// run -1, then up to pool_size - 1 causal tail ids. A compact row keeps each
+// run's first id and the tail slots verbatim: topk / pool_size +
+// (width - topk) words instead of width. Grid (rows), block 256.
+extern "C" __global__ void glm_index_sel_pack(
+    const int* __restrict__ selected,
+    int* __restrict__ compact,
+    unsigned int rows,
+    unsigned int topk,
+    unsigned int pool_size,
+    unsigned int width) {
+    const unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+    const unsigned int runs = topk / pool_size, cw = runs + width - topk;
+    const int* sel = selected + (unsigned long long)row * width;
+    int* out = compact + (unsigned long long)row * cw;
+    for (unsigned int j = threadIdx.x; j < cw; j += blockDim.x)
+        out[j] = j < runs ? sel[j * pool_size] : sel[topk + j - runs];
+}
+
+// The inverse of glm_index_sel_pack: the expanded rows' exact words.
+extern "C" __global__ void glm_index_sel_unpack(
+    const int* __restrict__ compact,
+    int* __restrict__ selected,
+    unsigned int rows,
+    unsigned int topk,
+    unsigned int pool_size,
+    unsigned int width) {
+    const unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+    const unsigned int runs = topk / pool_size, cw = runs + width - topk;
+    const int* in = compact + (unsigned long long)row * cw;
+    int* sel = selected + (unsigned long long)row * width;
+    for (unsigned int i = threadIdx.x; i < width; i += blockDim.x) {
+        int v;
+        if (i < topk) {
+            const int first = in[i / pool_size];
+            v = first < 0 ? -1 : first + (int)(i % pool_size);
+        } else {
+            v = in[runs + i - topk];
+        }
+        sel[i] = v;
+    }
 }
 
 // Tiled sparse absorbed MLA. One CTA owns one (query, head); its eight warps

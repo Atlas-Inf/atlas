@@ -21,7 +21,7 @@ __device__ __forceinline__ bool glm_argmax_other_better(
 // byte-for-byte the same as `argmax_bf16`; thread zero additionally preserves
 // the winning BF16 value as FP32 beside its shard-local index. Two ranks can
 // exchange this 8-byte pair instead of all BF16 logits. Merged like
-// `argmax_pair_merge_ban`, a tied valid maximum keeps rank zero's pair (the
+// `argmax_pairs_merge_ban`, a tied valid maximum keeps rank zero's pair (the
 // lower vocabulary IDs, as a single-GPU argmax would pick), and two untouched
 // -1e30f sentinels select index zero, preserving the full-row all-invalid
 // fallback. No BF16 value equals that FP32 sentinel, so the host can
@@ -178,31 +178,39 @@ extern "C" __global__ void argmax_bf16_value_ban_allow(
         s_val, s_idx);
 }
 
-// Merge per-row TP2 shard quads from argmax_bf16_value_ban into global token
-// IDs, on device so a graph-captured verify needs no host round trip. Ties
-// follow the engine's first-index-wins argmax: rank 0 holds the lower IDs, so
-// an exact tie (and two untouched sentinels) keeps rank 0's pair. Row r merges
-// the unbanned pairs when bit r of (mask_hi:mask_lo) is set, else the best pairs.
+// Merge per-row shard quads from argmax_bf16_value_ban of every rank (the
+// TP2 pair or the TP4 chain; rank k's quads at pairs + k * rank_words) into
+// global token IDs, on device so a graph-captured verify needs no host round
+// trip. Ties follow the engine's first-index-wins argmax: a lower rank holds
+// the lower IDs, so an exact tie (and untouched sentinels) keeps the lowest
+// rank's pair. Row r merges the unbanned pairs when bit r of (mask_hi:mask_lo)
+// is set, else the best pairs.
 //
 // Grid: (1, 1, 1)  Block: (32, 1, 1)
-extern "C" __global__ void argmax_pair_merge_ban(
-    const unsigned int* __restrict__ local,
-    const unsigned int* __restrict__ peer,
+extern "C" __global__ void argmax_pairs_merge_ban(
+    const unsigned int* __restrict__ pairs,
     unsigned int* __restrict__ out,
     unsigned int rows,
     unsigned int shard,
-    unsigned int rank,
+    unsigned int ranks,
+    unsigned int rank_words,
     unsigned int mask_lo,
     unsigned int mask_hi
 ) {
     for (unsigned int r = threadIdx.x; r < rows; r += blockDim.x) {
         const unsigned int word = r < 32 ? mask_lo : mask_hi;
         const unsigned int o = 4 * r + (((word >> (r & 31)) & 1u) ? 2 : 0);
-        const unsigned int* p0 = rank == 0 ? local : peer;
-        const unsigned int* p1 = rank == 0 ? peer : local;
-        const float v0 = __uint_as_float(p0[o]);
-        const float v1 = __uint_as_float(p1[o]);
-        out[r] = v1 > v0 ? p1[o + 1] + shard : p0[o + 1];
+        float best = __uint_as_float(pairs[o]);
+        unsigned int id = pairs[o + 1];
+        for (unsigned int k = 1; k < ranks; ++k) {
+            const unsigned int* p = pairs + k * rank_words;
+            const float v = __uint_as_float(p[o]);
+            if (v > best) {
+                best = v;
+                id = p[o + 1] + k * shard;
+            }
+        }
+        out[r] = id;
     }
 }
 

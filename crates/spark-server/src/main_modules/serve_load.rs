@@ -602,6 +602,12 @@ pub(crate) fn load_model(
     // Failure is logged inside and never fails the serve.
     #[cfg(feature = "cuda")]
     spark_runtime::cublaslt::prewarm(0);
+    // Likewise the CUTLASS workspace (512 MB, 28 ms of the first prefill), on
+    // the models whose prefill GEMMs run CUTLASS.
+    #[cfg(feature = "cuda")]
+    if spark_model::layers::ops::fp8b_cutlass_requested().unwrap_or(false) {
+        spark_runtime::cutlass::prewarm();
+    }
 
     // 4. Post-load OOM check + audit log.
     serve_phases::post_load_memory_audit(
@@ -855,7 +861,11 @@ pub(crate) fn load_model(
         top_p: default_top_p,
         top_n_sigma: default_top_n_sigma,
         min_p: default_min_p,
-    } = serve_phases::load_sampling_defaults(&model_dir, &args, &sampling_presets.non_thinking);
+    } = serve_phases::load_sampling_defaults(
+        &model_dir,
+        &args,
+        &serve_phases::server_default_preset(&config.model_type, sampling_presets.non_thinking),
+    );
 
     // 6. Load tokenizer
     spark_runtime::progress::phase(8, "tokenizer");

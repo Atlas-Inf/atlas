@@ -107,6 +107,12 @@ pub async fn completions(
             );
         }
     };
+    if req.return_token_ids && req.stream {
+        return openai_error_response(
+            StatusCode::BAD_REQUEST,
+            "return_token_ids requires stream=false on /v1/completions".to_string(),
+        );
+    }
     let prompts = match resolve_prompts(&state, &req.prompt) {
         Ok(t) => t,
         Err((status, msg)) => return openai_error_response(status, msg),

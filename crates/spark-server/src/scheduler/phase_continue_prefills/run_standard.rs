@@ -90,12 +90,15 @@ pub(super) fn run_standard_chunk_loop(
     }
     // R11 fix 5: end non-last chunks on the model's prefill cut grid.
     chunk_len = model.align_prefill_chunk(p.chunk_offset, chunk_len, p.prompt_tokens.len());
-    let is_last = p.chunk_offset + chunk_len >= p.prompt_tokens.len();
-    // Align intermediate chunks to GDN WY4 boundary (4 tokens).
-    if !is_last && chunk_len >= spark_runtime::prefill_chunk_granule() {
-        // (ATLAS_QWEN4EXP_PREFILL_ROWINV: 64, the GDN chunk.)
-        let g = spark_runtime::prefill_chunk_granule();
-        chunk_len = (chunk_len / g) * g;
+    let mut is_last = p.chunk_offset + chunk_len >= p.prompt_tokens.len();
+    // Align intermediate chunks to GDN WY4 boundary (4 tokens;
+    // ATLAS_QWEN4EXP_PREFILL_ROWINV: 64, the GDN chunk), and to the
+    // sequence-parallel row multiple.
+    let multiple = model.prefill_row_multiple();
+    if !is_last {
+        chunk_len = super::super::chunk_align(chunk_len, multiple);
+    } else {
+        (chunk_len, is_last) = super::super::sp_final_cut(chunk_len, multiple);
     }
 
     // ── Mixed forward: fuse prefill chunk + decode in one pass ──

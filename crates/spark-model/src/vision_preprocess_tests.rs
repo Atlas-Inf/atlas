@@ -326,3 +326,6 @@ fn rotation_does_not_change_the_token_count_of_a_square() {
     let (_, gh_b, gw_b) = preprocess_image(&as_data_uri(EXIF_NONE), &ok_cfg()).expect("untagged");
     assert_eq!((gh_a, gw_a), (gh_b, gw_b));
 }
+
+#[path = "vision_preprocess_tests/glm.rs"]
+mod glm;

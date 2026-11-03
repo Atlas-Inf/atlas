@@ -34,7 +34,7 @@ impl Qwen3AttentionLayer {
             self.block_idx != 0 && self.block_idx + 1 != ctx.config.num_hidden_layers,
             "GLM long owner batch MLA cannot be the first or last layer"
         );
-        if crate::speculative::glm_repair_policy::dflash_enabled() {
+        if crate::speculative::glm_repair_policy::canonical_target_enabled() {
             return self.glm_long_owners_mla_chunk(owners, kv_cache, stage, ctx, stream);
         }
         let rows = long_owner::owner_rows(owners)?;
@@ -195,6 +195,41 @@ impl Qwen3AttentionLayer {
         })
     }
 
+    /// Packed multi-prompt prefill (`layer::glm_packed`): each prompt's
+    /// attention pieces (exactly a single-prompt chunk's, from position 0)
+    /// as chunk owners at its rows; mHC, norms, TP reduce and the FFN once
+    /// over every row.
+    pub(in crate::layers::qwen3_attention) fn prefill_glm_packed_mla(
+        &self,
+        total: usize,
+        packed: &[crate::layer::glm_packed::GlmPackedOwner<'_>],
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        ensure!(
+            self.mla.as_ref().is_some_and(|m| m.glm_indexer.is_some())
+                && self.hc.is_some()
+                && !self.ffn.is_none(),
+            "GLM packed prefill requires an mHC GLM MLA layer with FFN"
+        );
+        ensure!(
+            self.block_idx != 0 && self.block_idx + 1 != ctx.config.num_hidden_layers,
+            "GLM packed prefill MLA cannot be the first or last layer"
+        );
+        ensure!(
+            crate::layer::glm_packed::tiled_rows(packed) == Some(total),
+            "GLM packed prefill: owners do not tile {total} rows"
+        );
+        let owners = packed_chunk_owners(packed, ctx.config.index_topk);
+        let b = ctx.buffers;
+        self.glm_mla_chunk_owners(&owners, None, kv_cache, ctx, stream, &mut || {
+            self.ffn
+                .forward_prefill(b.norm_output(), total, ctx, stream)?;
+            Ok(b.moe_output())
+        })
+    }
+
     /// GLM's MLA layer over chunk owners that tile the stacked rows: mHC
     /// pre/post, norms, TP all-reduce and `ffn` run once over every row and
     /// `glm_chunk_attention` per owner. `stash` keeps the mHC coefficients in
@@ -324,4 +359,22 @@ fn owner_chunk(
             ..input.meta
         },
     }
+}
+
+/// Every packed prompt's attention pieces, shifted to its rows.
+fn packed_chunk_owners(
+    packed: &[crate::layer::glm_packed::GlmPackedOwner<'_>],
+    index_topk: usize,
+) -> Vec<crate::layers::qwen3_attention::prefill::GlmChunkOwner> {
+    packed
+        .iter()
+        .flat_map(|p| {
+            crate::layers::qwen3_attention::prefill::glm_chunk_pieces(p.meta, 0, p.rows, index_topk)
+                .into_iter()
+                .map(move |mut piece| {
+                    piece.row0 += p.row0;
+                    piece
+                })
+        })
+        .collect()
 }

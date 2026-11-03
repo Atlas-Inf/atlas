@@ -12,6 +12,7 @@
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 
+use super::forward_block_layer_paged::AttnPhases;
 use super::{BlockDiffusionDraftHead, DflashLayer};
 use crate::layer::ForwardContext;
 
@@ -101,6 +102,17 @@ impl BlockDiffusionDraftHead {
 
     /// Input norm through attention, leaving the attention rows in `batch_attn_out`.
     pub(super) fn batched_attention(&self, layer_idx: usize, a: &BatchLayerArgs) -> Result<()> {
+        self.batched_attention_phases(layer_idx, a, AttnPhases::ALL)
+    }
+
+    /// [`Self::batched_attention`] in `phases` (`AttnPhases`): the input
+    /// norm and conv, the q/k/v projections, then the rest through attention.
+    pub(super) fn batched_attention_phases(
+        &self,
+        layer_idx: usize,
+        a: &BatchLayerArgs,
+        phases: AttnPhases,
+    ) -> Result<()> {
         let BatchLayerArgs {
             batch_rows,
             batch_size,
@@ -119,60 +131,67 @@ impl BlockDiffusionDraftHead {
                 ..
             },
         ) = self.batched_layer(layer_idx, batch_rows)?;
-        crate::layers::ops::rms_norm(
-            ctx.gpu,
-            self.kernels.rms_norm,
-            self.batch_query_embed,
-            &layer.input_layernorm,
-            self.batch_norm,
-            batch_rows,
-            hidden,
-            self.rms_norm_eps,
-            stream,
-        )?;
-        if let Some(ref conv) = layer.attention_conv {
-            self.staged_conv_prepare(conv, self.batch_norm, batch_size, hidden, ctx, stream)?;
-        }
-        let mx = layer.mx.as_ref();
-        for (weight, fp8, nvfp4, mx, output, width) in [
-            (
-                &layer.q_proj,
-                &layer.q_proj_fp8,
-                &layer.q_proj_nvfp4,
-                mx.map(|mx| &mx.q_proj),
-                self.batch_q,
-                q_dim,
-            ),
-            (
-                &layer.k_proj,
-                &layer.k_proj_fp8,
-                &layer.k_proj_nvfp4,
-                None,
-                self.batch_k,
-                kv_dim,
-            ),
-            (
-                &layer.v_proj,
-                &layer.v_proj_fp8,
-                &layer.v_proj_nvfp4,
-                None,
-                self.batch_v,
-                kv_dim,
-            ),
-        ] {
-            self.run_staged_projection(
-                batch_size,
+        if phases.norm {
+            crate::layers::ops::rms_norm(
+                ctx.gpu,
+                self.kernels.rms_norm,
+                self.batch_query_embed,
+                &layer.input_layernorm,
                 self.batch_norm,
-                weight,
-                fp8,
-                nvfp4,
-                mx,
-                output,
-                width,
+                batch_rows,
                 hidden,
-                ctx,
+                self.rms_norm_eps,
                 stream,
             )?;
+            if let Some(ref conv) = layer.attention_conv {
+                self.staged_conv_prepare(conv, self.batch_norm, batch_size, hidden, ctx, stream)?;
+            }
+        }
+        if phases.project {
+            let mx = layer.mx.as_ref();
+            for (weight, fp8, nvfp4, mx, output, width) in [
+                (
+                    &layer.q_proj,
+                    &layer.q_proj_fp8,
+                    &layer.q_proj_nvfp4,
+                    mx.map(|mx| &mx.q_proj),
+                    self.batch_q,
+                    q_dim,
+                ),
+                (
+                    &layer.k_proj,
+                    &layer.k_proj_fp8,
+                    &layer.k_proj_nvfp4,
+                    None,
+                    self.batch_k,
+                    kv_dim,
+                ),
+                (
+                    &layer.v_proj,
+                    &layer.v_proj_fp8,
+                    &layer.v_proj_nvfp4,
+                    None,
+                    self.batch_v,
+                    kv_dim,
+                ),
+            ] {
+                self.run_staged_projection(
+                    batch_size,
+                    self.batch_norm,
+                    weight,
+                    fp8,
+                    nvfp4,
+                    mx,
+                    output,
+                    width,
+                    hidden,
+                    ctx,
+                    stream,
+                )?;
+            }
+        }
+        if !phases.finish {
+            return Ok(());
         }
         let q_rows = batch_rows
             .checked_mul(self.num_q_heads as u32)
@@ -275,6 +294,17 @@ impl BlockDiffusionDraftHead {
 
     /// o_proj, the attention residual and the MLP input norm into `batch_norm`.
     pub(super) fn batched_project(&self, layer_idx: usize, a: &BatchLayerArgs) -> Result<()> {
+        self.batched_project_phases(layer_idx, a, AttnPhases::ALL)
+    }
+
+    /// [`Self::batched_project`] in `phases`: o_proj (`project`), then the
+    /// rest (`finish`).
+    pub(super) fn batched_project_phases(
+        &self,
+        layer_idx: usize,
+        a: &BatchLayerArgs,
+        phases: AttnPhases,
+    ) -> Result<()> {
         let BatchLayerArgs {
             batch_rows,
             batch_size,
@@ -291,20 +321,25 @@ impl BlockDiffusionDraftHead {
                 ..
             },
         ) = self.batched_layer(layer_idx, batch_rows)?;
-        let mx = layer.mx.as_ref();
-        self.run_staged_projection(
-            batch_size,
-            self.batch_attn_out,
-            &layer.o_proj,
-            &layer.o_proj_fp8,
-            &layer.o_proj_nvfp4,
-            mx.map(|mx| &mx.o_proj),
-            self.batch_attn_proj,
-            hidden,
-            q_dim,
-            ctx,
-            stream,
-        )?;
+        if phases.project {
+            let mx = layer.mx.as_ref();
+            self.run_staged_projection(
+                batch_size,
+                self.batch_attn_out,
+                &layer.o_proj,
+                &layer.o_proj_fp8,
+                &layer.o_proj_nvfp4,
+                mx.map(|mx| &mx.o_proj),
+                self.batch_attn_proj,
+                hidden,
+                q_dim,
+                ctx,
+                stream,
+            )?;
+        }
+        if !phases.finish {
+            return Ok(());
+        }
         if let Some(ref conv) = layer.attention_conv {
             self.staged_conv_finish(conv, self.batch_attn_proj, batch_size, hidden, ctx, stream)?;
         }

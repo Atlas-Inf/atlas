@@ -6,11 +6,11 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
-// q[rows,32,512] -> out[rows,32,576]; copy first 512, zero last 64
+// q[rows,heads,512] -> out[rows,heads,576]; copy first 512, zero last 64
 extern "C" __global__ void glm_sparse_native_prep_q(const __nv_bfloat16* __restrict__ q,
                        __nv_bfloat16* __restrict__ out,
-                       unsigned rows) {
-    const size_t total = (size_t)rows * 32u * 576u;
+                       unsigned rows, unsigned heads) {
+    const size_t total = (size_t)rows * heads * 576u;
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
          i < total;
          i += (size_t)gridDim.x * blockDim.x) {

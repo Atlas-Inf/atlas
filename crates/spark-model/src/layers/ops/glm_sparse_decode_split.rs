@@ -6,6 +6,8 @@ use spark_runtime::gpu::KernelHandle;
 
 const FLAG: &str = "ATLAS_GLM_SPARSE_DECODE_SPLIT";
 const SPLITS: u32 = 8;
+/// Partials and LSEs are laid out at the 32 heads of a TP2 rank, the most
+/// the kernel serves; 16 local heads (TP4) use the front of each region.
 const PART_O_BYTES: usize = 8 * 32 * 512 * 4;
 const PART_LSE_BYTES: usize = 8 * 32 * 4;
 const SCRATCH_BYTES: usize = PART_O_BYTES + PART_LSE_BYTES + 32 * 4;
@@ -107,16 +109,17 @@ fn dispatch(
                 .all(|p| p.0.is_multiple_of(4)),
         "GLM split vector/storage alignment"
     );
+    let row_bytes = a.heads as usize * 512 * 2;
     let input = [
-        (a.query, 32 * 512 * 2),
+        (a.query, row_bytes),
         (a.k_cache, 1),
         (a.v_cache, 1),
         (a.indices, 2051 * 4),
         (a.block_table, 4),
     ];
     validate_scratch(scratch, scratch_bytes, &input)?;
-    validate_scratch(scratch, scratch_bytes, &[(a.output, 32 * 512 * 2)])?;
-    let (lo, hi) = extent(a.output, 32 * 512 * 2)?;
+    validate_scratch(scratch, scratch_bytes, &[(a.output, row_bytes)])?;
+    let (lo, hi) = extent(a.output, row_bytes)?;
     for (p, n) in input {
         let (a, b) = extent(p, n)?;
         ensure!(hi <= a || b <= lo, "GLM split output aliases input");
@@ -131,7 +134,7 @@ fn dispatch(
         a.output,
         scratch.offset(PART_O_BYTES + PART_LSE_BYTES),
         1,
-        32,
+        a.heads,
         SPLITS,
         stream,
     )?;
@@ -203,18 +206,7 @@ pub(crate) fn launch_merge_f32(
         .op_cache()
         .kernel(gpu, SHARD_MODULE, "glm_sparse_decode_split_merge_f32")?;
     ensure!(k.0 != 0, "GLM FP32 split merge kernel unavailable");
-    launch_merge(
-        gpu,
-        k,
-        part,
-        plse,
-        out,
-        lse,
-        rows,
-        rows * 32,
-        splits,
-        stream,
-    )
+    launch_merge(gpu, k, part, plse, out, lse, rows, 32, splits, stream)
 }
 
 /// `glm_sparse_decode_split_merge_extra` over `rows` x 32 heads: the BF16
@@ -239,7 +231,7 @@ pub(crate) fn launch_merge_extra(
         k.0 != 0 && splits < 16 && extra.0 != 0,
         "GLM extra-partition split merge needs its kernel, a partial and at most 15 splits"
     );
-    merge_launch(gpu, k, part, plse, out, lse, rows, rows * 32, splits)
+    merge_launch(gpu, k, part, plse, out, lse, rows, 32, splits)
         .arg_ptr(extra)
         .launch(stream)
 }
@@ -268,14 +260,14 @@ pub(crate) fn launch_merge_pair(
         k.0 != 0 && (1..16).contains(&splits) && extra.0 != 0,
         "GLM paired split merge needs its kernel, a partial and 1..=15 splits"
     );
-    merge_launch(gpu, k, part, plse, out, lse, rows, rows * 32, splits)
+    merge_launch(gpu, k, part, plse, out, lse, rows, 32, splits)
         .arg_ptr(part_b)
         .arg_ptr(plse_b)
         .arg_ptr(extra)
         .launch(stream)
 }
 
-/// `glm_sparse_decode_split_merge` over `grid` = rows x 32 heads.
+/// `glm_sparse_decode_split_merge` over rows x `heads`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_merge(
     gpu: &dyn GpuBackend,
@@ -285,14 +277,15 @@ pub(crate) fn launch_merge(
     out: DevicePtr,
     lse: DevicePtr,
     rows: u32,
-    grid: u32,
+    heads: u32,
     splits: u32,
     stream: u64,
 ) -> Result<()> {
-    merge_launch(gpu, k, part, plse, out, lse, rows, grid, splits).launch(stream)
+    merge_launch(gpu, k, part, plse, out, lse, rows, heads, splits).launch(stream)
 }
 
-/// The arguments every split-merge entry point shares.
+/// The arguments every split-merge entry point shares: one CTA per row and
+/// head (one for a warm-up launch of zero rows, which returns at once).
 #[allow(clippy::too_many_arguments)]
 fn merge_launch<'a>(
     gpu: &'a dyn GpuBackend,
@@ -302,18 +295,18 @@ fn merge_launch<'a>(
     out: DevicePtr,
     lse: DevicePtr,
     rows: u32,
-    grid: u32,
+    heads: u32,
     splits: u32,
 ) -> KernelLaunch<'a> {
     KernelLaunch::new(gpu, k)
-        .grid([grid, 1, 1])
+        .grid([(rows * heads).max(1), 1, 1])
         .block([256, 1, 1])
         .arg_ptr(part)
         .arg_ptr(plse)
         .arg_ptr(out)
         .arg_ptr(lse)
         .arg_u32(rows)
-        .arg_u32(32)
+        .arg_u32(heads)
         .arg_u32(512)
         .arg_u32(splits)
 }

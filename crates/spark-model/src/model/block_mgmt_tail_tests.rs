@@ -6,11 +6,13 @@
 //! allocation, which a preempt-and-retry re-enters with already in-window.
 
 use super::*;
+use crate::model::prefix_share::adopt_prefix_match;
 use spark_runtime::gpu::mock::MockGpuBackend;
 use spark_runtime::kv_cache::{
     KvCacheConfig, KvCacheDtype, NO_TAIL, SparseIndexCacheConfig, TailSlotPlan,
 };
-use spark_runtime::prefix_cache::NoPrefixCaching;
+use spark_runtime::prefix_cache::{NoPrefixCaching, PrefixCache};
+use spark_runtime::radix_tree::RadixTree;
 
 const BLOCKS: usize = 8;
 const PLAN: TailSlotPlan = TailSlotPlan {
@@ -103,6 +105,68 @@ fn prefill_exhaustion_publishes_the_blocks_it_pushed() {
     held[..2].iter().for_each(|&b| cache.free_block(b));
     prefill(&mut seq, 4, &mut cache, &gpu).unwrap();
     assert_eq!(seq.block_table.len(), 5);
+    assert_published(&cache, &gpu, &seq.block_table);
+}
+
+#[test]
+fn prefill_before_a_nonzero_window_is_a_noop() {
+    let gpu = MockGpuBackend::new();
+    let mut cache = cache_with_stale_index(&gpu, None);
+    let mut seq = SequenceState::host_only(0);
+    seq.block_table.push(cache.alloc_block().unwrap());
+    // Model the retained HSS prefix: two disk ids and one resident block make
+    // the current window start one. The requested absolute block is before it;
+    // bulk-reclaim bookkeeping must not underflow or allocate a new block.
+    seq.disk_block_ids.extend([101, 102]);
+    let before = seq.block_table.clone();
+    prefill(&mut seq, 0, &mut cache, &gpu).unwrap();
+    assert_eq!(seq.block_table, before);
+}
+
+#[test]
+fn prefill_bulk_reclaims_exact_shortfall_from_real_prefix_cache() {
+    const BS: usize = 16;
+    let gpu = MockGpuBackend::new();
+    let mut cache = cache_with_stale_index(&gpu, Some(PLAN));
+    let tree = RadixTree::new();
+    let mut prefixes = Vec::with_capacity(BLOCKS);
+
+    // Fill the pool with one-block real radix entries. Drop each creator's
+    // temporary KV reference after publishing so only the cache owns it.
+    for i in 0..BLOCKS {
+        let base = 1_000 + (i * BS) as u32;
+        let tokens: Vec<u32> = (base..base + BS as u32).collect();
+        let block = cache.alloc_block().unwrap();
+        let acquired = tree.insert(&tokens, &[block], &[], BS, 0, 0);
+        super::super::cache_acquires_refs(&acquired, &mut cache);
+        cache.free_block(block);
+        // `insert(..., matched_tokens=0)` also records the inserting
+        // sequence's temporary tree reference. Finalization releases that
+        // reference while the cache's baseline ref remains evictable.
+        tree.release(&tokens, BS, 0);
+        prefixes.push((tokens, block));
+    }
+    assert_eq!(cache.num_free_blocks(), 0);
+
+    // Keep one cached block live through a production prefix lookup/adoption;
+    // bulk reclaim must evict exactly the two blocks needed by this prefill,
+    // leaving that live block and the other cache entries intact.
+    let mut live_seq = SequenceState::host_only(7);
+    let live_match = tree.lookup_whole_blocks(&prefixes[0].0, BS, 0, 0);
+    adopt_prefix_match(&mut live_seq, &live_match, &mut cache).unwrap();
+    assert_eq!(cache.ref_count(prefixes[0].1), 2);
+
+    let mut seq = SequenceState::host_only(8);
+    ensure_blocks_through_prefill(&mut seq, 1, &mut cache, &tree, &gpu, 0, false).unwrap();
+    assert_eq!(seq.block_table.len(), 2);
+    assert_eq!(cache.num_free_blocks(), 0);
+    assert_eq!(cache.ref_count(prefixes[0].1), 2);
+    assert_eq!(tree.peek_matched_tokens(&prefixes[0].0, BS, 0), BS);
+    let survivors = prefixes
+        .iter()
+        .filter(|(tokens, _)| tree.peek_matched_tokens(tokens, BS, 0) == BS)
+        .count();
+    assert_eq!(survivors, BLOCKS - 2);
     assert_published(&cache, &gpu, &seq.block_table);
 }
 

@@ -959,6 +959,8 @@ impl BlockDiffusionDraftHead {
             // capture pass lands. Layout: [pre_0, post_0, ..., tail].
             propose_graphs: parking_lot::Mutex::new(std::collections::HashMap::new()),
             next_lane: std::sync::atomic::AtomicUsize::new(0),
+            acc_pool: parking_lot::Mutex::new(Vec::new()),
+            acc_pool_cap: 4,
             lanes_start_event: gpu.create_event()?,
             suppress_graphs: std::sync::atomic::AtomicBool::new(false),
             propose_warmup_count: std::sync::atomic::AtomicUsize::new(0),

@@ -150,7 +150,12 @@ impl Glm5KdaLayer {
             } else {
                 run_fused()?;
             }
-        } else {
+        } else if self.layer_idx + 1 == ctx.config.num_hidden_layers
+            || !crate::layers::glm_sp_moe_seam::defer_post(self.hc_post_k)
+        {
+            // A pending MoE output seam (`layers::glm_sp_moe_seam`) runs
+            // whole when this layer posts itself.
+            crate::layers::glm_sp_moe_seam::flush(ctx, stream)?;
             self.hc_post(ffn_out, m, ctx, stream)?;
         }
         profile::step(ctx, stream, &mut profile_timer, "hc_ffn_post")?;

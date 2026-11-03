@@ -45,13 +45,12 @@ pub(super) fn strip_all_preserving_boundary(s: &str, tag: &str) -> String {
     out
 }
 
-/// Env-gated diagnostic trace for the thinking-phase emit path.
-/// Off by default; logs at DEBUG when `ATLAS_THINKING_DECODE_TRACE` is
-/// set in the environment. Lets us spot strip-loop mutations against
-/// the raw decoded delta when investigating residual missing-space
-/// artifacts in `<think>` blocks.
+/// Diagnostic trace for the thinking-phase emit path, at DEBUG
+/// (`RUST_LOG`). Lets us spot strip-loop mutations against the raw decoded
+/// delta when investigating residual missing-space artifacts in `<think>`
+/// blocks.
 pub(super) fn maybe_log_decode_trace(raw: &str, cleaned: &str, full_len: usize, emitted_in: usize) {
-    if std::env::var_os("ATLAS_THINKING_DECODE_TRACE").is_none() {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
         return;
     }
     let raw_head: String = raw.chars().take(64).collect();
