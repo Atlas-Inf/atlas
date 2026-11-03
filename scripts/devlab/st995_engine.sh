@@ -3,22 +3,32 @@
 # DevLab Strix bench: the ST-995 accuracy leg (bfcl-subset: n=995, seed 42, temp 0, no overrides; Atlas's own runner, the
 # same leg st995.sh runs against Atlas) against ANOTHER engine's OpenAI-compatible server, for the engine head-to-head.
 #
-#   scripts/devlab/st995_engine.sh <gufo|llamacpp> [27b|fnext] [KEY=VAL ...]
+#   scripts/devlab/st995_engine.sh <atlas|gufo|llamacpp> [27b|fnext] [KEY=VAL ...]
 #   KEYS: WEIGHTS=q4|nvfp4 (llamacpp only; default q4 -- nvfp4 converts NVIDIA's checkpoint with llama.cpp's converter)
+#         ATLAS_MODE=recipe|refmode|think (atlas; see lib_engines.sh atlas_up), THINK=on (llamacpp: thinking on)
+# atlas serves NVIDIA's NVFP4 checkpoint through serve-amd.sh at this ref (MAX_BATCH 1, GPU_UTIL 0.70).
 # Gufo serves GGUF only, so it runs the Unsloth UD-Q4_K_XL its guide pins. Thinking off, AR (no speculation), 1 session:
 # the leg is sequential, and Gufo's quality contract makes greedy speculation output-identical to AR anyway.
 set -uo pipefail
-ENGINE=${1:?gufo|llamacpp}; MK=fnext; ARGS=("${@:2}")
+ENGINE=${1:?atlas|gufo|llamacpp}; MK=fnext; ARGS=("${@:2}")
 [[ "${2:-}" =~ ^(27b|fnext)$ ]] && { MK=$2; ARGS=("${@:3}"); }
 for kv in "${ARGS[@]}"; do [[ "$kv" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9_./:,+-]*$ ]] && export "$kv"; done
 WEIGHTS=${WEIGHTS:-q4}; CTX=${CTX:-32768}; PORT=18085
 OUT=${DEVLAB_OUT:-$PWD/devlab-out}; mkdir -p "$OUT"; RES="$OUT/RESULTS.txt"
 HERE=$(cd "$(dirname "$0")" && pwd); . "$HERE/lib_engines.sh"
 model_spec "$MK" || exit 1; pyhf
-Q4D=$(hf_get "$Q4_REPO" "$Q4_PAT" "$Q4_REV") || { log "MODEL DOWNLOAD FAILED: $(tail -2 "$OUT/download.log")"; exit 1; }
-TGT=$(first_gguf "$Q4D" "$Q4_PAT")
+if [ "$ENGINE" != atlas ]; then # the GGUF engines' weights; atlas serves NVIDIA's NVFP4 directly
+  Q4D=$(hf_get "$Q4_REPO" "$Q4_PAT" "$Q4_REV") || { log "MODEL DOWNLOAD FAILED: $(tail -2 "$OUT/download.log")"; exit 1; }
+  TGT=$(first_gguf "$Q4D" "$Q4_PAT")
+fi
 
 case $ENGINE in
+atlas)
+  [ -x target/release/spark ] || { log "no target/release/spark"; exit 1; }
+  hf_get "$NVFP4_REPO" "" >/dev/null || { log "NVFP4 DOWNLOAD FAILED"; exit 1; }
+  TGT=$(hf_get "$NVFP4_REPO" "")/config.json
+  atlas_up $PORT "$NVFP4_REPO" GPU_UTIL=0.70 MAX_SEQ_LEN=$CTX MAX_BATCH=1 ATLAS_KV_EXTERNAL_RESERVE_GB=0
+  log "atlas mode ${ATLAS_MODE:-recipe}" ;;
 gufo) gufo_build || exit 1; gufo_up $PORT 1 "$CTX" "$TGT" ;;
 llamacpp)
   llama_build || exit 1
@@ -26,7 +36,7 @@ llamacpp)
   llama_up $PORT 1 "$CTX" "$TGT" ;;
 *) log "unknown engine $ENGINE"; exit 1 ;;
 esac
-log "engine $ENGINE, model $MK, weights $(basename "$TGT") ($(du -shL "$TGT" | cut -f1)), atlas ref $(git rev-parse --short=9 HEAD)"
+log "engine $ENGINE, model $MK, weights $(basename "$(dirname "$TGT")")/$(basename "$TGT"), atlas ref $(git rev-parse --short=9 HEAD), THINK=${THINK:-off}"
 wait_ready $PORT || { log "SERVER NOT READY"; ENGINE_DOWN "$OUT/serve.log"; tail -20 "$OUT/serve.log" | tee -a "$RES"; exit 1; }
 log "serving model id '$MID'; bfcl-subset starting"
 SHIM=""; for d in $(ls -dt "$PWD"/target/release/build/atlas-kernels-*/out 2>/dev/null); do ls "$d"/libcuda.so* >/dev/null 2>&1 && { SHIM="$d"; break; }; done

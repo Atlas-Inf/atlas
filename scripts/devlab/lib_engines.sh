@@ -86,16 +86,23 @@ PY
 llama_up() { # port parallel ctx-per-slot model [extra llama-server args...]
   local port=$1 np=$2 ctx=$3 m=$4; shift 4
   "$LB/llama-server" -m "$m" -ngl 99 -c $(( ctx * np )) -np "$np" --jinja --host 127.0.0.1 --port "$port" \
-    --chat-template-kwargs '{"enable_thinking":false}' "$@" > "$OUT/llama-server.log" 2>&1 &
+    --chat-template-kwargs "{\"enable_thinking\":$([ "${THINK:-off}" = on ] && echo true || echo false)}" "$@" > "$OUT/llama-server.log" 2>&1 &
   LPID=$!
   ENGINE_ALIVE() { kill -0 "$LPID" 2>/dev/null; }
   ENGINE_DOWN() { kill -INT "$LPID" 2>/dev/null; sleep 8; kill -9 "$LPID" 2>/dev/null; cp "$OUT/llama-server.log" "$1" 2>/dev/null; true; }
 }
 
 atlas_up() { # port model [KEY=VAL env...] -- Atlas through serve-amd.sh at this ref (the binary the workflow just built)
+  # ATLAS_MODE: recipe (default; --disable-thinking), refmode (--reference-mode, client sampling + checkpoint template only;
+  # thinking kept off through the default template kwarg, which is how the llama.cpp side runs), think (thinking on, recipe).
   local port=$1 m=$2; shift 2
+  local mf=(--disable-thinking)
+  case ${ATLAS_MODE:-recipe} in
+    refmode) mf=(--reference-mode --default-chat-template-kwargs '{"enable_thinking":false}') ;;
+    think) mf=() ;;
+  esac
   ( exec env RUST_LOG=info ATLAS_BIN="$PWD/target/release/spark" PORT="$port" HOST=127.0.0.1 MODEL_NAME=m "$@" \
-      ./serve-amd.sh "$m" --disable-thinking --request-timeout 0 --enable-prefix-caching ) > "$OUT/atlas-server.log" 2>&1 &
+      ./serve-amd.sh "$m" "${mf[@]}" --request-timeout 0 --enable-prefix-caching ) > "$OUT/atlas-server.log" 2>&1 &
   APID=$!
   ENGINE_ALIVE() { kill -0 "$APID" 2>/dev/null; }
   ENGINE_DOWN() { kill -INT "$APID" 2>/dev/null; for _ in $(seq 1 90); do kill -0 "$APID" 2>/dev/null || break; sleep 2; done
