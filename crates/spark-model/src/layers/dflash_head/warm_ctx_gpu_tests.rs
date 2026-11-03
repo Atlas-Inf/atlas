@@ -11,16 +11,27 @@
 //! window vs a cold prefill of the same prompt) is
 //! `scripts/dflash_warm_ctx_check.py`.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::GpuBackend;
+use std::sync::OnceLock;
 
 use super::WarmCtx;
 use super::warm_ctx_store::{StoreRefs, WarmCtxStore, store_key};
 use super::warm_ctx_tests::{Turn, W, prefill, store, tokens, window};
 
-fn cuda() -> Result<AtlasCudaBackend> {
-    AtlasCudaBackend::new(0, &[]).context("CUDA backend")
+/// One backend for the whole test process: two `AtlasCudaBackend::new`s in
+/// the same process leave the second with a NULL current context
+/// (`cuCtxGetCurrent: status 0`), so the shared instance is bound to the
+/// calling thread on every use.
+fn cuda() -> Result<&'static AtlasCudaBackend> {
+    static GPU: OnceLock<Result<AtlasCudaBackend, String>> = OnceLock::new();
+    let gpu = GPU
+        .get_or_init(|| AtlasCudaBackend::new(0, &[]).map_err(|e| format!("CUDA backend: {e:#}")))
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!(e.clone()))?;
+    gpu.bind_to_thread()?;
+    Ok(gpu)
 }
 
 #[test]
@@ -29,24 +40,24 @@ fn a_warm_turn_window_matches_its_cold_prefill_on_the_device() -> Result<()> {
     let gpu = cuda()?;
     for (first, second) in [(40, 44), (40, 41), (70, 75), (90, 120), (9, 13)] {
         let toks = tokens(second, 2);
-        let store = store(&gpu, 4);
+        let store = store(gpu, 4);
         let cold = window(
-            &gpu,
-            &mut prefill(&gpu, &store, WarmCtx::Exact, &toks, Turn::cold(second)),
+            gpu,
+            &mut prefill(gpu, &store, WarmCtx::Exact, &toks, Turn::cold(second)),
         );
         let turn1 = Turn::cold(first);
-        prefill(&gpu, &store, WarmCtx::Restore, &toks, turn1);
+        prefill(gpu, &store, WarmCtx::Restore, &toks, turn1);
         let turn2 = Turn {
             skip: turn1.cut(),
             ..Turn::cold(second)
         };
         let warm = window(
-            &gpu,
-            &mut prefill(&gpu, &store, WarmCtx::Restore, &toks, turn2),
+            gpu,
+            &mut prefill(gpu, &store, WarmCtx::Restore, &toks, turn2),
         );
         anyhow::ensure!(warm == cold, "{first}->{second}: {warm:?} != {cold:?}");
         anyhow::ensure!(warm.len() == W.min(second));
-        store.free(&gpu);
+        store.free(gpu);
     }
     Ok(())
 }
@@ -57,7 +68,7 @@ fn the_store_round_trips_glm_windows_on_the_device() -> Result<()> {
     const ROW: usize = 5 * 4096 * 2;
     const WINDOW: usize = 2048;
     let gpu = cuda()?;
-    let gpu: &dyn GpuBackend = &gpu;
+    let gpu: &dyn GpuBackend = gpu;
     let stream = gpu.default_stream();
     let rows: Vec<u8> = (0..WINDOW * ROW).map(|i| (i * 131 % 251) as u8).collect();
     let acc = gpu.alloc(WINDOW * ROW)?;
