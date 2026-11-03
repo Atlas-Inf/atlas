@@ -626,6 +626,14 @@ max_thinking_budget = 2048
 # template's own default is xhigh. Clients and --default-chat-template-kwargs
 # still pick any tier.
 default_reasoning_effort = "medium"
+# Tool calls: no `<tool_call>` logit bias or inter-tool prose cap, and the prompt
+# is the checkpoint template's render only (no Atlas tool prompt on top of the
+# template's own tool block). The same three settings took the strix-hip 27B from
+# ST-995 84.32/74.58 to 88.24/84.83 (live_irrelevance 38.64 -> 94.32, #324) and
+# match gb10/qwen3.8-flash-next (565aa68bc).
+tool_call_steering = false
+max_inter_tool_prose = 0
+verbatim_prompt = true
 # Guards carried over from the Atlas-Inf side of the merge: cap the think
 # budget at the request's own max_tokens rather than letting a 2048-token
 # reasoning block starve the answer, and keep the repetition watchdog on --
