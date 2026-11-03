@@ -271,8 +271,9 @@ fn text_of(deltas: &[ir::StreamDelta]) -> String {
 
 #[test]
 fn a_call_that_validation_rejects_finishes_stop() {
-    // A declared write whose path carries whitespace fails validation, so no
-    // call reaches the client and the stream must not claim a tool turn.
+    // A declared write whose path carries a command separator fails
+    // validation, so no call reaches the client and the stream must not claim
+    // a tool turn.
     let write = vec![1, END, TOOL, 44, 5, 45, 7, 8, 46, 10, 11];
     let (_, deltas) = stream_tokens_for_write(write.clone());
     assert!(tool_names(&deltas).is_empty());

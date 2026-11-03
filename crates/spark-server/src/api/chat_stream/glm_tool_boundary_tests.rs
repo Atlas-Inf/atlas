@@ -97,7 +97,7 @@ fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<A
         "\n",
         "write",
         "path",
-        "/tmp/a b",
+        "/tmp/a; b",
     ];
     let vocab = words
         .iter()
