@@ -147,7 +147,7 @@ impl Default for ParsedBehavior {
             eos_ends_thinking: false,
             tool_call_steering: true,
             verbatim_reasoning_effort: false,
-            ban_tool_call_without_tools: false,
+            ban_tool_call_without_tools: true,
         }
     }
 }
@@ -341,7 +341,7 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
     let eos_ends_thinking = flag("eos_ends_thinking", false);
     let tool_call_steering = flag("tool_call_steering", true);
     let verbatim_reasoning_effort = flag("verbatim_reasoning_effort", false);
-    let ban_tool_call_without_tools = flag("ban_tool_call_without_tools", false);
+    let ban_tool_call_without_tools = flag("ban_tool_call_without_tools", true);
     ParsedBehavior {
         thinking_in_tools,
         max_thinking_budget,
