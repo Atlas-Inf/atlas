@@ -30,7 +30,7 @@ pub(in crate::scheduler) fn raw_argmax_is_pick(a: &ActiveSeq) -> bool {
         && a.frequency_penalty == 0.0
         && a.lz_penalty == 0.0
         && a.dry_multiplier == 0.0
-        && a.logit_bias.is_empty()
+        && crate::scheduler::min_tokens_ban::bias_is_hard_bans_only(&a.logit_bias)
         && !tool_pin_armed(a)
 }
 
@@ -47,6 +47,9 @@ pub(in crate::scheduler) fn raw_pick_masked(a: &ActiveSeq, tok: u32) -> bool {
     Some(tok) == a.think_end_token
         || Some(tok) == a.think_start_token
         || (a.suppress_tool_call && Some(tok) == a.tool_call_start_token)
+        || a.logit_bias
+            .iter()
+            .any(|&(id, delta)| id == tok && delta == f32::NEG_INFINITY)
 }
 
 /// One row's pick as plain decode makes it: the GPU argmax where

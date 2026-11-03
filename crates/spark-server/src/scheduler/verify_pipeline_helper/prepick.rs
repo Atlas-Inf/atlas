@@ -51,7 +51,7 @@ pub(super) struct Prepicked {
 /// a hint the stage does not consume is simply dropped. Not under a
 /// min_tokens end-token ban: F2 reads the masked row there (`min_tokens_ban`).
 pub(super) fn f2_may_run(a: &ActiveSeq, ctx: &LogitsContext, k: usize) -> bool {
-    crate::scheduler::min_tokens_ban::banned_ids(a).is_none()
+    !crate::scheduler::min_tokens_ban::eos_ban_active(a)
         && !ctx.sampling.disable_watchdogs
         && ctx.watchdog.confidence_early_stop
         && a.inside_thinking

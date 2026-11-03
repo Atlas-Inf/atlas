@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Qwen3.8-Flash-Next prompts are the reference server's prompts, byte for
-//! byte.
+//! These pin the `verbatim_prompt = true` render: the reference server's
+//! prompts byte for byte (reachable by flipping the target's key back on;
+//! MODEL.toml now ships it off).
 //!
 //! The reference for nvidia/Qwen3.8-Flash-Next-FP4-Local is vLLM rendering
 //! the checkpoint's own `chat_template.jinja`
@@ -127,7 +128,7 @@ fn behavior() -> atlas_kernels::ModelBehavior {
         cap_thinking_at_max_tokens: b.cap_thinking_at_max_tokens,
         tscg: b.tscg,
         preserve_thinking: b.preserve_thinking,
-        verbatim_prompt: b.verbatim_prompt,
+        verbatim_prompt: true,
         tool_call_steering: b.tool_call_steering,
         ..Default::default()
     }
@@ -244,7 +245,20 @@ fn no_request_form_gets_a_thinking_budget_or_a_tool_call_bias() {
             0,
         )
         .unwrap_or_else(|_| panic!("{}: sampling setup", case.name));
-        assert!(sampling.logit_bias.is_empty(), "{}: logit bias", case.name);
+        // No steering bias; a request without tools carries only the hard ban
+        // on the `<tool_call>` opener (`ban_tool_call_without_tools`).
+        if prepared.tools_active {
+            assert!(sampling.logit_bias.is_empty(), "{}: logit bias", case.name);
+        } else {
+            assert!(
+                sampling
+                    .logit_bias
+                    .iter()
+                    .all(|&(_, delta)| delta == f32::NEG_INFINITY),
+                "{}: logit bias",
+                case.name
+            );
+        }
     }
 }
 
@@ -264,4 +278,18 @@ fn n104_fenced_tool_call_render() {
     let (_, prepared) = prepare(&state, &request).unwrap();
     eprintln!("PROMPT>>>{prompt}<<<");
     eprintln!("IDS>>>{:?}<<<", prepared.prompt_tokens);
+}
+
+/// The target's own MODEL.toml ships `verbatim_prompt = false` (the
+/// 2026-11-02 maintainer override on the #271 attribution). The golden cases
+/// above still pin the verbatim RENDER; this one guards the knob.
+#[test]
+fn target_model_toml_ships_verbatim_prompt_off() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(TARGET);
+    let b = build_behavior::parse_behavior(&dir);
+    assert!(
+        !b.verbatim_prompt,
+        "the MODEL.toml 2026-11-02 override wants verbatim_prompt = false; \
+         if this flips back, re-check the #271 attribution numbers"
+    );
 }

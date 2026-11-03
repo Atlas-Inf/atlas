@@ -414,7 +414,18 @@ min_reasoning_floor_tokens = 0
 # tool prompt beside the template's own tool block (it rendered the tool list
 # twice), no tool-result hints or notices, and `tojson` spaced as transformers
 # renders it.
-verbatim_prompt = true
+# 2026-11-02 OVERRIDE (maintainer decision on the #271 attribution): this
+# target ships verbatim_prompt OFF. The paragraph above describes the
+# reference render, which stays reachable by setting this key to true. On
+# single-GB10 FP4-Local the verbatim render cost the agentic-webserver gate
+# 3/50 iterations (the final Cargo.toml write never issued) and 2.1 points of
+# BFCL ST-995 normalized (irrelevance 95.83 -> 87.50). With only this key
+# off, main 8c2b67218 observed agentic 50/50 and BFCL 87.54 / 87.79
+# (run-1793576349809849743; one run per arm, full table on #271). Off
+# restores Atlas's render: the qwen3_coder parser tool prompt beside the
+# template's tool block, and the tool-result hints. Every other
+# reference-parity key below stays as 565aa68 set it.
+verbatim_prompt = false
 # No server thinking budget: an effort-silent request renders the template's
 # default (xhigh) and thinks until it closes `</think>` or hits max_tokens; a
 # client's reasoning_effort only picks the template's tier. An explicit client
@@ -440,3 +451,10 @@ max_inter_tool_prose = 0
 # other engines; clients bound it there.
 enable_loop_watchdog = false
 enable_stream_loop_guards = false
+
+# 2026-11-02: on the pair (job tcrepro), a request declaring NO tools whose
+# system prompt describes tool abilities — clients without native function
+# calling — produced literal `<tool_call>` content 8/8 on rc16 and 6/8 in
+# spark mode. Banning the opener restores a prose answer. vLLM does not do
+# this.
+ban_tool_call_without_tools = true

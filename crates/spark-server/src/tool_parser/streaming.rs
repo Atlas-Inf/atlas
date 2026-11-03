@@ -58,6 +58,12 @@ pub struct StreamingToolDetector {
     /// Lexical context for content already emitted by the detector. XML-looking
     /// markers inside code or quotes remain content and update this state.
     pub(super) literal_xml_state: crate::literal_xml::LiteralXmlState,
+    /// Native GLM opener tokens sampled but not yet matched to an opener in
+    /// `buffer` (`note_native_opener`).
+    pub(super) native_openers: u32,
+    /// The open envelope began with a native opener token. It is a call even
+    /// under an undeclared name, so it goes to validation instead of prose.
+    pub(super) native_envelope: bool,
 }
 
 pub enum DetectorOutput {

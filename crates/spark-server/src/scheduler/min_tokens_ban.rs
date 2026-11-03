@@ -35,10 +35,41 @@ use crate::scheduler::types::ActiveSeq;
 use spark_model::traits::Model;
 use spark_runtime::gpu::DevicePtr;
 
-/// The ids the sequence's next pick may not take, when its ban covers it.
-pub(in crate::scheduler) fn banned_ids(a: &ActiveSeq) -> Option<[u32; 4]> {
-    let ban = a.seq.eos_ban;
-    (ban.target && a.output_tokens.len() < a.min_tokens).then_some(ban.ids)
+/// Up to eight ids one pick may not take; unused slots are `u32::MAX`.
+pub(in crate::scheduler) type BanIds = [u32; 8];
+
+/// Whether the min_tokens end-token ban covers the sequence's next pick.
+pub(in crate::scheduler) fn eos_ban_active(a: &ActiveSeq) -> bool {
+    a.seq.eos_ban.target && a.output_tokens.len() < a.min_tokens
+}
+
+/// The ids the sequence's next pick may not take: the min_tokens end-token
+/// ban's while it covers the pick, plus every request `logit_bias` entry at
+/// `-inf` (a hard ban, e.g. `ban_tool_call_without_tools`). Hard bans go
+/// through the same masking as the end-token ban, so they keep the GPU-argmax
+/// fast paths (a non-`-inf` bias still takes the host pipeline).
+pub(in crate::scheduler) fn banned_ids(a: &ActiveSeq) -> Option<BanIds> {
+    let mut ids = [u32::MAX; 8];
+    let mut n = 0;
+    if eos_ban_active(a) {
+        for id in a.seq.eos_ban.ids {
+            ids[n] = id;
+            n += 1;
+        }
+    }
+    for &(id, delta) in &a.logit_bias {
+        if delta == f32::NEG_INFINITY && n < ids.len() {
+            ids[n] = id;
+            n += 1;
+        }
+    }
+    (n > 0).then_some(ids)
+}
+
+/// Whether every request bias entry is a hard ban (`-inf`), which
+/// [`banned_ids`] masks on the fast paths. Empty counts.
+pub(in crate::scheduler) fn bias_is_hard_bans_only(bias: &[(u32, f32)]) -> bool {
+    bias.iter().all(|&(_, delta)| delta == f32::NEG_INFINITY)
 }
 
 /// Mask the banned ids of the next pick in a host logits row (`f32`).
@@ -48,7 +79,7 @@ pub(in crate::scheduler) fn mask_row(logits: &mut [f32], a: &ActiveSeq) {
     }
 }
 
-fn mask_ids(logits: &mut [f32], ids: [u32; 4]) {
+fn mask_ids(logits: &mut [f32], ids: BanIds) {
     for id in ids {
         if let Some(v) = logits.get_mut(id as usize) {
             *v = f32::NEG_INFINITY;
@@ -98,8 +129,8 @@ pub(in crate::scheduler) fn fix_raw_picks(
         return Ok(true);
     }
     // Row r's count is at most `n + r`: every row is below the floor when
-    // the last one is.
-    if a.output_tokens.len() + picks.len() > a.min_tokens {
+    // the last one is. (Hard bans have no floor.)
+    if eos_ban_active(a) && a.output_tokens.len() + picks.len() > a.min_tokens {
         return Ok(false);
     }
     let vocab = model.vocab_size();
