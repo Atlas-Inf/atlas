@@ -98,6 +98,50 @@ fn validate_rejects_write_with_empty_filepath() {
 }
 
 #[test]
+fn validate_write_paths_reject_commands_not_ordinary_names() {
+    // A live ZCode Edit under "/Volumes/JMac Overflow/…" was rejected for its
+    // space. Spaces, parentheses and a lone `&` are ordinary file names;
+    // shell operators and control characters still mark a leaked command.
+    let tool: ToolDefinition = serde_json::from_value(serde_json::json!({
+        "type": "function",
+        "function": {"name": "edit", "parameters": {"type": "object",
+            "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}}
+    }))
+    .unwrap();
+    let check = |path: &str| {
+        let call = ToolCall {
+            id: "x".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "edit".to_string(),
+                arguments: serde_json::json!({ "file_path": path }).to_string(),
+            },
+        };
+        validate_single_tool_call(&call, std::slice::from_ref(&tool))
+    };
+    for path in [
+        "/Volumes/JMac External/software/ml/a.rs",
+        "/tmp/My Files (2)/notes.md",
+        "docs/R&D plan.md",
+        "src/main.rs",
+    ] {
+        assert!(check(path).is_ok(), "{path:?}: {:?}", check(path));
+    }
+    for path in [
+        "created && ls -R",
+        "a.rs; rm -rf /",
+        "a.rs | tee b",
+        "out.txt > log",
+        "`id`.rs",
+        "$(id).rs",
+        "a.rs\nb.rs",
+        "ab",
+    ] {
+        assert!(check(path).is_err(), "{path:?} should be rejected");
+    }
+}
+
+#[test]
 fn validate_allows_read_with_empty_path() {
     // Theia getWorkspaceFileList passes path="" — must keep
     // working. Only WRITE_FAMILY rejects empty paths.
