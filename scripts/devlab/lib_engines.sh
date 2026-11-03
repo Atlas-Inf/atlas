@@ -91,7 +91,7 @@ llama_up() { # port parallel ctx-per-slot model [extra llama-server args...]
 atlas_up() { # port model [KEY=VAL env...] -- Atlas through serve-amd.sh at this ref (the binary the workflow just built)
   local port=$1 m=$2; shift 2
   ( exec env RUST_LOG=info ATLAS_BIN="$PWD/target/release/spark" PORT="$port" HOST=127.0.0.1 MODEL_NAME=m "$@" \
-      ./serve-amd.sh "$m" --disable-thinking --request-timeout 0 ) > "$OUT/atlas-server.log" 2>&1 &
+      ./serve-amd.sh "$m" --disable-thinking --request-timeout 0 --enable-prefix-caching ) > "$OUT/atlas-server.log" 2>&1 &
   APID=$!
   ENGINE_ALIVE() { kill -0 "$APID" 2>/dev/null; }
   ENGINE_DOWN() { kill -INT "$APID" 2>/dev/null; for _ in $(seq 1 90); do kill -0 "$APID" 2>/dev/null || break; sleep 2; done
