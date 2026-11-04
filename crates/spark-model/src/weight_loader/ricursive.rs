@@ -19,7 +19,7 @@
 
 use anyhow::{Context, Result, ensure};
 use atlas_core::config::{LayerType, ModelConfig};
-use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kv_cache::KvCacheDtype;
 use spark_runtime::weights::{WeightDtype, WeightStore};
 

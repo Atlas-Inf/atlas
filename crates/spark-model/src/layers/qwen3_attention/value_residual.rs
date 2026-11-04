@@ -138,7 +138,10 @@ pub(crate) fn install_value_residual(
     let shadow = gpu.alloc(hidden_states_bytes)?;
     let vin = gpu.alloc(hidden_states_bytes)?;
     for (i, layer) in layers.iter_mut().enumerate() {
-        let Some(attn) = layer.as_any_mut().downcast_mut::<Qwen3AttentionLayer>() else {
+        let Some(attn) = layer
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<Qwen3AttentionLayer>())
+        else {
             anyhow::bail!("value residuals: layer {i} is not a Qwen3AttentionLayer");
         };
         ensure!(
