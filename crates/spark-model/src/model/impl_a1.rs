@@ -611,12 +611,17 @@ impl TransformerModel {
         };
 
         // Embedding scale (Gemma-4: sqrt(hidden_size)). Only load if model uses it.
+        // A config that asks for a scale and a target that cannot apply it is
+        // a load error: skipping it ran Ripple on unscaled embeddings (the
+        // strix-hip tree had no `embed_scale` module) with nothing but a WARN.
         let embed_scale_kernel = if config.embed_scale > 0.0 {
-            gpu.kernel("embed_scale", "bf16_scale_inplace")
-                .unwrap_or_else(|e| {
-                    tracing::warn!("embed_scale kernel not found: {e}");
-                    KernelHandle(0)
-                })
+            gpu.kernel("embed_scale", "bf16_scale_inplace").map_err(|e| {
+                anyhow::anyhow!(
+                    "config embed_scale {} needs embed_scale::bf16_scale_inplace, \
+                     which this kernel target does not ship: {e}",
+                    config.embed_scale
+                )
+            })?
         } else {
             KernelHandle(0)
         };

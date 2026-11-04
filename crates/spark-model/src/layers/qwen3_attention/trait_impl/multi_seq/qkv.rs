@@ -357,7 +357,10 @@ impl Qwen3AttentionLayer {
                 std::env::var("ATLAS_NO_QK_NORM_STRIDED").ok().as_deref() != Some("1")
             })
         }
+        // `rms_norm_strided` is the offset-from-1 `(1 + w)` norm: vanilla-norm
+        // models take the per-row `rms_norm_w_k` loop below.
         if n > 1
+            && !self.norm_vanilla
             && self.rms_norm_strided_k.0 != 0
             && qk_norm_strided_enabled()
             && per_seq_qkv.is_multiple_of(bf16)

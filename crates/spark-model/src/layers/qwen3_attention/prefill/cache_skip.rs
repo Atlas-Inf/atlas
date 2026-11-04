@@ -229,7 +229,9 @@ impl Qwen3AttentionLayer {
                     .unwrap_or(ctx.config.rope_theta as f32),
                 stream,
             )?;
-        } else if self.gated && !self.attn.q_norm.weight.is_null() {
+        } else if self.gated && !self.attn.q_norm.weight.is_null() && !self.norm_vanilla {
+            // The fused kernel applies the offset-from-1 `(1 + w)` norm; vanilla-
+            // norm models (Ripple) take the split + `rms_norm_w_k` arm below.
             // Fused deinterleave + Q norm: eliminates Q global memory round-trip
             ops::deinterleave_qg_split_qnorm(
                 ctx.gpu,
@@ -256,6 +258,19 @@ impl Qwen3AttentionLayer {
                 q_proj_dim as u32,
                 stream,
             )?;
+            if !self.attn.q_norm.weight.is_null() {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_w_k,
+                    q_contiguous,
+                    &self.attn.q_norm,
+                    q_contiguous,
+                    nq * n,
+                    hd,
+                    eps,
+                    stream,
+                )?;
+            }
         } else if self.mla.is_some() {
             // DIAGNOSTIC: check V BEFORE Q copy
             if self.attn_layer_idx == 0 && ctx.config.model_type == "mistral" {
