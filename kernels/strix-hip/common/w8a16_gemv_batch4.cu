@@ -283,6 +283,14 @@ extern "C" __global__ void __launch_bounds__(256) w8a16_gemv_batch8_dyn_vl2_n2(
         const float sc1 = v1 ? block_scale[nb1 * k_blocks + base_k / FP8_BLOCK] : 0.f;
         const uint4 p0 = v0 ? reinterpret_cast<const uint4*>(B + (unsigned long long)n0 * K)[k16] : make_uint4(0,0,0,0);
         const uint4 p1 = v1 ? reinterpret_cast<const uint4*>(B + (unsigned long long)n1 * K)[k16] : make_uint4(0,0,0,0);
+        // Second-half weight words + scales are issued here, before the first half's FMAs, so all four 16-byte
+        // weight loads of the iteration are in flight together (kbench 41797477178, DRAM-rotated: +5..+19% at
+        // the 27B FP8 shapes, bit-identical). Only issue order moved; every output's arithmetic is unchanged.
+        const unsigned int base2_h = k2 * 16;
+        const float sc20 = (v0 && k2v) ? block_scale[nb0 * k_blocks + base2_h / FP8_BLOCK] : 0.f;
+        const float sc21 = (v1 && k2v) ? block_scale[nb1 * k_blocks + base2_h / FP8_BLOCK] : 0.f;
+        const uint4 q0 = (v0 && k2v) ? reinterpret_cast<const uint4*>(B + (unsigned long long)n0 * K)[k2] : make_uint4(0,0,0,0);
+        const uint4 q1 = (v1 && k2v) ? reinterpret_cast<const uint4*>(B + (unsigned long long)n1 * K)[k2] : make_uint4(0,0,0,0);
         float w0[16], w1[16];
         {
             const unsigned int w[4] = {p0.x, p0.y, p0.z, p0.w};
@@ -320,11 +328,6 @@ extern "C" __global__ void __launch_bounds__(256) w8a16_gemv_batch8_dyn_vl2_n2(
             }
         }
         if (k2v) {
-            const unsigned int base2 = k2 * 16;
-            const float sc20 = v0 ? block_scale[nb0 * k_blocks + base2 / FP8_BLOCK] : 0.f;
-            const float sc21 = v1 ? block_scale[nb1 * k_blocks + base2 / FP8_BLOCK] : 0.f;
-            const uint4 q0 = v0 ? reinterpret_cast<const uint4*>(B + (unsigned long long)n0 * K)[k2] : make_uint4(0,0,0,0);
-            const uint4 q1 = v1 ? reinterpret_cast<const uint4*>(B + (unsigned long long)n1 * K)[k2] : make_uint4(0,0,0,0);
             float u0[16], u1[16];
             {
                 const unsigned int w[4] = {q0.x, q0.y, q0.z, q0.w};
