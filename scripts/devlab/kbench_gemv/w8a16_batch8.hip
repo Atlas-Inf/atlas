@@ -124,12 +124,12 @@ struct Cand { const char* name; KFn fn; int outs_per_block; };
 
 int main() {
     // 27B FP8 projections at M = 8 (Qwen3.8-27B: H 5120; GDN qkv 10240 + z 6144; attn q+gate 12288; out/o_proj K 6144)
-    const unsigned int shapes[][2] = {{16384, 5120}, {12288, 5120}, {5120, 6144}, {2048, 5120}};
+    const unsigned int shapes[][2] = {{16384, 5120}, {5120, 6144}};
     // Loop #2: DRAM-realistic timing (weights rotated across >256 MB of copies so the 32 MB MALL cannot serve them)
     // and occupancy candidates. Loop #1's bit-decode / prefetch / 4-output arms all lost and are dropped here.
     const Cand cands[] = {{"n2 (shipped)", w8a16_gemv_batch8_dyn_vl2_n2, 16}, {"n2_rw", cand_n2_rw, 16},
                           {"n2_lb2", cand_n2_lb2, 16}, {"n2_lb3", cand_n2_lb3, 16}, {"n2_pf", cand_n2_pf, 16}};
-    const unsigned int M = 8;
+    for (unsigned int M : {8u, 7u, 6u, 5u})   // loop #8: hoist bit-identity at every M the n2 tier serves (MTP verify runs M=5)
     for (auto& sh : shapes) {
         const unsigned int N = sh[0], K = sh[1], kb = (K + 127) / 128, nb = (N + 127) / 128;
         std::vector<unsigned char> hB((size_t)N * K); std::vector<float> hS((size_t)nb * kb); std::vector<unsigned short> hA((size_t)M * K);
