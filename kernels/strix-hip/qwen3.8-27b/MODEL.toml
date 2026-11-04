@@ -151,7 +151,17 @@ enable_loop_watchdog = true
 # still wins — and it is the value the 3.6 Strix submission was certified
 # under. Flip it here only with a gfx1151 A/B on THESE weights recorded in
 # this comment.
-thinking_in_tools = false
+#
+# 2026-11-04, the gfx1151 A/B on these weights (nvidia/Qwen3.8-27B-NVFP4, main
+# 2f9c37083, strix, same recipe otherwise):
+#   ST-995  thinking on  88.94 / 89.97 (irrelevance 100, live_irrelevance 96.59; s204)
+#           thinking off 88.24 / 84.83 (framework f193), 88.54 / 85.56 (DevLab 41614041238)
+#   agentic thinking on  50/50 + 50/50 followed_directions, 9,219 s wall (s207)
+#           thinking off 50/50 + 50/50, 9,590 s wall (s203)
+# No post-`</think>` collapse showed in either run, so thinking is on by default
+# and on tool-armed requests. Clients still turn it off per request.
+thinking_default = true
+thinking_in_tools = true
 max_thinking_budget = 512
 # Effort-silent requests render the template's "medium" tier (no directive
 # sentence), the tier this target's budget was tuned with; the checkpoint
