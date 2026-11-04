@@ -94,12 +94,14 @@ llama_up() { # port parallel ctx-per-slot model [extra llama-server args...]
 
 atlas_up() { # port model [KEY=VAL env...] -- Atlas through serve-amd.sh at this ref (the binary the workflow just built)
   # ATLAS_MODE: recipe (default; --disable-thinking), refmode (--reference-mode, client sampling + checkpoint template only;
-  # thinking kept off through the default template kwarg, which is how the llama.cpp side runs), think (thinking on, recipe).
+  # thinking kept off through the default template kwarg, which is how the llama.cpp side runs), think (thinking forced on).
   local port=$1 m=$2; shift 2
   local mf=(--disable-thinking)
   case ${ATLAS_MODE:-recipe} in
     refmode) mf=(--reference-mode --default-chat-template-kwargs '{"enable_thinking":false}') ;;
-    think) mf=() ;;
+    # dropping --disable-thinking alone leaves the 27B's thinking off (MODEL.toml thinking_default unset; the BFCL leg sends no
+    # flag -- strix s200c reproduced the think-off score exactly), so turn it on through the default template kwarg
+    think) mf=(--default-chat-template-kwargs '{"enable_thinking":true}') ;;
   esac
   ( exec env RUST_LOG=info ATLAS_BIN="$PWD/target/release/spark" PORT="$port" HOST=127.0.0.1 MODEL_NAME=m "$@" \
       ./serve-amd.sh "$m" "${mf[@]}" --request-timeout 0 --enable-prefix-caching ) > "$OUT/atlas-server.log" 2>&1 &
