@@ -115,8 +115,7 @@ int main() {
     // 27B MLP gate/up: N = intermediate 17408, K = hidden 5120, M = 8 decode rows
     const unsigned int shapes[][2] = {{17408, 5120}};
     // Loop #2: weights rotated across >256 MB of copies (DRAM-realistic) and occupancy arms; loop #1's n2/n4 lost.
-    const Cand cands[] = {{"vl2 (shipped)", w4a16_gemv_dp4a_dual_batch8_d4_dyn_vl2, 8}, {"n1 (rewrite)", cand_dual_n1, 8},
-                          {"n1_lb2", cand_dual_n1_lb2, 8}, {"n1_lb3", cand_dual_n1_lb3, 8}};
+    const Cand cands[] = {{"vl2 (shipped)", w4a16_gemv_dp4a_dual_batch8_d4_dyn_vl2, 8}};
     const unsigned int M = 8;
     for (auto& sh : shapes) {
         const unsigned int N = sh[0], K = sh[1], G = K / 16;
@@ -160,6 +159,27 @@ int main() {
             size_t diff = 0; if (ci) for (size_t i = 0; i < o0.size(); ++i) diff += (o0[i] != r0[i]) + (o1[i] != r1[i]);
             printf("   %-14s %8.1f us  %6.1f GB/s  %s\n", c.name, us, bytes / us / 1e3, ci == 0 ? "(reference)" : (diff == 0 ? "BIT-IDENTICAL" : "DIFFERS"));
             if (ci && diff) printf("      %zu of %zu outputs differ\n", diff, 2 * o0.size());
+        }
+        {   // Loop #6: two launches of the single-matrix w4a16_gemv_dp4a_batch8_d4 (gate, then up). Its 64 threads per
+            // output split the groups across two warps exactly like the dual's two virtual lanes, with the same
+            // accumulate expression and reduce -> expected BIT-IDENTICAL to the dual kernel, at the single's ~187 GB/s.
+            dim3 grid((N + DP4A_N_PER_BLOCK - 1) / DP4A_N_PER_BLOCK), block(256);
+            CHECK(hipMemset(dC0, 0, (size_t)M * N * 2)); CHECK(hipMemset(dC1, 0, (size_t)M * N * 2));
+            hipLaunchKernelGGL(w4a16_gemv_dp4a_batch8_d4, grid, block, 0, 0, dA, dAs, dB0, dS0, 1.0f, dC0, M, N, K);
+            hipLaunchKernelGGL(w4a16_gemv_dp4a_batch8_d4, grid, block, 0, 0, dA, dAs, dB1, dS1, 1.0f, dC1, M, N, K);
+            CHECK(hipDeviceSynchronize());
+            CHECK(hipMemcpy(o0.data(), dC0, (size_t)M * N * 2, hipMemcpyDeviceToHost)); CHECK(hipMemcpy(o1.data(), dC1, (size_t)M * N * 2, hipMemcpyDeviceToHost));
+            hipEvent_t e0, e1; CHECK(hipEventCreate(&e0)); CHECK(hipEventCreate(&e1));
+            const int iters = 50; CHECK(hipEventRecord(e0));
+            for (int it = 0; it < iters; ++it) {
+                hipLaunchKernelGGL(w4a16_gemv_dp4a_batch8_d4, grid, block, 0, 0, dA, dAs, r0b[it % NROT], dS0, 1.0f, dC0, M, N, K);
+                hipLaunchKernelGGL(w4a16_gemv_dp4a_batch8_d4, grid, block, 0, 0, dA, dAs, r1b[it % NROT], dS1, 1.0f, dC1, M, N, K);
+            }
+            CHECK(hipEventRecord(e1)); CHECK(hipEventSynchronize(e1)); float ms; CHECK(hipEventElapsedTime(&ms, e0, e1));
+            const double us = ms * 1000.0 / iters;
+            size_t diff = 0; for (size_t i = 0; i < o0.size(); ++i) diff += (o0[i] != r0[i]) + (o1[i] != r1[i]);
+            printf("   %-14s %8.1f us  %6.1f GB/s  %s\n", "2x single d4", us, bytes / us / 1e3, diff == 0 ? "BIT-IDENTICAL" : "DIFFERS");
+            if (diff) printf("      %zu of %zu outputs differ\n", diff, 2 * o0.size());
         }
     }
     return 0;
