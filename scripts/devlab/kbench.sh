@@ -14,13 +14,14 @@ ROOT=$PWD
 # The strix-hip build widens every warp-sync mask literal to 64 bits before compiling (build.rs widen_warp_masks:
 # `__shfl_down_sync(0xffffffffu, ...)` -> `0xffffffffULL`); ROCm's headers reject a 32-bit mask. Apply the same rewrite
 # to copies of the kernel dirs and the bench dir, and put the copies first on the include path.
-W=$(mktemp -d); mkdir -p "$W/common" "$W/q27" "$W/bench"
-cp -rL "$ROOT/kernels/strix-hip/common/." "$W/common/"; cp -rL "$ROOT/kernels/strix-hip/qwen3.6-27b/nvfp4/." "$W/q27/"; cp -rL "$DIR/." "$W/bench/"
+W=$(mktemp -d); mkdir -p "$W/common" "$W/q27" "$W/bench" "$W/gb10c"
+cp -rL "$ROOT/kernels/strix-hip/common/." "$W/common/"; cp -rL "$ROOT/kernels/strix-hip/qwen3.6-27b/nvfp4/." "$W/q27/"; cp -rL "$DIR/." "$W/bench/"; cp -rL "$ROOT/kernels/gb10/common/." "$W/gb10c/"   # strix-hip compiles some kernels (e.g. w4a16_gemv) from gb10/common
+cp -rL "$ROOT/kernels/gb10/common/." "$W/gb10c/"   # strix-hip compiles some kernels (e.g. w4a16_gemv) from gb10/common
 find "$W" -type f \( -name '*.cu' -o -name '*.cuh' -o -name '*.hip' -o -name '*.h' \) -exec sed -i -E \
   's/(__(shfl|shfl_up|shfl_down|shfl_xor|ballot)_sync\()[[:space:]]*(0[xX][0-9a-fA-F]+)[uUlL]*/\1\3ULL/g' {} +
 FLAGS=(--offload-arch=gfx1151 -O3 -ffp-contract=off -include hip/hip_runtime.h
        -include "$ROOT/crates/atlas-kernels/hip/compat/atlas_hip_cache_hints.h"
-       -I"$ROOT/crates/atlas-kernels/hip/compat" -I"$W/common" -I"$W/q27" -I"$W/bench")
+       -I"$ROOT/crates/atlas-kernels/hip/compat" -I"$W/common" -I"$W/q27" -I"$W/bench" -I"$W/gb10c")
 echo "kbench $(git rev-parse --short=9 HEAD) dir=$DIR args=$*" | tee -a "$RES"
 for src in "$W/bench"/*.hip; do
   [ -e "$src" ] || { echo "no .hip files in $DIR" | tee -a "$RES"; exit 1; }
