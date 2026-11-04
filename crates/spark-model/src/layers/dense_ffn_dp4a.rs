@@ -171,25 +171,56 @@ impl DenseFfnLayer {
             h,
             stream,
         )?;
-        let dual_launch = if dual_vl2 {
-            ops::w4a16_gemv_dp4a_dual_batch8_vl2
+        // ATLAS_W4A16_DUAL_SPLIT=0 restores the vl2 dual launch (bit-identical; kept for A/B).
+        static SPLIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let split = *SPLIT
+            .get_or_init(|| std::env::var("ATLAS_W4A16_DUAL_SPLIT").map_or(true, |v| v != "0"));
+        if cfg!(atlas_hip) && dual_vl2 && split {
+            // m 5..=8: gate and up as two launches of the single-matrix batch8 tier instead of the
+            // vl2 dual. Its 64 threads per output split the groups across two warps exactly as the
+            // dual's two virtual lanes do, with the same accumulate expression and reduce, so each
+            // output is bit-identical; the single kernel streams ~1.37x faster at the 27B gate/up
+            // shape (kbench, DevLab 41808247496, weights rotated over >256 MB: dual 768 us / 131
+            // GB/s vs 2x single 562 us / 178 GB/s at N=17408 K=5120 M=8).
+            for (weight, out) in [
+                (&self.weights.gate_proj, gate_out),
+                (&self.weights.up_proj, up_out),
+            ] {
+                ops::w4a16_gemv_dp4a_batch4(
+                    ctx.gpu, gemv_k, quantized, scales, weight, out, m, inter, h, stream,
+                )?;
+            }
+        } else if dual_vl2 {
+            ops::w4a16_gemv_dp4a_dual_batch8_vl2(
+                ctx.gpu,
+                dual_k,
+                quantized,
+                scales,
+                &self.weights.gate_proj,
+                gate_out,
+                &self.weights.up_proj,
+                up_out,
+                m,
+                inter,
+                h,
+                stream,
+            )?;
         } else {
-            ops::w4a16_gemv_dp4a_dual_batch4
-        };
-        dual_launch(
-            ctx.gpu,
-            dual_k,
-            quantized,
-            scales,
-            &self.weights.gate_proj,
-            gate_out,
-            &self.weights.up_proj,
-            up_out,
-            m,
-            inter,
-            h,
-            stream,
-        )?;
+            ops::w4a16_gemv_dp4a_dual_batch4(
+                ctx.gpu,
+                dual_k,
+                quantized,
+                scales,
+                &self.weights.gate_proj,
+                gate_out,
+                &self.weights.up_proj,
+                up_out,
+                m,
+                inter,
+                h,
+                stream,
+            )?;
+        }
         ops::silu_mul(
             ctx.gpu,
             self.act_mul,
