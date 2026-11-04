@@ -104,6 +104,8 @@ __device__ __forceinline__ void dual8_multi(const signed char* __restrict__ a_q,
                   const unsigned char* b1, const unsigned char* s1, const float s12, __nv_bfloat16* c1, unsigned int M, unsigned int N, unsigned int K
 extern "C" __global__ void __launch_bounds__(256) cand_dual_n2(DUAL_ARGS) { dual8_multi<2>(a, as, b0, s0, s02, c0, b1, s1, s12, c1, M, N, K); }
 extern "C" __global__ void __launch_bounds__(256) cand_dual_n4(DUAL_ARGS) { dual8_multi<4>(a, as, b0, s0, s02, c0, b1, s1, s12, c1, M, N, K); }
+extern "C" __global__ void __launch_bounds__(256, 2) cand_dual_n1_lb2(DUAL_ARGS) { dual8_multi<1>(a, as, b0, s0, s02, c0, b1, s1, s12, c1, M, N, K); }
+extern "C" __global__ void __launch_bounds__(256, 3) cand_dual_n1_lb3(DUAL_ARGS) { dual8_multi<1>(a, as, b0, s0, s02, c0, b1, s1, s12, c1, M, N, K); }
 extern "C" __global__ void __launch_bounds__(256) cand_dual_n1(DUAL_ARGS) { dual8_multi<1>(a, as, b0, s0, s02, c0, b1, s1, s12, c1, M, N, K); }
 
 typedef void (*DFn)(DUAL_ARGS);
@@ -112,8 +114,9 @@ struct Cand { const char* name; DFn fn; int outs_per_block; };
 int main() {
     // 27B MLP gate/up: N = intermediate 17408, K = hidden 5120, M = 8 decode rows
     const unsigned int shapes[][2] = {{17408, 5120}};
+    // Loop #2: weights rotated across >256 MB of copies (DRAM-realistic) and occupancy arms; loop #1's n2/n4 lost.
     const Cand cands[] = {{"vl2 (shipped)", w4a16_gemv_dp4a_dual_batch8_d4_dyn_vl2, 8}, {"n1 (rewrite)", cand_dual_n1, 8},
-                          {"n2", cand_dual_n2, 16}, {"n4", cand_dual_n4, 32}};
+                          {"n1_lb2", cand_dual_n1_lb2, 8}, {"n1_lb3", cand_dual_n1_lb3, 8}};
     const unsigned int M = 8;
     for (auto& sh : shapes) {
         const unsigned int N = sh[0], K = sh[1], G = K / 16;
@@ -133,6 +136,12 @@ int main() {
         CHECK(hipMemcpy(dS0, hS0.data(), hS0.size(), hipMemcpyHostToDevice)); CHECK(hipMemcpy(dS1, hS1.data(), hS1.size(), hipMemcpyHostToDevice));
         CHECK(hipMemcpy(dA, hA.data(), hA.size(), hipMemcpyHostToDevice)); CHECK(hipMemcpy(dAs, hAs.data(), hAs.size() * 4, hipMemcpyHostToDevice));
         const double bytes = 2.0 * ((double)N * K / 2 + (double)N * G);
+        const int NROT = (int)(256e6 / bytes) + 2;
+        std::vector<unsigned char*> r0b(NROT), r1b(NROT);
+        for (int r = 0; r < NROT; ++r) {
+            CHECK(hipMalloc(&r0b[r], hB0.size())); CHECK(hipMemcpy(r0b[r], hB0.data(), hB0.size(), hipMemcpyHostToDevice));
+            CHECK(hipMalloc(&r1b[r], hB1.size())); CHECK(hipMemcpy(r1b[r], hB1.data(), hB1.size(), hipMemcpyHostToDevice));
+        }
         std::vector<unsigned short> r0((size_t)M * N), r1(r0.size()), o0(r0.size()), o1(r0.size());
         printf("-- dual gate+up N=%u K=%u M=%u (weights+scales %.1f MB)\n", N, K, M, bytes / 1e6);
         for (int ci = 0; ci < (int)(sizeof(cands) / sizeof(cands[0])); ++ci) {
@@ -145,7 +154,7 @@ int main() {
             for (int w = 0; w < 5; ++w) hipLaunchKernelGGL(c.fn, grid, block, 0, 0, dA, dAs, dB0, dS0, 1.0f, dC0, dB1, dS1, 1.0f, dC1, M, N, K);
             hipEvent_t e0, e1; CHECK(hipEventCreate(&e0)); CHECK(hipEventCreate(&e1));
             const int iters = 50; CHECK(hipEventRecord(e0));
-            for (int it = 0; it < iters; ++it) hipLaunchKernelGGL(c.fn, grid, block, 0, 0, dA, dAs, dB0, dS0, 1.0f, dC0, dB1, dS1, 1.0f, dC1, M, N, K);
+            for (int it = 0; it < iters; ++it) hipLaunchKernelGGL(c.fn, grid, block, 0, 0, dA, dAs, r0b[it % NROT], dS0, 1.0f, dC0, r1b[it % NROT], dS1, 1.0f, dC1, M, N, K);
             CHECK(hipEventRecord(e1)); CHECK(hipEventSynchronize(e1)); float ms; CHECK(hipEventElapsedTime(&ms, e0, e1));
             const double us = ms * 1000.0 / iters;
             size_t diff = 0; if (ci) for (size_t i = 0; i < o0.size(); ++i) diff += (o0[i] != r0[i]) + (o1[i] != r1[i]);

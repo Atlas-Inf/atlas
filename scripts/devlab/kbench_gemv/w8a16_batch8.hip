@@ -113,6 +113,9 @@ __device__ __forceinline__ void gemv8_body(const __nv_bfloat16* A, const unsigne
 extern "C" __global__ void __launch_bounds__(256) cand_n2_bit(const __nv_bfloat16* A, const unsigned char* B, const float* s, __nv_bfloat16* C, unsigned int M, unsigned int N, unsigned int K) { gemv8_body<2, true, false>(A, B, s, C, M, N, K, nullptr); }
 extern "C" __global__ void __launch_bounds__(256) cand_n2_pf(const __nv_bfloat16* A, const unsigned char* B, const float* s, __nv_bfloat16* C, unsigned int M, unsigned int N, unsigned int K) { LUT_PROLOGUE gemv8_body<2, false, true>(A, B, s, C, M, N, K, lut); }
 extern "C" __global__ void __launch_bounds__(256) cand_n2_bitpf(const __nv_bfloat16* A, const unsigned char* B, const float* s, __nv_bfloat16* C, unsigned int M, unsigned int N, unsigned int K) { gemv8_body<2, true, true>(A, B, s, C, M, N, K, nullptr); }
+extern "C" __global__ void __launch_bounds__(256) cand_n2_rw(const __nv_bfloat16* A, const unsigned char* B, const float* s, __nv_bfloat16* C, unsigned int M, unsigned int N, unsigned int K) { LUT_PROLOGUE gemv8_body<2, false, false>(A, B, s, C, M, N, K, lut); }
+extern "C" __global__ void __launch_bounds__(256, 2) cand_n2_lb2(const __nv_bfloat16* A, const unsigned char* B, const float* s, __nv_bfloat16* C, unsigned int M, unsigned int N, unsigned int K) { LUT_PROLOGUE gemv8_body<2, false, false>(A, B, s, C, M, N, K, lut); }
+extern "C" __global__ void __launch_bounds__(256, 3) cand_n2_lb3(const __nv_bfloat16* A, const unsigned char* B, const float* s, __nv_bfloat16* C, unsigned int M, unsigned int N, unsigned int K) { LUT_PROLOGUE gemv8_body<2, false, false>(A, B, s, C, M, N, K, lut); }
 extern "C" __global__ void __launch_bounds__(256) cand_n4(const __nv_bfloat16* A, const unsigned char* B, const float* s, __nv_bfloat16* C, unsigned int M, unsigned int N, unsigned int K) { LUT_PROLOGUE gemv8_body<4, false, false>(A, B, s, C, M, N, K, lut); }
 extern "C" __global__ void __launch_bounds__(256) cand_n4_bit(const __nv_bfloat16* A, const unsigned char* B, const float* s, __nv_bfloat16* C, unsigned int M, unsigned int N, unsigned int K) { gemv8_body<4, true, false>(A, B, s, C, M, N, K, nullptr); }
 
@@ -122,9 +125,10 @@ struct Cand { const char* name; KFn fn; int outs_per_block; };
 int main() {
     // 27B FP8 projections at M = 8 (Qwen3.8-27B: H 5120; GDN qkv 10240 + z 6144; attn q+gate 12288; out/o_proj K 6144)
     const unsigned int shapes[][2] = {{16384, 5120}, {12288, 5120}, {5120, 6144}, {2048, 5120}};
-    const Cand cands[] = {{"n2 (shipped)", w8a16_gemv_batch8_dyn_vl2_n2, 16}, {"n2_bit", cand_n2_bit, 16},
-                          {"n2_pf", cand_n2_pf, 16}, {"n2_bitpf", cand_n2_bitpf, 16},
-                          {"n4", cand_n4, 32}, {"n4_bit", cand_n4_bit, 32}};
+    // Loop #2: DRAM-realistic timing (weights rotated across >256 MB of copies so the 32 MB MALL cannot serve them)
+    // and occupancy candidates. Loop #1's bit-decode / prefetch / 4-output arms all lost and are dropped here.
+    const Cand cands[] = {{"n2 (shipped)", w8a16_gemv_batch8_dyn_vl2_n2, 16}, {"n2_rw", cand_n2_rw, 16},
+                          {"n2_lb2", cand_n2_lb2, 16}, {"n2_lb3", cand_n2_lb3, 16}, {"n2_pf", cand_n2_pf, 16}};
     const unsigned int M = 8;
     for (auto& sh : shapes) {
         const unsigned int N = sh[0], K = sh[1], kb = (K + 127) / 128, nb = (N + 127) / 128;
@@ -134,6 +138,9 @@ int main() {
         for (auto& s : hS) s = 0.001f + (rand() % 1000) * 1e-5f;
         for (auto& a : hA) { float f = ((rand() % 2001) - 1000) * 1e-3f; unsigned int u; memcpy(&u, &f, 4); a = (unsigned short)(u >> 16); }
         unsigned char* dB; float* dS; __nv_bfloat16 *dA, *dC;
+        const int NROT = (int)((256e6 + hB.size() - 1) / hB.size()) + 1;
+        std::vector<unsigned char*> rot(NROT);
+        for (int r = 0; r < NROT; ++r) { CHECK(hipMalloc(&rot[r], hB.size())); CHECK(hipMemcpy(rot[r], hB.data(), hB.size(), hipMemcpyHostToDevice)); }
         CHECK(hipMalloc(&dB, hB.size())); CHECK(hipMalloc(&dS, hS.size() * 4)); CHECK(hipMalloc(&dA, hA.size() * 2)); CHECK(hipMalloc(&dC, (size_t)M * N * 2));
         CHECK(hipMemcpy(dB, hB.data(), hB.size(), hipMemcpyHostToDevice)); CHECK(hipMemcpy(dS, hS.data(), hS.size() * 4, hipMemcpyHostToDevice));
         CHECK(hipMemcpy(dA, hA.data(), hA.size() * 2, hipMemcpyHostToDevice));
@@ -148,7 +155,7 @@ int main() {
             for (int w = 0; w < 5; ++w) hipLaunchKernelGGL(c.fn, grid, block, 0, 0, dA, dB, dS, dC, M, N, K);
             hipEvent_t e0, e1; CHECK(hipEventCreate(&e0)); CHECK(hipEventCreate(&e1));
             const int iters = 50; CHECK(hipEventRecord(e0));
-            for (int it = 0; it < iters; ++it) hipLaunchKernelGGL(c.fn, grid, block, 0, 0, dA, dB, dS, dC, M, N, K);
+            for (int it = 0; it < iters; ++it) hipLaunchKernelGGL(c.fn, grid, block, 0, 0, dA, rot[it % NROT], dS, dC, M, N, K);
             CHECK(hipEventRecord(e1)); CHECK(hipEventSynchronize(e1)); float ms; CHECK(hipEventElapsedTime(&ms, e0, e1));
             const double us = ms * 1000.0 / iters;
             size_t diff = 0; if (ci > 0) for (size_t i = 0; i < out.size(); ++i) diff += out[i] != ref[i];
@@ -156,7 +163,7 @@ int main() {
                    ci == 0 ? "(reference)" : (diff == 0 ? "BIT-IDENTICAL" : "DIFFERS"));
             if (ci > 0 && diff) printf("      %zu of %zu outputs differ\n", diff, out.size());
         }
-        hipFree(dB); hipFree(dS); hipFree(dA); hipFree(dC);
+        hipFree(dB); hipFree(dS); hipFree(dA); hipFree(dC); for (auto r : rot) hipFree(r);
     }
     return 0;
 }
