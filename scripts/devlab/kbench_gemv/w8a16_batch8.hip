@@ -119,19 +119,21 @@ extern "C" __global__ void __launch_bounds__(256, 3) cand_n2_lb3(const __nv_bflo
 extern "C" __global__ void __launch_bounds__(256) cand_n4(const __nv_bfloat16* A, const unsigned char* B, const float* s, __nv_bfloat16* C, unsigned int M, unsigned int N, unsigned int K) { LUT_PROLOGUE gemv8_body<4, false, false>(A, B, s, C, M, N, K, lut); }
 extern "C" __global__ void __launch_bounds__(256) cand_n4_bit(const __nv_bfloat16* A, const unsigned char* B, const float* s, __nv_bfloat16* C, unsigned int M, unsigned int N, unsigned int K) { gemv8_body<4, true, false>(A, B, s, C, M, N, K, nullptr); }
 
+extern "C" __global__ void cand_b4_vl2(const __nv_bfloat16* A, const unsigned char* B, const float* s, __nv_bfloat16* C, unsigned int M, unsigned int N, unsigned int K) { w8a16_gemv_batchm_impl<4, 2>(A, B, s, C, M, N, K); }
 typedef void (*KFn)(const __nv_bfloat16*, const unsigned char*, const float*, __nv_bfloat16*, unsigned int, unsigned int, unsigned int);
 struct Cand { const char* name; KFn fn; int outs_per_block; };
 
 int main() {
     // 27B FP8 projections at M = 8 (Qwen3.8-27B: H 5120; GDN qkv 10240 + z 6144; attn q+gate 12288; out/o_proj K 6144)
-    const unsigned int shapes[][2] = {{16384, 5120}, {12288, 5120}, {5120, 6144}, {5120, 5120}, {2048, 5120}, {1024, 5120}};
+    const unsigned int shapes[][2] = {{16384, 5120}, {12288, 5120}, {5120, 6144}, {2048, 5120}};
     // Loop #2: DRAM-realistic timing (weights rotated across >256 MB of copies so the 32 MB MALL cannot serve them)
     // and occupancy candidates. Loop #1's bit-decode / prefetch / 4-output arms all lost and are dropped here.
     // Loop #3: small-N grid fill. vl2 (shipped, 8 outputs/block = twice the blocks of n2) vs n2 / n2_rw per shape,
     // to pick the arm by N. Loop #2's lb2/lb3/pf arms added nothing and are dropped.
-    const Cand cands[] = {{"n2 (shipped)", w8a16_gemv_batch8_dyn_vl2_n2, 16}, {"n2_rw", cand_n2_rw, 16},
-                          {"vl2 (shipped)", w8a16_gemv_batch8_dyn_vl2, 8}};
-    const unsigned int M = 8;
+    // Loop #9: the m 2..4 FP8 tier. w8a16_gemv_batch4 (impl<4>, one 16 B weight load per lane per iteration) vs the
+    // same impl at VLANES=2 (both k16 halves' loads issued together; grid ceil(N/8)) -- bit-identical by construction.
+    const Cand cands[] = {{"batch4 (shipped)", w8a16_gemv_batch4, 4}, {"batch4_vl2", cand_b4_vl2, 8}};
+    for (unsigned int M : {4u, 2u})
     for (auto& sh : shapes) {
         const unsigned int N = sh[0], K = sh[1], kb = (K + 127) / 128, nb = (N + 127) / 128;
         std::vector<unsigned char> hB((size_t)N * K); std::vector<float> hS((size_t)nb * kb); std::vector<unsigned short> hA((size_t)M * K);
