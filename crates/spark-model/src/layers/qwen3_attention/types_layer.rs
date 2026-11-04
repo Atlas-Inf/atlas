@@ -60,6 +60,15 @@ pub struct Qwen3AttentionLayer {
     /// attn_out *= sigmoid(g_proj @ hidden_states), broadcast over head_dim.
     pub(crate) head_gate_weight: Option<DenseWeight>,
     pub(crate) head_gate_activation: HeadGateActivation,
+    /// Ripple value residuals: `blend = bf16(sigmoid(value_res_lambda))`.
+    /// `Some` makes V project from `lerp(vres_row, normed, blend)` — see
+    /// `value_residual.rs`.
+    pub(crate) valres_blend: Option<f32>,
+    /// Model-owned value-residual buffers, installed after the arena exists.
+    pub(crate) valres: Option<super::value_residual::ValresBuffers>,
+    /// The V-projection input for the forward in flight (0 = `normed`).
+    pub(crate) valres_vin: std::sync::atomic::AtomicU64,
+    pub(super) valres_lerp_k: KernelHandle,
     /// Kernel handle for per-head sigmoid gate broadcast multiply.
     pub(super) sigmoid_gate_head_broadcast_k: KernelHandle,
     pub(super) softplus_gate_head_broadcast_k: KernelHandle,

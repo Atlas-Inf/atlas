@@ -150,6 +150,14 @@ impl Qwen3AttentionLayer {
             v_norm_weight: None,
             head_gate_weight: None,
             head_gate_activation: HeadGateActivation::Sigmoid,
+            valres_blend: None,
+            valres: None,
+            valres_vin: std::sync::atomic::AtomicU64::new(0),
+            valres_lerp_k: if config.value_residual {
+                gpu.kernel("ripple_ops", "ripple_valres_lerp")?
+            } else {
+                KernelHandle(0)
+            },
             sigmoid_gate_head_broadcast_k: super::super::try_kernel(
                 gpu,
                 "residual_add",

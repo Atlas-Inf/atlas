@@ -654,6 +654,15 @@ impl TransformerModel {
             && kv_cache.dtype() == spark_runtime::kv_cache::KvCacheDtype::Fp8;
         // Sharded latents exchange with the peer inside attention (eager only).
         let latent_shard = kv_cache.latent_shard().is_some();
+        // Ripple value residuals: per-row embedding shadow + V-input scratch.
+        let mut layers = layers;
+        if config.value_residual {
+            crate::layers::qwen3_attention::value_residual::install_value_residual(
+                &mut layers,
+                buffers.sizes().hidden_states,
+                gpu.as_ref(),
+            )?;
+        }
         // Feature-2 overlay kernels: resolve before `gpu` is moved into Self.
         let overlay_kernels = crate::layers::ops::token_overlay::OverlayKernels::new(gpu.as_ref());
         let warm = super::warm_turn::WarmTurn::from_env(&config.model_type)?;

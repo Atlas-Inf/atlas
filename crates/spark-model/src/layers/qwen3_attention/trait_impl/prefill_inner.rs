@@ -90,6 +90,7 @@ impl Qwen3AttentionLayer {
             stream,
         )
         .map_err(|e| anyhow::anyhow!("rms_norm_residual failed: {e}"))?;
+        self.prepare_value_input(ctx, hidden, normed, num_tokens, stream)?;
         // ATLAS_OP_DUMP hook: post-input-norm (input to Q/K/V GEMM).
         if num_tokens > 0 {
             super::super::op_dump::dump_bf16(

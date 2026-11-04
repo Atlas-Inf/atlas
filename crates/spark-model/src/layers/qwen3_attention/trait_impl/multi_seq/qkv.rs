@@ -152,7 +152,8 @@ impl Qwen3AttentionLayer {
             let k_out_i = q_out_i.offset(q_proj_bytes);
             let v_out_i = k_out_i.offset((nkv * hd) as usize * bf16);
             self.ms_qkv_seq_q(fwd, normed_i, q_out_i, q_proj_dim, q_dim, nq, hd, h, stream)?;
-            self.ms_qkv_seq_kv(fwd, normed_i, k_out_i, v_out_i, nkv, hd, h, stream)?;
+            let v_in_i = self.v_input(normed).offset(i * h * bf16);
+            self.ms_qkv_seq_kv(fwd, normed_i, v_in_i, k_out_i, v_out_i, nkv, hd, h, stream)?;
         }
         Ok(())
     }
@@ -1257,6 +1258,7 @@ impl Qwen3AttentionLayer {
         &self,
         fwd: &crate::layer::ForwardContext<'_>,
         normed_i: spark_runtime::gpu::DevicePtr,
+        v_in_i: spark_runtime::gpu::DevicePtr,
         k_out_i: spark_runtime::gpu::DevicePtr,
         v_out_i: spark_runtime::gpu::DevicePtr,
         nkv: u32,
@@ -1264,6 +1266,13 @@ impl Qwen3AttentionLayer {
         h: usize,
         stream: u64,
     ) -> Result<()> {
+        // Value residuals give V its own input row (`v_in_i`); only the
+        // per-projection arm at the bottom reads it.
+        anyhow::ensure!(
+            v_in_i == normed_i || (self.k_weight.is_none() && self.v_weight.is_none()),
+            "L{}: value residuals need the per-projection K/V arm",
+            self.attn_layer_idx
+        );
         if let (Some(k_q2), Some(v_q2)) = (
             self.k_weight.as_ref().and_then(|w| w.as_packed_q2()),
             self.v_weight.as_ref().and_then(|w| w.as_packed_q2()),
@@ -1340,7 +1349,7 @@ impl Qwen3AttentionLayer {
                 self.nvfp4_decode_gemv(
                     fwd.gpu,
                     fwd.levers.gemv_sw,
-                    normed_i,
+                    v_in_i,
                     nvfp4,
                     v_out_i,
                     nkv * hd,
@@ -1351,7 +1360,7 @@ impl Qwen3AttentionLayer {
                 ops::dense_gemv(
                     fwd.gpu,
                     self.dense_gemv_k,
-                    normed_i,
+                    v_in_i,
                     &self.attn.v_proj,
                     v_out_i,
                     nkv * hd,

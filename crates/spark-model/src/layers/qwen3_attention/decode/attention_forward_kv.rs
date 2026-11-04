@@ -29,6 +29,14 @@ impl Qwen3AttentionLayer {
             // MLA branch already wrote K and V into k_out/v_out
             return Ok(());
         }
+        // Value residuals feed V a different input than K; only the
+        // per-projection dense/NVFP4 arm below takes a separate V input.
+        anyhow::ensure!(
+            !self.has_value_residual() || (self.k_weight.is_none() && self.v_weight.is_none()),
+            "L{}: value residuals need the per-projection K/V decode arm",
+            self.attn_layer_idx
+        );
+        let v_in = self.v_input(normed);
 
         if let Some(r) = self.try_mx8(ctx, self.k_weight.as_ref(), normed, k_out, 1, true, stream) {
             r?;
@@ -124,7 +132,7 @@ impl Qwen3AttentionLayer {
                     self.nvfp4_decode_gemv(
                         ctx.gpu,
                         ctx.levers.gemv_sw,
-                        normed,
+                        v_in,
                         nvfp4,
                         v_out,
                         nkv * hd,
@@ -135,7 +143,7 @@ impl Qwen3AttentionLayer {
                     ops::dense_gemv(
                         ctx.gpu,
                         self.dense_gemv_k,
-                        normed,
+                        v_in,
                         &self.attn.v_proj,
                         v_out,
                         nkv * hd,

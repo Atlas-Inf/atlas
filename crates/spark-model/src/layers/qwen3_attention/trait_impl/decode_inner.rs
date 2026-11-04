@@ -82,6 +82,7 @@ impl Qwen3AttentionLayer {
             eps,
             stream,
         )?;
+        self.prepare_value_input(ctx, hidden, normed, 1, stream)?;
         if gemma4_diag {
             diag_norm(
                 ctx.gpu,

@@ -129,9 +129,16 @@ impl Qwen3AttentionLayer {
         )?;
 
         let v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16);
+        // Value residuals: V projects its own input; the shared quantized
+        // activations above are of `normed` and cannot serve it.
+        anyhow::ensure!(
+            !self.has_value_residual() || (a4.is_none() && a8.is_none()),
+            "L{}: value residuals with quantized attention activations",
+            self.attn_layer_idx
+        );
         self.prefill_one_proj(
             Proj::V,
-            normed,
+            self.v_input(normed),
             v_contiguous,
             n,
             nkv * hd,

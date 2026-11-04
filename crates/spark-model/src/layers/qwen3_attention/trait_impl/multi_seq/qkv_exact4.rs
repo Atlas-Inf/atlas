@@ -235,7 +235,7 @@ impl Qwen3AttentionLayer {
             for i in 0..n {
                 let (_, k_out, v_out) = row(i);
                 let normed_i = normed.offset(i * h * bf16);
-                self.ms_qkv_seq_kv(fwd, normed_i, k_out, v_out, nkv, hd, h, stream)?;
+                self.ms_qkv_seq_kv(fwd, normed_i, normed_i, k_out, v_out, nkv, hd, h, stream)?;
             }
         }
         Ok(true)

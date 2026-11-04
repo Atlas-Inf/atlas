@@ -118,6 +118,7 @@ impl Qwen3AttentionLayer {
             c.eps,
             c.stream,
         )?;
+        self.prepare_value_input(ctx, c.hidden, c.normed, c.n, c.stream)?;
 
         let meta = ctx
             .attn_metadata

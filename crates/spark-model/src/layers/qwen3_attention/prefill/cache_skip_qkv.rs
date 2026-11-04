@@ -100,9 +100,14 @@ impl Qwen3AttentionLayer {
         )?;
         let v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16);
         let t0 = std::time::Instant::now();
+        anyhow::ensure!(
+            !self.has_value_residual() || normed_fp8.is_null(),
+            "L{}: value residuals with FP8 attention activations",
+            self.attn_layer_idx
+        );
         self.cache_skip_one_proj(
             SkipProj::V,
-            normed,
+            self.v_input(normed),
             normed_fp8,
             v_contiguous,
             n,
