@@ -131,6 +131,8 @@ pub struct DenseFfnLayer {
     w4a16_gemv_batch16: KernelHandle,
     dp4a_quant_k: KernelHandle,
     dp4a_silu_quant_k: KernelHandle,
+    /// Ripple clamped SwiGLU in `act_mul` (see `use_clamped_swiglu`).
+    clamped_swiglu: bool,
     dp4a_gemv_k: KernelHandle,
     dp4a_quant_batch4_k: KernelHandle,
     /// Guard-free m == 4 specialization of the batch4 DP4A GEMVs.
@@ -591,8 +593,31 @@ impl DenseFfnLayer {
             // packed-Q2 weights.
             q2_0_mmq_nc_k: KernelHandle(0),
             q2_0_mmq_wc_k: KernelHandle(0),
+            clamped_swiglu: false,
         };
+        let mut layer = layer;
+        if model_type == "ricursive" && activation == FfnActivation::SiLU {
+            layer.use_clamped_swiglu(gpu)?;
+        }
         Ok(layer)
+    }
+
+    /// Ripple (`ricursive`): RicursiveMLP clamps gate (max C) and up (±C)
+    /// before `silu(gate) * up`. Every split-SiLU site runs through `act_mul`,
+    /// so the clamped kernel replaces it; the fused activation kernels that
+    /// would bypass it (dp4a SiLU+int8-quant, NVFP4-MMQ SiLU epilogues, the
+    /// FP8 fused silu-input GEMV) are switched off, and their dispatch sites
+    /// fall back to the split path because each is gated on handle != 0. The
+    /// fused NVFP4 `w4a16_gemv_silu_input` stays resolved but is reached only
+    /// with `ATLAS_NO_DECODE_SPLIT_SILU`, which `forward` refuses here.
+    fn use_clamped_swiglu(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
+        self.act_mul = gpu.kernel("ripple_ops", "ripple_silu_mul_clamp")?;
+        self.clamped_swiglu = true;
+        self.dp4a_silu_quant_k = KernelHandle(0);
+        self.nvfp4_silu_scaled_k = KernelHandle(0);
+        self.nvfp4_silu_quant_k = KernelHandle(0);
+        self.w8a16_gemv_silu_input_k = KernelHandle(0);
+        Ok(())
     }
 
     /// Load-time finalize for the Q4_K MMQ prefill path (`ATLAS_FFN_MMQ`). MUST run at
@@ -1336,7 +1361,7 @@ impl DenseFfnLayer {
         let split_silu = self.activation == FfnActivation::SiLU
             && self.act_mul.0 != 0
             && self.w4a16_gemv.0 != 0
-            && std::env::var_os("ATLAS_NO_DECODE_SPLIT_SILU").is_none();
+            && (self.clamped_swiglu || std::env::var_os("ATLAS_NO_DECODE_SPLIT_SILU").is_none());
         if split_silu {
             ops::silu_mul(
                 ctx.gpu,

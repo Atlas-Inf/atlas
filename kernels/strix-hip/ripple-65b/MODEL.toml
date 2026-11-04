@@ -1,0 +1,91 @@
+[model]
+name = "ripple-65b"
+hf_id = "ricursiveAI/Ripple-65B-Preview-NVFP4"
+model_type = "ricursive"
+architecture = "Dense PeriNorm Transformer, 4:1 Sliding/Global Attention"
+parameters = "65B"
+active_parameters = "65B"
+
+# ── Kernels: the 27B's gfx1151 tree plus a two-kernel overlay ───────────────
+# Ripple is dense attention + a dense NVFP4 SwiGLU FFN at hidden 5120 — the
+# same GEMV/GEMM shapes family the qwen3.6-27b strix-hip tree already serves
+# (BF16 attention projections, w4a16/dp4a NVFP4 FFN, paged attention with a
+# sliding window). `kernel_source` compiles that tree; `nvfp4/ripple_ops.cu`
+# (target-local overlay) adds only what it lacks:
+#   * ripple_silu_mul_clamp — RicursiveMLP clamps gate (max 20) and up (±20)
+#     before SiLU*up; swapped in for DenseFfnLayer's act_mul.
+#   * ripple_valres_lerp    — the value-residual V input.
+kernel_source = "qwen3.6-27b"
+
+# Architecture from the checkpoint's config.json.
+layers_total = 80
+layers_sliding_attention = 64
+layers_full_attention = 16
+layer_pattern = "4 sliding (RoPE, window 1024) then 1 global (NoPE, full)"
+hidden_dim = 5120
+head_dim = 128
+q_heads = 80
+kv_heads = 8
+intermediate_size = 40960
+vocab_size = 100352
+max_position_embeddings = 2097152
+sliding_window = 1024
+rope_theta = 10000
+vision = false
+mtp_layers = 0
+moe_experts = 0
+
+# The vendor ships no sampling recommendation (generation_config.json carries
+# token ids only). Conservative defaults until measured.
+[sampling.thinking_text]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.thinking_coding]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.non_thinking]
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.tools]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[behavior]
+# The model opens `<think>` itself (the generation prompt does not), like the
+# vendor's SGLang reasoning detector expects.
+thinking_in_tools = true
+max_thinking_budget = 8192
+# The vendor's reference requires an unquantized BF16 KV cache.
+default_kv_dtype = "bf16"
+tool_call_parser = "hermes"
+
+[[model_types]]
+model_type = "ricursive"
+hidden_size = 5120
+
+[dflash]
+draft_model = "ricursiveAI/Ripple-65B-Preview-DFlash2"
+gamma = 16
+window_size = 4096
+mask_token_id = 100278
+target_layer_ids = [1, 20, 39, 58, 77]
