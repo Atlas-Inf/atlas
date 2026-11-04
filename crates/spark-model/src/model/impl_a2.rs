@@ -18,7 +18,7 @@ use super::block_mgmt::{
 };
 use super::ssm_pool::SsmStatePool;
 use super::ssm_snapshot::SsmSnapshotPool;
-use super::types::{PinnedMetaStaging, TransformerModel};
+use super::types::{EP_CMD_BUF_BYTES, EP_MIN_STRIDE, PinnedMetaStaging, TransformerModel};
 use crate::layer::{
     AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
 };
@@ -241,6 +241,24 @@ impl TransformerModel {
             return Ok(val);
         };
         let stream = self.gpu.default_stream();
+        // One gather of every rank's value where the transport has one (the
+        // chain), instead of a broadcast, sync and copy back per rank: the
+        // same minimum, one round.
+        let world = comm.world_size();
+        if world * EP_MIN_STRIDE <= EP_CMD_BUF_BYTES && comm.supports_gather_async(4) {
+            let base = self.ep_cmd_buf;
+            self.gpu
+                .copy_h2d(&val.to_le_bytes(), base.offset(comm.rank() * EP_MIN_STRIDE))?;
+            if comm.gather_async(base.0, EP_MIN_STRIDE as i64, 4, stream)? {
+                self.gpu.synchronize(stream)?;
+                let mut buf = vec![0u8; world * EP_MIN_STRIDE];
+                self.gpu.copy_d2h(base, &mut buf)?;
+                return Ok((0..world)
+                    .map(|r| u32::from_le_bytes(buf[r * EP_MIN_STRIDE..][..4].try_into().unwrap()))
+                    .min()
+                    .unwrap_or(val));
+            }
+        }
         // Loop over the ranks of the ACTUAL communicator: under pure TP
         // (`--tp-size 2 --ep-size 1`) `ep_world_size` is 1 but the comm
         // spans `tp_world_size` ranks — looping only `0..1` would leave
@@ -440,6 +458,7 @@ impl TransformerModel {
     /// - 0xFFFFFFF2/3/4: verify K=2/3/4 → K tokens, then accept/num_accepted
     /// - 0xFFFFFFF5/6/7, 0xFFFFFFE1, 0xFFFFFFEB/EC: GLM/vision extensions (`impl_a2_ep_worker`)
     /// - 0xFFFFFFE6: batched multi-sequence verify (`trait_impl/ep_verify_batch.rs`)
+    /// - 0xFFFFFFE8: packed multi-prompt prefill (`glm_packed_prefill`)
     /// - 0xFFFFFFF8: cache this slot's sequence (`trait_impl::finish_leaf`)
     /// - 0xFFFFFFED: plant a prefix checkpoint → position (`prefill_b::pc_inflight`)
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored; applies to the whole worker)

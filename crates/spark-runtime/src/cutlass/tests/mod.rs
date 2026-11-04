@@ -101,7 +101,7 @@ pub(super) fn run_cutlass_variant(
             m as i32,
             n as i32,
             k as i32,
-            ctx.workspace as *mut c_void,
+            ctx.workspace()? as *mut c_void,
             ctx.ws_size,
             std::ptr::null_mut(),
         )
@@ -132,7 +132,7 @@ pub(super) fn run_cublaslt_algo(
             m as i32,
             n as i32,
             k as i32,
-            ctx.workspace as *mut c_void,
+            ctx.workspace()? as *mut c_void,
             ctx.ws_size,
             std::ptr::null_mut(),
             algo_index,

@@ -127,7 +127,7 @@ impl DenseFfnLayer {
         {
             return Ok(false);
         }
-        // ATLAS_GLM_DENSE_TP_SPLIT: half the columns on each rank.
+        // ATLAS_GLM_DENSE_TP_SPLIT: 1/n of the columns on each rank.
         let proj = super::tp_split::SplitProj::Nvfp4 { weights: w, tc };
         if self.glm_verify_rows_split(input, rows, proj, ctx, stream)? {
             return Ok(true);
@@ -168,12 +168,15 @@ impl DenseFfnLayer {
         }
         // All existing native speculative verification widths retain W4A16,
         // including fallbacks that happen to enter forward_prefill_inner.
-        if rows <= 8 {
+        // A packed prefill (`glm_packed_scope`) takes the BF16 GEMMs at every
+        // row count.
+        let packed = crate::layers::glm_packed_scope::active();
+        if rows <= 8 && !packed {
             return Ok(false);
         }
         // Owner-batched verify blocks (9..=32 rows) read the NVFP4 weights once
         // on the tensor-core tiers instead of dequantizing them to BF16 per step.
-        if rows <= 32 && self.glm_verify_rows_tc(input, rows as u32, ctx, stream)? {
+        if rows <= 32 && !packed && self.glm_verify_rows_tc(input, rows as u32, ctx, stream)? {
             return Ok(true);
         }
         crate::factory::glm_dense_cache::validate(ctx.config)?;

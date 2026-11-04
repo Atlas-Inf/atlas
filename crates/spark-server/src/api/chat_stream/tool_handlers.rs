@@ -126,7 +126,14 @@ pub(super) fn handle_complete_tool_call(
             i.into_message(),
         )
     });
-    let is_soft = validation.as_ref().err().is_some_and(|(soft, _)| *soft);
+    // Under GLM only a native call reaches here with an undeclared name. It
+    // goes out unchanged; the client's own unknown-tool result keeps the turn.
+    let undeclared_native = ctx.state.glm_tool_boundary.is_some()
+        && !ctx
+            .tool_defs_for_backfill
+            .iter()
+            .any(|t| t.function.name == tc.function.name);
+    let is_soft = undeclared_native || validation.as_ref().err().is_some_and(|(soft, _)| *soft);
     if let Err((_, e)) = &validation
         && !is_soft
     {

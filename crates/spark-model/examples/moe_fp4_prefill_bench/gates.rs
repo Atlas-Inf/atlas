@@ -16,7 +16,7 @@ pub(super) fn gate_up_silu(
     tile_bound: u32,
     all_rows: usize,
 ) -> Result<bool> {
-    let (n, k) = (2048u32, 4096u32);
+    let (n, k) = (super::inter(), 4096u32);
     let (nu, ku) = (n as usize, k as usize);
     let (Ok(fused), Ok(wide), Ok(silu), Ok(prefix_k)) = (
         g.kernel(MODULE, "moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w"),
@@ -155,6 +155,125 @@ pub(super) fn gate_up_silu(
     Ok(diff != 0)
 }
 
+/// E4M3 value of `b` (OCP FP8 E4M3: bias 7, no infinities).
+fn e4m3(b: u8) -> f32 {
+    let (s, e, m) = (b >> 7, (b >> 3) & 15, b & 7);
+    let v = if e == 0 {
+        m as f32 / 8.0 * 2f32.powi(-6)
+    } else {
+        (1.0 + m as f32 / 8.0) * 2f32.powi(e as i32 - 7)
+    };
+    if s == 1 { -v } else { v }
+}
+
+/// The lossy E4M3 down grid (`_e4m3`) against the BF16 reference `want`:
+/// its time and the dequantized values' error relative to each 64-column
+/// group's amax. Returns true when the kernel's error exceeds E4M3's
+/// rounding (2^-4 of the group amax).
+pub(super) fn down_e4m3(
+    g: &dyn GpuBackend,
+    args: &[DevicePtr; 8],
+    want: &[u8],
+    [n, k]: [u32; 2],
+    tile_bound: u32,
+    flop: f64,
+) -> Result<bool> {
+    let Ok(prefix_k) = g.kernel(MODULE, "moe_mtile_prefix") else {
+        return Ok(false);
+    };
+    let rows = want.len() / 2 / n as usize;
+    let d_sc = g.alloc(rows * n as usize / 64 * 4)?;
+    let d_prefix = g.alloc((GRID_EXPERTS + 1) * 4)?;
+    let d_next = g.alloc(16)?;
+    let mut fail = false;
+    for (name, persist) in [
+        ("moe_w4a4_grouped_gemm_prequant_t_k128w_compact_e4m3", false),
+        (
+            "moe_w4a4_grouped_gemm_prequant_t_k128w_compact_persist_e4m3",
+            true,
+        ),
+    ] {
+        let Ok(kernel) = g.kernel(MODULE, name) else {
+            println!("  {name}: absent");
+            continue;
+        };
+        g.memset(args[5], 0, rows * n as usize)?;
+        let run = || -> Result<()> {
+            KernelLaunch::new(g, prefix_k)
+                .grid([1, 1, 1])
+                .block([1024, 1, 1])
+                .arg_ptr(args[6])
+                .arg_ptr(args[2])
+                .arg_ptr(d_prefix)
+                .arg_u32(GRID_EXPERTS as u32)
+                .launch(0)?;
+            let grid = if persist {
+                g.memset_async(d_next, 0, 4, 0)?;
+                [2 * g.sm_count()?, 1, 1]
+            } else {
+                [n / 256, tile_bound, 1]
+            };
+            let mut l = KernelLaunch::new(g, kernel).grid(grid).block([256, 1, 1]);
+            for p in args {
+                l = l.arg_ptr(*p);
+            }
+            l = l
+                .arg_u32(GRID_EXPERTS as u32)
+                .arg_u32(n)
+                .arg_u32(k)
+                .arg_ptr(d_prefix);
+            if persist {
+                l = l.arg_ptr(d_next);
+            }
+            l.arg_ptr(d_sc).launch(0)
+        };
+        let t = time(g, &run)?;
+        let mut q = vec![0u8; rows * n as usize];
+        g.copy_d2h(args[5], &mut q)?;
+        let mut sc = vec![0u8; rows * n as usize / 64 * 4];
+        g.copy_d2h(d_sc, &mut sc)?;
+        let (mut worst, mut sum, mut count) = (0f64, 0f64, 0usize);
+        for (r, (wrow, qrow)) in want
+            .chunks_exact(2 * n as usize)
+            .zip(q.chunks_exact(n as usize))
+            .enumerate()
+        {
+            for gi in 0..n as usize / 64 {
+                let ref_vals: Vec<f32> = (0..64)
+                    .map(|j| {
+                        let c = gi * 64 + j;
+                        half::bf16::from_le_bytes([wrow[2 * c], wrow[2 * c + 1]]).to_f32()
+                    })
+                    .collect();
+                let amax = ref_vals.iter().fold(0f32, |m, v| m.max(v.abs()));
+                if amax == 0.0 {
+                    continue;
+                }
+                let o = (r * (n as usize / 64) + gi) * 4;
+                let s = f32::from_le_bytes(sc[o..o + 4].try_into()?);
+                for (j, v) in ref_vals.iter().enumerate() {
+                    let e = ((e4m3(qrow[gi * 64 + j]) * s - v) / amax).abs() as f64;
+                    worst = worst.max(e);
+                    sum += e;
+                    count += 1;
+                }
+            }
+        }
+        println!(
+            "  {name}: {:7.1}us {:5.1} TFLOPS  lossy: error / group amax max {worst:.4} mean {:.5} ({count} values)",
+            t * 1e6,
+            flop / t / 1e12,
+            sum / count.max(1) as f64
+        );
+        // BF16 reference rounding (2^-9) + E4M3 rounding of the FP32 values (2^-4).
+        fail |= worst > 1.0 / 16.0 + 1.0 / 256.0;
+    }
+    for p in [d_sc, d_prefix, d_next] {
+        g.free(p)?;
+    }
+    Ok(fail)
+}
+
 /// `moe_build_tile_worklist` (block scan) against a host serial walk of the
 /// same offsets, local experts only, at the decode compact shape (M64 tiles,
 /// 16 N tiles). Returns true on mismatch.
@@ -165,10 +284,10 @@ pub(super) fn tile_worklist(g: &dyn GpuBackend, offsets: &[i32]) -> Result<bool>
     };
     let (n_tiles, m_tile) = (16u32, 64u32);
     let ptrs: Vec<u8> = (0..GRID_EXPERTS)
-        .flat_map(|e| (if e < EXPERTS { 0x1000u64 } else { 0 }).to_le_bytes())
+        .flat_map(|e| (if e < experts() { 0x1000u64 } else { 0 }).to_le_bytes())
         .collect();
     let mut want = Vec::new();
-    for e in 0..EXPERTS {
+    for e in 0..experts() {
         let rows = (offsets[e + 1] - offsets[e]) as u32;
         for mt in 0..rows.div_ceil(m_tile) {
             for nt in 0..n_tiles {

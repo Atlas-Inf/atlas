@@ -130,7 +130,8 @@ fn w4a16_launch_family_arity_pins() {
 /// signature pin in spark-model's `dflash2_selector_bounds.rs` covers stub
 /// builds where no PTX exists. The rank split's two launches
 /// (`dflash2_selector_topk`, seven args; `dflash2_selector_walk` and its
-/// confidence twin, sixteen) are pinned with it.
+/// confidence twin, sixteen; the chain's `_ranks` walks, seventeen) are
+/// pinned with it.
 #[test]
 #[ignore = "requires nvcc and ATLAS_SKIP_BUILD unset"]
 fn dflash2_candidate_selector_arity_pin() {
@@ -141,13 +142,15 @@ fn dflash2_candidate_selector_arity_pin() {
         eprintln!("no compiled PTX in this binary (stub build) — arity pin skipped");
         return;
     }
-    const SELECTOR_PINS: [(&str, usize); 6] = [
+    const SELECTOR_PINS: [(&str, usize); 8] = [
         ("dflash2_candidate_selector", 16),
         ("dflash2_candidate_selector_conf", 16),
         ("dflash2_candidate_selector_batched", 10),
         ("dflash2_selector_topk", 7),
         ("dflash2_selector_walk", 16),
         ("dflash2_selector_walk_conf", 16),
+        ("dflash2_selector_walk_ranks", 17),
+        ("dflash2_selector_walk_ranks_conf", 17),
     ];
     let mut checked = 0usize;
     for set in atlas_kernels::available_targets() {

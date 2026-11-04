@@ -20,6 +20,7 @@ impl TransformerModel {
     pub(super) fn prefill_b_forward_layers(
         &self,
         seq: &mut SequenceState,
+        tokens: &[u32],
         kv_cache: &mut PagedKvCache,
         chunk_start: usize,
         chunk_len: usize,
@@ -249,6 +250,34 @@ impl TransformerModel {
         // of the contracted `hidden`, gathered below.
         let sp_excluded =
             passengers.is_some() || use_decode_path || midcap.is_some_and(|p| !p.ckpt);
+        // ATLAS_GLM_PREFILL_PIPE2: a plain cold pass as two pipelined halves.
+        let plain = !sp_excluded
+            && !marconi_skip
+            && kv_write_start == 0
+            && layer_write_floor == 0
+            && !profile_now
+            && !host_timing
+            && sync_every == 0;
+        if let Some(rows) = self.glm_pipe2_rows(proc_count, plain, &ctx) {
+            self.glm_prefill_pipe2(
+                seq,
+                kv_cache,
+                rows,
+                effective_seq_len_start,
+                proc_count,
+                &ctx,
+                stream,
+            )?;
+            self.capture_native_mtp_prefill(
+                seq,
+                tokens,
+                effective_seq_len_start,
+                proc_count,
+                hidden,
+                stream,
+            )?;
+            return self.try_mtp_prefill_capture(seq, effective_seq_len_start, proc_count, stream);
+        }
         let mut sp = self.glm_prefill_sp_rows(proc_count, sp_excluded, &ctx);
         let mut sp_scope = sp.map(crate::layers::glm_sp::enter);
         // qwen4_exp (`ATLAS_QWEN4EXP_PREFILL_SP`): the split starts at
@@ -331,6 +360,14 @@ impl TransformerModel {
             if let Some(t) = t_pf {
                 t_in_prefill += t.elapsed();
             }
+            // A MoE output seam left to the next layer (`layers::glm_sp_moe_seam`)
+            // runs here when something reads this layer's highway first.
+            if passengers.is_some()
+                || i + 1 == self.layers.len()
+                || self.config.dflash_capture_layers.contains(&i)
+            {
+                crate::layers::glm_sp_moe_seam::flush(&ctx, stream)?;
+            }
             det.tap_floats("out", ctx.buffers.hc_streams(), det_out, hc_row, hc_elem);
             if let Some(p) = qsp.filter(|p| p.check) {
                 let split = sp.is_some();
@@ -342,6 +379,7 @@ impl TransformerModel {
             // computed token; `layer_kv_write_start` is a constant write
             // floor (0 on cold prefills) and would alias every chunk's
             // captures onto the same rows.
+            let _gathered = self.glm_sp_capture_gather(sp, i, &ctx, stream)?;
             self.try_dflash_prefill_capture_layer(
                 seq,
                 i,
@@ -349,6 +387,7 @@ impl TransformerModel {
                 proc_count,
                 stream,
             )?;
+            drop(_gathered);
             // Riding owners' rows land in their stable hidden-save slots, as
             // after an owner-batched verify.
             if let Some((p, run)) = passengers.as_ref()
@@ -514,6 +553,14 @@ impl TransformerModel {
         // Ported from Enntity/atlas e7d4e1a (AGPL-3.0-only).
         let held = sp.map_or(proc_count, |s| if s.row0 == 0 { s.rows } else { 0 });
         self.note_mtp_prompt_rows(seq, effective_seq_len_start, held, 0);
+        self.capture_native_mtp_prefill(
+            seq,
+            tokens,
+            effective_seq_len_start,
+            proc_count,
+            hidden,
+            stream,
+        )?;
         self.prefill_b_forward_layers_profile_tail(
             seq,
             effective_seq_len_start,

@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Standalone bitwise check of the strict structured-output TP2 verify head
-// (ATLAS_GLM_STRICT_SPEC): each rank's argmax_bf16_value_ban_allow over its
-// half of a row, under the row's full-vocabulary grammar bitmask read from
-// the rank's first vocabulary bit, then argmax_pair_merge_ban, must pick the
-// best ALLOWED token of the whole row, value first then the lower index,
-// exactly as a single-GPU masked argmax would; with the min_tokens ban on
-// banned rows. Both ranks are emulated on one GPU and both merge views (rank
-// 0 and rank 1) must agree. Also: under an all-ones mask the masked kernel
-// returns argmax_bf16_value_ban's pairs bit for bit.
+// Standalone bitwise check of the strict structured-output verify head of the
+// TP2 pair and the TP4 chain (ATLAS_GLM_STRICT_SPEC): each rank's
+// argmax_bf16_value_ban_allow over its 1/ranks of a row, under the row's
+// full-vocabulary grammar bitmask read from the rank's first vocabulary bit,
+// then argmax_pairs_merge_ban over every rank's pairs, must pick the best
+// ALLOWED token of the whole row, value first then the lower index, exactly
+// as a single-GPU masked argmax would; with the min_tokens ban on banned
+// rows. The ranks are emulated on one GPU. Also: under an all-ones mask the
+// masked kernel returns argmax_bf16_value_ban's pairs bit for bit.
 //
-// Vocabularies cycle through 154,880 (word-aligned split), GLM-5.3's real
-// 154,856 (rank 1 starts at 77,428, inside a mask word) and random even sizes
-// (random split offsets within a word). Values are multiples of 1/8 in
+// Cases alternate two and four ranks. Vocabularies cycle through 154,880
+// (word-aligned splits), GLM-5.3's real 154,856 (rank 1 of 2 starts at
+// 77,428, rank 1 of 4 at 38,714, inside a mask word) and random sizes the
+// ranks divide (random split offsets within a word). Values are multiples of 1/8 in
 // [-12.5, 12.5), so ties are common and the tie rule is exercised. Row shapes:
 // random density, all ones, a single allowed token (in either shard), allowed
 // tokens in one shard only, nothing allowed (both sentinels: token 0), and ban
@@ -40,7 +41,7 @@
         }                                                                        \
     } while (0)
 
-static const unsigned VMAX = 160000, ROWS = 9;
+static const unsigned VMAX = 160000, ROWS = 9, RANKS_MAX = 4, RANK_WORDS = ROWS * 4;
 
 static uint64_t rng = 0x9E3779B97F4A7C15ull;
 static unsigned next_u32() {
@@ -51,7 +52,7 @@ static unsigned next_u32() {
 }
 
 struct Shape {
-    unsigned v, shard, w, ban[2];
+    unsigned v, ranks, shard, w, ban[2];
 };
 
 static bool bit(const std::vector<unsigned>& m, const Shape& s, unsigned r, unsigned t) {
@@ -95,17 +96,18 @@ int main(int argc, char** argv) {
     CK(cudaMalloc(&d_logits, logits.size() * 2));
     CK(cudaMalloc(&d_masks, masks.size() * 4));
     CK(cudaMalloc(&d_ones, ones.size() * 4));
-    // Masked pairs of rank 0 and 1, then their all-ones-mask pairs.
-    CK(cudaMalloc(&d_pairs, 4 * ROWS * 4 * 4));
-    CK(cudaMalloc(&d_ref_pairs, 2 * ROWS * 4 * 4));
-    CK(cudaMalloc(&d_out, 2 * ROWS * 4));
+    // Every rank's masked pairs (RANK_WORDS words a rank), then their all-ones-mask pairs.
+    CK(cudaMalloc(&d_pairs, 2 * RANKS_MAX * RANK_WORDS * 4));
+    CK(cudaMalloc(&d_ref_pairs, RANKS_MAX * RANK_WORDS * 4));
+    CK(cudaMalloc(&d_out, ROWS * 4));
     CK(cudaMemcpy(d_ones, ones.data(), ones.size() * 4, cudaMemcpyHostToDevice));
     long checked = 0, bad = 0;
     int unaligned = 0;
     for (int c = 0; c < cases; ++c) {
         Shape s;
-        s.v = c % 3 == 0 ? 154880u : c % 3 == 1 ? 154856u : 150000u + 2 * (next_u32() % 5000);
-        s.shard = s.v / 2;
+        s.ranks = (c / 3) % 2 ? 4u : 2u;
+        s.v = c % 3 == 0 ? 154880u : c % 3 == 1 ? 154856u : 150000u + s.ranks * (next_u32() % 2500);
+        s.shard = s.v / s.ranks;
         s.w = (s.v + 31) / 32;
         s.ban[0] = s.v - 60;
         s.ban[1] = s.v - 53;
@@ -146,44 +148,39 @@ int main(int argc, char** argv) {
         const unsigned ban_lo = ban_rows ? 0x0Fu : 0u;
         CK(cudaMemcpy(d_logits, logits.data(), n * 2, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(d_masks, masks.data(), (size_t)ROWS * s.w * 4, cudaMemcpyHostToDevice));
-        for (unsigned rank = 0; rank < 2; ++rank) {
+        for (unsigned rank = 0; rank < s.ranks; ++rank) {
             const unsigned start = rank * s.shard;
             const unsigned b0 = local_ban(s.ban[0], s, start), b1 = local_ban(s.ban[1], s, start);
             argmax_bf16_value_ban_allow<<<ROWS, 1024>>>(
-                d_logits + start, d_pairs + rank * ROWS * 4, s.shard, s.v, d_masks, s.w, start,
+                d_logits + start, d_pairs + rank * RANK_WORDS, s.shard, s.v, d_masks, s.w, start,
                 b0, b1, 0xFFFFFFFFu, 0xFFFFFFFFu);
             // All-ones mask vs the unmasked kernel: identical pairs.
             argmax_bf16_value_ban<<<ROWS, 1024>>>(
-                d_logits + start, d_ref_pairs + rank * ROWS * 4, s.shard, s.v,
+                d_logits + start, d_ref_pairs + rank * RANK_WORDS, s.shard, s.v,
                 b0, b1, 0xFFFFFFFFu, 0xFFFFFFFFu);
             argmax_bf16_value_ban_allow<<<ROWS, 1024>>>(
-                d_logits + start, d_pairs + (2 + rank) * ROWS * 4, s.shard, s.v, d_ones, s.w,
+                d_logits + start, d_pairs + (RANKS_MAX + rank) * RANK_WORDS, s.shard, s.v, d_ones, s.w,
                 start, b0, b1, 0xFFFFFFFFu, 0xFFFFFFFFu);
         }
         CK(cudaGetLastError());
         CK(cudaDeviceSynchronize());
-        std::vector<unsigned> refp(2 * ROWS * 4);
+        std::vector<unsigned> refp(s.ranks * RANK_WORDS);
         CK(cudaMemcpy(refp.data(), d_ref_pairs, refp.size() * 4, cudaMemcpyDeviceToHost));
-        for (unsigned rank = 0; rank < 2; ++rank) {
-            argmax_pair_merge_ban<<<1, 32>>>(
-                d_pairs + rank * ROWS * 4, d_pairs + (1 - rank) * ROWS * 4, d_out + rank * ROWS,
-                ROWS, s.shard, rank, ban_lo, 0);
-        }
+        // Every rank merges the same gathered pairs.
+        argmax_pairs_merge_ban<<<1, 32>>>(d_pairs, d_out, ROWS, s.shard, s.ranks, RANK_WORDS, ban_lo, 0);
         CK(cudaGetLastError());
         CK(cudaDeviceSynchronize());
-        std::vector<unsigned> out(2 * ROWS);
+        std::vector<unsigned> out(ROWS);
         CK(cudaMemcpy(out.data(), d_out, out.size() * 4, cudaMemcpyDeviceToHost));
         for (unsigned r = 0; r < ROWS; ++r) {
             const unsigned want = reference(vals, masks, s, r, (ban_lo >> r) & 1u);
-            for (unsigned rank = 0; rank < 2; ++rank) {
-                ++checked;
-                if (out[rank * ROWS + r] != want && bad++ < 10)
-                    fprintf(stderr, "case %d vocab %u row %u rank %u: got %u want %u\n", c, s.v,
-                            r, rank, out[rank * ROWS + r], want);
-            }
+            ++checked;
+            if (out[r] != want && bad++ < 10)
+                fprintf(stderr, "case %d vocab %u ranks %u row %u: got %u want %u\n", c, s.v,
+                        s.ranks, r, out[r], want);
         }
-        std::vector<unsigned> onesp(2 * ROWS * 4);
-        CK(cudaMemcpy(onesp.data(), d_pairs + 2 * ROWS * 4, onesp.size() * 4,
+        std::vector<unsigned> onesp(s.ranks * RANK_WORDS);
+        CK(cudaMemcpy(onesp.data(), d_pairs + RANKS_MAX * RANK_WORDS, onesp.size() * 4,
                       cudaMemcpyDeviceToHost));
         for (size_t i = 0; i < onesp.size(); ++i) {
             ++checked;
@@ -197,8 +194,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     printf("PASS glm_strict_split_argmax_bitcheck: %d cases x %u rows (%d with a mid-word "
-           "split), %ld checks (masked TP2 argmax == single-GPU masked argmax; all-ones mask "
-           "== unmasked)\n",
+           "split), %ld checks (masked 2- and 4-rank argmax == single-GPU masked argmax; "
+           "all-ones mask == unmasked)\n",
            cases, ROWS, unaligned, checked);
     return 0;
 }

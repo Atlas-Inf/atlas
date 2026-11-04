@@ -30,6 +30,9 @@ use parking_lot::{Mutex, RwLock};
 use crate::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use anyhow::Result;
 
+/// `(purpose tag, scratch lane)` → `(pointer, bytes)`.
+type ScratchMap = HashMap<(&'static str, usize), (DevicePtr, usize)>;
+
 /// Memoized kernel handles and scratch allocations for one backend.
 #[derive(Default)]
 pub struct OpCache {
@@ -38,7 +41,8 @@ pub struct OpCache {
     /// and read on every launch after.
     kernels: RwLock<HashMap<(&'static str, &'static str), KernelHandle>>,
     /// Purpose tag → `(pointer, bytes)`. Grow-only within a model's life.
-    scratch: Mutex<HashMap<&'static str, (DevicePtr, usize)>>,
+    /// Per `(tag, scratch lane)` (`crate::lane`).
+    scratch: Mutex<ScratchMap>,
     /// Device allocation has failed on this backend at least once.
     alloc_fell_back: std::sync::atomic::AtomicBool,
     /// `(name-hash, M, N, K)` combinations whose route line has been logged.
@@ -72,7 +76,8 @@ impl OpCache {
         Ok(handle)
     }
 
-    /// A scratch allocation of at least `bytes`, memoized under `tag`.
+    /// A scratch allocation of at least `bytes`, memoized under `tag` and the
+    /// calling thread's scratch lane (`crate::lane`).
     ///
     /// Grow-only: a request larger than the current buffer allocates a new one
     /// and abandons the old, which is bounded because the sizes that drive it
@@ -86,11 +91,12 @@ impl OpCache {
         bytes: usize,
     ) -> Result<DevicePtr> {
         let mut g = self.scratch.lock();
-        match g.get(tag) {
+        let key = (tag, crate::lane::current());
+        match g.get(&key) {
             Some(&(p, sz)) if sz >= bytes => Ok(p),
             _ => {
                 let p = gpu.alloc(bytes)?;
-                g.insert(tag, (p, bytes));
+                g.insert(key, (p, bytes));
                 Ok(p)
             }
         }

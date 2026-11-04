@@ -14,6 +14,9 @@ mod layers;
 mod mla_native;
 mod mla_twins;
 pub mod mode;
+mod mtp;
+pub use mtp::Glm5MtpModule;
+pub(crate) use mtp::{glm5_mtp_draft_config, glm5_mtp_marker_names, load_glm5_mtp_module};
 pub(crate) mod retirement;
 mod shared_native;
 mod tp;
@@ -37,6 +40,17 @@ pub struct Glm5WeightLoader;
 impl ModelWeightLoader for Glm5WeightLoader {
     fn supports_tp(&self) -> bool {
         true
+    }
+
+    /// A rank that only receives vision rows never reads the tower.
+    fn dead_namespaces(&self, config: &ModelConfig) -> Vec<String> {
+        if crate::layers::vision_encoder::vision_receive_only(config) {
+            ["model.visual.", "model.language_model.visual."]
+                .map(String::from)
+                .to_vec()
+        } else {
+            Vec::new()
+        }
     }
 
     fn load_layers(

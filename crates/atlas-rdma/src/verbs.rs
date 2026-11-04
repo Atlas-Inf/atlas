@@ -74,6 +74,7 @@ unsafe extern "C" {
         wr_id: u64,
     ) -> c_int;
     fn rs_poll(c: *mut RsConn, out_wr_id: *mut u64) -> c_int;
+    fn rs_try_poll(c: *mut RsConn, out_wr_id: *mut u64, out_status: *mut c_int) -> c_int;
 }
 
 /// Registration keys returned when a memory region is pinned to the QP's PD.
@@ -310,6 +311,20 @@ impl Verbs {
             bail!("ibv_poll_cq error");
         } else {
             bail!("RDMA completion error: ibv_wc_status {rc}");
+        }
+    }
+}
+
+impl Verbs {
+    /// [`Self::poll`] without waiting: `None` when no completion is ready.
+    pub fn try_poll(&mut self) -> Result<Option<u64>> {
+        let (mut wr_id, mut status) = (0u64, 0 as c_int);
+        // SAFETY: conn live; out params valid.
+        match unsafe { rs_try_poll(self.conn, &mut wr_id, &mut status) } {
+            0 => Ok(None),
+            1 if status == 0 => Ok(Some(wr_id)),
+            1 => bail!("RDMA completion error: ibv_wc_status {status}"),
+            _ => bail!("ibv_poll_cq error"),
         }
     }
 }

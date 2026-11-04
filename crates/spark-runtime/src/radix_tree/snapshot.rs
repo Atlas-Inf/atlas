@@ -256,16 +256,6 @@ impl SsmSnapshotIndex {
                 self.stats.recompute_tokens_on_miss += matched_tokens as u64;
             }
         }
-        if std::env::var("ATLAS_SNAP_LOOKUP_DBG").is_ok() {
-            let mut cands: Vec<usize> = self.entries.iter().map(|e| e.token_count).collect();
-            cands.sort_unstable();
-            tracing::info!(
-                "snap-lookup: matched={matched_tokens} selected={:?} n_entries={} token_counts={:?}",
-                best.map(|b| b.1),
-                self.entries.len(),
-                cands,
-            );
-        }
         self.log_stats_if_due();
         best
     }

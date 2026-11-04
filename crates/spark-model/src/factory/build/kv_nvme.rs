@@ -23,12 +23,10 @@
 //! host RAM ([`snapshots_off_host`]), and on a multi-rank world with
 //! `ATLAS_EP_PEER_LIFELINE=0` ([`word_for`]); every rank stops.
 //!
-//! Under a latent shard (`ATLAS_GLM_KV_SHARD=1`) the record slots come in two
-//! classes ([`NvmeGeometry`], `kv_cache/nvme_lanes.rs`): each rank keeps one
-//! record file per class — full records for the blocks whose latents it
-//! stores, index-only records for the peer's — and the budget buys
-//! `ATLAS_KV_NVME_GB / (own + peer record)` slots of EACH class. On GLM-5.3
-//! (106 496 + 12 288 B) a GiB then holds ~1.8× the tokens it holds unsharded.
+//! A latent shard keeps one class per rank: full records for its own blocks,
+//! index-only records for each peer class. The budget buys
+//! `ATLAS_KV_NVME_GB / (own + (world - 1) * peer)` slots per class: about 1.8×
+//! the unsharded token capacity at TP2 and 3× at TP4 for GLM-5.3.
 
 use std::path::PathBuf;
 
@@ -155,6 +153,7 @@ pub(super) fn max_slots(budget_bytes: u64, record_bytes: usize) -> Result<u32> {
 /// slot index (unsharded: [`max_slots`] of the one record), so the classes'
 /// files together stay within the budget.
 pub(super) fn slots_per_class(budget_bytes: u64, geometry: NvmeGeometry) -> Result<u32> {
+    geometry.validate()?;
     let classes = geometry.classes() as u32;
     Ok(max_slots(budget_bytes, geometry.row_bytes())?.min((u32::MAX - 1) / classes))
 }
@@ -207,7 +206,7 @@ pub(super) fn rank_word(geometry: NvmeGeometry, ssm_home: Option<SpillHome>) -> 
 
 /// The fingerprint covers every slot of every class and the bytes of one
 /// slot of each (unsharded: the one class's slots and record, as before).
-/// Both ranks of a latent shard size the same pair of records.
+/// Every rank of a latent shard sizes the same set of records.
 fn word_for(
     cfg: Option<&NvmeKvConfig>,
     geometry: NvmeGeometry,
@@ -230,12 +229,18 @@ fn word_for(
     );
     let slots = slots_per_class(cfg.budget_bytes, geometry)? * geometry.classes() as u32;
     let switches = (cfg.fast, cfg.keep);
-    Ok(rank_fingerprint(
-        slots,
-        geometry.row_bytes(),
-        ssm_home,
-        switches,
-    ))
+    let word = rank_fingerprint(slots, geometry.row_bytes(), ssm_home, switches);
+    if geometry.classes() == 1 {
+        return Ok(word);
+    }
+    // Equal aggregate row sizes do not imply equal own/peer layouts. Include
+    // both record sizes and the class count before any rank allocates stores.
+    let layout = atlas_tier::hash::mix64(
+        atlas_tier::hash::mix64(geometry.classes() as u64, geometry.own as u64),
+        geometry.peer.unwrap_or(0) as u64,
+    );
+    let h = atlas_tier::hash::mix64(u64::from(word), layout);
+    Ok((h % (FAILED_RANK as u64 - 1)) as u32 + 1)
 }
 
 /// Hosts hang on unified-memory exhaustion: the KV pool is sized around what
@@ -347,9 +352,13 @@ fn setup_local(
     let per_class = slots_per_class(cfg.budget_bytes, geometry)?;
     let classes = geometry.classes();
     ensure!(
-        classes == kv_cache.nvme_classes(),
-        "NVMe prefix tier sized for {classes} record class(es), the KV cache has {}",
-        kv_cache.nvme_classes()
+        geometry == kv_cache.nvme_geometry(),
+        "NVMe prefix tier record class geometry {geometry:?} differs from the KV cache {:?}",
+        kv_cache.nvme_geometry()
+    );
+    ensure!(
+        kv_cache.latent_shard().is_none_or(|s| s.spec.rank == rank),
+        "NVMe prefix tier rank {rank} differs from the latent-shard owner"
     );
     ensure!(
         prefix_cache.is_active(),
@@ -399,9 +408,10 @@ fn setup_local(
         ),
         Some(peer) => format!(
             "latent shard: {} B/block record for this rank's blocks (latent + pooled index), \
-             {peer} B for the peer's (pooled index only), {per_class} slots each \
+             {peer} B for each of {} peer classes (pooled index only), {per_class} slots each \
              ({per_token:.0} B/token)",
-            geometry.own
+            geometry.own,
+            classes - 1
         ),
     };
     tracing::info!(

@@ -21,26 +21,32 @@ pub(super) struct BuildPolicy<'a> {
 /// the target KV pool nor disables DFlash above the probe: runtime verification
 /// validates positions against the model limit, block tables and scratch.
 pub(super) fn repair_context(context: usize) -> usize {
-    context.min(crate::speculative::glm_repair_policy::MAX_LONG_CONTEXT)
+    if crate::weight_loader::glm5_mode::strict_native_mtp() {
+        context
+    } else {
+        context.min(crate::speculative::glm_repair_policy::MAX_LONG_CONTEXT)
+    }
 }
 
 impl BuildPolicy<'_> {
-    fn validate(&self, dflash_lane_enabled: bool, long_context: bool) -> Result<()> {
-        let dflash_lane = self.dflash && !self.self_speculative && dflash_lane_enabled;
+    fn validate(&self, dflash_lane_enabled: bool, long_context: bool, native: bool) -> Result<()> {
+        let target_lane = !self.self_speculative
+            && ((self.dflash && dflash_lane_enabled) || (!self.dflash && native));
+        let max_context = if native {
+            self.config.max_position_embeddings
+        } else {
+            crate::speculative::glm_repair_policy::max_long_context()
+        };
         ensure!(
             self.config.model_type == "glm5_next"
-                && self.config.tp_world_size == 2
-                && self.config.ep_world_size == 2
-                // Serving topology has already converted this to local heads.
-                && self.config.num_attention_heads == 32
-                && (2049..=crate::speculative::glm_repair_policy::max_long_context())
-                    .contains(&self.context)
+                && crate::layers::ops::glm_sparse_tc_rank(self.config)
+                && (2049..=max_context).contains(&self.context)
                 && self.block_size == 16
                 && matches!(self.kv_dtype, KvCacheDtype::Bf16 | KvCacheDtype::Fp8G128)
                 && self.layer_dtypes.iter().all(|d| *d == self.kv_dtype)
-                && dflash_lane
+                && target_lane
                 && long_context,
-            "GLM sparse decode TC requires the GLM DFlash lane, TP2/EP2 local32 heads and BF16 or fp8_g128 block16 caches"
+            "GLM sparse decode TC requires the GLM DFlash lane, TP2/EP2 local32 or TP4/EP4 local16 heads and BF16 or fp8_g128 block16 caches"
         );
         Ok(())
     }
@@ -59,6 +65,7 @@ pub(super) fn initialize(gpu: &dyn GpuBackend, policy: BuildPolicy<'_>) -> Resul
     policy.validate(
         crate::speculative::glm_repair_policy::dflash_enabled(),
         crate::speculative::glm_repair_policy::long_context_enabled(),
+        crate::weight_loader::glm5_mode::strict_native_mtp(),
     )?;
     crate::layers::ops::initialize_glm_sparse_decode_tc(gpu, policy.config)?;
     tracing::info!(

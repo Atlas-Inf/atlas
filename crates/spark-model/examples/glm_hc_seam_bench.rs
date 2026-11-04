@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Prefill-shaped benchmark + bitwise gate for the GLM mHC seam kernels
-//! (`glm_hc_mix_ss_bf16`, `glm_hc_post_mix_ss_bf16`) at a 4100-row chunk:
-//! each variant in `VARIANTS` must reproduce the first one's raw mix, sum of
-//! squares and (post) highway byte for byte. Measured 0.85 / 1.74 ms (serving
-//! nsys: 1.2-1.4 / 2.3-2.5 ms); 16- and 8-token tiles were no faster.
+//! (`glm_hc_mix_ss_bf16`, `glm_hc_post_mix_ss_bf16`) at a 4100-row chunk, or
+//! `HC_SEAM_ROWS` rows: each variant in `VARIANTS` (the 32-token tiles, and
+//! the `_w2` / `_w1` 16- and 8-token tiles) must reproduce the first one's
+//! raw mix, sum of squares and (post) highway byte for byte. Measured 0.85 /
+//! 1.74 ms at 4100 rows (serving nsys: 1.2-1.4 / 2.3-2.5 ms), where 16- and
+//! 8-token tiles were no faster; a 512-row sequence-parallel block fills 16
+//! CTAs at 32 tokens.
 //!
 //! Exit: 0 pass, 1 mismatch.
 //!
@@ -18,11 +21,12 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kernel_args::KernelLaunch;
 
 const MODULE: &str = "glm_hc_prefill_vec";
-const T: usize = 4100;
+/// Rows unless `HC_SEAM_ROWS` says otherwise.
+const ROWS: usize = 4100;
 const H: usize = 4096;
 const K: usize = 4 * H;
 /// (tokens per CTA, kernel name suffix); the first is the reference.
-const VARIANTS: &[(u32, &str)] = &[(32, "")];
+const VARIANTS: &[(u32, &str)] = &[(32, ""), (16, "_w2"), (8, "_w1")];
 
 struct Lcg(u64);
 impl Lcg {
@@ -51,18 +55,32 @@ fn fetch(g: &dyn GpuBackend, p: DevicePtr, n: usize) -> Result<Vec<u8>> {
     Ok(v)
 }
 
-fn time(g: &dyn GpuBackend, f: &dyn Fn() -> Result<()>) -> Result<f64> {
+/// Mean seconds of one `f()`, each from a cold L2 (a 128 MiB memset first,
+/// untimed), as serving runs a site: its rows were last touched a layer ago.
+fn time(g: &dyn GpuBackend, flush: DevicePtr, f: &dyn Fn() -> Result<()>) -> Result<f64> {
     f()?;
     g.synchronize(0)?;
-    let t0 = std::time::Instant::now();
+    let mut total = 0.0;
     for _ in 0..20 {
+        g.memset(flush, 0, FLUSH_BYTES)?;
+        g.synchronize(0)?;
+        let t0 = std::time::Instant::now();
         f()?;
+        g.synchronize(0)?;
+        total += t0.elapsed().as_secs_f64();
     }
-    g.synchronize(0)?;
-    Ok(t0.elapsed().as_secs_f64() / 20.0)
+    Ok(total / 20.0)
 }
 
+/// Bytes the L2 flush writes.
+const FLUSH_BYTES: usize = 128 << 20;
+
 fn main() -> Result<()> {
+    #[allow(non_snake_case)]
+    let T: usize = std::env::var("HC_SEAM_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(ROWS);
     let backend = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let g: &dyn GpuBackend = &backend;
     let mut rng = Lcg(0x4C4C);
@@ -85,17 +103,18 @@ fn main() -> Result<()> {
         up(g, &hc_fn)?,
     );
     let d_streams = g.alloc(streams.len())?;
+    let flush = g.alloc(FLUSH_BYTES)?;
     let (d_mix, d_ss) = (g.alloc(T * 24 * 4)?, g.alloc(T * 4)?);
     let mut fail = false;
     for post_mix in [false, true] {
         let base = if post_mix {
-            "glm_hc_post_mix_ss_bf16"
+            "glm_hc_post_mix_ss"
         } else {
-            "glm_hc_mix_ss_bf16"
+            "glm_hc_mix_ss"
         };
         let mut want: Option<Vec<u8>> = None;
         for &(tile, suffix) in VARIANTS {
-            let name = format!("{base}{suffix}");
+            let name = format!("{base}{suffix}_bf16");
             let Ok(kernel) = g.kernel(MODULE, &name) else {
                 println!("{name}: absent");
                 continue;
@@ -120,7 +139,7 @@ fn main() -> Result<()> {
             // Timing mutates the highway in place (post); the check runs once
             // from the pristine copy afterwards.
             g.copy_d2d(d_pristine, d_streams, streams.len())?;
-            let t = time(g, &run)?;
+            let t = time(g, flush, &run)?;
             g.copy_d2d(d_pristine, d_streams, streams.len())?;
             run()?;
             g.synchronize(0)?;
@@ -131,8 +150,13 @@ fn main() -> Result<()> {
             }
             let verdict = match &want {
                 None => {
+                    // A hash to compare builds by (kernel changes that must
+                    // keep the bytes).
+                    let hash = got.iter().fold(0xcbf29ce484222325u64, |h, &b| {
+                        (h ^ b as u64).wrapping_mul(0x100000001b3)
+                    });
                     want = Some(got);
-                    "reference".to_string()
+                    format!("reference {hash:016x}")
                 }
                 Some(w) => {
                     let diff = w.iter().zip(&got).filter(|(a, b)| a != b).count();

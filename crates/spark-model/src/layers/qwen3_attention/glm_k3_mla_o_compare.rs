@@ -80,7 +80,7 @@ impl StagePlan {
         );
         let out = span(candidate, bytes)?;
         ensure!(
-            disjoint(out, span(self.input, self.rows * ROW)?)
+            disjoint(out, span(self.input, self.rows * self.width * 2)?)
                 && disjoint(out, span(self.output, bytes)?),
             "{COMPARE_FLAG}: comparison output aliases staged/reference rows"
         );
@@ -113,7 +113,7 @@ impl StagePlan {
             weight,
             self.output.offset(row * OUTPUT_ROW),
             4096,
-            8192,
+            self.width as u32,
             stream,
         )
     }

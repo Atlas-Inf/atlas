@@ -172,8 +172,24 @@ unsafe extern "C" {
 
 struct Ctx {
     handle: cublasLtHandle_t,
-    workspace: u64,
+    lanes: crate::lane::LaneWorkspace,
     ws_size: usize,
+}
+
+impl Ctx {
+    /// The calling thread's scratch lane's workspace (`crate::lane`).
+    fn workspace(&self) -> Result<u64> {
+        self.lanes.get()
+    }
+}
+
+fn alloc_workspace(bytes: usize) -> Result<u64> {
+    let mut ws: u64 = 0;
+    let st = unsafe { cuMemAlloc_v2(&mut ws, bytes) };
+    if st != 0 {
+        bail!("cuMemAlloc cuBLASLt workspace failed: {st}");
+    }
+    Ok(ws)
 }
 // cuBLASLt handle + device workspace are process-global; matmul is invoked
 // serially from the single-threaded scheduler forward.
@@ -209,7 +225,7 @@ fn ctx() -> Result<&'static Ctx> {
     }
     let _ = CTX.set(Ctx {
         handle,
-        workspace: ws,
+        lanes: crate::lane::LaneWorkspace::new(ws_size, ws, alloc_workspace),
         ws_size,
     });
     Ok(CTX.get().unwrap())

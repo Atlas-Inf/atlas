@@ -206,7 +206,7 @@ pub fn bf16_grouped_gemm_act_weight_t(
                 out as *mut c_void,
                 lc,
                 result.as_ptr().cast(),
-                context.workspace as *mut c_void,
+                context.workspace()? as *mut c_void,
                 context.ws_size,
                 stream as *mut c_void,
             ),

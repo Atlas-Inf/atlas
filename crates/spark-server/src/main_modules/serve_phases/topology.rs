@@ -65,13 +65,16 @@ pub(crate) fn resolve_topology(
     };
     config.tp_rank = tp_rank;
     config.tp_world_size = tp_size;
+    // The DFlash verify widths are priced by this topology's step costs.
+    crate::scheduler::set_verify_ranks(tp_size);
     config.ep_rank = ep_rank;
     config.ep_world_size = ep_size;
     // Every rank must resolve the same value (`rank_settings`): with it each
-    // rank holds a slice of every routed expert, without it half of them.
+    // rank holds a 1/ep slice of every routed expert, without it 1/ep of the
+    // experts. The pair (EP2) and the chain (EP4) slice alike.
     config.expert_tp = std::env::var("ATLAS_GLM_EXPERT_TP").as_deref() == Ok("1")
         && config.model_type == "glm5_next"
-        && ep_size == 2
+        && matches!(ep_size, 2 | 4)
         && tp_size == ep_size
         && world_size == ep_size;
     if tp_size > 1 {
@@ -465,5 +468,21 @@ mod tests {
             differing((&["--speculative"], 8192, 8196), (&[], 8192, 8196)),
             ["--speculative or --dflash"]
         );
+    }
+
+    #[test]
+    fn the_vision_pixel_bound_is_compared() {
+        // It sizes the encoder's capacity and output window on each rank.
+        let args = crate::cli::ServeArgs::parse_from(["spark", "some/model"]);
+        let a = super::rank_settings(&args, false, 8192, 8196, Some(16_777_216));
+        let b = super::rank_settings(&args, false, 8192, 8196, Some(1_048_576));
+        let differ: Vec<_> = a
+            .iter()
+            .zip(&b)
+            .filter(|(x, y)| x != y)
+            .map(|(x, _)| x.0)
+            .collect();
+        assert_eq!(differ.len(), 1);
+        assert!(differ[0].starts_with("vision max pixels"), "{differ:?}");
     }
 }

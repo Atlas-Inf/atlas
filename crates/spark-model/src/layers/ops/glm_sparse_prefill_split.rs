@@ -114,7 +114,7 @@ pub(super) fn dispatch_split(
         a.output,
         out_lse,
         a.rows,
-        a.rows * a.heads,
+        a.heads,
         splits,
         stream,
     )?;

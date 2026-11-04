@@ -41,6 +41,10 @@ impl MoeLayer {
         Ok(())
     }
     pub(super) fn independent_grouped(&self, ctx: &ForwardContext, rows: u32) -> bool {
+        // A packed prefill keeps the generic grouped path (`glm_packed_scope`).
+        if crate::layers::glm_packed_scope::active() {
+            return false;
+        }
         // ATLAS_GLM_CANONICAL_VERIFY: a verify block keeps the arms of every
         // width; only the nonspeculative independent lane takes these.
         if crate::layers::canonical_verify::enabled()
@@ -77,10 +81,10 @@ impl MoeLayer {
                 && self.independent_grouped(ctx, rows as u32)
                 && !self.is_dflash_capture_layer
                 && input == ctx.buffers.norm_output()
-                && ctx
-                    .comm
-                    .is_some_and(|c| c.world_size() == 2 && c.rank() == ctx.config.ep_rank),
-            "independent MoE requires native-T exact live rows and local EP2 context"
+                && ctx.comm.is_some_and(|c| {
+                    c.world_size() == ctx.config.ep_world_size && c.rank() == ctx.config.ep_rank
+                }),
+            "independent MoE requires native-T exact live rows and this EP rank's context"
         );
         self.validate_independent_handles()?;
         super::forward_c4::validate_independent_moe_arenas(ctx.config, ctx.buffers.sizes(), rows)?;

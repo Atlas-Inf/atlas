@@ -8,7 +8,7 @@ use super::*;
 #[ignore = "requires CUDA GPU + non-stub kernel build"]
 fn split_selector_timing() -> Result<()> {
     let (gpu, stream) = setup()?;
-    let (topk, walk, walk_conf) = split_kernels(&gpu)?;
+    let (topk, walk, walk_conf) = split_kernels(&gpu, false)?;
     let inp = inputs(&gpu, &CASES[0])?;
     let cut = VOCAB / 2 / 16 * 16;
     let scratch_bytes = ops::dflash2_selector_scratch_bytes(GAMMA);
@@ -50,7 +50,7 @@ fn split_selector_timing() -> Result<()> {
             ops::dflash2_selector_walk(
                 &gpu,
                 kernel,
-                [d_lists, d_lists],
+                ops::SelectorLists::Pair([d_lists, d_lists]),
                 inp.d_proj,
                 inp.d_pred,
                 inp.d_succ,

@@ -22,6 +22,8 @@ const COMPARE_FLAG: &str = "ATLAS_GLM_K3_MLA_QUERY_COMPARE";
 
 const HIDDEN: usize = 4096;
 const Q_LORA: usize = 1536;
+/// Staged Q rows are a TP2 rank's 32 heads x 256 wide, the widest; a TP4
+/// rank's 16 heads fill the front half of each.
 const Q_DIM: usize = 8192;
 const INDEX_DIM: usize = 4096;
 const BF16: usize = 2;
@@ -285,6 +287,11 @@ impl QueryPlan {
         let stream = c.stream;
         let batch_kernel = layer.dense_gemv_batchm_k;
         ensure!(batch_kernel.0 != 0, "{FLAG}: batchm kernel unavailable");
+        let q_dim = (c.nq * c.hd) as usize;
+        ensure!(
+            q_dim <= Q_DIM && (self.diagnostic.is_none() || q_dim == Q_DIM),
+            "{FLAG}: Q width {q_dim} exceeds its staging, or the scalar comparison is not at TP2"
+        );
         // ATLAS_GLM_FP4L_MLA_FP8: q_a / q_b on the native twins; the scalar
         // comparison reads the BF16 copies, which a native layer does not keep.
         ensure!(
@@ -393,7 +400,7 @@ impl QueryPlan {
             &mla.wq_b,
             self.latent,
             self.q_full,
-            [self.rows as u32, Q_DIM as u32, Q_LORA as u32],
+            [self.rows as u32, q_dim as u32, Q_LORA as u32],
             Q_DIM as u32,
             stream,
         )? {
@@ -404,7 +411,7 @@ impl QueryPlan {
                 &mla.wq_b,
                 self.q_full,
                 self.rows as u32,
-                Q_DIM as u32,
+                q_dim as u32,
                 Q_LORA as u32,
                 Q_DIM as u32,
                 stream,

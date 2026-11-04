@@ -423,7 +423,11 @@ fn spawn_ffmpeg<T>(
     // will ever cause. Killing here turns a 120-second hang into an immediate
     // error. (Draining stdout instead would defeat the cap, which is the
     // thing being enforced.)
-    let over_cap = false; // the read closure enforces the cap
+    if read_res.is_err()
+        && let Ok(mut g) = child.lock()
+    {
+        let _ = g.kill();
+    }
 
     let err_text = stderr_reader
         .join()
@@ -437,17 +441,12 @@ fn spawn_ffmpeg<T>(
     };
     let timed_out = watchdog.join().unwrap_or(false);
 
-    let out = read_res.context("reading decoded frames")?;
     ensure!(
         !timed_out,
         "decoding exceeded {}s and was stopped",
         policy.timeout_secs
     );
-    ensure!(
-        !over_cap,
-        "decoded output exceeded the {}-byte cap",
-        policy.max_output_bytes
-    );
+    let out = read_res.context("reading decoded frames")?;
     if !status.success() {
         let why = err_text.lines().next_back().unwrap_or("no detail").trim();
         bail!("decoder failed: {why}");
@@ -483,6 +482,9 @@ fn split_png_stream(buf: &[u8]) -> Result<Vec<RgbImage>> {
     Ok(frames)
 }
 
+#[cfg(test)]
+#[path = "video_decode_ffmpeg_index_tests.rs"]
+mod index_tests;
 #[cfg(test)]
 #[path = "video_decode_ffmpeg_tests.rs"]
 mod tests;

@@ -50,9 +50,17 @@ pub(super) fn glm_grouped_shape(config: &atlas_core::config::ModelConfig) -> boo
         && config.shared_expert_intermediate_size == 2048
         && config.num_experts == 288
         && config.num_experts_per_tok == 8
-        && config.tp_world_size == 2
-        && config.ep_world_size == 2
+        && glm_tp_ep(config)
         && config.scoring_func == "sigmoid"
+}
+
+/// Whether the ranks split GLM-5 as the TP2/EP2 pair or the TP4/EP4 chain
+/// do: one TP rank per EP rank. Each rank holds its 1/ep of the routed
+/// experts (or, under expert TP, of every expert's width), so every routed
+/// and shared lane serves the same rows on every rank and the one all-reduce
+/// sums the ranks' partials, at two ranks or four.
+pub(crate) fn glm_tp_ep(config: &atlas_core::config::ModelConfig) -> bool {
+    config.tp_world_size == config.ep_world_size && matches!(config.ep_world_size, 2 | 4)
 }
 
 /// Row tiles of the K128W kernels over `rows` sorted rows: the device prefix
@@ -107,7 +115,9 @@ impl MoeLayer {
     /// routed GEMV to the established prequantized native-FP4 grouped path.
     pub(super) fn glm_c3_grouped(&self, ctx: &ForwardContext, rows: u32) -> bool {
         // ATLAS_GLM_CANONICAL_VERIFY: no K=3-only arm (router, shared, tiles).
+        // A packed prefill keeps the generic grouped path (`glm_packed_scope`).
         !crate::layers::canonical_verify::enabled()
+            && !crate::layers::glm_packed_scope::active()
             && std::env::var("ATLAS_GLM_C3_GROUPED_MOE").as_deref() == Ok("1")
             && c3_grouped_shape(ctx.config, rows, ctx.levers.max_decode_seqs)
             && self.glm_grouped_resources(ctx)
@@ -115,7 +125,8 @@ impl MoeLayer {
     }
 
     pub(super) fn glm_c4_grouped(&self, ctx: &ForwardContext, rows: u32) -> bool {
-        crate::model::glm_c4::enabled(&ctx.config.model_type)
+        !crate::layers::glm_packed_scope::active()
+            && crate::model::glm_c4::enabled(&ctx.config.model_type)
             && super::forward_c4::c4_grouped_requested()
             && c4_grouped_shape(ctx.config, rows, ctx.levers.max_decode_seqs)
             && ctx.attn_metadata.is_some_and(|m| m.num_seqs == 4)

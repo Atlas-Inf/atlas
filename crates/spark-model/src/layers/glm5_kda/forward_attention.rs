@@ -66,11 +66,38 @@ impl Glm5KdaLayer {
             (sp.map_or(0, |sp| sp.row0), m_hc as usize),
             h as usize * bf16,
         );
+        // The four-rank KDA quant gather: the rows are gathered cast and
+        // side-projected below instead (`sp_quant_gather.rs`).
+        let quant_gather = sp.filter(|&sp| self.sp_kda_quant_gather(sp, ctx));
+        let projected = ctx.buffers.qkv_output();
+        let plane_bytes = tokens * p * bf16;
+        // ... cast, side-projected and gathered a seam block at a time, as
+        // the seam norms each block, when the seam overlaps.
+        let blocks = quant_gather.and_then(|sp| crate::layers::glm_sp_overlap::blocks(sp, ctx));
+        let block_staging = match (quant_gather, &blocks) {
+            (Some(sp), Some(blocks)) => self.sp_kda_block_staging(sp, blocks, ctx)?,
+            _ => None,
+        };
+        let stage = |block| match quant_gather {
+            Some(sp) => {
+                self.sp_kda_stage_rows(normed, projected, plane_bytes, sp, block, ctx, stream)
+            }
+            None => Ok(()),
+        };
+        let extra = block_staging.map(|(ptr, width)| crate::layers::qwen3_attention::SeamGather {
+            ptr,
+            width,
+            also: None,
+            group: crate::layers::SEAM_GATHER_GROUP,
+            rows: &stage,
+        });
         // ATLAS_GLM_SP_GATHER_OVERLAP: pre, norm and gather a row block at a time.
         let overlapped = self.sp_seam_overlapped(
             &self.hc.attn,
             &self.input_norm,
-            (false, true),
+            (false, quant_gather.is_none()),
+            false,
+            extra,
             hidden,
             normed,
             sp,
@@ -100,14 +127,21 @@ impl Glm5KdaLayer {
                     stream,
                 )?;
             }
-            if let Some(sp) = sp {
+            if let Some(sp) = sp.filter(|_| quant_gather.is_none()) {
                 sp.all_gather(normed, self.hidden_size, ctx, stream)?;
             }
         }
         profile::step(ctx, stream, &mut profile_timer, "hc_attn_norm")?;
 
-        let projected = ctx.buffers.qkv_output();
-        let plane_bytes = tokens * p * bf16;
+        match (quant_gather, &blocks) {
+            (Some(sp), Some(blocks)) if overlapped && block_staging.is_some() => {
+                self.sp_kda_unstage(projected, plane_bytes, sp, blocks, ctx, stream)?
+            }
+            (Some(sp), _) => {
+                self.sp_kda_gather_quantized(normed, projected, plane_bytes, sp, ctx, stream)?
+            }
+            (None, _) => {}
+        }
         self.forward_attention_qkv(
             normed,
             projected,
@@ -117,6 +151,7 @@ impl Glm5KdaLayer {
             h,
             decode,
             verify_proj,
+            quant_gather.is_some(),
             &mut profile_timer,
             ctx,
             stream,
@@ -130,6 +165,7 @@ impl Glm5KdaLayer {
             decode,
             verify_proj,
             capture_verify_intermediates,
+            quant_gather.is_some(),
             &mut profile_timer,
             ctx,
             stream,
@@ -155,7 +191,13 @@ impl Glm5KdaLayer {
         )?;
         profile::step(ctx, stream, &mut profile_timer, "gated_norm")?;
         det.tap("x_gated", gated, (0, tokens), p * bf16);
-        if verify_proj {
+        // ATLAS_GLM_SP_KDA_OPROJ_A2A: this rank's rows over every head, whole.
+        let whole = match sp.filter(|&sp| !verify_proj && self.sp_oproj_a2a(sp, ctx)) {
+            Some(sp) => self.sp_oproj_all_to_all(gated, local(normed), sp, ctx, stream)?,
+            None => false,
+        };
+        if whole {
+        } else if verify_proj {
             self.project_hot_verify(
                 gated,
                 &self.weights.o_proj,
@@ -194,11 +236,31 @@ impl Glm5KdaLayer {
         // ATLAS_GLM_SP_GATHER_OVERLAP: reduce, post + pre, norm and (MoE)
         // gather a row block at a time; all of it is timed as `tp_reduce`.
         let moe = matches!(self.ffn, crate::layers::FfnComponent::Moe(_));
+        // The routed MoE needs every row, unless it gathers them itself.
+        let gather = moe && !sp.is_some_and(|sp| self.ffn.sp_gathers_own_input(sp, ctx));
+        // Its quantized rows instead, gathered as each block is normed.
+        let route = |block| match sp {
+            Some(sp) => self.ffn.sp_route_rows(normed, sp, block, ctx, stream),
+            None => Ok(()),
+        };
+        let staging = match sp.filter(|_| moe && !gather) {
+            Some(sp) => self.ffn.sp_route_staging(sp, ctx)?,
+            None => None,
+        };
+        let extra = staging.map(|(ptr, width)| crate::layers::qwen3_attention::SeamGather {
+            ptr,
+            width,
+            also: None,
+            group: crate::layers::SEAM_GATHER_GROUP,
+            rows: &route,
+        });
         let overlapped = !fused_tp_hc
             && self.sp_seam_overlapped(
                 &self.hc.ffn,
                 &self.post_attn_norm,
-                (true, moe),
+                (true, gather),
+                whole,
+                extra,
                 hidden,
                 normed,
                 sp,
@@ -216,8 +278,9 @@ impl Glm5KdaLayer {
                 tokens * self.hidden_size * 2,
                 stream,
             )?;
-        } else if let Some(sp) = sp {
+        } else if let Some(sp) = sp.filter(|_| !whole) {
             sp.reduce_scatter(normed, self.hidden_size, ctx, stream)?;
+        } else if whole {
         } else if ctx.config.tp_world_size > 1
             && let Some(comm) = ctx.comm
         {
@@ -288,7 +351,7 @@ impl Glm5KdaLayer {
                 )?;
             }
             // The routed MoE needs every row; a dense FFN runs only the local ones.
-            if let Some(sp) = sp.filter(|_| moe) {
+            if let Some(sp) = sp.filter(|_| gather) {
                 sp.all_gather(normed, self.hidden_size, ctx, stream)?;
             }
         }

@@ -252,12 +252,15 @@ impl MoeLayer {
             Some(sp) if !sp.full_shared => (sp.local(input, h as usize), sp.rows as u32),
             _ => (input, n),
         };
+        // Not in a packed prefill (`glm_packed_scope`): a choice made from the
+        // pass height, kept off so a lone prompt and a pack run alike.
         // An MXFP8 shared expert under EP is this rank's slice
         // (`shared_mxfp8.rs`): its partial over every row joins the routed sum
         // before the reduce (`split`).
         let mx_split = has_shared && is_ep_prefill && self.shared_joins_reduce();
         let overlap_shared_reduce = has_shared
             && is_ep_prefill
+            && !crate::layers::glm_packed_scope::active()
             && !mx_split
             && num_tokens > 64
             && !ctx.graph_capture
@@ -269,6 +272,7 @@ impl MoeLayer {
         // intermediate columns and blends that partial before the EP
         // all-reduce, which sums the halves; each rank reads half the weights.
         let split_eligible = has_shared
+            && !crate::layers::glm_packed_scope::active()
             && is_ep_prefill
             && sp.is_none()
             && !overlap_shared_reduce
@@ -311,8 +315,15 @@ impl MoeLayer {
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
         let row = h as usize * 2;
         det.tap("moe_in", input, (0, num_tokens), row);
-        // 1-3. Router GEMM, top-k, sort by expert (route_fuse.rs).
-        let routes = self.route_and_sort(input, [n, h, inter], det, ctx, stream)?;
+        // 1-3. Router GEMM, top-k, sort by expert (route_fuse.rs), or under
+        // the four-rank chain's quant gather, this rank's rows routed and quantized,
+        // then gathered (sp_quant_gather.rs).
+        let quant_gather = crate::layers::glm_sp::current()
+            .filter(|&sp| num_tokens == sp.total() && self.sp_quant_gather(sp, ctx));
+        let routes = match quant_gather {
+            Some(sp) => self.route_sp_quantized(input, sp, ctx, stream)?,
+            None => self.route_and_sort(input, [n, h, inter], det, ctx, stream)?,
+        };
         let super::route_fuse::Routes {
             indices: indices_dev,
             weights: weights_dev,
@@ -351,7 +362,7 @@ impl MoeLayer {
         // 4-6. Routed grouped-GEMM phase (grid sizing → grouped gate+up
         // GEMM → SiLU → grouped down GEMM). Hoisted to forward_prefill_routed.rs
         // to keep this file under the 500 LoC cap; behavior identical.
-        self.run_routed_grouped_gemm(
+        let e4m3_scales = self.run_routed_grouped_gemm(
             expert_input,
             expert_offsets,
             sorted_token_ids,
@@ -363,6 +374,7 @@ impl MoeLayer {
             num_tokens,
             num_experts as usize,
             prerouted,
+            quant_gather.is_some(),
             &mut t0,
             ctx,
             stream,
@@ -389,6 +401,7 @@ impl MoeLayer {
             shared_in,
             shared_n,
             defer_shared_hc,
+            e4m3_scales,
             ctx,
             stream,
         )?;

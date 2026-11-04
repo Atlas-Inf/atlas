@@ -215,6 +215,45 @@ pub(super) fn kda_twin(
     }))
 }
 
+/// `ATLAS_GLM_SP_KDA_OPROJ_A2A=1`: KDA's o_proj on this rank's rows over
+/// every head (`glm5_kda::sp_oproj_a2a`).
+pub(crate) fn oproj_a2a_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_SP_KDA_OPROJ_A2A").as_deref() == Ok("1"))
+}
+
+/// The whole, unsharded KDA o_proj `stem` (`[n, k]` in the config) as a W8A8
+/// prefill operand, under `ATLAS_GLM_SP_KDA_OPROJ_A2A` on the four-rank
+/// chain with W8A8 prefill: +1 B a parameter (~33 MiB a layer at GLM's
+/// shape), the same checkpoint bytes every rank's shard is cut from.
+pub(super) fn kda_oproj_full(
+    policy: KdaMxPolicy,
+    store: &WeightStore,
+    stem: &str,
+    nk: [usize; 2],
+    tp_size: usize,
+    gpu: &dyn GpuBackend,
+) -> Result<Option<MxW8a8>> {
+    if !(policy.w8a8_prefill && tp_size == 4 && oproj_a2a_requested()) {
+        return Ok(None);
+    }
+    let w8a8_only = KdaMxPolicy {
+        decode: false,
+        w8a8_prefill: true,
+    };
+    let mx = kda_twin(
+        w8a8_only,
+        store,
+        stem,
+        nk,
+        TpShardKind::RowParallel,
+        0,
+        1,
+        gpu,
+    )?;
+    Ok(mx.and_then(|mx| mx.w8a8))
+}
+
 /// `ATLAS_GLM_FP4L_KDA_TILED_TWIN=1` with `ATLAS_GLM_MXFP8_TILED=1`: a KDA
 /// layer serving W8A8 prefill gives decode / verify a chunk-tiled copy of the
 /// twin (the `_tiled` tiers stream ~10% faster than row-major at these

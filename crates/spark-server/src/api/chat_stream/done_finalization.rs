@@ -34,7 +34,8 @@ pub(super) fn finalize_done<'a>(
     let fr = resolve_wire_finish_reason(
         finish_reason,
         state.tool_loop_capped,
-        state.detector.as_ref().is_some_and(|d| d.has_tool_calls()) || state.salvaged_tool_call,
+        // Calls sent to the client, not parsed: a rejected call is content.
+        state.tool_calls_emitted_count > 0 || state.salvaged_tool_call,
         state.stop_string_matched,
         state.guard_stop,
     );

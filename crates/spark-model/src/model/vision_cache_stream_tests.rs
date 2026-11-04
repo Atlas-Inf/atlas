@@ -21,8 +21,9 @@ use crate::traits::Model;
 fn staged() -> (Fixture, Vec<u32>) {
     let mut f = Fixture::new(1, 1, 0);
     let tower = VisionEncoder::new_glm(
-        test_tower::weights(),
+        Some(test_tower::weights()),
         &test_tower::config(),
+        test_tower::capacity(),
         f.model.gpu.as_ref(),
     )
     .unwrap();
@@ -200,8 +201,9 @@ fn a_worker_waits_for_the_heads_encode_as_an_idle_receive() {
     let (_, tokens) = staged();
     let mut w = Fixture::new(2, 1, 1);
     let tower = VisionEncoder::new_glm(
-        test_tower::weights(),
+        Some(test_tower::weights()),
         &test_tower::config(),
+        test_tower::capacity(),
         w.model.gpu.as_ref(),
     )
     .unwrap();
@@ -268,8 +270,9 @@ fn a_head_without_pixels_fails_instead_of_splicing_stale_rows() {
     for tp in [1, 2] {
         let mut f = Fixture::new(tp, 1, 0);
         let tower = VisionEncoder::new_glm(
-            test_tower::weights(),
+            Some(test_tower::weights()),
             &test_tower::config(),
+            test_tower::capacity(),
             f.model.gpu.as_ref(),
         )
         .unwrap();

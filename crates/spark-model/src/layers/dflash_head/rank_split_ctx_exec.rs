@@ -62,7 +62,7 @@ impl RankSplit {
         }
         for step in ctx_steps(i) {
             if let Step::Swap(swap) = step {
-                self.exchange(swap, self.sink, self.sink, comm, stream)?;
+                self.drain(swap, comm.rank(), comm, stream)?;
             }
         }
         Ok(None)
@@ -85,7 +85,7 @@ impl BlockDiffusionDraftHead {
     /// sequence's rows are those its propose appends from the state it
     /// starts from (`pending_ctx_rows`); only appends of 1..=`CTX_MAX_ROWS`
     /// rows on the tensor-core tiers within one precompute pass split.
-    pub(crate) fn split_ctx_rows(&self, comm: &dyn CommBackend, seqs: &[CtxSeq<'_>]) -> u32 {
+    pub(crate) fn split_ctx_rows(&self, comm: &dyn CommBackend, seqs: &[CtxSeq<'_>]) -> u64 {
         let Some(split) = self.rank_split.as_ref() else {
             return 0;
         };
@@ -99,7 +99,7 @@ impl BlockDiffusionDraftHead {
                 let tier = crate::layers::w4a16_gemv_tiers::tc_kernel(n as u32).0 != 0;
                 if (1..=CTX_MAX_ROWS.min(self.ctx_window)).contains(&n)
                     && tier
-                    && comm.supports_exchange_async(split.ctx_bytes(n))
+                    && split.carries(comm, split.ctx_bytes(n))
                 {
                     *slot = n as u8;
                 }
@@ -151,7 +151,7 @@ impl BlockDiffusionDraftHead {
         walk(&ctx_steps(turn.index), Graphs::Eager, gpu, stream, &walker)
     }
 
-    /// A context piece both ranks run, over `rank`'s half: the GEMVs of the
+    /// A context piece every rank runs, over `rank`'s share: the GEMVs of the
     /// unsplit `ctx_projection` (its NVFP4 twin, at the append's rows) over a
     /// row range, and the norm over the same joined rows.
     pub(super) fn ctx_piece(
@@ -170,9 +170,9 @@ impl BlockDiffusionDraftHead {
                 gpu,
                 twin(0),
                 frame.ctx_in,
-                split.ctx_own,
+                split.own(Swap::CtxHidden(i), rank),
                 [g.ctx.get(i), g.hidden, g.ctx_in],
-                rank,
+                (rank, g.ranks),
                 stream,
             ),
             Piece::CtxNorm(i) => ops::rms_norm(
@@ -190,9 +190,9 @@ impl BlockDiffusionDraftHead {
                 gpu,
                 twin(1),
                 frame.ctx_fc,
-                split.ctx_own,
+                split.own(Swap::CtxKv(i), rank),
                 [g.ctx.get(i), g.ctx_kv, g.hidden],
-                rank,
+                (rank, g.ranks),
                 stream,
             ),
             other => bail!("rank-split propose: {other:?} is not a context piece"),

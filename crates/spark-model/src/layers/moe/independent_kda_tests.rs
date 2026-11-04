@@ -84,6 +84,8 @@ fn kda_layer(
         k_proj: projection(),
         v_proj: projection(),
         o_proj: projection(),
+        o_proj_full: None,
+        b_proj_full: None,
         b_proj: dense(32 * 4096 * 2),
         f_a_proj: dense(128 * 4096 * 2),
         f_b_proj: dense(4096 * 128 * 2),

@@ -11,6 +11,10 @@ use crate::layer::ForwardContext;
 use crate::layers::ops;
 
 pub(super) fn fast_prefill(tokens: u32) -> bool {
+    // A packed prefill takes the fused mixer at every row count.
+    if crate::layers::glm_packed_scope::active() {
+        return true;
+    }
     tokens >= 128
         && matches!(
             std::env::var("ATLAS_HC_CUBLAS_PREFILL").ok().as_deref(),
@@ -153,7 +157,7 @@ pub(crate) fn hc_pre_prefill_mix(
 }
 
 /// The highway, post and comb rows from this rank's row `row0` on.
-fn hc_rows(ctx: &ForwardContext, row0: usize) -> (DevicePtr, DevicePtr, DevicePtr) {
+pub(crate) fn hc_rows(ctx: &ForwardContext, row0: usize) -> (DevicePtr, DevicePtr, DevicePtr) {
     let b = ctx.buffers;
     let highway_row = 4 * ctx.config.hidden_size * ops::hc_elem_bytes(&ctx.config.model_type);
     (
@@ -282,8 +286,11 @@ pub(super) fn seam_forms(
             flag("ATLAS_GLM_HC_DECODE_SEAM"),
         )
     });
-    let prefill = prefill_on && with_post && tokens >= 512;
-    let decode = decode_on && (1..=32).contains(&tokens);
+    // A packed prefill: the prefill seam whenever it is on, never the decode
+    // one, so the form does not depend on the pass's row count.
+    let packed = crate::layers::glm_packed_scope::active();
+    let prefill = prefill_on && with_post && (tokens >= 512 || packed);
+    let decode = decode_on && !packed && (1..=32).contains(&tokens);
     let shaped = hc_mult == 4
         && ctx.config.hidden_size == 4096
         && ctx.config.model_type == "glm5_next"
@@ -405,6 +412,7 @@ impl Qwen3AttentionLayer {
         let h = ctx.config.hidden_size as u32;
         let hc_mult = hc.hc_mult as u32;
         if tokens <= 32
+            && !crate::layers::glm_packed_scope::active()
             && hc_post_pre_prefill_fused(
                 site,
                 None,

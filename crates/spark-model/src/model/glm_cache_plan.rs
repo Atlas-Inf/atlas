@@ -199,6 +199,22 @@ impl GlmCachePlan {
         self.block_bytes_all_layers
     }
 
+    /// Budget an auxiliary pool that grows with the same admitted target rows.
+    /// Keep the original plan for target allocation and rank geometry agreement.
+    pub(crate) fn with_auxiliary_pool(self, per_block: usize, fixed: usize) -> Result<Self> {
+        Ok(Self {
+            block_bytes_all_layers: self
+                .block_bytes_all_layers
+                .checked_add(per_block)
+                .ok_or_else(|| anyhow::anyhow!("joint KV block bytes overflow"))?,
+            fixed_bytes: self
+                .fixed_bytes
+                .checked_add(fixed)
+                .ok_or_else(|| anyhow::anyhow!("joint KV fixed bytes overflow"))?,
+            ..self
+        })
+    }
+
     pub(crate) fn num_blocks_for_budget(self, available_bytes: usize) -> usize {
         available_bytes.saturating_sub(self.fixed_bytes) / self.block_bytes_all_layers
     }
@@ -245,6 +261,21 @@ mod tests {
             layer_dims: vec![],
             cache_blocks_per_seq: None,
         }
+    }
+
+    #[test]
+    fn joint_native_budget_preserves_target_geometry_and_charges_tail_slack() {
+        let cfg = config(11, KvCacheDtype::Bf16);
+        let target = GlmCachePlan::new(GlmMlaShape::new(512, 0).unwrap(), &cfg, None).unwrap();
+        let joint = target.with_auxiliary_pool(25_600, 4 * 25_600).unwrap();
+        let bytes = target.bytes_for_blocks(100).unwrap() + 104 * 25_600;
+        assert_eq!(joint.num_blocks_for_budget(bytes), 100);
+        assert_eq!(joint.num_blocks_for_budget(bytes - 1), 99);
+        assert_eq!(joint.bytes_for_blocks(100).unwrap(), bytes);
+        assert_eq!(joint.shard(), target.shard());
+        assert_eq!(target.block_bytes_all_layers(), 11 * 2 * 16 * 512 * 2);
+        assert!(target.with_auxiliary_pool(usize::MAX, 0).is_err());
+        assert!(joint.with_auxiliary_pool(0, usize::MAX).is_err());
     }
 
     #[test]

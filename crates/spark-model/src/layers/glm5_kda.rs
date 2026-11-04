@@ -13,11 +13,14 @@ mod hc;
 mod indexed_core;
 mod init;
 mod multi_seq;
+mod packed;
 mod profile;
 mod projection;
 mod recurrent;
 mod shared_cache;
+mod sp_oproj_a2a;
 mod sp_overlap;
+mod sp_quant_gather;
 
 use std::mem::size_of;
 
@@ -297,6 +300,18 @@ impl TransformerLayer for Glm5KdaLayer {
             },
         )?;
         self.forward_ffn(phase, ctx, stream)
+    }
+
+    fn prefill_glm_packed(
+        &self,
+        hidden: DevicePtr,
+        total: usize,
+        owners: &mut [crate::layer::glm_packed::GlmPackedOwner<'_>],
+        _cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.prefill_packed(hidden, total, owners, ctx, stream)
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {

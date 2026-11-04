@@ -88,6 +88,7 @@ pub fn step_verify_k2(
     dflash_verify_raw_argmax: bool,
 ) {
     use crate::scheduler::mtp_timing::Phase;
+    let native_mtp = model.native_mtp_enabled();
     let t_step = Instant::now();
     let t_sync = Instant::now();
     if let Err(e) = model.sync_secondary() {
@@ -250,7 +251,8 @@ pub fn step_verify_k2(
         // then row 1 @ N+1 BEFORE propose so forward_block conditions on row 1
         // (the hidden that generated bonus). This also sets the proposer's
         // skip-flag so propose does NOT re-append row 0.
-        let eagle_fix = std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref() == Some("1");
+        let eagle_fix =
+            !native_mtp && std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref() == Some("1");
         if eagle_fix && let Err(e) = model.dflash_eagle_accept_append(&mut a.seq) {
             tracing::error!("dflash_eagle_accept_append: {e:#}");
         }
@@ -262,17 +264,45 @@ pub fn step_verify_k2(
         super::verify_k4_verdict::stage_absorb(model, a, 0, &drafts[..1]);
         if let Err(e) = model.select_mtp_stream_row(1) {
             tracing::error!("select_mtp_stream_row(1): {e:#}");
+            if native_mtp {
+                a.abort_on_engine_error(format_args!(
+                    "native GLM MTP stream-row selection failed: {e:#}"
+                ));
+                return;
+            }
         }
         if let Err(e) = model.save_hidden_for_mtp(1, 0) {
             tracing::error!("save_hidden_for_mtp(1): {e:#}");
+            if native_mtp {
+                a.abort_on_engine_error(format_args!(
+                    "native GLM MTP hidden staging failed: {e:#}"
+                ));
+            }
             return;
         }
         sched.timing.record(Phase::SaveHidden, t_save);
         let t_trim = Instant::now();
         if let Err(e) = crate::scheduler::copy_drafts::mtp::trim_proposer(model, a, 1) {
             tracing::error!("trim_proposer_state: {e:#}");
+            if native_mtp {
+                a.abort_on_engine_error(format_args!(
+                    "native GLM MTP private-state trim failed: {e:#}"
+                ));
+                return;
+            }
         }
         sched.timing.record(Phase::TrimProposer, t_trim);
+        // Native GLM keeps the row for the verified input pair, then repairs
+        // the accepted-draft pair from verify row 0 before the next propose.
+        // Other proposer families receive the trait's no-op default.
+        if let Err(e) =
+            model.repair_mtp_after_verify(drafts[0], a.seq.seq_len.saturating_sub(1), &mut a.seq, 0)
+        {
+            tracing::error!("repair_mtp_after_verify: {e:#}");
+            a.engine_error = Some(format!("{e:#}"));
+            a.finished = true;
+            return;
+        }
         let t_mask = Instant::now();
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
         sched.timing.record(Phase::ProposeMask, t_mask);
@@ -288,8 +318,19 @@ pub fn step_verify_k2(
                 _mtp_grammar_mask.as_deref(),
             ) {
                 Ok(d) if !d.is_empty() => a.pending_drafts = d,
-                Ok(_) => {}
+                Ok(_) => {
+                    if native_mtp {
+                        a.abort_on_engine_error("native GLM MTP re-propose returned no drafts");
+                        return;
+                    }
+                }
                 Err(e) => {
+                    if native_mtp {
+                        a.abort_on_engine_error(format_args!(
+                            "native GLM MTP re-propose failed: {e:#}"
+                        ));
+                        return;
+                    }
                     tracing::error!("run_mtp_propose_multi: {e:#}");
                 }
             }
@@ -320,6 +361,12 @@ pub fn step_verify_k2(
         let t_trim = Instant::now();
         if let Err(e) = crate::scheduler::copy_drafts::mtp::trim_proposer(model, a, 0) {
             tracing::error!("trim_proposer_state: {e:#}");
+            if native_mtp {
+                a.abort_on_engine_error(format_args!(
+                    "native GLM MTP private-state trim failed: {e:#}"
+                ));
+                return;
+            }
         }
         sched.timing.record(Phase::TrimProposer, t_trim);
         // Item #2 (STree-style in-place K=2 verify commit). K=2 reject means
@@ -347,9 +394,20 @@ pub fn step_verify_k2(
         // the first verify row instead of the accepted one.
         if let Err(e) = model.select_mtp_stream_row(0) {
             tracing::error!("select_mtp_stream_row(0): {e:#}");
+            if native_mtp {
+                a.abort_on_engine_error(format_args!(
+                    "native GLM MTP stream-row selection failed: {e:#}"
+                ));
+                return;
+            }
         }
         if let Err(e) = model.save_hidden_for_mtp(0, 0) {
             tracing::error!("save_hidden_for_mtp(0): {e:#}");
+            if native_mtp {
+                a.abort_on_engine_error(format_args!(
+                    "native GLM MTP hidden staging failed: {e:#}"
+                ));
+            }
             return;
         }
         sched.timing.record(Phase::SaveHidden, t_save);
@@ -368,8 +426,19 @@ pub fn step_verify_k2(
                 _mtp_grammar_mask.as_deref(),
             ) {
                 Ok(d) if !d.is_empty() => a.pending_drafts = d,
-                Ok(_) => {}
+                Ok(_) => {
+                    if native_mtp {
+                        a.abort_on_engine_error("native GLM MTP re-propose returned no drafts");
+                        return;
+                    }
+                }
                 Err(e) => {
+                    if native_mtp {
+                        a.abort_on_engine_error(format_args!(
+                            "native GLM MTP re-propose failed: {e:#}"
+                        ));
+                        return;
+                    }
                     tracing::error!("run_mtp_propose_multi: {e:#}");
                 }
             }

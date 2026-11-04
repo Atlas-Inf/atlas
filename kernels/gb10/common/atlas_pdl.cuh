@@ -13,3 +13,16 @@ __device__ __forceinline__ void atlas_pdl_enter() {
     asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
 }
+
+// The same entry with the two steps swapped: wait for the predecessor, then
+// let our successor be scheduled. A kernel that waits long after its entry
+// (the RDMA chain kernels, which spin for their peers) otherwise lets a whole
+// run of PDL-launched successors become resident at once, each holding its
+// blocks' registers while it waits, and starves kernels on other streams.
+// Here at most one successor waits beside a running kernel.
+__device__ __forceinline__ void atlas_pdl_enter_serial() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}

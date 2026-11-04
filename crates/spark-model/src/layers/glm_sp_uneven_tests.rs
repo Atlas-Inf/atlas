@@ -111,6 +111,15 @@ pub(crate) fn with_ctx<R>(
     with_model_ctx(gpu, comm, None, f)
 }
 
+/// [`with_ctx`] over any communicator.
+pub(crate) fn with_comm_ctx<R>(
+    gpu: &MockGpuBackend,
+    comm: &dyn CommBackend,
+    f: impl FnOnce(&ForwardContext) -> R,
+) -> R {
+    with_model_ctx(gpu, comm, None, f)
+}
+
 /// [`with_ctx`] with the config's `model_type` replaced (any GPU and pair:
 /// the QSA split's GPU test runs it on CUDA).
 pub(crate) fn with_model_ctx<R>(

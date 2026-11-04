@@ -161,6 +161,12 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        let shape = [num_tokens, num_experts, hidden_size];
+        // A packed prefill (`glm_packed_scope`): the BF16 GEMM, row-invariant
+        // there, at every row count.
+        if crate::layers::glm_packed_scope::active() && ctx.config.model_type == "glm5_next" {
+            return self.router_bf16_gemm(router_in, gate_logits, shape, stream);
+        }
         match glm_router_prefill_gemm(
             ctx.config.model_type == "glm5_next",
             num_tokens,
@@ -169,20 +175,7 @@ impl MoeLayer {
             glm_router_prefill_cutlass(),
         ) {
             Some(RouterPrefillGemm::Cutlass) => {
-                let gemm = if self.router_f32 {
-                    ops::bf16_gemm_f32out
-                } else {
-                    ops::bf16_gemm
-                };
-                return gemm(
-                    router_in,
-                    self.weights.gate.weight.0,
-                    gate_logits,
-                    num_tokens,
-                    num_experts,
-                    hidden_size,
-                    stream,
-                );
+                return self.router_bf16_gemm(router_in, gate_logits, shape, stream);
             }
             Some(RouterPrefillGemm::CublasLt) => {
                 let lt = if self.router_f32 {
@@ -280,6 +273,32 @@ impl MoeLayer {
         )
     }
 
+    /// `ops::bf16_gemm` for the router, into BF16 logits or, under
+    /// [`Self::router_f32`], FP32 ones (`ops::bf16_gemm_f32out`: the same
+    /// tiles, the accumulator unrounded).
+    pub(super) fn router_bf16_gemm(
+        &self,
+        router_in: DevicePtr,
+        gate_logits: DevicePtr,
+        [m, n, k]: [u32; 3],
+        stream: u64,
+    ) -> Result<()> {
+        let gemm = if self.router_f32 {
+            ops::bf16_gemm_f32out
+        } else {
+            ops::bf16_gemm
+        };
+        gemm(
+            router_in,
+            self.weights.gate.weight.0,
+            gate_logits,
+            m,
+            n,
+            k,
+            stream,
+        )
+    }
+
     /// Apply the router pre-normalization (Gemma-4 only) and return the
     /// pointer that should be fed into the gate GEMV. If the MoE has no
     /// router_pre_norm weight, this is a no-op and returns `input` unchanged.
@@ -352,6 +371,41 @@ fn glm_router_prefill_gemm(
         Some(RouterPrefillGemm::Cutlass)
     } else {
         Some(RouterPrefillGemm::CublasLt)
+    }
+}
+
+impl MoeLayer {
+    /// Whether the prefill router GEMM of `n` rows runs `ops::bf16_gemm` on
+    /// its CUTLASS tiles (`router_gate_gemm_dense`'s CUTLASS arm), as a block
+    /// of `rows` of those rows does too: each then computes its rows' bytes of
+    /// the whole call: those tiles' config depends on N and K alone and never
+    /// splits K.
+    pub(super) fn router_prefill_row_blocks(
+        &self,
+        n: u32,
+        rows: u32,
+        ctx: &ForwardContext,
+    ) -> bool {
+        // An arm `prefill_gate_gemm` takes before the dense router.
+        let other_arm = crate::layers::glm_packed_scope::active()
+            || self.gate_fp8.is_some()
+            || self.gate_nvfp4.is_some()
+            || (n <= crate::layers::canonical_verify::MAX_ROWS
+                && crate::layers::canonical_verify::enabled())
+            || self.independent_grouped(ctx, n)
+            || self.glm_c3_grouped(ctx, n)
+            || self.glm_c2_grouped(ctx, n)
+            || self.glm_c4_grouped(ctx, n);
+        !other_arm
+            && glm_router_prefill_gemm(
+                ctx.config.model_type == "glm5_next",
+                n,
+                ctx.graph_capture,
+                glm_router_prefill_cublas(),
+                glm_router_prefill_cutlass(),
+            ) == Some(RouterPrefillGemm::Cutlass)
+            && ops::bf16_gemm_cutlass_rows(n)
+            && ops::bf16_gemm_cutlass_rows(rows)
     }
 }
 

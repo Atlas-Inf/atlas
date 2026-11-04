@@ -15,7 +15,7 @@ fn small_rows() -> RowBytes {
 fn widths_admit_up_to_eight_owners_within_the_row_budget() {
     assert_eq!(
         (K3_ROWS, MAX_OWNER_ROWS, MAX_OWNERS, MAX_ROWS),
-        (3, 8, 8, 32)
+        (3, 8, 8, 64)
     );
     for owners in 1..=MAX_OWNERS {
         for rows in 2..=MAX_OWNER_ROWS {
@@ -29,15 +29,19 @@ fn widths_admit_up_to_eight_owners_within_the_row_budget() {
             assert!(!width_supported(owners, rows), "{owners}x{rows}");
         }
     }
-    for (owners, rows) in [(8, 4), (6, 5), (5, 6), (4, 8), (1, 8)] {
+    for (owners, rows) in [(8, 4), (6, 5), (5, 6), (4, 8), (1, 8), (8, 8), (5, 7)] {
         assert!(width_supported(owners, rows), "{owners}x{rows}");
     }
-    for (owners, rows) in [(8, 5), (5, 7), (0, K3_ROWS), (MAX_OWNERS + 1, 2)] {
+    for (owners, rows) in [(8, 9), (0, K3_ROWS), (MAX_OWNERS + 1, 2)] {
         assert!(!width_supported(owners, rows), "{owners}x{rows}");
     }
-    assert_eq!(max_rows_per_owner(8), 4);
-    assert_eq!(max_rows_per_owner(3), 8);
-    assert_eq!(max_rows_per_owner(9), 0);
+    // The pair and the chain admit 32 rows (8x4); the buffers hold every
+    // owner's whole block.
+    assert_eq!(ROW_BUDGET, 32);
+    assert_eq!(max_rows_per_owner(8, ROW_BUDGET), 4);
+    assert_eq!(max_rows_per_owner(8, MAX_ROWS), 8);
+    assert_eq!(max_rows_per_owner(3, ROW_BUDGET), 8);
+    assert_eq!(max_rows_per_owner(9, ROW_BUDGET), 0);
 }
 
 #[test]
@@ -82,6 +86,7 @@ fn stage_spans_are_disjoint_and_hold_max_rows() {
         (stage.comb, r.comb),
         (stage.logits, r.logits),
         (stage.ffn, r.hidden),
+        (stage.live, 4),
     ];
     for pair in spans.windows(2) {
         assert_eq!(pair[1].0.0, pair[0].0.0 + (MAX_ROWS * pair[0].1) as u64);

@@ -9,4 +9,5 @@
 #define DF2_SEL_EDGE 0.6f
 #define dflash2_candidate_selector dflash2_candidate_selector_conf
 #define dflash2_selector_walk dflash2_selector_walk_conf
+#define dflash2_selector_walk_ranks dflash2_selector_walk_ranks_conf
 #include "../../common/dflash2_candidate_selector.cu"

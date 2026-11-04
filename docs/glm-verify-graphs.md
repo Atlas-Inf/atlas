@@ -141,7 +141,9 @@ touch, so C4 should not move.
    exposes a capture-safe one-shot all-reduce, `Recorder::split` forwards the
    call into the open capture instead of splitting. Each KDA run then
    collapses to one graph (12 graphs per key, about 7x less memory).
-   Nothing else in the cache or keys changes.
+   Nothing else in the cache or keys changes. Beyond two ranks this is on:
+   the TP4 chain's one-shot is graph-safe, so the GLM verify cache captures
+   it there (the pair keeps splitting).
 2. **MLA layers in the graph.** Either (a) take `decode_multi_seq_rows`
    under capture (already capture-safe: it reads positions and `seq_len` from
    `AttnMetadataDev`, uploaded before replay), at its row-chain cost, or

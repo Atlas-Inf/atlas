@@ -35,6 +35,10 @@ use crate::weight_map::{DenseWeight, Fp8DenseWeight, MtpWeights, QuantizedWeight
 /// Rows in the drafter catch-up hidden ring (see `mtp_catchup_ring`):
 /// 512 covers the gate's 256-token serial re-probe interval with 2x margin.
 pub(super) const MTP_CATCHUP_RING_ROWS: usize = 512;
+/// The EP command buffer: a u32 at 0 (command words), and for `ep_min_u32`
+/// one u32 per rank `EP_MIN_STRIDE` bytes apart (up to four ranks).
+pub(super) const EP_CMD_BUF_BYTES: usize = 256;
+pub(super) const EP_MIN_STRIDE: usize = 64;
 
 pub struct TransformerModel {
     pub(super) config: ModelConfig,
@@ -93,6 +97,9 @@ pub struct TransformerModel {
     pub(super) lm_head_fp8: Option<Fp8DenseWeight>,
     pub(super) layers: Vec<Box<dyn TransformerLayer>>,
     pub(super) buffers: BufferArena,
+    /// `ATLAS_GLM_PREFILL_PIPE2`: the second half-chunk's arena and stream
+    /// (`model::glm_prefill_pipe`).
+    pub(super) prefill_pipe: Option<super::glm_prefill_pipe::PrefillPipe>,
     /// Startup-static LoRA adapter (pool + per-layer pairs + M2 pointer
     /// tables). `None` = no adapter. Installed post-construction via
     /// `set_lora_weights`, which also copies the per-layer pairs into the
@@ -236,6 +243,8 @@ pub struct TransformerModel {
     pub(super) suppress_graphs: std::sync::atomic::AtomicBool,
     /// MTP draft proposer (built from mtp_weights at init).
     pub(super) proposer: Option<Arc<dyn DraftProposer>>,
+    /// Rank-symmetric native GLM capability; independent of DFlash settings.
+    pub(super) native_glm_mtp: bool,
     /// `ATLAS_GLM_DRAFT_TP` / `ATLAS_QWEN4EXP_MTP_DRAFT_TP`: the worker
     /// rank's copy of the drafter, which serves its part of a split propose
     /// (`draft_assist`). `None` on the head and when the split is off.
@@ -299,6 +308,10 @@ pub struct TransformerModel {
     /// Monotonic sequence-lifetime generation used by DSpark owner stamps.
     /// Never emits zero; exhaustion fails sequence allocation.
     pub(super) dspark_sequence_generation: std::sync::atomic::AtomicU64,
+    /// Model-local native snapshots own KV refs and boundary hiddens independently
+    /// of active request slots. Entries are bounded by target snapshot capacity.
+    pub(super) native_mtp_prefix:
+        parking_lot::Mutex<Vec<super::native_mtp_prefix::NativeMtpPrefix>>,
     /// ATLAS_MTP_CARRY_DRAFTER: the previous turn's drafter KV, held so the
     /// next turn of the same session can adopt it instead of rebuilding
     /// (1136 ms at 12k rows) or — as today — silently going without. Single
@@ -644,6 +657,7 @@ impl TransformerModel {
             }
         };
 
+        attempt("native MTP prefixes", self.clear_native_mtp_prefix());
         attempt("derived weights", self.derived.release(gpu));
         attempt("ssm snapshots", self.ssm_snapshots.release(gpu));
         // The pool is Arc'd because slots are handed out to sequences. A live

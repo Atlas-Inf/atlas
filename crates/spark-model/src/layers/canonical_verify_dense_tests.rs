@@ -8,14 +8,12 @@
 use super::*;
 
 /// The width-tuned BF16 GEMV the serial (and E9) router used for `m` rows,
-/// as `(module, function)`: the C1 strict-order kernel at one row, the C3
-/// rows kernel at three, M5 at five, `batchm` lane splits otherwise, tensor
-/// cores above eight.
+/// as `(module, function)`: the C1 strict-order kernel at one row, `batchm`
+/// lane splits otherwise, tensor cores above eight. (The C3 rows and M5
+/// router kernels write FP32 logits now, not BF16.)
 fn legacy_dense(m: u32) -> (&'static str, &'static str) {
     match m {
         1 => ("gemm", "dense_gemm_bf16_router"),
-        3 => ("gemm", "dense_gemm_bf16_router_rows"),
-        5 => ("gemm", "dense_gemm_bf16_router_m5"),
         2..=8 => ("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm"),
         9..=16 => ("dense_gemv_bf16_batchm", "dense_gemv_bf16_tc16"),
         _ => ("dense_gemv_bf16_batchm", "dense_gemv_bf16_tc32"),
@@ -35,7 +33,7 @@ fn canonical_dense_rows_do_not_depend_on_the_width() -> Result<()> {
     for (n, k) in [(288, 4096), (32, 4096), (128, 4096), (4096, 128)] {
         let (w, _) = bf16_weight(gpu, &mut rng, n, k, 0.05)?;
         let probe = random_row(&mut rng, k);
-        let canon = probe_bits(&mut rng, &probe, k, &WIDTHS, |rows| {
+        let canon = probe_bits(&mut rng, &probe, k, &CANON_WIDTHS, |rows| {
             run_rows(gpu, rows, n, |a, c, m| {
                 dense(gpu, a, &w, c, m, n, k, n, gpu.default_stream())
             })
@@ -55,7 +53,7 @@ fn canonical_dense_rows_do_not_depend_on_the_width() -> Result<()> {
     let (beta, _) = bf16_weight(gpu, &mut rng, 32, 4096, 0.05)?;
     let (fa, _) = bf16_weight(gpu, &mut rng, 128, 4096, 0.05)?;
     let (fb, _) = bf16_weight(gpu, &mut rng, 4096, 128, 0.05)?;
-    for m in WIDTHS {
+    for m in CANON_WIDTHS {
         let x = upload(
             gpu,
             &rows_bytes(
@@ -98,14 +96,14 @@ fn canonical_dense_rows_do_not_depend_on_the_width() -> Result<()> {
             gpu.free(p)?;
         }
     }
-    println!("planes vs plain: checked widths {WIDTHS:?}");
+    println!("planes vs plain: checked widths {CANON_WIDTHS:?}");
     // MLA W_uk absorb (heads x [512, 256]) and W_uv extract (heads x
     // [256, 512]), 8 heads, rows `heads * k` apart.
     let g = 8u32;
     for (n, k) in [(512u32, 256u32), (256, 512)] {
         let (w, _) = bf16_weight(gpu, &mut rng, g * n, k, 0.05)?;
         let probe = random_row(&mut rng, g * k);
-        let canon = probe_bits(&mut rng, &probe, g * k, &WIDTHS, |rows| {
+        let canon = probe_bits(&mut rng, &probe, g * k, &CANON_WIDTHS, |rows| {
             run_rows(gpu, rows, g * n, |a, c, m| {
                 dense_grouped(
                     gpu,

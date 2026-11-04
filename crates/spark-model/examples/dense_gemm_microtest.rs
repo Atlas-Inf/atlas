@@ -138,7 +138,6 @@ fn grid_block(name: &str, m: u32, n: u32) -> Result<([u32; 3], [u32; 3])> {
         // Production scalar kernel: 16×16 tile, one thread per output element.
         "dense_gemm_bf16" => ([n.div_ceil(16), m.div_ceil(16), 1], [16u32, 16, 1]),
         "dense_gemm_bf16_router" => ([n.div_ceil(64), m.div_ceil(16), 1], [16u32, 16, 1]),
-        "dense_gemm_bf16_router_m5" => ([n.div_ceil(16), 1, 1], [16u32, 5, 1]),
         // Fix-E pipelined rewrite: 128×N_TILE tile (M×N), 256-thread block (8
         // warps). N_TILE defaults to 128 (the shipped geometry); a sweep can
         // override it via DM_N_TILE_SWEEP to match a `-DDM_N_TILE=` rebuild

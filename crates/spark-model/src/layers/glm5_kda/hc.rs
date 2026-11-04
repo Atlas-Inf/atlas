@@ -15,6 +15,10 @@ fn parse_fast_prefill(value: Option<&str>) -> bool {
 }
 
 fn fast_prefill(tokens: u32) -> bool {
+    // A packed prefill takes the fused mixer at every row count.
+    if crate::layers::glm_packed_scope::active() {
+        return true;
+    }
     (tokens >= 128 && parse_fast_prefill(std::env::var("ATLAS_HC_CUBLAS_PREFILL").ok().as_deref()))
         || (tokens == 5
             && !crate::layers::canonical_verify::enabled()
@@ -34,6 +38,7 @@ impl Glm5KdaLayer {
         stream: u64,
     ) -> Result<bool> {
         if tokens <= 32
+            && !crate::layers::glm_packed_scope::active()
             && crate::layers::qwen3_attention::hc_post_pre_prefill_fused(
                 site,
                 None,

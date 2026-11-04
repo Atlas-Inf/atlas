@@ -140,6 +140,10 @@ impl MoeLayer {
             })
             .collect::<Result<Vec<_>>>()?;
         let Some((a1, a2, present)) = fold_scales(&scales)? else {
+            ensure!(
+                !require_calibration,
+                "GLM serving mode found no calibrated local experts"
+            );
             if gpu.op_cache().once("moe:input_scales_none") {
                 tracing::warn!(
                     "ATLAS_GLM_FP4L_INPUT_SCALES=1 ignored: the routed experts ship no input_scale"

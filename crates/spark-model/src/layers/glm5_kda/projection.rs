@@ -62,6 +62,13 @@ pub struct Glm5KdaWeights {
     pub dt_bias: DenseWeight,
     pub o_norm: DenseWeight,
     pub o_proj: Glm5Projection,
+    /// The whole o_proj over every rank's heads, for this rank's rows
+    /// (`ATLAS_GLM_SP_KDA_OPROJ_A2A`, `sp_oproj_a2a.rs`).
+    pub o_proj_full: Option<ops::MxW8a8>,
+    /// The whole b_proj (every rank's heads), for the quantized gather's
+    /// beta of this rank's rows (the four-rank chain,
+    /// `sp_quant_gather.rs`).
+    pub b_proj_full: Option<DenseWeight>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,9 +80,25 @@ pub(super) enum ProjectionPath {
 
 impl ProjectionPath {
     pub(super) fn for_forward(decode: bool, has_transposed: bool, tokens: u32) -> Self {
+        Self::for_forward_pinned(
+            decode,
+            has_transposed,
+            tokens,
+            crate::layers::glm_packed_scope::active(),
+        )
+    }
+
+    /// `packed` (`glm_packed_scope`): the transposed M128 tiles at every row
+    /// count when present, so the family does not depend on the pass height.
+    pub(super) fn for_forward_pinned(
+        decode: bool,
+        has_transposed: bool,
+        tokens: u32,
+        packed: bool,
+    ) -> Self {
         if decode {
             Self::DecodeGemv
-        } else if has_transposed && tokens > 128 {
+        } else if has_transposed && (tokens > 128 || packed) {
             Self::PrefillTransposedM128
         } else {
             Self::PrefillBase
@@ -366,6 +389,7 @@ impl Glm5KdaLayer {
         }
         if !decode
             && m >= 2048
+            && !crate::layers::glm_packed_scope::active()
             && fp8::try_project(
                 ctx.gpu,
                 input,

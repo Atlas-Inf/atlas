@@ -96,6 +96,34 @@ fn tail_commits_once_when_the_sequence_continues() {
     assert_eq!(commits(), vec![(PRE + 3, 3, 5)]);
 }
 
+/// An owner of a batch with dead rows judges fewer drafts than it verified
+/// rows: its state is rewound by the rows it ran, not the drafts it judged.
+#[test]
+fn tail_commits_over_the_rows_verified_when_rows_are_dead() {
+    let (mut a, _rx) = verified(5);
+    let sched = SchedCtx::for_test();
+    let ctx = sched.verify_logits_ctx(None, None, None, None);
+    let tokens = [a.last_token, 1, 2, 3, 4];
+    let next = verify_dflash_tail(
+        &StubModel::default(),
+        &mut a,
+        &sched,
+        &[1, 2],
+        &[],
+        2,
+        &ctx,
+        true,
+        &tokens,
+        vec![1, 2, 8, 9, 9],
+        false,
+        0.0,
+        true,
+        true,
+    );
+    assert!(next.is_some());
+    assert_eq!(commits(), vec![(PRE + 3, 3, 5)]);
+}
+
 #[test]
 fn batched_accept_commits_when_an_emit_finishes_the_sequence() {
     let sched = SchedCtx::for_test();

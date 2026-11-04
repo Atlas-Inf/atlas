@@ -34,6 +34,8 @@ impl StreamingToolDetector {
             emitted_keys: Vec::new(),
             incremental_emitted: false,
             literal_xml_state: crate::literal_xml::LiteralXmlState::default(),
+            native_openers: 0,
+            native_envelope: false,
         }
     }
 
@@ -57,6 +59,13 @@ impl StreamingToolDetector {
         self.promote_bare_names
     }
 
+    /// The sampled token is GLM's native opener outside a quote or code span.
+    /// The next opener in the text is then a call, so a name the request did
+    /// not declare is rejected by validation rather than streamed as prose.
+    pub fn note_native_opener(&mut self) {
+        self.native_openers = self.native_openers.saturating_add(1);
+    }
+
     /// Reset the detector state. Called when thinking→content transition occurs
     /// to prevent thinking-era tag fragments from corrupting tool detection.
     /// Preserves `tools` / `buffer_args` (request-scoped config, not per-call).
@@ -66,6 +75,7 @@ impl StreamingToolDetector {
         self.current_tag_open = None;
         self.inside_dsml = false;
         self.literal_xml_state = crate::literal_xml::LiteralXmlState::default();
+        self.native_openers = 0;
         self.reset_call_state();
     }
 
@@ -79,6 +89,7 @@ impl StreamingToolDetector {
         self.args_open = false;
         self.emitted_keys.clear();
         self.incremental_emitted = false;
+        self.native_envelope = false;
     }
 
     /// Feed a text delta. Returns events to emit (content or tool calls).
@@ -213,7 +224,10 @@ impl StreamingToolDetector {
                             }
                         } else if let Some(tc) =
                             parse_complete_call(trimmed, self.call_counter, self.promote_bare_names)
-                                .filter(|tc| self.is_registered_tool(&tc.function.name))
+                                .filter(|tc| {
+                                    self.native_envelope
+                                        || self.is_registered_tool(&tc.function.name)
+                                })
                         {
                             self.call_counter += 1;
                             self.emitted_tool_calls = true;
@@ -358,6 +372,8 @@ impl StreamingToolDetector {
                 //   - `<minimax:_call>` (MiniMax BPE-broken — F73 / fix42)
                 let before = self.buffer[..start].to_string();
                 let literal = self.marker_is_literal(start);
+                let native = self.native_openers > 0;
+                self.native_openers = self.native_openers.saturating_sub(1);
                 let marker = self.buffer[start..start + tag_len].to_string();
                 self.buffer = self.buffer[start + tag_len..].to_string();
                 if !before.is_empty() {
@@ -371,6 +387,7 @@ impl StreamingToolDetector {
                 } else {
                     self.inside_tag = true;
                     self.current_tag_open = Some(marker);
+                    self.native_envelope = native;
                 }
                 continue;
             } else if self.buffer.contains("<function") {

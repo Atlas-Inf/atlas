@@ -134,6 +134,8 @@ const GLM: &[(&str, &str)] = &[
     ("glm_hc_prefill_vec", "glm_hc_decode_partial_ilp_bf16"),
     ("glm_hc_prefill_vec", "glm_hc_decode_post_partial_ilp_bf16"),
     ("glm_hc_prefill_vec", "glm_hc_decode_finalize_ilp_bf16"),
+    ("moe", "moe_batched_blend"),
+    ("glm_hc_prefill_vec", "glm_hc_moe_blend_post_bf16"),
 ];
 
 fn ptr(p: u64) -> Vec<u8> {
@@ -182,11 +184,14 @@ fn hc_post_twin_takes_the_glm_bf16_post_and_its_peer_add() {
     assert!(hc_post_for(ALL, &gpu, hc_post_bf16, ptrs(0), [5, 4096, 4], 7).unwrap());
     let add = KernelHandle(gpu.handle("hyper_connection", "hc_post_bf16_add_bf16"));
     assert!(hc_post_for(HC_POST, &gpu, add, ptrs(peer), [32, 4096, 4], 7).unwrap());
+    // Prefill widths too: a 512-row sequence-parallel block and an 8K chunk.
+    assert!(hc_post_for(ALL, &gpu, hc_post_bf16, ptrs(0), [512, 4096, 4], 7).unwrap());
+    assert!(hc_post_for(ALL, &gpu, hc_post_bf16, ptrs(0), [8196, 4096, 4], 7).unwrap());
     let twin = gpu.handle("glm_hc_prefill_vec", "glm_hc_decode_post_bf16");
     let launches = gpu.launches();
-    assert_eq!(launches.len(), 2);
-    for ((kernel, grid, block_dim, args), (rows, peer)) in launches.iter().zip([(5, 0), (32, peer)])
-    {
+    assert_eq!(launches.len(), 4);
+    let calls = [(5, 0), (32, peer), (512, 0), (8196, 0)];
+    for ((kernel, grid, block_dim, args), (rows, peer)) in launches.iter().zip(calls) {
         assert_eq!(
             (*kernel, *grid, *block_dim),
             (twin, [2 * rows, 1, 1], [256, 1, 1])
@@ -215,7 +220,6 @@ fn hc_post_twin_leaves_every_other_post_alone() {
     assert!(off(HC_PARTIAL | MOE_POST, bf16, ptrs, [4, 4096, 4]));
     assert!(off(ALL, fp32, ptrs, [4, 4096, 4]));
     assert!(off(ALL, bf16, ptrs, [0, 4096, 4]));
-    assert!(off(ALL, bf16, ptrs, [33, 4096, 4]));
     assert!(off(ALL, bf16, ptrs, [4, 2048, 4]));
     assert!(off(ALL, bf16, ptrs, [4, 4096, 2]));
     let mut out_of_place = ptrs;
@@ -360,4 +364,42 @@ fn flag_off_seam_keeps_its_kernels_and_fp32_weight() {
         assert_eq!((kernel.0, weight), (k, fn32));
     }
     assert_eq!(hc_decode_finalize(&gpu, "glm5_next").unwrap().0, 3);
+}
+
+#[test]
+fn moe_seam_blend_and_post_run_as_one_twin_only_for_the_glm_kernels() {
+    let gpu = Capture::new(GLM);
+    let blend = KernelHandle(gpu.handle("moe", "moe_batched_blend"));
+    let post = KernelHandle(gpu.handle("hyper_connection", "hc_post_bf16"));
+    let raw = [0x1000, 0x2000, 0x3000, 0, 0x5000, 0x6000, 0x7000];
+    let ptrs = raw.map(DevicePtr);
+    let run =
+        |groups, kernels, ptrs, dims| moe_blend_post_for(groups, &gpu, kernels, ptrs, dims, 7);
+    assert!(run(HC_POST, [blend, post], ptrs, [512, 4096, 4]).unwrap());
+    let twin = gpu.handle("glm_hc_prefill_vec", "glm_hc_moe_blend_post_bf16");
+    let launches = gpu.launches();
+    assert_eq!(launches.len(), 1);
+    let (kernel, grid, block, args) = &launches[0];
+    assert_eq!((*kernel, *grid, *block), (twin, [512, 1, 1], [256, 1, 1]));
+    let mut want: Vec<_> = raw.iter().map(|&p| ptr(p)).collect();
+    want.push(word(512));
+    assert_eq!(args[..], want[..]);
+    // Anything else keeps the two kernels.
+    let fp32 = KernelHandle(gpu.handle("hyper_connection", "hc_post"));
+    assert!(!run(0, [blend, post], ptrs, [512, 4096, 4]).unwrap());
+    assert!(!run(ALL & !HC_POST, [blend, post], ptrs, [512, 4096, 4]).unwrap());
+    assert!(!run(ALL, [blend, fp32], ptrs, [512, 4096, 4]).unwrap());
+    assert!(!run(ALL, [KernelHandle(99), post], ptrs, [512, 4096, 4]).unwrap());
+    assert!(!run(ALL, [blend, post], ptrs, [0, 4096, 4]).unwrap());
+    assert!(!run(ALL, [blend, post], ptrs, [512, 2048, 4]).unwrap());
+    let mut unaligned = ptrs;
+    unaligned[1] = DevicePtr(0x2008);
+    assert!(!run(ALL, [blend, post], unaligned, [512, 4096, 4]).unwrap());
+    assert_eq!(gpu.launches().len(), 1);
+    let old = Capture::new(&GLM[..GLM.len() - 1]);
+    let (b, p) = (
+        KernelHandle(old.handle("moe", "moe_batched_blend")),
+        KernelHandle(old.handle("hyper_connection", "hc_post_bf16")),
+    );
+    assert!(!moe_blend_post_for(ALL, &old, [b, p], ptrs, [512, 4096, 4], 7).unwrap());
 }

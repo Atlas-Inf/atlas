@@ -4,10 +4,11 @@
 //!
 //! The head walks the grammar matcher through the drafted tokens and builds
 //! one bitmask per verify row (vLLM #14702, "Enable Speculative Decoding with
-//! Structured Outputs"; #44297 for the reasoning boundary). On the TP2 vocab
-//! split each rank takes the argmax of its own half of the vocabulary, so rank
-//! 1, which holds no grammar state, needs the masks too. They live in a buffer
-//! both ranks attach at load (before KV sizing), and the next split-head
+//! Structured Outputs"; #44297 for the reasoning boundary). On the vocab split
+//! (the TP2 pair's halves, the TP4 chain's quarters) each rank takes the
+//! argmax of its own part of the vocabulary, so the ranks past 0, which hold
+//! no grammar state, need the masks too. They live in a buffer every rank
+//! attaches at load (before KV sizing), and the next split-head
 //! verify applies them before each rank's partial argmax (`glm_vocab_split`).
 //! Unmasked verifies never touch any of this.
 //!
@@ -41,16 +42,14 @@ fn mask_words(vocab: usize) -> usize {
 }
 
 /// Attach the mask buffer (`MAX_ROWS` rows, ~0.6 MiB for GLM-5.3) on every
-/// rank whose verify head may be the TP2 vocab split. Called before KV sizing.
+/// rank whose verify head may be the vocab split (the pair's or the chain's).
+/// Called before KV sizing.
 pub(crate) fn prepare(
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
     buffers: &mut BufferArena,
 ) -> Result<()> {
-    if config.model_type != "glm5_next"
-        || config.ep_world_size != 2
-        || !super::glm_vocab_split::enabled()
-    {
+    if config.model_type != "glm5_next" || !super::glm_vocab_split::serves(config.ep_world_size) {
         return Ok(());
     }
     buffers.attach_verify_masks(MAX_ROWS * mask_words(config.vocab_size) * 4, gpu)

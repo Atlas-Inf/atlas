@@ -77,6 +77,13 @@ pub(in crate::nccl_backend) fn wire(on: bool) -> u64 {
     if on { RING_WORDS as u64 } else { 0 }
 }
 
+/// Whether a WRITE to offset `dst` of the peer's command region goes back to
+/// the rank whose stream it carries (an acknowledgement) rather than on with
+/// the stream; on a chain the two take different links.
+pub(in crate::nccl_backend) fn upstream(dst: usize) -> bool {
+    dst == ACK
+}
+
 /// Delivers bytes of this rank's command region into the peer's: an RDMA
 /// WRITE on rail 0, or a copy in tests.
 pub(in crate::nccl_backend) trait Wire {
@@ -217,6 +224,20 @@ impl CmdRing {
         }
         *read = end;
         self.shared.consumed.store(end, Ordering::Release);
+        Ok(())
+    }
+
+    /// [`Self::recv`], then on a chain rank with one above (`onward`) the
+    /// same words onward: each such rank's `out` stream is the head's.
+    pub(in crate::nccl_backend) fn recv_relay(
+        &self,
+        words: &mut [u32],
+        onward: bool,
+    ) -> Result<()> {
+        self.recv(words)?;
+        if onward {
+            self.send(words)?;
+        }
         Ok(())
     }
 }

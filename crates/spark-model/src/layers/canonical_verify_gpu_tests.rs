@@ -2,7 +2,8 @@
 
 //! GPU tests (`#[ignore]` per repo convention; a GB10 and a glm-5.3-flash
 //! kernel build, run with `ATLAS_W4A16_TC=1`): one probe row through every
-//! verify width 1..8, 16 and 32, at the first, middle and last slot, beside
+//! verify width 1..8, 16 and 32 (and 56, 64 for the canonical kernels), at
+//! the first, middle and last slot, beside
 //! other rows each time. The canonical kernels ([`w4a16`], [`dense`], the
 //! touch / strided / pair twins) must give the probe the same bits at every
 //! width; the width-tuned kernels they replace are shown to not (the test's
@@ -18,6 +19,9 @@ use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 pub(super) const WIDTHS: [u32; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 16, 32];
+/// The widths the canonical kernels take: also the chain's owner verifies
+/// past one launch (56 and 64 rows, two launches).
+pub(super) const CANON_WIDTHS: [u32; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 56, 64];
 
 pub(super) struct Rng(pub u64);
 
@@ -294,7 +298,7 @@ fn canonical_w4a16_rows_do_not_depend_on_the_width() -> Result<()> {
     ] {
         let w = w4(gpu, &mut rng, n, k)?;
         let probe = wide_row(&mut rng, k);
-        let canon = probe_bits(&mut rng, &probe, k, &WIDTHS, |rows| {
+        let canon = probe_bits(&mut rng, &probe, k, &CANON_WIDTHS, |rows| {
             run_rows(gpu, rows, n, |a, c, m| {
                 w4a16(gpu, a, &w.q, c, m, n, k, gpu.default_stream())
             })
@@ -390,12 +394,6 @@ pub(super) fn launch_dense(
     let s = gpu.default_stream();
     match name {
         "dense_gemm_bf16_router" => ops::dense_gemm_router(gpu, kernel, a, weight, c, m, n, k, s),
-        "dense_gemm_bf16_router_rows" => {
-            ops::dense_gemm_router_rows(gpu, kernel, a, weight, c, m, n, k, s)
-        }
-        "dense_gemm_bf16_router_m5" => {
-            ops::dense_gemm_router_m5(gpu, kernel, a, weight, c, m, n, k, s)
-        }
         "dense_gemv_bf16_batchm" => {
             ops::dense_gemv_batchm(gpu, kernel, a, weight, c, m, n, k, n, s)
         }

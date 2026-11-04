@@ -8,9 +8,13 @@ pub mod dflash_head;
 pub mod ep_dispatch;
 pub mod fp8_calibration;
 mod glm5_kda;
+pub mod glm5_mtp;
+pub(crate) mod glm5_mtp_cursor;
 pub mod glm_kv_shard;
 pub mod glm_native;
+pub mod glm_packed_scope;
 pub mod glm_sp;
+pub mod glm_sp_moe_seam;
 pub mod glm_sp_overlap;
 pub mod glm_sp_uneven;
 pub mod moe;
@@ -24,6 +28,7 @@ pub mod nemotron_moe;
 pub mod ngram_embed;
 pub mod ops;
 pub mod ple;
+pub(crate) mod prefill_profile;
 pub mod qsa;
 pub mod qwen3_attention;
 pub mod qwen3_ssm;
@@ -79,6 +84,7 @@ pub enum FfnComponent {
 
 mod ffn_c4;
 mod ffn_glm;
+pub(crate) use ffn_glm::SEAM_GATHER_GROUP;
 
 impl FfnComponent {
     pub fn is_none(&self) -> bool {

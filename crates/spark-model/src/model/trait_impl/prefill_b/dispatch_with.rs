@@ -340,6 +340,7 @@ impl TransformerModel {
         if !self.prefill_b_exact_direct(seq, chunk_start + chunk_len, is_last_chunk, proc_count) {
             self.prefill_b_forward_layers(
                 seq,
+                tokens,
                 &mut kv_cache,
                 chunk_start,
                 chunk_len,

@@ -19,6 +19,8 @@
 //!                       (`ATLAS_GLM_DRAFT_TP_CTX`, v2 only; `announce_word`)
 //! EC  (seq_id plan)  -> a qwen4_exp batched propose's draft head
 //!                       (`ATLAS_QWEN4EXP_MTP_DRAFT_TP`, v2 only; `draft_tp::Plan`)
+//!     then ctx'      -> a batched propose of more than four sequences:
+//!                       the rest of its appends' rows (`announce_extra`)
 //! ```
 //!
 //! The command carries no payload: both ranks plan the swaps from the same
@@ -36,7 +38,9 @@ use spark_runtime::gpu::GpuBackend;
 
 use super::types::TransformerModel;
 use crate::layers::BlockDiffusionDraftHead;
-use crate::layers::dflash_head::rank_split::announce_word;
+use crate::layers::dflash_head::rank_split::{
+    announce_extra, announce_word, ctx_requested, extra_follows,
+};
 use crate::layers::qwen4exp_mtp::draft_tp::Qwen4ExpDraftAssist;
 use crate::speculative::DraftProposer;
 
@@ -45,26 +49,39 @@ pub(super) const EP_CMD_DRAFT_ASSIST: u32 = 0xFFFF_FFEC;
 /// A worker rank's copy of the drafter, serving the head's announced
 /// proposes: `word` is the announce's preamble word.
 pub trait DraftAssist: Send + Sync {
+    /// Whether the head sends one more word after `word`
+    /// (`rank_split::announce_extra`).
+    fn extra_follows(&self, _word: u32) -> bool {
+        false
+    }
+
     /// Enqueue this rank's whole part of the announced propose on `stream`,
-    /// with no host sync (the swaps order it against the head).
+    /// with no host sync (the swaps order it against the head). `extra`: the
+    /// word [`Self::extra_follows`] announced.
     fn serve(
         &self,
         gpu: &dyn GpuBackend,
         comm: &dyn CommBackend,
         stream: u64,
         word: u32,
+        extra: Option<u32>,
     ) -> Result<()>;
 }
 
 impl DraftAssist for BlockDiffusionDraftHead {
+    fn extra_follows(&self, word: u32) -> bool {
+        self.rank_split_extra_follows(word)
+    }
+
     fn serve(
         &self,
         gpu: &dyn GpuBackend,
         comm: &dyn CommBackend,
         stream: u64,
         word: u32,
+        extra: Option<u32>,
     ) -> Result<()> {
-        self.rank_split_serve(gpu, comm, stream, word)
+        self.rank_split_serve(gpu, comm, stream, word, extra)
     }
 }
 
@@ -75,6 +92,7 @@ impl DraftAssist for Qwen4ExpDraftAssist {
         comm: &dyn CommBackend,
         stream: u64,
         word: u32,
+        _extra: Option<u32>,
     ) -> Result<()> {
         Qwen4ExpDraftAssist::serve(self, gpu, comm, stream, word)
     }
@@ -100,7 +118,7 @@ impl TransformerModel {
 
     /// Head: announce the split propose about to run, with its packed
     /// context rows (`DraftProposer::rank_split_ctx`; 0 without v2).
-    pub(super) fn announce_draft_split(&self, ctx: u32) -> Result<()> {
+    pub(super) fn announce_draft_split(&self, ctx: u64) -> Result<()> {
         let word = announce_word(0, ctx)?;
         self.ep_broadcast_seq_and_cmd(word, EP_CMD_DRAFT_ASSIST, self.ep_protocol_v2)
     }
@@ -119,10 +137,19 @@ impl TransformerModel {
         Some((comm, rows))
     }
 
-    /// Head: announce the batched split propose of `rows` rows about to run,
-    /// with its packed context rows.
-    pub(super) fn announce_draft_split_rows(&self, rows: usize, ctx: u32) -> Result<()> {
-        self.ep_broadcast_seq_and_cmd(announce_word(rows, ctx)?, EP_CMD_DRAFT_ASSIST, true)
+    /// Head: announce the batched split propose of `rows` rows over
+    /// `sequences` sequences about to run, with its packed context rows.
+    pub(super) fn announce_draft_split_rows(
+        &self,
+        rows: usize,
+        sequences: usize,
+        ctx: u64,
+    ) -> Result<()> {
+        self.ep_broadcast_seq_and_cmd(announce_word(rows, ctx)?, EP_CMD_DRAFT_ASSIST, true)?;
+        if extra_follows(sequences, ctx_requested()?) {
+            self.ep_broadcast_u32(announce_extra(ctx))?;
+        }
+        Ok(())
     }
 
     /// Head: `ATLAS_QWEN4EXP_MTP_DRAFT_TP`. When a batched propose of `n`
@@ -158,7 +185,17 @@ impl TransformerModel {
         let comm = self
             .comm_ref()
             .context("rank-split propose without a communicator")?;
-        head.serve(self.gpu.as_ref(), comm, self.gpu.default_stream(), seq_id)?;
+        let extra = head
+            .extra_follows(seq_id)
+            .then(|| self.ep_broadcast_u32(0))
+            .transpose()?;
+        head.serve(
+            self.gpu.as_ref(),
+            comm,
+            self.gpu.default_stream(),
+            seq_id,
+            extra,
+        )?;
         Ok(true)
     }
 }

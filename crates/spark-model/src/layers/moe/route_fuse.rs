@@ -24,7 +24,6 @@
 //! (`prerouted`). Every other batch runs the five launches.
 
 use super::*;
-#[cfg(test)]
 use spark_runtime::kernel_args::KernelLaunch;
 
 mod kernels;
@@ -49,6 +48,34 @@ pub(crate) fn route_fuse_requested() -> Result<bool> {
     )
     .clone()
     .map_err(anyhow::Error::msg)
+}
+
+thread_local! {
+    /// Device `[rows]` u32 liveness of the owner-verify rows being routed,
+    /// and `rows` (`DeadRows`), else 0.
+    static ROW_LIVE: std::cell::Cell<(u64, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// While held (an owner-batched DFlash verify with dead rows, the chain),
+/// a routed FFN over all `rows` rows routes those whose `row_live` word
+/// (device `[rows]` u32) is 0 to no expert: their routed output is 0 and no
+/// expert weight is read for them (`moe_route_mask_rows`). A routed FFN of
+/// any other height (one owner's rows) routes every row. The verdict keeps
+/// no dead row, and a dead row follows every live row of its owner, so no
+/// live row reads one.
+pub(crate) struct DeadRows(());
+
+impl DeadRows {
+    pub(crate) fn enter(row_live: DevicePtr, rows: u32) -> Self {
+        ROW_LIVE.with(|c| c.set((row_live.0, rows)));
+        Self(())
+    }
+}
+
+impl Drop for DeadRows {
+    fn drop(&mut self) {
+        ROW_LIVE.with(|c| c.set((0, 0)));
+    }
 }
 
 /// The two routing kernels, both loaded or both null, and the one-launch
@@ -137,6 +164,10 @@ impl MoeLayer {
         let top_k = ctx.config.num_experts_per_tok as u32;
         let (te, ne) = ((n * top_k) as usize, num_experts as usize);
         let rows = (0, n as usize);
+        let row_live = match ROW_LIVE.with(|c| c.get()) {
+            (live, rows) if rows == n => live,
+            _ => 0,
+        };
         // The sort's outputs overlay the gate logits, which the top-k has
         // consumed by then.
         let gate_logits = ctx.buffers.gate_logits();
@@ -151,7 +182,15 @@ impl MoeLayer {
         };
         let sorted_expert_ids = gate_logits.offset(te * 4);
         if routes.prerouted {
-            self.route_fused(input, &routes, sorted_expert_ids, [n, h], ctx, stream)?;
+            self.route_fused(
+                input,
+                &routes,
+                sorted_expert_ids,
+                [n, h],
+                DevicePtr(row_live),
+                ctx,
+                stream,
+            )?;
         } else {
             // Sequence-parallel Qwen prefill may already have routed this
             // rank's rows before the gather. Consume those routes before the
@@ -208,6 +247,21 @@ impl MoeLayer {
                 n,
                 top_k,
             )?;
+            if row_live != 0 {
+                let mask = ctx
+                    .gpu
+                    .op_cache()
+                    .kernel(ctx.gpu, "moe", "moe_route_mask_rows")?;
+                KernelLaunch::new(ctx.gpu, mask)
+                    .grid([(n * top_k).div_ceil(256), 1, 1])
+                    .block([256, 1, 1])
+                    .arg_ptr(routes.indices)
+                    .arg_ptr(DevicePtr(row_live))
+                    .arg_u32(n)
+                    .arg_u32(top_k)
+                    .arg_u32(num_experts)
+                    .launch(stream)?;
+            }
             // 3. Sort tokens by expert → L2-optimized ordering.
             ops::moe_sort_by_expert(
                 ctx.gpu,
@@ -232,7 +286,13 @@ impl MoeLayer {
     /// canonical router on a BF16 weight with FP32 logits, the unadapted
     /// sigmoid top-k with correction bias, and a routed FFN on the M16 stream
     /// twins of the prequant path.
-    fn route_fused_applies(&self, n: u32, h: u32, inter: u32, ctx: &ForwardContext) -> bool {
+    pub(super) fn route_fused_applies(
+        &self,
+        n: u32,
+        h: u32,
+        inter: u32,
+        ctx: &ForwardContext,
+    ) -> bool {
         self.route_fuse.loaded()
             && ctx.config.model_type == "glm5_next"
             && self.router_f32
@@ -284,6 +344,7 @@ impl MoeLayer {
         routes: &Routes,
         sorted_expert_ids: DevicePtr,
         [n, h]: [u32; 2],
+        row_live: DevicePtr,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -314,7 +375,7 @@ impl MoeLayer {
             top_k,
             normalize: ctx.config.norm_topk_prob,
             scaling: ctx.config.routed_scaling_factor as f32,
-            row_live: DevicePtr(0),
+            row_live,
             a_scale2: self.a1_scale2(),
         };
         self.route_fuse.launch(ctx.gpu, &args, stream)

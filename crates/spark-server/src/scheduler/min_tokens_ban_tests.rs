@@ -302,7 +302,7 @@ fn without_min_tokens_the_target_ban_changes_nothing() {
             assert_eq!(on.finished, off.finished);
         }
     }
-    let c = chat_seq(
+    let mut c = chat_seq(
         Case {
             ignore_eos: true,
             min_tokens: 0,
@@ -315,6 +315,13 @@ fn without_min_tokens_the_target_ban_changes_nothing() {
     );
     assert_eq!((c.seq.eos_ban.floor, c.seq.eos_ban.target), (0, false));
     assert_eq!(banned_ids(&c), None);
+    // A hard-ban bias entry (`-inf`) is banned with no floor; a soft one is not.
+    c.logit_bias = vec![(9, -8.0), (42, f32::NEG_INFINITY)];
+    let ids = banned_ids(&c).expect("the hard ban is masked");
+    assert!(ids.contains(&42) && !ids.contains(&9));
+    assert!(super::bias_is_hard_bans_only(&[(42, f32::NEG_INFINITY)]));
+    assert!(super::bias_is_hard_bans_only(&[]));
+    assert!(!super::bias_is_hard_bans_only(&c.logit_bias));
     // No target ban is installed in this process: the first token keeps the
     // end tokens it always suppressed.
     assert_eq!(first_token_suppress(&[END], 30), vec![END]);

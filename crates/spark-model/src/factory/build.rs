@@ -100,7 +100,7 @@ pub fn build_model(
         kv_dtype,
         &layer_dtypes,
     )?;
-    crate::layers::ops::preload_glm_sparse_native(gpu.as_ref())?;
+    crate::layers::ops::preload_glm_sparse_native(gpu.as_ref(), config.num_attention_heads)?;
     crate::layers::ops::initialize_glm_sparse_prefill_pipe(gpu.as_ref(), &config)?;
     crate::layers::ops::initialize_glm_kv_canonical(gpu.as_ref(), &config, kv_dtype)?;
     crate::layers::ops::initialize_glm_mla_fuse(gpu.as_ref(), &config)?;
@@ -284,6 +284,44 @@ pub fn build_model(
     let lm_head = loader.load_lm_head(&store, &config, gpu.as_ref())?;
     let mtp_weights = loader.load_mtp_weights_multi(&store, &config, gpu.as_ref())?;
 
+    // GLM's appended predictor is a native full-rank module, not the generic
+    // MTP weight bundle.  Validate the rank-symmetric capability before any
+    // rank-0-only body construction, then load its body only on rank 0.
+    // `native_glm_mtp` remains true on worker ranks so SsmPools and the model
+    // scheduler reserve the same hidden/rollback capacity on every rank.
+    // `use_speculative` also covers DFlash at the server boundary.  Native
+    // GLM MTP is a separate lane: never load its rank-0 body for a DFlash
+    // request (where the appended tensors may intentionally be absent), nor
+    // for self/n-gram speculation that uses a different proposer contract.
+    let native_glm_requested =
+        glm::native_mtp_requested(use_speculative, dflash_args.is_some(), self_speculative);
+    let native_glm_mtp =
+        glm::native_mtp_capability(&config, &store, native_glm_requested, mtp_vocab_size)?;
+    if crate::weight_loader::glm5_mode::strict_native_mtp() {
+        anyhow::ensure!(
+            native_glm_mtp
+                && matches!(
+                    crate::weight_loader::glm5_mode::selected()?,
+                    Some(crate::weight_loader::glm5_mode::ServingMode::Strict)
+                )
+                && (1..=4).contains(&max_batch_size)
+                && max_seq_len <= config.max_position_embeddings,
+            "strict native MTP requires GLM TP2/TP4 native MTP, C1..C4 and the checkpoint context limit"
+        );
+    }
+    if native_glm_mtp {
+        glm::ensure_native_mtp_target_prerequisites(&config)?;
+    }
+    let glm5_mtp_module = if native_glm_mtp && config.tp_rank == 0 && config.ep_rank == 0 {
+        crate::weight_loader::glm5::load_glm5_mtp_module(&store, &config, gpu.as_ref())?
+            .ok_or_else(|| {
+                anyhow::anyhow!("GLM-5 native MTP was advertised but no module was loaded")
+            })
+            .map(Some)?
+    } else {
+        None
+    };
+
     // DeepSeek-V4 ships an architecturally distinct MTP module (MLA + mHC), not
     // the Qwen-shaped `MtpWeights`. Load it via the V4-specific path and keep it
     // — the `DeepseekV4MtpHead` proposer is built from it after the model is
@@ -321,7 +359,12 @@ pub fn build_model(
             None
         };
 
-    glm::ensure_expert_tp_drafter(&config, use_speculative, dflash_args.is_none())?;
+    glm::ensure_expert_tp_drafter(
+        &config,
+        use_speculative,
+        dflash_args.is_none(),
+        native_glm_mtp,
+    )?;
     // Qwen3.8-Flash-Next ships an MTP block that is architecturally a full
     // layer (gated attention + QSA indexer + mHC + 512-expert MoE), not the
     // Qwen-shaped `MtpWeights`, so it loads through its own path exactly like
@@ -366,6 +409,7 @@ pub fn build_model(
         && mtp_weights.is_empty()
         && v4_mtp_module.is_none()
         && !q4e_mtp_loaded
+        && !native_glm_mtp
     {
         tracing::warn!(
             "`--speculative` was requested but no MTP weights were loaded for this \
@@ -434,6 +478,23 @@ pub fn build_model(
         !mtp_weights.is_empty(),
     )?;
 
+    // Reserve native MTP weights/workspace before measuring free memory. Its
+    // private KV is allocated later from the joint target/native pool budget.
+    let glm5_mtp_head = if let Some(module) = glm5_mtp_module {
+        Some(crate::layers::glm5_mtp::Glm5MtpHead::new(
+            module,
+            embed,
+            lm_head,
+            &config,
+            gpu.as_ref(),
+            mtp_vocab_size,
+            max_seq_len,
+            max_batch_size,
+        )?)
+    } else {
+        None
+    };
+
     // Capture the shared embed + resolved draft NVFP4 head for the DeepSeek-V4
     // MTP proposer BEFORE `embed` / `lm_head_nvfp4` / `mtp_lm_head_nvfp4` are
     // moved into `TransformerModel::new`. All are `Copy` (DenseWeight /
@@ -473,6 +534,22 @@ pub fn build_model(
         max_seq_len,
         kv_block_size,
         max_batch_size,
+        gpu.as_ref(),
+    )?;
+    // ATLAS_GLM_PREFILL_PIPE2: the second half-chunk's arena, sized with
+    // the model's before the KV pool.
+    let glm_latent_tokens = (kv_dtype == spark_runtime::kv_cache::KvCacheDtype::Fp8G128
+        && config.model_type == "glm5_next")
+        .then(|| {
+            crate::layers::ops::GLM_LATENT_BF16_VIEW_TOKENS.min(max_seq_len.next_multiple_of(16))
+        });
+    let pipe_arena = crate::model::glm_prefill_pipe::arena(
+        &config,
+        max_batch_tokens,
+        max_seq_len,
+        kv_block_size,
+        max_batch_size,
+        glm_latent_tokens,
         gpu.as_ref(),
     )?;
     glm::init_arena_consumers(
@@ -608,16 +685,26 @@ pub fn build_model(
     // they overflowed the physical remainder and boot died in cuMemAlloc
     // (Atlas-Inf/atlas#61).
     let draft_lm_head_nvfp4 = mtp_lm_head_nvfp4.or(lm_head_nvfp4);
-    let ssm_pools = crate::model::ssm_pools::SsmPools::new(
+    let ssm_pools = crate::model::ssm_pools::SsmPools::new_with_native(
         &config,
         max_batch_size,
         self_speculative,
         use_speculative,
+        native_glm_mtp,
         mtp_weights.is_empty(),
         draft_lm_head_nvfp4.is_some(),
         num_drafts,
         ssm_cache_slots,
         gpu.as_ref(),
+    )?;
+    // ATLAS_DFLASH_WARM_CTX=restore: the drafter window store, reserved here
+    // so the KV budget below sees it as used (nothing otherwise).
+    let dflash_warm_store = crate::layers::dflash_head::WarmCtxStore::for_build(
+        gpu.as_ref(),
+        config.dflash_capture_layers.len(),
+        config.hidden_size,
+        config.dflash_ctx_window,
+        comm.as_deref().is_none_or(|c| c.rank() == 0),
     )?;
 
     // Materialize the inference reserve as a "balloon" allocation held across
@@ -704,7 +791,7 @@ pub fn build_model(
         &kv_config,
         glm_cache_plan.is_some(),
         sparse_index,
-        glm_cache_plan.and_then(|p| p.shard()).is_some(),
+        glm_cache_plan.and_then(|p| p.shard()).map(|s| s.world),
     );
     // ATLAS_QWEN4EXP_SNAPSHOT_SLOTS / _AUX_MB: the snapshots' host aux
     // (`ssm_snapshot_budget`), 0 by default.
@@ -733,6 +820,18 @@ pub fn build_model(
     // budget-driven sum. This is the *whole point* of the HBM-shrink
     // feature — the production cache becomes write staging only; older
     // blocks live on disk under the orchestrator's control.
+    let (native_block_bytes, native_fixed_bytes) = glm5_mtp_head
+        .as_ref()
+        .map(|head| head.private_kv_budget(kv_block_size))
+        .transpose()?
+        .unwrap_or((0, 0));
+    let joint_glm_plan = glm_cache_plan
+        .map(|plan| plan.with_auxiliary_pool(native_block_bytes, native_fixed_bytes))
+        .transpose()?;
+    anyhow::ensure!(
+        glm5_mtp_head.is_none() || joint_glm_plan.is_some(),
+        "native MTP requires the GLM joint KV planner"
+    );
     let mut num_kv_blocks = match hss_cache_blocks_per_seq {
         Some(cap) => {
             // Phase 6.3 (original): pool = max_batch × cap + 1 dummy + 1 spare per seq.
@@ -795,7 +894,7 @@ pub fn build_model(
                     budget.no_room_advice(actual_free),
                 );
             }
-            let n = match glm_cache_plan {
+            let n = match joint_glm_plan {
                 Some(plan) => plan.num_blocks_for_budget(kv_budget),
                 None => kv_budget::blocks_with_aux(&kv_config, kv_budget, aux_bytes_per_token)?,
             };
@@ -841,7 +940,7 @@ pub fn build_model(
         latent_shard: glm_cache_plan.and_then(|p| p.shard()),
         // Native proposer bytes per logical block; always remain in system
         // memory (Enntity/atlas 4d75b9ec).
-        auxiliary_block_bytes: 0,
+        auxiliary_block_bytes: native_block_bytes,
     }
     .with_per_token_aux(aux_bytes_per_token)?;
     let (blocks, kv_placement) = if hss_cache_blocks_per_seq.is_none() {
@@ -856,6 +955,9 @@ pub fn build_model(
         glm_cache_plan,
         kv_nvme::rank_word(nvme_geometry, ssm_pools.tier_home),
     )?;
+    if let Some(head) = &glm5_mtp_head {
+        head.allocate_private_kv(num_kv_blocks, gpu.as_ref())?;
+    }
     let _max_kv_tokens = num_kv_blocks * kv_block_size;
     // Phase 6.1.f / 6.2.c — when --high-speed-swap is on with HBM-shrink, the
     // production KV cache only has to fit the per-seq HBM window, not the full
@@ -994,7 +1096,8 @@ pub fn build_model(
     // first propose read freed memory under `--lm-head-dtype nvfp4` (#264:
     // illegal address in run_mtp_propose_multi; the fp8 and bf16 heads never
     // reach this free, and NUM_DRAFTS=0 never reads the head).
-    let drafter_holds_bf16_head = q4e_mtp_loaded || v4_mtp_module.is_some();
+    let drafter_holds_bf16_head =
+        q4e_mtp_loaded || v4_mtp_module.is_some() || glm5_mtp_head.is_some();
     let lm_head = if !drafter_holds_bf16_head
         && super::lm_head_setup::bf16_lm_head_is_dead(
             lm_head.weight,
@@ -1037,6 +1140,15 @@ pub fn build_model(
         ssm_checkpoint_interval,
         ssm_pools,
     )?;
+    model.set_dflash_warm_store(dflash_warm_store);
+    if let Some(arena) = pipe_arena {
+        model.set_prefill_pipe(arena)?;
+    }
+
+    if let Some(head) = glm5_mtp_head {
+        model.set_dflash_proposer(std::sync::Arc::new(head));
+        tracing::info!("GLM-5 native MTP speculative decoding: ENABLED (single full-rank module)");
+    }
 
     // ── Step 6b: DeepSeek-V4 MTP proposer (optional, post-construction) ──
     //
@@ -1209,26 +1321,26 @@ pub fn build_model(
                     &model.config_ref().model_type,
                     startup,
                 )?;
-                // ATLAS_GLM_DRAFT_TP: on the TP2 pair both ranks hold the
-                // drafter and swap halves of a propose; the worker's copy
-                // serves its half and proposes nothing.
-                let (rank, pair) = {
+                // ATLAS_GLM_DRAFT_TP: on the TP2 pair or the TP4 chain every
+                // rank holds the drafter and computes its share of a propose;
+                // a worker's copy serves its share and proposes nothing.
+                let (rank, ranks, split_ranks) = {
                     let c = model.config_ref();
-                    (c.ep_rank, c.tp_world_size == 2 && c.ep_world_size == 2)
+                    (c.ep_rank, c.ep_world_size, crate::layers::moe::glm_tp_ep(c))
                 };
                 let split = crate::layers::dflash_head::rank_split::requested()?
-                    .filter(|_| pair && !lightning_dspark_admitted);
+                    .filter(|_| split_ranks && !lightning_dspark_admitted);
                 if let Some(parts) = split {
                     let batch = crate::layers::dflash_head::rank_split::batch_requested()?;
                     let ctx = crate::layers::dflash_head::rank_split::ctx_requested()?;
                     let topk = crate::layers::dflash_head::rank_split::topk_requested()?;
-                    head.enable_rank_split(parts, batch, ctx, topk, model.gpu_backend())?;
+                    head.enable_rank_split(parts, batch, ctx, topk, ranks, model.gpu_backend())?;
                 }
                 if rank != 0 {
                     anyhow::ensure!(
                         split.is_some(),
                         "rank {rank} loaded a drafter it cannot use: ATLAS_GLM_DRAFT_TP \
-                         needs the generic DFlash drafter on the TP2 pair"
+                         needs the generic DFlash drafter on the TP2 pair or the TP4 chain"
                     );
                     model.set_draft_assist(std::sync::Arc::new(head));
                     tracing::info!(

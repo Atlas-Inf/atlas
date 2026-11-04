@@ -154,7 +154,10 @@ impl MoeLayer {
         // the exact-M decode kernels already proven by forward_k5: they read
         // each native NVFP4 projection once while computing only five rows.
         let batch5 = self.w4a16_batchm.kernel(5);
+        // A packed prefill keeps the generic shared expert (`glm_packed_scope`).
+        let packed = crate::layers::glm_packed_scope::active();
         let exact_k5 = n == 5
+            && !packed
             && std::env::var("ATLAS_GLM_K5_BATCHED_SHARED").as_deref() == Ok("1")
             && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
             && batch5.0 != 0
@@ -163,6 +166,7 @@ impl MoeLayer {
             && !self.weights.shared_expert.down_proj.is_null();
         let tc = crate::layers::w4a16_gemv_tiers::tc_kernel(n);
         if n > 8
+            && !packed
             && tc.0 != 0
             && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
             && !self.weights.shared_expert.gate_proj.is_null()

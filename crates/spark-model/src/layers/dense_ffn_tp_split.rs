@@ -2,14 +2,16 @@
 
 //! `ATLAS_GLM_DENSE_TP_SPLIT=1` (default off): the GLM dense FFN of a
 //! canonical verify block (layers 0..=2, replicated rows) split by output
-//! columns across the pair, joined by two exchanges.
+//! columns across the TP ranks (the pair, or the four-rank chain), joined by
+//! two exchanges (on the chain, two gathers).
 //!
-//! Unsplit, both ranks read all three 28 MB NVFP4 projections per layer
-//! (about 0.45 ms a layer at a three-row verify), or all three of
-//! FP4-Local's 50 MB MXFP8 ones (`dense_ffn_native.rs`). Split, rank `r` runs gate
-//! and up over intermediate columns `[r * inter/2, +inter/2)`, the SiLU on
-//! its half, swaps halves with the peer, then down over hidden columns
-//! `[r * h/2, +h/2)` with the whole intermediate, and swaps those. A
+//! Unsplit, every rank reads all three 28 MB NVFP4 projections per layer
+//! (about 0.45 ms a layer at a three-row verify), or all three of FP4-Local's
+//! 50 MB MXFP8 ones (`dense_ffn_native.rs`, about 0.73 ms). Split over `n`
+//! ranks, rank
+//! `r` runs gate and up over intermediate columns `[r * inter/n, +inter/n)`,
+//! the SiLU on its part, joins the parts, then down over hidden columns
+//! `[r * h/n, +h/n)` with the whole intermediate, and joins those. A
 //! tensor-core tier's output column depends only on its own weight row and
 //! the activation (`canonical_verify`), and the exchanges copy, so every
 //! column, and the joined `[rows, h]` output, is the unsplit FFN's word.
@@ -61,7 +63,7 @@ fn mx_rows_from(w: &Mxfp8Weight, first: u32, k: u32) -> Mxfp8Weight {
 
 impl DenseFfnLayer {
     /// The split FFN of `rows` verify rows on `proj` into `moe_output`, or
-    /// false (nothing launched) when it does not apply (or under SP prefill).
+    /// false (nothing launched) when it does not apply.
     pub(super) fn glm_verify_rows_split(
         &self,
         input: DevicePtr,
@@ -75,14 +77,20 @@ impl DenseFfnLayer {
         let Some(comm) = ctx.comm else {
             return Ok(false);
         };
+        let ranks = comm.world_size();
+        let part = (rows * inter) as usize / ranks.max(1) * 2;
         if !dense_tp_split_requested()?
             || ctx.graph_capture
             || crate::layers::glm_sp::current().is_some()
             || !proj.row_major()
-            || comm.world_size() != 2
-            || !inter.is_multiple_of(32)
-            || !h.is_multiple_of(32)
-            || !comm.supports_exchange_async((rows * inter / 2) as usize * 2)
+            || !matches!(ranks, 2 | 4)
+            || !inter.is_multiple_of(16 * ranks as u32)
+            || !h.is_multiple_of(16 * ranks as u32)
+            || !if ranks == 2 {
+                comm.supports_exchange_async(part)
+            } else {
+                comm.supports_gather_async(part)
+            }
         {
             return Ok(false);
         }
@@ -126,7 +134,7 @@ impl SplitProj<'_> {
     }
 }
 
-/// One rank's half of a dense FFN `[inter, h]` / `[h, inter]`.
+/// One rank's part of a dense FFN `[inter, h]` / `[h, inter]`.
 pub(super) struct SplitFfn<'a> {
     pub gpu: &'a dyn GpuBackend,
     pub comm: &'a dyn spark_comm::CommBackend,
@@ -138,9 +146,10 @@ pub(super) struct SplitFfn<'a> {
 
 impl SplitFfn<'_> {
     /// `[rows, h]` FFN rows of `input` into `out`. Scratch `g` (`rows *
-    /// inter` BF16): this rank's gate (then gated activation) half, the
-    /// peer's half after it, later the two down halves. `u` (as large): this
-    /// rank's up half, then the joined activation `[rows, inter]`.
+    /// inter` BF16): the ranks' gate (then gated activation) parts, later
+    /// their down parts; this rank's goes first on the pair (the peer's
+    /// after it), at its rank's place on a chain. `u` (as large): this
+    /// rank's up part, then the joined activation `[rows, inter]`.
     pub(super) fn run(
         &self,
         input: DevicePtr,
@@ -149,12 +158,17 @@ impl SplitFfn<'_> {
         stream: u64,
     ) -> Result<()> {
         let (h, inter, gpu) = (self.h, self.inter, self.gpu);
-        let (ih, hh, r) = (inter / 2, h / 2, self.comm.rank() as u32);
-        self.gate_up(input, rows, r * ih, ih, [g, u], stream)?;
-        ops::silu_mul(gpu, self.act_mul, g, u, g, rows * ih, stream)?;
-        self.swap_join(g, [rows, inter], u, stream)?;
-        self.down(u, rows, r * hh, hh, g, stream)?;
-        self.swap_join(g, [rows, h], out, stream)
+        let ranks = self.comm.world_size() as u32;
+        let (ih, hh, r) = (inter / ranks, h / ranks, self.comm.rank() as u32);
+        let own = |cols: u32| {
+            let at = if ranks == 2 { 0 } else { r * rows * cols };
+            g.offset(at as usize * 2)
+        };
+        self.gate_up(input, rows, r * ih, ih, [own(ih), u], stream)?;
+        ops::silu_mul(gpu, self.act_mul, own(ih), u, own(ih), rows * ih, stream)?;
+        self.join(g, [rows, inter], u, stream)?;
+        self.down(u, rows, r * hh, hh, own(hh), stream)?;
+        self.join(g, [rows, h], out, stream)
     }
 
     /// Gate and up rows `[first, first + n)` of `rows` rows of `input` into
@@ -247,6 +261,56 @@ impl SplitFfn<'_> {
                 )
             }
         }
+    }
+
+    /// Join the ranks' `[rows, n/ranks]` parts in `parts` (this rank's set,
+    /// as `run` places it) into the `[rows, n]` rows at `dst`, rank 0's
+    /// columns first: a pair swap or a chain gather, then one join launch
+    /// (else a pitched copy per part).
+    fn join(
+        &self,
+        parts: DevicePtr,
+        [rows, n]: [u32; 2],
+        dst: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        let ranks = self.comm.world_size();
+        if ranks == 2 {
+            return self.swap_join(parts, [rows, n], dst, stream);
+        }
+        let (rows, part) = (rows as usize, n as usize / ranks);
+        let bytes = rows * part * 2;
+        anyhow::ensure!(
+            self.comm
+                .gather_async(parts.0, bytes as i64, bytes, stream)?,
+            "dense TP split: chain gather refused {bytes} bytes"
+        );
+        // Equal parts in whole 16s: `rank_join_bf16`'s cuts.
+        let kernel = super::ops::rank_join_kernel(self.gpu);
+        if kernel.0 != 0 {
+            return super::ops::rank_join_bf16(
+                self.gpu,
+                kernel,
+                dst,
+                parts,
+                bytes,
+                [rows, n as usize],
+                ranks,
+                stream,
+            );
+        }
+        for r in 0..ranks {
+            self.gpu.copy_d2d_2d_async(
+                parts.offset(r * bytes),
+                part * 2,
+                dst.offset(r * part * 2),
+                n as usize * 2,
+                part * 2,
+                rows,
+                stream,
+            )?;
+        }
+        Ok(())
     }
 
     /// Send this rank's `[rows, n/2]` half at `own`, land the peer's right

@@ -55,10 +55,19 @@ pub(super) fn run(chunk: impl FnMut() -> bool) -> usize {
     run_with(enabled(), BUDGET, chunk)
 }
 
-fn run_with(on: bool, budget: Duration, mut chunk: impl FnMut() -> bool) -> usize {
+fn run_with(on: bool, budget: Duration, chunk: impl FnMut() -> bool) -> usize {
     let began = Instant::now();
+    run_until(on, budget, chunk, || began.elapsed())
+}
+
+fn run_until(
+    on: bool,
+    budget: Duration,
+    mut chunk: impl FnMut() -> bool,
+    mut elapsed: impl FnMut() -> Duration,
+) -> usize {
     let mut chunks = 1;
-    while chunk() && on && began.elapsed() < budget {
+    while chunk() && on && elapsed() < budget {
         chunks += 1;
     }
     chunks
@@ -113,11 +122,17 @@ mod tests {
     fn a_run_past_its_budget_ends_the_tick() {
         assert_eq!(tick(true, Duration::ZERO, 45_520, 45_556, 8_192), [8_192]);
         let mut chunks = 0;
-        let n = run_with(true, Duration::from_millis(30), || {
-            chunks += 1;
-            std::thread::sleep(Duration::from_millis(20));
-            true
-        });
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let n = run_until(
+            true,
+            Duration::from_millis(30),
+            || {
+                chunks += 1;
+                elapsed.set(elapsed.get() + Duration::from_millis(20));
+                true
+            },
+            || elapsed.get(),
+        );
         assert_eq!((n, chunks), (2, 2));
     }
 

@@ -306,10 +306,15 @@ impl BlockDiffusionDraftHead {
             }
             self.mask_batched_draft_logits(n, grammar_bitmasks, ctx, stream)?;
             if self.candidate_selector.is_some() {
+                // ATLAS_GLM_DRAFT_TP_TOPK: the split swapped candidate lists.
+                let lists = batch_split
+                    .filter(|(split, _)| split.plan().topk)
+                    .and_then(|(split, _)| split.topk.as_ref());
                 self.run_batched_dflash2_tail(
                     batch_size,
                     last_tokens,
                     ban_depths.iter().any(|&depth| depth > 0),
+                    lists,
                     ctx,
                     stream,
                 )?;

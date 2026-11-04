@@ -24,21 +24,45 @@ pub const K3_ROWS: usize = 3;
 pub const MAX_OWNER_ROWS: usize = crate::speculative::glm_repair_policy::MAX_DFLASH_VERIFY_ROWS;
 /// The long-context lane batches at most eight owners...
 pub const MAX_OWNERS: usize = 8;
-/// ...within one budget of verify rows across all owners (8x4, 6x5, 4x8).
-/// Stage, metadata, EOS-ban and split-head buffers are sized to it.
-pub const MAX_ROWS: usize = 32;
+/// ...within one budget of verify rows across all owners ([`ROW_BUDGET`]):
+/// the buffers hold at most every owner's whole DFlash block (8x8). Stage, metadata, EOS-ban
+/// (one u64 mask) and split-head buffers are sized to it.
+pub const MAX_ROWS: usize = 64;
+/// The rows one owner batch may verify (8x4, 6x5, 4x8), on the pair and
+/// the TP4 chain alike: the pair's width costs were measured within it. On
+/// the chain eight owners at five to seven rows measured no faster in steady
+/// state than at four (169..180 against 181 tok/s, 2026-10-18): the step
+/// costs its ~2 ms an owner-row there too, and the deeper drafts accept too
+/// little to pay for it. Dead rows ([`DEAD_ROW`]) do not change that: past
+/// 32 rows the step jumps ~17 ms and a live row costs ~1.6 ms (eight owners,
+/// 2026-10-18). Past 32 rows the verify is also not batch-invariant: eight
+/// greedy streams give other tokens than at 32 (job 24-moe-exact,
+/// 2026-10-18). Only the head reads it (it picks the widths; a worker takes
+/// any width the buffers hold, up to [`MAX_ROWS`]).
+pub const ROW_BUDGET: usize = 32;
 
-/// Whether one call may verify `owners` owners of `rows` rows each.
+/// Marks a dead verify row's token: on the TP4 chain the head may verify
+/// each owner of a batch on a prefix of the batch's width, its other rows
+/// dead (`scheduler::dflash_width::choose_live`; the pair never does). The
+/// owner's verdict keeps none of its rows from there on, so the row's routed
+/// FFN is skipped (`layers::moe::DeadRows`). Rows of one owner past its
+/// first dead row are dead too. The token broadcast carries the mark to
+/// every rank.
+pub const DEAD_ROW: u32 = 1 << 31;
+
+/// Whether one call may verify `owners` owners of `rows` rows each within
+/// the buffers ([`MAX_ROWS`]; [`ROW_BUDGET`] bounds what a batch admits).
 pub fn width_supported(owners: usize, rows: usize) -> bool {
     (1..=MAX_OWNERS).contains(&owners)
         && (2..=MAX_OWNER_ROWS).contains(&rows)
         && owners * rows <= MAX_ROWS
 }
 
-/// Widest per-owner block `owners` owners can verify together (0 if none).
-pub fn max_rows_per_owner(owners: usize) -> usize {
+/// Widest per-owner block `owners` owners can verify together within
+/// `budget` rows (0 if none).
+pub fn max_rows_per_owner(owners: usize, budget: usize) -> usize {
     if (1..=MAX_OWNERS).contains(&owners) {
-        (MAX_ROWS / owners).min(MAX_OWNER_ROWS)
+        (budget.min(MAX_ROWS) / owners).min(MAX_OWNER_ROWS)
     } else {
         0
     }
@@ -95,7 +119,7 @@ impl RowBytes {
         }
     }
     fn total(&self) -> usize {
-        MAX_ROWS * (3 * self.hidden + self.highway + self.post + self.comb + self.logits)
+        MAX_ROWS * (3 * self.hidden + self.highway + self.post + self.comb + self.logits + 4)
     }
 
     /// Whether every arena span the stage copies touch holds `rows` rows.
@@ -133,6 +157,8 @@ pub struct GlmLongStage {
     pub logits: DevicePtr,
     /// Joint FFN output, one owner's rows at a time.
     pub ffn: DevicePtr,
+    /// `[MAX_ROWS]` u32: whether each row of a call with dead rows is live.
+    pub live: DevicePtr,
 }
 
 impl GlmLongStage {
@@ -153,6 +179,7 @@ impl GlmLongStage {
             comb: take(rows.comb),
             logits: take(rows.logits),
             ffn: take(rows.hidden),
+            live: take(4),
         })
     }
 

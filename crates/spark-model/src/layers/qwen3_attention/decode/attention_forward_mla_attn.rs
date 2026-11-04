@@ -129,10 +129,12 @@ impl Qwen3AttentionLayer {
         [heads, dim]: [u32; 2],
         stream: u64,
     ) -> Result<()> {
-        use crate::layers::glm_kv_shard::{HEADS, LATENT, WIDTH};
+        use crate::layers::glm_kv_shard::{LATENT, WIDTH, local_heads};
+        let world = kv_cache.latent_shard().map_or(2, |s| s.spec.world);
         anyhow::ensure!(
-            heads == HEADS && dim == LATENT,
-            "GLM KV shard decode needs {HEADS} local heads of the {LATENT}-wide latent"
+            heads == local_heads(world) && dim == LATENT,
+            "GLM KV shard decode needs {} local heads of the {LATENT}-wide latent",
+            local_heads(world)
         );
         let (sparse, pos) = selection;
         let (selected, causal_start) = match sparse {
@@ -242,8 +244,9 @@ impl Qwen3AttentionLayer {
 
     /// Single-row GLM sparse attention through the tensor-core decode kernel,
     /// 32 heads per launch (attention is independent per head, so a 64-head
-    /// MTP body runs two launches). Returns false, leaving the scalar kernel to
-    /// the caller, unless every precondition of that kernel holds.
+    /// MTP body runs two launches), or a TP4 rank's 16 in one. Returns false,
+    /// leaving the scalar kernel to the caller, unless every precondition of
+    /// that kernel holds.
     #[allow(clippy::too_many_arguments)]
     fn try_glm_sparse_tc_decode_heads(
         &self,
@@ -259,12 +262,12 @@ impl Qwen3AttentionLayer {
         scale: f32,
         stream: u64,
     ) -> Result<bool> {
-        const GROUP: u32 = 32;
+        let group = heads.min(32);
         // ops::glm_sparse_decode_split's partial O + LSE + merge scratch.
         const SPLIT_SCRATCH_BYTES: usize = 8 * 32 * 512 * 4 + 8 * 32 * 4 + 32 * 4;
         if !ops::glm_sparse_decode_tc_enabled(&ctx.config.model_type)?
-            || heads == 0
-            || !heads.is_multiple_of(GROUP)
+            || !ops::glm_sparse_tc_heads(group)
+            || !heads.is_multiple_of(group)
             || head_dim != 512
             || index_width != 2051
             || kv_cache.block_size() != 16
@@ -280,20 +283,20 @@ impl Qwen3AttentionLayer {
         {
             return Ok(false);
         }
-        let group_bytes = (GROUP * head_dim) as usize * 2;
-        for group in 0..(heads / GROUP) as usize {
+        let group_bytes = (group * head_dim) as usize * 2;
+        for index in 0..(heads / group) as usize {
             let a = ops::GlmSparsePrefillTc {
                 config: ctx.config,
                 dtype: self.kv_dtype,
                 identical_kv_latent: true,
-                query: query.offset(group * group_bytes),
+                query: query.offset(index * group_bytes),
                 k_cache: kv_cache.k_pool_ptr(self.attn_layer_idx),
                 v_cache: kv_cache.v_pool_ptr(self.attn_layer_idx),
                 indices,
-                output: output.offset(group * group_bytes),
+                output: output.offset(index * group_bytes),
                 block_table,
                 rows: 1,
-                heads: GROUP,
+                heads: group,
                 head_dim,
                 index_width,
                 block_size: 16,
@@ -326,7 +329,7 @@ impl Qwen3AttentionLayer {
             }
             if !ops::try_glm_sparse_decode_tc(ctx.gpu, &a, stream)? {
                 anyhow::ensure!(
-                    group == 0,
+                    index == 0,
                     "GLM sparse TC decode stopped after a partial head group"
                 );
                 return Ok(false);

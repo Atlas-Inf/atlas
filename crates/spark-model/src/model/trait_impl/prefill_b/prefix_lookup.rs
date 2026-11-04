@@ -170,6 +170,24 @@ impl TransformerModel {
                 (eff_snapshot, eff_snapshot_tokens),
             )?;
 
+            // Native MTP: every rank agrees the predictor prefix exists before
+            // any rank restores target state (`native_mtp_prefix`).
+            let native_ready = !self.native_glm_mtp || {
+                let depth = eff_snapshot
+                    .filter(|&id| {
+                        self.marconi_restorable(
+                            id,
+                            eff_snapshot_tokens,
+                            eff_is_tail,
+                            matched,
+                            total,
+                            seq,
+                        )
+                    })
+                    .map_or(0, |_| eff_snapshot_tokens);
+                self.restore_native_mtp_prefix(tokens, seq, depth, stream)?
+            };
+
             let mut skip = if let Some(snap_id) = eff_snapshot {
                 let snap_tok = eff_snapshot_tokens;
                 // Exact full-prompt hit on a hiddenless snapshot (finish
@@ -208,7 +226,8 @@ impl TransformerModel {
                 // e.g. mid-chunk tail captures — rather than restore a
                 // stale lexical state. See prefill_a. The whole gate is
                 // `pc_policy::marconi_restorable`.
-                if self.marconi_restorable(snap_id, snap_tok, eff_is_tail, matched, total, seq)
+                if native_ready
+                    && self.marconi_restorable(snap_id, snap_tok, eff_is_tail, matched, total, seq)
                     // R11 fix 7: MTP output equals cold only with the cold
                     // drafter context; decline a hit that cannot rebuild it.
                     && self.mtp_anchor_available(snap_id, tokens, snap_tok)

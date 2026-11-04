@@ -90,8 +90,47 @@ impl FfnComponent {
         }
     }
 
+    /// Whether the SP prefill FFN over `sp` reads only this rank's rows of
+    /// its normed input, gathering what it needs of the others itself
+    /// (`moe::sp_quant_gather`): the seam before it then gathers no
+    /// BF16 rows.
+    pub fn sp_gathers_own_input(&self, sp: glm_sp::SpRows, ctx: &ForwardContext) -> bool {
+        matches!(self, Self::Moe(m) if m.sp_quant_gather(sp, ctx))
+    }
+
+    /// The routed MoE's quantized input as a seam's per-block gather
+    /// (`qwen3_attention::SeamGather`): its staged rows `(ptr, width)`, when
+    /// [`Self::sp_gathers_own_input`].
+    pub fn sp_route_staging(
+        &self,
+        sp: glm_sp::SpRows,
+        ctx: &ForwardContext,
+    ) -> Result<Option<(DevicePtr, usize)>> {
+        match self {
+            Self::Moe(m) if m.sp_quant_gather(sp, ctx) => m.sp_route_staging(sp, ctx).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// Route, quantize and stage this rank's rows `block` of `normed` for
+    /// the seam's per-block gather ([`Self::sp_route_staging`]).
+    pub fn sp_route_rows(
+        &self,
+        normed: DevicePtr,
+        sp: glm_sp::SpRows,
+        block: (usize, usize),
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        match self {
+            Self::Moe(m) => m.sp_route_rows(normed, sp, block, ctx, stream),
+            _ => anyhow::bail!("per-block routing on a layer without a routed MoE"),
+        }
+    }
+
     /// Sequence-parallel prefill FFN over a normed `[sp.total(), H]` input
-    /// (all rows gathered). Returns this rank's `[sp.rows, H]` output rows:
+    /// (all rows gathered, or only this rank's when [`Self::sp_gathers_own_input`]).
+    /// Returns this rank's `[sp.rows, H]` output rows:
     /// the MoE runs every row and reduce-scatters (`layers::glm_sp`), the
     /// replicated dense FFN runs only the local rows.
     pub fn forward_prefill_sp(
@@ -134,3 +173,11 @@ impl FfnComponent {
         }
     }
 }
+
+/// Seam blocks one per-block gather of a quantized seam input covers (the
+/// four-rank chain's MoE, KDA and MLA quant gathers; the pair has none): one,
+/// the four-rank profile's. pf10.sqlite measured four one-block gathers at
+/// ~0.65 ms each against ~0.55 ms of mHC a block, so a gather a block queued
+/// behind the last and ran ~1 ms past the seam; the quantized gathers since
+/// move far fewer bytes.
+pub(crate) const SEAM_GATHER_GROUP: usize = 1;

@@ -863,26 +863,9 @@ impl SsmStatePool {
         // the ~528 per-layer submissions were a dominant TTFT term.
         let stream = gpu.default_stream();
         let _tp = std::time::Instant::now();
-        // Diagnostic: when set, sync after each column and report its bytes +
-        // drain time, to identify which pool's memset dominates. Off in prod.
-        let col_prof = std::env::var_os("ATLAS_RESET_COL_PROFILE").is_some();
         macro_rules! col {
             ($name:literal, $pools:expr, $off:expr, $width:expr) => {{
-                let _c0 = _tp.elapsed();
                 self.zero_slot_column($pools, $off, $width, gpu, stream)?;
-                if col_prof {
-                    let sub = _tp.elapsed().saturating_sub(_c0);
-                    gpu.synchronize(stream)?;
-                    let tot = _tp.elapsed().saturating_sub(_c0);
-                    let bytes = (*$pools).len() as u64 * ($width) as u64;
-                    tracing::info!(
-                        "reset_slot col {}: submit={:?} drain={:?} bytes={}MB",
-                        $name,
-                        sub,
-                        tot,
-                        bytes >> 20
-                    );
-                }
             }};
         }
         col!(

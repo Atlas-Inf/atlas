@@ -20,16 +20,22 @@ use crate::layers::ops;
 #[path = "paged_glm_projection.rs"]
 mod projection;
 
+#[path = "paged_glm_a2a.rs"]
+mod a2a;
 #[path = "paged_glm_canonical.rs"]
 pub(in crate::layers::qwen3_attention) mod canonical;
 #[path = "paged_glm_front.rs"]
 mod front;
+#[path = "paged_glm_oproj_ahead.rs"]
+mod oproj_ahead;
 #[path = "paged_glm_output.rs"]
 mod output;
 #[path = "paged_glm_owner.rs"]
 mod owner;
 #[path = "paged_glm_shard.rs"]
 pub(in crate::layers::qwen3_attention) mod shard;
+#[path = "paged_glm_sp_gather.rs"]
+pub(in crate::layers::qwen3_attention) mod sp_gather;
 pub(crate) use owner::write_floor_legacy;
 pub(in crate::layers::qwen3_attention) use owner::{GlmChunkOwner, glm_chunk_pieces};
 
@@ -122,8 +128,27 @@ impl Qwen3AttentionLayer {
             "unsupported GLM MLA geometry: kv_lora={kv_lora}, nope={nope}, v={v_dim}, hd={hd}"
         );
 
+        // ATLAS_PROFILE_PREFILL parts of prefill_inner_hc's `attn` step.
+        let mut prof = crate::layers::prefill_profile::start(ctx, stream)?;
+        let step = |prof: &mut Option<std::time::Instant>, label: &str| {
+            crate::layers::prefill_profile::step(ctx, stream, prof, "MLA", label)
+        };
+        // The four-rank MLA quant gather: the input arrived cast; the index
+        // projections run on this rank's rows and gather beside the front.
+        let cast = sp_gather::cast_input();
+        let gathered_index = match cast {
+            Some(cast) => {
+                sp_gather::check_rows(cast, num_tokens)?;
+                Some(self.sp_mla_index_gather(owners, normed, cast, ctx, stream)?)
+            }
+            None => None,
+        };
         // Joint: q_a (+ norm), kv_a (+ norm) and the cache write.
         let front = self.glm_chunk_front(owners, kv_cache, ctx, args, kv_write_floor, mla)?;
+        if gathered_index.is_some() {
+            crate::layers::glm_sp_overlap::join_beside(ctx, stream)?;
+        }
+        step(&mut prof, "attn.q_kv_a")?;
         let (q_latent, wf) = (front.q_latent, front.write_floor);
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
 
@@ -134,8 +159,21 @@ impl Qwen3AttentionLayer {
         // parked for one joint W_uv + o_proj. When the chunk outgrows the
         // park (8K sub-chunked prefill) each owner projects its own rows.
         let o_out = ctx.buffers.norm_output();
-        let per_owner = owners.len() > 1 && ctx.buffers.sizes().logits < num_tokens * latent_row;
-        let parked = (owners.len() > 1 && !per_owner).then(|| ctx.buffers.logits());
+        // ATLAS_GLM_SP_MLA_OPROJ_A2A: each owner's rows cast for the
+        // all-to-all o_proj after the last owner (`paged_glm_a2a.rs`).
+        let a2a = self.glm_oproj_a2a(num_tokens, ctx);
+        // The four-rank o_proj ahead: the o_proj a seam block at a time,
+        // each block reduced behind it, after the last owner; the owners'
+        // W_uv rows are cast for it as they are for the all-to-all.
+        let ahead = match a2a {
+            None => self.glm_oproj_ahead(num_tokens, ctx),
+            Some(_) => None,
+        };
+        let per_owner = a2a.is_none()
+            && owners.len() > 1
+            && ctx.buffers.sizes().logits < num_tokens * latent_row;
+        let parked =
+            (a2a.is_none() && owners.len() > 1 && !per_owner).then(|| ctx.buffers.logits());
         // Owner-batched verify: every row-wise projection (index keys, gates,
         // queries and weights, q_b and the W_uk absorb) runs once over all
         // owners' rows, so each weight is read once per layer rather than once
@@ -151,6 +189,7 @@ impl Qwen3AttentionLayer {
             ctx,
             stream,
         )?;
+        step(&mut prof, "attn.owner_proj")?;
         for o in owners {
             let on = o.rows as u32;
             let octx = ForwardContext {
@@ -165,8 +204,9 @@ impl Qwen3AttentionLayer {
             let rows_of = |base: DevicePtr, row_bytes: usize| base.offset(o.row0 * row_bytes);
             let select = |octx: &ForwardContext| {
                 if !front.indexed {
-                    let keys =
-                        batched.map(|b| (rows_of(b.keys, b.key_row), rows_of(b.gates, b.key_row)));
+                    let keys = batched
+                        .map(|b| (rows_of(b.keys, b.key_row), rows_of(b.gates, b.key_row)))
+                        .or(gathered_index.map(|g| g.keys(o.row0)));
                     self.glm_index_prefill_cache_update(
                         o_normed,
                         on,
@@ -180,7 +220,18 @@ impl Qwen3AttentionLayer {
                 if use_dense {
                     return Ok(None);
                 }
-                let projected = batched.map(|b| b.index_rows(o.row0)).transpose()?;
+                let projected = match (batched, gathered_index) {
+                    (Some(b), _) => Some(b.index_rows(o.row0)?),
+                    (None, Some(g)) => {
+                        let query = ctx.buffers.ssm_deinterleaved();
+                        let weights = g.weights(o.row0);
+                        self.glm_index_project_query(
+                            o_latent, None, on, query, weights, octx, stream,
+                        )?;
+                        Some((query, weights))
+                    }
+                    (None, None) => None,
+                };
                 let start = o.seq_len_start;
                 self.glm_index_prefill_select(
                     o_latent, o_normed, on, start, kv_cache, octx, stream, projected,
@@ -192,6 +243,7 @@ impl Qwen3AttentionLayer {
             let ready = batched.map(|b| rows_of(b.q_absorbed, latent_row));
             let (sparse_indices, queries_swapped) =
                 self.glm_shard_swap_queries_during(kv_cache, &octx, o.rows, ready, stream, select)?;
+            step(&mut prof, "attn.index")?;
             // The BF16 dense and native kernels read an fp8_g128 owner through
             // a dequantized view; long owners and verify rows read FP8 directly,
             // as do, under the pipelined kernel, sparse pieces native declines.
@@ -242,6 +294,9 @@ impl Qwen3AttentionLayer {
                     q_absorbed
                 }
             };
+            step(&mut prof, "attn.q_b_absorb")?;
+            // The chain's index split gathers ran beside: they landed.
+            crate::layers::glm_sp_overlap::join_beside(ctx, stream)?;
             det.tap("x_q_abs", q_absorbed, (o.row0, o.rows), latent_row);
             if merge_form {
                 self.glm_shard_merge_owner(
@@ -375,10 +430,21 @@ impl Qwen3AttentionLayer {
                 )?;
             }
 
+            step(&mut prof, "attn.sparse")?;
             det.tap("x_attn_lat", attn_latent, (o.row0, o.rows), latent_row);
             // Convert the latent attention result back to each head's value
             // width, then apply the row-parallel output projection.
-            if per_owner {
+            if a2a.is_some() || (ahead.is_some() && per_owner) {
+                self.glm_owner_cast(
+                    mla,
+                    attn_latent,
+                    (o.row0, o.rows),
+                    num_tokens,
+                    nq,
+                    &octx,
+                    stream,
+                )?;
+            } else if per_owner {
                 self.paged_glm_output(
                     mla,
                     attn_latent,
@@ -396,9 +462,19 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             }
+            step(&mut prof, "attn.uv_o")?;
         }
 
-        if !per_owner {
+        if let Some(sp) = a2a {
+            self.glm_oproj_exchange(mla, o_out, sp, nq, h, ctx, stream)?;
+        } else if let Some((sp, blocks)) = &ahead {
+            if !per_owner {
+                let rows = (0, num_tokens);
+                let latent = parked.unwrap_or(attn_latent);
+                self.glm_owner_cast(mla, latent, rows, num_tokens, nq, ctx, stream)?;
+            }
+            self.glm_oproj_reduce_ahead(mla, o_out, (*sp, blocks), nq, h, ctx, stream)?;
+        } else if !per_owner {
             self.paged_glm_output(
                 mla,
                 parked.unwrap_or(attn_latent),
@@ -408,6 +484,7 @@ impl Qwen3AttentionLayer {
                 stream,
                 accelerated,
             )?;
+            step(&mut prof, "attn.uv_o")?;
         }
         Ok(o_out)
     }

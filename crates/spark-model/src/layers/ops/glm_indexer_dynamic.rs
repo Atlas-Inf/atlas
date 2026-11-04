@@ -167,7 +167,7 @@ pub fn glm_sparse_mla_dynamic(
     stream: u64,
 ) -> Result<()> {
     ensure!(
-        matches!(num_heads, 32 | 64) && !seq_len.is_null(),
+        matches!(num_heads, 16 | 32 | 64) && !seq_len.is_null(),
         "GLM dynamic sparse attention geometry is unsupported"
     );
     KernelLaunch::new(gpu, kernel)

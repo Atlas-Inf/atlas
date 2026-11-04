@@ -103,6 +103,7 @@ pub(super) fn try_fused_chunk(
         spec.num_drafts,
         verify_ctx,
         spec.dflash_verify_raw_argmax,
+        &[],
         &mut |rows, tokens, seqs| {
             let (logits, ids) = model.prefill_chunk_with_glm_owner_rows(
                 &p.prompt_tokens,

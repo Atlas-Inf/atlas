@@ -263,6 +263,18 @@ pub(super) fn load_mla_layer(
         force_dimension_overrides,
         gpu,
     )?;
+    let o_full = if native.is_some() {
+        super::mla_native::mla_o_full(
+            crate::layers::glm_native::NativePolicy::from_env(),
+            store,
+            &p,
+            &tp,
+            force_dimension_overrides,
+            gpu,
+        )?
+    } else {
+        None
+    };
     if let Some(twins) = native.as_mut() {
         super::mla_native::tile_large_twins(twins, native_prefill, gpu)?;
         // Pick each W8A8 prefill GEMM now (cuBLASLt block FP8, else the
@@ -397,7 +409,7 @@ pub(super) fn load_mla_layer(
             .zip(twins)
             .map(|(key, (twin, nk))| (key, nk, twin))
             .collect();
-        layer.install_mla_native(twins, native_prefill);
+        layer.install_mla_native(twins, native_prefill, o_full);
     }
     if !opt_in_twins.is_empty() {
         layer.install_mla_mxfp8(gpu, &opt_in_twins)?;

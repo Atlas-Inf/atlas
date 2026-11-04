@@ -18,6 +18,23 @@ impl TransformerModel {
         proc_count: usize,
         stream: u64,
     ) -> Result<()> {
+        let base = seq
+            .chunked_prefill_meta
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("paged prefill metadata missing"))?
+            .seq_len;
+        self.upload_seq_lens_at(seq, proc_start, proc_count, base, stream)
+    }
+
+    /// [`Self::upload_chunk_seq_lens`] into `base`.
+    pub(super) fn upload_seq_lens_at(
+        &self,
+        _seq: &SequenceState,
+        proc_start: usize,
+        proc_count: usize,
+        base: spark_runtime::gpu::DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
         use crate::layer::{PREFILL_MAX_SUB_CHUNKS, prefill_attention_pieces};
         let end = proc_start + proc_count;
         let mut values = vec![end as u32];
@@ -34,11 +51,6 @@ impl TransformerModel {
             );
         }
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let base = seq
-            .chunked_prefill_meta
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("paged prefill metadata missing"))?
-            .seq_len;
         self.gpu.copy_h2d_async(&bytes, base, stream)
     }
 }

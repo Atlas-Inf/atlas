@@ -13,6 +13,9 @@ use std::sync::OnceLock;
 
 /// Rows below this keep cuBLASLt (decode/verify widths).
 const MIN_ROWS: u32 = 256;
+/// The reference row count of the cuBLASLt configuration a packed prefill
+/// falls back to where CUTLASS declines (`fixed_algo`).
+const PACKED_REF_ROWS: u32 = 4096;
 
 fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -57,6 +60,24 @@ pub fn bf16_gemm(
     if super::qwen4exp_rowinv::try_bf16_gemm(act, weight, out, [m, n, k], stream)? {
         return Ok(());
     }
+    // A packed prefill (`glm_packed_scope`): one row-invariant kernel for
+    // every row count.
+    if crate::layers::glm_packed_scope::active() {
+        if cutlass_gemm(false, act, weight, out, [m, n, k], stream)? {
+            return Ok(());
+        }
+        if spark_runtime::cublaslt::bf16_gemm_act_weight_t_fixed(
+            act.0,
+            weight,
+            out.0,
+            [m, n, k],
+            PACKED_REF_ROWS,
+            stream,
+        )? {
+            return Ok(());
+        }
+        anyhow::bail!("packed prefill: no row-invariant BF16 GEMM for {n}x{k}");
+    }
     if enabled() && m >= MIN_ROWS {
         if cutlass_gemm(false, act, weight, out, [m, n, k], stream)? {
             return Ok(());
@@ -69,7 +90,8 @@ pub fn bf16_gemm(
 /// [`bf16_gemm`] with an FP32 `out` (the FP32 accumulator unrounded, GLM-5's
 /// FP32 router logits): the same CUTLASS tiles where [`bf16_gemm`] takes
 /// them, so a row's words do not depend on the call's row count either, and
-/// cuBLASLt with an FP32 output elsewhere.
+/// cuBLASLt with an FP32 output elsewhere. A packed prefill has no FP32
+/// cuBLASLt fallback.
 pub fn bf16_gemm_f32out(
     act: DevicePtr,
     weight: u64,
@@ -79,10 +101,15 @@ pub fn bf16_gemm_f32out(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    if enabled() && m >= MIN_ROWS {
+    let packed = crate::layers::glm_packed_scope::active();
+    if packed || (enabled() && m >= MIN_ROWS) {
         if cutlass_gemm(true, act, weight, out, [m, n, k], stream)? {
             return Ok(());
         }
+        ensure!(
+            !packed,
+            "packed prefill: no row-invariant FP32-output GEMM for {n}x{k}"
+        );
         report_rejected(m, n, k);
     }
     spark_runtime::cublaslt::bf16_gemm_act_weight_t_f32out(act.0, weight, out.0, m, n, k, stream)

@@ -8,7 +8,9 @@ use spark_runtime::weights::{WeightDtype, WeightStore};
 use crate::layers::qwen3_attention::{HcSiteWeights, HcWeights};
 use crate::layers::{Glm5KdaWeights, Glm5Projection};
 use crate::tp_shard::{TpGdnDims, TpShardKind, shard_dense_bf16, shard_gdn_value_vector};
-use crate::weight_map::{DenseWeight, QuantizeCtx, QuantizedWeight, dense_auto, quantize_to_nvfp4};
+use crate::weight_map::{
+    DenseWeight, QuantizeCtx, QuantizedWeight, dense_auto, quantize_to_nvfp4_scaled_by,
+};
 
 pub(super) use super::ffn::load_ffn;
 
@@ -117,26 +119,38 @@ pub(super) fn load_kda_weights(
             });
         }
         let nvfp4 = || -> Result<(QuantizedWeight, Option<QuantizedWeight>)> {
-            let dense = load_tp_dense(name, n, k, kind)?;
-            let local_n = if kind == TpShardKind::ColumnParallel {
-                n / dims.tp_size
-            } else {
-                n
-            };
-            let local_k = if kind == TpShardKind::RowParallel {
-                k / dims.tp_size
-            } else {
-                k
-            };
-            let decode_nvfp4 = quantize_to_nvfp4(
+            let source =
+                LoadedDense::load(store, &format!("{p}.{name}.weight"), gpu, retirement, false)?;
+            let (local, local_n, local_k) = shard_dense_bf16(
+                source.dense.weight,
+                n,
+                k,
+                kind,
+                dims.tp_rank,
+                dims.tp_size,
+                gpu,
+            )?;
+            // Beyond two ranks the NVFP4 global scale is the TP2 shard's
+            // (`tp_shard::pair_scale_rank`): the bytes serving proved at TP2.
+            let pair = crate::tp_shard::pair_scale_rank(dims.tp_rank, dims.tp_size)
+                .map(|rank| shard_dense_bf16(source.dense.weight, n, k, kind, rank, 2, gpu))
+                .transpose()?;
+            let dense = source.replaced(local, local_n * local_k * 2, gpu)?;
+            let scale_source = pair.map_or((local, local_n * local_k), |(p, pn, pk)| (p, pn * pk));
+            let decode_nvfp4 = quantize_to_nvfp4_scaled_by(
                 &dense.dense,
                 local_n,
                 local_k,
+                scale_source,
                 gpu,
                 qctx.absmax_k,
                 qctx.quantize_k,
                 qctx.stream,
-            )?;
+            );
+            if let Some((p, _, _)) = pair {
+                gpu.free(p)?;
+            }
+            let decode_nvfp4 = decode_nvfp4?;
             // Quantization synchronizes internally, so the checkpoint-native BF16
             // source is no longer needed. Releasing it keeps the safe 92% memory
             // budget viable on GB10 instead of retaining two projection copies.
@@ -188,6 +202,19 @@ pub(super) fn load_kda_weights(
     let dt_bias = dt_bias_full
         .replaced(dt_bias, dt_len * 4, gpu)?
         .into_dense();
+    // The four-rank KDA quant gather (`glm5_kda::sp_quant_gather`): beta is
+    // per head, so the gather moves every head's beta of each rank's rows: an
+    // owned copy of the whole b_proj, taken before the shard's load releases
+    // the checkpoint bytes.
+    let b_proj_full = if dims.tp_size == 4 {
+        let whole = load("b_proj")?;
+        let bytes = dims.full_nk * dims.h * 2;
+        let copy = gpu.alloc(bytes)?;
+        gpu.copy_d2d(whole.weight, copy, bytes)?;
+        Some(DenseWeight { weight: copy })
+    } else {
+        None
+    };
     let b_proj = load_tp_dense("b_proj", dims.full_nk, dims.h, TpShardKind::ColumnParallel)?;
     let [b_proj, f_a_proj, g_a_proj] = if crate::layers::kda_side_proj_lt_enabled() {
         super::kda_side_pack::pack_side(store, &p, gpu, retirement, b_proj, &dims)?
@@ -243,6 +270,15 @@ pub(super) fn load_kda_weights(
             dims.full_value_dim(),
             TpShardKind::RowParallel,
             true,
+        )?,
+        b_proj_full,
+        o_proj_full: super::kda_mx::kda_oproj_full(
+            mx_policy,
+            store,
+            &format!("{p}.o_proj"),
+            [dims.h, dims.full_value_dim()],
+            dims.tp_size,
+            gpu,
         )?,
     })
 }

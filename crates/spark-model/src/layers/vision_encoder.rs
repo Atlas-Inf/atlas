@@ -11,8 +11,25 @@ use spark_runtime::gpu::{DevicePtr, KernelHandle};
 
 pub(crate) mod glm;
 pub(crate) use glm::{
-    GlmVisionBlockWeights, GlmVisionEncoder, GlmVisionMergerWeights, GlmVisionWeights,
+    GlmCapacity, GlmVisionBlockWeights, GlmVisionEncoder, GlmVisionMergerWeights, GlmVisionWeights,
 };
+
+/// A multi-rank GLM-5 world: its tower holds the processor's budgets and its
+/// workers no vision weights. A single rank keeps its bounded tower.
+fn glm_budget_tower(config: &atlas_core::config::ModelConfig) -> bool {
+    config.tp_world_size.max(config.ep_world_size) > 1
+}
+
+/// Whether this rank only receives encoded vision rows: a worker of a GLM-5
+/// multi-rank world. Rank 0 encodes every item and broadcasts its rows
+/// (`EP_CMD_VISION_STATE`), so a worker loads no vision weights and allocates
+/// only the row buffer. Decided from the configuration alone, so the weight
+/// loader and the model builder agree.
+pub fn vision_receive_only(config: &atlas_core::config::ModelConfig) -> bool {
+    config.vision.as_ref().is_some_and(|v| v.is_glm5_next)
+        && glm_budget_tower(config)
+        && (config.tp_rank != 0 || config.ep_rank != 0)
+}
 
 pub(super) const IMAGE_PAD_TOKEN: u32 = 151_655;
 pub const IMAGE_PAD_TOKEN_ID: u32 = IMAGE_PAD_TOKEN;
@@ -160,3 +177,78 @@ mod glm_oracle_tests;
 #[cfg(all(test, feature = "cuda"))]
 #[path = "vision_encoder/glm_attention_gpu_tests.rs"]
 mod glm_attention_gpu_tests;
+
+#[cfg(test)]
+mod receive_only_tests {
+    use super::vision_receive_only;
+    use atlas_core::config::{ModelConfig, VisionConfig};
+
+    fn glm_vision() -> VisionConfig {
+        VisionConfig {
+            is_glm5_next: true,
+            in_channels: 3,
+            depth: 1,
+            hidden_size: 64,
+            num_heads: 1,
+            patch_size: 14,
+            temporal_patch_size: 2,
+            spatial_merge_size: 2,
+            intermediate_size: 64,
+            out_hidden_size: 64,
+            projection_intermediate_size: 64,
+            rms_norm_eps: 1e-5,
+            swiglu_limit: 10.0,
+            deepstack_visual_indexes: Vec::new(),
+            image_pad_token_id: 0,
+            video_pad_token_id: 0,
+            image_start_token_id: 0,
+            image_end_token_id: 0,
+            video_start_token_id: 0,
+            video_end_token_id: 0,
+            max_pixels: None,
+            token_budgets: Default::default(),
+            min_pixels: None,
+            video_pixels: None,
+            is_qwen3vl_video: false,
+            omni: None,
+        }
+    }
+
+    #[test]
+    fn only_a_glm_worker_skips_the_vision_weights() {
+        let mut c = ModelConfig::qwen3_next_80b_nvfp4();
+        (c.tp_world_size, c.ep_world_size) = (4, 4);
+        c.tp_rank = 1;
+        c.ep_rank = 1;
+        assert!(!vision_receive_only(&c), "no vision config");
+        c.vision = Some(glm_vision());
+        assert!(vision_receive_only(&c));
+        c.tp_rank = 0;
+        c.ep_rank = 0;
+        assert!(!vision_receive_only(&c), "rank 0 encodes");
+        c.ep_rank = 1;
+        assert!(vision_receive_only(&c), "an orthogonal-mesh worker");
+        (c.tp_world_size, c.ep_world_size) = (2, 2);
+        assert!(vision_receive_only(&c), "a pair worker only receives too");
+        (c.tp_world_size, c.ep_world_size) = (1, 1);
+        assert!(!vision_receive_only(&c), "a single rank keeps its tower");
+        (c.tp_world_size, c.ep_world_size) = (4, 4);
+        c.vision.as_mut().unwrap().is_glm5_next = false;
+        assert!(!vision_receive_only(&c), "other towers keep their weights");
+    }
+
+    #[test]
+    fn a_receive_only_rank_does_not_load_the_tower() {
+        use crate::weight_loader::ModelWeightLoader;
+        use crate::weight_loader::glm5::Glm5WeightLoader;
+        let mut c = ModelConfig::qwen3_next_80b_nvfp4();
+        (c.tp_world_size, c.ep_world_size) = (4, 4);
+        c.vision = Some(glm_vision());
+        assert!(Glm5WeightLoader.dead_namespaces(&c).is_empty(), "rank 0");
+        (c.tp_rank, c.ep_rank) = (1, 1);
+        assert_eq!(
+            Glm5WeightLoader.dead_namespaces(&c),
+            ["model.visual.", "model.language_model.visual."]
+        );
+    }
+}

@@ -31,6 +31,8 @@ impl MoeLayer {
         shared_in: DevicePtr,
         shared_n: u32,
         defer_shared_hc: bool,
+        // The E4M3 down rows' scales (`prequant_fp4_down`), or BF16 rows.
+        e4m3_scales: Option<DevicePtr>,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -67,6 +69,110 @@ impl MoeLayer {
 
         // 7. Unpermute + weighted reduce: scatter sorted outputs to token order
         let output = ctx.buffers.moe_output();
+        if let Some((sp, blocks)) = self.output_seam_blocks(
+            sp,
+            (split, use_overlap, defer_shared_hc),
+            has_shared.then_some(shared_n),
+            h,
+            ctx,
+        ) {
+            // ATLAS_GLM_SP_GATHER_OVERLAP on the chain: unpermute a row
+            // block of every part at a time, its reduce-scatter behind it,
+            // and leave the blend and the post to the next attention seam
+            // (`layers::glm_sp_moe_seam`).
+            if overlap_shared_reduce {
+                self.run_shared_expert_prefill(
+                    shared_in,
+                    shared_n,
+                    h,
+                    ctx.config.shared_expert_intermediate_size as u32,
+                    self.prefill_stream,
+                    stream,
+                    true,
+                    ctx,
+                )?;
+            }
+            let blend = has_shared.then_some(crate::layers::glm_sp_moe_seam::Blend {
+                kernel: self.moe_batched_blend,
+                shared: ctx.buffers.attn_output(),
+                input: shared_in,
+                gate: self.weights.shared_expert_gate.weight,
+                join: overlap_shared_reduce.then_some(self.event_b),
+            });
+            let (start, end) = ctx.config.local_expert_range();
+            let (row, route) = (h as usize * 2, top_k as usize * 4);
+            // Only the `_vec8` kernel strides a short grid over its tokens.
+            let vec8 = ctx
+                .gpu
+                .op_cache()
+                .kernel(ctx.gpu, "moe", "moe_unpermute_reduce_indexed_ep_vec8")
+                .is_ok_and(|k| k.0 == self.moe_unpermute_reduce_ep.0);
+            let ctas = vec8.then_some(crate::layers::glm_sp_moe_seam::UNPERMUTE_CTAS);
+            let e4m3 = e4m3_scales.filter(|_| self.down_e4m3.is_some());
+            // The unpermute kernels' producers of a fused reduce-scatter.
+            let fused_kernel = (vec8 || e4m3.is_some())
+                .then(|| {
+                    let name = match e4m3 {
+                        Some(_) => "moe_unpermute_rs_fused_vec8_e4m3",
+                        None => "moe_unpermute_rs_fused_vec8",
+                    };
+                    ctx.gpu
+                        .op_cache()
+                        .kernel(ctx.gpu, "moe_unpermute_fused", name)
+                        .ok()
+                })
+                .flatten();
+            use crate::layers::glm_sp_moe_seam::Produce;
+            return crate::layers::glm_sp_moe_seam::begin(
+                sp,
+                &blocks,
+                output,
+                blend,
+                fused_kernel.is_some(),
+                ctx,
+                stream,
+                |produce| match produce {
+                    Produce::Fused(plan) => crate::layers::glm_sp_moe_seam::unpermute_rs_fused(
+                        ctx.gpu,
+                        fused_kernel.expect("a fused seam without its producer"),
+                        expert_down_out,
+                        output,
+                        (token_to_perm, indices_dev, weights_dev),
+                        h,
+                        top_k,
+                        (start as u32, end as u32),
+                        // A short grid, as the blocked seam's (job 51's best).
+                        ctas.unwrap_or(32),
+                        e4m3,
+                        plan.words(),
+                        stream,
+                    ),
+                    Produce::Block((r0, rows)) => {
+                        for part in 0..sp.ranks {
+                            let t0 = part * sp.rows + r0;
+                            ops::moe_unpermute_reduce_indexed_ep_grid(
+                                ctx.gpu,
+                                self.ep_reduce_kernel(e4m3_scales),
+                                expert_down_out,
+                                output.offset(t0 * row),
+                                token_to_perm.offset(t0 * route),
+                                indices_dev.offset(t0 * route),
+                                weights_dev.offset(t0 * route),
+                                h,
+                                rows as u32,
+                                top_k,
+                                start as u32,
+                                end as u32,
+                                ctas.unwrap_or(rows as u32),
+                                e4m3_scales,
+                                stream,
+                            )?;
+                        }
+                        Ok(())
+                    }
+                },
+            );
+        }
         // ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE: under SP, the unpermute of the
         // rows the peer needs first, their reduce-scatter on the wire while
         // the rest unpermute (`layers::qwen4exp_sp_pipe`).
@@ -106,6 +212,7 @@ impl MoeLayer {
         let blended = !rs_done
             && self.unpermute_ep_prefill(
                 expert_down_out,
+                e4m3_scales,
                 output,
                 token_to_perm,
                 indices_dev,

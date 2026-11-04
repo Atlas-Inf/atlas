@@ -26,6 +26,8 @@ use support::{Rng, bf16_bits_to_f32, f32_to_bf16_bits, rd_u32, up_u16, up_u32};
 
 #[path = "dflash2_selector_exact/geometry.rs"]
 mod geometry;
+#[path = "dflash2_selector_exact/split.rs"]
+mod split_tests;
 #[path = "dflash2_selector_exact/timing.rs"]
 mod timing;
 
@@ -254,43 +256,113 @@ fn split(
     order: [usize; 2],
     words: usize,
 ) -> Result<Vec<u32>> {
-    let shares = [(0, cut), (cut, VOCAB - cut)];
     let mut lists = Vec::new();
-    for (first, columns) in shares {
-        let share: Vec<u16> = (0..GAMMA)
-            .flat_map(|r| inp.logits[r * VOCAB + first..r * VOCAB + first + columns].to_vec())
-            .collect();
-        let d_share = up_u16(gpu, &share)?;
-        let scratch_bytes = ops::dflash2_selector_scratch_bytes(GAMMA);
-        let d_scratch = gpu.alloc(scratch_bytes)?;
-        gpu.memset(d_scratch, 0, scratch_bytes)?;
+    for (first, columns) in [(0, cut), (cut, VOCAB - cut)] {
         let d_lists = gpu.alloc(ops::dflash2_selector_lists_bytes(GAMMA))?;
-        // Twice over one scratch: the row tickets must be reset.
-        for _ in 0..2 {
-            ops::dflash2_selector_topk(
-                gpu,
-                topk,
-                d_share,
-                columns as u32,
-                columns as u32,
-                first as u32,
-                GAMMA as u32,
-                d_lists,
-                d_scratch,
-                stream,
-            )?;
-        }
-        gpu.synchronize(stream)?;
-        gpu.free(d_share)?;
-        gpu.free(d_scratch)?;
+        share_lists(gpu, stream, topk, inp, (first, columns), d_lists)?;
         lists.push(d_lists);
     }
+    let out = walk_lists(
+        gpu,
+        stream,
+        walk,
+        inp,
+        ops::SelectorLists::Pair([lists[order[0]], lists[order[1]]]),
+        words,
+    );
+    for p in lists {
+        gpu.free(p)?;
+    }
+    out
+}
+
+/// The TP4 chain's selector over `inp`: `dflash2_selector_topk` over each
+/// of four CTA-aligned quarters of the vocabulary (`rank_split::share`) into
+/// rank-ordered slots of one buffer, as the chain gathers them, then the
+/// `_ranks` `walk` over the four.
+fn split4(
+    gpu: &dyn GpuBackend,
+    stream: u64,
+    topk: KernelHandle,
+    walk: KernelHandle,
+    inp: &Inputs,
+    words: usize,
+) -> Result<Vec<u32>> {
+    let stride = ops::dflash2_selector_lists_bytes(GAMMA);
+    let base = gpu.alloc(4 * stride)?;
+    let cut = |r: usize| {
+        if r == 4 {
+            VOCAB
+        } else {
+            VOCAB * r / 4 / 16 * 16
+        }
+    };
+    for r in 0..4 {
+        let share = (cut(r), cut(r + 1) - cut(r));
+        share_lists(gpu, stream, topk, inp, share, base.offset(r * stride))?;
+    }
+    let lists = ops::SelectorLists::Ranks {
+        base,
+        stride,
+        count: 4,
+    };
+    let out = walk_lists(gpu, stream, walk, inp, lists, words);
+    gpu.free(base)?;
+    out
+}
+
+/// `dflash2_selector_topk` over the logits columns `[first, first +
+/// columns)` of `inp`, held alone as a rank holds its share, into `d_lists`.
+fn share_lists(
+    gpu: &dyn GpuBackend,
+    stream: u64,
+    topk: KernelHandle,
+    inp: &Inputs,
+    (first, columns): (usize, usize),
+    d_lists: DevicePtr,
+) -> Result<()> {
+    let share: Vec<u16> = (0..GAMMA)
+        .flat_map(|r| inp.logits[r * VOCAB + first..r * VOCAB + first + columns].to_vec())
+        .collect();
+    let d_share = up_u16(gpu, &share)?;
+    let scratch_bytes = ops::dflash2_selector_scratch_bytes(GAMMA);
+    let d_scratch = gpu.alloc(scratch_bytes)?;
+    gpu.memset(d_scratch, 0, scratch_bytes)?;
+    // Twice over one scratch: the row tickets must be reset.
+    for _ in 0..2 {
+        ops::dflash2_selector_topk(
+            gpu,
+            topk,
+            d_share,
+            columns as u32,
+            columns as u32,
+            first as u32,
+            GAMMA as u32,
+            d_lists,
+            d_scratch,
+            stream,
+        )?;
+    }
+    gpu.synchronize(stream)?;
+    gpu.free(d_share)?;
+    gpu.free(d_scratch)
+}
+
+/// `walk` over `lists` into `words` output words.
+fn walk_lists(
+    gpu: &dyn GpuBackend,
+    stream: u64,
+    walk: KernelHandle,
+    inp: &Inputs,
+    lists: ops::SelectorLists,
+    words: usize,
+) -> Result<Vec<u32>> {
     let d_out = gpu.alloc(words * 4)?;
     gpu.memset(d_out, 0xff, words * 4)?;
     ops::dflash2_selector_walk(
         gpu,
         walk,
-        [lists[order[0]], lists[order[1]]],
+        lists,
         inp.d_proj,
         inp.d_pred,
         inp.d_succ,
@@ -306,18 +378,27 @@ fn split(
     )?;
     gpu.synchronize(stream)?;
     let out = rd_u32(gpu, d_out, words)?;
-    for p in lists.into_iter().chain([d_out]) {
-        gpu.free(p)?;
-    }
+    gpu.free(d_out)?;
     Ok(out)
 }
 
-/// `(topk, walk, walk with confidences)`, when this build ships them.
-fn split_kernels(gpu: &dyn GpuBackend) -> Result<(KernelHandle, KernelHandle, KernelHandle)> {
+/// `(topk, walk, walk with confidences)`, when this build ships them: the
+/// pair's two-list walks, or with `ranks` the chain's.
+fn split_kernels(
+    gpu: &dyn GpuBackend,
+    ranks: bool,
+) -> Result<(KernelHandle, KernelHandle, KernelHandle)> {
+    let ranked = if ranks { "_ranks" } else { "" };
     Ok((
         gpu.kernel("dflash2_candidate_selector", "dflash2_selector_topk")?,
-        gpu.kernel("dflash2_candidate_selector", "dflash2_selector_walk")?,
-        gpu.kernel("glm_dflash2_selector_conf", "dflash2_selector_walk_conf")?,
+        gpu.kernel(
+            "dflash2_candidate_selector",
+            &format!("dflash2_selector_walk{ranked}"),
+        )?,
+        gpu.kernel(
+            "glm_dflash2_selector_conf",
+            &format!("dflash2_selector_walk{ranked}_conf"),
+        )?,
     ))
 }
 
@@ -390,52 +471,5 @@ fn selector_drafts_match_the_reference_kernel() -> Result<()> {
         }
     }
     assert!(mismatches.is_empty(), "drafts moved on {mismatches:?}");
-    Ok(())
-}
-
-/// The rank split's two launches pick the fused kernel's tokens and
-/// confidences, bit for bit, at the split's cut (the largest 16-row boundary
-/// at or under half the vocabulary), at an uneven cut and with the lists in
-/// either order.
-#[test]
-#[ignore = "requires CUDA GPU + non-stub kernel build"]
-fn split_selector_matches_the_fused_kernel() -> Result<()> {
-    let (gpu, stream) = setup()?;
-    let (prod, conf) = kernels(&gpu)?;
-    let (topk, walk, walk_conf) = split_kernels(&gpu)?;
-    for case in CASES {
-        let inp = inputs(&gpu, case)?;
-        let tokens = fused(&gpu, stream, prod, &inp, GAMMA)?;
-        let twin = fused(&gpu, stream, conf, &inp, 2 * GAMMA)?;
-        for (cut, order) in [
-            (VOCAB / 2 / 16 * 16, [0, 1]),
-            (VOCAB / 2 / 16 * 16, [1, 0]),
-            (1000, [0, 1]),
-        ] {
-            let got = split(&gpu, stream, topk, walk, &inp, cut, order, GAMMA)?;
-            assert_eq!(
-                got, tokens,
-                "{} cut {cut} {order:?}: split picks differ",
-                case.name
-            );
-            let got = split(&gpu, stream, topk, walk_conf, &inp, cut, order, 2 * GAMMA)?;
-            assert_eq!(
-                got, twin,
-                "{} cut {cut} {order:?}: split confidences differ",
-                case.name
-            );
-        }
-        println!("SPLIT {} matches the fused kernel", case.name);
-        for p in [
-            inp.d_logits,
-            inp.d_proj,
-            inp.d_pred,
-            inp.d_succ,
-            inp.d_anchor,
-            inp.d_ban,
-        ] {
-            gpu.free(p)?;
-        }
-    }
     Ok(())
 }

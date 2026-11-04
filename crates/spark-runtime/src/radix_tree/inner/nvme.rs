@@ -99,24 +99,22 @@ impl RadixTreeInner {
     /// `None` when every droppable on-disk block of the class is hotter than
     /// the candidate (or none is droppable).
     ///
-    /// With several classes a chain's last block of `class` may sit just
-    /// above a leaf of another class (a latent shard's chains alternate): it
-    /// is droppable together with those leaves, so a full class can always
-    /// trim a chain's tail.
+    /// With several classes a chain's last block of `class` can sit up to
+    /// `classes - 1` edges above its leaf. Drop that bounded on-disk tail,
+    /// including branches, but never a resident or pinned descendant.
     fn alloc_slot(&mut self, cold_access: u64, class: u32) -> Option<u32> {
         if let Some(s) = self.nvme.as_mut()?.take_free_slot(class) {
             return Some(s);
         }
         let idx = self.nvme.as_ref()?;
-        let leaf = |id: NodeId| self.nodes[id].children.is_empty();
-        let victim = idx.lru.iter().copied().find(|&(_, Reverse(id))| {
-            let n = &self.nodes[id];
-            let tail = leaf(id) || (idx.classes > 1 && n.children.values().all(|&c| leaf(c)));
-            tail && n.ref_count <= 1 && slot_class(n.nvme_slot, idx.classes) == class
+        let victim = idx.lru.iter().find_map(|&(access, Reverse(id))| {
+            (slot_class(self.nodes[id].nvme_slot, idx.classes) == class)
+                .then(|| self.droppable_disk_tail(id, idx.classes - 1))
+                .flatten()
+                .map(|nodes| (access, id, nodes))
         });
         match victim {
-            Some((access, Reverse(id))) if access <= cold_access => {
-                let nodes = 1 + self.nodes[id].children.len() as u64;
+            Some((access, id, nodes)) if access <= cold_access => {
                 let freed = self.drop_subtree(id);
                 debug_assert!(freed.is_empty(), "on-disk tail held resident blocks");
                 let idx = self.nvme.as_mut()?;
@@ -125,6 +123,17 @@ impl RadixTreeInner {
             }
             _ => None,
         }
+    }
+
+    /// Number of records in a fully droppable tail, bounded by shard width.
+    fn droppable_disk_tail(&self, id: NodeId, depth: u32) -> Option<u64> {
+        let n = &self.nodes[id];
+        if !self.is_on_disk(id) || n.ref_count > 1 || (depth == 0 && !n.children.is_empty()) {
+            return None;
+        }
+        n.children.values().try_fold(1, |count, &child| {
+            Some(count + self.droppable_disk_tail(child, depth - 1)?)
+        })
     }
 
     /// Spill-mode eviction: like [`Self::evict`] but the victim's block is

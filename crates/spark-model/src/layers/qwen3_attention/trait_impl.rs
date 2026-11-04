@@ -52,6 +52,18 @@ impl TransformerLayer for Qwen3AttentionLayer {
         self.prefill_glm_passengers_mla(num_tokens, seq_len_start, passengers, cache, ctx, stream)
     }
 
+    fn prefill_glm_packed(
+        &self,
+        _hidden: DevicePtr,
+        total: usize,
+        owners: &mut [crate::layer::glm_packed::GlmPackedOwner<'_>],
+        cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.prefill_glm_packed_mla(total, owners, cache, ctx, stream)
+    }
+
     fn uses_local_mla_prefill(&self) -> bool {
         // GLM-5 prefill (`prefill_attention_paged_glm_dense`) absorbs Q and
         // reads the complete paged latent + index history, exactly as chunk 1+
@@ -451,22 +463,8 @@ impl TransformerLayer for Qwen3AttentionLayer {
         packed_ptrs_t: DevicePtr,
         scale_ptrs_t: DevicePtr,
     ) {
-        if let FfnComponent::Moe(moe) = &mut self.ffn {
-            moe.set_down_transpose_scratch(
-                scratch_packed,
-                scratch_scale,
-                packed_ptrs_t,
-                scale_ptrs_t,
-            );
-        }
-        if let Some(FfnComponent::Moe(moe)) = self.moe_ffn.as_mut() {
-            moe.set_down_transpose_scratch(
-                scratch_packed,
-                scratch_scale,
-                packed_ptrs_t,
-                scale_ptrs_t,
-            );
-        }
+        let scratch = [scratch_packed, scratch_scale, packed_ptrs_t, scale_ptrs_t];
+        moe_transpose::set_moe_down_transpose_scratch_inner(self, scratch);
     }
 
     fn transpose_moe_for_prefill_unified(

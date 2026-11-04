@@ -248,9 +248,9 @@ impl TransformerModel {
         // verified) and is the shape a bonus-token off-by-one would take —
         // e.g. DFlash passing `gamma` instead of `gamma + 1` as `k` while
         // passing `num_accepted + 1`. Today `verify_dflash_step.rs` passes
-        // `k_verify = drafts.len() + 1` against `total_accepted =
-        // num_accepted + 1`, so the two agree; this catches the day they
-        // stop agreeing.
+        // `k_verify = tokens.len()` (the verified rows, `drafts.len() + 1` or
+        // more) against `total_accepted = num_accepted + 1`, so the two
+        // agree; this catches the day they stop agreeing.
         if num_accepted > k {
             anyhow::bail!(
                 "commit_accepted_prefix: num_accepted ({num_accepted}) > k ({k}) — more \

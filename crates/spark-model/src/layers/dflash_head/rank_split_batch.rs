@@ -16,6 +16,7 @@ use spark_comm::CommBackend;
 
 use super::BlockDiffusionDraftHead;
 use super::batch_forward::BatchLayerArgs;
+use super::forward_block_layer_paged::AttnPhases;
 use super::rank_split::{Frame, Graphs, Piece, RankSplit, SplitOps, Swap, walk};
 
 impl BlockDiffusionDraftHead {
@@ -47,7 +48,7 @@ impl BlockDiffusionDraftHead {
             && tiers
             && staged
             && head_twin
-            && comm.supports_exchange_async(split.max_bytes_at(rows)))
+            && split.carries(comm, split.max_bytes_at(rows)))
         .then_some((split, comm, rows))
     }
 
@@ -58,6 +59,11 @@ impl BlockDiffusionDraftHead {
             inter: self.batch_mlp_gate,
             acc: self.batch_mlp_down,
             logits: self.batch_logits,
+            q: self.batch_q,
+            k: self.batch_k,
+            v: self.batch_v,
+            attn: self.batch_attn_out,
+            attn_proj: self.batch_attn_proj,
             ..Frame::serial(&self.scratch)
         }
     }
@@ -108,6 +114,9 @@ impl SplitOps for BatchWalk<'_> {
         let (head, a) = (self.head, &self.a);
         match piece {
             Piece::Attention(l) => head.batched_attention(l, a),
+            Piece::AttnPre(l) => head.batched_attention_phases(l, a, AttnPhases::BEFORE),
+            Piece::AttnCore(l) => head.batched_attention_phases(l, a, AttnPhases::AFTER),
+            Piece::ProjectRest(l) => head.batched_project_phases(l, a, AttnPhases::AFTER),
             Piece::Project(l) => head.batched_project(l, a),
             Piece::Residual(l) => head.batched_residual(l, a),
             Piece::Post(l) => {
@@ -117,8 +126,16 @@ impl SplitOps for BatchWalk<'_> {
             }
             Piece::Norm => head.batched_final_norm(a.batch_rows, a.ctx, a.stream),
             Piece::Tail => head.run_batched_tail_base(a.batch_rows, a.ctx, a.stream),
+            // With the candidate swap the logits are not joined: the batched
+            // selector walks the lists (`run_batched_dflash2_tail`).
+            Piece::Select if self.split.plan().topk => Ok(()),
             Piece::Select => head.batched_argmax(a.batch_rows, a.ctx, a.stream),
-            Piece::GateUp(_) | Piece::Down(_) | Piece::Vocab | Piece::TopK => {
+            Piece::GateUp(_)
+            | Piece::Down(_)
+            | Piece::Vocab
+            | Piece::TopK
+            | Piece::Qkv(_)
+            | Piece::OProj(_) => {
                 head.split_piece(self.split, piece, 0, a.ctx.gpu, &self.frame, a.stream)
             }
             Piece::CtxFc(_) | Piece::CtxNorm(_) | Piece::CtxKv(_) => {

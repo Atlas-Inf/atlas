@@ -219,7 +219,7 @@ fn pass_on(
             layer_dims: vec![],
             cache_blocks_per_seq: None,
         };
-        let spec = shard::spec(RANK, &kv_config, BLOCKS * 16 - 64, 256.max(rows));
+        let spec = shard::spec((RANK, 2), &kv_config, BLOCKS * 16 - 64, 256.max(rows));
         let mut cache = match sharded {
             true => PagedKvCache::new_latent_sharded(kv_config, BLOCKS, gpu, spec).unwrap(),
             false => PagedKvCache::new(kv_config, BLOCKS, gpu).unwrap(),

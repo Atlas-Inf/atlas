@@ -249,7 +249,7 @@ fn send_segment(
 /// is 50,000 us and the naps stay the legacy ones: the head's next step
 /// words come a drafter pass (6-16 ms) after its last collective and must
 /// not meet a napping proxy, while a nap between requests costs nothing.
-struct Idle {
+pub(super) struct Idle {
     spin: Option<Duration>,
     nap: Duration,
     since: Option<Instant>,
@@ -257,7 +257,7 @@ struct Idle {
 }
 
 impl Idle {
-    fn from_env(oneshot: bool, cmd: bool) -> Self {
+    pub(super) fn from_env(oneshot: bool, cmd: bool) -> Self {
         let us = |key: &str| std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok());
         let fine = us("ATLAS_RDMA_PAIR_SPIN_US").or(oneshot.then_some(10_000));
         let spin = fine.or(cmd.then_some(50_000)).map(Duration::from_micros);
@@ -275,12 +275,12 @@ impl Idle {
         }
     }
 
-    fn reset(&mut self) {
+    pub(super) fn reset(&mut self) {
         self.since = None;
         self.spins = 0;
     }
 
-    fn wait(&mut self) {
+    pub(super) fn wait(&mut self) {
         let napping = match self.spin {
             None => {
                 self.spins = self.spins.saturating_add(1);

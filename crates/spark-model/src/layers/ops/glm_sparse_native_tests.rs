@@ -100,5 +100,25 @@ fn native_sparse_context_limit_is_a_fallback_boundary() {
     assert!(plan::admit(4096, 32768, false, false, false).is_none());
 }
 
+#[test]
+fn tp4_native_sparse_validates_actual_sixteen_head_arena() {
+    let mut c = config();
+    c.tp_world_size = 4;
+    c.ep_world_size = 4;
+    c.num_attention_heads = 16;
+    c.num_key_value_heads = 16;
+    c.linear_num_key_heads = 16;
+    c.linear_num_value_heads = 16;
+    for rows in [4100, 16384] {
+        c.max_batch_tokens = rows;
+        validate_startup(&c, rows, 32768, 16, 4, KvCacheDtype::Fp8G128, &[]).unwrap();
+    }
+    c.num_attention_heads = 32;
+    assert!(validate_geometry(&c).is_err());
+    c.num_attention_heads = 16;
+    c.ep_world_size = 2;
+    assert!(validate_geometry(&c).is_err());
+}
+
 #[path = "glm_sparse_native_dispatch_tests.rs"]
 mod dispatch_tests;

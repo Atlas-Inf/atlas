@@ -12,6 +12,8 @@ use spark_runtime::{
 pub(super) mod compare;
 const FLAG: &str = "ATLAS_GLM_K3_MLA_O_BATCHM";
 const PREFIX: usize = 2 * 128 * 2; // index keys and gates, both BF16
+/// A staged V row of a TP2 rank (32 heads x 256), the widest; a TP4 rank's
+/// 16 heads stage half as wide.
 const ROW: usize = 8192 * 2;
 const OUTPUT_ROW: usize = 4096 * 2;
 /// Widest verify block the staged MLA projections admit. One batched GEMV
@@ -22,7 +24,7 @@ const _: () = assert!(MAX_ROWS <= ops::DENSE_GEMV_BATCHM_MAX_M as usize);
 pub(in crate::layers::qwen3_attention) fn rows_supported(rows: usize) -> bool {
     (2..=MAX_ROWS).contains(&rows)
 }
-/// Index key/gate prefix plus every retained V row.
+/// Index key/gate prefix plus every retained V row, at the widest rows.
 pub(in crate::layers::qwen3_attention) const fn scratch_bytes(rows: usize) -> usize {
     PREFIX + rows * ROW
 }
@@ -46,10 +48,14 @@ pub(crate) fn enabled(model: &str) -> Result<bool> {
         Err(_) => bail!("{FLAG} must be 0 or 1"),
     }
 }
+/// The O projection's local input width: 16 or 32 heads x 256.
+fn width_supported(k: usize) -> bool {
+    matches!(k, 4096 | 8192)
+}
 fn validate_weight(ptr: DevicePtr, n: usize, k: usize) -> Result<()> {
     ensure!(
-        n == 4096 && k == 8192 && ptr.0 != 0 && ptr.0.is_multiple_of(16),
-        "{FLAG} requires aligned resident BF16 O[4096,8192]"
+        n == 4096 && width_supported(k) && ptr.0 != 0 && ptr.0.is_multiple_of(16),
+        "{FLAG} requires aligned resident BF16 O[4096,4096|8192]"
     );
     Ok(())
 }
@@ -69,15 +75,13 @@ pub(crate) fn initialize(
     }
     ensure!(
         config.hidden_size == 4096
-            && config.num_attention_heads == 32
+            && ops::glm_sparse_tc_rank(config)
             && config.v_head_dim == 256
             && config.qk_rope_head_dim == 0
-            && config.tp_world_size == 2
-            && config.ep_world_size == 2
             && matches!(dtype, KvCacheDtype::Bf16 | KvCacheDtype::Fp8G128)
             && super::glm_long_context::enabled(&config.model_type)
             && crate::speculative::glm_repair_policy::long_lane_enabled(),
-        "{FLAG} requires repaired long-context GLM TP2/EP2 BF16 MLA"
+        "{FLAG} requires repaired long-context GLM TP2/EP2 or TP4/EP4 BF16 MLA"
     );
     validate_weight(ptr, n, k)?;
     if compare {
@@ -96,7 +100,7 @@ pub(crate) fn initialize(
         "{FLAG}: batchm kernel unavailable"
     );
     tracing::info!(
-        "GLM K3 MLA O batchm initialized: local BF16 [4096,8192], causal serial attention"
+        "GLM K3 MLA O batchm initialized: local BF16 [4096,{k}], causal serial attention"
     );
     Ok(())
 }
@@ -115,13 +119,17 @@ fn disjoint(a: (u64, u64), b: (u64, u64)) -> bool {
 #[derive(Clone, Copy)]
 pub(in crate::layers::qwen3_attention) struct StagePlan {
     rows: usize,
+    /// Elements of a staged row (the O projection's K).
+    width: usize,
     input: DevicePtr,
     output: DevicePtr,
     comparison: Option<DevicePtr>,
 }
 impl StagePlan {
+    /// `rows` staged rows of `width` elements (16 or 32 heads x 256).
     pub(in crate::layers::qwen3_attention) fn new(
         rows: usize,
+        width: usize,
         scratch: DevicePtr,
         capacity: usize,
         output: DevicePtr,
@@ -129,10 +137,11 @@ impl StagePlan {
         live: &[(DevicePtr, usize)],
     ) -> Result<Self> {
         ensure!(
-            rows_supported(rows),
-            "{FLAG}: {rows} staged rows outside 2..={MAX_ROWS}"
+            rows_supported(rows) && width_supported(width),
+            "{FLAG}: {rows} staged rows outside 2..={MAX_ROWS}, or width {width}"
         );
-        let (scratch_bytes, output_bytes) = (scratch_bytes(rows), output_bytes(rows));
+        let scratch_bytes = PREFIX + rows * width * 2;
+        let output_bytes = output_bytes(rows);
         ensure!(
             capacity >= scratch_bytes && output_capacity >= output_bytes,
             "{FLAG}: {rows} rows need {scratch_bytes} scratch bytes and {output_bytes} output bytes"
@@ -154,6 +163,7 @@ impl StagePlan {
         }
         Ok(Self {
             rows,
+            width,
             input: DevicePtr(retained.0),
             output,
             comparison: None,
@@ -165,7 +175,11 @@ impl StagePlan {
             "{FLAG}: staging row {i} outside {}",
             self.rows
         );
-        Ok(self.input.offset(i * ROW))
+        Ok(self.input.offset(i * self.width * 2))
+    }
+    /// Elements of a staged row (the O projection's K).
+    pub(in crate::layers::qwen3_attention) fn width(&self) -> usize {
+        self.width
     }
     /// Whether the scalar comparison is on (it reads the BF16 weight).
     pub(in crate::layers::qwen3_attention) fn comparing(&self) -> bool {
@@ -190,7 +204,7 @@ impl StagePlan {
         )? {
             return Ok(());
         }
-        validate_weight(weight.weight, 4096, 8192)?;
+        validate_weight(weight.weight, 4096, self.width)?;
         ensure!(kernel.0 != 0, "{FLAG}: batchm kernel unavailable");
         ops::dense_gemv_batchm(
             gpu,
@@ -200,7 +214,7 @@ impl StagePlan {
             self.comparison.unwrap_or(self.output),
             self.rows as u32,
             4096,
-            8192,
+            self.width as u32,
             4096,
             stream,
         )

@@ -39,7 +39,21 @@ fn spec(rank: usize) -> LatentShardSpec {
 /// Rank `rank`'s GLM-5.3-shaped cache (FP8-G128 latent, V aliasing K, BF16
 /// pooled index), with the tier's lanes attached when `path` is set.
 fn sharded(gpu: &MockGpuBackend, rank: usize, blocks: usize, fast: Option<bool>) -> PagedKvCache {
-    let mut c = PagedKvCache::new_latent_sharded(config(), blocks, gpu, spec(rank)).unwrap();
+    sharded_world(gpu, rank, 2, blocks, fast)
+}
+
+fn sharded_world(
+    gpu: &dyn GpuBackend,
+    rank: usize,
+    world: usize,
+    blocks: usize,
+    fast: Option<bool>,
+) -> PagedKvCache {
+    let shard = LatentShardSpec {
+        world,
+        ..spec(rank)
+    };
+    let mut c = PagedKvCache::new_latent_sharded(config(), blocks, gpu, shard).unwrap();
     c.attach_sparse_index(SparseIndexCacheConfig::bf16(4, 128), gpu)
         .unwrap();
     if let Some(fast) = fast {
@@ -54,6 +68,83 @@ fn sharded(gpu: &MockGpuBackend, rank: usize, blocks: usize, fast: Option<bool>)
         }
     }
     c
+}
+
+#[test]
+fn tp4_geometry_counts_all_three_peer_lanes() {
+    for rank in 0..4 {
+        let gpu = MockGpuBackend::new();
+        let c = sharded_world(&gpu, rank, 4, 16, None);
+        let g = c.nvme_geometry();
+        assert_eq!(g.classes(), 4);
+        assert_eq!(
+            g,
+            PagedKvCache::nvme_geometry_for(
+                &config(),
+                true,
+                Some(SparseIndexCacheConfig::bf16(4, 128)),
+                Some(4)
+            )
+        );
+        assert_eq!(g.row_bytes(), g.own + 3 * g.peer.unwrap());
+        for fast in [false, true] {
+            let expected: usize = (0..4)
+                .map(|class| PagedKvCache::nvme_staging_bytes(g.class_bytes(class, rank), fast))
+                .sum();
+            assert_eq!(g.staging_bytes(fast), expected);
+        }
+    }
+}
+
+#[test]
+fn tp4_all_lanes_round_trip_and_bound_faults_on_both_paths() {
+    for fast in [false, true] {
+        for rank in 0..4 {
+            let gpu = MockGpuBackend::new();
+            let mut c = sharded_world(&gpu, rank, 4, 32, Some(fast));
+            let source: Vec<u32> = (0..8).map(|l| c.alloc_block_at(l).unwrap()).collect();
+            let want: Vec<Vec<u8>> = source
+                .iter()
+                .enumerate()
+                .map(|(l, &b)| {
+                    fill(&c, &gpu, b, 20 + l as u8);
+                    dump(&c, &gpu, b)
+                })
+                .collect();
+            let orders: Vec<SpillOrder> = source
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(l, &block)| SpillOrder {
+                    block,
+                    slot: l as u32,
+                    tag: tag(l as u32),
+                })
+                .collect();
+            assert!(c.nvme_write(&orders, &gpu, 0).is_empty());
+            for bad in 0..=8 {
+                let disk: Vec<DiskRef> = (0..8)
+                    .map(|l| DiskRef {
+                        slot: l as u32,
+                        tag: if l == bad { 1 } else { tag(l as u32) },
+                    })
+                    .collect();
+                let mut targets: Vec<u32> = (0..8).map(|l| c.alloc_block_at(l).unwrap()).collect();
+                assert_eq!(c.nvme_read(&disk, &mut targets, &gpu, 0), (bad, bad < 8));
+                for (l, &b) in targets[..bad].iter().enumerate() {
+                    assert_eq!(b as usize % 4, l % 4);
+                    assert_eq!(
+                        dump(&c, &gpu, b),
+                        want[l],
+                        "rank={rank} fast={fast} block={l}"
+                    );
+                }
+                c.free_blocks(&targets);
+            }
+            assert!(c.nvme_take_failed().is_empty());
+            c.release(&gpu).unwrap();
+        }
+    }
 }
 
 /// Every region this rank holds for `block`: the latents when it owns the
@@ -72,7 +163,7 @@ fn regions(c: &PagedKvCache, block: u32) -> Vec<(DevicePtr, usize)> {
     out
 }
 
-fn fill(c: &PagedKvCache, gpu: &MockGpuBackend, block: u32, seed: u8) {
+fn fill(c: &PagedKvCache, gpu: &dyn GpuBackend, block: u32, seed: u8) {
     for (i, (ptr, len)) in regions(c, block).into_iter().enumerate() {
         let bytes: Vec<u8> = (0..len)
             .map(|j| seed.wrapping_add((i * 31 + j) as u8))
@@ -81,7 +172,7 @@ fn fill(c: &PagedKvCache, gpu: &MockGpuBackend, block: u32, seed: u8) {
     }
 }
 
-fn dump(c: &PagedKvCache, gpu: &MockGpuBackend, block: u32) -> Vec<u8> {
+fn dump(c: &PagedKvCache, gpu: &dyn GpuBackend, block: u32) -> Vec<u8> {
     let mut out = Vec::new();
     for (ptr, len) in regions(c, block) {
         let mut b = vec![0u8; len];
@@ -104,7 +195,7 @@ fn tag(slot: u32) -> u64 {
 fn each_rank_has_a_full_lane_and_an_index_only_lane() {
     let gpu = MockGpuBackend::new();
     let index = SparseIndexCacheConfig::bf16(4, 128);
-    let unsharded = PagedKvCache::nvme_geometry_for(&config(), true, Some(index), false);
+    let unsharded = PagedKvCache::nvme_geometry_for(&config(), true, Some(index), None);
     assert_eq!(unsharded.peer, None);
     assert_eq!(unsharded.classes(), 1);
     // Per layer: latent 16×528 = 8448, index 4×128×2 = 1024; + 24 B trailer.
@@ -122,7 +213,7 @@ fn each_rank_has_a_full_lane_and_an_index_only_lane() {
         assert_eq!(g.class_bytes(1 - rank, rank), index_only);
         assert_eq!(g.row_bytes(), full + index_only);
         assert_eq!(
-            PagedKvCache::nvme_geometry_for(&config(), true, Some(index), true),
+            PagedKvCache::nvme_geometry_for(&config(), true, Some(index), Some(2)),
             g,
             "sized before the cache exists exactly as after"
         );
@@ -371,3 +462,7 @@ fn an_unsharded_cache_keeps_its_one_lane() {
     assert_eq!(c.nvme_class_record_bytes(0), c.nvme_record_bytes());
     assert_eq!(c.nvme_block_record_bytes(), c.nvme_record_bytes());
 }
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[path = "nvme_shard_gpu.rs"]
+mod gpu_tests;

@@ -343,3 +343,38 @@ fn issue_517_tool_capped_ceiling_leaves_room_for_tool_call() {
     assert_eq!(tb, Some(230));
     assert!(tb.unwrap() < 256);
 }
+
+#[test]
+fn no_server_budget_leaves_only_an_explicit_client_budget() {
+    // GLM-5.3 (`max_thinking_budget = 0`): like vLLM, the server never
+    // closes reasoning on its own. Effort levels and budgetless requests
+    // resolve to no budget; a stated token budget is the sole cap.
+    use crate::ir::EffortLevel::*;
+    let p = Policy {
+        model_default: true,
+        max_thinking_budget: 0,
+        cap_at_max_tokens: false,
+        ..policy()
+    };
+    for directive in [
+        ThinkingDirective::Unspecified,
+        ThinkingDirective::On { budget: None },
+        ThinkingDirective::OnEffort(Minimal),
+        ThinkingDirective::OnEffort(Medium),
+        ThinkingDirective::OnEffort(XHigh),
+    ] {
+        assert_eq!(
+            resolve(directive, p, 4096, true),
+            (true, None),
+            "{directive:?}"
+        );
+    }
+    assert_eq!(
+        resolve(ThinkingDirective::On { budget: Some(300) }, p, 4096, false),
+        (true, Some(300))
+    );
+    assert_eq!(
+        resolve(ThinkingDirective::Off, p, 4096, false),
+        (false, None)
+    );
+}

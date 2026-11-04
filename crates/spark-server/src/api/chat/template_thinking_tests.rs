@@ -177,3 +177,41 @@ fn qwen_tool_markers_in_schemas_stay_text() {
     let mut tools = [json!({"function": {"description": "<tool_call>"}})];
     assert_eq!(tokenizer.escape_glm_tool_markup(tools.iter_mut()), 1);
 }
+
+#[test]
+fn an_open_think_in_the_prompt_tail_turns_reasoning_on() {
+    // A template that always opens `<think>` (GLM-5.3) reasons whatever the
+    // request resolved to; the server budget then applies, and a model with
+    // none (`max_thinking_budget = 0`) gets none.
+    let open = [9, 3, START];
+    assert_eq!(
+        reconcile_prompt_thinking(&open, Some(START), Some(END), false, None, 128),
+        (true, Some(128))
+    );
+    assert_eq!(
+        reconcile_prompt_thinking(&open, Some(START), Some(END), false, None, 0),
+        (true, None)
+    );
+    // A request that already enabled thinking keeps its own budget.
+    assert_eq!(
+        reconcile_prompt_thinking(&open, Some(START), Some(END), true, Some(32), 0),
+        (true, Some(32))
+    );
+}
+
+#[test]
+fn a_closed_empty_think_block_turns_reasoning_off() {
+    for enabled in [false, true] {
+        assert_eq!(
+            reconcile_prompt_thinking(
+                &[9, START, END],
+                Some(START),
+                Some(END),
+                enabled,
+                Some(32),
+                128
+            ),
+            (false, None)
+        );
+    }
+}

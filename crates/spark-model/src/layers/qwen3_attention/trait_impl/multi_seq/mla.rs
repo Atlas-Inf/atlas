@@ -229,9 +229,8 @@ impl Qwen3AttentionLayer {
                 self.dense_gemv_batchm_k,
                 &mla.wo,
                 |input, output, rows| {
-                    self.mla_native_gemv(
-                        c.fwd.gpu, &mla.wo, input, output, rows, 4096, 8192, stream,
-                    )
+                    let k = plan.width() as u32;
+                    self.mla_native_gemv(c.fwd.gpu, &mla.wo, input, output, rows, 4096, k, stream)
                 },
                 stream,
             )?;

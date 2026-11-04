@@ -19,6 +19,9 @@ impl Glm5KdaLayer {
         h: u32,
         decode: bool,
         capture_verify_intermediates: bool,
+        // `normed`'s MXFP8 image is already in the activation scratch
+        // (`sp_quant_gather.rs`): no projection casts it again.
+        cast_done: bool,
         profile_timer: &mut Option<std::time::Instant>,
         ctx: &ForwardContext,
         stream: u64,
@@ -37,6 +40,10 @@ impl Glm5KdaLayer {
             profile::step(ctx, stream, profile_timer, "q_proj")?;
             return Ok(());
         }
+        anyhow::ensure!(
+            !cast_done || (!decode && !capture_verify_intermediates && self.qkv_w8a8()),
+            "GLM KDA: a pre-cast input needs the W8A8 prefill projections"
+        );
         // Whether Q took the Lt FP8 route, leaving `normed` cast in scratch.
         let mut q_fp8 = false;
         if fused_qkv {
@@ -74,7 +81,7 @@ impl Glm5KdaLayer {
                 p as u32,
                 h,
                 decode,
-                true,
+                !cast_done,
                 ctx,
                 stream,
             )?;

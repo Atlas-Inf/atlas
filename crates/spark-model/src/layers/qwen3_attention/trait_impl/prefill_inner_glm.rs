@@ -97,6 +97,8 @@ impl Qwen3AttentionLayer {
         site: &HcSiteWeights,
         norm_weight: &crate::weight_map::DenseWeight,
         (post, gather): (bool, bool),
+        reduced: bool,
+        extra: Option<super::super::SeamGather<'_>>,
         hidden: DevicePtr,
         normed: DevicePtr,
         sp: Option<crate::layers::glm_sp::SpRows>,
@@ -109,12 +111,15 @@ impl Qwen3AttentionLayer {
             || !ops::HcVariant::of(hc).applies_block_input_norm()
             || (post && self.post_attn_out_norm.is_some())
         {
+            crate::layers::glm_sp_moe_seam::flush(ctx, stream)?;
             return Ok(false);
         }
         super::super::hc_seam_overlapped(
             hc,
             site,
             (post, gather),
+            reduced,
+            extra,
             hidden,
             normed,
             sp,
@@ -193,7 +198,10 @@ impl Qwen3AttentionLayer {
     }
 
     /// Whether this prefill chunk takes the paged (GLM sparse) attention arm.
-    pub(super) fn glm_paged_prefill(&self, ctx: &ForwardContext) -> bool {
+    pub(in crate::layers::qwen3_attention) fn glm_paged_prefill(
+        &self,
+        ctx: &ForwardContext,
+    ) -> bool {
         // GLM semantic-index MLA runs every chunk, the first included, through
         // the paged sparse path: the dense cache-skip arm attends to every
         // earlier row (not the top-k selection) and is quadratic in the chunk.
