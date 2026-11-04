@@ -160,6 +160,33 @@ int main() {
             printf("   %-14s %8.1f us  %6.1f GB/s  %s\n", c.name, us, bytes / us / 1e3, ci == 0 ? "(reference)" : (diff == 0 ? "BIT-IDENTICAL" : "DIFFERS"));
             if (ci && diff) printf("      %zu of %zu outputs differ\n", diff, 2 * o0.size());
         }
+        for (unsigned int m4 : {4u, 2u}) {   // Loop #7: the m 2..4 tier (dual_batch4_d4 vs 2x single batch4_d4)
+            dim3 grid((N + DP4A_N_PER_BLOCK - 1) / DP4A_N_PER_BLOCK), block(256);
+            std::vector<unsigned short> d0(r0.size()), d1(r0.size()), q0(r0.size()), q1(r0.size());
+            auto dual4 = m4 == 4 ? w4a16_gemv_dp4a_dual_batch4_d4 : w4a16_gemv_dp4a_dual_batch4_d4_dyn;
+            auto single4 = m4 == 4 ? w4a16_gemv_dp4a_batch4_d4 : w4a16_gemv_dp4a_batch4_d4_dyn;
+            double us_d = 0, us_s = 0;
+            for (int arm = 0; arm < 2; ++arm) {
+                CHECK(hipMemset(dC0, 0, (size_t)M * N * 2)); CHECK(hipMemset(dC1, 0, (size_t)M * N * 2));
+                auto run = [&](int it) {
+                    unsigned char* b0 = it < 0 ? dB0 : r0b[it % NROT]; unsigned char* b1 = it < 0 ? dB1 : r1b[it % NROT];
+                    if (arm == 0) hipLaunchKernelGGL(dual4, grid, block, 0, 0, dA, dAs, b0, dS0, 1.0f, dC0, b1, dS1, 1.0f, dC1, m4, N, K);
+                    else { hipLaunchKernelGGL(single4, grid, block, 0, 0, dA, dAs, b0, dS0, 1.0f, dC0, m4, N, K);
+                           hipLaunchKernelGGL(single4, grid, block, 0, 0, dA, dAs, b1, dS1, 1.0f, dC1, m4, N, K); }
+                };
+                run(-1); CHECK(hipDeviceSynchronize());
+                CHECK(hipMemcpy(arm ? q0.data() : d0.data(), dC0, (size_t)M * N * 2, hipMemcpyDeviceToHost));
+                CHECK(hipMemcpy(arm ? q1.data() : d1.data(), dC1, (size_t)M * N * 2, hipMemcpyDeviceToHost));
+                hipEvent_t e0, e1; CHECK(hipEventCreate(&e0)); CHECK(hipEventCreate(&e1));
+                const int iters = 50; CHECK(hipEventRecord(e0));
+                for (int it = 0; it < iters; ++it) run(it);
+                CHECK(hipEventRecord(e1)); CHECK(hipEventSynchronize(e1)); float ms; CHECK(hipEventElapsedTime(&ms, e0, e1));
+                (arm ? us_s : us_d) = ms * 1000.0 / iters;
+            }
+            size_t diff = 0; for (size_t i = 0; i < (size_t)m4 * N; ++i) diff += (q0[i] != d0[i]) + (q1[i] != d1[i]);
+            printf("   m=%u dual_batch4 %8.1f us %6.1f GB/s | 2x single batch4 %8.1f us %6.1f GB/s  %s\n", m4, us_d, bytes / us_d / 1e3,
+                   us_s, bytes / us_s / 1e3, diff == 0 ? "BIT-IDENTICAL" : "DIFFERS");
+        }
         {   // Loop #6: two launches of the single-matrix w4a16_gemv_dp4a_batch8_d4 (gate, then up). Its 64 threads per
             // output split the groups across two warps exactly like the dual's two virtual lanes, with the same
             // accumulate expression and reduce -> expected BIT-IDENTICAL to the dual kernel, at the single's ~187 GB/s.
