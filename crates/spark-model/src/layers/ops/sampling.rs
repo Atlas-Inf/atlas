@@ -261,7 +261,14 @@ pub fn apply_grammar_bitmask(
 /// (`DF2_SEL_MAX_TOP_K` / `DF2_SEL_MAX_RANK`). `Dflash2CandidateSelector::new`
 /// fails fast when a checkpoint's `selector_top_k`/`selector_rank` exceeds
 /// them — pinned to the kernel defines by `tests/dflash2_selector_bounds.rs`.
-pub const DFLASH2_SELECTOR_MAX_TOP_K: usize = 16;
+pub const DFLASH2_SELECTOR_MAX_TOP_K: usize = if cfg!(atlas_hip) {
+    DFLASH2_SELECTOR_MAX_TOP_K_HIP
+} else {
+    DFLASH2_SELECTOR_MAX_TOP_K_CUDA
+};
+/// Per-tree caps: strix-hip raised to 32 for Ripple-65B's drafter (top-32).
+pub const DFLASH2_SELECTOR_MAX_TOP_K_CUDA: usize = 16;
+pub const DFLASH2_SELECTOR_MAX_TOP_K_HIP: usize = 32;
 pub const DFLASH2_SELECTOR_MAX_RANK: usize = 256;
 /// Single-sequence entry resolved by both CUDA and HIP targets.
 pub const DFLASH2_SELECTOR_SYMBOL: &str = "dflash2_candidate_selector";
@@ -269,7 +276,14 @@ pub const DFLASH2_SELECTOR_SYMBOL: &str = "dflash2_candidate_selector";
 pub const DFLASH2_SELECTOR_BANS_END_TOKENS: bool = true;
 /// Mirrors `DF2_SEL_MAX_SPLITS` / `DF2_SEL_THREADS` in the CUDA kernel.
 pub const DFLASH2_SELECTOR_MAX_SPLITS: usize = 16;
-pub const DFLASH2_SELECTOR_THREADS: u32 = 512;
+pub const DFLASH2_SELECTOR_THREADS: u32 = if cfg!(atlas_hip) {
+    DFLASH2_SELECTOR_THREADS_HIP
+} else {
+    DFLASH2_SELECTOR_THREADS_CUDA
+};
+/// The walk scores candidate c on warp c: one warp per possible candidate.
+pub const DFLASH2_SELECTOR_THREADS_CUDA: u32 = 512;
+pub const DFLASH2_SELECTOR_THREADS_HIP: u32 = 1024;
 
 /// Vocab slices per row of the fused selector: about one block per SM on
 /// GB10 over the `gamma` rows (six at gamma 8, the fastest on GLM-5.3's

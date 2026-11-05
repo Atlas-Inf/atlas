@@ -52,10 +52,13 @@
 // selector scores; github.com/knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4
 // overlay/glm_draft_trunc.py; idea only, see docs/glm-prior-art.md).
 
-#define DF2_SEL_MAX_TOP_K 16
+// 32 on strix-hip (Ripple-65B's DFlash2 drafter selects top-32; gb10 keeps 16).
+// A top-16 checkpoint selects the same tokens: every slice's top-32 contains
+// its top-16, and the merge is an exact total order.
+#define DF2_SEL_MAX_TOP_K 32
 #define DF2_SEL_MAX_RANK 256
 #define DF2_SEL_MAX_SPLITS 16
-#define DF2_SEL_THREADS 512
+#define DF2_SEL_THREADS 1024
 
 // (va, ia) precedes (vb, ib) in the total order.
 __device__ __forceinline__ bool df2_sel_before(float va, unsigned int ia, float vb, unsigned int ib) {
