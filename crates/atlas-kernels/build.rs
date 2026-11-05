@@ -497,6 +497,11 @@ fn main() {
         if let Some(ref base) = target.base_kernel_dir {
             println!("cargo:rerun-if-changed={}", base.display());
         }
+        // The `kernel_source` overlay dir is the last layer of the merge; a file
+        // ADDED there must rebuild too (per-file watches only see existing files).
+        if let Some(ref local) = target.local_kernel_dir {
+            println!("cargo:rerun-if-changed={}", local.display());
+        }
         let n_overrides: usize = target
             .overlay_dirs()
             .iter()
