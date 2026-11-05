@@ -1,0 +1,81 @@
+# Atlas kernel target: XiaomiMiMo/MiMo-V2.6-Flash — GB10, text backbone.
+#
+# 309B total / 15B active MoE (model_type "mimo_v2"):
+#   * 48 layers: 9 full attention (4 KV heads, RoPE theta 1e7) + 39 sliding
+#     window (window 128, 8 KV heads, theta 1e4, per-head attention sink)
+#   * Q/K head dim 192, V head dim 128, partial RoPE on the first 64 dims,
+#     V scaled by attention_value_scale = 0.707 (folded into o_proj)
+#   * Layer 0 dense FFN (16384), layers 1-47: 256 experts top-8, sigmoid +
+#     e_score_correction_bias (noaux_tc), no shared expert
+#   * Checkpoint: experts native MXFP4 (U8 + E8M0 `weight_scale`, group 32),
+#     qkv / dense FFN FP8 128x128 block scales (qkv stored as 4 TP chunks),
+#     o_proj BF16. ~173 GB → two Sparks with EP=2.
+#
+# Kernels: compiles deepseek-v4-flash's sources (`kernel_source`) for the
+# transcode-free E8M0 MoE GEMMs; `nvfp4/mimo_attn.cu` is the target-local
+# overlay carrying the 192/128 attention kernels (see
+# crates/spark-model/src/layers/qwen3_attention/mimo.rs).
+#
+# Phase 1 (this target): text only, BF16 KV, EP=2. MTP (3 modules in
+# model_mtp.safetensors) and the vision / audio towers are not wired.
+
+[model]
+name = "mimo-v2.6-flash"
+hf_id = "XiaomiMiMo/MiMo-V2.6-Flash-RL"
+params = "309B"
+active_params = "15B"
+architecture = "Hybrid Full/SWA Attention (QK192/V128, sinks) + 256-expert Sigmoid MoE"
+match_names = ["mimo-v2.6-flash", "mimo-v2.6-flash-rl"]
+kernel_source = "deepseek-v4-flash"
+
+layers_total = 48
+layers_full_attention = 9
+layers_sliding_attention = 39
+layer_pattern = "full at 0,5,11,17,23,29,35,41,47; sliding (window 128) elsewhere"
+
+moe_experts = 256
+moe_topk = 8
+moe_intermediate = 2048
+shared_expert_intermediate = 0
+moe_scoring_func = "sigmoid"
+moe_routing_bias = true
+
+hidden_dim = 4096
+head_dim = 192
+v_head_dim = 128
+q_heads = 64
+kv_heads = 8
+full_attention_kv_heads = 4
+rotary_dim = 64
+rope_theta = 10000000
+swa_rope_theta = 10000
+sliding_window = 128
+vocab_size = 152576
+max_position_embeddings = 1048576
+
+[[model_types]]
+model_type = "mimo_v2"
+
+[sampling.general]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+
+[sampling.thinking]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+
+[sampling.coding]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+
+[behavior]
+enable_loop_watchdog = true
+thinking_default = false
+# The MiMo attention path (mimo.rs) only reads/writes a BF16 paged cache.
+default_kv_dtype = "bf16"

@@ -65,11 +65,12 @@ pub(super) fn glm5_series(model_type: &str) -> bool {
 }
 
 /// Native-MXFP4 (E8M0) MoE scale-format family: deepseek-v4-flash,
-/// glm-5.3-flash, longcat-flash-lite.
+/// glm-5.3-flash, longcat-flash-lite, mimo-v2.6-flash (compiles
+/// deepseek-v4-flash's sources).
 pub(super) fn e8m0_series(model_type: &str) -> bool {
     matches!(
         model_type,
-        "deepseek_v4" | "glm5_next" | "longcat_flash" | "longcat_flash_ngram"
+        "deepseek_v4" | "glm5_next" | "longcat_flash" | "longcat_flash_ngram" | "mimo_v2"
     )
 }
 
@@ -92,7 +93,7 @@ pub(super) fn gateup_fp4_series(model_type: &str) -> bool {
 /// declare the lookup expected-absent in their MODEL.tomls; DeepSeek-V4 and
 /// Step3.7 do not, so only those two stop issuing it.
 pub(super) fn silu_quant_fp8_issued(model_type: &str) -> bool {
-    !matches!(model_type, "deepseek_v4" | "step3p7")
+    !matches!(model_type, "deepseek_v4" | "step3p7" | "mimo_v2")
 }
 
 /// The batched router-logits GEMV (`dense_gemv_bf16_batchm` arguments and

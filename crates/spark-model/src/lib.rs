@@ -73,7 +73,10 @@ pub fn ships_vanilla_norm_weights(config: &atlas_core::config::ModelConfig) -> b
 /// The dispatch predicate itself, on the bare `model_type`, so it is unit-testable
 /// without constructing a full `ModelConfig`.
 pub fn model_type_ships_vanilla_norm_weights(model_type: &str) -> bool {
-    matches!(model_type, "deepseek_v4" | "glm5_next" | "laguna")
+    matches!(
+        model_type,
+        "deepseek_v4" | "glm5_next" | "laguna" | "mimo_v2"
+    )
 }
 
 #[cfg(test)]
@@ -88,6 +91,7 @@ mod norm_convention_tests {
         assert!(vanilla("deepseek_v4"));
         assert!(vanilla("glm5_next"));
         assert!(vanilla("laguna"));
+        assert!(vanilla("mimo_v2"));
         for other in [
             "qwen3_next",
             "qwen3_5_moe",

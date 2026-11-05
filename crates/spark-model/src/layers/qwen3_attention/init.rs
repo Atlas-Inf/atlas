@@ -179,6 +179,7 @@ impl Qwen3AttentionLayer {
             o_dense_bf16: None,
             mx8_rt: None,
             mla: None,
+            mimo: None,
             mla_mx: Vec::new(),
             mla_q4: Vec::new(),
             mla_native: Default::default(),

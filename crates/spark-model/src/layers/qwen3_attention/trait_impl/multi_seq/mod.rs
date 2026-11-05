@@ -127,7 +127,10 @@ impl Qwen3AttentionLayer {
         // MLA models (Mistral-Small-4) take the dedicated absorbed-MLA
         // batched path (issue #84). The standard `ms_phase_qkv` reads
         // `attn.q_proj`, a NULL stub for MLA loaders — see `mla.rs`.
-        let o_out = if let Some(ref _mla) = self.mla {
+        let o_out = if self.mimo.is_some() {
+            let o_out = c.fwd.buffers.moe_output();
+            self.mimo_attend_decode(c.fwd, kv_cache, c.normed, &meta, o_out, c.stream)?
+        } else if let Some(ref _mla) = self.mla {
             self.ms_mla_decode(&c, kv_cache, meta)?
         } else {
             // ── Phase 2: QKV projections (batch3 / batch2 / sequential) ──
