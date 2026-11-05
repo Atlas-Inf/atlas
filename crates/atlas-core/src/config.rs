@@ -555,6 +555,20 @@ pub struct ModelConfig {
     #[serde(default)]
     pub rotary_dim: usize,
 
+    // ── MiMo-V2 specific ──
+    /// KV heads on full-attention layers when they differ from the
+    /// sliding-window layers (MiMo-V2: 4 full vs 8 SWA). 0 = same as
+    /// `num_key_value_heads`, which holds the max across layer types.
+    #[serde(default)]
+    pub full_num_key_value_heads: usize,
+    /// RoPE theta on sliding-window layers. 0.0 = same as `rope_theta`.
+    #[serde(default)]
+    pub swa_rope_theta: f64,
+    /// Scale applied to V before attention (MiMo-V2 `attention_value_scale`).
+    /// 1.0 = none. Folded into o_proj at load time.
+    #[serde(default = "default_one_f64")]
+    pub attention_value_scale: f64,
+
     /// Target-model layer indices to capture intermediate hidden states from
     /// for DFlash speculative decoding. Sourced from the drafter's
     /// `dflash_config.target_layer_ids` (e.g., `[1, 10, 19, 28, 37]` for
@@ -821,8 +835,8 @@ pub use parsers::{
 };
 pub(crate) use parsers::{
     parse_deepseek_v4, parse_gemma4_params, parse_glm5_next, parse_glm5_vision_config,
-    parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_qwen4_exp, parse_step3p7,
-    parse_vision_config,
+    parse_laguna, parse_longcat_ngram, parse_mimo_v2, parse_minimax_m2, parse_qwen4_exp,
+    parse_step3p7, parse_vision_config,
 };
 pub use vision::{OmniVisionConfig, PixelBounds, VisionConfig, VisionTokenBudgets};
 
