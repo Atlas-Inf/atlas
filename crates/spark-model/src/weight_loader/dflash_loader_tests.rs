@@ -309,6 +309,7 @@ fn lilicorr_config_takes_generic_dflash_admission_path() {
         drafter_config: parse_dflash_config(json).expect("parse LiLiCorr config"),
         gamma: Some(8),
         window_size: Some(0),
+            ctx_window: None,
     };
     let target = ModelConfig::qwen3_next_80b_nvfp4();
     let admitted = admit_lightning_dspark_build(&args, &target, 1, 16, KvCacheDtype::Bf16)
@@ -379,4 +380,88 @@ fn own_lm_head_policy() {
     );
     let no_scale2 = WeightStore::from_map(no_scale2);
     assert!(own_lm_head_present(&no_scale2, "", Some(true)).is_err());
+}
+
+/// Ripple-65B-DFlash2's real config: 4 sliding + 1 full layer, NoPE on the
+/// full layer — the mixed-attention contract the drafter head consumes.
+#[test]
+fn ripple_drafter_parses_per_layer_attention() {
+    let json = r#"{
+        "hidden_size": 5120, "num_hidden_layers": 5, "intermediate_size": 40960,
+        "num_attention_heads": 80, "num_key_value_heads": 8, "head_dim": 128,
+        "vocab_size": 100352, "is_causal": false,
+        "use_sliding_window": true, "sliding_window": 4096,
+        "layer_types": ["sliding_attention", "sliding_attention",
+            "sliding_attention", "sliding_attention", "full_attention"],
+        "no_rope_layers": [4],
+        "rope_parameters": {"rope_theta": 10000.0},
+        "dflash_config": {"mask_token_id": 100278,
+            "target_layer_ids": [1, 20, 39, 58, 77],
+            "block_size": 16, "conv_group_size": 16, "conv_kernel_size": 4,
+            "selector_rank": 256, "selector_top_k": 32}
+    }"#;
+    let cfg = parse_dflash_config(json).expect("ripple drafter config parses");
+    assert!(cfg.is_mixed_attention());
+    assert_eq!(cfg.sliding_window(), None, "mixed head has no single window");
+    let la = cfg.layer_attentions().expect("per-layer attention table");
+    assert_eq!(
+        la.iter().map(|l| l.window).collect::<Vec<_>>(),
+        vec![Some(4096), Some(4096), Some(4096), Some(4096), None]
+    );
+    assert_eq!(
+        la.iter().map(|l| l.rope).collect::<Vec<_>>(),
+        vec![true, true, true, true, false]
+    );
+    assert!(cfg.query_causal() == false);
+    let sub = cfg.dflash_config.as_ref().unwrap();
+    assert_eq!(sub.conv_kernel_size, Some(4));
+    assert_eq!(sub.selector_top_k, Some(32));
+}
+
+/// Uniform configs (all-sliding GLM, all-full) keep their previous shapes:
+/// `sliding_window()` unchanged and no mixed table required.
+#[test]
+fn uniform_drafters_are_not_mixed() {
+    let sliding = r#"{
+        "hidden_size": 5120, "num_hidden_layers": 4, "intermediate_size": 100,
+        "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 128,
+        "vocab_size": 10, "use_sliding_window": true, "sliding_window": 2048,
+        "layer_types": ["sliding_attention"; 4],
+        "dflash_config": {"mask_token_id": 1, "target_layer_ids": [1]}
+    }"#
+    .replace("; 4]", ",\"sliding_attention\",\"sliding_attention\",\"sliding_attention\"]");
+    let cfg = parse_dflash_config(&sliding).unwrap();
+    assert!(!cfg.is_mixed_attention());
+    assert_eq!(cfg.sliding_window(), Some(2048));
+
+    let full = r#"{
+        "hidden_size": 5120, "num_hidden_layers": 1, "intermediate_size": 100,
+        "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 128,
+        "vocab_size": 10, "layer_types": ["full_attention"],
+        "dflash_config": {"mask_token_id": 1, "target_layer_ids": [1]}
+    }"#;
+    let cfg = parse_dflash_config(full).unwrap();
+    assert!(!cfg.is_mixed_attention());
+    assert_eq!(cfg.sliding_window(), None);
+}
+
+/// Bad `no_rope_layers` / layer-type entries fail closed.
+#[test]
+fn mixed_config_rejects_out_of_range_and_unknown() {
+    let base = |layers: &str, no_rope: &str| {
+        format!(
+            r#"{{"hidden_size": 1, "num_hidden_layers": 2, "intermediate_size": 1,
+            "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 1,
+            "vocab_size": 10, "sliding_window": 16,
+            "layer_types": {}, "no_rope_layers": {},
+            "dflash_config": {{"mask_token_id": 1, "target_layer_ids": [1]}}}}"#,
+            layers, no_rope
+        )
+    };
+    let cfg = parse_dflash_config(&base(
+        r#"["sliding_attention","bogus_type"]"#, "[]")).unwrap();
+    assert!(cfg.layer_attentions().is_err());
+    let cfg = parse_dflash_config(&base(
+        r#"["sliding_attention","full_attention"]"#, "[7]")).unwrap();
+    assert!(cfg.layer_attentions().is_err());
 }

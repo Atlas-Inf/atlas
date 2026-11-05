@@ -262,6 +262,28 @@ pub fn apply_grammar_bitmask(
 /// fails fast when a checkpoint's `selector_top_k`/`selector_rank` exceeds
 /// them — pinned to the kernel defines by `tests/dflash2_selector_bounds.rs`.
 pub const DFLASH2_SELECTOR_MAX_TOP_K: usize = 16;
+/// top_k=32 twin (`dflash2_candidate_selector_k32.cu`): Ripple-65B's
+/// `selector_top_k: 32`. Its own THREADS block (1024) and scratch widths;
+/// the K=16 instantiation is byte-identical.
+pub const DFLASH2_SELECTOR_MAX_TOP_K_K32: usize = 32;
+pub const DFLASH2_SELECTOR_SYMBOL_K32: &str = "dflash2_candidate_selector_k32";
+pub const DFLASH2_SELECTOR_THREADS_K32: u32 = 1024;
+/// Compile-time candidate cap a launch's `top_k` is checked against.
+pub fn dflash2_selector_max_top_k(top_k: u32) -> usize {
+    if top_k as usize > DFLASH2_SELECTOR_MAX_TOP_K {
+        DFLASH2_SELECTOR_MAX_TOP_K_K32
+    } else {
+        DFLASH2_SELECTOR_MAX_TOP_K
+    }
+}
+/// Launch block for a given `top_k` tier.
+fn dflash2_selector_threads(top_k: u32) -> u32 {
+    if top_k as usize > DFLASH2_SELECTOR_MAX_TOP_K {
+        DFLASH2_SELECTOR_THREADS_K32
+    } else {
+        DFLASH2_SELECTOR_THREADS
+    }
+}
 pub const DFLASH2_SELECTOR_MAX_RANK: usize = 256;
 /// Single-sequence entry resolved by both CUDA and HIP targets.
 pub const DFLASH2_SELECTOR_SYMBOL: &str = "dflash2_candidate_selector";
@@ -293,15 +315,23 @@ fn dflash2_selector_topk_splits(columns: u32) -> u32 {
 /// It must start zeroed (the kernel leaves every ticket at zero), and
 /// launches sharing it must be stream-ordered.
 pub fn dflash2_selector_scratch_bytes(gamma: usize) -> usize {
-    16 + 2 * 4 * gamma * DFLASH2_SELECTOR_MAX_SPLITS * DFLASH2_SELECTOR_MAX_TOP_K
+    dflash2_selector_scratch_bytes_for(gamma, DFLASH2_SELECTOR_MAX_TOP_K)
+}
+/// Same, sized for a `top_k` tier (> 16 rides the K=32 twin's wider lists).
+pub fn dflash2_selector_scratch_bytes_for(gamma: usize, top_k_cap: usize) -> usize {
+    16 + 2 * 4 * gamma * DFLASH2_SELECTOR_MAX_SPLITS * top_k_cap
         + 4 * gamma
-        + dflash2_selector_lists_bytes(gamma)
+        + dflash2_selector_lists_bytes_for(gamma, top_k_cap)
 }
 
 /// Bytes of `gamma` rows' top-`DFLASH2_SELECTOR_MAX_TOP_K` lists: f32 values
 /// `[gamma, K]`, then u32 ids `[gamma, K]` (`dflash2_selector_topk`).
 pub fn dflash2_selector_lists_bytes(gamma: usize) -> usize {
-    2 * 4 * gamma * DFLASH2_SELECTOR_MAX_TOP_K
+    dflash2_selector_lists_bytes_for(gamma, DFLASH2_SELECTOR_MAX_TOP_K)
+}
+/// Same, sized for a `top_k` tier.
+pub fn dflash2_selector_lists_bytes_for(gamma: usize, top_k_cap: usize) -> usize {
+    2 * 4 * gamma * top_k_cap
 }
 
 /// Steps 1-2 of the selector over one share of the vocabulary: `logits` is
@@ -373,7 +403,7 @@ pub fn dflash2_selector_walk(
     let launch =
         KernelLaunch::new(gpu, kernel)
             .grid([1, 1, 1])
-            .block([DFLASH2_SELECTOR_THREADS, 1, 1]);
+            .block([dflash2_selector_threads(top_k), 1, 1]);
     let launch = match lists {
         SelectorLists::Pair([a, b]) => launch.arg_ptr(a).arg_ptr(b),
         SelectorLists::Ranks {
@@ -438,7 +468,7 @@ pub fn dflash2_candidate_selector(
 ) -> Result<()> {
     let mut launch = KernelLaunch::new(gpu, kernel)
         .grid([dflash2_selector_splits(gamma), gamma, 1])
-        .block([DFLASH2_SELECTOR_THREADS, 1, 1])
+        .block([dflash2_selector_threads(top_k), 1, 1])
         .arg_ptr(logits)
         .arg_ptr(projected_hidden)
         .arg_ptr(pred_codebook)

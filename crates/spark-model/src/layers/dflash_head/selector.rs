@@ -12,7 +12,7 @@ use half::bf16;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use crate::layers::ops;
-use crate::layers::ops::{DFLASH2_SELECTOR_MAX_RANK, DFLASH2_SELECTOR_MAX_TOP_K};
+use crate::layers::ops::{DFLASH2_SELECTOR_MAX_RANK, DFLASH2_SELECTOR_MAX_TOP_K_K32};
 use crate::weight_map::DenseWeight;
 
 /// The block anchor (row 1's predecessor) and min_tokens ban of one selector
@@ -63,8 +63,8 @@ impl Dflash2CandidateSelector {
             "DFlash2 selector rank {rank} exceeds the on-device selector's cap {DFLASH2_SELECTOR_MAX_RANK}"
         );
         anyhow::ensure!(
-            (1..=DFLASH2_SELECTOR_MAX_TOP_K).contains(&top_k),
-            "DFlash2 selector top_k {top_k} exceeds the on-device selector's cap {DFLASH2_SELECTOR_MAX_TOP_K}"
+            (1..=DFLASH2_SELECTOR_MAX_TOP_K_K32).contains(&top_k),
+            "DFlash2 selector top_k {top_k} exceeds the on-device selector's cap {DFLASH2_SELECTOR_MAX_TOP_K_K32}"
         );
         let n_elements = vocab_size * rank;
         let mut pred_buf = vec![0u8; n_elements * 2];

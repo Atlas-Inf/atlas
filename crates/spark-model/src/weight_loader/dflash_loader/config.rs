@@ -85,6 +85,11 @@ pub struct DflashConfig {
     /// NVIDIA LiLiCorr drafters ship their own `lm_head` (`Some(true)`);
     /// generic DFlash drafters omit the key and share the target's head.
     pub has_own_lm_head: Option<bool>,
+    /// HF `no_rope_layers`: drafter layer indices that skip RoPE on q and k
+    /// entirely (including context K). Ripple-65B-DFlash2 ships `[4]` — its
+    /// single full-attention layer is NoPE.
+    #[serde(default)]
+    pub no_rope_layers: Option<Vec<usize>>,
 }
 
 fn default_rope_theta() -> f32 {
@@ -229,8 +234,71 @@ impl DflashConfig {
         let sliding = self.use_sliding_window == Some(true)
             || sub.and_then(|c| c.use_swa) == Some(true)
             || all_sliding;
-        if sliding { self.sliding_window } else { None }
+        if sliding && !self.is_mixed_attention() { self.sliding_window } else { None }
     }
+
+    /// `true` when `layer_types` mixes `sliding_attention` and
+    /// `full_attention` (Ripple-65B-DFlash2: 4 sliding + 1 full). A mixed
+    /// head has no single sliding window — [`Self::sliding_window`] returns
+    /// `None` and every consumer must use [`Self::layer_attention`].
+    pub fn is_mixed_attention(&self) -> bool {
+        self.layer_types
+            .as_ref()
+            .is_some_and(|t| t.iter().any(|t| t == "full_attention") && t.iter().any(|t| t == "sliding_attention"))
+    }
+
+    /// Per-layer attention shape for a mixed drafter. `window` is the
+    /// checkpoint's `sliding_window` on `sliding_attention` layers and
+    /// `None` on `full_attention` layers; `rope` is false on
+    /// `no_rope_layers` entries. Fails fast on an unknown layer type or an
+    /// out-of-range `no_rope_layers` index (PCND — never guess).
+    pub fn layer_attention(&self, layer_idx: usize) -> Result<DraftLayerAttention> {
+        let layer_type = self
+            .layer_types
+            .as_ref()
+            .and_then(|t| t.get(layer_idx))
+            .map(String::as_str)
+            .context("drafter layer_types is missing or shorter than num_hidden_layers")?;
+        let window = match layer_type {
+            "sliding_attention" => Some(
+                self.sliding_window
+                    .context("sliding_attention layer but no sliding_window in config")?,
+            ),
+            "full_attention" => None,
+            other => anyhow::bail!("unknown drafter layer_type {other:?} at layer {layer_idx}"),
+        };
+        let rope = !self
+            .no_rope_layers
+            .as_deref()
+            .unwrap_or(&[])
+            .contains(&layer_idx);
+        if let Some(&i) = self
+            .no_rope_layers
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .find(|&&i| i >= self.num_hidden_layers)
+        {
+            anyhow::bail!("no_rope_layers index {i} >= num_hidden_layers {}", self.num_hidden_layers);
+        }
+        Ok(DraftLayerAttention { window, rope })
+    }
+
+    /// Validated per-layer attention table for the whole head.
+    pub fn layer_attentions(&self) -> Result<Vec<DraftLayerAttention>> {
+        (0..self.num_hidden_layers)
+            .map(|i| self.layer_attention(i))
+            .collect()
+    }
+}
+
+/// Attention shape of one drafter layer for a mixed window/rope head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DraftLayerAttention {
+    /// Slot-space sliding window for this layer, `None` for full attention.
+    pub window: Option<usize>,
+    /// `false` on `no_rope_layers` entries — skip RoPE on q/k and ctx K.
+    pub rope: bool,
 }
 
 /// Parse a DFlash drafter's `config.json` into a [`DflashConfig`]. Used by

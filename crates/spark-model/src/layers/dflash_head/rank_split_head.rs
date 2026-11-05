@@ -97,6 +97,12 @@ impl BlockDiffusionDraftHead {
         );
         let mut split = RankSplit::new(geometry, capacity, gpu)?;
         let conf = self.startup.diagnostics.draft_conf;
+        let top_k = self.candidate_selector.as_ref().map_or(0, |s| s.top_k);
+        ensure!(
+            !topk || top_k <= crate::layers::ops::DFLASH2_SELECTOR_MAX_TOP_K,
+            "the rank split's selector swap has no top_k={top_k} twin (cap {})",
+            crate::layers::ops::DFLASH2_SELECTOR_MAX_TOP_K
+        );
         split.topk = topk
             .then(|| TopkSelect::new(self.gamma, capacity, conf, ranks, gpu))
             .transpose()?;

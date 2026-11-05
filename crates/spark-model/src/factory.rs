@@ -44,6 +44,10 @@ pub struct DflashBuildArgs<'a> {
     pub drafter_config: DflashConfig,
     pub gamma: Option<usize>,
     pub window_size: Option<usize>,
+    /// Drafter context retention in tokens from the target's MODEL.toml
+    /// `[dflash].ctx_window` (vendor `speculative-draft-window-size`).
+    /// `ATLAS_DFLASH_CTX_WINDOW` overrides at head construction.
+    pub ctx_window: Option<usize>,
 }
 
 /// LoRA adapter build arguments (`--lora-adapter NAME=PATH`). `None` for

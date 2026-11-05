@@ -9,7 +9,7 @@ impl BlockDiffusionDraftHead {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_staged_attention(
         &self,
-        _layer_idx: usize,
+        layer_idx: usize,
         batch_size: u32,
         max_kv_len: u32,
         serial_block_tables: Option<&[u64]>,
@@ -47,7 +47,7 @@ impl BlockDiffusionDraftHead {
                     self.num_kv_heads as u32,
                     self.head_dim as u32,
                     16,
-                    self.attn_sliding_window(),
+                    self.attn_sliding_window_for(layer_idx),
                     self.attn_causal(),
                     1.0 / (self.head_dim as f32).sqrt(),
                     sinks,
@@ -75,7 +75,7 @@ impl BlockDiffusionDraftHead {
             self.num_kv_heads as u32,
             self.head_dim as u32,
             16,
-            self.attn_sliding_window(),
+            self.attn_sliding_window_for(layer_idx),
             1.0 / (self.head_dim as f32).sqrt(),
             sinks,
             stream,

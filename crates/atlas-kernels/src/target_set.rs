@@ -21,6 +21,10 @@ pub struct DflashConfig {
     /// (shallow-to-deep). The drafter's `fc` projection consumes the stack
     /// of these hiddens. From the drafter's `dflash_config.target_layer_ids`.
     pub target_layer_ids: &'static [usize],
+    /// Drafter context retention in tokens (vendor
+    /// `speculative-draft-window-size`). 0 = unset;
+    /// `ATLAS_DFLASH_CTX_WINDOW` overrides at runtime.
+    pub ctx_window: usize,
 }
 
 /// Kernel modules hyperoptimized for a specific (H, M_q) target.

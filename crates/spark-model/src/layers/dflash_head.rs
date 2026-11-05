@@ -563,6 +563,13 @@ pub struct BlockDiffusionDraftHead {
     pub gamma: usize,
     pub mask_token_id: u32,
     pub window_size: Option<usize>,
+    /// Per-layer attention shape for MIXED drafters (`layer_types` mixing
+    /// `sliding_attention` and `full_attention`, e.g. Ripple-65B-DFlash2:
+    /// sliding layers window-mask the retained context, the full layer sees
+    /// everything, `no_rope_layers` skip RoPE). Empty for uniform heads —
+    /// `attn_sliding_window`/`layer_rope` fall back to `window_size`/true so
+    /// existing drafters are bit-identical.
+    pub layer_attention: Vec<crate::weight_loader::DraftLayerAttention>,
     /// Causal γ-block attention. `true` for Lightning DSpark
     /// (`dflash_config.causal`); `false` for Qwen-DFlash bidirectional.
     pub query_causal: bool,
@@ -890,6 +897,8 @@ mod forward_block_layer_paged;
 mod free_state_carry_tests;
 #[cfg(test)]
 mod free_state_tests;
+#[cfg(test)]
+mod conv_kernel_tests;
 mod from_weights;
 mod from_weights_kernels;
 #[cfg(test)]

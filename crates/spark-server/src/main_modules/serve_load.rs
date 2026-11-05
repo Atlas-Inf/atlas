@@ -743,10 +743,21 @@ pub(crate) fn load_model(
             max_loras: args.max_loras,
         })
     };
-    let dflash_args =
-        dflash_drafter_state
+    let dflash_args = dflash_drafter_state
             .as_ref()
-            .map(|(s, c)| spark_model::factory::DflashBuildArgs {
+            .map(|(s, c)| -> anyhow::Result<_> {
+                // A head-wide MODEL.toml `[dflash].window_size` cannot name a
+                // single window for a mixed drafter (sliding layers already
+                // carry the checkpoint's window; full layers have none) —
+                // fail closed rather than silently override one or all.
+                anyhow::ensure!(
+                    !c.is_mixed_attention()
+                        || ptx_set.dflash.as_ref().map(|d| d.window_size).unwrap_or(0) == 0,
+                    "MODEL.toml [dflash].window_size is invalid for a mixed-attention \
+                     drafter (layer_types mixes sliding/full): remove it — per-layer \
+                     windows come from the checkpoint"
+                );
+                Ok(spark_model::factory::DflashBuildArgs {
                 drafter_store: s,
                 drafter_config: c.clone(),
                 gamma: Some(args.resolved_dflash_gamma()),
@@ -755,7 +766,14 @@ pub(crate) fn load_model(
                 } else {
                     None
                 },
-            });
+                ctx_window: ptx_set
+                    .dflash
+                    .as_ref()
+                    .map(|d| d.ctx_window)
+                    .filter(|&w| w > 0),
+                })
+            })
+            .transpose()?;
     // NLLB / M2M-100: resolve the translation language pair to token ids from
     // the checkpoint tokenizer (the ChatTokenizer isn't built until after the
     // model). Only for encoder-decoder checkpoints; other models pass `None`.

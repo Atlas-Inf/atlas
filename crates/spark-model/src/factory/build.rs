@@ -1315,6 +1315,7 @@ pub fn build_model(
                     target_vocab_for_dflash,
                     args.gamma,
                     served_window_size,
+                    args.ctx_window,
                     model.gpu_backend(),
                     max_seq_len,
                     max_batch_size,
