@@ -35,7 +35,15 @@ pub(super) fn batch_selector_scratch(
     // The batched tail's per-sequence selector launches run in stream
     // order, so they share one selector scratch (ticket starts at zero).
     Ok(if weights.candidate_selector.is_some() {
-        let bytes = crate::layers::ops::dflash2_selector_scratch_bytes(gamma);
+        let top_k = weights
+            .candidate_selector
+            .as_ref()
+            .map(|cs| cs.top_k)
+            .unwrap_or(crate::layers::ops::DFLASH2_SELECTOR_MAX_TOP_K);
+        let bytes = crate::layers::ops::dflash2_selector_scratch_bytes_for(
+            gamma,
+            crate::layers::ops::dflash2_selector_max_top_k(top_k as u32),
+        );
         let p = gpu.alloc(bytes)?;
         gpu.memset(p, 0, bytes)?;
         p

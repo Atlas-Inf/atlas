@@ -77,10 +77,15 @@
 // selector scores; github.com/knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4
 // overlay/glm_draft_trunc.py; idea only, see docs/glm-prior-art.md).
 
+// Twins (top_k=32 drafters) define these before including this file.
+#ifndef DF2_SEL_MAX_TOP_K
 #define DF2_SEL_MAX_TOP_K 16
+#endif
 #define DF2_SEL_MAX_RANK 256
 #define DF2_SEL_MAX_SPLITS 16
+#ifndef DF2_SEL_THREADS
 #define DF2_SEL_THREADS 512
+#endif
 
 // (va, ia) precedes (vb, ib) in the total order.
 __device__ __forceinline__ bool df2_sel_before(float va, unsigned int ia, float vb, unsigned int ib) {

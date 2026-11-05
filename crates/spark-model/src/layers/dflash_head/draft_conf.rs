@@ -41,7 +41,7 @@ fn edge_module(edge: Option<&str>) -> &'static str {
 
 /// The selector to launch and whether it reports confidences: the confidence
 /// twin when wanted and shipped by the target, else the production kernel.
-pub(super) fn selector_kernel(gpu: &dyn GpuBackend, want: bool) -> (Option<KernelHandle>, bool) {
+pub(super) fn selector_kernel(gpu: &dyn GpuBackend, want: bool, top_k: usize) -> (Option<KernelHandle>, bool) {
     let twin = want
         .then(|| gpu.kernel(conf_module(), "dflash2_candidate_selector_conf"))
         .and_then(Result::ok)
@@ -63,14 +63,29 @@ pub(super) fn selector_kernel(gpu: &dyn GpuBackend, want: bool) -> (Option<Kerne
     }
     match twin {
         Some(kernel) => (Some(kernel), true),
-        None => (
-            gpu.kernel(
-                "dflash2_candidate_selector",
-                crate::layers::ops::DFLASH2_SELECTOR_SYMBOL,
-            )
-            .ok(),
-            false,
-        ),
+        None => {
+            // top_k > 16 rides the K=32 instantiation's module and entry —
+            // the K=16 production selector is untouched.
+            if top_k > crate::layers::ops::DFLASH2_SELECTOR_MAX_TOP_K {
+                (
+                    gpu.kernel(
+                        "dflash2_candidate_selector_k32",
+                        crate::layers::ops::DFLASH2_SELECTOR_SYMBOL_K32,
+                    )
+                    .ok(),
+                    false,
+                )
+            } else {
+                (
+                    gpu.kernel(
+                        "dflash2_candidate_selector",
+                        crate::layers::ops::DFLASH2_SELECTOR_SYMBOL,
+                    )
+                    .ok(),
+                    false,
+                )
+            }
+        }
     }
 }
 
