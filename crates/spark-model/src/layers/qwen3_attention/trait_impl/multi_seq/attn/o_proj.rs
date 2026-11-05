@@ -225,13 +225,9 @@ impl Qwen3AttentionLayer {
                     c0 += m;
                 }
             } else {
-                // n > 8 (DFlash verify rows): the pipelined tensor-core GEMM
-                // when the target ships it — the scalar dense_gemm streams at
-                // ~89 GB/s and o_proj is the full nq*hd x h weight.
-                ops::dense_gemm_prefill(
+                ops::dense_gemm(
                     fwd.gpu,
                     self.dense_gemm_k,
-                    self.dense_gemm_pipelined_k,
                     attn_out,
                     o_bf16,
                     o_out,
