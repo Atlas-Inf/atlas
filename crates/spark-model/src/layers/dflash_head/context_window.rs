@@ -26,11 +26,6 @@ impl BlockDiffusionDraftHead {
     /// window; masking again hides every context key once the sequence passes
     /// `window` tokens (GLM C1-16K first-draft acceptance 0.000 before this).
     /// Causal (Lightning DSpark) heads keep the kernel window.
-    /// False for the drafter's NoPE layers (`no_rope_layers`).
-    pub(super) fn layer_has_rope(&self, layer_idx: usize) -> bool {
-        !self.no_rope_layers.contains(&layer_idx)
-    }
-
     pub(super) fn attn_sliding_window(&self) -> u32 {
         if !self.query_causal {
             return 0;

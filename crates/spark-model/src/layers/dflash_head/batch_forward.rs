@@ -221,23 +221,21 @@ impl BlockDiffusionDraftHead {
             self.rms_norm_eps,
             stream,
         )?;
-        if self.layer_has_rope(layer_idx) {
-            crate::layers::ops::rope_yarn(
-                ctx.gpu,
-                self.kernels.rope_qwen3,
-                self.batch_q,
-                self.batch_k,
-                self.batch_position_ids,
-                batch_rows,
-                self.num_q_heads as u32,
-                self.num_kv_heads as u32,
-                self.head_dim as u32,
-                self.rotary_dim as u32,
-                self.yarn_inv_freq,
-                self.rope_theta,
-                stream,
-            )?;
-        }
+        crate::layers::ops::rope_yarn(
+            ctx.gpu,
+            self.kernels.rope_qwen3,
+            self.batch_q,
+            self.batch_k,
+            self.batch_position_ids,
+            batch_rows,
+            self.num_q_heads as u32,
+            self.num_kv_heads as u32,
+            self.head_dim as u32,
+            self.rotary_dim as u32,
+            self.yarn_inv_freq,
+            self.rope_theta,
+            stream,
+        )?;
         // Attention sinks are required only by the Lightning product's
         // batched-sink kernel; generic DFlash2 passes NULL exactly like its
         // serial Option-B layer does.

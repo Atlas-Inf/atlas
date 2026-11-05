@@ -160,7 +160,6 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         max_seq_len: 0,
         yarn_inv_freq: DevicePtr(0),
         rope_theta: 0.0,
-        no_rope_layers: Vec::new(),
         rotary_dim: 0,
         rms_norm_eps: 0.0,
         ctx_window: 0,
