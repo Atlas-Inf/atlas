@@ -110,7 +110,7 @@ impl BlockDiffusionDraftHead {
             let buf_seq = buf.offset(sequence * row_bytes);
             let delta_seq = self
                 .batch_conv_delta
-                .offset(sequence * delta_row_bytes + 2 * conv.num_groups * 2);
+                .offset(sequence * delta_row_bytes + conv.output_delta_offset());
             let out_seq = self.batch_conv_out.offset(sequence * row_bytes);
             conv.finish(
                 ctx.gpu,
