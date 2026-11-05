@@ -263,6 +263,41 @@ impl Qwen3AttentionLayer {
         let kv_bytes = kv_dim as usize * bf16;
         let v_in = self.v_input(normed);
         let max_rows = ops::DENSE_GEMV_BATCHM_MAX_M as usize;
+        if n > max_rows && self.dense_gemm_pipelined_k.0 != 0 {
+            // One tensor-core GEMM per projection (each weight read once for
+            // all n rows) into contiguous scratch, then a pitched copy into
+            // the per-row [q | k | v] layout. `attn_output` is free until the
+            // attention phase writes it, and holds n x q_proj_dim BF16.
+            let scratch = fwd.buffers.attn_output();
+            for (w, input, n_out, dst_off) in [
+                (&self.attn.q_proj, normed, q_proj_dim, 0usize),
+                (&self.attn.k_proj, normed, kv_dim, q_proj_bytes),
+                (&self.attn.v_proj, v_in, kv_dim, q_proj_bytes + kv_bytes),
+            ] {
+                ops::dense_gemm_prefill(
+                    fwd.gpu,
+                    self.dense_gemm_k,
+                    self.dense_gemm_pipelined_k,
+                    input,
+                    w,
+                    scratch,
+                    n as u32,
+                    n_out,
+                    h as u32,
+                    stream,
+                )?;
+                let row_bytes = n_out as usize * bf16;
+                fwd.gpu.copy_d2d_2d_async(
+                    scratch,
+                    row_bytes,
+                    qkv_buf.offset(dst_off),
+                    per_seq_qkv,
+                    row_bytes,
+                    n,
+                    stream,
+                )?;
+            }
+        } else {
         for start in (0..n).step_by(max_rows) {
             let rows = (n - start).min(max_rows) as u32;
             let x = normed.offset(start * h * bf16);
@@ -285,6 +320,7 @@ impl Qwen3AttentionLayer {
             gemv(x, &self.attn.q_proj, out, q_proj_dim)?;
             gemv(x, &self.attn.k_proj, out.offset(q_proj_bytes), kv_dim)?;
             gemv(vx, &self.attn.v_proj, out.offset(q_proj_bytes + kv_bytes), kv_dim)?;
+        }
         }
         // Rows are `per_seq_qkv` apart; the kernel splits each row's leading
         // [Q | gate] segment in place.
