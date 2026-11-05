@@ -397,11 +397,19 @@ pub(super) fn parse_dflash(model_dir: &std::path::Path) -> Option<DflashRaw> {
                 .collect()
         })
         .unwrap_or_default();
+    // Context retention in tokens (vendor `speculative-draft-window-size`).
+    // 0 = unset; `ATLAS_DFLASH_CTX_WINDOW` still overrides at runtime.
+    let ctx_window = dflash
+        .get("ctx_window")
+        .and_then(|v| v.as_integer())
+        .map(|v| v as usize)
+        .unwrap_or(0);
     Some(DflashRaw {
         draft_model,
         gamma,
         window_size,
         mask_token_id,
         target_layer_ids,
+        ctx_window,
     })
 }

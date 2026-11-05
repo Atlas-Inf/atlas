@@ -88,9 +88,12 @@ hidden_size = 5120
 [dflash]
 draft_model = "ricursiveAI/Ripple-65B-Preview-DFlash2"
 gamma = 16
-window_size = 4096
 mask_token_id = 100278
 target_layer_ids = [1, 20, 39, 58, 77]
+# Mixed drafter: sliding layers use the checkpoint's 4096 window (a head-wide
+# `window_size` here would be an error); context retention is the vendor
+# `speculative-draft-window-size` 16384.
+ctx_window = 16384
 
 # ── Kernel lookups this model may legitimately fail to resolve ──
 # Same tree (and same dense_ffn probes) as qwen3.6-27b: the two entries below

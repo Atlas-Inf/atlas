@@ -171,6 +171,7 @@ struct DflashRaw {
     window_size: usize,
     mask_token_id: u32,
     target_layer_ids: Vec<usize>,
+    ctx_window: usize,
 }
 
 fn main() {
