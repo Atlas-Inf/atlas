@@ -77,10 +77,22 @@
 // selector scores; github.com/knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4
 // overlay/glm_draft_trunc.py; idea only, see docs/glm-prior-art.md).
 
+// A twin may widen the candidate cap before including this file
+// (`dflash2_candidate_selector_k32.cu`); the walk scores candidate c on warp
+// c, so DF2_SEL_THREADS must grow with it.
+#ifndef DF2_SEL_MAX_TOP_K
 #define DF2_SEL_MAX_TOP_K 16
+#endif
 #define DF2_SEL_MAX_RANK 256
 #define DF2_SEL_MAX_SPLITS 16
+#ifndef DF2_SEL_THREADS
 #define DF2_SEL_THREADS 512
+#endif
+// Entry-point launch bounds: empty here; a twin whose block needs a register
+// cap (1024 threads leave 64 registers a thread) sets them.
+#ifndef DF2_SEL_BOUNDS
+#define DF2_SEL_BOUNDS
+#endif
 
 // (va, ia) precedes (vb, ib) in the total order.
 __device__ __forceinline__ bool df2_sel_before(float va, unsigned int ia, float vb, unsigned int ib) {
@@ -88,9 +100,14 @@ __device__ __forceinline__ bool df2_sel_before(float va, unsigned int ia, float 
 }
 
 // Shared candidates a block's threshold pass may collect (`df2_sel_slice`).
+#ifndef DF2_SEL_POOL
 #define DF2_SEL_POOL 512
+#endif
 // `df2_sel_slice`'s threshold needs a best candidate from K warps.
 static_assert(DF2_SEL_THREADS / 32 >= DF2_SEL_MAX_TOP_K, "the threshold pass needs K warps");
+// The overflow path (`df2_sel_slice_lists`) stages every warp's K best in the pool.
+static_assert(DF2_SEL_POOL >= DF2_SEL_THREADS / 32 * DF2_SEL_MAX_TOP_K,
+              "the pool must hold every warp's top-K list");
 
 // A block's shared scratch for steps 1-2.
 struct Df2SelShared {
@@ -427,8 +444,11 @@ __device__ __forceinline__ void df2_sel_prefetch_rows(
     }
 }
 
-// Rows of top-k lists the walk stages in shared memory at a time.
+// Rows of top-k lists the walk stages in shared memory at a time (a wider
+// twin stages fewer to stay inside the 48 KB static shared-memory limit).
+#ifndef DF2_SEL_WALK_ROWS
 #define DF2_SEL_WALK_ROWS 16
+#endif
 // 16-byte words of one staged block of codebook rows: K rows of up to
 // DF2_SEL_MAX_RANK BF16.
 #define DF2_SEL_BLOCK_WORDS (DF2_SEL_MAX_TOP_K * DF2_SEL_MAX_RANK / 8)
@@ -651,7 +671,7 @@ __device__ __forceinline__ bool df2_sel_shape_ok(unsigned int rank, unsigned int
         && gridDim.x <= DF2_SEL_MAX_SPLITS && blockDim.x == DF2_SEL_THREADS;
 }
 
-extern "C" __global__ void dflash2_candidate_selector(
+extern "C" __global__ void DF2_SEL_BOUNDS dflash2_candidate_selector(
     const __nv_bfloat16* __restrict__ logits,
     const __nv_bfloat16* __restrict__ projected_hidden,
     const __nv_bfloat16* __restrict__ pred_codebook,
@@ -701,7 +721,7 @@ extern "C" __global__ void dflash2_candidate_selector(
 // `out_lists` receives every row's exact top DF2_SEL_MAX_TOP_K: f32 values
 // [gamma, K], then u32 ids [gamma, K]. Grid (splits, gamma); scratch as the
 // fused kernel's (its walk ticket unused).
-extern "C" __global__ void dflash2_selector_topk(
+extern "C" __global__ void DF2_SEL_BOUNDS dflash2_selector_topk(
     const __nv_bfloat16* __restrict__ logits,
     unsigned int row_stride,
     unsigned int columns,
@@ -793,7 +813,7 @@ __device__ __forceinline__ void df2_sel_walk_merged(
 // Steps 2-4 over the lists two `dflash2_selector_topk` launches wrote for
 // complementary shares of the vocabulary (`lists_a`, `lists_b`): each row's
 // two lists merge by rank into its top-k, then the walk. One block.
-extern "C" __global__ void dflash2_selector_walk(
+extern "C" __global__ void DF2_SEL_BOUNDS dflash2_selector_walk(
     const float* __restrict__ lists_a,
     const float* __restrict__ lists_b,
     const __nv_bfloat16* __restrict__ projected_hidden,
@@ -819,7 +839,7 @@ extern "C" __global__ void dflash2_selector_walk(
 
 // The same over `count` (at most DF2_SEL_MAX_LISTS) ranks' lists, rank k's at
 // `lists + k * list_stride` floats: the TP4 chain's gathered shares.
-extern "C" __global__ void dflash2_selector_walk_ranks(
+extern "C" __global__ void DF2_SEL_BOUNDS dflash2_selector_walk_ranks(
     const float* __restrict__ lists,
     unsigned int list_stride,
     unsigned int count,
@@ -844,7 +864,7 @@ extern "C" __global__ void dflash2_selector_walk_ranks(
         vocab_size, rank, top_k, end0, end1, end2, end3);
 }
 
-#ifndef DF2_SEL_CONF
+#if !defined(DF2_SEL_CONF) && !defined(DF2_SEL_NO_BATCHED)
 // Insert (v, idx) into a sorted-desc local list of length top_k.
 __device__ __forceinline__ void df2_batch_insert_topk(
     float* __restrict__ vals,
@@ -1114,4 +1134,4 @@ extern "C" __global__ void dflash2_candidate_selector_batched(
         top_k
     );
 }
-#endif // !DF2_SEL_CONF
+#endif // !DF2_SEL_CONF && !DF2_SEL_NO_BATCHED

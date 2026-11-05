@@ -73,7 +73,10 @@ pub fn ships_vanilla_norm_weights(config: &atlas_core::config::ModelConfig) -> b
 /// The dispatch predicate itself, on the bare `model_type`, so it is unit-testable
 /// without constructing a full `ModelConfig`.
 pub fn model_type_ships_vanilla_norm_weights(model_type: &str) -> bool {
-    matches!(model_type, "deepseek_v4" | "glm5_next" | "laguna")
+    matches!(
+        model_type,
+        "deepseek_v4" | "glm5_next" | "laguna" | "ricursive"
+    )
 }
 
 #[cfg(test)]

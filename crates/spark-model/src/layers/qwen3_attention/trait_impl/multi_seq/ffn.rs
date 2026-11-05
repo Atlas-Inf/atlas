@@ -52,6 +52,9 @@ impl Qwen3AttentionLayer {
                 || self.mla.is_some(),
             "shortcut-MoE model reached the batched FFN ladder, which does not              implement the shortcut; only the per-token branch does"
         );
+        if self.has_post_sublayer_norms() {
+            return self.ms_phase_ffn_perinorm(c, o_out);
+        }
         let MultiSeqCtx {
             fwd,
             n,

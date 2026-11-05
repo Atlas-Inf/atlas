@@ -48,6 +48,26 @@ fn kernel_define(src: &str, name: &str) -> usize {
         .unwrap_or_else(|| panic!("missing #define {name}"))
 }
 
+/// The 32-candidate twin's caps (`dflash2_selector_build`) against its
+/// defines.
+#[test]
+fn wide_twin_caps_match_kernel_defines() {
+    let src = kernel_src("gb10/common/dflash2_candidate_selector_k32.cu");
+    assert_eq!(
+        kernel_define(&src, "DF2_SEL_MAX_TOP_K"),
+        spark_model::layers::ops::DFLASH2_SELECTOR_WIDE_MAX_TOP_K
+    );
+    assert_eq!(
+        kernel_define(&src, "DF2_SEL_THREADS"),
+        spark_model::layers::ops::DFLASH2_SELECTOR_WIDE_THREADS as usize
+    );
+    let wide = spark_model::layers::ops::DFLASH2_SELECTOR_WIDE;
+    assert!(src.contains(&format!(
+        "#define dflash2_candidate_selector {}",
+        wide.symbol
+    )));
+}
+
 #[test]
 fn caps_match_kernel_defines() {
     for rel in [KERNEL_GB10, KERNEL_STRIX] {

@@ -76,6 +76,7 @@ impl Qwen3AttentionLayer {
         }
 
         // ── 1. RMS norm + residual for N tokens ──
+        self.value_residual_capture(ctx.gpu, hidden, num_tokens, h, stream)?;
         let normed = ctx.buffers.norm_output();
         ops::rms_norm_residual(
             ctx.gpu,

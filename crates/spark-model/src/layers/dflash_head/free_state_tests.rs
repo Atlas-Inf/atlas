@@ -5,19 +5,11 @@
 //! reachable through production teardown, and a backend-free failure must
 //! stay observable/retryable instead of silently leaking).
 //!
-//! `BlockDiffusionDraftHead::from_weights` resolves real kernel handles and
-//! cannot run on a host test runner, so these tests construct the head via
-//! a zeroed literal (all kernel handles `KernelHandle(0)`, no lanes, empty
-//! graph pool). `free_state` touches only: `kv_cache`, `propose_graphs`,
-//! and the state's own resources — none of which depend on kernel handles —
-//! so the zeroed head exercises the production cleanup path faithfully.
-
-use std::collections::HashMap;
-
-use spark_runtime::gpu::GpuBackend;
-use spark_runtime::gpu::mock::MockGpuBackend;
-use spark_runtime::gpu::{DevicePtr, KernelHandle};
-use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
+//! `BlockDiffusionDraftHead::from_weights` resolves real kernel handles and cannot run
+//! on a host test runner, so these tests construct the head via a zeroed literal (all
+//! kernel handles `KernelHandle(0)`, no lanes, empty graph pool). `free_state` touches
+//! only `kv_cache`, `propose_graphs` and the state's own resources — none of which
+//! depend on kernel handles — so the zeroed head exercises the production cleanup path.
 
 use super::lifecycle::*;
 use super::{
@@ -25,6 +17,11 @@ use super::{
 };
 use crate::speculative::DraftProposer;
 use crate::weight_map::DenseWeight;
+use spark_runtime::gpu::GpuBackend;
+use spark_runtime::gpu::mock::MockGpuBackend;
+use spark_runtime::gpu::{DevicePtr, KernelHandle};
+use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
+use std::collections::HashMap;
 
 /// Serializes tests that exercise the global `CTX_ACC_POOL` (free_state
 /// success paths and carry-reject recycling push into it). Rust runs tests
@@ -97,6 +94,7 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         lm_head_shared: DevicePtr(0),
         lm_head_nvfp4: None,
         lm_head_shared_fp8: None,
+        fp8_m32: Vec::new(),
         hidden_norm: DenseWeight {
             weight: DevicePtr(0),
         },
@@ -191,6 +189,8 @@ pub(super) fn zero_kernels() -> DflashKernels {
         dense_gemm: zero,
         w4a16_gemm: zero,
         dense_gemm_pipelined: zero,
+        bf16_gemv_m32: zero,
+        fp8_gemv_m32: zero,
         rope_qwen3: zero,
         reshape_cache_fp8: zero,
         reshape_cache_bf16: zero,

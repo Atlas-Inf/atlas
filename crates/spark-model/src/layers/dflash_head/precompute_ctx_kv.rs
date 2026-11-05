@@ -351,30 +351,30 @@ impl BlockDiffusionDraftHead {
             )?;
         }
 
-        // ── Step 7: single fused RoPE across all L layers ─────────────
-        // py:403–418  `all_k_flat = all_k_normed.view(L * n, kv)`
-        //              `ops.rotary_embedding(positions_repeated, all_k_flat,
-        //                None, head_size, cos_sin_cache, is_neox)`
-        // Atlas: rope_yarn with seq_len=L*n, num_q_heads=0 (K-only).
-        //   K buffer = all_k_stage[0..L*n*kv_dim].
-        //   positions = norm_buf (L*n i32 written in step 4).
-        // Grid: [num_kv_heads, ceil(L*n / pos_per_block), 1] — all CTAs
-        //   process K heads across the full L*n row range.
-        ops::rope_yarn(
-            gpu,
-            self.kernels.rope_qwen3,
-            all_k_stage, // Q — unread when num_q_heads=0
-            all_k_stage, // K = all_k_flat [L*n, kv_dim]
-            scratch.norm_buf,
-            l_total as u32 * n,
-            0, // num_q_heads=0 → K-only (rope.cu:46-48)
-            self.num_kv_heads as u32,
-            self.head_dim as u32,
-            self.rotary_dim as u32,
-            self.yarn_inv_freq,
-            self.rope_theta,
-            stream,
-        )?;
+        // ── Step 7: fused RoPE across each run of RoPE layers ─────────
+        // py:403–418  `ops.rotary_embedding(positions_repeated, all_k_flat, …)`
+        // Atlas: rope_yarn, num_q_heads=0 (K-only), over the rows
+        //   all_k_stage[run.start*n .. run.end*n] at norm_buf's positions
+        //   (step 4). Without NoPE layers that is ONE launch over all L*n rows.
+        for run in self.rope_layer_runs() {
+            let first = run.start * new_ctx_count;
+            let k_rows = all_k_stage.offset(first * kv_slab_bytes);
+            ops::rope_yarn(
+                gpu,
+                self.kernels.rope_qwen3,
+                k_rows, // Q — unread when num_q_heads=0
+                k_rows, // K = this run's rows of all_k_flat [L*n, kv_dim]
+                scratch.norm_buf.offset(first * 4),
+                run.len() as u32 * n,
+                0, // num_q_heads=0 → K-only (rope.cu:46-48)
+                self.num_kv_heads as u32,
+                self.head_dim as u32,
+                self.rotary_dim as u32,
+                self.yarn_inv_freq,
+                self.rope_theta,
+                stream,
+            )?;
+        }
 
         if dump_opt.is_some() {
             dump(

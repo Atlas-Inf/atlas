@@ -215,7 +215,7 @@ impl BlockDiffusionDraftHead {
         conv: &Dflash2Conv,
         kind: ConvTwinKind,
     ) -> Result<ConvTwin> {
-        let n = 2 * conv.kernel_size * conv.num_groups;
+        let n = conv.delta_row_elems();
         let k = conv.hidden_size;
         Ok(match kind {
             ConvTwinKind::Nvfp4 => ConvTwin::Nvfp4(crate::weight_map::quantize_to_nvfp4(

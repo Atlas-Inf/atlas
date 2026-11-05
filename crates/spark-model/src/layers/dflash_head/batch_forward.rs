@@ -221,19 +221,14 @@ impl BlockDiffusionDraftHead {
             self.rms_norm_eps,
             stream,
         )?;
-        crate::layers::ops::rope_yarn(
+        self.layer_rope(
             ctx.gpu,
-            self.kernels.rope_qwen3,
+            layer_idx,
             self.batch_q,
             self.batch_k,
             self.batch_position_ids,
             batch_rows,
             self.num_q_heads as u32,
-            self.num_kv_heads as u32,
-            self.head_dim as u32,
-            self.rotary_dim as u32,
-            self.yarn_inv_freq,
-            self.rope_theta,
             stream,
         )?;
         // Attention sinks are required only by the Lightning product's

@@ -226,6 +226,9 @@ impl Qwen3AttentionLayer {
         let (wht_k_dtype, wht_v_dtype) = self.kv_dtype.kv_pair();
         let k_is_turbo = wht_k_dtype.is_wht_rotated();
         let v_is_turbo = wht_v_dtype.is_wht_rotated();
+        if let Some(out) = self.ms_verify_rows_attention(c, kv_cache, meta)? {
+            return Ok(out);
+        }
 
         // ── Q for the batched paged decode ────────────────────────────────
         // `run_paged_decode` already takes an explicit `q_stride` and the kernel

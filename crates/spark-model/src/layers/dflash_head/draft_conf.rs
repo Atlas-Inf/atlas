@@ -40,8 +40,20 @@ fn edge_module(edge: Option<&str>) -> &'static str {
 }
 
 /// The selector to launch and whether it reports confidences: the confidence
-/// twin when wanted and shipped by the target, else the production kernel.
-pub(super) fn selector_kernel(gpu: &dyn GpuBackend, want: bool) -> (Option<KernelHandle>, bool) {
+/// twin when wanted and shipped by the target, else `build`'s production
+/// kernel. Only the 16-candidate selector has a confidence twin.
+pub(super) fn selector_kernel(
+    gpu: &dyn GpuBackend,
+    want: bool,
+    build: crate::layers::ops::Dflash2SelectorBuild,
+) -> (Option<KernelHandle>, bool) {
+    if want && !build.full_family {
+        tracing::warn!(
+            "DFlash draft confidence: no confidence twin of {}: off",
+            build.module
+        );
+    }
+    let want = want && build.full_family;
     let twin = want
         .then(|| gpu.kernel(conf_module(), "dflash2_candidate_selector_conf"))
         .and_then(Result::ok)
@@ -63,14 +75,7 @@ pub(super) fn selector_kernel(gpu: &dyn GpuBackend, want: bool) -> (Option<Kerne
     }
     match twin {
         Some(kernel) => (Some(kernel), true),
-        None => (
-            gpu.kernel(
-                "dflash2_candidate_selector",
-                crate::layers::ops::DFLASH2_SELECTOR_SYMBOL,
-            )
-            .ok(),
-            false,
-        ),
+        None => (gpu.kernel(build.module, build.symbol).ok(), false),
     }
 }
 

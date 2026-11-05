@@ -32,17 +32,13 @@ use spark_runtime::weights::WeightStore;
 use crate::weight_map::{DenseWeight, QuantizedWeight, dense_auto};
 
 mod config;
+mod conv;
+mod layer_attention;
 mod own_head;
 
 pub use config::*;
+pub use conv::DflashConvWeights;
 pub(crate) use own_head::own_lm_head_present;
-
-/// DFlash2 2-tap grouped dynamic convolution weights.
-#[derive(Clone)]
-pub struct DflashConvWeights {
-    pub base_kernel: DenseWeight,
-    pub kernel_projection: DenseWeight,
-}
 
 /// DFlash2 bilinear candidate selector weights.
 #[derive(Clone)]
@@ -190,29 +186,18 @@ pub fn load_dflash_weights(
         } else {
             None
         };
-        let attn_conv_base = format!("{lp}.attention_conv.base_kernel");
-        let attn_conv_proj = format!("{lp}.attention_conv.kernel_projection.weight");
-        let attention_conv =
-            if drafter_store.contains(&attn_conv_base) && drafter_store.contains(&attn_conv_proj) {
-                Some(DflashConvWeights {
-                    base_kernel: dense_auto(drafter_store, &attn_conv_base, gpu)?,
-                    kernel_projection: dense_auto(drafter_store, &attn_conv_proj, gpu)?,
-                })
-            } else {
-                None
-            };
-
-        let mlp_conv_base = format!("{lp}.mlp_conv.base_kernel");
-        let mlp_conv_proj = format!("{lp}.mlp_conv.kernel_projection.weight");
-        let mlp_conv =
-            if drafter_store.contains(&mlp_conv_base) && drafter_store.contains(&mlp_conv_proj) {
-                Some(DflashConvWeights {
-                    base_kernel: dense_auto(drafter_store, &mlp_conv_base, gpu)?,
-                    kernel_projection: dense_auto(drafter_store, &mlp_conv_proj, gpu)?,
-                })
-            } else {
-                None
-            };
+        let attention_conv = conv::load_conv(
+            drafter_store,
+            &format!("{lp}.attention_conv"),
+            drafter_config,
+            gpu,
+        )?;
+        let mlp_conv = conv::load_conv(
+            drafter_store,
+            &format!("{lp}.mlp_conv"),
+            drafter_config,
+            gpu,
+        )?;
 
         let layer = DflashLayerWeights {
             input_layernorm: dense_auto(

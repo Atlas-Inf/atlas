@@ -135,3 +135,11 @@ pub fn fp8_blockwise_gemm_act_weight_t(
 ) -> Result<()> {
     unreachable!("cutlass::fp8_blockwise_gemm_act_weight_t is cuda-only (not built for metal)")
 }
+
+// Backend-neutral: without `atlas_cutlass` every entry bails.
+#[path = "cutlass/prequant.rs"]
+mod prequant;
+pub use prequant::{
+    Nvfp4Act, Nvfp4WeightSfb, nvfp4_gemm_prequant, nvfp4_quant_act_scaled,
+    nvfp4_quant_swiglu_clamp, nvfp4_sf_bytes,
+};

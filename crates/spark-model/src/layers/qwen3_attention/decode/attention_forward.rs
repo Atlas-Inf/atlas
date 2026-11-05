@@ -294,7 +294,8 @@ impl Qwen3AttentionLayer {
         let k_out = q_out.offset(q_proj_bytes);
         let v_out = k_out.offset((nkv * hd) as usize * 2);
 
-        self.attention_forward_kv(normed, k_out, v_out, nkv, hd, h, ctx, stream)?;
+        let v_in = self.value_residual_input(ctx.gpu, normed, 1, h as usize, stream)?;
+        self.attention_forward_kv(normed, v_in, k_out, v_out, nkv, hd, h, ctx, stream)?;
 
         // ── LoRA deltas on K/V (v0; Q excluded — gated [Q|gate] interleave).
         // MUST run BEFORE the q/k RMS-norm, RoPE, and write_kv_cache below:

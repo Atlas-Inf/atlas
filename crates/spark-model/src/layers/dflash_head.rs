@@ -29,6 +29,7 @@ use crate::weight_map::{DenseWeight, QuantizedWeight};
 
 pub mod conv;
 mod draft_conf;
+mod fp8_m32;
 mod paged_attn_modules;
 pub mod product_policy;
 pub mod selector;
@@ -71,6 +72,10 @@ pub struct DflashKernels {
     /// (and ~4× OOB → CUDA-700). `.0 == 0` when the target lm_head is BF16.
     pub w4a16_gemm: KernelHandle,
     pub dense_gemm_pipelined: KernelHandle,
+    /// `bf16_gemv_m32` (Ricursive's target): 1..=32-row drafter GEMMs; 0 elsewhere.
+    pub bf16_gemv_m32: KernelHandle,
+    /// `fp8_gemv_m32`: the same GEMMs on [`Self::fp8_m32`]'s FP8 mirrors.
+    pub fp8_gemv_m32: KernelHandle,
     pub rope_qwen3: KernelHandle,
     pub reshape_cache_fp8: KernelHandle,
     /// BF16 KV cache writeback. Used by Phase 2 `precompute_ctx_kv` and
@@ -248,7 +253,7 @@ pub struct DflashScratch {
     /// historical target positions (decoded indices); last γ are
     /// the to-be-predicted noise positions.
     pub position_ids: DevicePtr,
-    /// DFlash2 scratch: dynamic conv delta coefficients `[γ, 4 * num_groups]` BF16.
+    /// DFlash2 scratch: dynamic conv delta coefficients `[γ, 2 * kernel_size * num_groups]` BF16.
     pub dflash2_conv_delta: DevicePtr,
     /// DFlash2 scratch: convolution output `[γ, hidden_size]` BF16.
     pub dflash2_conv_out: DevicePtr,
@@ -325,6 +330,12 @@ pub struct DflashLayer {
     pub mlp_conv: Option<Dflash2Conv>,
     /// MXFP8 twins of q/o/gate/up/down (`ATLAS_DFLASH_MXFP8=1`), else None.
     pub mx: Option<LayerMxfp8>,
+    /// RoPE on this layer's Q/K (`false` for HF `no_rope_layers`).
+    pub rope: bool,
+    /// This layer's own sliding window in the attention kernel (0 = none)
+    /// when `layer_types` mixes sliding and full layers; see
+    /// [`BlockDiffusionDraftHead::layer_attn_window`].
+    pub attn_window: u32,
 }
 
 /// Per-sequence DFlash drafter state. One paged KV cache per drafter layer
@@ -595,6 +606,9 @@ pub struct BlockDiffusionDraftHead {
     /// it must not mutate the target model's lm_head. `None` on the
     /// BF16 path.
     pub lm_head_shared_fp8: Option<crate::weight_map::Fp8DenseWeight>,
+    /// FP8 mirrors for the small-M drafter GEMMs (`ATLAS_DFLASH_DRAFTER_FP8_M32`),
+    /// keyed by the BF16 weight pointer `drafter_dense_gemm` receives.
+    pub fp8_m32: Vec<(u64, crate::weight_map::Fp8DenseWeight)>,
 
     // === Weights from the drafter checkpoint ===
     /// Hidden-norm applied to the projected target context before mixing
@@ -905,6 +919,7 @@ mod rank_split_forward;
 mod small_m_gemm;
 
 mod context_window;
+mod layer_attention;
 mod markov_slots;
 use markov_slots::{MARKOV_BAN_DEPTH_OFFSET, MARKOV_PREV_BYTES};
 mod twins;

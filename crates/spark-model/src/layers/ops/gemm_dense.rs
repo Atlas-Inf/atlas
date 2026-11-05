@@ -149,12 +149,10 @@ pub fn dense_gemm_router(
         .launch(stream)
 }
 
-/// Pipelined tensor-core BF16 GEMM — drop-in faster `dense_gemm` (kernel
-/// `dense_gemm_bf16_pipelined`): mma.sync.m16n8k16 + cp.async 2-stage, 128x128
-/// tile. ~40x the scalar `dense_gemm` on large-M shapes (cosine=1.0, same math).
-/// Grid: (ceil(N/128), ceil(M/128), 1)  Block: (256, 1, 1)
-/// (`DENSE_GEMM_BF16_PIPELINED_{TILE,THREADS}` — shared with the cuBLASLt
-/// fallback launcher in `spark_runtime::cublaslt`.)
+/// Pipelined tensor-core BF16 GEMM (`dense_gemm_bf16_pipelined`, mma.sync
+/// m16n8k16 + 2-stage cp.async, 128x128 tile; ~40x scalar `dense_gemm` at large
+/// M; grid/block `DENSE_GEMM_BF16_PIPELINED_{TILE,THREADS}`, shared with the
+/// cuBLASLt fallback launcher). Large M may take `pipelined_on_cutlass`.
 #[allow(clippy::too_many_arguments)]
 pub fn dense_gemm_bf16_pipelined(
     gpu: &dyn GpuBackend,
@@ -167,6 +165,9 @@ pub fn dense_gemm_bf16_pipelined(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    if super::pipelined_on_cutlass(input, weight.weight.0, output, [m, n, k], stream)? {
+        return Ok(());
+    }
     let (t, th) = (
         DENSE_GEMM_BF16_PIPELINED_TILE,
         DENSE_GEMM_BF16_PIPELINED_THREADS,
@@ -183,9 +184,8 @@ pub fn dense_gemm_bf16_pipelined(
         .launch(stream)
 }
 
-/// Dense BF16 prefill GEMM. Prefer the pipelined tensor-core kernel when the
-/// selected target ships it, and retain the scalar kernel as an explicit
-/// compatibility fallback for older targets.
+/// Dense BF16 prefill GEMM: the pipelined tensor-core kernel when the target
+/// ships it, else the scalar kernel (older targets).
 #[allow(clippy::too_many_arguments)]
 pub fn dense_gemm_prefill(
     gpu: &dyn GpuBackend,

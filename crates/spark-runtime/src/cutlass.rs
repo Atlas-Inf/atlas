@@ -79,6 +79,7 @@ use std::sync::OnceLock;
 mod gemm;
 mod grouped;
 mod pack;
+mod prequant;
 
 pub use gemm::{
     bf16_gemm_act_weight_t, bf16_gemm_tuned, bf16_gemm_tuned_f32out,
@@ -86,6 +87,10 @@ pub use gemm::{
 };
 pub use grouped::{nvfp4_grouped_down, nvfp4_grouped_gate_up, nvfp4_grouped_gate_up_fused};
 pub use pack::{pack_bf16_weight_to_nvfp4_t, pack_weight_sfb, transpose_nvfp4_packed_kton};
+pub use prequant::{
+    Nvfp4Act, Nvfp4WeightSfb, nvfp4_gemm_prequant, nvfp4_quant_act_scaled,
+    nvfp4_quant_swiglu_clamp, nvfp4_sf_bytes,
+};
 
 #[cfg(all(test, atlas_cutlass))]
 mod tests;
