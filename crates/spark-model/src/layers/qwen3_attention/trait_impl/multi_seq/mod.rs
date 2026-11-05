@@ -15,6 +15,7 @@ mod attn;
 mod c4;
 mod ctx;
 mod ffn;
+mod ffn_perinorm;
 pub(crate) use ffn::{
     grouped_routed_decode_enabled, grouped_routed_decode_min, pairwise_moe_decode_enabled,
 };
