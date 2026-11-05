@@ -34,7 +34,8 @@ use crate::layers::qwen3_attention::mimo::{
 use crate::layers::{DenseFfnLayer, FfnComponent, MoeLayer, Qwen3AttentionLayer};
 use crate::weight_map::{
     AttentionWeights, DenseWeight, ExpertWeight, MoeWeights, MtpWeights, QuantizedWeight,
-    WeightQuantFormat, dense, dense_auto, load_kv_scales, quantize_to_nvfp4, quantized_mxfp4_e8m0,
+    WeightQuantFormat, dense, dense_auto, free_loader_source, load_kv_scales, quantize_to_nvfp4,
+    quantized_mxfp4_e8m0,
 };
 
 /// The published checkpoint stores fused QKV pre-sharded for TP=4.
@@ -126,8 +127,10 @@ fn load_qkv_chunked(
             .launch(stream)?;
     }
     gpu.synchronize(stream)?;
-    gpu.free(w_ptr)?;
-    gpu.free(s_ptr)?;
+    // Both source tensors are store-owned; reclaim records them so release does
+    // not free the same pointers a second time.
+    store.reclaim(gpu, &format!("{prefix}.weight"))?;
+    store.reclaim(gpu, &format!("{prefix}.weight_scale_inv"))?;
     Ok((DenseWeight { weight: out }, chunk_rows))
 }
 
@@ -144,8 +147,24 @@ fn load_dense_ffn(
     let h = config.hidden_size;
     let inter = config.intermediate_size;
     let quant = |name: &str, n: usize, k: usize| -> Result<QuantizedWeight> {
-        let w = dense_auto(store, &format!("{lp}.mlp.{name}.weight"), gpu)?;
-        quantize_to_nvfp4(&w, n, k, gpu, absmax_k, quantize_k, stream)
+        let wkey = format!("{lp}.mlp.{name}.weight");
+        let w = dense_auto(store, &wkey, gpu)?;
+        let q = quantize_to_nvfp4(&w, n, k, gpu, absmax_k, quantize_k, stream)?;
+        // Free the BF16 input (alias or dequant buffer) and the on-disk source
+        // tensor; only the NVFP4 result stays resident.
+        free_loader_source(store, gpu, &wkey, w)?;
+        store.reclaim(gpu, &wkey)?;
+        let prefix = wkey.strip_suffix(".weight").expect("weight suffix");
+        for scale_key in [
+            format!("{prefix}.weight_scale_inv"),
+            format!("{prefix}.weight_scale"),
+            format!("{prefix}.scale"),
+        ] {
+            if store.contains(&scale_key) {
+                store.reclaim(gpu, &scale_key)?;
+            }
+        }
+        Ok(q)
     };
     let gate_q = quant("gate_proj", inter, h)?;
     let up_q = quant("up_proj", inter, h)?;
