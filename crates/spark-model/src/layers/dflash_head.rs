@@ -325,6 +325,12 @@ pub struct DflashLayer {
     pub mlp_conv: Option<Dflash2Conv>,
     /// MXFP8 twins of q/o/gate/up/down (`ATLAS_DFLASH_MXFP8=1`), else None.
     pub mx: Option<LayerMxfp8>,
+    /// RoPE on this layer's Q/K (`false` for HF `no_rope_layers`).
+    pub rope: bool,
+    /// This layer's own sliding window in the attention kernel (0 = none)
+    /// when `layer_types` mixes sliding and full layers; see
+    /// [`BlockDiffusionDraftHead::layer_attn_window`].
+    pub attn_window: u32,
 }
 
 /// Per-sequence DFlash drafter state. One paged KV cache per drafter layer
@@ -905,6 +911,7 @@ mod rank_split_forward;
 mod small_m_gemm;
 
 mod context_window;
+mod layer_attention;
 mod markov_slots;
 use markov_slots::{MARKOV_BAN_DEPTH_OFFSET, MARKOV_PREV_BYTES};
 mod twins;

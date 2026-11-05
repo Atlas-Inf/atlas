@@ -61,15 +61,19 @@ impl BlockDiffusionDraftHead {
         // HF `is_causal` / sliding-window keys as well as `dflash_config`
         // (GLM-5.3's DFlash2 declares its 2048 window only through them).
         let query_causal = weights.config.query_causal();
-        let window_size = window_size.or_else(|| weights.config.sliding_window());
         // Resolved early: the drafter paged-KV pool must cover every ctx
         // slot the accumulator can retain. The accumulator cap follows
         // ctx_window — NOT the SWA window_size — because the paged-attention
         // path panics when ctx_count exceeds the ctx_window-sized scratch.
-        let ctx_window: usize = std::env::var("ATLAS_DFLASH_CTX_WINDOW")
+        let env_ctx_window = std::env::var("ATLAS_DFLASH_CTX_WINDOW")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(4096);
+            .and_then(|s| s.parse().ok());
+        let (window_size, ctx_window) = super::layer_attention::resolve_context_window(
+            window_size,
+            &weights.config,
+            env_ctx_window,
+        )?;
+        let layer_attention = super::layer_attention::layer_attention(&weights.config)?;
         let ctx_capacity = ctx_window.min(max_seq_len);
 
         if target_layer_ids.is_empty() {
@@ -834,7 +838,8 @@ impl BlockDiffusionDraftHead {
                 weights
                     .layers
                     .into_iter()
-                    .map(|l| DflashLayer {
+                    .zip(layer_attention)
+                    .map(|(l, (rope, attn_window))| DflashLayer {
                         input_layernorm: l.input_layernorm,
                         post_attention_layernorm: l.post_attention_layernorm,
                         q_proj: l.q_proj,
@@ -847,6 +852,8 @@ impl BlockDiffusionDraftHead {
                         up_proj: l.up_proj,
                         down_proj: l.down_proj,
                         attention_sink_bias: l.attention_sink_bias,
+                        rope,
+                        attn_window,
                         attention_conv: l.attention_conv.map(|c| {
                             super::Dflash2Conv::new(
                                 c.base_kernel,

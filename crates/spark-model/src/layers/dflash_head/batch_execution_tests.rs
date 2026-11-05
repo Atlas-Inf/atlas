@@ -111,7 +111,7 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
     let input_norm = source.find("&layer.input_layernorm").unwrap();
     let q_proj = source.find("&layer.q_proj").unwrap();
     let q_norm = source.find("&layer.q_norm").unwrap();
-    let rope = source.find("ops::rope_yarn").unwrap();
+    let rope = source.find("self.layer_rope(").unwrap();
     let attention = source.find("self.run_staged_attention").unwrap();
     let o_proj = source.find("&layer.o_proj").unwrap();
     let post_norm = source.find("&layer.post_attention_layernorm").unwrap();

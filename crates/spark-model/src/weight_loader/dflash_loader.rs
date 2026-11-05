@@ -33,6 +33,7 @@ use crate::weight_map::{DenseWeight, QuantizedWeight, dense_auto};
 
 mod config;
 mod conv;
+mod layer_attention;
 mod own_head;
 
 pub use config::*;
