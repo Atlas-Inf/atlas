@@ -27,6 +27,7 @@ mod nllb;
 mod qwen3;
 mod qwen35;
 mod qwen35_dense;
+mod ricursive;
 mod qwen3_vl;
 #[cfg_attr(test, allow(unreachable_pub))]
 pub(crate) mod qwen4_exp;
@@ -51,6 +52,7 @@ pub use qwen4_exp::Qwen4ExpWeightLoader;
 pub use qwen4_exp::mode as qwen4exp_mode;
 pub use qwen35::Qwen35WeightLoader;
 pub use qwen35_dense::Qwen35DenseWeightLoader;
+pub use ricursive::RicursiveWeightLoader;
 pub use step3p7::Step3p7WeightLoader;
 
 use anyhow::Result;
@@ -268,6 +270,17 @@ pub trait ModelWeightLoader {
         _max_tokens: usize,
     ) -> Result<Option<crate::layers::ngram_embed::NgramEmbedding>> {
         Ok(None)
+    }
+    /// Size per-forward activation state the layers share once the arena's
+    /// `max_tokens` is known (Ricursive value residuals). Default: none.
+    fn attach_layer_buffers(
+        &self,
+        _layers: &mut [Box<dyn TransformerLayer>],
+        _config: &ModelConfig,
+        _gpu: &dyn GpuBackend,
+        _max_tokens: usize,
+    ) -> Result<()> {
+        Ok(())
     }
     /// Load the final RMSNorm weight used before the LM head.
     ///
