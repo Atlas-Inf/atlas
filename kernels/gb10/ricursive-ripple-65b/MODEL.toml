@@ -5,13 +5,17 @@
 # head_dim 128, gated attention (g_proj interleaved into q_proj at load),
 # Gemma-style pre/post sublayer norms with plain `x * w` weights, value
 # residuals from the scaled layer-0 embedding, SwiGLU clamped at 20.
-# Checkpoint formats are kept (Strict): ModelOpt NVFP4 MLPs (W4A16 decode),
+# Checkpoint formats are kept (Strict): ModelOpt NVFP4 MLPs (W4A16 single-token
+# decode, W4A4 at the checkpoint's input scales for multi-row passes),
 # BF16 attention / embedding / lm_head, BF16 KV cache.
 #
 # KERNELS: the compiled set is Laguna-S-2.1's (`kernel_source`): head_dim
 # 128 BF16 attention, sliding-window paged decode/prefill, NVFP4 W4A16 dense
-# FFN. This target's own `nvfp4/` overlay adds the embedding scale and the
-# value-residual lerp, and the target FFN's clamped SwiGLU (`ricursive_swiglu`).
+# FFN. This target's own `nvfp4/` overlay adds the embedding scale, the
+# value-residual lerp, the target FFN's clamped SwiGLU (`ricursive_swiglu`),
+# and glm-5.3-flash's native W4A4 GEMM (`w4a4_gemm_mfast`): multi-row FFN
+# passes (DFlash verify, prefill) run W4A4 at the checkpoint's calibrated
+# input scales, as ModelOpt NVFP4 and the reference engine do.
 
 [model]
 name = "ricursive-ripple-65b"
@@ -165,9 +169,6 @@ w4a16_gemm_t_m128 / w4a16_gemm arms; handle != 0 gated."""
 w4a4_gemm = """
 Direct FP4-activation GEMM probed by dense_ffn; opt-in path
 (ATLAS_ATTN_W4A4-family), handle-gated, never default-dispatched."""
-w4a4_gemm_mfast = """
-Shipped only in nemotron-labs-3-puzzle-75b-a9b. qwen3_attention::init
-probes it; opt-in, handle-gated. UNMEASURED."""
 
 [expected_absent.q4k_mmq]
 atlas_q4k_mmq128_nc = """
