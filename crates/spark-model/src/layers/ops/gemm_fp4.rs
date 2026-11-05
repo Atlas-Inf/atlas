@@ -110,6 +110,26 @@ pub fn w4a4_gemm_mfast(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    // Single-level activations (scaleA2 = 1).
+    w4a4_gemm_mfast_scaled(gpu, kernel, a_packed, a_scale, 1.0, weight, output, m, n, k, stream)
+}
+
+/// [`w4a4_gemm_mfast`] for two-level activations quantized at global scale
+/// `1 / scale_a2` ([`quantize_bf16_to_nvfp4_scaled`] with the same value).
+#[allow(clippy::too_many_arguments)]
+pub fn w4a4_gemm_mfast_scaled(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a_packed: DevicePtr,
+    a_scale: DevicePtr,
+    scale_a2: f32,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(m, 128), div_ceil(n, 128), 1])
         .block([128, 1, 1])
@@ -118,8 +138,51 @@ pub fn w4a4_gemm_mfast(
         .arg_ptr(weight.weight)
         .arg_ptr(weight.weight_scale)
         .arg_ptr(output)
-        .arg_f32(1.0) // scaleA2 (activation single-level)
+        .arg_f32(scale_a2) // scaleA2 (activation global scale)
         .arg_f32(weight.weight_scale_2) // scaleB2 (weight per-tensor)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Rows [`w4a4_gemv_m32`] serves (two 16-row MMA fragments).
+pub const W4A4_GEMV_MAX_M: u32 = 32;
+
+/// Small-M W4A4 GEMV (`w4a4_gemv_m32_bn{32,16}`, Ricursive target): the
+/// operands and scales of [`w4a4_gemm_mfast_scaled`] for
+/// `m <= W4A4_GEMV_MAX_M` rows. `kernels` = (32-row, 16-row) weight-panel
+/// variants; the 16-row panel keeps narrow N (the down projection) at full
+/// occupancy.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a4_gemv_m32(
+    gpu: &dyn GpuBackend,
+    kernels: (KernelHandle, KernelHandle),
+    a_packed: DevicePtr,
+    a_scale: DevicePtr,
+    scale_a2: f32,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        (1..=W4A4_GEMV_MAX_M).contains(&m) && k.is_multiple_of(512),
+        "w4a4_gemv_m32: m={m} k={k} unsupported"
+    );
+    let (kernel, bn) = if n >= 16384 { (kernels.0, 32) } else { (kernels.1, 16) };
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, bn), 1, 1])
+        .block([128, 1, 1])
+        .arg_ptr(a_packed)
+        .arg_ptr(a_scale)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_ptr(output)
+        .arg_f32(scale_a2)
+        .arg_f32(weight.weight_scale_2)
         .arg_u32(m)
         .arg_u32(n)
         .arg_u32(k)

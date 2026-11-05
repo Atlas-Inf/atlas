@@ -23,6 +23,9 @@ mod native;
 mod prefill_bf16;
 #[path = "dense_ffn_tp_split.rs"]
 mod tp_split;
+#[path = "dense_ffn_w4a4_rows.rs"]
+mod w4a4_rows;
+pub use w4a4_rows::W4a4InputScales;
 pub use native::DenseNative;
 pub(crate) use tp_split::dense_tp_split_requested;
 
@@ -255,6 +258,8 @@ pub struct DenseFfnLayer {
     w4a16_gemm_t_k64_k: KernelHandle,
     /// SiLU(gate)*up or GELU(gate)*up depending on activation.
     act_mul: KernelHandle,
+    /// Multi-row passes on W4A4 at the checkpoint's input scales (`enable_w4a4_rows`).
+    w4a4_rows: Option<w4a4_rows::W4a4Rows>,
     /// BF16 dense MLP weights — when `Some`, all forward paths use the
     /// `dense_gemv_bf16` / `dense_gemm_bf16` kernels instead of w4a16
     /// NVFP4. Falls back to the NVFP4 weights when `None`. Set via
@@ -554,6 +559,7 @@ impl DenseFfnLayer {
             fp4mmq_down: std::sync::OnceLock::new(),
             w4a16_gemm_t_k64_k: super::k64_kernel(gpu).unwrap_or(KernelHandle(0)),
             act_mul,
+            w4a4_rows: None,
             bf16_weights: None,
             prefill_bf16_weights: None,
             dense_gemv_bf16_k,
@@ -995,6 +1001,7 @@ impl DenseFfnLayer {
         self.w4a16_gemv_silu_input = KernelHandle(0);
         self.w4a16_gemv_silu_input_sw = KernelHandle(0);
     }
+
 
     /// Single-token decode: 2-3 kernel launches depending on activation.
     /// SiLU: dual GEMV + SiLU-fused down GEMV (2 launches).
@@ -1894,7 +1901,8 @@ impl DenseFfnLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        if self.try_glm_canonical_rows(input, num_tokens, ctx, stream)?
+        if self.try_w4a4_rows(input, num_tokens, ctx, stream)?
+            || self.try_glm_canonical_rows(input, num_tokens, ctx, stream)?
             || self.try_glm_prefill_bf16(input, num_tokens, ctx, stream)?
         {
             return Ok(());
