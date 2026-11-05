@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! DFlash2 grouped dynamic causal convolution (`conv_kernel_size` taps; 2 on
-//! the Qwen drafters, 4 on Ripple's).
+//! DFlash2 2-tap grouped dynamic causal convolution.
 //!
 //! Wraps attention and MLP sublayers:
 //! - `prepare`: projects input states through `kernel_projection` to generate
@@ -54,12 +53,6 @@ impl Dflash2Conv {
             kernel_size,
             hidden_size,
         }
-    }
-
-    /// Byte offset of the output-side coefficients within one delta row
-    /// (`[input taps | output taps] x num_groups` BF16).
-    pub fn output_delta_offset(&self) -> usize {
-        self.kernel_size * self.num_groups * 2
     }
 
     /// Project input states to dynamic kernel delta and apply input-side convolution.
@@ -145,11 +138,10 @@ impl Dflash2Conv {
                 .arg_u32(h)
                 .arg_u32(self.group_size as u32)
                 .arg_u32(self.num_groups as u32)
-                .arg_u32(self.kernel_size as u32)
                 .launch(stream)?;
         }
 
-        let output_delta = delta_buf.offset(self.output_delta_offset());
+        let output_delta = delta_buf.offset(2 * self.num_groups * 2);
         Ok(output_delta)
     }
 
@@ -165,8 +157,7 @@ impl Dflash2Conv {
         stream: u64,
     ) -> Result<()> {
         let h = self.hidden_size as u32;
-        // base_kernel is [2 (input, output), kernel_size, hidden] BF16.
-        let output_base_kernel = self.base_kernel.weight.offset(self.kernel_size * self.hidden_size * 2);
+        let output_base_kernel = self.base_kernel.weight.offset(2 * self.hidden_size * 2);
 
         if let Some(k) = conv_kernel {
             let total_elems = gamma * h;
@@ -183,7 +174,6 @@ impl Dflash2Conv {
                 .arg_u32(h)
                 .arg_u32(self.group_size as u32)
                 .arg_u32(self.num_groups as u32)
-                .arg_u32(self.kernel_size as u32)
                 .launch(stream)?;
         }
         Ok(())

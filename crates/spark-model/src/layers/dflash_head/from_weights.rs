@@ -402,16 +402,7 @@ impl BlockDiffusionDraftHead {
                 ctx_positions_pinned_bytes,
                 ctx_positions_cursor: std::sync::atomic::AtomicUsize::new(0),
                 position_ids: gpu.alloc(n_attn * 4)?,
-                // [2 (input, output) x conv_kernel_size x num_groups] per row.
-                dflash2_conv_delta: gpu.alloc(
-                    n_attn
-                        * 2
-                        * weights.config.dflash_config.as_ref().and_then(|c| c.conv_kernel_size).unwrap_or(2)
-                        * (hidden_size
-                            / weights.config.dflash_config.as_ref().and_then(|c| c.conv_group_size).unwrap_or(16).max(1))
-                        .max(1)
-                        * bf16,
-                )?,
+                dflash2_conv_delta: gpu.alloc(n_attn * 4 * (hidden_size / 16).max(1) * bf16)?,
                 dflash2_conv_out: gpu.alloc(n_attn * hidden_size * bf16)?,
                 dflash2_projected_hidden: gpu.alloc(g * 256 * bf16)?,
                 dflash2_selector_scratch: gpu.alloc(selector_bytes)?,

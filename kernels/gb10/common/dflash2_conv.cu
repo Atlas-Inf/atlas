@@ -2,14 +2,13 @@
 #include <cuda_bf16.h>
 #include "atlas_pdl.cuh"
 
-// DFlash2 grouped dynamic causal convolution, `taps` taps (2 on the Qwen
-// drafters, 4 on Ripple's).
+// DFlash2 two-tap grouped dynamic causal convolution.
 //
 // Parameters:
 //   y: output buffer [K, hidden_size]
 //   x: input buffer [K, hidden_size]
-//   delta_kernel: dynamic delta kernel rows [K, 2 * taps * num_groups] (input half or output half)
-//   base_kernel: static base kernel [taps, hidden_size] (input or output side)
+//   delta_kernel: dynamic delta kernel [K, 2, num_groups]
+//   base_kernel: static base kernel [2, hidden_size]
 //   K: number of draft tokens in the block
 //   hidden_size: model hidden dimension D (e.g. 5120)
 //   group_size: number of channels sharing a dynamic delta (e.g. 16)
@@ -18,8 +17,9 @@
 // Formulation:
 //   For each token position t in [0, K) and channel c in [0, hidden_size):
 //     g = c / group_size
-//     tap_j = base_kernel[j, c] + delta_kernel[t, j, g]
-//     y[t, c] = sum_{j < taps, j <= t} tap_j * x[t - j, c]
+//     tap0 = base_kernel[0, c] + delta_kernel[t, 0, g]
+//     tap1 = base_kernel[1, c] + delta_kernel[t, 1, g]
+//     y[t, c] = tap0 * x[t, c] + (t > 0 ? tap1 * x[t - 1, c] : 0)
 //
 // Causal boundary: convolution never crosses token 0 (the block boundary).
 
@@ -31,8 +31,7 @@ extern "C" __global__ void dflash2_grouped_dynamic_causal_conv(
     unsigned int K,
     unsigned int hidden_size,
     unsigned int group_size,
-    unsigned int num_groups,
-    unsigned int taps
+    unsigned int num_groups
 ) {
     atlas_pdl_enter();
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -42,19 +41,21 @@ extern "C" __global__ void dflash2_grouped_dynamic_causal_conv(
     const unsigned int t = idx / hidden_size;
     const unsigned int c = idx % hidden_size;
     const unsigned int g = c / group_size;
-    // One delta row is [input taps | output taps] x num_groups; the caller
-    // passes the input or output half, both strided by the full row.
-    const unsigned int row_stride = 2 * taps * num_groups;
 
-    // Tap j weights position t - j (causal within the block). Tap 0 seeds the
-    // sum so the 2-tap drafters keep the former kernel's exact arithmetic.
-    float val = (__bfloat162float(base_kernel[c]) + __bfloat162float(delta_kernel[t * row_stride + g]))
-              * __bfloat162float(x[idx]);
-    for (unsigned int j = 1; j < taps && j <= t; ++j) {
-        float b = __bfloat162float(base_kernel[j * hidden_size + c]);
-        float d = __bfloat162float(delta_kernel[t * row_stride + j * num_groups + g]);
-        float xv = __bfloat162float(x[(t - j) * hidden_size + c]);
-        val += (b + d) * xv;
+    // Tap 0: current position t
+    float b0 = __bfloat162float(base_kernel[c]);
+    float d0 = __bfloat162float(delta_kernel[t * (4 * num_groups) + g]);
+    float k0 = b0 + d0;
+    float x0 = __bfloat162float(x[idx]);
+    float val = k0 * x0;
+
+    // Tap 1: previous position t - 1 (causal within block)
+    if (t > 0) {
+        float b1 = __bfloat162float(base_kernel[hidden_size + c]);
+        float d1 = __bfloat162float(delta_kernel[t * (4 * num_groups) + num_groups + g]);
+        float k1 = b1 + d1;
+        float x1 = __bfloat162float(x[(t - 1) * hidden_size + c]);
+        val += k1 * x1;
     }
 
     y[idx] = __float2bfloat16(val);
