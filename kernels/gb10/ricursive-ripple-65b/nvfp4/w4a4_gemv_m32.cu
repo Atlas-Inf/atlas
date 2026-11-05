@@ -50,9 +50,11 @@ __device__ __forceinline__ void w4g_mma(
           "r"(sfa), "h"(z), "h"(z), "r"(sfb), "h"(z), "h"(z));
 }
 
+// L1-allocating copies (.ca): on GB10 the .cg (L2-only) form of this
+// pipeline streams at ~192 GB/s, .ca at ~238 (pure-read roofline ~240).
 __device__ __forceinline__ void w4g_cp16(void* dst, const void* src) {
     unsigned d = __cvta_generic_to_shared(dst);
-    asm volatile("cp.async.cg.shared.global [%0],[%1],16;\n" : : "r"(d), "l"(src));
+    asm volatile("cp.async.ca.shared.global [%0],[%1],16;\n" : : "r"(d), "l"(src));
 }
 
 template <int BN>

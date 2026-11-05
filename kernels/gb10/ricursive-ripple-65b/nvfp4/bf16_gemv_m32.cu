@@ -9,13 +9,13 @@
 // o (5120 x 10240) projections dominate the verify step. cuBLASLt's 64x64
 // tiles at M = 32 stream them at ~175 GB/s. Here a CTA owns 32 weight rows
 // for all M rows: the weight panel streams through shared memory with 16-byte
-// cp.async (3 stages of 128 K values in flight), activations are read from
+// cp.async (stages of 256 K values in flight), activations are read from
 // L2 (every CTA reads the same small A), and the 4 warps split each stage's
 // K and reduce through shared memory. `mma.sync.m16n8k16` BF16. The tile
 // macros are tuned on GB10 (examples: kbench sweep); the host op's grid uses
 // the same B16G_BN.
 //
-// A: [M, K] row-major BF16. W: [N, K] row-major BF16. K % 512 == 0.
+// A: [M, K] row-major BF16. W: [N, K] row-major BF16. K % 256 == 0.
 // Grid: (ceil(N/16)). Block: 128.
 
 #include "atlas_pdl_touch.cuh"
@@ -25,13 +25,13 @@
 #define B16G_TOUCH_CTAS 96u
 
 #ifndef B16G_STAGES
-#define B16G_STAGES 3
+#define B16G_STAGES 4
 #endif
 #ifndef B16G_BN
-#define B16G_BN 16                       // GB10 sweep: 3 stages x 16 rows x KK 8 best
+#define B16G_BN 16                       // GB10 sweep: 4 stages x 16 rows x KK 4 best
 #endif
 #ifndef B16G_KK
-#define B16G_KK 8                        // k16 MMA steps per warp per stage
+#define B16G_KK 4                        // k16 MMA steps per warp per stage
 #endif
 #define B16G_KS (4 * 16 * B16G_KK)       // K values per stage (4 warps)
 #define B16G_PITCH (B16G_KS * 2 + 16)    // bytes; pad: 8 rows x 4 lanes -> 32 banks
@@ -45,9 +45,11 @@ __device__ __forceinline__ void b16g_mma(float* c, uint32_t a0, uint32_t a1, uin
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+// L1-allocating copies (.ca): on GB10 the .cg (L2-only) form of this
+// pipeline streams at ~192 GB/s, .ca at ~238 (pure-read roofline ~240).
 __device__ __forceinline__ void b16g_cp16(void* dst, const void* src) {
     unsigned d = __cvta_generic_to_shared(dst);
-    asm volatile("cp.async.cg.shared.global [%0],[%1],16;\n" : : "r"(d), "l"(src));
+    asm volatile("cp.async.ca.shared.global [%0],[%1],16;\n" : : "r"(d), "l"(src));
 }
 
 __device__ __forceinline__ void bf16_gemv_m32_impl(

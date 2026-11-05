@@ -35,9 +35,11 @@ __device__ __forceinline__ void f8g_mma(float* c, uint32_t a0, uint32_t a1, uint
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+// L1-allocating copies (.ca): on GB10 the .cg (L2-only) form of this
+// pipeline streams at ~192 GB/s, .ca at ~238 (pure-read roofline ~240).
 __device__ __forceinline__ void f8g_cp16(void* dst, const void* src) {
     unsigned d = __cvta_generic_to_shared(dst);
-    asm volatile("cp.async.cg.shared.global [%0],[%1],16;\n" : : "r"(d), "l"(src));
+    asm volatile("cp.async.ca.shared.global [%0],[%1],16;\n" : : "r"(d), "l"(src));
 }
 
 // Two E4M3 values (low byte first) -> packed BF16x2 (exact: E4M3 fits BF16).
