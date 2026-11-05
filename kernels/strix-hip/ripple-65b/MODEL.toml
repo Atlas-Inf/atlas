@@ -86,11 +86,13 @@ hidden_size = 5120
 # DFlash2 drafter: 4 SWA(4096)+RoPE layers then 1 full-attention NoPE layer,
 # 4-tap dynamic convs, top-32 selector, 16-token blocks. Its global layer was
 # trained on 16K-token rows (12,288 context + 4,096 predicted); the vendor's
-# SGLang wrapper refuses a draft window below 16384, so the context window
-# kept for the drafter is 16384.
+# SGLang wrapper refuses a draft window below 16384 (see ctx_window).
 [dflash]
 draft_model = "ricursiveAI/Ripple-65B-Preview-DFlash2"
 gamma = 16
-window_size = 16384
 mask_token_id = 100278
 target_layer_ids = [1, 20, 39, 58, 77]
+# Mixed drafter: sliding layers use the checkpoint's 4096 window (a head-wide
+# `window_size` here would be an error); context retention is the vendor
+# `speculative-draft-window-size` 16384.
+ctx_window = 16384
