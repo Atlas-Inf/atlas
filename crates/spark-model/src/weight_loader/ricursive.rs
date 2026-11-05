@@ -182,16 +182,16 @@ fn load_attention(
         dense(store, &format!("{lp}.post_attention_layernorm.weight"))?,
         dense(store, &format!("{lp}.post_feedforward_layernorm.weight"))?,
     );
-    match config.layer_types[i] {
-        LayerType::SlidingAttention => {
-            layer.set_sliding_window(Some(config.sliding_window));
-            layer.set_rope_overrides(config.rope_theta as f32, hd as u32);
-        }
-        LayerType::FullAttention => {
-            layer.set_sliding_window(None);
-            layer.set_rope_disabled(true);
-        }
-        other => anyhow::bail!("ricursive layer {i} is not attention: {other:?}"),
+    ensure!(
+        config.layer_types[i] == LayerType::FullAttention && i < config.sliding_layers.len(),
+        "ricursive layer {i}: parser must list FullAttention + the sliding pattern"
+    );
+    if config.sliding_layers[i] {
+        layer.set_sliding_window(Some(config.sliding_window));
+        layer.set_rope_overrides(config.rope_theta as f32, hd as u32);
+    } else {
+        layer.set_sliding_window(None);
+        layer.set_rope_disabled(true);
     }
     if config.value_residual {
         let lambda = load_scalar(store, gpu, &format!("{p}.value_res_lambda"))?;

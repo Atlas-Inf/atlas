@@ -131,6 +131,7 @@ impl ModelConfig {
             embed_scale: 0.0,
             ffn_clamp_threshold: 0.0,
             value_residual: false,
+            sliding_layers: Vec::new(),
             // MiniMax M2 fields — all default to "unused" (empty/0) so the
             // base Qwen3-Next-80B template behaves identically to before.
             scoring_func: String::new(),

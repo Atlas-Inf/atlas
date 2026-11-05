@@ -87,6 +87,14 @@ pub(crate) fn parse_ricursive(raw: &Value) -> Result<ModelConfig> {
         .and_then(Value::as_f64)
         .map_or(0.0, |c| c as f32);
     config.value_residual = raw.get("use_valres").and_then(Value::as_bool) == Some(true);
+    // Keep the sliding/global pattern for the loader, then list every layer
+    // as FullAttention (see `ModelConfig::sliding_layers`).
+    config.sliding_layers = config
+        .layer_types
+        .iter()
+        .map(|t| *t == LayerType::SlidingAttention)
+        .collect();
+    config.layer_types = vec![LayerType::FullAttention; config.num_hidden_layers];
 
     finalize_config(&mut config, raw)?;
     Ok(config)
@@ -132,8 +140,8 @@ mod tests {
         assert_eq!(c.num_key_value_heads, 8);
         assert_eq!(c.head_dim, 128);
         assert_eq!(c.sliding_window, 1024);
-        assert_eq!(c.layer_types[0], LayerType::SlidingAttention);
-        assert_eq!(c.layer_types[4], LayerType::FullAttention);
+        assert!(c.layer_types.iter().all(|t| *t == LayerType::FullAttention));
+        assert_eq!(c.sliding_layers, vec![true, true, true, true, false]);
         assert!(c.attn_gated);
         assert!(c.value_residual);
         assert_eq!(c.ffn_clamp_threshold, 20.0);
