@@ -12,8 +12,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use spark_model::layers::ops::{
-    DFLASH2_SELECTOR_MAX_RANK, DFLASH2_SELECTOR_MAX_SPLITS, DFLASH2_SELECTOR_MAX_TOP_K_CUDA,
-    DFLASH2_SELECTOR_MAX_TOP_K_HIP, DFLASH2_SELECTOR_THREADS_CUDA, DFLASH2_SELECTOR_THREADS_HIP,
+    DFLASH2_SELECTOR_MAX_RANK, DFLASH2_SELECTOR_MAX_SPLITS, DFLASH2_SELECTOR_MAX_TOP_K,
+    DFLASH2_SELECTOR_THREADS,
 };
 
 const KERNEL_GB10: &str = "gb10/common/dflash2_candidate_selector.cu";
@@ -50,14 +50,11 @@ fn kernel_define(src: &str, name: &str) -> usize {
 
 #[test]
 fn caps_match_kernel_defines() {
-    for (rel, top_k) in [
-        (KERNEL_GB10, DFLASH2_SELECTOR_MAX_TOP_K_CUDA),
-        (KERNEL_STRIX, DFLASH2_SELECTOR_MAX_TOP_K_HIP),
-    ] {
+    for rel in [KERNEL_GB10, KERNEL_STRIX] {
         let src = kernel_src(rel);
         assert_eq!(
             kernel_define(&src, "DF2_SEL_MAX_TOP_K"),
-            top_k,
+            DFLASH2_SELECTOR_MAX_TOP_K,
             "DF2_SEL_MAX_TOP_K drifted from DFLASH2_SELECTOR_MAX_TOP_K in {rel}"
         );
         assert_eq!(
@@ -66,16 +63,16 @@ fn caps_match_kernel_defines() {
             "DF2_SEL_MAX_RANK drifted from DFLASH2_SELECTOR_MAX_RANK in {rel}"
         );
     }
-    for (rel, threads) in [
-        (KERNEL_GB10, DFLASH2_SELECTOR_THREADS_CUDA),
-        (KERNEL_STRIX, DFLASH2_SELECTOR_THREADS_HIP),
-    ] {
+    for rel in [KERNEL_GB10, KERNEL_STRIX] {
         let src = kernel_src(rel);
         assert_eq!(
             kernel_define(&src, "DF2_SEL_MAX_SPLITS"),
             DFLASH2_SELECTOR_MAX_SPLITS
         );
-        assert_eq!(kernel_define(&src, "DF2_SEL_THREADS"), threads as usize);
+        assert_eq!(
+            kernel_define(&src, "DF2_SEL_THREADS"),
+            DFLASH2_SELECTOR_THREADS as usize
+        );
     }
 }
 
