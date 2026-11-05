@@ -82,6 +82,10 @@ pub struct DflashConfig {
     pub sliding_window: Option<usize>,
     #[serde(default)]
     pub layer_types: Option<Vec<String>>,
+    /// Drafter layers that apply no RoPE (Ripple's DFlash2: its final,
+    /// full-attention layer). Absent = every layer is rotated.
+    #[serde(default)]
+    pub no_rope_layers: Option<Vec<usize>>,
     /// NVIDIA LiLiCorr drafters ship their own `lm_head` (`Some(true)`);
     /// generic DFlash drafters omit the key and share the target's head.
     pub has_own_lm_head: Option<bool>,
