@@ -200,6 +200,7 @@ pub(super) fn generate_target_ptx_rs(
              \x20               tool_retry: {},\n\
              \x20               preserve_thinking: {:?},\n\
              \x20               verbatim_prompt: {},\n\
+             \x20               nvfp4_verbatim_prompt: {:?},\n\
              \x20               eos_ends_thinking: {},\n\
              \x20               tool_call_steering: {},\n\
              \x20               verbatim_reasoning_effort: {},\n\
@@ -253,6 +254,7 @@ pub(super) fn generate_target_ptx_rs(
             target.behavior_tool_retry,
             target.behavior_preserve_thinking,
             target.behavior_verbatim_prompt,
+            target.behavior_nvfp4_verbatim_prompt,
             target.behavior_eos_ends_thinking,
             target.behavior_tool_call_steering,
             target.behavior_verbatim_reasoning_effort,
