@@ -51,7 +51,7 @@ pub(super) fn load_layers(
             lerp_k,
             wide_gemv_k,
             verify_attn_k,
-        });
+        })?;
         gpu.synchronize(stream)?;
         layers.push(Box::new(layer));
     }
@@ -91,7 +91,8 @@ fn load_ffn(
         DenseFfnLayer::new_with_activation(weights, FfnActivation::SiLU, gpu, "ricursive")?;
     // Target-only clamped SwiGLU; the drafter keeps the unclamped common kernel.
     layer.set_act_mul(gpu.kernel("ricursive_swiglu", "silu_mul_clamp20")?);
-    layer.enable_w4a4_rows(gpu, input_scales)?;
+    let limit = atlas_core::config::RICURSIVE_FFN_CLAMP as f32;
+    layer.enable_w4a4_rows(gpu, input_scales, limit, [h, inter])?;
     Ok(FfnComponent::Dense(layer))
 }
 

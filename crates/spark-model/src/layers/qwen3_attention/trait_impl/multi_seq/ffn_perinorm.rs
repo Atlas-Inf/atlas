@@ -40,13 +40,11 @@ impl Qwen3AttentionLayer {
         else {
             anyhow::bail!("PeriNorm multi-row FFN needs both post-sublayer norms");
         };
+        // `has_post_sublayer_norms` (the only caller's gate) already excludes
+        // MoE and the layer scalar.
         ensure!(
-            self.ffn.is_dense()
-                && self.moe_ffn.is_none()
-                && self.layer_scalar.is_none()
-                && self.mla.is_none()
-                && self.hc.is_none(),
-            "PeriNorm multi-row FFN covers dense blocks only (no MoE/layer scalar/MLA/HC)"
+            self.ffn.is_dense() && self.mla.is_none() && self.hc.is_none(),
+            "PeriNorm multi-row FFN covers dense blocks only (no MLA/HC)"
         );
         let (gpu, rows, width) = (fwd.gpu, n as u32, h as u32);
         ops::rms_norm(

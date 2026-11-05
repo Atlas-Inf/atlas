@@ -160,7 +160,7 @@ impl Qwen3AttentionLayer {
         Ok(())
     }
 
-    pub(super) fn qkv_is_dense_bf16(&self) -> bool {
+    pub(crate) fn qkv_is_dense_bf16(&self) -> bool {
         let dense = |w: &Option<crate::weight_map::QuantWeight>| {
             w.as_ref()
                 .is_none_or(|w| w.as_nvfp4().is_none() && w.as_fp8().is_none())

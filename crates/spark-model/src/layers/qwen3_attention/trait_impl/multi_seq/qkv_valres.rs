@@ -5,11 +5,11 @@
 //!
 //! One BF16 GEMM per projection reads each weight once for all `n` rows (the
 //! DFlash verify width), instead of the per-row GEMV loop gated BF16 layers
-//! otherwise fall into. The contiguous outputs land in the per-row `qkv_buf`
+//! otherwise fall into; `set_value_residual` guarantees the dense BF16 weights. The contiguous outputs land in the per-row `qkv_buf`
 //! layout through one pitched copy per projection, and the interleaved
 //! `[Q_h | G_h]` rows are split in place.
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
 
 use super::ctx::MultiSeqCtx;
 use crate::layers::ops;
@@ -33,10 +33,6 @@ impl Qwen3AttentionLayer {
             qkv_buf,
             ..
         } = *c;
-        ensure!(
-            self.qkv_is_dense_bf16() && self.lora.is_none(),
-            "value-residual Q/K/V needs dense BF16 projections without LoRA"
-        );
         let kv_dim = nkv * hd;
         let kv_bytes = kv_dim as usize * bf16;
         let v_in = self.value_residual_input(fwd.gpu, normed, n, h, stream)?;

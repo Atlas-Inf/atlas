@@ -821,8 +821,8 @@ pub use gguf::{GgufConfigInputs, GgufMeta, config_from_gguf};
 pub use ngram::{NgramDims, ngram_ids, shift_right_ignore_eos, shift_right_ignore_eos_fill};
 pub use ngram_qwen4exp::Qwen4ExpNgram;
 pub use parsers::{
-    Exl3QuantConfig, PEFT_SUPPORTED_TARGET_MODULES, PeftAdapterConfig, parse_mistral_params,
-    parse_peft_adapter_config, parse_quantization_config,
+    Exl3QuantConfig, PEFT_SUPPORTED_TARGET_MODULES, PeftAdapterConfig, RICURSIVE_FFN_CLAMP,
+    parse_mistral_params, parse_peft_adapter_config, parse_quantization_config,
 };
 pub(crate) use parsers::{
     parse_deepseek_v4, parse_gemma4_params, parse_glm5_next, parse_glm5_vision_config,

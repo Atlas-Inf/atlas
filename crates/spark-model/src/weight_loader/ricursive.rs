@@ -58,7 +58,7 @@ impl ModelWeightLoader for RicursiveWeightLoader {
             vr.x0 = x0;
             vr.blended = blended;
             vr.max_rows = max_tokens;
-            attn.set_value_residual(vr);
+            attn.set_value_residual(vr)?;
         }
         Ok(())
     }
