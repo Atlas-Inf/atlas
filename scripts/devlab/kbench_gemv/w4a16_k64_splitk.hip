@@ -5,7 +5,9 @@
 // rocprofv3 (f236) 2.4 ms per Ripple call vs ~0.5 ms to stream the weights.
 // Candidate: the same K64 tile loop over K-slices (blockIdx.z), fp32 partials,
 // fixed-order reduce. NOT bit-identical (fp32 partial sums) — reports rel error.
-#include "w4a16_gemm.cu"
+// The 27B tree's copy (kbench stages it at <tmp>/q27; common/ has a different w4a16_gemm.cu).
+#include "../q27/w4a16_gemm.cu"
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -99,7 +101,7 @@ extern "C" __global__ void splitk_reduce(const float* __restrict__ P, __nv_bfloa
     C[i] = __float2bfloat16(s);
 }
 
-static float bf(__nv_bfloat16 x) { unsigned short u; memcpy(&u, &x, 2); unsigned int v = (unsigned int)u << 16; float f; memcpy(&f, &v, 4); return f; }
+static float bf(__nv_bfloat16 x) { unsigned short u; std::memcpy(&u, &x, 2); unsigned int v = (unsigned int)u << 16; float f; std::memcpy(&f, &v, 4); return f; }
 
 int main() {
     struct Shape { const char* name; unsigned int M, N, K; } shapes[] = {
