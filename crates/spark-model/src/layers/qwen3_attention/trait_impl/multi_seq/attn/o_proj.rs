@@ -225,9 +225,13 @@ impl Qwen3AttentionLayer {
                     c0 += m;
                 }
             } else {
-                ops::dense_gemm(
+                // n > 8 (DFlash verify rows): the pipelined tensor-core GEMM
+                // when the target ships it — the scalar dense_gemm measured
+                // 1.85 ms per Ripple layer at 16 rows (rocprofv3, f236).
+                ops::dense_gemm_prefill(
                     fwd.gpu,
                     self.dense_gemm_k,
+                    self.dense_gemm_pipelined_k,
                     attn_out,
                     o_bf16,
                     o_out,
