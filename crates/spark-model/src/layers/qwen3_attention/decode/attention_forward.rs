@@ -542,6 +542,15 @@ impl Qwen3AttentionLayer {
             )?;
         }
 
+        // ATLAS_OP_DUMP (eager decode only — the dump synchronizes).
+        if !ctx.graph_capture {
+            let l = self.attn_layer_idx;
+            let od = |p, n: u32, op| super::super::op_dump::dump_bf16(ctx.gpu, p, 0, n as usize, l, op, stream);
+            od(q_out, nq * hd, "dec_q_post_rope")?;
+            od(k_out, nkv * hd, "dec_k_post_rope")?;
+            od(v_out, nkv * hd, "dec_v_proj")?;
+        }
+
         // K/V are contiguous (separate dense_gemm outputs), stride = nkv * hd
         let kv_stride = nkv * hd;
         self.write_kv_cache(
@@ -767,6 +776,9 @@ impl Qwen3AttentionLayer {
                 .launch(stream)?;
         }
 
+        if !ctx.graph_capture {
+            super::super::op_dump::dump_bf16(ctx.gpu, attn_out, 0, (nq * hd) as usize, self.attn_layer_idx, "dec_attn_out_pre_gate", stream)?;
+        }
         // Apply sigmoid gate: attn_out = attn_out * sigmoid(gate)
         if self.gated {
             let gate_ptr = q_out.offset(q_dim as usize * 2);
