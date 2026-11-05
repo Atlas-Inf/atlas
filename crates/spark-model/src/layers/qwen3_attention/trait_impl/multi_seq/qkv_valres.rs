@@ -45,20 +45,22 @@ impl Qwen3AttentionLayer {
         let k_scratch = fwd.buffers.attn_output();
         let v_scratch = k_scratch.offset(n * kv_bytes);
         let (m, k) = (n as u32, h as u32);
-        ops::bf16_gemm(normed, self.attn.q_proj.weight.0, q_scratch, m, q_proj_dim, k, stream)?;
+        let gpu = fwd.gpu;
+        // q|gate (the widest projection) straight into its qkv_buf rows.
+        let q_direct = self.wide_bf16_gemv(n);
+        if let Some(gemv) = q_direct {
+            let ldc = (per_seq_qkv / bf16) as u32;
+            let q_w = self.attn.q_proj.weight;
+            ops::bf16_gemv_m32(gpu, gemv, normed, q_w, qkv_buf, [m, q_proj_dim, k], ldc, stream)?;
+        } else {
+            ops::bf16_gemm(normed, self.attn.q_proj.weight.0, q_scratch, m, q_proj_dim, k, stream)?;
+        }
         ops::bf16_gemm(normed, self.attn.k_proj.weight.0, k_scratch, m, kv_dim, k, stream)?;
         ops::bf16_gemm(v_in, self.attn.v_proj.weight.0, v_scratch, m, kv_dim, k, stream)?;
 
-        let gpu = fwd.gpu;
-        gpu.copy_d2d_2d_async(
-            q_scratch,
-            q_proj_bytes,
-            qkv_buf,
-            per_seq_qkv,
-            q_proj_bytes,
-            n,
-            stream,
-        )?;
+        if q_direct.is_none() {
+            gpu.copy_d2d_2d_async(q_scratch, q_proj_bytes, qkv_buf, per_seq_qkv, q_proj_bytes, n, stream)?;
+        }
         let k_dst = qkv_buf.offset(q_proj_bytes);
         gpu.copy_d2d_2d_async(k_scratch, kv_bytes, k_dst, per_seq_qkv, kv_bytes, n, stream)?;
         let v_dst = k_dst.offset(kv_bytes);

@@ -358,10 +358,11 @@ impl Qwen3AttentionLayer {
             w4a16_gemv_dual_k: gpu.kernel("w4a16_gemv_fused", "w4a16_gemv_dual")?,
             rope_k: gpu.kernel("rope", "rope_forward")?,
             rope_strided_k: super::super::try_kernel(gpu, "rope", "rope_forward_strided"),
-            // Offset-from-1 only (no vanilla twin): plain-`x * w` models take
-            // the per-row `rms_norm_w_k` loop in `ms_qkv_norms` instead.
+            // `rms_norm_strided` is offset-from-1: plain-`x * w` models take a
+            // target's vanilla twin, else (handle 0) the per-row loop in
+            // `ms_qkv_norms`.
             rms_norm_strided_k: if crate::ships_vanilla_norm_weights(config) {
-                KernelHandle(0)
+                super::super::try_kernel(gpu, "rms_norm_vanilla_strided", "rms_norm_vanilla_strided")
             } else {
                 super::super::try_kernel(gpu, "norm", "rms_norm_strided")
             },

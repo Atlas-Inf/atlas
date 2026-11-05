@@ -34,6 +34,8 @@ pub struct ValueResidual {
     /// Layer 0 writes `x0`; every other layer only reads it.
     pub capture: bool,
     pub lerp_k: KernelHandle,
+    /// `bf16_gemv_m32`: the wide-verify BF16 q|gate and o projections.
+    pub wide_gemv_k: KernelHandle,
 }
 
 /// `bf16(sigmoid(lambda))` with the sigmoid evaluated in f32 on the BF16
@@ -49,6 +51,14 @@ impl Qwen3AttentionLayer {
     /// opts in, so other models' verify numerics are unchanged.
     pub(crate) fn wide_bf16_gemm(&self) -> bool {
         self.value_residual.is_some()
+    }
+
+    /// The small-M BF16 GEMV for `rows` verify rows, or `None` (wider, or a
+    /// model without it): callers fall back to the cuBLASLt GEMM.
+    pub(crate) fn wide_bf16_gemv(&self, rows: usize) -> Option<KernelHandle> {
+        self.value_residual
+            .map(|vr| vr.wide_gemv_k)
+            .filter(|_| rows as u32 <= crate::layers::ops::BF16_GEMV_MAX_M)
     }
 
     pub fn set_value_residual(&mut self, vr: ValueResidual) {

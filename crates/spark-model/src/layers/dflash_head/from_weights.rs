@@ -181,6 +181,7 @@ impl BlockDiffusionDraftHead {
             dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             w4a16_gemm: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm"),
             dense_gemm_pipelined: gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?,
+            bf16_gemv_m32: crate::layers::try_kernel(gpu, "bf16_gemv_m32", "bf16_gemv_m32"),
             dflash2_conv: gpu
                 .kernel("dflash2_conv", "dflash2_grouped_dynamic_causal_conv")
                 .ok(),

@@ -351,3 +351,37 @@ mod tests {
         assert!(!matches_pipelined(104) && !matches_pipelined(120));
     }
 }
+
+/// Rows [`bf16_gemv_m32`] serves (two 16-row MMA fragments).
+pub const BF16_GEMV_MAX_M: u32 = 32;
+
+/// Small-M BF16 GEMV (`bf16_gemv_m32`, Ricursive target): `out[m, n]` (row
+/// stride `ldc`) = `act[m, k] . weight[n, k]^T` for `m <= BF16_GEMV_MAX_M`,
+/// 16 weight rows per CTA streamed once through shared memory.
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_gemv_m32(
+    gpu: &dyn GpuBackend,
+    kernel: spark_runtime::gpu::KernelHandle,
+    act: DevicePtr,
+    weight: DevicePtr,
+    out: DevicePtr,
+    [m, n, k]: [u32; 3],
+    ldc: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        (1..=BF16_GEMV_MAX_M).contains(&m) && k.is_multiple_of(512) && ldc >= n,
+        "bf16_gemv_m32: m={m} n={n} k={k} ldc={ldc} unsupported"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 16), 1, 1]) // B16G_BN
+        .block([128, 1, 1])
+        .arg_ptr(act)
+        .arg_ptr(weight)
+        .arg_ptr(out)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(ldc)
+        .launch(stream)
+}

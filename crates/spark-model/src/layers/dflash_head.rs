@@ -71,6 +71,8 @@ pub struct DflashKernels {
     /// (and ~4× OOB → CUDA-700). `.0 == 0` when the target lm_head is BF16.
     pub w4a16_gemm: KernelHandle,
     pub dense_gemm_pipelined: KernelHandle,
+    /// `bf16_gemv_m32` (Ricursive's target): 1..=32-row drafter GEMMs; 0 elsewhere.
+    pub bf16_gemv_m32: KernelHandle,
     pub rope_qwen3: KernelHandle,
     pub reshape_cache_fp8: KernelHandle,
     /// BF16 KV cache writeback. Used by Phase 2 `precompute_ctx_kv` and

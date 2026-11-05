@@ -13,7 +13,6 @@
 //! so the zeroed head exercises the production cleanup path faithfully.
 
 use std::collections::HashMap;
-
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::gpu::mock::MockGpuBackend;
 use spark_runtime::gpu::{DevicePtr, KernelHandle};
@@ -191,6 +190,7 @@ pub(super) fn zero_kernels() -> DflashKernels {
         dense_gemm: zero,
         w4a16_gemm: zero,
         dense_gemm_pipelined: zero,
+        bf16_gemv_m32: zero,
         rope_qwen3: zero,
         reshape_cache_fp8: zero,
         reshape_cache_bf16: zero,
