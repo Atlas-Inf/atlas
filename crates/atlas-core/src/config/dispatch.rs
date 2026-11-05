@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use super::{
     LayerType, ModelConfig, default_conv_kernel, default_partial_rotary, default_rms_eps,
     default_rope_theta, finalize_config, parse_deepseek_v4, parse_gemma4_params, parse_glm5_next,
-    parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_mistral_params,
+    parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_mistral_params, parse_ricursive,
     parse_quantization_config, parse_qwen4_exp, parse_step3p7, parse_vision_config,
     validate_config,
 };
@@ -192,6 +192,7 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
         "nemotron_h_omni" => dispatch_nemotron::parse_nemotron_h_omni(&raw),
         "gemma4" => parse_gemma4_params(&raw),
         "laguna" => parse_laguna(&raw),
+        "ricursive" => parse_ricursive(&raw),
         "longcat_flash_ngram" | "longcat_flash" => parse_longcat_ngram(&raw),
         // Nested text_config like qwen3_5_moe, but hyper-connections, the QSA
         // indexer and PLE n-gram injection put it outside that arm.

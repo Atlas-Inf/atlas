@@ -821,7 +821,8 @@ pub use parsers::{
 };
 pub(crate) use parsers::{
     parse_deepseek_v4, parse_gemma4_params, parse_glm5_next, parse_glm5_vision_config,
-    parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_qwen4_exp, parse_step3p7,
+    parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_qwen4_exp, parse_ricursive,
+    parse_step3p7,
     parse_vision_config,
 };
 pub use vision::{OmniVisionConfig, PixelBounds, VisionConfig, VisionTokenBudgets};

@@ -14,6 +14,7 @@ mod minimax;
 mod mistral;
 mod quantization;
 mod qwen4_exp;
+mod ricursive;
 mod step3p7;
 mod vision;
 
@@ -28,5 +29,6 @@ pub(crate) use minimax::parse_minimax_m2;
 pub use mistral::parse_mistral_params;
 pub use quantization::parse_quantization_config;
 pub(crate) use qwen4_exp::parse_qwen4_exp;
+pub(crate) use ricursive::parse_ricursive;
 pub(crate) use step3p7::parse_step3p7;
 pub(crate) use vision::{parse_glm5_vision_config, parse_vision_config};
