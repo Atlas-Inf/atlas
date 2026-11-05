@@ -9,6 +9,7 @@
 //
 // Grid: (ceil(N/256), 1, 1)  Block: (256, 1, 1)
 
+#include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 extern "C" __global__ void value_residual_lerp(
@@ -18,6 +19,7 @@ extern "C" __global__ void value_residual_lerp(
     unsigned int n,
     float w
 ) {
+    atlas_pdl_enter();
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float start = __bfloat162float(x0[i]);

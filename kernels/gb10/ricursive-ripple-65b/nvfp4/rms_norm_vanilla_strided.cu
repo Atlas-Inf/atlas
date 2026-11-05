@@ -7,6 +7,7 @@
 //
 // Grid: (rows_per_group, num_groups, 1)   Block: (min(hidden_size, 1024), 1, 1)
 
+#include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 __device__ __forceinline__ float rmsvs_warp_sum(float v) {
@@ -22,6 +23,7 @@ extern "C" __global__ void rms_norm_vanilla_strided(
     float eps,
     unsigned int row_stride                     // elements between GROUPS
 ) {
+    atlas_pdl_enter();
     const unsigned int tid = threadIdx.x;
     const unsigned long long base =
         (unsigned long long)blockIdx.y * row_stride + (unsigned long long)blockIdx.x * hidden_size;

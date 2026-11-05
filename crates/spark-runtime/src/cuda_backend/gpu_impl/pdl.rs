@@ -33,6 +33,11 @@ pub(super) const PDL_TARGETS: &[PdlTarget] = &[
         switch: "ATLAS_QWEN4EXP_PDL",
         kernels: QWEN4EXP_PDL_KERNELS,
     },
+    PdlTarget {
+        model: "ricursive-ripple-65b",
+        switch: "ATLAS_RICURSIVE_PDL",
+        kernels: RICURSIVE_PDL_KERNELS,
+    },
 ];
 
 static PDL_TARGET: OnceLock<Option<&'static PdlTarget>> = OnceLock::new();
@@ -284,6 +289,23 @@ pub(super) const QWEN4EXP_PDL_KERNELS: &[&str] = &[
     "moe_batched_blend",
     "moe_blend_hc_post",
     "bf16_add_inplace",
+];
+
+/// Ricursive Ripple: the DFlash verify chain. The small-M GEMVs touch their
+/// weight panels into L2 during the wait (`atlas_pdl_enter_touch`); the rest
+/// enter with `atlas_pdl_enter()`.
+pub(super) const RICURSIVE_PDL_KERNELS: &[&str] = &[
+    "bf16_gemv_m32",
+    "w4a4_gemv_m32_bn32",
+    "w4a4_gemv_m32_bn16",
+    "silu_mul_clamp20",
+    "value_residual_lerp",
+    "rms_norm_vanilla_strided",
+    "quantize_bf16_to_nvfp4",
+    "rms_norm_vanilla",
+    "paged_decode_attn",
+    "reshape_and_cache_flash",
+    "sigmoid_gate_mul",
 ];
 
 #[cfg(test)]

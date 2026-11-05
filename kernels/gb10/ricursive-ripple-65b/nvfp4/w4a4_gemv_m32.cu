@@ -16,8 +16,13 @@
 // NVFP4 layout, as `quantize_bf16_to_nvfp4[_scaled]` writes it. B: the same
 // layout [N, K/2] / [N, K/16]. K % (256 * W4G_SPW) == 0. Grid: (ceil(N/BN)). Block: 128.
 
+#include "atlas_pdl_touch.cuh"
 #include <cuda_bf16.h>
 #include <stdint.h>
+
+// PDL entry: the first W4G_TOUCH_CTAS CTAs pull their weight panels' first
+// W4G_STAGES stages into L2 while the predecessor finishes (weights only).
+#define W4G_TOUCH_CTAS 96u
 
 #define W4G_WARPS 4
 #ifndef W4G_STAGES
@@ -186,14 +191,20 @@ __device__ __forceinline__ void w4a4_gemv_m32_impl(
 // at 32-row panels; narrow N (down, 5120 x 40960) 181 GB/s at 16-row panels.
 extern "C" __global__ void __launch_bounds__(128) w4a4_gemv_m32_bn32(
     const uint8_t* __restrict__ A_packed, const uint8_t* __restrict__ A_sf,
-    const uint8_t* __restrict__ B_packed, const uint8_t* __restrict__ B_sf,
+    const unsigned char* __restrict__ B_packed, const unsigned char* __restrict__ B_sf,
     __nv_bfloat16* __restrict__ C, float scaleA2, float scaleB2, int M, int N, int K) {
+    atlas_pdl_enter_touch({B_packed, W4G_STAGES * W4G_ROWB, (unsigned long long)K / 2u},
+                          {B_sf, W4G_STAGES * W4G_ROWS, (unsigned long long)K / 16u},
+                          min((unsigned)N, W4G_TOUCH_CTAS * 32u), blockIdx.x, W4G_TOUCH_CTAS);
     w4a4_gemv_m32_impl<32>(A_packed, A_sf, B_packed, B_sf, C, scaleA2, scaleB2, M, N, K);
 }
 
 extern "C" __global__ void __launch_bounds__(128) w4a4_gemv_m32_bn16(
     const uint8_t* __restrict__ A_packed, const uint8_t* __restrict__ A_sf,
-    const uint8_t* __restrict__ B_packed, const uint8_t* __restrict__ B_sf,
+    const unsigned char* __restrict__ B_packed, const unsigned char* __restrict__ B_sf,
     __nv_bfloat16* __restrict__ C, float scaleA2, float scaleB2, int M, int N, int K) {
+    atlas_pdl_enter_touch({B_packed, W4G_STAGES * W4G_ROWB, (unsigned long long)K / 2u},
+                          {B_sf, W4G_STAGES * W4G_ROWS, (unsigned long long)K / 16u},
+                          min((unsigned)N, W4G_TOUCH_CTAS * 16u), blockIdx.x, W4G_TOUCH_CTAS);
     w4a4_gemv_m32_impl<16>(A_packed, A_sf, B_packed, B_sf, C, scaleA2, scaleB2, M, N, K);
 }

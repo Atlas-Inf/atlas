@@ -17,6 +17,7 @@
 //
 // Grid: (ceil(total_elements / 256), 1, 1)  Block: (256, 1, 1)
 
+#include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 extern "C" __global__ void silu_mul_clamp20(
@@ -25,6 +26,7 @@ extern "C" __global__ void silu_mul_clamp20(
     __nv_bfloat16* __restrict__ output,
     unsigned int total_elements
 ) {
+    atlas_pdl_enter();
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_elements) return;
 

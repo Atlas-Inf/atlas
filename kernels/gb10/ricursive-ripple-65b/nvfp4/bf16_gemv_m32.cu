@@ -16,8 +16,11 @@
 // A: [M, K] row-major BF16. W: [N, K] row-major BF16. K % 512 == 0.
 // Grid: (ceil(N/16)). Block: 128.
 
+#include "atlas_pdl_touch.cuh"
 #include <cuda_bf16.h>
 #include <stdint.h>
+
+#define B16G_TOUCH_CTAS 96u
 
 #ifndef B16G_STAGES
 #define B16G_STAGES 3
@@ -45,7 +48,7 @@ __device__ __forceinline__ void b16g_cp16(void* dst, const void* src) {
     asm volatile("cp.async.cg.shared.global [%0],[%1],16;\n" : : "r"(d), "l"(src));
 }
 
-extern "C" __global__ void __launch_bounds__(128) bf16_gemv_m32(
+__device__ __forceinline__ void bf16_gemv_m32_impl(
     const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ W,
     __nv_bfloat16* __restrict__ C, int M, int N, int K, int ldc) {
     constexpr int NF = B16G_BN / 8;
@@ -163,4 +166,15 @@ extern "C" __global__ void __launch_bounds__(128) bf16_gemv_m32(
                 if (m < (unsigned)M && n < (unsigned)N)
                     C[(size_t)m * ldc + n] = __float2bfloat16(acc[mf][nf][j]);
             }
+}
+
+// PDL entry: the first B16G_TOUCH_CTAS CTAs pull their panels' first
+// B16G_STAGES stages into L2 while the predecessor finishes (weights only;
+// the second region is empty).
+extern "C" __global__ void __launch_bounds__(128) bf16_gemv_m32(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
+    __nv_bfloat16* __restrict__ C, int M, int N, int K, int ldc) {
+    atlas_pdl_enter_touch({W, B16G_STAGES * B16G_KS * 2u, (unsigned long long)K * 2u}, {W, 0u, 0ull},
+                          min((unsigned)N, B16G_TOUCH_CTAS * B16G_BN), blockIdx.x, B16G_TOUCH_CTAS);
+    bf16_gemv_m32_impl(A, reinterpret_cast<const __nv_bfloat16*>(W), C, M, N, K, ldc);
 }
