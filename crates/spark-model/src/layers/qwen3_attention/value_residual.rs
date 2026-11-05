@@ -51,7 +51,9 @@ impl Qwen3AttentionLayer {
     /// The prefill-style verify attention (`attn_rows.rs`), when the target
     /// ships it (Ricursive). 0 elsewhere.
     pub(crate) fn verify_rows_attn_k(&self) -> Option<KernelHandle> {
-        self.value_residual.map(|vr| vr.verify_attn_k).filter(|k| k.0 != 0)
+        self.value_residual
+            .map(|vr| vr.verify_attn_k)
+            .filter(|k| k.0 != 0)
     }
 
     /// Wide (n > 8) multi-row BF16 projections take the cuBLASLt GEMM rather

@@ -21,7 +21,11 @@ impl Qwen3AttentionLayer {
             && self.moe_ffn.is_none()
     }
 
-    pub(super) fn ms_phase_ffn_perinorm(&self, c: &MultiSeqCtx<'_>, o_out: DevicePtr) -> Result<()> {
+    pub(super) fn ms_phase_ffn_perinorm(
+        &self,
+        c: &MultiSeqCtx<'_>,
+        o_out: DevicePtr,
+    ) -> Result<()> {
         let MultiSeqCtx {
             fwd,
             n,
@@ -45,7 +49,17 @@ impl Qwen3AttentionLayer {
             "PeriNorm multi-row FFN covers dense blocks only (no MoE/layer scalar/MLA/HC)"
         );
         let (gpu, rows, width) = (fwd.gpu, n as u32, h as u32);
-        ops::rms_norm(gpu, self.rms_norm_w_k, o_out, post_attn, o_out, rows, width, eps, stream)?;
+        ops::rms_norm(
+            gpu,
+            self.rms_norm_w_k,
+            o_out,
+            post_attn,
+            o_out,
+            rows,
+            width,
+            eps,
+            stream,
+        )?;
         let normed2 = fwd.buffers.norm_output();
         ops::residual_add_rms_norm(
             gpu,
@@ -62,7 +76,24 @@ impl Qwen3AttentionLayer {
         )?;
         self.ffn.forward_prefill(normed2, n, fwd, stream)?;
         let ffn_out = fwd.buffers.moe_output();
-        ops::rms_norm(gpu, self.rms_norm_w_k, ffn_out, post_ffn, ffn_out, rows, width, eps, stream)?;
-        ops::residual_add(gpu, self.residual_add_k, hidden, ffn_out, rows * width, stream)
+        ops::rms_norm(
+            gpu,
+            self.rms_norm_w_k,
+            ffn_out,
+            post_ffn,
+            ffn_out,
+            rows,
+            width,
+            eps,
+            stream,
+        )?;
+        ops::residual_add(
+            gpu,
+            self.residual_add_k,
+            hidden,
+            ffn_out,
+            rows * width,
+            stream,
+        )
     }
 }

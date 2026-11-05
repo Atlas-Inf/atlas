@@ -35,7 +35,12 @@ fn parses_hybrid_swa_gated_valres_layout() {
     let config = crate::config::parse_config(CONFIG).expect("parse ricursive");
     assert_eq!(config.model_type, "ricursive");
     assert_eq!(config.num_hidden_layers, 5);
-    assert!(config.layer_types.iter().all(|t| *t == LayerType::FullAttention));
+    assert!(
+        config
+            .layer_types
+            .iter()
+            .all(|t| *t == LayerType::FullAttention)
+    );
     assert_eq!(config.sliding_attention_layers, [0, 1, 2, 3]);
     assert_eq!(config.sliding_window, 1024);
     assert_eq!(config.embed_scale, 71.554_18_f32);
@@ -50,7 +55,10 @@ fn parses_hybrid_swa_gated_valres_layout() {
 
 #[test]
 fn rejects_other_clamp_limits() {
-    let invalid = CONFIG.replace("\"ffn_clamp_threshold\": 20.0", "\"ffn_clamp_threshold\": 10.0");
+    let invalid = CONFIG.replace(
+        "\"ffn_clamp_threshold\": 20.0",
+        "\"ffn_clamp_threshold\": 10.0",
+    );
     let error = crate::config::parse_config(&invalid).expect_err("clamp is compiled in");
     assert!(error.to_string().contains("ffn_clamp_threshold"));
 }

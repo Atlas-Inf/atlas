@@ -2,11 +2,11 @@
 
 //! The `Qwen3AttentionLayer` struct, split from `types.rs` (500-LoC cap).
 
+use super::types_weights::{HcWeights, HeadGateActivation, MlaWeights};
 use crate::layers::FfnComponent;
 use crate::layers::fp8_calibration::Fp8KvCalibration;
 use crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers;
 use crate::weight_map::{AttentionWeights, DenseWeight, QuantWeight, QuantizedWeight};
-use super::types_weights::{HcWeights, HeadGateActivation, MlaWeights};
 use spark_runtime::gpu::{DevicePtr, KernelHandle};
 use spark_runtime::kv_cache::KvCacheDtype;
 

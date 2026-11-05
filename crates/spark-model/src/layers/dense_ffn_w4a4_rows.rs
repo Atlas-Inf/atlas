@@ -32,7 +32,11 @@ pub(super) struct W4a4Rows {
 
 impl DenseFfnLayer {
     /// Serve every multi-row pass on W4A4 at the given activation scales.
-    pub fn enable_w4a4_rows(&mut self, gpu: &dyn GpuBackend, scales: W4a4InputScales) -> Result<()> {
+    pub fn enable_w4a4_rows(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        scales: W4a4InputScales,
+    ) -> Result<()> {
         ensure!(
             self.w4a4_gemm_mfast_k.0 != 0 && self.quantize_nvfp4_k.0 != 0,
             "W4A4 rows need w4a4_gemm_mfast and quantize_bf16_to_nvfp4 in this kernel target"

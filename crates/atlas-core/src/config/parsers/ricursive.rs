@@ -74,10 +74,10 @@ pub(crate) fn parse_ricursive(raw: &Value) -> Result<ModelConfig> {
         "ricursive layer_types must list every layer"
     );
     ensure!(
-        config.layer_types.iter().all(|t| matches!(
-            t,
-            LayerType::SlidingAttention | LayerType::FullAttention
-        )),
+        config
+            .layer_types
+            .iter()
+            .all(|t| matches!(t, LayerType::SlidingAttention | LayerType::FullAttention)),
         "ricursive layer_types must be sliding_attention or full_attention"
     );
     ensure!(

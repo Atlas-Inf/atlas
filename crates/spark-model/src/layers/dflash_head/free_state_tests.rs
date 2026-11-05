@@ -11,17 +11,17 @@
 //! only `kv_cache`, `propose_graphs` and the state's own resources — none of which
 //! depend on kernel handles — so the zeroed head exercises the production cleanup path.
 
-use std::collections::HashMap;
-use spark_runtime::gpu::GpuBackend;
-use spark_runtime::gpu::mock::MockGpuBackend;
-use spark_runtime::gpu::{DevicePtr, KernelHandle};
-use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 use super::lifecycle::*;
 use super::{
     BlockDiffusionDraftHead, CTX_ACC_POOL, DflashKernels, DflashProposerState, DflashScratch,
 };
 use crate::speculative::DraftProposer;
 use crate::weight_map::DenseWeight;
+use spark_runtime::gpu::GpuBackend;
+use spark_runtime::gpu::mock::MockGpuBackend;
+use spark_runtime::gpu::{DevicePtr, KernelHandle};
+use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
+use std::collections::HashMap;
 
 /// Serializes tests that exercise the global `CTX_ACC_POOL` (free_state
 /// success paths and carry-reject recycling push into it). Rust runs tests

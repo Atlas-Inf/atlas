@@ -296,6 +296,7 @@ pub(super) const QWEN4EXP_PDL_KERNELS: &[&str] = &[
 /// enter with `atlas_pdl_enter()`.
 pub(super) const RICURSIVE_PDL_KERNELS: &[&str] = &[
     "bf16_gemv_m32",
+    "fp8_gemv_m32",
     "w4a4_gemv_m32_bn32",
     "w4a4_gemv_m32_bn16",
     "silu_mul_clamp20",

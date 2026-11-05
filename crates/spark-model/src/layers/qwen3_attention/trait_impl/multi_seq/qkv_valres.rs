@@ -56,13 +56,45 @@ impl Qwen3AttentionLayer {
             let shape = [m, q_proj_dim, k];
             ops::bf16_gemv_m32(gpu, gemv, normed, q_w, qkv_buf, shape, ldc, qg_hd, stream)?;
         } else {
-            ops::bf16_gemm(normed, self.attn.q_proj.weight.0, q_scratch, m, q_proj_dim, k, stream)?;
+            ops::bf16_gemm(
+                normed,
+                self.attn.q_proj.weight.0,
+                q_scratch,
+                m,
+                q_proj_dim,
+                k,
+                stream,
+            )?;
         }
-        ops::bf16_gemm(normed, self.attn.k_proj.weight.0, k_scratch, m, kv_dim, k, stream)?;
-        ops::bf16_gemm(v_in, self.attn.v_proj.weight.0, v_scratch, m, kv_dim, k, stream)?;
+        ops::bf16_gemm(
+            normed,
+            self.attn.k_proj.weight.0,
+            k_scratch,
+            m,
+            kv_dim,
+            k,
+            stream,
+        )?;
+        ops::bf16_gemm(
+            v_in,
+            self.attn.v_proj.weight.0,
+            v_scratch,
+            m,
+            kv_dim,
+            k,
+            stream,
+        )?;
 
         if q_direct.is_none() {
-            gpu.copy_d2d_2d_async(q_scratch, q_proj_bytes, qkv_buf, per_seq_qkv, q_proj_bytes, n, stream)?;
+            gpu.copy_d2d_2d_async(
+                q_scratch,
+                q_proj_bytes,
+                qkv_buf,
+                per_seq_qkv,
+                q_proj_bytes,
+                n,
+                stream,
+            )?;
         }
         let k_dst = qkv_buf.offset(q_proj_bytes);
         gpu.copy_d2d_2d_async(k_scratch, kv_bytes, k_dst, per_seq_qkv, kv_bytes, n, stream)?;

@@ -161,7 +161,17 @@ impl BlockDiffusionDraftHead {
                     && m <= ops::BF16_GEMV_MAX_M
                     && k.is_multiple_of(512) =>
             {
-                ops::bf16_gemv_m32(gpu, kernels.bf16_gemv_m32, src, w.weight, dst, [m, n, k], n, 0, stream)
+                ops::bf16_gemv_m32(
+                    gpu,
+                    kernels.bf16_gemv_m32,
+                    src,
+                    w.weight,
+                    dst,
+                    [m, n, k],
+                    n,
+                    0,
+                    stream,
+                )
             }
             SmallMArm::Pipelined if use_drafter_cublas(self.drafter_cublas, m) => {
                 spark_runtime::cublaslt::bf16_gemm_act_weight_t(

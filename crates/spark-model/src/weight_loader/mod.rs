@@ -27,10 +27,10 @@ mod nllb;
 mod qwen3;
 mod qwen35;
 mod qwen35_dense;
-mod ricursive;
 mod qwen3_vl;
 #[cfg_attr(test, allow(unreachable_pub))]
 pub(crate) mod qwen4_exp;
+mod ricursive;
 mod step3p7;
 
 pub use deepseek_v4::DeepSeekV4WeightLoader;

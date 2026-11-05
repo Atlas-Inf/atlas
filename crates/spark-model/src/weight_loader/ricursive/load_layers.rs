@@ -68,7 +68,9 @@ fn load_ffn(
     qctx: QuantizeCtx,
 ) -> Result<FfnComponent> {
     let (h, inter) = (config.hidden_size, config.intermediate_size);
-    let q = |name: &str, n, k| quantized_any(store, &format!("{lp}.mlp.{name}"), n, k, gpu, variant, qctx);
+    let q = |name: &str, n, k| {
+        quantized_any(store, &format!("{lp}.mlp.{name}"), n, k, gpu, variant, qctx)
+    };
     let gate_proj = q("gate_proj", inter, h)?;
     let up_proj = q("up_proj", inter, h)?;
     let down_proj = q("down_proj", h, inter)?;
@@ -138,7 +140,12 @@ fn load_attention(
         config.fp8_kv_calibration_tokens,
         config,
     )?;
-    layer.set_o_dense_bf16(bf16_dense(store, &format!("{p}.o_proj.weight"), h, nq * hd)?);
+    layer.set_o_dense_bf16(bf16_dense(
+        store,
+        &format!("{p}.o_proj.weight"),
+        h,
+        nq * hd,
+    )?);
     layer.set_post_sublayer_norms(
         dense(store, &format!("{lp}.post_attention_layernorm.weight"))?,
         dense(store, &format!("{lp}.post_feedforward_layernorm.weight"))?,
@@ -192,7 +199,15 @@ fn interleave_q_gate(
     let stream = gpu.default_stream();
     gpu.copy_d2d_2d_async(q, head_bytes, qg, 2 * head_bytes, head_bytes, heads, stream)?;
     let g_dst = qg.offset(head_bytes);
-    gpu.copy_d2d_2d_async(g, head_bytes, g_dst, 2 * head_bytes, head_bytes, heads, stream)?;
+    gpu.copy_d2d_2d_async(
+        g,
+        head_bytes,
+        g_dst,
+        2 * head_bytes,
+        head_bytes,
+        heads,
+        stream,
+    )?;
     gpu.synchronize(stream)?;
     Ok(qg)
 }
@@ -210,7 +225,10 @@ fn load_bf16_scalar(store: &WeightStore, gpu: &dyn GpuBackend, key: &str) -> Res
 
 /// A checkpoint `input_scale` (an F32 scalar already on the device).
 fn f32_scalar(gpu: &dyn GpuBackend, ptr: DevicePtr) -> Result<f32> {
-    ensure!(!ptr.is_null(), "ricursive MLP projection is missing its input_scale");
+    ensure!(
+        !ptr.is_null(),
+        "ricursive MLP projection is missing its input_scale"
+    );
     let mut bytes = [0u8; 4];
     gpu.copy_d2h(ptr, &mut bytes)?;
     Ok(f32::from_le_bytes(bytes))

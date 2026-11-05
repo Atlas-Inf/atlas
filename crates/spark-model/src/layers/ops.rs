@@ -94,6 +94,7 @@ pub mod model_stats;
 pub(crate) mod moe_gate_up_repack;
 #[path = "ops/strix_f16.rs"]
 mod strix_f16;
+mod verify_rows;
 #[path = "ops/yarn_mrope.rs"]
 mod yarn_mrope;
 pub use model_stats::ModelStats;
@@ -427,5 +428,6 @@ pub use ssm_preproc::*;
 pub use ssm_ssd::*;
 pub use strix_f16::*;
 pub use strix_s64::*;
+pub use verify_rows::*;
 pub use wide_prefill::*;
 pub use yarn_mrope::*;

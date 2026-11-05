@@ -51,7 +51,8 @@ impl Qwen3AttentionLayer {
         // Q rows sit `per_seq_qkv` apart in qkv_buf; the kernel reads packed Q.
         let q = fwd.buffers.ssm_qkvz();
         let q_bytes = q_dim as usize * bf16;
-        fwd.gpu.copy_d2d_2d_async(qkv_buf, per_seq_qkv, q, q_bytes, q_bytes, n, stream)?;
+        fwd.gpu
+            .copy_d2d_2d_async(qkv_buf, per_seq_qkv, q, q_bytes, q_bytes, n, stream)?;
         let attn_out = fwd.buffers.attn_output();
         let last_len = meta.seq_len.offset((n - 1) * 4);
         let layer = self.attn_layer_idx;

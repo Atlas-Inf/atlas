@@ -25,9 +25,9 @@ mod prefill_bf16;
 mod tp_split;
 #[path = "dense_ffn_w4a4_rows.rs"]
 mod w4a4_rows;
-pub use w4a4_rows::W4a4InputScales;
 pub use native::DenseNative;
 pub(crate) use tp_split::dense_tp_split_requested;
+pub use w4a4_rows::W4a4InputScales;
 
 pub struct DenseFfnWeights {
     pub gate_proj: QuantizedWeight,
@@ -1001,7 +1001,6 @@ impl DenseFfnLayer {
         self.w4a16_gemv_silu_input = KernelHandle(0);
         self.w4a16_gemv_silu_input_sw = KernelHandle(0);
     }
-
 
     /// Single-token decode: 2-3 kernel launches depending on activation.
     /// SiLU: dual GEMV + SiLU-fused down GEMV (2 launches).
