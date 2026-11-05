@@ -109,6 +109,10 @@ impl BlockDiffusionDraftHead {
     ) -> Result<()> {
         ensure_bf16_present(w, m, n, k)?;
         let kernels = &self.kernels;
+        // FP8 mirror (ATLAS_DFLASH_DRAFTER_FP8_M32): the weight stream halves.
+        if let Some(w8) = self.fp8_m32_for(w, m, k) {
+            return ops::fp8_gemv_m32(gpu, kernels.fp8_gemv_m32, src, w8, dst, [m, n, k], stream);
+        }
         match small_m_arm(
             kernels.small_m_gemv,
             kernels.dense_gemv_batchm.0 != 0,
@@ -157,7 +161,7 @@ impl BlockDiffusionDraftHead {
                     && m <= ops::BF16_GEMV_MAX_M
                     && k.is_multiple_of(512) =>
             {
-                ops::bf16_gemv_m32(gpu, kernels.bf16_gemv_m32, src, w.weight, dst, [m, n, k], n, stream)
+                ops::bf16_gemv_m32(gpu, kernels.bf16_gemv_m32, src, w.weight, dst, [m, n, k], n, 0, stream)
             }
             SmallMArm::Pipelined if use_drafter_cublas(self.drafter_cublas, m) => {
                 spark_runtime::cublaslt::bf16_gemm_act_weight_t(

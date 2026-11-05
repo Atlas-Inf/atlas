@@ -51,7 +51,10 @@ impl Qwen3AttentionLayer {
         if let Some(gemv) = q_direct {
             let ldc = (per_seq_qkv / bf16) as u32;
             let q_w = self.attn.q_proj.weight;
-            ops::bf16_gemv_m32(gpu, gemv, normed, q_w, qkv_buf, [m, q_proj_dim, k], ldc, stream)?;
+            // Gated: the store splits [Q_h | G_h] (no deinterleave pass).
+            let qg_hd = if self.gated { hd } else { 0 };
+            let shape = [m, q_proj_dim, k];
+            ops::bf16_gemv_m32(gpu, gemv, normed, q_w, qkv_buf, shape, ldc, qg_hd, stream)?;
         } else {
             ops::bf16_gemm(normed, self.attn.q_proj.weight.0, q_scratch, m, q_proj_dim, k, stream)?;
         }
@@ -65,7 +68,8 @@ impl Qwen3AttentionLayer {
         gpu.copy_d2d_2d_async(k_scratch, kv_bytes, k_dst, per_seq_qkv, kv_bytes, n, stream)?;
         let v_dst = k_dst.offset(kv_bytes);
         gpu.copy_d2d_2d_async(v_scratch, kv_bytes, v_dst, per_seq_qkv, kv_bytes, n, stream)?;
-        if self.gated {
+        // The direct q GEMV already stored [Q_all | G_all].
+        if self.gated && q_direct.is_none() {
             ops::deinterleave_qg(
                 gpu,
                 self.deinterleave_qg_k,

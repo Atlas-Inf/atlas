@@ -356,7 +356,8 @@ mod tests {
 pub const BF16_GEMV_MAX_M: u32 = 32;
 
 /// Small-M BF16 GEMV (`bf16_gemv_m32`, Ricursive target): `out[m, n]` (row
-/// stride `ldc`) = `act[m, k] . weight[n, k]^T` for `m <= BF16_GEMV_MAX_M`,
+/// stride `ldc`) = `act[m, k] . weight[n, k]^T` for `m <= BF16_GEMV_MAX_M`;
+/// `qg_head_dim` > 0 stores a gated q_proj's `[Q_h | G_h]` heads split.
 /// 16 weight rows per CTA streamed once through shared memory.
 #[allow(clippy::too_many_arguments)]
 pub fn bf16_gemv_m32(
@@ -367,11 +368,16 @@ pub fn bf16_gemv_m32(
     out: DevicePtr,
     [m, n, k]: [u32; 3],
     ldc: u32,
+    qg_head_dim: u32,
     stream: u64,
 ) -> Result<()> {
     ensure!(
         (1..=BF16_GEMV_MAX_M).contains(&m) && k.is_multiple_of(512) && ldc >= n,
         "bf16_gemv_m32: m={m} n={n} k={k} ldc={ldc} unsupported"
+    );
+    ensure!(
+        qg_head_dim == 0 || n.is_multiple_of(2 * qg_head_dim),
+        "bf16_gemv_m32: n={n} is not whole [Q|G] heads of {qg_head_dim}"
     );
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 16), 1, 1]) // B16G_BN
@@ -383,5 +389,36 @@ pub fn bf16_gemv_m32(
         .arg_u32(n)
         .arg_u32(k)
         .arg_u32(ldc)
+        .arg_u32(qg_head_dim)
+        .launch(stream)
+}
+
+/// Small-M FP8-weight GEMV (`fp8_gemv_m32`, Ricursive's drafter):
+/// `out[m, n] = row_scale[n] * act[m, k] . w8[n, k]^T` for `m <= BF16_GEMV_MAX_M`
+/// on [`crate::weight_map::Fp8DenseWeight`] (E4M3 rows, f32 per-row scale).
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemv_m32(
+    gpu: &dyn GpuBackend,
+    kernel: spark_runtime::gpu::KernelHandle,
+    act: DevicePtr,
+    weight: &crate::weight_map::Fp8DenseWeight,
+    out: DevicePtr,
+    [m, n, k]: [u32; 3],
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        (1..=BF16_GEMV_MAX_M).contains(&m) && k.is_multiple_of(512),
+        "fp8_gemv_m32: m={m} k={k} unsupported"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 16), 1, 1])
+        .block([128, 1, 1])
+        .arg_ptr(act)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.row_scale)
+        .arg_ptr(out)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
         .launch(stream)
 }

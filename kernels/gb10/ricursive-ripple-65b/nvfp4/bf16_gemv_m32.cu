@@ -2,6 +2,8 @@
 //
 // Small-M BF16 GEMV for M <= 32 rows (DFlash verify width) on sm_121:
 // C[m, n] (row stride ldc) = sum_k A[m, k] * W[n, k], FP32 accumulation.
+// `qg_hd` > 0 splits a gated q_proj's per-head [Q_h | G_h] output columns into
+// [Q_all | G_all] on store (fusing `deinterleave_qg`); 0 stores as computed.
 //
 // Ripple keeps attention in BF16 (Strict), and its q|gate (20480 x 5120) and
 // o (5120 x 10240) projections dominate the verify step. cuBLASLt's 64x64
@@ -50,7 +52,7 @@ __device__ __forceinline__ void b16g_cp16(void* dst, const void* src) {
 
 __device__ __forceinline__ void bf16_gemv_m32_impl(
     const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ W,
-    __nv_bfloat16* __restrict__ C, int M, int N, int K, int ldc) {
+    __nv_bfloat16* __restrict__ C, int M, int N, int K, int ldc, int qg_hd) {
     constexpr int NF = B16G_BN / 8;
     __shared__ __align__(16) uint8_t sW[B16G_STAGES][B16G_BN][B16G_PITCH];
 
@@ -163,8 +165,16 @@ __device__ __forceinline__ void bf16_gemv_m32_impl(
             for (int j = 0; j < 4; j++) {
                 const unsigned m = mf * 16u + gid + ((j & 2) ? 8u : 0u);
                 const unsigned n = n0 + nf * 8u + tid * 2u + (j & 1);
-                if (m < (unsigned)M && n < (unsigned)N)
-                    C[(size_t)m * ldc + n] = __float2bfloat16(acc[mf][nf][j]);
+                if (m < (unsigned)M && n < (unsigned)N) {
+                    // qg_hd > 0: W rows are per-head [Q_h | G_h] (gated q_proj);
+                    // store split as [Q_all | G_all], as deinterleave_qg would.
+                    unsigned col = n;
+                    if (qg_hd > 0) {
+                        const unsigned g2 = 2u * (unsigned)qg_hd, h = n / g2, r = n % g2;
+                        col = (r < (unsigned)qg_hd) ? h * qg_hd + r : (unsigned)N / 2u + h * qg_hd + (r - qg_hd);
+                    }
+                    C[(size_t)m * ldc + col] = __float2bfloat16(acc[mf][nf][j]);
+                }
             }
 }
 
@@ -173,8 +183,8 @@ __device__ __forceinline__ void bf16_gemv_m32_impl(
 // the second region is empty).
 extern "C" __global__ void __launch_bounds__(128) bf16_gemv_m32(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
-    __nv_bfloat16* __restrict__ C, int M, int N, int K, int ldc) {
+    __nv_bfloat16* __restrict__ C, int M, int N, int K, int ldc, int qg_hd) {
     atlas_pdl_enter_touch({W, B16G_STAGES * B16G_KS * 2u, (unsigned long long)K * 2u}, {W, 0u, 0ull},
                           min((unsigned)N, B16G_TOUCH_CTAS * B16G_BN), blockIdx.x, B16G_TOUCH_CTAS);
-    bf16_gemv_m32_impl(A, reinterpret_cast<const __nv_bfloat16*>(W), C, M, N, K, ldc);
+    bf16_gemv_m32_impl(A, reinterpret_cast<const __nv_bfloat16*>(W), C, M, N, K, ldc, qg_hd);
 }

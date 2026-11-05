@@ -29,6 +29,7 @@ use crate::weight_map::{DenseWeight, QuantizedWeight};
 
 pub mod conv;
 mod draft_conf;
+mod fp8_m32;
 mod paged_attn_modules;
 pub mod product_policy;
 pub mod selector;
@@ -73,6 +74,8 @@ pub struct DflashKernels {
     pub dense_gemm_pipelined: KernelHandle,
     /// `bf16_gemv_m32` (Ricursive's target): 1..=32-row drafter GEMMs; 0 elsewhere.
     pub bf16_gemv_m32: KernelHandle,
+    /// `fp8_gemv_m32`: the same GEMMs on [`Self::fp8_m32`]'s FP8 mirrors.
+    pub fp8_gemv_m32: KernelHandle,
     pub rope_qwen3: KernelHandle,
     pub reshape_cache_fp8: KernelHandle,
     /// BF16 KV cache writeback. Used by Phase 2 `precompute_ctx_kv` and
@@ -603,6 +606,9 @@ pub struct BlockDiffusionDraftHead {
     /// it must not mutate the target model's lm_head. `None` on the
     /// BF16 path.
     pub lm_head_shared_fp8: Option<crate::weight_map::Fp8DenseWeight>,
+    /// FP8 mirrors for the small-M drafter GEMMs (`ATLAS_DFLASH_DRAFTER_FP8_M32`),
+    /// keyed by the BF16 weight pointer `drafter_dense_gemm` receives.
+    pub fp8_m32: Vec<(u64, crate::weight_map::Fp8DenseWeight)>,
 
     // === Weights from the drafter checkpoint ===
     /// Hidden-norm applied to the projected target context before mixing
