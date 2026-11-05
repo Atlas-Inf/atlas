@@ -158,6 +158,9 @@ impl TransformerModel {
         row_base: usize,
         stream: u64,
     ) -> Result<()> {
+        // ATLAS_DFLASH_PREFILL_CAPTURE_LOG=1: why a prefill capture did or did
+        // not land (no device sync, safe under graph capture).
+        let plog = std::env::var("ATLAS_DFLASH_PREFILL_CAPTURE_LOG").as_deref() == Ok("1");
         if self.dflash_capture_layers.is_empty() {
             return Ok(());
         }
@@ -169,6 +172,13 @@ impl TransformerModel {
             Some(s) => s,
             None => return Ok(()),
         };
+        if plog {
+            tracing::info!(
+                layer_idx, slot_idx, chunk_start, proc_count, row_base,
+                has_state = seq.proposer_state.is_some(),
+                "DFlash prefill capture: entered"
+            );
+        }
         if let Some(ref c) = self.comm
             && c.rank() != 0
         {
@@ -185,7 +195,13 @@ impl TransformerModel {
             None => return Ok(()),
         };
         if dstate.max_ctx_len == 0 {
+            if plog {
+                tracing::info!(layer_idx, "DFlash prefill capture: skipped (max_ctx_len 0)");
+            }
             return Ok(()); // ctx conditioning disabled
+        }
+        if plog {
+            tracing::info!(layer_idx, max_ctx_len = dstate.max_ctx_len, "DFlash prefill capture: capturing");
         }
         if self.config.model_type == "glm5_next" {
             if dstate.ctx_hidden_acc.0 == 0
