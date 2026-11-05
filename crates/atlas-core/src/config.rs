@@ -523,6 +523,13 @@ pub struct ModelConfig {
     /// instead of the normed hidden alone.
     #[serde(skip)]
     pub value_residual: bool,
+    /// Ripple: which layers are sliding-window (RoPE + window) vs global
+    /// (NoPE, full). `layer_types` itself lists every Ripple layer as
+    /// `FullAttention` — the Gemma-4 convention — because model-level paths
+    /// (verify, capture, decode dispatch) test `== FullAttention` for
+    /// "is an attention layer"; the window is a per-layer attention setting.
+    #[serde(skip)]
+    pub sliding_layers: Vec<bool>,
 
     // ── MiniMax M2 specific ──
     /// MoE routing activation. "" = default softmax. "sigmoid" = DeepSeek-V3
