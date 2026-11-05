@@ -52,10 +52,20 @@
 // selector scores; github.com/knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4
 // overlay/glm_draft_trunc.py; idea only, see docs/glm-prior-art.md).
 
+// Twins (top_k=32 drafters) define these before including this file.
+#ifndef DF2_SEL_MAX_TOP_K
 #define DF2_SEL_MAX_TOP_K 16
+#endif
 #define DF2_SEL_MAX_RANK 256
 #define DF2_SEL_MAX_SPLITS 16
+// strix-hip: the register-list phase 1 spills on gfx1151 even at K=16
+// (801 VGPRs/thread, 1416 B scratch); the round form is exact and spill-free.
+#ifndef DF2_SEL_ROUND_TOPK
+#define DF2_SEL_ROUND_TOPK 1
+#endif
+#ifndef DF2_SEL_THREADS
 #define DF2_SEL_THREADS 512
+#endif
 
 // (va, ia) precedes (vb, ib) in the total order.
 __device__ __forceinline__ bool df2_sel_before(float va, unsigned int ia, float vb, unsigned int ib) {
@@ -162,6 +172,45 @@ extern "C" __global__ void dflash2_candidate_selector(
     float* cand_v = reinterpret_cast<float*>(scratch + 4);
     unsigned int* cand_i = scratch + 4 + gamma * splits * DF2_SEL_MAX_TOP_K;
 
+#if defined(DF2_SEL_ROUND_TOPK)
+    // Phase 1 (round form): this slice's exact top-K as K block-wide argmax
+    // rounds, each over every thread's own elements strictly after the
+    // previous round's winner in the total order. No per-thread K-lists: the
+    // register form spilled ~2.9K VGPRs/thread on gfx1151 at K=32, 1024
+    // threads (3.7 KB scratch per thread, ~257 ms per call on Ripple-65B).
+    // Same total order and tie rule -> the same K entries, same order.
+    {
+        const unsigned int chunk = (vocab_size + splits - 1) / splits;
+        const unsigned int lo = split * chunk;
+        const unsigned int hi = min(vocab_size, lo + chunk);
+        const __nv_bfloat16* row_logits = logits + (unsigned long long)row * vocab_size;
+        const unsigned long long base = ((unsigned long long)row * splits + split) * DF2_SEL_MAX_TOP_K;
+        float prev_v = INFINITY;
+        unsigned int prev_i = 0u;
+        bool first = true;
+        for (unsigned int out = 0; out < DF2_SEL_MAX_TOP_K; out++) {
+            float v = -INFINITY;
+            unsigned int i = 0xFFFFFFFFu;
+            for (unsigned int j = lo + tid; j < hi; j += blockDim.x) {
+                const float x = __bfloat162float(row_logits[j]);
+                if (!first && !df2_sel_before(prev_v, prev_i, x, j)) continue;
+                if (df2_sel_before(x, j, v, i)) {
+                    v = x;
+                    i = j;
+                }
+            }
+            unsigned int owner = tid;
+            df2_sel_block_best(v, i, owner, s_v, s_i, s_owner);
+            if (tid == 0) {
+                cand_v[base + out] = v;
+                cand_i[base + out] = i;
+            }
+            prev_v = v;
+            prev_i = i;
+            first = false;
+        }
+    }
+#else
     // Phase 1: this slice's exact top-K. Each thread keeps a sorted register
     // list (fixed size: no dynamic indexing, no local-memory spill), then K
     // block-wide argmax rounds pop the heads.
@@ -216,6 +265,8 @@ extern "C" __global__ void dflash2_candidate_selector(
             }
         }
     }
+
+#endif
 
     // Publish, then take a ticket: the last block runs the walk.
     __threadfence();
