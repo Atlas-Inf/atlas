@@ -275,6 +275,8 @@ mod qwen4exp_w4_wide;
 #[path = "ops/qwen4exp_wide_rows.rs"]
 mod qwen4exp_wide_rows;
 // Shared harness for the oracle-parity tests, split for the 500-LoC cap.
+#[path = "ops/dflash2_selector_build.rs"]
+mod dflash2_selector_build;
 #[cfg(test)]
 #[path = "ops/grammar_bitmask_tests.rs"]
 mod grammar_bitmask_tests;
@@ -323,6 +325,7 @@ pub use bf16_gemm_cutlass::*;
 pub use dense_gemv_multi::*;
 pub use derived_reserve::{lazy_bf16_copy_bytes, lazy_bf16_reserve, lazy_bf16_reserve_enabled};
 pub use derived_weights::{Derivation, DerivedWeights};
+pub use dflash2_selector_build::*;
 pub use dispatch_config::GemmDispatch;
 pub use dispatch_helpers::*;
 pub use dispatch_proj::*;

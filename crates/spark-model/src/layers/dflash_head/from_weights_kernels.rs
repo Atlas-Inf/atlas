@@ -61,3 +61,22 @@ pub(super) fn mxfp8_gemv_kernels(gpu: &dyn GpuBackend, glm_series: bool) -> [Ker
     ["mxfp8_gemv_tc8", "mxfp8_gemv_tc16", "mxfp8_gemv_tc32"]
         .map(|name| crate::layers::try_kernel_gated(glm_series, gpu, "mxfp8_gemv", name))
 }
+
+/// `(kernel_size, group_size)` of the drafter's DFlash2 convs, which every
+/// conv of every layer must share (one scratch layout), or `None` without.
+pub(super) fn dflash2_conv_geometry(weights: &DflashWeights) -> Result<Option<(usize, usize)>> {
+    let mut convs = weights
+        .layers
+        .iter()
+        .flat_map(|l| [l.attention_conv.as_ref(), l.mlp_conv.as_ref()])
+        .flatten()
+        .map(|c| (c.kernel_size, c.group_size));
+    let Some(first) = convs.next() else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        convs.all(|g| g == first),
+        "DFlash2 drafter convs disagree on (kernel_size, group_size); expected {first:?} everywhere"
+    );
+    Ok(Some(first))
+}

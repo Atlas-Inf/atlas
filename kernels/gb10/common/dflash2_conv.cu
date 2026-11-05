@@ -2,24 +2,28 @@
 #include <cuda_bf16.h>
 #include "atlas_pdl.cuh"
 
-// DFlash2 two-tap grouped dynamic causal convolution.
+// DFlash2 grouped dynamic causal convolution over `taps` taps.
 //
 // Parameters:
 //   y: output buffer [K, hidden_size]
 //   x: input buffer [K, hidden_size]
-//   delta_kernel: dynamic delta kernel [K, 2, num_groups]
-//   base_kernel: static base kernel [2, hidden_size]
+//   delta_kernel: this side's dynamic delta kernel, row t at
+//                 t * (2 * taps * num_groups): [taps, num_groups]
+//                 (the projection emits [K, 2 (input/output), taps, num_groups])
+//   base_kernel: this side's static base kernel [taps, hidden_size]
 //   K: number of draft tokens in the block
 //   hidden_size: model hidden dimension D (e.g. 5120)
 //   group_size: number of channels sharing a dynamic delta (e.g. 16)
 //   num_groups: D / group_size (e.g. 320)
+//   taps: kernel size (checkpoint `conv_kernel_size`, >= 1)
 //
 // Formulation:
 //   For each token position t in [0, K) and channel c in [0, hidden_size):
 //     g = c / group_size
-//     tap0 = base_kernel[0, c] + delta_kernel[t, 0, g]
-//     tap1 = base_kernel[1, c] + delta_kernel[t, 1, g]
-//     y[t, c] = tap0 * x[t, c] + (t > 0 ? tap1 * x[t - 1, c] : 0)
+//     tap_j = base_kernel[j, c] + delta_kernel[t, j, g]
+//     y[t, c] = sum_{j < taps, j <= t} tap_j * x[t - j, c]
+//   summed in tap order (tap 0 first), so a 2-tap launch computes exactly the
+//   two-term expression this kernel computed before it was generic.
 //
 // Causal boundary: convolution never crosses token 0 (the block boundary).
 
@@ -31,7 +35,8 @@ extern "C" __global__ void dflash2_grouped_dynamic_causal_conv(
     unsigned int K,
     unsigned int hidden_size,
     unsigned int group_size,
-    unsigned int num_groups
+    unsigned int num_groups,
+    unsigned int taps
 ) {
     atlas_pdl_enter();
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -41,21 +46,22 @@ extern "C" __global__ void dflash2_grouped_dynamic_causal_conv(
     const unsigned int t = idx / hidden_size;
     const unsigned int c = idx % hidden_size;
     const unsigned int g = c / group_size;
+    const __nv_bfloat16* delta_row = delta_kernel + t * (2 * taps * num_groups);
 
     // Tap 0: current position t
     float b0 = __bfloat162float(base_kernel[c]);
-    float d0 = __bfloat162float(delta_kernel[t * (4 * num_groups) + g]);
+    float d0 = __bfloat162float(delta_row[g]);
     float k0 = b0 + d0;
     float x0 = __bfloat162float(x[idx]);
     float val = k0 * x0;
 
-    // Tap 1: previous position t - 1 (causal within block)
-    if (t > 0) {
-        float b1 = __bfloat162float(base_kernel[hidden_size + c]);
-        float d1 = __bfloat162float(delta_kernel[t * (4 * num_groups) + num_groups + g]);
-        float k1 = b1 + d1;
-        float x1 = __bfloat162float(x[(t - 1) * hidden_size + c]);
-        val += k1 * x1;
+    // Taps 1..taps-1: previous positions t - j (causal within block)
+    for (unsigned int j = 1; j < taps && j <= t; j++) {
+        float bj = __bfloat162float(base_kernel[j * hidden_size + c]);
+        float dj = __bfloat162float(delta_row[j * num_groups + g]);
+        float kj = bj + dj;
+        float xj = __bfloat162float(x[(t - j) * hidden_size + c]);
+        val += kj * xj;
     }
 
     y[idx] = __float2bfloat16(val);
