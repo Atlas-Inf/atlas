@@ -897,6 +897,8 @@ mod forward_block_layer_paged;
 mod free_state_carry_tests;
 #[cfg(test)]
 mod free_state_tests;
+#[cfg(test)]
+mod conv_kernel_tests;
 mod from_weights;
 mod from_weights_kernels;
 #[cfg(test)]

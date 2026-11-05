@@ -138,10 +138,12 @@ impl Dflash2Conv {
                 .arg_u32(h)
                 .arg_u32(self.group_size as u32)
                 .arg_u32(self.num_groups as u32)
+                .arg_u32(self.kernel_size as u32)
                 .launch(stream)?;
         }
 
-        let output_delta = delta_buf.offset(2 * self.num_groups * 2);
+        // io=1 (output) deltas follow the io=0 k·num_groups block.
+        let output_delta = delta_buf.offset(self.kernel_size * self.num_groups * 2);
         Ok(output_delta)
     }
 
@@ -157,7 +159,9 @@ impl Dflash2Conv {
         stream: u64,
     ) -> Result<()> {
         let h = self.hidden_size as u32;
-        let output_base_kernel = self.base_kernel.weight.offset(2 * self.hidden_size * 2);
+        // io=1 base rows follow the io=0 k·hidden block.
+        let output_base_kernel =
+            self.base_kernel.weight.offset(self.kernel_size * self.hidden_size * 2);
 
         if let Some(k) = conv_kernel {
             let total_elems = gamma * h;
@@ -174,6 +178,7 @@ impl Dflash2Conv {
                 .arg_u32(h)
                 .arg_u32(self.group_size as u32)
                 .arg_u32(self.num_groups as u32)
+                .arg_u32(self.kernel_size as u32)
                 .launch(stream)?;
         }
         Ok(())
