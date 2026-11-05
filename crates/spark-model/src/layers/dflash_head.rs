@@ -744,6 +744,9 @@ pub struct BlockDiffusionDraftHead {
     /// rope_yarn kernel each step.
     pub rope_theta: f32,
 
+    /// Drafter layers that skip RoPE (`no_rope_layers`; Ripple's NoPE layer).
+    pub no_rope_layers: Vec<usize>,
+
     /// rotary_dim. Drafter uses full-rotation (rotary_dim = head_dim = 128).
     pub rotary_dim: usize,
 

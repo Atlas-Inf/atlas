@@ -232,21 +232,23 @@ impl BlockDiffusionDraftHead {
         }
 
         // 3d. yarn RoPE — n_attn positions.
-        ops::rope_yarn(
-            gpu,
-            self.kernels.rope_qwen3,
-            scratch.q_buf,
-            scratch.k_buf,
-            scratch.position_ids,
-            n_attn,
-            self.num_q_heads as u32,
-            self.num_kv_heads as u32,
-            self.head_dim as u32,
-            self.rotary_dim as u32,
-            self.yarn_inv_freq,
-            self.rope_theta,
-            stream,
-        )?;
+        if self.layer_has_rope(layer_idx) {
+            ops::rope_yarn(
+                gpu,
+                self.kernels.rope_qwen3,
+                scratch.q_buf,
+                scratch.k_buf,
+                scratch.position_ids,
+                n_attn,
+                self.num_q_heads as u32,
+                self.num_kv_heads as u32,
+                self.head_dim as u32,
+                self.rotary_dim as u32,
+                self.yarn_inv_freq,
+                self.rope_theta,
+                stream,
+            )?;
+        }
         if layer_idx == 0 {
             let noise_q_offset = eff_ctx * q_dim as usize * bf16;
             let noise_k_offset = eff_ctx * kv_dim as usize * bf16;

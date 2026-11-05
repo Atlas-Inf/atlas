@@ -425,21 +425,23 @@ impl BlockDiffusionDraftHead {
         //          precompute_ctx_kv; noise K is rotated here at
         //          [position..position+γ) — same positions as Q.
         //   position_ids buffer: γ entries = [position, ..., position+γ-1].
-        ops::rope_yarn(
-            gpu,
-            self.kernels.rope_qwen3,
-            scratch.q_buf,
-            scratch.k_buf,
-            scratch.position_ids,
-            g,
-            self.num_q_heads as u32,
-            self.num_kv_heads as u32,
-            self.head_dim as u32,
-            self.rotary_dim as u32,
-            self.yarn_inv_freq,
-            self.rope_theta,
-            stream,
-        )?;
+        if self.layer_has_rope(layer_idx) {
+            ops::rope_yarn(
+                gpu,
+                self.kernels.rope_qwen3,
+                scratch.q_buf,
+                scratch.k_buf,
+                scratch.position_ids,
+                g,
+                self.num_q_heads as u32,
+                self.num_kv_heads as u32,
+                self.head_dim as u32,
+                self.rotary_dim as u32,
+                self.yarn_inv_freq,
+                self.rope_theta,
+                stream,
+            )?;
+        }
 
         // id259 per-layer dump: post-RoPE (the rotated q/k actually fed to attn).
         if args.block_dump {

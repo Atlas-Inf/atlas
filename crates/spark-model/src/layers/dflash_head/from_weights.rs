@@ -659,6 +659,7 @@ impl BlockDiffusionDraftHead {
         // the wrong angular basis at every layer → 0% draft acceptance. Now
         // we read the drafter's own scaling block instead of guessing.
         let rope_theta = weights.config.rope_theta;
+        let no_rope_layers = weights.config.no_rope_layers.clone().unwrap_or_default();
         let rotary_dim = head_dim; // Qwen3.6-DFlash applies rope to full head_dim
         let dim_f = rotary_dim as f32;
         let n_pairs = rotary_dim / 2;
@@ -961,6 +962,7 @@ impl BlockDiffusionDraftHead {
             max_seq_len,
             yarn_inv_freq,
             rope_theta,
+            no_rope_layers,
             rotary_dim,
             rms_norm_eps: weights.config.rms_norm_eps,
             ctx_window,

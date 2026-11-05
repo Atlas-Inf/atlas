@@ -81,6 +81,10 @@ pub struct DflashConfig {
     pub sliding_window: Option<usize>,
     #[serde(default)]
     pub layer_types: Option<Vec<String>>,
+    /// Drafter layers that apply no RoPE (Ripple's DFlash2: its final,
+    /// full-attention layer). Absent = every layer is rotated.
+    #[serde(default)]
+    pub no_rope_layers: Option<Vec<usize>>,
 }
 
 fn default_rope_theta() -> f32 {

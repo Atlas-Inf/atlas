@@ -360,21 +360,33 @@ impl BlockDiffusionDraftHead {
         //   positions = norm_buf (L*n i32 written in step 4).
         // Grid: [num_kv_heads, ceil(L*n / pos_per_block), 1] — all CTAs
         //   process K heads across the full L*n row range.
-        ops::rope_yarn(
-            gpu,
-            self.kernels.rope_qwen3,
-            all_k_stage, // Q — unread when num_q_heads=0
-            all_k_stage, // K = all_k_flat [L*n, kv_dim]
-            scratch.norm_buf,
-            l_total as u32 * n,
-            0, // num_q_heads=0 → K-only (rope.cu:46-48)
-            self.num_kv_heads as u32,
-            self.head_dim as u32,
-            self.rotary_dim as u32,
-            self.yarn_inv_freq,
-            self.rope_theta,
-            stream,
-        )?;
+        // NoPE drafter layers (Ripple's last layer) keep their ctx K
+        // unrotated: rope each layer's contiguous [n, kv] row block alone.
+        let rope_rows = |first: usize, layers: usize| -> Result<()> {
+            let k = all_k_stage.offset(first * new_ctx_count * kv_slab_bytes);
+            ops::rope_yarn(
+                gpu,
+                self.kernels.rope_qwen3,
+                k, // Q — unread when num_q_heads=0
+                k,
+                scratch.norm_buf.offset(first * new_ctx_count * 4),
+                layers as u32 * n,
+                0, // num_q_heads=0 → K-only (rope.cu:46-48)
+                self.num_kv_heads as u32,
+                self.head_dim as u32,
+                self.rotary_dim as u32,
+                self.yarn_inv_freq,
+                self.rope_theta,
+                stream,
+            )
+        };
+        if self.no_rope_layers.is_empty() {
+            rope_rows(0, l_total)?;
+        } else {
+            for l in (0..l_total).filter(|&l| self.layer_has_rope(l)) {
+                rope_rows(l, 1)?;
+            }
+        }
 
         if dump_opt.is_some() {
             dump(
