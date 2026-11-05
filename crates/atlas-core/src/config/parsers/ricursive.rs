@@ -13,8 +13,8 @@ use serde_json::Value;
 
 use super::super::{LayerType, ModelConfig, finalize_config};
 
-/// The SwiGLU clamp the shipped `moe_silu_mul` shadow hardcodes
-/// (`kernels/gb10/ricursive-ripple-65b/nvfp4/moe_silu_mul.cu`). The kernel has
+/// The SwiGLU clamp `silu_mul_clamp20` hardcodes
+/// (`kernels/gb10/ricursive-ripple-65b/nvfp4/ricursive_swiglu.cu`). The kernel has
 /// no argument for it, so a checkpoint declaring any other limit must fail
 /// here rather than run with the wrong activation.
 pub const RICURSIVE_FFN_CLAMP: f64 = 20.0;

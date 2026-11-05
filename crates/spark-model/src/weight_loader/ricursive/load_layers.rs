@@ -104,8 +104,10 @@ fn load_ffn(
         up_proj_t,
         down_proj_t,
     };
-    // The clamped SwiGLU lives in this target's `moe_silu_mul` shadow.
-    let layer = DenseFfnLayer::new_with_activation(weights, FfnActivation::SiLU, gpu, "ricursive")?;
+    let mut layer =
+        DenseFfnLayer::new_with_activation(weights, FfnActivation::SiLU, gpu, "ricursive")?;
+    // Target-only clamped SwiGLU; the drafter keeps the unclamped common kernel.
+    layer.set_act_mul(gpu.kernel("ricursive_swiglu", "silu_mul_clamp20")?);
     Ok(FfnComponent::Dense(layer))
 }
 

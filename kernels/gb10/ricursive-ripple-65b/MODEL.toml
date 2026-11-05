@@ -11,7 +11,7 @@
 # KERNELS: the compiled set is Laguna-S-2.1's (`kernel_source`): head_dim
 # 128 BF16 attention, sliding-window paged decode/prefill, NVFP4 W4A16 dense
 # FFN. This target's own `nvfp4/` overlay adds the embedding scale and the
-# value-residual lerp, and shadows `moe_silu_mul` with the clamped SwiGLU.
+# value-residual lerp, and the target FFN's clamped SwiGLU (`ricursive_swiglu`).
 
 [model]
 name = "ricursive-ripple-65b"
