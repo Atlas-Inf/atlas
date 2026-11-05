@@ -88,6 +88,7 @@ sudo docker run -d \
     --ep-size "$EP_SIZE" \
     --master-addr "$HEAD_IP" \
     --master-port "$MASTER_PORT" \
+    --bind 0.0.0.0 \
     --port "$PORT" \
     --max-seq-len "$MAX_SEQ_LEN" \
     --max-batch-size "$MAX_BATCH" \
