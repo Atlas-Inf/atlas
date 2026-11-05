@@ -138,10 +138,21 @@ impl BlockDiffusionDraftHead {
         // `kernels/gb10/common/`.
         let paged_sink = super::paged_attn_modules::paged_sink_modules_for_head_dim(head_dim)?;
         let glm_series = target_model_type == "glm5_next";
+        let selector_build = match weights.candidate_selector.as_ref() {
+            Some(selector) => ops::dflash2_selector_build(selector.top_k)?,
+            None => ops::DFLASH2_SELECTOR_BASE,
+        };
         let (selector_kernel, draft_conf) = super::draft_conf::selector_kernel(
             gpu,
             glm_series && startup.diagnostics.draft_conf && weights.candidate_selector.is_some(),
+            selector_build,
         );
+        if weights.candidate_selector.is_some() && selector_kernel.is_none() {
+            tracing::warn!(
+                "DFlash2 selector: this target has no {} kernel; drafts take the host walk",
+                selector_build.module
+            );
+        }
         startup.diagnostics.draft_conf = draft_conf;
         let dense_gemv_tc = dense_gemv_tc_kernels(gpu, glm_series);
         let kernels = DflashKernels {
@@ -170,11 +181,17 @@ impl BlockDiffusionDraftHead {
                 .kernel("dflash2_conv", "dflash2_grouped_dynamic_causal_conv")
                 .ok(),
             dflash2_candidate_selector: selector_kernel,
-            dflash2_candidate_selector_batched: crate::layers::try_kernel(
-                gpu,
-                "dflash2_candidate_selector",
-                "dflash2_candidate_selector_batched",
-            ),
+            // Only the 16-candidate module ships the batched entry; a wider
+            // selector serves batches with per-sequence fused launches.
+            dflash2_candidate_selector_batched: if selector_build.full_family {
+                crate::layers::try_kernel(
+                    gpu,
+                    "dflash2_candidate_selector",
+                    "dflash2_candidate_selector_batched",
+                )
+            } else {
+                spark_runtime::gpu::KernelHandle(0)
+            },
             // Qwen3.6-DFlash uses yarn RoPE — confirmed in the drafter
             // `config.json:rope_scaling.rope_type="yarn"`. Atlas's yarn
             // kernel is `rope::rope_forward_yarn`.

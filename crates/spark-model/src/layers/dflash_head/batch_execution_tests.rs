@@ -250,6 +250,8 @@ fn batched_selector_is_one_launch_with_fallback() {
         include_str!("../../../../../kernels/gb10/common/dflash2_candidate_selector.cu"),
         include_str!("../../../../../kernels/strix-hip/common/dflash2_candidate_selector.cu"),
     ] {
+        // The gb10 entries carry a launch-bounds hook a wider twin sets.
+        let cu = cu.replace(" DF2_SEL_BOUNDS", "");
         assert!(cu.contains("extern \"C\" __global__ void dflash2_candidate_selector("));
         assert!(cu.contains("extern \"C\" __global__ void dflash2_candidate_selector_batched("));
     }
