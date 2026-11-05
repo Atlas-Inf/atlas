@@ -6,6 +6,7 @@
 // path keeps the K=16 cap for now and mixed drafters use the serial path.
 #define DF2_SEL_MAX_TOP_K 32
 #define DF2_SEL_THREADS 1024
+#define DF2_SEL_LAUNCH_BOUNDS __launch_bounds__(DF2_SEL_THREADS)
 #define dflash2_candidate_selector dflash2_candidate_selector_k32
 #define dflash2_selector_topk dflash2_selector_topk_k32
 #define dflash2_selector_walk dflash2_selector_walk_k32

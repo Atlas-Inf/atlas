@@ -86,6 +86,11 @@
 #ifndef DF2_SEL_THREADS
 #define DF2_SEL_THREADS 512
 #endif
+// Twins may pin `__launch_bounds__` so a wider block never overflows the
+// register budget (empty for the production K=16 instantiation).
+#ifndef DF2_SEL_LAUNCH_BOUNDS
+#define DF2_SEL_LAUNCH_BOUNDS
+#endif
 
 // (va, ia) precedes (vb, ib) in the total order.
 __device__ __forceinline__ bool df2_sel_before(float va, unsigned int ia, float vb, unsigned int ib) {
@@ -656,7 +661,7 @@ __device__ __forceinline__ bool df2_sel_shape_ok(unsigned int rank, unsigned int
         && gridDim.x <= DF2_SEL_MAX_SPLITS && blockDim.x == DF2_SEL_THREADS;
 }
 
-extern "C" __global__ void dflash2_candidate_selector(
+extern "C" __global__ DF2_SEL_LAUNCH_BOUNDS void dflash2_candidate_selector(
     const __nv_bfloat16* __restrict__ logits,
     const __nv_bfloat16* __restrict__ projected_hidden,
     const __nv_bfloat16* __restrict__ pred_codebook,
@@ -706,7 +711,7 @@ extern "C" __global__ void dflash2_candidate_selector(
 // `out_lists` receives every row's exact top DF2_SEL_MAX_TOP_K: f32 values
 // [gamma, K], then u32 ids [gamma, K]. Grid (splits, gamma); scratch as the
 // fused kernel's (its walk ticket unused).
-extern "C" __global__ void dflash2_selector_topk(
+extern "C" __global__ DF2_SEL_LAUNCH_BOUNDS void dflash2_selector_topk(
     const __nv_bfloat16* __restrict__ logits,
     unsigned int row_stride,
     unsigned int columns,
@@ -798,7 +803,7 @@ __device__ __forceinline__ void df2_sel_walk_merged(
 // Steps 2-4 over the lists two `dflash2_selector_topk` launches wrote for
 // complementary shares of the vocabulary (`lists_a`, `lists_b`): each row's
 // two lists merge by rank into its top-k, then the walk. One block.
-extern "C" __global__ void dflash2_selector_walk(
+extern "C" __global__ DF2_SEL_LAUNCH_BOUNDS void dflash2_selector_walk(
     const float* __restrict__ lists_a,
     const float* __restrict__ lists_b,
     const __nv_bfloat16* __restrict__ projected_hidden,
@@ -824,7 +829,7 @@ extern "C" __global__ void dflash2_selector_walk(
 
 // The same over `count` (at most DF2_SEL_MAX_LISTS) ranks' lists, rank k's at
 // `lists + k * list_stride` floats: the TP4 chain's gathered shares.
-extern "C" __global__ void dflash2_selector_walk_ranks(
+extern "C" __global__ DF2_SEL_LAUNCH_BOUNDS void dflash2_selector_walk_ranks(
     const float* __restrict__ lists,
     unsigned int list_stride,
     unsigned int count,
@@ -1093,7 +1098,7 @@ __device__ __forceinline__ void df2_batch_selector_body(
 // the batched tail already produces; `last_tokens` is the device array
 // (batch_markov_prev) the prologue already uploads.
 // Grid: (n_seqs, 1, 1)   Block: (1024, 1, 1) — same hard requirement.
-extern "C" __global__ void dflash2_candidate_selector_batched(
+extern "C" __global__ DF2_SEL_LAUNCH_BOUNDS void dflash2_candidate_selector_batched(
     const __nv_bfloat16* __restrict__ logits,
     const __nv_bfloat16* __restrict__ projected_hidden,
     const __nv_bfloat16* __restrict__ pred_codebook,
