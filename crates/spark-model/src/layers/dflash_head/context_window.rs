@@ -32,6 +32,28 @@ impl BlockDiffusionDraftHead {
         }
         self.window_size.unwrap_or(0) as u32
     }
+
+    /// Per-layer SWA window for the paged attention kernel. 0 = no window.
+    /// Uniform heads defer to [`Self::attn_sliding_window`]; a mixed head's
+    /// sliding layers return their slot-space window even when
+    /// `query_causal` is false — the retained context (16384) outlives the
+    /// layer's window (4096), so the buffer alone can no longer stand in
+    /// for it and the kernel must mask `q_slot - kv_slot >= window`.
+    pub(super) fn attn_sliding_window_for(&self, layer_idx: usize) -> u32 {
+        if let Some(la) = self.layer_attention.get(layer_idx) {
+            return la.window.unwrap_or(0) as u32;
+        }
+        self.attn_sliding_window()
+    }
+
+    /// `false` on `no_rope_layers` entries (mixed heads): skip RoPE on the
+    /// layer's block q/k and on its context K. Uniform heads always rope.
+    pub(super) fn layer_rope(&self, layer_idx: usize) -> bool {
+        self.layer_attention
+            .get(layer_idx)
+            .map(|la| la.rope)
+            .unwrap_or(true)
+    }
 }
 
 #[cfg(test)]

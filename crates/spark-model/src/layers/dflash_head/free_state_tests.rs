@@ -90,6 +90,7 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         gamma: 0,
         mask_token_id: 0,
         window_size: None,
+        layer_attention: Vec::new(),
         query_causal: true,
         target_layer_ids: Vec::new(),
         target_hidden_size: 0,

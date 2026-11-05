@@ -231,7 +231,8 @@ impl BlockDiffusionDraftHead {
             )?;
         }
 
-        // 3d. yarn RoPE — n_attn positions.
+        // 3d. yarn RoPE — n_attn positions. Skipped on `no_rope_layers`.
+        if self.layer_rope(layer_idx) {
         ops::rope_yarn(
             gpu,
             self.kernels.rope_qwen3,
@@ -247,6 +248,7 @@ impl BlockDiffusionDraftHead {
             self.rope_theta,
             stream,
         )?;
+        }
         if layer_idx == 0 {
             let noise_q_offset = eff_ctx * q_dim as usize * bf16;
             let noise_k_offset = eff_ctx * kv_dim as usize * bf16;
@@ -279,7 +281,7 @@ impl BlockDiffusionDraftHead {
             self.head_dim as u32,
             inv_sqrt_d,
             self.attn_causal(),
-            self.attn_sliding_window(),
+            self.attn_sliding_window_for(layer_idx),
             stream,
         )?;
         if layer_idx == 0 {

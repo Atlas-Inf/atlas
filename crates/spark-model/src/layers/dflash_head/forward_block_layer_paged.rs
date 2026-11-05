@@ -425,7 +425,10 @@ impl BlockDiffusionDraftHead {
         //          precompute_ctx_kv; noise K is rotated here at
         //          [position..position+γ) — same positions as Q.
         //   position_ids buffer: γ entries = [position, ..., position+γ-1].
-        ops::rope_yarn(
+        // no_rope_layers (mixed drafters): the full-attention layer's block
+        // q/k and ctx K stay unrotated — rope_yarn skipped entirely.
+        if self.layer_rope(args.layer_idx) {
+            ops::rope_yarn(
             gpu,
             self.kernels.rope_qwen3,
             scratch.q_buf,
@@ -440,6 +443,7 @@ impl BlockDiffusionDraftHead {
             self.rope_theta,
             stream,
         )?;
+        }
 
         // id259 per-layer dump: post-RoPE (the rotated q/k actually fed to attn).
         if args.block_dump {
@@ -645,7 +649,7 @@ impl BlockDiffusionDraftHead {
             self.num_kv_heads as u32,
             self.head_dim as u32,
             16, // cache_block_size
-            self.attn_sliding_window(),
+            self.attn_sliding_window_for(args.layer_idx),
             self.attn_causal(),
             inv_sqrt_d,
             sinks,
@@ -740,7 +744,7 @@ impl BlockDiffusionDraftHead {
                 self.head_dim as u32,
                 inv_sqrt_d,
                 self.attn_causal(),
-                self.attn_sliding_window(),
+                self.attn_sliding_window_for(args.layer_idx),
                 stream,
             )?;
             if args.block_dump {
@@ -841,7 +845,7 @@ impl BlockDiffusionDraftHead {
             self.head_dim as u32,
             inv_sqrt_d,
             self.attn_causal(),
-            self.attn_sliding_window(),
+            self.attn_sliding_window_for(args.layer_idx),
             stream,
         )?;
 

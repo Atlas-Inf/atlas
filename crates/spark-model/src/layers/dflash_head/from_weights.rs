@@ -30,6 +30,7 @@ impl BlockDiffusionDraftHead {
         target_vocab_size: usize,
         gamma: Option<usize>,
         window_size: Option<usize>,
+        ctx_window_arg: Option<usize>,
         gpu: &dyn GpuBackend,
         max_seq_len: usize,
         max_batch_size: usize,
@@ -61,7 +62,26 @@ impl BlockDiffusionDraftHead {
         // HF `is_causal` / sliding-window keys as well as `dflash_config`
         // (GLM-5.3's DFlash2 declares its 2048 window only through them).
         let query_causal = weights.config.query_causal();
-        let window_size = window_size.or_else(|| weights.config.sliding_window());
+        let mixed = weights.config.is_mixed_attention();
+        // A mixed drafter's head-wide window means "sliding-layer override":
+        // the full-attention layers keep `window: None`. `window_size = 0`
+        // (full attention, `--dflash-window-size 0`) clears sliding windows.
+        let layer_attention = if mixed {
+            let mut layers = weights.config.layer_attentions()?;
+            for la in &mut layers {
+                if la.window.is_some() {
+                    la.window = window_size.or(la.window);
+                }
+            }
+            layers
+        } else {
+            Vec::new()
+        };
+        let window_size = if mixed {
+            None // a mixed head has no single window — see `layer_attention`
+        } else {
+            window_size.or_else(|| weights.config.sliding_window())
+        };
         // Resolved early: the drafter paged-KV pool must cover every ctx
         // slot the accumulator can retain. The accumulator cap follows
         // ctx_window — NOT the SWA window_size — because the paged-attention
@@ -69,6 +89,7 @@ impl BlockDiffusionDraftHead {
         let ctx_window: usize = std::env::var("ATLAS_DFLASH_CTX_WINDOW")
             .ok()
             .and_then(|s| s.parse().ok())
+            .or(ctx_window_arg)
             .unwrap_or(4096);
         let ctx_capacity = ctx_window.min(max_seq_len);
 
@@ -138,9 +159,15 @@ impl BlockDiffusionDraftHead {
         // `kernels/gb10/common/`.
         let paged_sink = super::paged_attn_modules::paged_sink_modules_for_head_dim(head_dim)?;
         let glm_series = target_model_type == "glm5_next";
+        let selector_top_k = weights
+            .candidate_selector
+            .as_ref()
+            .map(|cs| cs.top_k)
+            .unwrap_or(0);
         let (selector_kernel, draft_conf) = super::draft_conf::selector_kernel(
             gpu,
             glm_series && startup.diagnostics.draft_conf && weights.candidate_selector.is_some(),
+            selector_top_k,
         );
         startup.diagnostics.draft_conf = draft_conf;
         let dense_gemv_tc = dense_gemv_tc_kernels(gpu, glm_series);
@@ -336,7 +363,10 @@ impl BlockDiffusionDraftHead {
         // precompute region (l_total × ctx_window i32) each; the tail chunk
         // count is ≤ ctx_len/ctx_window and overflow falls back to sync.
         let ctx_positions_pinned_bytes = max_batch_size.max(1) * num_layers * ctx_window * 4;
-        let selector_bytes = ops::dflash2_selector_scratch_bytes(g);
+        let selector_bytes = ops::dflash2_selector_scratch_bytes_for(
+            g,
+            ops::dflash2_selector_max_top_k(selector_top_k as u32),
+        );
         let draft_record_bytes =
             super::draft_conf::record_bytes(gamma_val, startup.diagnostics.draft_conf);
         // The selector writes one record at the front of the token buffer.
@@ -796,6 +826,7 @@ impl BlockDiffusionDraftHead {
             gamma: gamma_val,
             mask_token_id,
             window_size,
+            layer_attention,
             query_causal,
             target_layer_ids,
             target_hidden_size,

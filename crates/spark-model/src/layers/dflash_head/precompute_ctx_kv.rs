@@ -360,21 +360,47 @@ impl BlockDiffusionDraftHead {
         //   positions = norm_buf (L*n i32 written in step 4).
         // Grid: [num_kv_heads, ceil(L*n / pos_per_block), 1] — all CTAs
         //   process K heads across the full L*n row range.
-        ops::rope_yarn(
-            gpu,
-            self.kernels.rope_qwen3,
-            all_k_stage, // Q — unread when num_q_heads=0
-            all_k_stage, // K = all_k_flat [L*n, kv_dim]
-            scratch.norm_buf,
-            l_total as u32 * n,
-            0, // num_q_heads=0 → K-only (rope.cu:46-48)
-            self.num_kv_heads as u32,
-            self.head_dim as u32,
-            self.rotary_dim as u32,
-            self.yarn_inv_freq,
-            self.rope_theta,
-            stream,
-        )?;
+        if self.layer_attention.is_empty() {
+            ops::rope_yarn(
+                gpu,
+                self.kernels.rope_qwen3,
+                all_k_stage, // Q — unread when num_q_heads=0
+                all_k_stage, // K = all_k_flat [L*n, kv_dim]
+                scratch.norm_buf,
+                l_total as u32 * n,
+                0, // num_q_heads=0 → K-only (rope.cu:46-48)
+                self.num_kv_heads as u32,
+                self.head_dim as u32,
+                self.rotary_dim as u32,
+                self.yarn_inv_freq,
+                self.rope_theta,
+                stream,
+            )?;
+        } else {
+            // Mixed drafter (e.g. Ripple): `no_rope_layers` keep their ctx K
+            // unrotated, so the fused all-layer launch becomes per-layer
+            // launches over the roped layers only.
+            for l in 0..l_total {
+                if !self.layer_rope(l) {
+                    continue;
+                }
+                ops::rope_yarn(
+                    gpu,
+                    self.kernels.rope_qwen3,
+                    all_k_stage,
+                    all_k_stage.offset(l * new_ctx_count * kv_slab_bytes),
+                    scratch.norm_buf.offset(l * new_ctx_count * 4),
+                    n,
+                    0,
+                    self.num_kv_heads as u32,
+                    self.head_dim as u32,
+                    self.rotary_dim as u32,
+                    self.yarn_inv_freq,
+                    self.rope_theta,
+                    stream,
+                )?;
+            }
+        }
 
         if dump_opt.is_some() {
             dump(
