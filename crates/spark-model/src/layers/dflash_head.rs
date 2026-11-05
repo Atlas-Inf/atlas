@@ -248,7 +248,7 @@ pub struct DflashScratch {
     /// historical target positions (decoded indices); last γ are
     /// the to-be-predicted noise positions.
     pub position_ids: DevicePtr,
-    /// DFlash2 scratch: dynamic conv delta coefficients `[γ, 4 * num_groups]` BF16.
+    /// DFlash2 scratch: dynamic conv delta coefficients `[γ, 2 * kernel_size * num_groups]` BF16.
     pub dflash2_conv_delta: DevicePtr,
     /// DFlash2 scratch: convolution output `[γ, hidden_size]` BF16.
     pub dflash2_conv_out: DevicePtr,

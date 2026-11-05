@@ -292,6 +292,15 @@ impl BlockDiffusionDraftHead {
             mxfp8_gemv: mxfp8_gemv_kernels(gpu, glm_series),
         };
 
+        // DFlash2 conv geometry, from the checkpoint tensors (one for every conv).
+        let conv_geometry = dflash2_conv_geometry(&weights)?;
+        let conv_delta_row =
+            conv_geometry.map_or(0, |(taps, group)| 2 * taps * (hidden_size / group));
+        anyhow::ensure!(
+            conv_geometry.is_none() || kernels.dflash2_conv.is_some(),
+            "DFlash2 drafter ships convs but the target has no dflash2_conv kernel"
+        );
+
         // Per-step scratch buffers. BF16 = 2 bytes/element.
         //
         // Sized for `n_attn_slots = ctx_window + γ` rows in the attention
@@ -402,7 +411,7 @@ impl BlockDiffusionDraftHead {
                 ctx_positions_pinned_bytes,
                 ctx_positions_cursor: std::sync::atomic::AtomicUsize::new(0),
                 position_ids: gpu.alloc(n_attn * 4)?,
-                dflash2_conv_delta: gpu.alloc(n_attn * 4 * (hidden_size / 16).max(1) * bf16)?,
+                dflash2_conv_delta: gpu.alloc(n_attn * conv_delta_row.max(1) * bf16)?,
                 dflash2_conv_out: gpu.alloc(n_attn * hidden_size * bf16)?,
                 dflash2_projected_hidden: gpu.alloc(g * 256 * bf16)?,
                 dflash2_selector_scratch: gpu.alloc(selector_bytes)?,
@@ -541,26 +550,9 @@ impl BlockDiffusionDraftHead {
         // DFlash2 grouped causal conv scratch — the conv is causal along the
         // row dim, so it runs per [sequence, gamma] slice, never across
         // sequence boundaries.
-        let dflash2_group_size = weights
-            .config
-            .dflash_config
-            .as_ref()
-            .and_then(|sc| sc.conv_group_size)
-            .unwrap_or(16);
-        let dflash2_kernel_size = weights
-            .config
-            .dflash_config
-            .as_ref()
-            .and_then(|sc| sc.conv_kernel_size)
-            .unwrap_or(2);
-        let dflash2_has_conv = weights
-            .layers
-            .iter()
-            .any(|l| l.attention_conv.is_some() || l.mlp_conv.is_some());
-        let (batch_conv_delta, batch_conv_out) = if dflash2_has_conv {
-            let conv_groups = hidden_size / dflash2_group_size.max(1);
+        let (batch_conv_delta, batch_conv_out) = if conv_geometry.is_some() {
             let delta_bytes = batch_rows
-                .checked_mul(2 * dflash2_kernel_size * conv_groups)
+                .checked_mul(conv_delta_row)
                 .and_then(|n| n.checked_mul(bf16))
                 .ok_or_else(|| anyhow::anyhow!("DFlash batch conv delta bytes overflow"))?;
             (
@@ -843,8 +835,8 @@ impl BlockDiffusionDraftHead {
                                 c.base_kernel,
                                 c.kernel_projection,
                                 hidden_size,
-                                dflash2_group_size,
-                                dflash2_kernel_size,
+                                c.group_size,
+                                c.kernel_size,
                             )
                         }),
                         mlp_conv: l.mlp_conv.map(|c| {
@@ -852,8 +844,8 @@ impl BlockDiffusionDraftHead {
                                 c.base_kernel,
                                 c.kernel_projection,
                                 hidden_size,
-                                dflash2_group_size,
-                                dflash2_kernel_size,
+                                c.group_size,
+                                c.kernel_size,
                             )
                         }),
                         // Phase G — populated below if ATLAS_DFLASH_DRAFTER_FP8=1.

@@ -37,7 +37,7 @@ impl BlockDiffusionDraftHead {
             .ok_or_else(|| anyhow::anyhow!("DFlash conv row elements overflow"))?;
         let row_bytes = row_elements as usize * 2;
         let delta_row_bytes = (self.gamma)
-            .checked_mul(2 * conv.kernel_size * conv.num_groups)
+            .checked_mul(conv.delta_row_elems())
             .and_then(|n| n.checked_mul(2))
             .ok_or_else(|| anyhow::anyhow!("DFlash conv delta row bytes overflow"))?;
         let gemm = |src, w: &crate::weight_map::DenseWeight, dst, m, n, k| {
@@ -103,14 +103,14 @@ impl BlockDiffusionDraftHead {
             .ok_or_else(|| anyhow::anyhow!("DFlash conv row elements overflow"))?;
         let row_bytes = row_elements as usize * 2;
         let delta_row_bytes = (self.gamma)
-            .checked_mul(2 * conv.kernel_size * conv.num_groups)
+            .checked_mul(conv.delta_row_elems())
             .and_then(|n| n.checked_mul(2))
             .ok_or_else(|| anyhow::anyhow!("DFlash conv delta row bytes overflow"))?;
         for sequence in 0..batch_size as usize {
             let buf_seq = buf.offset(sequence * row_bytes);
             let delta_seq = self
                 .batch_conv_delta
-                .offset(sequence * delta_row_bytes + 2 * conv.num_groups * 2);
+                .offset(sequence * delta_row_bytes + conv.output_delta_offset());
             let out_seq = self.batch_conv_out.offset(sequence * row_bytes);
             conv.finish(
                 ctx.gpu,
