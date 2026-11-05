@@ -1,0 +1,112 @@
+[model]
+name = "ripple-65b"
+hf_id = "ricursiveAI/Ripple-65B-Preview-NVFP4"
+params = "65B"
+active_params = "65B"
+architecture = "Dense PeriNorm Transformer, 4:1 Sliding/Global Attention"
+
+# ── Kernels: the 27B's gb10 tree plus a two-kernel overlay ─────────────────
+# Ripple is dense attention + a dense NVFP4 SwiGLU FFN at hidden 5120 — the
+# same GEMV/GEMM shapes family the qwen3.6-27b gb10 tree already serves
+# (BF16 attention projections, NVFP4 FFN, paged attention with a sliding
+# window). `kernel_source` compiles that tree; `nvfp4/` (target-local
+# overlay) adds only what it lacks:
+#   * ripple_silu_mul_clamp — RicursiveMLP clamps gate (max 20) and up (±20)
+#     before SiLU*up; swapped in for DenseFfnLayer's act_mul.
+#   * ripple_valres_lerp    — the value-residual V input.
+#   * embed_scale           — bf16_scale_inplace (embed_scale = 71.554).
+kernel_source = "qwen3.6-27b"
+
+# Architecture from the checkpoint's config.json.
+layers_total = 80
+layers_sliding_attention = 64
+layers_full_attention = 16
+layer_pattern = "4 sliding (RoPE, window 1024) then 1 global (NoPE, full)"
+hidden_dim = 5120
+head_dim = 128
+q_heads = 80
+kv_heads = 8
+intermediate_size = 40960
+vocab_size = 100352
+max_position_embeddings = 2097152
+sliding_window = 1024
+rope_theta = 10000
+vision = false
+mtp_layers = 0
+moe_experts = 0
+
+# The vendor ships no sampling recommendation (generation_config.json carries
+# token ids only). Conservative defaults until measured.
+[sampling.thinking_text]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.thinking_coding]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.non_thinking]
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.tools]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[behavior]
+# The model opens `<think>` itself (the generation prompt does not), like the
+# vendor's SGLang reasoning detector expects.
+thinking_in_tools = true
+max_thinking_budget = 8192
+# The vendor's reference requires an unquantized BF16 KV cache.
+default_kv_dtype = "bf16"
+tool_call_parser = "hermes"
+
+[[model_types]]
+model_type = "ricursive"
+hidden_size = 5120
+
+# DFlash block-diffusion pairing metadata only — speculation arms solely via
+# `--dflash`; without the flag this block changes nothing.
+[dflash]
+draft_model = "ricursiveAI/Ripple-65B-Preview-DFlash2"
+gamma = 16
+window_size = 4096
+mask_token_id = 100278
+target_layer_ids = [1, 20, 39, 58, 77]
+
+# ── Kernel lookups this model may legitimately fail to resolve ──
+# Same tree (and same dense_ffn probes) as qwen3.6-27b: the two entries below
+# are its declarations carried over verbatim. `spark serve --check-kernels`
+# is the authority — repopulate if it reports more.
+
+[expected_absent.w4a4]
+w4a4_gemm_mfast = """
+This kernel tree's w4a4_gemm.cu defines only w4a4_gemm; the mfast variant exists solely
+in nemotron-labs-3-puzzle-75b-a9b. Dispatch (qwen3_attention/init.rs) falls back
+to w4a4_gemm, which is correct. Same declaration as gb10/qwen3.6-27b/MODEL.toml,
+whose kernel tree this target shares via `kernel_source`."""
+
+[expected_absent.w4a16]
+w4a16_gemm_t_m128_k16 = """
+K16-tile w4a16 GEMM variant, exists only in
+strix-hip/qwen3.6-27b/nvfp4/w4a16_gemm.cu — and even there it only runs under
+ATLAS_W4A16_K16=1 (a gfx1151 occupancy A/B lever). gb10 uses the compiled
+w4a16_gemm_t_m128 / w4a16_gemm arms; handle!=0 gated."""
