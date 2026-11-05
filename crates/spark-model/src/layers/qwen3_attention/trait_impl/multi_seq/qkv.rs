@@ -82,6 +82,18 @@ impl Qwen3AttentionLayer {
             && self.v_weight.as_ref().and_then(|w| w.as_fp8()).is_some()
         {
             self.ms_qkv_batchm_fp8(c)?;
+        } else if (2..=64).contains(&n)
+            && self.gated
+            && self.lora.is_none()
+            && self.dense_gemv_batchm_k.0 != 0
+            && self.qkv_is_dense_bf16()
+            && bf16_batchm_enabled()
+        {
+            // Gated dense-BF16 q/k/v (Ripple): the batched GEMV in chunks of
+            // DENSE_GEMV_BATCHM_MAX_M rows, then the per-row Q/gate
+            // deinterleave. The per-row arm re-read ~250 MB of attention
+            // weights per row per layer — the bulk of a DFlash K=16 verify.
+            self.ms_qkv_batchm_bf16_gated(c)?;
         } else if (2..=8).contains(&n)
             && !self.gated
             && self.dense_gemv_batchm_k.0 != 0
@@ -220,6 +232,71 @@ impl Qwen3AttentionLayer {
             &self.attn.v_proj,
             qkv_buf.offset(q_proj_bytes + kv_bytes),
             kv_dim,
+        )?;
+        Ok(())
+    }
+
+    /// [`Self::ms_qkv_batchm_bf16`] for a gated model: `q_proj` emits the
+    /// per-head `[Q | gate]` interleave, split per row afterwards; V reads the
+    /// value-residual input when the layer has one. Same per-row K order and
+    /// reduction tree as the single-row GEMV (dense_gemv_batchm contract).
+    fn ms_qkv_batchm_bf16_gated(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
+        let MultiSeqCtx {
+            fwd,
+            n,
+            stream,
+            h,
+            nq,
+            nkv,
+            hd,
+            bf16,
+            q_proj_dim,
+            q_proj_bytes,
+            per_seq_qkv,
+            normed,
+            qkv_buf,
+            ..
+        } = *c;
+        debug_assert_eq!(per_seq_qkv % bf16, 0);
+        let out_stride = (per_seq_qkv / bf16) as u32;
+        let kv_dim = nkv * hd;
+        let kv_bytes = kv_dim as usize * bf16;
+        let v_in = self.v_input(normed);
+        let max_rows = ops::DENSE_GEMV_BATCHM_MAX_M as usize;
+        for start in (0..n).step_by(max_rows) {
+            let rows = (n - start).min(max_rows) as u32;
+            let x = normed.offset(start * h * bf16);
+            let vx = v_in.offset(start * h * bf16);
+            let out = qkv_buf.offset(start * per_seq_qkv);
+            let gemv = |input, w, dst, n_out| {
+                ops::dense_gemv_batchm(
+                    fwd.gpu,
+                    self.dense_gemv_batchm_k,
+                    input,
+                    w,
+                    dst,
+                    rows,
+                    n_out,
+                    h as u32,
+                    out_stride,
+                    stream,
+                )
+            };
+            gemv(x, &self.attn.q_proj, out, q_proj_dim)?;
+            gemv(x, &self.attn.k_proj, out.offset(q_proj_bytes), kv_dim)?;
+            gemv(vx, &self.attn.v_proj, out.offset(q_proj_bytes + kv_bytes), kv_dim)?;
+        }
+        // Rows are `per_seq_qkv` apart; the kernel splits each row's leading
+        // [Q | gate] segment in place.
+        ops::deinterleave_qg(
+            fwd.gpu,
+            self.deinterleave_qg_k,
+            qkv_buf,
+            n as u32,
+            nq,
+            hd,
+            out_stride,
+            stream,
         )?;
         Ok(())
     }
