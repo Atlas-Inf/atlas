@@ -122,6 +122,11 @@ pub struct ModelConfig {
     /// because Nemotron-H (and some other models) set it to `null` in JSON.
     #[serde(default, deserialize_with = "nullable_u32")]
     pub sliding_window: u32,
+    /// Layers that use `sliding_window`, for parsers that label every layer
+    /// `FullAttention` because the forward paths only batch that type
+    /// (Ricursive). Empty everywhere else.
+    #[serde(skip)]
+    pub sliding_attention_layers: Vec<usize>,
 
     // ── Position embeddings ──
     #[serde(default)]

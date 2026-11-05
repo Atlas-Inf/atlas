@@ -84,6 +84,13 @@ pub(crate) fn parse_ricursive(raw: &Value) -> Result<ModelConfig> {
         config.sliding_window > 0,
         "ricursive sliding_window must be non-zero"
     );
+    // The batched decode/verify paths only treat `FullAttention` as attention
+    // (as for Gemma-4): every layer is labelled full, and the sliding ones are
+    // listed for the loader, which sets each layer's window and RoPE.
+    config.sliding_attention_layers = (0..config.num_hidden_layers)
+        .filter(|&i| config.layer_types[i] == LayerType::SlidingAttention)
+        .collect();
+    config.layer_types = vec![LayerType::FullAttention; config.num_hidden_layers];
     ensure!(
         config.head_dim > 0 && config.num_key_value_heads > 0,
         "ricursive head_dim and num_key_value_heads must be non-zero"

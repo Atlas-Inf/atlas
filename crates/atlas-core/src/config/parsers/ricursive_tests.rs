@@ -35,8 +35,8 @@ fn parses_hybrid_swa_gated_valres_layout() {
     let config = crate::config::parse_config(CONFIG).expect("parse ricursive");
     assert_eq!(config.model_type, "ricursive");
     assert_eq!(config.num_hidden_layers, 5);
-    assert_eq!(config.layer_types[0], LayerType::SlidingAttention);
-    assert_eq!(config.layer_types[4], LayerType::FullAttention);
+    assert!(config.layer_types.iter().all(|t| *t == LayerType::FullAttention));
+    assert_eq!(config.sliding_attention_layers, [0, 1, 2, 3]);
     assert_eq!(config.sliding_window, 1024);
     assert_eq!(config.embed_scale, 71.554_18_f32);
     assert_eq!(config.eos_token_id, 100265);

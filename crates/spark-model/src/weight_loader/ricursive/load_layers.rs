@@ -159,16 +159,17 @@ fn load_attention(
         dense(store, &format!("{lp}.post_attention_layernorm.weight"))?,
         dense(store, &format!("{lp}.post_feedforward_layernorm.weight"))?,
     );
-    match config.layer_types[i] {
-        LayerType::SlidingAttention => {
-            layer.set_sliding_window(Some(config.sliding_window));
-            layer.set_rope_overrides(config.rope_theta as f32, hd as u32);
-        }
-        LayerType::FullAttention => {
-            layer.set_sliding_window(None);
-            layer.set_rope_disabled(true);
-        }
-        other => anyhow::bail!("ricursive layer {i} is not attention: {other:?}"),
+    // Sliding layers: windowed RoPE attention. Global layers: full NoPE.
+    ensure!(
+        config.layer_types[i] == LayerType::FullAttention,
+        "ricursive layer {i} is not attention"
+    );
+    if config.sliding_attention_layers.contains(&i) {
+        layer.set_sliding_window(Some(config.sliding_window));
+        layer.set_rope_overrides(config.rope_theta as f32, hd as u32);
+    } else {
+        layer.set_sliding_window(None);
+        layer.set_rope_disabled(true);
     }
     Ok(layer)
 }
