@@ -1,0 +1,8 @@
+[build]
+# Ripple's head_dim is 128. The strix-hip attention kernels inherited from the
+# qwen3.6-27b tree (`paged_decode_attn`, the generic paged prefill compute) fix
+# their per-lane vector width at compile time from HDIM, defaulting to 256 —
+# at runtime head_dim 128 each lane then read 8 elements of a 4-element slice
+# and the decode attention output was garbage (cos 0.50 vs the CPU reference,
+# with Q/K/V exact). Same remedy as gb10/laguna-s-2.1.
+extra_nvcc_flags = ["-DHDIM=128"]
