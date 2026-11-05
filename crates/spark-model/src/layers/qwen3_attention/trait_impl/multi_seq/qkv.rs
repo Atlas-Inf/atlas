@@ -44,7 +44,10 @@ impl Qwen3AttentionLayer {
         let MultiSeqCtx { fwd, n, eps, .. } = *c;
 
         // ATLAS_QWEN4EXP_BATCH_FAST_BISECT: the sequential per-row arm.
-        if fwd.levers.batch_bisect(ops::BISECT_ATTN_PROJ) {
+        if self.value_residual.is_some() {
+            // Ricursive: V reads blended rows (`qkv_valres.rs`).
+            self.ms_qkv_valres_bf16(c)?;
+        } else if fwd.levers.batch_bisect(ops::BISECT_ATTN_PROJ) {
             self.ms_qkv_seq_rows(c)?;
         } else if self.ms_qkv_batch_mx8(c)? {
             // Native MXFP8 (FP4-Local): `qkv_mx8.rs`.
@@ -157,7 +160,7 @@ impl Qwen3AttentionLayer {
         Ok(())
     }
 
-    fn qkv_is_dense_bf16(&self) -> bool {
+    pub(super) fn qkv_is_dense_bf16(&self) -> bool {
         let dense = |w: &Option<crate::weight_map::QuantWeight>| {
             w.as_ref()
                 .is_none_or(|w| w.as_nvfp4().is_none() && w.as_fp8().is_none())

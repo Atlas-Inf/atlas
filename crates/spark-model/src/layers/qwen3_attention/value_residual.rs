@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Value residuals (Ricursive Ripple): every layer's V projection reads
+//! `lerp(x0, normed, sigmoid(lambda))` instead of `normed`, where `x0` is the
+//! scaled embedding — the residual stream entering layer 0.
+//!
+//! Reference (`RicursiveAttention.forward`):
+//!
+//! ```text
+//! blend = sigmoid(value_res_lambda[0]).to(bf16)
+//! v = v_proj(torch.lerp(x0, normed, blend))
+//! ```
+//!
+//! Layer 0 snapshots its input rows into the shared `x0` buffer before the
+//! residual stream is updated; later layers of the same forward read them.
+//! Every path that projects V (decode, multi-row verify, prefill) routes its
+//! V input through [`Qwen3AttentionLayer::value_residual_input`].
+
+use anyhow::{Result, ensure};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+use spark_runtime::kernel_args::KernelLaunch;
+
+use super::Qwen3AttentionLayer;
+
+/// Per-layer value-residual state. `x0` and `blended` are shared by every
+/// layer of the model (one allocation each, `[max_rows, hidden]` BF16).
+#[derive(Clone, Copy, Debug)]
+pub struct ValueResidual {
+    pub x0: DevicePtr,
+    pub blended: DevicePtr,
+    pub max_rows: usize,
+    /// `bf16(sigmoid(bf16 lambda))`, as the reference rounds it.
+    pub blend: f32,
+    /// Layer 0 writes `x0`; every other layer only reads it.
+    pub capture: bool,
+    pub lerp_k: KernelHandle,
+}
+
+/// `bf16(sigmoid(lambda))` with the sigmoid evaluated in f32 on the BF16
+/// parameter value, matching torch's BF16 `sigmoid`.
+pub fn value_residual_blend(lambda_bf16: f32) -> f32 {
+    let s = 1.0f32 / (1.0f32 + (-lambda_bf16).exp());
+    half::bf16::from_f32(s).to_f32()
+}
+
+impl Qwen3AttentionLayer {
+    /// Wide (n > 8) multi-row BF16 projections take the cuBLASLt GEMM rather
+    /// than the scalar `dense_gemm` tile kernel (~89 GB/s). Only Ricursive
+    /// opts in, so other models' verify numerics are unchanged.
+    pub(crate) fn wide_bf16_gemm(&self) -> bool {
+        self.value_residual.is_some()
+    }
+
+    pub fn set_value_residual(&mut self, vr: ValueResidual) {
+        self.value_residual = Some(vr);
+    }
+
+    /// Layer 0 only: copy the `rows` input rows (the scaled embeddings) into `x0`.
+    pub(crate) fn value_residual_capture(
+        &self,
+        gpu: &dyn GpuBackend,
+        hidden: DevicePtr,
+        rows: usize,
+        h: usize,
+        stream: u64,
+    ) -> Result<()> {
+        let Some(vr) = self.value_residual.filter(|vr| vr.capture) else {
+            return Ok(());
+        };
+        ensure!(
+            rows <= vr.max_rows,
+            "value residual: {rows} rows exceed the {}-row x0 buffer",
+            vr.max_rows
+        );
+        gpu.copy_d2d_async(hidden, vr.x0, rows * h * 2, stream)
+    }
+
+    /// The V projection input for `rows` contiguous normed rows: `normed`
+    /// itself without value residuals, else the blended rows.
+    pub(crate) fn value_residual_input(
+        &self,
+        gpu: &dyn GpuBackend,
+        normed: DevicePtr,
+        rows: usize,
+        h: usize,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        let Some(vr) = self.value_residual else {
+            return Ok(normed);
+        };
+        ensure!(
+            rows <= vr.max_rows,
+            "value residual: {rows} rows exceed the {}-row blend buffer",
+            vr.max_rows
+        );
+        let n = (rows * h) as u32;
+        KernelLaunch::new(gpu, vr.lerp_k)
+            .grid([n.div_ceil(256), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(vr.x0)
+            .arg_ptr(normed)
+            .arg_ptr(vr.blended)
+            .arg_u32(n)
+            .arg_f32(vr.blend)
+            .launch(stream)?;
+        Ok(vr.blended)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::value_residual_blend;
+
+    #[test]
+    fn blend_is_bf16_rounded_sigmoid() {
+        // Layer 0 of Ripple-65B Preview ships lambda = 2.140625 (exact in BF16).
+        let b = value_residual_blend(2.140625);
+        assert_eq!(b, half::bf16::from_f32(b).to_f32());
+        assert!((b - 0.894_531_25).abs() < 1e-6, "{b}");
+        assert_eq!(value_residual_blend(0.0), 0.5);
+    }
+}

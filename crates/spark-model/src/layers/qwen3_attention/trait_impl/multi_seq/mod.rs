@@ -39,6 +39,7 @@ mod qkv_dp4a;
 mod qkv_exact4;
 mod qkv_fp8;
 mod qkv_mx8;
+mod qkv_valres;
 mod qsa_rows;
 #[cfg(test)]
 mod tests;
@@ -106,6 +107,7 @@ impl Qwen3AttentionLayer {
         let _ = (states, row_owner); // Non-hc attention keeps no per-seq state.
 
         // ── Phase 1: RMS norm + residual for N tokens ──
+        self.value_residual_capture(ctx.gpu, c.hidden, c.n, c.h, c.stream)?;
         ops::rms_norm_residual(
             ctx.gpu,
             self.rms_norm_residual_k,

@@ -168,6 +168,7 @@ impl Qwen3AttentionLayer {
             moe_ffn: None,
             shortcut_carry_out: None,
             shortcut_carry_in: None,
+            value_residual: None,
             pre_moe_norm: None,
             post_moe_out_norm: None,
             post_dense_ffn_norm: None,

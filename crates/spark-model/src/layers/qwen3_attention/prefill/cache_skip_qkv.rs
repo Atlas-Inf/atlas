@@ -100,9 +100,10 @@ impl Qwen3AttentionLayer {
         )?;
         let v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16);
         let t0 = std::time::Instant::now();
+        let v_in = self.value_residual_input(ctx.gpu, normed, n as usize, h as usize, stream)?;
         self.cache_skip_one_proj(
             SkipProj::V,
-            normed,
+            v_in,
             normed_fp8,
             v_contiguous,
             n,
