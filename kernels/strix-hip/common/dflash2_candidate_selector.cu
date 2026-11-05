@@ -58,6 +58,11 @@
 #endif
 #define DF2_SEL_MAX_RANK 256
 #define DF2_SEL_MAX_SPLITS 16
+// strix-hip: the register-list phase 1 spills on gfx1151 even at K=16
+// (801 VGPRs/thread, 1416 B scratch); the round form is exact and spill-free.
+#ifndef DF2_SEL_ROUND_TOPK
+#define DF2_SEL_ROUND_TOPK 1
+#endif
 #ifndef DF2_SEL_THREADS
 #define DF2_SEL_THREADS 512
 #endif
