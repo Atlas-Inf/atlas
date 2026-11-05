@@ -490,3 +490,46 @@ pub fn prefill_attention_paged_dflash_bf16_indirect(
         .arg_ptr(sinks)
         .launch(stream)
 }
+
+/// DFlash verify attention for one sequence's `q_len` rows
+/// (`ricursive_verify_attn`): [`prefill_attention_paged`]'s BF16 kernel with
+/// the KV extent read from `dev_kv_len` (the last row's device `seq_len`),
+/// so the launch carries no per-step host values and can be graph-captured.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_rows_attention_paged(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k_cache: DevicePtr,
+    v_cache: DevicePtr,
+    output: DevicePtr,
+    block_table: DevicePtr,
+    dev_kv_len: DevicePtr,
+    [q_len, num_q_heads, num_kv_heads, head_dim]: [u32; 4],
+    cache_block_size: u32,
+    sliding_window: u32,
+    inv_sqrt_d: f32,
+    stream: u64,
+) -> Result<()> {
+    let br = 32u32;
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_q_heads, div_ceil(q_len, br), 1])
+        .block([128, 1, 1])
+        .arg_ptr(q)
+        .arg_ptr(k_cache)
+        .arg_ptr(v_cache)
+        .arg_ptr(output)
+        .arg_ptr(block_table)
+        .arg_u32(q_len)
+        .arg_u32(0) // kv_len: overwritten from dev_kv_len in-kernel
+        .arg_u32(0) // q_offset: kv_len - q_len in-kernel
+        .arg_u32(num_q_heads)
+        .arg_u32(num_kv_heads)
+        .arg_u32(head_dim)
+        .arg_u32(cache_block_size)
+        .arg_u32(sliding_window)
+        .arg_u32(1u32) // causal
+        .arg_f32(inv_sqrt_d)
+        .arg_ptr(dev_kv_len)
+        .launch(stream)
+}

@@ -35,6 +35,7 @@ pub(super) fn load_layers(
     };
     let lerp_k = gpu.kernel("value_residual", "value_residual_lerp")?;
     let wide_gemv_k = gpu.kernel("bf16_gemv_m32", "bf16_gemv_m32")?;
+    let verify_attn_k = gpu.kernel("ricursive_verify_attn", "ricursive_verify_attn")?;
     let mut layers: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
         let lp = format!("model.layers.{i}");
@@ -49,6 +50,7 @@ pub(super) fn load_layers(
             capture: i == 0,
             lerp_k,
             wide_gemv_k,
+            verify_attn_k,
         });
         gpu.synchronize(stream)?;
         layers.push(Box::new(layer));

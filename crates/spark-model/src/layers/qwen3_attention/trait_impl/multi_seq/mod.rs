@@ -12,6 +12,7 @@ use crate::layer::{ForwardContext, LayerState};
 use crate::layers::ops;
 
 mod attn;
+mod attn_rows;
 mod c4;
 mod ctx;
 mod ffn;
@@ -98,6 +99,8 @@ impl Qwen3AttentionLayer {
             c.seq_slot = m.seq_slot;
         }
         c.active = active_rows.min(num_seqs);
+        c.single_seq_rows =
+            num_seqs > 1 && row_owner.is_some_and(|o| o.iter().all(|&s| Some(&s) == o.first()));
 
         // DeepSeek-V4 / Qwen4-exp: Manifold-Constrained Hyper-Connections.
         if self.hc.is_some() {

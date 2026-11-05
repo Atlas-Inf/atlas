@@ -36,6 +36,8 @@ pub struct ValueResidual {
     pub lerp_k: KernelHandle,
     /// `bf16_gemv_m32`: the wide-verify BF16 q|gate and o projections.
     pub wide_gemv_k: KernelHandle,
+    /// `ricursive_verify_attn`: one sequence's verify rows against the cache.
+    pub verify_attn_k: KernelHandle,
 }
 
 /// `bf16(sigmoid(lambda))` with the sigmoid evaluated in f32 on the BF16
@@ -46,6 +48,12 @@ pub fn value_residual_blend(lambda_bf16: f32) -> f32 {
 }
 
 impl Qwen3AttentionLayer {
+    /// The prefill-style verify attention (`attn_rows.rs`), when the target
+    /// ships it (Ricursive). 0 elsewhere.
+    pub(crate) fn verify_rows_attn_k(&self) -> Option<KernelHandle> {
+        self.value_residual.map(|vr| vr.verify_attn_k).filter(|k| k.0 != 0)
+    }
+
     /// Wide (n > 8) multi-row BF16 projections take the cuBLASLt GEMM rather
     /// than the scalar `dense_gemm` tile kernel (~89 GB/s). Only Ricursive
     /// opts in, so other models' verify numerics are unchanged.
