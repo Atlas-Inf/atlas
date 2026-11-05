@@ -614,10 +614,6 @@ impl DenseFfnLayer {
         self.act_mul = gpu.kernel("ripple_ops", "ripple_silu_mul_clamp")?;
         self.clamped_swiglu = true;
         self.dp4a_silu_quant_k = KernelHandle(0);
-        // The batched dp4a arm quantizes activations to int8; Ripple's
-        // single-row decode keeps BF16 activations, so multi-row decode and
-        // DFlash verify take the BF16 w4a16 batchm arm to stay consistent.
-        self.dp4a_quant_batch4_k = KernelHandle(0);
         self.nvfp4_silu_scaled_k = KernelHandle(0);
         self.nvfp4_silu_quant_k = KernelHandle(0);
         self.w8a16_gemv_silu_input_k = KernelHandle(0);

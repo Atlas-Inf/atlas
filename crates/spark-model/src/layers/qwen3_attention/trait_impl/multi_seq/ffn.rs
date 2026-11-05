@@ -114,11 +114,7 @@ impl Qwen3AttentionLayer {
                 eps,
                 stream,
             )?;
-            // Batched weight-streaming GEMV (one read of each FFN weight for
-            // the n rows) where a tier exists; the prefill GEMM otherwise.
-            if !(self.ffn.can_forward_km(n as u32) && self.ffn.try_forward_km(normed2, n as u32, fwd, stream)?) {
-                self.ffn.forward_prefill(normed2, n, fwd, stream)?;
-            }
+            self.ffn.forward_prefill(normed2, n, fwd, stream)?;
             let ffn_out = fwd.buffers.moe_output();
             ops::rms_norm(fwd.gpu, self.rms_norm_w_k, ffn_out, post_ffn, ffn_out, n as u32, h as u32, eps, stream)?;
             ops::residual_add(fwd.gpu, self.residual_add_k, hidden, ffn_out, (n * h) as u32, stream)?;
