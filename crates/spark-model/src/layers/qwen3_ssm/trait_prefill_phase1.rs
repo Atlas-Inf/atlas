@@ -383,6 +383,9 @@ impl Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.gdn_chunk_tc_serves(ctx) {
+            return Ok(()); // the fused GDN scan normalizes Q and K itself
+        }
         let nk = ctx.config.linear_num_key_heads;
         let kd = ctx.config.linear_key_head_dim;
         let nv = ctx.config.linear_num_value_heads;

@@ -36,6 +36,21 @@ pub(super) struct ChunkTcScan {
 }
 
 impl Qwen3SsmLayer {
+    /// Whether every GDN scan under `ctx` runs on the fused kernel: the lever
+    /// and kernel are present, not an exact replay, 128-dim heads. The kernel
+    /// L2-normalizes Q and K itself, so the separate pass is skipped exactly
+    /// when this holds (`prefill_phase1_l2_batched`).
+    pub(super) fn gdn_chunk_tc_serves(&self, ctx: &ForwardContext) -> bool {
+        let c = ctx.config;
+        let (nk, nv) = (c.linear_num_key_heads, c.linear_num_value_heads);
+        self.gdn_chunk_tc_k.0 != 0
+            && !ctx.gdn_exact_replay
+            && c.linear_key_head_dim == 128
+            && c.linear_value_head_dim == 128
+            && nk != 0
+            && nv.is_multiple_of(nk)
+    }
+
     /// Run `scan` on the fused kernel. `Ok(false)`: not eligible (lever off,
     /// kernel absent, exact replay, or not 128-dim heads); the caller keeps
     /// its own ladder.
@@ -46,18 +61,12 @@ impl Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
+        if !self.gdn_chunk_tc_serves(ctx) {
+            return Ok(false);
+        }
         let c = ctx.config;
         let (nk, kd) = (c.linear_num_key_heads, c.linear_key_head_dim);
         let (nv, vd) = (c.linear_num_value_heads, c.linear_value_head_dim);
-        if self.gdn_chunk_tc_k.0 == 0
-            || ctx.gdn_exact_replay
-            || kd != 128
-            || vd != 128
-            || nk == 0
-            || !nv.is_multiple_of(nk)
-        {
-            return Ok(false);
-        }
         if ctx.stats.once("log:gdn_chunk_tc") {
             tracing::info!("GDN prefill: fused chunked tensor-core scan ACTIVE ({MODULE}::{FUNC})");
         }

@@ -20,6 +20,11 @@
 // ~16 mantissa bits; Q, K and V are BF16 inputs and go in as they are. Q S
 // uses the hi half of S only (the FLA output pass reads a BF16 state too).
 //
+// Q and K rows are L2-normalized here, bit for bit as l2_norm_bf16 (same
+// pair squares, same reduction tree, eps 1e-6), so that pass is skipped
+// wherever this kernel serves every scan (`gdn_chunk_tc_serves`); a path
+// that normalized already only re-normalizes unit rows.
+//
 // Each stream is computed by its own CTAs in a fixed order, so a stream's
 // result does not depend on what else is in the launch.
 //
@@ -38,6 +43,7 @@ constexpr int KP = KD + 8;     // pitch of [*][k] bf16 tiles (conflict-free frag
 constexpr int VP = DV + 8;     // pitch of the V tile
 constexpr int CP = CH + 8;     // pitch of [*][chunk] tiles (bf16 and the fp32 T)
 constexpr float GATE_FLOOR = 1e-30f;   // as gated_delta_rule_fla.cu
+constexpr float L2_EPS = 1e-6f;        // as the l2_norm_bf16 pass this kernel absorbs
 
 constexpr int OFF_K = 0;                      // bf16 [CH][KP]   K chunk
 constexpr int OFF_V = OFF_K + CH * KP * 2;    // bf16 [CH][VP]   V chunk (this block's columns)
@@ -214,6 +220,35 @@ __device__ __forceinline__ void tri_inverse(float* T, int tid) {
     bar_sync(BAR_G0, 128);
 }
 
+// A 128-wide row's sum of squares exactly as l2_norm_bf16 forms it (128
+// threads, thread p squaring pair p, a butterfly per warp, then the two warp
+// sums), from the quad that holds it: lane q of the quad holds sq[k][f] =
+// pair k * 8 + q + 4 f. Every lane of the quad returns the row's total.
+__device__ __forceinline__ float l2_row_total(const float (&sq)[8][2], int lane) {
+    float w[2];
+#pragma unroll
+    for (int h = 0; h < 2; h++) {   // warp h of the norm pass: pairs 32 h ..
+        float b[2];
+#pragma unroll
+        for (int f = 0; f < 2; f++) {
+            const float a0 = sq[4 * h][f] + sq[4 * h + 2][f];       // xor 16
+            const float a1 = sq[4 * h + 1][f] + sq[4 * h + 3][f];
+            b[f] = a0 + a1;                                         // xor 8
+        }
+        const float c = b[0] + b[1];                                // xor 4
+        const float d = c + __shfl_xor_sync(0xffffffffu, c, 2);     // xor 2
+        const float e = d + __shfl_xor_sync(0xffffffffu, d, 1);     // xor 1
+        w[h] = __shfl_sync(0xffffffffu, e, lane & ~3);              // lane 0's
+    }
+    return w[0] + w[1];
+}
+// One pair's square, written as l2_norm_bf16 accumulates it.
+__device__ __forceinline__ float pair_sq(float x0, float x1) {
+    float s = 0.f;
+    s += x0 * x0 + x1 * x1;
+    return s;
+}
+
 // The warp's state rows (16 * warp + grp, +8) x 64 columns, into S^T hi/lo.
 __device__ __forceinline__ void stage_state(const float (&S)[8][4], bf16* Sh, bf16* Sl, int warp, int grp, int q) {
 #pragma unroll
@@ -316,6 +351,31 @@ gdn_chunk_tc_prefill(
         }
         cp_wait_all();
         __syncthreads();   // K, V (this chunk) and the raw log gates are staged
+        {   // L2-normalize the K rows in place, bit for bit as l2_norm_bf16: a
+            // quad a row, lane q owning pairs k * 8 + q + 4 f (l2_row_total).
+            const int i = tid >> 2, qq = tid & 3;
+            uint32_t* row = reinterpret_cast<uint32_t*>(Ks + i * KP);
+            uint32_t w[8][2];
+            float sq[8][2];
+#pragma unroll
+            for (int k = 0; k < 8; k++)
+#pragma unroll
+                for (int f = 0; f < 2; f++) {
+                    w[k][f] = row[k * 8 + qq + 4 * f];
+                    const __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(&w[k][f]);
+                    sq[k][f] = pair_sq(__low2float(v), __high2float(v));
+                }
+            const float inv = rsqrtf(l2_row_total(sq, lane) + L2_EPS);
+#pragma unroll
+            for (int k = 0; k < 8; k++)
+#pragma unroll
+                for (int f = 0; f < 2; f++) {
+                    const __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(&w[k][f]);
+                    const __nv_bfloat162 o = __floats2bfloat162_rn(__low2float(v) * inv, __high2float(v) * inv);
+                    row[k * 8 + qq + 4 * f] = *reinterpret_cast<const uint32_t*>(&o);
+                }
+        }
+        __syncthreads();
 
         // Two groups run side by side until the join:
         //   G0 (warps 0-3): K K^T -> L -> T = (I + L)^-1 -> T diag(beta) hi/lo
@@ -400,6 +460,30 @@ gdn_chunk_tc_prefill(
                     qa[ks][2] = v0 ? ld32(q0 + ks * 16 + 8) : 0u;
                     qa[ks][3] = v1 ? ld32(q1 + ks * 16 + 8) : 0u;
                 }
+                // L2-normalize both rows, bit for bit as l2_norm_bf16: lane q
+                // of the quad holds pairs k * 8 + q (reg 0 / 1) and + 4 (reg 2 / 3)
+                // of rows grp and grp + 8, the layout l2_row_total takes.
+                float inv[2];
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    float sq[8][2];
+#pragma unroll
+                    for (int ks = 0; ks < 8; ks++)
+#pragma unroll
+                        for (int f = 0; f < 2; f++) {
+                            const __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(&qa[ks][h + 2 * f]);
+                            sq[ks][f] = pair_sq(__low2float(v), __high2float(v));
+                        }
+                    inv[h] = rsqrtf(l2_row_total(sq, lane) + L2_EPS);
+                }
+#pragma unroll
+                for (int ks = 0; ks < 8; ks++)
+#pragma unroll
+                    for (int f = 0; f < 4; f++) {
+                        const __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(&qa[ks][f]);
+                        const __nv_bfloat162 o = __floats2bfloat162_rn(__low2float(v) * inv[f & 1], __high2float(v) * inv[f & 1]);
+                        qa[ks][f] = *reinterpret_cast<const uint32_t*>(&o);
+                    }
             }
             float kS[8][4] = {};
 #pragma unroll
