@@ -11,11 +11,15 @@ use super::*;
 use spark_runtime::kernel_args::KernelLaunch;
 
 const MODULE: &str = "moe_bf16mma_prefill";
-/// 128-feature down tiles per CTA. The down K is short (one 512-wide
-/// intermediate, 8 pipeline stages per tile), so chaining 4 tiles on one
-/// pipeline amortizes its fill: 0.95 -> 0.89 ms at 1k rows, 1.81 -> 1.70 ms
-/// at 4k (isolated, 256 experts, hidden 2048).
-const DOWN_TILES_PER_CTA: u32 = 4;
+/// Threads per CTA: two 128-thread feature halves (`BM_HV` in the kernel).
+const THREADS: u32 = 256;
+/// Gate/up features per CTA (64 of gate and of up per half).
+const GATE_UP_FEATURES: u32 = 128;
+/// Down features per CTA: 4 tiles of 256 back to back. The down K is short (a
+/// 512-wide intermediate, 8 pipeline stages per tile), so chaining tiles on one
+/// pipeline amortizes its fill (0.95 -> 0.89 ms at 1k rows, 1.81 -> 1.70 ms at
+/// 4k, isolated, 256 experts, hidden 2048).
+const DOWN_FEATURES: u32 = 4 * 256;
 
 /// `[gate_up_silu, down]`; handle 0 where the target does not ship them.
 pub(super) fn kernels(gpu: &dyn GpuBackend) -> [KernelHandle; 2] {
@@ -46,8 +50,8 @@ impl MoeLayer {
             && !self.gelu_activation
             && self.lora.is_none()
             && ctx.comm.is_none()
-            && h.is_multiple_of(128 * DOWN_TILES_PER_CTA)
-            && inter.is_multiple_of(64)
+            && h.is_multiple_of(DOWN_FEATURES)
+            && inter.is_multiple_of(GATE_UP_FEATURES)
     }
 
     /// Gate/up GEMM + SiLU·mul: token-major `input` gathered by
@@ -151,8 +155,8 @@ pub(super) fn launch_gate_up(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([inter / 64, rows.max_m_tiles, rows.num_experts])
-        .block([128, 1, 1])
+        .grid([inter / GATE_UP_FEATURES, rows.max_m_tiles, rows.num_experts])
+        .block([THREADS, 1, 1])
         .arg_ptr(input)
         .arg_ptr(g[0])
         .arg_ptr(g[1])
@@ -182,12 +186,8 @@ pub(super) fn launch_down(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([
-            h / (128 * DOWN_TILES_PER_CTA),
-            rows.max_m_tiles,
-            rows.num_experts,
-        ])
-        .block([128, 1, 1])
+        .grid([h / DOWN_FEATURES, rows.max_m_tiles, rows.num_experts])
+        .block([THREADS, 1, 1])
         .arg_ptr(input)
         .arg_ptr(d[0])
         .arg_ptr(d[1])

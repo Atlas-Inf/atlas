@@ -14,7 +14,7 @@ use super::*;
 use anyhow::ensure;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 
-const H: usize = 512;
+const H: usize = 1024;
 const I: usize = 128;
 const COUNTS: [usize; 6] = [0, 1, 9, 64, 65, 135];
 const TOKENS: usize = 140;
