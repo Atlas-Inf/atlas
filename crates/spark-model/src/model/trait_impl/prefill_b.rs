@@ -48,6 +48,7 @@ pub(in crate::model) mod qwen4exp_points;
 mod save_checkpoint;
 mod score;
 mod score_head;
+mod score_plan;
 mod score_profile;
 mod score_ssm;
 mod stage_batched;

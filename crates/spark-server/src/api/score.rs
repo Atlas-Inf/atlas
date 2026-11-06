@@ -44,6 +44,8 @@ struct ScoreResponse {
     probs: Vec<Vec<f32>>,
     engine_us: u64,
     queue_us: u64,
+    /// Requests that shared this one's forward pass (1 = ran alone).
+    batched: usize,
 }
 
 /// Validate and expand a request into (prefix, branches, per-branch options).
@@ -127,6 +129,7 @@ pub async fn score(
             probs: out.probs,
             engine_us: out.engine_us,
             queue_us: out.queue_us,
+            batched: out.batched,
         })
         .into_response(),
         Ok(Err(e)) => openai_error_response(StatusCode::UNPROCESSABLE_ENTITY, e),

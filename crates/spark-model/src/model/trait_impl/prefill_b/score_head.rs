@@ -9,7 +9,7 @@ use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 
 use super::super::super::types::TransformerModel;
-use super::score::ScorePlan;
+use super::score_plan::ScorePlan;
 
 impl TransformerModel {
     /// Final norm on each branch's last row, LM head, softmax over options.
@@ -24,12 +24,11 @@ impl TransformerModel {
         let bf16 = 2usize;
         let hidden = self.buffers.hidden_states();
         let normed = self.buffers.norm_output();
-        let first = usize::from(plan.has_head);
         let mut last_rows = Vec::with_capacity(options.len());
         let mut end = 0usize;
-        for i in 0..plan.tokens.len() {
+        for i in 0..plan.streams() {
             end += plan.rows(i);
-            if i >= first {
+            if i >= plan.heads {
                 last_rows.push(end - 1);
             }
         }

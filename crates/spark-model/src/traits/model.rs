@@ -93,6 +93,16 @@ pub fn padded_batch_n(n: usize) -> usize {
     spark_runtime::buffers::padded_batch_rung(n)
 }
 
+/// One prefill-only scoring request (see [`Model::score_requests`]).
+pub struct ScoreInput<'a> {
+    /// Shared prefix, read once.
+    pub prefix: &'a [u32],
+    /// Continuations of `prefix`, each scored at its last row.
+    pub branches: &'a [Vec<u32>],
+    /// Per branch, the single option token ids to score.
+    pub options: &'a [Vec<u32>],
+}
+
 pub trait Model: Send + Sync {
     /// Release the device memory this model owns, in reverse construction
     /// order.
@@ -301,17 +311,16 @@ pub trait Model: Send + Sync {
         Ok(out)
     }
 
-    /// Prefill-only scoring: run `prefix` once and each branch as its
-    /// continuation, all in one forward pass, and return per branch the
-    /// softmax over that branch's single option tokens at its last row.
-    /// Nothing is sampled, decoded or cached. Default: unsupported.
-    fn score_branches(
+    /// Prefill-only scoring: for each request, run `prefix` once and each
+    /// branch as its continuation — every request in ONE forward pass — and
+    /// return, per request and branch, the softmax over that branch's single
+    /// option tokens at its last row. Nothing is sampled, decoded or cached.
+    /// Default: unsupported.
+    fn score_requests(
         &self,
-        _prefix: &[u32],
-        _branches: &[Vec<u32>],
-        _options: &[Vec<u32>],
+        _reqs: &[ScoreInput<'_>],
         _stream: u64,
-    ) -> Result<Vec<Vec<f32>>> {
+    ) -> Result<Vec<Vec<Vec<f32>>>> {
         anyhow::bail!("this model does not support prefill-only scoring")
     }
 
