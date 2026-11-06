@@ -196,13 +196,17 @@ impl TransformerModel {
                 // A verify step that finishes the sequence commits on the secondary
                 // stream and is freed straight away: order the zero after it.
                 if let Err(e) = self.sync_secondary_dispatch() {
-                    tracing::error!("free_sequence: sync_secondary before zero_slot({slot}): {e:#}");
+                    tracing::error!(
+                        "free_sequence: sync_secondary before zero_slot({slot}): {e:#}"
+                    );
                 }
                 if let Err(e) = self.ssm_pool.zero_slot(slot, self.gpu.as_ref(), stream) {
                     tracing::error!("free_sequence: ssm_pool.zero_slot({slot}): {e:#}");
                 }
                 if let Err(e) = self.gpu.synchronize(stream) {
-                    tracing::error!("free_sequence: gpu.synchronize after zero_slot({slot}): {e:#}");
+                    tracing::error!(
+                        "free_sequence: gpu.synchronize after zero_slot({slot}): {e:#}"
+                    );
                 }
             }
             self.ssm_pool.release_slot(slot);

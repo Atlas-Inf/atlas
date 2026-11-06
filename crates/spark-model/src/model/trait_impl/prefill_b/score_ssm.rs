@@ -49,7 +49,9 @@ fn gdn_slice(
     let (bf16, fp32) = (2usize, 4usize);
     GdnPrefillBuffers {
         qkv: g.qkv.offset(off * conv_dim * bf16),
-        gate_beta: g.gate_beta.offset(off * c.linear_num_value_heads * 2 * fp32),
+        gate_beta: g
+            .gate_beta
+            .offset(off * c.linear_num_value_heads * 2 * fp32),
         output: g.output.offset(off * value_dim * bf16),
         z: g.z.offset(off * value_dim * bf16),
         total_len: len,
@@ -71,9 +73,8 @@ impl TransformerModel {
         let rebased: Vec<i32> = cu[plan.heads..].iter().map(|c| c - base).collect();
         let dst = self.buffers.scratch().offset(off);
         // SAFETY: a live `&[i32]` reinterpreted as its own bytes.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(rebased.as_ptr() as *const u8, rebased.len() * 4)
-        };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(rebased.as_ptr() as *const u8, rebased.len() * 4) };
         self.gpu.copy_h2d_async_retained(bytes, dst, stream)?;
         Ok(dst)
     }
@@ -135,11 +136,22 @@ impl TransformerModel {
         let max_len = |lo: usize, hi: usize| (lo..hi).map(|b| (cu[b + 1] - cu[b]) as u32).max();
         let g = gdn_slice(gdn, 0, cu[heads] as usize, ctx);
         if let Some(len) = max_len(0, heads)
-            && !layer.score_gdn_scan(tabs, DevicePtr::NULL, &g, heads as u32, meta.cu_seqlens, len, ctx, stream)?
+            && !layer.score_gdn_scan(
+                tabs,
+                DevicePtr::NULL,
+                &g,
+                heads as u32,
+                meta.cu_seqlens,
+                len,
+                ctx,
+                stream,
+            )?
         {
             return Ok(false);
         }
-        let Some(len) = max_len(heads, n) else { return Ok(true) };
+        let Some(len) = max_len(heads, n) else {
+            return Ok(true);
+        };
         let base = cu[heads] as usize;
         let g = gdn_slice(gdn, base, cu[n] as usize - base, ctx);
         let (h, init) = (tabs.offset(heads * 8), tabs.offset((n + heads) * 8));
@@ -147,7 +159,10 @@ impl TransformerModel {
         if layer.score_gdn_scan(h, init, &g, nb, branch_cu, len, ctx, stream)? {
             return Ok(true);
         }
-        ensure!(heads == 0, "score: layer {layer_idx} scanned its heads but not its branches");
+        ensure!(
+            heads == 0,
+            "score: layer {layer_idx} scanned its heads but not its branches"
+        );
         Ok(false)
     }
 
@@ -175,7 +190,12 @@ impl TransformerModel {
         let group = &mut seqs[lo..hi];
         if group.len() == 1 {
             let g = gdn_slice(gdn, base, lens[0], ctx);
-            return layer.prefill_gdn_full(group[0].layer_states[layer_idx].as_mut(), &g, ctx, stream);
+            return layer.prefill_gdn_full(
+                group[0].layer_states[layer_idx].as_mut(),
+                &g,
+                ctx,
+                stream,
+            );
         }
         let gb = gdn_slice(gdn, base, lens.iter().sum(), ctx);
         let ptrs = self.stage_h_state_ptrs(layer_idx, group, h_ptrs_off, stream)?;
@@ -286,9 +306,31 @@ impl TransformerModel {
         };
         if !fused {
             let g = (gdn, h_ptrs_off, ctx, stream);
-            self.score_gdn_group(layer, layer_idx, seqs, (0, heads), cu, meta.cu_seqlens, g.0, g.1, g.2, g.3)?;
+            self.score_gdn_group(
+                layer,
+                layer_idx,
+                seqs,
+                (0, heads),
+                cu,
+                meta.cu_seqlens,
+                g.0,
+                g.1,
+                g.2,
+                g.3,
+            )?;
             self.score_fork(seqs, plan, layer_idx, false, stream)?;
-            self.score_gdn_group(layer, layer_idx, seqs, (heads, n), cu, branch_cu, g.0, g.1, g.2, g.3)?;
+            self.score_gdn_group(
+                layer,
+                layer_idx,
+                seqs,
+                (heads, n),
+                cu,
+                branch_cu,
+                g.0,
+                g.1,
+                g.2,
+                g.3,
+            )?;
         }
         prof.mark(self, stream, Phase::SsmGdn)?;
 

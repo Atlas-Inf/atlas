@@ -46,9 +46,18 @@ impl TransformerModel {
         let v = self.config.vocab_size as u32;
         for r in reqs {
             ensure!(!r.branches.is_empty(), "score: no branches");
-            ensure!(r.branches.len() == r.options.len(), "score: one option set per branch");
-            ensure!(r.branches.iter().all(|b| !b.is_empty()), "score: empty branch");
-            ensure!(r.options.iter().all(|o| !o.is_empty()), "score: empty option set");
+            ensure!(
+                r.branches.len() == r.options.len(),
+                "score: one option set per branch"
+            );
+            ensure!(
+                r.branches.iter().all(|b| !b.is_empty()),
+                "score: empty branch"
+            );
+            ensure!(
+                r.options.iter().all(|o| !o.is_empty()),
+                "score: empty option set"
+            );
             ensure!(
                 r.options.iter().flatten().all(|&t| t < v),
                 "score: option token outside the vocabulary"
@@ -59,7 +68,10 @@ impl TransformerModel {
             "score: single-rank models only"
         );
         ensure!(self.comm.is_none(), "score: single-rank models only");
-        ensure!(!self.use_fp32_logits, "score: FP32 logits mode is not supported");
+        ensure!(
+            !self.use_fp32_logits,
+            "score: FP32 logits mode is not supported"
+        );
         let bs = self.kv_cache.lock().block_size();
         let plan_reqs: Vec<ScoreRequest<'_>> = reqs
             .iter()
@@ -78,7 +90,10 @@ impl TransformerModel {
             "score: {} sequences exceed the SSM state pool ({max_streams}; raise --max-batch-size)",
             plan.streams()
         );
-        let options: Vec<Vec<u32>> = reqs.iter().flat_map(|r| r.options.iter().cloned()).collect();
+        let options: Vec<Vec<u32>> = reqs
+            .iter()
+            .flat_map(|r| r.options.iter().cloned())
+            .collect();
 
         let trace = std::env::var("ATLAS_SCORE_TRACE").is_ok_and(|v| v == "1");
         let t0 = std::time::Instant::now();
@@ -391,7 +406,8 @@ impl TransformerModel {
         }
         if changed {
             let bytes = as_bytes(&meta.kv_lens_host);
-            self.gpu.copy_h2d_async_retained(&bytes, meta.kv_lens, stream)?;
+            self.gpu
+                .copy_h2d_async_retained(&bytes, meta.kv_lens, stream)?;
         }
         Ok(off + ((n * 4 + 63) & !63))
     }
