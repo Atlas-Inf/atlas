@@ -271,8 +271,7 @@ pub(crate) fn load_dflash_drafter(
             drafter_config,
         )));
     }
-    // The fast loader stores the same tensors and bytes
-    // (`dflash_fast_load_check`: 0.6 s against 5.3 s for the 2.2 GB drafter).
+    // Same tensors and bytes, 0.6 s vs 5.3 s (`dflash_fast_load_check`).
     let mut drafter_store = if use_fast_load(args) {
         #[cfg(unix)]
         {
@@ -398,8 +397,7 @@ fn skip_activation_scales(config: &ModelConfig) -> bool {
     matches!(config.model_type.as_str(), "qwen4_exp")
 }
 
-/// Whether this model's loader builds no MTP head, so `mtp.*` need not be
-/// uploaded at all.
+/// Whether this model's loader builds no MTP head, so `mtp.*` need not be uploaded.
 ///
 /// Measured, not estimated: `mtp.*` on this checkpoint is 5.21 GB (31 tensors,
 /// 5.03 GB of which is the stacked BF16 expert pair) — not the ~1.5 GB an
@@ -407,9 +405,7 @@ fn skip_activation_scales(config: &ModelConfig) -> bool {
 /// against, and on a box where 0.90 utilization is already near the boot floor
 /// it is the difference between a usable KV cache and none.
 fn skip_mtp(config: &ModelConfig, args: &cli::ServeArgs) -> bool {
-    // qwen4_exp and mimo_v2 both have rank-0-only dedicated MTP loaders. Their
-    // checkpoints ship the draft weights under `mtp.*` and `model.mtp.*`
-    // respectively; the tensor-name predicate below covers both spellings.
+    // Both have rank-0-only MTP loaders (`mtp.*` / `model.mtp.*` tensors).
     matches!(config.model_type.as_str(), "qwen4_exp" | "mimo_v2")
         && (!args.speculative || config.ep_rank != 0)
 }
