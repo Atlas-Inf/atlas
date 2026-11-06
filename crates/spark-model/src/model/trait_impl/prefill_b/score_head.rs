@@ -87,12 +87,14 @@ impl TransformerModel {
             let x = bf16_to_f32(&rows[j * h * 2..(j + 1) * h * 2]);
             let mut logits = Vec::with_capacity(opts.len());
             for &t in opts {
-                if !cache.1.contains_key(&t) {
-                    self.gpu.copy_d2h(head.offset(t as usize * h * 2), &mut buf)?;
-                    cache.1.insert(t, bf16_to_f32(&buf));
-                }
-                let w = &cache.1[&t];
-                logits.push(x.iter().zip(w).map(|(a, b)| a * b).sum::<f32>());
+                let w = match cache.1.entry(t) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        self.gpu.copy_d2h(head.offset(t as usize * h * 2), &mut buf)?;
+                        e.insert(bf16_to_f32(&buf))
+                    }
+                };
+                logits.push(x.iter().zip(w.iter()).map(|(a, b)| a * b).sum::<f32>());
             }
             out.push(softmax_f32(&logits));
         }
