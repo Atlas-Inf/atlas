@@ -31,8 +31,8 @@
 // 2^8 are applied to the FP32 accumulators. Activations stay BF16 (the FP8
 // kernels round them to E4M3), so this path is at least as precise.
 //
-// Grid: (x, y, num_experts), block 256. Feature tiles (128 gate+up features
-// or 256 down features) are split evenly over x. An expert's rows are split
+// Grid: (N / features, y, num_experts), block 256; a CTA computes 128 gate+up
+// features or 256 down features. An expert's rows are split
 // into ceil(M/64) balanced chunks (<= 64 rows); CTA y takes chunks y,
 // y + gridDim.y, ...
 
@@ -168,10 +168,7 @@ __device__ __forceinline__ void bm_stage(const __nv_bfloat16 (*tok)[BM_TOK_LD],
 }
 
 // Per half, FUSED: 64 features of gate and of up, output silu(gate)*up,
-// N = inter, one tile per CTA. Otherwise 128 features of one matrix; a CTA
-// covers N / (128 * HV * gridDim.x) such tiles back to back for the same rows,
-// on one cp.async pipeline (the grid picks it: fewer, longer CTAs amortize the
-// pipeline fill when K is short).
+// N = inter. Otherwise 128 features of one matrix.
 template <bool FUSED, int HV>
 __device__ __forceinline__ void bm_body(
     const __nv_bfloat16* __restrict__ A,
@@ -200,8 +197,7 @@ __device__ __forceinline__ void bm_body(
 
     constexpr unsigned int FEAT = FUSED ? 64 : 128;      // features per half
     constexpr unsigned int NT = 128 * HV;                // threads
-    const unsigned int xt = N / (FEAT * HV * gridDim.x);
-    const unsigned int n0 = blockIdx.x * FEAT * HV * xt;
+    const unsigned int n0 = blockIdx.x * FEAT * HV;
     const unsigned int tid = threadIdx.x;
     // Each 128-thread half loads and multiplies its own FEAT features.
     const unsigned int half = tid >> 7, ht = tid & 127;
@@ -213,8 +209,8 @@ __device__ __forceinline__ void bm_body(
     __shared__ BmStage<HV> st[BM_STAGES];
 
     // Weight loader: two 16-byte chunks of k-pair row `wkp`; scale loader
-    // (threads 0..31): one chunk of group row `sgr`. FUSED chunks 0..3 are
-    // gate, 4..7 up.
+    // (threads 0..31 of each half): one chunk of group row `sgr`. FUSED
+    // chunks 0..3 are gate, 4..7 up.
     const unsigned int nh = n0 + half * FEAT;
     const unsigned int wkp = FUSED ? (ht & 63) >> 1 : ht >> 2;
     const unsigned int wc = FUSED ? (ht >> 6) * 4 + (ht & 1) * 2 : (ht & 3) * 2;
@@ -244,21 +240,20 @@ __device__ __forceinline__ void bm_body(
         const unsigned int tc0 = (tid % TPR) * CPT * 8;
         const __nv_bfloat16* a_src = A + tok_row * (long long)K + tc0;
 
-        // Stage s: feature tile s / ksteps, k = (s % ksteps) * 64.
         auto issue = [&](int buf, int s) {
-            const unsigned int x = s / ksteps, kb = (s % ksteps) * BM_KS;
+            const unsigned int kb = s * BM_KS;
             if (tok_live) {
                 #pragma unroll
                 for (int c = 0; c < CPT; c++)
                     bm_cp16(&st[buf].tok[lr][tc0 + c * 8], a_src + kb + c * 8, tok_valid);
             }
-            const unsigned char* ws = w_src + x * FEAT * HV + (unsigned long long)(kb / 2) * N;
+            const unsigned char* ws = w_src + (unsigned long long)(kb / 2) * N;
             const unsigned int sw = bm_swz_w(wkp);
             bm_cp16(&st[buf].w[half][wkp][(wc ^ sw) * 16], ws, true);
             bm_cp16(&st[buf].w[half][wkp][((wc + 1) ^ sw) * 16], ws + 16, true);
             if (ht < 32)
                 bm_cp16(&st[buf].s[half][sgr][(sc_c ^ bm_swz_s(sgr)) * 16],
-                        s_src + x * FEAT * HV + (unsigned long long)(kb / 16) * N, true);
+                        s_src + (unsigned long long)(kb / 16) * N, true);
         };
 
         float acc[2][8][4];
@@ -268,19 +263,18 @@ __device__ __forceinline__ void bm_body(
             for (int i = 0; i < 8; i++)
                 acc[f][i][0] = acc[f][i][1] = acc[f][i][2] = acc[f][i][3] = 0.0f;
 
-        const int nstages = xt * ksteps;
         #pragma unroll
         for (int s = 0; s < BM_STAGES - 1; s++) {
-            if (s < nstages) issue(s, s);
+            if (s < ksteps) issue(s, s);
             bm_commit();
         }
 
-        for (int s = 0; s < nstages; s++) {
+        for (int s = 0; s < ksteps; s++) {
             bm_wait<BM_STAGES - 2>();
             __syncthreads();
             {
                 const int ns = s + BM_STAGES - 1;
-                if (ns < nstages) issue(ns % BM_STAGES, ns);
+                if (ns < ksteps) issue(ns % BM_STAGES, ns);
                 bm_commit();
             }
             // Token-tile count as a template argument: with the tiles' loads
@@ -299,48 +293,32 @@ __device__ __forceinline__ void bm_body(
                 case 7: bm_stage<FUSED, 7>(sb.tok, sw, ss, acc, warp, g, t); break;
                 default: bm_stage<FUSED, 8>(sb.tok, sw, ss, acc, warp, g, t); break;
             }
-            if (FUSED || (s + 1) % ksteps != 0) continue;
-
-            // Down tile done: store from registers. Thread (g, t) holds tokens
-            // 2t, 2t+1 of each token tile, features 32w + 4g + {0..3} of each.
-            const unsigned int nx = n0 + (s / ksteps) * FEAT * HV + half * FEAT;
-            #pragma unroll
-            for (int tt = 0; tt < 8; tt++) {
-                #pragma unroll
-                for (int p = 0; p < 2; p++) {
-                    const int r = tt * 8 + 2 * t + p;
-                    if (tt < tt_valid && r < rows) {
-                        __nv_bfloat162 lo = __floats2bfloat162_rn(acc[0][tt][p] * k0, acc[0][tt][2 + p] * k0);
-                        __nv_bfloat162 hi = __floats2bfloat162_rn(acc[1][tt][p] * k1, acc[1][tt][2 + p] * k1);
-                        *(uint2*)&C[(unsigned long long)(m_start + r0 + r) * N + nx + 32 * warp + 4 * g] =
-                            make_uint2(*(unsigned int*)&lo, *(unsigned int*)&hi);
-                    }
-                }
-                #pragma unroll
-                for (int f = 0; f < 2; f++)
-                    acc[f][tt][0] = acc[f][tt][1] = acc[f][tt][2] = acc[f][tt][3] = 0.0f;
-            }
         }
         bm_wait<0>();
-        if (!FUSED) continue;
 
-        // gate/up (one feature tile, xt == 1): SiLU·mul staged through shared
-        // memory as [token][feature], then whole 256-byte rows. Measured faster
-        // than 4-byte register stores (1.27 vs 1.34 ms at 1k rows).
+        // Epilogue staged through shared memory as [token][feature], then
+        // whole rows (measured faster than 4- and 8-byte register stores:
+        // gate/up 1.27 vs 1.34 ms at 1k rows).
         __syncthreads();
         constexpr unsigned int OLD = FEAT * HV + 8;
+        static_assert(sizeof(st) >= BM_ROWS * OLD * sizeof(__nv_bfloat16), "epilogue tile fits the stages");
         __nv_bfloat16* os = (__nv_bfloat16*)&st[0];
         #pragma unroll
         for (int tt = 0; tt < 8; tt++) {
             if (tt < tt_valid) {
                 #pragma unroll
                 for (int i = 0; i < 4; i++) {
-                    const unsigned int tok = tt * 8 + 2 * t + (i & 1);
-                    // The SiLU reads BF16 gate/up, as the unfused chain does.
-                    const float gv = __bfloat162float(__float2bfloat16(acc[0][tt][i] * k0));
-                    const float uv = __bfloat162float(__float2bfloat16(acc[1][tt][i] * k1));
-                    os[tok * OLD + half * FEAT + 16 * warp + 2 * g + (i >> 1)] =
-                        __float2bfloat16(gv * (1.0f / (1.0f + __expf(-gv))) * uv);
+                    const unsigned int tok = tt * 8 + 2 * t + (i & 1), q = i >> 1;
+                    __nv_bfloat16* o = os + tok * OLD + half * FEAT;
+                    if (FUSED) {
+                        // The SiLU reads BF16 gate/up, as the unfused chain does.
+                        const float gv = __bfloat162float(__float2bfloat16(acc[0][tt][i] * k0));
+                        const float uv = __bfloat162float(__float2bfloat16(acc[1][tt][i] * k1));
+                        o[16 * warp + 2 * g + q] = __float2bfloat16(gv * (1.0f / (1.0f + __expf(-gv))) * uv);
+                    } else {
+                        o[32 * warp + 4 * g + q] = __float2bfloat16(acc[0][tt][i] * k0);
+                        o[32 * warp + 4 * g + 2 + q] = __float2bfloat16(acc[1][tt][i] * k1);
+                    }
                 }
             }
         }
@@ -376,7 +354,7 @@ moe_bf16mma_gate_up_silu(
 }
 
 // down: A sorted [total_expanded, K]; weights the transposed [K/2, N] table;
-// C sorted [total_expanded, N]. Grid x divides N / 256, block 256.
+// C sorted [total_expanded, N]. Grid x = N / 256, block 256.
 extern "C" __global__ void __launch_bounds__(128 * BM_HV, 2)
 moe_bf16mma_down(
     const __nv_bfloat16* __restrict__ A,

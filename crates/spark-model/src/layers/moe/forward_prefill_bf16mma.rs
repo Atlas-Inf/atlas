@@ -15,11 +15,15 @@ const MODULE: &str = "moe_bf16mma_prefill";
 const THREADS: u32 = 256;
 /// Gate/up features per CTA (64 of gate and of up per half).
 const GATE_UP_FEATURES: u32 = 128;
-/// Down features per CTA: 4 tiles of 256 back to back. The down K is short (a
-/// 512-wide intermediate, 8 pipeline stages per tile), so chaining tiles on one
-/// pipeline amortizes its fill (0.95 -> 0.89 ms at 1k rows, 1.81 -> 1.70 ms at
-/// 4k, isolated, 256 experts, hidden 2048).
-const DOWN_FEATURES: u32 = 4 * 256;
+/// Down features per CTA (128 per half).
+const DOWN_FEATURES: u32 = 256;
+/// Down CTAs per expert along y cover 4x the average expert's 64-row chunks;
+/// the kernel strides the rest, so the hottest expert's tile count is not
+/// launched as empty CTAs for every expert (short K: 8 stages per CTA). Down
+/// per layer, one score pass: 1011 -> 949 us at 2k rows, 1567 -> 1465 at 4k.
+/// Gate/up keeps the full grid: there the hot experts' serialized chunks cost
+/// more (1111 -> 1237 us at 1k rows).
+const DOWN_GRID_AVG_FACTOR: u32 = 4;
 
 /// `[gate_up_silu, down]`; handle 0 where the target does not ship them.
 pub(super) fn kernels(gpu: &dyn GpuBackend) -> [KernelHandle; 2] {
@@ -76,7 +80,7 @@ impl MoeLayer {
             offsets: expert_offsets,
             sorted_token_ids,
             num_experts,
-            max_m_tiles,
+            grid_y: max_m_tiles,
         };
         launch_gate_up(
             ctx.gpu,
@@ -92,13 +96,14 @@ impl MoeLayer {
 
     /// Down GEMM: sorted `expert_gate_out` `[rows, inter]` → sorted
     /// `[rows, h]` in `expert_down_out`.
+    /// `[max_m_tiles, avg_rows]`: the hottest expert's 64-row tiles and the
+    /// average expert's rows.
     pub(super) fn bf16mma_down(
         &self,
         expert_offsets: DevicePtr,
         num_experts: u32,
-        h: u32,
-        inter: u32,
-        max_m_tiles: u32,
+        [h, inter]: [u32; 2],
+        [max_m_tiles, avg_rows]: [u32; 2],
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -109,7 +114,7 @@ impl MoeLayer {
             offsets: expert_offsets,
             sorted_token_ids: DevicePtr::NULL,
             num_experts,
-            max_m_tiles,
+            grid_y: max_m_tiles.min((DOWN_GRID_AVG_FACTOR * avg_rows).div_ceil(64).max(1)),
         };
         launch_down(
             ctx.gpu,
@@ -133,13 +138,14 @@ fn table(t: &ExpertPtrTable) -> Table {
 }
 
 /// The expert-sorted rows: `[num_experts + 1]` offsets, the token of each
-/// sorted row (gate/up only), and the hottest expert's 64-row tile count.
+/// sorted row (gate/up only), and the CTAs per expert along y (any count:
+/// the kernels stride an expert's 64-row chunks).
 #[derive(Clone, Copy)]
 pub(super) struct Rows {
     pub offsets: DevicePtr,
     pub sorted_token_ids: DevicePtr,
     pub num_experts: u32,
-    pub max_m_tiles: u32,
+    pub grid_y: u32,
 }
 
 /// `moe_bf16mma_gate_up_silu` over `[gate, up]`; `[h, inter]` dims.
@@ -155,7 +161,7 @@ pub(super) fn launch_gate_up(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([inter / GATE_UP_FEATURES, rows.max_m_tiles, rows.num_experts])
+        .grid([inter / GATE_UP_FEATURES, rows.grid_y, rows.num_experts])
         .block([THREADS, 1, 1])
         .arg_ptr(input)
         .arg_ptr(g[0])
@@ -186,7 +192,7 @@ pub(super) fn launch_down(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([h / DOWN_FEATURES, rows.max_m_tiles, rows.num_experts])
+        .grid([h / DOWN_FEATURES, rows.grid_y, rows.num_experts])
         .block([THREADS, 1, 1])
         .arg_ptr(input)
         .arg_ptr(d[0])

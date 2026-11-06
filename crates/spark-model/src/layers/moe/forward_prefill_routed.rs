@@ -270,9 +270,8 @@ impl MoeLayer {
             self.bf16mma_down(
                 expert_offsets,
                 num_experts,
-                h,
-                inter,
-                max_m_tiles,
+                [h, inter],
+                [max_m_tiles, avg_per_expert as u32],
                 ctx,
                 stream,
             )?;

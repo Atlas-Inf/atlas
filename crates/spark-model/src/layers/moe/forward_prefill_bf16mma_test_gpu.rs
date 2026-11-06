@@ -180,11 +180,11 @@ fn bf16mma_moe_matches_exact_dequant_reference() -> Result<()> {
         upload(&gpu, &bytes_of(&poison))?,
         upload(&gpu, &bytes_of(&poison))?,
     );
-    let rows = |sorted_token_ids, max_m_tiles| Rows {
+    let rows = |sorted_token_ids, grid_y| Rows {
         offsets: upload(&gpu, &bytes_of(&offsets)).expect("offsets"),
         sorted_token_ids,
         num_experts: COUNTS.len() as u32,
-        max_m_tiles,
+        grid_y,
     };
     let sorted_d = upload(&gpu, &bytes_of(&sorted))?;
     let tables = [gate.upload(&gpu)?, up.upload(&gpu)?, down.upload(&gpu)?];
