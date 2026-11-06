@@ -97,8 +97,31 @@ pub struct LowpArgs {
 
 /// The MX handoff's K granularity: its scales stage eight 64-K stages at a time.
 const MX_K: u32 = 512;
+/// Threads of the 16-warp W4A8 kernels (`DX_THREADS`).
+pub(super) const X16_THREADS: u32 = 512;
+/// Rows from which the 16-warp W4A8 kernels beat the 8-warp ones they
+/// reproduce bit for bit: gate+up from a few hundred rows; the projections
+/// whose 20 to 48 feature tiles keep few CTAs per wave only at the longest
+/// passes (microbenchmark at the 27B shapes, us 8-warp / 16-warp: gate+up
+/// 288 rows 913 / 841, 4128 rows 11076 / 10627; down 288 568 / 617, 1056
+/// 1511 / 1676, 4128 5348 / 5111; q 1056 1001 / 927; o 1056 556 / 591).
+/// The MX handoff (dnmx) keeps the 8-warp kernels: in the engine at 4128
+/// rows its 16-warp twins took 12.18 / 6.20 ms per call against 11.60 / 5.88.
+const X16_GATE_UP_ROWS: u32 = 129;
+const X16_PROJ_ROWS: u32 = 2048;
 
 impl DenseBf16mma {
+    /// The 16-warp twin of a W4A8 kernel for `m` rows, where it is faster.
+    pub(super) fn x16_twin(&self, kernel: KernelHandle, m: u32) -> Option<KernelHandle> {
+        let [gate_up, nvfp4] = self.w4a8x16;
+        let twin = match kernel.0 {
+            k if k == self.w4a8_gate_up.0 && m >= X16_GATE_UP_ROWS => gate_up,
+            k if k == self.w4a8.0 && m >= X16_PROJ_ROWS => nvfp4,
+            _ => KernelHandle(0),
+        };
+        (twin.0 != 0).then_some(twin)
+    }
+
     /// Whether the gate+up -> down handoff runs as MX8 tokens (`dnmx`) for a
     /// `k_down`-wide intermediate: both kernels shipped, W4A8 gate+up on.
     pub(super) fn mx_on(&self, lowp: &LowpArgs, k_down: u32) -> bool {

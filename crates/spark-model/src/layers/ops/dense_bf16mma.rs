@@ -62,6 +62,8 @@ pub struct DenseBf16mma {
     /// The MX8 handoff pair (`LowpMix::DOWN_MX`).
     w4a8_gate_up_mx: KernelHandle,
     w4a8_mx: KernelHandle,
+    /// Their 16-warp twins (`dx_body`): [gate_up, nvfp4, gate_up_mx, mx].
+    w4a8x16: [KernelHandle; 2],
     w8a8: KernelHandle,
     /// W8A8 on the transposed `[K, N]` prefill copy.
     w8a8_t: KernelHandle,
@@ -88,6 +90,7 @@ impl Default for DenseBf16mma {
             w4a8: KernelHandle(0),
             w4a8_gate_up_mx: KernelHandle(0),
             w4a8_mx: KernelHandle(0),
+            w4a8x16: [KernelHandle(0); 2],
             w8a8: KernelHandle(0),
             w8a8_t: KernelHandle(0),
             quant_nvfp4: KernelHandle(0),
@@ -158,6 +161,7 @@ impl DenseBf16mma {
             w4a8: k("dense_w4a8_nvfp4"),
             w4a8_gate_up_mx: k("dense_w4a8_gate_up_silu_mx"),
             w4a8_mx: k("dense_w4a8mx_nvfp4"),
+            w4a8x16: [k("dense_w4a8x16_gate_up_silu"), k("dense_w4a8x16_nvfp4")],
             w8a8: k("dense_w8a8_fp8"),
             w8a8_t: k("dense_w8a8_fp8t"),
             quant_nvfp4: k("dl_quant_nvfp4"),
@@ -190,6 +194,7 @@ impl DenseBf16mma {
         [m, n, k, features]: [u32; 4],
         stream: u64,
     ) -> Result<(KernelLaunch<'a>, u32)> {
+        let mut threads = THREADS;
         let (launch, rows, slots) = match lp {
             None => (
                 KernelLaunch::new(gpu, kernel)
@@ -200,6 +205,14 @@ impl DenseBf16mma {
             ),
             Some((nvfp4, kernel, smem)) => {
                 let token_scales = self.quantize(gpu, nvfp4, input, lowp, [m, k], stream)?;
+                // The 16-warp W4A8 twin where it is faster (bit-identical).
+                let kernel = match self.x16_twin(kernel, m) {
+                    Some(twin) => {
+                        threads = X16_THREADS;
+                        twin
+                    }
+                    None => kernel,
+                };
                 let launch = KernelLaunch::new(gpu, kernel)
                     .shared_mem(smem)
                     .arg_ptr(lowp.codes);
@@ -218,7 +231,7 @@ impl DenseBf16mma {
         Ok((
             launch
                 .grid([(n / features) * c, 1, 1])
-                .block([THREADS, 1, 1]),
+                .block([threads, 1, 1]),
             c,
         ))
     }
@@ -430,6 +443,7 @@ pub fn fp8_scale_k_uniform(gpu: &dyn GpuBackend, w: &Fp8Weight) -> Result<bool> 
 
 #[path = "dense_bf16mma_lowp.rs"]
 mod lowp;
+use lowp::X16_THREADS;
 pub use lowp::{LowpArgs, LowpMix};
 
 #[path = "dense_bf16mma_ba.rs"]

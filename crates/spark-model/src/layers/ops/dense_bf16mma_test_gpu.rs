@@ -17,7 +17,8 @@ use spark_runtime::cuda_backend::AtlasCudaBackend;
 
 pub(super) const H: usize = 256;
 pub(super) const I: usize = 256;
-pub(super) const ROWS: [usize; 3] = [33, 135, 1100];
+/// 2100 rows reach the 16-warp W4A8 projections (from 2048 rows).
+pub(super) const ROWS: [usize; 4] = [33, 135, 1100, 2100];
 pub(super) const SPARE_ROWS: usize = 3;
 pub(super) const POISON: u16 = 0xa5a5;
 pub(super) const NO_LOWP: LowpArgs = LowpArgs {
