@@ -42,6 +42,9 @@
 #define MIMO_QK 192
 #define MIMO_VD 128
 #define MIMO_TILE 32
+// Mirrors MIMO_SPLIT_TOKENS / MIMO_MAX_SPLITS in qwen3_attention/mimo.rs.
+#define MIMO_SPLIT_TOKENS 512u
+#define MIMO_MAX_SPLITS 16u
 // +2 bf16 per K row: 388-byte stride maps lane j to bank (j*97) % 32 = j.
 #define MIMO_KROW (MIMO_QK + 2)
 #define MIMO_VROW MIMO_VD
@@ -289,11 +292,22 @@ static __device__ __forceinline__ void mimo_load_q(float* __restrict__ qs,
 }
 
 // ---------------------------------------------------------------------------
+// Split-K partitions of one row, from its own attended length alone, so a
+// row's arithmetic does not depend on the batch it rides in (a speculative
+// verify row matches the serial decode of the same token). `grid` is the
+// launched split count: an upper bound for every row of the batch.
+static __device__ __forceinline__ unsigned int mimo_row_splits(
+    unsigned int span, unsigned int grid) {
+    const unsigned int want = (span + MIMO_SPLIT_TOKENS - 1) / MIMO_SPLIT_TOKENS;
+    return min(grid, max(1u, min(MIMO_MAX_SPLITS, want)));
+}
+
 // Paged decode. Grid: (nkv, num_splits, num_seqs). Block: (32 * group, 1, 1)
 // where group = nq / nkv (≤ 32). Warp w handles Q head kvh*group + w.
 //
-// num_splits == 1: writes the final normalized row to `out`.
-// num_splits  > 1: writes (m, l) to ws_ml[seq][head][split][2] and the
+// Each row uses mimo_row_splits(span) <= num_splits partitions; splits past
+// that exit. One partition: writes the final normalized row to `out`.
+// More: writes (m, l) to ws_ml[seq][head][split][2] and the
 //                  unnormalized accumulator to ws_acc[seq][head][split][128];
 //                  mimo_paged_decode_reduce finishes the row.
 // ---------------------------------------------------------------------------
@@ -336,7 +350,9 @@ extern "C" __global__ void mimo_paged_decode_attn(
     const unsigned int lo = (window > 0 && len > window) ? len - window : 0u;
     // Split the attended range into 32-aligned chunks.
     const unsigned int span = len - lo;
-    const unsigned int per = ((span + num_splits - 1) / num_splits + MIMO_TILE - 1) / MIMO_TILE * MIMO_TILE;
+    const unsigned int rs = mimo_row_splits(span, num_splits);
+    if (split >= rs) return;
+    const unsigned int per = ((span + rs - 1) / rs + MIMO_TILE - 1) / MIMO_TILE * MIMO_TILE;
     const unsigned int s_lo = lo + split * per;
     const unsigned int s_hi = min(len, s_lo + per);
 
@@ -357,7 +373,7 @@ extern "C" __global__ void mimo_paged_decode_attn(
         mimo_consume_tile(st, qs, ks, vs, k0, s_lo, s_hi, scale);
     }
 
-    if (num_splits == 1) {
+    if (rs == 1) {
         const bool has_sink = sinks != nullptr;
         const float sink = has_sink ? __bfloat162float(sinks[head]) : 0.f;
         mimo_store_row(st, sink, has_sink, out_scale, out + (unsigned long long)seq * out_stride + head * MIMO_VD);
@@ -372,12 +388,14 @@ extern "C" __global__ void mimo_paged_decode_attn(
     *a = make_float4(st.acc[0], st.acc[1], st.acc[2], st.acc[3]);
 }
 
-// Grid: (nq, num_seqs). Block: (128, 1, 1).
+// Grid: (nq, num_seqs). Block: (128, 1, 1). Full attention only (window 0).
+// Rows that took one partition were finished by the decode kernel.
 extern "C" __global__ void mimo_paged_decode_reduce(
     const float* __restrict__ ws_ml,
     const float* __restrict__ ws_acc,
     const __nv_bfloat16* __restrict__ sinks,  // [nq] or null
     __nv_bfloat16* __restrict__ out,
+    const int* __restrict__ seq_lens,         // [num_seqs]
     const unsigned int nq,
     const unsigned int num_splits,
     const float out_scale,
@@ -386,13 +404,16 @@ extern "C" __global__ void mimo_paged_decode_reduce(
     const unsigned int head = blockIdx.x;
     const unsigned int seq = blockIdx.y;
     const unsigned int d = threadIdx.x;
+    const int len_i = seq_lens[seq];
+    const unsigned int rs = mimo_row_splits(len_i > 0 ? (unsigned int)len_i : 0u, num_splits);
+    if (rs == 1) return;
     const unsigned long long base = ((unsigned long long)seq * nq + head) * num_splits;
     float m = -CUDART_INF_F;
-    for (unsigned int s = 0; s < num_splits; ++s) m = fmaxf(m, ws_ml[(base + s) * 2]);
+    for (unsigned int s = 0; s < rs; ++s) m = fmaxf(m, ws_ml[(base + s) * 2]);
     if (sinks != nullptr) m = fmaxf(m, __bfloat162float(sinks[head]));
     float l = 0.f;
     float acc = 0.f;
-    for (unsigned int s = 0; s < num_splits; ++s) {
+    for (unsigned int s = 0; s < rs; ++s) {
         const float ms = ws_ml[(base + s) * 2];
         if (ms == -CUDART_INF_F) continue;
         const float w = __expf(ms - m);

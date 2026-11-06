@@ -141,7 +141,12 @@ fn dispatch(
     let k5 = rows == 5 && config.model_type == "glm5_next" && batchm.0 != 0 && k5_enabled;
     let n = config.vocab_size as u32;
     let k = config.hidden_size as u32;
-    if k3 || k5 {
+    // MiMo verify rows: the batched GEMV is bit-identical per row to the
+    // serial head's `dense_gemv_bf16`, so a verify row's argmax matches serial.
+    let mimo = config.model_type == "mimo_v2"
+        && batchm.0 != 0
+        && (2..=ops::DENSE_GEMV_BATCHM_MAX_M).contains(&rows);
+    if k3 || k5 || mimo {
         ops::dense_gemv_batchm(gpu, batchm, input, weight, output, rows, n, k, n, stream)
     } else {
         ops::dense_gemm(gpu, gemm, input, weight, output, rows, n, k, stream)

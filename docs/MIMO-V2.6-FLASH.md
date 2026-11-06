@@ -100,14 +100,29 @@ DFLASH=1 bash scripts/start-mimo-ep2.sh   # adds --dflash --draft-model <snapsho
 acceptance rate (`DFlash` lines in the rank-0 log) and tok/s against serial
 and MTP K=1 on the same prompts.
 
-## Row-batched MoE verify (`MOE_ROWS=1`)
+## Row-exact verify (`MOE_ROWS=1`)
 
-By default an 8-row speculative verify (DFlash γ=8) runs MiMo's E8M0 MoE one
-row at a time, each with its own EP all-reduce: 8 round trips per MoE layer
-instead of 1. `MOE_ROWS=1` (`ATLAS_MOE_ROWS_DECODE=1`, both ranks) routes the
-batched decode/verify FFN through `MoeLayer::forward_rows`: the same per-row
-arithmetic and one `[n, h]` all-reduce per layer. Greedy output must match
-the default exactly.
+By default an 8-row speculative verify (DFlash γ=8) runs MiMo's MoE through
+the pairwise batched path (a batched router, then per-row experts), each pair
+with its own EP all-reduce, and layer 0's dense FFN through the batched
+`w4a16_gemv_batchm` kernels. Both differ numerically from serial decode.
+`MOE_ROWS=1` (`ATLAS_MOE_ROWS_DECODE=1`, both ranks) instead runs every
+verify row through the serial FFN code: MoE rows via
+`MoeLayer::forward_rows` (serial per-row arithmetic, one `[n, h]`
+all-reduce per layer) and the dense layer per row.
+
+Two batch-invariance fixes apply always (not gated by the flag):
+
+- Full-attention split-K partitions are chosen per row from the row's own
+  length (`mimo_row_splits` in `mimo_attn.cu`). Before, they came from the
+  batch's longest block table, so a verify row split differently from the
+  serial step of the same token.
+- The LM head for 2–8 rows uses `dense_gemv_batchm`, which is bit-identical
+  per row to serial `dense_gemv_bf16`. It used to be a tiled GEMM.
+
+With `MOE_ROWS=1`, greedy DFlash output should match serial decode
+byte-for-byte. If it doesn't, compare the first diverging token's logits
+between the two runs.
 
 ## Sliding-window KV eviction (`SWA_EVICT=1`)
 

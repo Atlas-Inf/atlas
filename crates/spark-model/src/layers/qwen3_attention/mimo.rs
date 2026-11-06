@@ -267,6 +267,7 @@ impl Qwen3AttentionLayer {
                 .arg_ptr(ws_acc)
                 .arg_ptr(m.sinks)
                 .arg_ptr(attn)
+                .arg_ptr(meta.seq_len)
                 .arg_u32(m.nq)
                 .arg_u32(splits)
                 .arg_f32(m.out_scale)
