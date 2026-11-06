@@ -30,6 +30,7 @@ impl Qwen3AttentionLayer {
         &self,
         gpu: &dyn GpuBackend,
         dispatch: &crate::layers::ops::GemmDispatch,
+        lowp: crate::layers::ops::LowpArgs,
         input: DevicePtr,
         weight: &crate::weight_map::QuantizedWeight,
         output: DevicePtr,
@@ -46,7 +47,7 @@ impl Qwen3AttentionLayer {
         if self.bf16mma.serves_nvfp4(weight, [m, n, k]) {
             return self
                 .bf16mma
-                .nvfp4(gpu, input, weight, output, [m, n, k], stream);
+                .nvfp4(gpu, input, weight, output, [m, n, k], lowp, stream);
         }
         let v = dispatch.w4a16_variant;
         // LOSSLESS opt-in: route QKV/o projection prefill through the BF16-TC

@@ -35,14 +35,27 @@ impl DenseFfnLayer {
             return Ok(false);
         }
         let act = ctx.buffers.expert_gate_out();
-        self.bf16mma
-            .gate_up_silu(ctx.gpu, input, [gate, up], act, [m, inter, h], stream)?;
+        let lowp = |group| ops::LowpArgs {
+            group,
+            codes: ctx.buffers.ffn_act_a(),
+            scales: ctx.buffers.ffn_act_scale(),
+        };
+        self.bf16mma.gate_up_silu(
+            ctx.gpu,
+            input,
+            [gate, up],
+            act,
+            [m, inter, h],
+            lowp(ops::LowpMix::GATE_UP),
+            stream,
+        )?;
         self.bf16mma.nvfp4(
             ctx.gpu,
             act,
             down,
             ctx.buffers.moe_output(),
             [m, h, inter],
+            lowp(ops::LowpMix::DOWN),
             stream,
         )?;
         Ok(true)

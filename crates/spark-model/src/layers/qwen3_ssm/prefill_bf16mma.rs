@@ -49,7 +49,17 @@ impl Qwen3SsmLayer {
         {
             return Ok(false);
         }
-        self.bf16mma.fp8(ctx.gpu, input, w, out, rows, stream)?;
+        let lowp = ops::LowpArgs {
+            group: if slot == QKVZ {
+                ops::LowpMix::GDN_QKVZ
+            } else {
+                ops::LowpMix::GDN_OUT
+            },
+            codes: ctx.buffers.ffn_act_a(),
+            scales: ctx.buffers.ffn_act_scale(),
+        };
+        self.bf16mma
+            .fp8(ctx.gpu, input, w, out, rows, lowp, stream)?;
         Ok(true)
     }
 

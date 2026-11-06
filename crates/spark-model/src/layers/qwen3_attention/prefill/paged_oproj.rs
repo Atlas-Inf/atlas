@@ -263,6 +263,11 @@ impl Qwen3AttentionLayer {
                 self.w4a16_gemm_m128_dispatch(
                     ctx.gpu,
                     ctx.dispatch,
+                    crate::layers::ops::LowpArgs {
+                        group: crate::layers::ops::LowpMix::ATTN_O,
+                        codes: ctx.buffers.ffn_act_a(),
+                        scales: ctx.buffers.ffn_act_scale(),
+                    },
                     attn_out,
                     nvfp4_t,
                     o_out,
