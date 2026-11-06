@@ -35,6 +35,16 @@ NUM_DRAFTS="${NUM_DRAFTS:-3}"
 if [ "$SPECULATIVE" = "1" ]; then
   EXTRA_FLAGS="--speculative --num-drafts $NUM_DRAFTS $EXTRA_FLAGS"
 fi
+# SWA_EVICT=1: the 39 sliding-window layers keep only a per-sequence ring of
+# KV slots (ATLAS_SWA_EVICT), so --max-seq-len can grow past 65536. It drops
+# old sliding-window history, so prefix caching is turned off with it.
+SWA_EVICT="${SWA_EVICT:-0}"
+PREFIX_CACHE_FLAG="--enable-prefix-caching"
+SWA_EVICT_ENV=""
+if [ "$SWA_EVICT" = "1" ]; then
+  PREFIX_CACHE_FLAG=""
+  SWA_EVICT_ENV="-e ATLAS_SWA_EVICT=1"
+fi
 DFLASH="${DFLASH:-0}"
 # Block size 8 (7 drafts per step) and the trained 1024-token sliding window.
 DFLASH_GAMMA="${DFLASH_GAMMA:-8}"
@@ -100,6 +110,7 @@ sudo docker run -d \
   $RDMA_FLAGS \
   $NCCL_ENV \
   -e RUST_LOG=info \
+  $SWA_EVICT_ENV \
   ${ATLAS_PROFILE_FIRST:+-e ATLAS_PROFILE_FIRST=$ATLAS_PROFILE_FIRST} \
   -v "${HOME}/.cache/huggingface:/root/.cache/huggingface" \
   "$IMAGE" serve "$MODEL" \
@@ -115,7 +126,7 @@ sudo docker run -d \
     --max-batch-size "$MAX_BATCH" \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --kv-cache-dtype "$KV_DTYPE" \
-    --enable-prefix-caching \
+    $PREFIX_CACHE_FLAG \
     $EXTRA_FLAGS \
     --oom-guard-mb 512
 
@@ -129,6 +140,7 @@ ssh "$WORKER_IP" "sudo docker run -d \
   $RDMA_FLAGS \
   $NCCL_ENV \
   -e RUST_LOG=info \
+  $SWA_EVICT_ENV \
   ${ATLAS_PROFILE_FIRST:+-e ATLAS_PROFILE_FIRST=$ATLAS_PROFILE_FIRST} \
   -v \"\${HOME}/.cache/huggingface:/root/.cache/huggingface\" \
   $IMAGE serve $MODEL \
@@ -143,7 +155,7 @@ ssh "$WORKER_IP" "sudo docker run -d \
     --max-batch-size $MAX_BATCH \
     --gpu-memory-utilization $GPU_MEM_UTIL \
     --kv-cache-dtype $KV_DTYPE \
-    --enable-prefix-caching \
+    $PREFIX_CACHE_FLAG \
     $EXTRA_FLAGS \
     --oom-guard-mb 512"
 

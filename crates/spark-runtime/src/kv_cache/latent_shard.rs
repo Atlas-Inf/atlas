@@ -221,7 +221,15 @@ impl PagedKvCache {
             .collect();
         let built = gpu.copy_h2d(&table, identity).and_then(|()| {
             let lane = spec.lane.then(|| ExchangeLane::new(gpu)).transpose()?;
-            match Self::new_with_k_slots(config, num_blocks, local_blocks, gpu, true, placement) {
+            match Self::new_with_k_slots(
+                config,
+                num_blocks,
+                local_blocks,
+                gpu,
+                true,
+                placement,
+                None,
+            ) {
                 Ok(cache) => Ok((lane, cache)),
                 Err(error) => {
                     if let Some(lane) = lane {

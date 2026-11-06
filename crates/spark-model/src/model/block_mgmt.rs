@@ -48,6 +48,7 @@ fn fill_fresh_blocks(
     } else {
         kv_cache.zero_blocks(blocks, gpu, stream)?;
     }
+    kv_cache.lend_swa_slots(blocks, gpu, stream)?;
     kv_cache.lend_tail_slots(blocks, gpu, stream)
 }
 
@@ -330,6 +331,7 @@ pub(crate) fn ensure_blocks_through_decode(
     kv_poison: bool,
 ) -> Result<()> {
     kv_cache.release_lagging_tail_slots(&seq.block_table, abs_block_idx);
+    kv_cache.release_lagging_swa_slots(&seq.block_table, abs_block_idx);
     let cap = kv_cache.config().cache_blocks_per_seq.map(|c| c as usize);
     // Loop invariant: each iter either slides (frees a block) or grows
     // block_table by one. Terminates when the highest needed logical block
@@ -472,6 +474,7 @@ pub(crate) fn ensure_blocks_through_prefill(
     kv_poison: bool,
 ) -> Result<()> {
     kv_cache.release_lagging_tail_slots(&seq.block_table, abs_block_idx);
+    kv_cache.release_lagging_swa_slots(&seq.block_table, abs_block_idx);
     // A chunk's fresh blocks are filled together, on EVERY exit: blocks pushed
     // before a failed allocation stay in `block_table`, and the scheduler's
     // preempt-and-retry re-enters with them in-window, where nothing would

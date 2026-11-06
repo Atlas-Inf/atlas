@@ -78,7 +78,8 @@ extern "C" __global__ void mimo_qkv_rope_cache(
     const unsigned int rotary_dim,
     const float rope_theta,
     const unsigned int block_size,
-    const unsigned int kv_write_floor        // tokens [0, floor) skip the cache write
+    const unsigned int kv_write_floor,       // tokens [0, floor) skip the cache write
+    const unsigned int* __restrict__ swa_map // [num_blocks] block -> SWA slot, or null
 ) {
     const unsigned int t = blockIdx.x;
     const unsigned int nq_c = nq / tp_chunks;
@@ -88,12 +89,19 @@ extern "C" __global__ void mimo_qkv_rope_cache(
     const float pos = (float)positions[t];
     const unsigned int half = rotary_dim / 2;
     const long long slot = slot_mapping[t];
-    const bool write_kv = slot >= 0 && t >= kv_write_floor;
+    bool write_kv = slot >= 0 && t >= kv_write_floor;
+    unsigned long long swa_blk = 0;
+    if (write_kv && swa_map) {
+        const unsigned int s = swa_map[slot / block_size];
+        write_kv = s != 0xFFFFFFFFu;
+        swa_blk = s;
+    }
 
     __nv_bfloat16* k_dst = nullptr;
     __nv_bfloat16* v_dst = nullptr;
     if (write_kv) {
-        const unsigned long long blk = (unsigned long long)(slot / block_size);
+        const unsigned long long blk =
+            swa_map ? swa_blk : (unsigned long long)(slot / block_size);
         const unsigned long long off = (unsigned long long)(slot % block_size);
         const unsigned long long base = (blk * block_size + off) * nkv * MIMO_QK;
         k_dst = k_cache + base;
@@ -148,6 +156,14 @@ extern "C" __global__ void mimo_qkv_rope_cache(
 // Shared attention core.
 // ---------------------------------------------------------------------------
 
+// Physical pool index of logical block `i`: the block id, or its SWA slot
+// when the layer's pool is slotted (`smap`, see kv_cache/swa_slots.rs).
+static __device__ __forceinline__ unsigned long long mimo_block(
+    const int* __restrict__ bt, const unsigned int* __restrict__ smap, unsigned int i) {
+    const unsigned int b = (unsigned int)bt[i];
+    return smap ? (unsigned long long)smap[b] : (unsigned long long)b;
+}
+
 // Stage keys [k0, k0+32) of one KV head into shared memory. Positions at or
 // beyond `k_end` are zero-filled (masked later). Called by all threads.
 // bt == null selects contiguous mode: k_cache/v_cache are [T, nkv, 192] /
@@ -155,7 +171,8 @@ extern "C" __global__ void mimo_qkv_rope_cache(
 static __device__ __forceinline__ void mimo_load_tile(
     __nv_bfloat16* __restrict__ ks, __nv_bfloat16* __restrict__ vs,
     const __nv_bfloat16* __restrict__ k_cache, const __nv_bfloat16* __restrict__ v_cache,
-    const int* __restrict__ bt, unsigned int k0, unsigned int k_end,
+    const int* __restrict__ bt, const unsigned int* __restrict__ smap,
+    unsigned int k0, unsigned int k_end,
     unsigned int kvh, unsigned int nkv, unsigned int block_size, unsigned int pos_base) {
     const unsigned int nthreads = blockDim.x;
     // K: 32 rows × 96 bf16x2
@@ -167,7 +184,7 @@ static __device__ __forceinline__ void mimo_load_tile(
         if (p < k_end) {
             unsigned long long base;
             if (bt) {
-                const unsigned long long blk = (unsigned long long)bt[p / block_size];
+                const unsigned long long blk = mimo_block(bt, smap, p / block_size);
                 base = ((blk * block_size + p % block_size) * nkv + kvh) * MIMO_QK;
             } else {
                 base = ((unsigned long long)(p - pos_base) * nkv + kvh) * MIMO_QK;
@@ -185,7 +202,7 @@ static __device__ __forceinline__ void mimo_load_tile(
         if (p < k_end) {
             unsigned long long base;
             if (bt) {
-                const unsigned long long blk = (unsigned long long)bt[p / block_size];
+                const unsigned long long blk = mimo_block(bt, smap, p / block_size);
                 base = ((blk * block_size + p % block_size) * nkv + kvh) * MIMO_QK;
             } else {
                 base = ((unsigned long long)(p - pos_base) * nkv + kvh) * MIMO_VD;
@@ -298,7 +315,8 @@ extern "C" __global__ void mimo_paged_decode_attn(
     const float scale,
     const float out_scale,
     const unsigned int q_stride,
-    const unsigned int out_stride
+    const unsigned int out_stride,
+    const unsigned int* __restrict__ swa_map  // block -> SWA slot, or null
 ) {
     __shared__ __align__(16) __nv_bfloat16 ks[MIMO_TILE * MIMO_KROW];
     __shared__ __align__(16) __nv_bfloat16 vs[MIMO_TILE * MIMO_VROW];
@@ -334,7 +352,7 @@ extern "C" __global__ void mimo_paged_decode_attn(
     const int* bt = block_table + (unsigned long long)seq * max_blocks_per_seq;
     for (unsigned int k0 = s_lo; k0 < s_hi; k0 += MIMO_TILE) {
         __syncthreads();
-        mimo_load_tile(ks, vs, k_cache, v_cache, bt, k0, s_hi, kvh, nkv, block_size, 0u);
+        mimo_load_tile(ks, vs, k_cache, v_cache, bt, swa_map, k0, s_hi, kvh, nkv, block_size, 0u);
         __syncthreads();
         mimo_consume_tile(st, qs, ks, vs, k0, s_lo, s_hi, scale);
     }
@@ -414,7 +432,8 @@ extern "C" __global__ void mimo_prefill_attn(
     const float scale,
     const float out_scale,
     const unsigned int q_stride,
-    const unsigned int out_stride
+    const unsigned int out_stride,
+    const unsigned int* __restrict__ swa_map  // block -> SWA slot, or null
 ) {
     __shared__ __align__(16) __nv_bfloat16 ks[MIMO_TILE * MIMO_KROW];
     __shared__ __align__(16) __nv_bfloat16 vs[MIMO_TILE * MIMO_VROW];
@@ -449,7 +468,7 @@ extern "C" __global__ void mimo_prefill_attn(
 
     for (unsigned int k0 = tile_lo; k0 < tile_hi; k0 += MIMO_TILE) {
         __syncthreads();
-        mimo_load_tile(ks, vs, k_cache, v_cache, block_table, k0, tile_hi, kvh, nkv, block_size, pos0);
+        mimo_load_tile(ks, vs, k_cache, v_cache, block_table, swa_map, k0, tile_hi, kvh, nkv, block_size, pos0);
         __syncthreads();
         if (active && k0 < hi && k0 + MIMO_TILE > lo) {
             mimo_consume_tile(st, qs, ks, vs, k0, lo, hi, scale);

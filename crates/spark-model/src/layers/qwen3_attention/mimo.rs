@@ -203,6 +203,7 @@ impl Qwen3AttentionLayer {
             .arg_f32(m.rope_theta)
             .arg_u32(kv_cache.block_size() as u32)
             .arg_u32(kv_write_floor)
+            .arg_ptr(kv_cache.swa_slot_map_ptr(self.attn_layer_idx))
             .launch(stream)?;
         Ok((q, k_contig, v_contig))
     }
@@ -256,6 +257,7 @@ impl Qwen3AttentionLayer {
             .arg_f32(m.out_scale)
             .arg_u32(m.nq * MIMO_QK_DIM)
             .arg_u32(m.nq * MIMO_V_DIM)
+            .arg_ptr(kv_cache.swa_slot_map_ptr(self.attn_layer_idx))
             .launch(stream)?;
         if splits > 1 {
             KernelLaunch::new(ctx.gpu, m.kernels.decode_reduce)
@@ -349,6 +351,7 @@ impl Qwen3AttentionLayer {
             .arg_f32(m.out_scale)
             .arg_u32(m.nq * MIMO_QK_DIM)
             .arg_u32(m.nq * MIMO_V_DIM)
+            .arg_ptr(kv_cache.swa_slot_map_ptr(self.attn_layer_idx))
             .launch(stream)?;
         let h = ctx.config.hidden_size as u32;
         let o_out = ctx.buffers.norm_output();

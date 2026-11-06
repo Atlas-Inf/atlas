@@ -38,7 +38,15 @@ impl PagedKvCache {
         v_aliases_k: bool,
         placement: KvPlacement,
     ) -> Result<Self> {
-        Self::new_with_k_slots(config, num_blocks, num_blocks, gpu, v_aliases_k, placement)
+        Self::new_with_k_slots(
+            config,
+            num_blocks,
+            num_blocks,
+            gpu,
+            v_aliases_k,
+            placement,
+            None,
+        )
     }
 
     /// [`Self::new_with_v_alias`] with `k_slots` K-pool block slots per layer
@@ -50,6 +58,7 @@ impl PagedKvCache {
         gpu: &dyn GpuBackend,
         v_aliases_k: bool,
         placement: KvPlacement,
+        swa: Option<&super::SwaSlotPlan>,
     ) -> Result<Self> {
         let mut layers = Vec::with_capacity(config.num_layers);
         let mut total_bytes: usize = 0;
@@ -59,7 +68,8 @@ impl PagedKvCache {
             // and the V pool is allocated turbo3-sized — avoids the 4× V over-
             // allocation that would result from a single MAX-sized stride.
             let k_block_bytes = config.k_block_bytes_for_layer(i);
-            let k_pool_bytes = k_slots * k_block_bytes;
+            let slotted = swa.filter(|plan| plan.holds(i)).map(|plan| plan.capacity());
+            let k_pool_bytes = slotted.unwrap_or(k_slots) * k_block_bytes;
             // Preserve allocation-failure rollback for both ordinary K/V pools
             // and GLM's shared latent pool. An alias owns only one allocation.
             let release = |layers: &[LayerPool]| {
@@ -81,7 +91,7 @@ impl PagedKvCache {
                 (k_pool, k_block_bytes, 0)
             } else {
                 let v_block_bytes = config.v_block_bytes_for_layer(i);
-                let v_pool_bytes = num_blocks * v_block_bytes;
+                let v_pool_bytes = slotted.unwrap_or(num_blocks) * v_block_bytes;
                 let v_pool = match placement.alloc(gpu, KvBuffer::V(i), v_pool_bytes) {
                     Ok(ptr) => ptr,
                     Err(error) => {
@@ -144,6 +154,7 @@ impl PagedKvCache {
             config,
             sparse_index_config: None,
             tail_slots: None,
+            swa: None,
             trace: BlockTrace::new(num_blocks),
             nvme: Vec::new(),
             latent_shard: None,
@@ -169,7 +180,10 @@ impl PagedKvCache {
         let Some(slot) = self.latent_slot(block_idx) else {
             return Ok(());
         };
-        for layer in &self.layers {
+        for (i, layer) in self.layers.iter().enumerate() {
+            if self.swa_slotted(i) {
+                continue;
+            }
             let k_offset = slot as usize * layer.k_block_stride;
             let v_offset = slot as usize * layer.v_block_stride;
             gpu.memset_async(

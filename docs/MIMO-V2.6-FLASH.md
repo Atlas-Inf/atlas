@@ -100,6 +100,23 @@ DFLASH=1 bash scripts/start-mimo-ep2.sh   # adds --dflash --draft-model <snapsho
 acceptance rate (`DFlash` lines in the rank-0 log) and tok/s against serial
 and MTP K=1 on the same prompts.
 
+## Sliding-window KV eviction (`SWA_EVICT=1`)
+
+The 39 sliding-window layers read only their last 128 tokens. With
+`ATLAS_SWA_EVICT=1` their K/V pools hold a per-sequence ring of slots
+(`kv_cache/swa_slots.rs`): a block is lent a slot when allocated and gives it
+back once it lags `window + max_batch_tokens + 64` rows behind the sequence
+end. The block pool then pays only for the 9 full-attention layers, so
+`--max-seq-len` can go well past 65536.
+
+```bash
+SWA_EVICT=1 MAX_SEQ_LEN=131072 bash scripts/start-mimo-ep2.sh   # drops --enable-prefix-caching
+```
+
+Prefix caching is off under eviction (evicted history can't be reused). A
+`sliding-window KV slots exhausted` error means a step wrote more rows than the lag
+covers (prefill chunk > `--max-batch-tokens`).
+
 ## Known risk areas to watch
 
 1. Missing-kernel errors at startup (kernel audit / `gpu.kernel` lookup) —

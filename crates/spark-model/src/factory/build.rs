@@ -28,6 +28,7 @@ mod kv_budget;
 mod kv_carveout;
 mod kv_nvme;
 mod kv_summary;
+mod swa_evict;
 
 pub fn build_model(
     mut config: ModelConfig,
@@ -637,6 +638,14 @@ pub fn build_model(
         max_seq_len,
         max_batch_tokens,
     )?;
+    let swa_slot_plan = swa_evict::plan(
+        &config,
+        &kv_config,
+        max_batch_tokens,
+        max_batch_size,
+        prefix_cache.is_active(),
+        hss_cache_blocks_per_seq.is_some(),
+    )?;
 
     if hss_cache_blocks_per_seq.is_some() {
         kv_summary::log_hss_kv_summary(&kv_config);
@@ -916,7 +925,12 @@ pub fn build_model(
             }
             let n = match joint_glm_plan {
                 Some(plan) => plan.num_blocks_for_budget(kv_budget),
-                None => kv_budget::blocks_with_aux(&kv_config, kv_budget, aux_bytes_per_token)?,
+                None => match swa_slot_plan.as_ref() {
+                    Some(swa) => {
+                        swa_evict::blocks(swa, &kv_config, kv_budget, aux_bytes_per_token)?
+                    }
+                    None => kv_budget::blocks_with_aux(&kv_config, kv_budget, aux_bytes_per_token)?,
+                },
             };
             let max_kv_tokens = n * kv_block_size;
             let lazy_bf16_term = if derived_reserve > 0 {
@@ -1047,6 +1061,7 @@ pub fn build_model(
         num_kv_blocks,
         gpu.as_ref(),
         glm_cache_plan,
+        swa_slot_plan.as_ref(),
         kv_placement.clone(),
     ) {
         Ok(kv) => kv,
@@ -1063,6 +1078,7 @@ pub fn build_model(
                 num_kv_blocks,
                 gpu.as_ref(),
                 glm_cache_plan,
+                swa_slot_plan.as_ref(),
                 kv_placement,
             )?
         }
