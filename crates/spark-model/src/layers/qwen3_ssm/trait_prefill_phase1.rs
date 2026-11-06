@@ -190,16 +190,16 @@ impl Qwen3SsmLayer {
         // Z stride in source = qkvz_size, Z stride in dest = value_dim.
         // Strided copy: one per-token D2D async call.
         let z_src_base = deinterleaved.offset((key_dim * 2 + value_dim) * bf16);
-        let z_dst_base = gdn_bufs.z.offset(token_offset * value_dim * bf16);
+        let z_dst_base = gdn_bufs.z.offset(token_offset * gdn_bufs.z_stride * bf16);
         let z_elem_bytes = value_dim * bf16;
         // One pitched copy instead of a per-token D2D loop (num_tokens launches).
         ctx.gpu.copy_d2d_2d_async(
             z_src_base,
             qkvz_size * bf16, // src row pitch
             z_dst_base,
-            value_dim * bf16, // dst row pitch
-            z_elem_bytes,     // width per row
-            num_tokens,       // rows
+            gdn_bufs.z_stride * bf16, // dst row pitch
+            z_elem_bytes,             // width per row
+            num_tokens,               // rows
             stream,
         )?;
 
@@ -302,17 +302,25 @@ impl Qwen3SsmLayer {
         )?;
 
         // Z gate: strided copy from deinterleaved (stride qkvz_size) → gdn_bufs.z
-        // (stride value_dim) over all tokens.
+        // (stride z_stride) over all tokens, unless gdn_bufs.z already reads
+        // the deinterleaved rows in place.
         let z_src_base = deinterleaved.offset((key_dim * 2 + value_dim) * bf16);
+        if gdn_bufs.z == z_src_base {
+            anyhow::ensure!(
+                gdn_bufs.z_stride == qkvz_size,
+                "in-place Z needs the QKVZ row pitch"
+            );
+            return Ok(());
+        }
         let z_elem_bytes = value_dim * bf16;
         // One pitched copy instead of a per-token D2D loop (total_tokens launches).
         ctx.gpu.copy_d2d_2d_async(
             z_src_base,
             qkvz_size * bf16, // src row pitch
             gdn_bufs.z,
-            value_dim * bf16, // dst row pitch
-            z_elem_bytes,     // width per row
-            total_tokens,     // rows
+            gdn_bufs.z_stride * bf16, // dst row pitch
+            z_elem_bytes,             // width per row
+            total_tokens,             // rows
             stream,
         )?;
         Ok(())

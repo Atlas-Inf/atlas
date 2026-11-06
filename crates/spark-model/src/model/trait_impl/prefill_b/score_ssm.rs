@@ -53,7 +53,8 @@ fn gdn_slice(
             .gate_beta
             .offset(off * c.linear_num_value_heads * 2 * fp32),
         output: g.output.offset(off * value_dim * bf16),
-        z: g.z.offset(off * value_dim * bf16),
+        z: g.z.offset(off * g.z_stride * bf16),
+        z_stride: g.z_stride,
         total_len: len,
     }
 }

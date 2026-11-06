@@ -27,6 +27,10 @@ mod moe_transpose;
 mod state;
 
 impl TransformerLayer for Qwen3AttentionLayer {
+    // prefill_inner only writes `residual`; the mHC path is not audited.
+    fn prefill_reads_residual(&self) -> bool {
+        self.hc.is_some()
+    }
     fn decode_glm_long_owners(
         &self,
         owners: &mut [crate::layer::glm_long_owner::GlmLongOwner<'_>],

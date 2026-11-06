@@ -28,7 +28,7 @@ impl Qwen3SsmLayer {
         // ── 9. Gated RMS norm (batched: all chunk tokens × heads) ──
         // Read GDN output and Z from full-sequence buffers at token_offset.
         let gdn_out_chunk = gdn_bufs.output.offset(token_offset * value_dim * bf16);
-        let z_chunk = gdn_bufs.z.offset(token_offset * value_dim * bf16);
+        let z_chunk = gdn_bufs.z.offset(token_offset * gdn_bufs.z_stride * bf16);
 
         // Output buffer: reuse ssm_qkvz (same as monolithic prefill)
         let normed_out_buf = ctx.buffers.ssm_qkvz();
@@ -44,7 +44,7 @@ impl Qwen3SsmLayer {
             eps,
             k,
             value_dim as u32, // input_token_stride: GDN output is [N, value_dim] contiguous
-            value_dim as u32, // gate_token_stride: Z buffer is [N, value_dim] contiguous
+            gdn_bufs.z_stride as u32, // gate_token_stride: Z row pitch
             stream,
         )?;
 
