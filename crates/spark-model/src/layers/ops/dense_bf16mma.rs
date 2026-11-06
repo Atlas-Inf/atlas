@@ -141,6 +141,8 @@ pub struct DenseBf16mma {
     lowp: LowpMix,
     /// GDN in_proj_ba + gates (`gdn_ba_gates_prefill.cu`).
     ba: KernelHandle,
+    /// Its 16 x 32 tile twin (`gdn_ba_gates_prefill_small`).
+    ba_small: KernelHandle,
     /// Resident CTAs (SMs x 2).
     slots: u32,
 }
@@ -160,6 +162,7 @@ impl Default for DenseBf16mma {
             quant_fp8: KernelHandle(0),
             lowp: LowpMix(0),
             ba: KernelHandle(0),
+            ba_small: KernelHandle(0),
             slots: 0,
         }
     }
@@ -229,6 +232,11 @@ impl DenseBf16mma {
             nvfp4: crate::layers::try_kernel(gpu, MODULE, "dense_bf16mma_nvfp4"),
             fp8: crate::layers::try_kernel(gpu, MODULE, "dense_bf16mma_fp8"),
             ba: crate::layers::try_kernel(gpu, "gdn_ba_gates_prefill", "gdn_ba_gates_prefill"),
+            ba_small: crate::layers::try_kernel(
+                gpu,
+                "gdn_ba_gates_prefill",
+                "gdn_ba_gates_prefill_small",
+            ),
             slots: CTAS_PER_SM * gpu.sm_count().unwrap_or(48),
         }
     }
@@ -500,17 +508,22 @@ impl DenseBf16mma {
     }
 }
 
-/// `gdn_ba_gates_prefill` CTA tile: tokens x outputs.
-const BA_TOK: u32 = 32;
-const BA_OUT: u32 = 48;
+/// `gdn_ba_gates_prefill` CTA tiles, tokens x outputs: the large one, and
+/// the small one below `BA_SMALL_ROWS` rows (more CTAs where the K loop is
+/// latency-bound: 29 vs 45 us at 96 rows, 99 vs 64 us at 1056).
+const BA_TILES: [(u32, u32); 2] = [(32, 48), (16, 32)];
+const BA_SMALL_ROWS: u32 = 640;
 impl DenseBf16mma {
     /// Whether `ba_gates` serves an `[n, k]` BF16 in_proj_ba. At every row
-    /// count: the two kernels sum in different orders, so a choice by the
-    /// pass's rows would make a request's gates depend on what it is batched
-    /// with. (Per layer it loses 79 vs 62 us at 96 rows, under 1 ms a pass,
-    /// and wins 155 vs 674 us at 1056.)
+    /// count: it sums in another order than the token-parallel kernel, so a
+    /// choice by the pass's rows would make a request's gates depend on what
+    /// it is batched with. Its two tile shapes give identical results (each
+    /// output's MMA sequence is the same), so they may be picked by rows.
     pub fn serves_ba(&self, [n, k]: [u32; 2]) -> bool {
-        self.ba.0 != 0 && n.is_multiple_of(BA_OUT) && k.is_multiple_of(KS)
+        self.ba.0 != 0
+            && self.ba_small.0 != 0
+            && BA_TILES.iter().all(|&(_, out)| n.is_multiple_of(out))
+            && k.is_multiple_of(KS)
     }
 
     /// The GDN BA projection + gates on tensor cores; the arguments of
@@ -524,10 +537,14 @@ impl DenseBf16mma {
         stream: u64,
     ) -> Result<()> {
         let [m, n, ..] = dims;
+        let (kernel, (tok, out)) = match m < BA_SMALL_ROWS {
+            true => (self.ba_small, BA_TILES[1]),
+            false => (self.ba, BA_TILES[0]),
+        };
         dims.iter()
             .fold(
-                KernelLaunch::new(gpu, self.ba)
-                    .grid([n / BA_OUT, m.div_ceil(BA_TOK), 1])
+                KernelLaunch::new(gpu, kernel)
+                    .grid([n / out, m.div_ceil(tok), 1])
                     .block([128, 1, 1])
                     .arg_ptr(input)
                     .arg_ptr(weight)
