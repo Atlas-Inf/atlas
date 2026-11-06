@@ -38,6 +38,7 @@
 //  * W8A8: per-tensor FP8 weights x E4M3 tokens (per-token power-of-two
 //    scale) on m16n8k32 e4m3.
 
+#include "../../common/atlas_pdl.cuh"
 #include "../../common/bf16mma_dequant.cuh"
 #include "../../common/nvfp4_block_quant.cuh"
 
@@ -45,7 +46,10 @@
 #define DB_KS 64
 #define DB_GROUP 16     // row chunks per raster group
 
-enum { DB_NVFP4 = 0, DB_FP8 = 1 };
+// DB_FP8T: the transposed [K, N] copy of a per-tensor FP8 weight (the
+// w8a16_gemm_t prefill tables): each stage streams 64 rows of 256
+// contiguous features instead of 256 rows of 64 bytes.
+enum { DB_NVFP4 = 0, DB_FP8 = 1, DB_FP8T = 2 };
 
 // One K stage of staged weights: NVFP4 weight and scale rows swizzled as
 // bm_swz_w / bm_swz_s; FP8 64-byte k rows per feature, feature f at row f
@@ -57,6 +61,12 @@ template <int HV> struct __align__(16) DbW<DB_NVFP4, HV> {
     unsigned char w[HV][DB_KS / 2][128];            // 4096 B each: [k pair][feature]
     unsigned char s[HV][DB_KS / 16][128];           //  512 B each: [group][feature]
 };
+// FP8T: [k][feature] 128-byte rows per half, 16-byte chunk c of row r at
+// chunk c ^ dl_swz_f8t(r): the four quad lanes read rows 16 apart.
+template <int HV> struct __align__(16) DbW<DB_FP8T, HV> {
+    unsigned char w[HV][DB_KS][128];                // 8192 B each: [k][feature]
+};
+__device__ __forceinline__ unsigned int dl_swz_f8t(unsigned int r) { return ((r >> 4) & 3) << 1; }
 template <int HV> struct __align__(16) DbW<DB_FP8, HV> {
     unsigned char w[HV][128][DB_KS];                // 8192 B each: [feature][k]
 };
@@ -356,11 +366,31 @@ __device__ __forceinline__ void dl_stage(const typename DbT<AF>::T& tk, const vo
             dl_mma_f4(acc[1][j], f1, b0, b1, s1, bs);
         }
     } else {
-        const DbW<DB_FP8, HV>& sb = *(const DbW<DB_FP8, HV>*)sbv;
         uint4 q[4];
-        #pragma unroll
-        for (int s = 0; s < 4; s++)
-            q[s] = *(const uint4*)&sb.w[half][db_fp8_row(32 * warp + 4 * g + s)][16 * t];
+        if constexpr (WF == DB_FP8T) {
+            // k rows 16t + 4m + i of the four slot features, transposed so
+            // that word m of slot s is k 16t + 4m .. 16t + 4m + 3.
+            const DbW<DB_FP8T, HV>& sb = *(const DbW<DB_FP8T, HV>*)sbv;
+            const unsigned int o = 32 * warp + 4 * g;
+            unsigned int m4[4][4];
+            #pragma unroll
+            for (int m = 0; m < 4; m++) {
+                unsigned int w[4];
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    const unsigned int r = 16 * t + 4 * m + i;
+                    w[i] = *(const unsigned int*)&sb.w[half][r][((o >> 4) ^ dl_swz_f8t(r)) * 16 + (o & 15)];
+                }
+                dl_transpose4(w, m4[m]);
+            }
+            #pragma unroll
+            for (int sl = 0; sl < 4; sl++) q[sl] = make_uint4(m4[0][sl], m4[1][sl], m4[2][sl], m4[3][sl]);
+        } else {
+            const DbW<DB_FP8, HV>& sb = *(const DbW<DB_FP8, HV>*)sbv;
+            #pragma unroll
+            for (int s = 0; s < 4; s++)
+                q[s] = *(const uint4*)&sb.w[half][db_fp8_row(32 * warp + 4 * g + s)][16 * t];
+        }
         #pragma unroll
         for (int j = 0; j < TT; j++) {
             const uint4 b = *(const uint4*)&tk.q[j * 8 + g][16 * t];
@@ -402,6 +432,8 @@ __device__ __forceinline__ void db_body(
     unsigned int nchunks)
 {
     static_assert(AF != DB_A_BF16 || WST == 2 || WST == 3, "the wait_group order below holds for 2 or 3 weight stages");
+    // PDL entry before any other work (no-op unless launched with PDL).
+    atlas_pdl_enter();
     constexpr int TST = db_tst<AF, WST>();
     static_assert(AF != DB_A_NVFP4 || WF == DB_NVFP4, "NVFP4 tokens take NVFP4 weights (W4A4)");
     using Tok = typename DbT<AF>::T;
@@ -467,6 +499,9 @@ __device__ __forceinline__ void db_body(
                 + (unsigned long long)wkp * N;
         s_src = (const unsigned char*)((FUSED && sc_c >= 4) ? S1 : S0) + nh + (sc_c & (FUSED ? 3 : 7)) * 16
                 + (unsigned long long)sgr * N;
+    } else if constexpr (WF == DB_FP8T) {
+        // FP8T loader: k rows ht/8 + 16j (j = 0..3), chunk ht%8 of each.
+        w_src = W0 + (unsigned long long)(ht >> 3) * N + nh + (ht & 7) * 16;
     } else {
         // FP8 loader: rows ht/4 + 32j (j = 0..3), chunk ht%4 of each.
         w_src = W0 + (unsigned long long)(nh + (ht >> 2)) * K + (ht & 3) * 16;
@@ -502,6 +537,13 @@ __device__ __forceinline__ void db_body(
             if (ht < 32)
                 bm_cp16(&sw.s[half][sgr][(sc_c ^ bm_swz_s(sgr)) * 16],
                         s_src + (unsigned long long)(kb / 16) * N, true);
+        } else if constexpr (WF == DB_FP8T) {
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const unsigned int r = (ht >> 3) + 16 * j;
+                bm_cp16(&sw.w[half][r][((ht & 7) ^ dl_swz_f8t(r)) * 16],
+                        w_src + (unsigned long long)(kb + 16 * j) * N, true);
+            }
         } else {
             #pragma unroll
             for (int j = 0; j < 4; j++)
@@ -621,7 +663,9 @@ __device__ __forceinline__ void db_body(
         k0 = gs0 * WK;
         k1 = FUSED ? gs1 * WK : k0;
     } else {
-        k0 = k1 = ((const float*)S0)[(nh >> 7) * (K >> 7)] * WK;
+        // FP8: the [N/128, K/128] grid's column 0; FP8T: the transposed
+        // [K/128, N/128] grid's row 0.
+        k0 = k1 = ((const float*)S0)[WF == DB_FP8T ? nh >> 7 : (nh >> 7) * (K >> 7)] * WK;
     }
 
     // Epilogue staged through shared memory as [token][feature], then whole rows.
@@ -744,6 +788,17 @@ dense_w4a4_nvfp4(const unsigned char* __restrict__ aq, const unsigned char* __re
                                                            C, M, N, K, ldc, nchunks);
 }
 
+// W8A8 on the transposed [K, N] FP8 table; scale_t = its [K/128, N/128] grid.
+extern "C" __global__ void __launch_bounds__(128 * DB_HV, 1)
+dense_w8a8_fp8t(const unsigned char* __restrict__ aq, const float* __restrict__ ag,
+                const unsigned char* __restrict__ weight_t, const float* __restrict__ scale_t,
+                __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+                unsigned int ldc, unsigned int nchunks)
+{
+    db_body<DB_FP8T, false, DB_HV, DL_F8_WST, DB_A_FP8>(aq, nullptr, ag, weight_t, scale_t, 0.0f, nullptr, nullptr,
+                                                        0.0f, C, M, N, K, ldc, nchunks);
+}
+
 extern "C" __global__ void __launch_bounds__(128 * DB_HV, 1)
 dense_w8a8_fp8(const unsigned char* __restrict__ aq, const float* __restrict__ ag,
                const unsigned char* __restrict__ weight, const float* __restrict__ scale_grid,
@@ -807,6 +862,7 @@ extern "C" __global__ void __launch_bounds__(256)
 dl_quant_nvfp4(const __nv_bfloat16* __restrict__ x, unsigned char* __restrict__ q, unsigned char* __restrict__ s,
                float* __restrict__ ag, unsigned int K)
 {
+    atlas_pdl_enter();
     const unsigned long long r = blockIdx.x;
     uint4 v[DL_QB][2];
     float bmax[DL_QB];
@@ -834,6 +890,7 @@ extern "C" __global__ void __launch_bounds__(256)
 dl_quant_fp8(const __nv_bfloat16* __restrict__ x, unsigned char* __restrict__ q, float* __restrict__ ag,
              unsigned int K)
 {
+    atlas_pdl_enter();
     const unsigned long long r = blockIdx.x;
     uint4 v[DL_QB][2];
     float bmax[DL_QB];

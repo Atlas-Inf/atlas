@@ -38,10 +38,10 @@ impl Qwen3SsmLayer {
         rows: u32,
         stream: u64,
     ) -> Result<bool> {
-        let w = if slot == QKVZ {
-            &self.qkvz_fp8w
+        let (w, wt) = if slot == QKVZ {
+            (&self.qkvz_fp8w, &self.qkvz_fp8w_t)
         } else {
-            &self.out_proj_fp8w
+            (&self.out_proj_fp8w, &self.out_proj_fp8w_t)
         };
         let Some(w) = w else { return Ok(false) };
         if !(ctx.levers.dense_prefill_bf16mma
@@ -59,7 +59,7 @@ impl Qwen3SsmLayer {
             scales: ctx.buffers.ffn_act_scale(),
         };
         self.bf16mma
-            .fp8(ctx.gpu, input, w, out, rows, lowp, stream)?;
+            .fp8(ctx.gpu, input, w, wt.as_ref(), out, rows, lowp, stream)?;
         Ok(true)
     }
 

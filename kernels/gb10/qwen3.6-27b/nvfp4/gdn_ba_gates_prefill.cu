@@ -17,6 +17,7 @@
 //
 // Grid: (N / OUT, ceil(M / TOK)), block 128. N % OUT == 0, K % 64 == 0.
 
+#include "../../common/atlas_pdl.cuh"
 #include "../../common/bf16mma_dequant.cuh"
 
 #define BA_KS 64
@@ -39,6 +40,7 @@ __device__ __forceinline__ void ba_body(const __nv_bfloat16* __restrict__ A, con
     // Warp (wt, wn): tokens 16 wt.., outputs NT * 8 wn.. (NT n8 tiles).
     constexpr int WT = BA_TOK / 16, WN = 4 / WT, NT = BA_OUT / (8 * WN);
     static_assert(WT * WN == 4 && NT * 8 * WN == BA_OUT, "four warps tile the CTA");
+    atlas_pdl_enter();   // no-op unless launched with PDL
     __shared__ BaStage<BA_TOK, BA_OUT> st[BA_ST];
     const unsigned int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const unsigned int g = lane >> 2, t = lane & 3;

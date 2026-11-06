@@ -12,7 +12,7 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
-use crate::weight_map::{Fp8Weight, QuantizedWeight, WeightQuantFormat};
+use crate::weight_map::{Fp8Weight, Fp8WeightTransposed, QuantizedWeight, WeightQuantFormat};
 
 const MODULE: &str = "dense_bf16mma_prefill";
 /// Fewer rows are decode / verify batches; they keep their small-M kernels.
@@ -47,82 +47,6 @@ const CTAS_PER_SM: u32 = 2;
 /// (`chunks`).
 const CTA_FIXED: u32 = 4;
 
-/// Projections whose activations `ATLAS_DENSE_PREFILL_LOWP` quantizes per
-/// token (on top of `ATLAS_DENSE_PREFILL_BF16MMA=1`). NVFP4 weights take
-/// NVFP4 tokens (W4A4, `kind::mxf4nvf4`: `gu,dn,qkv,o`) or E4M3 tokens
-/// (W4A8, the weights re-encoded as block-scaled E4M3: `gu8,dn8,qkv8,o8`);
-/// the FP8 GDN projections take E4M3 tokens (W8A8: `qkvz,gout`). The value
-/// is `1` for [`LowpMix::DEFAULT`] or a comma list of those names.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LowpMix(u16);
-
-impl LowpMix {
-    pub const GATE_UP: u16 = 1;
-    pub const DOWN: u16 = 2;
-    pub const ATTN_QKV: u16 = 4;
-    pub const ATTN_O: u16 = 8;
-    pub const GDN_QKVZ: u16 = 16;
-    pub const GDN_OUT: u16 = 32;
-    /// An NVFP4 group's W4A8 bit: its W4A4 bit shifted by this.
-    const A8: u32 = 6;
-    const NAMES: [(&str, u16); 10] = [
-        ("gu", Self::GATE_UP),
-        ("dn", Self::DOWN),
-        ("qkv", Self::ATTN_QKV),
-        ("o", Self::ATTN_O),
-        ("qkvz", Self::GDN_QKVZ),
-        ("gout", Self::GDN_OUT),
-        ("gu8", Self::GATE_UP << Self::A8),
-        ("dn8", Self::DOWN << Self::A8),
-        ("qkv8", Self::ATTN_QKV << Self::A8),
-        ("o8", Self::ATTN_O << Self::A8),
-    ];
-    /// `ATLAS_DENSE_PREFILL_LOWP=1`: W4A8 MLP and attention, W8A8 GDN. On the
-    /// d3 oracle this stays at the BF16-MMA path's distance from d3's BF16
-    /// runtime; NVFP4 tokens on the MLP (`gu,dn`, faster) land at or past the
-    /// old default kernels' distance, depending on the rest of the pass.
-    pub const DEFAULT: Self = Self(
-        (Self::GATE_UP | Self::DOWN | Self::ATTN_QKV | Self::ATTN_O) << Self::A8
-            | Self::GDN_QKVZ
-            | Self::GDN_OUT,
-    );
-
-    pub fn parse(v: &str) -> Self {
-        match v.trim() {
-            "1" => Self::DEFAULT,
-            "all" => Self(0x3f),
-            list => Self(
-                list.split(',')
-                    .filter_map(|n| Self::NAMES.iter().find(|(k, _)| *k == n.trim()))
-                    .fold(0, |m, (_, b)| m | b),
-            ),
-        }
-    }
-
-    pub fn from_env() -> Self {
-        std::env::var("ATLAS_DENSE_PREFILL_LOWP").map_or(Self(0), |v| Self::parse(&v))
-    }
-
-    pub fn has(self, group: u16) -> bool {
-        self.0 & group != 0
-    }
-
-    /// Whether NVFP4 group `group` takes E4M3 tokens (W4A8).
-    pub fn has_a8(self, group: u16) -> bool {
-        self.has(group << Self::A8)
-    }
-}
-
-/// A projection's group in [`LowpMix`] and the arena's activation-quant
-/// scratch (`ffn_act_a`: codes; `ffn_act_scale`: NVFP4 block scales, then
-/// the FP32 per-token scales).
-#[derive(Clone, Copy, Debug)]
-pub struct LowpArgs {
-    pub group: u16,
-    pub codes: DevicePtr,
-    pub scales: DevicePtr,
-}
-
 /// The three kernels; handle 0 where the target does not ship them.
 #[derive(Clone, Copy, Debug)]
 pub struct DenseBf16mma {
@@ -136,6 +60,8 @@ pub struct DenseBf16mma {
     w4a8_gate_up: KernelHandle,
     w4a8: KernelHandle,
     w8a8: KernelHandle,
+    /// W8A8 on the transposed `[K, N]` prefill copy.
+    w8a8_t: KernelHandle,
     quant_nvfp4: KernelHandle,
     quant_fp8: KernelHandle,
     lowp: LowpMix,
@@ -158,6 +84,7 @@ impl Default for DenseBf16mma {
             w4a8_gate_up: KernelHandle(0),
             w4a8: KernelHandle(0),
             w8a8: KernelHandle(0),
+            w8a8_t: KernelHandle(0),
             quant_nvfp4: KernelHandle(0),
             quant_fp8: KernelHandle(0),
             lowp: LowpMix(0),
@@ -225,6 +152,7 @@ impl DenseBf16mma {
             w4a8_gate_up: k("dense_w4a8_gate_up_silu"),
             w4a8: k("dense_w4a8_nvfp4"),
             w8a8: k("dense_w8a8_fp8"),
+            w8a8_t: k("dense_w8a8_fp8t"),
             quant_nvfp4: k("dl_quant_nvfp4"),
             quant_fp8: k("dl_quant_fp8"),
             lowp,
@@ -238,71 +166,6 @@ impl DenseBf16mma {
                 "gdn_ba_gates_prefill_small",
             ),
             slots: CTAS_PER_SM * gpu.sm_count().unwrap_or(48),
-        }
-    }
-
-    /// Whether `group` takes low-precision activations through `handle`
-    /// for a `k`-wide input.
-    fn lowp_on(
-        &self,
-        group: u16,
-        lowp: &LowpArgs,
-        k: u32,
-        [handle, quant]: [KernelHandle; 2],
-    ) -> bool {
-        self.lowp.has(group)
-            && k <= QUANT_MAX_K
-            && handle.0 != 0
-            && quant.0 != 0
-            && !lowp.codes.is_null()
-            && !lowp.scales.is_null()
-    }
-
-    /// Quantizes `input[m, k]` per token into the scratch: NVFP4 codes +
-    /// block scales, or E4M3 codes; returns the per-token scale pointer
-    /// (after the block scales, 16-byte aligned).
-    fn quantize(
-        &self,
-        gpu: &dyn GpuBackend,
-        nvfp4: bool,
-        input: DevicePtr,
-        lowp: &LowpArgs,
-        [m, k]: [u32; 2],
-        stream: u64,
-    ) -> Result<DevicePtr> {
-        let (kernel, block_scales) = match nvfp4 {
-            true => (self.quant_nvfp4, m as usize * (k as usize / 16)),
-            false => (self.quant_fp8, 0),
-        };
-        let token_scales = lowp.scales.offset(block_scales.next_multiple_of(16));
-        let launch = KernelLaunch::new(gpu, kernel)
-            .grid([m, 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(input)
-            .arg_ptr(lowp.codes);
-        let launch = match nvfp4 {
-            true => launch.arg_ptr(lowp.scales),
-            false => launch,
-        };
-        launch.arg_ptr(token_scales).arg_u32(k).launch(stream)?;
-        Ok(token_scales)
-    }
-
-    /// The low-precision twin serving this launch, if any: `(NVFP4 tokens,
-    /// kernel, shared memory)`. `a8` is the E4M3-token kernel and its group bit.
-    fn lowp_kernel(
-        &self,
-        lowp: &LowpArgs,
-        k: u32,
-        a4: (KernelHandle, u32),
-        (a8_group, a8, a8_smem): (u16, KernelHandle, u32),
-    ) -> Option<(bool, KernelHandle, u32)> {
-        if self.lowp_on(a8_group, lowp, k, [a8, self.quant_fp8]) {
-            Some((false, a8, a8_smem))
-        } else if self.lowp_on(lowp.group, lowp, k, [a4.0, self.quant_nvfp4]) {
-            Some((true, a4.0, a4.1))
-        } else {
-            None
         }
     }
 
@@ -468,24 +331,35 @@ impl DenseBf16mma {
             && w.k.is_multiple_of(FP8_BLOCK)
     }
 
-    /// `out[m, w.n] = input[m, w.k] · wᵀ` for an `[N, K]` e4m3 weight.
+    /// `out[m, w.n] = input[m, w.k] · wᵀ` for an `[N, K]` e4m3 weight. W8A8
+    /// reads the transposed `[K, N]` prefill copy `wt` where there is one
+    /// (64 rows of 256 contiguous features a stage instead of 256 rows of 64
+    /// bytes; the same MMA operands, so the same results).
+    #[allow(clippy::too_many_arguments)]
     pub fn fp8(
         &self,
         gpu: &dyn GpuBackend,
         input: DevicePtr,
         w: &Fp8Weight,
+        wt: Option<&Fp8WeightTransposed>,
         out: DevicePtr,
         m: u32,
         lowp: LowpArgs,
         stream: u64,
     ) -> Result<()> {
+        let wt = wt.filter(|t| t.n == w.n && t.k == w.k && self.w8a8_t.0 != 0);
         // E4M3 tokens only: the FP8 group's own bit selects W8A8.
+        let w8a8 = if wt.is_some() { self.w8a8_t } else { self.w8a8 };
         let lp = self.lowp_kernel(
             &lowp,
             w.k,
             (KernelHandle(0), 0),
-            (lowp.group, self.w8a8, SMEM_W8A8),
+            (lowp.group, w8a8, SMEM_W8A8),
         );
+        let (weight, scale) = match (lp, wt) {
+            (Some(_), Some(t)) => (t.weight_t, t.scale_t),
+            _ => (w.weight, w.row_scale),
+        };
         let (launch, nchunks) = self.head(
             gpu,
             (self.fp8, SMEM_FP8),
@@ -496,63 +370,14 @@ impl DenseBf16mma {
             stream,
         )?;
         launch
-            .arg_ptr(w.weight)
-            .arg_ptr(w.row_scale)
+            .arg_ptr(weight)
+            .arg_ptr(scale)
             .arg_ptr(out)
             .arg_u32(m)
             .arg_u32(w.n)
             .arg_u32(w.k)
             .arg_u32(w.n)
             .arg_u32(nchunks)
-            .launch(stream)
-    }
-}
-
-/// `gdn_ba_gates_prefill` CTA tiles, tokens x outputs: the large one, and
-/// the small one below `BA_SMALL_ROWS` rows (more CTAs where the K loop is
-/// latency-bound: 29 vs 45 us at 96 rows, 99 vs 64 us at 1056).
-const BA_TILES: [(u32, u32); 2] = [(32, 48), (16, 32)];
-const BA_SMALL_ROWS: u32 = 640;
-impl DenseBf16mma {
-    /// Whether `ba_gates` serves an `[n, k]` BF16 in_proj_ba. At every row
-    /// count: it sums in another order than the token-parallel kernel, so a
-    /// choice by the pass's rows would make a request's gates depend on what
-    /// it is batched with. Its two tile shapes give identical results (each
-    /// output's MMA sequence is the same), so they may be picked by rows.
-    pub fn serves_ba(&self, [n, k]: [u32; 2]) -> bool {
-        self.ba.0 != 0
-            && self.ba_small.0 != 0
-            && BA_TILES.iter().all(|&(_, out)| n.is_multiple_of(out))
-            && k.is_multiple_of(KS)
-    }
-
-    /// The GDN BA projection + gates on tensor cores; the arguments of
-    /// `ops::dense_gemm_ba_gates_prefill`, `[m, n, k, k_stride, gate_stride,
-    /// nv, vheads_per_group]`.
-    pub fn ba_gates(
-        &self,
-        gpu: &dyn GpuBackend,
-        [input, weight, a_log, dt_bias, gate_out]: [DevicePtr; 5],
-        dims: [u32; 7],
-        stream: u64,
-    ) -> Result<()> {
-        let [m, n, ..] = dims;
-        let (kernel, (tok, out)) = match m < BA_SMALL_ROWS {
-            true => (self.ba_small, BA_TILES[1]),
-            false => (self.ba, BA_TILES[0]),
-        };
-        dims.iter()
-            .fold(
-                KernelLaunch::new(gpu, kernel)
-                    .grid([n / out, m.div_ceil(tok), 1])
-                    .block([128, 1, 1])
-                    .arg_ptr(input)
-                    .arg_ptr(weight)
-                    .arg_ptr(a_log)
-                    .arg_ptr(dt_bias)
-                    .arg_ptr(gate_out),
-                |l, &d| l.arg_u32(d),
-            )
             .launch(stream)
     }
 }
@@ -580,32 +405,24 @@ pub fn fp8_scale_k_uniform(gpu: &dyn GpuBackend, w: &Fp8Weight) -> Result<bool> 
         .all(|row| row.iter().all(|&s| s == row[0])))
 }
 
+#[path = "dense_bf16mma_lowp.rs"]
+mod lowp;
+pub use lowp::{LowpArgs, LowpMix};
+
+#[path = "dense_bf16mma_ba.rs"]
+mod ba;
+
 #[cfg(test)]
 #[path = "dense_bf16mma_test_gpu.rs"]
 mod gpu_tests;
 
 #[cfg(test)]
-mod tests {
-    use super::{LOWP_ROWS, LowpMix, ROWS, chunks};
+#[path = "dense_bf16mma_lowp_test_gpu.rs"]
+mod lowp_gpu_tests;
 
-    #[test]
-    fn lowp_mix_parses_groups_and_formats() {
-        assert_eq!(LowpMix::parse("0"), LowpMix(0));
-        assert_eq!(LowpMix::parse(""), LowpMix(0));
-        assert_eq!(
-            LowpMix::parse("1"),
-            LowpMix::parse("gu8,dn8,qkv8,o8,qkvz,gout")
-        );
-        let m = LowpMix::parse(" gu8, dn8 ,gout,bogus");
-        assert!(m.has_a8(LowpMix::GATE_UP) && m.has_a8(LowpMix::DOWN) && m.has(LowpMix::GDN_OUT));
-        assert!(
-            !m.has(LowpMix::GATE_UP) && !m.has(LowpMix::GDN_QKVZ) && !m.has_a8(LowpMix::ATTN_O)
-        );
-        assert_eq!(
-            LowpMix::parse("all"),
-            LowpMix::parse("gu,dn,qkv,o,qkvz,gout")
-        );
-    }
+#[cfg(test)]
+mod tests {
+    use super::{LOWP_ROWS, ROWS, chunks};
 
     #[test]
     fn chunks_stay_within_the_kernel_tile_and_fill_short_grids() {
