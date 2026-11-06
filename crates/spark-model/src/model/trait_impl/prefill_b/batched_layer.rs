@@ -239,7 +239,8 @@ impl TransformerModel {
                         qkv: gdn_bufs.qkv.offset(off * conv_dim * bf16),
                         gate_beta: gdn_bufs.gate_beta.offset(off * (nv * 2) * fp32),
                         output: gdn_bufs.output.offset(off * value_dim * bf16),
-                        z: gdn_bufs.z.offset(off * value_dim * bf16),
+                        z: gdn_bufs.z.offset(off * gdn_bufs.z_stride * bf16),
+                        z_stride: gdn_bufs.z_stride,
                         total_len: len,
                     };
                     let st = seq.layer_states[layer_idx].as_mut();

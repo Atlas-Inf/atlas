@@ -386,6 +386,11 @@ gdn_chunk_tc_prefill(
         //   G1 (warps 4-7): K S -> R; Q K^T -> P; Q S -> e^gc Q S (registers)
         // Each warp of either group owns 16 rows x all 64 columns.
         const int g = warp & 3, r0 = 16 * g;
+        // A partial chunk's rows and columns past ce are exact zeros (K, Q,
+        // V, beta and the decay are), so the 16-wide tiles wholly past ce
+        // only ever add zeros: skip them. `live` tiles hold a row below ce.
+        const int live = (ce + 15) >> 4;
+        const bool rows_live = r0 < ce;
         float o1[8][4] = {}, pk[8][4] = {};   // G1: e^gc Q S, then P (rows r0..)
         if (warp < 4) {
             if (tid == 0) {   // in token order, as the FLA path sums it (gc is 0 past ce)
@@ -402,6 +407,7 @@ gdn_chunk_tc_prefill(
             float kk[8][4] = {};
 #pragma unroll
             for (int ks = 0; ks < 8; ks++) {
+                if (!rows_live) break;
                 uint32_t ka[4];
                 lda(ka, Ks, KP, r0, ks * 16, grp, q);
 #pragma unroll
@@ -492,6 +498,7 @@ gdn_chunk_tc_prefill(
             float kS[8][4] = {};
 #pragma unroll
             for (int ks = 0; ks < 8; ks++) {
+                if (!rows_live) break;
                 uint32_t ka[4];
                 lda(ka, Ks, KP, r0, ks * 16, grp, q);
 #pragma unroll
@@ -507,11 +514,12 @@ gdn_chunk_tc_prefill(
             for (int ks = 0; ks < 8; ks++)
 #pragma unroll
                 for (int nt = 0; nt < 8; nt++) {
+                    if (!rows_live) break;
                     uint32_t b0, b1, h0, h1;
-                    ldb(b0, b1, Ks, KP, nt * 8, ks * 16, grp, q);
                     ldb(h0, h1, Sh, KP, nt * 8, ks * 16, grp, q);
-                    mma(pk[nt], qa[ks], b0, b1);
                     mma(o1[nt], qa[ks], h0, h1);
+                    ldb(b0, b1, Ks, KP, nt * 8, ks * 16, grp, q);
+                    mma(pk[nt], qa[ks], b0, b1);
                 }
             bar_sync(BAR_GATES, 256);   // gc, egc, dec from G0
             // R = V - e^gc (K S) -> R^T hi/lo; e^gc Q S and P stay in registers.
@@ -556,6 +564,7 @@ gdn_chunk_tc_prefill(
         float uc[4][4] = {};
 #pragma unroll
         for (int ks = 0; ks < 4; ks++) {
+            if (16 * mg >= ce || ks >= live) break;
             uint32_t th[4], tl[4];
             lda(th, Th, CP, 16 * mg, ks * 16, grp, q);
             lda(tl, Tl, CP, 16 * mg, ks * 16, grp, q);
@@ -593,6 +602,7 @@ gdn_chunk_tc_prefill(
         if (warp >= 4) {
 #pragma unroll
             for (int ks = 0; ks < 4; ks++) {
+                if (!rows_live || ks >= live) break;
                 uint32_t ph[4], pl[4];
                 lda(ph, Th, CP, r0, ks * 16, grp, q);
                 lda(pl, Tl, CP, r0, ks * 16, grp, q);
@@ -624,6 +634,7 @@ gdn_chunk_tc_prefill(
         const int k0 = 16 * warp + grp;
 #pragma unroll
         for (int ks = 0; ks < 4; ks++) {
+            if (ks >= live) break;
             uint32_t ah[4], al[4];
 #pragma unroll
             for (int f = 0; f < 4; f++) {

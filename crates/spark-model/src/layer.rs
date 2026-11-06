@@ -331,8 +331,11 @@ pub struct GdnPrefillBuffers {
     pub gate_beta: DevicePtr,
     /// GDN recurrence output: [total_len, value_dim] BF16.
     pub output: DevicePtr,
-    /// Z gate for gated RMS norm: [total_len, value_dim] BF16.
+    /// Z gate for gated RMS norm: [total_len, z_stride] BF16, value_dim used.
     pub z: DevicePtr,
+    /// Row pitch of `z` in elements: value_dim for the dedicated buffer, the
+    /// QKVZ row when `z` reads the projection output in place (score pass).
+    pub z_stride: usize,
     /// Total number of tokens across all chunks.
     pub total_len: usize,
 }

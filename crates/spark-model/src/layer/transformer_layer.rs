@@ -758,6 +758,15 @@ pub trait TransformerLayer: Send + Sync {
         false
     }
 
+    /// Whether this layer's batched prefill (`prefill_inner_batched_q12`,
+    /// `prefill_phase1_proj_batched`, `prefill_phase3`) reads the `residual`
+    /// buffer back. When no layer does, a score pass aliases it to `hidden`
+    /// (the norms' residual copy then rewrites the bytes they just wrote).
+    /// Default: true.
+    fn prefill_reads_residual(&self) -> bool {
+        true
+    }
+
     /// Allocate the transposed MoE expert weights used by the coalesced
     /// prefill GEMM kernels. Called as a post-load pass from `factory::build`
     /// after LM-head NVFP4 quantization has freed BF16 headroom, so
