@@ -23,6 +23,10 @@ use crate::layer::{
 };
 use crate::traits::SequenceState;
 
+/// Pointer tables a layer gets from `score_stage_ssm_tables`, `n` entries
+/// each: states, entry states, conv states, entry conv states.
+pub(super) const TABLES: usize = 4;
+
 fn ssm_ptrs(seq: &mut SequenceState, layer_idx: usize) -> Result<(DevicePtr, DevicePtr)> {
     let st = seq.layer_states[layer_idx]
         .as_any_mut()
@@ -98,17 +102,19 @@ impl TransformerModel {
             return Ok(None);
         }
         ensure!(
-            off + ssm.len() * 2 * n * 8 <= self.buffers.scratch_bytes(),
+            off + ssm.len() * TABLES * n * 8 <= self.buffers.scratch_bytes(),
             "score: SSM pointer tables exceed scratch ({n} streams)"
         );
-        let mut tab: Vec<u64> = Vec::with_capacity(ssm.len() * 2 * n);
+        let mut tab: Vec<u64> = Vec::with_capacity(ssm.len() * TABLES * n);
         for &l in &ssm {
-            let at = tab.len();
-            for seq in seqs.iter_mut() {
-                tab.push(ssm_ptrs(seq, l)?.0.0);
-            }
-            for i in 0..n {
-                tab.push(tab[at + plan.head_of[i].unwrap_or(i)]);
+            let ptrs = seqs
+                .iter_mut()
+                .map(|s| ssm_ptrs(s, l))
+                .collect::<Result<Vec<_>>>()?;
+            let picks: [fn((DevicePtr, DevicePtr)) -> DevicePtr; 2] = [|p| p.0, |p| p.1];
+            for pick in picks {
+                tab.extend(ptrs.iter().map(|&p| pick(p).0));
+                tab.extend((0..n).map(|i| pick(ptrs[plan.head_of[i].unwrap_or(i)]).0));
             }
         }
         let bytes: Vec<u8> = tab.iter().flat_map(|p| p.to_le_bytes()).collect();
@@ -165,6 +171,40 @@ impl TransformerModel {
             "score: layer {layer_idx} scanned its heads but not its branches"
         );
         Ok(false)
+    }
+
+    /// The branches' conv1d in one launch (`score_conv1d`), each from its
+    /// head's updated window read in place (no fork copy). `Ok(false)`: the
+    /// layer has no such launch and nothing ran.
+    fn score_conv1d_branches(
+        &self,
+        layer: &dyn TransformerLayer,
+        plan: &ScorePlan,
+        meta: &BatchedAttnMetadata,
+        gdn: &GdnPrefillBuffers,
+        branch_cu: DevicePtr,
+        tabs: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        let (n, heads, cu) = (plan.streams(), plan.heads, &meta.cu_seqlens_host);
+        let at = |t: usize, s: usize| tabs.offset((t * n + s) * 8);
+        let Some(len) = (heads..n).map(|b| (cu[b + 1] - cu[b]) as u32).max() else {
+            return Ok(true);
+        };
+        let base = cu[heads] as usize;
+        let g = gdn_slice(gdn, base, cu[n] as usize - base, ctx);
+        let nb = (n - heads) as u32;
+        layer.score_conv1d(
+            [at(2, heads), at(3, heads)],
+            base,
+            &g,
+            nb,
+            branch_cu,
+            len,
+            ctx,
+            stream,
+        )
     }
 
     /// Run the recurrence of the contiguous streams `lo..hi` together, from
@@ -279,9 +319,18 @@ impl TransformerModel {
         layer.prefill_phase1_proj_batched(hidden, residual, total, gdn, ctx, stream)?;
         prof.mark(self, stream, Phase::SsmProj)?;
 
-        // conv1d: heads first, then fork their windows into the branches.
+        // conv1d: heads first, then fork their windows into the branches, or
+        // run every branch in one launch from its head's window in place.
         for b in 0..n {
             if b == heads {
+                let fused = match tabs {
+                    Some(t) => self
+                        .score_conv1d_branches(layer, plan, meta, gdn, branch_cu, t, ctx, stream)?,
+                    None => false,
+                };
+                if fused {
+                    break;
+                }
                 self.score_fork(seqs, plan, layer_idx, true, stream)?;
             }
             let (off, len) = (cu[b] as usize, (cu[b + 1] - cu[b]) as usize);
