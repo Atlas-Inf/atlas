@@ -373,7 +373,7 @@ impl Qwen3AttentionLayer {
                 )?;
             }
         } else if let Some(nvfp4_t) = nvfp4_t {
-            if n > 128 {
+            if self.nvfp4_proj_m128(nvfp4_t, [n, out_dim, h]) {
                 self.w4a16_gemm_m128_dispatch(
                     ctx.gpu,
                     ctx.dispatch,

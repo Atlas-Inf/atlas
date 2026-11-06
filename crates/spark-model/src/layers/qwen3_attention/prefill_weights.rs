@@ -16,6 +16,16 @@ impl Qwen3AttentionLayer {
     /// kernel when available (MiniMax-only), otherwise to the v1 kernel.
     /// Args mirror [`crate::layers::ops::w4a16_gemm_n128_m128`].
     #[allow(clippy::too_many_arguments)]
+    /// Whether an `m`-row NVFP4 projection takes [`Self::w4a16_gemm_m128_dispatch`]:
+    /// above 128 rows, or wherever the BF16-MMA kernel serves it.
+    pub(crate) fn nvfp4_proj_m128(
+        &self,
+        w: &crate::weight_map::QuantizedWeight,
+        mnk: [u32; 3],
+    ) -> bool {
+        mnk[0] > 128 || self.bf16mma.serves_nvfp4(w, mnk)
+    }
+
     pub(crate) fn w4a16_gemm_m128_dispatch(
         &self,
         gpu: &dyn GpuBackend,
@@ -32,6 +42,12 @@ impl Qwen3AttentionLayer {
         // CTAs/SM, 8 warps; v3 with K_STEP=64 is slower in practice, kept for
         // A/B). Resolved once per model into `GemmDispatch`, which the forward
         // pass already carries.
+        // ATLAS_DENSE_PREFILL_BF16MMA (the handles exist only with the lever).
+        if self.bf16mma.serves_nvfp4(weight, [m, n, k]) {
+            return self
+                .bf16mma
+                .nvfp4(gpu, input, weight, output, [m, n, k], stream);
+        }
         let v = dispatch.w4a16_variant;
         // LOSSLESS opt-in: route QKV/o projection prefill through the BF16-TC
         // kernel (FP4→BF16 dequant + BF16 MMA, bit-identical to base w4a16_gemm)

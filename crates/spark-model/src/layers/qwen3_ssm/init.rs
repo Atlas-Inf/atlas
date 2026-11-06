@@ -44,6 +44,8 @@ impl Qwen3SsmLayer {
             qkvz_fp8w: None,
             out_proj_fp8w: None,
             fp8w_decode_only: false,
+            bf16mma: Default::default(),
+            bf16mma_fp8_ok: [false; 2],
             qkvz_fp8w_t: None,
             out_proj_fp8w_t: None,
             qkvz_fp8w_rowwise: None,
