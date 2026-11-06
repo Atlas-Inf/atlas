@@ -237,7 +237,6 @@ impl Qwen3SsmLayer {
         let eps = ctx.config.rms_norm_eps as f32;
         let k = total_tokens as u32;
         let bf16 = 2usize;
-        let fp32 = 4usize;
         let nk = ctx.config.linear_num_key_heads;
         let kd = ctx.config.linear_key_head_dim;
         let nv = ctx.config.linear_num_value_heads;
@@ -278,10 +277,10 @@ impl Qwen3SsmLayer {
             stream,
         )?;
 
-        // 4+5. BA GEMM + GDN gates over ALL tokens → ssm_gates, then copy to
-        // gdn_bufs.gate_beta in one contiguous D2D ([total, 2*nv] FP32 both).
+        // 4+5. BA GEMM + GDN gates over ALL tokens, straight into
+        // gdn_bufs.gate_beta ([total, 2*nv] FP32, the layout ssm_gates has).
         let ba_size = ctx.config.ssm_ba_size();
-        let gates_buf = ctx.buffers.ssm_gates();
+        let gates_buf = gdn_bufs.gate_beta;
         let gate_stride = nv * 2;
         self.ba_gates_prefill(
             ctx,
@@ -299,12 +298,6 @@ impl Qwen3SsmLayer {
                 nv as u32,
                 vpg as u32,
             ],
-            stream,
-        )?;
-        ctx.gpu.copy_d2d_async(
-            gates_buf,
-            gdn_bufs.gate_beta,
-            total_tokens * gate_stride * fp32,
             stream,
         )?;
 
