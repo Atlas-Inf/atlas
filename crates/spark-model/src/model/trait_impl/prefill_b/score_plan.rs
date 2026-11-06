@@ -7,9 +7,16 @@
 //! head is `prefix[0..F)` with `F = floor(L / block) * block`, omitted when
 //! F == 0; each of its branches is `prefix ++ branch`, processed from F and
 //! sharing the head's `F / block` whole blocks.
+//!
+//! A `prefix_bidir` request marks every one of its streams with the state end
+//! S = L (its prefix length): in the full-attention layers state rows read
+//! keys k < S and branch rows read every key of their stream. Its head reads
+//! the state's partial last block `[F, S)` from its first branch (every
+//! branch writes the same tail), so the head's KV extent is S, not F.
 
-/// One request: a shared prefix and its branches.
-pub(in crate::model) type ScoreRequest<'a> = (&'a [u32], &'a [Vec<u32>]);
+/// One request: a shared prefix, its branches, and whether the prefix is a
+/// bidirectional state block (`prefix_bidir`).
+pub(in crate::model) type ScoreRequest<'a> = (&'a [u32], &'a [Vec<u32>], bool);
 
 pub(super) struct ScorePlan {
     /// Full token list per stream.
@@ -25,6 +32,13 @@ pub(super) struct ScorePlan {
     pub shared_blocks: Vec<usize>,
     /// Branches per request, in request order.
     pub branch_counts: Vec<usize>,
+    /// Per stream: the state end S of a `prefix_bidir` request, -1 if causal.
+    pub state_end: Vec<i32>,
+    /// Per stream: the KV extent its attention reads (S for a bidirectional
+    /// head with a partial tail; else its token count).
+    pub kv_len: Vec<usize>,
+    /// Per head stream: the branch stream whose tail block it reads, if any.
+    pub tail_from: Vec<Option<usize>>,
 }
 
 impl ScorePlan {
@@ -36,34 +50,53 @@ impl ScorePlan {
             head_of: Vec::new(),
             shared_blocks: Vec::new(),
             branch_counts: Vec::with_capacity(reqs.len()),
+            state_end: Vec::new(),
+            kv_len: Vec::new(),
+            tail_from: Vec::new(),
         };
+        let s_end = |prefix: &[u32], bidir: bool| if bidir { prefix.len() as i32 } else { -1 };
         let mut head_idx = Vec::with_capacity(reqs.len());
-        for (prefix, _) in reqs {
+        for &(prefix, _, bidir) in reqs {
             let f = (prefix.len() / bs) * bs;
             head_idx.push((f > 0).then_some(p.tokens.len()));
             if f > 0 {
-                p.push(prefix[..f].to_vec(), 0, None, 0);
+                p.push(prefix[..f].to_vec(), 0, None, 0, s_end(prefix, bidir));
             }
         }
         p.heads = p.tokens.len();
-        for ((prefix, branches), head) in reqs.iter().zip(head_idx) {
+        p.tail_from = vec![None; p.heads];
+        for (&(prefix, branches, bidir), head) in reqs.iter().zip(head_idx) {
             let f = (prefix.len() / bs) * bs;
+            if let Some(h) = head
+                && bidir
+                && prefix.len() > f
+            {
+                p.tail_from[h] = Some(p.tokens.len());
+                p.kv_len[h] = prefix.len();
+            }
             for b in branches.iter() {
                 let mut t = Vec::with_capacity(prefix.len() + b.len());
                 t.extend_from_slice(prefix);
                 t.extend_from_slice(b);
-                p.push(t, f, head, f / bs);
+                p.push(t, f, head, f / bs, s_end(prefix, bidir));
             }
             p.branch_counts.push(branches.len());
         }
         p
     }
 
-    fn push(&mut self, tokens: Vec<u32>, start: usize, head: Option<usize>, shared: usize) {
+    fn push(&mut self, tokens: Vec<u32>, start: usize, head: Option<usize>, shared: usize, s: i32) {
+        self.kv_len.push(tokens.len());
         self.tokens.push(tokens);
         self.starts.push(start);
         self.head_of.push(head);
         self.shared_blocks.push(shared);
+        self.state_end.push(s);
+    }
+
+    /// Whether any stream uses the prefix-bidirectional mask.
+    pub(super) fn any_bidir(&self) -> bool {
+        self.state_end.iter().any(|&s| s >= 0)
     }
 
     pub(super) fn streams(&self) -> usize {
@@ -94,7 +127,7 @@ mod tests {
     fn one_request_shares_whole_blocks_and_replays_the_tail() {
         let prefix: Vec<u32> = (0..37).collect();
         let branches = [vec![100, 101], vec![200]];
-        let plan = ScorePlan::new(&[(&prefix, &branches)], 16);
+        let plan = ScorePlan::new(&[(&prefix, &branches, false)], 16);
         assert_eq!(plan.heads, 1);
         assert_eq!(plan.starts, vec![0, 32, 32]);
         assert_eq!(plan.head_of, vec![None, Some(0), Some(0)]);
@@ -109,12 +142,25 @@ mod tests {
     fn heads_come_first_and_branches_keep_request_order() {
         let (p1, p2): (Vec<u32>, Vec<u32>) = ((0..20).collect(), vec![7, 8, 9]);
         let (b1, b2) = ([vec![1], vec![2]], [vec![3]]);
-        let plan = ScorePlan::new(&[(&p1, &b1), (&p2, &b2)], 16);
+        let plan = ScorePlan::new(&[(&p1, &b1, false), (&p2, &b2, false)], 16);
         // Request 2's prefix is under a block: no head, its branch starts at 0.
         assert_eq!(plan.heads, 1);
         assert_eq!(plan.head_of, vec![None, Some(0), Some(0), None]);
         assert_eq!(plan.starts, vec![0, 16, 16, 0]);
         assert_eq!(plan.branch_counts, vec![2, 1]);
         assert_eq!(plan.tokens[3], vec![7, 8, 9, 3]);
+    }
+
+    #[test]
+    fn bidir_head_reads_its_first_branchs_tail() {
+        let prefix: Vec<u32> = (0..37).collect();
+        let (b1, b2) = ([vec![100, 101], vec![200]], [vec![300]]);
+        let short = vec![5, 6];
+        let plan = ScorePlan::new(&[(&prefix, &b1, true), (&short, &b2, false)], 16);
+        assert_eq!(plan.heads, 1);
+        assert_eq!(plan.state_end, vec![37, 37, 37, -1]);
+        assert_eq!(plan.tail_from, vec![Some(1)]);
+        assert_eq!(plan.kv_len, vec![37, 39, 38, 3]);
+        assert!(plan.any_bidir());
     }
 }

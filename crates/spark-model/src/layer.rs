@@ -294,6 +294,11 @@ pub struct BatchedAttnMetadata {
     pub kv_lens: DevicePtr,
     /// Host copy of `kv_lens`. Empty in the legacy path.
     pub kv_lens_host: Vec<i32>,
+    /// Per-stream prefix-bidirectional state end `[batch_size]` i32 on device
+    /// (`-1` = causal), read by the batched paged attention kernels; see
+    /// `prefill_paged_compute.cuh`. `DevicePtr::NULL` (every stream causal)
+    /// everywhere except the score path's `prefix_bidir` requests.
+    pub state_end: DevicePtr,
     /// Maximum block_table length across the batch (kernel uses for
     /// bounds checking; per-stream block_table reads via the pointer
     /// array dereference).

@@ -21,6 +21,8 @@ pub struct ScoreJob {
     pub prefix: Vec<u32>,
     pub branches: Vec<Vec<u32>>,
     pub options: Vec<Vec<u32>>,
+    /// Read the prefix as a bidirectional state block (`"prefix_bidir"`).
+    pub prefix_bidir: bool,
     /// When the HTTP handler queued the job (for `queue_us`).
     pub enqueued: Instant,
     pub reply: tokio::sync::oneshot::Sender<Result<ScoreOutput, String>>,
@@ -80,6 +82,7 @@ fn run_batch(model: &dyn Model, batch: Vec<ScoreJob>, stream: u64) {
             prefix: &j.prefix,
             branches: &j.branches,
             options: &j.options,
+            prefix_bidir: j.prefix_bidir,
         })
         .collect();
     let res = model.score_requests(&inputs, stream).and_then(|r| {
@@ -127,6 +130,7 @@ mod tests {
             prefix: vec![1; prefix],
             branches: branches.iter().map(|&n| vec![2; n]).collect(),
             options: branches.iter().map(|_| vec![3, 4]).collect(),
+            prefix_bidir: false,
             enqueued: Instant::now(),
             reply,
         }

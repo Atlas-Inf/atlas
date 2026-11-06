@@ -61,7 +61,10 @@ impl TransformerModel {
         ensure!(self.comm.is_none(), "score: single-rank models only");
         ensure!(!self.use_fp32_logits, "score: FP32 logits mode is not supported");
         let bs = self.kv_cache.lock().block_size();
-        let plan_reqs: Vec<ScoreRequest<'_>> = reqs.iter().map(|r| (r.prefix, r.branches)).collect();
+        let plan_reqs: Vec<ScoreRequest<'_>> = reqs
+            .iter()
+            .map(|r| (r.prefix, r.branches, r.prefix_bidir))
+            .collect();
         let plan = ScorePlan::new(&plan_reqs, bs);
         ensure!(
             plan.total_rows() <= self.buffers.max_batch_tokens(),
@@ -165,6 +168,15 @@ impl TransformerModel {
                 self.levers.kv_poison,
             )?;
         }
+        // prefix_bidir heads read the state's partial tail block from their
+        // first branch (it holds the same tail K/V as every branch).
+        for h in 0..plan.heads {
+            if let Some(b) = plan.tail_from[h] {
+                let tail = seqs[b].block_table[plan.shared_blocks[b]];
+                kv_cache.inc_ref(tail);
+                seqs[h].block_table.push(tail);
+            }
+        }
 
         // ── Embed + per-stream paged metadata at stacked offsets. ──
         self.buffers
@@ -175,7 +187,7 @@ impl TransformerModel {
         let hidden = self.buffers.hidden_states();
         let mut off = 0usize;
         for i in 0..n {
-            let (start, rows, len) = (plan.starts[i], plan.rows(i), plan.tokens[i].len());
+            let (start, rows, len) = (plan.starts[i], plan.rows(i), plan.kv_len[i]);
             let toks = &plan.tokens[i];
             // positions (x3 with MRoPE) + slots for this stream's own rows.
             let meta_bytes = (rows * 24 + 127) & !63;
@@ -237,7 +249,7 @@ impl TransformerModel {
                 }
             })
             .collect();
-        let meta = self.stage_batched_attn_metadata(
+        let mut meta = self.stage_batched_attn_metadata(
             &infos,
             &kv_cache,
             self.config.mrope_interleaved,
@@ -246,6 +258,9 @@ impl TransformerModel {
         )?;
         drop(infos);
         cursor += meta.staged_bytes;
+        if plan.any_bidir() {
+            cursor = self.score_stage_bidir(plan, &mut meta, cursor, stream)?;
+        }
         let ptrs_off = (cursor + 63) & !63;
         // h_state_ptrs[n] then the branches' rebased cu_seqlens[n+1].
         let branch_cu_off = ptrs_off + ((n * 8 + 63) & !63);
@@ -321,5 +336,43 @@ impl TransformerModel {
         }
         prof.report(plan.total_rows(), n);
         Ok(())
+    }
+}
+
+impl TransformerModel {
+    /// `prefix_bidir`: upload each stream's state end and the heads' widened
+    /// KV extents (a head with a partial tail reads up to S, not F). Returns
+    /// the scratch cursor past the staged array.
+    fn score_stage_bidir(
+        &self,
+        plan: &ScorePlan,
+        meta: &mut crate::layer::BatchedAttnMetadata,
+        cursor: usize,
+        stream: u64,
+    ) -> Result<usize> {
+        let n = plan.streams();
+        let off = (cursor + 63) & !63;
+        ensure!(
+            off + n * 4 <= self.buffers.scratch_bytes(),
+            "score: state-end staging exceeds scratch ({n} streams)"
+        );
+        let as_bytes = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let dst = self.buffers.scratch().offset(off);
+        self.gpu
+            .copy_h2d_async_retained(&as_bytes(&plan.state_end), dst, stream)?;
+        meta.state_end = dst;
+        let mut changed = false;
+        for i in 0..n {
+            let want = plan.kv_len[i] as i32;
+            if meta.kv_lens_host[i] != want {
+                meta.kv_lens_host[i] = want;
+                changed = true;
+            }
+        }
+        if changed {
+            let bytes = as_bytes(&meta.kv_lens_host);
+            self.gpu.copy_h2d_async_retained(&bytes, meta.kv_lens, stream)?;
+        }
+        Ok(off + ((n * 4 + 63) & !63))
     }
 }

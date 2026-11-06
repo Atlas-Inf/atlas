@@ -101,6 +101,11 @@ pub struct ScoreInput<'a> {
     pub branches: &'a [Vec<u32>],
     /// Per branch, the single option token ids to score.
     pub options: &'a [Vec<u32>],
+    /// `prefix_bidir`: in the full-attention layers the prefix (the state) is
+    /// read in both directions and never sees a branch, and each branch reads
+    /// the whole prefix and itself in both directions. GDN layers stay causal.
+    /// False: plain causal attention.
+    pub prefix_bidir: bool,
 }
 
 pub trait Model: Send + Sync {

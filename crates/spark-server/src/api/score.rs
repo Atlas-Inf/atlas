@@ -9,7 +9,9 @@
 //! softmax over its option tokens at the branch's last position. `prefix` is
 //! read once and every branch continues it, all in one forward pass
 //! (`spark_model::traits::Model::score_branches`). A flat `options` list
-//! applies to every branch.
+//! applies to every branch. `"attention": "prefix_bidir"` reads the prefix
+//! as a bidirectional state block and each branch as a bidirectional
+//! question block on it (full-attention layers only; the default is causal).
 
 use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
@@ -37,7 +39,13 @@ pub struct ScoreRequest {
     pub prefix: Vec<u32>,
     pub branches: Vec<Vec<u32>>,
     pub options: ScoreOptions,
+    /// "causal" (default) or "prefix_bidir".
+    #[serde(default)]
+    pub attention: Option<String>,
 }
+
+/// A validated request: prefix, branches, per-branch options, prefix_bidir.
+pub type Validated = (Vec<u32>, Vec<Vec<u32>>, Vec<Vec<u32>>, bool);
 
 #[derive(Serialize)]
 struct ScoreResponse {
@@ -49,15 +57,21 @@ struct ScoreResponse {
 }
 
 /// Validate and expand a request into (prefix, branches, per-branch options).
-pub fn validate(
-    req: ScoreRequest,
-    vocab_size: u32,
-) -> Result<(Vec<u32>, Vec<Vec<u32>>, Vec<Vec<u32>>), String> {
+pub fn validate(req: ScoreRequest, vocab_size: u32) -> Result<Validated, String> {
     let ScoreRequest {
         prefix,
         branches,
         options,
+        attention,
     } = req;
+    let prefix_bidir = match attention.as_deref() {
+        None | Some("causal") => false,
+        Some("prefix_bidir") => true,
+        Some(other) => return Err(format!("attention: {other:?} is not causal or prefix_bidir")),
+    };
+    if prefix_bidir && prefix.is_empty() {
+        return Err("attention: prefix_bidir needs a non-empty prefix (the state block)".into());
+    }
     if branches.is_empty() || branches.len() > MAX_BRANCHES {
         return Err(format!("branches: need 1..={MAX_BRANCHES}"));
     }
@@ -84,7 +98,7 @@ pub fn validate(
     if let Some(bad) = all.copied().find(|&t| t >= vocab_size) {
         return Err(format!("token id {bad} out of range: vocab_size is {vocab_size}"));
     }
-    Ok((prefix, branches, options))
+    Ok((prefix, branches, options, prefix_bidir))
 }
 
 pub async fn score(
@@ -100,7 +114,7 @@ pub async fn score(
             );
         }
     };
-    let (prefix, branches, options) = match validate(req, state.tokenizer.vocab_size()) {
+    let (prefix, branches, options, prefix_bidir) = match validate(req, state.tokenizer.vocab_size()) {
         Ok(v) => v,
         Err(msg) => return openai_error_response(StatusCode::BAD_REQUEST, msg),
     };
@@ -115,6 +129,7 @@ pub async fn score(
         prefix,
         branches,
         options,
+        prefix_bidir,
         enqueued: std::time::Instant::now(),
         reply,
     };
@@ -150,9 +165,10 @@ mod tests {
 
     #[test]
     fn shared_options_expand_per_branch() {
-        let (p, b, o) =
+        let (p, b, o, bidir) =
             validate(req(r#"{"prefix":[1,2],"branches":[[3],[4,5]],"options":[7,8]}"#), 10)
                 .unwrap();
+        assert!(!bidir);
         assert_eq!(p, vec![1, 2]);
         assert_eq!(b.len(), 2);
         assert_eq!(o, vec![vec![7, 8], vec![7, 8]]);
@@ -173,5 +189,15 @@ mod tests {
         assert!(validate(req(r#"{"branches":[[1]],"options":[]}"#), 10).is_err());
         assert!(validate(req(r#"{"branches":[[1]],"options":[10]}"#), 10).is_err());
         assert!(validate(req(r#"{"prefix":[11],"branches":[[1]],"options":[2]}"#), 10).is_err());
+    }
+
+    #[test]
+    fn attention_mode_is_validated() {
+        let ok = req(r#"{"prefix":[1],"branches":[[3]],"options":[7],"attention":"prefix_bidir"}"#);
+        assert!(validate(ok, 10).unwrap().3);
+        let empty = req(r#"{"branches":[[3]],"options":[7],"attention":"prefix_bidir"}"#);
+        assert!(validate(empty, 10).is_err());
+        let bad = req(r#"{"prefix":[1],"branches":[[3]],"options":[7],"attention":"full"}"#);
+        assert!(validate(bad, 10).is_err());
     }
 }
