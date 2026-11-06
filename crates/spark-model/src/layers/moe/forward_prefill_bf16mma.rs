@@ -25,8 +25,19 @@ const DOWN_FEATURES: u32 = 256;
 /// more (1111 -> 1237 us at 1k rows).
 const DOWN_GRID_AVG_FACTOR: u32 = 4;
 
-/// `[gate_up_silu, down]`; handle 0 where the target does not ship them.
+/// `[gate_up_silu, down]`; handle 0 where the target does not ship them or
+/// the lever is off. Only qwen3.6-35b-a3b ships the module, and a lookup that
+/// misses fails the boot audit, so other targets must not issue it.
 pub(super) fn kernels(gpu: &dyn GpuBackend) -> [KernelHandle; 2] {
+    if std::env::var("ATLAS_MOE_PREFILL_BF16MMA").as_deref() == Ok("1") {
+        resolve(gpu)
+    } else {
+        [KernelHandle(0); 2]
+    }
+}
+
+/// The lookup itself, lever or not (the GPU test).
+pub(super) fn resolve(gpu: &dyn GpuBackend) -> [KernelHandle; 2] {
     [
         super::super::try_kernel(gpu, MODULE, "moe_bf16mma_gate_up_silu"),
         super::super::try_kernel(gpu, MODULE, "moe_bf16mma_down"),

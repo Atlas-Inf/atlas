@@ -75,7 +75,7 @@ impl Proj {
 #[ignore = "needs a GB10 and a qwen3.6-35b-a3b kernel build"]
 fn bf16mma_moe_matches_exact_dequant_reference() -> Result<()> {
     let gpu = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
-    let [k_gu, k_down] = kernels(&gpu);
+    let [k_gu, k_down] = resolve(&gpu);
     ensure!(
         k_gu.0 != 0 && k_down.0 != 0,
         "moe_bf16mma_prefill not in this build"
