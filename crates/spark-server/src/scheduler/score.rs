@@ -10,7 +10,8 @@
 //! flight. Jobs queued together share ONE forward pass (and one read of the
 //! weights), packed up to the row arena and the SSM slot count; if a merged
 //! pass fails, each of its jobs is retried alone so one bad request cannot
-//! fail its neighbours.
+//! fail its neighbours. A job too big for one pass runs as several passes,
+//! each over the prefix and a subset of its branches, reassembled in order.
 
 use std::time::Instant;
 
@@ -60,6 +61,10 @@ pub(super) fn run_jobs(model: &dyn Model, jobs: Vec<ScoreJob>, stream: u64, budg
     let (mut rows, mut streams) = (0, 0);
     for job in jobs {
         let (r, s) = cost(&job, BLOCK);
+        if job.branches.len() > 1 && (r > budget.rows || s > budget.streams) {
+            run_split(model, job, stream, budget, BLOCK);
+            continue;
+        }
         if !batch.is_empty() && (rows + r > budget.rows || streams + s > budget.streams) {
             run_batch(model, std::mem::take(&mut batch), stream);
             (rows, streams) = (0, 0);
@@ -71,6 +76,58 @@ pub(super) fn run_jobs(model: &dyn Model, jobs: Vec<ScoreJob>, stream: u64, budg
     if !batch.is_empty() {
         run_batch(model, batch, stream);
     }
+}
+
+/// Branch groups of `job` that each fit one pass (at least one branch each).
+fn split_branches(job: &ScoreJob, budget: &ScoreBudget, block: usize) -> Vec<std::ops::Range<usize>> {
+    let head = usize::from(job.prefix.len() >= block);
+    let mut groups = Vec::new();
+    let (mut lo, mut rows, mut streams) = (0, job.prefix.len(), head);
+    for (i, b) in job.branches.iter().enumerate() {
+        let r = b.len() + block - 1;
+        if i > lo && (rows + r > budget.rows || streams + 1 > budget.streams) {
+            groups.push(lo..i);
+            (lo, rows, streams) = (i, job.prefix.len(), head);
+        }
+        rows += r;
+        streams += 1;
+    }
+    groups.push(lo..job.branches.len());
+    groups
+}
+
+/// Run one oversized job as several passes and reply once.
+fn run_split(model: &dyn Model, job: ScoreJob, stream: u64, budget: &ScoreBudget, block: usize) {
+    let t = Instant::now();
+    let mut probs = Vec::with_capacity(job.branches.len());
+    let groups = split_branches(&job, budget, block);
+    for g in &groups {
+        let input = ScoreInput {
+            prefix: &job.prefix,
+            branches: &job.branches[g.clone()],
+            options: &job.options[g.clone()],
+            prefix_bidir: job.prefix_bidir,
+        };
+        match model.score_requests(std::slice::from_ref(&input), stream) {
+            Ok(mut out) if out.len() == 1 => probs.append(&mut out[0]),
+            Ok(_) => {
+                let _ = job.reply.send(Err("score: engine returned the wrong number of results".into()));
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("split score job failed: {e:#}");
+                let _ = job.reply.send(Err(format!("{e:#}")));
+                return;
+            }
+        }
+    }
+    let queue_us = t.duration_since(job.enqueued).as_micros() as u64;
+    let _ = job.reply.send(Ok(ScoreOutput {
+        probs,
+        engine_us: t.elapsed().as_micros() as u64,
+        queue_us,
+        batched: 1,
+    }));
 }
 
 fn run_batch(model: &dyn Model, batch: Vec<ScoreJob>, stream: u64) {
@@ -134,6 +191,19 @@ mod tests {
             enqueued: Instant::now(),
             reply,
         }
+    }
+
+    #[test]
+    fn oversized_jobs_split_into_passes_that_fit() {
+        let budget = ScoreBudget { rows: 100, streams: 4 };
+        // prefix 40; each branch costs 10 + 15 = 25 rows: two fit per pass.
+        let groups = split_branches(&job(40, &[10, 10, 10, 10, 10]), &budget, 16);
+        assert_eq!(groups, vec![0..2, 2..4, 4..5]);
+        // A single branch that is too big still gets its own pass.
+        assert_eq!(split_branches(&job(40, &[90, 10]), &budget, 16), vec![0..1, 1..2]);
+        // The stream budget splits too (head + 3 branches).
+        let tight = ScoreBudget { rows: 1000, streams: 4 };
+        assert_eq!(split_branches(&job(40, &[1; 5]), &tight, 16), vec![0..3, 3..5]);
     }
 
     #[test]
