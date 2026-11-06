@@ -656,12 +656,14 @@ gdn_chunk_tc_prefill(
                 mma(S[nt], al, h0, h1);
             }
         }
-        __syncthreads();   // every read of K, S^T and uc^T for this chunk is done
+        // S^T is last read before the join (K S, Q S), so each warp stages its
+        // new rows as soon as its own update is done, beside the others'.
+        stage_state(S, Sh, Sl, warp, grp, q);
+        __syncthreads();   // every read of K and uc^T for this chunk is done; S^T is staged
         if (cen > 0) {
             stage_rows<KD, KP>(Ks, kg, qk_stride, cn, cen, tid);
             cp_commit();
         }
-        stage_state(S, Sh, Sl, warp, grp, q);
     }
 
 #pragma unroll
