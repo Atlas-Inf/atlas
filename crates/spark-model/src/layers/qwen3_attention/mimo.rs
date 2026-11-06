@@ -129,8 +129,16 @@ impl Qwen3AttentionLayer {
         k: u32,
         stream: u64,
     ) -> Result<()> {
+        static BATCHM: std::sync::OnceLock<KernelHandle> = std::sync::OnceLock::new();
+        let batchm = *BATCHM.get_or_init(|| {
+            crate::layers::try_kernel(ctx.gpu, "dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")
+        });
         if m == 1 {
             ops::dense_gemv(ctx.gpu, self.dense_gemv_k, input, w, out, n, k, stream)
+        } else if batchm.0 != 0 && m <= ops::DENSE_GEMV_BATCHM_MAX_M {
+            // Speculative verify / small multi-seq batches: one weight pass for
+            // all rows instead of a large-M tiled GEMM.
+            ops::dense_gemv_batchm(ctx.gpu, batchm, input, w, out, m, n, k, n, stream)
         } else if ctx.dispatch.cublas_gemm {
             ops::cublas_bf16_proj_dense(input, w.weight, out, m, n, k, stream)
         } else if self.dense_gemm_pipelined_k.0 != 0 {
