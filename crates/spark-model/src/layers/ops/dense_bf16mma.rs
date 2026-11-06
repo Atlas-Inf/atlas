@@ -77,10 +77,15 @@ impl LowpMix {
         ("qkv8", Self::ATTN_QKV << Self::A8),
         ("o8", Self::ATTN_O << Self::A8),
     ];
-    /// `ATLAS_DENSE_PREFILL_LOWP=1`: W4A4 MLP and W8A8 GDN. On the d3 oracle
-    /// these stay within the old default kernels' distance from d3's BF16
-    /// runtime; NVFP4 tokens on the attention projections as well do not.
-    pub const DEFAULT: Self = Self(Self::GATE_UP | Self::DOWN | Self::GDN_QKVZ | Self::GDN_OUT);
+    /// `ATLAS_DENSE_PREFILL_LOWP=1`: W4A8 MLP and attention, W8A8 GDN. On the
+    /// d3 oracle this stays at the BF16-MMA path's distance from d3's BF16
+    /// runtime; NVFP4 tokens on the MLP (`gu,dn`, faster) land at or past the
+    /// old default kernels' distance, depending on the rest of the pass.
+    pub const DEFAULT: Self = Self(
+        (Self::GATE_UP | Self::DOWN | Self::ATTN_QKV | Self::ATTN_O) << Self::A8
+            | Self::GDN_QKVZ
+            | Self::GDN_OUT,
+    );
 
     pub fn parse(v: &str) -> Self {
         match v.trim() {
@@ -570,9 +575,10 @@ mod tests {
     fn lowp_mix_parses_groups_and_formats() {
         assert_eq!(LowpMix::parse("0"), LowpMix(0));
         assert_eq!(LowpMix::parse(""), LowpMix(0));
-        let d = LowpMix::parse("1");
-        assert!(d.has(LowpMix::GATE_UP) && d.has(LowpMix::DOWN) && d.has(LowpMix::GDN_QKVZ));
-        assert!(!d.has(LowpMix::ATTN_QKV) && !d.has_a8(LowpMix::GATE_UP));
+        assert_eq!(
+            LowpMix::parse("1"),
+            LowpMix::parse("gu8,dn8,qkv8,o8,qkvz,gout")
+        );
         let m = LowpMix::parse(" gu8, dn8 ,gout,bogus");
         assert!(m.has_a8(LowpMix::GATE_UP) && m.has_a8(LowpMix::DOWN) && m.has(LowpMix::GDN_OUT));
         assert!(
