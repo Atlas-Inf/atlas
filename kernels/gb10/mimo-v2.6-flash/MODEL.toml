@@ -122,6 +122,8 @@ w4a16_gemm_t_m128_bf16 = "Optional BF16-projection prefill twin; dispatch gates 
 w4a16_gemm_t_m128_bf16_v2 = "Optional BF16-projection prefill twin; dispatch gates on handle != 0 and uses the resolved m128 path."
 w4a16_gemm_t_m128_k16 = "Optional narrow-K twin; dispatch gates on handle != 0 and uses the resolved m128 path."
 w4a16_gemm_t_p3 = "Optional deep-pipeline twin; dispatch falls back to the resolved w4a16 tile."
+fp8_gemm_t_row_scaled = "Optional DFlash FP8-drafter GEMM; try_kernel lookup only gates the ATLAS_DFLASH_DRAFTER_FP8 mirror path, which this target does not use (BF16 drafter)."
+fp8_gemm_t_row_scaled_m16 = "Same optional DFlash FP8-drafter family (M<=16 lm_head variant); absent by design."
 
 [expected_absent.w4a4]
 w4a4_gemm = "Opt-in native-FP4 dense-FFN prefill variant gated by handle plus ATLAS_FP4_PREFILL; the compiled NVFP4 path serves by default."
