@@ -301,6 +301,20 @@ pub trait Model: Send + Sync {
         Ok(out)
     }
 
+    /// Prefill-only scoring: run `prefix` once and each branch as its
+    /// continuation, all in one forward pass, and return per branch the
+    /// softmax over that branch's single option tokens at its last row.
+    /// Nothing is sampled, decoded or cached. Default: unsupported.
+    fn score_branches(
+        &self,
+        _prefix: &[u32],
+        _branches: &[Vec<u32>],
+        _options: &[Vec<u32>],
+        _stream: u64,
+    ) -> Result<Vec<Vec<f32>>> {
+        anyhow::bail!("this model does not support prefill-only scoring")
+    }
+
     /// Like `prefill_batch_chunk`, but each finishing stream's first-token
     /// logits land in row `row_base + stream_idx` of the shared logits arena
     /// instead of row `stream_idx`.

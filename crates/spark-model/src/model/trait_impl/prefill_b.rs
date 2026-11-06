@@ -46,6 +46,8 @@ mod prompt_logprobs;
 mod qwen4exp_ckpt;
 pub(in crate::model) mod qwen4exp_points;
 mod save_checkpoint;
+mod score;
+mod score_ssm;
 mod stage_batched;
 mod upload_meta;
 mod upload_paged;

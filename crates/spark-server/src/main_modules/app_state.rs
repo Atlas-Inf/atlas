@@ -56,6 +56,8 @@ pub struct AppState {
     /// when no adapter is loaded. Carries `(adapter_name, ack)` to the
     /// scheduler, which applies the rotation at a quiescent point.
     pub rotation_tx: Option<mpsc::Sender<crate::scheduler::LoraRotation>>,
+    /// Prefill-only score jobs (`POST /v1/score`). `None` in test fixtures.
+    pub score_tx: Option<mpsc::Sender<crate::scheduler::score::ScoreJob>>,
     /// Vision config for VL models — None for text-only models.
     pub vision_config: Option<atlas_core::config::VisionConfig>,
     /// Optional vLLM-style image area cap applied before vision patching.

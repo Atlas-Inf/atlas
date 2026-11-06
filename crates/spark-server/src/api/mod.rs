@@ -50,6 +50,7 @@ pub mod responses_stream;
 pub mod responses_stream_finalize;
 pub mod responses_translate;
 pub mod sanitizer;
+pub mod score;
 pub mod scrub;
 pub mod stored;
 pub mod stream_guards;
@@ -90,6 +91,7 @@ pub use misc_handlers::{
 };
 pub use models::{embeddings_stub, get_model, list_models};
 pub use responses::responses_endpoint;
+pub use score::score;
 pub use stored::{
     delete_stored_response, get_stored_completion, get_stored_response, list_response_input_items,
 };

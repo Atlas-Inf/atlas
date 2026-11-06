@@ -941,6 +941,8 @@ pub(crate) fn load_model(
     // LoRA adapter-rotation control channel (POST /v1/lora/active). Small: it
     // carries only control messages, applied one-at-a-time at quiescence.
     let (rotation_tx, rotation_rx) = mpsc::channel::<scheduler::LoraRotation>(8);
+    // Prefill-only score jobs (POST /v1/score).
+    let (score_tx, score_rx) = mpsc::channel::<scheduler::score::ScoreJob>(args.max_num_seqs);
 
     let model_name = serve_phases::resolve_model_name(&args, &config_json, &model_dir);
 
@@ -1197,6 +1199,7 @@ pub(crate) fn load_model(
                 scheduler_model,
                 request_rx,
                 rotation_rx,
+                score_rx,
                 scheduler_eos,
                 max_batch_size,
                 use_speculative,
@@ -1395,6 +1398,7 @@ pub(crate) fn load_model(
         } else {
             Some(rotation_tx)
         },
+        score_tx: Some(score_tx),
         chat: crate::api::chat::levers::ChatLevers::resolve(&ptx_set.behavior),
         vision_max_pixels,
         vision_limits: vision_config.as_ref().map(|_| {

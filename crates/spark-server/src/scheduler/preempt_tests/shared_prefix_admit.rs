@@ -88,6 +88,7 @@ fn queue() -> Arc<(Mutex<PendingQueue>, Condvar)> {
         requests: Vec::new(),
         closed: false,
         rotations: Vec::new(),
+        scores: Vec::new(),
     };
     Arc::new((Mutex::new(q), Condvar::new()))
 }

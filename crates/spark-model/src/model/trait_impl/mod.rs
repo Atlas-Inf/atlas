@@ -291,6 +291,15 @@ impl Model for TransformerModel {
     ) -> Result<Vec<DevicePtr>> {
         self.prefill_batch_chunk_rows(streams, stream, 0)
     }
+    fn score_branches(
+        &self,
+        prefix: &[u32],
+        branches: &[Vec<u32>],
+        options: &[Vec<u32>],
+        stream: u64,
+    ) -> Result<Vec<Vec<f32>>> {
+        self.score_branches_impl(prefix, branches, options, stream)
+    }
     fn supports_prefill_multi(&self) -> bool {
         self.prefill_multi_supported()
     }

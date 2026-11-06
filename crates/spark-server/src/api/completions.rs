@@ -84,7 +84,7 @@ fn resolve_prompts(
 /// vocabulary. The tokenizer is the authoritative source of vocab size
 /// (SSOT); an OOB ID would index past the embedding table.
 fn validate_token_ids(state: &AppState, ids: &[u32]) -> Result<(), (StatusCode, String)> {
-    let vocab_size = state.tokenizer.inner().get_vocab_size(true) as u32;
+    let vocab_size = state.tokenizer.vocab_size();
     if let Some(&bad) = ids.iter().find(|&&id| id >= vocab_size) {
         return Err((
             StatusCode::BAD_REQUEST,
