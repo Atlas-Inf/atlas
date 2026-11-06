@@ -659,6 +659,12 @@ impl TransformerLayer for Qwen3SsmLayer {
         self.is_ssm_layer_inner()
     }
 
+    fn prefill_reads_residual(&self) -> bool {
+        // rms_norm_residual and residual_add_rms_norm only write it; the mHC
+        // paths are not audited for this.
+        self.hc.is_some()
+    }
+
     fn prefill_phase1(
         &self,
         hidden: DevicePtr,

@@ -337,7 +337,13 @@ impl TransformerModel {
         // Any non-zero start keeps the layers on the paged path; the kernels
         // take each stream's real offset from `kv_lens` / `cu_seqlens`.
         let seq_lens_start = plan.starts.iter().copied().max().unwrap_or(0).max(1);
-        let residual = self.buffers.residual();
+        // No layer reads the residual copy back: alias it to `hidden` rather
+        // than write a second activation-sized buffer per norm.
+        let residual = if self.layers.iter().any(|l| l.prefill_reads_residual()) {
+            self.buffers.residual()
+        } else {
+            hidden
+        };
         prof.mark(self, stream, Phase::Setup)?;
         let mut ssm_k = 0usize;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
