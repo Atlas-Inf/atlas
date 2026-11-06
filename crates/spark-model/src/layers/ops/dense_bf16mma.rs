@@ -33,16 +33,15 @@ const FP8_BLOCK: u32 = 128;
 /// 8 KiB) — `DbTok` / `DbW` in the kernel. Both fit two CTAs per SM.
 const SMEM_NVFP4: u32 = 2 * 8192 + 3 * 2 * (4096 + 512);
 const SMEM_FP8: u32 = 2 * 8192 + 2 * 2 * 8192;
-/// Low-precision kernels (`db_smem_bytes`, one CTA per SM): the 128-row
-/// BF16 epilogue tile bounds W4A4 (four stages of 4.5 KiB NVFP4 tokens and
-/// 9 KiB weights) and W4A8 (three of 8 KiB E4M3 tokens and 9 KiB weights);
-/// W8A8 is three stages of 8 KiB tokens and 16 KiB weights.
-const LOWP_EPILOGUE: u32 = LOWP_ROWS * (256 + 8) * 2;
-const SMEM_W4A4: u32 = LOWP_EPILOGUE;
+/// Low-precision kernels (`db_smem_bytes`, one CTA per SM, four stages):
+/// the 128-row BF16 epilogue tile bounds W4A4 (4.5 KiB NVFP4 tokens and
+/// 9 KiB weights per stage); W8A8 8 KiB E4M3 tokens and 16 KiB weights,
+/// W4A8 8 KiB tokens and 9 KiB weights.
+const SMEM_W4A4: u32 = LOWP_ROWS * (256 + 8) * 2;
 /// The quantizers hold a row in registers: 16 x 256 x `DL_QB` values.
 const QUANT_MAX_K: u32 = 16 * 256 * 5;
-const SMEM_W8A8: u32 = 3 * (8192 + 2 * 8192);
-const SMEM_W4A8: u32 = LOWP_EPILOGUE;
+const SMEM_W8A8: u32 = 4 * (8192 + 2 * 8192);
+const SMEM_W4A8: u32 = 4 * (8192 + 2 * (4096 + 512));
 const CTAS_PER_SM: u32 = 2;
 /// Per-CTA cost of streaming its weight tile, in token tiles' worth of work
 /// (`chunks`).
@@ -78,8 +77,10 @@ impl LowpMix {
         ("qkv8", Self::ATTN_QKV << Self::A8),
         ("o8", Self::ATTN_O << Self::A8),
     ];
-    /// `ATLAS_DENSE_PREFILL_LOWP=1`.
-    pub const DEFAULT: Self = Self(0x3f);
+    /// `ATLAS_DENSE_PREFILL_LOWP=1`: W4A4 MLP and W8A8 GDN. On the d3 oracle
+    /// these stay within the old default kernels' distance from d3's BF16
+    /// runtime; NVFP4 tokens on the attention projections as well do not.
+    pub const DEFAULT: Self = Self(Self::GATE_UP | Self::DOWN | Self::GDN_QKVZ | Self::GDN_OUT);
 
     pub fn parse(v: &str) -> Self {
         match v.trim() {
@@ -563,7 +564,25 @@ mod gpu_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::{LOWP_ROWS, ROWS, chunks};
+    use super::{LOWP_ROWS, LowpMix, ROWS, chunks};
+
+    #[test]
+    fn lowp_mix_parses_groups_and_formats() {
+        assert_eq!(LowpMix::parse("0"), LowpMix(0));
+        assert_eq!(LowpMix::parse(""), LowpMix(0));
+        let d = LowpMix::parse("1");
+        assert!(d.has(LowpMix::GATE_UP) && d.has(LowpMix::DOWN) && d.has(LowpMix::GDN_QKVZ));
+        assert!(!d.has(LowpMix::ATTN_QKV) && !d.has_a8(LowpMix::GATE_UP));
+        let m = LowpMix::parse(" gu8, dn8 ,gout,bogus");
+        assert!(m.has_a8(LowpMix::GATE_UP) && m.has_a8(LowpMix::DOWN) && m.has(LowpMix::GDN_OUT));
+        assert!(
+            !m.has(LowpMix::GATE_UP) && !m.has(LowpMix::GDN_QKVZ) && !m.has_a8(LowpMix::ATTN_O)
+        );
+        assert_eq!(
+            LowpMix::parse("all"),
+            LowpMix::parse("gu,dn,qkv,o,qkvz,gout")
+        );
+    }
 
     #[test]
     fn chunks_stay_within_the_kernel_tile_and_fill_short_grids() {

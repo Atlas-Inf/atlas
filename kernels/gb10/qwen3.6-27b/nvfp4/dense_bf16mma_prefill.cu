@@ -115,6 +115,24 @@ __device__ __forceinline__ void dl_cp4(void* dst, const void* src, bool pred) {
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" :: "r"(d), "l"(src), "r"(pred ? 4 : 0));
 }
 
+// mbarriers for the low-precision pipeline.
+__device__ __forceinline__ void dl_mbar_init(unsigned long long* b, unsigned int count) {
+    asm volatile("mbarrier.init.shared.b64 [%0], %1;" :: "r"((unsigned int)__cvta_generic_to_shared(b)), "r"(count));
+}
+// Arrives on b once this thread's cp.async copies so far have landed.
+__device__ __forceinline__ void dl_cp_arrive(unsigned long long* b) {
+    asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];" :: "r"((unsigned int)__cvta_generic_to_shared(b)));
+}
+__device__ __forceinline__ void dl_mbar_arrive(unsigned long long* b) {
+    asm volatile("{\n\t.reg .b64 st;\n\tmbarrier.arrive.shared.b64 st, [%0];\n\t}"
+                 :: "r"((unsigned int)__cvta_generic_to_shared(b)) : "memory");
+}
+__device__ __forceinline__ void dl_mbar_wait(unsigned long long* b, unsigned int parity) {
+    asm volatile("{\n\t.reg .pred p;\n\tWAIT_%=:\n\t"
+                 "mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n\t@!p bra WAIT_%=;\n\t}"
+                 :: "r"((unsigned int)__cvta_generic_to_shared(b)), "r"(parity) : "memory");
+}
+
 __device__ __forceinline__ void dl_mma_f4(float c[4], const unsigned int (&a)[4], unsigned int b0, unsigned int b1,
                                           unsigned int sa, unsigned int sb) {
     asm volatile(
@@ -513,29 +531,45 @@ __device__ __forceinline__ void db_body(
             if (s < ksteps) issue_w(s);
             bm_commit();
         }
-    } else {
+    }
+    if constexpr (AF != DB_A_BF16) {
+        // Split barriers instead of one CTA barrier per stage: full[b] counts
+        // every thread's copies into buffer b (cp.async.mbarrier.arrive), and
+        // empty[b] every thread done reading it, so a warp can run up to a
+        // stage ahead of the slowest.
+        __shared__ __align__(8) unsigned long long full[WST], empty[WST];
+        if (tid == 0) {
+            #pragma unroll
+            for (int b = 0; b < WST; b++) {
+                dl_mbar_init(&full[b], NT);
+                dl_mbar_init(&empty[b], NT);
+            }
+            asm volatile("fence.mbarrier_init.release.cluster;");
+        }
+        __syncthreads();
         #pragma unroll
         for (int s = 0; s < WST - 1; s++) {
             if (s < ksteps) {
                 issue_tok(s);
                 issue_w(s);
             }
-            bm_commit();
+            dl_cp_arrive(&full[s]);
         }
-    }
-    if constexpr (AF != DB_A_BF16) {
         // The tile count is fixed per CTA: one loop per count.
         auto kloop = [&](auto ttc) {
             constexpr int TT = decltype(ttc)::value;
             for (int s = 0; s < ksteps; s++) {
-                bm_wait<WST - 2>();
-                __syncthreads();
-                if (s + WST - 1 < ksteps) {
-                    issue_tok(s + WST - 1);
-                    issue_w(s + WST - 1);
+                const int b = s % WST;
+                dl_mbar_wait(&full[b], (s / WST) & 1);
+                dl_stage<WF, AF, FUSED, TT, HV, TTM>(tk[b], &wt[b], half, acc, warp, g, t);
+                dl_mbar_arrive(&empty[b]);
+                const int sn = s + WST - 1;    // into buffer (s - 1) % WST
+                if (sn < ksteps) {
+                    if (sn >= WST) dl_mbar_wait(&empty[sn % WST], (sn / WST - 1) & 1);
+                    issue_tok(sn);
+                    issue_w(sn);
+                    dl_cp_arrive(&full[sn % WST]);
                 }
-                bm_commit();
-                dl_stage<WF, AF, FUSED, TT, HV, TTM>(tk[s % TST], &wt[s % WST], half, acc, warp, g, t);
             }
         };
         switch (tt_valid) {
@@ -630,14 +664,19 @@ __device__ __forceinline__ void db_body(
 #define DB_HV 2
 #define DB_NV_WST 3
 #define DB_F8_WST 2
-// Low-precision kernels: one CTA per SM, 128-row chunks; the 128 x 264 BF16
-// epilogue tile (66 KiB) bounds the stages: W4A4 4 x 13.5 KiB, W8A8
-// 3 x 24 KiB, W4A8 3 x 17 KiB.
+// Low-precision kernels: one CTA per SM, 128-row chunks, four stages:
+// W4A4 4 x 13.5 KiB (under the 66 KiB 128 x 264 BF16 epilogue tile), W8A8
+// 4 x 24 KiB, W4A8 4 x 17 KiB. Measured at the 27B shapes: W4A4 five or six
+// stages and W8A8 / W4A8 three are slower.
 #ifndef DL_NV_WST
 #define DL_NV_WST 4
 #endif
-#define DL_F8_WST 3
-#define DL_W4A8_WST 3
+#ifndef DL_F8_WST
+#define DL_F8_WST 4
+#endif
+#ifndef DL_W4A8_WST
+#define DL_W4A8_WST 4
+#endif
 
 // Shared memory: 2 * sizeof(DbTok) + WST * sizeof(DbW<WF, HV>) bytes (dynamic).
 // Grid: (N / (128 HV)) * nchunks CTAs (FUSED: N = inter, N / (64 HV)), block
