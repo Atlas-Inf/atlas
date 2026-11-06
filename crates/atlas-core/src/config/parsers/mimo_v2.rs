@@ -122,9 +122,11 @@ pub(crate) fn parse_mimo_v2(raw: &Value) -> Result<ModelConfig> {
             .collect();
     }
 
-    // ── MTP: shipped in model_mtp.safetensors; not wired yet (phase 3) ──
-    config.mtp_num_hidden_layers = 0;
-    config.num_mtp_modules = 0;
+    // ── MTP: three single-layer draft modules in model_mtp.safetensors ──
+    let mtp = get_u("num_nextn_predict_layers").unwrap_or(0);
+    config.num_mtp_modules = mtp;
+    config.mtp_num_hidden_layers = mtp;
+    config.mtp_transformer_layers = 1;
 
     finalize_config(&mut config, raw)?;
     Ok(config)

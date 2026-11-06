@@ -33,6 +33,8 @@ fn parses_published_mimo_v2_6_flash() {
     assert_eq!(c.mlp_only_layers, vec![0]);
     assert_eq!(c.vocab_size, 152576);
     assert_eq!(c.eos_token_id, 151645);
+    assert_eq!(c.num_mtp_modules, 3);
+    assert_eq!(c.mtp_num_hidden_layers, 3);
     assert!(c.vision.is_none());
     let full: Vec<usize> = c
         .layer_types

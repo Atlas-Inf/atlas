@@ -16,7 +16,8 @@
 //!     (F32), `mlp.experts.E.{gate,up,down}_proj` native MXFP4 (U8 nibbles +
 //!     E8M0 `weight_scale`, group 32) landed transcode-free.
 //!
-//! Vision, audio and MTP tensors are skipped (phase 1: text, no speculation).
+//! Vision and audio tensors are skipped. `model.mtp.*` stays loadable; the
+//! server-side `skip_mtp` policy drops it unless `--speculative` runs on rank 0.
 
 use anyhow::{Context, Result, bail, ensure};
 use atlas_core::config::{LayerType, ModelConfig};
@@ -39,10 +40,13 @@ use crate::weight_map::{
 };
 
 /// The published checkpoint stores fused QKV pre-sharded for TP=4.
-const QKV_TP_CHUNKS: usize = 4;
+pub(super) const QKV_TP_CHUNKS: usize = 4;
 /// Upper bound on concurrently decoded sequences the split-K scratch covers;
 /// beyond it decode falls back to fewer splits.
-const MAX_DECODE_SEQS: usize = 64;
+pub(super) const MAX_DECODE_SEQS: usize = 64;
+
+pub(crate) mod mtp;
+pub(crate) use mtp::load_mimo_mtp_modules;
 
 pub struct MimoV2WeightLoader;
 
@@ -59,7 +63,7 @@ fn layer_kv_heads(config: &ModelConfig, layer: usize) -> usize {
 }
 
 /// Load the TP-chunked fused QKV as BF16 `[4 * chunk_rows, hidden]`.
-fn load_qkv_chunked(
+pub(super) fn load_qkv_chunked(
     store: &WeightStore,
     prefix: &str,
     nq: usize,
@@ -135,7 +139,7 @@ fn load_qkv_chunked(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn load_dense_ffn(
+pub(super) fn load_dense_ffn(
     store: &WeightStore,
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
@@ -244,15 +248,10 @@ impl ModelWeightLoader for MimoV2WeightLoader {
     }
 
     fn dead_namespaces(&self, _config: &ModelConfig) -> Vec<String> {
-        [
-            "visual.",
-            "audio_encoder.",
-            "speech_embeddings.",
-            "model.mtp.",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+        ["visual.", "audio_encoder.", "speech_embeddings."]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     fn kv_layer_dims(&self, config: &ModelConfig) -> Vec<(usize, usize)> {
@@ -423,7 +422,8 @@ impl ModelWeightLoader for MimoV2WeightLoader {
         _config: &ModelConfig,
         _gpu: &dyn GpuBackend,
     ) -> Result<Option<MtpWeights>> {
-        // model_mtp.safetensors ships 3 MTP layers; wiring them is phase 3.
+        // MiMo MTP bodies are loaded by `load_mimo_mtp_modules`, not the
+        // Qwen-shaped `MtpWeights` path.
         Ok(None)
     }
 }

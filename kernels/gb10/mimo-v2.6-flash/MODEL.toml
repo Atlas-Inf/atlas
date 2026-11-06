@@ -16,8 +16,8 @@
 # overlay carrying the 192/128 attention kernels (see
 # crates/spark-model/src/layers/qwen3_attention/mimo.rs).
 #
-# Phase 1 (this target): text only, BF16 KV, EP=2. MTP (3 modules in
-# model_mtp.safetensors) and the vision / audio towers are not wired.
+# Text-only serving; MTP ships in model_mtp.safetensors and is loaded only
+# with `--speculative` on rank 0. Vision/audio towers are not wired.
 
 [model]
 name = "mimo-v2.6-flash"
@@ -79,6 +79,7 @@ enable_loop_watchdog = true
 thinking_default = false
 # The MiMo attention path (mimo.rs) only reads/writes a BF16 paged cache.
 default_kv_dtype = "bf16"
+default_num_drafts = 3
 
 # Dense-FFN probes alternate prefill families before settling on the compiled
 # NVFP4 path. The alternate families are opt-in or handle-gated and are not

@@ -5,7 +5,7 @@
 # rank holds half of the 256 experts (~89 GB). Phase 1 limits:
 #   * --kv-cache-dtype bf16 only (the QK192/V128 attention kernels read a
 #     BF16 paged cache; the loader rejects other KV dtypes)
-#   * --speculative off (the 3 MTP modules are not wired yet)
+#   * --speculative is optional (SPECULATIVE=1; the 3 MTP modules run on rank 0)
 #   * text only (vision / audio towers are skipped at load)
 #   * --max-batch-size 1 by default (MAX_BATCH); raise once single-stream output is clean
 #
@@ -27,6 +27,11 @@ MAX_BATCH="${MAX_BATCH:-1}"
 TP_SIZE="${TP_SIZE:-1}"
 EP_SIZE="${EP_SIZE:-2}"
 EXTRA_FLAGS="${EXTRA_FLAGS:-}"
+SPECULATIVE="${SPECULATIVE:-0}"
+NUM_DRAFTS="${NUM_DRAFTS:-3}"
+if [ "$SPECULATIVE" = "1" ]; then
+  EXTRA_FLAGS="--speculative --num-drafts $NUM_DRAFTS $EXTRA_FLAGS"
+fi
 
 echo "=== Atlas MiMo-V2.6-Flash EP=2 bring-up (RDMA-enabled) ==="
 echo "Model:   $MODEL"

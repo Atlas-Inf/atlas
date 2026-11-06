@@ -44,6 +44,7 @@ pub use glm5::mode as glm5_mode;
 pub use laguna::LagunaWeightLoader;
 pub use longcat::LongcatWeightLoader;
 pub use mimo_v2::MimoV2WeightLoader;
+pub(crate) use mimo_v2::load_mimo_mtp_modules;
 pub use minimax::MinimaxM2WeightLoader;
 pub use nemotron::NemotronHWeightLoader;
 pub use nllb::NllbWeightLoader;

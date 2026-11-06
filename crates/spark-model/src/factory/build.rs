@@ -399,6 +399,25 @@ pub fn build_model(
     let q4e_mtp_embed = embed;
     let q4e_mtp_lm_head = lm_head;
 
+    // MiMo-V2 ships three dense-FFN sliding-window MTP bodies under
+    // `model.mtp.layers.*`, not the Qwen-shaped `MtpWeights`. Rank 0 owns the
+    // proposer; all other ranks skip the namespace at upload.
+    let mimo_mtp_modules =
+        if config.model_type == "mimo_v2" && use_speculative && config.ep_rank == 0 {
+            match crate::weight_loader::load_mimo_mtp_modules(&store, &config, gpu.as_ref()) {
+                Ok(modules) => modules,
+                Err(e) => {
+                    tracing::error!("mimo_v2 MTP module load FAILED: {e:#}");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+    let mimo_mtp_loaded = !mimo_mtp_modules.is_empty();
+    let mimo_mtp_embed = embed;
+    let mimo_mtp_lm_head = lm_head;
+
     // Capability warning: user asked for `--speculative` but the model has no
     // MTP head bundled, so speculative decoding will silently no-op. Surface
     // this loudly so the user knows the flag was inert. Rank 0 only: the
@@ -410,6 +429,7 @@ pub fn build_model(
         && v4_mtp_module.is_none()
         && !q4e_mtp_loaded
         && !native_glm_mtp
+        && !mimo_mtp_loaded
     {
         tracing::warn!(
             "`--speculative` was requested but no MTP weights were loaded for this \
@@ -1096,8 +1116,10 @@ pub fn build_model(
     // first propose read freed memory under `--lm-head-dtype nvfp4` (#264:
     // illegal address in run_mtp_propose_multi; the fp8 and bf16 heads never
     // reach this free, and NUM_DRAFTS=0 never reads the head).
-    let drafter_holds_bf16_head =
-        q4e_mtp_loaded || v4_mtp_module.is_some() || glm5_mtp_head.is_some();
+    let drafter_holds_bf16_head = q4e_mtp_loaded
+        || v4_mtp_module.is_some()
+        || glm5_mtp_head.is_some()
+        || mimo_mtp_loaded;
     let lm_head = if !drafter_holds_bf16_head
         && super::lm_head_setup::bf16_lm_head_is_dead(
             lm_head.weight,
@@ -1239,6 +1261,33 @@ pub fn build_model(
                     "Failed to build qwen4_exp MTP proposer: {e:#}. Speculative decoding disabled."
                 );
             }
+        }
+    }
+
+    // ── Step 6d: MiMo-V2 MTP proposer (optional) ──
+    if !mimo_mtp_modules.is_empty() {
+        match crate::layers::MimoMtpHead::new(
+            mimo_mtp_modules,
+            mimo_mtp_embed,
+            mimo_mtp_lm_head,
+            model.gpu_backend(),
+            model.config_ref(),
+            max_seq_len,
+            kv_block_size,
+            mtp_vocab_size as usize,
+            max_batch_size,
+            num_kv_blocks,
+        ) {
+            Ok(head) => {
+                let modules = head.num_modules();
+                model.set_dflash_proposer(std::sync::Arc::new(head));
+                tracing::info!(
+                    "mimo_v2 MTP speculative decoding: ENABLED ({modules} modules, dense-FFN SWA bodies)"
+                );
+            }
+            Err(e) => tracing::warn!(
+                "Failed to build mimo_v2 MTP proposer: {e:#}. Speculative decoding disabled."
+            ),
         }
     }
 

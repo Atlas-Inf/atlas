@@ -414,12 +414,11 @@ fn skip_activation_scales(config: &ModelConfig) -> bool {
 /// against, and on a box where 0.90 utilization is already near the boot floor
 /// it is the difference between a usable KV cache and none.
 fn skip_mtp(config: &ModelConfig, args: &cli::ServeArgs) -> bool {
-    // qwen4_exp now BUILDS an MTP head, but only under `--speculative`
-    // (`weight_loader/qwen4_exp/mtp.rs`). Without the flag the `mtp.*` upload is
-    // 5.21 GB of BF16 held resident for nothing, which on a 119.6 GB unified box
-    // comes straight out of the KV cache. With the flag it is the drafter, on
-    // rank 0 only (`factory::build`): every other rank skips it as well.
-    matches!(config.model_type.as_str(), "qwen4_exp") && (!args.speculative || config.ep_rank != 0)
+    // qwen4_exp and mimo_v2 both have rank-0-only dedicated MTP loaders. Their
+    // checkpoints ship the draft weights under `mtp.*` and `model.mtp.*`
+    // respectively; the tensor-name predicate below covers both spellings.
+    matches!(config.model_type.as_str(), "qwen4_exp" | "mimo_v2")
+        && (!args.speculative || config.ep_rank != 0)
 }
 
 #[cfg(test)]
@@ -438,6 +437,22 @@ mod tests {
         };
         let mut config = ModelConfig::qwen3_next_80b_nvfp4();
         config.model_type = "qwen4_exp".to_string();
+        assert!(skip_mtp(&config, &args(&[])));
+        assert!(!skip_mtp(&config, &args(&["--speculative"])));
+        config.ep_rank = 1;
+        assert!(skip_mtp(&config, &args(&["--speculative"])));
+    }
+
+    /// MiMo's `model.mtp.*` (three draft bodies) has the same rank-0-only /
+    /// flag-gated upload policy, with a different tensor namespace.
+    #[test]
+    fn mimo_mtp_is_uploaded_on_the_drafting_rank_only() {
+        let args = |more: &[&str]| {
+            let argv = ["spark", "some/model"].iter().chain(more);
+            crate::cli::ServeArgs::parse_from(argv)
+        };
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "mimo_v2".to_string();
         assert!(skip_mtp(&config, &args(&[])));
         assert!(!skip_mtp(&config, &args(&["--speculative"])));
         config.ep_rank = 1;
