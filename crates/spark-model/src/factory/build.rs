@@ -1120,7 +1120,7 @@ pub fn build_model(
     {
         anyhow::ensure!(
             bytes.len() == config.hidden_size * 2
-                && (sub.mask_token_id as usize) < config.vocab_size,
+                && (sub.mask_token_id as usize) < args.drafter_config.vocab_size,
             "DFlash mask embedding does not fit the target embedding table"
         );
         let row = embed
