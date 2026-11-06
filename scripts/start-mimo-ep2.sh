@@ -50,6 +50,10 @@ fi
 MOE_ROWS="${MOE_ROWS:-0}"
 MOE_ROWS_ENV=""
 [ "$MOE_ROWS" = "1" ] && MOE_ROWS_ENV="-e ATLAS_MOE_ROWS_DECODE=1"
+INTHINK_ENV=""
+if [ -n "${ATLAS_INTHINK_TOOL_LEAK_OPENERS+x}" ]; then
+  INTHINK_ENV="-e ATLAS_INTHINK_TOOL_LEAK_OPENERS=$ATLAS_INTHINK_TOOL_LEAK_OPENERS"
+fi
 DFLASH="${DFLASH:-0}"
 # Block size 8 (7 drafts per step) and the trained 1024-token sliding window.
 DFLASH_GAMMA="${DFLASH_GAMMA:-8}"
@@ -117,6 +121,7 @@ sudo docker run -d \
   -e RUST_LOG=info \
   $SWA_EVICT_ENV \
   $MOE_ROWS_ENV \
+  $INTHINK_ENV \
   ${ATLAS_PROFILE_FIRST:+-e ATLAS_PROFILE_FIRST=$ATLAS_PROFILE_FIRST} \
   -v "${HOME}/.cache/huggingface:/root/.cache/huggingface" \
   "$IMAGE" serve "$MODEL" \
@@ -148,6 +153,7 @@ ssh "$WORKER_IP" "sudo docker run -d \
   -e RUST_LOG=info \
   $SWA_EVICT_ENV \
   $MOE_ROWS_ENV \
+  $INTHINK_ENV \
   ${ATLAS_PROFILE_FIRST:+-e ATLAS_PROFILE_FIRST=$ATLAS_PROFILE_FIRST} \
   -v \"\${HOME}/.cache/huggingface:/root/.cache/huggingface\" \
   $IMAGE serve $MODEL \
