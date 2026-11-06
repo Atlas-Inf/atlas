@@ -69,26 +69,44 @@ __device__ __forceinline__ unsigned bf16w_to_f16x2(uint32_t w) {
 }
 
 // One KV tile [kv_s, kv_s + BC) of one head into a pitch-HP smem tile (the
-// BF16 LOAD_KV_TILE of inferspark_prefill_paged_batched.cu).
+// BF16 LOAD_KV_TILE of inferspark_prefill_paged_batched.cu). Thread t copies
+// 16 bytes of rows t / 32 + 8 j; with a power-of-two page of at least 8 rows
+// its rows j and j + 1 share a page, so each pair costs one table read.
 __device__ __forceinline__ void load_kv(__nv_bfloat16 (*dst)[HP], const __nv_bfloat16* cache, const int* bt,
                                         unsigned kv_s, unsigned kv_l, unsigned kvh, unsigned cbs,
                                         unsigned num_kv_heads, unsigned tid) {
     const unsigned long long ps = (unsigned long long)cbs * num_kv_heads * HD;
     const unsigned long long rs = (unsigned long long)num_kv_heads * HD;
-    // A power-of-two block size (the usual 16) takes shifts, not divisions.
-    const bool pow2 = (cbs & (cbs - 1)) == 0;
+    const unsigned r0 = tid / (HD / 8), col = (tid % (HD / 8)) * 8;
+    const bool pow2 = (cbs & (cbs - 1)) == 0 && cbs >= 16 && (kv_s & 7) == 0;
     const unsigned sh = __ffs(cbs) - 1;
+    const __nv_bfloat16* base = cache + kvh * HD + col;
+    if (pow2) {
 #pragma unroll
-    for (unsigned j = 0; j < KV_CHUNKS / 256; j++) {
-        const unsigned i = tid + 256 * j;
-        const unsigned row = i / (HD / 8), col = (i % (HD / 8)) * 8;
-        const unsigned pos = kv_s + row;
-        if (pos < kv_l) {
-            const unsigned lb = pow2 ? pos >> sh : pos / cbs, bo = pow2 ? pos & (cbs - 1) : pos % cbs;
-            const unsigned pb = (unsigned)bt[lb];
-            cp16(&dst[row][col], cache + pb * ps + bo * rs + kvh * HD + col);
-        } else {
-            *reinterpret_cast<uint4*>(&dst[row][col]) = make_uint4(0, 0, 0, 0);
+        for (unsigned j = 0; j < 4; j += 2) {
+            // rows r0 + 8 j and r0 + 8 j + 8 lie in one 16-row-aligned window
+            const unsigned pos = kv_s + r0 + 8 * j;
+            const unsigned pb = (unsigned)bt[pos >> sh];
+#pragma unroll
+            for (unsigned h = 0; h < 2; h++) {
+                const unsigned p = pos + 8 * h, row = r0 + 8 * (j + h);
+                if (p < kv_l) {
+                    const unsigned pg = (p >> sh) == (pos >> sh) ? pb : (unsigned)bt[p >> sh];
+                    cp16(&dst[row][col], base + pg * ps + (p & (cbs - 1)) * rs);
+                } else {
+                    *reinterpret_cast<uint4*>(&dst[row][col]) = make_uint4(0, 0, 0, 0);
+                }
+            }
+        }
+    } else {
+#pragma unroll
+        for (unsigned j = 0; j < 4; j++) {
+            const unsigned row = r0 + 8 * j, p = kv_s + row;
+            if (p < kv_l) {
+                cp16(&dst[row][col], base + (unsigned)bt[p / cbs] * ps + (p % cbs) * rs);
+            } else {
+                *reinterpret_cast<uint4*>(&dst[row][col]) = make_uint4(0, 0, 0, 0);
+            }
         }
     }
 }
