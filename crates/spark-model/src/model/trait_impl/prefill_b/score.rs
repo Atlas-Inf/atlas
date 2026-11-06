@@ -108,8 +108,9 @@ impl TransformerModel {
         for seq in seqs.iter_mut() {
             // Score sequences never populate `tokens`, so the prefix-cache
             // release in `free_sequence` is a no-op; the KV refs (shared head
-            // blocks included) and the SSM slot are returned here.
-            if let Err(e) = self.free_sequence(seq) {
+            // blocks included) and the SSM slot are returned here, the slot
+            // unzeroed (its next claim zeroes what it reads).
+            if let Err(e) = self.free_sequence_dispatch(seq, false) {
                 tracing::error!("score: free_sequence: {e:#}");
             }
         }
