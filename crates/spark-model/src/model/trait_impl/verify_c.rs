@@ -286,7 +286,10 @@ impl TransformerModel {
                 }
                 let layer_type = self.config.layer_type(layer_idx);
 
-                if layer_type == LayerType::FullAttention {
+                if matches!(
+                    layer_type,
+                    LayerType::FullAttention | LayerType::SlidingAttention
+                ) {
                     if hss_engaged {
                         // HSS path: decode_multi_seq's paged-decode kernel
                         // reads K/V from HBM only, missing the long-context

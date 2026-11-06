@@ -199,7 +199,10 @@ impl TransformerModel {
             )?;
         }
         for (i, l) in self.layers.iter().enumerate() {
-            if self.config.layer_type(i) == LayerType::FullAttention {
+            if matches!(
+                self.config.layer_type(i),
+                LayerType::FullAttention | LayerType::SlidingAttention
+            ) {
                 l.rollback_aux_verify(
                     seq.layer_states[i].as_mut(),
                     0,
