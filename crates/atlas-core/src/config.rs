@@ -24,6 +24,13 @@ pub enum LayerType {
     Moe,
 }
 
+impl LayerType {
+    /// Softmax attention layer (full or sliding-window).
+    pub fn is_softmax_attention(self) -> bool {
+        matches!(self, Self::FullAttention | Self::SlidingAttention)
+    }
+}
+
 /// Model configuration parsed from HuggingFace config.json.
 ///
 /// Single source of truth for model dimensions. All kernel launch

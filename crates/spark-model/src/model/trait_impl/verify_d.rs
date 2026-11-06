@@ -289,10 +289,8 @@ impl TransformerModel {
                 }
                 let t0 = Instant::now();
 
-                if matches!(
-                    layer_type,
-                    LayerType::FullAttention | LayerType::SlidingAttention
-                ) && let Some(ref prefill_ctx) = glm_prefill_ctx
+                if layer_type.is_softmax_attention()
+                    && let Some(ref prefill_ctx) = glm_prefill_ctx
                 {
                     layer.prefill(
                         hidden,
@@ -308,10 +306,7 @@ impl TransformerModel {
                         prefill_ctx,
                         stream,
                     )?;
-                } else if matches!(
-                    layer_type,
-                    LayerType::FullAttention | LayerType::SlidingAttention
-                ) {
+                } else if layer_type.is_softmax_attention() {
                     if hss_engaged {
                         // HSS path: decode_multi_seq's paged-decode kernel
                         // reads K/V from HBM only, missing the long-context
@@ -375,10 +370,7 @@ impl TransformerModel {
                 if let Some(started) = layer_started {
                     self.gpu.synchronize(stream)?;
                     let elapsed = started.elapsed().as_micros();
-                    if matches!(
-                        layer_type,
-                        LayerType::FullAttention | LayerType::SlidingAttention
-                    ) {
+                    if layer_type.is_softmax_attention() {
                         attn_us += elapsed;
                         attn_layers += 1;
                     } else {

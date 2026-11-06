@@ -1116,10 +1116,8 @@ pub fn build_model(
     // first propose read freed memory under `--lm-head-dtype nvfp4` (#264:
     // illegal address in run_mtp_propose_multi; the fp8 and bf16 heads never
     // reach this free, and NUM_DRAFTS=0 never reads the head).
-    let drafter_holds_bf16_head = q4e_mtp_loaded
-        || v4_mtp_module.is_some()
-        || glm5_mtp_head.is_some()
-        || mimo_mtp_loaded;
+    let drafter_holds_bf16_head =
+        q4e_mtp_loaded || v4_mtp_module.is_some() || glm5_mtp_head.is_some() || mimo_mtp_loaded;
     let lm_head = if !drafter_holds_bf16_head
         && super::lm_head_setup::bf16_lm_head_is_dead(
             lm_head.weight,

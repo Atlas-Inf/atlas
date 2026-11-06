@@ -427,36 +427,22 @@ mod tests {
     use atlas_core::config::ModelConfig;
     use clap::Parser as _;
 
-    /// qwen4_exp's `mtp.*` (5.21 GB) is uploaded only where it drafts: rank 0
-    /// under `--speculative`.
+    /// qwen4_exp's `mtp.*` (5.21 GB) and MiMo's `model.mtp.*` are uploaded only
+    /// where they draft: rank 0 under `--speculative`.
     #[test]
-    fn qwen4_exp_mtp_is_uploaded_on_the_drafting_rank_only() {
+    fn dedicated_mtp_is_uploaded_on_the_drafting_rank_only() {
         let args = |more: &[&str]| {
             let argv = ["spark", "some/model"].iter().chain(more);
             crate::cli::ServeArgs::parse_from(argv)
         };
-        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
-        config.model_type = "qwen4_exp".to_string();
-        assert!(skip_mtp(&config, &args(&[])));
-        assert!(!skip_mtp(&config, &args(&["--speculative"])));
-        config.ep_rank = 1;
-        assert!(skip_mtp(&config, &args(&["--speculative"])));
-    }
-
-    /// MiMo's `model.mtp.*` (three draft bodies) has the same rank-0-only /
-    /// flag-gated upload policy, with a different tensor namespace.
-    #[test]
-    fn mimo_mtp_is_uploaded_on_the_drafting_rank_only() {
-        let args = |more: &[&str]| {
-            let argv = ["spark", "some/model"].iter().chain(more);
-            crate::cli::ServeArgs::parse_from(argv)
-        };
-        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
-        config.model_type = "mimo_v2".to_string();
-        assert!(skip_mtp(&config, &args(&[])));
-        assert!(!skip_mtp(&config, &args(&["--speculative"])));
-        config.ep_rank = 1;
-        assert!(skip_mtp(&config, &args(&["--speculative"])));
+        for model_type in ["qwen4_exp", "mimo_v2"] {
+            let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+            config.model_type = model_type.to_string();
+            assert!(skip_mtp(&config, &args(&[])));
+            assert!(!skip_mtp(&config, &args(&["--speculative"])));
+            config.ep_rank = 1;
+            assert!(skip_mtp(&config, &args(&["--speculative"])));
+        }
     }
 
     #[test]
