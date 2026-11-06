@@ -16,6 +16,7 @@
 
 pub(crate) mod deepseek_v4;
 pub mod dflash_loader;
+pub mod dflash_mask_embedding;
 pub mod dflash_preshrink;
 mod gemma4;
 pub(crate) mod glm5;

@@ -85,6 +85,14 @@ pub struct DflashConfig {
     /// NVIDIA LiLiCorr drafters ship their own `lm_head` (`Some(true)`);
     /// generic DFlash drafters omit the key and share the target's head.
     pub has_own_lm_head: Option<bool>,
+    /// Fraction of `head_dim` RoPE rotates (MiMo drafter: 0.5); absent means
+    /// the full head, as in HF.
+    #[serde(default)]
+    pub partial_rotary_factor: Option<f32>,
+    /// Learned mask-token embedding (`mask_embedding.pt`, raw BF16), written
+    /// into the target's `mask_token_id` row when the drafter ships one.
+    #[serde(skip)]
+    pub mask_embedding: Option<Vec<u8>>,
 }
 
 fn default_rope_theta() -> f32 {
@@ -157,6 +165,9 @@ pub struct DflashSubConfig {
     /// When `Some(true)`, each layer must ship `self_attn.attention_sink_bias`.
     #[serde(default)]
     pub attention_sink_bias: Option<bool>,
+    /// Scale on V (MiMo drafter: 0.612), folded into `v_proj` at load.
+    #[serde(default)]
+    pub attention_value_scale: Option<f32>,
     #[serde(default)]
     pub sample_from_anchor: Option<bool>,
     #[serde(
@@ -192,6 +203,20 @@ pub struct DflashSubConfig {
 }
 
 impl DflashConfig {
+    /// Rotated dims per head: `head_dim * partial_rotary_factor`, even.
+    pub fn rotary_dim(&self) -> usize {
+        let factor = self.partial_rotary_factor.unwrap_or(1.0);
+        ((self.head_dim as f32 * factor).round() as usize) & !1
+    }
+
+    /// `dflash_config.attention_value_scale`; absent means unscaled V.
+    pub fn attention_value_scale(&self) -> f32 {
+        self.dflash_config
+            .as_ref()
+            .and_then(|c| c.attention_value_scale)
+            .unwrap_or(1.0)
+    }
+
     pub fn block_size(&self) -> usize {
         self.dflash_config
             .as_ref()

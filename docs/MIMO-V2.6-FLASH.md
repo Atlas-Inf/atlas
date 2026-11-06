@@ -83,6 +83,23 @@ For any failure, include:
   added to both containers' env and send that log too.
 - `nvidia-smi` memory after load on both nodes.
 
+## Native DFlash drafter (`dflash/`)
+
+The checkpoint ships Xiaomi's DFlash drafter: 5 non-causal SWA-1024 layers,
+block size 8 (7 drafts per step), taps on target layers `[0,11,23,35,47]`,
+sink bias, V scale 0.612 (folded into `v_proj` at load), RoPE on the first 64
+of 128 head dims. Its trained mask-token vector (`mask_embedding.pt`) replaces
+the target's zero `mask_token_id` (151675) row, as SGLang does.
+
+```bash
+hf download XiaomiMiMo/MiMo-V2.6-Flash-RL --include 'dflash/*'   # both nodes
+DFLASH=1 bash scripts/start-mimo-ep2.sh   # adds --dflash --draft-model <snapshot>/dflash --dflash-gamma 8 --dflash-window-size 1024
+```
+
+`--dflash` and `--speculative` (MTP) are mutually exclusive. Report the
+acceptance rate (`DFlash` lines in the rank-0 log) and tok/s against serial
+and MTP K=1 on the same prompts.
+
 ## Known risk areas to watch
 
 1. Missing-kernel errors at startup (kernel audit / `gpu.kernel` lookup) —

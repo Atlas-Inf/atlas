@@ -1094,6 +1094,28 @@ pub fn build_model(
     // shares embed_tokens + lm_head with the target). DenseWeight is Copy
     // so this clones the device pointer cheaply.
     let target_embed_for_dflash = embed.weight;
+    // A drafter's trained mask vector replaces the target's (untrained,
+    // zero on MiMo) `mask_token_id` row, as SGLang's DFlash worker does.
+    if let Some(args) = dflash_args.as_ref()
+        && let (Some(bytes), Some(sub)) = (
+            args.drafter_config.mask_embedding.as_deref(),
+            args.drafter_config.dflash_config.as_ref(),
+        )
+    {
+        anyhow::ensure!(
+            bytes.len() == config.hidden_size * 2
+                && (sub.mask_token_id as usize) < config.vocab_size,
+            "DFlash mask embedding does not fit the target embedding table"
+        );
+        let row = embed
+            .weight
+            .offset(sub.mask_token_id as usize * config.hidden_size * 2);
+        gpu.copy_h2d(bytes, row)?;
+        tracing::info!(
+            "DFlash: trained mask embedding -> target row {}",
+            sub.mask_token_id
+        );
+    }
     let target_lm_head_for_dflash = lm_head.weight;
     // NVFP4 lm_head (Copy) shared with the DFlash drafter so its final logits
     // GEMM uses w4a16 instead of a BF16 dense_gemm on NVFP4-packed bytes.

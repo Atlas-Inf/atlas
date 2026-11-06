@@ -6,6 +6,9 @@
 #   * --kv-cache-dtype bf16 only (the QK192/V128 attention kernels read a
 #     BF16 paged cache; the loader rejects other KV dtypes)
 #   * --speculative is optional (SPECULATIVE=1; the 3 MTP modules run on rank 0)
+#   * --dflash is optional (DFLASH=1; the checkpoint's dflash/ drafter runs on
+#     rank 0, both ranks read its config). Needs the dflash/ files downloaded:
+#     hf download XiaomiMiMo/MiMo-V2.6-Flash-RL --include 'dflash/*'
 #   * text only (vision / audio towers are skipped at load)
 #   * --max-batch-size 1 by default (MAX_BATCH); raise once single-stream output is clean
 #
@@ -31,6 +34,19 @@ SPECULATIVE="${SPECULATIVE:-0}"
 NUM_DRAFTS="${NUM_DRAFTS:-3}"
 if [ "$SPECULATIVE" = "1" ]; then
   EXTRA_FLAGS="--speculative --num-drafts $NUM_DRAFTS $EXTRA_FLAGS"
+fi
+DFLASH="${DFLASH:-0}"
+# Block size 8 (7 drafts per step) and the trained 1024-token sliding window.
+DFLASH_GAMMA="${DFLASH_GAMMA:-8}"
+DFLASH_WINDOW="${DFLASH_WINDOW:-1024}"
+if [ "$DFLASH" = "1" ]; then
+  if [ -z "${DRAFT_MODEL:-}" ]; then
+    # dflash/ inside the target's HF snapshot, as the container sees it.
+    snap="$(ls -d "${HOME}/.cache/huggingface/hub/models--${MODEL//\//--}"/snapshots/*/dflash | head -n1)"
+    [ -f "$snap/config.json" ] || { echo "dflash/ not found in the HF cache for $MODEL" >&2; exit 1; }
+    DRAFT_MODEL="/root/.cache/huggingface/${snap#"${HOME}/.cache/huggingface/"}"
+  fi
+  EXTRA_FLAGS="--dflash --draft-model $DRAFT_MODEL --dflash-gamma $DFLASH_GAMMA --dflash-window-size $DFLASH_WINDOW $EXTRA_FLAGS"
 fi
 
 echo "=== Atlas MiMo-V2.6-Flash EP=2 bring-up (RDMA-enabled) ==="

@@ -253,15 +253,8 @@ pub(crate) fn load_dflash_drafter(
     let drafter_dir =
         crate::model_resolver::resolve_model_dir(&drafter_id, args.cache_dir.as_deref())
             .context("Failed to resolve DFlash drafter checkpoint")?;
-    let drafter_config_json = std::fs::read_to_string(drafter_dir.join("config.json"))
-        .with_context(|| {
-            format!(
-                "Failed to read drafter config.json at {}",
-                drafter_dir.display()
-            )
-        })?;
     let drafter_config =
-        spark_model::weight_loader::dflash_loader::parse_dflash_config(&drafter_config_json)?;
+        spark_model::weight_loader::dflash_mask_embedding::load_drafter_config(&drafter_dir)?;
     // Only the head proposes. A worker keeps the drafter's config (its target
     // capture layers shape the verify rows and SSM pools) but no weights, so
     // no proposer is built there and its memory goes to the KV pool. Under

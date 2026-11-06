@@ -191,6 +191,7 @@ fn load_moe(
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
     lp: &str,
+    layer: usize,
 ) -> Result<FfnComponent> {
     let p = format!("{lp}.mlp");
     let n = config.num_experts;
@@ -238,6 +239,7 @@ fn load_moe(
     let mut moe = MoeLayer::new(weights, n, None, gpu, config)?;
     moe.experts_scale_kind = WeightQuantFormat::Mxfp4E8m0;
     moe.shared_experts_scale_kind = WeightQuantFormat::Nvfp4;
+    moe.is_dflash_capture_layer = config.dflash_capture_layers.contains(&layer);
     Ok(FfnComponent::Moe(moe))
 }
 
@@ -305,7 +307,7 @@ impl ModelWeightLoader for MimoV2WeightLoader {
             let ffn = if config.mlp_only_layers.contains(&i) {
                 load_dense_ffn(store, config, gpu, &lp, absmax_k, quantize_k, stream)?
             } else {
-                load_moe(store, config, gpu, &lp)?
+                load_moe(store, config, gpu, &lp, i)?
             };
 
             let p = format!("{lp}.self_attn");
