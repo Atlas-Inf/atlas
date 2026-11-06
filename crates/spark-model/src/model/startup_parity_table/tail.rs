@@ -110,6 +110,10 @@ pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
             crate::speculative::deep_depth::deep_max_seqs,
         )
     }),
+    // One EP reduce over a batched decode step's MoE rows, not one a row.
+    ("ATLAS_MOE_ROWS_DECODE", || {
+        Ok(crate::layers::qwen3_attention::rows_moe_decode_enabled() as u64)
+    }),
     // The qwen4_exp exact batching lane: the batched MoE all-reduce shape,
     // the batched QSA-active step (instead of per-sequence decode), the
     // batched multi-sequence verify under TP, and the check's serial steps.

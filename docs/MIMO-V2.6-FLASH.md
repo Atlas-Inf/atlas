@@ -100,6 +100,15 @@ DFLASH=1 bash scripts/start-mimo-ep2.sh   # adds --dflash --draft-model <snapsho
 acceptance rate (`DFlash` lines in the rank-0 log) and tok/s against serial
 and MTP K=1 on the same prompts.
 
+## Row-batched MoE verify (`MOE_ROWS=1`)
+
+By default an 8-row speculative verify (DFlash γ=8) runs MiMo's E8M0 MoE one
+row at a time, each with its own EP all-reduce: 8 round trips per MoE layer
+instead of 1. `MOE_ROWS=1` (`ATLAS_MOE_ROWS_DECODE=1`, both ranks) routes the
+batched decode/verify FFN through `MoeLayer::forward_rows`: the same per-row
+arithmetic and one `[n, h]` all-reduce per layer. Greedy output must match
+the default exactly.
+
 ## Sliding-window KV eviction (`SWA_EVICT=1`)
 
 The 39 sliding-window layers read only their last 128 tokens. With

@@ -17,6 +17,7 @@ mod ctx;
 mod ffn;
 pub(crate) use ffn::{
     grouped_routed_decode_enabled, grouped_routed_decode_min, pairwise_moe_decode_enabled,
+    rows_moe_decode_enabled,
 };
 mod glm_long_owner;
 mod guard;

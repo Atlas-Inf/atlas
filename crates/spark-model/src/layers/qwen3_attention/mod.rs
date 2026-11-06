@@ -65,6 +65,7 @@ pub(crate) use hc_prefill_block::{SeamGather, hc_seam_overlapped};
 pub(crate) use prefill::{attn_w4a4_requested, index_split_words, write_floor_legacy};
 pub(crate) use trait_impl::{
     grouped_routed_decode_enabled, grouped_routed_decode_min, pairwise_moe_decode_enabled,
+    rows_moe_decode_enabled,
 };
 pub(crate) use types::HeadGateActivation;
 pub use types_layer::Qwen3AttentionLayer;
