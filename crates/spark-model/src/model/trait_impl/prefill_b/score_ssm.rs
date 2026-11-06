@@ -78,6 +78,79 @@ impl TransformerModel {
         Ok(dst)
     }
 
+    /// Once per pass: for every SSM layer, `[n]` state pointers then `[n]`
+    /// entry-state pointers (a branch with a head reads the head's state),
+    /// the tables `score_gdn_scan` takes. `None` without SSM layers.
+    pub(super) fn score_stage_ssm_tables(
+        &self,
+        plan: &ScorePlan,
+        seqs: &mut [SequenceState],
+        off: usize,
+        stream: u64,
+    ) -> Result<Option<DevicePtr>> {
+        let n = seqs.len();
+        let ssm: Vec<usize> = (0..self.layers.len())
+            .filter(|&l| self.layers[l].is_ssm_layer())
+            .collect();
+        if ssm.is_empty() {
+            return Ok(None);
+        }
+        ensure!(
+            off + ssm.len() * 2 * n * 8 <= self.buffers.scratch_bytes(),
+            "score: SSM pointer tables exceed scratch ({n} streams)"
+        );
+        let mut tab: Vec<u64> = Vec::with_capacity(ssm.len() * 2 * n);
+        for &l in &ssm {
+            let at = tab.len();
+            for seq in seqs.iter_mut() {
+                tab.push(ssm_ptrs(seq, l)?.0.0);
+            }
+            for i in 0..n {
+                tab.push(tab[at + plan.head_of[i].unwrap_or(i)]);
+            }
+        }
+        let bytes: Vec<u8> = tab.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let dst = self.buffers.scratch().offset(off);
+        self.gpu.copy_h2d_async_retained(&bytes, dst, stream)?;
+        Ok(Some(dst))
+    }
+
+    /// The recurrence as two single-launch scans (`score_gdn_scan`): the heads
+    /// from zero, then every branch from its head's final state read in
+    /// place (no copy). `Ok(false)`: the layer has no such scan and nothing
+    /// ran.
+    fn score_gdn_fused(
+        &self,
+        layer: &dyn TransformerLayer,
+        layer_idx: usize,
+        plan: &ScorePlan,
+        meta: &BatchedAttnMetadata,
+        gdn: &GdnPrefillBuffers,
+        branch_cu: DevicePtr,
+        tabs: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        let (n, heads, cu) = (plan.streams(), plan.heads, &meta.cu_seqlens_host);
+        let max_len = |lo: usize, hi: usize| (lo..hi).map(|b| (cu[b + 1] - cu[b]) as u32).max();
+        let g = gdn_slice(gdn, 0, cu[heads] as usize, ctx);
+        if let Some(len) = max_len(0, heads)
+            && !layer.score_gdn_scan(tabs, DevicePtr::NULL, &g, heads as u32, meta.cu_seqlens, len, ctx, stream)?
+        {
+            return Ok(false);
+        }
+        let Some(len) = max_len(heads, n) else { return Ok(true) };
+        let base = cu[heads] as usize;
+        let g = gdn_slice(gdn, base, cu[n] as usize - base, ctx);
+        let (h, init) = (tabs.offset(heads * 8), tabs.offset((n + heads) * 8));
+        let nb = (n - heads) as u32;
+        if layer.score_gdn_scan(h, init, &g, nb, branch_cu, len, ctx, stream)? {
+            return Ok(true);
+        }
+        ensure!(heads == 0, "score: layer {layer_idx} scanned its heads but not its branches");
+        Ok(false)
+    }
+
     /// Run the recurrence of the contiguous streams `lo..hi` together, from
     /// each stream's current state. `cu_dev` holds their `cu_seqlens` rebased
     /// to stream `lo`'s first row.
@@ -171,6 +244,7 @@ impl TransformerModel {
         gdn: &GdnPrefillBuffers,
         h_ptrs_off: usize,
         branch_cu: DevicePtr,
+        tabs: Option<DevicePtr>,
         ctx: &ForwardContext,
         stream: u64,
         prof: &mut ScoreProfile,
@@ -204,10 +278,18 @@ impl TransformerModel {
 
         // Recurrence: heads from zero (their cu_seqlens are the first heads+1
         // entries of the pass's, already based at 0), fork, then branches.
-        let g = (gdn, h_ptrs_off, ctx, stream);
-        self.score_gdn_group(layer, layer_idx, seqs, (0, heads), cu, meta.cu_seqlens, g.0, g.1, g.2, g.3)?;
-        self.score_fork(seqs, plan, layer_idx, false, stream)?;
-        self.score_gdn_group(layer, layer_idx, seqs, (heads, n), cu, branch_cu, g.0, g.1, g.2, g.3)?;
+        let fused = match tabs {
+            Some(t) => {
+                self.score_gdn_fused(layer, layer_idx, plan, meta, gdn, branch_cu, t, ctx, stream)?
+            }
+            None => false,
+        };
+        if !fused {
+            let g = (gdn, h_ptrs_off, ctx, stream);
+            self.score_gdn_group(layer, layer_idx, seqs, (0, heads), cu, meta.cu_seqlens, g.0, g.1, g.2, g.3)?;
+            self.score_fork(seqs, plan, layer_idx, false, stream)?;
+            self.score_gdn_group(layer, layer_idx, seqs, (heads, n), cu, branch_cu, g.0, g.1, g.2, g.3)?;
+        }
         prof.mark(self, stream, Phase::SsmGdn)?;
 
         // Gated norm, out-projection and MoE once over every row.

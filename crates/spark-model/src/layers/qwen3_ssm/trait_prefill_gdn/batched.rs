@@ -31,6 +31,7 @@ impl Qwen3SsmLayer {
             batch: batch_size,
             seq_len: chunk_len,
             cu_seqlens: None,
+            h_init: spark_runtime::gpu::DevicePtr::NULL,
         };
         if self.try_gdn_chunk_tc(gdn_bufs, scan, ctx, stream)? {
             return Ok(());
@@ -272,6 +273,7 @@ impl Qwen3SsmLayer {
                 batch: batch_size,
                 seq_len: max_seqlen,
                 cu_seqlens: Some(cu_seqlens),
+                h_init: spark_runtime::gpu::DevicePtr::NULL,
             };
             if self.try_gdn_chunk_tc(gdn_bufs, scan, ctx, stream)? {
                 return Ok(true);

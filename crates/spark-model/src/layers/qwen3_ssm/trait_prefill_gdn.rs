@@ -103,6 +103,7 @@ impl Qwen3SsmLayer {
             batch: 1,
             seq_len: total,
             cu_seqlens: None,
+            h_init: DevicePtr::NULL,
         };
         if self.try_gdn_chunk_tc(gdn_bufs, scan, ctx, stream)? {
             return Ok(());

@@ -282,6 +282,8 @@ impl TransformerModel {
             "score: SSM staging exceeds scratch ({n} streams)"
         );
         let branch_cu = self.score_stage_branch_cu(plan, &meta, branch_cu_off, stream)?;
+        let tabs_off = (branch_cu_off + (n + 1) * 4 + 63) & !63;
+        let ssm_tabs = self.score_stage_ssm_tables(plan, seqs, tabs_off, stream)?;
 
         let gdn = GdnPrefillBuffers {
             qkv: self.gdn_buf_qkv,
@@ -315,8 +317,11 @@ impl TransformerModel {
         let seq_lens_start = plan.starts.iter().copied().max().unwrap_or(0).max(1);
         let residual = self.buffers.residual();
         prof.mark(self, stream, Phase::Setup)?;
+        let mut ssm_k = 0usize;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             if layer.is_ssm_layer() {
+                let tabs = ssm_tabs.map(|t| t.offset(ssm_k * 2 * n * 8));
+                ssm_k += 1;
                 let mut refs: Vec<&mut SequenceState> = seqs.iter_mut().collect();
                 self.score_ssm_layer(
                     layer.as_ref(),
@@ -329,6 +334,7 @@ impl TransformerModel {
                     &gdn,
                     ptrs_off,
                     branch_cu,
+                    tabs,
                     &ctx,
                     stream,
                     &mut prof,
@@ -407,9 +413,11 @@ impl TransformerModel {
         // staged positions (x3 with MRoPE) and slots (20 B); per stream, the
         // alignment pads and pointer, cu_seqlens, kv_lens, state-end and
         // h-state-pointer entries (256 B, generously); 64 KiB to spare.
+        // Plus, per SSM layer, two pointer-table entries (`score_ssm.rs`).
         const PER_STREAM: usize = 256;
+        let per_stream = PER_STREAM + 16 * self.ssm_pool.num_ssm_layers;
         let per_row = self.config.num_experts_per_tok.max(1) * 8 + 24 + 20;
-        let fixed = 64 * 1024 + PER_STREAM * streams.min(4096);
+        let fixed = 64 * 1024 + per_stream * streams.min(4096);
         let scratch_rows = self.buffers.scratch_bytes().saturating_sub(fixed) / per_row;
         (rows.min(scratch_rows), streams)
     }

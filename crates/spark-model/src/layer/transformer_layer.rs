@@ -709,6 +709,26 @@ pub trait TransformerLayer: Send + Sync {
         Ok(false)
     }
 
+    /// Score pass: one GDN scan over `batch` streams laid out by the device
+    /// `cu_seqlens` (rebased to `gdn_bufs`), states advanced through the
+    /// device table `h_ptrs`, each entry state read from the table `h_init`
+    /// (`NULL`: from `h_ptrs`). `Ok(false)`: no single-launch scan here; the
+    /// caller keeps its own path. Default: `Ok(false)`.
+    #[allow(clippy::too_many_arguments)]
+    fn score_gdn_scan(
+        &self,
+        _h_ptrs: DevicePtr,
+        _h_init: DevicePtr,
+        _gdn_bufs: &GdnPrefillBuffers,
+        _batch: u32,
+        _cu_seqlens: DevicePtr,
+        _max_len: u32,
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Two-phase SSM prefill — Phase 3: post-GDN processing.
     ///
     /// Reads GDN output and Z gate from `gdn_bufs` at `token_offset`,

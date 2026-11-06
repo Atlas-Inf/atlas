@@ -33,6 +33,9 @@ pub(super) struct ChunkTcScan {
     pub batch: u32,
     pub seq_len: u32,
     pub cu_seqlens: Option<DevicePtr>,
+    /// Device table of per-stream entry states read in place of `h_state`
+    /// (`NULL`: start from `h_state`).
+    pub h_init: DevicePtr,
 }
 
 impl Qwen3SsmLayer {
@@ -94,6 +97,7 @@ impl Qwen3SsmLayer {
             .arg_u32(scan.h_state_is_table as u32)
             .arg_ptr(scan.cu_seqlens.unwrap_or(DevicePtr::NULL))
             .arg_u32(scan.cu_seqlens.is_some() as u32)
+            .arg_ptr(scan.h_init)
             .launch(stream)?;
         Ok(true)
     }

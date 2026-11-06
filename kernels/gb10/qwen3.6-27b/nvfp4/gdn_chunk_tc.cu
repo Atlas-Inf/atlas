@@ -276,7 +276,8 @@ gdn_chunk_tc_prefill(
     unsigned int batch_size, unsigned int seq_len, unsigned int num_k_heads,
     unsigned int num_v_heads, unsigned int qk_stride, unsigned int v_stride,
     unsigned int gb_stride, unsigned int h_state_is_table,
-    const int* __restrict__ cu_seqlens, unsigned int is_varlen
+    const int* __restrict__ cu_seqlens, unsigned int is_varlen,
+    const float* const* __restrict__ h_init   // optional per-stream entry-state table
 ) {
     using namespace gdn_chunk_tc;
     const int vb = blockIdx.x, vh = blockIdx.y, b = blockIdx.z;
@@ -296,6 +297,9 @@ gdn_chunk_tc_prefill(
         ? ((float* const*)h_state)[b] + (size_t)vh * KD * VD
         : h_state + ((size_t)b * num_v_heads + vh) * KD * VD;
     H += vb * DV;
+    // The entry state: h_init[b] when given (a score branch reads its head's
+    // final state in place of a copy), else the state being advanced.
+    const float* H0 = h_init ? h_init[b] + (size_t)vh * KD * VD + vb * DV : H;
     const bf16* qg = query + (size_t)tok0 * qk_stride + kh * KD;
     const bf16* kg = key + (size_t)tok0 * qk_stride + kh * KD;
     const bf16* vg = value + (size_t)tok0 * v_stride + vh * VD + vb * DV;
@@ -326,7 +330,7 @@ gdn_chunk_tc_prefill(
     for (int nt = 0; nt < 8; nt++)
 #pragma unroll
         for (int e = 0; e < 4; e++)
-            S[nt][e] = H[(16 * warp + erow(e, grp)) * VD + nt * 8 + ecol(e, q)];
+            S[nt][e] = H0[(16 * warp + erow(e, grp)) * VD + nt * 8 + ecol(e, q)];
     stage_state(S, Sh, Sl, warp, grp, q);
     if (len > 0) {
         const int ce0 = len < (unsigned)CH ? (int)len : CH;
