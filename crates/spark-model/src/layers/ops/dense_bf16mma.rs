@@ -498,14 +498,14 @@ impl DenseBf16mma {
 /// `gdn_ba_gates_prefill` CTA tile: tokens x outputs.
 const BA_TOK: u32 = 32;
 const BA_OUT: u32 = 48;
-/// Below this its few CTAs lose to the token-parallel kernel (one score pass,
-/// per layer: 96 rows 79 vs 62 us; 1056 rows 155 vs 674 us).
-const BA_MIN_ROWS: u32 = 256;
-
 impl DenseBf16mma {
-    /// Whether `ba_gates` serves `m` rows of an `[n, k]` BF16 in_proj_ba.
-    pub fn serves_ba(&self, [m, n, k]: [u32; 3]) -> bool {
-        m >= BA_MIN_ROWS && self.ba.0 != 0 && n.is_multiple_of(BA_OUT) && k.is_multiple_of(KS)
+    /// Whether `ba_gates` serves an `[n, k]` BF16 in_proj_ba. At every row
+    /// count: the two kernels sum in different orders, so a choice by the
+    /// pass's rows would make a request's gates depend on what it is batched
+    /// with. (Per layer it loses 79 vs 62 us at 96 rows, under 1 ms a pass,
+    /// and wins 155 vs 674 us at 1056.)
+    pub fn serves_ba(&self, [n, k]: [u32; 2]) -> bool {
+        self.ba.0 != 0 && n.is_multiple_of(BA_OUT) && k.is_multiple_of(KS)
     }
 
     /// The GDN BA projection + gates on tensor cores; the arguments of

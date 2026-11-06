@@ -74,10 +74,10 @@ impl Qwen3SsmLayer {
         a_log: DevicePtr,
         dt_bias: DevicePtr,
         gate_out: DevicePtr,
-        dims @ [m, n, k, ..]: [u32; 7],
+        dims @ [_, n, k, ..]: [u32; 7],
         stream: u64,
     ) -> Result<()> {
-        if ctx.levers.dense_prefill_bf16mma && self.bf16mma.serves_ba([m, n, k]) {
+        if ctx.levers.dense_prefill_bf16mma && self.bf16mma.serves_ba([n, k]) {
             return self.bf16mma.ba_gates(
                 ctx.gpu,
                 [input, ba.weight, a_log, dt_bias, gate_out],
