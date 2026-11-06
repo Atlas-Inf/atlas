@@ -46,9 +46,18 @@ impl TransformerModel {
         let v = self.config.vocab_size as u32;
         for r in reqs {
             ensure!(!r.branches.is_empty(), "score: no branches");
-            ensure!(r.branches.len() == r.options.len(), "score: one option set per branch");
-            ensure!(r.branches.iter().all(|b| !b.is_empty()), "score: empty branch");
-            ensure!(r.options.iter().all(|o| !o.is_empty()), "score: empty option set");
+            ensure!(
+                r.branches.len() == r.options.len(),
+                "score: one option set per branch"
+            );
+            ensure!(
+                r.branches.iter().all(|b| !b.is_empty()),
+                "score: empty branch"
+            );
+            ensure!(
+                r.options.iter().all(|o| !o.is_empty()),
+                "score: empty option set"
+            );
             ensure!(
                 r.options.iter().flatten().all(|&t| t < v),
                 "score: option token outside the vocabulary"
@@ -59,7 +68,10 @@ impl TransformerModel {
             "score: single-rank models only"
         );
         ensure!(self.comm.is_none(), "score: single-rank models only");
-        ensure!(!self.use_fp32_logits, "score: FP32 logits mode is not supported");
+        ensure!(
+            !self.use_fp32_logits,
+            "score: FP32 logits mode is not supported"
+        );
         let bs = self.kv_cache.lock().block_size();
         let plan_reqs: Vec<ScoreRequest<'_>> = reqs
             .iter()
@@ -78,15 +90,25 @@ impl TransformerModel {
             "score: {} sequences exceed the SSM state pool ({max_streams}; raise --max-batch-size)",
             plan.streams()
         );
-        let options: Vec<Vec<u32>> = reqs.iter().flat_map(|r| r.options.iter().cloned()).collect();
+        let options: Vec<Vec<u32>> = reqs
+            .iter()
+            .flat_map(|r| r.options.iter().cloned())
+            .collect();
 
         let trace = std::env::var("ATLAS_SCORE_TRACE").is_ok_and(|v| v == "1");
         let t0 = std::time::Instant::now();
         let mut marks = [0u128; 3];
         let mut seqs: Vec<SequenceState> = Vec::with_capacity(plan.tokens.len());
         let run = (|| -> Result<Vec<Vec<f32>>> {
-            for _ in 0..plan.streams() {
-                seqs.push(self.alloc_sequence()?);
+            // Only a stream that starts from the zero state needs one: a
+            // branch with a head gets the head's conv window and state copied
+            // over whole (`score_fork`), and MTP scratch is never read here.
+            for i in 0..plan.streams() {
+                seqs.push(self.alloc_sequence_reset(false)?);
+                if i < plan.heads || plan.head_of[i].is_none() {
+                    let slot = seqs[i].slot_idx;
+                    self.ssm_pool.zero_slot(slot, self.gpu.as_ref(), stream)?;
+                }
             }
             marks[0] = t0.elapsed().as_micros();
             self.score_forward(&plan, &mut seqs, stream)?;
@@ -101,8 +123,9 @@ impl TransformerModel {
         for seq in seqs.iter_mut() {
             // Score sequences never populate `tokens`, so the prefix-cache
             // release in `free_sequence` is a no-op; the KV refs (shared head
-            // blocks included) and the SSM slot are returned here.
-            if let Err(e) = self.free_sequence(seq) {
+            // blocks included) and the SSM slot are returned here, the slot
+            // unzeroed (its next claim zeroes what it reads).
+            if let Err(e) = self.free_sequence_dispatch(seq, false) {
                 tracing::error!("score: free_sequence: {e:#}");
             }
         }
@@ -185,9 +208,9 @@ impl TransformerModel {
         }
 
         // ── Embed + per-stream paged metadata at stacked offsets. ──
-        self.buffers
-            .zero_prefill_essentials(self.gpu.as_ref(), stream)?;
         let total = plan.total_rows();
+        self.buffers
+            .zero_prefill_essentials_rows(self.gpu.as_ref(), total, stream)?;
         let topk = self.config.num_experts_per_tok.max(1);
         let mut cursor = (total * topk * 4 * 2 + 63) & !63;
         let hidden = self.buffers.hidden_states();
@@ -275,6 +298,8 @@ impl TransformerModel {
             "score: SSM staging exceeds scratch ({n} streams)"
         );
         let branch_cu = self.score_stage_branch_cu(plan, &meta, branch_cu_off, stream)?;
+        let tabs_off = (branch_cu_off + (n + 1) * 4 + 63) & !63;
+        let ssm_tabs = self.score_stage_ssm_tables(plan, seqs, tabs_off, stream)?;
 
         let gdn = GdnPrefillBuffers {
             qkv: self.gdn_buf_qkv,
@@ -308,8 +333,11 @@ impl TransformerModel {
         let seq_lens_start = plan.starts.iter().copied().max().unwrap_or(0).max(1);
         let residual = self.buffers.residual();
         prof.mark(self, stream, Phase::Setup)?;
+        let mut ssm_k = 0usize;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             if layer.is_ssm_layer() {
+                let tabs = ssm_tabs.map(|t| t.offset(ssm_k * 2 * n * 8));
+                ssm_k += 1;
                 let mut refs: Vec<&mut SequenceState> = seqs.iter_mut().collect();
                 self.score_ssm_layer(
                     layer.as_ref(),
@@ -322,6 +350,7 @@ impl TransformerModel {
                     &gdn,
                     ptrs_off,
                     branch_cu,
+                    tabs,
                     &ctx,
                     stream,
                     &mut prof,
@@ -377,7 +406,8 @@ impl TransformerModel {
         }
         if changed {
             let bytes = as_bytes(&meta.kv_lens_host);
-            self.gpu.copy_h2d_async_retained(&bytes, meta.kv_lens, stream)?;
+            self.gpu
+                .copy_h2d_async_retained(&bytes, meta.kv_lens, stream)?;
         }
         Ok(off + ((n * 4 + 63) & !63))
     }
@@ -400,9 +430,11 @@ impl TransformerModel {
         // staged positions (x3 with MRoPE) and slots (20 B); per stream, the
         // alignment pads and pointer, cu_seqlens, kv_lens, state-end and
         // h-state-pointer entries (256 B, generously); 64 KiB to spare.
+        // Plus, per SSM layer, two pointer-table entries (`score_ssm.rs`).
         const PER_STREAM: usize = 256;
+        let per_stream = PER_STREAM + 16 * self.ssm_pool.num_ssm_layers;
         let per_row = self.config.num_experts_per_tok.max(1) * 8 + 24 + 20;
-        let fixed = 64 * 1024 + PER_STREAM * streams.min(4096);
+        let fixed = 64 * 1024 + per_stream * streams.min(4096);
         let scratch_rows = self.buffers.scratch_bytes().saturating_sub(fixed) / per_row;
         (rows.min(scratch_rows), streams)
     }

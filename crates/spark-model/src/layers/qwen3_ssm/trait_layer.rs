@@ -725,6 +725,28 @@ impl TransformerLayer for Qwen3SsmLayer {
         self.prefill_phase1_conv1d_one_inner(state, token_offset, len, gdn_bufs, ctx, stream)
     }
 
+    fn score_gdn_scan(
+        &self,
+        h_ptrs: DevicePtr,
+        h_init: DevicePtr,
+        gdn_bufs: &GdnPrefillBuffers,
+        batch: u32,
+        cu_seqlens: DevicePtr,
+        max_len: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        let scan = super::gdn_chunk_tc::ChunkTcScan {
+            h_state: h_ptrs,
+            h_state_is_table: true,
+            batch,
+            seq_len: max_len,
+            cu_seqlens: Some(cu_seqlens),
+            h_init,
+        };
+        self.try_gdn_chunk_tc(gdn_bufs, scan, ctx, stream)
+    }
+
     fn prefill_phase1_l2_batched(
         &self,
         total_tokens: usize,

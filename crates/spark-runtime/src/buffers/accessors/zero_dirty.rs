@@ -144,6 +144,34 @@ impl BufferArena {
         Ok(())
     }
 
+    /// [`Self::zero_prefill_essentials`] over the first `rows` rows' share of
+    /// each buffer (page-rounded) instead of all of it: for a single pass
+    /// that computes exactly rows `[0, rows)` (a score pass). Rows past it
+    /// keep whatever an earlier pass left, as they already do in every
+    /// prefill chunk after the first; the kernels never read them into a
+    /// computed row.
+    pub fn zero_prefill_essentials_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        rows: usize,
+        stream: u64,
+    ) -> anyhow::Result<()> {
+        let s = &self.sizes;
+        for (ptr, bytes) in [
+            (self.hidden_states, s.hidden_states),
+            (self.residual, s.residual),
+            (self.gate_logits, s.gate_logits),
+            (self.expert_gate_out, s.expert_gate_out),
+            (self.expert_up_out, s.expert_up_out),
+            (self.expert_down_out, s.expert_down_out),
+            (self.moe_output, s.moe_output),
+        ] {
+            let prefix = dirty_prefix(bytes, rows, self.max_batch_tokens, 0);
+            gpu.memset_zero_async(ptr, prefix, stream)?;
+        }
+        Ok(())
+    }
+
     /// What `zero_dirty` would leave behind now: for each buffer with a
     /// nonzero byte past its prefix, its name, the offset of the first such
     /// byte and the prefix. Reads the device after draining `stream`; for

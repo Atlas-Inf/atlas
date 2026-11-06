@@ -605,7 +605,7 @@ impl Model for TransformerModel {
         self.decode_marconi_checkpoint_dispatch(seq)
     }
     fn free_sequence(&self, seq: &mut SequenceState) -> Result<()> {
-        self.free_sequence_dispatch(seq)
+        self.free_sequence_dispatch(seq, true)
     }
     fn decode_verify_graphed(
         &self,
