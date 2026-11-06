@@ -59,6 +59,9 @@ pub struct DenseBf16mma {
     w4a4: KernelHandle,
     w4a8_gate_up: KernelHandle,
     w4a8: KernelHandle,
+    /// The MX8 handoff pair (`LowpMix::DOWN_MX`).
+    w4a8_gate_up_mx: KernelHandle,
+    w4a8_mx: KernelHandle,
     w8a8: KernelHandle,
     /// W8A8 on the transposed `[K, N]` prefill copy.
     w8a8_t: KernelHandle,
@@ -83,6 +86,8 @@ impl Default for DenseBf16mma {
             w4a4: KernelHandle(0),
             w4a8_gate_up: KernelHandle(0),
             w4a8: KernelHandle(0),
+            w4a8_gate_up_mx: KernelHandle(0),
+            w4a8_mx: KernelHandle(0),
             w8a8: KernelHandle(0),
             w8a8_t: KernelHandle(0),
             quant_nvfp4: KernelHandle(0),
@@ -151,6 +156,8 @@ impl DenseBf16mma {
             w4a4: k("dense_w4a4_nvfp4"),
             w4a8_gate_up: k("dense_w4a8_gate_up_silu"),
             w4a8: k("dense_w4a8_nvfp4"),
+            w4a8_gate_up_mx: k("dense_w4a8_gate_up_silu_mx"),
+            w4a8_mx: k("dense_w4a8mx_nvfp4"),
             w8a8: k("dense_w8a8_fp8"),
             w8a8_t: k("dense_w8a8_fp8t"),
             quant_nvfp4: k("dl_quant_nvfp4"),
@@ -232,7 +239,9 @@ impl DenseBf16mma {
     }
 
     /// `out[m, inter] = silu(input · gateᵀ) * (input · upᵀ)`, both rounded to
-    /// BF16 before the SiLU as the unfused chain does.
+    /// BF16 before the SiLU as the unfused chain does. With the MX8 handoff
+    /// (`dnmx`) `out` takes those values as E4M3 codes `[m, inter]` and then
+    /// their UE8M0 block scales `[m, inter/32]`, for `nvfp4`'s down.
     #[allow(clippy::too_many_arguments)]
     pub fn gate_up_silu(
         &self,
@@ -244,12 +253,18 @@ impl DenseBf16mma {
         lowp: LowpArgs,
         stream: u64,
     ) -> Result<()> {
-        let lp = self.lowp_kernel(
-            &lowp,
-            h,
-            (self.w4a4_gate_up, SMEM_W4A4),
-            (lowp.group << LowpMix::A8, self.w4a8_gate_up, SMEM_W4A8),
-        );
+        // MX8 handoff: `out` takes the E4M3 codes [m, inter] then the scales.
+        let mx = self.mx_on(&lowp, inter);
+        let lp = if mx {
+            Some((false, self.w4a8_gate_up_mx, SMEM_W4A8))
+        } else {
+            self.lowp_kernel(
+                &lowp,
+                h,
+                (self.w4a4_gate_up, SMEM_W4A4),
+                (lowp.group << LowpMix::A8, self.w4a8_gate_up, SMEM_W4A8),
+            )
+        };
         let (launch, nchunks) = self.head(
             gpu,
             (self.gate_up, SMEM_NVFP4),
@@ -259,14 +274,19 @@ impl DenseBf16mma {
             [m, inter, h, GATE_UP_FEATURES],
             stream,
         )?;
-        launch
+        let launch = launch
             .arg_ptr(gate.weight)
             .arg_ptr(gate.weight_scale)
             .arg_f32(gate.weight_scale_2)
             .arg_ptr(up.weight)
             .arg_ptr(up.weight_scale)
             .arg_f32(up.weight_scale_2)
-            .arg_ptr(out)
+            .arg_ptr(out);
+        let launch = match mx {
+            true => launch.arg_ptr(out.offset(m as usize * inter as usize)),
+            false => launch,
+        };
+        launch
             .arg_u32(m)
             .arg_u32(inter)
             .arg_u32(h)
@@ -291,6 +311,9 @@ impl DenseBf16mma {
         lowp: LowpArgs,
         stream: u64,
     ) -> Result<()> {
+        if lowp.group == LowpMix::DOWN && self.mx_on(&lowp, k) {
+            return self.mx_down(gpu, input, w, out, [m, n, k], stream);
+        }
         let lp = self.lowp_kernel(
             &lowp,
             k,

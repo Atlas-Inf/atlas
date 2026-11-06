@@ -8,7 +8,11 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
-use super::{DenseBf16mma, QUANT_MAX_K};
+use super::{DenseBf16mma, QUANT_MAX_K, SMEM_W4A8};
+
+/// The MX8 down: the W4A8 stages plus two groups of 128 tokens' 16 scale
+/// bytes (`db_smem_bytes` with `DB_A_MX8`).
+const SMEM_W4A8_MX: u32 = SMEM_W4A8 + 2 * 128 * 16;
 
 /// Projections whose activations `ATLAS_DENSE_PREFILL_LOWP` quantizes per
 /// token (on top of `ATLAS_DENSE_PREFILL_BF16MMA=1`). NVFP4 weights take
@@ -26,9 +30,13 @@ impl LowpMix {
     pub const ATTN_O: u16 = 8;
     pub const GDN_QKVZ: u16 = 16;
     pub const GDN_OUT: u16 = 32;
+    /// `dnmx` (with `gu8`): the W4A8 gate+up writes the down projection's
+    /// tokens as E4M3 with a UE8M0 scale per 32-K MMA block, and the W4A8
+    /// down reads them (no per-token quantizer pass). Changes the numerics.
+    pub const DOWN_MX: u16 = 1 << 10;
     /// An NVFP4 group's W4A8 bit: its W4A4 bit shifted by this.
     pub(super) const A8: u32 = 6;
-    const NAMES: [(&str, u16); 10] = [
+    const NAMES: [(&str, u16); 11] = [
         ("gu", Self::GATE_UP),
         ("dn", Self::DOWN),
         ("qkv", Self::ATTN_QKV),
@@ -39,6 +47,7 @@ impl LowpMix {
         ("dn8", Self::DOWN << Self::A8),
         ("qkv8", Self::ATTN_QKV << Self::A8),
         ("o8", Self::ATTN_O << Self::A8),
+        ("dnmx", Self::DOWN_MX),
     ];
     /// `ATLAS_DENSE_PREFILL_LOWP=1`: W4A8 MLP and attention, W8A8 GDN. On the
     /// d3 oracle this stays at the BF16-MMA path's distance from d3's BF16
@@ -86,7 +95,58 @@ pub struct LowpArgs {
     pub scales: DevicePtr,
 }
 
+/// The MX handoff's K granularity: its scales stage eight 64-K stages at a time.
+const MX_K: u32 = 512;
+
 impl DenseBf16mma {
+    /// Whether the gate+up -> down handoff runs as MX8 tokens (`dnmx`) for a
+    /// `k_down`-wide intermediate: both kernels shipped, W4A8 gate+up on.
+    pub(super) fn mx_on(&self, lowp: &LowpArgs, k_down: u32) -> bool {
+        self.lowp.has(LowpMix::DOWN_MX)
+            && self.lowp.has_a8(LowpMix::GATE_UP)
+            && self.w4a8_gate_up_mx.0 != 0
+            && self.w4a8_mx.0 != 0
+            && self.quant_fp8.0 != 0
+            && k_down.is_multiple_of(MX_K)
+            && !lowp.codes.is_null()
+            && !lowp.scales.is_null()
+    }
+
+    /// The W4A8 down projection on MX8 tokens `input` (codes `[m, k]`, then
+    /// the `[m, k/32]` scales), as written by `dense_w4a8_gate_up_silu_mx`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn mx_down(
+        &self,
+        gpu: &dyn GpuBackend,
+        input: DevicePtr,
+        w: &crate::weight_map::QuantizedWeight,
+        out: DevicePtr,
+        [m, n, k]: [u32; 3],
+        stream: u64,
+    ) -> Result<()> {
+        let c = super::chunks(
+            m,
+            n / super::FEATURES,
+            (self.slots / super::CTAS_PER_SM).max(1),
+            super::LOWP_ROWS,
+        );
+        KernelLaunch::new(gpu, self.w4a8_mx)
+            .grid([(n / super::FEATURES) * c, 1, 1])
+            .block([super::THREADS, 1, 1])
+            .shared_mem(SMEM_W4A8_MX)
+            .arg_ptr(input)
+            .arg_ptr(input.offset(m as usize * k as usize))
+            .arg_ptr(w.weight)
+            .arg_ptr(w.weight_scale)
+            .arg_f32(w.weight_scale_2)
+            .arg_ptr(out)
+            .arg_u32(m)
+            .arg_u32(n)
+            .arg_u32(k)
+            .arg_u32(n)
+            .arg_u32(c)
+            .launch(stream)
+    }
     /// Whether `group` takes low-precision activations through `handle`
     /// for a `k`-wide input.
     pub(super) fn lowp_on(
@@ -170,6 +230,8 @@ mod tests {
         assert!(
             !m.has(LowpMix::GATE_UP) && !m.has(LowpMix::GDN_QKVZ) && !m.has_a8(LowpMix::ATTN_O)
         );
+        assert!(LowpMix::parse("gu8,dnmx").has(LowpMix::DOWN_MX));
+        assert!(!LowpMix::parse("1").has(LowpMix::DOWN_MX));
         assert_eq!(
             LowpMix::parse("all"),
             LowpMix::parse("gu,dn,qkv,o,qkvz,gout")

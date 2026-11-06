@@ -278,3 +278,111 @@ fn lowp_case(mix: &str, a8: bool) -> Result<()> {
     }
     Ok(())
 }
+
+/// The MX8 handoff (`gu8,dnmx`): the W4A8 gate+up writes E4M3 codes and
+/// UE8M0 block scales (block: 64-K stage st, half h = k % 16 / 8), each a
+/// block's smallest power of two that fits its amax under 448; the down reads
+/// them. The codes stay within E4M3 rounding of the SiLU values, and the down
+/// matches an FP64 reference on the tokens read back.
+#[test]
+#[ignore = "needs a GB10 and a qwen3.8-27b kernel build"]
+fn dense_mx_handoff_matches_reference() -> Result<()> {
+    let gpu = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
+    let kernels = DenseBf16mma::resolve_lowp(&gpu, LowpMix::parse("gu8,dnmx"));
+    let stream = gpu.default_stream();
+    let mut rng = Rng(0x3c8_e8e0);
+    // The handoff stages its scales 512 K at a time.
+    const IM: usize = 512;
+    let (gate, up, down) = (
+        Nvfp4::new(&mut rng, H, IM, 0.02),
+        Nvfp4::new(&mut rng, H, IM, 0.03),
+        Nvfp4::new(&mut rng, IM, H, 0.05),
+    );
+    let (g_d, u_d, d_d) = (gate.upload(&gpu)?, up.upload(&gpu)?, down.upload(&gpu)?);
+    for m in ROWS {
+        let x: Vec<u16> = (0..m * H)
+            .map(|i| bf16(rng.unit() * if i / H % 3 == 1 { 50.0 } else { 2.0 }))
+            .collect();
+        let poison = vec![POISON; (m + SPARE_ROWS) * IM];
+        let (x_d, act, out) = (
+            upload(&gpu, &bytes_of(&x))?,
+            upload(&gpu, &bytes_of(&poison))?,
+            upload(&gpu, &bytes_of(&poison))?,
+        );
+        let scratch = [gpu.alloc(m * IM)?, gpu.alloc(m * IM / 16 * 4)?];
+        let lowp = |group| LowpArgs {
+            group,
+            codes: scratch[0],
+            scales: scratch[1],
+        };
+        ensure!(
+            kernels.mx_on(&lowp(LowpMix::GATE_UP), IM as u32),
+            "MX handoff kernels not in this build"
+        );
+        let mu = m as u32;
+        kernels.gate_up_silu(
+            &gpu,
+            x_d,
+            [&g_d, &u_d],
+            act,
+            [mu, IM as u32, H as u32],
+            lowp(LowpMix::GATE_UP),
+            stream,
+        )?;
+        gpu.synchronize(stream)?;
+        let xq = lowp_activations(&gpu, false, &x, [m, H], scratch)?;
+        kernels.nvfp4(
+            &gpu,
+            act,
+            &d_d,
+            out,
+            [mu, H as u32, IM as u32],
+            lowp(LowpMix::DOWN),
+            stream,
+        )?;
+        gpu.synchronize(stream)?;
+        let mut mx = vec![0u8; m * IM + m * IM / 32];
+        gpu.copy_d2h(act, &mut mx)?;
+        let (codes, scales) = mx.split_at(m * IM);
+        let out_h = read_u16(&gpu, out, (m + SPARE_ROWS) * H)?;
+        let (mut w_gu, mut w_dn) = (0.0f64, 0.0f64);
+        for r in 0..m {
+            let deq: Vec<f64> = (0..IM)
+                .map(|k| {
+                    let s = scales[r * (IM / 32) + k / 64 * 2 + k % 16 / 8] as i32 - 127;
+                    e4m3(codes[r * IM + k]) * 2f64.powi(s)
+                })
+                .collect();
+            for b in 0..IM / 32 {
+                let p = 2f64.powi(scales[r * (IM / 32) + b] as i32 - 127);
+                let amax = (0..IM)
+                    .filter(|k| k / 64 * 2 + k % 16 / 8 == b)
+                    .fold(0.0f64, |a, k| a.max(deq[k].abs()));
+                ensure!(
+                    amax <= 448.0 * p
+                        && (amax == 0.0 || amax > 448.0 * p / 2.0 * (1.0 - 1.0 / 16.0)),
+                    "M={m} row {r} block {b}: amax {amax} under scale {p}"
+                );
+            }
+            let xr = &xq[r * H..][..H];
+            let want: Vec<f64> = (0..IM)
+                .map(|n| {
+                    let g = f32_of(bf16(gate.dot_a8(xr, n) as f32)) as f64;
+                    let u = f32_of(bf16(up.dot_a8(xr, n) as f32)) as f64;
+                    g / (1.0 + (-g).exp()) * u
+                })
+                .collect();
+            let deq_h: Vec<u16> = deq.iter().map(|&v| bf16(v as f32)).collect();
+            w_gu = w_gu.max(worst(&deq_h, &want, 2e-2 + 1.0 / 16.0, 2e-3));
+            let want: Vec<f64> = (0..H).map(|n| down.dot_a8(&deq_h, n)).collect();
+            w_dn = w_dn.max(worst(&out_h[r * H..][..H], &want, 1e-2, 1e-3));
+        }
+        println!("M={m}: worst error / tolerance: mx gate_up+silu {w_gu:.3}, mx down {w_dn:.3}");
+        ensure!(w_gu <= 1.0 && w_dn <= 1.0, "M={m}: off the reference");
+        ensure!(
+            out_h[m * H..].iter().all(|&v| v == POISON),
+            "M={m}: rows past M were written"
+        );
+    }
+    Ok(())
+}

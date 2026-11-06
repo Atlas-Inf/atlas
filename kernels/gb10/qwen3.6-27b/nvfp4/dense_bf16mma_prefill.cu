@@ -86,7 +86,14 @@ __device__ __forceinline__ unsigned int db_fp8_row(unsigned int f) {
 // FP32 per-token scale), E4M3 (bytes [M, K], FP32 per-token scale). The
 // low-precision kernels take 128-row chunks (one CTA per SM, 16 token tiles
 // per warp: each weight tile is read by half as many CTAs).
-enum { DB_A_BF16 = 0, DB_A_NVFP4 = 1, DB_A_FP8 = 2 };
+// MX8: E4M3 tokens with a UE8M0 scale per token and 32-K MMA block (two per
+// 64-K stage: k % 16 in [0, 8) and [8, 16)), written by the W4A8 gate+up
+// epilogue for the down projection (dense_w4a8_gate_up_silu_mx); scales
+// [M, K/32] bytes, byte 2 s + h of a row for stage s, MMA half h.
+enum { DB_A_BF16 = 0, DB_A_NVFP4 = 1, DB_A_FP8 = 2, DB_A_MX8 = 3 };
+template <int AF> __host__ __device__ constexpr bool dl_a8() { return AF == DB_A_FP8 || AF == DB_A_MX8; }
+// MX8 scales are staged 8 stages (16 bytes a token) at a time, two groups.
+#define DL_MX_SG 8
 #define DL_ROWS 128
 template <int AF> __host__ __device__ constexpr int db_rows() { return AF == DB_A_BF16 ? DB_ROWS : DL_ROWS; }
 template <int AF> struct DbT;
@@ -102,6 +109,7 @@ struct __align__(16) DbTok8 {
     unsigned char q[DL_ROWS][DB_KS];                // 8192 B
 };
 template <> struct DbT<DB_A_FP8> { using T = DbTok8; };
+template <> struct DbT<DB_A_MX8> { using T = DbTok8; };
 __device__ __forceinline__ unsigned int dl_tok4(unsigned int r, unsigned int c) { return (c ^ ((r >> 2) & 1)) * 16; }
 // W4A4 weight rows: thread t reads k-pair rows 4t + i and 16 + 4t + i, so
 // the swizzle keys on bits 2..3 of the row (bm_swz_w keys on 3..4).
@@ -155,12 +163,13 @@ __device__ __forceinline__ void dl_mma_f4(float c[4], const unsigned int (&a)[4]
 // mxf8f6f4 block-scaled E4M3 MMA: one UE8M0 scale per A row (thread t even:
 // row g, odd: g + 8), B unscaled (2^0).
 __device__ __forceinline__ void dl_mma_mx8(float c[4], unsigned int a0, unsigned int a1, unsigned int a2,
-                                           unsigned int a3, unsigned int b0, unsigned int b1, unsigned int sa) {
+                                           unsigned int a3, unsigned int b0, unsigned int b1, unsigned int sa,
+                                           unsigned int sb) {
     asm volatile(
         "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
         "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3},%10,{0,0},%11,{0,0};"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(sa), "r"(0x7f7f7f7fu));
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(sa), "r"(sb));
 }
 
 // Four e2m1 pairs (bytes of w, low nibble = even k) -> four f16x2, exact.
@@ -258,7 +267,95 @@ __device__ __forceinline__ void db_stage(const DbTok& tk, const DbW<WF, HV>& sb,
     }
 }
 
+// The smallest power of two p with amax / p <= lim; 1 for amax == 0.
+__device__ __forceinline__ float dl_pow2_scale(float amax, float lim) {
+    if (!(amax > 0.0f)) return 1.0f;
+    int e;
+    const float f = frexpf(__fdiv_rn(amax, lim), &e);   // f in [0.5, 1)
+    return ldexpf(1.0f, f == 0.5f ? e - 1 : e);
+}
+
 template <int N> struct dl_int { static constexpr int value = N; };
+
+// W4A8 weights of one stage, re-encoded per thread: the raw transposed
+// words f[h][slot] (k 16t+8h .. 16t+8h+7), the f16 scales s / 2^E, the
+// E4M3 MMA operands a[h][slot] and the UE8M0 row scales of the two
+// fragments. Split so the next stage's re-encode can interleave with this
+// stage's MMAs (dl_body's W4A8 loop).
+struct DlA8 {
+    unsigned int f[2][4], sh[4], a[2][4][2], sa0, sa1;
+};
+
+template <bool FUSED, int HV>
+__device__ __forceinline__ void dl_a8_begin(DlA8& e, const void* sbv, unsigned int half, unsigned int warp,
+                                            unsigned int g, unsigned int t) {
+    const DbW<DB_NVFP4, HV>& sb = *(const DbW<DB_NVFP4, HV>*)sbv;
+    // Group t's scale for the four slots, and the stage maximum per slot
+    // (positive E4M3 bytes order as their values).
+    const unsigned int s4 = bm_slots<FUSED>(sb.s[half][t], bm_swz_s(t), warp, g);
+    unsigned int m4 = __vmaxu4(s4, __shfl_xor_sync(0xffffffffu, s4, 1));
+    m4 = __vmaxu4(m4, __shfl_xor_sync(0xffffffffu, m4, 2));
+    unsigned int ue[4];
+    #pragma unroll
+    for (int sl = 0; sl < 4; sl++) {
+        // E = ceil(log2(6 * max / 448)) from the FP32 bits (max * 6 / 448
+        // is a normal float for every nonzero E4M3 scale); 0 for max 0.
+        const unsigned int xb = __float_as_uint(nvfp4q_e4m3_value((m4 >> (8 * sl)) & 0xFF) * (6.0f / 448.0f));
+        const int ex = xb ? (int)(xb >> 23) - 127 + ((xb & 0x7FFFFFu) != 0) : 0;
+        ue[sl] = (unsigned int)(127 + ex);
+        // s / 2^E in f16: <= 448 / 6, and exact wherever its values
+        // reach E4M3 (below 2^-14 they round to zero either way).
+        const float sv = nvfp4q_e4m3_value((s4 >> (8 * sl)) & 0xFF) * __uint_as_float((unsigned int)(127 - ex) << 23);
+        const unsigned int hb = __half_as_ushort(__float2half_rn(sv));
+        e.sh[sl] = hb | (hb << 16);
+    }
+    const unsigned int odd = t & 1;
+    e.sa0 = odd ? ue[1] : ue[0];
+    e.sa1 = odd ? ue[3] : ue[2];
+    #pragma unroll
+    for (int h = 0; h < 2; h++) {
+        unsigned int w[4];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const unsigned int kp = 8 * t + 4 * h + i;
+            w[i] = bm_slots<FUSED>(sb.w[half][kp], bm_swz_w(kp), warp, g);
+        }
+        dl_transpose4(w, e.f[h]);
+    }
+}
+
+__device__ __forceinline__ void dl_a8_slot(DlA8& e, int sl) {
+    #pragma unroll
+    for (int h = 0; h < 2; h++) {
+        unsigned int x[4], p[4];
+        dl_e2m1_f16(e.f[h][sl], x);
+        #pragma unroll
+        for (int j = 0; j < 4; j++) p[j] = dl_e4m3x2(dl_hmul2(x[j], e.sh[sl]));
+        e.a[h][sl][0] = p[0] | (p[1] << 16);
+        e.a[h][sl][1] = p[2] | (p[3] << 16);
+    }
+}
+
+// The MMAs of token tiles [J0, J1) of a W4A8 stage.
+// mxs: MX8 token scales of this stage (token r's at mxs[16 r], halves 0 and
+// 1), or null for unscaled tokens.
+template <int J0, int J1, int TTM>
+__device__ __forceinline__ void dl_a8_mma(const DbTok8& tk, const DlA8& e, float (&acc)[2][TTM][4], unsigned int g,
+                                          unsigned int t, const unsigned char* mxs) {
+    #pragma unroll
+    for (int j = J0; j < J1; j++) {
+        const uint4 b = *(const uint4*)&tk.q[j * 8 + g][16 * t];
+        const unsigned int bs = mxs ? *(const unsigned short*)&mxs[16 * (j * 8 + g)] : 0x7f7fu;
+        #pragma unroll
+        for (int f = 0; f < 2; f++) {
+            const unsigned int sa = f ? e.sa1 : e.sa0;
+            dl_mma_mx8(acc[f][j], e.a[0][2 * f][0], e.a[0][2 * f + 1][0], e.a[0][2 * f][1], e.a[0][2 * f + 1][1], b.x,
+                       b.y, sa, bs & 0xff);
+            dl_mma_mx8(acc[f][j], e.a[1][2 * f][0], e.a[1][2 * f + 1][0], e.a[1][2 * f][1], e.a[1][2 * f + 1][1], b.z,
+                       b.w, sa, bs >> 8);
+        }
+    }
+}
 
 // One 64-wide K stage of the low-precision paths for TT token tiles.
 //  W4A4: the MMA's K is the stage's K in order. Thread t's A registers are
@@ -278,61 +375,11 @@ __device__ __forceinline__ void dl_stage(const typename DbT<AF>::T& tk, const vo
                                          float (&acc)[2][TTM][4], unsigned int warp, unsigned int g,
                                          unsigned int t) {
     if constexpr (AF == DB_A_FP8 && WF == DB_NVFP4) {
-        const DbW<DB_NVFP4, HV>& sb = *(const DbW<DB_NVFP4, HV>*)sbv;
-        // Group t's scale for the four slots, and the stage maximum per slot
-        // (positive E4M3 bytes order as their values).
-        const unsigned int s4 = bm_slots<FUSED>(sb.s[half][t], bm_swz_s(t), warp, g);
-        unsigned int m4 = __vmaxu4(s4, __shfl_xor_sync(0xffffffffu, s4, 1));
-        m4 = __vmaxu4(m4, __shfl_xor_sync(0xffffffffu, m4, 2));
-        unsigned int sh[4], ue[4];
+        DlA8 e;
+        dl_a8_begin<FUSED, HV>(e, sbv, half, warp, g, t);
         #pragma unroll
-        for (int sl = 0; sl < 4; sl++) {
-            // E = ceil(log2(6 * max / 448)) from the FP32 bits (max * 6 / 448
-            // is a normal float for every nonzero E4M3 scale); 0 for max 0.
-            const unsigned int xb = __float_as_uint(nvfp4q_e4m3_value((m4 >> (8 * sl)) & 0xFF) * (6.0f / 448.0f));
-            const int e = xb ? (int)(xb >> 23) - 127 + ((xb & 0x7FFFFFu) != 0) : 0;
-            ue[sl] = (unsigned int)(127 + e);
-            // s / 2^E in f16: <= 448 / 6, and exact wherever its values
-            // reach E4M3 (below 2^-14 they round to zero either way).
-            const float sv = nvfp4q_e4m3_value((s4 >> (8 * sl)) & 0xFF) * __uint_as_float((unsigned int)(127 - e) << 23);
-            const unsigned int hb = __half_as_ushort(__float2half_rn(sv));
-            sh[sl] = hb | (hb << 16);
-        }
-        const unsigned int odd = t & 1;
-        const unsigned int sa0 = odd ? ue[1] : ue[0], sa1 = odd ? ue[3] : ue[2];
-        unsigned int a[2][4][2];   // [h][slot]: E4M3 of k 16t+8h+{0..3}, {4..7}
-        #pragma unroll
-        for (int h = 0; h < 2; h++) {
-            unsigned int w[4], f[4];
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                const unsigned int kp = 8 * t + 4 * h + i;
-                w[i] = bm_slots<FUSED>(sb.w[half][kp], bm_swz_w(kp), warp, g);
-            }
-            dl_transpose4(w, f);   // f[slot]: k 16t+8h .. 16t+8h+7
-            #pragma unroll
-            for (int sl = 0; sl < 4; sl++) {
-                unsigned int x[4], p[4];
-                dl_e2m1_f16(f[sl], x);
-                #pragma unroll
-                for (int j = 0; j < 4; j++)
-                    p[j] = dl_e4m3x2(dl_hmul2(x[j], sh[sl]));
-                a[h][sl][0] = p[0] | (p[1] << 16);
-                a[h][sl][1] = p[2] | (p[3] << 16);
-            }
-        }
-        #pragma unroll
-        for (int j = 0; j < TT; j++) {
-            const uint4 b = *(const uint4*)&tk.q[j * 8 + g][16 * t];
-            #pragma unroll
-            for (int f = 0; f < 2; f++) {
-                const unsigned int sa = f ? sa1 : sa0;
-                dl_mma_mx8(acc[f][j], a[0][2 * f][0], a[0][2 * f + 1][0], a[0][2 * f][1], a[0][2 * f + 1][1], b.x,
-                           b.y, sa);
-                dl_mma_mx8(acc[f][j], a[1][2 * f][0], a[1][2 * f + 1][0], a[1][2 * f][1], a[1][2 * f + 1][1], b.z,
-                           b.w, sa);
-            }
-        }
+        for (int sl = 0; sl < 4; sl++) dl_a8_slot(e, sl);
+        dl_a8_mma<0, TT, TTM>(tk, e, acc, g, t, nullptr);
     } else if constexpr (AF == DB_A_NVFP4) {
         const DbW<DB_NVFP4, HV>& sb = *(const DbW<DB_NVFP4, HV>*)sbv;
         unsigned int a[2][4], sc[4];
@@ -411,7 +458,8 @@ template <int AF, int WST> __host__ __device__ constexpr int db_tst() { return A
 
 template <int WF, bool FUSED, int HV, int WST, int AF>
 __host__ __device__ constexpr unsigned int db_smem_bytes() {
-    constexpr unsigned int stages = db_tst<AF, WST>() * sizeof(typename DbT<AF>::T) + WST * sizeof(DbW<WF, HV>);
+    constexpr unsigned int stages = db_tst<AF, WST>() * sizeof(typename DbT<AF>::T) + WST * sizeof(DbW<WF, HV>)
+                                    + (AF == DB_A_MX8 ? 2 * DL_ROWS * 2 * DL_MX_SG : 0);
     constexpr unsigned int out = db_rows<AF>() * ((FUSED ? 64 : 128) * HV + 8) * sizeof(__nv_bfloat16);
     return stages > out ? stages : out;
 }
@@ -423,17 +471,19 @@ __host__ __device__ constexpr unsigned int db_smem_bytes() {
 // s = the FP32 scale grid [N/128, K/128] (column 0 is read). AF: A is BF16
 // [M, K]; or NVFP4 packed [M, K/2] with As the E4M3 scales [M, K/16]; or
 // E4M3 [M, K]; Ag the FP32 per-token scales of the last two.
-template <int WF, bool FUSED, int HV, int WST, int AF = DB_A_BF16>
+// OUTMX (FUSED W4A8): C is written as MX8 tokens for the down projection,
+// E4M3 codes [M, N] at C and the UE8M0 scales [M, N/32] at Cs (DbT MX8).
+template <int WF, bool FUSED, int HV, int WST, int AF = DB_A_BF16, bool OUTMX = false>
 __device__ __forceinline__ void db_body(
     const void* __restrict__ Av, const unsigned char* __restrict__ As, const float* __restrict__ Ag,
     const unsigned char* __restrict__ W0, const void* __restrict__ S0, float gs0,
     const unsigned char* __restrict__ W1, const void* __restrict__ S1, float gs1,
     __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K, unsigned int ldc,
-    unsigned int nchunks)
+    unsigned int nchunks, unsigned char* __restrict__ Cs = nullptr)
 {
-    static_assert(AF != DB_A_BF16 || WST == 2 || WST == 3, "the wait_group order below holds for 2 or 3 weight stages");
     // PDL entry before any other work (no-op unless launched with PDL).
     atlas_pdl_enter();
+    static_assert(AF != DB_A_BF16 || WST == 2 || WST == 3, "the wait_group order below holds for 2 or 3 weight stages");
     constexpr int TST = db_tst<AF, WST>();
     static_assert(AF != DB_A_NVFP4 || WF == DB_NVFP4, "NVFP4 tokens take NVFP4 weights (W4A4)");
     using Tok = typename DbT<AF>::T;
@@ -443,6 +493,8 @@ __device__ __forceinline__ void db_body(
     extern __shared__ __align__(16) unsigned char db_smem[];
     Tok* tk = (Tok*)db_smem;                                       // TST token stages
     DbW<WF, HV>* wt = (DbW<WF, HV>*)(db_smem + TST * sizeof(Tok));  // WST weight stages
+    // MX8: two groups of DL_MX_SG stages' token scales, 16 bytes a token.
+    unsigned char* mxb = db_smem + TST * sizeof(Tok) + WST * sizeof(DbW<WF, HV>);
 
     // Raster: groups of DB_GROUP row chunks, chunk index fastest. The host
     // picks nchunks >= ceil(M / 64) for the wave count.
@@ -524,6 +576,9 @@ __device__ __forceinline__ void db_body(
             if ((int)qrow < tt_valid * 8) bm_cp16(&tk[s % TST].q[qrow][qc * 16], q_src + kb, qrow < rows);
             if ((int)QROW_B < tt_valid * 8)
                 bm_cp16(&tk[s % TST].q[QROW_B][qc * 16], q_src_b + kb, QROW_B < rows);
+            if (AF == DB_A_MX8 && s % DL_MX_SG == 0 && (int)tid < tt_valid * 8 && tid < DL_ROWS)
+                bm_cp16(&mxb[((s / DL_MX_SG) & 1) * (DL_ROWS * 16) + tid * 16],
+                        As + (unsigned long long)(r0 + (tid < rows ? tid : 0)) * (K / 32) + 2 * s, tid < rows);
         }
     };
     auto issue_w = [&](int s) {
@@ -600,17 +655,57 @@ __device__ __forceinline__ void db_body(
         // The tile count is fixed per CTA: one loop per count.
         auto kloop = [&](auto ttc) {
             constexpr int TT = decltype(ttc)::value;
-            for (int s = 0; s < ksteps; s++) {
-                const int b = s % WST;
-                dl_mbar_wait(&full[b], (s / WST) & 1);
-                dl_stage<WF, AF, FUSED, TT, HV, TTM>(tk[b], &wt[b], half, acc, warp, g, t);
-                dl_mbar_arrive(&empty[b]);
-                const int sn = s + WST - 1;    // into buffer (s - 1) % WST
-                if (sn < ksteps) {
-                    if (sn >= WST) dl_mbar_wait(&empty[sn % WST], (sn / WST - 1) & 1);
-                    issue_tok(sn);
-                    issue_w(sn);
-                    dl_cp_arrive(&full[sn % WST]);
+            if constexpr (dl_a8<AF>() && WF == DB_NVFP4) {
+                // W4A8: stage s + 1 is re-encoded slot by slot between the
+                // MMA groups of stage s, so the two warps of a scheduler that
+                // run in step still overlap ALU and tensor work.
+                DlA8 cur;
+                dl_mbar_wait(&full[0], 0);
+                dl_a8_begin<FUSED, HV>(cur, &wt[0], half, warp, g, t);
+                #pragma unroll
+                for (int sl = 0; sl < 4; sl++) dl_a8_slot(cur, sl);
+                for (int s = 0; s < ksteps; s++) {
+                    const int b = s % WST;
+                    const bool more = s + 1 < ksteps;
+                    const unsigned char* mxs = AF == DB_A_MX8
+                        ? mxb + ((s / DL_MX_SG) & 1) * (DL_ROWS * 16) + 2 * (s % DL_MX_SG) : nullptr;
+                    DlA8 nxt;
+                    constexpr int Q = (TT + 3) / 4;
+                    dl_a8_mma<0, (Q < TT ? Q : TT), TTM>(tk[b], cur, acc, g, t, mxs);
+                    if (more) {
+                        dl_mbar_wait(&full[(s + 1) % WST], ((s + 1) / WST) & 1);
+                        dl_a8_begin<FUSED, HV>(nxt, &wt[(s + 1) % WST], half, warp, g, t);
+                        dl_a8_slot(nxt, 0);
+                    }
+                    dl_a8_mma<(Q < TT ? Q : TT), (2 * Q < TT ? 2 * Q : TT), TTM>(tk[b], cur, acc, g, t, mxs);
+                    if (more) dl_a8_slot(nxt, 1);
+                    dl_a8_mma<(2 * Q < TT ? 2 * Q : TT), (3 * Q < TT ? 3 * Q : TT), TTM>(tk[b], cur, acc, g, t, mxs);
+                    if (more) dl_a8_slot(nxt, 2);
+                    dl_a8_mma<(3 * Q < TT ? 3 * Q : TT), TT, TTM>(tk[b], cur, acc, g, t, mxs);
+                    if (more) dl_a8_slot(nxt, 3);
+                    dl_mbar_arrive(&empty[b]);
+                    const int sn = s + WST - 1;
+                    if (sn < ksteps) {
+                        if (sn >= WST) dl_mbar_wait(&empty[sn % WST], (sn / WST - 1) & 1);
+                        issue_tok(sn);
+                        issue_w(sn);
+                        dl_cp_arrive(&full[sn % WST]);
+                    }
+                    if (more) cur = nxt;
+                }
+            } else {
+                for (int s = 0; s < ksteps; s++) {
+                    const int b = s % WST;
+                    dl_mbar_wait(&full[b], (s / WST) & 1);
+                    dl_stage<WF, AF, FUSED, TT, HV, TTM>(tk[b], &wt[b], half, acc, warp, g, t);
+                    dl_mbar_arrive(&empty[b]);
+                    const int sn = s + WST - 1;    // into buffer (s - 1) % WST
+                    if (sn < ksteps) {
+                        if (sn >= WST) dl_mbar_wait(&empty[sn % WST], (sn / WST - 1) & 1);
+                        issue_tok(sn);
+                        issue_w(sn);
+                        dl_cp_arrive(&full[sn % WST]);
+                    }
                 }
             }
         };
@@ -681,7 +776,7 @@ __device__ __forceinline__ void db_body(
                 __nv_bfloat16* o = os + tok * OLD + half * FEAT;
                 // Per-token activation scale (1 for BF16 tokens; rows past M
                 // read row r0, their outputs are never stored).
-                const float ag = AF == DB_A_BF16 ? 1.0f : Ag[r0 + (tok < rows ? tok : 0)];
+                const float ag = AF == DB_A_BF16 || AF == DB_A_MX8 ? 1.0f : Ag[r0 + (tok < rows ? tok : 0)];
                 if (FUSED) {
                     // The SiLU reads BF16 gate/up, as the unfused chain does.
                     const float gv = __bfloat162float(__float2bfloat16(acc[0][tt][i] * k0 * ag));
@@ -695,9 +790,56 @@ __device__ __forceinline__ void db_body(
         }
     }
     __syncthreads();
-    for (unsigned int i = tid; i < rows * (FEAT * HV / 8); i += NT) {
-        const unsigned int r = i / (FEAT * HV / 8), c = i % (FEAT * HV / 8);
-        *(uint4*)&C[(unsigned long long)(r0 + r) * ldc + n0 + c * 8] = *(const uint4*)&os[r * OLD + c * 8];
+    if constexpr (OUTMX) {
+        // The tile's 128 outputs are two 64-K stages of the down projection:
+        // per row and MMA block (stage st, half h: k = 64 st + 16 c + 8 h + i)
+        // E4M3 of x / 2^E, 2^E the smallest power of two with amax / 2^E <=
+        // 448 (UE8M0 127 + E; 2^0 for an all-zero block), from the BF16 the
+        // unfused chain would write.
+        static_assert(FUSED && FEAT * HV == 128, "MX output: the fused 128-wide gate+up tile");
+        unsigned char* ct = db_smem + DL_ROWS * OLD * sizeof(__nv_bfloat16);   // [row][128] codes
+        for (unsigned int task = tid; task < rows * 4; task += NT) {
+            const unsigned int r = task >> 2, st = (task >> 1) & 1, h = task & 1;
+            uint4 v[4];
+            float am = 0.0f;
+            #pragma unroll
+            for (int c = 0; c < 4; c++) {
+                v[c] = *(const uint4*)&os[r * OLD + 64 * st + 16 * c + 8 * h];
+                const unsigned int* w = (const unsigned int*)&v[c];
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const float2 f = __bfloat1622float2(*(const __nv_bfloat162*)&w[j]);
+                    am = fmaxf(am, fmaxf(fabsf(f.x), fabsf(f.y)));
+                }
+            }
+            const float sc = dl_pow2_scale(am, 448.0f), inv = 1.0f / sc;
+            Cs[(unsigned long long)(r0 + r) * (N / 32) + (n0 / 64 + st) * 2 + h] =
+                (unsigned char)((__float_as_uint(sc) >> 23) & 0xFF);   // 127 + E
+            #pragma unroll
+            for (int c = 0; c < 4; c++) {
+                const unsigned int* w = (const unsigned int*)&v[c];
+                unsigned int o[2] = {0, 0};
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const float2 f = __bfloat1622float2(*(const __nv_bfloat162*)&w[j]);
+                    unsigned short pair;
+                    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(pair) : "f"(f.y * inv), "f"(f.x * inv));
+                    o[j >> 1] |= (unsigned int)pair << (16 * (j & 1));
+                }
+                *(uint2*)&ct[r * 128 + 64 * st + 16 * c + 8 * h] = make_uint2(o[0], o[1]);
+            }
+        }
+        __syncthreads();
+        unsigned char* Cq = (unsigned char*)C;
+        for (unsigned int i = tid; i < rows * 8; i += NT) {
+            const unsigned int r = i >> 3, c = i & 7;
+            *(uint4*)&Cq[(unsigned long long)(r0 + r) * N + n0 + c * 16] = *(const uint4*)&ct[r * 128 + c * 16];
+        }
+    } else {
+        for (unsigned int i = tid; i < rows * (FEAT * HV / 8); i += NT) {
+            const unsigned int r = i / (FEAT * HV / 8), c = i % (FEAT * HV / 8);
+            *(uint4*)&C[(unsigned long long)(r0 + r) * ldc + n0 + c * 8] = *(const uint4*)&os[r * OLD + c * 8];
+        }
     }
 }
 
@@ -819,13 +961,6 @@ dense_w8a8_fp8(const unsigned char* __restrict__ aq, const float* __restrict__ a
 //   dl_quant_fp8: E4M3 of x / ag; ag = 2^e >= amax / 448.
 #define DL_QB 5   // blocks per thread: K <= 20480
 
-// The smallest power of two p with amax / p <= lim; 1 for amax == 0.
-__device__ __forceinline__ float dl_pow2_scale(float amax, float lim) {
-    if (!(amax > 0.0f)) return 1.0f;
-    int e;
-    const float f = frexpf(__fdiv_rn(amax, lim), &e);   // f in [0.5, 1)
-    return ldexpf(1.0f, f == 0.5f ? e - 1 : e);
-}
 
 // Loads this thread's blocks of row x; returns the row's amax (all threads).
 __device__ __forceinline__ float dl_load_row(const __nv_bfloat16* __restrict__ x, unsigned int K, uint4 (&v)[DL_QB][2],
@@ -936,5 +1071,32 @@ dense_w4a8_nvfp4(const unsigned char* __restrict__ aq, const float* __restrict__
                  unsigned int M, unsigned int N, unsigned int K, unsigned int ldc, unsigned int nchunks)
 {
     db_body<DB_NVFP4, false, DB_HV, DL_W4A8_WST, DB_A_FP8>(aq, nullptr, ag, packed, scale, scale2, nullptr, nullptr,
+                                                           0.0f, C, M, N, K, ldc, nchunks);
+}
+
+// MX8 handoff (ATLAS_DENSE_PREFILL_LOWP `dnmx`): the W4A8 gate+up writes the
+// down projection's tokens as MX8 (codes [M, N] at C, scales [M, N/32] at
+// cs); the W4A8 down reads them with the scales applied by the MMA.
+extern "C" __global__ void __launch_bounds__(128 * DB_HV, 1)
+dense_w4a8_gate_up_silu_mx(const unsigned char* __restrict__ aq, const float* __restrict__ ag,
+                           const unsigned char* __restrict__ gate_packed, const unsigned char* __restrict__ gate_scale,
+                           float gate_scale2,
+                           const unsigned char* __restrict__ up_packed, const unsigned char* __restrict__ up_scale,
+                           float up_scale2,
+                           unsigned char* __restrict__ C, unsigned char* __restrict__ cs, unsigned int M,
+                           unsigned int N, unsigned int K, unsigned int nchunks)
+{
+    db_body<DB_NVFP4, true, DB_HV, DL_W4A8_WST, DB_A_FP8, true>(aq, nullptr, ag, gate_packed, gate_scale, gate_scale2,
+                                                                up_packed, up_scale, up_scale2, (__nv_bfloat16*)C, M,
+                                                                N, K, N, nchunks, cs);
+}
+
+extern "C" __global__ void __launch_bounds__(128 * DB_HV, 1)
+dense_w4a8mx_nvfp4(const unsigned char* __restrict__ aq, const unsigned char* __restrict__ as,
+                   const unsigned char* __restrict__ packed, const unsigned char* __restrict__ scale,
+                   float scale2, __nv_bfloat16* __restrict__ C,
+                   unsigned int M, unsigned int N, unsigned int K, unsigned int ldc, unsigned int nchunks)
+{
+    db_body<DB_NVFP4, false, DB_HV, DL_W4A8_WST, DB_A_MX8>(aq, as, nullptr, packed, scale, scale2, nullptr, nullptr,
                                                            0.0f, C, M, N, K, ldc, nchunks);
 }

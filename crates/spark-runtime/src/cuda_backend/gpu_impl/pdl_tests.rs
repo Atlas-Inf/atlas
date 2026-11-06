@@ -266,6 +266,24 @@ extern "C" __global__ void tri_input(const unsigned char* __restrict__ w0, float
     );
 }
 
+/// The kernel tree a target compiles: its MODEL.toml `kernel_source`, else
+/// its own dir (qwen3.8-27b builds qwen3.6-27b's .cu files).
+fn kernel_source(gb10: &Path, model: &str) -> String {
+    std::fs::read_to_string(gb10.join(model).join("MODEL.toml"))
+        .ok()
+        .and_then(|toml| {
+            toml.lines().find_map(|line| {
+                let value = line
+                    .trim()
+                    .strip_prefix("kernel_source")?
+                    .trim()
+                    .strip_prefix('=')?;
+                Some(value.trim().trim_matches('"').to_owned())
+            })
+        })
+        .unwrap_or_else(|| model.to_owned())
+}
+
 /// What a PDL target lists against what its sources define:
 ///
 /// * every listed kernel is defined in every quant dir of the target, and
@@ -283,7 +301,7 @@ fn pdl_target_kernels_wait_exactly_when_listed() {
     let gb10 = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels/gb10");
     let listed_anywhere = |name: &str| PDL_TARGETS.iter().any(|t| t.kernels.contains(&name));
     for target in PDL_TARGETS {
-        for quant in std::fs::read_dir(gb10.join(target.model)).unwrap() {
+        for quant in std::fs::read_dir(gb10.join(kernel_source(&gb10, target.model))).unwrap() {
             let quant = quant.unwrap().path();
             if !quant.is_dir() {
                 continue;
