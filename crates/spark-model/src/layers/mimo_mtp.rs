@@ -48,6 +48,20 @@ pub struct MimoMtpProposerState {
     last_num_drafted: usize,
 }
 
+/// Module `i`'s row is committed once its shifted input token survives verify:
+/// module 0 consumes the already-committed `x_{t+1}`, so it survives even a
+/// full reject; module `i > 0` consumes draft `i` and survives only when at
+/// least `i` drafts were accepted.
+fn module_row_is_committed(module_index: usize, num_accepted: usize) -> bool {
+    module_index <= num_accepted
+}
+
+/// `propose(position)` is called with the pending token's sequence index
+/// (`t + 1`). MiMo MTP rows attend at the anchor hidden's position `t`.
+fn mimo_anchor_position(position: usize) -> usize {
+    position.saturating_sub(1)
+}
+
 impl ProposerState for MimoMtpProposerState {
     fn as_any(&self) -> &dyn Any {
         self
@@ -141,8 +155,9 @@ impl MimoMtpHead {
         })
     }
 
-    /// One draft through module `idx`. The body's output remains in
-    /// `ctx.buffers.hidden_states()` for the next module's `hnorm`.
+    /// One draft through module `idx`. Every MiMo MTP layer consumes the
+    /// TARGET hidden (`h_t`), never the previous draft layer's output; only
+    /// the input token rotates (`x_{t+idx+1}`).
     #[allow(clippy::too_many_arguments)]
     fn forward_one(
         &self,
@@ -359,13 +374,13 @@ impl DraftProposer for MimoMtpHead {
         let k = num_drafts.min(self.modules.len());
         let mut drafts = Vec::with_capacity(k);
         let mut current_token = last_token;
-        let mut current_hidden = target_hidden;
+        let anchor_position = mimo_anchor_position(position);
         for i in 0..k {
             let draft = self.forward_one(
                 i,
                 current_token,
-                current_hidden,
-                position + i,
+                target_hidden,
+                anchor_position,
                 &mut st.modules[i],
                 ctx,
                 stream,
@@ -373,7 +388,6 @@ impl DraftProposer for MimoMtpHead {
             )?;
             drafts.push(draft);
             current_token = draft;
-            current_hidden = ctx.buffers.hidden_states();
         }
         st.last_num_drafted = drafts.len();
         Ok(drafts)
@@ -392,7 +406,7 @@ impl DraftProposer for MimoMtpHead {
             .ok_or_else(|| anyhow::anyhow!("Invalid mimo_v2 MTP proposer state"))?;
         let k = st.last_num_drafted;
         for (i, module) in st.modules.iter_mut().take(k).enumerate() {
-            if i >= num_accepted {
+            if !module_row_is_committed(i, num_accepted) {
                 module.seq_len = module.seq_len.saturating_sub(1);
             }
         }
@@ -418,5 +432,26 @@ impl DraftProposer for MimoMtpHead {
             module.seq_len = 0;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mimo_anchor_position, module_row_is_committed};
+
+    #[test]
+    fn mimo_anchor_is_the_hidden_position_not_the_pending_token() {
+        assert_eq!(mimo_anchor_position(41), 40);
+        assert_eq!(mimo_anchor_position(0), 0);
+    }
+
+    #[test]
+    fn shifted_module_rows_commit_only_after_their_draft_survives() {
+        assert!(module_row_is_committed(0, 0));
+        assert!(!module_row_is_committed(1, 0));
+        assert!(module_row_is_committed(1, 1));
+        assert!(!module_row_is_committed(2, 1));
+        assert!(module_row_is_committed(2, 2));
+        assert!(module_row_is_committed(2, 3));
     }
 }
