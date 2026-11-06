@@ -74,6 +74,10 @@ pub struct ModelLevers {
     /// Routed NVFP4 MoE prefill on BF16 tensor cores with register dequant
     /// (`moe_bf16mma_prefill.cu`) where the target ships it. Opt-in.
     pub moe_prefill_bf16mma: bool,
+    /// Dense NVFP4 MLP and FP8 GDN projection prefill on BF16 tensor cores
+    /// with register dequant (`dense_bf16mma_prefill.cu`) where the target
+    /// ships it. Opt-in.
+    pub dense_prefill_bf16mma: bool,
 
     // ── Attention ──
     /// Contiguous-attention path for the DFlash head.
@@ -244,6 +248,7 @@ impl ModelLevers {
             holo_moe_gateup_fp4: opt_in_truthy("ATLAS_HOLO_MOE_GATEUP_FP4"),
             moe_union_stats: opt_in("ATLAS_MOE_UNION_STATS"),
             moe_prefill_bf16mma: opt_in("ATLAS_MOE_PREFILL_BF16MMA"),
+            dense_prefill_bf16mma: opt_in("ATLAS_DENSE_PREFILL_BF16MMA"),
             dflash_contig_attn: opt_in("ATLAS_DFLASH_CONTIG_ATTN"),
             // Product installation also arms these. The explicit model-load
             // diagnostic lets a no-spec control use identical target arithmetic.

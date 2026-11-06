@@ -384,10 +384,10 @@ pub struct Qwen3AttentionLayer {
     /// when absent or killed by `ATLAS_NO_K64_N64`.
     pub(super) w4a16_gemm_t_k64_n64_k: KernelHandle,
     pub(super) w4a16_gemm_t_m128_k: KernelHandle,
-    /// LOSSLESS BF16-TC variant of t_m128 for QKV/o projection prefill (FP4→BF16
-    /// dequant + BF16 MMA, no FP8 activation crush). Opt-in via ATLAS_BF16_TC_PROJ
-    /// (default off → t_m128 path unchanged). KernelHandle(0) on miss.
+    /// LOSSLESS BF16-TC t_m128 for QKV/o prefill (ATLAS_BF16_TC_PROJ). 0 on miss.
     pub(super) w4a16_gemm_t_m128_bf16_k: KernelHandle,
+    /// NVFP4 q/k/v/o prefill on BF16 tensor cores (ATLAS_DENSE_PREFILL_BF16MMA).
+    pub(super) bf16mma: crate::layers::ops::DenseBf16mma,
     /// MiniMax-only shadow kernel.
     pub(super) w4a16_gemm_t_m128_v2_k: KernelHandle,
     /// v3 variant: K_STEP=64.

@@ -1147,6 +1147,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                             gpu,
                         )?;
                         layer.set_fp8_decode_weights(Some(qkvz_f), Some(out_f));
+                        layer.prepare_dense_bf16mma(gpu)?;
                         // Materialize the transposed [K,N] FP8 copies for the
                         // coalesced `w8a16_gemm_t` prefill GEMM (gfx1151 has no
                         // cp.async pipelined w8a16, so without this the strided

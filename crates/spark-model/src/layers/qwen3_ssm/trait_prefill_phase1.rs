@@ -112,21 +112,22 @@ impl Qwen3SsmLayer {
         let ba_size = ctx.config.ssm_ba_size();
         let gates_buf = ctx.buffers.ssm_gates();
         let gate_stride = nv * 2;
-        ops::dense_gemm_ba_gates_prefill(
-            ctx.gpu,
-            self.ba_gates_prefill_k,
+        self.ba_gates_prefill(
+            ctx,
             normed,
             &self.ssm.in_proj_ba,
             self.ssm.a_log.weight,
             self.ssm.dt_bias.weight,
             gates_buf,
-            k,
-            ba_size as u32,
-            h as u32,
-            h as u32,
-            gate_stride as u32,
-            nv as u32,
-            vpg as u32,
+            [
+                k,
+                ba_size as u32,
+                h as u32,
+                h as u32,
+                gate_stride as u32,
+                nv as u32,
+                vpg as u32,
+            ],
             stream,
         )?;
 
@@ -282,21 +283,22 @@ impl Qwen3SsmLayer {
         let ba_size = ctx.config.ssm_ba_size();
         let gates_buf = ctx.buffers.ssm_gates();
         let gate_stride = nv * 2;
-        ops::dense_gemm_ba_gates_prefill(
-            ctx.gpu,
-            self.ba_gates_prefill_k,
+        self.ba_gates_prefill(
+            ctx,
             normed,
             &self.ssm.in_proj_ba,
             self.ssm.a_log.weight,
             self.ssm.dt_bias.weight,
             gates_buf,
-            k,
-            ba_size as u32,
-            h as u32,
-            h as u32,
-            gate_stride as u32,
-            nv as u32,
-            vpg as u32,
+            [
+                k,
+                ba_size as u32,
+                h as u32,
+                h as u32,
+                gate_stride as u32,
+                nv as u32,
+                vpg as u32,
+            ],
             stream,
         )?;
         ctx.gpu.copy_d2d_async(

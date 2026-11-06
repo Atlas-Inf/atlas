@@ -68,6 +68,10 @@ pub struct Qwen3SsmLayer {
     /// Set by `quantize_dense_gdn_to_fp8` (`ATLAS_QWEN4EXP_FP8_GDN=1`); false
     /// everywhere else, where the dispatch is unchanged.
     fp8w_decode_only: bool,
+    /// Prefill of `[qkvz_fp8w, out_proj_fp8w]` on BF16 tensor cores
+    /// (`prefill_bf16mma.rs`); set up by `prepare_dense_bf16mma`.
+    bf16mma: ops::DenseBf16mma,
+    bf16mma_fp8_ok: [bool; 2],
     // Transposed [K,N] copies of the block-scaled FP8 weights for the coalesced
     // `w8a16_gemm_t` prefill path — populated by `transpose_fp8_for_prefill`
     // for native-FP8 GDN checkpoints. The non-transposed `*_fp8w` copies stay
@@ -447,6 +451,7 @@ mod trait_decode_batched_hc;
 mod trait_decode_hc;
 mod trait_decode_multi_seq;
 pub(crate) use trait_decode_multi_seq::moe_legacy_pertoken_decode;
+mod prefill_bf16mma;
 mod trait_layer;
 mod trait_prefill;
 mod trait_prefill_block;
