@@ -731,6 +731,22 @@ impl TransformerLayer for Qwen3SsmLayer {
         self.prefill_phase1_conv1d_one_inner(state, token_offset, len, gdn_bufs, ctx, stream)
     }
 
+    fn score_conv1d(
+        &self,
+        tables: [DevicePtr; 2],
+        row0: usize,
+        gdn_bufs: &GdnPrefillBuffers,
+        batch: u32,
+        cu_seqlens: DevicePtr,
+        max_len: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        self.try_conv1d_varlen(
+            tables, row0, gdn_bufs, batch, cu_seqlens, max_len, ctx, stream,
+        )
+    }
+
     fn score_gdn_scan(
         &self,
         h_ptrs: DevicePtr,

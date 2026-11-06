@@ -709,6 +709,27 @@ pub trait TransformerLayer: Send + Sync {
         Ok(false)
     }
 
+    /// Score pass: conv1d for `batch` streams laid out by the device
+    /// `cu_seqlens` (rebased to `gdn_bufs`, whose rows start at pass row
+    /// `row0`), each stream's window read from the conv state in the device
+    /// table `inits` and written to the one in `states`. `Ok(false)`: no such
+    /// launch here; the caller keeps `prefill_phase1_conv1d_one`. Default:
+    /// `Ok(false)`.
+    #[allow(clippy::too_many_arguments)]
+    fn score_conv1d(
+        &self,
+        _tables: [DevicePtr; 2],
+        _row0: usize,
+        _gdn_bufs: &GdnPrefillBuffers,
+        _batch: u32,
+        _cu_seqlens: DevicePtr,
+        _max_len: u32,
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Score pass: one GDN scan over `batch` streams laid out by the device
     /// `cu_seqlens` (rebased to `gdn_bufs`), states advanced through the
     /// device table `h_ptrs`, each entry state read from the table `h_init`

@@ -21,6 +21,7 @@
 //
 // Grid (num_q_heads, ceil(max_len / 128), batch), block 256.
 
+#include <cuda.h>   // CUtensorMap
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
@@ -110,6 +111,70 @@ __device__ __forceinline__ void load_kv(__nv_bfloat16 (*dst)[HP], const __nv_bfl
         }
     }
 }
+// ── TMA (the _tma entry): a KV tile as 4 column chunks of 64 x 32 rows,
+// each written by the copy engine with the 128-byte swizzle (16-byte unit u
+// of row r at unit u ^ (r & 7)), one 16-row box per page and chunk. ──
+constexpr int TILE_TMA = BC * HD * 2;   // 16 KB, no padding
+constexpr int TILE_PAD = BC * HP * 2;   // the cp.async tile
+__device__ __forceinline__ unsigned swz(unsigned row, unsigned col) {
+    return (col / 64) * (BC * 128) + row * 128 + ((((col % 64) / 8) ^ (row & 7)) * 16) + (col % 8) * 2;
+}
+__device__ __forceinline__ void mbar_init(uint64_t* bar) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"((unsigned)__cvta_generic_to_shared(bar)));
+}
+__device__ __forceinline__ void mbar_expect_tx(uint64_t* bar, unsigned bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"((unsigned)__cvta_generic_to_shared(bar)),
+                 "r"(bytes) : "memory");
+}
+__device__ __forceinline__ void mbar_wait(uint64_t* bar, unsigned parity) {
+    asm volatile(
+        "{\n.reg .pred P;\nW_%=:\n"
+        "mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1;\n"
+        "@P bra D_%=;\nbra W_%=;\nD_%=:\n}\n" ::"r"((unsigned)__cvta_generic_to_shared(bar)),
+        "r"(parity) : "memory");
+}
+// This thread's generic smem accesses before a later bulk copy into them.
+__device__ __forceinline__ void fence_async() { asm volatile("fence.proxy.async.shared::cta;" ::: "memory"); }
+__device__ __forceinline__ void tma_2d(const CUtensorMap* map, uint64_t* bar, void* dst, int c0, int c1) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%3, %4}], [%2];" ::
+            "r"((unsigned)__cvta_generic_to_shared(dst)), "l"((const void*)map),
+        "r"((unsigned)__cvta_generic_to_shared(bar)), "r"(c0), "r"(c1) : "memory");
+}
+// Thread 0: tile [kv_s, kv_s + BC) of kv head kvh, K and V, completing on
+// `bar`. Pages are 16 rows; a page wholly past kv_l is not loaded (its V
+// rows are zeroed by v_to_f16_tma, its K rows masked before they are read).
+__device__ __forceinline__ void issue_tma(unsigned char* k, unsigned char* v, uint64_t* bar, const CUtensorMap* km,
+                                          const CUtensorMap* vm, const int* bt, unsigned kv_s, unsigned kv_l,
+                                          unsigned kvh) {
+    const unsigned pages = kv_s + 16 < kv_l ? 2 : 1;
+    mbar_expect_tx(bar, pages * 4 * 16 * 128 * 2);
+    for (unsigned i = 0; i < pages; i++) {
+        const int row = bt[kv_s / 16 + i] * 16;
+#pragma unroll
+        for (unsigned c = 0; c < 4; c++) {
+            const unsigned off = c * (BC * 128) + i * 16 * 128;
+            tma_2d(km, bar, k + off, kvh * HD + c * 64, row);
+            tma_2d(vm, bar, v + off, kvh * HD + c * 64, row);
+        }
+    }
+}
+// v_to_f16 for the swizzled tile: rows of 16-byte units, zeroed past `rows`.
+__device__ __forceinline__ void v_to_f16_tma(unsigned char* v, unsigned rows, unsigned tid) {
+#pragma unroll
+    for (unsigned j = 0; j < TILE_TMA / 16 / 256; j++) {
+        const unsigned u = tid + 256 * j, r = (u * 16 % (BC * 128)) / 128;
+        uint4* c = reinterpret_cast<uint4*>(v + u * 16);
+        uint4 w = make_uint4(0, 0, 0, 0);
+        if (r < rows) {
+            w = *c;
+            w.x = bf16w_to_f16x2(w.x); w.y = bf16w_to_f16x2(w.y);
+            w.z = bf16w_to_f16x2(w.z); w.w = bf16w_to_f16x2(w.w);
+        }
+        *c = w;
+    }
+}
+
 // V to FP16 in place, each thread over exactly the chunks load_kv gave it
 // (its own cp.async writes are visible to it after its own wait, no barrier).
 // The BR=64 kernel converts each pair as it builds a fragment; same
@@ -127,8 +192,8 @@ __device__ __forceinline__ void v_to_f16(__nv_bfloat16 (*v)[HP], unsigned tid) {
 }
 }  // namespace rows128
 
-extern "C" __global__ void __launch_bounds__(256, 1)
-prefill_paged_bf16_rows128(
+template <bool TMA>
+__device__ __forceinline__ void rows128_body(
     const __nv_bfloat16* __restrict__ Q,
     const __nv_bfloat16* __restrict__ K_cache,
     const __nv_bfloat16* __restrict__ V_cache,
@@ -147,7 +212,8 @@ prefill_paged_bf16_rows128(
     const unsigned int cache_block_size,
     const unsigned int sliding_window,
     const unsigned int causal_mask_enabled,
-    const float inv_sqrt_d
+    const float inv_sqrt_d,
+    const CUtensorMap* kmap, const CUtensorMap* vmap
 ) {
     using namespace rows128;
     const unsigned q_head = blockIdx.x, q_block = blockIdx.y, b = blockIdx.z;
@@ -175,8 +241,16 @@ prefill_paged_bf16_rows128(
     const unsigned kv_head = q_head / (num_q_heads / num_kv_heads);
     const unsigned long long q_batch_off = (unsigned long long)q_base_b * q_seq_stride;
 
-    __shared__ __align__(16) __nv_bfloat16 sK[2][BC][HP];
-    __shared__ __align__(16) __nv_bfloat16 sV[2][BC][HP];
+    // K tiles then V tiles, two each: padded rows (cp.async) or swizzled chunks (TMA).
+    constexpr unsigned TB = TMA ? TILE_TMA : TILE_PAD;
+    __shared__ __align__(1024) unsigned char smem_kv[4 * TILE_PAD];
+    __shared__ __align__(8) uint64_t bars[2];
+    unsigned char* const kt[2] = {smem_kv, smem_kv + TB};
+    unsigned char* const vt[2] = {smem_kv + 2 * TB, smem_kv + 3 * TB};
+    const auto pad = [](unsigned char* t) { return reinterpret_cast<__nv_bfloat16(*)[HP]>(t); };
+    // Byte offset of (row, col) in a tile.
+    const auto at = [](unsigned row, unsigned col) { return TMA ? swz(row, col) : (row * HP + col) * 2; };
+    const auto rows_of = [&](unsigned blk) { return min((unsigned)BC, kv_len - blk * BC); };
 
     // KV extent of the tile, as the BR=64 kernel derives it for its own rows.
     unsigned num_kv_blocks = (kv_len + BC - 1) / BC;
@@ -196,11 +270,24 @@ prefill_paged_bf16_rows128(
     const unsigned wm = warp * 16, row0 = wm + grp, row1 = row0 + 8;
     const bool active = wm < q_tile_len;
 
-    if (num_kv_blocks > 0) {
-        load_kv(sK[0], K_cache, block_table, kv_block_lo * BC, kv_len, kv_head, cache_block_size, num_kv_heads, tid);
-        load_kv(sV[0], V_cache, block_table, kv_block_lo * BC, kv_len, kv_head, cache_block_size, num_kv_heads, tid);
+    if (TMA) {
+        if (tid == 0) {
+            mbar_init(&bars[0]);
+            mbar_init(&bars[1]);
+            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        }
+        __syncthreads();
+        if (num_kv_blocks > 0 && tid == 0)
+            issue_tma(kt[0], vt[0], &bars[0], kmap, vmap, block_table, kv_block_lo * BC, kv_len, kv_head);
+    } else {
+        if (num_kv_blocks > 0) {
+            load_kv(pad(kt[0]), K_cache, block_table, kv_block_lo * BC, kv_len, kv_head, cache_block_size,
+                    num_kv_heads, tid);
+            load_kv(pad(vt[0]), V_cache, block_table, kv_block_lo * BC, kv_len, kv_head, cache_block_size,
+                    num_kv_heads, tid);
+        }
+        cp_commit();
     }
-    cp_commit();
 
     // Q A-fragments for the warp's 16 rows (rows past the stream read as 0).
     uint32_t qa[HD / 16][4];
@@ -218,8 +305,15 @@ prefill_paged_bf16_rows128(
         }
     }
 
-    cp_wait();
-    v_to_f16(sV[0], tid);
+    if (TMA) {
+        if (num_kv_blocks > 0) {
+            mbar_wait(&bars[0], 0);
+            v_to_f16_tma(vt[0], rows_of(kv_block_lo), tid);
+        }
+    } else {
+        cp_wait();
+        v_to_f16(pad(vt[0]), tid);
+    }
 
     float acc_o[NT_O][4];
 #pragma unroll
@@ -230,15 +324,22 @@ prefill_paged_bf16_rows128(
         const unsigned buf = (kv_block - kv_block_lo) & 1;
         const unsigned kv_start = kv_block * BC;
         const unsigned kv_tile_len = min(kv_start + BC, kv_len) - kv_start;
+        if (TMA) fence_async();   // this thread's accesses of buf ^ 1 precede its next fill
         __syncthreads();   // tile kv_block is in buf (V as FP16); buf ^ 1 is free
         const bool next = kv_block + 1 < num_kv_blocks;
-        if (next) {
-            load_kv(sK[buf ^ 1], K_cache, block_table, (kv_block + 1) * BC, kv_len, kv_head, cache_block_size,
-                    num_kv_heads, tid);
-            load_kv(sV[buf ^ 1], V_cache, block_table, (kv_block + 1) * BC, kv_len, kv_head, cache_block_size,
-                    num_kv_heads, tid);
+        if (TMA) {
+            if (next && tid == 0)
+                issue_tma(kt[buf ^ 1], vt[buf ^ 1], &bars[buf ^ 1], kmap, vmap, block_table, (kv_block + 1) * BC,
+                          kv_len, kv_head);
+        } else {
+            if (next) {
+                load_kv(pad(kt[buf ^ 1]), K_cache, block_table, (kv_block + 1) * BC, kv_len, kv_head,
+                        cache_block_size, num_kv_heads, tid);
+                load_kv(pad(vt[buf ^ 1]), V_cache, block_table, (kv_block + 1) * BC, kv_len, kv_head,
+                        cache_block_size, num_kv_heads, tid);
+            }
+            cp_commit();
         }
-        cp_commit();
         if (active) {
 
         // ── S = Q K^T (16 rows x 32 keys) ──
@@ -253,7 +354,7 @@ prefill_paged_bf16_rows128(
             const unsigned kb = ks * 16;
             uint32_t kf[2][4];
 #pragma unroll
-            for (int np = 0; np < 2; np++) ldsm_x4(kf[np], &sK[buf][np * 16 + lrow][kb + lcol]);
+            for (int np = 0; np < 2; np++) ldsm_x4(kf[np], kt[buf] + at(np * 16 + lrow, kb + lcol));
 #pragma unroll
             for (int nt = 0; nt < 4; nt++) {
                 const unsigned b0 = kf[nt >> 1][(nt & 1) * 2], b1 = kf[nt >> 1][(nt & 1) * 2 + 1];
@@ -357,7 +458,7 @@ prefill_paged_bf16_rows128(
 #pragma unroll
             for (int np = 0; np < NT_O / 2; np++) {
               uint32_t vf[4];
-              ldsm_x4_t(vf, &sV[buf][vrow][np * 16 + vcol]);
+              ldsm_x4_t(vf, vt[buf] + at(vrow, np * 16 + vcol));
 #pragma unroll
               for (int h = 0; h < 2; h++) {
                 const int nt = 2 * np + h;
@@ -373,8 +474,13 @@ prefill_paged_bf16_rows128(
         }
         }   // active
         if (next) {   // the next tile's V, converted before the barrier that publishes it
-            cp_wait();
-            v_to_f16(sV[buf ^ 1], tid);
+            if (TMA) {
+                mbar_wait(&bars[buf ^ 1], ((kv_block + 1 - kv_block_lo) >> 1) & 1);
+                v_to_f16_tma(vt[buf ^ 1], rows_of(kv_block + 1), tid);
+            } else {
+                cp_wait();
+                v_to_f16(pad(vt[buf ^ 1]), tid);
+            }
         }
     }
 
@@ -396,4 +502,31 @@ prefill_paged_bf16_rows128(
             *reinterpret_cast<unsigned*>(&ob[gr1 * q_seq_stride + c0]) = lo | (hi << 16);
         }
     }
+}
+
+#define ROWS128_PARAMS                                                                              \
+    const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ K_cache,                 \
+        const __nv_bfloat16* __restrict__ V_cache, __nv_bfloat16* __restrict__ O,                   \
+        const int* const* __restrict__ block_table_ptrs, const unsigned int batch_size,             \
+        const int* __restrict__ cu_seqlens, const int* __restrict__ kv_lens,                        \
+        const int* __restrict__ state_end, const unsigned int q_len, unsigned int kv_len,           \
+        unsigned int q_offset, const unsigned int num_q_heads, const unsigned int num_kv_heads,     \
+        const unsigned int head_dim, const unsigned int cache_block_size,                           \
+        const unsigned int sliding_window, const unsigned int causal_mask_enabled, const float inv_sqrt_d
+#define ROWS128_ARGS                                                                                \
+    Q, K_cache, V_cache, O, block_table_ptrs, batch_size, cu_seqlens, kv_lens, state_end, q_len,   \
+        kv_len, q_offset, num_q_heads, num_kv_heads, head_dim, cache_block_size, sliding_window,    \
+        causal_mask_enabled, inv_sqrt_d
+
+extern "C" __global__ void __launch_bounds__(256, 1) prefill_paged_bf16_rows128(ROWS128_PARAMS) {
+    rows128_body<false>(ROWS128_ARGS, nullptr, nullptr);
+}
+
+// K and V by TMA: `kmap` / `vmap` view a layer's pool as [blocks * 16 rows]
+// x [num_kv_heads * 256] BF16 with 16 x 64 boxes and the 128-byte swizzle.
+// Needs 16-row pages (the caller checks).
+extern "C" __global__ void __launch_bounds__(256, 1)
+prefill_paged_bf16_rows128_tma(ROWS128_PARAMS, const __grid_constant__ CUtensorMap kmap,
+                               const __grid_constant__ CUtensorMap vmap) {
+    rows128_body<true>(ROWS128_ARGS, &kmap, &vmap);
 }

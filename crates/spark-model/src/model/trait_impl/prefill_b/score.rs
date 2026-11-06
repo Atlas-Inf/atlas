@@ -348,7 +348,7 @@ impl TransformerModel {
         let mut ssm_k = 0usize;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             if layer.is_ssm_layer() {
-                let tabs = ssm_tabs.map(|t| t.offset(ssm_k * 2 * n * 8));
+                let tabs = ssm_tabs.map(|t| t.offset(ssm_k * super::score_ssm::TABLES * n * 8));
                 ssm_k += 1;
                 let mut refs: Vec<&mut SequenceState> = seqs.iter_mut().collect();
                 self.score_ssm_layer(
@@ -442,9 +442,10 @@ impl TransformerModel {
         // staged positions (x3 with MRoPE) and slots (20 B); per stream, the
         // alignment pads and pointer, cu_seqlens, kv_lens, state-end and
         // h-state-pointer entries (256 B, generously); 64 KiB to spare.
-        // Plus, per SSM layer, two pointer-table entries (`score_ssm.rs`).
+        // Plus, per SSM layer, its pointer-table entries (`score_ssm.rs`).
         const PER_STREAM: usize = 256;
-        let per_stream = PER_STREAM + 16 * self.ssm_pool.num_ssm_layers;
+        let tables = super::score_ssm::TABLES * 8 * self.ssm_pool.num_ssm_layers;
+        let per_stream = PER_STREAM + tables;
         let per_row = self.config.num_experts_per_tok.max(1) * 8 + 24 + 20;
         let fixed = 64 * 1024 + per_stream * streams.min(4096);
         let scratch_rows = self.buffers.scratch_bytes().saturating_sub(fixed) / per_row;

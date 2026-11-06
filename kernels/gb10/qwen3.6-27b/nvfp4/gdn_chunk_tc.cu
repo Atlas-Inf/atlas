@@ -656,12 +656,14 @@ gdn_chunk_tc_prefill(
                 mma(S[nt], al, h0, h1);
             }
         }
-        __syncthreads();   // every read of K, S^T and uc^T for this chunk is done
+        // S^T is last read before the join (K S, Q S), so each warp stages its
+        // new rows as soon as its own update is done, beside the others'.
+        stage_state(S, Sh, Sl, warp, grp, q);
+        __syncthreads();   // every read of K and uc^T for this chunk is done; S^T is staged
         if (cen > 0) {
             stage_rows<KD, KP>(Ks, kg, qk_stride, cn, cen, tid);
             cp_commit();
         }
-        stage_state(S, Sh, Sl, warp, grp, q);
     }
 
 #pragma unroll
@@ -669,4 +671,80 @@ gdn_chunk_tc_prefill(
 #pragma unroll
         for (int e = 0; e < 4; e++)
             H[(16 * warp + erow(e, grp)) * VD + nt * 8 + ecol(e, q)] = S[nt][e];
+}
+
+// causal_conv1d_update_prefill_tp (common/causal_conv1d.cu) over several
+// streams in one launch, each stream b over its rows [cu[b], cu[b + 1]) of
+// the input / output, reading its incoming window from init[b] and writing
+// the outgoing one to state[b] (a score branch starts from its head's window
+// with no copy; init[b] == state[b] is the in-place update). Per channel and
+// token the arithmetic is the single-stream kernel's.
+// Grid (ceil(dim / 32), ceil(max_len / 64), batch), block (32, 8).
+extern "C" __global__ void __launch_bounds__(256, 4)
+gdn_chunk_tc_conv1d_varlen(
+    float* const* __restrict__ state,
+    const float* const* __restrict__ init,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ weight,
+    const float* __restrict__ bias,
+    __nv_bfloat16* __restrict__ output,
+    const int* __restrict__ cu_seqlens,
+    unsigned int dim,
+    unsigned int d_conv,
+    unsigned int input_stride,
+    unsigned int output_stride,
+    unsigned int batch_size
+) {
+    const unsigned int b = blockIdx.z;
+    if (b >= batch_size) return;
+    const unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= dim) return;
+    const unsigned int tok0 = (unsigned int)cu_seqlens[b];
+    const unsigned int seq_len = (unsigned int)cu_seqlens[b + 1] - tok0;
+    const unsigned int t0 = (blockIdx.y * blockDim.y + threadIdx.y) * 8u;
+    if (t0 >= seq_len) return;
+    input += (unsigned long long)tok0 * input_stride;
+    output += (unsigned long long)tok0 * output_stride;
+
+    const float* st_in = init[b] + (unsigned long long)ch * d_conv;
+    const __nv_bfloat16* w = weight + (unsigned long long)ch * d_conv;
+    const float b_val = (bias != nullptr) ? bias[ch] : 0.0f;
+
+    float w_reg[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (unsigned int k = 0; k < 4; k++)
+        if (k < d_conv) w_reg[k] = __bfloat162float(w[k]);
+
+    auto xin = [&](long long t) -> float {
+        if (t >= 0) {
+            return (t < (long long)seq_len) ? __bfloat162float(input[(unsigned long long)t * input_stride + ch])
+                                            : 0.0f;
+        }
+        const long long idx = (long long)d_conv + t;
+        return (idx >= 0) ? st_in[idx] : 0.0f;
+    };
+
+    float s0 = xin((long long)t0 - 3);
+    float s1 = xin((long long)t0 - 2);
+    float s2 = xin((long long)t0 - 1);
+#pragma unroll
+    for (unsigned int i = 0; i < 8; i++) {
+        const unsigned int t = t0 + i;
+        if (t >= seq_len) break;
+        const float s3 = xin((long long)t);
+        const float acc = b_val + s0 * w_reg[0] + s1 * w_reg[1] + s2 * w_reg[2] + s3 * w_reg[3];
+        const float sig = 1.0f / (1.0f + __expf(-acc));
+        output[(unsigned long long)t * output_stride + ch] = __float2bfloat16(acc * sig);
+        s0 = s1; s1 = s2; s2 = s3;
+    }
+
+    // As the single-stream kernel: the thread that read the incoming window
+    // writes the outgoing one, reading before ascending k overwrites (only
+    // matters in place).
+    if (t0 == 0u) {
+        float* st = state[b] + (unsigned long long)ch * d_conv;
+#pragma unroll
+        for (unsigned int k = 0; k < 4; k++)
+            if (k < d_conv) st[k] = xin((long long)seq_len - (long long)d_conv + (long long)k);
+    }
 }
