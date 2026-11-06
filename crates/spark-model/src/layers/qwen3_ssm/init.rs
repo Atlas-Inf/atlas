@@ -290,6 +290,7 @@ impl Qwen3SsmLayer {
                 "gated_delta_rule_fla",
                 "gated_delta_rule_chunk_delta_h_tma",
             ),
+            gdn_chunk_tc_k: super::gdn_chunk_tc::load(gpu),
             gdn_prefill_fla_chunk_fwd_o_k: super::super::try_kernel(
                 gpu,
                 "gated_delta_rule_fla",

@@ -232,6 +232,9 @@ pub struct Qwen3SsmLayer {
     /// shape loads the wrong columns without erroring.
     gdn_prefill_fla_chunk_delta_h_tma_k: KernelHandle,
     gdn_prefill_fla_chunk_fwd_o_k: KernelHandle,
+    /// Fused chunked tensor-core GDN scan (`gdn_chunk_tc.rs`); 0 unless
+    /// `ATLAS_GDN_CHUNK_TC=1` and the target ships it.
+    gdn_chunk_tc_k: KernelHandle,
     /// WY32 chunked prefill: processes 32 tokens per WY iteration with H in
     /// shared memory. ~30x faster than per-token for 14k+ sequences.
     gdn_prefill_wy32_k: KernelHandle,
@@ -428,6 +431,7 @@ mod ckpt_capture;
 mod debug;
 mod exact_rows;
 mod fla_dispatch;
+mod gdn_chunk_tc;
 mod gdn_defer;
 pub mod gdn_flags;
 mod gdn_fused_rows;

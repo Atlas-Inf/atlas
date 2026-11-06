@@ -25,6 +25,16 @@ impl Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        let scan = super::super::gdn_chunk_tc::ChunkTcScan {
+            h_state: h_state_ptrs,
+            h_state_is_table: true,
+            batch: batch_size,
+            seq_len: chunk_len,
+            cu_seqlens: None,
+        };
+        if self.try_gdn_chunk_tc(gdn_bufs, scan, ctx, stream)? {
+            return Ok(());
+        }
         let nk = ctx.config.linear_num_key_heads;
         let kd = ctx.config.linear_key_head_dim;
         let nv = ctx.config.linear_num_value_heads;
@@ -255,6 +265,18 @@ impl Qwen3SsmLayer {
         let kd = ctx.config.linear_key_head_dim;
         let nv = ctx.config.linear_num_value_heads;
         let vd = ctx.config.linear_value_head_dim;
+        if cu_seqlens.0 != 0 {
+            let scan = super::super::gdn_chunk_tc::ChunkTcScan {
+                h_state: h_state_ptrs,
+                h_state_is_table: true,
+                batch: batch_size,
+                seq_len: max_seqlen,
+                cu_seqlens: Some(cu_seqlens),
+            };
+            if self.try_gdn_chunk_tc(gdn_bufs, scan, ctx, stream)? {
+                return Ok(true);
+            }
+        }
         let fla_scratch = ctx.buffers.gdn_fla_scratch();
         if !ctx.levers.gdn_batched_fla
             || kd != 128

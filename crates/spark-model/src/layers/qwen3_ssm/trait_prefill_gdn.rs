@@ -97,6 +97,16 @@ impl Qwen3SsmLayer {
         // there for all sizes. Correctness-equivalent, lower throughput; the
         // smem-H fast paths are a Blackwell-only optimization. NVIDIA (cfg
         // unset) takes the full ladder below unchanged.
+        let scan = super::gdn_chunk_tc::ChunkTcScan {
+            h_state,
+            h_state_is_table: false,
+            batch: 1,
+            seq_len: total,
+            cu_seqlens: None,
+        };
+        if self.try_gdn_chunk_tc(gdn_bufs, scan, ctx, stream)? {
+            return Ok(());
+        }
         if cfg!(atlas_scale) {
             // FLA chunked path (recompute_wu → chunk_delta_h_vfused → fwd_o):
             // the HIP-ported kernels keep state in registers/small smem, unlike
