@@ -227,6 +227,13 @@ impl TransformerModel {
     }
 
     pub(super) fn alloc_sequence_dispatch(&self) -> Result<SequenceState> {
+        self.alloc_sequence_reset(true)
+    }
+
+    /// [`Self::alloc_sequence_dispatch`]; `reset = false` skips zeroing the
+    /// slot's SSM state (a score pass zeroes or overwrites what it reads, and
+    /// the slot's next owner resets it on claim).
+    pub(super) fn alloc_sequence_reset(&self, reset: bool) -> Result<SequenceState> {
         // Claim via the RAII guard so the slot is returned to the pool on EVERY
         // sequence-exit path (normal finish, abort/cancel, decode error,
         // swap-out failure, panic). The explicit `free_sequence`/
@@ -311,9 +318,11 @@ impl TransformerModel {
         // Zero SSM states for the new sequence.
         // Synchronous reset: memset + stream sync ensures zero is visible
         // before any subsequent kernel reads the state.
-        self.ssm_pool.reset_slot(slot, self.gpu.as_ref())?;
-        // Double-check: explicit sync to guarantee zero is complete
-        self.gpu.synchronize(self.gpu.default_stream())?;
+        if reset {
+            self.ssm_pool.reset_slot(slot, self.gpu.as_ref())?;
+            // Double-check: explicit sync to guarantee zero is complete
+            self.gpu.synchronize(self.gpu.default_stream())?;
+        }
         let t_reset = t_alloc.elapsed();
 
         let dspark_generation = super::super::dspark_generation::next_dspark_generation(

@@ -85,8 +85,15 @@ impl TransformerModel {
         let mut marks = [0u128; 3];
         let mut seqs: Vec<SequenceState> = Vec::with_capacity(plan.tokens.len());
         let run = (|| -> Result<Vec<Vec<f32>>> {
-            for _ in 0..plan.streams() {
-                seqs.push(self.alloc_sequence()?);
+            // Only a stream that starts from the zero state needs one: a
+            // branch with a head gets the head's conv window and state copied
+            // over whole (`score_fork`), and MTP scratch is never read here.
+            for i in 0..plan.streams() {
+                seqs.push(self.alloc_sequence_reset(false)?);
+                if i < plan.heads || plan.head_of[i].is_none() {
+                    let slot = seqs[i].slot_idx;
+                    self.ssm_pool.zero_slot(slot, self.gpu.as_ref(), stream)?;
+                }
             }
             marks[0] = t0.elapsed().as_micros();
             self.score_forward(&plan, &mut seqs, stream)?;
