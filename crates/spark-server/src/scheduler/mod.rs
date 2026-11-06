@@ -629,10 +629,10 @@ pub fn run(
             }
             let jobs = std::mem::take(&mut pending.0.lock().scores);
             if !jobs.is_empty() {
+                let (rows, streams) = model.score_capacity();
                 let budget = score::ScoreBudget {
-                    // The arena holds a full prefill chunk (8192 unless set).
-                    rows: if max_prefill_tokens > 0 { max_prefill_tokens } else { 8192 },
-                    streams: max_batch_size.max(1),
+                    rows: rows.max(1),
+                    streams: streams.clamp(1, max_batch_size.max(1)),
                 };
                 score::run_jobs(&*model, jobs, prefill_stream, &budget);
             }

@@ -66,11 +66,17 @@ impl TransformerModel {
             .map(|r| (r.prefix, r.branches, r.prefix_bidir))
             .collect();
         let plan = ScorePlan::new(&plan_reqs, bs);
+        let (max_rows, max_streams) = self.score_capacity_impl();
         ensure!(
-            plan.total_rows() <= self.buffers.max_batch_tokens(),
-            "score: {} rows exceed the prefill arena ({} tokens)",
-            plan.total_rows(),
-            self.buffers.max_batch_tokens()
+            plan.total_rows() <= max_rows,
+            "score: {} rows exceed one pass ({max_rows} rows: the prefill arena and SSM \
+             staging buffers; raise --max-prefill-tokens and --max-seq-len)",
+            plan.total_rows()
+        );
+        ensure!(
+            plan.streams() <= max_streams,
+            "score: {} sequences exceed the SSM state pool ({max_streams}; raise --max-batch-size)",
+            plan.streams()
         );
         let options: Vec<Vec<u32>> = reqs.iter().flat_map(|r| r.options.iter().cloned()).collect();
 
@@ -374,5 +380,21 @@ impl TransformerModel {
             self.gpu.copy_h2d_async_retained(&bytes, meta.kv_lens, stream)?;
         }
         Ok(off + ((n * 4 + 63) & !63))
+    }
+}
+
+impl TransformerModel {
+    /// See [`crate::traits::Model::score_capacity`].
+    pub(in crate::model) fn score_capacity_impl(&self) -> (usize, usize) {
+        let mut rows = self.buffers.max_batch_tokens();
+        if self.ssm_pool.num_ssm_layers > 0 {
+            rows = rows.min(self.gdn_buf_max_len);
+        }
+        let streams = if self.ssm_pool.num_ssm_layers > 0 {
+            self.ssm_pool.max_slots
+        } else {
+            usize::MAX
+        };
+        (rows, streams)
     }
 }

@@ -329,6 +329,13 @@ pub trait Model: Send + Sync {
         anyhow::bail!("this model does not support prefill-only scoring")
     }
 
+    /// Most rows and sequences one [`Model::score_requests`] pass can take
+    /// (the prefill arena and the SSM staging buffers; the SSM state pool).
+    /// `(0, 0)` when scoring is unsupported.
+    fn score_capacity(&self) -> (usize, usize) {
+        (0, 0)
+    }
+
     /// Like `prefill_batch_chunk`, but each finishing stream's first-token
     /// logits land in row `row_base + stream_idx` of the shared logits arena
     /// instead of row `stream_idx`.

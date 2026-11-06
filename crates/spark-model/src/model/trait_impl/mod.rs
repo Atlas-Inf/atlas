@@ -298,6 +298,9 @@ impl Model for TransformerModel {
     ) -> Result<Vec<Vec<Vec<f32>>>> {
         self.score_requests_impl(reqs, stream)
     }
+    fn score_capacity(&self) -> (usize, usize) {
+        self.score_capacity_impl()
+    }
     fn supports_prefill_multi(&self) -> bool {
         self.prefill_multi_supported()
     }
