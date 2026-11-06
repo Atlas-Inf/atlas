@@ -17,8 +17,9 @@ use crate::weight_map::{Fp8Weight, QuantizedWeight, WeightQuantFormat};
 const MODULE: &str = "dense_bf16mma_prefill";
 /// Fewer rows are decode / verify batches; they keep their small-M kernels.
 const MIN_ROWS: u32 = 32;
-/// Rows per CTA chunk (`DB_ROWS`).
+/// Rows per CTA chunk (`DB_ROWS`; the low-precision kernels `DL_ROWS`).
 const ROWS: u32 = 64;
+const LOWP_ROWS: u32 = 128;
 /// Threads per CTA: two 128-thread feature halves.
 const THREADS: u32 = 256;
 /// Output features per CTA: gate/up (64 of each per half), the others.
@@ -32,15 +33,16 @@ const FP8_BLOCK: u32 = 128;
 /// 8 KiB) — `DbTok` / `DbW` in the kernel. Both fit two CTAs per SM.
 const SMEM_NVFP4: u32 = 2 * 8192 + 3 * 2 * (4096 + 512);
 const SMEM_FP8: u32 = 2 * 8192 + 2 * 2 * 8192;
-/// Low-precision kernels (`db_smem_bytes`): W4A4 four stages of 2304-byte
-/// NVFP4 tokens and weights (`DL_NV_WST`); W8A8 two stages of 4 KiB E4M3
-/// tokens and weights.
-const SMEM_W4A4: u32 = 4 * (2304 + 2 * (4096 + 512));
+/// Low-precision kernels (`db_smem_bytes`, one CTA per SM): the 128-row
+/// BF16 epilogue tile bounds W4A4 (four stages of 4.5 KiB NVFP4 tokens and
+/// 9 KiB weights) and W4A8 (three of 8 KiB E4M3 tokens and 9 KiB weights);
+/// W8A8 is three stages of 8 KiB tokens and 16 KiB weights.
+const LOWP_EPILOGUE: u32 = LOWP_ROWS * (256 + 8) * 2;
+const SMEM_W4A4: u32 = LOWP_EPILOGUE;
 /// The quantizers hold a row in registers: 16 x 256 x `DL_QB` values.
 const QUANT_MAX_K: u32 = 16 * 256 * 5;
-const SMEM_W8A8: u32 = 2 * 4096 + 2 * 2 * 8192;
-/// W4A8: three stages of 4 KiB E4M3 tokens and NVFP4 weights (`DL_W4A8_WST`).
-const SMEM_W4A8: u32 = 3 * (4096 + 2 * (4096 + 512));
+const SMEM_W8A8: u32 = 3 * (8192 + 2 * 8192);
+const SMEM_W4A8: u32 = LOWP_EPILOGUE;
 const CTAS_PER_SM: u32 = 2;
 /// Per-CTA cost of streaming its weight tile, in token tiles' worth of work
 /// (`chunks`).
@@ -163,8 +165,8 @@ impl Default for DenseBf16mma {
 /// (down at 288 rows: 5 chunks x 20 tiles = 100 CTAs on 96 slots) takes
 /// smaller chunks instead of a nearly empty second wave. Results do not
 /// depend on it: every output is one CTA's fixed-order K loop.
-fn chunks(m: u32, tiles: u32, slots: u32) -> u32 {
-    (m.div_ceil(ROWS)..=m.div_ceil(16))
+fn chunks(m: u32, tiles: u32, slots: u32, rows: u32) -> u32 {
+    (m.div_ceil(rows)..=m.div_ceil(16))
         .min_by_key(|&c| (tiles * c).div_ceil(slots) * (CTA_FIXED + m.div_ceil(c).div_ceil(8)))
         .unwrap_or(1)
 }
@@ -272,10 +274,69 @@ impl DenseBf16mma {
         Ok(token_scales)
     }
 
-    /// `[grid, nchunks]` for `m` rows of `n` features, `features` per CTA.
-    fn geometry(&self, m: u32, n: u32, features: u32) -> ([u32; 3], u32) {
-        let c = chunks(m, n / features, self.slots.max(1));
-        ([(n / features) * c, 1, 1], c)
+    /// The low-precision twin serving this launch, if any: `(NVFP4 tokens,
+    /// kernel, shared memory)`. `a8` is the E4M3-token kernel and its group bit.
+    fn lowp_kernel(
+        &self,
+        lowp: &LowpArgs,
+        k: u32,
+        a4: (KernelHandle, u32),
+        (a8_group, a8, a8_smem): (u16, KernelHandle, u32),
+    ) -> Option<(bool, KernelHandle, u32)> {
+        if self.lowp_on(a8_group, lowp, k, [a8, self.quant_fp8]) {
+            Some((false, a8, a8_smem))
+        } else if self.lowp_on(lowp.group, lowp, k, [a4.0, self.quant_nvfp4]) {
+            Some((true, a4.0, a4.1))
+        } else {
+            None
+        }
+    }
+
+    /// The launch up to the weights: the BF16 `kernel` on `input`, or the
+    /// activations quantized and the low-precision kernel `lp`; its grid for
+    /// `m` rows of `n` features, `features` per CTA, and the chunk count.
+    #[allow(clippy::too_many_arguments)]
+    fn head<'a>(
+        &self,
+        gpu: &'a dyn GpuBackend,
+        (kernel, smem): (KernelHandle, u32),
+        lp: Option<(bool, KernelHandle, u32)>,
+        input: DevicePtr,
+        lowp: &LowpArgs,
+        [m, n, k, features]: [u32; 4],
+        stream: u64,
+    ) -> Result<(KernelLaunch<'a>, u32)> {
+        let (launch, rows, slots) = match lp {
+            None => (
+                KernelLaunch::new(gpu, kernel)
+                    .shared_mem(smem)
+                    .arg_ptr(input),
+                ROWS,
+                self.slots,
+            ),
+            Some((nvfp4, kernel, smem)) => {
+                let token_scales = self.quantize(gpu, nvfp4, input, lowp, [m, k], stream)?;
+                let launch = KernelLaunch::new(gpu, kernel)
+                    .shared_mem(smem)
+                    .arg_ptr(lowp.codes);
+                let launch = match nvfp4 {
+                    true => launch.arg_ptr(lowp.scales),
+                    false => launch,
+                };
+                (
+                    launch.arg_ptr(token_scales),
+                    LOWP_ROWS,
+                    self.slots / CTAS_PER_SM,
+                )
+            }
+        };
+        let c = chunks(m, n / features, slots.max(1), rows);
+        Ok((
+            launch
+                .grid([(n / features) * c, 1, 1])
+                .block([THREADS, 1, 1]),
+            c,
+        ))
     }
 
     /// Whether `gate_up_silu` + `nvfp4` serve `m` rows of an MLP with these
@@ -306,29 +367,22 @@ impl DenseBf16mma {
         lowp: LowpArgs,
         stream: u64,
     ) -> Result<()> {
-        let (grid, nchunks) = self.geometry(m, inter, GATE_UP_FEATURES);
-        let a8 = lowp.group << LowpMix::A8;
-        let launch = if self.lowp_on(a8, &lowp, h, [self.w4a8_gate_up, self.quant_fp8]) {
-            let token_scales = self.quantize(gpu, false, input, &lowp, [m, h], stream)?;
-            KernelLaunch::new(gpu, self.w4a8_gate_up)
-                .shared_mem(SMEM_W4A8)
-                .arg_ptr(lowp.codes)
-                .arg_ptr(token_scales)
-        } else if self.lowp_on(lowp.group, &lowp, h, [self.w4a4_gate_up, self.quant_nvfp4]) {
-            let token_scales = self.quantize(gpu, true, input, &lowp, [m, h], stream)?;
-            KernelLaunch::new(gpu, self.w4a4_gate_up)
-                .shared_mem(SMEM_W4A4)
-                .arg_ptr(lowp.codes)
-                .arg_ptr(lowp.scales)
-                .arg_ptr(token_scales)
-        } else {
-            KernelLaunch::new(gpu, self.gate_up)
-                .shared_mem(SMEM_NVFP4)
-                .arg_ptr(input)
-        };
+        let lp = self.lowp_kernel(
+            &lowp,
+            h,
+            (self.w4a4_gate_up, SMEM_W4A4),
+            (lowp.group << LowpMix::A8, self.w4a8_gate_up, SMEM_W4A8),
+        );
+        let (launch, nchunks) = self.head(
+            gpu,
+            (self.gate_up, SMEM_NVFP4),
+            lp,
+            input,
+            &lowp,
+            [m, inter, h, GATE_UP_FEATURES],
+            stream,
+        )?;
         launch
-            .grid(grid)
-            .block([THREADS, 1, 1])
             .arg_ptr(gate.weight)
             .arg_ptr(gate.weight_scale)
             .arg_f32(gate.weight_scale_2)
@@ -360,29 +414,22 @@ impl DenseBf16mma {
         lowp: LowpArgs,
         stream: u64,
     ) -> Result<()> {
-        let (grid, nchunks) = self.geometry(m, n, FEATURES);
-        let a8 = lowp.group << LowpMix::A8;
-        let launch = if self.lowp_on(a8, &lowp, k, [self.w4a8, self.quant_fp8]) {
-            let token_scales = self.quantize(gpu, false, input, &lowp, [m, k], stream)?;
-            KernelLaunch::new(gpu, self.w4a8)
-                .shared_mem(SMEM_W4A8)
-                .arg_ptr(lowp.codes)
-                .arg_ptr(token_scales)
-        } else if self.lowp_on(lowp.group, &lowp, k, [self.w4a4, self.quant_nvfp4]) {
-            let token_scales = self.quantize(gpu, true, input, &lowp, [m, k], stream)?;
-            KernelLaunch::new(gpu, self.w4a4)
-                .shared_mem(SMEM_W4A4)
-                .arg_ptr(lowp.codes)
-                .arg_ptr(lowp.scales)
-                .arg_ptr(token_scales)
-        } else {
-            KernelLaunch::new(gpu, self.nvfp4)
-                .shared_mem(SMEM_NVFP4)
-                .arg_ptr(input)
-        };
+        let lp = self.lowp_kernel(
+            &lowp,
+            k,
+            (self.w4a4, SMEM_W4A4),
+            (lowp.group << LowpMix::A8, self.w4a8, SMEM_W4A8),
+        );
+        let (launch, nchunks) = self.head(
+            gpu,
+            (self.nvfp4, SMEM_NVFP4),
+            lp,
+            input,
+            &lowp,
+            [m, n, k, FEATURES],
+            stream,
+        )?;
         launch
-            .grid(grid)
-            .block([THREADS, 1, 1])
             .arg_ptr(w.weight)
             .arg_ptr(w.weight_scale)
             .arg_f32(w.weight_scale_2)
@@ -418,21 +465,23 @@ impl DenseBf16mma {
         lowp: LowpArgs,
         stream: u64,
     ) -> Result<()> {
-        let (grid, nchunks) = self.geometry(m, w.n, FEATURES);
-        let launch = if self.lowp_on(lowp.group, &lowp, w.k, [self.w8a8, self.quant_fp8]) {
-            let token_scales = self.quantize(gpu, false, input, &lowp, [m, w.k], stream)?;
-            KernelLaunch::new(gpu, self.w8a8)
-                .shared_mem(SMEM_W8A8)
-                .arg_ptr(lowp.codes)
-                .arg_ptr(token_scales)
-        } else {
-            KernelLaunch::new(gpu, self.fp8)
-                .shared_mem(SMEM_FP8)
-                .arg_ptr(input)
-        };
+        // E4M3 tokens only: the FP8 group's own bit selects W8A8.
+        let lp = self.lowp_kernel(
+            &lowp,
+            w.k,
+            (KernelHandle(0), 0),
+            (lowp.group, self.w8a8, SMEM_W8A8),
+        );
+        let (launch, nchunks) = self.head(
+            gpu,
+            (self.fp8, SMEM_FP8),
+            lp,
+            input,
+            &lowp,
+            [m, w.n, w.k, FEATURES],
+            stream,
+        )?;
         launch
-            .grid(grid)
-            .block([THREADS, 1, 1])
             .arg_ptr(w.weight)
             .arg_ptr(w.row_scale)
             .arg_ptr(out)
@@ -514,24 +563,26 @@ mod gpu_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::chunks;
+    use super::{LOWP_ROWS, ROWS, chunks};
 
     #[test]
     fn chunks_stay_within_the_kernel_tile_and_fill_short_grids() {
-        for m in 1..5000 {
-            for tiles in [20, 64, 136] {
-                let c = chunks(m, tiles, 96);
-                assert!(
-                    c >= m.div_ceil(64) && m.div_ceil(c) <= 64,
-                    "m={m} tiles={tiles} c={c}"
-                );
-                // The kernel's balanced split never leaves an empty chunk.
-                assert!((c - 1) * m.div_ceil(c) < m, "m={m} tiles={tiles} c={c}");
+        for (rows, slots) in [(ROWS, 96), (LOWP_ROWS, 48)] {
+            for m in 1..5000 {
+                for tiles in [20, 64, 136] {
+                    let c = chunks(m, tiles, slots, rows);
+                    assert!(
+                        c >= m.div_ceil(rows) && m.div_ceil(c) <= rows,
+                        "m={m} tiles={tiles} c={c}"
+                    );
+                    // The kernel's balanced split never leaves an empty chunk.
+                    assert!((c - 1) * m.div_ceil(c) < m, "m={m} tiles={tiles} c={c}");
+                }
             }
         }
         // down / out_proj at 288 rows: not 5 x 20 = 100 CTAs on 96 slots.
-        assert!(chunks(288, 20, 96) * 20 <= 96 || chunks(288, 20, 96) * 20 > 150);
+        assert!(chunks(288, 20, 96, ROWS) * 20 <= 96 || chunks(288, 20, 96, ROWS) * 20 > 150);
         // Full waves already: keep 64-row chunks.
-        assert_eq!(chunks(4128, 136, 96), 65);
+        assert_eq!(chunks(4128, 136, 96, ROWS), 65);
     }
 }

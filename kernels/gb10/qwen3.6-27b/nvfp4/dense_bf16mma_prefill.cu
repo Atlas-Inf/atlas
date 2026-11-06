@@ -73,19 +73,23 @@ __device__ __forceinline__ unsigned int db_fp8_row(unsigned int f) {
 }
 
 // Token formats: BF16, NVFP4 (packed e2m1 [M, K/2], E4M3 scales [M, K/16],
-// FP32 per-token scale), E4M3 (bytes [M, K], FP32 per-token scale).
+// FP32 per-token scale), E4M3 (bytes [M, K], FP32 per-token scale). The
+// low-precision kernels take 128-row chunks (one CTA per SM, 16 token tiles
+// per warp: each weight tile is read by half as many CTAs).
 enum { DB_A_BF16 = 0, DB_A_NVFP4 = 1, DB_A_FP8 = 2 };
+#define DL_ROWS 128
+template <int AF> __host__ __device__ constexpr int db_rows() { return AF == DB_A_BF16 ? DB_ROWS : DL_ROWS; }
 template <int AF> struct DbT;
 template <> struct DbT<DB_A_BF16> { using T = DbTok; };
 // NVFP4: 32-byte rows, the two 16-byte chunks swapped on rows 4..7 of each
 // 8 (dl_tok4) so a quarter warp's b0 / b1 reads hit 32 banks.
 struct __align__(16) DbTok4 {
-    unsigned char q[DB_ROWS][DB_KS / 2];            // 2048 B
-    unsigned int s[DB_ROWS];                        //  256 B: the 4 group scales
+    unsigned char q[DL_ROWS][DB_KS / 2];            // 4096 B
+    unsigned int s[DL_ROWS];                        //  512 B: the 4 group scales
 };
 template <> struct DbT<DB_A_NVFP4> { using T = DbTok4; };
 struct __align__(16) DbTok8 {
-    unsigned char q[DB_ROWS][DB_KS];                // 4096 B
+    unsigned char q[DL_ROWS][DB_KS];                // 8192 B
 };
 template <> struct DbT<DB_A_FP8> { using T = DbTok8; };
 __device__ __forceinline__ unsigned int dl_tok4(unsigned int r, unsigned int c) { return (c ^ ((r >> 2) & 1)) * 16; }
@@ -131,17 +135,12 @@ __device__ __forceinline__ void dl_mma_mx8(float c[4], unsigned int a0, unsigned
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(sa), "r"(0x7f7f7f7fu));
 }
 
-// Four e2m1 pairs (bytes of w, low nibble = even k) -> four f16x2 of
-// value * 2^-14 (bm_dequant4's bit placement, three bits higher).
+// Four e2m1 pairs (bytes of w, low nibble = even k) -> four f16x2, exact.
 __device__ __forceinline__ void dl_e2m1_f16(unsigned int w, unsigned int out[4]) {
-    const unsigned int v = w << 4;
-    const unsigned int z01 = __byte_perm(w, v, 0x0145);
-    const unsigned int z23 = __byte_perm(w, v, 0x2367);
-    const unsigned int S = 0x80008000u, M = 0x0E000E00u;
-    out[0] = (z01 & S) | ((z01 >> 3) & M);
-    out[1] = ((z01 << 8) & S) | ((z01 << 5) & M);
-    out[2] = (z23 & S) | ((z23 >> 3) & M);
-    out[3] = ((z23 << 8) & S) | ((z23 << 5) & M);
+    asm("{\n\t.reg .b8 b0, b1, b2, b3;\n\tmov.b32 {b0, b1, b2, b3}, %4;\n\t"
+        "cvt.rn.f16x2.e2m1x2 %0, b0;\n\tcvt.rn.f16x2.e2m1x2 %1, b1;\n\t"
+        "cvt.rn.f16x2.e2m1x2 %2, b2;\n\tcvt.rn.f16x2.e2m1x2 %3, b3;\n\t}"
+        : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3]) : "r"(w));
 }
 
 // f16x2 -> two E4M3 bytes (low half in the low byte), round to nearest.
@@ -231,6 +230,8 @@ __device__ __forceinline__ void db_stage(const DbTok& tk, const DbW<WF, HV>& sb,
     }
 }
 
+template <int N> struct dl_int { static constexpr int value = N; };
+
 // One 64-wide K stage of the low-precision paths for TT token tiles.
 //  W4A4: the MMA's K is the stage's K in order. Thread t's A registers are
 //  k-pair rows 4t..4t+3 (a0, a1) and 16+4t..16+4t+3 (a2, a3) of its four
@@ -244,9 +245,9 @@ __device__ __forceinline__ void db_stage(const DbTok& tk, const DbW<WF, HV>& sb,
 //  stage's largest block scale * 6 under 448, and the MMA applies 2^E as a
 //  UE8M0 scale: values with at most 4 significant bits are exact, the rest
 //  round once to E4M3.
-template <int WF, int AF, bool FUSED, int TT, int HV>
+template <int WF, int AF, bool FUSED, int TT, int HV, int TTM>
 __device__ __forceinline__ void dl_stage(const typename DbT<AF>::T& tk, const void* sbv, unsigned int half,
-                                         float (&acc)[2][8][4], unsigned int warp, unsigned int g,
+                                         float (&acc)[2][TTM][4], unsigned int warp, unsigned int g,
                                          unsigned int t) {
     if constexpr (AF == DB_A_FP8 && WF == DB_NVFP4) {
         const DbW<DB_NVFP4, HV>& sb = *(const DbW<DB_NVFP4, HV>*)sbv;
@@ -258,17 +259,15 @@ __device__ __forceinline__ void dl_stage(const typename DbT<AF>::T& tk, const vo
         unsigned int sh[4], ue[4];
         #pragma unroll
         for (int sl = 0; sl < 4; sl++) {
-            const float mx = nvfp4q_e4m3_value((m4 >> (8 * sl)) & 0xFF);
-            int e = 0;
-            if (mx > 0.0f) {
-                const float f = frexpf(mx * (6.0f / 448.0f), &e);
-                e = f == 0.5f ? e - 1 : e;
-            }
+            // E = ceil(log2(6 * max / 448)) from the FP32 bits (max * 6 / 448
+            // is a normal float for every nonzero E4M3 scale); 0 for max 0.
+            const unsigned int xb = __float_as_uint(nvfp4q_e4m3_value((m4 >> (8 * sl)) & 0xFF) * (6.0f / 448.0f));
+            const int e = xb ? (int)(xb >> 23) - 127 + ((xb & 0x7FFFFFu) != 0) : 0;
             ue[sl] = (unsigned int)(127 + e);
-            // s * 2^(9 - E) in f16: >= 1 for every scale whose values still
-            // reach E4M3 under 2^E, below 2^16 for all.
-            const __half hs = __float2half_rn(ldexpf(nvfp4q_e4m3_value((s4 >> (8 * sl)) & 0xFF), 9 - e));
-            const unsigned int hb = __half_as_ushort(hs);
+            // s / 2^E in f16: <= 448 / 6, and exact wherever its values
+            // reach E4M3 (below 2^-14 they round to zero either way).
+            const float sv = nvfp4q_e4m3_value((s4 >> (8 * sl)) & 0xFF) * __uint_as_float((unsigned int)(127 - e) << 23);
+            const unsigned int hb = __half_as_ushort(__float2half_rn(sv));
             sh[sl] = hb | (hb << 16);
         }
         const unsigned int odd = t & 1;
@@ -289,7 +288,7 @@ __device__ __forceinline__ void dl_stage(const typename DbT<AF>::T& tk, const vo
                 dl_e2m1_f16(f[sl], x);
                 #pragma unroll
                 for (int j = 0; j < 4; j++)
-                    p[j] = dl_e4m3x2(dl_hmul2(dl_hmul2(x[j], sh[sl]), 0x50005000u));   // x 32
+                    p[j] = dl_e4m3x2(dl_hmul2(x[j], sh[sl]));
                 a[h][sl][0] = p[0] | (p[1] << 16);
                 a[h][sl][1] = p[2] | (p[3] << 16);
             }
@@ -365,7 +364,7 @@ template <int AF, int WST> __host__ __device__ constexpr int db_tst() { return A
 template <int WF, bool FUSED, int HV, int WST, int AF>
 __host__ __device__ constexpr unsigned int db_smem_bytes() {
     constexpr unsigned int stages = db_tst<AF, WST>() * sizeof(typename DbT<AF>::T) + WST * sizeof(DbW<WF, HV>);
-    constexpr unsigned int out = DB_ROWS * ((FUSED ? 64 : 128) * HV + 8) * sizeof(__nv_bfloat16);
+    constexpr unsigned int out = db_rows<AF>() * ((FUSED ? 64 : 128) * HV + 8) * sizeof(__nv_bfloat16);
     return stages > out ? stages : out;
 }
 
@@ -388,6 +387,7 @@ __device__ __forceinline__ void db_body(
     constexpr int TST = db_tst<AF, WST>();
     static_assert(AF != DB_A_NVFP4 || WF == DB_NVFP4, "NVFP4 tokens take NVFP4 weights (W4A4)");
     using Tok = typename DbT<AF>::T;
+    constexpr int TTM = db_rows<AF>() / 8;               // token tiles per chunk
     constexpr unsigned int FEAT = FUSED ? 64 : 128;      // output features per half
     constexpr unsigned int NT = 128 * HV;                // threads
     extern __shared__ __align__(16) unsigned char db_smem[];
@@ -423,18 +423,18 @@ __device__ __forceinline__ void db_body(
     const bool tok_valid = lr < rows;
     const unsigned int tc = (tid % TPR) * CPT, tc0 = tc * 8;
     const __nv_bfloat16* a_src = (const __nv_bfloat16*)Av + (unsigned long long)(r0 + (tok_valid ? lr : 0)) * K + tc0;
-    // Low-precision token loaders. NVFP4: threads 0..127 one 16-byte chunk
-    // (row tid / 2), threads 128..191 a row's four scales. E4M3: one chunk
-    // (row tid / 4) per thread.
-    const unsigned int qr = AF == DB_A_NVFP4 ? (tid & 127) >> 1 : tid >> 2;
+    // Low-precision token loaders (128 rows). NVFP4: one 16-byte chunk per
+    // thread (row tid / 2), and threads 0..127 row tid's four scales. E4M3:
+    // chunk tid % 4 of rows tid / 4 and tid / 4 + 64.
+    const unsigned int qrow = AF == DB_A_NVFP4 ? tid >> 1 : tid >> 2;
     const unsigned int qc = AF == DB_A_NVFP4 ? tid & 1 : tid & 3;
-    const bool q_live = AF == DB_A_NVFP4 ? (tid < 128 ? (int)qr < tt_valid * 8 : (int)(tid - 128) < tt_valid * 8)
-                                         : (int)qr < tt_valid * 8;
-    const unsigned int qrow = AF == DB_A_NVFP4 && tid >= 128 ? tid - 128 : qr;
-    const bool q_valid = qrow < rows;
-    const unsigned char* q_src = (const unsigned char*)Av
-        + (unsigned long long)(r0 + (q_valid ? qrow : 0)) * (AF == DB_A_NVFP4 ? K / 2 : K) + qc * 16;
-    const unsigned char* qs_src = As + (unsigned long long)(r0 + (q_valid ? qrow : 0)) * (K / 16);
+    constexpr unsigned int QSTEP = 64;                   // E4M3: the second row
+    const unsigned int QROW_B = AF == DB_A_NVFP4 ? 0 : qrow + QSTEP;
+    const unsigned int qbytes = AF == DB_A_NVFP4 ? K / 2 : K;
+    auto q_row = [&](unsigned int r) { return (const unsigned char*)Av + (unsigned long long)(r0 + (r < rows ? r : 0)) * qbytes + qc * 16; };
+    const unsigned char* q_src = q_row(qrow);
+    const unsigned char* q_src_b = q_row(QROW_B);
+    const unsigned char* qs_src = As + (unsigned long long)(r0 + (tid < rows ? tid : 0)) * (K / 16);
 
     // NVFP4 weight loader: two 16-byte chunks of k-pair row `wkp`; scale
     // loader (threads 0..31 of each half): one chunk of group row `sgr`.
@@ -463,12 +463,14 @@ __device__ __forceinline__ void db_body(
                     bm_cp16(&tk[s % TST].tok[lr][db_tok(lr, tc + c)], a_src + kb + 8 * c, tok_valid);
             }
         } else if constexpr (AF == DB_A_NVFP4) {
-            if (q_live && tid < 128)
-                bm_cp16(&tk[s % TST].q[qrow][dl_tok4(qrow, qc)], q_src + kb / 2, q_valid);
-            else if (q_live && tid < 192)
-                dl_cp4(&tk[s % TST].s[qrow], qs_src + kb / 16, q_valid);
+            if ((int)qrow < tt_valid * 8)
+                bm_cp16(&tk[s % TST].q[qrow][dl_tok4(qrow, qc)], q_src + kb / 2, qrow < rows);
+            if ((int)tid < tt_valid * 8 && tid < DL_ROWS)
+                dl_cp4(&tk[s % TST].s[tid], qs_src + kb / 16, tid < rows);
         } else {
-            if (q_live) bm_cp16(&tk[s % TST].q[qrow][qc * 16], q_src + kb, q_valid);
+            if ((int)qrow < tt_valid * 8) bm_cp16(&tk[s % TST].q[qrow][qc * 16], q_src + kb, qrow < rows);
+            if ((int)QROW_B < tt_valid * 8)
+                bm_cp16(&tk[s % TST].q[QROW_B][qc * 16], q_src_b + kb, QROW_B < rows);
         }
     };
     auto issue_w = [&](int s) {
@@ -490,11 +492,11 @@ __device__ __forceinline__ void db_body(
         }
     };
 
-    float acc[2][8][4];
+    float acc[2][TTM][4];
     #pragma unroll
     for (int f = 0; f < 2; f++)
         #pragma unroll
-        for (int i = 0; i < 8; i++)
+        for (int i = 0; i < TTM; i++)
             acc[f][i][0] = acc[f][i][1] = acc[f][i][2] = acc[f][i][3] = 0.0f;
 
     // BF16 tokens: commit order W0 T0 W1 .. W(WST-2), then per step T(s+1)
@@ -521,35 +523,50 @@ __device__ __forceinline__ void db_body(
             bm_commit();
         }
     }
+    if constexpr (AF != DB_A_BF16) {
+        // The tile count is fixed per CTA: one loop per count.
+        auto kloop = [&](auto ttc) {
+            constexpr int TT = decltype(ttc)::value;
+            for (int s = 0; s < ksteps; s++) {
+                bm_wait<WST - 2>();
+                __syncthreads();
+                if (s + WST - 1 < ksteps) {
+                    issue_tok(s + WST - 1);
+                    issue_w(s + WST - 1);
+                }
+                bm_commit();
+                dl_stage<WF, AF, FUSED, TT, HV, TTM>(tk[s % TST], &wt[s % WST], half, acc, warp, g, t);
+            }
+        };
+        switch (tt_valid) {
+            case 1: kloop(dl_int<1>{}); break;
+            case 2: kloop(dl_int<2>{}); break;
+            case 3: kloop(dl_int<3>{}); break;
+            case 4: kloop(dl_int<4>{}); break;
+            case 5: kloop(dl_int<5>{}); break;
+            case 6: kloop(dl_int<6>{}); break;
+            case 7: kloop(dl_int<7>{}); break;
+            case 8: kloop(dl_int<8>{}); break;
+            case 9: kloop(dl_int<9>{}); break;
+            case 10: kloop(dl_int<10>{}); break;
+            case 11: kloop(dl_int<11>{}); break;
+            case 12: kloop(dl_int<12>{}); break;
+            case 13: kloop(dl_int<13>{}); break;
+            case 14: kloop(dl_int<14>{}); break;
+            case 15: kloop(dl_int<15>{}); break;
+            default: kloop(dl_int<TTM>{}); break;
+        }
+    } else
     for (int s = 0; s < ksteps; s++) {
         bm_wait<WST - 2>();
         __syncthreads();
-        if constexpr (AF == DB_A_BF16) {
-            if (s + 1 < ksteps) issue_tok(s + 1);
-            bm_commit();
-            if (s + WST - 1 < ksteps) issue_w(s + WST - 1);
-            bm_commit();
-        } else {
-            if (s + WST - 1 < ksteps) {
-                issue_tok(s + WST - 1);
-                issue_w(s + WST - 1);
-            }
-            bm_commit();
-        }
+        if (s + 1 < ksteps) issue_tok(s + 1);
+        bm_commit();
+        if (s + WST - 1 < ksteps) issue_w(s + WST - 1);
+        bm_commit();
         const Tok& tb = tk[s % TST];
         const DbW<WF, HV>& sb = wt[s % WST];
-        if constexpr (AF != DB_A_BF16) {
-            switch (tt_valid) {
-                case 1: dl_stage<WF, AF, FUSED, 1, HV>(tb, &sb, half, acc, warp, g, t); break;
-                case 2: dl_stage<WF, AF, FUSED, 2, HV>(tb, &sb, half, acc, warp, g, t); break;
-                case 3: dl_stage<WF, AF, FUSED, 3, HV>(tb, &sb, half, acc, warp, g, t); break;
-                case 4: dl_stage<WF, AF, FUSED, 4, HV>(tb, &sb, half, acc, warp, g, t); break;
-                case 5: dl_stage<WF, AF, FUSED, 5, HV>(tb, &sb, half, acc, warp, g, t); break;
-                case 6: dl_stage<WF, AF, FUSED, 6, HV>(tb, &sb, half, acc, warp, g, t); break;
-                case 7: dl_stage<WF, AF, FUSED, 7, HV>(tb, &sb, half, acc, warp, g, t); break;
-                default: dl_stage<WF, AF, FUSED, 8, HV>(tb, &sb, half, acc, warp, g, t); break;
-            }
-        } else switch (tt_valid) {
+        switch (tt_valid) {
             case 1: db_stage<WF, FUSED, 1>(tb, sb, half, acc, warp, g, t); break;
             case 2: db_stage<WF, FUSED, 2>(tb, sb, half, acc, warp, g, t); break;
             case 3: db_stage<WF, FUSED, 3>(tb, sb, half, acc, warp, g, t); break;
@@ -578,7 +595,7 @@ __device__ __forceinline__ void db_body(
     constexpr unsigned int OLD = FEAT * HV + 8;
     __nv_bfloat16* os = (__nv_bfloat16*)db_smem;
     #pragma unroll
-    for (int tt = 0; tt < 8; tt++) {
+    for (int tt = 0; tt < TTM; tt++) {
         if (tt < tt_valid) {
             #pragma unroll
             for (int i = 0; i < 4; i++) {
@@ -613,11 +630,14 @@ __device__ __forceinline__ void db_body(
 #define DB_HV 2
 #define DB_NV_WST 3
 #define DB_F8_WST 2
-// Low-precision tokens are small: four W4A4 stages (46 KiB) still fit two
-// CTAs per SM, W8A8 keeps two (40 KiB).
+// Low-precision kernels: one CTA per SM, 128-row chunks; the 128 x 264 BF16
+// epilogue tile (66 KiB) bounds the stages: W4A4 4 x 13.5 KiB, W8A8
+// 3 x 24 KiB, W4A8 3 x 17 KiB.
+#ifndef DL_NV_WST
 #define DL_NV_WST 4
-#define DL_F8_WST 2
-#define DL_W4A8_WST 3   // 4 KiB E4M3 tokens + 9 KiB NVFP4 weights per stage: 39 KiB
+#endif
+#define DL_F8_WST 3
+#define DL_W4A8_WST 3
 
 // Shared memory: 2 * sizeof(DbTok) + WST * sizeof(DbW<WF, HV>) bytes (dynamic).
 // Grid: (N / (128 HV)) * nchunks CTAs (FUSED: N = inter, N / (64 HV)), block
@@ -660,7 +680,7 @@ dense_bf16mma_fp8(const __nv_bfloat16* __restrict__ A,
 // Same grids as the BF16 kernels. A4: aq = packed e2m1 [M, K/2], as = E4M3
 // scales [M, K/16]; A8: aq = E4M3 [M, K]; ag = FP32 per-token scales.
 
-extern "C" __global__ void __launch_bounds__(128 * DB_HV, 2)
+extern "C" __global__ void __launch_bounds__(128 * DB_HV, 1)
 dense_w4a4_gate_up_silu(const unsigned char* __restrict__ aq, const unsigned char* __restrict__ as,
                         const float* __restrict__ ag,
                         const unsigned char* __restrict__ gate_packed, const unsigned char* __restrict__ gate_scale,
@@ -674,7 +694,7 @@ dense_w4a4_gate_up_silu(const unsigned char* __restrict__ aq, const unsigned cha
                                                           up_scale, up_scale2, C, M, N, K, N, nchunks);
 }
 
-extern "C" __global__ void __launch_bounds__(128 * DB_HV, 2)
+extern "C" __global__ void __launch_bounds__(128 * DB_HV, 1)
 dense_w4a4_nvfp4(const unsigned char* __restrict__ aq, const unsigned char* __restrict__ as,
                  const float* __restrict__ ag,
                  const unsigned char* __restrict__ packed, const unsigned char* __restrict__ scale,
@@ -685,7 +705,7 @@ dense_w4a4_nvfp4(const unsigned char* __restrict__ aq, const unsigned char* __re
                                                            C, M, N, K, ldc, nchunks);
 }
 
-extern "C" __global__ void __launch_bounds__(128 * DB_HV, 2)
+extern "C" __global__ void __launch_bounds__(128 * DB_HV, 1)
 dense_w8a8_fp8(const unsigned char* __restrict__ aq, const float* __restrict__ ag,
                const unsigned char* __restrict__ weight, const float* __restrict__ scale_grid,
                __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
@@ -800,7 +820,7 @@ dl_quant_fp8(const __nv_bfloat16* __restrict__ x, unsigned char* __restrict__ q,
 
 // W4A8: NVFP4 weights re-encoded per stage as block-scaled E4M3 (dl_stage),
 // E4M3 tokens.
-extern "C" __global__ void __launch_bounds__(128 * DB_HV, 2)
+extern "C" __global__ void __launch_bounds__(128 * DB_HV, 1)
 dense_w4a8_gate_up_silu(const unsigned char* __restrict__ aq, const float* __restrict__ ag,
                         const unsigned char* __restrict__ gate_packed, const unsigned char* __restrict__ gate_scale,
                         float gate_scale2,
@@ -813,7 +833,7 @@ dense_w4a8_gate_up_silu(const unsigned char* __restrict__ aq, const float* __res
                                                           up_packed, up_scale, up_scale2, C, M, N, K, N, nchunks);
 }
 
-extern "C" __global__ void __launch_bounds__(128 * DB_HV, 2)
+extern "C" __global__ void __launch_bounds__(128 * DB_HV, 1)
 dense_w4a8_nvfp4(const unsigned char* __restrict__ aq, const float* __restrict__ ag,
                  const unsigned char* __restrict__ packed, const unsigned char* __restrict__ scale,
                  float scale2, __nv_bfloat16* __restrict__ C,
