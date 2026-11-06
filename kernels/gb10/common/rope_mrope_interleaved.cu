@@ -46,15 +46,9 @@ extern "C" __global__ void rope_forward_mrope_interleaved(
     const float theta
 ) {
     atlas_pdl_enter();
-    const unsigned int head_idx = blockIdx.x;
     const unsigned int seq_block = blockIdx.y;
     const unsigned int batch = blockIdx.z;
     const unsigned int tid = threadIdx.x;
-
-    const bool is_q = (head_idx < num_q_heads);
-    const unsigned int head = is_q ? head_idx : (head_idx - num_q_heads);
-
-    if (!is_q && head >= num_kv_heads) return;
 
     const unsigned int pairs_per_pos = rotary_dim / 2;
     const unsigned int pos_per_block = 128 / pairs_per_pos;
@@ -82,29 +76,38 @@ extern "C" __global__ void rope_forward_mrope_interleaved(
     const float cos_val = cosf(angle);
     const float sin_val = sinf(angle);
 
-    __nv_bfloat16* ptr;
-    if (is_q) {
-        ptr = Q + batch * seq_len * (num_q_heads * head_dim)
-                + seq_pos * (num_q_heads * head_dim)
-                + head * head_dim;
-    } else {
-        ptr = K + batch * seq_len * (num_kv_heads * head_dim)
-                + seq_pos * (num_kv_heads * head_dim)
-                + head * head_dim;
-    }
-
     // rotate-half convention: pair (i, i + half_rot)
     const unsigned int half_rot = rotary_dim / 2;
     const unsigned int d0 = pair_idx;
     const unsigned int d1 = pair_idx + half_rot;
-    const float x0 = (float)ptr[d0];
-    const float x1 = (float)ptr[d1];
 
-    const float y0 = x0 * cos_val - x1 * sin_val;
-    const float y1 = x1 * cos_val + x0 * sin_val;
+    // The angle depends on (position, pair) only, so a block may rotate
+    // several heads with one evaluation: heads blockIdx.x, +gridDim.x, ...
+    // (grid.x = num_q_heads + num_kv_heads is one head a block, as before).
+    // Every head gets the same cos/sin and the same arithmetic either way.
+    for (unsigned int head_idx = blockIdx.x; head_idx < num_q_heads + num_kv_heads;
+         head_idx += gridDim.x) {
+        const bool is_q = (head_idx < num_q_heads);
+        const unsigned int head = is_q ? head_idx : (head_idx - num_q_heads);
+        __nv_bfloat16* ptr;
+        if (is_q) {
+            ptr = Q + batch * seq_len * (num_q_heads * head_dim)
+                    + seq_pos * (num_q_heads * head_dim)
+                    + head * head_dim;
+        } else {
+            ptr = K + batch * seq_len * (num_kv_heads * head_dim)
+                    + seq_pos * (num_kv_heads * head_dim)
+                    + head * head_dim;
+        }
+        const float x0 = (float)ptr[d0];
+        const float x1 = (float)ptr[d1];
 
-    ptr[d0] = __float2bfloat16(y0);
-    ptr[d1] = __float2bfloat16(y1);
+        const float y0 = x0 * cos_val - x1 * sin_val;
+        const float y1 = x1 * cos_val + x0 * sin_val;
+
+        ptr[d0] = __float2bfloat16(y0);
+        ptr[d1] = __float2bfloat16(y1);
+    }
 }
 
 extern "C" __global__ void rope_forward_mrope_interleaved_k_only(
