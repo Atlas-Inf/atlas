@@ -305,7 +305,13 @@ impl TransformerModel {
             qkv: self.gdn_buf_qkv,
             gate_beta: self.gdn_buf_gate_beta,
             output: self.gdn_buf_out,
-            z: self.gdn_buf_z,
+            // Z read in place from the projection output: no per-layer copy.
+            z: self.buffers.ssm_deinterleaved().offset(
+                (self.config.linear_num_key_heads * self.config.linear_key_head_dim * 2
+                    + self.config.linear_num_value_heads * self.config.linear_value_head_dim)
+                    * 2,
+            ),
+            z_stride: self.config.ssm_qkvz_size(),
             total_len: total,
         };
         let ctx = ForwardContext {

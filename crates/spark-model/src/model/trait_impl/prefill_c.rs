@@ -478,6 +478,7 @@ impl TransformerModel {
             gate_beta: self.gdn_buf_gate_beta,
             output: self.gdn_buf_out,
             z: self.gdn_buf_z,
+            z_stride: self.config.linear_num_value_heads * self.config.linear_value_head_dim,
             total_len: proc_count,
         };
 
