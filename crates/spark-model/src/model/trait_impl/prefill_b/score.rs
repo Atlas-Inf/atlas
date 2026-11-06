@@ -185,9 +185,9 @@ impl TransformerModel {
         }
 
         // ── Embed + per-stream paged metadata at stacked offsets. ──
-        self.buffers
-            .zero_prefill_essentials(self.gpu.as_ref(), stream)?;
         let total = plan.total_rows();
+        self.buffers
+            .zero_prefill_essentials_rows(self.gpu.as_ref(), total, stream)?;
         let topk = self.config.num_experts_per_tok.max(1);
         let mut cursor = (total * topk * 4 * 2 + 63) & !63;
         let hidden = self.buffers.hidden_states();
