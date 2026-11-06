@@ -395,6 +395,15 @@ impl TransformerModel {
         } else {
             usize::MAX
         };
-        (rows, streams)
+        // The metadata scratch (`score_forward`): per row, MoE top-k staging
+        // (8 B per expert), this path's own per-stream metadata (24 B), the
+        // staged positions (x3 with MRoPE) and slots (20 B); per stream, the
+        // alignment pads and pointer, cu_seqlens, kv_lens, state-end and
+        // h-state-pointer entries (256 B, generously); 64 KiB to spare.
+        const PER_STREAM: usize = 256;
+        let per_row = self.config.num_experts_per_tok.max(1) * 8 + 24 + 20;
+        let fixed = 64 * 1024 + PER_STREAM * streams.min(4096);
+        let scratch_rows = self.buffers.scratch_bytes().saturating_sub(fixed) / per_row;
+        (rows.min(scratch_rows), streams)
     }
 }
