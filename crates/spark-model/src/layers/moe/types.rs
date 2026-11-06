@@ -467,6 +467,9 @@ pub struct MoeLayer {
     /// the first. Only then may the prefill grid be sized by the AVERAGE expert
     /// (`ATLAS_MOE_PREFILL_PERSIST_TILES`) rather than the hottest one.
     pub(crate) moe_k64_strides_m_tiles: KernelHandle,
+    /// `moe_bf16mma_prefill` gate/up+SiLU and down kernels; 0 where the target
+    /// does not ship them (`forward_prefill_bf16mma.rs`).
+    pub(super) bf16mma_k: [KernelHandle; 2],
     /// `moe_permute_tokens` gather kernel — only needed by the FP4 escape-hatch
     /// (which consumes expert-sorted contiguous rows, unlike the FP8 fused
     /// kernel that gathers via `sorted_token_ids` internally). `try_kernel`

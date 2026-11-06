@@ -71,6 +71,9 @@ pub struct ModelLevers {
     pub holo_moe_gateup_fp4: bool,
     /// Collect per-layer MoE expert-union statistics. Diagnostic.
     pub moe_union_stats: bool,
+    /// Routed NVFP4 MoE prefill on BF16 tensor cores with register dequant
+    /// (`moe_bf16mma_prefill.cu`) where the target ships it. Opt-in.
+    pub moe_prefill_bf16mma: bool,
 
     // ── Attention ──
     /// Contiguous-attention path for the DFlash head.
@@ -240,6 +243,7 @@ impl ModelLevers {
             holo_moe_down_fp4: opt_in_truthy("ATLAS_HOLO_MOE_DOWN_FP4"),
             holo_moe_gateup_fp4: opt_in_truthy("ATLAS_HOLO_MOE_GATEUP_FP4"),
             moe_union_stats: opt_in("ATLAS_MOE_UNION_STATS"),
+            moe_prefill_bf16mma: opt_in("ATLAS_MOE_PREFILL_BF16MMA"),
             dflash_contig_attn: opt_in("ATLAS_DFLASH_CONTIG_ATTN"),
             // Product installation also arms these. The explicit model-load
             // diagnostic lets a no-spec control use identical target arithmetic.
