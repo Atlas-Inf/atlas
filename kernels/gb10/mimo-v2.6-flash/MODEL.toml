@@ -79,6 +79,7 @@ enable_loop_watchdog = true
 thinking_default = false
 # The MiMo attention path (mimo.rs) only reads/writes a BF16 paged cache.
 default_kv_dtype = "bf16"
+tool_call_parser = "qwen3_coder"
 default_num_drafts = 3
 
 # Dense-FFN probes alternate prefill families before settling on the compiled
