@@ -25,6 +25,7 @@ use anyhow::{Result, ensure};
 use spark_runtime::gpu::DevicePtr;
 
 use super::super::super::types::TransformerModel;
+use super::score_profile::{Phase, ScoreProfile};
 use super::stage_batched::PerStreamStageInfo;
 use crate::layer::{ForwardContext, GdnPrefillBuffers};
 use crate::traits::{Model, SequenceState};
@@ -66,7 +67,7 @@ impl ScorePlan {
         }
     }
 
-    fn rows(&self, i: usize) -> usize {
+    pub(super) fn rows(&self, i: usize) -> usize {
         self.tokens[i].len() - self.starts[i]
     }
 
@@ -359,134 +360,11 @@ impl TransformerModel {
         prof.report(plan.total_rows(), n);
         Ok(())
     }
-
-    /// Final norm on each branch's last row, LM head, softmax over options.
-    fn score_head(
-        &self,
-        plan: &ScorePlan,
-        options: &[Vec<u32>],
-        stream: u64,
-    ) -> Result<Vec<Vec<f32>>> {
-        let h = self.config.hidden_size;
-        let v = self.config.vocab_size;
-        let bf16 = 2usize;
-        let hidden = self.buffers.hidden_states();
-        let normed = self.buffers.norm_output();
-        let first = usize::from(plan.has_head);
-        let mut last_rows = Vec::with_capacity(options.len());
-        let mut end = 0usize;
-        for i in 0..plan.tokens.len() {
-            end += plan.rows(i);
-            if i >= first {
-                last_rows.push(end - 1);
-            }
-        }
-        for (j, &row) in last_rows.iter().enumerate() {
-            self.final_norm_rows(
-                hidden.offset(row * h * bf16),
-                normed.offset(j * h * bf16),
-                1,
-                stream,
-            )?;
-        }
-        // The logits arena holds a bounded number of rows; run the LM head
-        // in groups and keep only each branch's option logits.
-        const GROUP: usize = 32;
-        let mut out = Vec::with_capacity(options.len());
-        let mut row = vec![0u8; v * bf16];
-        for g in (0..last_rows.len()).step_by(GROUP) {
-            let k = GROUP.min(last_rows.len() - g);
-            let dst = self.buffers.logits();
-            self.lm_head_batched(normed.offset(g * h * bf16), k as u32, dst, stream)?;
-            self.gpu.synchronize(stream)?;
-            for j in 0..k {
-                self.gpu.copy_d2h(dst.offset(j * v * bf16), &mut row)?;
-                out.push(softmax_options(&row, &options[g + j]));
-            }
-        }
-        Ok(out)
-    }
-}
-
-/// Phases timed by `ATLAS_SCORE_TRACE=2` (each mark synchronizes).
-#[derive(Clone, Copy)]
-pub(super) enum Phase {
-    Setup,
-    Attn,
-    SsmProj,
-    SsmConv,
-    SsmGdn,
-    SsmOut,
-}
-
-pub(super) struct ScoreProfile {
-    on: bool,
-    last: std::time::Instant,
-    us: [u128; 6],
-}
-
-impl ScoreProfile {
-    fn new() -> Self {
-        Self {
-            on: std::env::var("ATLAS_SCORE_TRACE").is_ok_and(|v| v == "2"),
-            last: std::time::Instant::now(),
-            us: [0; 6],
-        }
-    }
-
-    /// Charge the time since the previous mark to `phase`.
-    pub(super) fn mark(&mut self, m: &TransformerModel, stream: u64, phase: Phase) -> Result<()> {
-        if self.on {
-            m.gpu.synchronize(stream)?;
-            let now = std::time::Instant::now();
-            self.us[phase as usize] += now.duration_since(self.last).as_micros();
-            self.last = now;
-        }
-        Ok(())
-    }
-
-    fn report(&self, rows: usize, streams: usize) {
-        if self.on {
-            let [setup, attn, proj, conv, gdn, out] = self.us;
-            tracing::info!(
-                "score profile: rows={rows} streams={streams} setup={setup}us attn={attn}us \
-                 ssm_proj={proj}us ssm_conv={conv}us ssm_gdn={gdn}us ssm_out_moe={out}us"
-            );
-        }
-    }
-}
-
-/// Softmax over the BF16 logits of `opts`, in f32 (max-subtracted).
-pub(super) fn softmax_options(row_bf16: &[u8], opts: &[u32]) -> Vec<f32> {
-    let logit = |t: u32| {
-        let i = t as usize * 2;
-        f32::from_bits((u16::from_le_bytes([row_bf16[i], row_bf16[i + 1]]) as u32) << 16)
-    };
-    let xs: Vec<f32> = opts.iter().map(|&t| logit(t)).collect();
-    let m = xs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let es: Vec<f32> = xs.iter().map(|&x| (x - m).exp()).collect();
-    let s: f32 = es.iter().sum();
-    es.into_iter().map(|e| e / s).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn bf16_row(vals: &[f32]) -> Vec<u8> {
-        vals.iter()
-            .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
-            .collect()
-    }
-
-    #[test]
-    fn softmax_picks_option_logits_only() {
-        let row = bf16_row(&[9.0, 1.0, 0.0, 1.0, -50.0]);
-        let p = softmax_options(&row, &[1, 3]);
-        assert!((p[0] - 0.5).abs() < 1e-6 && (p[1] - 0.5).abs() < 1e-6);
-        let p = softmax_options(&row, &[2, 4]);
-        assert!(p[0] > 0.999_999 && (p.iter().sum::<f32>() - 1.0).abs() < 1e-6);
-    }
 
     #[test]
     fn plan_shares_whole_blocks_and_replays_the_tail() {

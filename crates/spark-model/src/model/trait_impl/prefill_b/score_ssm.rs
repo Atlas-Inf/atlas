@@ -15,7 +15,8 @@ use anyhow::{Result, ensure};
 use spark_runtime::gpu::DevicePtr;
 
 use super::super::super::types::TransformerModel;
-use super::score::{Phase, ScorePlan, ScoreProfile};
+use super::score::ScorePlan;
+use super::score_profile::{Phase, ScoreProfile};
 use crate::layer::{
     BatchedAttnMetadata, ForwardContext, GdnPrefillBuffers, SsmLayerState, TransformerLayer,
 };
