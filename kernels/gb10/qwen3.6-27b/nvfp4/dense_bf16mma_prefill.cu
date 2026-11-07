@@ -1548,8 +1548,28 @@ __device__ __forceinline__ void dz_body(
                        unsigned long long row) {
             return ((FUSED && c >= 4) ? b : a) + n0 + (c & (FUSED ? 3 : 7)) * 16 + row * N;
         };
+        // Gate+up: an L2 prefetch of the weight lines PF stages ahead of the
+        // copies (thread lt < 72: k-pair row lt / 2 of gate / up, then the
+        // scale lines), so the DRAM stream runs ahead of the ring (288 rows:
+        // 736 -> 705 us a call in the engine; the projections measured
+        // slower with it).
+        constexpr int PF = FUSED ? 4 : 0;
+        DwCursor pf = start;
+        auto prefetch = [&]() {
+            if (lt < 72 && pf.L < total) {
+                const bool sc = lt >= 64;
+                const unsigned int i = sc ? lt - 64 : lt, kb = pf.s * DB_KS;
+                const unsigned char* b = sc ? ((i & 1) ? S1 : S0) : ((i & 1) ? W1 : W0);
+                const unsigned long long row = sc ? kb / 16 + (i >> 1) : kb / 2 + (i >> 1);
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(b + pf.tl.n0 + row * N));
+            }
+            dw_next<FUSED>(pf, ksteps, M, N, nchunks);
+        };
+        #pragma unroll
+        for (int i = 0; i < PF; i++) prefetch();
         int G = 0;
         for (DwCursor c = start; c.L < total; G++) {
+            if constexpr (PF > 0) prefetch();
             if (G >= DZ_R) dl_mbar_wait(&empty[G % DZ_R], ((G - DZ_R) / DZ_R) & 1);
             const unsigned int kb = c.s * DB_KS, live = c.tl.ttv * 8;
             Tok& tb = tk[G % DZ_R];
