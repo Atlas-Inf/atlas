@@ -58,19 +58,14 @@ impl TransformerModel {
                 r.options.iter().all(|o| !o.is_empty()),
                 "score: empty option set"
             );
-            ensure!(
-                r.options.iter().flatten().all(|&t| t < v),
-                "score: option token outside the vocabulary"
-            );
+            let tokens = r.prefix.iter().chain(r.branches.iter().flatten());
+            if let Some(t) = tokens.chain(r.options.iter().flatten()).find(|&&t| t >= v) {
+                anyhow::bail!("score: token id {t} outside the model's vocabulary ({v} rows)");
+            }
         }
         ensure!(
-            !self.multi_rank_protocol_active(),
-            "score: single-rank models only"
-        );
-        ensure!(self.comm.is_none(), "score: single-rank models only");
-        ensure!(
-            !self.use_fp32_logits,
-            "score: FP32 logits mode is not supported"
+            self.score_supported(),
+            "score: single-rank models with BF16 logits only"
         );
         let bs = self.kv_cache.lock().block_size();
         let plan_reqs: Vec<ScoreRequest<'_>> = reqs
@@ -120,6 +115,13 @@ impl TransformerModel {
             marks[2] = t0.elapsed().as_micros();
             out
         })();
+        if run.is_err() {
+            // Work may still be in flight on the stream: let it finish before
+            // its blocks and slots go back to the pools.
+            if let Err(e) = self.gpu.synchronize(stream) {
+                tracing::error!("score: synchronize after a failed pass: {e:#}");
+            }
+        }
         for seq in seqs.iter_mut() {
             // Score sequences never populate `tokens`, so the prefix-cache
             // release in `free_sequence` is a no-op; the KV refs (shared head
@@ -426,8 +428,16 @@ impl TransformerModel {
 }
 
 impl TransformerModel {
+    /// Score passes run on one rank and read BF16 logits.
+    fn score_supported(&self) -> bool {
+        !self.multi_rank_protocol_active() && self.comm.is_none() && !self.use_fp32_logits
+    }
+
     /// See [`crate::traits::Model::score_capacity`].
     pub(in crate::model) fn score_capacity_impl(&self) -> (usize, usize) {
+        if !self.score_supported() {
+            return (0, 0);
+        }
         let mut rows = self.buffers.max_batch_tokens();
         if self.ssm_pool.num_ssm_layers > 0 {
             rows = rows.min(self.gdn_buf_max_len);

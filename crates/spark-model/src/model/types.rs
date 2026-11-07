@@ -95,6 +95,8 @@ pub struct TransformerModel {
     /// with `lm_head_nvfp4` (that stays `None` on the FP8 path). Additive: when
     /// `None`, the NVFP4/BF16 LM-head dispatch is byte-identical to before.
     pub(super) lm_head_fp8: Option<Fp8DenseWeight>,
+    /// Score passes' host copies of BF16 LM-head rows (bounded).
+    pub(super) score_head_rows: super::trait_impl::prefill_b::score_head::HeadRows,
     pub(super) layers: Vec<Box<dyn TransformerLayer>>,
     pub(super) buffers: BufferArena,
     /// `ATLAS_GLM_PREFILL_PIPE2`: the second half-chunk's arena and stream
@@ -658,6 +660,7 @@ impl TransformerModel {
         };
 
         attempt("native MTP prefixes", self.clear_native_mtp_prefix());
+        self.score_head_rows.clear();
         attempt("derived weights", self.derived.release(gpu));
         attempt("ssm snapshots", self.ssm_snapshots.release(gpu));
         // The pool is Arc'd because slots are handed out to sequences. A live
