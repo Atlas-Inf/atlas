@@ -101,9 +101,9 @@ const MX_K: u32 = 512;
 /// persistent; up to 144 token rows a tile (288 rows as two tiles, so the
 /// 20 feature tiles of an N = 5120 projection fit one wave of 48 SMs); four
 /// token stages, two re-encoded operand stages (`DpA`), three NVFP4 stages.
-pub(super) const WS_THREADS: u32 = 512;
+const WS_THREADS: u32 = 512;
 pub(super) const WS_TILE_ROWS: u32 = 144;
-pub(super) const SMEM_W4A8_WS: u32 =
+const SMEM_W4A8_WS: u32 =
     4 * WS_TILE_ROWS * 64 + 2 * (8 * 4 * 32 * 16 + 8 * 8 * 4) + 3 * 2 * (4096 + 512);
 /// A tile's cost beyond its 8-row token tiles in `chunks`: the per-stage
 /// re-encode, about 16 tiles' worth of MMAs (1056 rows: 9 chunks, not 12).
@@ -117,18 +117,56 @@ pub(super) const WS_FIXED: u32 = 16;
 /// (gate+up 554 / 547 us, down+o 283 / 278), below up to 15 %. The MX
 /// handoff (dnmx) keeps the 8-warp kernels.
 const WS_ROWS: u32 = 129;
+/// The persistent W4A4 kernels (`dz_body`): 8 MMA warps + a loader
+/// warpgroup; db_body's token layout and 6 stages from Z_LONG_ROWS rows,
+/// below that the per-lane layout and 4 stages (`wsl`). No re-encode, so a
+/// tile costs about CTA_FIXED beyond its token tiles. Preliminary
+/// microbenchmark, us 8-warp / persistent: gate+up 96 rows 537 / 509, 288
+/// 660 / 693, 1056 1839 / 1663, 4128 7368 / 6387; down 96 246 / 235, 288
+/// 344 / 300, 1056 864 / 786; q 288 228 / 222, 2112 1272 / 1001.
+const Z_THREADS: u32 = 384;
+const SMEM_W4A4_WS: u32 = 6 * (WS_TILE_ROWS * 36 + 2 * (4096 + 512));
+const SMEM_W4A4_WSL: u32 = 4 * (WS_TILE_ROWS * 64 + 2 * (4096 + 512));
+const Z_ROWS: u32 = 96;
+const Z_LONG_ROWS: u32 = 384;
+
+/// A bit-identical persistent twin of a low-precision kernel.
+pub(super) struct Twin {
+    pub kernel: KernelHandle,
+    pub threads: u32,
+    pub smem: u32,
+    /// `chunks`' per-CTA cost.
+    pub fixed: u32,
+}
 
 impl DenseBf16mma {
-    /// The warp-specialized twin of a W4A8 kernel for `m` rows, where it is
+    /// The persistent twin of a W4A8 / W4A4 kernel for `m` rows, where it is
     /// faster.
-    pub(super) fn w4a8_twin(&self, kernel: KernelHandle, m: u32) -> Option<KernelHandle> {
-        let [gate_up, nvfp4] = self.w4a8ws;
-        let twin = match kernel.0 {
-            k if k == self.w4a8_gate_up.0 => gate_up,
-            k if k == self.w4a8.0 => nvfp4,
-            _ => KernelHandle(0),
+    pub(super) fn lowp_twin(&self, kernel: KernelHandle, m: u32) -> Option<Twin> {
+        let [w8_gate_up, w8_nvfp4] = self.w4a8ws;
+        let [z_gate_up, z_nvfp4, zl_gate_up, zl_nvfp4] = self.w4a4ws;
+        let long = m >= Z_LONG_ROWS;
+        let (twin, threads, smem, fixed) = match kernel.0 {
+            k if k == self.w4a8_gate_up.0 && m >= WS_ROWS => {
+                (w8_gate_up, WS_THREADS, SMEM_W4A8_WS, WS_FIXED)
+            }
+            k if k == self.w4a8.0 && m >= WS_ROWS => (w8_nvfp4, WS_THREADS, SMEM_W4A8_WS, WS_FIXED),
+            k if k == self.w4a4_gate_up.0 && m >= Z_ROWS => match long {
+                true => (z_gate_up, Z_THREADS, SMEM_W4A4_WS, super::CTA_FIXED),
+                false => (zl_gate_up, Z_THREADS, SMEM_W4A4_WSL, super::CTA_FIXED),
+            },
+            k if k == self.w4a4.0 && m >= Z_ROWS => match long {
+                true => (z_nvfp4, Z_THREADS, SMEM_W4A4_WS, super::CTA_FIXED),
+                false => (zl_nvfp4, Z_THREADS, SMEM_W4A4_WSL, super::CTA_FIXED),
+            },
+            _ => return None,
         };
-        (m >= WS_ROWS && twin.0 != 0).then_some(twin)
+        (twin.0 != 0).then_some(Twin {
+            kernel: twin,
+            threads,
+            smem,
+            fixed,
+        })
     }
 
     /// Whether the gate+up -> down handoff runs as MX8 tokens (`dnmx`) for a

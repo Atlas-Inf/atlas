@@ -357,6 +357,39 @@ __device__ __forceinline__ void dl_a8_mma(const DbTok8& tk, const DlA8& e, float
     }
 }
 
+// The W4A4 A operands of one warp and stage: thread t's A registers are
+// k-pair rows 4t..4t+3 (a0, a1) and 16+4t..16+4t+3 (a2, a3) of its four slot
+// features, byte-transposed into one word per feature; its scale word holds
+// a feature's four group scales (thread t even: MMA row g, odd: g+8).
+template <bool FUSED, int HV>
+__device__ __forceinline__ void dl_f4_frags(const void* sbv, unsigned int half, unsigned int warp, unsigned int g,
+                                            unsigned int t, unsigned int (&f0)[4], unsigned int (&f1)[4],
+                                            unsigned int& s0, unsigned int& s1) {
+    const DbW<DB_NVFP4, HV>& sb = *(const DbW<DB_NVFP4, HV>*)sbv;
+    unsigned int a[2][4], sc[4];
+    #pragma unroll
+    for (int h = 0; h < 2; h++) {
+        unsigned int w[4];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const unsigned int kp = 16 * h + 4 * t + i;
+            w[i] = bm_slots<FUSED>(sb.w[half][kp], dl_swz_w(kp), warp, g);
+        }
+        dl_transpose4(w, a[h]);
+    }
+    {
+        unsigned int w[4];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) w[i] = bm_slots<FUSED>(sb.s[half][i], bm_swz_s(i), warp, g);
+        dl_transpose4(w, sc);
+    }
+    const unsigned int odd = t & 1;
+    f0[0] = a[0][0]; f0[1] = a[0][1]; f0[2] = a[1][0]; f0[3] = a[1][1];
+    f1[0] = a[0][2]; f1[1] = a[0][3]; f1[2] = a[1][2]; f1[3] = a[1][3];
+    s0 = odd ? sc[1] : sc[0];
+    s1 = odd ? sc[3] : sc[2];
+}
+
 // One 64-wide K stage of the low-precision paths for TT token tiles.
 //  W4A4: the MMA's K is the stage's K in order. Thread t's A registers are
 //  k-pair rows 4t..4t+3 (a0, a1) and 16+4t..16+4t+3 (a2, a3) of its four
@@ -381,28 +414,8 @@ __device__ __forceinline__ void dl_stage(const typename DbT<AF>::T& tk, const vo
         for (int sl = 0; sl < 4; sl++) dl_a8_slot(e, sl);
         dl_a8_mma<0, TT, TTM>(tk, e, acc, g, t, nullptr);
     } else if constexpr (AF == DB_A_NVFP4) {
-        const DbW<DB_NVFP4, HV>& sb = *(const DbW<DB_NVFP4, HV>*)sbv;
-        unsigned int a[2][4], sc[4];
-        #pragma unroll
-        for (int h = 0; h < 2; h++) {
-            unsigned int w[4];
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                const unsigned int kp = 16 * h + 4 * t + i;
-                w[i] = bm_slots<FUSED>(sb.w[half][kp], dl_swz_w(kp), warp, g);
-            }
-            dl_transpose4(w, a[h]);
-        }
-        {
-            unsigned int w[4];
-            #pragma unroll
-            for (int i = 0; i < 4; i++) w[i] = bm_slots<FUSED>(sb.s[half][i], bm_swz_s(i), warp, g);
-            dl_transpose4(w, sc);
-        }
-        const unsigned int odd = t & 1;
-        const unsigned int f0[4] = {a[0][0], a[0][1], a[1][0], a[1][1]};
-        const unsigned int f1[4] = {a[0][2], a[0][3], a[1][2], a[1][3]};
-        const unsigned int s0 = odd ? sc[1] : sc[0], s1 = odd ? sc[3] : sc[2];
+        unsigned int f0[4], f1[4], s0, s1;
+        dl_f4_frags<FUSED, HV>(sbv, half, warp, g, t, f0, f1, s0, s1);
         #pragma unroll
         for (int j = 0; j < TT; j++) {
             const unsigned int r = j * 8 + g;
@@ -1466,4 +1479,222 @@ dense_w4a8ws_nvfp4(const unsigned char* __restrict__ aq, const float* __restrict
                    unsigned int M, unsigned int N, unsigned int K, unsigned int ldc, unsigned int nchunks)
 {
     dw_body<false>(aq, ag, packed, scale, scale2, nullptr, nullptr, 0.0f, C, M, N, K, ldc, nchunks);
+}
+
+// ---- W4A4, persistent with loader warps (picked by row count) ---------------
+// db_body's W4A4 stage (dl_f4_frags + kind::mxf4nvf4 m16n8k64) on token
+// tiles of up to 144 rows, persistent over the tiles (CTA b: tiles b, b +
+// grid, ... in db_body's raster order): a loader warpgroup cp.async's each
+// stage's NVFP4 weights, block scales, tokens and token scales into
+// db_body's layouts, and the 8 MMA warps gather their operands and issue its
+// MMAs in its order, so results are bit-identical. No re-encode, so the
+// stages are small and many are in flight. Two token layouts:
+//  LANE (short passes, 4 stages): per (row, lane t) the MMA's b0, b1 and the
+//  row's group scales, copied 4 bytes at a time, so a token tile is one
+//  16-byte shared load per lane.
+//  !LANE (long passes, 6 stages): db_body's (dl_tok4 chunks, 16-byte
+//  copies), three 4-byte loads per tile.
+#define DZ_THREADS 384  // 8 MMA warps + a loader warpgroup
+#define DZ_CREG 232     // setmaxnreg: 256 x 232 + 128 x 40 = 384 x 168
+template <bool LANE> struct DzTok;
+template <> struct __align__(16) DzTok<true> {
+    uint4 f[DW_ROWS][4];                            // {b0, b1, scales, -} of lane t
+};
+template <> struct __align__(16) DzTok<false> {
+    unsigned char q[DW_ROWS][DB_KS / 2];
+    unsigned int s[DW_ROWS];
+};
+template <bool LANE> __host__ __device__ constexpr int dz_stages() { return LANE ? 4 : 6; }
+
+template <bool FUSED, bool LANE>
+__device__ __forceinline__ void dz_body(
+    const unsigned char* __restrict__ Aq, const unsigned char* __restrict__ As, const float* __restrict__ Ag,
+    const unsigned char* __restrict__ W0, const unsigned char* __restrict__ S0, float gs0,
+    const unsigned char* __restrict__ W1, const unsigned char* __restrict__ S1, float gs1,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K, unsigned int ldc,
+    unsigned int nchunks)
+{
+    atlas_pdl_enter();
+    constexpr int HV = 2, TTM = DW_ROWS / 8, DZ_R = dz_stages<LANE>();
+    constexpr unsigned int FEAT = FUSED ? 64 : 128;
+    using Tok = DzTok<LANE>;
+    extern __shared__ __align__(16) unsigned char db_smem[];
+    Tok* tk = (Tok*)db_smem;
+    DbW<DB_NVFP4, HV>* wt = (DbW<DB_NVFP4, HV>*)(db_smem + DZ_R * sizeof(Tok));
+
+    DwCursor start{blockIdx.x, 0, {}};
+    dw_seek<FUSED>(start, M, N, nchunks);
+    const unsigned int total = (N / (FEAT * HV)) * nchunks;
+    if (start.L >= total) return;
+    const unsigned int tid = threadIdx.x, wid = tid >> 5;
+    const int ksteps = K / DB_KS;
+
+    __shared__ __align__(8) unsigned long long full[DZ_R], empty[DZ_R];
+    __shared__ float ag_s[2][DW_ROWS];
+    if (tid == 0) {
+        #pragma unroll
+        for (int b = 0; b < DZ_R; b++) {
+            dl_mbar_init(&full[b], 128);
+            dl_mbar_init(&empty[b], 256);
+        }
+        asm volatile("fence.mbarrier_init.release.cluster;");
+    }
+    __syncthreads();
+
+    if (wid >= 8) {
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
+        const unsigned int lt = tid - 256;
+        auto src = [&](const unsigned char* a, const unsigned char* b, unsigned int c, unsigned int n0,
+                       unsigned long long row) {
+            return ((FUSED && c >= 4) ? b : a) + n0 + (c & (FUSED ? 3 : 7)) * 16 + row * N;
+        };
+        int G = 0;
+        for (DwCursor c = start; c.L < total; G++) {
+            if (G >= DZ_R) dl_mbar_wait(&empty[G % DZ_R], ((G - DZ_R) / DZ_R) & 1);
+            const unsigned int kb = c.s * DB_KS, live = c.tl.ttv * 8;
+            Tok& tb = tk[G % DZ_R];
+            if constexpr (LANE) {
+            // Word w of a row's 32 code bytes is b(w / 4) of lane w % 4.
+            #pragma unroll
+            for (unsigned int i = 0; i < (8 * DW_ROWS + 127) / 128; i++) {
+                const unsigned int x = lt + 128 * i, r = x >> 3, w = x & 7;
+                if (r < DW_ROWS && r < live)
+                    dl_cp4((unsigned char*)&tb.f[r][w & 3] + 4 * (w >> 2),
+                           Aq + (unsigned long long)(c.tl.r0 + (r < c.tl.rows ? r : 0)) * (K / 2) + kb / 2 + 4 * w,
+                           r < c.tl.rows);
+            }
+            #pragma unroll
+            for (unsigned int i = 0; i < (4 * DW_ROWS + 127) / 128; i++) {
+                const unsigned int x = lt + 128 * i, r = x >> 2;
+                if (r < DW_ROWS && r < live)
+                    dl_cp4((unsigned char*)&tb.f[r][x & 3] + 8,
+                           As + (unsigned long long)(c.tl.r0 + (r < c.tl.rows ? r : 0)) * (K / 16) + kb / 16,
+                           r < c.tl.rows);
+            }
+            } else {
+            #pragma unroll
+            for (unsigned int i = 0; i < (2 * DW_ROWS + 127) / 128; i++) {
+                const unsigned int x = lt + 128 * i, r = x >> 1, qc = x & 1;
+                if (r < DW_ROWS && r < live)
+                    bm_cp16(&tb.q[r][dl_tok4(r, qc)],
+                            Aq + (unsigned long long)(c.tl.r0 + (r < c.tl.rows ? r : 0)) * (K / 2) + qc * 16 + kb / 2,
+                            r < c.tl.rows);
+            }
+            #pragma unroll
+            for (unsigned int i = 0; i < (DW_ROWS + 127) / 128; i++) {
+                const unsigned int r = lt + 128 * i;
+                if (r < DW_ROWS && r < live)
+                    dl_cp4(&tb.s[r], As + (unsigned long long)(c.tl.r0 + (r < c.tl.rows ? r : 0)) * (K / 16) + kb / 16,
+                           r < c.tl.rows);
+            }
+            }
+            DbW<DB_NVFP4, HV>& sw = wt[G % DZ_R];
+            #pragma unroll
+            for (unsigned int j = 0; j < 4; j++) {
+                const unsigned int x = lt + 128 * j, h = x >> 8, kp = (x >> 3) & 31, ch = x & 7;
+                bm_cp16(&sw.w[h][kp][(ch ^ dl_swz_w(kp)) * 16], src(W0, W1, ch, c.tl.n0 + h * FEAT, kb / 2 + kp), true);
+            }
+            if (lt < 64) {
+                const unsigned int h = lt >> 5, gr = (lt >> 3) & 3, ch = lt & 7;
+                bm_cp16(&sw.s[h][gr][(ch ^ bm_swz_s(gr)) * 16], src(S0, S1, ch, c.tl.n0 + h * FEAT, kb / 16 + gr), true);
+            }
+            dl_cp_arrive(&full[G % DZ_R]);
+            dw_next<FUSED>(c, ksteps, M, N, nchunks);
+        }
+        bm_wait<0>();
+        return;
+    }
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" :: "n"(DZ_CREG));
+    unsigned int ctid;
+    asm volatile("mov.u32 %0, %%tid.x;" : "=r"(ctid));
+    const unsigned int cw = ctid >> 5, cl = ctid & 31, cg = cl >> 2, cq = cl & 3;
+    float acc[2][TTM][4];
+    int G = 0;
+    auto kloop = [&](auto ttc) {
+        constexpr int TT = decltype(ttc)::value;
+        for (int s = 0; s < ksteps; s++, G++) {
+            dl_mbar_wait(&full[G % DZ_R], (G / DZ_R) & 1);
+            unsigned int f0[4], f1[4], s0, s1;
+            dl_f4_frags<FUSED, HV>(&wt[G % DZ_R], cw >> 2, cw & 3, cg, cq, f0, f1, s0, s1);
+            const Tok& tb = tk[G % DZ_R];
+            #pragma unroll
+            for (int j = 0; j < TT; j++) {
+                uint4 v;
+                if constexpr (LANE) {
+                    v = tb.f[j * 8 + cg][cq];
+                } else {
+                    const unsigned int r = j * 8 + cg;
+                    v = make_uint4(*(const unsigned int*)&tb.q[r][dl_tok4(r, 0) + 4 * cq],
+                                   *(const unsigned int*)&tb.q[r][dl_tok4(r, 1) + 4 * cq], tb.s[r], 0);
+                }
+                dl_mma_f4(acc[0][j], f0, v.x, v.y, s0, v.z);
+                dl_mma_f4(acc[1][j], f1, v.x, v.y, s1, v.z);
+            }
+            dl_mbar_arrive(&empty[G % DZ_R]);
+        }
+    };
+    for (DwCursor c = start; c.L < total;) {
+        const DwTile tl = c.tl;
+        float* agp = ag_s[(G / ksteps) & 1];
+        if (ctid < tl.rows) agp[ctid] = Ag[tl.r0 + ctid];
+        #pragma unroll
+        for (int i = 0; i < TTM; i++)
+            #pragma unroll
+            for (int f = 0; f < 2; f++) acc[f][i][0] = acc[f][i][1] = acc[f][i][2] = acc[f][i][3] = 0.0f;
+        dl_by_tt<1, TTM>(tl.ttv, kloop);
+        asm volatile("bar.sync 1, 256;" ::: "memory");
+        dw_epi_store<FUSED, TTM>(C, ldc, tl.r0, tl.n0 + (cw >> 2) * FEAT, acc, tl.ttv, cw & 3, cg, cq, gs0,
+                                 FUSED ? gs1 : gs0, agp, tl.rows);
+        c.L += gridDim.x;
+        dw_seek<FUSED>(c, M, N, nchunks);
+    }
+}
+
+// Long passes (db_body's token layout, 6 stages); short ones: the wsl twins.
+extern "C" __global__ void __launch_bounds__(DZ_THREADS, 1)
+dense_w4a4ws_gate_up_silu(const unsigned char* __restrict__ aq, const unsigned char* __restrict__ as,
+                          const float* __restrict__ ag,
+                          const unsigned char* __restrict__ gate_packed, const unsigned char* __restrict__ gate_scale,
+                          float gate_scale2,
+                          const unsigned char* __restrict__ up_packed, const unsigned char* __restrict__ up_scale,
+                          float up_scale2,
+                          __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+                          unsigned int nchunks)
+{
+    dz_body<true, false>(aq, as, ag, gate_packed, gate_scale, gate_scale2, up_packed, up_scale, up_scale2, C, M, N, K,
+                        N, nchunks);
+}
+
+extern "C" __global__ void __launch_bounds__(DZ_THREADS, 1)
+dense_w4a4ws_nvfp4(const unsigned char* __restrict__ aq, const unsigned char* __restrict__ as,
+                   const float* __restrict__ ag,
+                   const unsigned char* __restrict__ packed, const unsigned char* __restrict__ scale,
+                   float scale2, __nv_bfloat16* __restrict__ C,
+                   unsigned int M, unsigned int N, unsigned int K, unsigned int ldc, unsigned int nchunks)
+{
+    dz_body<false, false>(aq, as, ag, packed, scale, scale2, nullptr, nullptr, 0.0f, C, M, N, K, ldc, nchunks);
+}
+
+extern "C" __global__ void __launch_bounds__(DZ_THREADS, 1)
+dense_w4a4wsl_gate_up_silu(const unsigned char* __restrict__ aq, const unsigned char* __restrict__ as,
+                          const float* __restrict__ ag,
+                          const unsigned char* __restrict__ gate_packed, const unsigned char* __restrict__ gate_scale,
+                          float gate_scale2,
+                          const unsigned char* __restrict__ up_packed, const unsigned char* __restrict__ up_scale,
+                          float up_scale2,
+                          __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+                          unsigned int nchunks)
+{
+    dz_body<true, true>(aq, as, ag, gate_packed, gate_scale, gate_scale2, up_packed, up_scale, up_scale2, C, M, N, K,
+                        N, nchunks);
+}
+
+extern "C" __global__ void __launch_bounds__(DZ_THREADS, 1)
+dense_w4a4wsl_nvfp4(const unsigned char* __restrict__ aq, const unsigned char* __restrict__ as,
+                   const float* __restrict__ ag,
+                   const unsigned char* __restrict__ packed, const unsigned char* __restrict__ scale,
+                   float scale2, __nv_bfloat16* __restrict__ C,
+                   unsigned int M, unsigned int N, unsigned int K, unsigned int ldc, unsigned int nchunks)
+{
+    dz_body<false, true>(aq, as, ag, packed, scale, scale2, nullptr, nullptr, 0.0f, C, M, N, K, ldc, nchunks);
 }

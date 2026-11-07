@@ -96,10 +96,11 @@ fn lowp_activations(
 #[test]
 #[ignore = "needs a GB10 and a qwen3.8-27b kernel build"]
 fn dense_lowp_matches_exact_reference_on_quantized_activations() -> Result<()> {
-    // W4A4 MLP, then W4A8; the FP8 projection is W8A8 in both. W4A8 again
-    // on four SMs' worth of CTAs: the persistent warp-specialized kernels
-    // then walk many tiles per CTA.
+    // W4A4 MLP, then W4A8; the FP8 projection is W8A8 in both. Each again on
+    // four SMs' worth of CTAs: the persistent kernels then walk many tiles
+    // per CTA.
     lowp_case("all", false, None)?;
+    lowp_case("all", false, Some(4 * super::CTAS_PER_SM))?;
     lowp_case("gu8,dn8,gout", true, None)?;
     lowp_case("gu8,dn8,gout", true, Some(4 * super::CTAS_PER_SM))
 }
@@ -118,6 +119,8 @@ fn lowp_case(mix: &str, a8: bool, slots: Option<u32>) -> Result<()> {
             kernels.w4a8,
             kernels.w4a8ws[0],
             kernels.w4a8ws[1],
+            kernels.w4a4ws[0],
+            kernels.w4a4ws[3],
             kernels.w8a8,
             kernels.quant_nvfp4,
             kernels.quant_fp8
