@@ -1312,11 +1312,361 @@ dense_w4a8x16_gate_up_silu(const unsigned char* __restrict__ aq, const float* __
                           nchunks);
 }
 
-extern "C" __global__ void __launch_bounds__(DX_THREADS, 1)
-dense_w4a8x16_nvfp4(const unsigned char* __restrict__ aq, const float* __restrict__ ag,
-                    const unsigned char* __restrict__ packed, const unsigned char* __restrict__ scale,
-                    float scale2, __nv_bfloat16* __restrict__ C,
-                    unsigned int M, unsigned int N, unsigned int K, unsigned int ldc, unsigned int nchunks)
+// ---- W4A8, warp-specialized (picked by row count: dense_bf16mma_lowp.rs) ---
+// The 8-warp kernels' CTA tile (256 weight rows x 128 tokens, 64-K stages)
+// with the re-encode moved off the MMA warps, persistent over the tiles.
+//  * Producers (warps 8..15): producer p runs dl_a8_begin / dl_a8_slot for
+//    slot warp p of the 8-warp layout (half p / 4, warp p % 4), lane by
+//    lane, and stores the E4M3 operands and UE8M0 row scales in lane order.
+//    Their lanes 0..15 copy the NVFP4 stages, lanes 16..31 the tokens.
+//  * Consumers (warps 0..7): warp c reads slot warp c's operands back in the
+//    same lane and issues only MMAs, so each output is the same MMA row of
+//    the same operands in the same K order as in the 8-warp kernel; the
+//    epilogue computes db_body's values and stores them from registers.
+//    Results are bit-identical.
+//  * Tiles: CTA b takes raster tiles b, b + grid, ... (the 8-warp grid's
+//    order); the rings run on across tiles, so the next tile's stages load
+//    and re-encode during the epilogue.
+//  Rings: tokens DW_RT deep (issued DW_TA stages ahead), operands DW_RA,
+//  NVFP4 stages DW_RW (issued DW_RW - 1 ahead). Barriers: tfull (the token
+//  lanes' copies), afull[p] (producer p's operands), cdone (every consumer
+//  lane done with a stage's tokens and operands).
+#define DW_PRODUCERS 8
+#define DW_THREADS (32 * (8 + DW_PRODUCERS))
+#define DW_RT 4
+#define DW_RA 2
+#define DW_RW 3
+#define DW_TA (DW_RT - DW_RA)
+// Registers: 512 threads launch at 128; the producers give theirs to the
+// consumers' 128 FP32 accumulators (setmaxnreg: 256 x 192 + 256 x 64).
+#define DW_CREG 192
+#define DW_PREG 64
+#define DW_BG 2     // token tiles per MMA group: 4 MMAs between dependent ones
+
+// One stage of re-encoded operands: per slot warp and lane the four MMA A
+// fragments (q = 2 h + f: a[h][2f][0], a[h][2f+1][0], a[h][2f][1],
+// a[h][2f+1][1]) and the UE8M0 scales (sa0, sa1).
+struct __align__(16) DwA {
+    uint4 a[8][4][32];
+    uint2 sa[8][32];
+};
+
+// A raster tile of the 8-warp grid (db_body's blockIdx.x mapping).
+struct DwTile {
+    unsigned int n0, r0, rows;
+    int ttv;
+};
+// Walks one CTA's tiles: L = blockIdx.x, + gridDim.x, ..., skipping chunks
+// past M; s is the stage within the tile.
+struct DwCursor {
+    unsigned int L;
+    int s;
+    DwTile tl;
+};
+template <bool FUSED>
+__device__ __forceinline__ bool dw_tile(unsigned int L, unsigned int M, unsigned int N, unsigned int nchunks,
+                                        DwTile& tl) {
+    constexpr unsigned int TW = (FUSED ? 64 : 128) * 2;
+    const unsigned int cs = (M + nchunks - 1) / nchunks, nft = N / TW;
+    const unsigned int grp = L / (DB_GROUP * nft), first = grp * DB_GROUP;
+    const unsigned int gc = min(nchunks - first, (unsigned int)DB_GROUP);
+    const unsigned int in = L - grp * DB_GROUP * nft;
+    tl.n0 = (in / gc) * TW;
+    tl.r0 = (first + in % gc) * cs;
+    if (tl.r0 >= M) return false;
+    tl.rows = min(cs, M - tl.r0);
+    tl.ttv = (tl.rows + 7) >> 3;
+    return true;
+}
+// The first valid tile at or after c.L (c.L >= total: done).
+template <bool FUSED>
+__device__ __forceinline__ void dw_seek(DwCursor& c, unsigned int M, unsigned int N, unsigned int nchunks) {
+    const unsigned int total = (N / ((FUSED ? 64 : 128) * 2)) * nchunks;
+    while (c.L < total && !dw_tile<FUSED>(c.L, M, N, nchunks, c.tl)) c.L += gridDim.x;
+}
+template <bool FUSED>
+__device__ __forceinline__ void dw_next(DwCursor& c, int ksteps, unsigned int M, unsigned int N,
+                                        unsigned int nchunks) {
+    if (++c.s == ksteps) {
+        c.s = 0;
+        c.L += gridDim.x;
+        dw_seek<FUSED>(c, M, N, nchunks);
+    }
+}
+
+// db_body's epilogue outputs of one consumer warp, stored from registers: FUSED
+// bf16 pairs (outputs 16 warp + 2 g + {0, 1}), else four features 32 warp +
+// 4 g + {0..3}; rows past `rows` are not stored.
+template <bool FUSED, int TTM>
+__device__ __forceinline__ void dw_epi_store(__nv_bfloat16* __restrict__ C, unsigned int ldc, unsigned int r0,
+                                             unsigned int col, const float (&acc)[2][TTM][4], int ttv,
+                                             unsigned int warp, unsigned int g, unsigned int t, float k0, float k1,
+                                             const float* ag_row, unsigned int rows) {
+    #pragma unroll
+    for (int tt = 0; tt < TTM; tt++) {
+        if (tt < ttv) {
+            #pragma unroll
+            for (int par = 0; par < 2; par++) {
+                const unsigned int tok = tt * 8 + 2 * t + par;
+                if (tok >= rows) continue;
+                const float ag = ag_row[tok];
+                __nv_bfloat16 o[4];
+                #pragma unroll
+                for (int q = 0; q < 2; q++) {
+                    const int i = par + 2 * q;
+                    if (FUSED) {
+                        const float gv = __bfloat162float(__float2bfloat16(acc[0][tt][i] * k0 * ag));
+                        const float uv = __bfloat162float(__float2bfloat16(acc[1][tt][i] * k1 * ag));
+                        o[q] = __float2bfloat16(gv * (1.0f / (1.0f + __expf(-gv))) * uv);
+                    } else {
+                        o[q] = __float2bfloat16(acc[0][tt][i] * k0 * ag);
+                        o[2 + q] = __float2bfloat16(acc[1][tt][i] * k1 * ag);
+                    }
+                }
+                __nv_bfloat16* dst = C + (unsigned long long)(r0 + tok) * ldc + col;
+                if (FUSED)
+                    *(__nv_bfloat162*)&dst[16 * warp + 2 * g] = __halves2bfloat162(o[0], o[1]);
+                else
+                    *(uint2*)&dst[32 * warp + 4 * g] = make_uint2(
+                        *(const unsigned int*)&o[0], *(const unsigned int*)&o[2]);
+            }
+        }
+    }
+}
+
+template <bool FUSED>
+__device__ __forceinline__ void dw_body(
+    const unsigned char* __restrict__ Aq, const float* __restrict__ Ag,
+    const unsigned char* __restrict__ W0, const unsigned char* __restrict__ S0, float gs0,
+    const unsigned char* __restrict__ W1, const unsigned char* __restrict__ S1, float gs1,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K, unsigned int ldc,
+    unsigned int nchunks)
 {
-    dx_body<false, DX_WST>(aq, ag, packed, scale, scale2, nullptr, nullptr, 0.0f, C, M, N, K, ldc, nchunks);
+    atlas_pdl_enter();
+    constexpr int HV = 2, TTM = DL_ROWS / 8;
+    constexpr unsigned int FEAT = FUSED ? 64 : 128;      // weight features per half (per matrix)
+    extern __shared__ __align__(16) unsigned char db_smem[];
+    DbTok8* tk = (DbTok8*)db_smem;
+    DwA* ab = (DwA*)(db_smem + DW_RT * sizeof(DbTok8));
+    DbW<DB_NVFP4, HV>* wt = (DbW<DB_NVFP4, HV>*)(db_smem + DW_RT * sizeof(DbTok8) + DW_RA * sizeof(DwA));
+
+    DwCursor start{blockIdx.x, 0, {}};
+    dw_seek<FUSED>(start, M, N, nchunks);
+    const unsigned int total = (N / (FEAT * HV)) * nchunks;
+    if (start.L >= total) return;                        // whole CTA, before any barrier
+
+    const unsigned int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
+    const unsigned int g = lane >> 2, t = lane & 3;
+    const int ksteps = K / DB_KS;
+
+    __shared__ __align__(8) unsigned long long tfull[DW_RT], cdone[DW_RT], afull[DW_RA][DW_PRODUCERS];
+    // Per-token scales of the consumers' last two tiles.
+    __shared__ float ag_s[2][DL_ROWS];
+    if (tid == 0) {
+        #pragma unroll
+        for (int b = 0; b < DW_RT; b++) {
+            dl_mbar_init(&tfull[b], 16 * DW_PRODUCERS);
+            dl_mbar_init(&cdone[b], 256);
+        }
+        #pragma unroll
+        for (int b = 0; b < DW_RA; b++)
+            #pragma unroll
+            for (int p = 0; p < DW_PRODUCERS; p++) dl_mbar_init(&afull[b][p], 32);
+        asm volatile("fence.mbarrier_init.release.cluster;");
+    }
+    __syncthreads();
+
+    if (wid >= 8) {
+        // Producer p. Lanes 0..15 of all producers (WL threads) copy each
+        // NVFP4 stage coalesced (thread wq: chunk wq % 8 of k-pair rows
+        // wq / 8 + (WL / 8) r of both halves; scales: threads 0..63), each
+        // waits on its own copies and a producer barrier publishes them;
+        // lanes 16..31 copy the tokens (rows tq / 4 + (WL / 4) i, chunk
+        // tq % 4), tracked by tfull, so token arrivals never wait on weights.
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" :: "n"(DW_PREG));
+        constexpr unsigned int WL = 16 * DW_PRODUCERS, WROWS = WL / 8, TROWS = WL / 4;
+        const unsigned int p = wid - 8;
+        const bool wl = lane < 16;
+        const unsigned int wq = p * 16 + (lane & 15), wc = wq & 7, wr = wq >> 3;
+        const unsigned int sh_h = (wq >> 5) & 1, sgr = (wq >> 3) & 3;
+        auto src = [&](const unsigned char* a, const unsigned char* b, unsigned int c, unsigned int n0,
+                       unsigned long long row) {
+            return ((FUSED && c >= 4) ? b : a) + n0 + (c & (FUSED ? 3 : 7)) * 16 + row * N;
+        };
+        // Weight lanes run DW_RW - 1 stages ahead, token lanes DW_TA: one
+        // cursor each (`ahead`), issuing into ring slot Gi.
+        const unsigned int qc = wq & 3;
+        auto issue = [&](const DwCursor& c, int Gi) {
+            const unsigned int kb = c.s * DB_KS;
+            if (wl) {
+                DbW<DB_NVFP4, HV>& sw = wt[Gi % DW_RW];
+                #pragma unroll
+                for (int h = 0; h < HV; h++)
+                    #pragma unroll
+                    for (unsigned int r = 0; r < DB_KS / 2 / WROWS; r++) {
+                        const unsigned int row = wr + WROWS * r;
+                        bm_cp16(&sw.w[h][row][(wc ^ bm_swz_w(row)) * 16],
+                                src(W0, W1, wc, c.tl.n0 + h * FEAT, kb / 2 + row), true);
+                    }
+                if (wq < 64)
+                    bm_cp16(&sw.s[sh_h][sgr][(wc ^ bm_swz_s(sgr)) * 16],
+                            src(S0, S1, wc, c.tl.n0 + sh_h * FEAT, kb / 16 + sgr), true);
+                bm_commit();
+            } else {
+                #pragma unroll
+                for (unsigned int i = 0; i < DL_ROWS / TROWS; i++) {
+                    const unsigned int r = (wq >> 2) + TROWS * i;
+                    if ((int)r < c.tl.ttv * 8)
+                        bm_cp16(&tk[Gi % DW_RT].q[r][qc * 16],
+                                Aq + (unsigned long long)(c.tl.r0 + (r < c.tl.rows ? r : 0)) * K + qc * 16 + kb,
+                                c.tl.rows > r);
+                }
+                dl_cp_arrive(&tfull[Gi % DW_RT]);
+            }
+        };
+        // This CTA's stage count, and the lanes' look-ahead cursor.
+        int nG = 0;
+        for (DwCursor c = start; c.L < total; c.L += gridDim.x, dw_seek<FUSED>(c, M, N, nchunks)) nG += ksteps;
+        const int ahead = wl ? DW_RW - 1 : DW_TA;
+        DwCursor cur = start;
+        int Gi = 0;
+        for (; Gi < ahead && Gi < nG; Gi++) {
+            issue(cur, Gi);
+            dw_next<FUSED>(cur, ksteps, M, N, nchunks);
+        }
+        if (wl)
+            for (int i = Gi; i < DW_RW - 1; i++) bm_commit();
+        for (int G = 0; G < nG; G++) {
+            if (G >= DW_RA) dl_mbar_wait(&cdone[(G - DW_RA) % DW_RT], ((G - DW_RA) / DW_RT) & 1);
+            if (!wl && Gi < nG) {
+                issue(cur, Gi++);
+                dw_next<FUSED>(cur, ksteps, M, N, nchunks);
+            }
+            // Stage G's rows have landed everywhere, and every producer is
+            // done with stage G - 1's buffer, which takes stage G + RW - 1.
+            if (wl) bm_wait<DW_RW - 2>();
+            asm volatile("bar.sync 2, %0;" :: "n"(32 * DW_PRODUCERS) : "memory");
+            if (wl) {
+                if (Gi < nG) {
+                    issue(cur, Gi++);
+                    dw_next<FUSED>(cur, ksteps, M, N, nchunks);
+                } else {
+                    bm_commit();
+                }
+            }
+            DwA& out = ab[G % DW_RA];
+            static_assert(DW_PRODUCERS == 8, "one slot warp per producer");
+            DlA8 a8;
+            dl_a8_begin<FUSED, HV>(a8, &wt[G % DW_RW], p >> 2, p & 3, g, t);
+            #pragma unroll
+            for (int sl = 0; sl < 4; sl++) dl_a8_slot(a8, sl);
+            #pragma unroll
+            for (int hh = 0; hh < 2; hh++)
+                #pragma unroll
+                for (int f = 0; f < 2; f++)
+                    out.a[p][2 * hh + f][lane] = make_uint4(a8.a[hh][2 * f][0], a8.a[hh][2 * f + 1][0],
+                                                            a8.a[hh][2 * f][1], a8.a[hh][2 * f + 1][1]);
+            out.sa[p][lane] = make_uint2(a8.sa0, a8.sa1);
+            dl_mbar_arrive(&afull[G % DW_RA][p]);
+        }
+        bm_wait<0>();
+        return;
+    }
+    // Consumer warp c = 4 half + warp.
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" :: "n"(DW_CREG));
+    // The lane coordinates re-read after the register handoff, so they are
+    // not values carried (and spilled) across it.
+    unsigned int ctid;
+    asm volatile("mov.u32 %0, %%tid.x;" : "=r"(ctid));
+    const unsigned int cw = ctid >> 5, cl = ctid & 31, cg = cl >> 2, cq = cl & 3;
+    float acc[2][TTM][4];
+    int G = 0;
+    auto kloop = [&](auto ttc) {
+        constexpr int TT = decltype(ttc)::value;
+        for (int s = 0; s < ksteps; s++, G++) {
+            dl_mbar_wait(&afull[G % DW_RA][cw % DW_PRODUCERS], (G / DW_RA) & 1);
+            dl_mbar_wait(&tfull[G % DW_RT], (G / DW_RT) & 1);
+            const DwA& a = ab[G % DW_RA];
+            uint4 q[4];
+            #pragma unroll
+            for (int i = 0; i < 4; i++) q[i] = a.a[cw][i][cl];
+            const uint2 sa = a.sa[cw][cl];
+            const DbTok8& tb = tk[G % DW_RT];
+            #pragma unroll
+            for (int j0 = 0; j0 < TT; j0 += DW_BG) {
+                uint4 b[DW_BG];
+                #pragma unroll
+                for (int j = 0; j < DW_BG; j++)
+                    if (j0 + j < TT) b[j] = *(const uint4*)&tb.q[(j0 + j) * 8 + cg][16 * cq];
+                #pragma unroll
+                for (int h = 0; h < 2; h++)
+                    #pragma unroll
+                    for (int j = 0; j < DW_BG; j++)
+                        if (j0 + j < TT)
+                            #pragma unroll
+                            for (int f = 0; f < 2; f++) {
+                                const uint4& x = q[2 * h + f];
+                                dl_mma_mx8(acc[f][j0 + j], x.x, x.y, x.z, x.w, h ? b[j].z : b[j].x,
+                                           h ? b[j].w : b[j].y, f ? sa.y : sa.x, 0x7f);
+                            }
+            }
+            dl_mbar_arrive(&cdone[G % DW_RT]);
+        }
+    };
+    for (DwCursor c = start; c.L < total;) {
+        const DwTile tl = c.tl;
+        // ag_s[n % 2]: written here, read after the next barrier; the
+        // buffer is reused two tiles on, after every consumer has passed
+        // the barrier of the tile between.
+        float* ag = ag_s[(G / ksteps) & 1];
+        if (ctid < tl.rows) ag[ctid] = Ag[tl.r0 + ctid];
+        #pragma unroll
+        for (int i = 0; i < TTM; i++)
+            #pragma unroll
+            for (int f = 0; f < 2; f++) acc[f][i][0] = acc[f][i][1] = acc[f][i][2] = acc[f][i][3] = 0.0f;
+        switch (tl.ttv) {
+            case 1: kloop(dl_int<1>{}); break;
+            case 2: kloop(dl_int<2>{}); break;
+            case 3: kloop(dl_int<3>{}); break;
+            case 4: kloop(dl_int<4>{}); break;
+            case 5: kloop(dl_int<5>{}); break;
+            case 6: kloop(dl_int<6>{}); break;
+            case 7: kloop(dl_int<7>{}); break;
+            case 8: kloop(dl_int<8>{}); break;
+            case 9: kloop(dl_int<9>{}); break;
+            case 10: kloop(dl_int<10>{}); break;
+            case 11: kloop(dl_int<11>{}); break;
+            case 12: kloop(dl_int<12>{}); break;
+            case 13: kloop(dl_int<13>{}); break;
+            case 14: kloop(dl_int<14>{}); break;
+            case 15: kloop(dl_int<15>{}); break;
+            default: kloop(dl_int<TTM>{}); break;
+        }
+        asm volatile("bar.sync 1, 256;" ::: "memory");
+        dw_epi_store<FUSED, TTM>(C, ldc, tl.r0, tl.n0 + (cw >> 2) * FEAT, acc, tl.ttv, cw & 3, cg, cq, gs0,
+                                 FUSED ? gs1 : gs0, ag, tl.rows);
+        c.L += gridDim.x;
+        dw_seek<FUSED>(c, M, N, nchunks);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(DW_THREADS, 1)
+dense_w4a8ws_gate_up_silu(const unsigned char* __restrict__ aq, const float* __restrict__ ag,
+                          const unsigned char* __restrict__ gate_packed, const unsigned char* __restrict__ gate_scale,
+                          float gate_scale2,
+                          const unsigned char* __restrict__ up_packed, const unsigned char* __restrict__ up_scale,
+                          float up_scale2,
+                          __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+                          unsigned int nchunks)
+{
+    dw_body<true>(aq, ag, gate_packed, gate_scale, gate_scale2, up_packed, up_scale, up_scale2, C, M, N, K, N, nchunks);
+}
+
+extern "C" __global__ void __launch_bounds__(DW_THREADS, 1)
+dense_w4a8ws_nvfp4(const unsigned char* __restrict__ aq, const float* __restrict__ ag,
+                   const unsigned char* __restrict__ packed, const unsigned char* __restrict__ scale,
+                   float scale2, __nv_bfloat16* __restrict__ C,
+                   unsigned int M, unsigned int N, unsigned int K, unsigned int ldc, unsigned int nchunks)
+{
+    dw_body<false>(aq, ag, packed, scale, scale2, nullptr, nullptr, 0.0f, C, M, N, K, ldc, nchunks);
 }

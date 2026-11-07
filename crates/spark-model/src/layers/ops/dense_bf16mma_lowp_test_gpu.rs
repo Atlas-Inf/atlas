@@ -96,20 +96,28 @@ fn lowp_activations(
 #[test]
 #[ignore = "needs a GB10 and a qwen3.8-27b kernel build"]
 fn dense_lowp_matches_exact_reference_on_quantized_activations() -> Result<()> {
-    // W4A4 MLP, then W4A8; the FP8 projection is W8A8 in both.
-    lowp_case("all", false)?;
-    lowp_case("gu8,dn8,gout", true)
+    // W4A4 MLP, then W4A8; the FP8 projection is W8A8 in both. W4A8 again
+    // on four SMs' worth of CTAs: the persistent warp-specialized kernels
+    // then walk many tiles per CTA.
+    lowp_case("all", false, None)?;
+    lowp_case("gu8,dn8,gout", true, None)?;
+    lowp_case("gu8,dn8,gout", true, Some(4 * super::CTAS_PER_SM))
 }
 
-fn lowp_case(mix: &str, a8: bool) -> Result<()> {
+fn lowp_case(mix: &str, a8: bool, slots: Option<u32>) -> Result<()> {
     let gpu = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
-    let kernels = DenseBf16mma::resolve_lowp(&gpu, LowpMix::parse(mix));
+    let mut kernels = DenseBf16mma::resolve_lowp(&gpu, LowpMix::parse(mix));
+    if let Some(slots) = slots {
+        kernels.slots = slots;
+    }
     ensure!(
         [
             kernels.w4a4_gate_up,
             kernels.w4a4,
             kernels.w4a8_gate_up,
             kernels.w4a8,
+            kernels.w4a8ws[0],
+            kernels.w4a8ws[1],
             kernels.w8a8,
             kernels.quant_nvfp4,
             kernels.quant_fp8
