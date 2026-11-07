@@ -167,6 +167,13 @@ pub(crate) fn check_active(model_type: &str) -> bool {
         || check_from(check_requested(), model_type)
 }
 
+/// Whether the serial check runs before a DFlash K=γ verify
+/// (`verify_d.rs`): `ATLAS_EXACT_VERIFY_CHECK` on a qwen3_5 model only, so
+/// the qwen4_exp check keeps the K=2/3/4 verifies it was built for.
+pub(crate) fn kgamma_check_active(model_type: &str) -> bool {
+    check_from(check_requested(), model_type)
+}
+
 fn check_from(requested: bool, model_type: &str) -> bool {
     requested && model_type == MODEL_TYPE
 }

@@ -792,8 +792,20 @@ impl Model for TransformerModel {
         // were staged for (`glm_verify_masks`).
         let allow = self.take_verify_row_masks(tokens.len())?;
         self.ssm_pool.require_verify_rollback_supported()?;
+        // ATLAS_EXACT_VERIFY_CHECK (qwen3_5): serial reference rows first,
+        // compared after the forward (`exact_verify_check.rs`); masked rows
+        // are not serial decode's, so a masked verify is not checked.
+        let serial = match allow {
+            None => self.kgamma_serial_rows(tokens, seq)?,
+            Some(_) => None,
+        };
+        let seq_len = seq.seq_len;
         self.mark_gdn_deferred_commit(seq, tokens.len())?;
-        self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream, allow)
+        let rows = self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream, allow)?;
+        if let Some(serial) = serial {
+            self.exact_verify_compare(serial, seq_len)?;
+        }
+        Ok(rows)
     }
     fn decode_and_verify_fused(
         &self,
