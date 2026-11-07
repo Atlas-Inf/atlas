@@ -585,7 +585,7 @@ impl Model for TransformerModel {
         super::exact_verify::max_drafts(&self.levers, self.dflash_drafter(), layers)
     }
     fn verify_bit_exact(&self) -> bool {
-        super::exact_verify::verify_bit_exact(&self.levers, self.dflash_drafter())
+        super::exact_verify::verify_bit_exact(&self.levers)
     }
     fn batch_verify_bit_exact(&self) -> bool {
         self.levers.qwen4exp_exact_verify && self.levers.qwen4exp_batch_fast

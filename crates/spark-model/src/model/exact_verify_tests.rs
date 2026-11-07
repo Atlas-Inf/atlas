@@ -71,16 +71,25 @@ fn the_check_is_qwen3_5_only() {
 }
 
 #[test]
-fn verify_bit_exact_needs_a_lever_and_no_dflash() {
+fn verify_bit_exact_needs_a_lever_and_covers_dflash() {
     // Off: false, as the trait default.
-    assert!(!verify_bit_exact(&levers(false, false), false));
-    // Dense lever: true for MTP, false beside a DFlash drafter.
-    assert!(verify_bit_exact(&levers(false, true), false));
-    assert!(!verify_bit_exact(&levers(false, true), true));
+    assert!(!verify_bit_exact(&levers(false, false)));
+    // Dense lever: true, for MTP and beside a DFlash drafter alike (the K=γ
+    // verify is covered up to DFLASH_MAX_ROWS rows).
+    assert!(verify_bit_exact(&levers(false, true)));
     // qwen4_exp keeps its own answer (both fields set by its lever).
-    assert!(verify_bit_exact(&levers(true, true), false));
+    assert!(verify_bit_exact(&levers(true, true)));
     assert!(levers(false, true).dense_exact_verify());
     assert!(!levers(true, true).dense_exact_verify());
+}
+
+#[test]
+fn max_rows_is_the_mtp_or_dflash_width() {
+    assert_eq!(max_rows(false), MAX_ROWS);
+    assert_eq!(max_rows(true), DFLASH_MAX_ROWS);
+    // γ = 8 (DFlash2's served depth) fits in one exact verify.
+    assert!(DFLASH_MAX_DRAFTS >= 8);
+    assert_eq!(DFLASH_MAX_DRAFTS + 1, DFLASH_MAX_ROWS);
 }
 
 #[test]
@@ -89,10 +98,15 @@ fn max_drafts_caps_the_dense_lever_at_the_widest_exact_verify() {
     assert_eq!(max_drafts(&dense, false, None), Some(MAX_DRAFTS));
     assert_eq!(max_drafts(&dense, false, Some(7)), Some(MAX_DRAFTS));
     assert_eq!(max_drafts(&dense, false, Some(1)), Some(1));
-    // DFlash, the lever off, or qwen4_exp: the layers' ceiling as before.
-    assert_eq!(max_drafts(&dense, true, None), None);
+    // DFlash: the K=γ cap, never above the layers' ceiling.
+    assert_eq!(max_drafts(&dense, true, None), Some(DFLASH_MAX_DRAFTS));
+    assert_eq!(max_drafts(&dense, true, Some(8)), Some(8));
+    assert_eq!(max_drafts(&dense, true, Some(31)), Some(DFLASH_MAX_DRAFTS));
+    // The lever off, or qwen4_exp: the layers' ceiling as before.
+    assert_eq!(max_drafts(&levers(false, false), true, None), None);
     assert_eq!(max_drafts(&levers(false, false), false, Some(7)), Some(7));
     assert_eq!(max_drafts(&levers(true, true), false, None), None);
+    assert_eq!(max_drafts(&levers(true, true), true, Some(9)), Some(9));
 }
 
 #[test]
@@ -100,12 +114,49 @@ fn attention_split_pin_covers_the_widest_verify_under_the_dense_lever() {
     let mut l = levers(false, true);
     l.max_decode_seqs = 1;
     assert_eq!(l.attn_split_ref_seqs(), MAX_ROWS as u32);
+    l.exact_verify_rows = max_rows(false) as u32;
+    assert_eq!(l.attn_split_ref_seqs(), MAX_ROWS as u32);
+    // Beside a DFlash drafter: every K=γ row reduces over serial's splits.
+    l.exact_verify_rows = max_rows(true) as u32;
+    assert_eq!(l.attn_split_ref_seqs(), DFLASH_MAX_ROWS as u32);
+    l.max_decode_seqs = 32;
+    assert_eq!(l.attn_split_ref_seqs(), 32);
+    l.exact_verify_rows = 0;
     l.max_decode_seqs = 8;
     assert_eq!(l.attn_split_ref_seqs(), 8);
     // Off, and for qwen4_exp: the configured max batch, unchanged.
     for mut other in [levers(false, false), levers(true, true)] {
         other.max_decode_seqs = 1;
+        other.exact_verify_rows = DFLASH_MAX_ROWS as u32;
         assert_eq!(other.attn_split_ref_seqs(), 1);
+    }
+}
+
+#[test]
+fn dense_exact_rows_follow_the_verify_width() {
+    let mut l = levers(false, true);
+    // MTP (no DFlash): 2..=4.
+    l.exact_verify_rows = max_rows(false) as u32;
+    for rows in 0..=20 {
+        assert_eq!(
+            l.dense_exact_rows(rows),
+            (2..=MAX_ROWS).contains(&rows),
+            "{rows}"
+        );
+    }
+    // DFlash: 2..=16, so γ = 8 (9 rows) and γ = 15 take the exact arms.
+    l.exact_verify_rows = max_rows(true) as u32;
+    for rows in 0..=20 {
+        assert_eq!(
+            l.dense_exact_rows(rows),
+            (2..=DFLASH_MAX_ROWS).contains(&rows),
+            "{rows}"
+        );
+    }
+    // Never without the dense lever (off, or qwen4_exp's own).
+    for mut other in [levers(false, false), levers(true, true)] {
+        other.exact_verify_rows = DFLASH_MAX_ROWS as u32;
+        assert!((0..=20).all(|r| !other.dense_exact_rows(r)));
     }
 }
 
@@ -135,5 +186,29 @@ fn native_fp8_attention_verify_rows_are_the_serial_twin() {
             ..k
         };
         assert!(crate::layers::ops::fp8_rows_plan(rows, true, true, no_b4).is_none());
+    }
+}
+
+/// Native FP8 attention beside a DFlash drafter: on the GB10 kernel set (no
+/// Strix batch8 tiers) every K=γ verify width 5..=16 is ONE
+/// `w8a16_gemv_batch16` launch, the template whose rows are `w8a16_gemv`'s
+/// bytes (`examples/attn_fp8_native_microtest` TWIN legs 1..=16).
+#[test]
+fn native_fp8_attention_dflash_rows_are_one_batch16_launch_on_gb10() {
+    use spark_runtime::gpu::KernelHandle;
+    let gb10 = crate::layers::ops::Fp8RowsKernels {
+        batch4: KernelHandle(4),
+        batch8: KernelHandle(0),
+        batch8_dyn_vl2: KernelHandle(0),
+        batch8_dyn_vl2_n2: KernelHandle(0),
+        batch16: KernelHandle(16),
+    };
+    for rows in MAX_ROWS + 1..=DFLASH_MAX_ROWS {
+        for (wide, vl2) in [(true, true), (true, false), (false, true), (false, false)] {
+            let plan = crate::layers::ops::fp8_rows_plan(rows, wide, vl2, gb10).unwrap();
+            assert_eq!(plan.len(), 1, "rows {rows}");
+            assert_eq!((plan[0].kernel.0, plan[0].div), (16, 4), "rows {rows}");
+            assert_eq!((plan[0].first, plan[0].rows), (0, rows));
+        }
     }
 }

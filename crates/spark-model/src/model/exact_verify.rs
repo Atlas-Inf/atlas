@@ -1,39 +1,45 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Bit-exact K=2/3/4 MTP verify for the dense hybrid qwen3_5 (Qwen3.8-27B)
-//! (`ATLAS_EXACT_VERIFY=1`, default off; both ranks must agree,
-//! `startup_parity`). The qwen4_exp switch (`ATLAS_QWEN4EXP_EXACT_VERIFY`,
-//! `qwen4exp_exact_verify.rs`) is separate and unchanged; both set the
-//! generic [`ModelLevers::exact_verify`](crate::layers::ops::ModelLevers),
-//! which the ops the two models share read.
+//! Bit-exact single-sequence verify for the dense hybrid qwen3_5
+//! (Qwen3.8-27B): MTP K=2/3/4 and the DFlash K=γ verify up to
+//! [`DFLASH_MAX_ROWS`] rows (`ATLAS_EXACT_VERIFY=1`, default off; both ranks
+//! must agree, `startup_parity`). The qwen4_exp switch
+//! (`ATLAS_QWEN4EXP_EXACT_VERIFY`, `qwen4exp_exact_verify.rs`) is separate
+//! and unchanged; both set the generic
+//! [`ModelLevers::exact_verify`](crate::layers::ops::ModelLevers), which the
+//! ops the two models share read.
 //!
 //! With the switch, row `i` of a single-sequence verify (`verify_b.rs` K=2,
-//! `verify_c.rs` K=3, `verify_c2.rs` K=4) computes the bits the serial decode
-//! step at that position computes, so `Model::verify_bit_exact` is true and
-//! the scheduler lets MTP speculate inside `<think>` (`mtp_gate::
-//! spec_think_for`): lossless at T=0, and exact in distribution at T>0
-//! because the rows are accepted by sequential sampling. Only one active
-//! sequence: the multi-sequence verify is NOT exact
-//! (`batch_verify_bit_exact` stays false). Not with a DFlash drafter, whose
-//! verify is wider than 4 rows; the MTP depth is capped at 3 drafts.
+//! `verify_c.rs` K=3, `verify_c2.rs` K=4, `verify_d.rs` K=γ for DFlash)
+//! computes the bits the serial decode step at that position computes, so
+//! `Model::verify_bit_exact` is true and the scheduler lets MTP or DFlash
+//! speculate inside `<think>` (`mtp_gate::spec_think_for`, no
+//! `ATLAS_DFLASH_SPEC_THINK` needed): lossless at T=0, and exact in
+//! distribution at T>0 because the rows are accepted by sequential
+//! sampling. Only one active sequence: the multi-sequence verify is NOT
+//! exact (`batch_verify_bit_exact` stays false). The MTP depth is capped at
+//! [`MAX_DRAFTS`]; beside a DFlash drafter γ is capped at
+//! [`DFLASH_MAX_DRAFTS`] (`ModelLevers::exact_verify_rows` = 16, which also
+//! widens the attention split pin and admits the 5..=16-row arms below).
 //!
 //! Row by row against serial decode (nvidia/Qwen3.8-27B-NVFP4: NVFP4 MLP and
-//! attention, FP8 block-scaled GDN projections, BF16 LM head, GB10):
+//! attention, FP8 GDN projections (per-tensor scale broadcast to the block
+//! grid), NVFP4 LM head, GB10). "K" is the verify width (rows):
 //!
 //! | op | serial | verify (default) | under the switch |
 //! |---|---|---|---|
-//! | GDN qkvz, out_proj (FP8) | `w8a16_gemv` | `w8a16_gemv_batch4` | `exact_rows_proj` (same kernel; also NVFP4/BF16 copies) |
+//! | GDN qkvz, out_proj (FP8) | `w8a16_gemv` | `w8a16_gemv_batch4`; 5..16 `batch16` | `exact_rows_proj`: `batch4` to 4 rows, `w8a16_gemv_batch16` 5..16 (rows are `w8a16_gemv`'s) |
 //! | GDN ba + gates | `dense_gemv_ba_gates` | `dense_gemm_ba_gates_prefill` | equal (same reduction, token-parallel) |
-//! | GDN conv, recurrence, norm | FP32 conv, `decode_f32[_norm]` | BF16 conv, WY | the `--exact-verify` per-token chain (`_snap` twins) |
-//! | attention Q+gate | `w4a16_gemv_qg` | `qg_batch2/3`; 4 rows `batch4_os` | 2/3 equal; 4 rows `qg_batch4` (`qkv_exact4.rs`) |
-//! | attention K/V | `w4a16_gemv_dual` | `dual_batch2/3`; 4 rows `batch4_os` | `w4a16_gemv_batch2/3/4` per projection |
+//! | GDN conv, recurrence, norm | FP32 conv, `decode_f32[_norm]` (or the one-launch `ATLAS_QWEN38_DECODE_FUSE` twin) | BF16 conv, WY / wyN | the `--exact-verify` per-token chain (`_snap` twins), any K |
+//! | attention Q+gate | `w4a16_gemv_qg` | `qg_batch2/3`; 4..8 `batch4/8_os`; 9+ tile GEMM | 2/3 equal; 4..16 `qg_batch4` chunks, the last 1..3 rows `qg[_batch2/3]` (`qkv_exact4.rs`) |
+//! | attention K/V | `w4a16_gemv_dual` | `dual_batch2/3`; 4..8 `batch4/8_os`; 9+ tile GEMM | `w4a16_gemv_batch2/3/N` per projection, batch16 past 8 rows |
 //! | q/k norm, MRoPE, KV write, gate | per row | strided, per row | equal (text positions: MRoPE == RoPE) |
-//! | attention core | split-K from `max(max_batch, 1)` | from `max(max_batch, K)` | split count pinned to `max(max_batch, 4)` for both |
-//! | o_proj | `w4a16_gemv[_sw]` | `batch2/3`; 4 rows tile GEMM | 4 rows scalar `w4a16_gemv_batch4` |
-//! | attention q+gate, k, v, o (native FP8, `ATLAS_DENSE_NATIVE_FP8_ATTN`) | `w8a16_gemv` (+ `deinterleave_qg`) | one `w8a16_gemv_batch4`, M = K (`ops::fp8_rows_plan`) | equal (rows are `w8a16_gemv`'s bytes) |
-//! | dense FFN | `dual[_sw]` + SiLU + `gemv[_sw]` | `dual_batch2/3`, batchm 4 | scalar `w4a16_gemv_batch2/3/4` per projection |
+//! | attention core | split-K from `max(max_batch, 1)` | from `max(max_batch, K)` | split count pinned to `max(max_batch, 4)` (16 beside DFlash) for both |
+//! | o_proj | `w4a16_gemv[_sw]` | `batch2/3`; 4+ rows tile GEMM | scalar `w4a16_gemv_batchN` (batch16 past 8 rows) |
+//! | attention q+gate, k, v, o (native FP8, `ATLAS_DENSE_NATIVE_FP8_ATTN`) | `w8a16_gemv` (+ `deinterleave_qg`) | one `w8a16_gemv_batch4`/`batch16` (`ops::fp8_rows_plan`) | equal on GB10 (rows are `w8a16_gemv`'s bytes) |
+//! | dense FFN | `dual[_sw]` + SiLU + `gemv[_sw]` | `dual_batch2/3`, batchm 4..8; GDN layers 9+ `forward_prefill` | scalar `w4a16_gemv_batch2/3/N` per projection, batch16 past 8 rows (`dense_ffn_exact.rs`) |
 //! | residual/RMS norms, final norm | 1 row | `[K, h]`, one block a row | equal |
-//! | LM head (BF16) | `dense_gemv_bf16` | 2 rows `_batch2`; 3/4 tile GEMM | 3/4 rows `dense_gemv_bf16_batchm` |
-//! | LM head (NVFP4) | `w4a16_gemv` | `batch2`; batchm tier | scalar tier (no DP4A / tensor core) |
+//! | LM head (BF16) | `dense_gemv_bf16` | 2 rows `_batch2`; 3+ tile GEMM | `dense_gemv_bf16_batchm` |
+//! | LM head (NVFP4) | `w4a16_gemv` | `batch2`; batchm tier / DP4A; 9+ wide or tile | scalar tier; 9..16 rows `w4a16_gemv_batch16` |
 //!
 //! Every verify arm above is a scalar template whose row `r` is the
 //! single-row kernel's bytes; no tensor-core or DP4A tier can be picked
@@ -41,12 +47,20 @@
 //! reads FP32), `ATLAS_DECODE_FFN_VIA_GEMM` and `ATLAS_NO_DECODE_SPLIT_SILU`
 //! (serial decode's FFN would then take another arithmetic).
 //!
+//! The DFlash path's target-side extras do not touch the target's
+//! arithmetic: the hidden-row capture for the drafter's context
+//! (`kgamma_dflash_capture`, `try_dflash_capture` in serial decode) only
+//! copies residual rows out, and the drafter's context commit, warm context
+//! (`ATLAS_DFLASH_WARM_CTX`) and proposal run on drafter state. The proposal
+//! itself is not exact and need not be: it only proposes.
+//!
 //! `ATLAS_EXACT_VERIFY_CHECK=1` (diagnostic, default off) is the qwen4_exp
 //! check (`trait_impl/exact_verify_check.rs`) on this model: before each
-//! K=2/3/4 verify the tokens are decoded serially on the live state, the
-//! state is put back, and the verify's logits and final hidden rows are
-//! compared byte for byte (`EXACT_VERIFY_CHECK` lines, summary every 64
-//! steps). Works with the switch off too, which measures the default gap.
+//! K=2/3/4 verify, and each DFlash K=γ verify of up to [`DFLASH_MAX_ROWS`]
+//! rows, the tokens are decoded serially on the live state, the state is put
+//! back, and the verify's logits and final hidden rows are compared byte for
+//! byte (`EXACT_VERIFY_CHECK` lines, summary every 64 steps). Works with the
+//! switch off too, which measures the default gap.
 
 use std::sync::OnceLock;
 
@@ -139,8 +153,9 @@ pub(crate) fn lever_from(requested: bool, model_type: &str, c: Conflicts) -> Res
         bail!("ATLAS_EXACT_VERIFY=1 cannot run beside {why}: drop one of the two.");
     }
     tracing::info!(
-        "exact verify ON (ATLAS_EXACT_VERIFY=1): K=2/3/4 single-sequence verify rows run \
-         serial decode's arithmetic; MTP may speculate inside <think> (one sequence)"
+        "exact verify ON (ATLAS_EXACT_VERIFY=1): single-sequence verify rows (MTP K=2/3/4, \
+         DFlash K=γ up to {DFLASH_MAX_ROWS}) run serial decode's arithmetic; speculation may \
+         enter <think> (one sequence)"
     );
     Ok(true)
 }
@@ -163,21 +178,23 @@ pub(crate) fn max_rows(dflash: bool) -> usize {
     if dflash { DFLASH_MAX_ROWS } else { MAX_ROWS }
 }
 
-/// `Model::verify_bit_exact`: the qwen4_exp lever, or the dense one without
-/// a DFlash drafter (its verify is wider than [`MAX_ROWS`]).
-pub(crate) fn verify_bit_exact(levers: &ModelLevers, dflash: bool) -> bool {
-    levers.qwen4exp_exact_verify || (levers.dense_exact_verify() && !dflash)
+/// `Model::verify_bit_exact`: the qwen4_exp lever, or the dense one (MTP
+/// K=2/3/4, or a DFlash K=γ verify of up to [`DFLASH_MAX_ROWS`] rows).
+pub(crate) fn verify_bit_exact(levers: &ModelLevers) -> bool {
+    levers.qwen4exp_exact_verify || levers.dense_exact_verify()
 }
 
 /// `Model::verify_max_drafts` from the layers' own ceiling: under the dense
-/// lever (no DFlash) at most [`MAX_DRAFTS`], the widest exact verify.
+/// lever at most the widest exact verify's drafts ([`MAX_DRAFTS`], or
+/// [`DFLASH_MAX_DRAFTS`] beside a DFlash drafter).
 pub(crate) fn max_drafts(
     levers: &ModelLevers,
     dflash: bool,
     layers: Option<usize>,
 ) -> Option<usize> {
-    if levers.dense_exact_verify() && !dflash {
-        Some(layers.map_or(MAX_DRAFTS, |d| d.min(MAX_DRAFTS)))
+    if levers.dense_exact_verify() {
+        let cap = max_rows(dflash) - 1;
+        Some(layers.map_or(cap, |d| d.min(cap)))
     } else {
         layers
     }

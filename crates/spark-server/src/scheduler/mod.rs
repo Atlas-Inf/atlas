@@ -864,8 +864,9 @@ pub fn run(
             // DFlash raw-argmax does not run ForcedThinkEnd, so it stays
             // serial-in-think unless this lever is on. Resume guard still
             // serial-decodes the spec-entry window. A bit-exact verify
-            // (`ATLAS_QWEN4EXP_EXACT_VERIFY=1`) counts as the opt-in for a
-            // single sequence: speculating there is lossless.
+            // (`ATLAS_QWEN4EXP_EXACT_VERIFY=1`, or `ATLAS_EXACT_VERIFY=1` on
+            // qwen3_5, DFlash included) counts as the opt-in for a single
+            // sequence: speculating there is lossless.
             let dflash_spec_think = mtp_gate::spec_think_for(
                 sched.levers.dflash_spec_think,
                 model.verify_bit_exact(),

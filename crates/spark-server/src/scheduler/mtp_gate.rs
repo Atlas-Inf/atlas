@@ -180,7 +180,8 @@ pub fn spec_dispatch_eligible(
 /// The `spec_think` a step dispatches with: the `ATLAS_MTP_SPEC_THINK` /
 /// `ATLAS_DFLASH_SPEC_THINK` opt-in, or a model whose single-sequence verify
 /// is bitwise serial decode (`Model::verify_bit_exact`, qwen4_exp under
-/// `ATLAS_QWEN4EXP_EXACT_VERIFY=1`, qwen3_5 under `ATLAS_EXACT_VERIFY=1`). The reason speculation stays out of
+/// `ATLAS_QWEN4EXP_EXACT_VERIFY=1`, qwen3_5 under `ATLAS_EXACT_VERIFY=1`,
+/// MTP or DFlash alike). The reason speculation stays out of
 /// `<think>` is that batch-K verify is not byte-lossless at T=0; an exact
 /// verify removes it. A concurrent batch verifies through the multi-sequence
 /// path, so it needs that path exact as well (`Model::batch_verify_bit_exact`,
