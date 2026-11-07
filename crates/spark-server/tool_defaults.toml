@@ -52,3 +52,5 @@ qwen3_vl_moe = "qwen"
 mistral     = "mistral"
 minimax_m2  = "minimax"        # MiniMax M2/M2.7 — <think>...</think>, own identity
 laguna      = "qwen"           # Laguna uses ordinary <think>...</think> tags
+mimo_v2     = "qwen"           # MiMo-V2 <think>/</think>; without it think_end_token is None and the
+                               # template's closed `<think></think>` reads as unclosed (forced thinking).
