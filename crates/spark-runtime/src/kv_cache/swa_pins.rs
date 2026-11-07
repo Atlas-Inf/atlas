@@ -102,8 +102,14 @@ impl PagedKvCache {
             swa.pins.tails.push_back(same);
             return;
         }
+        // Add the new pins before dropping the oldest, so a block shared by
+        // both keeps its count (and slot) throughout.
+        for &b in &tail {
+            swa.pins.count[b as usize] += 1;
+        }
+        swa.pins.tails.push_back(tail.clone());
         let mut evicted = Vec::new();
-        while swa.pins.tails.len() >= swa.pins.max_tails {
+        while swa.pins.tails.len() > swa.pins.max_tails {
             let Some(old) = swa.pins.tails.pop_front() else {
                 break;
             };
@@ -114,12 +120,6 @@ impl PagedKvCache {
             }
             evicted.extend(old);
         }
-        for &b in &tail {
-            swa.pins.count[b as usize] += 1;
-        }
-        swa.pins.tails.push_back(tail.clone());
-        // Take the new references before dropping the old ones, so a block in
-        // both tails never transiently reaches zero.
         tail.iter().for_each(|&b| self.inc_ref(b));
         evicted.iter().for_each(|&b| {
             self.dec_ref(b);

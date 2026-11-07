@@ -5,8 +5,8 @@
 //! A slotted sliding-window layer keeps only the newest rows of each
 //! sequence, so a cached prefix is resumable only where the window behind
 //! its end still holds slots. A finished prompt pins its tail
-//! (`PagedKvCache::pin_swa_tail`), and a lookup is capped to the deepest
-//! block whose window is resident, before the ranks agree on a match.
+//! (`PagedKvCache::pin_swa_tail`), and the agreed prefix match is capped to
+//! the deepest block whose window is resident (after the ranks agree).
 
 use spark_runtime::kv_cache::PagedKvCache;
 use spark_runtime::prefix_cache::PrefixMatch;
@@ -50,8 +50,9 @@ impl TransformerModel {
     }
 
     /// After the prefill of `prompt` (the whole prompt): pin the
-    /// sliding-window tail of its whole blocks, if the prefix cache
-    /// published them.
+    /// sliding-window tail of its whole blocks. Pins come from the block
+    /// table alone, so both EP ranks pin the same prompt ends even when
+    /// their prefix caches disagree.
     pub(crate) fn pin_swa_prompt_tail(&self, prompt: &[u32], seq: &SequenceState) {
         if !self.prefix_cache.is_active() {
             return;
@@ -65,14 +66,9 @@ impl TransformerModel {
         if whole == 0 || whole > seq.block_table.len() {
             return;
         }
-        let key = self.pc_key_tokens(seq, &prompt[..whole * bs]);
-        if self
-            .prefix_cache
-            .peek_matched_tokens(&key, bs, seq.adapter_id)
-            < whole * bs
-        {
-            return;
-        }
+        // Pin from the block table alone, not the radix: the two EP ranks'
+        // caches can disagree on what is published, and both must pin the
+        // same prompt ends or their slot maps diverge.
         kv_cache.pin_swa_tail(&seq.block_table[..whole]);
     }
 }

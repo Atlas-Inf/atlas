@@ -80,9 +80,18 @@ fn slots_return_on_free_and_refuse_exhaustion() {
 }
 
 fn pinned_cache(gpu: &MockGpuBackend, sequences: usize, prefix_tails: usize) -> PagedKvCache {
+    pinned_cache_lag(gpu, sequences, prefix_tails, 2)
+}
+
+fn pinned_cache_lag(
+    gpu: &MockGpuBackend,
+    sequences: usize,
+    prefix_tails: usize,
+    lag_blocks: usize,
+) -> PagedKvCache {
     let plan = SwaSlotPlan {
         layers: vec![1, 2],
-        lag_blocks: 2,
+        lag_blocks,
         sequences,
         window_blocks: 2,
         prefix_tails,
@@ -158,6 +167,30 @@ fn repinning_a_tail_refreshes_it_without_more_references() {
     assert_eq!(cache.ref_count(a[0]), 2);
     assert_eq!(cache.swa_adoptable_blocks(&b), Some(0));
     assert_eq!(cache.swa_adoptable_blocks(&a), Some(3));
+}
+
+#[test]
+fn evicting_a_tail_shared_with_the_new_one_keeps_the_shared_blocks() {
+    let gpu = MockGpuBackend::new();
+    let mut cache = pinned_cache_lag(&gpu, 1, 1, 100);
+    let mut table = Vec::new();
+    grow(&mut cache, &gpu, &mut table, 7, 0);
+    // Tail of `table[..6]` is blocks [3, 4, 5].
+    cache.pin_swa_tail(&table[..6]);
+    cache.release_swa_slots(&table);
+    cache.free_blocks(&table);
+    cache.lend_swa_slots(&[], &gpu, 0).unwrap();
+    // A second prompt whose held tail [3, 4] overlaps the first: evicting the
+    // first must not drop the pins (or free the blocks) the second needs.
+    cache.pin_swa_tail(&[table[2], table[3], table[4]]);
+    cache.lend_swa_slots(&[], &gpu, 0).unwrap();
+    assert_eq!(cache.ref_count(table[3]), 1);
+    assert_eq!(cache.ref_count(table[4]), 1);
+    assert_eq!(cache.ref_count(table[5]), 0);
+    let map = device_swa_map(&cache, &gpu);
+    assert_ne!(map[table[3] as usize], NO_TAIL);
+    assert_ne!(map[table[4] as usize], NO_TAIL);
+    assert_eq!(map[table[5] as usize], NO_TAIL);
 }
 
 #[test]
