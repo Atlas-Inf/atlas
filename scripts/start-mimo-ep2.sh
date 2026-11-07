@@ -45,9 +45,10 @@ if [ "$SWA_EVICT" = "1" ]; then
   PREFIX_CACHE_FLAG=""
   SWA_EVICT_ENV="-e ATLAS_SWA_EVICT=1"
 fi
-# MOE_ROWS=1: batched decode/verify MoE runs one EP all-reduce per layer over
-# all rows (ATLAS_MOE_ROWS_DECODE) instead of one per row.
-MOE_ROWS="${MOE_ROWS:-0}"
+# MOE_ROWS=1: row-exact verify (ATLAS_MOE_ROWS_DECODE): each verify row runs the
+# serial FFN arithmetic with one EP all-reduce per layer. Defaults on with DFLASH=1
+# (byte-identical to serial greedy and faster on GB10).
+MOE_ROWS="${MOE_ROWS:-${DFLASH:-0}}"
 MOE_ROWS_ENV=""
 [ "$MOE_ROWS" = "1" ] && MOE_ROWS_ENV="-e ATLAS_MOE_ROWS_DECODE=1"
 INTHINK_ENV=""
@@ -56,7 +57,7 @@ if [ -n "${ATLAS_INTHINK_TOOL_LEAK_OPENERS+x}" ]; then
 fi
 DFLASH="${DFLASH:-0}"
 # Block size 8 (7 drafts per step) and the trained 1024-token sliding window.
-DFLASH_GAMMA="${DFLASH_GAMMA:-8}"
+DFLASH_GAMMA="${DFLASH_GAMMA:-4}"  # γ sweep 3/4/5/6/8 on GB10: 4 fastest
 DFLASH_WINDOW="${DFLASH_WINDOW:-1024}"
 if [ "$DFLASH" = "1" ]; then
   if [ -z "${DRAFT_MODEL:-}" ]; then
