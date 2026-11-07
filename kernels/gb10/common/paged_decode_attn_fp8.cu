@@ -22,6 +22,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include "atlas_pdl.cuh"
 
 #define WARP_SIZE 32
 #ifndef HDIM
@@ -88,6 +89,7 @@ extern "C" __global__ void paged_decode_attn_fp8(
     const unsigned long long cache_stride,    // k_cache.stride(0) in elements (block-level stride)
     const unsigned int sliding_window         // 0 = full attention; >0 = trailing window size
 ) {
+    atlas_pdl_enter();
     const unsigned int q_head = blockIdx.x;
     const unsigned int seq_idx = blockIdx.y;
     const unsigned int tid = threadIdx.x;
@@ -363,6 +365,7 @@ extern "C" __global__ void paged_decode_attn_splitk_fp8(
     const unsigned long long cache_stride,    // k_cache.stride(0) in elements (block-level stride)
     const unsigned int sliding_window         // 0 = full attention; >0 = trailing window size
 ) {
+    atlas_pdl_enter();
     const unsigned int q_head = blockIdx.x;
     const unsigned int split_id = blockIdx.y;
     const unsigned int seq_idx = blockIdx.z;
@@ -540,6 +543,7 @@ extern "C" __global__ void paged_decode_attn_reduce_fp8(
     const unsigned int head_dim,
     const unsigned int num_splits
 ) {
+    atlas_pdl_enter();
     const unsigned int q_head = blockIdx.x;
     const unsigned int seq_idx = blockIdx.y;
     const unsigned int lane_id = threadIdx.x;  // 0..31
