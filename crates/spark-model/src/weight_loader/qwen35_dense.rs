@@ -168,6 +168,7 @@ fn dense_fp8_enabled() -> bool {
     std::env::var("ATLAS_DENSE_FP8").as_deref() == Ok("1")
 }
 
+mod attn_fp8;
 #[cfg(test)]
 mod fp8_policy_tests;
 mod fp8_preservation;
@@ -529,16 +530,10 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         }
                         continue;
                     }
-                    // ATLAS_NO_ATTN_FP8 forces the dequant→NVFP4 attention path
-                    // for A/B against the native-FP8 prefill transpose — mirrors
-                    // the ATLAS_NO_GDN_FP8 / ATLAS_NO_Q2_ATTN debug levers.
-                    let native_fp8_attention = cfg!(atlas_hip)
-                        && std::env::var_os("ATLAS_NO_ATTN_FP8").is_none()
-                        && config.tp_world_size.max(1) == 1
-                        && ["q_proj", "k_proj", "v_proj", "o_proj"]
-                            .iter()
-                            .all(|name| proj_is_fp8_any_scale(store, &format!("{p}.{name}")));
-                    if native_fp8_attention {
+                    // Native FP8 q/k/v/o: HIP always, CUDA under
+                    // ATLAS_DENSE_NATIVE_FP8_ATTN=1; ATLAS_NO_ATTN_FP8 forces the
+                    // dequant→NVFP4 path for A/B (`qwen35_dense/attn_fp8.rs`).
+                    if attn_fp8::native(store, &p, tp_size) {
                         let load_fp8_proj = |name: &str,
                                              _n: usize,
                                              _k: usize,
@@ -586,6 +581,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         if let Err(e) = attn_layer.transpose_fp8_for_prefill(gpu, stream) {
                             tracing::warn!("Layer {i}: dense FP8 transpose failed: {e}");
                         }
+                        attn_layer.prepare_fp8_bf16mma(gpu)?;
                         layers.push(Box::new(attn_layer));
                         attn_idx += 1;
                         if (i + 1) % 10 == 0 {
