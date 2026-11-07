@@ -416,14 +416,16 @@ pub fn run(
         }
     });
 
-    // Score receiver thread: `/v1/score` jobs land in `pending.scores` and
-    // run at the same quiescent point as rotations (see `score.rs`).
+    // Score receiver thread: `/v1/score` jobs land in `pending.scores` (a
+    // bounded backlog, see `score::admit`) and run at the same quiescent
+    // point as rotations (see `score.rs`).
     let ps = Arc::clone(&pending);
     std::thread::spawn(move || {
         let mut rx = score_rx;
         while let Some(job) = rx.blocking_recv() {
-            ps.0.lock().scores.push(job);
-            ps.1.notify_one();
+            if score::admit(&mut ps.0.lock().scores, job) {
+                ps.1.notify_one();
+            }
         }
     });
 
@@ -627,13 +629,11 @@ pub fn run(
                 };
                 let _ = ack.send(res);
             }
-            let jobs = std::mem::take(&mut pending.0.lock().scores);
-            if !jobs.is_empty() {
-                let (rows, streams) = model.score_capacity();
-                let budget = score::ScoreBudget {
-                    rows: rows.max(1),
-                    streams: streams.clamp(1, max_batch_size.max(1)),
-                };
+            // One score pass per quiescent tick; the rest stay queued.
+            if !pending.0.lock().scores.is_empty() {
+                let budget =
+                    score::ScoreBudget::new(model.score_capacity(), max_batch_size, block_size);
+                let jobs = score::take_tick(&mut pending.0.lock().scores, &budget);
                 score::run_jobs(&*model, jobs, prefill_stream, &budget);
             }
         }

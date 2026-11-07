@@ -12,6 +12,14 @@
 //! applies to every branch. `"attention": "prefix_bidir"` reads the prefix
 //! as a bidirectional state block and each branch as a bidirectional
 //! question block on it (full-attention layers only; the default is causal).
+//!
+//! Scheduling: a score pass shares the prefill arena, KV pool and SSM slots
+//! with chat requests, so it runs only when the scheduler is quiescent (no
+//! request decoding, prefilling, admitted, swapped or preempted), one pass
+//! per quiescent tick. Under sustained chat traffic score jobs wait; each
+//! waits at most `--request-timeout` seconds (504, the job is then dropped).
+//! A full backlog answers 503; a model that does not score, 501; a request
+//! that cannot fit even one branch per pass fails fast with 422.
 
 use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
@@ -20,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use super::compact::openai_error_response;
 use crate::main_modules::model_host::CurrentModel;
-use crate::scheduler::score::ScoreJob;
+use crate::scheduler::score::{ScoreError, ScoreJob};
 
 /// Upper bounds per request (branches and options per branch).
 pub const MAX_BRANCHES: usize = 256;
@@ -125,12 +133,15 @@ pub async fn score(
             Ok(v) => v,
             Err(msg) => return openai_error_response(StatusCode::BAD_REQUEST, msg),
         };
-    let Some(tx) = state.score_tx.clone() else {
+    let Some(queue) = state.score_tx.clone() else {
         return openai_error_response(
             StatusCode::NOT_IMPLEMENTED,
             "scoring is not enabled on this server".into(),
         );
     };
+    if let Err(msg) = queue.check_fits(&prefix, &branches) {
+        return openai_error_response(StatusCode::UNPROCESSABLE_ENTITY, msg);
+    }
     let (reply, rx) = tokio::sync::oneshot::channel();
     let job = ScoreJob {
         prefix,
@@ -140,13 +151,35 @@ pub async fn score(
         enqueued: std::time::Instant::now(),
         reply,
     };
-    if tx.send(job).await.is_err() {
-        return openai_error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "scheduler is not running".into(),
-        );
+    match queue.tx.try_send(job) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => return busy(),
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            return openai_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "scheduler is not running".into(),
+            );
+        }
     }
-    match rx.await {
+    // Dropping `rx` on timeout closes the reply, and the scheduler drops a
+    // job whose reply is closed before running it.
+    let reply = match state.request_deadline(None) {
+        Some(at) => match tokio::time::timeout_at(at.into(), rx).await {
+            Ok(r) => r,
+            Err(_) => {
+                return openai_error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!(
+                        "score request timed out after {}s (--request-timeout) waiting \
+                         for a quiescent scheduler",
+                        state.request_timeout
+                    ),
+                );
+            }
+        },
+        None => rx.await,
+    };
+    match reply {
         Ok(Ok(out)) => Json(ScoreResponse {
             probs: out.probs,
             engine_us: out.engine_us,
@@ -154,12 +187,25 @@ pub async fn score(
             batched: out.batched,
         })
         .into_response(),
-        Ok(Err(e)) => openai_error_response(StatusCode::UNPROCESSABLE_ENTITY, e),
+        Ok(Err(ScoreError::Busy)) => busy(),
+        Ok(Err(ScoreError::Failed(e))) => {
+            openai_error_response(StatusCode::UNPROCESSABLE_ENTITY, e)
+        }
         Err(_) => openai_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "scheduler dropped the request".into(),
         ),
     }
+}
+
+fn busy() -> Response {
+    openai_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "score queue is full ({} jobs pending); retry later",
+            crate::scheduler::score::MAX_PENDING_JOBS
+        ),
+    )
 }
 
 #[cfg(test)]
