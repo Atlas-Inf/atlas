@@ -40,6 +40,17 @@ pub(in crate::layers::qwen3_attention) struct PagedAttnBatchedArgs<'a> {
 }
 
 impl Qwen3AttentionLayer {
+    /// [`crate::layer::TransformerLayer::honours_state_end`]: the batched
+    /// paged kernels below (rows128 included) apply `state_end` when no
+    /// sliding window is set. MLA, mHC and the QSA indexer take other routes,
+    /// and HSS, HDIM > 256 and other KV dtypes refuse batched mode outright.
+    pub(in crate::layers::qwen3_attention) fn honours_state_end_inner(&self) -> bool {
+        self.mla.is_none()
+            && self.hc.is_none()
+            && self.qsa.is_none()
+            && self.sliding_window.is_none()
+    }
+
     /// Run batched paged Flash Attention across N streams. Uses the
     /// `prefill_attention_paged_*_batched` kernels shipped in commit
     /// 4ec2cf2 + ops bindings from commit a96fc67.

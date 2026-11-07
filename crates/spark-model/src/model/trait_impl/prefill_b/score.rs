@@ -67,6 +67,15 @@ impl TransformerModel {
             self.score_supported(),
             "score: single-rank models with BF16 logits only"
         );
+        ensure!(
+            !reqs.iter().any(|r| r.prefix_bidir)
+                || self
+                    .layers
+                    .iter()
+                    .all(|l| l.is_ssm_layer() || l.honours_state_end()),
+            "score: attention \"prefix_bidir\" is not supported by this model's attention \
+             layers (MLA, sliding-window, indexer or hyper-connection attention reads causally)"
+        );
         let bs = self.kv_cache.lock().block_size();
         let plan_reqs: Vec<ScoreRequest<'_>> = reqs
             .iter()

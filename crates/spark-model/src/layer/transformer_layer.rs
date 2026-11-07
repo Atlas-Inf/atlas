@@ -779,6 +779,14 @@ pub trait TransformerLayer: Send + Sync {
         false
     }
 
+    /// Whether this layer's `prefill_inner_batched_q12` applies
+    /// `BatchedAttnMetadata::state_end` (the `prefix_bidir` score mask)
+    /// rather than reading every stream causally. A score pass refuses a
+    /// bidirectional request unless every non-SSM layer does. Default: false.
+    fn honours_state_end(&self) -> bool {
+        false
+    }
+
     /// Whether this layer's batched prefill (`prefill_inner_batched_q12`,
     /// `prefill_phase1_proj_batched`, `prefill_phase3`) reads the `residual`
     /// buffer back. When no layer does, a score pass aliases it to `hidden`

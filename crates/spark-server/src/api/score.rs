@@ -12,6 +12,8 @@
 //! applies to every branch. `"attention": "prefix_bidir"` reads the prefix
 //! as a bidirectional state block and each branch as a bidirectional
 //! question block on it (full-attention layers only; the default is causal).
+//! It is refused (422) on a model whose attention layers would read it
+//! causally (MLA, sliding-window, indexer or hyper-connection attention).
 //!
 //! Scheduling: a score pass shares the prefill arena, KV pool and SSM slots
 //! with chat requests, so it runs only when the scheduler is quiescent (no
