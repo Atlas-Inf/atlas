@@ -186,6 +186,16 @@ impl TransformerModel {
         levers.qwen4exp_exact_verify = super::qwen4exp_exact_verify::lever(&config.model_type)?;
         levers.exact_verify = levers.qwen4exp_exact_verify
             || super::exact_verify::lever(&config.model_type, &levers)?;
+        if levers.dense_exact_verify() {
+            let dflash = !config.dflash_capture_layers.is_empty();
+            levers.exact_verify_rows = super::exact_verify::max_rows(dflash) as u32;
+            if dflash {
+                tracing::info!(
+                    "exact verify covers the DFlash K=γ verify (one sequence, up to {} rows)",
+                    levers.exact_verify_rows
+                );
+            }
+        }
         levers.qwen4exp_batch_fast = super::qwen4exp_batch_fast::lever(&config.model_type)?;
         levers.qwen4exp_mtp_depth = super::qwen4exp_mtp_depth::lever(
             &config.model_type,

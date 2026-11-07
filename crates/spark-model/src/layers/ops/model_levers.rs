@@ -109,6 +109,10 @@ pub struct ModelLevers {
     /// (`ATLAS_EXACT_VERIFY=1`, `model/exact_verify.rs`). Set by
     /// `TransformerModel::new`; the ops both models share read this one.
     pub exact_verify: bool,
+    /// The widest single-sequence verify the dense lever makes exact
+    /// (`model::exact_verify::max_rows`: 4 for MTP, 16 beside a DFlash
+    /// drafter); 0 when the lever is off. Set by `TransformerModel::new`.
+    pub exact_verify_rows: u32,
     /// qwen4_exp: the MTP verify ceiling in drafts (`ATLAS_QWEN4EXP_MTP_DEPTH`,
     /// `model/qwen4exp_mtp_depth.rs`), overriding the GDN layers' default 1.
     /// Set by `TransformerModel::new` for a qwen4_exp model only.
@@ -242,14 +246,26 @@ impl ModelLevers {
         self.exact_verify && !self.qwen4exp_exact_verify
     }
 
+    /// The widest exact verify under the dense lever (at least the MTP 4).
+    fn dense_exact_max_rows(&self) -> u32 {
+        self.exact_verify_rows
+            .max(crate::model::exact_verify::MAX_ROWS as u32)
+    }
+
+    /// Whether a `rows`-row single-sequence forward is a verify the dense
+    /// exact lever covers (2..=[`Self::exact_verify_rows`]), so the ops take
+    /// their row-exact arms at that width.
+    pub fn dense_exact_rows(&self, rows: usize) -> bool {
+        self.dense_exact_verify() && (2..=self.dense_exact_max_rows() as usize).contains(&rows)
+    }
+
     /// The batch the paged-decode split-K count is pinned to
     /// (`qwen3_attention::split_ref_seqs`). Under the dense exact verify it is
     /// at least the widest verify, so serial decode (1 row) and every K-row
     /// verify reduce attention over the same split count.
     pub fn attn_split_ref_seqs(&self) -> u32 {
         if self.dense_exact_verify() {
-            self.max_decode_seqs
-                .max(crate::model::exact_verify::MAX_ROWS as u32)
+            self.max_decode_seqs.max(self.dense_exact_max_rows())
         } else {
             self.max_decode_seqs
         }
@@ -304,6 +320,7 @@ impl ModelLevers {
             // Model-specific: `TransformerModel::new` sets it.
             qwen4exp_exact_verify: false,
             exact_verify: false,
+            exact_verify_rows: 0,
             qwen4exp_mtp_depth: None,
             qwen4exp_batch_fast: false,
             qwen4exp_batch_bisect: 0,

@@ -54,10 +54,16 @@ use anyhow::{Result, bail};
 
 use crate::layers::ops::ModelLevers;
 
-/// Widest single-sequence verify the switch makes exact (`verify_c2.rs`).
+/// Widest single-sequence MTP verify the switch makes exact (`verify_c2.rs`).
 pub const MAX_ROWS: usize = 4;
 /// The MTP depth that verify serves.
 pub const MAX_DRAFTS: usize = MAX_ROWS - 1;
+/// Widest single-sequence DFlash (K=γ, `verify_d.rs`) verify the switch makes
+/// exact: every row-exact twin below serves it in one launch (the scalar
+/// `w4a16_gemv_batch16` / `w8a16_gemv_batch16` templates).
+pub const DFLASH_MAX_ROWS: usize = 16;
+/// The DFlash γ that verify serves.
+pub const DFLASH_MAX_DRAFTS: usize = DFLASH_MAX_ROWS - 1;
 /// The dense hybrid the switch is for.
 const MODEL_TYPE: &str = "qwen3_5";
 
@@ -148,6 +154,13 @@ pub(crate) fn check_active(model_type: &str) -> bool {
 
 fn check_from(requested: bool, model_type: &str) -> bool {
     requested && model_type == MODEL_TYPE
+}
+
+/// The widest exact verify under the dense lever: the K=γ verify's beside a
+/// DFlash drafter, the MTP K=4 verify's otherwise
+/// (`ModelLevers::exact_verify_rows`).
+pub(crate) fn max_rows(dflash: bool) -> usize {
+    if dflash { DFLASH_MAX_ROWS } else { MAX_ROWS }
 }
 
 /// `Model::verify_bit_exact`: the qwen4_exp lever, or the dense one without
