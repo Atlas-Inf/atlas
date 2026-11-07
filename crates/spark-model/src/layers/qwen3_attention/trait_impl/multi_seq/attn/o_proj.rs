@@ -240,7 +240,7 @@ impl Qwen3AttentionLayer {
         } else if let Some(o_fp8) = self.o_weight.as_ref().and_then(|w| w.as_fp8()) {
             // One weight pass per `fp8_rows_plan` launch (`qkv_fp8.rs`); up
             // to 4 rows serial decode's `w8a16_gemv` bytes, as for q/k/v.
-            if let Some(plan) = self.fp8_rows_plan(n).filter(|_| n >= 2) {
+            if let Some(plan) = self.fp8_rows_plan(fwd, n).filter(|_| n >= 2) {
                 self.fp8_rows(
                     fwd,
                     &plan,

@@ -11,10 +11,7 @@
 
 use spark_runtime::weights::WeightStore;
 
-use crate::layers::ops::ModelLevers;
-
-/// The CUDA opt-in.
-pub(super) const LEVER: &str = "ATLAS_DENSE_NATIVE_FP8_ATTN";
+use crate::layers::ops::{DENSE_NATIVE_FP8_ATTN as LEVER, ModelLevers};
 
 const PROJS: [&str; 4] = ["q_proj", "k_proj", "v_proj", "o_proj"];
 

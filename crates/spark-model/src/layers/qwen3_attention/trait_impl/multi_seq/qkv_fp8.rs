@@ -4,7 +4,8 @@
 //! weight pass per launch of [`ops::fp8_rows_plan`]. Up to 4 rows that is one
 //! `w8a16_gemv_batch4`, whose rows are serial decode's `w8a16_gemv` bytes, so
 //! the K=2/3/4 verify is exact (`model/exact_verify.rs`). Past 16 rows the
-//! plan chunks by 16 on NVIDIA; the HIP build keeps its per-row loop there.
+//! plan chunks by 16 on NVIDIA under `ATLAS_DENSE_NATIVE_FP8_ATTN`; without
+//! it, and on HIP, those widths keep the per-row loop.
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
@@ -20,6 +21,7 @@ impl Qwen3AttentionLayer {
     /// its per-row `w8a16_gemv` loop.
     pub(in crate::layers::qwen3_attention) fn fp8_rows_plan(
         &self,
+        fwd: &ForwardContext<'_>,
         n: usize,
     ) -> Option<Vec<ops::Fp8RowsLaunch>> {
         let kernels = ops::Fp8RowsKernels {
@@ -29,7 +31,8 @@ impl Qwen3AttentionLayer {
             batch8_dyn_vl2_n2: self.w8a16_gemv_batch8_dyn_vl2_n2_k,
             batch16: self.w8a16_gemv_batch16_k,
         };
-        ops::fp8_rows_plan(n, !cfg!(atlas_hip), ops::gemv_vl2_enabled(), kernels)
+        let wide = !cfg!(atlas_hip) && fwd.levers.dense_native_fp8_attn;
+        ops::fp8_rows_plan(n, wide, ops::gemv_vl2_enabled(), kernels)
     }
 
     /// `plan`'s launches of `w` (`[n_out, k]`) over `input` (`[rows, k]`)
@@ -66,14 +69,18 @@ impl Qwen3AttentionLayer {
 
     /// Whether q/k/v are native FP8 and [`Self::fp8_rows_plan`] serves `n`
     /// rows; then [`Self::ms_qkv_batchm_fp8`] projects them.
-    pub(super) fn ms_qkv_fp8_plan(&self, n: usize) -> Option<Vec<ops::Fp8RowsLaunch>> {
+    pub(super) fn ms_qkv_fp8_plan(
+        &self,
+        fwd: &ForwardContext<'_>,
+        n: usize,
+    ) -> Option<Vec<ops::Fp8RowsLaunch>> {
         let fp8 = |w: &Option<crate::weight_map::QuantWeight>| {
             w.as_ref().and_then(|w| w.as_fp8()).is_some()
         };
         if n < 2 || !(fp8(&self.q_weight) && fp8(&self.k_weight) && fp8(&self.v_weight)) {
             return None;
         }
-        self.fp8_rows_plan(n)
+        self.fp8_rows_plan(fwd, n)
     }
 
     pub(super) fn ms_qkv_batchm_fp8(
