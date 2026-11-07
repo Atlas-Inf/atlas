@@ -133,6 +133,21 @@ __device__ __forceinline__ void dl_cp4(void* dst, const void* src, bool pred) {
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" :: "r"(d), "l"(src), "r"(pred ? 4 : 0));
 }
 
+// Weight copies marked L2 evict-first (the W8A8 GDN projections): their
+// weights stream through L2 once, and would otherwise evict the lines the
+// kernel's other row chunks and the next kernels read (288 rows, cold L2:
+// qkvz 510 -> 464 us, out 238 -> 214 us). The W4A4 kernels measured slower
+// with it (their second token tile re-reads the weights from L2).
+__device__ __forceinline__ unsigned long long dl_l2_evict_first() {
+    unsigned long long p;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(p));
+    return p;
+}
+__device__ __forceinline__ void dl_cp16_ef(void* dst, const void* src, unsigned long long pol) {
+    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;"
+                 :: "r"((unsigned int)__cvta_generic_to_shared(dst)), "l"(src), "l"(pol));
+}
+
 // mbarriers for the low-precision pipeline.
 __device__ __forceinline__ void dl_mbar_init(unsigned long long* b, unsigned int count) {
     asm volatile("mbarrier.init.shared.b64 [%0], %1;" :: "r"((unsigned int)__cvta_generic_to_shared(b)), "r"(count));
@@ -609,8 +624,12 @@ __device__ __forceinline__ void db_body(
             #pragma unroll
             for (int j = 0; j < 4; j++) {
                 const unsigned int r = (ht >> 3) + 16 * j;
-                bm_cp16(&sw.w[half][r][((ht & 7) ^ dl_swz_f8t(r)) * 16],
-                        w_src + (unsigned long long)(kb + 16 * j) * N, true);
+                if (AF == DB_A_FP8)
+                    dl_cp16_ef(&sw.w[half][r][((ht & 7) ^ dl_swz_f8t(r)) * 16],
+                               w_src + (unsigned long long)(kb + 16 * j) * N, dl_l2_evict_first());
+                else
+                    bm_cp16(&sw.w[half][r][((ht & 7) ^ dl_swz_f8t(r)) * 16],
+                            w_src + (unsigned long long)(kb + 16 * j) * N, true);
             }
         } else {
             #pragma unroll
