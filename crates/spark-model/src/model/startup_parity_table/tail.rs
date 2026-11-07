@@ -5,7 +5,9 @@ use anyhow::Result;
 use super::while_on;
 use crate::layers::dflash_head::ConvTwinKind;
 use crate::layers::{self, ops};
-use crate::model::{graph_flags, qwen4exp_batch_fast, qwen4exp_exact_verify, qwen4exp_mtp_depth};
+use crate::model::{
+    exact_verify, graph_flags, qwen4exp_batch_fast, qwen4exp_exact_verify, qwen4exp_mtp_depth,
+};
 
 /// The table's trailing entries, split for the 500-LoC cap. The caller
 /// chains them after [`super::SETTINGS`], so the gathered order is
@@ -90,6 +92,15 @@ pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
     }),
     ("ATLAS_QWEN4EXP_EXACT_VERIFY_CHECK", || {
         Ok(qwen4exp_exact_verify::check_requested() as u64)
+    }),
+    // The dense (qwen3_5) exact verify: which verify arms run, the MTP depth
+    // ceiling, and the check's serial steps (their collectives).
+    (
+        "ATLAS_EXACT_VERIFY",
+        || Ok(exact_verify::requested() as u64),
+    ),
+    ("ATLAS_EXACT_VERIFY_CHECK", || {
+        Ok(exact_verify::check_requested() as u64)
     }),
     // The qwen4_exp verify width ceiling: the K the head dispatches and the
     // worker mirrors.

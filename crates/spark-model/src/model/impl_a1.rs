@@ -184,7 +184,8 @@ impl TransformerModel {
         let mut levers = ops::ModelLevers::from_env();
         levers.max_decode_seqs = (max_batch_size as u32).max(1);
         levers.qwen4exp_exact_verify = super::qwen4exp_exact_verify::lever(&config.model_type)?;
-        levers.exact_verify = levers.qwen4exp_exact_verify;
+        levers.exact_verify = levers.qwen4exp_exact_verify
+            || super::exact_verify::lever(&config.model_type, &levers)?;
         levers.qwen4exp_batch_fast = super::qwen4exp_batch_fast::lever(&config.model_type)?;
         levers.qwen4exp_mtp_depth = super::qwen4exp_mtp_depth::lever(
             &config.model_type,

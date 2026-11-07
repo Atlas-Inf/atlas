@@ -227,6 +227,26 @@ impl ModelLevers {
         self.qwen4exp_batch_fast && self.qwen4exp_batch_bisect & bit != 0
     }
 
+    /// The dense exact verify (`ATLAS_EXACT_VERIFY=1` on qwen3_5): the generic
+    /// lever without the qwen4_exp one, for the ops only the dense model
+    /// routes differently.
+    pub fn dense_exact_verify(&self) -> bool {
+        self.exact_verify && !self.qwen4exp_exact_verify
+    }
+
+    /// The batch the paged-decode split-K count is pinned to
+    /// (`qwen3_attention::split_ref_seqs`). Under the dense exact verify it is
+    /// at least the widest verify, so serial decode (1 row) and every K-row
+    /// verify reduce attention over the same split count.
+    pub fn attn_split_ref_seqs(&self) -> u32 {
+        if self.dense_exact_verify() {
+            self.max_decode_seqs
+                .max(crate::model::exact_verify::MAX_ROWS as u32)
+        } else {
+            self.max_decode_seqs
+        }
+    }
+
     /// Rows one launch of a multi-row mHC collapse may take under the exact
     /// batching lane (0: unchunked, the lane off): the split path's 8, or one
     /// row a launch under `BISECT_HC`.

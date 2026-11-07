@@ -59,6 +59,7 @@ mod dspark_generation_tests;
 pub(crate) mod dspark_pool;
 #[cfg(test)]
 mod dspark_pool_tests;
+pub mod exact_verify;
 mod final_norm;
 pub(crate) mod impl_a1;
 pub(crate) mod impl_a1_init;

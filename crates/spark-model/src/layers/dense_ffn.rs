@@ -17,6 +17,8 @@ use crate::weight_map::{
 
 #[path = "dense_ffn_dp4a.rs"]
 mod dp4a_decode;
+#[path = "dense_ffn_exact.rs"]
+mod exact_rows;
 #[path = "dense_ffn_native.rs"]
 mod native;
 #[path = "dense_ffn_prefill_bf16.rs"]
@@ -1481,6 +1483,10 @@ impl DenseFfnLayer {
         if self.try_glm_canonical_rows(input, 2, ctx, stream)? {
             return Ok(());
         }
+        // ATLAS_EXACT_VERIFY: serial decode's arithmetic per row (`dense_ffn_exact.rs`).
+        if self.forward_rows_exact(input, 2, ctx, stream)? {
+            return Ok(());
+        }
         // Packed-Q2: NVFP4 fallback weights are NULL, so the NVFP4 batch2 GEMVs
         // below would fault. Route to the keep-packed batchm FFN (m=2).
         if let Some(ref q2w) = self.q2_weights {
@@ -1596,6 +1602,10 @@ impl DenseFfnLayer {
         if self.try_glm_canonical_rows(input, 3, ctx, stream)? {
             return Ok(());
         }
+        // ATLAS_EXACT_VERIFY: serial decode's arithmetic per row (`dense_ffn_exact.rs`).
+        if self.forward_rows_exact(input, 3, ctx, stream)? {
+            return Ok(());
+        }
         // Packed-Q2: route to the keep-packed batchm FFN (m=3); NVFP4 weights null.
         if let Some(ref q2w) = self.q2_weights {
             return self.forward_km_q2(q2w, input, ctx, 3, stream);
@@ -1694,6 +1704,10 @@ impl DenseFfnLayer {
         stream: u64,
     ) -> Result<()> {
         if self.try_glm_canonical_rows(input, m as usize, ctx, stream)? {
+            return Ok(());
+        }
+        // ATLAS_EXACT_VERIFY: serial decode's arithmetic per row (`dense_ffn_exact.rs`).
+        if self.forward_rows_exact(input, m, ctx, stream)? {
             return Ok(());
         }
         if self.forward_dp4a_batch(input, m, ctx, stream)? {

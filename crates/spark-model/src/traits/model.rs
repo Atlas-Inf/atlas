@@ -709,7 +709,8 @@ pub trait Model: Send + Sync {
     /// position, so a T=0 speculative run commits exactly the tokens and
     /// logits a non-speculative one does. Default false: batch-K verify
     /// kernels round differently from the single-row ones. qwen4_exp under
-    /// `ATLAS_QWEN4EXP_EXACT_VERIFY=1` (`model/qwen4exp_exact_verify.rs`).
+    /// `ATLAS_QWEN4EXP_EXACT_VERIFY=1` (`model/qwen4exp_exact_verify.rs`),
+    /// qwen3_5 under `ATLAS_EXACT_VERIFY=1` (`model/exact_verify.rs`).
     fn verify_bit_exact(&self) -> bool {
         false
     }

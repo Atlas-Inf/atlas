@@ -576,13 +576,16 @@ impl Model for TransformerModel {
         if let Some(depth) = self.levers.qwen4exp_mtp_depth {
             return Some(depth);
         }
-        self.layers
+        let layers = self
+            .layers
             .iter()
             .filter_map(|l| l.verify_max_drafts())
-            .min()
+            .min();
+        // ATLAS_EXACT_VERIFY: at most the widest exact verify (`exact_verify.rs`).
+        super::exact_verify::max_drafts(&self.levers, self.dflash_drafter(), layers)
     }
     fn verify_bit_exact(&self) -> bool {
-        self.levers.qwen4exp_exact_verify
+        super::exact_verify::verify_bit_exact(&self.levers, self.dflash_drafter())
     }
     fn batch_verify_bit_exact(&self) -> bool {
         self.levers.qwen4exp_exact_verify && self.levers.qwen4exp_batch_fast

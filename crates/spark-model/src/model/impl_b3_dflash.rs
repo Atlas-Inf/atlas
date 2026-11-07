@@ -9,6 +9,12 @@ use super::types::TransformerModel;
 mod ctx_len;
 
 impl TransformerModel {
+    /// A DFlash drafter is installed: the target captures hidden rows for it
+    /// (`dflash_capture_layers`, from the drafter's `target_layer_ids`).
+    pub(super) fn dflash_drafter(&self) -> bool {
+        !self.dflash_capture_layers.is_empty()
+    }
+
     /// Copy `rows` target hidden rows, starting at forward row `row0`, into
     /// capture storage whose rows are `dst_stride` bytes apart. mHC targets
     /// (GLM-5) keep the residual in the FP32 highway and `hidden_states` holds

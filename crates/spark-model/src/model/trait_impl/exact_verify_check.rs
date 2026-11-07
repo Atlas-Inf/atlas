@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `ATLAS_QWEN4EXP_EXACT_VERIFY_CHECK=1`: run a K=2/3/4 verify's tokens
+//! `ATLAS_QWEN4EXP_EXACT_VERIFY_CHECK=1` (qwen4_exp) and
+//! `ATLAS_EXACT_VERIFY_CHECK=1` (qwen3_5, `model/exact_verify.rs`): run a
+//! K=2/3/4 verify's tokens
 //! through serial decode first, put the state back, and compare the verify's
 //! rows with the serial ones byte for byte (design and how to read it:
 //! `model/qwen4exp_exact_verify.rs`).
@@ -16,7 +18,7 @@ use anyhow::{Result, ensure};
 use atlas_core::config::LayerType;
 use spark_runtime::gpu::DevicePtr;
 
-use super::super::qwen4exp_exact_verify::check_active;
+use super::super::exact_verify::check_active;
 use super::super::types::TransformerModel;
 use crate::layer::SsmLayerState;
 use crate::traits::SequenceState;
