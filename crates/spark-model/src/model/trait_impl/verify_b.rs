@@ -335,7 +335,10 @@ impl TransformerModel {
                 }
                 let layer_type = self.config.layer_type(layer_idx);
 
-                if layer_type == LayerType::FullAttention {
+                if matches!(
+                    layer_type,
+                    LayerType::FullAttention | LayerType::SlidingAttention
+                ) {
                     if hss_engaged {
                         // HSS path: `decode_multi_seq` calls the production
                         // paged-decode kernel which reads K/V from HBM only

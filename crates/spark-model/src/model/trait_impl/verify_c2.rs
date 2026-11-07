@@ -294,7 +294,10 @@ impl TransformerModel {
                     None
                 };
 
-                if layer_type == LayerType::FullAttention {
+                if matches!(
+                    layer_type,
+                    LayerType::FullAttention | LayerType::SlidingAttention
+                ) {
                     if hss_engaged {
                         // HSS path: decode_multi_seq's paged-decode kernel
                         // reads K/V from HBM only, missing the long-context
@@ -375,7 +378,10 @@ impl TransformerModel {
                 if let Some(started) = layer_started {
                     self.gpu.synchronize(stream)?;
                     let elapsed = started.elapsed().as_micros();
-                    if layer_type == LayerType::FullAttention {
+                    if matches!(
+                        layer_type,
+                        LayerType::FullAttention | LayerType::SlidingAttention
+                    ) {
                         attn_us += elapsed;
                         attn_layers += 1;
                     } else {

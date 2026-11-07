@@ -276,9 +276,17 @@ pub(super) fn new_kv_cache(
     num_blocks: usize,
     gpu: &dyn GpuBackend,
     plan: Option<GlmCachePlan>,
+    swa: Option<&spark_runtime::kv_cache::SwaSlotPlan>,
     placement: spark_runtime::kv_cache::KvPlacement,
 ) -> Result<spark_runtime::kv_cache::PagedKvCache> {
     use spark_runtime::kv_cache::PagedKvCache;
+    if let Some(swa) = swa {
+        anyhow::ensure!(
+            plan.is_none(),
+            "SWA slots and the GLM cache plan are exclusive"
+        );
+        return PagedKvCache::new_with_swa_slots(kv_config, num_blocks, gpu, placement, swa);
+    }
     match plan.and_then(GlmCachePlan::shard) {
         Some(spec) => {
             PagedKvCache::new_latent_sharded_placed(kv_config, num_blocks, gpu, spec, placement)

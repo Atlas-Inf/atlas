@@ -81,8 +81,7 @@ pub struct Qwen3AttentionLayer {
     /// arm (which requires the three Gemma norms, absent here).
     pub(crate) shortcut_carry_out: Option<(spark_runtime::gpu::DevicePtr, usize)>,
     /// LongCat shortcut-MoE CONSUMER: after this sublayer's FFN residual add,
-    /// `hidden += carry` (the shortcut MoE output stashed by the previous
-    /// sublayer).
+    /// `hidden += carry` (the shortcut MoE output stashed by the previous sublayer).
     pub(crate) shortcut_carry_in: Option<(spark_runtime::gpu::DevicePtr, usize)>,
     /// Pre-norm for MoE input (pre_feedforward_layernorm_2).
     pub(crate) pre_moe_norm: Option<DenseWeight>,
@@ -107,6 +106,7 @@ pub struct Qwen3AttentionLayer {
     pub(super) mx8_rt: Option<super::mx8::Mx8AttnRt>,
     // ── MLA (Multi-head Latent Attention) — 2-step decode ──
     pub(crate) mla: Option<MlaWeights>,
+    pub(crate) mimo: Option<super::mimo::MimoAttn>, // MiMo-V2 (Q/K 192, V 128)
     /// MXFP8 twins of MLA weights keyed by the BF16 pointer, with their `[n, k]`:
     /// rows of short (<= 32) calls read half the bytes; longer keep BF16.
     pub(crate) mla_mx: Vec<(DevicePtr, [usize; 2], crate::weight_map::Mxfp8Weight)>,

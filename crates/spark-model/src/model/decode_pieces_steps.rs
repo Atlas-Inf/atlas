@@ -118,7 +118,10 @@ impl TransformerModel {
             ctx,
             stream,
             |li, ctx| {
-                if self.config.layer_type(li) == LayerType::FullAttention {
+                if matches!(
+                    self.config.layer_type(li),
+                    LayerType::FullAttention | LayerType::SlidingAttention
+                ) {
                     let mut state: [&mut (dyn LayerState + 'static); 1] =
                         [seq.layer_states[li].as_mut()];
                     self.layers[li].decode_multi_seq_rows(
@@ -189,7 +192,10 @@ impl TransformerModel {
                     .iter_mut()
                     .map(|s| s.layer_states[li].as_mut())
                     .collect();
-                if self.config.layer_type(li) == LayerType::FullAttention {
+                if matches!(
+                    self.config.layer_type(li),
+                    LayerType::FullAttention | LayerType::SlidingAttention
+                ) {
                     return self.layers[li].decode_multi_seq_rows(
                         hidden,
                         residual,

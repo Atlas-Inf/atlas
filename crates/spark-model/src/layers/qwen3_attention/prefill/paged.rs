@@ -62,6 +62,24 @@ impl Qwen3AttentionLayer {
             );
         }
 
+        if self.mimo.is_some() {
+            anyhow::ensure!(
+                batched_meta.is_none(),
+                "MiMo layer {} does not support batched prefill",
+                self.attn_layer_idx
+            );
+            return self.mimo_attend_prefill(
+                ctx,
+                kv_cache,
+                normed,
+                num_tokens,
+                seq_len_start,
+                kv_write_floor,
+                false,
+                stream,
+            );
+        }
+
         // ── MLA 2-step prefill (reference: HuggingFace modeling_mistral4.py) ──
         if let Some(ref mla) = self.mla {
             let args = self.mla_prefill_args(normed, num_tokens, seq_len_start, bs, ctx, stream);

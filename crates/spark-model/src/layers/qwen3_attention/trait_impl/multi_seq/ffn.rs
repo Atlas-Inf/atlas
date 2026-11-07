@@ -20,6 +20,14 @@ pub(crate) fn pairwise_moe_decode_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_MOE_PAIRWISE_DECODE").as_deref() != Ok("0"))
 }
 
+/// Row-batched MoE decode (`ATLAS_MOE_ROWS_DECODE=1`): per-row `forward`
+/// arithmetic with one EP all-reduce over the batch (`MoeLayer::forward_rows`).
+pub(crate) fn rows_moe_decode_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_MOE_ROWS_DECODE").as_deref() == Ok("1"))
+}
+
 /// Route batched decode MoE (n >= min) through the grouped read-once GEMM
 /// (forward_prefill) instead of the pairwise per-slot loop. Default OFF.
 /// Min default 2: one consistent grouped path for every batched decode size.
@@ -96,7 +104,50 @@ impl Qwen3AttentionLayer {
             && n >= grouped_routed_decode_min()
             && grouped_routed_decode_enabled()
             && self.ffn.moe_grouped_decode_ok();
-        if !use_grouped && n == 3 && !force_seq_ffn {
+        if !force_seq_ffn && n > 1 && rows_moe_decode_enabled() {
+            // ROW-EXACT FFN (`ATLAS_MOE_ROWS_DECODE=1`): every row runs the
+            // serial decode's own FFN arithmetic, so a verify row matches the
+            // serial step of its token. MoE rows share ONE EP all-reduce
+            // (`forward_rows`) instead of one per row; a dense FFN runs per row.
+            let normed2 = fwd.buffers.norm_output();
+            ops::residual_add_rms_norm(
+                fwd.gpu,
+                self.residual_add_rms_norm_k,
+                hidden,
+                o_out,
+                &self.post_attn_norm,
+                normed2,
+                residual,
+                n as u32,
+                h as u32,
+                eps,
+                stream,
+            )?;
+            if let Some((moe_out, _)) = self.ffn.forward_rows(normed2, n, None, fwd, stream)? {
+                ops::residual_add(
+                    fwd.gpu,
+                    self.residual_add_k,
+                    hidden,
+                    moe_out,
+                    (n * h) as u32,
+                    stream,
+                )?;
+            } else {
+                for i in 0..n {
+                    let moe_out = self
+                        .ffn
+                        .forward(normed2.offset(i * h * bf16), fwd, stream)?;
+                    ops::residual_add(
+                        fwd.gpu,
+                        self.residual_add_k,
+                        hidden.offset(i * h * 2),
+                        moe_out,
+                        h as u32,
+                        stream,
+                    )?;
+                }
+            }
+        } else if !use_grouped && n == 3 && !force_seq_ffn {
             let normed2 = fwd.buffers.norm_output();
             ops::residual_add_rms_norm(
                 fwd.gpu,

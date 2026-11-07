@@ -1,0 +1,130 @@
+# Atlas kernel target: XiaomiMiMo/MiMo-V2.6-Flash — GB10, text backbone.
+#
+# 309B total / 15B active MoE (model_type "mimo_v2"):
+#   * 48 layers: 9 full attention (4 KV heads, RoPE theta 1e7) + 39 sliding
+#     window (window 128, 8 KV heads, theta 1e4, per-head attention sink)
+#   * Q/K head dim 192, V head dim 128, partial RoPE on the first 64 dims,
+#     V scaled by attention_value_scale = 0.707 (folded into o_proj)
+#   * Layer 0 dense FFN (16384), layers 1-47: 256 experts top-8, sigmoid +
+#     e_score_correction_bias (noaux_tc), no shared expert
+#   * Checkpoint: experts native MXFP4 (U8 + E8M0 `weight_scale`, group 32),
+#     qkv / dense FFN FP8 128x128 block scales (qkv stored as 4 TP chunks),
+#     o_proj BF16. ~173 GB → two Sparks with EP=2.
+#
+# Kernels: compiles deepseek-v4-flash's sources (`kernel_source`) for the
+# transcode-free E8M0 MoE GEMMs; `nvfp4/mimo_attn.cu` is the target-local
+# overlay carrying the 192/128 attention kernels (see
+# crates/spark-model/src/layers/qwen3_attention/mimo.rs).
+#
+# Text-only serving; MTP ships in model_mtp.safetensors and is loaded only
+# with `--speculative` on rank 0. Vision/audio towers are not wired.
+
+[model]
+name = "mimo-v2.6-flash"
+hf_id = "XiaomiMiMo/MiMo-V2.6-Flash-RL"
+params = "309B"
+active_params = "15B"
+architecture = "Hybrid Full/SWA Attention (QK192/V128, sinks) + 256-expert Sigmoid MoE"
+match_names = ["mimo-v2.6-flash", "mimo-v2.6-flash-rl"]
+kernel_source = "deepseek-v4-flash"
+
+layers_total = 48
+layers_full_attention = 9
+layers_sliding_attention = 39
+layer_pattern = "full at 0,5,11,17,23,29,35,41,47; sliding (window 128) elsewhere"
+
+moe_experts = 256
+moe_topk = 8
+moe_intermediate = 2048
+shared_expert_intermediate = 0
+moe_scoring_func = "sigmoid"
+moe_routing_bias = true
+
+hidden_dim = 4096
+head_dim = 192
+v_head_dim = 128
+q_heads = 64
+kv_heads = 8
+full_attention_kv_heads = 4
+rotary_dim = 64
+rope_theta = 10000000
+swa_rope_theta = 10000
+sliding_window = 128
+vocab_size = 152576
+max_position_embeddings = 1048576
+
+[[model_types]]
+model_type = "mimo_v2"
+
+[sampling.general]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+
+[sampling.thinking]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+
+[sampling.coding]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+
+[behavior]
+enable_loop_watchdog = true
+thinking_default = false
+# The MiMo attention path (mimo.rs) only reads/writes a BF16 paged cache.
+default_kv_dtype = "bf16"
+tool_call_parser = "qwen3_coder"
+default_num_drafts = 3
+
+# Dense-FFN probes alternate prefill families before settling on the compiled
+# NVFP4 path. The alternate families are opt-in or handle-gated and are not
+# compiled into DeepSeek-V4's kernel source set used by this target.
+[expected_absent.moe_persist_marker]
+moe_w4a16_k64_strides_m_tiles = "Capability marker shipped only by qwen3.8-flash-next; absent here so the full m-tile grid is used."
+
+[expected_absent.nvfp4_mmq]
+atlas_nvfp4_mmq128_nc = "Optional MMQ dense-FFN family; dispatch requires all family handles plus ATLAS_FFN_NVFP4_MMQ, so the compiled NVFP4 path serves by default."
+atlas_nvfp4_mmq128_wc = "Same opt-in MMQ family; absent by design."
+atlas_nvfp4_mmq16_nc = "Same opt-in MMQ family; absent by design."
+atlas_nvfp4_mmq16_wc = "Same opt-in MMQ family; absent by design."
+atlas_nvfp4_mmq32_nc = "Same opt-in MMQ family; absent by design."
+atlas_nvfp4_mmq32_wc = "Same opt-in MMQ family; absent by design."
+atlas_nvfp4_mmq64_nc = "Same opt-in MMQ family; absent by design."
+atlas_nvfp4_mmq64_wc = "Same opt-in MMQ family; absent by design."
+atlas_nvfp4_quantize_bf16 = "MMQ helper; only used with the opt-in MMQ family."
+atlas_nvfp4_repack = "MMQ helper; only used with the opt-in MMQ family."
+atlas_nvfp4_scale_bf16 = "MMQ helper; only used with the opt-in MMQ family."
+atlas_nvfp4_silu_mul_quant = "MMQ helper; only used with the opt-in MMQ family."
+atlas_nvfp4_silu_mul_scaled = "MMQ helper; only used with the opt-in MMQ family."
+
+[expected_absent.q4k_mmq]
+atlas_q4k_mmq128_nc = "Optional Q4_K dense-FFN family gated by all handles plus ATLAS_FFN_MMQ; the compiled NVFP4 path serves by default."
+atlas_q4k_mmq128_wc = "Same opt-in Q4_K family; absent by design."
+atlas_q8_1_quantize_ds4_bf16 = "Q4_K helper; only used with the opt-in Q4_K family."
+
+[expected_absent.q4k_quantize]
+q4k_quantize = "Q4_K weight-quantize helper for the opt-in Q4_K family; absent by design."
+
+[expected_absent.w4a16]
+int8_gemm_faith2 = "Opt-in int8 dense-FFN prefill variant gated by handle plus ATLAS_INT8_PREFILL; the compiled NVFP4 path serves by default."
+int8_gemm_i32acc = "Same opt-in int8 prefill family; absent by design."
+requant_a_bf16_int8 = "Activation requant helper for the opt-in int8 family; absent by design."
+requant_w_nvfp4_int8 = "Weight requant helper for the opt-in int8 family; absent by design."
+w4a16_gemm_t_k64_n64_p3 = "Optional deep-pipeline twin; dispatch gates on handle != 0 and falls back to the resolved K64 tile."
+w4a16_gemm_t_k64_p3 = "Optional deep-pipeline twin; dispatch falls back to the resolved K64 tile."
+w4a16_gemm_t_m128_bf16 = "Optional BF16-projection prefill twin; dispatch gates on handle != 0 and uses the resolved m128 path."
+w4a16_gemm_t_m128_bf16_v2 = "Optional BF16-projection prefill twin; dispatch gates on handle != 0 and uses the resolved m128 path."
+w4a16_gemm_t_m128_k16 = "Optional narrow-K twin; dispatch gates on handle != 0 and uses the resolved m128 path."
+w4a16_gemm_t_p3 = "Optional deep-pipeline twin; dispatch falls back to the resolved w4a16 tile."
+fp8_gemm_t_row_scaled = "Optional DFlash FP8-drafter GEMM; try_kernel lookup only gates the ATLAS_DFLASH_DRAFTER_FP8 mirror path, which this target does not use (BF16 drafter)."
+fp8_gemm_t_row_scaled_m16 = "Same optional DFlash FP8-drafter family (M<=16 lm_head variant); absent by design."
+
+[expected_absent.w4a4]
+w4a4_gemm = "Opt-in native-FP4 dense-FFN prefill variant gated by handle plus ATLAS_FP4_PREFILL; the compiled NVFP4 path serves by default."
+w4a4_gemm_mfast = "Same opt-in W4A4 family; absent by design."

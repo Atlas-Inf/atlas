@@ -41,6 +41,8 @@ pub(super) struct TailSlots {
     free: Vec<u32>,
     plan: TailSlotPlan,
     dirty: Vec<u32>,
+    /// What the slots hold, for the exhaustion error.
+    pub(super) label: &'static str,
 }
 
 impl TailSlots {
@@ -66,6 +68,7 @@ impl TailSlots {
             free: (0..capacity as u32).rev().collect(),
             plan,
             dirty: Vec::new(),
+            label: "sparse index tail",
         })
     }
 
@@ -73,13 +76,14 @@ impl TailSlots {
         self.plan.capacity()
     }
 
-    fn assign(&mut self, block: u32) -> Result<()> {
+    pub(super) fn assign(&mut self, block: u32) -> Result<()> {
         if self.host[block as usize] != NO_TAIL {
             return Ok(());
         }
         let Some(slot) = self.free.pop() else {
             bail!(
-                "sparse index tail slots exhausted ({} in use, plan {:?})",
+                "{} slots exhausted ({} in use, plan {:?})",
+                self.label,
                 self.plan.capacity(),
                 self.plan
             );
@@ -87,6 +91,17 @@ impl TailSlots {
         self.host[block as usize] = slot;
         self.dirty.push(block);
         Ok(())
+    }
+
+    /// Release the slots of blocks lagging more than `lag_blocks` behind
+    /// `newest_block`, scanning only what the previous call could have left.
+    pub(super) fn release_lagging(&mut self, block_table: &[u32], newest_block: usize) {
+        let lag = self.plan.lag_blocks;
+        let end = newest_block.saturating_sub(lag).min(block_table.len());
+        let start = end.saturating_sub(2 * lag + 2);
+        for &block in &block_table[start..end] {
+            self.release(block);
+        }
     }
 
     pub(super) fn release(&mut self, block: u32) {
@@ -100,7 +115,7 @@ impl TailSlots {
     /// Publish every changed entry, one copy per run of contiguous blocks.
     /// Releases and assignments land in the same stream-ordered flush, so a
     /// reused slot is never mapped by two blocks when a kernel reads the map.
-    fn flush(&mut self, gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
+    pub(super) fn flush(&mut self, gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
         self.dirty.sort_unstable();
         self.dirty.dedup();
         for run in self.dirty.chunk_by(|a, b| *b == *a + 1) {
@@ -159,14 +174,8 @@ impl PagedKvCache {
     /// previous call could have left behind, so a step costs O(lag), not
     /// O(context). Published with the next [`Self::lend_tail_slots`].
     pub fn release_lagging_tail_slots(&mut self, block_table: &[u32], newest_block: usize) {
-        let Some(tails) = self.tail_slots.as_mut() else {
-            return;
-        };
-        let lag = tails.plan.lag_blocks;
-        let end = newest_block.saturating_sub(lag).min(block_table.len());
-        let start = end.saturating_sub(2 * lag + 2);
-        for &block in &block_table[start..end] {
-            tails.release(block);
+        if let Some(tails) = self.tail_slots.as_mut() {
+            tails.release_lagging(block_table, newest_block);
         }
     }
 
@@ -175,6 +184,11 @@ impl PagedKvCache {
             && let Some(tails) = self.tail_slots.as_mut()
         {
             tails.release(block);
+        }
+        if self.block_ref_counts[block as usize] == 0
+            && let Some(swa) = self.swa.as_mut()
+        {
+            swa.slots.release(block);
         }
     }
 }

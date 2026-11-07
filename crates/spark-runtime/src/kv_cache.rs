@@ -452,6 +452,8 @@ pub struct PagedKvCache {
     sparse_index_config: Option<SparseIndexCacheConfig>,
     /// Slot-mapped sparse-index tails; `None` = one tail per physical block.
     tail_slots: Option<tail_slots::TailSlots>,
+    /// Slotted sliding-window layer pools; `None` = every pool block-indexed.
+    swa: Option<swa_slots::SwaSlots>,
     /// Per-block refcount event history (`ATLAS_KV_TRACE=1`; inert otherwise).
     trace: block_trace::BlockTrace,
     /// Prefix-cache NVMe spill stores (`ATLAS_KV_NVME_DIR`), one lane per
@@ -481,11 +483,13 @@ mod placement;
 mod release;
 mod sparse_index;
 mod sparse_index_impl;
+mod swa_slots;
 mod tail_slots;
 mod zero_impl;
 pub use latent_shard::{ExchangeLane, LatentShard, LatentShardSpec, LatentViewPlan};
 pub use placement::{KvBuffer, KvPlacement};
 pub use sparse_index::{SparseIndexCacheConfig, SparseIndexCacheDtype};
+pub use swa_slots::SwaSlotPlan;
 pub use tail_slots::{NO_TAIL, TailSlotPlan};
 #[cfg(test)]
 mod tests;

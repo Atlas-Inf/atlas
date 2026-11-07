@@ -18,7 +18,7 @@ impl SafetensorsLoader {
             return true;
         }
         // MTP head weights for a model whose loader does not build one.
-        if self.skip_mtp && name.starts_with("mtp.") {
+        if self.skip_mtp && (name.starts_with("mtp.") || name.starts_with("model.mtp.")) {
             return true;
         }
         // Dead namespaces the model's loader never reads (nemotron_h_omni's
@@ -40,7 +40,7 @@ impl SafetensorsLoader {
             return false;
         }
         // MTP head experts are small — always replicate, never shard.
-        if name.starts_with("mtp.") {
+        if name.starts_with("mtp.") || name.starts_with("model.mtp.") {
             return false;
         }
         // Parse expert index from patterns like "*.experts.42.gate_proj*"
@@ -70,5 +70,19 @@ impl SafetensorsLoader {
         } else {
             false // Non-expert tensors are always loaded (replicated)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SafetensorsLoader;
+
+    #[test]
+    fn model_mtp_namespace_is_covered_by_skip_mtp() {
+        let mut loader = SafetensorsLoader::new();
+        loader.skip_mtp = true;
+        assert!(loader.should_skip_tensor("model.mtp.layers.0.enorm.weight"));
+        assert!(loader.should_skip_tensor("mtp.layers.0.enorm.weight"));
+        assert!(!loader.should_skip_tensor("model.layers.0.enorm.weight"));
     }
 }
