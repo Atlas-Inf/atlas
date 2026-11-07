@@ -33,9 +33,17 @@ impl LowpMix {
     /// `dnmx` (with `gu8`): the W4A8 gate+up writes the down projection's
     /// tokens as E4M3 with a UE8M0 scale per 32-K MMA block, and the W4A8
     /// down reads them (no per-token quantizer pass). Changes the numerics.
-    pub const DOWN_MX: u16 = 1 << 10;
-    /// An NVFP4 group's W4A8 bit: its W4A4 bit shifted by this.
+    pub const DOWN_MX: u16 = 1 << 12;
+    /// An NVFP4 group's W4A8 bit: its W4A4 bit shifted by this (bits 6..12
+    /// are the shifted groups, so [`Self::DOWN_MX`] sits above them).
     pub(super) const A8: u32 = 6;
+    /// The NVFP4 groups, which have both a W4A4 and a W4A8 form.
+    const NVFP4_GROUPS: [(&str, u16); 4] = [
+        ("gu", Self::GATE_UP),
+        ("dn", Self::DOWN),
+        ("qkv", Self::ATTN_QKV),
+        ("o", Self::ATTN_O),
+    ];
     const NAMES: [(&str, u16); 11] = [
         ("gu", Self::GATE_UP),
         ("dn", Self::DOWN),
@@ -49,10 +57,10 @@ impl LowpMix {
         ("o8", Self::ATTN_O << Self::A8),
         ("dnmx", Self::DOWN_MX),
     ];
-    /// `ATLAS_DENSE_PREFILL_LOWP=1`: W4A8 MLP and attention, W8A8 GDN. On the
-    /// d3 oracle this stays at the BF16-MMA path's distance from d3's BF16
-    /// runtime; NVFP4 tokens on the MLP (`gu,dn`, faster) land at or past the
-    /// old default kernels' distance, depending on the rest of the pass.
+    /// `ATLAS_DENSE_PREFILL_LOWP=1`: W4A8 MLP and attention, W8A8 GDN.
+    /// Against a BF16 reference this stays at the BF16-MMA path's distance;
+    /// NVFP4 tokens on the MLP (`gu,dn`, faster) land at or past the old
+    /// default kernels' distance, depending on the rest of the pass.
     pub const DEFAULT: Self = Self(
         (Self::GATE_UP | Self::DOWN | Self::ATTN_QKV | Self::ATTN_O) << Self::A8
             | Self::GDN_QKVZ
@@ -60,19 +68,66 @@ impl LowpMix {
     );
 
     pub fn parse(v: &str) -> Self {
-        match v.trim() {
-            "1" => Self::DEFAULT,
-            "all" => Self(0x3f),
-            list => Self(
-                list.split(',')
-                    .filter_map(|n| Self::NAMES.iter().find(|(k, _)| *k == n.trim()))
-                    .fold(0, |m, (_, b)| m | b),
-            ),
-        }
+        Self::parse_checked(v).0
     }
 
+    /// [`Self::parse`] plus a note for every name it drops or that has no
+    /// effect: unknown names, a group named in both token formats (W4A8
+    /// wins), and `dnmx` without `gu8`.
+    pub fn parse_checked(v: &str) -> (Self, Vec<String>) {
+        let mut notes = Vec::new();
+        let mix = match v.trim() {
+            "1" => Self::DEFAULT,
+            "all" => Self(0x3f),
+            "" | "0" => Self(0),
+            list => Self(list.split(',').map(str::trim).fold(0, |m, n| {
+                match Self::NAMES.iter().find(|(k, _)| *k == n) {
+                    Some((_, b)) => m | b,
+                    None => {
+                        notes.push(format!("unknown name {n:?} ignored"));
+                        m
+                    }
+                }
+            })),
+        };
+        for (name, g) in Self::NVFP4_GROUPS {
+            if mix.has(g) && mix.has_a8(g) {
+                notes.push(format!(
+                    "{name} and {name}8 both set: {name}8 (W4A8) is used"
+                ));
+            }
+        }
+        if mix.has(Self::DOWN_MX) && !mix.has_a8(Self::GATE_UP) {
+            notes.push("dnmx has no effect without gu8".into());
+        }
+        (mix, notes)
+    }
+
+    /// The lever, read where the layers are built (once per layer); its
+    /// notes are logged once per process.
     pub fn from_env() -> Self {
-        std::env::var("ATLAS_DENSE_PREFILL_LOWP").map_or(Self(0), |v| Self::parse(&v))
+        let Ok(v) = std::env::var(LOWP_VAR) else {
+            return Self(0);
+        };
+        let (mix, notes) = Self::parse_checked(&v);
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            for n in &notes {
+                tracing::warn!("{LOWP_VAR}={v:?}: {n}");
+            }
+        });
+        mix
+    }
+
+    /// The lever set while `ATLAS_DENSE_PREFILL_BF16MMA` is off: it does
+    /// nothing then, so say so (once per process).
+    pub(super) fn warn_without_bf16mma() {
+        if std::env::var(LOWP_VAR).is_ok_and(|v| Self::parse(&v) != Self(0)) {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!("{LOWP_VAR} has no effect without ATLAS_DENSE_PREFILL_BF16MMA=1");
+            });
+        }
     }
 
     pub fn has(self, group: u16) -> bool {
@@ -84,6 +139,8 @@ impl LowpMix {
         self.has(group << Self::A8)
     }
 }
+
+const LOWP_VAR: &str = "ATLAS_DENSE_PREFILL_LOWP";
 
 /// A projection's group in [`LowpMix`] and the arena's activation-quant
 /// scratch (`ffn_act_a`: codes; `ffn_act_scale`: NVFP4 block scales, then
@@ -296,16 +353,44 @@ mod tests {
             LowpMix::parse("1"),
             LowpMix::parse("gu8,dn8,qkv8,o8,qkvz,gout")
         );
-        let m = LowpMix::parse(" gu8, dn8 ,gout,bogus");
+        let (m, notes) = LowpMix::parse_checked(" gu8, dn8 ,gout,bogus");
         assert!(m.has_a8(LowpMix::GATE_UP) && m.has_a8(LowpMix::DOWN) && m.has(LowpMix::GDN_OUT));
         assert!(
             !m.has(LowpMix::GATE_UP) && !m.has(LowpMix::GDN_QKVZ) && !m.has_a8(LowpMix::ATTN_O)
         );
+        // The unknown name is dropped, and said so.
+        assert_eq!(notes, vec!["unknown name \"bogus\" ignored".to_string()]);
         assert!(LowpMix::parse("gu8,dnmx").has(LowpMix::DOWN_MX));
         assert!(!LowpMix::parse("1").has(LowpMix::DOWN_MX));
         assert_eq!(
             LowpMix::parse("all"),
             LowpMix::parse("gu,dn,qkv,o,qkvz,gout")
         );
+        for v in ["1", "all", "0", "", "gu8,dnmx", "qkv,o8"] {
+            assert!(LowpMix::parse_checked(v).1.is_empty(), "{v}");
+        }
+    }
+
+    #[test]
+    fn lowp_mix_notes_conflicts_and_dead_names() {
+        let (m, notes) = LowpMix::parse_checked("gu,gu8");
+        assert!(m.has_a8(LowpMix::GATE_UP));
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("gu8 (W4A8) is used"));
+        let (_, notes) = LowpMix::parse_checked("dnmx,gu");
+        assert_eq!(notes, vec!["dnmx has no effect without gu8".to_string()]);
+    }
+
+    #[test]
+    fn lowp_mix_bits_are_distinct() {
+        // DOWN_MX used to share bit 10 with GDN_QKVZ's shifted (W4A8) bit.
+        let shifted = [LowpMix::GDN_QKVZ, LowpMix::GDN_OUT].map(|g| g << LowpMix::A8);
+        assert!(shifted.iter().all(|&b| b & LowpMix::DOWN_MX == 0));
+        assert!(!LowpMix(LowpMix::DOWN_MX).has_a8(LowpMix::GDN_QKVZ));
+        let mut seen = 0u16;
+        for (_, b) in LowpMix::NAMES {
+            assert_eq!(seen & b, 0, "bit {b:#x} reused");
+            seen |= b;
+        }
     }
 }

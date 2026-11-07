@@ -29,7 +29,7 @@ const DOWN_GRID_AVG_FACTOR: u32 = 4;
 /// the lever is off. Only qwen3.6-35b-a3b ships the module, and a lookup that
 /// misses fails the boot audit, so other targets must not issue it.
 pub(super) fn kernels(gpu: &dyn GpuBackend) -> [KernelHandle; 2] {
-    if std::env::var("ATLAS_MOE_PREFILL_BF16MMA").as_deref() == Ok("1") {
+    if crate::layers::ops::ModelLevers::opt_in("ATLAS_MOE_PREFILL_BF16MMA") {
         resolve(gpu)
     } else {
         [KernelHandle(0); 2]

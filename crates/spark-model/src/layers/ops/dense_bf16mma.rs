@@ -47,7 +47,8 @@ const CTAS_PER_SM: u32 = 2;
 /// (`chunks`).
 const CTA_FIXED: u32 = 4;
 
-/// The three kernels; handle 0 where the target does not ship them.
+/// The BF16-MMA kernels, their low-precision twins and the activation
+/// quantizers; handle 0 where the target does not ship them.
 #[derive(Clone, Copy, Debug)]
 pub struct DenseBf16mma {
     gate_up: KernelHandle,
@@ -137,12 +138,13 @@ impl DenseBf16mma {
     /// misses fails the boot audit, so other targets must not issue it.
     /// Dispatch reads the same lever from `ModelLevers`.
     pub fn lever() -> bool {
-        std::env::var("ATLAS_DENSE_PREFILL_BF16MMA").as_deref() == Ok("1")
+        super::ModelLevers::opt_in("ATLAS_DENSE_PREFILL_BF16MMA")
     }
 
     /// The kernels when the lever is on, else all handles 0.
     pub fn load(gpu: &dyn GpuBackend) -> Self {
         if !Self::lever() {
+            LowpMix::warn_without_bf16mma();
             return Self::default();
         }
         Self::resolve(gpu)

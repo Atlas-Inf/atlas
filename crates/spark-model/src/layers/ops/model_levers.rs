@@ -205,6 +205,12 @@ fn opt_in_truthy(var: &str) -> bool {
 }
 
 impl ModelLevers {
+    /// [`Self::from_env`]'s opt-in rule (on only when `var` is exactly `1`),
+    /// for load-time sites that run before a model carries its levers.
+    pub fn opt_in(var: &str) -> bool {
+        opt_in(var)
+    }
+
     /// `ATLAS_QWEN4EXP_BATCH_FAST_BISECT` bit `bit` is set (lane on).
     pub fn batch_bisect(&self, bit: u32) -> bool {
         self.qwen4exp_batch_fast && self.qwen4exp_batch_bisect & bit != 0
