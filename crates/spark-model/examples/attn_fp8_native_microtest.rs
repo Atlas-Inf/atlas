@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! GPU gate for `ATLAS_DENSE_NATIVE_FP8_ATTN` at the Qwen3.8-27B attention
-//! shapes (q+gate [12288, 5120], k/v [1024, 5120], o [5120, 6144]), FP8 E4M3
-//! weights with one per-tensor scale broadcast to the 128x128 grid, as the
-//! loader builds them from nvidia/Qwen3.8-27B-NVFP4:
+//! shapes (q+gate [12288, 5120], k/v [1024, 5120], o [5120, 6144]), and for
+//! the `ATLAS_EXACT_VERIFY` GDN projections' rows (qkvz [16384, 5120]; out
+//! [5120, 6144] is o's shape), FP8 E4M3 weights with one per-tensor scale
+//! broadcast to the 128x128 grid, as the loader builds them from
+//! nvidia/Qwen3.8-27B-NVFP4:
 //!
 //! 1. ACCURACY: `w8a16_gemv` (serial decode) against an FP64 CPU reference
 //!    of the exact dequantized weights, and against BF16-rounded dequantized
 //!    weights (the precision the FP8 -> BF16 -> NVFP4 path starts from).
 //! 2. TWIN: `ops::fp8_rows_plan` launches (verify and batched decode) at
-//!    1..=4, 8, 16, 24 and 36 rows against that many serial `w8a16_gemv`
-//!    calls: zero differing bytes (1..=4 rows is the exact K=2/3/4 verify).
+//!    every width 1..=16, then 24 and 36 rows, against that many serial
+//!    `w8a16_gemv` calls: zero differing bytes (1..=4 rows is the exact
+//!    K=2/3/4 verify, 5..=16 the DFlash K=γ verify: one `w8a16_gemv_batch16`
+//!    launch, the same launch `exact_rows_proj` gives the GDN qkvz/out_proj).
 //! 3. PREFILL (BF16-MMA): the BF16-MMA FP8 kernel
 //!    (`ATLAS_DENSE_PREFILL_BF16MMA`) at 64 rows against the serial rows
 //!    (cosine), skipped when not in the build.
@@ -34,14 +38,17 @@ use spark_model::weight_map::{Fp8Weight, WeightQuantFormat};
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
-const SHAPES: [(&str, usize, usize); 3] = [
+const SHAPES: [(&str, usize, usize); 4] = [
     ("q+gate", 12288, 5120),
     ("k/v", 1024, 5120),
     ("o", 5120, 6144),
+    ("gdnqkvz", 16384, 5120),
 ];
 /// The per-tensor scale (nvidia's attention scales are O(1e-3..1e-2)).
 const SCALE: f32 = 0.0068;
-const TWIN_ROWS: [usize; 8] = [1, 2, 3, 4, 8, 16, 24, 36];
+const TWIN_ROWS: [usize; 18] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 24, 36,
+];
 const MAX_ROWS: usize = 64;
 
 struct Lcg(u64);
