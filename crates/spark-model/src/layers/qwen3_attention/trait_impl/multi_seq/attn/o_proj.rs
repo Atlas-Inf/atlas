@@ -320,11 +320,11 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else if n == 4
-            && fwd.levers.qwen4exp_exact_verify
+            && fwd.levers.exact_verify
             && !self.attn.o_proj.is_null()
             && self.w4a16_batchm.scalar_kernel(4).0 != 0
         {
-            // qwen4_exp exact K=4 verify: the scalar batch4 template, whose
+            // Exact K=4 verify (qwen4_exp, qwen3_5): the scalar batch4 template, whose
             // rows equal serial decode's `w4a16_gemv[_sw]`. The wide arm below
             // may take DP4A or the tensor-core tier, which do not.
             ops::w4a16_gemv_batchm(

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The 4-row (K=4 verify) NVFP4 Q/K/V projections under the qwen4_exp exact
-//! verify (`ATLAS_QWEN4EXP_EXACT_VERIFY=1`, `model/qwen4exp_exact_verify.rs`),
+//! The 4-row (K=4 verify) NVFP4 Q/K/V projections under an exact verify
+//! (`ATLAS_QWEN4EXP_EXACT_VERIFY=1` / `ATLAS_EXACT_VERIFY=1`,
+//! `ModelLevers::exact_verify`),
 //! and every width from 4 rows up under the exact batching lane
 //! (`ATLAS_QWEN4EXP_BATCH_FAST=1`, `model/qwen4exp_batch_fast.rs`): there the
 //! Q+gate rows run `w4a16_gemv_qg_batch4/3/2` (or `w4a16_gemv_qg`) in chunks
@@ -61,7 +62,7 @@ impl Qwen3AttentionLayer {
         // 2 and 3 rows: the qg_batch2/3 arms and their exact K/V already are
         // serial decode's arithmetic.
         let lane = fwd.levers.qwen4exp_batch_fast && n >= 4;
-        if !(lane || fwd.levers.qwen4exp_exact_verify && n == 4) {
+        if !(lane || fwd.levers.exact_verify && n == 4) {
             return Ok(false);
         }
         let kv_dim = nkv * hd;

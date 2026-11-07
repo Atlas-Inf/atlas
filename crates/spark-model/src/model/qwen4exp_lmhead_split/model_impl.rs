@@ -51,13 +51,14 @@ impl TransformerModel {
                     stream,
                 )
             }
+            // Under an exact verify (`ModelLevers::exact_verify`, qwen4_exp or
+            // qwen3_5) too: the batch-M rows are `dense_gemv_bf16`'s bytes.
             HeadArith::Gemv
                 if rows > 1
                     && self.dense_gemv_batchm_kernel.0 != 0
-                    && self.config.model_type == "qwen4_exp"
-                    && (batchm_requested()
-                        || self.levers.qwen4exp_exact_verify
-                        || self.levers.qwen4exp_batch_fast)
+                    && (self.levers.exact_verify
+                        || self.config.model_type == "qwen4_exp"
+                            && (batchm_requested() || self.levers.qwen4exp_batch_fast))
                     && !self.levers.batch_bisect(ops::BISECT_HEAD) =>
             {
                 // Up to 32 rows a pass over the head (8 without the lane).

@@ -196,12 +196,10 @@ impl TransformerModel {
                     )?;
                 }
             }
-        } else if self.levers.qwen4exp_exact_verify
-            && num_tokens > 2
-            && self.lm_head_nvfp4.is_none()
-        {
-            // qwen4_exp exact verify: serial decode's `dense_gemv_bf16` per
-            // row (one `_batchm` pass), not the scalar tile GEMM below.
+        } else if self.levers.exact_verify && num_tokens > 2 && self.lm_head_nvfp4.is_none() {
+            // Exact verify (qwen4_exp, qwen3_5): serial decode's
+            // `dense_gemv_bf16` per row (one `_batchm` pass), not the scalar
+            // tile GEMM below.
             self.head_project(
                 super::qwen4exp_lmhead_split::HeadArith::Gemv,
                 hidden,
@@ -289,11 +287,13 @@ impl TransformerModel {
                 )?;
                 c0 += m;
             }
-        } else if self.lm_head_dp4a_batch4(hidden, num_tokens, logits, h, v, stream)? {
+        } else if !self.levers.exact_verify
+            && self.lm_head_dp4a_batch4(hidden, num_tokens, logits, h, v, stream)?
+        {
             // Handled by the W4A8 DP4A arm (see `trait_impl/lm_head_dp4a.rs`).
             // Nothing further to launch.
         } else if (3..=8).contains(&num_tokens)
-            && self.w4a16_batchm.kernel(num_tokens).0 != 0
+            && self.lm_head_batchm_kernel(num_tokens).0 != 0
             && let Some(ref nvfp4) = self.lm_head_nvfp4
         {
             // K=3..8 verify lm_head: one weight read for all rows via the
@@ -311,7 +311,7 @@ impl TransformerModel {
             // (batchm_bench).
             ops::w4a16_gemv_batchm(
                 self.gpu.as_ref(),
-                self.w4a16_batchm.kernel(num_tokens),
+                self.lm_head_batchm_kernel(num_tokens),
                 hidden,
                 nvfp4,
                 logits,

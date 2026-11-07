@@ -99,6 +99,11 @@ pub struct ModelLevers {
     /// `model/qwen4exp_exact_verify.rs`). Not from the environment directly:
     /// `TransformerModel::new` sets it for a qwen4_exp model only.
     pub qwen4exp_exact_verify: bool,
+    /// Every row of a K=2..4 single-sequence verify runs serial decode's
+    /// arithmetic: `qwen4exp_exact_verify`, or the dense qwen3_5 lever
+    /// (`ATLAS_EXACT_VERIFY=1`, `model/exact_verify.rs`). Set by
+    /// `TransformerModel::new`; the ops both models share read this one.
+    pub exact_verify: bool,
     /// qwen4_exp: the MTP verify ceiling in drafts (`ATLAS_QWEN4EXP_MTP_DEPTH`,
     /// `model/qwen4exp_mtp_depth.rs`), overriding the GDN layers' default 1.
     /// Set by `TransformerModel::new` for a qwen4_exp model only.
@@ -269,6 +274,7 @@ impl ModelLevers {
             lightning_mamba_scalar_in_proj: lightning_lossless_target,
             // Model-specific: `TransformerModel::new` sets it.
             qwen4exp_exact_verify: false,
+            exact_verify: false,
             qwen4exp_mtp_depth: None,
             qwen4exp_batch_fast: false,
             qwen4exp_batch_bisect: 0,
