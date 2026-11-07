@@ -87,7 +87,9 @@ __device__ __forceinline__ void load_kv(__nv_bfloat16 (*dst)[HP], const __nv_bfl
         for (unsigned j = 0; j < 4; j += 2) {
             // rows r0 + 8 j and r0 + 8 j + 8 lie in one 16-row-aligned window
             const unsigned pos = kv_s + r0 + 8 * j;
-            const unsigned pb = (unsigned)bt[pos >> sh];
+            // Past kv_l both rows are zero-filled: do not read the table
+            // past its last page (the base LOAD_KV_TILE guards likewise).
+            const unsigned pb = pos < kv_l ? (unsigned)bt[pos >> sh] : 0u;
 #pragma unroll
             for (unsigned h = 0; h < 2; h++) {
                 const unsigned p = pos + 8 * h, row = r0 + 8 * (j + h);
