@@ -18,6 +18,7 @@
 // Grid: (num_v_heads, batch, 1)   Block: (128, 1, 1)
 
 #include <cuda_bf16.h>
+#include "../../common/atlas_pdl.cuh"
 
 #define K_DIM 128
 
@@ -672,6 +673,7 @@ extern "C" __global__ void gated_delta_rule_decode_f32(
     unsigned int k_dim,
     unsigned int v_dim
 ) {
+    atlas_pdl_enter();
     const unsigned int vh = blockIdx.x;
     const unsigned int b = blockIdx.y;
     if (vh >= num_v_heads || b >= batch_size) return;

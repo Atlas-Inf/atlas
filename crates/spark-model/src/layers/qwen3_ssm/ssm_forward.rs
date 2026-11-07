@@ -210,7 +210,8 @@ impl Qwen3SsmLayer {
         let ba_size = ctx.config.ssm_ba_size() as u32;
         let gates = ctx.buffers.ssm_gates();
         let beta_fp32 = gates.offset(nv * 4); // FP32, after gate[nv]
-        // ATLAS_QWEN4EXP_DECODE_FUSE (GDN group): steps 3-7 as one exact launch.
+        // ATLAS_QWEN4EXP_DECODE_FUSE (GDN group) / ATLAS_QWEN38_DECODE_FUSE:
+        // steps 3-7 as one exact launch.
         if self.gdn_decode_fused(normed, state, deinterleaved, gates, beta_fp32, ctx, stream)? {
             return self.ssm_out_proj(ctx.buffers.ssm_qkvz(), ctx, stream, trace, debug);
         }

@@ -3,53 +3,95 @@
 //! Programmatic dependent launch (PDL) gating: which kernel targets and
 //! kernels are launched with PDL, and under which switch.
 //!
-//! Each PDL target names its switch and its own kernel list: GLM-5.3-Flash
-//! under `ATLAS_PDL=1` ([`PDL_KERNELS`]), Qwen3.8-Flash-Next under
-//! `ATLAS_QWEN4EXP_PDL=1` ([`QWEN4EXP_PDL_KERNELS`]), Qwen3.8-27B under
-//! `ATLAS_QWEN38_PDL=1` ([`QWEN38_PDL_KERNELS`]). A list is its target's
-//! own: a `common/` kernel that waits for one target's sake is launched with
-//! PDL only where a target lists it (without the launch attribute its
-//! `griddepcontrol` instructions are no-ops).
+//! Each PDL target names its switches, each with its own kernel list:
+//! GLM-5.3-Flash under `ATLAS_PDL=1` ([`PDL_KERNELS`]), Qwen3.8-Flash-Next
+//! under `ATLAS_QWEN4EXP_PDL=1` ([`QWEN4EXP_PDL_KERNELS`]), Qwen3.8-27B under
+//! `ATLAS_QWEN38_PDL=1` (prefill, [`QWEN38_PDL_KERNELS`]) and, separately,
+//! `ATLAS_QWEN38_PDL_DECODE=1` (the decode chain,
+//! [`QWEN38_PDL_DECODE_KERNELS`]). A kernel launches with PDL when a switch
+//! that is on lists it. A list is its target's own: a `common/` kernel that
+//! waits for one target's sake is launched with PDL only where a target lists
+//! it (without the launch attribute its `griddepcontrol` instructions are
+//! no-ops).
 
 use std::sync::OnceLock;
 
-/// A kernel target with PDL-entered kernels: its name, the switch that turns
-/// PDL on for it, and the kernels it then launches with PDL. Every copy of a
-/// listed kernel the target serves starts with `atlas_pdl_enter()`; launching
-/// any other kernel with PDL would let it read its predecessor's output early.
+/// A kernel target with PDL-entered kernels: its name and its switches. Every
+/// copy of a kernel any of its lists names, in the kernels the target serves,
+/// starts with `atlas_pdl_enter()`; launching any other kernel with PDL would
+/// let it read its predecessor's output early.
 pub(super) struct PdlTarget {
     pub(super) model: &'static str,
-    pub(super) switch: &'static str,
+    pub(super) switches: &'static [PdlSwitch],
+}
+
+/// One PDL switch of a target: set to `1`, the kernels it lists launch with
+/// PDL. A target's switches are independent; a kernel on two lists launches
+/// with PDL when either is on.
+pub(super) struct PdlSwitch {
+    pub(super) name: &'static str,
     pub(super) kernels: &'static [&'static str],
+}
+
+impl PdlTarget {
+    /// Whether any of this target's lists names `func_name`.
+    #[cfg(test)]
+    pub(super) fn lists(&self, func_name: &str) -> bool {
+        self.switches.iter().any(|s| s.kernels.contains(&func_name))
+    }
+
+    /// Whether `func_name` launches with PDL when the switches `on` reports
+    /// as set are on.
+    fn pdl_kernel_with(&self, func_name: &str, on: impl Fn(&str) -> bool) -> bool {
+        self.switches
+            .iter()
+            .any(|s| on(s.name) && s.kernels.contains(&func_name))
+    }
 }
 
 pub(super) const PDL_TARGETS: &[PdlTarget] = &[
     PdlTarget {
         model: "glm-5.3-flash",
-        switch: "ATLAS_PDL",
-        kernels: PDL_KERNELS,
+        switches: &[PdlSwitch {
+            name: "ATLAS_PDL",
+            kernels: PDL_KERNELS,
+        }],
     },
     PdlTarget {
         model: "qwen3.8-flash-next",
-        switch: "ATLAS_QWEN4EXP_PDL",
-        kernels: QWEN4EXP_PDL_KERNELS,
+        switches: &[PdlSwitch {
+            name: "ATLAS_QWEN4EXP_PDL",
+            kernels: QWEN4EXP_PDL_KERNELS,
+        }],
     },
     PdlTarget {
         model: "qwen3.8-27b",
-        switch: "ATLAS_QWEN38_PDL",
-        kernels: QWEN38_PDL_KERNELS,
+        switches: &[
+            PdlSwitch {
+                name: "ATLAS_QWEN38_PDL",
+                kernels: QWEN38_PDL_KERNELS,
+            },
+            PdlSwitch {
+                name: "ATLAS_QWEN38_PDL_DECODE",
+                kernels: QWEN38_PDL_DECODE_KERNELS,
+            },
+        ],
     },
 ];
+
+fn switch_on(name: &str) -> bool {
+    std::env::var(name).as_deref() == Ok("1")
+}
 
 static PDL_TARGET: OnceLock<Option<&'static PdlTarget>> = OnceLock::new();
 
 /// Record the served kernel target before any kernel handle is resolved.
 pub fn configure_pdl(target_model: &str) {
     for other in PDL_TARGETS.iter().filter(|t| t.model != target_model) {
-        if std::env::var(other.switch).as_deref() == Ok("1") {
+        for switch in other.switches.iter().filter(|s| switch_on(s.name)) {
             tracing::warn!(
                 "{}=1 ignored: it enables PDL for kernel target {}, not {target_model}",
-                other.switch,
+                switch.name,
                 other.model
             );
         }
@@ -61,17 +103,18 @@ fn target() -> Option<&'static PdlTarget> {
     PDL_TARGET.get().copied().flatten()
 }
 
-/// The served target's PDL switch is `1`: launch its listed kernels with
-/// programmatic dependent launch. Read once, after [`configure_pdl`].
+/// One of the served target's PDL switches is `1`: launch the kernels it
+/// lists with programmatic dependent launch. Read once, after
+/// [`configure_pdl`].
 pub fn pdl_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| target().is_some_and(|t| std::env::var(t.switch).as_deref() == Ok("1")))
+    *ON.get_or_init(|| target().is_some_and(|t| t.switches.iter().any(|s| switch_on(s.name))))
 }
 
-/// Whether `func_name` launches with PDL: PDL is on and the served target
-/// lists it.
+/// Whether `func_name` launches with PDL: a switch of the served target that
+/// is on lists it.
 pub(super) fn pdl_kernel(func_name: &str) -> bool {
-    pdl_enabled() && target().is_some_and(|t| t.kernels.contains(&func_name))
+    pdl_enabled() && target().is_some_and(|t| t.pdl_kernel_with(func_name, switch_on))
 }
 
 /// GLM-5.3-Flash: kernels whose every copy starts with `atlas_pdl_enter()`
@@ -295,9 +338,10 @@ pub(super) const QWEN4EXP_PDL_KERNELS: &[&str] = &[
 /// Qwen3.8-27B (`ATLAS_QWEN38_PDL=1`, kernels of qwen3.6-27b's tree): the
 /// dense prefill GEMMs with their activation quantizers and the GDN BA gates
 /// (`dense_bf16mma_prefill.cu`, `gdn_ba_gates_prefill.cu`), and the prefill
-/// glue that already enters first. The norms, the GDN scan and conv, and
-/// attention are not PDL-entered: a listed kernel after one of them launches
-/// when it completes.
+/// glue that already enters first. The prefill norms, the GDN scan and conv,
+/// and prefill attention are not PDL-entered: a listed kernel after one of
+/// them launches when it completes. The decode chain has its own switch
+/// ([`QWEN38_PDL_DECODE_KERNELS`]).
 pub(super) const QWEN38_PDL_KERNELS: &[&str] = &[
     "dense_bf16mma_gate_up_silu",
     "dense_bf16mma_nvfp4",
@@ -323,6 +367,51 @@ pub(super) const QWEN38_PDL_KERNELS: &[&str] = &[
     "bf16_residual_add",
     "rope_forward_mrope_interleaved",
     "reshape_and_cache_flash",
+];
+
+/// Qwen3.8-27B decode (`ATLAS_QWEN38_PDL_DECODE=1`, independent of
+/// `ATLAS_QWEN38_PDL`): the single-token chain of a GDN layer, an attention
+/// layer (FP8 and BF16 KV) and the dense FFN, the final norm and the LM head,
+/// each `atlas_pdl_enter()` first. PDL is a property of the kernel, so a
+/// listed kernel also launches with PDL where prefill or verify calls it.
+/// Not listed: argmax and sampling (after the graph, behind a copy) and the
+/// arms a default decode does not take (`--gdn-fused-norm`,
+/// `ATLAS_NO_DECODE_SPLIT_SILU`, the TC/batch GEMV tiers).
+pub(super) const QWEN38_PDL_DECODE_KERNELS: &[&str] = &[
+    // Layer input norm and the residual + post-mixer norm.
+    "rms_norm_residual",
+    "residual_add_rms_norm",
+    // GDN mixer: projections (FP8 block / NVFP4 / per-row FP8 / BF16), the
+    // four small kernels.
+    "w8a16_gemv",
+    "w4a16_gemv",
+    "w4a16_gemv_sw",
+    "dense_gemv_fp8w",
+    "dense_gemv_bf16",
+    "dense_gemv_ba_gates",
+    "causal_conv1d_update_l2norm_f32",
+    "gated_delta_rule_decode_f32",
+    "gated_rms_norm_f32_input",
+    // Their fused twin (ATLAS_QWEN38_DECODE_FUSE).
+    "qwen35_gdn_decode_fused",
+    // Attention mixer: Q+gate and K/V GEMVs, q/k norm, MRoPE, the KV write
+    // and paged decode attention (split-K and its reduce), the output gate.
+    "w4a16_gemv_qg",
+    "w4a16_gemv_dual",
+    "rms_norm",
+    "rope_forward_mrope_interleaved",
+    "reshape_and_cache_flash",
+    "reshape_and_cache_flash_fp8",
+    "paged_decode_attn",
+    "paged_decode_attn_fp8",
+    "paged_decode_attn_splitk_fp8",
+    "paged_decode_attn_reduce_fp8",
+    "sigmoid_gate_mul",
+    // Dense FFN: gate/up, SiLU-mul, down (the plain and `_sw` arms), and the
+    // residual add.
+    "w4a16_gemv_dual_sw",
+    "moe_silu_mul",
+    "bf16_residual_add",
 ];
 
 #[cfg(test)]

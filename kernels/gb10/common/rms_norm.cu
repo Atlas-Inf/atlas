@@ -351,6 +351,7 @@ extern "C" __global__ void rms_norm_residual(
     unsigned int hidden_size,
     float eps
 ) {
+    atlas_pdl_enter();
     unsigned int token = blockIdx.x;
     unsigned int tid = threadIdx.x;
 
@@ -475,6 +476,7 @@ extern "C" __global__ void residual_add_rms_norm(
     unsigned int hidden_size,
     float eps
 ) {
+    atlas_pdl_enter();
     unsigned int token = blockIdx.x;
     unsigned int tid = threadIdx.x;
 
@@ -1302,6 +1304,7 @@ extern "C" __global__ void gated_rms_norm_f32_input(
     unsigned int gate_stride,
     unsigned int group_size
 ) {
+    atlas_pdl_enter();
     (void)group_size;
     unsigned int token = blockIdx.x;
     unsigned int tid = threadIdx.x;

@@ -166,6 +166,7 @@ extern "C" __global__ void reshape_and_cache_flash_fp8(
     const unsigned int value_stride,                      // value.stride(0) in elements
     const unsigned long long cache_stride                 // k_cache.stride(0) in elements (block-level stride)
 ) {
+    atlas_pdl_enter();
     const unsigned int token_idx = blockIdx.x;
     const long long slot = slot_mapping[token_idx];
 

@@ -249,6 +249,8 @@ mod qsa_rows;
 mod qsa_yarn;
 #[path = "ops/quant_dispatch.rs"]
 mod quant_dispatch;
+#[path = "ops/qwen38_decode_fuse.rs"]
+pub mod qwen38_decode_fuse;
 pub mod qwen4exp;
 #[path = "ops/qwen4exp_decode_fuse.rs"]
 pub mod qwen4exp_decode_fuse;

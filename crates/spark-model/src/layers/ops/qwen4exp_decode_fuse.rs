@@ -21,7 +21,9 @@
 //!
 //! A fused kernel runs only where it is shipped (the qwen3.8-flash-next
 //! target) and its shape and alignment hold; otherwise the original launches
-//! are issued unchanged. Exact, and the collectives are unchanged, so the
+//! are issued unchanged. The dense 27B's SiLU-gated twin of the GDN group is
+//! `qwen38_decode_fuse` (`ATLAS_QWEN38_DECODE_FUSE`), which launches through
+//! [`launch_gdn_fused`]. Exact, and the collectives are unchanged, so the
 //! ranks need not agree on it (no startup-parity entry).
 
 use anyhow::{Result, anyhow, bail, ensure};
@@ -152,6 +154,28 @@ pub fn gdn_decode(
     }
     static K: OnceLock<KernelHandle> = OnceLock::new();
     let k = kernel(&K, gpu, "qwen4exp_gdn_decode_fused");
+    launch_gdn_fused(gpu, k, b, nk, nv, kd, vd, d_conv, ba_k, l2_eps, eps, stream)
+}
+
+/// One launch of a fused GDN decode kernel (`qwen4exp_gdn_decode_fused`, or
+/// the dense 27B's `qwen35_gdn_decode_fused`, which shares its signature and
+/// block layout) over `b`, when it is shipped (`k != 0`) and the shape and
+/// alignment fit. Returns whether it launched; on `false` nothing was.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn launch_gdn_fused(
+    gpu: &dyn GpuBackend,
+    k: KernelHandle,
+    b: &GdnDecode,
+    nk: u32,
+    nv: u32,
+    kd: u32,
+    vd: u32,
+    d_conv: u32,
+    ba_k: u32,
+    l2_eps: f32,
+    eps: f32,
+    stream: u64,
+) -> Result<bool> {
     let conv_dim = 2 * nk * kd + nv * vd;
     let fits = k.0 != 0
         && gdn_geometry_fits(nk, nv, kd, vd, d_conv, ba_k)
