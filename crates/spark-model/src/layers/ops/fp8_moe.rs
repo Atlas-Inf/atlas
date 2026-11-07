@@ -72,6 +72,32 @@ pub fn bf16_concat(
         .launch(stream)
 }
 
+/// Row-batched [`bf16_concat`]: `out[r] = a[r] ++ b[r]` for `rows` rows of
+/// `n` values each, in one launch.
+///
+/// Kernel: `bf16_concat_rows(a, b, out, N)`
+/// Grid: (ceil(N/256), rows, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_concat_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a: DevicePtr,
+    b: DevicePtr,
+    output: DevicePtr,
+    n: u32,
+    rows: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 256), rows, 1])
+        .block([256, 1, 1])
+        .arg_ptr(a)
+        .arg_ptr(b)
+        .arg_ptr(output)
+        .arg_u32(n)
+        .launch(stream)
+}
+
 // ── FP8 MoE batch2/batch3 dispatch ──────────────────────────────────
 
 /// FP8 fused gate+up GEMV for batch=2 (MTP K=2 verify).
