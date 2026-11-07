@@ -17,8 +17,8 @@ use spark_runtime::cuda_backend::AtlasCudaBackend;
 
 pub(super) const H: usize = 256;
 pub(super) const I: usize = 256;
-/// W4A8 at 135 rows: the 16-warp gate+up and the warp-specialized
-/// projections; at 1100 and 2100 the warp-specialized gate+up too.
+/// W4A8 from 135 rows: the warp-specialized kernels (135: one 17-tile
+/// chunk; 1100 and 2100: 144-row chunks).
 pub(super) const ROWS: [usize; 4] = [33, 135, 1100, 2100];
 pub(super) const SPARE_ROWS: usize = 3;
 pub(super) const POISON: u16 = 0xa5a5;

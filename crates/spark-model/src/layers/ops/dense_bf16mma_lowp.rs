@@ -98,48 +98,37 @@ pub struct LowpArgs {
 /// The MX handoff's K granularity: its scales stage eight 64-K stages at a time.
 const MX_K: u32 = 512;
 /// The warp-specialized W4A8 kernels (`dw_body`): 8 MMA + 8 producer warps,
-/// persistent; four token stages, two re-encoded operand stages (`DwA`),
-/// three NVFP4 stages.
+/// persistent; up to 144 token rows a tile (288 rows as two tiles, so the
+/// 20 feature tiles of an N = 5120 projection fit one wave of 48 SMs); four
+/// token stages, two re-encoded operand stages (`DpA`), three NVFP4 stages.
 pub(super) const WS_THREADS: u32 = 512;
+pub(super) const WS_TILE_ROWS: u32 = 144;
 pub(super) const SMEM_W4A8_WS: u32 =
-    4 * 8192 + 2 * (8 * 4 * 32 * 16 + 8 * 32 * 8) + 3 * 2 * (4096 + 512);
-/// The 16-warp gate+up (`DX_THREADS`).
-pub(super) const X16_THREADS: u32 = 512;
-/// Rows from which the twins replace the 8-warp kernels they reproduce bit
-/// for bit. Preliminary microbenchmark at the 27B shapes, us 8-warp /
-/// 16-warp / warp-specialized: gate+up 288 rows 918 / 847 / 861, 1056 2973
-/// / 2741 / 2678, 4128 11114 / 10673 / 10269 (the warp-specialized one
-/// re-encodes the same weights per stage whatever the token tiles, so it
-/// trails at short chunks: 939 against 896 at 288 rows in the engine);
-/// down 96 282 / - / 274, 1056 1534 / 1658 / 1429; q 288 301 / 300 / 268;
-/// o 96 92 / - / 95, 288 209 / 220 / 201. The MX handoff (dnmx) keeps the
-/// 8-warp kernels.
-const X16_GATE_UP_ROWS: u32 = 129;
-const WS_GATE_UP_ROWS: u32 = 1024;
-const WS_PROJ_ROWS: u32 = 96;
-
-/// A faster bit-identical twin of a W4A8 kernel.
-pub(super) enum W4a8Twin {
-    Ws(KernelHandle),
-    X16(KernelHandle),
-}
+    4 * WS_TILE_ROWS * 64 + 2 * (8 * 4 * 32 * 16 + 8 * 8 * 4) + 3 * 2 * (4096 + 512);
+/// A tile's cost beyond its 8-row token tiles in `chunks`: the per-stage
+/// re-encode, about 16 tiles' worth of MMAs (1056 rows: 9 chunks, not 12).
+pub(super) const WS_FIXED: u32 = 16;
+/// Rows from which they replace the 8-warp kernels they reproduce bit for
+/// bit. Preliminary microbenchmark at the 27B shapes, us 8-warp / 16-warp
+/// (round 4) / warp-specialized: gate+up 96 rows 524 / 523 / 525, 288 918 /
+/// 844 / 729, 1056 2973 / 2735 / 2654, 4128 11114 / 10673 / 9957; down 288
+/// 569 / 618 / 368, 1056 1534 / 1658 / 1262; q 288 301 / 300 / 235; o 288
+/// 209 / 220 / 135. At 96 rows the engine measured them 1 to 6 % slower
+/// (gate+up 554 / 547 us, down+o 283 / 278), below up to 15 %. The MX
+/// handoff (dnmx) keeps the 8-warp kernels.
+const WS_ROWS: u32 = 129;
 
 impl DenseBf16mma {
-    /// The twin of a W4A8 kernel for `m` rows, where one is faster.
-    pub(super) fn w4a8_twin(&self, kernel: KernelHandle, m: u32) -> Option<W4a8Twin> {
-        let [ws_gate_up, ws_nvfp4] = self.w4a8ws;
+    /// The warp-specialized twin of a W4A8 kernel for `m` rows, where it is
+    /// faster.
+    pub(super) fn w4a8_twin(&self, kernel: KernelHandle, m: u32) -> Option<KernelHandle> {
+        let [gate_up, nvfp4] = self.w4a8ws;
         let twin = match kernel.0 {
-            k if k == self.w4a8_gate_up.0 && m >= WS_GATE_UP_ROWS => W4a8Twin::Ws(ws_gate_up),
-            k if k == self.w4a8_gate_up.0 && m >= X16_GATE_UP_ROWS => {
-                W4a8Twin::X16(self.w4a8x16_gate_up)
-            }
-            k if k == self.w4a8.0 && m >= WS_PROJ_ROWS => W4a8Twin::Ws(ws_nvfp4),
-            _ => return None,
+            k if k == self.w4a8_gate_up.0 => gate_up,
+            k if k == self.w4a8.0 => nvfp4,
+            _ => KernelHandle(0),
         };
-        match twin {
-            W4a8Twin::Ws(h) | W4a8Twin::X16(h) if h.0 == 0 => None,
-            twin => Some(twin),
-        }
+        (m >= WS_ROWS && twin.0 != 0).then_some(twin)
     }
 
     /// Whether the gate+up -> down handoff runs as MX8 tokens (`dnmx`) for a
@@ -172,6 +161,7 @@ impl DenseBf16mma {
             n / super::FEATURES,
             (self.slots / super::CTAS_PER_SM).max(1),
             super::LOWP_ROWS,
+            super::CTA_FIXED,
         );
         KernelLaunch::new(gpu, self.w4a8_mx)
             .grid([(n / super::FEATURES) * c, 1, 1])

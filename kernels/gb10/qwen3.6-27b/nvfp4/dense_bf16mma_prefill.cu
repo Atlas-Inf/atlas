@@ -1101,220 +1101,10 @@ dense_w4a8mx_nvfp4(const unsigned char* __restrict__ aq, const unsigned char* __
                                                            0.0f, C, M, N, K, ldc, nchunks);
 }
 
-// ---- W4A8 on 16 warps (picked by row count: dense_bf16mma_lowp.rs) ---------
-// The W4A8 kernels above run one 8-warp CTA per SM (242 registers), two
-// warps per scheduler: the warps' re-encode and MMA bursts line up and the
-// tensor pipe idles between them (Nsight Compute: 56-59% active). Here the
-// same CTA tile (256 features x 128 tokens, the same weight and token
-// stages) runs on 16 warps: warp W takes fragment f = W & 1 of the four slot
-// features of the 8-warp layout's warp (W >> 1) & 3 in half W >> 3, rows g
-// = slot f and g + 8 = slot f + 2 (FUSED: gate and up of one output, so the
-// SiLU stays in registers). Each output is the same MMA row of the same
-// re-encoded operands in the same K order: results are bit-identical to the
-// 8-warp kernels. Per thread: 16 token tiles of one fragment (64 FP32).
-#define DX_THREADS 512
-
-template <int F, int J0, int J1, int TTM>
-__device__ __forceinline__ void dx_mma(const DbTok8& tk, const DlA8& e, float (&acc)[TTM][4], unsigned int g,
-                                       unsigned int t) {
-    constexpr int f = F;
-    const unsigned int sa = (t & 1) ? e.ue[f + 2] : e.ue[f];
-    #pragma unroll
-    for (int j = J0; j < J1; j++) {
-        const uint4 b = *(const uint4*)&tk.q[j * 8 + g][16 * t];
-        dl_mma_mx8(acc[j], e.a[0][f][0], e.a[0][f + 2][0], e.a[0][f][1], e.a[0][f + 2][1], b.x, b.y, sa, 0x7f);
-        dl_mma_mx8(acc[j], e.a[1][f][0], e.a[1][f + 2][0], e.a[1][f][1], e.a[1][f + 2][1], b.z, b.w, sa, 0x7f);
-    }
-}
-
-// C[M, ldc] = A . W^T on NVFP4 weights and E4M3 tokens; the arguments of
-// db_body's W4A8 instantiations. The MX8 handoff (dnmx) stays on the 8-warp
-// kernels: its 16-warp twins measured about 5% slower in the engine.
-template <bool FUSED, int WST>
-__device__ __forceinline__ void dx_body(
-    const unsigned char* __restrict__ Aq, const float* __restrict__ Ag,
-    const unsigned char* __restrict__ W0, const unsigned char* __restrict__ S0, float gs0,
-    const unsigned char* __restrict__ W1, const unsigned char* __restrict__ S1, float gs1,
-    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K, unsigned int ldc,
-    unsigned int nchunks)
-{
-    atlas_pdl_enter();
-    constexpr int HV = 2, TTM = DL_ROWS / 8;
-    constexpr unsigned int FEAT = FUSED ? 64 : 128;      // weight features per half (per matrix)
-    extern __shared__ __align__(16) unsigned char db_smem[];
-    DbTok8* tk = (DbTok8*)db_smem;
-    DbW<DB_NVFP4, HV>* wt = (DbW<DB_NVFP4, HV>*)(db_smem + WST * sizeof(DbTok8));
-
-    const unsigned int cs = (M + nchunks - 1) / nchunks;
-    const unsigned int nft = N / (FEAT * HV);
-    const unsigned int grp = blockIdx.x / (DB_GROUP * nft);
-    const unsigned int first = grp * DB_GROUP;
-    const unsigned int gc = min(nchunks - first, (unsigned int)DB_GROUP);
-    const unsigned int in = blockIdx.x - grp * DB_GROUP * nft;
-    const unsigned int chunk = first + in % gc;
-    const unsigned int n0 = (in / gc) * FEAT * HV;
-    const unsigned int r0 = chunk * cs;
-    if (r0 >= M) return;
-    const unsigned int rows = min(cs, M - r0);
-    const int tt_valid = (rows + 7) >> 3;
-
-    const unsigned int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
-    const unsigned int half = wid >> 3, ww = (wid >> 1) & 3, f = wid & 1;
-    const unsigned int g = lane >> 2, t = lane & 3;
-    const int ksteps = K / DB_KS;
-
-    // Loaders (512 threads). Tokens: row tid / 4, chunk tid % 4. Weights:
-    // per half 32 k-pair rows x 8 chunks (FUSED: chunks 0..3 gate, 4..7 up);
-    // scales: threads 0..31 of each half, row ht / 8, chunk ht % 8.
-    const unsigned int qrow = tid >> 2, qc = tid & 3;
-    const unsigned char* q_src = Aq + (unsigned long long)(r0 + (qrow < rows ? qrow : 0)) * K + qc * 16;
-    const unsigned int ht = tid & 255, whalf = tid >> 8;
-    const unsigned int wkp = ht >> 3, wc = ht & 7;
-    const unsigned int wnh = n0 + whalf * FEAT;
-    const unsigned char* w_src = ((FUSED && wc >= 4) ? W1 : W0) + wnh + (wc & (FUSED ? 3 : 7)) * 16
-                                 + (unsigned long long)wkp * N;
-    const unsigned int sgr = (ht >> 3) & 3;
-    const unsigned char* s_src = ((FUSED && wc >= 4) ? S1 : S0) + wnh + (wc & (FUSED ? 3 : 7)) * 16
-                                 + (unsigned long long)sgr * N;
-
-    auto issue = [&](int s) {
-        const unsigned int kb = s * DB_KS;
-        DbTok8& tb = tk[s % WST];
-        DbW<DB_NVFP4, HV>& sw = wt[s % WST];
-        if ((int)qrow < tt_valid * 8) bm_cp16(&tb.q[qrow][qc * 16], q_src + kb, qrow < rows);
-        bm_cp16(&sw.w[whalf][wkp][(wc ^ bm_swz_w(wkp)) * 16], w_src + (unsigned long long)(kb / 2) * N, true);
-        if (ht < 32)
-            bm_cp16(&sw.s[whalf][sgr][(wc ^ bm_swz_s(sgr)) * 16], s_src + (unsigned long long)(kb / 16) * N, true);
-    };
-
-    float acc[TTM][4];
-    #pragma unroll
-    for (int i = 0; i < TTM; i++) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.0f;
-
-    __shared__ __align__(8) unsigned long long full[WST], empty[WST];
-    if (tid == 0) {
-        #pragma unroll
-        for (int b = 0; b < WST; b++) {
-            dl_mbar_init(&full[b], DX_THREADS);
-            dl_mbar_init(&empty[b], DX_THREADS);
-        }
-        asm volatile("fence.mbarrier_init.release.cluster;");
-    }
-    __syncthreads();
-    #pragma unroll
-    for (int s = 0; s < WST - 1; s++) {
-        if (s < ksteps) issue(s);
-        dl_cp_arrive(&full[s]);
-    }
-
-    auto kloop = [&](auto fc, auto ttc) {
-        constexpr int F = decltype(fc)::value;
-        constexpr int TT = decltype(ttc)::value;
-        constexpr int Q = (TT + 1) / 2;
-        // Stage s + 1's two slots are re-encoded between stage s's MMA halves.
-        DlA8 cur;
-        dl_mbar_wait(&full[0], 0);
-        dl_a8_begin<FUSED, HV>(cur, &wt[0], half, ww, g, t);
-        dl_a8_slot(cur, F);
-        dl_a8_slot(cur, F + 2);
-        for (int s = 0; s < ksteps; s++) {
-            const int b = s % WST;
-            const bool more = s + 1 < ksteps;
-            DlA8 nxt;
-            dx_mma<F, 0, Q, TTM>(tk[b], cur, acc, g, t);
-            if (more) {
-                dl_mbar_wait(&full[(s + 1) % WST], ((s + 1) / WST) & 1);
-                dl_a8_begin<FUSED, HV>(nxt, &wt[(s + 1) % WST], half, ww, g, t);
-                dl_a8_slot(nxt, F);
-            }
-            dx_mma<F, Q, TT, TTM>(tk[b], cur, acc, g, t);
-            if (more) dl_a8_slot(nxt, F + 2);
-            dl_mbar_arrive(&empty[b]);
-            const int sn = s + WST - 1;    // into buffer (s - 1) % WST
-            if (sn < ksteps) {
-                if (sn >= WST) dl_mbar_wait(&empty[sn % WST], (sn / WST - 1) & 1);
-                issue(sn);
-                dl_cp_arrive(&full[sn % WST]);
-            }
-            if (more) cur = nxt;
-        }
-    };
-    // The fragment is warp-uniform: one loop per fragment and tile count.
-    auto byf = [&](auto fc) {
-        switch (tt_valid) {
-            case 1: kloop(fc, dl_int<1>{}); break;
-            case 2: kloop(fc, dl_int<2>{}); break;
-            case 3: kloop(fc, dl_int<3>{}); break;
-            case 4: kloop(fc, dl_int<4>{}); break;
-            case 5: kloop(fc, dl_int<5>{}); break;
-            case 6: kloop(fc, dl_int<6>{}); break;
-            case 7: kloop(fc, dl_int<7>{}); break;
-            case 8: kloop(fc, dl_int<8>{}); break;
-            case 9: kloop(fc, dl_int<9>{}); break;
-            case 10: kloop(fc, dl_int<10>{}); break;
-            case 11: kloop(fc, dl_int<11>{}); break;
-            case 12: kloop(fc, dl_int<12>{}); break;
-            case 13: kloop(fc, dl_int<13>{}); break;
-            case 14: kloop(fc, dl_int<14>{}); break;
-            case 15: kloop(fc, dl_int<15>{}); break;
-            default: kloop(fc, dl_int<TTM>{}); break;
-        }
-    };
-    if (f) byf(dl_int<1>{});
-    else byf(dl_int<0>{});
-    bm_wait<0>();
-
-    // The 8-warp epilogue's arithmetic per output (k0, k1: the tensor scales).
-    const float k0 = gs0, k1 = FUSED ? gs1 : gs0;
-    __syncthreads();
-    constexpr unsigned int OLD = FEAT * HV + 8;
-    __nv_bfloat16* os = (__nv_bfloat16*)db_smem;
-    #pragma unroll
-    for (int tt = 0; tt < TTM; tt++) {
-        if (tt < tt_valid) {
-            #pragma unroll
-            for (int i = 0; i < 2; i++) {
-                const unsigned int tok = tt * 8 + 2 * t + i;
-                __nv_bfloat16* o = os + tok * OLD + half * FEAT;
-                const float ag = Ag[r0 + (tok < rows ? tok : 0)];
-                if (FUSED) {
-                    // acc[i]: gate (row g), acc[2 + i]: up (row g + 8) of
-                    // output 16 ww + 2 g + f.
-                    const float gv = __bfloat162float(__float2bfloat16(acc[tt][i] * k0 * ag));
-                    const float uv = __bfloat162float(__float2bfloat16(acc[tt][2 + i] * k1 * ag));
-                    o[16 * ww + 2 * g + f] = __float2bfloat16(gv * (1.0f / (1.0f + __expf(-gv))) * uv);
-                } else {
-                    o[32 * ww + 4 * g + f] = __float2bfloat16(acc[tt][i] * k0 * ag);
-                    o[32 * ww + 4 * g + 2 + f] = __float2bfloat16(acc[tt][2 + i] * k1 * ag);
-                }
-            }
-        }
-    }
-    __syncthreads();
-    for (unsigned int i = tid; i < rows * (FEAT * HV / 8); i += DX_THREADS) {
-        const unsigned int r = i / (FEAT * HV / 8), c = i % (FEAT * HV / 8);
-        *(uint4*)&C[(unsigned long long)(r0 + r) * ldc + n0 + c * 8] = *(const uint4*)&os[r * OLD + c * 8];
-    }
-}
-
-#define DX_WST 4   // 5 stages and a 2-stage reuse lag measured slower
-
-extern "C" __global__ void __launch_bounds__(DX_THREADS, 1)
-dense_w4a8x16_gate_up_silu(const unsigned char* __restrict__ aq, const float* __restrict__ ag,
-                           const unsigned char* __restrict__ gate_packed, const unsigned char* __restrict__ gate_scale,
-                           float gate_scale2,
-                           const unsigned char* __restrict__ up_packed, const unsigned char* __restrict__ up_scale,
-                           float up_scale2,
-                           __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
-                           unsigned int nchunks)
-{
-    dx_body<true, DX_WST>(aq, ag, gate_packed, gate_scale, gate_scale2, up_packed, up_scale, up_scale2, C, M, N, K, N,
-                          nchunks);
-}
-
 // ---- W4A8, warp-specialized (picked by row count: dense_bf16mma_lowp.rs) ---
-// The 8-warp kernels' CTA tile (256 weight rows x 128 tokens, 64-K stages)
-// with the re-encode moved off the MMA warps, persistent over the tiles.
+// The 8-warp kernels' 256 weight rows and 64-K stages, with the re-encode
+// moved off the MMA warps, persistent over the tiles, and token tiles of up
+// to 144 rows (DW_ROWS).
 //  * Producers (warps 8..15): producer p runs dl_a8_begin / dl_a8_slot for
 //    slot warp p of the 8-warp layout (half p / 4, warp p % 4), lane by
 //    lane, and stores the E4M3 operands and UE8M0 row scales in lane order.
@@ -1325,8 +1115,8 @@ dense_w4a8x16_gate_up_silu(const unsigned char* __restrict__ aq, const float* __
 //    epilogue computes db_body's values and stores them from registers.
 //    Results are bit-identical.
 //  * Tiles: CTA b takes raster tiles b, b + grid, ... (the 8-warp grid's
-//    order); the rings run on across tiles, so the next tile's stages load
-//    and re-encode during the epilogue.
+//    order over 144-row chunks); the rings run on across tiles, so the next
+//    tile's stages load and re-encode during the epilogue.
 //  Rings: tokens DW_RT deep (issued DW_TA stages ahead), operands DW_RA,
 //  NVFP4 stages DW_RW (issued DW_RW - 1 ahead). Barriers: tfull (the token
 //  lanes' copies), afull[p] (producer p's operands), cdone (every consumer
@@ -1338,20 +1128,43 @@ dense_w4a8x16_gate_up_silu(const unsigned char* __restrict__ aq, const float* __
 #define DW_RW 3
 #define DW_TA (DW_RT - DW_RA)
 // Registers: 512 threads launch at 128; the producers give theirs to the
-// consumers' 128 FP32 accumulators (setmaxnreg: 256 x 192 + 256 x 64).
+// consumers' up to 144 FP32 accumulators (setmaxnreg: 256 x 192 + 256 x 64).
 #define DW_CREG 192
 #define DW_PREG 64
 #define DW_BG 2     // token tiles per MMA group: 4 MMAs between dependent ones
 
 // One stage of re-encoded operands: per slot warp and lane the four MMA A
 // fragments (q = 2 h + f: a[h][2f][0], a[h][2f+1][0], a[h][2f][1],
-// a[h][2f+1][1]) and the UE8M0 scales (sa0, sa1).
-struct __align__(16) DwA {
+// a[h][2f+1][1]) and per slot warp and row g its four slots' UE8M0 scales.
+struct __align__(16) DpA {
     uint4 a[8][4][32];
-    uint2 sa[8][32];
+    unsigned int ue[8][8];
 };
+// The scales (sa0, sa1) lane (g, t) passes the MMA (dl_a8_begin's).
+__device__ __forceinline__ void dp_sa(const DpA& a, unsigned int c, unsigned int g, unsigned int t,
+                                      unsigned int& sa0, unsigned int& sa1) {
+    const unsigned int u = a.ue[c][g], odd = t & 1;
+    sa0 = (u >> (8 * odd)) & 0xFF;
+    sa1 = (u >> (8 * (2 + odd))) & 0xFF;
+}
+__device__ __forceinline__ unsigned int dp_ue(const DlA8& e) {
+    return e.ue[0] | (e.ue[1] << 8) | (e.ue[2] << 16) | (e.ue[3] << 24);
+}
+// Token tiles: up to 144 rows a CTA (288 rows = two tiles, so the N = 5120
+// projections' 20 feature tiles x 2 fit one wave of 48 SMs).
+#define DW_ROWS 144
+struct __align__(16) DwTok {
+    unsigned char q[DW_ROWS][DB_KS];
+};
+// f(dl_int<n>{}) for the tile count n = ttv (TTM: the compiled maximum).
+template <int N, int TTM, class F>
+__device__ __forceinline__ void dl_by_tt(int ttv, F&& f) {
+    if constexpr (N >= TTM) f(dl_int<TTM>{});
+    else if (ttv == N) f(dl_int<N>{});
+    else dl_by_tt<N + 1, TTM>(ttv, f);
+}
 
-// A raster tile of the 8-warp grid (db_body's blockIdx.x mapping).
+// A raster tile (db_body's blockIdx.x mapping over this kernel's chunks).
 struct DwTile {
     unsigned int n0, r0, rows;
     int ttv;
@@ -1443,12 +1256,12 @@ __device__ __forceinline__ void dw_body(
     unsigned int nchunks)
 {
     atlas_pdl_enter();
-    constexpr int HV = 2, TTM = DL_ROWS / 8;
+    constexpr int HV = 2, TTM = DW_ROWS / 8;
     constexpr unsigned int FEAT = FUSED ? 64 : 128;      // weight features per half (per matrix)
     extern __shared__ __align__(16) unsigned char db_smem[];
-    DbTok8* tk = (DbTok8*)db_smem;
-    DwA* ab = (DwA*)(db_smem + DW_RT * sizeof(DbTok8));
-    DbW<DB_NVFP4, HV>* wt = (DbW<DB_NVFP4, HV>*)(db_smem + DW_RT * sizeof(DbTok8) + DW_RA * sizeof(DwA));
+    DwTok* tk = (DwTok*)db_smem;
+    DpA* ab = (DpA*)(db_smem + DW_RT * sizeof(DwTok));
+    DbW<DB_NVFP4, HV>* wt = (DbW<DB_NVFP4, HV>*)(db_smem + DW_RT * sizeof(DwTok) + DW_RA * sizeof(DpA));
 
     DwCursor start{blockIdx.x, 0, {}};
     dw_seek<FUSED>(start, M, N, nchunks);
@@ -1461,7 +1274,7 @@ __device__ __forceinline__ void dw_body(
 
     __shared__ __align__(8) unsigned long long tfull[DW_RT], cdone[DW_RT], afull[DW_RA][DW_PRODUCERS];
     // Per-token scales of the consumers' last two tiles.
-    __shared__ float ag_s[2][DL_ROWS];
+    __shared__ float ag_s[2][DW_ROWS];
     if (tid == 0) {
         #pragma unroll
         for (int b = 0; b < DW_RT; b++) {
@@ -1514,9 +1327,9 @@ __device__ __forceinline__ void dw_body(
                 bm_commit();
             } else {
                 #pragma unroll
-                for (unsigned int i = 0; i < DL_ROWS / TROWS; i++) {
+                for (unsigned int i = 0; i < (DW_ROWS + TROWS - 1) / TROWS; i++) {
                     const unsigned int r = (wq >> 2) + TROWS * i;
-                    if ((int)r < c.tl.ttv * 8)
+                    if (r < DW_ROWS && (int)r < c.tl.ttv * 8)
                         bm_cp16(&tk[Gi % DW_RT].q[r][qc * 16],
                                 Aq + (unsigned long long)(c.tl.r0 + (r < c.tl.rows ? r : 0)) * K + qc * 16 + kb,
                                 c.tl.rows > r);
@@ -1554,7 +1367,7 @@ __device__ __forceinline__ void dw_body(
                     bm_commit();
                 }
             }
-            DwA& out = ab[G % DW_RA];
+            DpA& out = ab[G % DW_RA];
             static_assert(DW_PRODUCERS == 8, "one slot warp per producer");
             DlA8 a8;
             dl_a8_begin<FUSED, HV>(a8, &wt[G % DW_RW], p >> 2, p & 3, g, t);
@@ -1566,7 +1379,7 @@ __device__ __forceinline__ void dw_body(
                 for (int f = 0; f < 2; f++)
                     out.a[p][2 * hh + f][lane] = make_uint4(a8.a[hh][2 * f][0], a8.a[hh][2 * f + 1][0],
                                                             a8.a[hh][2 * f][1], a8.a[hh][2 * f + 1][1]);
-            out.sa[p][lane] = make_uint2(a8.sa0, a8.sa1);
+            if (t == 0) out.ue[p][g] = dp_ue(a8);
             dl_mbar_arrive(&afull[G % DW_RA][p]);
         }
         bm_wait<0>();
@@ -1586,12 +1399,13 @@ __device__ __forceinline__ void dw_body(
         for (int s = 0; s < ksteps; s++, G++) {
             dl_mbar_wait(&afull[G % DW_RA][cw % DW_PRODUCERS], (G / DW_RA) & 1);
             dl_mbar_wait(&tfull[G % DW_RT], (G / DW_RT) & 1);
-            const DwA& a = ab[G % DW_RA];
+            const DpA& a = ab[G % DW_RA];
             uint4 q[4];
             #pragma unroll
             for (int i = 0; i < 4; i++) q[i] = a.a[cw][i][cl];
-            const uint2 sa = a.sa[cw][cl];
-            const DbTok8& tb = tk[G % DW_RT];
+            uint2 sa;
+            dp_sa(a, cw, cg, cq, sa.x, sa.y);
+            const DwTok& tb = tk[G % DW_RT];
             #pragma unroll
             for (int j0 = 0; j0 < TT; j0 += DW_BG) {
                 uint4 b[DW_BG];
@@ -1624,24 +1438,7 @@ __device__ __forceinline__ void dw_body(
         for (int i = 0; i < TTM; i++)
             #pragma unroll
             for (int f = 0; f < 2; f++) acc[f][i][0] = acc[f][i][1] = acc[f][i][2] = acc[f][i][3] = 0.0f;
-        switch (tl.ttv) {
-            case 1: kloop(dl_int<1>{}); break;
-            case 2: kloop(dl_int<2>{}); break;
-            case 3: kloop(dl_int<3>{}); break;
-            case 4: kloop(dl_int<4>{}); break;
-            case 5: kloop(dl_int<5>{}); break;
-            case 6: kloop(dl_int<6>{}); break;
-            case 7: kloop(dl_int<7>{}); break;
-            case 8: kloop(dl_int<8>{}); break;
-            case 9: kloop(dl_int<9>{}); break;
-            case 10: kloop(dl_int<10>{}); break;
-            case 11: kloop(dl_int<11>{}); break;
-            case 12: kloop(dl_int<12>{}); break;
-            case 13: kloop(dl_int<13>{}); break;
-            case 14: kloop(dl_int<14>{}); break;
-            case 15: kloop(dl_int<15>{}); break;
-            default: kloop(dl_int<TTM>{}); break;
-        }
+        dl_by_tt<1, TTM>(tl.ttv, kloop);
         asm volatile("bar.sync 1, 256;" ::: "memory");
         dw_epi_store<FUSED, TTM>(C, ldc, tl.r0, tl.n0 + (cw >> 2) * FEAT, acc, tl.ttv, cw & 3, cg, cq, gs0,
                                  FUSED ? gs1 : gs0, ag, tl.rows);

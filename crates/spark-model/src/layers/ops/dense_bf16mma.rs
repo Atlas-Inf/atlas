@@ -62,10 +62,8 @@ pub struct DenseBf16mma {
     /// The MX8 handoff pair (`LowpMix::DOWN_MX`).
     w4a8_gate_up_mx: KernelHandle,
     w4a8_mx: KernelHandle,
-    /// Their warp-specialized twins (`dw_body`): [gate_up, nvfp4]; and the
-    /// 16-warp gate+up (`dx_body`).
+    /// Their warp-specialized twins (`dw_body`): [gate_up, nvfp4].
     w4a8ws: [KernelHandle; 2],
-    w4a8x16_gate_up: KernelHandle,
     w8a8: KernelHandle,
     /// W8A8 on the transposed `[K, N]` prefill copy.
     w8a8_t: KernelHandle,
@@ -93,7 +91,6 @@ impl Default for DenseBf16mma {
             w4a8_gate_up_mx: KernelHandle(0),
             w4a8_mx: KernelHandle(0),
             w4a8ws: [KernelHandle(0); 2],
-            w4a8x16_gate_up: KernelHandle(0),
             w8a8: KernelHandle(0),
             w8a8_t: KernelHandle(0),
             quant_nvfp4: KernelHandle(0),
@@ -110,11 +107,13 @@ impl Default for DenseBf16mma {
 /// 64-row to 16-row chunks, the one with the fewest waves x per-CTA work
 /// (its weight tile plus its 8-row token tiles). A short M x narrow N grid
 /// (down at 288 rows: 5 chunks x 20 tiles = 100 CTAs on 96 slots) takes
-/// smaller chunks instead of a nearly empty second wave. Results do not
-/// depend on it: every output is one CTA's fixed-order K loop.
-fn chunks(m: u32, tiles: u32, slots: u32, rows: u32) -> u32 {
+/// smaller chunks instead of a nearly empty second wave. `fixed`: a CTA's
+/// cost beyond its token tiles (CTA_FIXED; the warp-specialized kernels'
+/// per-stage re-encode, WS_FIXED). Results do not depend on it: every
+/// output is one CTA's fixed-order K loop.
+fn chunks(m: u32, tiles: u32, slots: u32, rows: u32, fixed: u32) -> u32 {
     (m.div_ceil(rows)..=m.div_ceil(16))
-        .min_by_key(|&c| (tiles * c).div_ceil(slots) * (CTA_FIXED + m.div_ceil(c).div_ceil(8)))
+        .min_by_key(|&c| (tiles * c).div_ceil(slots) * (fixed + m.div_ceil(c).div_ceil(8)))
         .unwrap_or(1)
 }
 
@@ -165,7 +164,6 @@ impl DenseBf16mma {
             w4a8_gate_up_mx: k("dense_w4a8_gate_up_silu_mx"),
             w4a8_mx: k("dense_w4a8mx_nvfp4"),
             w4a8ws: [k("dense_w4a8ws_gate_up_silu"), k("dense_w4a8ws_nvfp4")],
-            w4a8x16_gate_up: k("dense_w4a8x16_gate_up_silu"),
             w8a8: k("dense_w8a8_fp8"),
             w8a8_t: k("dense_w8a8_fp8t"),
             quant_nvfp4: k("dl_quant_nvfp4"),
@@ -209,16 +207,12 @@ impl DenseBf16mma {
             ),
             Some((nvfp4, kernel, smem)) => {
                 let token_scales = self.quantize(gpu, nvfp4, input, lowp, [m, k], stream)?;
-                // A bit-identical W4A8 twin where it is faster: the
-                // persistent warp-specialized one, or the 16-warp gate+up.
+                // The bit-identical warp-specialized W4A8 twin where it is
+                // faster: persistent, one CTA per SM.
                 let (kernel, smem) = match self.w4a8_twin(kernel, m) {
-                    Some(W4a8Twin::Ws(twin)) => {
+                    Some(twin) => {
                         (threads, persistent) = (WS_THREADS, true);
                         (twin, SMEM_W4A8_WS)
-                    }
-                    Some(W4a8Twin::X16(twin)) => {
-                        threads = X16_THREADS;
-                        (twin, smem)
                     }
                     None => (kernel, smem),
                 };
@@ -236,7 +230,10 @@ impl DenseBf16mma {
                 )
             }
         };
-        let c = chunks(m, n / features, slots.max(1), rows);
+        let c = match persistent {
+            true => chunks(m, n / features, slots.max(1), WS_TILE_ROWS, WS_FIXED),
+            false => chunks(m, n / features, slots.max(1), rows, CTA_FIXED),
+        };
         let ctas = match persistent {
             true => ((n / features) * c).min(slots.max(1)),
             false => (n / features) * c,
@@ -452,7 +449,7 @@ pub fn fp8_scale_k_uniform(gpu: &dyn GpuBackend, w: &Fp8Weight) -> Result<bool> 
 #[path = "dense_bf16mma_lowp.rs"]
 mod lowp;
 pub use lowp::{LowpArgs, LowpMix};
-use lowp::{SMEM_W4A8_WS, W4a8Twin, WS_THREADS, X16_THREADS};
+use lowp::{SMEM_W4A8_WS, WS_FIXED, WS_THREADS, WS_TILE_ROWS};
 
 #[path = "dense_bf16mma_ba.rs"]
 mod ba;
@@ -467,14 +464,18 @@ mod lowp_gpu_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::{LOWP_ROWS, ROWS, chunks};
+    use super::{CTA_FIXED, LOWP_ROWS, ROWS, WS_FIXED, WS_TILE_ROWS, chunks};
 
     #[test]
     fn chunks_stay_within_the_kernel_tile_and_fill_short_grids() {
-        for (rows, slots) in [(ROWS, 96), (LOWP_ROWS, 48)] {
+        for (rows, slots, fixed) in [
+            (ROWS, 96, CTA_FIXED),
+            (LOWP_ROWS, 48, CTA_FIXED),
+            (WS_TILE_ROWS, 48, WS_FIXED),
+        ] {
             for m in 1..5000 {
                 for tiles in [20, 64, 136] {
-                    let c = chunks(m, tiles, slots, rows);
+                    let c = chunks(m, tiles, slots, rows, fixed);
                     assert!(
                         c >= m.div_ceil(rows) && m.div_ceil(c) <= rows,
                         "m={m} tiles={tiles} c={c}"
@@ -485,8 +486,11 @@ mod tests {
             }
         }
         // down / out_proj at 288 rows: not 5 x 20 = 100 CTAs on 96 slots.
-        assert!(chunks(288, 20, 96, ROWS) * 20 <= 96 || chunks(288, 20, 96, ROWS) * 20 > 150);
+        let c = chunks(288, 20, 96, ROWS, CTA_FIXED);
+        assert!(c * 20 <= 96 || c * 20 > 150);
         // Full waves already: keep 64-row chunks.
-        assert_eq!(chunks(4128, 136, 96, ROWS), 65);
+        assert_eq!(chunks(4128, 136, 96, ROWS, CTA_FIXED), 65);
+        // Warp-specialized: 288 rows as two 144-row tiles, 40 CTAs on 48 SMs.
+        assert_eq!(chunks(288, 20, 48, WS_TILE_ROWS, WS_FIXED), 2);
     }
 }

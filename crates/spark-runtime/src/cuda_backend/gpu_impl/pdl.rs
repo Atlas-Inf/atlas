@@ -308,7 +308,6 @@ pub(super) const QWEN38_PDL_KERNELS: &[&str] = &[
     "dense_w4a8_nvfp4",
     "dense_w4a8_gate_up_silu_mx",
     "dense_w4a8mx_nvfp4",
-    "dense_w4a8x16_gate_up_silu",
     "dense_w4a8ws_gate_up_silu",
     "dense_w4a8ws_nvfp4",
     "dense_w8a8_fp8",
