@@ -37,6 +37,15 @@
 //    two global scale applied in the epilogue with the weight tensor scale.
 //  * W8A8: per-tensor FP8 weights x E4M3 tokens (per-token power-of-two
 //    scale) on m16n8k32 e4m3.
+//  * W4A8: NVFP4 weights re-encoded per stage as block-scaled E4M3 (UE8M0
+//    per 32 K) x E4M3 tokens (per-token power-of-two scale) on mma.sync
+//    kind::mxf8f6f4 m16n8k32; the 8-warp kernels, plus warp-specialized
+//    persistent twins (dw_body) from 129 rows.
+//  * MX8 handoff (`dnmx`): the W4A8 gate+up writes the down projection's
+//    tokens as E4M3 with a UE8M0 scale per token and 32-K block, and the
+//    W4A8 down reads them with no per-token quantizer pass.
+//  * The W4A4 kernels have persistent twins with loader warps (dz_body)
+//    from 96 rows. Every twin reproduces its 8-warp kernel bit for bit.
 
 #include "../../common/atlas_pdl.cuh"
 #include "../../common/bf16mma_dequant.cuh"
@@ -282,12 +291,16 @@ __device__ __forceinline__ void db_stage(const DbTok& tk, const DbW<WF, HV>& sb,
     }
 }
 
-// The smallest power of two p with amax / p <= lim; 1 for amax == 0.
+// The smallest power of two p with amax / p <= lim; 1 for amax == 0. p is
+// kept at or above 2^-126 so it stays normal and 1 / p finite (a subnormal
+// p gave 1 / p = Inf and 0 x Inf NaN codes for rows with amax below about
+// 2^-117; this module builds without --ftz). No row with amax of normal
+// magnitude times lim reaches the clamp, so their codes are unchanged.
 __device__ __forceinline__ float dl_pow2_scale(float amax, float lim) {
     if (!(amax > 0.0f)) return 1.0f;
     int e;
     const float f = frexpf(__fdiv_rn(amax, lim), &e);   // f in [0.5, 1)
-    return ldexpf(1.0f, f == 0.5f ? e - 1 : e);
+    return ldexpf(1.0f, max(f == 0.5f ? e - 1 : e, -126));
 }
 
 template <int N> struct dl_int { static constexpr int value = N; };
@@ -829,6 +842,10 @@ __device__ __forceinline__ void db_body(
         // 448 (UE8M0 127 + E; 2^0 for an all-zero block), from the BF16 the
         // unfused chain would write.
         static_assert(FUSED && FEAT * HV == 128, "MX output: the fused 128-wide gate+up tile");
+        // The code tile follows the BF16 epilogue tile, which db_smem_bytes
+        // does not count; it fits only because the stages are larger.
+        static_assert(DL_ROWS * OLD * sizeof(__nv_bfloat16) + DL_ROWS * 128 <= db_smem_bytes<WF, FUSED, HV, WST, AF>(),
+                      "MX output: the E4M3 code tile must fit the dynamic shared memory");
         unsigned char* ct = db_smem + DL_ROWS * OLD * sizeof(__nv_bfloat16);   // [row][128] codes
         for (unsigned int task = tid; task < rows * 4; task += NT) {
             const unsigned int r = task >> 2, st = (task >> 1) & 1, h = task & 1;
@@ -896,8 +913,9 @@ __device__ __forceinline__ void db_body(
 #define DL_W4A8_WST 4
 #endif
 
-// Shared memory: 2 * sizeof(DbTok) + WST * sizeof(DbW<WF, HV>) bytes (dynamic).
-// Grid: (N / (128 HV)) * nchunks CTAs (FUSED: N = inter, N / (64 HV)), block
+// Shared memory: db_smem_bytes<...>() bytes (dynamic): the token and WST
+// weight stages (two BF16 token stages, WST low-precision ones, plus the MX8
+// scale groups) or the epilogue tile, whichever is larger. Grid: (N / (128 HV)) * nchunks CTAs (FUSED: N = inter, N / (64 HV)), block
 // 128 HV; nchunks >= ceil(M / 64) row chunks of ceil(M / nchunks) rows.
 
 extern "C" __global__ void __launch_bounds__(128 * DB_HV, 2)
