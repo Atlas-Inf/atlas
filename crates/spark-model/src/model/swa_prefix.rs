@@ -49,9 +49,10 @@ impl TransformerModel {
         )
     }
 
-    /// After a prompt's prefill: pin the sliding-window tail of its whole
-    /// blocks, if the prefix cache published them.
-    pub(crate) fn pin_swa_prompt_tail(&self, seq: &SequenceState) {
+    /// After the prefill of `prompt` (the whole prompt): pin the
+    /// sliding-window tail of its whole blocks, if the prefix cache
+    /// published them.
+    pub(crate) fn pin_swa_prompt_tail(&self, prompt: &[u32], seq: &SequenceState) {
         if !self.prefix_cache.is_active() {
             return;
         }
@@ -60,11 +61,11 @@ impl TransformerModel {
             return;
         }
         let bs = kv_cache.block_size();
-        let whole = seq.prompt_len.min(seq.tokens.len()) / bs;
+        let whole = prompt.len() / bs;
         if whole == 0 || whole > seq.block_table.len() {
             return;
         }
-        let key = self.pc_key_tokens(seq, &seq.tokens[..whole * bs]);
+        let key = self.pc_key_tokens(seq, &prompt[..whole * bs]);
         if self
             .prefix_cache
             .peek_matched_tokens(&key, bs, seq.adapter_id)

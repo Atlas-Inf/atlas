@@ -40,7 +40,7 @@ impl TransformerModel {
 
         (|| {
             let logits = self.prefill_dispatch(tokens, seq, stream)?;
-            self.pin_swa_prompt_tail(seq);
+            self.pin_swa_prompt_tail(tokens, seq);
             // Ported from Enntity/atlas e7d4e1a (AGPL-3.0-only).
             self.try_mtp_prompt_absorb(seq, tokens, stream);
             self.try_eager_drafter_prefill(seq, true, stream)?;
@@ -81,7 +81,7 @@ impl TransformerModel {
                 stream,
             )?;
             if is_last_chunk {
-                self.pin_swa_prompt_tail(seq);
+                self.pin_swa_prompt_tail(tokens, seq);
             }
             self.try_mtp_prompt_absorb(seq, tokens, stream);
             self.try_eager_drafter_prefill(seq, is_last_chunk, stream)?;
@@ -109,7 +109,7 @@ impl TransformerModel {
 
         (|| {
             let logits = self.prefill_twophase_dispatch(tokens, seq, chunk_size, stream)?;
-            self.pin_swa_prompt_tail(seq);
+            self.pin_swa_prompt_tail(tokens, seq);
             self.try_mtp_prompt_absorb(seq, tokens, stream);
             self.try_eager_drafter_prefill(seq, true, stream)?;
             Ok(logits)
