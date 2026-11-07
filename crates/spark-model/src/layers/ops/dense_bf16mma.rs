@@ -138,6 +138,8 @@ fn nvfp4_ok(w: &QuantizedWeight, n: u32, k: u32, features: u32) -> bool {
         && !w.has_per_row_scale2()
         && n.is_multiple_of(features)
         && k.is_multiple_of(KS)
+        && n > 0
+        && k > 0
 }
 
 impl DenseBf16mma {
@@ -293,7 +295,7 @@ impl DenseBf16mma {
         stream: u64,
     ) -> Result<()> {
         // MX8 handoff: `out` takes the E4M3 codes [m, inter] then the scales.
-        let mx = self.mx_on(&lowp, inter);
+        let mx = self.mx_on(&lowp, [h, inter]);
         let lp = if mx {
             Some((false, self.w4a8_gate_up_mx, SMEM_W4A8))
         } else {
@@ -355,7 +357,7 @@ impl DenseBf16mma {
         lowp: LowpArgs,
         stream: u64,
     ) -> Result<()> {
-        if lowp.group == LowpMix::DOWN && self.mx_on(&lowp, k) {
+        if lowp.group == LowpMix::DOWN && self.mx_on(&lowp, [n, k]) {
             return self.mx_down(gpu, input, w, out, [m, n, k], stream);
         }
         let lp = self.lowp_kernel(
@@ -396,6 +398,8 @@ impl DenseBf16mma {
             && w.scale_format == WeightQuantFormat::Fp8BlockScaled
             && w.n.is_multiple_of(FEATURES)
             && w.k.is_multiple_of(FP8_BLOCK)
+            && w.n > 0
+            && w.k > 0
     }
 
     /// `out[m, w.n] = input[m, w.k] · wᵀ` for an `[N, K]` e4m3 weight. W8A8

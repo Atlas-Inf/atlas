@@ -226,15 +226,20 @@ impl DenseBf16mma {
         })
     }
 
-    /// Whether the gate+up -> down handoff runs as MX8 tokens (`dnmx`) for a
-    /// `k_down`-wide intermediate: both kernels shipped, W4A8 gate+up on.
-    pub(super) fn mx_on(&self, lowp: &LowpArgs, k_down: u32) -> bool {
+    /// Whether the gate+up -> down handoff runs as MX8 tokens (`dnmx`) for
+    /// an `h`-wide input and a `k_down`-wide intermediate: both kernels
+    /// shipped, W4A8 gate+up on, and its input within the E4M3 quantizer's
+    /// row (`QUANT_MAX_K`). Both sides of the handoff ask with the same
+    /// shapes, so they agree.
+    pub(super) fn mx_on(&self, lowp: &LowpArgs, [h, k_down]: [u32; 2]) -> bool {
         self.lowp.has(LowpMix::DOWN_MX)
             && self.lowp.has_a8(LowpMix::GATE_UP)
             && self.w4a8_gate_up_mx.0 != 0
             && self.w4a8_mx.0 != 0
             && self.quant_fp8.0 != 0
             && k_down.is_multiple_of(MX_K)
+            && k_down > 0
+            && (1..=QUANT_MAX_K).contains(&h)
             && !lowp.codes.is_null()
             && !lowp.scales.is_null()
     }
@@ -285,7 +290,7 @@ impl DenseBf16mma {
         [handle, quant]: [KernelHandle; 2],
     ) -> bool {
         self.lowp.has(group)
-            && k <= QUANT_MAX_K
+            && (1..=QUANT_MAX_K).contains(&k)
             && handle.0 != 0
             && quant.0 != 0
             && !lowp.codes.is_null()

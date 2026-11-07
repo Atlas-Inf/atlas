@@ -327,7 +327,7 @@ fn dense_mx_handoff_matches_reference() -> Result<()> {
             scales: scratch[1],
         };
         ensure!(
-            kernels.mx_on(&lowp(LowpMix::GATE_UP), IM as u32),
+            kernels.mx_on(&lowp(LowpMix::GATE_UP), [H as u32, IM as u32]),
             "MX handoff kernels not in this build"
         );
         let mu = m as u32;
