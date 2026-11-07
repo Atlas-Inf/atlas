@@ -10,8 +10,17 @@
 //! 2. TWIN: `ops::fp8_rows_plan` launches (verify and batched decode) at
 //!    1..=4, 8, 16, 24 and 36 rows against that many serial `w8a16_gemv`
 //!    calls: zero differing bytes (1..=4 rows is the exact K=2/3/4 verify).
-//! 3. PREFILL: the BF16-MMA FP8 kernel (`ATLAS_DENSE_PREFILL_BF16MMA`) at 64
-//!    rows against the serial rows (cosine), skipped when not in the build.
+//! 3. PREFILL (BF16-MMA): the BF16-MMA FP8 kernel
+//!    (`ATLAS_DENSE_PREFILL_BF16MMA`) at 64 rows against the serial rows
+//!    (cosine), skipped when not in the build.
+//! 4. PREFILL (default): the route the lever takes without BF16-MMA,
+//!    `per_token_group_quant_fp8` + `fp8_gemm_t_blockscaled`, at 64 rows
+//!    against the serial rows (its activations are E4M3 per 128, so a looser
+//!    cosine bound).
+//!
+//! The weights carry no E4M3 NaN codes (0x7f / 0xff), as no checkpoint does:
+//! the LUT and block-scaled kernels read them as 0, the BF16-MMA register
+//! dequant as +-480, so with them the two prefill routes disagree (~0.9 cos).
 //!
 //! GPU REQUIRED. Build with the qwen3.8-27b (or qwen3.6-27b) kernels, then:
 //!   cargo run --release -p spark-model --features cuda,gpu-examples \
@@ -108,7 +117,13 @@ impl Proj {
         rng: &mut Lcg,
         (name, n, k): (&'static str, usize, usize),
     ) -> Result<Self> {
-        let bytes: Vec<u8> = (0..n * k).map(|_| rng.next() as u8).collect();
+        // Every E4M3 code but NaN (see the module docs).
+        let bytes: Vec<u8> = (0..n * k)
+            .map(|_| match rng.next() as u8 {
+                b if b & 0x7f == 0x7f => b ^ 1,
+                b => b,
+            })
+            .collect();
         let grid = vec![SCALE; n.div_ceil(128) * k.div_ceil(128)];
         let grid_b: Vec<u8> = grid.iter().flat_map(|s| s.to_le_bytes()).collect();
         let x: Vec<u16> = (0..MAX_ROWS * k)
@@ -229,8 +244,37 @@ fn twin(g: &dyn GpuBackend, ks: &Kernels, p: &Proj, [a, b]: [DevicePtr; 2]) -> R
     Ok(pass)
 }
 
+/// The worst row cosine of `a` against `b` (`MAX_ROWS` rows of `n`).
+fn rows_vs_serial(
+    g: &dyn GpuBackend,
+    p: &Proj,
+    [a, b]: [DevicePtr; 2],
+    label: &str,
+    min_cos: f64,
+) -> Result<bool> {
+    let (n, _) = p.nk();
+    g.synchronize(0)?;
+    let va: Vec<f64> = down_bf16(g, a, MAX_ROWS * n)?.into_iter().map(f).collect();
+    let vb: Vec<f64> = down_bf16(g, b, MAX_ROWS * n)?.into_iter().map(f).collect();
+    let worst = (0..MAX_ROWS)
+        .map(|r| cos(&va[r * n..(r + 1) * n], &vb[r * n..(r + 1) * n]))
+        .fold(1f64, f64::min);
+    let pass = worst >= min_cos;
+    println!(
+        "{label} {:7} rows={MAX_ROWS}: worst row cos vs serial GEMV={worst:.9} (min {min_cos}) {}",
+        p.name,
+        if pass { "PASS" } else { "FAIL" }
+    );
+    Ok(pass)
+}
+
 /// Leg 3: the BF16-MMA FP8 prefill kernel at MAX_ROWS rows.
-fn prefill(g: &dyn GpuBackend, ks: &Kernels, p: &Proj, [a, b]: [DevicePtr; 2]) -> Result<bool> {
+fn prefill_bf16mma(
+    g: &dyn GpuBackend,
+    ks: &Kernels,
+    p: &Proj,
+    outs: [DevicePtr; 2],
+) -> Result<bool> {
     // SAFETY: single-threaded example, before any reader of the variable.
     unsafe { std::env::set_var("ATLAS_DENSE_PREFILL_BF16MMA", "1") };
     let mma = ops::DenseBf16mma::load(g);
@@ -238,7 +282,7 @@ fn prefill(g: &dyn GpuBackend, ks: &Kernels, p: &Proj, [a, b]: [DevicePtr; 2]) -
     let uniform = ops::fp8_scale_k_uniform(g, &p.w)?;
     if !mma.serves_fp8(&p.w, uniform, MAX_ROWS as u32, &levers) {
         println!(
-            "PREFILL {:7}: BF16-MMA FP8 kernel not served (not in this build?) SKIP",
+            "PREFILL-MMA {:7}: BF16-MMA FP8 kernel not served (not in this build?) SKIP",
             p.name
         );
         return Ok(true);
@@ -248,21 +292,47 @@ fn prefill(g: &dyn GpuBackend, ks: &Kernels, p: &Proj, [a, b]: [DevicePtr; 2]) -
         codes: DevicePtr::NULL,
         scales: DevicePtr::NULL,
     };
-    let (n, _) = p.nk();
-    mma.fp8(g, p.x_dev, &p.w, None, a, MAX_ROWS as u32, lowp, 0)?;
-    p.serial(g, ks, b, MAX_ROWS)?;
-    g.synchronize(0)?;
-    let va: Vec<f64> = down_bf16(g, a, MAX_ROWS * n)?.into_iter().map(f).collect();
-    let vb: Vec<f64> = down_bf16(g, b, MAX_ROWS * n)?.into_iter().map(f).collect();
-    let worst = (0..MAX_ROWS)
-        .map(|r| cos(&va[r * n..(r + 1) * n], &vb[r * n..(r + 1) * n]))
-        .fold(1f64, f64::min);
-    let pass = worst >= 0.99999;
-    println!(
-        "PREFILL {:7} rows={MAX_ROWS}: worst row cos vs serial GEMV={worst:.9} {}",
-        p.name,
-        if pass { "PASS" } else { "FAIL" }
-    );
+    mma.fp8(g, p.x_dev, &p.w, None, outs[0], MAX_ROWS as u32, lowp, 0)?;
+    p.serial(g, ks, outs[1], MAX_ROWS)?;
+    rows_vs_serial(g, p, outs, "PREFILL-MMA", 0.99999)
+}
+
+/// Leg 4: the default FP8 prefill route (E4M3 activations per 128 values).
+fn prefill_default(
+    g: &dyn GpuBackend,
+    ks: &Kernels,
+    p: &Proj,
+    outs: [DevicePtr; 2],
+) -> Result<bool> {
+    let (Ok(quant), Ok(gemm)) = (
+        g.kernel("per_token_group_quant_fp8", "per_token_group_quant_fp8"),
+        g.kernel("fp8_gemm_t_blockscaled", "fp8_gemm_t_blockscaled"),
+    ) else {
+        println!("PREFILL-W8A8 {:7}: kernels not in this build SKIP", p.name);
+        return Ok(true);
+    };
+    let (n, k) = p.nk();
+    let a8 = g.alloc(MAX_ROWS * k)?;
+    let a_scale = g.alloc(MAX_ROWS * (k / 128) * 4)?;
+    let (m, n32, k32) = (MAX_ROWS as u32, n as u32, k as u32);
+    ops::per_token_group_quant_fp8(g, quant, p.x_dev, a8, a_scale, m, k32, 0)?;
+    ops::fp8_gemm_t_blockscaled(
+        g,
+        gemm,
+        a8,
+        a_scale,
+        p.w.weight,
+        p.w.row_scale,
+        outs[0],
+        m,
+        n32,
+        k32,
+        0,
+    )?;
+    p.serial(g, ks, outs[1], MAX_ROWS)?;
+    let pass = rows_vs_serial(g, p, outs, "PREFILL-W8A8", 0.998)?;
+    g.free(a8)?;
+    g.free(a_scale)?;
     Ok(pass)
 }
 
@@ -292,7 +362,8 @@ fn main() -> Result<()> {
         let outs = [g.alloc(MAX_ROWS * n * 2)?, g.alloc(MAX_ROWS * n * 2)?];
         pass &= accuracy(g, &ks, &p, outs[0])?;
         pass &= twin(g, &ks, &p, outs)?;
-        pass &= prefill(g, &ks, &p, outs)?;
+        pass &= prefill_bf16mma(g, &ks, &p, outs)?;
+        pass &= prefill_default(g, &ks, &p, outs)?;
         for ptr in outs.into_iter().chain([p.w.weight, p.w.row_scale, p.x_dev]) {
             g.free(ptr)?;
         }
