@@ -50,7 +50,12 @@ pub(super) struct ScoreBudget {
 /// Upper bound on a job's rows and sequences (a branch replays < one block).
 fn cost(job: &ScoreJob, block: usize) -> (usize, usize) {
     let head = usize::from(job.prefix.len() >= block);
-    let rows = job.prefix.len() + job.branches.iter().map(|b| b.len() + block - 1).sum::<usize>();
+    let rows = job.prefix.len()
+        + job
+            .branches
+            .iter()
+            .map(|b| b.len() + block - 1)
+            .sum::<usize>();
     (rows, head + job.branches.len())
 }
 
@@ -79,7 +84,11 @@ pub(super) fn run_jobs(model: &dyn Model, jobs: Vec<ScoreJob>, stream: u64, budg
 }
 
 /// Branch groups of `job` that each fit one pass (at least one branch each).
-fn split_branches(job: &ScoreJob, budget: &ScoreBudget, block: usize) -> Vec<std::ops::Range<usize>> {
+fn split_branches(
+    job: &ScoreJob,
+    budget: &ScoreBudget,
+    block: usize,
+) -> Vec<std::ops::Range<usize>> {
     let head = usize::from(job.prefix.len() >= block);
     let mut groups = Vec::new();
     let (mut lo, mut rows, mut streams) = (0, job.prefix.len(), head);
@@ -111,7 +120,9 @@ fn run_split(model: &dyn Model, job: ScoreJob, stream: u64, budget: &ScoreBudget
         match model.score_requests(std::slice::from_ref(&input), stream) {
             Ok(mut out) if out.len() == 1 => probs.append(&mut out[0]),
             Ok(_) => {
-                let _ = job.reply.send(Err("score: engine returned the wrong number of results".into()));
+                let _ = job.reply.send(Err(
+                    "score: engine returned the wrong number of results".into()
+                ));
                 return;
             }
             Err(e) => {
@@ -143,7 +154,11 @@ fn run_batch(model: &dyn Model, batch: Vec<ScoreJob>, stream: u64) {
         })
         .collect();
     let res = model.score_requests(&inputs, stream).and_then(|r| {
-        anyhow::ensure!(r.len() == n, "score: engine returned {} results for {n} jobs", r.len());
+        anyhow::ensure!(
+            r.len() == n,
+            "score: engine returned {} results for {n} jobs",
+            r.len()
+        );
         Ok(r)
     });
     drop(inputs);
@@ -195,15 +210,27 @@ mod tests {
 
     #[test]
     fn oversized_jobs_split_into_passes_that_fit() {
-        let budget = ScoreBudget { rows: 100, streams: 4 };
+        let budget = ScoreBudget {
+            rows: 100,
+            streams: 4,
+        };
         // prefix 40; each branch costs 10 + 15 = 25 rows: two fit per pass.
         let groups = split_branches(&job(40, &[10, 10, 10, 10, 10]), &budget, 16);
         assert_eq!(groups, vec![0..2, 2..4, 4..5]);
         // A single branch that is too big still gets its own pass.
-        assert_eq!(split_branches(&job(40, &[90, 10]), &budget, 16), vec![0..1, 1..2]);
+        assert_eq!(
+            split_branches(&job(40, &[90, 10]), &budget, 16),
+            vec![0..1, 1..2]
+        );
         // The stream budget splits too (head + 3 branches).
-        let tight = ScoreBudget { rows: 1000, streams: 4 };
-        assert_eq!(split_branches(&job(40, &[1; 5]), &tight, 16), vec![0..3, 3..5]);
+        let tight = ScoreBudget {
+            rows: 1000,
+            streams: 4,
+        };
+        assert_eq!(
+            split_branches(&job(40, &[1; 5]), &tight, 16),
+            vec![0..3, 3..5]
+        );
     }
 
     #[test]

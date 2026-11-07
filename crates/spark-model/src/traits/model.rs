@@ -321,11 +321,7 @@ pub trait Model: Send + Sync {
     /// return, per request and branch, the softmax over that branch's single
     /// option tokens at its last row. Nothing is sampled, decoded or cached.
     /// Default: unsupported.
-    fn score_requests(
-        &self,
-        _reqs: &[ScoreInput<'_>],
-        _stream: u64,
-    ) -> Result<Vec<Vec<Vec<f32>>>> {
+    fn score_requests(&self, _reqs: &[ScoreInput<'_>], _stream: u64) -> Result<Vec<Vec<Vec<f32>>>> {
         anyhow::bail!("this model does not support prefill-only scoring")
     }
 

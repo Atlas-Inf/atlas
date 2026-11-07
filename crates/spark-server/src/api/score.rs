@@ -67,7 +67,11 @@ pub fn validate(req: ScoreRequest, vocab_size: u32) -> Result<Validated, String>
     let prefix_bidir = match attention.as_deref() {
         None | Some("causal") => false,
         Some("prefix_bidir") => true,
-        Some(other) => return Err(format!("attention: {other:?} is not causal or prefix_bidir")),
+        Some(other) => {
+            return Err(format!(
+                "attention: {other:?} is not causal or prefix_bidir"
+            ));
+        }
     };
     if prefix_bidir && prefix.is_empty() {
         return Err("attention: prefix_bidir needs a non-empty prefix (the state block)".into());
@@ -96,7 +100,9 @@ pub fn validate(req: ScoreRequest, vocab_size: u32) -> Result<Validated, String>
         .chain(branches.iter().flatten())
         .chain(options.iter().flatten());
     if let Some(bad) = all.copied().find(|&t| t >= vocab_size) {
-        return Err(format!("token id {bad} out of range: vocab_size is {vocab_size}"));
+        return Err(format!(
+            "token id {bad} out of range: vocab_size is {vocab_size}"
+        ));
     }
     Ok((prefix, branches, options, prefix_bidir))
 }
@@ -114,10 +120,11 @@ pub async fn score(
             );
         }
     };
-    let (prefix, branches, options, prefix_bidir) = match validate(req, state.tokenizer.vocab_size()) {
-        Ok(v) => v,
-        Err(msg) => return openai_error_response(StatusCode::BAD_REQUEST, msg),
-    };
+    let (prefix, branches, options, prefix_bidir) =
+        match validate(req, state.tokenizer.vocab_size()) {
+            Ok(v) => v,
+            Err(msg) => return openai_error_response(StatusCode::BAD_REQUEST, msg),
+        };
     let Some(tx) = state.score_tx.clone() else {
         return openai_error_response(
             StatusCode::NOT_IMPLEMENTED,
@@ -165,9 +172,11 @@ mod tests {
 
     #[test]
     fn shared_options_expand_per_branch() {
-        let (p, b, o, bidir) =
-            validate(req(r#"{"prefix":[1,2],"branches":[[3],[4,5]],"options":[7,8]}"#), 10)
-                .unwrap();
+        let (p, b, o, bidir) = validate(
+            req(r#"{"prefix":[1,2],"branches":[[3],[4,5]],"options":[7,8]}"#),
+            10,
+        )
+        .unwrap();
         assert!(!bidir);
         assert_eq!(p, vec![1, 2]);
         assert_eq!(b.len(), 2);

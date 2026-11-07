@@ -90,7 +90,8 @@ impl TransformerModel {
                 let w = match cache.1.entry(t) {
                     std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                     std::collections::hash_map::Entry::Vacant(e) => {
-                        self.gpu.copy_d2h(head.offset(t as usize * h * 2), &mut buf)?;
+                        self.gpu
+                            .copy_d2h(head.offset(t as usize * h * 2), &mut buf)?;
                         e.insert(bf16_to_f32(&buf))
                     }
                 };
