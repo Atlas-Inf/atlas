@@ -108,3 +108,32 @@ fn attention_split_pin_covers_the_widest_verify_under_the_dense_lever() {
         assert_eq!(other.attn_split_ref_seqs(), 1);
     }
 }
+
+/// Native FP8 attention (`ATLAS_DENSE_NATIVE_FP8_ATTN`): every exact verify
+/// width is ONE `w8a16_gemv_batch4` launch (rows = serial `w8a16_gemv`), on
+/// NVIDIA and HIP alike, whatever the vl2 lever says; a missing batch4 leaves
+/// the per-row `w8a16_gemv` loop, which is serial decode itself.
+#[test]
+fn native_fp8_attention_verify_rows_are_the_serial_twin() {
+    use spark_runtime::gpu::KernelHandle;
+    let k = crate::layers::ops::Fp8RowsKernels {
+        batch4: KernelHandle(4),
+        batch8: KernelHandle(8),
+        batch8_dyn_vl2: KernelHandle(9),
+        batch8_dyn_vl2_n2: KernelHandle(10),
+        batch16: KernelHandle(16),
+    };
+    for rows in 2..=MAX_ROWS {
+        for (wide, vl2) in [(true, true), (true, false), (false, true), (false, false)] {
+            let plan = crate::layers::ops::fp8_rows_plan(rows, wide, vl2, k).unwrap();
+            assert_eq!(plan.len(), 1, "rows {rows}");
+            assert_eq!((plan[0].kernel.0, plan[0].div), (4, 4), "rows {rows}");
+            assert_eq!((plan[0].first, plan[0].rows), (0, rows));
+        }
+        let no_b4 = crate::layers::ops::Fp8RowsKernels {
+            batch4: KernelHandle(0),
+            ..k
+        };
+        assert!(crate::layers::ops::fp8_rows_plan(rows, true, true, no_b4).is_none());
+    }
+}

@@ -278,6 +278,10 @@ name = "verify_exact_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "attn_fp8_native_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "gdn_conv_kn_microtest"
 required-features = ["cuda", "gpu-examples"]
 

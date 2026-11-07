@@ -29,6 +29,7 @@
 //! | q/k norm, MRoPE, KV write, gate | per row | strided, per row | equal (text positions: MRoPE == RoPE) |
 //! | attention core | split-K from `max(max_batch, 1)` | from `max(max_batch, K)` | split count pinned to `max(max_batch, 4)` for both |
 //! | o_proj | `w4a16_gemv[_sw]` | `batch2/3`; 4 rows tile GEMM | 4 rows scalar `w4a16_gemv_batch4` |
+//! | attention q+gate, k, v, o (native FP8, `ATLAS_DENSE_NATIVE_FP8_ATTN`) | `w8a16_gemv` (+ `deinterleave_qg`) | one `w8a16_gemv_batch4`, M = K (`ops::fp8_rows_plan`) | equal (rows are `w8a16_gemv`'s bytes) |
 //! | dense FFN | `dual[_sw]` + SiLU + `gemv[_sw]` | `dual_batch2/3`, batchm 4 | scalar `w4a16_gemv_batch2/3/4` per projection |
 //! | residual/RMS norms, final norm | 1 row | `[K, h]`, one block a row | equal |
 //! | LM head (BF16) | `dense_gemv_bf16` | 2 rows `_batch2`; 3/4 tile GEMM | 3/4 rows `dense_gemv_bf16_batchm` |
