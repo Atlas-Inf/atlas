@@ -124,7 +124,11 @@ With `MOE_ROWS=1`, greedy DFlash output should match serial decode
 byte-for-byte. If it doesn't, compare the first diverging token's logits
 between the two runs.
 
-## Sliding-window KV eviction (`SWA_EVICT=1`)
+## Sliding-window KV eviction (`SWA_EVICT=1`, experimental)
+
+**Experimental:** startup, 524K capacity and short-prompt greedy output are
+verified on 2× GB10. Correctness past the ~8.4K-token slot-reclaim lag and the
+131K / 262K / 524K needle tests are not yet validated.
 
 The 39 sliding-window layers read only their last 128 tokens. With
 `ATLAS_SWA_EVICT=1` their K/V pools hold a per-sequence ring of slots

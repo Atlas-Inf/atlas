@@ -35,7 +35,7 @@ NUM_DRAFTS="${NUM_DRAFTS:-3}"
 if [ "$SPECULATIVE" = "1" ]; then
   EXTRA_FLAGS="--speculative --num-drafts $NUM_DRAFTS $EXTRA_FLAGS"
 fi
-# SWA_EVICT=1: the 39 sliding-window layers keep only a per-sequence ring of
+# SWA_EVICT=1 (experimental; deep-context correctness not yet validated): the 39 sliding-window layers keep only a per-sequence ring of
 # KV slots (ATLAS_SWA_EVICT), so --max-seq-len can grow past 65536. It drops
 # old sliding-window history, so prefix caching is turned off with it.
 SWA_EVICT="${SWA_EVICT:-0}"
