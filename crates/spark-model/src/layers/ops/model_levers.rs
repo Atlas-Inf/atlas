@@ -78,6 +78,12 @@ pub struct ModelLevers {
     /// with register dequant (`dense_bf16mma_prefill.cu`) where the target
     /// ships it. Opt-in.
     pub dense_prefill_bf16mma: bool,
+    /// Under `dense_prefill_bf16mma`: those kernels serve every row count,
+    /// not only prefill-sized ones (below 32 rows chat decode / verify
+    /// batches keep their small-M kernels). Not from the environment: a
+    /// score pass sets it on its own copy, so a request's rows take the same
+    /// kernels whether it runs alone or merged into a bigger pass.
+    pub dense_prefill_any_rows: bool,
 
     // ── Attention ──
     /// Contiguous-attention path for the DFlash head.
@@ -255,6 +261,7 @@ impl ModelLevers {
             moe_union_stats: opt_in("ATLAS_MOE_UNION_STATS"),
             moe_prefill_bf16mma: opt_in("ATLAS_MOE_PREFILL_BF16MMA"),
             dense_prefill_bf16mma: opt_in("ATLAS_DENSE_PREFILL_BF16MMA"),
+            dense_prefill_any_rows: false,
             dflash_contig_attn: opt_in("ATLAS_DFLASH_CONTIG_ATTN"),
             // Product installation also arms these. The explicit model-load
             // diagnostic lets a no-spec control use identical target arithmetic.

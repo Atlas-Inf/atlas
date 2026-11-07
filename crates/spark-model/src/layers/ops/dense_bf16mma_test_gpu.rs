@@ -133,12 +133,24 @@ fn dense_bf16mma_matches_exact_dequant_reference() -> Result<()> {
         Nvfp4::new(&mut rng, I, H, 0.05),
     );
     let (g_d, u_d, d_d) = (gate.upload(&gpu)?, up.upload(&gpu)?, down.upload(&gpu)?);
-    ensure!(kernels.serves_mlp([&g_d, &u_d, &d_d], [64, H as u32, I as u32]));
+    ensure!(kernels.serves_mlp(
+        [&g_d, &u_d, &d_d],
+        [64, H as u32, I as u32],
+        &crate::layers::ops::ModelLevers::defaults()
+    ));
     let grid: Vec<f32> = (0..H / 128)
         .flat_map(|nb| [0.001 * (1 + nb) as f32; I / 128])
         .collect();
     let (w8, w8_d) = fp8_weight(&mut rng, &gpu, H, I, &grid)?;
-    ensure!(fp8_scale_k_uniform(&gpu, &w8_d)? && kernels.serves_fp8(&w8_d, true, 64));
+    ensure!(
+        fp8_scale_k_uniform(&gpu, &w8_d)?
+            && kernels.serves_fp8(
+                &w8_d,
+                true,
+                64,
+                &crate::layers::ops::ModelLevers::defaults()
+            )
+    );
     let mut varying = grid.clone();
     varying[1] *= 2.0;
     let (_, w8_var) = fp8_weight(&mut rng, &gpu, H, I, &varying)?;

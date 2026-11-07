@@ -12,10 +12,12 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
+use super::ModelLevers;
 use crate::weight_map::{Fp8Weight, Fp8WeightTransposed, QuantizedWeight, WeightQuantFormat};
 
 const MODULE: &str = "dense_bf16mma_prefill";
-/// Fewer rows are decode / verify batches; they keep their small-M kernels.
+/// Fewer rows are decode / verify batches; they keep their small-M kernels,
+/// except in a score pass (`ModelLevers::dense_prefill_any_rows`).
 const MIN_ROWS: u32 = 32;
 /// Rows per CTA chunk (`DB_ROWS`; the low-precision kernels `DL_ROWS`).
 const ROWS: u32 = 64;
@@ -120,6 +122,12 @@ fn chunks(m: u32, tiles: u32, slots: u32, rows: u32, fixed: u32) -> u32 {
     (m.div_ceil(rows)..=m.div_ceil(16))
         .min_by_key(|&c| (tiles * c).div_ceil(slots) * (fixed + m.div_ceil(c).div_ceil(8)))
         .unwrap_or(1)
+}
+
+/// Whether these kernels take an `m`-row launch: prefill-sized, or any
+/// non-empty one in a score pass.
+fn rows_ok(m: u32, levers: &ModelLevers) -> bool {
+    m >= MIN_ROWS || (m > 0 && levers.dense_prefill_any_rows)
 }
 
 /// A transposed NVFP4 table this kernel reads: scalar tensor scale, shapes
@@ -259,8 +267,9 @@ impl DenseBf16mma {
         &self,
         [gate, up, down]: [&QuantizedWeight; 3],
         [m, h, inter]: [u32; 3],
+        levers: &ModelLevers,
     ) -> bool {
-        m >= MIN_ROWS
+        rows_ok(m, levers)
             && self.gate_up.0 != 0
             && self.nvfp4.0 != 0
             && nvfp4_ok(gate, inter, h, GATE_UP_FEATURES)
@@ -325,8 +334,13 @@ impl DenseBf16mma {
     }
 
     /// Whether `nvfp4` serves `m` rows of an `[n, k]` transposed NVFP4 table.
-    pub fn serves_nvfp4(&self, w: &QuantizedWeight, [m, n, k]: [u32; 3]) -> bool {
-        m >= MIN_ROWS && self.nvfp4.0 != 0 && nvfp4_ok(w, n, k, FEATURES)
+    pub fn serves_nvfp4(
+        &self,
+        w: &QuantizedWeight,
+        [m, n, k]: [u32; 3],
+        levers: &ModelLevers,
+    ) -> bool {
+        rows_ok(m, levers) && self.nvfp4.0 != 0 && nvfp4_ok(w, n, k, FEATURES)
     }
 
     /// `out[m, n] = input[m, k] · wᵀ` for a transposed NVFP4 table.
@@ -375,8 +389,8 @@ impl DenseBf16mma {
     /// Whether `fp8` serves `m` rows of this weight: kernel shipped, shapes
     /// tile, and the block-scale grid is constant along K (`k_uniform`, see
     /// [`fp8_scale_k_uniform`]).
-    pub fn serves_fp8(&self, w: &Fp8Weight, k_uniform: bool, m: u32) -> bool {
-        m >= MIN_ROWS
+    pub fn serves_fp8(&self, w: &Fp8Weight, k_uniform: bool, m: u32, levers: &ModelLevers) -> bool {
+        rows_ok(m, levers)
             && self.fp8.0 != 0
             && k_uniform
             && w.scale_format == WeightQuantFormat::Fp8BlockScaled

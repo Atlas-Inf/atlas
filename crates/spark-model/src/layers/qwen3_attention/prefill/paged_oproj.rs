@@ -259,10 +259,10 @@ impl Qwen3AttentionLayer {
                 )?;
             }
         } else if let Some(ref nvfp4_t) = self.o_nvfp4_t {
-            if self.nvfp4_proj_m128(nvfp4_t, [n, h, nq * hd]) {
+            if self.nvfp4_proj_m128(nvfp4_t, [n, h, nq * hd], ctx.levers) {
                 self.w4a16_gemm_m128_dispatch(
                     ctx.gpu,
-                    ctx.dispatch,
+                    (ctx.dispatch, ctx.levers),
                     crate::layers::ops::LowpArgs {
                         group: crate::layers::ops::LowpMix::ATTN_O,
                         codes: ctx.buffers.ffn_act_a(),

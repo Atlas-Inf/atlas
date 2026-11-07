@@ -325,6 +325,12 @@ impl TransformerModel {
             z_stride: self.config.ssm_qkvz_size(),
             total_len: total,
         };
+        // The dense BF16-MMA kernels at every row count, so a request's
+        // rows take the same kernels alone as merged into a bigger pass.
+        let levers = crate::layers::ops::ModelLevers {
+            dense_prefill_any_rows: true,
+            ..self.levers
+        };
         let ctx = ForwardContext {
             ssm_batch: None,
             buffers: &self.buffers,
@@ -332,7 +338,7 @@ impl TransformerModel {
             config: &self.config,
             dispatch: &self.dispatch,
             derived: &self.derived,
-            levers: &self.levers,
+            levers: &levers,
             stats: &self.stats,
             attn_metadata: None,
             profile: self.profile,

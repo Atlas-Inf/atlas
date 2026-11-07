@@ -45,7 +45,9 @@ impl Qwen3SsmLayer {
         };
         let Some(w) = w else { return Ok(false) };
         if !(ctx.levers.dense_prefill_bf16mma
-            && self.bf16mma.serves_fp8(w, self.bf16mma_fp8_ok[slot], rows))
+            && self
+                .bf16mma
+                .serves_fp8(w, self.bf16mma_fp8_ok[slot], rows, ctx.levers))
         {
             return Ok(false);
         }

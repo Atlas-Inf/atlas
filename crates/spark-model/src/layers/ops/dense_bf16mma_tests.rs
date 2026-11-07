@@ -1,8 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `chunks` unit tests.
+//! `chunks` and row-eligibility unit tests.
 
-use super::{CTA_FIXED, LOWP_ROWS, ROWS, WS_FIXED, WS_TILE_ROWS, chunks};
+use super::{CTA_FIXED, LOWP_ROWS, ModelLevers, ROWS, WS_FIXED, WS_TILE_ROWS, chunks, rows_ok};
+
+#[test]
+fn score_passes_take_these_kernels_at_every_row_count() {
+    // Chat: decode / verify batches below 32 rows keep their kernels.
+    let chat = ModelLevers::defaults();
+    assert!(!rows_ok(31, &chat) && rows_ok(32, &chat));
+    // A score pass: one row or a thousand, the same kernels.
+    let score = ModelLevers {
+        dense_prefill_any_rows: true,
+        ..chat
+    };
+    assert!(rows_ok(1, &score) && rows_ok(31, &score) && !rows_ok(0, &score));
+}
 
 #[test]
 fn chunks_stay_within_the_kernel_tile_and_fill_short_grids() {

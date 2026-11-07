@@ -30,7 +30,9 @@ impl DenseFfnLayer {
         if !ctx.levers.dense_prefill_bf16mma
             || !matches!(self.activation, FfnActivation::SiLU)
             || self.lora.is_some()
-            || !self.bf16mma.serves_mlp([gate, up, down], [m, h, inter])
+            || !self
+                .bf16mma
+                .serves_mlp([gate, up, down], [m, h, inter], ctx.levers)
         {
             return Ok(false);
         }

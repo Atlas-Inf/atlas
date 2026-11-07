@@ -22,14 +22,18 @@ impl Qwen3AttentionLayer {
         &self,
         w: &crate::weight_map::QuantizedWeight,
         mnk: [u32; 3],
+        levers: &crate::layers::ops::ModelLevers,
     ) -> bool {
-        mnk[0] > 128 || self.bf16mma.serves_nvfp4(w, mnk)
+        mnk[0] > 128 || self.bf16mma.serves_nvfp4(w, mnk, levers)
     }
 
     pub(crate) fn w4a16_gemm_m128_dispatch(
         &self,
         gpu: &dyn GpuBackend,
-        dispatch: &crate::layers::ops::GemmDispatch,
+        (dispatch, levers): (
+            &crate::layers::ops::GemmDispatch,
+            &crate::layers::ops::ModelLevers,
+        ),
         lowp: crate::layers::ops::LowpArgs,
         input: DevicePtr,
         weight: &crate::weight_map::QuantizedWeight,
@@ -44,7 +48,7 @@ impl Qwen3AttentionLayer {
         // A/B). Resolved once per model into `GemmDispatch`, which the forward
         // pass already carries.
         // ATLAS_DENSE_PREFILL_BF16MMA (the handles exist only with the lever).
-        if self.bf16mma.serves_nvfp4(weight, [m, n, k]) {
+        if self.bf16mma.serves_nvfp4(weight, [m, n, k], levers) {
             return self
                 .bf16mma
                 .nvfp4(gpu, input, weight, output, [m, n, k], lowp, stream);
