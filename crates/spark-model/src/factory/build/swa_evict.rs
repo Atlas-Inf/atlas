@@ -7,7 +7,9 @@
 //! token against ~27 KiB for the 9 full-attention layers). With eviction on,
 //! those layers' pools hold a per-sequence ring of slots
 //! (`PagedKvCache::new_with_swa_slots`) and the budget buys blocks for the
-//! full-attention layers only.
+//! full-attention layers only. With prefix caching on, the last blocks of up
+//! to `ATLAS_SWA_PREFIX_TAILS` finished prompts keep their slots so the next
+//! turn resumes from the cached prefix (`kv_cache/swa_pins.rs`).
 
 use anyhow::{Result, ensure};
 use atlas_core::config::{LayerType, ModelConfig};
@@ -16,6 +18,28 @@ use spark_runtime::kv_cache::{KvCacheConfig, SwaSlotPlan};
 /// Rows past one prefill chunk a sequence may write before its lagging slots
 /// are reclaimed: a speculative verify block plus rollback.
 const SPEC_ROWS: usize = 64;
+
+/// Rows a pinned prompt tail keeps past the window: a next turn whose match
+/// ends a few blocks before the previous prompt's end (a re-rendered
+/// generation prompt) still resumes from it.
+const TAIL_SLACK_ROWS: usize = 64;
+
+/// `ATLAS_SWA_PREFIX_TAILS`: prompt-end tails kept for prefix reuse. Required
+/// with prefix caching; each costs `tail_blocks` slots in every slotted layer.
+fn prefix_tails() -> Result<usize> {
+    let raw = std::env::var("ATLAS_SWA_PREFIX_TAILS").map_err(|_| {
+        anyhow::anyhow!(
+            "ATLAS_SWA_EVICT=1 with --enable-prefix-caching needs \
+             ATLAS_SWA_PREFIX_TAILS=<n>: how many prompt-end sliding-window tails \
+             stay resident for reuse"
+        )
+    })?;
+    let tails: usize = raw
+        .parse()
+        .map_err(|e| anyhow::anyhow!("ATLAS_SWA_PREFIX_TAILS={raw:?}: {e}"))?;
+    ensure!(tails > 0, "ATLAS_SWA_PREFIX_TAILS must be positive");
+    Ok(tails)
+}
 
 pub(super) fn plan(
     config: &ModelConfig,
@@ -35,11 +59,6 @@ pub(super) fn plan(
         config.model_type
     );
     ensure!(
-        !prefix_cache_active,
-        "ATLAS_SWA_EVICT=1 drops sliding-window history that prefix reuse needs; \
-         run without --enable-prefix-caching"
-    );
-    ensure!(
         !hss_active,
         "ATLAS_SWA_EVICT=1 is incompatible with --high-speed-swap"
     );
@@ -54,11 +73,19 @@ pub(super) fn plan(
         !layers.is_empty() && config.sliding_window > 0,
         "ATLAS_SWA_EVICT=1: the model has no sliding-window layers"
     );
-    let rows = config.sliding_window as usize + max_batch_tokens + SPEC_ROWS;
+    let window = config.sliding_window as usize;
+    let rows = window + max_batch_tokens + SPEC_ROWS;
     Ok(Some(SwaSlotPlan {
         layers,
         lag_blocks: rows.div_ceil(kv.block_size) + 1,
         sequences: max_batch_size,
+        window_blocks: window.div_ceil(kv.block_size),
+        prefix_tails: if prefix_cache_active {
+            prefix_tails()?
+        } else {
+            0
+        },
+        tail_blocks: (window + TAIL_SLACK_ROWS).div_ceil(kv.block_size),
     }))
 }
 
@@ -79,9 +106,11 @@ pub(super) fn blocks(
     ensure!(per_block > 0, "KV cache block size is zero");
     let blocks = (budget - pools) / per_block;
     tracing::info!(
-        "SWA eviction: {:.2} GB slot pools ({} slots/layer), {} B/token in the block pool",
+        "SWA eviction: {:.2} GB slot pools ({} slots/layer, {} pinned prefix tails), \
+         {} B/token in the block pool",
         pools as f64 / (1u64 << 30) as f64,
         plan.capacity(),
+        plan.prefix_tails,
         per_block / kv.block_size
     );
     Ok(blocks)

@@ -35,15 +35,24 @@ NUM_DRAFTS="${NUM_DRAFTS:-3}"
 if [ "$SPECULATIVE" = "1" ]; then
   EXTRA_FLAGS="--speculative --num-drafts $NUM_DRAFTS $EXTRA_FLAGS"
 fi
-# SWA_EVICT=1 (experimental; deep-context correctness not yet validated): the 39 sliding-window layers keep only a per-sequence ring of
-# KV slots (ATLAS_SWA_EVICT), so --max-seq-len can grow past 65536. It drops
-# old sliding-window history, so prefix caching is turned off with it.
+# SWA_EVICT=1 (experimental; validated on the fork at 62ef5e27, not yet on
+# upstream): the 39 sliding-window layers keep only a per-sequence ring of
+# KV slots (ATLAS_SWA_EVICT), so --max-seq-len can grow past 65536. Prefix
+# caching stays on: the last 12 blocks (window + 64 rows) of up to
+# SWA_PREFIX_TAILS finished prompts keep their sliding-window slots (~38 MB
+# each on MiMo), so the next turn resumes from the previous prompt's end.
+# SWA_PREFIX_TAILS=0 turns prefix caching off instead.
 SWA_EVICT="${SWA_EVICT:-0}"
+SWA_PREFIX_TAILS="${SWA_PREFIX_TAILS:-32}"
 PREFIX_CACHE_FLAG="--enable-prefix-caching"
 SWA_EVICT_ENV=""
 if [ "$SWA_EVICT" = "1" ]; then
-  PREFIX_CACHE_FLAG=""
   SWA_EVICT_ENV="-e ATLAS_SWA_EVICT=1"
+  if [ "$SWA_PREFIX_TAILS" = "0" ]; then
+    PREFIX_CACHE_FLAG=""
+  else
+    SWA_EVICT_ENV="$SWA_EVICT_ENV -e ATLAS_SWA_PREFIX_TAILS=$SWA_PREFIX_TAILS"
+  fi
 fi
 # MOE_ROWS=1: row-exact verify (ATLAS_MOE_ROWS_DECODE): each verify row runs the
 # serial FFN arithmetic with one EP all-reduce per layer. Defaults on with DFLASH=1

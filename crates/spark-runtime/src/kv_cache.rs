@@ -483,6 +483,7 @@ mod placement;
 mod release;
 mod sparse_index;
 mod sparse_index_impl;
+mod swa_pins;
 mod swa_slots;
 mod tail_slots;
 mod zero_impl;

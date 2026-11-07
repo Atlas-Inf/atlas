@@ -175,7 +175,7 @@ impl TransformerModel {
         // established per-stream path. Once admitted, Phase A consumes these
         // reservations instead of walking the cache again.
         let reserved_prefix_matches =
-            match self.prefill_b_reserve_batched_prefix_matches(streams, kv_cache.block_size()) {
+            match self.prefill_b_reserve_batched_prefix_matches(streams, &mut kv_cache) {
                 Some(matches) => matches,
                 None => return Ok(KernelBatchResult::NotAdmitted),
             };

@@ -218,7 +218,11 @@ impl TransformerModel {
             seq.adapter_id,
         );
         if !seq.block_table.is_empty() {
-            self.kv_cache.lock().free_blocks(&seq.block_table);
+            let mut kv_cache = self.kv_cache.lock();
+            let owned = seq.cached_prefix_blocks.min(seq.block_table.len());
+            kv_cache.release_swa_slots(&seq.block_table[owned..]);
+            kv_cache.free_blocks(&seq.block_table);
+            drop(kv_cache);
             seq.block_table.clear();
         }
 

@@ -12,8 +12,9 @@ impl TransformerModel {
     pub(in crate::model) fn prefill_b_reserve_batched_prefix_matches(
         &self,
         streams: &[PrefillSlice<'_>],
-        block_size: usize,
+        kv_cache: &mut PagedKvCache,
     ) -> Option<Vec<PrefixMatch>> {
+        let block_size = kv_cache.block_size();
         if !self.prefix_cache.is_active() || streams.first()?.chunk_start != 0 {
             return Some(Vec::new());
         }
@@ -42,12 +43,13 @@ impl TransformerModel {
                 self.release_batched_prefix_reservations(streams, &matches, block_size);
                 return None;
             }
-            matches.push(self.prefix_cache.lookup_whole_blocks(
+            let found = self.prefix_cache.lookup_whole_blocks(
                 slice.prompt_tokens,
                 block_size,
                 seq.session_hash,
                 seq.adapter_id,
-            ));
+            );
+            matches.push(self.swa_cap_prefix_match(slice.prompt_tokens, seq, found, kv_cache));
         }
 
         // Hybrid-SSM models: a WARM prefix match implies a KV/Marconi skip

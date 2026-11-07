@@ -138,11 +138,21 @@ end. The block pool then pays only for the 9 full-attention layers, so
 `--max-seq-len` can go well past 65536.
 
 ```bash
-SWA_EVICT=1 MAX_SEQ_LEN=131072 bash scripts/start-mimo-ep2.sh   # drops --enable-prefix-caching
+SWA_EVICT=1 MAX_SEQ_LEN=131072 bash scripts/start-mimo-ep2.sh
 ```
 
-Prefix caching is off under eviction (evicted history can't be reused). A
-`sliding-window KV slots exhausted` error means a step wrote more rows than the lag
+Prefix caching stays on under eviction (`kv_cache/swa_pins.rs`). When a
+prompt finishes prefill, its last `ceil((128 + 64) / 16) = 12` whole blocks
+keep their sliding-window slots (~38 MB on MiMo) in an LRU of
+`ATLAS_SWA_PREFIX_TAILS` tails (launcher: `SWA_PREFIX_TAILS`, default 32).
+A lookup is capped to the deepest block whose 128-row window is still
+resident, before the ranks agree on a match, so the next turn resumes at the
+previous prompt's end (or up to 64 rows short of it) and prefills only the
+reply and the new message. Without a resident tail it falls back to a full
+prefill. A sequence releases only the slots it lent; blocks taken from the
+cache keep theirs. `SWA_PREFIX_TAILS=0` turns prefix caching off.
+
+A `sliding-window KV slots exhausted` error means a step wrote more rows than the lag
 covers (prefill chunk > `--max-batch-tokens`).
 
 ## Known risk areas to watch

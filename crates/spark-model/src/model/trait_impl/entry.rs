@@ -40,6 +40,7 @@ impl TransformerModel {
 
         (|| {
             let logits = self.prefill_dispatch(tokens, seq, stream)?;
+            self.pin_swa_prompt_tail(seq);
             // Ported from Enntity/atlas e7d4e1a (AGPL-3.0-only).
             self.try_mtp_prompt_absorb(seq, tokens, stream);
             self.try_eager_drafter_prefill(seq, true, stream)?;
@@ -79,6 +80,9 @@ impl TransformerModel {
                 is_last_chunk,
                 stream,
             )?;
+            if is_last_chunk {
+                self.pin_swa_prompt_tail(seq);
+            }
             self.try_mtp_prompt_absorb(seq, tokens, stream);
             self.try_eager_drafter_prefill(seq, is_last_chunk, stream)?;
             // The prompt is in: its pixels are done (`SeqVision::items`).
@@ -105,6 +109,7 @@ impl TransformerModel {
 
         (|| {
             let logits = self.prefill_twophase_dispatch(tokens, seq, chunk_size, stream)?;
+            self.pin_swa_prompt_tail(seq);
             self.try_mtp_prompt_absorb(seq, tokens, stream);
             self.try_eager_drafter_prefill(seq, true, stream)?;
             Ok(logits)

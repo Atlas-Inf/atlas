@@ -63,12 +63,13 @@ impl TransformerModel {
                 // NVMe spill tier: page the on-disk continuation back in so
                 // the resident-only lookup below sees it (no-op when off).
                 self.nvme_restore_prefix(key_tokens, seq, kv_cache, stream);
-                self.prefix_cache.lookup_whole_blocks(
+                let found = self.prefix_cache.lookup_whole_blocks(
                     key_tokens,
                     bs,
                     seq.session_hash,
                     seq.adapter_id,
-                )
+                );
+                self.swa_cap_prefix_match(key_tokens, seq, found, kv_cache)
             };
             // F83 (2026-04-30): on EP>1, head and worker have
             // independent local prefix caches whose match counts can

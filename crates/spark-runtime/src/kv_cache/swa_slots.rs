@@ -7,10 +7,13 @@
 //! lent to each freshly allocated block and reclaimed once the block falls
 //! more than `lag_blocks` behind its sequence's newest block. Kernels
 //! translate `physical block -> slot` through a device map (`u32[num_blocks]`).
-//! The evicted history is gone, so slotted layers cannot serve prefix reuse.
+//! The evicted history is gone, so a cached prefix is reusable only where the
+//! blocks its end reads still hold slots: the prompt-end tails the prefix
+//! cache pins (`swa_pins.rs`).
 
 use anyhow::{Result, ensure};
 
+use super::swa_pins::SwaPins;
 use super::tail_slots::{TailSlotPlan, TailSlots};
 use super::{KvCacheConfig, KvPlacement, PagedKvCache};
 use crate::gpu::{DevicePtr, GpuBackend};
@@ -26,6 +29,13 @@ pub struct SwaSlotPlan {
     pub lag_blocks: usize,
     /// Sequences that can hold slots at once.
     pub sequences: usize,
+    /// Blocks a slotted layer reads behind a position (its window).
+    pub window_blocks: usize,
+    /// Prompt-end tails the prefix cache may keep slotted; 0 = no reuse.
+    pub prefix_tails: usize,
+    /// Blocks per pinned tail: the window plus slack for a next turn whose
+    /// match ends a little short of the previous prompt's end.
+    pub tail_blocks: usize,
 }
 
 impl SwaSlotPlan {
@@ -36,9 +46,10 @@ impl SwaSlotPlan {
         }
     }
 
-    /// Slots per slotted layer.
+    /// Slots per slotted layer: every sequence's lent ring plus the pinned
+    /// tails (a pinned block may outlive the sequence that lent it).
     pub fn capacity(&self) -> usize {
-        self.slot_plan().capacity()
+        self.slot_plan().capacity() + self.prefix_tails * self.tail_blocks
     }
 
     pub fn holds(&self, layer: usize) -> bool {
@@ -66,6 +77,25 @@ impl SwaSlotPlan {
 pub(super) struct SwaSlots {
     layers: Vec<bool>,
     pub(super) slots: TailSlots,
+    pub(super) pins: SwaPins,
+    pub(super) window_blocks: usize,
+}
+
+impl SwaSlots {
+    /// Return `block`'s slot, unless a pinned tail holds it: the last unpin
+    /// returns it then.
+    fn release(&mut self, block: u32) {
+        if !self.pins.park(block) {
+            self.slots.release(block);
+        }
+    }
+
+    /// `block` went back on the free list: no pin holds it (a pin holds a
+    /// reference), so its slot goes too.
+    pub(super) fn release_freed(&mut self, block: u32) {
+        self.pins.forget(block);
+        self.slots.release(block);
+    }
 }
 
 impl PagedKvCache {
@@ -94,14 +124,29 @@ impl PagedKvCache {
             placement,
             Some(plan),
         )?;
-        let mut slots = TailSlots::new(num_blocks, plan.slot_plan(), gpu, &cache.placement)?;
+        let mut slots = TailSlots::new(
+            num_blocks,
+            plan.slot_plan(),
+            plan.capacity(),
+            gpu,
+            &cache.placement,
+        )?;
         slots.label = "sliding-window KV";
-        cache.swa = Some(SwaSlots { layers, slots });
+        let pins = SwaPins::new(num_blocks, plan.prefix_tails, plan.tail_blocks);
+        cache.swa = Some(SwaSlots {
+            layers,
+            slots,
+            pins,
+            window_blocks: plan.window_blocks,
+        });
         tracing::info!(
-            "KV cache: {} sliding-window layers slotted ({} slots each, lag {} blocks)",
+            "KV cache: {} sliding-window layers slotted ({} slots each, lag {} blocks, \
+             {} prefix tails of {} blocks)",
             plan.layers.len(),
             plan.capacity(),
-            plan.lag_blocks
+            plan.lag_blocks,
+            plan.prefix_tails,
+            plan.tail_blocks
         );
         Ok(cache)
     }
@@ -137,11 +182,33 @@ impl PagedKvCache {
     }
 
     /// Reclaim slots of blocks lagging more than `lag_blocks` behind
-    /// `newest_block` (a logical index into `block_table`). Published with
-    /// the next [`Self::lend_swa_slots`].
-    pub fn release_lagging_swa_slots(&mut self, block_table: &[u32], newest_block: usize) {
+    /// `newest_block` (a logical index into `block_table`). Only blocks from
+    /// `owned_from` on are this sequence's to release: the ones before it came
+    /// from the prefix cache, lent by another sequence. Published with the
+    /// next [`Self::lend_swa_slots`].
+    pub fn release_lagging_swa_slots(
+        &mut self,
+        block_table: &[u32],
+        newest_block: usize,
+        owned_from: usize,
+    ) {
         if let Some(swa) = self.swa.as_mut() {
-            swa.slots.release_lagging(block_table, newest_block);
+            let owned = &block_table[owned_from.min(block_table.len())..];
+            for i in swa
+                .slots
+                .lagging(owned.len(), newest_block.saturating_sub(owned_from))
+            {
+                swa.release(owned[i]);
+            }
+        }
+    }
+
+    /// A departing sequence returns the slots of the blocks it lent: a block
+    /// the prefix cache keeps is never read through them again unless a
+    /// pinned tail holds it.
+    pub fn release_swa_slots(&mut self, owned_blocks: &[u32]) {
+        if let Some(swa) = self.swa.as_mut() {
+            owned_blocks.iter().for_each(|&block| swa.release(block));
         }
     }
 }
@@ -171,8 +238,19 @@ mod tests {
             layers: vec![1, 2],
             lag_blocks: 10,
             sequences: 2,
+            window_blocks: 2,
+            prefix_tails: 0,
+            tail_blocks: 3,
         };
         assert_eq!(plan.capacity(), 24);
+        assert_eq!(
+            SwaSlotPlan {
+                prefix_tails: 4,
+                ..plan.clone()
+            }
+            .capacity(),
+            36
+        );
         let wide = cfg.k_block_bytes_for_layer(1) + cfg.v_block_bytes_for_layer(1);
         let narrow = cfg.k_block_bytes_for_layer(0) + cfg.v_block_bytes_for_layer(0);
         assert_eq!(plan.pool_bytes(&cfg), 2 * wide * 24);
