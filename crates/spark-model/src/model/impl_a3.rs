@@ -261,12 +261,14 @@ impl TransformerModel {
                     stream,
                 )?;
             }
-        } else if self.levers.mamba_verify_exact
+        } else if (self.levers.mamba_verify_exact
+            || num_tokens > 8 && self.levers.dense_exact_rows(num_tokens as usize))
             && self.w4a16_gemv_batch16_kernel.0 != 0
             && let Some(ref nvfp4) = self.lm_head_nvfp4
         {
-            // Exact-verify LM head (omni, K-row verify): chunked
-            // w4a16_gemv_batchm at <=16 rows per call. The batchm twin is
+            // Exact-verify LM head (omni, K-row verify; the dense
+            // ATLAS_EXACT_VERIFY's 9..=16-row DFlash K=γ verify, one chunk):
+            // chunked w4a16_gemv_batchm at <=16 rows per call. The batchm twin is
             // byte-identical to the serial w4a16 GEMV decode uses (proven at
             // shared-expert dims; covered here at lm-head dims by
             // lmhead_batchm_identical_to_serial). Chunking is result-free.

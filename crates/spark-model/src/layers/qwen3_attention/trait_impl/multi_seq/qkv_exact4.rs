@@ -3,6 +3,10 @@
 //! The 4-row (K=4 verify) NVFP4 Q/K/V projections under an exact verify
 //! (`ATLAS_QWEN4EXP_EXACT_VERIFY=1` / `ATLAS_EXACT_VERIFY=1`,
 //! `ModelLevers::exact_verify`),
+//! the dense lever's 5..=16-row DFlash K=γ verify (`ATLAS_EXACT_VERIFY=1`
+//! beside a DFlash drafter: Q+gate in `w4a16_gemv_qg_batch4` chunks, the
+//! last 1..3 rows `w4a16_gemv_qg[_batch2/3]`; K/V one scalar
+//! `W4a16BatchmTiers::exact_kernel` launch each, batch16 past 8 rows),
 //! and every width from 4 rows up under the exact batching lane
 //! (`ATLAS_QWEN4EXP_BATCH_FAST=1`, `model/qwen4exp_batch_fast.rs`): there the
 //! Q+gate rows run `w4a16_gemv_qg_batch4/3/2` (or `w4a16_gemv_qg`) in chunks
@@ -60,9 +64,11 @@ impl Qwen3AttentionLayer {
             return Ok(false);
         };
         // 2 and 3 rows: the qg_batch2/3 arms and their exact K/V already are
-        // serial decode's arithmetic.
+        // serial decode's arithmetic. 5..=16 rows: the dense lever's DFlash
+        // K=γ verify (`ModelLevers::dense_exact_rows`).
         let lane = fwd.levers.qwen4exp_batch_fast && n >= 4;
-        if !(lane || fwd.levers.exact_verify && n == 4) {
+        let dense_wide = n > 4 && fwd.levers.dense_exact_rows(n);
+        if !(lane || dense_wide || fwd.levers.exact_verify && n == 4) {
             return Ok(false);
         }
         let kv_dim = nkv * hd;
@@ -186,8 +192,18 @@ impl Qwen3AttentionLayer {
         if batch4.0 != 0 {
             let k_scratch = fwd.buffers.attn_output();
             let v_scratch = k_scratch.offset(n * kv_bytes);
-            // The widest scalar tier (batch16 past 8 rows, else 8 or 4) a launch.
+            // The widest scalar tier (batch16 past 8 rows, else 8 or 4) a
+            // launch; the dense K=γ verify's rows in one exact launch.
+            let wide_exact = self
+                .w4a16_batchm
+                .exact_kernel(n as u32, self.w4a16_gemv_batch16_k);
             for (w, out) in [(k_nvfp4, k_scratch), (v_nvfp4, v_scratch)] {
+                if dense_wide && wide_exact.0 != 0 {
+                    ops::w4a16_gemv_batchm(
+                        fwd.gpu, wide_exact, normed, w, out, n as u32, kv_dim, h as u32, stream,
+                    )?;
+                    continue;
+                }
                 self.wide_rows.w4a16_rows(
                     fwd.gpu,
                     &self.w4a16_batchm,

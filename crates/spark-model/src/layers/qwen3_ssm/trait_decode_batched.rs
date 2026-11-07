@@ -1460,7 +1460,7 @@ impl Qwen3SsmLayer {
                 (2 * h) as u32,
                 stream,
             )?;
-        } else if (4..=8).contains(&num_tokens)
+        } else if ((4..=8).contains(&num_tokens) || ctx.levers.dense_exact_rows(num_tokens))
             && self
                 .ffn
                 .try_forward_km(normed2_base, num_tokens as u32, ctx, stream)
@@ -1468,8 +1468,9 @@ impl Qwen3SsmLayer {
                 .unwrap_or(false)
         {
             // K=4..8 verify FFN via batched GEMV (batch4 M<=4, batch8
-            // M=5..8): one weight read per projection for all rows at
-            // near-peak stream bandwidth. nsys (2026-07-18): the
+            // M=5..8; under ATLAS_EXACT_VERIFY beside a DFlash drafter the
+            // K=γ rows to 16 too, row-exact): one weight read per projection
+            // for all rows at near-peak stream bandwidth. nsys (2026-07-18): the
             // forward_prefill MMQ arm below cost 54.8 ms/verify-step across
             // the 64-layer dense FFN stack at M=4 vs the ~31 ms
             // weight-traffic floor this path hits. Falls through to

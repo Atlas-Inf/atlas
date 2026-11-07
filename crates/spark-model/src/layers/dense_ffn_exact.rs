@@ -8,9 +8,11 @@
 //! `w4a16_gemv[_sw]`: every projection row is `w4a16_gemv`'s bytes. The
 //! verify's 2/3-row arms read gate+up with `w4a16_gemv_dual_batch2/3`, a
 //! different accumulation (~1 output in 1000 a BF16 ULP off), and the 4..8
-//! row arm may take a tensor-core or DP4A tier. Here every projection runs
-//! the scalar `w4a16_gemv_batch2/3` / `w4a16_gemv_batchN` template, whose row
-//! `r` is `w4a16_gemv` on row `r` with the weight read once for all rows
+//! row arm may take a tensor-core or DP4A tier, and 9..=16 rows (a DFlash
+//! K=γ verify) the `forward_prefill` tile GEMMs. Here every projection runs
+//! the scalar `w4a16_gemv_batch2/3` / `w4a16_gemv_batchN` template (batch16
+//! past 8 rows, `W4a16BatchmTiers::exact_kernel`), whose row `r` is
+//! `w4a16_gemv` on row `r` with the weight read once for all rows
 //! (`examples/w4a16_batch_bitparity_microtest.rs`).
 
 use anyhow::Result;
@@ -38,9 +40,11 @@ impl DenseFfnLayer {
             && !ctx.levers.decode_ffn_via_gemm
     }
 
-    /// `m` (2..=8) verify rows of `input` through the FFN into `moe_output`,
-    /// each row serial decode's bytes. `Ok(false)`, nothing launched, when
-    /// the dense exact verify is off or serial decode takes another arm.
+    /// `m` verify rows of `input` through the FFN into `moe_output`, each row
+    /// serial decode's bytes: 2..=8 rows, or up to the lever's widest verify
+    /// (`ModelLevers::dense_exact_rows`, 16 beside a DFlash drafter).
+    /// `Ok(false)`, nothing launched, when the dense exact verify is off or
+    /// serial decode takes another arm.
     pub(super) fn forward_rows_exact(
         &self,
         input: DevicePtr,
@@ -49,12 +53,12 @@ impl DenseFfnLayer {
         stream: u64,
     ) -> Result<bool> {
         if !ctx.levers.dense_exact_verify()
-            || !(2..=8).contains(&m)
+            || !((2..=8).contains(&m) || ctx.levers.dense_exact_rows(m as usize))
             || !self.serial_is_plain_nvfp4(ctx)
         {
             return Ok(false);
         }
-        let tier = self.w4a16_batchm.scalar_kernel(m);
+        let tier = self.w4a16_batchm.exact_kernel(m, self.w4a16_gemv_batch16);
         if m > 3 && tier.0 == 0 {
             return Ok(false);
         }
