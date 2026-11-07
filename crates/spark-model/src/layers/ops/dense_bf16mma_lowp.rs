@@ -18,8 +18,10 @@ const SMEM_W4A8_MX: u32 = SMEM_W4A8 + 2 * 128 * 16;
 /// token (on top of `ATLAS_DENSE_PREFILL_BF16MMA=1`). NVFP4 weights take
 /// NVFP4 tokens (W4A4, `kind::mxf4nvf4`: `gu,dn,qkv,o`) or E4M3 tokens
 /// (W4A8, the weights re-encoded as block-scaled E4M3: `gu8,dn8,qkv8,o8`);
-/// the FP8 GDN projections take E4M3 tokens (W8A8: `qkvz,gout`). The value
-/// is `1` for [`LowpMix::DEFAULT`] or a comma list of those names.
+/// the FP8 GDN projections take E4M3 tokens (W8A8: `qkvz,gout`), and native
+/// FP8 attention (`ATLAS_DENSE_NATIVE_FP8_ATTN`) reads its E4M3-token bits
+/// `qkv8,o8` as W8A8 (`qkv,o` leave its tokens BF16). The value is `1` for
+/// [`LowpMix::DEFAULT`] or a comma list of those names.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LowpMix(pub(super) u16);
 
@@ -37,6 +39,10 @@ impl LowpMix {
     /// An NVFP4 group's W4A8 bit: its W4A4 bit shifted by this (bits 6..12
     /// are the shifted groups, so [`Self::DOWN_MX`] sits above them).
     pub(super) const A8: u32 = 6;
+    /// The E4M3-token bits of the attention groups (`qkv8`, `o8`): W4A8 on
+    /// NVFP4 weights, W8A8 on native FP8 ones.
+    pub const ATTN_QKV_A8: u16 = Self::ATTN_QKV << Self::A8;
+    pub const ATTN_O_A8: u16 = Self::ATTN_O << Self::A8;
     /// The NVFP4 groups, which have both a W4A4 and a W4A8 form.
     const NVFP4_GROUPS: [(&str, u16); 4] = [
         ("gu", Self::GATE_UP),
@@ -366,6 +372,13 @@ mod tests {
         // The unknown name is dropped, and said so.
         assert_eq!(notes, vec!["unknown name \"bogus\" ignored".to_string()]);
         assert!(LowpMix::parse("gu8,dnmx").has(LowpMix::DOWN_MX));
+        // Native FP8 attention's W8A8 bits are the qkv8 / o8 names.
+        assert!(LowpMix::parse("qkv8,o8").has(LowpMix::ATTN_QKV_A8));
+        assert!(LowpMix::parse("qkv8,o8").has(LowpMix::ATTN_O_A8));
+        assert!(!LowpMix::parse("qkv,o").has(LowpMix::ATTN_QKV_A8));
+        assert!(
+            LowpMix::DEFAULT.has(LowpMix::ATTN_QKV_A8) && LowpMix::DEFAULT.has(LowpMix::ATTN_O_A8)
+        );
         assert!(!LowpMix::parse("1").has(LowpMix::DOWN_MX));
         assert_eq!(
             LowpMix::parse("all"),

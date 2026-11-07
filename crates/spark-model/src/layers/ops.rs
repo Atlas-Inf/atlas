@@ -64,6 +64,8 @@ mod dp4a;
 mod embeddings;
 #[path = "ops/fp8_gemv_batch.rs"]
 mod fp8_gemv_batch;
+#[path = "ops/fp8_gemv_rows.rs"]
+mod fp8_gemv_rows;
 #[path = "ops/fp8_moe.rs"]
 mod fp8_moe;
 #[path = "ops/fp8_moe_batch_a.rs"]
@@ -336,6 +338,7 @@ pub use dp4a::*;
 pub use embeddings::*;
 pub use exl3_ops::*;
 pub use fp8_gemv_batch::*;
+pub use fp8_gemv_rows::*;
 pub use fp8_moe::*;
 pub use fp8_moe_batch_a::*;
 pub use fp8_moe_batch_b::*;
@@ -375,7 +378,7 @@ pub use marlin_nvfp4::*;
 pub use marlin_nvfp4_pack::marlin_pack_nvfp4;
 pub use model_levers::{
     BISECT_ATTN_PROJ, BISECT_ATTN_ROWS, BISECT_GDN, BISECT_HC, BISECT_HEAD, BISECT_MOE_FORWARD,
-    BISECT_MOE_ROWS, BISECT_MOE_T_ROWS, ModelLevers,
+    BISECT_MOE_ROWS, BISECT_MOE_T_ROWS, DENSE_NATIVE_FP8_ATTN, ModelLevers,
 };
 pub use moe_atomic_c4::*;
 pub use moe_expert::*;

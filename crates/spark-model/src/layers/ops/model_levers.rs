@@ -86,6 +86,11 @@ pub struct ModelLevers {
     pub dense_prefill_any_rows: bool,
 
     // ── Attention ──
+    /// Dense qwen3_5 full-attention q/k/v/o kept native FP8 on CUDA
+    /// ([`DENSE_NATIVE_FP8_ATTN`], `weight_loader/qwen35_dense/attn_fp8.rs`);
+    /// their multi-row GEMVs then also chunk past 16 rows
+    /// (`ops::fp8_rows_plan`). Opt-in.
+    pub dense_native_fp8_attn: bool,
     /// Contiguous-attention path for the DFlash head.
     pub dflash_contig_attn: bool,
     /// Official Lightning product: preserve sequential Mamba recurrence during
@@ -200,6 +205,9 @@ pub const BISECT_HEAD: u32 = 64;
 /// transposed tables instead of the `_t_rows` union kernels.
 pub const BISECT_MOE_T_ROWS: u32 = 128;
 
+/// The native FP8 dense attention lever ([`ModelLevers::dense_native_fp8_attn`]).
+pub const DENSE_NATIVE_FP8_ATTN: &str = "ATLAS_DENSE_NATIVE_FP8_ATTN";
+
 /// Opt-IN: off unless the variable is exactly `1`.
 fn opt_in(var: &str) -> bool {
     std::env::var(var).ok().as_deref() == Some("1")
@@ -287,6 +295,7 @@ impl ModelLevers {
             moe_prefill_bf16mma: opt_in("ATLAS_MOE_PREFILL_BF16MMA"),
             dense_prefill_bf16mma: opt_in("ATLAS_DENSE_PREFILL_BF16MMA"),
             dense_prefill_any_rows: false,
+            dense_native_fp8_attn: opt_in(DENSE_NATIVE_FP8_ATTN),
             dflash_contig_attn: opt_in("ATLAS_DFLASH_CONTIG_ATTN"),
             // Product installation also arms these. The explicit model-load
             // diagnostic lets a no-spec control use identical target arithmetic.
@@ -359,6 +368,7 @@ mod tests {
         assert!(!d.decode_ffn_via_gemm);
         assert!(!d.lora_eager);
         assert!(!d.k4_diag);
+        assert!(!d.dense_native_fp8_attn);
         assert!(
             d.gdn_deferred_commit,
             "ATLAS_GDN_DEFERRED_COMMIT ships ON; =0 opts out"

@@ -45,8 +45,9 @@ impl Qwen3AttentionLayer {
         }
         let force_w8a8 = ctx.dispatch.fp8_blockscaled_prefill;
         // Native FP4 o_proj: quantize attn_out to NVFP4 and consume o_proj in
-        // its original NVFP4 form. OPT-IN ONLY -- see the QKV path's comment.
+        // its original NVFP4 form (none on a native-FP8 layer). OPT-IN ONLY.
         let w4a4 = n >= 256
+            && !self.attn.o_proj.is_null()
             && self.w4a4_gemm_k.0 != 0
             && self.quantize_nvfp4_k.0 != 0
             && ctx.buffers.fp8_act_bytes() >= (n as usize) * (nq as usize) * (hd as usize)
