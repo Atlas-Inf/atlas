@@ -72,16 +72,9 @@ impl Qwen3AttentionLayer {
             // weight loop in the wide verify — one GEMM per Q/K/V reads each
             // weight ONCE for all n rows instead of n× (mirrors batch3 with M=n).
             self.ms_qkv_batchn(c)?;
-        } else if (2..=16).contains(&n)
-            && ((n <= 4 && self.w8a16_gemv_batch4_k.0 != 0)
-                || (n > 4
-                    && (self.w8a16_gemv_batch16_k.0 != 0
-                        || (n <= 8 && self.w8a16_gemv_batch8_k.0 != 0))))
-            && self.q_weight.as_ref().and_then(|w| w.as_fp8()).is_some()
-            && self.k_weight.as_ref().and_then(|w| w.as_fp8()).is_some()
-            && self.v_weight.as_ref().and_then(|w| w.as_fp8()).is_some()
-        {
-            self.ms_qkv_batchm_fp8(c)?;
+        } else if let Some(plan) = self.ms_qkv_fp8_plan(n) {
+            // Native FP8 q/k/v (`qkv_fp8.rs`): exact rows up to 4.
+            self.ms_qkv_batchm_fp8(c, &plan)?;
         } else if (2..=8).contains(&n)
             && !self.gated
             && self.dense_gemv_batchm_k.0 != 0

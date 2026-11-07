@@ -1,13 +1,86 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+//! Native FP8 q/k/v (and, from `attn/o_proj.rs`, o) over several rows: one
+//! weight pass per launch of [`ops::fp8_rows_plan`]. Up to 4 rows that is one
+//! `w8a16_gemv_batch4`, whose rows are serial decode's `w8a16_gemv` bytes, so
+//! the K=2/3/4 verify is exact (`model/exact_verify.rs`). Past 16 rows the
+//! plan chunks by 16 on NVIDIA; the HIP build keeps its per-row loop there.
+
 use anyhow::Result;
+use spark_runtime::gpu::DevicePtr;
 
 use super::ctx::MultiSeqCtx;
+use crate::layer::ForwardContext;
 use crate::layers::ops;
 use crate::layers::qwen3_attention::Qwen3AttentionLayer;
+use crate::weight_map::Fp8Weight;
 
 impl Qwen3AttentionLayer {
-    pub(super) fn ms_qkv_batchm_fp8(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
+    /// The multi-row FP8 launches for `n` rows, `None` where the caller keeps
+    /// its per-row `w8a16_gemv` loop.
+    pub(in crate::layers::qwen3_attention) fn fp8_rows_plan(
+        &self,
+        n: usize,
+    ) -> Option<Vec<ops::Fp8RowsLaunch>> {
+        let kernels = ops::Fp8RowsKernels {
+            batch4: self.w8a16_gemv_batch4_k,
+            batch8: self.w8a16_gemv_batch8_k,
+            batch8_dyn_vl2: self.w8a16_gemv_batch8_dyn_vl2_k,
+            batch8_dyn_vl2_n2: self.w8a16_gemv_batch8_dyn_vl2_n2_k,
+            batch16: self.w8a16_gemv_batch16_k,
+        };
+        ops::fp8_rows_plan(n, !cfg!(atlas_hip), ops::gemv_vl2_enabled(), kernels)
+    }
+
+    /// `plan`'s launches of `w` (`[n_out, k]`) over `input` (`[rows, k]`)
+    /// into `output` (`[rows, n_out]`), rows contiguous.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layers::qwen3_attention) fn fp8_rows(
+        &self,
+        fwd: &ForwardContext<'_>,
+        plan: &[ops::Fp8RowsLaunch],
+        input: DevicePtr,
+        w: &Fp8Weight,
+        output: DevicePtr,
+        [n_out, k]: [u32; 2],
+        stream: u64,
+    ) -> Result<()> {
+        let (in_row, out_row) = (k as usize * 2, n_out as usize * 2);
+        for l in plan {
+            ops::w8a16_gemv_batch4_div(
+                fwd.gpu,
+                l.kernel,
+                input.offset(l.first * in_row),
+                w.weight,
+                w.row_scale,
+                output.offset(l.first * out_row),
+                l.rows as u32,
+                n_out,
+                k,
+                l.div,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Whether q/k/v are native FP8 and [`Self::fp8_rows_plan`] serves `n`
+    /// rows; then [`Self::ms_qkv_batchm_fp8`] projects them.
+    pub(super) fn ms_qkv_fp8_plan(&self, n: usize) -> Option<Vec<ops::Fp8RowsLaunch>> {
+        let fp8 = |w: &Option<crate::weight_map::QuantWeight>| {
+            w.as_ref().and_then(|w| w.as_fp8()).is_some()
+        };
+        if n < 2 || !(fp8(&self.q_weight) && fp8(&self.k_weight) && fp8(&self.v_weight)) {
+            return None;
+        }
+        self.fp8_rows_plan(n)
+    }
+
+    pub(super) fn ms_qkv_batchm_fp8(
+        &self,
+        c: &MultiSeqCtx<'_>,
+        plan: &[ops::Fp8RowsLaunch],
+    ) -> Result<()> {
         let MultiSeqCtx {
             fwd,
             n,
@@ -32,37 +105,18 @@ impl Qwen3AttentionLayer {
         let kv_bytes = kv_dim as usize * bf16;
         let k_scratch = fwd.buffers.attn_output();
         let v_scratch = k_scratch.offset(n * kv_bytes);
-        let (batch_kernel, grid_div) = if n <= 4 {
-            (self.w8a16_gemv_batch4_k, 4)
-        } else {
-            ops::fp8_verify_gemv_tier(
-                n,
-                ops::gemv_vl2_enabled(),
-                self.w8a16_gemv_batch8_k,
-                self.w8a16_gemv_batch8_dyn_vl2_k,
-                self.w8a16_gemv_batch8_dyn_vl2_n2_k,
-                self.w8a16_gemv_batch16_k,
-            )
-        };
 
-        let project = |weight: &crate::weight_map::Fp8Weight, output, rows| {
-            ops::w8a16_gemv_batch4_div(
-                fwd.gpu,
-                batch_kernel,
-                normed,
-                weight.weight,
-                weight.row_scale,
-                output,
-                n as u32,
-                rows,
-                h as u32,
-                grid_div,
-                stream,
-            )
-        };
-        project(q, q_scratch, q_proj_dim)?;
-        project(k, k_scratch, kv_dim)?;
-        project(v, v_scratch, kv_dim)?;
+        self.fp8_rows(
+            fwd,
+            plan,
+            normed,
+            q,
+            q_scratch,
+            [q_proj_dim, h as u32],
+            stream,
+        )?;
+        self.fp8_rows(fwd, plan, normed, k, k_scratch, [kv_dim, h as u32], stream)?;
+        self.fp8_rows(fwd, plan, normed, v, v_scratch, [kv_dim, h as u32], stream)?;
 
         let q_lora_active = self
             .lora

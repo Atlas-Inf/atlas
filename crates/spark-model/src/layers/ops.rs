@@ -64,6 +64,8 @@ mod dp4a;
 mod embeddings;
 #[path = "ops/fp8_gemv_batch.rs"]
 mod fp8_gemv_batch;
+#[path = "ops/fp8_gemv_rows.rs"]
+mod fp8_gemv_rows;
 #[path = "ops/fp8_moe.rs"]
 mod fp8_moe;
 #[path = "ops/fp8_moe_batch_a.rs"]
@@ -334,6 +336,7 @@ pub use dp4a::*;
 pub use embeddings::*;
 pub use exl3_ops::*;
 pub use fp8_gemv_batch::*;
+pub use fp8_gemv_rows::*;
 pub use fp8_moe::*;
 pub use fp8_moe_batch_a::*;
 pub use fp8_moe_batch_b::*;
