@@ -392,6 +392,8 @@ pub(super) const QWEN38_PDL_DECODE_KERNELS: &[&str] = &[
     "causal_conv1d_update_l2norm_f32",
     "gated_delta_rule_decode_f32",
     "gated_rms_norm_f32_input",
+    // Their fused twin (ATLAS_QWEN38_DECODE_FUSE).
+    "qwen35_gdn_decode_fused",
     // Attention mixer: Q+gate and K/V GEMVs, q/k norm, MRoPE, the KV write
     // and paged decode attention (split-K and its reduce), the output gate.
     "w4a16_gemv_qg",
