@@ -127,8 +127,10 @@ between the two runs.
 ## Sliding-window KV eviction (`SWA_EVICT=1`, experimental)
 
 **Experimental:** startup, 524K capacity and short-prompt greedy output are
-verified on 2× GB10. Correctness past the ~8.4K-token slot-reclaim lag and the
-131K / 262K / 524K needle tests are not yet validated.
+verified on 2× GB10. On the fork (`62ef5e27`) the 67K and 131K needle tests
+pass, and prefix caching with pinned SWA tails passes a 67K warm follow-up
+(99.9% cache hit, 0.87s TTFT vs 383s cold). The 262K / 524K needle tests are
+still open.
 
 The 39 sliding-window layers read only their last 128 tokens. With
 `ATLAS_SWA_EVICT=1` their K/V pools hold a per-sequence ring of slots
