@@ -412,6 +412,14 @@ pub(super) const QWEN38_PDL_DECODE_KERNELS: &[&str] = &[
     "w4a16_gemv_dual_sw",
     "moe_silu_mul",
     "bf16_residual_add",
+    // The row-invariant tensor-core twins of the GEMVs above
+    // (ATLAS_SKINNY_MMA), which take their place in decode and verify.
+    "skinny_w4a16_t1",
+    "skinny_w4a16_t2",
+    "skinny_qg_t1",
+    "skinny_qg_t2",
+    "skinny_w8a16_t1",
+    "skinny_w8a16_t2",
 ];
 
 #[cfg(test)]
