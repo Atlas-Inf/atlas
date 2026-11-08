@@ -154,9 +154,14 @@ impl Qwen3SsmLayer {
         // conv-state snapshots written inline — requires the pool-contiguous
         // intermediate layout it writes to (always true for ssm_pool slots;
         // CHECKED, and constant for a given slot ⇒ graph-stable).
-        let conv_inter_base = ssm_state.conv_state_intermediates[0];
+        let conv_inter_base = ssm_state
+            .conv_state_intermediates
+            .first()
+            .copied()
+            .unwrap_or(DevicePtr::NULL);
         let fused_conv = use_f32_conv
             && self.gdn_verify_fused_conv_kn_f32_k.0 != 0
+            && ssm_state.conv_state_intermediates.len() >= num_tokens
             && ssm_state
                 .conv_state_intermediates
                 .iter()
@@ -426,8 +431,13 @@ impl Qwen3SsmLayer {
                     .enumerate()
                     .all(|(t, p)| p.0 == v[0].0 + (t * stride) as u64)
         };
-        if !contiguous(&ssm_state.h_state_intermediates, h_bytes)
-            || !contiguous(&ssm_state.conv_state_intermediates, conv_bytes)
+        let tree = crate::speculative::draft_tree::current();
+        // A deferred chain writes and reads no slot (only a tree's branch
+        // parents keep their H), so it needs none of them.
+        let slotless = ssm_state.gdn_commit_pending && tree.is_none();
+        if !slotless
+            && (!contiguous(&ssm_state.h_state_intermediates, h_bytes)
+                || !contiguous(&ssm_state.conv_state_intermediates, conv_bytes))
         {
             return Ok(false);
         }
@@ -440,8 +450,7 @@ impl Qwen3SsmLayer {
             h_snap_bytes: h_bytes,
             conv_snap: first(&ssm_state.conv_state_intermediates),
             conv_snap_bytes: conv_bytes,
-            parent: crate::speculative::draft_tree::current()
-                .map_or(DevicePtr::NULL, |t| t.parents),
+            parent: tree.map_or(DevicePtr::NULL, |t| t.parents),
             qkvz: deinterleaved,
             qkvz_stride: qkvz_size as u32,
             conv_w: self.ssm.conv1d.weight,

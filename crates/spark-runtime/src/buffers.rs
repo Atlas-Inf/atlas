@@ -282,6 +282,9 @@ impl BufferArena {
             DevicePtr::NULL
         };
 
+        if std::env::var_os("ATLAS_ALLOC_LOG_MB").is_some() {
+            tracing::info!("Buffer arena sizes: {sizes:?}");
+        }
         tracing::info!(
             "Buffer arena: {} tokens × {:.1} MB total (attn_out={:.1}MB, ssm_deint={:.1}MB, kv_lora_rank={})",
             max_batch_tokens,

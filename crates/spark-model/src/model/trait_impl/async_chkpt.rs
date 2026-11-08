@@ -32,6 +32,11 @@ impl TransformerModel {
     pub(super) fn start_checkpoint_async_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
         use crate::layer::SsmLayerState;
 
+        // Deferred-commit pools: no checkpoint is ever read (`defer_only`).
+        if self.ssm_pool.defer_only() {
+            return Ok(());
+        }
+
         let stream = self.secondary_stream;
         let mut h_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
         let mut conv_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
@@ -82,6 +87,11 @@ impl TransformerModel {
     ) -> Result<()> {
         use crate::layer::SsmLayerState;
 
+        anyhow::ensure!(
+            !self.ssm_pool.defer_only(),
+            "start_rollback_and_checkpoint_async: the deferred-commit pools hold no \
+             snapshots to roll back to (ATLAS_VERIFY_POOL_STORE=1 allocates them)"
+        );
         let stream = self.secondary_stream;
         let mut ssm_layer_idx = 0usize;
         // Four plans in the ORIGINAL issue order: rollback h, rollback conv,
@@ -415,6 +425,13 @@ impl TransformerModel {
                 ssm_layer_idx += 1;
                 continue;
             }
+            anyhow::ensure!(
+                inter_idx < ssm.h_state_intermediates.len()
+                    && inter_idx < ssm.conv_state_intermediates.len(),
+                "commit_accepted_prefix: layer {i} ran a storing verify but its slot holds \
+                 no snapshot {inter_idx} (deferred-commit pools; ATLAS_VERIFY_POOL_STORE=1 \
+                 allocates them)"
+            );
             h_plan.push(StateCopy {
                 src: self.ssm_pool.h_intermediate(ssm_layer_idx, slot, inter_idx),
                 dst: ssm.h_state,

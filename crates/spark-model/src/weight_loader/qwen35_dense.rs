@@ -1241,12 +1241,15 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                             Nvfp4Variant::Standard,
                         )?;
                         let qkvz_nvfp4 = qkv_qw.concat_rows(&z_qw, qkv_rows, z_rows, h, gpu)?;
-                        if cfg!(atlas_hip) {
-                            store.reclaim(gpu, &format!("{la}.in_proj_qkv.weight"))?;
-                            store.reclaim(gpu, &format!("{la}.in_proj_qkv.weight_scale"))?;
-                            store.reclaim(gpu, &format!("{la}.in_proj_z.weight"))?;
-                            store.reclaim(gpu, &format!("{la}.in_proj_z.weight_scale"))?;
-                        }
+                        // The concat copied both projections; nothing reads the
+                        // store's separate qkv / z again on this branch (2.1 GB
+                        // on the 27B). Synchronized first: the concat's copies
+                        // must land before their sources are freed.
+                        gpu.synchronize(0)?;
+                        store.reclaim(gpu, &format!("{la}.in_proj_qkv.weight"))?;
+                        store.reclaim(gpu, &format!("{la}.in_proj_qkv.weight_scale"))?;
+                        store.reclaim(gpu, &format!("{la}.in_proj_z.weight"))?;
+                        store.reclaim(gpu, &format!("{la}.in_proj_z.weight_scale"))?;
                         let qkvz_nvfp4_t = qkvz_nvfp4.transpose_for_gemm(gpu, qkvz_size, h)?;
 
                         let (out_proj_nvfp4, out_proj_nvfp4_t, out_f) = if out_fp8 {

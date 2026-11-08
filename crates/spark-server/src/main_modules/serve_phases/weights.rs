@@ -443,7 +443,14 @@ fn skip_mtp(config: &ModelConfig, args: &cli::ServeArgs) -> bool {
     // 5.21 GB of BF16 held resident for nothing, which on a 119.6 GB unified box
     // comes straight out of the KV cache. With the flag it is the drafter, on
     // rank 0 only (`factory::build`): every other rank skips it as well.
-    matches!(config.model_type.as_str(), "qwen4_exp") && (!args.speculative || config.ep_rank != 0)
+    let qwen4_exp =
+        matches!(config.model_type.as_str(), "qwen4_exp") && (!args.speculative || config.ep_rank != 0);
+    // The dense hybrid under `--dflash`: the DFlash drafter is the only
+    // proposer, so an MTP head would be built only to be replaced (its BF16
+    // weights, 0.85 GB on the 27B, and a private KV pool as large as 1/16 of
+    // the target's, left allocated for the life of the process).
+    let dense_dflash = config.model_type == "qwen3_5" && args.dflash && !args.speculative;
+    qwen4_exp || dense_dflash
 }
 
 #[cfg(test)]
@@ -466,6 +473,20 @@ mod tests {
         assert!(!skip_mtp(&config, &args(&["--speculative"])));
         config.ep_rank = 1;
         assert!(skip_mtp(&config, &args(&["--speculative"])));
+    }
+
+    /// The dense hybrid uploads `mtp.*` unless DFlash replaces the MTP head.
+    #[test]
+    fn qwen3_5_skips_mtp_under_dflash_only() {
+        let args = |more: &[&str]| {
+            let argv = ["spark", "some/model"].iter().chain(more);
+            crate::cli::ServeArgs::parse_from(argv)
+        };
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "qwen3_5".to_string();
+        assert!(!skip_mtp(&config, &args(&[])));
+        assert!(!skip_mtp(&config, &args(&["--speculative"])));
+        assert!(skip_mtp(&config, &args(&["--dflash"])));
     }
 
     #[test]
