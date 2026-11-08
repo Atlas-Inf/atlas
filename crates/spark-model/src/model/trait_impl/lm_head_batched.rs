@@ -113,6 +113,30 @@ impl TransformerModel {
             // explicitly disabled, not a lossless substitute.
             // Exact-M tier first (batch2..8/16/32 incl. the 5/6/7 tiers);
             // batch16 stays the capability fallback when no exact tier resolved.
+            // The batch lever past 16 rows: 16-row passes of the batch16 tier,
+            // each row the single-row head's bytes, not the transposed tile
+            // GEMM below (another FP32 reduction order). Plain batched decode
+            // of more than sixteen sequences diverged from serial decode here.
+            if self.levers.dense_batch_exact
+                && padded_n > 16
+                && self.w4a16_gemv_batch16_kernel.0 != 0
+            {
+                for row in (0..padded_n).step_by(16) {
+                    let rows = (padded_n - row).min(16);
+                    ops::w4a16_gemv_batchm(
+                        self.gpu.as_ref(),
+                        self.w4a16_gemv_batch16_kernel,
+                        normed.offset(row * h * bf16),
+                        nvfp4,
+                        logits.offset(row * v * bf16),
+                        rows as u32,
+                        v as u32,
+                        h as u32,
+                        stream,
+                    )?;
+                }
+                return Ok(logits);
+            }
             let narrow = self.w4a16_batchm.kernel(padded_n as u32);
             let batch_k = if narrow.0 != 0 {
                 narrow
