@@ -92,6 +92,11 @@ pub(super) fn hold_chunk(decoding: bool) -> bool {
         let Ok(mut c) = LAST_CHUNK.lock() else {
             return false;
         };
+        // A chunk fused with the decode rows (the mixed forward) is followed
+        // by no standalone decode step: it ended by this tick.
+        if let Some((_, end @ None)) = c.as_mut() {
+            *end = Some(now);
+        }
         if decoding
             && let Some((start, Some(end))) = *c
             && now.duration_since(end) < decode_window(end.duration_since(start), f)
