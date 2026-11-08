@@ -61,6 +61,22 @@ launcher default; `FP8_QKV=1` already was).
   flat (+1.6%, within noise); top-4 decode +29% but ppl +20.3% and factual
   errors in the 46-prompt gate. **Quality-unacceptable; stays opt-in,
   default off, do not pursue further.**
+- **Multi-sequence decode** (`MAX_BATCH=2/4`; TP=2+EP=2, FP8 QKV, chan4,
+  γ=4, util 0.84, greedy): batched decode is **bit-identical** to batch=1
+  at matched prefix-cache state — the one observed divergence was traced
+  to prefix-cache warm/cold numerics (last-ulp KV differences flipping an
+  early argmax), not a batching bug; all needles identical across runs.
+  DFlash batched verify clean (no crashes/hangs/cross-lane contamination).
+  At batch=2, per-lane decode (~14.6–15.2 tok/s) is equal-or-faster than
+  batch=1 (~11.5): expert weight reads amortize, ~2× aggregate during true
+  overlap. **KV pool is the lane constraint**: pool shrinks with
+  MAX_BATCH (613K → 423K → 141K tokens at batch=1/2/4), so at util 0.84
+  batch=2 fits one 262K lane + ~161K and batch=4 cannot fit one 262K
+  request. MAX_BATCH=1 stays the long-context default; MAX_BATCH=2 is
+  opt-in for short/medium multi-tenant serving. Caveat: prefix-cache warm
+  vs cold yields different greedy continuations on this model (chunked
+  numerics) — don't A/B cached vs uncached runs as if they were the same
+  arm.
 
 Off-hardware checks that still apply: `cargo test -p atlas-core --lib
 mimo_v2` against the published `config.json`; `cargo build -p
