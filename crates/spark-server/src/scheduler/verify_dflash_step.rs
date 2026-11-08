@@ -216,8 +216,21 @@ pub(super) fn verify_dflash_tail(
             a,
             &verified_argmax,
         );
+    // An exact verify (`Model::verify_bit_exact`, `ATLAS_EXACT_VERIFY`): the
+    // rows are serial decode's logits, so each is picked through serial
+    // decode's pipeline against the state serial decode would hold there
+    // (`exact_picks`), never the raw argmax.
+    let exact = scored.is_none() && !split_rows && exact_picks(raw, model.verify_bit_exact());
     let mut verified = if let Some(scored) = &scored {
         scored.tokens.clone()
+    } else if exact {
+        crate::scheduler::verify_pipeline_helper::verify_pick_prefix_with_pipeline(
+            model,
+            &verified_argmax,
+            drafts,
+            a,
+            verify_ctx,
+        )
     } else if split_rows {
         match crate::scheduler::verify_pipeline_helper::split_verify_picks(
             model,
@@ -261,7 +274,7 @@ pub(super) fn verify_dflash_tail(
     // proposer's guess for the same slot. First mismatch terminates the
     // accepted prefix; verified[first_mismatch] becomes the bonus token.
     // An exhausted thinking budget may end the step early at `</think>`.
-    let num_accepted = if scored.is_some() || split_rows {
+    let num_accepted = if scored.is_some() || split_rows || exact {
         // The full pipeline already enforces thinking boundaries per position.
         // Split picks enforce them with each row's shadow state; replaying the
         // raw helper would use the restored pre-span fence.
@@ -551,5 +564,26 @@ pub(super) fn verify_dflash_tail(
     None
 }
 
+/// Whether a DFlash verify (`raw_lane`: `--dflash`'s raw-argmax lane) picks
+/// its rows through the per-position pipeline instead: under an exact verify
+/// (`Model::verify_bit_exact`), whose rows are serial decode's logits.
+///
+/// The raw argmax skips every stateful stage serial decode runs per token.
+/// [`accept_with_forced_think_end`] only honours a `</think>` armed before the
+/// step, so a block crossing the thinking budget, completing F2's confidence
+/// streak or tripping the think-loop watchdog accepted past the point serial
+/// decode closes the reasoning. The pipeline picks row `i` against the state
+/// after committing rows `0..i` (`emit_step::SpanShadow`, MTP's verify):
+/// budget, F2, watchdog, sentence deferral, fences, penalties, bias, grammar,
+/// the min_tokens ban, content-loop steers, and the request's sampling at
+/// T>0 (each row drawn from its processed logits, seeded by position), with
+/// each stage's effect applied once per committed token (`PickEffects`).
+/// Off the exact verify the raw-argmax lane is unchanged.
+pub(super) fn exact_picks(raw_lane: bool, verify_bit_exact: bool) -> bool {
+    raw_lane && verify_bit_exact
+}
+
+#[cfg(test)]
+mod exact_pick_tests;
 #[cfg(test)]
 mod masked_path_tests;
