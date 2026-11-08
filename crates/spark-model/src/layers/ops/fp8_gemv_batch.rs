@@ -92,6 +92,9 @@ pub fn w8a16_gemv_batch4(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    if w8a16_wide(gpu, input, (weight, block_scale), output, (m, n, k), stream)? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -103,6 +106,22 @@ pub fn w8a16_gemv_batch4(
         .arg_u32(n)
         .arg_u32(k)
         .launch(stream)
+}
+
+/// `ATLAS_WIDE_GEMV`: the plain `w8a16_gemv_batch4/16` template's rows (each
+/// `w8a16_gemv`'s bytes) in one `w8a16_gemv_wide*` launch when one serves.
+fn w8a16_wide(
+    gpu: &dyn GpuBackend,
+    input: DevicePtr,
+    weight_scale: (DevicePtr, DevicePtr),
+    output: DevicePtr,
+    (m, n, k): (u32, u32, u32),
+    stream: u64,
+) -> Result<bool> {
+    match crate::layers::ops::wide_gemv::active() {
+        Some(wide) => wide.try_w8a16(gpu, input, weight_scale, output, (m, n, k), n, stream),
+        None => Ok(false),
+    }
 }
 
 /// Kernel for the block-scaled FP8 verify GEMV at `m` rows (5..=16) and the
@@ -152,6 +171,10 @@ pub fn w8a16_gemv_batch4_div(
     div: u32,
     stream: u64,
 ) -> Result<()> {
+    // Only the plain template twins (div 4) are `w8a16_gemv`'s bytes.
+    if div == 4 && w8a16_wide(gpu, input, (weight, block_scale), output, (m, n, k), stream)? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, div), 1, 1])
         .block([256, 1, 1])
