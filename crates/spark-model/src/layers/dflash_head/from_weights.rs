@@ -22,7 +22,7 @@ use crate::weight_loader::DflashWeights;
 
 impl BlockDiffusionDraftHead {
     pub fn from_weights(
-        weights: DflashWeights,
+        mut weights: DflashWeights,
         embed_tokens_shared: DevicePtr,
         lm_head_shared: DevicePtr,
         lm_head_nvfp4: Option<crate::weight_map::QuantizedWeight>,
@@ -37,6 +37,8 @@ impl BlockDiffusionDraftHead {
         mut startup: DsparkStartupExecution,
     ) -> Result<Self> {
         super::selector_platform::validate_requested_features(startup.diagnostics.draft_conf)?;
+        let dspine_weights = weights.dspine.take();
+        let dspine_spec = dspine_weights.as_ref().map(|w| w.spec);
         let embed_tokens_shared = weights
             .embed_tokens
             .as_ref()
@@ -406,6 +408,10 @@ impl BlockDiffusionDraftHead {
                 dflash2_conv_out: gpu.alloc(n_attn * hidden_size * bf16)?,
                 dflash2_projected_hidden: gpu.alloc(g * 256 * bf16)?,
                 dflash2_selector_scratch: gpu.alloc(selector_bytes)?,
+                dspine: dspine_spec
+                    .as_ref()
+                    .map(|spec| super::dspine::DspineScratch::alloc(gpu, spec, hidden_size, g))
+                    .transpose()?,
             };
             // C1 diagnostic: zero ALL device buffers so any uninitialized
             // read sees deterministic zeros instead of per-lane garbage.
@@ -889,6 +895,8 @@ impl BlockDiffusionDraftHead {
             } else {
                 None
             },
+            dspine: None,
+            alt: None,
             // Phase 2 stage 2: fused KV weight built above by copy_d2d
             // from each layer's k_proj/v_proj. precompute_ctx_kv will
             // GEMM against it in stage 3 once we wire the call site.
@@ -945,6 +953,7 @@ impl BlockDiffusionDraftHead {
             batch_markov_bias,
             batch_dflash2_projected,
             batch_dflash2_selector_scratch,
+            last_select: parking_lot::Mutex::new(None),
             batch_conv_delta,
             batch_conv_out,
             extra_lanes,
@@ -970,6 +979,9 @@ impl BlockDiffusionDraftHead {
             ctx_carry: Mutex::new(None),
             rank_split: None,
         };
+        if let Some(w) = dspine_weights {
+            head.dspine = Some(super::dspine::Dspine::build(&head, w, gpu)?);
+        }
 
         // Fallback pool prime for build paths that skipped the early
         // `factory::build` prime (which runs before the residual KV-pool

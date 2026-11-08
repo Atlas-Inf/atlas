@@ -74,6 +74,7 @@ pub(super) fn zero_scratch() -> DflashScratch {
         dflash2_conv_out: DevicePtr(0),
         dflash2_projected_hidden: DevicePtr(0),
         dflash2_selector_scratch: DevicePtr(0),
+        dspine: None,
     }
 }
 
@@ -112,6 +113,8 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         draft_id_to_target_id: None,
         layers: Vec::new(),
         candidate_selector: None,
+        dspine: None,
+        alt: None,
         fused_kv_weight: None,
         kv_cache: parking_lot::Mutex::new(zero_kv_cache()),
         scratch: zero_scratch(),
@@ -151,6 +154,7 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         batch_markov_bias: DevicePtr(0),
         batch_dflash2_projected: DevicePtr(0),
         batch_dflash2_selector_scratch: DevicePtr(0),
+        last_select: parking_lot::Mutex::new(None),
         batch_conv_delta: DevicePtr(0),
         batch_conv_out: DevicePtr(0),
         extra_lanes: Vec::new(),
@@ -282,6 +286,8 @@ pub(super) fn live_state(
         ctx_store: super::warm_ctx_store::StoreRefs::default(),
         lane_id: 0,
         lifecycle: Some(CaptureDescriptor::bind(own, 40, 4, 4, 16).unwrap()),
+        alt: None,
+        route: Default::default(),
     })
 }
 
@@ -338,6 +344,8 @@ pub(super) fn fresh_state_inner(gpu: &MockGpuBackend) -> Box<DflashProposerState
         ctx_store: super::warm_ctx_store::StoreRefs::default(),
         lane_id: 0,
         lifecycle: None,
+        alt: None,
+        route: Default::default(),
     })
 }
 

@@ -65,6 +65,17 @@ impl BlockDiffusionDraftHead {
         let total_rows = batch_size
             .checked_mul(gamma)
             .ok_or_else(|| anyhow::anyhow!("DFlash batched selector rows overflow"))?;
+        // A lone sequence's buffers serve a tree verify's lattice
+        // (`tree_lattice`); a batch's or a rank split's do not.
+        self.note_select((batch_size == 1 && lists.is_none()).then(|| {
+            super::tree_lattice::LastSelect {
+                logits: self.batch_logits,
+                projected: self.batch_dflash2_projected,
+                scratch: self.batch_dflash2_selector_scratch,
+                anchor: self.batch_markov_prev,
+                ban_depth: self.batch_ban_depth(),
+            }
+        }));
 
         // (a) Projected-hidden GEMM — per-sequence at m = gamma, mirroring
         // the serial arm bit-for-bit. Serial `select_candidates` calls

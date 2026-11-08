@@ -64,6 +64,8 @@ pub(in crate::model) mod verify_e2;
 mod verify_fused;
 mod verify_layer_trace;
 pub(in crate::model) mod verify_rows;
+mod verify_tree;
+mod verify_tree_check;
 
 impl Model for TransformerModel {
     fn verify_logits_argmax_only(&self) -> bool {
@@ -784,6 +786,31 @@ impl Model for TransformerModel {
             Some(p) => p.propose_batch_min(),
             None => 2,
         }
+    }
+    fn dflash_tree_supported(&self) -> bool {
+        self.dflash_tree_supported_impl()
+    }
+    fn dflash_draft_tree(
+        &self,
+        rows: usize,
+    ) -> Result<Option<crate::speculative::draft_tree::DraftTree>> {
+        match &self.proposer {
+            Some(p) => p.draft_tree(self.gpu.as_ref(), rows),
+            None => Ok(None),
+        }
+    }
+    fn decode_verify_dflash_tree(
+        &self,
+        tree: &crate::speculative::draft_tree::DraftTree,
+        seq: &mut SequenceState,
+    ) -> Result<Vec<u32>> {
+        self.decode_verify_dflash_tree_impl(tree, seq)
+    }
+    fn dflash_tree_gather_rows(&self, rows: &[usize]) -> Result<()> {
+        self.dflash_tree_gather_rows_impl(rows)
+    }
+    fn commit_dflash_tree(&self, seq: &mut SequenceState, path: &[usize]) -> Result<()> {
+        self.commit_dflash_tree_impl(seq, path)
     }
     fn decode_verify_graphed_kgamma(
         &self,

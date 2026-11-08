@@ -138,7 +138,7 @@ impl TransformerModel {
     }
 
     /// One sequence's GDN recurrent state (h + conv per layer).
-    fn serial_ssm_states(&self, seq: &SequenceState) -> Vec<(DevicePtr, DevicePtr)> {
+    pub(super) fn serial_ssm_states(&self, seq: &SequenceState) -> Vec<(DevicePtr, DevicePtr)> {
         seq.layer_states
             .iter()
             .enumerate()

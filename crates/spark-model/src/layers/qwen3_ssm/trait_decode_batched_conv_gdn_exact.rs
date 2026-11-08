@@ -179,6 +179,14 @@ impl Qwen3SsmLayer {
             !ssm_state.gdn_commit_pending,
             "deferred GDN verify: the fused exact rows could not run"
         );
+        // A tree verify's rows continue their parents' states, which only
+        // the fused launch above does; the per-row chain below would run
+        // them as a chain.
+        anyhow::ensure!(
+            crate::speculative::draft_tree::current().is_none(),
+            "tree verify: the GDN layer cannot run the fused exact rows \
+             (ATLAS_QWEN38_VERIFY_FUSE, the FP32 four-kernel arm, contiguous slots)"
+        );
 
         static LOGGED: std::sync::Once = std::sync::Once::new();
         LOGGED.call_once(|| {
@@ -384,10 +392,10 @@ impl Qwen3SsmLayer {
 
     /// The exact chain's conv, recurrence, gated norm and rollback slots of
     /// all `num_tokens` rows as one `qwen35_gdn_verify_tree` launch
-    /// (`ATLAS_QWEN38_VERIFY_FUSE=1`), the rows a chain (the kernel's
-    /// parent table is NULL). Needs the rollback slots laid out contiguously
-    /// (the ssm pool's are). Returns whether it launched; on `false` nothing
-    /// was launched.
+    /// (`ATLAS_QWEN38_VERIFY_FUSE=1`): a chain, or the rows of the tree
+    /// verify in flight (`draft_tree::current`, its parent table). Needs the
+    /// rollback slots laid out contiguously (the ssm pool's are). Returns
+    /// whether it launched; on `false` nothing was launched.
     fn exact_rows_fused(
         &self,
         ssm_state: &mut SsmLayerState,
@@ -432,7 +440,8 @@ impl Qwen3SsmLayer {
             h_snap_bytes: h_bytes,
             conv_snap: first(&ssm_state.conv_state_intermediates),
             conv_snap_bytes: conv_bytes,
-            parent: DevicePtr::NULL,
+            parent: crate::speculative::draft_tree::current()
+                .map_or(DevicePtr::NULL, |t| t.parents),
             qkvz: deinterleaved,
             qkvz_stride: qkvz_size as u32,
             conv_w: self.ssm.conv1d.weight,

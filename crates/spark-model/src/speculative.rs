@@ -6,6 +6,7 @@
 //! MTP implements this first; EAGLE-3 can implement later without engine changes.
 
 pub mod deep_depth;
+pub mod draft_tree;
 pub mod glm_repair_policy;
 pub mod ladder;
 pub mod tree_shape;
@@ -299,6 +300,17 @@ pub trait DraftProposer: Send + Sync {
     /// environment, so post-startup mutation cannot change behavior.
     fn startup_diagnostics(&self) -> Option<&crate::layers::dflash_head::DsparkDiagnostics> {
         None
+    }
+
+    /// An exact tree verify's draft tree (`draft_tree`): best-first, at most
+    /// `rows` rows, over the lattice of the last single-sequence propose.
+    /// `None` when this proposer has no lattice.
+    fn draft_tree(
+        &self,
+        _gpu: &dyn GpuBackend,
+        _rows: usize,
+    ) -> Result<Option<draft_tree::DraftTree>> {
+        Ok(None)
     }
 
     /// Whether a single-sequence [`Self::propose`] handed `comm` (with a

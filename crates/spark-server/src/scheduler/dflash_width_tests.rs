@@ -115,3 +115,19 @@ fn the_chain_step_costs_track_its_measured_steps() {
         assert!(chain_step_ms(n, 4) > chain_step_ms(n, 3));
     }
 }
+
+#[test]
+fn batch_depth_keeps_long_blocks_at_two_and_eight_rows_past_two() {
+    // Alone: the drafter's depth.
+    assert_eq!(batch_depth(15, 1, [15].into_iter()), 15);
+    // Two DSpine sequences keep 16-row blocks; with a DFlash2 one, 7.
+    assert_eq!(batch_depth(15, 2, [15, 15].into_iter()), 15);
+    assert_eq!(batch_depth(15, 2, [15, 7].into_iter()), 7);
+    assert_eq!(batch_depth(15, 2, [15, 3].into_iter()), 7);
+    // Past two sequences, 8 rows each.
+    assert_eq!(batch_depth(15, 8, [15; 8].into_iter()), 7);
+    // A 7-draft drafter (DFlash2) is unchanged at every width.
+    for n in 1..=8 {
+        assert_eq!(batch_depth(7, n, [7, 2].into_iter()), 7);
+    }
+}

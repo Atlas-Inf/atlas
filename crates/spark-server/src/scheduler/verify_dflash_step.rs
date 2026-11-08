@@ -9,6 +9,7 @@ mod native_mtp;
 mod split_head;
 mod stats;
 mod think_end;
+mod tree;
 pub use glm_owner::{step_verify_glm_long_batched, step_verify_glm_long_with};
 pub(super) use think_end::accept_with_forced_think_end;
 
@@ -61,6 +62,17 @@ fn step_verify_dflash_inner(
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
 ) {
+    // ATLAS_DFLASH_TREE: a lone greedy sequence verifies a draft tree.
+    if tree::try_step_verify_tree(
+        model,
+        a,
+        sched,
+        num_drafts,
+        verify_ctx,
+        dflash_verify_raw_argmax,
+    ) {
+        return;
+    }
     // Reject an unsupported sampled request before any worker enters the
     // verify command and waits for its verdict.
     if let Err(e) = split_head::ensure_available(model, a) {
@@ -455,6 +467,35 @@ pub(super) fn verify_dflash_tail(
         return None;
     }
 
+    propose_after_verify(
+        model,
+        a,
+        sched,
+        num_drafts,
+        dflash_verify_raw_argmax,
+        defer_propose,
+        bonus_token_idx,
+        (step_timing, verify_ms, tokens.len(), num_accepted),
+    )
+}
+
+/// The re-propose after a verify's commit and emission (shared by the chain
+/// and the tree verify): the next drafts, or `Some(width)` for an
+/// owner-batched caller that proposes every owner in one pass
+/// (`defer_propose`). The last argument is the step-timing switch, the
+/// verify's ms, its rows and its accepted drafts, for the STEP_TIMING line.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn propose_after_verify(
+    model: &dyn Model,
+    a: &mut ActiveSeq,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    num_drafts: usize,
+    dflash_verify_raw_argmax: bool,
+    defer_propose: bool,
+    bonus_token_idx: usize,
+    (step_timing, verify_ms, k_rows, num_accepted): (bool, f64, usize, usize),
+) -> Option<usize> {
+    let native_mtp = model.native_mtp_enabled();
     // Re-propose for next step — unless adaptive speculation just suspended
     // this seq (no drafts → the scheduler serial-decodes it via bootstrap).
     let _mtp_grammar_mask = mtp_grammar_mask_for(a);
@@ -558,7 +599,7 @@ pub(super) fn verify_dflash_tail(
             if native_mtp { "MTP" } else { "DFLASH" },
             verify_ms,
             propose_ms,
-            tokens.len(),
+            k_rows,
             num_accepted,
         );
     }

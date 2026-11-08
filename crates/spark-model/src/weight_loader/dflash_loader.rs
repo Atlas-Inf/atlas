@@ -32,9 +32,11 @@ use spark_runtime::weights::WeightStore;
 use crate::weight_map::{DenseWeight, QuantizedWeight, dense_auto};
 
 mod config;
+mod dspine;
 mod own_head;
 
 pub use config::*;
+pub use dspine::*;
 pub(crate) use own_head::own_lm_head_present;
 
 /// DFlash2 2-tap grouped dynamic convolution weights.
@@ -71,6 +73,8 @@ pub struct DflashWeights {
     /// Own NVFP4 lm_head (LiLiCorr-style drafters, `has_own_lm_head: true`).
     /// `None` on generic DFlash — the head shares the target's.
     pub lm_head: Option<QuantizedWeight>,
+    /// DSpine's code bridge (`selected_prefix_bridge.*`), when declared.
+    pub dspine: Option<DspineBridgeWeights>,
 }
 
 /// Per-drafter-layer raw weights (BF16).
@@ -323,6 +327,8 @@ pub fn load_dflash_weights(
         );
     }
 
+    let dspine = load_dspine_bridge(drafter_store, drafter_config, prefix, gpu)?;
+
     if let Ok(fc_meta) = drafter_store.get(&format!("{prefix}fc.weight"))
         && fc_meta.dtype == spark_runtime::weights::WeightDtype::UInt8
         && fc_meta.shape.len() == 2
@@ -364,6 +370,7 @@ pub fn load_dflash_weights(
         embed_tokens,
         candidate_selector,
         lm_head,
+        dspine,
     }))
 }
 

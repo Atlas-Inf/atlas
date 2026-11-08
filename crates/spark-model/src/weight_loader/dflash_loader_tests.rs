@@ -309,6 +309,7 @@ fn lilicorr_config_takes_generic_dflash_admission_path() {
         drafter_config: parse_dflash_config(json).expect("parse LiLiCorr config"),
         gamma: Some(8),
         window_size: Some(0),
+        alt: None,
     };
     let target = ModelConfig::qwen3_next_80b_nvfp4();
     let admitted = admit_lightning_dspark_build(&args, &target, 1, 16, KvCacheDtype::Bf16)
@@ -379,4 +380,45 @@ fn own_lm_head_policy() {
     );
     let no_scale2 = WeightStore::from_map(no_scale2);
     assert!(own_lm_head_present(&no_scale2, "", Some(true)).is_err());
+}
+
+/// `tencent/Qwen3.8-27B-DSpine-b16` @ea909c0f (Apache-2.0): the keys DSpine
+/// adds to a causal DFlash config.
+const DSPINE_QWEN38_JSON: &str = r#"{
+  "architectures": ["DFlashDraftModel"], "block_size": 16,
+  "code_bridge_second_pass": {"first_exact": 4, "head_topk": 16, "mode": "serial_table"},
+  "dflash_config": {"mask_token_id": 248070, "draft_block_causal": true,
+    "selected_prefix_code_bridge": {"code_size": 1024, "eps": 1e-06, "kappa": 10.0, "rank": 512},
+    "selected_prefix_last_write_refine": {"head_topk": 16, "kind": "exact_sender", "version": 1, "weight": 1.0},
+    "target_layer_ids": [1, 16, 31, 46, 61]},
+  "head_dim": 128, "hidden_size": 5120, "intermediate_size": 17408, "is_causal": true,
+  "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention"],
+  "num_attention_heads": 32, "num_hidden_layers": 5, "num_key_value_heads": 8,
+  "rms_norm_eps": 1e-06, "rope_theta": 10000000, "sliding_window": 8192,
+  "use_sliding_window": true, "vocab_size": 248320
+}"#;
+
+#[test]
+fn parse_dspine_qwen38_config() {
+    let c = parse_dflash_config(DSPINE_QWEN38_JSON).unwrap();
+    assert_eq!(c.block_size(), 16);
+    assert!(c.query_causal());
+    assert_eq!(c.sliding_window(), Some(8192));
+    let spec = c.dspine().unwrap().expect("DSpine geometry");
+    assert_eq!((spec.code_size, spec.rank, spec.head_topk), (1024, 512, 16));
+    assert_eq!(spec.eps(), 1e-6);
+    // A second pass that is not the last write's serial table is refused.
+    let wrong = DSPINE_QWEN38_JSON.replace("\"first_exact\": 4", "\"first_exact\": 3");
+    assert!(parse_dflash_config(&wrong).unwrap().dspine().is_err());
+    let unknown = DSPINE_QWEN38_JSON.replace("exact_sender", "approx");
+    assert!(parse_dflash_config(&unknown).unwrap().dspine().is_err());
+}
+
+#[test]
+fn dflash2_config_is_not_dspine() {
+    let json = r#"{"architectures": ["DFlash2DraftModel"], "head_dim": 128, "hidden_size": 5120,
+      "intermediate_size": 17408, "num_attention_heads": 32, "num_hidden_layers": 5,
+      "num_key_value_heads": 8, "vocab_size": 248320,
+      "dflash_config": {"block_size": 8, "mask_token_id": 248070, "target_layer_ids": [5, 19, 33, 47, 61]}}"#;
+    assert!(parse_dflash_config(json).unwrap().dspine().unwrap().is_none());
 }
