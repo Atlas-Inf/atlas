@@ -21,7 +21,7 @@
 //! and the rope kernel never reads pad rows.
 
 use anyhow::{Result, bail, ensure};
-use spark_runtime::gpu::GpuBackend;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
 use super::{QKV_TP_CHUNKS, qkv_chunk_rows};
@@ -49,8 +49,14 @@ pub(crate) fn padded_chunk_rows(chunk_rows: usize) -> usize {
 
 /// Load the TP-chunked fused QKV as a native FP8 block weight
 /// (`[padded_rows, hidden]` E4M3 + F32 `[padded_rows/128, hidden/128]`
-/// grid), returning the weight and the padded per-chunk row count the rope
-/// kernel strides by.
+/// grid), returning the weight, the padded per-chunk row count the rope
+/// kernel strides by and this rank's local chunk count.
+///
+/// `nq`/`nkv` are the PRE-TP (checkpoint) head counts. With `tp_size > 1`
+/// only this rank's `QKV_TP_CHUNKS / tp_size` consecutive chunks are kept —
+/// whole chunks with their own scale grids, so the 128-row block alignment
+/// holds per chunk without any repacking.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn load_qkv_fp8b(
     store: &WeightStore,
     prefix: &str,
@@ -58,11 +64,18 @@ pub(crate) fn load_qkv_fp8b(
     nkv: usize,
     h: usize,
     gpu: &dyn GpuBackend,
-) -> Result<(Fp8BlockWeight, usize)> {
+    tp_rank: usize,
+    tp_size: usize,
+) -> Result<(Fp8BlockWeight, usize, usize)> {
+    ensure!(
+        tp_rank < tp_size && QKV_TP_CHUNKS.is_multiple_of(tp_size),
+        "{prefix}: checkpoint {QKV_TP_CHUNKS} chunks not divisible by tp_size {tp_size}"
+    );
+    let local_chunks = QKV_TP_CHUNKS / tp_size;
     let chunk_rows = qkv_chunk_rows(nq, nkv);
     let rows = QKV_TP_CHUNKS * chunk_rows;
     let padded_chunk = padded_chunk_rows(chunk_rows);
-    let padded_rows = QKV_TP_CHUNKS * padded_chunk;
+    let padded_rows = local_chunks * padded_chunk;
     let (w_ptr, w_dtype, w_shape) = {
         let w = store.get(&format!("{prefix}.weight"))?;
         (w.ptr, w.dtype, w.shape.clone())
@@ -91,16 +104,17 @@ pub(crate) fn load_qkv_fp8b(
         "{prefix}.weight_scale_inv: {FP8_QKV_ENV} needs F32 scales, got {s_dtype:?}"
     );
     // Padding adds only the partial block's remainder rows, so the padded
-    // grid has exactly the checkpoint's block count.
+    // grid has exactly the checkpoint's block count for the kept chunks.
     ensure!(
-        padded_rows / FP8_BLOCK == QKV_TP_CHUNKS * blocks_per_chunk,
+        padded_rows / FP8_BLOCK == local_chunks * blocks_per_chunk,
         "{prefix}: padded grid has {} scale rows, checkpoint has {}",
         padded_rows / FP8_BLOCK,
-        QKV_TP_CHUNKS * blocks_per_chunk
+        local_chunks * blocks_per_chunk
     );
 
     let data = gpu.alloc(padded_rows * h)?;
-    let scales_bytes = s_shape[0] * s_shape[1] * 4;
+    let local_scale_rows = local_chunks * blocks_per_chunk * s_shape[1];
+    let scales_bytes = local_scale_rows * 4;
     let scales = match gpu.alloc(scales_bytes) {
         Ok(p) => p,
         Err(e) => {
@@ -110,20 +124,39 @@ pub(crate) fn load_qkv_fp8b(
     };
     let stream = gpu.default_stream();
     if padded_chunk == chunk_rows {
-        gpu.copy_d2d_async(w_ptr, data, rows * h, stream)?;
+        // One contiguous row range when the local chunks cover the tensor;
+        // otherwise per-chunk copies with the pad rows between them.
+        if local_chunks == QKV_TP_CHUNKS {
+            gpu.copy_d2d_async(w_ptr, data, rows * h, stream)?;
+        } else {
+            for j in 0..local_chunks {
+                let c = tp_rank * local_chunks + j;
+                gpu.copy_d2d_async(
+                    w_ptr.offset(c * chunk_rows * h),
+                    data.offset(j * chunk_rows * h),
+                    chunk_rows * h,
+                    stream,
+                )?;
+            }
+        }
     } else {
         // Each chunk is contiguous in both layouts; the pad rows sit
         // between chunks in the destination only.
-        for c in 0..QKV_TP_CHUNKS {
+        for j in 0..local_chunks {
+            let c = tp_rank * local_chunks + j;
             gpu.copy_d2d_async(
                 w_ptr.offset(c * chunk_rows * h),
-                data.offset(c * padded_chunk * h),
+                data.offset(j * padded_chunk * h),
                 chunk_rows * h,
                 stream,
             )?;
         }
     }
-    gpu.copy_d2d_async(s_ptr, scales, scales_bytes, stream)?;
+    // The scale grid is row-major over (row block, k block); a chunk is a
+    // contiguous band of `blocks_per_chunk` rows, so the local chunks' bands
+    // are one contiguous range.
+    let s_offset = (tp_rank * local_chunks * blocks_per_chunk * s_shape[1] * 4) as u64;
+    gpu.copy_d2d_async(DevicePtr(s_ptr.0 + s_offset), scales, scales_bytes, stream)?;
     gpu.synchronize(stream)?;
     // Both source tensors are store-owned; reclaim records them so release
     // does not free the same pointers a second time.
@@ -136,6 +169,7 @@ pub(crate) fn load_qkv_fp8b(
             tiled: false,
         },
         padded_chunk,
+        local_chunks,
     ))
 }
 

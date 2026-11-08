@@ -31,8 +31,12 @@ pub(crate) fn load_mimo_mtp_modules(
         config.v_head_dim
     );
     let h = config.hidden_size;
-    let nq = config.num_attention_heads;
-    let nkv = config.num_key_value_heads;
+    // The drafter is unsharded (rank 0 only): it always loads the checkpoint's
+    // full head counts and all four QKV chunks, even when the main model runs
+    // attention TP.
+    let tp_size = config.tp_world_size.max(1);
+    let nq = config.num_attention_heads * tp_size;
+    let nkv = config.num_key_value_heads * tp_size;
     let null = DenseWeight {
         weight: DevicePtr::NULL,
     };
@@ -51,7 +55,8 @@ pub(crate) fn load_mimo_mtp_modules(
         let ffn = load_dense_ffn(store, config, gpu, &lp, absmax_k, quantize_k, stream)?;
 
         let p = format!("{lp}.self_attn");
-        let (qkv, chunk_rows) = load_qkv_chunked(store, &format!("{p}.qkv_proj"), nq, nkv, h, gpu)?;
+        let (qkv, chunk_rows, _) =
+            load_qkv_chunked(store, &format!("{p}.qkv_proj"), nq, nkv, h, gpu, 0, 1)?;
         let o_key = format!("{p}.o_proj.weight");
         {
             let o = store.get(&o_key)?;

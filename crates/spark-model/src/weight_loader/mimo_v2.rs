@@ -19,10 +19,9 @@
 //! Vision and audio tensors are skipped. `model.mtp.*` stays loadable; the
 //! server-side `skip_mtp` policy drops it unless `--speculative` runs on rank 0.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
-use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 use spark_runtime::kv_cache::KvCacheDtype;
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
@@ -39,15 +38,15 @@ use crate::weight_map::{
     quantized_mxfp4_e8m0,
 };
 
-/// The published checkpoint stores fused QKV pre-sharded for TP=4.
-pub(super) const QKV_TP_CHUNKS: usize = 4;
 /// Upper bound on concurrently decoded sequences the split-K scratch covers;
 /// beyond it decode falls back to fewer splits.
 pub(super) const MAX_DECODE_SEQS: usize = 64;
 
 pub(crate) mod fp8b;
 pub(crate) mod mtp;
+pub(crate) mod qkv;
 pub(crate) use mtp::load_mimo_mtp_modules;
+pub(super) use qkv::{QKV_TP_CHUNKS, load_qkv_chunked, qkv_chunk_rows};
 
 pub struct MimoV2WeightLoader;
 
@@ -61,87 +60,6 @@ fn layer_kv_heads(config: &ModelConfig, layer: usize) -> usize {
     } else {
         config.full_num_key_value_heads
     }
-}
-
-/// Rows of one TP chunk of the fused QKV: `Q_c | K_c | V_c`.
-pub(super) fn qkv_chunk_rows(nq: usize, nkv: usize) -> usize {
-    let qk = MIMO_QK_DIM as usize;
-    let vd = MIMO_V_DIM as usize;
-    (nq / QKV_TP_CHUNKS) * qk + (nkv / QKV_TP_CHUNKS) * (qk + vd)
-}
-
-/// Load the TP-chunked fused QKV as BF16 `[4 * chunk_rows, hidden]`.
-pub(super) fn load_qkv_chunked(
-    store: &WeightStore,
-    prefix: &str,
-    nq: usize,
-    nkv: usize,
-    h: usize,
-    gpu: &dyn GpuBackend,
-) -> Result<(DenseWeight, usize)> {
-    ensure!(
-        nq.is_multiple_of(QKV_TP_CHUNKS) && nkv.is_multiple_of(QKV_TP_CHUNKS),
-        "{prefix}: heads ({nq} q / {nkv} kv) not divisible by the {QKV_TP_CHUNKS} checkpoint chunks"
-    );
-    let chunk_rows = qkv_chunk_rows(nq, nkv);
-    let rows = QKV_TP_CHUNKS * chunk_rows;
-    let (w_ptr, w_dtype, w_shape) = {
-        let w = store.get(&format!("{prefix}.weight"))?;
-        (w.ptr, w.dtype, w.shape.clone())
-    };
-    ensure!(
-        w_shape == [rows, h],
-        "{prefix}.weight: shape {w_shape:?}, expected [{rows}, {h}]"
-    );
-    match w_dtype {
-        WeightDtype::BF16 => return Ok((DenseWeight { weight: w_ptr }, chunk_rows)),
-        WeightDtype::FP8E4M3 => {}
-        other => bail!("{prefix}.weight: unsupported dtype {other:?}"),
-    }
-    let (s_ptr, s_dtype, s_shape) = {
-        let s = store.get(&format!("{prefix}.weight_scale_inv"))?;
-        (s.ptr, s.dtype, s.shape.clone())
-    };
-    let blocks_per_chunk = chunk_rows.div_ceil(128);
-    let sk = h.div_ceil(128);
-    ensure!(
-        s_shape == [QKV_TP_CHUNKS * blocks_per_chunk, sk],
-        "{prefix}.weight_scale_inv: shape {s_shape:?}, expected [{}, {sk}] \
-         ({QKV_TP_CHUNKS} chunks × {blocks_per_chunk} row blocks)",
-        QKV_TP_CHUNKS * blocks_per_chunk
-    );
-    let scale_bytes = match s_dtype {
-        WeightDtype::FP32 => 4,
-        WeightDtype::BF16 => 2,
-        other => bail!("{prefix}.weight_scale_inv: unsupported dtype {other:?}"),
-    };
-    let out = gpu.alloc(rows * h * 2)?;
-    let kernel: KernelHandle = gpu.kernel(
-        "dequant_fp8_blockscaled_bf16",
-        "dequant_fp8_blockscaled_bf16",
-    )?;
-    let stream = gpu.default_stream();
-    for c in 0..QKV_TP_CHUNKS {
-        KernelLaunch::new(gpu, kernel)
-            .grid([div_ceil(h as u32, 64), div_ceil(chunk_rows as u32, 4), 1])
-            .block([64, 4, 1])
-            .arg_ptr(w_ptr.offset(c * chunk_rows * h))
-            .arg_ptr(s_ptr.offset(c * blocks_per_chunk * sk * scale_bytes))
-            .arg_ptr(out.offset(c * chunk_rows * h * 2))
-            .arg_u32(chunk_rows as u32)
-            .arg_u32(h as u32)
-            .arg_u32(128)
-            .arg_u32(128)
-            .arg_u32(sk as u32)
-            .arg_u32((scale_bytes == 4) as u32)
-            .launch(stream)?;
-    }
-    gpu.synchronize(stream)?;
-    // Both source tensors are store-owned; reclaim records them so release does
-    // not free the same pointers a second time.
-    store.reclaim(gpu, &format!("{prefix}.weight"))?;
-    store.reclaim(gpu, &format!("{prefix}.weight_scale_inv"))?;
-    Ok((DenseWeight { weight: out }, chunk_rows))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -251,8 +169,12 @@ fn load_moe(
 
 impl ModelWeightLoader for MimoV2WeightLoader {
     fn supports_tp(&self) -> bool {
-        // Expert parallelism only; attention is replicated per rank.
-        false
+        // Attention shards by checkpoint chunk pairs (see `load_qkv_chunked`);
+        // each rank stores only its own KV heads. The dense layer-0 FFN, the
+        // MoE router and the LM head stay replicated; experts stay EP-sharded.
+        // Decode/prefill/verify TP all-reduces are the generic paths in
+        // `qwen3_attention` (`tp_world_size > 1` branches).
+        true
     }
 
     fn dead_namespaces(&self, _config: &ModelConfig) -> Vec<String> {
@@ -288,6 +210,13 @@ impl ModelWeightLoader for MimoV2WeightLoader {
         let stream = gpu.default_stream();
         let kernels = MimoKernels::resolve(gpu)?;
         let fp8_qkv = fp8b::fp8_qkv_enabled()?;
+        // Attention TP: `config` head counts are already TP-local (topology
+        // divides them); the checkpoint's QKV chunk layout and the o_proj /
+        // sink tensors are indexed by the PRE-TP counts, recovered as
+        // local × tp_size.
+        let tp_rank = config.tp_rank;
+        let tp_size = config.tp_world_size.max(1);
+        let qkv_full = |nkv_local: usize| (nq * tp_size, nkv_local * tp_size);
         if fp8_qkv {
             let nk = crate::layers::ops::native_kernels(gpu);
             ensure!(
@@ -333,28 +262,84 @@ impl ModelWeightLoader for MimoV2WeightLoader {
             let p = format!("{lp}.self_attn");
             let swa = is_swa(config, i);
             let nkv = layer_kv_heads(config, i);
-            let (qkv, chunk_rows) = if fp8_qkv {
-                let (w, rows) =
-                    fp8b::load_qkv_fp8b(store, &format!("{p}.qkv_proj"), nq, nkv, h, gpu)?;
-                (MimoQkv::Fp8b(w), rows)
+            let (nq_full, nkv_full) = qkv_full(nkv);
+            let qkv_prefix = format!("{p}.qkv_proj");
+            let (qkv, chunk_rows, local_chunks) = if fp8_qkv {
+                let (w, rows, chunks) = fp8b::load_qkv_fp8b(
+                    store,
+                    &qkv_prefix,
+                    nq_full,
+                    nkv_full,
+                    h,
+                    gpu,
+                    tp_rank,
+                    tp_size,
+                )?;
+                (MimoQkv::Fp8b(w), rows, chunks)
             } else {
-                let (w, rows) = load_qkv_chunked(store, &format!("{p}.qkv_proj"), nq, nkv, h, gpu)?;
-                (MimoQkv::Bf16(w), rows)
+                let (w, rows, chunks) = load_qkv_chunked(
+                    store,
+                    &qkv_prefix,
+                    nq_full,
+                    nkv_full,
+                    h,
+                    gpu,
+                    tp_rank,
+                    tp_size,
+                )?;
+                (MimoQkv::Bf16(w), rows, chunks)
             };
             let o_key = format!("{p}.o_proj.weight");
             {
                 let o = store.get(&o_key)?;
                 ensure!(
-                    o.shape == [h, nq * MIMO_V_DIM as usize],
+                    o.shape == [h, nq_full * MIMO_V_DIM as usize],
                     "{o_key}: shape {:?}, expected [{h}, {}]",
                     o.shape,
-                    nq * MIMO_V_DIM as usize
+                    nq_full * MIMO_V_DIM as usize
                 );
             }
-            let o_proj = dense_auto(store, &o_key, gpu)?;
+            // Row-parallel shard: each rank keeps the input columns of its own
+            // query heads and produces a partial [n, hidden] that the generic
+            // TP all-reduce (decode/prefill/multi-seq) sums after the GEMM.
+            let o_full = dense_auto(store, &o_key, gpu)?;
+            let o_proj = if tp_size > 1 {
+                use crate::tp_shard::{TpShardKind, shard_dense_bf16};
+                let (ptr, _, local_in) = shard_dense_bf16(
+                    o_full.weight,
+                    h,
+                    nq_full * MIMO_V_DIM as usize,
+                    TpShardKind::RowParallel,
+                    tp_rank,
+                    tp_size,
+                    gpu,
+                )?;
+                ensure!(
+                    local_in == nq * MIMO_V_DIM as usize,
+                    "{o_key}: TP shard left {local_in} input columns, expected {}",
+                    nq * MIMO_V_DIM as usize
+                );
+                free_loader_source(store, gpu, &o_key, o_full)?;
+                DenseWeight { weight: ptr }
+            } else {
+                o_full
+            };
             let sink_key = format!("{p}.attention_sink_bias");
             let sinks = if store.contains(&sink_key) {
-                dense_auto(store, &sink_key, gpu)?.weight
+                let s_full = dense_auto(store, &sink_key, gpu)?;
+                if tp_size > 1 {
+                    use crate::tp_shard::shard_dense_1d_bf16;
+                    let (sp, dim) =
+                        shard_dense_1d_bf16(s_full.weight, nq_full, tp_rank, tp_size, gpu)?;
+                    ensure!(
+                        dim == nq,
+                        "{sink_key}: TP shard left {dim} sinks, expected {nq}"
+                    );
+                    free_loader_source(store, gpu, &sink_key, s_full)?;
+                    sp
+                } else {
+                    s_full.weight
+                }
             } else {
                 DevicePtr::NULL
             };
@@ -400,7 +385,7 @@ impl ModelWeightLoader for MimoV2WeightLoader {
                 sinks,
                 nq: nq as u32,
                 nkv: nkv as u32,
-                tp_chunks: QKV_TP_CHUNKS as u32,
+                tp_chunks: local_chunks as u32,
                 chunk_rows: chunk_rows as u32,
                 window: if swa { config.sliding_window } else { 0 },
                 rope_theta: rope_theta as f32,
