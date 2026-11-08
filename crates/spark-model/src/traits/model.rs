@@ -106,7 +106,41 @@ pub struct ScoreInput<'a> {
     /// the whole prefix and itself in both directions. GDN layers stay causal.
     /// False: plain causal attention.
     pub prefix_bidir: bool,
+    /// A knowledge pack ([`Model::score_pack`]) this request continues: its
+    /// K/V fill positions `[0, P)` and its SSM state is the entry state, so the
+    /// prefix starts at position P and the pack is never recomputed. Under
+    /// `prefix_bidir` the state block also reads the pack; the pack never reads
+    /// the state. `None`: no pack.
+    pub pack: Option<u64>,
 }
+
+/// A knowledge pack held by the model ([`Model::score_pack`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScorePackInfo {
+    /// Content address: the pack's tokens and attention mode.
+    pub id: u64,
+    /// The pack's length in tokens (P).
+    pub tokens: usize,
+    /// Whether this call encoded it (false: it was already held).
+    pub built: bool,
+}
+
+/// [`Model::score_requests`] named a pack the model does not hold (never
+/// built, or evicted): the caller can send its tokens again.
+#[derive(Debug)]
+pub struct UnknownScorePack(pub u64);
+
+impl std::fmt::Display for UnknownScorePack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "score: unknown pack {:016x} (evicted or never built)",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for UnknownScorePack {}
 
 pub trait Model: Send + Sync {
     /// Release the device memory this model owns, in reverse construction
@@ -330,6 +364,22 @@ pub trait Model: Send + Sync {
     /// `(0, 0)` when scoring is unsupported.
     fn score_capacity(&self) -> (usize, usize) {
         (0, 0)
+    }
+
+    /// The knowledge pack for `tokens` under `prefix_bidir` (a bidirectional
+    /// block: every pack row reads every pack key), encoded once in a score
+    /// pass of its own and held until evicted: its K/V blocks and its SSM
+    /// state at its end, each holding one SSM slot. Content-addressed: the
+    /// same tokens return the held pack. At most `limit` packs are held; the
+    /// least recently used goes first. Default: unsupported.
+    fn score_pack(
+        &self,
+        _tokens: &[u32],
+        _prefix_bidir: bool,
+        _limit: usize,
+        _stream: u64,
+    ) -> Result<ScorePackInfo> {
+        anyhow::bail!("this model does not support score packs")
     }
 
     /// Like `prefill_batch_chunk`, but each finishing stream's first-token

@@ -683,6 +683,14 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 8192)]
     pub max_prefill_tokens: usize,
 
+    /// Most knowledge packs `/v1/score` holds (`"pack"`): token blocks encoded
+    /// once whose K/V and SSM state later requests read instead of
+    /// recomputing. Each holds its KV blocks and one SSM slot (one sequence
+    /// fewer per score pass); the least recently used is evicted first.
+    /// 0 = packs off.
+    #[arg(long, default_value_t = 0)]
+    pub score_packs: usize,
+
     /// Minimum free GPU memory (in MB) to keep as a safety margin during
     /// model loading. If free memory drops below this threshold after any
     /// shard, loading is aborted to prevent system OOM. Default 4096 MB

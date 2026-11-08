@@ -1007,6 +1007,15 @@ pub(crate) fn load_model(
          ceiling of {} rows (DECODE_META_MAX_ROWS)",
         spark_runtime::buffers::DECODE_META_MAX_ROWS
     );
+    // Each held score knowledge pack keeps one of the SSM pool's
+    // max_batch_size slots, so the scheduler admits that many fewer sequences.
+    anyhow::ensure!(
+        args.score_packs < max_batch_size.max(1),
+        "--score-packs {} needs a larger --max-batch-size (each pack holds one of its {max_batch_size} \
+         SSM slots)",
+        args.score_packs
+    );
+    let scheduler_batch_size = max_batch_size - args.score_packs;
     // `use_speculative` gates the scheduler's `step_mtp` path which already
     // dispatches both MTP and DFlash proposers via the shared `DraftProposer`
     // trait + the `drafts.len() ≥ 4` ladder route to `step_verify_dflash`
@@ -1204,7 +1213,7 @@ pub(crate) fn load_model(
                 rotation_rx,
                 score_rx,
                 scheduler_eos,
-                max_batch_size,
+                scheduler_batch_size,
                 use_speculative,
                 dflash_verify_raw_argmax,
                 num_drafts,
@@ -1404,6 +1413,7 @@ pub(crate) fn load_model(
         score_tx: (score_capacity != (0, 0)).then(|| scheduler::score::ScoreQueue {
             tx: score_tx,
             budget: scheduler::score::ScoreBudget::new(score_capacity, max_batch_size, block_size),
+            packs: args.score_packs,
         }),
         chat: crate::api::chat::levers::ChatLevers::resolve(&ptx_set.behavior),
         vision_max_pixels,

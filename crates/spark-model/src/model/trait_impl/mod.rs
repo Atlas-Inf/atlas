@@ -301,6 +301,15 @@ impl Model for TransformerModel {
     fn score_capacity(&self) -> (usize, usize) {
         self.score_capacity_impl()
     }
+    fn score_pack(
+        &self,
+        tokens: &[u32],
+        prefix_bidir: bool,
+        limit: usize,
+        stream: u64,
+    ) -> Result<crate::traits::ScorePackInfo> {
+        self.score_pack_impl(tokens, prefix_bidir, limit, stream)
+    }
     fn supports_prefill_multi(&self) -> bool {
         self.prefill_multi_supported()
     }
