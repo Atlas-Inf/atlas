@@ -8,7 +8,7 @@ use spark_runtime::weights::WeightStore;
 
 use super::{MAX_DECODE_SEQS, QKV_TP_CHUNKS, load_dense_ffn, load_qkv_chunked};
 use crate::layers::qwen3_attention::mimo::{
-    MIMO_QK_DIM, MIMO_V_DIM, MimoAttn, MimoKernels, mimo_workspace_bytes,
+    MIMO_QK_DIM, MIMO_V_DIM, MimoAttn, MimoKernels, MimoQkv, mimo_workspace_bytes,
 };
 use crate::layers::{Qwen3AttentionLayer, mimo_mtp::MimoMtpModule};
 use crate::weight_map::{AttentionWeights, DenseWeight, QuantizedWeight, dense, dense_auto};
@@ -93,7 +93,7 @@ pub(crate) fn load_mimo_mtp_modules(
             config,
         )?;
         body.set_mimo(MimoAttn {
-            qkv,
+            qkv: MimoQkv::Bf16(qkv),
             o_proj,
             sinks,
             nq: nq as u32,

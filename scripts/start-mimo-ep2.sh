@@ -54,6 +54,12 @@ if [ "$SWA_EVICT" = "1" ]; then
     SWA_EVICT_ENV="$SWA_EVICT_ENV -e ATLAS_SWA_PREFIX_TAILS=$SWA_PREFIX_TAILS"
   fi
 fi
+# FP8_QKV=1 (default): keep qkv_proj as the checkpoint's native FP8 block
+# weights (fp8b GEMV tiers + W8A16 prefill GEMM) instead of dequantizing to
+# BF16 at load — halves the attention projection weight reads. FP8_QKV=0
+# restores the BF16 path for A/B.
+FP8_QKV="${FP8_QKV:-1}"
+FP8_QKV_ENV="-e ATLAS_MIMO_FP8_QKV=$FP8_QKV"
 # MOE_ROWS=1: row-exact verify (ATLAS_MOE_ROWS_DECODE): each verify row runs the
 # serial FFN arithmetic with one EP all-reduce per layer. Defaults on with DFLASH=1
 # (byte-identical to serial greedy and faster on GB10).
@@ -131,6 +137,7 @@ sudo docker run -d \
   -e RUST_LOG=info \
   $SWA_EVICT_ENV \
   $MOE_ROWS_ENV \
+  $FP8_QKV_ENV \
   $INTHINK_ENV \
   ${ATLAS_PROFILE_FIRST:+-e ATLAS_PROFILE_FIRST=$ATLAS_PROFILE_FIRST} \
   -v "${HOME}/.cache/huggingface:/root/.cache/huggingface" \
@@ -163,6 +170,7 @@ ssh "$WORKER_IP" "sudo docker run -d \
   -e RUST_LOG=info \
   $SWA_EVICT_ENV \
   $MOE_ROWS_ENV \
+  $FP8_QKV_ENV \
   $INTHINK_ENV \
   ${ATLAS_PROFILE_FIRST:+-e ATLAS_PROFILE_FIRST=$ATLAS_PROFILE_FIRST} \
   -v \"\${HOME}/.cache/huggingface:/root/.cache/huggingface\" \

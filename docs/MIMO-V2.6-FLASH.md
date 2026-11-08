@@ -159,6 +159,16 @@ theirs. `SWA_PREFIX_TAILS=0` turns prefix caching off.
 A `sliding-window KV slots exhausted` error means a step wrote more rows than the lag
 covers (prefill chunk > `--max-batch-tokens`).
 
+## FP8 block QKV projections (`FP8_QKV=1`, default)
+
+`qkv_proj` stays in the checkpoint's native FP8 E4M3 + F32 128×128 block-scale
+form (`ATLAS_MIMO_FP8_QKV=1`) instead of being dequantized to BF16 at load.
+Decode/verify (≤64 rows) runs the native `fp8b` GEMV tiers; longer prefills
+run the W8A16 GEMM (`fp8b_prefill_gemm`). Full-attention TP chunks (3392
+rows) are padded to the 128-row block grid (3456); the pad rows are never
+read. `o_proj` stays BF16. The kernel target carries `mxfp8_gemv.cu` (same
+source as glm-5.3-flash). `FP8_QKV=0` restores the BF16 path for A/B.
+
 ## Known risk areas to watch
 
 1. Missing-kernel errors at startup (kernel audit / `gpu.kernel` lookup) —

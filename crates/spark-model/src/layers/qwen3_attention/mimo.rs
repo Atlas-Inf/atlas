@@ -22,7 +22,7 @@ use spark_runtime::kv_cache::PagedKvCache;
 use super::Qwen3AttentionLayer;
 use crate::layer::{AttnMetadataDev, ForwardContext};
 use crate::layers::ops;
-use crate::weight_map::DenseWeight;
+use crate::weight_map::{DenseWeight, Fp8BlockWeight};
 
 pub(crate) const MIMO_QK_DIM: u32 = 192;
 pub(crate) const MIMO_V_DIM: u32 = 128;
@@ -61,12 +61,22 @@ impl MimoKernels {
     }
 }
 
+/// The fused QKV projection's weight form: BF16 (dequantized at load) or
+/// the checkpoint's native FP8 block bytes (`ATLAS_MIMO_FP8_QKV=1`).
+#[derive(Debug, Clone)]
+pub(crate) enum MimoQkv {
+    Bf16(DenseWeight),
+    Fp8b(Fp8BlockWeight),
+}
+
 /// Per-layer MiMo attention weights and geometry.
 #[derive(Debug, Clone)]
 pub(crate) struct MimoAttn {
-    /// Fused QKV, BF16 `[tp_chunks * chunk_rows, hidden]`, rows in the
-    /// checkpoint's chunk order `[Q_c | K_c | V_c] × tp_chunks`.
-    pub qkv: DenseWeight,
+    /// Fused QKV, rows in the checkpoint's chunk order `[Q_c | K_c | V_c] ×
+    /// tp_chunks`. BF16 is `[tp_chunks * chunk_rows, hidden]`; FP8 blocks pad
+    /// full-attention chunks to the 128-row grid, so `chunk_rows` is the
+    /// stride the rope kernel uses either way.
+    pub qkv: MimoQkv,
     /// O projection, BF16 `[hidden, nq * 128]` (checkpoint tensor).
     pub o_proj: DenseWeight,
     /// Per-head sink logits `[nq]` BF16, or NULL.
@@ -158,6 +168,51 @@ impl Qwen3AttentionLayer {
         }
     }
 
+    /// The QKV projection on either weight form. FP8 blocks run the native
+    /// `fp8b` tiers: the row-invariant GEMV tiers through GLM's decode-row
+    /// ceiling, the exact W8A16 prefill GEMM beyond it.
+    fn mimo_qkv_gemm(
+        &self,
+        ctx: &ForwardContext,
+        input: DevicePtr,
+        out: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: u64,
+    ) -> Result<()> {
+        let w = match &self.mimo().qkv {
+            MimoQkv::Bf16(w) => return self.mimo_gemm(ctx, input, w, out, m, n, k, stream),
+            MimoQkv::Fp8b(w) => w,
+        };
+        let kernels = ops::native_kernels(ctx.gpu);
+        ensure!(
+            kernels.fp8b.complete(false) && kernels.w8a16_gemm.0 != 0,
+            "mimo_v2: FP8 block QKV needs the fp8b GEMV tiers and w8a16_gemm_pipelined \
+             (rebuild the kernels)"
+        );
+        let (m, n, k) = (m as usize, n as usize, k as usize);
+        // GLM's ceiling: decode/verify batches stay on the GEMV tiers.
+        const GEMV_MAX_ROWS: usize = 2 * ops::MXFP8_MAX_ROWS;
+        if m <= GEMV_MAX_ROWS {
+            ops::fp8b_gemv_rows(ctx.gpu, &kernels.fp8b, w, input, out, m, n, k, n, stream)
+        } else {
+            ops::fp8b_prefill_gemm(
+                ctx.gpu,
+                &kernels,
+                ops::Fp8ActScratch::of(ctx.buffers),
+                ops::Fp8bPrefill::W8a16,
+                w,
+                input,
+                out,
+                m,
+                n,
+                k,
+                stream,
+            )
+        }
+    }
+
     /// QKV projection + RoPE + paged K/V write. Leaves Q `[n, nq*192]` in
     /// `ssm_deinterleaved`. With `contiguous`, roped K `[n, nkv, 192]` and V
     /// `[n, nkv, 128]` are also written back-to-back into `ssm_qkvz`.
@@ -183,7 +238,7 @@ impl Qwen3AttentionLayer {
         };
         let qkv_out = ctx.buffers.qkv_output();
         let q = ctx.buffers.ssm_deinterleaved();
-        self.mimo_gemm(ctx, normed, &m.qkv, qkv_out, n, m.qkv_rows(), h, stream)?;
+        self.mimo_qkv_gemm(ctx, normed, qkv_out, n, m.qkv_rows(), h, stream)?;
         KernelLaunch::new(ctx.gpu, m.kernels.qkv_rope_cache)
             .grid([n, 1, 1])
             .block([256, 1, 1])

@@ -30,7 +30,7 @@ use super::ModelWeightLoader;
 use crate::layer::TransformerLayer;
 use crate::layers::dense_ffn::DenseFfnWeights;
 use crate::layers::qwen3_attention::mimo::{
-    MIMO_QK_DIM, MIMO_V_DIM, MimoAttn, MimoKernels, mimo_workspace_bytes,
+    MIMO_QK_DIM, MIMO_V_DIM, MimoAttn, MimoKernels, MimoQkv, mimo_workspace_bytes,
 };
 use crate::layers::{DenseFfnLayer, FfnComponent, MoeLayer, Qwen3AttentionLayer};
 use crate::weight_map::{
@@ -45,6 +45,7 @@ pub(super) const QKV_TP_CHUNKS: usize = 4;
 /// beyond it decode falls back to fewer splits.
 pub(super) const MAX_DECODE_SEQS: usize = 64;
 
+pub(crate) mod fp8b;
 pub(crate) mod mtp;
 pub(crate) use mtp::load_mimo_mtp_modules;
 
@@ -62,6 +63,13 @@ fn layer_kv_heads(config: &ModelConfig, layer: usize) -> usize {
     }
 }
 
+/// Rows of one TP chunk of the fused QKV: `Q_c | K_c | V_c`.
+pub(super) fn qkv_chunk_rows(nq: usize, nkv: usize) -> usize {
+    let qk = MIMO_QK_DIM as usize;
+    let vd = MIMO_V_DIM as usize;
+    (nq / QKV_TP_CHUNKS) * qk + (nkv / QKV_TP_CHUNKS) * (qk + vd)
+}
+
 /// Load the TP-chunked fused QKV as BF16 `[4 * chunk_rows, hidden]`.
 pub(super) fn load_qkv_chunked(
     store: &WeightStore,
@@ -75,9 +83,7 @@ pub(super) fn load_qkv_chunked(
         nq.is_multiple_of(QKV_TP_CHUNKS) && nkv.is_multiple_of(QKV_TP_CHUNKS),
         "{prefix}: heads ({nq} q / {nkv} kv) not divisible by the {QKV_TP_CHUNKS} checkpoint chunks"
     );
-    let qk = MIMO_QK_DIM as usize;
-    let vd = MIMO_V_DIM as usize;
-    let chunk_rows = (nq / QKV_TP_CHUNKS) * qk + (nkv / QKV_TP_CHUNKS) * (qk + vd);
+    let chunk_rows = qkv_chunk_rows(nq, nkv);
     let rows = QKV_TP_CHUNKS * chunk_rows;
     let (w_ptr, w_dtype, w_shape) = {
         let w = store.get(&format!("{prefix}.weight"))?;
@@ -281,6 +287,20 @@ impl ModelWeightLoader for MimoV2WeightLoader {
         let quantize_k = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
         let stream = gpu.default_stream();
         let kernels = MimoKernels::resolve(gpu)?;
+        let fp8_qkv = fp8b::fp8_qkv_enabled()?;
+        if fp8_qkv {
+            let nk = crate::layers::ops::native_kernels(gpu);
+            ensure!(
+                nk.fp8b.complete(false) && nk.w8a16_gemm.0 != 0,
+                "mimo_v2: {}=1 but the kernel target lacks the fp8b GEMV tiers or \
+                 w8a16_gemm_pipelined (rebuild the kernels)",
+                fp8b::FP8_QKV_ENV
+            );
+            tracing::info!(
+                "mimo_v2: FP8 block QKV projections ON ({})",
+                fp8b::FP8_QKV_ENV
+            );
+        }
         let workspace_bytes = mimo_workspace_bytes(MAX_DECODE_SEQS, nq);
         let workspace = gpu.alloc(workspace_bytes)?;
         let (ep_lo, ep_hi) = config.local_expert_range();
@@ -313,8 +333,14 @@ impl ModelWeightLoader for MimoV2WeightLoader {
             let p = format!("{lp}.self_attn");
             let swa = is_swa(config, i);
             let nkv = layer_kv_heads(config, i);
-            let (qkv, chunk_rows) =
-                load_qkv_chunked(store, &format!("{p}.qkv_proj"), nq, nkv, h, gpu)?;
+            let (qkv, chunk_rows) = if fp8_qkv {
+                let (w, rows) =
+                    fp8b::load_qkv_fp8b(store, &format!("{p}.qkv_proj"), nq, nkv, h, gpu)?;
+                (MimoQkv::Fp8b(w), rows)
+            } else {
+                let (w, rows) = load_qkv_chunked(store, &format!("{p}.qkv_proj"), nq, nkv, h, gpu)?;
+                (MimoQkv::Bf16(w), rows)
+            };
             let o_key = format!("{p}.o_proj.weight");
             {
                 let o = store.get(&o_key)?;
