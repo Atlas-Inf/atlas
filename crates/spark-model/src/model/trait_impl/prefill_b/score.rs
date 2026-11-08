@@ -336,6 +336,7 @@ impl TransformerModel {
             stream,
         )?;
         drop(infos);
+        meta.gqa_tiles = true;
         cursor += meta.staged_bytes;
         if plan.any_bidir() {
             cursor = self.score_stage_bidir(plan, &mut meta, cursor, stream)?;

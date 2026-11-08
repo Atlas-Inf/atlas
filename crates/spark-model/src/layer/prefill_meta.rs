@@ -132,6 +132,10 @@ pub struct BatchedAttnMetadata {
     /// `prefill_paged_compute.cuh`. `DevicePtr::NULL` (every stream causal)
     /// everywhere except the score path's `prefix_bidir` requests.
     pub state_end: DevicePtr,
+    /// Score pass: the BF16 HDIM-256 layers run GQA-packed 128-row tiles at
+    /// any length (`rows128.rs`), so every request of a pass takes the same
+    /// kernel alone or merged. False everywhere else.
+    pub gqa_tiles: bool,
     /// Maximum block_table length across the batch (kernel uses for
     /// bounds checking; per-stream block_table reads via the pointer
     /// array dereference).

@@ -281,6 +281,7 @@ impl TransformerModel {
             kv_lens: scratch_base.offset(kv_lens_off - positions_off),
             kv_lens_host,
             state_end: DevicePtr::NULL,
+            gqa_tiles: false,
             max_blocks_per_seq: max_blocks,
             staged_bytes: total_meta_bytes,
         })
