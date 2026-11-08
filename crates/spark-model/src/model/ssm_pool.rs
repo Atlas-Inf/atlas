@@ -359,6 +359,9 @@ impl SsmStatePool {
         } else {
             Vec::new()
         };
+        if has_mtp {
+            tracing::info!("SSM verify H snapshots per slot: {h_inter_counts:?}");
+        }
         let (h_inter_offsets, h_inter_total) = h_inter_layout(&h_inter_counts);
         let mut replay_input_rings = Vec::new();
         let records = has_mtp && rollback_mode == crate::ssm_reserve::SsmRollbackMode::Records;

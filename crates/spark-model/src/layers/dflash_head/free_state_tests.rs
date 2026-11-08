@@ -115,6 +115,7 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         candidate_selector: None,
         dspine: None,
         alt: None,
+        live: Default::default(),
         fused_kv_weight: None,
         kv_cache: parking_lot::Mutex::new(zero_kv_cache()),
         scratch: zero_scratch(),

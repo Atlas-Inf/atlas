@@ -127,7 +127,8 @@ impl Route {
         }
     }
 
-    fn short(&self) -> usize {
+    /// The short-block head.
+    pub fn short(&self) -> usize {
         usize::from(self.caps[1] < self.caps[0])
     }
 
@@ -263,6 +264,21 @@ impl BlockDiffusionDraftHead {
         Ok(())
     }
 
+    /// The head of a sequence's next propose: its router's pick with at most
+    /// two sequences alive, else the short-block head (the
+    /// batched verify runs 8 rows a sequence there, where the long head's
+    /// extra rows buy nothing; the router keeps its state for later).
+    pub(super) fn dual_pick(&self, route: &mut Route) -> usize {
+        let live = self.live.load(std::sync::atomic::Ordering::Relaxed);
+        let head = if live > 2 {
+            route.short()
+        } else {
+            route.pick()
+        };
+        route.last = head;
+        head
+    }
+
     /// The head serving route `h` (0 = this one).
     pub(super) fn routed(&self, h: usize) -> &BlockDiffusionDraftHead {
         match (h, self.alt.as_deref()) {
@@ -299,9 +315,7 @@ impl BlockDiffusionDraftHead {
                 .as_any_mut()
                 .downcast_mut::<DflashProposerState>()
                 .context("Invalid DFlash proposer state")?;
-            let h = d.route.pick();
-            d.route.last = h;
-            heads.push(h);
+            heads.push(self.dual_pick(&mut d.route));
         }
         let mut out = vec![Vec::new(); n];
         for h in 0..2 {
