@@ -57,6 +57,14 @@ const SHAPES: &[(&str, Family, usize, usize, u32, u32)] = &[
         0,
     ),
     (
+        "w4 gdn qkvz [16384 x 5120]",
+        Family::W4a16,
+        16384,
+        5120,
+        0,
+        0,
+    ),
+    (
         "w4 o_proj   [ 5120 x 6144]",
         Family::W4a16,
         5120,

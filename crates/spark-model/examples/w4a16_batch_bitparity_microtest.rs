@@ -51,8 +51,9 @@ const _: () = assert!(!TAIL_N.is_multiple_of(4));
 /// The `q27` rows are the Qwen3.8-27B (qwen3_5, hidden 5120) NVFP4 shapes
 /// the `ATLAS_EXACT_VERIFY` DFlash K=γ verify runs on `w4a16_gemv_batch16`
 /// at 9..=16 rows (and the scalar tiers below that): dense FFN gate/up and
-/// down, attention K/V and o_proj, and the LM head.
-const SHAPES: [(&str, usize, usize); 10] = [
+/// down, attention K/V and o_proj (also the NVFP4 GDN out_proj's shape), the
+/// NVFP4 GDN in_proj_qkvz, and the LM head.
+const SHAPES: [(&str, usize, usize); 11] = [
     ("nano  in_proj  [10304 x 2688]", 10304, 2688),
     ("nano  out_proj [ 2688 x 4096]", 2688, 4096),
     ("super in_proj  [18560 x 4096]", 18560, 4096),
@@ -61,6 +62,7 @@ const SHAPES: [(&str, usize, usize); 10] = [
     ("q27   gate/up  [17408 x 5120]", 17408, 5120),
     ("q27   down     [5120 x 17408]", 5120, 17408),
     ("q27   o_proj   [ 5120 x 6144]", 5120, 6144),
+    ("q27   gdn qkvz [16384 x 5120]", 16384, 5120),
     ("q27   k/v      [ 1024 x 5120]", 1024, 5120),
     ("q27   lm_head [248320 x 5120]", 248_320, 5120),
 ];

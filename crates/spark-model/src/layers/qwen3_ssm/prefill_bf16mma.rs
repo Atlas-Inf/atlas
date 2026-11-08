@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! GDN `in_proj_qkvz` / `out_proj` prefill on BF16 tensor cores
-//! (`ops::DenseBf16mma::fp8`, lever `ATLAS_DENSE_PREFILL_BF16MMA=1`) for
-//! native per-tensor FP8 checkpoints: BF16 activations times the exact
-//! FP8 weights, where the default arms quantize the activations to FP8.
+//! GDN `in_proj_qkvz` / `out_proj` prefill on BF16 tensor cores (lever
+//! `ATLAS_DENSE_PREFILL_BF16MMA=1`): `ops::DenseBf16mma::fp8` for native
+//! per-tensor FP8 checkpoints (BF16 activations times the exact FP8 weights,
+//! where the default arms quantize the activations to FP8), and
+//! `ops::DenseBf16mma::nvfp4` on the transposed tables of NVFP4 ones. With
+//! `ATLAS_DENSE_PREFILL_LOWP` the `qkvz` / `gout` bits give either format
+//! E4M3 tokens (W8A8 / W4A8).
 
 use super::*;
 
@@ -30,7 +33,7 @@ impl Qwen3SsmLayer {
     }
 
     /// Runs the projection `slot` of `rows` rows if this path serves it.
-    pub(super) fn try_fp8_bf16mma(
+    pub(super) fn try_bf16mma(
         &self,
         slot: usize,
         ctx: &ForwardContext,
@@ -43,12 +46,7 @@ impl Qwen3SsmLayer {
         } else {
             (&self.out_proj_fp8w, &self.out_proj_fp8w_t)
         };
-        let Some(w) = w else { return Ok(false) };
-        if !(ctx.levers.dense_prefill_bf16mma
-            && self
-                .bf16mma
-                .serves_fp8(w, self.bf16mma_fp8_ok[slot], rows, ctx.levers))
-        {
+        if !ctx.levers.dense_prefill_bf16mma {
             return Ok(false);
         }
         let lowp = ops::LowpArgs {
@@ -60,8 +58,31 @@ impl Qwen3SsmLayer {
             codes: ctx.buffers.ffn_act_a(),
             scales: ctx.buffers.ffn_act_scale(),
         };
+        if let Some(w) = w {
+            if !self
+                .bf16mma
+                .serves_fp8(w, self.bf16mma_fp8_ok[slot], rows, ctx.levers)
+            {
+                return Ok(false);
+            }
+            self.bf16mma
+                .fp8(ctx.gpu, input, w, wt.as_ref(), out, rows, lowp, stream)?;
+            return Ok(true);
+        }
+        let h = ctx.config.hidden_size as u32;
+        let value_dim =
+            (ctx.config.linear_num_value_heads * ctx.config.linear_value_head_dim) as u32;
+        let (wt, [n, k]) = if slot == QKVZ {
+            (&self.qkvz_nvfp4_t, [ctx.config.ssm_qkvz_size() as u32, h])
+        } else {
+            (&self.out_proj_nvfp4_t, [h, value_dim])
+        };
+        let Some(wt) = wt else { return Ok(false) };
+        if !self.bf16mma.serves_nvfp4(wt, [rows, n, k], ctx.levers) {
+            return Ok(false);
+        }
         self.bf16mma
-            .fp8(ctx.gpu, input, w, wt.as_ref(), out, rows, lowp, stream)?;
+            .nvfp4(ctx.gpu, input, wt, out, [rows, n, k], lowp, stream)?;
         Ok(true)
     }
 
