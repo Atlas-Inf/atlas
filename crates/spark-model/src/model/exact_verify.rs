@@ -15,8 +15,10 @@
 //! speculate inside `<think>` (`mtp_gate::spec_think_for`, no
 //! `ATLAS_DFLASH_SPEC_THINK` needed): lossless at T=0, and exact in
 //! distribution at T>0 because the rows are accepted by sequential
-//! sampling. Only one active sequence: the multi-sequence verify is NOT
-//! exact (`batch_verify_bit_exact` stays false). The MTP depth is capped at
+//! sampling. With `ATLAS_SKINNY_MMA=1` as well the batched multi-sequence
+//! decode and verify are exact too ([`batch_lever`], the section below), so
+//! `batch_verify_bit_exact` holds and a concurrent batch speculates inside
+//! `<think>`; without it only ONE active sequence does. The MTP depth is capped at
 //! [`MAX_DRAFTS`]; beside a DFlash drafter γ is capped at
 //! [`DFLASH_MAX_DRAFTS`] (`ModelLevers::exact_verify_rows` = 16, which also
 //! widens the attention split pin and admits the 5..=16-row arms below).
@@ -60,6 +62,38 @@
 //! (`ATLAS_DFLASH_WARM_CTX`) and proposal run on drafter state. The proposal
 //! itself is not exact and need not be: it only proposes.
 //!
+//! ## Several sequences (`ATLAS_EXACT_VERIFY=1` + `ATLAS_SKINNY_MMA=1`)
+//!
+//! A batched multi-sequence decode (`decode_a2`, one row a sequence) or
+//! verify (`verify_e`, `Σ ks` rows, DFlash or MTP) runs the same layer bodies
+//! as the single-sequence verify above at a wider row count, up to
+//! [`BATCH_MAX_ROWS`]. Under [`batch_lever`] (`ModelLevers::dense_batch_exact`)
+//! every op whose arithmetic was keyed on the row count takes, at every
+//! width, the arm whose rows are serial decode's bytes:
+//!
+//! | op | batched (default) | under the batch lever |
+//! |---|---|---|
+//! | NVFP4, Q+gate and FP8 projections past 16 rows (attention q/k/v/o, GDN qkvz/out, dense FFN) | tile GEMMs (`forward_prefill`, `wide_verify_gemm`, `w8a16_gemm`) | the skinny kernels at any row count (`skinny_mma::MAX_ROWS`: one `x8` / `w4..w16` launch, the weight streamed once; a row's bits never depend on the launch's rows) |
+//! | dense FFN of a 5+-row GDN decode step | `forward_prefill` tile GEMMs | `forward_km`'s row-exact arm (`dense_ffn_exact.rs`) |
+//! | dense FFN past 16 rows (attention and GDN layers) | `forward_prefill` | the same row-exact arm |
+//! | attention core | split count from `max(pin, rows)` | pin raised to [`BATCH_MAX_ROWS`] (on this model one split either way) |
+//! | GDN conv, recurrence, norm | per-sequence exact chain / strided twin | unchanged (already per-sequence exact) |
+//! | LM head (BF16), batched decode and mixed forward | `dense_gemm` tile GEMM | `dense_gemv_bf16` rows (`head_project`) |
+//! | LM head (BF16), past 8 rows | `dense_gemv_bf16_batchm` 8-row passes | `qwen4exp_bf16_rows16/32` passes (rows `dense_gemv_bf16`'s bytes, `ops::Qwen4ExpWideRows`) |
+//!
+//! The scheduler half: a bit-exact batched DFlash verify picks each
+//! sequence's rows through serial decode's logits pipeline
+//! (`verify_dflash_batch_step`, as `verify_dflash_step`'s `exact_picks`
+//! does for one sequence), so the thinking budget's `</think>`, the
+//! watchdogs and the penalties land on the token serial decode puts them on.
+//!
+//! `ATLAS_BATCH_EXACT_CHECK=1` (diagnostic, default off) is the qwen4_exp
+//! batching check (`trait_impl/batch_fast_check.rs`) on this model: before
+//! every batched decode step and batched verify, each sequence's rows are
+//! decoded serially on its live state, the state is put back, and the
+//! batched step's logits and final hidden rows are compared byte for byte
+//! (`BATCH_FAST_CHECK` lines).
+//!
 //! `ATLAS_EXACT_VERIFY_CHECK=1` (diagnostic, default off) is the qwen4_exp
 //! check (`trait_impl/exact_verify_check.rs`) on this model: before each
 //! K=2/3/4 verify, and each DFlash K=γ verify of up to [`DFLASH_MAX_ROWS`]
@@ -84,6 +118,9 @@ pub const MAX_DRAFTS: usize = MAX_ROWS - 1;
 pub const DFLASH_MAX_ROWS: usize = 16;
 /// The DFlash γ that verify serves.
 pub const DFLASH_MAX_DRAFTS: usize = DFLASH_MAX_ROWS - 1;
+/// Widest batched multi-sequence step the batch lever makes exact: the
+/// batched verify's row cap (`trait_impl/verify_e2.rs`, `VERIFY_ROW_CAP`).
+pub const BATCH_MAX_ROWS: usize = 128;
 /// The dense hybrid the switch is for.
 const MODEL_TYPE: &str = "qwen3_5";
 
@@ -164,6 +201,55 @@ pub(crate) fn lever_from(requested: bool, model_type: &str, c: Conflicts) -> Res
          enter <think> (one sequence)"
     );
     Ok(true)
+}
+
+/// Both switches the batch lever needs are set (`ATLAS_EXACT_VERIFY=1`,
+/// `ATLAS_SKINNY_MMA=1`): load-time sites that run before the model's levers
+/// exist (the head's wide BF16 tiers) ask this.
+pub(crate) fn batch_requested() -> bool {
+    requested() && crate::layers::ops::skinny_mma::requested()
+}
+
+/// The model's batch lever (`ModelLevers::dense_batch_exact`): the dense
+/// exact verify with the skinny kernels active, whose rows are invariant to
+/// the launch's row count at any width the batch lever serves.
+pub(crate) fn batch_lever(levers: &ModelLevers) -> bool {
+    batch_lever_from(
+        levers.dense_exact_verify(),
+        crate::layers::ops::skinny_mma::requested(),
+        crate::layers::ops::skinny_mma::active().is_some(),
+    )
+}
+
+pub(crate) fn batch_lever_from(dense_exact: bool, skinny_requested: bool, skinny: bool) -> bool {
+    if !(dense_exact && skinny_requested) {
+        return false;
+    }
+    if !skinny {
+        tracing::warn!(
+            "ATLAS_EXACT_VERIFY=1 + ATLAS_SKINNY_MMA=1: the skinny kernels did not resolve, so \
+             the batched multi-sequence steps stay inexact (one sequence speculates in <think>)"
+        );
+        return false;
+    }
+    tracing::info!(
+        "exact batching ON (ATLAS_EXACT_VERIFY=1 + ATLAS_SKINNY_MMA=1): every row of a batched \
+         multi-sequence decode or verify, up to {BATCH_MAX_ROWS} rows, runs serial decode's \
+         arithmetic; a concurrent batch speculates inside <think>"
+    );
+    true
+}
+
+/// `ATLAS_BATCH_EXACT_CHECK=1`, read once.
+pub(crate) fn batch_check_requested() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| requested_from(std::env::var("ATLAS_BATCH_EXACT_CHECK").ok().as_deref()))
+}
+
+/// Whether the batched-step check (`trait_impl/batch_fast_check.rs`) runs
+/// for this model under the batch lever.
+pub(crate) fn batch_check_active(model_type: &str, lever: bool) -> bool {
+    lever && check_from(batch_check_requested(), model_type)
 }
 
 /// Whether the serial check runs for this model: the qwen4_exp check, or

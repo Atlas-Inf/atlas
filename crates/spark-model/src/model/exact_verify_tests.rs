@@ -212,3 +212,29 @@ fn native_fp8_attention_dflash_rows_are_one_batch16_launch_on_gb10() {
         }
     }
 }
+
+#[test]
+fn the_batch_lever_needs_the_exact_verify_and_the_skinny_kernels() {
+    assert!(batch_lever_from(true, true, true));
+    assert!(!batch_lever_from(false, true, true), "no exact verify");
+    assert!(!batch_lever_from(true, false, true), "skinny not asked for");
+    assert!(
+        !batch_lever_from(true, true, false),
+        "skinny kernels missing"
+    );
+}
+
+#[test]
+fn the_batch_rows_are_the_batched_verify_cap() {
+    assert_eq!(
+        BATCH_MAX_ROWS,
+        crate::model::trait_impl::verify_e2::VERIFY_ROW_CAP
+    );
+    let mut l = levers(false, true);
+    l.exact_verify_rows = DFLASH_MAX_ROWS as u32;
+    assert!(l.dense_exact_rows(16) && !l.dense_exact_rows(17));
+    l.dense_batch_exact = true;
+    assert!(l.dense_exact_rows(17) && l.dense_exact_rows(BATCH_MAX_ROWS));
+    assert!(!l.dense_exact_rows(BATCH_MAX_ROWS + 1) && !l.dense_exact_rows(1));
+    assert_eq!(l.attn_split_ref_seqs(), BATCH_MAX_ROWS as u32);
+}

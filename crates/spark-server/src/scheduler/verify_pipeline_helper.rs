@@ -320,13 +320,16 @@ pub fn verify_pick_all_with_pipeline(
 /// rejected suffix costs no dequant, pipeline or draw. The returned picks run
 /// up to and including that row (all `argmax_ids.len()` when every draft
 /// matches, or when a GPU-argmax arm serves the span); the accept prefix and
-/// the bonus are read off them exactly as off the full span.
+/// the bonus are read off them exactly as off the full span. `row_base` is
+/// the span's first logits row (0 for a single-sequence verify, the
+/// sequence's row offset in a batched one).
 pub fn verify_pick_prefix_with_pipeline(
     model: &dyn Model,
     argmax_ids: &[u32],
     drafts: &[u32],
     a: &mut ActiveSeq,
     ctx: &LogitsContext,
+    row_base: usize,
 ) -> Vec<u32> {
     selection::select_span(
         model,
@@ -334,7 +337,7 @@ pub fn verify_pick_prefix_with_pipeline(
         Some(drafts),
         a,
         ctx,
-        0,
+        row_base,
         selection_io::CopyFailurePolicy::LegacyFallback,
     )
     .unwrap_or_else(|_| argmax_ids.to_vec())

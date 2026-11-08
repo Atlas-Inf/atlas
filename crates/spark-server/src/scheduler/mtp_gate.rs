@@ -184,8 +184,9 @@ pub fn spec_dispatch_eligible(
 /// MTP or DFlash alike). The reason speculation stays out of
 /// `<think>` is that batch-K verify is not byte-lossless at T=0; an exact
 /// verify removes it. A concurrent batch verifies through the multi-sequence
-/// path, so it needs that path exact as well (`Model::batch_verify_bit_exact`,
-/// the qwen4_exp exact-batching lane); otherwise only ONE active sequence.
+/// path, so it needs that path exact as well (`Model::batch_verify_bit_exact`:
+/// the qwen4_exp exact-batching lane, or qwen3_5 under `ATLAS_EXACT_VERIFY=1`
+/// plus `ATLAS_SKINNY_MMA=1`); otherwise only ONE active sequence.
 pub fn spec_think_for(
     opt_in: bool,
     verify_bit_exact: bool,

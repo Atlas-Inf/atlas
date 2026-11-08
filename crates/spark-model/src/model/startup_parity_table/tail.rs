@@ -102,6 +102,9 @@ pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_EXACT_VERIFY_CHECK", || {
         Ok(exact_verify::check_requested() as u64)
     }),
+    ("ATLAS_BATCH_EXACT_CHECK", || {
+        Ok(exact_verify::batch_check_requested() as u64)
+    }),
     // The qwen4_exp verify width ceiling: the K the head dispatches and the
     // worker mirrors.
     ("ATLAS_QWEN4EXP_MTP_DEPTH", || {

@@ -719,7 +719,9 @@ pub trait Model: Send + Sync {
     /// too, row by row, so a concurrent batch may speculate wherever a single
     /// sequence may (inside `<think>` included). Default false. qwen4_exp
     /// under `ATLAS_QWEN4EXP_EXACT_VERIFY=1` plus `ATLAS_QWEN4EXP_BATCH_FAST=1`
-    /// (`model/qwen4exp_batch_fast.rs`).
+    /// (`model/qwen4exp_batch_fast.rs`); qwen3_5 under `ATLAS_EXACT_VERIFY=1`
+    /// plus `ATLAS_SKINNY_MMA=1` (`model/exact_verify.rs`, "Several
+    /// sequences").
     fn batch_verify_bit_exact(&self) -> bool {
         false
     }

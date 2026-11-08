@@ -82,6 +82,16 @@ impl TransformerModel {
     ) -> Result<DevicePtr> {
         let logits = self.buffers.logits();
         let v = self.config.vocab_size;
+        // qwen3_5's batch lever (`exact_verify.rs`): each row the single-row
+        // decode head's bytes (`dense_gemv_bf16` arithmetic, 8 rows a pass
+        // over the head) instead of the `dense_gemm` tile GEMM below. Serves
+        // the batched decode (`decode_a2`) and the mixed decode+prefill
+        // forward's decode rows (`decode_b2`) alike.
+        if self.levers.dense_batch_exact && self.plain_bf16_head() {
+            use super::super::qwen4exp_lmhead_split::HeadArith;
+            self.head_project(HeadArith::Gemv, normed, 0, v, padded_n, logits, v, stream)?;
+            return Ok(logits);
+        }
         if let Some(ref fp8) = self.lm_head_fp8 {
             for i in 0..padded_n {
                 ops::dense_gemv_fp8w(

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `ATLAS_QWEN4EXP_BATCH_FAST_CHECK=1`: before a batched multi-sequence
+//! `ATLAS_QWEN4EXP_BATCH_FAST_CHECK=1` (qwen4_exp) and
+//! `ATLAS_BATCH_EXACT_CHECK=1` (qwen3_5 under the batch lever,
+//! `model/exact_verify.rs`): before a batched multi-sequence
 //! decode step or batched multi-sequence verify, decode each sequence's rows
 //! through single-sequence decode on its live state, put the state back, and
 //! compare the batched step's logits and final hidden rows with those byte
@@ -52,7 +54,12 @@ impl TransformerModel {
         ks: Option<&[usize]>,
         seqs: &mut [&mut SequenceState],
     ) -> Result<Option<BatchSerialRows>> {
-        if !check_active(&self.config.model_type, self.levers.qwen4exp_batch_fast)
+        let model_type = &self.config.model_type;
+        if !(check_active(model_type, self.levers.qwen4exp_batch_fast)
+            || super::super::exact_verify::batch_check_active(
+                model_type,
+                self.levers.dense_batch_exact,
+            ))
             || seqs.is_empty()
         {
             return Ok(None);

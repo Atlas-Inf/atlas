@@ -83,9 +83,17 @@ impl Qwen3SsmLayer {
                 return Ok(false);
             }
             // batch4 to 4 rows, batch16 past that: one template, each row
-            // `w8a16_gemv`'s bytes.
+            // `w8a16_gemv`'s bytes. Past 16 rows (the batch lever's
+            // multi-sequence steps) one call when the skinny kernels take it
+            // whole.
             let (kernel, chunk) = if rows <= 4 || self.w8a16_gemv_batch16_k.0 == 0 {
                 (self.w8a16_gemv_batch4_k, 4)
+            } else if ops::skinny_mma::serves_rows(
+                ops::skinny_mma::Family::W8a16,
+                rows as u32,
+                k as u32,
+            ) {
+                (self.w8a16_gemv_batch16_k, rows)
             } else {
                 (self.w8a16_gemv_batch16_k, 16)
             };
@@ -117,6 +125,23 @@ impl Qwen3SsmLayer {
         if let Some(w) = nvfp4 {
             if !self.w4a16_batchm.has_base() {
                 return Ok(false);
+            }
+            let whole =
+                self.w4a16_batchm
+                    .exact_kernel(rows as u32, k as u32, self.w4a16_gemv_batch16_k);
+            if rows > 16 && whole.0 != 0 {
+                ops::w4a16_gemv_batchm(
+                    ctx.gpu,
+                    whole,
+                    input,
+                    w,
+                    output,
+                    rows as u32,
+                    n as u32,
+                    k as u32,
+                    stream,
+                )?;
+                return Ok(true);
             }
             self.wide_rows.w4a16_rows(
                 ctx.gpu,

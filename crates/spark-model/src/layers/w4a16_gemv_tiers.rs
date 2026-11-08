@@ -258,15 +258,25 @@ impl W4a16BatchmTiers {
             .map_or(KernelHandle(0), |i| self.handles[i])
     }
 
-    /// The row-exact tier for `m` rows of an exact verify
-    /// (`ATLAS_EXACT_VERIFY`, `model/exact_verify.rs`): [`Self::scalar_kernel`]
-    /// up to 8 rows, `batch16` (`w4a16_gemv_batch16`, the same scalar template
-    /// at `MAX_M` 16, so row `r` is still `w4a16_gemv`'s bytes) for 9..=16, a
-    /// zero handle past that. One launch, one weight pass, at every width.
-    pub fn exact_kernel(&self, m: u32, batch16: KernelHandle) -> KernelHandle {
+    /// The row-exact tier for `m` rows of an exact verify of a `k`-wide
+    /// weight (`ATLAS_EXACT_VERIFY`, `model/exact_verify.rs`):
+    /// [`Self::scalar_kernel`] up to 8 rows, `batch16` (`w4a16_gemv_batch16`,
+    /// the same scalar template at `MAX_M` 16, so row `r` is still
+    /// `w4a16_gemv`'s bytes) for 9..=16. Past 16 rows `batch16` only when the
+    /// skinny kernels take the launch whole (`skinny_mma::serves_rows`, the
+    /// batch lever's wide steps), else a zero handle. One call, at every width.
+    pub fn exact_kernel(&self, m: u32, k: u32, batch16: KernelHandle) -> KernelHandle {
         match m {
             0..=8 => self.scalar_kernel(m),
             9..=16 => batch16,
+            _ if super::ops::skinny_mma::serves_rows(
+                super::ops::skinny_mma::Family::W4a16,
+                m,
+                k,
+            ) =>
+            {
+                batch16
+            }
             _ => KernelHandle(0),
         }
     }

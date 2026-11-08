@@ -218,10 +218,12 @@ impl Qwen3AttentionLayer {
             let k_scratch = fwd.buffers.attn_output();
             let v_scratch = k_scratch.offset(n * kv_bytes);
             // The widest scalar tier (batch16 past 8 rows, else 8 or 4) a
-            // launch; the dense K=γ verify's rows in one exact launch.
-            let wide_exact = self
-                .w4a16_batchm
-                .exact_kernel(n as u32, self.w4a16_gemv_batch16_k);
+            // launch; the dense K=γ verify's rows in one exact launch, and
+            // under the batch lever any width in one call the skinny
+            // kernels take whole.
+            let wide_exact =
+                self.w4a16_batchm
+                    .exact_kernel(n as u32, h as u32, self.w4a16_gemv_batch16_k);
             for (w, out) in [(k_nvfp4, k_scratch), (v_nvfp4, v_scratch)] {
                 if dense_wide && wide_exact.0 != 0 {
                     ops::w4a16_gemv_batchm(

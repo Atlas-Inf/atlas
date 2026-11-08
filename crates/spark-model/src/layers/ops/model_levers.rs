@@ -113,6 +113,14 @@ pub struct ModelLevers {
     /// (`model::exact_verify::max_rows`: 4 for MTP, 16 beside a DFlash
     /// drafter); 0 when the lever is off. Set by `TransformerModel::new`.
     pub exact_verify_rows: u32,
+    /// The dense exact verify extended to rows of several sequences
+    /// (`ATLAS_EXACT_VERIFY=1` with `ATLAS_SKINNY_MMA=1` on qwen3_5,
+    /// `model::exact_verify::batch_lever`): every row of a batched
+    /// multi-sequence decode or verify, up to
+    /// [`crate::model::exact_verify::BATCH_MAX_ROWS`] rows, runs serial
+    /// decode's arithmetic, so `Model::batch_verify_bit_exact` holds. Set by
+    /// `TransformerModel::new`.
+    pub dense_batch_exact: bool,
     /// qwen4_exp: the MTP verify ceiling in drafts (`ATLAS_QWEN4EXP_MTP_DEPTH`,
     /// `model/qwen4exp_mtp_depth.rs`), overriding the GDN layers' default 1.
     /// Set by `TransformerModel::new` for a qwen4_exp model only.
@@ -246,23 +254,31 @@ impl ModelLevers {
         self.exact_verify && !self.qwen4exp_exact_verify
     }
 
-    /// The widest exact verify under the dense lever (at least the MTP 4).
+    /// The widest exact forward under the dense lever (at least the MTP 4):
+    /// the single-sequence verify's, or under [`Self::dense_batch_exact`] the
+    /// widest batched multi-sequence step's.
     fn dense_exact_max_rows(&self) -> u32 {
+        if self.dense_batch_exact {
+            return crate::model::exact_verify::BATCH_MAX_ROWS as u32;
+        }
         self.exact_verify_rows
             .max(crate::model::exact_verify::MAX_ROWS as u32)
     }
 
-    /// Whether a `rows`-row single-sequence forward is a verify the dense
-    /// exact lever covers (2..=[`Self::exact_verify_rows`]), so the ops take
-    /// their row-exact arms at that width.
+    /// Whether a `rows`-row forward is one the dense exact lever covers
+    /// (2..=[`Self::exact_verify_rows`] rows of one sequence, or under
+    /// [`Self::dense_batch_exact`] up to `BATCH_MAX_ROWS` rows of any number
+    /// of sequences), so the ops take their row-exact arms at that width.
     pub fn dense_exact_rows(&self, rows: usize) -> bool {
         self.dense_exact_verify() && (2..=self.dense_exact_max_rows() as usize).contains(&rows)
     }
 
     /// The batch the paged-decode split-K count is pinned to
     /// (`qwen3_attention::split_ref_seqs`). Under the dense exact verify it is
-    /// at least the widest verify, so serial decode (1 row) and every K-row
-    /// verify reduce attention over the same split count.
+    /// at least the widest exact forward, so serial decode (1 row) and every
+    /// K-row verify, single- or multi-sequence, reduce attention over the
+    /// same split count (`split_ref_seqs` takes the larger of the pin and the
+    /// row count, and no exact forward has more rows than the pin).
     pub fn attn_split_ref_seqs(&self) -> u32 {
         if self.dense_exact_verify() {
             self.max_decode_seqs.max(self.dense_exact_max_rows())
@@ -321,6 +337,7 @@ impl ModelLevers {
             qwen4exp_exact_verify: false,
             exact_verify: false,
             exact_verify_rows: 0,
+            dense_batch_exact: false,
             qwen4exp_mtp_depth: None,
             qwen4exp_batch_fast: false,
             qwen4exp_batch_bisect: 0,

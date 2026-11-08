@@ -13,7 +13,10 @@
 //! the scalar `w4a16_gemv_batch2/3` / `w4a16_gemv_batchN` template (batch16
 //! past 8 rows, `W4a16BatchmTiers::exact_kernel`), whose row `r` is
 //! `w4a16_gemv` on row `r` with the weight read once for all rows
-//! (`examples/w4a16_batch_bitparity_microtest.rs`).
+//! (`examples/w4a16_batch_bitparity_microtest.rs`). Under the batch lever
+//! (`ModelLevers::dense_batch_exact`) the rows of a batched multi-sequence
+//! step take the same arm at any width up to `BATCH_MAX_ROWS`: past 16 rows
+//! one `batch16` call the skinny kernels take whole (`exact_kernel`).
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
@@ -40,11 +43,33 @@ impl DenseFfnLayer {
             && !ctx.levers.decode_ffn_via_gemm
     }
 
+    /// The tier [`Self::forward_rows_exact`] runs `m` rows of a `k`-wide
+    /// projection on (2 and 3 rows take their own GEMVs).
+    fn exact_tier(&self, m: u32, k: u32) -> spark_runtime::gpu::KernelHandle {
+        self.w4a16_batchm
+            .exact_kernel(m, k, self.w4a16_gemv_batch16)
+    }
+
+    /// Whether [`Self::forward_rows_exact`] serves `m` rows: the dense exact
+    /// verify, 2..=8 rows or up to the lever's widest exact forward
+    /// (`ModelLevers::dense_exact_rows`: 16 beside a DFlash drafter, the batch
+    /// lever's `BATCH_MAX_ROWS` across sequences), serial decode on the plain
+    /// NVFP4 arm, and a row-exact tier for both projection widths.
+    pub(crate) fn rows_exact_serves(&self, m: u32, ctx: &ForwardContext) -> bool {
+        let (h, inter) = (
+            ctx.config.hidden_size as u32,
+            ctx.config.intermediate_size as u32,
+        );
+        ctx.levers.dense_exact_verify()
+            && ((2..=8).contains(&m) || ctx.levers.dense_exact_rows(m as usize))
+            && self.serial_is_plain_nvfp4(ctx)
+            && (m <= 3 || [h, inter].iter().all(|&k| self.exact_tier(m, k).0 != 0))
+    }
+
     /// `m` verify rows of `input` through the FFN into `moe_output`, each row
-    /// serial decode's bytes: 2..=8 rows, or up to the lever's widest verify
-    /// (`ModelLevers::dense_exact_rows`, 16 beside a DFlash drafter).
-    /// `Ok(false)`, nothing launched, when the dense exact verify is off or
-    /// serial decode takes another arm.
+    /// serial decode's bytes (when [`Self::rows_exact_serves`]). `Ok(false)`,
+    /// nothing launched, when the dense exact verify is off or serial decode
+    /// takes another arm.
     pub(super) fn forward_rows_exact(
         &self,
         input: DevicePtr,
@@ -52,14 +77,7 @@ impl DenseFfnLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
-        if !ctx.levers.dense_exact_verify()
-            || !((2..=8).contains(&m) || ctx.levers.dense_exact_rows(m as usize))
-            || !self.serial_is_plain_nvfp4(ctx)
-        {
-            return Ok(false);
-        }
-        let tier = self.w4a16_batchm.exact_kernel(m, self.w4a16_gemv_batch16);
-        if m > 3 && tier.0 == 0 {
+        if !self.rows_exact_serves(m, ctx) {
             return Ok(false);
         }
         let h = ctx.config.hidden_size as u32;
@@ -72,7 +90,7 @@ impl DenseFfnLayer {
         let rows = |x: DevicePtr, w: &QuantizedWeight, y: DevicePtr, n: u32, k: u32| match m {
             2 => ops::w4a16_gemv_batch2(ctx.gpu, self.w4a16_gemv_batch2, x, w, y, n, k, stream),
             3 => ops::w4a16_gemv_batch3(ctx.gpu, self.w4a16_gemv_batch3, x, w, y, n, k, stream),
-            _ => ops::w4a16_gemv_batchm(ctx.gpu, tier, x, w, y, m, n, k, stream),
+            _ => ops::w4a16_gemv_batchm(ctx.gpu, self.exact_tier(m, k), x, w, y, m, n, k, stream),
         };
         rows(input, &self.weights.gate_proj, gate, inter, h)?;
         rows(input, &self.weights.up_proj, up, inter, h)?;

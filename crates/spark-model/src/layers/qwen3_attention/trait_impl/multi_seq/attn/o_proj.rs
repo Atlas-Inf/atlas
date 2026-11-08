@@ -307,19 +307,20 @@ impl Qwen3AttentionLayer {
             && !self.attn.o_proj.is_null()
             && self
                 .w4a16_batchm
-                .exact_kernel(n as u32, self.w4a16_gemv_batch16_k)
+                .exact_kernel(n as u32, nq * hd, self.w4a16_gemv_batch16_k)
                 .0
                 != 0
         {
             // Exact K=4 verify (qwen4_exp, qwen3_5) and the dense lever's
-            // 5..=16-row DFlash K=γ verify: the scalar batch template (batch16
-            // past 8 rows), whose rows equal serial decode's
+            // 5..=16-row DFlash K=γ verify (past 16 rows the batch lever's
+            // steps, one call the skinny kernels take whole): the scalar
+            // batch template (batch16 past 8 rows), whose rows equal serial decode's
             // `w4a16_gemv[_sw]`. The wide arm below may take DP4A or the
             // tensor-core tier, which do not.
             ops::w4a16_gemv_batchm(
                 fwd.gpu,
                 self.w4a16_batchm
-                    .exact_kernel(n as u32, self.w4a16_gemv_batch16_k),
+                    .exact_kernel(n as u32, nq * hd, self.w4a16_gemv_batch16_k),
                 attn_out,
                 &self.attn.o_proj,
                 o_out,

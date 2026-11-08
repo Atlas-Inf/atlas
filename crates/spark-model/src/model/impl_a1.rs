@@ -196,6 +196,7 @@ impl TransformerModel {
                 );
             }
         }
+        levers.dense_batch_exact = super::exact_verify::batch_lever(&levers);
         levers.qwen4exp_batch_fast = super::qwen4exp_batch_fast::lever(&config.model_type)?;
         levers.qwen4exp_mtp_depth = super::qwen4exp_mtp_depth::lever(
             &config.model_type,

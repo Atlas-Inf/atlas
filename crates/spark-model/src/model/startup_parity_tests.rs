@@ -389,6 +389,7 @@ fn the_table_carries_each_setting_once() {
         "ATLAS_GLM_LM_HEAD_MXFP8",
         "ATLAS_EXACT_VERIFY",
         "ATLAS_EXACT_VERIFY_CHECK",
+        "ATLAS_BATCH_EXACT_CHECK",
     ] {
         assert_eq!(
             names.iter().filter(|&&n| n == required).count(),

@@ -588,7 +588,10 @@ impl Model for TransformerModel {
         super::exact_verify::verify_bit_exact(&self.levers)
     }
     fn batch_verify_bit_exact(&self) -> bool {
+        // qwen4_exp's exact batching lane, or qwen3_5's batch lever
+        // (`exact_verify.rs`, "Several sequences").
         self.levers.qwen4exp_exact_verify && self.levers.qwen4exp_batch_fast
+            || self.levers.dense_batch_exact
     }
     fn has_proposer(&self) -> bool {
         self.has_proposer_dispatch()

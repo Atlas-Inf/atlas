@@ -287,7 +287,7 @@ impl TransformerModel {
 
     /// The head is the plain resident BF16 projection `lm_head` runs with
     /// `dense_gemv_bf16` (no FP8/NVFP4 copy, overlay, softcap or FP32 logits).
-    fn plain_bf16_head(&self) -> bool {
+    pub(in crate::model) fn plain_bf16_head(&self) -> bool {
         self.lm_head_fp8.is_none()
             && self.lm_head_nvfp4.is_none()
             && !self.lm_head_weight.weight.is_null()

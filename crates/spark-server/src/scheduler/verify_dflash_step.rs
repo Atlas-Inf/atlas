@@ -230,6 +230,7 @@ pub(super) fn verify_dflash_tail(
             drafts,
             a,
             verify_ctx,
+            0,
         )
     } else if split_rows {
         match crate::scheduler::verify_pipeline_helper::split_verify_picks(
