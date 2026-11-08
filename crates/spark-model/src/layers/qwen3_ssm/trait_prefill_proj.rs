@@ -151,7 +151,7 @@ impl Qwen3SsmLayer {
         // weight to BF16 once (cached), then route the projection through
         // cuBLASLt. W16A16 here is strictly more accurate than the W8A8 path.
         if !force_bf16
-            && self.try_fp8_bf16mma(prefill_bf16mma::QKVZ, ctx, [normed, proj_dst], k, stream)?
+            && self.try_bf16mma(prefill_bf16mma::QKVZ, ctx, [normed, proj_dst], k, stream)?
         {
             // Served on BF16 tensor cores (`prefill_bf16mma.rs`).
         } else if ctx.dispatch.cutlass_nvfp4_qkvz

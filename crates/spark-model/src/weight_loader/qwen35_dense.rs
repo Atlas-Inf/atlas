@@ -1273,7 +1273,14 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                             config,
                             gpu,
                         )?;
-                        layer.predequant_for_prefill(gpu, config, stream)?;
+                        // Prefill on BF16 tensor cores reads the transposed
+                        // tables (`prefill_bf16mma.rs`); without that lever the
+                        // out_proj arms want the FP8 predequant.
+                        if crate::layers::ops::DenseBf16mma::lever() {
+                            layer.prepare_dense_bf16mma(gpu)?;
+                        } else {
+                            layer.predequant_for_prefill(gpu, config, stream)?;
+                        }
                         tracing::info!(
                             "SSM[{lp}] native NVFP4 GDN: qkvz+out_proj loaded pre-quantized \
                              (U8-packed on disk; no BF16 dequant/requant roundtrip)"

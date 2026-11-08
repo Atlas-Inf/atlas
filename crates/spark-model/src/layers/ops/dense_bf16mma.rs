@@ -360,12 +360,7 @@ impl DenseBf16mma {
         if lowp.group == LowpMix::DOWN && self.mx_on(&lowp, [n, k]) {
             return self.mx_down(gpu, input, w, out, [m, n, k], stream);
         }
-        let lp = self.lowp_kernel(
-            &lowp,
-            k,
-            (self.w4a4, SMEM_W4A4),
-            (lowp.group << LowpMix::A8, self.w4a8, SMEM_W4A8),
-        );
+        let lp = self.nvfp4_lowp(&lowp, k);
         let (launch, nchunks) = self.head(
             gpu,
             (self.nvfp4, SMEM_NVFP4),
