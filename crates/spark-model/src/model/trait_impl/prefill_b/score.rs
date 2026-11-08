@@ -14,6 +14,10 @@
 //! rest, so no partly filled block is ever shared; each branch replays the
 //! prefix tail `[F, L)` itself (< one block of rows).
 //!
+//! A request may continue a knowledge pack (`score_pack.rs`): its positions
+//! start at the pack's length and the streams that read the pack directly take
+//! its blocks and SSM state; the pack's rows are never recomputed.
+//!
 //! Per layer every weight-bound step (norms, projections, MoE) runs ONCE over
 //! all rows. Attention needs no ordering: every row's K/V is written before
 //! the batched varlen attention reads it, and the kernel derives each
@@ -77,12 +81,34 @@ impl TransformerModel {
              layers (MLA, sliding-window, indexer or hyper-connection attention reads causally)"
         );
         let bs = self.kv_cache.lock().block_size();
+        // Held for the whole pass: no pack is evicted while this pass reads it.
+        let mut held = self.score_packs.lock();
+        let (req_pack, ids) = super::score_pack::resolve(&mut held, reqs)?;
+        let packs: Vec<&SequenceState> = ids.iter().map(|id| &held.0[id].seq).collect();
+        let pack_tokens: Vec<&[u32]> = ids.iter().map(|id| &held.0[id].tokens[..]).collect();
         let plan_reqs: Vec<ScoreRequest<'_>> = reqs
             .iter()
-            .map(|r| (r.prefix, r.branches, r.prefix_bidir))
+            .zip(&req_pack)
+            .map(|(r, k)| {
+                let pack = k.map(|k| (k, pack_tokens[k]));
+                (r.prefix, r.branches, r.prefix_bidir, pack)
+            })
             .collect();
         let plan = ScorePlan::new(&plan_reqs, bs);
-        let (max_rows, max_streams) = self.score_capacity_impl();
+        // The block-table stride bounds a stream's positions (--max-seq-len).
+        let max_blocks = self.max_blocks_per_seq as usize;
+        if let Some(t) = plan
+            .tokens
+            .iter()
+            .find(|t| t.len().div_ceil(bs) > max_blocks)
+        {
+            anyhow::bail!(
+                "score: {} positions (pack + prefix + branch) exceed {max_blocks} KV blocks \
+                 per sequence (raise --max-seq-len)",
+                t.len()
+            );
+        }
+        let (max_rows, max_streams) = self.score_capacity_held(held.0.len());
         ensure!(
             plan.total_rows() <= max_rows,
             "score: {} rows exceed one pass ({max_rows} rows: the prefill arena and SSM \
@@ -105,17 +131,18 @@ impl TransformerModel {
         let mut seqs: Vec<SequenceState> = Vec::with_capacity(plan.tokens.len());
         let run = (|| -> Result<Vec<Vec<f32>>> {
             // Only a stream that starts from the zero state needs one: a
-            // branch with a head gets the head's conv window and state copied
-            // over whole (`score_fork`), and MTP scratch is never read here.
+            // branch with a head enters from the head's conv window and state,
+            // a stream on a pack from the pack's (`score_ssm.rs`), and MTP
+            // scratch is never read here.
             for i in 0..plan.streams() {
                 seqs.push(self.alloc_sequence_reset(false)?);
-                if i < plan.heads || plan.head_of[i].is_none() {
+                if (i < plan.heads || plan.head_of[i].is_none()) && plan.reads_pack(i).is_none() {
                     let slot = seqs[i].slot_idx;
                     self.ssm_pool.zero_slot(slot, self.gpu.as_ref(), stream)?;
                 }
             }
             marks[0] = t0.elapsed().as_micros();
-            self.score_forward(&plan, &mut seqs, stream)?;
+            self.score_forward(&plan, &mut seqs, &packs, stream)?;
             if trace {
                 self.gpu.synchronize(stream)?;
             }
@@ -160,11 +187,13 @@ impl TransformerModel {
             .collect())
     }
 
-    /// Allocate blocks, embed, stage metadata and run the layer loop.
-    fn score_forward(
+    /// Allocate blocks, embed, stage metadata and run the layer loop. `packs`:
+    /// the sequences of the knowledge packs `plan.pack_of` indexes.
+    pub(super) fn score_forward(
         &self,
         plan: &ScorePlan,
         seqs: &mut [SequenceState],
+        packs: &[&SequenceState],
         stream: u64,
     ) -> Result<()> {
         let n = seqs.len();
@@ -196,6 +225,13 @@ impl TransformerModel {
                     kv_cache.inc_ref(b);
                     right[0].block_table.push(b);
                 }
+            } else if let Some(p) = plan.reads_pack(i) {
+                // The pack's whole blocks, shared; its partial last block is
+                // copied into this stream's own block below.
+                for &b in &packs[p].block_table[..plan.shared_blocks[i]] {
+                    kv_cache.inc_ref(b);
+                    seqs[i].block_table.push(b);
+                }
             }
             let end = plan.tokens[i].len();
             super::super::super::block_mgmt::ensure_blocks_through_prefill(
@@ -207,6 +243,9 @@ impl TransformerModel {
                 stream,
                 self.levers.kv_poison,
             )?;
+        }
+        if !packs.is_empty() {
+            self.score_pack_tail_copies(plan, seqs, packs, &kv_cache, stream)?;
         }
         // prefix_bidir heads read the state's partial tail block from their
         // first branch (it holds the same tail K/V as every branch).
@@ -310,7 +349,7 @@ impl TransformerModel {
         );
         let branch_cu = self.score_stage_branch_cu(plan, &meta, branch_cu_off, stream)?;
         let tabs_off = (branch_cu_off + (n + 1) * 4 + 63) & !63;
-        let ssm_tabs = self.score_stage_ssm_tables(plan, seqs, tabs_off, stream)?;
+        let ssm_tabs = self.score_stage_ssm_tables(plan, seqs, packs, tabs_off, stream)?;
 
         let gdn = GdnPrefillBuffers {
             qkv: self.gdn_buf_qkv,
@@ -374,6 +413,7 @@ impl TransformerModel {
                     hidden,
                     residual,
                     &mut refs,
+                    packs,
                     plan,
                     &meta,
                     &gdn,
@@ -439,41 +479,5 @@ impl TransformerModel {
                 .copy_h2d_async_retained(&bytes, meta.kv_lens, stream)?;
         }
         Ok(off + ((n * 4 + 63) & !63))
-    }
-}
-
-impl TransformerModel {
-    /// Score passes run on one rank and read BF16 logits.
-    fn score_supported(&self) -> bool {
-        !self.multi_rank_protocol_active() && self.comm.is_none() && !self.use_fp32_logits
-    }
-
-    /// See [`crate::traits::Model::score_capacity`].
-    pub(in crate::model) fn score_capacity_impl(&self) -> (usize, usize) {
-        if !self.score_supported() {
-            return (0, 0);
-        }
-        let mut rows = self.buffers.max_batch_tokens();
-        if self.ssm_pool.num_ssm_layers > 0 {
-            rows = rows.min(self.gdn_buf_max_len);
-        }
-        let streams = if self.ssm_pool.num_ssm_layers > 0 {
-            self.ssm_pool.max_slots
-        } else {
-            usize::MAX
-        };
-        // The metadata scratch (`score_forward`): per row, MoE top-k staging
-        // (8 B per expert), this path's own per-stream metadata (24 B), the
-        // staged positions (x3 with MRoPE) and slots (20 B); per stream, the
-        // alignment pads and pointer, cu_seqlens, kv_lens, state-end and
-        // h-state-pointer entries (256 B, generously); 64 KiB to spare.
-        // Plus, per SSM layer, its pointer-table entries (`score_ssm.rs`).
-        const PER_STREAM: usize = 256;
-        let tables = super::score_ssm::TABLES * 8 * self.ssm_pool.num_ssm_layers;
-        let per_stream = PER_STREAM + tables;
-        let per_row = self.config.num_experts_per_tok.max(1) * 8 + 24 + 20;
-        let fixed = 64 * 1024 + per_stream * streams.min(4096);
-        let scratch_rows = self.buffers.scratch_bytes().saturating_sub(fixed) / per_row;
-        (rows.min(scratch_rows), streams)
     }
 }

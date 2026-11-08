@@ -15,6 +15,16 @@
 //! It is refused (422) on a model whose attention layers would read it
 //! causally (MLA, sliding-window, indexer or hyper-connection attention).
 //!
+//! Knowledge packs (`--score-packs N`): `"pack": [ids]` puts a token block
+//! (a policy, a handbook) before the prefix at positions `[0, P)`. The model
+//! encodes it once and holds its K/V and SSM state (up to N packs, least
+//! recently used evicted first); later requests read it instead of
+//! recomputing it. Under `prefix_bidir` the pack is one bidirectional block
+//! the state reads and that never reads the state. The response carries
+//! `"pack_id"` (and `"pack": "built" | "held"`), which a later request can
+//! send instead of the tokens; an id the model no longer holds answers 404,
+//! and the client sends the tokens again.
+//!
 //! Scheduling: a score pass shares the prefill arena, KV pool and SSM slots
 //! with chat requests, so it runs only when the scheduler is quiescent (no
 //! request decoding, prefilling, admitted, swapped or preempted), one pass
@@ -30,7 +40,7 @@ use serde::{Deserialize, Serialize};
 
 use super::compact::openai_error_response;
 use crate::main_modules::model_host::CurrentModel;
-use crate::scheduler::score::{ScoreError, ScoreJob};
+use crate::scheduler::score::{PackRef, ScoreError, ScoreJob};
 
 /// Upper bounds per request (branches and options per branch).
 pub const MAX_BRANCHES: usize = 256;
@@ -52,10 +62,23 @@ pub struct ScoreRequest {
     /// "causal" (default) or "prefix_bidir".
     #[serde(default)]
     pub attention: Option<String>,
+    /// A knowledge pack's tokens (before the prefix).
+    #[serde(default)]
+    pub pack: Option<Vec<u32>>,
+    /// A pack id from an earlier response (instead of `pack`).
+    #[serde(default)]
+    pub pack_id: Option<String>,
 }
 
-/// A validated request: prefix, branches, per-branch options, prefix_bidir.
-pub type Validated = (Vec<u32>, Vec<Vec<u32>>, Vec<Vec<u32>>, bool);
+/// A validated request: prefix, branches, per-branch options, prefix_bidir,
+/// and the pack it continues.
+pub type Validated = (
+    Vec<u32>,
+    Vec<Vec<u32>>,
+    Vec<Vec<u32>>,
+    bool,
+    Option<PackRef>,
+);
 
 #[derive(Serialize)]
 struct ScoreResponse {
@@ -64,6 +87,12 @@ struct ScoreResponse {
     queue_us: u64,
     /// Requests that shared this one's forward pass (1 = ran alone).
     batched: usize,
+    /// The pack this request ran on (16 hex digits), if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pack_id: Option<String>,
+    /// "built" (this request encoded it) or "held".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pack: Option<&'static str>,
 }
 
 /// Validate and expand a request into (prefix, branches, per-branch options).
@@ -73,6 +102,8 @@ pub fn validate(req: ScoreRequest, vocab_size: u32) -> Result<Validated, String>
         branches,
         options,
         attention,
+        pack,
+        pack_id,
     } = req;
     let prefix_bidir = match attention.as_deref() {
         None | Some("causal") => false,
@@ -83,7 +114,17 @@ pub fn validate(req: ScoreRequest, vocab_size: u32) -> Result<Validated, String>
             ));
         }
     };
-    if prefix_bidir && prefix.is_empty() {
+    let pack = match (pack, pack_id) {
+        (Some(_), Some(_)) => return Err("pack: send the tokens or a pack_id, not both".into()),
+        (Some(t), None) if t.is_empty() => return Err("pack: an empty pack".into()),
+        (Some(t), None) => Some(PackRef::Tokens(t)),
+        (None, Some(id)) => match u64::from_str_radix(&id, 16) {
+            Ok(id) => Some(PackRef::Id(id)),
+            Err(_) => return Err(format!("pack_id: {id:?} is not a hex pack id")),
+        },
+        (None, None) => None,
+    };
+    if prefix_bidir && prefix.is_empty() && pack.is_none() {
         return Err("attention: prefix_bidir needs a non-empty prefix (the state block)".into());
     }
     if branches.is_empty() || branches.len() > MAX_BRANCHES {
@@ -105,8 +146,13 @@ pub fn validate(req: ScoreRequest, vocab_size: u32) -> Result<Validated, String>
     {
         return Err(format!("options: need 1..={MAX_OPTIONS} per branch"));
     }
+    let pack_tokens: &[u32] = match &pack {
+        Some(PackRef::Tokens(t)) => t,
+        _ => &[],
+    };
     let all = prefix
         .iter()
+        .chain(pack_tokens)
         .chain(branches.iter().flatten())
         .chain(options.iter().flatten());
     if let Some(bad) = all.copied().find(|&t| t >= vocab_size) {
@@ -114,7 +160,7 @@ pub fn validate(req: ScoreRequest, vocab_size: u32) -> Result<Validated, String>
             "token id {bad} out of range: vocab_size is {vocab_size}"
         ));
     }
-    Ok((prefix, branches, options, prefix_bidir))
+    Ok((prefix, branches, options, prefix_bidir, pack))
 }
 
 pub async fn score(
@@ -130,7 +176,7 @@ pub async fn score(
             );
         }
     };
-    let (prefix, branches, options, prefix_bidir) =
+    let (prefix, branches, options, prefix_bidir, pack) =
         match validate(req, state.tokenizer.vocab_size()) {
             Ok(v) => v,
             Err(msg) => return openai_error_response(StatusCode::BAD_REQUEST, msg),
@@ -144,12 +190,20 @@ pub async fn score(
     if let Err(msg) = queue.check_fits(&prefix, &branches) {
         return openai_error_response(StatusCode::UNPROCESSABLE_ENTITY, msg);
     }
+    if pack.is_some() && queue.packs == 0 {
+        return openai_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "pack: knowledge packs are off on this server (start it with --score-packs N)".into(),
+        );
+    }
     let (reply, rx) = tokio::sync::oneshot::channel();
     let job = ScoreJob {
         prefix,
         branches,
         options,
         prefix_bidir,
+        pack,
+        pack_limit: queue.packs,
         enqueued: std::time::Instant::now(),
         reply,
     };
@@ -187,9 +241,15 @@ pub async fn score(
             engine_us: out.engine_us,
             queue_us: out.queue_us,
             batched: out.batched,
+            pack_id: out.pack.map(|p| format!("{:016x}", p.id)),
+            pack: out.pack.map(|p| if p.built { "built" } else { "held" }),
         })
         .into_response(),
         Ok(Err(ScoreError::Busy)) => busy(),
+        Ok(Err(ScoreError::UnknownPack(id))) => openai_error_response(
+            StatusCode::NOT_FOUND,
+            format!("pack_id {id:016x} is not held (evicted or never built); send its tokens"),
+        ),
         Ok(Err(ScoreError::Failed(e))) => {
             openai_error_response(StatusCode::UNPROCESSABLE_ENTITY, e)
         }
@@ -220,12 +280,13 @@ mod tests {
 
     #[test]
     fn shared_options_expand_per_branch() {
-        let (p, b, o, bidir) = validate(
+        let (p, b, o, bidir, pack) = validate(
             req(r#"{"prefix":[1,2],"branches":[[3],[4,5]],"options":[7,8]}"#),
             10,
         )
         .unwrap();
         assert!(!bidir);
+        assert!(pack.is_none());
         assert_eq!(p, vec![1, 2]);
         assert_eq!(b.len(), 2);
         assert_eq!(o, vec![vec![7, 8], vec![7, 8]]);
@@ -256,5 +317,28 @@ mod tests {
         assert!(validate(empty, 10).is_err());
         let bad = req(r#"{"prefix":[1],"branches":[[3]],"options":[7],"attention":"full"}"#);
         assert!(validate(bad, 10).is_err());
+    }
+
+    #[test]
+    fn a_pack_is_tokens_or_an_id_never_both() {
+        let t = req(r#"{"prefix":[1],"branches":[[3]],"options":[7],"pack":[4,5]}"#);
+        assert_eq!(
+            validate(t, 10).unwrap().4,
+            Some(PackRef::Tokens(vec![4, 5]))
+        );
+        let id =
+            req(r#"{"prefix":[1],"branches":[[3]],"options":[7],"pack_id":"00000000000000ff"}"#);
+        assert_eq!(validate(id, 10).unwrap().4, Some(PackRef::Id(255)));
+        let both = req(r#"{"branches":[[3]],"options":[7],"pack":[4],"pack_id":"ff"}"#);
+        assert!(validate(both, 10).is_err());
+        let state_is_pack =
+            req(r#"{"branches":[[3]],"options":[7],"pack":[4],"attention":"prefix_bidir"}"#);
+        assert!(validate(state_is_pack, 10).is_ok());
+        let empty = req(r#"{"branches":[[3]],"options":[7],"pack":[]}"#);
+        assert!(validate(empty, 10).is_err());
+        let not_hex = req(r#"{"branches":[[3]],"options":[7],"pack_id":"zz"}"#);
+        assert!(validate(not_hex, 10).is_err());
+        let out_of_vocab = req(r#"{"branches":[[3]],"options":[7],"pack":[10]}"#);
+        assert!(validate(out_of_vocab, 10).is_err());
     }
 }

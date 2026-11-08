@@ -9,6 +9,12 @@
 //! copied into its branches, and all branches run together from their fork
 //! points. Each branch therefore sees exactly the state it would have had run
 //! alone.
+//!
+//! A stream on a knowledge pack (`score_pack.rs`) enters from the pack's
+//! state the same way a branch enters from its head's: the pointer tables name
+//! the pack's slot as its entry state and conv window, read in place. Heads on
+//! a pack then run their conv1d in one launch too, and their scan reads the
+//! entry table instead of starting from zero.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -85,12 +91,15 @@ impl TransformerModel {
     }
 
     /// Once per pass: for every SSM layer, `[n]` state pointers then `[n]`
-    /// entry-state pointers (a branch with a head reads the head's state),
-    /// the tables `score_gdn_scan` takes. `None` without SSM layers.
+    /// entry-state pointers (a branch with a head reads the head's state, a
+    /// stream on a pack without one the pack's), the tables `score_gdn_scan`
+    /// takes; then the same two for the conv windows. `None` without SSM
+    /// layers.
     pub(super) fn score_stage_ssm_tables(
         &self,
         plan: &ScorePlan,
         seqs: &mut [SequenceState],
+        packs: &[&SequenceState],
         off: usize,
         stream: u64,
     ) -> Result<Option<DevicePtr>> {
@@ -111,10 +120,19 @@ impl TransformerModel {
                 .iter_mut()
                 .map(|s| ssm_ptrs(s, l))
                 .collect::<Result<Vec<_>>>()?;
+            let pack_ptrs = packs
+                .iter()
+                .map(|s| super::score_pack::ssm_ptrs_of(s, l))
+                .collect::<Result<Vec<_>>>()?;
+            let entry = |i: usize| match (plan.head_of[i], plan.reads_pack(i)) {
+                (Some(h), _) => ptrs[h],
+                (None, Some(p)) => pack_ptrs[p],
+                (None, None) => ptrs[i],
+            };
             let picks: [fn((DevicePtr, DevicePtr)) -> DevicePtr; 2] = [|p| p.0, |p| p.1];
             for pick in picks {
                 tab.extend(ptrs.iter().map(|&p| pick(p).0));
-                tab.extend((0..n).map(|i| pick(ptrs[plan.head_of[i].unwrap_or(i)]).0));
+                tab.extend((0..n).map(|i| pick(entry(i)).0));
             }
         }
         let bytes: Vec<u8> = tab.iter().flat_map(|p| p.to_le_bytes()).collect();
@@ -142,10 +160,16 @@ impl TransformerModel {
         let (n, heads, cu) = (plan.streams(), plan.heads, &meta.cu_seqlens_host);
         let max_len = |lo: usize, hi: usize| (lo..hi).map(|b| (cu[b + 1] - cu[b]) as u32).max();
         let g = gdn_slice(gdn, 0, cu[heads] as usize, ctx);
+        // Heads start from zero, or from their pack's state (entry table).
+        let heads_init = if (0..heads).any(|b| plan.reads_pack(b).is_some()) {
+            tabs.offset(n * 8)
+        } else {
+            DevicePtr::NULL
+        };
         if let Some(len) = max_len(0, heads)
             && !layer.score_gdn_scan(
                 tabs,
-                DevicePtr::NULL,
+                heads_init,
                 &g,
                 heads as u32,
                 meta.cu_seqlens,
@@ -201,6 +225,41 @@ impl TransformerModel {
             &g,
             nb,
             branch_cu,
+            len,
+            ctx,
+            stream,
+        )
+    }
+
+    /// Heads on a pack: their conv1d in one launch (`score_conv1d`), each from
+    /// its entry window (the pack's, or its own zeroed one) read in place.
+    /// `Ok(false)`: no head reads a pack, or no such launch; nothing ran.
+    fn score_conv1d_pack_heads(
+        &self,
+        layer: &dyn TransformerLayer,
+        plan: &ScorePlan,
+        meta: &BatchedAttnMetadata,
+        gdn: &GdnPrefillBuffers,
+        tabs: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        let (n, heads, cu) = (plan.streams(), plan.heads, &meta.cu_seqlens_host);
+        if !(0..heads).any(|b| plan.reads_pack(b).is_some()) {
+            return Ok(false);
+        }
+        let at = |t: usize| tabs.offset(t * n * 8);
+        let len = (0..heads)
+            .map(|b| (cu[b + 1] - cu[b]) as u32)
+            .max()
+            .unwrap_or(0);
+        let g = gdn_slice(gdn, 0, cu[heads] as usize, ctx);
+        layer.score_conv1d(
+            [at(2), at(3)],
+            0,
+            &g,
+            heads as u32,
+            meta.cu_seqlens,
             len,
             ctx,
             stream,
@@ -300,6 +359,7 @@ impl TransformerModel {
         hidden: DevicePtr,
         residual: DevicePtr,
         seqs: &mut [&mut SequenceState],
+        packs: &[&SequenceState],
         plan: &ScorePlan,
         meta: &BatchedAttnMetadata,
         gdn: &GdnPrefillBuffers,
@@ -321,7 +381,16 @@ impl TransformerModel {
 
         // conv1d: heads first, then fork their windows into the branches, or
         // run every branch in one launch from its head's window in place.
-        for b in 0..n {
+        // Heads on a pack run in one launch from their entry windows too; a
+        // layer without these launches copies the pack's window in first.
+        let heads_fused = match tabs {
+            Some(t) => self.score_conv1d_pack_heads(layer, plan, meta, gdn, t, ctx, stream)?,
+            None => false,
+        };
+        if !heads_fused && !packs.is_empty() {
+            self.score_pack_seed(plan, seqs, packs, layer_idx, true, 0..heads, stream)?;
+        }
+        for b in (if heads_fused { heads } else { 0 })..n {
             if b == heads {
                 let fused = match tabs {
                     Some(t) => self
@@ -332,6 +401,9 @@ impl TransformerModel {
                     break;
                 }
                 self.score_fork(seqs, plan, layer_idx, true, stream)?;
+                if !packs.is_empty() {
+                    self.score_pack_seed(plan, seqs, packs, layer_idx, true, heads..n, stream)?;
+                }
             }
             let (off, len) = (cu[b] as usize, (cu[b + 1] - cu[b]) as usize);
             layer.prefill_phase1_conv1d_one(
@@ -355,6 +427,9 @@ impl TransformerModel {
             None => false,
         };
         if !fused {
+            if !packs.is_empty() {
+                self.score_pack_seed(plan, seqs, packs, layer_idx, false, 0..n, stream)?;
+            }
             let g = (gdn, h_ptrs_off, ctx, stream);
             self.score_gdn_group(
                 layer,

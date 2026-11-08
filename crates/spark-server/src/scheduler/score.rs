@@ -17,10 +17,15 @@
 //! bad request cannot fail its neighbours. A job too big for one pass runs as
 //! several passes in its tick, each over the prefix and a subset of its
 //! branches, reassembled in order.
+//!
+//! A job may continue a knowledge pack (`"pack"` tokens or `"pack_id"`,
+//! `spark_model::traits::Model::score_pack`): before its pass the tick gets
+//! the pack from the model, encoding it on a miss, and the pass reads it
+//! instead of recomputing it.
 
 use std::time::Instant;
 
-use spark_model::traits::{Model, ScoreInput};
+use spark_model::traits::{Model, ScoreInput, UnknownScorePack};
 
 /// Most jobs waiting for a quiescent tick; further jobs are refused as busy.
 pub const MAX_PENDING_JOBS: usize = 64;
@@ -32,6 +37,26 @@ pub enum ScoreError {
     Busy,
     /// The engine refused or failed the job.
     Failed(String),
+    /// The job named a pack the model no longer holds (evicted or never
+    /// built); the client can send its tokens again.
+    UnknownPack(u64),
+}
+
+/// The knowledge pack a job continues.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PackRef {
+    /// The pack's tokens: the model returns the held pack or encodes it.
+    Tokens(Vec<u32>),
+    /// A pack id from an earlier response.
+    Id(u64),
+}
+
+/// The pack a job ran on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackUse {
+    pub id: u64,
+    /// Whether this job's tick encoded it.
+    pub built: bool,
 }
 
 /// The handlers' end of the score queue, present only when the loaded model
@@ -41,6 +66,8 @@ pub struct ScoreQueue {
     pub tx: tokio::sync::mpsc::Sender<ScoreJob>,
     /// The scheduler's pass limits for this model.
     pub budget: ScoreBudget,
+    /// Most knowledge packs the model holds (`--score-packs`; 0: packs off).
+    pub packs: usize,
 }
 
 impl ScoreQueue {
@@ -79,6 +106,10 @@ pub struct ScoreJob {
     pub options: Vec<Vec<u32>>,
     /// Read the prefix as a bidirectional state block (`"prefix_bidir"`).
     pub prefix_bidir: bool,
+    /// The knowledge pack the prefix continues, if any.
+    pub pack: Option<PackRef>,
+    /// Most packs the model may hold when this job's pack is encoded.
+    pub pack_limit: usize,
     /// When the HTTP handler queued the job (for `queue_us`).
     pub enqueued: Instant,
     pub reply: tokio::sync::oneshot::Sender<Result<ScoreOutput, ScoreError>>,
@@ -92,6 +123,8 @@ pub struct ScoreOutput {
     pub queue_us: u64,
     /// Jobs that shared this job's forward pass (1 = ran alone).
     pub batched: usize,
+    /// The pack the job ran on, if any.
+    pub pack: Option<PackUse>,
 }
 
 /// Limits a merged pass must respect.
@@ -151,9 +184,10 @@ pub(super) fn take_tick(queue: &mut Vec<ScoreJob>, budget: &ScoreBudget) -> Vec<
     queue.drain(..n).collect()
 }
 
-/// Upper bound on a job's rows and sequences (a branch replays < one block).
+/// Upper bound on a job's rows and sequences (a branch replays < one block;
+/// on a pack the head can exist below one block of prefix).
 fn cost(job: &ScoreJob, block: usize) -> (usize, usize) {
-    let head = usize::from(job.prefix.len() >= block);
+    let head = usize::from(job.prefix.len() >= block || job.pack.is_some());
     let rows = job.prefix.len()
         + job
             .branches
@@ -163,15 +197,63 @@ fn cost(job: &ScoreJob, block: usize) -> (usize, usize) {
     (rows, head + job.branches.len())
 }
 
+/// The pack each job continues, as an id (`PackRef::Tokens` encoded on a
+/// miss). A job whose pack cannot be had is answered and dropped.
+fn resolve_packs(
+    model: &dyn Model,
+    jobs: Vec<ScoreJob>,
+    stream: u64,
+) -> Vec<(ScoreJob, Option<PackUse>)> {
+    let mut out = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        let pack = match &job.pack {
+            None => None,
+            Some(PackRef::Id(id)) => Some(PackUse {
+                id: *id,
+                built: false,
+            }),
+            Some(PackRef::Tokens(t)) => {
+                match model.score_pack(t, job.prefix_bidir, job.pack_limit, stream) {
+                    Ok(info) => Some(PackUse {
+                        id: info.id,
+                        built: info.built,
+                    }),
+                    Err(e) => {
+                        tracing::warn!("score pack failed: {e:#}");
+                        let _ = job.reply.send(Err(ScoreError::Failed(format!("{e:#}"))));
+                        continue;
+                    }
+                }
+            }
+        };
+        out.push((job, pack));
+    }
+    out
+}
+
+/// The job's error: an unknown pack, or the engine's message.
+fn job_error(e: &anyhow::Error) -> ScoreError {
+    match e.downcast_ref::<UnknownScorePack>() {
+        Some(u) => ScoreError::UnknownPack(u.0),
+        None => ScoreError::Failed(format!("{e:#}")),
+    }
+}
+
 /// Run queued jobs in arrival order on `stream`, merging neighbours.
 pub(super) fn run_jobs(model: &dyn Model, jobs: Vec<ScoreJob>, stream: u64, budget: &ScoreBudget) {
     let block = budget.block;
-    let mut batch: Vec<ScoreJob> = Vec::new();
+    let jobs = resolve_packs(model, jobs, stream);
+    // A pack built just now holds an SSM slot the tick's budget still counted.
+    let budget = &ScoreBudget {
+        streams: budget.streams.min(model.score_capacity().1.max(1)),
+        ..*budget
+    };
+    let mut batch: Vec<(ScoreJob, Option<PackUse>)> = Vec::new();
     let (mut rows, mut streams) = (0, 0);
-    for job in jobs {
+    for (job, pack) in jobs {
         let (r, s) = cost(&job, block);
         if job.branches.len() > 1 && (r > budget.rows || s > budget.streams) {
-            run_split(model, job, stream, budget, block);
+            run_split(model, job, pack, stream, budget, block);
             continue;
         }
         if !batch.is_empty() && (rows + r > budget.rows || streams + s > budget.streams) {
@@ -180,7 +262,7 @@ pub(super) fn run_jobs(model: &dyn Model, jobs: Vec<ScoreJob>, stream: u64, budg
         }
         rows += r;
         streams += s;
-        batch.push(job);
+        batch.push((job, pack));
     }
     if !batch.is_empty() {
         run_batch(model, batch, stream);
@@ -193,7 +275,7 @@ fn split_branches(
     budget: &ScoreBudget,
     block: usize,
 ) -> Vec<std::ops::Range<usize>> {
-    let head = usize::from(job.prefix.len() >= block);
+    let head = usize::from(job.prefix.len() >= block || job.pack.is_some());
     let mut groups = Vec::new();
     let (mut lo, mut rows, mut streams) = (0, job.prefix.len(), head);
     for (i, b) in job.branches.iter().enumerate() {
@@ -210,7 +292,14 @@ fn split_branches(
 }
 
 /// Run one oversized job as several passes and reply once.
-fn run_split(model: &dyn Model, job: ScoreJob, stream: u64, budget: &ScoreBudget, block: usize) {
+fn run_split(
+    model: &dyn Model,
+    job: ScoreJob,
+    pack: Option<PackUse>,
+    stream: u64,
+    budget: &ScoreBudget,
+    block: usize,
+) {
     let t = Instant::now();
     let mut probs = Vec::with_capacity(job.branches.len());
     let groups = split_branches(&job, budget, block);
@@ -220,6 +309,7 @@ fn run_split(model: &dyn Model, job: ScoreJob, stream: u64, budget: &ScoreBudget
             branches: &job.branches[g.clone()],
             options: &job.options[g.clone()],
             prefix_bidir: job.prefix_bidir,
+            pack: pack.map(|p| p.id),
         };
         match model.score_requests(std::slice::from_ref(&input), stream) {
             Ok(mut out) if out.len() == 1 => probs.append(&mut out[0]),
@@ -231,7 +321,7 @@ fn run_split(model: &dyn Model, job: ScoreJob, stream: u64, budget: &ScoreBudget
             }
             Err(e) => {
                 tracing::warn!("split score job failed: {e:#}");
-                let _ = job.reply.send(Err(ScoreError::Failed(format!("{e:#}"))));
+                let _ = job.reply.send(Err(job_error(&e)));
                 return;
             }
         }
@@ -242,19 +332,21 @@ fn run_split(model: &dyn Model, job: ScoreJob, stream: u64, budget: &ScoreBudget
         engine_us: t.elapsed().as_micros() as u64,
         queue_us,
         batched: 1,
+        pack,
     }));
 }
 
-fn run_batch(model: &dyn Model, batch: Vec<ScoreJob>, stream: u64) {
+fn run_batch(model: &dyn Model, batch: Vec<(ScoreJob, Option<PackUse>)>, stream: u64) {
     let t = Instant::now();
     let n = batch.len();
     let inputs: Vec<ScoreInput<'_>> = batch
         .iter()
-        .map(|j| ScoreInput {
+        .map(|(j, pack)| ScoreInput {
             prefix: &j.prefix,
             branches: &j.branches,
             options: &j.options,
             prefix_bidir: j.prefix_bidir,
+            pack: pack.map(|p| p.id),
         })
         .collect();
     let res = model.score_requests(&inputs, stream).and_then(|r| {
@@ -269,7 +361,7 @@ fn run_batch(model: &dyn Model, batch: Vec<ScoreJob>, stream: u64) {
     match res {
         Ok(per_job) => {
             let engine_us = t.elapsed().as_micros() as u64;
-            for (job, probs) in batch.into_iter().zip(per_job) {
+            for ((job, pack), probs) in batch.into_iter().zip(per_job) {
                 let queue_us = t.duration_since(job.enqueued).as_micros() as u64;
                 // The client may have gone away; nothing to do then.
                 let _ = job.reply.send(Ok(ScoreOutput {
@@ -277,6 +369,7 @@ fn run_batch(model: &dyn Model, batch: Vec<ScoreJob>, stream: u64) {
                     engine_us,
                     queue_us,
                     batched: n,
+                    pack,
                 }));
             }
         }
@@ -288,132 +381,13 @@ fn run_batch(model: &dyn Model, batch: Vec<ScoreJob>, stream: u64) {
         }
         Err(e) => {
             tracing::warn!("score job failed: {e:#}");
-            let msg = format!("{e:#}");
-            for job in batch {
-                let _ = job.reply.send(Err(ScoreError::Failed(msg.clone())));
+            for (job, _) in batch {
+                let _ = job.reply.send(Err(job_error(&e)));
             }
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn job(prefix: usize, branches: &[usize]) -> ScoreJob {
-        let (reply, _rx) = tokio::sync::oneshot::channel();
-        ScoreJob {
-            prefix: vec![1; prefix],
-            branches: branches.iter().map(|&n| vec![2; n]).collect(),
-            options: branches.iter().map(|_| vec![3, 4]).collect(),
-            prefix_bidir: false,
-            enqueued: Instant::now(),
-            reply,
-        }
-    }
-
-    /// A job whose client is still waiting (its receiver kept alive).
-    fn live(prefix: usize, branches: &[usize]) -> (ScoreJob, ScoreRx) {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        let j = job(prefix, branches);
-        (ScoreJob { reply, ..j }, rx)
-    }
-    type ScoreRx = tokio::sync::oneshot::Receiver<Result<ScoreOutput, ScoreError>>;
-
-    fn budget(rows: usize, streams: usize) -> ScoreBudget {
-        ScoreBudget {
-            rows,
-            streams,
-            block: 16,
-        }
-    }
-
-    #[test]
-    fn admit_refuses_a_full_backlog_and_drops_abandoned_jobs() {
-        let mut queue = Vec::new();
-        let mut rxs = Vec::new();
-        for _ in 0..MAX_PENDING_JOBS {
-            let (j, rx) = live(4, &[2]);
-            assert!(admit(&mut queue, j));
-            rxs.push(rx);
-        }
-        let (j, mut rx) = live(4, &[2]);
-        assert!(!admit(&mut queue, j));
-        assert_eq!(rx.try_recv().unwrap().err(), Some(ScoreError::Busy));
-        // One client goes away: its job is dropped and the next one fits.
-        drop(rxs.pop());
-        let (j, _rx) = live(4, &[2]);
-        assert!(admit(&mut queue, j));
-        assert_eq!(queue.len(), MAX_PENDING_JOBS);
-    }
-
-    #[test]
-    fn a_tick_takes_one_pass_and_leaves_the_rest_queued() {
-        // Each job costs 4 + 17 = 21 rows and one sequence.
-        let (mut queue, mut rxs) = (Vec::new(), Vec::new());
-        for _ in 0..5 {
-            let (j, rx) = live(4, &[2]);
-            queue.push(j);
-            rxs.push(rx);
-        }
-        let b = budget(50, 8);
-        assert_eq!(take_tick(&mut queue, &b).len(), 2);
-        assert_eq!(queue.len(), 3);
-        // Abandoned jobs are dropped unrun.
-        drop(rxs.remove(2));
-        drop(rxs.remove(2));
-        assert_eq!(take_tick(&mut queue, &b).len(), 1);
-        assert!(queue.is_empty());
-        // An oversized job runs alone (split), its neighbours wait.
-        let (big, _a) = live(40, &[10, 10, 10]);
-        let (small, _b) = live(4, &[2]);
-        queue.extend([big, small]);
-        let tick = take_tick(&mut queue, &b);
-        assert_eq!((tick.len(), tick[0].branches.len(), queue.len()), (1, 3, 1));
-    }
-
-    #[test]
-    fn check_fits_needs_each_branch_to_fit_a_pass_alone() {
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let q = ScoreQueue {
-            tx,
-            budget: budget(50, 2),
-        };
-        let b = |n: usize| vec![vec![1u32; n]];
-        assert!(q.check_fits(&[1; 40], &b(10)).is_ok());
-        assert!(q.check_fits(&[1; 40], &b(11)).is_err());
-        let one = ScoreQueue {
-            budget: budget(50, 1),
-            ..q.clone()
-        };
-        // A prefix of a whole block needs a head sequence too.
-        assert!(one.check_fits(&[1; 15], &b(1)).is_ok());
-        assert!(one.check_fits(&[1; 16], &b(1)).is_err());
-    }
-
-    #[test]
-    fn oversized_jobs_split_into_passes_that_fit() {
-        let b = budget(100, 4);
-        // prefix 40; each branch costs 10 + 15 = 25 rows: two fit per pass.
-        let groups = split_branches(&job(40, &[10, 10, 10, 10, 10]), &b, 16);
-        assert_eq!(groups, vec![0..2, 2..4, 4..5]);
-        // A single branch that is too big still gets its own pass.
-        assert_eq!(
-            split_branches(&job(40, &[90, 10]), &b, 16),
-            vec![0..1, 1..2]
-        );
-        // The stream budget splits too (head + 3 branches).
-        let tight = budget(1000, 4);
-        assert_eq!(
-            split_branches(&job(40, &[1; 5]), &tight, 16),
-            vec![0..3, 3..5]
-        );
-    }
-
-    #[test]
-    fn cost_bounds_rows_and_streams() {
-        assert_eq!(cost(&job(40, &[10, 5]), 16), (40 + 25 + 20, 3));
-        // A prefix under one block has no head stream.
-        assert_eq!(cost(&job(3, &[4]), 16), (3 + 19, 1));
-    }
-}
+#[path = "score_tests.rs"]
+mod tests;
