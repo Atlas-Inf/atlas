@@ -12,6 +12,20 @@ pub(super) fn select(
     row_base: usize,
     policy: CopyFailurePolicy,
 ) -> anyhow::Result<Vec<u32>> {
+    select_span(model, argmax_ids, None, a, ctx, row_base, policy)
+}
+
+/// [`select`], the host pipeline stopping after the first row whose pick is
+/// not its draft when `drafts` is given (the step emits nothing past it).
+pub(super) fn select_span(
+    model: &dyn Model,
+    argmax_ids: &[u32],
+    drafts: Option<&[u32]>,
+    a: &mut ActiveSeq,
+    ctx: &LogitsContext,
+    row_base: usize,
+    policy: CopyFailurePolicy,
+) -> anyhow::Result<Vec<u32>> {
     if let Some(picks) = fast(model, argmax_ids, a, ctx, row_base, policy)? {
         return Ok(picks);
     }
@@ -24,7 +38,7 @@ pub(super) fn select(
             CopyFailurePolicy::Propagate => Err(error),
         };
     }
-    Ok(slow(&buf, k, vocab, a, ctx))
+    Ok(slow(&buf, k, vocab, a, ctx, drafts))
 }
 
 /// D2H of a span's `[K, vocab]` BF16 rows starting at `row_base` into `buf`
@@ -110,10 +124,15 @@ pub(super) fn fast(
     // pipeline provably cannot change any pick, so the raw argmax IS the
     // masked pick and the [K, vocab] D2H is skipped entirely. Any
     // ineligible position falls through to the slow path for the call.
+    // Not under an exact verify (`Model::verify_bit_exact`): the masked fast
+    // path reads its stateful gates (F2's 400-token floor, an armed or
+    // ceiling-forced `</think>`) at the span's start only, so a span that
+    // crosses one mid-block would skip a stage serial decode runs. The exact
+    // verify takes MTP's arms, whose gates stand down inside `<think>`.
     let masked_verify = fast_masked::masked_verify_required(
         ctx.sampling.dflash_masked_verify,
         model.is_lightning_dspark_product(),
-    );
+    ) && !model.verify_bit_exact();
     if let Some(picks) =
         fast_masked::try_chat_fast_path(model, argmax_ids, a, ctx, row_base, policy, masked_verify)?
     {
@@ -337,6 +356,7 @@ pub(super) fn slow(
     vocab: usize,
     a: &mut ActiveSeq,
     ctx: &LogitsContext,
+    drafts: Option<&[u32]>,
 ) -> Vec<u32> {
     let elem_bytes = 2usize;
     // ATLAS_VERIFY_PICK_PAR: the rows' dequant and F2 sums up front, in
@@ -349,7 +369,7 @@ pub(super) fn slow(
             .record(crate::scheduler::mtp_timing::Phase::Dequant, t);
         p
     });
-    span_picks(k, a, ctx, None, |i, a| {
+    span_picks(k, a, ctx, drafts, |i, a| {
         Ok(match pre.as_mut() {
             Some(p) => p.pick(i, vocab, a, ctx),
             None => {
