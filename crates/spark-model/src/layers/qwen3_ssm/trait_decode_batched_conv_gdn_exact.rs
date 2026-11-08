@@ -164,6 +164,16 @@ impl Qwen3SsmLayer {
                 .enumerate()
                 .all(|(t, p)| p.0 == conv_inter_base.0 + (t * conv_bytes) as u64);
 
+        // ATLAS_QWEN38_VERIFY_FUSE: the whole chain below (four-kernel FP32
+        // arm) as one launch, the same bytes (`qwen35_gdn_verify_tree`).
+        if use_f32_conv
+            && use_f32_gdn
+            && !fused_gdn_norm
+            && self.exact_rows_fused(ssm_state, ctx, args)?
+        {
+            return Ok(());
+        }
+
         static LOGGED: std::sync::Once = std::sync::Once::new();
         LOGGED.call_once(|| {
             tracing::info!(
@@ -364,6 +374,78 @@ impl Qwen3SsmLayer {
         }
 
         Ok(())
+    }
+
+    /// The exact chain's conv, recurrence, gated norm and rollback slots of
+    /// all `num_tokens` rows as one `qwen35_gdn_verify_tree` launch
+    /// (`ATLAS_QWEN38_VERIFY_FUSE=1`), the rows a chain (the kernel's
+    /// parent table is NULL). Needs the rollback slots laid out contiguously
+    /// (the ssm pool's are). Returns whether it launched; on `false` nothing
+    /// was launched.
+    fn exact_rows_fused(
+        &self,
+        ssm_state: &mut SsmLayerState,
+        ctx: &ForwardContext,
+        args: &ConvGdnArgs,
+    ) -> Result<bool> {
+        let ConvGdnArgs {
+            num_tokens,
+            deinterleaved,
+            gates_buf,
+            normed_out,
+            h_bytes,
+            conv_bytes,
+            qkvz_size,
+            d_conv,
+            nk,
+            nv,
+            kd,
+            vd,
+            stream,
+            ..
+        } = *args;
+        let slots = num_tokens - 1;
+        let contiguous = |v: &[DevicePtr], stride: usize| {
+            v.len() >= slots
+                && v.iter()
+                    .take(slots)
+                    .enumerate()
+                    .all(|(t, p)| p.0 == v[0].0 + (t * stride) as u64)
+        };
+        if !contiguous(&ssm_state.h_state_intermediates, h_bytes)
+            || !contiguous(&ssm_state.conv_state_intermediates, conv_bytes)
+        {
+            return Ok(false);
+        }
+        let first = |v: &[DevicePtr]| v.first().copied().unwrap_or(DevicePtr::NULL);
+        let b = ops::qwen38_decode_fuse::GdnVerifyTree {
+            h_state: ssm_state.h_state,
+            conv_state: ssm_state.conv_state,
+            h_snap: first(&ssm_state.h_state_intermediates),
+            h_snap_bytes: h_bytes,
+            conv_snap: first(&ssm_state.conv_state_intermediates),
+            conv_snap_bytes: conv_bytes,
+            parent: DevicePtr::NULL,
+            qkvz: deinterleaved,
+            qkvz_stride: qkvz_size as u32,
+            conv_w: self.ssm.conv1d.weight,
+            gates: gates_buf,
+            norm_w: self.ssm.norm.weight,
+            out: normed_out,
+            rows: num_tokens as u32,
+        };
+        ops::qwen38_decode_fuse::gdn_verify_tree(
+            ctx.gpu,
+            &b,
+            nk as u32,
+            nv as u32,
+            kd as u32,
+            vd as u32,
+            d_conv as u32,
+            1e-6,
+            ctx.config.rms_norm_eps as f32,
+            stream,
+        )
     }
 }
 

@@ -282,6 +282,10 @@ name = "gdn_decode_fuse_check"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "gdn_verify_tree_check"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "attn_fp8_native_microtest"
 required-features = ["cuda", "gpu-examples"]
 
