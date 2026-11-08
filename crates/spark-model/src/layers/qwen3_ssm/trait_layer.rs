@@ -48,6 +48,7 @@ impl TransformerLayer for Qwen3SsmLayer {
         num_tokens: usize,
     ) -> bool {
         self.exact_defer_arm(gpu, levers, config, num_tokens)
+            || self.q38_defer_arm(gpu, levers, config, num_tokens)
     }
 
     fn gdn_conv_weight(&self) -> DevicePtr {

@@ -387,25 +387,40 @@ __device__ __forceinline__ void q35f_path_window(float (&win)[Q35F_DCONV], const
     }
 }
 
-extern "C" __global__ void __cluster_dims__(Q35F_REPEAT, 1, 1) __launch_bounds__(Q35F_D, 1)
-qwen35_gdn_verify_tree(
-    float* __restrict__ h_state,               // [nv, 128, 128] FP32: in before row 0, out after the last row
-    float* __restrict__ conv_state,            // [conv_dim, 4] FP32: idem
-    float* __restrict__ h_snap,                // row t's H at h_snap + t * h_snap_stride (t < k - 1)
-    float* __restrict__ conv_snap,             // row t's windows at conv_snap + t * conv_snap_stride (t < k - 1)
-    const int* __restrict__ parent,            // [k] parent row, -1 = before the verify; NULL = a chain
-    const __nv_bfloat16* __restrict__ qkvz,    // [k, qkvz_stride]: Q | K | V | Z
-    const __nv_bfloat16* __restrict__ conv_w,  // [conv_dim, 4]
-    const float* __restrict__ gates,           // [k, 2 * nv]: gate | beta
-    const __nv_bfloat16* __restrict__ norm_w,  // [128]
-    __nv_bfloat16* __restrict__ out,           // [k, nv * 128]
+// Whether row `t` of a deferred verify must keep its state in its rollback
+// slot: a later row other than `t + 1` continues it (a branch reloads it).
+// A chain (NULL parents) keeps none.
+__device__ __forceinline__ bool q35f_branch_parent(const int* __restrict__ parent,
+                                                   const unsigned int t, const unsigned int k) {
+    if (parent == nullptr) return false;
+    for (unsigned int c = t + 2; c < k; c++) {
+        if (parent[c] == (int)t) return true;
+    }
+    return false;
+}
+
+// The verify rows' body. DEFER = the deferred twin (`qwen35_gdn_verify_tree_defer`).
+template <bool DEFER>
+__device__ __forceinline__ void q35f_verify_rows(
+    float* __restrict__ h_state,
+    float* __restrict__ conv_state,
+    float* __restrict__ h_snap,
+    float* __restrict__ conv_snap,
+    const int* __restrict__ parent,
+    const __nv_bfloat16* __restrict__ qkvz,
+    const __nv_bfloat16* __restrict__ conv_w,
+    const float* __restrict__ gates,
+    const __nv_bfloat16* __restrict__ norm_w,
+    __nv_bfloat16* __restrict__ out,
+    __nv_bfloat16* __restrict__ stage_qkv,
+    float* __restrict__ stage_gb,
     const unsigned int k,
     const unsigned int num_k_heads,
     const unsigned int num_v_heads,
-    const unsigned int head_dim,               // 128 (host checks); a RUNTIME value
-    const unsigned int qkvz_stride,            // BF16 elements between rows
-    const unsigned long long h_snap_stride,    // FP32 elements between slots
-    const unsigned long long conv_snap_stride, // FP32 elements between slots
+    const unsigned int head_dim,
+    const unsigned int qkvz_stride,
+    const unsigned long long h_snap_stride,
+    const unsigned long long conv_snap_stride,
     const float l2_eps,
     const float eps
 ) {
@@ -448,6 +463,23 @@ qwen35_gdn_verify_tree(
             q35f_path_window(wv, p, parent, qkvz, qkvz_stride, cv, conv_state);
         }
         const __nv_bfloat16* qkv = qkvz + (unsigned long long)t * qkvz_stride;
+        if (DEFER) {
+            // What the commit replays: the row's raw conv inputs (the key
+            // head's q/k channels by the cluster's lead, every block its v)
+            // and its gate and beta.
+            __nv_bfloat16* st = stage_qkv + (unsigned long long)t * conv_dim;
+            if (lead) {
+                st[cq] = qkv[cq];
+                st[ck] = qkv[ck];
+            }
+            st[cv] = qkv[cv];
+            if (tid == 0) {
+                const float* gr = gates + (unsigned long long)t * 2u * num_v_heads;
+                float* gb = stage_gb + (unsigned long long)t * 2u * num_v_heads;
+                gb[vh] = gr[vh];
+                gb[num_v_heads + vh] = gr[num_v_heads + vh];
+            }
+        }
         wq[0] = wq[1]; wq[1] = wq[2]; wq[2] = wq[3]; wq[3] = (float)qkv[cq];
         wk[0] = wk[1]; wk[1] = wk[2]; wk[2] = wk[3]; wk[3] = (float)qkv[ck];
         wv[0] = wv[1]; wv[1] = wv[2]; wv[2] = wv[3]; wv[3] = (float)qkv[cv];
@@ -458,8 +490,10 @@ qwen35_gdn_verify_tree(
         smem_k[tid] = q35f_l2(k_silu, ws, l2_eps);
         __syncthreads();  // every smem_q / smem_k entry before the dots read them
 
-        const bool snap = t + 1 < k;
-        if (snap) {
+        // The deferred twin keeps only a branch parent's H (no conv slots: a
+        // branch rebuilds its windows from the inputs).
+        const bool snap = DEFER ? q35f_branch_parent(parent, t, k) : t + 1 < k;
+        if (snap && !DEFER) {
             float* cs = conv_snap + (unsigned long long)t * conv_snap_stride;
             if (lead) {
                 q35f_store_window(cs + (unsigned long long)cq * Q35F_DCONV, wq);
@@ -481,6 +515,8 @@ qwen35_gdn_verify_tree(
                         head_dim, eps);
     }
 
+    // Deferred: H0 and the windows stay for the commit's replay.
+    if (DEFER) return;
     // Every block of the key head has read the pre-verify q/k windows (the
     // row loop and any path rebuild): only now may the lead overwrite them.
     cg::this_cluster().sync();
@@ -492,5 +528,159 @@ qwen35_gdn_verify_tree(
     #pragma unroll
     for (int j = 0; j < Q35F_D; j++) {
         h_state[head + j * Q35F_D + tid] = H_reg[j];
+    }
+}
+
+extern "C" __global__ void __cluster_dims__(Q35F_REPEAT, 1, 1) __launch_bounds__(Q35F_D, 1)
+qwen35_gdn_verify_tree(
+    float* __restrict__ h_state,               // [nv, 128, 128] FP32: in before row 0, out after the last row
+    float* __restrict__ conv_state,            // [conv_dim, 4] FP32: idem
+    float* __restrict__ h_snap,                // row t's H at h_snap + t * h_snap_stride (t < k - 1)
+    float* __restrict__ conv_snap,             // row t's windows at conv_snap + t * conv_snap_stride (t < k - 1)
+    const int* __restrict__ parent,            // [k] parent row, -1 = before the verify; NULL = a chain
+    const __nv_bfloat16* __restrict__ qkvz,    // [k, qkvz_stride]: Q | K | V | Z
+    const __nv_bfloat16* __restrict__ conv_w,  // [conv_dim, 4]
+    const float* __restrict__ gates,           // [k, 2 * nv]: gate | beta
+    const __nv_bfloat16* __restrict__ norm_w,  // [128]
+    __nv_bfloat16* __restrict__ out,           // [k, nv * 128]
+    const unsigned int k,
+    const unsigned int num_k_heads,
+    const unsigned int num_v_heads,
+    const unsigned int head_dim,               // 128 (host checks); a RUNTIME value
+    const unsigned int qkvz_stride,            // BF16 elements between rows
+    const unsigned long long h_snap_stride,    // FP32 elements between slots
+    const unsigned long long conv_snap_stride, // FP32 elements between slots
+    const float l2_eps,
+    const float eps
+) {
+    q35f_verify_rows<false>(h_state, conv_state, h_snap, conv_snap, parent, qkvz, conv_w, gates,
+                            norm_w, out, nullptr, nullptr, k, num_k_heads, num_v_heads, head_dim,
+                            qkvz_stride, h_snap_stride, conv_snap_stride, l2_eps, eps);
+}
+
+// ── qwen35_gdn_verify_tree_defer + qwen35_gdn_commit_rows
+// (ATLAS_QWEN38_VERIFY_DEFER=1) ──
+//
+// The storing verify above writes, per row and GDN layer, the 3 MiB H of
+// every row but the last (and its conv windows) plus the final state, so the
+// commit is a copy of the accepted row's slot: ~0.6 ms a row over 48 layers
+// of writes nothing reads unless that row is the one accepted.
+//
+// Deferred, the verify writes no state: H0 and the windows stay as they
+// were, and each row stages its raw Q | K | V conv inputs and its gate and
+// beta (~20 KiB a row a layer) in the sequence's deferred-commit staging. A
+// tree's branch parents still keep their H (a branch reloads it), nothing
+// else. After the verdict `qwen35_gdn_commit_rows` replays the accepted rows
+// (a chain's prefix, or a tree's root path) from H0 over all the sequence's
+// GDN layers in one launch, through the same conv, L2 norm and recurrence
+// calls on the same inputs, so the state it stores is, byte for byte, the
+// storing kernel's slot of the last accepted row (its final state when that
+// row is the last). The gated norm, which the verify already produced and
+// which does not feed the state, is skipped.
+extern "C" __global__ void __cluster_dims__(Q35F_REPEAT, 1, 1) __launch_bounds__(Q35F_D, 1)
+qwen35_gdn_verify_tree_defer(
+    float* __restrict__ h_state,               // [nv, 128, 128] FP32: H0, read only
+    float* __restrict__ conv_state,            // [conv_dim, 4] FP32: read only
+    float* __restrict__ h_snap,                // a branch parent t's H at h_snap + t * h_snap_stride
+    const int* __restrict__ parent,            // [k] parent row; NULL = a chain
+    const __nv_bfloat16* __restrict__ qkvz,
+    const __nv_bfloat16* __restrict__ conv_w,
+    const float* __restrict__ gates,
+    const __nv_bfloat16* __restrict__ norm_w,
+    __nv_bfloat16* __restrict__ out,
+    __nv_bfloat16* __restrict__ stage_qkv,     // [k, conv_dim] BF16: row t's raw Q | K | V channels
+    float* __restrict__ stage_gb,              // [k, 2 * nv] FP32: row t's gate | beta
+    const unsigned int k,
+    const unsigned int num_k_heads,
+    const unsigned int num_v_heads,
+    const unsigned int head_dim,
+    const unsigned int qkvz_stride,
+    const unsigned long long h_snap_stride,
+    const float l2_eps,
+    const float eps
+) {
+    q35f_verify_rows<true>(h_state, conv_state, h_snap, nullptr, parent, qkvz, conv_w, gates,
+                           norm_w, out, stage_qkv, stage_gb, k, num_k_heads, num_v_heads,
+                           head_dim, qkvz_stride, h_snap_stride, 0, l2_eps, eps);
+}
+
+#define Q35F_COMMIT_LAYERS 48
+
+struct Q35fCommitLayer {
+    float* h;                         // [nv, 128, 128] FP32: H0 in, committed out
+    float* conv;                      // [conv_dim, 4] FP32: idem
+    const __nv_bfloat16* stage_qkv;   // [k, conv_dim] BF16
+    const float* stage_gb;            // [k, 2 * nv] FP32
+    const __nv_bfloat16* conv_w;      // [conv_dim, 4]
+};
+
+struct Q35fCommitLayers {
+    Q35fCommitLayer layer[Q35F_COMMIT_LAYERS];
+};
+
+// Grid: (num_v_heads, layers, 1) with clusters of Q35F_REPEAT; block Q35F_D.
+// `rows` packs the accepted rows 4 bits each, first row in the low nibble.
+extern "C" __global__ void __cluster_dims__(Q35F_REPEAT, 1, 1) __launch_bounds__(Q35F_D, 1)
+qwen35_gdn_commit_rows(
+    const __grid_constant__ Q35fCommitLayers layers,
+    const unsigned long long rows,
+    const unsigned int n,                      // accepted rows, 1..16
+    const unsigned int num_k_heads,
+    const unsigned int num_v_heads,
+    const unsigned int head_dim,
+    const float l2_eps
+) {
+    namespace cg = cooperative_groups;
+    const Q35fCommitLayer& L = layers.layer[blockIdx.y];
+    const unsigned int vh = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int kh = vh / (num_v_heads / num_k_heads);
+    const unsigned int key_dim = num_k_heads * Q35F_D;
+    const unsigned long long conv_dim = 2ull * key_dim + num_v_heads * Q35F_D;
+    const unsigned long long head = (unsigned long long)vh * Q35F_D * Q35F_D;
+    const bool lead = cg::this_cluster().block_rank() == 0;
+
+    float H_reg[Q35F_D];
+    #pragma unroll
+    for (int j = 0; j < Q35F_D; j++) {
+        H_reg[j] = L.h[head + j * Q35F_D + tid];
+    }
+    const unsigned int cq = kh * Q35F_D + tid;
+    const unsigned int ck = key_dim + kh * Q35F_D + tid;
+    const unsigned int cv = 2u * key_dim + vh * Q35F_D + tid;
+    float wq[Q35F_DCONV], wk[Q35F_DCONV], wv[Q35F_DCONV];
+    q35f_load_window(L.conv + (unsigned long long)cq * Q35F_DCONV, wq);
+    q35f_load_window(L.conv + (unsigned long long)ck * Q35F_DCONV, wk);
+    q35f_load_window(L.conv + (unsigned long long)cv * Q35F_DCONV, wv);
+
+    __shared__ float smem_k[Q35F_D];
+    __shared__ float smem_q[Q35F_D];
+    __shared__ float ws[4];
+    for (unsigned int i = 0; i < n; i++) {
+        const unsigned int r = (unsigned int)((rows >> (4 * i)) & 0xFull);
+        const __nv_bfloat16* qkv = L.stage_qkv + (unsigned long long)r * conv_dim;
+        wq[0] = wq[1]; wq[1] = wq[2]; wq[2] = wq[3]; wq[3] = (float)qkv[cq];
+        wk[0] = wk[1]; wk[1] = wk[2]; wk[2] = wk[3]; wk[3] = (float)qkv[ck];
+        wv[0] = wv[1]; wv[1] = wv[2]; wv[2] = wv[3]; wv[3] = (float)qkv[cv];
+        const float q_silu = q35f_conv_silu(wq, L.conv_w + (unsigned long long)cq * Q35F_DCONV);
+        const float k_silu = q35f_conv_silu(wk, L.conv_w + (unsigned long long)ck * Q35F_DCONV);
+        const float v_i = q35f_conv_silu(wv, L.conv_w + (unsigned long long)cv * Q35F_DCONV);
+        smem_q[tid] = q35f_l2(q_silu, ws, l2_eps);
+        smem_k[tid] = q35f_l2(k_silu, ws, l2_eps);
+        __syncthreads();
+        const float* g = L.stage_gb + (unsigned long long)r * 2u * num_v_heads;
+        (void)q35f_recur(H_reg, smem_k, smem_q, g[vh], g[num_v_heads + vh], v_i, head_dim);
+        __syncthreads();  // the dots read smem_q / smem_k before the next row writes them
+    }
+    // Every block of the key head has read the old q/k windows.
+    cg::this_cluster().sync();
+    if (lead) {
+        q35f_store_window(L.conv + (unsigned long long)cq * Q35F_DCONV, wq);
+        q35f_store_window(L.conv + (unsigned long long)ck * Q35F_DCONV, wk);
+    }
+    q35f_store_window(L.conv + (unsigned long long)cv * Q35F_DCONV, wv);
+    #pragma unroll
+    for (int j = 0; j < Q35F_D; j++) {
+        L.h[head + j * Q35F_D + tid] = H_reg[j];
     }
 }

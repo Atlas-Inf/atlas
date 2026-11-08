@@ -18,6 +18,14 @@
 //! change; (2) a tree's rows run as a chain (NULL table) must differ from the
 //! tree's golden — the parent table is what makes a branch exact.
 //!
+//! DEFERRED (`ATLAS_QWEN38_VERIFY_DEFER`): `qwen35_gdn_verify_tree_defer`
+//! must give the same normed rows, leave H0 and the conv windows untouched
+//! and keep a tree's branch parents' H in their slots; then
+//! `qwen35_gdn_commit_rows` replaying any accepted root path (every prefix of
+//! a chain, every row's path of a tree) must store, byte for byte, the
+//! state the storing kernel leaves for that path's last row. NEGATIVE: the
+//! replay from a gate one ULP away must differ.
+//!
 //! It also times today's exact arm (one fused FP32 conv launch, then per row
 //! the recurrence, the gated norm and an H copy to the rollback slot) against
 //! the fused launch, per GDN layer.
@@ -29,11 +37,34 @@
 use anyhow::{Result, ensure};
 use half::bf16;
 use spark_model::layers::ops;
+use spark_model::layers::ops::qwen4exp_gdn_defer::GdnCommitLayer;
 use spark_model::layers::ops::qwen38_decode_fuse::GdnVerifyTree;
 use spark_model::weight_map::DenseWeight;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
+
+/// A tree's rows, for the deferred legs' root paths.
+struct DraftTree {
+    #[allow(dead_code)]
+    tokens: Vec<u32>,
+    parent: Vec<i32>,
+    #[allow(dead_code)]
+    depth: Vec<u8>,
+}
+
+impl DraftTree {
+    fn path_to(&self, row: usize) -> Vec<usize> {
+        let mut path = vec![row];
+        let mut r = row;
+        while self.parent[r] >= 0 {
+            r = self.parent[r] as usize;
+            path.push(r);
+        }
+        path.reverse();
+        path
+    }
+}
 
 const NK: usize = 16;
 const NV: usize = 48;
@@ -413,6 +444,149 @@ fn exact_arm(
     Ok(())
 }
 
+/// The deferred legs' buffers: staging and a commit target.
+struct Deferred {
+    stage_qkv: DevicePtr,
+    stage_gb: DevicePtr,
+    h: DevicePtr,
+    conv: DevicePtr,
+}
+
+impl Deferred {
+    fn new(g: &dyn GpuBackend) -> Result<Self> {
+        Ok(Self {
+            stage_qkv: g.alloc(MAX_ROWS * CONV_DIM * 2)?,
+            stage_gb: g.alloc(MAX_ROWS * 2 * NV * 4)?,
+            h: g.alloc(H_BYTES)?,
+            conv: g.alloc(CONV_BYTES)?,
+        })
+    }
+
+    /// The deferred verify from (h0, conv0) into `f`'s buffers.
+    fn verify(
+        &self,
+        g: &dyn GpuBackend,
+        c: &Case,
+        f: &Fused,
+        k: usize,
+        table: DevicePtr,
+    ) -> Result<()> {
+        g.copy_h2d(&c.h0, f.h)?;
+        g.copy_h2d(&c.conv0, f.conv)?;
+        let b = GdnVerifyTree {
+            h_state: f.h,
+            conv_state: f.conv,
+            h_snap: f.h_snap,
+            h_snap_bytes: H_BYTES,
+            conv_snap: f.conv_snap,
+            conv_snap_bytes: CONV_BYTES,
+            parent: table,
+            qkvz: c.qkvz,
+            qkvz_stride: QKVZ as u32,
+            conv_w: c.conv_w,
+            gates: c.gates,
+            norm_w: c.norm_w,
+            out: f.out,
+            rows: k as u32,
+        };
+        let ran = ops::qwen38_decode_fuse::gdn_verify_tree_defer(
+            g,
+            &b,
+            self.stage_qkv,
+            self.stage_gb,
+            NK as u32,
+            NV as u32,
+            KD as u32,
+            VD as u32,
+            D_CONV as u32,
+            L2_EPS,
+            EPS,
+            0,
+        )?;
+        ensure!(ran, "gdn_verify_tree_defer declined the 27B shape");
+        g.synchronize(0)
+    }
+
+    /// Replay `rows` from (h0, conv0); returns (h, conv).
+    fn commit(&self, g: &dyn GpuBackend, c: &Case, rows: &[usize]) -> Result<(Vec<u8>, Vec<u8>)> {
+        g.copy_h2d(&c.h0, self.h)?;
+        g.copy_h2d(&c.conv0, self.conv)?;
+        let layer = GdnCommitLayer {
+            h: self.h,
+            conv: self.conv,
+            stage_qkv: self.stage_qkv,
+            stage_gb: self.stage_gb,
+            conv_w: c.conv_w,
+        };
+        ops::qwen38_decode_fuse::gdn_commit_rows(
+            g,
+            &[layer],
+            rows,
+            NK as u32,
+            NV as u32,
+            KD as u32,
+            VD as u32,
+            D_CONV as u32,
+            L2_EPS,
+            0,
+        )?;
+        g.synchronize(0)?;
+        Ok((dn(g, self.h, H_BYTES)?, dn(g, self.conv, CONV_BYTES)?))
+    }
+}
+
+/// The deferred legs for one case: rows, untouched state, branch slots, and
+/// every root path's replay. Returns the failures.
+fn deferred_leg(
+    g: &dyn GpuBackend,
+    d: &Deferred,
+    c: &Case,
+    f: &Fused,
+    gold: &Rows,
+    parent: &[i32],
+    table: bool,
+) -> Result<Vec<String>> {
+    let k = parent.len();
+    let t = f.table(g, table.then_some(parent))?;
+    d.verify(g, c, f, k, t)?;
+    let mut bad = Vec::new();
+    if dn(g, f.out, k * VALUE_DIM * 2)? != gold.out {
+        bad.push("normed out".to_string());
+    }
+    if dn(g, f.h, H_BYTES)? != c.h0 || dn(g, f.conv, CONV_BYTES)? != c.conv0 {
+        bad.push("H0 / conv windows moved".to_string());
+    }
+    let tree = DraftTree {
+        tokens: (0..k as u32).collect(),
+        parent: parent.to_vec(),
+        depth: (0..k)
+            .map(|r| {
+                let mut d = 0u8;
+                let mut x = parent[r];
+                while x >= 0 {
+                    d += 1;
+                    x = parent[x as usize];
+                }
+                d
+            })
+            .collect(),
+    };
+    for r in 0..k {
+        // A branch parent keeps its H.
+        if table && (r + 2..k).any(|ch| parent[ch] == r as i32) {
+            if dn(g, f.h_snap.offset(r * H_BYTES), H_BYTES)? != gold.h[r] {
+                bad.push(format!("branch slot {r}"));
+            }
+        }
+        let path = tree.path_to(r);
+        let (h, conv) = d.commit(g, c, &path)?;
+        if h != gold.h[r] || conv != gold.conv[r] {
+            bad.push(format!("replay of {path:?}"));
+        }
+    }
+    Ok(bad)
+}
+
 fn time_us(g: &dyn GpuBackend, iters: usize, mut f: impl FnMut() -> Result<()>) -> Result<f64> {
     for _ in 0..5 {
         f()?;
@@ -432,7 +606,10 @@ fn chain(k: usize) -> Vec<i32> {
 
 fn main() -> Result<()> {
     // SAFETY: single-threaded here; nothing else reads or writes the env yet.
-    unsafe { std::env::set_var("ATLAS_QWEN38_VERIFY_FUSE", "1") };
+    unsafe {
+        std::env::set_var("ATLAS_QWEN38_VERIFY_FUSE", "1");
+        std::env::set_var("ATLAS_QWEN38_VERIFY_DEFER", "1");
+    }
     let set = atlas_kernels::ptx_for_model("qwen3.8-27b")
         .or_else(|| atlas_kernels::ptx_for_model("qwen3.6-27b"))
         .expect("no qwen3.8-27b or qwen3.6-27b kernel set in this build");
@@ -470,6 +647,7 @@ fn main() -> Result<()> {
         ("spine16", spine16.clone(), true),
     ];
     let f = Fused::new(g)?;
+    let d = Deferred::new(g)?;
     let mut ok = true;
     for seed in 0..4u64 {
         let c = Case::new(g, 0x7EE0_0000 + seed)?;
@@ -505,6 +683,35 @@ fn main() -> Result<()> {
         let seen = !mismatches(&gold, &got).is_empty();
         println!("seed {seed} NEGATIVE tree rows as a chain: detected={seen}");
         ok &= seen;
+
+        // DEFERRED: the verify that stores nothing, then the replayed commit.
+        for (name, parent, table) in &cases {
+            let gold = golden(g, &ks, &c, parent)?;
+            let bad = deferred_leg(g, &d, &c, &f, &gold, parent, *table)?;
+            println!(
+                "seed {seed} DEFERRED {name:<18} rows {:>2}: {}",
+                parent.len(),
+                if bad.is_empty() {
+                    "rows and every replayed path byte-identical".to_string()
+                } else {
+                    format!("MISMATCH {bad:?}")
+                }
+            );
+            ok &= bad.is_empty();
+        }
+        // NEGATIVE 3: the replay of a chain with row 0's gate one ULP away.
+        let chain8 = chain(8);
+        let gold = golden(g, &ks, &c, &chain8)?;
+        let t = f.table(g, None)?;
+        d.verify(g, &c, &f, 8, t)?;
+        let mut gb = dn(g, d.stage_gb, 4)?;
+        let v = u32::from_le_bytes([gb[0], gb[1], gb[2], gb[3]]) ^ 1;
+        gb.copy_from_slice(&v.to_le_bytes());
+        g.copy_h2d(&gb, d.stage_gb)?;
+        let (h, _) = d.commit(g, &c, &(0..8).collect::<Vec<_>>())?;
+        let seen = h != gold.h[7];
+        println!("seed {seed} NEGATIVE replay from a 1-ULP gate: detected={seen}");
+        ok &= seen;
     }
 
     // Timing per GDN layer: today's exact arm vs the fused launch.
@@ -521,16 +728,80 @@ fn main() -> Result<()> {
         let arm = time_us(g, 200, || exact_arm(g, &ks, &c, &f, k, scratch))?;
         let table = f.table(g, parent)?;
         let fused = time_us(g, 200, || f.launch(g, &c, k, table, 0))?;
+        let defer = time_us(g, 200, || {
+            let b = GdnVerifyTree {
+                h_state: f.h,
+                conv_state: f.conv,
+                h_snap: f.h_snap,
+                h_snap_bytes: H_BYTES,
+                conv_snap: f.conv_snap,
+                conv_snap_bytes: CONV_BYTES,
+                parent: table,
+                qkvz: c.qkvz,
+                qkvz_stride: QKVZ as u32,
+                conv_w: c.conv_w,
+                gates: c.gates,
+                norm_w: c.norm_w,
+                out: f.out,
+                rows: k as u32,
+            };
+            ops::qwen38_decode_fuse::gdn_verify_tree_defer(
+                g,
+                &b,
+                d.stage_qkv,
+                d.stage_gb,
+                NK as u32,
+                NV as u32,
+                KD as u32,
+                VD as u32,
+                D_CONV as u32,
+                L2_EPS,
+                EPS,
+                0,
+            )
+            .map(|_| ())
+        })?;
         println!(
-            "rows {k:>2} {:<6} us per GDN layer: exact arm {arm:.1}, fused {fused:.1}; x48 layers = {:.2} ms saved per verify",
+            "rows {k:>2} {:<6} us per GDN layer: exact arm {arm:.1}, fused {fused:.1}, deferred {defer:.1}; x48 layers = {:.2} ms (fused) / {:.2} ms (deferred) saved per verify",
             if parent.is_some() { "bush" } else { "chain" },
-            (arm - fused) * 48.0 / 1000.0
+            (arm - fused) * 48.0 / 1000.0,
+            (arm - defer) * 48.0 / 1000.0
         );
     }
+    // The deferred commit of one sequence's 48 GDN layers, 7 accepted rows.
+    let states: Vec<(DevicePtr, DevicePtr)> = (0..48)
+        .map(|_| Ok((up(g, &c.h0)?, up(g, &c.conv0)?)))
+        .collect::<Result<_>>()?;
+    let layers: Vec<GdnCommitLayer> = states
+        .iter()
+        .map(|&(h, conv)| GdnCommitLayer {
+            h,
+            conv,
+            stage_qkv: d.stage_qkv,
+            stage_gb: d.stage_gb,
+            conv_w: c.conv_w,
+        })
+        .collect();
+    let rows: Vec<usize> = (0..7).collect();
+    let commit = time_us(g, 100, || {
+        ops::qwen38_decode_fuse::gdn_commit_rows(
+            g,
+            &layers,
+            &rows,
+            NK as u32,
+            NV as u32,
+            KD as u32,
+            VD as u32,
+            D_CONV as u32,
+            L2_EPS,
+            0,
+        )
+    })?;
+    println!("deferred commit, 48 GDN layers, 7 rows: {commit:.1} us a sequence");
 
     if ok {
         println!(
-            "PASS: qwen35_gdn_verify_tree is byte-identical to the exact chain (chains and trees); both negative controls detected"
+            "PASS: qwen35_gdn_verify_tree and the deferred verify + replayed commit are byte-identical to the exact chain (chains and trees); all negative controls detected"
         );
         Ok(())
     } else {

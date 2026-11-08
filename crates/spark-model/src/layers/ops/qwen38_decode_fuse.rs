@@ -29,6 +29,8 @@ const LEVER: &str = "ATLAS_QWEN38_DECODE_FUSE";
 /// The exact verify's GDN rows of one sequence as one launch
 /// (`qwen35_gdn_verify_tree`): [`gdn_verify_tree`].
 const VERIFY_LEVER: &str = "ATLAS_QWEN38_VERIFY_FUSE";
+/// The fused rows' deferred commit: [`defer_on`].
+const DEFER_LEVER: &str = "ATLAS_QWEN38_VERIFY_DEFER";
 
 fn parse(lever: &str, value: Option<&str>) -> Result<bool> {
     match value {
@@ -73,6 +75,33 @@ pub fn verify_on() -> Result<bool> {
         VERIFY_LEVER,
         "fused exact GDN verify rows (qwen35_gdn_verify_tree)",
     )
+}
+
+/// `ATLAS_QWEN38_VERIFY_DEFER=1` (with `ATLAS_QWEN38_VERIFY_FUSE=1`): the
+/// fused exact verify stores no GDN state and the accepted rows are replayed
+/// from H0 at the commit ([`gdn_verify_tree_defer`], [`gdn_commit_rows`]).
+pub fn defer_on() -> bool {
+    static ON: OnceLock<std::result::Result<bool, String>> = OnceLock::new();
+    read_once(
+        &ON,
+        DEFER_LEVER,
+        "deferred exact GDN commit (qwen35_gdn_verify_tree_defer + qwen35_gdn_commit_rows)",
+    )
+    .unwrap_or(false)
+        && verify_on().unwrap_or(false)
+}
+
+/// `(verify_defer, commit)` handles, 0 where the kernel set lacks them.
+/// Looked up only once the lever is on.
+pub fn defer_kernels(gpu: &dyn GpuBackend) -> (KernelHandle, KernelHandle) {
+    static K: OnceLock<(KernelHandle, KernelHandle)> = OnceLock::new();
+    *K.get_or_init(|| {
+        let k = |name| crate::layers::try_kernel(gpu, "qwen35_decode_fuse", name);
+        (
+            k("qwen35_gdn_verify_tree_defer"),
+            k("qwen35_gdn_commit_rows"),
+        )
+    })
 }
 
 /// `qwen35_gdn_decode_fused` in place of the BA gates, conv, recurrence and
@@ -207,13 +236,140 @@ pub fn gdn_verify_tree(
     Ok(true)
 }
 
+/// [`gdn_verify_tree`] without the stores: H0 and the conv windows stay,
+/// each row stages its raw `Q | K | V` conv inputs into `stage_qkv`
+/// (`[rows, conv_dim]` BF16) and its gate and beta into `stage_gb`
+/// (`[rows, 2 * nv]` FP32), and only a tree's branch parents keep their H
+/// in their slot (`b.conv_snap` is unused). Returns whether it launched.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_verify_tree_defer(
+    gpu: &dyn GpuBackend,
+    b: &GdnVerifyTree,
+    stage_qkv: DevicePtr,
+    stage_gb: DevicePtr,
+    nk: u32,
+    nv: u32,
+    kd: u32,
+    vd: u32,
+    d_conv: u32,
+    l2_eps: f32,
+    eps: f32,
+    stream: u64,
+) -> Result<bool> {
+    let (k, _) = defer_kernels(gpu);
+    let conv_dim = (2 * nk * kd + nv * vd) as usize;
+    let fits = k.0 != 0
+        && (1..=DEFER_ROWS_MAX as u32).contains(&b.rows)
+        && gdn_geometry_fits(nk, nv, kd, vd, d_conv, 8)
+        && !stage_qkv.is_null()
+        && !stage_gb.is_null()
+        && b.h_snap_bytes.is_multiple_of(16)
+        && aligned(&[b.conv_state, b.h_snap], 16)
+        && aligned(&[b.qkvz.offset(conv_dim * 2), b.norm_w, b.out], 8)
+        && (b.qkvz_stride as usize * 2).is_multiple_of(8);
+    if !fits {
+        return Ok(false);
+    }
+    let (grid_x, block) = gdn_grid_x_block(nv);
+    KernelLaunch::new(gpu, k)
+        .grid([grid_x, 1, 1])
+        .block([block, 1, 1])
+        .arg_ptr(b.h_state)
+        .arg_ptr(b.conv_state)
+        .arg_ptr(b.h_snap)
+        .arg_ptr(b.parent)
+        .arg_ptr(b.qkvz)
+        .arg_ptr(b.conv_w)
+        .arg_ptr(b.gates)
+        .arg_ptr(b.norm_w)
+        .arg_ptr(b.out)
+        .arg_ptr(stage_qkv)
+        .arg_ptr(stage_gb)
+        .arg_u32(b.rows)
+        .arg_u32(nk)
+        .arg_u32(nv)
+        .arg_u32(kd)
+        .arg_u32(b.qkvz_stride)
+        .arg_u64((b.h_snap_bytes / 4) as u64)
+        .arg_f32(l2_eps)
+        .arg_f32(eps)
+        .launch(stream)?;
+    Ok(true)
+}
+
+/// Rows a deferred verify stages (the staging pools' window,
+/// `ssm_pool` commit_qkv: 16 rows) and the commit replays (4 bits a row).
+pub const DEFER_ROWS_MAX: usize = 16;
+
+/// The deferred commit: replay verify rows `rows` (a chain's prefix `0..n`
+/// or a tree's root path) from H0 into every layer of `layers`, in launches
+/// of up to `GDN_COMMIT_LAYERS` layers. Errors rather than skipping: a
+/// deferred layer has no other way to its committed state.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_commit_rows(
+    gpu: &dyn GpuBackend,
+    layers: &[super::qwen4exp_gdn_defer::GdnCommitLayer],
+    rows: &[usize],
+    nk: u32,
+    nv: u32,
+    kd: u32,
+    vd: u32,
+    d_conv: u32,
+    l2_eps: f32,
+    stream: u64,
+) -> Result<()> {
+    use super::qwen4exp_gdn_defer::{GDN_COMMIT_LAYERS, commit_table};
+    let (_, k) = defer_kernels(gpu);
+    anyhow::ensure!(
+        k.0 != 0 && gdn_geometry_fits(nk, nv, kd, vd, d_conv, 8),
+        "deferred GDN commit: qwen35_gdn_commit_rows unavailable for nk={nk} nv={nv}"
+    );
+    anyhow::ensure!(
+        (1..=DEFER_ROWS_MAX).contains(&rows.len()) && rows.iter().all(|&r| r < DEFER_ROWS_MAX),
+        "deferred GDN commit: rows {rows:?} past the staged window"
+    );
+    let packed = pack_rows(rows);
+    let (grid_x, block) = gdn_grid_x_block(nv);
+    for chunk in layers.chunks(GDN_COMMIT_LAYERS) {
+        KernelLaunch::new(gpu, k)
+            .grid([grid_x, chunk.len() as u32, 1])
+            .block([block, 1, 1])
+            .arg_words(&commit_table(chunk))
+            .arg_u64(packed)
+            .arg_u32(rows.len() as u32)
+            .arg_u32(nk)
+            .arg_u32(nv)
+            .arg_u32(kd)
+            .arg_f32(l2_eps)
+            .launch(stream)?;
+    }
+    Ok(())
+}
+
+/// `rows`, 4 bits each, the first in the low nibble.
+fn pack_rows(rows: &[usize]) -> u64 {
+    rows.iter()
+        .enumerate()
+        .fold(0u64, |acc, (i, &r)| acc | ((r as u64 & 0xF) << (4 * i)))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LEVER, VERIFY_LEVER, parse};
+    use super::{LEVER, VERIFY_LEVER, pack_rows, parse};
+
+    #[test]
+    fn rows_pack_low_nibble_first() {
+        assert_eq!(pack_rows(&[0, 1, 2]), 0x210);
+        assert_eq!(pack_rows(&[0, 3, 15]), 0xF30);
+        assert_eq!(
+            pack_rows(&(0..16).collect::<Vec<_>>()),
+            0xFEDC_BA98_7654_3210
+        );
+    }
 
     #[test]
     fn lever_is_off_unless_exactly_one() {
-        for lever in [LEVER, VERIFY_LEVER] {
+        for lever in [LEVER, VERIFY_LEVER, super::DEFER_LEVER] {
             assert!(!parse(lever, None).unwrap());
             assert!(!parse(lever, Some("0")).unwrap());
             assert!(parse(lever, Some("1")).unwrap());

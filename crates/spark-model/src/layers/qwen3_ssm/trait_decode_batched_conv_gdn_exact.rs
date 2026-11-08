@@ -173,6 +173,12 @@ impl Qwen3SsmLayer {
         {
             return Ok(());
         }
+        // A deferred step (ATLAS_QWEN38_VERIFY_DEFER, marked before the
+        // forward) has no other arm: its commit replays the staged rows.
+        anyhow::ensure!(
+            !ssm_state.gdn_commit_pending,
+            "deferred GDN verify: the fused exact rows could not run"
+        );
 
         static LOGGED: std::sync::Once = std::sync::Once::new();
         LOGGED.call_once(|| {
@@ -418,6 +424,7 @@ impl Qwen3SsmLayer {
             return Ok(false);
         }
         let first = |v: &[DevicePtr]| v.first().copied().unwrap_or(DevicePtr::NULL);
+        let deferred = ssm_state.gdn_commit_pending;
         let b = ops::qwen38_decode_fuse::GdnVerifyTree {
             h_state: ssm_state.h_state,
             conv_state: ssm_state.conv_state,
@@ -434,18 +441,59 @@ impl Qwen3SsmLayer {
             out: normed_out,
             rows: num_tokens as u32,
         };
+        let eps = ctx.config.rms_norm_eps as f32;
+        let (nk, nv, kd, vd, d_conv) = (nk as u32, nv as u32, kd as u32, vd as u32, d_conv as u32);
+        if deferred {
+            return ops::qwen38_decode_fuse::gdn_verify_tree_defer(
+                ctx.gpu,
+                &b,
+                ssm_state.gdn_commit_qkv,
+                ssm_state.gdn_commit_gb,
+                nk,
+                nv,
+                kd,
+                vd,
+                d_conv,
+                1e-6,
+                eps,
+                stream,
+            );
+        }
         ops::qwen38_decode_fuse::gdn_verify_tree(
-            ctx.gpu,
-            &b,
-            nk as u32,
-            nv as u32,
-            kd as u32,
-            vd as u32,
-            d_conv as u32,
-            1e-6,
-            ctx.config.rms_norm_eps as f32,
-            stream,
+            ctx.gpu, &b, nk, nv, kd, vd, d_conv, 1e-6, eps, stream,
         )
+    }
+
+    /// Whether a verify of `num_tokens` rows on this layer takes the deferred
+    /// fused rows (`ATLAS_QWEN38_VERIFY_DEFER`): the lever, the exact verify
+    /// on the fused rows' four-kernel FP32 arm, both kernels and the geometry,
+    /// and a window the staging holds. The dispatch entry marks the step
+    /// pending from this (`mark_gdn_deferred_commit`, through
+    /// `gdn_exact_defer`), outside any capture.
+    pub(super) fn q38_defer_arm(
+        &self,
+        gpu: &dyn spark_runtime::gpu::GpuBackend,
+        levers: &crate::layers::ops::ModelLevers,
+        config: &atlas_core::config::ModelConfig,
+        num_tokens: usize,
+    ) -> bool {
+        if !ops::qwen38_decode_fuse::defer_on() {
+            return false;
+        }
+        let (kv, kc) = ops::qwen38_decode_fuse::defer_kernels(gpu);
+        kv.0 != 0
+            && kc.0 != 0
+            && super::verify_exact_for(levers)
+            && self.conv1d_l2norm_f32_k.0 != 0
+            && self.gdn_f32_k.0 != 0
+            && self.gated_rms_norm_f32_k.0 != 0
+            && !crate::layers::qwen3_ssm::gdn_fused_norm_enabled()
+            && (1..=ops::qwen38_decode_fuse::DEFER_ROWS_MAX).contains(&num_tokens)
+            && config.linear_key_head_dim == 128
+            && config.linear_value_head_dim == 128
+            && config.linear_conv_kernel_dim == 4
+            && config.linear_num_key_heads != 0
+            && config.linear_num_value_heads == 3 * config.linear_num_key_heads
     }
 }
 
