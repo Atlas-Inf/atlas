@@ -897,6 +897,7 @@ impl BlockDiffusionDraftHead {
             },
             dspine: None,
             alt: None,
+            live: Default::default(),
             // Phase 2 stage 2: fused KV weight built above by copy_d2d
             // from each layer's k_proj/v_proj. precompute_ctx_kv will
             // GEMM against it in stage 3 once we wire the call site.

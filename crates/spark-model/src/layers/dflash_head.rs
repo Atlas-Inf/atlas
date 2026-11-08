@@ -635,6 +635,9 @@ pub struct BlockDiffusionDraftHead {
     pub dspine: Option<dspine::Dspine>,
     /// `--draft-model-alt`: the second drafter, routed per request (`dual`).
     pub alt: Option<Box<BlockDiffusionDraftHead>>,
+    /// Sequence states alive (`alloc_state` .. `free_state`): past two every
+    /// sequence of a dual head proposes with the short-block head.
+    pub live: std::sync::atomic::AtomicUsize,
 
     /// Phase 2 (Option B) fused K/V projection across all L drafter layers.
     /// Shape: `[L × 2 × kv_dim, h]` BF16 — concatenated `[K0; V0; K1; V1; …]`
@@ -1350,6 +1353,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
 
     fn alloc_state(&self, _gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
         let mut state = self.fresh_state();
+        self.live.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(alt) = self.alt.as_deref() {
             state.alt = Some(Box::new(alt.fresh_state()));
             state.route = dual::Route::new([self.gamma, alt.gamma]);
@@ -1418,8 +1422,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 .as_any_mut()
                 .downcast_mut::<DflashProposerState>()
                 .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
-            let head = d.route.pick();
-            d.route.last = head;
+            let head = self.dual_pick(&mut d.route);
             if head == 1 {
                 return dual::with_alt(d, |a| {
                     alt.propose_drafts(
@@ -1623,6 +1626,11 @@ impl DraftProposer for BlockDiffusionDraftHead {
             // Phase 1 / non-DFlash proposer state: nothing allocated, nothing to free.
             None => return Ok(()),
         };
+        let _ = self.live.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |n| n.checked_sub(1),
+        );
         // The alt drafter's KV goes first; the accumulator is this state's.
         if let (Some(alt), Some(mut a)) = (self.alt.as_deref(), dstate.alt.take()) {
             a.mirror_from(dstate);
