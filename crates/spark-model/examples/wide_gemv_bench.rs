@@ -21,10 +21,16 @@
 //!   cargo run -p spark-model --release --features cuda,gpu-examples \
 //!     --example wide_gemv_bench
 //!
+//! It also times the `ATLAS_SKINNY_MMA` kernels (`skinny_mma.cu`) at the
+//! same M: other arithmetic (no byte comparison; `skinny_mma_microtest` is
+//! their gate), one family for every M, so its M=1 row is the serial decode
+//! it would replace.
+//!
 //! Env: ATLAS_PEAK_GBPS (default 273) for the %-of-peak column;
 //! WIDE_BENCH_ITERS (default 30).
 
 use anyhow::Result;
+use spark_model::layers::ops::skinny_mma::{self, SkinnyKernels};
 use spark_model::layers::ops::wide_gemv::{self, Family, NBS, TIERS, WideKernel};
 use spark_model::weight_map::QuantizedWeight;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
@@ -244,6 +250,29 @@ fn launch_wide(
     }
 }
 
+/// One `ATLAS_SKINNY_MMA` launch of `m` rows.
+fn launch_skinny(
+    g: &dyn GpuBackend,
+    ks: &SkinnyKernels,
+    (family, n, k, heads, hd): (Family, u32, u32, u32, u32),
+    m: u32,
+    a: DevicePtr,
+    (w, s): (DevicePtr, DevicePtr),
+    c: DevicePtr,
+) -> Result<()> {
+    let q = QuantizedWeight {
+        weight: w,
+        weight_scale: s,
+        weight_scale_2: SCALE2,
+        ..QuantizedWeight::null()
+    };
+    match family {
+        Family::W4a16 => skinny_mma::launch_w4a16(g, ks, a, &[(&q, c, n)], (m, k), n, 0),
+        Family::Qg => skinny_mma::launch_qg(g, ks, a, &q, c, (m, n, k), (heads, hd), 0),
+        Family::W8a16 => skinny_mma::launch_w8a16(g, ks, a, &[((w, s), c, n)], (m, k), n, 0),
+    }
+}
+
 /// Mean us a call of `run(i)` over `iters` calls (weight copy `i`).
 fn time(g: &dyn GpuBackend, iters: usize, run: &dyn Fn(usize) -> Result<()>) -> Result<f64> {
     for i in 0..WARMUP {
@@ -326,11 +355,17 @@ fn main() -> Result<()> {
         .map(|(f, r, nb)| WideKernel::resolve(g, f, r, nb))
         .filter(|w| w.handle.0 != 0)
         .collect();
+    let skinny = SkinnyKernels::resolve(g);
     eprintln!(
         "kernel set {}, {sms} SMs, peak {peak:.0} GB/s, {iters} iters, cold weights; \
-         {} wide tiers resolved",
+         {} wide tiers resolved, skinny_mma {}",
         set.target.model,
-        wides.len()
+        wides.len(),
+        if skinny.complete() {
+            "resolved"
+        } else {
+            "absent"
+        }
     );
 
     let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
@@ -362,6 +397,14 @@ fn main() -> Result<()> {
             g.synchronize(0)?;
             let mut want = vec![0u8; m as usize * n as usize * 2];
             g.copy_d2h(bufs.c[0], &mut want)?;
+            if skinny.complete() && skinny_mma::serves(family, m, k) {
+                let us = time(g, iters, &|i| {
+                    let w = bufs.weights[i % copies];
+                    launch_skinny(g, &skinny, shape, m, bufs.a, w, bufs.c[1])
+                })?;
+                let name = skinny_mma::kernel_name(family, m.div_ceil(8));
+                report(&name, m, us, None);
+            }
             for &nb in &NBS {
                 let Some(w) = wides
                     .iter()

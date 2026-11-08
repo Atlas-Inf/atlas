@@ -378,6 +378,10 @@ name = "wide_gemv_bench"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "skinny_mma_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "moe_t_rows_bench"
 required-features = ["cuda", "gpu-examples"]
 
