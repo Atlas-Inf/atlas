@@ -18,6 +18,22 @@
 
 use std::sync::OnceLock;
 
+/// A batched DFlash step's draft depth. Every member verifies the same
+/// width and only members holding that many drafts batch, so past two
+/// sequences the depth is at most 7 (8 rows each): the batched verify is
+/// bound by the weight stream's L2 reuse past ~24 rows, and 16 rows for
+/// each of 8 sequences halved the C8 rate (59 vs 114 tok/s). Two sequences
+/// keep the deepest width both hold, but never less than 7, so a long-block
+/// drafter's sequence (DSpine, 15 drafts) still batches with a short one's
+/// (DFlash2, 7) under `--draft-model-alt`. A 7-draft drafter is unchanged.
+pub(crate) fn batch_depth(nd: usize, n: usize, held: impl Iterator<Item = usize>) -> usize {
+    match n {
+        0 | 1 => nd,
+        2 => held.min().map_or(nd, |h| nd.min(h.max(MAX_DRAFTS))),
+        _ => nd.min(MAX_DRAFTS),
+    }
+}
+
 /// Draft positions tracked (γ = 8 → seven drafts).
 pub(crate) const MAX_DRAFTS: usize = 7;
 /// Estimator tuning: per-step decay (0.98 ≈ the last fifty verifies; code sits near the

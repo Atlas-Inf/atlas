@@ -467,6 +467,18 @@ impl BlockDiffusionDraftHead {
             self.batch_mlp_down,
             hidden_elements,
             stream,
-        )
+        )?;
+        match self.dspine.as_ref() {
+            Some(d) => self.dspine_bridge(
+                ctx.gpu,
+                layer_idx,
+                self.batch_query_embed,
+                a.batch_rows,
+                self.dspine_batch_blocks(),
+                &d.batch,
+                stream,
+            ),
+            None => Ok(()),
+        }
     }
 }

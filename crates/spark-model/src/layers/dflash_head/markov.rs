@@ -48,6 +48,18 @@ impl BlockDiffusionDraftHead {
         markov_bias: DevicePtr,
     ) -> Result<()> {
         let bf16 = 2usize;
+        if let Some(sc) = scratch.dspine.as_ref() {
+            let _ = (last_token, ban_depth, hidden_buf, markov_embed, markov_bias);
+            return self.dspine_tail(
+                gpu,
+                scratch.logits,
+                self.gamma as u32,
+                Self::dspine_single_blocks(scratch),
+                sc,
+                scratch.draft_tokens_dev,
+                stream,
+            );
+        }
         if let Some(ref selector) = self.candidate_selector {
             let anchor = Self::selector_anchor(last_token, ban_depth, scratch);
             self.note_select(self.kernels.dflash2_candidate_selector.map(|_| {

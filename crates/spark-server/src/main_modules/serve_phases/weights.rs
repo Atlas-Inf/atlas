@@ -237,7 +237,6 @@ pub(crate) fn load_dflash_drafter(
         spark_model::weight_loader::DflashConfig,
     )>,
 > {
-    use spark_runtime::weights::WeightLoader;
     if !args.dflash {
         return Ok(None);
     }
@@ -249,9 +248,37 @@ pub(crate) fn load_dflash_drafter(
             "--dflash set but no drafter HF id provided: pass --draft-model <ID> \
              or use a target whose MODEL.toml has a [dflash] section",
         )?;
+    load_drafter(args, &drafter_id, gpu).map(Some)
+}
+
+/// `--draft-model-alt`'s drafter, when given (see [`load_dflash_drafter`]).
+pub(crate) fn load_dflash_drafter_alt(
+    args: &cli::ServeArgs,
+    gpu: &dyn spark_runtime::gpu::GpuBackend,
+) -> Result<
+    Option<(
+        spark_runtime::weights::WeightStore,
+        spark_model::weight_loader::DflashConfig,
+    )>,
+> {
+    match args.draft_model_alt.as_deref() {
+        Some(id) if args.dflash => load_drafter(args, id, gpu).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn load_drafter(
+    args: &cli::ServeArgs,
+    drafter_id: &str,
+    gpu: &dyn spark_runtime::gpu::GpuBackend,
+) -> Result<(
+    spark_runtime::weights::WeightStore,
+    spark_model::weight_loader::DflashConfig,
+)> {
+    use spark_runtime::weights::WeightLoader;
     tracing::info!("DFlash: resolving drafter '{drafter_id}'");
     let drafter_dir =
-        crate::model_resolver::resolve_model_dir(&drafter_id, args.cache_dir.as_deref())
+        crate::model_resolver::resolve_model_dir(drafter_id, args.cache_dir.as_deref())
             .context("Failed to resolve DFlash drafter checkpoint")?;
     let drafter_config_json = std::fs::read_to_string(drafter_dir.join("config.json"))
         .with_context(|| {
@@ -273,10 +300,7 @@ pub(crate) fn load_dflash_drafter(
             "DFlash: rank {} keeps the drafter config only; the head proposes",
             args.rank
         );
-        return Ok(Some((
-            spark_runtime::weights::WeightStore::empty(),
-            drafter_config,
-        )));
+        return Ok((spark_runtime::weights::WeightStore::empty(), drafter_config));
     }
     // The fast loader stores the same tensors and bytes
     // (`dflash_fast_load_check`: 0.6 s against 5.3 s for the 2.2 GB drafter).
@@ -308,7 +332,7 @@ pub(crate) fn load_dflash_drafter(
         drafter_store.len(),
         drafter_store.total_bytes()
     );
-    Ok(Some((drafter_store, drafter_config)))
+    Ok((drafter_store, drafter_config))
 }
 
 /// Startup-loaded LoRA adapter: its own WeightStore + parsed PEFT config.

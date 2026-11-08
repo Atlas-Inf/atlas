@@ -3,7 +3,7 @@
 //! `build_model` — entry point that wires up the configured loader,
 //! buffers, KV cache, and (optional) DFlash drafter into a `TransformerModel`.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use atlas_core::config::ModelConfig;
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::GpuBackend;
@@ -215,6 +215,13 @@ pub fn build_model(
         && let Some(ref sub) = args.drafter_config.dflash_config
     {
         config.dflash_capture_layers = sub.target_layer_ids.clone();
+        // `--draft-model-alt`: one capture covers both drafters' layers.
+        if let Some(alt) = args.alt.as_ref().and_then(|(_, c)| c.dflash_config.as_ref()) {
+            config.dflash_capture_layers = crate::layers::dflash_head::dual::union_layers(
+                &sub.target_layer_ids,
+                &alt.target_layer_ids,
+            );
+        }
         // The window a bidirectional head keeps (`ctx_window_len`): the served
         // one (Lightning admission's, else the caller's) capped at max_seq_len.
         let served = lightning_dspark_policy
@@ -1306,21 +1313,65 @@ pub fn build_model(
                 // Strict for every head: an unknown value fails the build.
                 startup.diagnostics.first_append = FirstAppend::for_head()?;
                 startup.diagnostics.warm_ctx = crate::layers::dflash_head::WarmCtx::for_head()?;
-                let mut head = crate::layers::BlockDiffusionDraftHead::from_weights(
-                    weights,
-                    target_embed_for_dflash,
-                    target_lm_head_for_dflash,
-                    target_lm_head_nvfp4_for_dflash,
-                    target_hidden_for_dflash,
-                    target_vocab_for_dflash,
-                    args.gamma,
-                    served_window_size,
-                    model.gpu_backend(),
-                    max_seq_len,
-                    max_batch_size,
-                    &model.config_ref().model_type,
-                    startup,
-                )?;
+                let union = model.config_ref().dflash_capture_layers.clone();
+                let dual = args.alt.is_some();
+                anyhow::ensure!(
+                    !dual || !lightning_dspark_admitted,
+                    "--draft-model-alt does not pair with the Lightning DSpark product"
+                );
+                let build_head = |mut weights: crate::weight_loader::DflashWeights,
+                                  store: &WeightStore,
+                                  startup: DsparkStartupExecution|
+                 -> Result<crate::layers::BlockDiffusionDraftHead> {
+                    // Two drafters: each reads its own layers out of the union
+                    // capture, and runs at its own block size (capped by γ).
+                    let gamma = if dual {
+                        crate::layers::dflash_head::dual::widen_to_union(
+                            &mut weights,
+                            &union,
+                            target_hidden_for_dflash,
+                            store,
+                            model.gpu_backend(),
+                        )?;
+                        Some(args.gamma.map_or(weights.config.block_size(), |g| {
+                            g.min(weights.config.block_size())
+                        }))
+                    } else {
+                        args.gamma
+                    };
+                    crate::layers::BlockDiffusionDraftHead::from_weights(
+                        weights,
+                        target_embed_for_dflash,
+                        target_lm_head_for_dflash,
+                        target_lm_head_nvfp4_for_dflash,
+                        target_hidden_for_dflash,
+                        target_vocab_for_dflash,
+                        gamma,
+                        served_window_size,
+                        model.gpu_backend(),
+                        max_seq_len,
+                        max_batch_size,
+                        &model.config_ref().model_type,
+                        startup,
+                    )
+                };
+                let alt_head = match args.alt.as_ref() {
+                    Some((store, alt_config)) => {
+                        let alt_weights =
+                            load_dflash_weights(store, alt_config, model.gpu_backend(), 1)?
+                                .context("--draft-model-alt has no DFlash weights (fc.weight)")?;
+                        let mut alt_startup = DsparkStartupExecution::from_env_lenient();
+                        alt_startup.diagnostics.first_append = FirstAppend::for_head()?;
+                        alt_startup.diagnostics.warm_ctx =
+                            crate::layers::dflash_head::WarmCtx::for_head()?;
+                        Some(build_head(alt_weights, store, alt_startup)?)
+                    }
+                    None => None,
+                };
+                let mut head = build_head(weights, args.drafter_store, startup)?;
+                if let Some(alt) = alt_head {
+                    head.set_alt(alt)?;
+                }
                 // ATLAS_GLM_DRAFT_TP: on the TP2 pair or the TP4 chain every
                 // rank holds the drafter and computes its share of a propose;
                 // a worker's copy serves its share and proposes nothing.
