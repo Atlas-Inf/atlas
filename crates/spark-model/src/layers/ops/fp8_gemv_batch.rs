@@ -92,6 +92,17 @@ pub fn w8a16_gemv_batch4(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    if super::skinny_mma::try_w8a16(
+        gpu,
+        kernel,
+        input,
+        &[((weight, block_scale), output, n)],
+        (m, k),
+        n,
+        stream,
+    )? {
+        return Ok(());
+    }
     if w8a16_wide(gpu, input, (weight, block_scale), output, (m, n, k), stream)? {
         return Ok(());
     }
@@ -171,6 +182,17 @@ pub fn w8a16_gemv_batch4_div(
     div: u32,
     stream: u64,
 ) -> Result<()> {
+    if super::skinny_mma::try_w8a16(
+        gpu,
+        kernel,
+        input,
+        &[((weight, block_scale), output, n)],
+        (m, k),
+        n,
+        stream,
+    )? {
+        return Ok(());
+    }
     // Only the plain template twins (div 4) are `w8a16_gemv`'s bytes.
     if div == 4 && w8a16_wide(gpu, input, (weight, block_scale), output, (m, n, k), stream)? {
         return Ok(());

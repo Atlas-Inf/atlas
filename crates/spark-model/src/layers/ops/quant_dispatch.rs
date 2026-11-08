@@ -127,6 +127,9 @@ pub fn w4a16_gemv(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    if super::skinny_mma::try_w4a16_one(gpu, kernel, input, weight, output, (1, n, k), stream)? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([w4a16_gemv_grid_x(n), 1, 1])
         .block([256, 1, 1])
@@ -157,6 +160,9 @@ pub fn w4a16_gemv_batch2(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    if super::skinny_mma::try_w4a16_one(gpu, kernel, input, weight, output, (2, n, k), stream)? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -187,6 +193,9 @@ pub fn w4a16_gemv_batch3(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    if super::skinny_mma::try_w4a16_one(gpu, kernel, input, weight, output, (3, n, k), stream)? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -277,6 +286,11 @@ pub fn w4a16_gemv_batchm(
         (1..=32).contains(&m),
         "w4a16_gemv_batchm: m={m} outside 1..=32"
     );
+    // `ATLAS_SKINNY_MMA`: the scalar tiers' rows on the row-invariant
+    // tensor-core kernels (a tensor-core tier is not on its list).
+    if super::skinny_mma::try_w4a16_one(gpu, kernel, input, weight, output, (m, n, k), stream)? {
+        return Ok(());
+    }
     // Tensor-core tiers own 16 outputs per 8-warp CTA.
     let tc_rows = crate::layers::w4a16_gemv_tiers::tc_rows(kernel);
     let tc = tc_rows.is_some();

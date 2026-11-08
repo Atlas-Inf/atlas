@@ -45,7 +45,11 @@
 //! single-row kernel's bytes; no tensor-core or DP4A tier can be picked
 //! under the switch. `ATLAS_WIDE_GEMV=1` (`layers/ops/wide_gemv.rs`) serves
 //! the 5..=16-row NVFP4, FP8 and Q+gate arms with one `wide_gemv.cu` launch
-//! each instead: the same rows' bytes, fewer instructions a weight byte. Refused beside it: the FP16 h-state (the exact GDN chain
+//! each instead: the same rows' bytes, fewer instructions a weight byte.
+//! `ATLAS_SKINNY_MMA=1` (`layers/ops/skinny_mma.rs`) goes further: serial
+//! decode itself and every one of these NVFP4, Q+gate and FP8 arms run one
+//! row-invariant tensor-core kernel family, so the rows stay serial decode's
+//! bytes while serial decode's own arithmetic changes. Refused beside it: the FP16 h-state (the exact GDN chain
 //! reads FP32), `ATLAS_DECODE_FFN_VIA_GEMM` and `ATLAS_NO_DECODE_SPLIT_SILU`
 //! (serial decode's FFN would then take another arithmetic).
 //!

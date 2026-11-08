@@ -215,6 +215,8 @@ impl W4a16BatchmTiers {
         // `ATLAS_WIDE_GEMV`'s tiers, which the batched launch ops consult
         // (`ops::wide_gemv`); resolved once, and only when the lever is on.
         super::ops::wide_gemv::init(gpu);
+        // `ATLAS_SKINNY_MMA`'s kernels, likewise (`ops::skinny_mma`).
+        super::ops::skinny_mma::init(gpu);
         if glm_series && tc_requested() {
             let canonical_target = canonical_target(gpu);
             TC.get_or_init(|| {

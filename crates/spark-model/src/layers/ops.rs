@@ -96,6 +96,8 @@ mod gemm_fp4;
 pub mod model_stats;
 #[path = "ops/moe_gate_up_repack.rs"]
 pub(crate) mod moe_gate_up_repack;
+#[path = "ops/skinny_mma.rs"]
+pub mod skinny_mma;
 #[path = "ops/strix_f16.rs"]
 mod strix_f16;
 #[path = "ops/yarn_mrope.rs"]
