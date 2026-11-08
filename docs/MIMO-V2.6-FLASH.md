@@ -57,6 +57,17 @@ launcher default; `FP8_QKV=1` already was).
   with all diffs stylistic (no factual errors either arm), needles pass
   both arms, decode a wash. **NVFP4 stays the default**; the BF16 arm
   remains an opt-in escape hatch.
+- **LM-head NVFP4 A/B** (`--lm-head-dtype bf16`, flag-only): NVFP4 is
+  clean — no Qwen3.6-style argmax-flip/long-generation collapse (2K-token
+  structured code probe clean on both arms), needles/greedy pass,
+  46-prompt diffs stylistic, ppl 3.028 vs 3.004 (noise). NVFP4 ~6% faster
+  on long generations; the BF16 arm showed no KV-pool shrink (boot
+  variance). **NVFP4 stays the default**; BF16 remains an opt-in escape
+  hatch. (MiMo lm_head = `lm_head.weight` [152,576 × 4096], BF16 in the
+  checkpoint, untied from `embed_tokens`; runtime-quantized to NVFP4 —
+  packed E2M1 + FP8 scale per 16 weights + FP32 global scale, ~352 MB/rank
+  vs 1.25 GB BF16 — replicated on both ranks, read once per decode token
+  and once per DFlash verify step via a transposed twin.)
 - **`ATLAS_MOE_TOPK` (closed experiment)**: top-6 quality-clean but decode
   flat (+1.6%, within noise); top-4 decode +29% but ppl +20.3% and factual
   errors in the 46-prompt gate. **Quality-unacceptable; stays opt-in,
