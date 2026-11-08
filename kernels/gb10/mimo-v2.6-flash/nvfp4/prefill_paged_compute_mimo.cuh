@@ -623,12 +623,12 @@ extern "C" __global__ void KERNEL_NAME(
         unsigned int r0=pv_warp_m+group_id, r1=r0+8;
         float il0,il1;
         if(warp_id<2){
-            il0=(l_r0>0)?(1.f/l_r0):0;
-            il1=(l_r1>0)?(1.f/l_r1):0;
+            il0=(l_r0>0)?(out_scale/l_r0):0;
+            il1=(l_r1>0)?(out_scale/l_r1):0;
         } else {
             float lv0=smem_ml[r0][1], lv1=smem_ml[r1][1];
-            il0=(lv0>0)?(1.f/lv0):0;
-            il1=(lv1>0)?(1.f/lv1):0;
+            il0=(lv0>0)?(out_scale/lv0):0;
+            il1=(lv1>0)?(out_scale/lv1):0;
         }
 
 #ifdef PREFILL_BATCHED

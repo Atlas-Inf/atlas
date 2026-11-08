@@ -77,7 +77,7 @@
 #define KERNEL_NAME mimo_prefill_tc
 #define K_CACHE_TYPE const __nv_bfloat16* __restrict__
 #define V_CACHE_TYPE const __nv_bfloat16* __restrict__
-#define KERNEL_EXTRA_PARAMS , const float inv_sqrt_d, const __nv_bfloat16* __restrict__ sinks
+#define KERNEL_EXTRA_PARAMS , const float inv_sqrt_d, const float out_scale, const __nv_bfloat16* __restrict__ sinks
 #define KERNEL_PREAMBLE /* nothing */
 
 #include "prefill_paged_compute_mimo.cuh"

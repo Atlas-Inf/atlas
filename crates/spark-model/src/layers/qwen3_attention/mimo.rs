@@ -415,6 +415,7 @@ impl Qwen3AttentionLayer {
                 .arg_u32(m.window)
                 .arg_u32(1)
                 .arg_f32(m.scale)
+                .arg_f32(m.out_scale)
                 .arg_ptr(m.sinks)
                 .launch(stream)?;
         } else {
