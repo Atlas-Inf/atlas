@@ -169,6 +169,20 @@ rows) are padded to the 128-row block grid (3456); the pad rows are never
 read. `o_proj` stays BF16. The kernel target carries `mxfp8_gemv.cu` (same
 source as glm-5.3-flash). `FP8_QKV=0` restores the BF16 path for A/B.
 
+## Tensor-core paged prefill (`mimo_prefill_tc`)
+
+Chunked (paged) prefill runs a tensor-core (`mma.sync` BF16) flash-attention
+kernel, `mimo_prefill_tc`, forked from the shared `prefill_paged_compute.cuh`
+for MiMo's geometry: Q/K head dim 192, V head dim 128 (output 128), SWA
+`attention_sink` bias (nullable; full-attention layers pass null) and the
+`SWA_EVICT=1` `swa_map` logical→ring-slot indirection. The chunk-0 contiguous
+prefill and any stale kernel build fall back to the scalar `mimo_prefill_attn`
+in `mimo_attn.cu`. The fork lives in this target only
+(`prefill_paged_compute_mimo.cuh`); the shared header is untouched. Decode and
+the DFlash drafter are unaffected. Off-hardware checks: `nvcc -arch=sm_121a`
+compile, fmt/clippy/license/typos; correctness and TTFT are validated on the
+fork before this is relied on.
+
 ## Known risk areas to watch
 
 1. Missing-kernel errors at startup (kernel audit / `gpu.kernel` lookup) —
