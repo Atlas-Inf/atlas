@@ -945,6 +945,7 @@ impl BlockDiffusionDraftHead {
             batch_markov_bias,
             batch_dflash2_projected,
             batch_dflash2_selector_scratch,
+            last_select: parking_lot::Mutex::new(None),
             batch_conv_delta,
             batch_conv_out,
             extra_lanes,

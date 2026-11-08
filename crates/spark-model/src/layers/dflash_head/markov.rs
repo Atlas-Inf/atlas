@@ -49,6 +49,16 @@ impl BlockDiffusionDraftHead {
     ) -> Result<()> {
         let bf16 = 2usize;
         if let Some(ref selector) = self.candidate_selector {
+            let anchor = Self::selector_anchor(last_token, ban_depth, scratch);
+            self.note_select(self.kernels.dflash2_candidate_selector.map(|_| {
+                super::tree_lattice::LastSelect {
+                    logits: scratch.logits,
+                    projected: scratch.dflash2_projected_hidden,
+                    scratch: scratch.dflash2_selector_scratch,
+                    anchor: anchor.token_dev,
+                    ban_depth: anchor.ban_depth_dev,
+                }
+            }));
             return selector.select_candidates(
                 Self::selector_anchor(last_token, ban_depth, scratch),
                 hidden_buf,

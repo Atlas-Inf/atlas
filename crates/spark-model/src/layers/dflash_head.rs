@@ -690,6 +690,9 @@ pub struct BlockDiffusionDraftHead {
     /// DFlash2 selector scratch for the batched tail's per-sequence launches.
     /// NULL when the head has no candidate selector.
     pub batch_dflash2_selector_scratch: DevicePtr,
+    /// The buffers of the last single-sequence DFlash2 selector launch
+    /// (`tree_lattice`): what an exact tree verify builds its tree from.
+    pub last_select: parking_lot::Mutex<Option<tree_lattice::LastSelect>>,
     /// DFlash2 conv scratch: dynamic-delta rows `[B*gamma, 2*kernel_size*groups]`
     /// and conv output `[B*gamma, hidden]`. NULL when the drafter ships no conv.
     pub batch_conv_delta: DevicePtr,
@@ -903,6 +906,7 @@ pub mod rank_split;
 mod rank_split_batch;
 mod rank_split_forward;
 mod small_m_gemm;
+mod tree_lattice;
 
 mod context_window;
 mod markov_slots;
@@ -1291,6 +1295,14 @@ impl BlockDiffusionDraftHead {
 impl DraftProposer for BlockDiffusionDraftHead {
     fn startup_diagnostics(&self) -> Option<&DsparkDiagnostics> {
         Some(&self.startup.diagnostics)
+    }
+
+    fn draft_tree(
+        &self,
+        gpu: &dyn GpuBackend,
+        rows: usize,
+    ) -> Result<Option<crate::speculative::draft_tree::DraftTree>> {
+        self.tree_from_last_select(gpu, rows)
     }
 
     fn propose_batch_max(

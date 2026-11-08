@@ -1051,6 +1051,47 @@ pub trait Model: Send + Sync {
         bail!("this model cannot grammar-mask a speculative verify")
     }
 
+    /// Exact DFlash tree verify (`ATLAS_DFLASH_TREE`,
+    /// `speculative::draft_tree`): whether this model serves it.
+    fn dflash_tree_supported(&self) -> bool {
+        false
+    }
+
+    /// A best-first draft tree of at most `rows` rows over the last
+    /// single-sequence propose's lattice; `None` when there is none.
+    fn dflash_draft_tree(
+        &self,
+        _rows: usize,
+    ) -> Result<Option<crate::speculative::draft_tree::DraftTree>> {
+        Ok(None)
+    }
+
+    /// Verify `tree`'s rows (row 0 the last committed token) on `seq`, each
+    /// row's logits serial decode's for the path ending at it. Returns every
+    /// row's argmax; advances `seq` by the rows like
+    /// [`Self::decode_verify_dflash`], and must be followed by
+    /// [`Self::commit_dflash_tree`].
+    fn decode_verify_dflash_tree(
+        &self,
+        _tree: &crate::speculative::draft_tree::DraftTree,
+        _seq: &mut SequenceState,
+    ) -> Result<Vec<u32>> {
+        bail!("this model has no exact tree verify")
+    }
+
+    /// Move the tree verify's logits rows `rows[i]` to row `i` (a root path,
+    /// so the per-row pick pipeline reads it in order).
+    fn dflash_tree_gather_rows(&self, _rows: &[usize]) -> Result<()> {
+        bail!("this model has no exact tree verify")
+    }
+
+    /// Commit the accepted root `path` of the tree verify that just ran:
+    /// KV, recurrent state, drafter-context captures, `seq.tokens` and
+    /// `seq.seq_len` as a chain verify accepting that path leaves them.
+    fn commit_dflash_tree(&self, _seq: &mut SequenceState, _path: &[usize]) -> Result<()> {
+        bail!("this model has no exact tree verify")
+    }
+
     fn decode_verify_dflash(
         &self,
         tokens: &[u32],

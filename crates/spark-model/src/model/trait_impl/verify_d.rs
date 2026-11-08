@@ -33,6 +33,20 @@ impl TransformerModel {
         // (`glm_verify_masks`): eager only, and the split head must serve.
         allow: Option<spark_runtime::gpu::DevicePtr>,
     ) -> Result<Vec<u32>> {
+        self.decode_verify_graphed_kgamma_dispatch_with(tokens, seq, _stream, allow, None)
+    }
+
+    /// [`Self::decode_verify_graphed_kgamma_dispatch`]; with `tree`, the rows
+    /// of an exact tree verify (`verify_tree.rs`): its per-row metadata, its
+    /// layers' tree arms (`draft_tree::enter`) and its own graphs.
+    pub(super) fn decode_verify_graphed_kgamma_dispatch_with(
+        &self,
+        tokens: &[u32],
+        seq: &mut SequenceState,
+        _stream: u64,
+        allow: Option<spark_runtime::gpu::DevicePtr>,
+        tree: Option<&super::verify_tree::TreePlan>,
+    ) -> Result<Vec<u32>> {
         let k = tokens.len();
         if k == 0 {
             return Ok(Vec::new());
@@ -77,7 +91,10 @@ impl TransformerModel {
         }
 
         // 1c. Upload K-entry attention metadata (see `kgamma_upload_meta`).
-        let metadata = self.kgamma_upload_meta(seq, k, bs, stream)?;
+        let metadata = match tree {
+            Some(plan) => self.kgamma_upload_meta_tree(seq, plan, stream)?,
+            None => self.kgamma_upload_meta(seq, k, bs, stream)?,
+        };
 
         // Phase 6.2.c — HSS host I/O is illegal under CUDA graph capture.
         let hss_engaged = kv_cache.config().cache_blocks_per_seq.is_some();
@@ -209,7 +226,16 @@ impl TransformerModel {
             None
         };
 
-        let cache_key = (seq.slot_idx, k);
+        let cache_key = (
+            seq.slot_idx,
+            if tree.is_some() {
+                k | super::verify_tree::TREE_KEY
+            } else {
+                k
+            },
+        );
+        // A tree's layers read its descriptor while recording or running.
+        let _tree_scope = tree.map(|p| crate::speculative::draft_tree::enter(p.dev));
         let cached_for_slot = graph_cache
             .as_ref()
             .and_then(|c| c.get(&cache_key).copied());
@@ -220,8 +246,16 @@ impl TransformerModel {
         }
         let need_run = cached_for_slot.is_none();
         if need_run {
-            let seq_lens_vec: Vec<usize> = (0..k).map(|t| seq.seq_len + t).collect();
-            let block_tables_vec: Vec<Vec<u32>> = vec![seq.block_table.clone(); k];
+            let (seq_lens_vec, block_tables_vec): (Vec<usize>, Vec<Vec<u32>>) = match tree {
+                Some(plan) => (
+                    plan.positions.iter().map(|&p| p as usize).collect(),
+                    plan.tables.clone(),
+                ),
+                None => (
+                    (0..k).map(|t| seq.seq_len + t).collect(),
+                    vec![seq.block_table.clone(); k],
+                ),
+            };
 
             if use_graphs {
                 self.gpu.begin_capture(stream)?;

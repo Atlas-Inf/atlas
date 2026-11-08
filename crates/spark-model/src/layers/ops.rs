@@ -282,6 +282,8 @@ mod qwen4exp_w4_rows;
 mod qwen4exp_w4_wide;
 #[path = "ops/qwen4exp_wide_rows.rs"]
 mod qwen4exp_wide_rows;
+#[path = "ops/tree_verify.rs"]
+mod tree_verify;
 // Shared harness for the oracle-parity tests, split for the 500-LoC cap.
 #[cfg(test)]
 #[path = "ops/grammar_bitmask_tests.rs"]
@@ -436,5 +438,6 @@ pub use ssm_preproc::*;
 pub use ssm_ssd::*;
 pub use strix_f16::*;
 pub use strix_s64::*;
+pub use tree_verify::*;
 pub use wide_prefill::*;
 pub use yarn_mrope::*;

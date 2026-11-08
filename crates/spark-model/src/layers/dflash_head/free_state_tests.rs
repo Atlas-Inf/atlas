@@ -151,6 +151,7 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         batch_markov_bias: DevicePtr(0),
         batch_dflash2_projected: DevicePtr(0),
         batch_dflash2_selector_scratch: DevicePtr(0),
+        last_select: parking_lot::Mutex::new(None),
         batch_conv_delta: DevicePtr(0),
         batch_conv_out: DevicePtr(0),
         extra_lanes: Vec::new(),
