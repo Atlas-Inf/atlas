@@ -1,0 +1,54 @@
+--- a/crates/spark-model/src/layers/qwen3_ssm/debug.rs
++++ b/crates/spark-model/src/layers/qwen3_ssm/debug.rs
+@@ -141,3 +141,31 @@
+         tracing::info!("  SSM {label}: {:?}", vals);
+     }
+ }
++
++/// SCRATCH (not for commit): append `rows` BF16 rows of a GDN projection input
++/// to `<ATLAS_GDN_CAPTURE>/L{ssm:02}_{kind}.bin` (calibration capture).
++pub(super) fn capture_rows(
++    gpu: &dyn GpuBackend,
++    ptr: DevicePtr,
++    rows: usize,
++    cols: usize,
++    kind: &str,
++    stream: u64,
++) -> Result<()> {
++    static QKVZ: AtomicUsize = AtomicUsize::new(0);
++    static OUT: AtomicUsize = AtomicUsize::new(0);
++    let Ok(dir) = std::env::var("ATLAS_GDN_CAPTURE") else {
++        return Ok(());
++    };
++    let c = if kind == "qkvz" { &QKVZ } else { &OUT }.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++    gpu.synchronize(stream)?;
++    let mut buf = vec![0u8; rows * cols * 2];
++    gpu.copy_d2h(ptr, &mut buf)?;
++    use std::io::Write;
++    let mut f = std::fs::OpenOptions::new()
++        .create(true)
++        .append(true)
++        .open(std::path::Path::new(&dir).join(format!("L{:02}_{kind}.bin", c % 48)))?;
++    f.write_all(&buf)?;
++    Ok(())
++}
+--- a/crates/spark-model/src/layers/qwen3_ssm/trait_prefill_proj.rs
++++ b/crates/spark-model/src/layers/qwen3_ssm/trait_prefill_proj.rs
+@@ -30,6 +30,7 @@
+         ctx: &ForwardContext,
+         stream: u64,
+     ) -> Result<()> {
++        super::debug::capture_rows(ctx.gpu, normed, k as usize, h, "qkvz", stream)?;
+         let proj_dst = if self.sequential_qkvz {
+             deinterleaved
+         } else {
+--- a/crates/spark-model/src/layers/qwen3_ssm/trait_prefill_helper.rs
++++ b/crates/spark-model/src/layers/qwen3_ssm/trait_prefill_helper.rs
+@@ -121,6 +121,7 @@
+         value_dim: usize,
+         stream: u64,
+     ) -> Result<()> {
++        super::debug::capture_rows(ctx.gpu, normed_out_buf, k as usize, value_dim, "out", stream)?;
+         // Native MXFP8 (FP4-Local): the layer's only out_proj.
+         if let Some(mx8) = self.mx8.as_ref() {
+             return self.mx8_out(
