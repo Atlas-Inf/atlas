@@ -23,15 +23,35 @@ backbone, official checkpoint served as-is (~173 GB → ~89 GB per rank).
 - Sliding-window layers keep their full paged history (no block eviction yet);
   attention only reads the last 128 tokens.
 
-## Verified off-hardware
+## Hardware validation (2× GB10, fork)
 
-- `cargo test -p atlas-core --lib mimo_v2` against the published `config.json`.
-- `cargo build -p atlas-kernels` with `ATLAS_TARGET_MODEL=mimo-v2.6-flash`
-  (nvcc 13.0, sm_121): all kernels compile; `mimo_attn` kernels have no
-  register spills.
-- fmt / clippy / license headers.
+Validated on the fork hardware agent (two DGX Sparks, RoCE); all numbers
+below are observed, n≥3 where quoted, on the fingerprint named per section.
+The recommended build is **TP=2 + FP8 QKV + DFLASH γ=4** (`TP_SIZE=2` is the
+launcher default; `FP8_QKV=1` already was).
 
-Nothing has run on a GPU yet. Everything below is for the local tester.
+- **FP8 QKV**: decode n=3 12.73 vs 10.66 tok/s baseline on the same
+  fingerprint (+19%); p64k cold TTFT 349.5s → 144.7s; 262K needle PASS.
+- **Tensor-core prefill** (`mimo_prefill_tc`): bit-exact per chunk vs the
+  scalar path; p64k cold TTFT ~147s.
+- **TP=2 attention sharding**: correctness PASS on both FP8 and BF16 QKV
+  arms (greedy + needles identical to TP=1); KV pool 1,456,864 vs 508,576
+  max KV tokens at `--gpu-memory-utilization 0.93` (**2.86×**; 613,424 at
+  0.84); decode ~12.6 vs ~13.3 tok/s (~5% cost, the per-layer attention
+  all-reduce). The KV win is the primary motivation near the memory
+  ceiling; the decode cost is the known trade.
+- **MXFP4 tensor-core experts** (`ATLAS_MOE_MXFP4_TC[_SD]=1`): correctness
+  PASS (greedy + needles) for both halves; decode perf-neutral (decode is
+  expert-weight-bytes-bound, not dequant-FLOP-bound). Opt-in, default off.
+- **`ATLAS_MOE_TOPK` (closed experiment)**: top-6 quality-clean but decode
+  flat (+1.6%, within noise); top-4 decode +29% but ppl +20.3% and factual
+  errors in the 46-prompt gate. **Quality-unacceptable; stays opt-in,
+  default off, do not pursue further.**
+
+Off-hardware checks that still apply: `cargo test -p atlas-core --lib
+mimo_v2` against the published `config.json`; `cargo build -p
+atlas-kernels` with `ATLAS_TARGET_MODEL=mimo-v2.6-flash` (nvcc 13.0,
+sm_121); fmt / clippy / license headers.
 
 ## Local test plan (2× GB10)
 
@@ -93,7 +113,7 @@ the target's zero `mask_token_id` (151675) row, as SGLang does.
 
 ```bash
 hf download XiaomiMiMo/MiMo-V2.6-Flash-RL --include 'dflash/*'   # both nodes
-DFLASH=1 bash scripts/start-mimo-ep2.sh   # adds --dflash --draft-model <snapshot>/dflash --dflash-gamma 8 --dflash-window-size 1024
+DFLASH=1 bash scripts/start-mimo-ep2.sh   # adds --dflash --draft-model <snapshot>/dflash --dflash-gamma 4 --dflash-window-size 1024
 ```
 
 `--dflash` and `--speculative` (MTP) are mutually exclusive. Report the
@@ -181,19 +201,35 @@ opt-in, `ATLAS_MOE_MXFP4_TC_SD=1`, swaps the SiLU+down half
 (`mxfp4_silu_down_tc`), which computes `silu(gate) * up` on the fly with one
 BF16 rounding per element (the scalar kernel keeps FP32 intermediates —
 the only intended numeric deviation). Either flag alone leaves the other
-half scalar. Both default off pending hardware validation; require
-`N % 16 == 0` and `K % 64 == 0` (MiMo: gate/up 2048/4096, silu/down
-4096/2048). Other quant targets never resolve the kernels (`try_kernel`
-gives 0), so the scalar path is untouched everywhere else.
+half scalar. Both default off: hardware-validated correct (greedy + needles)
+but decode perf-neutral (see Hardware validation), so there is no reason to
+enable by default. Require `N % 16 == 0` and `K % 64 == 0` (MiMo: gate/up
+2048/4096, silu/down 4096/2048). Other quant targets never resolve the
+kernels (`try_kernel` gives 0), so the scalar path is untouched everywhere
+else.
+
+## Tensor-parallel attention (`TP_SIZE=2`, default)
+
+With `TP_SIZE=2` (the launcher default) the attention projections shard by
+head across the two Sparks while experts stay EP=2: QKV loads whole
+checkpoint chunk pairs `{2r, 2r+1}` per rank (BF16 contiguous row ranges,
+FP8 per-chunk data + scale-band copies, 128-block alignment preserved by
+construction), `o_proj` row-parallel with sinks 1D-sharded, and the generic
+TP all-reduce after `o_proj` sums partials in all three forward paths. Each
+rank stores KV for its own heads only, so the KV pool roughly doubles on
+top of the weight savings. The MTP/DFlash drafter stays unsharded on rank
+0. `TP_SIZE=1` restores the replicated-attention EP=2 layout. Hardware
+validation and numbers: see [Hardware validation](#hardware-validation-2-gb10-fork).
 
 ## Experimental MoE top-k override (`ATLAS_MOE_TOPK`, opt-in)
 
 `ATLAS_MOE_TOPK=<k>` (1..=8) reduces the routed-expert count per token at
-config-parse time. Expert weight bytes — the decode bottleneck per the
-nsys profile — scale ~linearly with k, so top-4 is expected to roughly halve
-the expert bucket. **Quality is unvalidated**: the model was trained at
-top-8, so any reduction is an experiment (greedy/needle A/B, then a quality
-eval) and the flag must never become a default. Unset = trained top-8.
+config-parse time. Expert weight bytes scale ~linearly with k. **Quality is
+unvalidated and the experiment is closed**: the model was trained at
+top-8; on hardware, top-6 was quality-clean but decode-flat (+1.6%), and
+top-4 was +29% decode with ppl +20.3% and factual errors — not shippable.
+The flag stays opt-in and must never become a default. Unset = trained
+top-8.
 
 ## Tensor-core paged prefill (`mimo_prefill_tc`)
 

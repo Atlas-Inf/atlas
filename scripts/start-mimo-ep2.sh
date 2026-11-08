@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# Multi-node MiMo-V2.6-Flash bring-up on 2x GB10 (EP=2), text backbone.
+# Multi-node MiMo-V2.6-Flash bring-up on 2x GB10 (EP=2 + TP=2), text backbone.
 #
 # The checkpoint is ~173 GB (native MXFP4 experts, FP8 attention), so each
-# rank holds half of the 256 experts (~89 GB). Phase 1 limits:
+# rank holds half of the 256 experts (~89 GB). Validated limits:
 #   * --kv-cache-dtype bf16 only (the QK192/V128 attention kernels read a
 #     BF16 paged cache; the loader rejects other KV dtypes)
+#   * TP_SIZE=2 (default): attention QKV/o_proj shard by head across the two
+#     Sparks (TP all-reduce per layer); experts stay EP=2. Raises the KV pool
+#     ~2.86x (1,456,864 vs 508,576 max KV tokens at util 0.93) at a ~5% decode
+#     cost. TP_SIZE=1 restores the replicated-attention EP=2 layout.
+#   * FP8_QKV=1 (default): qkv_proj stays native FP8 block weights.
 #   * --speculative is optional (SPECULATIVE=1; the 3 MTP modules run on rank 0)
 #   * --dflash is optional (DFLASH=1; the checkpoint's dflash/ drafter runs on
 #     rank 0, both ranks read its config). Needs the dflash/ files downloaded:
@@ -27,7 +32,7 @@ GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-16384}"
 KV_DTYPE="${KV_DTYPE:-bf16}"
 MAX_BATCH="${MAX_BATCH:-1}"
-TP_SIZE="${TP_SIZE:-1}"
+TP_SIZE="${TP_SIZE:-2}"
 EP_SIZE="${EP_SIZE:-2}"
 EXTRA_FLAGS="${EXTRA_FLAGS:-}"
 SPECULATIVE="${SPECULATIVE:-0}"
