@@ -19,8 +19,11 @@
 // earlier); such a tile leaves m, l and O unchanged (exp(-1e30 - m) = 0), so
 // the output is bit-identical.
 //
-// Grid (num_q_heads, ceil(max_len / 128), batch), block 256.
+// Grid (num_q_heads, ceil(max_len / 128), batch), block 256. The `_gqa`
+// entries (score passes) pack a KV head's query heads into each tile and can
+// split a long KV range across a 2-CTA cluster; see the end of the file.
 
+#include <cooperative_groups.h>
 #include <cuda.h>   // CUtensorMap
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -33,6 +36,17 @@ constexpr int BR = 128;           // query rows a CTA
 constexpr int HP = HD + 8;        // smem row pitch (as HDIM_PAD)
 constexpr int NT_O = HD / 8;      // output n-tiles a warp
 constexpr int KV_CHUNKS = BC * (HD / 8);
+// In the split entries, a stream with more than SPLIT_MIN_KEYS keys and at
+// least SPLIT_KEYS_PER_ROW keys a row (a knowledge pack under a short state)
+// shares each tile's KV range across the cluster; any other stream gives
+// each rank whole tiles of its own, computed exactly as the unsplit entry
+// does. The rule reads the stream alone, so a merged pass scores as each
+// request alone. A split stream's tiles each read over 3,072 keys (its state
+// ends at least 3/4 of the way through its KV), so no chunk is empty.
+constexpr unsigned SPLIT_MIN_KEYS = 4096, SPLIT_KEYS_PER_ROW = 4;
+__device__ __forceinline__ bool stream_splits(unsigned kv_len, unsigned rows) {
+    return kv_len > SPLIT_MIN_KEYS && kv_len >= SPLIT_KEYS_PER_ROW * rows;
+}
 static_assert(KV_CHUNKS % 256 == 0, "load_kv: whole rounds of 256 threads");
 
 __device__ __forceinline__ void cp16(void* dst, const void* src) {
@@ -194,7 +208,70 @@ __device__ __forceinline__ void v_to_f16(__nv_bfloat16 (*v)[HP], unsigned tid) {
 }
 }  // namespace rows128
 
-template <bool TMA>
+// The CS CTAs of a split tile hold O, m and l of their KV chunks for the same
+// 128 rows. Each publishes m, l and (in two 128-column halves) O in its own
+// smem; rank r reads every rank's rows [r 128 / CS, (r + 1) 128 / CS) through
+// distributed shared memory and writes them, combined in rank order:
+// O = sum_s exp(m_s - M) O_s / sum_s exp(m_s - M) l_s, M = max_s m_s. Keys
+// are masked only from above here (no sliding window in a split), so a chunk
+// either starts on a key the row reads or reads none of them.
+template <unsigned CS, typename RowOut>
+__device__ __forceinline__ void split_combine(unsigned char* smem, const float (&acc_o)[rows128::NT_O][4], float m0,
+                                              float m1, float l0, float l1, unsigned rank, unsigned warp, unsigned lane,
+                                              unsigned rows, RowOut row_out) {
+    using namespace rows128;
+    namespace cg = cooperative_groups;
+    static_assert(BR * 2 * 4 + BR * 128 * 4 <= 4 * BC * HP * 2, "m, l and half of O fit the KV tiles");
+    cg::cluster_group cl = cg::this_cluster();
+    float* const ml = reinterpret_cast<float*>(smem);   // [BR][2]
+    float* const so = ml + 2 * BR;                     // [BR][128], 8-float groups XOR-swizzled by row
+    const auto at = [](unsigned r, unsigned c) { return r * 128 + (c ^ ((r & 7) << 3)); };
+    const unsigned grp = lane >> 2, tq = lane & 3, row0 = warp * 16 + grp, row1 = row0 + 8;
+    __syncthreads();   // every warp is done with the last K/V tile
+    if (tq == 0) {
+        ml[2 * row0] = m0; ml[2 * row0 + 1] = l0;
+        ml[2 * row1] = m1; ml[2 * row1 + 1] = l1;
+    }
+    constexpr unsigned SLICE = BR / CS;
+    const unsigned tid = warp * 32 + lane;
+#pragma unroll
+    for (unsigned half = 0; half < 2; half++) {
+#pragma unroll
+        for (int i = 0; i < NT_O / 2; i++) {
+            const unsigned c0 = i * 8 + tq * 2;
+            const int nt = half * (NT_O / 2) + i;
+            *reinterpret_cast<float2*>(&so[at(row0, c0)]) = make_float2(acc_o[nt][0], acc_o[nt][1]);
+            *reinterpret_cast<float2*>(&so[at(row1, c0)]) = make_float2(acc_o[nt][2], acc_o[nt][3]);
+        }
+        cl.sync();   // every rank's m, l and this half of O are published
+        for (unsigned e = tid; e < SLICE * 64; e += 256) {
+            const unsigned r = rank * SLICE + e / 64, c = (e % 64) * 2;
+            if (r >= rows) continue;
+            float mx = -1e30f;
+#pragma unroll
+            for (unsigned s = 0; s < CS; s++) mx = fmaxf(mx, cl.map_shared_rank(ml, s)[2 * r]);
+            float l = 0.f, o0 = 0.f, o1 = 0.f;
+#pragma unroll
+            for (unsigned s = 0; s < CS; s++) {
+                const float* pml = cl.map_shared_rank(ml, s);
+                // A chunk wholly past the row's last key never left -1e30
+                // (its l and O are not a softmax): it weighs nothing.
+                const float w = pml[2 * r] == -1e30f ? 0.f : softmax_exp(pml[2 * r] - mx);
+                const float2 v = *reinterpret_cast<const float2*>(&cl.map_shared_rank(so, s)[at(r, c)]);
+                l += w * pml[2 * r + 1];
+                o0 += w * v.x;
+                o1 += w * v.y;
+            }
+            const float il = (l > 0) ? (1.f / l) : 0;
+            const unsigned lo = __bfloat16_as_ushort(__float2bfloat16(o0 * il));
+            const unsigned hi = __bfloat16_as_ushort(__float2bfloat16(o1 * il));
+            *reinterpret_cast<unsigned*>(&row_out(r)[half * 128 + c]) = lo | (hi << 16);
+        }
+        cl.sync();   // no rank still reads this half (or, at the end, this CTA's smem)
+    }
+}
+
+template <bool TMA, bool GQA, unsigned CS = 1>
 __device__ __forceinline__ void rows128_body(
     const __nv_bfloat16* __restrict__ Q,
     const __nv_bfloat16* __restrict__ K_cache,
@@ -218,8 +295,15 @@ __device__ __forceinline__ void rows128_body(
     const CUtensorMap* kmap, const CUtensorMap* vmap
 ) {
     using namespace rows128;
-    const unsigned q_head = blockIdx.x, q_block = blockIdx.y, b = blockIdx.z;
-    if (b >= batch_size || q_head >= num_q_heads) return;
+    // GQA: blockIdx.x is the KV head and the CTA's rows are its G query
+    // heads' rows interleaved, flat index f = row * G + head-in-group, so a
+    // short stream fills one tile instead of G mostly empty ones.
+    const unsigned G = num_q_heads / num_kv_heads;
+    const unsigned b = blockIdx.z;
+    static_assert(CS == 1 || GQA, "split entries are GQA-packed");
+    const unsigned q_head = GQA ? 0u : blockIdx.x;
+    const unsigned kv_head = GQA ? blockIdx.x / CS : q_head / G;
+    if (b >= batch_size || (GQA ? kv_head >= num_kv_heads : q_head >= num_q_heads)) return;
     const int* const __restrict__ block_table = block_table_ptrs[b];
     unsigned q_base_b, q_len_eff = q_len;
     if (cu_seqlens != nullptr) {
@@ -233,14 +317,25 @@ __device__ __forceinline__ void rows128_body(
         if (cu_seqlens != nullptr && kv_len >= q_len_eff) q_offset = kv_len - q_len_eff;
     }
     const int s_end = state_end != nullptr ? state_end[b] : -1;
+    // Split entries: rank r of the cluster takes chunk r of a split stream's
+    // tile, or whole tile CS y + r of another stream.
+    [[maybe_unused]] const unsigned rank = blockIdx.x % CS;
+    const bool split = CS > 1 && stream_splits(kv_len, q_len_eff);
+    const unsigned q_block = CS > 1 && !split ? blockIdx.y * CS + rank : blockIdx.y;
     const unsigned tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
     const unsigned grp = lane >> 2, tq = lane & 3;
+    // Tile rows are flat indices; pos() is a flat index's row in the stream
+    // and head_of() its query head (both the identity without GQA).
+    const unsigned n_flat = GQA ? q_len_eff * G : q_len_eff;
+    const auto pos = [&](unsigned f) { return GQA ? f / G : f; };
+    const auto head_of = [&](unsigned f) { return GQA ? kv_head * G + f % G : q_head; };
     const unsigned q_start = q_block * BR;
-    if (q_start >= q_len_eff) return;
-    const unsigned q_tile_end = min(q_start + BR, q_len_eff);
+    if (q_start >= n_flat) return;
+    const unsigned q_tile_end = min(q_start + BR, n_flat);
     const unsigned q_tile_len = q_tile_end - q_start;
+    // First and one-past-last stream row the tile touches.
+    const unsigned r_start = pos(q_start), r_end = pos(q_tile_end - 1) + 1;
     const unsigned q_seq_stride = num_q_heads * head_dim;
-    const unsigned kv_head = q_head / (num_q_heads / num_kv_heads);
     const unsigned long long q_batch_off = (unsigned long long)q_base_b * q_seq_stride;
 
     // K tiles then V tiles, two each: padded rows (cp.async) or swizzled chunks (TMA).
@@ -257,16 +352,21 @@ __device__ __forceinline__ void rows128_body(
     // KV extent of the tile, as the BR=64 kernel derives it for its own rows.
     unsigned num_kv_blocks = (kv_len + BC - 1) / BC;
     if (s_end < 0) {
-        num_kv_blocks = min(num_kv_blocks, (q_offset + q_tile_end - 1) / BC + 1);
-    } else if (q_offset + q_tile_end <= (unsigned)s_end) {
+        num_kv_blocks = min(num_kv_blocks, (q_offset + r_end - 1) / BC + 1);
+    } else if (q_offset + r_end <= (unsigned)s_end) {
         num_kv_blocks = min(num_kv_blocks, ((unsigned)s_end + BC - 1) / BC);
     }
     unsigned kv_block_lo = 0;
     if (causal_mask_enabled && sliding_window > 0) {
-        const unsigned q_abs_lo = q_offset + q_start;
+        const unsigned q_abs_lo = q_offset + r_start;
         if (q_abs_lo + 1 > sliding_window) kv_block_lo = (q_abs_lo + 1 - sliding_window) / BC;
     }
     if (kv_block_lo >= num_kv_blocks && num_kv_blocks > 0) kv_block_lo = num_kv_blocks - 1;
+    if (split) {
+        const unsigned chunk = (num_kv_blocks - kv_block_lo + CS - 1) / CS;
+        kv_block_lo += rank * chunk;
+        num_kv_blocks = min(num_kv_blocks, kv_block_lo + chunk);
+    }
 
     // This warp's rows; a warp with none still loads tiles and syncs.
     const unsigned wm = warp * 16, row0 = wm + grp, row1 = row0 + 8;
@@ -294,10 +394,11 @@ __device__ __forceinline__ void rows128_body(
     // Q A-fragments for the warp's 16 rows (rows past the stream read as 0).
     uint32_t qa[HD / 16][4];
     {
-        const __nv_bfloat16* qb = Q + q_batch_off + q_head * head_dim + 2 * tq;
-        const bool v0 = q_start + row0 < q_len_eff, v1 = q_start + row1 < q_len_eff;
-        const __nv_bfloat16* q0 = qb + (unsigned long long)(q_start + row0) * q_seq_stride;
-        const __nv_bfloat16* q1 = qb + (unsigned long long)(q_start + row1) * q_seq_stride;
+        const unsigned f0 = q_start + row0, f1 = q_start + row1;
+        const bool v0 = f0 < n_flat, v1 = f1 < n_flat;
+        const __nv_bfloat16* qb = Q + q_batch_off + 2 * tq;
+        const __nv_bfloat16* q0 = qb + (unsigned long long)pos(f0) * q_seq_stride + head_of(f0) * head_dim;
+        const __nv_bfloat16* q1 = qb + (unsigned long long)pos(f1) * q_seq_stride + head_of(f1) * head_dim;
 #pragma unroll
         for (int ks = 0; ks < HD / 16; ks++) {
             qa[ks][0] = v0 ? *reinterpret_cast<const uint32_t*>(q0 + ks * 16) : 0u;
@@ -371,7 +472,7 @@ __device__ __forceinline__ void rows128_body(
 
         // ── masks and online softmax (the BR=64 kernel's, row for row) ──
         // A tile no mask can touch for any of the warp's rows skips them.
-        const unsigned qw_lo = q_offset + q_start + wm, qw_hi = qw_lo + 15;
+        const unsigned qw_lo = q_offset + pos(q_start + wm), qw_hi = q_offset + pos(q_start + wm + 15);
         const bool full = kv_start + BC <= kv_len && wm + 16 <= q_tile_len && sliding_window == 0 &&
             (s_end >= 0 ? (qw_hi < (unsigned)s_end || qw_lo >= (unsigned)s_end
                                ? kv_start + BC <= (qw_lo < (unsigned)s_end ? (unsigned)s_end : kv_len)
@@ -383,7 +484,7 @@ __device__ __forceinline__ void rows128_body(
             acc_s[nt][2] *= inv_sqrt_d; acc_s[nt][3] *= inv_sqrt_d;
             if (full) continue;
             const unsigned c0 = nt * 8 + tq * 2, c1 = c0 + 1;
-            const unsigned qr0 = q_offset + q_start + row0, qr1 = q_offset + q_start + row1;
+            const unsigned qr0 = q_offset + pos(q_start + row0), qr1 = q_offset + pos(q_start + row1);
             if (s_end >= 0) {
                 const unsigned lim0 = (qr0 < (unsigned)s_end) ? (unsigned)s_end : kv_len;
                 const unsigned lim1 = (qr1 < (unsigned)s_end) ? (unsigned)s_end : kv_len;
@@ -486,22 +587,33 @@ __device__ __forceinline__ void rows128_body(
         }
     }
 
+    if constexpr (CS > 1) {
+        if (split) {
+            split_combine<CS>(smem_kv, acc_o, m_r0, m_r1, l_r0, l_r1, rank, warp, lane, q_tile_len, [&](unsigned r) {
+                const unsigned f = q_start + r;
+                return O + q_batch_off + (unsigned long long)pos(f) * q_seq_stride + head_of(f) * head_dim;
+            });
+            return;
+        }
+    }
     if (!active) return;
     const float il0 = (l_r0 > 0) ? (1.f / l_r0) : 0, il1 = (l_r1 > 0) ? (1.f / l_r1) : 0;
-    __nv_bfloat16* ob = O + q_batch_off + q_head * head_dim;
+    const unsigned f0 = q_start + row0, f1 = q_start + row1;
+    const unsigned gr0 = pos(f0), gr1 = pos(f1);
+    __nv_bfloat16* ob0 = O + q_batch_off + (unsigned long long)gr0 * q_seq_stride + head_of(f0) * head_dim;
+    __nv_bfloat16* ob1 = O + q_batch_off + (unsigned long long)gr1 * q_seq_stride + head_of(f1) * head_dim;
 #pragma unroll
     for (int nt = 0; nt < NT_O; nt++) {
         const unsigned c0 = nt * 8 + tq * 2;
-        const unsigned gr0 = q_start + row0, gr1 = q_start + row1;
         if (gr0 < q_len && row0 < q_tile_len && c0 < head_dim) {
             const unsigned lo = __bfloat16_as_ushort(__float2bfloat16(acc_o[nt][0] * il0));
             const unsigned hi = __bfloat16_as_ushort(__float2bfloat16(acc_o[nt][1] * il0));
-            *reinterpret_cast<unsigned*>(&ob[gr0 * q_seq_stride + c0]) = lo | (hi << 16);
+            *reinterpret_cast<unsigned*>(&ob0[c0]) = lo | (hi << 16);
         }
         if (gr1 < q_len && row1 < q_tile_len && c0 < head_dim) {
             const unsigned lo = __bfloat16_as_ushort(__float2bfloat16(acc_o[nt][2] * il1));
             const unsigned hi = __bfloat16_as_ushort(__float2bfloat16(acc_o[nt][3] * il1));
-            *reinterpret_cast<unsigned*>(&ob[gr1 * q_seq_stride + c0]) = lo | (hi << 16);
+            *reinterpret_cast<unsigned*>(&ob1[c0]) = lo | (hi << 16);
         }
     }
 }
@@ -521,7 +633,7 @@ __device__ __forceinline__ void rows128_body(
         causal_mask_enabled, inv_sqrt_d
 
 extern "C" __global__ void __launch_bounds__(256, 1) prefill_paged_bf16_rows128(ROWS128_PARAMS) {
-    rows128_body<false>(ROWS128_ARGS, nullptr, nullptr);
+    rows128_body<false, false>(ROWS128_ARGS, nullptr, nullptr);
 }
 
 // K and V by TMA: `kmap` / `vmap` view a layer's pool as [blocks * 16 rows]
@@ -530,5 +642,33 @@ extern "C" __global__ void __launch_bounds__(256, 1) prefill_paged_bf16_rows128(
 extern "C" __global__ void __launch_bounds__(256, 1)
 prefill_paged_bf16_rows128_tma(ROWS128_PARAMS, const __grid_constant__ CUtensorMap kmap,
                                const __grid_constant__ CUtensorMap vmap) {
-    rows128_body<true>(ROWS128_ARGS, &kmap, &vmap);
+    rows128_body<true, false>(ROWS128_ARGS, &kmap, &vmap);
+}
+
+// GQA-packed entries (score passes), grid (num_kv_heads * CS, ceil(max_len
+// * G / 128), batch): each CTA's 128 rows are one KV head's G query heads
+// over ceil(128 / G) stream rows, sharing every K/V tile. Per row the
+// unsplit entry's arithmetic is the per-head entry's (a taller row span only
+// adds tiles fully masked for the rows that end earlier), so its output is
+// bit-identical. The split entry (clusters of 2 along x, rank = blockIdx.x %
+// 2) splits the streams `stream_splits` picks, within bf16 rounding of the
+// unsplit entry, and computes every other stream exactly as that entry.
+// Clusters of four were 5-10% faster for one long-pack request but 13%
+// slower than unsplit with eight merged; two stay within 2% there.
+extern "C" __global__ void __launch_bounds__(256, 1) prefill_paged_bf16_rows128_gqa(ROWS128_PARAMS) {
+    rows128_body<false, true>(ROWS128_ARGS, nullptr, nullptr);
+}
+extern "C" __global__ void __launch_bounds__(256, 1)
+prefill_paged_bf16_rows128_gqa_tma(ROWS128_PARAMS, const __grid_constant__ CUtensorMap kmap,
+                                   const __grid_constant__ CUtensorMap vmap) {
+    rows128_body<true, true>(ROWS128_ARGS, &kmap, &vmap);
+}
+extern "C" __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(256, 1)
+prefill_paged_bf16_rows128_gqa_split2(ROWS128_PARAMS) {
+    rows128_body<false, true, 2>(ROWS128_ARGS, nullptr, nullptr);
+}
+extern "C" __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(256, 1)
+prefill_paged_bf16_rows128_gqa_split2_tma(ROWS128_PARAMS, const __grid_constant__ CUtensorMap kmap,
+                                          const __grid_constant__ CUtensorMap vmap) {
+    rows128_body<true, true, 2>(ROWS128_ARGS, &kmap, &vmap);
 }

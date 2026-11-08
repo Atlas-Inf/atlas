@@ -109,8 +109,42 @@ impl Qwen3AttentionLayer {
         }
 
         let use_br64 = chunk_len >= 256;
-        let (fp8_k_scale, fp8_v_scale) = self.effective_fp8_scales();
         let q_offset_u32 = seq_len_start as u32;
+        // 128-row tiles: a score pass's GQA tiles at any length (no sliding
+        // window: the split entry has none), else the lever's per-head tiles
+        // in place of BR=64.
+        let rows128 = if batched_meta.gqa_tiles && self.sliding_window.is_none() {
+            Some(super::rows128::Tiles::gqa(
+                &batched_meta.kv_lens_host,
+                &batched_meta.cu_seqlens_host,
+            ))
+        } else {
+            use_br64.then_some(super::rows128::Tiles::PerHead)
+        }
+        .filter(|&t| hd == 256 && super::rows128::available(ctx.gpu, t));
+        if let (KvCacheDtype::Bf16, Some(tiles)) = (self.kv_dtype, rows128) {
+            // Same arguments and bit-identical output, 128-row tiles (split
+            // GQA tiles: within bf16 rounding).
+            let pools = super::rows128::Pools {
+                k: kv_cache.k_pool_ptr(self.attn_layer_idx),
+                v: kv_cache.v_pool_ptr(self.attn_layer_idx),
+                blocks: kv_cache.num_blocks(),
+                block_stride: kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx),
+            };
+            return super::rows128::launch(
+                ctx.gpu,
+                tiles,
+                pools,
+                [q_contiguous, attn_out, block_table_ptrs],
+                batch_size,
+                [cu_seqlens, kv_lens, batched_meta.state_end],
+                [chunk_len, kv_len, q_offset_u32],
+                [nq, nkv, hd, bs_u, self.sliding_window.unwrap_or(0)],
+                inv_sqrt_d,
+                stream,
+            );
+        }
+        let (fp8_k_scale, fp8_v_scale) = self.effective_fp8_scales();
 
         match (self.kv_dtype, use_br64) {
             (KvCacheDtype::Nvfp4, false) => {
@@ -274,26 +308,6 @@ impl Qwen3AttentionLayer {
                     hd,
                     bs_u,
                     self.sliding_window.unwrap_or(0),
-                    inv_sqrt_d,
-                    stream,
-                )?;
-            }
-            (KvCacheDtype::Bf16, true) if super::rows128::available(ctx.gpu) && hd == 256 => {
-                // Same arguments and bit-identical output, 128-row tiles.
-                let pools = super::rows128::Pools {
-                    k: kv_cache.k_pool_ptr(self.attn_layer_idx),
-                    v: kv_cache.v_pool_ptr(self.attn_layer_idx),
-                    blocks: kv_cache.num_blocks(),
-                    block_stride: kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx),
-                };
-                super::rows128::launch(
-                    ctx.gpu,
-                    pools,
-                    [q_contiguous, attn_out, block_table_ptrs],
-                    batch_size,
-                    [cu_seqlens, kv_lens, batched_meta.state_end],
-                    [chunk_len, kv_len, q_offset_u32],
-                    [nq, nkv, hd, bs_u, self.sliding_window.unwrap_or(0)],
                     inv_sqrt_d,
                     stream,
                 )?;
