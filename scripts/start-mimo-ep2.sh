@@ -113,7 +113,10 @@ ssh "$WORKER_IP" "sudo docker rm -f atlas-mimo-ep1 2>/dev/null || true"
 # unconfined for the storage path.
 RDMA_FLAGS="--device=/dev/infiniband --cap-add=IPC_LOCK --cap-add=SYS_NICE --ulimit memlock=-1 --security-opt seccomp=unconfined"
 
-# NCCL env — same as Qwen3.5-122B EP=2 (RoCEv2 / IPv4, GB10-safe)
+# NCCL env — same as Qwen3.5-122B EP=2 (RoCEv2 / IPv4, GB10-safe), except
+# MAX_NCHANNELS=4: hardware sweep on MiMo decode (2026-11-08) showed +8.4%
+# decode tok/s vs 2 channels with unchanged correctness (Tree/Collnet fail to
+# init on this 2-rank RoCE setup; GDR regresses).
 NCCL_ENV="\
   -e NCCL_SOCKET_IFNAME=enp1s0f0np0 \
   -e NCCL_IB_DISABLE=0 \
@@ -131,7 +134,7 @@ NCCL_ENV="\
   -e NCCL_ALGO=Ring \
   -e NCCL_BUFFSIZE=33554432 \
   -e NCCL_MIN_NCHANNELS=1 \
-  -e NCCL_MAX_NCHANNELS=2 \
+  -e NCCL_MAX_NCHANNELS=4 \
   -e NCCL_DEBUG=WARN \
   -e NCCL_DEBUG_SUBSYS=INIT,NET"
 

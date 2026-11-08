@@ -43,6 +43,12 @@ launcher default; `FP8_QKV=1` already was).
 - **MXFP4 tensor-core experts** (`ATLAS_MOE_MXFP4_TC[_SD]=1`): correctness
   PASS (greedy + needles) for both halves; decode perf-neutral (decode is
   expert-weight-bytes-bound, not dequant-FLOP-bound). Opt-in, default off.
+- **NCCL sweep** (env-only, numerics identical): `NCCL_MAX_NCHANNELS=4`
+  adopted — decode 12.01 vs 11.08 tok/s baseline (**+8.4%**, non-overlapping
+  n=3 ranges, greedy/needle smoke unchanged, 4 channels confirmed in NCCL
+  INFO logs). Tree/Collnet fail init on this 2-rank RoCE setup; GDR
+  regresses; PROTO=LL and BUFFSIZE 16/64MiB also beat baseline but were not
+  fully probed (available if chan4 ever regresses).
 - **`ATLAS_MOE_TOPK` (closed experiment)**: top-6 quality-clean but decode
   flat (+1.6%, within noise); top-4 decode +29% but ppl +20.3% and factual
   errors in the 46-prompt gate. **Quality-unacceptable; stays opt-in,
