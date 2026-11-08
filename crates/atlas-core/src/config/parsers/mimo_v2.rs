@@ -128,6 +128,23 @@ pub(crate) fn parse_mimo_v2(raw: &Value) -> Result<ModelConfig> {
     config.mtp_num_hidden_layers = mtp;
     config.mtp_transformer_layers = 1;
 
+    // ── Experimental top-k override (quality-unvalidated; opt-in) ──
+    // ATLAS_MOE_TOPK=<k> (1..=trained top_k) reduces the routed-expert count
+    // per token. Expert weight bytes — and decode time — scale ~linearly
+    // with k, but the model was trained at the checkpoint's top_k, so any
+    // reduction is a quality experiment, never a default.
+    if let Ok(v) = std::env::var("ATLAS_MOE_TOPK") {
+        let k = v
+            .parse::<usize>()
+            .context("ATLAS_MOE_TOPK must be an integer")?;
+        ensure!(
+            k >= 1 && k <= config.num_experts_per_tok,
+            "ATLAS_MOE_TOPK={k} out of range 1..={}",
+            config.num_experts_per_tok
+        );
+        config.num_experts_per_tok = k;
+    }
+
     finalize_config(&mut config, raw)?;
     Ok(config)
 }

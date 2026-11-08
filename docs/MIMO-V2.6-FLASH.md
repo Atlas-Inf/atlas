@@ -186,6 +186,15 @@ half scalar. Both default off pending hardware validation; require
 4096/2048). Other quant targets never resolve the kernels (`try_kernel`
 gives 0), so the scalar path is untouched everywhere else.
 
+## Experimental MoE top-k override (`ATLAS_MOE_TOPK`, opt-in)
+
+`ATLAS_MOE_TOPK=<k>` (1..=8) reduces the routed-expert count per token at
+config-parse time. Expert weight bytes — the decode bottleneck per the
+nsys profile — scale ~linearly with k, so top-4 is expected to roughly halve
+the expert bucket. **Quality is unvalidated**: the model was trained at
+top-8, so any reduction is an experiment (greedy/needle A/B, then a quality
+eval) and the flag must never become a default. Unset = trained top-8.
+
 ## Tensor-core paged prefill (`mimo_prefill_tc`)
 
 Chunked (paged) prefill runs a tensor-core (`mma.sync` BF16) flash-attention
