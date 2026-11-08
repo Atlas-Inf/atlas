@@ -65,6 +65,11 @@ fi
 # restores the BF16 path for A/B.
 FP8_QKV="${FP8_QKV:-1}"
 FP8_QKV_ENV="-e ATLAS_MIMO_FP8_QKV=$FP8_QKV"
+# DENSE_BF16=1: layer-0 dense FFN stays BF16 (ATLAS_MIMO_DENSE_BF16) instead
+# of the NVFP4 requant — opt-in A/B arm to price NVFP4 quality/perf.
+# Default 0 = NVFP4 (validated default).
+DENSE_BF16="${DENSE_BF16:-0}"
+DENSE_BF16_ENV="-e ATLAS_MIMO_DENSE_BF16=$DENSE_BF16"
 # MOE_ROWS=1: row-exact verify (ATLAS_MOE_ROWS_DECODE): each verify row runs the
 # serial FFN arithmetic with one EP all-reduce per layer. Defaults on with DFLASH=1
 # (byte-identical to serial greedy and faster on GB10).
@@ -143,6 +148,7 @@ sudo docker run -d \
   $SWA_EVICT_ENV \
   $MOE_ROWS_ENV \
   $FP8_QKV_ENV \
+  $DENSE_BF16_ENV \
   $INTHINK_ENV \
   ${ATLAS_PROFILE_FIRST:+-e ATLAS_PROFILE_FIRST=$ATLAS_PROFILE_FIRST} \
   -v "${HOME}/.cache/huggingface:/root/.cache/huggingface" \
@@ -176,6 +182,7 @@ ssh "$WORKER_IP" "sudo docker run -d \
   $SWA_EVICT_ENV \
   $MOE_ROWS_ENV \
   $FP8_QKV_ENV \
+  $DENSE_BF16_ENV \
   $INTHINK_ENV \
   ${ATLAS_PROFILE_FIRST:+-e ATLAS_PROFILE_FIRST=$ATLAS_PROFILE_FIRST} \
   -v \"\${HOME}/.cache/huggingface:/root/.cache/huggingface\" \

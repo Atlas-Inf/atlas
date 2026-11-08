@@ -62,6 +62,41 @@ fn layer_kv_heads(config: &ModelConfig, layer: usize) -> usize {
     }
 }
 
+/// Opt-in BF16 arm for the layer-0 dense FFN (`ATLAS_MIMO_DENSE_BF16=1`):
+/// skips the NVFP4 requant so hardware can A/B NVFP4's quality/perf on the
+/// one dense layer. Unset/0 = NVFP4 (the validated default).
+fn dense_bf16_enabled() -> Result<bool> {
+    static V: std::sync::OnceLock<std::result::Result<bool, String>> = std::sync::OnceLock::new();
+    V.get_or_init(
+        || match std::env::var("ATLAS_MIMO_DENSE_BF16").ok().as_deref() {
+            None | Some("") | Some("0") | Some("false") | Some("off") => Ok(false),
+            Some("1") | Some("true") | Some("on") => Ok(true),
+            Some(other) => Err(format!(
+                "ATLAS_MIMO_DENSE_BF16 must be 1 or 0, got {other:?}"
+            )),
+        },
+    )
+    .clone()
+    .map_err(anyhow::Error::msg)
+}
+
+/// Reclaim a dense-FFN projection's on-disk source and scale tensors once
+/// its weights have been transformed (NVFP4 requant or BF16 keep).
+fn reclaim_ffn_source(store: &WeightStore, gpu: &dyn GpuBackend, wkey: &str) -> Result<()> {
+    store.reclaim(gpu, wkey)?;
+    let prefix = wkey.strip_suffix(".weight").expect("weight suffix");
+    for scale_key in [
+        format!("{prefix}.weight_scale_inv"),
+        format!("{prefix}.weight_scale"),
+        format!("{prefix}.scale"),
+    ] {
+        if store.contains(&scale_key) {
+            store.reclaim(gpu, &scale_key)?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn load_dense_ffn(
     store: &WeightStore,
@@ -74,6 +109,32 @@ pub(super) fn load_dense_ffn(
 ) -> Result<FfnComponent> {
     let h = config.hidden_size;
     let inter = config.intermediate_size;
+    if dense_bf16_enabled()? {
+        // BF16 arm: keep the checkpoint's FP8->BF16 dequant (E4M3 values are
+        // exact in BF16) instead of the NVFP4 requant. The FP8 source and
+        // scale tensors are unused on this arm.
+        let bf16 = |name: &str| -> Result<DenseWeight> {
+            let wkey = format!("{lp}.mlp.{name}.weight");
+            let w = dense_auto(store, &wkey, gpu)?;
+            reclaim_ffn_source(store, gpu, &wkey)?;
+            Ok(w)
+        };
+        let mut dffn = DenseFfnLayer::new(
+            DenseFfnWeights {
+                gate_proj: QuantizedWeight::null(),
+                up_proj: QuantizedWeight::null(),
+                down_proj: QuantizedWeight::null(),
+                gate_proj_t: None,
+                up_proj_t: None,
+                down_proj_t: None,
+            },
+            gpu,
+            &config.model_type,
+        )?;
+        dffn.set_bf16_weights(bf16("gate_proj")?, bf16("up_proj")?, bf16("down_proj")?);
+        tracing::info!("mimo_v2: layer-0 dense FFN BF16 arm ON (ATLAS_MIMO_DENSE_BF16=1)");
+        return Ok(FfnComponent::Dense(dffn));
+    }
     let quant = |name: &str, n: usize, k: usize| -> Result<QuantizedWeight> {
         let wkey = format!("{lp}.mlp.{name}.weight");
         let w = dense_auto(store, &wkey, gpu)?;
@@ -81,17 +142,7 @@ pub(super) fn load_dense_ffn(
         // Free the BF16 input (alias or dequant buffer) and the on-disk source
         // tensor; only the NVFP4 result stays resident.
         free_loader_source(store, gpu, &wkey, w)?;
-        store.reclaim(gpu, &wkey)?;
-        let prefix = wkey.strip_suffix(".weight").expect("weight suffix");
-        for scale_key in [
-            format!("{prefix}.weight_scale_inv"),
-            format!("{prefix}.weight_scale"),
-            format!("{prefix}.scale"),
-        ] {
-            if store.contains(&scale_key) {
-                store.reclaim(gpu, &scale_key)?;
-            }
-        }
+        reclaim_ffn_source(store, gpu, &wkey)?;
         Ok(q)
     };
     let gate_q = quant("gate_proj", inter, h)?;

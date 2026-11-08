@@ -189,6 +189,18 @@ rows) are padded to the 128-row block grid (3456); the pad rows are never
 read. `o_proj` stays BF16. The kernel target carries `mxfp8_gemv.cu` (same
 source as glm-5.3-flash). `FP8_QKV=0` restores the BF16 path for A/B.
 
+## Layer-0 dense FFN BF16 A/B arm (`ATLAS_MIMO_DENSE_BF16=1`, opt-in)
+
+Layer 0 is the only dense FFN; its checkpoint weights are FP8 block-scaled
+and the default load requantizes them to NVFP4 (`quantize_to_nvfp4`).
+`DENSE_BF16=1` (launcher) / `ATLAS_MIMO_DENSE_BF16=1` skips the requant and
+keeps the FP8→BF16 dequant (E4M3 values are exact in BF16) via
+`DenseFfnLayer::set_bf16_weights` — the same arm Gemma-4/Laguna/LongCat use.
+This is the A/B to price NVFP4's quality and speed on the one dense layer:
+compare greedy/needle/ppl against the default NVFP4 arm, plus decode tok/s
+(NVFP4 is faster; BF16 reads 2× the bytes for this layer). Default 0 =
+NVFP4. Validation pending on hardware.
+
 ## MXFP4 tensor-core expert gate/up (`ATLAS_MOE_MXFP4_TC=1`, opt-in)
 
 Decode gate+up over routed MXFP4 (E8M0) experts can run a tensor-core
