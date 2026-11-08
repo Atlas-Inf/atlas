@@ -48,7 +48,15 @@ launcher default; `FP8_QKV=1` already was).
   n=3 ranges, greedy/needle smoke unchanged, 4 channels confirmed in NCCL
   INFO logs). Tree/Collnet fail init on this 2-rank RoCE setup; GDR
   regresses; PROTO=LL and BUFFSIZE 16/64MiB also beat baseline but were not
-  fully probed (available if chan4 ever regresses).
+  fully probed. The chan4×64MiB combo was tested later and does NOT beat
+  chan4 alone (11.03 vs chan4's same-session control) — chan4 stands solo.
+  Caveat: absolute decode tok/s drifts upward across sessions (~12.0 →
+  ~13.4 observed); only same-session pairs are comparable.
+- **Layer-0 NVFP4 A/B** (`ATLAS_MIMO_DENSE_BF16=1`): NVFP4 is clean — ppl
+  3.028 (NVFP4) vs 3.007 (BF16, −0.7% = noise), 23/46 greedy exact-match
+  with all diffs stylistic (no factual errors either arm), needles pass
+  both arms, decode a wash. **NVFP4 stays the default**; the BF16 arm
+  remains an opt-in escape hatch.
 - **`ATLAS_MOE_TOPK` (closed experiment)**: top-6 quality-clean but decode
   flat (+1.6%, within noise); top-4 decode +29% but ppl +20.3% and factual
   errors in the 46-prompt gate. **Quality-unacceptable; stays opt-in,
@@ -205,7 +213,9 @@ keeps the FP8→BF16 dequant (E4M3 values are exact in BF16) via
 This is the A/B to price NVFP4's quality and speed on the one dense layer:
 compare greedy/needle/ppl against the default NVFP4 arm, plus decode tok/s
 (NVFP4 is faster; BF16 reads 2× the bytes for this layer). Default 0 =
-NVFP4. Validation pending on hardware.
+NVFP4. **Validated on hardware: NVFP4 clean (ppl delta noise-level, diffs
+stylistic, decode a wash) — NVFP4 stays default; the BF16 arm remains an
+opt-in escape hatch.**
 
 ## MXFP4 tensor-core expert gate/up (`ATLAS_MOE_MXFP4_TC=1`, opt-in)
 
