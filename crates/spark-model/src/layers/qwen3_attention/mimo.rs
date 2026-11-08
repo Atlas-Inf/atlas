@@ -27,6 +27,8 @@ use crate::weight_map::{DenseWeight, Fp8BlockWeight};
 pub(crate) const MIMO_QK_DIM: u32 = 192;
 pub(crate) const MIMO_V_DIM: u32 = 128;
 const MIMO_PREFILL_Q: u32 = 16;
+/// Tensor-core paged prefill (`mimo_prefill_tc`): BR=32 queries/block, 4 warps.
+const MIMO_TC_BR: u32 = 32;
 /// Split-K partitions for full-attention decode: one per 512 cached tokens.
 const MIMO_SPLIT_TOKENS: u32 = 512;
 const MIMO_MAX_SPLITS: u32 = 16;
@@ -43,6 +45,8 @@ pub(crate) struct MimoKernels {
     pub decode: KernelHandle,
     pub decode_reduce: KernelHandle,
     pub prefill: KernelHandle,
+    /// Tensor-core paged prefill; null when the kernel build predates it.
+    pub prefill_tc: KernelHandle,
 }
 
 impl MimoKernels {
@@ -57,6 +61,7 @@ impl MimoKernels {
             decode: k("mimo_paged_decode_attn")?,
             decode_reduce: k("mimo_paged_decode_reduce")?,
             prefill: k("mimo_prefill_attn")?,
+            prefill_tc: crate::layers::try_kernel(gpu, "mimo_prefill_tc", "mimo_prefill_tc"),
         })
     }
 }
@@ -388,27 +393,53 @@ impl Qwen3AttentionLayer {
             )
         };
         let attn = ctx.buffers.attn_output();
-        KernelLaunch::new(ctx.gpu, m.kernels.prefill)
-            .grid([div_ceil(n, MIMO_PREFILL_Q), m.nq, 1])
-            .block([32 * MIMO_PREFILL_Q, 1, 1])
-            .arg_ptr(q)
-            .arg_ptr(k_src)
-            .arg_ptr(v_src)
-            .arg_ptr(block_table)
-            .arg_ptr(m.sinks)
-            .arg_ptr(attn)
-            .arg_u32(n)
-            .arg_u32(seq_len_start as u32)
-            .arg_u32(m.nq)
-            .arg_u32(m.nkv)
-            .arg_u32(kv_cache.block_size() as u32)
-            .arg_u32(m.window)
-            .arg_f32(m.scale)
-            .arg_f32(m.out_scale)
-            .arg_u32(m.nq * MIMO_QK_DIM)
-            .arg_u32(m.nq * MIMO_V_DIM)
-            .arg_ptr(kv_cache.swa_slot_map_ptr(self.attn_layer_idx))
-            .launch(stream)?;
+        // Chunked (paged) prefill uses the tensor-core kernel when built;
+        // chunk-0 contiguous prefill and stale kernel builds keep the scalar path.
+        if !contiguous && m.kernels.prefill_tc.0 != 0 {
+            let kv_len = (seq_len_start + num_tokens) as u32;
+            KernelLaunch::new(ctx.gpu, m.kernels.prefill_tc)
+                .grid([m.nq, div_ceil(n, MIMO_TC_BR), 1])
+                .block([128, 1, 1])
+                .arg_ptr(q)
+                .arg_ptr(k_src)
+                .arg_ptr(v_src)
+                .arg_ptr(attn)
+                .arg_ptr(block_table)
+                .arg_u32(n)
+                .arg_u32(kv_len)
+                .arg_u32(seq_len_start as u32)
+                .arg_u32(m.nq)
+                .arg_u32(m.nkv)
+                .arg_u32(kv_cache.block_size() as u32)
+                .arg_ptr(kv_cache.swa_slot_map_ptr(self.attn_layer_idx))
+                .arg_u32(m.window)
+                .arg_u32(1)
+                .arg_f32(m.scale)
+                .arg_ptr(m.sinks)
+                .launch(stream)?;
+        } else {
+            KernelLaunch::new(ctx.gpu, m.kernels.prefill)
+                .grid([div_ceil(n, MIMO_PREFILL_Q), m.nq, 1])
+                .block([32 * MIMO_PREFILL_Q, 1, 1])
+                .arg_ptr(q)
+                .arg_ptr(k_src)
+                .arg_ptr(v_src)
+                .arg_ptr(block_table)
+                .arg_ptr(m.sinks)
+                .arg_ptr(attn)
+                .arg_u32(n)
+                .arg_u32(seq_len_start as u32)
+                .arg_u32(m.nq)
+                .arg_u32(m.nkv)
+                .arg_u32(kv_cache.block_size() as u32)
+                .arg_u32(m.window)
+                .arg_f32(m.scale)
+                .arg_f32(m.out_scale)
+                .arg_u32(m.nq * MIMO_QK_DIM)
+                .arg_u32(m.nq * MIMO_V_DIM)
+                .arg_ptr(kv_cache.swa_slot_map_ptr(self.attn_layer_idx))
+                .launch(stream)?;
+        }
         let h = ctx.config.hidden_size as u32;
         let o_out = ctx.buffers.norm_output();
         self.mimo_gemm(ctx, attn, &m.o_proj, o_out, n, h, m.nq * MIMO_V_DIM, stream)?;
