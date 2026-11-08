@@ -420,6 +420,18 @@ pub(super) const QWEN38_PDL_DECODE_KERNELS: &[&str] = &[
     "skinny_qg_t2",
     "skinny_w8a16_t1",
     "skinny_w8a16_t2",
+    // Their wide arms past 16 rows (batched decode and verify).
+    "skinny_w4a16_w4",
+    "skinny_w4a16_w8",
+    "skinny_w4a16_w16",
+    "skinny_w4a16_x8",
+    "skinny_qg_w4",
+    "skinny_qg_w8",
+    "skinny_qg_w16",
+    "skinny_qg_x8",
+    "skinny_w8a16_w4",
+    "skinny_w8a16_w8",
+    "skinny_w8a16_w16",
 ];
 
 #[cfg(test)]
