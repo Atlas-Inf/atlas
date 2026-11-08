@@ -131,3 +131,19 @@ fn batch_depth_keeps_long_blocks_at_two_and_eight_rows_past_two() {
         assert_eq!(batch_depth(7, n, [7, 2].into_iter()), 7);
     }
 }
+
+#[test]
+fn wide_batches_narrow_then_decode_plain() {
+    use super::{WIDE_DEPTHS, depth_for, parse_depths};
+    assert_eq!(depth_for(&WIDE_DEPTHS, 8), 7);
+    assert_eq!(depth_for(&WIDE_DEPTHS, 9), 3);
+    assert_eq!(depth_for(&WIDE_DEPTHS, 16), 3);
+    assert_eq!(depth_for(&WIDE_DEPTHS, 17), 0);
+    assert_eq!(depth_for(&WIDE_DEPTHS, 64), 0);
+    for &(n, d) in &WIDE_DEPTHS[..2] {
+        assert!(n * (d + 1) <= 128, "{n} sequences of {d} drafts exceed one verify");
+    }
+    assert_eq!(parse_depths(Some("8:7,64:2")), Some(vec![(8, 7), (64, 2)]));
+    assert_eq!(depth_for(&[(8, 7), (64, 2)], 99), 2);
+    assert_eq!(parse_depths(Some("")), None);
+}

@@ -23,6 +23,7 @@ use crate::model::TransformerModel;
 use crate::traits::Model;
 use crate::weight_loader::load_dflash_weights;
 
+mod dflash_reserve;
 mod glm;
 mod kv_budget;
 mod kv_carveout;
@@ -806,8 +807,26 @@ pub fn build_model(
         &ssm_pools.snapshots,
         layers.iter().map(|l| l.aux_bytes_per_token()).sum(),
     );
+    // The drafter's per-sequence pools, allocated after this sizing.
+    let dflash_post_kv = dflash_args.as_ref().map_or(0, |args| {
+        dflash_reserve::bytes(
+            args,
+            config.dflash_capture_layers.len(),
+            config.hidden_size,
+            max_seq_len,
+            max_batch_size,
+        )
+    });
+    if dflash_post_kv > 0 {
+        tracing::info!(
+            "DFlash per-sequence pools (drafter KV + context accumulator) reserved from the KV \
+             budget: {:.2} GB for {max_batch_size} sequences",
+            dflash_post_kv as f64 / 1e9
+        );
+    }
     let reserve_net = reserve_net
         + snapshot_aux
+        + dflash_post_kv
         + kv_nvme::host_reserve_bytes(nvme_geometry, ssm_pools.tier_lazy_host_bytes());
     let budget = kv_budget::measure(
         gpu.as_ref(),

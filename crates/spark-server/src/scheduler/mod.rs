@@ -898,7 +898,8 @@ pub fn run(
             // `adaptive_rung` so both halves of the regime report from one
             // place — no parallel accounting, the value below is the one the
             // dispatch chain actually uses.
-            let spec_width_ok = active.len() <= mtp_max_seqs();
+            let spec_width_ok = active.len() <= mtp_max_seqs()
+                && (!dflash_verify_raw_argmax || dflash_width::spec_width_ok(active.len()));
             // Conservative bound: multi-sequence verify batches and the
             // n-gram lane stop at the QSA inert bound. A sequence speculating
             // ALONE on the MTP lane may go past it when the model serves an

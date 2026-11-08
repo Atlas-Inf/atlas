@@ -364,7 +364,9 @@ pub(super) fn chunk_ranges(ks: &[usize]) -> Vec<(usize, usize)> {
     while lo < ks.len() {
         // Derived, not hardcoded: rows <= 8 (the exact lane's deep windows,
         // `mtp_deep_depth`; 4 elsewhere), so the division is >= 16.
-        let seq_cap = VERIFY_ROW_BUDGET / ks[lo].max(1);
+        // Also at most the sequences one batched verify takes
+        // (`can_batch_verify`): past that a chunk would verify one by one.
+        let seq_cap = (VERIFY_ROW_BUDGET / ks[lo].max(1)).min(spark_model::layer::VERIFY_WY_TABLE_SEQS);
         let mut hi = lo;
         let mut r = 0usize;
         while hi < ks.len() && hi - lo < seq_cap && r + ks[hi] <= VERIFY_ROW_BUDGET {
