@@ -18,8 +18,10 @@ impl TransformerModel {
         Self::try_dflash_capture_batched_at(self, layer_idx, ks, off, None, stream)
     }
 
-    /// Slot-indexed variant: `slots[i]` is sequence i's STABLE SSM slot. The
-    /// capture region is `slots[i] * kmax`, not the batch position — after
+    /// Slot-indexed variant: `slots[i]` is sequence i's live SSM slot
+    /// (`SequenceState::dflash_hidden_save_slot`, exclusive among live
+    /// sequences). The capture region is `slots[i] * kmax`, not the batch
+    /// position — after
     /// any mid-batch finish (churn/EOS/max_tokens) the pending set reorders,
     /// and a batch-position region would hand the re-propose another (or a
     /// dead) sequence's hiddens, poisoning the drafter ctx accumulator (the

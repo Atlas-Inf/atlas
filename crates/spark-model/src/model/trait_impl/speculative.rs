@@ -609,9 +609,8 @@ impl TransformerModel {
                             .map(|d| d.last_num_accepted)
                             .unwrap_or(0)
                             .min(kmax.saturating_sub(1));
-                        // Stable owner slot: `slot_idx` may migrate after
-                        // compaction or become the detach sentinel, but the
-                        // hidden-save arena is allocated per DSpark owner.
+                        // The region this step's verify captured into: the
+                        // sequence's live slot (`dflash_hidden_save_slot`).
                         let slot = seq.dflash_hidden_save_slot()?;
                         anyhow::ensure!(
                             slot < self.dflash_hidden_save_nseq,
