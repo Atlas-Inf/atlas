@@ -99,6 +99,11 @@ impl Qwen4ExpWideRows {
     };
 
     pub fn resolve(gpu: &dyn GpuBackend, model_type: &str) -> Self {
+        // qwen3_5's batch lever (`model/exact_verify.rs`): only the BF16
+        // tiers, for its LM head.
+        if model_type == "qwen3_5" && crate::model::exact_verify::batch_requested() {
+            return Self::resolve_bf16(gpu);
+        }
         // Only looked up when wanted, so no other model or default boot asks.
         if !(crate::model::qwen4exp_batch_fast::requested() && model_type == "qwen4_exp") {
             return Self::OFF;
@@ -120,6 +125,19 @@ impl Qwen4ExpWideRows {
             ],
             w4a16_16: try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch16"),
             w4_wide: super::Qwen4ExpW4Wide::resolve(gpu),
+        }
+    }
+
+    /// Only the BF16 tiers (`qwen4exp_bf16_rows16/32`), every other tier off:
+    /// the dense head of qwen3_5's batch lever, and its gate
+    /// (`examples/bf16_wide_rows_microtest.rs`).
+    pub fn resolve_bf16(gpu: &dyn GpuBackend) -> Self {
+        Self {
+            bf16: [
+                try_kernel(gpu, "qwen4exp_wide_rows", "qwen4exp_bf16_rows16"),
+                try_kernel(gpu, "qwen4exp_wide_rows", "qwen4exp_bf16_rows32"),
+            ],
+            ..Self::OFF
         }
     }
 

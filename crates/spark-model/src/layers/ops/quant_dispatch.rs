@@ -280,17 +280,18 @@ pub fn w4a16_gemv_batchm(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    // `ATLAS_SKINNY_MMA`: the scalar tiers' rows on the row-invariant
+    // tensor-core kernels (a tensor-core tier is not on its list), at up to
+    // `skinny_mma::MAX_ROWS` rows (the batch lever's wide arms).
+    if super::skinny_mma::try_w4a16_one(gpu, kernel, input, weight, output, (m, n, k), stream)? {
+        return Ok(());
+    }
     // Largest template is w4a16_gemv_batch32 (MAX_M=32). Refuse rather than
     // silently leaving rows above a selected template's bound unwritten.
     anyhow::ensure!(
         (1..=32).contains(&m),
         "w4a16_gemv_batchm: m={m} outside 1..=32"
     );
-    // `ATLAS_SKINNY_MMA`: the scalar tiers' rows on the row-invariant
-    // tensor-core kernels (a tensor-core tier is not on its list).
-    if super::skinny_mma::try_w4a16_one(gpu, kernel, input, weight, output, (m, n, k), stream)? {
-        return Ok(());
-    }
     // Tensor-core tiers own 16 outputs per 8-warp CTA.
     let tc_rows = crate::layers::w4a16_gemv_tiers::tc_rows(kernel);
     let tc = tc_rows.is_some();

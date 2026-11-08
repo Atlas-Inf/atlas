@@ -382,6 +382,14 @@ name = "skinny_mma_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "skinny_rows_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "bf16_wide_rows_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "moe_t_rows_bench"
 required-features = ["cuda", "gpu-examples"]
 

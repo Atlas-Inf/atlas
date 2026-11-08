@@ -13,7 +13,10 @@
 //   skinny_w8a16_t{1,2}   block-scaled FP8 E4M3 weight (FP32 scale per 128 x
 //                         128 block), up to two weights a launch
 //
-// `t1` serves M <= 8, `t2` M <= 16: one or two 8-row token tiles.
+// `t1` serves M <= 8, `t2` M <= 16: one or two 8-row token tiles. `w4`,
+// `w8`, `w16` serve M <= 32, 64, 128 in one launch (the batched
+// multi-sequence steps, `model/exact_verify.rs`'s batch lever): the same
+// per-(output, row) arithmetic, the weight still streamed once (WIDE below).
 //
 // MMA MAPPING. `mma.sync.m16n8k16` (BF16 in, FP32 accumulate) takes 16 weight
 // rows (outputs) as A and 8 token rows as B, so a CTA owns 16 outputs and a
@@ -51,7 +54,8 @@
 // M-row launches against M one-row launches byte for byte.
 //
 // Limits (host-checked, `skinny_mma.rs`): K a multiple of the chunk (NVFP4
-// 256, FP8 128; it also aligns every load), M in 1..=16, rows A[t] at A + t*K.
+// 256, FP8 128; it also aligns every load), M in 1..=16 (t1, t2) or up to
+// 8 x NT (wN), rows A[t] at A + t*K.
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -332,6 +336,242 @@ __device__ __forceinline__ void sk_run(const __nv_bfloat16* __restrict__ A, unsi
         }
 }
 
+// ── Wide: up to 8 x NT rows in one launch ──────────────────────────────────
+// WIDE. Every (output, row) value is computed exactly as `sk_run` computes it:
+// the chunk -> warp assignment, a chunk's MMA order (k16 step j = 0..15 for
+// NVFP4, j = 0..7 then the block-scale fmaf for FP8), the FP32 add of each MMA
+// into the row tile's accumulator, and the warps 0..7 combine are the same;
+// only how many token tiles share the chunk's registers changes, and an MMA
+// output column depends on its own B column alone. The chunk's weights
+// (NVFP4: dequantized once into A fragments) stay in registers while the
+// token tiles go through two at a time, so the weight streams once for all
+// M rows; the combine runs two tiles a round through shared memory.
+
+// NVFP4: the chunk's A fragments, dequantized once for every tile pair.
+__device__ __forceinline__ void sk_dequant_w4(const SkW& t, unsigned (&d0)[8][4], unsigned (&d1)[8][4]) {
+    unsigned sc0[4], sc1[4];
+    bm_scales(t.s0, sc0);
+    bm_scales(t.s1, sc1);
+    const unsigned w0[8] = {t.w0[0].x, t.w0[0].y, t.w0[0].z, t.w0[0].w, t.w0[1].x, t.w0[1].y, t.w0[1].z, t.w0[1].w};
+    const unsigned w1[8] = {t.w1[0].x, t.w1[0].y, t.w1[0].z, t.w1[0].w, t.w1[1].x, t.w1[1].y, t.w1[1].z, t.w1[1].w};
+#pragma unroll
+    for (int q = 0; q < 8; q++) {
+        const unsigned s0[4] = {sc0[q >> 1], sc0[q >> 1], sc0[q >> 1], sc0[q >> 1]};
+        const unsigned s1[4] = {sc1[q >> 1], sc1[q >> 1], sc1[q >> 1], sc1[q >> 1]};
+        bm_dequant4(w0[q], s0, d0[q]);
+        bm_dequant4(w1[q], s1, d1[q]);
+    }
+}
+
+// FP8: the chunk's A fragments (word j: rows g / g + 8, values 4j..4j+3).
+__device__ __forceinline__ void sk_frag_w8(const SkW& t, unsigned (&a)[8][4]) {
+    const unsigned w0[8] = {t.w0[0].x, t.w0[0].y, t.w0[0].z, t.w0[0].w, t.w0[1].x, t.w0[1].y, t.w0[1].z, t.w0[1].w};
+    const unsigned w1[8] = {t.w1[0].x, t.w1[0].y, t.w1[0].z, t.w1[0].w, t.w1[1].x, t.w1[1].y, t.w1[1].z, t.w1[1].w};
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        a[j][0] = bm_fp8_pair<false>(w0[j]);
+        a[j][1] = bm_fp8_pair<false>(w1[j]);
+        a[j][2] = bm_fp8_pair<true>(w0[j]);
+        a[j][3] = bm_fp8_pair<true>(w1[j]);
+    }
+}
+
+template <bool FP8, int NT>
+__device__ __forceinline__ void sk_run_wide(const __nv_bfloat16* __restrict__ A, unsigned M, unsigned K,
+                                            unsigned c_stride, const SkPart& p0, const SkPart& p1) {
+    static_assert(NT % 2 == 0, "token tiles go two at a time");
+    using F = SkFam<FP8>;
+    __shared__ float s_red[SK_WARPS][8][32];
+    const unsigned warp = threadIdx.x / 32u, lane = threadIdx.x % 32u;
+    const unsigned g = lane >> 2, c = lane & 3u;
+    const unsigned chunks = K / F::KC;
+    unsigned part, r0;
+    const SkTile w = sk_tile_at<FP8>(p0, p1, (p0.N + SK_ROWS - 1u) / SK_ROWS, K, blockIdx.x, g, part, r0);
+    float acc[NT][4];
+#pragma unroll
+    for (int tt = 0; tt < NT; tt++) acc[tt][0] = acc[tt][1] = acc[tt][2] = acc[tt][3] = 0.0f;
+    SkW cur, nxt;
+    if (warp < chunks) sk_load_w<FP8>(cur, w, warp, c);
+    nxt = cur;
+    for (unsigned ch = warp; ch < chunks; ch += SK_WARPS) {
+        if (ch + SK_WARPS < chunks) sk_load_w<FP8>(nxt, w, ch + SK_WARPS, c);
+        if constexpr (FP8) {
+            unsigned a[8][4];
+            sk_frag_w8(cur, a);
+#pragma unroll
+            for (int tp = 0; tp < NT; tp += 2) {
+                if (8u * tp >= M) break;
+                uint4 x[2][F::XV];
+                sk_load_a<FP8, 2>(x, A + (unsigned long long)(8u * tp) * K, K, M - 8u * tp, g, ch, c);
+                float part2[2][4];
+#pragma unroll
+                for (int tt = 0; tt < 2; tt++) part2[tt][0] = part2[tt][1] = part2[tt][2] = part2[tt][3] = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 8; j++)
+#pragma unroll
+                    for (int tt = 0; tt < 2; tt++)
+                        sk_mma_add(part2[tt], a[j][0], a[j][1], a[j][2], a[j][3], sk_b0<4>(x[tt], j), sk_b1<4>(x[tt], j));
+#pragma unroll
+                for (int tt = 0; tt < 2; tt++)
+#pragma unroll
+                    for (int i = 0; i < 4; i++) acc[tp + tt][i] = fmaf(cur.bs, part2[tt][i], acc[tp + tt][i]);
+            }
+        } else {
+            unsigned d0[8][4], d1[8][4];
+            sk_dequant_w4(cur, d0, d1);
+#pragma unroll
+            for (int tp = 0; tp < NT; tp += 2) {
+                if (8u * tp >= M) break;
+                uint4 x[2][F::XV];
+                sk_load_a<FP8, 2>(x, A + (unsigned long long)(8u * tp) * K, K, M - 8u * tp, g, ch, c);
+#pragma unroll
+                for (int q = 0; q < 8; q++)
+#pragma unroll
+                    for (int h = 0; h < 2; h++) {
+                        const int j = 2 * q + h;
+#pragma unroll
+                        for (int tt = 0; tt < 2; tt++)
+                            sk_mma_add(acc[tp + tt], d0[q][2 * h], d1[q][2 * h], d0[q][2 * h + 1], d1[q][2 * h + 1],
+                                       sk_b0<8>(x[tt], j), sk_b1<8>(x[tt], j));
+                    }
+            }
+        }
+        cur = nxt;
+    }
+    // Fixed-order combine of the 8 warps' K slices, two tiles a round.
+    const SkPart& p = part ? p1 : p0;
+#pragma unroll
+    for (int tp = 0; tp < NT; tp += 2) {
+        if (8u * tp >= M) break;  // uniform across the CTA
+#pragma unroll
+        for (int tt = 0; tt < 2; tt++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) s_red[warp][4 * tt + i][lane] = acc[tp + tt][i];
+        __syncthreads();
+        if (warp == 0u) {
+#pragma unroll
+            for (int tt = 0; tt < 2; tt++)
+#pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    const unsigned n = i < 2 ? r0 : r0 + 8u;
+                    const unsigned m = 8u * (tp + tt) + 2u * c + (i & 1u);
+                    float v = 0.0f;
+#pragma unroll
+                    for (unsigned ww = 0; ww < SK_WARPS; ww++) v = __fadd_rn(v, s_red[ww][4 * tt + i][lane]);
+                    if (n < p.N && m < M)
+                        p.C[(unsigned long long)m * c_stride + p.col(n)] = __float2bfloat16_rn(__fmul_rn(v, p.fscale));
+                }
+        }
+        __syncthreads();
+    }
+}
+
+// NVFP4, two output tiles a CTA (32 outputs): the activation rows a chunk
+// streams from L2 feed both tiles' MMAs, halving a wide call's activation
+// traffic (what bounds the NVFP4 wide kernels past ~16 rows). Every
+// (output, row) value is still `sk_run`'s: each tile's A fragments of a word
+// are dequantized as `sk_mma_w4` dequantizes them (once per token-tile pair
+// here), and each row tile's MMAs run in the same k16 order into its own
+// accumulator. CTA b owns global tiles 2b and 2b + 1 (either may be part 1's).
+template <int NT>
+__device__ __forceinline__ void sk_run_wide_o2(const __nv_bfloat16* __restrict__ A, unsigned M, unsigned K,
+                                               unsigned c_stride, const SkPart& p0, const SkPart& p1) {
+    static_assert(NT % 2 == 0, "token tiles go two at a time");
+    using F = SkFam<false>;
+    __shared__ float s_red[SK_WARPS][8][32];
+    const unsigned warp = threadIdx.x / 32u, lane = threadIdx.x % 32u;
+    const unsigned g = lane >> 2, c = lane & 3u;
+    const unsigned chunks = K / F::KC;
+    const unsigned tiles0 = (p0.N + SK_ROWS - 1u) / SK_ROWS;
+    unsigned part[2], r0[2];
+    SkTile w[2];
+#pragma unroll
+    for (int o = 0; o < 2; o++) w[o] = sk_tile_at<false>(p0, p1, tiles0, K, 2u * blockIdx.x + o, g, part[o], r0[o]);
+    float acc[2][NT][4];
+#pragma unroll
+    for (int o = 0; o < 2; o++)
+#pragma unroll
+        for (int tt = 0; tt < NT; tt++) acc[o][tt][0] = acc[o][tt][1] = acc[o][tt][2] = acc[o][tt][3] = 0.0f;
+    SkW cur[2], nxt[2];
+    if (warp < chunks) {
+        sk_load_w<false>(cur[0], w[0], warp, c);
+        sk_load_w<false>(cur[1], w[1], warp, c);
+    }
+    nxt[0] = cur[0];
+    nxt[1] = cur[1];
+    for (unsigned ch = warp; ch < chunks; ch += SK_WARPS) {
+        if (ch + SK_WARPS < chunks) {
+            sk_load_w<false>(nxt[0], w[0], ch + SK_WARPS, c);
+            sk_load_w<false>(nxt[1], w[1], ch + SK_WARPS, c);
+        }
+        unsigned sc[2][2][4];  // [tile][row g / g + 8][group]
+#pragma unroll
+        for (int o = 0; o < 2; o++) {
+            bm_scales(cur[o].s0, sc[o][0]);
+            bm_scales(cur[o].s1, sc[o][1]);
+        }
+#pragma unroll
+        for (int tp = 0; tp < NT; tp += 2) {
+            if (8u * tp >= M) break;
+            uint4 x[2][F::XV];
+            sk_load_a<false, 2>(x, A + (unsigned long long)(8u * tp) * K, K, M - 8u * tp, g, ch, c);
+#pragma unroll
+            for (int q = 0; q < 8; q++) {
+#pragma unroll
+                for (int o = 0; o < 2; o++) {
+                    const unsigned wq0 = (q < 4) ? ((const unsigned*)&cur[o].w0[0])[q] : ((const unsigned*)&cur[o].w0[1])[q - 4];
+                    const unsigned wq1 = (q < 4) ? ((const unsigned*)&cur[o].w1[0])[q] : ((const unsigned*)&cur[o].w1[1])[q - 4];
+                    const unsigned s0[4] = {sc[o][0][q >> 1], sc[o][0][q >> 1], sc[o][0][q >> 1], sc[o][0][q >> 1]};
+                    const unsigned s1[4] = {sc[o][1][q >> 1], sc[o][1][q >> 1], sc[o][1][q >> 1], sc[o][1][q >> 1]};
+                    unsigned d0[4], d1[4];
+                    bm_dequant4(wq0, s0, d0);
+                    bm_dequant4(wq1, s1, d1);
+#pragma unroll
+                    for (int h = 0; h < 2; h++) {
+                        const int j = 2 * q + h;
+#pragma unroll
+                        for (int tt = 0; tt < 2; tt++)
+                            sk_mma_add(acc[o][tp + tt], d0[2 * h], d1[2 * h], d0[2 * h + 1], d1[2 * h + 1],
+                                       sk_b0<8>(x[tt], j), sk_b1<8>(x[tt], j));
+                    }
+                }
+            }
+        }
+        cur[0] = nxt[0];
+        cur[1] = nxt[1];
+    }
+    // Fixed-order combine, one output tile and two row tiles a round.
+#pragma unroll
+    for (int o = 0; o < 2; o++) {
+        const SkPart& p = part[o] ? p1 : p0;
+#pragma unroll
+        for (int tp = 0; tp < NT; tp += 2) {
+            if (8u * tp >= M) break;  // uniform across the CTA
+#pragma unroll
+            for (int tt = 0; tt < 2; tt++)
+#pragma unroll
+                for (int i = 0; i < 4; i++) s_red[warp][4 * tt + i][lane] = acc[o][tp + tt][i];
+            __syncthreads();
+            if (warp == 0u) {
+#pragma unroll
+                for (int tt = 0; tt < 2; tt++)
+#pragma unroll
+                    for (int i = 0; i < 4; i++) {
+                        const unsigned n = i < 2 ? r0[o] : r0[o] + 8u;
+                        const unsigned m = 8u * (tp + tt) + 2u * c + (i & 1u);
+                        float v = 0.0f;
+#pragma unroll
+                        for (unsigned ww = 0; ww < SK_WARPS; ww++) v = __fadd_rn(v, s_red[ww][4 * tt + i][lane]);
+                        if (n < p.N && m < M)
+                            p.C[(unsigned long long)m * c_stride + p.col(n)] =
+                                __float2bfloat16_rn(__fmul_rn(v, p.fscale));
+                    }
+            }
+            __syncthreads();
+        }
+    }
+}
+
 // ── Entry points ────────────────────────────────────────────────────────────
 // Grid: (ceil(N0/16) + ceil(N1/16), 1, 1), block 256; part 1 (N1 = 0: none)
 // owns the CTAs past part 0's, and each output is the word a launch of its
@@ -368,6 +608,30 @@ extern "C" __global__ void __launch_bounds__(SK_WARPS * 32, 1) skinny_w4a16_t2(S
     sk_w4a16<2>(SK_W4_ARGS);
 }
 
+template <int NT>
+__device__ __forceinline__ void sk_w4a16_wide(SK_W4_PARAMS) {
+    atlas_pdl_enter();
+    const SkPart p0{P0, S0, nullptr, __fmul_rn(s0, 256.0f), C0, N0, SkCol{0u, 0u}};
+    const SkPart p1{P1, S1, nullptr, __fmul_rn(s1, 256.0f), C1, N1, SkCol{0u, 0u}};
+    sk_run_wide<false, NT>(A, M, K, c_stride, p0, p1);
+}
+extern "C" __global__ void __launch_bounds__(SK_WARPS * 32, 1) skinny_w4a16_w4(SK_W4_PARAMS) {
+    sk_w4a16_wide<4>(SK_W4_ARGS);
+}
+extern "C" __global__ void __launch_bounds__(SK_WARPS * 32, 1) skinny_w4a16_w8(SK_W4_PARAMS) {
+    sk_w4a16_wide<8>(SK_W4_ARGS);
+}
+extern "C" __global__ void __launch_bounds__(SK_WARPS * 32, 1) skinny_w4a16_w16(SK_W4_PARAMS) {
+    sk_w4a16_wide<16>(SK_W4_ARGS);
+}
+// Two output tiles a CTA (grid: ceil(tiles / 2)), up to 64 rows.
+extern "C" __global__ void __launch_bounds__(SK_WARPS * 32, 1) skinny_w4a16_x8(SK_W4_PARAMS) {
+    atlas_pdl_enter();
+    const SkPart p0{P0, S0, nullptr, __fmul_rn(s0, 256.0f), C0, N0, SkCol{0u, 0u}};
+    const SkPart p1{P1, S1, nullptr, __fmul_rn(s1, 256.0f), C1, N1, SkCol{0u, 0u}};
+    sk_run_wide_o2<8>(A, M, K, c_stride, p0, p1);
+}
+
 // Q+gate: N = heads x head_dim x 2 interleaved rows, C row t at C + t * N, [Q | G].
 #define SK_QG_PARAMS                                                                                 \
     const __nv_bfloat16 *__restrict__ A, unsigned M, unsigned K, const unsigned char *__restrict__ P, \
@@ -386,6 +650,27 @@ extern "C" __global__ void __launch_bounds__(SK_WARPS * 32, 1) skinny_qg_t1(SK_Q
 }
 extern "C" __global__ void __launch_bounds__(SK_WARPS * 32, 1) skinny_qg_t2(SK_QG_PARAMS) {
     sk_qg<2>(A, M, K, P, S, s2, C, N, heads, head_dim);
+}
+
+template <int NT>
+__device__ __forceinline__ void sk_qg_wide(SK_QG_PARAMS) {
+    atlas_pdl_enter();
+    const SkPart p{P, S, nullptr, __fmul_rn(s2, 256.0f), C, N, SkCol{heads, head_dim}};
+    sk_run_wide<false, NT>(A, M, K, N, p, p);
+}
+extern "C" __global__ void __launch_bounds__(SK_WARPS * 32, 1) skinny_qg_w4(SK_QG_PARAMS) {
+    sk_qg_wide<4>(A, M, K, P, S, s2, C, N, heads, head_dim);
+}
+extern "C" __global__ void __launch_bounds__(SK_WARPS * 32, 1) skinny_qg_w8(SK_QG_PARAMS) {
+    sk_qg_wide<8>(A, M, K, P, S, s2, C, N, heads, head_dim);
+}
+extern "C" __global__ void __launch_bounds__(SK_WARPS * 32, 1) skinny_qg_w16(SK_QG_PARAMS) {
+    sk_qg_wide<16>(A, M, K, P, S, s2, C, N, heads, head_dim);
+}
+extern "C" __global__ void __launch_bounds__(SK_WARPS * 32, 1) skinny_qg_x8(SK_QG_PARAMS) {
+    atlas_pdl_enter();
+    const SkPart p{P, S, nullptr, __fmul_rn(s2, 256.0f), C, N, SkCol{heads, head_dim}};
+    sk_run_wide_o2<8>(A, M, K, N, p, p);
 }
 
 // FP8: block_scale [ceil(N/128), K/128] FP32 a weight.
@@ -408,4 +693,21 @@ extern "C" __global__ void __launch_bounds__(SK_WARPS * 32, 1) skinny_w8a16_t1(S
 }
 extern "C" __global__ void __launch_bounds__(SK_WARPS * 32, 1) skinny_w8a16_t2(SK_W8_PARAMS) {
     sk_w8a16<2>(A, M, K, c_stride, B0, BS0, C0, N0, B1, BS1, C1, N1);
+}
+
+template <int NT>
+__device__ __forceinline__ void sk_w8a16_wide(SK_W8_PARAMS) {
+    atlas_pdl_enter();
+    const SkPart p0{B0, nullptr, BS0, 1.0f, C0, N0, SkCol{0u, 0u}};
+    const SkPart p1{B1, nullptr, BS1, 1.0f, C1, N1, SkCol{0u, 0u}};
+    sk_run_wide<true, NT>(A, M, K, c_stride, p0, p1);
+}
+extern "C" __global__ void __launch_bounds__(SK_WARPS * 32, 1) skinny_w8a16_w4(SK_W8_PARAMS) {
+    sk_w8a16_wide<4>(A, M, K, c_stride, B0, BS0, C0, N0, B1, BS1, C1, N1);
+}
+extern "C" __global__ void __launch_bounds__(SK_WARPS * 32, 1) skinny_w8a16_w8(SK_W8_PARAMS) {
+    sk_w8a16_wide<8>(A, M, K, c_stride, B0, BS0, C0, N0, B1, BS1, C1, N1);
+}
+extern "C" __global__ void __launch_bounds__(SK_WARPS * 32, 1) skinny_w8a16_w16(SK_W8_PARAMS) {
+    sk_w8a16_wide<16>(A, M, K, c_stride, B0, BS0, C0, N0, B1, BS1, C1, N1);
 }

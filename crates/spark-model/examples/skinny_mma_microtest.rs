@@ -2,10 +2,11 @@
 //! Row-invariance and accuracy gate for the `ATLAS_SKINNY_MMA` kernels
 //! (`kernels/gb10/qwen3.6-27b/nvfp4/skinny_mma.cu`, `layers/ops/skinny_mma.rs`).
 //!
-//! 1. BYTES. On every served Qwen3.8-27B shape, an M-row launch (M = 1..=16)
-//!    must write exactly the bytes of M one-row launches of the same family,
-//!    leave the row after the M-th untouched, and write identical rows for
-//!    rows whose inputs are identical (rows 5, 12, 15 repeat rows 0, 3, 9).
+//! 1. BYTES. On every served Qwen3.8-27B shape, an M-row call (M =
+//!    1..=`MAX_ROWS`, past 16 rows several 16-row launches) must write
+//!    exactly the bytes of M one-row launches of the same family, leave the
+//!    row after the M-th untouched, and write identical rows for rows whose
+//!    inputs are identical (rows 5, 12, 15, 70 repeat rows 0, 3, 9, 3).
 //!    Two-weight launches must match each weight launched alone, and a
 //!    strided launch the packed one. A 1-ULP change to one activation of row
 //!    1 (its largest) must change row 1 and no other row (negative control).
@@ -33,7 +34,7 @@ const ROWS: usize = MAX_ROWS as usize;
 const SCALE2: f32 = 0.0123;
 const SENTINEL: u8 = 0xA5;
 /// Rows that repeat an earlier row's input: (row, source).
-const SHARED: [(usize, usize); 3] = [(5, 0), (12, 3), (15, 9)];
+const SHARED: [(usize, usize); 4] = [(5, 0), (12, 3), (15, 9), (70, 3)];
 /// Rows checked against FP64.
 const ACC_ROWS: usize = 2;
 
@@ -434,7 +435,9 @@ fn main() -> Result<()> {
                 (16, 2, total, n),
                 (9, 2, total, n),
                 (1, 2, total, n),
+                (41, 2, total, n),
                 (16, 1, 0, 2 * n),
+                (41, 1, 0, 2 * n),
             ] {
                 g.memset(c, SENTINEL, 2 * total)?;
                 skinny(g, &ks, &sh, &op, op.a, c, m, (parts, c1_off, stride))?;
@@ -455,7 +458,7 @@ fn main() -> Result<()> {
         }
         bytes_ok &= bad.is_empty();
         println!(
-            "{label}  M=1..=16 byte-identical to M one-row launches={}{}",
+            "{label}  M=1..={ROWS} byte-identical to M one-row launches={}{}",
             bad.is_empty(),
             if bad.is_empty() {
                 String::new()
