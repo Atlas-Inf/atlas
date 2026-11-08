@@ -212,6 +212,9 @@ impl W4a16BatchmTiers {
         for (h, w) in handles.iter_mut().zip(W4A16_BATCHM_WIDTHS) {
             *h = super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_batch{w}"));
         }
+        // `ATLAS_WIDE_GEMV`'s tiers, which the batched launch ops consult
+        // (`ops::wide_gemv`); resolved once, and only when the lever is on.
+        super::ops::wide_gemv::init(gpu);
         if glm_series && tc_requested() {
             let canonical_target = canonical_target(gpu);
             TC.get_or_init(|| {

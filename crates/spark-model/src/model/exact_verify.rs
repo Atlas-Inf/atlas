@@ -43,7 +43,9 @@
 //!
 //! Every verify arm above is a scalar template whose row `r` is the
 //! single-row kernel's bytes; no tensor-core or DP4A tier can be picked
-//! under the switch. Refused beside it: the FP16 h-state (the exact GDN chain
+//! under the switch. `ATLAS_WIDE_GEMV=1` (`layers/ops/wide_gemv.rs`) serves
+//! the 5..=16-row NVFP4, FP8 and Q+gate arms with one `wide_gemv.cu` launch
+//! each instead: the same rows' bytes, fewer instructions a weight byte. Refused beside it: the FP16 h-state (the exact GDN chain
 //! reads FP32), `ATLAS_DECODE_FFN_VIA_GEMM` and `ATLAS_NO_DECODE_SPLIT_SILU`
 //! (serial decode's FFN would then take another arithmetic).
 //!

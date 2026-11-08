@@ -84,8 +84,21 @@ impl Qwen3AttentionLayer {
         // adapter; `ms_qkv_seq_q` covers the adapter case exactly as serial.
         if self.gated && !self.q_lora_active() && self.w4a16_gemv_qg_batch4_k.0 != 0 {
             let q_scratch = fwd.buffers.ssm_qkvz();
+            // `ATLAS_WIDE_GEMV`: 5..=16 rows in one `w4a16_gemv_qg_wide*`
+            // launch (row `r` `w4a16_gemv_qg`'s bytes).
+            let wide = ops::wide_gemv::active().map_or(Ok(false), |w| {
+                w.try_qg(
+                    fwd.gpu,
+                    normed,
+                    q_nvfp4,
+                    q_scratch,
+                    (n as u32, q_proj_dim, h as u32),
+                    (nq, hd),
+                    stream,
+                )
+            })?;
             // The lane's 16/32-row tiers past 8 rows, else at most 4 a launch.
-            let mut first = 0usize;
+            let mut first = if wide { n } else { 0 };
             while first < n {
                 let (rows, wide) = self.wide_rows.qg_chunk((n - first) as u32);
                 let m = rows as usize;

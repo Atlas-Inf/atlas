@@ -321,6 +321,8 @@ mod ssm_ssd;
 #[path = "ops/strix_s64.rs"]
 mod strix_s64;
 pub mod token_overlay;
+#[path = "ops/wide_gemv.rs"]
+pub mod wide_gemv;
 #[path = "ops/wide_prefill.rs"]
 mod wide_prefill;
 
