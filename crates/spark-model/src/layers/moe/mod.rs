@@ -178,6 +178,101 @@ impl MoeLayer {
             nvfp4
         }
     }
+
+    /// Tensor-core MXFP4 decode gate/up handle when opted in and compatible,
+    /// else None (caller keeps the scalar dual-format kernel).
+    ///
+    /// Opt-in: `ATLAS_MOE_MXFP4_TC=1`. Requires routed experts tagged
+    /// Mxfp4E8m0, the kernel compiled into this target (the mimo-v2.6-flash
+    /// overlay), and tile geometry N % 16 == 0, K % 64 == 0.
+    fn gate_up_tc_handle(&self, n: usize, k: usize) -> Option<spark_runtime::gpu::KernelHandle> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled =
+            *ON.get_or_init(|| std::env::var("ATLAS_MOE_MXFP4_TC").is_ok_and(|v| v == "1"));
+        if enabled
+            && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Mxfp4E8m0
+            && self.moe_expert_gate_up_tc_k.0 != 0
+            && n.is_multiple_of(16)
+            && k.is_multiple_of(64)
+        {
+            Some(self.moe_expert_gate_up_tc_k)
+        } else {
+            None
+        }
+    }
+
+    /// Decode gate+up over routed experts: the tensor-core MXFP4 kernel when
+    /// opted in and compatible, else the scalar dual-format `_shared_t`
+    /// kernel. Single-token decode only.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layers::moe) fn decode_gate_up_shared_t(
+        &self,
+        ctx: &ForwardContext,
+        input: DevicePtr,
+        gate_t: &ExpertPtrTable,
+        up_t: &ExpertPtrTable,
+        gate_out: DevicePtr,
+        up_out: DevicePtr,
+        expert_indices: DevicePtr,
+        sh_gate_t: &QuantizedWeight,
+        sh_gate_out: DevicePtr,
+        sh_up_t: &QuantizedWeight,
+        sh_up_out: DevicePtr,
+        n: u32,
+        k: u32,
+        top_k: u32,
+        stream: u64,
+        site: &str,
+    ) -> Result<()> {
+        if let Some(tc_k) = self.gate_up_tc_handle(n as usize, k as usize) {
+            return ops::moe_expert_gate_up_tc(
+                ctx.gpu,
+                tc_k,
+                input,
+                gate_t.packed_ptrs,
+                gate_t.scale_ptrs,
+                gate_out,
+                up_t.packed_ptrs,
+                up_t.scale_ptrs,
+                up_out,
+                expert_indices,
+                sh_gate_out,
+                sh_up_out,
+                1,
+                n,
+                k,
+                k,
+                top_k,
+                stream,
+            );
+        }
+        ops::moe_expert_gate_up_shared_t(
+            ctx.gpu,
+            self.e8m0_or(
+                self.moe_expert_gate_up_shared_t_k,
+                self.moe_expert_gate_up_shared_t_e8m0_k,
+                site,
+            ),
+            input,
+            gate_t.packed_ptrs,
+            gate_t.scale_ptrs,
+            gate_t.scale2_vals,
+            gate_out,
+            up_t.packed_ptrs,
+            up_t.scale_ptrs,
+            up_t.scale2_vals,
+            up_out,
+            expert_indices,
+            sh_gate_t,
+            sh_gate_out,
+            sh_up_t,
+            sh_up_out,
+            n,
+            k,
+            top_k,
+            stream,
+        )
+    }
 }
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────

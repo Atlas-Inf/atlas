@@ -169,6 +169,19 @@ rows) are padded to the 128-row block grid (3456); the pad rows are never
 read. `o_proj` stays BF16. The kernel target carries `mxfp8_gemv.cu` (same
 source as glm-5.3-flash). `FP8_QKV=0` restores the BF16 path for A/B.
 
+## MXFP4 tensor-core expert gate/up (`ATLAS_MOE_MXFP4_TC=1`, opt-in)
+
+Decode gate+up over routed MXFP4 (E8M0) experts can run a tensor-core
+(`mma.sync` BF16) GEMV, `mxfp4_gate_up_tc` (`nvfp4/mxfp4_gemv.cu`), instead of
+the scalar `moe_expert_gate_up_shared_t_e8m0`. It keeps the decode grid (16
+weight rows per CTA, K split across 8 warps) and stages the transposed
+`[K/2, N]` FP4 weights through smem; FP4 nibbles dequantize through a 16-entry
+BF16 LUT and the E8M0 scales decode exactly as in the MXFP8 tiers. The
+SiLU+down half stays scalar. Off by default pending hardware validation;
+requires `N % 16 == 0` and `K % 64 == 0` (MiMo: 2048/4096). Other quant
+targets never resolve the kernel (`try_kernel` gives 0), so the scalar path
+is untouched everywhere else.
+
 ## Tensor-core paged prefill (`mimo_prefill_tc`)
 
 Chunked (paged) prefill runs a tensor-core (`mma.sync` BF16) flash-attention

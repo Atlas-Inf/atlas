@@ -174,6 +174,10 @@ pub struct MoeLayer {
     // decode variants. KernelHandle(0) on models that don't ship them.
     pub(super) moe_expert_gate_up_shared_t_e8m0_k: KernelHandle,
     pub(super) moe_expert_silu_down_shared_t_e8m0_k: KernelHandle,
+    // MXFP4 tensor-core decode gate/up (mimo-v2.6-flash target overlay
+    // mxfp4_gemv.cu; KernelHandle(0) elsewhere). Opt-in via
+    // ATLAS_MOE_MXFP4_TC=1; the silu/down half stays scalar.
+    pub(super) moe_expert_gate_up_tc_k: KernelHandle,
     // S7 verify-row dedup: unique-expert map + multi-row `_t` gate/up and
     // silu/down over the transposed tables, one extern "C" instantiation per
     // row count (`_r1.._r8`; index = rows). gb10-only; KernelHandle(0)

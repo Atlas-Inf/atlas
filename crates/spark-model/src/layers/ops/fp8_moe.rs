@@ -369,6 +369,54 @@ pub fn moe_expert_gate_up_shared_t(
         .launch(stream)
 }
 
+/// MXFP4 tensor-core fused gate+up GEMV (transposed E8M0 weights,
+/// `mxfp4_gate_up_tc` in the mimo-v2.6-flash target overlay). Single-token
+/// decode; mirror of `moe_expert_gate_up_shared_t` for Mxfp4E8m0 routed
+/// experts — no NVFP4 scale2 values (E8M0 has no global scale) and no
+/// shared-expert weights (the kernel zero-fills the shared slot, matching
+/// the scalar kernel's null-pointer path).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_expert_gate_up_tc(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    gate_packed_t_ptrs: DevicePtr,
+    gate_scale_t_ptrs: DevicePtr,
+    gate_out: DevicePtr,
+    up_packed_t_ptrs: DevicePtr,
+    up_scale_t_ptrs: DevicePtr,
+    up_out: DevicePtr,
+    expert_indices: DevicePtr,
+    sh_gate_out: DevicePtr,
+    sh_up_out: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    lda: u32,
+    top_k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 16), top_k + 1, 2])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(gate_packed_t_ptrs)
+        .arg_ptr(gate_scale_t_ptrs)
+        .arg_ptr(gate_out)
+        .arg_ptr(up_packed_t_ptrs)
+        .arg_ptr(up_scale_t_ptrs)
+        .arg_ptr(up_out)
+        .arg_ptr(expert_indices)
+        .arg_ptr(sh_gate_out)
+        .arg_ptr(sh_up_out)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(lda)
+        .arg_u32(top_k)
+        .launch(stream)
+}
+
 /// NVFP4 fused SiLU+down GEMV (transposed weight). Single-token decode.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_expert_silu_down_shared_t(
