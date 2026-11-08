@@ -340,18 +340,11 @@ impl MoeLayer {
                     ctx,
                     stream,
                 )?;
-                ops::moe_expert_silu_down_shared_t(
-                    ctx.gpu,
-                    self.e8m0_or(
-                        self.moe_expert_silu_down_shared_t_k,
-                        self.moe_expert_silu_down_shared_t_e8m0_k,
-                        "decode silu_down_shared_t",
-                    ),
+                self.decode_silu_down_shared_t(
+                    ctx,
                     expert_gate_out,
                     expert_up_out,
-                    down_t.packed_ptrs,
-                    down_t.scale_ptrs,
-                    down_t.scale2_vals,
+                    down_t,
                     expert_down_out,
                     indices_dev,
                     shared_gate_scratch,
@@ -362,6 +355,7 @@ impl MoeLayer {
                     inter,
                     top_k,
                     stream,
+                    "decode silu_down_shared_t",
                 )?;
             } else {
                 // NVFP4 path

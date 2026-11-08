@@ -176,11 +176,15 @@ Decode gate+up over routed MXFP4 (E8M0) experts can run a tensor-core
 the scalar `moe_expert_gate_up_shared_t_e8m0`. It keeps the decode grid (16
 weight rows per CTA, K split across 8 warps) and stages the transposed
 `[K/2, N]` FP4 weights through smem; FP4 nibbles dequantize through a 16-entry
-BF16 LUT and the E8M0 scales decode exactly as in the MXFP8 tiers. The
-SiLU+down half stays scalar. Off by default pending hardware validation;
-requires `N % 16 == 0` and `K % 64 == 0` (MiMo: 2048/4096). Other quant
-targets never resolve the kernel (`try_kernel` gives 0), so the scalar path
-is untouched everywhere else.
+BF16 LUT and the E8M0 scales decode exactly as in the MXFP8 tiers. A second
+opt-in, `ATLAS_MOE_MXFP4_TC_SD=1`, swaps the SiLU+down half
+(`mxfp4_silu_down_tc`), which computes `silu(gate) * up` on the fly with one
+BF16 rounding per element (the scalar kernel keeps FP32 intermediates —
+the only intended numeric deviation). Either flag alone leaves the other
+half scalar. Both default off pending hardware validation; require
+`N % 16 == 0` and `K % 64 == 0` (MiMo: gate/up 2048/4096, silu/down
+4096/2048). Other quant targets never resolve the kernels (`try_kernel`
+gives 0), so the scalar path is untouched everywhere else.
 
 ## Tensor-core paged prefill (`mimo_prefill_tc`)
 

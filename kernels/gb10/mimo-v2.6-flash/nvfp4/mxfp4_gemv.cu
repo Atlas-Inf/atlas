@@ -205,3 +205,159 @@ extern "C" __global__ void __launch_bounds__(MX4_WARPS * MX4_WARP) mxfp4_gate_up
             C[c_base + (unsigned long long)m * N + n] = __float2bfloat16(v);
     }
 }
+
+// ── SiLU+down decode GEMV ────────────────────────────────────────────────
+//
+// Second half of the decode expert MLP: C = down(silu(gate) * up). The
+// scalar kernel fuses the activation into the dot product in FP32
+// (`(gf / (1 + __expf(-gf))) * uf`, no intermediate rounding); the MMA
+// A operand must be BF16, so this kernel rounds once per element:
+// bf16(silu_fp32(g) * u). Weight dequant is exact (same LUT/scales as
+// gate_up), so the only deviation from the scalar path is that single
+// activation rounding plus the K-split accumulation order — the same
+// noise class as the gate_up TC kernel, gated by greedy A/B.
+//
+// Grid mirrors `moe_expert_silu_down_shared_t_e8m0` without the z dim:
+//   grid [ceil(N/16), top_k + 1, 1]  block 256   (single-token decode)
+// gate_out / up_out: [expert_slot * K + k] BF16 (the shared slot reads
+// sh_gate_in / sh_up_in; MiMo ships no shared expert → zero-fill).
+extern "C" __global__ void __launch_bounds__(MX4_WARPS * MX4_WARP) mxfp4_silu_down_tc(
+    const __nv_bfloat16* __restrict__ gate_out,
+    const __nv_bfloat16* __restrict__ up_out,
+    const unsigned long long* __restrict__ packed_t_ptrs,
+    const unsigned long long* __restrict__ scale_t_ptrs,
+    __nv_bfloat16* __restrict__ C,
+    const unsigned int* __restrict__ expert_indices,
+    const __nv_bfloat16* __restrict__ sh_gate_in,
+    const __nv_bfloat16* __restrict__ sh_up_in,
+    __nv_bfloat16* __restrict__ sh_down_out,
+    unsigned int N, unsigned int K, unsigned int top_k
+) {
+    atlas_pdl_enter();
+    const unsigned int expert_slot = blockIdx.y;
+    const unsigned int n0 = blockIdx.x * MX4_TILE_N;
+    const bool is_shared = (expert_slot == top_k);
+
+    const unsigned char* B_packed = nullptr;
+    const unsigned char* B_scale = nullptr;
+    __nv_bfloat16* out = nullptr;
+    unsigned long long c_base = 0;
+    const __nv_bfloat16* g_ptr = nullptr;
+    const __nv_bfloat16* u_ptr = nullptr;
+    if (is_shared) {
+        out = sh_down_out;
+        g_ptr = sh_gate_in;
+        u_ptr = sh_up_in;
+    } else {
+        const unsigned int expert_id = expert_indices[expert_slot];
+        B_packed = (const unsigned char*)packed_t_ptrs[expert_id];
+        B_scale = (const unsigned char*)scale_t_ptrs[expert_id];
+        out = C;
+        c_base = (unsigned long long)expert_slot * N;
+        g_ptr = gate_out + (unsigned long long)expert_slot * K;
+        u_ptr = up_out + (unsigned long long)expert_slot * K;
+    }
+
+    // Same per-warp staged tiles as mxfp4_gate_up_tc (duplicated to keep the
+    // pushed gate_up kernel byte-identical while it awaits validation).
+    __shared__ unsigned char s_pk[MX4_WARPS][MX4_TILE_N * (MX4_CHUNK / 2)];
+    __shared__ unsigned char s_sc[MX4_WARPS][2 * MX4_TILE_N];
+    __shared__ unsigned short s_lut[16];
+    __shared__ float s_red[MX4_WARPS][MX4_WARP][4];
+
+    const unsigned int warp = threadIdx.x / MX4_WARP;
+    const unsigned int lane = threadIdx.x % MX4_WARP;
+
+    if (is_shared || B_packed == nullptr) {
+        for (unsigned int n = n0; n < min(n0 + MX4_TILE_N, N); n++)
+            out[c_base + n] = __float2bfloat16(0.0f);
+        return;
+    }
+
+    if (threadIdx.x < 16)
+        s_lut[threadIdx.x] = __bfloat16_as_ushort(__float2bfloat16(MX4_LUT_T[threadIdx.x]));
+    __syncthreads();
+
+    const unsigned int g = lane >> 2, c = lane & 3u;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const unsigned int chunks = K / MX4_CHUNK;
+    unsigned char* pk = s_pk[warp];
+    unsigned char* sc = s_sc[warp];
+    for (unsigned int ch = warp; ch < chunks; ch += MX4_WARPS) {
+        {
+            const uint4 v = *(const uint4*)(B_packed +
+                (unsigned long long)(ch * (MX4_CHUNK / 2) + lane) * N + n0);
+            const unsigned char* b = reinterpret_cast<const unsigned char*>(&v);
+            #pragma unroll
+            for (unsigned int n = 0; n < MX4_TILE_N; n++)
+                pk[n * (MX4_CHUNK / 2) + lane] = b[n];
+        }
+        if (lane < 2) {
+            const uint4 v = *(const uint4*)(B_scale +
+                (unsigned long long)(ch * 2u + lane) * N + n0);
+            const unsigned char* b = reinterpret_cast<const unsigned char*>(&v);
+            #pragma unroll
+            for (unsigned int n = 0; n < MX4_TILE_N; n++)
+                sc[lane * MX4_TILE_N + n] = b[n];
+        }
+        __syncwarp();
+
+        // Activation row 0 only (single-token decode): lane (g == 0, c)
+        // covers K values ch*64 + 16c .. +15 of silu(gate) * up.
+        const unsigned int kb = ch * MX4_CHUNK + 16u * c;
+        unsigned int xw[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+        if (g == 0) {
+            const uint4 g0 = *(const uint4*)(g_ptr + kb);
+            const uint4 g1 = *(const uint4*)(g_ptr + kb + 8);
+            const uint4 u0 = *(const uint4*)(u_ptr + kb);
+            const uint4 u1 = *(const uint4*)(u_ptr + kb + 8);
+            const unsigned int gw[8] = {g0.x, g0.y, g0.z, g0.w, g1.x, g1.y, g1.z, g1.w};
+            const unsigned int uw[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
+            #pragma unroll
+            for (int t = 0; t < 8; t++) {
+                const __nv_bfloat162 gf = __halves2bfloat162(
+                    __ushort_as_bfloat16(gw[t] & 0xFFFFu),
+                    __ushort_as_bfloat16(gw[t] >> 16));
+                const __nv_bfloat162 uf = __halves2bfloat162(
+                    __ushort_as_bfloat16(uw[t] & 0xFFFFu),
+                    __ushort_as_bfloat16(uw[t] >> 16));
+                const float2 g2 = __bfloat1622float2(gf);
+                const float2 u2 = __bfloat1622float2(uf);
+                // Scalar contract: silu in FP32, one BF16 rounding at the end.
+                const float s0 = (g2.x / (1.0f + __expf(-g2.x))) * u2.x;
+                const float s1 = (g2.y / (1.0f + __expf(-g2.y))) * u2.y;
+                xw[t] = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(s0)) |
+                        ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(s1)) << 16);
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const unsigned short ug = *(const unsigned short*)(pk + g * (MX4_CHUNK / 2) + 8u * c + 2u * j);
+            const unsigned short uh = *(const unsigned short*)(pk + (g + 8u) * (MX4_CHUNK / 2) + 8u * c + 2u * j);
+            const unsigned int sc_g = sc[(c >> 1) * MX4_TILE_N + g];
+            const unsigned int sc_h = sc[(c >> 1) * MX4_TILE_N + g + 8u];
+            unsigned int a[4] = {
+                mx4_pair(ug & 0xFFu, sc_g, s_lut),
+                mx4_pair(uh & 0xFFu, sc_h, s_lut),
+                mx4_pair(ug >> 8, sc_g, s_lut),
+                mx4_pair(uh >> 8, sc_h, s_lut),
+            };
+            mx4_mma(acc, a, xw[2 * j], xw[2 * j + 1]);
+        }
+    }
+
+    #pragma unroll
+    for (int q = 0; q < 4; q++) s_red[warp][lane][q] = acc[q];
+    __syncthreads();
+    if (warp != 0) return;
+    #pragma unroll
+    for (int q = 0; q < 4; q++) {
+        float v = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < MX4_WARPS; w++) v += s_red[w][lane][q];
+        const unsigned int n = (q < 2) ? (n0 + g) : (n0 + g + 8u);
+        const unsigned int m = 2u * c + (q & 1u);
+        if (n < N && m == 0)  // single-token decode: only row 0 is live
+            out[c_base + n] = __float2bfloat16(v);
+    }
+}

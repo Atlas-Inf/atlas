@@ -280,6 +280,7 @@ mod types;
 pub use types::MoeLayer;
 mod compact_layout;
 mod decode_m16;
+mod decode_tc;
 mod dump;
 mod ep_prefill;
 mod forward;

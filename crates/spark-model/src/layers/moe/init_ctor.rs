@@ -264,12 +264,9 @@ impl MoeLayer {
                 "moe_shared_expert_fused_t",
                 "moe_expert_silu_down_shared_t_e8m0",
             ),
-            // MXFP4 tensor-core gate/up — target-local overlay, 0 elsewhere.
-            moe_expert_gate_up_tc_k: super::super::try_kernel(
-                gpu,
-                "mxfp4_gemv",
-                "mxfp4_gate_up_tc",
-            ),
+            // MXFP4 tensor-core decode GEMVs — mimo overlay, 0 elsewhere.
+            moe_expert_gate_up_tc_k: mxfp4_tc_kernel(gpu, "mxfp4_gate_up_tc"),
+            moe_expert_silu_down_tc_k: mxfp4_tc_kernel(gpu, "mxfp4_silu_down_tc"),
             // S7 verify-row dedup (`forward_rows_t`): gb10-only entries in
             // the same module — gated, so other targets get KernelHandle(0).
             moe_expert_union_t_k: t_rows.moe_expert_union_t_k,
@@ -494,4 +491,9 @@ impl MoeLayer {
         }
         Ok(layer)
     }
+}
+
+/// Tensor-core MXFP4 decode GEMV (mimo overlay; 0 on other targets).
+fn mxfp4_tc_kernel(gpu: &dyn GpuBackend, entry: &str) -> KernelHandle {
+    super::super::try_kernel(gpu, "mxfp4_gemv", entry)
 }
