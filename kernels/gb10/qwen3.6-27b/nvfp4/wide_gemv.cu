@@ -280,8 +280,8 @@ struct WgQg {
     float scale2;
     unsigned half_K, groups, heads, head_dim;
 
-    __device__ __forceinline__ static float lut_entry(unsigned i) { return WG_E2M1_LUT[i]; }
-    __device__ __forceinline__ static unsigned chunks(unsigned K) { return K / 8u; }
+    static __device__ __forceinline__ float lut_entry(unsigned i) { return WG_E2M1_LUT[i]; }
+    static __device__ __forceinline__ unsigned chunks(unsigned K) { return K / 8u; }
 
     __device__ __forceinline__ void fetch(Chunk& w, unsigned n0, unsigned N, bool live, unsigned kk) const {
 #pragma unroll
@@ -347,8 +347,8 @@ struct WgW8 {
     const float* __restrict__ block_scale;
     unsigned K, k_blocks;
 
-    __device__ __forceinline__ static float lut_entry(unsigned i) { return E4M3_LUT[i]; }
-    __device__ __forceinline__ static unsigned chunks(unsigned K) { return K / 16u; }
+    static __device__ __forceinline__ float lut_entry(unsigned i) { return E4M3_LUT[i]; }
+    static __device__ __forceinline__ unsigned chunks(unsigned K) { return K / 16u; }
 
     __device__ __forceinline__ void fetch(Chunk& w, unsigned n0, unsigned N, bool live, unsigned kk) const {
 #pragma unroll
