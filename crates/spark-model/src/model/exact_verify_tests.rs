@@ -88,7 +88,7 @@ fn max_rows_is_the_mtp_or_dflash_width() {
     assert_eq!(max_rows(false), MAX_ROWS);
     assert_eq!(max_rows(true), DFLASH_MAX_ROWS);
     // γ = 8 (DFlash2's served depth) fits in one exact verify.
-    assert!(DFLASH_MAX_DRAFTS >= 8);
+    const { assert!(DFLASH_MAX_DRAFTS >= 8) };
     assert_eq!(DFLASH_MAX_DRAFTS + 1, DFLASH_MAX_ROWS);
 }
 
