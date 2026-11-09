@@ -297,9 +297,9 @@ impl ModelWeightLoader for MimoV2WeightLoader {
         for i in 0..config.num_hidden_layers {
             let kv_dtype = layer_kv_dtypes[i];
             ensure!(
-                matches!(kv_dtype, KvCacheDtype::Bf16),
+                matches!(kv_dtype, KvCacheDtype::Bf16 | KvCacheDtype::Fp8),
                 "mimo_v2: layer {i} KV dtype {kv_dtype:?} unsupported; the MiMo attention \
-                 kernels read a BF16 paged cache (use --kv-cache-dtype bf16)"
+                 kernels support a BF16 or FP8 paged cache"
             );
             let lp = format!("model.layers.{i}");
             let input_norm = dense(store, &format!("{lp}.input_layernorm.weight"))?;

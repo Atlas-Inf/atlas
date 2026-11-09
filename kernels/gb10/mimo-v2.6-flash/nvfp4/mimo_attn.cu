@@ -37,6 +37,8 @@
 // each lane accumulates 4 of the 128 V dims. Online softmax in FP32.
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <math_constants.h>
 
 #define MIMO_QK 192
@@ -61,6 +63,13 @@ static __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
+// FP8 KV (KvCacheDtype::Fp8): the paged pools store one E4M3 byte per element
+// in the SAME element layout as the BF16 cache (192-stride head slots), so only
+// the per-element width changes; scales are per-layer per-tensor, passed in.
+static __device__ __forceinline__ float mimo_fp8_f32(__nv_fp8_storage_t b) {
+    return __half2float(__nv_cvt_fp8_to_halfraw(b, __NV_E4M3));
+}
+
 // ---------------------------------------------------------------------------
 // QKV split + partial RoPE + paged cache write.
 // Grid: (T, 1, 1). Block: (256, 1, 1).
@@ -82,7 +91,10 @@ extern "C" __global__ void mimo_qkv_rope_cache(
     const float rope_theta,
     const unsigned int block_size,
     const unsigned int kv_write_floor,       // tokens [0, floor) skip the cache write
-    const unsigned int* __restrict__ swa_map // [num_blocks] block -> SWA slot, or null
+    const unsigned int* __restrict__ swa_map, // [num_blocks] block -> SWA slot, or null
+    const unsigned int kv_fp8,               // 1 = paged cache holds FP8 E4M3
+    const float k_inv_scale,                 // 1 / per-layer K scale (FP8 only)
+    const float v_inv_scale                  // 1 / per-layer V scale (FP8 only)
 ) {
     const unsigned int t = blockIdx.x;
     const unsigned int nq_c = nq / tp_chunks;
@@ -102,13 +114,21 @@ extern "C" __global__ void mimo_qkv_rope_cache(
 
     __nv_bfloat16* k_dst = nullptr;
     __nv_bfloat16* v_dst = nullptr;
+    __nv_fp8_storage_t* k_dst8 = nullptr;
+    __nv_fp8_storage_t* v_dst8 = nullptr;
     if (write_kv) {
         const unsigned long long blk =
             swa_map ? swa_blk : (unsigned long long)(slot / block_size);
         const unsigned long long off = (unsigned long long)(slot % block_size);
         const unsigned long long base = (blk * block_size + off) * nkv * MIMO_QK;
-        k_dst = k_cache + base;
-        v_dst = v_cache + base;
+        if (kv_fp8) {
+            // FP8 pool: same element layout as BF16, one byte per element.
+            k_dst8 = (__nv_fp8_storage_t*)k_cache + base;
+            v_dst8 = (__nv_fp8_storage_t*)v_cache + base;
+        } else {
+            k_dst = k_cache + base;
+            v_dst = v_cache + base;
+        }
     }
 
     // Rows to RoPE: nq Q heads then nkv K heads. One (head, rotary pair) per item.
@@ -137,7 +157,15 @@ extern "C" __global__ void mimo_qkv_rope_cache(
         if (is_q) {
             q_out[(unsigned long long)t * nq * MIMO_QK + h * MIMO_QK + d] = y;
         } else {
-            if (write_kv) k_dst[hh * MIMO_QK + d] = y;
+            if (write_kv) {
+                if (kv_fp8) {
+                    // Quantize the roped FP32 value directly (single rounding).
+                    k_dst8[hh * MIMO_QK + d] = __nv_cvt_float_to_fp8(
+                        x * k_inv_scale, __NV_SATFINITE, __NV_E4M3);
+                } else {
+                    k_dst[hh * MIMO_QK + d] = y;
+                }
+            }
             if (k_contig) k_contig[((unsigned long long)t * nkv + hh) * MIMO_QK + d] = y;
         }
     }
@@ -149,7 +177,14 @@ extern "C" __global__ void mimo_qkv_rope_cache(
             const unsigned int local = hh % nkv_c;
             const unsigned int src =
                 c * chunk_stride + nq_c * MIMO_QK + nkv_c * MIMO_QK + local * MIMO_VD + d;
-            if (write_kv) v_dst[hh * MIMO_QK + d] = row[src];
+            if (write_kv) {
+                if (kv_fp8) {
+                    v_dst8[hh * MIMO_QK + d] = __nv_cvt_float_to_fp8(
+                        __bfloat162float(row[src]) * v_inv_scale, __NV_SATFINITE, __NV_E4M3);
+                } else {
+                    v_dst[hh * MIMO_QK + d] = row[src];
+                }
+            }
             if (v_contig) v_contig[((unsigned long long)t * nkv + hh) * MIMO_VD + d] = row[src];
         }
     }
@@ -176,7 +211,8 @@ static __device__ __forceinline__ void mimo_load_tile(
     const __nv_bfloat16* __restrict__ k_cache, const __nv_bfloat16* __restrict__ v_cache,
     const int* __restrict__ bt, const unsigned int* __restrict__ smap,
     unsigned int k0, unsigned int k_end,
-    unsigned int kvh, unsigned int nkv, unsigned int block_size, unsigned int pos_base) {
+    unsigned int kvh, unsigned int nkv, unsigned int block_size, unsigned int pos_base,
+    unsigned int kv_fp8, float k_scale, float v_scale) {
     const unsigned int nthreads = blockDim.x;
     // K: 32 rows × 96 bf16x2
     for (unsigned int i = threadIdx.x; i < MIMO_TILE * (MIMO_QK / 2); i += nthreads) {
@@ -192,7 +228,15 @@ static __device__ __forceinline__ void mimo_load_tile(
             } else {
                 base = ((unsigned long long)(p - pos_base) * nkv + kvh) * MIMO_QK;
             }
-            val = reinterpret_cast<const __nv_bfloat162*>(k_cache + base)[c2];
+            if (kv_fp8 && bt) {
+                // FP8 paged read: one E4M3 byte per element, same element layout.
+                const __nv_fp8_storage_t* src8 = (const __nv_fp8_storage_t*)k_cache + base;
+                val = __floats2bfloat162_rn(
+                    mimo_fp8_f32(src8[c2 * 2]) * k_scale,
+                    mimo_fp8_f32(src8[c2 * 2 + 1]) * k_scale);
+            } else {
+                val = reinterpret_cast<const __nv_bfloat162*>(k_cache + base)[c2];
+            }
         }
         reinterpret_cast<__nv_bfloat162*>(ks + r * MIMO_KROW)[c2] = val;
     }
@@ -210,7 +254,14 @@ static __device__ __forceinline__ void mimo_load_tile(
             } else {
                 base = ((unsigned long long)(p - pos_base) * nkv + kvh) * MIMO_VD;
             }
-            val = reinterpret_cast<const __nv_bfloat162*>(v_cache + base)[c2];
+            if (kv_fp8 && bt) {
+                const __nv_fp8_storage_t* src8 = (const __nv_fp8_storage_t*)v_cache + base;
+                val = __floats2bfloat162_rn(
+                    mimo_fp8_f32(src8[c2 * 2]) * v_scale,
+                    mimo_fp8_f32(src8[c2 * 2 + 1]) * v_scale);
+            } else {
+                val = reinterpret_cast<const __nv_bfloat162*>(v_cache + base)[c2];
+            }
         }
         reinterpret_cast<__nv_bfloat162*>(vs + r * MIMO_VROW)[c2] = val;
     }
@@ -330,7 +381,10 @@ extern "C" __global__ void mimo_paged_decode_attn(
     const float out_scale,
     const unsigned int q_stride,
     const unsigned int out_stride,
-    const unsigned int* __restrict__ swa_map  // block -> SWA slot, or null
+    const unsigned int* __restrict__ swa_map, // block -> SWA slot, or null
+    const unsigned int kv_fp8,               // 1 = paged cache holds FP8 E4M3
+    const float k_scale,                     // per-layer K scale (FP8 only)
+    const float v_scale                      // per-layer V scale (FP8 only)
 ) {
     __shared__ __align__(16) __nv_bfloat16 ks[MIMO_TILE * MIMO_KROW];
     __shared__ __align__(16) __nv_bfloat16 vs[MIMO_TILE * MIMO_VROW];
@@ -368,7 +422,7 @@ extern "C" __global__ void mimo_paged_decode_attn(
     const int* bt = block_table + (unsigned long long)seq * max_blocks_per_seq;
     for (unsigned int k0 = s_lo; k0 < s_hi; k0 += MIMO_TILE) {
         __syncthreads();
-        mimo_load_tile(ks, vs, k_cache, v_cache, bt, swa_map, k0, s_hi, kvh, nkv, block_size, 0u);
+        mimo_load_tile(ks, vs, k_cache, v_cache, bt, swa_map, k0, s_hi, kvh, nkv, block_size, 0u, kv_fp8, k_scale, v_scale);
         __syncthreads();
         mimo_consume_tile(st, qs, ks, vs, k0, s_lo, s_hi, scale);
     }
@@ -454,7 +508,10 @@ extern "C" __global__ void mimo_prefill_attn(
     const float out_scale,
     const unsigned int q_stride,
     const unsigned int out_stride,
-    const unsigned int* __restrict__ swa_map  // block -> SWA slot, or null
+    const unsigned int* __restrict__ swa_map, // block -> SWA slot, or null
+    const unsigned int kv_fp8,               // 1 = paged cache holds FP8 E4M3
+    const float k_scale,                     // per-layer K scale (FP8 only)
+    const float v_scale                      // per-layer V scale (FP8 only)
 ) {
     __shared__ __align__(16) __nv_bfloat16 ks[MIMO_TILE * MIMO_KROW];
     __shared__ __align__(16) __nv_bfloat16 vs[MIMO_TILE * MIMO_VROW];
@@ -489,7 +546,7 @@ extern "C" __global__ void mimo_prefill_attn(
 
     for (unsigned int k0 = tile_lo; k0 < tile_hi; k0 += MIMO_TILE) {
         __syncthreads();
-        mimo_load_tile(ks, vs, k_cache, v_cache, block_table, swa_map, k0, tile_hi, kvh, nkv, block_size, pos0);
+        mimo_load_tile(ks, vs, k_cache, v_cache, block_table, swa_map, k0, tile_hi, kvh, nkv, block_size, pos0, kv_fp8, k_scale, v_scale);
         __syncthreads();
         if (active && k0 < hi && k0 + MIMO_TILE > lo) {
             mimo_consume_tile(st, qs, ks, vs, k0, lo, hi, scale);

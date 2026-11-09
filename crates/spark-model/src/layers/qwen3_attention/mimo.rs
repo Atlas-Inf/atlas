@@ -17,7 +17,7 @@
 use anyhow::{Context, Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
-use spark_runtime::kv_cache::PagedKvCache;
+use spark_runtime::kv_cache::{KvCacheDtype, PagedKvCache};
 
 use super::Qwen3AttentionLayer;
 use crate::layer::{AttnMetadataDev, ForwardContext};
@@ -132,6 +132,17 @@ impl Qwen3AttentionLayer {
             .expect("MiMo path entered without MimoAttn")
     }
 
+    /// FP8 KV args for the MiMo kernels: `(kv_fp8, k_scale, v_scale)`. BF16 KV
+    /// passes `kv_fp8 = 0` (scales unused); FP8 KV dequantizes with these.
+    fn mimo_kv_fp8(&self) -> (u32, f32, f32) {
+        if self.kv_dtype == KvCacheDtype::Fp8 {
+            let (k, v) = self.effective_fp8_scales();
+            (1, k, v)
+        } else {
+            (0, 1.0, 1.0)
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn mimo_gemm(
         &self,
@@ -244,6 +255,12 @@ impl Qwen3AttentionLayer {
         let qkv_out = ctx.buffers.qkv_output();
         let q = ctx.buffers.ssm_deinterleaved();
         self.mimo_qkv_gemm(ctx, normed, qkv_out, n, m.qkv_rows(), h, stream)?;
+        let (kv_fp8, k_scale, v_scale) = self.mimo_kv_fp8();
+        let (k_inv_scale, v_inv_scale) = if kv_fp8 == 1 {
+            (1.0 / k_scale, 1.0 / v_scale)
+        } else {
+            (1.0, 1.0)
+        };
         KernelLaunch::new(ctx.gpu, m.kernels.qkv_rope_cache)
             .grid([n, 1, 1])
             .block([256, 1, 1])
@@ -264,6 +281,9 @@ impl Qwen3AttentionLayer {
             .arg_u32(kv_cache.block_size() as u32)
             .arg_u32(kv_write_floor)
             .arg_ptr(kv_cache.swa_slot_map_ptr(self.attn_layer_idx))
+            .arg_u32(kv_fp8)
+            .arg_f32(k_inv_scale)
+            .arg_f32(v_inv_scale)
             .launch(stream)?;
         Ok((q, k_contig, v_contig))
     }
@@ -296,6 +316,7 @@ impl Qwen3AttentionLayer {
         let ws_acc = m
             .workspace
             .offset(num_seqs as usize * m.nq as usize * splits as usize * 2 * 4);
+        let (kv_fp8, k_scale, v_scale) = self.mimo_kv_fp8();
         KernelLaunch::new(ctx.gpu, m.kernels.decode)
             .grid([m.nkv, splits, num_seqs])
             .block([32 * (m.nq / m.nkv), 1, 1])
@@ -318,6 +339,9 @@ impl Qwen3AttentionLayer {
             .arg_u32(m.nq * MIMO_QK_DIM)
             .arg_u32(m.nq * MIMO_V_DIM)
             .arg_ptr(kv_cache.swa_slot_map_ptr(self.attn_layer_idx))
+            .arg_u32(kv_fp8)
+            .arg_f32(k_scale)
+            .arg_f32(v_scale)
             .launch(stream)?;
         if splits > 1 {
             KernelLaunch::new(ctx.gpu, m.kernels.decode_reduce)
@@ -393,9 +417,11 @@ impl Qwen3AttentionLayer {
             )
         };
         let attn = ctx.buffers.attn_output();
+        let (kv_fp8, k_scale, v_scale) = self.mimo_kv_fp8();
         // Chunked (paged) prefill uses the tensor-core kernel when built;
-        // chunk-0 contiguous prefill and stale kernel builds keep the scalar path.
-        if !contiguous && m.kernels.prefill_tc.0 != 0 {
+        // chunk-0 contiguous prefill, stale kernel builds, and FP8 KV (no TC
+        // FP8 variant yet) keep the scalar path.
+        if !contiguous && kv_fp8 == 0 && m.kernels.prefill_tc.0 != 0 {
             let kv_len = (seq_len_start + num_tokens) as u32;
             KernelLaunch::new(ctx.gpu, m.kernels.prefill_tc)
                 .grid([m.nq, div_ceil(n, MIMO_TC_BR), 1])
@@ -439,6 +465,9 @@ impl Qwen3AttentionLayer {
                 .arg_u32(m.nq * MIMO_QK_DIM)
                 .arg_u32(m.nq * MIMO_V_DIM)
                 .arg_ptr(kv_cache.swa_slot_map_ptr(self.attn_layer_idx))
+                .arg_u32(kv_fp8)
+                .arg_f32(k_scale)
+                .arg_f32(v_scale)
                 .launch(stream)?;
         }
         let h = ctx.config.hidden_size as u32;
