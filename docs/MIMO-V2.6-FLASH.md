@@ -70,10 +70,6 @@ launcher default; `FP8_QKV=1` already was).
   packed E2M1 + FP8 scale per 16 weights + FP32 global scale, ~352 MB/rank
   vs 1.25 GB BF16 — replicated on both ranks, read once per decode token
   and once per DFlash verify step via a transposed twin.)
-- **`ATLAS_MOE_TOPK` (closed experiment)**: top-6 quality-clean but decode
-  flat (+1.6%, within noise); top-4 decode +29% but ppl +20.3% and factual
-  errors in the 46-prompt gate. **Quality-unacceptable; stays opt-in,
-  default off, do not pursue further.**
 - **Multi-sequence decode** (`MAX_BATCH=2/4`; TP=2+EP=2, FP8 QKV, chan4,
   γ=4, util 0.84, greedy): batched decode is **bit-identical** to batch=1
   at matched prefix-cache state — the one observed divergence was traced
@@ -299,16 +295,6 @@ rank stores KV for its own heads only, so the KV pool roughly doubles on
 top of the weight savings. The MTP/DFlash drafter stays unsharded on rank
 0. `TP_SIZE=1` restores the replicated-attention EP=2 layout. Hardware
 validation and numbers: see [Hardware validation](#hardware-validation-2-gb10-fork).
-
-## Experimental MoE top-k override (`ATLAS_MOE_TOPK`, opt-in)
-
-`ATLAS_MOE_TOPK=<k>` (1..=8) reduces the routed-expert count per token at
-config-parse time. Expert weight bytes scale ~linearly with k. **Quality is
-unvalidated and the experiment is closed**: the model was trained at
-top-8; on hardware, top-6 was quality-clean but decode-flat (+1.6%), and
-top-4 was +29% decode with ppl +20.3% and factual errors — not shippable.
-The flag stays opt-in and must never become a default. Unset = trained
-top-8.
 
 ## Tensor-core paged prefill (`mimo_prefill_tc`)
 
