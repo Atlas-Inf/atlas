@@ -52,7 +52,10 @@ impl PagedKvCache {
             Some(shard) => shard.owned_run(first, count),
             None => (first as usize, count),
         };
-        for layer in &self.layers {
+        for (i, layer) in self.layers.iter().enumerate() {
+            // Slotted SWA pools are indexed by slot, and a slot's rows are
+            // rewritten before any in-window read: nothing to zero.
+            let swa = self.swa_slotted(i);
             for (base, stride, first, count) in [
                 (
                     layer.k_pool,
@@ -89,6 +92,9 @@ impl PagedKvCache {
                     count,
                 ),
             ] {
+                if swa && (base == layer.k_pool || base == layer.owned_v_pool()) {
+                    continue;
+                }
                 if base.is_null() || stride == 0 || count == 0 {
                     continue;
                 }

@@ -266,7 +266,10 @@ impl TransformerModel {
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let layer_type = self.config.layer_type(layer_idx);
 
-                if layer_type == LayerType::FullAttention {
+                if matches!(
+                    layer_type,
+                    LayerType::FullAttention | LayerType::SlidingAttention
+                ) {
                     if hss_engaged {
                         // HSS: paged-decode kernel only reads HBM blocks, missing
                         // long-context disk history. Fall back to sequential

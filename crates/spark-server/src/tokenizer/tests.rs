@@ -281,6 +281,25 @@ fn deepseek_v4_reasoning_parser_is_registered() {
     assert_eq!(p.end_tag(), "</think>", "DS4F reasoning end tag");
 }
 
+/// MiMo-V2's template closes thinking-off turns with `<think></think>`. With no
+/// `[reasoning]` entry `think_end_token` is None, so reconcile reads that tail as
+/// an unclosed `<think>`, forces thinking on and the answer lands in
+/// `reasoning_content` with empty `content`.
+#[test]
+fn mimo_v2_reasoning_parser_is_registered() {
+    use crate::reasoning_parser::ReasoningFormat;
+    let defaults: toml::Value =
+        toml::from_str(include_str!("../../tool_defaults.toml")).expect("tool_defaults parses");
+    let fmt: ReasoningFormat = defaults
+        .get("reasoning")
+        .and_then(|t| t.get("mimo_v2"))
+        .and_then(|s| s.as_str())
+        .expect("tool_defaults [reasoning] must register mimo_v2")
+        .parse()
+        .expect("mimo_v2 reasoning format parses");
+    assert_eq!(fmt.into_parser().end_tag(), "</think>");
+}
+
 /// Byte-match guard: the `{{ tool | tojson }}` filter used by the
 /// `<tools>` block in jinja-templates/openai/qwen3_5_moe.jinja must
 /// produce EXACTLY what transformers' jinja2 `tojson` does, which is

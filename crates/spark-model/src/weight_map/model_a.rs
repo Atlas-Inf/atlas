@@ -138,7 +138,13 @@ pub(crate) fn quantized_mxfp4_e8m0(store: &WeightStore, prefix: &str) -> Result<
     let n = w.shape[0];
     let k_packed = w.shape[1];
     let total_nibbles = n * k_packed * 2;
-    let scale_t = store.get(&format!("{prefix}.scale"))?;
+    // DeepSeek-V4 names the E8M0 scales `.scale`; MiMo-V2 uses `.weight_scale`.
+    let scale_key = if store.contains(&format!("{prefix}.scale")) {
+        format!("{prefix}.scale")
+    } else {
+        format!("{prefix}.weight_scale")
+    };
+    let scale_t = store.get(&scale_key)?;
     let num_groups = scale_t.num_elements();
     ensure!(
         num_groups > 0 && total_nibbles.is_multiple_of(num_groups),
@@ -152,7 +158,7 @@ pub(crate) fn quantized_mxfp4_e8m0(store: &WeightStore, prefix: &str) -> Result<
     );
     Ok(QuantizedWeight {
         weight: ptr(store, &format!("{prefix}.weight"))?,
-        weight_scale: ptr(store, &format!("{prefix}.scale"))?,
+        weight_scale: ptr(store, &scale_key)?,
         weight_scale_2: 1.0, // native MXFP4 has no per-tensor global
         input_scale: DevicePtr::NULL,
         // native MXFP4 uses the scalar `weight_scale_2` (E8M0 per-group), not

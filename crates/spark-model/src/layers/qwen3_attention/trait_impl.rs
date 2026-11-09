@@ -15,6 +15,7 @@ mod diag;
 mod multi_seq;
 pub(crate) use multi_seq::{
     grouped_routed_decode_enabled, grouped_routed_decode_min, pairwise_moe_decode_enabled,
+    rows_moe_decode_enabled,
 };
 mod prefill_inner;
 mod prefill_inner_glm;

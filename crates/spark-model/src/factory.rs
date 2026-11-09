@@ -14,9 +14,9 @@ use crate::mistral_loader::MistralWeightLoader;
 use crate::weight_loader::LongcatWeightLoader;
 use crate::weight_loader::{
     DeepSeekV4WeightLoader, DflashConfig, Gemma4WeightLoader, Glm5WeightLoader, LagunaWeightLoader,
-    MinimaxM2WeightLoader, ModelWeightLoader, NemotronHWeightLoader, NllbWeightLoader,
-    Qwen3VLWeightLoader, Qwen3WeightLoader, Qwen4ExpWeightLoader, Qwen35DenseWeightLoader,
-    Qwen35WeightLoader, Step3p7WeightLoader,
+    MimoV2WeightLoader, MinimaxM2WeightLoader, ModelWeightLoader, NemotronHWeightLoader,
+    NllbWeightLoader, Qwen3VLWeightLoader, Qwen3WeightLoader, Qwen4ExpWeightLoader,
+    Qwen35DenseWeightLoader, Qwen35WeightLoader, Step3p7WeightLoader,
 };
 
 mod dspark_admission;
@@ -123,6 +123,7 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
         // MiniMax M2 family (M2.1 / M2.7) — full attention + 256-expert
         // sigmoid-routed MoE + 3-module MTP.
         "minimax_m2" => Ok(Box::new(MinimaxM2WeightLoader)),
+        "mimo_v2" => Ok(Box::new(MimoV2WeightLoader)),
         // Step 3.7 Flash — 288-expert sigmoid-routed MoE + shared expert +
         // mixed full/sliding attention + attention gate + 3 MTP modules.
         "step3p7" => Ok(Box::new(Step3p7WeightLoader)),
@@ -132,7 +133,7 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
         "glm5_next" => Ok(Box::new(Glm5WeightLoader)),
         _ => bail!(
             "Unsupported model type: '{}' (normalized: '{}'). \
-             Supported: qwen3_next, qwen3_5_moe, qwen3_5, qwen3_6_moe, holo3_1_moe, qwen3_vl_moe, qwen4_exp, nemotron_h, nemotron_h_puzzle, nemotron_h_omni, gemma4, mistral, minimax_m2, step3p7, laguna, deepseek_v4, m2m_100",
+             Supported: qwen3_next, qwen3_5_moe, qwen3_5, qwen3_6_moe, holo3_1_moe, qwen3_vl_moe, qwen4_exp, nemotron_h, nemotron_h_puzzle, nemotron_h_omni, gemma4, mistral, minimax_m2, mimo_v2, step3p7, laguna, deepseek_v4, m2m_100",
             config.model_type,
             normalized,
         ),

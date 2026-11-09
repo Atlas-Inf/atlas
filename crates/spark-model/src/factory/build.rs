@@ -28,6 +28,7 @@ mod kv_budget;
 mod kv_carveout;
 mod kv_nvme;
 mod kv_summary;
+mod swa_evict;
 
 pub fn build_model(
     mut config: ModelConfig,
@@ -399,6 +400,25 @@ pub fn build_model(
     let q4e_mtp_embed = embed;
     let q4e_mtp_lm_head = lm_head;
 
+    // MiMo-V2 ships three dense-FFN sliding-window MTP bodies under
+    // `model.mtp.layers.*`, not the Qwen-shaped `MtpWeights`. Rank 0 owns the
+    // proposer; all other ranks skip the namespace at upload.
+    let mimo_mtp_modules =
+        if config.model_type == "mimo_v2" && use_speculative && config.ep_rank == 0 {
+            match crate::weight_loader::load_mimo_mtp_modules(&store, &config, gpu.as_ref()) {
+                Ok(modules) => modules,
+                Err(e) => {
+                    tracing::error!("mimo_v2 MTP module load FAILED: {e:#}");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+    let mimo_mtp_loaded = !mimo_mtp_modules.is_empty();
+    let mimo_mtp_embed = embed;
+    let mimo_mtp_lm_head = lm_head;
+
     // Capability warning: user asked for `--speculative` but the model has no
     // MTP head bundled, so speculative decoding will silently no-op. Surface
     // this loudly so the user knows the flag was inert. Rank 0 only: the
@@ -410,6 +430,7 @@ pub fn build_model(
         && v4_mtp_module.is_none()
         && !q4e_mtp_loaded
         && !native_glm_mtp
+        && !mimo_mtp_loaded
     {
         tracing::warn!(
             "`--speculative` was requested but no MTP weights were loaded for this \
@@ -616,6 +637,14 @@ pub fn build_model(
         comm.as_deref(),
         max_seq_len,
         max_batch_tokens,
+    )?;
+    let swa_slot_plan = swa_evict::plan(
+        &config,
+        &kv_config,
+        max_batch_tokens,
+        max_batch_size,
+        prefix_cache.is_active(),
+        hss_cache_blocks_per_seq.is_some(),
     )?;
 
     if hss_cache_blocks_per_seq.is_some() {
@@ -896,7 +925,12 @@ pub fn build_model(
             }
             let n = match joint_glm_plan {
                 Some(plan) => plan.num_blocks_for_budget(kv_budget),
-                None => kv_budget::blocks_with_aux(&kv_config, kv_budget, aux_bytes_per_token)?,
+                None => match swa_slot_plan.as_ref() {
+                    Some(swa) => {
+                        swa_evict::blocks(swa, &kv_config, kv_budget, aux_bytes_per_token)?
+                    }
+                    None => kv_budget::blocks_with_aux(&kv_config, kv_budget, aux_bytes_per_token)?,
+                },
             };
             let max_kv_tokens = n * kv_block_size;
             let lazy_bf16_term = if derived_reserve > 0 {
@@ -1027,6 +1061,7 @@ pub fn build_model(
         num_kv_blocks,
         gpu.as_ref(),
         glm_cache_plan,
+        swa_slot_plan.as_ref(),
         kv_placement.clone(),
     ) {
         Ok(kv) => kv,
@@ -1043,6 +1078,7 @@ pub fn build_model(
                 num_kv_blocks,
                 gpu.as_ref(),
                 glm_cache_plan,
+                swa_slot_plan.as_ref(),
                 kv_placement,
             )?
         }
@@ -1074,6 +1110,28 @@ pub fn build_model(
     // shares embed_tokens + lm_head with the target). DenseWeight is Copy
     // so this clones the device pointer cheaply.
     let target_embed_for_dflash = embed.weight;
+    // A drafter's trained mask vector replaces the target's (untrained,
+    // zero on MiMo) `mask_token_id` row, as SGLang's DFlash worker does.
+    if let Some(args) = dflash_args.as_ref()
+        && let (Some(bytes), Some(sub)) = (
+            args.drafter_config.mask_embedding.as_deref(),
+            args.drafter_config.dflash_config.as_ref(),
+        )
+    {
+        anyhow::ensure!(
+            bytes.len() == config.hidden_size * 2
+                && (sub.mask_token_id as usize) < args.drafter_config.vocab_size,
+            "DFlash mask embedding does not fit the target embedding table"
+        );
+        let row = embed
+            .weight
+            .offset(sub.mask_token_id as usize * config.hidden_size * 2);
+        gpu.copy_h2d(bytes, row)?;
+        tracing::info!(
+            "DFlash: trained mask embedding -> target row {}",
+            sub.mask_token_id
+        );
+    }
     let target_lm_head_for_dflash = lm_head.weight;
     // NVFP4 lm_head (Copy) shared with the DFlash drafter so its final logits
     // GEMM uses w4a16 instead of a BF16 dense_gemm on NVFP4-packed bytes.
@@ -1097,7 +1155,7 @@ pub fn build_model(
     // illegal address in run_mtp_propose_multi; the fp8 and bf16 heads never
     // reach this free, and NUM_DRAFTS=0 never reads the head).
     let drafter_holds_bf16_head =
-        q4e_mtp_loaded || v4_mtp_module.is_some() || glm5_mtp_head.is_some();
+        q4e_mtp_loaded || v4_mtp_module.is_some() || glm5_mtp_head.is_some() || mimo_mtp_loaded;
     let lm_head = if !drafter_holds_bf16_head
         && super::lm_head_setup::bf16_lm_head_is_dead(
             lm_head.weight,
@@ -1239,6 +1297,33 @@ pub fn build_model(
                     "Failed to build qwen4_exp MTP proposer: {e:#}. Speculative decoding disabled."
                 );
             }
+        }
+    }
+
+    // ── Step 6d: MiMo-V2 MTP proposer (optional) ──
+    if !mimo_mtp_modules.is_empty() {
+        match crate::layers::MimoMtpHead::new(
+            mimo_mtp_modules,
+            mimo_mtp_embed,
+            mimo_mtp_lm_head,
+            model.gpu_backend(),
+            model.config_ref(),
+            max_seq_len,
+            kv_block_size,
+            mtp_vocab_size as usize,
+            max_batch_size,
+            num_kv_blocks,
+        ) {
+            Ok(head) => {
+                let modules = head.num_modules();
+                model.set_dflash_proposer(std::sync::Arc::new(head));
+                tracing::info!(
+                    "mimo_v2 MTP speculative decoding: ENABLED ({modules} modules, dense-FFN SWA bodies)"
+                );
+            }
+            Err(e) => tracing::warn!(
+                "Failed to build mimo_v2 MTP proposer: {e:#}. Speculative decoding disabled."
+            ),
         }
     }
 

@@ -17,6 +17,7 @@ pub mod glm_sp;
 pub mod glm_sp_moe_seam;
 pub mod glm_sp_overlap;
 pub mod glm_sp_uneven;
+pub mod mimo_mtp;
 pub mod moe;
 mod moe_grouped_decode;
 pub mod mtp_head;
@@ -53,6 +54,7 @@ pub(crate) use glm5_kda::{
     kda_batched_ffn_enabled, kda_conv_planes_enabled, kda_flash_prefill_word,
     kda_multi_seq_enabled, kda_side_proj_lt_enabled, verify_fused_tp_hc_enabled,
 };
+pub use mimo_mtp::{MimoMtpHead, MimoMtpModule};
 pub use moe::MoeLayer;
 pub use moe_grouped_decode::{
     moe_grouped_decode_decide, moe_grouped_decode_enabled, moe_grouped_decode_for,

@@ -32,7 +32,13 @@ impl PagedKvCache {
         spec.block_bytes(self.config.block_size)?;
         let tails = tail_slots
             .map(|plan| {
-                super::tail_slots::TailSlots::new(self.num_blocks, plan, gpu, &self.placement)
+                super::tail_slots::TailSlots::new(
+                    self.num_blocks,
+                    plan,
+                    plan.capacity(),
+                    gpu,
+                    &self.placement,
+                )
             })
             .transpose()?;
         let tail_entries = tails.as_ref().map_or(self.num_blocks, |t| t.capacity());

@@ -139,6 +139,26 @@ impl Qwen3AttentionLayer {
             None
         };
 
+        // MiMo: chunk 0 has no history, so attention reads the chunk's K/V
+        // contiguously (this metadata carries no device block table).
+        if self.mimo.is_some() {
+            anyhow::ensure!(
+                batched_meta.is_none(),
+                "MiMo layer {} does not support batched prefill",
+                self.attn_layer_idx
+            );
+            return self.mimo_attend_prefill(
+                ctx,
+                kv_cache,
+                normed,
+                num_tokens,
+                0,
+                kv_write_start,
+                true,
+                stream,
+            );
+        }
+
         // ── MLA 2-step prefill ── (extracted to cache_skip_mla.rs)
         if let Some(ref mla) = self.mla {
             let args = super::cache_skip_mla::CacheSkipMlaArgs {

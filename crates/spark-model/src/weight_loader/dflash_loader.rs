@@ -137,6 +137,21 @@ pub fn store_has_dflash_weights(store: &WeightStore) -> bool {
 /// Under TP the drafter is replicated, not sharded — `tp_size>1` produces
 /// the same per-rank result as `tp_size=1`. Memory cost: ~948 MB BF16
 /// per rank, trivially below the 119 GB GB10 budget.
+fn scale_bf16_in_place(
+    gpu: &dyn GpuBackend,
+    ptr: spark_runtime::gpu::DevicePtr,
+    numel: usize,
+    scale: f32,
+) -> Result<()> {
+    let mut bytes = vec![0u8; numel * 2];
+    gpu.copy_d2h(ptr, &mut bytes)?;
+    for v in bytes.chunks_exact_mut(2) {
+        let x = half::bf16::from_le_bytes([v[0], v[1]]).to_f32() * scale;
+        v.copy_from_slice(&half::bf16::from_f32(x).to_le_bytes());
+    }
+    gpu.copy_h2d(&bytes, ptr)
+}
+
 pub fn load_dflash_weights(
     drafter_store: &WeightStore,
     drafter_config: &DflashConfig,
@@ -177,6 +192,10 @@ pub fn load_dflash_weights(
         Some(dropped) => Ok(dropped),
         None => dense_auto(drafter_store, name, gpu),
     };
+    // V scale (vLLM `v = v * v_scale`) folded into `v_proj` once.
+    let value_scale = drafter_config.attention_value_scale();
+    let v_numel =
+        drafter_config.num_key_value_heads * drafter_config.head_dim * drafter_config.hidden_size;
     for i in 0..layer_count {
         let lp = format!("{prefix}layers.{i}");
         let sink_name = format!("{lp}.self_attn.attention_sink_bias");
@@ -238,6 +257,9 @@ pub fn load_dflash_weights(
             attention_conv,
             mlp_conv,
         };
+        if value_scale != 1.0 {
+            scale_bf16_in_place(gpu, layer.v_proj.weight, v_numel, value_scale)?;
+        }
         layers.push(layer);
     }
 

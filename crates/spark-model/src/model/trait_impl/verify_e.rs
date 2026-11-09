@@ -596,7 +596,10 @@ impl TransformerModel {
                 }
                 let layer_type = self.config.layer_type(layer_idx);
 
-                if layer_type == LayerType::FullAttention {
+                if matches!(
+                    layer_type,
+                    LayerType::FullAttention | LayerType::SlidingAttention
+                ) {
                     let mut refs: Vec<&mut (dyn LayerState + 'static)> = seqs
                         .iter_mut()
                         .map(|s| s.layer_states[layer_idx].as_mut())

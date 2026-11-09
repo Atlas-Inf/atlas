@@ -70,6 +70,11 @@ impl Qwen3AttentionLayer {
             .attn_metadata
             .expect("attention layer requires pre-uploaded metadata");
 
+        if self.mimo.is_some() {
+            let o_out = ctx.buffers.norm_output();
+            return self.mimo_attend_decode(ctx, kv_cache, normed, &meta, o_out, stream);
+        }
+
         // ── MLA 2-step decode ── (extracted to attention_forward_mla.rs)
         if let Some(ref mla) = self.mla {
             let args = super::attention_forward_mla::DecodeMlaArgs {

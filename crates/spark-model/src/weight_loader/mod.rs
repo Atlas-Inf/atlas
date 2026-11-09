@@ -16,11 +16,13 @@
 
 pub(crate) mod deepseek_v4;
 pub mod dflash_loader;
+pub mod dflash_mask_embedding;
 pub mod dflash_preshrink;
 mod gemma4;
 pub(crate) mod glm5;
 mod laguna;
 mod longcat;
+mod mimo_v2;
 mod minimax;
 mod nemotron;
 mod nllb;
@@ -42,6 +44,8 @@ pub use glm5::Glm5WeightLoader;
 pub use glm5::mode as glm5_mode;
 pub use laguna::LagunaWeightLoader;
 pub use longcat::LongcatWeightLoader;
+pub use mimo_v2::MimoV2WeightLoader;
+pub(crate) use mimo_v2::load_mimo_mtp_modules;
 pub use minimax::MinimaxM2WeightLoader;
 pub use nemotron::NemotronHWeightLoader;
 pub use nllb::NllbWeightLoader;

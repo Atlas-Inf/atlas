@@ -88,7 +88,8 @@ impl TransformerModel {
                 .map(|s| (s.chunk_len, eff(s), s.chunk_start, s.is_last_chunk)),
             streams.len(),
             self.buffers.max_batch_tokens(),
-            config_is_mla(&self.config),
+            // MiMo-V2 attention (mimo.rs) is per-stream only, like MLA.
+            config_is_mla(&self.config) || self.config.model_type == "mimo_v2",
             self.config.head_dim,
             self.buffers.scratch_bytes(),
             self.config.num_experts_per_tok,

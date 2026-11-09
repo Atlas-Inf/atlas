@@ -127,6 +127,15 @@ pub(crate) fn resolve_topology(
         }
         config.num_attention_heads /= tp_size;
         config.num_key_value_heads /= tp_size;
+        // MiMo-V2's full-attention KV heads shard by the same TP factor.
+        if config.full_num_key_value_heads > 0 {
+            anyhow::ensure!(
+                config.full_num_key_value_heads.is_multiple_of(tp_size),
+                "TP requires full_num_key_value_heads ({}) divisible by tp_size ({tp_size})",
+                config.full_num_key_value_heads,
+            );
+            config.full_num_key_value_heads /= tp_size;
+        }
         // GDN HeadParallel: linear-attention (SSM) key/value head counts are
         // sharded exactly like attention heads — each rank owns a contiguous
         // head range; the recurrence is head-parallel with one all-reduce after

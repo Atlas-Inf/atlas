@@ -253,15 +253,8 @@ pub(crate) fn load_dflash_drafter(
     let drafter_dir =
         crate::model_resolver::resolve_model_dir(&drafter_id, args.cache_dir.as_deref())
             .context("Failed to resolve DFlash drafter checkpoint")?;
-    let drafter_config_json = std::fs::read_to_string(drafter_dir.join("config.json"))
-        .with_context(|| {
-            format!(
-                "Failed to read drafter config.json at {}",
-                drafter_dir.display()
-            )
-        })?;
     let drafter_config =
-        spark_model::weight_loader::dflash_loader::parse_dflash_config(&drafter_config_json)?;
+        spark_model::weight_loader::dflash_mask_embedding::load_drafter_config(&drafter_dir)?;
     // Only the head proposes. A worker keeps the drafter's config (its target
     // capture layers shape the verify rows and SSM pools) but no weights, so
     // no proposer is built there and its memory goes to the KV pool. Under
@@ -278,8 +271,7 @@ pub(crate) fn load_dflash_drafter(
             drafter_config,
         )));
     }
-    // The fast loader stores the same tensors and bytes
-    // (`dflash_fast_load_check`: 0.6 s against 5.3 s for the 2.2 GB drafter).
+    // Same tensors and bytes, 0.6 s vs 5.3 s (`dflash_fast_load_check`).
     let mut drafter_store = if use_fast_load(args) {
         #[cfg(unix)]
         {
@@ -405,8 +397,7 @@ fn skip_activation_scales(config: &ModelConfig) -> bool {
     matches!(config.model_type.as_str(), "qwen4_exp")
 }
 
-/// Whether this model's loader builds no MTP head, so `mtp.*` need not be
-/// uploaded at all.
+/// Whether this model's loader builds no MTP head, so `mtp.*` need not be uploaded.
 ///
 /// Measured, not estimated: `mtp.*` on this checkpoint is 5.21 GB (31 tensors,
 /// 5.03 GB of which is the stacked BF16 expert pair) — not the ~1.5 GB an
@@ -414,12 +405,9 @@ fn skip_activation_scales(config: &ModelConfig) -> bool {
 /// against, and on a box where 0.90 utilization is already near the boot floor
 /// it is the difference between a usable KV cache and none.
 fn skip_mtp(config: &ModelConfig, args: &cli::ServeArgs) -> bool {
-    // qwen4_exp now BUILDS an MTP head, but only under `--speculative`
-    // (`weight_loader/qwen4_exp/mtp.rs`). Without the flag the `mtp.*` upload is
-    // 5.21 GB of BF16 held resident for nothing, which on a 119.6 GB unified box
-    // comes straight out of the KV cache. With the flag it is the drafter, on
-    // rank 0 only (`factory::build`): every other rank skips it as well.
-    matches!(config.model_type.as_str(), "qwen4_exp") && (!args.speculative || config.ep_rank != 0)
+    // Both have rank-0-only MTP loaders (`mtp.*` / `model.mtp.*` tensors).
+    matches!(config.model_type.as_str(), "qwen4_exp" | "mimo_v2")
+        && (!args.speculative || config.ep_rank != 0)
 }
 
 #[cfg(test)]
@@ -428,20 +416,22 @@ mod tests {
     use atlas_core::config::ModelConfig;
     use clap::Parser as _;
 
-    /// qwen4_exp's `mtp.*` (5.21 GB) is uploaded only where it drafts: rank 0
-    /// under `--speculative`.
+    /// qwen4_exp's `mtp.*` (5.21 GB) and MiMo's `model.mtp.*` are uploaded only
+    /// where they draft: rank 0 under `--speculative`.
     #[test]
-    fn qwen4_exp_mtp_is_uploaded_on_the_drafting_rank_only() {
+    fn dedicated_mtp_is_uploaded_on_the_drafting_rank_only() {
         let args = |more: &[&str]| {
             let argv = ["spark", "some/model"].iter().chain(more);
             crate::cli::ServeArgs::parse_from(argv)
         };
-        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
-        config.model_type = "qwen4_exp".to_string();
-        assert!(skip_mtp(&config, &args(&[])));
-        assert!(!skip_mtp(&config, &args(&["--speculative"])));
-        config.ep_rank = 1;
-        assert!(skip_mtp(&config, &args(&["--speculative"])));
+        for model_type in ["qwen4_exp", "mimo_v2"] {
+            let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+            config.model_type = model_type.to_string();
+            assert!(skip_mtp(&config, &args(&[])));
+            assert!(!skip_mtp(&config, &args(&["--speculative"])));
+            config.ep_rank = 1;
+            assert!(skip_mtp(&config, &args(&["--speculative"])));
+        }
     }
 
     #[test]

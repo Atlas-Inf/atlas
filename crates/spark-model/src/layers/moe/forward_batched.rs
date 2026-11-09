@@ -309,21 +309,12 @@ impl MoeLayer {
                         .as_ref()
                         .expect("gate_ptrs_t under unified_t");
                     let up_t = self.up_ptrs_t.as_ref().expect("up_ptrs_t under unified_t");
-                    ops::moe_expert_gate_up_shared_t(
-                        ctx.gpu,
-                        self.e8m0_or(
-                            self.moe_expert_gate_up_shared_t_k,
-                            self.moe_expert_gate_up_shared_t_e8m0_k,
-                            "decode gate_up_shared_t",
-                        ),
+                    self.decode_gate_up_shared_t(
+                        ctx,
                         input_t,
-                        gate_t.packed_ptrs,
-                        gate_t.scale_ptrs,
-                        gate_t.scale2_vals,
+                        gate_t,
+                        up_t,
                         expert_gate_out,
-                        up_t.packed_ptrs,
-                        up_t.scale_ptrs,
-                        up_t.scale2_vals,
                         expert_up_out,
                         indices_dev,
                         sh_gate_t,
@@ -334,6 +325,7 @@ impl MoeLayer {
                         h,
                         top_k,
                         stream,
+                        "decode gate_up_shared_t",
                     )?;
                 }
                 // SOLID Incr-4: fold gate/up delta BEFORE the fused silu+down.
@@ -348,18 +340,11 @@ impl MoeLayer {
                     ctx,
                     stream,
                 )?;
-                ops::moe_expert_silu_down_shared_t(
-                    ctx.gpu,
-                    self.e8m0_or(
-                        self.moe_expert_silu_down_shared_t_k,
-                        self.moe_expert_silu_down_shared_t_e8m0_k,
-                        "decode silu_down_shared_t",
-                    ),
+                self.decode_silu_down_shared_t(
+                    ctx,
                     expert_gate_out,
                     expert_up_out,
-                    down_t.packed_ptrs,
-                    down_t.scale_ptrs,
-                    down_t.scale2_vals,
+                    down_t,
                     expert_down_out,
                     indices_dev,
                     shared_gate_scratch,
@@ -370,6 +355,7 @@ impl MoeLayer {
                     inter,
                     top_k,
                     stream,
+                    "decode silu_down_shared_t",
                 )?;
             } else {
                 // NVFP4 path

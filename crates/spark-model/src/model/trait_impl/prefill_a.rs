@@ -83,8 +83,10 @@ impl TransformerModel {
         let prefix_match = if self.tokens_have_vision_pad(tokens) {
             spark_runtime::prefix_cache::PrefixMatch::empty()
         } else {
-            self.prefix_cache
-                .lookup_whole_blocks(tokens, bs, seq.session_hash, seq.adapter_id)
+            let found =
+                self.prefix_cache
+                    .lookup_whole_blocks(tokens, bs, seq.session_hash, seq.adapter_id);
+            self.swa_cap_prefix_match(tokens, seq, found, &mut kv_cache)
         };
         let mut kv_write_start = prefix_match.matched_tokens;
         // Record the original prompt length — cache_sequence() uses it later
