@@ -152,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn bidir_head_reads_its_first_branchs_tail() {
+    fn bidir_head_reads_its_first_branch_tail() {
         let prefix: Vec<u32> = (0..37).collect();
         let (b1, b2) = ([vec![100, 101], vec![200]], [vec![300]]);
         let short = vec![5, 6];
