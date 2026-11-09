@@ -47,6 +47,8 @@ pub(crate) struct MimoKernels {
     pub prefill: KernelHandle,
     /// Tensor-core paged prefill; null when the kernel build predates it.
     pub prefill_tc: KernelHandle,
+    /// FP8 tensor-core paged prefill; null when the kernel build predates it.
+    pub prefill_tc_fp8: KernelHandle,
 }
 
 impl MimoKernels {
@@ -62,6 +64,11 @@ impl MimoKernels {
             decode_reduce: k("mimo_paged_decode_reduce")?,
             prefill: k("mimo_prefill_attn")?,
             prefill_tc: crate::layers::try_kernel(gpu, "mimo_prefill_tc", "mimo_prefill_tc"),
+            prefill_tc_fp8: crate::layers::try_kernel(
+                gpu,
+                "mimo_prefill_tc_fp8",
+                "mimo_prefill_tc_fp8",
+            ),
         })
     }
 }
@@ -418,9 +425,9 @@ impl Qwen3AttentionLayer {
         };
         let attn = ctx.buffers.attn_output();
         let (kv_fp8, k_scale, v_scale) = self.mimo_kv_fp8();
-        // Chunked (paged) prefill uses the tensor-core kernel when built;
-        // chunk-0 contiguous prefill, stale kernel builds, and FP8 KV (no TC
-        // FP8 variant yet) keep the scalar path.
+        // Chunked (paged) prefill uses a tensor-core kernel when built:
+        // prefill_tc for BF16 KV, prefill_tc_fp8 for FP8 KV. Chunk-0
+        // contiguous prefill and stale kernel builds keep the scalar path.
         if !contiguous && kv_fp8 == 0 && m.kernels.prefill_tc.0 != 0 {
             let kv_len = (seq_len_start + num_tokens) as u32;
             KernelLaunch::new(ctx.gpu, m.kernels.prefill_tc)
@@ -441,6 +448,31 @@ impl Qwen3AttentionLayer {
                 .arg_u32(m.window)
                 .arg_u32(1)
                 .arg_f32(m.scale)
+                .arg_f32(m.out_scale)
+                .arg_ptr(m.sinks)
+                .launch(stream)?;
+        } else if !contiguous && kv_fp8 != 0 && m.kernels.prefill_tc_fp8.0 != 0 {
+            let kv_len = (seq_len_start + num_tokens) as u32;
+            KernelLaunch::new(ctx.gpu, m.kernels.prefill_tc_fp8)
+                .grid([m.nq, div_ceil(n, MIMO_TC_BR), 1])
+                .block([128, 1, 1])
+                .arg_ptr(q)
+                .arg_ptr(k_src)
+                .arg_ptr(v_src)
+                .arg_ptr(attn)
+                .arg_ptr(block_table)
+                .arg_u32(n)
+                .arg_u32(kv_len)
+                .arg_u32(seq_len_start as u32)
+                .arg_u32(m.nq)
+                .arg_u32(m.nkv)
+                .arg_u32(kv_cache.block_size() as u32)
+                .arg_ptr(kv_cache.swa_slot_map_ptr(self.attn_layer_idx))
+                .arg_u32(m.window)
+                .arg_u32(1)
+                .arg_f32(m.scale)
+                .arg_f32(k_scale)
+                .arg_f32(v_scale)
                 .arg_f32(m.out_scale)
                 .arg_ptr(m.sinks)
                 .launch(stream)?;
