@@ -16,7 +16,10 @@ backbone, official checkpoint served as-is (~173 GB → ~89 GB per rank).
 
 ## Phase-1 limits (by design)
 
-- `--kv-cache-dtype bf16` only; the loader rejects other KV dtypes.
+- KV cache defaults to BF16. FP8 KV (`--kv-cache-dtype fp8`) is supported
+  opt-in and hardware-validated (see
+  [FP8 KV cache](#fp8-kv-cache-kv-cache-dtype-fp8-opt-in) and the validation
+  entry below).
 - No MTP / speculative decoding (3 MTP modules in `model_mtp.safetensors` are skipped).
 - No vision / audio (towers are dead namespaces at load).
 - Batched multi-stream prefill is disabled for MiMo (per-stream prefill only).
@@ -88,6 +91,19 @@ launcher default; `FP8_QKV=1` already was).
   vs cold yields different greedy continuations on this model (chunked
   numerics) — don't A/B cached vs uncached runs as if they were the same
   arm.
+- **FP8 KV + tensor-core FP8 prefill** (`--kv-cache-dtype fp8`, fork
+  `fef0a7b8`, image `mimo-fp8tc`, TP=2+EP=2 FP8 QKV chan4 γ=4 NVFP4
+  lm_head, same-session vs BF16-KV and FP8-v1 controls): the lane-capacity
+  lever. KV pool **2.36× at batch=1** (1,447,024 vs 613,424 tokens) and
+  **3.12× at batch=2** (1,321,648 vs 423,168) — ~5× 262K lanes' worth of
+  tokens at batch=2. Correctness PASS: ppl 3.028 identical to BF16,
+  46-prompt greedy 22/46 byte-identical with stylistic-only diffs, all
+  needles incl. the 262K needle (`ZX-42-QUASAR`) pass, DFlash engages
+  normally. Cold 262K TTFT **816.8s vs BF16 ~751s (+8.7%, parity-class)**
+  with `mimo_prefill_tc_fp8` engaged (v1's scalar fallback was ~2539s,
+  3.1× slower). Decode neutral (~13.7 tok/s n=3, within drift). FP8 KV
+  stays **opt-in**; a MODEL.toml default flip awaits one more cycle (real
+  2×262K concurrent run + optional per-group scale check).
 
 Off-hardware checks that still apply: `cargo test -p atlas-core --lib
 mimo_v2` against the published `config.json`; `cargo build -p
@@ -299,6 +315,36 @@ in `mimo_attn.cu`. The fork lives in this target only
 the DFlash drafter are unaffected. Off-hardware checks: `nvcc -arch=sm_121a`
 compile, fmt/clippy/license/typos; correctness and TTFT are validated on the
 fork before this is relied on.
+
+## FP8 KV cache (`--kv-cache-dtype fp8`, opt-in)
+
+The paged K/V cache can store FP8 E4M3 (1 byte/element) instead of BF16
+(2 bytes/element), roughly doubling KV-pool capacity — the lever for running
+multiple long-context lanes concurrently. Enabled per-run with
+`--kv-cache-dtype fp8` (explicit flag wins over MODEL.toml, which defaults
+to `bf16`).
+
+- **Layout:** same 192-stride paged NHD layout as BF16, one byte per element;
+  V uses the first 128 dims of each 192-wide head slot as before. Only the
+  stored dtype changes.
+- **Write/read:** `mimo_qkv_rope_cache` quantizes on write
+  (`__nv_cvt_float_to_fp8(value * inv_scale, __NV_SATFINITE, __NV_E4M3)`);
+  decode + scalar prefill dequantize on read in the shared `mimo_load_tile`.
+  Chunk-0 contiguous K/V stays BF16.
+- **Scales:** per-tensor K/V scales via `effective_fp8_scales()`, defaulting
+  to 1.0/1.0 (uncalibrated E4M3 native ±448 range). Proper per-layer
+  calibration is a later quality-margin follow-up, not a blocker.
+- **Prefill:** chunked prefill runs the tensor-core FP8 variant
+  `mimo_prefill_tc_fp8` (`nvfp4/mimo_prefill_tc_fp8.cu`,
+  `ATLAS_ATTN_FP8_SMEM`, `PAD_KV=16` for 16-byte `cp.async` alignment on the
+  192/128 geometry), keeping K/V as raw E4M3 in shared memory and
+  dequantizing in-register before each MMA. BF16 KV keeps `mimo_prefill_tc`;
+  the scalar `mimo_prefill_attn` is the stale-build fallback.
+- **Hardware-validated** (fork `fef0a7b8`): ppl identical to BF16, greedy
+  stylistic-only, needles incl. 262K pass, cold 262K TTFT parity-class
+  (816.8s vs BF16 ~751s), decode neutral, pool 2.36×/3.12× at batch=1/2.
+  Stays **opt-in**; the MODEL.toml default flip awaits a real concurrent
+  long-context lane run.
 
 ## Known risk areas to watch
 
