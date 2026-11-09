@@ -449,10 +449,9 @@ impl SsmStatePool {
             // per-slot shape ((ni-1) H + ni conv + checkpoint).
             let full_h = mtp_total * ni.saturating_sub(1);
             if defer_only {
-                let staging_mb = num_ssm_layers
-                    * mtp_total
-                    * (commit_qkv_slot_bytes + commit_gb_slot_bytes)
-                    / (1024 * 1024);
+                let staging_mb =
+                    num_ssm_layers * mtp_total * (commit_qkv_slot_bytes + commit_gb_slot_bytes)
+                        / (1024 * 1024);
                 tracing::info!(
                     "SSM verify pools: deferred commit only ({mtp_total} slots × {num_ssm_layers} \
                      layers of 16-row staging = {staging_mb} MB); no per-row snapshots or \

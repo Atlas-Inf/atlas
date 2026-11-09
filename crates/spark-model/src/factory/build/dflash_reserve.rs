@@ -2,19 +2,18 @@
 
 //! What a DFlash drafter allocates per sequence after the KV pool is sized.
 //!
-//! The drafter head is built after the target (it needs the target's embed
-//! and LM head), so its paged KV pool, sized `per-seq blocks × max batch`,
-//! lands after the KV budget; and every sequence that speculates takes a
-//! context accumulator (`acquire_ctx_acc`: `ctx_window` rows of the captured
-//! target hiddens) at request time. Neither was in the budget. At eight
-//! sequences the OOM guard absorbed them (about 2.3 GB on the 27B); at 64 they
-//! are 18 GB for DFlash2 and twice that for two drafters, and the unified
-//! memory ran out mid-run (swap, then a stalled server). The budget now
-//! reserves them.
+//! The drafter head itself (its paged KV pool, batch scratch, NVFP4 twins,
+//! DSpine tables) is built before the KV budget, so the budget measures it.
+//! What stays outside is the context accumulator every sequence takes at
+//! request time (`acquire_ctx_acc`: `ctx_window` rows of the captured target
+//! hiddens, 200 MiB a sequence for DFlash2, 377 MiB for the two drafters'
+//! union capture). Unreserved, 64 sequences of it ran the unified memory out
+//! mid-run (swap, then a stalled server). The budget reserves it.
 
-use crate::factory::DflashBuildArgs;
+#[cfg(test)]
 use crate::weight_loader::DflashConfig;
 
+#[cfg(test)]
 const BLOCK: usize = 16;
 const BF16: usize = 2;
 
@@ -29,28 +28,22 @@ fn ctx_capacity(max_seq_len: usize) -> usize {
 }
 
 /// One drafter's paged KV per sequence, as `from_weights` sizes its pool.
+#[cfg(test)]
 fn drafter_kv_per_seq(c: &DflashConfig, ctx: usize, gamma: usize) -> usize {
     let blocks = (ctx + gamma + 1) / BLOCK + 1;
     blocks * BLOCK * c.num_hidden_layers * 2 * c.num_key_value_heads * c.head_dim * BF16
 }
 
-/// Bytes the drafter(s) take after the KV budget for `max_batch` sequences.
+/// The context accumulators of `max_batch` sequences.
 pub(super) fn bytes(
-    args: &DflashBuildArgs<'_>,
     capture_layers: usize,
     target_hidden: usize,
     max_seq_len: usize,
     max_batch: usize,
 ) -> usize {
     let ctx = ctx_capacity(max_seq_len);
-    let gamma = |c: &DflashConfig| args.gamma.map_or(c.block_size(), |g| g.min(c.block_size()));
-    let mut per_seq = drafter_kv_per_seq(&args.drafter_config, ctx, gamma(&args.drafter_config));
-    if let Some((_, alt)) = args.alt.as_ref() {
-        per_seq += drafter_kv_per_seq(alt, ctx, gamma(alt));
-    }
     // The accumulator holds the union capture (one per sequence).
-    per_seq += (ctx + 1) * capture_layers * target_hidden * BF16;
-    per_seq * max_batch.max(1)
+    (ctx + 1) * capture_layers * target_hidden * BF16 * max_batch.max(1)
 }
 
 #[cfg(test)]
@@ -67,7 +60,10 @@ mod tests {
                 "vocab_size":248320,"block_size":8}"#,
         )
         .unwrap();
-        assert_eq!(drafter_kv_per_seq(&c, 4096, 8), 257 * 16 * 5 * 2 * 8 * 128 * 2);
+        assert_eq!(
+            drafter_kv_per_seq(&c, 4096, 8),
+            257 * 16 * 5 * 2 * 8 * 128 * 2
+        );
         let acc = 4097 * 5 * 5120 * 2;
         assert_eq!(acc / (1 << 20), 200);
     }
