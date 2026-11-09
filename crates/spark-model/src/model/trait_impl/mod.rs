@@ -1269,6 +1269,9 @@ impl Model for TransformerModel {
     fn reclaim_prefix_blocks(&self, num_blocks: usize) -> usize {
         self.reclaim_prefix_blocks_dispatch(num_blocks)
     }
+    fn cached_prefix_blocks(&self, tokens: &[u32], adapter_slot: i32) -> usize {
+        self.cached_prefix_blocks_dispatch(tokens, adapter_slot)
+    }
     fn start_checkpoint_async(&self, seq: &mut SequenceState) -> Result<()> {
         self.gdn_fuse_flush_all()?;
         self.start_checkpoint_async_dispatch(seq)

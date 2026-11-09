@@ -88,6 +88,7 @@ pub mod spec_stats;
 mod spec_step;
 mod ssm_decode_ring;
 mod strict_spec;
+mod swap_gate;
 mod teardown;
 #[cfg(test)]
 mod test_support;
@@ -648,8 +649,14 @@ pub fn run(
         // ── Swap-out: evict active sequences to disk when blocks run low ──
         if let Some(ref mut spill) = spill_manager {
             for req in &new_reqs {
-                let prompt_len = req.prompt_len();
-                let blocks_needed = prompt_len / block_size + 1;
+                // Only the blocks this request will allocate: its cached prefix
+                // is handed over by the lookup (`swap_gate`).
+                let blocks_needed = swap_gate::blocks_for_admission(
+                    &*model,
+                    &req.prompt_tokens_arc(),
+                    req.adapter_slot(),
+                    block_size,
+                );
                 // Reclaim from the prefix cache BEFORE paying disk I/O for a live
                 // sequence. Cached blocks are a pure optimization; a swapped-out
                 // sequence is in-flight work that costs a write now and a read

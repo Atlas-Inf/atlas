@@ -1739,6 +1739,14 @@ pub trait Model: Send + Sync {
         0
     }
 
+    /// Whole blocks of `tokens` the prefix cache would hand a new request
+    /// under `adapter_slot` — a read-only probe (no refs, no LRU touch).
+    /// Admission subtracts them so it never reclaims the prefix it is about
+    /// to reuse. Default 0: no prefix cache.
+    fn cached_prefix_blocks(&self, _tokens: &[u32], _adapter_slot: i32) -> usize {
+        0
+    }
+
     /// Return the default CUDA stream handle.
     fn default_stream(&self) -> u64 {
         0
