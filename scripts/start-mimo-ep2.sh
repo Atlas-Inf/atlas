@@ -3,8 +3,10 @@
 #
 # The checkpoint is ~173 GB (native MXFP4 experts, FP8 attention), so each
 # rank holds half of the 256 experts (~89 GB). Validated limits:
-#   * --kv-cache-dtype bf16 only (the QK192/V128 attention kernels read a
-#     BF16 paged cache; the loader rejects other KV dtypes)
+#   * --kv-cache-dtype fp8 by default (KV_DTYPE=bf16 opts out): FP8 E4M3
+#     halves KV bytes (~2-3x pool) with quality identical to BF16 on the
+#     hardware gate; 4x262K concurrent lanes proven at util 0.85, 3x262K
+#     at 0.84. See docs/MIMO-V2.6-FLASH.md.
 #   * TP_SIZE=2 (default): attention QKV/o_proj shard by head across the two
 #     Sparks (TP all-reduce per layer); experts stay EP=2. Raises the KV pool
 #     ~2.86x (1,456,864 vs 508,576 max KV tokens at util 0.93) at a ~5% decode
@@ -30,7 +32,7 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 PORT="${PORT:-8888}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-16384}"
-KV_DTYPE="${KV_DTYPE:-bf16}"
+KV_DTYPE="${KV_DTYPE:-fp8}"
 MAX_BATCH="${MAX_BATCH:-1}"
 TP_SIZE="${TP_SIZE:-2}"
 EP_SIZE="${EP_SIZE:-2}"

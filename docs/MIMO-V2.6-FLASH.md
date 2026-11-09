@@ -16,10 +16,9 @@ backbone, official checkpoint served as-is (~173 GB → ~89 GB per rank).
 
 ## Phase-1 limits (by design)
 
-- KV cache defaults to BF16. FP8 KV (`--kv-cache-dtype fp8`) is supported
-  opt-in and hardware-validated (see
-  [FP8 KV cache](#fp8-kv-cache-kv-cache-dtype-fp8-opt-in) and the validation
-  entry below).
+- KV cache defaults to FP8 E4M3 (`default_kv_dtype = "fp8"` in MODEL.toml;
+  BF16 remains available via `--kv-cache-dtype bf16`). Hardware-validated —
+  see [FP8 KV cache](#fp8-kv-cache-default) and the validation entries below.
 - No MTP / speculative decoding (3 MTP modules in `model_mtp.safetensors` are skipped).
 - No vision / audio (towers are dead namespaces at load).
 - Batched multi-stream prefill is disabled for MiMo (per-stream prefill only).
@@ -102,14 +101,17 @@ launcher default; `FP8_QKV=1` already was).
   normally. Cold 262K TTFT **816.8s vs BF16 ~751s (+8.7%, parity-class)**
   with `mimo_prefill_tc_fp8` engaged (v1's scalar fallback was ~2539s,
   3.1× slower). Decode neutral (~13.7 tok/s n=3, within drift).
-- **Concurrent 262K lanes** (MAX_BATCH=4, FP8 KV+TC, SWA_EVICT=1, util
-  0.84): 2× and 3× cold 262K both PASS — per-lane decode ~14.7–15.0
-  tok/s at solo parity, TTFT ~solo (~830s vs 817s), prefills serialize
-  then decode overlaps, no stall, no cross-contamination, DFlash on every
-  lane. Pool at batch=4 = 1,021,824 tokens: fits 3×262K (786K) with
-  headroom but NOT 4×262K (1,048,576; short 2.6%) — 4 lanes needs util
-  ~0.86+. BF16 KV cannot fit even 2×262K (423K pool). FP8 KV stays
-  **opt-in** pending a util-0.86 4-lane confirmation before the default flip.
+- **Concurrent 262K lanes** (MAX_BATCH=4, FP8 KV+TC, SWA_EVICT=1): 2×, 3×
+  and **4×** cold 262K all PASS. At util 0.84 the batch=4 pool is
+  1,021,824 tokens (fits 3×262K, 2.6% short of 4×); at **util 0.85** the
+  pool is **1,256,672 tokens** (~20% headroom over the 1,048,576 needed)
+  and four simultaneous cold ~262K requests all completed — per-lane
+  decode 14.26–14.58 tok/s (solo parity), TTFT ~820s each (prefills
+  serialize back-to-back, decode phases overlap; aggregate ~57 tok/s
+  during overlap), all needles `ZX-42-QUASAR`, no stall, no
+  cross-contamination, DFlash on every lane. BF16 KV cannot fit even
+  2×262K (423K pool). **FP8 KV is the MODEL.toml default**; 4×262K needs
+  `--gpu-memory-utilization ≥ ~0.85`, 3×262K works at 0.84.
 
 Off-hardware checks that still apply: `cargo test -p atlas-core --lib
 mimo_v2` against the published `config.json`; `cargo build -p
@@ -322,13 +324,13 @@ the DFlash drafter are unaffected. Off-hardware checks: `nvcc -arch=sm_121a`
 compile, fmt/clippy/license/typos; correctness and TTFT are validated on the
 fork before this is relied on.
 
-## FP8 KV cache (`--kv-cache-dtype fp8`, opt-in)
+## FP8 KV cache (default)
 
-The paged K/V cache can store FP8 E4M3 (1 byte/element) instead of BF16
+The paged K/V cache stores FP8 E4M3 (1 byte/element) instead of BF16
 (2 bytes/element), roughly doubling KV-pool capacity — the lever for running
-multiple long-context lanes concurrently. Enabled per-run with
-`--kv-cache-dtype fp8` (explicit flag wins over MODEL.toml, which defaults
-to `bf16`).
+multiple long-context lanes concurrently. It is the MODEL.toml default
+(`default_kv_dtype = "fp8"`); `--kv-cache-dtype bf16` opts back out (an
+explicit flag always wins).
 
 - **Layout:** same 192-stride paged NHD layout as BF16, one byte per element;
   V uses the first 128 dims of each 192-wide head slot as before. Only the
@@ -349,10 +351,11 @@ to `bf16`).
 - **Hardware-validated** (fork `fef0a7b8`): ppl identical to BF16, greedy
   stylistic-only, needles incl. 262K pass, cold 262K TTFT parity-class
   (816.8s vs BF16 ~751s), decode neutral, pool 2.36×/3.12× at batch=1/2.
-  Concurrent cold 262K lanes at MAX_BATCH=4/util 0.84: 2× and 3× PASS at
-  solo-parity per-lane tok/s (~14.7–15.0), no stall/contamination; pool
-  1,021,824 fits 3×262K but not 4×262K (needs util ~0.86+). Stays
-  **opt-in** pending that 4-lane confirmation.
+  Concurrent cold 262K lanes at MAX_BATCH=4: 2× and 3× PASS at util 0.84,
+  and **4× PASS at util 0.85** (pool 1,256,672 tokens, ~20% headroom;
+  per-lane decode 14.26–14.58 tok/s, TTFT ~820s, no stall/contamination,
+  DFlash on every lane). FP8 KV is the **default**; 4×262K needs
+  `--gpu-memory-utilization ≥ ~0.85`.
 
 ## Known risk areas to watch
 

@@ -77,8 +77,11 @@ presence_penalty = 0.0
 [behavior]
 enable_loop_watchdog = true
 thinking_default = false
-# The MiMo attention path (mimo.rs) only reads/writes a BF16 paged cache.
-default_kv_dtype = "bf16"
+# FP8 KV is the hardware-validated default: quality identical to BF16
+# (ppl/greedy/needles), ~2-3x KV pool, and 4x262K concurrent lanes proven at
+# gpu-memory-utilization 0.85 (3x262K at 0.84). BF16 stays available via
+# --kv-cache-dtype bf16. See docs/MIMO-V2.6-FLASH.md.
+default_kv_dtype = "fp8"
 tool_call_parser = "qwen3_coder"
 default_num_drafts = 3
 
