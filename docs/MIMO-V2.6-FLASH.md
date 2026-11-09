@@ -101,9 +101,15 @@ launcher default; `FP8_QKV=1` already was).
   needles incl. the 262K needle (`ZX-42-QUASAR`) pass, DFlash engages
   normally. Cold 262K TTFT **816.8s vs BF16 ~751s (+8.7%, parity-class)**
   with `mimo_prefill_tc_fp8` engaged (v1's scalar fallback was ~2539s,
-  3.1× slower). Decode neutral (~13.7 tok/s n=3, within drift). FP8 KV
-  stays **opt-in**; a MODEL.toml default flip awaits one more cycle (real
-  2×262K concurrent run + optional per-group scale check).
+  3.1× slower). Decode neutral (~13.7 tok/s n=3, within drift).
+- **Concurrent 262K lanes** (MAX_BATCH=4, FP8 KV+TC, SWA_EVICT=1, util
+  0.84): 2× and 3× cold 262K both PASS — per-lane decode ~14.7–15.0
+  tok/s at solo parity, TTFT ~solo (~830s vs 817s), prefills serialize
+  then decode overlaps, no stall, no cross-contamination, DFlash on every
+  lane. Pool at batch=4 = 1,021,824 tokens: fits 3×262K (786K) with
+  headroom but NOT 4×262K (1,048,576; short 2.6%) — 4 lanes needs util
+  ~0.86+. BF16 KV cannot fit even 2×262K (423K pool). FP8 KV stays
+  **opt-in** pending a util-0.86 4-lane confirmation before the default flip.
 
 Off-hardware checks that still apply: `cargo test -p atlas-core --lib
 mimo_v2` against the published `config.json`; `cargo build -p
@@ -343,8 +349,10 @@ to `bf16`).
 - **Hardware-validated** (fork `fef0a7b8`): ppl identical to BF16, greedy
   stylistic-only, needles incl. 262K pass, cold 262K TTFT parity-class
   (816.8s vs BF16 ~751s), decode neutral, pool 2.36×/3.12× at batch=1/2.
-  Stays **opt-in**; the MODEL.toml default flip awaits a real concurrent
-  long-context lane run.
+  Concurrent cold 262K lanes at MAX_BATCH=4/util 0.84: 2× and 3× PASS at
+  solo-parity per-lane tok/s (~14.7–15.0), no stall/contamination; pool
+  1,021,824 fits 3×262K but not 4×262K (needs util ~0.86+). Stays
+  **opt-in** pending that 4-lane confirmation.
 
 ## Known risk areas to watch
 
