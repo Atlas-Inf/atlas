@@ -16,7 +16,7 @@
 #define CHECK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { printf("HIP %s at %s:%d\n", hipGetErrorString(e_), __FILE__, __LINE__); exit(1); } } while (0)
 
 #define RG_KW 4
-template <int MR>
+template <int MR, bool DOT2>
 __global__ __launch_bounds__(32 * RG_KW) void rowgemv(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ Bp, const unsigned char* __restrict__ Bs,
     const float scale2, __nv_bfloat16* __restrict__ C, float* __restrict__ ws, unsigned int N, unsigned int K, unsigned int KS) {
@@ -39,17 +39,24 @@ __global__ __launch_bounds__(32 * RG_KW) void rowgemv(
         const unsigned int pw = *(const unsigned int*)&Bp[(unsigned long long)kp * N + n0];
         const unsigned int tl = e2m1x4_off12(pw & 0x0F0F0F0Fu), th = e2m1x4_off12((pw >> 4) & 0x0F0F0F0Fu);
         float wl[4], wh[4];
+        unsigned int w2[4];
         #pragma unroll
         for (int c = 0; c < 4; c++) {   // bf16-round the weight exactly as m128's smem tile does
             wl[c] = __bfloat162float(__float2bfloat16((float)(int)(((tl >> (8 * c)) & 0xFF) - 12) * svh[c]));
             wh[c] = __bfloat162float(__float2bfloat16((float)(int)(((th >> (8 * c)) & 0xFF) - 12) * svh[c]));
+            w2[c] = (__float_as_uint(wl[c]) >> 16) | (__float_as_uint(wh[c]) & 0xFFFF0000u);
         }
         #pragma unroll
         for (int m = 0; m < MR; m++) {
             const unsigned int ap = A32[((unsigned long long)m * K >> 1) + kp];
-            const float al = __uint_as_float(ap << 16), ah = __uint_as_float(ap & 0xFFFF0000u);
-            #pragma unroll
-            for (int c = 0; c < 4; c++) acc[m][c] = fmaf(ah, wh[c], fmaf(al, wl[c], acc[m][c]));
+            if (DOT2) {   // v_dot2_f32_bf16: a.lo*w.lo + a.hi*w.hi + acc in one VALU op
+                #pragma unroll
+                for (int c = 0; c < 4; c++) asm volatile("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc[m][c]) : "v"(ap), "v"(w2[c]));
+            } else {
+                const float al = __uint_as_float(ap << 16), ah = __uint_as_float(ap & 0xFFFF0000u);
+                #pragma unroll
+                for (int c = 0; c < 4; c++) acc[m][c] = fmaf(ah, wh[c], fmaf(al, wl[c], acc[m][c]));
+            }
         }
     }
     __shared__ float red[RG_KW - 1][MR][128];
@@ -97,11 +104,14 @@ int main() {
         __nv_bfloat16 *A, *C0, *C1; float* ws; CHECK(hipMalloc(&A, hA.size() * 2)); CHECK(hipMemcpy(A, hA.data(), hA.size() * 2, hipMemcpyHostToDevice));
         CHECK(hipMalloc(&C0, (size_t)M * N * 2)); CHECK(hipMalloc(&C1, (size_t)M * N * 2)); CHECK(hipMalloc(&ws, (size_t)16 * M * N * 4));
         hipEvent_t e0, e1; CHECK(hipEventCreate(&e0)); CHECK(hipEventCreate(&e1));
-        const unsigned int KSV[] = {0, 1, 2, 4, 8};   // 0 = t_m128 baseline
+        const unsigned int KSV[] = {0, 1, 2, 4, 8, 17, 18, 20, 24};   // 0 = t_m128 baseline; 16+ks = DOT2
         auto launch = [&](unsigned int ks, int c, __nv_bfloat16* C) {
             if (ks == 0) { hipLaunchKernelGGL(w4a16_gemm_t_m128, dim3((N + 127) / 128, (M + 127) / 128), dim3(128), 0, 0, A, P[c], Q[c], 0.01f, C, M, N, K); return; }
-            if (M == 17) hipLaunchKernelGGL(rowgemv<17>, dim3(N / 128, ks), dim3(32 * RG_KW), 0, 0, A, P[c], Q[c], 0.01f, C, ws, N, K, ks);
-            else         hipLaunchKernelGGL(rowgemv<9>,  dim3(N / 128, ks), dim3(32 * RG_KW), 0, 0, A, P[c], Q[c], 0.01f, C, ws, N, K, ks);
+            const bool d2 = ks >= 16; ks = d2 ? ks - 16 : ks;
+            if (M == 17) { if (d2) hipLaunchKernelGGL((rowgemv<17, true>), dim3(N / 128, ks), dim3(32 * RG_KW), 0, 0, A, P[c], Q[c], 0.01f, C, ws, N, K, ks);
+                           else    hipLaunchKernelGGL((rowgemv<17, false>), dim3(N / 128, ks), dim3(32 * RG_KW), 0, 0, A, P[c], Q[c], 0.01f, C, ws, N, K, ks); }
+            else         { if (d2) hipLaunchKernelGGL((rowgemv<9, true>), dim3(N / 128, ks), dim3(32 * RG_KW), 0, 0, A, P[c], Q[c], 0.01f, C, ws, N, K, ks);
+                           else    hipLaunchKernelGGL((rowgemv<9, false>), dim3(N / 128, ks), dim3(32 * RG_KW), 0, 0, A, P[c], Q[c], 0.01f, C, ws, N, K, ks); }
             if (ks > 1) hipLaunchKernelGGL(rowgemv_reduce, dim3((M * N + 255) / 256), dim3(256), 0, 0, ws, C, M * N, ks);
         };
         printf("-- %s M=%u N=%u K=%u (%.1f MB)\n", s.name, M, N, K, wbytes / 1e6);
@@ -113,7 +123,7 @@ int main() {
             float ms; CHECK(hipEventElapsedTime(&ms, e0, e1));
             launch(ks, 0, C1); CHECK(hipDeviceSynchronize()); CHECK(hipMemcpy(r1.data(), C1, r1.size() * 2, hipMemcpyDeviceToHost));
             double n = 0, d = 0; size_t neq = 0; for (size_t i = 0; i < r0.size(); i++) { double x = bf(r1[i]) - bf(r0[i]); n += x * x; d += (double)bf(r0[i]) * bf(r0[i]); neq += (x != 0); }
-            char nm[32]; if (ks == 0) snprintf(nm, sizeof nm, "t_m128"); else snprintf(nm, sizeof nm, "rowgemv KS=%u", ks);
+            char nm[32]; if (ks == 0) snprintf(nm, sizeof nm, "t_m128"); else if (ks >= 16) snprintf(nm, sizeof nm, "dot2 KS=%u", ks - 16); else snprintf(nm, sizeof nm, "rowgemv KS=%u", ks);
             printf("   %-14s %8.1f us  %6.1f GB/s  relL2 vs m128 %.2e  (%zu/%zu differ)\n", nm, 1000 * ms / it, wbytes / 1e9 / (ms / it / 1000), std::sqrt(n / (d + 1e-30)), neq, r0.size());
         }
         for (int c = 0; c < copies; c++) { hipFree(P[c]); hipFree(Q[c]); }
