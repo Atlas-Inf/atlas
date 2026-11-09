@@ -65,13 +65,17 @@ fn down(g: &dyn GpuBackend, p: DevicePtr, n: usize) -> Result<Vec<u16>> {
     let mut b = vec![0u8; n * 2];
     g.synchronize(g.default_stream())?;
     g.copy_d2h(p, &mut b)?;
-    Ok(b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
+    Ok(b.chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect())
 }
 fn down32(g: &dyn GpuBackend, p: DevicePtr, n: usize) -> Result<Vec<u32>> {
     let mut b = vec![0u8; n * 4];
     g.synchronize(g.default_stream())?;
     g.copy_d2h(p, &mut b)?;
-    Ok(b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    Ok(b.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
 }
 fn bits(v: &[bf16]) -> Vec<u16> {
     v.iter().map(|x| x.to_bits()).collect()
@@ -141,15 +145,28 @@ fn read_cpu(x: &[bf16], rows: usize) -> (Vec<u16>, Vec<u32>) {
     let (mut n, mut r) = (Vec::new(), Vec::new());
     for row in x.chunks_exact(H).take(rows) {
         let sq: Vec<f32> = row.iter().map(|v| v.to_f32() * v.to_f32()).collect();
-        let rms = (block_sum(&sq, 256) / H as f32).max(f32::MIN_POSITIVE).sqrt();
+        let rms = (block_sum(&sq, 256) / H as f32)
+            .max(f32::MIN_POSITIVE)
+            .sqrt();
         r.push(rms.to_bits());
-        n.extend(row.iter().map(|v| bf16::from_f32(v.to_f32() / (rms + EPS)).to_bits()));
+        n.extend(
+            row.iter()
+                .map(|v| bf16::from_f32(v.to_f32() / (rms + EPS)).to_bits()),
+        );
     }
     (n, r)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn codes(g: &dyn GpuBackend, k: &Ks, p: &[bf16], cb: DevicePtr, anchors: DevicePtr, stride: u32, rows: usize) -> Result<Vec<u16>> {
+fn codes(
+    g: &dyn GpuBackend,
+    k: &Ks,
+    p: &[bf16],
+    cb: DevicePtr,
+    anchors: DevicePtr,
+    stride: u32,
+    rows: usize,
+) -> Result<Vec<u16>> {
     let (pp, out) = (up(g, p)?, g.alloc(rows * C * 2)?);
     KernelLaunch::new(g, k.codes)
         .grid([rows as u32, 1, 1])
@@ -173,17 +190,30 @@ fn codes_cpu(p: &[bf16], cb: &[bf16], anchors: &[u32]) -> Vec<u16> {
     for (row, pr) in p.chunks_exact(C).enumerate() {
         if row % G == 0 {
             let a = anchors[row / G] as usize;
-            out.extend(cb[a * C..a * C + C].iter().map(|v| bf16::from_f32(sc * v.to_f32()).to_bits()));
+            out.extend(
+                cb[a * C..a * C + C]
+                    .iter()
+                    .map(|v| bf16::from_f32(sc * v.to_f32()).to_bits()),
+            );
             continue;
         }
         let sq: Vec<f32> = pr.iter().map(|v| v.to_f32() * v.to_f32()).collect();
         let d = block_sum(&sq, 256).sqrt() + EPS;
-        out.extend(pr.iter().map(|v| bf16::from_f32(sc * v.to_f32() / d).to_bits()));
+        out.extend(
+            pr.iter()
+                .map(|v| bf16::from_f32(sc * v.to_f32() / d).to_bits()),
+        );
     }
     out
 }
 
-fn message(g: &dyn GpuBackend, k: &Ks, packed: &[bf16], bias: DevicePtr, rows: usize) -> Result<Vec<u16>> {
+fn message(
+    g: &dyn GpuBackend,
+    k: &Ks,
+    packed: &[bf16],
+    bias: DevicePtr,
+    rows: usize,
+) -> Result<Vec<u16>> {
     let (pp, out) = (up(g, packed)?, g.alloc(rows * R * 2)?);
     KernelLaunch::new(g, k.message)
         .grid([rows as u32, 1, 1])
@@ -214,7 +244,14 @@ fn message_cpu(packed: &[bf16], bias: &[bf16]) -> Vec<f32> {
     out
 }
 
-fn write(g: &dyn GpuBackend, k: &Ks, x: &[bf16], rms: &[f32], delta: &[bf16], rows: usize) -> Result<(Vec<u16>, Vec<u16>)> {
+fn write(
+    g: &dyn GpuBackend,
+    k: &Ks,
+    x: &[bf16],
+    rms: &[f32],
+    delta: &[bf16],
+    rows: usize,
+) -> Result<(Vec<u16>, Vec<u16>)> {
     let (xp, dp, sp) = (up(g, x)?, up(g, delta)?, g.alloc(rows * H * 2)?);
     let rp = g.alloc(rows * 4)?;
     let rb: Vec<u8> = rms.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -282,9 +319,17 @@ fn main() -> Result<()> {
     let x = rng.bf(ROWS * H, 4.0);
     let (n, r) = read(g, &k, &x, ROWS)?;
     let (n0, r0) = read_cpu(&x, ROWS);
-    check("read: normalized + rms byte-exact vs CPU", n == n0 && r == r0, &mut fails);
+    check(
+        "read: normalized + rms byte-exact vs CPU",
+        n == n0 && r == r0,
+        &mut fails,
+    );
     let (nb, rb) = read(g, &k, &bump(&x, 3 * H + 77), ROWS)?;
-    check("read: 1-ulp input differs (negative control)", nb != n0 || rb != r0, &mut fails);
+    check(
+        "read: 1-ulp input differs (negative control)",
+        nb != n0 || rb != r0,
+        &mut fails,
+    );
 
     // codes
     let cb = rng.bf(V * C, 0.05);
@@ -293,9 +338,17 @@ fn main() -> Result<()> {
     let ap = up_u32(g, &anchors)?;
     let p = rng.bf(ROWS * C, 2.0);
     let c = codes(g, &k, &p, cbp, ap, 1, ROWS)?;
-    check("codes: byte-exact vs CPU", c == codes_cpu(&p, &cb, &anchors), &mut fails);
+    check(
+        "codes: byte-exact vs CPU",
+        c == codes_cpu(&p, &cb, &anchors),
+        &mut fails,
+    );
     let cbump = codes(g, &k, &bump(&p, C + 5), cbp, ap, 1, ROWS)?;
-    check("codes: 1-ulp input differs (negative control)", cbump != c, &mut fails);
+    check(
+        "codes: 1-ulp input differs (negative control)",
+        cbump != c,
+        &mut fails,
+    );
 
     // message: determinism, batch independence, CPU within 1 BF16 ulp
     let packed = rng.bf(ROWS * 3 * R, 3.0);
@@ -305,27 +358,51 @@ fn main() -> Result<()> {
     let m2 = message(g, &k, &packed, bp, ROWS)?;
     let alone = message(g, &k, &packed[G * 3 * R..], bp, G)?;
     check("message: run-to-run byte-identical", m1 == m2, &mut fails);
-    check("message: block alone == block in batch", alone == m1[G * R..], &mut fails);
+    check(
+        "message: block alone == block in batch",
+        alone == m1[G * R..],
+        &mut fails,
+    );
     let cpu = message_cpu(&packed, &bias);
     let off = m1
         .iter()
         .zip(&cpu)
         .filter(|(a, b)| (**a as i32 - bf16::from_f32(**b).to_bits() as i32).abs() > 1)
         .count();
-    check(&format!("message: CPU within 1 BF16 ulp ({off} off)"), off == 0, &mut fails);
+    check(
+        &format!("message: CPU within 1 BF16 ulp ({off} off)"),
+        off == 0,
+        &mut fails,
+    );
     let mb = message(g, &k, &bump(&packed, 5 * 3 * R + R + 9), bp, ROWS)?;
-    check("message: 1-ulp input differs (negative control)", mb != m1, &mut fails);
+    check(
+        "message: 1-ulp input differs (negative control)",
+        mb != m1,
+        &mut fails,
+    );
 
     // write (with stash)
     let rms: Vec<f32> = (0..ROWS).map(|_| rng.f().abs() + 0.5).collect();
     let delta = rng.bf(ROWS * H, 1.0);
     let (w, stash) = write(g, &k, &x, &rms, &delta, ROWS)?;
-    check("write: byte-exact vs CPU", w == write_cpu(&x, &rms, &delta), &mut fails);
-    check("write: stash holds the pre-write rows", stash == bits(&x), &mut fails);
+    check(
+        "write: byte-exact vs CPU",
+        w == write_cpu(&x, &rms, &delta),
+        &mut fails,
+    );
+    check(
+        "write: stash holds the pre-write rows",
+        stash == bits(&x),
+        &mut fails,
+    );
     // An anchor row passes through unwritten, so a 1-ulp input there must
     // reach the output (a 1-ulp delta can round away in `x + rms * delta`).
     let (wb, _) = write(g, &k, &bump(&x, G * H + 1), &rms, &delta, ROWS)?;
-    check("write: 1-ulp input differs (negative control)", wb != w, &mut fails);
+    check(
+        "write: 1-ulp input differs (negative control)",
+        wb != w,
+        &mut fails,
+    );
 
     // scale (column and scalar)
     let col = rng.bf(H, 2.0);
@@ -351,8 +428,15 @@ fn main() -> Result<()> {
         .collect();
     launch(DevicePtr::NULL, 32.0)?;
     let ss = down(g, dst, ROWS * H)?;
-    let ss0: Vec<u16> = x.iter().map(|v| bf16::from_f32(v.to_f32() * 32.0).to_bits()).collect();
-    check("scale: byte-exact vs CPU (column, scalar)", sc == sc0 && ss == ss0, &mut fails);
+    let ss0: Vec<u16> = x
+        .iter()
+        .map(|v| bf16::from_f32(v.to_f32() * 32.0).to_bits())
+        .collect();
+    check(
+        "scale: byte-exact vs CPU (column, scalar)",
+        sc == sc0 && ss == ss0,
+        &mut fails,
+    );
 
     fails += table_legs(g, &k, &mut rng)?;
     if fails > 0 {
@@ -398,11 +482,24 @@ fn table_legs(g: &dyn GpuBackend, k: &Ks, rng: &mut Rng) -> Result<u32> {
         let sbytes = spark_model::layers::ops::dflash2_selector_scratch_bytes(rows);
         let scratch = g.alloc(sbytes)?;
         g.memset(scratch, 0, sbytes)?;
-        let (cand, idx, out) = (g.alloc(rows * K * 4)?, g.alloc(rows * K * 4)?, g.alloc(rows * 4)?);
+        let (cand, idx, out) = (
+            g.alloc(rows * K * 4)?,
+            g.alloc(rows * K * 4)?,
+            g.alloc(rows * 4)?,
+        );
         let s = g.default_stream();
         let off = |p: DevicePtr, w: usize| p.offset(row0 * w);
         spark_model::layers::ops::dflash2_selector_topk(
-            g, k.topk, off(lp, V * 2), V as u32, V as u32, 0, rows as u32, lists, scratch, s,
+            g,
+            k.topk,
+            off(lp, V * 2),
+            V as u32,
+            V as u32,
+            0,
+            rows as u32,
+            lists,
+            scratch,
+            s,
         )?;
         KernelLaunch::new(g, k.table)
             .grid([rows as u32, 1, 1])
@@ -447,11 +544,20 @@ fn table_legs(g: &dyn GpuBackend, k: &Ks, rng: &mut Rng) -> Result<u32> {
             .arg_u32(G as u32)
             .launch(s)?;
         let ids = down32(g, lists.offset(rows * K * 4), rows * K)?;
-        Ok((down32(g, cand, rows * K)?, down32(g, idx, rows * K)?, down32(g, out, rows)?, ids))
+        Ok((
+            down32(g, cand, rows * K)?,
+            down32(g, idx, rows * K)?,
+            down32(g, out, rows)?,
+            ids,
+        ))
     };
     let (cand, idx, out, ids) = run(0, ROWS)?;
     let again = run(0, ROWS)?;
-    check("table: run-to-run byte-identical", (cand.clone(), idx.clone(), out.clone()) == (again.0, again.1, again.2), &mut fails);
+    check(
+        "table: run-to-run byte-identical",
+        (cand.clone(), idx.clone(), out.clone()) == (again.0, again.1, again.2),
+        &mut fails,
+    );
     let solo = run(G, G)?;
     check(
         "table: block alone == block in batch",
@@ -469,7 +575,11 @@ fn table_legs(g: &dyn GpuBackend, k: &Ks, rng: &mut Rng) -> Result<u32> {
             walk_ok &= out[r0 + t] == cand[(r0 + t) * K + j];
         }
     }
-    check("walk: byte-exact vs CPU walk of the table", walk_ok, &mut fails);
+    check(
+        "walk: byte-exact vs CPU walk of the table",
+        walk_ok,
+        &mut fails,
+    );
     // CPU replica of the table's picks (f64; near-ties excluded).
     let (mut agree, mut total, mut ties) = (0, 0, 0);
     for row in 0..ROWS {
@@ -488,19 +598,34 @@ fn table_legs(g: &dyn GpuBackend, k: &Ks, rng: &mut Rng) -> Result<u32> {
         };
         let base: Vec<f64> = c
             .iter()
-            .map(|&id| (0..H).map(|i| (raw[row * H + i].to_f32() * norm_w[i].to_f32()) as f64 * head[id as usize * H + i].to_f64()).sum())
+            .map(|&id| {
+                (0..H)
+                    .map(|i| {
+                        (raw[row * H + i].to_f32() * norm_w[i].to_f32()) as f64
+                            * head[id as usize * H + i].to_f64()
+                    })
+                    .sum()
+            })
             .collect();
         for (j, &s) in send.iter().enumerate() {
             let m: Vec<f64> = (0..R)
                 .map(|r| {
-                    let z = packed[row * 3 * R + r].to_f64() + tsv[s as usize * 2 * R + r].to_f64() + bias[r].to_f64();
+                    let z = packed[row * 3 * R + r].to_f64()
+                        + tsv[s as usize * 2 * R + r].to_f64()
+                        + bias[r].to_f64();
                     tsv[s as usize * 2 * R + R + r].to_f64() / (1.0 + (-z).exp())
                 })
                 .collect();
             let sc: Vec<f64> = c
                 .iter()
                 .enumerate()
-                .map(|(kk, &id)| base[kk] + rms[row] as f64 * (0..R).map(|r| m[r] * tg[id as usize * R + r].to_f64()).sum::<f64>())
+                .map(|(kk, &id)| {
+                    base[kk]
+                        + rms[row] as f64
+                            * (0..R)
+                                .map(|r| m[r] * tg[id as usize * R + r].to_f64())
+                                .sum::<f64>()
+                })
                 .collect();
             let mut order: Vec<usize> = (0..K).collect();
             order.sort_by(|&a, &b| sc[b].partial_cmp(&sc[a]).unwrap());
@@ -512,7 +637,11 @@ fn table_legs(g: &dyn GpuBackend, k: &Ks, rng: &mut Rng) -> Result<u32> {
             agree += (idx[row * K + j] as usize == order[0]) as usize;
         }
     }
-    check(&format!("table: picks == CPU replica ({agree}/{total}, {ties} near-ties skipped)"), agree == total && total > 0, &mut fails);
+    check(
+        &format!("table: picks == CPU replica ({agree}/{total}, {ties} near-ties skipped)"),
+        agree == total && total > 0,
+        &mut fails,
+    );
     ensure!(cand.len() == ROWS * K, "table output size");
     Ok(fails)
 }

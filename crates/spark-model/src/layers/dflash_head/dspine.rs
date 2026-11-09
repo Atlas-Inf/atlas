@@ -82,7 +82,12 @@ pub struct DspineScratch {
 }
 
 impl DspineScratch {
-    pub fn alloc(gpu: &dyn GpuBackend, spec: &DspineSpec, hidden: usize, rows: usize) -> Result<Self> {
+    pub fn alloc(
+        gpu: &dyn GpuBackend,
+        spec: &DspineSpec,
+        hidden: usize,
+        rows: usize,
+    ) -> Result<Self> {
         let (c, r) = (spec.code_size, spec.rank);
         let a = |bytes: usize| -> Result<DevicePtr> {
             let p = gpu.alloc(bytes.max(16))?;
@@ -183,18 +188,19 @@ impl Dspine {
             p
         };
         let dq = crate::layers::try_kernel(gpu, "dequant_nvfp4_bf16", "dequant_nvfp4_to_bf16");
-        let launch_scale = |src: DevicePtr, dst: DevicePtr, n: usize, cols: u32, s: f32, col: DevicePtr| {
-            KernelLaunch::new(gpu, scale)
-                .grid([1024, 1, 1])
-                .block([THREADS, 1, 1])
-                .arg_ptr(src)
-                .arg_ptr(dst)
-                .arg_u64(n as u64)
-                .arg_u32(cols)
-                .arg_f32(s)
-                .arg_ptr(col)
-                .launch(stream)
-        };
+        let launch_scale =
+            |src: DevicePtr, dst: DevicePtr, n: usize, cols: u32, s: f32, col: DevicePtr| {
+                KernelLaunch::new(gpu, scale)
+                    .grid([1024, 1, 1])
+                    .block([THREADS, 1, 1])
+                    .arg_ptr(src)
+                    .arg_ptr(dst)
+                    .arg_u64(n as u64)
+                    .arg_u32(cols)
+                    .arg_f32(s)
+                    .arg_ptr(col)
+                    .launch(stream)
+            };
         let sqrt_c = (c as f32).sqrt();
         let mut start = 0;
         while start < v {
@@ -290,7 +296,9 @@ impl BlockDiffusionDraftHead {
         DspineBlocks {
             anchors: scratch.markov_prev_dev,
             anchor_stride: 0,
-            ban_depth: scratch.markov_prev_dev.offset(super::MARKOV_BAN_DEPTH_OFFSET),
+            ban_depth: scratch
+                .markov_prev_dev
+                .offset(super::MARKOV_BAN_DEPTH_OFFSET),
             ban_stride: 0,
         }
     }
@@ -322,7 +330,11 @@ impl BlockDiffusionDraftHead {
         let Some(d) = self.dspine.as_ref() else {
             return Ok(());
         };
-        anyhow::ensure!(rows as usize <= sc.rows, "DSpine bridge: {rows} rows > scratch {}", sc.rows);
+        anyhow::ensure!(
+            rows as usize <= sc.rows,
+            "DSpine bridge: {rows} rows > scratch {}",
+            sc.rows
+        );
         let (h, c, r, g) = (
             self.hidden_size as u32,
             d.spec.code_size as u32,
@@ -330,7 +342,11 @@ impl BlockDiffusionDraftHead {
             self.gamma as u32,
         );
         let eps = d.spec.eps();
-        let launch = |kernel| KernelLaunch::new(gpu, kernel).grid([rows, 1, 1]).block([THREADS, 1, 1]);
+        let launch = |kernel| {
+            KernelLaunch::new(gpu, kernel)
+                .grid([rows, 1, 1])
+                .block([THREADS, 1, 1])
+        };
         launch(d.k.read)
             .arg_ptr(x)
             .arg_ptr(sc.normalized)
@@ -339,7 +355,16 @@ impl BlockDiffusionDraftHead {
             .arg_f32(eps)
             .launch(stream)?;
         let gemm = |src, w: DevicePtr, dst, n, k| {
-            self.drafter_dense_gemm(gpu, src, &DenseWeight { weight: w }, dst, rows, n, k, stream)
+            self.drafter_dense_gemm(
+                gpu,
+                src,
+                &DenseWeight { weight: w },
+                dst,
+                rows,
+                n,
+                k,
+                stream,
+            )
         };
         gemm(sc.normalized, d.read[layer], sc.projected, c, h)?;
         launch(d.k.codes)
@@ -391,7 +416,10 @@ impl BlockDiffusionDraftHead {
         out_tokens: DevicePtr,
         stream: u64,
     ) -> Result<()> {
-        let d = self.dspine.as_ref().context("DSpine tail on a non-DSpine head")?;
+        let d = self
+            .dspine
+            .as_ref()
+            .context("DSpine tail on a non-DSpine head")?;
         let (h, r, g, v) = (
             self.hidden_size as u32,
             d.spec.rank as u32,
@@ -403,7 +431,18 @@ impl BlockDiffusionDraftHead {
             "DSpine tail: {rows} rows (scratch {}, γ {g})",
             sc.rows
         );
-        ops::dflash2_selector_topk(gpu, d.k.topk, logits, v, v, 0, rows, sc.lists, sc.topk_scratch, stream)?;
+        ops::dflash2_selector_topk(
+            gpu,
+            d.k.topk,
+            logits,
+            v,
+            v,
+            0,
+            rows,
+            sc.lists,
+            sc.topk_scratch,
+            stream,
+        )?;
         let (head_bf16, packed, scales, scale2) = match self.lm_head_nvfp4.as_ref() {
             Some(q) => (DevicePtr::NULL, q.weight, q.weight_scale, q.weight_scale_2),
             None => (self.lm_head_shared, DevicePtr::NULL, DevicePtr::NULL, 0.0),

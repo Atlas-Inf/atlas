@@ -420,5 +420,11 @@ fn dflash2_config_is_not_dspine() {
       "intermediate_size": 17408, "num_attention_heads": 32, "num_hidden_layers": 5,
       "num_key_value_heads": 8, "vocab_size": 248320,
       "dflash_config": {"block_size": 8, "mask_token_id": 248070, "target_layer_ids": [5, 19, 33, 47, 61]}}"#;
-    assert!(parse_dflash_config(json).unwrap().dspine().unwrap().is_none());
+    assert!(
+        parse_dflash_config(json)
+            .unwrap()
+            .dspine()
+            .unwrap()
+            .is_none()
+    );
 }

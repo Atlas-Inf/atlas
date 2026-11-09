@@ -38,7 +38,9 @@ fn tensor<'a>(
     name: &str,
     shape: &[usize],
 ) -> Result<&'a spark_runtime::weights::WeightTensor> {
-    let t = store.get(name).with_context(|| format!("DSpine: missing {name}"))?;
+    let t = store
+        .get(name)
+        .with_context(|| format!("DSpine: missing {name}"))?;
     anyhow::ensure!(
         t.dtype == WeightDtype::BF16 && t.shape == shape,
         "DSpine: {name} is {:?} {:?}, expected BF16 {shape:?}",
@@ -50,7 +52,9 @@ fn tensor<'a>(
 
 /// The I64 scalar `name` (a checkpoint format version) must read 1.
 fn version_one(store: &WeightStore, gpu: &dyn GpuBackend, name: &str) -> Result<()> {
-    let t = store.get(name).with_context(|| format!("DSpine: missing {name}"))?;
+    let t = store
+        .get(name)
+        .with_context(|| format!("DSpine: missing {name}"))?;
     anyhow::ensure!(
         t.dtype == WeightDtype::Int64 && t.num_elements() == 1,
         "DSpine: {name} is not an I64 scalar"
@@ -96,7 +100,9 @@ pub fn load_dspine_bridge(
     let mut bytes = vec![0u8; c * r * 2];
     gpu.copy_d2h(out.ptr, &mut bytes)?;
     anyhow::ensure!(
-        bytes.chunks_exact(2).all(|w| (u16::from_le_bytes([w[0], w[1]]) & 0x7fff) == 0),
+        bytes
+            .chunks_exact(2)
+            .all(|w| (u16::from_le_bytes([w[0], w[1]]) & 0x7fff) == 0),
         "DSpine: terminal-disabled checkpoint carries a nonzero out.weight"
     );
 

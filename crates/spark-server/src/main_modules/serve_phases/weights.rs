@@ -443,8 +443,8 @@ fn skip_mtp(config: &ModelConfig, args: &cli::ServeArgs) -> bool {
     // 5.21 GB of BF16 held resident for nothing, which on a 119.6 GB unified box
     // comes straight out of the KV cache. With the flag it is the drafter, on
     // rank 0 only (`factory::build`): every other rank skips it as well.
-    let qwen4_exp =
-        matches!(config.model_type.as_str(), "qwen4_exp") && (!args.speculative || config.ep_rank != 0);
+    let qwen4_exp = matches!(config.model_type.as_str(), "qwen4_exp")
+        && (!args.speculative || config.ep_rank != 0);
     // The dense hybrid under `--dflash`: the DFlash drafter is the only
     // proposer, so an MTP head would be built only to be replaced (its BF16
     // weights, 0.85 GB on the 27B, and a private KV pool as large as 1/16 of

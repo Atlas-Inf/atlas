@@ -66,4 +66,3 @@ fn equal_blocks_never_switch() {
     let mut r = Route::new([8, 8]);
     assert!(run(&mut r, 50, |_, _| 8).iter().all(|&h| h == 0));
 }
-

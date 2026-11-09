@@ -141,7 +141,10 @@ fn wide_batches_narrow_then_decode_plain() {
     assert_eq!(depth_for(&WIDE_DEPTHS, 17), 0);
     assert_eq!(depth_for(&WIDE_DEPTHS, 64), 0);
     for &(n, d) in &WIDE_DEPTHS[..2] {
-        assert!(n * (d + 1) <= 128, "{n} sequences of {d} drafts exceed one verify");
+        assert!(
+            n * (d + 1) <= 128,
+            "{n} sequences of {d} drafts exceed one verify"
+        );
     }
     assert_eq!(parse_depths(Some("8:7,64:2")), Some(vec![(8, 7), (64, 2)]));
     assert_eq!(depth_for(&[(8, 7), (64, 2)], 99), 2);

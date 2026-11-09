@@ -230,7 +230,10 @@ pub(super) fn with_alt<T>(
     d: &mut DflashProposerState,
     f: impl FnOnce(&mut DflashProposerState) -> Result<T>,
 ) -> Result<T> {
-    let mut a = d.alt.take().context("dual drafter state without its alt state")?;
+    let mut a = d
+        .alt
+        .take()
+        .context("dual drafter state without its alt state")?;
     a.mirror_from(d);
     let r = f(&mut a);
     a.mirror_to(d);
@@ -256,9 +259,17 @@ impl BlockDiffusionDraftHead {
         tracing::info!(
             "DFlash dual drafter: primary γ={}{}, alt γ={}{}; per-request routing",
             self.gamma,
-            if self.dspine.is_some() { " (DSpine)" } else { "" },
+            if self.dspine.is_some() {
+                " (DSpine)"
+            } else {
+                ""
+            },
             alt.gamma,
-            if alt.dspine.is_some() { " (DSpine)" } else { "" },
+            if alt.dspine.is_some() {
+                " (DSpine)"
+            } else {
+                ""
+            },
         );
         self.alt = Some(Box::new(alt));
         Ok(())
@@ -327,8 +338,8 @@ impl BlockDiffusionDraftHead {
             let hiddens: Vec<_> = idx.iter().map(|&i| target_hiddens[i]).collect();
             let pos: Vec<usize> = idx.iter().map(|&i| positions[i]).collect();
             let own: Vec<_> = idx.iter().map(|&i| owners[i]).collect();
-            let masks: Option<Vec<Option<Vec<i32>>>> =
-                grammar_bitmasks.map(|m| idx.iter().map(|&i| m.get(i).cloned().flatten()).collect());
+            let masks: Option<Vec<Option<Vec<i32>>>> = grammar_bitmasks
+                .map(|m| idx.iter().map(|&i| m.get(i).cloned().flatten()).collect());
             let head = self.routed(h);
             let mut picked: Vec<&mut DflashProposerState> = states
                 .iter_mut()
@@ -343,18 +354,41 @@ impl BlockDiffusionDraftHead {
             let drafts = if h == 0 {
                 let mut group: Vec<&mut dyn crate::speculative::ProposerState> =
                     picked.iter_mut().map(|d| &mut **d as _).collect();
-                head.propose_group(&tokens, &hiddens, &pos, num_drafts, &mut group, &own, ctx, stream, masks.as_deref())?
+                head.propose_group(
+                    &tokens,
+                    &hiddens,
+                    &pos,
+                    num_drafts,
+                    &mut group,
+                    &own,
+                    ctx,
+                    stream,
+                    masks.as_deref(),
+                )?
             } else {
                 let mut alts = Vec::with_capacity(picked.len());
                 for d in picked.iter_mut() {
-                    let mut a = d.alt.take().context("dual drafter state without its alt state")?;
+                    let mut a = d
+                        .alt
+                        .take()
+                        .context("dual drafter state without its alt state")?;
                     a.mirror_from(d);
                     alts.push(a);
                 }
                 let r = {
                     let mut group: Vec<&mut dyn crate::speculative::ProposerState> =
                         alts.iter_mut().map(|a| &mut **a as _).collect();
-                    head.propose_group(&tokens, &hiddens, &pos, num_drafts, &mut group, &own, ctx, stream, masks.as_deref())
+                    head.propose_group(
+                        &tokens,
+                        &hiddens,
+                        &pos,
+                        num_drafts,
+                        &mut group,
+                        &own,
+                        ctx,
+                        stream,
+                        masks.as_deref(),
+                    )
                 };
                 for (d, a) in picked.iter_mut().zip(alts) {
                     a.mirror_to(d);
@@ -386,7 +420,16 @@ impl BlockDiffusionDraftHead {
     ) -> Result<Vec<Vec<u32>>> {
         if tokens.len() >= 2
             && let Some(drafts) = self.propose_batch_staged(
-                tokens, hiddens, positions, num_drafts, states, Some(owners), ctx, stream, masks, None,
+                tokens,
+                hiddens,
+                positions,
+                num_drafts,
+                states,
+                Some(owners),
+                ctx,
+                stream,
+                masks,
+                None,
             )?
         {
             return Ok(drafts);

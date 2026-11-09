@@ -128,7 +128,10 @@ mod tests {
     fn the_decode_window_keeps_the_share() {
         let w = decode_window(Duration::from_secs(40), 0.3);
         assert!((w.as_secs_f64() - 40.0 * 0.3 / 0.7).abs() < 1e-6);
-        assert_eq!(decode_window(Duration::from_secs(40), 0.5), Duration::from_secs(40));
+        assert_eq!(
+            decode_window(Duration::from_secs(40), 0.5),
+            Duration::from_secs(40)
+        );
     }
 
     #[test]
