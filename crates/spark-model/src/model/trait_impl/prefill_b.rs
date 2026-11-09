@@ -26,6 +26,7 @@ mod batch_kernel;
 #[cfg(test)]
 mod batch_kernel_tests;
 mod batched_layer;
+mod ckpt_interval;
 pub(in crate::model) mod embed_chunk;
 mod exact_direct;
 mod finalize_last;

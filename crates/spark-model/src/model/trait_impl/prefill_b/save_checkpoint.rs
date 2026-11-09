@@ -43,28 +43,19 @@ impl TransformerModel {
         // tail checkpoints + leaf carry the warm path).
         let tail = (tokens.len().saturating_sub(1) / bs) * bs;
         let is_prompt_tail = end_token == tail || (tail >= bs && end_token == tail - bs);
-        // NOTE (2026-07-21, dgx2 SSM audit): `--ssm-checkpoint-interval` is a
-        // FILTER over chunk boundaries, not a generator of them. This
-        // function only runs at a chunk end, so the effective checkpoint
-        // spacing is the CHUNK size, not the interval — the interval can only
-        // suppress boundaries, never create one. The auto-clamp that used to
-        // force the prefill budget down to `interval * block_size` was
-        // removed deliberately (impl_a1.rs, issue #15, 2026-07-02) because it
-        // forced micro-chunked prefill.
-        //
-        // Consequence to be aware of when reading a serve log: with
-        // `--ssm-checkpoint-interval 32` (32 blocks = 512 tokens at bs=16)
-        // and `--max-prefill-tokens 8192`, chunk ends land on blocks 512,
-        // 1024, ... — every one of which is a multiple of 32 — so interval
-        // checkpoints fire every 8192 tokens, NOT every 512. The warm path is
-        // carried by the tail checkpoints and the leaf above, which is why
-        // this is not currently a correctness problem.
-        //
-        // Making the interval a real generator (splitting chunks at interval
-        // boundaries) is a behaviour change with a prefill-throughput cost
-        // and is deliberately NOT made here; it needs its own measured A/B.
-        let on_interval = self.ssm_checkpoint_interval > 0
-            && end_block.is_multiple_of(self.ssm_checkpoint_interval);
+        // `--ssm-checkpoint-interval` is a filter over chunk ends (this runs
+        // only at a chunk end; splitting chunks at interval boundaries would
+        // cost prefill throughput and is not done). A chunk end fires when the
+        // chunk CROSSES an interval boundary, not only when it lands on one:
+        // an idle server's first chunk is the whole arena (budget + decode
+        // rows), which put every later end off the interval and left cold
+        // prefills with no interval checkpoint (`ckpt_interval`).
+        let on_interval = super::ckpt_interval::crosses_interval(
+            chunk_start,
+            end_token,
+            bs,
+            self.ssm_checkpoint_interval,
+        );
         // R11 fix 1: under the pass grid, checkpoint ONLY at the last two grid
         // points below the prompt end (the passes there are full grid passes
         // in every run, so the anchor state is layout-independent). A planned
