@@ -175,4 +175,15 @@ pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
         Ok(graph_flags::dflash_debug_no_graph() as u64)
     }),
     ("ATLAS_K2_DIAG", || Ok(graph_flags::k2_diag() as u64)),
+    // The restore points a full snapshot pool keeps behind each save, under
+    // the session-aware victim only (see ATLAS_SNAP_EVICT_ALPHA).
+    ("ATLAS_SSM_SNAP_LADDER", || {
+        use spark_runtime::radix_tree as rt;
+        let unused = rt::glm_pc_evict_enabled() || rt::snap_evict_legacy();
+        Ok(if unused {
+            0
+        } else {
+            rt::ssm_snap_ladder_base().unwrap_or(0) as u64
+        })
+    }),
 ];

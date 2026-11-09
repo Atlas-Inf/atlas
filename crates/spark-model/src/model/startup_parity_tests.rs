@@ -325,6 +325,7 @@ fn the_table_carries_each_setting_once() {
         "ATLAS_GLM_INDEX_SPLIT_MIN_CTX",
         "ATLAS_GLM_INDEX_SPLIT_CHECK",
         "ATLAS_GLM_PC_EVICT",
+        "ATLAS_SSM_SNAP_LADDER",
         "ATLAS_GLM_PC_BRANCH",
         "ATLAS_GLM_PC_BRANCH_MIN",
         "ATLAS_GLM_PC_FINISH_LEAF",

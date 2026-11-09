@@ -17,6 +17,7 @@ mod nvme;
 mod snapshot;
 mod snapshot_chain;
 mod snapshot_insert;
+mod snapshot_ladder;
 mod snapshot_leaf;
 mod snapshot_stats;
 mod snapshot_tier;
@@ -28,6 +29,7 @@ use inner::RadixTreeInner;
 use snapshot::SsmSnapshotIndex;
 pub use snapshot::{snap_evict_alpha, snap_evict_legacy};
 pub use snapshot_chain::glm_pc_evict_enabled;
+pub use snapshot_ladder::ssm_snap_ladder_base;
 
 /// FNV-1a-ish stable hash for the first `count` tokens — used to key SSM
 /// snapshots independently of the radix tree (allows the same prefix hash to be
@@ -202,6 +204,7 @@ impl PrefixCache for RadixTree {
         let mut idx = self.snapshot_index.lock();
         let displaced = idx.insert(prefix_hash, snapshot_id, session_hash, tokens.len());
         idx.link_chain_if_enabled(tokens, adapter_id, prefix_hash);
+        idx.stamp_ladder(tokens, session_hash, adapter_id);
         (displaced, newly_acquired)
     }
 
@@ -216,9 +219,10 @@ impl PrefixCache for RadixTree {
         // final chunk's `insert` (finalize_last); re-inserting the whole prefix
         // here cost ~0.9 s/turn for zero benefit.
         let prefix_hash = hash_token_prefix(tokens, tokens.len(), adapter_id);
-        self.snapshot_index
-            .lock()
-            .insert_tail(prefix_hash, snapshot_id, session_hash, tokens.len())
+        let mut idx = self.snapshot_index.lock();
+        let displaced = idx.insert_tail(prefix_hash, snapshot_id, session_hash, tokens.len());
+        idx.stamp_ladder(tokens, session_hash, adapter_id);
+        displaced
     }
 
     fn insert_tail_sibling_snapshot(
@@ -256,6 +260,7 @@ impl PrefixCache for RadixTree {
         let mut idx = self.snapshot_index.lock();
         let displaced = idx.insert(prefix_hash, snapshot_id, session_hash, tokens.len());
         idx.link_chain_if_enabled(tokens, adapter_id, prefix_hash);
+        idx.stamp_ladder(tokens, session_hash, adapter_id);
         displaced
     }
 
@@ -267,9 +272,10 @@ impl PrefixCache for RadixTree {
         adapter_id: u64,
     ) -> Option<usize> {
         let prefix_hash = hash_token_prefix(tokens, tokens.len(), adapter_id);
-        self.snapshot_index
-            .lock()
-            .insert_leaf(prefix_hash, snapshot_id, session_hash, tokens.len())
+        let mut idx = self.snapshot_index.lock();
+        let displaced = idx.insert_leaf(prefix_hash, snapshot_id, session_hash, tokens.len());
+        idx.stamp_ladder(tokens, session_hash, adapter_id);
+        displaced
     }
 
     fn take_leaf_snapshot(&self, tokens: &[u32], snapshot_id: usize, adapter_id: u64) -> bool {
