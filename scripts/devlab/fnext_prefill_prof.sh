@@ -22,7 +22,7 @@ NV=$("${PY:-python3}" -c 'import sys; from huggingface_hub import snapshot_downl
 
 # spark under the profiler: serve-amd.sh execs $ATLAS_BIN, so point it at a wrapper.
 W="$OUT/spark-prof"; mkdir -p "$OUT/prof"
-printf '#!/usr/bin/env bash\nexec rocprofv3 --kernel-trace --output-format csv -d %q -o run -- %q "$@"\n' "$OUT/prof" "$PWD/target/release/spark" > "$W"; chmod +x "$W"
+if [ "${NOPROF:-0}" = 1 ]; then W="$PWD/target/release/spark"; else printf '#!/usr/bin/env bash\nexec rocprofv3 --kernel-trace --output-format csv -d %q -o run -- %q "$@"\n' "$OUT/prof" "$PWD/target/release/spark" > "$W"; chmod +x "$W"; fi
 ( exec env RUST_LOG=info ATLAS_BIN="$W" PORT="$PORT" HOST=127.0.0.1 MODEL_NAME=m GPU_UTIL=${GPU_UTIL:-0.76} MAX_SEQ_LEN=32768 \
     ATLAS_KV_EXTERNAL_RESERVE_GB=0 MAX_BATCH=${MAX_BATCH:-1} ./serve-amd.sh "$REPO" --disable-thinking --request-timeout 0 --enable-prefix-caching ) > "$OUT/atlas-server.log" 2>&1 &
 APID=$!; ENGINE_ALIVE() { kill -0 "$APID" 2>/dev/null; }
@@ -73,6 +73,7 @@ EOF
 kill -INT "$APID" 2>/dev/null; for _ in $(seq 1 120); do kill -0 "$APID" 2>/dev/null || break; sleep 2; done; kill -9 "$APID" 2>/dev/null || true
 cp "$OUT/atlas-server.log" "$OUT/serve-prof.log" 2>/dev/null || true
 
+[ "${NOPROF:-0}" = 1 ] && { log DONE; exit 0; }
 KT=$(find "$OUT/prof" -name '*kernel_trace.csv' | head -1)
 [ -n "$KT" ] || { log "no kernel_trace.csv (profiler did not flush): $(ls -R "$OUT/prof" | head)"; exit 1; }
 python3 - "$KT" <<'EOF' | tee -a "$RES"
