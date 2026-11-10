@@ -76,7 +76,7 @@ pub struct DflashKernels {
     pub dense_gemm_pipelined: KernelHandle,
     /// `bf16_gemv_m32` (Ricursive's target): 1..=32-row drafter GEMMs; 0 elsewhere.
     pub bf16_gemv_m32: KernelHandle,
-    /// `fp8_gemv_m32`: the same GEMMs on [`Self::fp8_m32`]'s FP8 mirrors.
+    /// `fp8_gemv_m32`: the same GEMMs on [`BlockDiffusionDraftHead::fp8_m32`]'s FP8 mirrors.
     pub fp8_gemv_m32: KernelHandle,
     pub rope_qwen3: KernelHandle,
     pub reshape_cache_fp8: KernelHandle,
@@ -338,7 +338,7 @@ pub struct DflashLayer {
     pub rope: bool,
     /// This layer's own sliding window in the attention kernel (0 = none)
     /// when `layer_types` mixes sliding and full layers; see
-    /// [`BlockDiffusionDraftHead::layer_attn_window`].
+    /// `BlockDiffusionDraftHead::layer_attn_window`.
     pub attn_window: u32,
 }
 
