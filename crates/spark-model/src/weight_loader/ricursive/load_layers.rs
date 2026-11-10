@@ -34,10 +34,11 @@ pub(super) fn load_layers(
         stream,
     };
     let lerp_k = gpu.kernel("value_residual", "value_residual_lerp")?;
-    // strix-hip ships no `bf16_gemv_m32` (cp.async m32 GEMV): handle 0 sends
-    // the verify-row projections to the BF16 GEMM fallback.
+    // strix-hip ships no `bf16_gemv_m32` (cp.async m32 GEMV): handle 0, with
+    // no lookup issued (the boot audit fails closed), sends the verify-row
+    // projections to the BF16 GEMM fallback.
     let wide_gemv_k = if cfg!(atlas_hip) {
-        crate::layers::try_kernel(gpu, "bf16_gemv_m32", "bf16_gemv_m32")
+        spark_runtime::gpu::KernelHandle(0)
     } else {
         gpu.kernel("bf16_gemv_m32", "bf16_gemv_m32")?
     };
