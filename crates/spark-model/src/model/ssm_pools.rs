@@ -13,7 +13,7 @@
 //! the pools land in `used_so_far` and the KV pool shrinks to fit — the
 //! same positional-budgeting rule the LoRA adapter load documents.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 
 use super::ssm_pool::SsmStatePool;
@@ -175,6 +175,30 @@ impl SsmPools {
                 atlas_kernels::DECODE_ROLLBACK_RING_SLOTS,
             );
         }
+        // The pools are deliberately out of `preflight_reserve` (see the
+        // module doc): they allocate BEFORE the KV budget's free_memory()
+        // snapshot, so nothing checks that they fit before `cuMemAlloc`
+        // dies with NV_ERR_NO_MEMORY and the process is killed with no error
+        // line (plain decode at 64 seqs: ~81 GB of decode-rollback ring). Size the
+        // same inputs the pool is about to use and fail fast with remedies.
+        let hidden_bytes = config.hidden_size * 2;
+        let marconi_bytes = ssm_cache_slots
+            .checked_mul(pool.num_ssm_layers)
+            .and_then(|s| s.checked_mul(pool.h_bytes + pool.conv_bytes))
+            .and_then(|s| s.checked_add(ssm_cache_slots.checked_mul(hidden_bytes)?))
+            .context("SSM snapshot pool size overflow")?;
+        let ring_bytes = ring
+            .slots
+            .checked_mul(max_batch_size)
+            .and_then(|s| s.checked_mul(pool.num_ssm_layers))
+            .and_then(|s| s.checked_mul(pool.h_bytes + pool.conv_bytes))
+            .context("SSM decode-rollback ring size overflow")?;
+        snapshot_pool_fits(
+            marconi_bytes,
+            ring_bytes,
+            gpu.free_memory()?,
+            SNAPSHOT_POOL_OOM_GUARD,
+        )?;
         let snapshots = SsmSnapshotPool::new(
             ssm_cache_slots,
             pool.h_bytes,
@@ -185,7 +209,7 @@ impl SsmPools {
             // Last-token hidden snapshot: post-final-norm `norm_output` is
             // BF16 (`hidden_size` elements). Used to emit exact-hit logits
             // without re-running the last token through the SSM layers.
-            config.hidden_size * 2,
+            hidden_bytes,
             gpu,
         )?;
         // Optional SSM snapshot spill tier. `None` (default) keeps the reclaim
@@ -208,3 +232,40 @@ impl SsmPools {
         })
     }
 }
+
+/// Slack the snapshot-pool fit check keeps between the pools and the OOM
+/// kill: the KV budget sizes itself off the free memory measured after
+/// these allocations, so a pool that leaves ~0 free would boot-fail one
+/// step later anyway.
+const SNAPSHOT_POOL_OOM_GUARD: usize = 2 << 30;
+
+/// Does the SSM snapshot pool fit the currently-free device memory?
+/// `bail!`s with the split that overflowed and the operator remedies —
+/// the decode-rollback ring exists only for plain decode's watchdog
+/// re-steer, so speculation sidesteps it entirely.
+fn snapshot_pool_fits(
+    marconi_bytes: usize,
+    ring_bytes: usize,
+    free: usize,
+    guard: usize,
+) -> Result<()> {
+    let need = marconi_bytes
+        .checked_add(ring_bytes)
+        .context("SSM snapshot pool size overflow")?;
+    let budget = free.saturating_sub(guard);
+    if need <= budget {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "SSM snapshot pools do not fit: need {need_gb:.1} GB (Marconi prefix slots {marconi_gb:.1} GB + decode-rollback ring {ring_gb:.1} GB) against {free_gb:.1} GB free (guard {guard_gb:.1} GB). The decode ring serves only PLAIN decode's watchdog rollback — run with --speculative or --dflash, lower --max-batch-size, or shrink the ring with ATLAS_SSM_DECODE_RING=0 / ATLAS_DISABLE_WATCHDOGS=1.",
+        need_gb = need as f64 / 1e9,
+        marconi_gb = marconi_bytes as f64 / 1e9,
+        ring_gb = ring_bytes as f64 / 1e9,
+        free_gb = free as f64 / 1e9,
+        guard_gb = guard as f64 / 1e9,
+    )
+}
+
+#[cfg(test)]
+#[path = "ssm_pools_tests.rs"]
+mod tests;
