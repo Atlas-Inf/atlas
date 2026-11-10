@@ -1664,16 +1664,20 @@ void w4a16_gemm_t_m128_f16a(const __nv_bfloat16* __restrict__ A, const unsigned 
 // m128 pads M to 128, so at M = 17 seven eighths of its WMMA work is on zero
 // rows and it runs at ~58 GB/s. Here each lane owns 4 consecutive output
 // columns, dequantizes each weight byte ONCE with m128's exact decode
-// (e2m1x4_off12 / e4m3_scale_half, bf16-rounded like its smem tile) and
-// applies it to every row with explicit fmaf. A is read at wave-uniform
+// (e2m1x4_off12 / e4m3_scale_half) and applies it in f32 to every row with
+// explicit fmaf. No bf16 rounding: gfx1151 has no f32->bf16 instruction, so
+// rounding each weight in software cost ~20% (the _f16a twins skip it too).
+// The row loop always runs MR rows (rows >= M re-read row M-1 and are not
+// stored): a data-dependent break there turns acc[][] into dynamic indexing. A is read at wave-uniform
 // addresses (scalar loads), 4 K-pairs (one uint4 per row) and 4 weight rows
 // per iteration so the loads overlap. 4 waves split K inside the block and
 // reduce through LDS in a fixed order; gridDim.y = KS > 1 splits K across
 // blocks into an fp32 workspace [KS][M][N] summed in order by
 // w4a16_rowgemv_reduce. Deterministic, but NOT bit-identical to the WMMA
-// kernels (fp32 summation order): relL2 1.5e-4..6.5e-4 vs m128.
-// gfx1151 kbench 42721529794: Ripple M=17 gate/up 2098 -> 1379 us, down
-// 2041 -> 1420 (KS=2); Qwen3.8-27B M=9 gate/up 1003 -> 329, down 865 -> 330.
+// kernels (fp32 summation order): relL2 6e-5..3e-4 vs m128_f16a.
+// gfx1151 kbench 42729349013, m128_f16a -> rowgemv: Ripple M=17 gate/up
+// 1881 -> 1161 us (KS=1), down 2463 -> 1229 (KS=2); Qwen3.8-27B M=9
+// gate/up 930 -> 275, down 1050 -> 270 (KS=4).
 //
 // Requires N % 128 == 0 and (K/2) % (16*KS) == 0.
 // Grid: (N/128, KS, 1)   Block: (128, 1, 1)
@@ -1710,14 +1714,14 @@ __device__ __forceinline__ void w4a16_rowgemv_body(
             const unsigned int tl = e2m1x4_off12(pw[u] & 0x0F0F0F0Fu), th = e2m1x4_off12((pw[u] >> 4) & 0x0F0F0F0Fu);
             #pragma unroll
             for (int c = 0; c < 4; c++) {
-                wl[u][c] = __bfloat162float(__float2bfloat16((float)(int)(((tl >> (8 * c)) & 0xFF) - 12) * svh[c]));
-                wh[u][c] = __bfloat162float(__float2bfloat16((float)(int)(((th >> (8 * c)) & 0xFF) - 12) * svh[c]));
+                wl[u][c] = (float)(int)(((tl >> (8 * c)) & 0xFF) - 12) * svh[c];
+                wh[u][c] = (float)(int)(((th >> (8 * c)) & 0xFF) - 12) * svh[c];
             }
         }
         #pragma unroll
         for (int m = 0; m < MR; m++) {
-            if ((unsigned int)m >= M) break;
-            const uint4 a4 = *(const uint4*)&A32[((unsigned long long)m * K >> 1) + kq];
+            const unsigned int mr = (unsigned int)m < M ? (unsigned int)m : M - 1;
+            const uint4 a4 = *(const uint4*)&A32[((unsigned long long)mr * K >> 1) + kq];
             const unsigned int ap[4] = {a4.x, a4.y, a4.z, a4.w};
             #pragma unroll
             for (int u = 0; u < 4; u++) {
@@ -1738,7 +1742,7 @@ __device__ __forceinline__ void w4a16_rowgemv_body(
     if (w != 0) return;
     #pragma unroll
     for (int m = 0; m < MR; m++) {
-        if ((unsigned int)m >= M) break;
+        if ((unsigned int)m >= M) continue;
         #pragma unroll
         for (int c = 0; c < 4; c++) {
             float s = acc[m][c];
