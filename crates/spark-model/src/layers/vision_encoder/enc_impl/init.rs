@@ -309,7 +309,7 @@ impl VisionEncoder {
         self.glm.as_ref().map_or(0, |glm| glm.lent_bytes())
     }
 
-    /// See [`GlmVisionEncoder::attach_lent_scratch`].
+    /// See `GlmVisionEncoder::attach_lent_scratch`.
     pub fn attach_lent_scratch(&mut self, base: DevicePtr, borrowed: bool) -> Result<()> {
         match self.glm.as_mut() {
             Some(glm) => glm.attach_lent_scratch(base, borrowed),
