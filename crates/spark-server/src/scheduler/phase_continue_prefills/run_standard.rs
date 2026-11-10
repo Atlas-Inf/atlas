@@ -112,18 +112,18 @@ pub(super) fn run_standard_chunk_loop(
     // The spec gate here used to be the process-GLOBAL flags (`!use_mtp && ...`),
     // which meant a `--speculative` serve could NEVER fuse prefill with decode —
     // at any concurrency. But speculative execution is per-STEP: the scheduler
-    // only runs a spec step when `active.len() == 1` (mod.rs:511/516/520);
-    // at C>=2 every sequence is on plain batched decode anyway, so fusing is
-    // exactly as safe as it is for a non-speculative serve. The correct
-    // predicate is "a spec step would run this tick", i.e. the same
-    // `single_active_with_spec` shape phase_continue_prefills.rs computes.
+    // only runs a single-sequence spec step when `active.len() == 1`; at C>=2
+    // those lanes are on plain batched decode anyway, so fusing is exactly as
+    // safe as it is for a non-speculative serve. The correct predicate is "a
+    // spec step would run this tick" (`SpecStep::blocks_mixed`, which also
+    // holds a DFlash serve out at every width).
     //
     // Without this, one 8K prefill chunk froze every active decoder for the
     // whole chunk (mixed_forward never fired in any --speculative production
     // config) — the single largest scheduler-level concurrency gap found by
     // the 2026-07-25 architecture map.
     let any_spec = use_mtp || use_self_speculative || use_ngram_speculative;
-    let spec_step_this_tick = active.len() == 1 && any_spec;
+    let spec_step_this_tick = spec.blocks_mixed(active.len(), any_spec);
     // mHC highway models: mixed_forward's decode portion runs the batched
     // decode paths, which the highway refuses — decode stalls during a
     // prefill chunk instead (v1 of #753 item B).
