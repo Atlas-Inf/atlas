@@ -278,7 +278,8 @@ def main():
     r.add_argument("--reps", type=int, default=3)
     r.add_argument("--concurrency", default="1,2,4,8",
                    help="levels for the json_schema case; keep within --max-num-seqs")
-    r.add_argument("--max-tokens", type=int, default=800)
+    r.add_argument("--max-tokens", type=int, default=2400,
+                   help="room for the 12-item reply to end on its own (800 truncates it)")
     r.add_argument("--commit", default="unknown", help="build commit, recorded")
     r.add_argument("--note", default="", help="serve flags and env, recorded (no host names)")
     c = sub.add_parser("compare")
