@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # DevLab Strix bench (G3): kernel attribution of Atlas Flash-Next prefill under rocprofv3.
 #
-#   scripts/devlab/fnext_prefill_prof.sh [KEY=VAL ...]      e.g. GPU_UTIL=0.76 (the runner OOMs at 0.92)
+#   scripts/devlab/fnext_prefill_prof.sh [KEY=VAL ...]      e.g. GPU_UTIL=0.76 (the runner OOMs at 0.92); PHASE=depth profiles
+#   1.9k-token extensions of one cached 16k prefix instead of cold prompts
 #
 # Serves nvidia/Qwen3.8-Flash-Next-NVFP4 from the workflow's build with spark wrapped in rocprofv3 --kernel-trace,
 # then sends prefill-only requests (max_tokens 1, distinct prompts): 3 x ~2k, 2 x ~16k tokens. Kernels are
@@ -41,8 +42,22 @@ def ask(tag, n_words, seed):
     u = json.load(urllib.request.urlopen(req, timeout=1800)).get("usage", {})
     dt = time.time() - t
     print(f"  [prof] {tag}: prompt {u.get('prompt_tokens')} tok in {dt:.2f}s -> {u.get('prompt_tokens', 0) / dt:.0f} tok/s", flush=True)
-for i in range(3): ask(f"2k-{i}", 1900, 100 + i)
-for i in range(2): ask(f"16k-{i}", 16000, 200 + i)
+import os
+if os.environ.get("PHASE") == "depth":
+    # Prefix-cached extension (the h2h "depth 16384" row: 1.86k new tokens on a cached 16k prefix, 5.4 s vs Halogen 1.26 s).
+    r = random.Random(7); base = " ".join(r.choice(words) for _ in range(16000))
+    def ext(tag, tail_seed, tail_words):
+        rr = random.Random(tail_seed); tail = " ".join(rr.choice(words) for _ in range(tail_words))
+        body = {"model": "m", "messages": [{"role": "user", "content": f"Summarize: {base}"}, {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": f"[{tag}] {tail}"}], "max_tokens": 1, "temperature": 0}
+        t = time.time(); req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
+        u = json.load(urllib.request.urlopen(req, timeout=1800)).get("usage", {}); dt = time.time() - t
+        print(f"  [prof] {tag}: prompt {u.get('prompt_tokens')} tok (cached {u.get('prompt_tokens_details', {}) or {}}) in {dt:.2f}s", flush=True)
+    ext("warm-16k", 0, 10)
+    for i in range(5): ext(f"ext-{i}", 300 + i, 1900)
+else:
+    for i in range(3): ask(f"2k-{i}", 1900, 100 + i)
+    for i in range(2): ask(f"16k-{i}", 16000, 200 + i)
 EOF
 kill -INT "$APID" 2>/dev/null; for _ in $(seq 1 120); do kill -0 "$APID" 2>/dev/null || break; sleep 2; done; kill -9 "$APID" 2>/dev/null || true
 cp "$OUT/atlas-server.log" "$OUT/serve-prof.log" 2>/dev/null || true
