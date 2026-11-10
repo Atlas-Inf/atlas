@@ -103,7 +103,11 @@ fn load_ffn(
         DenseFfnLayer::new_with_activation(weights, FfnActivation::SiLU, gpu, "ricursive")?;
     // Target-only clamped SwiGLU; the drafter keeps the unclamped common kernel.
     layer.set_act_mul(gpu.kernel("ricursive_swiglu", "silu_mul_clamp20")?);
-    if !hip {
+    if hip {
+        // Verify rows (M = 17) on the row-GEMV, not m128's padded tile:
+        // framework f257 0.97 vs 1.59 ms per call, fib 7.3 vs 9.6 s.
+        layer.enable_rowgemv_default(gpu)?;
+    } else {
         let limit = atlas_core::config::RICURSIVE_FFN_CLAMP as f32;
         layer.enable_w4a4_rows(gpu, input_scales, limit, [h, inter])?;
     }
