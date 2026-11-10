@@ -34,7 +34,7 @@ atlas)
   # so pull everything else through the hub cache and curl that one file (resumable) into the snapshot dir.
   BIG=model-fp8-mtp-ple.safetensors
   NV=$("${PY:-python3}" -c 'import sys; from huggingface_hub import snapshot_download as s; print(s(sys.argv[1], ignore_patterns=[sys.argv[2]]))' "$NVFP4_REPO" "$BIG" 2>>"$OUT/download.log") \
-    && curl -fsSL -C - --retry 5 --retry-all-errors -o "$NV/$BIG" "${HF_ENDPOINT:-https://huggingface.co}/$NVFP4_REPO/resolve/main/$BIG" 2>>"$OUT/download.log" \
+    && { [ "$MK" != fnext ] || curl -fsSL -C - --retry 5 --retry-all-errors -o "$NV/$BIG" "${HF_ENDPOINT:-https://huggingface.co}/$NVFP4_REPO/resolve/main/$BIG" 2>>"$OUT/download.log"; } \
     || { log "NVFP4 DOWNLOAD FAILED: $(grep -av "^ " "$OUT/download.log" | tail -8)"; exit 1; }
   log "atlas $(git rev-parse --short=9 HEAD), $NVFP4_REPO ($(du -shL "$NV" | cut -f1))"
   AENV=(GPU_UTIL=${GPU_UTIL:-0.70} MAX_SEQ_LEN=32768 ATLAS_KV_EXTERNAL_RESERVE_GB=0)
