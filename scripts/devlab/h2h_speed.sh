@@ -30,7 +30,7 @@ bench_arm() { # arm-name [gufo_bench concurrency list, default 1,4,8] [wait_read
 case $ENGINE in
 atlas)
   [ -x target/release/spark ] || { log "no target/release/spark (run with job=bench, which builds it)"; exit 1; }
-  NV=$(hf_get "$NVFP4_REPO" "") || { log "NVFP4 DOWNLOAD FAILED: $(tail -3 "$OUT/download.log")"; exit 1; }
+  NV=$(hf_get "$NVFP4_REPO" "") || { log "NVFP4 DOWNLOAD FAILED: $(grep -av "^ " "$OUT/download.log" | tail -8)"; exit 1; }
   log "atlas $(git rev-parse --short=9 HEAD), $NVFP4_REPO ($(du -shL "$NV" | cut -f1))"
   AENV=(GPU_UTIL=${GPU_UTIL:-0.70} MAX_SEQ_LEN=32768 ATLAS_KV_EXTERNAL_RESERVE_GB=0)
   atlas_up $PORT "$NVFP4_REPO" "${AENV[@]}" MAX_BATCH=1; bench_arm atlas_b1 1
