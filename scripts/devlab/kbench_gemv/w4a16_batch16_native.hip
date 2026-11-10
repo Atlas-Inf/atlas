@@ -31,7 +31,7 @@ int main() {
             if ((unsigned)tier < M) continue;
             auto launch = [&](int c) {
                 dim3 g((N + N_PER_BLOCK - 1) / N_PER_BLOCK), b(BLOCK_SIZE);
-                if (tier == 8) hipLaunchKernelGGL(w4a16_gemv_batch8, g, b, 0, 0, A, P[c], Q[c], 0.01f, C, M, N, K, N);
+                if (tier == 8) hipLaunchKernelGGL(w4a16_gemv_batch8, g, b, 0, 0, A, P[c], Q[c], 0.01f, C, M, N, K);
                 else if (tier == 16) hipLaunchKernelGGL(w4a16_gemv_batch16, g, b, 0, 0, A, P[c], Q[c], 0.01f, C, M, N, K);
                 else hipLaunchKernelGGL(w4a16_gemv_batch32, g, b, 0, 0, A, P[c], Q[c], 0.01f, C, M, N, K);
             };

@@ -3,24 +3,25 @@
 # DevLab Strix bench: engine head-to-head speed, on the protocol Atlas's headline uses (gufo_bench.py: pp ~2048 / tg128 at
 # depth 0/8192/16384, then C 1/4/8 steady aggregate decode), so rows compare directly with the Atlas numbers.
 #
-#   scripts/devlab/h2h_speed.sh <atlas|gufo|llamacpp> <27b|fnext> [KEY=VAL ...]     KEYS: SESSIONS (8), CONTEXT (32768)
+#   scripts/devlab/h2h_speed.sh <atlas|gufo|llamacpp|halogen> <27b|fnext> [KEY=VAL ...]     KEYS: SESSIONS (8), CONTEXT (32768)
 # atlas arms:   b1 (MAX_BATCH 1, MTP: the single-user recipe) and b8 (MAX_BATCH 8) on NVIDIA's NVFP4 via serve-amd.sh, GPU_UTIL
 #               0.70 (the runner's batch-8 27B ceiling, run 41181983380), so all three engines share one machine.
 # gufo arms:     ar, and its speculative leg (DFlash2 for 27B, MTP for Flash-Next) -- each engine's own performance leg
+# halogen arm:   fnext only; Peonist's image at its defaults (drafting on), thinking off per request (it thinks by default).
 # llamacpp arms: nvfp4 (NVIDIA's checkpoint through llama.cpp's own converter, if it converts) and q4 (the Unsloth
 #                UD-Q4_K_XL Gufo uses); stock llama.cpp has no speculative leg for these models.
 set -uo pipefail
-ENGINE=${1:?atlas|gufo|llamacpp}; MK=${2:?27b|fnext}
+ENGINE=${1:?atlas|gufo|llamacpp|halogen}; MK=${2:?27b|fnext}
 for kv in "${@:3}"; do [[ "$kv" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9_./:,+-]*$ ]] && export "$kv"; done
 SESSIONS=${SESSIONS:-8}; CONTEXT=${CONTEXT:-32768}; PORT=18086
 OUT=${DEVLAB_OUT:-$PWD/devlab-out}; mkdir -p "$OUT"; RES="$OUT/RESULTS.txt"
 HERE=$(cd "$(dirname "$0")" && pwd); . "$HERE/lib_engines.sh"
 model_spec "$MK" || exit 1; pyhf
-t0=$(date +%s); Q4D=$(hf_get "$Q4_REPO" "$Q4_PAT" "$Q4_REV") || { log "Q4 DOWNLOAD FAILED: $(tail -2 "$OUT/download.log")"; exit 1; }
-Q4=$(first_gguf "$Q4D" "$Q4_PAT"); log "$MK q4: $Q4_REPO $(basename "$Q4") ($(du -shL "$Q4" | cut -f1)) in $(( $(date +%s) - t0 ))s"
+[ "$ENGINE" = halogen ] || { t0=$(date +%s); Q4D=$(hf_get "$Q4_REPO" "$Q4_PAT" "$Q4_REV") || { log "Q4 DOWNLOAD FAILED: $(tail -2 "$OUT/download.log")"; exit 1; }
+Q4=$(first_gguf "$Q4D" "$Q4_PAT"); log "$MK q4: $Q4_REPO $(basename "$Q4") ($(du -shL "$Q4" | cut -f1)) in $(( $(date +%s) - t0 ))s"; }
 
-bench_arm() { # arm-name [gufo_bench concurrency list, default 1,4,8]
-  if ! wait_ready $PORT; then log "$1 SERVE FAILED:"; ENGINE_DOWN "$OUT/serve-$1.log"; grep -aiE "error|fail|memory|alloc" "$OUT/serve-$1.log" | tail -5 | tee -a "$RES"; return 1; fi
+bench_arm() { # arm-name [gufo_bench concurrency list, default 1,4,8] [wait_ready tries]
+  if ! wait_ready $PORT "${3:-360}"; then log "$1 SERVE FAILED:"; ENGINE_DOWN "$OUT/serve-$1.log"; grep -aiE "error|fail|memory|alloc" "$OUT/serve-$1.log" | tail -5 | tee -a "$RES"; return 1; fi
   log "$1 serving (model id $MID)"
   python3 "$HERE/gufo_bench.py" $PORT "$1" "$OUT/$1.json" --depths 0,8192,16384 --cs "${2:-1,4,8}" --kinds mixed 2>&1 | grep -aE "^\s+\[" | tee -a "$RES"
   ENGINE_DOWN "$OUT/serve-$1.log"
@@ -53,6 +54,13 @@ llamacpp)
   fi
   llama_up $PORT "$SESSIONS" "$CONTEXT" "$Q4"; bench_arm llamacpp_q4
   "$LB/llama-bench" -m "$Q4" -ngl 99 -p 2048 -n 128 -r 2 -o md 2>"$OUT/bench-q4.err" | tee -a "$RES" || tail -3 "$OUT/bench-q4.err" | tee -a "$RES" ;;
+halogen)
+  [ "$MK" = fnext ] || { log "halogen serves Flash-Next only"; exit 1; }
+  docker pull -q "ghcr.io/peonist-ai/halogen-flash-server:${HALOGEN_TAG:-0.20.1}" > "$OUT/pull.log" 2>&1 || { log "PULL FAILED: $(tail -2 "$OUT/pull.log")"; exit 1; }
+  log "halogen ${HALOGEN_TAG:-0.20.1} $(docker image inspect -f '{{.Id}}' "ghcr.io/peonist-ai/halogen-flash-server:${HALOGEN_TAG:-0.20.1}" | cut -c8-19)"
+  halogen_up $PORT
+  export H2H_REQ_EXTRA='{"reasoning_effort":"none"}'
+  bench_arm halogen 1,4,8 2160 ;;   # first start downloads ~118 GB: allow 3 h
 *) log "unknown engine $ENGINE"; exit 1 ;;
 esac
 log "DONE"

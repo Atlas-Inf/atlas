@@ -8,7 +8,7 @@ of per-request decode rates) AND the honest wall aggregate.
 
 usage: gufo_bench.py PORT LABEL OUT.json [--depths 0,8192,32768] [--cs 1,2,4,8] [--kinds mixed,repetitive]
 """
-import argparse, json, statistics, sys, time, urllib.request
+import argparse, json, os, statistics, sys, time, urllib.request
 
 ap = argparse.ArgumentParser()
 ap.add_argument("port"); ap.add_argument("label"); ap.add_argument("out")
@@ -20,6 +20,8 @@ ap.add_argument("--reps", type=int, default=2)
 ap.add_argument("--multi-tg", type=int, default=384, help="output tokens per request in the C sweep (long enough that all C decode at once)")
 a = ap.parse_args()
 URL = f"http://127.0.0.1:{a.port}/v1/chat/completions"
+# Request fields for engines that think by default and take no server flag (Halogen): H2H_REQ_EXTRA='{"reasoning_effort":"none"}'
+EXTRA = json.loads(os.environ.get("H2H_REQ_EXTRA") or "{}")
 MODEL = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{a.port}/v1/models", timeout=30).read())["data"][0]["id"]  # the served id (Atlas: m; Gufo: its own)
 
 CORPUS = open("/usr/share/common-licenses/GPL-3").read().split()
@@ -37,7 +39,7 @@ ASK = {"mixed": "\n\nWrite a long, detailed essay explaining the history and pur
 def stream(content, tg=None):
     req = {"model": MODEL, "temperature": 0, "max_tokens": tg or a.tg, "stream": True,
            "stream_options": {"include_usage": True},
-           "messages": [{"role": "user", "content": content}]}
+           "messages": [{"role": "user", "content": content}], **EXTRA}
     t0 = time.time(); first = last = None; usage = {}; n_chunks = 0; stamps = []
     r = urllib.request.urlopen(urllib.request.Request(URL, data=json.dumps(req).encode(),
                                headers={"Content-Type": "application/json"}), timeout=3600)
@@ -58,7 +60,7 @@ def stream(content, tg=None):
     return {"ttft": ttft, "tg": tg, "ptok": usage.get("prompt_tokens"), "ctok": ct, "wall": time.time() - t0, "stamps": stamps}
 
 def warm(content):
-    req = {"model": MODEL, "temperature": 0, "max_tokens": 1, "messages": [{"role": "user", "content": content}]}
+    req = {"model": MODEL, "temperature": 0, "max_tokens": 1, "messages": [{"role": "user", "content": content}], **EXTRA}
     o = json.loads(urllib.request.urlopen(urllib.request.Request(URL, data=json.dumps(req).encode(),
                    headers={"Content-Type": "application/json"}), timeout=3600).read())
     return o.get("usage", {}).get("prompt_tokens") or 0

@@ -92,6 +92,19 @@ llama_up() { # port parallel ctx-per-slot model [extra llama-server args...]
   ENGINE_DOWN() { kill -INT "$LPID" 2>/dev/null; sleep 8; kill -9 "$LPID" 2>/dev/null; cp "$OUT/llama-server.log" "$1" 2>/dev/null; true; }
 }
 
+halogen_up() { # port -- Peonist's published halogen-flash-server image at its defaults (EULA s4 permits benchmarking and
+  # publishing results), weights fetched by the image itself on first start into the runner's scratch.
+  local port=$1 GR GV; GR=$(getent group render | cut -d: -f3); GV=$(getent group video | cut -d: -f3)
+  local md=${HALOGEN_MODELS:-$(dirname "$HFC")/halogen-models}; mkdir -p "$md"
+  docker rm -f halogen-h2h >/dev/null 2>&1
+  docker run -d --name halogen-h2h -p "127.0.0.1:$port:8731" --device /dev/kfd --device /dev/dri --group-add "$GV" --group-add "$GR" \
+    --ipc=host --ulimit memlock=-1:-1 -e HALOGEN_DOWNLOAD=${HALOGEN_REPO:-peonist-ai/halogen-qwen3.8-flash-next} \
+    -e HALOGEN_KV_SLOTS=${SESSIONS:-8} ${HF_ENDPOINT:+-e HF_ENDPOINT=$HF_ENDPOINT} -v "$md":/models \
+    "ghcr.io/peonist-ai/halogen-flash-server:${HALOGEN_TAG:-0.20.1}" > /dev/null
+  ENGINE_ALIVE() { docker ps -q -f name=halogen-h2h | grep -q .; }
+  ENGINE_DOWN() { docker logs halogen-h2h > "$1" 2>&1; docker rm -f halogen-h2h >/dev/null 2>&1; }
+}
+
 atlas_up() { # port model [KEY=VAL env...] -- Atlas through serve-amd.sh at this ref (the binary the workflow just built)
   # ATLAS_MODE: recipe (default; --disable-thinking), refmode (--reference-mode, client sampling + checkpoint template only;
   # thinking kept off through the default template kwarg, which is how the llama.cpp side runs), think (thinking forced on).
@@ -112,9 +125,9 @@ atlas_up() { # port model [KEY=VAL env...] -- Atlas through serve-amd.sh at this
     for _ in $(seq 1 60); do [ "$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)" -gt 40000 ] && break; sleep 2; done; true; }
 }
 
-wait_ready() { # port -> MID (served model id); 0 when a 2-token chat answers
+wait_ready() { # port [tries x5s, default 360] -> MID (served model id); 0 when a 2-token chat answers
   local port=$1
-  for _ in $(seq 1 360); do
+  for _ in $(seq 1 "${2:-360}"); do
     MID=$(curl -s -m 10 "http://127.0.0.1:$port/v1/models" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['data'][0]['id'])" 2>/dev/null)
     [ -n "$MID" ] && curl -s -m 120 "http://127.0.0.1:$port/v1/chat/completions" -H 'Content-Type: application/json' \
       -d "$(python3 -c 'import json,sys; print(json.dumps({"model": sys.argv[1], "messages": [{"role": "user", "content": "hi"}], "max_tokens": 2}))' "$MID")" 2>/dev/null | grep -q choices && return 0
