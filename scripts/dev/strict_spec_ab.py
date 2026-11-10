@@ -17,8 +17,12 @@ short); the server's own `Done:` lines carry the decode-only rate and the
 `serial=`/`mtp=` split, which is what proves the lever engaged. The record
 holds no URL or host name.
 
-Exit status: `run` 0 when every request returned; `compare` 0 when the `on`
-arm has no invalid structured reply.
+A third arm, `serial`, is the lever on with every structured request on a
+verify of its own (`ATLAS_GRAMMAR_SERIAL_VERIFY` set); `compare` takes any two
+records, baseline first.
+
+Exit status: `run` 0 when every request returned; `compare` 0 when the second
+record has no invalid structured reply.
 """
 import argparse
 import concurrent.futures
@@ -203,11 +207,17 @@ def compare(args):
         off = json.load(f)
     with open(args.on) as f:
         on = json.load(f)
-    for rec in (off, on):
-        print(f"- `{rec['arm']}`: commit {rec['commit']}, model {rec['model']}, {rec['date']}, "
+    # Columns carry the records' own arm names; two records of one arm (the
+    # noise floor) read `off` and `off#2`.
+    a_name, b_name = off["arm"], on["arm"]
+    if a_name == b_name:
+        b_name += "#2"
+    for name, rec in ((a_name, off), (b_name, on)):
+        print(f"- `{name}`: commit {rec['commit']}, model {rec['model']}, {rec['date']}, "
               f"reps {rec['reps']}, max_tokens {rec['max_tokens']}; {rec['note']}")
-    print("\n| case | off tok/s (min-max) | on tok/s (min-max) | on/off | invalid off | "
-          "invalid on | identical |\n|---|---|---|---|---|---|---|")
+    print(f"\n| case | {a_name} tok/s (min-max) | {b_name} tok/s (min-max) | "
+          f"{b_name}/{a_name} | invalid {a_name} | invalid {b_name} | identical |"
+          "\n|---|---|---|---|---|---|---|")
     on_invalid, details = 0, []
     for key, off_bs in off["rows"].items():
         on_bs = on["rows"].get(key)
@@ -227,7 +237,7 @@ def compare(args):
         bad_on = [r for r in r_on if r["invalid"]]
         on_invalid += len(bad_on)
         details += [f"- {key} ({arm}): {r['invalid']}"
-                    for arm, bad in (("off", bad_off), ("on", bad_on)) for r in bad[:2]]
+                    for arm, bad in ((a_name, bad_off), (b_name, bad_on)) for r in bad[:2]]
         # Sampled replies are not expected to match across arms.
         if key.startswith("sampled"):
             same = "n/a"
@@ -241,7 +251,8 @@ def compare(args):
                     at = next((n for n, (p, q) in enumerate(zip(x, y)) if p != q),
                               min(len(x), len(y)))
                     details.append(f"- {key} prompt {a['prompt']}: first difference at char "
-                                   f"{at}: off {x[at:at + 40]!r} / on {y[at:at + 40]!r}")
+                                   f"{at}: {a_name} {x[at:at + 40]!r} / "
+                                   f"{b_name} {y[at:at + 40]!r}")
                     break
         ratio = f"{m_on / m_off:.2f}" if m_off else "n/a"
         print(f"| {key} | {s_off} | {s_on} | {ratio} | {len(bad_off)}/{len(r_off)} | "
@@ -249,7 +260,7 @@ def compare(args):
     if details:
         print("\n" + "\n".join(details))
     print(f"\n{'FAIL' if on_invalid else 'PASS'}: {on_invalid} invalid structured "
-          "reply(ies) with the lever on")
+          f"reply(ies) in `{b_name}`")
     return 1 if on_invalid else 0
 
 
@@ -259,7 +270,9 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
     r.add_argument("--url", default="http://127.0.0.1:8081")
-    r.add_argument("--arm", required=True, choices=["off", "on"])
+    r.add_argument("--arm", required=True, choices=["off", "serial", "on"],
+                   help="off: lever unset; serial: lever on, one verify per structured "
+                        "request; on: lever on, batched verify")
     r.add_argument("--out", required=True)
     r.add_argument("--model", default=None)
     r.add_argument("--reps", type=int, default=3)
