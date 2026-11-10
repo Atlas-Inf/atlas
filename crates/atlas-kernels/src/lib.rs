@@ -386,6 +386,12 @@ pub struct ModelBehavior {
     /// transformers): no Atlas tool prompt, hints or injected kwargs, and
     /// `tojson` spaced like `json.dumps`. Default `false`.
     pub verbatim_prompt: bool,
+    /// `verbatim_prompt` for a checkpoint that is a ModelOpt NVFP4 pack and
+    /// NOT FP4-Local (`ModeloptQuantPlan::from_config` returns a plan and
+    /// `!plan.is_fp4_local()`). `None` (the default) = `verbatim_prompt`
+    /// applies to every checkpoint. Resolved once at serve start, so every
+    /// `verbatim_prompt` reader sees the resolved value.
+    pub nvfp4_verbatim_prompt: Option<bool>,
     /// An end token sampled inside `<think>` ends the turn, as on the
     /// reference engines. Default `false` (discarded, or the block closed
     /// under `honor_eos_inside_thinking`).

@@ -292,4 +292,10 @@ fn target_model_toml_ships_verbatim_prompt_off() {
         "the MODEL.toml 2026-11-02 override wants verbatim_prompt = false; \
          if this flips back, re-check the #271 attribution numbers"
     );
+    assert_eq!(
+        b.nvfp4_verbatim_prompt,
+        Some(true),
+        "the 2026-11-05 per-checkpoint key wants the vendor NVFP4 pack verbatim; \
+         FP4-Local/EXL3 still resolve to verbatim_prompt = false at serve start"
+    );
 }

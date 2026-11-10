@@ -15,6 +15,8 @@
 mod activations;
 #[path = "ops/bf16_gemm_cutlass.rs"]
 mod bf16_gemm_cutlass;
+#[path = "ops/dense_bf16mma.rs"]
+mod dense_bf16mma;
 #[path = "ops/dense_gemv_multi.rs"]
 mod dense_gemv_multi;
 #[path = "ops/derived_reserve.rs"]
@@ -325,6 +327,7 @@ mod wide_prefill;
 
 pub use activations::*;
 pub use bf16_gemm_cutlass::*;
+pub use dense_bf16mma::{DenseBf16mma, LowpArgs, LowpMix, fp8_scale_k_uniform};
 pub use dense_gemv_multi::*;
 pub use derived_reserve::{lazy_bf16_copy_bytes, lazy_bf16_reserve, lazy_bf16_reserve_enabled};
 pub use derived_weights::{Derivation, DerivedWeights};

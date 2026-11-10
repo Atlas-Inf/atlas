@@ -252,6 +252,32 @@ impl MoeLayer {
         // kernels write every row that can be referenced by unpermute_reduce.
         // Skipping the memset removes ~138 MB/layer of scratch clears on Holo.
         self.prepare_ep_prefill_outputs(total_expanded, inter, h, ctx, stream)?;
+        // ATLAS_MOE_PREFILL_BF16MMA: BF16 tensor cores, SiLU fused into gate/up
+        // (`forward_prefill_bf16mma.rs`).
+        if max_m_tiles > 0 && self.bf16mma_serves(h, inter, ctx) {
+            self.bf16mma_gate_up(
+                expert_input,
+                expert_offsets,
+                sorted_token_ids,
+                num_experts,
+                h,
+                inter,
+                max_m_tiles,
+                ctx,
+                stream,
+            )?;
+            prof_step!("grouped_gate_up");
+            self.bf16mma_down(
+                expert_offsets,
+                num_experts,
+                [h, inter],
+                [max_m_tiles, avg_per_expert as u32],
+                ctx,
+                stream,
+            )?;
+            prof_step!("grouped_silu_down");
+            return Ok(None);
+        }
         // ATLAS_QWEN4EXP_PREFILL_MOE: the whole chain below on the q38
         // kernels, byte for byte (`forward_prefill_q38.rs`).
         if max_m_tiles > 0

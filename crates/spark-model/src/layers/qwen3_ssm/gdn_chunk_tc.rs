@@ -1,0 +1,149 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Fused chunked GDN prefill on BF16 tensor cores (`gdn_chunk_tc.cu`,
+//! lever `ATLAS_GDN_CHUNK_TC=1`): one launch per GDN scan in place of the
+//! FLA path's three, for the single-stream, uniform-batch and varlen scans.
+//! The handle is looked up only with the lever set (and only the 27B dense
+//! targets ship the module), so other boot audits are unchanged.
+
+use spark_runtime::kernel_args::KernelLaunch;
+
+use super::*;
+
+/// Kernel module and entry points: the scan, and the multi-stream conv1d a
+/// score pass runs ahead of it.
+const MODULE: &str = "gdn_chunk_tc";
+const FUNC: &str = "gdn_chunk_tc_prefill";
+const FUNC_CONV: &str = "gdn_chunk_tc_conv1d_varlen";
+/// `gdn_chunk_tc::SMEM` in the kernel.
+const SMEM: u32 = 99_328;
+/// Value columns per CTA (`gdn_chunk_tc::DV`).
+const DV: u32 = 64;
+
+/// `[scan, conv1d]` when the lever is set and the target ships them.
+pub(super) fn load(gpu: &dyn GpuBackend) -> [KernelHandle; 2] {
+    let on = std::env::var("ATLAS_GDN_CHUNK_TC").as_deref() == Ok("1");
+    [FUNC, FUNC_CONV].map(|f| super::super::try_kernel_gated(on, gpu, MODULE, f))
+}
+
+/// One GDN scan's operands: the packed buffers, `batch` streams of
+/// `seq_len` rows each (or `cu_seqlens` when varlen), and the state (a
+/// contiguous base or a device table of per-stream bases).
+pub(super) struct ChunkTcScan {
+    pub h_state: DevicePtr,
+    pub h_state_is_table: bool,
+    pub batch: u32,
+    pub seq_len: u32,
+    pub cu_seqlens: Option<DevicePtr>,
+    /// Device table of per-stream entry states read in place of `h_state`
+    /// (`NULL`: start from `h_state`).
+    pub h_init: DevicePtr,
+}
+
+impl Qwen3SsmLayer {
+    /// Whether every GDN scan under `ctx` runs on the fused kernel: the lever
+    /// and kernel are present, not an exact replay, 128-dim heads. The kernel
+    /// L2-normalizes Q and K itself, so the separate pass is skipped exactly
+    /// when this holds (`prefill_phase1_l2_batched`).
+    pub(super) fn gdn_chunk_tc_serves(&self, ctx: &ForwardContext) -> bool {
+        let c = ctx.config;
+        let (nk, nv) = (c.linear_num_key_heads, c.linear_num_value_heads);
+        self.gdn_chunk_tc_k[0].0 != 0
+            && !ctx.gdn_exact_replay
+            && c.linear_key_head_dim == 128
+            && c.linear_value_head_dim == 128
+            && nk != 0
+            && nv.is_multiple_of(nk)
+    }
+
+    /// Run `scan` on the fused kernel. `Ok(false)`: not eligible (lever off,
+    /// kernel absent, exact replay, or not 128-dim heads); the caller keeps
+    /// its own ladder.
+    pub(super) fn try_gdn_chunk_tc(
+        &self,
+        gdn_bufs: &GdnPrefillBuffers,
+        scan: ChunkTcScan,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        if !self.gdn_chunk_tc_serves(ctx) {
+            return Ok(false);
+        }
+        let c = ctx.config;
+        let (nk, kd) = (c.linear_num_key_heads, c.linear_key_head_dim);
+        let (nv, vd) = (c.linear_num_value_heads, c.linear_value_head_dim);
+        if ctx.stats.once("log:gdn_chunk_tc") {
+            tracing::info!("GDN prefill: fused chunked tensor-core scan ACTIVE ({MODULE}::{FUNC})");
+        }
+        let key_dim = nk * kd;
+        let conv_dim = (key_dim * 2 + nv * vd) as u32;
+        let (bf16, fp32) = (2usize, 4usize);
+        KernelLaunch::new(ctx.gpu, self.gdn_chunk_tc_k[0])
+            .grid([vd as u32 / DV, nv as u32, scan.batch])
+            .block([256, 1, 1])
+            .shared_mem(SMEM)
+            .arg_ptr(scan.h_state)
+            .arg_ptr(gdn_bufs.qkv)
+            .arg_ptr(gdn_bufs.qkv.offset(key_dim * bf16))
+            .arg_ptr(gdn_bufs.qkv.offset(key_dim * 2 * bf16))
+            .arg_ptr(gdn_bufs.gate_beta)
+            .arg_ptr(gdn_bufs.gate_beta.offset(nv * fp32))
+            .arg_ptr(gdn_bufs.output)
+            .arg_u32(scan.batch)
+            .arg_u32(scan.seq_len)
+            .arg_u32(nk as u32)
+            .arg_u32(nv as u32)
+            .arg_u32(conv_dim)
+            .arg_u32(conv_dim)
+            .arg_u32((nv * 2) as u32)
+            .arg_u32(scan.h_state_is_table as u32)
+            .arg_ptr(scan.cu_seqlens.unwrap_or(DevicePtr::NULL))
+            .arg_u32(scan.cu_seqlens.is_some() as u32)
+            .arg_ptr(scan.h_init)
+            .launch(stream)?;
+        Ok(true)
+    }
+
+    /// conv1d + SiLU for `batch` streams in one launch (score pass): stream b
+    /// over rows `[cu[b], cu[b + 1])` of the projection rows from pass row
+    /// `row0` into `gdn_bufs.qkv`, its window read from the conv state in the
+    /// device table `inits` and written to the one in `states` (a branch reads
+    /// its head's, no copy). `Ok(false)`: the kernel is not loaded.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn try_conv1d_varlen(
+        &self,
+        [states, inits]: [DevicePtr; 2],
+        row0: usize,
+        gdn_bufs: &GdnPrefillBuffers,
+        batch: u32,
+        cu_seqlens: DevicePtr,
+        max_len: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        if self.gdn_chunk_tc_k[1].0 == 0 || !self.gdn_chunk_tc_serves(ctx) {
+            return Ok(false);
+        }
+        let c = ctx.config;
+        let conv_dim = c.linear_num_key_heads * c.linear_key_head_dim * 2
+            + c.linear_num_value_heads * c.linear_value_head_dim;
+        let qkvz = c.ssm_qkvz_size();
+        KernelLaunch::new(ctx.gpu, self.gdn_chunk_tc_k[1])
+            .grid([(conv_dim as u32).div_ceil(32), max_len.div_ceil(64), batch])
+            .block([32, 8, 1])
+            .arg_ptr(states)
+            .arg_ptr(inits)
+            .arg_ptr(ctx.buffers.ssm_deinterleaved().offset(row0 * qkvz * 2))
+            .arg_ptr(self.ssm.conv1d.weight)
+            .arg_ptr(DevicePtr::NULL) // no bias, as conv1d_update_prefill
+            .arg_ptr(gdn_bufs.qkv)
+            .arg_ptr(cu_seqlens)
+            .arg_u32(conv_dim as u32)
+            .arg_u32(c.linear_conv_kernel_dim as u32)
+            .arg_u32(qkvz as u32)
+            .arg_u32(conv_dim as u32)
+            .arg_u32(batch)
+            .launch(stream)?;
+        Ok(true)
+    }
+}

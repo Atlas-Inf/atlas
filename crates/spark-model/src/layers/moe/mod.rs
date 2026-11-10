@@ -214,6 +214,7 @@ mod forward_pair_verify;
 mod forward_phase;
 mod forward_prefill;
 mod forward_prefill_bf16;
+mod forward_prefill_bf16mma;
 mod forward_prefill_finish;
 mod forward_prefill_fp8;
 mod forward_prefill_phase;

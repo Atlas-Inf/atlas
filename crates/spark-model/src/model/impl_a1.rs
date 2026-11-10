@@ -696,6 +696,7 @@ impl TransformerModel {
             lm_head_nvfp4,
             lm_head_nvfp4_t,
             lm_head_fp8,
+            score_head_rows: Default::default(),
             layers,
             buffers,
             prefill_pipe: None,

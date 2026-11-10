@@ -5,7 +5,9 @@
 //!
 //! Each PDL target names its switch and its own kernel list: GLM-5.3-Flash
 //! under `ATLAS_PDL=1` ([`PDL_KERNELS`]), Qwen3.8-Flash-Next under
-//! `ATLAS_QWEN4EXP_PDL=1` ([`QWEN4EXP_PDL_KERNELS`]). A list is its target's
+//! `ATLAS_QWEN4EXP_PDL=1` ([`QWEN4EXP_PDL_KERNELS`]), Ricursive Ripple under
+//! `ATLAS_RICURSIVE_PDL=1` ([`RICURSIVE_PDL_KERNELS`]), Qwen3.8-27B under
+//! `ATLAS_QWEN38_PDL=1` ([`QWEN38_PDL_KERNELS`]). A list is its target's
 //! own: a `common/` kernel that waits for one target's sake is launched with
 //! PDL only where a target lists it (without the launch attribute its
 //! `griddepcontrol` instructions are no-ops).
@@ -37,6 +39,11 @@ pub(super) const PDL_TARGETS: &[PdlTarget] = &[
         model: "ricursive-ripple-65b",
         switch: "ATLAS_RICURSIVE_PDL",
         kernels: RICURSIVE_PDL_KERNELS,
+    },
+    PdlTarget {
+        model: "qwen3.8-27b",
+        switch: "ATLAS_QWEN38_PDL",
+        kernels: QWEN38_PDL_KERNELS,
     },
 ];
 
@@ -307,6 +314,39 @@ pub(super) const RICURSIVE_PDL_KERNELS: &[&str] = &[
     "paged_decode_attn",
     "reshape_and_cache_flash",
     "sigmoid_gate_mul",
+];
+
+/// Qwen3.8-27B (`ATLAS_QWEN38_PDL=1`, kernels of qwen3.6-27b's tree): the
+/// dense prefill GEMMs with their activation quantizers and the GDN BA gates
+/// (`dense_bf16mma_prefill.cu`, `gdn_ba_gates_prefill.cu`), and the prefill
+/// glue that already enters first. The norms, the GDN scan and conv, and
+/// attention are not PDL-entered: a listed kernel after one of them launches
+/// when it completes.
+pub(super) const QWEN38_PDL_KERNELS: &[&str] = &[
+    "dense_bf16mma_gate_up_silu",
+    "dense_bf16mma_nvfp4",
+    "dense_bf16mma_fp8",
+    "dense_w4a4_gate_up_silu",
+    "dense_w4a4_nvfp4",
+    "dense_w4a8_gate_up_silu",
+    "dense_w4a8_nvfp4",
+    "dense_w4a8_gate_up_silu_mx",
+    "dense_w4a8mx_nvfp4",
+    "dense_w4a8ws_gate_up_silu",
+    "dense_w4a8ws_nvfp4",
+    "dense_w4a4ws_gate_up_silu",
+    "dense_w4a4ws_nvfp4",
+    "dense_w4a4wsl_gate_up_silu",
+    "dense_w4a4wsl_nvfp4",
+    "dense_w8a8_fp8",
+    "dense_w8a8_fp8t",
+    "dl_quant_nvfp4",
+    "dl_quant_fp8",
+    "gdn_ba_gates_prefill",
+    "gdn_ba_gates_prefill_small",
+    "bf16_residual_add",
+    "rope_forward_mrope_interleaved",
+    "reshape_and_cache_flash",
 ];
 
 #[cfg(test)]

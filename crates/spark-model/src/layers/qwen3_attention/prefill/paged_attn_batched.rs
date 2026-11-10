@@ -40,6 +40,17 @@ pub(in crate::layers::qwen3_attention) struct PagedAttnBatchedArgs<'a> {
 }
 
 impl Qwen3AttentionLayer {
+    /// [`crate::layer::TransformerLayer::honours_state_end`]: the batched
+    /// paged kernels below (rows128 included) apply `state_end` when no
+    /// sliding window is set. MLA, mHC and the QSA indexer take other routes,
+    /// and HSS, HDIM > 256 and other KV dtypes refuse batched mode outright.
+    pub(in crate::layers::qwen3_attention) fn honours_state_end_inner(&self) -> bool {
+        self.mla.is_none()
+            && self.hc.is_none()
+            && self.qsa.is_none()
+            && self.sliding_window.is_none()
+    }
+
     /// Run batched paged Flash Attention across N streams. Uses the
     /// `prefill_attention_paged_*_batched` kernels shipped in commit
     /// 4ec2cf2 + ops bindings from commit a96fc67.
@@ -120,6 +131,7 @@ impl Qwen3AttentionLayer {
                     batch_size,
                     cu_seqlens,
                     kv_lens,
+                    batched_meta.state_end,
                     chunk_len,
                     kv_len,
                     q_offset_u32,
@@ -152,6 +164,7 @@ impl Qwen3AttentionLayer {
                     batch_size,
                     cu_seqlens,
                     kv_lens,
+                    batched_meta.state_end,
                     chunk_len,
                     kv_len,
                     q_offset_u32,
@@ -184,6 +197,7 @@ impl Qwen3AttentionLayer {
                     batch_size,
                     cu_seqlens,
                     kv_lens,
+                    batched_meta.state_end,
                     chunk_len,
                     kv_len,
                     q_offset_u32,
@@ -217,6 +231,7 @@ impl Qwen3AttentionLayer {
                     batch_size,
                     cu_seqlens,
                     kv_lens,
+                    batched_meta.state_end,
                     chunk_len,
                     kv_len,
                     q_offset_u32,
@@ -250,6 +265,7 @@ impl Qwen3AttentionLayer {
                     batch_size,
                     cu_seqlens,
                     kv_lens,
+                    batched_meta.state_end,
                     chunk_len,
                     kv_len,
                     q_offset_u32,
@@ -258,6 +274,26 @@ impl Qwen3AttentionLayer {
                     hd,
                     bs_u,
                     self.sliding_window.unwrap_or(0),
+                    inv_sqrt_d,
+                    stream,
+                )?;
+            }
+            (KvCacheDtype::Bf16, true) if super::rows128::available(ctx.gpu) && hd == 256 => {
+                // Same arguments and bit-identical output, 128-row tiles.
+                let pools = super::rows128::Pools {
+                    k: kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    v: kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    blocks: kv_cache.num_blocks(),
+                    block_stride: kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx),
+                };
+                super::rows128::launch(
+                    ctx.gpu,
+                    pools,
+                    [q_contiguous, attn_out, block_table_ptrs],
+                    batch_size,
+                    [cu_seqlens, kv_lens, batched_meta.state_end],
+                    [chunk_len, kv_len, q_offset_u32],
+                    [nq, nkv, hd, bs_u, self.sliding_window.unwrap_or(0)],
                     inv_sqrt_d,
                     stream,
                 )?;
@@ -280,6 +316,7 @@ impl Qwen3AttentionLayer {
                     batch_size,
                     cu_seqlens,
                     kv_lens,
+                    batched_meta.state_end,
                     chunk_len,
                     kv_len,
                     q_offset_u32,

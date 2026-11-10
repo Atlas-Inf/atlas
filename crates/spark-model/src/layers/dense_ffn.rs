@@ -21,6 +21,8 @@ mod dp4a_decode;
 mod native;
 #[path = "dense_ffn_prefill_bf16.rs"]
 mod prefill_bf16;
+#[path = "dense_ffn_prefill_bf16mma.rs"]
+mod prefill_bf16mma;
 #[path = "dense_ffn_tp_split.rs"]
 mod tp_split;
 #[path = "dense_ffn_w4a4_rows.rs"]
@@ -337,6 +339,8 @@ pub struct DenseFfnLayer {
     // KernelHandle(0) when absent → falls back to the transient-dequant path.
     q2_0_mmq_nc_k: KernelHandle,
     q2_0_mmq_wc_k: KernelHandle,
+    /// NVFP4 prefill on BF16 tensor cores (`dense_ffn_prefill_bf16mma.rs`).
+    bf16mma: ops::DenseBf16mma,
 }
 
 /// Whether the NVFP4 W4A4 MMQ prefill arm (`atlas_nvfp4_mmq*` + the FP4
@@ -600,6 +604,7 @@ impl DenseFfnLayer {
             // packed-Q2 weights.
             q2_0_mmq_nc_k: KernelHandle(0),
             q2_0_mmq_wc_k: KernelHandle(0),
+            bf16mma: ops::DenseBf16mma::load(gpu),
         };
         Ok(layer)
     }
@@ -2264,6 +2269,9 @@ impl DenseFfnLayer {
             return Ok(());
         }
 
+        if self.try_prefill_bf16mma(input, m, ctx, stream)? {
+            return Ok(());
+        }
         // Prefill: prefer the 128x128 cp.async-pipelined `w4a16_gemm_t_m128`
         // (the kernel attention/SSM use) over the M64xN64 base `w4a16_gemm`
         // (~10 TFLOPS, the flat ~155 tok/s bottleneck). That kernel needs the

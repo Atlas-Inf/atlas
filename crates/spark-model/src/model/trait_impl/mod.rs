@@ -291,6 +291,16 @@ impl Model for TransformerModel {
     ) -> Result<Vec<DevicePtr>> {
         self.prefill_batch_chunk_rows(streams, stream, 0)
     }
+    fn score_requests(
+        &self,
+        reqs: &[crate::traits::ScoreInput<'_>],
+        stream: u64,
+    ) -> Result<Vec<Vec<Vec<f32>>>> {
+        self.score_requests_impl(reqs, stream)
+    }
+    fn score_capacity(&self) -> (usize, usize) {
+        self.score_capacity_impl()
+    }
     fn supports_prefill_multi(&self) -> bool {
         self.prefill_multi_supported()
     }
@@ -595,7 +605,7 @@ impl Model for TransformerModel {
         self.decode_marconi_checkpoint_dispatch(seq)
     }
     fn free_sequence(&self, seq: &mut SequenceState) -> Result<()> {
-        self.free_sequence_dispatch(seq)
+        self.free_sequence_dispatch(seq, true)
     }
     fn decode_verify_graphed(
         &self,
