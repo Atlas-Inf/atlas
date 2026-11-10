@@ -46,6 +46,7 @@ pub(crate) async fn build_and_serve(
         .route("/v1/chat/completions", post(api::chat_completions))
         .route("/v1/chat/completions/{id}", get(api::get_stored_completion))
         .route("/v1/completions", post(api::completions))
+        .route("/v1/score", post(api::score))
         .route("/v1/responses", post(api::responses_endpoint))
         .route(
             "/v1/responses/{id}",

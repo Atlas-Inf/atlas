@@ -12,9 +12,11 @@ use crate::layer::{ForwardContext, LayerState};
 use crate::layers::ops;
 
 mod attn;
+mod attn_rows;
 mod c4;
 mod ctx;
 mod ffn;
+mod ffn_perinorm;
 pub(crate) use ffn::{
     grouped_routed_decode_enabled, grouped_routed_decode_min, pairwise_moe_decode_enabled,
 };
@@ -39,6 +41,7 @@ mod qkv_dp4a;
 mod qkv_exact4;
 mod qkv_fp8;
 mod qkv_mx8;
+mod qkv_valres;
 mod qsa_rows;
 #[cfg(test)]
 mod tests;
@@ -96,6 +99,8 @@ impl Qwen3AttentionLayer {
             c.seq_slot = m.seq_slot;
         }
         c.active = active_rows.min(num_seqs);
+        c.single_seq_rows =
+            num_seqs > 1 && row_owner.is_some_and(|o| o.iter().all(|&s| Some(&s) == o.first()));
 
         // DeepSeek-V4 / Qwen4-exp: Manifold-Constrained Hyper-Connections.
         if self.hc.is_some() {
@@ -106,6 +111,7 @@ impl Qwen3AttentionLayer {
         let _ = (states, row_owner); // Non-hc attention keeps no per-seq state.
 
         // ── Phase 1: RMS norm + residual for N tokens ──
+        self.value_residual_capture(ctx.gpu, c.hidden, c.n, c.h, c.stream)?;
         ops::rms_norm_residual(
             ctx.gpu,
             self.rms_norm_residual_k,

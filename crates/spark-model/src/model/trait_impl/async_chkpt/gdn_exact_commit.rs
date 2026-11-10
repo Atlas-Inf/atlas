@@ -37,6 +37,20 @@ impl TransformerModel {
         num_accepted: usize,
         stream: u64,
     ) -> Result<()> {
+        let rows: Vec<usize> = (0..num_accepted).collect();
+        self.commit_gdn_exact_rows(layers, &rows, stream)
+    }
+
+    /// Replay the staged verify rows `rows` (a prefix, or on qwen3_5 also a
+    /// tree's root path) into `layers` on `stream`: qwen3_5's deferred fused
+    /// rows (`ATLAS_QWEN38_VERIFY_DEFER`, `qwen35_gdn_commit_rows`) where its
+    /// kernels are in the set, else qwen4_exp's prefix commit.
+    pub(in crate::model::trait_impl) fn commit_gdn_exact_rows(
+        &self,
+        layers: &[GdnCommitLayer],
+        rows: &[usize],
+        stream: u64,
+    ) -> Result<()> {
         anyhow::ensure!(
             layers
                 .iter()
@@ -44,6 +58,30 @@ impl TransformerModel {
             "deferred GDN commit: a pending layer without staging or conv weight"
         );
         let c = &self.config;
+        let q38 = crate::layers::ops::qwen38_decode_fuse::defer_on()
+            && crate::layers::ops::qwen38_decode_fuse::defer_kernels(self.gpu.as_ref())
+                .1
+                .0
+                != 0;
+        if q38 {
+            return crate::layers::ops::qwen38_decode_fuse::gdn_commit_rows(
+                self.gpu.as_ref(),
+                layers,
+                rows,
+                c.linear_num_key_heads as u32,
+                c.linear_num_value_heads as u32,
+                c.linear_key_head_dim as u32,
+                c.linear_value_head_dim as u32,
+                c.linear_conv_kernel_dim as u32,
+                1e-6,
+                stream,
+            );
+        }
+        anyhow::ensure!(
+            rows.iter().enumerate().all(|(i, &r)| r == i),
+            "deferred GDN commit: rows {rows:?} are not a prefix"
+        );
+        let num_accepted = rows.len();
         gdn_commit_layers(
             self.gpu.as_ref(),
             layers,

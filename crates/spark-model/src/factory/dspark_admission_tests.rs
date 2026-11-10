@@ -182,6 +182,7 @@ fn generic_non_lightning_architecture_returns_none() {
         drafter_config: parse_value(&value),
         gamma: None,
         window_size: Some(4096),
+        alt: None,
     };
     let target = ModelConfig::qwen3_next_80b_nvfp4();
     assert!(
@@ -435,6 +436,7 @@ fn build_mapper_accepts_exact_lightning_swa_window() {
         drafter_config: config,
         gamma: Some(4),
         window_size: Some(1024),
+        alt: None,
     };
     let mut target = ModelConfig::qwen3_next_80b_nvfp4();
     target.model_type = "nemotron_h".to_owned();
@@ -453,6 +455,7 @@ fn build_mapper_accepts_exact_lightning_swa_window() {
         drafter_config: parse_dflash_config(OFFICIAL_LIGHTNING_JSON).unwrap(),
         gamma: None,
         window_size: Some(1024),
+        alt: None,
     };
     assert!(
         admit_lightning_dspark_build(&missing_gamma, &target, 3, 16, KvCacheDtype::Fp8).is_err()
@@ -467,6 +470,7 @@ fn build_mapper_rejects_missing_lightning_swa_window() {
         drafter_config: config,
         gamma: Some(4),
         window_size: None,
+        alt: None,
     };
     let mut target = ModelConfig::qwen3_next_80b_nvfp4();
     target.tp_world_size = 1;
@@ -487,6 +491,7 @@ fn build_mapper_rejects_wrong_lightning_swa_window() {
         drafter_config: config,
         gamma: Some(4),
         window_size: Some(4096),
+        alt: None,
     };
     let mut target = ModelConfig::qwen3_next_80b_nvfp4();
     target.tp_world_size = 1;

@@ -30,6 +30,7 @@ pub(crate) fn app_state(tokenizer: crate::tokenizer::ChatTokenizer) -> AppState 
         request_tx,
         reference_mode: false,
         rotation_tx: None,
+        score_tx: None,
         vision_config: None,
         vision_max_pixels: None,
         remote_image_policy: Default::default(),

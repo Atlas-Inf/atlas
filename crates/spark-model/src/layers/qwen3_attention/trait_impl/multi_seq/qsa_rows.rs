@@ -253,7 +253,7 @@ impl Qwen3AttentionLayer {
                     inv_sqrt_d,
                     nq * hd,
                     fwd.buffers.splitk_workspace(),
-                    fwd.levers.max_decode_seqs,
+                    fwd.levers.attn_split_ref_seqs(),
                     stream,
                 )?,
             }

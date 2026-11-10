@@ -318,6 +318,16 @@ impl BlockDiffusionDraftHead {
                     ctx,
                     stream,
                 )?;
+            } else if let Some(d) = self.dspine.as_ref() {
+                self.dspine_tail(
+                    ctx.gpu,
+                    self.batch_logits,
+                    batch_rows,
+                    self.dspine_batch_blocks(),
+                    &d.batch,
+                    self.batch_tokens,
+                    stream,
+                )?;
             } else {
                 self.run_batched_markov(batch_size, ctx, stream)?;
             }

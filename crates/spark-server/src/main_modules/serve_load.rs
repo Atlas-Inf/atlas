@@ -399,6 +399,21 @@ pub(crate) fn load_model(
             None => ptx_set,
         }
     };
+    // `nvfp4_verbatim_prompt` resolves to one `verbatim_prompt` value here so
+    // every downstream reader — the tokenizer, `ChatLevers`, the
+    // reference-mode copy, AppState, `log_behavior_audit` — sees it.
+    let ptx_set = {
+        let mut s = ptx_set;
+        let resolved = resolve_verbatim_prompt(&s.behavior, &config);
+        if resolved != s.behavior.verbatim_prompt {
+            tracing::info!(
+                "nvfp4_verbatim_prompt: checkpoint is a ModelOpt NVFP4 pack (not FP4-Local); verbatim_prompt {} -> {resolved}",
+                s.behavior.verbatim_prompt
+            );
+        }
+        s.behavior.verbatim_prompt = resolved;
+        s
+    };
     let sampling_presets = ptx_set.sampling;
     // Record the RESOLVED target identity for the dashboard's kernel table.
     // It used to re-run resolution from (model_type, hidden_size), but that
@@ -470,6 +485,15 @@ pub(crate) fn load_model(
     // [behavior].default_num_drafts → engine default. After this call
     // `args.num_drafts` is Some and `args.resolved_num_drafts()` is valid.
     serve_phases::apply_model_default_num_drafts(&mut args, &ptx_set);
+    // MODEL.toml [dflash].drop_bf16: only where every drafter pass fits the
+    // NVFP4 batched-GEMV tiers (max_batch_size x γ <= 16 rows); wider passes
+    // read the BF16 projections.
+    if args.dflash
+        && ptx_set.dflash.as_ref().is_some_and(|d| d.drop_bf16)
+        && args.max_batch_size * args.resolved_dflash_gamma() <= 16
+    {
+        spark_model::weight_loader::dflash_preshrink::set_target_default();
+    }
 
     // ── Pre-load reserve preflight ──
     let (gpu, free_mem, prepared_topology, reserve) =
@@ -710,6 +734,7 @@ pub(crate) fn load_model(
         }
     }
     let dflash_drafter_state = serve_phases::load_dflash_drafter(&args, &ptx_set, gpu.as_ref())?;
+    let dflash_alt_state = serve_phases::load_dflash_drafter_alt(&args, gpu.as_ref())?;
     // LoRA adapters: resolve + load BEFORE `gpu` is moved into build_model.
     // `lora_states` must outlive build_model (lora_args borrows &l.store) and
     // stays alive until after AppState construction (adapter name clones).
@@ -755,6 +780,7 @@ pub(crate) fn load_model(
                 } else {
                     None
                 },
+                alt: dflash_alt_state.as_ref().map(|(s, c)| (s, c.clone())),
             });
     // NLLB / M2M-100: resolve the translation language pair to token ids from
     // the checkpoint tokenizer (the ChatTokenizer isn't built until after the
@@ -941,6 +967,9 @@ pub(crate) fn load_model(
     // LoRA adapter-rotation control channel (POST /v1/lora/active). Small: it
     // carries only control messages, applied one-at-a-time at quiescence.
     let (rotation_tx, rotation_rx) = mpsc::channel::<scheduler::LoraRotation>(8);
+    // Prefill-only score jobs (POST /v1/score).
+    let (score_tx, score_rx) =
+        mpsc::channel::<scheduler::score::ScoreJob>(scheduler::score::MAX_PENDING_JOBS);
 
     let model_name = serve_phases::resolve_model_name(&args, &config_json, &model_dir);
 
@@ -950,6 +979,8 @@ pub(crate) fn load_model(
     // model whose tower did not load (window 0) serves text only, and the
     // API refuses media as it does for a text model.
     let (vision_window_rows, vision_request_bound) = scheduler_model.vision_row_limits();
+    // Likewise `/v1/score`: (0, 0) = this model does not score (501).
+    let score_capacity = scheduler_model.score_capacity();
     let vision_config = config.vision.clone().filter(|_| vision_window_rows > 0);
     if config.vision.is_some() && vision_config.is_none() {
         tracing::warn!(
@@ -1197,6 +1228,7 @@ pub(crate) fn load_model(
                 scheduler_model,
                 request_rx,
                 rotation_rx,
+                score_rx,
                 scheduler_eos,
                 max_batch_size,
                 use_speculative,
@@ -1395,6 +1427,10 @@ pub(crate) fn load_model(
         } else {
             Some(rotation_tx)
         },
+        score_tx: (score_capacity != (0, 0)).then(|| scheduler::score::ScoreQueue {
+            tx: score_tx,
+            budget: scheduler::score::ScoreBudget::new(score_capacity, max_batch_size, block_size),
+        }),
         chat: crate::api::chat::levers::ChatLevers::resolve(&ptx_set.behavior),
         vision_max_pixels,
         vision_limits: vision_config.as_ref().map(|_| {
@@ -1477,6 +1513,22 @@ pub(crate) fn load_model(
         port: args.port,
         scheduler: scheduler_handle,
     }))
+}
+
+/// `nvfp4_verbatim_prompt` applies only when the checkpoint resolves to a
+/// ModelOpt plan that is not FP4-Local; every other checkpoint (EXL3,
+/// FP4-Local, no plan) keeps the baked `verbatim_prompt`.
+fn resolve_verbatim_prompt(
+    b: &atlas_kernels::ModelBehavior,
+    config: &atlas_core::config::ModelConfig,
+) -> bool {
+    match (
+        b.nvfp4_verbatim_prompt,
+        spark_model::weight_map::modelopt_plan::ModeloptQuantPlan::from_config(config),
+    ) {
+        (Some(v), Some(plan)) if !plan.is_fp4_local() => v,
+        _ => b.verbatim_prompt,
+    }
 }
 
 #[cfg(test)]

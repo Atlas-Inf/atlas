@@ -17,14 +17,21 @@ use crate::weight_map::{
 
 #[path = "dense_ffn_dp4a.rs"]
 mod dp4a_decode;
+#[path = "dense_ffn_exact.rs"]
+mod exact_rows;
 #[path = "dense_ffn_native.rs"]
 mod native;
 #[path = "dense_ffn_prefill_bf16.rs"]
 mod prefill_bf16;
+#[path = "dense_ffn_prefill_bf16mma.rs"]
+mod prefill_bf16mma;
 #[path = "dense_ffn_tp_split.rs"]
 mod tp_split;
+#[path = "dense_ffn_w4a4_rows.rs"]
+mod w4a4_rows;
 pub use native::DenseNative;
 pub(crate) use tp_split::dense_tp_split_requested;
+pub use w4a4_rows::W4a4InputScales;
 
 pub struct DenseFfnWeights {
     pub gate_proj: QuantizedWeight,
@@ -158,6 +165,8 @@ pub struct DenseFfnLayer {
     // ~10 TFLOPS at M=8k and was the flat ~155 tok/s dense-FFN prefill
     // bottleneck on Qwen3.6-27B. KernelHandle(0) on miss → scalar-tile fallback.
     w4a16_gemm_t_m128_k: KernelHandle,
+    /// Small-M row-GEMV (`ATLAS_FFN_ROWGEMV=1`); handles 0 off strix-hip.
+    w4a16_rowgemv: super::ops::RowGemvKernels,
     w4a16_gemm_t_m128_k16_k: KernelHandle,
     // v2: 8-warp (256-thread) variant of t_m128 — parallel chunk MMAs, 3 CTAs/SM.
     // Preferred over t_m128 for dense-FFN prefill when present. KernelHandle(0) → use t_m128.
@@ -255,6 +264,8 @@ pub struct DenseFfnLayer {
     w4a16_gemm_t_k64_k: KernelHandle,
     /// SiLU(gate)*up or GELU(gate)*up depending on activation.
     act_mul: KernelHandle,
+    /// Multi-row passes on W4A4 at the checkpoint's input scales (`enable_w4a4_rows`).
+    w4a4_rows: Option<w4a4_rows::W4a4Rows>,
     /// BF16 dense MLP weights — when `Some`, all forward paths use the
     /// `dense_gemv_bf16` / `dense_gemm_bf16` kernels instead of w4a16
     /// NVFP4. Falls back to the NVFP4 weights when `None`. Set via
@@ -330,6 +341,8 @@ pub struct DenseFfnLayer {
     // KernelHandle(0) when absent → falls back to the transient-dequant path.
     q2_0_mmq_nc_k: KernelHandle,
     q2_0_mmq_wc_k: KernelHandle,
+    /// NVFP4 prefill on BF16 tensor cores (`dense_ffn_prefill_bf16mma.rs`).
+    bf16mma: ops::DenseBf16mma,
 }
 
 /// Whether the NVFP4 W4A4 MMQ prefill arm (`atlas_nvfp4_mmq*` + the FP4
@@ -505,6 +518,7 @@ impl DenseFfnLayer {
             w4a16_batchm: W4a16BatchmTiers::resolve(gpu, model_type == "glm5_next"),
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_m128_k: super::ops::w4a16_m128_kernel(gpu),
+            w4a16_rowgemv: super::ops::RowGemvKernels::resolve(gpu)?,
             w4a16_gemm_t_m128_k16_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128_k16"),
             w4a16_gemm_t_m128_v2_k: super::w4a16_v2_kernel(gpu),
             w4a16_gemm_t_m128_bf16_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128_bf16"),
@@ -554,6 +568,7 @@ impl DenseFfnLayer {
             fp4mmq_down: std::sync::OnceLock::new(),
             w4a16_gemm_t_k64_k: super::k64_kernel(gpu).unwrap_or(KernelHandle(0)),
             act_mul,
+            w4a4_rows: None,
             bf16_weights: None,
             prefill_bf16_weights: None,
             dense_gemv_bf16_k,
@@ -591,6 +606,7 @@ impl DenseFfnLayer {
             // packed-Q2 weights.
             q2_0_mmq_nc_k: KernelHandle(0),
             q2_0_mmq_wc_k: KernelHandle(0),
+            bf16mma: ops::DenseBf16mma::load(gpu),
         };
         Ok(layer)
     }
@@ -985,6 +1001,15 @@ impl DenseFfnLayer {
             let _ = gpu.free(dup.w_q4k);
         }
         Ok(*cell.get().expect("q4k weight cell set above"))
+    }
+
+    /// Replace the SiLU-multiply kernel (same signature as `moe_silu_mul`) for
+    /// a model whose activation differs (Ricursive's clamped SwiGLU). The fused
+    /// SiLU-input GEMVs compute their own unclamped SiLU, so they are disabled.
+    pub fn set_act_mul(&mut self, kernel: KernelHandle) {
+        self.act_mul = kernel;
+        self.w4a16_gemv_silu_input = KernelHandle(0);
+        self.w4a16_gemv_silu_input_sw = KernelHandle(0);
     }
 
     /// Single-token decode: 2-3 kernel launches depending on activation.
@@ -1476,6 +1501,10 @@ impl DenseFfnLayer {
         if self.try_glm_canonical_rows(input, 2, ctx, stream)? {
             return Ok(());
         }
+        // ATLAS_EXACT_VERIFY: serial decode's arithmetic per row (`dense_ffn_exact.rs`).
+        if self.forward_rows_exact(input, 2, ctx, stream)? {
+            return Ok(());
+        }
         // Packed-Q2: NVFP4 fallback weights are NULL, so the NVFP4 batch2 GEMVs
         // below would fault. Route to the keep-packed batchm FFN (m=2).
         if let Some(ref q2w) = self.q2_weights {
@@ -1591,6 +1620,10 @@ impl DenseFfnLayer {
         if self.try_glm_canonical_rows(input, 3, ctx, stream)? {
             return Ok(());
         }
+        // ATLAS_EXACT_VERIFY: serial decode's arithmetic per row (`dense_ffn_exact.rs`).
+        if self.forward_rows_exact(input, 3, ctx, stream)? {
+            return Ok(());
+        }
         // Packed-Q2: route to the keep-packed batchm FFN (m=3); NVFP4 weights null.
         if let Some(ref q2w) = self.q2_weights {
             return self.forward_km_q2(q2w, input, ctx, 3, stream);
@@ -1691,6 +1724,10 @@ impl DenseFfnLayer {
         if self.try_glm_canonical_rows(input, m as usize, ctx, stream)? {
             return Ok(());
         }
+        // ATLAS_EXACT_VERIFY: serial decode's arithmetic per row (`dense_ffn_exact.rs`).
+        if self.forward_rows_exact(input, m, ctx, stream)? {
+            return Ok(());
+        }
         if self.forward_dp4a_batch(input, m, ctx, stream)? {
             return Ok(());
         }
@@ -1778,6 +1815,14 @@ impl DenseFfnLayer {
         // `layers::ops::ModelLevers` — resolved when the model is built and carried
         // on `ForwardContext`, because a static outlives the model whose flags it
         // encodes.
+        if let Some(wt) = wt
+            && ctx.levers.ffn_rowgemv
+            && self.w4a16_rowgemv.fits(m, n, k)
+        {
+            return self
+                .w4a16_rowgemv
+                .launch(ctx.gpu, input, wt, output, m, n, k, stream);
+        }
         if let Some(wt) = wt {
             if m <= 64 && k.is_multiple_of(32) && ctx.levers.ffn_small_m {
                 if k >= crate::layers::w4a16_k64_min_k()
@@ -1885,7 +1930,8 @@ impl DenseFfnLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        if self.try_glm_canonical_rows(input, num_tokens, ctx, stream)?
+        if self.try_w4a4_rows(input, num_tokens, ctx, stream)?
+            || self.try_glm_canonical_rows(input, num_tokens, ctx, stream)?
             || self.try_glm_prefill_bf16(input, num_tokens, ctx, stream)?
         {
             return Ok(());
@@ -2237,6 +2283,9 @@ impl DenseFfnLayer {
             return Ok(());
         }
 
+        if self.try_prefill_bf16mma(input, m, ctx, stream)? {
+            return Ok(());
+        }
         // Prefill: prefer the 128x128 cp.async-pipelined `w4a16_gemm_t_m128`
         // (the kernel attention/SSM use) over the M64xN64 base `w4a16_gemm`
         // (~10 TFLOPS, the flat ~155 tok/s bottleneck). That kernel needs the

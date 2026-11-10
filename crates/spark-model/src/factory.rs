@@ -16,7 +16,7 @@ use crate::weight_loader::{
     DeepSeekV4WeightLoader, DflashConfig, Gemma4WeightLoader, Glm5WeightLoader, LagunaWeightLoader,
     MinimaxM2WeightLoader, ModelWeightLoader, NemotronHWeightLoader, NllbWeightLoader,
     Qwen3VLWeightLoader, Qwen3WeightLoader, Qwen4ExpWeightLoader, Qwen35DenseWeightLoader,
-    Qwen35WeightLoader, Step3p7WeightLoader,
+    Qwen35WeightLoader, RicursiveWeightLoader, Step3p7WeightLoader,
 };
 
 mod dspark_admission;
@@ -44,6 +44,9 @@ pub struct DflashBuildArgs<'a> {
     pub drafter_config: DflashConfig,
     pub gamma: Option<usize>,
     pub window_size: Option<usize>,
+    /// `--draft-model-alt`: a second drafter for the same target, routed per
+    /// request beside the first (`layers::dflash_head::dual`).
+    pub alt: Option<(&'a WeightStore, DflashConfig)>,
 }
 
 /// LoRA adapter build arguments (`--lora-adapter NAME=PATH`). `None` for
@@ -127,6 +130,8 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
         // mixed full/sliding attention + attention gate + 3 MTP modules.
         "step3p7" => Ok(Box::new(Step3p7WeightLoader)),
         "laguna" => Ok(Box::new(LagunaWeightLoader)),
+        // Ricursive Ripple — dense hybrid-SWA, gated attention, value residuals.
+        "ricursive" => Ok(Box::new(RicursiveWeightLoader)),
         // DeepSeek-V4 family (Flash) — MLA + MoE + CSA/HCA hybrid attention + mHC.
         "deepseek_v4" => Ok(Box::new(DeepSeekV4WeightLoader)),
         "glm5_next" => Ok(Box::new(Glm5WeightLoader)),

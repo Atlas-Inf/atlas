@@ -164,21 +164,22 @@ impl Qwen3SsmLayer {
         ];
         // ATLAS_QWEN4EXP_PREFILL_BA_ROWS: the same bytes, two tokens a CTA.
         if !ops::qwen4exp_prefill::try_ba_gates_rows(ctx.gpu, ptrs, dims, stream)? {
-            ops::dense_gemm_ba_gates_prefill(
-                ctx.gpu,
-                self.ba_gates_prefill_k,
+            self.ba_gates_prefill(
+                ctx,
                 normed,
                 &self.ssm.in_proj_ba,
                 self.ssm.a_log.weight,
                 self.ssm.dt_bias.weight,
                 gates_buf,
-                k,
-                ba_size as u32,
-                h as u32,
-                h as u32,
-                gate_stride as u32,
-                nv as u32,
-                vpg as u32,
+                [
+                    k,
+                    ba_size as u32,
+                    h as u32,
+                    h as u32,
+                    gate_stride as u32,
+                    nv as u32,
+                    vpg as u32,
+                ],
                 stream,
             )?;
         }

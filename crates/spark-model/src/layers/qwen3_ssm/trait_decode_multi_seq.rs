@@ -227,6 +227,23 @@ impl Qwen3SsmLayer {
                     )?;
                 }
             }
+            // The batch lever (`model/exact_verify.rs`): the row-exact arm
+            // at every width, so each row is serial decode's FFN bytes (the
+            // tile GEMMs below are not).
+            n if self.ffn.rows_exact(n as u32, ctx) => {
+                let used = self
+                    .ffn
+                    .try_forward_km(normed_base, n as u32, ctx, stream)?;
+                anyhow::ensure!(used, "ssm ffn: try_forward_km declined {n} rows");
+                ops::residual_add(
+                    ctx.gpu,
+                    self.residual_add_k,
+                    hidden,
+                    ctx.buffers.moe_output(),
+                    (n * h) as u32,
+                    stream,
+                )?;
+            }
             // WIDE BATCH (n>8): one batched dense FFN, weights read ONCE.
             //
             // MEASURED 2026-07-27 (ATLAS_SSM_MS_PROFILE, 9168 samples/n): the

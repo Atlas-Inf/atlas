@@ -155,6 +155,25 @@ extern "C" __global__ void bf16_concat(
     }
 }
 
+// Row-batched BF16 concatenation: for each row r < rows,
+// out[r, 0..N] = a[r, 0..N] and out[r, N..2N] = b[r, 0..N].
+// One launch for the MTP drafter prefill's [rows, 2N] fc input, instead of
+// one bf16_concat launch per row.
+// Grid: (ceil(N/256), rows, 1)  Block: (256, 1, 1)
+extern "C" __global__ void bf16_concat_rows(
+    const __nv_bfloat16* __restrict__ a,      // [rows, N]
+    const __nv_bfloat16* __restrict__ b,      // [rows, N]
+    __nv_bfloat16* __restrict__ out,          // [rows, 2N]
+    unsigned int N
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t r = blockIdx.y;
+    if (i < N) {
+        out[r * 2 * N + i] = a[r * N + i];
+        out[r * 2 * N + N + i] = b[r * N + i];
+    }
+}
+
 // Device-pointer sigmoid blend: reads gate scalar from device BF16 pointer.
 //
 // output[i] += sigmoid(bf16_to_f32(*gate_ptr)) * src[i]

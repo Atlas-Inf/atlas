@@ -76,6 +76,22 @@ impl OpCache {
         Ok(handle)
     }
 
+    /// [`Self::kernel`], with an absent function memoized as the null handle
+    /// (an optional twin a target may not ship, resolved per launch).
+    pub fn kernel_or_null(
+        &self,
+        gpu: &dyn GpuBackend,
+        module: &'static str,
+        func: &'static str,
+    ) -> KernelHandle {
+        if let Some(k) = self.kernels.read().get(&(module, func)) {
+            return *k;
+        }
+        let handle = gpu.kernel(module, func).unwrap_or(KernelHandle(0));
+        self.kernels.write().insert((module, func), handle);
+        handle
+    }
+
     /// A scratch allocation of at least `bytes`, memoized under `tag` and the
     /// calling thread's scratch lane (`crate::lane`).
     ///

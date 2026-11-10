@@ -111,7 +111,7 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
     let input_norm = source.find("&layer.input_layernorm").unwrap();
     let q_proj = source.find("&layer.q_proj").unwrap();
     let q_norm = source.find("&layer.q_norm").unwrap();
-    let rope = source.find("ops::rope_yarn").unwrap();
+    let rope = source.find("self.layer_rope(").unwrap();
     let attention = source.find("self.run_staged_attention").unwrap();
     let o_proj = source.find("&layer.o_proj").unwrap();
     let post_norm = source.find("&layer.post_attention_layernorm").unwrap();
@@ -133,7 +133,8 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
     assert!(attention_source.contains("prefill_attention_paged_dflash_bf16_indirect"));
     assert!(attention_source.contains("prefill_attention_paged_batched_sink"));
     let projection_source = include_str!("batch_projection.rs");
-    assert!(projection_source.contains("(total_rows - row).min(16)"));
+    assert!(projection_source.contains("(total_rows - row).min(wave)"));
+    assert!(projection_source.contains("self.startup.native_batch_authoritative"));
     assert!(!projection_source.contains("w4a16_gemv_batch32"));
     // The tail and the Markov stage live in batch_tail.rs, the tail as its
     // three pieces in order.
@@ -146,7 +147,7 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
     assert!(tail.contains("self.batch_tokens"));
     assert!(tail.contains("ops::w4a16_gemv_batchm"));
     assert!(tail.contains("self.kernels.w4a16_gemv_batch16"));
-    assert!(tail.contains("(batch_rows - row).min(16)"));
+    assert!(tail.contains("(batch_rows - row).min(wave)"));
     assert!(tail.contains("self.startup.native_batch_authoritative"));
     assert!(tail.contains("exact NVFP4 LM-head batch kernel is unresolved"));
     assert!(final_norm < lm_head && lm_head < argmax);
@@ -223,7 +224,8 @@ fn production_seam_prepares_then_returns_native_rows_before_generic_serial_dispa
     for tier in ["batch4", "batch8", "batch16"] {
         assert!(projection_source.contains(tier));
     }
-    assert!(projection_source.contains("(total_rows - row).min(16)"));
+    assert!(projection_source.contains("(total_rows - row).min(wave)"));
+    assert!(projection_source.contains("self.startup.native_batch_authoritative"));
     assert!(!projection_source.contains("w4a16_gemv_batch32"));
 }
 
@@ -250,6 +252,8 @@ fn batched_selector_is_one_launch_with_fallback() {
         include_str!("../../../../../kernels/gb10/common/dflash2_candidate_selector.cu"),
         include_str!("../../../../../kernels/strix-hip/common/dflash2_candidate_selector.cu"),
     ] {
+        // The gb10 entries carry a launch-bounds hook a wider twin sets.
+        let cu = cu.replace(" DF2_SEL_BOUNDS", "");
         assert!(cu.contains("extern \"C\" __global__ void dflash2_candidate_selector("));
         assert!(cu.contains("extern \"C\" __global__ void dflash2_candidate_selector_batched("));
     }

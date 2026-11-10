@@ -3,7 +3,8 @@
 //! Drafter NVFP4: load-time quant and scalar or tensor-core dispatch.
 //!
 //! The drafter runs its per-step projections at M=γ rows: `w4a16_gemv_batch4`
-//! covers γ ≤ 4 and `w4a16_gemv_batch8` covers γ in 5..8. The opt-in
+//! covers γ ≤ 4, `w4a16_gemv_batch8` γ in 5..8 and `w4a16_gemv_batch16` γ in
+//! 9..16 (DSpine's b16 blocks). The opt-in
 //! tensor-core route covers wider blocks in pieces of up to 32 rows.
 
 use anyhow::Result;
@@ -23,6 +24,7 @@ use crate::weight_map::{
 pub(super) enum DrafterNvfp4Tier {
     Batch4,
     Batch8,
+    Batch16,
 }
 
 impl DrafterNvfp4Tier {
@@ -30,17 +32,53 @@ impl DrafterNvfp4Tier {
         match self {
             Self::Batch4 => "w4a16_gemv_batch4",
             Self::Batch8 => "w4a16_gemv_batch8",
+            Self::Batch16 => "w4a16_gemv_batch16",
         }
     }
 }
 
-/// Pure γ→tier pick; `None` above the batched GEMV tiers' reach (γ > 8).
+/// Pure γ→tier pick; `None` above the batched GEMV tiers' reach (γ > 16).
 pub(super) fn drafter_nvfp4_tier(gamma: u32) -> Option<DrafterNvfp4Tier> {
     match gamma {
         1..=4 => Some(DrafterNvfp4Tier::Batch4),
         5..=8 => Some(DrafterNvfp4Tier::Batch8),
+        9..=16 => Some(DrafterNvfp4Tier::Batch16),
         _ => None,
     }
+}
+
+/// Free memory the drafter NVFP4 twins must leave behind (the KV pool and
+/// the remaining serve allocations are sized after them).
+const DRAFTER_NVFP4_FREE_FLOOR: usize = 2 << 30;
+
+/// Device bytes of the 7 NVFP4 twins per drafter layer (packed E2M1 plus one
+/// E4M3 scale per 16 weights).
+pub(super) fn drafter_nvfp4_bytes(
+    layers: usize,
+    h: usize,
+    q_dim: usize,
+    kv_dim: usize,
+    inter: usize,
+) -> usize {
+    let per_layer = 2 * q_dim * h + 2 * kv_dim * h + 3 * inter * h;
+    layers * (per_layer / 2 + per_layer / 16)
+}
+
+/// Rows of one batched drafter NVFP4 launch over `rows` rows of width `k`:
+/// all of them when the row-invariant skinny kernels (`ATLAS_SKINNY_MMA`)
+/// take `kernel` at that width (the weight streams once), else the 16 the
+/// batch tiers hold (always for the Lightning product, whose exact contract
+/// is the 16-row waves).
+pub(super) fn drafter_nvfp4_wave(
+    kernel: spark_runtime::gpu::KernelHandle,
+    rows: u32,
+    k: u32,
+    lightning: bool,
+) -> u32 {
+    let all = !lightning
+        && ops::skinny_mma::active()
+            .is_some_and(|s| s.takes(ops::skinny_mma::Family::W4a16, kernel, rows, k));
+    if all { rows.max(1) } else { 16 }
 }
 
 impl BlockDiffusionDraftHead {
@@ -52,6 +90,7 @@ impl BlockDiffusionDraftHead {
             match tier {
                 DrafterNvfp4Tier::Batch4 => self.kernels.w4a16_gemv_batch4,
                 DrafterNvfp4Tier::Batch8 => self.kernels.w4a16_gemv_batch8,
+                DrafterNvfp4Tier::Batch16 => self.kernels.w4a16_gemv_batch16,
             }
             .0 != 0
         });
@@ -88,6 +127,30 @@ impl BlockDiffusionDraftHead {
         let q_dim = self.num_q_heads * self.head_dim;
         let kv_dim = self.num_kv_heads * self.head_dim;
         let inter = self.intermediate_size;
+        // The twins sit beside the BF16 weights and are built before the KV
+        // budget. Where they do not fit (Ripple-65B on a 96 GB gfx1151 leaves
+        // ~1.5 GB pre-KV) the drafter keeps its BF16 arms instead of failing
+        // the boot.
+        // After the preshrink only k/v remain to quantize, and the BF16 they
+        // would replace is already gone: the twins are not optional then.
+        let parked = crate::weight_loader::dflash_preshrink::parked();
+        let twin_bytes = if parked {
+            drafter_nvfp4_bytes(self.layers.len(), h, 0, kv_dim, 0)
+        } else {
+            drafter_nvfp4_bytes(self.layers.len(), h, q_dim, kv_dim, inter)
+        };
+        if !parked
+            && let Ok(free) = gpu.free_memory()
+            && free < twin_bytes + DRAFTER_NVFP4_FREE_FLOOR
+        {
+            tracing::warn!(
+                "DFlash NVFP4: twins need {:.2} GB, {:.2} GB free (floor {:.1} GB) — skipping drafter quantization",
+                twin_bytes as f64 / 1e9,
+                free as f64 / 1e9,
+                DRAFTER_NVFP4_FREE_FLOOR as f64 / 1e9
+            );
+            return Ok(());
+        }
         tracing::info!(
             "DFlash NVFP4: quantizing {} layers × 7 GEMMs for {}",
             self.layers.len(),
@@ -199,6 +262,7 @@ impl BlockDiffusionDraftHead {
         let nvfp4_kernel = drafter_nvfp4_tier(m).map(|tier| match tier {
             DrafterNvfp4Tier::Batch4 => self.kernels.w4a16_gemv_batch4,
             DrafterNvfp4Tier::Batch8 => self.kernels.w4a16_gemv_batch8,
+            DrafterNvfp4Tier::Batch16 => self.kernels.w4a16_gemv_batch16,
         });
         if matches!(self.quant, DflashQuantization::Nvfp4Weights)
             && let Some(w) = w_nvfp4
@@ -236,13 +300,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn drafter_nvfp4_wave_is_16_rows_off_the_skinny_kernels() {
+        use spark_runtime::gpu::KernelHandle;
+        // No `ATLAS_SKINNY_MMA` in unit tests: the batch tiers' 16-row waves.
+        assert_eq!(drafter_nvfp4_wave(KernelHandle(7), 128, 5120, false), 16);
+        assert_eq!(drafter_nvfp4_wave(KernelHandle(7), 128, 5120, true), 16);
+    }
+
+    #[test]
     fn drafter_nvfp4_tier_pick() {
         assert_eq!(drafter_nvfp4_tier(1), Some(DrafterNvfp4Tier::Batch4));
         assert_eq!(drafter_nvfp4_tier(4), Some(DrafterNvfp4Tier::Batch4));
         assert_eq!(drafter_nvfp4_tier(5), Some(DrafterNvfp4Tier::Batch8));
         assert_eq!(drafter_nvfp4_tier(8), Some(DrafterNvfp4Tier::Batch8));
-        assert_eq!(drafter_nvfp4_tier(9), None);
+        assert_eq!(drafter_nvfp4_tier(9), Some(DrafterNvfp4Tier::Batch16));
+        assert_eq!(drafter_nvfp4_tier(16), Some(DrafterNvfp4Tier::Batch16));
+        assert_eq!(drafter_nvfp4_tier(17), None);
         assert_eq!(drafter_nvfp4_tier(0), None);
+    }
+
+    #[test]
+    fn drafter_nvfp4_twin_bytes_ripple() {
+        // Ripple-65B DFlash2: 5 layers, h 5120, q 80x128, kv 8x128, inter 40960.
+        assert_eq!(
+            drafter_nvfp4_bytes(5, 5120, 10240, 1024, 40960),
+            2_093_875_200
+        );
     }
 }
 

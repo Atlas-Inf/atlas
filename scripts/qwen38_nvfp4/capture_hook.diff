@@ -1,0 +1,62 @@
+diff --git a/crates/spark-model/src/layers/qwen3_ssm/debug.rs b/crates/spark-model/src/layers/qwen3_ssm/debug.rs
+index f165fcd48..b6b56eeb3 100644
+--- a/crates/spark-model/src/layers/qwen3_ssm/debug.rs
++++ b/crates/spark-model/src/layers/qwen3_ssm/debug.rs
+@@ -141,3 +141,33 @@ impl Qwen3SsmLayer {
+         tracing::info!("  SSM {label}: {:?}", vals);
+     }
+ }
++
++/// SCRATCH (not for commit): write `rows` BF16 rows of a GDN projection input
++/// to `<ATLAS_GDN_CAPTURE>/L{ssm:02}_{kind}_{seq:08}.bin` (written as `.tmp`,
++/// then renamed), for a consumer that folds them into X^T X and deletes them.
++pub(super) fn capture_rows(
++    gpu: &dyn GpuBackend,
++    ptr: DevicePtr,
++    rows: usize,
++    cols: usize,
++    kind: &str,
++    stream: u64,
++) -> Result<()> {
++    static QKVZ: AtomicUsize = AtomicUsize::new(0);
++    static OUT: AtomicUsize = AtomicUsize::new(0);
++    static SEQ: AtomicUsize = AtomicUsize::new(0);
++    let Ok(dir) = std::env::var("ATLAS_GDN_CAPTURE") else {
++        return Ok(());
++    };
++    let order = std::sync::atomic::Ordering::SeqCst;
++    let c = if kind == "qkvz" { &QKVZ } else { &OUT }.fetch_add(1, order);
++    let seq = SEQ.fetch_add(1, order);
++    gpu.synchronize(stream)?;
++    let mut buf = vec![0u8; rows * cols * 2];
++    gpu.copy_d2h(ptr, &mut buf)?;
++    let dir = std::path::Path::new(&dir);
++    let name = format!("L{:02}_{kind}_{seq:08}.bin", c % 48);
++    std::fs::write(dir.join(format!("{name}.tmp")), &buf)?;
++    std::fs::rename(dir.join(format!("{name}.tmp")), dir.join(name))?;
++    Ok(())
++}
+diff --git a/crates/spark-model/src/layers/qwen3_ssm/trait_prefill_helper.rs b/crates/spark-model/src/layers/qwen3_ssm/trait_prefill_helper.rs
+index 09a441fc9..24c3f4bf8 100644
+--- a/crates/spark-model/src/layers/qwen3_ssm/trait_prefill_helper.rs
++++ b/crates/spark-model/src/layers/qwen3_ssm/trait_prefill_helper.rs
+@@ -121,6 +121,7 @@ impl Qwen3SsmLayer {
+         value_dim: usize,
+         stream: u64,
+     ) -> Result<()> {
++        super::debug::capture_rows(ctx.gpu, normed_out_buf, k as usize, value_dim, "out", stream)?;
+         // Native MXFP8 (FP4-Local): the layer's only out_proj.
+         if let Some(mx8) = self.mx8.as_ref() {
+             return self.mx8_out(
+diff --git a/crates/spark-model/src/layers/qwen3_ssm/trait_prefill_proj.rs b/crates/spark-model/src/layers/qwen3_ssm/trait_prefill_proj.rs
+index 503f1ee48..0be4df6f6 100644
+--- a/crates/spark-model/src/layers/qwen3_ssm/trait_prefill_proj.rs
++++ b/crates/spark-model/src/layers/qwen3_ssm/trait_prefill_proj.rs
+@@ -30,6 +30,7 @@ impl Qwen3SsmLayer {
+         ctx: &ForwardContext,
+         stream: u64,
+     ) -> Result<()> {
++        super::debug::capture_rows(ctx.gpu, normed, k as usize, h, "qkvz", stream)?;
+         let proj_dst = if self.sequential_qkvz {
+             deinterleaved
+         } else {

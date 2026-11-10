@@ -129,6 +129,7 @@ impl ModelConfig {
             fp8_kv_headroom: 2.0,
             final_logit_softcapping: 0.0,
             embed_scale: 0.0,
+            sliding_attention_layers: Vec::new(),
             // MiniMax M2 fields — all default to "unused" (empty/0) so the
             // base Qwen3-Next-80B template behaves identically to before.
             scoring_func: String::new(),

@@ -22,7 +22,7 @@ use crate::weight_loader::DflashWeights;
 
 impl BlockDiffusionDraftHead {
     pub fn from_weights(
-        weights: DflashWeights,
+        mut weights: DflashWeights,
         embed_tokens_shared: DevicePtr,
         lm_head_shared: DevicePtr,
         lm_head_nvfp4: Option<crate::weight_map::QuantizedWeight>,
@@ -37,6 +37,8 @@ impl BlockDiffusionDraftHead {
         mut startup: DsparkStartupExecution,
     ) -> Result<Self> {
         super::selector_platform::validate_requested_features(startup.diagnostics.draft_conf)?;
+        let dspine_weights = weights.dspine.take();
+        let dspine_spec = dspine_weights.as_ref().map(|w| w.spec);
         let embed_tokens_shared = weights
             .embed_tokens
             .as_ref()
@@ -61,15 +63,19 @@ impl BlockDiffusionDraftHead {
         // HF `is_causal` / sliding-window keys as well as `dflash_config`
         // (GLM-5.3's DFlash2 declares its 2048 window only through them).
         let query_causal = weights.config.query_causal();
-        let window_size = window_size.or_else(|| weights.config.sliding_window());
         // Resolved early: the drafter paged-KV pool must cover every ctx
         // slot the accumulator can retain. The accumulator cap follows
         // ctx_window — NOT the SWA window_size — because the paged-attention
         // path panics when ctx_count exceeds the ctx_window-sized scratch.
-        let ctx_window: usize = std::env::var("ATLAS_DFLASH_CTX_WINDOW")
+        let env_ctx_window = std::env::var("ATLAS_DFLASH_CTX_WINDOW")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(4096);
+            .and_then(|s| s.parse().ok());
+        let (window_size, ctx_window) = super::layer_attention::resolve_context_window(
+            window_size,
+            &weights.config,
+            env_ctx_window,
+        )?;
+        let layer_attention = super::layer_attention::layer_attention(&weights.config)?;
         let ctx_capacity = ctx_window.min(max_seq_len);
 
         if target_layer_ids.is_empty() {
@@ -138,10 +144,21 @@ impl BlockDiffusionDraftHead {
         // `kernels/gb10/common/`.
         let paged_sink = super::paged_attn_modules::paged_sink_modules_for_head_dim(head_dim)?;
         let glm_series = target_model_type == "glm5_next";
+        let selector_build = match weights.candidate_selector.as_ref() {
+            Some(selector) => ops::dflash2_selector_build(selector.top_k)?,
+            None => ops::DFLASH2_SELECTOR_BASE,
+        };
         let (selector_kernel, draft_conf) = super::draft_conf::selector_kernel(
             gpu,
             glm_series && startup.diagnostics.draft_conf && weights.candidate_selector.is_some(),
+            selector_build,
         );
+        if weights.candidate_selector.is_some() && selector_kernel.is_none() {
+            tracing::warn!(
+                "DFlash2 selector: this target has no {} kernel; drafts take the host walk",
+                selector_build.module
+            );
+        }
         startup.diagnostics.draft_conf = draft_conf;
         let dense_gemv_tc = dense_gemv_tc_kernels(gpu, glm_series);
         let kernels = DflashKernels {
@@ -166,15 +183,23 @@ impl BlockDiffusionDraftHead {
             dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             w4a16_gemm: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm"),
             dense_gemm_pipelined: gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?,
+            bf16_gemv_m32: crate::layers::try_kernel(gpu, "bf16_gemv_m32", "bf16_gemv_m32"),
+            fp8_gemv_m32: crate::layers::try_kernel(gpu, "fp8_gemv_m32", "fp8_gemv_m32"),
             dflash2_conv: gpu
                 .kernel("dflash2_conv", "dflash2_grouped_dynamic_causal_conv")
                 .ok(),
             dflash2_candidate_selector: selector_kernel,
-            dflash2_candidate_selector_batched: crate::layers::try_kernel(
-                gpu,
-                "dflash2_candidate_selector",
-                "dflash2_candidate_selector_batched",
-            ),
+            // Only the 16-candidate module ships the batched entry; a wider
+            // selector serves batches with per-sequence fused launches.
+            dflash2_candidate_selector_batched: if selector_build.full_family {
+                crate::layers::try_kernel(
+                    gpu,
+                    "dflash2_candidate_selector",
+                    "dflash2_candidate_selector_batched",
+                )
+            } else {
+                spark_runtime::gpu::KernelHandle(0)
+            },
             // Qwen3.6-DFlash uses yarn RoPE — confirmed in the drafter
             // `config.json:rope_scaling.rope_type="yarn"`. Atlas's yarn
             // kernel is `rope::rope_forward_yarn`.
@@ -292,6 +317,15 @@ impl BlockDiffusionDraftHead {
             mxfp8_gemv: mxfp8_gemv_kernels(gpu, glm_series),
         };
 
+        // DFlash2 conv geometry, from the checkpoint tensors (one for every conv).
+        let conv_geometry = dflash2_conv_geometry(&weights)?;
+        let conv_delta_row =
+            conv_geometry.map_or(0, |(taps, group)| 2 * taps * (hidden_size / group));
+        anyhow::ensure!(
+            conv_geometry.is_none() || kernels.dflash2_conv.is_some(),
+            "DFlash2 drafter ships convs but the target has no dflash2_conv kernel"
+        );
+
         // Per-step scratch buffers. BF16 = 2 bytes/element.
         //
         // Sized for `n_attn_slots = ctx_window + γ` rows in the attention
@@ -402,10 +436,14 @@ impl BlockDiffusionDraftHead {
                 ctx_positions_pinned_bytes,
                 ctx_positions_cursor: std::sync::atomic::AtomicUsize::new(0),
                 position_ids: gpu.alloc(n_attn * 4)?,
-                dflash2_conv_delta: gpu.alloc(n_attn * 4 * (hidden_size / 16).max(1) * bf16)?,
+                dflash2_conv_delta: gpu.alloc(n_attn * conv_delta_row.max(1) * bf16)?,
                 dflash2_conv_out: gpu.alloc(n_attn * hidden_size * bf16)?,
                 dflash2_projected_hidden: gpu.alloc(g * 256 * bf16)?,
                 dflash2_selector_scratch: gpu.alloc(selector_bytes)?,
+                dspine: dspine_spec
+                    .as_ref()
+                    .map(|spec| super::dspine::DspineScratch::alloc(gpu, spec, hidden_size, g))
+                    .transpose()?,
             };
             // C1 diagnostic: zero ALL device buffers so any uninitialized
             // read sees deterministic zeros instead of per-lane garbage.
@@ -541,26 +579,9 @@ impl BlockDiffusionDraftHead {
         // DFlash2 grouped causal conv scratch — the conv is causal along the
         // row dim, so it runs per [sequence, gamma] slice, never across
         // sequence boundaries.
-        let dflash2_group_size = weights
-            .config
-            .dflash_config
-            .as_ref()
-            .and_then(|sc| sc.conv_group_size)
-            .unwrap_or(16);
-        let dflash2_kernel_size = weights
-            .config
-            .dflash_config
-            .as_ref()
-            .and_then(|sc| sc.conv_kernel_size)
-            .unwrap_or(2);
-        let dflash2_has_conv = weights
-            .layers
-            .iter()
-            .any(|l| l.attention_conv.is_some() || l.mlp_conv.is_some());
-        let (batch_conv_delta, batch_conv_out) = if dflash2_has_conv {
-            let conv_groups = hidden_size / dflash2_group_size.max(1);
+        let (batch_conv_delta, batch_conv_out) = if conv_geometry.is_some() {
             let delta_bytes = batch_rows
-                .checked_mul(2 * dflash2_kernel_size * conv_groups)
+                .checked_mul(conv_delta_row)
                 .and_then(|n| n.checked_mul(bf16))
                 .ok_or_else(|| anyhow::anyhow!("DFlash batch conv delta bytes overflow"))?;
             (
@@ -804,6 +825,7 @@ impl BlockDiffusionDraftHead {
             lm_head_shared,
             lm_head_nvfp4,
             lm_head_shared_fp8: None,
+            fp8_m32: Vec::new(),
             hidden_norm: weights.hidden_norm,
             norm: weights.norm,
             fc: weights.fc,
@@ -825,7 +847,8 @@ impl BlockDiffusionDraftHead {
                 weights
                     .layers
                     .into_iter()
-                    .map(|l| DflashLayer {
+                    .zip(layer_attention)
+                    .map(|(l, (rope, attn_window))| DflashLayer {
                         input_layernorm: l.input_layernorm,
                         post_attention_layernorm: l.post_attention_layernorm,
                         q_proj: l.q_proj,
@@ -838,13 +861,15 @@ impl BlockDiffusionDraftHead {
                         up_proj: l.up_proj,
                         down_proj: l.down_proj,
                         attention_sink_bias: l.attention_sink_bias,
+                        rope,
+                        attn_window,
                         attention_conv: l.attention_conv.map(|c| {
                             super::Dflash2Conv::new(
                                 c.base_kernel,
                                 c.kernel_projection,
                                 hidden_size,
-                                dflash2_group_size,
-                                dflash2_kernel_size,
+                                c.group_size,
+                                c.kernel_size,
                             )
                         }),
                         mlp_conv: l.mlp_conv.map(|c| {
@@ -852,8 +877,8 @@ impl BlockDiffusionDraftHead {
                                 c.base_kernel,
                                 c.kernel_projection,
                                 hidden_size,
-                                dflash2_group_size,
-                                dflash2_kernel_size,
+                                c.group_size,
+                                c.kernel_size,
                             )
                         }),
                         // Phase G — populated below if ATLAS_DFLASH_DRAFTER_FP8=1.
@@ -889,6 +914,9 @@ impl BlockDiffusionDraftHead {
             } else {
                 None
             },
+            dspine: None,
+            alt: None,
+            live: Default::default(),
             // Phase 2 stage 2: fused KV weight built above by copy_d2d
             // from each layer's k_proj/v_proj. precompute_ctx_kv will
             // GEMM against it in stage 3 once we wire the call site.
@@ -945,6 +973,7 @@ impl BlockDiffusionDraftHead {
             batch_markov_bias,
             batch_dflash2_projected,
             batch_dflash2_selector_scratch,
+            last_select: parking_lot::Mutex::new(None),
             batch_conv_delta,
             batch_conv_out,
             extra_lanes,
@@ -970,6 +999,9 @@ impl BlockDiffusionDraftHead {
             ctx_carry: Mutex::new(None),
             rank_split: None,
         };
+        if let Some(w) = dspine_weights {
+            head.dspine = Some(super::dspine::Dspine::build(&head, w, gpu)?);
+        }
 
         // Fallback pool prime for build paths that skipped the early
         // `factory::build` prime (which runs before the residual KV-pool
@@ -1156,6 +1188,7 @@ impl BlockDiffusionDraftHead {
             );
         }
 
+        super::fp8_m32::build(&mut head, gpu)?;
         head.install_twins(gpu)?;
         Ok(head)
     }

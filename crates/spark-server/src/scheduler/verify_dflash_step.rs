@@ -9,6 +9,7 @@ mod native_mtp;
 mod split_head;
 mod stats;
 mod think_end;
+mod tree;
 pub use glm_owner::{step_verify_glm_long_batched, step_verify_glm_long_with};
 pub(super) use think_end::accept_with_forced_think_end;
 
@@ -61,6 +62,17 @@ fn step_verify_dflash_inner(
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
 ) {
+    // ATLAS_DFLASH_TREE: a lone greedy sequence verifies a draft tree.
+    if tree::try_step_verify_tree(
+        model,
+        a,
+        sched,
+        num_drafts,
+        verify_ctx,
+        dflash_verify_raw_argmax,
+    ) {
+        return;
+    }
     // Reject an unsupported sampled request before any worker enters the
     // verify command and waits for its verdict.
     if let Err(e) = split_head::ensure_available(model, a) {
@@ -216,8 +228,22 @@ pub(super) fn verify_dflash_tail(
             a,
             &verified_argmax,
         );
+    // An exact verify (`Model::verify_bit_exact`, `ATLAS_EXACT_VERIFY`): the
+    // rows are serial decode's logits, so each is picked through serial
+    // decode's pipeline against the state serial decode would hold there
+    // (`exact_picks`), never the raw argmax.
+    let exact = scored.is_none() && !split_rows && exact_picks(raw, model.verify_bit_exact());
     let mut verified = if let Some(scored) = &scored {
         scored.tokens.clone()
+    } else if exact {
+        crate::scheduler::verify_pipeline_helper::verify_pick_prefix_with_pipeline(
+            model,
+            &verified_argmax,
+            drafts,
+            a,
+            verify_ctx,
+            0,
+        )
     } else if split_rows {
         match crate::scheduler::verify_pipeline_helper::split_verify_picks(
             model,
@@ -261,7 +287,7 @@ pub(super) fn verify_dflash_tail(
     // proposer's guess for the same slot. First mismatch terminates the
     // accepted prefix; verified[first_mismatch] becomes the bonus token.
     // An exhausted thinking budget may end the step early at `</think>`.
-    let num_accepted = if scored.is_some() || split_rows {
+    let num_accepted = if scored.is_some() || split_rows || exact {
         // The full pipeline already enforces thinking boundaries per position.
         // Split picks enforce them with each row's shadow state; replaying the
         // raw helper would use the restored pre-span fence.
@@ -441,6 +467,35 @@ pub(super) fn verify_dflash_tail(
         return None;
     }
 
+    propose_after_verify(
+        model,
+        a,
+        sched,
+        num_drafts,
+        dflash_verify_raw_argmax,
+        defer_propose,
+        bonus_token_idx,
+        (step_timing, verify_ms, tokens.len(), num_accepted),
+    )
+}
+
+/// The re-propose after a verify's commit and emission (shared by the chain
+/// and the tree verify): the next drafts, or `Some(width)` for an
+/// owner-batched caller that proposes every owner in one pass
+/// (`defer_propose`). The last argument is the step-timing switch, the
+/// verify's ms, its rows and its accepted drafts, for the STEP_TIMING line.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn propose_after_verify(
+    model: &dyn Model,
+    a: &mut ActiveSeq,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    num_drafts: usize,
+    dflash_verify_raw_argmax: bool,
+    defer_propose: bool,
+    bonus_token_idx: usize,
+    (step_timing, verify_ms, k_rows, num_accepted): (bool, f64, usize, usize),
+) -> Option<usize> {
+    let native_mtp = model.native_mtp_enabled();
     // Re-propose for next step — unless adaptive speculation just suspended
     // this seq (no drafts → the scheduler serial-decodes it via bootstrap).
     let _mtp_grammar_mask = mtp_grammar_mask_for(a);
@@ -544,12 +599,33 @@ pub(super) fn verify_dflash_tail(
             if native_mtp { "MTP" } else { "DFLASH" },
             verify_ms,
             propose_ms,
-            tokens.len(),
+            k_rows,
             num_accepted,
         );
     }
     None
 }
 
+/// Whether a DFlash verify (`raw_lane`: `--dflash`'s raw-argmax lane) picks
+/// its rows through the per-position pipeline instead: under an exact verify
+/// (`Model::verify_bit_exact`), whose rows are serial decode's logits.
+///
+/// The raw argmax skips every stateful stage serial decode runs per token.
+/// [`accept_with_forced_think_end`] only honours a `</think>` armed before the
+/// step, so a block crossing the thinking budget, completing F2's confidence
+/// streak or tripping the think-loop watchdog accepted past the point serial
+/// decode closes the reasoning. The pipeline picks row `i` against the state
+/// after committing rows `0..i` (`emit_step::SpanShadow`, MTP's verify):
+/// budget, F2, watchdog, sentence deferral, fences, penalties, bias, grammar,
+/// the min_tokens ban, content-loop steers, and the request's sampling at
+/// T>0 (each row drawn from its processed logits, seeded by position), with
+/// each stage's effect applied once per committed token (`PickEffects`).
+/// Off the exact verify the raw-argmax lane is unchanged.
+pub(super) fn exact_picks(raw_lane: bool, verify_bit_exact: bool) -> bool {
+    raw_lane && verify_bit_exact
+}
+
+#[cfg(test)]
+mod exact_pick_tests;
 #[cfg(test)]
 mod masked_path_tests;

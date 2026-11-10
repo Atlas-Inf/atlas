@@ -93,6 +93,21 @@ pub fn padded_batch_n(n: usize) -> usize {
     spark_runtime::buffers::padded_batch_rung(n)
 }
 
+/// One prefill-only scoring request (see [`Model::score_requests`]).
+pub struct ScoreInput<'a> {
+    /// Shared prefix, read once.
+    pub prefix: &'a [u32],
+    /// Continuations of `prefix`, each scored at its last row.
+    pub branches: &'a [Vec<u32>],
+    /// Per branch, the single option token ids to score.
+    pub options: &'a [Vec<u32>],
+    /// `prefix_bidir`: in the full-attention layers the prefix (the state) is
+    /// read in both directions and never sees a branch, and each branch reads
+    /// the whole prefix and itself in both directions. GDN layers stay causal.
+    /// False: plain causal attention.
+    pub prefix_bidir: bool,
+}
+
 pub trait Model: Send + Sync {
     /// Release the device memory this model owns, in reverse construction
     /// order.
@@ -299,6 +314,22 @@ pub trait Model: Send + Sync {
             out.push(logits);
         }
         Ok(out)
+    }
+
+    /// Prefill-only scoring: for each request, run `prefix` once and each
+    /// branch as its continuation — every request in ONE forward pass — and
+    /// return, per request and branch, the softmax over that branch's single
+    /// option tokens at its last row. Nothing is sampled, decoded or cached.
+    /// Default: unsupported.
+    fn score_requests(&self, _reqs: &[ScoreInput<'_>], _stream: u64) -> Result<Vec<Vec<Vec<f32>>>> {
+        anyhow::bail!("this model does not support prefill-only scoring")
+    }
+
+    /// Most rows and sequences one [`Model::score_requests`] pass can take
+    /// (the prefill arena and the SSM staging buffers; the SSM state pool).
+    /// `(0, 0)` when scoring is unsupported.
+    fn score_capacity(&self) -> (usize, usize) {
+        (0, 0)
     }
 
     /// Like `prefill_batch_chunk`, but each finishing stream's first-token
@@ -678,7 +709,8 @@ pub trait Model: Send + Sync {
     /// position, so a T=0 speculative run commits exactly the tokens and
     /// logits a non-speculative one does. Default false: batch-K verify
     /// kernels round differently from the single-row ones. qwen4_exp under
-    /// `ATLAS_QWEN4EXP_EXACT_VERIFY=1` (`model/qwen4exp_exact_verify.rs`).
+    /// `ATLAS_QWEN4EXP_EXACT_VERIFY=1` (`model/qwen4exp_exact_verify.rs`),
+    /// qwen3_5 under `ATLAS_EXACT_VERIFY=1` (`model/exact_verify.rs`).
     fn verify_bit_exact(&self) -> bool {
         false
     }
@@ -687,7 +719,9 @@ pub trait Model: Send + Sync {
     /// too, row by row, so a concurrent batch may speculate wherever a single
     /// sequence may (inside `<think>` included). Default false. qwen4_exp
     /// under `ATLAS_QWEN4EXP_EXACT_VERIFY=1` plus `ATLAS_QWEN4EXP_BATCH_FAST=1`
-    /// (`model/qwen4exp_batch_fast.rs`).
+    /// (`model/qwen4exp_batch_fast.rs`); qwen3_5 under `ATLAS_EXACT_VERIFY=1`
+    /// plus `ATLAS_SKINNY_MMA=1` (`model/exact_verify.rs`, "Several
+    /// sequences").
     fn batch_verify_bit_exact(&self) -> bool {
         false
     }
@@ -1015,6 +1049,47 @@ pub trait Model: Send + Sync {
     /// every rank and stage them for the next `decode_verify_dflash`.
     fn send_verify_row_masks(&self, _rows: usize) -> Result<()> {
         bail!("this model cannot grammar-mask a speculative verify")
+    }
+
+    /// Exact DFlash tree verify (`ATLAS_DFLASH_TREE`,
+    /// `speculative::draft_tree`): whether this model serves it.
+    fn dflash_tree_supported(&self) -> bool {
+        false
+    }
+
+    /// A best-first draft tree of at most `rows` rows over the last
+    /// single-sequence propose's lattice; `None` when there is none.
+    fn dflash_draft_tree(
+        &self,
+        _rows: usize,
+    ) -> Result<Option<crate::speculative::draft_tree::DraftTree>> {
+        Ok(None)
+    }
+
+    /// Verify `tree`'s rows (row 0 the last committed token) on `seq`, each
+    /// row's logits serial decode's for the path ending at it. Returns every
+    /// row's argmax; advances `seq` by the rows like
+    /// [`Self::decode_verify_dflash`], and must be followed by
+    /// [`Self::commit_dflash_tree`].
+    fn decode_verify_dflash_tree(
+        &self,
+        _tree: &crate::speculative::draft_tree::DraftTree,
+        _seq: &mut SequenceState,
+    ) -> Result<Vec<u32>> {
+        bail!("this model has no exact tree verify")
+    }
+
+    /// Move the tree verify's logits rows `rows[i]` to row `i` (a root path,
+    /// so the per-row pick pipeline reads it in order).
+    fn dflash_tree_gather_rows(&self, _rows: &[usize]) -> Result<()> {
+        bail!("this model has no exact tree verify")
+    }
+
+    /// Commit the accepted root `path` of the tree verify that just ran:
+    /// KV, recurrent state, drafter-context captures, `seq.tokens` and
+    /// `seq.seq_len` as a chain verify accepting that path leaves them.
+    fn commit_dflash_tree(&self, _seq: &mut SequenceState, _path: &[usize]) -> Result<()> {
+        bail!("this model has no exact tree verify")
     }
 
     fn decode_verify_dflash(
@@ -1661,6 +1736,14 @@ pub trait Model: Send + Sync {
     /// to ask. Returns 0 when nothing is evictable, which the caller must treat
     /// as "no progress possible" rather than retrying forever.
     fn reclaim_prefix_blocks(&self, _num_blocks: usize) -> usize {
+        0
+    }
+
+    /// Whole blocks of `tokens` the prefix cache would hand a new request
+    /// under `adapter_slot` — a read-only probe (no refs, no LRU touch).
+    /// Admission subtracts them so it never reclaims the prefix it is about
+    /// to reuse. Default 0: no prefix cache.
+    fn cached_prefix_blocks(&self, _tokens: &[u32], _adapter_slot: i32) -> usize {
         0
     }
 

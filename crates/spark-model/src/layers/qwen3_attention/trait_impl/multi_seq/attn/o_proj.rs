@@ -224,6 +224,30 @@ impl Qwen3AttentionLayer {
                     )?;
                     c0 += m;
                 }
+            } else if let Some(gemv) = self.wide_bf16_gemv(n) {
+                let shape = [n as u32, h as u32, nq * hd];
+                let ldc = h as u32;
+                ops::bf16_gemv_m32(
+                    fwd.gpu,
+                    gemv,
+                    attn_out,
+                    o_bf16.weight,
+                    o_out,
+                    shape,
+                    ldc,
+                    0,
+                    stream,
+                )?;
+            } else if self.wide_bf16_gemm() {
+                ops::bf16_gemm(
+                    attn_out,
+                    o_bf16.weight.0,
+                    o_out,
+                    n as u32,
+                    h as u32,
+                    nq * hd,
+                    stream,
+                )?;
             } else {
                 ops::dense_gemm(
                     fwd.gpu,
@@ -238,32 +262,16 @@ impl Qwen3AttentionLayer {
                 )?;
             }
         } else if let Some(o_fp8) = self.o_weight.as_ref().and_then(|w| w.as_fp8()) {
-            // Rows 5..8 take the 8-row tier (bit-identical per row to batch16),
-            // as the SSM projections do (`ssm_batched/impl.rs`).
-            let (batch_kernel, div) = if n <= 4 {
-                (self.w8a16_gemv_batch4_k, 4)
-            } else {
-                ops::fp8_verify_gemv_tier(
-                    n,
-                    ops::gemv_vl2_enabled(),
-                    self.w8a16_gemv_batch8_k,
-                    self.w8a16_gemv_batch8_dyn_vl2_k,
-                    self.w8a16_gemv_batch8_dyn_vl2_n2_k,
-                    self.w8a16_gemv_batch16_k,
-                )
-            };
-            if (2..=16).contains(&n) && batch_kernel.0 != 0 {
-                ops::w8a16_gemv_batch4_div(
-                    fwd.gpu,
-                    batch_kernel,
+            // One weight pass per `fp8_rows_plan` launch (`qkv_fp8.rs`); up
+            // to 4 rows serial decode's `w8a16_gemv` bytes, as for q/k/v.
+            if let Some(plan) = self.fp8_rows_plan(fwd, n).filter(|_| n >= 2) {
+                self.fp8_rows(
+                    fwd,
+                    &plan,
                     attn_out,
-                    o_fp8.weight,
-                    o_fp8.row_scale,
+                    o_fp8,
                     o_out,
-                    n as u32,
-                    h as u32,
-                    nq * hd,
-                    div,
+                    [h as u32, nq * hd],
                     stream,
                 )?;
             } else {
@@ -319,21 +327,28 @@ impl Qwen3AttentionLayer {
                 nq * hd,
                 stream,
             )?;
-        } else if n == 4
-            && fwd.levers.qwen4exp_exact_verify
+        } else if (n == 4 && fwd.levers.exact_verify || n > 4 && fwd.levers.dense_exact_rows(n))
             && !self.attn.o_proj.is_null()
-            && self.w4a16_batchm.scalar_kernel(4).0 != 0
+            && self
+                .w4a16_batchm
+                .exact_kernel(n as u32, nq * hd, self.w4a16_gemv_batch16_k)
+                .0
+                != 0
         {
-            // qwen4_exp exact K=4 verify: the scalar batch4 template, whose
-            // rows equal serial decode's `w4a16_gemv[_sw]`. The wide arm below
-            // may take DP4A or the tensor-core tier, which do not.
+            // Exact K=4 verify (qwen4_exp, qwen3_5) and the dense lever's
+            // 5..=16-row DFlash K=γ verify (past 16 rows the batch lever's
+            // steps, one call the skinny kernels take whole): the scalar
+            // batch template (batch16 past 8 rows), whose rows equal serial decode's
+            // `w4a16_gemv[_sw]`. The wide arm below may take DP4A or the
+            // tensor-core tier, which do not.
             ops::w4a16_gemv_batchm(
                 fwd.gpu,
-                self.w4a16_batchm.scalar_kernel(4),
+                self.w4a16_batchm
+                    .exact_kernel(n as u32, nq * hd, self.w4a16_gemv_batch16_k),
                 attn_out,
                 &self.attn.o_proj,
                 o_out,
-                4,
+                n as u32,
                 h as u32,
                 nq * hd,
                 stream,

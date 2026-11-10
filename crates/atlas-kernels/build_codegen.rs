@@ -200,6 +200,7 @@ pub(super) fn generate_target_ptx_rs(
              \x20               tool_retry: {},\n\
              \x20               preserve_thinking: {:?},\n\
              \x20               verbatim_prompt: {},\n\
+             \x20               nvfp4_verbatim_prompt: {:?},\n\
              \x20               eos_ends_thinking: {},\n\
              \x20               tool_call_steering: {},\n\
              \x20               verbatim_reasoning_effort: {},\n\
@@ -253,6 +254,7 @@ pub(super) fn generate_target_ptx_rs(
             target.behavior_tool_retry,
             target.behavior_preserve_thinking,
             target.behavior_verbatim_prompt,
+            target.behavior_nvfp4_verbatim_prompt,
             target.behavior_eos_ends_thinking,
             target.behavior_tool_call_steering,
             target.behavior_verbatim_reasoning_effort,
@@ -272,9 +274,10 @@ pub(super) fn generate_target_ptx_rs(
             match &target.dflash {
                 None => "None".to_string(),
                 Some(d) => format!(
-                    "Some(DflashConfig {{ draft_model: \"{}\", gamma: {}, window_size: {}, mask_token_id: {}, target_layer_ids: &[{}] }})",
+                    "Some(DflashConfig {{ draft_model: \"{}\", gamma: {}, window_size: {}, mask_token_id: {}, target_layer_ids: &[{}], drop_bf16: {} }})",
                     d.draft_model, d.gamma, d.window_size, d.mask_token_id,
                     d.target_layer_ids.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", "),
+                    d.drop_bf16,
                 ),
             },
             all_drops

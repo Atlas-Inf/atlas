@@ -280,6 +280,7 @@ impl TransformerModel {
             cu_seqlens_host,
             kv_lens: scratch_base.offset(kv_lens_off - positions_off),
             kv_lens_host,
+            state_end: DevicePtr::NULL,
             max_blocks_per_seq: max_blocks,
             staged_bytes: total_meta_bytes,
         })

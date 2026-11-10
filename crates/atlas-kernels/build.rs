@@ -145,6 +145,7 @@ struct Target {
     behavior_tool_retry: bool,
     behavior_preserve_thinking: Option<bool>,
     behavior_verbatim_prompt: bool,
+    behavior_nvfp4_verbatim_prompt: Option<bool>,
     behavior_eos_ends_thinking: bool,
     behavior_tool_call_steering: bool,
     behavior_verbatim_reasoning_effort: bool,
@@ -171,6 +172,7 @@ struct DflashRaw {
     window_size: usize,
     mask_token_id: u32,
     target_layer_ids: Vec<usize>,
+    drop_bf16: bool,
 }
 
 fn main() {
@@ -1371,6 +1373,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_tool_retry: pb.tool_retry,
                 behavior_preserve_thinking: pb.preserve_thinking,
                 behavior_verbatim_prompt: pb.verbatim_prompt,
+                behavior_nvfp4_verbatim_prompt: pb.nvfp4_verbatim_prompt,
                 behavior_eos_ends_thinking: pb.eos_ends_thinking,
                 behavior_tool_call_steering: pb.tool_call_steering,
                 behavior_verbatim_reasoning_effort: pb.verbatim_reasoning_effort,

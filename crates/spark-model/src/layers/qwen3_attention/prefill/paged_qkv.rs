@@ -129,9 +129,10 @@ impl Qwen3AttentionLayer {
         )?;
 
         let v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16);
+        let v_in = self.value_residual_input(ctx.gpu, normed, n as usize, h as usize, stream)?;
         self.prefill_one_proj(
             Proj::V,
-            normed,
+            v_in,
             v_contiguous,
             n,
             nkv * hd,
@@ -373,10 +374,15 @@ impl Qwen3AttentionLayer {
                 )?;
             }
         } else if let Some(nvfp4_t) = nvfp4_t {
-            if n > 128 {
+            if self.nvfp4_proj_m128(nvfp4_t, [n, out_dim, h], ctx.levers) {
                 self.w4a16_gemm_m128_dispatch(
                     ctx.gpu,
-                    ctx.dispatch,
+                    (ctx.dispatch, ctx.levers),
+                    crate::layers::ops::LowpArgs {
+                        group: crate::layers::ops::LowpMix::ATTN_QKV,
+                        codes: ctx.buffers.ffn_act_a(),
+                        scales: ctx.buffers.ffn_act_scale(),
+                    },
                     normed,
                     nvfp4_t,
                     out,

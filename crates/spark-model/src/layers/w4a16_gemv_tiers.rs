@@ -212,6 +212,11 @@ impl W4a16BatchmTiers {
         for (h, w) in handles.iter_mut().zip(W4A16_BATCHM_WIDTHS) {
             *h = super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_batch{w}"));
         }
+        // `ATLAS_WIDE_GEMV`'s tiers, which the batched launch ops consult
+        // (`ops::wide_gemv`); resolved once, and only when the lever is on.
+        super::ops::wide_gemv::init(gpu);
+        // `ATLAS_SKINNY_MMA`'s kernels, likewise (`ops::skinny_mma`).
+        super::ops::skinny_mma::init(gpu);
         if glm_series && tc_requested() {
             let canonical_target = canonical_target(gpu);
             TC.get_or_init(|| {
@@ -251,6 +256,29 @@ impl W4a16BatchmTiers {
     pub fn scalar_kernel(&self, m: u32) -> KernelHandle {
         select_tier(m, self.present(), exact_m_tiers_enabled())
             .map_or(KernelHandle(0), |i| self.handles[i])
+    }
+
+    /// The row-exact tier for `m` rows of an exact verify of a `k`-wide
+    /// weight (`ATLAS_EXACT_VERIFY`, `model/exact_verify.rs`):
+    /// [`Self::scalar_kernel`] up to 8 rows, `batch16` (`w4a16_gemv_batch16`,
+    /// the same scalar template at `MAX_M` 16, so row `r` is still
+    /// `w4a16_gemv`'s bytes) for 9..=16. Past 16 rows `batch16` only when the
+    /// skinny kernels take the launch whole (`skinny_mma::serves_rows`, the
+    /// batch lever's wide steps), else a zero handle. One call, at every width.
+    pub fn exact_kernel(&self, m: u32, k: u32, batch16: KernelHandle) -> KernelHandle {
+        match m {
+            0..=8 => self.scalar_kernel(m),
+            9..=16 => batch16,
+            _ if super::ops::skinny_mma::serves_rows(
+                super::ops::skinny_mma::Family::W4a16,
+                m,
+                k,
+            ) =>
+            {
+                batch16
+            }
+            _ => KernelHandle(0),
+        }
     }
 
     /// Width of the tier [`Self::kernel`] would pick, for logging and tests.

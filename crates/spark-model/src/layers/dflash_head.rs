@@ -29,6 +29,9 @@ use crate::weight_map::{DenseWeight, QuantizedWeight};
 
 pub mod conv;
 mod draft_conf;
+pub mod dspine;
+pub mod dual;
+mod fp8_m32;
 mod paged_attn_modules;
 pub mod product_policy;
 pub mod selector;
@@ -71,6 +74,10 @@ pub struct DflashKernels {
     /// (and ~4× OOB → CUDA-700). `.0 == 0` when the target lm_head is BF16.
     pub w4a16_gemm: KernelHandle,
     pub dense_gemm_pipelined: KernelHandle,
+    /// `bf16_gemv_m32` (Ricursive's target): 1..=32-row drafter GEMMs; 0 elsewhere.
+    pub bf16_gemv_m32: KernelHandle,
+    /// `fp8_gemv_m32`: the same GEMMs on [`Self::fp8_m32`]'s FP8 mirrors.
+    pub fp8_gemv_m32: KernelHandle,
     pub rope_qwen3: KernelHandle,
     pub reshape_cache_fp8: KernelHandle,
     /// BF16 KV cache writeback. Used by Phase 2 `precompute_ctx_kv` and
@@ -248,7 +255,7 @@ pub struct DflashScratch {
     /// historical target positions (decoded indices); last γ are
     /// the to-be-predicted noise positions.
     pub position_ids: DevicePtr,
-    /// DFlash2 scratch: dynamic conv delta coefficients `[γ, 4 * num_groups]` BF16.
+    /// DFlash2 scratch: dynamic conv delta coefficients `[γ, 2 * kernel_size * num_groups]` BF16.
     pub dflash2_conv_delta: DevicePtr,
     /// DFlash2 scratch: convolution output `[γ, hidden_size]` BF16.
     pub dflash2_conv_out: DevicePtr,
@@ -257,6 +264,8 @@ pub struct DflashScratch {
     /// DFlash2 candidate-selector slice lists + ticket
     /// ([`crate::layers::ops::dflash2_selector_scratch_bytes`], zeroed at allocation).
     pub dflash2_selector_scratch: DevicePtr,
+    /// DSpine bridge/tail buffers for this lane's γ rows (`None` off DSpine).
+    pub dspine: Option<dspine::DspineScratch>,
 }
 
 /// Drafter-side weight precision. Defaults to BF16. **Phase G (2026-05-28)**
@@ -325,6 +334,12 @@ pub struct DflashLayer {
     pub mlp_conv: Option<Dflash2Conv>,
     /// MXFP8 twins of q/o/gate/up/down (`ATLAS_DFLASH_MXFP8=1`), else None.
     pub mx: Option<LayerMxfp8>,
+    /// RoPE on this layer's Q/K (`false` for HF `no_rope_layers`).
+    pub rope: bool,
+    /// This layer's own sliding window in the attention kernel (0 = none)
+    /// when `layer_types` mixes sliding and full layers; see
+    /// [`BlockDiffusionDraftHead::layer_attn_window`].
+    pub attn_window: u32,
 }
 
 /// Per-sequence DFlash drafter state. One paged KV cache per drafter layer
@@ -466,6 +481,11 @@ pub struct DflashProposerState {
     pub(crate) ctx_run: Option<warm_ctx::CtxRun>,
     /// The store windows this prefill wrote and restored from (`warm_ctx`).
     pub(crate) ctx_store: warm_ctx_store::StoreRefs,
+    /// `--draft-model-alt`: the second drafter's state (its own drafter KV;
+    /// the context accumulator is this state's, mirrored in for each of its
+    /// proposes) and the per-request router between the two (`dual`).
+    pub alt: Option<Box<DflashProposerState>>,
+    pub route: dual::Route,
 }
 
 impl DflashProposerState {
@@ -595,6 +615,9 @@ pub struct BlockDiffusionDraftHead {
     /// it must not mutate the target model's lm_head. `None` on the
     /// BF16 path.
     pub lm_head_shared_fp8: Option<crate::weight_map::Fp8DenseWeight>,
+    /// FP8 mirrors for the small-M drafter GEMMs (`ATLAS_DFLASH_DRAFTER_FP8_M32`),
+    /// keyed by the BF16 weight pointer `drafter_dense_gemm` receives.
+    pub fp8_m32: Vec<(u64, crate::weight_map::Fp8DenseWeight)>,
 
     // === Weights from the drafter checkpoint ===
     /// Hidden-norm applied to the projected target context before mixing
@@ -621,6 +644,14 @@ pub struct BlockDiffusionDraftHead {
     pub layers: Vec<DflashLayer>,
     /// DFlash2 CandidateSelector bilinear path scorer (replaces greedy argmax).
     pub candidate_selector: Option<Dflash2CandidateSelector>,
+    /// DSpine code bridge and serial-table tail (`dspine`), when the drafter
+    /// is a DSpine checkpoint.
+    pub dspine: Option<dspine::Dspine>,
+    /// `--draft-model-alt`: the second drafter, routed per request (`dual`).
+    pub alt: Option<Box<BlockDiffusionDraftHead>>,
+    /// Sequence states alive (`alloc_state` .. `free_state`): past two every
+    /// sequence of a dual head proposes with the short-block head.
+    pub live: std::sync::atomic::AtomicUsize,
 
     /// Phase 2 (Option B) fused K/V projection across all L drafter layers.
     /// Shape: `[L × 2 × kv_dim, h]` BF16 — concatenated `[K0; V0; K1; V1; …]`
@@ -690,6 +721,9 @@ pub struct BlockDiffusionDraftHead {
     /// DFlash2 selector scratch for the batched tail's per-sequence launches.
     /// NULL when the head has no candidate selector.
     pub batch_dflash2_selector_scratch: DevicePtr,
+    /// The buffers of the last single-sequence DFlash2 selector launch
+    /// (`tree_lattice`): what an exact tree verify builds its tree from.
+    pub last_select: parking_lot::Mutex<Option<tree_lattice::LastSelect>>,
     /// DFlash2 conv scratch: dynamic-delta rows `[B*gamma, 2*kernel_size*groups]`
     /// and conv output `[B*gamma, hidden]`. NULL when the drafter ships no conv.
     pub batch_conv_delta: DevicePtr,
@@ -903,8 +937,10 @@ pub mod rank_split;
 mod rank_split_batch;
 mod rank_split_forward;
 mod small_m_gemm;
+mod tree_lattice;
 
 mod context_window;
+mod layer_attention;
 mod markov_slots;
 use markov_slots::{MARKOV_BAN_DEPTH_OFFSET, MARKOV_PREV_BYTES};
 mod twins;
@@ -1293,6 +1329,18 @@ impl DraftProposer for BlockDiffusionDraftHead {
         Some(&self.startup.diagnostics)
     }
 
+    fn draft_tree(
+        &self,
+        gpu: &dyn GpuBackend,
+        rows: usize,
+    ) -> Result<Option<crate::speculative::draft_tree::DraftTree>> {
+        // Two drafters: the lattice may be the other head's. Chain verify.
+        if self.alt.is_some() {
+            return Ok(None);
+        }
+        self.tree_from_last_select(gpu, rows)
+    }
+
     fn propose_batch_max(
         &self,
         _buffers: &spark_runtime::buffers::BufferArena,
@@ -1319,69 +1367,13 @@ impl DraftProposer for BlockDiffusionDraftHead {
     }
 
     fn alloc_state(&self, _gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
-        // Per-seq ctx accumulator: `[max_seq_len, 5 * target_hidden] BF16`
-        // (~1.4 GB at max_seq_len=26624). Lazy — see below.
-        let bf16 = 2usize;
-        let ctx_slot_bytes = self.target_layer_ids.len() * self.target_hidden_size * bf16;
-        // The ~1.4 GB accumulator is LAZY: allocated at the first prefill
-        // capture (acquire_ctx_acc), after carry adoption — a validated
-        // carry installs the previous seq's buffer instead, so eager
-        // alloc-here forced TWO ~1.4 GB buffers live per warm turn and
-        // fragmented the device map into alloc failures.
-        let ctx_hidden_acc = DevicePtr(0);
-        let max_ctx_len = self.ctx_window_len();
-        Ok(Box::new(DflashProposerState {
-            block_table: Vec::with_capacity(64),
-            seq_len: 0,
-            last_num_drafted: 0,
-            last_draft_conf: Vec::new(),
-            prefill_done: false,
-            ctx_hidden_acc,
-            ctx_len: 0,
-            last_num_accepted: 0,
-            skip_next_decode_append: false,
-            // Retention cap follows ctx_window (the attention-side ctx
-            // budget), NOT the drafter SWA window_size: paged attention
-            // panics when ctx_count exceeds the ctx_window-sized scratch,
-            // and a smaller cap slides the accumulator mid-prompt — which
-            // empirically collapses acceptance to zero on prompts past it.
-            max_ctx_len,
-            // Dense window: the buffer only ever needs max_ctx_len rows —
-            // decode appends slide before writing and the prefill capture
-            // slides mid-prefill on overflow, so sizing at max_seq_len was
-            // ~0.5 GB of dead allocation at 16K ctx_window.
-            ctx_acc_rows: max_ctx_len,
-            ctx_prefill_origin: None,
-            ctx_prefill_base: 0,
-            ctx_slot_bytes,
-            // Phase 2 Option B: lazily allocated on first propose when
-            // Option B is on (the generic default; ATLAS_DFLASH_OPTION_B=0
-            // restores the legacy contiguous path). None until then to
-            // keep alloc_state
-            // cheap for sequences that never use Option B.
-            block_table_dev: None,
-            ctx_count_drafter: 0,
-            max_ctx_count_drafter: 0,
-            ctx_committed: 0,
-            ctx_positions: Vec::new(),
-            end_floor: 0,
-            first_append_at: None,
-            own_capture: false,
-            own_row_at: None,
-            own_row: None,
-            warm_ctx: self.startup.diagnostics.warm_ctx,
-            ctx_floor: 0,
-            ctx_run: None,
-            ctx_store: warm_ctx_store::StoreRefs::default(),
-            // Propose lane: fixed for the seq lifetime (batch positions
-            // reorder; captured graphs bake lane scratch pointers). Round-
-            // robin keeps concurrent seqs spread across the lane streams.
-            lane_id: self
-                .next_lane
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                % self.lane_count(),
-            lifecycle: None,
-        }))
+        let mut state = self.fresh_state();
+        self.live.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(alt) = self.alt.as_deref() {
+            state.alt = Some(Box::new(alt.fresh_state()));
+            state.route = dual::Route::new([self.gamma, alt.gamma]);
+        }
+        Ok(Box::new(state))
     }
 
     fn acquire_ctx_acc(&self, gpu: &dyn GpuBackend, state: &mut dyn ProposerState) -> Result<()> {
@@ -1439,6 +1431,44 @@ impl DraftProposer for BlockDiffusionDraftHead {
         grammar_bitmask: Option<&[i32]>,
         target_hidden_stack: Option<spark_runtime::gpu::DevicePtr>,
     ) -> Result<Vec<u32>> {
+        // `--draft-model-alt`: the request's router picks the head.
+        if let Some(alt) = self.alt.as_deref() {
+            let d = state
+                .as_any_mut()
+                .downcast_mut::<DflashProposerState>()
+                .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+            let head = self.dual_pick(&mut d.route);
+            if head == 1 {
+                return dual::with_alt(d, |a| {
+                    alt.propose_drafts(
+                        last_token,
+                        target_hidden,
+                        position,
+                        num_drafts,
+                        a,
+                        expected_owner,
+                        ctx,
+                        stream,
+                        draft_embed_target,
+                        grammar_bitmask,
+                        target_hidden_stack,
+                    )
+                });
+            }
+            return self.propose_drafts(
+                last_token,
+                target_hidden,
+                position,
+                num_drafts,
+                d,
+                expected_owner,
+                ctx,
+                stream,
+                draft_embed_target,
+                grammar_bitmask,
+                target_hidden_stack,
+            );
+        }
         // ATLAS_GLM_DRAFT_TP: the model announced this propose to the worker,
         // which walks every swap. However the propose ends, issue them all.
         let split = self.rank_split_with(ctx.comm, grammar_bitmask.is_some());
@@ -1499,6 +1529,19 @@ impl DraftProposer for BlockDiffusionDraftHead {
         _out_conf: Option<&mut Vec<Vec<f32>>>,
         grammar_bitmasks: Option<&[Option<Vec<i32>>]>,
     ) -> Result<Option<Vec<Vec<u32>>>> {
+        if self.alt.is_some() {
+            return self.dual_propose_batch(
+                last_tokens,
+                target_hiddens,
+                positions,
+                num_drafts,
+                states,
+                expected_owners,
+                ctx,
+                stream,
+                grammar_bitmasks,
+            );
+        }
         // ATLAS_GLM_DRAFT_TP_BATCH: the model announced this batched propose
         // to the worker, which walks every swap; however it ends, the guard
         // issues them all. Only the staged forward and the context appends
@@ -1572,6 +1615,12 @@ impl DraftProposer for BlockDiffusionDraftHead {
         )?;
         dstate.last_num_accepted = num_accepted;
         dstate.last_num_drafted = 0;
+        if self.alt.is_some() {
+            dstate.route.record(valid_rows);
+            if let Some(alt) = dstate.alt.as_mut() {
+                alt.last_num_drafted = 0;
+            }
+        }
         Ok(())
     }
 
@@ -1592,6 +1641,19 @@ impl DraftProposer for BlockDiffusionDraftHead {
             // Phase 1 / non-DFlash proposer state: nothing allocated, nothing to free.
             None => return Ok(()),
         };
+        let _ = self.live.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |n| n.checked_sub(1),
+        );
+        // The alt drafter's KV goes first; the accumulator is this state's.
+        if let (Some(alt), Some(mut a)) = (self.alt.as_deref(), dstate.alt.take()) {
+            a.mirror_from(dstate);
+            a.release_shared();
+            if let Err(e) = alt.free_state(gpu, expected_owner, &mut *a) {
+                tracing::warn!("DFlash dual drafter: freeing the alt state failed: {e:#}");
+            }
+        }
         // Transactional cleanup: owner validation runs FIRST, but a
         // validation failure still reclaims every resource below before
         // propagating — a mismatched owner must not leak graphs, KV blocks,
@@ -1856,3 +1918,74 @@ impl DraftProposer for BlockDiffusionDraftHead {
 
 #[cfg(test)]
 pub(crate) mod prefill_test_support;
+
+impl BlockDiffusionDraftHead {
+    /// A fresh sequence state for this head (no alt state).
+    pub(super) fn fresh_state(&self) -> DflashProposerState {
+        // Per-seq ctx accumulator: `[max_seq_len, 5 * target_hidden] BF16`
+        // (~1.4 GB at max_seq_len=26624). Lazy — see below.
+        let bf16 = 2usize;
+        let ctx_slot_bytes = self.target_layer_ids.len() * self.target_hidden_size * bf16;
+        // The ~1.4 GB accumulator is LAZY: allocated at the first prefill
+        // capture (acquire_ctx_acc), after carry adoption — a validated
+        // carry installs the previous seq's buffer instead, so eager
+        // alloc-here forced TWO ~1.4 GB buffers live per warm turn and
+        // fragmented the device map into alloc failures.
+        let ctx_hidden_acc = DevicePtr(0);
+        let max_ctx_len = self.ctx_window_len();
+        DflashProposerState {
+            block_table: Vec::with_capacity(64),
+            seq_len: 0,
+            last_num_drafted: 0,
+            last_draft_conf: Vec::new(),
+            prefill_done: false,
+            ctx_hidden_acc,
+            ctx_len: 0,
+            last_num_accepted: 0,
+            skip_next_decode_append: false,
+            // Retention cap follows ctx_window (the attention-side ctx
+            // budget), NOT the drafter SWA window_size: paged attention
+            // panics when ctx_count exceeds the ctx_window-sized scratch,
+            // and a smaller cap slides the accumulator mid-prompt — which
+            // empirically collapses acceptance to zero on prompts past it.
+            max_ctx_len,
+            // Dense window: the buffer only ever needs max_ctx_len rows —
+            // decode appends slide before writing and the prefill capture
+            // slides mid-prefill on overflow, so sizing at max_seq_len was
+            // ~0.5 GB of dead allocation at 16K ctx_window.
+            ctx_acc_rows: max_ctx_len,
+            ctx_prefill_origin: None,
+            ctx_prefill_base: 0,
+            ctx_slot_bytes,
+            // Phase 2 Option B: lazily allocated on first propose when
+            // Option B is on (the generic default; ATLAS_DFLASH_OPTION_B=0
+            // restores the legacy contiguous path). None until then to
+            // keep alloc_state
+            // cheap for sequences that never use Option B.
+            block_table_dev: None,
+            ctx_count_drafter: 0,
+            max_ctx_count_drafter: 0,
+            ctx_committed: 0,
+            ctx_positions: Vec::new(),
+            end_floor: 0,
+            first_append_at: None,
+            own_capture: false,
+            own_row_at: None,
+            own_row: None,
+            warm_ctx: self.startup.diagnostics.warm_ctx,
+            ctx_floor: 0,
+            ctx_run: None,
+            ctx_store: warm_ctx_store::StoreRefs::default(),
+            // Propose lane: fixed for the seq lifetime (batch positions
+            // reorder; captured graphs bake lane scratch pointers). Round-
+            // robin keeps concurrent seqs spread across the lane streams.
+            lane_id: self
+                .next_lane
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % self.lane_count(),
+            lifecycle: None,
+            alt: None,
+            route: Default::default(),
+        }
+    }
+}

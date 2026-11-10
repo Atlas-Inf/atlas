@@ -78,6 +78,7 @@ mod repetition;
 mod rollback;
 mod sample_step;
 pub mod sched_ctx;
+pub mod score;
 mod shared_prefix;
 #[cfg(test)]
 mod slot_compaction_tests;
@@ -87,6 +88,7 @@ pub mod spec_stats;
 mod spec_step;
 mod ssm_decode_ring;
 mod strict_spec;
+mod swap_gate;
 mod teardown;
 #[cfg(test)]
 mod test_support;
@@ -253,6 +255,7 @@ pub fn run(
     mut model: Box<dyn Model>,
     request_rx: tokio::sync::mpsc::Receiver<InferenceRequest>,
     rotation_rx: tokio::sync::mpsc::Receiver<LoraRotation>,
+    score_rx: tokio::sync::mpsc::Receiver<score::ScoreJob>,
     eos_tokens: Vec<u32>,
     max_batch_size: usize,
     use_speculative: bool,
@@ -382,6 +385,7 @@ pub fn run(
             requests: Vec::new(),
             closed: false,
             rotations: Vec::new(),
+            scores: Vec::new(),
         }),
         Condvar::new(),
     ));
@@ -410,6 +414,19 @@ pub fn run(
         while let Some(rot) = rx.blocking_recv() {
             pr.0.lock().rotations.push(rot);
             pr.1.notify_one();
+        }
+    });
+
+    // Score receiver thread: `/v1/score` jobs land in `pending.scores` (a
+    // bounded backlog, see `score::admit`) and run at the same quiescent
+    // point as rotations (see `score.rs`).
+    let ps = Arc::clone(&pending);
+    std::thread::spawn(move || {
+        let mut rx = score_rx;
+        while let Some(job) = rx.blocking_recv() {
+            if score::admit(&mut ps.0.lock().scores, job) {
+                ps.1.notify_one();
+            }
         }
     });
 
@@ -613,6 +630,13 @@ pub fn run(
                 };
                 let _ = ack.send(res);
             }
+            // One score pass per quiescent tick; the rest stay queued.
+            if !pending.0.lock().scores.is_empty() {
+                let budget =
+                    score::ScoreBudget::new(model.score_capacity(), max_batch_size, block_size);
+                let jobs = score::take_tick(&mut pending.0.lock().scores, &budget);
+                score::run_jobs(&*model, jobs, prefill_stream, &budget);
+            }
         }
         if new_reqs.is_empty() && active.is_empty() && prefilling.is_empty() {
             // Receiver thread was closed (shutdown).
@@ -625,8 +649,14 @@ pub fn run(
         // ── Swap-out: evict active sequences to disk when blocks run low ──
         if let Some(ref mut spill) = spill_manager {
             for req in &new_reqs {
-                let prompt_len = req.prompt_len();
-                let blocks_needed = prompt_len / block_size + 1;
+                // Only the blocks this request will allocate: its cached prefix
+                // is handed over by the lookup (`swap_gate`).
+                let blocks_needed = swap_gate::blocks_for_admission(
+                    &*model,
+                    &req.prompt_tokens_arc(),
+                    req.adapter_slot(),
+                    block_size,
+                );
                 // Reclaim from the prefix cache BEFORE paying disk I/O for a live
                 // sequence. Cached blocks are a pure optimization; a swapped-out
                 // sequence is in-flight work that costs a write now and a read
@@ -841,8 +871,9 @@ pub fn run(
             // DFlash raw-argmax does not run ForcedThinkEnd, so it stays
             // serial-in-think unless this lever is on. Resume guard still
             // serial-decodes the spec-entry window. A bit-exact verify
-            // (`ATLAS_QWEN4EXP_EXACT_VERIFY=1`) counts as the opt-in for a
-            // single sequence: speculating there is lossless.
+            // (`ATLAS_QWEN4EXP_EXACT_VERIFY=1`, or `ATLAS_EXACT_VERIFY=1` on
+            // qwen3_5, DFlash included) counts as the opt-in for a single
+            // sequence: speculating there is lossless.
             let dflash_spec_think = mtp_gate::spec_think_for(
                 sched.levers.dflash_spec_think,
                 model.verify_bit_exact(),
@@ -874,7 +905,8 @@ pub fn run(
             // `adaptive_rung` so both halves of the regime report from one
             // place — no parallel accounting, the value below is the one the
             // dispatch chain actually uses.
-            let spec_width_ok = active.len() <= mtp_max_seqs();
+            let spec_width_ok = active.len() <= mtp_max_seqs()
+                && (!dflash_verify_raw_argmax || dflash_width::spec_width_ok(active.len()));
             // Conservative bound: multi-sequence verify batches and the
             // n-gram lane stop at the QSA inert bound. A sequence speculating
             // ALONE on the MTP lane may go past it when the model serves an

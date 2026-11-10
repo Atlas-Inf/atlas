@@ -223,6 +223,7 @@ fn gate(
             requests: vec![],
             closed: false,
             rotations: vec![],
+            scores: vec![],
         }),
         Condvar::new(),
     ));

@@ -32,17 +32,15 @@ use spark_runtime::weights::WeightStore;
 use crate::weight_map::{DenseWeight, QuantizedWeight, dense_auto};
 
 mod config;
+mod conv;
+mod dspine;
+mod layer_attention;
 mod own_head;
 
 pub use config::*;
+pub use conv::DflashConvWeights;
+pub use dspine::*;
 pub(crate) use own_head::own_lm_head_present;
-
-/// DFlash2 2-tap grouped dynamic convolution weights.
-#[derive(Clone)]
-pub struct DflashConvWeights {
-    pub base_kernel: DenseWeight,
-    pub kernel_projection: DenseWeight,
-}
 
 /// DFlash2 bilinear candidate selector weights.
 #[derive(Clone)]
@@ -71,6 +69,8 @@ pub struct DflashWeights {
     /// Own NVFP4 lm_head (LiLiCorr-style drafters, `has_own_lm_head: true`).
     /// `None` on generic DFlash — the head shares the target's.
     pub lm_head: Option<QuantizedWeight>,
+    /// DSpine's code bridge (`selected_prefix_bridge.*`), when declared.
+    pub dspine: Option<DspineBridgeWeights>,
 }
 
 /// Per-drafter-layer raw weights (BF16).
@@ -190,29 +190,18 @@ pub fn load_dflash_weights(
         } else {
             None
         };
-        let attn_conv_base = format!("{lp}.attention_conv.base_kernel");
-        let attn_conv_proj = format!("{lp}.attention_conv.kernel_projection.weight");
-        let attention_conv =
-            if drafter_store.contains(&attn_conv_base) && drafter_store.contains(&attn_conv_proj) {
-                Some(DflashConvWeights {
-                    base_kernel: dense_auto(drafter_store, &attn_conv_base, gpu)?,
-                    kernel_projection: dense_auto(drafter_store, &attn_conv_proj, gpu)?,
-                })
-            } else {
-                None
-            };
-
-        let mlp_conv_base = format!("{lp}.mlp_conv.base_kernel");
-        let mlp_conv_proj = format!("{lp}.mlp_conv.kernel_projection.weight");
-        let mlp_conv =
-            if drafter_store.contains(&mlp_conv_base) && drafter_store.contains(&mlp_conv_proj) {
-                Some(DflashConvWeights {
-                    base_kernel: dense_auto(drafter_store, &mlp_conv_base, gpu)?,
-                    kernel_projection: dense_auto(drafter_store, &mlp_conv_proj, gpu)?,
-                })
-            } else {
-                None
-            };
+        let attention_conv = conv::load_conv(
+            drafter_store,
+            &format!("{lp}.attention_conv"),
+            drafter_config,
+            gpu,
+        )?;
+        let mlp_conv = conv::load_conv(
+            drafter_store,
+            &format!("{lp}.mlp_conv"),
+            drafter_config,
+            gpu,
+        )?;
 
         let layer = DflashLayerWeights {
             input_layernorm: dense_auto(
@@ -323,6 +312,8 @@ pub fn load_dflash_weights(
         );
     }
 
+    let dspine = load_dspine_bridge(drafter_store, drafter_config, prefix, gpu)?;
+
     if let Ok(fc_meta) = drafter_store.get(&format!("{prefix}fc.weight"))
         && fc_meta.dtype == spark_runtime::weights::WeightDtype::UInt8
         && fc_meta.shape.len() == 2
@@ -364,6 +355,7 @@ pub fn load_dflash_weights(
         embed_tokens,
         candidate_selector,
         lm_head,
+        dspine,
     }))
 }
 

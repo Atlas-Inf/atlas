@@ -79,7 +79,7 @@ pub(in crate::scheduler) fn verify_pick_batch(
     }
     let run = |(i, buf, a): &mut (usize, Vec<u8>, &mut ActiveSeq), ctx: &LogitsContext| {
         let k = off[*i + 1] - off[*i];
-        (*i, slow(buf, k, vocab, a, ctx))
+        (*i, slow(buf, k, vocab, a, ctx, None))
     };
     let done: Vec<(usize, Vec<u32>)> = if jobs.len() > 1 {
         let parts = ctx.parts();

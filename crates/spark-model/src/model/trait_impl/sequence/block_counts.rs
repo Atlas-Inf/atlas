@@ -32,4 +32,21 @@ impl TransformerModel {
         self.apply_evicted(evicted, &mut kv);
         kv.num_free_in_all().saturating_sub(before)
     }
+
+    pub(in crate::model::trait_impl) fn cached_prefix_blocks_dispatch(
+        &self,
+        tokens: &[u32],
+        adapter_slot: i32,
+    ) -> usize {
+        // The prefill looks up the vision-keyed prompt (`pc_key`); a raw probe
+        // of a vision prompt would credit blocks it never adopts.
+        if !self.prefix_cache.is_active() || self.tokens_have_vision_pad(tokens) {
+            return 0;
+        }
+        let bs = self.kv_cache.lock().block_size();
+        let adapter_id = self.adapter_id_for_slot(adapter_slot);
+        self.prefix_cache
+            .peek_matched_tokens(tokens, bs, adapter_id)
+            / bs
+    }
 }

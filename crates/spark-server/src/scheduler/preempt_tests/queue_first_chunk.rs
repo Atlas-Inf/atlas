@@ -45,7 +45,7 @@ fn sched(queue: bool, srpt: bool) -> SchedCtx {
 
 /// A buffered request for a `len`-token prompt. `min_tokens` bans the end
 /// token from the first sample, which the stub then draws on the host.
-fn request(len: usize) -> (InferenceRequest, RespRx) {
+pub(super) fn request(len: usize) -> (InferenceRequest, RespRx) {
     let (response_tx, rx) = tokio::sync::oneshot::channel();
     let mut req = test_request!(Blocking, response_tx,);
     if let InferenceRequest::Blocking {
@@ -83,15 +83,15 @@ fn streaming(
 }
 
 /// The scheduler's prefill state across ticks.
-struct Tick<'a> {
+pub(super) struct Tick<'a> {
     model: &'a PreemptStubModel,
     sched: SchedCtx,
-    active: Vec<ActiveSeq>,
+    pub(super) active: Vec<ActiveSeq>,
     prefilling: Vec<PrefillInProgress>,
 }
 
 impl<'a> Tick<'a> {
-    fn new(model: &'a PreemptStubModel, queue: bool, srpt: bool) -> Self {
+    pub(super) fn new(model: &'a PreemptStubModel, queue: bool, srpt: bool) -> Self {
         Self {
             model,
             sched: sched(queue, srpt),
@@ -101,7 +101,7 @@ impl<'a> Tick<'a> {
     }
 
     /// One tick's start phase.
-    fn admit(&mut self, reqs: Vec<InferenceRequest>) {
+    pub(super) fn admit(&mut self, reqs: Vec<InferenceRequest>) {
         let plants = vec![None; reqs.len()];
         self.admit_planted(reqs, plants);
     }
@@ -133,9 +133,15 @@ impl<'a> Tick<'a> {
 
     /// One tick's continue phase.
     fn step(&mut self) {
+        self.step_spec(false, false);
+    }
+
+    /// One tick's continue phase on a serve that speculates with MTP
+    /// (`use_mtp`) or DFlash (`dflash`, which implies it).
+    pub(super) fn step_spec(&mut self, use_mtp: bool, dflash: bool) {
         let spec = SpecStep {
             num_drafts: 0,
-            dflash_verify_raw_argmax: false,
+            dflash_verify_raw_argmax: dflash,
         };
         let mut rode = Vec::new();
         continue_in_progress_prefills(
@@ -148,7 +154,7 @@ impl<'a> Tick<'a> {
             false,
             0,
             0,
-            false,
+            use_mtp || dflash,
             false,
             false,
             None,
@@ -164,7 +170,7 @@ impl<'a> Tick<'a> {
 
     /// `(prompt tokens, tokens done, queued first chunk)` per prefill, in
     /// service order.
-    fn queue(&self) -> Vec<(usize, usize, Option<usize>)> {
+    pub(super) fn queue(&self) -> Vec<(usize, usize, Option<usize>)> {
         self.prefilling
             .iter()
             .map(|p| (p.prompt_tokens.len(), p.chunk_offset, p.queued_first_chunk))
@@ -176,7 +182,7 @@ fn wire(model: &PreemptStubModel) -> Vec<u32> {
     model.wire.lock().unwrap().clone()
 }
 
-fn chunks(model: &PreemptStubModel) -> Vec<(usize, usize)> {
+pub(super) fn chunks(model: &PreemptStubModel) -> Vec<(usize, usize)> {
     model.chunk_calls.lock().unwrap().clone()
 }
 

@@ -122,6 +122,11 @@ pub struct ModelConfig {
     /// because Nemotron-H (and some other models) set it to `null` in JSON.
     #[serde(default, deserialize_with = "nullable_u32")]
     pub sliding_window: u32,
+    /// Layers that use `sliding_window`, for parsers that label every layer
+    /// `FullAttention` because the forward paths only batch that type
+    /// (Ricursive). Empty everywhere else.
+    #[serde(skip)]
+    pub sliding_attention_layers: Vec<usize>,
 
     // ── Position embeddings ──
     #[serde(default)]
@@ -816,13 +821,13 @@ pub use gguf::{GgufConfigInputs, GgufMeta, config_from_gguf};
 pub use ngram::{NgramDims, ngram_ids, shift_right_ignore_eos, shift_right_ignore_eos_fill};
 pub use ngram_qwen4exp::Qwen4ExpNgram;
 pub use parsers::{
-    Exl3QuantConfig, PEFT_SUPPORTED_TARGET_MODULES, PeftAdapterConfig, parse_mistral_params,
-    parse_peft_adapter_config, parse_quantization_config,
+    Exl3QuantConfig, PEFT_SUPPORTED_TARGET_MODULES, PeftAdapterConfig, RICURSIVE_FFN_CLAMP,
+    parse_mistral_params, parse_peft_adapter_config, parse_quantization_config,
 };
 pub(crate) use parsers::{
     parse_deepseek_v4, parse_gemma4_params, parse_glm5_next, parse_glm5_vision_config,
-    parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_qwen4_exp, parse_step3p7,
-    parse_vision_config,
+    parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_qwen4_exp, parse_ricursive,
+    parse_step3p7, parse_vision_config,
 };
 pub use vision::{OmniVisionConfig, PixelBounds, VisionConfig, VisionTokenBudgets};
 

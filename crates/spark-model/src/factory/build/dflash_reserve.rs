@@ -1,0 +1,70 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! What a DFlash drafter allocates per sequence after the KV pool is sized.
+//!
+//! The drafter head itself (its paged KV pool, batch scratch, NVFP4 twins,
+//! DSpine tables) is built before the KV budget, so the budget measures it.
+//! What stays outside is the context accumulator every sequence takes at
+//! request time (`acquire_ctx_acc`: `ctx_window` rows of the captured target
+//! hiddens, 200 MiB a sequence for DFlash2, 377 MiB for the two drafters'
+//! union capture). Unreserved, 64 sequences of it ran the unified memory out
+//! mid-run (swap, then a stalled server). The budget reserves it.
+
+#[cfg(test)]
+use crate::weight_loader::DflashConfig;
+
+#[cfg(test)]
+const BLOCK: usize = 16;
+const BF16: usize = 2;
+
+/// The drafter context window (`from_weights`: `ATLAS_DFLASH_CTX_WINDOW`,
+/// 4096), capped at `max_seq_len`.
+fn ctx_capacity(max_seq_len: usize) -> usize {
+    std::env::var("ATLAS_DFLASH_CTX_WINDOW")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4096usize)
+        .min(max_seq_len)
+}
+
+/// One drafter's paged KV per sequence, as `from_weights` sizes its pool.
+#[cfg(test)]
+fn drafter_kv_per_seq(c: &DflashConfig, ctx: usize, gamma: usize) -> usize {
+    let blocks = (ctx + gamma + 1) / BLOCK + 1;
+    blocks * BLOCK * c.num_hidden_layers * 2 * c.num_key_value_heads * c.head_dim * BF16
+}
+
+/// The context accumulators of `max_batch` sequences.
+pub(super) fn bytes(
+    capture_layers: usize,
+    target_hidden: usize,
+    max_seq_len: usize,
+    max_batch: usize,
+) -> usize {
+    let ctx = ctx_capacity(max_seq_len);
+    // The accumulator holds the union capture (one per sequence).
+    (ctx + 1) * capture_layers * target_hidden * BF16 * max_batch.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 27B DFlash2 pool as the log reports it: 257 blocks a sequence of
+    /// 5 layers x 8 KV heads x 128 (84 MB), plus the 200 MiB accumulator.
+    #[test]
+    fn matches_the_27b_dflash2_log() {
+        let c: DflashConfig = serde_json::from_str(
+            r#"{"hidden_size":5120,"num_hidden_layers":5,"intermediate_size":17408,
+                "num_attention_heads":32,"num_key_value_heads":8,"head_dim":128,
+                "vocab_size":248320,"block_size":8}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            drafter_kv_per_seq(&c, 4096, 8),
+            257 * 16 * 5 * 2 * 8 * 128 * 2
+        );
+        let acc = 4097 * 5 * 5120 * 2;
+        assert_eq!(acc / (1 << 20), 200);
+    }
+}

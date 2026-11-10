@@ -278,6 +278,26 @@ name = "verify_exact_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "gdn_decode_fuse_check"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "gdn_verify_tree_check"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "attn_shared_scan_check"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "dspine_bridge_check"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "attn_fp8_native_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "gdn_conv_kn_microtest"
 required-features = ["cuda", "gpu-examples"]
 
@@ -359,6 +379,26 @@ required-features = ["cuda", "gpu-examples"]
 
 [[example]]
 name = "w4a16_qg_batch_bitparity_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "wide_gemv_bitparity_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "wide_gemv_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "skinny_mma_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "skinny_rows_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "bf16_wide_rows_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]

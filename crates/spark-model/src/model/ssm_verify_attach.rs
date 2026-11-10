@@ -22,8 +22,10 @@ impl SsmStatePool {
         if !self.has_mtp {
             return;
         }
-        state.h_state_checkpoint = Some(self.h_checkpoint(ssm_layer_idx, slot));
-        state.conv_state_checkpoint = Some(self.conv_checkpoint(ssm_layer_idx, slot));
+        // No checkpoints when every verify defers (`defer_only`).
+        let ckpt = !self.h_checkpoint_pools.is_empty();
+        state.h_state_checkpoint = ckpt.then(|| self.h_checkpoint(ssm_layer_idx, slot));
+        state.conv_state_checkpoint = ckpt.then(|| self.conv_checkpoint(ssm_layer_idx, slot));
         // Tiered pools: H count is per-SLOT (h_inter_count), conv count is
         // uniform. The vec lengths are the capacity gates every verify arm
         // checks before writing. KDA records replace the H snapshots when
@@ -37,7 +39,7 @@ impl SsmStatePool {
         state.h_state_intermediates = (0..self.h_snapshot_count(slot))
             .map(|t| self.h_intermediate(ssm_layer_idx, slot, t))
             .collect();
-        state.conv_state_intermediates = (0..self.num_intermediates)
+        state.conv_state_intermediates = (0..self.conv_inter_count())
             .map(|t| self.conv_intermediate(ssm_layer_idx, slot, t))
             .collect();
     }

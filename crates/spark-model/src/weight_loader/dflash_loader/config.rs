@@ -82,9 +82,16 @@ pub struct DflashConfig {
     pub sliding_window: Option<usize>,
     #[serde(default)]
     pub layer_types: Option<Vec<String>>,
+    /// HF `no_rope_layers`: indices of layers that apply no RoPE (NoPE),
+    /// read by [`Self::rope_layers`] (Ripple-65B's DFlash2 global layer).
+    #[serde(default)]
+    pub no_rope_layers: Option<Vec<usize>>,
     /// NVIDIA LiLiCorr drafters ship their own `lm_head` (`Some(true)`);
     /// generic DFlash drafters omit the key and share the target's head.
     pub has_own_lm_head: Option<bool>,
+    /// DSpine's serial-table second pass (see [`DspineSecondPass`]).
+    #[serde(default)]
+    pub code_bridge_second_pass: Option<DspineSecondPass>,
 }
 
 fn default_rope_theta() -> f32 {
@@ -189,9 +196,100 @@ pub struct DflashSubConfig {
     pub projector_type: Option<String>,
     #[serde(default)]
     pub lilicorr_enabled: Option<bool>,
+    /// DSpine's code bridge (`tencent/*-DSpine-*`): the predecessor-feature
+    /// write after every drafter layer. Its presence makes the drafter DSpine.
+    #[serde(default)]
+    pub selected_prefix_code_bridge: Option<DspineBridgeConfig>,
+    /// DSpine's last-write refinement (`kind: exact_sender`, version 1).
+    #[serde(default)]
+    pub selected_prefix_last_write_refine: Option<DspineRefineConfig>,
+}
+
+/// `dflash_config.selected_prefix_code_bridge` of a DSpine drafter.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DspineBridgeConfig {
+    pub code_size: usize,
+    pub rank: usize,
+    #[serde(default = "default_rms_norm_eps")]
+    pub eps: f32,
+}
+
+/// `dflash_config.selected_prefix_last_write_refine` of a DSpine drafter.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DspineRefineConfig {
+    pub kind: String,
+    pub version: u32,
+    pub head_topk: usize,
+}
+
+/// Root `code_bridge_second_pass` of a DSpine drafter: the serial-table
+/// refinement of the last bridge write.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DspineSecondPass {
+    pub mode: String,
+    pub first_exact: usize,
+    pub head_topk: usize,
+}
+
+/// The validated DSpine geometry ([`DflashConfig::dspine`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DspineSpec {
+    pub code_size: usize,
+    pub rank: usize,
+    pub eps_bits: u32,
+    pub head_topk: usize,
+}
+
+impl DspineSpec {
+    pub fn eps(&self) -> f32 {
+        f32::from_bits(self.eps_bits)
+    }
 }
 
 impl DflashConfig {
+    /// The DSpine geometry when the drafter declares the code bridge, checked
+    /// against the one variant Atlas runs: the serial-table refinement of the
+    /// last write (`first_exact = layers - 1`) over the top-16 candidates
+    /// with the exact-sender refine. `Ok(None)` for every other drafter.
+    pub fn dspine(&self) -> Result<Option<DspineSpec>> {
+        let Some(bridge) = self
+            .dflash_config
+            .as_ref()
+            .and_then(|c| c.selected_prefix_code_bridge.as_ref())
+        else {
+            return Ok(None);
+        };
+        let second = self
+            .code_bridge_second_pass
+            .as_ref()
+            .context("DSpine drafter declares no code_bridge_second_pass")?;
+        anyhow::ensure!(
+            second.mode == "serial_table"
+                && second.first_exact + 1 == self.num_hidden_layers
+                && second.head_topk == 16,
+            "DSpine second pass {second:?} is not the serial table over the last write (top-16)"
+        );
+        let refine = self
+            .dflash_config
+            .as_ref()
+            .and_then(|c| c.selected_prefix_last_write_refine.as_ref())
+            .context("DSpine drafter declares no selected_prefix_last_write_refine")?;
+        anyhow::ensure!(
+            refine.kind == "exact_sender" && refine.version == 1 && refine.head_topk == 16,
+            "DSpine last-write refine {refine:?} is not exact_sender v1 over 16 candidates"
+        );
+        anyhow::ensure!(
+            self.query_causal() && bridge.code_size > 0 && bridge.rank > 0,
+            "DSpine drafter needs causal block attention and a non-empty code bridge"
+        );
+        Ok(Some(DspineSpec {
+            code_size: bridge.code_size,
+            rank: bridge.rank,
+            eps_bits: bridge.eps.to_bits(),
+            head_topk: second.head_topk,
+        }))
+    }
+
     pub fn block_size(&self) -> usize {
         self.dflash_config
             .as_ref()
@@ -217,7 +315,12 @@ impl DflashConfig {
     /// Checkpoint sliding window: `dflash_config.swa_window_size`, else the HF
     /// `sliding_window` when `use_sliding_window` (or `dflash_config.use_swa`)
     /// is set or every `layer_types` entry is `sliding_attention`.
+    /// A `layer_types` list mixing sliding and full layers has no single
+    /// window ([`Self::mixed_layer_windows`] holds them), so this is `None`.
     pub fn sliding_window(&self) -> Option<usize> {
+        if self.layer_types_mixed() {
+            return None;
+        }
         let sub = self.dflash_config.as_ref();
         if let Some(window) = sub.and_then(|c| c.swa_window_size) {
             return Some(window);

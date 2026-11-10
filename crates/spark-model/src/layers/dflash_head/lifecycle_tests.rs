@@ -192,6 +192,8 @@ fn owner_failure_reclaim_frees_state_resources_without_leaking() {
         ctx_store: super::warm_ctx_store::StoreRefs::default(),
         lane_id: 0,
         lifecycle: Some(CaptureDescriptor::bind(owner_now, 40, 4, 4, 16).unwrap()),
+        alt: None,
+        route: Default::default(),
     };
     let kv_cache = parking_lot::Mutex::new(
         PagedKvCache::new(

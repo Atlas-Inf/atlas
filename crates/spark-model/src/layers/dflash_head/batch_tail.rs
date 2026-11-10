@@ -79,9 +79,15 @@ impl BlockDiffusionDraftHead {
                 self.kernels.w4a16_gemv_batch16,
             );
             if kernel.0 != 0 {
+                let wave = super::nvfp4::drafter_nvfp4_wave(
+                    kernel,
+                    batch_rows,
+                    hidden,
+                    self.startup.native_batch_authoritative,
+                );
                 let mut row = 0u32;
                 while row < batch_rows {
-                    let rows = (batch_rows - row).min(16);
+                    let rows = (batch_rows - row).min(wave);
                     crate::layers::ops::w4a16_gemv_batchm(
                         ctx.gpu,
                         kernel,

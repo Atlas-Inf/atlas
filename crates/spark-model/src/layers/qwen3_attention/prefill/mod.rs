@@ -35,6 +35,7 @@ mod paged_mla_args;
 mod paged_oproj;
 mod paged_qkv;
 mod paged_v4;
+mod rows128;
 
 /// `ATLAS_ATTN_W4A4` (PRESENCE, read once): the opt-in native FP4 Q/K/V and
 /// o_proj prefill GEMMs. Both ranks must agree (`model::startup_parity`):

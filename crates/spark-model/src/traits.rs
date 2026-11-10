@@ -354,14 +354,25 @@ impl SequenceState {
             .ok_or_else(|| anyhow::anyhow!("sequence has no DSpark allocation owner"))
     }
 
-    /// Stable hidden-save region for DSpark batched verify/capture.
+    /// Hidden-save region of a DSpark sequence for batched verify/capture:
+    /// its live SSM pool slot.
     ///
-    /// `slot_idx` is a mutable runtime SSM slot: compaction may migrate it and
-    /// detaching sets it to the reuse sentinel. The hidden-save arena is keyed
-    /// by the immutable allocation owner instead, so capture and re-propose
-    /// continue to address the same region across churn.
+    /// The region must be exclusive among live sequences, and only the live
+    /// slot is: the pool hands each slot to one sequence at a time. The
+    /// allocation owner's slot is not — compaction migrates a sequence off it
+    /// and the pool hands it to the next admission, so two live sequences
+    /// shared one region, the batch's later capture overwrote the earlier
+    /// one's, and the earlier one committed the other's hiddens to its drafter
+    /// context (accept 0 from then on). A region is written and read within
+    /// one scheduler step (verify capture, commit, re-propose) and compaction
+    /// runs between steps, so following the live slot loses nothing.
     pub fn dflash_hidden_save_slot(&self) -> anyhow::Result<usize> {
-        Ok(self.expected_dspark_owner()?.slot())
+        self.expected_dspark_owner()?;
+        anyhow::ensure!(
+            self.slot_idx != usize::MAX,
+            "detached sequence has no DFlash hidden-save region"
+        );
+        Ok(self.slot_idx)
     }
 
     /// The drafter's confidence in each draft of this sequence's last
@@ -444,6 +455,6 @@ mod model_defaults;
 mod seq_vision;
 pub use eos_ban::EosBan;
 pub use logprobs::*;
-pub use model::{BeamReq, Model, padded_batch_n};
+pub use model::{BeamReq, Model, ScoreInput, padded_batch_n};
 pub use model_defaults::EP_CMD_PC_PLANT;
 pub use seq_vision::SeqVision;

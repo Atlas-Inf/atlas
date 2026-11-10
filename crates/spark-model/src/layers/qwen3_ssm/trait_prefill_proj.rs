@@ -150,7 +150,11 @@ impl Qwen3SsmLayer {
         // ceiling on GB10 (32 vs 85 TFLOPS bf16 on this shape). Dequant the FP8
         // weight to BF16 once (cached), then route the projection through
         // cuBLASLt. W16A16 here is strictly more accurate than the W8A8 path.
-        if ctx.dispatch.cutlass_nvfp4_qkvz
+        if !force_bf16
+            && self.try_bf16mma(prefill_bf16mma::QKVZ, ctx, [normed, proj_dst], k, stream)?
+        {
+            // Served on BF16 tensor cores (`prefill_bf16mma.rs`).
+        } else if ctx.dispatch.cutlass_nvfp4_qkvz
             && let Some(ref nvfp4_t) = self.qkvz_nvfp4_t
         {
             ops::log_cutlass_nvfp4_route(ctx.gpu, "ssm_qkvz_nvfp4", k, qkvz_size as u32, h as u32);

@@ -138,7 +138,10 @@ fn launch_batchm(
 
 /// Launch a tile GEMM: base w4a16_gemm grid (N/64, M/64) or transposed
 /// w4a16_gemm_t grid (N/128, M/64), block 128 — mirrors ops::w4a16_gemm /
-/// ops::w4a16_gemm_n128.
+/// ops::w4a16_gemm_n128. `w4a16_gemm_t` takes a 9th argument, the B row
+/// stride `ldb` (N here, as `w4a16_gemm_n128` passes): launching it with 8
+/// made the driver read a kernel-parameter pointer past the argument array
+/// — the host segfault this bench hit on its first shape.
 #[allow(clippy::too_many_arguments)]
 fn launch_gemm(
     g: &dyn GpuBackend,
@@ -152,7 +155,7 @@ fn launch_gemm(
     n: u32,
     k: u32,
 ) -> Result<()> {
-    KernelLaunch::new(g, kh)
+    let launch = KernelLaunch::new(g, kh)
         .grid([div_ceil(n, n_tile), div_ceil(m, 64), 1])
         .block([128, 1, 1])
         .arg_ptr(a)
@@ -162,8 +165,13 @@ fn launch_gemm(
         .arg_ptr(c)
         .arg_u32(m)
         .arg_u32(n)
-        .arg_u32(k)
-        .launch(0)
+        .arg_u32(k);
+    if n_tile == 128 {
+        launch.arg_u32(n)
+    } else {
+        launch
+    }
+    .launch(0)
 }
 
 #[derive(Clone, Copy)]

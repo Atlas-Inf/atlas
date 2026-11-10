@@ -122,8 +122,10 @@ impl Qwen3AttentionLayer {
 
     /// The prefill guard for weights that are not GEMM-ready as stored:
     /// native MXFP8 ([`Self::try_mx8`]), then keep-packed Q2_0
-    /// (`try_q2_prefill`). `None` for every other format. Checked first at
-    /// each prefill projection: the arms after it read NULL slots for both.
+    /// (`try_q2_prefill`); then native FP8 on BF16 tensor cores where that
+    /// lever serves it (`prefill_fp8_bf16mma.rs`). `None` for every other
+    /// case. Checked first at each prefill projection: the arms after it read
+    /// NULL slots for the first two.
     pub(crate) fn try_unpacked_prefill(
         &self,
         ctx: &ForwardContext,
@@ -135,6 +137,7 @@ impl Qwen3AttentionLayer {
     ) -> Option<Result<()>> {
         self.try_mx8(ctx, weight, input, out, m as usize, false, stream)
             .or_else(|| self.try_q2_prefill(ctx, weight, input, out, m, stream))
+            .or_else(|| self.try_fp8_bf16mma(ctx, weight, input, out, m, stream))
     }
 
     /// Arm the collapse that writes rows `[row0, row0 + rows)` of `x`

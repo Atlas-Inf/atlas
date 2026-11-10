@@ -582,6 +582,16 @@ pub struct ServeArgs {
     #[arg(long)]
     pub draft_model: Option<String>,
 
+    /// A second DFlash drafter for the same target (HF id or local path),
+    /// loaded beside `--draft-model`: each request proposes with whichever
+    /// of the two its recent rounds measure faster (tokens per round over
+    /// round time), probing the other now and then. Typical pair: a DFlash2
+    /// drafter (prose) with a DSpine drafter (code, JSON, tool calls). Both
+    /// drafters read one union of target capture layers; each keeps its own
+    /// block size, and `--dflash-gamma` should be the larger of the two.
+    #[arg(long, requires = "dflash")]
+    pub draft_model_alt: Option<String>,
+
     /// DFlash block size γ (parallel draft tokens per step). Precedence
     /// (highest wins): this flag → the target's MODEL.toml `[dflash].gamma`
     /// → 16 (`DEFAULT_DFLASH_GAMMA`, the `block_size` of every published

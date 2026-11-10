@@ -211,6 +211,10 @@ pub struct MtpHead {
     residual_add_rms_norm_k: KernelHandle,
     sigmoid_gate_mul_k: KernelHandle,
     bf16_concat_k: KernelHandle,
+    /// Row-batched concat and embedding gather for the drafter prefill (0
+    /// when the kernel set lacks them: prefill then loops per row).
+    bf16_concat_rows_k: KernelHandle,
+    batched_embed_k: KernelHandle,
     argmax_k: KernelHandle,
     embed_from_argmax_k: KernelHandle,
     /// Fixed device buffer (4 bytes) for deferred draft token ID readback.

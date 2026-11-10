@@ -51,6 +51,15 @@ impl ChatTokenizer {
         &self.tokenizer
     }
 
+    /// One past the largest valid token id. `Tokenizer::get_vocab_size(true)`
+    /// builds the whole vocabulary map (~45 ms at 248k entries) on every
+    /// call; this reads the base size and the added tokens only.
+    pub fn vocab_size(&self) -> u32 {
+        let base = self.tokenizer.get_vocab_size(false) as u32;
+        let added = self.tokenizer.get_added_tokens_decoder();
+        added.keys().map(|&id| id + 1).fold(base, u32::max)
+    }
+
     /// Bare-role literal filtering applies only when the model does NOT
     /// encode tool markup as text (Enntity/atlas 1c1a8fee, AGPL-3.0-only).
     pub(crate) fn filters_bare_role_literals(&self) -> bool {

@@ -2,7 +2,7 @@
 
 //! Source contract between each PDL target list and the kernels it serves.
 
-use super::PDL_TARGETS;
+use super::{PDL_TARGETS, PdlTarget, QWEN38_PDL_DECODE_KERNELS};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -126,12 +126,19 @@ fn base_quant(quant: &Path) -> Option<String> {
 /// if any, then itself, each overlaying the previous by file name
 /// (atlas-kernels `collect_cu_files`). `true` marks a file from the target's
 /// own dirs rather than `common/`.
-fn served_sources(common: &Path, quant: &Path) -> Vec<(PathBuf, bool)> {
+fn served_sources(common: &Path, quant: &Path, local: Option<&Path>) -> Vec<(PathBuf, bool)> {
     let mut dirs = vec![(common.to_path_buf(), false)];
     if let Some(base) = base_quant(quant) {
         dirs.push((quant.parent().unwrap().join(base), true));
     }
     dirs.push((quant.to_path_buf(), true));
+    // A `kernel_source` target's own quant dir overlays the borrowed one
+    // (build.rs: target-local > kernel_source > common).
+    dirs.extend(
+        local
+            .filter(|d| d.is_dir())
+            .map(|d| (d.to_path_buf(), true)),
+    );
     let mut files = BTreeMap::new();
     for (dir, own) in dirs {
         for entry in std::fs::read_dir(dir).unwrap() {
@@ -266,6 +273,24 @@ extern "C" __global__ void tri_input(const unsigned char* __restrict__ w0, float
     );
 }
 
+/// The kernel tree a target compiles: its MODEL.toml `kernel_source`, else
+/// its own dir (qwen3.8-27b builds qwen3.6-27b's .cu files).
+fn kernel_source(gb10: &Path, model: &str) -> String {
+    std::fs::read_to_string(gb10.join(model).join("MODEL.toml"))
+        .ok()
+        .and_then(|toml| {
+            toml.lines().find_map(|line| {
+                let value = line
+                    .trim()
+                    .strip_prefix("kernel_source")?
+                    .trim()
+                    .strip_prefix('=')?;
+                Some(value.trim().trim_matches('"').to_owned())
+            })
+        })
+        .unwrap_or_else(|| model.to_owned())
+}
+
 /// What a PDL target lists against what its sources define:
 ///
 /// * every listed kernel is defined in every quant dir of the target, and
@@ -281,21 +306,23 @@ extern "C" __global__ void tri_input(const unsigned char* __restrict__ w0, float
 #[test]
 fn pdl_target_kernels_wait_exactly_when_listed() {
     let gb10 = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels/gb10");
-    let listed_anywhere = |name: &str| PDL_TARGETS.iter().any(|t| t.kernels.contains(&name));
+    let listed_anywhere = |name: &str| PDL_TARGETS.iter().any(|t| t.lists(name));
     for target in PDL_TARGETS {
-        for quant in std::fs::read_dir(gb10.join(target.model)).unwrap() {
+        for quant in std::fs::read_dir(gb10.join(kernel_source(&gb10, target.model))).unwrap() {
             let quant = quant.unwrap().path();
             if !quant.is_dir() {
                 continue;
             }
             let mut defined = Vec::new();
-            for (path, own) in served_sources(&gb10.join("common"), &quant) {
+            let local = gb10.join(target.model).join(quant.file_name().unwrap());
+            let local = (local != quant).then_some(local.as_path());
+            for (path, own) in served_sources(&gb10.join("common"), &quant, local) {
                 // An included namesake is another dir's source: as with
                 // `common/`, its target opts its kernels in.
                 for (i, src) in with_namesakes(&path).iter().enumerate() {
                     let own = own && i == 0;
                     for (name, waits) in kernels(src) {
-                        let listed = target.kernels.contains(&name);
+                        let listed = target.lists(name);
                         assert!(
                             waits || !listed,
                             "{}: {name} is on the {} PDL list but does not wait on PDL entry",
@@ -315,7 +342,7 @@ fn pdl_target_kernels_wait_exactly_when_listed() {
                     }
                 }
             }
-            for listed in target.kernels {
+            for listed in target.switches.iter().flat_map(|s| s.kernels) {
                 assert!(
                     defined.iter().any(|name| name == listed),
                     "{listed} is listed, but {} defines no such kernel",
@@ -339,6 +366,96 @@ fn glm_lists_the_drafter_chain() {
         "bf16_residual_add",
         "reshape_and_cache_flash",
     ] {
-        assert!(glm.kernels.contains(&name), "{name}");
+        assert!(glm.lists(name), "{name}");
+    }
+}
+
+fn target(model: &str) -> &'static PdlTarget {
+    PDL_TARGETS.iter().find(|t| t.model == model).unwrap()
+}
+
+/// The two Qwen3.8-27B switches are independent: the prefill switch alone
+/// leaves the decode chain off PDL, the decode switch alone leaves the prefill
+/// GEMMs off, and a kernel on both lists follows either.
+#[test]
+fn qwen38_prefill_and_decode_switches_are_independent() {
+    let t = target("qwen3.8-27b");
+    let only = |on: &'static str| move |name: &str| name == on;
+    let prefill = only("ATLAS_QWEN38_PDL");
+    let decode = only("ATLAS_QWEN38_PDL_DECODE");
+    for (kernel, under_prefill, under_decode) in [
+        ("dense_bf16mma_nvfp4", true, false),
+        ("gdn_ba_gates_prefill", true, false),
+        ("w8a16_gemv", false, true),
+        ("gated_delta_rule_decode_f32", false, true),
+        ("paged_decode_attn_splitk_fp8", false, true),
+        ("bf16_residual_add", true, true),
+        ("rope_forward_mrope_interleaved", true, true),
+    ] {
+        assert_eq!(
+            t.pdl_kernel_with(kernel, prefill),
+            under_prefill,
+            "{kernel}"
+        );
+        assert_eq!(t.pdl_kernel_with(kernel, decode), under_decode, "{kernel}");
+        assert!(
+            !t.pdl_kernel_with(kernel, |_| false),
+            "{kernel} with no switch"
+        );
+        assert!(t.pdl_kernel_with(kernel, |_| true), "{kernel} with both");
+    }
+}
+
+/// The Qwen3.8-27B switches do nothing on another target, and every switch
+/// belongs to one target (`configure_pdl` names the target it ignores).
+#[test]
+fn qwen38_switches_leave_other_targets_alone() {
+    let qwen38 = |name: &str| name.starts_with("ATLAS_QWEN38_PDL");
+    for model in ["glm-5.3-flash", "qwen3.8-flash-next"] {
+        for kernel in QWEN38_PDL_DECODE_KERNELS {
+            assert!(
+                !target(model).pdl_kernel_with(kernel, qwen38),
+                "{model}: {kernel}"
+            );
+        }
+    }
+    let names: Vec<&str> = PDL_TARGETS
+        .iter()
+        .flat_map(|t| t.switches.iter().map(|s| s.name))
+        .collect();
+    let mut unique = names.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), names.len(), "{names:?}");
+}
+
+/// The default Qwen3.8-27B single-token decode chain (FP8 KV, separate gated
+/// norm, split SiLU) is on the decode list: a kernel dropped from it pays the
+/// launch gap again, silently.
+#[test]
+fn qwen38_decode_list_covers_the_decode_chain() {
+    for kernel in [
+        "rms_norm_residual",
+        "w8a16_gemv",
+        "w4a16_gemv_sw",
+        "dense_gemv_ba_gates",
+        "causal_conv1d_update_l2norm_f32",
+        "gated_delta_rule_decode_f32",
+        "gated_rms_norm_f32_input",
+        "residual_add_rms_norm",
+        "w4a16_gemv_qg",
+        "w4a16_gemv_dual",
+        "rms_norm",
+        "rope_forward_mrope_interleaved",
+        "reshape_and_cache_flash_fp8",
+        "paged_decode_attn_splitk_fp8",
+        "paged_decode_attn_reduce_fp8",
+        "sigmoid_gate_mul",
+        "w4a16_gemv_dual_sw",
+        "moe_silu_mul",
+        "bf16_residual_add",
+        "dense_gemv_bf16",
+    ] {
+        assert!(QWEN38_PDL_DECODE_KERNELS.contains(&kernel), "{kernel}");
     }
 }

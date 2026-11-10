@@ -100,6 +100,9 @@ pub(super) struct SsmSnapshotIndex {
     /// `recompute_tokens_on_hit` after tail-protect + a large pool is exactly
     /// what Phase 1 (spill-not-drop) converts from recompute → fault-in.
     pub(super) stats: SnapshotStats,
+    /// Log-spaced restore points kept behind each live conversation's
+    /// newest save (`snapshot_ladder`).
+    pub(super) ladder: super::snapshot_ladder::Ladder,
 }
 
 /// Tail-lease kill switch. Default ON; opt out with
@@ -173,6 +176,7 @@ impl SsmSnapshotIndex {
             last_lookup_session: 0,
             evictions_since_lookup: 0,
             stats: SnapshotStats::default(),
+            ladder: Default::default(),
         }
     }
 
@@ -391,14 +395,24 @@ impl SsmSnapshotIndex {
                 && e.session_hash != 0
                 && e.session_hash == self.last_lookup_session
         };
-        // The lease bites only while an UNLEASED eligible candidate exists, so
-        // a pool of only-leased entries (or a single entry) still yields a
-        // victim — no deadlock, and `save`/reclaim always make progress.
-        let n_unleased = self
+        // Protection class, lowest evicted first: ordinary entries, restore
+        // ladder rungs (`snapshot_ladder`), the leased tail. A class is
+        // spared only while a lower one has an eligible entry, so a pool of
+        // only-protected entries (or a single entry) still yields a victim —
+        // no deadlock, and `save`/reclaim always make progress.
+        let class = |e: &SnapshotEntry| {
+            if leased(e) {
+                2
+            } else {
+                u8::from(self.ladder.holds(e.prefix_hash))
+            }
+        };
+        let victim_class = self
             .entries
             .iter()
-            .filter(|e| eligible(e) && !leased(e))
-            .count();
+            .filter(|e| eligible(e))
+            .map(class)
+            .min()?;
         // Within-session rank: S(e) = norm(recency) + α·norm(depth) — Marconi
         // Eq 2 (see snap_evict_alpha). At the default α=0 this is exactly
         // pure-LRU ordering. Min-max normalization over the ELIGIBLE pool per
@@ -431,8 +445,8 @@ impl SsmSnapshotIndex {
             if !eligible(e) {
                 continue;
             }
-            if leased(e) && n_unleased >= 1 {
-                continue; // never evict the live session's restore points
+            if class(e) > victim_class {
+                continue; // a less valuable restore point is still resident
             }
             let sf = *session_fresh.get(&e.session_hash).unwrap_or(&0);
             let s = score(e);

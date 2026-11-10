@@ -298,7 +298,8 @@ impl ModelConfig {
         if self.kv_lora_rank > 0 {
             return true;
         }
-        if self.model_type == "laguna" {
+        // Laguna and Ricursive ship lm_head in BF16; Strict keeps checkpoint precision.
+        if matches!(self.model_type.as_str(), "laguna" | "ricursive") {
             return true;
         }
         if self.model_type == "gemma4" && self.num_experts == 0 {

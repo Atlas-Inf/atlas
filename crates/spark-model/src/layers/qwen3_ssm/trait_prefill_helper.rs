@@ -158,6 +158,17 @@ impl Qwen3SsmLayer {
                 stream,
             );
         }
+        if self.out_proj_dense.is_none()
+            && self.try_bf16mma(
+                super::prefill_bf16mma::OUT_PROJ,
+                ctx,
+                [normed_out_buf, out_proj_buf],
+                k,
+                stream,
+            )?
+        {
+            return Ok(());
+        }
         if ctx.dispatch.cutlass_nvfp4_ssm_out
             && let Some(ref nvfp4_t) = self.out_proj_nvfp4_t
         {

@@ -64,6 +64,8 @@ pub(in crate::model) mod verify_e2;
 mod verify_fused;
 mod verify_layer_trace;
 pub(in crate::model) mod verify_rows;
+mod verify_tree;
+mod verify_tree_check;
 
 impl Model for TransformerModel {
     fn verify_logits_argmax_only(&self) -> bool {
@@ -290,6 +292,16 @@ impl Model for TransformerModel {
         stream: u64,
     ) -> Result<Vec<DevicePtr>> {
         self.prefill_batch_chunk_rows(streams, stream, 0)
+    }
+    fn score_requests(
+        &self,
+        reqs: &[crate::traits::ScoreInput<'_>],
+        stream: u64,
+    ) -> Result<Vec<Vec<Vec<f32>>>> {
+        self.score_requests_impl(reqs, stream)
+    }
+    fn score_capacity(&self) -> (usize, usize) {
+        self.score_capacity_impl()
     }
     fn supports_prefill_multi(&self) -> bool {
         self.prefill_multi_supported()
@@ -566,16 +578,22 @@ impl Model for TransformerModel {
         if let Some(depth) = self.levers.qwen4exp_mtp_depth {
             return Some(depth);
         }
-        self.layers
+        let layers = self
+            .layers
             .iter()
             .filter_map(|l| l.verify_max_drafts())
-            .min()
+            .min();
+        // ATLAS_EXACT_VERIFY: at most the widest exact verify (`exact_verify.rs`).
+        super::exact_verify::max_drafts(&self.levers, self.dflash_drafter(), layers)
     }
     fn verify_bit_exact(&self) -> bool {
-        self.levers.qwen4exp_exact_verify
+        super::exact_verify::verify_bit_exact(&self.levers)
     }
     fn batch_verify_bit_exact(&self) -> bool {
+        // qwen4_exp's exact batching lane, or qwen3_5's batch lever
+        // (`exact_verify.rs`, "Several sequences").
         self.levers.qwen4exp_exact_verify && self.levers.qwen4exp_batch_fast
+            || self.levers.dense_batch_exact
     }
     fn has_proposer(&self) -> bool {
         self.has_proposer_dispatch()
@@ -595,7 +613,7 @@ impl Model for TransformerModel {
         self.decode_marconi_checkpoint_dispatch(seq)
     }
     fn free_sequence(&self, seq: &mut SequenceState) -> Result<()> {
-        self.free_sequence_dispatch(seq)
+        self.free_sequence_dispatch(seq, true)
     }
     fn decode_verify_graphed(
         &self,
@@ -769,6 +787,31 @@ impl Model for TransformerModel {
             None => 2,
         }
     }
+    fn dflash_tree_supported(&self) -> bool {
+        self.dflash_tree_supported_impl()
+    }
+    fn dflash_draft_tree(
+        &self,
+        rows: usize,
+    ) -> Result<Option<crate::speculative::draft_tree::DraftTree>> {
+        match &self.proposer {
+            Some(p) => p.draft_tree(self.gpu.as_ref(), rows),
+            None => Ok(None),
+        }
+    }
+    fn decode_verify_dflash_tree(
+        &self,
+        tree: &crate::speculative::draft_tree::DraftTree,
+        seq: &mut SequenceState,
+    ) -> Result<Vec<u32>> {
+        self.decode_verify_dflash_tree_impl(tree, seq)
+    }
+    fn dflash_tree_gather_rows(&self, rows: &[usize]) -> Result<()> {
+        self.dflash_tree_gather_rows_impl(rows)
+    }
+    fn commit_dflash_tree(&self, seq: &mut SequenceState, path: &[usize]) -> Result<()> {
+        self.commit_dflash_tree_impl(seq, path)
+    }
     fn decode_verify_graphed_kgamma(
         &self,
         tokens: &[u32],
@@ -779,8 +822,20 @@ impl Model for TransformerModel {
         // were staged for (`glm_verify_masks`).
         let allow = self.take_verify_row_masks(tokens.len())?;
         self.ssm_pool.require_verify_rollback_supported()?;
+        // ATLAS_EXACT_VERIFY_CHECK (qwen3_5): serial reference rows first,
+        // compared after the forward (`exact_verify_check.rs`); masked rows
+        // are not serial decode's, so a masked verify is not checked.
+        let serial = match allow {
+            None => self.kgamma_serial_rows(tokens, seq)?,
+            Some(_) => None,
+        };
+        let seq_len = seq.seq_len;
         self.mark_gdn_deferred_commit(seq, tokens.len())?;
-        self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream, allow)
+        let rows = self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream, allow)?;
+        if let Some(serial) = serial {
+            self.exact_verify_compare(serial, seq_len)?;
+        }
+        Ok(rows)
     }
     fn decode_and_verify_fused(
         &self,
@@ -1213,6 +1268,9 @@ impl Model for TransformerModel {
     }
     fn reclaim_prefix_blocks(&self, num_blocks: usize) -> usize {
         self.reclaim_prefix_blocks_dispatch(num_blocks)
+    }
+    fn cached_prefix_blocks(&self, tokens: &[u32], adapter_slot: i32) -> usize {
+        self.cached_prefix_blocks_dispatch(tokens, adapter_slot)
     }
     fn start_checkpoint_async(&self, seq: &mut SequenceState) -> Result<()> {
         self.gdn_fuse_flush_all()?;

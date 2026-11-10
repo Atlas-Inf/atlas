@@ -457,6 +457,7 @@ impl MoeLayer {
                 "moe_w4a16_k64_strides_m_tiles",
             ),
             moe_permute_tokens_k: super::super::try_kernel(gpu, "moe", "moe_permute_tokens"),
+            bf16mma_k: super::forward_prefill_bf16mma::kernels(gpu),
             // Phase 2.7 Tier C — set by loader after construction (qwen35.rs).
             is_dflash_capture_layer: false,
             lora: None,

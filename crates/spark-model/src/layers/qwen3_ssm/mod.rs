@@ -68,6 +68,10 @@ pub struct Qwen3SsmLayer {
     /// Set by `quantize_dense_gdn_to_fp8` (`ATLAS_QWEN4EXP_FP8_GDN=1`); false
     /// everywhere else, where the dispatch is unchanged.
     fp8w_decode_only: bool,
+    /// Prefill of `[qkvz_fp8w, out_proj_fp8w]` on BF16 tensor cores
+    /// (`prefill_bf16mma.rs`); set up by `prepare_dense_bf16mma`.
+    bf16mma: ops::DenseBf16mma,
+    bf16mma_fp8_ok: [bool; 2],
     // Transposed [K,N] copies of the block-scaled FP8 weights for the coalesced
     // `w8a16_gemm_t` prefill path — populated by `transpose_fp8_for_prefill`
     // for native-FP8 GDN checkpoints. The non-transposed `*_fp8w` copies stay
@@ -228,6 +232,9 @@ pub struct Qwen3SsmLayer {
     /// shape loads the wrong columns without erroring.
     gdn_prefill_fla_chunk_delta_h_tma_k: KernelHandle,
     gdn_prefill_fla_chunk_fwd_o_k: KernelHandle,
+    /// Fused chunked tensor-core GDN scan (`gdn_chunk_tc.rs`); 0 unless
+    /// `ATLAS_GDN_CHUNK_TC=1` and the target ships it.
+    gdn_chunk_tc_k: [KernelHandle; 2],
     /// WY32 chunked prefill: processes 32 tokens per WY iteration with H in
     /// shared memory. ~30x faster than per-token for 14k+ sequences.
     gdn_prefill_wy32_k: KernelHandle,
@@ -424,6 +431,7 @@ mod ckpt_capture;
 mod debug;
 mod exact_rows;
 mod fla_dispatch;
+mod gdn_chunk_tc;
 mod gdn_defer;
 pub mod gdn_flags;
 mod gdn_fused_rows;
@@ -447,6 +455,7 @@ mod trait_decode_batched_hc;
 mod trait_decode_hc;
 mod trait_decode_multi_seq;
 pub(crate) use trait_decode_multi_seq::moe_legacy_pertoken_decode;
+mod prefill_bf16mma;
 mod trait_layer;
 mod trait_prefill;
 mod trait_prefill_block;

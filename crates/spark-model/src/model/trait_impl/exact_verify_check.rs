@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `ATLAS_QWEN4EXP_EXACT_VERIFY_CHECK=1`: run a K=2/3/4 verify's tokens
-//! through serial decode first, put the state back, and compare the verify's
+//! `ATLAS_QWEN4EXP_EXACT_VERIFY_CHECK=1` (qwen4_exp) and
+//! `ATLAS_EXACT_VERIFY_CHECK=1` (qwen3_5, `model/exact_verify.rs`): run a
+//! K=2/3/4 verify's tokens (on qwen3_5 also a DFlash K=γ verify's, up to
+//! `exact_verify::DFLASH_MAX_ROWS` rows) through serial decode first, put the state back, and compare the verify's
 //! rows with the serial ones byte for byte (design and how to read it:
 //! `model/qwen4exp_exact_verify.rs`).
 //!
@@ -16,14 +18,14 @@ use anyhow::{Result, ensure};
 use atlas_core::config::LayerType;
 use spark_runtime::gpu::DevicePtr;
 
-use super::super::qwen4exp_exact_verify::check_active;
+use super::super::exact_verify::{DFLASH_MAX_ROWS, check_active, kgamma_check_active};
 use super::super::types::TransformerModel;
 use crate::layer::SsmLayerState;
 use crate::traits::SequenceState;
 
 const BF16: usize = 2;
-/// Widest verify the check serves (`verify_c`).
-const MAX_ROWS: usize = 4;
+/// Widest verify the check serves (the DFlash K=γ verify, `verify_d`).
+const MAX_ROWS: usize = DFLASH_MAX_ROWS;
 /// Summary period, in checked verify steps.
 const SUMMARY_EVERY: u64 = 64;
 
@@ -55,6 +57,38 @@ impl TransformerModel {
         if !check_active(&self.config.model_type) {
             return Ok(None);
         }
+        self.serial_rows_for_check(tokens, seq)
+    }
+
+    /// [`Self::exact_verify_serial_rows`] before a DFlash K=γ verify
+    /// (`decode_verify_graphed_kgamma`): the qwen3_5 check only. A verify
+    /// wider than the check serves (γ past 15 with the lever off) is not
+    /// checked, said once.
+    pub(super) fn kgamma_serial_rows(
+        &self,
+        tokens: &[u32],
+        seq: &mut SequenceState,
+    ) -> Result<Option<SerialRows>> {
+        if !kgamma_check_active(&self.config.model_type) {
+            return Ok(None);
+        }
+        if tokens.len() > MAX_ROWS {
+            static WIDE: std::sync::Once = std::sync::Once::new();
+            WIDE.call_once(|| {
+                tracing::warn!(
+                    "EXACT_VERIFY_CHECK: K=γ verifies wider than {MAX_ROWS} rows are not checked"
+                )
+            });
+            return Ok(None);
+        }
+        self.serial_rows_for_check(tokens, seq)
+    }
+
+    fn serial_rows_for_check(
+        &self,
+        tokens: &[u32],
+        seq: &mut SequenceState,
+    ) -> Result<Option<SerialRows>> {
         let k = tokens.len();
         ensure!(
             k <= MAX_ROWS,
@@ -104,7 +138,7 @@ impl TransformerModel {
     }
 
     /// One sequence's GDN recurrent state (h + conv per layer).
-    fn serial_ssm_states(&self, seq: &SequenceState) -> Vec<(DevicePtr, DevicePtr)> {
+    pub(super) fn serial_ssm_states(&self, seq: &SequenceState) -> Vec<(DevicePtr, DevicePtr)> {
         seq.layer_states
             .iter()
             .enumerate()

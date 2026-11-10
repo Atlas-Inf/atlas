@@ -520,6 +520,7 @@ impl TransformerModel {
             gate_beta: self.gdn_buf_gate_beta,
             output: self.gdn_buf_out,
             z: self.gdn_buf_z,
+            z_stride: self.config.linear_num_value_heads * self.config.linear_value_head_dim,
             // VARLEN: packed total = Σ proc_count (running_proc_off after the
             // PHASE-A loop) — the cu_seqlens SSOT. Was Σ chunk_len (total_tokens),
             // which over-counts on a partial cache hit and makes the GDN scan

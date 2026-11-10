@@ -93,7 +93,18 @@ pub fn rope(
     );
     let half_rot = (rotary_dim / 2).max(1);
     let pos_per_block = (128 / half_rot).max(1);
-    let seq_blocks = div_ceil(seq_len, pos_per_block);
+    // `rope_forward_rows` (common/rope.cu; a target shadowing `rope` may lack
+    // it) is the same rotation with each block covering ROPE_ROWS position
+    // groups, amortizing the per-block FP64 frequencies. Bit-identical.
+    const ROPE_ROWS: u32 = 16;
+    let rows = gpu
+        .op_cache()
+        .kernel_or_null(gpu, "rope", "rope_forward_rows");
+    let (kernel, seq_blocks) = if rows.0 != 0 {
+        (rows, div_ceil(seq_len, pos_per_block * ROPE_ROWS))
+    } else {
+        (kernel, div_ceil(seq_len, pos_per_block))
+    };
     KernelLaunch::new(gpu, kernel)
         .grid([num_q_heads + num_kv_heads, seq_blocks, 1])
         .block([128, 1, 1])
@@ -177,8 +188,13 @@ pub fn rope_mrope_interleaved(
     let half_rot = (rotary_dim / 2).max(1);
     let pos_per_block = (128 / half_rot).max(1);
     let seq_blocks = div_ceil(seq_len, pos_per_block);
+    // A block rotates heads x, x + grid.x, ... with one angle evaluation (an
+    // FP64 pow plus sincos a pair): give each block as many heads as keeps
+    // ~4 blocks an SM. Decode-sized calls keep one head a block.
+    let heads = num_q_heads + num_kv_heads;
+    let head_blocks = div_ceil(192, seq_blocks).clamp(1, heads.max(1));
     KernelLaunch::new(gpu, kernel)
-        .grid([num_q_heads + num_kv_heads, seq_blocks, 1])
+        .grid([head_blocks, seq_blocks, 1])
         .block([128, 1, 1])
         .arg_ptr(q)
         .arg_ptr(k)

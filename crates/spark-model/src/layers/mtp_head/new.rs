@@ -414,6 +414,8 @@ impl MtpHead {
             residual_add_rms_norm_k: gpu.kernel("norm", "residual_add_rms_norm")?,
             sigmoid_gate_mul_k: gpu.kernel("residual_add", "sigmoid_gate_mul")?,
             bf16_concat_k: gpu.kernel("residual_add", "bf16_concat")?,
+            bf16_concat_rows_k: crate::layers::try_kernel(gpu, "residual_add", "bf16_concat_rows"),
+            batched_embed_k: crate::layers::try_kernel(gpu, "embed_from_argmax", "batched_embed"),
             argmax_k: gpu.kernel("argmax", "argmax_bf16")?,
             embed_from_argmax_k: gpu.kernel("embed_from_argmax", "embed_from_argmax")?,
             draft_token_id_dev: gpu.alloc(4)?,

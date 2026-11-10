@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use atlas_core::registry::AtlasRegistry;
 
+mod alloc_log;
 mod display_carveout;
 mod fault_probe;
 mod gpu_copy;
@@ -234,7 +235,12 @@ impl AtlasCudaBackend {
     }
 
     pub(crate) fn record_alloc(&self, ptr: crate::gpu::DevicePtr, bytes: usize) {
-        self.live_allocs.lock().record(ptr.0, bytes);
+        let total = {
+            let mut live = self.live_allocs.lock();
+            live.record(ptr.0, bytes);
+            live.bytes()
+        };
+        alloc_log::note(bytes, total);
     }
 
     /// Drop `ptr` from the ledger, returning the bytes it was recorded with.
