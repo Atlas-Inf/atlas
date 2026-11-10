@@ -139,9 +139,9 @@ pub(super) fn continue_in_progress_prefills(
         })
         .collect();
 
-    // single_active_with_spec: active.len()==1 AND a speculative path is
-    // active (those step_* paths require active.len()==1 and mixing would
-    // double-decode). Computed early because the always-mixed gate below
+    // single_active_with_spec: a speculative step serves the active set
+    // (`SpecStep::blocks_mixed`: one decoder, or any number under DFlash), so
+    // mixing would double-decode. Computed early because the always-mixed gate below
     // needs it too. (Also reused by the Q12 mixed-batch gate further down.)
     // Buffered disconnect: retire dead prefills before any further chunk
     // forward or batched dispatch so we do not schedule GPU work whose result
@@ -149,8 +149,8 @@ pub(super) fn continue_in_progress_prefills(
     if retire_disconnected_prefills(model, prefilling) > 0 {
         return did_mixed_step;
     }
-    let single_active_with_spec =
-        active.len() == 1 && (use_mtp || use_self_speculative || use_ngram_speculative);
+    let any_spec = use_mtp || use_self_speculative || use_ngram_speculative;
+    let single_active_with_spec = spec.blocks_mixed(active.len(), any_spec);
 
     // ── Step 2 (spec): always-on fused mixed step ──
     //

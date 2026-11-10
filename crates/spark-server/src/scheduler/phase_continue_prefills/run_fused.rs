@@ -20,6 +20,23 @@ pub(in crate::scheduler) struct SpecStep {
     pub dflash_verify_raw_argmax: bool,
 }
 
+impl SpecStep {
+    /// Whether speculation rules out fusing the active sequences' decode
+    /// into a prefill chunk (`mixed_forward`, `mixed_forward_batch`) beside
+    /// `active` decoders.
+    ///
+    /// The single-sequence lanes speculate only alone, so they block it at
+    /// one decoder. A DFlash serve blocks it at every width: the mixed
+    /// forwards do not capture the prefilling sequence's drafter context
+    /// (`try_dflash_prefill_capture_layer`), so a sequence promoted from one
+    /// has no accumulator and every propose for it fails, and they decode
+    /// the owners one plain token where a batched verify step would have
+    /// run. The chunk runs alone instead and the owners take their step.
+    pub fn blocks_mixed(&self, active: usize, any_spec: bool) -> bool {
+        any_spec && (active == 1 || self.dflash_verify_raw_argmax)
+    }
+}
+
 fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_GLM_FUSED_PREFILL_VERIFY").as_deref() == Ok("1"))
