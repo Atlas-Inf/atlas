@@ -161,6 +161,8 @@ pub struct DenseFfnLayer {
     // ~10 TFLOPS at M=8k and was the flat ~155 tok/s dense-FFN prefill
     // bottleneck on Qwen3.6-27B. KernelHandle(0) on miss → scalar-tile fallback.
     w4a16_gemm_t_m128_k: KernelHandle,
+    /// Small-M row-GEMV (`ATLAS_FFN_ROWGEMV=1`); handles 0 off strix-hip.
+    w4a16_rowgemv: super::ops::RowGemvKernels,
     w4a16_gemm_t_m128_k16_k: KernelHandle,
     // v2: 8-warp (256-thread) variant of t_m128 — parallel chunk MMAs, 3 CTAs/SM.
     // Preferred over t_m128 for dense-FFN prefill when present. KernelHandle(0) → use t_m128.
@@ -510,6 +512,7 @@ impl DenseFfnLayer {
             w4a16_batchm: W4a16BatchmTiers::resolve(gpu, model_type == "glm5_next"),
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_m128_k: super::ops::w4a16_m128_kernel(gpu),
+            w4a16_rowgemv: super::ops::RowGemvKernels::resolve(gpu)?,
             w4a16_gemm_t_m128_k16_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128_k16"),
             w4a16_gemm_t_m128_v2_k: super::w4a16_v2_kernel(gpu),
             w4a16_gemm_t_m128_bf16_k: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128_bf16"),
@@ -1793,6 +1796,14 @@ impl DenseFfnLayer {
         // `layers::ops::ModelLevers` — resolved when the model is built and carried
         // on `ForwardContext`, because a static outlives the model whose flags it
         // encodes.
+        if let Some(wt) = wt
+            && ctx.levers.ffn_rowgemv
+            && self.w4a16_rowgemv.fits(m, n, k)
+        {
+            return self
+                .w4a16_rowgemv
+                .launch(ctx.gpu, input, wt, output, m, n, k, stream);
+        }
         if let Some(wt) = wt {
             if m <= 64 && k.is_multiple_of(32) && ctx.levers.ffn_small_m {
                 if k >= crate::layers::w4a16_k64_min_k()
