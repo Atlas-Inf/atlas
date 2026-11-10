@@ -23,6 +23,9 @@ pub(super) struct TestModel {
 #[derive(Default)]
 pub(super) struct VerifyScript {
     pub picks: Vec<u32>,
+    /// Scripted verify whose head still writes full logits: the
+    /// argmax-only split head is OFF even though picks are scripted.
+    pub full_logits: bool,
     pub is_ep: bool,
     pub fail_candidates: bool,
     pub fail_full_rows: bool,
@@ -283,7 +286,7 @@ impl Model for TestModel {
         EXACT_VERIFY.with(|e| e.get())
     }
     fn verify_logits_argmax_only(&self) -> bool {
-        self.verify.is_some()
+        self.verify.as_ref().is_some_and(|v| !v.full_logits)
     }
     /// A scripted split head (`split_rows` tests): two ranks of the scripted
     /// rows from the cursor on, each sending its best [`SPLIT_CANDIDATES`].

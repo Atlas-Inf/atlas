@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Speculative decoding for strict structured output (`ATLAS_GLM_STRICT_SPEC=1`).
+//! Speculative decoding for strict structured output (`ATLAS_GLM_STRICT_SPEC=1`
+//! on the GLM vocab-split head, `ATLAS_STRICT_SPEC=1` on full-logits verifies).
 //!
 //! A port of vLLM's design: vllm-project/vllm#14702 ("Enable Speculative
 //! Decoding with Structured Outputs") and #44297 ("Constrain bitmask and trim
@@ -28,6 +29,13 @@
 //! (`spark_model::model::glm_verify_masks`) and each applies its slice before
 //! its partial argmax, so every emitted token is the best one the grammar
 //! allows at its own position. Rows of other sequences are untouched.
+//!
+//! A verify that writes full logits needs none of this: the host pick
+//! pipeline (`verify_pipeline_helper`) already masks every row at its own
+//! position — it speculatively advances the matcher between rows and rolls
+//! back, exactly the walk above — so `ATLAS_STRICT_SPEC` strict sequences
+//! verify unmasked drafts and let the accept prefix reject what the grammar
+//! refuses.
 
 use anyhow::{Result, ensure};
 
@@ -36,14 +44,24 @@ use crate::grammar::GrammarState;
 use super::ActiveSeq;
 use super::levers::SchedLevers;
 
-/// Strict sequences speculate only on the DFlash raw-argmax lane served by
-/// the GLM vocab-split head, the one verify that applies the row masks.
+/// Strict sequences speculate only on a verify that masks every row at its
+/// own position. The GLM vocab-split head picks raw argmax ids, so its rows
+/// are masked on device by this module's walk (`ATLAS_GLM_STRICT_SPEC`,
+/// DFlash raw-argmax lane). Every other verify writes full logits that the
+/// host pick pipeline masks per position — the same masks this walk builds —
+/// so strict sequences speculate there under `ATLAS_STRICT_SPEC` on any
+/// lane, with no device masks and no draft trimming (an illegal draft is
+/// simply rejected at the accept prefix).
 pub(super) fn enabled(
     levers: &SchedLevers,
     model: &dyn spark_model::traits::Model,
     raw: bool,
 ) -> bool {
-    levers.glm_strict_spec && raw && model.verify_logits_argmax_only()
+    if model.verify_logits_argmax_only() {
+        levers.glm_strict_spec && raw
+    } else {
+        levers.strict_spec
+    }
 }
 
 /// A strict verify: the drafts it carries and one mask per verify row.
