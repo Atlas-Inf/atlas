@@ -362,7 +362,11 @@ impl Qwen3AttentionLayer {
             // target's vanilla twin, else (handle 0) the per-row loop in
             // `ms_qkv_norms`.
             rms_norm_strided_k: if crate::ships_vanilla_norm_weights(config) {
-                super::super::try_kernel(
+                // The strided vanilla twin exists only in the ricursive
+                // target — gated so every other vanilla-norm model takes the
+                // handle-0 fallback without a failed audit row.
+                super::super::try_kernel_gated(
+                    config.model_type == "ricursive",
                     gpu,
                     "rms_norm_vanilla_strided",
                     "rms_norm_vanilla_strided",

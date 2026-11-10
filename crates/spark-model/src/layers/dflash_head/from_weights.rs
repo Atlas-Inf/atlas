@@ -144,6 +144,10 @@ impl BlockDiffusionDraftHead {
         // `kernels/gb10/common/`.
         let paged_sink = super::paged_attn_modules::paged_sink_modules_for_head_dim(head_dim)?;
         let glm_series = target_model_type == "glm5_next";
+        // The small-M m32 GEMVs compile only into the ricursive target;
+        // gated (not plain try_kernel) so non-ricursive DFlash targets never
+        // issue a permanently-unresolvable lookup — see kernel_pick.
+        let ricursive_series = target_model_type == "ricursive";
         let selector_build = match weights.candidate_selector.as_ref() {
             Some(selector) => ops::dflash2_selector_build(selector.top_k)?,
             None => ops::DFLASH2_SELECTOR_BASE,
@@ -183,8 +187,18 @@ impl BlockDiffusionDraftHead {
             dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             w4a16_gemm: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm"),
             dense_gemm_pipelined: gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?,
-            bf16_gemv_m32: crate::layers::try_kernel(gpu, "bf16_gemv_m32", "bf16_gemv_m32"),
-            fp8_gemv_m32: crate::layers::try_kernel(gpu, "fp8_gemv_m32", "fp8_gemv_m32"),
+            bf16_gemv_m32: crate::layers::try_kernel_gated(
+                ricursive_series,
+                gpu,
+                "bf16_gemv_m32",
+                "bf16_gemv_m32",
+            ),
+            fp8_gemv_m32: crate::layers::try_kernel_gated(
+                ricursive_series,
+                gpu,
+                "fp8_gemv_m32",
+                "fp8_gemv_m32",
+            ),
             dflash2_conv: gpu
                 .kernel("dflash2_conv", "dflash2_grouped_dynamic_causal_conv")
                 .ok(),
