@@ -19,6 +19,8 @@ use crate::weight_map::{
 mod dp4a_decode;
 #[path = "dense_ffn_exact.rs"]
 mod exact_rows;
+#[path = "dense_ffn_km_rowgemv.rs"]
+mod km_rowgemv;
 #[path = "dense_ffn_native.rs"]
 mod native;
 #[path = "dense_ffn_prefill_bf16.rs"]
@@ -1737,6 +1739,9 @@ impl DenseFfnLayer {
             return Ok(());
         }
         if self.forward_dp4a_batch(input, m, ctx, stream)? {
+            return Ok(());
+        }
+        if self.forward_km_rowgemv(input, m, ctx, stream)? {
             return Ok(());
         }
         let h = ctx.config.hidden_size as u32;
