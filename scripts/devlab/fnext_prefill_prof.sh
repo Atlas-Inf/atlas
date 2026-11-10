@@ -15,16 +15,16 @@ OUT=${DEVLAB_OUT:-$PWD/devlab-out}; mkdir -p "$OUT"; RES="$OUT/RESULTS.txt"
 HERE=$(cd "$(dirname "$0")" && pwd); . "$HERE/lib_engines.sh"
 [ -x target/release/spark ] || { log "no target/release/spark (run with job=bench)"; exit 1; }
 command -v rocprofv3 >/dev/null || PATH=$PATH:/opt/rocm/bin; command -v rocprofv3 >/dev/null || { log "no rocprofv3"; exit 1; }
-REPO=nvidia/Qwen3.8-Flash-Next-NVFP4; BIG=model-fp8-mtp-ple.safetensors; PORT=${PORT:-8093}
+REPO=${REPO:-nvidia/Qwen3.8-Flash-Next-NVFP4}; BIG=model-fp8-mtp-ple.safetensors; PORT=${PORT:-8093}
 NV=$("${PY:-python3}" -c 'import sys; from huggingface_hub import snapshot_download as s; print(s(sys.argv[1], ignore_patterns=[sys.argv[2]]))' "$REPO" "$BIG" 2>>"$OUT/download.log") \
-  && curl -fsSL -C - --retry 5 --retry-all-errors -o "$NV/$BIG" "${HF_ENDPOINT:-https://huggingface.co}/$REPO/resolve/main/$BIG" 2>>"$OUT/download.log" \
+  && { [[ "$REPO" != *Flash-Next* ]] || curl -fsSL -C - --retry 5 --retry-all-errors -o "$NV/$BIG" "${HF_ENDPOINT:-https://huggingface.co}/$REPO/resolve/main/$BIG" 2>>"$OUT/download.log"; } \
   || { log "DOWNLOAD FAILED: $(grep -av '^ ' "$OUT/download.log" | tail -6)"; exit 1; }
 
 # spark under the profiler: serve-amd.sh execs $ATLAS_BIN, so point it at a wrapper.
 W="$OUT/spark-prof"; mkdir -p "$OUT/prof"
 printf '#!/usr/bin/env bash\nexec rocprofv3 --kernel-trace --output-format csv -d %q -o run -- %q "$@"\n' "$OUT/prof" "$PWD/target/release/spark" > "$W"; chmod +x "$W"
 ( exec env RUST_LOG=info ATLAS_BIN="$W" PORT="$PORT" HOST=127.0.0.1 MODEL_NAME=m GPU_UTIL=${GPU_UTIL:-0.76} MAX_SEQ_LEN=32768 \
-    ATLAS_KV_EXTERNAL_RESERVE_GB=0 MAX_BATCH=1 ./serve-amd.sh "$REPO" --disable-thinking --request-timeout 0 --enable-prefix-caching ) > "$OUT/atlas-server.log" 2>&1 &
+    ATLAS_KV_EXTERNAL_RESERVE_GB=0 MAX_BATCH=${MAX_BATCH:-1} ./serve-amd.sh "$REPO" --disable-thinking --request-timeout 0 --enable-prefix-caching ) > "$OUT/atlas-server.log" 2>&1 &
 APID=$!; ENGINE_ALIVE() { kill -0 "$APID" 2>/dev/null; }
 wait_ready "$PORT" 720 || { log "SERVE FAILED: $(grep -aE 'ERROR|allocfail|panick' "$OUT/atlas-server.log" | tail -3)"; kill -9 "$APID" 2>/dev/null; exit 1; }
 log "serving under rocprofv3"
@@ -55,6 +55,17 @@ if os.environ.get("PHASE") == "depth":
         print(f"  [prof] {tag}: prompt {u.get('prompt_tokens')} tok (cached {u.get('prompt_tokens_details', {}) or {}}) in {dt:.2f}s", flush=True)
     ext("warm-16k", 0, 10)
     for i in range(5): ext(f"ext-{i}", 300 + i, 1900)
+elif os.environ.get("PHASE") == "c8":
+    # G1: steady C8 decode (8 concurrent 256-token greedy streams on short prompts) to attribute decode kernels.
+    import threading
+    def gen(i):
+        body = {"model": "m", "messages": [{"role": "user", "content": f"[c8-{i}] Write a long story about a {words[i]}."}], "max_tokens": 256, "temperature": 0}
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
+        json.load(urllib.request.urlopen(req, timeout=1800))
+    for rnd in range(2):
+        t = time.time(); th = [threading.Thread(target=gen, args=(i,)) for i in range(8)]
+        [x.start() for x in th]; [x.join() for x in th]
+        print(f"  [prof] c8 round {rnd}: 8x256 tok in {time.time() - t:.2f}s -> {2048 / (time.time() - t):.1f} tok/s agg", flush=True)
 else:
     for i in range(3): ask(f"2k-{i}", 1900, 100 + i)
     for i in range(2): ask(f"16k-{i}", 16000, 200 + i)
