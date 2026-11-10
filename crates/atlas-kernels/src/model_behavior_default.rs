@@ -47,6 +47,7 @@ impl Default for ModelBehavior {
             tool_retry: true,
             preserve_thinking: None,
             verbatim_prompt: false,
+            nvfp4_verbatim_prompt: None,
             eos_ends_thinking: false,
             tool_call_steering: true,
             verbatim_reasoning_effort: false,

@@ -94,6 +94,8 @@ pub(crate) struct ParsedBehavior {
     pub preserve_thinking: Option<bool>,
     /// See `ModelBehavior::verbatim_prompt`.
     pub verbatim_prompt: bool,
+    /// See `ModelBehavior::nvfp4_verbatim_prompt`.
+    pub nvfp4_verbatim_prompt: Option<bool>,
     /// See `ModelBehavior::eos_ends_thinking`.
     pub eos_ends_thinking: bool,
     /// See `ModelBehavior::tool_call_steering`.
@@ -144,6 +146,7 @@ impl Default for ParsedBehavior {
             tool_retry: true,
             preserve_thinking: None,
             verbatim_prompt: false,
+            nvfp4_verbatim_prompt: None,
             eos_ends_thinking: false,
             tool_call_steering: true,
             verbatim_reasoning_effort: false,
@@ -338,6 +341,11 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
             .unwrap_or(default)
     };
     let verbatim_prompt = flag("verbatim_prompt", false);
+    // Tri-state like `preserve_thinking`: absent key stays `None`, meaning
+    // `verbatim_prompt` applies to every checkpoint.
+    let nvfp4_verbatim_prompt = b
+        .and_then(|v| v.get("nvfp4_verbatim_prompt"))
+        .and_then(|v| v.as_bool());
     let eos_ends_thinking = flag("eos_ends_thinking", false);
     let tool_call_steering = flag("tool_call_steering", true);
     let verbatim_reasoning_effort = flag("verbatim_reasoning_effort", false);
@@ -380,6 +388,7 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         tool_retry,
         preserve_thinking,
         verbatim_prompt,
+        nvfp4_verbatim_prompt,
         eos_ends_thinking,
         tool_call_steering,
         verbatim_reasoning_effort,

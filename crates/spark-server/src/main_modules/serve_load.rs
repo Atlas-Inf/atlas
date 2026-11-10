@@ -399,6 +399,21 @@ pub(crate) fn load_model(
             None => ptx_set,
         }
     };
+    // `nvfp4_verbatim_prompt` resolves to one `verbatim_prompt` value here so
+    // every downstream reader — the tokenizer, `ChatLevers`, the
+    // reference-mode copy, AppState, `log_behavior_audit` — sees it.
+    let ptx_set = {
+        let mut s = ptx_set;
+        let resolved = resolve_verbatim_prompt(&s.behavior, &config);
+        if resolved != s.behavior.verbatim_prompt {
+            tracing::info!(
+                "nvfp4_verbatim_prompt: checkpoint is a ModelOpt NVFP4 pack (not FP4-Local); verbatim_prompt {} -> {resolved}",
+                s.behavior.verbatim_prompt
+            );
+        }
+        s.behavior.verbatim_prompt = resolved;
+        s
+    };
     let sampling_presets = ptx_set.sampling;
     // Record the RESOLVED target identity for the dashboard's kernel table.
     // It used to re-run resolution from (model_type, hidden_size), but that
@@ -1477,6 +1492,22 @@ pub(crate) fn load_model(
         port: args.port,
         scheduler: scheduler_handle,
     }))
+}
+
+/// `nvfp4_verbatim_prompt` applies only when the checkpoint resolves to a
+/// ModelOpt plan that is not FP4-Local; every other checkpoint (EXL3,
+/// FP4-Local, no plan) keeps the baked `verbatim_prompt`.
+fn resolve_verbatim_prompt(
+    b: &atlas_kernels::ModelBehavior,
+    config: &atlas_core::config::ModelConfig,
+) -> bool {
+    match (
+        b.nvfp4_verbatim_prompt,
+        spark_model::weight_map::modelopt_plan::ModeloptQuantPlan::from_config(config),
+    ) {
+        (Some(v), Some(plan)) if !plan.is_fp4_local() => v,
+        _ => b.verbatim_prompt,
+    }
 }
 
 #[cfg(test)]
