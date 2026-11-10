@@ -155,17 +155,19 @@ impl TransformerModel {
         seq: &SequenceState,
         idx: Vec<usize>,
         layers: Vec<GdnCommitLayer>,
-        n: usize,
+        rows: &[usize],
         stream: u64,
     ) -> Result<()> {
+        let n = rows.len();
+        let prefix = rows.iter().enumerate().all(|(i, &r)| r == i);
         let worded = idx.iter().all(|&i| {
             seq.layer_states[i]
                 .as_any()
                 .downcast_ref::<SsmLayerState>()
                 .is_some_and(|s| !s.gdn_fuse_n.is_null())
         });
-        if !(requested() && worded) || layers.is_empty() {
-            return self.commit_gdn_exact(&layers, n, stream);
+        if !(requested() && worded && prefix) || layers.is_empty() {
+            return self.commit_gdn_exact_rows(&layers, rows, stream);
         }
         let mut map = self.gdn_fuse.pending.lock();
         // A verify consumes its pending commit before its verdict; a stale

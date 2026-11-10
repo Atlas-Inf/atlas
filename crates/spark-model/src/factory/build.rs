@@ -3,7 +3,7 @@
 //! `build_model` — entry point that wires up the configured loader,
 //! buffers, KV cache, and (optional) DFlash drafter into a `TransformerModel`.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use atlas_core::config::ModelConfig;
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::GpuBackend;
@@ -23,6 +23,7 @@ use crate::model::TransformerModel;
 use crate::traits::Model;
 use crate::weight_loader::load_dflash_weights;
 
+mod dflash_reserve;
 mod glm;
 mod kv_budget;
 mod kv_carveout;
@@ -215,6 +216,17 @@ pub fn build_model(
         && let Some(ref sub) = args.drafter_config.dflash_config
     {
         config.dflash_capture_layers = sub.target_layer_ids.clone();
+        // `--draft-model-alt`: one capture covers both drafters' layers.
+        if let Some(alt) = args
+            .alt
+            .as_ref()
+            .and_then(|(_, c)| c.dflash_config.as_ref())
+        {
+            config.dflash_capture_layers = crate::layers::dflash_head::dual::union_layers(
+                &sub.target_layer_ids,
+                &alt.target_layer_ids,
+            );
+        }
         // The window a bidirectional head keeps (`ctx_window_len`): the served
         // one (Lightning admission's, else the caller's) capped at max_seq_len.
         let served = lightning_dspark_policy
@@ -780,6 +792,127 @@ pub fn build_model(
         inference_reserve
     };
 
+    // The DFlash drafter head is built BEFORE the KV budget below: its paged KV
+    // pools, batch scratch, NVFP4 twins and (DSpine) serial tables then land in
+    // the measured footprint instead of past it. Installed after the model.
+    let mut dflash_head: Option<crate::layers::BlockDiffusionDraftHead> = None;
+    let mut dflash_weights_missing = false;
+    if let Some(ptr) = drafter_balloon
+        && let Err(e) = gpu.free(ptr)
+    {
+        tracing::warn!("drafter balloon free failed: {e}");
+    }
+    if let Some(args) = dflash_args.as_ref().filter(|a| !a.drafter_store.is_empty()) {
+        let target_embed_for_dflash = embed.weight;
+        let target_lm_head_for_dflash = lm_head.weight;
+        let target_lm_head_nvfp4_for_dflash = lm_head_nvfp4;
+        let target_hidden_for_dflash = config.hidden_size;
+        let target_vocab_for_dflash = config.vocab_size;
+        let weights = load_dflash_weights(
+            args.drafter_store,
+            &args.drafter_config,
+            gpu.as_ref(),
+            1, // tp_size for the drafter side: replicated, so always 1
+        )?;
+        match weights {
+            Some(weights) => {
+                if lightning_dspark_admitted {
+                    anyhow::ensure!(
+                        weights.markov_w1.is_some() && weights.markov_w2.is_some(),
+                        "Lightning DSpark required Markov weights disappeared after load"
+                    );
+                    anyhow::ensure!(
+                        weights
+                            .layers
+                            .iter()
+                            .all(|layer| layer.attention_sink_bias.is_some()),
+                        "Lightning DSpark required attention sink weights disappeared after load"
+                    );
+                }
+                // Lightning admission owns the served SWA window. Generic
+                // DFlash keeps the caller's existing override/default path.
+                let served_window_size = lightning_dspark_policy
+                    .as_ref()
+                    .map(|policy| policy.profile().attention.swa_window)
+                    .or(args.window_size);
+                // Startup-static execution is frozen at head construction:
+                // the admitted Lightning product derives it from the
+                // validated policy toggles; generic DFlash keeps legacy
+                // lenient environment semantics, still parsed exactly once.
+                let mut startup = match lightning_dspark_policy.as_ref() {
+                    Some(policy) => {
+                        DsparkStartupExecution::from_lightning(policy.runtime_toggles())
+                    }
+                    None => DsparkStartupExecution::from_env_lenient(),
+                };
+                // Strict for every head: an unknown value fails the build.
+                startup.diagnostics.first_append = FirstAppend::for_head()?;
+                startup.diagnostics.warm_ctx = crate::layers::dflash_head::WarmCtx::for_head()?;
+                let union = config.dflash_capture_layers.clone();
+                let dual = args.alt.is_some();
+                anyhow::ensure!(
+                    !dual || !lightning_dspark_admitted,
+                    "--draft-model-alt does not pair with the Lightning DSpark product"
+                );
+                let build_head =
+                    |mut weights: crate::weight_loader::DflashWeights,
+                     store: &WeightStore,
+                     startup: DsparkStartupExecution|
+                     -> Result<crate::layers::BlockDiffusionDraftHead> {
+                        // Two drafters: each reads its own layers out of the union
+                        // capture, and runs at its own block size (capped by γ).
+                        let gamma = if dual {
+                            crate::layers::dflash_head::dual::widen_to_union(
+                                &mut weights,
+                                &union,
+                                target_hidden_for_dflash,
+                                store,
+                                gpu.as_ref(),
+                            )?;
+                            Some(args.gamma.map_or(weights.config.block_size(), |g| {
+                                g.min(weights.config.block_size())
+                            }))
+                        } else {
+                            args.gamma
+                        };
+                        crate::layers::BlockDiffusionDraftHead::from_weights(
+                            weights,
+                            target_embed_for_dflash,
+                            target_lm_head_for_dflash,
+                            target_lm_head_nvfp4_for_dflash,
+                            target_hidden_for_dflash,
+                            target_vocab_for_dflash,
+                            gamma,
+                            served_window_size,
+                            gpu.as_ref(),
+                            max_seq_len,
+                            max_batch_size,
+                            &config.model_type,
+                            startup,
+                        )
+                    };
+                let alt_head = match args.alt.as_ref() {
+                    Some((store, alt_config)) => {
+                        let alt_weights = load_dflash_weights(store, alt_config, gpu.as_ref(), 1)?
+                            .context("--draft-model-alt has no DFlash weights (fc.weight)")?;
+                        let mut alt_startup = DsparkStartupExecution::from_env_lenient();
+                        alt_startup.diagnostics.first_append = FirstAppend::for_head()?;
+                        alt_startup.diagnostics.warm_ctx =
+                            crate::layers::dflash_head::WarmCtx::for_head()?;
+                        Some(build_head(alt_weights, store, alt_startup)?)
+                    }
+                    None => None,
+                };
+                let mut head = build_head(weights, args.drafter_store, startup)?;
+                if let Some(alt) = alt_head {
+                    head.set_alt(alt)?;
+                }
+                dflash_head = Some(head);
+            }
+            None => dflash_weights_missing = true,
+        }
+    }
+
     let total_mem = gpu.total_memory()?;
     let actual_free = gpu.free_memory()?;
     let gib = kv_budget::gib;
@@ -800,8 +933,32 @@ pub fn build_model(
         &ssm_pools.snapshots,
         layers.iter().map(|l| l.aux_bytes_per_token()).sum(),
     );
+    // The drafter's per-sequence context accumulators, taken at request time.
+    let dflash_post_kv = dflash_args.as_ref().map_or(0, |_| {
+        dflash_reserve::bytes(
+            config.dflash_capture_layers.len(),
+            config.hidden_size,
+            max_seq_len,
+            max_batch_size,
+        )
+    });
+    if dflash_post_kv > 0 {
+        tracing::info!(
+            "DFlash context accumulators reserved from the KV \
+             budget: {:.2} GB for {max_batch_size} sequences",
+            dflash_post_kv as f64 / 1e9
+        );
+    }
+    // The NVFP4 LM head's transposed twin, built in `TransformerModel::new`.
+    let lm_twin = crate::model::impl_a1::lm_head_twin_bytes(
+        lm_head_nvfp4.is_some(),
+        config.vocab_size,
+        config.hidden_size,
+    );
     let reserve_net = reserve_net
         + snapshot_aux
+        + dflash_post_kv
+        + lm_twin
         + kv_nvme::host_reserve_bytes(nvme_geometry, ssm_pools.tier_lazy_host_bytes());
     let budget = kv_budget::measure(
         gpu.as_ref(),
@@ -1074,13 +1231,8 @@ pub fn build_model(
     // Capture pointers for any post-construction sharing (DFlash drafter
     // shares embed_tokens + lm_head with the target). DenseWeight is Copy
     // so this clones the device pointer cheaply.
-    let target_embed_for_dflash = embed.weight;
-    let target_lm_head_for_dflash = lm_head.weight;
     // NVFP4 lm_head (Copy) shared with the DFlash drafter so its final logits
     // GEMM uses w4a16 instead of a BF16 dense_gemm on NVFP4-packed bytes.
-    let target_lm_head_nvfp4_for_dflash = lm_head_nvfp4;
-    let target_hidden_for_dflash = config.hidden_size;
-    let target_vocab_for_dflash = config.vocab_size;
 
     // The BF16 lm_head is only ever a fallback: every logits producer prefers
     // the NVFP4 head when it exists (impl_a3::lm_head, the lm_head_batched
@@ -1257,123 +1409,54 @@ pub fn build_model(
     // first makes that precondition observable instead of bypassable.
     model.set_lora_weights(lora_weights)?;
 
-    // Free the drafter balloon: the drafter's pools, fused weights and NVFP4
-    // staging now allocate into its pristine region — not the shredded tail.
-    if let Some(ptr) = drafter_balloon
-        && let Err(e) = model.gpu_backend().free(ptr)
-    {
-        tracing::warn!("drafter balloon free failed: {e}");
-    }
-
     // A worker rank carries the drafter config only; the head proposes.
-    if let Some(args) = dflash_args.filter(|a| !a.drafter_store.is_empty()) {
-        let weights = load_dflash_weights(
-            args.drafter_store,
-            &args.drafter_config,
-            model.gpu_backend(),
-            1, // tp_size for the drafter side: replicated, so always 1
-        )?;
-        match weights {
-            Some(weights) => {
-                if lightning_dspark_admitted {
-                    anyhow::ensure!(
-                        weights.markov_w1.is_some() && weights.markov_w2.is_some(),
-                        "Lightning DSpark required Markov weights disappeared after load"
-                    );
-                    anyhow::ensure!(
-                        weights
-                            .layers
-                            .iter()
-                            .all(|layer| layer.attention_sink_bias.is_some()),
-                        "Lightning DSpark required attention sink weights disappeared after load"
-                    );
-                }
-                // Lightning admission owns the served SWA window. Generic
-                // DFlash keeps the caller's existing override/default path.
-                let served_window_size = lightning_dspark_policy
-                    .as_ref()
-                    .map(|policy| policy.profile().attention.swa_window)
-                    .or(args.window_size);
-                // Startup-static execution is frozen at head construction:
-                // the admitted Lightning product derives it from the
-                // validated policy toggles; generic DFlash keeps legacy
-                // lenient environment semantics, still parsed exactly once.
-                let mut startup = match lightning_dspark_policy.as_ref() {
-                    Some(policy) => {
-                        DsparkStartupExecution::from_lightning(policy.runtime_toggles())
-                    }
-                    None => DsparkStartupExecution::from_env_lenient(),
-                };
-                // Strict for every head: an unknown value fails the build.
-                startup.diagnostics.first_append = FirstAppend::for_head()?;
-                startup.diagnostics.warm_ctx = crate::layers::dflash_head::WarmCtx::for_head()?;
-                let mut head = crate::layers::BlockDiffusionDraftHead::from_weights(
-                    weights,
-                    target_embed_for_dflash,
-                    target_lm_head_for_dflash,
-                    target_lm_head_nvfp4_for_dflash,
-                    target_hidden_for_dflash,
-                    target_vocab_for_dflash,
-                    args.gamma,
-                    served_window_size,
-                    model.gpu_backend(),
-                    max_seq_len,
-                    max_batch_size,
-                    &model.config_ref().model_type,
-                    startup,
-                )?;
-                // ATLAS_GLM_DRAFT_TP: on the TP2 pair or the TP4 chain every
-                // rank holds the drafter and computes its share of a propose;
-                // a worker's copy serves its share and proposes nothing.
-                let (rank, ranks, split_ranks) = {
-                    let c = model.config_ref();
-                    (c.ep_rank, c.ep_world_size, crate::layers::moe::glm_tp_ep(c))
-                };
-                let split = crate::layers::dflash_head::rank_split::requested()?
-                    .filter(|_| split_ranks && !lightning_dspark_admitted);
-                if let Some(parts) = split {
-                    let batch = crate::layers::dflash_head::rank_split::batch_requested()?;
-                    let ctx = crate::layers::dflash_head::rank_split::ctx_requested()?;
-                    let topk = crate::layers::dflash_head::rank_split::topk_requested()?;
-                    head.enable_rank_split(parts, batch, ctx, topk, ranks, model.gpu_backend())?;
-                }
-                if rank != 0 {
-                    anyhow::ensure!(
-                        split.is_some(),
-                        "rank {rank} loaded a drafter it cannot use: ATLAS_GLM_DRAFT_TP \
-                         needs the generic DFlash drafter on the TP2 pair or the TP4 chain"
-                    );
-                    model.set_draft_assist(std::sync::Arc::new(head));
-                    tracing::info!(
-                        "DFlash drafter installed on rank {rank} to serve split proposes"
-                    );
-                } else {
-                    match lightning_dspark_policy {
-                        Some(policy) => model
-                            .set_lightning_dspark_proposer(std::sync::Arc::new(head), policy)?,
-                        None => model.set_dflash_proposer(std::sync::Arc::new(head)),
-                    }
-                    tracing::info!(
-                        "{} drafter installed as the active proposer",
-                        if lightning_dspark_admitted {
-                            "Lightning DSpark"
-                        } else {
-                            "DFlash"
-                        }
-                    );
-                }
-            }
-            None if lightning_dspark_admitted => {
-                anyhow::bail!(
-                    "Lightning DSpark admission passed but required drafter weights were not loaded"
-                );
-            }
-            None => {
-                tracing::warn!(
-                    "Generic DFlash drafter store had no fc.weight — proposer not installed"
-                );
-            }
+    if let Some(mut head) = dflash_head {
+        // ATLAS_GLM_DRAFT_TP: on the TP2 pair or the TP4 chain every
+        // rank holds the drafter and computes its share of a propose;
+        // a worker's copy serves its share and proposes nothing.
+        let (rank, ranks, split_ranks) = {
+            let c = model.config_ref();
+            (c.ep_rank, c.ep_world_size, crate::layers::moe::glm_tp_ep(c))
+        };
+        let split = crate::layers::dflash_head::rank_split::requested()?
+            .filter(|_| split_ranks && !lightning_dspark_admitted);
+        if let Some(parts) = split {
+            let batch = crate::layers::dflash_head::rank_split::batch_requested()?;
+            let ctx = crate::layers::dflash_head::rank_split::ctx_requested()?;
+            let topk = crate::layers::dflash_head::rank_split::topk_requested()?;
+            head.enable_rank_split(parts, batch, ctx, topk, ranks, model.gpu_backend())?;
         }
+        if rank != 0 {
+            anyhow::ensure!(
+                split.is_some(),
+                "rank {rank} loaded a drafter it cannot use: ATLAS_GLM_DRAFT_TP \
+                 needs the generic DFlash drafter on the TP2 pair or the TP4 chain"
+            );
+            model.set_draft_assist(std::sync::Arc::new(head));
+            tracing::info!("DFlash drafter installed on rank {rank} to serve split proposes");
+        } else {
+            match lightning_dspark_policy {
+                Some(policy) => {
+                    model.set_lightning_dspark_proposer(std::sync::Arc::new(head), policy)?
+                }
+                None => model.set_dflash_proposer(std::sync::Arc::new(head)),
+            }
+            tracing::info!(
+                "{} drafter installed as the active proposer",
+                if lightning_dspark_admitted {
+                    "Lightning DSpark"
+                } else {
+                    "DFlash"
+                }
+            );
+        }
+    } else if dflash_weights_missing {
+        if lightning_dspark_admitted {
+            anyhow::bail!(
+                "Lightning DSpark admission passed but required drafter weights were not loaded"
+            );
+        }
+        tracing::warn!("Generic DFlash drafter store had no fc.weight — proposer not installed");
     }
 
     if let Some(ngram) = ngram_embed {

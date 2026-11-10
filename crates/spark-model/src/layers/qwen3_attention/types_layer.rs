@@ -155,10 +155,8 @@ pub struct Qwen3AttentionLayer {
     pub(super) o_fp8w_t: Option<crate::weight_map::Fp8WeightTransposed>,
     pub(super) w8a16_gemm_t_k: KernelHandle,
     pub(super) w8a16_gemm_t_pipelined_k: KernelHandle,
-    // Fast transposed FP8 prefill GEMM (128x128 / 8-warp / two-level FP32 fold).
-    // Consumes the SAME B_t[K,N] + block_scale_t[K/128,N/128] that
-    // transpose_fp8 / transpose_block_scale already produce. KernelHandle(0) on
-    // miss → fall back to w8a16_gemm_t.
+    // Fast transposed FP8 prefill GEMM (128x128 / 8-warp / two-level FP32 fold) on
+    // the B_t[K,N] + block_scale_t the transposes produce. 0 on miss → w8a16_gemm_t.
     pub(super) w8a16_gemm_t_m128_k: KernelHandle,
     // Large-M NON-transposed W8A16 prefill (gfx1151): reads native B[N,K]
     // k-contiguous + block_scale[N/128,K/128] directly — contiguous smem stores,
@@ -388,6 +386,8 @@ pub struct Qwen3AttentionLayer {
     pub(super) w4a16_gemm_t_m128_bf16_k: KernelHandle,
     /// NVFP4 q/k/v/o prefill on BF16 tensor cores (ATLAS_DENSE_PREFILL_BF16MMA).
     pub(super) bf16mma: crate::layers::ops::DenseBf16mma,
+    /// `[q, k, v, o]` native FP8 weights it serves too (K-uniform scale grid).
+    pub(super) fp8_bf16mma_ok: [bool; 4],
     /// MiniMax-only shadow kernel.
     pub(super) w4a16_gemm_t_m128_v2_k: KernelHandle,
     /// v3 variant: K_STEP=64.

@@ -1166,6 +1166,20 @@ impl BlockDiffusionDraftHead {
             scratch.stream_acc,
             g * h,
             stream,
-        )
+        )?;
+        // DSpine: the layer's code bridge writes each row its predecessor's
+        // message before the next layer's input norm reads the stream.
+        match scratch.dspine.as_ref() {
+            Some(sc) => self.dspine_bridge(
+                gpu,
+                args.layer_idx,
+                scratch.stream_buf,
+                g,
+                Self::dspine_single_blocks(scratch),
+                sc,
+                stream,
+            ),
+            None => Ok(()),
+        }
     }
 }

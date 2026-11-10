@@ -127,6 +127,9 @@ pub fn w4a16_gemv(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    if super::skinny_mma::try_w4a16_one(gpu, kernel, input, weight, output, (1, n, k), stream)? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([w4a16_gemv_grid_x(n), 1, 1])
         .block([256, 1, 1])
@@ -157,6 +160,9 @@ pub fn w4a16_gemv_batch2(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    if super::skinny_mma::try_w4a16_one(gpu, kernel, input, weight, output, (2, n, k), stream)? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -187,6 +193,9 @@ pub fn w4a16_gemv_batch3(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    if super::skinny_mma::try_w4a16_one(gpu, kernel, input, weight, output, (3, n, k), stream)? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -271,6 +280,12 @@ pub fn w4a16_gemv_batchm(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    // `ATLAS_SKINNY_MMA`: the scalar tiers' rows on the row-invariant
+    // tensor-core kernels (a tensor-core tier is not on its list), at up to
+    // `skinny_mma::MAX_ROWS` rows (the batch lever's wide arms).
+    if super::skinny_mma::try_w4a16_one(gpu, kernel, input, weight, output, (m, n, k), stream)? {
+        return Ok(());
+    }
     // Largest template is w4a16_gemv_batch32 (MAX_M=32). Refuse rather than
     // silently leaving rows above a selected template's bound unwritten.
     anyhow::ensure!(
@@ -280,6 +295,14 @@ pub fn w4a16_gemv_batchm(
     // Tensor-core tiers own 16 outputs per 8-warp CTA.
     let tc_rows = crate::layers::w4a16_gemv_tiers::tc_rows(kernel);
     let tc = tc_rows.is_some();
+    // `ATLAS_WIDE_GEMV`: the same rows' bytes in one wide launch (scalar
+    // tiers only: a tensor-core tier is other arithmetic).
+    if !tc
+        && let Some(wide) = crate::layers::ops::wide_gemv::active()
+        && wide.try_w4a16(gpu, input, weight, output, (m, n, k), n, stream)?
+    {
+        return Ok(());
+    }
     anyhow::ensure!(
         tc_rows.is_none_or(|rows| m <= rows && k.is_multiple_of(16)),
         "w4a16 tensor-core GEMV: m={m} k={k} exceeds {tc_rows:?} rows"

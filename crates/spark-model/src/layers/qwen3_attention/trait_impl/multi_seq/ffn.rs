@@ -149,7 +149,13 @@ impl Qwen3AttentionLayer {
                 (2 * h) as u32,
                 stream,
             )?;
-        } else if (4..=16).contains(&n) && !force_seq_ffn && self.ffn.can_forward_km(n as u32) {
+        } else if n >= 4
+            && !force_seq_ffn
+            && ((n <= 16 && self.ffn.can_forward_km(n as u32))
+                || self.ffn.rows_exact(n as u32, fwd))
+        {
+            // Under the batch lever (`model/exact_verify.rs`) also past 16
+            // rows: the row-exact arm instead of `forward_prefill` below.
             // MISSING K=4 ARM (2026-07-24): the ladder jumped from n==2/3
             // straight to the dense `forward_prefill` GEMM below, so K=4
             // verify ran the 16 attention layers' FFN through the MMQ/tile
@@ -174,7 +180,7 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
             let used = self.ffn.try_forward_km(normed2, n as u32, fwd, stream)?;
-            debug_assert!(used, "can_forward_km checked at branch entry");
+            debug_assert!(used, "can_forward_km / rows_exact checked at branch entry");
             let moe_out = fwd.buffers.moe_output();
             ops::residual_add(
                 fwd.gpu,

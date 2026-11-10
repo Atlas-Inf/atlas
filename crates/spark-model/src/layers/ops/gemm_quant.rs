@@ -283,6 +283,17 @@ pub fn w8a16_gemv(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    if super::skinny_mma::try_w8a16(
+        gpu,
+        kernel,
+        input,
+        &[((weight, row_scale), output, n)],
+        (1, k),
+        n,
+        stream,
+    )? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])

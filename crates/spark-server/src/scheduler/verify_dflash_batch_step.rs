@@ -121,12 +121,38 @@ pub(super) fn step_verify_dflash_batched(
     let verify_ms = t_verify.elapsed().as_secs_f64() * 1000.0;
     tracing::info!("DFLASH BATCHED verify n={n} R={} {:.1}ms", acc, verify_ms);
 
+    // A bit-exact batched verify (`Model::batch_verify_bit_exact`): every
+    // row is serial decode's logits, so, as the single-sequence exact verify
+    // does (`verify_dflash_step::exact_picks`), each sequence's rows are
+    // picked through serial decode's pipeline against the state serial decode
+    // would hold at each position (`verify_pick_prefix_with_pipeline`: the
+    // thinking budget, the watchdogs and penalties per row), never the raw
+    // argmax with the step-granular `accept_with_forced_think_end`.
+    let exact = super::verify_dflash_step::exact_picks(
+        dflash_verify_raw_argmax,
+        model.batch_verify_bit_exact(),
+    );
     let mut verifieds: Vec<Vec<u32>> = Vec::with_capacity(n);
     let mut accepts: Vec<usize> = Vec::with_capacity(n);
     for i in 0..n {
         let a = &mut batch[i];
         let drafts = &drafts_per_seq[i];
         let raw = &results[off[i]..off[i + 1]];
+        if exact {
+            let verified =
+                crate::scheduler::verify_pipeline_helper::verify_pick_prefix_with_pipeline(
+                    model, raw, drafts, a, verify_ctx, off[i],
+                );
+            let num_accepted = drafts
+                .iter()
+                .zip(&verified)
+                .take_while(|(d, v)| d == v)
+                .count()
+                .min(verified.len().saturating_sub(1));
+            accepts.push(num_accepted);
+            verifieds.push(verified);
+            continue;
+        }
         let mut verified: Vec<u32> = if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
             dflash_verify_raw_argmax,
             sched.levers.dflash_masked_verify,

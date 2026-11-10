@@ -325,6 +325,7 @@ fn the_table_carries_each_setting_once() {
         "ATLAS_GLM_INDEX_SPLIT_MIN_CTX",
         "ATLAS_GLM_INDEX_SPLIT_CHECK",
         "ATLAS_GLM_PC_EVICT",
+        "ATLAS_SSM_SNAP_LADDER",
         "ATLAS_GLM_PC_BRANCH",
         "ATLAS_GLM_PC_BRANCH_MIN",
         "ATLAS_GLM_PC_FINISH_LEAF",
@@ -387,6 +388,9 @@ fn the_table_carries_each_setting_once() {
         "ATLAS_GLM_FP4L_INPUT_SCALES",
         "ATLAS_GLM_FP4L_DECODE_A16",
         "ATLAS_GLM_LM_HEAD_MXFP8",
+        "ATLAS_EXACT_VERIFY",
+        "ATLAS_EXACT_VERIFY_CHECK",
+        "ATLAS_BATCH_EXACT_CHECK",
     ] {
         assert_eq!(
             names.iter().filter(|&&n| n == required).count(),

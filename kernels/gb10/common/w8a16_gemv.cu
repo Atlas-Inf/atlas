@@ -19,6 +19,7 @@
 // Grid: (ceil(N / 4), 1, 1)   Block: (256, 1, 1)
 
 #include <cuda_bf16.h>
+#include "atlas_pdl.cuh"
 
 #define BLOCK_SIZE 256
 #define N_PER_BLOCK 4
@@ -115,6 +116,7 @@ extern "C" __global__ void w8a16_gemv(
     unsigned int N,
     unsigned int K
 ) {
+    atlas_pdl_enter();
     const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
     const unsigned int local_out = threadIdx.x / threads_per_out;
     const unsigned int lane = threadIdx.x % threads_per_out;

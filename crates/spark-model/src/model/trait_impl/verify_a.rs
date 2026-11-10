@@ -261,6 +261,12 @@ impl TransformerModel {
     pub(super) fn checkpoint_ssm_states_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
         use crate::layer::SsmLayerState;
 
+        // Every verify defers its commit: the live state is its own
+        // checkpoint until the verdict commits (`ssm_pool::defer_only`).
+        if self.ssm_pool.defer_only() {
+            return Ok(());
+        }
+
         let stream = self.gpu.default_stream();
         let mut h_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
         let mut conv_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
@@ -403,6 +409,14 @@ impl TransformerModel {
                 let conv_bytes = self.config.ssm_conv_state_bytes();
 
                 if num_accepted == 0 {
+                    // A deferred verify left the state as it was; any other
+                    // needs the checkpoint `defer_only` pools do not hold.
+                    anyhow::ensure!(
+                        ssm.gdn_commit_pending || ssm.h_state_checkpoint.is_some(),
+                        "rollback_ssm_states: full reject of a stored verify at layer {i} \
+                         with no checkpoint (deferred-commit pools; ATLAS_VERIFY_POOL_STORE=1 \
+                         allocates them)"
+                    );
                     ssm.gdn_commit_pending = false;
                     // Restore to pre-verification checkpoint
                     if let Some(ckpt) = ssm.h_state_checkpoint {

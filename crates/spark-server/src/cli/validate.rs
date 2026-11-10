@@ -134,15 +134,11 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
     // `--ssm-h-dtype f16` by SILENTLY ignoring an explicit `--exact-verify`
     // would ship the very divergence the operator just opted out of — the
     // exact class of combination this validator exists to refuse.
-    if args.exact_verify == Some(true) && h_f16 {
-        v.push(Violation::new(
-            "--exact-verify together with --ssm-h-dtype f16",
-            "the exact MTP-verify chain (issue #435) runs FP32-reader kernels and must \
-             never read the FP16 h-state pool, so with f16 the exact request would be \
-             silently dropped and spec-on output would NOT equal spec-off",
-            "drop --ssm-h-dtype f16 (f32 is the default), or drop --exact-verify",
-        ));
-    }
+    v.extend(exact_verify_h_f16(
+        args.exact_verify,
+        spark_model::model::exact_verify::requested(),
+        h_f16,
+    ));
     check_enum(
         &mut v,
         "--mtp-quantization",
@@ -395,6 +391,34 @@ fn format_violations(v: &[Violation]) -> String {
         ));
     }
     out
+}
+
+/// The exact-verify requests beside an FP16 h-state: `--exact-verify` (the
+/// GDN chain) and `ATLAS_EXACT_VERIFY=1` (the dense qwen3_5 verify, which
+/// runs that chain). Pure: the caller reads the environment.
+fn exact_verify_h_f16(flag: Option<bool>, env_lever: bool, h_f16: bool) -> Vec<Violation> {
+    let mut v = Vec::new();
+    if !h_f16 {
+        return v;
+    }
+    let why = "the exact MTP-verify chain (issue #435) runs FP32-reader kernels and must \
+               never read the FP16 h-state pool, so with f16 the exact request would be \
+               silently dropped and spec-on output would NOT equal spec-off";
+    if flag == Some(true) {
+        v.push(Violation::new(
+            "--exact-verify together with --ssm-h-dtype f16",
+            why,
+            "drop --ssm-h-dtype f16 (f32 is the default), or drop --exact-verify",
+        ));
+    }
+    if env_lever {
+        v.push(Violation::new(
+            "ATLAS_EXACT_VERIFY=1 together with --ssm-h-dtype f16",
+            why,
+            "drop --ssm-h-dtype f16 (f32 is the default), or unset ATLAS_EXACT_VERIFY",
+        ));
+    }
+    v
 }
 
 #[cfg(test)]

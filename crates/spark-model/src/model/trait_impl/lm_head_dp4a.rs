@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! W4A8 DP4A arm for the K=4 verify LM head.
+//! W4A8 DP4A arm for the K=4 verify LM head, and the head's batched-GEMV
+//! tier pick.
 //!
 //! Split out of `impl_a3.rs` to keep that file inside the 500-LoC cap.
 //!
@@ -80,5 +81,17 @@ impl TransformerModel {
             stream,
         )?;
         Ok(true)
+    }
+
+    /// The NVFP4 head's batched-GEMV tier for the K=3..8 verify rows. Under
+    /// an exact verify (`ModelLevers::exact_verify`) the scalar template
+    /// only, whose row `r` is serial decode's `w4a16_gemv`; otherwise the
+    /// narrowest tier, tensor-core when opted in.
+    pub(crate) fn lm_head_batchm_kernel(&self, rows: u32) -> spark_runtime::gpu::KernelHandle {
+        if self.levers.exact_verify {
+            self.w4a16_batchm.scalar_kernel(rows)
+        } else {
+            self.w4a16_batchm.kernel(rows)
+        }
     }
 }

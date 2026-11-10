@@ -5,7 +5,9 @@ use anyhow::Result;
 use super::while_on;
 use crate::layers::dflash_head::ConvTwinKind;
 use crate::layers::{self, ops};
-use crate::model::{graph_flags, qwen4exp_batch_fast, qwen4exp_exact_verify, qwen4exp_mtp_depth};
+use crate::model::{
+    exact_verify, graph_flags, qwen4exp_batch_fast, qwen4exp_exact_verify, qwen4exp_mtp_depth,
+};
 
 /// The table's trailing entries, split for the 500-LoC cap. The caller
 /// chains them after [`super::SETTINGS`], so the gathered order is
@@ -91,6 +93,18 @@ pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_EXACT_VERIFY_CHECK", || {
         Ok(qwen4exp_exact_verify::check_requested() as u64)
     }),
+    // The dense (qwen3_5) exact verify: which verify arms run, the MTP depth
+    // ceiling, and the check's serial steps (their collectives).
+    (
+        "ATLAS_EXACT_VERIFY",
+        || Ok(exact_verify::requested() as u64),
+    ),
+    ("ATLAS_EXACT_VERIFY_CHECK", || {
+        Ok(exact_verify::check_requested() as u64)
+    }),
+    ("ATLAS_BATCH_EXACT_CHECK", || {
+        Ok(exact_verify::batch_check_requested() as u64)
+    }),
     // The qwen4_exp verify width ceiling: the K the head dispatches and the
     // worker mirrors.
     ("ATLAS_QWEN4EXP_MTP_DEPTH", || {
@@ -161,4 +175,15 @@ pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
         Ok(graph_flags::dflash_debug_no_graph() as u64)
     }),
     ("ATLAS_K2_DIAG", || Ok(graph_flags::k2_diag() as u64)),
+    // The restore points a full snapshot pool keeps behind each save, under
+    // the session-aware victim only (see ATLAS_SNAP_EVICT_ALPHA).
+    ("ATLAS_SSM_SNAP_LADDER", || {
+        use spark_runtime::radix_tree as rt;
+        let unused = rt::glm_pc_evict_enabled() || rt::snap_evict_legacy();
+        Ok(if unused {
+            0
+        } else {
+            rt::ssm_snap_ladder_base().unwrap_or(0) as u64
+        })
+    }),
 ];
