@@ -12,6 +12,7 @@ use atlas_core::config::ModelConfig;
 mod accessors;
 pub mod decode_meta;
 mod glm_latent;
+mod lend;
 mod release;
 mod sizes;
 mod sizes_q12;
@@ -152,6 +153,11 @@ pub struct BufferArena {
     verify_masks: DevicePtr,
     /// Bytes of `verify_masks` (not an allocation).
     verify_masks_bytes: usize,
+    /// The one allocation behind the lendable members (`lend`), and its bytes.
+    lend_base: DevicePtr,
+    lend_bytes: usize,
+    /// Bytes at the span's start that `zero_all` never zeroes (`lend`).
+    lend_unzeroed: usize,
     /// Maximum batch tokens this arena was sized for.
     max_batch_tokens: usize,
     /// Rows a pass may have written since the arena was last all zero
@@ -186,23 +192,36 @@ impl BufferArena {
 
         let hidden_states = gpu.alloc(sizes.hidden_states)?;
         let residual = gpu.alloc(sizes.residual)?;
-        let norm_output = gpu.alloc(sizes.norm_output)?;
-        let qkv_output = gpu.alloc(sizes.qkv_output)?;
-        let attn_output = gpu.alloc(sizes.attn_output)?;
+        // Per-pass prefill scratch, carved from one allocation the arena can
+        // lend between passes (`lend`): see that module for the contract.
+        // In `BufferSizes::lent_sizes` order.
+        let lent_sizes = sizes.lent_sizes();
+        let (lend_base, lend_bytes, lent) = lend::carve(gpu, &lent_sizes)?;
+        let lend_unzeroed = lend::layout(&lent_sizes[..lend::UNZEROED]).1;
+        let [
+            fp8_act,
+            fp8_act_scale,
+            moe_router_in_f32,
+            gate_logits_f32,
+            qkv_output,
+            attn_output,
+            norm_output,
+            moe_output,
+            ssm_qkvz,
+            ssm_ba,
+            ssm_deinterleaved,
+            ssm_conv_out_f32,
+            expert_gate_out,
+            expert_up_out,
+            expert_down_out,
+        ] = lent[..]
+        else {
+            unreachable!("lend::carve returns one pointer per size")
+        };
         let gate_logits = gpu.alloc(sizes.gate_logits)?;
-        let gate_logits_f32 = gpu.alloc(sizes.gate_logits_f32)?;
-        let moe_router_in_f32 = gpu.alloc(sizes.moe_router_in_f32)?;
-        let moe_output = gpu.alloc(sizes.moe_output)?;
         let logits = gpu.alloc(sizes.logits)?;
-        let ssm_qkvz = gpu.alloc(sizes.ssm_qkvz)?;
-        let ssm_ba = gpu.alloc(sizes.ssm_ba)?;
-        let ssm_deinterleaved = gpu.alloc(sizes.ssm_deinterleaved)?;
         let ssm_gates = gpu.alloc(sizes.ssm_gates)?;
-        let ssm_conv_out_f32 = gpu.alloc(sizes.ssm_conv_out_f32)?;
         let scratch = gpu.alloc(sizes.scratch)?;
-        let expert_gate_out = gpu.alloc(sizes.expert_gate_out)?;
-        let expert_up_out = gpu.alloc(sizes.expert_up_out)?;
-        let expert_down_out = gpu.alloc(sizes.expert_down_out)?;
         let splitk_workspace = gpu.alloc(sizes.splitk_workspace)?;
         let o_latent = gpu.alloc(sizes.o_latent)?;
         // Zero-filled "weight" for unweighted RMSNorm under the offset-from-1
@@ -245,8 +264,6 @@ impl BufferArena {
         } else {
             DevicePtr::NULL
         };
-        let fp8_act = gpu.alloc(sizes.fp8_act)?;
-        let fp8_act_scale = gpu.alloc(sizes.fp8_act_scale)?;
         // Q2_0 prefill dequant scratch. 0 → NULL unless ATLAS_GGUF_NATIVE_Q2.
         let q2_dequant_scratch = if sizes.q2_dequant_scratch > 0 {
             gpu.alloc(sizes.q2_dequant_scratch)?
@@ -341,6 +358,9 @@ impl BufferArena {
             glm_latent_tokens: 0,
             verify_masks: DevicePtr::NULL,
             verify_masks_bytes: 0,
+            lend_base,
+            lend_bytes,
+            lend_unzeroed,
             max_batch_tokens,
             dirty_rows: std::sync::atomic::AtomicUsize::new(usize::MAX),
             decode_meta,

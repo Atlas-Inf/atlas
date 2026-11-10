@@ -285,7 +285,44 @@ impl VisionEncoder {
         capacity: GlmCapacity,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
-        let glm = GlmVisionEncoder::new(weights, config, capacity, gpu)?;
+        Self::wrap_glm(
+            GlmVisionEncoder::new(weights, config, capacity, gpu)?,
+            config,
+        )
+    }
+
+    /// The GLM tower without scratch of its own ([`GlmVisionEncoder::new_lent`]).
+    pub(crate) fn new_glm_lent(
+        weights: GlmVisionWeights,
+        config: &atlas_core::config::VisionConfig,
+        capacity: GlmCapacity,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Self> {
+        Self::wrap_glm(
+            GlmVisionEncoder::new_lent(weights, config, capacity, gpu)?,
+            config,
+        )
+    }
+
+    /// Bytes the GLM tower borrows per encode (0 for any other tower).
+    pub fn lent_scratch_bytes(&self) -> usize {
+        self.glm.as_ref().map_or(0, |glm| glm.lent_bytes())
+    }
+
+    /// See [`GlmVisionEncoder::attach_lent_scratch`].
+    pub fn attach_lent_scratch(&mut self, base: DevicePtr, borrowed: bool) -> Result<()> {
+        match self.glm.as_mut() {
+            Some(glm) => glm.attach_lent_scratch(base, borrowed),
+            None => anyhow::bail!("only the GLM tower takes lent scratch"),
+        }
+    }
+
+    /// Whether each encode borrows the model arena's lendable span.
+    pub fn borrows_arena(&self) -> bool {
+        self.glm.as_ref().is_some_and(|glm| glm.borrows_arena())
+    }
+
+    fn wrap_glm(glm: GlmVisionEncoder, config: &atlas_core::config::VisionConfig) -> Result<Self> {
         let glm_buf_out = glm.buf_out;
         let glm_p_max = glm.p_max;
         Ok(Self {

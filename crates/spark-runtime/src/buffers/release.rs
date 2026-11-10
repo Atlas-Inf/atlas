@@ -73,29 +73,19 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
             glm_latent_tokens: _,
             verify_masks,
             verify_masks_bytes: _,
+            lend_base,
+            lend_bytes,
+            lend_unzeroed,
         } = self;
         // Every pointer, then NULL it: `release` must be idempotent because a
         // `Drop` backstop may call it again, and `free` already no-ops on NULL.
         let owned = [
             *hidden_states,
             *residual,
-            *norm_output,
-            *qkv_output,
-            *attn_output,
             *gate_logits,
-            *gate_logits_f32,
-            *moe_router_in_f32,
-            *moe_output,
             *logits,
-            *ssm_qkvz,
-            *ssm_ba,
-            *ssm_deinterleaved,
             *ssm_gates,
-            *ssm_conv_out_f32,
             *scratch,
-            *expert_gate_out,
-            *expert_up_out,
-            *expert_down_out,
             *splitk_workspace,
             *o_latent,
             *norm_unit_w,
@@ -110,8 +100,6 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
             *ffn_act_q8,
             *ffn_act_a,
             *ffn_act_scale,
-            *fp8_act,
-            *fp8_act_scale,
             *lora_xa,
             *lora_delta,
             *lora_hact,
@@ -121,6 +109,8 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
             *glm_latent_bf16,
             *glm_identity_table,
             *verify_masks,
+            // The lendable members are views into this one allocation.
+            *lend_base,
         ];
         let mut first_error = None;
         for ptr in owned {
@@ -174,6 +164,9 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
         *glm_latent_bf16 = DevicePtr::NULL;
         *glm_identity_table = DevicePtr::NULL;
         *verify_masks = DevicePtr::NULL;
+        *lend_base = DevicePtr::NULL;
+        *lend_bytes = 0;
+        *lend_unzeroed = 0;
         match first_error {
             Some(e) => Err(e),
             None => Ok(()),

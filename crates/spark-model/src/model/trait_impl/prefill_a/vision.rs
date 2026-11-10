@@ -15,6 +15,28 @@ use super::super::super::types::TransformerModel;
 use crate::traits::SequenceState;
 
 impl TransformerModel {
+    /// Encode `items` on `stream`. A tower that borrows the arena's lendable
+    /// span gets it around the encode: every earlier pass has finished, and
+    /// the span is zeroed and the device idle again before the next pass.
+    pub(in crate::model) fn vision_forward_items(
+        &self,
+        ve: &crate::layers::VisionTower,
+        items: &[&crate::VisionItem],
+        stream: u64,
+    ) -> Result<Vec<(usize, usize, usize)>> {
+        let gpu = self.gpu.as_ref();
+        if !ve.borrows_arena() {
+            return ve.forward_items(items, gpu, stream);
+        }
+        let bytes = ve.lent_scratch_bytes();
+        self.buffers.lend(bytes, gpu)?;
+        let encoded = ve.forward_items(items, gpu, stream);
+        let returned = self.buffers.return_lent(bytes, gpu, stream);
+        let encoded = encoded?;
+        returned?;
+        Ok(encoded)
+    }
+
     pub(in crate::model) fn prepare_vision_embed_dispatch(
         &self,
         seq: &mut SequenceState,
@@ -41,7 +63,7 @@ impl TransformerModel {
             item_refs.push(it);
         }
         let _vt0 = std::time::Instant::now();
-        let per_image = ve.forward_items(&item_refs, self.gpu.as_ref(), stream)?;
+        let per_image = self.vision_forward_items(ve, &item_refs, stream)?;
         if std::env::var("ATLAS_VISION_TIMING").is_ok() {
             self.gpu.synchronize(stream).ok();
             tracing::info!(
@@ -121,7 +143,7 @@ impl TransformerModel {
             group_cursor += group_count;
             per_req_groups.push(groups);
         }
-        let per_image = ve.forward_items(&flat_items, self.gpu.as_ref(), stream)?;
+        let per_image = self.vision_forward_items(ve, &flat_items, stream)?;
         let total_merged: usize = per_image.iter().map(|(_, _, mp)| *mp).sum();
         // Per-request slice descriptors (request order matches the flatten order,
         // so row offsets accumulate Σ merged_p of earlier requests).
