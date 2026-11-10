@@ -10,6 +10,7 @@
 # Why: the 11-10 runner 3-way puts Atlas pp at 740 / 344 tok/s (depth 0 / 16k) vs Halogen 1658 / 1471.
 set -euo pipefail
 for kv in "$@"; do [[ "$kv" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9_./:,+-]*$ ]] && export "$kv"; done
+OUT=${DEVLAB_OUT:-$PWD/devlab-out}; mkdir -p "$OUT"; RES="$OUT/RESULTS.txt"
 HERE=$(cd "$(dirname "$0")" && pwd); . "$HERE/lib_engines.sh"
 [ -x target/release/spark ] || { log "no target/release/spark (run with job=bench)"; exit 1; }
 command -v rocprofv3 >/dev/null || PATH=$PATH:/opt/rocm/bin; command -v rocprofv3 >/dev/null || { log "no rocprofv3"; exit 1; }
