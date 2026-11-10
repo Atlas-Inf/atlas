@@ -542,6 +542,38 @@ impl Qwen3AttentionLayer {
                 // Gemma-4 sliding layers attend only to the last `window_size`
                 // KV positions; full layers (and all non-Gemma-4 models) pass 0.
                 let sliding = self.sliding_window.unwrap_or(0);
+                // ATLAS_ATTN_SHARED_SCAN: one scan of each KV head for the
+                // rows that share its blocks. The test is the layer's
+                // constants only, so serial decode and every verify width
+                // take the same kernel.
+                if sliding == 0
+                    && ops::attn_shared_scan_on(
+                        gpu,
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        block_size,
+                    )
+                {
+                    return ops::attn_shared_scan_bf16(
+                        gpu,
+                        q,
+                        kv_cache.k_pool_ptr(self.attn_layer_idx),
+                        kv_cache.v_pool_ptr(self.attn_layer_idx),
+                        output,
+                        block_table,
+                        seq_lens,
+                        max_blocks_per_seq,
+                        num_seqs,
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        block_size,
+                        inv_sqrt_d,
+                        q_stride,
+                        stream,
+                    );
+                }
                 ops::paged_decode_attn_bf16(
                     gpu,
                     kernel,
