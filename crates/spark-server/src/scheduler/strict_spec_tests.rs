@@ -5,7 +5,7 @@
 //! drafts before it, the bonus row masked, trimming at the first rejected
 //! draft or `-1` pad, an exact rollback, and the `</think>` boundary.
 
-use super::{StrictVerify, prepare, row_masks, width_word};
+use super::{StrictVerify, enabled, prepare, row_masks, width_word};
 use crate::grammar::GrammarState;
 use crate::scheduler::test_support::{
     GRAMMAR_VOCAB as VOCAB, THINK_END, THINK_START, grammar_engine, test_seq,
@@ -205,12 +205,46 @@ fn a_stop_token_draft_holds_the_state_and_a_finished_matcher_constrains_nothing(
     );
 }
 
+#[test]
+fn enabled_arms_by_verify_capability() {
+    use crate::scheduler::cancel_test_model::{TestModel, VerifyScript};
+    use crate::scheduler::levers::SchedLevers;
+    use std::sync::Arc;
+
+    let model = |verify: Option<Arc<VerifyScript>>| TestModel {
+        tokens: vec![],
+        host_logits: false,
+        cancel_after_sampling: None,
+        cancel_after_row_commit: None,
+        verify,
+    };
+    // `verify_logits_argmax_only()` is `verify.is_some()` on the test model.
+    let argmax_only = model(Some(Arc::new(VerifyScript::default())));
+    let full_logits = model(None);
+
+    let mut levers = SchedLevers::defaults();
+    // The GLM arm masks rows on device: argmax-only head, DFlash lane only.
+    levers.glm_strict_spec = true;
+    assert!(enabled(&levers, &argmax_only, true));
+    assert!(!enabled(&levers, &argmax_only, false));
+    assert!(!enabled(&levers, &full_logits, true));
+    // The full-logits arm needs no device masks: any speculation lane.
+    levers.glm_strict_spec = false;
+    levers.strict_spec = true;
+    assert!(enabled(&levers, &full_logits, true));
+    assert!(enabled(&levers, &full_logits, false));
+    assert!(!enabled(&levers, &argmax_only, true));
+    levers.strict_spec = false;
+    assert!(!enabled(&levers, &full_logits, true));
+}
+
 mod step {
     use super::*;
     use crate::scheduler::cancel_test_model::{TestModel, VerifyScript};
     use crate::scheduler::sched_ctx::SchedCtx;
     use crate::scheduler::verify_dflash_step::step_verify_dflash;
     use spark_model::model::MASKED_VERIFY;
+    use spark_model::traits::Model;
     use std::sync::Arc;
 
     const LAST: u32 = b'\n' as u32;
@@ -285,5 +319,111 @@ mod step {
         assert_eq!(log[2], format!("cmd {:#x}", 2 | MASKED_VERIFY), "width 2");
         assert_eq!(a.output_tokens, bytes("{"));
         assert_eq!(format!("{:?}", a.spec_adapt.survival), before);
+    }
+
+    /// `ATLAS_STRICT_SPEC` arm: a verify with full logits masks every row in
+    /// the host pick pipeline, so the step sends no device masks, sets no
+    /// `MASKED_VERIFY` width flag and does not trim drafts — an illegal draft
+    /// rides the verify and is rejected at the accept prefix instead.
+    #[test]
+    fn a_full_logits_strict_verify_skips_the_device_mask_walk() {
+        use crate::scheduler::cancel_test_model::SCRIPT;
+
+        // `{"bridge":"` is a legal prefix (the raw literal ends at the ':'
+        // — its closing `"` is the delimiter); the trailing SOH (token 1) is
+        // not legal inside the JSON string, so the pipeline must reject it.
+        let mut drafts = bytes(r#"{"bridge":"#);
+        drafts.push(b'"' as u32);
+        drafts.push(1);
+        let rows = drafts.len() + 1;
+        // Scripted logits: row i argmaxes draft i, except the row predicting
+        // the illegal draft (index drafts.len()-1), where it loses to 'x'
+        // (the mask drops token 1 outright). The last row is the bonus slot.
+        let mut script_rows: Vec<Vec<f32>> = (0..rows)
+            .map(|i| {
+                let mut row = vec![0.0f32; VOCAB];
+                let t = match i.cmp(&(drafts.len() - 1)) {
+                    std::cmp::Ordering::Less => drafts[i] as usize,
+                    std::cmp::Ordering::Equal => b'x' as usize,
+                    std::cmp::Ordering::Greater => b'y' as usize,
+                };
+                row[t] = 10.0;
+                if i == drafts.len() - 1 {
+                    row[1] = 50.0; // illegal decoy: masked to -inf
+                }
+                row
+            })
+            .collect();
+        SCRIPT.with(|s| {
+            *s.borrow_mut() = Some(crate::scheduler::cancel_test_model::Script {
+                rows: std::mem::take(&mut script_rows),
+                cursor: 0,
+            })
+        });
+        let mut picks = drafts.clone();
+        picks.extend([b'x' as u32, b'y' as u32]);
+        let script = Arc::new(VerifyScript {
+            picks,
+            full_logits: true,
+            ..Default::default()
+        });
+        let model = TestModel {
+            tokens: vec![],
+            host_logits: false,
+            cancel_after_sampling: None,
+            cancel_after_row_commit: None,
+            verify: Some(script.clone()),
+        };
+        assert!(!model.verify_logits_argmax_only());
+        let (mut a, _rx) = test_seq(vec![], 50, None, 8);
+        a.finished = false;
+        a.think_ended = true;
+        a.last_token = LAST;
+        a.tool_call_end_token = None;
+        // Neutral penalties: the repeated '"' in the JSON prefix would
+        // otherwise be penalised and flip a scripted argmax, exactly as it
+        // would for serial decode.
+        a.repetition_penalty = 1.0;
+        a.frequency_penalty = 0.0;
+        a.presence_penalty = 0.0;
+        a.dry_multiplier = 0.0;
+        a.grammar_state = Some(strict());
+        let sched = SchedCtx::for_test();
+        let ctx = sched.verify_logits_ctx(Some(THINK_END), Some(THINK_START), None, None);
+        step_verify_dflash(
+            &model,
+            &mut a,
+            &sched,
+            &drafts,
+            &[],
+            drafts.len(),
+            &ctx,
+            true,
+        );
+        SCRIPT.with(|s| *s.borrow_mut() = None);
+        let log = script.log.lock().unwrap().clone();
+        assert!(
+            !log.iter()
+                .any(|e| e.starts_with("upload") || e.starts_with("send")),
+            "full-logits strict verify must not stage device masks: {log:?}"
+        );
+        assert!(
+            log.contains(&format!("cmd {:#x}", rows as u32)),
+            "width word carries no MASKED_VERIFY flag: {log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|e| e.starts_with("tokens [") && e.ends_with(", 1]")),
+            "the illegal draft rode the verify untrimmed: {log:?}"
+        );
+        assert!(a.engine_error.is_none(), "{:?}", a.engine_error);
+        assert_eq!(
+            a.output_tokens,
+            bytes(r#"{"bridge":"x"#),
+            "legal drafts accepted, the masked bonus corrects the illegal one"
+        );
+        // The matcher advanced exactly by what was emitted.
+        let mut gs = a.grammar_state.unwrap();
+        assert!(gs.accept_token(b'y' as u32));
     }
 }
