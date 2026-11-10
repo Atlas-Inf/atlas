@@ -34,7 +34,13 @@ pub(super) fn load_layers(
         stream,
     };
     let lerp_k = gpu.kernel("value_residual", "value_residual_lerp")?;
-    let wide_gemv_k = gpu.kernel("bf16_gemv_m32", "bf16_gemv_m32")?;
+    // strix-hip ships no `bf16_gemv_m32` (cp.async m32 GEMV): handle 0 sends
+    // the verify-row projections to the BF16 GEMM fallback.
+    let wide_gemv_k = if cfg!(atlas_hip) {
+        crate::layers::try_kernel(gpu, "bf16_gemv_m32", "bf16_gemv_m32")
+    } else {
+        gpu.kernel("bf16_gemv_m32", "bf16_gemv_m32")?
+    };
     let verify_attn_k = gpu.kernel("ricursive_verify_attn", "ricursive_verify_attn")?;
     let mut layers: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
@@ -78,21 +84,28 @@ fn load_ffn(
         gate_up: f32_scalar(gpu, gate_proj.input_scale)?.max(f32_scalar(gpu, up_proj.input_scale)?),
         down: f32_scalar(gpu, down_proj.input_scale)?,
     };
+    // gfx1151 has no FP4 MMA: multi-row passes run W4A16 on transposed twins
+    // (the m128 GEMM) instead of W4A4 on the native layout.
+    let hip = cfg!(atlas_hip);
+    let twin = |w: &QuantizedWeight, n, k| -> Result<Option<QuantizedWeight>> {
+        Ok(if hip { Some(w.transpose_for_gemm(gpu, n, k)?) } else { None })
+    };
     let weights = DenseFfnWeights {
+        gate_proj_t: twin(&gate_proj, inter, h)?,
+        up_proj_t: twin(&up_proj, inter, h)?,
+        down_proj_t: twin(&down_proj, h, inter)?,
         gate_proj,
         up_proj,
         down_proj,
-        // Multi-row passes run W4A4 on the native layout: no transposed copies.
-        gate_proj_t: None,
-        up_proj_t: None,
-        down_proj_t: None,
     };
     let mut layer =
         DenseFfnLayer::new_with_activation(weights, FfnActivation::SiLU, gpu, "ricursive")?;
     // Target-only clamped SwiGLU; the drafter keeps the unclamped common kernel.
     layer.set_act_mul(gpu.kernel("ricursive_swiglu", "silu_mul_clamp20")?);
-    let limit = atlas_core::config::RICURSIVE_FFN_CLAMP as f32;
-    layer.enable_w4a4_rows(gpu, input_scales, limit, [h, inter])?;
+    if !hip {
+        let limit = atlas_core::config::RICURSIVE_FFN_CLAMP as f32;
+        layer.enable_w4a4_rows(gpu, input_scales, limit, [h, inter])?;
+    }
     Ok(FfnComponent::Dense(layer))
 }
 

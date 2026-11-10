@@ -68,7 +68,7 @@ impl Qwen3AttentionLayer {
     pub(crate) fn wide_bf16_gemv(&self, rows: usize) -> Option<KernelHandle> {
         self.value_residual
             .map(|vr| vr.wide_gemv_k)
-            .filter(|_| rows as u32 <= crate::layers::ops::BF16_GEMV_MAX_M)
+            .filter(|k| k.0 != 0 && rows as u32 <= crate::layers::ops::BF16_GEMV_MAX_M)
     }
 
     /// Every V path blends through [`Self::value_residual_input`]; the
