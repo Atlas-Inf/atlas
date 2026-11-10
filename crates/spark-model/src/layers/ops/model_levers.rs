@@ -65,6 +65,10 @@ pub struct ModelLevers {
     pub decode_ffn_via_gemm: bool,
     /// Small-M FFN GEMM tile shape. Ships ON; `ATLAS_FFN_SMALLM=0` opts out.
     pub ffn_small_m: bool,
+    /// Small-M W4A16 row-GEMV for M <= 17 FFN passes (DFlash verify) on
+    /// targets that ship it (strix-hip). Numerics-changing (fp32 summation
+    /// order), so opt-in: `ATLAS_FFN_ROWGEMV=1`.
+    pub ffn_rowgemv: bool,
     /// FP4 holo layout for the MoE down projection.
     pub holo_moe_down_fp4: bool,
     /// FP4 holo layout for the MoE gate/up projections.
@@ -232,6 +236,7 @@ impl ModelLevers {
             gdn_wyn: opt_out("ATLAS_GDN_WYN"),
             gdn_deferred_commit: opt_out("ATLAS_GDN_DEFERRED_COMMIT"),
             ffn_small_m: opt_out("ATLAS_FFN_SMALLM"),
+            ffn_rowgemv: opt_in("ATLAS_FFN_ROWGEMV"),
             gemv_sw: super::gemv_sw::gemv_sw_from(
                 std::env::var("ATLAS_NO_GEMV_SW").ok().as_deref(),
             ),
