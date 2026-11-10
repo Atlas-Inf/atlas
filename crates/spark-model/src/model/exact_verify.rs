@@ -16,7 +16,7 @@
 //! `ATLAS_DFLASH_SPEC_THINK` needed): lossless at T=0, and exact in
 //! distribution at T>0 because the rows are accepted by sequential
 //! sampling. With `ATLAS_SKINNY_MMA=1` as well the batched multi-sequence
-//! decode and verify are exact too ([`batch_lever`], the section below), so
+//! decode and verify are exact too (`batch_lever`, the section below), so
 //! `batch_verify_bit_exact` holds and a concurrent batch speculates inside
 //! `<think>`; without it only ONE active sequence does. The MTP depth is capped at
 //! [`MAX_DRAFTS`]; beside a DFlash drafter γ is capped at
@@ -67,7 +67,7 @@
 //! A batched multi-sequence decode (`decode_a2`, one row a sequence) or
 //! verify (`verify_e`, `Σ ks` rows, DFlash or MTP) runs the same layer bodies
 //! as the single-sequence verify above at a wider row count, up to
-//! [`BATCH_MAX_ROWS`]. Under [`batch_lever`] (`ModelLevers::dense_batch_exact`)
+//! [`BATCH_MAX_ROWS`]. Under `batch_lever` (`ModelLevers::dense_batch_exact`)
 //! every op whose arithmetic was keyed on the row count takes, at every
 //! width, the arm whose rows are serial decode's bytes:
 //!

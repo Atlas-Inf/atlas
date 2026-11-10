@@ -23,7 +23,7 @@
 //! target) and its shape and alignment hold; otherwise the original launches
 //! are issued unchanged. The dense 27B's SiLU-gated twin of the GDN group is
 //! `qwen38_decode_fuse` (`ATLAS_QWEN38_DECODE_FUSE`), which launches through
-//! [`launch_gdn_fused`]. Exact, and the collectives are unchanged, so the
+//! `launch_gdn_fused`. Exact, and the collectives are unchanged, so the
 //! ranks need not agree on it (no startup-parity entry).
 
 use anyhow::{Result, anyhow, bail, ensure};

@@ -10,10 +10,11 @@ use spark_runtime::gpu::{DevicePtr, KernelHandle};
 #[test]
 fn hip_kernel_is_the_unmodified_upstream_implementation() {
     let source = include_bytes!("../../../kernels/strix-hip/common/dflash2_candidate_selector.cu");
-    // Exact blob from Atlas e29809db; changing the AMD algorithm needs its own qualification.
+    // Exact blob as qualified in #329 (exact round top-K for phase 1); changing the AMD
+    // algorithm needs its own qualification.
     assert_eq!(
         format!("{:x}", Sha256::digest(source)),
-        "89ba53435de29dabb1bebe3428a2eece9348e2a9c7a6e07b3efbb6e7ce29a9d1"
+        "315dab4d2049d6409353f2014edd2577a99975f23a7b2986c03c22a6b07e56a3"
     );
 }
 
