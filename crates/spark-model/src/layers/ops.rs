@@ -282,6 +282,8 @@ mod qwen4exp_w4_rows;
 mod qwen4exp_w4_wide;
 #[path = "ops/qwen4exp_wide_rows.rs"]
 mod qwen4exp_wide_rows;
+#[path = "ops/shared_scan.rs"]
+mod shared_scan;
 #[path = "ops/tree_verify.rs"]
 mod tree_verify;
 // Shared harness for the oracle-parity tests, split for the 500-LoC cap.
@@ -426,6 +428,7 @@ pub use qwen4exp_w4_wide::*;
 pub use qwen4exp_wide_rows::*;
 pub use rank_join::{rank_join_bf16, rank_join_kernel};
 pub use sampling::*;
+pub use shared_scan::*;
 pub use ssm_gdn_a::*;
 pub use ssm_gdn_a2::*;
 pub use ssm_gdn_a3::*;

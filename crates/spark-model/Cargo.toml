@@ -286,6 +286,10 @@ name = "gdn_verify_tree_check"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "attn_shared_scan_check"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "dspine_bridge_check"
 required-features = ["cuda", "gpu-examples"]
 

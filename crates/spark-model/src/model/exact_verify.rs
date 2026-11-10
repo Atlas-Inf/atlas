@@ -55,6 +55,15 @@
 //! reads FP32), `ATLAS_DECODE_FFN_VIA_GEMM` and `ATLAS_NO_DECODE_SPLIT_SILU`
 //! (serial decode's FFN would then take another arithmetic).
 //!
+//! `ATLAS_ATTN_SHARED_SCAN=1` (`layers/ops/shared_scan.rs`) does the same for
+//! the attention core over a BF16 KV cache: serial decode and every verify
+//! width run `attn_shared_scan`, which reads a KV head's keys and values once
+//! for the rows that share its blocks and scores them on tensor cores. The
+//! positions are cut by the row's own length and every sum is per query, so a
+//! row's bytes do not depend on the launch's rows
+//! (`examples/attn_shared_scan_check.rs`); serial decode's own attention
+//! arithmetic changes with the switch.
+//!
 //! The DFlash path's target-side extras do not touch the target's
 //! arithmetic: the hidden-row capture for the drafter's context
 //! (`kgamma_dflash_capture`, `try_dflash_capture` in serial decode) only
