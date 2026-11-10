@@ -397,11 +397,16 @@ pub(super) fn parse_dflash(model_dir: &std::path::Path) -> Option<DflashRaw> {
                 .collect()
         })
         .unwrap_or_default();
+    let drop_bf16 = dflash
+        .get("drop_bf16")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     Some(DflashRaw {
         draft_model,
         gamma,
         window_size,
         mask_token_id,
         target_layer_ids,
+        drop_bf16,
     })
 }

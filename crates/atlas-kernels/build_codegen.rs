@@ -274,9 +274,10 @@ pub(super) fn generate_target_ptx_rs(
             match &target.dflash {
                 None => "None".to_string(),
                 Some(d) => format!(
-                    "Some(DflashConfig {{ draft_model: \"{}\", gamma: {}, window_size: {}, mask_token_id: {}, target_layer_ids: &[{}] }})",
+                    "Some(DflashConfig {{ draft_model: \"{}\", gamma: {}, window_size: {}, mask_token_id: {}, target_layer_ids: &[{}], drop_bf16: {} }})",
                     d.draft_model, d.gamma, d.window_size, d.mask_token_id,
                     d.target_layer_ids.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", "),
+                    d.drop_bf16,
                 ),
             },
             all_drops

@@ -21,6 +21,11 @@ pub struct DflashConfig {
     /// (shallow-to-deep). The drafter's `fc` projection consumes the stack
     /// of these hiddens. From the drafter's `dflash_config.target_layer_ids`.
     pub target_layer_ids: &'static [usize],
+    /// `drop_bf16`: free the drafter's BF16 q/o/gate/up/down after quantizing
+    /// them to NVFP4, before the KV budget (the `ATLAS_DFLASH_DROP_BF16=1`
+    /// default for this target). For targets whose drafter BF16 copies cost
+    /// the KV pool its room (Ripple-65B on a 96 GB gfx1151 box).
+    pub drop_bf16: bool,
 }
 
 /// Kernel modules hyperoptimized for a specific (H, M_q) target.

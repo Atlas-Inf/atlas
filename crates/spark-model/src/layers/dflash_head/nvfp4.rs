@@ -131,8 +131,16 @@ impl BlockDiffusionDraftHead {
         // budget. Where they do not fit (Ripple-65B on a 96 GB gfx1151 leaves
         // ~1.5 GB pre-KV) the drafter keeps its BF16 arms instead of failing
         // the boot.
-        let twin_bytes = drafter_nvfp4_bytes(self.layers.len(), h, q_dim, kv_dim, inter);
-        if let Ok(free) = gpu.free_memory()
+        // After the preshrink only k/v remain to quantize, and the BF16 they
+        // would replace is already gone: the twins are not optional then.
+        let parked = crate::weight_loader::dflash_preshrink::parked();
+        let twin_bytes = if parked {
+            drafter_nvfp4_bytes(self.layers.len(), h, 0, kv_dim, 0)
+        } else {
+            drafter_nvfp4_bytes(self.layers.len(), h, q_dim, kv_dim, inter)
+        };
+        if !parked
+            && let Ok(free) = gpu.free_memory()
             && free < twin_bytes + DRAFTER_NVFP4_FREE_FLOOR
         {
             tracing::warn!(
