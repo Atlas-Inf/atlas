@@ -5,7 +5,7 @@
 //! drafts before it, the bonus row masked, trimming at the first rejected
 //! draft or `-1` pad, an exact rollback, and the `</think>` boundary.
 
-use super::{StrictVerify, enabled, prepare, row_masks, width_word};
+use super::{StrictVerify, enabled, prepare, rides_batch, row_masks, width_word};
 use crate::grammar::GrammarState;
 use crate::scheduler::test_support::{
     GRAMMAR_VOCAB as VOCAB, THINK_END, THINK_START, grammar_engine, test_seq,
@@ -218,7 +218,7 @@ fn enabled_arms_by_verify_capability() {
         cancel_after_row_commit: None,
         verify,
     };
-    // `verify_logits_argmax_only()` is `verify.is_some()` on the test model.
+    // A scripted verify is argmax-only unless it sets `full_logits`.
     let argmax_only = model(Some(Arc::new(VerifyScript::default())));
     let full_logits = model(None);
 
@@ -234,8 +234,15 @@ fn enabled_arms_by_verify_capability() {
     assert!(enabled(&levers, &full_logits, true));
     assert!(enabled(&levers, &full_logits, false));
     assert!(!enabled(&levers, &argmax_only, true));
+    // Only its MTP lane shares the batched verify.
+    assert!(rides_batch(&levers, &full_logits, false));
+    assert!(!rides_batch(&levers, &full_logits, true));
+    assert!(!rides_batch(&levers, &argmax_only, false));
     levers.strict_spec = false;
     assert!(!enabled(&levers, &full_logits, true));
+    assert!(!rides_batch(&levers, &full_logits, false));
+    levers.glm_strict_spec = true;
+    assert!(!rides_batch(&levers, &argmax_only, true));
 }
 
 mod step {

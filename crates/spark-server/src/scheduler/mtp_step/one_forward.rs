@@ -12,15 +12,16 @@
 //! measuring them against a single batched decode, parked the batch in serial
 //! decode for most steps.
 //!
-//! Now every grammarless verify-ready sequence rides the batched verify at
-//! its own depth (`drafts + 1` rows, D-Cut prunes within it), and when the
-//! model verifies decode rows (`Model::can_batch_verify` admits `k = 1`,
-//! qwen4_exp's exact lane) every draftless grammarless sequence rides it too
-//! at ONE row: the target token at its position, the verify row a decode
-//! step would compute. Its verdict emits that row's pick and its propose runs
-//! with the batch's, exactly as the bootstrap's would. Anything the plan
-//! cannot carry (grammar, DFlash's uniform-width contract, a shape the model
-//! refuses) keeps its previous path.
+//! Now every verify-ready sequence the batch can pick for
+//! (`grammar_rides_batch`) rides the batched verify at its own depth
+//! (`drafts + 1` rows, D-Cut prunes within it), and when the model verifies
+//! decode rows (`Model::can_batch_verify` admits `k = 1`, qwen4_exp's exact
+//! lane) every such draftless sequence rides it too at ONE row: the target
+//! token at its position, the verify row a decode step would compute. Its
+//! verdict emits that row's pick and its propose runs with the batch's,
+//! exactly as the bootstrap's would. Anything the plan cannot carry (a strict
+//! grammar outside `strict_spec::rides_batch`, DFlash's uniform-width
+//! contract, a shape the model refuses) keeps its previous path.
 //!
 //! Kill switch `ATLAS_NO_MTP_ONE_FORWARD` (PRESENCE): draftless sequences
 //! bootstrap in their own forward again.
@@ -42,12 +43,13 @@ fn grammar_serial_verify() -> bool {
 }
 
 /// Whether a sequence may ride the batched verify. Grammarless always; a
-/// NON-STRICT grammar sequence also, unless the kill switch is on — the
-/// batched pick runs the same per-sequence fast/slow selection the serial
-/// path does, with per-row masks keeping picks grammar-legal. Strict
-/// grammars keep the serial path either way.
-fn grammar_rides_batch(a: &ActiveSeq, serial_verify: bool) -> bool {
-    a.grammar_state.is_none() || (!a.strict_grammar() && !serial_verify)
+/// grammar sequence also, unless the kill switch is on — the batched pick
+/// runs the same per-sequence fast/slow selection the serial path does, with
+/// per-row masks keeping picks grammar-legal. A STRICT grammar only where
+/// `strict_batch` (`strict_spec::rides_batch`); elsewhere it keeps the serial
+/// path.
+fn grammar_rides_batch(a: &ActiveSeq, serial_verify: bool, strict_batch: bool) -> bool {
+    a.grammar_state.is_none() || (!serial_verify && (strict_batch || !a.strict_grammar()))
 }
 
 /// The batched verify of one step.
@@ -114,11 +116,14 @@ pub(super) fn plan_verify(
     } else {
         1
     };
+    let strict_batch =
+        crate::scheduler::strict_spec::rides_batch(&sched.levers, model, dflash_verify_raw_argmax);
+    let rides = |a: &ActiveSeq| grammar_rides_batch(a, grammar_serial_verify(), strict_batch);
     for &idx in verify_idxs {
         let a = &active[idx];
         // Batched DFlash cannot report generated scores. Keep those requests
         // on the single-sequence scored path; native MTP batches can score.
-        if grammar_rides_batch(a, grammar_serial_verify())
+        if rides(a)
             && a.pending_drafts.len() >= min_drafts
             && (!dflash_verify_raw_argmax || a.top_logprobs.is_none())
         {
@@ -136,7 +141,7 @@ pub(super) fn plan_verify(
         plan.decode_rows = bootstrap_idxs
             .iter()
             .copied()
-            .filter(|&i| grammar_rides_batch(&active[i], grammar_serial_verify()))
+            .filter(|&i| rides(&active[i]))
             .collect();
         plan.batch.extend_from_slice(&plan.decode_rows);
     }

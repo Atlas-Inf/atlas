@@ -62,9 +62,10 @@ pub struct SchedLevers {
     /// speculation on any verify whose logits reach the host pick pipeline —
     /// every verify row is grammar-masked at its own position there, the same
     /// per-position masks `strict_spec` builds for the GLM split head. Off:
-    /// they decode serially. Unlike the GLM arm this covers every speculation
-    /// lane (the pipeline pick is lane-independent) and sampled verifies keep
-    /// the request's sampling parameters.
+    /// they decode serially. Unlike the GLM arm this is not tied to the DFlash
+    /// lane, sampled verifies keep the request's sampling parameters, and on
+    /// the MTP lane such sequences share the batched verify
+    /// (`strict_spec::rides_batch`). N-gram and self-spec take no grammar.
     pub strict_spec: bool,
     /// Mean accepted drafts below which adaptive speculation suspends.
     pub dflash_adaptive_min: f32,

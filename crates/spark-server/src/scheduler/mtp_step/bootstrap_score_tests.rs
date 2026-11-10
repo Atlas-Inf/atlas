@@ -93,8 +93,10 @@ impl Stub {
             if self.fail_row == Some(row) {
                 bail!("injected row read failure");
             }
-            let bytes: Vec<u8> = self.bootstrap_rows[row]
+            // From `row` on: a verify span reads several rows at once.
+            let bytes: Vec<u8> = self.bootstrap_rows[row..]
                 .iter()
+                .flatten()
                 .flat_map(|v| {
                     if self.fp32 {
                         v.to_le_bytes().to_vec()

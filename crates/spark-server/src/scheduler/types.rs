@@ -487,8 +487,8 @@ impl ActiveSeq {
         self.pending_drafts = drafts;
     }
 
-    /// A `response_format` grammar is engaged. Unless ATLAS_GLM_STRICT_SPEC
-    /// masks its verify row by row (`strict_spec`), such a sequence decodes
+    /// A `response_format` grammar is engaged. Unless its verify is masked
+    /// row by row (`strict_spec::enabled`), such a sequence decodes
     /// serially: every emitted token must be sampled from logits masked at
     /// its own position, which the unmasked verify paths cannot guarantee
     /// (the GLM TP2 vocab-split verify head returns raw argmax ids only —
