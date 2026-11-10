@@ -29,6 +29,8 @@ pyhf() { # -> PY, a python with huggingface_hub + hf_transfer (system python if 
   export HF_HUB_ENABLE_HF_TRANSFER=1
 }
 hf_get() { # repo pattern [rev] -> prints the snapshot dir; 3 tries (the runner's mirror drops long pulls)
+  # NVFP4 shards are xet-only ("too large to be downloaded using the regular download method"): install hf_xet once.
+  "${PY:-python3}" -c 'import hf_xet' 2>/dev/null || "${PY:-python3}" -m pip install -q --user --break-system-packages hf_xet >>"$OUT/download.log" 2>&1
   local i; for i in 1 2 3; do
     "${PY:-python3}" -c 'import sys; from huggingface_hub import snapshot_download as s; print(s(sys.argv[1], revision=(sys.argv[3] or None), allow_patterns=([sys.argv[2]] if sys.argv[2] else None)))' "$1" "$2" "${3:-}" 2>>"$OUT/download.log" && return 0
     echo "hf_get $1: try $i failed" >> "$OUT/download.log"; sleep 30
