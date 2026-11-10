@@ -202,13 +202,6 @@ impl TransformerModel {
         {
             levers.ffn_small_m = false;
         }
-        // The Ripple FFN layers resolved the row-GEMV (load_layers).
-        if config.model_type == "ricursive"
-            && cfg!(atlas_hip)
-            && !crate::layers::ops::rowgemv_opted_out()
-        {
-            levers.ffn_rowgemv = true;
-        }
         levers.max_decode_seqs = (max_batch_size as u32).max(1);
         levers.qwen4exp_exact_verify = super::qwen4exp_exact_verify::lever(&config.model_type)?;
         levers.exact_verify = levers.qwen4exp_exact_verify

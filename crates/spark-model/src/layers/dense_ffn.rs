@@ -1012,14 +1012,6 @@ impl DenseFfnLayer {
         self.w4a16_gemv_silu_input_sw = KernelHandle(0);
     }
 
-    /// Take the small-M row-GEMV by default (a model whose accuracy gate passed
-    /// with it); `ATLAS_FFN_ROWGEMV=0` still opts out. The forward also needs
-    /// `ModelLevers::ffn_rowgemv`, which the model sets alongside.
-    pub fn enable_rowgemv_default(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
-        self.w4a16_rowgemv = super::ops::RowGemvKernels::resolve_default(gpu)?;
-        Ok(())
-    }
-
     /// Single-token decode: 2-3 kernel launches depending on activation.
     /// SiLU: dual GEMV + SiLU-fused down GEMV (2 launches).
     /// GELU: dual GEMV + gelu_mul + down GEMV (3 launches, no fused GELU down kernel).

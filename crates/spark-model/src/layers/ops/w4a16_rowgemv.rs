@@ -4,10 +4,8 @@
 //! `qwen3.6-27b/nvfp4/w4a16_gemm.cu`) for DFlash verify rows on the transposed
 //! NVFP4 layout `w4a16_gemm_t_m128` reads. Each weight is dequantized once for
 //! all rows instead of m128's 128-row tile (7/8 zero rows at M = 17). Not
-//! bit-identical to the WMMA kernels (fp32 summation order), so a model takes
-//! it by default only once its accuracy gate passes with it (Ripple-65B on
-//! strix-hip); elsewhere it is opt-in (`ATLAS_FFN_ROWGEMV=1`), and
-//! `ATLAS_FFN_ROWGEMV=0` turns it off everywhere.
+//! bit-identical to the WMMA kernels (fp32 summation order), so it is opt-in
+//! (`ATLAS_FFN_ROWGEMV=1`) until a model's accuracy gate passes with it.
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -26,11 +24,6 @@ const ROWGEMV_SPLIT_BELOW_N: u32 = 16384;
 pub const ROWGEMV_WS_BYTES: usize =
     (ROWGEMV_KS_NARROW * ROWGEMV_MAX_M * ROWGEMV_SPLIT_BELOW_N) as usize * 4;
 
-/// `ATLAS_FFN_ROWGEMV=0`: off even where a model takes it by default.
-pub fn rowgemv_opted_out() -> bool {
-    std::env::var("ATLAS_FFN_ROWGEMV").as_deref() == Ok("0")
-}
-
 /// `[m9, m17, reduce]`; all 0 on targets without the kernels.
 #[derive(Clone, Copy, Debug)]
 pub struct RowGemvKernels {
@@ -46,17 +39,7 @@ impl RowGemvKernels {
     /// the qwen3.6-27b gfx1151 tree alone, and a lookup that is never issued
     /// leaves no failed row in the fail-closed boot audit on other targets.
     pub fn resolve(gpu: &dyn GpuBackend) -> Result<Self> {
-        Self::resolve_if(gpu, super::ModelLevers::from_env().ffn_rowgemv)
-    }
-
-    /// [`Self::resolve`] for a model that takes the kernels by default (`on`),
-    /// unless `ATLAS_FFN_ROWGEMV=0`.
-    pub fn resolve_default(gpu: &dyn GpuBackend) -> Result<Self> {
-        Self::resolve_if(gpu, !rowgemv_opted_out())
-    }
-
-    fn resolve_if(gpu: &dyn GpuBackend, on: bool) -> Result<Self> {
-        let on = cfg!(atlas_hip) && on;
+        let on = cfg!(atlas_hip) && super::ModelLevers::from_env().ffn_rowgemv;
         let m9 = try_kernel_gated(on, gpu, "w4a16", "w4a16_rowgemv_m9");
         let m17 = try_kernel_gated(on, gpu, "w4a16", "w4a16_rowgemv_m17");
         let reduce = try_kernel_gated(on, gpu, "w4a16", "w4a16_rowgemv_reduce");
