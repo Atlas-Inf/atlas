@@ -34,8 +34,9 @@ impl Qwen3AttentionLayer {
         inv_sqrt_d: f32,
         q_stride: u32,
         workspace: DevicePtr,
-        // `ModelLevers::max_decode_seqs` — the determinism pin for the
-        // split-K split count. Passed in so the layer holds no process state.
+        // `ModelLevers::attn_split_ref_seqs` — the determinism pin for the
+        // split-K split count (the max batch; under `ATLAS_EXACT_VERIFY` at
+        // least the widest verify). Passed in so the layer holds no process state.
         max_decode_seqs: u32,
         stream: u64,
     ) -> Result<()> {

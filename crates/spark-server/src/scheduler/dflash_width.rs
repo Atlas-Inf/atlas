@@ -18,6 +18,79 @@
 
 use std::sync::OnceLock;
 
+/// A batched DFlash step's draft depth. Every member verifies the same
+/// width and only members holding that many drafts batch, so past two
+/// sequences the depth is at most 7 (8 rows each): the batched verify is
+/// bound by the weight stream's L2 reuse past ~24 rows, and 16 rows for
+/// each of 8 sequences halved the C8 rate (59 vs 114 tok/s). Two sequences
+/// keep the deepest width both hold, but never less than 7, so a long-block
+/// drafter's sequence (DSpine, 15 drafts) still batches with a short one's
+/// (DFlash2, 7) under `--draft-model-alt`. A 7-draft drafter is unchanged.
+///
+/// Past eight sequences the depth narrows with the batch so a step's rows
+/// stay within one exact batched verify (128 rows, `VERIFY_ROW_CAP`):
+/// [`wide_depth`].
+pub(crate) fn batch_depth(nd: usize, n: usize, held: impl Iterator<Item = usize>) -> usize {
+    match n {
+        0 | 1 => nd,
+        2 => held.min().map_or(nd, |h| nd.min(h.max(MAX_DRAFTS))),
+        _ => nd.min(wide_depth(n)).max(1),
+    }
+}
+
+/// Draft depth for `n` live sequences: `ATLAS_DFLASH_BATCH_DEPTH`
+/// (`n:depth,...`, ascending; the first entry whose `n` covers the batch
+/// applies, the last beyond it) or [`WIDE_DEPTHS`].
+pub(crate) fn wide_depth(n: usize) -> usize {
+    static T: OnceLock<Vec<(usize, usize)>> = OnceLock::new();
+    let table = T.get_or_init(|| {
+        parse_depths(std::env::var("ATLAS_DFLASH_BATCH_DEPTH").ok().as_deref())
+            .unwrap_or_else(|| WIDE_DEPTHS.to_vec())
+    });
+    depth_for(table, n)
+}
+
+/// Measured on the 27B (Qwen3.8-27B NVFP4 + DFlash2, one GB10, exact batched
+/// verify, think off, one wave of 300 tokens; aggregate tok/s):
+///
+/// | live | 7 drafts | 3 drafts | 1 draft | plain decode |
+/// |---|---|---|---|---|
+/// | 8  | 131 | | | 82 |
+/// | 16 | 95  | 115 | | 110 |
+/// | 32 | 102 | 119 | ~123 | 146 |
+///
+/// A verify row costs about 3.2 ms up to 64 rows and 4.2 ms at 128 (8 rows
+/// 72 ms, 64 rows 206 ms, 128 rows 535 ms), and the drafter's propose about
+/// 8 ms a sequence, so past eight sequences deep blocks lose and past
+/// sixteen plain decode delivers the most: depth 0 there (`spec_width_ok`).
+pub(crate) const WIDE_DEPTHS: [(usize, usize); 3] = [(8, 7), (16, 3), (usize::MAX, 0)];
+
+fn depth_for(table: &[(usize, usize)], n: usize) -> usize {
+    table
+        .iter()
+        .find(|&&(upto, _)| n <= upto)
+        .or(table.last())
+        .map_or(MAX_DRAFTS, |&(_, d)| d.min(MAX_DRAFTS))
+}
+
+/// Whether `n` live sequences speculate at all: a depth of 0 in the table
+/// is plain batched decode, which past the speculation width delivers more
+/// (every verify row costs about a decode row; see [`WIDE_DEPTHS`]).
+pub(crate) fn spec_width_ok(n: usize) -> bool {
+    n <= 2 || wide_depth(n) > 0
+}
+
+fn parse_depths(spec: Option<&str>) -> Option<Vec<(usize, usize)>> {
+    let v: Vec<(usize, usize)> = spec?
+        .split(',')
+        .filter_map(|e| {
+            let (n, d) = e.trim().split_once(':')?;
+            Some((n.parse().ok()?, d.parse().ok()?))
+        })
+        .collect();
+    (!v.is_empty()).then_some(v)
+}
+
 /// Draft positions tracked (γ = 8 → seven drafts).
 pub(crate) const MAX_DRAFTS: usize = 7;
 /// Estimator tuning: per-step decay (0.98 ≈ the last fifty verifies; code sits near the

@@ -10,10 +10,39 @@
 //! Holding chunks back for `k` decode steps lets short replies finish
 //! while the long prompt's TTFT grows by about `k` decode steps per chunk.
 
-use std::sync::OnceLock;
+//!
+//! `ATLAS_DECODE_TIME_SHARE=f` (0 < f < 1, default off): the same hold, by
+//! wall time. After a continued chunk that took `d`, decodes step alone for
+//! `d * f / (1 - f)` before the next chunk, so live sequences keep at least
+//! the share `f` of the time while a long prompt prefills. A chunk deep in a
+//! 254K prompt takes about 40 s on the 27B; with one chunk a tick, the
+//! eight requests decoding beside it got a token a chunk (0.2 tok/s) and ran
+//! into the request timeout.
+
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 static STEPS_SINCE_CHUNK: AtomicUsize = AtomicUsize::new(0);
+
+/// The last continued chunk: when it started, and once a decode step
+/// followed it, when it ended.
+static LAST_CHUNK: Mutex<Option<(Instant, Option<Instant>)>> = Mutex::new(None);
+
+fn time_share() -> Option<f64> {
+    static F: OnceLock<Option<f64>> = OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("ATLAS_DECODE_TIME_SHARE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|f| *f > 0.0 && *f < 1.0)
+    })
+}
+
+/// How long decodes run alone after a chunk of `chunk` at share `f`.
+fn decode_window(chunk: Duration, f: f64) -> Duration {
+    chunk.mul_f64(f / (1.0 - f))
+}
 
 fn steps_per_chunk() -> usize {
     static K: OnceLock<usize> = OnceLock::new();
@@ -29,11 +58,16 @@ fn steps_per_chunk() -> usize {
 /// ends the tick (as under EP), so requests that arrived during that
 /// chunk are admitted before the second one runs.
 pub(crate) fn enabled() -> bool {
-    steps_per_chunk() > 0
+    steps_per_chunk() > 0 || time_share().is_some()
 }
 
 /// A standalone decode step (not fused into a chunk) just ran.
 pub(crate) fn note_decode_step() {
+    if let Ok(mut c) = LAST_CHUNK.lock()
+        && let Some((_, end @ None)) = c.as_mut()
+    {
+        *end = Some(Instant::now());
+    }
     let _ = STEPS_SINCE_CHUNK.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
         Some(n.saturating_add(1))
     });
@@ -45,11 +79,33 @@ pub(crate) fn note_decode_step() {
 /// `hold_chunk`).
 pub(crate) fn note_idle() {
     STEPS_SINCE_CHUNK.store(0, Ordering::Relaxed);
+    if let Ok(mut c) = LAST_CHUNK.lock() {
+        *c = None;
+    }
 }
 
 /// Whether to skip this tick's continued chunk so decodes can step.
 /// Records the chunk when it is allowed to run.
 pub(super) fn hold_chunk(decoding: bool) -> bool {
+    if let Some(f) = time_share() {
+        let now = Instant::now();
+        let Ok(mut c) = LAST_CHUNK.lock() else {
+            return false;
+        };
+        // A chunk fused with the decode rows (the mixed forward) is followed
+        // by no standalone decode step: it ended by this tick.
+        if let Some((_, end @ None)) = c.as_mut() {
+            *end = Some(now);
+        }
+        if decoding
+            && let Some((start, Some(end))) = *c
+            && now.duration_since(end) < decode_window(end.duration_since(start), f)
+        {
+            return true;
+        }
+        *c = Some((now, None));
+        return false;
+    }
     let k = steps_per_chunk();
     if k == 0 {
         return false;
@@ -67,6 +123,16 @@ pub(super) fn hold_chunk(decoding: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_decode_window_keeps_the_share() {
+        let w = decode_window(Duration::from_secs(40), 0.3);
+        assert!((w.as_secs_f64() - 40.0 * 0.3 / 0.7).abs() < 1e-6);
+        assert_eq!(
+            decode_window(Duration::from_secs(40), 0.5),
+            Duration::from_secs(40)
+        );
+    }
 
     #[test]
     fn off_by_default_never_holds() {

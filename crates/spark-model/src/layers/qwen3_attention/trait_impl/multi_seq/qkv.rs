@@ -49,7 +49,7 @@ impl Qwen3AttentionLayer {
         } else if self.ms_qkv_batch_mx8(c)? {
             // Native MXFP8 (FP4-Local): `qkv_mx8.rs`.
         } else if self.ms_qkv_exact4(c)? {
-            // qwen4_exp exact K=4 verify: serial decode's arithmetic per row
+            // Exact K=4 verify (qwen4_exp, qwen3_5): serial decode's arithmetic per row
             // (`qkv_exact4.rs`).
         } else if n == 3
             && self.q_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
@@ -72,16 +72,9 @@ impl Qwen3AttentionLayer {
             // weight loop in the wide verify — one GEMM per Q/K/V reads each
             // weight ONCE for all n rows instead of n× (mirrors batch3 with M=n).
             self.ms_qkv_batchn(c)?;
-        } else if (2..=16).contains(&n)
-            && ((n <= 4 && self.w8a16_gemv_batch4_k.0 != 0)
-                || (n > 4
-                    && (self.w8a16_gemv_batch16_k.0 != 0
-                        || (n <= 8 && self.w8a16_gemv_batch8_k.0 != 0))))
-            && self.q_weight.as_ref().and_then(|w| w.as_fp8()).is_some()
-            && self.k_weight.as_ref().and_then(|w| w.as_fp8()).is_some()
-            && self.v_weight.as_ref().and_then(|w| w.as_fp8()).is_some()
-        {
-            self.ms_qkv_batchm_fp8(c)?;
+        } else if let Some(plan) = self.ms_qkv_fp8_plan(fwd, n) {
+            // Native FP8 q/k/v (`qkv_fp8.rs`): exact rows up to 4.
+            self.ms_qkv_batchm_fp8(c, &plan)?;
         } else if (2..=8).contains(&n)
             && !self.gated
             && self.dense_gemv_batchm_k.0 != 0
@@ -516,8 +509,8 @@ impl Qwen3AttentionLayer {
     /// not the arithmetic serial decode's `w4a16_gemv_dual` runs (K split
     /// across lanes differently, scale applied per element instead of per
     /// block): ~1 output in 1000 differs by a BF16 ULP, and that K/V is
-    /// written to the cache serial decode reads afterwards. Under
-    /// `ATLAS_QWEN4EXP_EXACT_VERIFY` each projection takes
+    /// written to the cache serial decode reads afterwards. Under an exact
+    /// verify (`ModelLevers::exact_verify`) each projection takes
     /// `w4a16_gemv_batch2` instead, whose rows are byte-identical to
     /// `w4a16_gemv`, i.e. to `w4a16_gemv_dual` per projection
     /// (`scripts/dev/qwen4exp_exact_verify_bench.cu`; +5 us a layer on GB10).
@@ -534,7 +527,7 @@ impl Qwen3AttentionLayer {
         h: usize,
         stream: u64,
     ) -> Result<()> {
-        if fwd.levers.qwen4exp_exact_verify || fwd.levers.qwen4exp_batch_fast {
+        if fwd.levers.exact_verify || fwd.levers.qwen4exp_batch_fast {
             for (w, out) in [(k_nvfp4, k_out), (v_nvfp4, v_out)] {
                 ops::w4a16_gemv_batch2(
                     fwd.gpu,
@@ -577,7 +570,7 @@ impl Qwen3AttentionLayer {
         h: usize,
         stream: u64,
     ) -> Result<()> {
-        if fwd.levers.qwen4exp_exact_verify || fwd.levers.qwen4exp_batch_fast {
+        if fwd.levers.exact_verify || fwd.levers.qwen4exp_batch_fast {
             for (w, out) in [(k_nvfp4, k_out), (v_nvfp4, v_out)] {
                 ops::w4a16_gemv_batch3(
                     fwd.gpu,

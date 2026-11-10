@@ -83,6 +83,10 @@ impl BlockDiffusionDraftHead {
             None => (None, 0),
         };
         let option_b_on = option_b_block_table.is_some();
+        anyhow::ensure!(
+            self.dspine.is_none() || option_b_on,
+            "DSpine proposes only on the paged (Option B) drafter path"
+        );
         let eff_ctx = if option_b_on { 0 } else { eff_ctx };
         let _ = ctx_base_ptr; // Option B doesn't read ctx from this path
         let n_attn = (eff_ctx + self.gamma) as u32;

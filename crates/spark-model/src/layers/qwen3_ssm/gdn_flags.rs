@@ -167,12 +167,13 @@ pub fn verify_exact_enabled() -> bool {
     flags().verify_exact_active()
 }
 
-/// [`verify_exact_enabled`] for one model's forward: also on under the
-/// qwen4_exp exact-verify lever (`ATLAS_QWEN4EXP_EXACT_VERIFY=1`, set per
-/// model in `ModelLevers`), which needs this chain for its GDN layers. The
-/// FP16 h-state still forces it off; the lever refuses that pair at build.
+/// [`verify_exact_enabled`] for one model's forward: also on under an
+/// exact-verify lever (`ATLAS_QWEN4EXP_EXACT_VERIFY=1` on qwen4_exp,
+/// `ATLAS_EXACT_VERIFY=1` on qwen3_5; `ModelLevers::exact_verify`), which
+/// needs this chain for its GDN layers. The FP16 h-state still forces it
+/// off; both levers refuse that pair at build.
 pub fn verify_exact_for(levers: &crate::layers::ops::ModelLevers) -> bool {
-    verify_exact_enabled() || (levers.qwen4exp_exact_verify && !ssm_h_fp16_enabled())
+    verify_exact_enabled() || (levers.exact_verify && !ssm_h_fp16_enabled())
 }
 
 /// Batch width at which the multi-seq decode projections switch to the

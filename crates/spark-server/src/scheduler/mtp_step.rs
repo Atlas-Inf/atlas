@@ -94,6 +94,18 @@ pub fn step_mtp(
     } else {
         ladder_nd
     };
+    let ladder_nd = if dflash_verify_raw_argmax && !deep {
+        super::dflash_width::batch_depth(
+            ladder_nd,
+            active.len(),
+            active
+                .iter()
+                .filter(|a| !a.pending_drafts.is_empty())
+                .map(|a| a.pending_drafts.len()),
+        )
+    } else {
+        ladder_nd
+    };
     super::mtp_step_trace::note_step(ladder_nd, deep);
     // Tiered verify-pool capacity clamp (2026-08-16): the step's draft
     // count must respect the MINIMUM slot capacity across the active

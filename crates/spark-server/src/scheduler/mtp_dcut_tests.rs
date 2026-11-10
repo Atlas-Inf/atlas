@@ -84,15 +84,15 @@ fn chunk_ranges_seq_cap_derives_from_the_row_budget() {
     assert_eq!(chunk_ranges(&[3; 21]), vec![(0, 21)]);
     assert_eq!(chunk_ranges(&[3; 24]), vec![(0, 24)]);
     assert_eq!(chunk_ranges(&[3; 32]), vec![(0, 32)]);
-    assert_eq!(chunk_ranges(&[3; 42]), vec![(0, 42)]);
-    assert_eq!(chunk_ranges(&[3; 43]), vec![(0, 42), (42, 43)]);
+    // ... and at most VERIFY_WY_TABLE_SEQS (32) sequences a chunk.
+    assert_eq!(chunk_ranges(&[3; 42]), vec![(0, 32), (32, 42)]);
+    assert_eq!(chunk_ranges(&[2; 64]), vec![(0, 32), (32, 64)]);
     // rows=4: 128/4 = 32 seqs.
     assert_eq!(chunk_ranges(&[4; 9]), vec![(0, 9)]);
     assert_eq!(chunk_ranges(&[4; 32]), vec![(0, 32)]);
     assert_eq!(chunk_ranges(&[4; 33]), vec![(0, 32), (32, 33)]);
-    // rows=2: 128/2 = 64 seqs.
-    assert_eq!(chunk_ranges(&[2; 64]), vec![(0, 64)]);
-    assert_eq!(chunk_ranges(&[2; 65]), vec![(0, 64), (64, 65)]);
+    // rows=2: 128/2 = 64 rows' worth, but 32 sequences a verify.
+    assert_eq!(chunk_ranges(&[2; 65]), vec![(0, 32), (32, 64), (64, 65)]);
     // rows=8 (DFlash2 γ=8): the job-376 C=16 shape — 16 seqs = 128 rows
     // hits the new budget dead on (was a 12+4 split at 96).
     assert_eq!(chunk_ranges(&[8; 16]), vec![(0, 16)]);

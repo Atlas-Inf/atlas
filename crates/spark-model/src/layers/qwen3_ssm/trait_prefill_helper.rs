@@ -159,7 +159,7 @@ impl Qwen3SsmLayer {
             );
         }
         if self.out_proj_dense.is_none()
-            && self.try_fp8_bf16mma(
+            && self.try_bf16mma(
                 super::prefill_bf16mma::OUT_PROJ,
                 ctx,
                 [normed_out_buf, out_proj_buf],

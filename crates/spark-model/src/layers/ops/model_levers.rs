@@ -86,6 +86,11 @@ pub struct ModelLevers {
     pub dense_prefill_any_rows: bool,
 
     // ── Attention ──
+    /// Dense qwen3_5 full-attention q/k/v/o kept native FP8 on CUDA
+    /// ([`DENSE_NATIVE_FP8_ATTN`], `weight_loader/qwen35_dense/attn_fp8.rs`);
+    /// their multi-row GEMVs then also chunk past 16 rows
+    /// (`ops::fp8_rows_plan`). Opt-in.
+    pub dense_native_fp8_attn: bool,
     /// Contiguous-attention path for the DFlash head.
     pub dflash_contig_attn: bool,
     /// Official Lightning product: preserve sequential Mamba recurrence during
@@ -99,6 +104,23 @@ pub struct ModelLevers {
     /// `model/qwen4exp_exact_verify.rs`). Not from the environment directly:
     /// `TransformerModel::new` sets it for a qwen4_exp model only.
     pub qwen4exp_exact_verify: bool,
+    /// Every row of a K=2..4 single-sequence verify runs serial decode's
+    /// arithmetic: `qwen4exp_exact_verify`, or the dense qwen3_5 lever
+    /// (`ATLAS_EXACT_VERIFY=1`, `model/exact_verify.rs`). Set by
+    /// `TransformerModel::new`; the ops both models share read this one.
+    pub exact_verify: bool,
+    /// The widest single-sequence verify the dense lever makes exact
+    /// (`model::exact_verify::max_rows`: 4 for MTP, 16 beside a DFlash
+    /// drafter); 0 when the lever is off. Set by `TransformerModel::new`.
+    pub exact_verify_rows: u32,
+    /// The dense exact verify extended to rows of several sequences
+    /// (`ATLAS_EXACT_VERIFY=1` with `ATLAS_SKINNY_MMA=1` on qwen3_5,
+    /// `model::exact_verify::batch_lever`): every row of a batched
+    /// multi-sequence decode or verify, up to
+    /// [`crate::model::exact_verify::BATCH_MAX_ROWS`] rows, runs serial
+    /// decode's arithmetic, so `Model::batch_verify_bit_exact` holds. Set by
+    /// `TransformerModel::new`.
+    pub dense_batch_exact: bool,
     /// qwen4_exp: the MTP verify ceiling in drafts (`ATLAS_QWEN4EXP_MTP_DEPTH`,
     /// `model/qwen4exp_mtp_depth.rs`), overriding the GDN layers' default 1.
     /// Set by `TransformerModel::new` for a qwen4_exp model only.
@@ -195,6 +217,9 @@ pub const BISECT_HEAD: u32 = 64;
 /// transposed tables instead of the `_t_rows` union kernels.
 pub const BISECT_MOE_T_ROWS: u32 = 128;
 
+/// The native FP8 dense attention lever ([`ModelLevers::dense_native_fp8_attn`]).
+pub const DENSE_NATIVE_FP8_ATTN: &str = "ATLAS_DENSE_NATIVE_FP8_ATTN";
+
 /// Opt-IN: off unless the variable is exactly `1`.
 fn opt_in(var: &str) -> bool {
     std::env::var(var).ok().as_deref() == Some("1")
@@ -220,6 +245,46 @@ impl ModelLevers {
     /// `ATLAS_QWEN4EXP_BATCH_FAST_BISECT` bit `bit` is set (lane on).
     pub fn batch_bisect(&self, bit: u32) -> bool {
         self.qwen4exp_batch_fast && self.qwen4exp_batch_bisect & bit != 0
+    }
+
+    /// The dense exact verify (`ATLAS_EXACT_VERIFY=1` on qwen3_5): the generic
+    /// lever without the qwen4_exp one, for the ops only the dense model
+    /// routes differently.
+    pub fn dense_exact_verify(&self) -> bool {
+        self.exact_verify && !self.qwen4exp_exact_verify
+    }
+
+    /// The widest exact forward under the dense lever (at least the MTP 4):
+    /// the single-sequence verify's, or under [`Self::dense_batch_exact`] the
+    /// widest batched multi-sequence step's.
+    fn dense_exact_max_rows(&self) -> u32 {
+        if self.dense_batch_exact {
+            return crate::model::exact_verify::BATCH_MAX_ROWS as u32;
+        }
+        self.exact_verify_rows
+            .max(crate::model::exact_verify::MAX_ROWS as u32)
+    }
+
+    /// Whether a `rows`-row forward is one the dense exact lever covers
+    /// (2..=[`Self::exact_verify_rows`] rows of one sequence, or under
+    /// [`Self::dense_batch_exact`] up to `BATCH_MAX_ROWS` rows of any number
+    /// of sequences), so the ops take their row-exact arms at that width.
+    pub fn dense_exact_rows(&self, rows: usize) -> bool {
+        self.dense_exact_verify() && (2..=self.dense_exact_max_rows() as usize).contains(&rows)
+    }
+
+    /// The batch the paged-decode split-K count is pinned to
+    /// (`qwen3_attention::split_ref_seqs`). Under the dense exact verify it is
+    /// at least the widest exact forward, so serial decode (1 row) and every
+    /// K-row verify, single- or multi-sequence, reduce attention over the
+    /// same split count (`split_ref_seqs` takes the larger of the pin and the
+    /// row count, and no exact forward has more rows than the pin).
+    pub fn attn_split_ref_seqs(&self) -> u32 {
+        if self.dense_exact_verify() {
+            self.max_decode_seqs.max(self.dense_exact_max_rows())
+        } else {
+            self.max_decode_seqs
+        }
     }
 
     /// Rows one launch of a multi-row mHC collapse may take under the exact
@@ -262,6 +327,7 @@ impl ModelLevers {
             moe_prefill_bf16mma: opt_in("ATLAS_MOE_PREFILL_BF16MMA"),
             dense_prefill_bf16mma: opt_in("ATLAS_DENSE_PREFILL_BF16MMA"),
             dense_prefill_any_rows: false,
+            dense_native_fp8_attn: opt_in(DENSE_NATIVE_FP8_ATTN),
             dflash_contig_attn: opt_in("ATLAS_DFLASH_CONTIG_ATTN"),
             // Product installation also arms these. The explicit model-load
             // diagnostic lets a no-spec control use identical target arithmetic.
@@ -269,6 +335,9 @@ impl ModelLevers {
             lightning_mamba_scalar_in_proj: lightning_lossless_target,
             // Model-specific: `TransformerModel::new` sets it.
             qwen4exp_exact_verify: false,
+            exact_verify: false,
+            exact_verify_rows: 0,
+            dense_batch_exact: false,
             qwen4exp_mtp_depth: None,
             qwen4exp_batch_fast: false,
             qwen4exp_batch_bisect: 0,
@@ -333,6 +402,7 @@ mod tests {
         assert!(!d.decode_ffn_via_gemm);
         assert!(!d.lora_eager);
         assert!(!d.k4_diag);
+        assert!(!d.dense_native_fp8_attn);
         assert!(
             d.gdn_deferred_commit,
             "ATLAS_GDN_DEFERRED_COMMIT ships ON; =0 opts out"

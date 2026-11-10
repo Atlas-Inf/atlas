@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `ATLAS_QWEN4EXP_BATCH_FAST`: the GDN layer's two big projections over
-//! several rows with single-row decode's arithmetic per row
-//! (`model/qwen4exp_batch_fast.rs`).
+//! `ATLAS_QWEN4EXP_BATCH_FAST` (`model/qwen4exp_batch_fast.rs`) and the dense
+//! exact verify (`ATLAS_EXACT_VERIFY`, `model/exact_verify.rs`): the GDN
+//! layer's two big projections over several rows with single-row decode's
+//! arithmetic per row.
 //!
 //! `ssm_forward` (serial decode) projects one row with `w8a16_gemv` (FP8
 //! block-scaled copy), `w4a16_gemv[_sw]` (NVFP4) or `dense_gemv_bf16` (BF16),
@@ -57,7 +58,8 @@ impl Qwen3SsmLayer {
             ops::mxfp8_proj_exact_rows(ctx.gpu, &mx8.kernels, p, input, output, rows, stream)?;
             return Ok(true);
         }
-        if !ctx.levers.qwen4exp_batch_fast
+        // The exact batching lane, or the dense exact verify (`ATLAS_EXACT_VERIFY`).
+        if !(ctx.levers.qwen4exp_batch_fast || ctx.levers.dense_exact_verify())
             || rows == 0
             || !self.sequential_qkvz
             || self.qkvz_q2.is_some()
@@ -81,9 +83,17 @@ impl Qwen3SsmLayer {
                 return Ok(false);
             }
             // batch4 to 4 rows, batch16 past that: one template, each row
-            // `w8a16_gemv`'s bytes.
+            // `w8a16_gemv`'s bytes. Past 16 rows (the batch lever's
+            // multi-sequence steps) one call when the skinny kernels take it
+            // whole.
             let (kernel, chunk) = if rows <= 4 || self.w8a16_gemv_batch16_k.0 == 0 {
                 (self.w8a16_gemv_batch4_k, 4)
+            } else if ops::skinny_mma::serves_rows(
+                ops::skinny_mma::Family::W8a16,
+                rows as u32,
+                k as u32,
+            ) {
+                (self.w8a16_gemv_batch16_k, rows)
             } else {
                 (self.w8a16_gemv_batch16_k, 16)
             };
@@ -115,6 +125,23 @@ impl Qwen3SsmLayer {
         if let Some(w) = nvfp4 {
             if !self.w4a16_batchm.has_base() {
                 return Ok(false);
+            }
+            let whole =
+                self.w4a16_batchm
+                    .exact_kernel(rows as u32, k as u32, self.w4a16_gemv_batch16_k);
+            if rows > 16 && whole.0 != 0 {
+                ops::w4a16_gemv_batchm(
+                    ctx.gpu,
+                    whole,
+                    input,
+                    w,
+                    output,
+                    rows as u32,
+                    n as u32,
+                    k as u32,
+                    stream,
+                )?;
+                return Ok(true);
             }
             self.wide_rows.w4a16_rows(
                 ctx.gpu,

@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The 4-row (K=4 verify) NVFP4 Q/K/V projections under the qwen4_exp exact
-//! verify (`ATLAS_QWEN4EXP_EXACT_VERIFY=1`, `model/qwen4exp_exact_verify.rs`),
+//! The 4-row (K=4 verify) NVFP4 Q/K/V projections under an exact verify
+//! (`ATLAS_QWEN4EXP_EXACT_VERIFY=1` / `ATLAS_EXACT_VERIFY=1`,
+//! `ModelLevers::exact_verify`),
+//! the dense lever's 5..=16-row DFlash K=γ verify (`ATLAS_EXACT_VERIFY=1`
+//! beside a DFlash drafter: Q+gate in `w4a16_gemv_qg_batch4` chunks, the
+//! last 1..3 rows `w4a16_gemv_qg[_batch2/3]`; K/V one scalar
+//! `W4a16BatchmTiers::exact_kernel` launch each, batch16 past 8 rows),
 //! and every width from 4 rows up under the exact batching lane
 //! (`ATLAS_QWEN4EXP_BATCH_FAST=1`, `model/qwen4exp_batch_fast.rs`): there the
 //! Q+gate rows run `w4a16_gemv_qg_batch4/3/2` (or `w4a16_gemv_qg`) in chunks
@@ -59,9 +64,11 @@ impl Qwen3AttentionLayer {
             return Ok(false);
         };
         // 2 and 3 rows: the qg_batch2/3 arms and their exact K/V already are
-        // serial decode's arithmetic.
+        // serial decode's arithmetic. 5..=16 rows: the dense lever's DFlash
+        // K=γ verify (`ModelLevers::dense_exact_rows`).
         let lane = fwd.levers.qwen4exp_batch_fast && n >= 4;
-        if !(lane || fwd.levers.qwen4exp_exact_verify && n == 4) {
+        let dense_wide = n > 4 && fwd.levers.dense_exact_rows(n);
+        if !(lane || dense_wide || fwd.levers.exact_verify && n == 4) {
             return Ok(false);
         }
         let kv_dim = nkv * hd;
@@ -77,8 +84,33 @@ impl Qwen3AttentionLayer {
         // adapter; `ms_qkv_seq_q` covers the adapter case exactly as serial.
         if self.gated && !self.q_lora_active() && self.w4a16_gemv_qg_batch4_k.0 != 0 {
             let q_scratch = fwd.buffers.ssm_qkvz();
+            // `ATLAS_SKINNY_MMA`: every row in one row-invariant launch.
+            let skinny = ops::skinny_mma::try_qg(
+                fwd.gpu,
+                self.w4a16_gemv_qg_batch4_k,
+                normed,
+                q_nvfp4,
+                q_scratch,
+                (n as u32, q_proj_dim, h as u32),
+                (nq, hd),
+                stream,
+            )?;
+            // `ATLAS_WIDE_GEMV`: 5..=16 rows in one `w4a16_gemv_qg_wide*`
+            // launch (row `r` `w4a16_gemv_qg`'s bytes).
+            let wide = skinny
+                || ops::wide_gemv::active().map_or(Ok(false), |w| {
+                    w.try_qg(
+                        fwd.gpu,
+                        normed,
+                        q_nvfp4,
+                        q_scratch,
+                        (n as u32, q_proj_dim, h as u32),
+                        (nq, hd),
+                        stream,
+                    )
+                })?;
             // The lane's 16/32-row tiers past 8 rows, else at most 4 a launch.
-            let mut first = 0usize;
+            let mut first = if wide { n } else { 0 };
             while first < n {
                 let (rows, wide) = self.wide_rows.qg_chunk((n - first) as u32);
                 let m = rows as usize;
@@ -185,8 +217,20 @@ impl Qwen3AttentionLayer {
         if batch4.0 != 0 {
             let k_scratch = fwd.buffers.attn_output();
             let v_scratch = k_scratch.offset(n * kv_bytes);
-            // The widest scalar tier (batch16 past 8 rows, else 8 or 4) a launch.
+            // The widest scalar tier (batch16 past 8 rows, else 8 or 4) a
+            // launch; the dense K=γ verify's rows in one exact launch, and
+            // under the batch lever any width in one call the skinny
+            // kernels take whole.
+            let wide_exact =
+                self.w4a16_batchm
+                    .exact_kernel(n as u32, h as u32, self.w4a16_gemv_batch16_k);
             for (w, out) in [(k_nvfp4, k_scratch), (v_nvfp4, v_scratch)] {
+                if dense_wide && wide_exact.0 != 0 {
+                    ops::w4a16_gemv_batchm(
+                        fwd.gpu, wide_exact, normed, w, out, n as u32, kv_dim, h as u32, stream,
+                    )?;
+                    continue;
+                }
                 self.wide_rows.w4a16_rows(
                     fwd.gpu,
                     &self.w4a16_batchm,

@@ -82,6 +82,16 @@ impl TransformerModel {
     ) -> Result<DevicePtr> {
         let logits = self.buffers.logits();
         let v = self.config.vocab_size;
+        // qwen3_5's batch lever (`exact_verify.rs`): each row the single-row
+        // decode head's bytes (`dense_gemv_bf16` arithmetic, 8 rows a pass
+        // over the head) instead of the `dense_gemm` tile GEMM below. Serves
+        // the batched decode (`decode_a2`) and the mixed decode+prefill
+        // forward's decode rows (`decode_b2`) alike.
+        if self.levers.dense_batch_exact && self.plain_bf16_head() {
+            use super::super::qwen4exp_lmhead_split::HeadArith;
+            self.head_project(HeadArith::Gemv, normed, 0, v, padded_n, logits, v, stream)?;
+            return Ok(logits);
+        }
         if let Some(ref fp8) = self.lm_head_fp8 {
             for i in 0..padded_n {
                 ops::dense_gemv_fp8w(
@@ -103,6 +113,30 @@ impl TransformerModel {
             // explicitly disabled, not a lossless substitute.
             // Exact-M tier first (batch2..8/16/32 incl. the 5/6/7 tiers);
             // batch16 stays the capability fallback when no exact tier resolved.
+            // The batch lever past 16 rows: 16-row passes of the batch16 tier,
+            // each row the single-row head's bytes, not the transposed tile
+            // GEMM below (another FP32 reduction order). Plain batched decode
+            // of more than sixteen sequences diverged from serial decode here.
+            if self.levers.dense_batch_exact
+                && padded_n > 16
+                && self.w4a16_gemv_batch16_kernel.0 != 0
+            {
+                for row in (0..padded_n).step_by(16) {
+                    let rows = (padded_n - row).min(16);
+                    ops::w4a16_gemv_batchm(
+                        self.gpu.as_ref(),
+                        self.w4a16_gemv_batch16_kernel,
+                        normed.offset(row * h * bf16),
+                        nvfp4,
+                        logits.offset(row * v * bf16),
+                        rows as u32,
+                        v as u32,
+                        h as u32,
+                        stream,
+                    )?;
+                }
+                return Ok(logits);
+            }
             let narrow = self.w4a16_batchm.kernel(padded_n as u32);
             let batch_k = if narrow.0 != 0 {
                 narrow

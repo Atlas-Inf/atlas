@@ -42,6 +42,7 @@ mod op_dump;
 #[cfg(feature = "cuda")]
 pub mod innerq_driver;
 mod prefill;
+mod prefill_fp8_bf16mma;
 mod prefill_weights;
 mod prefill_weights_rowinv;
 mod trait_impl;

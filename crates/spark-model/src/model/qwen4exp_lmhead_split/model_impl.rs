@@ -51,13 +51,14 @@ impl TransformerModel {
                     stream,
                 )
             }
+            // Under an exact verify (`ModelLevers::exact_verify`, qwen4_exp or
+            // qwen3_5) too: the batch-M rows are `dense_gemv_bf16`'s bytes.
             HeadArith::Gemv
                 if rows > 1
                     && self.dense_gemv_batchm_kernel.0 != 0
-                    && self.config.model_type == "qwen4_exp"
-                    && (batchm_requested()
-                        || self.levers.qwen4exp_exact_verify
-                        || self.levers.qwen4exp_batch_fast)
+                    && (self.levers.exact_verify
+                        || self.config.model_type == "qwen4_exp"
+                            && (batchm_requested() || self.levers.qwen4exp_batch_fast))
                     && !self.levers.batch_bisect(ops::BISECT_HEAD) =>
             {
                 // Up to 32 rows a pass over the head (8 without the lane).
@@ -286,7 +287,7 @@ impl TransformerModel {
 
     /// The head is the plain resident BF16 projection `lm_head` runs with
     /// `dense_gemv_bf16` (no FP8/NVFP4 copy, overlay, softcap or FP32 logits).
-    fn plain_bf16_head(&self) -> bool {
+    pub(in crate::model) fn plain_bf16_head(&self) -> bool {
         self.lm_head_fp8.is_none()
             && self.lm_head_nvfp4.is_none()
             && !self.lm_head_weight.weight.is_null()

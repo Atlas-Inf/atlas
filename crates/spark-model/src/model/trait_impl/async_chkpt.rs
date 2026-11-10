@@ -32,6 +32,11 @@ impl TransformerModel {
     pub(super) fn start_checkpoint_async_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
         use crate::layer::SsmLayerState;
 
+        // Deferred-commit pools: no checkpoint is ever read (`defer_only`).
+        if self.ssm_pool.defer_only() {
+            return Ok(());
+        }
+
         let stream = self.secondary_stream;
         let mut h_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
         let mut conv_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
@@ -82,6 +87,11 @@ impl TransformerModel {
     ) -> Result<()> {
         use crate::layer::SsmLayerState;
 
+        anyhow::ensure!(
+            !self.ssm_pool.defer_only(),
+            "start_rollback_and_checkpoint_async: the deferred-commit pools hold no \
+             snapshots to roll back to (ATLAS_VERIFY_POOL_STORE=1 allocates them)"
+        );
         let stream = self.secondary_stream;
         let mut ssm_layer_idx = 0usize;
         // Four plans in the ORIGINAL issue order: rollback h, rollback conv,
@@ -232,6 +242,27 @@ impl TransformerModel {
         num_accepted: usize,
         k: usize,
     ) -> Result<()> {
+        let rows: Vec<usize> = (0..num_accepted).collect();
+        self.commit_accepted_rows_dispatch(seq, &rows, k)
+    }
+
+    /// [`Self::commit_accepted_prefix_dispatch`] for the accepted verify
+    /// `rows`, in order: a chain's prefix `0..n`, or a tree verify's root
+    /// path. A storing verify's state is the last row's (its rollback slot,
+    /// or the live state when it is the verify's last row); a deferred one
+    /// (`gdn_commit_pending`) replays `rows` from H0.
+    pub(super) fn commit_accepted_rows_dispatch(
+        &self,
+        seq: &mut SequenceState,
+        rows: &[usize],
+        k: usize,
+    ) -> Result<()> {
+        let num_accepted = rows.len();
+        anyhow::ensure!(
+            rows.iter().all(|&r| r < k.max(1)) && rows.windows(2).all(|w| w[0] < w[1]),
+            "commit_accepted_prefix: rows {rows:?} are not verify rows of k={k} in order"
+        );
+        let last_row = rows.last().copied().unwrap_or(0);
         use crate::layer::SsmLayerState;
 
         // Width invariant. Together with the `num_accepted == 0` guard below
@@ -298,7 +329,8 @@ impl TransformerModel {
         // already the canonical committed state — nothing to do — UNLESS a
         // layer ran the deferred-commit verify (`gdn_commit_pending`), in
         // which case `h_state` still holds H0 and must be committed below.
-        if num_accepted == k
+        if num_accepted > 0
+            && last_row + 1 == k
             && !seq.layer_states.iter().any(|ls| {
                 ls.as_any()
                     .downcast_ref::<crate::layer::SsmLayerState>()
@@ -369,7 +401,7 @@ impl TransformerModel {
             // Partial accept: rewind live state to the last accepted token's
             // intermediate (state after token `num_accepted-1`).
             let slot = seq.slot_idx;
-            let inter_idx = num_accepted - 1;
+            let inter_idx = last_row;
             if ssm.gdn_commit_pending {
                 // ATLAS_GDN_DEFERRED_COMMIT: `h_state` still holds H0 (the
                 // `_defer` verify stored nothing); replay the accepted
@@ -381,7 +413,7 @@ impl TransformerModel {
                 // PARTIAL accept: the fused conv path never writes index
                 // k-1 (the final conv state is already canonical), so a
                 // full accept must not read the unwritten slot.
-                if num_accepted < k {
+                if last_row + 1 < k {
                     conv_plan.push(StateCopy {
                         src: self
                             .ssm_pool
@@ -393,6 +425,13 @@ impl TransformerModel {
                 ssm_layer_idx += 1;
                 continue;
             }
+            anyhow::ensure!(
+                inter_idx < ssm.h_state_intermediates.len()
+                    && inter_idx < ssm.conv_state_intermediates.len(),
+                "commit_accepted_prefix: layer {i} ran a storing verify but its slot holds \
+                 no snapshot {inter_idx} (deferred-commit pools; ATLAS_VERIFY_POOL_STORE=1 \
+                 allocates them)"
+            );
             h_plan.push(StateCopy {
                 src: self.ssm_pool.h_intermediate(ssm_layer_idx, slot, inter_idx),
                 dst: ssm.h_state,
@@ -410,7 +449,7 @@ impl TransformerModel {
         }
         if !exact_layers.is_empty() {
             // ATLAS_QWEN4EXP_GDN_COMMIT_FUSE: or left for the next verify.
-            self.gdn_commit_or_defer(seq, exact_idx, exact_layers, num_accepted, stream)?;
+            self.gdn_commit_or_defer(seq, exact_idx, exact_layers, rows, stream)?;
         }
         run_ssm_state_copies(self.gpu.as_ref(), &h_plan, &conv_plan, stream)?;
         self.gpu.record_event(self.secondary_event, stream)?;

@@ -55,6 +55,9 @@ pub fn w4a16_gemv_sw(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    if super::skinny_mma::try_w4a16_one(gpu, kernel, input, weight, output, (1, n, k), stream)? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([w4a16_gemv_sw_grid_x(n), 1, 1])
         .block([256, 1, 1])

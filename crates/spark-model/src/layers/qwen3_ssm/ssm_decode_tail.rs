@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The single-token GDN mixer's tail: the exact fused decode step
-//! (`ATLAS_QWEN4EXP_DECODE_FUSE`, GDN group) and the out projection both arms
-//! end in. Split from `ssm_forward.rs` for the 500-LoC cap.
+//! (`ATLAS_QWEN4EXP_DECODE_FUSE` GDN group on the sigmoid-gated qwen4_exp,
+//! `ATLAS_QWEN38_DECODE_FUSE` on the SiLU-gated dense 27B) and the out
+//! projection both arms end in. Split from `ssm_forward.rs` for the 500-LoC
+//! cap.
 
 use super::*;
 
 impl Qwen3SsmLayer {
     /// Steps 3-7 of [`Self::ssm_forward`] (BA gates, conv + L2 norm,
-    /// recurrence, sigmoid-gated RMS norm) as one launch of
-    /// `qwen4exp_gdn_decode_fused`, writing the gated-norm output to
+    /// recurrence, gated RMS norm) as one launch of the model's fused kernel
+    /// (`qwen4exp_gdn_decode_fused` for the sigmoid gate,
+    /// `qwen35_gdn_decode_fused` for SiLU), writing the gated-norm output to
     /// `ssm_qkvz` and the same recurrence state, conv window, gates and betas
     /// as the four kernels. Only on the arm those four kernels form (FP32 conv
-    /// output, FP32 recurrence state, FP32 GDN output into the sigmoid gated
-    /// norm). Returns whether it ran; on `false` nothing was launched.
+    /// output, FP32 recurrence state, FP32 GDN output into the gated norm).
+    /// Returns whether it ran; on `false` nothing was launched.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn gdn_decode_fused(
         &self,
@@ -25,11 +28,18 @@ impl Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
-        if !self.four_kernel_f32_arm(ctx) {
+        let c = ctx.config;
+        if !self.four_kernel_f32_chain() {
             return Ok(false);
         }
-        let c = ctx.config;
-        ops::qwen4exp_decode_fuse::gdn_decode(
+        // `gated_rms_norm_f32_k` was resolved for this gate
+        // (`kernel_select::gated_norm_kernel`): sigmoid or SiLU, nothing else.
+        let fused = if c.output_gate_type == "sigmoid" {
+            ops::qwen4exp_decode_fuse::gdn_decode
+        } else {
+            ops::qwen38_decode_fuse::gdn_decode
+        };
+        fused(
             ctx.gpu,
             &ops::qwen4exp_decode_fuse::GdnDecode {
                 h_state: state.h_state,
@@ -67,13 +77,19 @@ impl Qwen3SsmLayer {
     /// [`Self::four_kernel_f32_arm`] from the config alone, for host-side
     /// predicates that run before a forward context exists.
     pub(super) fn four_kernel_f32_arm_for(&self, config: &atlas_core::config::ModelConfig) -> bool {
+        self.four_kernel_f32_chain() && config.output_gate_type == "sigmoid"
+    }
+
+    /// The four-kernel FP32 arm under either gate: FP32 conv output, FP32
+    /// recurrence state and output, the separate gated norm (sigmoid or
+    /// SiLU, as the model declares), no fused GDN+norm kernel.
+    pub(super) fn four_kernel_f32_chain(&self) -> bool {
         let fused_norm = self.gdn_f32_norm_k.0 != 0 && super::gdn_fused_norm_enabled();
         self.conv1d_l2norm_f32_k.0 != 0
             && self.gdn_f32_k.0 != 0
             && self.gated_rms_norm_f32_k.0 != 0
             && !fused_norm
             && !super::ssm_h_fp16_enabled()
-            && config.output_gate_type == "sigmoid"
     }
 
     /// Step 8 of [`Self::ssm_forward`]: the out projection of the gated-norm

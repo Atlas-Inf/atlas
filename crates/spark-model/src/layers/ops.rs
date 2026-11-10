@@ -64,6 +64,8 @@ mod dp4a;
 mod embeddings;
 #[path = "ops/fp8_gemv_batch.rs"]
 mod fp8_gemv_batch;
+#[path = "ops/fp8_gemv_rows.rs"]
+mod fp8_gemv_rows;
 #[path = "ops/fp8_moe.rs"]
 mod fp8_moe;
 #[path = "ops/fp8_moe_batch_a.rs"]
@@ -94,6 +96,8 @@ mod gemm_fp4;
 pub mod model_stats;
 #[path = "ops/moe_gate_up_repack.rs"]
 pub(crate) mod moe_gate_up_repack;
+#[path = "ops/skinny_mma.rs"]
+pub mod skinny_mma;
 #[path = "ops/strix_f16.rs"]
 mod strix_f16;
 #[path = "ops/yarn_mrope.rs"]
@@ -249,6 +253,8 @@ mod qsa_rows;
 mod qsa_yarn;
 #[path = "ops/quant_dispatch.rs"]
 mod quant_dispatch;
+#[path = "ops/qwen38_decode_fuse.rs"]
+pub mod qwen38_decode_fuse;
 pub mod qwen4exp;
 #[path = "ops/qwen4exp_decode_fuse.rs"]
 pub mod qwen4exp_decode_fuse;
@@ -276,6 +282,8 @@ mod qwen4exp_w4_rows;
 mod qwen4exp_w4_wide;
 #[path = "ops/qwen4exp_wide_rows.rs"]
 mod qwen4exp_wide_rows;
+#[path = "ops/tree_verify.rs"]
+mod tree_verify;
 // Shared harness for the oracle-parity tests, split for the 500-LoC cap.
 #[cfg(test)]
 #[path = "ops/grammar_bitmask_tests.rs"]
@@ -317,6 +325,8 @@ mod ssm_ssd;
 #[path = "ops/strix_s64.rs"]
 mod strix_s64;
 pub mod token_overlay;
+#[path = "ops/wide_gemv.rs"]
+pub mod wide_gemv;
 #[path = "ops/wide_prefill.rs"]
 mod wide_prefill;
 
@@ -334,6 +344,7 @@ pub use dp4a::*;
 pub use embeddings::*;
 pub use exl3_ops::*;
 pub use fp8_gemv_batch::*;
+pub use fp8_gemv_rows::*;
 pub use fp8_moe::*;
 pub use fp8_moe_batch_a::*;
 pub use fp8_moe_batch_b::*;
@@ -373,7 +384,7 @@ pub use marlin_nvfp4::*;
 pub use marlin_nvfp4_pack::marlin_pack_nvfp4;
 pub use model_levers::{
     BISECT_ATTN_PROJ, BISECT_ATTN_ROWS, BISECT_GDN, BISECT_HC, BISECT_HEAD, BISECT_MOE_FORWARD,
-    BISECT_MOE_ROWS, BISECT_MOE_T_ROWS, ModelLevers,
+    BISECT_MOE_ROWS, BISECT_MOE_T_ROWS, DENSE_NATIVE_FP8_ATTN, ModelLevers,
 };
 pub use moe_atomic_c4::*;
 pub use moe_expert::*;
@@ -427,5 +438,6 @@ pub use ssm_preproc::*;
 pub use ssm_ssd::*;
 pub use strix_f16::*;
 pub use strix_s64::*;
+pub use tree_verify::*;
 pub use wide_prefill::*;
 pub use yarn_mrope::*;

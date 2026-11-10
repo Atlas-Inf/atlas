@@ -226,6 +226,14 @@ impl FfnComponent {
         matches!(self, Self::Dense(d) if d.can_forward_km(m))
     }
 
+    /// Whether `m` rows take the dense FFN's row-exact arm
+    /// (`dense_ffn_exact.rs`: the dense exact verify, at any width it covers,
+    /// e.g. a batched multi-sequence step under the batch lever). Such a
+    /// call goes through [`Self::try_forward_km`].
+    pub fn rows_exact(&self, m: u32, ctx: &ForwardContext) -> bool {
+        matches!(self, Self::Dense(d) if d.rows_exact_serves(m, ctx))
+    }
+
     /// K=m (m=4..8) verify FFN via batched GEMV (dense only). Returns
     /// `false` when the path is unavailable (MoE / missing batchm kernel /
     /// non-NVFP4 weights) so the caller can fall back to `forward_prefill`.
@@ -237,7 +245,7 @@ impl FfnComponent {
         stream: u64,
     ) -> Result<bool> {
         match self {
-            Self::Dense(d) if d.can_forward_km(m) => {
+            Self::Dense(d) if d.can_forward_km(m) || d.rows_exact_serves(m, ctx) => {
                 d.forward_km(input, m, ctx, stream)?;
                 Ok(true)
             }

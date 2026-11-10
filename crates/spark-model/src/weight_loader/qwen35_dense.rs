@@ -168,6 +168,7 @@ fn dense_fp8_enabled() -> bool {
     std::env::var("ATLAS_DENSE_FP8").as_deref() == Ok("1")
 }
 
+mod attn_fp8;
 #[cfg(test)]
 mod fp8_policy_tests;
 mod fp8_preservation;
@@ -529,16 +530,10 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         }
                         continue;
                     }
-                    // ATLAS_NO_ATTN_FP8 forces the dequant→NVFP4 attention path
-                    // for A/B against the native-FP8 prefill transpose — mirrors
-                    // the ATLAS_NO_GDN_FP8 / ATLAS_NO_Q2_ATTN debug levers.
-                    let native_fp8_attention = cfg!(atlas_hip)
-                        && std::env::var_os("ATLAS_NO_ATTN_FP8").is_none()
-                        && config.tp_world_size.max(1) == 1
-                        && ["q_proj", "k_proj", "v_proj", "o_proj"]
-                            .iter()
-                            .all(|name| proj_is_fp8_any_scale(store, &format!("{p}.{name}")));
-                    if native_fp8_attention {
+                    // Native FP8 q/k/v/o: HIP always, CUDA under
+                    // ATLAS_DENSE_NATIVE_FP8_ATTN=1; ATLAS_NO_ATTN_FP8 forces the
+                    // dequant→NVFP4 path for A/B (`qwen35_dense/attn_fp8.rs`).
+                    if attn_fp8::native(store, &p, tp_size) {
                         let load_fp8_proj = |name: &str,
                                              _n: usize,
                                              _k: usize,
@@ -586,6 +581,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         if let Err(e) = attn_layer.transpose_fp8_for_prefill(gpu, stream) {
                             tracing::warn!("Layer {i}: dense FP8 transpose failed: {e}");
                         }
+                        attn_layer.prepare_fp8_bf16mma(gpu)?;
                         layers.push(Box::new(attn_layer));
                         attn_idx += 1;
                         if (i + 1) % 10 == 0 {
@@ -1220,10 +1216,17 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                             .get(&format!("{la}.in_proj_z.weight"))
                             .map(|w| w.dtype),
                         Ok(WeightDtype::UInt8)
-                    ) && matches!(
-                        store.get(&format!("{la}.out_proj.weight")).map(|w| w.dtype),
-                        Ok(WeightDtype::UInt8)
                     );
+                    // out_proj may stay FP8 beside an NVFP4 qkvz (a precision
+                    // mix: the output projection is the most sensitive per byte).
+                    let out_fp8 =
+                        native_nvfp4 && proj_is_fp8_any_scale(store, &format!("{la}.out_proj"));
+                    let native_nvfp4 = native_nvfp4
+                        && (out_fp8
+                            || matches!(
+                                store.get(&format!("{la}.out_proj.weight")).map(|w| w.dtype),
+                                Ok(WeightDtype::UInt8)
+                            ));
                     if native_nvfp4 {
                         let qkv_qw = quantized_auto(
                             store,
@@ -1238,22 +1241,38 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                             Nvfp4Variant::Standard,
                         )?;
                         let qkvz_nvfp4 = qkv_qw.concat_rows(&z_qw, qkv_rows, z_rows, h, gpu)?;
-                        if cfg!(atlas_hip) {
-                            store.reclaim(gpu, &format!("{la}.in_proj_qkv.weight"))?;
-                            store.reclaim(gpu, &format!("{la}.in_proj_qkv.weight_scale"))?;
-                            store.reclaim(gpu, &format!("{la}.in_proj_z.weight"))?;
-                            store.reclaim(gpu, &format!("{la}.in_proj_z.weight_scale"))?;
-                        }
+                        // The concat copied both projections; nothing reads the
+                        // store's separate qkv / z again on this branch (2.1 GB
+                        // on the 27B). Synchronized first: the concat's copies
+                        // must land before their sources are freed.
+                        gpu.synchronize(0)?;
+                        store.reclaim(gpu, &format!("{la}.in_proj_qkv.weight"))?;
+                        store.reclaim(gpu, &format!("{la}.in_proj_qkv.weight_scale"))?;
+                        store.reclaim(gpu, &format!("{la}.in_proj_z.weight"))?;
+                        store.reclaim(gpu, &format!("{la}.in_proj_z.weight_scale"))?;
                         let qkvz_nvfp4_t = qkvz_nvfp4.transpose_for_gemm(gpu, qkvz_size, h)?;
 
-                        let out_proj_nvfp4 = quantized_auto(
-                            store,
-                            &format!("{la}.out_proj"),
-                            gpu,
-                            Nvfp4Variant::Standard,
-                        )?;
-                        let out_proj_nvfp4_t =
-                            out_proj_nvfp4.transpose_for_gemm(gpu, h, value_dim)?;
+                        let (out_proj_nvfp4, out_proj_nvfp4_t, out_f) = if out_fp8 {
+                            let out_f = load_fp8_block_scaled_as_fp8weight(
+                                store,
+                                &format!("{la}.out_proj"),
+                                gpu,
+                            )?;
+                            (
+                                crate::weight_map::QuantizedWeight::null(),
+                                None,
+                                Some(out_f),
+                            )
+                        } else {
+                            let w = quantized_auto(
+                                store,
+                                &format!("{la}.out_proj"),
+                                gpu,
+                                Nvfp4Variant::Standard,
+                            )?;
+                            let t = w.transpose_for_gemm(gpu, h, value_dim)?;
+                            (w, Some(t), None)
+                        };
 
                         let ssm = SsmWeights {
                             in_proj_qkvz: DenseWeight {
@@ -1273,14 +1292,32 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                             ffn,
                             Some(qkvz_nvfp4),
                             Some(qkvz_nvfp4_t),
-                            Some(out_proj_nvfp4_t),
+                            out_proj_nvfp4_t,
                             config,
                             gpu,
                         )?;
-                        layer.predequant_for_prefill(gpu, config, stream)?;
+                        if out_f.is_some() {
+                            layer.set_fp8_decode_weights(None, out_f);
+                            if let Err(e) = layer.transpose_fp8_for_prefill(gpu, stream) {
+                                tracing::warn!("SSM[{lp}] fp8 prefill transpose skipped: {e}");
+                            }
+                        }
+                        // Prefill on BF16 tensor cores reads the transposed
+                        // tables (`prefill_bf16mma.rs`); without that lever the
+                        // out_proj arms want the FP8 predequant.
+                        if crate::layers::ops::DenseBf16mma::lever() {
+                            layer.prepare_dense_bf16mma(gpu)?;
+                        } else {
+                            layer.predequant_for_prefill(gpu, config, stream)?;
+                        }
                         tracing::info!(
-                            "SSM[{lp}] native NVFP4 GDN: qkvz+out_proj loaded pre-quantized \
-                             (U8-packed on disk; no BF16 dequant/requant roundtrip)"
+                            "SSM[{lp}] native NVFP4 GDN: qkvz{} loaded pre-quantized \
+                             (U8-packed on disk; no BF16 dequant/requant roundtrip)",
+                            if out_fp8 {
+                                ", out_proj FP8"
+                            } else {
+                                "+out_proj"
+                            }
                         );
                         layers.push(Box::new(layer));
                         continue;

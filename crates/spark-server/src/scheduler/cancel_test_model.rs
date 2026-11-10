@@ -39,6 +39,12 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+thread_local! {
+    /// What [`Model::verify_bit_exact`] answers on this test thread (an
+    /// `ATLAS_EXACT_VERIFY` target, `verify_dflash_step::exact_picks` tests).
+    pub(super) static EXACT_VERIFY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub(super) struct Script {
     pub rows: Vec<Vec<f32>>,
     pub cursor: usize,
@@ -272,6 +278,9 @@ impl Model for TestModel {
         anyhow::ensure!(self.verify.is_some(), "no scripted owner tail");
         self.log(format!("owner {owner}"));
         Ok(())
+    }
+    fn verify_bit_exact(&self) -> bool {
+        EXACT_VERIFY.with(|e| e.get())
     }
     fn verify_logits_argmax_only(&self) -> bool {
         self.verify.is_some()

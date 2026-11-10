@@ -168,6 +168,17 @@ pub fn w4a16_gemv_dual(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    if super::skinny_mma::try_w4a16(
+        gpu,
+        kernel,
+        input,
+        &[(weight1, output1, n), (weight2, output2, n)],
+        (1, k),
+        n,
+        stream,
+    )? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([w4a16_gemv_grid_x(n), 1, 2])
         .block([256, 1, 1])
@@ -201,6 +212,17 @@ pub fn w4a16_gemv_dual_sw(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    if super::skinny_mma::try_w4a16(
+        gpu,
+        kernel,
+        input,
+        &[(weight1, output1, n), (weight2, output2, n)],
+        (1, k),
+        n,
+        stream,
+    )? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([w4a16_gemv_sw_grid_x(n), 1, 2])
         .block([256, 1, 1])
@@ -299,6 +321,20 @@ pub fn w8a16_gemv_dual(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    if super::skinny_mma::try_w8a16(
+        gpu,
+        kernel,
+        input,
+        &[
+            ((weight1, row_scale1), output1, n),
+            ((weight2, row_scale2), output2, n),
+        ],
+        (1, k),
+        n,
+        stream,
+    )? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 2])
         .block([256, 1, 1])

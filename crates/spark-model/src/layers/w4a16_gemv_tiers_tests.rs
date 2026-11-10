@@ -127,3 +127,28 @@ fn default_table_is_empty_and_declines() {
 fn widths_are_ascending() {
     assert!(W4A16_BATCHM_WIDTHS.windows(2).all(|w| w[0] < w[1]));
 }
+
+/// The exact-verify pick: the scalar tiers to 8 rows, the passed batch16
+/// for 9..=16 (a DFlash K=γ verify), nothing wider without the skinny
+/// kernels (none resolve in a unit test), and never a tensor-core
+/// tier (an empty table has no scalar tier, so 2..=8 decline there).
+#[test]
+fn exact_kernel_is_scalar_to_eight_then_batch16() {
+    use spark_runtime::gpu::KernelHandle;
+    let b16 = KernelHandle(16);
+    let t = W4a16BatchmTiers::default();
+    for m in 0..=8 {
+        assert_eq!(
+            t.exact_kernel(m, 5120, b16).0,
+            t.scalar_kernel(m).0,
+            "m={m}"
+        );
+    }
+    for m in 9..=16 {
+        assert_eq!(t.exact_kernel(m, 5120, b16).0, 16, "m={m}");
+        assert_eq!(t.exact_kernel(m, 5120, KernelHandle(0)).0, 0, "m={m}");
+    }
+    for m in [17, 24, 32] {
+        assert_eq!(t.exact_kernel(m, 5120, b16).0, 0, "m={m}");
+    }
+}

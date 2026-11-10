@@ -725,6 +725,7 @@ pub(crate) fn load_model(
         }
     }
     let dflash_drafter_state = serve_phases::load_dflash_drafter(&args, &ptx_set, gpu.as_ref())?;
+    let dflash_alt_state = serve_phases::load_dflash_drafter_alt(&args, gpu.as_ref())?;
     // LoRA adapters: resolve + load BEFORE `gpu` is moved into build_model.
     // `lora_states` must outlive build_model (lora_args borrows &l.store) and
     // stays alive until after AppState construction (adapter name clones).
@@ -770,6 +771,7 @@ pub(crate) fn load_model(
                 } else {
                     None
                 },
+                alt: dflash_alt_state.as_ref().map(|(s, c)| (s, c.clone())),
             });
     // NLLB / M2M-100: resolve the translation language pair to token ids from
     // the checkpoint tokenizer (the ChatTokenizer isn't built until after the

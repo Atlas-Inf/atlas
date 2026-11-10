@@ -8,7 +8,7 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
-use super::{DenseBf16mma, QUANT_MAX_K, SMEM_W4A8};
+use super::{DenseBf16mma, QUANT_MAX_K, SMEM_W4A4, SMEM_W4A8};
 
 /// The MX8 down: the W4A8 stages plus two groups of 128 tokens' 16 scale
 /// bytes (`db_smem_bytes` with `DB_A_MX8`).
@@ -18,8 +18,11 @@ const SMEM_W4A8_MX: u32 = SMEM_W4A8 + 2 * 128 * 16;
 /// token (on top of `ATLAS_DENSE_PREFILL_BF16MMA=1`). NVFP4 weights take
 /// NVFP4 tokens (W4A4, `kind::mxf4nvf4`: `gu,dn,qkv,o`) or E4M3 tokens
 /// (W4A8, the weights re-encoded as block-scaled E4M3: `gu8,dn8,qkv8,o8`);
-/// the FP8 GDN projections take E4M3 tokens (W8A8: `qkvz,gout`). The value
-/// is `1` for [`LowpMix::DEFAULT`] or a comma list of those names.
+/// the GDN projections take E4M3 tokens (`qkvz,gout`: W8A8 on FP8 weights,
+/// W4A8 on NVFP4 ones; they have no W4A4 form), and native
+/// FP8 attention (`ATLAS_DENSE_NATIVE_FP8_ATTN`) reads its E4M3-token bits
+/// `qkv8,o8` as W8A8 (`qkv,o` leave its tokens BF16). The value is `1` for
+/// [`LowpMix::DEFAULT`] or a comma list of those names.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LowpMix(pub(super) u16);
 
@@ -37,6 +40,10 @@ impl LowpMix {
     /// An NVFP4 group's W4A8 bit: its W4A4 bit shifted by this (bits 6..12
     /// are the shifted groups, so [`Self::DOWN_MX`] sits above them).
     pub(super) const A8: u32 = 6;
+    /// The E4M3-token bits of the attention groups (`qkv8`, `o8`): W4A8 on
+    /// NVFP4 weights, W8A8 on native FP8 ones.
+    pub const ATTN_QKV_A8: u16 = Self::ATTN_QKV << Self::A8;
+    pub const ATTN_O_A8: u16 = Self::ATTN_O << Self::A8;
     /// The NVFP4 groups, which have both a W4A4 and a W4A8 form.
     const NVFP4_GROUPS: [(&str, u16); 4] = [
         ("gu", Self::GATE_UP),
@@ -128,6 +135,12 @@ impl LowpMix {
                 tracing::warn!("{LOWP_VAR} has no effect without ATLAS_DENSE_PREFILL_BF16MMA=1");
             });
         }
+    }
+
+    /// Whether NVFP4 group `group` has a W4A4 form, i.e. is not a GDN group
+    /// (whose own bit means E4M3 tokens on either weight format).
+    pub fn nvfp4_has_w4a4(group: u16) -> bool {
+        group & (Self::GDN_QKVZ | Self::GDN_OUT) == 0
     }
 
     pub fn has(self, group: u16) -> bool {
@@ -329,6 +342,20 @@ impl DenseBf16mma {
 
     /// The low-precision twin serving this launch, if any: `(NVFP4 tokens,
     /// kernel, shared memory)`. `a8` is the E4M3-token kernel and its group bit.
+    /// The token format of an NVFP4 projection in group `lowp.group`: E4M3
+    /// (W4A8) or NVFP4 (W4A4) where its bits ask, BF16 (`None`) otherwise.
+    /// The GDN groups' own bit is E4M3 tokens, as on FP8 weights; they have
+    /// no W4A4 form.
+    pub(super) fn nvfp4_lowp(&self, lowp: &LowpArgs, k: u32) -> Option<(bool, KernelHandle, u32)> {
+        if LowpMix::nvfp4_has_w4a4(lowp.group) {
+            let a8 = (lowp.group << LowpMix::A8, self.w4a8, SMEM_W4A8);
+            self.lowp_kernel(lowp, k, (self.w4a4, SMEM_W4A4), a8)
+        } else {
+            let a8 = (lowp.group, self.w4a8, SMEM_W4A8);
+            self.lowp_kernel(lowp, k, (KernelHandle(0), 0), a8)
+        }
+    }
+
     pub(super) fn lowp_kernel(
         &self,
         lowp: &LowpArgs,
@@ -366,6 +393,17 @@ mod tests {
         // The unknown name is dropped, and said so.
         assert_eq!(notes, vec!["unknown name \"bogus\" ignored".to_string()]);
         assert!(LowpMix::parse("gu8,dnmx").has(LowpMix::DOWN_MX));
+        // The GDN groups have no W4A4 form; the others do.
+        assert!(!LowpMix::nvfp4_has_w4a4(LowpMix::GDN_QKVZ));
+        assert!(!LowpMix::nvfp4_has_w4a4(LowpMix::GDN_OUT));
+        assert!(LowpMix::nvfp4_has_w4a4(LowpMix::DOWN) && LowpMix::nvfp4_has_w4a4(LowpMix::ATTN_O));
+        // Native FP8 attention's W8A8 bits are the qkv8 / o8 names.
+        assert!(LowpMix::parse("qkv8,o8").has(LowpMix::ATTN_QKV_A8));
+        assert!(LowpMix::parse("qkv8,o8").has(LowpMix::ATTN_O_A8));
+        assert!(!LowpMix::parse("qkv,o").has(LowpMix::ATTN_QKV_A8));
+        assert!(
+            LowpMix::DEFAULT.has(LowpMix::ATTN_QKV_A8) && LowpMix::DEFAULT.has(LowpMix::ATTN_O_A8)
+        );
         assert!(!LowpMix::parse("1").has(LowpMix::DOWN_MX));
         assert_eq!(
             LowpMix::parse("all"),

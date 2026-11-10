@@ -326,6 +326,7 @@ extern "C" __global__ void w4a16_gemv_dual_sw(
     unsigned int N,
     unsigned int K
 ) {
+    atlas_pdl_enter();
     const unsigned int proj = blockIdx.z;
     const unsigned char* B_packed = proj == 0 ? B1_packed : B2_packed;
     const unsigned char* B_scale = proj == 0 ? B1_scale : B2_scale;

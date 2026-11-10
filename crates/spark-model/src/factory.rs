@@ -44,6 +44,9 @@ pub struct DflashBuildArgs<'a> {
     pub drafter_config: DflashConfig,
     pub gamma: Option<usize>,
     pub window_size: Option<usize>,
+    /// `--draft-model-alt`: a second drafter for the same target, routed per
+    /// request beside the first (`layers::dflash_head::dual`).
+    pub alt: Option<(&'a WeightStore, DflashConfig)>,
 }
 
 /// LoRA adapter build arguments (`--lora-adapter NAME=PATH`). `None` for

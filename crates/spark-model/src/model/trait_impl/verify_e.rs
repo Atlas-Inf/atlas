@@ -153,8 +153,9 @@ impl TransformerModel {
         }
         off.push(acc);
         let r_total = acc;
-        // DFlash: per-layer capture needs each sequence's STABLE owner slot —
-        // the capture regions are slot-indexed (`try_dflash_capture_batched_at`),
+        // DFlash: per-layer capture needs each sequence's hidden-save region
+        // (`SequenceState::dflash_hidden_save_slot`, its live SSM slot) — the
+        // capture regions are slot-indexed (`try_dflash_capture_batched_at`),
         // never batch-positioned, because the batch reorders on churn and a
         // position-keyed write would hand the re-propose a dead sequence's
         // hiddens. Resolved here, before the iter_mut walks below. `None` on

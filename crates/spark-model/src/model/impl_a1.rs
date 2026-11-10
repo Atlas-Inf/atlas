@@ -34,10 +34,19 @@ use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 ///
 /// Measured C=16: 113.10 -> 119.32 tok/s (+5.50%, disjoint ranges, 4 reps).
 /// `padded_n <= 4` is untouched and stays byte-identical, so C=1 is unaffected.
-/// The twin costs ~681 MB and leaves the KV pool at 4759 blocks vs 4757 without
-/// it — no measurable KV impact.
-fn lmhead_tgemm_enabled() -> bool {
+/// The twin costs ~681 MB, built after the KV budget, which reserves it
+/// ([`lm_head_twin_bytes`]).
+pub(crate) fn lmhead_tgemm_enabled() -> bool {
     std::env::var("ATLAS_NO_LMHEAD_TGEMM").ok().as_deref() != Some("1")
+}
+
+/// Bytes of the NVFP4 LM head's transposed twin (`vocab` padded to 128 rows of
+/// `hidden / 2` codes and `hidden / 16` scales), 0 when it is not built.
+pub(crate) fn lm_head_twin_bytes(nvfp4_head: bool, vocab: usize, hidden: usize) -> usize {
+    if !nvfp4_head || !lmhead_tgemm_enabled() {
+        return 0;
+    }
+    vocab.div_ceil(128) * 128 * (hidden / 2 + hidden / 16)
 }
 
 impl TransformerModel {
@@ -184,6 +193,19 @@ impl TransformerModel {
         let mut levers = ops::ModelLevers::from_env();
         levers.max_decode_seqs = (max_batch_size as u32).max(1);
         levers.qwen4exp_exact_verify = super::qwen4exp_exact_verify::lever(&config.model_type)?;
+        levers.exact_verify = levers.qwen4exp_exact_verify
+            || super::exact_verify::lever(&config.model_type, &levers)?;
+        if levers.dense_exact_verify() {
+            let dflash = !config.dflash_capture_layers.is_empty();
+            levers.exact_verify_rows = super::exact_verify::max_rows(dflash) as u32;
+            if dflash {
+                tracing::info!(
+                    "exact verify covers the DFlash K=γ verify (one sequence, up to {} rows)",
+                    levers.exact_verify_rows
+                );
+            }
+        }
+        levers.dense_batch_exact = super::exact_verify::batch_lever(&levers);
         levers.qwen4exp_batch_fast = super::qwen4exp_batch_fast::lever(&config.model_type)?;
         levers.qwen4exp_mtp_depth = super::qwen4exp_mtp_depth::lever(
             &config.model_type,

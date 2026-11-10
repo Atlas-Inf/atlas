@@ -237,7 +237,6 @@ pub(crate) fn load_dflash_drafter(
         spark_model::weight_loader::DflashConfig,
     )>,
 > {
-    use spark_runtime::weights::WeightLoader;
     if !args.dflash {
         return Ok(None);
     }
@@ -249,9 +248,37 @@ pub(crate) fn load_dflash_drafter(
             "--dflash set but no drafter HF id provided: pass --draft-model <ID> \
              or use a target whose MODEL.toml has a [dflash] section",
         )?;
+    load_drafter(args, &drafter_id, gpu).map(Some)
+}
+
+/// `--draft-model-alt`'s drafter, when given (see [`load_dflash_drafter`]).
+pub(crate) fn load_dflash_drafter_alt(
+    args: &cli::ServeArgs,
+    gpu: &dyn spark_runtime::gpu::GpuBackend,
+) -> Result<
+    Option<(
+        spark_runtime::weights::WeightStore,
+        spark_model::weight_loader::DflashConfig,
+    )>,
+> {
+    match args.draft_model_alt.as_deref() {
+        Some(id) if args.dflash => load_drafter(args, id, gpu).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn load_drafter(
+    args: &cli::ServeArgs,
+    drafter_id: &str,
+    gpu: &dyn spark_runtime::gpu::GpuBackend,
+) -> Result<(
+    spark_runtime::weights::WeightStore,
+    spark_model::weight_loader::DflashConfig,
+)> {
+    use spark_runtime::weights::WeightLoader;
     tracing::info!("DFlash: resolving drafter '{drafter_id}'");
     let drafter_dir =
-        crate::model_resolver::resolve_model_dir(&drafter_id, args.cache_dir.as_deref())
+        crate::model_resolver::resolve_model_dir(drafter_id, args.cache_dir.as_deref())
             .context("Failed to resolve DFlash drafter checkpoint")?;
     let drafter_config_json = std::fs::read_to_string(drafter_dir.join("config.json"))
         .with_context(|| {
@@ -273,10 +300,7 @@ pub(crate) fn load_dflash_drafter(
             "DFlash: rank {} keeps the drafter config only; the head proposes",
             args.rank
         );
-        return Ok(Some((
-            spark_runtime::weights::WeightStore::empty(),
-            drafter_config,
-        )));
+        return Ok((spark_runtime::weights::WeightStore::empty(), drafter_config));
     }
     // The fast loader stores the same tensors and bytes
     // (`dflash_fast_load_check`: 0.6 s against 5.3 s for the 2.2 GB drafter).
@@ -308,7 +332,7 @@ pub(crate) fn load_dflash_drafter(
         drafter_store.len(),
         drafter_store.total_bytes()
     );
-    Ok(Some((drafter_store, drafter_config)))
+    Ok((drafter_store, drafter_config))
 }
 
 /// Startup-loaded LoRA adapter: its own WeightStore + parsed PEFT config.
@@ -419,7 +443,14 @@ fn skip_mtp(config: &ModelConfig, args: &cli::ServeArgs) -> bool {
     // 5.21 GB of BF16 held resident for nothing, which on a 119.6 GB unified box
     // comes straight out of the KV cache. With the flag it is the drafter, on
     // rank 0 only (`factory::build`): every other rank skips it as well.
-    matches!(config.model_type.as_str(), "qwen4_exp") && (!args.speculative || config.ep_rank != 0)
+    let qwen4_exp = matches!(config.model_type.as_str(), "qwen4_exp")
+        && (!args.speculative || config.ep_rank != 0);
+    // The dense hybrid under `--dflash`: the DFlash drafter is the only
+    // proposer, so an MTP head would be built only to be replaced (its BF16
+    // weights, 0.85 GB on the 27B, and a private KV pool as large as 1/16 of
+    // the target's, left allocated for the life of the process).
+    let dense_dflash = config.model_type == "qwen3_5" && args.dflash && !args.speculative;
+    qwen4_exp || dense_dflash
 }
 
 #[cfg(test)]
@@ -442,6 +473,20 @@ mod tests {
         assert!(!skip_mtp(&config, &args(&["--speculative"])));
         config.ep_rank = 1;
         assert!(skip_mtp(&config, &args(&["--speculative"])));
+    }
+
+    /// The dense hybrid uploads `mtp.*` unless DFlash replaces the MTP head.
+    #[test]
+    fn qwen3_5_skips_mtp_under_dflash_only() {
+        let args = |more: &[&str]| {
+            let argv = ["spark", "some/model"].iter().chain(more);
+            crate::cli::ServeArgs::parse_from(argv)
+        };
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "qwen3_5".to_string();
+        assert!(!skip_mtp(&config, &args(&[])));
+        assert!(!skip_mtp(&config, &args(&["--speculative"])));
+        assert!(skip_mtp(&config, &args(&["--dflash"])));
     }
 
     #[test]

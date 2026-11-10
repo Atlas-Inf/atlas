@@ -51,10 +51,11 @@ fn integration_nvfp4_installs_for_the_actual_execution_route() {
         if scalar_present {
             head.kernels.w4a16_gemv_batch4 = KernelHandle(1);
             head.kernels.w4a16_gemv_batch8 = KernelHandle(1);
+            head.kernels.w4a16_gemv_batch16 = KernelHandle(1);
         }
         // No numerical emulation: empty layers isolate the real install gate.
         head.install_twins(&gpu).unwrap();
-        let expected = gamma > 0 && (mode == "tc" || (gamma <= 8 && scalar_present));
+        let expected = gamma > 0 && (mode == "tc" || (gamma <= 16 && scalar_present));
         assert_eq!(
             matches!(head.quant, DflashQuantization::Nvfp4Weights),
             expected,

@@ -28,6 +28,19 @@ pub fn w4a16_gemv_qg(
     head_dim: u32,
     stream: u64,
 ) -> Result<()> {
+    let shape = (1, n, k);
+    if crate::layers::ops::skinny_mma::try_qg(
+        gpu,
+        kernel,
+        input,
+        weight,
+        output,
+        shape,
+        (num_heads, head_dim),
+        stream,
+    )? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -103,6 +116,19 @@ pub fn w4a16_gemv_qg_batch2(
     head_dim: u32,
     stream: u64,
 ) -> Result<()> {
+    let shape = (2, n, k);
+    if crate::layers::ops::skinny_mma::try_qg(
+        gpu,
+        kernel,
+        input,
+        weight,
+        output,
+        shape,
+        (num_heads, head_dim),
+        stream,
+    )? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -139,6 +165,19 @@ pub fn w4a16_gemv_qg_batch3(
     head_dim: u32,
     stream: u64,
 ) -> Result<()> {
+    let shape = (3, n, k);
+    if crate::layers::ops::skinny_mma::try_qg(
+        gpu,
+        kernel,
+        input,
+        weight,
+        output,
+        shape,
+        (num_heads, head_dim),
+        stream,
+    )? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -170,6 +209,19 @@ pub fn w4a16_gemv_qg_batch4(
     head_dim: u32,
     stream: u64,
 ) -> Result<()> {
+    let shape = (4, n, k);
+    if crate::layers::ops::skinny_mma::try_qg(
+        gpu,
+        kernel,
+        input,
+        weight,
+        output,
+        shape,
+        (num_heads, head_dim),
+        stream,
+    )? {
+        return Ok(());
+    }
     w4a16_gemv_qg_batch3(
         gpu, kernel, input, weight, output, n, k, num_heads, head_dim, stream,
     )
@@ -196,6 +248,10 @@ pub fn w4a16_gemv_dual_batch3(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    let parts = [(weight0, output0, n), (weight1, output1, n)];
+    if crate::layers::ops::skinny_mma::try_w4a16(gpu, kernel, input, &parts, (3, k), n, stream)? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 2])
         .block([256, 1, 1])
@@ -234,6 +290,10 @@ pub fn w4a16_gemv_dual_batch2(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    let parts = [(weight0, output0, n), (weight1, output1, n)];
+    if crate::layers::ops::skinny_mma::try_w4a16(gpu, kernel, input, &parts, (2, k), n, stream)? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 2])
         .block([256, 1, 1])
