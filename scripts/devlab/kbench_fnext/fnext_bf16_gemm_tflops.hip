@@ -1,6 +1,8 @@
 // KLOOP #25 (G3): Flash-Next keeps linear_attn / self_attn / shared_expert / hyper-connection weights BF16 in the NVFP4
 // pack, and those run as Tensile Cijk_Alik_Bljk BF16 GEMMs: 18-21% of prefill GPU time (runner profiles 42825832209,
 // 42835428664). Is that at the gfx1151 BF16 ceiling (then quantizing them is the only lever), or underfed?
+// KLOOP #26: also int8 x int8 -> int32 (rocblas_datatype_i8_r, i32 compute) at the same shapes: is RDNA3.5 int8 WMMA
+// really 2x BF16 through rocBLAS? If so W8A8 is the Flash-Next pp lever.
 // rocblas_gemm_ex, Y[N,M] = W[K,N]^T X[K,M] (the Alik layout), BF16 in/out, f32 compute, at M = 512/2048/4096 tokens.
 #include <rocblas/rocblas.h>
 #include <hip/hip_bfloat16.h>
@@ -32,6 +34,19 @@ int main() {
             const int it = 20; CHECK(hipEventRecord(e0)); for (int i = 0; i < it; i++) run(); CHECK(hipEventRecord(e1)); CHECK(hipEventSynchronize(e1));
             float ms; CHECK(hipEventElapsedTime(&ms, e0, e1)); ms /= it;
             printf("  M=%-5d %-26s N=%-6d K=%-5d %8.1f us  %6.1f TFLOP/s\n", M, s.name, N, K, 1000 * ms, 2.0 * M * N * K / (ms / 1000) / 1e12);
+            {   // int8 x int8 -> int32 at the same shape (K multiple of 4 holds for every shape here)
+                int8_t *Wi, *Xi; int32_t* Yi; CHECK(hipMalloc(&Wi, (size_t)K * N)); CHECK(hipMalloc(&Xi, (size_t)K * M)); CHECK(hipMalloc(&Yi, (size_t)N * M * 4));
+                CHECK(hipMemset(Wi, 3, (size_t)K * N)); CHECK(hipMemset(Xi, 5, (size_t)K * M));
+                const int32_t ai = 1, bi = 0;
+                auto runi = [&] { RB(rocblas_gemm_ex(h, rocblas_operation_transpose, rocblas_operation_none, N, M, K, &ai,
+                    Wi, rocblas_datatype_i8_r, K, Xi, rocblas_datatype_i8_r, K, &bi, Yi, rocblas_datatype_i32_r, N,
+                    Yi, rocblas_datatype_i32_r, N, rocblas_datatype_i32_r, rocblas_gemm_algo_standard, 0, 0)); };
+                for (int i = 0; i < 3; i++) runi();
+                CHECK(hipEventRecord(e0)); for (int i = 0; i < it; i++) runi(); CHECK(hipEventRecord(e1)); CHECK(hipEventSynchronize(e1));
+                float mi; CHECK(hipEventElapsedTime(&mi, e0, e1)); mi /= it;
+                printf("  M=%-5d %-26s int8 %8.1f us  %6.1f TOP/s  (%.2fx bf16)\n", M, s.name, 1000 * mi, 2.0 * M * N * K / (mi / 1000) / 1e12, ms / mi);
+                hipFree(Wi); hipFree(Xi); hipFree(Yi);
+            }
             hipFree(W); hipFree(X); hipFree(Y); hipEventDestroy(e0); hipEventDestroy(e1);
         }
     }
