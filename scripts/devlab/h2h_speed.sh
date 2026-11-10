@@ -30,7 +30,12 @@ bench_arm() { # arm-name [gufo_bench concurrency list, default 1,4,8] [wait_read
 case $ENGINE in
 atlas)
   [ -x target/release/spark ] || { log "no target/release/spark (run with job=bench, which builds it)"; exit 1; }
-  NV=$(hf_get "$NVFP4_REPO" "") || { log "NVFP4 DOWNLOAD FAILED: $(grep -av "^ " "$OUT/download.log" | tail -8)"; exit 1; }
+  # The 53.7 GB model-fp8-mtp-ple.safetensors is over huggingface_hub's plain-HTTP cap and the mirror serves no xet,
+  # so pull everything else through the hub cache and curl that one file (resumable) into the snapshot dir.
+  BIG=model-fp8-mtp-ple.safetensors
+  NV=$("${PY:-python3}" -c 'import sys; from huggingface_hub import snapshot_download as s; print(s(sys.argv[1], ignore_patterns=[sys.argv[2]]))' "$NVFP4_REPO" "$BIG" 2>>"$OUT/download.log") \
+    && curl -fsSL -C - --retry 5 --retry-all-errors -o "$NV/$BIG" "${HF_ENDPOINT:-https://huggingface.co}/$NVFP4_REPO/resolve/main/$BIG" 2>>"$OUT/download.log" \
+    || { log "NVFP4 DOWNLOAD FAILED: $(grep -av "^ " "$OUT/download.log" | tail -8)"; exit 1; }
   log "atlas $(git rev-parse --short=9 HEAD), $NVFP4_REPO ($(du -shL "$NV" | cut -f1))"
   AENV=(GPU_UTIL=${GPU_UTIL:-0.70} MAX_SEQ_LEN=32768 ATLAS_KV_EXTERNAL_RESERVE_GB=0)
   atlas_up $PORT "$NVFP4_REPO" "${AENV[@]}" MAX_BATCH=1; bench_arm atlas_b1 1
