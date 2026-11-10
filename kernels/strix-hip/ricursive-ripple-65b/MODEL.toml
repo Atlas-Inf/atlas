@@ -1,0 +1,123 @@
+# Ricursive Ripple-65B Preview (`model_type: ricursive`), Strict.
+#
+# Dense 80-layer transformer: 4 sliding-window (1024, RoPE theta 10000)
+# layers then 1 full-attention NoPE layer, repeated. 80 Q / 8 KV heads at
+# head_dim 128, gated attention (g_proj interleaved into q_proj at load),
+# Gemma-style pre/post sublayer norms with plain `x * w` weights, value
+# residuals from the scaled layer-0 embedding, SwiGLU clamped at 20.
+# Checkpoint formats are kept (Strict): ModelOpt NVFP4 MLPs (W4A16 single-token
+# decode, W4A4 at the checkpoint's input scales for multi-row passes),
+# BF16 attention / embedding / lm_head, BF16 KV cache.
+#
+# STRIX-HIP (gfx1151). KERNELS: the compiled set is qwen3.6-27b's gfx1151 tree
+# (`kernel_source`): BF16 paged attention with a sliding window, NVFP4 W4A16
+# dense FFN incl. the transposed m128 GEMM. Built with -DHDIM=128 (nvfp4/
+# KERNEL.toml) — those attention kernels fix head_dim at compile time. The
+# `nvfp4/` overlay carries the gb10 target's portable Ripple kernels verbatim
+# (embedding scale, value-residual lerp, clamped SwiGLU, strided plain-w RMS
+# norm, verify-row attention). Not ported: the W4A4 multi-row FFN and the
+# cp.async m32 GEMVs. gfx1151 has no FP4 MMA, so multi-row FFN passes (DFlash
+# verify, prefill) run W4A16 on transposed twins (the loader's HIP arm), and the
+# verify-row BF16 projections take the GEMM fallback.
+
+[model]
+name = "ricursive-ripple-65b"
+hf_id = "ricursiveAI/Ripple-65B-Preview-NVFP4"
+model_type = "ricursive"
+architecture = "Dense hybrid sliding/full attention, gated attention, value residuals"
+parameters = "65B"
+kernel_source = "qwen3.6-27b"
+layers_total = 80
+layers_sliding_attention = 64
+layers_full_attention = 16
+layer_pattern = "4 sliding attention followed by 1 full attention (NoPE)"
+hidden_dim = 5120
+head_dim = 128
+q_heads = 80
+kv_heads = 8
+intermediate_size = 40960
+rope_theta = 10000
+vocab_size = 100352
+max_position_embeddings = 2097152
+sliding_window = 1024
+vision = false
+mtp_layers = 0
+
+# The checkpoint ships no sampling defaults (generation_config.json carries
+# token ids only). Neutral presets (use_sampling_presets_for_core = true):
+# plain temperature / top-p sampling as the reference engine does, with the
+# CLI's min_p / top_n_sigma filters off. Request values always win.
+[sampling.thinking_text]
+temperature = 1.0
+top_p = 1.0
+top_k = 0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.thinking_coding]
+temperature = 1.0
+top_p = 1.0
+top_k = 0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.non_thinking]
+temperature = 1.0
+top_p = 1.0
+top_k = 0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.tools]
+temperature = 1.0
+top_p = 1.0
+top_k = 0
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[behavior]
+enable_think_loop_watchdog = false
+honor_eos_inside_thinking = true
+confidence_early_stop = false
+rollback_resteer = false
+thinking_in_tools = true
+cap_thinking_at_max_tokens = false
+# The template never opens <think>; the model emits it when it reasons.
+thinking_default = false
+default_kv_dtype = "bf16"
+# `<tool_call>\n{"name": ..., "arguments": {...}}\n</tool_call>` (Hermes JSON).
+tool_call_parser = "hermes"
+use_sampling_presets_for_core = true
+disable_cwd_hint_injection = true
+
+[[model_types]]
+model_type = "ricursive"
+hidden_size = 5120
+
+# DFlash2 drafter (`ricursiveAI/Ripple-65B-Preview-DFlash2`): 5 layers (4
+# sliding 4096 + 1 full NoPE), conv kernel 4, selector top-k 32, taps the
+# target's post-block states at layers 1/20/39/58/77 (zero-based). gamma 32
+# is SGLang's verified block (--speculative-num-draft-tokens 32): 1 anchor +
+# 31 drafts. Serve with --dflash-window-size 16384 (the full draft layer's
+# training context); `window_size` here is documentation only.
+# gfx1151: gamma 16 — verify cost grows ~linearly with rows on this
+# bandwidth-bound part (measured on framework, f239: 16-token blocks).
+[dflash]
+draft_model = "ricursiveAI/Ripple-65B-Preview-DFlash2"
+gamma = 16
+window_size = 16384
+mask_token_id = 100278
+target_layer_ids = [1, 20, 39, 58, 77]
