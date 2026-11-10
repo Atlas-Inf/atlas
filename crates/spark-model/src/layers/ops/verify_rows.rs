@@ -85,7 +85,7 @@ pub fn fp8_gemv_m32(
 pub const W4A4_GEMV_MAX_M: u32 = 32;
 
 /// Small-M W4A4 GEMV (`w4a4_gemv_m32_bn{32,16}`, Ricursive target): the
-/// operands and scales of [`w4a4_gemm_mfast_scaled`] for
+/// operands and scales of `w4a4_gemm_mfast_scaled` for
 /// `m <= W4A4_GEMV_MAX_M` rows. `kernels` = (32-row, 16-row) weight-panel
 /// variants; the 16-row panel keeps narrow N (the down projection) at full
 /// occupancy.
@@ -129,7 +129,7 @@ pub fn w4a4_gemv_m32(
 }
 
 /// DFlash verify attention for one sequence's `q_len` rows
-/// (`ricursive_verify_attn`): [`prefill_attention_paged`]'s BF16 kernel with
+/// (`ricursive_verify_attn`): `prefill_attention_paged`'s BF16 kernel with
 /// the KV extent read from `dev_kv_len` (the last row's device `seq_len`),
 /// so the launch carries no per-step host values and can be graph-captured.
 #[allow(clippy::too_many_arguments)]

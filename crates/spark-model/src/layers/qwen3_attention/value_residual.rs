@@ -71,7 +71,7 @@ impl Qwen3AttentionLayer {
             .filter(|k| k.0 != 0 && rows as u32 <= crate::layers::ops::BF16_GEMV_MAX_M)
     }
 
-    /// Every V path blends through [`Self::value_residual_input`]; the
+    /// Every V path blends through `Self::value_residual_input`; the
     /// quantized Q/K/V arms project V from activations quantized from the
     /// un-blended rows, so value residuals require dense BF16 projections.
     pub fn set_value_residual(&mut self, vr: ValueResidual) -> Result<()> {
