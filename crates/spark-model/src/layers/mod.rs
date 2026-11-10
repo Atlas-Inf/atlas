@@ -315,4 +315,6 @@ impl FfnComponent {
 }
 
 #[cfg(test)]
+pub(crate) mod bf16mma_test_ref;
+#[cfg(test)]
 pub(crate) mod glm_gpu_test_backend;

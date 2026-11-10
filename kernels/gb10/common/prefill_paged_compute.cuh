@@ -180,6 +180,14 @@ extern "C" __global__ void KERNEL_NAME(
     const unsigned int batch_size,
     const int* __restrict__ cu_seqlens,
     const int* __restrict__ kv_lens,
+#ifdef PREFILL_STATE_END
+    // Prefix-bidirectional score streams (Atlas `/v1/score`, "prefix_bidir"):
+    // `state_end[b]` >= 0 is stream b's state-block end in KV slot space; a
+    // query at slot p < state_end reads keys k < state_end, any other query
+    // reads every key k < kv_len (both directions). -1 (or a NULL array)
+    // keeps the stream causal. NULL is byte-identical to the build without it.
+    const int* __restrict__ state_end,
+#endif
 #ifdef PREFILL_BATCHED_INDIRECT_ARGS
     const unsigned int* __restrict__ batch_indirect_args,
 #endif
@@ -227,6 +235,11 @@ extern "C" __global__ void KERNEL_NAME(
 #endif
 #else
     const unsigned int q_len_eff = q_len;
+#endif
+#if defined(PREFILL_BATCHED) && defined(PREFILL_STATE_END)
+    const int s_end = (state_end != nullptr) ? state_end[b] : -1;
+#else
+    const int s_end = -1;
 #endif
     const unsigned int tid = threadIdx.x;
     const unsigned int warp_id = tid / 32;
@@ -296,8 +309,13 @@ extern "C" __global__ void KERNEL_NAME(
     float l_r0 = 0.0f, l_r1 = 0.0f;
 
     unsigned int num_kv_blocks = (kv_len + BC - 1) / BC;
-    { unsigned int mx = (q_offset + q_tile_end - 1) / BC;
-      num_kv_blocks = min(num_kv_blocks, mx + 1); }
+    if (s_end < 0) {
+        unsigned int mx = (q_offset + q_tile_end - 1) / BC;
+        num_kv_blocks = min(num_kv_blocks, mx + 1);
+    } else if (q_offset + q_tile_end <= (unsigned int)s_end) {
+        // Every row of this tile is a state row: keys past the state are masked.
+        num_kv_blocks = min(num_kv_blocks, ((unsigned int)s_end + BC - 1) / BC);
+    }
     // Sliding-window lower bound. The mask below drops any key with
     // (q_abs - k) >= sliding_window, so every KV block strictly below the
     // first in-window key is fully masked — start there instead of scoring
@@ -419,7 +437,13 @@ extern "C" __global__ void KERNEL_NAME(
                 // queries attend bidirectionally within their block; the prefix
                 // KV positions are still strictly < q_offset so they need no
                 // mask in the non-causal mode.
-                if(causal_mask_enabled){
+                if(s_end>=0){
+                    // Prefix-bidirectional: state rows see the state, question rows see all.
+                    const unsigned int lim0=(qr0<(unsigned int)s_end)?(unsigned int)s_end:kv_len;
+                    const unsigned int lim1=(qr1<(unsigned int)s_end)?(unsigned int)s_end:kv_len;
+                    if(kv_start+c0>=lim0) acc_s[nt][0]=-1e30f; if(kv_start+c1>=lim0) acc_s[nt][1]=-1e30f;
+                    if(kv_start+c0>=lim1) acc_s[nt][2]=-1e30f; if(kv_start+c1>=lim1) acc_s[nt][3]=-1e30f;
+                } else if(causal_mask_enabled){
                     if(kv_start+c0>qr0) acc_s[nt][0]=-1e30f; if(kv_start+c1>qr0) acc_s[nt][1]=-1e30f;
                     if(kv_start+c0>qr1) acc_s[nt][2]=-1e30f; if(kv_start+c1>qr1) acc_s[nt][3]=-1e30f;
                 }
@@ -698,6 +722,14 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     const unsigned int batch_size,
     const int* __restrict__ cu_seqlens,
     const int* __restrict__ kv_lens,
+#ifdef PREFILL_STATE_END
+    // Prefix-bidirectional score streams (Atlas `/v1/score`, "prefix_bidir"):
+    // `state_end[b]` >= 0 is stream b's state-block end in KV slot space; a
+    // query at slot p < state_end reads keys k < state_end, any other query
+    // reads every key k < kv_len (both directions). -1 (or a NULL array)
+    // keeps the stream causal. NULL is byte-identical to the build without it.
+    const int* __restrict__ state_end,
+#endif
 #ifdef PREFILL_BATCHED_INDIRECT_ARGS
     const unsigned int* __restrict__ batch_indirect_args,
 #endif
@@ -744,6 +776,11 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
 #endif
 #else
     const unsigned int q_len_eff = q_len;
+#endif
+#if defined(PREFILL_BATCHED) && defined(PREFILL_STATE_END)
+    const int s_end = (state_end != nullptr) ? state_end[b] : -1;
+#else
+    const int s_end = -1;
 #endif
     const unsigned int tid = threadIdx.x;
     const unsigned int warp_id = tid / 32;
@@ -805,8 +842,13 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     float l_r0 = 0.0f, l_r1 = 0.0f;
 
     unsigned int num_kv_blocks = (kv_len + BC - 1) / BC;
-    { unsigned int mx = (q_offset + q_tile_end - 1) / BC;
-      num_kv_blocks = min(num_kv_blocks, mx + 1); }
+    if (s_end < 0) {
+        unsigned int mx = (q_offset + q_tile_end - 1) / BC;
+        num_kv_blocks = min(num_kv_blocks, mx + 1);
+    } else if (q_offset + q_tile_end <= (unsigned int)s_end) {
+        // Every row of this tile is a state row: keys past the state are masked.
+        num_kv_blocks = min(num_kv_blocks, ((unsigned int)s_end + BC - 1) / BC);
+    }
     // Sliding-window lower bound. The mask below drops any key with
     // (q_abs - k) >= sliding_window, so every KV block strictly below the
     // first in-window key is fully masked — start there instead of scoring
@@ -927,7 +969,13 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
                 // Slot-space mask coordinate (kpos = slot index); see kv_block_lo note.
                 unsigned int qr0=q_offset+q_start+row0, qr1=q_offset+q_start+row1;
                 // Causal mask gated for DFlash γ-block (causal_mask_enabled=0).
-                if(causal_mask_enabled){
+                if(s_end>=0){
+                    // Prefix-bidirectional: state rows see the state, question rows see all.
+                    const unsigned int lim0=(qr0<(unsigned int)s_end)?(unsigned int)s_end:kv_len;
+                    const unsigned int lim1=(qr1<(unsigned int)s_end)?(unsigned int)s_end:kv_len;
+                    if(kv_start+c0>=lim0) acc_s[nt][0]=-1e30f; if(kv_start+c1>=lim0) acc_s[nt][1]=-1e30f;
+                    if(kv_start+c0>=lim1) acc_s[nt][2]=-1e30f; if(kv_start+c1>=lim1) acc_s[nt][3]=-1e30f;
+                } else if(causal_mask_enabled){
                     if(kv_start+c0>qr0) acc_s[nt][0]=-1e30f; if(kv_start+c1>qr0) acc_s[nt][1]=-1e30f;
                     if(kv_start+c0>qr1) acc_s[nt][2]=-1e30f; if(kv_start+c1>qr1) acc_s[nt][3]=-1e30f;
                 }

@@ -78,6 +78,7 @@ mod repetition;
 mod rollback;
 mod sample_step;
 pub mod sched_ctx;
+pub mod score;
 mod shared_prefix;
 #[cfg(test)]
 mod slot_compaction_tests;
@@ -253,6 +254,7 @@ pub fn run(
     mut model: Box<dyn Model>,
     request_rx: tokio::sync::mpsc::Receiver<InferenceRequest>,
     rotation_rx: tokio::sync::mpsc::Receiver<LoraRotation>,
+    score_rx: tokio::sync::mpsc::Receiver<score::ScoreJob>,
     eos_tokens: Vec<u32>,
     max_batch_size: usize,
     use_speculative: bool,
@@ -382,6 +384,7 @@ pub fn run(
             requests: Vec::new(),
             closed: false,
             rotations: Vec::new(),
+            scores: Vec::new(),
         }),
         Condvar::new(),
     ));
@@ -410,6 +413,19 @@ pub fn run(
         while let Some(rot) = rx.blocking_recv() {
             pr.0.lock().rotations.push(rot);
             pr.1.notify_one();
+        }
+    });
+
+    // Score receiver thread: `/v1/score` jobs land in `pending.scores` (a
+    // bounded backlog, see `score::admit`) and run at the same quiescent
+    // point as rotations (see `score.rs`).
+    let ps = Arc::clone(&pending);
+    std::thread::spawn(move || {
+        let mut rx = score_rx;
+        while let Some(job) = rx.blocking_recv() {
+            if score::admit(&mut ps.0.lock().scores, job) {
+                ps.1.notify_one();
+            }
         }
     });
 
@@ -612,6 +628,13 @@ pub fn run(
                     }
                 };
                 let _ = ack.send(res);
+            }
+            // One score pass per quiescent tick; the rest stay queued.
+            if !pending.0.lock().scores.is_empty() {
+                let budget =
+                    score::ScoreBudget::new(model.score_capacity(), max_batch_size, block_size);
+                let jobs = score::take_tick(&mut pending.0.lock().scores, &budget);
+                score::run_jobs(&*model, jobs, prefill_stream, &budget);
             }
         }
         if new_reqs.is_empty() && active.is_empty() && prefilling.is_empty() {

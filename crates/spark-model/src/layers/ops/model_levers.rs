@@ -71,6 +71,19 @@ pub struct ModelLevers {
     pub holo_moe_gateup_fp4: bool,
     /// Collect per-layer MoE expert-union statistics. Diagnostic.
     pub moe_union_stats: bool,
+    /// Routed NVFP4 MoE prefill on BF16 tensor cores with register dequant
+    /// (`moe_bf16mma_prefill.cu`) where the target ships it. Opt-in.
+    pub moe_prefill_bf16mma: bool,
+    /// Dense NVFP4 MLP and FP8 GDN projection prefill on BF16 tensor cores
+    /// with register dequant (`dense_bf16mma_prefill.cu`) where the target
+    /// ships it. Opt-in.
+    pub dense_prefill_bf16mma: bool,
+    /// Under `dense_prefill_bf16mma`: those kernels serve every row count,
+    /// not only prefill-sized ones (below 32 rows chat decode / verify
+    /// batches keep their small-M kernels). Not from the environment: a
+    /// score pass sets it on its own copy, so a request's rows take the same
+    /// kernels whether it runs alone or merged into a bigger pass.
+    pub dense_prefill_any_rows: bool,
 
     // ── Attention ──
     /// Contiguous-attention path for the DFlash head.
@@ -198,6 +211,12 @@ fn opt_in_truthy(var: &str) -> bool {
 }
 
 impl ModelLevers {
+    /// [`Self::from_env`]'s opt-in rule (on only when `var` is exactly `1`),
+    /// for load-time sites that run before a model carries its levers.
+    pub fn opt_in(var: &str) -> bool {
+        opt_in(var)
+    }
+
     /// `ATLAS_QWEN4EXP_BATCH_FAST_BISECT` bit `bit` is set (lane on).
     pub fn batch_bisect(&self, bit: u32) -> bool {
         self.qwen4exp_batch_fast && self.qwen4exp_batch_bisect & bit != 0
@@ -240,6 +259,9 @@ impl ModelLevers {
             holo_moe_down_fp4: opt_in_truthy("ATLAS_HOLO_MOE_DOWN_FP4"),
             holo_moe_gateup_fp4: opt_in_truthy("ATLAS_HOLO_MOE_GATEUP_FP4"),
             moe_union_stats: opt_in("ATLAS_MOE_UNION_STATS"),
+            moe_prefill_bf16mma: opt_in("ATLAS_MOE_PREFILL_BF16MMA"),
+            dense_prefill_bf16mma: opt_in("ATLAS_DENSE_PREFILL_BF16MMA"),
+            dense_prefill_any_rows: false,
             dflash_contig_attn: opt_in("ATLAS_DFLASH_CONTIG_ATTN"),
             // Product installation also arms these. The explicit model-load
             // diagnostic lets a no-spec control use identical target arithmetic.

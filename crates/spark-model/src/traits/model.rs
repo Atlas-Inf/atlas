@@ -93,6 +93,21 @@ pub fn padded_batch_n(n: usize) -> usize {
     spark_runtime::buffers::padded_batch_rung(n)
 }
 
+/// One prefill-only scoring request (see [`Model::score_requests`]).
+pub struct ScoreInput<'a> {
+    /// Shared prefix, read once.
+    pub prefix: &'a [u32],
+    /// Continuations of `prefix`, each scored at its last row.
+    pub branches: &'a [Vec<u32>],
+    /// Per branch, the single option token ids to score.
+    pub options: &'a [Vec<u32>],
+    /// `prefix_bidir`: in the full-attention layers the prefix (the state) is
+    /// read in both directions and never sees a branch, and each branch reads
+    /// the whole prefix and itself in both directions. GDN layers stay causal.
+    /// False: plain causal attention.
+    pub prefix_bidir: bool,
+}
+
 pub trait Model: Send + Sync {
     /// Release the device memory this model owns, in reverse construction
     /// order.
@@ -299,6 +314,22 @@ pub trait Model: Send + Sync {
             out.push(logits);
         }
         Ok(out)
+    }
+
+    /// Prefill-only scoring: for each request, run `prefix` once and each
+    /// branch as its continuation — every request in ONE forward pass — and
+    /// return, per request and branch, the softmax over that branch's single
+    /// option tokens at its last row. Nothing is sampled, decoded or cached.
+    /// Default: unsupported.
+    fn score_requests(&self, _reqs: &[ScoreInput<'_>], _stream: u64) -> Result<Vec<Vec<Vec<f32>>>> {
+        anyhow::bail!("this model does not support prefill-only scoring")
+    }
+
+    /// Most rows and sequences one [`Model::score_requests`] pass can take
+    /// (the prefill arena and the SSM staging buffers; the SSM state pool).
+    /// `(0, 0)` when scoring is unsupported.
+    fn score_capacity(&self) -> (usize, usize) {
+        (0, 0)
     }
 
     /// Like `prefill_batch_chunk`, but each finishing stream's first-token

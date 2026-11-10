@@ -956,6 +956,9 @@ pub(crate) fn load_model(
     // LoRA adapter-rotation control channel (POST /v1/lora/active). Small: it
     // carries only control messages, applied one-at-a-time at quiescence.
     let (rotation_tx, rotation_rx) = mpsc::channel::<scheduler::LoraRotation>(8);
+    // Prefill-only score jobs (POST /v1/score).
+    let (score_tx, score_rx) =
+        mpsc::channel::<scheduler::score::ScoreJob>(scheduler::score::MAX_PENDING_JOBS);
 
     let model_name = serve_phases::resolve_model_name(&args, &config_json, &model_dir);
 
@@ -965,6 +968,8 @@ pub(crate) fn load_model(
     // model whose tower did not load (window 0) serves text only, and the
     // API refuses media as it does for a text model.
     let (vision_window_rows, vision_request_bound) = scheduler_model.vision_row_limits();
+    // Likewise `/v1/score`: (0, 0) = this model does not score (501).
+    let score_capacity = scheduler_model.score_capacity();
     let vision_config = config.vision.clone().filter(|_| vision_window_rows > 0);
     if config.vision.is_some() && vision_config.is_none() {
         tracing::warn!(
@@ -1212,6 +1217,7 @@ pub(crate) fn load_model(
                 scheduler_model,
                 request_rx,
                 rotation_rx,
+                score_rx,
                 scheduler_eos,
                 max_batch_size,
                 use_speculative,
@@ -1410,6 +1416,10 @@ pub(crate) fn load_model(
         } else {
             Some(rotation_tx)
         },
+        score_tx: (score_capacity != (0, 0)).then(|| scheduler::score::ScoreQueue {
+            tx: score_tx,
+            budget: scheduler::score::ScoreBudget::new(score_capacity, max_batch_size, block_size),
+        }),
         chat: crate::api::chat::levers::ChatLevers::resolve(&ptx_set.behavior),
         vision_max_pixels,
         vision_limits: vision_config.as_ref().map(|_| {

@@ -15,6 +15,7 @@ __device__ __forceinline__ float fp8e4m3_f32(__nv_fp8_storage_t b) {
 }
 
 #define PREFILL_BATCHED
+#define PREFILL_STATE_END
 
 #define LOAD_KV_TILE(cache, bt, smem, kv_s, kv_l, kvh, t, stride) \
     do { \

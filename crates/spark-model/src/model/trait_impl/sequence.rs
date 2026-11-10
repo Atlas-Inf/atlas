@@ -128,7 +128,14 @@ impl TransformerModel {
         }
     }
 
-    pub(super) fn free_sequence_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
+    /// `zero_ssm = false` releases the SSM slot without zeroing it: every
+    /// claim zeroes what it reads (`alloc_sequence_reset`), so only a caller
+    /// whose own next use needs the zero (none today but the default) pays.
+    pub(super) fn free_sequence_dispatch(
+        &self,
+        seq: &mut SequenceState,
+        zero_ssm: bool,
+    ) -> Result<()> {
         // A commit left for this sequence's next verify is moot
         // (`gdn_commit_fuse`); the slot is zeroed below.
         self.gdn_fuse_drop_slot(seq.slot_idx);
@@ -184,17 +191,23 @@ impl TransformerModel {
         let taken = seq.ssm_slot.as_mut().and_then(|g| g.take());
         let slot_to_release = if slot_reused_by_compact { None } else { taken };
         if let Some(slot) = slot_to_release {
-            let stream = self.gpu.default_stream();
-            // A verify step that finishes the sequence commits on the secondary
-            // stream and is freed straight away: order the zero after it.
-            if let Err(e) = self.sync_secondary_dispatch() {
-                tracing::error!("free_sequence: sync_secondary before zero_slot({slot}): {e:#}");
-            }
-            if let Err(e) = self.ssm_pool.zero_slot(slot, self.gpu.as_ref(), stream) {
-                tracing::error!("free_sequence: ssm_pool.zero_slot({slot}): {e:#}");
-            }
-            if let Err(e) = self.gpu.synchronize(stream) {
-                tracing::error!("free_sequence: gpu.synchronize after zero_slot({slot}): {e:#}");
+            if zero_ssm {
+                let stream = self.gpu.default_stream();
+                // A verify step that finishes the sequence commits on the secondary
+                // stream and is freed straight away: order the zero after it.
+                if let Err(e) = self.sync_secondary_dispatch() {
+                    tracing::error!(
+                        "free_sequence: sync_secondary before zero_slot({slot}): {e:#}"
+                    );
+                }
+                if let Err(e) = self.ssm_pool.zero_slot(slot, self.gpu.as_ref(), stream) {
+                    tracing::error!("free_sequence: ssm_pool.zero_slot({slot}): {e:#}");
+                }
+                if let Err(e) = self.gpu.synchronize(stream) {
+                    tracing::error!(
+                        "free_sequence: gpu.synchronize after zero_slot({slot}): {e:#}"
+                    );
+                }
             }
             self.ssm_pool.release_slot(slot);
         }

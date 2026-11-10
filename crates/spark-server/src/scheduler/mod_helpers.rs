@@ -116,7 +116,7 @@ pub(super) fn drain_pending_requests(
         // Parked-only tick: wait BOUNDED so the scheduler keeps ticking
         // toward the resume pass (blocks may already be free) without
         // spinning hot while the pool refills.
-        if g.requests.is_empty() && g.rotations.is_empty() && !g.closed {
+        if g.requests.is_empty() && g.rotations.is_empty() && g.scores.is_empty() && !g.closed {
             let _ = cv.wait_for(&mut g, std::time::Duration::from_millis(10));
         }
     } else if active.is_empty() && prefilling.is_empty() {
@@ -127,7 +127,7 @@ pub(super) fn drain_pending_requests(
         // predicate the notify would wake us but the loop would immediately
         // re-sleep (requests still empty), starving the quiescence-apply block —
         // an idle-scheduler deadlock for demand-driven promotion.
-        while g.requests.is_empty() && g.rotations.is_empty() && !g.closed {
+        while g.requests.is_empty() && g.rotations.is_empty() && g.scores.is_empty() && !g.closed {
             cv.wait(&mut g);
         }
         if g.closed && g.requests.is_empty() {

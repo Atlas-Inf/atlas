@@ -40,6 +40,7 @@ use crate::gpu::DevicePtr;
 const CU_TENSOR_MAP_DATA_TYPE_BFLOAT16: u32 = 9;
 const CU_TENSOR_MAP_INTERLEAVE_NONE: u32 = 0;
 const CU_TENSOR_MAP_SWIZZLE_NONE: u32 = 0;
+const CU_TENSOR_MAP_SWIZZLE_128B: u32 = 3;
 const CU_TENSOR_MAP_L2_PROMOTION_L2_128B: u32 = 2;
 const CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE: u32 = 0;
 
@@ -130,6 +131,39 @@ impl TensorMap {
         box_rows: u32,
         box_cols: u32,
     ) -> Result<Self> {
+        Self::tiled_2d_bf16_with(
+            global,
+            rows,
+            cols,
+            row_stride_elems,
+            box_rows,
+            box_cols,
+            false,
+        )
+    }
+
+    /// [`Self::tiled_2d_bf16`] with the 128-byte swizzle: 16-byte unit `u` of
+    /// box row `r` lands at unit `u ^ (r % 8)`, so a box row must be exactly
+    /// 128 bytes (64 BF16) and the shared destination 1024-byte aligned.
+    pub fn tiled_2d_bf16_swizzle128(
+        global: DevicePtr,
+        rows: u64,
+        cols: u64,
+        row_stride_elems: u64,
+        box_rows: u32,
+    ) -> Result<Self> {
+        Self::tiled_2d_bf16_with(global, rows, cols, row_stride_elems, box_rows, 64, true)
+    }
+
+    fn tiled_2d_bf16_with(
+        global: DevicePtr,
+        rows: u64,
+        cols: u64,
+        row_stride_elems: u64,
+        box_rows: u32,
+        box_cols: u32,
+        swizzle128: bool,
+    ) -> Result<Self> {
         // Fail fast on the alignment rules rather than let the driver return a
         // generic invalid-argument, or worse, succeed and mis-address.
         if !global.0.is_multiple_of(16) {
@@ -183,7 +217,11 @@ impl TensorMap {
                 box_dim.as_ptr(),
                 element_strides.as_ptr(),
                 CU_TENSOR_MAP_INTERLEAVE_NONE,
-                CU_TENSOR_MAP_SWIZZLE_NONE,
+                if swizzle128 {
+                    CU_TENSOR_MAP_SWIZZLE_128B
+                } else {
+                    CU_TENSOR_MAP_SWIZZLE_NONE
+                },
                 CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
                 CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
             )

@@ -659,6 +659,12 @@ impl TransformerLayer for Qwen3SsmLayer {
         self.is_ssm_layer_inner()
     }
 
+    fn prefill_reads_residual(&self) -> bool {
+        // rms_norm_residual and residual_add_rms_norm only write it; the mHC
+        // paths are not audited for this.
+        self.hc.is_some()
+    }
+
     fn prefill_phase1(
         &self,
         hidden: DevicePtr,
@@ -723,6 +729,44 @@ impl TransformerLayer for Qwen3SsmLayer {
         stream: u64,
     ) -> Result<()> {
         self.prefill_phase1_conv1d_one_inner(state, token_offset, len, gdn_bufs, ctx, stream)
+    }
+
+    fn score_conv1d(
+        &self,
+        tables: [DevicePtr; 2],
+        row0: usize,
+        gdn_bufs: &GdnPrefillBuffers,
+        batch: u32,
+        cu_seqlens: DevicePtr,
+        max_len: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        self.try_conv1d_varlen(
+            tables, row0, gdn_bufs, batch, cu_seqlens, max_len, ctx, stream,
+        )
+    }
+
+    fn score_gdn_scan(
+        &self,
+        h_ptrs: DevicePtr,
+        h_init: DevicePtr,
+        gdn_bufs: &GdnPrefillBuffers,
+        batch: u32,
+        cu_seqlens: DevicePtr,
+        max_len: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        let scan = super::gdn_chunk_tc::ChunkTcScan {
+            h_state: h_ptrs,
+            h_state_is_table: true,
+            batch,
+            seq_len: max_len,
+            cu_seqlens: Some(cu_seqlens),
+            h_init,
+        };
+        self.try_gdn_chunk_tc(gdn_bufs, scan, ctx, stream)
     }
 
     fn prefill_phase1_l2_batched(

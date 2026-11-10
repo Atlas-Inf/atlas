@@ -41,6 +41,8 @@ pub fn prefill_attention_paged_batched(
     batch_size: u32,
     cu_seqlens: DevicePtr,
     kv_lens: DevicePtr,
+    // Per-stream prefix-bidirectional state end (`[batch]` i32, -1 causal); NULL = causal.
+    state_end: DevicePtr,
     q_len: u32,
     kv_len: u32,
     q_offset: u32,
@@ -64,6 +66,7 @@ pub fn prefill_attention_paged_batched(
         .arg_u32(batch_size)
         .arg_ptr(cu_seqlens)
         .arg_ptr(kv_lens)
+        .arg_ptr(state_end)
         .arg_u32(q_len)
         .arg_u32(kv_len)
         .arg_u32(q_offset)
@@ -140,6 +143,8 @@ pub fn prefill_attention_paged_batched_64(
     batch_size: u32,
     cu_seqlens: DevicePtr,
     kv_lens: DevicePtr,
+    // Per-stream prefix-bidirectional state end (`[batch]` i32, -1 causal); NULL = causal.
+    state_end: DevicePtr,
     q_len: u32,
     kv_len: u32,
     q_offset: u32,
@@ -163,6 +168,7 @@ pub fn prefill_attention_paged_batched_64(
         .arg_u32(batch_size)
         .arg_ptr(cu_seqlens)
         .arg_ptr(kv_lens)
+        .arg_ptr(state_end)
         .arg_u32(q_len)
         .arg_u32(kv_len)
         .arg_u32(q_offset)
@@ -188,6 +194,8 @@ pub fn prefill_attention_paged_fp8_batched(
     batch_size: u32,
     cu_seqlens: DevicePtr,
     kv_lens: DevicePtr,
+    // Per-stream prefix-bidirectional state end (`[batch]` i32, -1 causal); NULL = causal.
+    state_end: DevicePtr,
     q_len: u32,
     kv_len: u32,
     q_offset: u32,
@@ -214,6 +222,7 @@ pub fn prefill_attention_paged_fp8_batched(
         .arg_u32(batch_size)
         .arg_ptr(cu_seqlens)
         .arg_ptr(kv_lens)
+        .arg_ptr(state_end)
         .arg_u32(q_len)
         .arg_u32(kv_len)
         .arg_u32(q_offset)
@@ -242,6 +251,8 @@ pub fn prefill_attention_paged_fp8_batched_64(
     batch_size: u32,
     cu_seqlens: DevicePtr,
     kv_lens: DevicePtr,
+    // Per-stream prefix-bidirectional state end (`[batch]` i32, -1 causal); NULL = causal.
+    state_end: DevicePtr,
     q_len: u32,
     kv_len: u32,
     q_offset: u32,
@@ -268,6 +279,7 @@ pub fn prefill_attention_paged_fp8_batched_64(
         .arg_u32(batch_size)
         .arg_ptr(cu_seqlens)
         .arg_ptr(kv_lens)
+        .arg_ptr(state_end)
         .arg_u32(q_len)
         .arg_u32(kv_len)
         .arg_u32(q_offset)
@@ -296,6 +308,8 @@ pub fn prefill_attention_paged_nvfp4_batched(
     batch_size: u32,
     cu_seqlens: DevicePtr,
     kv_lens: DevicePtr,
+    // Per-stream prefix-bidirectional state end (`[batch]` i32, -1 causal); NULL = causal.
+    state_end: DevicePtr,
     q_len: u32,
     kv_len: u32,
     q_offset: u32,
@@ -321,6 +335,7 @@ pub fn prefill_attention_paged_nvfp4_batched(
         .arg_u32(batch_size)
         .arg_ptr(cu_seqlens)
         .arg_ptr(kv_lens)
+        .arg_ptr(state_end)
         .arg_u32(q_len)
         .arg_u32(kv_len)
         .arg_u32(q_offset)
@@ -352,6 +367,8 @@ pub fn prefill_attention_paged_nvfp4_batched_64(
     batch_size: u32,
     cu_seqlens: DevicePtr,
     kv_lens: DevicePtr,
+    // Per-stream prefix-bidirectional state end (`[batch]` i32, -1 causal); NULL = causal.
+    state_end: DevicePtr,
     q_len: u32,
     kv_len: u32,
     q_offset: u32,
@@ -377,6 +394,7 @@ pub fn prefill_attention_paged_nvfp4_batched_64(
         .arg_u32(batch_size)
         .arg_ptr(cu_seqlens)
         .arg_ptr(kv_lens)
+        .arg_ptr(state_end)
         .arg_u32(q_len)
         .arg_u32(kv_len)
         .arg_u32(q_offset)

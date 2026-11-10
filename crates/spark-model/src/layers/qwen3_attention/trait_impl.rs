@@ -27,6 +27,10 @@ mod moe_transpose;
 mod state;
 
 impl TransformerLayer for Qwen3AttentionLayer {
+    // prefill_inner only writes `residual`; the mHC path is not audited.
+    fn prefill_reads_residual(&self) -> bool {
+        self.hc.is_some()
+    }
     fn decode_glm_long_owners(
         &self,
         owners: &mut [crate::layer::glm_long_owner::GlmLongOwner<'_>],
@@ -433,13 +437,7 @@ impl TransformerLayer for Qwen3AttentionLayer {
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
     ) -> Result<()> {
-        if let FfnComponent::Moe(moe) = &mut self.ffn {
-            moe.transpose_for_prefill(gpu, config)?;
-        }
-        if let Some(FfnComponent::Moe(moe)) = self.moe_ffn.as_mut() {
-            moe.transpose_for_prefill(gpu, config)?;
-        }
-        Ok(())
+        moe_transpose::each_moe(self, |moe| moe.transpose_for_prefill(gpu, config))
     }
 
     fn transpose_moe_gate_up_for_prefill(
@@ -447,13 +445,11 @@ impl TransformerLayer for Qwen3AttentionLayer {
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
     ) -> Result<()> {
-        if let FfnComponent::Moe(moe) = &mut self.ffn {
-            moe.transpose_gate_up_for_prefill(gpu, config)?;
-        }
-        if let Some(FfnComponent::Moe(moe)) = self.moe_ffn.as_mut() {
-            moe.transpose_gate_up_for_prefill(gpu, config)?;
-        }
-        Ok(())
+        moe_transpose::each_moe(self, |moe| moe.transpose_gate_up_for_prefill(gpu, config))
+    }
+
+    fn honours_state_end(&self) -> bool {
+        self.honours_state_end_inner()
     }
 
     fn set_moe_down_transpose_scratch(

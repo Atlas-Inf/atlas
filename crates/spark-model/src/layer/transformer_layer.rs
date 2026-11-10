@@ -709,6 +709,47 @@ pub trait TransformerLayer: Send + Sync {
         Ok(false)
     }
 
+    /// Score pass: conv1d for `batch` streams laid out by the device
+    /// `cu_seqlens` (rebased to `gdn_bufs`, whose rows start at pass row
+    /// `row0`), each stream's window read from the conv state in the device
+    /// table `inits` and written to the one in `states`. `Ok(false)`: no such
+    /// launch here; the caller keeps `prefill_phase1_conv1d_one`. Default:
+    /// `Ok(false)`.
+    #[allow(clippy::too_many_arguments)]
+    fn score_conv1d(
+        &self,
+        _tables: [DevicePtr; 2],
+        _row0: usize,
+        _gdn_bufs: &GdnPrefillBuffers,
+        _batch: u32,
+        _cu_seqlens: DevicePtr,
+        _max_len: u32,
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Score pass: one GDN scan over `batch` streams laid out by the device
+    /// `cu_seqlens` (rebased to `gdn_bufs`), states advanced through the
+    /// device table `h_ptrs`, each entry state read from the table `h_init`
+    /// (`NULL`: from `h_ptrs`). `Ok(false)`: no single-launch scan here; the
+    /// caller keeps its own path. Default: `Ok(false)`.
+    #[allow(clippy::too_many_arguments)]
+    fn score_gdn_scan(
+        &self,
+        _h_ptrs: DevicePtr,
+        _h_init: DevicePtr,
+        _gdn_bufs: &GdnPrefillBuffers,
+        _batch: u32,
+        _cu_seqlens: DevicePtr,
+        _max_len: u32,
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Two-phase SSM prefill — Phase 3: post-GDN processing.
     ///
     /// Reads GDN output and Z gate from `gdn_bufs` at `token_offset`,
@@ -736,6 +777,23 @@ pub trait TransformerLayer: Send + Sync {
     /// `prefill_phase3` instead of the monolithic `prefill`.
     fn is_ssm_layer(&self) -> bool {
         false
+    }
+
+    /// Whether this layer's `prefill_inner_batched_q12` applies
+    /// `BatchedAttnMetadata::state_end` (the `prefix_bidir` score mask)
+    /// rather than reading every stream causally. A score pass refuses a
+    /// bidirectional request unless every non-SSM layer does. Default: false.
+    fn honours_state_end(&self) -> bool {
+        false
+    }
+
+    /// Whether this layer's batched prefill (`prefill_inner_batched_q12`,
+    /// `prefill_phase1_proj_batched`, `prefill_phase3`) reads the `residual`
+    /// buffer back. When no layer does, a score pass aliases it to `hidden`
+    /// (the norms' residual copy then rewrites the bytes they just wrote).
+    /// Default: true.
+    fn prefill_reads_residual(&self) -> bool {
+        true
     }
 
     /// Allocate the transposed MoE expert weights used by the coalesced

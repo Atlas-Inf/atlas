@@ -59,6 +59,7 @@ fn state(dir: &std::path::Path) -> AppState {
         max_seq_len: 4096,
         request_tx,
         rotation_tx: None,
+        score_tx: None,
         vision_config: None,
         vision_max_pixels: None,
         vision_limits: None,

@@ -26,6 +26,8 @@ pub(super) struct PendingQueue {
     /// at a quiescent point (see [`super::LoraRotation`]). Kept OUT of
     /// `requests` so the sequence machinery never sees a control message.
     pub rotations: Vec<super::LoraRotation>,
+    /// Pending `/v1/score` jobs, run at the same quiescent point.
+    pub scores: Vec<super::score::ScoreJob>,
 }
 
 /// Per-request slice of a co-dispatched batched-ViT encode. When >=2 image
