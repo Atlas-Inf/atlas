@@ -485,6 +485,15 @@ pub(crate) fn load_model(
     // [behavior].default_num_drafts → engine default. After this call
     // `args.num_drafts` is Some and `args.resolved_num_drafts()` is valid.
     serve_phases::apply_model_default_num_drafts(&mut args, &ptx_set);
+    // MODEL.toml [dflash].drop_bf16: only where every drafter pass fits the
+    // NVFP4 batched-GEMV tiers (max_batch_size x γ <= 16 rows); wider passes
+    // read the BF16 projections.
+    if args.dflash
+        && ptx_set.dflash.as_ref().is_some_and(|d| d.drop_bf16)
+        && args.max_batch_size * args.resolved_dflash_gamma() <= 16
+    {
+        spark_model::weight_loader::dflash_preshrink::set_target_default();
+    }
 
     // ── Pre-load reserve preflight ──
     let (gpu, free_mem, prepared_topology, reserve) =

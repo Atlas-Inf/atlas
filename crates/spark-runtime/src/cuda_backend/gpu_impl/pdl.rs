@@ -5,7 +5,8 @@
 //!
 //! Each PDL target names its switches, each with its own kernel list:
 //! GLM-5.3-Flash under `ATLAS_PDL=1` ([`PDL_KERNELS`]), Qwen3.8-Flash-Next
-//! under `ATLAS_QWEN4EXP_PDL=1` ([`QWEN4EXP_PDL_KERNELS`]), Qwen3.8-27B under
+//! under `ATLAS_QWEN4EXP_PDL=1` ([`QWEN4EXP_PDL_KERNELS`]), Ricursive Ripple
+//! under `ATLAS_RICURSIVE_PDL=1` ([`RICURSIVE_PDL_KERNELS`]), Qwen3.8-27B under
 //! `ATLAS_QWEN38_PDL=1` (prefill, [`QWEN38_PDL_KERNELS`]) and, separately,
 //! `ATLAS_QWEN38_PDL_DECODE=1` (the decode chain,
 //! [`QWEN38_PDL_DECODE_KERNELS`]). A kernel launches with PDL when a switch
@@ -62,6 +63,13 @@ pub(super) const PDL_TARGETS: &[PdlTarget] = &[
         switches: &[PdlSwitch {
             name: "ATLAS_QWEN4EXP_PDL",
             kernels: QWEN4EXP_PDL_KERNELS,
+        }],
+    },
+    PdlTarget {
+        model: "ricursive-ripple-65b",
+        switches: &[PdlSwitch {
+            name: "ATLAS_RICURSIVE_PDL",
+            kernels: RICURSIVE_PDL_KERNELS,
         }],
     },
     PdlTarget {
@@ -333,6 +341,24 @@ pub(super) const QWEN4EXP_PDL_KERNELS: &[&str] = &[
     "moe_batched_blend",
     "moe_blend_hc_post",
     "bf16_add_inplace",
+];
+
+/// Ricursive Ripple: the DFlash verify chain. The small-M GEMVs touch their
+/// weight panels into L2 during the wait (`atlas_pdl_enter_touch`); the rest
+/// enter with `atlas_pdl_enter()`.
+pub(super) const RICURSIVE_PDL_KERNELS: &[&str] = &[
+    "bf16_gemv_m32",
+    "fp8_gemv_m32",
+    "w4a4_gemv_m32_bn32",
+    "w4a4_gemv_m32_bn16",
+    "silu_mul_clamp20",
+    "value_residual_lerp",
+    "rms_norm_vanilla_strided",
+    "quantize_bf16_to_nvfp4",
+    "rms_norm_vanilla",
+    "paged_decode_attn",
+    "reshape_and_cache_flash",
+    "sigmoid_gate_mul",
 ];
 
 /// Qwen3.8-27B (`ATLAS_QWEN38_PDL=1`, kernels of qwen3.6-27b's tree): the

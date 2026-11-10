@@ -232,19 +232,14 @@ impl BlockDiffusionDraftHead {
         }
 
         // 3d. yarn RoPE — n_attn positions.
-        ops::rope_yarn(
+        self.layer_rope(
             gpu,
-            self.kernels.rope_qwen3,
+            layer_idx,
             scratch.q_buf,
             scratch.k_buf,
             scratch.position_ids,
             n_attn,
             self.num_q_heads as u32,
-            self.num_kv_heads as u32,
-            self.head_dim as u32,
-            self.rotary_dim as u32,
-            self.yarn_inv_freq,
-            self.rope_theta,
             stream,
         )?;
         if layer_idx == 0 {
@@ -279,7 +274,7 @@ impl BlockDiffusionDraftHead {
             self.head_dim as u32,
             inv_sqrt_d,
             self.attn_causal(),
-            self.attn_sliding_window(),
+            self.layer_attn_window(layer_idx),
             stream,
         )?;
         if layer_idx == 0 {

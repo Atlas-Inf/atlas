@@ -126,12 +126,19 @@ fn base_quant(quant: &Path) -> Option<String> {
 /// if any, then itself, each overlaying the previous by file name
 /// (atlas-kernels `collect_cu_files`). `true` marks a file from the target's
 /// own dirs rather than `common/`.
-fn served_sources(common: &Path, quant: &Path) -> Vec<(PathBuf, bool)> {
+fn served_sources(common: &Path, quant: &Path, local: Option<&Path>) -> Vec<(PathBuf, bool)> {
     let mut dirs = vec![(common.to_path_buf(), false)];
     if let Some(base) = base_quant(quant) {
         dirs.push((quant.parent().unwrap().join(base), true));
     }
     dirs.push((quant.to_path_buf(), true));
+    // A `kernel_source` target's own quant dir overlays the borrowed one
+    // (build.rs: target-local > kernel_source > common).
+    dirs.extend(
+        local
+            .filter(|d| d.is_dir())
+            .map(|d| (d.to_path_buf(), true)),
+    );
     let mut files = BTreeMap::new();
     for (dir, own) in dirs {
         for entry in std::fs::read_dir(dir).unwrap() {
@@ -307,7 +314,9 @@ fn pdl_target_kernels_wait_exactly_when_listed() {
                 continue;
             }
             let mut defined = Vec::new();
-            for (path, own) in served_sources(&gb10.join("common"), &quant) {
+            let local = gb10.join(target.model).join(quant.file_name().unwrap());
+            let local = (local != quant).then_some(local.as_path());
+            for (path, own) in served_sources(&gb10.join("common"), &quant, local) {
                 // An included namesake is another dir's source: as with
                 // `common/`, its target opts its kernels in.
                 for (i, src) in with_namesakes(&path).iter().enumerate() {

@@ -129,9 +129,10 @@ impl Qwen3AttentionLayer {
         )?;
 
         let v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16);
+        let v_in = self.value_residual_input(ctx.gpu, normed, n as usize, h as usize, stream)?;
         self.prefill_one_proj(
             Proj::V,
-            normed,
+            v_in,
             v_contiguous,
             n,
             nkv * hd,

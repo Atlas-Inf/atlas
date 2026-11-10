@@ -339,6 +339,11 @@ impl TransformerModel {
                 h,
                 stream,
             )?;
+        } else if self.config.model_type == "ricursive" {
+            // BF16 head over the verify rows: cuBLASLt streams the 1 GB weight
+            // ~6x faster than the scalar `dense_gemm` tile kernel.
+            let w = self.lm_head_weight.weight.0;
+            ops::bf16_gemm(hidden, w, logits, num_tokens, v, h, stream)?;
         } else {
             super::glm_k3_head::project(
                 self.gpu.as_ref(),

@@ -100,6 +100,9 @@ pub(crate) mod moe_gate_up_repack;
 pub mod skinny_mma;
 #[path = "ops/strix_f16.rs"]
 mod strix_f16;
+mod verify_rows;
+#[path = "ops/w4a16_rowgemv.rs"]
+mod w4a16_rowgemv;
 #[path = "ops/yarn_mrope.rs"]
 mod yarn_mrope;
 pub use model_stats::ModelStats;
@@ -287,6 +290,8 @@ mod shared_scan;
 #[path = "ops/tree_verify.rs"]
 mod tree_verify;
 // Shared harness for the oracle-parity tests, split for the 500-LoC cap.
+#[path = "ops/dflash2_selector_build.rs"]
+mod dflash2_selector_build;
 #[cfg(test)]
 #[path = "ops/grammar_bitmask_tests.rs"]
 mod grammar_bitmask_tests;
@@ -338,6 +343,7 @@ pub use dense_bf16mma::{DenseBf16mma, LowpArgs, LowpMix, fp8_scale_k_uniform};
 pub use dense_gemv_multi::*;
 pub use derived_reserve::{lazy_bf16_copy_bytes, lazy_bf16_reserve, lazy_bf16_reserve_enabled};
 pub use derived_weights::{Derivation, DerivedWeights};
+pub use dflash2_selector_build::*;
 pub use dispatch_config::GemmDispatch;
 pub use dispatch_helpers::*;
 pub use dispatch_proj::*;
@@ -442,5 +448,7 @@ pub use ssm_ssd::*;
 pub use strix_f16::*;
 pub use strix_s64::*;
 pub use tree_verify::*;
+pub use verify_rows::*;
+pub use w4a16_rowgemv::*;
 pub use wide_prefill::*;
 pub use yarn_mrope::*;

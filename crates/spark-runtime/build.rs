@@ -190,6 +190,7 @@ fn build_cutlass_object(cutlass_home: std::path::PathBuf) {
     let sources = [
         std::path::PathBuf::from("cuda/cutlass_bf16_gemm.cu"),
         std::path::PathBuf::from("cuda/cutlass_nvfp4_gemm.cu"),
+        std::path::PathBuf::from("cuda/cutlass_nvfp4_prequant.cu"),
         std::path::PathBuf::from("cuda/cutlass_nvfp4_grouped_gemm.cu"),
         std::path::PathBuf::from("cuda/cutlass_fp8_blockwise_gemm.cu"),
     ];
@@ -199,6 +200,7 @@ fn build_cutlass_object(cutlass_home: std::path::PathBuf) {
     // The sources share this header; its launch-status base must match
     // `cutlass::LAUNCH_FAILED`.
     println!("cargo:rerun-if-changed=cuda/atlas_stale_cuda_error.h");
+    println!("cargo:rerun-if-changed=cuda/cutlass_nvfp4_types.cuh");
     println!("cargo:rustc-cfg=atlas_cutlass");
 
     let mut objects = Vec::new();

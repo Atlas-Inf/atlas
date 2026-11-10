@@ -224,6 +224,30 @@ impl Qwen3AttentionLayer {
                     )?;
                     c0 += m;
                 }
+            } else if let Some(gemv) = self.wide_bf16_gemv(n) {
+                let shape = [n as u32, h as u32, nq * hd];
+                let ldc = h as u32;
+                ops::bf16_gemv_m32(
+                    fwd.gpu,
+                    gemv,
+                    attn_out,
+                    o_bf16.weight,
+                    o_out,
+                    shape,
+                    ldc,
+                    0,
+                    stream,
+                )?;
+            } else if self.wide_bf16_gemm() {
+                ops::bf16_gemm(
+                    attn_out,
+                    o_bf16.weight.0,
+                    o_out,
+                    n as u32,
+                    h as u32,
+                    nq * hd,
+                    stream,
+                )?;
             } else {
                 ops::dense_gemm(
                     fwd.gpu,

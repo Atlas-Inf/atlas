@@ -2,12 +2,11 @@
 
 //! The `Qwen3AttentionLayer` struct, split from `types.rs` (500-LoC cap).
 
+use super::types_weights::{HcWeights, HeadGateActivation, MlaWeights};
 use crate::layers::FfnComponent;
 use crate::layers::fp8_calibration::Fp8KvCalibration;
 use crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers;
 use crate::weight_map::{AttentionWeights, DenseWeight, QuantWeight, QuantizedWeight};
-
-use super::types_weights::{HcWeights, HeadGateActivation, MlaWeights};
 use spark_runtime::gpu::{DevicePtr, KernelHandle};
 use spark_runtime::kv_cache::KvCacheDtype;
 
@@ -81,9 +80,10 @@ pub struct Qwen3AttentionLayer {
     /// arm (which requires the three Gemma norms, absent here).
     pub(crate) shortcut_carry_out: Option<(spark_runtime::gpu::DevicePtr, usize)>,
     /// LongCat shortcut-MoE CONSUMER: after this sublayer's FFN residual add,
-    /// `hidden += carry` (the shortcut MoE output stashed by the previous
-    /// sublayer).
+    /// `hidden += carry` (the shortcut MoE output stashed by the previous sublayer).
     pub(crate) shortcut_carry_in: Option<(spark_runtime::gpu::DevicePtr, usize)>,
+    /// Ricursive value residual: V reads `lerp(x0, normed, blend)` (`value_residual.rs`).
+    pub(crate) value_residual: Option<super::value_residual::ValueResidual>,
     /// Pre-norm for MoE input (pre_feedforward_layernorm_2).
     pub(crate) pre_moe_norm: Option<DenseWeight>,
     /// Post-norm for MoE output (post_feedforward_layernorm_2).

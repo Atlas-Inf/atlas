@@ -70,6 +70,7 @@ impl Qwen3AttentionLayer {
                 &format!("L{:02} hidden_in", self.attn_layer_idx),
             );
         }
+        self.value_residual_capture(ctx.gpu, hidden, 1, h, stream)?;
         ops::rms_norm_residual(
             ctx.gpu,
             self.rms_norm_residual_k,

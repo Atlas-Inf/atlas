@@ -4,7 +4,10 @@
 //! The KV pool is sized before the drafter head is built, so BF16 drafter
 //! projections that serving never reads still cost KV blocks. Under the NVFP4
 //! tensor-core tiers (`ATLAS_DFLASH_NVFP4_TC=1`) every drafter row block reads
-//! the NVFP4 twins, so right after the drafter store loads this quantizes
+//! the NVFP4 twins, and so do the batched-GEMV tiers when every pass is at
+//! most 16 rows (a target's MODEL.toml `[dflash].drop_bf16`, which the server
+//! applies only at max_batch_size x γ <= 16). Right after the drafter store
+//! loads this quantizes
 //! q/o/gate/up/down, frees their BF16 tensors and parks the twins for
 //! `try_install_nvfp4`. k/v stay BF16: the context precompute reads them
 //! through `fused_kv_weight` (as do `fc`, the norms, the DFlash2 convs and
@@ -16,6 +19,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::WeightStore;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::weight_map::{DenseWeight, QuantizedWeight, quantize_to_nvfp4};
 
@@ -30,9 +34,24 @@ const DROPPED: [(&str, &str); 5] = [
 
 static TWINS: Mutex<Option<HashMap<(usize, &'static str), QuantizedWeight>>> = Mutex::new(None);
 
-/// Whether `ATLAS_DFLASH_DROP_BF16=1`.
+static TARGET_DEFAULT: AtomicBool = AtomicBool::new(false);
+
+/// The served target's MODEL.toml asks for the preshrink (`[dflash].drop_bf16`).
+pub fn set_target_default() {
+    TARGET_DEFAULT.store(true, Ordering::Relaxed);
+}
+
+/// Whether `ATLAS_DFLASH_DROP_BF16=1`, or it is unset and the target asks.
 pub fn requested() -> bool {
-    std::env::var("ATLAS_DFLASH_DROP_BF16").as_deref() == Ok("1")
+    match std::env::var("ATLAS_DFLASH_DROP_BF16") {
+        Ok(v) => v == "1",
+        Err(_) => TARGET_DEFAULT.load(Ordering::Relaxed),
+    }
+}
+
+/// Whether the preshrink parked NVFP4 twins for `try_install_nvfp4`.
+pub(crate) fn parked() -> bool {
+    TWINS.lock().expect("drafter twins lock").is_some()
 }
 
 fn env_is(name: &str, value: &str) -> bool {
@@ -42,15 +61,16 @@ fn env_is(name: &str, value: &str) -> bool {
 /// Quantize and free the dropped BF16 projections of `store`. Returns the
 /// BF16 bytes released.
 pub fn preshrink(store: &mut WeightStore, layers: usize, gpu: &dyn GpuBackend) -> Result<usize> {
+    // Tensor-core tiers both on, or neither (the batched-GEMV tiers).
+    let tc = env_is("ATLAS_DFLASH_NVFP4_TC", "1");
     ensure!(
-        env_is("ATLAS_DFLASH_NVFP4_TC", "1")
-            && env_is("ATLAS_W4A16_TC", "1")
+        tc == env_is("ATLAS_W4A16_TC", "1")
             && !env_is("ATLAS_DFLASH_DRAFTER_FP8", "1")
             && std::env::var("ATLAS_NO_DFLASH_DRAFTER_NVFP4").is_err()
             // The legacy contiguous path reads the BF16 projections.
             && !env_is("ATLAS_DFLASH_OPTION_B", "0"),
-        "ATLAS_DFLASH_DROP_BF16=1 needs the NVFP4 tensor-core drafter \
-         (ATLAS_DFLASH_NVFP4_TC=1, ATLAS_W4A16_TC=1, no drafter FP8, Option B)"
+        "ATLAS_DFLASH_DROP_BF16=1 needs an NVFP4 drafter (ATLAS_DFLASH_NVFP4_TC and \
+         ATLAS_W4A16_TC both 1 or both unset, no drafter FP8, Option B)"
     );
     let absmax = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
     let quant = gpu.kernel(

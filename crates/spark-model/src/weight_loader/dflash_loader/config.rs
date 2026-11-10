@@ -82,6 +82,10 @@ pub struct DflashConfig {
     pub sliding_window: Option<usize>,
     #[serde(default)]
     pub layer_types: Option<Vec<String>>,
+    /// HF `no_rope_layers`: indices of layers that apply no RoPE (NoPE),
+    /// read by [`Self::rope_layers`] (Ripple-65B's DFlash2 global layer).
+    #[serde(default)]
+    pub no_rope_layers: Option<Vec<usize>>,
     /// NVIDIA LiLiCorr drafters ship their own `lm_head` (`Some(true)`);
     /// generic DFlash drafters omit the key and share the target's head.
     pub has_own_lm_head: Option<bool>,
@@ -311,7 +315,12 @@ impl DflashConfig {
     /// Checkpoint sliding window: `dflash_config.swa_window_size`, else the HF
     /// `sliding_window` when `use_sliding_window` (or `dflash_config.use_swa`)
     /// is set or every `layer_types` entry is `sliding_attention`.
+    /// A `layer_types` list mixing sliding and full layers has no single
+    /// window ([`Self::mixed_layer_windows`] holds them), so this is `None`.
     pub fn sliding_window(&self) -> Option<usize> {
+        if self.layer_types_mixed() {
+            return None;
+        }
         let sub = self.dflash_config.as_ref();
         if let Some(window) = sub.and_then(|c| c.swa_window_size) {
             return Some(window);

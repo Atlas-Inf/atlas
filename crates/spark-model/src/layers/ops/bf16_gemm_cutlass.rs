@@ -232,6 +232,24 @@ pub fn bf16_gemm_cutlass_rows(m: u32) -> bool {
     enabled() && m >= MIN_ROWS
 }
 
+/// `dense_gemm_bf16_pipelined`'s large-M rows on the CUTLASS tiles when
+/// [`bf16_gemm_cutlass_rows`]: bit-identical at [`bf16_gemm_matches_pipelined`]
+/// K (`examples/bf16_gemm_bench`) and 1.5x+ faster at prefill M (Ripple's
+/// attention projections, M = 6618: 57 -> 93 TFLOPS). `true` when it ran.
+pub fn pipelined_on_cutlass(
+    act: DevicePtr,
+    weight: u64,
+    out: DevicePtr,
+    [m, n, k]: [u32; 3],
+    stream: u64,
+) -> Result<bool> {
+    if !(bf16_gemm_cutlass_rows(m) && bf16_gemm_matches_pipelined(k)) {
+        return Ok(false);
+    }
+    bf16_gemm(act, weight, out, m, n, k, stream)?;
+    Ok(true)
+}
+
 /// Whether the CUTLASS configs and `dense_gemm_bf16_pipelined` accumulate a
 /// `k`-wide row in the same k16 MMA steps. CUTLASS tiles a K residue first
 /// (per config K tile, 32 or 64) and the pipelined kernel zero-fills it last,

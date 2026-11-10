@@ -1655,3 +1655,125 @@ void w4a16_gemm_t_m128_f16a(const __nv_bfloat16* __restrict__ A, const unsigned 
     unsigned int M, unsigned int N, unsigned int K) {
     w4a16_m128_f16_body<true>((const unsigned short*)A, B_packed, B_scale, scale2, C, M, N, K);
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// w4a16_rowgemv_m{9,17}: small-M (DFlash verify rows, M <= 9 / <= 17) W4A16
+// on the TRANSPOSED NVFP4 layout `w4a16_gemm_t_m128` reads
+// (B_packed[(k/2)*N + n], B_scale[(k/16)*N + n]).
+//
+// m128 pads M to 128, so at M = 17 seven eighths of its WMMA work is on zero
+// rows and it runs at ~58 GB/s. Here each lane owns 4 consecutive output
+// columns, dequantizes each weight byte ONCE with m128's exact decode
+// (e2m1x4_off12 / e4m3_scale_half) and applies it in f32 to every row with
+// explicit fmaf. No bf16 rounding: gfx1151 has no f32->bf16 instruction, so
+// rounding each weight in software cost ~20% (the _f16a twins skip it too).
+// The row loop always runs MR rows (rows >= M re-read row M-1 and are not
+// stored): a data-dependent break there turns acc[][] into dynamic indexing. A is read at wave-uniform
+// addresses (scalar loads), 4 K-pairs (one uint4 per row) and 4 weight rows
+// per iteration so the loads overlap. 4 waves split K inside the block and
+// reduce through LDS in a fixed order; gridDim.y = KS > 1 splits K across
+// blocks into an fp32 workspace [KS][M][N] summed in order by
+// w4a16_rowgemv_reduce. Deterministic, but NOT bit-identical to the WMMA
+// kernels (fp32 summation order): relL2 6e-5..3e-4 vs m128_f16a.
+// gfx1151 kbench 42729349013, m128_f16a -> rowgemv: Ripple M=17 gate/up
+// 1881 -> 1161 us (KS=1), down 2463 -> 1229 (KS=2); Qwen3.8-27B M=9
+// gate/up 930 -> 275, down 1050 -> 270 (KS=4).
+//
+// Requires N % 128 == 0 and (K/2) % (16*KS) == 0.
+// Grid: (N/128, KS, 1)   Block: (128, 1, 1)
+// ═══════════════════════════════════════════════════════════════════
+#define RG_KW 4
+template <int MR>
+__device__ __forceinline__ void w4a16_rowgemv_body(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ Bp,
+    const unsigned char* __restrict__ Bs, const float scale2, __nv_bfloat16* __restrict__ C,
+    float* __restrict__ ws, unsigned int M, unsigned int N, unsigned int K) {
+    const unsigned int KS = gridDim.y;
+    const unsigned int lane = threadIdx.x & 31;
+    const unsigned int w = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
+    const unsigned int n0 = blockIdx.x * 128 + lane * 4;
+    const unsigned int slice = (K / 2) / (RG_KW * KS);
+    const unsigned int kp0 = __builtin_amdgcn_readfirstlane((blockIdx.y * RG_KW + w) * slice);
+    const unsigned int* A32 = (const unsigned int*)A;
+    float acc[MR][4];
+    #pragma unroll
+    for (int m = 0; m < MR; m++) { acc[m][0] = acc[m][1] = acc[m][2] = acc[m][3] = 0.f; }
+    float svh[4];
+    for (unsigned int kq = kp0; kq < kp0 + slice; kq += 4) {
+        if ((kq & 7) == 0) {
+            const unsigned int sb = *(const unsigned int*)&Bs[(unsigned long long)(kq >> 3) * N + n0];
+            #pragma unroll
+            for (int c = 0; c < 4; c++) svh[c] = e4m3_scale_half((sb >> (8 * c)) & 0xFF, scale2);
+        }
+        unsigned int pw[4];
+        #pragma unroll
+        for (int u = 0; u < 4; u++) pw[u] = *(const unsigned int*)&Bp[(unsigned long long)(kq + u) * N + n0];
+        float wl[4][4], wh[4][4];
+        #pragma unroll
+        for (int u = 0; u < 4; u++) {
+            const unsigned int tl = e2m1x4_off12(pw[u] & 0x0F0F0F0Fu), th = e2m1x4_off12((pw[u] >> 4) & 0x0F0F0F0Fu);
+            #pragma unroll
+            for (int c = 0; c < 4; c++) {
+                wl[u][c] = (float)(int)(((tl >> (8 * c)) & 0xFF) - 12) * svh[c];
+                wh[u][c] = (float)(int)(((th >> (8 * c)) & 0xFF) - 12) * svh[c];
+            }
+        }
+        #pragma unroll
+        for (int m = 0; m < MR; m++) {
+            const unsigned int mr = (unsigned int)m < M ? (unsigned int)m : M - 1;
+            const uint4 a4 = *(const uint4*)&A32[((unsigned long long)mr * K >> 1) + kq];
+            const unsigned int ap[4] = {a4.x, a4.y, a4.z, a4.w};
+            #pragma unroll
+            for (int u = 0; u < 4; u++) {
+                const float al = __uint_as_float(ap[u] << 16), ah = __uint_as_float(ap[u] & 0xFFFF0000u);
+                #pragma unroll
+                for (int c = 0; c < 4; c++) acc[m][c] = fmaf(ah, wh[u][c], fmaf(al, wl[u][c], acc[m][c]));
+            }
+        }
+    }
+    __shared__ float red[RG_KW - 1][MR][128];
+    if (w > 0) {
+        #pragma unroll
+        for (int m = 0; m < MR; m++)
+            #pragma unroll
+            for (int c = 0; c < 4; c++) red[w - 1][m][lane * 4 + c] = acc[m][c];
+    }
+    __syncthreads();
+    if (w != 0) return;
+    #pragma unroll
+    for (int m = 0; m < MR; m++) {
+        if ((unsigned int)m >= M) continue;
+        #pragma unroll
+        for (int c = 0; c < 4; c++) {
+            float s = acc[m][c];
+            #pragma unroll
+            for (int j = 0; j < RG_KW - 1; j++) s += red[j][m][lane * 4 + c];
+            if (KS == 1) C[(unsigned long long)m * N + n0 + c] = __float2bfloat16(s);
+            else ws[((unsigned long long)blockIdx.y * M + m) * N + n0 + c] = s;
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(32 * RG_KW) void w4a16_rowgemv_m9(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ Bp,
+    const unsigned char* __restrict__ Bs, const float scale2, __nv_bfloat16* __restrict__ C,
+    float* __restrict__ ws, unsigned int M, unsigned int N, unsigned int K) {
+    w4a16_rowgemv_body<9>(A, Bp, Bs, scale2, C, ws, M, N, K);
+}
+
+extern "C" __global__ __launch_bounds__(32 * RG_KW) void w4a16_rowgemv_m17(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ Bp,
+    const unsigned char* __restrict__ Bs, const float scale2, __nv_bfloat16* __restrict__ C,
+    float* __restrict__ ws, unsigned int M, unsigned int N, unsigned int K) {
+    w4a16_rowgemv_body<17>(A, Bp, Bs, scale2, C, ws, M, N, K);
+}
+
+// C[i] = bf16(sum_{s < KS} ws[s][i]) in split order. Grid: (ceil(MN/256)) Block: 256.
+extern "C" __global__ void w4a16_rowgemv_reduce(
+    const float* __restrict__ ws, __nv_bfloat16* __restrict__ C, unsigned int MN, unsigned int KS) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= MN) return;
+    float s = 0.f;
+    for (unsigned int k = 0; k < KS; k++) s += ws[(unsigned long long)k * MN + i];
+    C[i] = __float2bfloat16(s);
+}

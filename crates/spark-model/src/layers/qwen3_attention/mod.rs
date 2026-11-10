@@ -49,6 +49,7 @@ mod trait_impl;
 mod types;
 mod types_layer;
 mod types_weights;
+pub(crate) mod value_residual;
 
 #[cfg(feature = "cuda")]
 pub use innerq_driver::InnerQDriver;

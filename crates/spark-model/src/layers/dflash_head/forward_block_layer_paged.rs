@@ -425,19 +425,14 @@ impl BlockDiffusionDraftHead {
         //          precompute_ctx_kv; noise K is rotated here at
         //          [position..position+γ) — same positions as Q.
         //   position_ids buffer: γ entries = [position, ..., position+γ-1].
-        ops::rope_yarn(
+        self.layer_rope(
             gpu,
-            self.kernels.rope_qwen3,
+            layer_idx,
             scratch.q_buf,
             scratch.k_buf,
             scratch.position_ids,
             g,
             self.num_q_heads as u32,
-            self.num_kv_heads as u32,
-            self.head_dim as u32,
-            self.rotary_dim as u32,
-            self.yarn_inv_freq,
-            self.rope_theta,
             stream,
         )?;
 
@@ -645,7 +640,7 @@ impl BlockDiffusionDraftHead {
             self.num_kv_heads as u32,
             self.head_dim as u32,
             16, // cache_block_size
-            self.attn_sliding_window(),
+            self.layer_attn_window(args.layer_idx),
             self.attn_causal(),
             inv_sqrt_d,
             sinks,
@@ -740,7 +735,7 @@ impl BlockDiffusionDraftHead {
                 self.head_dim as u32,
                 inv_sqrt_d,
                 self.attn_causal(),
-                self.attn_sliding_window(),
+                self.layer_attn_window(args.layer_idx),
                 stream,
             )?;
             if args.block_dump {
@@ -841,7 +836,7 @@ impl BlockDiffusionDraftHead {
             self.head_dim as u32,
             inv_sqrt_d,
             self.attn_causal(),
-            self.attn_sliding_window(),
+            self.layer_attn_window(args.layer_idx),
             stream,
         )?;
 
@@ -968,7 +963,9 @@ impl BlockDiffusionDraftHead {
             return Ok(());
         }
         if let Some(ref conv) = layer.attention_conv {
-            let output_delta = scratch.dflash2_conv_delta.offset(2 * conv.num_groups * 2);
+            let output_delta = scratch
+                .dflash2_conv_delta
+                .offset(conv.output_delta_offset());
             conv.finish(
                 gpu,
                 self.kernels.dflash2_conv,
@@ -1136,7 +1133,9 @@ impl BlockDiffusionDraftHead {
         let g = self.gamma as u32;
 
         if let Some(ref conv) = layer.mlp_conv {
-            let output_delta = scratch.dflash2_conv_delta.offset(2 * conv.num_groups * 2);
+            let output_delta = scratch
+                .dflash2_conv_delta
+                .offset(conv.output_delta_offset());
             conv.finish(
                 gpu,
                 self.kernels.dflash2_conv,

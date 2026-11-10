@@ -191,6 +191,17 @@ impl TransformerModel {
         // sequences are co-batched (concurrent-decode determinism — see
         // tasks/determinism_investigation.md).
         let mut levers = ops::ModelLevers::from_env();
+        // Ricursive on strix-hip: the GB10-picked small-M FFN GEMMs (w4a16_gemm_t /
+        // _k64 for M <= 64, the DFlash verify rows) are 1.5-2.4x slower on gfx1151
+        // than the m128 kernel at Ripple's shapes, bit-identical (kbench
+        // 42541712895); e2e +5% DFlash2 tok/s, greedy identical. An explicit
+        // ATLAS_FFN_SMALLM=1 still opts back in.
+        if config.model_type == "ricursive"
+            && cfg!(atlas_hip)
+            && std::env::var("ATLAS_FFN_SMALLM").as_deref() != Ok("1")
+        {
+            levers.ffn_small_m = false;
+        }
         levers.max_decode_seqs = (max_batch_size as u32).max(1);
         levers.qwen4exp_exact_verify = super::qwen4exp_exact_verify::lever(&config.model_type)?;
         levers.exact_verify = levers.qwen4exp_exact_verify
