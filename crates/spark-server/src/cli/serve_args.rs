@@ -507,6 +507,14 @@ pub struct ServeArgs {
     #[arg(long)]
     pub content_loop_watchdog: Option<bool>,
 
+    /// Arm or disarm the stream loop guards, overriding MODEL.toml's
+    /// `[behavior].enable_stream_loop_guards`. The guards (SimHash
+    /// sentence-repeat and token-loop) end a streamed response on a
+    /// detected loop, and also end answers that repeat by design, such as
+    /// table-driven tests. Precedence: this flag → MODEL.toml.
+    #[arg(long)]
+    pub stream_loop_guards: Option<bool>,
+
     /// Override the content-loop watchdog's repeat threshold (end-anchored
     /// consecutive repeats that constitute a loop; built-in default 3).
     /// Raise it for models whose legitimate output is short-period

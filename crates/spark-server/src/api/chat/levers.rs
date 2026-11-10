@@ -98,6 +98,16 @@ impl ChatLevers {
     }
 }
 
+impl ChatLevers {
+    /// `--stream-loop-guards` over the model's `[behavior]` value.
+    pub fn with_stream_loop_guards(mut self, cli: Option<bool>) -> Self {
+        if let Some(armed) = cli {
+            self.stream_loop_guards = armed;
+        }
+        self
+    }
+}
+
 /// SSOT parse for `ATLAS_INTHINK_TOOL_LEAK_OPENERS`. A set-but-unparseable
 /// value is a config error, not an absent one — silently keeping the default
 /// is how an operator's "fix" fails to apply (#328 class), so it warns.
@@ -120,6 +130,19 @@ fn in_think_leak_openers_from(env: Option<&str>) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_stream_loop_guards_flag_outranks_the_model() {
+        let armed = |model: bool, cli: Option<bool>| {
+            let levers = ChatLevers {
+                stream_loop_guards: model,
+                ..ChatLevers::OFF
+            };
+            levers.with_stream_loop_guards(cli).stream_loop_guards
+        };
+        assert!(armed(true, None) && !armed(false, None));
+        assert!(!armed(true, Some(false)) && armed(false, Some(true)));
+    }
 
     #[test]
     fn off_is_the_default() {
