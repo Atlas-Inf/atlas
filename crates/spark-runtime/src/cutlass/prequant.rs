@@ -55,6 +55,8 @@ unsafe extern "C" {
 /// (`prequant_bench`): K 5120 x N 40960 234 -> 309 TFLOPS at 8; K 40960 x
 /// N 5120 92 -> 215 at 4 (8: 211). Unswizzled, a wave's tiles stream fresh
 /// long-K operand panels from DRAM.
+// Only the CUTLASS (SM120) build calls this; strix-hip compiles the stubs.
+#[cfg_attr(not(atlas_cutlass), allow(dead_code))]
 fn swizzle(k: u32) -> i32 {
     if k > 8192 { 4 } else { 8 }
 }
@@ -80,6 +82,8 @@ pub struct Nvfp4WeightSfb {
     pub sfb: u64,
 }
 
+// Only the CUTLASS (SM120) build calls this; strix-hip compiles the stubs.
+#[cfg_attr(not(atlas_cutlass), allow(dead_code))]
 fn check(what: &str, status: i32, m: u32, k: u32) -> Result<()> {
     if status != 0 {
         bail!("CUTLASS {what} failed: status {status} for {m}x{k}");
