@@ -337,3 +337,11 @@ embed_rowdiff_bf16 = "Routed-token overlay feature; every hook guards kernel.0==
 embed_overlay_routed_bf16 = "Same feature."
 lmhead_overlay_routed_bf16 = "Same feature."
 lmhead_overlay_routed_f32 = "Same feature."
+
+# The DFlash2 drafter probes the gb10 small-M GEMVs (cp.async PTX, not ported)
+# and gates every use on handle != 0: the BF16 drafter takes the GEMM path.
+[expected_absent.bf16_gemv_m32]
+bf16_gemv_m32 = "Drafter/verify small-M BF16 GEMV (cp.async); gb10-only, handle-gated (dflash_head::from_weights), BF16 GEMM fallback on gfx1151."
+
+[expected_absent.fp8_gemv_m32]
+fp8_gemv_m32 = "FP8 drafter GEMV for ATLAS_DFLASH_DRAFTER_FP8_M32=1 (cp.async); gb10-only, handle-gated, the drafter is served BF16."
