@@ -62,15 +62,25 @@ impl RowGemvKernels {
         let reduce = try_kernel_gated(on, gpu, "w4a16", "w4a16_rowgemv_reduce");
         let ws = if m9.0 != 0 && m17.0 != 0 && reduce.0 != 0 {
             // Allocated at load, never inside a captured forward.
-            gpu.op_cache().scratch(gpu, "w4a16_rowgemv_ws", ROWGEMV_WS_BYTES)?
+            gpu.op_cache()
+                .scratch(gpu, "w4a16_rowgemv_ws", ROWGEMV_WS_BYTES)?
         } else {
             DevicePtr::NULL
         };
-        Ok(Self { m9, m17, reduce, ws })
+        Ok(Self {
+            m9,
+            m17,
+            reduce,
+            ws,
+        })
     }
 
     fn ks(n: u32) -> u32 {
-        if n < ROWGEMV_SPLIT_BELOW_N { ROWGEMV_KS_NARROW } else { 1 }
+        if n < ROWGEMV_SPLIT_BELOW_N {
+            ROWGEMV_KS_NARROW
+        } else {
+            1
+        }
     }
 
     /// Whether `[m, n, k]` is a shape the kernels take.

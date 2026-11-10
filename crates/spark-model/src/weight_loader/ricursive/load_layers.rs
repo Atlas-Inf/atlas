@@ -89,7 +89,11 @@ fn load_ffn(
     // (the m128 GEMM) instead of W4A4 on the native layout.
     let hip = cfg!(atlas_hip);
     let twin = |w: &QuantizedWeight, n, k| -> Result<Option<QuantizedWeight>> {
-        Ok(if hip { Some(w.transpose_for_gemm(gpu, n, k)?) } else { None })
+        Ok(if hip {
+            Some(w.transpose_for_gemm(gpu, n, k)?)
+        } else {
+            None
+        })
     };
     let weights = DenseFfnWeights {
         gate_proj_t: twin(&gate_proj, inter, h)?,

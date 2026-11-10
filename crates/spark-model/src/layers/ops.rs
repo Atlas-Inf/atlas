@@ -100,9 +100,9 @@ pub(crate) mod moe_gate_up_repack;
 pub mod skinny_mma;
 #[path = "ops/strix_f16.rs"]
 mod strix_f16;
+mod verify_rows;
 #[path = "ops/w4a16_rowgemv.rs"]
 mod w4a16_rowgemv;
-mod verify_rows;
 #[path = "ops/yarn_mrope.rs"]
 mod yarn_mrope;
 pub use model_stats::ModelStats;
@@ -443,9 +443,9 @@ pub use ssm_mamba_snap::*;
 pub use ssm_preproc::*;
 pub use ssm_ssd::*;
 pub use strix_f16::*;
-pub use w4a16_rowgemv::*;
 pub use strix_s64::*;
 pub use tree_verify::*;
 pub use verify_rows::*;
+pub use w4a16_rowgemv::*;
 pub use wide_prefill::*;
 pub use yarn_mrope::*;

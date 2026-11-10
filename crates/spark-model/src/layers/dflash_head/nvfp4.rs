@@ -322,7 +322,10 @@ mod tests {
     #[test]
     fn drafter_nvfp4_twin_bytes_ripple() {
         // Ripple-65B DFlash2: 5 layers, h 5120, q 80x128, kv 8x128, inter 40960.
-        assert_eq!(drafter_nvfp4_bytes(5, 5120, 10240, 1024, 40960), 2_093_875_200);
+        assert_eq!(
+            drafter_nvfp4_bytes(5, 5120, 10240, 1024, 40960),
+            2_093_875_200
+        );
     }
 }
 
