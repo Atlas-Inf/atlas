@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod chunk_retry;
 mod kv_refusal;
 mod min_tokens_ban;
+mod mixed_gate;
 mod packed_prefill;
 mod queue_first_chunk;
 mod resume;
