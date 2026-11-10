@@ -30,7 +30,7 @@ bench_arm() { # arm-name [gufo_bench concurrency list, default 1,4,8] [wait_read
 case $ENGINE in
 atlas)
   [ -x target/release/spark ] || { log "no target/release/spark (run with job=bench, which builds it)"; exit 1; }
-  NV=$(hf_get "$NVFP4_REPO" "") || { log "NVFP4 DOWNLOAD FAILED"; exit 1; }
+  NV=$(hf_get "$NVFP4_REPO" "") || { log "NVFP4 DOWNLOAD FAILED: $(tail -3 "$OUT/download.log")"; exit 1; }
   log "atlas $(git rev-parse --short=9 HEAD), $NVFP4_REPO ($(du -shL "$NV" | cut -f1))"
   AENV=(GPU_UTIL=${GPU_UTIL:-0.70} MAX_SEQ_LEN=32768 ATLAS_KV_EXTERNAL_RESERVE_GB=0)
   atlas_up $PORT "$NVFP4_REPO" "${AENV[@]}" MAX_BATCH=1; bench_arm atlas_b1 1
@@ -58,7 +58,7 @@ halogen)
   [ "$MK" = fnext ] || { log "halogen serves Flash-Next only"; exit 1; }
   docker pull -q "ghcr.io/peonist-ai/halogen-flash-server:${HALOGEN_TAG:-0.20.1}" > "$OUT/pull.log" 2>&1 || { log "PULL FAILED: $(tail -2 "$OUT/pull.log")"; exit 1; }
   log "halogen ${HALOGEN_TAG:-0.20.1} $(docker image inspect -f '{{.Id}}' "ghcr.io/peonist-ai/halogen-flash-server:${HALOGEN_TAG:-0.20.1}" | cut -c8-19)"
-  halogen_up $PORT
+  PORT=8731; halogen_up || { log "halogen models dir not writable"; exit 1; }
   export H2H_REQ_EXTRA='{"reasoning_effort":"none"}'
   bench_arm halogen 1,4,8 2160 ;;   # first start downloads ~118 GB: allow 3 h
 *) log "unknown engine $ENGINE"; exit 1 ;;

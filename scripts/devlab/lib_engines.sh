@@ -28,8 +28,11 @@ pyhf() { # -> PY, a python with huggingface_hub + hf_transfer (system python if 
   fi
   export HF_HUB_ENABLE_HF_TRANSFER=1
 }
-hf_get() { # repo pattern [rev] -> prints the snapshot dir
-  "${PY:-python3}" -c 'import sys; from huggingface_hub import snapshot_download as s; print(s(sys.argv[1], revision=(sys.argv[3] or None), allow_patterns=([sys.argv[2]] if sys.argv[2] else None)))' "$1" "$2" "${3:-}" 2>>"$OUT/download.log"
+hf_get() { # repo pattern [rev] -> prints the snapshot dir; 3 tries (the runner's mirror drops long pulls)
+  local i; for i in 1 2 3; do
+    "${PY:-python3}" -c 'import sys; from huggingface_hub import snapshot_download as s; print(s(sys.argv[1], revision=(sys.argv[3] or None), allow_patterns=([sys.argv[2]] if sys.argv[2] else None)))' "$1" "$2" "${3:-}" 2>>"$OUT/download.log" && return 0
+    echo "hf_get $1: try $i failed" >> "$OUT/download.log"; sleep 30
+  done; return 1
 }
 first_gguf() { ls "$1"/$2 2>/dev/null | sort | head -1; }
 
@@ -92,12 +95,13 @@ llama_up() { # port parallel ctx-per-slot model [extra llama-server args...]
   ENGINE_DOWN() { kill -INT "$LPID" 2>/dev/null; sleep 8; kill -9 "$LPID" 2>/dev/null; cp "$OUT/llama-server.log" "$1" 2>/dev/null; true; }
 }
 
-halogen_up() { # port -- Peonist's published halogen-flash-server image at its defaults (EULA s4 permits benchmarking and
+halogen_up() { # Peonist's published halogen-flash-server image at its defaults (EULA s4 permits benchmarking and
   # publishing results), weights fetched by the image itself on first start into the runner's scratch.
-  local port=$1 GR GV; GR=$(getent group render | cut -d: -f3); GV=$(getent group video | cut -d: -f3)
-  local md=${HALOGEN_MODELS:-$(dirname "$HFC")/halogen-models}; mkdir -p "$md"
+  # Host network (as gufo_up): the bridge could not reach the runner's HF mirror (07:37Z Errno 110). Serves on 8731.
+  local GR GV; GR=$(getent group render | cut -d: -f3); GV=$(getent group video | cut -d: -f3)
+  local md=${HALOGEN_MODELS:-$HFC/halogen-models}; mkdir -p "$md" || return 1
   docker rm -f halogen-h2h >/dev/null 2>&1
-  docker run -d --name halogen-h2h -p "127.0.0.1:$port:8731" --device /dev/kfd --device /dev/dri --group-add "$GV" --group-add "$GR" \
+  docker run -d --name halogen-h2h --network host --device /dev/kfd --device /dev/dri --group-add "$GV" --group-add "$GR" \
     --ipc=host --ulimit memlock=-1:-1 -e HALOGEN_DOWNLOAD=${HALOGEN_REPO:-peonist-ai/halogen-qwen3.8-flash-next} \
     -e HALOGEN_KV_SLOTS=${SESSIONS:-8} ${HF_ENDPOINT:+-e HF_ENDPOINT=$HF_ENDPOINT} -v "$md":/models \
     "ghcr.io/peonist-ai/halogen-flash-server:${HALOGEN_TAG:-0.20.1}" > /dev/null
