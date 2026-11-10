@@ -98,6 +98,7 @@ pub(crate) mod ssm_pool;
 mod ssm_pool_teardown;
 pub(crate) mod ssm_pools;
 pub(crate) mod ssm_snapshot;
+mod ssm_snapshot_aux_spill;
 pub mod ssm_snapshot_budget;
 pub(crate) mod ssm_snapshot_faultin;
 pub(crate) mod ssm_snapshot_spill;

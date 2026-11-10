@@ -14,7 +14,7 @@ use spark_runtime::kv_cache::PagedKvCache;
 use spark_runtime::prefix_cache::TierEvict;
 
 use super::ssm_snapshot::SsmSnapshotPool;
-use super::ssm_snapshot_faultin::{log_spill_gate_skip, retire_refused_spill};
+use super::ssm_snapshot_faultin::log_spill_gate_skip;
 use super::ssm_spill_gate::spill_min_tokens;
 
 /// One-shot latch for the "this is the new spill shape" info line. Steady state
@@ -104,7 +104,7 @@ impl SsmSnapshotPool {
             let stream = gpu.default_stream();
             match self.spill_slot(slot, key, store, gpu, stream) {
                 Ok(true) => {}
-                Ok(false) => retire_refused_spill(prefix_cache, store, key),
+                Ok(false) => self.retire_refused_spill(prefix_cache, store, key),
                 Err(e) => tracing::warn!(
                     "SSM spill during fault-in acquire failed ({e:#}); freeing slot anyway, \
                      key {key} RETAINED (an error is not evidence of absence)"
@@ -192,7 +192,7 @@ impl SsmSnapshotPool {
                     // MISMATCH while KEEPING the record — without this that
                     // blob would be unreachable forever yet still consume
                     // ATLAS_SSM_TIER_DISK_GB budget.
-                    store.remove(key);
+                    self.remove_spilled(store, key);
                     tracing::info!(
                         "SSM tier reap: no blob for key {key} (depth {depth} tok) — retired the \
                          index entry; this prefix now recomputes once instead of re-spilling a \
@@ -321,7 +321,12 @@ impl SsmSnapshotPool {
         // slot. If so this decays to ~0 in steady state with no code at all.
         // Measure that (put wall time vs put ordinal 1..128) before touching
         // the trait.
-        let r = store.put(key, blob)?;
+        let mut r = store.put(key, blob)?;
+        if r && !self.spill_aux(snap_slot, key, store, blob)? {
+            // A refused aux chunk refuses the spill: keep none of it.
+            store.remove(key);
+            r = false;
+        }
         if timing {
             tracing::info!(
                 "SSM spill: {} B  gather+sync={}us  store.put={}us  total={}us  staging={}",
