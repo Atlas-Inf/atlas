@@ -93,7 +93,9 @@ static float bf(__nv_bfloat16 x) { unsigned short u; std::memcpy(&u, &x, 2); uns
 int main() {
     struct S { const char* name; unsigned int M, N, K; } shapes[] = {
         {"ripple gate/up", 17, 40960, 5120}, {"ripple down", 17, 5120, 40960},
-        {"27b gate/up K8", 9, 17408, 5120}, {"27b down K8", 9, 5120, 17408}};
+        {"27b gate/up K8", 9, 17408, 5120}, {"27b down K8", 9, 5120, 17408},
+        {"27b gate/up M16", 16, 17408, 5120}, {"27b down M16", 16, 5120, 17408},
+        {"27b gate/up M8", 8, 17408, 5120}, {"27b down M8", 8, 5120, 17408}};
     for (auto& s : shapes) {
         const unsigned M = s.M, N = s.N, K = s.K;
         const size_t pb = (size_t)K / 2 * N, sb = (size_t)K / 16 * N, wbytes = pb + sb;
@@ -113,6 +115,10 @@ int main() {
             const bool d2 = ks >= 16; ks = d2 ? ks - 16 : ks;
             if (M == 17) { if (d2) hipLaunchKernelGGL((rowgemv<17, false>), dim3(N / 128, ks), dim3(32 * RG_KW), 0, 0, A, P[c], Q[c], 0.01f, C, ws, N, K, ks);
                            else    hipLaunchKernelGGL((rowgemv<17, true>), dim3(N / 128, ks), dim3(32 * RG_KW), 0, 0, A, P[c], Q[c], 0.01f, C, ws, N, K, ks); }
+            else if (M == 16) { if (d2) hipLaunchKernelGGL((rowgemv<16, false>), dim3(N / 128, ks), dim3(32 * RG_KW), 0, 0, A, P[c], Q[c], 0.01f, C, ws, N, K, ks);
+                                else    hipLaunchKernelGGL((rowgemv<16, true>), dim3(N / 128, ks), dim3(32 * RG_KW), 0, 0, A, P[c], Q[c], 0.01f, C, ws, N, K, ks); }
+            else if (M == 8)  { if (d2) hipLaunchKernelGGL((rowgemv<8, false>), dim3(N / 128, ks), dim3(32 * RG_KW), 0, 0, A, P[c], Q[c], 0.01f, C, ws, N, K, ks);
+                                else    hipLaunchKernelGGL((rowgemv<8, true>), dim3(N / 128, ks), dim3(32 * RG_KW), 0, 0, A, P[c], Q[c], 0.01f, C, ws, N, K, ks); }
             else         { if (d2) hipLaunchKernelGGL((rowgemv<9, false>), dim3(N / 128, ks), dim3(32 * RG_KW), 0, 0, A, P[c], Q[c], 0.01f, C, ws, N, K, ks);
                            else    hipLaunchKernelGGL((rowgemv<9, true>), dim3(N / 128, ks), dim3(32 * RG_KW), 0, 0, A, P[c], Q[c], 0.01f, C, ws, N, K, ks); }
             if (ks > 1) hipLaunchKernelGGL(rowgemv_reduce, dim3((M * N + 255) / 256), dim3(256), 0, 0, ws, C, M * N, ks);
