@@ -382,8 +382,11 @@ pub(super) fn hc_pre_split(
     // and to fill the part after grid.x shrinks by HC_TT. At or below HC_TT the
     // tile degenerates to one token per block while still paying
     // hc_dim/HC_CH rounds of barriers, which is the decode regression measured
-    // above -- so the single-pass kernel keeps those shapes.
-    if num_tokens > HC_TT {
+    // above -- so the single-pass kernel keeps those shapes. A full tile
+    // (T == HC_TT, the C8 decode step) is the exception: strix kbench
+    // (runner 42927943967, DRAM-rotated) has tiled 224 us vs single-pass
+    // 320 us there, bit-identical; at T=1..4 single-pass still wins.
+    if num_tokens >= HC_TT {
         let smem = HC_TT as usize * HC_CH * 4;
         anyhow::ensure!(
             smem <= HC_SMEM_MAX,
