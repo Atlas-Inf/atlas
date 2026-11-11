@@ -406,12 +406,12 @@ pub fn requested() -> bool {
 }
 
 /// `ATLAS_GLM_SP_QUANT_GATHER_PAIR` (default 0, read once; the ranks compare
-/// it at startup, `model::startup_parity`): the two-rank pair gathers the
-/// MoE, KDA and MLA block inputs quantized, as the four-rank chain always
-/// does. `1`: on the pair's own chunks, whose 4098-row parts are off the
-/// KDA cast's 128-row scale tile grid, so a KDA layer keeps its BF16 gather
-/// there. `2`: the pair's chunks are also cut to 128 rows a rank
-/// (`model::glm_prefill_sp`), so KDA layers gather quantized too.
+/// it at startup, `model::startup_parity`): the two-rank pair gathers block
+/// inputs quantized, as the four-rank chain always does. `1`: the MoE and
+/// MLA inputs, on the pair's own chunks; KDA layers keep their BF16 gather.
+/// `2`: the pair's chunks are also cut to 128 rows a rank
+/// (`model::glm_prefill_sp`), the KDA cast's scale tile grid, and KDA layers
+/// gather quantized too.
 pub fn quant_gather_pair() -> usize {
     static MODE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
@@ -423,12 +423,12 @@ pub fn quant_gather_pair() -> usize {
         .unwrap_or_else(|e| panic!("{e:#}"));
         if mode > 0 {
             tracing::info!(
-                "ATLAS_GLM_SP_QUANT_GATHER_PAIR={mode}: a two-rank SP prefill gathers its MoE, \
-                 KDA and MLA inputs quantized{}",
+                "ATLAS_GLM_SP_QUANT_GATHER_PAIR={mode}: a two-rank SP prefill gathers its MoE \
+                 and MLA inputs quantized{}",
                 if mode == 2 {
-                    "; its chunks are cut to 128 rows a rank"
+                    ", and its KDA inputs on chunks cut to 128 rows a rank"
                 } else {
-                    " (KDA only where a part is whole 128-row tiles)"
+                    ""
                 }
             );
         }

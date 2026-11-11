@@ -32,6 +32,10 @@ impl Glm5KdaLayer {
     /// side-projected: the seam then gathers no BF16 rows.
     pub(super) fn sp_kda_quant_gather(&self, sp: SpRows, ctx: &ForwardContext) -> bool {
         sp.quant_gathers()
+            // The pair's KDA gather is mode 2's alone: mode 1 keeps its own
+            // chunks, and a tail that happens to land on the tile grid stays
+            // on the BF16 gather the rest of that prompt took.
+            && (sp.ranks > 2 || crate::layers::glm_sp::quant_gather_pair() == 2)
             && sp.rows * (sp.ranks - 1) == sp.peer_rows
             && sp.rows.is_multiple_of(ops::MX_LT_TILE_ROWS)
             && !ctx.graph_capture

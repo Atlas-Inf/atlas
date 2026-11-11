@@ -206,8 +206,8 @@ pub(super) fn load_kda_weights(
     // per head, so the gather moves every head's beta of each rank's rows: an
     // owned copy of the whole b_proj, taken before the shard's load releases
     // the checkpoint bytes. The pair's too under
-    // `ATLAS_GLM_SP_QUANT_GATHER_PAIR`.
-    let pair_gather = dims.tp_size == 2 && crate::layers::glm_sp::quant_gather_pair() > 0;
+    // `ATLAS_GLM_SP_QUANT_GATHER_PAIR=2`, the mode whose KDA layers gather.
+    let pair_gather = dims.tp_size == 2 && crate::layers::glm_sp::quant_gather_pair() == 2;
     let b_proj_full = if dims.tp_size == 4 || pair_gather {
         let whole = load("b_proj")?;
         let bytes = dims.full_nk * dims.h * 2;
