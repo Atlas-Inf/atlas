@@ -119,9 +119,11 @@ pub fn router_worklist_bytes(rows: usize, top_k: usize, inter: usize) -> usize {
 /// `ATLAS_FP32_ROUTING=1` reads a router input there
 /// (`MoeLayer::fp32_routing_active`), and never on a correction-bias router;
 /// without it the buffer is worklist scratch. Per-layer expert shapes keep
-/// the full size: the worklist bound is stated for one shape.
+/// the full size: the worklist bound is stated for one shape. Only GLM-5 is
+/// trimmed: the other correction-bias models have not run with less.
 fn fp32_router_input(config: &ModelConfig) -> bool {
-    !config.use_routing_bias
+    config.model_type != "glm5_next"
+        || !config.use_routing_bias
         || !config.moe_intermediate_sizes.is_empty()
         || !config.num_experts_per_toks.is_empty()
         || std::env::var("ATLAS_FP32_ROUTING").as_deref() == Ok("1")

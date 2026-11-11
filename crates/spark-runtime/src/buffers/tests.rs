@@ -207,6 +207,7 @@ fn a_correction_bias_router_keeps_only_worklist_scratch() {
         return; // sized for the router input in this environment
     }
     let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+    cfg.model_type = "glm5_next".into();
     cfg.hidden_size = 4096;
     cfg.num_experts = 288;
     cfg.num_experts_per_tok = 8;
@@ -221,5 +222,9 @@ fn a_correction_bias_router_keeps_only_worklist_scratch() {
     assert_eq!(full(&cfg, 1), 4096 * 4);
     // Per-layer expert shapes: the bound is stated for one shape.
     cfg.moe_intermediate_sizes = vec![2048];
+    assert_eq!(full(&cfg, 8196), 8196 * 4096 * 4);
+    // Another correction-bias model keeps the full size.
+    cfg.moe_intermediate_sizes.clear();
+    cfg.model_type = "deepseek_v4".into();
     assert_eq!(full(&cfg, 8196), 8196 * 4096 * 4);
 }
