@@ -3,7 +3,7 @@
 // (runner 42927951718). Baseline ceiling check before writing a candidate: TFLOP/s of the shipped f16a kernel and its
 // bf16 twin w4a16_gemm_t_m128 at the 27B FFN shapes (gate/up N=17408 K=5120, down N=5120 K=17408) for M = 512, 1024,
 // 2048, 4096, against gfx1151's ~59 TFLOP/s f16 WMMA peak and the ~33-44 measured for rocBLAS BF16 (11-10 kbench).
-#include "w4a16_gemm.cu"
+#include "../q27/w4a16_gemm.cu"   // the 27B copy (common/ has a w4a16_gemm.cu without the m128 kernels)
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
