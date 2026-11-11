@@ -71,3 +71,32 @@ fn free_within_total_is_unchanged() {
     let b = size(&i);
     assert_eq!(b.used_raw, i.total - i.free_now);
 }
+
+/// DevLab runner, Ripple-65B (2026-11-11, run 42977170558): baseline free 122.6
+/// GB on a 100 GB GTT total, and after 83 GB of weights + layers free-now reads
+/// 36.1, back under total. `total - free_now` charged 63.9 GB pre-KV, called
+/// the correct 86.5 GB delta implausible, and the pool OOMed at 98.9 GiB used.
+#[test]
+fn baseline_above_total_charges_the_delta_even_when_free_now_fits() {
+    let i = Inputs {
+        total: gib(100.0),
+        free_now: gib(36.1),
+        utilization: 0.90,
+        reserve: gib(0.3),
+        baseline_free: Some(gib(122.6)),
+        manual_external: None,
+        tracked: None,
+    };
+    let b = size(&i);
+    assert_eq!(b.basis, Basis::Delta);
+    assert!(
+        (b.own as f64 / GIB_F - 86.5).abs() < 0.05,
+        "own {}",
+        b.own as f64 / GIB_F
+    );
+    assert!(
+        b.own + i.reserve + b.bytes <= i.total,
+        "pool {} does not fit",
+        b.bytes as f64 / GIB_F
+    );
+}
