@@ -69,7 +69,7 @@ fn copied_drafts_are_measured_and_calibrate_only_their_own_bin() {
         reply_before
     );
     assert!(policy.calibration.survival(&copies)[0] < PRIOR[COPY_BIN] / 2.0);
-    assert_eq!(choose(&mut policy, &[&copies[..]], 7, NO_PROBE), Some(2));
+    assert_eq!(choose(&mut policy, &[&copies[..]], 7, NO_PROBE), Some(1));
     // Drafter rounds leave the copies' evidence where it is.
     let copies_after = policy.calibration.survival(&copies);
     for _ in 0..200 {
@@ -93,7 +93,7 @@ fn copy_rounds_do_not_move_the_drafters_probe() {
         // A copy round between every drafter round: probed on its own count.
         choose(&mut policy, &[copies], 7, params).unwrap();
     }
-    assert_eq!(widths, [2, 2, 2, 7]);
+    assert_eq!(widths, [1, 1, 1, 7]);
     assert_eq!((policy.steps, policy.copy_steps), (4, 4));
     // A batch with any drafter owner is the drafter's step.
     choose(&mut policy, &[copies, unsure], 7, params).unwrap();
@@ -105,7 +105,7 @@ fn a_sure_block_verifies_wide_and_an_unsure_one_narrow() {
     assert_eq!(lone(&[SURE; 7]), 7);
     // Two drafts is the floor for a lone owner: its 2-row verify costs more
     // than its 3-row one, so one draft never pays.
-    assert_eq!(lone(&[UNSURE; 7]), 2);
+    assert_eq!(lone(&[UNSURE; 7]), 1);
 }
 
 #[test]
@@ -155,7 +155,7 @@ fn every_probe_period_verifies_the_full_width() {
     let widths: Vec<usize> = (0..12)
         .map(|_| choose(&mut policy, &[&[UNSURE; 7]], 7, params).unwrap())
         .collect();
-    assert_eq!(widths, [2, 2, 2, 7, 2, 2, 2, 7, 2, 2, 2, 7]);
+    assert_eq!(widths, [1, 1, 1, 7, 1, 1, 1, 7, 1, 1, 1, 7]);
     // The probe respects the caller's cap.
     let mut policy = Policy::default();
     let probe_every_step = Params {
@@ -221,7 +221,7 @@ fn min_tokens_bans_fall_back_and_recalibrate() {
     for _ in 0..40 {
         policy.calibration.record(&forced, 7, 1);
     }
-    assert_eq!(choose(&mut policy, &[&forced], 7, NO_PROBE), Some(2));
+    assert_eq!(choose(&mut policy, &[&forced], 7, NO_PROBE), Some(1));
     // ...and unlearns it once sure picks are accepted again.
     for _ in 0..200 {
         policy.calibration.record(&forced, 7, 7);
@@ -271,11 +271,12 @@ fn a_cut_position_cannot_stay_mislearned() {
 
 #[test]
 fn rows_are_priced_at_todays_step_cost() {
-    // One owner: 5.68 ms a row from 3 to 8 rows; its 2-row verify is slower
-    // than its 3-row one, so a lone owner never verifies one draft.
+    // One owner: 5.68 ms a row from 2 to 8 rows, the 2-row verify included
+    // (measured 5.4 ms under the 3-row one on 2026-11-11), so an unsure lone
+    // owner verifies one draft.
     assert!((row_ms() - 5.68).abs() < 1e-3);
     assert!(((step_ms(1, 8) - step_ms(1, 3)) / 5.0 - row_ms()).abs() < 1e-3);
-    assert!(step_ms(1, 2) > step_ms(1, 3));
+    assert!((step_ms(1, 3) - step_ms(1, 2) - row_ms()).abs() < 1e-3);
     // Four owners: 3.2 ms an owner-row, linear (not the concave 2026-09-28
     // table, which priced deep rows too cheaply).
     assert!((step_ms(4, 5) - step_ms(4, 4) - 4.0 * 3.2).abs() < 1e-3);
