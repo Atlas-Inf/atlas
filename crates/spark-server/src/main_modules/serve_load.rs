@@ -1431,7 +1431,8 @@ pub(crate) fn load_model(
             tx: score_tx,
             budget: scheduler::score::ScoreBudget::new(score_capacity, max_batch_size, block_size),
         }),
-        chat: crate::api::chat::levers::ChatLevers::resolve(&ptx_set.behavior),
+        chat: crate::api::chat::levers::ChatLevers::resolve(&ptx_set.behavior)
+            .with_stream_loop_guards(args.stream_loop_guards),
         vision_max_pixels,
         vision_limits: vision_config.as_ref().map(|_| {
             spark_model::vision_limits::VisionRowLimits::resolve(
