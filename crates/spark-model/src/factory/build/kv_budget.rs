@@ -186,7 +186,10 @@ pub(super) fn size(i: &Inputs) -> KvBudget {
     // the tracked footprint (no co-tenants on such a box is the conservative
     // reading of an unreadable split), and read free as what that leaves of
     // `total`. A device whose free fits its total is sized exactly as before.
-    let scales_disagree = i.free_now > i.total;
+    // A baseline above total is the same mismatch caught earlier in the load:
+    // after a big model free can drop back under total and look consistent
+    // (Ripple on the 100 GB runner: baseline 122.6, free-now 36.1, real use 86).
+    let scales_disagree = i.free_now > i.total || i.baseline_free.is_some_and(|b| b > i.total);
     let (used_raw, free_now) = if scales_disagree {
         let delta = i.baseline_free.map_or(0, |b| b.saturating_sub(i.free_now));
         let tracked = i.tracked.map_or(0, |t| t.total());
