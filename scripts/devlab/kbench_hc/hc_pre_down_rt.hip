@@ -71,7 +71,7 @@ int main() {
         printf("  T=%u %-10s %8.1f us  %6.1f GB/s(weight once)", T, name, us, wbytes / (us * 1e3));
         return us;
     };
-    for (unsigned T : {1u, 2u, 4u, 8u}) {
+    for (unsigned T : {4u, 5u, 6u, 7u, 8u}) {
         const unsigned ds = std::min(10u, std::max(1u, 48u / T));
         double up = run("plain", T, o0, [&](__nv_bfloat16* w, float* o) {
             hipLaunchKernelGGL(hc_pre_down, dim3(T, ds), dim3(1024), D * 4, 0, dn, w, o, H, HC, R, T); });
@@ -83,12 +83,11 @@ int main() {
             printf("  %5.2fx  %s\n", up / us, memcmp(ref.data(), got.data(), T * R * 4) ? "DIFFERS" : "bit-identical");
             CHECK(hipMemset(o1, 0, 8 * R * 4));
         };
-        cmp(run("tiled", T, o1, [&](__nv_bfloat16* w, float* o) {
-            hipLaunchKernelGGL(hc_pre_down_tiled, dim3((T + 7) / 8, 10), dim3(1024), 0, 0, dn, w, o, H, HC, R, T); }));
-        for (unsigned wpb : {2u, 4u, 8u}) {
-            char nm[32]; snprintf(nm, sizeof nm, "rt_w%u", wpb);
+        // 11-11 sweep: rt lost everywhere (latency-bound scalar global normed reads), so the tiled grid.y / block is swept
+        for (unsigned ys : {10u, 20u, 40u}) for (unsigned bs : {256u, 512u, 1024u}) {
+            char nm[32]; snprintf(nm, sizeof nm, "tiled_y%u_b%u", ys, bs);
             cmp(run(nm, T, o1, [&](__nv_bfloat16* w, float* o) {
-                hipLaunchKernelGGL(hc_pre_down_rt<8>, dim3((R + wpb - 1) / wpb), dim3(32 * wpb), 0, 0, dn, w, o, H, HC, R, T); }));
+                hipLaunchKernelGGL(hc_pre_down_tiled, dim3((T + 7) / 8, ys), dim3(bs), 0, 0, dn, w, o, H, HC, R, T); }));
         }
     }
     return 0;
