@@ -880,10 +880,10 @@ pub fn run(
                 model.batch_verify_bit_exact(),
                 active.len(),
             );
-            // ATLAS_GLM_STRICT_SPEC=1: strict structured-output sequences
-            // speculate too, on the DFlash lane whose verify the GLM split head
-            // grammar-masks row by row (`strict_spec`). Anywhere else they stay
-            // serial.
+            // Strict structured-output sequences speculate too where the
+            // verify grammar-masks row by row (`strict_spec::enabled`: the GLM
+            // split head's DFlash lane, or any full-logits verify). Anywhere
+            // else they stay serial.
             let strict_spec =
                 strict_spec::enabled(&sched.levers, &*model, dflash_verify_raw_argmax);
             // Spec dispatch additionally requires every active sequence's

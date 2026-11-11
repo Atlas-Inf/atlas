@@ -362,7 +362,7 @@ pub fn step_mtp(
         // `accept_token` silently fails — desync'ing the grammar
         // from the output stream. Truncating here downgrades K=4 →
         // K=3 → K=2 cleanly.
-        // Strict grammars trim at the verify, thinking-aware (`strict_spec`).
+        // Strict grammars are masked at the verify, thinking-aware (`strict_spec`).
         if let Some(gs) = a.grammar_state.as_mut().filter(|gs| !gs.is_strict()) {
             let kept = truncate_drafts_at_grammar_boundary(gs, &drafts);
             if kept < drafts.len() {

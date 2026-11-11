@@ -99,7 +99,7 @@ impl Model for Stub {
         }
         let mut seen = self.seen.lock().unwrap();
         seen.batched.push((ks.to_vec(), tokens.to_vec()));
-        Ok(picks)
+        Ok(self.scripted_picks(picks))
     }
     fn stash_verify_hidden_rows(&self, _rows: &[usize], _st: u64) -> Result<()> {
         Ok(())
@@ -486,6 +486,8 @@ mod copy;
 mod grammar;
 #[path = "one_forward_logprob_tests.rs"]
 mod logprob_tests;
+#[path = "one_forward_strict_tests.rs"]
+mod strict;
 
 #[path = "bootstrap_score_tests.rs"]
 mod bootstrap_score_tests;

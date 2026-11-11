@@ -64,6 +64,19 @@ pub(super) fn enabled(
     }
 }
 
+/// Whether a speculating strict sequence may share the batched MTP verify
+/// (`mtp_step::one_forward`): only the full-logits arm, whose batched pick
+/// runs the same host pipeline per member as the per-sequence verify. The
+/// argmax-only head masks one sequence's rows on device, and the DFlash
+/// batch is not covered, so both keep the per-sequence verify.
+pub(super) fn rides_batch(
+    levers: &SchedLevers,
+    model: &dyn spark_model::traits::Model,
+    raw: bool,
+) -> bool {
+    levers.strict_spec && !raw && !model.verify_logits_argmax_only()
+}
+
 /// A strict verify: the drafts it carries and one mask per verify row.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct StrictVerify {

@@ -242,7 +242,7 @@ pub fn mtp_grammar_masks_for(
 /// for all six propose sites — semantics identical to the bootstrap clamp
 /// (`grammar_state.is_some()`). No-op when grammar is inactive: full K kept.
 pub fn effective_drafts_under_grammar(a: &ActiveSeq, num_drafts: usize) -> usize {
-    // A strict grammar speculating (ATLAS_GLM_STRICT_SPEC, the only way it
+    // A strict grammar speculating (`strict_spec::enabled`, the only way it
     // reaches a propose) keeps full width: its verify masks every row.
     if a.grammar_state.is_some() && !a.strict_grammar() {
         1

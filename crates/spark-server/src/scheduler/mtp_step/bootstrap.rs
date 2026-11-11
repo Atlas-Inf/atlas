@@ -37,7 +37,7 @@ pub(super) fn bootstrap_one(
         && crate::scheduler::adaptive_spec::spec_allowed(a, sched)
     {
         // A strict grammar here speculates at full width: its verify
-        // masks every row and trims the drafts (`strict_spec`).
+        // masks every row (`strict_spec`).
         let eff = if a.grammar_state.is_some() && !a.strict_grammar() {
             1
         } else {
