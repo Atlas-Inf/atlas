@@ -382,14 +382,11 @@ pub(super) fn hc_pre_split(
     // and to fill the part after grid.x shrinks by HC_TT. At or below HC_TT the
     // tile degenerates to one token per block while still paying
     // hc_dim/HC_CH rounds of barriers, which is the decode regression measured
-    // above -- so the single-pass kernel keeps those shapes. Batched decode
-    // (T = 5..=HC_TT) is the exception: strix kbench (runners 42927943967,
-    // 42932386097, DRAM-rotated, bit-identical) has tiled at grid.y 20 vs
-    // single-pass 161/168/185/189 us vs 192/244/269/319 us at T=5/6/7/8;
-    // at T<=4 single-pass still wins (129 vs 150 us at T=4). Measured on
-    // strix only, so other targets keep the T > HC_TT cut.
-    let tiled_min = if cfg!(atlas_hip) { 5 } else { HC_TT + 1 };
-    if num_tokens >= tiled_min {
+    // above -- so the single-pass kernel keeps those shapes. On strix tiled at
+    // twice the row splits wins from T=5 (kbench 42932386097: 189 vs 319 us at
+    // T=8, bit-identical; T=4 still loses), so HIP cuts over there.
+    let hip_dec = cfg!(atlas_hip) && num_tokens <= HC_TT;
+    if num_tokens > HC_TT || (hip_dec && num_tokens >= 5) {
         let smem = HC_TT as usize * HC_CH * 4;
         anyhow::ensure!(
             smem <= HC_SMEM_MAX,
@@ -400,14 +397,7 @@ pub(super) fn hc_pre_split(
         );
         // One row per warp keeps the kernel's accumulator array at HC_TT
         // registers rather than HC_TT x rows_per_warp.
-        // A single tile fills the part only with more row splits: grid.y 20
-        // beat 10 (188.5 vs 217.5 us at T=8) and 40 on strix; prefill widths
-        // keep the swept 10.
-        let dsplit = if cfg!(atlas_hip) && num_tokens <= HC_TT {
-            20
-        } else {
-            (w.rank as u32).div_ceil(32).clamp(1, 16)
-        };
+        let dsplit = (w.rank as u32).div_ceil(32).clamp(1, 16) * if hip_dec { 2 } else { 1 };
         KernelLaunch::new(gpu, k_down_tiled)
             .grid([num_tokens.div_ceil(HC_TT), dsplit, 1])
             .block([1024, 1, 1])
