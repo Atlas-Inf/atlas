@@ -24,6 +24,7 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
             // exhaustiveness check above keeps its teeth.
             sizes: _,
             max_batch_tokens: _,
+            conv_wide_rows: _,
             dirty_rows: _,
             // Layout, not an allocation — derived from `--max-batch-size`.
             decode_meta: _,

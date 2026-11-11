@@ -8,6 +8,9 @@ use atlas_core::device::sm121::NUM_SMS;
 use super::sizes_q12::{Q12_SIZING_STREAMS, q12_batched_scratch_bytes};
 
 #[cfg(test)]
+#[path = "sizes_glm_tests.rs"]
+mod glm_tests;
+#[cfg(test)]
 #[path = "sizes_total_tests.rs"]
 mod total_tests;
 
@@ -95,6 +98,12 @@ mod hc_scratch_layout_tests {
         }
     }
 }
+
+/// Rows of the widest attention piece of a GLM-5 prefill chunk: its native
+/// sparse attention and FlashKDA take at most this many rows a call, and a
+/// wider chunk runs them piece by piece (`spark-model`
+/// `layer::PREFILL_ATTENTION_ROWS`, `glm_sparse_native_plan::admit`).
+pub const GLM_ATTENTION_PIECE_ROWS: usize = 4100;
 
 /// Bytes of the MoE tile-worklist scratch for `rows` rows: a 16-byte tile
 /// count and one 8-byte item per row, routed expert and 128-wide tile of the
@@ -523,6 +532,15 @@ impl BufferSizes {
             (0, 0, 0)
         };
 
+        // GLM-5's linear-attention layers are KDA, whose prefill convolution
+        // writes BF16 (`causal_conv1d_update_prefill*`), and its MLA has no
+        // RoPE partition and no low-rank O projection, the other two users
+        // that scale this buffer with the rows.
+        let kda_conv_bf16 = config.model_type == "glm5_next"
+            && config.linear_num_value_heads > 0
+            && config.qk_rope_head_dim == 0
+            && config.o_lora_rank == 0;
+
         Self {
             hidden_states: m * h * residual_elem,
             residual: m * h * residual_elem,
@@ -603,13 +621,23 @@ impl BufferSizes {
             // FP32 conv output for SSM recurrent path precision (4 bytes/element).
             // Uses ssm_qkvz_size as upper bound (includes Q+K+V+Z).
             // Also reused by MLA as q_rope contiguous buffer: [M, nq * qk_rope_head_dim] BF16.
-            ssm_conv_out_f32: (m * config.ssm_qkvz_size() * 4)
-                .max(if config.kv_lora_rank > 0 {
-                    m * q_heads * config.qk_rope_head_dim * bf16
-                } else {
-                    0
-                })
-                .max(256),
+            ssm_conv_out_f32: if kda_conv_bf16 {
+                // GLM-5 KDA convolves q|k|v into `[M, 3p]` BF16 rows, not the
+                // GDN's FP32 q|k|v|z. The first rows keep the FP32 width:
+                // what an attention piece borrows of this buffer (the native
+                // sparse attention's padded queries) fits as it always did.
+                (m * config.ssm_qkv_size() * bf16)
+                    .max(m.min(GLM_ATTENTION_PIECE_ROWS) * config.ssm_qkvz_size() * 4)
+                    .max(256)
+            } else {
+                (m * config.ssm_qkvz_size() * 4)
+                    .max(if config.kv_lora_rank > 0 {
+                        m * q_heads * config.qk_rope_head_dim * bf16
+                    } else {
+                        0
+                    })
+                    .max(256)
+            },
             scratch,
             expert_gate_out,
             expert_up_out,
@@ -732,6 +760,15 @@ impl BufferSizes {
             q2_dequant_scratch,
             q2_act_q8,
         }
+    }
+
+    /// Rows of an `m`-row arena's `ssm_conv_out_f32` at the FP32 q|k|v|z
+    /// row its widest writers reach (an attention piece's borrow is narrower):
+    /// `m` unless the buffer was sized for GLM-5's BF16 convolution.
+    /// `zero_dirty` shares this buffer out by these rows, so what it zeroes
+    /// for a pass of `n` rows is what it zeroed before the trim.
+    pub(super) fn conv_wide_rows(&self, config: &ModelConfig, m: usize) -> usize {
+        m.min(self.ssm_conv_out_f32 / (config.ssm_qkvz_size() * 4).max(1))
     }
 
     /// Total bytes across all buffers: the lendable members as their one

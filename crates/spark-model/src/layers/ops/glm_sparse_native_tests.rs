@@ -100,6 +100,23 @@ fn native_sparse_context_limit_is_a_fallback_boundary() {
     assert!(plan::admit(4096, 32768, false, false, false).is_none());
 }
 
+/// A chunk wider than one attention piece reaches the kernel path in
+/// pieces: the startup check asks the arena for the widest piece, and the
+/// pair's arena (KDA-sized conv scratch) holds it at every serving width.
+#[test]
+fn a_wide_pair_arena_holds_the_widest_piece() {
+    let mut c = config();
+    for rows in [4100, 6144, 8196, 16384] {
+        c.max_batch_tokens = rows;
+        validate_startup(&c, rows, 32768, 16, 4, KvCacheDtype::Bf16, &[]).unwrap();
+        let sizes = BufferSizes::from_config(&c, rows, 32768, 16, 4);
+        let piece = rows.min(plan::MAX_ROWS);
+        let (required, _) = plan::required_bytes(piece, 32768, 1, 2048, 32).unwrap();
+        assert!(sizes.ssm_conv_out_f32 >= required[4], "{rows} rows");
+    }
+    assert_eq!(plan::MAX_ROWS, 4100);
+}
+
 #[test]
 fn tp4_native_sparse_validates_actual_sixteen_head_arena() {
     let mut c = config();

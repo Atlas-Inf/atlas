@@ -108,9 +108,14 @@ impl BufferArena {
             .load(Ordering::Relaxed)
             .saturating_add(floor_rows);
         let (capacity, embedded) = (self.max_batch_tokens, self.hidden_states);
+        // The conv scratch may hold fewer rows than the arena at the width
+        // its passes reach (`BufferSizes::conv_wide_rows`).
+        let (conv, conv_rows) = (self.ssm_conv_out_f32, self.conv_wide_rows);
         self.zeroed().into_iter().map(move |(name, ptr, bytes)| {
             let prefix = if ptr == embedded {
                 bytes
+            } else if ptr == conv {
+                dirty_prefix(bytes, rows, conv_rows, min_bytes)
             } else {
                 dirty_prefix(bytes, rows, capacity, min_bytes)
             };

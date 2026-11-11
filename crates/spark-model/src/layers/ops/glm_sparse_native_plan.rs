@@ -31,6 +31,9 @@ pub(crate) struct Operands {
     pub heads: u32,
 }
 
+/// Most rows of one call: the arena's piece bound.
+pub(crate) const MAX_ROWS: usize = spark_runtime::buffers::GLM_ATTENTION_PIECE_ROWS;
+
 pub(crate) fn admit(
     rows: usize,
     seq_start: usize,
@@ -41,7 +44,7 @@ pub(crate) fn admit(
     if graph_capture
         || stream_capturing
         || capture_verify_intermediates
-        || !(2048..=4100).contains(&rows)
+        || !(2048..=MAX_ROWS).contains(&rows)
         || seq_start < 2048
     {
         return None;

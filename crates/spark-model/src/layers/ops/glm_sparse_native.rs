@@ -61,7 +61,10 @@ fn validate_startup(
         "native sparse requires a >=4100-row arena,32K context,C4,block16,BF16/fp8_g128 cache"
     );
     let sizes = BufferSizes::from_config(c, rows, seq, block, active);
-    let (required, _) = plan::required_bytes(rows, seq, 1, seq / block, c.num_attention_heads)
+    // The widest piece `plan::admit` takes: a wider chunk reaches the kernel
+    // path in pieces, and each `Plan::new` checks its own operands again.
+    let piece = rows.min(plan::MAX_ROWS);
+    let (required, _) = plan::required_bytes(piece, seq, 1, seq / block, c.num_attention_heads)
         .map_err(anyhow::Error::msg)?;
     let capacities = [
         sizes.ssm_deinterleaved,
