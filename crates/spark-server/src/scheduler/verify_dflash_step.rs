@@ -87,10 +87,17 @@ fn step_verify_dflash_inner(
         return;
     }
 
-    // Strict structured output (`strict_spec`): admitted drafts, row masks.
-    let strict = match super::strict_spec::prepare(a, drafts, model.vocab_size()) {
-        Ok(s) => s,
-        Err(e) => return a.abort_on_engine_error(format_args!("strict verify: {e:#}")),
+    // Strict structured output (`strict_spec`): the argmax-only head masks
+    // rows on device, so it walks the matcher for trimmed drafts and row
+    // masks. A full-logits verify masks every row in the host pick pipeline
+    // instead — no walk, no upload, no `MASKED_VERIFY` width flag.
+    let strict = if model.verify_logits_argmax_only() {
+        match super::strict_spec::prepare(a, drafts, model.vocab_size()) {
+            Ok(s) => s,
+            Err(e) => return a.abort_on_engine_error(format_args!("strict verify: {e:#}")),
+        }
+    } else {
+        None
     };
     let (drafts, draft_conf) = super::strict_spec::verified_drafts(&strict, drafts, draft_conf);
 

@@ -58,6 +58,14 @@ pub struct SchedLevers {
     /// DFlash verify, the verified positions are greedy: the request's
     /// temperature, top_p/top_k/min_p and penalties do not apply there.
     pub glm_strict_spec: bool,
+    /// `ATLAS_STRICT_SPEC=1`: strict structured-output sequences keep
+    /// speculation on any verify whose logits reach the host pick pipeline —
+    /// every verify row is grammar-masked at its own position there, the same
+    /// per-position masks `strict_spec` builds for the GLM split head. Off:
+    /// they decode serially. Unlike the GLM arm this covers every speculation
+    /// lane (the pipeline pick is lane-independent) and sampled verifies keep
+    /// the request's sampling parameters.
+    pub strict_spec: bool,
     /// Mean accepted drafts below which adaptive speculation suspends.
     pub dflash_adaptive_min: f32,
     /// Serially-decoded tokens between adaptive re-probes.
@@ -174,6 +182,7 @@ impl SchedLevers {
             // spelling as a compatibility alias for existing deployments.
             dflash_spec_think: opt_in("ATLAS_MTP_SPEC_THINK") || opt_in("ATLAS_DFLASH_SPEC_THINK"),
             glm_strict_spec: opt_in("ATLAS_GLM_STRICT_SPEC"),
+            strict_spec: opt_in("ATLAS_STRICT_SPEC"),
             dflash_adaptive_min: num("ATLAS_DFLASH_ADAPTIVE_MIN", 2.0),
             dflash_adaptive_reprobe: num("ATLAS_DFLASH_ADAPTIVE_REPROBE", 256),
             dflash_resume_guard: num("ATLAS_DFLASH_RESUME_GUARD", 0),
@@ -224,6 +233,7 @@ impl SchedLevers {
             dflash_unified_ctx: false,
             dflash_spec_think: false,
             glm_strict_spec: false,
+            strict_spec: false,
             dflash_adaptive_min: 2.0,
             dflash_adaptive_reprobe: 256,
             dflash_resume_guard: 0,
