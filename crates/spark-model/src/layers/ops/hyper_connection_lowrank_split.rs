@@ -382,11 +382,13 @@ pub(super) fn hc_pre_split(
     // and to fill the part after grid.x shrinks by HC_TT. At or below HC_TT the
     // tile degenerates to one token per block while still paying
     // hc_dim/HC_CH rounds of barriers, which is the decode regression measured
-    // above -- so the single-pass kernel keeps those shapes. A full tile
-    // (T == HC_TT, the C8 decode step) is the exception: strix kbench
-    // (runner 42927943967, DRAM-rotated) has tiled 224 us vs single-pass
-    // 320 us there, bit-identical; at T=1..4 single-pass still wins.
-    if num_tokens >= HC_TT {
+    // above -- so the single-pass kernel keeps those shapes. Batched decode
+    // (T = 5..=HC_TT) is the exception: strix kbench (runners 42927943967,
+    // 42932386097, DRAM-rotated, bit-identical) has tiled at grid.y 20 vs
+    // single-pass 161/168/185/189 us vs 192/244/269/319 us at T=5/6/7/8;
+    // at T<=4 single-pass still wins (129 vs 150 us at T=4).
+    const HC_TILED_MIN: u32 = 5;
+    if num_tokens >= HC_TILED_MIN {
         let smem = HC_TT as usize * HC_CH * 4;
         anyhow::ensure!(
             smem <= HC_SMEM_MAX,
@@ -397,7 +399,14 @@ pub(super) fn hc_pre_split(
         );
         // One row per warp keeps the kernel's accumulator array at HC_TT
         // registers rather than HC_TT x rows_per_warp.
-        let dsplit = (w.rank as u32).div_ceil(32).clamp(1, 16);
+        // A single tile fills the part only with more row splits: grid.y 20
+        // beat 10 (188.5 vs 217.5 us at T=8) and 40 on strix; prefill widths
+        // keep the swept 10.
+        let dsplit = if num_tokens <= HC_TT {
+            20
+        } else {
+            (w.rank as u32).div_ceil(32).clamp(1, 16)
+        };
         KernelLaunch::new(gpu, k_down_tiled)
             .grid([num_tokens.div_ceil(HC_TT), dsplit, 1])
             .block([1024, 1, 1])
