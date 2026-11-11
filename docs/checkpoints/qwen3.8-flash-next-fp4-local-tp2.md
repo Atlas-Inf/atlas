@@ -233,6 +233,19 @@ once under EP, MXFP8 TP slicing) is unconditional for FP4-Local or keyed by the 
 formats, and has no switch. The remaining variables come from the rc16 TP2 profile this PR does not
 change.
 
+Since the Spark/Strict serving modes landed (`weight_loader/qwen4_exp/mode.rs`), the checkpoint's
+own formats are **opt-in** on this engine: `ATLAS_QWEN4EXP_MXFP8_DECODE=1`,
+`ATLAS_QWEN4EXP_PREFILL_W8A8=1`, `ATLAS_QWEN4EXP_MXFP8_SHARED=1` and `ATLAS_QWEN4EXP_PREFILL_W4A4=1`
+(the sparkrun recipe above sets all four; `ATLAS_QWEN4EXP_SERVING_MODE=spark` requires them).
+SparkQwen's engine defaults them on, so a profile written for it and carried over unchanged serves
+the MXFP8 GDN/QSA projections from BF16 expansions and prefills in BF16. Measured on one pair (same
+image and checkpoint, TP=EP=2, 8 x 262K, util 0.80, 7 drafts, idle, fresh boot per arm, n=3–4,
+streamed 400-token answers after a ~12K-token prompt, plain / with tools at C1, C2, C4): unset 36.5
+/ 41.4, 53.6 / 57.6, 79.2 / 84.2 total tok/s; the first three set 39.7 / 40.7, 60.0 / 61.4, 88.0 /
+92.8; all four 38.9 / 42.8, 58.3 / 62.7, 87.8 / 93.7, and one cold 185K-token prefill 60.5 s → 56.6
+s with W4A4. The engine now logs one WARN at startup when any of the four is unset for an FP4-Local
+checkpoint.
+
 ### 7b. Memory admission with the resident table
 
 The resident table is allocated during model load, before the KV cache is sized, so it is charged
