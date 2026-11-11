@@ -65,14 +65,36 @@ pub struct ModelLevers {
     pub decode_ffn_via_gemm: bool,
     /// Small-M FFN GEMM tile shape. Ships ON; `ATLAS_FFN_SMALLM=0` opts out.
     pub ffn_small_m: bool,
+    /// Small-M W4A16 row-GEMV for M <= 17 FFN passes (DFlash verify) on
+    /// targets that ship it (strix-hip). Numerics-changing (fp32 summation
+    /// order), so opt-in: `ATLAS_FFN_ROWGEMV=1`.
+    pub ffn_rowgemv: bool,
     /// FP4 holo layout for the MoE down projection.
     pub holo_moe_down_fp4: bool,
     /// FP4 holo layout for the MoE gate/up projections.
     pub holo_moe_gateup_fp4: bool,
     /// Collect per-layer MoE expert-union statistics. Diagnostic.
     pub moe_union_stats: bool,
+    /// Routed NVFP4 MoE prefill on BF16 tensor cores with register dequant
+    /// (`moe_bf16mma_prefill.cu`) where the target ships it. Opt-in.
+    pub moe_prefill_bf16mma: bool,
+    /// Dense NVFP4 MLP and FP8 GDN projection prefill on BF16 tensor cores
+    /// with register dequant (`dense_bf16mma_prefill.cu`) where the target
+    /// ships it. Opt-in.
+    pub dense_prefill_bf16mma: bool,
+    /// Under `dense_prefill_bf16mma`: those kernels serve every row count,
+    /// not only prefill-sized ones (below 32 rows chat decode / verify
+    /// batches keep their small-M kernels). Not from the environment: a
+    /// score pass sets it on its own copy, so a request's rows take the same
+    /// kernels whether it runs alone or merged into a bigger pass.
+    pub dense_prefill_any_rows: bool,
 
     // ── Attention ──
+    /// Dense qwen3_5 full-attention q/k/v/o kept native FP8 on CUDA
+    /// ([`DENSE_NATIVE_FP8_ATTN`], `weight_loader/qwen35_dense/attn_fp8.rs`);
+    /// their multi-row GEMVs then also chunk past 16 rows
+    /// (`ops::fp8_rows_plan`). Opt-in.
+    pub dense_native_fp8_attn: bool,
     /// Contiguous-attention path for the DFlash head.
     pub dflash_contig_attn: bool,
     /// Official Lightning product: preserve sequential Mamba recurrence during
@@ -81,6 +103,59 @@ pub struct ModelLevers {
     /// Official Lightning product: use the scalar W8A16 input projection per
     /// verify row. The existing batch4 kernel is not byte-identical at K=4.
     pub lightning_mamba_scalar_in_proj: bool,
+    /// qwen4_exp: every K-row verify row runs the kernels serial decode runs,
+    /// bit for bit (`ATLAS_QWEN4EXP_EXACT_VERIFY=1`; design in
+    /// `model/qwen4exp_exact_verify.rs`). Not from the environment directly:
+    /// `TransformerModel::new` sets it for a qwen4_exp model only.
+    pub qwen4exp_exact_verify: bool,
+    /// Every row of a K=2..4 single-sequence verify runs serial decode's
+    /// arithmetic: `qwen4exp_exact_verify`, or the dense qwen3_5 lever
+    /// (`ATLAS_EXACT_VERIFY=1`, `model/exact_verify.rs`). Set by
+    /// `TransformerModel::new`; the ops both models share read this one.
+    pub exact_verify: bool,
+    /// The widest single-sequence verify the dense lever makes exact
+    /// (`model::exact_verify::max_rows`: 4 for MTP, 16 beside a DFlash
+    /// drafter); 0 when the lever is off. Set by `TransformerModel::new`.
+    pub exact_verify_rows: u32,
+    /// The dense exact verify extended to rows of several sequences
+    /// (`ATLAS_EXACT_VERIFY=1` with `ATLAS_SKINNY_MMA=1` on qwen3_5,
+    /// `model::exact_verify::batch_lever`): every row of a batched
+    /// multi-sequence decode or verify, up to
+    /// [`crate::model::exact_verify::BATCH_MAX_ROWS`] rows, runs serial
+    /// decode's arithmetic, so `Model::batch_verify_bit_exact` holds. Set by
+    /// `TransformerModel::new`.
+    pub dense_batch_exact: bool,
+    /// qwen4_exp: the MTP verify ceiling in drafts (`ATLAS_QWEN4EXP_MTP_DEPTH`,
+    /// `model/qwen4exp_mtp_depth.rs`), overriding the GDN layers' default 1.
+    /// Set by `TransformerModel::new` for a qwen4_exp model only.
+    pub qwen4exp_mtp_depth: Option<usize>,
+    /// qwen4_exp: every row of a batched multi-sequence step runs the kernels
+    /// single-sequence decode runs, bit for bit, with the per-row collectives
+    /// batched (`ATLAS_QWEN4EXP_BATCH_FAST=1`; design in
+    /// `model/qwen4exp_batch_fast.rs`). Set by `TransformerModel::new` for a
+    /// qwen4_exp model only.
+    pub qwen4exp_batch_fast: bool,
+    /// `ATLAS_QWEN4EXP_BATCH_FAST_BISECT` (diagnostic, 0 = off): components of
+    /// the exact batching lane forced back to one single-row launch per row
+    /// (`model/qwen4exp_batch_fast.rs`, `BISECT_*`). Set with the lane.
+    pub qwen4exp_batch_bisect: u32,
+    /// qwen4_exp, under `qwen4exp_batch_fast`: the small per-row kernels of a
+    /// batched step (MoE top-k and weighted-sum blend, the GDN mixer's four
+    /// small kernels per sequence) as one multi-row launch each, every row's
+    /// bytes the single-row kernel's (`ATLAS_QWEN4EXP_BATCH_SMALL=1`; design
+    /// in `model/qwen4exp_batch_fast.rs`). Set with the lane.
+    pub qwen4exp_batch_small: bool,
+    /// Exact persistent K-row Mamba-2 verify (`mamba2_ssm_verify_exact_
+    /// persistent`): decode's own column mapping, ±200 clamp and reduction
+    /// order, with H held in shared memory across the K loop. Opt-in via
+    /// ATLAS_MAMBA_VERIFY_EXACT, or armed by proposer-install policy for
+    /// targets that disable the fused kernel.
+    pub mamba_verify_exact: bool,
+    /// Fused K-row Mamba-2 verify (`mamba2_ssm_verify`). Opt-out:
+    /// `ATLAS_NO_MAMBA_VERIFY_FUSED` (presence-gated), or cleared at
+    /// proposer install for targets whose fused verify isn't bit-exact
+    /// (nemotron_h_omni).
+    pub mamba_verify_fused: bool,
 
     // ── LoRA ──
     /// Apply LoRA eagerly at load instead of at each forward.
@@ -125,6 +200,30 @@ pub struct ModelLevers {
     pub drafter: crate::model::drafter_context::DrafterContext,
 }
 
+/// `ATLAS_QWEN4EXP_BATCH_FAST_BISECT` bits: each forces one component of a
+/// batched step to single-row launches, one per row, as C1 runs them.
+/// MoE experts per row (`forward_row_local`), the EP reduce still batched.
+pub const BISECT_MOE_ROWS: u32 = 1;
+/// MoE through `forward` per row: per-row experts AND per-row all-reduce.
+pub const BISECT_MOE_FORWARD: u32 = 2;
+/// mHC collapse (`hc_pre`, `hc_head`) one row a launch.
+pub const BISECT_HC: u32 = 4;
+/// GDN mixer through `ssm_forward` per sequence (projections, recurrence,
+/// per-row TP all-reduce), the C1 mixer.
+pub const BISECT_GDN: u32 = 8;
+/// Attention Q/K/V and o_proj: the single-row GEMVs per row.
+pub const BISECT_ATTN_PROJ: u32 = 16;
+/// Attention core: the per-row phase (`qsa_rows.rs`, bs=1 a row).
+pub const BISECT_ATTN_ROWS: u32 = 32;
+/// LM head: `dense_gemv_bf16` per row.
+pub const BISECT_HEAD: u32 = 64;
+/// Verify-row MoE dedup (`forward_rows_t`): per-row expert launches on the
+/// transposed tables instead of the `_t_rows` union kernels.
+pub const BISECT_MOE_T_ROWS: u32 = 128;
+
+/// The native FP8 dense attention lever ([`ModelLevers::dense_native_fp8_attn`]).
+pub const DENSE_NATIVE_FP8_ATTN: &str = "ATLAS_DENSE_NATIVE_FP8_ATTN";
+
 /// Opt-IN: off unless the variable is exactly `1`.
 fn opt_in(var: &str) -> bool {
     std::env::var(var).ok().as_deref() == Some("1")
@@ -141,6 +240,68 @@ fn opt_in_truthy(var: &str) -> bool {
 }
 
 impl ModelLevers {
+    /// [`Self::from_env`]'s opt-in rule (on only when `var` is exactly `1`),
+    /// for load-time sites that run before a model carries its levers.
+    pub fn opt_in(var: &str) -> bool {
+        opt_in(var)
+    }
+
+    /// `ATLAS_QWEN4EXP_BATCH_FAST_BISECT` bit `bit` is set (lane on).
+    pub fn batch_bisect(&self, bit: u32) -> bool {
+        self.qwen4exp_batch_fast && self.qwen4exp_batch_bisect & bit != 0
+    }
+
+    /// The dense exact verify (`ATLAS_EXACT_VERIFY=1` on qwen3_5): the generic
+    /// lever without the qwen4_exp one, for the ops only the dense model
+    /// routes differently.
+    pub fn dense_exact_verify(&self) -> bool {
+        self.exact_verify && !self.qwen4exp_exact_verify
+    }
+
+    /// The widest exact forward under the dense lever (at least the MTP 4):
+    /// the single-sequence verify's, or under [`Self::dense_batch_exact`] the
+    /// widest batched multi-sequence step's.
+    fn dense_exact_max_rows(&self) -> u32 {
+        if self.dense_batch_exact {
+            return crate::model::exact_verify::BATCH_MAX_ROWS as u32;
+        }
+        self.exact_verify_rows
+            .max(crate::model::exact_verify::MAX_ROWS as u32)
+    }
+
+    /// Whether a `rows`-row forward is one the dense exact lever covers
+    /// (2..=[`Self::exact_verify_rows`] rows of one sequence, or under
+    /// [`Self::dense_batch_exact`] up to `BATCH_MAX_ROWS` rows of any number
+    /// of sequences), so the ops take their row-exact arms at that width.
+    pub fn dense_exact_rows(&self, rows: usize) -> bool {
+        self.dense_exact_verify() && (2..=self.dense_exact_max_rows() as usize).contains(&rows)
+    }
+
+    /// The batch the paged-decode split-K count is pinned to
+    /// (`qwen3_attention::split_ref_seqs`). Under the dense exact verify it is
+    /// at least the widest exact forward, so serial decode (1 row) and every
+    /// K-row verify, single- or multi-sequence, reduce attention over the
+    /// same split count (`split_ref_seqs` takes the larger of the pin and the
+    /// row count, and no exact forward has more rows than the pin).
+    pub fn attn_split_ref_seqs(&self) -> u32 {
+        if self.dense_exact_verify() {
+            self.max_decode_seqs.max(self.dense_exact_max_rows())
+        } else {
+            self.max_decode_seqs
+        }
+    }
+
+    /// Rows one launch of a multi-row mHC collapse may take under the exact
+    /// batching lane (0: unchunked, the lane off): the split path's 8, or one
+    /// row a launch under `BISECT_HC`.
+    pub fn qwen4exp_hc_rows(&self) -> u32 {
+        match (self.qwen4exp_batch_fast, self.batch_bisect(BISECT_HC)) {
+            (false, _) => 0,
+            (true, true) => 1,
+            (true, false) => super::HC_SPLIT_MAX_ROWS,
+        }
+    }
+
     /// Resolve from the environment. Called once, when the model is built.
     pub fn from_env() -> Self {
         let lightning_lossless_target = opt_in("ATLAS_LIGHTNING_LOSSLESS_TARGET");
@@ -159,6 +320,7 @@ impl ModelLevers {
             gdn_wyn: opt_out("ATLAS_GDN_WYN"),
             gdn_deferred_commit: opt_out("ATLAS_GDN_DEFERRED_COMMIT"),
             ffn_small_m: opt_out("ATLAS_FFN_SMALLM"),
+            ffn_rowgemv: opt_in("ATLAS_FFN_ROWGEMV"),
             gemv_sw: super::gemv_sw::gemv_sw_from(
                 std::env::var("ATLAS_NO_GEMV_SW").ok().as_deref(),
             ),
@@ -167,11 +329,27 @@ impl ModelLevers {
             holo_moe_down_fp4: opt_in_truthy("ATLAS_HOLO_MOE_DOWN_FP4"),
             holo_moe_gateup_fp4: opt_in_truthy("ATLAS_HOLO_MOE_GATEUP_FP4"),
             moe_union_stats: opt_in("ATLAS_MOE_UNION_STATS"),
+            moe_prefill_bf16mma: opt_in("ATLAS_MOE_PREFILL_BF16MMA"),
+            dense_prefill_bf16mma: opt_in("ATLAS_DENSE_PREFILL_BF16MMA"),
+            dense_prefill_any_rows: false,
+            dense_native_fp8_attn: opt_in(DENSE_NATIVE_FP8_ATTN),
             dflash_contig_attn: opt_in("ATLAS_DFLASH_CONTIG_ATTN"),
             // Product installation also arms these. The explicit model-load
             // diagnostic lets a no-spec control use identical target arithmetic.
             lightning_mamba_exact_recurrence: lightning_lossless_target,
             lightning_mamba_scalar_in_proj: lightning_lossless_target,
+            // Model-specific: `TransformerModel::new` sets it.
+            qwen4exp_exact_verify: false,
+            exact_verify: false,
+            exact_verify_rows: 0,
+            dense_batch_exact: false,
+            qwen4exp_mtp_depth: None,
+            qwen4exp_batch_fast: false,
+            qwen4exp_batch_bisect: 0,
+            qwen4exp_batch_small: false,
+            // Presence-gated: any value disables.
+            mamba_verify_fused: std::env::var_os("ATLAS_NO_MAMBA_VERIFY_FUSED").is_none(),
+            mamba_verify_exact: opt_in("ATLAS_MAMBA_VERIFY_EXACT"),
             lora_eager: opt_in_truthy("ATLAS_LORA_EAGER"),
             lora_rotate: opt_in_truthy("ATLAS_LORA_ROTATE"),
             k4_diag: opt_in("ATLAS_K4_DIAG"),
@@ -203,6 +381,7 @@ impl ModelLevers {
             ffn_small_m: true,
             gemv_sw: true,
             gdn_deferred_commit: true,
+            mamba_verify_fused: true,
             ..Self::default()
         }
     }
@@ -228,6 +407,7 @@ mod tests {
         assert!(!d.decode_ffn_via_gemm);
         assert!(!d.lora_eager);
         assert!(!d.k4_diag);
+        assert!(!d.dense_native_fp8_attn);
         assert!(
             d.gdn_deferred_commit,
             "ATLAS_GDN_DEFERRED_COMMIT ships ON; =0 opts out"

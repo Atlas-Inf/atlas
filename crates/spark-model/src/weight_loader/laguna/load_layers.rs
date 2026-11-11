@@ -54,7 +54,7 @@ pub(super) fn load_layers(
         let input_norm = dense(store, &format!("{lp}.input_layernorm.weight"))?;
         let post_attn_norm = dense(store, &format!("{lp}.post_attention_layernorm.weight"))?;
         let ffn = if config.mlp_only_layers.contains(&i) {
-            load_dense_ffn(store, gpu, &lp)?
+            load_dense_ffn(store, gpu, &lp, config)?
         } else {
             load_moe_ffn(
                 store,
@@ -96,8 +96,13 @@ fn null_dense_ffn_weights() -> DenseFfnWeights {
     }
 }
 
-fn load_dense_ffn(store: &WeightStore, gpu: &dyn GpuBackend, lp: &str) -> Result<FfnComponent> {
-    let mut layer = DenseFfnLayer::new(null_dense_ffn_weights(), gpu)?;
+fn load_dense_ffn(
+    store: &WeightStore,
+    gpu: &dyn GpuBackend,
+    lp: &str,
+    config: &ModelConfig,
+) -> Result<FfnComponent> {
+    let mut layer = DenseFfnLayer::new(null_dense_ffn_weights(), gpu, &config.model_type)?;
     layer.set_bf16_weights(
         dense_auto(store, &format!("{lp}.mlp.gate_proj.weight"), gpu)?,
         dense_auto(store, &format!("{lp}.mlp.up_proj.weight"), gpu)?,

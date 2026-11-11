@@ -12,11 +12,13 @@
 use anyhow::Result;
 
 use super::super::super::types::TransformerModel;
+use crate::traits::SequenceState;
 
 impl TransformerModel {
     pub(in crate::model) fn prepare_vision_embed_dispatch(
         &self,
-        images: &[crate::VisionItem],
+        seq: &mut SequenceState,
+        images: Vec<crate::VisionItem>,
     ) -> Result<()> {
         let ve = match &self.vision_encoder {
             Some(ve) => ve,
@@ -26,22 +28,20 @@ impl TransformerModel {
         // ONE batched ViT forward over all images in this request — block GEMM
         // weights read once over Σpatches instead of N× (the per-image loop also
         // overwrote buf_out row 0 every call, corrupting multi-image requests).
-        // Each returned (post_h, post_w, merged_p) preserves image order, so the
-        // packed buf_out matches the pad-token splice order downstream.
-        // FLATTEN to the encoder's unit: one row-block per temporal group.
-        // The ViT has no notion of time, so a clip's groups ride the same path
-        // as separate stills; `item_groups` remembers which belong together so
-        // the grids below can carry the item's temporal extent.
-        let mut img_refs: Vec<(&[f32], usize, usize)> = Vec::new();
+        // Each returned (post_h, post_w, merged_p) preserves group order, so
+        // the packed buf_out matches the pad-token splice order downstream.
+        // Keep items intact for the native GLM path. It emits one attention
+        // sequence per temporal group and returns one geometry tuple per
+        // group, while the splice/MRoPE bookkeeping below collapses those
+        // tuples back to the original item boundaries.
+        let mut item_refs: Vec<&crate::VisionItem> = Vec::with_capacity(images.len());
         let mut item_groups: Vec<usize> = Vec::with_capacity(images.len());
-        for it in images {
+        for it in &images {
             item_groups.push(it.t_len());
-            for g in &it.groups {
-                img_refs.push((g.as_slice(), it.grid_h, it.grid_w));
-            }
+            item_refs.push(it);
         }
         let _vt0 = std::time::Instant::now();
-        let per_image = ve.forward_batched(&img_refs, self.gpu.as_ref(), stream)?;
+        let per_image = ve.forward_items(&item_refs, self.gpu.as_ref(), stream)?;
         if std::env::var("ATLAS_VISION_TIMING").is_ok() {
             self.gpu.synchronize(stream).ok();
             tracing::info!(
@@ -64,11 +64,20 @@ impl TransformerModel {
             out
         };
         let total_merged: usize = per_image.iter().map(|(_, _, mp)| *mp).sum();
-        *self.vision_embed_patches.lock() = total_merged;
-        *self.vision_image_grids.lock() = post_merge_grids;
+        // The whole prompt is encoded in one pass: every row is resident from
+        // physical 0, nothing is cached or deferred.
+        seq.vision.grids = post_merge_grids;
+        seq.vision.hashes = images.iter().map(|it| it.content_hash).collect();
+        // Moved, not copied (the request's only copy and its permits).
+        seq.vision.items = images;
+        seq.vision.rows_encoded = total_merged;
+        seq.vision.rows_base = 0;
+        seq.vision.skip_rows = 0;
+        seq.vision.computed_from = 0;
+        seq.vision.deferred = false;
         tracing::info!(
             "Vision encoder (batched): {} images, {} merged patches encoded",
-            images.len(),
+            seq.vision.items.len(),
             total_merged
         );
         Ok(())
@@ -77,11 +86,12 @@ impl TransformerModel {
     /// Cross-request batched encode: flatten every request's images into ONE
     /// `forward_batched` call so block GEMM weights are read once over Σpatches
     /// across the whole tick (the concurrent-image win). `per_request[i]` holds
-    /// request i's images. Fills the shared packed `buf_out` + `vision_image_grids`
-    /// (in request-then-image order) and returns one
+    /// request i's images. Fills the shared packed `buf_out` and returns one
     /// `(patch_row_offset, grid_index_offset, num_images, patch_row_count)` per
-    /// request locating its slice. Each request's chunk-0 splice/MRoPE then reads
-    /// its slice via `set_vision_slice_base`.
+    /// request locating its slice. Each request's chunk-0 splice/MRoPE then
+    /// reads its slice via `set_vision_slice_base`; the scheduler stamps each
+    /// request's own grids/hashes/row window into its `SequenceState` from the
+    /// same descriptor (per-sequence vision state — the model holds none).
     pub(in crate::model) fn prepare_vision_embed_batched_dispatch(
         &self,
         per_request: &[Vec<crate::VisionItem>],
@@ -92,44 +102,33 @@ impl TransformerModel {
         };
         let stream = self.gpu.default_stream();
         // Flatten all requests' images, recording each request's (start, count).
-        let mut flat: Vec<(&[f32], usize, usize)> = Vec::new();
+        let mut flat_items: Vec<&crate::VisionItem> = Vec::new();
         let mut req_bounds: Vec<(usize, usize)> = Vec::with_capacity(per_request.len());
         let mut per_req_groups: Vec<Vec<usize>> = Vec::with_capacity(per_request.len());
+        let mut group_cursor = 0usize;
         for imgs in per_request {
-            let start = flat.len();
+            let start = group_cursor;
             let mut groups = Vec::with_capacity(imgs.len());
+            let mut group_count = 0usize;
             for it in imgs {
                 groups.push(it.t_len());
-                for g in &it.groups {
-                    flat.push((g.as_slice(), it.grid_h, it.grid_w));
-                }
+                group_count += it.t_len();
+                flat_items.push(it);
             }
-            // Bounds are in ENCODER ROWS, which is what buf_out is indexed by.
-            req_bounds.push((start, flat.len() - start));
+            // Bounds are in per-group encoder rows, which is what buf_out and
+            // the returned geometry vector index.
+            req_bounds.push((start, group_count));
+            group_cursor += group_count;
             per_req_groups.push(groups);
         }
-        let per_image = ve.forward_batched(&flat, self.gpu.as_ref(), stream)?;
-        let grids: Vec<(usize, usize, usize)> = {
-            let mut out = Vec::new();
-            let mut row = 0usize;
-            for groups in &per_req_groups {
-                for t_len in groups {
-                    let (h, w, _) = per_image[row];
-                    out.push((*t_len, h, w));
-                    row += t_len;
-                }
-            }
-            out
-        };
+        let per_image = ve.forward_items(&flat_items, self.gpu.as_ref(), stream)?;
         let total_merged: usize = per_image.iter().map(|(_, _, mp)| *mp).sum();
-        *self.vision_embed_patches.lock() = total_merged;
-        *self.vision_image_grids.lock() = grids;
         // Per-request slice descriptors (request order matches the flatten order,
         // so row offsets accumulate Σ merged_p of earlier requests).
         // (buf_out row offset, GRID index offset, grid count, merged rows).
-        // The grid offset/count are in ITEMS — `vision_image_grids` is now one
-        // entry per item, not per encoder row — while the row offset stays in
-        // merged rows, which is what the splice indexes.
+        // The grid offset/count are in ITEMS — one entry per item, not per
+        // encoder row — while the row offset stays in merged rows, which is
+        // what the splice indexes.
         let mut out = Vec::with_capacity(per_request.len());
         let mut row_cursor = 0usize;
         let mut grid_cursor = 0usize;
@@ -143,10 +142,10 @@ impl TransformerModel {
             grid_cursor += groups.len();
         }
         tracing::info!(
-            "Vision encoder (co-dispatch): {} requests, {} images, {} merged patches",
+            "Vision co-dispatch: {} requests, {} images, {} merged patches",
             per_request.len(),
-            flat.len(),
-            total_merged
+            flat_items.len(),
+            total_merged,
         );
         Ok(out)
     }

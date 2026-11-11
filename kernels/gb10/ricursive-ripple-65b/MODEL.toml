@@ -1,0 +1,200 @@
+# Ricursive Ripple-65B Preview (`model_type: ricursive`), Strict.
+#
+# Dense 80-layer transformer: 4 sliding-window (1024, RoPE theta 10000)
+# layers then 1 full-attention NoPE layer, repeated. 80 Q / 8 KV heads at
+# head_dim 128, gated attention (g_proj interleaved into q_proj at load),
+# Gemma-style pre/post sublayer norms with plain `x * w` weights, value
+# residuals from the scaled layer-0 embedding, SwiGLU clamped at 20.
+# Checkpoint formats are kept (Strict): ModelOpt NVFP4 MLPs (W4A16 single-token
+# decode, W4A4 at the checkpoint's input scales for multi-row passes),
+# BF16 attention / embedding / lm_head, BF16 KV cache.
+#
+# KERNELS: the compiled set is Laguna-S-2.1's (`kernel_source`): head_dim
+# 128 BF16 attention, sliding-window paged decode/prefill, NVFP4 W4A16 dense
+# FFN. This target's own `nvfp4/` overlay adds the embedding scale, the
+# value-residual lerp, the target FFN's clamped SwiGLU (`ricursive_swiglu`),
+# and glm-5.3-flash's native W4A4 GEMM (`w4a4_gemm_mfast`): multi-row FFN
+# passes (DFlash verify, prefill) run W4A4 at the checkpoint's calibrated
+# input scales, as ModelOpt NVFP4 and the reference engine do.
+
+[model]
+name = "ricursive-ripple-65b"
+hf_id = "ricursiveAI/Ripple-65B-Preview-NVFP4"
+model_type = "ricursive"
+architecture = "Dense hybrid sliding/full attention, gated attention, value residuals"
+parameters = "65B"
+kernel_source = "laguna-s-2.1"
+layers_total = 80
+layers_sliding_attention = 64
+layers_full_attention = 16
+layer_pattern = "4 sliding attention followed by 1 full attention (NoPE)"
+hidden_dim = 5120
+head_dim = 128
+q_heads = 80
+kv_heads = 8
+intermediate_size = 40960
+rope_theta = 10000
+vocab_size = 100352
+max_position_embeddings = 2097152
+sliding_window = 1024
+vision = false
+mtp_layers = 0
+
+# The checkpoint ships no sampling defaults (generation_config.json carries
+# token ids only). Neutral presets (use_sampling_presets_for_core = true):
+# plain temperature / top-p sampling as the reference engine does, with the
+# CLI's min_p / top_n_sigma filters off. Request values always win.
+[sampling.thinking_text]
+temperature = 1.0
+top_p = 1.0
+top_k = 0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.thinking_coding]
+temperature = 1.0
+top_p = 1.0
+top_k = 0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.non_thinking]
+temperature = 1.0
+top_p = 1.0
+top_k = 0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.tools]
+temperature = 1.0
+top_p = 1.0
+top_k = 0
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[behavior]
+enable_think_loop_watchdog = false
+honor_eos_inside_thinking = true
+confidence_early_stop = false
+rollback_resteer = false
+thinking_in_tools = true
+cap_thinking_at_max_tokens = false
+# The template never opens <think>; the model emits it when it reasons.
+thinking_default = false
+default_kv_dtype = "bf16"
+# `<tool_call>\n{"name": ..., "arguments": {...}}\n</tool_call>` (Hermes JSON).
+tool_call_parser = "hermes"
+use_sampling_presets_for_core = true
+disable_cwd_hint_injection = true
+
+[[model_types]]
+model_type = "ricursive"
+hidden_size = 5120
+
+# DFlash2 drafter (`ricursiveAI/Ripple-65B-Preview-DFlash2`): 5 layers (4
+# sliding 4096 + 1 full NoPE), conv kernel 4, selector top-k 32, taps the
+# target's post-block states at layers 1/20/39/58/77 (zero-based). gamma 32
+# is SGLang's verified block (--speculative-num-draft-tokens 32): 1 anchor +
+# 31 drafts. Serve with --dflash-window-size 16384 (the full draft layer's
+# training context); `window_size` here is documentation only.
+[dflash]
+draft_model = "ricursiveAI/Ripple-65B-Preview-DFlash2"
+gamma = 32
+window_size = 16384
+mask_token_id = 100278
+target_layer_ids = [1, 20, 39, 58, 77]
+
+[expected_absent.moe_w4a16]
+moe_w4a16_grouped_gemm_ptrtable_e8m0 = """
+E8M0-scale twin; forward_k2/k3 gate on handle != 0 plus the checkpoint's
+scale format, and fall back to the non-e8m0 ptrtable kernels compiled in
+this target's own moe_w4a16_grouped_gemm.cu. This target compiles Laguna's sources, which ship FP8 scales,
+never E8M0."""
+moe_w4a16_grouped_gemm_ptrtable_t_e8m0 = "Same family — transposed twin; non-e8m0 sibling resolves here."
+moe_w4a16_grouped_gemm_ptrtable_t_k64_e8m0 = "Same family — k64 twin; non-e8m0 sibling resolves here."
+moe_w4a16_fused_gate_up_t_e8m0 = "Same family — fused gate/up twin; non-e8m0 sibling resolves here."
+moe_w4a16_fused_gate_up_t_k64_e8m0 = "Same family — fused k64 twin; non-e8m0 sibling resolves here."
+moe_w4a16_fused_gate_up_t_k64_fp4 = "FP4-scale twin of the fused k64 kernel; scale-format-gated like the e8m0 twins; the plain sibling resolves from this target's moe_w4a16_grouped_gemm.cu."
+moe_w4a16_down_t_k64_fp4 = "FP4-scale down-projection twin; scale-format-gated; plain sibling resolves here."
+
+
+[expected_absent.nvfp4_mmq]
+atlas_nvfp4_mmq128_nc = """
+Keep-packed NVFP4 MMQ family (dense-FFN prefill for runtime-quantized
+GGUF/BF16 checkpoints). DenseFfnLayer probes the whole family and gates
+every dispatch on handle != 0; Laguna's single dense FFN (layer 0) loads
+from safetensors NVFP4 and takes the w4a16/dense arms, which resolve from
+this target's own w4a16_gemm.cu. UNMEASURED here — candidate, not loss."""
+atlas_nvfp4_mmq128_wc = "Same family; handle-gated, w4a16 arm resolves."
+atlas_nvfp4_mmq16_nc = "Same family; handle-gated, w4a16 arm resolves."
+atlas_nvfp4_mmq16_wc = "Same family; handle-gated, w4a16 arm resolves."
+atlas_nvfp4_mmq32_nc = "Same family; handle-gated, w4a16 arm resolves."
+atlas_nvfp4_mmq32_wc = "Same family; handle-gated, w4a16 arm resolves."
+atlas_nvfp4_mmq64_nc = "Same family; handle-gated, w4a16 arm resolves."
+atlas_nvfp4_mmq64_wc = "Same family; handle-gated, w4a16 arm resolves."
+atlas_nvfp4_quantize_bf16 = "MMQ-family activation quantizer; only reached from the MMQ arms above."
+atlas_nvfp4_repack = "MMQ-family weight repacker; only reached from the MMQ arms above."
+atlas_nvfp4_scale_bf16 = "MMQ-family scale conversion; only reached from the MMQ arms above."
+atlas_nvfp4_silu_mul_quant = "MMQ-family fused epilogue; only reached from the MMQ arms above."
+atlas_nvfp4_silu_mul_scaled = "MMQ-family fused epilogue; only reached from the MMQ arms above."
+
+[expected_absent.w4a16]
+int8_gemm_faith2 = "Int8 requant experiment probed by dense_ffn; handle-gated, w4a16 arm resolves."
+int8_gemm_i32acc = "Same family; handle-gated."
+requant_a_bf16_int8 = "Same family — activation requant; only reached from the int8 arms above."
+requant_w_nvfp4_int8 = "Same family — weight requant; only reached from the int8 arms above."
+w4a16_gemm_t_p3 = """
+3-deep weight-pipeline twin shipped ONLY in qwen3.6-27b's shadow.
+dense_ffn probes it, falls back to w4a16_gemm_t (resolves from this
+target's w4a16_gemm.cu). UNMEASURED for this target — candidate, not
+loss."""
+w4a16_gemm_t_k64_p3 = "Same family; falls back to the resolved w4a16_gemm_t_k64."
+w4a16_gemm_t_k64_n64_p3 = "Narrow-N twin; qwen3_attention::init returns 0-handle, dispatch gates on handle != 0."
+w4a16_gemm_t_m128_bf16 = "BF16-projection prefill twin; handle-gated, falls back through the resolved w4a16 path."
+w4a16_gemm_t_m128_bf16_v2 = "Same family — v2 twin; handle-gated."
+fp8_gemm_t_row_scaled = """
+FP8 drafter twin (ATLAS_DFLASH_DRAFTER_FP8), compiled only in qwen3.6-27b's
+w4a16_gemm.cu. Strict serves the DFlash2 drafter in BF16, so the FP8 drafter
+path is skipped at its gate (handle 0 -> BF16)."""
+fp8_gemm_t_row_scaled_m16 = "Small-M FP8 drafter lm_head twin; same gate, BF16 drafter in Strict."
+w4a16_gemm_t_m128_k16 = """
+K16-tile w4a16 GEMM variant, shipped only in strix-hip/qwen3.6-27b (a gfx1151
+occupancy lever under ATLAS_W4A16_K16=1). gb10 uses the compiled
+w4a16_gemm_t_m128 / w4a16_gemm arms; handle != 0 gated."""
+
+[expected_absent.w4a4]
+w4a4_gemm = """
+Direct FP4-activation GEMM probed by dense_ffn; opt-in path
+(ATLAS_ATTN_W4A4-family), handle-gated, never default-dispatched."""
+
+[expected_absent.q4k_mmq]
+atlas_q4k_mmq128_nc = """
+Q4_K keep-packed MMQ (dense-FFN prefill for GGUF Q4_K checkpoints).
+DenseFfnLayer probes the family and gates every dispatch on handle != 0;
+a safetensors NVFP4 checkpoint never installs packed-Q4K weights, so the
+arm is unreachable here."""
+atlas_q4k_mmq128_wc = "Same family — unreachable without packed-Q4K weights."
+atlas_q8_1_quantize_ds4_bf16 = "MMQ-family activation quantizer; only reached from the Q4K MMQ arms above."
+
+[expected_absent.q4k_quantize]
+q4k_quantize = "Q4_K runtime quantizer probed by dense_ffn for GGUF paths; handle-gated, unreachable here."
+# `moe_persist_marker` ships only in qwen3.8-flash-next (whose k64 prefill
+# kernel was measured m-tile-strided); everywhere else the marker module is
+# absent by design and handle 0 keeps the full m-tile grid. The lookup is
+# issued unconditionally by MoeLayer::new (moe/init.rs), which every MoE
+# model_type this target serves constructs.
+[expected_absent.moe_persist_marker]
+moe_w4a16_k64_strides_m_tiles = "Capability marker issued by MoeLayer::new on every MoeLayer MoE model; only targets whose k64 prefill kernels were measured to stride m-tiles ship it (qwen3.8-flash-next). Absent here by design: handle 0 keeps the full m-tile grid."

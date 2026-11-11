@@ -377,7 +377,7 @@ impl Qwen3SsmLayer {
         // state (~16 MB/layer/step vs ~120 KB of extra conv-row bytes). It
         // would NOT make spec-on bitwise-equal to spec-off; only
         // `--exact-verify` does that.
-        if super::verify_exact_enabled() {
+        if super::verify_exact_for(ctx.levers) {
             return self.decode_batched_conv_gdn_exact(ssm_state, ctx, args);
         }
 

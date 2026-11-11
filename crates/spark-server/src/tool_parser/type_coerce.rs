@@ -45,7 +45,7 @@ fn coerce_call_args(call: &mut ToolCall, tool_def: Option<&ToolDefinition>) {
     };
 
     for (key, prop) in props {
-        let Some(ty) = prop.get("type").and_then(|t| t.as_str()) else {
+        let Some(ty) = super::validation::resolve_schema_type(prop) else {
             continue;
         };
         let Some(val) = obj.get_mut(key) else {

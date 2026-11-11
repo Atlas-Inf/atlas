@@ -69,10 +69,12 @@ impl TransformerModel {
                         h_state_checkpoint: None,
                         conv_state_checkpoint: None,
                         h_state_intermediates: Vec::new(),
+                        kda_records: spark_runtime::gpu::DevicePtr::NULL,
                         conv_state_intermediates: Vec::new(),
                         gdn_commit_qkv: DevicePtr(0),
                         gdn_commit_gb: DevicePtr(0),
                         gdn_commit_pending: false,
+                        gdn_fuse_n: DevicePtr::NULL,
                         // Padding rows point at the write-only dummy slot; tag
                         // them with the active mode so the decode mixer does
                         // not re-convert scratch on every single step.

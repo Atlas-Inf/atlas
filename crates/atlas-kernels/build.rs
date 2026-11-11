@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 
+mod build_kernel_flags;
+
 /// Per-category sampling defaults parsed from MODEL.toml `[sampling.*]`.
 #[derive(Debug, Clone)]
 struct SamplingCat {
@@ -63,6 +65,7 @@ impl Target {
             .as_deref()
             .into_iter()
             .chain(std::iter::once(self.model_kernel_dir.as_path()))
+            .chain(self.local_kernel_dir.as_deref())
             .collect()
     }
 }
@@ -82,7 +85,11 @@ struct Target {
     /// common and the model dir for sources and KERNEL.toml alike, so the
     /// base quant's own build stays free of the overlay's kernels.
     base_kernel_dir: Option<PathBuf>,
+    /// Target-local `<model>/<quant>/` dir present alongside a
+    /// `kernel_source` redirect — the last overlay layer.
+    local_kernel_dir: Option<PathBuf>,
     extra_flags: Vec<String>,
+    kernel_flags: build_kernel_flags::KernelFlags,
     module_overrides: HashMap<String, String>,
     /// `(module, kernel)` pairs declared in `[shadow_exempt]` — kernels this
     /// target may drop from `common/` WITHOUT it being drift, each with a
@@ -104,6 +111,7 @@ struct Target {
     behavior_thinking_in_tools: bool,
     behavior_max_thinking_budget: u32,
     behavior_effort_capped_at_ceiling: bool,
+    behavior_default_reasoning_effort: String,
     behavior_thinking_default: bool,
     behavior_fp8_kv_calibration_tokens: usize,
     behavior_default_kv_dtype: String,
@@ -117,6 +125,7 @@ struct Target {
     behavior_jinja_template: String,
     behavior_enable_loop_watchdog: bool,
     behavior_enable_think_loop_watchdog: bool,
+    behavior_enable_stream_loop_guards: bool,
     behavior_honor_eos_inside_thinking: bool,
     behavior_min_reasoning_floor_tokens: u32,
     behavior_cap_thinking_at_max_tokens: bool,
@@ -135,6 +144,12 @@ struct Target {
     behavior_rom_head: String,
     behavior_tool_retry: bool,
     behavior_preserve_thinking: Option<bool>,
+    behavior_verbatim_prompt: bool,
+    behavior_nvfp4_verbatim_prompt: Option<bool>,
+    behavior_eos_ends_thinking: bool,
+    behavior_tool_call_steering: bool,
+    behavior_verbatim_reasoning_effort: bool,
+    behavior_ban_tool_call_without_tools: bool,
     /// Which `(model_type, hidden_size)` pairs this kernel target supports.
     /// Parsed from `[[model_types]]` in MODEL.toml.
     model_type_matches: Vec<ModelTypeMatch>,
@@ -157,6 +172,7 @@ struct DflashRaw {
     window_size: usize,
     mask_token_id: u32,
     target_layer_ids: Vec<usize>,
+    drop_bf16: bool,
 }
 
 fn main() {
@@ -343,6 +359,16 @@ fn main() {
     }
 
     for (idx, target) in targets.iter().enumerate() {
+        if target.hw == "gb10" && target.model == "glm-5.3-flash" {
+            // The normal source include closure covers provenance; Cargo also
+            // needs to rerun when an imported device header changes.
+            println!(
+                "cargo:rerun-if-changed={}",
+                workspace_root
+                    .join("third_party/nvidia_sparse_mla_sm120")
+                    .display()
+            );
+        }
         let cu_files = collect_cu_files(
             target.common_kernel_dir.as_deref(),
             &target.overlay_dirs(),
@@ -356,6 +382,17 @@ fn main() {
             target.model,
             target.quant,
         );
+        for stem in target.kernel_flags.keys() {
+            assert!(
+                cu_files
+                    .iter()
+                    .any(|p| p.file_stem().is_some_and(|s| s == stem.as_str())),
+                "Per-source compiler flags name a missing kernel: {}/{}/{}:{stem}",
+                target.hw,
+                target.model,
+                target.quant,
+            );
+        }
 
         // Gather work for this target (no compilation yet — that runs
         // in parallel after the full work plan is built).
@@ -373,11 +410,11 @@ fn main() {
                 cu_file.clone()
             };
 
-            // Dedup key: same (source, arch, sorted-flags) → identical
-            // binary output. Sort flags so flag-order doesn't bust the cache.
-            let mut sorted_flags = target.extra_flags.clone();
-            sorted_flags.sort();
-            let key = (compile_source.clone(), target.arch.clone(), sorted_flags);
+            // Compiler flag order is significant (the last conflicting flag
+            // wins). Never deduplicate two sources by a sorted flag set.
+            let flags =
+                build_kernel_flags::for_source(&target.extra_flags, &target.kernel_flags, &stem);
+            let key = (compile_source.clone(), target.arch.clone(), flags.clone());
 
             if let Some(existing) = compile_cache.get(&key) {
                 copy_jobs.push((existing.clone(), out_file));
@@ -385,7 +422,7 @@ fn main() {
                 compile_jobs.push(CompileJob {
                     cu_file: compile_source.clone(),
                     arch: target.arch.clone(),
-                    extra_flags: target.extra_flags.clone(),
+                    extra_flags: flags,
                     out_file: out_file.clone(),
                 });
                 compile_cache.insert(key, out_file);
@@ -636,6 +673,11 @@ fn closure_attestation(
                 .join("kernels")
                 .join(&target.hw)
                 .join("HARDWARE.toml"),
+            target
+                .common_kernel_dir
+                .as_ref()
+                .map(|d| d.join("KERNEL.toml"))
+                .unwrap_or_default(),
             model_dir.map(|d| d.join("MODEL.toml")).unwrap_or_default(),
             target
                 .base_kernel_dir
@@ -672,6 +714,7 @@ fn closure_attestation(
                 "arch": target.arch,
                 "compiler": compiler,
                 "flags": target.extra_flags,
+                "kernel_flags": target.kernel_flags,
             }),
         );
     }
@@ -734,7 +777,7 @@ fn hip_mirror_source(
             let dst = mirror_dir.join(name);
             let text = std::fs::read_to_string(&p)
                 .unwrap_or_else(|e| panic!("read {} for HIP mirror: {e}", p.display()));
-            let widened = widen_warp_masks(&text);
+            let widened = anchor_relative_includes(&widen_warp_masks(&text), src_dir);
             // Only rewrite when content changed (keeps mtimes stable across
             // incremental builds → no needless hipcc recompiles).
             let needs_write = match std::fs::read_to_string(&dst) {
@@ -750,6 +793,36 @@ fn hip_mirror_source(
     }
 
     mirror_dir.join(src.file_name().unwrap())
+}
+
+/// Rewrite every `#include "../…"` to the absolute path it names from the
+/// ORIGINAL source directory, which is how clang resolves it on the unmirrored
+/// file. The mirror lives under OUT_DIR, so a parent-relative include names
+/// nothing from there: #174's `#include "../../common/atlas_pdl.cuh"` in the
+/// GDN kernel that strix-hip's 35B-A3B and Flash-Next targets share stopped
+/// both from compiling. Sibling includes (`"foo.cuh"`) are left alone, since
+/// the whole directory is mirrored; an include whose target does not exist is
+/// left as written so the compiler reports it.
+fn anchor_relative_includes(src: &str, src_dir: &std::path::Path) -> String {
+    let mut out = String::with_capacity(src.len());
+    for line in src.split_inclusive('\n') {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("#include \"../")
+            && let Some(end) = rest.find('"')
+            && let abs = src_dir.join(format!("../{}", &rest[..end]))
+            && abs.exists()
+        {
+            let indent = &line[..line.len() - t.len()];
+            out.push_str(&format!(
+                "{indent}#include \"{}\"{}",
+                abs.display(),
+                &rest[end + 1..]
+            ));
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
 }
 
 /// Append `ULL` to the warp-mask literal that is the first argument of every
@@ -1096,6 +1169,14 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
         // comes from THIS target's own directory; only the quant kernel
         // dirs are redirected. Chains are refused — a source must own its
         // sources.
+        //
+        // TARGET-LOCAL OVERLAY: if the redirecting target ALSO ships its
+        // own `<model>/<quant>/` dir it compiles too, AFTER the source
+        // dir — precedence target-local > kernel_source > common by stem
+        // (same shadowing machinery/audit as base_quant). The overlay
+        // holds only what the source lacks (e.g. a vision tower one
+        // sibling owns); a same-stem file shadows the source's copy and
+        // is reported the same way.
         let kernel_src_dir = match parse_kernel_source(&model_dir) {
             Some(src) => {
                 let src_dir = hw_dir.join(&src);
@@ -1125,6 +1206,12 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
 
         for quant in &quants {
             let model_kernel_dir = kernel_src_dir.join(quant);
+            // Target-local overlay dir (only meaningful when kernel_source
+            // redirected; for a normal target it IS model_kernel_dir).
+            let local_kernel_dir = {
+                let d = model_dir.join(quant);
+                (kernel_src_dir != model_dir && d.is_dir()).then_some(d)
+            };
             // Shared kernels live in `kernels/<hw>/common/` and apply to
             // every (model, quant) target on this hardware. Most kernels
             // here are dtype-agnostic (BF16 norms/embeds/attn) — the dir
@@ -1155,14 +1242,16 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
             // now: common parses first as the base; the model toml appends
             // flags (deduped, model last) and wins per-key on [modules].
             let mut extra_flags: Vec<String> = Vec::new();
+            let mut kernel_flags = build_kernel_flags::KernelFlags::new();
             let mut module_overrides: HashMap<String, String> = HashMap::new();
             // Shadow-drop exemptions merge the same way: common/ declares the
             // repo-wide superseded kernels, a model KERNEL.toml adds the ones
             // only IT may drop (e.g. mistral's divergent RoPE convention).
             let mut shadow_exempt: Vec<(String, String)> = Vec::new();
             if has_common_dir && common_kernel_dir.join("KERNEL.toml").exists() {
-                let (f, m) = parse_kernel_toml(&common_kernel_dir, &target_vendor);
+                let (f, m, k) = parse_kernel_toml(&common_kernel_dir, &target_vendor);
                 extra_flags.extend(f);
+                kernel_flags.extend(k);
                 module_overrides.extend(m);
                 shadow_exempt.extend(parse_shadow_exempt(&common_kernel_dir));
             }
@@ -1183,14 +1272,19 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                     );
                     dir
                 });
-            for dir in [base_kernel_dir.as_ref(), Some(&model_kernel_dir)]
-                .into_iter()
-                .flatten()
+            for dir in [
+                base_kernel_dir.as_ref(),
+                Some(&model_kernel_dir),
+                local_kernel_dir.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
             {
                 if !dir.join("KERNEL.toml").exists() {
                     continue;
                 }
-                let (f, m) = parse_kernel_toml(dir, &target_vendor);
+                let (f, m, k) = parse_kernel_toml(dir, &target_vendor);
+                kernel_flags.extend(k);
                 for flag in f {
                     if !extra_flags.contains(&flag) {
                         extra_flags.push(flag);
@@ -1225,6 +1319,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 quant: quant.clone(),
                 arch: arch.clone(),
                 model_kernel_dir,
+                local_kernel_dir,
                 common_kernel_dir: if has_common_dir {
                     Some(common_kernel_dir)
                 } else {
@@ -1232,6 +1327,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 },
                 base_kernel_dir,
                 extra_flags,
+                kernel_flags,
                 module_overrides,
                 shadow_exempt,
                 expected_absent,
@@ -1242,6 +1338,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_thinking_in_tools: pb.thinking_in_tools,
                 behavior_max_thinking_budget: pb.max_thinking_budget,
                 behavior_effort_capped_at_ceiling: pb.effort_capped_at_ceiling,
+                behavior_default_reasoning_effort: pb.default_reasoning_effort,
                 behavior_thinking_default: pb.thinking_default,
                 behavior_fp8_kv_calibration_tokens: pb.fp8_kv_calibration_tokens,
                 behavior_default_kv_dtype: pb.default_kv_dtype,
@@ -1256,6 +1353,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_jinja_template: pb.jinja_template,
                 behavior_enable_loop_watchdog: pb.enable_loop_watchdog,
                 behavior_enable_think_loop_watchdog: pb.enable_think_loop_watchdog,
+                behavior_enable_stream_loop_guards: pb.enable_stream_loop_guards,
                 behavior_honor_eos_inside_thinking: pb.honor_eos_inside_thinking,
                 behavior_min_reasoning_floor_tokens: pb.min_reasoning_floor_tokens,
                 behavior_cap_thinking_at_max_tokens: pb.cap_thinking_at_max_tokens,
@@ -1274,6 +1372,12 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_rom_head: pb.rom_head,
                 behavior_tool_retry: pb.tool_retry,
                 behavior_preserve_thinking: pb.preserve_thinking,
+                behavior_verbatim_prompt: pb.verbatim_prompt,
+                behavior_nvfp4_verbatim_prompt: pb.nvfp4_verbatim_prompt,
+                behavior_eos_ends_thinking: pb.eos_ends_thinking,
+                behavior_tool_call_steering: pb.tool_call_steering,
+                behavior_verbatim_reasoning_effort: pb.verbatim_reasoning_effort,
+                behavior_ban_tool_call_without_tools: pb.ban_tool_call_without_tools,
                 model_type_matches,
                 match_names,
                 dflash,

@@ -146,6 +146,49 @@ pub fn moe_w4a16_grouped_gemm_ptrtable(
         .launch(stream)
 }
 
+/// gfx1151: same grouped GEMM via `moe_w4a16_grouped_gemm_ptrtable_mloop`,
+/// whose kernel loops m-tiles internally — grid.y is a parallelism cap, not a
+/// coverage bound. 4 slabs keeps one slab per warp-quad while bounding CTAs on
+/// the skewed expert distribution.
+const MLOOP_GRID_Y: u32 = 4;
+
+#[allow(clippy::too_many_arguments)]
+pub fn moe_w4a16_grouped_gemm_ptrtable_mloop(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a: DevicePtr,
+    b_packed_ptrs: DevicePtr,
+    b_scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    c: DevicePtr,
+    expert_offsets: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    num_experts: u32,
+    n_out: u32,
+    k: u32,
+    max_m_tiles: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([
+            div_ceil(n_out, 64),
+            max_m_tiles.min(MLOOP_GRID_Y),
+            num_experts,
+        ])
+        .block([128, 1, 1])
+        .arg_ptr(a)
+        .arg_ptr(b_packed_ptrs)
+        .arg_ptr(b_scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(c)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(num_experts)
+        .arg_u32(n_out)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// Pointer-table grouped GEMM with N_TILE=128 (transposed or wide kernels).
 ///
 /// Grid: (ceil(n_out/128), max_m_tiles, num_experts)  Block: (128, 1, 1)

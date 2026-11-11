@@ -14,6 +14,16 @@ use crate::tool_parser;
 
 use super::chat_blocking::{extract_hoisted_tool_calls, merge_hoisted_tool_calls};
 
+/// Whether GLM's native opener at `pos` opens a call: it sits outside any
+/// quote or code span of the text decoded before it.
+pub(super) fn native_opener_opens_call(state: &AppState, tokens: &[u32], pos: usize) -> bool {
+    !state
+        .tokenizer
+        .decode(&tokens[..pos])
+        .ok()
+        .is_some_and(|prefix| crate::literal_xml::state_after(&prefix).is_literal())
+}
+
 /// Build the assistant message + finish_reason for one choice. Tool
 /// parsing, validation, content-strip + refusal-classifier all live
 /// here.
@@ -32,7 +42,6 @@ pub(super) fn build_choice_message(
     cwd_hint: Option<&str>,
     choice_idx: usize,
 ) -> ir::Choice {
-    let _ = response; // currently only used for finish_reason.clone() below
     // Neutral locals — the wire annotations (URL citations) are derived
     // at encode time by the surfaces that emit them.
     let mut reasoning_content = reasoning_content_i;
@@ -77,7 +86,36 @@ pub(super) fn build_choice_message(
             tool_parser::parse_tool_calls(&output_text_i)
         };
         let mut tool_calls_i = merge_hoisted_tool_calls(hoisted_tool_calls, parsed_tool_calls);
-        if !tool_calls_i.is_empty() {
+        let mut undeclared_native = Vec::new();
+        if let Some(opener) = state.glm_tool_boundary {
+            // Native GLM parser semantics require a declared name. Do this
+            // before repair/coercion: the generic validator can fuzzy-map an
+            // unknown name to the sole supplied tool, which is not authority
+            // to execute a call emitted at an implicit reasoning boundary.
+            let mut undeclared = Vec::new();
+            tool_calls_i.retain(|call| {
+                let declared = req
+                    .tools
+                    .iter()
+                    .any(|tool| tool.function.name == call.function.name);
+                if !declared {
+                    undeclared.push(call.clone());
+                }
+                declared
+            });
+            // Behind a native opener an undeclared name is still a call. It
+            // skips repair and validation and reaches the client unchanged, as
+            // in the stream; the client's unknown-tool result keeps the turn.
+            let tokens = &response.output_tokens;
+            if !undeclared.is_empty()
+                && (0..tokens.len()).any(|pos| {
+                    tokens[pos] == opener && native_opener_opens_call(state, tokens, pos)
+                })
+            {
+                undeclared_native = undeclared;
+            }
+        }
+        if !tool_calls_i.is_empty() || !undeclared_native.is_empty() {
             let tools_ref = req.tools.clone();
             tool_parser::backfill_required_params(&mut tool_calls_i, &tools_ref);
             if state
@@ -90,35 +128,37 @@ pub(super) fn build_choice_message(
             if let Some(cwd) = cwd_hint {
                 tool_parser::normalize_paths(&mut tool_calls_i, cwd);
             }
-            let validated = tool_parser::validate_tool_calls(tool_calls_i, &tools_ref);
+            if let Some(reason) = tool_calls_i
+                .iter()
+                .chain(&undeclared_native)
+                .find_map(|tc| state.tool_guard.inspect(&tc.function.arguments).err())
+            {
+                tracing::warn!(reason = reason.code(), "tool-call guard blocked a response");
+                return ir::Choice {
+                    index: choice_idx,
+                    content: Some(atlas_tool_guard::REFUSAL.into()),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    refusal: None,
+                    finish_reason: ir::FinishReason::ContentFilter,
+                    guard_stop: Some(atlas_tool_guard::GUARD_STOP),
+                    matched_stop: None,
+                    logprobs: None,
+                };
+            }
+            let mut validated = tool_parser::validate_tool_calls(tool_calls_i, &tools_ref);
+            validated.valid.extend(undeclared_native);
             if !validated.errors.is_empty() {
                 for err in &validated.errors {
                     tracing::warn!("Tool call validation error: {err}");
                 }
             }
-            // Strip orphan tool call XML tags + ```lang fences from content
-            // (Qwen3-Coder pattern: emits markdown narration AND structured
-            // tool_call for the same payload).
-            let content = content.map(|mut c| {
-                for tag in &["</parameter>", "</function>", "</tool_call>", "<tool_call>"] {
-                    c = c.replace(tag, "");
-                }
-                while let Some(start) = c.find("<function=") {
-                    let end = c[start..]
-                        .find('>')
-                        .map(|p| start + p + 1)
-                        .unwrap_or(c.len());
-                    c = format!("{}{}", &c[..start], &c[end..]);
-                }
-                while let Some(start) = c.find("```") {
-                    let after_open = start + 3;
-                    let Some(rel_close) = c[after_open..].find("```") else {
-                        break;
-                    };
-                    let close_end = after_open + rel_close + 3;
-                    c = format!("{}{}", &c[..start], &c[close_end..]);
-                }
-                c.trim().to_string()
+            // Strip orphan tool-call XML tags from narration while preserving
+            // the same bytes when they occur in a quoted/code example.
+            let content = content.map(|c| {
+                super::strip::strip_tool_markup_preserving_literals(&c)
+                    .trim()
+                    .to_string()
             });
             msg_content = content;
             if !validated.valid.is_empty() {
@@ -149,14 +189,17 @@ pub(super) fn build_choice_message(
     }
 
     // Refusal classifier: when the model's assistant text opens with
-    // a known refusal pattern AND no tool call fired, populate
-    // `refusal` and null out `content` per the OpenAI spec.
+    // a known refusal pattern AND no tool call fired, populate `refusal`.
+    // `content` is kept: the classifier is a prefix heuristic, and a reply
+    // like "I cannot verify that, but here is ..." carries a real answer
+    // after its first sentence. The streamed path sends every content piece
+    // and appends the refusal delta at the end, so blocking now matches it
+    // (#172: 27/200 blocking replies came back with `content: null`).
     if msg_tool_calls.is_none()
         && let Some(content_text) = msg_content.as_deref()
         && let Some(refusal_sentence) = crate::refusal::detect(content_text)
     {
         msg_refusal = Some(refusal_sentence);
-        msg_content = None;
     }
 
     // Validated wire tool calls → IR (arguments are serde-normalized
@@ -181,6 +224,7 @@ pub(super) fn build_choice_message(
         finish_reason: ir::FinishReason::from(finish_reason_i.as_str()),
         matched_stop: None, // caller fills
         logprobs: None,     // caller fills
+        guard_stop: response.guard_stop,
     }
 }
 

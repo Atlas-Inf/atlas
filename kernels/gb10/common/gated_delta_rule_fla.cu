@@ -138,7 +138,9 @@ __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0
 
 // C[m][n] = Σ_k A[m][k]·B[n][k], M=64, K=K_DIM, N=NTC*8. A/B row-major bf16 smem;
 // 128 threads = 4 warps (16 M-rows each). NSTRIDE = C row-stride. (SSOT helper.)
-template <int NTC, int NSTRIDE, bool OutBf16>
+// B_KN: B is stored [k][n] (row stride NTC*8) instead of [n][k]; the fragments
+// carry the same values, so C is bit-identical either way.
+template <int NTC, int NSTRIDE, bool OutBf16, bool B_KN = false>
 __device__ __forceinline__ void mma_gram(
     const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B, void* __restrict__ C
 ) {
@@ -164,8 +166,15 @@ __device__ __forceinline__ void mma_gram(
         for (int nt = 0; nt < NTC; nt++) {
             unsigned nc = nt * 8 + grp;
             unsigned k0 = ks + q * 2, k1 = k0 + 8;
-            unsigned b0 = ((unsigned)sB[nc * K_DIM + k0 + 1] << 16) | (unsigned)sB[nc * K_DIM + k0];
-            unsigned b1 = ((unsigned)sB[nc * K_DIM + k1 + 1] << 16) | (unsigned)sB[nc * K_DIM + k1];
+            unsigned b0, b1;
+            if constexpr (B_KN) {
+                constexpr unsigned NB = NTC * 8;
+                b0 = ((unsigned)sB[(k0 + 1) * NB + nc] << 16) | (unsigned)sB[k0 * NB + nc];
+                b1 = ((unsigned)sB[(k1 + 1) * NB + nc] << 16) | (unsigned)sB[k1 * NB + nc];
+            } else {
+                b0 = ((unsigned)sB[nc * K_DIM + k0 + 1] << 16) | (unsigned)sB[nc * K_DIM + k0];
+                b1 = ((unsigned)sB[nc * K_DIM + k1 + 1] << 16) | (unsigned)sB[nc * K_DIM + k1];
+            }
             asm volatile(
                 "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
                 : "=f"(acc[nt][0]), "=f"(acc[nt][1]), "=f"(acc[nt][2]), "=f"(acc[nt][3])
@@ -1125,7 +1134,23 @@ gated_delta_rule_chunk_delta_h_vfused(
 // (`cp.async.bulk.tensor` + `CUtensorMap`) and an `mbarrier` producer/consumer
 // pipeline, neither of which appears anywhere in this tree yet. `cp.async` +
 // double buffering is the part reachable without that machinery.
-template <int SPLIT, int VT>
+// CAP (the `_cap` twins, qwen4_exp mid-chunk prefix-cache checkpoint): also
+// store the FP32 entry state of chunk `cap_chunk` -- the state after the
+// pass's first `cap_chunk * CHUNK` tokens -- to `cap_state`, laid out as
+// `h_state`. Every other store and every value is the CAP=false kernel's.
+//
+// CAPN (the `_capn` twins, qwen4_exp dense / branch-point checkpoints): the
+// same store for up to CDH_CAP_MAX chunks of one pass, chunk `chunk[j]`'s
+// entry state to `dst[j]`. The list rides by value (`KernelLaunch::arg_words`:
+// 16 pointers, 16 chunk indices two to a word, then `n`).
+#define CDH_CAP_MAX 16
+struct CdhCaps {
+    unsigned long long dst[CDH_CAP_MAX];
+    unsigned int chunk[CDH_CAP_MAX];
+    unsigned int n;
+    unsigned int pad;
+};
+template <int SPLIT, int VT, bool CAP = false, bool CAPN = false>
 __device__ __forceinline__ void cdh_pipe_core(
     float* __restrict__ h_state, const __nv_bfloat16* __restrict__ W_in,
     const __nv_bfloat16* __restrict__ U_in, const __nv_bfloat16* __restrict__ key,
@@ -1135,7 +1160,8 @@ __device__ __forceinline__ void cdh_pipe_core(
     unsigned int num_v_heads, unsigned int k_dim, unsigned int v_dim,
     unsigned int qk_stride, unsigned int gb_stride, unsigned int h_state_is_table,
     const int* __restrict__ cu_seqlens, const int* __restrict__ cu_chunks,
-    unsigned int is_varlen
+    unsigned int is_varlen, float* __restrict__ cap_state = nullptr,
+    unsigned int cap_chunk = 0, const CdhCaps* __restrict__ caps = nullptr
 ) {
     constexpr int KH = K_DIM / SPLIT;
     const unsigned int vh = blockIdx.x;
@@ -1196,6 +1222,27 @@ __device__ __forceinline__ void cdh_pipe_core(
             for (int vt = 0; vt < VT; vt++)
                 S_out[base * K_DIM * V_DIM + (k0 + kk) * V_DIM + v0 + vt] =
                     __float2bfloat16(Sold[kk][vt]);
+        if constexpr (CAP) {
+            if (c == cap_chunk) {
+                float* Hc = cap_state + ((unsigned long long)(b * num_v_heads + vh) * K_DIM * V_DIM);
+                #pragma unroll
+                for (int kk = 0; kk < KH; kk++)
+                    #pragma unroll
+                    for (int vt = 0; vt < VT; vt++) Hc[(k0 + kk) * V_DIM + v0 + vt] = Sold[kk][vt];
+            }
+        }
+        if constexpr (CAPN) {
+            #pragma unroll 1
+            for (unsigned int j = 0; j < caps->n; j++) {
+                if (c != caps->chunk[j]) continue;
+                float* Hc = (float*)caps->dst[j]
+                    + ((unsigned long long)(b * num_v_heads + vh) * K_DIM * V_DIM);
+                #pragma unroll
+                for (int kk = 0; kk < KH; kk++)
+                    #pragma unroll
+                    for (int vt = 0; vt < VT; vt++) Hc[(k0 + kk) * V_DIM + v0 + vt] = Sold[kk][vt];
+            }
+        }
 
         const float edl = decs[0];
         float Snew[KH][VT];
@@ -1266,6 +1313,301 @@ gated_delta_rule_chunk_delta_h_pipe(
                         num_chunks, num_k_heads, num_v_heads, k_dim, v_dim, qk_stride,
                         gb_stride, h_state_is_table, cu_seqlens, cu_chunks, is_varlen);
 }
+
+// `..._pipe` that also stores chunk `cap_chunk`'s FP32 entry state to
+// `cap_state` (the CAP note on `cdh_pipe_core`).
+extern "C" __global__ void __launch_bounds__(256, 1)
+gated_delta_rule_chunk_delta_h_pipe_cap(
+    float* __restrict__ h_state, const __nv_bfloat16* __restrict__ W_in,
+    const __nv_bfloat16* __restrict__ U_in, const __nv_bfloat16* __restrict__ key,
+    const float* __restrict__ gate, const float* __restrict__ gc_in,
+    __nv_bfloat16* __restrict__ S_out, __nv_bfloat16* __restrict__ uc_out,
+    unsigned int batch_size, unsigned int seq_len, unsigned int num_chunks,
+    unsigned int num_k_heads, unsigned int num_v_heads, unsigned int k_dim,
+    unsigned int v_dim, unsigned int qk_stride, unsigned int gb_stride,
+    unsigned int h_state_is_table,
+    const int* __restrict__ cu_seqlens, const int* __restrict__ cu_chunks,
+    unsigned int is_varlen, float* __restrict__ cap_state, unsigned int cap_chunk
+) {
+    cdh_pipe_core<2, 1, true>(h_state, W_in, U_in, key, gate, gc_in, S_out, uc_out, seq_len,
+                              num_chunks, num_k_heads, num_v_heads, k_dim, v_dim, qk_stride,
+                              gb_stride, h_state_is_table, cu_seqlens, cu_chunks, is_varlen,
+                              cap_state, cap_chunk);
+}
+
+// `..._pipe` that also stores each listed chunk's FP32 entry state (the CAPN
+// note on `cdh_pipe_core`).
+extern "C" __global__ void __launch_bounds__(256, 1)
+gated_delta_rule_chunk_delta_h_pipe_capn(
+    float* __restrict__ h_state, const __nv_bfloat16* __restrict__ W_in,
+    const __nv_bfloat16* __restrict__ U_in, const __nv_bfloat16* __restrict__ key,
+    const float* __restrict__ gate, const float* __restrict__ gc_in,
+    __nv_bfloat16* __restrict__ S_out, __nv_bfloat16* __restrict__ uc_out,
+    unsigned int batch_size, unsigned int seq_len, unsigned int num_chunks,
+    unsigned int num_k_heads, unsigned int num_v_heads, unsigned int k_dim,
+    unsigned int v_dim, unsigned int qk_stride, unsigned int gb_stride,
+    unsigned int h_state_is_table,
+    const int* __restrict__ cu_seqlens, const int* __restrict__ cu_chunks,
+    unsigned int is_varlen, const __grid_constant__ CdhCaps caps
+) {
+    cdh_pipe_core<2, 1, false, true>(h_state, W_in, U_in, key, gate, gc_in, S_out, uc_out,
+                                     seq_len, num_chunks, num_k_heads, num_v_heads, k_dim,
+                                     v_dim, qk_stride, gb_stride, h_state_is_table, cu_seqlens,
+                                     cu_chunks, is_varlen, nullptr, 0, &caps);
+}
+
+// ── KERNEL 2-PIPE-DV: chunk_delta_h_pipe_dv<DVB> ─────────────────────────────
+// `..._pipe` with its 128 state columns split over 128 / DVB CTAs per head.
+//
+// WHY. `..._pipe` runs one CTA per v-head. At TP2 a qwen4_exp rank holds 24 of
+// the 48 GDN v-heads, so the spine -- serial over 64-token chunks, ~8.7 ms a
+// layer at a 16K prefill on the pair -- occupies 24 of GB10's 48 SMs, and at 8
+// warps a CTA it is issue-bound there (~33K instructions per thread per chunk:
+// 64 tokens x {64-term W.S dot, 64 state updates} with --fmad=false, plus a
+// 2-byte shared load for every W and K element). Splitting the columns puts the
+// same work on twice the SMs; the k-dimensioned W and K tiles are loaded by
+// every column block (the "V-tiling regressed" note on `chunk_delta_h` is about
+// 32 heads on 48 SMs, where a split goes past one wave).
+//
+// The W and K rows a thread reads (its 64-element k half) arrive as 16-byte
+// shared loads, eight values each, instead of one 2-byte load per value.
+//
+// BIT-IDENTICAL to `..._pipe`. A column block of S_{c+1} depends only on the
+// same column block of S_c (W.S contracts over k, the update is per column),
+// and each thread keeps `..._pipe`'s exact per-column program: thread
+// (v, sub) owns S[sub*64 .. +64][v]; the W.S partial accumulates kk = 0..63 in
+// order, one `__shfl_xor` with the partner half, `uc = U - wsp`, `d = dec * uc`,
+// then `S += d * k` per kk in token order -- the same values through the same
+// operations. `scripts/dev/qwen4exp_gdn_spine_bench.cu` compares S_out, uc_out
+// and the final state byte for byte.
+//
+// Grid: (num_v_heads, batch * (V_DIM / DVB)), Block: (2 * DVB). Dynamic smem:
+// 2 x {W, K} [CHUNK, K_DIM] + 2 x U [CHUNK, DVB] bf16 + gc / decay tables.
+template <int DVB>
+__device__ __forceinline__ void cdh_pipe_dv_prefetch(
+    __nv_bfloat16* Wp, __nv_bfloat16* Kp, __nv_bfloat16* Up, float* gcb, float* decb,
+    const __nv_bfloat16* __restrict__ W_in, const __nv_bfloat16* __restrict__ U_in,
+    const __nv_bfloat16* __restrict__ key, const float* __restrict__ gc_in,
+    unsigned int c, unsigned int vh, unsigned int dv0, const GdnGeom& g,
+    unsigned int num_v_heads, unsigned int k_dim, unsigned int kh, unsigned int qk_stride
+) {
+    const unsigned int tid = threadIdx.x;
+    const unsigned int nthr = blockDim.x;
+    const unsigned int cs = c * CHUNK;
+    const unsigned int ce = (g.seqlen - cs) < CHUNK ? (g.seqlen - cs) : CHUNK;
+    const unsigned long long base = ((unsigned long long)(g.choff + c) * num_v_heads + vh);
+    const __nv_bfloat16* Wsrc = W_in + base * CHUNK * K_DIM;
+    for (unsigned int e = tid * 8; e < CHUNK * K_DIM; e += nthr * 8) cp_async16(&Wp[e], &Wsrc[e]);
+    const __nv_bfloat16* Usrc = U_in + base * CHUNK * V_DIM + dv0;
+    for (unsigned int e = tid * 8; e < CHUNK * DVB; e += nthr * 8)
+        cp_async16(&Up[e], &Usrc[(e / DVB) * V_DIM + (e % DVB)]);
+    const __nv_bfloat16* key_b = key + g.tokoff * qk_stride;
+    for (unsigned int j = tid; j < CHUNK * 16; j += nthr) {
+        const unsigned int i = j >> 4, c16 = (j & 15) * 8;
+        if (i < ce)
+            cp_async16(&Kp[i * K_DIM + c16],
+                       key_b + (unsigned long long)(cs + i) * qk_stride + kh * k_dim + c16);
+    }
+    {
+        const float dl = gc_in[base * CHUNK + ce - 1];
+        if (tid == 0) decb[0] = expf(dl);
+        for (unsigned int i = tid; i < ce; i += nthr) {
+            const float gv = gc_in[base * CHUNK + i];
+            gcb[i] = gv;
+            decb[1 + i] = expf(dl - gv);
+        }
+    }
+    cp_commit();
+}
+
+template <int DVB, bool CAP = false, bool CAPN = false>
+__device__ __forceinline__ void cdh_pipe_dv_core(
+    float* __restrict__ h_state, const __nv_bfloat16* __restrict__ W_in,
+    const __nv_bfloat16* __restrict__ U_in, const __nv_bfloat16* __restrict__ key,
+    const float* __restrict__ gate, const float* __restrict__ gc_in,
+    __nv_bfloat16* __restrict__ S_out, __nv_bfloat16* __restrict__ uc_out,
+    unsigned int seq_len, unsigned int num_chunks, unsigned int num_k_heads,
+    unsigned int num_v_heads, unsigned int k_dim, unsigned int v_dim,
+    unsigned int qk_stride, unsigned int gb_stride, unsigned int h_state_is_table,
+    const int* __restrict__ cu_seqlens, const int* __restrict__ cu_chunks,
+    unsigned int is_varlen, float* __restrict__ cap_state = nullptr,
+    unsigned int cap_chunk = 0, const CdhCaps* __restrict__ caps = nullptr
+) {
+    constexpr int SPLIT = 2;
+    constexpr int KH = K_DIM / SPLIT;            // 64: a thread's k half
+    constexpr int NDVB = V_DIM / DVB;
+    (void)gate; (void)gb_stride;
+    const unsigned int vh = blockIdx.x;
+    if (vh >= num_v_heads) return;
+    const unsigned int dvb = blockIdx.y % (unsigned int)NDVB;
+    const unsigned int b = blockIdx.y / (unsigned int)NDVB;
+    const unsigned int dv0 = dvb * (unsigned int)DVB;
+    GDN_GEOM(g);
+    const unsigned int t = threadIdx.x;
+    const unsigned int vloc = t / SPLIT;
+    const unsigned int v = dv0 + vloc;
+    const unsigned int sub = t % SPLIT;
+    const unsigned int k0 = sub * KH;
+    const unsigned int head_repeat = num_v_heads / num_k_heads;
+    const unsigned int kh = vh / head_repeat;
+
+    extern __shared__ __align__(16) char smem_raw_pdv[];
+    __nv_bfloat16* Wb = (__nv_bfloat16*)smem_raw_pdv;     // [2][CHUNK * K_DIM]
+    __nv_bfloat16* Kb = Wb + 2 * CHUNK * K_DIM;           // [2][CHUNK * K_DIM]
+    __nv_bfloat16* Ub = Kb + 2 * CHUNK * K_DIM;           // [2][CHUNK * DVB]
+    float* gcb = (float*)(Ub + 2 * CHUNK * DVB);          // [2][CHUNK]
+    float* decb = gcb + 2 * CHUNK;                        // [2][CHUNK + 1]
+
+    float* H = h_state_is_table
+        ? ((float* const*)h_state)[b] + (unsigned long long)vh * K_DIM * V_DIM
+        : h_state + ((unsigned long long)(b * num_v_heads + vh) * K_DIM * V_DIM);
+    float Sold[KH];
+    #pragma unroll
+    for (int kk = 0; kk < KH; kk++) Sold[kk] = H[(k0 + kk) * V_DIM + v];
+
+    if (g.nchunks == 0) return;
+    cdh_pipe_dv_prefetch<DVB>(Wb, Kb, Ub, gcb, decb, W_in, U_in, key, gc_in, 0, vh, dv0, g,
+                              num_v_heads, k_dim, kh, qk_stride);
+
+    for (unsigned int c = 0; c < g.nchunks; c++) {
+        const unsigned int p = c & 1u;
+        const unsigned int ce = (g.seqlen - c * CHUNK) < CHUNK ? (g.seqlen - c * CHUNK) : CHUNK;
+        const unsigned long long base = ((unsigned long long)(g.choff + c) * num_v_heads + vh);
+
+        if (c + 1 < g.nchunks) {
+            const unsigned int q = p ^ 1u;
+            cdh_pipe_dv_prefetch<DVB>(Wb + q * CHUNK * K_DIM, Kb + q * CHUNK * K_DIM,
+                                      Ub + q * CHUNK * DVB, gcb + q * CHUNK,
+                                      decb + q * (CHUNK + 1), W_in, U_in, key, gc_in, c + 1, vh,
+                                      dv0, g, num_v_heads, k_dim, kh, qk_stride);
+            cp_wait<1>();
+        } else {
+            cp_wait<0>();
+        }
+        __syncthreads();
+
+        const __nv_bfloat16* Wp = Wb + p * CHUNK * K_DIM;
+        const __nv_bfloat16* Kp = Kb + p * CHUNK * K_DIM;
+        const __nv_bfloat16* Up = Ub + p * CHUNK * DVB;
+        const float* decs = decb + p * (CHUNK + 1);
+
+        #pragma unroll
+        for (int kk = 0; kk < KH; kk++)
+            S_out[base * K_DIM * V_DIM + (k0 + kk) * V_DIM + v] = __float2bfloat16(Sold[kk]);
+        if constexpr (CAP) {
+            if (c == cap_chunk) {
+                float* Hc = cap_state + ((unsigned long long)(b * num_v_heads + vh) * K_DIM * V_DIM);
+                #pragma unroll
+                for (int kk = 0; kk < KH; kk++) Hc[(k0 + kk) * V_DIM + v] = Sold[kk];
+            }
+        }
+        if constexpr (CAPN) {
+            #pragma unroll 1
+            for (unsigned int j = 0; j < caps->n; j++) {
+                if (c != caps->chunk[j]) continue;
+                float* Hc = (float*)caps->dst[j]
+                    + ((unsigned long long)(b * num_v_heads + vh) * K_DIM * V_DIM);
+                #pragma unroll
+                for (int kk = 0; kk < KH; kk++) Hc[(k0 + kk) * V_DIM + v] = Sold[kk];
+            }
+        }
+
+        const float edl = decs[0];
+        float Snew[KH];
+        #pragma unroll
+        for (int kk = 0; kk < KH; kk++) Snew[kk] = edl * Sold[kk];
+
+        // (Interleaving two or four tokens' independent W.S dots measured
+        // slower here -- register pressure -- so tokens run one at a time.)
+        for (unsigned int i = 0; i < ce; i++) {
+            const uint4* wrow = reinterpret_cast<const uint4*>(Wp + i * K_DIM + k0);
+            float wsp = 0.0f;
+            #pragma unroll
+            for (int c8 = 0; c8 < KH / 8; c8++) {
+                const uint4 w8 = wrow[c8];
+                const unsigned int ww[4] = {w8.x, w8.y, w8.z, w8.w};
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    wsp += __bfloat162float(__ushort_as_bfloat16((unsigned short)(ww[j] & 0xFFFFu)))
+                         * Sold[c8 * 8 + 2 * j];
+                    wsp += __bfloat162float(__ushort_as_bfloat16((unsigned short)(ww[j] >> 16)))
+                         * Sold[c8 * 8 + 2 * j + 1];
+                }
+            }
+            wsp += __shfl_xor_sync(0xffffffffu, wsp, 1);
+            const float uci = (float)Up[i * DVB + vloc] - wsp;
+            if (sub == 0) uc_out[base * CHUNK * V_DIM + i * v_dim + v] = __float2bfloat16(uci);
+            const float d = decs[1 + i] * uci;
+            const uint4* krow = reinterpret_cast<const uint4*>(Kp + i * K_DIM + k0);
+            #pragma unroll
+            for (int c8 = 0; c8 < KH / 8; c8++) {
+                const uint4 k8 = krow[c8];
+                const unsigned int kw[4] = {k8.x, k8.y, k8.z, k8.w};
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    Snew[c8 * 8 + 2 * j] += d
+                        * __bfloat162float(__ushort_as_bfloat16((unsigned short)(kw[j] & 0xFFFFu)));
+                    Snew[c8 * 8 + 2 * j + 1] += d
+                        * __bfloat162float(__ushort_as_bfloat16((unsigned short)(kw[j] >> 16)));
+                }
+            }
+        }
+        #pragma unroll
+        for (int kk = 0; kk < KH; kk++) Sold[kk] = Snew[kk];
+        __syncthreads();   // the next prefetch overwrites slot p
+    }
+
+    #pragma unroll
+    for (int kk = 0; kk < KH; kk++) H[(k0 + kk) * V_DIM + v] = Sold[kk];
+}
+
+#define CDH_PIPE_DV_ARGS                                                            \
+    float* __restrict__ h_state, const __nv_bfloat16* __restrict__ W_in,           \
+    const __nv_bfloat16* __restrict__ U_in, const __nv_bfloat16* __restrict__ key, \
+    const float* __restrict__ gate, const float* __restrict__ gc_in,               \
+    __nv_bfloat16* __restrict__ S_out, __nv_bfloat16* __restrict__ uc_out,         \
+    unsigned int batch_size, unsigned int seq_len, unsigned int num_chunks,        \
+    unsigned int num_k_heads, unsigned int num_v_heads, unsigned int k_dim,        \
+    unsigned int v_dim, unsigned int qk_stride, unsigned int gb_stride,            \
+    unsigned int h_state_is_table,                                                 \
+    const int* __restrict__ cu_seqlens, const int* __restrict__ cu_chunks,         \
+    unsigned int is_varlen
+#define CDH_PIPE_DV_CALL                                                            \
+    (h_state, W_in, U_in, key, gate, gc_in, S_out, uc_out, seq_len, num_chunks,    \
+     num_k_heads, num_v_heads, k_dim, v_dim, qk_stride, gb_stride, h_state_is_table, \
+     cu_seqlens, cu_chunks, is_varlen)
+
+// Two column blocks a head (128 threads each).
+extern "C" __global__ void __launch_bounds__(128, 1)
+gated_delta_rule_chunk_delta_h_pipe_dv64(CDH_PIPE_DV_ARGS) {
+    (void)batch_size;
+    cdh_pipe_dv_core<64> CDH_PIPE_DV_CALL;
+}
+
+// `..._pipe_dv64` that also stores chunk `cap_chunk`'s FP32 entry state to
+// `cap_state` (the CAP note on `cdh_pipe_core`).
+extern "C" __global__ void __launch_bounds__(128, 1)
+gated_delta_rule_chunk_delta_h_pipe_dv64_cap(CDH_PIPE_DV_ARGS, float* __restrict__ cap_state,
+                                             unsigned int cap_chunk) {
+    (void)batch_size;
+    cdh_pipe_dv_core<64, true>(h_state, W_in, U_in, key, gate, gc_in, S_out, uc_out, seq_len,
+                               num_chunks, num_k_heads, num_v_heads, k_dim, v_dim, qk_stride,
+                               gb_stride, h_state_is_table, cu_seqlens, cu_chunks, is_varlen,
+                               cap_state, cap_chunk);
+}
+
+// `..._pipe_dv64` that also stores each listed chunk's FP32 entry state (the
+// CAPN note on `cdh_pipe_core`).
+extern "C" __global__ void __launch_bounds__(128, 1)
+gated_delta_rule_chunk_delta_h_pipe_dv64_capn(CDH_PIPE_DV_ARGS,
+                                              const __grid_constant__ CdhCaps caps) {
+    (void)batch_size;
+    cdh_pipe_dv_core<64, false, true>(h_state, W_in, U_in, key, gate, gc_in, S_out, uc_out,
+                                      seq_len, num_chunks, num_k_heads, num_v_heads, k_dim,
+                                      v_dim, qk_stride, gb_stride, h_state_is_table, cu_seqlens,
+                                      cu_chunks, is_varlen, nullptr, 0, &caps);
+}
+
 
 // ── KERNEL 2-TMA: chunk_delta_h_tma<SPLIT,VT> ────────────────────────────────
 // `cdh_pipe_core`'s compute and double buffer, with the staging moved from
@@ -2000,8 +2342,17 @@ gated_delta_rule_chunk_delta_h_ksplit_vblock8(
 // profile put this kernel at 9.8% of GPU time, the largest single GDN kernel once
 // the vtile spine landed, and it stages 96.5 KB of smem through what used to be
 // only 4 warps. Same grid, same traffic: only the warp count changes.
-extern "C" __global__ void __launch_bounds__(512, 1)
-gated_delta_rule_chunk_fwd_o(
+// WIDE (`gated_delta_rule_chunk_fwd_o_wide`, ATLAS_QWEN4EXP_PREFILL_GDN):
+// * the closing per-(row, column) loop -- ~2,080 serial MACs a column for a
+//   full chunk -- runs on all 512 threads (4 row groups x 128 columns, rows
+//   interleaved for balance) instead of the first 128;
+// * S_c is staged as stored with 16-byte coalesced copies (the default
+//   transposes it element by element, 256 bytes apart across a warp) and
+//   mma_gram reads its fragments [k][v].
+// Every output is the same `t1 + t2`, `t2` summed over l = 0..i in order, on
+// the same MMA results, so the bytes are unchanged.
+template <bool WIDE>
+__device__ __forceinline__ void chunk_fwd_o_body(
     const __nv_bfloat16* __restrict__ query,
     const __nv_bfloat16* __restrict__ key,
     const float* __restrict__ gate,
@@ -2022,6 +2373,7 @@ gated_delta_rule_chunk_fwd_o(
     const int* __restrict__ cu_chunks,
     unsigned int is_varlen
 ) {
+    (void)gate;
     const unsigned int c = blockIdx.x;
     const unsigned int vh = blockIdx.y;
     const unsigned int b = blockIdx.z;
@@ -2040,8 +2392,8 @@ gated_delta_rule_chunk_fwd_o(
     query += g.tokoff * qk_stride;
     key   += g.tokoff * qk_stride;
 
-    extern __shared__ char smem_raw[];
-    __nv_bfloat16* sq = (__nv_bfloat16*)smem_raw;          // [CHUNK*K_DIM]
+    extern __shared__ char smem_raw_fo[];
+    __nv_bfloat16* sq = (__nv_bfloat16*)smem_raw_fo;          // [CHUNK*K_DIM]
     __nv_bfloat16* sk = sq + CHUNK * K_DIM;                // [CHUNK*K_DIM]
     float* kq = (float*)(sk + CHUNK * K_DIM);              // [CHUNK*CHUNK]
     __nv_bfloat16* ucb = (__nv_bfloat16*)(kq + CHUNK * CHUNK); // [CHUNK*V_DIM]
@@ -2049,25 +2401,56 @@ gated_delta_rule_chunk_fwd_o(
     float* gc = (float*)(Sb + K_DIM * V_DIM);              // [CHUNK]
     float* egc = gc + CHUNK;                               // [CHUNK] exp(gc)
 
-    for (unsigned int idx = tid; idx < CHUNK * k_dim; idx += blockDim.x) {
-        unsigned int i = idx / k_dim, j = idx % k_dim;
-        if (i < ce) {
-            unsigned long long off = (unsigned long long)(cs + i) * qk_stride + kh * k_dim + j;
-            sq[i * K_DIM + j] = query[off];
-            sk[i * K_DIM + j] = key[off];
-        } else {
-            sq[i * K_DIM + j] = __float2bfloat16(0.0f);
-            sk[i * K_DIM + j] = __float2bfloat16(0.0f);
+    if constexpr (WIDE) {
+        // Eight elements a copy (rows are K_DIM / V_DIM wide and 16-byte
+        // aligned: qk_stride, kh * k_dim and the uc rows are multiples of 8).
+        const uint4 zero = make_uint4(0, 0, 0, 0);
+        for (unsigned int idx = tid; idx < CHUNK * K_DIM / 8; idx += blockDim.x) {
+            const unsigned int i = idx / (K_DIM / 8), j = (idx % (K_DIM / 8)) * 8;
+            uint4 qv = zero, kv = zero;
+            if (i < ce) {
+                const unsigned long long off = (unsigned long long)(cs + i) * qk_stride + kh * k_dim + j;
+                qv = *reinterpret_cast<const uint4*>(query + off);
+                kv = *reinterpret_cast<const uint4*>(key + off);
+            }
+            *reinterpret_cast<uint4*>(sq + i * K_DIM + j) = qv;
+            *reinterpret_cast<uint4*>(sk + i * K_DIM + j) = kv;
+        }
+        for (unsigned int idx = tid; idx < CHUNK * V_DIM / 8; idx += blockDim.x) {
+            const unsigned int i = idx / (V_DIM / 8), v = (idx % (V_DIM / 8)) * 8;
+            *reinterpret_cast<uint4*>(ucb + i * V_DIM + v) = (i < ce)
+                ? *reinterpret_cast<const uint4*>(uc_in + base * CHUNK * V_DIM + i * v_dim + v)
+                : zero;
+        }
+    } else {
+        for (unsigned int idx = tid; idx < CHUNK * k_dim; idx += blockDim.x) {
+            unsigned int i = idx / k_dim, j = idx % k_dim;
+            if (i < ce) {
+                unsigned long long off = (unsigned long long)(cs + i) * qk_stride + kh * k_dim + j;
+                sq[i * K_DIM + j] = query[off];
+                sk[i * K_DIM + j] = key[off];
+            } else {
+                sq[i * K_DIM + j] = __float2bfloat16(0.0f);
+                sk[i * K_DIM + j] = __float2bfloat16(0.0f);
+            }
+        }
+        for (unsigned int idx = tid; idx < CHUNK * v_dim; idx += blockDim.x) {
+            unsigned int i = idx / v_dim, v = idx % v_dim;
+            ucb[i * V_DIM + v] = (i < ce) ? uc_in[base * CHUNK * V_DIM + i * v_dim + v] : __float2bfloat16(0.0f);
         }
     }
-    for (unsigned int idx = tid; idx < CHUNK * v_dim; idx += blockDim.x) {
-        unsigned int i = idx / v_dim, v = idx % v_dim;
-        ucb[i * V_DIM + v] = (i < ce) ? uc_in[base * CHUNK * V_DIM + i * v_dim + v] : __float2bfloat16(0.0f);
-    }
     // S_c read TRANSPOSED → Sbᵀ[v][k] = S_c[k][v], so mma_gram(q, Sbᵀ) = <q_i,S_c[:,v]>.
-    for (unsigned int idx = tid; idx < K_DIM * V_DIM; idx += blockDim.x) {
-        unsigned int v = idx / K_DIM, k = idx % K_DIM;
-        Sb[idx] = S_in[base * K_DIM * V_DIM + k * V_DIM + v];
+    // WIDE keeps S_c as stored ([k][v], 16-byte coalesced copies) and has
+    // mma_gram read it [k][n] -- the same fragments, so the same o1.
+    if constexpr (WIDE) {
+        const uint4* src = reinterpret_cast<const uint4*>(S_in + base * K_DIM * V_DIM);
+        uint4* dst = reinterpret_cast<uint4*>(Sb);
+        for (unsigned int idx = tid; idx < K_DIM * V_DIM / 8; idx += blockDim.x) dst[idx] = src[idx];
+    } else {
+        for (unsigned int idx = tid; idx < K_DIM * V_DIM; idx += blockDim.x) {
+            unsigned int v = idx / K_DIM, k = idx % K_DIM;
+            Sb[idx] = S_in[base * K_DIM * V_DIM + k * V_DIM + v];
+        }
     }
     for (unsigned int i = tid; i < ce; i += blockDim.x) {
         float g = gc_in[base * CHUNK + i];
@@ -2089,17 +2472,47 @@ gated_delta_rule_chunk_fwd_o(
 
     // o1[i][v] = <q_i, S_c[:,v]>  on tensor cores (bf16 out → terminal, precision-safe).
     __nv_bfloat16* o1 = sk;                   // [CHUNK*V_DIM] bf16, reuses sk's 16KB
-    if (tid < 128) mma_gram<16, V_DIM, true>(sq, Sb, o1);
+    if (tid < 128) mma_gram<16, V_DIM, true, WIDE>(sq, Sb, o1);
     __syncthreads();
 
-    if (tid < v_dim) {
-        for (unsigned int i = 0; i < ce; i++) {
-            float t1 = egc[i] * (float)o1[i * V_DIM + tid];
+    const unsigned int col = WIDE ? tid % V_DIM : tid;
+    const unsigned int i0 = WIDE ? tid / V_DIM : 0u;
+    const unsigned int istep = WIDE ? blockDim.x / V_DIM : 1u;
+    if (col < v_dim) {
+        for (unsigned int i = i0; i < ce; i += istep) {
+            float t1 = egc[i] * (float)o1[i * V_DIM + col];
             float t2 = 0.0f;
             for (unsigned int l = 0; l <= i; l++)
-                t2 += kq[i * CHUNK + l] * (float)ucb[l * V_DIM + tid];   // pure MAC inner loop
-            output[out_base + (unsigned long long)(cs + i) * num_v_heads * v_dim + tid] =
+                t2 += kq[i * CHUNK + l] * (float)ucb[l * V_DIM + col];   // pure MAC inner loop
+            output[out_base + (unsigned long long)(cs + i) * num_v_heads * v_dim + col] =
                 __float2bfloat16((t1 + t2) * inv_sqrt_d);
         }
     }
+}
+
+#define CHUNK_FWD_O_ARGS                                                              \
+    const __nv_bfloat16* __restrict__ query, const __nv_bfloat16* __restrict__ key,  \
+    const float* __restrict__ gate, const float* __restrict__ gc_in,                 \
+    const __nv_bfloat16* __restrict__ S_in, const __nv_bfloat16* __restrict__ uc_in, \
+    __nv_bfloat16* __restrict__ output, unsigned int batch_size, unsigned int seq_len, \
+    unsigned int num_chunks, unsigned int num_k_heads, unsigned int num_v_heads,     \
+    unsigned int k_dim, unsigned int v_dim, unsigned int qk_stride,                  \
+    unsigned int gb_stride, const int* __restrict__ cu_seqlens,                      \
+    const int* __restrict__ cu_chunks, unsigned int is_varlen
+#define CHUNK_FWD_O_CALL                                                              \
+    (query, key, gate, gc_in, S_in, uc_in, output, batch_size, seq_len, num_chunks,  \
+     num_k_heads, num_v_heads, k_dim, v_dim, qk_stride, gb_stride, cu_seqlens,       \
+     cu_chunks, is_varlen)
+
+extern "C" __global__ void __launch_bounds__(512, 1)
+gated_delta_rule_chunk_fwd_o(CHUNK_FWD_O_ARGS) {
+    chunk_fwd_o_body<false> CHUNK_FWD_O_CALL;
+}
+
+// Same arguments, grid and shared memory; Block: (512) -- every thread works
+// the closing loop (blockDim.x must be a multiple of V_DIM). Requires
+// k_dim == K_DIM, v_dim == V_DIM and qk_stride % 8 == 0 (16-byte copies).
+extern "C" __global__ void __launch_bounds__(512, 1)
+gated_delta_rule_chunk_fwd_o_wide(CHUNK_FWD_O_ARGS) {
+    chunk_fwd_o_body<true> CHUNK_FWD_O_CALL;
 }

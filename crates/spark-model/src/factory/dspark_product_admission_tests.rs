@@ -35,6 +35,7 @@ fn product_build(
         drafter_config: parse_value(value),
         gamma: Some(4),
         window_size: Some(1024),
+        alt: None,
     };
     let mut target = ModelConfig::qwen3_next_80b_nvfp4();
     target.model_type = "nemotron_h".to_owned();
@@ -75,6 +76,7 @@ fn executable_factory_wrapper_rejects_non_lightning_target_identity() {
         drafter_config: parse_value(&value),
         gamma: Some(4),
         window_size: Some(1024),
+        alt: None,
     };
     let mut target = ModelConfig::qwen3_next_80b_nvfp4();
     target.tp_world_size = 1;

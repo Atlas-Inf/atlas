@@ -30,7 +30,8 @@
 //! - **Redirects**: followed a bounded number of times, and every hop is
 //!   re-checked — a public URL that 302s to `127.0.0.1` is the standard way
 //!   to walk past an address check applied only to the first request.
-//! - **Type**: the response must declare an image content type.
+//! - **Type**: the response must declare an allowed image or video content
+//!   type for the requested media kind.
 //!
 //! # Where it runs
 //!
@@ -53,6 +54,14 @@ pub struct RemoteImagePolicy {
     /// `enabled` because "fetch from the public internet" and "fetch from
     /// inside my network" are different grants with different blast radii.
     pub allow_private: bool,
+}
+
+/// Media allowlist applied to a fetched response. GIF is accepted for video
+/// because the in-process decoder treats animated GIF as a video container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteMediaKind {
+    Image,
+    Video,
 }
 
 impl Default for RemoteImagePolicy {
@@ -178,6 +187,17 @@ fn split_url(url: &str) -> Result<(&str, &str, u16), String> {
 ///
 /// `Err` carries an operator-readable reason; the caller turns it into a 400.
 pub fn fetch_as_data_uri(url: &str, policy: &RemoteImagePolicy) -> Result<String, String> {
+    fetch_media_as_data_uri(url, policy, RemoteMediaKind::Image)
+}
+
+/// Fetch a remote image or video and return it as a `data:` URI. The legacy
+/// [`fetch_as_data_uri`] entry point remains image-only; callers handling
+/// structured video input must pass [`RemoteMediaKind::Video`] explicitly.
+pub fn fetch_media_as_data_uri(
+    url: &str,
+    policy: &RemoteImagePolicy,
+    media_kind: RemoteMediaKind,
+) -> Result<String, String> {
     if !policy.enabled {
         return Err("remote image fetching is disabled".to_string());
     }
@@ -227,8 +247,16 @@ pub fn fetch_as_data_uri(url: &str, policy: &RemoteImagePolicy) -> Result<String
             .unwrap_or("")
             .to_string();
         let mime = ctype.split(';').next().unwrap_or("").trim().to_lowercase();
-        if !mime.starts_with("image/") {
-            return Err(format!("content-type {mime:?} is not an image"));
+        let allowed = match media_kind {
+            RemoteMediaKind::Image => mime.starts_with("image/"),
+            RemoteMediaKind::Video => mime.starts_with("video/") || mime == "image/gif",
+        };
+        if !allowed {
+            let expected = match media_kind {
+                RemoteMediaKind::Image => "an image",
+                RemoteMediaKind::Video => "a video or animated GIF",
+            };
+            return Err(format!("content-type {mime:?} is not {expected}"));
         }
 
         // Read one byte past the cap so the overrun is DETECTED rather than

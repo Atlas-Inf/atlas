@@ -36,10 +36,86 @@ pub(crate) fn yarn_rope_mscale(config: &atlas_core::config::ModelConfig) -> f32 
 }
 
 impl Qwen3AttentionLayer {
+    /// Factory-only access: use the global block ordinal, not the MLA index.
+    pub(crate) fn glm_shared_cache_ffn(&mut self) -> (usize, &mut FfnComponent) {
+        (self.block_idx, &mut self.ffn)
+    }
     /// Set MLA weights for 2-step latent decode. When set, decode uses
     /// latent→norm→expand instead of single-step GEMV.
     pub fn set_mla_weights(&mut self, mla: MlaWeights) {
         self.mla = Some(mla);
+    }
+
+    /// Quantize BF16 projections `(weight, n, k)` to MXFP8 twins that
+    /// `mla_prefill_dense` (and `glm_head_gemm` for the per-head W_uk / W_uv)
+    /// use for verify-sized row counts. Runs at load, before KV sizing, so the
+    /// twins come out of the KV budget. q_b and o, which only
+    /// `mla_prefill_dense`'s plain tiers read, take the chunk-tiled layout
+    /// under `ATLAS_GLM_MXFP8_TILED=1`.
+    pub fn install_mla_mxfp8(
+        &mut self,
+        gpu: &dyn spark_runtime::gpu::GpuBackend,
+        weights: &[(DevicePtr, usize, usize)],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.mxfp8_quantize_k.0 != 0 && self.mxfp8_gemv_k.iter().all(|k| k.0 != 0),
+            "GLM MXFP8 twins requested but the mxfp8_gemv kernels are missing"
+        );
+        let stream = gpu.default_stream();
+        for &(weight, n, k) in weights {
+            let data = gpu.alloc(n * k)?;
+            let scales = gpu.alloc(n * k / crate::layers::ops::MXFP8_BLOCK)?;
+            crate::layers::ops::mxfp8_quantize(
+                gpu,
+                self.mxfp8_quantize_k,
+                weight,
+                data,
+                scales,
+                n,
+                k,
+                stream,
+            )?;
+            let mut mx = crate::weight_map::Mxfp8Weight {
+                data,
+                scales,
+                tiled: false,
+            };
+            if self
+                .mla
+                .as_ref()
+                .is_some_and(|mla| [mla.wq_b.weight, mla.wo.weight].contains(&weight))
+            {
+                crate::layers::ops::mxfp8_tile_if_requested(gpu, &mut mx, n, k, stream)?;
+            }
+            self.mla_mx.push((weight, [n, k], mx));
+        }
+        gpu.synchronize(stream)
+    }
+
+    /// Quantize BF16 projections `(weight, n, k)` to NVFP4 twins for up to 32
+    /// rows (`ATLAS_GLM_MLA_NVFP4=1`). Lossy relative to the BF16 checkpoint
+    /// weights; runs at load, before KV sizing.
+    pub fn install_mla_nvfp4(
+        &mut self,
+        gpu: &dyn spark_runtime::gpu::GpuBackend,
+        weights: &[(DevicePtr, usize, usize)],
+    ) -> anyhow::Result<()> {
+        let absmax = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
+        let quant = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
+        let stream = gpu.default_stream();
+        for &(weight, n, k) in weights {
+            let q4 = crate::weight_map::quantize_to_nvfp4(
+                &crate::weight_map::DenseWeight { weight },
+                n,
+                k,
+                gpu,
+                absmax,
+                quant,
+                stream,
+            )?;
+            self.mla_q4.push((weight, q4));
+        }
+        gpu.synchronize(stream)
     }
 
     /// Set per-block Manifold-Constrained Hyper-Connection weights
@@ -47,6 +123,12 @@ impl Qwen3AttentionLayer {
     /// `hc_pre`/`hc_post` against the model-level `hc_streams` buffer.
     pub fn set_hc_weights(&mut self, hc: HcWeights) {
         self.hc = Some(hc);
+    }
+
+    /// Set the absolute block index when attention layers are sparse in the
+    /// model schedule. KV-cache indexing remains `attn_layer_idx`.
+    pub fn set_block_idx(&mut self, block_idx: usize) {
+        self.block_idx = block_idx;
     }
 
     /// Attach the QSA indexer (Qwen3.8-Flash-Next full-attention layers).
@@ -254,40 +336,6 @@ impl Qwen3AttentionLayer {
     pub(crate) fn effective_attn_scale(&self, head_dim: u32) -> f32 {
         self.attn_scale_override
             .unwrap_or_else(|| 1.0f32 / (head_dim as f32).sqrt())
-    }
-}
-
-impl Qwen3AttentionLayer {
-    /// Whether this layer's single-sequence decode may be captured into a CUDA
-    /// graph. An indexer vetoes by default: its ingest counter is host state,
-    /// its launch parameters depend on the position, the default top-k arm
-    /// sorts on the host, and a graph captured on the dense path would replay
-    /// wrong attention once selection activates. ATLAS_EXL3_PLE_GRAPHS=1 lifts
-    /// the veto only when the indexer's capacity keeps every position inside
-    /// the inert bound (selection can never activate; --max-seq-len <= 2051 on
-    /// this card): the decode ingest then runs as one kernel that reads the
-    /// position from device memory (`QsaIndexer::decode_ingest_graph`).
-    pub(super) fn qsa_decode_graph_ok(&self) -> bool {
-        match self.qsa.as_ref() {
-            None => true,
-            Some(q) => {
-                crate::layers::ple::ple_graphs_enabled()
-                    && (q.decode_graph_safe() || q.dev_enabled())
-            }
-        }
-    }
-
-    /// A replayed step: advance the indexer's host counters exactly as the
-    /// captured `decode_ingest_graph` step did.
-    pub(super) fn qsa_graph_replayed(&self, state: &mut dyn crate::layer::LayerState, pos: usize) {
-        if let Some(qsa) = self.qsa.as_ref()
-            && let Some(attn) = state
-                .as_any_mut()
-                .downcast_mut::<crate::layer::AttnLayerState>()
-            && let Some(st) = attn.qsa.as_mut()
-        {
-            qsa.note_graph_step(st, pos);
-        }
     }
 }
 

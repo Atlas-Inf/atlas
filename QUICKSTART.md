@@ -1,6 +1,6 @@
 # Atlas Spark — Quickstart Guide
 
-Run state-of-the-art language models on a single NVIDIA DGX Spark (GB10).
+Run language models on NVIDIA DGX Spark (GB10), with two-node recipes for larger models.
 
 **Docker image:** `azeezish/atlas-gb10:latest`
 **API:** OpenAI-compatible (`/v1/chat/completions`, `/v1/models`)
@@ -378,6 +378,22 @@ sudo docker run -d \
 
 > Start both nodes. They handshake via NCCL on `master-addr:master-port`.
 > The API is served from Node 0 only (`http://<HEAD_IP>:8888`).
+
+---
+
+## 8. GLM-5.3-Flash NVFP4 — TP2/EP2 (two DGX Sparks)
+
+Use the original `nvidia/GLM-5.3-Flash-NVFP4` checkpoint with **FP8 g128 KV** and
+native Atlas KDA/sparse prefill. This model uses overlapping TP2/EP2 groups across
+exactly two Sparks. Build its image from this checkout; the generic published
+image above is not the artifact qualified by this integration.
+
+The [GLM deployment recipe](docker/gb10/glm-5.3-flash/nvfp4/README.md) includes
+the Docker build, common environment, both rank commands and a smoke request.
+It starts at **32,768 tokens per session and 32,768 shared aggregate tokens**
+across four slots. DFlash2 is an explicit option with separately supplied draft
+weights. Larger allocations require separate validation; the model's 1M
+position limit is not a guaranteed runtime capacity.
 
 ---
 

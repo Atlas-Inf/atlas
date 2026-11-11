@@ -25,21 +25,33 @@ impl Qwen3AttentionLayer {
         stream: u64,
     ) -> Result<DevicePtr> {
         let o_out = ctx.buffers.norm_output();
-        // Keep-packed Q2_0 (Tier-1c): transient-dequant o_proj then dense GEMM.
+        if self.oproj_reduce_scatter_piped(attn_out, o_out, [n, h, nq * hd], ctx, stream)? {
+            return Ok(o_out);
+        }
+        // ATLAS_QWEN4EXP_PREFILL_BF16_PROJ: BF16 at decode's weight values,
+        // on the pass's row-invariant k-chain.
+        if crate::layers::ops::qwen4exp_rowinv::active()
+            && let Some(w) = self.rowinv_bf16[3]
+        {
+            ops::bf16_gemm(attn_out, w.0, o_out, n, h, nq * hd, stream)?;
+            return Ok(o_out);
+        }
+        // Native MXFP8 / keep-packed Q2_0: not GEMM-ready as stored.
         if let Some(r) =
-            self.try_q2_prefill(ctx, self.o_weight.as_ref(), attn_out, o_out, n, stream)
+            self.try_unpacked_prefill(ctx, self.o_weight.as_ref(), attn_out, o_out, n, stream)
         {
             r?;
             return Ok(o_out);
         }
         let force_w8a8 = ctx.dispatch.fp8_blockscaled_prefill;
         // Native FP4 o_proj: quantize attn_out to NVFP4 and consume o_proj in
-        // its original NVFP4 form. OPT-IN ONLY -- see the QKV path's comment.
+        // its original NVFP4 form (none on a native-FP8 layer). OPT-IN ONLY.
         let w4a4 = n >= 256
+            && !self.attn.o_proj.is_null()
             && self.w4a4_gemm_k.0 != 0
             && self.quantize_nvfp4_k.0 != 0
             && ctx.buffers.fp8_act_bytes() >= (n as usize) * (nq as usize) * (hd as usize)
-            && std::env::var("ATLAS_ATTN_W4A4").is_ok();
+            && super::attn_w4a4_requested();
         if w4a4 {
             let kd = nq * hd;
             let a4 = ctx.buffers.fp8_act();
@@ -221,7 +233,8 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else if let Some(fp8) = self.o_fp8 {
-            if n > 128 {
+            // ATLAS_QWEN4EXP_PREFILL_ROWINV: one arm at every width.
+            if n > 128 || crate::layers::ops::qwen4exp_rowinv::active() {
                 ops::fp8_gemm_n128_m128(
                     ctx.gpu,
                     self.fp8_gemm_t_m128_k,
@@ -247,10 +260,15 @@ impl Qwen3AttentionLayer {
                 )?;
             }
         } else if let Some(ref nvfp4_t) = self.o_nvfp4_t {
-            if n > 128 {
+            if self.nvfp4_proj_m128(nvfp4_t, [n, h, nq * hd], ctx.levers) {
                 self.w4a16_gemm_m128_dispatch(
                     ctx.gpu,
-                    ctx.dispatch,
+                    (ctx.dispatch, ctx.levers),
+                    crate::layers::ops::LowpArgs {
+                        group: crate::layers::ops::LowpMix::ATTN_O,
+                        codes: ctx.buffers.ffn_act_a(),
+                        scales: ctx.buffers.ffn_act_scale(),
+                    },
                     attn_out,
                     nvfp4_t,
                     o_out,
@@ -402,5 +420,81 @@ impl Qwen3AttentionLayer {
             )?;
         }
         Ok(o_out)
+    }
+}
+
+impl Qwen3AttentionLayer {
+    /// The o_proj by row ranges with the SP reduce-scatter pipelined behind
+    /// it (`ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE`), when the caller offered its
+    /// reduce-scatter (`qwen4exp_sp_pipe::RsOffer`). Only on the `o_fp8` arm
+    /// (`fp8_gemm_t_m128`, row independent at any row ranges:
+    /// `fp8_gemm_m128_rows_are_independent`) and only when the dispatch
+    /// above would take it, so every byte is the unsplit o_proj + reduce-
+    /// scatter's. `Ok(false)`: not taken, nothing launched.
+    fn oproj_reduce_scatter_piped(
+        &self,
+        attn_out: DevicePtr,
+        o_out: DevicePtr,
+        [n, h, kd]: [u32; 3],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        use crate::layers::qwen4exp_sp_pipe as pipe;
+        let Some(sp) = crate::layers::glm_sp::current().filter(|sp| sp.total() == n as usize)
+        else {
+            return Ok(false);
+        };
+        let earlier_arms_skip = self
+            .o_weight
+            .as_ref()
+            .is_none_or(|w| w.as_packed_q2().is_none() && w.as_fp8().is_none())
+            && self.o_fp8w_t.is_none()
+            && !ctx.dispatch.cutlass_nvfp4_attn_o
+            && !super::attn_w4a4_requested();
+        // ATLAS_QWEN4EXP_PREFILL_BF16_PROJ: the BF16 o_proj, row-invariant too.
+        let rowinv = self.rowinv_bf16[3].filter(|_| crate::layers::ops::qwen4exp_rowinv::active());
+        let fp8 = self.o_fp8.filter(|_| n > 128 && earlier_arms_skip);
+        if rowinv.is_none() && fp8.is_none() {
+            return Ok(false);
+        }
+        if !pipe::rs_offered() {
+            return Ok(false);
+        }
+        let (row_in, row_out) = (kd as usize * 2, h as usize * 2);
+        let done = pipe::compute_and_reduce_scatter(
+            sp,
+            o_out,
+            h as usize,
+            ctx,
+            stream,
+            |r0, rows, s| match (rowinv, fp8) {
+                (Some(w), _) => ops::bf16_gemm(
+                    attn_out.offset(r0 * row_in),
+                    w.0,
+                    o_out.offset(r0 * row_out),
+                    rows as u32,
+                    h,
+                    kd,
+                    s,
+                ),
+                (None, Some(fp8)) => ops::fp8_gemm_n128_m128(
+                    ctx.gpu,
+                    self.fp8_gemm_t_m128_k,
+                    attn_out.offset(r0 * row_in),
+                    fp8,
+                    o_out.offset(r0 * row_out),
+                    rows as u32,
+                    h,
+                    kd,
+                    s,
+                ),
+                (None, None) => unreachable!("checked above"),
+            },
+            |_| Ok(()),
+        )?;
+        if done {
+            pipe::rs_took();
+        }
+        Ok(done)
     }
 }

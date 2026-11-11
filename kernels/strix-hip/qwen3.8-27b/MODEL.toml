@@ -153,6 +153,11 @@ enable_loop_watchdog = true
 # this comment.
 thinking_in_tools = false
 max_thinking_budget = 512
+# Effort-silent requests render the template's "medium" tier (no directive
+# sentence), the tier this target's budget was tuned with; the checkpoint
+# template's own default is xhigh. Clients and --default-chat-template-kwargs
+# still pick any tier.
+default_reasoning_effort = "medium"
 
 # default_num_drafts: 3 (K=4 verify). gb10/qwen3.8-27b leaves this unset on
 # the argument that draft acceptance is a weights property and 3.8 must earn
@@ -172,6 +177,21 @@ default_num_drafts = 3
 # on exactly the unproven path the recipe avoids. The certified MLPerf-edge
 # run and the 2026-09-14 2.55h soak both served bf16.
 default_kv_dtype = "bf16"
+# ── Tool calls: no server steering ─────────────────────────────────────────
+# Atlas's `<tool_call>` logit bias (+3.0 on every tool-armed step until the same
+# call repeats; sampling_setup.rs tool_call_bias) made this checkpoint append a
+# tool call after it had already declined in prose: on 60 BFCL live_irrelevance
+# items (DevLab run 41587487769, nvidia/Qwen3.8-27B-NVFP4) Atlas called a tool on
+# 29 where stock llama.cpp on the same weights called one on 8, e.g. "I don't
+# have access to a VirusTotal API tool ..." followed by a get_current_weather
+# call. ST-995 live_irrelevance 38.64 (Atlas) vs 89.77 (llama.cpp), normalized
+# 74.58 vs 81.79. gb10/qwen3.8-flash-next dropped the same steering in 565aa68bc.
+tool_call_steering = false
+max_inter_tool_prose = 0
+# The prompt is the checkpoint template's render and nothing else (no Atlas tool
+# prompt on top of the template's own tool block, no hints, tojson spaced as
+# transformers renders it), as on the reference server and gb10 Flash-Next.
+verbatim_prompt = true
 
 # Upstream reports model_type = "qwen3_5". The MRoPE -> "qwen3_6_moe"
 # dispatch rewrite fires only for MoE checkpoints (is_moe gate in

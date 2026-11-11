@@ -6,9 +6,9 @@
 
 use super::*;
 
-/// Widest `complete` the device kernel handles (its shared-memory flag array);
-/// wider selections take the host arm.
-pub(super) const QSA_SELECT_MAX_BLOCKS: usize = 4096;
+/// Widest `complete` the device kernel handles (`QSA_SELECT_RADIX_MAX` in
+/// qsa_indexer.cu, 65,536 tokens at ratio 4); wider selections take the host arm.
+pub(super) const QSA_SELECT_MAX_BLOCKS: usize = 16384;
 
 /// Shape of the decode selection for one query, from the position alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +129,51 @@ impl QsaIndexer {
         Ok(expand_selection(&blocks, ratio, complete * ratio, visible))
     }
 
+    /// Gather the `n_sel` tokens `sel_dev` names into the scratch and point
+    /// the identity table + seq_len at them: the selection as a paged cache.
+    /// `kv`: the layer's K pool, V pool and the sequence's block table.
+    pub(super) fn gather_selection(
+        &self,
+        st: &mut QsaSeqState,
+        n_sel: u32,
+        kv: [DevicePtr; 3],
+        block_size: u32,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<QsaSelection> {
+        let [k_pool, v_pool, block_table_dev] = kv;
+        ops::qsa_gather(
+            gpu,
+            self.k_gather_k,
+            k_pool,
+            v_pool,
+            block_table_dev,
+            self.sel_dev,
+            self.k_scratch,
+            self.v_scratch,
+            n_sel,
+            block_size,
+            self.nkv_attn,
+            self.hd_attn,
+            stream,
+        )?;
+        let pages = (n_sel as usize).div_ceil(block_size as usize);
+        if st.table_len < pages {
+            let ident: Vec<u8> = (0..pages as i32).flat_map(|v| v.to_le_bytes()).collect();
+            gpu.copy_h2d_async(&ident, self.table_dev, stream)?;
+            st.table_len = pages;
+        }
+        gpu.copy_h2d_async(&(n_sel as i32).to_le_bytes(), self.seq_len_dev, stream)?;
+        Ok(QsaSelection {
+            k_scratch: self.k_scratch,
+            v_scratch: self.v_scratch,
+            table_dev: self.table_dev,
+            seq_len_dev: self.seq_len_dev,
+            n_sel,
+            max_blocks: pages as u32,
+        })
+    }
+
     /// Parity check for the device arm: read back `sel_dev` and compare with
     /// the host reference; the first mismatch is an error (validation runs).
     pub(super) fn verify_device_selection(
@@ -165,81 +210,6 @@ impl QsaIndexer {
             );
         }
         Ok(())
-    }
-}
-
-impl QsaIndexer {
-    /// Every position this indexer can hold stays inside the inert bound, so
-    /// no decode step can ever run an ACTIVE selection (dense attention is
-    /// exact for the whole sequence). Only then is decode capturable.
-    pub fn decode_graph_safe(&self) -> bool {
-        self.max_tokens <= self.inert_bound()
-    }
-
-    /// Graph-mode decode ingest (ATLAS_EXL3_PLE_GRAPHS): the same qk
-    /// projection as `decode_select`, then ONE kernel that reads the position
-    /// from `pos_dev`, stores the raw key and pools a just-completed block with
-    /// `qsa_block_pool`'s arithmetic — no position-dependent launch parameter,
-    /// so one captured graph serves every step. Always `None` (dense is exact);
-    /// legal only when `decode_graph_safe`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn decode_ingest_graph(
-        &self,
-        st: &mut QsaSeqState,
-        normed: DevicePtr,
-        pos: usize,
-        pos_dev: DevicePtr,
-        gpu: &dyn GpuBackend,
-        stream: u64,
-    ) -> Result<Option<QsaSelection>> {
-        anyhow::ensure!(
-            self.decode_graph_safe() && !self.is_active_at(pos),
-            "QSA graph ingest at pos {pos}: capacity {} exceeds the inert bound {}",
-            self.max_tokens,
-            self.inert_bound()
-        );
-        // `pos + 1 == ingested`: the same step re-run eagerly after a failed
-        // capture attempt (the raw-key store and the pool are idempotent).
-        anyhow::ensure!(
-            pos < self.max_tokens && (pos == st.ingested || pos + 1 == st.ingested),
-            "QSA: graph decode at pos {pos} but {} tokens ingested (capacity {})",
-            st.ingested,
-            self.max_tokens
-        );
-        let hd = self.hd as usize;
-        ops::cublas_bf16_proj_dense(
-            normed,
-            self.qk_proj_w,
-            self.qk_scratch,
-            1,
-            self.qk_width() as u32,
-            self.hidden,
-            stream,
-        )
-        .context("QSA qk projection (graph decode)")?;
-        ops::qsa_decode_ingest(
-            gpu,
-            gpu.kernel("qsa_indexer", "qsa_decode_ingest")?,
-            self.qk_scratch.offset(self.n_heads as usize * hd * 2),
-            pos_dev,
-            st.raw_keys,
-            self.k_norm_w,
-            st.block_keys,
-            self.ratio,
-            self.hd,
-            self.rot,
-            self.theta,
-            self.eps,
-            stream,
-        )?;
-        self.note_graph_step(st, pos);
-        Ok(None)
-    }
-
-    /// Host counters after a graph-mode step at `pos` (captured or replayed).
-    pub fn note_graph_step(&self, st: &mut QsaSeqState, pos: usize) {
-        st.ingested = pos + 1;
-        st.pooled = st.ingested / self.ratio as usize;
     }
 }
 

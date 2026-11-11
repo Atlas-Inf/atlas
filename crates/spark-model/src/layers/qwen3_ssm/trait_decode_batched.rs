@@ -197,7 +197,17 @@ impl Qwen3SsmLayer {
         // verify — 2026-07-02 flagship gate). Mirrors the M<=4 dispatch in
         // trait_decode_multi_seq/ssm_batched.rs: one weight pass via
         // `w8a16_gemv_batch4`, per-token `w8a16_gemv` when it isn't linked.
-        if let Some(ref q2) = self.qkvz_q2 {
+        // ATLAS_QWEN4EXP_BATCH_FAST: serial decode's GEMV arithmetic per row
+        // at every row count (`exact_rows.rs`).
+        if self.exact_rows_proj(
+            super::exact_rows::GdnProj::Qkvz,
+            normed,
+            proj_dst,
+            num_tokens,
+            ctx,
+            stream,
+        )? {
+        } else if let Some(ref q2) = self.qkvz_q2 {
             // Tier-1c keep-packed Q2_0: per-token 2-bit fused-qkvz GEMV. Bonsai
             // (dense qwen35) has no MTP, so this batched path is only reached
             // under multi-token verify — a per-token loop is bit-identical to
@@ -513,30 +523,6 @@ impl Qwen3SsmLayer {
                     stream,
                 )?;
             }
-        } else if (5..=8).contains(&num_tokens)
-            && self.dense_gemv_batchm_k.0 != 0
-            && self.qkvz_nvfp4.is_none()
-            && self.qkvz_fp8.is_none()
-            && !self.ssm.in_proj_qkvz.weight.is_null()
-            && ops::exl3_dense_rows_env()
-        {
-            // K=5..8 MTP verify on a packed EXL3 in_proj_qkvz: the M-row
-            // native GEMV reads the trellis once for all rows (same arm as
-            // the 2..=4 widths above take through dense_gemv_batchm). Without
-            // it these widths fell to the 128-row tile dense_gemm at
-            // ~0.94 ms per layer.
-            ops::dense_gemv_batchm(
-                ctx.gpu,
-                self.dense_gemv_batchm_k,
-                normed,
-                &self.ssm.in_proj_qkvz,
-                proj_dst,
-                num_tokens as u32,
-                qkvz_size as u32,
-                h as u32,
-                qkvz_size as u32,
-                stream,
-            )?;
         } else if qkvz_verify_nvfp4_wins(
             num_tokens,
             self.qkvz_fp8.is_some(),
@@ -795,7 +781,20 @@ impl Qwen3SsmLayer {
         let h_bytes = self.h_slot_stride_bytes();
         let conv_bytes = self.conv_state_bytes;
 
+        // ATLAS_QWEN4EXP_BATCH_SMALL: the exact arm below, every sequence and
+        // token, as one launch (`gdn_fused_rows.rs`).
+        let fused_rows = self.gdn_verify_fused_rows(
+            &mut gdn,
+            num_tokens,
+            deinterleaved,
+            qkvz_size,
+            gates_buf,
+            conv_out_buf,
+            ctx,
+            stream,
+        )?;
         match gdn {
+            _ if fused_rows => {}
             GdnStates::Single(state) => {
                 let ssm_state = state
                     .as_any_mut()
@@ -807,8 +806,10 @@ impl Qwen3SsmLayer {
                 // out-of-bounds panic instead of an actionable error (see #bugs
                 // m0t0chan EP=2 2026-04-05). Most-common cause: EP=2 worker started
                 // without `--speculative --mtp-quantization` to mirror the head.
-                if ssm_state.h_state_intermediates.len() + 1 < num_tokens
-                    || ssm_state.conv_state_intermediates.len() < num_tokens
+                // A deferred step (`gdn_commit_pending`) stores no snapshots.
+                if !ssm_state.gdn_commit_pending
+                    && (ssm_state.h_state_intermediates.len() + 1 < num_tokens
+                        || ssm_state.conv_state_intermediates.len() < num_tokens)
                 {
                     anyhow::bail!(
                         "SSM MTP intermediate buffers not allocated (need K-1 h + K conv; \
@@ -937,8 +938,9 @@ impl Qwen3SsmLayer {
                                 .as_any_mut()
                                 .downcast_mut::<SsmLayerState>()
                                 .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState"))?;
-                            if ssm_state.h_state_intermediates.len() + 1 < kk
-                                || ssm_state.conv_state_intermediates.len() < kk
+                            if !ssm_state.gdn_commit_pending
+                                && (ssm_state.h_state_intermediates.len() + 1 < kk
+                                    || ssm_state.conv_state_intermediates.len() < kk)
                             {
                                 anyhow::bail!(
                                     "SSM MTP intermediate buffers not allocated for batched \
@@ -984,7 +986,7 @@ impl Qwen3SsmLayer {
         // ── 8. Gated RMS norm per token (Z gate at [Q|K|V] offset) ──
         let normed_out_buf = conv_out_buf;
         let z_offset = key_dim * 2 + value_dim; // == conv_dim
-        if super::verify_exact_enabled() {
+        if super::verify_exact_for(ctx.levers) {
             // Issue #435 exact arm (phase 5-7 above): the norm is already
             // applied inside the per-token chain — the SAME fused/unfused arm
             // sequential decode uses — and the normed rows are already in
@@ -1058,7 +1060,20 @@ impl Qwen3SsmLayer {
 
         // ── 9. Output projection → [K, H] ──
         let out_proj_buf = ctx.buffers.moe_output(); // [K, H] BF16
-        if let Some(ref dense_out) = self.out_proj_dense {
+        // A decode-only FP8 copy (`ATLAS_QWEN4EXP_FP8_GDN=1`) wins over the
+        // BF16 one it was quantized from — kept for prefill — so verify reads
+        // the weights single-token decode reads, at half the bytes.
+        if self.exact_rows_proj(
+            super::exact_rows::GdnProj::Out,
+            normed_out_buf,
+            out_proj_buf,
+            num_tokens,
+            ctx,
+            stream,
+        )? {
+        } else if let Some(ref dense_out) = self.out_proj_dense
+            && !self.fp8w_decode_only
+        {
             if num_tokens <= 8
                 && ctx.levers.gdn_fp8_decode
                 && self.dense_gemv_fp8w_batchm_k.0 != 0
@@ -1448,7 +1463,7 @@ impl Qwen3SsmLayer {
                 (2 * h) as u32,
                 stream,
             )?;
-        } else if (4..=8).contains(&num_tokens)
+        } else if ((4..=8).contains(&num_tokens) || ctx.levers.dense_exact_rows(num_tokens))
             && self
                 .ffn
                 .try_forward_km(normed2_base, num_tokens as u32, ctx, stream)
@@ -1456,8 +1471,9 @@ impl Qwen3SsmLayer {
                 .unwrap_or(false)
         {
             // K=4..8 verify FFN via batched GEMV (batch4 M<=4, batch8
-            // M=5..8): one weight read per projection for all rows at
-            // near-peak stream bandwidth. nsys (2026-07-18): the
+            // M=5..8; under ATLAS_EXACT_VERIFY beside a DFlash drafter the
+            // K=γ rows to 16 too, row-exact): one weight read per projection
+            // for all rows at near-peak stream bandwidth. nsys (2026-07-18): the
             // forward_prefill MMQ arm below cost 54.8 ms/verify-step across
             // the 64-layer dense FFN stack at M=4 vs the ~31 ms
             // weight-traffic floor this path hits. Falls through to

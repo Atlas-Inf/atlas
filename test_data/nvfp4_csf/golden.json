@@ -1,0 +1,202 @@
+{
+ "source": "https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local/tree/b9ce18a6887e18c089fdea8509a33e63429a3300",
+ "reference": "vLLM PR 60646 csf_scales.decode_nvfp4_csf_scale (Apache-2.0)",
+ "codec": "byte-window4-fixed-stream-u24-exceptions/1",
+ "cases": [
+  {
+   "tag": "l0_e0_gate",
+   "tensor": "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale",
+   "fixed_shape": [
+    40,
+    1296
+   ],
+   "exceptions_shape": [
+    1045
+   ],
+   "decoded_shape": [
+    640,
+    160
+   ],
+   "decoded_sha256": "425623551a68b087cc6a8827d42e43006ceaca909b874220491ec4f55db74c96",
+   "head": [
+    109,
+    106,
+    102,
+    103,
+    109,
+    103,
+    104,
+    107,
+    110,
+    103,
+    111,
+    108,
+    105,
+    106,
+    104,
+    104,
+    108,
+    110,
+    107,
+    105,
+    105,
+    106,
+    102,
+    108,
+    105,
+    106,
+    108,
+    107,
+    105,
+    105,
+    110,
+    102
+   ],
+   "exception_samples": [
+    [
+     74,
+     96
+    ],
+    [
+     199,
+     96
+    ],
+    [
+     240,
+     113
+    ]
+   ],
+   "exceptions": 1045
+  },
+  {
+   "tag": "l0_e0_down",
+   "tensor": "model.language_model.layers.0.mlp.experts.0.down_proj.weight_scale",
+   "fixed_shape": [
+    160,
+    336
+   ],
+   "exceptions_shape": [
+    226
+   ],
+   "decoded_shape": [
+    2560,
+    40
+   ],
+   "decoded_sha256": "e7a16aa0efb0bebaf528eb5053d011875e12ed7b06e183ecebd07ff14ea99220",
+   "head": [
+    106,
+    106,
+    110,
+    105,
+    103,
+    103,
+    107,
+    102,
+    105,
+    104,
+    105,
+    101,
+    105,
+    101,
+    105,
+    103,
+    105,
+    105,
+    108,
+    110,
+    100,
+    105,
+    102,
+    107,
+    105,
+    104,
+    106,
+    110,
+    104,
+    104,
+    108,
+    107
+   ],
+   "exception_samples": [
+    [
+     228,
+     111
+    ],
+    [
+     236,
+     114
+    ],
+    [
+     341,
+     112
+    ]
+   ],
+   "exceptions": 226
+  },
+  {
+   "tag": "l47_e511_up",
+   "tensor": "model.language_model.layers.47.mlp.experts.511.up_proj.weight_scale",
+   "fixed_shape": [
+    40,
+    1296
+   ],
+   "exceptions_shape": [
+    382
+   ],
+   "decoded_shape": [
+    640,
+    160
+   ],
+   "decoded_sha256": "758b79f611ce6359359c0991ab5f93b5d68721f2fc98092d421cbb196d8f88f7",
+   "head": [
+    113,
+    106,
+    105,
+    108,
+    104,
+    112,
+    98,
+    108,
+    102,
+    107,
+    100,
+    102,
+    100,
+    105,
+    104,
+    102,
+    99,
+    106,
+    102,
+    103,
+    105,
+    104,
+    102,
+    105,
+    113,
+    103,
+    100,
+    102,
+    102,
+    105,
+    107,
+    109
+   ],
+   "exception_samples": [
+    [
+     1259,
+     113
+    ],
+    [
+     1623,
+     96
+    ],
+    [
+     1814,
+     111
+    ]
+   ],
+   "exceptions": 382
+  }
+ ]
+}

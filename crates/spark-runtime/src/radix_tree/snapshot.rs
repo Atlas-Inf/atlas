@@ -45,6 +45,9 @@ pub(super) struct SnapshotEntry {
     /// but leased alongside the tail. At most one per session (swept together
     /// with the tail by `insert_tail`).
     pub(super) is_tail_sibling: bool,
+    /// Conversation-chain bookkeeping for chain-aware eviction
+    /// (`ATLAS_GLM_PC_EVICT`); left at its default when the flag is off.
+    pub(super) chain: super::snapshot_chain::ChainMeta,
 }
 
 /// Where a matched snapshot's state currently lives (Phase 1b).
@@ -97,6 +100,9 @@ pub(super) struct SsmSnapshotIndex {
     /// `recompute_tokens_on_hit` after tail-protect + a large pool is exactly
     /// what Phase 1 (spill-not-drop) converts from recompute → fault-in.
     pub(super) stats: SnapshotStats,
+    /// Log-spaced restore points kept behind each live conversation's
+    /// newest save (`snapshot_ladder`).
+    pub(super) ladder: super::snapshot_ladder::Ladder,
 }
 
 /// Tail-lease kill switch. Default ON; opt out with
@@ -148,12 +154,18 @@ fn tail_lease_ttl() -> u32 {
 /// clamped to [0, 8] so a runaway env value cannot make depth
 /// recency-insensitive (a depth-pinned analog of the 07-10 hit-pinning).
 /// Default flip requires its own measured A/B: ATLAS_SNAP_EVICT_ALPHA.
-fn snap_evict_alpha() -> f64 {
+pub fn snap_evict_alpha() -> f64 {
     std::env::var("ATLAS_SNAP_EVICT_ALPHA")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .map(|a| a.clamp(0.0, 8.0))
         .unwrap_or(0.0)
+}
+
+/// `ATLAS_SNAP_EVICT_LEGACY` (presence): the old per-entry victim choice
+/// instead of the session-aware one.
+pub fn snap_evict_legacy() -> bool {
+    std::env::var_os("ATLAS_SNAP_EVICT_LEGACY").is_some()
 }
 
 impl SsmSnapshotIndex {
@@ -164,6 +176,7 @@ impl SsmSnapshotIndex {
             last_lookup_session: 0,
             evictions_since_lookup: 0,
             stats: SnapshotStats::default(),
+            ladder: Default::default(),
         }
     }
 
@@ -247,16 +260,6 @@ impl SsmSnapshotIndex {
                 self.stats.recompute_tokens_on_miss += matched_tokens as u64;
             }
         }
-        if std::env::var("ATLAS_SNAP_LOOKUP_DBG").is_ok() {
-            let mut cands: Vec<usize> = self.entries.iter().map(|e| e.token_count).collect();
-            cands.sort_unstable();
-            tracing::info!(
-                "snap-lookup: matched={matched_tokens} selected={:?} n_entries={} token_counts={:?}",
-                best.map(|b| b.1),
-                self.entries.len(),
-                cands,
-            );
-        }
         self.log_stats_if_due();
         best
     }
@@ -313,10 +316,17 @@ impl SsmSnapshotIndex {
         let escore = |e: &SnapshotEntry| e.last_access;
 
         // SESSION-AWARE eviction (default ON; ATLAS_SNAP_EVICT_LEGACY=1 → old per-entry).
-        if std::env::var_os("ATLAS_SNAP_EVICT_LEGACY").is_none() {
-            let tail_protect = self.tail_lease_active();
+        // ATLAS_GLM_PC_EVICT=1 replaces the victim choice with the chain-aware
+        // one and takes precedence over ATLAS_SNAP_EVICT_LEGACY and the tail
+        // lease (`snapshot_chain`: a chain frontier is protected anyway).
+        let chain = super::snapshot_chain::glm_pc_evict_enabled();
+        if chain || !snap_evict_legacy() {
             // Skip tiered entries (no HBM slot to free).
-            let victim_idx = self.session_aware_victim(tail_protect, true)?;
+            let victim_idx = if chain {
+                self.chain_victim(true)?
+            } else {
+                self.session_aware_victim(self.tail_lease_active(), true)?
+            };
             let entry = self.entries.swap_remove(victim_idx);
             self.stats.evictions += 1;
             self.evictions_since_lookup = self.evictions_since_lookup.saturating_add(1);
@@ -385,14 +395,24 @@ impl SsmSnapshotIndex {
                 && e.session_hash != 0
                 && e.session_hash == self.last_lookup_session
         };
-        // The lease bites only while an UNLEASED eligible candidate exists, so
-        // a pool of only-leased entries (or a single entry) still yields a
-        // victim — no deadlock, and `save`/reclaim always make progress.
-        let n_unleased = self
+        // Protection class, lowest evicted first: ordinary entries, restore
+        // ladder rungs (`snapshot_ladder`), the leased tail. A class is
+        // spared only while a lower one has an eligible entry, so a pool of
+        // only-protected entries (or a single entry) still yields a victim —
+        // no deadlock, and `save`/reclaim always make progress.
+        let class = |e: &SnapshotEntry| {
+            if leased(e) {
+                2
+            } else {
+                u8::from(self.ladder.holds(e.prefix_hash))
+            }
+        };
+        let victim_class = self
             .entries
             .iter()
-            .filter(|e| eligible(e) && !leased(e))
-            .count();
+            .filter(|e| eligible(e))
+            .map(class)
+            .min()?;
         // Within-session rank: S(e) = norm(recency) + α·norm(depth) — Marconi
         // Eq 2 (see snap_evict_alpha). At the default α=0 this is exactly
         // pure-LRU ordering. Min-max normalization over the ELIGIBLE pool per
@@ -425,8 +445,8 @@ impl SsmSnapshotIndex {
             if !eligible(e) {
                 continue;
             }
-            if leased(e) && n_unleased >= 1 {
-                continue; // never evict the live session's restore points
+            if class(e) > victim_class {
+                continue; // a less valuable restore point is still resident
             }
             let sf = *session_fresh.get(&e.session_hash).unwrap_or(&0);
             let s = score(e);

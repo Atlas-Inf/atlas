@@ -1,0 +1,22 @@
+SparkGLM FP32-recurrence FlashKDA prefill (ATLAS_KDA_FLASH_LIBRARY)
+
+flashkda/: MoonshotAI/FlashKDA device kernels and launcher.
+Copyright (c) 2026 MoonshotAI. MIT license; see flashkda/LICENSE.
+Upstream: https://github.com/MoonshotAI/FlashKDA
+Revision: 1ce47ea3bb22c84eb9cc665028399cf35e8ffb0b
+Patched, in order, with SparkGLM 0.2.0's install/flash_kda/
+flash_kda_sm121_slots.patch, flash_kda_tma_swizzle.patch and
+flash_kda_fp32_recurrence.patch (AGPL-3.0-only modifications; Jason
+McCartney / Enntity). The five files are the patched tree's files, byte for
+byte; provenance.json pins every hash.
+
+bridge.cu: SparkGLM 0.2.0 install/flash_kda/atlas_flash_kda_bridge.cu,
+verbatim (AGPL-3.0-only AND MIT).
+runtime_bridge.cu, adapter.cuh: Enntity/atlas c87f2790
+research/flash-kda-prefill/, verbatim (AGPL-3.0-only).
+kernels.cu: the Atlas translation unit that compiles flashkda/ and bridge.cu
+inside a namespace, beside Atlas's own KDA operator (../glm_kda/).
+
+SparkGLM built these as libatlas_glm53_flash_kda.so and
+libatlas_mango_flash.so and dlopened them; Atlas links them statically with
+the same compiler flags. No external library is loaded.

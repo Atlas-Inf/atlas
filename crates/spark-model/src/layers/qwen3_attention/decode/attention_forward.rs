@@ -96,7 +96,23 @@ impl Qwen3AttentionLayer {
 
         if self.gated {
             // Q+Gate projection with inline deinterleave (output is [Q_all | Gate_all])
-            if let Some(q2) = self.q_weight.as_ref().and_then(|w| w.as_packed_q2()) {
+            if let Some(r) =
+                self.try_mx8(ctx, self.q_weight.as_ref(), normed, q_out, 1, true, stream)
+            {
+                // Native MXFP8 (FP4-Local): raw interleaved [Q|gate], then split.
+                r?;
+                self.apply_q_lora(ctx, normed, q_out, stream)?;
+                ops::deinterleave_qg(
+                    ctx.gpu,
+                    self.deinterleave_qg_k,
+                    q_out,
+                    1,
+                    nq,
+                    hd,
+                    nq * hd * 2,
+                    stream,
+                )?;
+            } else if let Some(q2) = self.q_weight.as_ref().and_then(|w| w.as_packed_q2()) {
                 // Keep-packed Q2_0 (Tier-1c): 2-bit GEMV → gated [Q|Gate], then
                 // the same deinterleave the dense fallback uses.
                 ops::q2_0_gemv_vec(ctx.gpu, self.q2_0_gemv_k, normed, q2, q_out, stream)?;
@@ -201,7 +217,11 @@ impl Qwen3AttentionLayer {
             }
         } else {
             // Ungated: Q projection only (no gate)
-            if let Some(q2) = self.q_weight.as_ref().and_then(|w| w.as_packed_q2()) {
+            if let Some(r) =
+                self.try_mx8(ctx, self.q_weight.as_ref(), normed, q_out, 1, true, stream)
+            {
+                r?;
+            } else if let Some(q2) = self.q_weight.as_ref().and_then(|w| w.as_packed_q2()) {
                 ops::q2_0_gemv_vec(ctx.gpu, self.q2_0_gemv_k, normed, q2, q_out, stream)?;
             } else if let Some(fp8) = self.q_weight.as_ref().and_then(|w| w.as_fp8()) {
                 ops::w8a16_gemv(
@@ -274,7 +294,8 @@ impl Qwen3AttentionLayer {
         let k_out = q_out.offset(q_proj_bytes);
         let v_out = k_out.offset((nkv * hd) as usize * 2);
 
-        self.attention_forward_kv(normed, k_out, v_out, nkv, hd, h, ctx, stream)?;
+        let v_in = self.value_residual_input(ctx.gpu, normed, 1, h as usize, stream)?;
+        self.attention_forward_kv(normed, v_in, k_out, v_out, nkv, hd, h, ctx, stream)?;
 
         // ── LoRA deltas on K/V (v0; Q excluded — gated [Q|gate] interleave).
         // MUST run BEFORE the q/k RMS-norm, RoPE, and write_kv_cache below:
@@ -447,20 +468,19 @@ impl Qwen3AttentionLayer {
         } else if self.rope_disabled {
             // Nemotron-H: no RoPE in attention (position lives in Mamba).
         } else if !self.yarn_inv_freq.is_null() {
-            ops::rope_yarn_scaled(
+            self.apply_scaled_rope(
                 ctx.gpu,
-                self.rope_yarn_scaled_k,
                 q_out,
                 k_out,
                 meta.positions,
+                meta.positions_h,
+                meta.positions_w,
                 1,
                 nq,
                 nkv,
                 hd,
                 self.rotary_dim_override
                     .unwrap_or(ctx.config.rotary_dim() as u32),
-                self.yarn_inv_freq,
-                self.yarn_attention_factor,
                 stream,
             )?;
         } else if self.rope_proportional && self.rope_proportional_k.0 != 0 {
@@ -605,7 +625,6 @@ impl Qwen3AttentionLayer {
         // scratch — which, through an identity block table, IS a valid paged
         // cache for the standard decode attention below. Runs AFTER
         // write_kv_cache so the current token is gatherable.
-        let mut qsa_dev_done = false;
         let qsa_sel = if let Some(ref qsa) = self.qsa {
             anyhow::ensure!(
                 matches!(self.kv_dtype.kv_pair().0, KvCacheDtype::Bf16)
@@ -623,41 +642,18 @@ impl Qwen3AttentionLayer {
             // sits at position `seq_len` — verified live: a 35-token
             // prompt's first decode arrives with seq_len=35 and 35 raw
             // keys already ingested by prefill.
-            let qsa_st =
-                crate::layers::qwen3_attention::helpers::qsa_seq_state(qsa, state, ctx.gpu)?;
-            if qsa.dev_enabled() && !use_orchestrator {
-                // Device arm: ingest + select + attend, straight into attn_out.
-                let a = crate::layers::qsa::QsaDevAttn {
-                    q: q_out,
-                    q_stride: nq * hd,
-                    out: attn_out,
-                    k_pool: kv_cache.k_pool_ptr(self.attn_layer_idx),
-                    v_pool: kv_cache.v_pool_ptr(self.attn_layer_idx),
-                    block_table: meta.block_table,
-                    max_blocks_per_seq: meta.max_blocks_per_seq,
-                    nq,
-                    nkv,
-                    block_size: bs as u32,
-                    inv_sqrt_d,
-                };
-                let hb = h as usize * 2;
-                qsa.dev_decode_rows(
-                    qsa_st,
-                    normed,
-                    hb,
-                    seq_len,
-                    1,
-                    meta.positions,
-                    &a,
-                    ctx.gpu,
-                    stream,
-                )?;
-                qsa_dev_done = true;
+            if crate::layers::qsa::staged_ingest() {
+                // Inside a staged run (`qsa_staged.rs`, inert steps only):
+                // the projection here, the rest of the ingest after the run.
+                anyhow::ensure!(
+                    !qsa.is_active_at(seq_len),
+                    "QSA staged ingest at active pos {seq_len}"
+                );
+                qsa.stage_row(normed, 0, ctx.gpu, stream)?;
                 None
-            } else if ctx.graph_capture && self.qsa_decode_graph_ok() {
-                // ATLAS_EXL3_PLE_GRAPHS: position read on device, always dense.
-                qsa.decode_ingest_graph(qsa_st, normed, seq_len, meta.positions, ctx.gpu, stream)?
             } else {
+                let qsa_st =
+                    crate::layers::qwen3_attention::helpers::qsa_seq_state(qsa, state, ctx.gpu)?;
                 qsa.decode_select(
                     qsa_st,
                     normed,
@@ -728,7 +724,7 @@ impl Qwen3AttentionLayer {
                 0,
                 stream,
             )?;
-        } else if !qsa_dev_done {
+        } else {
             self.run_paged_decode(
                 ctx.gpu,
                 q_out,
@@ -745,7 +741,7 @@ impl Qwen3AttentionLayer {
                 inv_sqrt_d,
                 nq * hd,
                 ctx.buffers.splitk_workspace(),
-                ctx.levers.max_decode_seqs,
+                ctx.levers.attn_split_ref_seqs(),
                 stream,
             )?;
         }

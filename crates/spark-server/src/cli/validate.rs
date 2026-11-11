@@ -48,6 +48,7 @@ impl Violation {
 /// error string listing EVERY violation (so the operator fixes them in one
 /// pass), or `Ok(())` when the invocation is self-consistent.
 pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
+    args.tool_guard.policy()?;
     let mut v: Vec<Violation> = Vec::new();
 
     // ── Enumerated-value typos (caught here so a typo fails fast, before the
@@ -133,15 +134,11 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
     // `--ssm-h-dtype f16` by SILENTLY ignoring an explicit `--exact-verify`
     // would ship the very divergence the operator just opted out of — the
     // exact class of combination this validator exists to refuse.
-    if args.exact_verify == Some(true) && h_f16 {
-        v.push(Violation::new(
-            "--exact-verify together with --ssm-h-dtype f16",
-            "the exact MTP-verify chain (issue #435) runs FP32-reader kernels and must \
-             never read the FP16 h-state pool, so with f16 the exact request would be \
-             silently dropped and spec-on output would NOT equal spec-off",
-            "drop --ssm-h-dtype f16 (f32 is the default), or drop --exact-verify",
-        ));
-    }
+    v.extend(exact_verify_h_f16(
+        args.exact_verify,
+        spark_model::model::exact_verify::requested(),
+        h_f16,
+    ));
     check_enum(
         &mut v,
         "--mtp-quantization",
@@ -251,6 +248,45 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
         ));
     }
 
+    // ── Batch width must be a padding rung above 32. ──
+    // A decode batch of n rows runs padded to the next rung (…32, 48, 64, 96,
+    // 128; `spark_runtime::buffers::DECODE_BATCH_RUNGS`), but the SSM state
+    // pool, the MTP pools and other per-row buffers are sized to
+    // `--max-batch-size` itself. At a non-rung width the padding rows index
+    // past them: GB10, Qwen3.6-35B, `--max-batch-size 36` → CUDA 700 on the
+    // first batch-48 step for n=35 (reiner 691, 2026-10-04). Refuse instead.
+    if args.max_batch_size > 32
+        && !spark_runtime::buffers::DECODE_BATCH_RUNGS.contains(&args.max_batch_size)
+    {
+        let up = spark_runtime::buffers::padded_batch_rung(args.max_batch_size);
+        v.push(Violation::new(
+            format!(
+                "--max-batch-size {} is not a decode padding rung.",
+                args.max_batch_size
+            ),
+            "above 32 a decode batch runs padded to the next rung (48, 64, 96, 128), and \
+             per-row buffers sized to the requested width are overrun by the padding rows.",
+            format!("use --max-batch-size 32 or {up} (any value up to 32 is fine)."),
+        ));
+    }
+
+    // ── Reference mode locks thinking to the client's request. ──
+    if args.reference_mode && args.disable_thinking {
+        v.push(Violation::new(
+            "--reference-mode is set together with --disable-thinking.",
+            "reference mode serves the client's thinking flags unchanged; \
+             --disable-thinking forces reasoning off for every request.",
+            "drop --disable-thinking (the client decides thinking in reference mode).",
+        ));
+    }
+    if args.reference_mode && args.max_thinking_budget.is_some() {
+        v.push(Violation::new(
+            "--reference-mode is set together with --max-thinking-budget.",
+            "reference mode leaves the client's max_tokens as the only cap on reasoning.",
+            "drop --max-thinking-budget.",
+        ));
+    }
+
     // ── Distributed topology sanity. ──
     if args.rank >= args.world_size {
         v.push(Violation::new(
@@ -355,6 +391,34 @@ fn format_violations(v: &[Violation]) -> String {
         ));
     }
     out
+}
+
+/// The exact-verify requests beside an FP16 h-state: `--exact-verify` (the
+/// GDN chain) and `ATLAS_EXACT_VERIFY=1` (the dense qwen3_5 verify, which
+/// runs that chain). Pure: the caller reads the environment.
+fn exact_verify_h_f16(flag: Option<bool>, env_lever: bool, h_f16: bool) -> Vec<Violation> {
+    let mut v = Vec::new();
+    if !h_f16 {
+        return v;
+    }
+    let why = "the exact MTP-verify chain (issue #435) runs FP32-reader kernels and must \
+               never read the FP16 h-state pool, so with f16 the exact request would be \
+               silently dropped and spec-on output would NOT equal spec-off";
+    if flag == Some(true) {
+        v.push(Violation::new(
+            "--exact-verify together with --ssm-h-dtype f16",
+            why,
+            "drop --ssm-h-dtype f16 (f32 is the default), or drop --exact-verify",
+        ));
+    }
+    if env_lever {
+        v.push(Violation::new(
+            "ATLAS_EXACT_VERIFY=1 together with --ssm-h-dtype f16",
+            why,
+            "drop --ssm-h-dtype f16 (f32 is the default), or unset ATLAS_EXACT_VERIFY",
+        ));
+    }
+    v
 }
 
 #[cfg(test)]

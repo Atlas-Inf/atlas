@@ -121,11 +121,17 @@ impl SetterHarness {
         )
     }
 
-    fn set_generic(&mut self) {
-        self.proposer_slot = None;
-        self.levers.lightning_mamba_exact_recurrence = false;
-        self.levers.lightning_mamba_scalar_in_proj = false;
-        self.lightning_dspark_identity.install_generic();
+    /// Drives the REAL production generic-install seam
+    /// (`install_generic_proposer`) that
+    /// `TransformerModel::set_dflash_proposer` delegates its whole body to.
+    fn set_generic(&mut self, model_type: &str) {
+        super::install_generic_proposer(
+            &mut self.proposer_slot,
+            &mut self.levers,
+            &mut self.lightning_dspark_identity,
+            model_type,
+            std::sync::Arc::new(NoopProposer),
+        );
     }
 
     fn is_product(&self) -> bool {
@@ -171,13 +177,33 @@ fn lightning_install_then_generic_install_clears_identity() {
     assert!(harness.levers.lightning_mamba_exact_recurrence);
     assert!(harness.levers.lightning_mamba_scalar_in_proj);
 
-    harness.set_generic();
+    harness.set_generic("nemotron_h");
     assert!(!harness.levers.lightning_mamba_exact_recurrence);
     assert!(!harness.levers.lightning_mamba_scalar_in_proj);
     assert!(
         !harness.is_product(),
         "generic setter clears stale Lightning identity"
     );
+}
+
+#[test]
+fn generic_dflash_install_disables_fused_verify_on_nemotron_h_omni() {
+    // nemotron_h_omni's fused K-row Mamba-2 verify kernel is not bit-exact
+    // against plain decode: generic DFlash on it must drop fused verify,
+    // no env vars.
+    let mut omni = SetterHarness::new();
+    omni.set_generic("nemotron_h_omni");
+    assert!(!omni.levers.mamba_verify_fused);
+    assert!(
+        omni.levers.mamba_verify_exact,
+        "omni verify should ride the persistent exact kernel"
+    );
+
+    // Other targets keep the fused-verify default.
+    let mut super_ = SetterHarness::new();
+    super_.set_generic("nemotron_h");
+    assert!(super_.levers.mamba_verify_fused);
+    assert!(!super_.levers.mamba_verify_exact);
 }
 
 #[test]

@@ -142,7 +142,7 @@ impl Qwen3SsmLayer {
         // which under the same predicate runs the per-token exact arm —
         // identical bits. The WY fast path below is the DEFAULT; without the
         // flag, spec-on output is NOT bitwise-equal to spec-off (#435).
-        if super::verify_exact_enabled() {
+        if super::verify_exact_for(ctx.levers) {
             return self.decode_batched_conv_gdn_multi_exact(states, ctx, args);
         }
         // wy2/wy3/wy4 and the K-templated wyN all carry the `state_is_table`

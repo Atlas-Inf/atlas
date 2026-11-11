@@ -8,7 +8,7 @@ use spark_runtime::gpu::DevicePtr;
 use super::super::TransformerModel;
 
 pub(super) fn enabled() -> bool {
-    std::env::var("ATLAS_LIGHTNING_VERIFY_LAYER_TRACE").as_deref() == Ok("1")
+    crate::model::graph_flags::verify_layer_trace()
 }
 
 impl TransformerModel {

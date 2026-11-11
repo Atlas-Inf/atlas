@@ -54,7 +54,11 @@ impl Qwen3AttentionLayer {
         if self.rope_disabled {
             return Ok(());
         }
-        if n > 1 && self.rope_strided_k.0 != 0 && rope_strided_enabled() {
+        if self.yarn_inv_freq.is_null()
+            && n > 1
+            && self.rope_strided_k.0 != 0
+            && rope_strided_enabled()
+        {
             let stride_e = (per_seq_qkv / bf16) as u32;
             return ops::rope_strided(
                 fwd.gpu,
@@ -97,20 +101,19 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             } else {
-                ops::rope_yarn_scaled(
+                self.apply_scaled_rope(
                     fwd.gpu,
-                    self.rope_yarn_scaled_k,
                     q_out_i,
                     k_out_i,
                     pos_i,
+                    meta.positions_h.offset(i * 4),
+                    meta.positions_w.offset(i * 4),
                     1,
                     nq,
                     nkv,
                     hd,
                     self.rotary_dim_override
                         .unwrap_or(fwd.config.rotary_dim() as u32),
-                    self.yarn_inv_freq,
-                    self.yarn_attention_factor,
                     stream,
                 )?;
             }
@@ -151,7 +154,7 @@ impl Qwen3AttentionLayer {
         let v_out_0 = k_out_0.offset((nkv * hd) as usize * bf16);
         if n > 1 && batch_cache_write_enabled() && per_seq_qkv.is_multiple_of(bf16) {
             let row_stride = (per_seq_qkv / bf16) as u32;
-            return self.write_kv_cache(
+            self.write_kv_cache(
                 fwd.gpu,
                 k_out_0,
                 v_out_0,
@@ -165,7 +168,8 @@ impl Qwen3AttentionLayer {
                 row_stride,
                 stream,
                 fwd.graph_capture,
-            );
+            )?;
+            return self.tree_kv_copies(fwd.gpu, kv_cache, nkv * hd, stream);
         }
         for i in 0..n {
             let q_out_i = qkv_buf.offset(i * per_seq_qkv);
@@ -188,7 +192,37 @@ impl Qwen3AttentionLayer {
                 fwd.graph_capture,
             )?;
         }
-        Ok(())
+        self.tree_kv_copies(fwd.gpu, kv_cache, nkv * hd, stream)
+    }
+
+    /// A tree verify in flight (`draft_tree::current`): after the rows wrote
+    /// their own K/V, copy into each row's private blocks the prefix and
+    /// ancestor entries its attention reads (`kv_slot_copy_bf16`, bytes
+    /// only). Nothing otherwise.
+    fn tree_kv_copies(
+        &self,
+        gpu: &dyn spark_runtime::gpu::GpuBackend,
+        kv_cache: &PagedKvCache,
+        n_elems: u32,
+        stream: u64,
+    ) -> Result<()> {
+        let Some(tree) = crate::speculative::draft_tree::current() else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            self.kv_dtype == spark_runtime::kv_cache::KvCacheDtype::Bf16,
+            "tree verify: the KV slot copies serve a BF16 cache"
+        );
+        ops::kv_slot_copy_bf16(
+            gpu,
+            kv_cache.k_pool_ptr(self.attn_layer_idx),
+            kv_cache.v_pool_ptr(self.attn_layer_idx),
+            tree.kv_entries,
+            tree.kv_count,
+            tree.kv_max,
+            n_elems,
+            stream,
+        )
     }
 
     /// Phase 5: build contiguous Q buffer + run BATCHED paged decode.
@@ -223,6 +257,9 @@ impl Qwen3AttentionLayer {
         let (wht_k_dtype, wht_v_dtype) = self.kv_dtype.kv_pair();
         let k_is_turbo = wht_k_dtype.is_wht_rotated();
         let v_is_turbo = wht_v_dtype.is_wht_rotated();
+        if let Some(out) = self.ms_verify_rows_attention(c, kv_cache, meta)? {
+            return Ok(out);
+        }
 
         // ── Q for the batched paged decode ────────────────────────────────
         // `run_paged_decode` already takes an explicit `q_stride` and the kernel
@@ -307,7 +344,7 @@ impl Qwen3AttentionLayer {
             inv_sqrt_d,
             q_stride,
             fwd.buffers.splitk_workspace(),
-            fwd.levers.max_decode_seqs,
+            fwd.levers.attn_split_ref_seqs(),
             stream,
         )?;
         if v_is_turbo && wht_runtime_active && self.wht_bf16_k_inv.0 != 0 {

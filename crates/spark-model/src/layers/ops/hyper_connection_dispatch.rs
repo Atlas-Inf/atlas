@@ -31,6 +31,8 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use super::hyper_connection as sinkhorn;
 use super::hyper_connection_lowrank as lowrank;
+use super::hyper_connection_lowrank_split::{HC_V_ROWS_MAX, hc_pre_rows_wide, hc_pre_split};
+use super::qwen4exp_decode_fuse::{HcPostFold, hc_post_stage_fits};
 use crate::layers::qwen3_attention::{HcHeadWeights, HcSiteWeights, HcWeights};
 
 /// Which family a site's weights select.
@@ -123,6 +125,103 @@ pub fn hc_pre_site(
     }
 }
 
+/// Rows the decode-shaped (split) low-rank collapse serves in one launch
+/// (`hyper_connection_lowrank::HC_DECODE_MAX_T`); wider batches take the
+/// GEMM formulation, which rounds `normed` to BF16 — another function of the
+/// row than the decode's.
+pub const HC_SPLIT_MAX_ROWS: u32 = 8;
+
+/// [`hc_pre_site`] for a multi-row decode or verify step. With `max_rows > 0`
+/// (`ModelLevers::qwen4exp_hc_rows`: [`HC_SPLIT_MAX_ROWS`] under
+/// `ATLAS_QWEN4EXP_BATCH_FAST`) a low-rank collapse of more rows runs as
+/// split-path chunks of at most that many rows -- with
+/// `ATLAS_QWEN4EXP_HC_FAST`, row-grouped launches of up to 32 rows -- each
+/// row then the single-row decode collapse's bytes (the split kernels'
+/// per-row arithmetic does not depend on the row count). Anything else is
+/// `hc_pre_site` unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_pre_site_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    streams: DevicePtr,
+    site: &HcSiteWeights,
+    hc: &HcWeights,
+    y_out: DevicePtr,
+    post_out: DevicePtr,
+    comb_out: DevicePtr,
+    scratch: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    norm_eps: f32,
+    max_rows: u32,
+    stream: u64,
+) -> Result<()> {
+    if !(max_rows > 0 && site.lowrank.is_some() && num_tokens > max_rows && !scratch.is_null()) {
+        return hc_pre_site(
+            gpu,
+            kernel,
+            streams,
+            site,
+            hc,
+            y_out,
+            post_out,
+            comb_out,
+            scratch,
+            num_tokens,
+            hidden_size,
+            norm_eps,
+            stream,
+        );
+    }
+    let (m, h) = (hc.hc_mult, hidden_size as usize);
+    let mut t0 = 0u32;
+    while t0 < num_tokens {
+        let t = t0 as usize;
+        let (streams_t, y_t) = (streams.offset(t * m * h * 4), y_out.offset(t * h * 2));
+        // The lane's split width: up to HC_V_ROWS_MAX rows in one row-grouped
+        // collapse where it applies (`ATLAS_QWEN4EXP_HC_FAST`), else chunks.
+        let wide = (num_tokens - t0).min(HC_V_ROWS_MAX);
+        if max_rows == HC_SPLIT_MAX_ROWS
+            && let Some(w) = &site.lowrank
+            && !w.inject_w.is_null()
+            && hc_pre_rows_wide(
+                gpu,
+                streams_t,
+                w,
+                y_t,
+                post_out.offset(t * m * 4),
+                scratch,
+                wide,
+                hidden_size,
+                m as u32,
+                norm_eps,
+                stream,
+            )?
+        {
+            t0 += wide;
+            continue;
+        }
+        let rows = (num_tokens - t0).min(max_rows);
+        hc_pre_site(
+            gpu,
+            kernel,
+            streams_t,
+            site,
+            hc,
+            y_t,
+            post_out.offset(t * m * 4),
+            comb_out.offset(t * m * m * 4),
+            scratch,
+            rows,
+            hidden_size,
+            norm_eps,
+            stream,
+        )?;
+        t0 += rows;
+    }
+    Ok(())
+}
+
 /// Inject the block output back into every stream. `out` may alias
 /// `residual`.
 ///
@@ -172,6 +271,132 @@ pub fn hc_post_site(
             stream,
         ),
     }
+}
+
+/// A decode layer's seam: [`hc_post_site`] of the sublayer that produced
+/// `block_out` (in place on `streams`), then [`hc_pre_site`] of `site`.
+///
+/// Under `ATLAS_QWEN4EXP_DECODE_FUSE` (mHC seam group) a low-rank site at a
+/// decode width runs the post inside its stage (`hc_post_stage_vec`): the
+/// same highway and `normed` bytes, one launch fewer. Otherwise the two
+/// calls run as they always have.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_post_pre_site(
+    gpu: &dyn GpuBackend,
+    post_kernel: KernelHandle,
+    pre_kernel: KernelHandle,
+    hc: &HcWeights,
+    block_out: DevicePtr,
+    streams: DevicePtr,
+    site: &HcSiteWeights,
+    y_out: DevicePtr,
+    post: DevicePtr,
+    comb: DevicePtr,
+    scratch: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    norm_eps: f32,
+    stream: u64,
+) -> Result<()> {
+    if let Some(w) = &site.lowrank
+        && HcVariant::of(hc) == HcVariant::LowRank
+        && num_tokens <= lowrank::HC_DECODE_MAX_T
+        && !scratch.is_null()
+        && !w.inject_w.is_null()
+    {
+        let fold = HcPostFold {
+            block_out,
+            inj: post,
+        };
+        // `normed` sits at the start of the split path's scratch.
+        let hc_mult = hc.hc_mult as u32;
+        if hc_post_stage_fits(gpu, fold, streams, w.norm_w, scratch, hidden_size, hc_mult)? {
+            return hc_pre_split(
+                gpu,
+                streams,
+                w,
+                y_out,
+                post,
+                scratch,
+                num_tokens,
+                hidden_size,
+                hc_mult,
+                norm_eps,
+                /* inject */ true,
+                Some(fold),
+                stream,
+            );
+        }
+    }
+    hc_post_site(
+        gpu,
+        post_kernel,
+        hc,
+        block_out,
+        streams,
+        post,
+        comb,
+        streams,
+        num_tokens,
+        hidden_size,
+        stream,
+    )?;
+    hc_pre_site(
+        gpu,
+        pre_kernel,
+        streams,
+        site,
+        hc,
+        y_out,
+        post,
+        comb,
+        scratch,
+        num_tokens,
+        hidden_size,
+        norm_eps,
+        stream,
+    )
+}
+
+/// [`hc_head_site`] for a multi-row step, chunked like [`hc_pre_site_rows`].
+#[allow(clippy::too_many_arguments)]
+pub fn hc_head_site_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    streams: DevicePtr,
+    head: &HcHeadWeights,
+    hc: &HcWeights,
+    y_out: DevicePtr,
+    scratch: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    norm_eps: f32,
+    max_rows: u32,
+    stream: u64,
+) -> Result<()> {
+    let chunk = if max_rows > 0 && head.lowrank.is_some() && !scratch.is_null() {
+        max_rows
+    } else {
+        num_tokens.max(1)
+    };
+    let (m, h) = (hc.hc_mult, hidden_size as usize);
+    for t0 in (0..num_tokens).step_by(chunk as usize) {
+        let t = t0 as usize;
+        hc_head_site(
+            gpu,
+            kernel,
+            streams.offset(t * m * h * 4),
+            head,
+            hc,
+            y_out.offset(t * h * 2),
+            scratch,
+            (num_tokens - t0).min(chunk),
+            hidden_size,
+            norm_eps,
+            stream,
+        )?;
+    }
+    Ok(())
 }
 
 /// The model-level final collapse before the LM head.

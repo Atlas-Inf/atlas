@@ -84,7 +84,7 @@ fn resolve_prompts(
 /// vocabulary. The tokenizer is the authoritative source of vocab size
 /// (SSOT); an OOB ID would index past the embedding table.
 fn validate_token_ids(state: &AppState, ids: &[u32]) -> Result<(), (StatusCode, String)> {
-    let vocab_size = state.tokenizer.inner().get_vocab_size(true) as u32;
+    let vocab_size = state.tokenizer.vocab_size();
     if let Some(&bad) = ids.iter().find(|&&id| id >= vocab_size) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -107,6 +107,12 @@ pub async fn completions(
             );
         }
     };
+    if req.return_token_ids && req.stream {
+        return openai_error_response(
+            StatusCode::BAD_REQUEST,
+            "return_token_ids requires stream=false on /v1/completions".to_string(),
+        );
+    }
     let prompts = match resolve_prompts(&state, &req.prompt) {
         Ok(t) => t,
         Err((status, msg)) => return openai_error_response(status, msg),
@@ -116,12 +122,12 @@ pub async fn completions(
     }
     for prompt_tokens in &prompts {
         let prompt_len = prompt_tokens.len();
-        if prompt_len >= state.max_seq_len {
+        if prompt_len.saturating_add(req.max_tokens) > state.max_seq_len {
             return openai_error_response(
                 StatusCode::BAD_REQUEST,
                 format!(
-                    "Prompt too long: {prompt_len} tokens exceeds max_seq_len {}",
-                    state.max_seq_len
+                    "Prompt plus max_tokens exceeds max_seq_len {} (prompt={}, max_tokens={})",
+                    state.max_seq_len, prompt_len, req.max_tokens
                 ),
             );
         }
@@ -316,6 +322,7 @@ pub(super) async fn completions_stream(
         image_pixels: Vec::new(),
         max_tokens: req.max_tokens,
         min_tokens: 0,
+        ignore_eos: req.ignore_eos,
         temperature: p.temperature,
         top_k: p.top_k,
         top_p: p.top_p,
@@ -332,21 +339,20 @@ pub(super) async fn completions_stream(
         logit_bias: p.logit_bias,
         stop_tokens: p.stop_tokens,
         enable_thinking: false,
+        force_nonempty_content: false,
         thinking_budget: None,
         repetition_detection: p.repetition_detection,
         require_tool_call: false,
         // Completions API defines no tools — multi-tool-call continuation off.
         tools_present: false,
         suppress_tool_call: false,
-        disable_mtp: false,
+        disable_mtp: req.disable_mtp,
         grammar_spec: None,
         seed: req.seed,
         top_logprobs: logprobs_k,
         prompt_logprobs: if echo { logprobs_k } else { None },
         echo,
-        // Was hard-coded `None`: streaming /v1/completions was the one
-        // surface with NO deadline while every other surface had 300 s.
-        timeout_at: state.request_deadline(None),
+        timeout_at: state.request_deadline(req.timeout),
         token_tx,
         // /v1/completions has no guard pipeline yet — the flag is
         // created so the scheduler's emit_step type-checks cleanly,
@@ -465,7 +471,7 @@ pub(super) async fn completions_stream(
                     )]
                 }
             }
-            StreamEvent::Error(msg) => {
+            StreamEvent::Error(msg) | StreamEvent::InvalidRequest(msg) => {
                 vec![Ok(Event::default().data(format!(r#"{{"error":"{msg}"}}"#)))]
             }
         };

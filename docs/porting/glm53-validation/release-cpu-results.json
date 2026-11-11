@@ -1,0 +1,265 @@
+{
+  "started_utc": "2026-10-15T15:36:40.639563+00:00",
+  "status": "PASS",
+  "plan_sha256": "85f32d3027c3bda7bbca5996f8b565223cbe84b5cc965ecc4720119464a3032a",
+  "runner_sha256": "1408f1d9ba3c55a2a06dbab6a099cf71d3d89854a192d95e7cef2b486bebfb31",
+  "cpu_stub_settings": {
+    "cpu_stub_dir": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/cpu-clean-seven/cpu-stubs",
+    "cpu_stub_sha256": {
+      "libcuda_stub.c": "05ea583b769cacd658f11c0a7ffb3beee508e1d6e9308375a22845908c5a8fed",
+      "libnccl_stub.c": "e9a48eaec412fb1909f75b8badc6450d160a866c5be3893b3a45d958c7875164",
+      "libcublaslt_stub.c": "208e471ca3916e0fe2e5c357cf38c6a8089262ef8d2af50da41dcd6803f838df",
+      "libcudart_stub.c": "3531e7dad5515eea0e1863f00885bd1db444926f0771cbdcdba8be29e9d9031c",
+      "libnccl.so": "94af3ec927ba64f9347e531081687ad8c89a46f37bc1f648036161164da3e052",
+      "libcublasLt.so": "7dc331293a98c5f87c24beea5d25b649e77a9e5da4c869cf2050fb4da5b7f5f5",
+      "libcudart.so": "bd459a529478f29727f8cfb31d6bb9045eb987a44a05f8a2c619558bd544925e",
+      "libcuda.so": "9853607f154cb9f741c2c24b0612d744fd5dd2d5b39d44fd04e1c968cfea1200"
+    },
+    "source_dir": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/cpu-corrected-seven/cpu-stubs",
+    "copied_utc": "2026-10-15T03:34:09.682493+00:00",
+    "scope": "Isolated fail-fast CPU linking stubs; cuOccupancyMaxActiveBlocksPerMultiprocessor, cuCtxGetStreamPriorityRange and cuStreamCreateWithPriority are typed NO_DEVICE symbols, not GPU implementations."
+  },
+  "environment_overrides": {
+    "PATH": "/home/abc/.cargo/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin",
+    "COLORTERM": "truecolor",
+    "ATLAS_SKIP_BUILD": "1",
+    "CUDARC_CUDA_VERSION": "13000",
+    "CARGO_BUILD_JOBS": "4",
+    "CARGO_TARGET_DIR": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/final-release-cpu-cb45065c/target",
+    "LIBRARY_PATH": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/cpu-clean-seven/cpu-stubs",
+    "LD_LIBRARY_PATH": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/cpu-clean-seven/cpu-stubs"
+  },
+  "environment_removed": [
+    "NO_COLOR",
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "CARGO_TERM_COLOR"
+  ],
+  "compiler": "rustc 1.95.0 (59807616e 2026-04-14)",
+  "commands": {
+    "clean": [
+      "cargo",
+      "clean"
+    ],
+    "fmt": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "clippy-default": [
+      "cargo",
+      "clippy",
+      "--locked",
+      "--workspace",
+      "--tests"
+    ],
+    "clippy-all-features": [
+      "cargo",
+      "clippy",
+      "--workspace",
+      "--tests",
+      "--all-features",
+      "--",
+      "-Dwarnings"
+    ],
+    "tests-default": [
+      "cargo",
+      "test",
+      "--locked",
+      "--workspace",
+      "--",
+      "--test-threads=1"
+    ],
+    "tests-all-features-compile": [
+      "cargo",
+      "test",
+      "--locked",
+      "--workspace",
+      "--all-features",
+      "--no-run"
+    ],
+    "rustdoc": [
+      "cargo",
+      "doc",
+      "--locked",
+      "--workspace",
+      "--no-deps"
+    ],
+    "checker-build": [
+      "cargo",
+      "build",
+      "--locked",
+      "-p",
+      "spark-server",
+      "--bin",
+      "spark"
+    ]
+  },
+  "scope": "Final combined release, fresh target cleaned before checks; full workspace tests serialized because of inherited global TUI log-ring interference. Original shared-target campaign preserved at cpu-corrected-seven; no old results reused. Exact-source CPU qualification. Native GPU compilation skipped; link stubs return errors/no-device. No GPU execution, intermediate GPU qualification, or macOS test execution is claimed.",
+  "branches": [
+    {
+      "name": "final-release",
+      "ref": "release/glm53-nvfp4",
+      "revision": "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e",
+      "tree": "4027d7a9cde20bf7bc68c05d58f0ecfb0e58b1b5",
+      "previous_revision": "9269a2fbbb9131ba66a3b45c7b977d5ccd341bcf",
+      "worktree": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/final-release-cpu-cb45065c/worktrees/final-release",
+      "started_utc": "2026-10-15T15:36:41.005003+00:00",
+      "status": "PASS",
+      "steps": [
+        {
+          "name": "clean",
+          "command": [
+            "cargo",
+            "clean"
+          ],
+          "log": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/final-release-cpu-cb45065c/final-release/clean.log",
+          "started_utc": "2026-10-15T15:36:41.005502+00:00",
+          "pid": 797118,
+          "exit_code": 0,
+          "finished_utc": "2026-10-15T15:36:41.085311+00:00",
+          "elapsed_seconds": 0.07964360993355513,
+          "log_sha256": "0bdaeb2aa6a92a0fdfec2d2cc4d0ab71946de5d0654e08c526e4629130ae0f28"
+        },
+        {
+          "name": "fmt",
+          "command": [
+            "cargo",
+            "fmt",
+            "--all",
+            "--",
+            "--check"
+          ],
+          "log": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/final-release-cpu-cb45065c/final-release/fmt.log",
+          "started_utc": "2026-10-15T15:36:41.085750+00:00",
+          "pid": 797129,
+          "exit_code": 0,
+          "finished_utc": "2026-10-15T15:36:46.998640+00:00",
+          "elapsed_seconds": 5.912788886809722,
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "name": "clippy-default",
+          "command": [
+            "cargo",
+            "clippy",
+            "--locked",
+            "--workspace",
+            "--tests"
+          ],
+          "log": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/final-release-cpu-cb45065c/final-release/clippy-default.log",
+          "started_utc": "2026-10-15T15:36:46.999259+00:00",
+          "pid": 798224,
+          "exit_code": 0,
+          "finished_utc": "2026-10-15T15:38:20.630609+00:00",
+          "elapsed_seconds": 93.631238210015,
+          "log_sha256": "0e81029418398060672e2ea3dd8229925785fa5e34ac9c580019911ad2a07fe6"
+        },
+        {
+          "name": "clippy-all-features",
+          "command": [
+            "cargo",
+            "clippy",
+            "--workspace",
+            "--tests",
+            "--all-features",
+            "--",
+            "-Dwarnings"
+          ],
+          "log": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/final-release-cpu-cb45065c/final-release/clippy-all-features.log",
+          "started_utc": "2026-10-15T15:38:20.631540+00:00",
+          "pid": 808936,
+          "exit_code": 0,
+          "finished_utc": "2026-10-15T15:39:35.147767+00:00",
+          "elapsed_seconds": 74.516011812957,
+          "log_sha256": "36c0c8cb8432e322b6ff5eac78bc61fb824de00f564f723ca9682d700b0b12db"
+        },
+        {
+          "name": "tests-default",
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "--workspace",
+            "--",
+            "--test-threads=1"
+          ],
+          "log": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/final-release-cpu-cb45065c/final-release/tests-default.log",
+          "started_utc": "2026-10-15T15:39:35.148770+00:00",
+          "pid": 810358,
+          "exit_code": 0,
+          "finished_utc": "2026-10-15T15:47:04.623611+00:00",
+          "elapsed_seconds": 449.47457023500465,
+          "log_sha256": "a1ef27aac8bf88e99ccb612df4779eb4f468530cab5a00267ea9110a187f7eb9",
+          "test_counts": {
+            "passed": 7146,
+            "failed": 0,
+            "ignored": 148
+          }
+        },
+        {
+          "name": "tests-all-features-compile",
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "--workspace",
+            "--all-features",
+            "--no-run"
+          ],
+          "log": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/final-release-cpu-cb45065c/final-release/tests-all-features-compile.log",
+          "started_utc": "2026-10-15T15:47:04.627496+00:00",
+          "pid": 840837,
+          "exit_code": 0,
+          "finished_utc": "2026-10-15T15:49:01.327259+00:00",
+          "elapsed_seconds": 116.69953950610943,
+          "log_sha256": "76fdf96bad4beb8329e2d5f239be5146a87b11d5753f40a595d6e81f611ad05f"
+        },
+        {
+          "name": "rustdoc",
+          "command": [
+            "cargo",
+            "doc",
+            "--locked",
+            "--workspace",
+            "--no-deps"
+          ],
+          "log": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/final-release-cpu-cb45065c/final-release/rustdoc.log",
+          "started_utc": "2026-10-15T15:49:01.328111+00:00",
+          "pid": 854869,
+          "exit_code": 0,
+          "finished_utc": "2026-10-15T15:50:00.304736+00:00",
+          "elapsed_seconds": 58.97642760910094,
+          "log_sha256": "cff5eb995e767e5fd0ebb6ee94852f5cda289f74bc216b273207629c2cafd769"
+        },
+        {
+          "name": "checker-build",
+          "command": [
+            "cargo",
+            "build",
+            "--locked",
+            "-p",
+            "spark-server",
+            "--bin",
+            "spark"
+          ],
+          "log": "/home/abc/storage/models/atlas-glm53-port-audit/technical-readiness-20261015/final-release-cpu-cb45065c/final-release/checker-build.log",
+          "started_utc": "2026-10-15T15:50:00.305807+00:00",
+          "pid": 858462,
+          "exit_code": 0,
+          "finished_utc": "2026-10-15T15:51:14.057910+00:00",
+          "elapsed_seconds": 73.7518556129653,
+          "log_sha256": "93b559bbaee2055fd42376b805690d4a44bb0766c0caaf00cfdab80b2add130f"
+        }
+      ],
+      "serialized_only": true,
+      "finished_utc": "2026-10-15T15:51:23.618360+00:00",
+      "head_after": "cb45065cb4f21c162ccd29dd837ef4b6be3aa52e",
+      "clean_after": true
+    }
+  ],
+  "finished_utc": "2026-10-15T15:51:23.711638+00:00"
+}

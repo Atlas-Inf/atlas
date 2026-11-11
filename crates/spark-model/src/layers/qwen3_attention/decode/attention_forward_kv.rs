@@ -17,6 +17,7 @@ impl Qwen3AttentionLayer {
     pub(super) fn attention_forward_kv(
         &self,
         normed: DevicePtr,
+        v_in: DevicePtr,
         k_out: DevicePtr,
         v_out: DevicePtr,
         nkv: u32,
@@ -28,6 +29,20 @@ impl Qwen3AttentionLayer {
         if self.mla.is_some() {
             // MLA branch already wrote K and V into k_out/v_out
             return Ok(());
+        }
+        // Only the separate-projection fallback below reads `v_in`; every
+        // fused/quantized arm projects K and V from `normed` together.
+        let separate_kv = self.k_weight.is_none() && self.v_weight.is_none();
+        anyhow::ensure!(
+            v_in == normed || separate_kv,
+            "value residuals need separate dense K/V projections"
+        );
+
+        if let Some(r) = self.try_mx8(ctx, self.k_weight.as_ref(), normed, k_out, 1, true, stream) {
+            r?;
+            return self
+                .try_mx8(ctx, self.v_weight.as_ref(), normed, v_out, 1, true, stream)
+                .unwrap_or_else(|| anyhow::bail!("MXFP8 k_proj without an MXFP8 v_proj"));
         }
 
         if let (Some(k_q2), Some(v_q2)) = (
@@ -128,7 +143,7 @@ impl Qwen3AttentionLayer {
                     ops::dense_gemv(
                         ctx.gpu,
                         self.dense_gemv_k,
-                        normed,
+                        v_in,
                         &self.attn.v_proj,
                         v_out,
                         nkv * hd,

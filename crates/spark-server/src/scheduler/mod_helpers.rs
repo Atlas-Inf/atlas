@@ -101,6 +101,9 @@ pub(super) fn drain_pending_requests(
     prefilling: &[PrefillInProgress],
     policy: &dyn SchedulingPolicy,
     max_batch_size: usize,
+    // `Model::has_shared_prompt_capture`: new prompts wait for the one in
+    // progress (GLM long context with the MTP prompt capture).
+    shared_prompt_capture: bool,
     // True when spilled/requeued sequences are parked awaiting resume. They
     // wait on KV BLOCKS, not on the request condvar — blocking here with an
     // empty active set would strand them (their resume only runs at the end
@@ -113,7 +116,7 @@ pub(super) fn drain_pending_requests(
         // Parked-only tick: wait BOUNDED so the scheduler keeps ticking
         // toward the resume pass (blocks may already be free) without
         // spinning hot while the pool refills.
-        if g.requests.is_empty() && g.rotations.is_empty() && !g.closed {
+        if g.requests.is_empty() && g.rotations.is_empty() && g.scores.is_empty() && !g.closed {
             let _ = cv.wait_for(&mut g, std::time::Duration::from_millis(10));
         }
     } else if active.is_empty() && prefilling.is_empty() {
@@ -124,7 +127,7 @@ pub(super) fn drain_pending_requests(
         // predicate the notify would wake us but the loop would immediately
         // re-sleep (requests still empty), starving the quiescence-apply block —
         // an idle-scheduler deadlock for demand-driven promotion.
-        while g.requests.is_empty() && g.rotations.is_empty() && !g.closed {
+        while g.requests.is_empty() && g.rotations.is_empty() && g.scores.is_empty() && !g.closed {
             cv.wait(&mut g);
         }
         if g.closed && g.requests.is_empty() {
@@ -200,6 +203,19 @@ pub(super) fn drain_pending_requests(
 
     // Account for both active and in-progress prefilling sequences.
     let cap = max_batch_size.saturating_sub(active.len() + prefilling.len());
+    let cap = if shared_prompt_capture
+        && spark_model::speculative::glm_repair_policy::long_context_enabled()
+    {
+        cap.min(
+            spark_model::speculative::glm_repair_policy::new_prompt_capacity(
+                active.len(),
+                prefilling.len(),
+                max_batch_size,
+            ),
+        )
+    } else {
+        cap
+    };
 
     let infos: Vec<PendingRequestInfo> = g
         .requests
@@ -219,6 +235,16 @@ pub(super) fn drain_pending_requests(
     for idx in remove_indices {
         taken.push((idx, g.requests.remove(idx)));
     }
+
+    // Why the rest wait, on change only (`admission_hold`).
+    admission_hold::log_on_change(
+        g.requests.len(),
+        selected.len(),
+        cap,
+        active.len(),
+        prefilling.len(),
+        max_batch_size,
+    );
 
     // Re-sort into policy-selected order.
     let mut result = Vec::with_capacity(selected.len());
@@ -419,5 +445,9 @@ pub(super) fn compact_survivors_into_range(model: &dyn Model, survivors: &mut [A
     }
 }
 
+mod admission_hold;
 mod send;
 pub use send::*;
+
+mod chunk_alignment;
+pub(super) use chunk_alignment::{chunk_align, sp_final_cut};

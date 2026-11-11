@@ -105,7 +105,7 @@ impl PleLayer {
         stream: u64,
     ) -> Result<()> {
         let table_va = self.gather_host(ids, gpu, stream)?;
-        self.gather_embed(table_va, num_tokens, heads, false, gpu, stream)
+        self.gather_embed(table_va, num_tokens, heads, gpu, stream)
     }
 
     /// The HOST half of `gather`: NVMe fault-in + slot upload into the
@@ -124,18 +124,10 @@ impl PleLayer {
             .map_err(|_| anyhow::anyhow!("PLE table mutex poisoned"))?;
 
         // Release the PREVIOUS batch's pins. See `release_prev_pins`.
-        // A graph-step gather recorded no event: 0 = full stream sync.
-        let gather_done = if self
-            .gather_in_graph
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            0
-        } else {
-            *self
-                .gather_done
-                .lock()
-                .map_err(|_| anyhow::anyhow!("PLE gather_done mutex poisoned"))?
-        };
+        let gather_done = *self
+            .gather_done
+            .lock()
+            .map_err(|_| anyhow::anyhow!("PLE gather_done mutex poisoned"))?;
         Self::release_prev_pins(&mut table, gpu, stream, gather_done)?;
         let table_va = match &mut *table {
             #[cfg(feature = "cuda")]
@@ -210,6 +202,33 @@ impl PleLayer {
                 // produced garbage input embeddings.
                 DevicePtr(va)
             }
+            #[cfg(feature = "cuda")]
+            NgramTable::ResidentNvfp4 {
+                rows,
+                row_base,
+                rows_total,
+                ..
+            } => {
+                // Fully resident packed table: the "slot" IS `row - row_base`
+                // (row_base 0 today), uploaded as u32 like the `Bf16` arm.
+                let bytes: Vec<u8> = ids
+                    .iter()
+                    .map(|r| {
+                        let (base, total) = (*row_base, *rows_total);
+                        anyhow::ensure!(
+                            *r >= base && *r < base + total,
+                            "PLE resident: row id {r} outside [{base}, {})",
+                            base + total
+                        );
+                        Ok((*r - base) as u32)
+                    })
+                    .collect::<Result<Vec<u32>>>()?
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                gpu.copy_h2d_async(&bytes, self.slots_dev, stream)?;
+                *rows
+            }
             NgramTable::Bf16(w) => {
                 // Fully resident table (small fixtures / tests): the "slot" IS
                 // the row id, so upload the ids truncated to u32.
@@ -233,24 +252,14 @@ impl PleLayer {
         table_va: u64,
         num_tokens: usize,
         heads: usize,
-        graph: bool,
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
-        // Trellis rows are not embeddings. `gather_host` already wrote the
-        // decoded BF16 matrix into `emb`; launching `batched_embed` would
-        // overwrite it with packed I16 interpreted as BF16.
-        if self.trellis.is_none() {
+        // Trellis and NVFP4 rows are not embeddings. `gather_host` already
+        // wrote the decoded BF16 matrix into `emb`; launching `batched_embed`
+        // would overwrite it with packed bytes interpreted as BF16.
+        if !self.host_decoded() {
             self.gather_embed_dispatch(table_va, num_tokens, heads, gpu, stream)?;
-        }
-        // A graph step (capture, or an eager step in graph mode) must not
-        // record the event: an event last recorded in a capture cannot be
-        // waited on later. `gather_host` then falls back to a stream sync
-        // (outside any capture: prestage runs before replay/capture).
-        let in_graph = std::sync::atomic::Ordering::Relaxed;
-        self.gather_in_graph.store(graph, in_graph);
-        if graph {
-            return Ok(());
         }
         // The pins taken by this gather must outlive THIS kernel: record an event
         // right behind it; `release_prev_pins` waits on it before freeing the slots.

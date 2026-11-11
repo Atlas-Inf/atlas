@@ -49,6 +49,16 @@ pub struct DsparkDiagnostics {
     pub precompute_dump: bool,
     /// `ATLAS_DFLASH_OPTION_B_DIAG=1`.
     pub option_b_diag: bool,
+    /// `ATLAS_DFLASH_CONF_WIDTH=1` or `ATLAS_DFLASH_CONF_LOG=1`: the selector
+    /// reports each draft's confidence (`draft_conf`). The head clears it
+    /// when the target ships no confidence selector.
+    pub draft_conf: bool,
+    /// `ATLAS_DFLASH_FIRST_APPEND=legacy|none|own|zero`. Strict, unlike the
+    /// probes above: the factory resolves it with `FirstAppend::for_head`.
+    pub first_append: super::FirstAppend,
+    /// `ATLAS_DFLASH_WARM_CTX=legacy|exact|seed|restore` (Enntity/atlas
+    /// 5573f4d5): the factory resolves it with `WarmCtx::for_head`.
+    pub warm_ctx: super::WarmCtx,
 }
 
 impl Default for DsparkDiagnostics {
@@ -73,6 +83,9 @@ impl Default for DsparkDiagnostics {
             batch_parity: false,
             precompute_dump: false,
             option_b_diag: false,
+            draft_conf: false,
+            first_append: super::FirstAppend::Legacy,
+            warm_ctx: super::WarmCtx::Legacy,
         }
     }
 }
@@ -112,6 +125,9 @@ impl DsparkDiagnostics {
             batch_parity: one("ATLAS_DFLASH_BATCH_PARITY"),
             precompute_dump: one("ATLAS_DFLASH_PRECOMPUTE_DUMP"),
             option_b_diag: one("ATLAS_DFLASH_OPTION_B_DIAG"),
+            draft_conf: one("ATLAS_DFLASH_CONF_WIDTH") || one("ATLAS_DFLASH_CONF_LOG"),
+            first_append: super::FirstAppend::Legacy,
+            warm_ctx: super::WarmCtx::Legacy,
         }
     }
 }

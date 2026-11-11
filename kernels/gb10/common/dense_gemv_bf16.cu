@@ -17,6 +17,7 @@
 // 256 threads cooperatively reduce K dimension per output element.
 // Uses warp shuffle for final reduction — no shared memory barrier needed.
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 #define BLOCK_SIZE 256
@@ -37,6 +38,7 @@ extern "C" __global__ void dense_gemv_bf16(
     unsigned int N,
     unsigned int K
 ) {
+    atlas_pdl_enter();
     const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 32
     const unsigned int local_out = threadIdx.x / threads_per_out;   // which of 8 outputs
     const unsigned int lane = threadIdx.x % threads_per_out;        // position within warp

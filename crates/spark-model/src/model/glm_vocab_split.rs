@@ -1,0 +1,464 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! Exact vocabulary split for the greedy GLM verify head, over the TP2 pair
+//! or the TP4 chain.
+//!
+//! Each of the `ranks` ranks projects only its contiguous `1/ranks` of the
+//! BF16 head with the same batched GEMV (per-column arithmetic unchanged),
+//! reduces it with `argmax_bf16_value_ban` (the best pair and the best pair
+//! outside the min_tokens end tokens), and shares both `(f32, u32)` pairs per
+//! row with the other ranks (the pair swaps them, the chain gathers them); a
+//! device merge applies the full-vocabulary tie rule, taking the unbanned
+//! pair on rows under a min_tokens floor. The other ranks' parts of the
+//! logits buffer are left stale, so this serves only argmax-consuming verify.
+use anyhow::{Result, ensure};
+use atlas_core::config::ModelConfig;
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+use spark_runtime::kernel_args::KernelLaunch;
+use std::sync::OnceLock;
+
+use super::types::TransformerModel;
+use crate::layers::ops;
+use crate::traits::EosBan;
+use crate::weight_map::DenseWeight;
+
+/// Every rank's pairs, rank by rank, above the verify argmax words in scratch.
+const PAIRS_OFFSET: usize = 16384;
+const PAIRS_BYTES: usize = 1024;
+
+/// The rank counts the split serves: the pair and the chain.
+fn split_ranks(ranks: usize) -> bool {
+    matches!(ranks, 2 | 4)
+}
+
+/// Whether the split head may serve `ranks` ranks: enabled, at a rank count
+/// it splits over.
+pub(super) fn serves(ranks: usize) -> bool {
+    split_ranks(ranks) && enabled()
+}
+
+/// `ATLAS_GLM_VERIFY_VOCAB_SPLIT=1`. Read once. Every rank must run the same
+/// value (`startup_parity`): each scores its part of the vocabulary and
+/// shares pairs.
+pub(super) fn enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_VERIFY_VOCAB_SPLIT").as_deref() == Ok("1"))
+}
+
+/// This rank's shard as MXFP8 (first vocab row, weight), when prepared.
+static SHARD_MX: OnceLock<(usize, crate::weight_map::Mxfp8Weight)> = OnceLock::new();
+
+/// This rank's part of the GLM head as MXFP8 before KV sizing
+/// (`ATLAS_GLM_LM_HEAD_MXFP8=1`, ~0.33 GB on the pair, ~0.16 GB on the
+/// chain); the split verify head then streams that part for up to 32 rows at
+/// a time. A checkpoint that
+/// ships the head MXFP8 (FP4-Local) gives its own rows, exactly; otherwise
+/// the BF16 head is quantized.
+pub(crate) fn prepare_shard_mxfp8(
+    config: &ModelConfig,
+    gpu: &dyn GpuBackend,
+    store: &spark_runtime::weights::WeightStore,
+    lm_head: DevicePtr,
+    bf16_head: bool,
+) -> Result<()> {
+    if config.model_type != "glm5_next"
+        || !bf16_head
+        || !serves(config.ep_world_size)
+        || std::env::var("ATLAS_GLM_LM_HEAD_MXFP8").as_deref() != Ok("1")
+    {
+        return Ok(());
+    }
+    let (vocab, h) = (config.vocab_size, config.hidden_size);
+    let shard = shard_of(vocab, config.ep_world_size)?;
+    let start = config.ep_rank * shard;
+    let stream = gpu.default_stream();
+    let checkpoint = crate::weight_map::raw_mxfp8(store, "lm_head")?;
+    crate::weight_loader::glm5_mode::require_format(checkpoint.is_some(), "checkpoint MXFP8 head")?;
+    let mut w = if let Some(raw) = checkpoint {
+        ensure!(raw.k == h, "GLM MXFP8 lm_head K {} != hidden {h}", raw.k);
+        crate::weight_map::mxfp8_row_range_twin(gpu, raw, start, shard, stream)?
+    } else {
+        let quantize = gpu.kernel("mxfp8_gemv", "mxfp8_quantize_bf16")?;
+        let w = crate::weight_map::Mxfp8Weight::alloc(gpu, shard, h)?;
+        ops::mxfp8_quantize(
+            gpu,
+            quantize,
+            lm_head.offset(start * h * 2),
+            w.data,
+            w.scales,
+            shard,
+            h,
+            stream,
+        )?;
+        w
+    };
+    ops::mxfp8_tile_if_requested(gpu, &mut w, shard, h, stream)?;
+    gpu.synchronize(stream)?;
+    let _ = SHARD_MX.set((start, w));
+    tracing::info!(
+        rank = config.ep_rank,
+        shard,
+        checkpoint_bytes = checkpoint.is_some(),
+        "GLM split verify head: MXFP8 shard ready"
+    );
+    Ok(())
+}
+
+/// Each rank's vocabulary rows when `ranks` split `vocab`.
+fn shard_of(vocab: usize, ranks: usize) -> Result<usize> {
+    ensure!(
+        vocab.is_multiple_of(ranks),
+        "GLM vocab split: {ranks} ranks do not split a vocabulary of {vocab}"
+    );
+    Ok(vocab / ranks)
+}
+
+impl TransformerModel {
+    /// Why the split head would not serve a verify of `rows` rows, if it
+    /// would not. Every term is identical on every rank, so all decline
+    /// together.
+    fn glm_split_head_decline(&self, rows: usize) -> Option<&'static str> {
+        let Some(comm) = self.comm.as_ref() else {
+            return Some("no_comm");
+        };
+        [
+            (!enabled(), "disabled"),
+            (self.config.model_type != "glm5_next", "model"),
+            (!split_ranks(comm.world_size()), "world"),
+            (
+                !self.config.vocab_size.is_multiple_of(comm.world_size()),
+                "vocab",
+            ),
+            (
+                if comm.world_size() == 2 {
+                    !comm.supports_peer_exchange_async()
+                } else {
+                    !comm.supports_gather_async(rows * 16)
+                },
+                "pair_share",
+            ),
+            (self.lm_head_fp8.is_some(), "lm_head_fp8"),
+            (self.lm_head_nvfp4.is_some(), "lm_head_nvfp4"),
+            (self.overlays.is_some(), "overlays"),
+            (self.logit_softcap_kernel.0 != 0, "softcap"),
+            (self.dense_gemv_batchm_kernel.0 == 0, "batchm_kernel"),
+            (rows == 0 || rows * 16 > PAIRS_BYTES, "rows"),
+        ]
+        .into_iter()
+        .find_map(|(hit, why)| hit.then_some(why))
+    }
+
+    /// The split head serves GLM verifies, which then leave the other ranks'
+    /// parts of the logits buffer stale: verify picks must stay on the raw
+    /// argmax.
+    pub(crate) fn glm_verify_logits_argmax_only(&self) -> bool {
+        // Native MTP completes every split row before returning from verify,
+        // so its target logits support the ordinary processor/logprob path.
+        !self.native_glm_mtp && self.glm_split_head_decline(1).is_none()
+    }
+
+    /// Project `normed` [rows, H] and write global argmax IDs to `out` [rows].
+    /// Rows whose bit is set in `ban_rows` never pick one of `ban.ids`.
+    /// With `allow` (row-major full-vocabulary bitmasks, one per row, from
+    /// `glm_verify_masks`), row r picks the best token its mask allows.
+    /// Returns `Ok(false)` without launching when the split does not apply.
+    pub(super) fn glm_split_head_argmax(
+        &self,
+        normed: DevicePtr,
+        rows: usize,
+        out: DevicePtr,
+        ban: (u64, &EosBan),
+        allow: Option<DevicePtr>,
+        stream: u64,
+    ) -> Result<bool> {
+        if let Some(why) = self.glm_split_head_decline(rows) {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                tracing::warn!(
+                    "GLM vocab-split verify head declined ({why}, rows={rows}); \
+                     min_tokens end-token ban inactive"
+                )
+            });
+            return Ok(false);
+        }
+        let Some(comm) = self.comm.as_ref() else {
+            return Ok(false);
+        };
+        static KERNELS: OnceLock<(KernelHandle, KernelHandle)> = OnceLock::new();
+        let (value_k, merge_k) = match KERNELS.get() {
+            Some(k) => *k,
+            None => *KERNELS.get_or_init(|| {
+                (
+                    self.gpu
+                        .kernel("argmax", "argmax_bf16_value_ban")
+                        .unwrap_or(KernelHandle(0)),
+                    self.gpu
+                        .kernel("argmax", "argmax_pairs_merge_ban")
+                        .unwrap_or(KernelHandle(0)),
+                )
+            }),
+        };
+        if value_k.0 == 0 || merge_k.0 == 0 {
+            return Ok(false);
+        }
+        let vocab = self.config.vocab_size;
+        let h = self.config.hidden_size;
+        let (rank, ranks) = (comm.rank(), comm.world_size());
+        let shard = shard_of(vocab, ranks)?;
+        let start = rank * shard;
+        let logits = self.buffers.logits();
+        let shard_weight = DenseWeight {
+            weight: self.lm_head_weight.weight.offset(start * h * 2),
+        };
+        // Up to 8 rows per batch-M pass; wider owner-batched verifies read the
+        // shard once per 32 rows on the tensor cores.
+        static TC: OnceLock<(KernelHandle, KernelHandle)> = OnceLock::new();
+        let (tc16, tc32) = *TC.get_or_init(|| {
+            let k = |name| {
+                self.gpu
+                    .kernel("dense_gemv_bf16_batchm", name)
+                    .unwrap_or(KernelHandle(0))
+            };
+            (k("dense_gemv_bf16_tc16"), k("dense_gemv_bf16_tc32"))
+        });
+        let max_m = if rows > ops::DENSE_GEMV_BATCHM_MAX_M as usize && tc32.0 != 0 {
+            ops::DENSE_GEMV_TC_MAX_M as usize
+        } else {
+            ops::DENSE_GEMV_BATCHM_MAX_M as usize
+        };
+        static MX: OnceLock<[KernelHandle; 3]> = OnceLock::new();
+        let mx = SHARD_MX.get().filter(|(s, _)| *s == start).map(|(_, w)| {
+            let k = *MX.get_or_init(|| {
+                ["mxfp8_gemv_tc8", "mxfp8_gemv_tc16", "mxfp8_gemv_tc32"].map(|name| {
+                    self.gpu
+                        .kernel("mxfp8_gemv", name)
+                        .unwrap_or(KernelHandle(0))
+                })
+            });
+            (*w, k)
+        });
+        if let Some((w, k)) = mx.filter(|(_, k)| k.iter().all(|k| k.0 != 0)) {
+            for first in (0..rows).step_by(32) {
+                let m = (rows - first).min(32);
+                ops::mxfp8_gemv(
+                    self.gpu.as_ref(),
+                    ops::mxfp8_kernel(self.gpu.as_ref(), &w, &k, m as u32),
+                    normed.offset(first * h * 2),
+                    w.data,
+                    w.scales,
+                    logits.offset((first * vocab + start) * 2),
+                    m as u32,
+                    shard as u32,
+                    h as u32,
+                    vocab as u32,
+                    stream,
+                )?;
+            }
+        }
+        for first in (0..rows).step_by(max_m).filter(|_| mx.is_none()) {
+            let m = (rows - first).min(max_m);
+            let (input, output) = (
+                normed.offset(first * h * 2),
+                logits.offset((first * vocab + start) * 2),
+            );
+            if m > ops::DENSE_GEMV_BATCHM_MAX_M as usize {
+                let kernel = if m <= 16 { tc16 } else { tc32 };
+                ops::dense_gemv_bf16_tc(
+                    self.gpu.as_ref(),
+                    kernel,
+                    input,
+                    &shard_weight,
+                    output,
+                    m as u32,
+                    shard as u32,
+                    h as u32,
+                    vocab as u32,
+                    stream,
+                )?;
+            } else {
+                ops::dense_gemv_batchm(
+                    self.gpu.as_ref(),
+                    self.dense_gemv_batchm_kernel,
+                    input,
+                    &shard_weight,
+                    output,
+                    m as u32,
+                    shard as u32,
+                    h as u32,
+                    vocab as u32,
+                    stream,
+                )?;
+            }
+        }
+        // Rank r's pairs at `pairs + r * PAIRS_BYTES`, on every rank once shared.
+        ensure!(
+            self.buffers.sizes().scratch >= PAIRS_OFFSET + ranks * PAIRS_BYTES,
+            "GLM vocab split: scratch holds no {ranks} ranks' pairs"
+        );
+        let pairs = self.buffers.scratch().offset(PAIRS_OFFSET);
+        let local = pairs.offset(rank * PAIRS_BYTES);
+        let (ban_rows, ban) = ban;
+        ensure!(
+            ban_rows == 0 || !self.gpu.stream_is_capturing(stream),
+            "min_tokens verify ban cannot be graph-captured"
+        );
+        let local_id = |id: u32| {
+            (id as usize)
+                .checked_sub(start)
+                .filter(|&i| i < shard)
+                .map_or(u32::MAX, |i| i as u32)
+        };
+        let allow = match allow {
+            Some(masks) => {
+                static ALLOW_K: OnceLock<KernelHandle> = OnceLock::new();
+                let k = *ALLOW_K.get_or_init(|| {
+                    self.gpu
+                        .kernel("argmax", "argmax_bf16_value_ban_allow")
+                        .unwrap_or(KernelHandle(0))
+                });
+                ensure!(
+                    k.0 != 0,
+                    "masked verify: argmax_bf16_value_ban_allow missing"
+                );
+                ensure!(
+                    !self.gpu.stream_is_capturing(stream),
+                    "masked verify cannot be graph-captured"
+                );
+                Some((k, masks, self.config.vocab_size.div_ceil(32)))
+            }
+            None => None,
+        };
+        let ban_ids = ban.head_ids().map(local_id);
+        launch_shard_argmax(
+            self.gpu.as_ref(),
+            value_k,
+            allow,
+            logits.offset(start * 2),
+            local,
+            rows,
+            (start, shard, vocab),
+            ban_ids,
+            stream,
+        )?;
+        if ranks == 2 {
+            let peer = pairs.offset((1 - rank) * PAIRS_BYTES);
+            comm.peer_exchange_async(local.0, peer.0, rows * 16, stream)?;
+        } else {
+            ensure!(
+                comm.gather_async(pairs.0, PAIRS_BYTES as i64, rows * 16, stream)?,
+                "GLM vocab split: the chain declined the pair gather"
+            );
+        }
+        KernelLaunch::new(self.gpu.as_ref(), merge_k)
+            .grid([1, 1, 1])
+            .block([32, 1, 1])
+            .arg_ptr(pairs)
+            .arg_ptr(out)
+            .arg_u32(rows as u32)
+            .arg_u32(shard as u32)
+            .arg_u32(ranks as u32)
+            .arg_u32((PAIRS_BYTES / 4) as u32)
+            .arg_u32(ban_rows as u32)
+            .arg_u32((ban_rows >> 32) as u32)
+            .launch(stream)?;
+        Ok(true)
+    }
+}
+
+impl TransformerModel {
+    /// Whether a one-row verify's split head runs the MXFP8 shard, the
+    /// row-invariant arithmetic `glm_split_head_full_rows` completes.
+    pub(super) fn glm_split_head_mxfp8(&self) -> bool {
+        self.glm_split_head_decline(1).is_none()
+            && self.comm.as_ref().is_some_and(|c| {
+                SHARD_MX.get().is_some_and(|(s, _)| {
+                    *s == c.rank() * (self.config.vocab_size / c.world_size())
+                })
+            })
+    }
+
+    /// After a split-head verify left this rank's part of rows `[0, rows)`
+    /// of the logits in `logits`, fetch the other ranks' parts so the rows
+    /// hold the full vocabulary: the plain decode of
+    /// `ATLAS_GLM_CANONICAL_VERIFY` samples row 0, a sampled verify the rows
+    /// its candidates do not decide (`glm_verify_sample`). The pair swaps
+    /// halves through `moe_output` (free once the layers ran); the chain
+    /// gathers the parts in place. Every rank calls it.
+    pub(super) fn glm_split_head_full_rows(&self, rows: usize, stream: u64) -> Result<()> {
+        let comm = self
+            .comm
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("split head full row needs the ranks"))?;
+        let shard = shard_of(self.config.vocab_size, comm.world_size())?;
+        let bytes = shard * 2;
+        let row_bytes = self.config.vocab_size * 2;
+        for row in 0..rows {
+            let logits = self.buffers.logits().offset(row * row_bytes);
+            if comm.world_size() != 2 {
+                ensure!(
+                    comm.gather_async(logits.0, bytes as i64, bytes, stream)?,
+                    "split head full row: the chain declined the logits gather"
+                );
+                continue;
+            }
+            let stage = self.buffers.moe_output();
+            ensure!(
+                self.buffers.sizes().moe_output >= 2 * bytes,
+                "split head full row: moe_output holds {} of {} bytes",
+                self.buffers.sizes().moe_output,
+                2 * bytes
+            );
+            let rank = comm.rank();
+            self.gpu
+                .copy_d2d_async(logits.offset(rank * bytes), stage, bytes, stream)?;
+            comm.peer_exchange_async(stage.0, stage.offset(bytes).0, bytes, stream)?;
+            self.gpu.copy_d2d_async(
+                stage.offset(bytes),
+                logits.offset((1 - rank) * bytes),
+                bytes,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Launch the per-row shard argmax: `argmax_bf16_value_ban`, or under row
+/// masks `argmax_bf16_value_ban_allow` (`(kernel, masks, words per row)`):
+/// each row's full-vocabulary mask, read from bit `start` on, so the rank's
+/// first vocabulary row may fall anywhere in a mask word (GLM-5.3 splits
+/// at 77,428).
+#[allow(clippy::too_many_arguments)]
+fn launch_shard_argmax(
+    gpu: &dyn GpuBackend,
+    value_k: KernelHandle,
+    allow: Option<(KernelHandle, DevicePtr, usize)>,
+    shard_logits: DevicePtr,
+    local: DevicePtr,
+    rows: usize,
+    (start, shard, vocab): (usize, usize, usize),
+    ban_ids: impl IntoIterator<Item = u32>,
+    stream: u64,
+) -> Result<()> {
+    let kernel = allow.map_or(value_k, |(k, _, _)| k);
+    let mut launch = KernelLaunch::new(gpu, kernel)
+        .grid([rows as u32, 1, 1])
+        .block([1024, 1, 1])
+        .arg_ptr(shard_logits)
+        .arg_ptr(local)
+        .arg_u32(shard as u32)
+        .arg_u32(vocab as u32);
+    if let Some((_, masks, words)) = allow {
+        launch = launch
+            .arg_ptr(masks)
+            .arg_u32(words as u32)
+            .arg_u32(start as u32);
+    }
+    for id in ban_ids {
+        launch = launch.arg_u32(id);
+    }
+    launch.launch(stream)
+}
+
+#[cfg(test)]
+#[path = "glm_vocab_split_tests.rs"]
+mod tests;

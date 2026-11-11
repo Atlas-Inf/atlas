@@ -153,6 +153,11 @@ enable_loop_watchdog = true
 # this comment.
 thinking_in_tools = false
 max_thinking_budget = 512
+# Effort-silent requests render the template's "medium" tier (no directive
+# sentence), the tier this target's budget was tuned with; the checkpoint
+# template's own default is xhigh. Clients and --default-chat-template-kwargs
+# still pick any tier.
+default_reasoning_effort = "medium"
 
 # default_num_drafts: 1, matching strix/qwen3.6-27b. gb10/qwen3.8-27b leaves
 # this unset on the argument that draft acceptance is a weights property and

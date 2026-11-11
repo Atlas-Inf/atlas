@@ -1,0 +1,103 @@
+[model]
+name = "nemotron-3.5-super-vl-120b-a12b"
+hf_id = "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4"
+model_type = "nemotron_h_omni"
+architecture = "hybrid_mamba2_latent_moe_attention"
+parameters = "120B"
+active_parameters = "12B"
+
+# The language model inside the omni wrapper is a stock Nemotron-3-Super
+# backbone (same 88-layer schedule, same LatentMoE/Mamba-2/GQA tensor
+# layout, same MIXED_PRECISION recipe under `language_model.backbone.*`),
+# so this target compiles its kernel set via kernel_source.
+# nemotron-labs-3-puzzle-75b-a9b's tree is the Super backbone's kernels
+# PLUS shadows for the LatentMoE/W4A4/GEMM paths the plain Super tree
+# lacks (prefill +39% at 660 tok, +6% at 17K, prefix-hit TTFT -26%;
+# measured on spark2, greedy identity preserved). MODEL.toml still comes
+# from THIS directory: the sampling/behavior/dflash blocks are 3.5-VL's.
+kernel_source = "nemotron-labs-3-puzzle-75b-a9b"
+
+# No (model_type, hidden_size) collision: nemotron_h_omni is a distinct
+# identity, so no match_names are needed.
+[[model_types]]
+model_type = "nemotron_h_omni"
+hidden_size = 4096
+
+# Sampling presets: Nemotron 3.5 family's (copied from
+# nemotron-3.5-lightning-30b-a3b). The VL checkpoint's
+# generation_config.json declares temperature=1.0 / top_p=0.95 and no
+# top_k — vendor recipe pending the public model card.
+[sampling.thinking_text]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.thinking_coding]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.non_thinking]
+temperature = 0.7
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[sampling.tools]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+frequency_penalty = 0.0
+repetition_penalty = 1.0
+dry_multiplier = 0.0
+
+[behavior]
+use_sampling_presets_for_core = true
+thinking_in_tools = true
+max_thinking_budget = 8192
+thinking_default = true
+cap_thinking_at_max_tokens = false
+# The 3.5 VL chat template (qwen3_coder XML tool format + <think> prefill),
+# shipped verbatim from the checkpoint.
+jinja_template = "nemotron_3_5_super_vl.jinja"
+
+# NVIDIA LiLiCorr drafter (DFlash family) — the DGX-Spark speculative path for
+# this checkpoint (public 2026-10-15). block_size 8; the public drafter is
+# bidirectional GQA (8 KV heads) with sliding-window attention over the last
+# 8192 context positions (dflash_config.swa_window_size), so window_size 8192.
+[dflash]
+draft_model = "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr"
+gamma = 3
+window_size = 8192
+mask_token_id = 990
+target_layer_ids = [1, 22, 43, 64, 85]
+
+# Kernel source is nemotron-labs-3-puzzle-75b-a9b, which resolves the
+# w4a4/moe_shadow probes the plain Super tree lacked. Only the w4a16
+# try-kernel probes below remain legitimately absent (verified against the
+# kernel audit of a serve boot on spark2, 2026-10-08).
+[expected_absent.w4a16]
+w4a16_gemm_t_p3 = """
+3-deep weight-pipeline twin shipped ONLY in qwen3.6-27b's shadow.
+layers::tgemm_kernel probes it, falls back to w4a16_gemm_t (resolves
+on this target's shadow). UNMEASURED for this target — candidate, not
+loss."""
+w4a16_gemm_t_k64_p3 = "Same family; layers::k64_kernel falls back to the required w4a16_gemm_t_k64 (resolves here)."
+w4a16_gemm_t_k64_n64_p3 = "Narrow-N twin; layers::k64_n64_kernel returns 0-handle, dispatch gates on handle != 0."
+w4a16_gemm_t_m128_bf16 = "BF16-projection prefill twin; prefill_weights gates on handle != 0, falls back through the resolved w4a16 path."
+fp8_gemm_t_m128_mfast = """
+M128-mfast FP8 GEMM; nemotron_mamba2/prefill gates the probe
+(handle != 0 && n >= 512) and falls back to the bf16-A FP8 path that
+resolves from common w4a16."""
+fp8_fp8_gemm_t_m128_mfast = "Same family — the pre-cast-A fp8 path falls back to the bf16-A arm that resolves."
+fp8_gemm_t_row_scaled = "Optional FP8 drafter probe (Phase G); only reached under ATLAS_DFLASH_DRAFTER_FP8=1, the BF16 drafter path is the default."
+fp8_gemm_t_row_scaled_m16 = "Optional small-M FP8 drafter twin; same opt-in Phase G gate, BF16 drafter fallback."

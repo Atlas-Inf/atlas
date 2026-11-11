@@ -9,6 +9,18 @@ use spark_runtime::weights::WeightStore;
 
 use crate::layer::TransformerLayer;
 
+/// Whether the K-major prefill transpose applies to `config`'s routed experts.
+///
+/// GLM-5.3 (`glm5_next`) is the exception: its routed prefill runs the prequant
+/// NVFP4 grouped GEMMs on the N-major originals, and its checkpoint-backed
+/// gate/up B-tile binding, expert-TP slicing and shared FP8 cache provenance
+/// are all defined over those originals. The unified tier frees them, which
+/// breaks the FP8 cache provenance check at load; every tier populates
+/// `gate_ptrs_t`, which disables the B-tile binding.
+fn runs_prefill_transpose(config: &ModelConfig) -> bool {
+    config.num_experts > 0 && config.model_type != "glm5_next"
+}
+
 /// Pre-flight memory audit + MoE-transpose pass for MiniMax-M2 unified /
 /// hybrid layout modes.
 pub(super) fn maybe_run_minimax_m2_moe_transpose(
@@ -30,7 +42,7 @@ pub(super) fn maybe_run_minimax_m2_moe_transpose(
     // -- qwen4_exp among them -- leaving prefill on the uncoalesced N-major
     // grouped GEMM with no log line to say so. Capability, not identity: if
     // the model has routed experts, it wants K-major prefill weights.
-    if config.num_experts == 0 {
+    if !runs_prefill_transpose(config) {
         return Ok(());
     }
     // Packed EXL3 experts have no NVFP4 [N, K/2] copy. Every tier below
@@ -68,13 +80,34 @@ pub(super) fn maybe_run_minimax_m2_moe_transpose(
     let per_expert_one: usize = config.moe_intermediate_size * config.hidden_size * 9 / 16;
     let cost_full: usize = local_experts * 3 * per_expert_one * config.num_hidden_layers;
     let cost_gate_up: usize = local_experts * 2 * per_expert_one * config.num_hidden_layers;
+    let gb = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    if crate::layers::moe::skips_routed_transpose(config) {
+        // ATLAS_QWEN4EXP_PREFILL_MOE_NODUP / _PREFILL_W4A4: prefill reads the
+        // routed experts in their checkpoint layout, so only the shared
+        // expert is transposed.
+        let free = gpu.free_memory()?;
+        for layer in layers.iter_mut() {
+            layer.transpose_moe_for_prefill(gpu, config)?;
+        }
+        tracing::info!(
+            "qwen4_exp prefill MoE (_MOE_NODUP / _PREFILL_W4A4): routed K-major prefill copy not built, \
+             {} bytes ({:.1} GiB: {} experts x {} layers) saved; shared-expert \
+             transpose {:.2} GiB, {:.1} GiB free",
+            cost_full,
+            gb(cost_full),
+            local_experts,
+            config.num_hidden_layers,
+            gb(free.saturating_sub(gpu.free_memory()?)),
+            gb(gpu.free_memory()?),
+        );
+        return Ok(());
+    }
     let safety: usize = std::env::var("ATLAS_MOE_TRANSPOSE_SAFETY_MB")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .map(|mb| mb * 1024 * 1024)
         .unwrap_or(2 * 1024 * 1024 * 1024); // 2 GB default, override via ATLAS_MOE_TRANSPOSE_SAFETY_MB
     let free = gpu.free_memory()?;
-    let gb = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
     // Hybrid mode pre-flight: Block C Path 2 needs ~2× the cost_full
     // budget — keeps originals AND builds transposed copies. Fall back
     // to unified if it doesn't fit (defends against KV-cache-heavy
@@ -254,3 +287,7 @@ pub(super) fn maybe_run_minimax_m2_moe_transpose(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "m2_setup_tests.rs"]
+mod tests;

@@ -166,12 +166,18 @@ pub(super) fn build_mtp_proposer(
 /// fingerprint (so different models sharing one peer can't collide).
 ///
 /// `blob_bytes` MUST be `SsmSnapshotPool::spill_blob_bytes()` so the tier's
-/// fixed blob sizing matches the spill/fault-in gathers.
+/// fixed blob sizing matches the spill/fault-in gathers. The store comes with
+/// where it keeps its spills (`SsmPools::tier_home`).
 pub(super) fn build_ssm_tier_store(
     config: &ModelConfig,
     blob_bytes: usize,
     num_ssm_layers: usize,
-) -> Result<Option<Arc<dyn super::ssm_tier::SnapshotBlobStore>>> {
+) -> Result<
+    Option<(
+        Arc<dyn super::ssm_tier::SnapshotBlobStore>,
+        super::ssm_tier::SpillHome,
+    )>,
+> {
     if super::ssm_tier::ssm_tier_enabled() && num_ssm_layers > 0 {
         let fp = super::ssm_tier::ModelFingerprint::derive(config, blob_bytes)?;
         Ok(Some(super::ssm_tier::build_tier_store(fp, blob_bytes)?))

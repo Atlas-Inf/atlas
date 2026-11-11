@@ -20,6 +20,13 @@ pub(super) struct MultiSeqCtx<'a> {
     pub residual: DevicePtr,
     /// Number of sequences in this batched decode.
     pub n: usize,
+    /// Rows `0..active` are live; `active..n` pad a batched decode to its
+    /// captured width on dummy states (no QSA carry: never ingested).
+    pub active: usize,
+    /// Host positions before appending this step's token, in metadata row order.
+    pub seq_lens: &'a [usize],
+    /// Every row is the same sequence's (a K-row verify): `row_owner` all equal.
+    pub single_seq_rows: bool,
     /// CUDA stream.
     pub stream: u64,
 
@@ -55,6 +62,7 @@ impl<'a> MultiSeqCtx<'a> {
         hidden: DevicePtr,
         residual: DevicePtr,
         n: usize,
+        seq_lens: &'a [usize],
         bs: u32,
         stream: u64,
     ) -> Self {
@@ -79,6 +87,9 @@ impl<'a> MultiSeqCtx<'a> {
             hidden,
             residual,
             n,
+            active: n,
+            seq_lens,
+            single_seq_rows: false,
             stream,
             h,
             nq,

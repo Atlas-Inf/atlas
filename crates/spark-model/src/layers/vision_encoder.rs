@@ -9,6 +9,28 @@
 
 use spark_runtime::gpu::{DevicePtr, KernelHandle};
 
+pub(crate) mod glm;
+pub(crate) use glm::{
+    GlmCapacity, GlmVisionBlockWeights, GlmVisionEncoder, GlmVisionMergerWeights, GlmVisionWeights,
+};
+
+/// A multi-rank GLM-5 world: its tower holds the processor's budgets and its
+/// workers no vision weights. A single rank keeps its bounded tower.
+fn glm_budget_tower(config: &atlas_core::config::ModelConfig) -> bool {
+    config.tp_world_size.max(config.ep_world_size) > 1
+}
+
+/// Whether this rank only receives encoded vision rows: a worker of a GLM-5
+/// multi-rank world. Rank 0 encodes every item and broadcasts its rows
+/// (`EP_CMD_VISION_STATE`), so a worker loads no vision weights and allocates
+/// only the row buffer. Decided from the configuration alone, so the weight
+/// loader and the model builder agree.
+pub fn vision_receive_only(config: &atlas_core::config::ModelConfig) -> bool {
+    config.vision.as_ref().is_some_and(|v| v.is_glm5_next)
+        && glm_budget_tower(config)
+        && (config.tp_rank != 0 || config.ep_rank != 0)
+}
+
 pub(super) const IMAGE_PAD_TOKEN: u32 = 151_655;
 pub const IMAGE_PAD_TOKEN_ID: u32 = IMAGE_PAD_TOKEN;
 
@@ -30,31 +52,61 @@ pub const VIDEO_PAD_TOKEN_ID: u32 = IMAGE_PAD_TOKEN + 1;
 /// therefore check the length rather than assume it — see `patch_embed`.
 pub(crate) const PATCH_DIM: usize = 1536;
 
+/// A ViT projection weight, in the checkpoint's native precision. BF16 is a
+/// raw pointer; the quantized arms carry everything the scratch dequant needs.
+#[derive(Debug, Clone, Copy)]
+pub enum VitWeight {
+    Bf16(DevicePtr),
+    /// E4M3 + E8M0 per-32-input scales (FP4-Local `attn.qkv`/`attn.proj`).
+    Mxfp8(crate::layers::ops::Mxfp8Proj),
+    /// Packed E2M1 + E4M3 per-16 scales + one F32 global (FP4-Local
+    /// `mlp.linear_fc*`/`merger.linear_fc*`).
+    Nvfp4 {
+        packed: DevicePtr,
+        scales: DevicePtr,
+        global: f32,
+        n: u32,
+        k: u32,
+    },
+}
+
+impl VitWeight {
+    /// BF16 bytes this weight expands to (`n * k * 2`).
+    pub fn bf16_bytes(&self) -> usize {
+        match self {
+            VitWeight::Bf16(_) => 0,
+            VitWeight::Mxfp8(p) => p.n as usize * p.k as usize * 2,
+            VitWeight::Nvfp4 { n, k, .. } => *n as usize * *k as usize * 2,
+        }
+    }
+}
+
 pub struct ViTBlock {
     pub norm1_w: DevicePtr,
     pub norm1_b: DevicePtr,
-    pub qkv_w: DevicePtr,
+    pub qkv_w: VitWeight,
     pub qkv_b: DevicePtr,
-    pub proj_w: DevicePtr,
+    pub proj_w: VitWeight,
     pub proj_b: DevicePtr,
     pub norm2_w: DevicePtr,
     pub norm2_b: DevicePtr,
-    pub fc1_w: DevicePtr,
+    pub fc1_w: VitWeight,
     pub fc1_b: DevicePtr,
-    pub fc2_w: DevicePtr,
+    pub fc2_w: VitWeight,
     pub fc2_b: DevicePtr,
 }
 
 pub struct MergerLayer {
     pub norm_w: DevicePtr,
     pub norm_b: DevicePtr,
-    pub fc1_w: DevicePtr,
+    pub fc1_w: VitWeight,
     pub fc1_b: DevicePtr,
-    pub fc2_w: DevicePtr,
+    pub fc2_w: VitWeight,
     pub fc2_b: DevicePtr,
 }
 
 pub struct VisionEncoder {
+    pub(crate) glm: Option<Box<GlmVisionEncoder>>,
     pub patch_embed_w: DevicePtr,      // [1152, 1536] BF16
     pub patch_embed_b: DevicePtr,      // [1152] BF16
     pub pos_embed: DevicePtr,          // [2304, 1152] BF16 (untouched, kept for reference)
@@ -77,6 +129,8 @@ pub struct VisionEncoder {
     k_merge: KernelHandle, // vision_spatial_merge (2×2)
     k_f32_bf16: KernelHandle, // vision_f32_to_bf16
     k_copy: KernelHandle, // vision_bf16_copy
+    k_nvfp4_dq: KernelHandle, // dequant_nvfp4_to_bf16 (native vision NVFP4)
+    k_mx8_dq: KernelHandle, // mxfp8_proj_dequant (native vision MXFP8)
     // config
     pub hidden_size: usize,        // 1152
     pub num_heads: usize,          // 16
@@ -105,9 +159,96 @@ pub struct VisionEncoder {
     pub buf_scores: DevicePtr, // [attn_max × attn_max] f32  — per-head raw QKᵀ
     pub buf_probs: DevicePtr, // [attn_max × attn_max] bf16 — per-head softmax probs
     pub buf_o_stage: DevicePtr, // [p_max × head_dim] bf16 — per-head GEMM2 output staging
+    /// Vision-owned BF16 expansion scratch for quantized weights — sized for
+    /// the largest projection (~10 MB), NOT shared with the LM buffers.
+    pub buf_vit_dq: DevicePtr,
     // host-side prep state
     pos_embed_host_f32: Vec<f32>, // [num_position_embeddings × hidden_size] row-major
     rope_inv_freq: Vec<f32>,      // [head_dim / 4] frequencies
 }
 
-mod enc_impl;
+pub(crate) mod enc_impl;
+pub use enc_impl::init::derive_max_patches;
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "vision_encoder/glm_oracle_tests.rs"]
+mod glm_oracle_tests;
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "vision_encoder/glm_attention_gpu_tests.rs"]
+mod glm_attention_gpu_tests;
+
+#[cfg(test)]
+mod receive_only_tests {
+    use super::vision_receive_only;
+    use atlas_core::config::{ModelConfig, VisionConfig};
+
+    fn glm_vision() -> VisionConfig {
+        VisionConfig {
+            is_glm5_next: true,
+            in_channels: 3,
+            depth: 1,
+            hidden_size: 64,
+            num_heads: 1,
+            patch_size: 14,
+            temporal_patch_size: 2,
+            spatial_merge_size: 2,
+            intermediate_size: 64,
+            out_hidden_size: 64,
+            projection_intermediate_size: 64,
+            rms_norm_eps: 1e-5,
+            swiglu_limit: 10.0,
+            deepstack_visual_indexes: Vec::new(),
+            image_pad_token_id: 0,
+            video_pad_token_id: 0,
+            image_start_token_id: 0,
+            image_end_token_id: 0,
+            video_start_token_id: 0,
+            video_end_token_id: 0,
+            max_pixels: None,
+            token_budgets: Default::default(),
+            min_pixels: None,
+            video_pixels: None,
+            is_qwen3vl_video: false,
+            omni: None,
+        }
+    }
+
+    #[test]
+    fn only_a_glm_worker_skips_the_vision_weights() {
+        let mut c = ModelConfig::qwen3_next_80b_nvfp4();
+        (c.tp_world_size, c.ep_world_size) = (4, 4);
+        c.tp_rank = 1;
+        c.ep_rank = 1;
+        assert!(!vision_receive_only(&c), "no vision config");
+        c.vision = Some(glm_vision());
+        assert!(vision_receive_only(&c));
+        c.tp_rank = 0;
+        c.ep_rank = 0;
+        assert!(!vision_receive_only(&c), "rank 0 encodes");
+        c.ep_rank = 1;
+        assert!(vision_receive_only(&c), "an orthogonal-mesh worker");
+        (c.tp_world_size, c.ep_world_size) = (2, 2);
+        assert!(vision_receive_only(&c), "a pair worker only receives too");
+        (c.tp_world_size, c.ep_world_size) = (1, 1);
+        assert!(!vision_receive_only(&c), "a single rank keeps its tower");
+        (c.tp_world_size, c.ep_world_size) = (4, 4);
+        c.vision.as_mut().unwrap().is_glm5_next = false;
+        assert!(!vision_receive_only(&c), "other towers keep their weights");
+    }
+
+    #[test]
+    fn a_receive_only_rank_does_not_load_the_tower() {
+        use crate::weight_loader::ModelWeightLoader;
+        use crate::weight_loader::glm5::Glm5WeightLoader;
+        let mut c = ModelConfig::qwen3_next_80b_nvfp4();
+        (c.tp_world_size, c.ep_world_size) = (4, 4);
+        c.vision = Some(glm_vision());
+        assert!(Glm5WeightLoader.dead_namespaces(&c).is_empty(), "rank 0");
+        (c.tp_rank, c.ep_rank) = (1, 1);
+        assert_eq!(
+            Glm5WeightLoader.dead_namespaces(&c),
+            ["model.visual.", "model.language_model.visual."]
+        );
+    }
+}

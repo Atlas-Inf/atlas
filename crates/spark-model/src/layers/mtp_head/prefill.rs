@@ -164,8 +164,30 @@ impl MtpHead {
         while done < rows_total {
             let c = (rows_total - done).min(PREFILL_CHUNK);
 
-            // 1. Gather embeddings of t_{i+1} for rows done..done+c.
+            // 1. Gather embeddings of t_{i+1} for rows done..done+c: one
+            //    launch when the kernel set has `batched_embed` (the token ids
+            //    ride in `pos_dev`, which step 6 refills, in stream order), else
+            //    one row copy each.
             phase!(t_embed, {
+                if self.batched_embed_k.0 != 0 {
+                    let ids = &prompt_tokens[done + 1..done + c + 1];
+                    // SAFETY: `ids` is a live `&[u32]` of exactly `c` elements, so
+                    // `c * 4` bytes from its start is exactly its buffer; shared
+                    // borrow only, and `copy_h2d_async` lets it go on return.
+                    let id_bytes =
+                        unsafe { std::slice::from_raw_parts(ids.as_ptr() as *const u8, c * 4) };
+                    ctx.gpu.copy_h2d_async(id_bytes, scratch.pos_dev, stream)?;
+                    return ops::batched_embed(
+                        ctx.gpu,
+                        self.batched_embed_k,
+                        scratch.pos_dev,
+                        self.embed_tokens.weight,
+                        scratch.embed,
+                        c as u32,
+                        h as u32,
+                        stream,
+                    );
+                }
                 for r in 0..c {
                     let tok = prompt_tokens[done + r + 1] as usize;
                     self_copy_embed_row(self, ctx, tok, scratch.embed, r, h, stream)?;
@@ -197,8 +219,21 @@ impl MtpHead {
                 stream,
             )?;
 
-            // 3. Per-row concat [normed_embed | normed_hidden] → [c, 2h].
+            // 3. Concat [normed_embed | normed_hidden] → [c, 2h]: one launch
+            //    when the kernel set has `bf16_concat_rows`, else per row.
             phase!(t_concat, {
+                if self.bf16_concat_rows_k.0 != 0 {
+                    return ops::bf16_concat_rows(
+                        ctx.gpu,
+                        self.bf16_concat_rows_k,
+                        scratch.normed_embed,
+                        scratch.normed_hidden,
+                        scratch.concat,
+                        h as u32,
+                        c as u32,
+                        stream,
+                    );
+                }
                 for r in 0..c {
                     ops::bf16_concat(
                         ctx.gpu,
@@ -213,11 +248,42 @@ impl MtpHead {
                 Ok(())
             });
 
-            // 4. fc: [c, 2h] → [c, h], then input layernorm.
+            // 4. fc: [c, 2h] → [c, h], then input layernorm. On native HIP,
+            // hipBLASLt first (~25x the scalar kernel at the 27B drafter's
+            // 5120x10240 fc shape, 2026-10-04), scalar `dense_gemm` as the
+            // fallback.
             phase!(t_fc, {
-                ops::dense_gemm(
+                #[cfg(atlas_hip)]
+                {
+                    ops::hip_bf16_proj_or(
+                        "mtp_drafter_fc",
+                        scratch.concat,
+                        fc_w.weight,
+                        scratch.fc_out,
+                        c as u32,
+                        h as u32,
+                        (2 * h) as u32,
+                        stream,
+                        || {
+                            ops::dense_gemm(
+                                ctx.gpu,
+                                self.dense_gemm_k,
+                                scratch.concat,
+                                fc_w,
+                                scratch.fc_out,
+                                c as u32,
+                                h as u32,
+                                (2 * h) as u32,
+                                stream,
+                            )
+                        },
+                    )
+                }
+                #[cfg(not(atlas_hip))]
+                ops::dense_gemm_prefill(
                     ctx.gpu,
                     self.dense_gemm_k,
+                    self.dense_gemm_pipelined_k,
                     scratch.concat,
                     fc_w,
                     scratch.fc_out,
@@ -241,25 +307,28 @@ impl MtpHead {
 
             // 5. K/V projections (Q is not needed — outputs are discarded).
             phase!(t_kv, {
-                ops::dense_gemm(
+                let kv = nkv * hd;
+                ops::dense_gemm_prefill(
                     ctx.gpu,
                     self.dense_gemm_k,
+                    self.dense_gemm_pipelined_k,
                     scratch.normed2,
                     k_w,
                     scratch.k_out,
                     c as u32,
-                    nkv * hd,
+                    kv,
                     h as u32,
                     stream,
                 )?;
-                ops::dense_gemm(
+                ops::dense_gemm_prefill(
                     ctx.gpu,
                     self.dense_gemm_k,
+                    self.dense_gemm_pipelined_k,
                     scratch.normed2,
                     v_w,
                     scratch.v_out,
                     c as u32,
-                    nkv * hd,
+                    kv,
                     h as u32,
                     stream,
                 )
@@ -337,12 +406,12 @@ impl MtpHead {
                 kv_cache.cache_stride() as u64,
                 stream,
             )?;
-            // The async H2D sources (positions/slots) are Vec-backed; the
-            // driver has queued them, but sync before drop for safety —
-            // one sync per 512-row chunk is negligible next to the GEMMs.
-            let t_sync = std::time::Instant::now();
-            ctx.gpu.synchronize(stream)?;
+            // No per-chunk sync: `copy_h2d_async` lets its (Vec-backed)
+            // source go the moment it returns, and every scratch reuse by the
+            // next chunk is ordered on `stream`. The profile still syncs.
             if profile {
+                let t_sync = std::time::Instant::now();
+                ctx.gpu.synchronize(stream)?;
                 t_rest += t_sync.elapsed().as_secs_f64() * 1e3;
             }
 

@@ -75,6 +75,38 @@ pub(super) struct PagedLayerArgs {
     pub block_dump: bool,
 }
 
+/// Which parts of a drafter layer's attention half one call runs
+/// (`pre_attn_phases`, `post_attn_phases` and their batched twins): all of
+/// it unsplit, or the head's parts around a rank split's shared projections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct AttnPhases {
+    /// Before the projections: the input norm and attention conv (or, after
+    /// attention, the post-o_proj rest: conv finish, residual, MLP norm).
+    pub norm: bool,
+    /// The q/k/v (or o) projections.
+    pub project: bool,
+    /// After the projections: q/k norms, RoPE and the cache write.
+    pub finish: bool,
+}
+
+impl AttnPhases {
+    pub(super) const ALL: Self = Self {
+        norm: true,
+        project: true,
+        finish: true,
+    };
+    pub(super) const BEFORE: Self = Self {
+        norm: true,
+        project: false,
+        finish: false,
+    };
+    pub(super) const AFTER: Self = Self {
+        norm: false,
+        project: false,
+        finish: true,
+    };
+}
+
 impl BlockDiffusionDraftHead {
     /// γ-only paged-attention per-layer body. See module docstring.
     ///
@@ -163,6 +195,23 @@ impl BlockDiffusionDraftHead {
         ctx: &ForwardContext,
         scratch: &DflashScratch,
     ) -> Result<(DevicePtr, DevicePtr)> {
+        self.pre_attn_phases(layer, args, ctx, scratch, AttnPhases::ALL)
+    }
+
+    /// [`Self::forward_block_layer_pre_attn`] in `phases`, each in its
+    /// unsplit order: the input norm (and attention conv), the q/k/v
+    /// projections, and the rest (q/k norms, RoPE, the cache write), which
+    /// returns the layer's pools (null pools without it). A rank-split
+    /// propose (`ATLAS_GLM_DRAFT_TP=...,attn`) runs the projections as
+    /// shares between the other two.
+    pub(super) fn pre_attn_phases(
+        &self,
+        layer: &DflashLayer,
+        args: &PagedLayerArgs,
+        ctx: &ForwardContext,
+        scratch: &DflashScratch,
+        phases: AttnPhases,
+    ) -> Result<(DevicePtr, DevicePtr)> {
         use crate::layers::ops;
 
         let PagedLayerArgs {
@@ -180,43 +229,47 @@ impl BlockDiffusionDraftHead {
         let g = self.gamma as u32;
         let kv_len = ctx_count + g;
 
-        // 3a. input_layernorm — γ rows.
-        // dflash.py:125  hidden_states = self.input_layernorm(hidden_states)
-        //   stream_buf holds the noise hidden states (the layer's residual);
-        //   norm_buf receives the layernorm output fed to all projections.
-        ops::rms_norm(
-            gpu,
-            self.kernels.rms_norm,
-            scratch.stream_buf,
-            &layer.input_layernorm,
-            scratch.norm_buf,
-            g,
-            h,
-            self.rms_norm_eps,
-            stream,
-        )?;
-
-        if let Some(ref conv) = layer.attention_conv {
-            conv.prepare(
+        if phases.norm {
+            // 3a. input_layernorm — γ rows.
+            // dflash.py:125  hidden_states = self.input_layernorm(hidden_states)
+            //   stream_buf holds the noise hidden states (the layer's residual);
+            //   norm_buf receives the layernorm output fed to all projections.
+            ops::rms_norm(
                 gpu,
-                &|src, w, dst, m, n, k| self.drafter_dense_gemm(gpu, src, w, dst, m, n, k, stream),
-                self.kernels.dflash2_conv,
+                self.kernels.rms_norm,
+                scratch.stream_buf,
+                &layer.input_layernorm,
                 scratch.norm_buf,
-                scratch.dflash2_conv_delta,
-                scratch.dflash2_conv_out,
                 g,
+                h,
+                self.rms_norm_eps,
                 stream,
             )?;
-            gpu.copy_d2d_async(
-                scratch.dflash2_conv_out,
-                scratch.norm_buf,
-                (g * h * 2) as usize,
-                stream,
-            )?;
+
+            if let Some(ref conv) = layer.attention_conv {
+                conv.prepare(
+                    gpu,
+                    &|src, w, dst, m, n, k| {
+                        self.conv_delta_gemm(gpu, conv, src, w, dst, m, n, k, stream)
+                    },
+                    self.kernels.dflash2_conv,
+                    scratch.norm_buf,
+                    scratch.dflash2_conv_delta,
+                    scratch.dflash2_conv_out,
+                    g,
+                    stream,
+                )?;
+                gpu.copy_d2d_async(
+                    scratch.dflash2_conv_out,
+                    scratch.norm_buf,
+                    (g * h * 2) as usize,
+                    stream,
+                )?;
+            }
         }
 
         // id259 per-layer dump: post-input_norm (γ × h).
-        if args.block_dump {
+        if phases.norm && args.block_dump {
             self.block_dump_buf(ctx, scratch.norm_buf, layer_idx, "input_norm", g, h, stream)?;
         }
 
@@ -228,61 +281,68 @@ impl BlockDiffusionDraftHead {
         let gemm_swap = |w_bf16: &crate::weight_map::DenseWeight,
                          w_fp8: &Option<crate::weight_map::Fp8DenseWeight>,
                          w_nvfp4: &Option<crate::weight_map::QuantizedWeight>,
+                         w_mx: Option<&crate::weight_map::Mxfp8Weight>,
                          src: spark_runtime::gpu::DevicePtr,
                          dst: spark_runtime::gpu::DevicePtr,
                          n_out: u32,
                          k_in: u32|
          -> Result<()> {
-            self.drafter_gemm(gpu, w_bf16, w_fp8, w_nvfp4, src, dst, n_out, k_in, stream)
+            self.drafter_gemm(
+                gpu, w_bf16, w_fp8, w_nvfp4, w_mx, src, dst, n_out, k_in, stream,
+            )
         };
 
         // 3b-q / 3c-q. Q branch: q_proj then q_norm — faithful to dflash.py:68-70.
         // dflash.py:68  q = self.q_proj(hidden_states)
         // dflash.py:70  q = self.q_norm(q.view(..., head_dim)).transpose(1,2)
         //   Atlas: [γ, q_dim] tokens-first; q_norm over [γ*num_q_heads, head_dim].
-        gemm_swap(
-            &layer.q_proj,
-            &layer.q_proj_fp8,
-            &layer.q_proj_nvfp4,
-            scratch.norm_buf,
-            scratch.q_buf,
-            q_dim,
-            h,
-        )?;
-        if args.block_dump {
-            self.block_dump_buf(
-                ctx,
+        if phases.project {
+            gemm_swap(
+                &layer.q_proj,
+                &layer.q_proj_fp8,
+                &layer.q_proj_nvfp4,
+                layer.mx.as_ref().map(|mx| &mx.q_proj),
+                scratch.norm_buf,
                 scratch.q_buf,
-                layer_idx,
-                "q_postproj",
-                g,
                 q_dim,
+                h,
+            )?;
+            if args.block_dump {
+                self.block_dump_buf(
+                    ctx,
+                    scratch.q_buf,
+                    layer_idx,
+                    "q_postproj",
+                    g,
+                    q_dim,
+                    stream,
+                )?;
+            }
+        }
+        if phases.finish {
+            ops::rms_norm(
+                gpu,
+                self.kernels.rms_norm,
+                scratch.q_buf,
+                &layer.q_norm,
+                scratch.q_buf,
+                g * self.num_q_heads as u32,
+                self.head_dim as u32,
+                self.rms_norm_eps,
                 stream,
             )?;
+            if args.block_dump {
+                self.block_dump_buf(
+                    ctx,
+                    scratch.q_buf,
+                    layer_idx,
+                    "q_postnorm",
+                    g,
+                    q_dim,
+                    stream,
+                )?;
+            }
         }
-        ops::rms_norm(
-            gpu,
-            self.kernels.rms_norm,
-            scratch.q_buf,
-            &layer.q_norm,
-            scratch.q_buf,
-            g * self.num_q_heads as u32,
-            self.head_dim as u32,
-            self.rms_norm_eps,
-            stream,
-        )?;
-        if args.block_dump {
-            self.block_dump_buf(
-                ctx,
-                scratch.q_buf,
-                layer_idx,
-                "q_postnorm",
-                g,
-                q_dim,
-                stream,
-            )?;
-        }
-
         // 3b-k / 3c-k. K_noise branch: k_proj then k_norm — faithful to
         // dflash.py:72 + 77 (noise portion).
         // dflash.py:72  k_noise = self.k_proj(hidden_states)
@@ -290,61 +350,71 @@ impl BlockDiffusionDraftHead {
         //   — per-head normalization is independent per token; applying k_norm
         //     to noise K alone is equivalent to the joint cat application.
         //     ctx K is normed separately in precompute_ctx_kv (same weight).
-        gemm_swap(
-            &layer.k_proj,
-            &layer.k_proj_fp8,
-            &layer.k_proj_nvfp4,
-            scratch.norm_buf,
-            scratch.k_buf,
-            kv_dim,
-            h,
-        )?;
-        if args.block_dump {
-            self.block_dump_buf(
-                ctx,
+        if phases.project {
+            gemm_swap(
+                &layer.k_proj,
+                &layer.k_proj_fp8,
+                &layer.k_proj_nvfp4,
+                None,
+                scratch.norm_buf,
                 scratch.k_buf,
-                layer_idx,
-                "k_postproj",
-                g,
                 kv_dim,
+                h,
+            )?;
+            if args.block_dump {
+                self.block_dump_buf(
+                    ctx,
+                    scratch.k_buf,
+                    layer_idx,
+                    "k_postproj",
+                    g,
+                    kv_dim,
+                    stream,
+                )?;
+            }
+        }
+        if phases.finish {
+            ops::rms_norm(
+                gpu,
+                self.kernels.rms_norm,
+                scratch.k_buf,
+                &layer.k_norm,
+                scratch.k_buf,
+                g * self.num_kv_heads as u32,
+                self.head_dim as u32,
+                self.rms_norm_eps,
                 stream,
             )?;
+            if args.block_dump {
+                self.block_dump_buf(
+                    ctx,
+                    scratch.k_buf,
+                    layer_idx,
+                    "k_postnorm",
+                    g,
+                    kv_dim,
+                    stream,
+                )?;
+            }
         }
-        ops::rms_norm(
-            gpu,
-            self.kernels.rms_norm,
-            scratch.k_buf,
-            &layer.k_norm,
-            scratch.k_buf,
-            g * self.num_kv_heads as u32,
-            self.head_dim as u32,
-            self.rms_norm_eps,
-            stream,
-        )?;
-        if args.block_dump {
-            self.block_dump_buf(
-                ctx,
-                scratch.k_buf,
-                layer_idx,
-                "k_postnorm",
-                g,
-                kv_dim,
-                stream,
-            )?;
-        }
-
         // 3b-v. V_noise branch: v_proj — faithful to dflash.py:74.
         // dflash.py:74  v_noise = self.v_proj(hidden_states)
         //   No v_norm: dflash.py:78 `v = v.transpose(1,2)` — transpose only.
-        gemm_swap(
-            &layer.v_proj,
-            &layer.v_proj_fp8,
-            &layer.v_proj_nvfp4,
-            scratch.norm_buf,
-            scratch.v_buf,
-            kv_dim,
-            h,
-        )?;
+        if phases.project {
+            gemm_swap(
+                &layer.v_proj,
+                &layer.v_proj_fp8,
+                &layer.v_proj_nvfp4,
+                None,
+                scratch.norm_buf,
+                scratch.v_buf,
+                kv_dim,
+                h,
+            )?;
+        }
+        if !phases.finish {
+            return Ok((DevicePtr::NULL, DevicePtr::NULL));
+        }
 
         // 3d. yarn RoPE over γ positions [position..position+γ) for Q and K_noise.
         // dflash.py:79-80  cos, sin = position_embeddings
@@ -355,19 +425,14 @@ impl BlockDiffusionDraftHead {
         //          precompute_ctx_kv; noise K is rotated here at
         //          [position..position+γ) — same positions as Q.
         //   position_ids buffer: γ entries = [position, ..., position+γ-1].
-        ops::rope_yarn(
+        self.layer_rope(
             gpu,
-            self.kernels.rope_qwen3,
+            layer_idx,
             scratch.q_buf,
             scratch.k_buf,
             scratch.position_ids,
             g,
             self.num_q_heads as u32,
-            self.num_kv_heads as u32,
-            self.head_dim as u32,
-            self.rotary_dim as u32,
-            self.yarn_inv_freq,
-            self.rope_theta,
             stream,
         )?;
 
@@ -575,7 +640,7 @@ impl BlockDiffusionDraftHead {
             self.num_kv_heads as u32,
             self.head_dim as u32,
             16, // cache_block_size
-            self.attn_sliding_window(),
+            self.layer_attn_window(args.layer_idx),
             self.attn_causal(),
             inv_sqrt_d,
             sinks,
@@ -670,7 +735,7 @@ impl BlockDiffusionDraftHead {
                 self.head_dim as u32,
                 inv_sqrt_d,
                 self.attn_causal(),
-                self.attn_sliding_window(),
+                self.layer_attn_window(args.layer_idx),
                 stream,
             )?;
             if args.block_dump {
@@ -771,7 +836,7 @@ impl BlockDiffusionDraftHead {
             self.head_dim as u32,
             inv_sqrt_d,
             self.attn_causal(),
-            self.attn_sliding_window(),
+            self.layer_attn_window(args.layer_idx),
             stream,
         )?;
 
@@ -810,6 +875,10 @@ impl BlockDiffusionDraftHead {
     /// pointers + layer weights. No D2H, no sync, no env-var
     /// branches. Safe to capture unconditionally when the upstream
     /// `graph_eligible` gate is set.
+    ///
+    /// The four parts are separate so the rank split (`rank_split`) can swap
+    /// the two MLP projections' halves between them; this entry runs them in
+    /// order on one rank.
     pub(super) fn forward_block_layer_post_attn(
         &self,
         layer: &DflashLayer,
@@ -817,31 +886,58 @@ impl BlockDiffusionDraftHead {
         ctx: &ForwardContext,
         scratch: &DflashScratch,
     ) -> Result<()> {
+        self.post_attn_project(layer, args, ctx, scratch)?;
+        self.post_attn_gate_up(layer, args, ctx, scratch)?;
+        self.post_attn_down(layer, args, ctx, scratch)?;
+        self.post_attn_residual(layer, args, ctx, scratch)?;
+
+        // id259 per-layer dump: final layer output (post-MLP residual), γ × h.
+        // This is the hidden_states the NEXT layer consumes — the per-layer
+        // chain the harness walks to find the first diverging op.
+        if args.block_dump {
+            self.block_dump_buf(
+                ctx,
+                scratch.stream_buf,
+                args.layer_idx,
+                "layer_out",
+                self.gamma as u32,
+                args.h,
+                args.stream,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Steps 3g–3i: o_proj, the attention residual and the MLP input norm
+    /// (with the MLP conv's prepare). Leaves the MLP input in `norm_buf`.
+    pub(super) fn post_attn_project(
+        &self,
+        layer: &DflashLayer,
+        args: &PagedLayerArgs,
+        ctx: &ForwardContext,
+        scratch: &DflashScratch,
+    ) -> Result<()> {
+        self.post_attn_phases(layer, args, ctx, scratch, AttnPhases::ALL)
+    }
+
+    /// [`Self::post_attn_project`] in `phases`: o_proj (`project`), then the
+    /// rest (`finish`: conv finish, residual, MLP input norm and conv).
+    pub(super) fn post_attn_phases(
+        &self,
+        layer: &DflashLayer,
+        args: &PagedLayerArgs,
+        ctx: &ForwardContext,
+        scratch: &DflashScratch,
+        phases: AttnPhases,
+    ) -> Result<()> {
         use crate::layers::ops;
 
         let PagedLayerArgs {
-            h,
-            q_dim,
-            inter,
-            stream,
-            ..
+            h, q_dim, stream, ..
         } = *args;
         let gpu = ctx.gpu;
         let g = self.gamma as u32;
-
-        // Phase G — same swap helper as pre_attn (q/k/v). Single call
-        // site per logical GEMM; the row-scaled FP8 GEMM kernel applies
-        // the per-row scale internally at write-out.
-        let gemm_swap = |w_bf16: &crate::weight_map::DenseWeight,
-                         w_fp8: &Option<crate::weight_map::Fp8DenseWeight>,
-                         w_nvfp4: &Option<crate::weight_map::QuantizedWeight>,
-                         src: spark_runtime::gpu::DevicePtr,
-                         dst: spark_runtime::gpu::DevicePtr,
-                         n_out: u32,
-                         k_in: u32|
-         -> Result<()> {
-            self.drafter_gemm(gpu, w_bf16, w_fp8, w_nvfp4, src, dst, n_out, k_in, stream)
-        };
 
         // 3g. o_proj — γ rows, [q_dim → h].
         // dflash.py:98-99  attn_output = attn_output.reshape(bsz, q_len, -1)
@@ -849,18 +945,27 @@ impl BlockDiffusionDraftHead {
         //   stream_acc ← o_proj(attn_out); stream_buf still holds the
         //   PRE-layernorm residual (saved implicitly — stream_buf was not
         //   modified since 3a wrote norm_buf from it).
-        gemm_swap(
-            &layer.o_proj,
-            &layer.o_proj_fp8,
-            &layer.o_proj_nvfp4,
-            scratch.attn_out,
-            scratch.stream_acc,
-            h,
-            q_dim,
-        )?;
-
+        if phases.project {
+            self.drafter_gemm(
+                gpu,
+                &layer.o_proj,
+                &layer.o_proj_fp8,
+                &layer.o_proj_nvfp4,
+                layer.mx.as_ref().map(|mx| &mx.o_proj),
+                scratch.attn_out,
+                scratch.stream_acc,
+                h,
+                q_dim,
+                stream,
+            )?;
+        }
+        if !phases.finish {
+            return Ok(());
+        }
         if let Some(ref conv) = layer.attention_conv {
-            let output_delta = scratch.dflash2_conv_delta.offset(2 * conv.num_groups * 2);
+            let output_delta = scratch
+                .dflash2_conv_delta
+                .offset(conv.output_delta_offset());
             conv.finish(
                 gpu,
                 self.kernels.dflash2_conv,
@@ -913,7 +1018,9 @@ impl BlockDiffusionDraftHead {
         if let Some(ref conv) = layer.mlp_conv {
             conv.prepare(
                 gpu,
-                &|src, w, dst, m, n, k| self.drafter_dense_gemm(gpu, src, w, dst, m, n, k, stream),
+                &|src, w, dst, m, n, k| {
+                    self.conv_delta_gemm(gpu, conv, src, w, dst, m, n, k, stream)
+                },
                 self.kernels.dflash2_conv,
                 scratch.norm_buf,
                 scratch.dflash2_conv_delta,
@@ -928,30 +1035,51 @@ impl BlockDiffusionDraftHead {
                 stream,
             )?;
         }
+        Ok(())
+    }
 
-        // 3j. MLP: gate_proj + up_proj + silu_mul + down_proj — γ rows.
-        // dflash.py:141  hidden_states = self.mlp(hidden_states)
-        //   Qwen3MLP: down_proj(silu(gate_proj(x)) * up_proj(x)).
-        //   gate_proj and up_proj both read from norm_buf (post-3i).
-        //   silu_mul: silu(mlp_intermediate) * mlp_up → mlp_intermediate.
-        //   down_proj: mlp_intermediate → stream_acc.
-        gemm_swap(
+    /// Step 3j, first half: gate_proj and up_proj of `norm_buf`, SiLU-gated
+    /// into `mlp_intermediate`.
+    // dflash.py:141  hidden_states = self.mlp(hidden_states)
+    //   Qwen3MLP: down_proj(silu(gate_proj(x)) * up_proj(x)).
+    //   gate_proj and up_proj both read from norm_buf (post-3i).
+    //   silu_mul: silu(mlp_intermediate) * mlp_up → mlp_intermediate.
+    pub(super) fn post_attn_gate_up(
+        &self,
+        layer: &DflashLayer,
+        args: &PagedLayerArgs,
+        ctx: &ForwardContext,
+        scratch: &DflashScratch,
+    ) -> Result<()> {
+        use crate::layers::ops;
+
+        let PagedLayerArgs {
+            h, inter, stream, ..
+        } = *args;
+        let gpu = ctx.gpu;
+        self.drafter_gemm(
+            gpu,
             &layer.gate_proj,
             &layer.gate_proj_fp8,
             &layer.gate_proj_nvfp4,
+            layer.mx.as_ref().map(|mx| &mx.gate_proj),
             scratch.norm_buf,
             scratch.mlp_intermediate,
             inter,
             h,
+            stream,
         )?;
-        gemm_swap(
+        self.drafter_gemm(
+            gpu,
             &layer.up_proj,
             &layer.up_proj_fp8,
             &layer.up_proj_nvfp4,
+            layer.mx.as_ref().map(|mx| &mx.up_proj),
             scratch.norm_buf,
             scratch.mlp_up,
             inter,
             h,
+            stream,
         )?;
         ops::silu_mul(
             gpu,
@@ -959,21 +1087,55 @@ impl BlockDiffusionDraftHead {
             scratch.mlp_intermediate,
             scratch.mlp_up,
             scratch.mlp_intermediate,
-            g * inter,
+            self.gamma as u32 * inter,
             stream,
-        )?;
-        gemm_swap(
+        )
+    }
+
+    /// Step 3j, second half: down_proj of `mlp_intermediate` into `stream_acc`.
+    pub(super) fn post_attn_down(
+        &self,
+        layer: &DflashLayer,
+        args: &PagedLayerArgs,
+        ctx: &ForwardContext,
+        scratch: &DflashScratch,
+    ) -> Result<()> {
+        let PagedLayerArgs {
+            h, inter, stream, ..
+        } = *args;
+        self.drafter_gemm(
+            ctx.gpu,
             &layer.down_proj,
             &layer.down_proj_fp8,
             &layer.down_proj_nvfp4,
+            layer.mx.as_ref().map(|mx| &mx.down_proj),
             scratch.mlp_intermediate,
             scratch.stream_acc,
             h,
             inter,
-        )?;
+            stream,
+        )
+    }
+
+    /// Step 3k (with the MLP conv's finish): add the MLP output in
+    /// `stream_acc` to the residual in `stream_buf`.
+    pub(super) fn post_attn_residual(
+        &self,
+        layer: &DflashLayer,
+        args: &PagedLayerArgs,
+        ctx: &ForwardContext,
+        scratch: &DflashScratch,
+    ) -> Result<()> {
+        use crate::layers::ops;
+
+        let PagedLayerArgs { h, stream, .. } = *args;
+        let gpu = ctx.gpu;
+        let g = self.gamma as u32;
 
         if let Some(ref conv) = layer.mlp_conv {
-            let output_delta = scratch.dflash2_conv_delta.offset(2 * conv.num_groups * 2);
+            let output_delta = scratch
+                .dflash2_conv_delta
+                .offset(conv.output_delta_offset());
             conv.finish(
                 gpu,
                 self.kernels.dflash2_conv,
@@ -1005,22 +1167,19 @@ impl BlockDiffusionDraftHead {
             g * h,
             stream,
         )?;
-
-        // id259 per-layer dump: final layer output (post-MLP residual), γ × h.
-        // This is the hidden_states the NEXT layer consumes — the per-layer
-        // chain the harness walks to find the first diverging op.
-        if args.block_dump {
-            self.block_dump_buf(
-                ctx,
-                scratch.stream_buf,
+        // DSpine: the layer's code bridge writes each row its predecessor's
+        // message before the next layer's input norm reads the stream.
+        match scratch.dspine.as_ref() {
+            Some(sc) => self.dspine_bridge(
+                gpu,
                 args.layer_idx,
-                "layer_out",
+                scratch.stream_buf,
                 g,
-                h,
+                Self::dspine_single_blocks(scratch),
+                sc,
                 stream,
-            )?;
+            ),
+            None => Ok(()),
         }
-
-        Ok(())
     }
 }

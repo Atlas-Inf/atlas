@@ -128,7 +128,29 @@ impl NemotronMoeLayer {
         let max_m_tiles = if std::env::var("ATLAS_MOE_MAX_M_TILES_ESTIMATE").is_ok() {
             (avg_per_expert * 2).div_ceil(64).max(1) as u32
         } else {
-            (total_expanded as usize).div_ceil(64).max(1) as u32
+            // Exact tiles (omni default, env override): the worst-case bound
+            // total_expanded/64 inflates grid.y to ~2816 tiles x 512 experts,
+            // and the empty tiles cost ~200ms per launch. Read the real sorted
+            // expert_offsets back (one D2H+sync per chunk) and tile by the true
+            // per-expert max. Worst case stays as the clamp so it cannot
+            // truncate.
+            let worst_case = (total_expanded as usize).div_ceil(64).max(1) as u32;
+            let exact_tiles = match std::env::var("ATLAS_MOE_PREFILL_EXACT_TILES")
+                .ok()
+                .as_deref()
+            {
+                Some("0") => false,
+                Some("1") => true,
+                _ => self.exact_prefill_tiles,
+            } && !ctx.graph_capture;
+            if exact_tiles {
+                let mut offsets = vec![0u8; (ne + 1) * 4];
+                ctx.gpu
+                    .copy_d2h_on_stream(expert_offsets, &mut offsets, stream)?;
+                crate::layers::moe::exact_m_tiles(&offsets, worst_case)
+            } else {
+                worst_case
+            }
         };
         // Native FP4 up GEMM: latent activations quantized to NVFP4 once per layer,
         // expert weights consumed as raw E2M1 + scales (no LUT dequant), relu^2
@@ -204,26 +226,73 @@ impl NemotronMoeLayer {
             // relu^2 fused into the UP GEMM's store when the epilogue variant is
             // compiled -- saves a full read+write of expert_up_out.
             let fused = self.moe_grouped_gemm_relu2_k.0 != 0;
-            ops::moe_w4a16_grouped_gemm_ptrtable_64(
-                ctx.gpu,
-                if fused {
-                    self.moe_grouped_gemm_relu2_k
-                } else {
-                    self.moe_grouped_gemm_k
-                },
-                expert_input,
-                self.up_ptrs.packed_ptrs,
-                self.up_ptrs.scale_ptrs,
-                self.up_ptrs.scale2_vals,
-                expert_up_out,
-                expert_offsets,
-                sorted_token_ids,
-                p.num_experts,
-                p.inter,
-                expert_k,
-                max_m_tiles,
-                stream,
-            )?;
+            let mloop = if self.moe_grouped_gemm_mloop2_k.0 != 0 {
+                self.moe_grouped_gemm_mloop2_k
+            } else {
+                self.moe_grouped_gemm_mloop_k
+            };
+            if !fused && mloop.0 != 0 {
+                // gfx1151: m-tile-looping grouped kernel — one CTA covers all of
+                // an expert's m-slabs, so the worst-case grid.y bound can't
+                // flood the launch. No fused relu2: elementwise pass below.
+                ops::moe_w4a16_grouped_gemm_ptrtable_mloop(
+                    ctx.gpu,
+                    mloop,
+                    expert_input,
+                    self.up_ptrs.packed_ptrs,
+                    self.up_ptrs.scale_ptrs,
+                    self.up_ptrs.scale2_vals,
+                    expert_up_out,
+                    expert_offsets,
+                    sorted_token_ids,
+                    p.num_experts,
+                    p.inter,
+                    expert_k,
+                    max_m_tiles,
+                    stream,
+                )?;
+                if self.moe_grouped_gemm_mloop2_k.0 != 0 && self.moe_grouped_gemm_mloop_k.0 != 0 {
+                    mloop2_shadow_check(
+                        ctx,
+                        self.moe_grouped_gemm_mloop_k,
+                        expert_input,
+                        self.up_ptrs.packed_ptrs,
+                        self.up_ptrs.scale_ptrs,
+                        self.up_ptrs.scale2_vals,
+                        expert_up_out,
+                        expert_offsets,
+                        sorted_token_ids,
+                        p.num_experts,
+                        p.inter,
+                        expert_k,
+                        max_m_tiles,
+                        (total_expanded * p.inter) as usize,
+                        stream,
+                        "up",
+                    )?;
+                }
+            } else {
+                ops::moe_w4a16_grouped_gemm_ptrtable_64(
+                    ctx.gpu,
+                    if fused {
+                        self.moe_grouped_gemm_relu2_k
+                    } else {
+                        self.moe_grouped_gemm_k
+                    },
+                    expert_input,
+                    self.up_ptrs.packed_ptrs,
+                    self.up_ptrs.scale_ptrs,
+                    self.up_ptrs.scale2_vals,
+                    expert_up_out,
+                    expert_offsets,
+                    sorted_token_ids,
+                    p.num_experts,
+                    p.inter,
+                    expert_k,
+                    max_m_tiles,
+                    stream,
+                )?;
+            }
             if !fused {
                 let relu2_n = total_expanded * p.inter;
                 KernelLaunch::new(ctx.gpu, self.moe_relu2_elementwise_k)
@@ -262,7 +331,54 @@ impl NemotronMoeLayer {
                 max_m_tiles,
                 stream,
             )?;
+        } else if self.moe_grouped_gemm_mloop_k.0 != 0 || self.moe_grouped_gemm_mloop2_k.0 != 0 {
+            let down_k = if self.moe_grouped_gemm_mloop2_k.0 != 0 {
+                self.moe_grouped_gemm_mloop2_k
+            } else {
+                self.moe_grouped_gemm_mloop_k
+            };
+            ops::moe_w4a16_grouped_gemm_ptrtable_mloop(
+                ctx.gpu,
+                down_k,
+                expert_up_out,
+                self.down_ptrs.packed_ptrs,
+                self.down_ptrs.scale_ptrs,
+                self.down_ptrs.scale2_vals,
+                expert_down_out,
+                expert_offsets,
+                DevicePtr::NULL,
+                p.num_experts,
+                expert_out_dim,
+                p.inter,
+                max_m_tiles,
+                stream,
+            )?;
+            if self.moe_grouped_gemm_mloop2_k.0 != 0 && self.moe_grouped_gemm_mloop_k.0 != 0 {
+                mloop2_shadow_check(
+                    ctx,
+                    self.moe_grouped_gemm_mloop_k,
+                    expert_up_out,
+                    self.down_ptrs.packed_ptrs,
+                    self.down_ptrs.scale_ptrs,
+                    self.down_ptrs.scale2_vals,
+                    expert_down_out,
+                    expert_offsets,
+                    DevicePtr::NULL,
+                    p.num_experts,
+                    expert_out_dim,
+                    p.inter,
+                    max_m_tiles,
+                    (total_expanded * expert_out_dim) as usize,
+                    stream,
+                    "down",
+                )?;
+            }
         } else {
+            // No mloop handle (GB10 / non-HIP): the _64 grouped kernel covers
+            // the same layout. Required — `down_ptrs_t` is None for latent
+            // models, so without this arm the routed DOWN GEMM silently never
+            // launched on GB10 omni (bisected from P9/P10 divergence: expert
+            // output stayed memset-zero, corrupting prefill).
             ops::moe_w4a16_grouped_gemm_ptrtable_64(
                 ctx.gpu,
                 self.moe_grouped_gemm_k,
@@ -483,4 +599,61 @@ impl NemotronMoeLayer {
         }
         Ok(())
     }
+}
+
+/// `ATLAS_MLOOP2_SHADOW=1`: run the fallback `mloop` on the same inputs into a
+/// scratch C buffer and byte-compare against what `mloop2` just produced.
+/// One-shot per process per (call-site) — a diagnostic aid, not a gate.
+#[allow(clippy::too_many_arguments)]
+fn mloop2_shadow_check(
+    ctx: &ForwardContext,
+    up_kernel: spark_runtime::gpu::KernelHandle,
+    a: DevicePtr,
+    packed_ptrs: DevicePtr,
+    scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    c_out: DevicePtr,
+    expert_offsets: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    num_experts: u32,
+    n_out: u32,
+    k: u32,
+    max_m_tiles: u32,
+    c_elems: usize,
+    stream: u64,
+    tag: &str,
+) -> Result<()> {
+    static SHADOWED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if std::env::var_os("ATLAS_MLOOP2_SHADOW").is_none()
+        || SHADOWED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 4
+    {
+        return Ok(());
+    }
+    let bytes = c_elems * 2;
+    let scratch = ctx.gpu.alloc(bytes.max(16))?;
+    ops::moe_w4a16_grouped_gemm_ptrtable_mloop(
+        ctx.gpu,
+        up_kernel,
+        a,
+        packed_ptrs,
+        scale_ptrs,
+        scale2_vals,
+        scratch,
+        expert_offsets,
+        sorted_token_ids,
+        num_experts,
+        n_out,
+        k,
+        max_m_tiles,
+        stream,
+    )?;
+    ctx.gpu.synchronize(stream)?;
+    let mut va = vec![0u8; bytes];
+    let mut vb = vec![0u8; bytes];
+    ctx.gpu.copy_d2h(c_out, &mut va)?;
+    ctx.gpu.copy_d2h(scratch, &mut vb)?;
+    ctx.gpu.free(scratch)?;
+    let mism = va.iter().zip(vb.iter()).filter(|(x, y)| x != y).count();
+    eprintln!("[mloop2-shadow] {tag}: {mism}/{bytes} bytes differ");
+    Ok(())
 }

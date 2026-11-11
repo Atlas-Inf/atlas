@@ -56,7 +56,7 @@ impl Qwen3AttentionLayer {
         let profile = ctx.profile;
         let diag_all =
             std::env::var("ATLAS_DIAG_V4_ALL_LAYERS").is_ok_and(|v| v == "1" || v == "true");
-        let diag_this = self.attn_layer_idx == 0 || diag_all;
+        let diag_this = diag_all;
         macro_rules! prof {
             ($label:expr, $body:expr) => {{
                 if profile {
@@ -642,7 +642,7 @@ impl Qwen3AttentionLayer {
                 inv_sqrt_d,
                 nq * hd,
                 ctx.buffers.splitk_workspace(),
-                ctx.levers.max_decode_seqs,
+                ctx.levers.attn_split_ref_seqs(),
                 stream,
             )
         })?;

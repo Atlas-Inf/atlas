@@ -403,11 +403,11 @@ pub async fn stream_parity(
 
 /// ★ `n > 1` WITH AN IMAGE.
 ///
-/// The blocking path decides PER CHOICE whether that choice carries the
-/// request's image pixels — choice 0 takes them, the rest get an empty vector,
-/// because the encode is shared rather than repeated. That is correct and it
-/// is also index-conditional code that nothing ran. If the later choices lose
-/// the image rather than sharing it, they answer about nothing at all.
+/// The blocking path runs one scheduler request per choice. Every choice
+/// carries the request's image pixels; until 2026-10-21 only choice 0 did and
+/// the rest relied on its leftover encoder rows, which broke silently once a
+/// request without media started clearing that state (#174). If the later
+/// choices lose the image, they answer about nothing at all.
 ///
 /// Every choice must be present and must answer about the picture.
 pub async fn multi_choice(

@@ -13,6 +13,8 @@ use super::diag_norm;
 use crate::layer::{BatchedAttnMetadata, ForwardContext, LayerState};
 use crate::layers::ops;
 
+#[path = "prefill_multi.rs"]
+mod prefill_multi;
 impl Qwen3AttentionLayer {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prefill_inner(
@@ -74,6 +76,7 @@ impl Qwen3AttentionLayer {
         }
 
         // ── 1. RMS norm + residual for N tokens ──
+        self.value_residual_capture(ctx.gpu, hidden, num_tokens, h, stream)?;
         let normed = ctx.buffers.norm_output();
         ops::rms_norm_residual(
             ctx.gpu,
@@ -546,18 +549,15 @@ impl Qwen3AttentionLayer {
     ) -> Result<()> {
         let h = ctx.config.hidden_size;
         let eps = ctx.config.rms_norm_eps as f32;
-        let n = num_tokens as u32;
+        // Sequence-parallel prefill (`layers::glm_sp`): the seam ops (`n`)
+        // run this rank's rows, compacted at row 0 of the highway and
+        // `hidden`; attention and the FFN keep every row (`num_tokens`).
+        let sp = crate::layers::glm_sp::current().filter(|sp| num_tokens == sp.total());
+        let local = |x: DevicePtr| sp.map_or(x, |sp| sp.local(x, ctx.config.hidden_size));
+        let n = sp.map_or(num_tokens, |sp| sp.rows) as u32;
         let hc = self.hc.as_ref().unwrap();
         let hc_mult = hc.hc_mult as u32;
-        // MODEL layer indices, carried on the weights. `attn_layer_idx`
-        // counts ATTENTION layers: it coincides with the model index only on
-        // an all-attention model like DeepSeek-V4. On a 3:1 GDN:attention
-        // interleave `attn_layer_idx == 0` is model layer 3 (the highway
-        // would seed three layers late) and `attn_layer_idx + 1 ==
-        // num_hidden_layers` is `12 == 48` (hc_head would never fire, and on
-        // Qwen the mixer IS the final norm).
-        let is_first_layer = hc.is_first_model_layer;
-        let is_last_layer = hc.is_last_model_layer;
+        let (is_first_layer, is_last_layer) = self.hc_prefill_layer_bounds(hc, ctx);
         let hc_streams = ctx.buffers.hc_streams();
         let post = ctx.buffers.hc_post();
         let comb = ctx.buffers.hc_comb();
@@ -568,8 +568,18 @@ impl Qwen3AttentionLayer {
         let diag_all =
             std::env::var("ATLAS_DIAG_V4_ALL_LAYERS").is_ok_and(|v| v == "1" || v == "true");
         let diag_this = diag_all;
+        // ATLAS_PROFILE_PREFILL steps; `attn` also logs `attn.*` parts.
+        let mut prof = crate::layers::prefill_profile::start(ctx, stream)?;
+        let step = |prof: &mut Option<std::time::Instant>, label: &str| {
+            crate::layers::prefill_profile::step(ctx, stream, prof, "MLA", label)
+        };
 
+        anyhow::ensure!(
+            sp.is_none() || !(is_first_layer || (is_last_layer && hc.head.is_none())),
+            "SP prefill expects a later first layer and a last layer with an hc_head"
+        );
         if is_first_layer {
+            ops::qwen4exp_prefill_seam::clear_pending();
             ops::hc_expand(
                 ctx.gpu,
                 self.hc_expand_k,
@@ -596,22 +606,100 @@ impl Qwen3AttentionLayer {
             stream,
         );
 
-        // ── Attention sublayer ──
-        ops::hc_pre_site(
-            ctx.gpu,
-            self.hc_pre_k,
-            hc_streams,
-            &hc.attn,
+        // ── Attention sublayer ── (with the previous layer's deferred post
+        // fused in, ATLAS_QWEN4EXP_PREFILL_HC)
+        // Qwen hands the collapse's rows straight to the block (no input
+        // norm): copied into `normed` and gathered, slab by slab under
+        // ATLAS_QWEN4EXP_PREFILL_SP_PIPE (`layers::qwen4exp_sp_pipe`).
+        let normed = ctx.buffers.norm_output();
+        let block_norm = ops::HcVariant::of(hc).applies_block_input_norm();
+        let attn_norm = (block_norm && !diag_this)
+            .then(|| self.hc_prefill_norm(&self.input_norm, local(normed), ctx))
+            .flatten();
+        // The four-rank MLA quant gather: the rows are gathered cast for q_a
+        // and kv_a instead (`prefill/paged_glm_sp_gather.rs`), each block as
+        // the seam norms it.
+        let cast = match sp {
+            Some(sp) => self.sp_mla_cast(sp, num_tokens, diag_this, ctx)?,
+            None => None,
+        };
+        let cast_rows = |block| match cast {
+            Some(c) => self.sp_mla_cast_rows(normed, c, block, ctx, stream),
+            None => Ok(()),
+        };
+        let extra = cast.map(|c| {
+            let [(ptr, width), also] = c.tensors(h);
+            super::super::SeamGather {
+                ptr,
+                width,
+                also: Some(also),
+                group: crate::layers::SEAM_GATHER_GROUP,
+                rows: &cast_rows,
+            }
+        });
+        // ATLAS_GLM_SP_GATHER_OVERLAP: pre, norm and gather a row block at a time.
+        let attn_overlapped = self.hc_seam_overlapped_glm(
             hc,
+            &hc.attn,
+            &self.input_norm,
+            (false, cast.is_none()),
+            false,
+            extra,
             hidden,
-            post,
-            comb,
-            ctx.buffers.hc_lowrank_scratch(),
-            n,
-            h as u32,
-            eps,
+            normed,
+            sp,
+            diag_this,
+            ctx,
             stream,
         )?;
+        let mut attn_normed = false;
+        let mut collapse = || -> Result<()> {
+            if !ops::qwen4exp_prefill_seam::pre_with_pending(
+                ctx.gpu,
+                self.hc_post_k,
+                hc,
+                &hc.attn,
+                hc_streams,
+                hidden,
+                post,
+                ctx.buffers.hc_lowrank_scratch(),
+                n,
+                h as u32,
+                eps,
+                stream,
+            )? {
+                attn_normed =
+                    self.hc_pre_prefill_site(&hc.attn, hc, hidden, n, attn_norm, ctx, stream)?;
+            }
+            Ok(())
+        };
+        if attn_overlapped {
+            // GLM's seam has already normalized and gathered every row.
+        } else if block_norm {
+            collapse()?;
+        } else {
+            // ATLAS_QWEN4EXP_PREFILL_W8A8: the collapse also writes its rows
+            // of the q/k/v input as MXFP8 where it can (`mx8.rs`).
+            let row0 = sp.map_or(0, |sp| sp.row0);
+            let mx = self.w8a8_producer(ctx, normed, num_tokens, row0, n as usize)?;
+            crate::layers::qwen4exp_sp_pipe::collapse_and_gather(
+                sp,
+                normed,
+                Some(hidden),
+                n as usize,
+                h,
+                ctx,
+                stream,
+                collapse,
+            )?;
+            if let Some(p) = mx {
+                p.finish();
+            }
+        }
+        // ATLAS_GLM_DET_TRACE stages; `det_rows` are the seam (local) rows.
+        let det = crate::det_trace::on_stream(ctx.gpu, stream);
+        let det_rows = (sp.map_or(0, |sp| sp.row0), n as usize);
+        det.tap("in", hidden, det_rows, h * 2);
         if diag_this {
             super::diag_norm(
                 ctx.gpu,
@@ -636,27 +724,32 @@ impl Qwen3AttentionLayer {
             );
         }
 
-        let normed = ctx.buffers.norm_output();
-        if ops::HcVariant::of(hc).applies_block_input_norm() {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_w_k,
-                hidden,
-                &self.input_norm,
-                normed,
-                n,
-                h as u32,
-                eps,
-                stream,
-            )?;
-        } else {
-            // Qwen: `hc_pre`'s grouped `hc_norm` IS this layer's input norm.
-            // The checkpoint has no per-layer `input_layernorm` and the
-            // loader's ones-placeholder would NOT make a second RMS an
-            // identity. Hand `hc_pre`'s output straight to the block.
-            ctx.gpu
-                .copy_d2d_async(hidden, normed, num_tokens * h * 2, stream)?;
+        // Qwen: `hc_pre`'s grouped `hc_norm` IS this layer's input norm. The
+        // checkpoint has no per-layer `input_layernorm` and the loader's
+        // ones-placeholder would NOT make a second RMS an identity, so the
+        // collapse's output went straight to the block above.
+        if block_norm && !attn_overlapped {
+            if !attn_normed {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_w_k,
+                    hidden,
+                    &self.input_norm,
+                    local(normed),
+                    n,
+                    h as u32,
+                    eps,
+                    stream,
+                )?;
+            }
+            match (sp, cast) {
+                (_, Some(c)) => self.sp_mla_cast_gather_whole(normed, c, ctx, stream)?,
+                (Some(sp), None) => sp.all_gather(normed, h, ctx, stream)?,
+                (None, None) => {}
+            }
         }
+
+        step(&mut prof, "hc_attn_norm")?;
 
         // QSA indexer ingest: park this chunk's raw indexer keys (the
         // indexer consumes the same block input the attention does). Decode
@@ -673,7 +766,14 @@ impl Qwen3AttentionLayer {
                  got seq_len_start=0."
             );
         }
-        let attn_out = if seq_len_start == 0 {
+        let glm_paged = self.glm_paged_prefill(ctx);
+        // ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE: the o_proj may reduce-scatter.
+        let rs_offer = sp.map(|_| crate::layers::qwen4exp_sp_pipe::RsOffer::new());
+        // ATLAS_QWEN4EXP_PREFILL_ROWINV: the paged path from the first chunk
+        // on, so a row attends through the same kernels in any chunk.
+        let rowinv = crate::layers::ops::qwen4exp_rowinv::active();
+        let cast_scope = cast.map(super::super::prefill::MlaCast::enter);
+        let attn_out = if seq_len_start == 0 && !glm_paged && !rowinv {
             self.prefill_attention_with_cache_skip(
                 state,
                 normed,
@@ -702,12 +802,65 @@ impl Qwen3AttentionLayer {
             )?
         };
 
-        if ctx.config.tp_world_size > 1
+        drop(cast_scope);
+        step(&mut prof, "attn")?;
+        det.tap("attn", attn_out, (0, num_tokens), h * 2);
+        // ATLAS_GLM_SP_GATHER_OVERLAP: reduce, post + pre, norm and gather a
+        // row block at a time (GLM's attention output is `norm_output`, the
+        // FFN input it becomes); all of it is timed as `tp_reduce`.
+        // ATLAS_GLM_SP_MLA_OPROJ_A2A: this rank's rows of the attention
+        // output are already whole (`paged_glm_a2a.rs`).
+        let whole = crate::layers::glm_sp::take_attn_whole();
+        // The FFN input's gather, unless the FFN gathers it itself.
+        let ffn_gather = !sp.is_some_and(|sp| self.ffn.sp_gathers_own_input(sp, ctx));
+        // Its quantized rows instead, gathered as each block is normed.
+        let route = |block| match sp {
+            Some(sp) => self.ffn.sp_route_rows(attn_out, sp, block, ctx, stream),
+            None => Ok(()),
+        };
+        let staging = match sp.filter(|_| !ffn_gather && !self.ffn.is_none()) {
+            Some(sp) => self.ffn.sp_route_staging(sp, ctx)?,
+            None => None,
+        };
+        let extra = staging.map(|(ptr, width)| super::super::SeamGather {
+            ptr,
+            width,
+            also: None,
+            group: crate::layers::SEAM_GATHER_GROUP,
+            rows: &route,
+        });
+        let ffn_overlapped = !self.ffn.is_none()
+            && self.hc_seam_overlapped_glm(
+                hc,
+                &hc.ffn,
+                &self.post_attn_norm,
+                (true, ffn_gather),
+                whole,
+                extra,
+                hidden,
+                ctx.buffers.norm_output(),
+                sp,
+                diag_this,
+                ctx,
+                stream,
+            )?;
+        if ffn_overlapped || whole {
+            // GLM's seam includes the reduction and the FFN input gather.
+        } else if crate::layers::glm_sp_overlap::join_ahead_of(attn_out, ctx, stream)? {
+            // The four-rank o_proj ahead: the o_proj reduced its blocks
+            // already (`prefill/paged_glm_oproj_ahead.rs`).
+        } else if let Some(sp) = sp {
+            if !rs_offer.is_some_and(|o| o.taken()) {
+                sp.reduce_scatter(attn_out, h, ctx, stream)?;
+            }
+        } else if ctx.config.tp_world_size > 1
             && let Some(comm) = ctx.comm
         {
             let bytes = num_tokens * h * 2;
             comm.all_reduce_async(attn_out.0, bytes, stream)?;
         }
+        step(&mut prof, "tp_reduce")?;
+        det.tap("attn_red", local(attn_out), det_rows, h * 2);
 
         if batched_meta.is_some() && self.high_speed_swap_engaged(kv_cache) {
             anyhow::bail!(
@@ -777,120 +930,165 @@ impl Qwen3AttentionLayer {
                     eps,
                     stream,
                 )?;
+            } else if is_last_layer && ctx.config.model_type == "glm5_next" {
+                self.hc_contract_prefill(hc_streams, hidden, n, hc_mult, ctx, stream)?;
             }
             return Ok(());
         }
 
-        ops::hc_post_site(
-            ctx.gpu,
-            self.hc_post_k,
-            hc,
-            attn_out,
-            hc_streams,
-            post,
-            comb,
-            hc_streams,
-            n,
-            h as u32,
-            stream,
-        )?;
-        if diag_this {
-            super::diag_norm_f32(
-                ctx.gpu,
-                hc_streams,
-                h,
-                stream,
-                &format!("V4-prefill L{} hc_post-attn", self.attn_layer_idx),
-            );
-            super::diag_norm_f32(
-                ctx.gpu,
-                hc_streams,
-                (n as usize) * (hc_mult as usize) * h,
-                stream,
-                &format!(
-                    "V4-prefill L{} hc_post-attn ALL_STREAMS",
-                    self.attn_layer_idx
-                ),
-            );
-        }
-
-        crate::layers::ple::dump::tap_highway(
-            ctx.gpu,
-            hc_streams,
-            model_layer,
-            "post_attn",
-            num_tokens,
-            (hc_mult as usize) * h,
-            stream,
-        );
-
-        // ── FFN sublayer ──
-        ops::hc_pre_site(
-            ctx.gpu,
-            self.hc_pre_k,
-            hc_streams,
-            &hc.ffn,
-            hc,
-            hidden,
-            post,
-            comb,
-            ctx.buffers.hc_lowrank_scratch(),
-            n,
-            h as u32,
-            eps,
-            stream,
-        )?;
-        if diag_this {
-            super::diag_norm(
-                ctx.gpu,
-                hidden,
-                h,
-                stream,
-                &format!("V4-prefill L{} hc_pre-ffn", self.attn_layer_idx),
-            );
-            super::diag_norm_f32(
-                ctx.gpu,
-                post,
-                (n as usize) * (hc_mult as usize),
-                stream,
-                &format!("V4-prefill L{} post-ffn", self.attn_layer_idx),
-            );
-            super::diag_norm_f32(
-                ctx.gpu,
-                comb,
-                (n as usize) * (hc_mult as usize) * (hc_mult as usize),
-                stream,
-                &format!("V4-prefill L{} comb-ffn", self.attn_layer_idx),
-            );
-        }
-
+        // As at the attention site: Qwen's FFN-site collapse output goes
+        // straight to the FFN, copied and gathered (slab by slab under
+        // ATLAS_QWEN4EXP_PREFILL_SP_PIPE).
         let normed2 = ctx.buffers.norm_output();
-        if ops::HcVariant::of(hc).applies_block_input_norm() {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_w_k,
+        let ffn_norm = (block_norm && !diag_this)
+            .then(|| self.hc_prefill_norm(&self.post_attn_norm, local(normed2), ctx))
+            .flatten();
+        let mut ffn_normed = false;
+        let mut collapse = || -> Result<()> {
+            let seam = self.hc_post_pre_prefill_seam(
+                hc,
+                local(attn_out),
                 hidden,
-                &self.post_attn_norm,
-                normed2,
                 n,
-                h as u32,
-                eps,
+                diag_this,
+                ffn_norm,
+                ctx,
                 stream,
             )?;
+            if !seam.ran() {
+                ops::hc_post_site(
+                    ctx.gpu,
+                    self.hc_post_k,
+                    hc,
+                    local(attn_out),
+                    hc_streams,
+                    post,
+                    comb,
+                    hc_streams,
+                    n,
+                    h as u32,
+                    stream,
+                )?;
+            }
+            if diag_this {
+                super::diag_norm_f32(
+                    ctx.gpu,
+                    hc_streams,
+                    h,
+                    stream,
+                    &format!("V4-prefill L{} hc_post-attn", self.attn_layer_idx),
+                );
+                super::diag_norm_f32(
+                    ctx.gpu,
+                    hc_streams,
+                    (n as usize) * (hc_mult as usize) * h,
+                    stream,
+                    &format!(
+                        "V4-prefill L{} hc_post-attn ALL_STREAMS",
+                        self.attn_layer_idx
+                    ),
+                );
+            }
+
+            step(&mut prof, "hc_attn_post")?;
+            crate::layers::ple::dump::tap_highway(
+                ctx.gpu,
+                hc_streams,
+                model_layer,
+                "post_attn",
+                num_tokens,
+                (hc_mult as usize) * h,
+                stream,
+            );
+
+            // ── FFN sublayer ──
+            ffn_normed = if seam.ran() {
+                seam.normed()
+            } else {
+                self.hc_pre_prefill_site(&hc.ffn, hc, hidden, n, ffn_norm, ctx, stream)?
+            };
+            if diag_this {
+                super::diag_norm(
+                    ctx.gpu,
+                    hidden,
+                    h,
+                    stream,
+                    &format!("V4-prefill L{} hc_pre-ffn", self.attn_layer_idx),
+                );
+                super::diag_norm_f32(
+                    ctx.gpu,
+                    post,
+                    (n as usize) * (hc_mult as usize),
+                    stream,
+                    &format!("V4-prefill L{} post-ffn", self.attn_layer_idx),
+                );
+                super::diag_norm_f32(
+                    ctx.gpu,
+                    comb,
+                    (n as usize) * (hc_mult as usize) * (hc_mult as usize),
+                    stream,
+                    &format!("V4-prefill L{} comb-ffn", self.attn_layer_idx),
+                );
+            }
+            Ok(())
+        };
+        if ffn_overlapped {
+            // The overlapped GLM seam already completed this site.
+        } else if block_norm {
+            collapse()?;
         } else {
-            // Qwen: the FFN site's own `hc_pre` already normed this, exactly
-            // as the attention site's did. There is no
-            // `post_attention_layernorm` in the checkpoint.
-            ctx.gpu
-                .copy_d2d_async(hidden, normed2, num_tokens * h * 2, stream)?;
+            // ATLAS_QWEN4EXP_PREFILL_SP_ROUTE: this rank's rows route first.
+            let route = |s| sp.map_or(Ok(()), |sp| self.ffn.route_local_rows(normed2, sp, ctx, s));
+            crate::layers::qwen4exp_sp_pipe::collapse_and_gather_then(
+                sp,
+                normed2,
+                Some(hidden),
+                [n as usize, h],
+                ctx,
+                stream,
+                collapse,
+                route,
+            )?;
         }
 
-        self.ffn
-            .forward_prefill(normed2, num_tokens, ctx, stream)
-            .map_err(|e| anyhow::anyhow!("ffn.forward_prefill (HC) failed: {e}"))?;
+        // Qwen: the FFN site's own `hc_pre` already normed this, exactly as
+        // the attention site's did. There is no `post_attention_layernorm` in
+        // the checkpoint.
+        if block_norm && !ffn_overlapped {
+            if !ffn_normed {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_w_k,
+                    hidden,
+                    &self.post_attn_norm,
+                    local(normed2),
+                    n,
+                    h as u32,
+                    eps,
+                    stream,
+                )?;
+            }
+            if let Some(sp) = sp.filter(|_| ffn_gather) {
+                sp.all_gather(normed2, h, ctx, stream)?;
+            }
+        }
 
-        let dense_out = ctx.buffers.moe_output();
+        step(&mut prof, "hc_ffn_norm")?;
+        let dense_out = match sp {
+            Some(sp) => self.ffn.forward_prefill_sp(normed2, sp, ctx, stream),
+            None => self
+                .ffn
+                .forward_prefill(normed2, num_tokens, ctx, stream)
+                .map(|()| ctx.buffers.moe_output()),
+        }
+        .map_err(|e| anyhow::anyhow!("ffn.forward_prefill (HC) failed: {e}"))?;
 
+        step(&mut prof, "ffn")?;
+        // A pending MoE output seam (`layers::glm_sp_moe_seam`) runs whole
+        // unless this layer leaves its post to the next one too.
+        if diag_this || is_last_layer || self.post_ffn_out_norm.is_some() {
+            crate::layers::glm_sp_moe_seam::flush(ctx, stream)?;
+        }
         if let Some(ref post_norm) = self.post_ffn_out_norm {
             ops::rms_norm(
                 ctx.gpu,
@@ -905,19 +1103,28 @@ impl Qwen3AttentionLayer {
             )?;
         }
 
-        ops::hc_post_site(
-            ctx.gpu,
-            self.hc_post_k,
-            hc,
-            dense_out,
-            hc_streams,
-            post,
-            comb,
-            hc_streams,
-            n,
-            h as u32,
-            stream,
-        )?;
+        // ATLAS_QWEN4EXP_PREFILL_HC: left to the next layer's collapse
+        // (never from the last layer, never under diagnostics). Under SP the
+        // pending post holds this rank's rows, which the next layer's
+        // collapse runs on too.
+        let deferred = !diag_this
+            && !is_last_layer
+            && ops::qwen4exp_prefill_seam::defer_post(ctx.gpu, hc, dense_out, n, h as u32);
+        if !deferred && !crate::layers::glm_sp_moe_seam::defer_post(self.hc_post_k) {
+            ops::hc_post_site(
+                ctx.gpu,
+                self.hc_post_k,
+                hc,
+                dense_out,
+                hc_streams,
+                post,
+                comb,
+                hc_streams,
+                n,
+                h as u32,
+                stream,
+            )?;
+        }
         if diag_this {
             super::diag_norm_f32(
                 ctx.gpu,
@@ -938,14 +1145,17 @@ impl Qwen3AttentionLayer {
             );
         }
 
+        step(&mut prof, "hc_ffn_post")?;
         if is_last_layer && let Some(ref head) = hc.head {
+            // Under SP: this rank's rows of the contracted `hidden`, which
+            // the model all-gathers after the last layer.
             ops::hc_head_site(
                 ctx.gpu,
                 self.hc_head_k,
                 hc_streams,
                 head,
                 hc,
-                hidden,
+                local(hidden),
                 ctx.buffers.hc_lowrank_scratch(),
                 n,
                 h as u32,
@@ -961,6 +1171,8 @@ impl Qwen3AttentionLayer {
                     &format!("V4-prefill L{} hc_head", self.attn_layer_idx),
                 );
             }
+        } else if is_last_layer && ctx.config.model_type == "glm5_next" {
+            self.hc_contract_prefill(hc_streams, hidden, n, hc_mult, ctx, stream)?;
         } else if is_last_layer {
             tracing::warn!(
                 "V4-prefill L{}: hc_head SKIPPED (no head weights)",

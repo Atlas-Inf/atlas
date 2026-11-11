@@ -7,7 +7,7 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::Qwen3SsmLayer;
-use crate::weight_map::Fp8Weight;
+use crate::weight_map::{DenseWeight, Fp8Weight};
 
 impl Qwen3SsmLayer {
     /// Install native FP8 block-scaled weights for the decode GEMV path.
@@ -40,6 +40,67 @@ impl Qwen3SsmLayer {
         }
         self.qkvz_fp8w = qkvz;
         self.out_proj_fp8w = out_proj;
+    }
+
+    /// Quantize this layer's BF16 GDN projections (`ssm.in_proj_qkvz` and
+    /// `out_proj_dense`, already sliced to this rank) to 128x128 block-scaled
+    /// FP8 E4M3 and install them through [`Self::set_fp8_decode_weights`], so
+    /// every decode arm (`w8a16_gemv`, `w8a16_gemv_batch4` and its wider
+    /// tiers, the multi-seq batch) reads half the bytes. Load time only.
+    ///
+    /// Block scales, never one scale per tensor: a scale computed over a TP
+    /// shard would differ from the TP=1 one. With every rank boundary a
+    /// multiple of 128 (the caller checks), each rank's bytes and scales are
+    /// exactly the matching slice of the TP=1 quantization.
+    ///
+    /// `keep_bf16_prefill`: prefill keeps its BF16 GEMMs (cuBLASLt QKVZ,
+    /// tensor-core out_proj) and the FP8 copy is extra memory. Otherwise the
+    /// BF16 copies are detached and returned for the caller to free — it owns
+    /// the knowledge of which buffer the weight store still holds — and
+    /// prefill runs the block-scaled `w8a16_gemm_pipelined` on the FP8 copy.
+    pub(crate) fn quantize_dense_gdn_to_fp8(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+        quantize_k: spark_runtime::gpu::KernelHandle,
+        stream: u64,
+        keep_bf16_prefill: bool,
+    ) -> Result<Option<(DenseWeight, DenseWeight)>> {
+        let out_dense = self.out_proj_dense.ok_or_else(|| {
+            anyhow::anyhow!("quantize_dense_gdn_to_fp8: no BF16 out_proj (not a BF16 GDN build)")
+        })?;
+        anyhow::ensure!(
+            !self.ssm.in_proj_qkvz.weight.is_null() && self.qkvz_nvfp4.is_none(),
+            "quantize_dense_gdn_to_fp8: no BF16 in_proj_qkvz (not a BF16 GDN build)"
+        );
+        let h = config.hidden_size;
+        let value_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+        let qkvz = crate::weight_map::quantize_to_fp8_blockscaled(
+            &self.ssm.in_proj_qkvz,
+            config.ssm_qkvz_size(),
+            h,
+            gpu,
+            quantize_k,
+            stream,
+        )?;
+        let out = crate::weight_map::quantize_to_fp8_blockscaled(
+            &out_dense, h, value_dim, gpu, quantize_k, stream,
+        )?;
+        // The BF16 sources may be freed as soon as this returns.
+        gpu.synchronize(stream)?;
+        self.set_fp8_decode_weights(Some(qkvz), Some(out));
+        if keep_bf16_prefill {
+            self.fp8w_decode_only = true;
+            return Ok(None);
+        }
+        let qkvz_bf16 = std::mem::replace(
+            &mut self.ssm.in_proj_qkvz,
+            DenseWeight {
+                weight: DevicePtr::NULL,
+            },
+        );
+        self.out_proj_dense = None;
+        Ok(Some((qkvz_bf16, out_dense)))
     }
 
     /// Transpose the block-scaled FP8 weights for the coalesced `w8a16_gemm_t`

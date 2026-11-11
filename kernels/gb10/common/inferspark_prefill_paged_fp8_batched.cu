@@ -28,6 +28,7 @@ __device__ __forceinline__ __nv_bfloat16 fp8_to_bf16(__nv_fp8_storage_t b, float
 }
 
 #define PREFILL_BATCHED
+#define PREFILL_STATE_END
 
 // FP8-smem occupancy variant — see inferspark_prefill_paged_fp8.cu. Keep K/V
 // in shared memory as raw E4M3 bytes (1 B) and dequant in-register before the

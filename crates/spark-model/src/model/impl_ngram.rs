@@ -33,6 +33,18 @@ impl TransformerModel {
         out: DevicePtr,
         stream: u64,
     ) -> Result<()> {
+        anyhow::ensure!(
+            seq_len <= ctx_tokens.len(),
+            "embedding: requested {seq_len} rows from a context of {} tokens",
+            ctx_tokens.len()
+        );
+        // Check before either a device upload or an n-gram/base-table gather.
+        let ids = &ctx_tokens[ctx_tokens.len() - seq_len..];
+        self.validate_embedding_tokens(if self.ngram_embed.is_some() {
+            ctx_tokens
+        } else {
+            ids
+        })?;
         if self.gpu.op_cache().first_n("diag:ngram_embed_arm", 3) {
             tracing::info!(
                 "embed_tokens_fused: ngram={} ctx_len={} seq_len={}",
@@ -48,7 +60,6 @@ impl TransformerModel {
             return ng.embed(ctx_tokens, seq_len, out, self.gpu.as_ref(), stream);
         }
         // Plain path: gather the last `seq_len` ids.
-        let ids = &ctx_tokens[ctx_tokens.len() - seq_len..];
         let bytes: Vec<u8> = ids.iter().flat_map(|t| t.to_le_bytes()).collect();
         let ids_dev = self.buffers.scratch();
         self.gpu.copy_h2d_async(&bytes, ids_dev, stream)?;

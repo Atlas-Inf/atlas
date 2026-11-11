@@ -172,10 +172,21 @@ impl NemotronHWeightLoader {
             // 34 MB), ~2.2 GB over the 20 SSM layers — well under the ~6.4 GB of
             // derived prefill copies this path no longer builds.
             for w in [&mut in_fp8, &mut out_fp8] {
+                // Slab interior: the base allocation is ledger-owned until
+                // teardown, interior frees are no-ops, and offsets are never
+                // reused — the alias can never read stale bytes, which is the
+                // only failure the copy below guarded. Aliasing keeps the
+                // checkpoint bytes resident exactly once (~110 MB/layer).
+                if gpu.is_slab_interior(w.weight) {
+                    continue;
+                }
                 let bytes = (w.n as usize) * (w.k as usize);
                 let owned = gpu.alloc(bytes)?;
                 gpu.copy_d2d(w.weight, owned, bytes)?;
                 w.weight = owned;
+            }
+            if gpu.is_slab_interior(in_fp8.weight) && gpu.is_slab_interior(out_fp8.weight) {
+                tracing::info!("L{i} SSM: FP8 weights are slab-resident — aliased, not copied");
             }
             if i == 0 {
                 // Prove the bytes the kernel will read ARE the checkpoint's. The

@@ -34,8 +34,9 @@ impl Qwen3AttentionLayer {
         inv_sqrt_d: f32,
         q_stride: u32,
         workspace: DevicePtr,
-        // `ModelLevers::max_decode_seqs` — the determinism pin for the
-        // split-K split count. Passed in so the layer holds no process state.
+        // `ModelLevers::attn_split_ref_seqs` — the determinism pin for the
+        // split-K split count (the max batch; under `ATLAS_EXACT_VERIFY` at
+        // least the widest verify). Passed in so the layer holds no process state.
         max_decode_seqs: u32,
         stream: u64,
     ) -> Result<()> {
@@ -541,6 +542,38 @@ impl Qwen3AttentionLayer {
                 // Gemma-4 sliding layers attend only to the last `window_size`
                 // KV positions; full layers (and all non-Gemma-4 models) pass 0.
                 let sliding = self.sliding_window.unwrap_or(0);
+                // ATLAS_ATTN_SHARED_SCAN: one scan of each KV head for the
+                // rows that share its blocks. The test is the layer's
+                // constants only, so serial decode and every verify width
+                // take the same kernel.
+                if sliding == 0
+                    && ops::attn_shared_scan_on(
+                        gpu,
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        block_size,
+                    )
+                {
+                    return ops::attn_shared_scan_bf16(
+                        gpu,
+                        q,
+                        kv_cache.k_pool_ptr(self.attn_layer_idx),
+                        kv_cache.v_pool_ptr(self.attn_layer_idx),
+                        output,
+                        block_table,
+                        seq_lens,
+                        max_blocks_per_seq,
+                        num_seqs,
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        block_size,
+                        inv_sqrt_d,
+                        q_stride,
+                        stream,
+                    );
+                }
                 ops::paged_decode_attn_bf16(
                     gpu,
                     kernel,
@@ -573,22 +606,6 @@ impl Qwen3AttentionLayer {
                 } else {
                     NUM_SMS / current_ctas
                 };
-
-                // DIAGNOSTIC (ATLAS_ATTN_DBG): split-K reduction structure for the
-                // active row depends on `num_seqs` (co-batched count) via num_splits.
-                // Print only when co-batched (num_seqs>1) to confirm whether a
-                // serial-looking workload ever shares a batch (root-cause probe for
-                // batch>1 temp-0 nondeterminism).
-                if num_seqs != 1 && std::env::var("ATLAS_ATTN_DBG").is_ok() {
-                    tracing::debug!(
-                        "ATTN_DBG L{} num_seqs={} num_splits={} (NUM_SMS={} nq={})",
-                        self.attn_layer_idx,
-                        num_seqs,
-                        num_splits,
-                        NUM_SMS,
-                        num_q_heads
-                    );
-                }
 
                 let (k_scale, v_scale) = self.effective_fp8_scales();
                 let sliding = self.sliding_window.unwrap_or(0);

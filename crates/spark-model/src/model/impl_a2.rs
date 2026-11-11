@@ -18,7 +18,7 @@ use super::block_mgmt::{
 };
 use super::ssm_pool::SsmStatePool;
 use super::ssm_snapshot::SsmSnapshotPool;
-use super::types::{PinnedMetaStaging, TransformerModel};
+use super::types::{EP_CMD_BUF_BYTES, EP_MIN_STRIDE, PinnedMetaStaging, TransformerModel};
 use crate::layer::{
     AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
 };
@@ -114,7 +114,9 @@ impl TransformerModel {
         if seq.chunked_prefill_meta.is_none() {
             seq.chunked_prefill_meta = Some(ChunkedPrefillPageMetadata {
                 block_table: self.gpu.alloc(required_blocks.max(1) * 4)?,
-                seq_len: self.gpu.alloc(std::mem::size_of::<u32>())?,
+                seq_len: self.gpu.alloc(
+                    (1 + crate::layer::PREFILL_MAX_SUB_CHUNKS) * std::mem::size_of::<u32>(),
+                )?,
                 block_capacity: required_blocks,
                 uploaded_blocks: 0,
             });
@@ -153,8 +155,12 @@ impl TransformerModel {
             return Ok(tokens.to_vec());
         }
         let comm = self.comm.as_ref().unwrap();
+        if self.ep_cmd_words_on_host(n) {
+            return self.ep_cmd_words(tokens);
+        }
         let byte_len = n * 4;
         let stream = self.gpu.default_stream();
+        let _transfer = self.warm.transfer_span(); // ATLAS_GLM_WARM_TRACE
 
         // Use scratch buffer as device staging. This is safe because
         // ep_broadcast_tokens is called BEFORE prefill_chunk, which overwrites
@@ -218,10 +224,41 @@ impl TransformerModel {
     /// most 2 NCCL ops per chunk-0 cache hit (negligible vs the prefill
     /// compute it unblocks).
     pub(super) fn ep_min_u32(&self, val: u32) -> Result<u32> {
+        self.ep_min_u32_with(val, false)
+    }
+
+    /// [`Self::ep_min_u32`] where rank 0 may arrive long after the others
+    /// (it encoded vision items they only receive: about 20 s per 2048^2
+    /// image). The others take rank 0's word as an idle receive, which the
+    /// slow-collective latch does not count, so a long encode does not mark
+    /// the communicator unhealthy. Same collectives, same order.
+    pub(super) fn ep_min_u32_head_late(&self, val: u32) -> Result<u32> {
+        self.ep_min_u32_with(val, true)
+    }
+
+    fn ep_min_u32_with(&self, val: u32, head_late: bool) -> Result<u32> {
         let Some(comm) = self.comm.as_ref() else {
             return Ok(val);
         };
         let stream = self.gpu.default_stream();
+        // One gather of every rank's value where the transport has one (the
+        // chain), instead of a broadcast, sync and copy back per rank: the
+        // same minimum, one round.
+        let world = comm.world_size();
+        if world * EP_MIN_STRIDE <= EP_CMD_BUF_BYTES && comm.supports_gather_async(4) {
+            let base = self.ep_cmd_buf;
+            self.gpu
+                .copy_h2d(&val.to_le_bytes(), base.offset(comm.rank() * EP_MIN_STRIDE))?;
+            if comm.gather_async(base.0, EP_MIN_STRIDE as i64, 4, stream)? {
+                self.gpu.synchronize(stream)?;
+                let mut buf = vec![0u8; world * EP_MIN_STRIDE];
+                self.gpu.copy_d2h(base, &mut buf)?;
+                return Ok((0..world)
+                    .map(|r| u32::from_le_bytes(buf[r * EP_MIN_STRIDE..][..4].try_into().unwrap()))
+                    .min()
+                    .unwrap_or(val));
+            }
+        }
         // Loop over the ranks of the ACTUAL communicator: under pure TP
         // (`--tp-size 2 --ep-size 1`) `ep_world_size` is 1 but the comm
         // spans `tp_world_size` ranks — looping only `0..1` would leave
@@ -237,7 +274,11 @@ impl TransformerModel {
                 comm.broadcast(self.ep_cmd_buf.0, 4, root)?;
                 val
             } else {
-                comm.broadcast(self.ep_cmd_buf.0, 4, root)?;
+                if head_late && root == 0 {
+                    comm.receive_idle_command_word(self.ep_cmd_buf.0)?;
+                } else {
+                    comm.broadcast(self.ep_cmd_buf.0, 4, root)?;
+                }
                 self.gpu.synchronize(stream)?;
                 let mut buf = [0u8; 4];
                 self.gpu.copy_d2h(self.ep_cmd_buf, &mut buf)?;
@@ -259,10 +300,9 @@ impl TransformerModel {
     /// byte-identical to the legacy single-sequence protocol — head and
     /// worker built before this change continue to interoperate.
     ///
-    /// Both ranks must agree on `v2` at startup (e.g. via the same env
-    /// var). Disagreement causes the worker to misread the next u32 as a
-    /// command code and is the kind of misconfiguration we want to fail
-    /// loudly in development — there's no graceful fallback.
+    /// Both ranks must agree on `v2`: disagreement makes the worker misread
+    /// the next u32 as a command code. `startup_parity` compares it across
+    /// the ranks at startup.
     /// True when the head↔worker command protocol must be live: a
     /// multi-rank NCCL world exists — EP **or** pure TP. Under
     /// `--tp-size 2 --ep-size 1` (GDN HeadParallel 2-node) rank>0 still
@@ -279,6 +319,31 @@ impl TransformerModel {
     /// and both ranks wedged in shape-mismatched collectives (head stuck
     /// in `sample_first_token` D2H, worker in the next cmd recv, both
     /// GPUs spinning in NCCL kernels).
+    /// `(window, request)` vision-row bounds the API admits against
+    /// (`vision_limits`) and both ranks apply to the vision wire state.
+    /// Derived from the shared configuration only, so the head and the
+    /// worker agree. Enntity/atlas b060f987.
+    ///
+    /// The native GLM tower on a multi-rank world keeps a deferred request
+    /// inside its window: that is what the rank protocol admitted before
+    /// (the header was checked against the window), and the per-chunk
+    /// encode past it is not measured on GLM. A single GLM rank never checked
+    /// the header, so it keeps the context bound (its chunks are still
+    /// checked against the window). Enntity/atlas ab1823c8.
+    pub(crate) fn vision_row_bounds(&self) -> crate::model::vision_transport::VisionRowBounds {
+        let ve = self.vision_encoder.as_ref();
+        let window = ve.map_or(0, |ve| ve.output_rows());
+        let glm = ve.is_some_and(|ve| ve.is_glm());
+        crate::model::vision_transport::VisionRowBounds {
+            window,
+            request: if glm && self.multi_rank_protocol_active() {
+                window
+            } else {
+                self.config.max_seq_len
+            },
+        }
+    }
+
     pub(crate) fn multi_rank_protocol_active(&self) -> bool {
         self.comm.is_some() && (self.config.ep_world_size > 1 || self.config.tp_world_size > 1)
     }
@@ -349,23 +414,14 @@ impl TransformerModel {
         Ok(())
     }
 
-    /// Receive a `(seq_id, cmd)` pair from rank 0. Worker-side counterpart
-    /// of [`Self::ep_broadcast_seq_and_cmd`].
-    ///
-    /// With `v2` enabled the returned `seq_id` is the slot the head wants
-    /// the worker to dispatch the command into; with `v2` disabled the
-    /// returned `seq_id` is always 0 (the legacy singleton slot).
-    pub(super) fn ep_recv_seq_and_cmd(&self, v2: bool) -> Result<(u32, u32)> {
-        let seq_id = if v2 { self.ep_broadcast_u32(0)? } else { 0 };
-        let cmd = self.ep_broadcast_u32(0)?;
-        Ok((seq_id, cmd))
-    }
-
     /// Broadcast a u32 command from rank 0 to all ranks.
     /// Rank 0 writes `val` to GPU buffer and broadcasts.
     /// Other ranks receive the value and return it.
     pub(super) fn ep_broadcast_u32(&self, val: u32) -> Result<u32> {
         let comm = self.comm.as_ref().expect("ep_broadcast_u32 without comm");
+        if self.ep_cmd_words_on_host(1) {
+            return Ok(self.ep_cmd_words(&[val])?[0]);
+        }
         let stream = self.gpu.default_stream();
         if comm.rank() == 0 {
             // Sender: H2D + broadcast. Stream ordering ensures completion
@@ -400,6 +456,11 @@ impl TransformerModel {
     /// - 0xFFFFFFF0: prefill start → chunk_len, chunk_start, full_len, then full_len tokens
     /// - 0xFFFFFFF1: alloc slot (frees any prior occupant first, then re-allocates)
     /// - 0xFFFFFFF2/3/4: verify K=2/3/4 → K tokens, then accept/num_accepted
+    /// - 0xFFFFFFF5/6/7, 0xFFFFFFE1, 0xFFFFFFEB/EC: GLM/vision extensions (`impl_a2_ep_worker`)
+    /// - 0xFFFFFFE6: batched multi-sequence verify (`trait_impl/ep_verify_batch.rs`)
+    /// - 0xFFFFFFE8: packed multi-prompt prefill (`glm_packed_prefill`)
+    /// - 0xFFFFFFF8: cache this slot's sequence (`trait_impl::finish_leaf`)
+    /// - 0xFFFFFFED: plant a prefix checkpoint → position (`prefill_b::pc_inflight`)
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored; applies to the whole worker)
     pub(super) fn ep_worker_step_impl(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
         let (seq_id, cmd) = self.ep_recv_seq_and_cmd(self.ep_protocol_v2)?;
@@ -408,6 +469,14 @@ impl TransformerModel {
         if cmd == 0xFFFFFFFF {
             return Ok(false);
         }
+        // ATLAS_QWEN4EXP_GDN_COMMIT_FUSE: only the batched verify takes a
+        // pending GDN commit, and the draft-assist walk between two of them
+        // reads no GDN state; every other command lands them first.
+        if cmd != super::trait_impl::ep_verify_batch::EP_CMD_VERIFY_BATCH
+            && cmd != super::draft_assist::EP_CMD_DRAFT_ASSIST
+        {
+            self.gdn_fuse_flush_all()?;
+        }
 
         // Batched-decode (`0xFFFFFFE0`): the preamble seq_id is sentinel-0;
         // the real per-token routing lives in the seq_ids[N] payload that
@@ -415,6 +484,16 @@ impl TransformerModel {
         // + tokens off the wire and dispatches the matched compute.
         if cmd == 0xFFFFFFE0 {
             return self.ep_worker_decode_batch(slots);
+        }
+        if cmd == super::impl_a2_ep_worker::EP_CMD_PREFILL_MULTI {
+            return self.ep_worker_prefill_multi(slots);
+        }
+        // Batched multi-sequence verify (`trait_impl/ep_verify_batch.rs`).
+        if cmd == super::trait_impl::ep_verify_batch::EP_CMD_VERIFY_BATCH {
+            return self.ep_worker_verify_batch(slots);
+        }
+        if let Some(keep) = self.ep_worker_glm_cmd(seq_id, cmd, slots)? {
+            return Ok(keep);
         }
 
         let slot_idx = seq_id as usize;
@@ -467,10 +546,19 @@ impl TransformerModel {
     /// (seq_id, cmd) preamble + slot lookup + shutdown + alloc are already
     /// handled by the caller; this routine assumes `seq` is the right
     /// slot's allocated `SequenceState`.
-    fn ep_worker_dispatch_cmd(&self, cmd: u32, seq: &mut SequenceState) -> Result<bool> {
+    pub(super) fn ep_worker_dispatch_cmd(&self, cmd: u32, seq: &mut SequenceState) -> Result<bool> {
         let stream = self.gpu.default_stream();
 
         match cmd {
+            super::vision_transport::EP_CMD_VISION_STATE => {
+                self.ep_worker_recv_vision_state(seq)?
+            }
+            super::glm_long_verify::EP_CMD_GLM_LONG_TAIL => self.glm_long_receive_tail(seq)?,
+            0xFFFFFFF6 => self.ep_worker_set_native_fence(seq)?,
+            crate::traits::EP_CMD_PC_PLANT => self.pc_plant_receive(seq)?,
+            super::trait_impl::finish_leaf::EP_CMD_CACHE_SEQUENCE => {
+                self.finish_leaf_cache_command(seq)
+            }
             0xFFFFFFF0 => {
                 // Prefill chunk: receive chunk_len, chunk_start, full prompt length,
                 // then ALL prompt tokens via bulk broadcast (single NCCL op).
@@ -481,6 +569,7 @@ impl TransformerModel {
                 // Compute is_last from chunk bounds — must match rank 0's
                 // value so Marconi skip branches are identical (bug #33).
                 let is_last = chunk_start + chunk_len >= full_len;
+                super::kv_admission::check_worker_chunk_start(seq, chunk_start)?;
                 let _ =
                     self.prefill_chunk(&full_tokens, seq, chunk_start, chunk_len, is_last, stream)?;
                 // Normalize SSM states after every chunk — must mirror the head's
@@ -491,85 +580,48 @@ impl TransformerModel {
                     tracing::warn!("Worker SSM state normalization failed: {e:#}");
                 }
             }
+            // Verify K=2/3/4: receive K tokens, run the verify, receive the
+            // number of accepted drafts, then commit exactly as the head
+            // does (`commit_accepted_prefix`, via `ep_worker_apply_verdict`).
+            // A rollback of the worker's own making would skip what the
+            // commit also rewinds: the per-layer verify aux (qwen4_exp's PLE
+            // carry and QSA ingest watermark, replicated on every rank) and a
+            // deferred GDN commit, and the ranks would part ways.
             0xFFFFFFF2 => {
-                // Verify K=2: receive 2 tokens, run verify, receive accept/reject
                 let t0 = self.ep_broadcast_u32(0)?;
                 let t1 = self.ep_broadcast_u32(0)?;
                 self.sync_secondary()?;
                 self.decode_verify_graphed(&[t0, t1], seq, stream)?;
-                let accepted = self.ep_broadcast_u32(0)?;
-                if accepted == 1 {
-                    self.start_checkpoint_async(seq)?;
-                    self.trim_proposer_state(seq, 1, 0)?;
-                } else {
-                    seq.seq_len -= 1;
-                    seq.tokens.pop();
-                    self.trim_proposer_state(seq, 0, 0)?;
-                    self.start_rollback_and_checkpoint_async(seq, 1)?;
-                }
+                // The head sends accept (1) or reject (0) of its one draft.
+                let num_accepted = self.ep_broadcast_u32(0)? as usize;
+                self.ep_worker_apply_verdict(seq, &[t0, t1], num_accepted)?;
             }
             0xFFFFFFF3 => {
-                // Verify K=3: receive 3 tokens, run verify, receive num_accepted (0/1/2)
                 let t0 = self.ep_broadcast_u32(0)?;
                 let t1 = self.ep_broadcast_u32(0)?;
                 let t2 = self.ep_broadcast_u32(0)?;
                 self.sync_secondary()?;
                 self.decode_verify_graphed_k3(&[t0, t1, t2], seq, stream)?;
-                let num_accepted = self.ep_broadcast_u32(0)?;
-                self.trim_proposer_state(seq, num_accepted as usize, 0)?;
-                match num_accepted {
-                    2 => {
-                        self.start_checkpoint_async(seq)?;
-                    }
-                    1 => {
-                        seq.seq_len -= 1;
-                        seq.tokens.pop();
-                        self.start_rollback_and_checkpoint_async(seq, 2)?;
-                    }
-                    _ => {
-                        seq.seq_len -= 2;
-                        seq.tokens.pop();
-                        seq.tokens.pop();
-                        self.start_rollback_and_checkpoint_async(seq, 1)?;
-                    }
-                }
+                let num_accepted = self.ep_broadcast_u32(0)? as usize;
+                self.ep_worker_apply_verdict(seq, &[t0, t1, t2], num_accepted)?;
             }
             0xFFFFFFF4 => {
-                // Verify K=4: receive 4 tokens, run verify, receive num_accepted (0/1/2/3)
                 let t0 = self.ep_broadcast_u32(0)?;
                 let t1 = self.ep_broadcast_u32(0)?;
                 let t2 = self.ep_broadcast_u32(0)?;
                 let t3 = self.ep_broadcast_u32(0)?;
                 self.sync_secondary()?;
                 self.decode_verify_graphed_k4(&[t0, t1, t2, t3], seq, stream)?;
-                let num_accepted = self.ep_broadcast_u32(0)?;
-                self.trim_proposer_state(seq, num_accepted as usize, 0)?;
-                match num_accepted {
-                    3 => {
-                        self.start_checkpoint_async(seq)?;
-                    }
-                    2 => {
-                        seq.seq_len -= 1;
-                        seq.tokens.pop();
-                        self.start_rollback_and_checkpoint_async(seq, 3)?;
-                    }
-                    1 => {
-                        seq.seq_len -= 2;
-                        seq.tokens.pop();
-                        seq.tokens.pop();
-                        self.start_rollback_and_checkpoint_async(seq, 2)?;
-                    }
-                    _ => {
-                        seq.seq_len -= 3;
-                        seq.tokens.pop();
-                        seq.tokens.pop();
-                        seq.tokens.pop();
-                        self.start_rollback_and_checkpoint_async(seq, 1)?;
-                    }
-                }
+                let num_accepted = self.ep_broadcast_u32(0)? as usize;
+                self.ep_worker_apply_verdict(seq, &[t0, t1, t2, t3], num_accepted)?;
             }
+            0xFFFFFFF5 => self.ep_worker_generic_verify(seq, stream)?,
             token => {
-                // Regular decode
+                // Regular decode. A verify commit may still be in flight on
+                // the secondary stream: the head orders its decode after it
+                // (`sync_secondary` in the scheduler), which no wire command
+                // carries, so the worker orders its own.
+                self.sync_secondary()?;
                 self.decode(token, seq, stream)?;
             }
         }
@@ -592,53 +644,19 @@ impl TransformerModel {
     /// payload from a buggy head fails before touching slot state.
     fn ep_worker_decode_batch(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
         let n = self.ep_broadcast_u32(0)? as usize;
+        self.ep_worker_check_independent_width(n, slots)?;
         let seq_ids = self.ep_broadcast_tokens(&vec![0u32; n])?;
         let tokens = self.ep_broadcast_tokens(&vec![0u32; n])?;
 
-        // Validate up front so we fail before touching slot state.
-        let mut seen = std::collections::HashSet::new();
-        for &id in &seq_ids {
-            let idx = id as usize;
-            if idx >= slots.len() {
-                anyhow::bail!(
-                    "ep_worker_decode_batch: seq_id {} exceeds slot capacity {}",
-                    id,
-                    slots.len(),
-                );
-            }
-            if !seen.insert(id) {
-                anyhow::bail!("ep_worker_decode_batch: duplicate seq_id {} in batch", id);
-            }
-        }
-
-        // Drain populated slots into a (idx, ref) Vec we can index by
-        // position with `swap_remove`. The borrow checker won't let us
-        // index `slots[seq_ids[i]]` in a loop because each `&mut` is
-        // distinct but the indexer can't prove non-overlap.
-        let mut slot_refs: Vec<(usize, &mut SequenceState)> = slots
-            .iter_mut()
-            .enumerate()
-            .filter_map(|(i, opt)| opt.as_mut().map(|s| (i, s)))
-            .collect();
-
-        // Order the refs to match the head's seq_ids order so the
-        // compute path processes tokens in the same batch index as the
-        // head — critical for KV-cache row alignment per slot.
-        let mut refs: Vec<&mut SequenceState> = Vec::with_capacity(n);
-        for &id in &seq_ids {
-            let idx = id as usize;
-            let pos = slot_refs
-                .iter()
-                .position(|(i, _)| *i == idx)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("ep_worker_decode_batch: slot {} not allocated", idx)
-                })?;
-            let (_, seq) = slot_refs.swap_remove(pos);
-            refs.push(seq);
-        }
+        // In the head's seq_ids order, so each row lands on its own slot —
+        // critical for KV-cache row alignment. Validated before any state is
+        // touched.
+        let mut refs = self.ep_worker_slot_refs(&seq_ids, slots)?;
 
         let stream = self.gpu.default_stream();
+        self.sync_secondary()?; // as for the single-token decode above
         self.decode_batch_compute_main(&tokens, &mut refs, stream)?;
+        refs.iter().for_each(|s| self.finish_leaf_after_decode(s));
         Ok(true)
     }
 }

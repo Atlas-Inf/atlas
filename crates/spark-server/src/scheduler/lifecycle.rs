@@ -140,6 +140,15 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize)
     // the response, so by the caching decision at the end of this function the
     // field is already `None` for blocking clients.
     let engine_failed = a.engine_error.is_some();
+    // One line per server-side cut, whichever guard set it: the single
+    // place every `guard_stop` passes, so a run can count them (an MLPerf
+    // point is invalid if any response was ended by a heuristic).
+    if let Some(guard) = a.guard_stop {
+        tracing::warn!(
+            "GUARD_STOP fired: {guard} (output_tokens={})",
+            a.output_tokens.len()
+        );
+    }
     let reason = if engine_failed {
         "error"
     } else {
@@ -170,7 +179,7 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize)
                     decode_time_ms: decode_ms,
                     reasoning_tokens: a.thinking_tokens,
                     cached_prompt_tokens: a.cached_prompt_tokens,
-                    accepted_prediction_tokens: a.mtp_acct.accepted_total() as usize,
+                    accepted_prediction_tokens: a.mtp_acct.accepted_output_total() as usize,
                     guard_stop: a.guard_stop,
                 },
                 "done frame",
@@ -188,7 +197,8 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize)
                     logprobs: std::mem::take(&mut a.logprobs_data),
                     reasoning_tokens: a.thinking_tokens,
                     cached_prompt_tokens: a.cached_prompt_tokens,
-                    accepted_prediction_tokens: a.mtp_acct.accepted_total() as usize,
+                    accepted_prediction_tokens: a.mtp_acct.accepted_output_total() as usize,
+                    guard_stop: a.guard_stop,
                     prompt_logprobs: std::mem::take(&mut a.seq.prompt_logprobs)
                         .into_iter()
                         .map(|p| crate::api::TokenLogprobs {
@@ -221,6 +231,7 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize)
     };
     let ttft_ms = a.decode_start.duration_since(a.request_start).as_secs_f64() * 1000.0;
     super::mtp_accept_debug::RequestAccept::log_done(n, reason, tps, ttft_ms, &a.mtp_acct);
+    super::copy_drafts::log_done(&a.spec_adapt.copy);
     // Cache the full sequence (prompt + generated) in the prefix cache.
     // Must happen BEFORE free_sequence() so block indices are still valid.
     // Enables multi-turn sessions to reuse KV cache for prior assistant responses.
@@ -275,17 +286,41 @@ pub fn send_error(model: &dyn Model, a: &mut ActiveSeq, msg: &str) {
 /// an ActiveSeq. Without this the sender is silently dropped, producing
 /// a misleading "Inference cancelled" error on the client side.
 pub fn send_error_to_sink(sink: &mut ResponseSink, msg: &str) {
+    send_sink_error(
+        sink,
+        StreamEvent::Error(msg.to_string()),
+        anyhow::anyhow!("{msg}"),
+    );
+}
+
+/// [`send_error_to_sink`] for a request the server cannot serve as asked
+/// (a blocking client gets HTTP 400 via [`crate::api::InvalidRequestError`]).
+pub fn send_invalid_request_to_sink(sink: &mut ResponseSink, msg: &str) {
+    send_sink_error(
+        sink,
+        StreamEvent::InvalidRequest(msg.to_string()),
+        crate::api::InvalidRequestError(msg.to_string()).into(),
+    );
+}
+
+/// Report a failed prefill: HTTP 400 when the request itself can never fit
+/// (resending the same images fails the same way, #180), otherwise 500.
+pub fn send_prefill_error_to_sink(sink: &mut ResponseSink, msg: &str, e: &anyhow::Error) {
+    if e.is::<spark_model::model::VisionCapacityError>() {
+        send_invalid_request_to_sink(sink, msg);
+    } else {
+        send_error_to_sink(sink, msg);
+    }
+}
+
+fn send_sink_error(sink: &mut ResponseSink, event: StreamEvent, err: anyhow::Error) {
     match sink {
         ResponseSink::Streaming(tx) => {
-            super::mod_helpers::spawn_terminal_send(
-                tx,
-                StreamEvent::Error(msg.to_string()),
-                "pre-seq error frame",
-            );
+            super::mod_helpers::spawn_terminal_send(tx, event, "pre-seq error frame");
         }
         ResponseSink::Blocking(tx) => {
             if let Some(tx) = tx.take()
-                && tx.send(Err(anyhow::anyhow!("{msg}"))).is_err()
+                && tx.send(Err(err)).is_err()
             {
                 tracing::warn!("send_error_to_sink: blocking Error send failed (receiver dropped)");
             }
@@ -355,6 +390,11 @@ pub fn resume_swapped_seq(
     model.restore_sequence_state(&mut seq, s.num_blocks, &mut reader)?;
     drop(reader);
     spill.remove_file(s.swap_id)?;
+    // Swap restore allocates a fresh local sequence without rerunning prefill;
+    // carry the native-only fence to both this rank and the worker before the
+    // resumed decode can issue any TP2/EP2 command.
+    seq.disable_mtp = s.disable_mtp;
+    model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, s.disable_mtp)?;
 
     // Restore CPU-side metadata.
     seq.tokens = s.tokens;
@@ -367,6 +407,8 @@ pub fn resume_swapped_seq(
     // remainder of the decode. Stores the freshly resolved index (release keys
     // off it, so the acquire/release stay balanced regardless of any rotate).
     seq.acquired_adapter_slot = model.acquire_adapter_slot(s.adapter_slot);
+    // The fresh sequence carries no min_tokens ban, and its drafter no floor.
+    s.eos_ban.arm(&mut seq);
 
     Ok(ActiveSeq {
         seq,
@@ -427,6 +469,8 @@ pub fn resume_swapped_seq(
         content_tokens: 0,
         prose_tokens_since_last_tool: 0,
         think_watchdog_fires: s.think_watchdog_fires,
+        loop_steers: s.loop_steers,
+        loop_steer_max: s.loop_steer_max,
         think_force_closed: s.think_force_closed,
         rollback_count: s.rollback_count,
         // Decode-rollback SSM snapshots are GPU-resident and not part of

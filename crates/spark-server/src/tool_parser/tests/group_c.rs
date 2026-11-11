@@ -462,3 +462,6 @@ fn fuzzy_repair_no_false_positive_on_distinct_names() {
     assert_eq!(v.errors.len(), 1);
     assert!(v.errors[0].contains("Unknown tool"));
 }
+
+#[path = "group_c/tail.rs"]
+mod tail;

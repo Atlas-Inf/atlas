@@ -27,6 +27,7 @@ impl LogitsProcessor for GrammarBitmaskApply {
             && let Some(ref mut gs) = a.grammar_state
             && gs.fill_bitmask()
         {
+            gs.choose_branch(logits);
             gs.apply_bitmask_to_logits(logits);
         }
         ProcessorOutcome::Continue

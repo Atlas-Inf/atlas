@@ -26,61 +26,21 @@
 
 #include <cuda_bf16.h>
 
-extern "C" __global__ void rope_forward(
-    __nv_bfloat16* __restrict__ Q,          // [batch, seq_len, num_q_heads, head_dim]
-    __nv_bfloat16* __restrict__ K,          // [batch, seq_len, num_kv_heads, head_dim]
-    const unsigned int* __restrict__ positions,  // [batch, seq_len]
-    const unsigned int seq_len,
-    const unsigned int num_q_heads,
-    const unsigned int num_kv_heads,
-    const unsigned int head_dim,
-    const unsigned int rotary_dim,           // Number of dims to rotate (e.g., 64)
-    const float theta                        // Base frequency (e.g., 10000000.0)
-) {
-    const unsigned int head_idx = blockIdx.x;     // Combined Q+K head index
-    const unsigned int seq_block = blockIdx.y;    // Which group of seq positions
-    const unsigned int batch = blockIdx.z;
-    const unsigned int tid = threadIdx.x;
-
-    // Determine if we're processing Q or K
+// One (position, pair) rotation of `rope_forward`, frequencies from `s_freq`.
+__device__ __forceinline__ void rope_rotate_pair(
+    __nv_bfloat16* __restrict__ Q, __nv_bfloat16* __restrict__ K,
+    const unsigned int* __restrict__ positions, unsigned int seq_len, unsigned int num_q_heads,
+    unsigned int num_kv_heads, unsigned int head_dim, unsigned int rotary_dim, const float* s_freq,
+    unsigned int head_idx, unsigned int batch, unsigned int seq_pos, unsigned int pair_idx) {
     const bool is_q = (head_idx < num_q_heads);
     const unsigned int head = is_q ? head_idx : (head_idx - num_q_heads);
-
-    if (!is_q && head >= num_kv_heads) return;
-
-    // Each block handles rotary_dim/2 pairs per position.
-    // With rotary_dim=64: 32 pairs per position.
-    // With 128 threads: 128 / 32 = 4 positions per block.
-    const unsigned int pairs_per_pos = rotary_dim / 2;
-    const unsigned int pos_per_block = 128 / pairs_per_pos;
-    // Guard: if rotary_dim > 256, pairs_per_pos > 128, need different mapping
-    // For rotary_dim=64: pairs_per_pos=32, pos_per_block=4
-
-    const unsigned int local_pos = tid / pairs_per_pos;   // 0..3
-    const unsigned int pair_idx = tid % pairs_per_pos;     // 0..31
-
-    // freq depends ONLY on pair_idx, but the block covers pos_per_block positions, so
-    // every freq was recomputed once per thread -- pos_per_block redundant FP64 pow()s.
-    // FP64 runs at 1/64 rate on SM121, which left this kernel ~13x above its bandwidth
-    // floor (1.16 ms for 4.4M elements). Evaluate each distinct freq once and share it.
-    // Bit-identical (same FP64 pow) and it must happen BEFORE the divergent return
-    // below, or the __syncthreads() is unreachable for the exited threads.
-    __shared__ float s_freq[128];
-    if (tid < pairs_per_pos) {
-        const double fe = (double)(2 * tid) / (double)rotary_dim;
-        s_freq[tid] = (float)(1.0 / pow((double)theta, fe));
-    }
-    __syncthreads();
-
-    const unsigned int seq_pos = seq_block * pos_per_block + local_pos;
-    if (seq_pos >= seq_len) return;
 
     // Get absolute position for this token
     const unsigned int abs_pos = positions[batch * seq_len + seq_pos];
 
-    // Compute frequency for this pair in FP64 to prevent precision loss at high positions.
-    // FP32 powf() has ~1e-6 relative error; at position 30K this causes ~0.03 rad drift.
-    // freq_i = 1.0 / theta^(2*pair_idx / rotary_dim)
+    // freq_i = 1.0 / theta^(2*pair_idx / rotary_dim), evaluated in FP64 once
+    // per block into `s_freq`: FP32 powf() has ~1e-6 relative error; at
+    // position 30K this causes ~0.03 rad drift.
     const float freq = s_freq[pair_idx];
     const float angle = (float)abs_pos * freq;
     const float cos_val = cosf(angle);
@@ -112,6 +72,85 @@ extern "C" __global__ void rope_forward(
     // Store back
     ptr[d0] = __float2bfloat16(y0);
     ptr[d1] = __float2bfloat16(y1);
+}
+
+// The block's distinct frequencies, once: freq depends ONLY on pair_idx, but
+// a block covers several positions, so every freq was recomputed once per
+// thread -- redundant FP64 pow()s. FP64 runs at 1/64 rate on SM121, which
+// left this kernel ~13x above its bandwidth floor (1.16 ms for 4.4M
+// elements). Bit-identical (same FP64 pow); called by every thread before any
+// divergent return, or the __syncthreads() is unreachable for exited threads.
+__device__ __forceinline__ void rope_block_freqs(float* s_freq, unsigned int rotary_dim, float theta) {
+    const unsigned int tid = threadIdx.x;
+    if (tid < rotary_dim / 2) {
+        const double fe = (double)(2 * tid) / (double)rotary_dim;
+        s_freq[tid] = (float)(1.0 / pow((double)theta, fe));
+    }
+    __syncthreads();
+}
+
+extern "C" __global__ void rope_forward(
+    __nv_bfloat16* __restrict__ Q,          // [batch, seq_len, num_q_heads, head_dim]
+    __nv_bfloat16* __restrict__ K,          // [batch, seq_len, num_kv_heads, head_dim]
+    const unsigned int* __restrict__ positions,  // [batch, seq_len]
+    const unsigned int seq_len,
+    const unsigned int num_q_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    const unsigned int rotary_dim,           // Number of dims to rotate (e.g., 64)
+    const float theta                        // Base frequency (e.g., 10000000.0)
+) {
+    const unsigned int head_idx = blockIdx.x;     // Combined Q+K head index
+    const unsigned int tid = threadIdx.x;
+    if (head_idx >= num_q_heads + num_kv_heads) return;
+
+    // Each block handles rotary_dim/2 pairs per position.
+    // With rotary_dim=64: 32 pairs per position; 128 threads -> 4 positions.
+    const unsigned int pairs_per_pos = rotary_dim / 2;
+    const unsigned int pos_per_block = 128 / pairs_per_pos;
+    const unsigned int local_pos = tid / pairs_per_pos;
+    const unsigned int pair_idx = tid % pairs_per_pos;
+
+    __shared__ float s_freq[128];
+    rope_block_freqs(s_freq, rotary_dim, theta);
+
+    const unsigned int seq_pos = blockIdx.y * pos_per_block + local_pos;
+    if (seq_pos >= seq_len) return;
+    // Threads past the last whole position of this block (rotary_dim/2 not a
+    // divisor of 128) would rotate the next block's first row a second time.
+    if (local_pos >= pos_per_block) return;
+    rope_rotate_pair(Q, K, positions, seq_len, num_q_heads, num_kv_heads, head_dim, rotary_dim,
+                     s_freq, head_idx, blockIdx.z, seq_pos, pair_idx);
+}
+
+// `rope_forward` with each block covering ROPE_ROWS groups of positions, so
+// the per-block FP64 frequencies amortize over ROPE_ROWS x more rotations (at
+// rotary_dim 128 the plain form computes 64 FP64 pow()s per 2 positions).
+// Bit-identical. Grid: (num_q_heads + num_kv_heads,
+// ceil(seq_len / (pos_per_block * ROPE_ROWS)), batch). `ops::rope` prefers it.
+#define ROPE_ROWS 16
+extern "C" __global__ void rope_forward_rows(
+    __nv_bfloat16* __restrict__ Q, __nv_bfloat16* __restrict__ K,
+    const unsigned int* __restrict__ positions, const unsigned int seq_len,
+    const unsigned int num_q_heads, const unsigned int num_kv_heads, const unsigned int head_dim,
+    const unsigned int rotary_dim, const float theta) {
+    const unsigned int head_idx = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    if (head_idx >= num_q_heads + num_kv_heads) return;
+    const unsigned int pairs_per_pos = rotary_dim / 2;
+    const unsigned int pos_per_block = 128 / pairs_per_pos;
+    const unsigned int local_pos = tid / pairs_per_pos;
+    const unsigned int pair_idx = tid % pairs_per_pos;
+
+    __shared__ float s_freq[128];
+    rope_block_freqs(s_freq, rotary_dim, theta);
+    if (local_pos >= pos_per_block) return;
+    for (unsigned int r = 0; r < ROPE_ROWS; ++r) {
+        const unsigned int seq_pos = (blockIdx.y * ROPE_ROWS + r) * pos_per_block + local_pos;
+        if (seq_pos >= seq_len) return;
+        rope_rotate_pair(Q, K, positions, seq_len, num_q_heads, num_kv_heads, head_dim, rotary_dim,
+                         s_freq, head_idx, blockIdx.z, seq_pos, pair_idx);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -199,6 +238,7 @@ extern "C" __global__ void rope_forward_strided(
 
     const unsigned int seq_pos = seq_block * pos_per_block + local_pos;
     if (seq_pos >= seq_len) return;
+    if (local_pos >= pos_per_block) return;   // see rope_forward
 
     // Get absolute position for this token
     const unsigned int abs_pos = positions[batch * seq_len + seq_pos];
@@ -371,6 +411,7 @@ extern "C" __global__ void rope_forward_yarn(
 
     const unsigned int seq_pos = seq_block * pos_per_block + local_pos;
     if (seq_pos >= seq_len) return;
+    if (local_pos >= pos_per_block) return;   // see rope_forward
 
     const unsigned int abs_pos = positions[batch * seq_len + seq_pos];
 
@@ -432,6 +473,7 @@ extern "C" __global__ void rope_forward_yarn_scaled(
     const unsigned int pair_idx = tid % pairs_per_pos;
     const unsigned int seq_pos = seq_block * pos_per_block + local_pos;
     if (seq_pos >= seq_len) return;
+    if (local_pos >= pos_per_block) return;   // see rope_forward
 
     const unsigned int num_heads = is_q ? num_q_heads : num_kv_heads;
     __nv_bfloat16* ptr = (is_q ? Q : K)
@@ -495,6 +537,7 @@ extern "C" __global__ void rope_forward_yarn_interleaved(
 
     const unsigned int seq_pos = seq_block * pos_per_block + local_pos;
     if (seq_pos >= seq_len) return;
+    if (local_pos >= pos_per_block) return;   // see rope_forward
 
     const unsigned int abs_pos = positions[batch * seq_len + seq_pos];
 
@@ -560,6 +603,7 @@ extern "C" __global__ void rope_forward_yarn_interleaved_inv(
     const unsigned int pair_idx = tid % pairs_per_pos;
     const unsigned int seq_pos = seq_block * pos_per_block + local_pos;
     if (seq_pos >= seq_len) return;
+    if (local_pos >= pos_per_block) return;   // see rope_forward
 
     const unsigned int abs_pos = positions[batch * seq_len + seq_pos];
     const float freq = inv_freq[pair_idx];

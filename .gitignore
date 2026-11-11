@@ -155,3 +155,4 @@ bench/qwen4_exp/qwen4exp_forward_golden.npz
 *.sqlite-wal
 *.sqlite-shm
 *.sqlite-journal
+.built-*

@@ -16,18 +16,23 @@ use super::fsm::{Fsm, NO_NEXT_STATE};
 use super::traversal;
 
 /// An immutable, CSR-packed finite-state machine.
+///
+/// The storage is shared: a clone is a reference, as `std::shared_ptr`
+/// makes it upstream. Every rule's view of a grammar's `complete_fsm`
+/// holds one, and a deep copy per rule made a grammar O(rules x states)
+/// in memory — gigabytes for a strict object of ~100 required properties.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CompactFsm {
-    edges: Compact2DArray<FsmEdge>,
-    edge_aux_data: Vec<i32>,
+    edges: std::sync::Arc<Compact2DArray<FsmEdge>>,
+    edge_aux_data: std::sync::Arc<Vec<i32>>,
 }
 
 impl CompactFsm {
     /// Build directly from a CSR edge array and aux data.
     pub fn new(edges: Compact2DArray<FsmEdge>, edge_aux_data: Vec<i32>) -> Self {
         Self {
-            edges,
-            edge_aux_data,
+            edges: std::sync::Arc::new(edges),
+            edge_aux_data: std::sync::Arc::new(edge_aux_data),
         }
     }
 
@@ -55,7 +60,7 @@ impl CompactFsm {
 
     /// Replace the repeat-edge auxiliary data buffer.
     pub fn set_edge_aux_data(&mut self, data: Vec<i32>) {
-        self.edge_aux_data = data;
+        self.edge_aux_data = std::sync::Arc::new(data);
     }
 
     /// Decode the repeat-edge info stored at aux index `idx`.
@@ -66,6 +71,11 @@ impl CompactFsm {
     /// Total edges across all states.
     pub fn num_edges(&self) -> usize {
         self.edges.total_elems()
+    }
+
+    /// True if `self` and `other` are the same storage (clones of one FSM).
+    pub fn shares_storage_with(&self, other: &CompactFsm) -> bool {
+        std::sync::Arc::ptr_eq(&self.edges, &other.edges)
     }
 
     /// Approximate heap footprint in bytes.
@@ -136,8 +146,26 @@ impl CompactFsm {
     }
 
     /// All states reachable from `from`. `result` is cleared first.
+    ///
+    /// Walks the packed rows in place, as `Fsm::reachable_states` walks
+    /// its own. Expanding the whole FSM first cost O(states) per call, and
+    /// eager mask warm-up calls this once per rule of a grammar whose
+    /// rules share one FSM: O(rules x states).
     pub fn reachable_states(&self, from: &[i32], result: &mut AHashSet<i32>) {
-        self.to_fsm().reachable_states(from, result);
+        result.clear();
+        let mut queue: std::collections::VecDeque<i32> = std::collections::VecDeque::new();
+        for &s in from {
+            if result.insert(s) {
+                queue.push_back(s);
+            }
+        }
+        while let Some(cur) = queue.pop_front() {
+            for edge in self.edges(cur as usize) {
+                if result.insert(edge.target) {
+                    queue.push_back(edge.target);
+                }
+            }
+        }
     }
 
     /* --------------------- construction ---------------------- */
@@ -145,7 +173,7 @@ impl CompactFsm {
     /// Expand back into a mutable [`Fsm`].
     pub fn to_fsm(&self) -> Fsm {
         let edges: Vec<Vec<FsmEdge>> = self.edges.iter_rows().map(|r| r.to_vec()).collect();
-        Fsm::from_edges(edges, self.edge_aux_data.clone())
+        Fsm::from_edges(edges, self.edge_aux_data.to_vec())
     }
 }
 

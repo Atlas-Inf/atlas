@@ -1,0 +1,1561 @@
+{
+  "schema_version": 1,
+  "scope": "Historical local measurements, not a current-tip CI or release-gate record. No new GPU measurements were made while preparing this summary.",
+  "measured_date": "2026-10-08 (content, coherence and output comparison); qualification includes earlier build/operator checks",
+  "identity": {
+    "native_source_commit": "451bbc21f3ff8df356a159cb376eb7518e26c395",
+    "native_binary_sha256": "6f65cc458e142740d28f757f54f4eab14d4e96eee46a519e3d6fe7bc4c69bfcb",
+    "native_kernel_set_hash": "5fd26547c6f6",
+    "reference_source_commit": "72588541a466f53cb9d38afd74c515e14ab601db",
+    "reference_image_sha256": "0b1e1d5c22bfc427fb5e8430e9112fc175616313ab53e0298528d67c15162a82",
+    "hardware": {
+      "architecture": "aarch64",
+      "gpus": "2x NVIDIA GB10",
+      "driver": "580.126.09",
+      "cuda": "13.0",
+      "engine_cutlass": "cf064d2e6bad2886238ac565b3b49007764f4939"
+    },
+    "target_checkpoint": "nvidia/GLM-5.3-Flash-NVFP4",
+    "draft_checkpoint": "incoai/GLM-5.3-Flash-DFlash2",
+    "checkpoint_revisions": null,
+    "checkpoint_revision_note": "Exact checkpoint snapshot revisions are not included in the source receipts summarized here. Do not interpret repository names as immutable pins.",
+    "review_source_commit": "6114dbc21f266680598d4b25999a1a80d1527dbd",
+    "history_map": "history-map.json",
+    "review_source_note": "Same file tree as native_source_commit after commit-message normalization. Historical measurements and binary SHA256 remain associated with the original commit, not a rebuild."
+  },
+  "profile": {
+    "tensor_parallel": 2,
+    "expert_parallel": 2,
+    "kv_cache": "fp8_g128",
+    "persistent_kda_state": "FP32",
+    "accelerated_kda_internal_state": "BF16",
+    "dflash_enabled": true,
+    "dflash_gamma": 8,
+    "dflash_window_tokens": 2048,
+    "max_sequences": 4,
+    "max_session_tokens": 524288,
+    "native_shared_kv_token_cap": 524288,
+    "prefill_chunk_tokens": 4096,
+    "native_sparse_accelerator_end_position_limit": 32768,
+    "beyond_native_sparse_domain": "Existing Atlas sparse fallback; the 524K end-to-end result does not enlarge the native accelerator admission domain.",
+    "native_prefix_cache_enabled": false,
+    "reference_prefix_cache_enabled": true,
+    "all_measured_cache_hits": 0,
+    "reference_weight_loading": "Converted overlay of the NVIDIA source checkpoint",
+    "native_weight_loading": "Original NVIDIA checkpoint without overlay",
+    "reference_kv_pool_note": "The reference physical KV pool differs; the native cap is not a reference pool measurement."
+  },
+  "methodology": {
+    "benchmark_endpoint": "/v1/chat/completions",
+    "temperature": 0,
+    "repetition_penalty": 1.0,
+    "min_tokens": 1024,
+    "max_tokens": 1024,
+    "thinking": "enable_thinking=false maps to low-effort reasoning in the GLM template; generated token counts include reasoning",
+    "input_tokens": "Approximately 10000, using complete source blocks",
+    "workloads": {
+      "structured": "Seeded synthetic JSON Lines operational records; unconstrained JSON analytical report",
+      "code": "Seeded generated Python module; replacement implementation and tests",
+      "prose": "Seeded synthetic operational field notes; analytical prose"
+    },
+    "repeats": 3,
+    "schedule": "Builds tested sequentially on the same two GPUs without competing request traffic",
+    "per_stream_decode_tps": "(completion_tokens - 1) / server decode duration, checked against first-to-last content or reasoning SSE timing",
+    "effective_prefill_tps": "prompt_tokens / server time to first token, includes scheduling; not isolated prefill kernel throughput",
+    "aggregate_decode_tps": "C1 equals per-stream decode; C2/C4 uses atlas_decoded_tokens_total sampled at 4 Hz only after all streams start and before any finishes, trimming 1 second from each edge and rejecting samples with RTT >= 200 ms",
+    "aggregate_output_tps_including_prefill": "total completion tokens / whole-wave wall time; separate from aggregate decode",
+    "aggregation": "Per-stream fields summarize all requests in the row; wave fields summarize three waves. Values retain median/min/max from source receipts.",
+    "shortest_common_decode_window_s": 23.799851173069328,
+    "exact_workload_reproduction": {
+      "generator": "scripts/dev/glm53_native/generate_workloads.py",
+      "manifest": "scripts/dev/glm53_native/workload-manifest.json",
+      "bodies": 63,
+      "single_stream_bodies": 9,
+      "concurrent_bodies": 54,
+      "validation": "All63 reconstructed request bodies compared exactly against the original recorded datasets offline; canonical body hashes and original token-ID hashes/counts also checked.",
+      "network_required": false,
+      "timing_harness_bundled": false,
+      "limitations": "Warmup excluded. Recorded prompt token counts depend on original checkpoint/template. Exact inputs do not guarantee identical timings or generated responses. Raw measurement artifacts remain unbundled."
+    }
+  },
+  "performance": {
+    "single_stream": {
+      "rows": [
+        {
+          "build": "original",
+          "workload": "structured",
+          "requests": 3,
+          "concurrency": 1,
+          "output_tokens_each": 1024,
+          "server_decode_tps": {
+            "median": 53.23807653746688,
+            "min": 52.748419217068225,
+            "max": 62.57504989531706
+          },
+          "client_decode_tps": {
+            "median": 53.23799581728809,
+            "min": 52.74755021017588,
+            "max": 62.57669864762848
+          },
+          "server_ttft_s": {
+            "median": 4.898728015,
+            "min": 4.880322472,
+            "max": 4.938456639
+          },
+          "client_ttft_s": {
+            "median": 4.913057501078583,
+            "min": 4.890457796049304,
+            "max": 4.9521106369793415
+          },
+          "effective_prefill_tps": {
+            "median": 2038.2842177450427,
+            "min": 2015.2044915018641,
+            "max": 2042.8977915293792
+          },
+          "wall_s": {
+            "median": 24.170078279916197,
+            "min": 21.240045715007,
+            "max": 24.310237645055167
+          },
+          "tokenized_prompt_count": {
+            "median": 9970,
+            "min": 9952,
+            "max": 9985
+          },
+          "reasoning_tokens": [
+            294,
+            257,
+            257
+          ],
+          "speculative_accepted_fraction_of_output": [
+            0.7587890625,
+            0.69921875,
+            0.70703125
+          ]
+        },
+        {
+          "build": "original",
+          "workload": "code",
+          "requests": 3,
+          "concurrency": 1,
+          "output_tokens_each": 1024,
+          "server_decode_tps": {
+            "median": 56.151704948186655,
+            "min": 55.268269362587105,
+            "max": 59.13140911100951
+          },
+          "client_decode_tps": {
+            "median": 56.15054924881097,
+            "min": 55.26762237812341,
+            "max": 59.13105330517427
+          },
+          "server_ttft_s": {
+            "median": 4.925261891,
+            "min": 4.896500661,
+            "max": 4.927124104
+          },
+          "client_ttft_s": {
+            "median": 4.938166299951263,
+            "min": 4.907903323997743,
+            "max": 4.940278258989565
+          },
+          "effective_prefill_tps": {
+            "median": 2024.9134767886903,
+            "min": 2021.8214219626357,
+            "max": 2033.0845820751742
+          },
+          "wall_s": {
+            "median": 23.160023372038268,
+            "min": 22.211186822969466,
+            "max": 23.491828517988324
+          },
+          "tokenized_prompt_count": {
+            "median": 9958,
+            "min": 9955,
+            "max": 9977
+          },
+          "reasoning_tokens": [
+            27,
+            28,
+            27
+          ],
+          "speculative_accepted_fraction_of_output": [
+            0.73828125,
+            0.7548828125,
+            0.7412109375
+          ]
+        },
+        {
+          "build": "original",
+          "workload": "prose",
+          "requests": 3,
+          "concurrency": 1,
+          "output_tokens_each": 1024,
+          "server_decode_tps": {
+            "median": 40.92999896135227,
+            "min": 40.44434465728619,
+            "max": 41.42978072290957
+          },
+          "client_decode_tps": {
+            "median": 40.930352605779014,
+            "min": 40.610943757290826,
+            "max": 41.430212620936224
+          },
+          "server_ttft_s": {
+            "median": 4.930514297,
+            "min": 4.928051764,
+            "max": 4.934207795
+          },
+          "client_ttft_s": {
+            "median": 4.948185600922443,
+            "min": 4.94256601005327,
+            "max": 5.052102918969467
+          },
+          "effective_prefill_tps": {
+            "median": 2015.2055954985499,
+            "min": 2013.2917811176212,
+            "max": 2023.923545783599
+          },
+          "wall_s": {
+            "median": 29.94470713089686,
+            "min": 29.63747089507524,
+            "max": 30.283072498976253
+          },
+          "tokenized_prompt_count": {
+            "median": 9936,
+            "min": 9934,
+            "max": 9974
+          },
+          "reasoning_tokens": [
+            30,
+            37,
+            0
+          ],
+          "speculative_accepted_fraction_of_output": [
+            0.591796875,
+            0.58203125,
+            0.578125
+          ]
+        },
+        {
+          "build": "native",
+          "workload": "structured",
+          "requests": 3,
+          "concurrency": 1,
+          "output_tokens_each": 1024,
+          "server_decode_tps": {
+            "median": 51.89920984156167,
+            "min": 50.937019066921984,
+            "max": 53.021569528583306
+          },
+          "client_decode_tps": {
+            "median": 51.89919467304944,
+            "min": 50.93688749950235,
+            "max": 53.01934418501787
+          },
+          "server_ttft_s": {
+            "median": 4.640600692,
+            "min": 4.639383842,
+            "max": 4.665278755
+          },
+          "client_ttft_s": {
+            "median": 4.655185457086191,
+            "min": 4.6507049860665575,
+            "max": 4.675399758038111
+          },
+          "effective_prefill_tps": {
+            "median": 2145.112441420621,
+            "min": 2140.279396873896,
+            "max": 2148.428762075442
+          },
+          "wall_s": {
+            "median": 24.36901802709326,
+            "min": 23.9480600990355,
+            "max": 24.769379140110686
+          },
+          "tokenized_prompt_count": {
+            "median": 9970,
+            "min": 9952,
+            "max": 9985
+          },
+          "reasoning_tokens": [
+            261,
+            321,
+            264
+          ],
+          "speculative_accepted_fraction_of_output": [
+            0.7080078125,
+            0.6923828125,
+            0.6904296875
+          ]
+        },
+        {
+          "build": "native",
+          "workload": "code",
+          "requests": 3,
+          "concurrency": 1,
+          "output_tokens_each": 1024,
+          "server_decode_tps": {
+            "median": 57.43689218476663,
+            "min": 55.461841554776626,
+            "max": 58.98825830357473
+          },
+          "client_decode_tps": {
+            "median": 57.43703024966063,
+            "min": 55.46295479098307,
+            "max": 58.98709875408487
+          },
+          "server_ttft_s": {
+            "median": 4.647252005,
+            "min": 4.636973863,
+            "max": 4.658271808
+          },
+          "client_ttft_s": {
+            "median": 4.659509846009314,
+            "min": 4.650815628003329,
+            "max": 4.6710719199618325
+          },
+          "effective_prefill_tps": {
+            "median": 2142.771682983006,
+            "min": 2137.0586368325544,
+            "max": 2151.6187700797486
+          },
+          "wall_s": {
+            "median": 22.47245899599511,
+            "min": 22.01631026400719,
+            "max": 23.09786283201538
+          },
+          "tokenized_prompt_count": {
+            "median": 9958,
+            "min": 9955,
+            "max": 9977
+          },
+          "reasoning_tokens": [
+            33,
+            25,
+            39
+          ],
+          "speculative_accepted_fraction_of_output": [
+            0.7275390625,
+            0.7578125,
+            0.7421875
+          ]
+        },
+        {
+          "build": "native",
+          "workload": "prose",
+          "requests": 3,
+          "concurrency": 1,
+          "output_tokens_each": 1024,
+          "server_decode_tps": {
+            "median": 41.46372241818244,
+            "min": 39.71346904293682,
+            "max": 41.56271159253223
+          },
+          "client_decode_tps": {
+            "median": 41.562863562105946,
+            "min": 39.71248267358282,
+            "max": 41.62659896806192
+          },
+          "server_ttft_s": {
+            "median": 4.640235343,
+            "min": 4.62116862,
+            "max": 4.657562374
+          },
+          "client_ttft_s": {
+            "median": 4.67985581792891,
+            "min": 4.635158458026126,
+            "max": 4.758316490100697
+          },
+          "effective_prefill_tps": {
+            "median": 2141.4635380253953,
+            "min": 2140.8396914578652,
+            "max": 2150.1054856552714
+          },
+          "wall_s": {
+            "median": 29.336514880065806,
+            "min": 29.295638812938705,
+            "max": 30.397598954034038
+          },
+          "tokenized_prompt_count": {
+            "median": 9936,
+            "min": 9934,
+            "max": 9974
+          },
+          "reasoning_tokens": [
+            21,
+            0,
+            71
+          ],
+          "speculative_accepted_fraction_of_output": [
+            0.568359375,
+            0.595703125,
+            0.591796875
+          ]
+        }
+      ],
+      "checks": {
+        "all18_requests_completed": true,
+        "all_outputs1024_tokens": true,
+        "identical_input_token_ids_between_builds": true,
+        "all_zero_cached_tokens": true
+      },
+      "max_client_server_decode_relative_error": 0.004119218679801806
+    },
+    "concurrent": {
+      "rows": [
+        {
+          "build": "original",
+          "workload": "structured",
+          "concurrency": 2,
+          "waves": 3,
+          "requests": 6,
+          "output_tokens_each": 1024,
+          "server_decode_tps": {
+            "median": 31.12613189173353,
+            "min": 28.418620022882155,
+            "max": 36.585041042029225
+          },
+          "client_decode_tps": {
+            "median": 31.130741795980136,
+            "min": 28.42167630999336,
+            "max": 36.593625580110505
+          },
+          "server_ttft_s": {
+            "median": 7.4297563874999994,
+            "min": 4.897731662,
+            "max": 10.036249864
+          },
+          "client_ttft_s": {
+            "median": 8.309380713966675,
+            "min": 6.615930319996551,
+            "max": 10.04603216808755
+          },
+          "effective_prefill_tps": {
+            "median": 1353.1240896439876,
+            "min": 994.5946080722248,
+            "max": 2026.2441237843382
+          },
+          "wall_s": {
+            "median": 40.548911044432316,
+            "min": 37.950491877039894,
+            "max": 42.65985086397268
+          },
+          "tokenized_prompt_count": {
+            "median": 9929.5,
+            "min": 9924,
+            "max": 9982
+          },
+          "aggregate_decode_tps_common_window": {
+            "median": 65.28747698743992,
+            "min": 65.12415023936637,
+            "max": 68.29891981995067
+          },
+          "aggregate_decode_window_s": {
+            "median": 26.77934006601572,
+            "min": 25.64044556848239,
+            "max": 28.361214591073804
+          },
+          "aggregate_output_tps_including_prefill": {
+            "median": 48.81937732732314,
+            "min": 48.00766900311852,
+            "max": 50.56896235752576
+          },
+          "launch_skew_s": {
+            "median": 0.0004151830216869712,
+            "min": 0.00041073409374803305,
+            "max": 0.00042480300180613995
+          },
+          "reasoning_tokens": [
+            266,
+            38,
+            266,
+            259,
+            287,
+            322
+          ]
+        },
+        {
+          "build": "original",
+          "workload": "structured",
+          "concurrency": 4,
+          "waves": 3,
+          "requests": 12,
+          "output_tokens_each": 1024,
+          "server_decode_tps": {
+            "median": 19.982879932581955,
+            "min": 17.541828655172267,
+            "max": 23.596908170335134
+          },
+          "client_decode_tps": {
+            "median": 19.983957563885554,
+            "min": 17.544739894062296,
+            "max": 23.603401645753305
+          },
+          "server_ttft_s": {
+            "median": 11.643529251499999,
+            "min": 6.573880196,
+            "max": 20.216978136
+          },
+          "client_ttft_s": {
+            "median": 15.094930165505502,
+            "min": 9.969813447096385,
+            "max": 20.39228897402063
+          },
+          "effective_prefill_tps": {
+            "median": 852.9642114299661,
+            "min": 491.6659618036597,
+            "max": 1509.9149519091723
+          },
+          "wall_s": {
+            "median": 68.17012756352779,
+            "min": 56.698341377894394,
+            "max": 70.59517178405076
+          },
+          "tokenized_prompt_count": {
+            "median": 9939.0,
+            "min": 9926,
+            "max": 9999
+          },
+          "aggregate_decode_tps_common_window": {
+            "median": 87.87995847107304,
+            "min": 83.20071291357135,
+            "max": 87.95653171981937
+          },
+          "aggregate_decode_window_s": {
+            "median": 39.398700866964646,
+            "min": 34.18734164710622,
+            "max": 40.726009231992066
+          },
+          "aggregate_output_tps_including_prefill": {
+            "median": 58.13296133776914,
+            "min": 58.020965123926366,
+            "max": 60.19026174126864
+          },
+          "launch_skew_s": {
+            "median": 0.001154830097220838,
+            "min": 0.0010909499833360314,
+            "max": 0.001306410995312035
+          },
+          "reasoning_tokens": [
+            320,
+            272,
+            271,
+            322,
+            268,
+            322,
+            321,
+            265,
+            265,
+            268,
+            267,
+            321
+          ]
+        },
+        {
+          "build": "original",
+          "workload": "code",
+          "concurrency": 2,
+          "waves": 3,
+          "requests": 6,
+          "output_tokens_each": 1024,
+          "server_decode_tps": {
+            "median": 34.86064138304275,
+            "min": 32.44487020801362,
+            "max": 38.33572832510839
+          },
+          "client_decode_tps": {
+            "median": 34.86432488883804,
+            "min": 32.452770439832065,
+            "max": 38.345486955390605
+          },
+          "server_ttft_s": {
+            "median": 7.4522474464999995,
+            "min": 4.9049096389999995,
+            "max": 10.009112362
+          },
+          "client_ttft_s": {
+            "median": 8.317408284463454,
+            "min": 6.6115488020004705,
+            "max": 10.067024272982962
+          },
+          "effective_prefill_tps": {
+            "median": 1351.7102915847433,
+            "min": 996.4919604526266,
+            "max": 2030.6184482596543
+          },
+          "wall_s": {
+            "median": 37.71648007800104,
+            "min": 36.10401866398752,
+            "max": 39.23279522394296
+          },
+          "tokenized_prompt_count": {
+            "median": 9958.5,
+            "min": 9944,
+            "max": 9979
+          },
+          "aggregate_decode_tps_common_window": {
+            "median": 74.32819588391831,
+            "min": 71.1956879056915,
+            "max": 75.27515013054754
+          },
+          "aggregate_decode_window_s": {
+            "median": 24.536649834597483,
+            "min": 23.799851173069328,
+            "max": 25.788078660494648
+          },
+          "aggregate_output_tps_including_prefill": {
+            "median": 53.8427451723008,
+            "min": 52.20122574264472,
+            "max": 54.764170253843446
+          },
+          "launch_skew_s": {
+            "median": 0.0004534040344879031,
+            "min": 0.0004472039872780442,
+            "max": 0.0004959249636158347
+          },
+          "reasoning_tokens": [
+            31,
+            30,
+            27,
+            36,
+            35,
+            37
+          ]
+        },
+        {
+          "build": "original",
+          "workload": "code",
+          "concurrency": 4,
+          "waves": 3,
+          "requests": 12,
+          "output_tokens_each": 1024,
+          "server_decode_tps": {
+            "median": 20.749201555966618,
+            "min": 18.671120268433288,
+            "max": 24.06738656558288
+          },
+          "client_decode_tps": {
+            "median": 20.75329643724382,
+            "min": 18.673186767446964,
+            "max": 24.070715695641045
+          },
+          "server_ttft_s": {
+            "median": 13.3906732845,
+            "min": 4.959135046,
+            "max": 18.620288102
+          },
+          "client_ttft_s": {
+            "median": 15.117088045924902,
+            "min": 10.013779813889414,
+            "max": 20.327877286006697
+          },
+          "effective_prefill_tps": {
+            "median": 743.6897605053653,
+            "min": 535.6522920248852,
+            "max": 2006.1966265719636
+          },
+          "wall_s": {
+            "median": 63.368474828021135,
+            "min": 62.11748206696939,
+            "max": 66.80310207488947
+          },
+          "tokenized_prompt_count": {
+            "median": 9957.0,
+            "min": 9948,
+            "max": 9979
+          },
+          "aggregate_decode_tps_common_window": {
+            "median": 92.41059694725159,
+            "min": 88.13156825595561,
+            "max": 96.15793608327947
+          },
+          "aggregate_decode_window_s": {
+            "median": 40.071161991450936,
+            "min": 39.55991730839014,
+            "max": 40.81397927191574
+          },
+          "aggregate_output_tps_including_prefill": {
+            "median": 63.47909997978801,
+            "min": 61.313335591860415,
+            "max": 64.47461895384495
+          },
+          "launch_skew_s": {
+            "median": 0.0012882010778412223,
+            "min": 0.0012857120018452406,
+            "max": 0.0015363239217549562
+          },
+          "reasoning_tokens": [
+            38,
+            320,
+            34,
+            39,
+            32,
+            28,
+            29,
+            39,
+            30,
+            38,
+            39,
+            31
+          ]
+        },
+        {
+          "build": "original",
+          "workload": "prose",
+          "concurrency": 2,
+          "waves": 3,
+          "requests": 6,
+          "output_tokens_each": 1024,
+          "server_decode_tps": {
+            "median": 25.971405311864487,
+            "min": 25.01587659017519,
+            "max": 27.83658719783831
+          },
+          "client_decode_tps": {
+            "median": 25.97965355326418,
+            "min": 25.082384817801543,
+            "max": 27.83659924445536
+          },
+          "server_ttft_s": {
+            "median": 7.472987680999999,
+            "min": 4.900824416,
+            "max": 10.037369048
+          },
+          "client_ttft_s": {
+            "median": 8.381426743988413,
+            "min": 6.633260244037956,
+            "max": 10.16214689204935
+          },
+          "effective_prefill_tps": {
+            "median": 1351.2698527795771,
+            "min": 994.6829644556474,
+            "max": 2034.3516016306103
+          },
+          "wall_s": {
+            "median": 47.17738372547319,
+            "min": 46.62917086703237,
+            "max": 48.816043970989995
+          },
+          "tokenized_prompt_count": {
+            "median": 9975.0,
+            "min": 9935,
+            "max": 9992
+          },
+          "aggregate_decode_tps_common_window": {
+            "median": 54.68373321667643,
+            "min": 53.120956736664326,
+            "max": 55.99458813854074
+          },
+          "aggregate_decode_window_s": {
+            "median": 34.25331025302876,
+            "min": 34.2149280954618,
+            "max": 35.31562899553683
+          },
+          "aggregate_output_tps_including_prefill": {
+            "median": 42.95450630067488,
+            "min": 41.95342009313718,
+            "max": 43.758481601975376
+          },
+          "launch_skew_s": {
+            "median": 0.0004770839586853981,
+            "min": 0.0004677050746977329,
+            "max": 0.0004982639802619815
+          },
+          "reasoning_tokens": [
+            0,
+            43,
+            0,
+            44,
+            33,
+            37
+          ]
+        },
+        {
+          "build": "original",
+          "workload": "prose",
+          "concurrency": 4,
+          "waves": 3,
+          "requests": 12,
+          "output_tokens_each": 1024,
+          "server_decode_tps": {
+            "median": 15.968406729806638,
+            "min": 14.558542531377263,
+            "max": 17.217593784892806
+          },
+          "client_decode_tps": {
+            "median": 15.985202042907371,
+            "min": 14.560642104912624,
+            "max": 17.26248419123209
+          },
+          "server_ttft_s": {
+            "median": 11.7659094385,
+            "min": 4.937145828,
+            "max": 20.373135683
+          },
+          "client_ttft_s": {
+            "median": 15.203936447040178,
+            "min": 10.049858212005347,
+            "max": 20.488912536995485
+          },
+          "effective_prefill_tps": {
+            "median": 848.2206110912764,
+            "min": 489.5662678142681,
+            "max": 2011.6886043091372
+          },
+          "wall_s": {
+            "median": 80.16030024451902,
+            "min": 77.90961638302542,
+            "max": 80.6561325340299
+          },
+          "tokenized_prompt_count": {
+            "median": 9970.5,
+            "min": 9932,
+            "max": 10000
+          },
+          "aggregate_decode_tps_common_window": {
+            "median": 67.87046460762846,
+            "min": 67.43634474722404,
+            "max": 68.84440494354779
+          },
+          "aggregate_decode_window_s": {
+            "median": 55.61817264801357,
+            "min": 55.22284283256158,
+            "max": 55.726626555551775
+          },
+          "aggregate_output_tps_including_prefill": {
+            "median": 50.84910714641696,
+            "min": 50.78321644981678,
+            "max": 51.207683052260656
+          },
+          "launch_skew_s": {
+            "median": 0.0015880739083513618,
+            "min": 0.0014488029992207885,
+            "max": 0.0015919640427455306
+          },
+          "reasoning_tokens": [
+            0,
+            33,
+            0,
+            0,
+            33,
+            0,
+            0,
+            0,
+            34,
+            29,
+            34,
+            44
+          ]
+        },
+        {
+          "build": "native",
+          "workload": "structured",
+          "concurrency": 2,
+          "waves": 3,
+          "requests": 6,
+          "output_tokens_each": 1024,
+          "server_decode_tps": {
+            "median": 30.925217573748984,
+            "min": 29.37548324938433,
+            "max": 33.32776238120457
+          },
+          "client_decode_tps": {
+            "median": 30.919446396617133,
+            "min": 29.375572247559905,
+            "max": 33.327264905367215
+          },
+          "server_ttft_s": {
+            "median": 7.0388909205,
+            "min": 4.655451839,
+            "max": 9.46584823
+          },
+          "client_ttft_s": {
+            "median": 7.906252410495654,
+            "min": 6.339777339017019,
+            "max": 9.525308888056315
+          },
+          "effective_prefill_tps": {
+            "median": 1424.0455778550663,
+            "min": 1049.0343557938072,
+            "max": 2131.6942679685617
+          },
+          "wall_s": {
+            "median": 40.84515360550722,
+            "min": 39.44927746197209,
+            "max": 42.54591260198504
+          },
+          "tokenized_prompt_count": {
+            "median": 9929.5,
+            "min": 9924,
+            "max": 9982
+          },
+          "aggregate_decode_tps_common_window": {
+            "median": 65.88372445182861,
+            "min": 62.48028443946403,
+            "max": 67.46003660316781
+          },
+          "aggregate_decode_window_s": {
+            "median": 29.096715705585666,
+            "min": 27.66082104248926,
+            "max": 29.097178675001487
+          },
+          "aggregate_output_tps_including_prefill": {
+            "median": 49.7146009772096,
+            "min": 48.13573944653551,
+            "max": 51.01780661833
+          },
+          "launch_skew_s": {
+            "median": 0.0004370240494608879,
+            "min": 0.0003212830051779747,
+            "max": 0.00044634402729570866
+          },
+          "reasoning_tokens": [
+            268,
+            258,
+            274,
+            266,
+            270,
+            271
+          ]
+        },
+        {
+          "build": "native",
+          "workload": "structured",
+          "concurrency": 4,
+          "waves": 3,
+          "requests": 12,
+          "output_tokens_each": 1024,
+          "server_decode_tps": {
+            "median": 19.744704992625778,
+            "min": 17.193218092857872,
+            "max": 23.93465336960264
+          },
+          "client_decode_tps": {
+            "median": 19.746910617671645,
+            "min": 17.193127703251555,
+            "max": 23.94116624344967
+          },
+          "server_ttft_s": {
+            "median": 11.207823696999998,
+            "min": 7.749269097,
+            "max": 17.432187741
+          },
+          "client_ttft_s": {
+            "median": 14.434513707528822,
+            "min": 9.691226721042767,
+            "max": 19.359745529014617
+          },
+          "effective_prefill_tps": {
+            "median": 888.3095103827909,
+            "min": 570.2095541698079,
+            "max": 1280.8949948379886
+          },
+          "wall_s": {
+            "median": 68.27587492205203,
+            "min": 58.54744743206538,
+            "max": 69.24394380894955
+          },
+          "tokenized_prompt_count": {
+            "median": 9939.0,
+            "min": 9926,
+            "max": 9999
+          },
+          "aggregate_decode_tps_common_window": {
+            "median": 83.66230651861432,
+            "min": 81.67429662594297,
+            "max": 88.12734002074784
+          },
+          "aggregate_decode_window_s": {
+            "median": 40.484181478386745,
+            "min": 36.84441172552761,
+            "max": 44.738677294459194
+          },
+          "aggregate_output_tps_including_prefill": {
+            "median": 59.35275981621354,
+            "min": 59.15279148066597,
+            "max": 60.09736700240837
+          },
+          "launch_skew_s": {
+            "median": 0.0012937310384586453,
+            "min": 0.00111370999366045,
+            "max": 0.0015878239646553993
+          },
+          "reasoning_tokens": [
+            262,
+            290,
+            270,
+            268,
+            320,
+            271,
+            257,
+            266,
+            302,
+            296,
+            268,
+            267
+          ]
+        },
+        {
+          "build": "native",
+          "workload": "code",
+          "concurrency": 2,
+          "waves": 3,
+          "requests": 6,
+          "output_tokens_each": 1024,
+          "server_decode_tps": {
+            "median": 33.37203460109761,
+            "min": 32.02663514352738,
+            "max": 36.43131567572702
+          },
+          "client_decode_tps": {
+            "median": 33.37161241738437,
+            "min": 32.04573649810207,
+            "max": 36.44020192914724
+          },
+          "server_ttft_s": {
+            "median": 7.086520718,
+            "min": 4.6605438150000005,
+            "max": 9.511108077
+          },
+          "client_ttft_s": {
+            "median": 7.939644422498532,
+            "min": 6.383670930052176,
+            "max": 9.527032974059694
+          },
+          "effective_prefill_tps": {
+            "median": 1419.8730065102004,
+            "min": 1049.194259933968,
+            "max": 2137.089660640815
+          },
+          "wall_s": {
+            "median": 38.10403062950354,
+            "min": 36.42195930797607,
+            "max": 40.75844387605321
+          },
+          "tokenized_prompt_count": {
+            "median": 9958.5,
+            "min": 9944,
+            "max": 9979
+          },
+          "aggregate_decode_tps_common_window": {
+            "median": 68.5845266099746,
+            "min": 65.57221700470544,
+            "max": 72.1613774863944
+          },
+          "aggregate_decode_window_s": {
+            "median": 25.817134662531316,
+            "min": 24.553081679157913,
+            "max": 26.40537289553322
+          },
+          "aggregate_output_tps_including_prefill": {
+            "median": 51.74588699303088,
+            "min": 50.247256893025316,
+            "max": 54.04827184037534
+          },
+          "launch_skew_s": {
+            "median": 0.00042553397361189127,
+            "min": 0.0004092630697414279,
+            "max": 0.00047936500050127506
+          },
+          "reasoning_tokens": [
+            38,
+            262,
+            324,
+            21,
+            23,
+            58
+          ]
+        },
+        {
+          "build": "native",
+          "workload": "code",
+          "concurrency": 4,
+          "waves": 3,
+          "requests": 12,
+          "output_tokens_each": 1024,
+          "server_decode_tps": {
+            "median": 21.165444439139165,
+            "min": 19.25891158576545,
+            "max": 25.293386042492312
+          },
+          "client_decode_tps": {
+            "median": 21.16961666726195,
+            "min": 19.26350422502757,
+            "max": 25.29965864182857
+          },
+          "server_ttft_s": {
+            "median": 10.371835631500002,
+            "min": 7.809491431,
+            "max": 17.595940078
+          },
+          "client_ttft_s": {
+            "median": 14.484756538528018,
+            "min": 9.73411394096911,
+            "max": 19.294980039005168
+          },
+          "effective_prefill_tps": {
+            "median": 963.3572806468263,
+            "min": 566.8353015404034,
+            "max": 1274.8589441406355
+          },
+          "wall_s": {
+            "median": 62.710856986930594,
+            "min": 58.49715448496863,
+            "max": 65.27169229299761
+          },
+          "tokenized_prompt_count": {
+            "median": 9957.0,
+            "min": 9948,
+            "max": 9979
+          },
+          "aggregate_decode_tps_common_window": {
+            "median": 92.77084548882598,
+            "min": 88.65187326437562,
+            "max": 94.9084083423797
+          },
+          "aggregate_decode_window_s": {
+            "median": 38.535813500056975,
+            "min": 37.17268113140017,
+            "max": 41.386604308499955
+          },
+          "aggregate_output_tps_including_prefill": {
+            "median": 64.31892034671392,
+            "min": 62.75242360698655,
+            "max": 66.65027233238118
+          },
+          "launch_skew_s": {
+            "median": 0.0012177410535514355,
+            "min": 0.0009444179013371468,
+            "max": 0.0012626219540834427
+          },
+          "reasoning_tokens": [
+            39,
+            34,
+            35,
+            40,
+            55,
+            29,
+            39,
+            41,
+            43,
+            42,
+            33,
+            26
+          ]
+        },
+        {
+          "build": "native",
+          "workload": "prose",
+          "concurrency": 2,
+          "waves": 3,
+          "requests": 6,
+          "output_tokens_each": 1024,
+          "server_decode_tps": {
+            "median": 26.451299615884146,
+            "min": 23.857257520423,
+            "max": 28.068836839036102
+          },
+          "client_decode_tps": {
+            "median": 26.525136277948153,
+            "min": 23.859483710942158,
+            "max": 28.0738014974008
+          },
+          "server_ttft_s": {
+            "median": 7.123650871500001,
+            "min": 4.658022179,
+            "max": 9.490613812
+          },
+          "client_ttft_s": {
+            "median": 8.021180061041377,
+            "min": 6.363894994021393,
+            "max": 9.668769748066552
+          },
+          "effective_prefill_tps": {
+            "median": 1415.646209657447,
+            "min": 1051.5652830990991,
+            "max": 2132.879496536206
+          },
+          "wall_s": {
+            "median": 46.71392507903511,
+            "min": 45.999937373097055,
+            "max": 49.2422511059558
+          },
+          "tokenized_prompt_count": {
+            "median": 9975.0,
+            "min": 9935,
+            "max": 9992
+          },
+          "aggregate_decode_tps_common_window": {
+            "median": 53.97153331290996,
+            "min": 52.05580336619023,
+            "max": 55.257902792076905
+          },
+          "aggregate_decode_window_s": {
+            "median": 34.462611784925684,
+            "min": 34.22134942607954,
+            "max": 35.03932092199102
+          },
+          "aggregate_output_tps_including_prefill": {
+            "median": 42.963745389812786,
+            "min": 41.59030007773744,
+            "max": 44.01717236765883
+          },
+          "launch_skew_s": {
+            "median": 0.0004721441073343158,
+            "min": 0.0003125329967588186,
+            "max": 0.0005146849434822798
+          },
+          "reasoning_tokens": [
+            0,
+            34,
+            0,
+            55,
+            0,
+            28
+          ]
+        },
+        {
+          "build": "native",
+          "workload": "prose",
+          "concurrency": 4,
+          "waves": 3,
+          "requests": 12,
+          "output_tokens_each": 1024,
+          "server_decode_tps": {
+            "median": 16.189085709916323,
+            "min": 14.881620857007338,
+            "max": 17.995771991529345
+          },
+          "client_decode_tps": {
+            "median": 16.20508994725804,
+            "min": 14.883082709655344,
+            "max": 17.99996207222616
+          },
+          "server_ttft_s": {
+            "median": 11.9743321285,
+            "min": 4.672153153,
+            "max": 17.60044222
+          },
+          "client_ttft_s": {
+            "median": 14.553089314023964,
+            "min": 9.766411416931078,
+            "max": 19.459214412025176
+          },
+          "effective_prefill_tps": {
+            "median": 860.5916273763655,
+            "min": 567.7698250470436,
+            "max": 2125.7864789005557
+          },
+          "wall_s": {
+            "median": 78.47655858902726,
+            "min": 75.24758839700371,
+            "max": 79.40947646799032
+          },
+          "tokenized_prompt_count": {
+            "median": 9970.5,
+            "min": 9932,
+            "max": 10000
+          },
+          "aggregate_decode_tps_common_window": {
+            "median": 68.2542222703011,
+            "min": 68.24895550792053,
+            "max": 68.27530387682577
+          },
+          "aggregate_decode_window_s": {
+            "median": 54.53142496093642,
+            "min": 53.67115104896948,
+            "max": 54.89539829455316
+          },
+          "aggregate_output_tps_including_prefill": {
+            "median": 51.669536053814,
+            "min": 51.57972375481022,
+            "max": 51.747830519771476
+          },
+          "launch_skew_s": {
+            "median": 0.0015731039457023144,
+            "min": 0.0013538019265979528,
+            "max": 0.0015841140411794186
+          },
+          "reasoning_tokens": [
+            33,
+            0,
+            25,
+            34,
+            0,
+            0,
+            0,
+            0,
+            25,
+            42,
+            34,
+            34
+          ]
+        }
+      ],
+      "checks": {
+        "all108_requests_completed": true,
+        "all_outputs1024_tokens": true,
+        "matched_input_token_ids": true,
+        "all_zero_prefix_cache_hits": true,
+        "all_wave_token_counter_deltas_match_usage_exactly": true
+      },
+      "max_client_server_decode_relative_error": 0.0032627940549265766
+    }
+  },
+  "output_comparison": {
+    "temperature": 0,
+    "identical_prompt_token_ids": true,
+    "short_cases": [
+      {
+        "case": "arithmetic",
+        "exact_visible_content": true,
+        "exact_reasoning": true
+      },
+      {
+        "case": "extraction",
+        "exact_visible_content": true,
+        "exact_reasoning": true
+      },
+      {
+        "case": "reasoning",
+        "exact_visible_content": false,
+        "exact_reasoning": true
+      },
+      {
+        "case": "explanation",
+        "exact_visible_content": false,
+        "exact_reasoning": true
+      }
+    ],
+    "short_visible_exact_matches": 2,
+    "short_full_generated_text_matches": 2,
+    "short_total": 4,
+    "long_visible_exact_matches": 0,
+    "long_reasoning_exact_matches": 0,
+    "long_total": 9,
+    "word_limit_observation": {
+      "case": "explanation",
+      "original_words": 92,
+      "native_words": 122,
+      "requested_range": [
+        70,
+        100
+      ],
+      "native_met_word_limit": false
+    },
+    "conclusion": "Not exact-output parity. Matching prompt token IDs and temperature0 do not yield identical generated responses across these builds.",
+    "cause": "Not isolated; this comparison does not establish which kernel, loader, or runtime difference caused output divergence."
+  },
+  "quality": {
+    "basic_coherence": {
+      "responses": 8,
+      "passed_categories": 6,
+      "categories": [
+        {
+          "name": "Reading comprehension and uncertainty",
+          "passed": true
+        },
+        {
+          "name": "Instruction following",
+          "passed": true
+        },
+        {
+          "name": "Simple reasoning",
+          "passed": true
+        },
+        {
+          "name": "Code understanding",
+          "passed": true
+        },
+        {
+          "name": "Prose continuity",
+          "passed": true
+        },
+        {
+          "name": "Multi-turn corrections and consistency",
+          "passed": true
+        }
+      ],
+      "format_checks": {
+        "instruction_exactly3_lines": true,
+        "instruction_prefixes": true,
+        "instruction_max12_words_each": true,
+        "instruction_no_forbidden_word": true,
+        "prose_two_paragraphs": true,
+        "prose_150_to200_words": true,
+        "code_under120_words": true,
+        "all_finished_naturally": true
+      },
+      "observed_garbled_output": false,
+      "observed_repetition_loop": false,
+      "assessment": "Manual semantic review plus deterministic formatting checks; short prompts and single stream, not a broad accuracy benchmark."
+    },
+    "retrieval": [
+      {
+        "passed": true,
+        "needles_correct": 3,
+        "needles_total": 3,
+        "input_tokens": 32608,
+        "wall_s": 15.095826899982058,
+        "usage": {
+          "prompt_tokens": 32608,
+          "completion_tokens": 42,
+          "total_tokens": 32650,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "audio_tokens": 0
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0,
+            "audio_tokens": 0,
+            "accepted_prediction_tokens": 32,
+            "rejected_prediction_tokens": 0
+          },
+          "time_to_first_token_ms": 13565.86452,
+          "response_token/s": 54.77845561737296
+        },
+        "finish_reason": "stop"
+      },
+      {
+        "passed": true,
+        "needles_correct": 20,
+        "needles_total": 20,
+        "input_tokens": 130016,
+        "wall_s": 58.01030098996125,
+        "usage": {
+          "prompt_tokens": 130016,
+          "completion_tokens": 272,
+          "total_tokens": 130288,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "audio_tokens": 0
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0,
+            "audio_tokens": 0,
+            "accepted_prediction_tokens": 214,
+            "rejected_prediction_tokens": 0
+          },
+          "time_to_first_token_ms": 51536.294277,
+          "response_token/s": 47.828359952328846
+        },
+        "finish_reason": "stop"
+      },
+      {
+        "passed": true,
+        "needles_correct": 20,
+        "needles_total": 20,
+        "input_tokens": 523232,
+        "wall_s": 243.05073283193633,
+        "usage": {
+          "prompt_tokens": 523232,
+          "completion_tokens": 275,
+          "total_tokens": 523507,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "audio_tokens": 0
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0,
+            "audio_tokens": 0,
+            "accepted_prediction_tokens": 213,
+            "rejected_prediction_tokens": 0
+          },
+          "time_to_first_token_ms": 237134.418063,
+          "response_token/s": 51.67950069885858
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "text_and_tool_smoke_passed": 5,
+    "vision": "2/2 counterbalanced224px spatial/color probes pass; no video claim",
+    "lifecycle": "14 requests;13 exact completions plus1client disconnect; C4 and2reuse waves pass; server cancellation ack not asserted",
+    "other_model_regression": {
+      "model": "Qwen3.5-27B",
+      "kernel_target": "qwen3.6-27b",
+      "source": "451bbc21",
+      "binary_sha256": "01ae5377e9ad73789d3cab114cb602e630fa743920c7bc560235e37148c41f3f",
+      "passed": true,
+      "requests": 8
+    }
+  },
+  "qualification": {
+    "build": {
+      "arm64": "pass",
+      "docker_no_cache_arm64": "pass",
+      "docker_image": "01ee1b6e17a8",
+      "max_memory_limit_gib": 24
+    },
+    "cpu": {
+      "workspace_tests": "pass",
+      "clippy": "pass",
+      "fmt": "pass",
+      "rustdoc": "pass",
+      "typos": "pass",
+      "license_headers": "pass",
+      "file_cap": "pass",
+      "cargo_deny": "advisories ok, bans ok, licenses ok, sources ok (0.20.2)"
+    },
+    "gpu": {
+      "sparse_analytic_cases": [
+        "zero",
+        "constant",
+        "onehot"
+      ],
+      "sparse_reference_samples_exact": 8,
+      "sparse_device_fixture_bytes": 426124800,
+      "kda_tests": 2,
+      "kda_scope": "independent FP64 and native FP32 comparison, chunk-aligned split, tails, continued decode; not bitexact math; full model separately tested"
+    },
+    "memory": {
+      "512k_profile_min_available_gib": [
+        9.886520385742188,
+        10.271759033203125
+      ],
+      "guard_floor_gib": 8,
+      "guard_interventions": 0
+    }
+  },
+  "limits": [
+    "Three repeats per workload do not establish statistically significant performance superiority.",
+    "Length-capped speed outputs are not validated complete JSON or code artifacts.",
+    "Kernel numerical checks, basic coherence and retrieval success do not establish model-wide accuracy or exact-output equivalence.",
+    "The long-context retrieval tests use one fixture per tested length; no 1M-context qualification.",
+    "FP32 persistent state does not mean the accelerated KDA recurrence runs internally in FP32.",
+    "Native appended MTP, general vision/video quality, prefix-sharing profiles and other untested models are outside these receipts.",
+    "Any code changes require relevant validation at their own revision; these historical results must not be relabeled as current-tip gates."
+  ],
+  "source_receipts": [
+    {
+      "id": "single_stream",
+      "file_name": "comparison.json",
+      "sha256": "74d94c1511bb355fe78332e0a6944b9ad036074adc5a20e5f7113794f249bae7",
+      "bundled": false
+    },
+    {
+      "id": "concurrent",
+      "file_name": "comparison.json",
+      "sha256": "f0834a832c2b8a46316dfbe33c9329e83044933149ec69a4c3fe4bf1d5e84b60",
+      "bundled": false
+    },
+    {
+      "id": "coherence",
+      "file_name": "review.json",
+      "sha256": "e929aa388710a970186807d0aecece1fb8bfde55d8d44614d2b93305e1ef7344",
+      "bundled": false
+    },
+    {
+      "id": "output_comparison",
+      "file_name": "parity-comparison.json",
+      "sha256": "2f358b6d70f640ed6d2223671e6c78e71f37d3000e57873fc3882c5c15444353",
+      "bundled": false
+    },
+    {
+      "id": "qualification",
+      "file_name": "native-port-validation-receipt.json",
+      "sha256": "6de243e4d3e7e985a6010e4d619ff776a7d4e89a6ef64887818c79ff460ca3ee",
+      "bundled": false
+    }
+  ]
+}

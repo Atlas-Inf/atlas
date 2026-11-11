@@ -112,21 +112,22 @@ impl Qwen3SsmLayer {
         let ba_size = ctx.config.ssm_ba_size();
         let gates_buf = ctx.buffers.ssm_gates();
         let gate_stride = nv * 2;
-        ops::dense_gemm_ba_gates_prefill(
-            ctx.gpu,
-            self.ba_gates_prefill_k,
+        self.ba_gates_prefill(
+            ctx,
             normed,
             &self.ssm.in_proj_ba,
             self.ssm.a_log.weight,
             self.ssm.dt_bias.weight,
             gates_buf,
-            k,
-            ba_size as u32,
-            h as u32,
-            h as u32,
-            gate_stride as u32,
-            nv as u32,
-            vpg as u32,
+            [
+                k,
+                ba_size as u32,
+                h as u32,
+                h as u32,
+                gate_stride as u32,
+                nv as u32,
+                vpg as u32,
+            ],
             stream,
         )?;
 
@@ -189,16 +190,16 @@ impl Qwen3SsmLayer {
         // Z stride in source = qkvz_size, Z stride in dest = value_dim.
         // Strided copy: one per-token D2D async call.
         let z_src_base = deinterleaved.offset((key_dim * 2 + value_dim) * bf16);
-        let z_dst_base = gdn_bufs.z.offset(token_offset * value_dim * bf16);
+        let z_dst_base = gdn_bufs.z.offset(token_offset * gdn_bufs.z_stride * bf16);
         let z_elem_bytes = value_dim * bf16;
         // One pitched copy instead of a per-token D2D loop (num_tokens launches).
         ctx.gpu.copy_d2d_2d_async(
             z_src_base,
             qkvz_size * bf16, // src row pitch
             z_dst_base,
-            value_dim * bf16, // dst row pitch
-            z_elem_bytes,     // width per row
-            num_tokens,       // rows
+            gdn_bufs.z_stride * bf16, // dst row pitch
+            z_elem_bytes,             // width per row
+            num_tokens,               // rows
             stream,
         )?;
 
@@ -236,7 +237,6 @@ impl Qwen3SsmLayer {
         let eps = ctx.config.rms_norm_eps as f32;
         let k = total_tokens as u32;
         let bf16 = 2usize;
-        let fp32 = 4usize;
         let nk = ctx.config.linear_num_key_heads;
         let kd = ctx.config.linear_key_head_dim;
         let nv = ctx.config.linear_num_value_heads;
@@ -277,47 +277,50 @@ impl Qwen3SsmLayer {
             stream,
         )?;
 
-        // 4+5. BA GEMM + GDN gates over ALL tokens → ssm_gates, then copy to
-        // gdn_bufs.gate_beta in one contiguous D2D ([total, 2*nv] FP32 both).
+        // 4+5. BA GEMM + GDN gates over ALL tokens, straight into
+        // gdn_bufs.gate_beta ([total, 2*nv] FP32, the layout ssm_gates has).
         let ba_size = ctx.config.ssm_ba_size();
-        let gates_buf = ctx.buffers.ssm_gates();
+        let gates_buf = gdn_bufs.gate_beta;
         let gate_stride = nv * 2;
-        ops::dense_gemm_ba_gates_prefill(
-            ctx.gpu,
-            self.ba_gates_prefill_k,
+        self.ba_gates_prefill(
+            ctx,
             normed,
             &self.ssm.in_proj_ba,
             self.ssm.a_log.weight,
             self.ssm.dt_bias.weight,
             gates_buf,
-            k,
-            ba_size as u32,
-            h as u32,
-            h as u32,
-            gate_stride as u32,
-            nv as u32,
-            vpg as u32,
-            stream,
-        )?;
-        ctx.gpu.copy_d2d_async(
-            gates_buf,
-            gdn_bufs.gate_beta,
-            total_tokens * gate_stride * fp32,
+            [
+                k,
+                ba_size as u32,
+                h as u32,
+                h as u32,
+                gate_stride as u32,
+                nv as u32,
+                vpg as u32,
+            ],
             stream,
         )?;
 
         // Z gate: strided copy from deinterleaved (stride qkvz_size) → gdn_bufs.z
-        // (stride value_dim) over all tokens.
+        // (stride z_stride) over all tokens, unless gdn_bufs.z already reads
+        // the deinterleaved rows in place.
         let z_src_base = deinterleaved.offset((key_dim * 2 + value_dim) * bf16);
+        if gdn_bufs.z == z_src_base {
+            anyhow::ensure!(
+                gdn_bufs.z_stride == qkvz_size,
+                "in-place Z needs the QKVZ row pitch"
+            );
+            return Ok(());
+        }
         let z_elem_bytes = value_dim * bf16;
         // One pitched copy instead of a per-token D2D loop (total_tokens launches).
         ctx.gpu.copy_d2d_2d_async(
             z_src_base,
             qkvz_size * bf16, // src row pitch
             gdn_bufs.z,
-            value_dim * bf16, // dst row pitch
-            z_elem_bytes,     // width per row
-            total_tokens,     // rows
+            gdn_bufs.z_stride * bf16, // dst row pitch
+            z_elem_bytes,             // width per row
+            total_tokens,             // rows
             stream,
         )?;
         Ok(())
@@ -381,6 +384,9 @@ impl Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.gdn_chunk_tc_serves(ctx) {
+            return Ok(()); // the fused GDN scan normalizes Q and K itself
+        }
         let nk = ctx.config.linear_num_key_heads;
         let kd = ctx.config.linear_key_head_dim;
         let nv = ctx.config.linear_num_value_heads;

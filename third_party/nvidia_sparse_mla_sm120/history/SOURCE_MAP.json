@@ -1,0 +1,123 @@
+{
+  "scope": "Historical export provenance for Atlas native sparse prefill bridge sources. Current builds compile pinned NVIDIA/FlashInfer source and do not use the historical cached object.",
+  "files": [
+    {
+      "experiment_relative_path": "parity-20260911/sparse-native/atlas-glm-sparse-native.h",
+      "copied_relative_path": "scripts/dev/glm_sparse_native/atlas-glm-sparse-native.h",
+      "experiment_sha256": "8b51f0252a5a8f8fc77f6a12fd6b0dfb0a528282419f14bcc3e00559fa3e7432",
+      "copied_sha256": "8b51f0252a5a8f8fc77f6a12fd6b0dfb0a528282419f14bcc3e00559fa3e7432",
+      "change": "none"
+    },
+    {
+      "experiment_relative_path": "parity-20260911/sparse-native/atlas-glm-sparse-native.cu",
+      "copied_relative_path": "scripts/dev/glm_sparse_native/atlas-glm-sparse-native.cu",
+      "experiment_sha256": "00bd03cbbdc11d7613e01355bfe044115474de7a6bb25457943e0937c965935b",
+      "copied_sha256": "00bd03cbbdc11d7613e01355bfe044115474de7a6bb25457943e0937c965935b",
+      "change": "none"
+    },
+    {
+      "experiment_relative_path": "parity-20260911/sparse-native/native-bridge.h",
+      "copied_relative_path": "scripts/dev/glm_sparse_native/native-bridge.h",
+      "experiment_sha256": "ecde20307f178328c5c29a8e0c56fd96de860799941b53cc68eb2f199ae96c8d",
+      "copied_sha256": "ecde20307f178328c5c29a8e0c56fd96de860799941b53cc68eb2f199ae96c8d",
+      "change": "none"
+    },
+    {
+      "experiment_relative_path": "parity-20260911/sparse-native/native-bridge.cpp",
+      "copied_relative_path": "scripts/dev/glm_sparse_native/native-bridge.cpp",
+      "experiment_sha256": "8ed4da92415b32a88b605bde22625e47ad3877d6b5e1a4d8295bf7757b31d749",
+      "copied_sha256": "5f6ee86ff340ee2ae31b6777cc2946bf80f3c6ff65e56441f8f46b2a3246b229",
+      "change": "Origin comment naming the NVIDIA/FlashInfer source (BSD-3-Clause) added; code unchanged"
+    },
+    {
+      "experiment_relative_path": "parity-20260911/sparse-native/native-init.cpp",
+      "copied_relative_path": "scripts/dev/glm_sparse_native/native-init.cpp",
+      "experiment_sha256": "fdd42e88f39e866dad63109ebbd46f200a596ecf7cba54f3f17eb92bab41eb85",
+      "copied_sha256": "44a856bf71361de3da2f0dd15c1fa009e0b5a0de4838f2b6d39c523889c65a32",
+      "change": "Origin comment naming the NVIDIA/FlashInfer source (BSD-3-Clause) added; code unchanged"
+    },
+    {
+      "experiment_relative_path": "parity-20260911/sparse-native/native-prep.cu",
+      "copied_relative_path": "scripts/dev/glm_sparse_native/native-prep.cu",
+      "experiment_sha256": "a8a2f55d47746b81758fc8a2304e251299ebca77b5075896d7f01aa43e9a4326",
+      "copied_sha256": "a8a2f55d47746b81758fc8a2304e251299ebca77b5075896d7f01aa43e9a4326",
+      "change": "none"
+    },
+    {
+      "experiment_relative_path": "parity-20260911/sparse-native/native-prep-reviewed.cuh",
+      "copied_relative_path": "scripts/dev/glm_sparse_native/native-prep-reviewed.cuh",
+      "experiment_sha256": "eefd834819966d0b7ad4fa53fc0efcf858befa7a10a53c1f737f7189c0a7d188",
+      "copied_sha256": "eefd834819966d0b7ad4fa53fc0efcf858befa7a10a53c1f737f7189c0a7d188",
+      "change": "none"
+    },
+    {
+      "experiment_relative_path": "parity-20260911/sparse-native/split-ds.cuh",
+      "copied_relative_path": "scripts/dev/glm_sparse_native/split-ds.cuh",
+      "experiment_sha256": "fe7b6e878fc4187fcd9bf13662b7675635aa9a20a40cb97f6e2409a215e13278",
+      "copied_sha256": "1cd1a2bdb91c201a701bfd26fb216ebeac95425059823d99090d15b056cecc3b",
+      "change": "Removed extra trailing blank line only; original worker bytes retained in experiment archive"
+    },
+    {
+      "experiment_relative_path": "parity-20260911/sparse-native/merge-ds.cu",
+      "copied_relative_path": "scripts/dev/glm_sparse_native/merge-ds.cu",
+      "experiment_sha256": "5b9a8028a181baa5c4445fb1db7ff9c3110c6a29e3dc61d4874fb59fc30bc54a",
+      "copied_sha256": "228b2b0cd43a2f644645f35f5478576a079e5fa06c6dd4824ca479a803f8f7bc",
+      "change": "Removed extra trailing blank line only; original worker bytes retained in experiment archive"
+    },
+    {
+      "experiment_relative_path": "parity-20260911/sparse-native/build-unified.sh",
+      "copied_relative_path": "scripts/dev/glm_sparse_native/build-unified.sh",
+      "experiment_sha256": "718c8dffaeaa699e1b876121c711c0aad661d2deaa89eb7bf96f5c8fd70a9e2a",
+      "copied_sha256": "718c8dffaeaa699e1b876121c711c0aad661d2deaa89eb7bf96f5c8fd70a9e2a",
+      "change": "none"
+    },
+    {
+      "experiment_relative_path": "parity-20260911/sparse-native/native-init-check.cpp",
+      "copied_relative_path": "scripts/dev/glm_sparse_native/native-init-check.cpp",
+      "experiment_sha256": "a78f3e10b692742f73a9be72c461fb28ecf543c8d89b7c53aa98047a6e57b34f",
+      "copied_sha256": "a78f3e10b692742f73a9be72c461fb28ecf543c8d89b7c53aa98047a6e57b34f",
+      "change": "none"
+    },
+    {
+      "experiment_relative_path": "parity-20260911/sparse-native/native-prep-check.py",
+      "copied_relative_path": "scripts/dev/glm_sparse_native/native-prep-check.py",
+      "experiment_sha256": "30d9c4078d52459896b09cda6c6d6e5bc3a1877527b03c0b738d73862d4efb81",
+      "copied_sha256": "4a333b06e1dd064d993b25001c017b00818caa5da6326b3943a953588cf00a71",
+      "change": "prepended SPDX comment only"
+    },
+    {
+      "experiment_relative_path": "parity-20260911/sparse-native/unified-check.py",
+      "copied_relative_path": "scripts/dev/glm_sparse_native/unified-check.py",
+      "experiment_sha256": "7e8f5a9c0a2cfe94536c3102fb63997dffda741932a744ee574cdd0543962085",
+      "copied_sha256": "6082325c5d1ff5071015f05448689880502d0ee780d43eb2a33a7cfb9ade1d17",
+      "change": "prepended SPDX comment only"
+    },
+    {
+      "experiment_relative_path": "parity-20260911/sparse-native/reference/traits/model/model_type.h",
+      "copied_relative_path": "scripts/dev/glm_sparse_native/reference/traits/model/model_type.h",
+      "experiment_sha256": "d8eb2cfdc3eb228f1671f37c50233ff2a0c07908799cc9dcb8848d74a33cf0e9",
+      "copied_sha256": "d8eb2cfdc3eb228f1671f37c50233ff2a0c07908799cc9dcb8848d74a33cf0e9",
+      "change": "none"
+    },
+    {
+      "experiment_relative_path": "parity-20260911/sparse-native/NATIVE-BRIDGE-NOTICE.txt",
+      "copied_relative_path": "scripts/dev/glm_sparse_native/NATIVE-BRIDGE-NOTICE.txt",
+      "experiment_sha256": "eb7324f2ae363e807927f5c16a141522697d45cf71513a07059fa5e31bb3f85f",
+      "copied_sha256": "eb7324f2ae363e807927f5c16a141522697d45cf71513a07059fa5e31bb3f85f",
+      "change": "none"
+    }
+  ],
+  "readme_sha256": "733c8fc0ab3ab6a646b41a1a4634eab0ce907b8d39ed023aa63eaa4399a80bd7",
+  "historical_cached_object": {
+    "sha256": "9e372b5a47ade0a8332a73878ec3f6b917ae137447fea2335d2003dd146d549a",
+    "source_identity_limit": "Retained object predates copied NVIDIA reference snapshot; exact build source identity remains unproven",
+    "used_by_current_builder": false
+  },
+  "current_source_build": {
+    "builder": "scripts/build_glm_prefill/build.sh",
+    "dependency_pin_source": "scripts/build_glm_prefill/sources.sh",
+    "translation_unit": "FlashInfer csrc/sparse_mla_sm120_prefill.cu",
+    "recipe_provenance": "third_party/glm_prefill/provenance.json",
+    "evidence": "Build output records compiler version, Atlas commit and worktree status, exact input hashes, dependency pins and output hashes. Successful compilation does not establish numerical parity or runtime performance."
+  }
+}

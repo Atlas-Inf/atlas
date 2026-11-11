@@ -144,6 +144,26 @@ impl QuantizedWeight {
         self.weight_scale_2_vec != DevicePtr::NULL
     }
 
+    /// Rows `first..` of a `[N, k]` weight as a view (pointer offsets, no
+    /// copy): packed E2M1 `k / 2` bytes a row, E4M3 block scales `k / 16`,
+    /// the per-row scale2 when present; the per-tensor scale is shared.
+    pub fn rows_from(&self, first: usize, k: usize) -> Self {
+        let at = |p: DevicePtr, row_bytes: usize| {
+            if p.is_null() {
+                p
+            } else {
+                p.offset(first * row_bytes)
+            }
+        };
+        Self {
+            weight: at(self.weight, k / 2),
+            weight_scale: at(self.weight_scale, k / 16),
+            weight_scale_2: self.weight_scale_2,
+            input_scale: self.input_scale,
+            weight_scale_2_vec: at(self.weight_scale_2_vec, 4),
+        }
+    }
+
     /// Whether this weight points to NULL (remote expert placeholder).
     pub fn is_null(&self) -> bool {
         self.weight == DevicePtr::NULL

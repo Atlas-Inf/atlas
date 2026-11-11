@@ -12,8 +12,24 @@ use half::bf16;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use crate::layers::ops;
-use crate::layers::ops::{DFLASH2_SELECTOR_MAX_RANK, DFLASH2_SELECTOR_MAX_TOP_K};
+use crate::layers::ops::DFLASH2_SELECTOR_MAX_RANK;
 use crate::weight_map::DenseWeight;
+
+/// The block anchor (row 1's predecessor) and min_tokens ban of one selector
+/// walk: host values for the host fallback, device `u32` slots for the
+/// kernel. The device slots are written before any captured tail, so a
+/// replayed graph walks from the current step's anchor (a by-value kernel
+/// argument would be frozen at capture).
+#[derive(Clone, Copy)]
+pub struct SelectorAnchor {
+    pub token: u32,
+    pub token_dev: DevicePtr,
+    /// Rows `1..=ban_depth` may not pick an end token (below min_tokens).
+    pub ban_depth: u32,
+    pub ban_depth_dev: DevicePtr,
+    /// The model end tokens (`EosBan::model_end_ids`, unused slots `u32::MAX`).
+    pub end_ids: [u32; 4],
+}
 
 #[derive(Clone)]
 pub struct Dflash2CandidateSelector {
@@ -46,10 +62,7 @@ impl Dflash2CandidateSelector {
             (1..=DFLASH2_SELECTOR_MAX_RANK).contains(&rank),
             "DFlash2 selector rank {rank} exceeds the on-device selector's cap {DFLASH2_SELECTOR_MAX_RANK}"
         );
-        anyhow::ensure!(
-            (1..=DFLASH2_SELECTOR_MAX_TOP_K).contains(&top_k),
-            "DFlash2 selector top_k {top_k} exceeds the on-device selector's cap {DFLASH2_SELECTOR_MAX_TOP_K}"
-        );
+        ops::dflash2_selector_build(top_k)?;
         let n_elements = vocab_size * rank;
         let mut pred_buf = vec![0u8; n_elements * 2];
         let mut succ_buf = vec![0u8; n_elements * 2];
@@ -79,13 +92,69 @@ impl Dflash2CandidateSelector {
         })
     }
 
+    /// The selector's first step: `projected_hidden_buf [γ, rank] =
+    /// hidden_buf [γ, H] @ hidden_projectionᵀ [rank, H]`. `gemm` is
+    /// `drafter_dense_gemm`: γ rows fit the batched GEMV arm.
+    pub fn project_hidden(
+        &self,
+        hidden_buf: DevicePtr,
+        projected_hidden_buf: DevicePtr,
+        gamma: usize,
+        gemm: &dyn Fn(DevicePtr, &DenseWeight, DevicePtr, u32, u32, u32) -> Result<()>,
+    ) -> Result<()> {
+        gemm(
+            hidden_buf,
+            &self.hidden_projection,
+            projected_hidden_buf,
+            gamma as u32,
+            self.rank as u32,
+            self.hidden_size as u32,
+        )
+    }
+
+    /// The rank split's walk (`ATLAS_GLM_DRAFT_TP_TOPK`): the chain over
+    /// the two ranks' top-K `lists` and the hidden rows `project_hidden`
+    /// already projected — the picks `select_candidates` makes over the
+    /// joined logits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn walk_lists(
+        &self,
+        anchor: SelectorAnchor,
+        lists: ops::SelectorLists,
+        projected_hidden_buf: DevicePtr,
+        draft_tokens_dev: DevicePtr,
+        gamma: usize,
+        gpu: &dyn GpuBackend,
+        walk_kernel: KernelHandle,
+        stream: u64,
+    ) -> Result<()> {
+        ops::dflash2_selector_walk(
+            gpu,
+            walk_kernel,
+            lists,
+            projected_hidden_buf,
+            self.predecessor_codebook.weight,
+            self.successor_codebook.weight,
+            draft_tokens_dev,
+            anchor.token_dev,
+            anchor.ban_depth_dev,
+            anchor.end_ids,
+            gamma as u32,
+            self.vocab_size as u32,
+            self.rank as u32,
+            self.top_k as u32,
+            stream,
+        )
+    }
+
     /// Select candidate tokens using the bilinear codebook path walk.
     pub fn select_candidates(
         &self,
-        last_token: u32,
+        anchor: SelectorAnchor,
         hidden_buf: DevicePtr,
         logits_buf: DevicePtr,
         projected_hidden_buf: DevicePtr,
+        selector_scratch: DevicePtr,
         draft_tokens_dev: DevicePtr,
         gamma: usize,
         gpu: &dyn GpuBackend,
@@ -94,19 +163,9 @@ impl Dflash2CandidateSelector {
         stream: u64,
     ) -> Result<()> {
         let r = self.rank as u32;
-        let h = self.hidden_size as u32;
         let g = gamma as u32;
 
-        // 1. GEMM: projected_hidden_buf [γ, rank] = hidden_buf [γ, H] @ hidden_projection^T [rank, H]
-        //    `gemm` is `drafter_dense_gemm`: γ-row fits the batched GEMV arm.
-        gemm(
-            hidden_buf,
-            &self.hidden_projection,
-            projected_hidden_buf,
-            g,
-            r,
-            h,
-        )?;
+        self.project_hidden(hidden_buf, projected_hidden_buf, gamma, gemm)?;
 
         // 2. On-Device GPU Candidate Selector (Zero D2H, Zero CPU Loop, <0.05ms)
         if let Some(kernel) = candidate_selector_kernel {
@@ -118,11 +177,14 @@ impl Dflash2CandidateSelector {
                 self.predecessor_codebook.weight,
                 self.successor_codebook.weight,
                 draft_tokens_dev,
-                last_token,
+                anchor.token_dev,
+                anchor.ban_depth_dev,
+                anchor.end_ids,
                 g,
                 self.vocab_size as u32,
                 r,
                 self.top_k as u32,
+                selector_scratch,
                 stream,
             );
         }
@@ -148,7 +210,7 @@ impl Dflash2CandidateSelector {
         // step 0's predecessor = last_token.
         let num_draft_steps = gamma.saturating_sub(1);
         let mut mask_drafts = Vec::with_capacity(num_draft_steps);
-        let mut prev_token = last_token as usize;
+        let mut prev_token = anchor.token as usize;
 
         for step in 0..num_draft_steps {
             let mask_row = step + 1;
@@ -162,7 +224,16 @@ impl Dflash2CandidateSelector {
                 .chunks_exact(2)
                 .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
                 .collect();
-            let top_candidates = topk_unary(&logits_row, self.top_k);
+            let mut top_candidates = topk_unary(&logits_row, self.top_k);
+            // Below the min_tokens floor an end token only truncates the
+            // chain; score it out like the kernel does.
+            if ops::DFLASH2_SELECTOR_BANS_END_TOKENS && mask_row <= anchor.ban_depth as usize {
+                for (value, id) in top_candidates.iter_mut() {
+                    if anchor.end_ids.contains(&(*id as u32)) {
+                        *value = f32::NEG_INFINITY;
+                    }
+                }
+            }
 
             // Context vector: c_r = pred[prev, r] * H_proj[mask_row, r]
             let h_step = &proj_hiddens[mask_row * self.rank..(mask_row + 1) * self.rank];

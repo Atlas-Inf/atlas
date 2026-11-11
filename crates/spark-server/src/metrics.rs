@@ -96,6 +96,26 @@ lazy_static! {
             &["k", "outcome"]
         ).unwrap();
 
+    // The same outcomes under vLLM's speculative-decoding counter names, so
+    // benchmarks written against vLLM's `/metrics` (tokens accepted per
+    // verify step, drafts verified) read Atlas too: one draft per sequence
+    // verify, its drafted tokens, and the drafted tokens the verify kept.
+    pub static ref SPEC_DECODE_NUM_DRAFTS: IntCounter =
+        register_int_counter!(
+            "vllm:spec_decode_num_drafts_total",
+            "Sequence verifies of a speculative draft"
+        ).unwrap();
+    pub static ref SPEC_DECODE_NUM_DRAFT_TOKENS: IntCounter =
+        register_int_counter!(
+            "vllm:spec_decode_num_draft_tokens_total",
+            "Draft tokens verified"
+        ).unwrap();
+    pub static ref SPEC_DECODE_NUM_ACCEPTED_TOKENS: IntCounter =
+        register_int_counter!(
+            "vllm:spec_decode_num_accepted_tokens_total",
+            "Draft tokens the verify accepted"
+        ).unwrap();
+
     // ── Tool-call telemetry ──
     //
     // Total successful tool calls emitted by the API layer (sum across

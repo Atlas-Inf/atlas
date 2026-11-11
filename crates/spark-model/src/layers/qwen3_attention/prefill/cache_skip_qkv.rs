@@ -100,9 +100,10 @@ impl Qwen3AttentionLayer {
         )?;
         let v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16);
         let t0 = std::time::Instant::now();
+        let v_in = self.value_residual_input(ctx.gpu, normed, n as usize, h as usize, stream)?;
         self.cache_skip_one_proj(
             SkipProj::V,
-            normed,
+            v_in,
             normed_fp8,
             v_contiguous,
             n,
@@ -167,8 +168,8 @@ impl Qwen3AttentionLayer {
             ),
         };
 
-        // Keep-packed Q2_0 (Tier-1c): transient-dequant to BF16 then dense GEMM.
-        if let Some(r) = self.try_q2_prefill(ctx, weight_opt, normed, out, n, stream) {
+        // Native MXFP8 / keep-packed Q2_0: not GEMM-ready as stored.
+        if let Some(r) = self.try_unpacked_prefill(ctx, weight_opt, normed, out, n, stream) {
             return r;
         }
 
@@ -302,7 +303,18 @@ impl Qwen3AttentionLayer {
         } else if weight_opt.and_then(|w| w.as_fp8()).is_some() {
             anyhow::bail!("w8a16_gemm kernel not loaded — cannot prefill with FP8 weights");
         } else if let Some(fp8p) = fp8 {
-            if n > 128 {
+            // ATLAS_QWEN4EXP_PREFILL_FP8_W2: the same k32 chain on a 2 x 4
+            // warp grid with 128-wide K steps, byte for byte.
+            if n > 128
+                && ctx.config.model_type == "qwen4_exp"
+                && ops::qwen4exp_prefill::try_fp8_gemm_w2(
+                    ctx.gpu,
+                    [normed_fp8, fp8p, out],
+                    [n, out_dim, h],
+                    stream,
+                )?
+            {
+            } else if n > 128 {
                 ops::fp8_fp8_gemm_n128_m128(
                     ctx.gpu,
                     self.fp8_fp8_gemm_t_m128_k,
@@ -328,10 +340,15 @@ impl Qwen3AttentionLayer {
                 )?;
             }
         } else if let Some(nvfp4_t) = nvfp4_t {
-            if n > 128 {
+            if self.nvfp4_proj_m128(nvfp4_t, [n, out_dim, h], ctx.levers) {
                 self.w4a16_gemm_m128_dispatch(
                     ctx.gpu,
-                    ctx.dispatch,
+                    (ctx.dispatch, ctx.levers),
+                    crate::layers::ops::LowpArgs {
+                        group: crate::layers::ops::LowpMix::ATTN_QKV,
+                        codes: ctx.buffers.ffn_act_a(),
+                        scales: ctx.buffers.ffn_act_scale(),
+                    },
                     normed,
                     nvfp4_t,
                     out,

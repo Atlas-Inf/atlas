@@ -28,7 +28,7 @@ impl Qwen3SsmLayer {
         // ── 9. Gated RMS norm (batched: all chunk tokens × heads) ──
         // Read GDN output and Z from full-sequence buffers at token_offset.
         let gdn_out_chunk = gdn_bufs.output.offset(token_offset * value_dim * bf16);
-        let z_chunk = gdn_bufs.z.offset(token_offset * value_dim * bf16);
+        let z_chunk = gdn_bufs.z.offset(token_offset * gdn_bufs.z_stride * bf16);
 
         // Output buffer: reuse ssm_qkvz (same as monolithic prefill)
         let normed_out_buf = ctx.buffers.ssm_qkvz();
@@ -44,7 +44,7 @@ impl Qwen3SsmLayer {
             eps,
             k,
             value_dim as u32, // input_token_stride: GDN output is [N, value_dim] contiguous
-            value_dim as u32, // gate_token_stride: Z buffer is [N, value_dim] contiguous
+            gdn_bufs.z_stride as u32, // gate_token_stride: Z row pitch
             stream,
         )?;
 
@@ -102,10 +102,12 @@ impl Qwen3SsmLayer {
             h_state_checkpoint: None,
             conv_state_checkpoint: None,
             h_state_intermediates: Vec::new(),
+            kda_records: spark_runtime::gpu::DevicePtr::NULL,
             conv_state_intermediates: Vec::new(),
             gdn_commit_qkv: DevicePtr(0),
             gdn_commit_gb: DevicePtr(0),
             gdn_commit_pending: false,
+            gdn_fuse_n: DevicePtr::NULL,
             h_is_f16: false,
             // `Layer::alloc_state` is the NON-pooled fallback — it owns a
             // private FP32 `h_state_bytes` blob, so there is nothing to widen.

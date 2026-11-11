@@ -30,6 +30,67 @@ mod windows;
 #[cfg(windows)]
 pub use windows::DirectSwapFile;
 
+mod shared;
+pub use shared::SharedRecordFile;
+
+/// Remove leftover swap files (`<prefix>*.swap`) from `dir`; returns how many
+/// went. For tiers whose files carry no state across restarts: a file found at
+/// startup was left by a process that died before unlinking it (or by a build
+/// that never unlinked), and only wastes the disk budget. Unlinking cannot
+/// hurt a live owner — it keeps its descriptor.
+pub fn remove_stale_swap_files(dir: &std::path::Path, prefix: &str) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(prefix) && name.ends_with(".swap")
+        })
+        .filter(|e| std::fs::remove_file(e.path()).is_ok())
+        .count()
+}
+
+/// `Some(kind)` when `dir` is on a filesystem that must not hold a swap tier:
+/// memory-backed (a "disk" tier there spends the RAM it was meant to save —
+/// and tmpfs accepts `O_DIRECT` on current kernels, so nothing else stops it)
+/// or a container overlay (the records would land in the image store, not on
+/// the mounted disk). `None` for everything else, off Linux, and when the
+/// directory cannot be examined (the open that follows reports that).
+pub fn unsuitable_swap_fs(dir: &std::path::Path) -> Option<&'static str> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        // SAFETY: `statfs` fills the zeroed struct it is handed; `path` is a
+        // NUL-terminated string that outlives the call.
+        let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statfs(path.as_ptr(), &mut fs) } != 0 {
+            return None;
+        }
+        // `f_type` is `i64` on glibc 64-bit and another width elsewhere.
+        #[allow(clippy::unnecessary_cast)]
+        fs_kind(fs.f_type as i64)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
+/// Classify a Linux `statfs.f_type` (see [`unsuitable_swap_fs`]).
+pub fn fs_kind(f_type: i64) -> Option<&'static str> {
+    match f_type {
+        0x0102_1994 => Some("tmpfs (host RAM)"),
+        0x8584_58f6 => Some("ramfs (host RAM)"),
+        0x794c_7630 => Some("overlayfs (the container layer, not a mounted disk)"),
+        _ => None,
+    }
+}
+
 /// Shared by both implementations so the error text of a misuse is identical
 /// on every platform.
 #[allow(dead_code)]

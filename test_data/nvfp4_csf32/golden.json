@@ -1,0 +1,319 @@
+{
+ "source": "https://huggingface.co/nvidia/GLM-5.3-Flash-FP4-Local/tree/76348ddb2be2e35e39ecfc00e75dc07703f4f3d5",
+ "reference": "Local Inference Lab FlashInfer fork 7e203806 scripts/encode_csf.py decode_scales (Apache-2.0)",
+ "encoding": "csf_32x2_v1",
+ "cases": [
+  {
+   "tag": "l3_e0_gate",
+   "tensor": "model.language_model.layers.3.mlp.experts.0.gate_proj.weight_scale",
+   "component_shapes": {
+    "bases": [
+     2048
+    ],
+    "codes": [
+     262144
+    ],
+    "page_bases": [
+     32
+    ],
+    "offsets": [
+     8224
+    ],
+    "exceptions": [
+     1428
+    ]
+   },
+   "weight_shape": [
+    2048,
+    2048
+   ],
+   "decoded_shape": [
+    2048,
+    256
+   ],
+   "decoded_sha256": "1ce16b445202b341f7a074af3d41f267664ada8e15750b01dd4521d977062c69",
+   "head": [
+    108,
+    115,
+    113,
+    105,
+    110,
+    108,
+    108,
+    113,
+    112,
+    112,
+    110,
+    110,
+    113,
+    107,
+    108,
+    111,
+    111,
+    109,
+    114,
+    111,
+    108,
+    110,
+    113,
+    107,
+    110,
+    108,
+    111,
+    106,
+    110,
+    114,
+    111,
+    107
+   ],
+   "exception_samples": [
+    [
+     20481,
+     119
+    ],
+    [
+     30465,
+     119
+    ],
+    [
+     8713,
+     120
+    ]
+   ],
+   "exceptions": 1428
+  },
+  {
+   "tag": "l3_e0_down",
+   "tensor": "model.language_model.layers.3.mlp.experts.0.down_proj.weight_scale",
+   "component_shapes": {
+    "bases": [
+     4096
+    ],
+    "codes": [
+     262144
+    ],
+    "page_bases": [
+     32
+    ],
+    "offsets": [
+     8224
+    ],
+    "exceptions": [
+     1487
+    ]
+   },
+   "weight_shape": [
+    4096,
+    1024
+   ],
+   "decoded_shape": [
+    4096,
+    128
+   ],
+   "decoded_sha256": "788ca32403a7a546a766f73beef4df478f0681a9173cd35e92028b237dde244c",
+   "head": [
+    114,
+    113,
+    113,
+    111,
+    113,
+    113,
+    115,
+    105,
+    114,
+    113,
+    116,
+    109,
+    110,
+    115,
+    116,
+    114,
+    111,
+    109,
+    111,
+    114,
+    107,
+    117,
+    111,
+    113,
+    113,
+    111,
+    114,
+    113,
+    113,
+    105,
+    116,
+    117
+   ],
+   "exception_samples": [
+    [
+     4609,
+     121
+    ],
+    [
+     13568,
+     121
+    ],
+    [
+     7046,
+     121
+    ]
+   ],
+   "exceptions": 1487
+  },
+  {
+   "tag": "l44_e287_up",
+   "tensor": "model.language_model.layers.44.mlp.experts.287.up_proj.weight_scale",
+   "component_shapes": {
+    "bases": [
+     2048
+    ],
+    "codes": [
+     262144
+    ],
+    "page_bases": [
+     32
+    ],
+    "offsets": [
+     8224
+    ],
+    "exceptions": [
+     1621
+    ]
+   },
+   "weight_shape": [
+    2048,
+    2048
+   ],
+   "decoded_shape": [
+    2048,
+    256
+   ],
+   "decoded_sha256": "f2f48f1bd5b1a803342714d303bc7a0c1bc524b2adf36c30064a4daff944e821",
+   "head": [
+    108,
+    117,
+    116,
+    117,
+    116,
+    113,
+    110,
+    113,
+    113,
+    112,
+    112,
+    114,
+    113,
+    113,
+    110,
+    112,
+    113,
+    114,
+    112,
+    116,
+    106,
+    115,
+    110,
+    113,
+    108,
+    113,
+    115,
+    111,
+    110,
+    115,
+    113,
+    113
+   ],
+   "exception_samples": [
+    [
+     13313,
+     121
+    ],
+    [
+     16386,
+     105
+    ],
+    [
+     19459,
+     120
+    ]
+   ],
+   "exceptions": 1621
+  },
+  {
+   "tag": "syn_160x133",
+   "tensor": null,
+   "component_shapes": {
+    "bases": [
+     160
+    ],
+    "codes": [
+     10640
+    ],
+    "page_bases": [
+     3
+    ],
+    "offsets": [
+     338
+    ],
+    "exceptions": [
+     977
+    ]
+   },
+   "decoded_shape": [
+    160,
+    133
+   ],
+   "decoded_sha256": "3f56e7321dd22183fa5f977bca706ca497b0455f6a96edc23963cc6b03ca7265",
+   "head": [
+    0,
+    43,
+    46,
+    49,
+    52,
+    55,
+    42,
+    45,
+    48,
+    51,
+    54,
+    41,
+    44,
+    47,
+    50,
+    53,
+    40,
+    43,
+    46,
+    57,
+    52,
+    55,
+    42,
+    45,
+    48,
+    51,
+    54,
+    41,
+    44,
+    47,
+    50,
+    53
+   ],
+   "exception_samples": [
+    [
+     0,
+     0
+    ],
+    [
+     1730,
+     16
+    ],
+    [
+     2527,
+     19
+    ]
+   ],
+   "exceptions": 977
+  }
+ ]
+}

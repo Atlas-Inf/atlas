@@ -197,7 +197,8 @@ impl Qwen3AttentionLayer {
         } else {
             qg_out
         };
-        let q_rope_fused = self.gated
+        let q_rope_fused = self.yarn_inv_freq.is_null()
+            && self.gated
             && !self.attn.q_norm.weight.is_null()
             && self.mrope_interleaved
             && !self.rope_proportional
@@ -433,20 +434,19 @@ impl Qwen3AttentionLayer {
             )
             .map_err(|e| anyhow::anyhow!("rope_mrope_interleaved_k_only failed: {e}"))?;
         } else if !self.yarn_inv_freq.is_null() {
-            ops::rope_yarn_scaled(
+            self.apply_scaled_rope(
                 ctx.gpu,
-                self.rope_yarn_scaled_k,
                 q_contiguous,
                 k_contiguous,
                 positions,
+                positions_h,
+                positions_w,
                 n,
                 nq,
                 nkv,
                 hd,
                 self.rotary_dim_override
                     .unwrap_or(ctx.config.rotary_dim() as u32),
-                self.yarn_inv_freq,
-                self.yarn_attention_factor,
                 stream,
             )
             .map_err(|e| anyhow::anyhow!("rope_yarn_scaled failed: {e}"))?;
@@ -779,6 +779,7 @@ impl Qwen3AttentionLayer {
                 bs as u32,
                 inv_sqrt_d,
                 ctx.buffers.qsa_select_scratch(),
+                Some(ctx),
                 ctx.gpu,
                 stream,
             )?;

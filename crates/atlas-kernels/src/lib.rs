@@ -195,6 +195,10 @@ pub struct ModelBehavior {
     /// (historical ladder shape). See `behavior_defaults.rs` for when a
     /// model should set `true` (measured budget non-monotonicity).
     pub effort_capped_at_ceiling: bool,
+    /// `[behavior].default_reasoning_effort` — qualitative effort a
+    /// request gets when it leaves effort undefined (template default); ""
+    /// means the template's own default applies, as on the reference server.
+    pub default_reasoning_effort: &'static str,
     /// Default thinking state for this model when the client request does not
     /// specify a reasoning_effort / thinking parameter. Typical values:
     /// - thinking-first models (Mistral Small 4, Qwen3.5, …): `true`
@@ -271,6 +275,9 @@ pub struct ModelBehavior {
     pub enable_loop_watchdog: bool,
     /// See build_parse.rs: gate for the THINKING-phase loop watchdog.
     pub enable_think_loop_watchdog: bool,
+    /// See build_parse_behavior.rs: arm the chat stream's SimHash and
+    /// token-loop guards. Defaults TRUE.
+    pub enable_stream_loop_guards: bool,
     /// See build_parse_behavior.rs: honor a mid-`<think>` EOS by implicitly
     /// closing the block. Defaults FALSE (pre-p350 behaviour).
     pub honor_eos_inside_thinking: bool,
@@ -374,6 +381,41 @@ pub struct ModelBehavior {
     /// multi-turn prompt bytes and therefore prefix-cache hit rate.
     /// Per-request `chat_template_kwargs.preserve_thinking` still wins.
     pub preserve_thinking: Option<bool>,
+    /// The prompt is the checkpoint template's render of the client's
+    /// request and nothing else, as on the reference server (vLLM over
+    /// transformers): no Atlas tool prompt, hints or injected kwargs, and
+    /// `tojson` spaced like `json.dumps`. Default `false`.
+    pub verbatim_prompt: bool,
+    /// `verbatim_prompt` for a checkpoint that is a ModelOpt NVFP4 pack and
+    /// NOT FP4-Local (`ModeloptQuantPlan::from_config` returns a plan and
+    /// `!plan.is_fp4_local()`). `None` (the default) = `verbatim_prompt`
+    /// applies to every checkpoint. Resolved once at serve start, so every
+    /// `verbatim_prompt` reader sees the resolved value.
+    pub nvfp4_verbatim_prompt: Option<bool>,
+    /// An end token sampled inside `<think>` ends the turn, as on the
+    /// reference engines. Default `false` (discarded, or the block closed
+    /// under `honor_eos_inside_thinking`).
+    pub eos_ends_thinking: bool,
+    /// Atlas's `<tool_call>` logit bias and loop-detector mask on tool-armed
+    /// requests. Default `true`; `false` leaves the opener to the model.
+    pub tool_call_steering: bool,
+    /// The template gets `reasoning_effort` verbatim (`minimal`, `xhigh`, `max`),
+    /// as vLLM hands it. Default `false`: `low`/`medium`/`high`/`xhigh`.
+    pub verbatim_reasoning_effort: bool,
+    /// A request that declares no tools bans the `<tool_call>` start token, so
+    /// a tool-describing system prompt cannot make the model answer with
+    /// literal markup nobody can execute. Default `true`; `--reference-mode` skips it.
+    pub ban_tool_call_without_tools: bool,
+}
+
+/// The server's thinking ceiling for a `max_thinking_budget`: 0 means none,
+/// so only a client's explicit token budget (or `max_tokens`) bounds it.
+pub const fn thinking_ceiling(max_thinking_budget: u32) -> Option<u32> {
+    if max_thinking_budget == 0 {
+        None
+    } else {
+        Some(max_thinking_budget)
+    }
 }
 
 /// Phase-C: maximum number of watchdog-triggered rollbacks a single
@@ -399,46 +441,7 @@ pub const DECODE_ROLLBACK_RING_SLOTS: usize = 8;
 /// never collide with a Marconi prefix-hash key on a shared store/peer.
 pub const DECODE_DOMAIN: u64 = 0xD3C0_DE12_A5B6_C7D8;
 
-impl Default for ModelBehavior {
-    fn default() -> Self {
-        Self {
-            thinking_in_tools: true,
-            max_thinking_budget: DEFAULT_MAX_THINKING_BUDGET,
-            effort_capped_at_ceiling: DEFAULT_EFFORT_CAPPED_AT_CEILING,
-            thinking_default: false,
-            fp8_kv_calibration_tokens: 0,
-            default_kv_dtype: "",
-            default_num_drafts: 0,
-            disable_tool_steering: false,
-            template_owns_tool_definitions: false,
-            disable_cwd_hint_injection: false,
-            use_sampling_presets_for_core: false,
-            use_sampling_preset_penalties_for_core: true,
-            tool_call_parser: "",
-            jinja_template: "",
-            enable_loop_watchdog: false,
-            enable_think_loop_watchdog: true,
-            honor_eos_inside_thinking: false,
-            min_reasoning_floor_tokens: 16,
-            cap_thinking_at_max_tokens: true,
-            min_p_floor: 0.0,
-            temperature_max: 0.0,
-            think_loop_min_repeats: 3,
-            think_loop_scan_window: 160,
-            confidence_early_stop: true,
-            confidence_run_length: 30,
-            fuzzy_repeat_tolerance_div: 12,
-            max_inter_tool_prose: DEFAULT_MAX_INTER_TOOL_PROSE,
-            max_post_think_content_tokens: 100_000,
-            tscg: false,
-            disable_tool_grammar: false,
-            rollback_resteer: true,
-            rom_head: "",
-            tool_retry: true,
-            preserve_thinking: None,
-        }
-    }
-}
+mod model_behavior_default;
 
 /// Declares which `(model_type, hidden_size)` pairs a kernel target supports.
 /// Parsed from `[[model_types]]` in MODEL.toml at build time.

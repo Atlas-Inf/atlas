@@ -23,6 +23,7 @@ impl MoeLayer {
         self.down_t_scratch_packed = Some(scratch_packed);
         self.down_t_scratch_scale = Some(scratch_scale);
         self.down_ptrs_t = Some(ExpertPtrTable {
+            allocation: None, // Borrowed scratch is not an owning table allocation.
             packed_ptrs: packed_ptrs_t,
             scale_ptrs: scale_ptrs_t,
             scale2_vals: self.down_ptrs.scale2_vals,
@@ -39,6 +40,7 @@ impl MoeLayer {
         ctx: &crate::layer::ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.btile_forward_guard(ctx, stream)?;
         let Some(dpt) = self.down_ptrs_t.as_ref() else {
             return Ok(());
         };
@@ -96,6 +98,7 @@ impl MoeLayer {
         ctx: &crate::layer::ForwardContext,
         compute_stream: u64,
     ) -> Result<()> {
+        self.btile_forward_guard(ctx, compute_stream)?;
         let Some(dpt) = self.down_ptrs_t.as_ref() else {
             return Ok(());
         };
@@ -216,8 +219,9 @@ impl MoeLayer {
         config: &atlas_core::config::ModelConfig,
         stream: u64,
     ) -> Result<()> {
+        self.btile_storage.require_legacy()?;
         let h = config.hidden_size;
-        let inter = config.moe_intermediate_size;
+        let inter = config.routed_inter_local();
         let num = self.weights.experts.len();
         // Swizzled SFB atom size (bytes): round_up(N,128) * round_up(K/16,4).
         let sfb_len = |n: usize, k: usize| n.div_ceil(128) * 128 * (k / 16).div_ceil(4) * 4;
@@ -291,9 +295,21 @@ impl MoeLayer {
             down,
         )?);
         self._cutlass_sfb_owned = owned;
+        if gate_up_cutlass_only(src_n_major) {
+            self.release_routed_scales(gpu)?;
+        }
         tracing::info!(
             "CUTLASS grouped SFB: built {num} experts gate/up (N={inter} K={h}) + down (N={h} K={inter})"
         );
         Ok(())
     }
+}
+
+/// GLM serves every routed row count through CUTLASS grouped when enabled, so
+/// the checkpoint scales are dead after the swizzle. Only native (N-major)
+/// sources are released; Atlas-transposed scales stay with their owners.
+fn gate_up_cutlass_only(src_n_major: bool) -> bool {
+    src_n_major
+        && super::forward_prefill_routed::env_flag("ATLAS_MOE_GROUPED_CUTLASS")
+        && std::env::var("ATLAS_MOE_CUTLASS_KEEP_SCALES").as_deref() != Ok("1")
 }

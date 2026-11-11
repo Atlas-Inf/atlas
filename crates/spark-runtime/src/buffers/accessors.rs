@@ -2,8 +2,12 @@
 
 //! `BufferArena` accessors. Split from `buffers.rs` (500-LoC cap).
 
+use std::sync::atomic::Ordering;
+
 use super::{BufferArena, sizes::BufferSizes};
 use crate::gpu::{DevicePtr, GpuBackend};
+
+pub(super) mod zero_dirty;
 
 impl BufferArena {
     pub fn hidden_states(&self) -> DevicePtr {
@@ -134,6 +138,15 @@ impl BufferArena {
     /// Allocated byte size of `q2_act_q8` (debug bounds-check).
     pub fn q2_act_q8_bytes(&self) -> usize {
         self.sizes.q2_act_q8
+    }
+    /// `(bf16 latents, identity table, token capacity)` when an `fp8_g128`
+    /// GLM cache attached its BF16 view.
+    pub fn glm_latent_scratch(&self) -> Option<(DevicePtr, DevicePtr, usize)> {
+        (!self.glm_latent_bf16.is_null()).then_some((
+            self.glm_latent_bf16,
+            self.glm_identity_table,
+            self.glm_latent_tokens,
+        ))
     }
     pub fn splitk_workspace(&self) -> DevicePtr {
         self.splitk_workspace
@@ -319,25 +332,15 @@ impl BufferArena {
 
     /// Zero all reusable buffers to eliminate stale data between requests.
     /// Ensures deterministic computation regardless of request history.
+    ///
+    /// The arena then counts as all zero for `zero_dirty`: a caller that goes
+    /// on to write more rows than a decode or verify step does must
+    /// `note_rows` them.
     pub fn zero_all(&self, gpu: &dyn GpuBackend, stream: u64) -> anyhow::Result<()> {
-        gpu.memset_zero_async(self.hidden_states, self.sizes.hidden_states, stream)?;
-        gpu.memset_zero_async(self.residual, self.sizes.residual, stream)?;
-        gpu.memset_zero_async(self.norm_output, self.sizes.norm_output, stream)?;
-        gpu.memset_zero_async(self.qkv_output, self.sizes.qkv_output, stream)?;
-        gpu.memset_zero_async(self.attn_output, self.sizes.attn_output, stream)?;
-        gpu.memset_zero_async(self.gate_logits, self.sizes.gate_logits, stream)?;
-        gpu.memset_zero_async(self.moe_output, self.sizes.moe_output, stream)?;
-        gpu.memset_zero_async(self.ssm_qkvz, self.sizes.ssm_qkvz, stream)?;
-        gpu.memset_zero_async(self.ssm_ba, self.sizes.ssm_ba, stream)?;
-        gpu.memset_zero_async(self.ssm_deinterleaved, self.sizes.ssm_deinterleaved, stream)?;
-        gpu.memset_zero_async(self.ssm_gates, self.sizes.ssm_gates, stream)?;
-        gpu.memset_zero_async(self.ssm_conv_out_f32, self.sizes.ssm_conv_out_f32, stream)?;
-        gpu.memset_zero_async(self.splitk_workspace, self.sizes.splitk_workspace, stream)?;
-        gpu.memset_zero_async(self.expert_gate_out, self.sizes.expert_gate_out, stream)?;
-        gpu.memset_zero_async(self.expert_up_out, self.sizes.expert_up_out, stream)?;
-        gpu.memset_zero_async(self.expert_down_out, self.sizes.expert_down_out, stream)?;
-        gpu.memset_zero_async(self.logits, self.sizes.logits, stream)?;
-        gpu.memset_zero_async(self.scratch, self.sizes.scratch, stream)?;
+        for (_, ptr, bytes) in self.zeroed() {
+            gpu.memset_zero_async(ptr, bytes, stream)?;
+        }
+        self.dirty_rows.store(0, Ordering::Relaxed);
         Ok(())
     }
 }

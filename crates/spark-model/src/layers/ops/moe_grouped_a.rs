@@ -46,6 +46,44 @@ pub fn moe_w4a16_grouped_gemm(
         .launch(stream)
 }
 
+// Sparse-expert M32 twin; the extracted grouped-prefill module retains M64.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_w4a16_grouped_gemm_ptrtable_k64_m32_n128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a: DevicePtr,
+    b_packed_ptrs: DevicePtr,
+    b_scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    c: DevicePtr,
+    expert_offsets: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    num_experts: u32,
+    n_out: u32,
+    k: u32,
+    max_m_tiles: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([
+            div_ceil(n_out, 128),
+            max_m_tiles.saturating_mul(2),
+            num_experts,
+        ])
+        .block([64, 1, 1])
+        .arg_ptr(a)
+        .arg_ptr(b_packed_ptrs)
+        .arg_ptr(b_scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(c)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(num_experts)
+        .arg_u32(n_out)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// Element-wise SiLU activation + multiply: `output[i] = silu(gate[i]) * up[i]`.
 ///
 /// Grid: (ceil(total_elements/256), 1, 1)  Block: (256, 1, 1)

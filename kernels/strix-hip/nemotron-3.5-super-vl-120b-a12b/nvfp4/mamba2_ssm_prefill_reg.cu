@@ -1,0 +1,1 @@
+../../../gb10/nemotron-3.5-super-vl-120b-a12b/nvfp4/mamba2_ssm_prefill_reg.cu

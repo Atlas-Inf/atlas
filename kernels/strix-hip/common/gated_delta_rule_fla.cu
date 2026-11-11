@@ -32,6 +32,13 @@ typedef float  v8f   __attribute__((ext_vector_type(8)));
 // log(0)=-inf → exp(gc_i-gc_l) NaNs in the chunked log-space form.
 #define GATE_FLOOR 1e-30f
 
+// chunk_delta_h_vfused stages each chunk's W/U/K into LDS as 16-byte loads (K rows fall back to the element loop
+// when the key row base is not 16-byte aligned) and computes the chunk's decay terms across threads. The bytes
+// and the expf operands are the same, so the spine is bit-identical. strix s126 (27B geometry, 48 v-heads, one
+// 2048-token chunk): 6.0-6.7 ms -> 3.8-3.9 ms. The element-wise staging was the spine's critical path (splitting
+// the v columns over more CTAs made it 2-4x slower, s125).
+#define GDN_VEC_STAGE
+
 // Per-stream prefill geometry — identical to the gb10 macro (varlen reads
 // cu_seqlens/cu_chunks; uniform reduces to b*seq_len / b*num_chunks).
 struct GdnGeom { unsigned int seqlen, nchunks, choff; unsigned long long tokoff; };
@@ -114,6 +121,16 @@ gated_delta_rule_recompute_wu(
     float* L = kk;                                     // aliased strict-lower (see gb10)
     float* gc = L + CHUNK * CHUNK;                      // [CHUNK]
 
+#ifdef GDN_VEC_STAGE
+    if (k_dim == K_DIM && (((unsigned long long)(key + kh * k_dim)) & 15ull) == 0 && qk_stride % 8 == 0) {
+        for (unsigned int e = tid; e < CHUNK * K_DIM / 8; e += blockDim.x) {
+            unsigned int i = (e * 8) / K_DIM, j = (e * 8) % K_DIM;
+            ((uint4*)sk)[e] = (i < ce)
+                ? *(const uint4*)&key[(unsigned long long)(cs + i) * qk_stride + kh * k_dim + j]
+                : make_uint4(0, 0, 0, 0);
+        }
+    } else
+#endif
     for (unsigned int idx = tid; idx < CHUNK * k_dim; idx += blockDim.x) {
         unsigned int i = idx / k_dim, j = idx % k_dim;
         sk[i * K_DIM + j] = (i < ce)
@@ -185,12 +202,20 @@ gated_delta_rule_recompute_wu(
     // Two independent right-looking forward-subs on disjoint halves — identical
     // to gb10 (RL_BLK must stay compile-time or xb spills to local).
     if (tid < v_dim) {
+        // acc[] is indexed only by compile-time loop counters (bounds CHUNK, the
+        // runtime ce becomes a predicate), so it stays in VGPRs instead of 272 B of
+        // scratch. Same operations, same order per element: bit-identical.
         float acc[CHUNK];
-        for (unsigned int i = 0; i < ce; i++) {
-            float bi = beta[(unsigned long long)(cs + i) * gb_stride + vh];
-            acc[i] = bi * (float)value[(unsigned long long)(cs + i) * v_stride + vh * v_dim + tid];
+        #pragma unroll
+        for (unsigned int i = 0; i < CHUNK; i++) {
+            if (i < ce) {
+                float bi = beta[(unsigned long long)(cs + i) * gb_stride + vh];
+                acc[i] = bi * (float)value[(unsigned long long)(cs + i) * v_stride + vh * v_dim + tid];
+            }
         }
-        for (unsigned int jb = 0; jb < ce; jb += RL_BLK) {
+        #pragma unroll
+        for (unsigned int jb = 0; jb < CHUNK; jb += RL_BLK) {
+            if (jb >= ce) continue;
             float xb[RL_BLK];
             #pragma unroll
             for (unsigned int r = 0; r < RL_BLK; r++) {
@@ -204,7 +229,9 @@ gated_delta_rule_recompute_wu(
                 acc[jb + r] = x;
                 U_out[base * CHUNK * V_DIM + (jb + r) * v_dim + tid] = __float2bfloat16(x);
             }
-            for (unsigned int i = jb + RL_BLK; i < ce; i++) {
+            #pragma unroll
+            for (unsigned int i = jb + RL_BLK; i < CHUNK; i++) {
+                if (i >= ce) continue;
                 float a = acc[i];
                 #pragma unroll
                 for (unsigned int q = 0; q < RL_BLK; q++) {
@@ -217,11 +244,16 @@ gated_delta_rule_recompute_wu(
     const unsigned int wtid = tid - 128u;
     if (tid >= 128u && wtid < k_dim) {
         float acc[CHUNK];
-        for (unsigned int i = 0; i < ce; i++) {
-            float bi = beta[(unsigned long long)(cs + i) * gb_stride + vh];
-            acc[i] = bi * expf(gc[i]) * (float)sk[i * K_DIM + wtid];
+        #pragma unroll
+        for (unsigned int i = 0; i < CHUNK; i++) {
+            if (i < ce) {
+                float bi = beta[(unsigned long long)(cs + i) * gb_stride + vh];
+                acc[i] = bi * expf(gc[i]) * (float)sk[i * K_DIM + wtid];
+            }
         }
-        for (unsigned int jb = 0; jb < ce; jb += RL_BLK) {
+        #pragma unroll
+        for (unsigned int jb = 0; jb < CHUNK; jb += RL_BLK) {
+            if (jb >= ce) continue;
             float xb[RL_BLK];
             #pragma unroll
             for (unsigned int r = 0; r < RL_BLK; r++) {
@@ -235,7 +267,9 @@ gated_delta_rule_recompute_wu(
                 acc[jb + r] = x;
                 W_out[base * CHUNK * K_DIM + (jb + r) * k_dim + wtid] = __float2bfloat16(x);
             }
-            for (unsigned int i = jb + RL_BLK; i < ce; i++) {
+            #pragma unroll
+            for (unsigned int i = jb + RL_BLK; i < CHUNK; i++) {
+                if (i >= ce) continue;
                 float a = acc[i];
                 #pragma unroll
                 for (unsigned int q = 0; q < RL_BLK; q++) {
@@ -304,22 +338,47 @@ gated_delta_rule_chunk_delta_h_vfused(
 
         __syncthreads();
         const __nv_bfloat16* Wsrc = W_in + base * CHUNK * K_DIM;
+        const __nv_bfloat16* Usrc0 = U_in + base * CHUNK * V_DIM;
+#ifdef GDN_VEC_STAGE
+        // 16-byte staging (same bytes as the element loops below). W/U are chunk-contiguous; K rows are
+        // contiguous along kx, so a row gathers as K_DIM/8 uint4 when the key row base is 16-byte aligned.
+        const bool kvec = ((((unsigned long long)(key_b + kh * k_dim)) & 15ull) == 0) && (qk_stride % 8 == 0);
+        for (unsigned int e = t; e < CHUNK * K_DIM / 8; e += nthr) ((uint4*)Wp)[e] = ((const uint4*)Wsrc)[e];
+        for (unsigned int e = t; e < CHUNK * V_DIM / 8; e += nthr) ((uint4*)Up)[e] = ((const uint4*)Usrc0)[e];
+        if (kvec) {
+            for (unsigned int e = t; e < CHUNK * K_DIM / 8; e += nthr) {
+                unsigned int i = (e * 8) / K_DIM, kx = (e * 8) % K_DIM;
+                ((uint4*)Kp)[e] = (i < ce)
+                    ? *(const uint4*)&key_b[(unsigned long long)(cs + i) * qk_stride + kh * k_dim + kx]
+                    : make_uint4(0, 0, 0, 0);
+            }
+        } else
+#endif
+        {
+#ifndef GDN_VEC_STAGE
         for (unsigned int e = t; e < CHUNK * K_DIM; e += nthr) Wp[e] = Wsrc[e];
+        for (unsigned int e = t; e < CHUNK * V_DIM; e += nthr) Up[e] = Usrc0[e];
+#endif
         for (unsigned int e = t; e < CHUNK * K_DIM; e += nthr) {
             unsigned int i = e / K_DIM, kx = e % K_DIM;
             Kp[e] = (i < ce)
                 ? key_b[(unsigned long long)(cs + i) * qk_stride + kh * k_dim + kx]
                 : __float2bfloat16(0.0f);
         }
-        {
-            const __nv_bfloat16* Usrc0 = U_in + base * CHUNK * V_DIM;
-            for (unsigned int e = t; e < CHUNK * V_DIM; e += nthr) Up[e] = Usrc0[e];
         }
+#ifdef GDN_VEC_STAGE
+        {   // decay terms across threads: each value is the same expf of the same operands.
+            const float dl = gc_in[base * CHUNK + ce - 1];
+            if (t == 0) decs[0] = expf(dl);
+            if (t < ce) decs[1 + t] = expf(dl - gc_in[base * CHUNK + t]);
+        }
+#else
         if (t == 0) {
             float dl = gc_in[base * CHUNK + ce - 1];
             decs[0] = expf(dl);
             for (unsigned int i = 0; i < ce; i++) decs[1 + i] = expf(dl - gc_in[base * CHUNK + i]);
         }
+#endif
         __syncthreads();
 
         #pragma unroll
@@ -431,6 +490,22 @@ gated_delta_rule_chunk_fwd_o(
     float* gc = kq + CHUNK * CHUNK;                        // [CHUNK]
     float* egc = gc + CHUNK;                               // [CHUNK]
 
+#ifdef GDN_VEC_STAGE
+    if (k_dim == K_DIM && qk_stride % 8 == 0 && (((unsigned long long)(query + kh * k_dim)) & 15ull) == 0
+        && (((unsigned long long)(key + kh * k_dim)) & 15ull) == 0) {
+        for (unsigned int e = tid; e < CHUNK * K_DIM / 8; e += blockDim.x) {
+            unsigned int i = (e * 8) / K_DIM, j = (e * 8) % K_DIM;
+            if (i < ce) {
+                unsigned long long off = (unsigned long long)(cs + i) * qk_stride + kh * k_dim + j;
+                ((uint4*)sq)[e] = *(const uint4*)&query[off];
+                ((uint4*)sk)[e] = *(const uint4*)&key[off];
+            } else {
+                ((uint4*)sq)[e] = make_uint4(0, 0, 0, 0);
+                ((uint4*)sk)[e] = make_uint4(0, 0, 0, 0);
+            }
+        }
+    } else
+#endif
     for (unsigned int idx = tid; idx < CHUNK * k_dim; idx += blockDim.x) {
         unsigned int i = idx / k_dim, j = idx % k_dim;
         if (i < ce) {
@@ -522,10 +597,18 @@ gated_delta_rule_chunk_fwd_o(
                 #pragma unroll
                 for (int i = 0; i < 16; i++)
                     a[i] = (__bf16)kq[(tr + (lane & 15)) * CHUNK + kb + i];
+                // chunk_delta_h_vfused writes uc only for rows < ce, so rows
+                // >= ce of the last partial chunk hold stale scratch from
+                // earlier passes/requests. kq is 0 there, but 0 x Inf/NaN = NaN,
+                // so a non-finite stale bit pattern poisons that output column
+                // for the whole chunk. On gfx1151 this made cold output depend
+                // on earlier requests (#158).
                 #pragma unroll
                 for (int k = 0; k < 16; k++)
-                    bfrag[k] = (__bf16)(float)
-                        uc_in[base * CHUNK * V_DIM + (kb + k) * v_dim + tc + (lane & 15)];
+                    bfrag[k] = (kb + k < ce)
+                        ? (__bf16)(float)
+                            uc_in[base * CHUNK * V_DIM + (kb + k) * v_dim + tc + (lane & 15)]
+                        : (__bf16)0.0f;
                 acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, bfrag, acc);
             }
             #pragma unroll

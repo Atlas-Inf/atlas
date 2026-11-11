@@ -92,7 +92,7 @@ impl MoeLayer {
         // replacing the placeholder the kernel was told (via NULL) to skip.
         if mixed_bf16_shared {
             let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
-            self.run_bf16_shared_expert(
+            self.run_separate_shared_expert(
                 input,
                 2,
                 h,
@@ -101,6 +101,7 @@ impl MoeLayer {
                 shared_up_scratch,
                 shared_down_out,
                 ctx,
+                true,
                 stream,
             )?;
         }

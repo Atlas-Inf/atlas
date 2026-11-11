@@ -502,11 +502,15 @@ impl SsmSnapshotPool {
         // slot refills them via `take_aux`/`collect_aux_states_into`), and
         // `has_aux` treats an all-empty entry as absent — a freed slot is
         // never restorable.
-        if let Some(blobs) = self.aux_blobs.lock().get_mut(&snap_slot) {
+        let mut aux = self.aux_blobs.lock();
+        if let Some(blobs) = aux.get_mut(&snap_slot) {
             for (_, b) in blobs.iter_mut() {
                 b.clear();
             }
         }
+        // ATLAS_QWEN4EXP_SNAPSHOT_AUX_MB: over budget, drop them instead.
+        super::ssm_snapshot_budget::trim_freed(&mut aux, snap_slot);
+        drop(aux);
         self.free_slots.lock().push(snap_slot);
     }
 

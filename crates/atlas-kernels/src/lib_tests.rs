@@ -59,6 +59,26 @@ fn all_targets_have_modules() {
     }
 }
 
+#[test]
+#[ignore = "requires nvcc and ATLAS_SKIP_BUILD unset"]
+fn glm5_target_ships_native_vision_module() {
+    let target = ptx_for_exact_target("glm-5.3-flash", "nvfp4")
+        .expect("the GLM-5.3 NVFP4 kernel target must be compiled");
+    assert!(
+        target
+            .modules
+            .iter()
+            .any(|(name, _)| *name == "glm_vision_encoder"),
+        "GLM-5.3 target must ship glm_vision_encoder; available modules: {:?}",
+        target
+            .modules
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| name.contains("vision"))
+            .collect::<Vec<_>>()
+    );
+}
+
 /// #438: the exact-verify `_snap` twins (#435) ship ONLY in
 /// qwen3.6-27b/nvfp4's shadow set, but `qwen3_ssm::init` issues their three
 /// lookups on EVERY GDN model. The boot gate fails CLOSED on an unresolved

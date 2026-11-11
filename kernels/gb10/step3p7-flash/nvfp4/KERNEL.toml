@@ -46,5 +46,11 @@ paged_decode_attn_turbo8_128 = "paged_decode_turbo8_128"
 # swiglu_limit shadow of moe_silu_mul.cu: the launch site checks the kernel
 # handle and falls back to the unfused silu_mul → per_token_group_quant_fp8
 # pair (see fused_silu_quant_ok in forward_prefill_fp8.rs).
+# qwen4_exp-only optional kernel this shadow legitimately lacks:
+# rms_norm_f32_grouped is resolved with try_kernel only under
+# ATLAS_QWEN4EXP_MTP_GROUPED_NORM=1 (the qwen4exp MTP drafter); a null
+# handle falls back to per-row rms_norm_f32, so this model's decode chain
+# never reaches it.
 [shadow_exempt]
+norm = ["rms_norm_f32_grouped"]
 moe_silu_mul = ["silu_mul_quant_fp8"]

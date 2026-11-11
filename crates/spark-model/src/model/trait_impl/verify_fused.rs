@@ -83,15 +83,7 @@ impl TransformerModel {
         for t in 0..m {
             let pos = seq.seq_len + t;
             let blocks_needed = (pos / bs) + 1;
-            ensure_blocks_through_decode(
-                seq,
-                blocks_needed - 1,
-                &mut kv_cache,
-                self.prefix_cache.as_ref(),
-                self.gpu.as_ref(),
-                stream,
-                self.levers.kv_poison,
-            )?;
+            self.reserve_decode_blocks(seq, blocks_needed - 1, &mut kv_cache, stream)?;
         }
 
         // 1c. Upload M-entry attention metadata.
@@ -202,14 +194,29 @@ impl TransformerModel {
         let hss_engaged = kv_cache.config().cache_blocks_per_seq.is_some();
         // ATLAS_LORA_EAGER: LoRA graph-vs-eager debugging hatch (see decode_a).
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
-        let use_graphs = self.comm.is_none()
+        // GLM TP/EP K=5 experiment: the fused verifier is pointer/shape static
+        // and both ranks issue the same collectives in the same layer order.
+        // CUDA/NCCL can therefore capture the distributed forward just like
+        // decode_a's existing ATLAS_EP_GRAPHS path.  Keep this narrowly
+        // opt-in: other distributed models retain the established eager
+        // default, and operators have an instant fallback if a driver/NCCL
+        // combination rejects multi-stream capture.
+        let glm_tp_graphs = self.config.model_type == "glm5_next"
+            && self.config.tp_world_size == 2
+            && crate::model::graph_flags::glm_tp_verify_graph();
+        let use_graphs = (self.comm.is_none() || glm_tp_graphs)
             && !self
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)
             && !hss_engaged
             && !lora_eager;
 
+        crate::layers::moe::validate_shared_fp8_cache_graphs(&self.config.model_type, use_graphs)?;
+
+        crate::layers::moe::validate_m5_projection_graphs(&self.config.model_type, m, use_graphs)?;
+
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,

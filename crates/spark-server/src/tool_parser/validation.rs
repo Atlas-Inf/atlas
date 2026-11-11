@@ -17,10 +17,21 @@ use super::*;
 ///
 /// Resolves the effective type from a JSON schema property, handling `anyOf`/`oneOf`
 /// wrappers (e.g., Pydantic v2's `Optional[int]` → `{"anyOf": [{"type":"integer"},{"type":"null"}]}`).
-fn resolve_schema_type(schema: &serde_json::Value) -> Option<&str> {
-    // Direct "type" field
-    if let Some(t) = schema.get("type").and_then(|t| t.as_str()) {
-        return Some(t);
+pub(super) fn resolve_schema_type(schema: &serde_json::Value) -> Option<&str> {
+    // Direct "type" field, or the first non-null member of a type array
+    // (`["integer", "null"]`).
+    match schema.get("type") {
+        Some(serde_json::Value::String(t)) => return Some(t),
+        Some(serde_json::Value::Array(types)) => {
+            if let Some(t) = types
+                .iter()
+                .filter_map(|t| t.as_str())
+                .find(|t| *t != "null")
+            {
+                return Some(t);
+            }
+        }
+        _ => {}
     }
     // anyOf / oneOf: pick first non-null type
     for key in ["anyOf", "oneOf"] {
@@ -787,19 +798,18 @@ pub fn assess_tool_call(call: &ToolCall, tools: &[ToolDefinition]) -> Result<(),
                 // required a `/`, `./`, or `../` prefix and rejected
                 // `Cargo.toml`, which made opencode loop on rejections and
                 // abandon the task. Accept any non-empty path EXCEPT ones
-                // carrying shell metacharacters / whitespace, which signal
-                // a leaked command (e.g. `created && ls -R`) rather than a
-                // real path — those we still reject (also closes CWE-78
-                // command-leak-as-path).
-                const SHELL_META: &[char] = &[
-                    ' ', '\t', '\n', '\r', '&', '|', ';', '`', '$', '<', '>', '(', ')', '*', '?',
-                ];
-                let looks_like_command = trimmed.contains(SHELL_META);
+                // carrying shell operators or control characters, which signal
+                // a leaked command (e.g. `created && ls -R`; CWE-78). Spaces,
+                // parentheses and a lone `&` are ordinary file names.
+                const SHELL_META: &[char] = &['\t', '\n', '\r', '|', ';', '`', '<', '>'];
+                let looks_like_command = trimmed.contains(SHELL_META)
+                    || trimmed.contains("&&")
+                    || trimmed.contains("$(");
                 if looks_like_command || trimmed.len() < 3 {
                     return Err(ToolCallIssue::Hard(format!(
                         "Error: {name} '{key}' must be a filesystem path (absolute or relative \
                          to the working directory), at least 3 chars, with no shell \
-                         metacharacters or whitespace. Got {path:?}."
+                         operators or control characters. Got {path:?}."
                     )));
                 }
             }

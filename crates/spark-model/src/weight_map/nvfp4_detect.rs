@@ -33,13 +33,19 @@ pub fn detect_nvfp4_variant(
     // `CUDA_ERROR_ILLEGAL_ADDRESS` bug.
     if let Some(qc) = &config.quantization_config {
         match qc.quant_method.as_str() {
-            "modelopt" if atlas_core::config::is_nvfp4_quant_algo(&qc.quant_algo) => {
+            // `modelopt_mixed` is the method label on ModelOpt MIXED_PRECISION
+            // dumps (Nemotron 3.5 Super VL NVFP4) — same map-driven semantics.
+            "modelopt" | "modelopt_mixed"
+                if atlas_core::config::is_nvfp4_quant_algo(&qc.quant_algo) =>
+            {
                 return Nvfp4Variant::Standard;
             }
-            "modelopt" if qc.quant_algo.eq_ignore_ascii_case("FP8") => {
+            "modelopt" | "modelopt_mixed" if qc.quant_algo.eq_ignore_ascii_case("FP8") => {
                 return Nvfp4Variant::Fp8Dequanted;
             }
-            "modelopt" if qc.quant_algo.eq_ignore_ascii_case("MIXED_PRECISION") => {
+            "modelopt" | "modelopt_mixed"
+                if qc.quant_algo.eq_ignore_ascii_case("MIXED_PRECISION") =>
+            {
                 // The per-component `quantized_layers` map is authoritative —
                 // and consulting it here is REQUIRED, not optional: nvidia's
                 // Flash-Next pack carries `weight_scale_inv` on its MTP

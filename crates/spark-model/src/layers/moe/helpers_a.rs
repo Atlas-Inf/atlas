@@ -4,53 +4,21 @@
 
 use super::inplace_transpose::TransposeScratch;
 use super::*;
+#[path = "helpers_btile_phase.rs"]
+mod btile_phase;
+
+#[path = "helpers_checkpoint_down.rs"]
+mod checkpoint_down;
+#[path = "helpers_unified_phases.rs"]
+mod unified_phases;
+pub(super) use unified_phases::SharedGateUpReceipt;
+#[cfg(test)]
+pub(super) use unified_phases::btile_shared_fixture;
+#[cfg(test)]
+#[path = "helpers_unified_tests.rs"]
+mod unified_tests;
 
 impl MoeLayer {
-    /// Transpose MoE weights for coalesced prefill GEMM reads.
-    ///
-    /// Transposes per-expert routed weights [N, K/2] → [K/2, N] to enable
-    /// the cp.async pipelined FP8-MMA K64 kernels. This doubles expert
-    /// memory (~17 GB for 35B, ~30 GB for 122B) but eliminates the
-    /// catastrophic uncoalesced B reads in the fallback grouped GEMM,
-    /// cutting MoE prefill time by ~2x.
-    /// Set pre-expert norm (Gemma-4 26B: pre_feedforward_layernorm_2).
-    /// Applied to input AFTER routing but BEFORE expert dispatch.
-    pub fn set_pre_expert_norm(&mut self, norm: crate::weight_map::DenseWeight) {
-        self.pre_expert_norm = Some(norm);
-    }
-
-    /// Set GeGLU activation for MoE experts (Gemma-4 26B).
-    /// Replaces SiLU with GELU in the sorted/unfused path and forces decode
-    /// to use the sorted path (avoiding fused SiLU kernels).
-    pub fn set_gelu_activation(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
-        self.moe_act_mul = gpu.kernel("gelu", "gelu_mul")?;
-        self.gelu_activation = true;
-        Ok(())
-    }
-
-    pub fn transpose_for_prefill(
-        &mut self,
-        gpu: &dyn GpuBackend,
-        config: &atlas_core::config::ModelConfig,
-    ) -> Result<()> {
-        self.transpose_for_prefill_impl(gpu, config, true)
-    }
-
-    /// Transpose only the gate+up routed weights, leaving the down projection
-    /// in its original layout. Cuts the transpose memory cost from ~3×
-    /// (gate+up+down) to ~2× per expert. Used by MiniMax M2.7-NVFP4 EP=2
-    /// when the full transpose doesn't fit but gate+up does — the fused
-    /// `moe_w4a16_fused_gate_up_k64_n128` kernel still runs (capturing the
-    /// dominant gate+up bandwidth savings), while down stays on the
-    /// uncoalesced grouped-GEMM path.
-    pub fn transpose_gate_up_for_prefill(
-        &mut self,
-        gpu: &dyn GpuBackend,
-        config: &atlas_core::config::ModelConfig,
-    ) -> Result<()> {
-        self.transpose_for_prefill_impl(gpu, config, false)
-    }
-
     pub(super) fn transpose_for_prefill_impl(
         &mut self,
         gpu: &dyn GpuBackend,
@@ -69,8 +37,9 @@ impl MoeLayer {
             );
             return Ok(());
         }
+        self.btile_storage.require_legacy()?;
         let h = config.hidden_size;
-        let inter = config.moe_intermediate_size;
+        let inter = config.routed_inter_local();
         let shared_inter = config.shared_expert_intermediate_size;
 
         // Transpose per-expert routed weights for coalesced prefill GEMM reads.
@@ -88,7 +57,14 @@ impl MoeLayer {
             } else {
                 16
             };
-        for expert in &self.weights.experts {
+        // ATLAS_QWEN4EXP_PREFILL_MOE_NODUP / _PREFILL_W4A4: the routed experts
+        // stay in their checkpoint layout (`forward_prefill_q38_nodup`); the
+        // shared expert below is still transposed.
+        let routed = !super::skips_routed_transpose(config);
+        if !routed {
+            self.check_q38_nodup_planes()?;
+        }
+        for expert in self.weights.experts.iter().filter(|_| routed) {
             if expert.gate_proj.is_null() {
                 gate_t.push(QuantizedWeight::null());
                 up_t.push(QuantizedWeight::null());
@@ -116,10 +92,13 @@ impl MoeLayer {
             }
         }
 
-        self.gate_ptrs_t = Some(build_ptr_table_from_qw(&gate_t, gpu)?);
-        self.up_ptrs_t = Some(build_ptr_table_from_qw(&up_t, gpu)?);
-        if include_down {
-            self.down_ptrs_t = Some(build_ptr_table_from_qw(&down_t, gpu)?);
+        if routed {
+            self.gate_ptrs_t = Some(build_ptr_table_from_qw(&gate_t, gpu)?);
+            self.up_ptrs_t = Some(build_ptr_table_from_qw(&up_t, gpu)?);
+            if include_down {
+                self.down_ptrs_t = Some(build_ptr_table_from_qw(&down_t, gpu)?);
+                self.build_input_scales(gpu)?;
+            }
         }
 
         // Transpose shared expert weights (tiny: ~5 MB per layer).
@@ -158,9 +137,9 @@ impl MoeLayer {
     ///   C. Transpose down                  (allocs +20 GB; free ≈ 27 GB)
     ///   D. Free down untransposed          (frees 20 GB; free ≈ 47 GB)
     ///
-    /// Net memory: same as starting point, but layout is now unified
-    /// (transposed-only) — the `[N, K/2]` decode kernels can no longer
-    /// run; dispatch must use the `_t` decode kernels (which do).
+    /// Net memory: all originals are freed and the layout is transposed-only.
+    /// Models that need a decode-native shared expert use the explicitly named
+    /// `transpose_for_prefill_unified_keep_shared` variant below.
     ///
     /// Caller responsibilities:
     ///   1. Set `ATLAS_UNIFIED_MOE_LAYOUT=1` so `MoeLayer::use_t_layout_for_decode()`
@@ -176,7 +155,22 @@ impl MoeLayer {
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
     ) -> Result<Vec<DevicePtr>> {
-        self.transpose_for_prefill_unified_inner(gpu, config, false)
+        let inplace = super::inplace_transpose::enabled();
+        self.transpose_for_prefill_unified_inner(gpu, config, false, false, inplace)
+    }
+
+    /// Unified routed-expert layout while retaining only the small shared
+    /// expert's decode-native weights. GLM K=4 verification uses this to run
+    /// an exact-M=4 shared projection without paying hybrid layout's cost for
+    /// every routed expert. Returns the original pointers it freed — same
+    /// contract as `transpose_for_prefill_unified`.
+    pub fn transpose_for_prefill_unified_keep_shared(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<Vec<DevicePtr>> {
+        let inplace = super::inplace_transpose::enabled();
+        self.transpose_for_prefill_unified_inner(gpu, config, false, true, inplace)
     }
 
     /// Hybrid-layout transpose pass — analogue of `transpose_for_prefill_unified`
@@ -192,21 +186,27 @@ impl MoeLayer {
         config: &atlas_core::config::ModelConfig,
     ) -> Result<()> {
         // Hybrid keeps the originals, so there is nothing freed to report.
-        self.transpose_for_prefill_unified_inner(gpu, config, true)
+        self.transpose_for_prefill_unified_inner(gpu, config, true, true, false)
             .map(|_| ())
     }
 
     /// Phased build of the transposed weight set. When `keep_originals` is true
     /// (hybrid-layout mode), Phase B and Phase D frees are skipped so decode
     /// paths still find the untransposed weights. When false (unified-layout
-    /// mode), the originals are freed between phases — current Phase 8a
-    /// behavior — and returned, so their owner can stop tracking them.
+    /// mode), routed allocations are transposed in place, or with `inplace`
+    /// false (`ATLAS_MOE_INPLACE_TRANSPOSE=0`) into one slab per projection,
+    /// the originals freed. The independent `keep_shared_originals` bit
+    /// retains the shared expert's native copies. Freed originals are
+    /// returned so their owner can stop tracking them.
     pub(super) fn transpose_for_prefill_unified_inner(
         &mut self,
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
         keep_originals: bool,
+        keep_shared_originals: bool,
+        inplace: bool,
     ) -> Result<Vec<DevicePtr>> {
+        let inplace = inplace && !keep_originals;
         let mut freed = Vec::new();
         // Packed EXL3 experts: nothing NVFP4 to transpose, and allocating the
         // transposed set would be a second copy of every expert.
@@ -216,10 +216,10 @@ impl MoeLayer {
             tracing::debug!("MoE unified/hybrid transpose: packed EXL3 layer, skipped");
             return Ok(freed);
         }
+        self.btile_storage.require_legacy()?;
         let h = config.hidden_size;
-        let inter = config.moe_intermediate_size;
+        let inter = config.routed_inter_local();
         let shared_inter = config.shared_expert_intermediate_size;
-        let _num_experts = self.weights.experts.len();
 
         // ── Layout state is DERIVED, never declared ──────────────────────
         // These two flags used to be read independently from env at
@@ -271,7 +271,7 @@ impl MoeLayer {
             })
             .collect();
         let mut scratch = TransposeScratch::new();
-        let (gate_t, up_t) = if keep_originals {
+        let (gate_t, up_t) = if !inplace {
             (
                 self.transpose_experts_gpu(gpu, &gate_src, inter, h, routed_gs)?,
                 self.transpose_experts_gpu(gpu, &up_src, inter, h, routed_gs)?,
@@ -286,19 +286,7 @@ impl MoeLayer {
         };
         self.gate_ptrs_t = Some(build_ptr_table_from_qw(&gate_t, gpu)?);
         self.up_ptrs_t = Some(build_ptr_table_from_qw(&up_t, gpu)?);
-        // Shared expert (tiny, do unconditionally — fits regardless).
-        if !self.weights.shared_expert.gate_proj.is_null() && shared_inter > 0 {
-            self.shared_gate_t = Some(self.weights.shared_expert.gate_proj.transpose_for_gemm(
-                gpu,
-                shared_inter,
-                h,
-            )?);
-            self.shared_up_t = Some(self.weights.shared_expert.up_proj.transpose_for_gemm(
-                gpu,
-                shared_inter,
-                h,
-            )?);
-        }
+        self.transpose_unified_shared_gate_up(gpu, config)?;
 
         if !keep_originals {
             // ── Phase B: free gate+up untransposed ──
@@ -306,34 +294,28 @@ impl MoeLayer {
             // contain stale addresses, but the unified dispatch never reads
             // them (gated by `use_t_layout_for_decode()`).
             for expert in &mut self.weights.experts {
-                // The original allocations now hold the transposed data;
-                // NULL the fields so no untransposed path can read them.
+                // In place, the original allocations now hold the transposed
+                // data; consolidated, they are freed. Either way NULL the
+                // fields so no untransposed path can read them.
                 if !expert.gate_proj.weight.is_null() {
+                    if !inplace {
+                        free_original(gpu, &mut freed, expert.gate_proj.weight)?;
+                        free_original(gpu, &mut freed, expert.gate_proj.weight_scale)?;
+                    }
                     expert.gate_proj.weight = DevicePtr::NULL;
                     expert.gate_proj.weight_scale = DevicePtr::NULL;
                 }
                 if !expert.up_proj.weight.is_null() {
+                    if !inplace {
+                        free_original(gpu, &mut freed, expert.up_proj.weight)?;
+                        free_original(gpu, &mut freed, expert.up_proj.weight_scale)?;
+                    }
                     expert.up_proj.weight = DevicePtr::NULL;
                     expert.up_proj.weight_scale = DevicePtr::NULL;
                 }
             }
-            if !self.weights.shared_expert.gate_proj.weight.is_null() && shared_inter > 0 {
-                free_original(gpu, &mut freed, self.weights.shared_expert.gate_proj.weight)?;
-                free_original(
-                    gpu,
-                    &mut freed,
-                    self.weights.shared_expert.gate_proj.weight_scale,
-                )?;
-                self.weights.shared_expert.gate_proj.weight = DevicePtr::NULL;
-                self.weights.shared_expert.gate_proj.weight_scale = DevicePtr::NULL;
-                free_original(gpu, &mut freed, self.weights.shared_expert.up_proj.weight)?;
-                free_original(
-                    gpu,
-                    &mut freed,
-                    self.weights.shared_expert.up_proj.weight_scale,
-                )?;
-                self.weights.shared_expert.up_proj.weight = DevicePtr::NULL;
-                self.weights.shared_expert.up_proj.weight_scale = DevicePtr::NULL;
+            if !keep_shared_originals {
+                self.release_unified_shared_gate_up(gpu, config, &mut freed)?;
             }
         }
 
@@ -350,7 +332,7 @@ impl MoeLayer {
                 }
             })
             .collect();
-        let down_t = if keep_originals {
+        let down_t = if !inplace {
             self.transpose_experts_gpu(gpu, &down_src, h, inter, routed_gs)?
         } else {
             self.transpose_experts_inplace(gpu, &down_src, h, inter, routed_gs, &mut scratch)?
@@ -368,11 +350,18 @@ impl MoeLayer {
             // ── Phase D: free down untransposed ──
             for expert in &mut self.weights.experts {
                 if !expert.down_proj.weight.is_null() {
+                    if !inplace {
+                        free_original(gpu, &mut freed, expert.down_proj.weight)?;
+                        free_original(gpu, &mut freed, expert.down_proj.weight_scale)?;
+                    }
                     expert.down_proj.weight = DevicePtr::NULL;
                     expert.down_proj.weight_scale = DevicePtr::NULL;
                 }
             }
-            if !self.weights.shared_expert.down_proj.weight.is_null() && shared_inter > 0 {
+            if !keep_shared_originals
+                && !self.weights.shared_expert.down_proj.weight.is_null()
+                && shared_inter > 0
+            {
                 free_original(gpu, &mut freed, self.weights.shared_expert.down_proj.weight)?;
                 free_original(
                     gpu,
@@ -384,20 +373,16 @@ impl MoeLayer {
             }
         }
         scratch.release(gpu)?;
+        self.build_input_scales(gpu)?;
 
         Ok(freed)
     }
 
     /// Transpose one projection across ALL routed experts on the GPU, into a
     /// single slab allocation per buffer.
-    ///
     /// Replaces a per-expert `QuantizedWeight::transpose_for_gemm_gs`, which
-    /// round-trips every expert through the host (D2H, a strided host byte
-    /// loop, H2D) and takes two `gpu.alloc`s each. At 256 experts x 3
-    /// projections x ~47 MoE layers that was ~36k host round-trips and ~145k
-    /// allocations, measured at ~1.0 s per layer (~48 s of load). The batched
-    /// kernel is the same one the lazy down-scratch path already uses.
-    ///
+    /// round-trips each expert through the host and creates two allocations.
+    /// The batched kernel avoids those transfers and allocation pressure.
     /// `src` supplies the per-expert untransposed `[n, k/2]` packed bytes and
     /// `[n, k/group_size]` scales; the returned `QuantizedWeight`s point into
     /// the two slabs and carry the source's scale metadata unchanged.
@@ -411,6 +396,8 @@ impl MoeLayer {
         group_size: usize,
     ) -> Result<Vec<QuantizedWeight>> {
         let num_experts = src.len();
+        let (local_experts, compact_slots) =
+            super::compact_layout::compact_slot_map(src.iter().map(|w| !w.is_null()));
         let packed_each = n * (k / 2);
         let scale_each = n * (k / group_size);
         anyhow::ensure!(
@@ -418,24 +405,26 @@ impl MoeLayer {
             "transpose_experts_gpu: zero-sized projection (n={n} k={k} gs={group_size})"
         );
 
-        // One slab per buffer instead of two allocations per expert.
-        let packed_slab = gpu.alloc(num_experts * packed_each)?;
-        let scale_slab = gpu.alloc(num_experts * scale_each)?;
+        if local_experts == 0 {
+            return Ok(vec![QuantizedWeight::null(); num_experts]);
+        }
+        let packed_slab = gpu.alloc(local_experts * packed_each)?;
+        let scale_slab = gpu.alloc(local_experts * scale_each)?;
 
         // Destinations carve the slabs; a NULL source keeps a NULL slot so the
         // kernel's own NULL guard skips that expert (EP-remote convention).
         let mut out = Vec::with_capacity(num_experts);
-        for (e, w) in src.iter().enumerate() {
-            if w.is_null() {
-                out.push(QuantizedWeight::null());
-            } else {
+        for (w, compact_slot) in src.iter().zip(compact_slots) {
+            if let Some(slot) = compact_slot {
                 out.push(QuantizedWeight {
-                    weight: packed_slab.offset(e * packed_each),
-                    weight_scale: scale_slab.offset(e * scale_each),
+                    weight: packed_slab.offset(slot * packed_each),
+                    weight_scale: scale_slab.offset(slot * scale_each),
                     weight_scale_2: w.weight_scale_2,
                     input_scale: w.input_scale,
                     weight_scale_2_vec: w.weight_scale_2_vec,
                 });
+            } else {
+                out.push(QuantizedWeight::null());
             }
         }
 

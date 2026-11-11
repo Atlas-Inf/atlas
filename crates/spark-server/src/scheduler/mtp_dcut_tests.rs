@@ -84,15 +84,15 @@ fn chunk_ranges_seq_cap_derives_from_the_row_budget() {
     assert_eq!(chunk_ranges(&[3; 21]), vec![(0, 21)]);
     assert_eq!(chunk_ranges(&[3; 24]), vec![(0, 24)]);
     assert_eq!(chunk_ranges(&[3; 32]), vec![(0, 32)]);
-    assert_eq!(chunk_ranges(&[3; 42]), vec![(0, 42)]);
-    assert_eq!(chunk_ranges(&[3; 43]), vec![(0, 42), (42, 43)]);
+    // ... and at most VERIFY_WY_TABLE_SEQS (32) sequences a chunk.
+    assert_eq!(chunk_ranges(&[3; 42]), vec![(0, 32), (32, 42)]);
+    assert_eq!(chunk_ranges(&[2; 64]), vec![(0, 32), (32, 64)]);
     // rows=4: 128/4 = 32 seqs.
     assert_eq!(chunk_ranges(&[4; 9]), vec![(0, 9)]);
     assert_eq!(chunk_ranges(&[4; 32]), vec![(0, 32)]);
     assert_eq!(chunk_ranges(&[4; 33]), vec![(0, 32), (32, 33)]);
-    // rows=2: 128/2 = 64 seqs.
-    assert_eq!(chunk_ranges(&[2; 64]), vec![(0, 64)]);
-    assert_eq!(chunk_ranges(&[2; 65]), vec![(0, 64), (64, 65)]);
+    // rows=2: 128/2 = 64 rows' worth, but 32 sequences a verify.
+    assert_eq!(chunk_ranges(&[2; 65]), vec![(0, 32), (32, 64), (64, 65)]);
     // rows=8 (DFlash2 γ=8): the job-376 C=16 shape — 16 seqs = 128 rows
     // hits the new budget dead on (was a 12+4 split at 96).
     assert_eq!(chunk_ranges(&[8; 16]), vec![(0, 16)]);
@@ -256,4 +256,68 @@ fn below_the_gate_the_pairing_is_legacy_but_the_pruning_is_kept() {
     assert_eq!(c_paired, vec![(0, 4), (5, 3)]);
     assert_ne!(c_paired, paired);
     assert_eq!(c_depths.iter().sum::<usize>(), 7);
+}
+
+/// A sequence's drafts cap its depth: the confidence stop leaves fewer than
+/// the ladder depth, a decode row riding the verify holds none.
+#[test]
+fn capped_select_never_deepens_past_the_drafts_held() {
+    let c: Vec<Vec<f32>> = vec![vec![-0.01, -0.01, -0.01]; 3];
+    let refs: Vec<&[f32]> = c.iter().map(|v| v.as_slice()).collect();
+    assert_eq!(
+        select_capped(&refs, &[3, 1, 0], VERIFY_ROW_BUDGET, 1.0),
+        vec![3, 1, 0]
+    );
+    // Ratio 0.75 over the 2 rankable positions (the full sequence's depths
+    // 2 and 3) keeps round(1.5) = 2: nothing is pruned, nothing is invented.
+    assert_eq!(
+        select_capped(&refs, &[3, 1, 0], VERIFY_ROW_BUDGET, 0.75),
+        vec![3, 1, 0]
+    );
+}
+
+#[test]
+fn capped_select_at_uniform_caps_is_select() {
+    let c = [
+        vec![-0.01f32, -6.0, -7.0],
+        vec![-0.01f32, -0.02, -4.0],
+        vec![-0.01f32, -0.02, -0.03],
+    ];
+    let refs: Vec<&[f32]> = c.iter().map(|v| v.as_slice()).collect();
+    for ratio in [0.25, 0.5, 0.75, 1.0] {
+        assert_eq!(
+            select_capped(&refs, &[3, 3, 3], VERIFY_ROW_BUDGET, ratio),
+            select(&refs, 3, VERIFY_ROW_BUDGET, ratio)
+        );
+    }
+}
+
+/// Canonical pairing moves the deepest row count onto the lowest slot. When
+/// that slot's sequence holds fewer drafts, the pairing is not a prefix of
+/// its drafts: the batch keeps each sequence's own depth instead.
+#[test]
+fn a_cap_the_canonical_pairing_would_break_keeps_own_depths() {
+    // Slot 0 holds one draft, slot 1 three.
+    let (order, ks, canonical) = assign(&[0, 1], &[1, 3], &[1, 3], true);
+    assert!(!canonical);
+    assert_eq!(order, vec![1, 0], "deepest first");
+    assert_eq!(ks, vec![4, 2]);
+    // Caps that admit the pairing keep it.
+    let (order, ks, canonical) = assign(&[0, 1], &[3, 3], &[1, 3], true);
+    assert!(canonical);
+    assert_eq!(order, vec![0, 1]);
+    assert_eq!(ks, vec![4, 2]);
+}
+
+/// A decode row (no drafts) is one row wherever it lands.
+#[test]
+fn a_decode_row_is_planned_at_one_row() {
+    let (_, ks, canonical) = assign(&[0, 1], &[3, 0], &[3, 0], true);
+    assert!(canonical);
+    assert_eq!(ks, vec![4, 1]);
+    // On the lower slot the canonical pairing would hand it four rows.
+    let (order, ks, canonical) = assign(&[1, 0], &[3, 0], &[3, 0], true);
+    assert!(!canonical);
+    assert_eq!((order, ks), (vec![0, 1], vec![4, 1]));
+    assert_eq!(chunk_ranges(&[4, 2, 1]), vec![(0, 3)], "one chunk");
 }

@@ -23,12 +23,17 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
+#[path = "block_mgmt_tails.rs"]
+mod tails;
+use tails::{check_write_window_tails, grow_prefill_window};
+
 /// Fill a freshly-allocated block: NaN-poison under the diagnostic flag,
-/// otherwise the production zero-fill (stale-KV leak guard).
+/// otherwise the production zero-fill (stale-KV leak guard). Slot-mapped
+/// sparse-index tails are lent here, so every write path publishes them.
 #[inline]
-fn fill_fresh_block(
-    kv_cache: &PagedKvCache,
-    blk: u32,
+fn fill_fresh_blocks(
+    kv_cache: &mut PagedKvCache,
+    blocks: &[u32],
     gpu: &dyn GpuBackend,
     stream: u64,
     // `ModelLevers::kv_poison`. Carried, not read from a static: it changes
@@ -37,21 +42,35 @@ fn fill_fresh_block(
     poison: bool,
 ) -> Result<()> {
     if poison {
-        kv_cache.poison_block(blk, gpu, stream)
+        blocks
+            .iter()
+            .try_for_each(|&blk| kv_cache.poison_block(blk, gpu, stream))?;
     } else {
-        kv_cache.zero_block(blk, gpu, stream)
+        kv_cache.zero_blocks(blocks, gpu, stream)?;
     }
+    kv_cache.lend_tail_slots(blocks, gpu, stream)
 }
 
 /// Apply an `EvictedBlocks` result to the production cache and the HSS
 /// orchestrator. Physical blocks return to the free list; disk-block IDs get
 /// `dec_disk_ref`'d (Phase 6.1.e). When HSS isn't engaged the disk vec is
 /// empty and this becomes a thin loop over the physical blocks.
+///
+/// NVMe spill tier: the blocks named in `evicted.spill` are written to disk
+/// FIRST — before any of them can reach the free list and be overwritten (on
+/// the fast path: gathered into staging that a queued write owns). A write
+/// that fails degrades to a plain eviction (the tree drops that node).
 pub(crate) fn apply_evicted_blocks(
     evicted: spark_runtime::prefix_cache::EvictedBlocks,
     kv_cache: &mut PagedKvCache,
+    prefix_cache: &dyn spark_runtime::prefix_cache::PrefixCache,
+    gpu: &dyn GpuBackend,
 ) {
-    let free_before = kv_cache.num_free_blocks();
+    if !evicted.spill.is_empty() {
+        let failed = kv_cache.nvme_write(&evicted.spill, gpu, gpu.default_stream());
+        super::kv_nvme::drop_failed_spills(&failed, kv_cache, prefix_cache);
+    }
+    let free_before = kv_cache.num_free_in_all();
     let n_evicted = evicted.physical.len();
     for block in &evicted.physical {
         kv_cache.return_evicted_block(*block);
@@ -63,7 +82,7 @@ pub(crate) fn apply_evicted_blocks(
     // eviction can release" them, which was true only while the cache's ref
     // could land on a block no node referenced; that mismatch is fixed, so the
     // shortfall now just measures how much of the LRU tail is still in use.)
-    let gained = kv_cache.num_free_blocks().saturating_sub(free_before);
+    let gained = kv_cache.num_free_in_all().saturating_sub(free_before);
     if gained < n_evicted {
         tracing::debug!(
             "prefix-cache evict reclaimed {gained}/{n_evicted} blocks (free={}): \
@@ -87,6 +106,22 @@ pub(crate) fn apply_evicted_blocks(
     }
 }
 
+impl TransformerModel {
+    /// [`apply_evicted_blocks`] against this model's prefix cache and GPU.
+    pub(crate) fn apply_evicted(
+        &self,
+        evicted: spark_runtime::prefix_cache::EvictedBlocks,
+        kv_cache: &mut PagedKvCache,
+    ) {
+        apply_evicted_blocks(
+            evicted,
+            kv_cache,
+            self.prefix_cache.as_ref(),
+            self.gpu.as_ref(),
+        );
+    }
+}
+
 /// Allocate one block, evicting from the prefix cache as many times as it takes.
 ///
 /// Evicting a radix node returns only the CACHE's reference to its block, so if a
@@ -104,16 +139,21 @@ pub(crate) fn apply_evicted_blocks(
 /// Keep evicting until a block comes free or the cache has nothing left to give;
 /// every iteration removes at least one node from a finite tree, so it terminates.
 /// `None` means genuinely out of capacity — the caller reports exhaustion.
+///
+/// `logical` is the block's index in its sequence's table: a latent-sharded
+/// cache (`ATLAS_GLM_KV_SHARD=1`) draws an id whose residue matches it.
 pub(crate) fn alloc_block_evicting(
     kv_cache: &mut PagedKvCache,
     prefix_cache: &dyn spark_runtime::prefix_cache::PrefixCache,
+    gpu: &dyn GpuBackend,
+    logical: usize,
 ) -> Option<u32> {
-    if let Some(b) = kv_cache.try_alloc_block() {
+    if let Some(b) = kv_cache.try_alloc_block_at(logical) {
         return Some(b);
     }
     let mut evicted_nodes = 0usize;
     loop {
-        let evicted = prefix_cache.evict(1);
+        let evicted = prefix_cache.evict(kv_cache.evict_batch());
         if evicted.is_empty() {
             if evicted_nodes > 0 {
                 tracing::debug!(
@@ -124,8 +164,8 @@ pub(crate) fn alloc_block_evicting(
             return None;
         }
         evicted_nodes += evicted.len();
-        apply_evicted_blocks(evicted, kv_cache);
-        if let Some(b) = kv_cache.try_alloc_block() {
+        apply_evicted_blocks(evicted, kv_cache, prefix_cache, gpu);
+        if let Some(b) = kv_cache.try_alloc_block_at(logical) {
             if evicted_nodes > 1 {
                 tracing::debug!(
                     "alloc: freed a block after evicting {evicted_nodes} prefix-cache node(s)"
@@ -181,14 +221,8 @@ pub(crate) fn cache_acquires_refs(
     kv_cache: &mut PagedKvCache,
 ) {
     cache_acquires_disk_refs(&acquired.disk_block_ids);
-    // Acquire before release: a block that is both (e.g. a partial slot re-set to
-    // the same block via different paths) must never transiently hit 0 and get
-    // handed to another sequence.
     for &block in &acquired.blocks {
         kv_cache.inc_ref(block);
-    }
-    for &block in &acquired.released_blocks {
-        kv_cache.dec_ref(block);
     }
 }
 
@@ -292,9 +326,10 @@ pub(crate) fn ensure_blocks_through_decode(
     prefix_cache: &dyn spark_runtime::prefix_cache::PrefixCache,
     gpu: &dyn GpuBackend,
     stream: u64,
-    // `ModelLevers::kv_poison` — see `fill_fresh_block`.
+    // `ModelLevers::kv_poison` — see `fill_fresh_blocks`.
     kv_poison: bool,
 ) -> Result<()> {
+    kv_cache.release_lagging_tail_slots(&seq.block_table, abs_block_idx);
     let cap = kv_cache.config().cache_blocks_per_seq.map(|c| c as usize);
     // Loop invariant: each iter either slides (frees a block) or grows
     // block_table by one. Terminates when the highest needed logical block
@@ -318,7 +353,7 @@ pub(crate) fn ensure_blocks_through_decode(
                     alloc_count
                 );
             }
-            return Ok(());
+            return check_write_window_tails(seq, abs_block_idx, kv_cache);
         }
         // We need to extend block_table by at least one. If at cap, slide.
         if let Some(c) = cap
@@ -361,7 +396,7 @@ pub(crate) fn ensure_blocks_through_decode(
         // "alloc failed in ensure_blocks_through_decode: abs=590 ...
         //  free_blocks=0". The prefill helper already had this; the
         // decode helper diverged.
-        let blk = match alloc_block_evicting(kv_cache, prefix_cache) {
+        let blk = match alloc_block_evicting(kv_cache, prefix_cache, gpu, ws + bt_len) {
             Some(b) => b,
             None => {
                 return Err(anyhow::anyhow!(
@@ -378,8 +413,10 @@ pub(crate) fn ensure_blocks_through_decode(
                 ));
             }
         };
-        fill_fresh_block(kv_cache, blk, gpu, stream, kv_poison)?;
+        // Owned before it is filled: a failed fill returns the block with the
+        // sequence instead of leaking it from the pool.
         seq.block_table.push(blk);
+        fill_fresh_blocks(kv_cache, &[blk], gpu, stream, kv_poison)?;
         alloc_count += 1;
         if cap.is_some() {
             let id = spark_storage::with_local(|hss| {
@@ -431,50 +468,19 @@ pub(crate) fn ensure_blocks_through_prefill(
     prefix_cache: &dyn spark_runtime::prefix_cache::PrefixCache,
     gpu: &dyn GpuBackend,
     stream: u64,
-    // `ModelLevers::kv_poison` — see `fill_fresh_block`.
+    // `ModelLevers::kv_poison` — see `fill_fresh_blocks`.
     kv_poison: bool,
 ) -> Result<()> {
-    let cap = kv_cache.config().cache_blocks_per_seq.map(|c| c as usize);
-    loop {
-        let ws = seq.hss_window_start();
-        let bt_len = seq.block_table.len();
-        let in_window = bt_len > 0 && abs_block_idx < ws + bt_len;
-        if in_window {
-            return Ok(());
-        }
-        // Issue #31: NEVER slide during prefill. block_table grows
-        // monotonically until the chunk's full token range is in-window.
-        // HBM headroom is preserved by the existing prefix-cache eviction
-        // fallback below when `try_alloc_block` returns None. The cap
-        // (when HSS is engaged) is enforced lazily on the first decode
-        // step, where attention reads through the orchestrator's tiled
-        // path and slides are correctness-safe.
-
-        // Try alloc; on failure, evict prefix-cache entries and retry once.
-        // Ask the prefix cache to free a block via LRU eviction, as many times
-        // as it takes (one eviction can free zero blocks — see
-        // `alloc_block_evicting`).
-        let blk = alloc_block_evicting(kv_cache, prefix_cache)
-            .ok_or_else(|| anyhow::anyhow!("KV cache exhausted: no free blocks"))?;
-        fill_fresh_block(kv_cache, blk, gpu, stream, kv_poison)?;
-        seq.block_table.push(blk);
-        if cap.is_some() {
-            let id = spark_storage::with_local(|hss| {
-                hss.alloc_disk_block_id().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "high-speed-swap: disk-block-id pool exhausted; \
-                         increase --high-speed-swap-bytes or shorten --max-seq-len"
-                    )
-                })
-            })
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "high-speed-swap: orchestrator not installed but cache_blocks_per_seq is set"
-                )
-            })??;
-            seq.disk_block_ids.push(id);
-        }
-    }
+    kv_cache.release_lagging_tail_slots(&seq.block_table, abs_block_idx);
+    // A chunk's fresh blocks are filled together, on EVERY exit: blocks pushed
+    // before a failed allocation stay in `block_table`, and the scheduler's
+    // preempt-and-retry re-enters with them in-window, where nothing would
+    // ever zero them or lend them index tails.
+    let mut fresh = Vec::new();
+    let grown = grow_prefill_window(seq, abs_block_idx, kv_cache, prefix_cache, gpu, &mut fresh);
+    fill_fresh_blocks(kv_cache, &fresh, gpu, stream, kv_poison)?;
+    grown?;
+    check_write_window_tails(seq, abs_block_idx, kv_cache)
 }
 
 /// Extract mutable references to a single layer's state across N sequences.

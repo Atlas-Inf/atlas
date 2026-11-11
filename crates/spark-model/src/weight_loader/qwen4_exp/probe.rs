@@ -29,9 +29,12 @@ pub struct NamespaceReport {
     pub stray_layer_norms: usize,
 }
 
-/// A projection is present in either the dense/NVFP4 layout (`.weight`) or the EXL3 one (`.trellis`).
+/// A projection is present in the dense/NVFP4 layout (`.weight`), the compressed-tensors
+/// one (`.weight_packed`), or the EXL3 one (`.trellis`).
 fn has_linear(store: &WeightStore, stem: &str) -> bool {
-    store.contains(&format!("{stem}.weight")) || store.contains(&format!("{stem}.trellis"))
+    store.contains(&format!("{stem}.weight"))
+        || store.contains(&format!("{stem}.weight_packed"))
+        || store.contains(&format!("{stem}.trellis"))
 }
 
 /// The n-gram tables are deferred (served from NVMe), which `contains` does not see.
@@ -52,6 +55,8 @@ pub fn audit_namespace(store: &WeightStore, config: &ModelConfig) -> NamespaceRe
     r.has_embed = store.contains(&format!("{pfx}.embed_tokens.weight"));
     r.has_lm_head = has_linear(store, "lm_head");
 
+    // Under EP a rank holds only its own experts, so probe its first one.
+    let first_expert = config.local_expert_range().0;
     for i in 0..config.num_hidden_layers {
         let lp = config.layer_prefix(i);
         if has_linear(store, &format!("{lp}.linear_attn.in_proj_qkv")) {
@@ -69,7 +74,7 @@ pub fn audit_namespace(store: &WeightStore, config: &ModelConfig) -> NamespaceRe
         if store.contains(&format!("{lp}.mlp_hyper_connection.hc_norm.weight")) {
             r.hc_tensors += 1;
         }
-        if has_linear(store, &format!("{lp}.mlp.experts.0.gate_proj")) {
+        if has_linear(store, &format!("{lp}.mlp.experts.{first_expert}.gate_proj")) {
             r.expert_tensors += 1;
         }
         if store.contains(&format!("{lp}.input_layernorm.weight"))

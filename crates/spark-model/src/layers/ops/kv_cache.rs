@@ -718,6 +718,12 @@ pub fn mla_paged_decode_nvfp4(
     num_seqs: u32,
     stream: u64,
 ) -> Result<()> {
+    // The kernel indexes Q and O by head only: a second sequence row in the
+    // grid would read sequence 0's Q and store to the same O elements.
+    anyhow::ensure!(
+        num_seqs == 1,
+        "mla_paged_decode_nvfp4: num_seqs={num_seqs}, the kernel has no per-sequence Q/O stride"
+    );
     KernelLaunch::new(gpu, kernel)
         .grid([num_q_heads, num_seqs, 1])
         .block([256, 1, 1])
@@ -776,6 +782,11 @@ pub fn mla_paged_decode_fp8(
     comp_block_count: u32, // 4b: # compressed blocks to attend (0 = no-op)
     stream: u64,
 ) -> Result<()> {
+    // Q and O are indexed by head only, as in the NVFP4 twin above.
+    anyhow::ensure!(
+        num_seqs == 1,
+        "mla_paged_decode_fp8: num_seqs={num_seqs}, the kernel has no per-sequence Q/O stride"
+    );
     KernelLaunch::new(gpu, kernel)
         .grid([num_q_heads, num_seqs, 1])
         .block([256, 1, 1])
@@ -803,3 +814,7 @@ pub fn mla_paged_decode_fp8(
 }
 
 // ── Batched prefill variants (N tokens) ──
+
+#[cfg(test)]
+#[path = "kv_cache_tests.rs"]
+mod tests;

@@ -131,6 +131,7 @@ const FAMILY_DISPLAY = {
   'nemotron-3-nano': 'Nemotron-3 Nano',
   'nemotron-3-super': 'Nemotron-3 Super',
   'nemotron-3.5-lightning': 'Nemotron-3.5 Lightning',
+  'nemotron-3.5-super-vl': 'Nemotron-3.5 Super VL',
   'mistral-small-4': 'Mistral-Small-4',
   'minimax-m2.7': 'MiniMax-M2.7',
   'deepseek-v4': 'DeepSeek-V4'
@@ -148,6 +149,7 @@ const VENDOR_OF_FAMILY = {
   'nemotron-3-nano': 'Nemotron',
   'nemotron-3-super': 'Nemotron',
   'nemotron-3.5-lightning': 'Nemotron',
+  'nemotron-3.5-super-vl': 'Nemotron',
   'mistral-small-4': 'Mistral',
   'minimax-m2.7': 'MiniMax',
   'deepseek-v4': 'DeepSeek'

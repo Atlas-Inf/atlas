@@ -124,10 +124,6 @@ pub(super) fn parse_header(file: &mut File) -> Result<Vec<TensorMeta>> {
         }
         let dtype_str = info["dtype"].as_str().unwrap_or("BF16");
         let (dtype, from_f16) = match dtype_str {
-            "F32" => (WeightDtype::FP32, false),
-            "BF16" => (WeightDtype::BF16, false),
-            "I16" => (WeightDtype::Int16, false),
-            "I32" => (WeightDtype::Int32, false),
             // F16 is not store-legal (WeightDtype is closed to store dtypes):
             // stage as BF16 and mark for byte conversion in the copy loop.
             // centml modelopt W4A4 exports ship all unquantized tensors as F16.
@@ -139,17 +135,22 @@ pub(super) fn parse_header(file: &mut File) -> Result<Vec<TensorMeta>> {
                     (WeightDtype::BF16, true)
                 }
             }
-            "U8" => (WeightDtype::UInt8, false),
-            // I8 is a 1-byte raw container; DeepSeek-V4-Flash-NVFP4 ships its MTP
-            // experts' 4-bit-packed weights as I8 (vs U8 for the main layers).
-            // Signedness is irrelevant for packed FP4 — the dequant kernel extracts
-            // nibbles by bit ops — so treat I8 as raw bytes (UInt8), matching the
-            // NVFP4 expert path.
-            "I8" => (WeightDtype::UInt8, false),
-            "F8_E4M3" => (WeightDtype::FP8E4M3, false),
-            "F8_E8M0" => (WeightDtype::FP8E8M0, false),
-            "I64" => (WeightDtype::Int64, false),
-            other => bail!("Unsupported safetensors dtype '{other}' for tensor {name}"),
+            // CSF component streams (slab exception words; csf_32x2_v1 page
+            // origins, prefixes and records). Never stored: the copy loop
+            // hands every CSF part to `CsfAssembler`, which re-derives the
+            // element width from byte length against shape. `UInt8` is only
+            // the staging container here; U16/U32 anywhere else is still
+            // refused below.
+            "U16" | "U32" if crate::weights::nvfp4_csf::csf_part(name).is_some() => {
+                (WeightDtype::UInt8, false)
+            }
+            // Every other dtype maps exactly as on the buffered and RDMA paths:
+            // one table (`from_safetensors_str`), so the loaders cannot drift.
+            other => (
+                WeightDtype::from_safetensors_str(other)
+                    .with_context(|| format!("tensor {name}"))?,
+                false,
+            ),
         };
         let shape: Vec<usize> = info["shape"]
             .as_array()

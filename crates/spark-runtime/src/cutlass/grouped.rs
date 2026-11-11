@@ -107,7 +107,7 @@ pub fn nvfp4_grouped_gate_up(
     #[cfg(atlas_cutlass)]
     {
         let ctx = ctx()?;
-        let status = unsafe {
+        let status = drained("nvfp4_grouped_gate_up", unsafe {
             atlas_cutlass_nvfp4_grouped_gate_up(
                 a as *const c_void,
                 gate_packed_ptrs.as_ptr(),
@@ -122,11 +122,11 @@ pub fn nvfp4_grouped_gate_up(
                 num_experts as i32,
                 n as i32,
                 k as i32,
-                ctx.workspace as *mut c_void,
+                ctx.workspace()? as *mut c_void,
                 ctx.ws_size,
                 stream as *mut c_void,
             )
-        };
+        });
         if status != 0 {
             bail!("CUTLASS nvfp4 grouped gate_up failed: status {status}");
         }
@@ -197,7 +197,7 @@ pub fn nvfp4_grouped_gate_up_fused(
     #[cfg(atlas_cutlass)]
     {
         let ctx = ctx()?;
-        let status = unsafe {
+        let status = drained("nvfp4_grouped_gate_up_fused", unsafe {
             atlas_cutlass_nvfp4_grouped_gate_up_fused(
                 a as *const c_void,
                 sorted_token_ids as *const i32,
@@ -213,11 +213,11 @@ pub fn nvfp4_grouped_gate_up_fused(
                 num_experts as i32,
                 n as i32,
                 k as i32,
-                ctx.workspace as *mut c_void,
+                ctx.workspace()? as *mut c_void,
                 ctx.ws_size,
                 stream as *mut c_void,
             )
-        };
+        });
         if status != 0 {
             bail!("CUTLASS nvfp4 grouped(fused) gate_up failed: status {status}");
         }
@@ -275,7 +275,7 @@ pub fn nvfp4_grouped_down(
     #[cfg(atlas_cutlass)]
     {
         let ctx = ctx()?;
-        let status = unsafe {
+        let status = drained("nvfp4_grouped_down", unsafe {
             atlas_cutlass_nvfp4_grouped_down(
                 a as *const c_void,
                 packed_ptrs.as_ptr(),
@@ -286,11 +286,11 @@ pub fn nvfp4_grouped_down(
                 num_experts as i32,
                 n as i32,
                 k as i32,
-                ctx.workspace as *mut c_void,
+                ctx.workspace()? as *mut c_void,
                 ctx.ws_size,
                 stream as *mut c_void,
             )
-        };
+        });
         if status != 0 {
             bail!("CUTLASS nvfp4 grouped down failed: status {status}");
         }

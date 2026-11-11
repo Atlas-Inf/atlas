@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! GPU parity test for the DFlash2 on-device candidate selector
-//! (`dflash2_candidate_selector`) against an f32 host reference
+//! (`dflash2_candidate_selector`, and its 32-candidate twin
+//! `dflash2_candidate_selector_k32` past top_k 16) against an f32 host
+//! reference — SGLang 0.5.19's `CandidateSelector` greedy walk
+//! (`build_lattice` + argmax `_follow_maps`) —
 //! implementing the same total order and greedy chain. Requires a CUDA GPU
 //! and a real (non-stub) kernel build — all tests are `#[ignore]`d; run on
 //! the GB10 with:
@@ -81,7 +84,8 @@ struct Case {
 
 fn run_case(c: &Case) -> Result<()> {
     let (gpu, stream) = setup()?;
-    let kernel = gpu.kernel("dflash2_candidate_selector", "dflash2_candidate_selector")?;
+    let build = ops::dflash2_selector_build(c.top_k)?;
+    let kernel = gpu.kernel(build.module, build.symbol)?;
     let mut rng = Rng(c.seed);
 
     // ── inputs ──────────────────────────────────────────────────────────
@@ -116,24 +120,44 @@ fn run_case(c: &Case) -> Result<()> {
     let d_pred = up_u16(&gpu, &pred)?;
     let d_succ = up_u16(&gpu, &succ)?;
     let d_out = gpu.alloc(c.gamma * 4)?;
+    // The anchor is read on device (graph-replay safe); no min_tokens ban.
+    let d_anchor = gpu.alloc(4)?;
+    gpu.copy_h2d(&last_token.to_le_bytes(), d_anchor)?;
+    let scratch_bytes = ops::dflash2_selector_scratch_bytes(c.gamma);
+    let d_scratch = gpu.alloc(scratch_bytes)?;
+    gpu.memset(d_scratch, 0, scratch_bytes)?;
 
-    ops::dflash2_candidate_selector(
-        &gpu,
-        kernel,
-        d_logits,
-        d_proj,
-        d_pred,
-        d_succ,
-        d_out,
-        last_token,
-        c.gamma as u32,
-        c.vocab as u32,
-        c.rank as u32,
-        c.top_k as u32,
-        stream,
-    )?;
-    gpu.synchronize(stream)?;
-    let kern_out = rd_u32(&gpu, d_out, c.gamma)?;
+    // Two launches over one scratch: the first must leave its ticket at zero
+    // (graph replay), so the second must pick the same chain.
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        gpu.memset(d_out, 0xff, c.gamma * 4)?;
+        ops::dflash2_candidate_selector(
+            &gpu,
+            kernel,
+            d_logits,
+            d_proj,
+            d_pred,
+            d_succ,
+            d_out,
+            d_anchor,
+            spark_runtime::gpu::DevicePtr::NULL,
+            [u32::MAX; 4],
+            c.gamma as u32,
+            c.vocab as u32,
+            c.rank as u32,
+            c.top_k as u32,
+            d_scratch,
+            stream,
+        )?;
+        gpu.synchronize(stream)?;
+        runs.push(rd_u32(&gpu, d_out, c.gamma)?);
+    }
+    assert_eq!(
+        runs[0], runs[1],
+        "second launch over the same scratch diverged"
+    );
+    let kern_out = runs.pop().unwrap();
 
     // ── f32 host reference ──────────────────────────────────────────────
     let logits_f32 = |row: usize, tok: usize| bf16_bits_to_f32(logits[row * c.vocab + tok]);
@@ -256,5 +280,62 @@ fn parity_gamma4_v4096_rank64_topk4() -> Result<()> {
         rank: 64,
         top_k: 4,
         seed: 0xDF2A_0003,
+    })
+}
+
+/// Ripple-65B's DFlash2 geometry: γ 32 (SGLang `--speculative-num-draft-tokens
+/// 32`), vocab 100352, rank 256, top_k 32 — the 32-candidate twin.
+#[test]
+#[ignore = "requires CUDA GPU + non-stub kernel build"]
+fn parity_gamma32_v100352_rank256_topk32() -> Result<()> {
+    run_case(&Case {
+        gamma: 32,
+        vocab: 100_352,
+        rank: 256,
+        top_k: 32,
+        seed: 0xDF2A_0004,
+    })
+}
+
+/// The twin at a non-power-of-two top_k and a γ that is not a multiple of
+/// its 8 staged rows.
+#[test]
+#[ignore = "requires CUDA GPU + non-stub kernel build"]
+fn parity_gamma13_v4096_rank256_topk20() -> Result<()> {
+    run_case(&Case {
+        gamma: 13,
+        vocab: 4096,
+        rank: 256,
+        top_k: 20,
+        seed: 0xDF2A_0005,
+    })
+}
+
+/// The checkpoint's own block (γ 16) at Ripple's vocabulary: three vocab
+/// slices a row, merged by the row's last block.
+#[test]
+#[ignore = "requires CUDA GPU + non-stub kernel build"]
+fn parity_gamma16_v100352_rank256_topk32() -> Result<()> {
+    run_case(&Case {
+        gamma: 16,
+        vocab: 100_352,
+        rank: 256,
+        top_k: 32,
+        seed: 0xDF2A_0006,
+    })
+}
+
+/// Six slices of 688 columns: fewer columns than the twin's 1024 threads, so
+/// idle warps make the threshold the sentinel and every slice takes the
+/// register-list path, whose 32 x 32 warp lists the pool must hold.
+#[test]
+#[ignore = "requires CUDA GPU + non-stub kernel build"]
+fn parity_gamma8_v4096_rank256_topk32() -> Result<()> {
+    run_case(&Case {
+        gamma: 8,
+        vocab: 4096,
+        rank: 256,
+        top_k: 32,
+        seed: 0xDF2A_0007,
     })
 }

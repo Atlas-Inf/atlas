@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! DFlash2 2-tap grouped dynamic causal convolution.
+//! DFlash2 grouped dynamic causal convolution over `kernel_size` taps.
 //!
 //! Wraps attention and MLP sublayers:
 //! - `prepare`: projects input states through `kernel_projection` to generate
-//!   dynamic kernel coefficients (2 taps input, 2 taps output) and applies
-//!   input convolution on `input_buf`.
+//!   dynamic kernel coefficients (`[2 (input/output), kernel_size,
+//!   num_groups]` per row) and applies input convolution on `input_buf`.
 //! - `finish`: applies output convolution on `sublayer_out` using the saved
 //!   output dynamic kernel coefficients.
 
@@ -13,12 +13,22 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
-use crate::weight_map::DenseWeight;
+use crate::weight_map::{DenseWeight, Mxfp8Weight, QuantizedWeight};
+
+/// A smaller copy of `kernel_projection` the delta GEMM reads instead
+/// (`ATLAS_DFLASH_CONV_TWIN`, `twins.rs`). It changes drafts only.
+#[derive(Clone, Copy, Debug)]
+pub enum ConvTwin {
+    Nvfp4(QuantizedWeight),
+    Mxfp8(Mxfp8Weight),
+}
 
 #[derive(Clone)]
 pub struct Dflash2Conv {
     pub base_kernel: DenseWeight,
     pub kernel_projection: DenseWeight,
+    /// `kernel_projection`'s twin, when one was installed.
+    pub twin: Option<ConvTwin>,
     pub num_groups: usize,
     pub group_size: usize,
     pub kernel_size: usize,
@@ -37,6 +47,7 @@ impl Dflash2Conv {
         Self {
             base_kernel,
             kernel_projection,
+            twin: None,
             num_groups,
             group_size,
             kernel_size,
@@ -60,18 +71,65 @@ impl Dflash2Conv {
         gamma: u32,
         stream: u64,
     ) -> Result<DevicePtr> {
-        let h = self.hidden_size as u32;
-        let total_dynamic_dims = (2 * self.kernel_size * self.num_groups) as u32;
+        self.project_deltas(gemm, input_buf, delta_buf, gamma)?;
+        self.apply_input(
+            gpu,
+            conv_kernel,
+            input_buf,
+            delta_buf,
+            out_buf,
+            gamma,
+            stream,
+        )
+    }
 
+    /// Elements of one row's dynamic coefficients, `[2, kernel_size, num_groups]`.
+    pub fn delta_row_elems(&self) -> usize {
+        2 * self.kernel_size * self.num_groups
+    }
+
+    /// Byte offset of a row's output-side coefficients within its delta row.
+    pub fn output_delta_offset(&self) -> usize {
+        self.kernel_size * self.num_groups * 2
+    }
+
+    /// `delta_buf[rows, 2 * kernel_size * num_groups] = input_buf ·
+    /// kernel_projectionᵀ` — the dynamic coefficients of `rows` consecutive
+    /// rows. A batched caller projects every sequence's block in one GEMM
+    /// (the weight read once) and then applies the conv per block.
+    pub fn project_deltas(
+        &self,
+        gemm: &dyn Fn(DevicePtr, &DenseWeight, DevicePtr, u32, u32, u32) -> Result<()>,
+        input_buf: DevicePtr,
+        delta_buf: DevicePtr,
+        rows: u32,
+    ) -> Result<()> {
+        let total_dynamic_dims = self.delta_row_elems() as u32;
         gemm(
             input_buf,
             &self.kernel_projection,
             delta_buf,
-            gamma,
+            rows,
             total_dynamic_dims,
-            h,
-        )?;
+            self.hidden_size as u32,
+        )
+    }
 
+    /// The input-side conv of one `gamma`-row block whose coefficients
+    /// [`Self::project_deltas`] already wrote to `delta_buf`. Returns the
+    /// output-side coefficients for [`Self::finish`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_input(
+        &self,
+        gpu: &dyn GpuBackend,
+        conv_kernel: Option<KernelHandle>,
+        input_buf: DevicePtr,
+        delta_buf: DevicePtr,
+        out_buf: DevicePtr,
+        gamma: u32,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        let h = self.hidden_size as u32;
         let input_base_kernel = self.base_kernel.weight;
         let input_delta = delta_buf;
 
@@ -90,10 +148,11 @@ impl Dflash2Conv {
                 .arg_u32(h)
                 .arg_u32(self.group_size as u32)
                 .arg_u32(self.num_groups as u32)
+                .arg_u32(self.kernel_size as u32)
                 .launch(stream)?;
         }
 
-        let output_delta = delta_buf.offset(2 * self.num_groups * 2);
+        let output_delta = delta_buf.offset(self.output_delta_offset());
         Ok(output_delta)
     }
 
@@ -109,7 +168,11 @@ impl Dflash2Conv {
         stream: u64,
     ) -> Result<()> {
         let h = self.hidden_size as u32;
-        let output_base_kernel = self.base_kernel.weight.offset(2 * self.hidden_size * 2);
+        // base_kernel [2, kernel_size, hidden]: the output side is row 1.
+        let output_base_kernel = self
+            .base_kernel
+            .weight
+            .offset(self.kernel_size * self.hidden_size * 2);
 
         if let Some(k) = conv_kernel {
             let total_elems = gamma * h;
@@ -126,6 +189,7 @@ impl Dflash2Conv {
                 .arg_u32(h)
                 .arg_u32(self.group_size as u32)
                 .arg_u32(self.num_groups as u32)
+                .arg_u32(self.kernel_size as u32)
                 .launch(stream)?;
         }
         Ok(())

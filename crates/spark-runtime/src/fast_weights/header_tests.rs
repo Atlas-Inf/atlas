@@ -73,3 +73,64 @@ fn unknown_dtype_is_still_refused() {
     };
     assert!(format!("{err:#}").contains("C64"), "{err:#}");
 }
+
+/// FP4-Local's CSF exception streams are U32; they stage as a raw 4-byte
+/// container exactly as the buffered loader maps them.
+#[test]
+fn a_csf_u32_stream_stages_as_bytes() {
+    let mut file = write_safetensors(
+        "u32",
+        &[("e.weight_scale.nvfp4_csf_exceptions", "U32", &[81], 4)],
+    );
+    let metas = parse_header(&mut file).unwrap();
+    assert_eq!(metas[0].dtype, WeightDtype::UInt8);
+    assert_eq!(metas[0].len, 324);
+    assert!(!metas[0].from_f16);
+}
+
+/// FP4-Local's index names its shards under `tensors/`; each shard must still
+/// receive exactly the tensors routed to it.
+#[test]
+fn shards_in_a_subdirectory_receive_their_tensors() {
+    let dir = Path::new("/models/fp4-local");
+    let map: HashMap<String, String> = [
+        ("a.weight", "tensors/model-00001-of-00002.safetensors"),
+        ("b.weight", "tensors/model-00002-of-00002.safetensors"),
+        ("c.weight", "tensors/model-00001-of-00002.safetensors"),
+    ]
+    .into_iter()
+    .map(|(t, s)| (t.to_string(), s.to_string()))
+    .collect();
+    let mut got = tensors_routed_to(
+        &map,
+        dir,
+        &dir.join("tensors/model-00001-of-00002.safetensors"),
+    );
+    got.sort();
+    assert_eq!(got, ["a.weight", "c.weight"]);
+    // A flat index still works, and a same-named file elsewhere matches nothing.
+    let flat: HashMap<String, String> = [("x.weight".to_string(), "model.safetensors".to_string())]
+        .into_iter()
+        .collect();
+    assert_eq!(
+        tensors_routed_to(&flat, dir, &dir.join("model.safetensors")),
+        ["x.weight"]
+    );
+    assert!(tensors_routed_to(&map, dir, &dir.join("model-00001-of-00002.safetensors")).is_empty());
+}
+
+/// The tensors an index routes to `shard_path`, compared as PATHS under
+/// `model_dir` (the FP4-Local pack routes every tensor to
+/// `tensors/model-000NN-of-00021.safetensors`; matching by bare file name
+/// found nothing). Kept here to pin the lookup `by_shard` does once in
+/// `resolve_shards` after the production call site moved to it.
+fn tensors_routed_to(
+    map: &HashMap<String, String>,
+    model_dir: &Path,
+    shard_path: &Path,
+) -> Vec<String> {
+    map.iter()
+        .filter(|(_, s)| model_dir.join(s.as_str()) == shard_path)
+        .map(|(t, _)| t.clone())
+        .collect()
+}

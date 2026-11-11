@@ -1,0 +1,152 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-20",
+  "status": "PASS_ONE_64K_RANDOM_REQUEST",
+  "runtime_revision": "5d652f8e0835231ead3bcac91d66e22632c08cbe",
+  "checkpoint": {
+    "repository": "nvidia/GLM-5.3-Flash-FP4-Local",
+    "revision": "76348ddb2be2e35e39ecfc00e75dc07703f4f3d5"
+  },
+  "settings": {
+    "tp": 2,
+    "ep": 2,
+    "target_kv_dtype": "fp8_g128",
+    "kda_dtype": "f32",
+    "aggregate_kv_token_cap": 131072,
+    "max_sequence_tokens": 98304,
+    "server_slots": 4,
+    "active_requests": 1,
+    "prefill_chunk_tokens": 4096,
+    "prefix_caching": false,
+    "draft": "incoai/GLM-5.3-Flash-DFlash2",
+    "draft_gamma": 8,
+    "draft_window_tokens": 2048,
+    "four_prefill_switches": "all on"
+  },
+  "metrics": {
+    "status": "PASS_HTTP_PENDING_RAW_LOG_REVIEW",
+    "stage": "64k-random-single",
+    "smoke": {
+      "label": "smoke",
+      "passed": true,
+      "usage": {
+        "prompt_tokens": 19,
+        "completion_tokens": 15,
+        "total_tokens": 34,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "audio_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 11,
+          "audio_tokens": 0,
+          "accepted_prediction_tokens": 10,
+          "rejected_prediction_tokens": 0
+        },
+        "time_to_first_token_ms": 222.207881,
+        "response_token/s": 53.43695705904607
+      }
+    },
+    "concurrency": 1,
+    "workload": "uniform seeded valid base-vocabulary integer IDs excluding all added tokens; not coherent text",
+    "input_tokens": 65536,
+    "output_tokens": 512,
+    "client_ttft_s": 29.684432853013277,
+    "prefill_ttft_proxy_tok_s": 2207.7565141470245,
+    "server_decode_tok_s": 97.19371962767468,
+    "client_decode_tok_s": 97.19259663608638,
+    "aggregate_decode_window_tok_s": 97.19259663608638,
+    "aggregate_end_to_end_tok_s": 14.651674881042206,
+    "metric_definition": "C1 per-stream and aggregate decode both (output-1)/(last-first); end-to-end includes prefill. TTFT-derived prefill is a proxy; correlate actual scheduler timing from raw rank log.",
+    "not_capacity_maximum": true
+  },
+  "ranks": [
+    {
+      "rank": 0,
+      "minimum_available_gib": 12.172019958496094,
+      "zero_swap": true,
+      "severity_error_count": 0,
+      "scheduler_prefill_timings": [
+        {
+          "prompt_tokens": 65536,
+          "scheduler_prefill_to_first_token_s": 29.64372,
+          "scheduler_prefill_to_first_token_tok_s": 2210.7886594529973
+        }
+      ],
+      "warnings": [
+        "2026-10-20T14:03:23.091876Z  WARN spark::main_modules::serve_phases::kv_cache: KV cache dtype: fp8_g128 (user override). MODEL.toml recommends 'bf16' for this model \u2014 mismatched KV dtype is a known cause of decode-path corruption (e.g. gemma `<unused>` collapse, mistral character-token loops on NVFP4 KV). Pass --kv-cache-dtype bf16 to use the recommended value.",
+        "2026-10-20T14:03:23.091892Z  WARN spark::main_modules::serve_phases::kv_cache: \u26a0 --kv-high-precision-layers is 0: all KV cache layers use fp8_g128 precision. NVFP4 models may hallucinate or lose coherence at long context. Consider --kv-high-precision-layers max (or 2-5) for better quality.",
+        "2026-10-20T14:03:28.471769Z  WARN spark_model::layers::ops::glm_sparse_native: GLM native sparse prefill is qualified through the native context limit; longer rows use the Atlas sparse/plain fallback max_seq_len=98304 native_context_limit=32768",
+        "2026-10-20T14:05:08.107249Z  WARN spark_model::factory::build::kv_budget: KV own-footprint: free memory fell by 99.67 GB but Atlas's own counters account for 96.98 GB \u2014 2.69 GB was taken by something else during the load, or is Atlas memory the counters miss; keeping the larger figure (the KV pool may be smaller than it needs to be)",
+        "2026-10-20T14:05:08.107536Z  WARN spark_model::factory::build: KV OVERCOMMIT: pool fits 1 seq(s) at full --max-seq-len=98304 but --max-batch-size=4 requested (6144 block(s)/seq, 8192 block(s) total). Paged KV allocates on demand; long-context bursts are back-pressured at the block allocator, not refused at boot.",
+        "2026-10-20T14:05:09.444698Z  WARN spark::scheduler: --mtp-gate force: MTP throughput gate DISARMED (diagnostic; verify runs even where the gate would measure it net-negative)",
+        "2026-10-20T14:05:15.591264Z  WARN spark_runtime::cuda_backend::host_staging: copy_h2d_async was handed a PAGE-LOCKED source. That copy is genuinely asynchronous, so the promise that the caller may drop the buffer on return is now being paid for with a cuStreamSynchronize on every such call. If the source outlives the next sync, switch the call site to copy_h2d_async_retained; if it does not, this sync is what keeps it from being a use-after-free.",
+        "2026-10-20T14:05:59.751362Z  WARN spark_model::model::types: teardown swept 75784 allocation(s) that no ModelResource released \u2014 they are reclaimed, but each one is memory whose owner is unaccounted for"
+      ]
+    },
+    {
+      "rank": 1,
+      "minimum_available_gib": 12.399066925048828,
+      "zero_swap": true,
+      "severity_error_count": 0,
+      "scheduler_prefill_timings": [],
+      "warnings": [
+        "2026-10-20T14:03:23.112887Z  WARN spark::main_modules::serve_phases::kv_cache: KV cache dtype: fp8_g128 (user override). MODEL.toml recommends 'bf16' for this model \u2014 mismatched KV dtype is a known cause of decode-path corruption (e.g. gemma `<unused>` collapse, mistral character-token loops on NVFP4 KV). Pass --kv-cache-dtype bf16 to use the recommended value.",
+        "2026-10-20T14:03:23.112903Z  WARN spark::main_modules::serve_phases::kv_cache: \u26a0 --kv-high-precision-layers is 0: all KV cache layers use fp8_g128 precision. NVFP4 models may hallucinate or lose coherence at long context. Consider --kv-high-precision-layers max (or 2-5) for better quality.",
+        "2026-10-20T14:03:29.993753Z  WARN spark_model::layers::ops::glm_sparse_native: GLM native sparse prefill is qualified through the native context limit; longer rows use the Atlas sparse/plain fallback max_seq_len=98304 native_context_limit=32768",
+        "2026-10-20T14:05:00.332848Z  WARN spark_model::factory::build::kv_budget: KV own-footprint: free memory fell by 99.74 GB but Atlas's own counters account for 96.98 GB \u2014 2.75 GB was taken by something else during the load, or is Atlas memory the counters miss; keeping the larger figure (the KV pool may be smaller than it needs to be)",
+        "2026-10-20T14:05:08.113406Z  WARN spark_model::factory::build: KV OVERCOMMIT: pool fits 1 seq(s) at full --max-seq-len=98304 but --max-batch-size=4 requested (6144 block(s)/seq, 8192 block(s) total). Paged KV allocates on demand; long-context bursts are back-pressured at the block allocator, not refused at boot.",
+        "2026-10-20T14:06:00.538179Z  WARN spark_runtime::cuda_backend: backend drop reclaimed 149239 allocation(s) that no owner released \u2014 expected if a load was abandoned part-way, otherwise an unregistered owner"
+      ]
+    }
+  ],
+  "initial_attempt": {
+    "status": "STARTUP_REFUSED_BEFORE_REQUESTS",
+    "cause": "One configured slot plus 4096 prefill tokens provided 4097 workspace rows, below the native sparse requirement of 4100.",
+    "correction": "Retain the proven four server slots (4100 workspace rows) and issue one actual request. No engine or guard change.",
+    "failed_receipt_sha256": "652efd389d306207adf63a196ef63a024de278c84a821a2ef47ede1c9d700f83",
+    "both_failed_attempt_containers_stopped": true,
+    "no_oom_or_swap": true
+  },
+  "limits": [
+    "One random-input request and one small text smoke, not a context maximum or retrieval/coherence benchmark.",
+    "Native sparse attention is qualified through 32768 context positions; later chunks use the existing Atlas sparse/plain fallback.",
+    "Scheduler prefill-to-first-token includes first-token work, not isolated CUDA prefill throughput.",
+    "No matching 64K off-setting or alternate-checkpoint comparison was run."
+  ],
+  "raw_artifact_hashes": {
+    "container-rank.py": "1a0c425e45b10c16339b432728c592e969f65f8c18b4f48699442ede09b9a629",
+    "rank0-r2.json": "d15548e3d28a885d50bef7babe52d5bc893fb1b5f4ba589a4828a0b8d6c1e7a2",
+    "rank1-r2.json": "ce583bb3661dd7b5e6cf733e2e86d60b7b28a0a7a33ac434ea72a1af918b4c49",
+    "plan.json": "22b769aa20723cad0b18974b95c2ad6c06e6b4762d2ebbc236a77e8599c19413",
+    "agent-review.json": "c445d0486f362241e5bd5caa9c02a0fc95660661ccf97be7fd02c0f412802a61",
+    "http/harness.json": "b170288ba32d570c7be659870c30a049ad08e0d3acb24232de9e18d285a4c57e",
+    "http/smoke-request.json": "c14a11401616ff4c36347f1300d9529f440e8eac16e316bbec5f62e15c4b0e1c",
+    "http/smoke-response.json": "8bfefc2164a468c13bdd292752e71f50411ebb9fea81efd4e0febc947986fdea",
+    "http/random-64k-c1-request.json": "972141e00ceca4cb553c7724f165a604097b1f3f375d0324b7a3757a52253c58",
+    "http/random-64k-c1-result.json": "53d8d7cef93870eaf75a11baede9c86f4b2dc9d663193ef83fe7c133020d344b",
+    "http/summary.json": "584e98f35e456b0e518d0a8c07572ee2559959a3fe6452210ff3228cfb5c0f34",
+    "collected-rank1/cleanup.json": "3343d7a70cc4c58e1e1364413d21fe8d5ab98bfa2754dea5a0da7a65991ce74f",
+    "collected-rank1/commands.jsonl": "0504ac718c2dec680d3ad9adce5eb1cb87a6049a5f81db143606529efe14730a",
+    "collected-rank1/config.json": "ce583bb3661dd7b5e6cf733e2e86d60b7b28a0a7a33ac434ea72a1af918b4c49",
+    "collected-rank1/container.cid": "af111c45e5f7a006644cbd1f7766796bac86d8ecbe5b65aee3374e9a73494c6d",
+    "collected-rank1/container.json": "09fad03efcaf1ae744b3721aa7f52a377cf356b54aad994c4ff7212ec6601fd0",
+    "collected-rank1/image.json": "935e86b00610cf4308a8c8aad84e3140c01a53e0592d48354dcb895693f94df2",
+    "collected-rank1/invocation.json": "78b768acc458a4d491cef3311d291ba44fc65b3a361e754d206707d618912110",
+    "collected-rank1/memory.jsonl": "5d0faf773feee0ffd2f31aa0cd30055a499c4f5769c792dc869092ac6366367b",
+    "collected-rank1/owner.json": "fbf8a30c05769b90d046e8d8630b1bfe11a6bb7f4ba35f69f426fc99babf4366",
+    "collected-rank1/rank.log": "d4eb94f9a3297dda9259d4d2b7495abf614c5f7a51a7abe29bbe94672093b34f",
+    "collected-rank1/result.json": "6d3b4f0b54af79a5bbabf7cd3a5813496cd8f7ba058c3243aacff8d45c374ee1",
+    "collected-rank0/cleanup.json": "daef0df3197270045fbefa4384838d762d26d12b75a6b0d0346b71cd4108b1e1",
+    "collected-rank0/commands.jsonl": "543b16821469ac22597debbdfcff61c3534dc08563d40822ef8d047440cbbad3",
+    "collected-rank0/config.json": "d15548e3d28a885d50bef7babe52d5bc893fb1b5f4ba589a4828a0b8d6c1e7a2",
+    "collected-rank0/container.cid": "080f6e3093840dc3b150da7b974858db39971283312b06e4d82c9959957d1923",
+    "collected-rank0/container.json": "c5a8e7c577f8a0ff220c095880773a071ac0e3a618b594ad685a51e7d78754e5",
+    "collected-rank0/image.json": "2af68ddc89c5a5d7ece7d9ca9827ba6af58fa500ddd3d265d99fb45ce7eb957b",
+    "collected-rank0/invocation.json": "c59eeff5d99e4524a8ea7a545c344bfbbfc63ac1be0c30804249c11e1d761bdf",
+    "collected-rank0/memory.jsonl": "da7c58b98e4b5adc3942226b5dcce4d90325d993fff3219093386a24b70ed09a",
+    "collected-rank0/owner.json": "efacaf78f1053e72fc699af202f1b5769ddf9b02628c384798e417eb64f2e47b",
+    "collected-rank0/rank.log": "f0384ff9adcfe5b25f0e1798c319551989acec48e452cd42ba48efadf2c9b5ca",
+    "collected-rank0/result.json": "c2adfd892c64686d474047a6d3535fae936e75de8a2070b62607f4aab7bb87b6"
+  }
+}

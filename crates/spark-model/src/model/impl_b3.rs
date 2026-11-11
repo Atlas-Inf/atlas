@@ -84,6 +84,7 @@ impl TransformerModel {
         // output is already complete — no all_reduce needed. Passing comm: None
         // prevents MoeLayer::forward() from doubling the output via SUM.
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -105,7 +106,12 @@ impl TransformerModel {
         // Give the drafter its prompt context on the first propose of this
         // sequence: whole-prompt prefill on a COLD turn, carried rows + a
         // short append on a WARM one. See `ensure_drafter_context`.
-        self.ensure_drafter_context(proposer, seq, &ctx, stream);
+        self.ensure_drafter_context(proposer, seq, &ctx, stream)?;
+        if self.native_glm_mtp {
+            // Every owner has its own boundary; shared scratch may have last
+            // belonged to another request's prefill, verify, or proposal.
+            self.save_native_mtp_prompt_hidden_dispatch(seq)?;
+        }
         let expected_owner = seq.expected_dspark_owner()?;
         let prop_state = seq
             .proposer_state
@@ -122,7 +128,10 @@ impl TransformerModel {
         // while RoPE stays sequence-space, so RoPE gaps are already the norm:
         // partial feeds (clipped to ring coverage) are safe, and wrong feeds
         // cannot corrupt output (verify rejects bad drafts).
-        if crate::speculative::mtp_catchup_enabled() && !self.mtp_catchup_ring.is_null() {
+        if !self.native_glm_mtp
+            && crate::speculative::mtp_catchup_enabled()
+            && !self.mtp_catchup_ring.is_null()
+        {
             let rows = proposer.drafter_rows(prop_state.as_mut());
             let last_key = proposer.last_pair_key(prop_state.as_mut());
             let (start, count) = *self.mtp_catchup_meta.lock();
@@ -234,6 +243,20 @@ impl TransformerModel {
                 }
             }
         }
+        // ATLAS_GLM_DRAFT_TP: a propose that swaps halves with the worker
+        // carries the communicator, and is announced right before it runs.
+        let split_comm = self.draft_split_comm(proposer, grammar_bitmask.is_some());
+        if let Some(comm) = split_comm {
+            // ATLAS_GLM_DRAFT_TP_CTX: its context rows ride the v2 preamble.
+            let seq = [(&**prop_state, self.dflash_hidden_save, position)];
+            let seqs = if self.ep_protocol_v2 { &seq[..] } else { &[] };
+            let ctx_rows = proposer.rank_split_ctx(comm, seqs);
+            self.announce_draft_split(ctx_rows)?;
+        }
+        let ctx = ForwardContext {
+            comm: split_comm,
+            ..ctx
+        };
         let drafts = proposer.propose(
             token,
             self.mtp_hidden_save,

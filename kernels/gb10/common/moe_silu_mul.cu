@@ -34,6 +34,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include "atlas_pdl.cuh"
 
 extern "C" __global__ void moe_silu_mul(
     const __nv_bfloat16* __restrict__ gate,   // [total_expanded, inter_size]
@@ -41,6 +42,7 @@ extern "C" __global__ void moe_silu_mul(
     __nv_bfloat16* __restrict__ output,        // [total_expanded, inter_size]
     unsigned int total_elements
 ) {
+    atlas_pdl_enter();
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_elements) return;
 

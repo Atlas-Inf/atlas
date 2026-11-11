@@ -53,6 +53,45 @@ pub(super) fn install_lightning_proposer(
     Ok(())
 }
 
+/// Generic-DFlash install seam: installs the proposer, clears the
+/// Lightning Mamba-2 verify levers (unless ATLAS_LIGHTNING_LOSSLESS_TARGET
+/// opts in), and applies the per-model fused-verify policy.
+/// `TransformerModel::set_dflash_proposer` delegates to this.
+///
+/// `nemotron_h_omni` (Nemotron 3.5 Super VL) additionally disables the
+/// fused K-row `mamba2_ssm_verify` kernel: it is not bit-exact against
+/// the plain `mamba2_ssm_decode` recurrence on this family (greedy
+/// identity vs spec-off broke on 11/12 prompts, measured 2026-10-08).
+/// The exact-recurrence / scalar-in_proj levers stay cleared — bit-
+/// exactness was validated with them OFF; arming them selects shadow
+/// kernels whose numerics differ on this target's kernel set.
+/// ATLAS_LIGHTNING_LOSSLESS_TARGET=1 still arms them on demand.
+pub(super) fn install_generic_proposer(
+    proposer_slot: &mut Option<std::sync::Arc<dyn DraftProposer>>,
+    levers: &mut crate::layers::ops::ModelLevers,
+    identity: &mut crate::layers::dflash_head::LightningDsparkIdentityLatch,
+    model_type: &str,
+    proposer: std::sync::Arc<dyn DraftProposer>,
+) {
+    *proposer_slot = Some(proposer);
+    if model_type == "nemotron_h_omni" {
+        levers.mamba_verify_fused = false;
+        // And arm the persistent exact verify — same per-row numerics as
+        // sequential decode, but H stays in smem across the K loop so the
+        // row loop stops re-reading layer weights per row.
+        levers.mamba_verify_exact = true;
+    }
+    if std::env::var("ATLAS_LIGHTNING_LOSSLESS_TARGET")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        levers.lightning_mamba_exact_recurrence = false;
+        levers.lightning_mamba_scalar_in_proj = false;
+    }
+    identity.install_generic();
+}
+
 impl TransformerModel {
     /// Borrow the GPU backend for post-construction wiring (e.g. installing
     /// a DFlash proposer that needs to allocate paged KV caches against the
@@ -81,10 +120,13 @@ impl TransformerModel {
         if self.proposer.is_some() {
             tracing::info!("DFlash: replacing existing MTP proposer with BlockDiffusionDraftHead");
         }
-        self.proposer = Some(proposer);
-        self.levers.lightning_mamba_exact_recurrence = false;
-        self.levers.lightning_mamba_scalar_in_proj = false;
-        self.lightning_dspark_identity.install_generic();
+        install_generic_proposer(
+            &mut self.proposer,
+            &mut self.levers,
+            &mut self.lightning_dspark_identity,
+            &self.config.model_type,
+            proposer,
+        );
     }
 
     /// Atomically install the admitted official Lightning proposer and its

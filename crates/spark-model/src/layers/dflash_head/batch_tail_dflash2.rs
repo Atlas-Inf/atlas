@@ -7,7 +7,9 @@
 //! (weights read once for the whole batch), then one
 //! `dflash2_candidate_selector` launch per sequence — the chain is sequential
 //! within a sequence, so it never merges across boundaries. Only the device
-//! kernel is supported here; the host fallback stays serial-only.
+//! kernel is supported here; the host fallback stays serial-only. A batched
+//! rank-split propose with the candidate swap (`ATLAS_GLM_DRAFT_TP_TOPK`)
+//! walks each sequence over every rank's lists in place of that launch.
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
@@ -16,10 +18,14 @@ use super::BlockDiffusionDraftHead;
 use crate::layers::ops;
 
 impl BlockDiffusionDraftHead {
+    /// `lists`: the batched split propose's candidate lists, when it swapped
+    /// them (`rank_split_topk`); the logits are then not joined.
     pub(super) fn run_batched_dflash2_tail(
         &self,
         batch_size: u32,
         last_tokens: &[u32],
+        has_end_ban: bool,
+        lists: Option<&super::rank_split::TopkSelect>,
         ctx: &crate::layer::ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -38,7 +44,8 @@ impl BlockDiffusionDraftHead {
                 )
             })?;
         anyhow::ensure!(
-            self.batch_dflash2_projected != DevicePtr::NULL,
+            self.batch_dflash2_projected != DevicePtr::NULL
+                && self.batch_dflash2_selector_scratch != DevicePtr::NULL,
             "DFlash batched selector scratch is null"
         );
         anyhow::ensure!(
@@ -58,6 +65,17 @@ impl BlockDiffusionDraftHead {
         let total_rows = batch_size
             .checked_mul(gamma)
             .ok_or_else(|| anyhow::anyhow!("DFlash batched selector rows overflow"))?;
+        // A lone sequence's buffers serve a tree verify's lattice
+        // (`tree_lattice`); a batch's or a rank split's do not.
+        self.note_select((batch_size == 1 && lists.is_none()).then(|| {
+            super::tree_lattice::LastSelect {
+                logits: self.batch_logits,
+                projected: self.batch_dflash2_projected,
+                scratch: self.batch_dflash2_selector_scratch,
+                anchor: self.batch_markov_prev,
+                ban_depth: self.batch_ban_depth(),
+            }
+        }));
 
         // (a) Projected-hidden GEMM — per-sequence at m = gamma, mirroring
         // the serial arm bit-for-bit. Serial `select_candidates` calls
@@ -75,11 +93,7 @@ impl BlockDiffusionDraftHead {
             .checked_mul(selector.rank)
             .and_then(|n| n.checked_mul(2))
             .ok_or_else(|| anyhow::anyhow!("DFlash selector projected stride overflow"))?;
-        if super::small_m_gemm::use_small_m_gemv(
-            super::small_m_gemm::small_m_gemv_enabled(),
-            self.kernels.dense_gemv_batchm.0 != 0,
-            gamma,
-        ) {
+        if self.kernels.small_m_gemv || self.drafter_cublas {
             for sequence in 0..batch_size as usize {
                 self.drafter_dense_gemm(
                     ctx.gpu,
@@ -108,11 +122,16 @@ impl BlockDiffusionDraftHead {
 
         // (b) Selector chain: one grid-wide launch (CTA = sequence) when
         // the batched kernel resolved — job 596: 16 × 4.70 ms sequential
-        // launches on one SM each. Byte-identical per sequence: the .cu
-        // shares one `df2_selector_body` with the single-seq entry, and
-        // `batch_markov_prev` (the prologue's last_tokens upload) carries
-        // the same values passed scalar below. Fallback = per-seq loop.
-        if self.kernels.dflash2_candidate_selector_batched.0 != 0 {
+        // launches on one SM each. The batched entry retains its per-CTA
+        // selector body; the single-sequence entry uses the grid-wide
+        // selector. Both read the same per-sequence anchors from
+        // `batch_markov_prev`. Confidence output or end-token bans require
+        // the per-sequence fallback below on CUDA. HIP keeps upstream's
+        // unmasked draft picks; its target verifier enforces min_tokens.
+        if self.kernels.dflash2_candidate_selector_batched.0 != 0
+            && !self.startup.diagnostics.draft_conf
+            && (!has_end_ban || !ops::DFLASH2_SELECTOR_BANS_END_TOKENS)
+        {
             return ops::dflash2_candidate_selector_batched(
                 ctx.gpu,
                 self.kernels.dflash2_candidate_selector_batched,
@@ -134,9 +153,33 @@ impl BlockDiffusionDraftHead {
             .checked_mul(vocab as usize)
             .and_then(|n| n.checked_mul(2))
             .ok_or_else(|| anyhow::anyhow!("DFlash selector logits stride overflow"))?;
-        let seq_token_bytes = (gamma as usize)
-            .checked_mul(4)
-            .ok_or_else(|| anyhow::anyhow!("DFlash selector token stride overflow"))?;
+        let seq_token_bytes = self.draft_record_bytes();
+        // Anchors and min_tokens ban depths were uploaded beside each other
+        // in batch_markov_prev (`batch_ban_depth`).
+        let end_ids = crate::traits::EosBan::model_end_ids();
+        if let Some(t) = lists {
+            for sequence in 0..batch_size as usize {
+                let anchor = super::selector::SelectorAnchor {
+                    token: last_tokens[sequence],
+                    token_dev: self.batch_markov_prev.offset(sequence * 4),
+                    ban_depth: 0,
+                    ban_depth_dev: self.batch_ban_depth().offset(sequence * 4),
+                    end_ids,
+                };
+                selector.walk_lists(
+                    anchor,
+                    t.sequence(sequence),
+                    self.batch_dflash2_projected
+                        .offset(sequence * seq_projected_bytes),
+                    self.batch_tokens.offset(sequence * seq_token_bytes),
+                    gamma as usize,
+                    ctx.gpu,
+                    t.walk,
+                    stream,
+                )?;
+            }
+            return Ok(());
+        }
         for sequence in 0..batch_size as usize {
             ops::dflash2_candidate_selector(
                 ctx.gpu,
@@ -147,11 +190,14 @@ impl BlockDiffusionDraftHead {
                 selector.predecessor_codebook.weight,
                 selector.successor_codebook.weight,
                 self.batch_tokens.offset(sequence * seq_token_bytes),
-                last_tokens[sequence],
+                self.batch_markov_prev.offset(sequence * 4),
+                self.batch_ban_depth().offset(sequence * 4),
+                end_ids,
                 gamma,
                 vocab,
                 rank,
                 selector.top_k as u32,
+                self.batch_dflash2_selector_scratch,
                 stream,
             )?;
         }

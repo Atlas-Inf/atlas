@@ -38,6 +38,7 @@ impl QsaIndexer {
         block_size: u32,
         inv_sqrt_d: f32,
         scratch: DevicePtr,
+        sp_ctx: Option<&crate::layer::ForwardContext>,
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
@@ -46,12 +47,7 @@ impl QsaIndexer {
         if total <= bound {
             return Ok(());
         }
-        // Kill switch: ATLAS_QSA_NO_PREFILL_SELECT=1 keeps stage-1 behavior
-        // (dense prefill past the bound; decode still selects).
-        static S2_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *S2_OFF
-            .get_or_init(|| std::env::var("ATLAS_QSA_NO_PREFILL_SELECT").as_deref() == Ok("1"))
-        {
+        if super::no_prefill_select() {
             return Ok(());
         }
         let diag = {
@@ -139,9 +135,7 @@ impl QsaIndexer {
         let topk = self.block_topk as usize;
         let heads = self.n_heads as usize;
         let hd = self.hd as usize;
-        let hd_attn = self.hd_attn as usize;
         let qkw = self.qk_width();
-        let q_row = nq as usize * hd_attn;
 
         // Scratch layout (per-call score stride; always <= the sizes.rs
         // allowance because total context never exceeds max_seq_len).
@@ -154,250 +148,21 @@ impl QsaIndexer {
         // First selective GLOBAL position, and its chunk-local row.
         let first_sel_pos = bound.max(seq_start);
         let n_sel_total = total - first_sel_pos;
-        let mut slab = 0usize;
-        while slab < n_sel_total {
-            let rows = row_cap.min(n_sel_total - slab);
-            let first_pos = first_sel_pos + slab; // GLOBAL position
-            let first_row = first_pos - seq_start; // chunk-local buffer row
-
-            ops::cublas_bf16_proj_dense(
-                normed.offset(first_row * self.hidden as usize * 2),
-                self.qk_proj_w,
-                qk_buf,
-                rows as u32,
-                qkw as u32,
-                self.hidden,
-                stream,
-            )
-            .context("QSA qk projection (prefill select)")?;
-            ops::qsa_qprep_rows(
-                gpu,
-                self.k_qprep_rows_k,
-                qk_buf,
-                self.q_norm_w,
-                qpost,
-                rows as u32,
-                first_pos as u32,
-                qkw as u32,
-                self.n_heads,
-                self.hd,
-                self.rot,
-                self.theta,
-                self.eps,
-                stream,
-            )?;
-            let n_blocks_max = (first_pos + rows) / ratio; // last row's complete
-            // One 128-thread block per OUTPUT SCALAR is 1.397 BILLION blocks
-            // over a 30k prefill, for 512 MACs each. The tiled scorer gives a
-            // block QSA_SR_B consecutive `b` values and stages the row's `q` in
-            // shared once. Identical arithmetic -- same reduction, same order --
-            // which matters because these scores feed a top-k, so a shifted
-            // score changes WHICH blocks are attended.
-            // SCORER. `_b` gives each CTA QSA_SR_B b-values and stages the
-            // row's `q` in shared, bit-identically; the original is one CTA per
-            // output scalar. The fallback is a shared-memory bound, not policy.
-            //
-            // A third arm exists and is NOT wired here: `qsa_score_rows_gemm`
-            // drops the four block-wide reductions per output (one thread per
-            // score, serial `d` contraction) and is worth **3.2 s of a 29.5 s
-            // 30k prefill** — but it reassociates the contraction, and these
-            // scores pick which blocks a query reads. Gated and REJECTED:
-            //
-            //   needle recall (scripts/lc_check.py)     12/12, unchanged
-            //   kl_drift --precision-change             top-1 69.3%
-            //   score drift vs reference                4.2e-7 rel, 44% bit-exact
-            //
-            // The kernel is correct — 4.2e-7 is ordinary FP32 reassociation over
-            // 128 terms. The top-k amplifies it: near-ties either side of the
-            // 512th block flip, and the attended set genuinely changes. The
-            // project's own QSA bar is **>=98% top-1 agreement** (Phase 4
-            // acceptance, vs the llama.cpp reference), so 69.3% is not close,
-            // and needle recall passing is exactly why it is not the deciding
-            // metric. Kept in-tree, exercised by
-            // `qsa_score_rows_gemm_vs_reference_drift`.
-            //
-            // THE REAL QUALITY GATE HAS NOW BEEN RUN, and it says the rejection
-            // above was measuring the wrong thing. `scripts/ppl.py` -- written
-            // after that verdict, precisely because agreement-with-our-own-build
-            // is meaningless for a scorer whose own summation order is arbitrary
-            // -- puts this arm at **+0.036% above-bound perplexity**, with the
-            // dense control at 0.000%. So the change that scored 69.3% top-1
-            // agreement costs 0.036% of the only absolute measure available.
-            // Calibrate future QSA verdicts against that pair.
-            //
-            // It still does NOT ship, for a different and simpler reason: the
-            // 3.2 s it was worth in that note was against the OLD scorer.
-            // `qsa_score_rows_exact` has since taken that win bit-identically,
-            // and against it the GEMM arm measures **-0.06 s** at ctx 31481 --
-            // inside run-to-run noise. There is no speed left to trade for even
-            // a 0.036% regression, so it stays off (`ATLAS_QSA_SCORE_GEMM=1`).
-            // `ATLAS_QSA_SCORE_GEMM=1` wires that third arm. The comment above
-            // says "dispatch-disabled until someone runs the real quality gate",
-            // and `scripts/ppl.py` -- written AFTER that rejection, precisely
-            // because agreement-with-our-own-build is the wrong question for a
-            // scorer whose own summation order is arbitrary -- is that gate.
-            // `ATLAS_QSA_SCORE_TC=1`: the same scores on tensor cores. See
-            // TTFT_GAP.md 34 -- the BF16-Q half was priced with a probe BEFORE
-            // this kernel was written, and measured BETTER than F32 Q.
-            let score_tc = matches!(
-                std::env::var("ATLAS_QSA_SCORE_TC").as_deref(),
-                Ok("1") | Ok("true")
-            ) && self.k_score_rows_tc_k.0 != 0
-                && ops::qsa_score_rows_tc_ok(self.n_heads, self.hd);
-            if score_tc {
-                ops::qsa_score_rows_tc(
-                    gpu,
-                    self.k_score_rows_tc_k,
-                    qpost,
-                    st.block_keys,
-                    scores,
-                    rows as u32,
-                    n_blocks_max as u32,
-                    first_pos as u32,
-                    stride as u32,
-                    self.ratio,
-                    self.n_heads,
-                    self.hd,
-                    stream,
-                )?;
-            }
-            let score_gemm = !score_tc
-                && matches!(
-                    std::env::var("ATLAS_QSA_SCORE_GEMM").as_deref(),
-                    Ok("1") | Ok("true")
-                )
-                && self.k_score_rows_gemm_k.0 != 0
-                && ops::qsa_score_rows_gemm_ok(self.n_heads, self.hd);
-            if score_tc {
-                // already dispatched above
-            } else if score_gemm {
-                ops::qsa_score_rows_gemm(
-                    gpu,
-                    self.k_score_rows_gemm_k,
-                    qpost,
-                    st.block_keys,
-                    scores,
-                    rows as u32,
-                    n_blocks_max as u32,
-                    first_pos as u32,
-                    stride as u32,
-                    self.ratio,
-                    self.n_heads,
-                    self.hd,
-                    stream,
-                )?;
-            } else if ops::qsa_score_rows_exact_ok(self.n_heads, self.hd) {
-                ops::qsa_score_rows_exact(
-                    gpu,
-                    self.k_score_rows_exact_k,
-                    qpost,
-                    st.block_keys,
-                    scores,
-                    rows as u32,
-                    n_blocks_max as u32,
-                    first_pos as u32,
-                    stride as u32,
-                    self.ratio,
-                    self.n_heads,
-                    self.hd,
-                    stream,
-                )?;
-            } else {
-                ops::qsa_score_rows(
-                    gpu,
-                    self.k_score_rows_k,
-                    qpost,
-                    st.block_keys,
-                    scores,
-                    rows as u32,
-                    n_blocks_max as u32,
-                    first_pos as u32,
-                    stride as u32,
-                    self.ratio,
-                    self.n_heads,
-                    self.hd,
-                    stream,
-                )?;
-            }
-            // SELECTION. On the GPU when the shape allows it: `qsa_topk_rows`
-            // produces byte-for-byte the same list, in the same order, without
-            // moving the score matrix anywhere. The host path below is the
-            // fallback for a `topk` wider than the kernel's running best-K, and
-            // it is what the GPU kernel is tested against
-            // (`qsa_topk_rows_matches_host_selection`).
-            //
-            // What this is worth: the host round-trip is a full stream drain
-            // per attention layer per slab, and no kernel-time profile can see
-            // it because while it runs no kernel is running. Measuring GPU IDLE
-            // instead (scripts/gaps.py), on a 30k prefill:
-            //
-            //   qsa_score_rows -> qsa_prefill_attn_g
-            //       7279 ms over 179 gaps, 40.7 ms each -- 19% of the window,
-            //       and the largest single item in it.
-            let host_select = !ops::qsa_topk_rows_ok(topk as u32);
-            if !host_select {
-                ops::qsa_topk_rows(
-                    gpu,
-                    self.k_topk_rows_k,
-                    scores,
-                    lists,
-                    rows as u32,
-                    first_pos as u32,
-                    stride as u32,
-                    self.ratio,
-                    topk as u32,
-                    stream,
-                )?;
-            }
-            // ── ATLAS_QSA_UNION_DIAG: how much do neighbouring rows agree? ──
-            // Decides whether an EXACT block-sparse tensor-core attention is
-            // possible here. A TC kernel needs a TILE of query rows to share one
-            // K/V set; QSA selects per ROW. Attending the UNION of a tile's
-            // selections and masking each row back to its own list is exactly
-            // equivalent -- so the only question is how big that union is.
-            // union/topk == 1.0 means free; == tile size means no sharing at all.
-            if std::env::var("ATLAS_QSA_UNION_DIAG").as_deref() == Ok("1") {
-                let mut host = vec![0u8; rows * topk * 4];
-                gpu.synchronize(stream)?;
-                gpu.copy_d2h_on_stream(lists, &mut host, stream)?;
-                let ids: Vec<i32> = host
-                    .chunks_exact(4)
-                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
-                let mut line = String::new();
-                for tile in [16usize, 32, 64, 128] {
-                    let (mut tot, mut n) = (0usize, 0usize);
-                    let mut r0 = 0usize;
-                    while r0 + tile <= rows {
-                        let mut set = std::collections::HashSet::new();
-                        for r in r0..r0 + tile {
-                            for k in 0..topk {
-                                let v = ids[r * topk + k];
-                                if v >= 0 {
-                                    set.insert(v);
-                                }
-                            }
-                        }
-                        tot += set.len();
-                        n += 1;
-                        r0 += tile;
-                    }
-                    if n > 0 {
-                        line.push_str(&format!(
-                            " tile{tile}: union={} ({:.2}x topk)",
-                            tot / n,
-                            (tot / n) as f64 / topk as f64
-                        ));
-                    }
-                }
-                tracing::info!("QSA union rows={rows} topk={topk}{line}");
-            }
-            if host_select {
-                self.prefill_host_select(
-                    gpu, scores, lists, rows, stride, first_pos, ratio, topk, stream,
-                )?;
-            }
-
+        let slabs: Vec<(usize, usize)> = (0..n_sel_total)
+            .step_by(row_cap)
+            .map(|slab| (first_sel_pos + slab, row_cap.min(n_sel_total - slab)))
+            .collect();
+        let bufs = SlabBufs {
+            qk_buf,
+            qpost,
+            scores,
+            stride,
+            normed,
+            seq_start,
+        };
+        // ATLAS_QWEN4EXP_PREFILL_QSA_SPLIT: under SP each rank selects every
+        // other slab and the pair swaps the lists (`qsa_select_sp`).
+        let attend = |first_pos: usize, rows: usize, lists: DevicePtr| {
             self.prefill_attend_slab(
                 gpu,
                 q_roped,
@@ -406,7 +171,7 @@ impl QsaIndexer {
                 v_pool,
                 block_table_dev,
                 lists,
-                first_row,
+                first_pos - seq_start,
                 q_row,
                 rows,
                 first_pos,
@@ -415,8 +180,16 @@ impl QsaIndexer {
                 nq,
                 inv_sqrt_d,
                 stream,
-            )?;
-            slab += rows;
+            )
+        };
+        let sp_ctx = sp_ctx.filter(|_| {
+            crate::layers::glm_sp::current().is_some_and(|sp| sp.total() == num_tokens)
+        });
+        if !self.prefill_select_split(st, &bufs, &slabs, sp_ctx, gpu, stream, &attend)? {
+            for &(first_pos, rows) in &slabs {
+                self.prefill_slab_lists(st, &bufs, first_pos, rows, lists, gpu, stream)?;
+                attend(first_pos, rows, lists)?;
+            }
         }
         if diag {
             let mut sel_last = vec![0u8; q_row * 2];
@@ -448,4 +221,277 @@ impl QsaIndexer {
         );
         Ok(())
     }
+
+    /// The block lists of one slab of selective rows `[first_pos, first_pos +
+    /// rows)` into `lists`: qk projection, q prep, block scores, top-k.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prefill_slab_lists(
+        &self,
+        st: &QsaSeqState,
+        b: &SlabBufs,
+        first_pos: usize,
+        rows: usize,
+        lists: DevicePtr,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let (qk_buf, qpost, scores, stride) = (b.qk_buf, b.qpost, b.scores, b.stride);
+        let first_row = first_pos - b.seq_start;
+        let normed = b.normed;
+        let ratio = self.ratio as usize;
+        let topk = self.block_topk as usize;
+        let qkw = self.qk_width();
+        ops::cublas_bf16_proj_dense(
+            normed.offset(first_row * self.hidden as usize * 2),
+            self.qk_proj_w,
+            qk_buf,
+            rows as u32,
+            qkw as u32,
+            self.hidden,
+            stream,
+        )
+        .context("QSA qk projection (prefill select)")?;
+        ops::qsa_qprep_rows_scaled(
+            gpu,
+            self.k_qprep_rows_k,
+            qk_buf,
+            self.q_norm_w,
+            qpost,
+            rows as u32,
+            first_pos as u32,
+            qkw as u32,
+            self.n_heads,
+            self.hd,
+            self.rot,
+            self.theta,
+            self.eps,
+            self.yarn_inv_freq,
+            self.yarn_attention_factor,
+            stream,
+        )?;
+        let n_blocks_max = (first_pos + rows) / ratio; // last row's complete
+        // One 128-thread block per OUTPUT SCALAR is 1.397 BILLION blocks
+        // over a 30k prefill, for 512 MACs each. The tiled scorer gives a
+        // block QSA_SR_B consecutive `b` values and stages the row's `q` in
+        // shared once. Identical arithmetic -- same reduction, same order --
+        // which matters because these scores feed a top-k, so a shifted
+        // score changes WHICH blocks are attended.
+        // SCORER. `_b` gives each CTA QSA_SR_B b-values and stages the
+        // row's `q` in shared, bit-identically; the original is one CTA per
+        // output scalar. The fallback is a shared-memory bound, not policy.
+        //
+        // A third arm exists and is NOT wired here: `qsa_score_rows_gemm`
+        // drops the four block-wide reductions per output (one thread per
+        // score, serial `d` contraction) and is worth **3.2 s of a 29.5 s
+        // 30k prefill** — but it reassociates the contraction, and these
+        // scores pick which blocks a query reads. Gated and REJECTED:
+        //
+        //   needle recall (scripts/lc_check.py)     12/12, unchanged
+        //   kl_drift --precision-change             top-1 69.3%
+        //   score drift vs reference                4.2e-7 rel, 44% bit-exact
+        //
+        // The kernel is correct — 4.2e-7 is ordinary FP32 reassociation over
+        // 128 terms. The top-k amplifies it: near-ties either side of the
+        // 512th block flip, and the attended set genuinely changes. The
+        // project's own QSA bar is **>=98% top-1 agreement** (Phase 4
+        // acceptance, vs the llama.cpp reference), so 69.3% is not close,
+        // and needle recall passing is exactly why it is not the deciding
+        // metric. Kept in-tree, exercised by
+        // `qsa_score_rows_gemm_vs_reference_drift`.
+        //
+        // THE REAL QUALITY GATE HAS NOW BEEN RUN, and it says the rejection
+        // above was measuring the wrong thing. `scripts/ppl.py` -- written
+        // after that verdict, precisely because agreement-with-our-own-build
+        // is meaningless for a scorer whose own summation order is arbitrary
+        // -- puts this arm at **+0.036% above-bound perplexity**, with the
+        // dense control at 0.000%. So the change that scored 69.3% top-1
+        // agreement costs 0.036% of the only absolute measure available.
+        // Calibrate future QSA verdicts against that pair.
+        //
+        // It still does NOT ship, for a different and simpler reason: the
+        // 3.2 s it was worth in that note was against the OLD scorer.
+        // `qsa_score_rows_exact` has since taken that win bit-identically,
+        // and against it the GEMM arm measures **-0.06 s** at ctx 31481 --
+        // inside run-to-run noise. There is no speed left to trade for even
+        // a 0.036% regression, so it stays off (`ATLAS_QSA_SCORE_GEMM=1`).
+        // `ATLAS_QSA_SCORE_GEMM=1` wires that third arm. The comment above
+        // says "dispatch-disabled until someone runs the real quality gate",
+        // and `scripts/ppl.py` -- written AFTER that rejection, precisely
+        // because agreement-with-our-own-build is the wrong question for a
+        // scorer whose own summation order is arbitrary -- is that gate.
+        // `ATLAS_QSA_SCORE_TC=1`: the same scores on tensor cores. See
+        // TTFT_GAP.md 34 -- the BF16-Q half was priced with a probe BEFORE
+        // this kernel was written, and measured BETTER than F32 Q.
+        let score_tc = matches!(
+            std::env::var("ATLAS_QSA_SCORE_TC").as_deref(),
+            Ok("1") | Ok("true")
+        ) && self.k_score_rows_tc_k.0 != 0
+            && ops::qsa_score_rows_tc_ok(self.n_heads, self.hd);
+        if score_tc {
+            ops::qsa_score_rows_tc(
+                gpu,
+                self.k_score_rows_tc_k,
+                qpost,
+                st.block_keys,
+                scores,
+                rows as u32,
+                n_blocks_max as u32,
+                first_pos as u32,
+                stride as u32,
+                self.ratio,
+                self.n_heads,
+                self.hd,
+                stream,
+            )?;
+        }
+        let score_gemm = !score_tc
+            && matches!(
+                std::env::var("ATLAS_QSA_SCORE_GEMM").as_deref(),
+                Ok("1") | Ok("true")
+            )
+            && self.k_score_rows_gemm_k.0 != 0
+            && ops::qsa_score_rows_gemm_ok(self.n_heads, self.hd);
+        if score_tc {
+            // already dispatched above
+        } else if score_gemm {
+            ops::qsa_score_rows_gemm(
+                gpu,
+                self.k_score_rows_gemm_k,
+                qpost,
+                st.block_keys,
+                scores,
+                rows as u32,
+                n_blocks_max as u32,
+                first_pos as u32,
+                stride as u32,
+                self.ratio,
+                self.n_heads,
+                self.hd,
+                stream,
+            )?;
+        } else if ops::qsa_score_rows_exact_ok(self.n_heads, self.hd) {
+            ops::qsa_score_rows_exact(
+                gpu,
+                self.k_score_rows_exact_k,
+                qpost,
+                st.block_keys,
+                scores,
+                rows as u32,
+                n_blocks_max as u32,
+                first_pos as u32,
+                stride as u32,
+                self.ratio,
+                self.n_heads,
+                self.hd,
+                stream,
+            )?;
+        } else {
+            ops::qsa_score_rows(
+                gpu,
+                self.k_score_rows_k,
+                qpost,
+                st.block_keys,
+                scores,
+                rows as u32,
+                n_blocks_max as u32,
+                first_pos as u32,
+                stride as u32,
+                self.ratio,
+                self.n_heads,
+                self.hd,
+                stream,
+            )?;
+        }
+        // SELECTION. On the GPU when the shape allows it: `qsa_topk_rows`
+        // produces byte-for-byte the same list, in the same order, without
+        // moving the score matrix anywhere. The host path below is the
+        // fallback for a `topk` wider than the kernel's running best-K, and
+        // it is what the GPU kernel is tested against
+        // (`qsa_topk_rows_matches_host_selection`).
+        //
+        // What this is worth: the host round-trip is a full stream drain
+        // per attention layer per slab, and no kernel-time profile can see
+        // it because while it runs no kernel is running. Measuring GPU IDLE
+        // instead (scripts/gaps.py), on a 30k prefill:
+        //
+        //   qsa_score_rows -> qsa_prefill_attn_g
+        //       7279 ms over 179 gaps, 40.7 ms each -- 19% of the window,
+        //       and the largest single item in it.
+        let host_select = !ops::qsa_topk_rows_ok(topk as u32);
+        if !host_select {
+            ops::qsa_topk_rows(
+                gpu,
+                self.k_topk_rows_k,
+                scores,
+                lists,
+                rows as u32,
+                first_pos as u32,
+                stride as u32,
+                self.ratio,
+                topk as u32,
+                stream,
+            )?;
+        }
+        // ── ATLAS_QSA_UNION_DIAG: how much do neighbouring rows agree? ──
+        // Decides whether an EXACT block-sparse tensor-core attention is
+        // possible here. A TC kernel needs a TILE of query rows to share one
+        // K/V set; QSA selects per ROW. Attending the UNION of a tile's
+        // selections and masking each row back to its own list is exactly
+        // equivalent -- so the only question is how big that union is.
+        // union/topk == 1.0 means free; == tile size means no sharing at all.
+        static UNION_DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *UNION_DIAG.get_or_init(|| std::env::var("ATLAS_QSA_UNION_DIAG").as_deref() == Ok("1")) {
+            let mut host = vec![0u8; rows * topk * 4];
+            gpu.synchronize(stream)?;
+            gpu.copy_d2h_on_stream(lists, &mut host, stream)?;
+            let ids: Vec<i32> = host
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let mut line = String::new();
+            for tile in [16usize, 32, 64, 128] {
+                let (mut tot, mut n) = (0usize, 0usize);
+                let mut r0 = 0usize;
+                while r0 + tile <= rows {
+                    let mut set = std::collections::HashSet::new();
+                    for r in r0..r0 + tile {
+                        for k in 0..topk {
+                            let v = ids[r * topk + k];
+                            if v >= 0 {
+                                set.insert(v);
+                            }
+                        }
+                    }
+                    tot += set.len();
+                    n += 1;
+                    r0 += tile;
+                }
+                if n > 0 {
+                    line.push_str(&format!(
+                        " tile{tile}: union={} ({:.2}x topk)",
+                        tot / n,
+                        (tot / n) as f64 / topk as f64
+                    ));
+                }
+            }
+            tracing::info!("QSA union rows={rows} topk={topk}{line}");
+        }
+        if host_select {
+            self.prefill_host_select(
+                gpu, scores, lists, rows, stride, first_pos, ratio, topk, stream,
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Scratch of the slab loop, shared by every slab.
+pub(super) struct SlabBufs {
+    pub qk_buf: DevicePtr,
+    pub qpost: DevicePtr,
+    pub scores: DevicePtr,
+    pub stride: usize,
+    pub normed: DevicePtr,
+    pub seq_start: usize,
 }

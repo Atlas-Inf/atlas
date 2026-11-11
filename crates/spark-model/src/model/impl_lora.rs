@@ -133,6 +133,9 @@ impl TransformerModel {
 
     pub fn set_lora_weights(&mut self, mut lora: Option<crate::lora::LoraWeights>) -> Result<()> {
         if let Some(ref lw) = lora {
+            // A failed install or later None detach may leave layer pointers.
+            // Only the bounded hidden diagnostic reads this sticky history bit.
+            self.lora_install_attempted = true;
             // eager-on-rotate: ONLY the global rotate/swap re-point path forces
             // eager decode. A multi-adapter pool no longer implies eager —
             // per-request routing (M2) is graph-safe by construction (the
@@ -414,6 +417,8 @@ impl TransformerModel {
             "fused_graph",
             self.fused_graph.lock().drain().map(|(_, g)| g).collect(),
         );
+        self.verify_pieces.clear(self.gpu.as_ref());
+        self.decode_pieces.clear(self.gpu.as_ref());
     }
 
     /// Runtime adapter rotation (eager-on-rotate). Selects the resident

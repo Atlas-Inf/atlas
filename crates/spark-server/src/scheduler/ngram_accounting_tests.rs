@@ -9,8 +9,8 @@
 //! per-request `Done:` line derives `p1`/`mean_na`/`tok_step` from that
 //! counter, so an un-fed lane reports `serial=0.00 mtp=0.00 p1=0.000
 //! mean_na=0.000 tok_step=1.000` — which reads exactly like a lane that ran
-//! and accepted nothing. `usage.completion_tokens_details.
-//! accepted_prediction_tokens` reads the same counter, so it was 0 too.
+//! and accepted nothing. Completion usage historically read this counter too;
+//! it now separately counts accepted draft tokens retained by emission.
 //!
 //! ★ The cost was concrete. On 2026-09-15 the nvidia Flash-Next pack was
 //! recorded as "the n-gram lane engages, accepts ~nothing", on the strength of

@@ -36,6 +36,7 @@ fn dtype_label(dt: KvCacheDtype) -> &'static str {
             "Turbo4"
         }
         KvCacheDtype::Turbo8 => "Turbo8",
+        KvCacheDtype::Fp8G128 => "FP8-G128",
     }
 }
 

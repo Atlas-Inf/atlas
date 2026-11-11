@@ -1,0 +1,499 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+use anyhow::Result;
+use spark_runtime::gpu::DevicePtr;
+
+use super::Glm5KdaLayer;
+use crate::layer::ForwardContext;
+use crate::layers::ops;
+use crate::weight_map::{DenseWeight, QuantizedWeight};
+#[path = "projection_fp8.rs"]
+mod fp8;
+#[path = "projection_mx.rs"]
+mod mx;
+
+/// Balanced `(first_row, rows)` chunks of at most the batch-M GEMV cap, so an
+/// owner-batched verify of `m > 8` rows reuses the exact short-batch kernels.
+fn verify_row_chunks(m: u32) -> impl Iterator<Item = (u32, u32)> {
+    // `ATLAS_GLM_LONG_BATCH_PROJ_ROWS=3` pins owner-exact 3-row chunks.
+    static CAP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let cap = *CAP.get_or_init(|| {
+        std::env::var("ATLAS_GLM_LONG_BATCH_PROJ_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| (2..=ops::DENSE_GEMV_BATCHM_MAX_M).contains(v))
+            .unwrap_or(ops::DENSE_GEMV_BATCHM_MAX_M)
+    });
+    let chunks = m.div_ceil(cap);
+    (0..chunks).map(move |c| {
+        let start = c * m / chunks;
+        (start, (c + 1) * m / chunks - start)
+    })
+}
+
+/// Memory-tight GLM KDA projection.
+///
+/// The checkpoint-native BF16 matrix is quantized once at load time and then
+/// released. Decode uses W4A16 GEMV; prefill uses W4A16 GEMM.
+pub struct Glm5Projection {
+    pub nvfp4: QuantizedWeight,
+    /// Optional `[K/2, N]` twin for Atlas' tensor-core prefill GEMMs.
+    pub prefill_nvfp4_t: Option<QuantizedWeight>,
+    /// The checkpoint's MXFP8 bytes as this rank's twin, which then serves
+    /// every decode and verify row (`ATLAS_GLM_FP4L_KDA_MXFP8_DECODE`,
+    /// `projection_mx.rs`).
+    pub mxfp8: Option<crate::weight_map::Mxfp8Weight>,
+    /// The checkpoint's MXFP8 bytes as the W8A8 prefill operand, which then
+    /// serves every prefill row (`ATLAS_GLM_FP4L_KDA_W8A8_PREFILL`).
+    pub w8a8: Option<ops::MxW8a8>,
+}
+
+pub struct Glm5KdaWeights {
+    pub q_proj: Glm5Projection,
+    pub k_proj: Glm5Projection,
+    pub v_proj: Glm5Projection,
+    pub b_proj: DenseWeight,
+    pub f_a_proj: DenseWeight,
+    pub f_b_proj: DenseWeight,
+    pub g_a_proj: DenseWeight,
+    pub g_b_proj: DenseWeight,
+    pub conv: DenseWeight,
+    pub a_log: DenseWeight,
+    pub dt_bias: DenseWeight,
+    pub o_norm: DenseWeight,
+    pub o_proj: Glm5Projection,
+    /// The whole o_proj over every rank's heads, for this rank's rows
+    /// (`ATLAS_GLM_SP_KDA_OPROJ_A2A`, `sp_oproj_a2a.rs`).
+    pub o_proj_full: Option<ops::MxW8a8>,
+    /// The whole b_proj (every rank's heads), for the quantized gather's
+    /// beta of this rank's rows (the four-rank chain,
+    /// `sp_quant_gather.rs`).
+    pub b_proj_full: Option<DenseWeight>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProjectionPath {
+    PrefillTransposedM128,
+    PrefillBase,
+    DecodeGemv,
+}
+
+impl ProjectionPath {
+    pub(super) fn for_forward(decode: bool, has_transposed: bool, tokens: u32) -> Self {
+        Self::for_forward_pinned(
+            decode,
+            has_transposed,
+            tokens,
+            crate::layers::glm_packed_scope::active(),
+        )
+    }
+
+    /// `packed` (`glm_packed_scope`): the transposed M128 tiles at every row
+    /// count when present, so the family does not depend on the pass height.
+    pub(super) fn for_forward_pinned(
+        decode: bool,
+        has_transposed: bool,
+        tokens: u32,
+        packed: bool,
+    ) -> Self {
+        if decode {
+            Self::DecodeGemv
+        } else if has_transposed && (tokens > 128 || packed) {
+            Self::PrefillTransposedM128
+        } else {
+            Self::PrefillBase
+        }
+    }
+}
+
+/// Kernel family for one prefill/decode dense (BF16) KDA projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DensePath {
+    Gemv,
+    /// `ops::bf16_gemm` (CUTLASS 128x128x64): f_b / g_b, K = 128.
+    Cutlass,
+    /// `dense_gemm_bf16_pipelined` (or its scalar fallback).
+    Pipelined,
+}
+
+impl DensePath {
+    /// `cutlass_rows` is [`ops::bf16_gemm_cutlass_rows`] for `m`. CUTLASS only
+    /// replaces the pipelined kernel where the two are bit-identical.
+    pub(super) fn for_forward(m: u32, k: u32, cutlass_rows: bool) -> Self {
+        if m == 1 {
+            Self::Gemv
+        } else if cutlass_rows && k <= 128 && ops::bf16_gemm_matches_pipelined(k) {
+            Self::Cutlass
+        } else {
+            Self::Pipelined
+        }
+    }
+}
+
+impl Glm5KdaLayer {
+    /// Project a short speculative-verification batch with the decode kernels
+    /// that amortize one weight read across the candidate rows.  Atlas only
+    /// ships tuned NVFP4 variants for M=2..=8. Widths 4..=8 use the shared
+    /// exact-M tier resolver, so K=5 does not fall off the decode path into a
+    /// small prefill GEMM.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn project_hot_verify(
+        &self,
+        input: DevicePtr,
+        weight: &Glm5Projection,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        if self.try_project_mxfp8(input, weight, output, m, n, k, ctx, stream)? {
+            return Ok(());
+        }
+        if crate::layers::canonical_verify::enabled() {
+            // One tensor-core family for every row count (1..=32).
+            return crate::layers::canonical_verify::w4a16(
+                ctx.gpu,
+                input,
+                &weight.nvfp4,
+                output,
+                m,
+                n,
+                k,
+                stream,
+            );
+        }
+        if (2..=8).contains(&m) {
+            self.project_hot_multi_decode(input, weight, output, m, n, k, ctx, stream)
+        } else if m > 8
+            && let tc = crate::layers::w4a16_gemv_tiers::tc_kernel(m)
+            && tc.0 != 0
+        {
+            // One tensor-core pass reads the weight once for all owner rows.
+            ops::w4a16_verify_touch(ctx.gpu, tc, input, &weight.nvfp4, output, m, n, k, stream)
+                .unwrap_or_else(|| {
+                    ops::w4a16_gemv_batchm(
+                        ctx.gpu,
+                        tc,
+                        input,
+                        &weight.nvfp4,
+                        output,
+                        m,
+                        n,
+                        k,
+                        stream,
+                    )
+                })
+        } else if m > 8 {
+            // Owner-batched verify: the batch-M GEMV tiers stream the weight
+            // at near-peak bandwidth where the M64-tile prefill GEMM mostly
+            // pads. One weight read per balanced <=8-row chunk.
+            for (row, rows) in verify_row_chunks(m) {
+                self.project_hot_multi_decode(
+                    input.offset(row as usize * k as usize * 2),
+                    weight,
+                    output.offset(row as usize * n as usize * 2),
+                    rows,
+                    n,
+                    k,
+                    ctx,
+                    stream,
+                )?;
+            }
+            Ok(())
+        } else {
+            self.project_hot(input, weight, output, m, n, k, false, ctx, stream)
+        }
+    }
+
+    /// BF16 side projections already have a general batch-M GEMV kernel, so
+    /// speculative verification need not fall through to a prefill GEMM.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn project_dense_verify(
+        &self,
+        input: DevicePtr,
+        weight: &DenseWeight,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        if crate::layers::canonical_verify::enabled() {
+            return crate::layers::canonical_verify::dense(
+                ctx.gpu, input, weight, output, m, n, k, n, stream,
+            );
+        }
+        if m == 1 {
+            self.project_dense(input, weight, output, m, n, k, ctx, stream)
+        } else if m <= ops::DENSE_GEMV_BATCHM_MAX_M {
+            self.project_dense_multi_decode(input, weight, output, m, n, k, ctx, stream)
+        } else if let tc = ops::dense_tc_kernel(ctx.gpu, m)
+            && tc.0 != 0
+            && k.is_multiple_of(8)
+        {
+            ops::dense_gemv_bf16_tc(ctx.gpu, tc, input, weight, output, m, n, k, n, stream)
+        } else {
+            // Owner-batched verify rows exceed the batch-M kernel's cap. These
+            // side projections are small; read them once per <=8-row chunk.
+            for (row, rows) in verify_row_chunks(m) {
+                self.project_dense_multi_decode(
+                    input.offset(row as usize * k as usize * 2),
+                    weight,
+                    output.offset(row as usize * n as usize * 2),
+                    rows,
+                    n,
+                    k,
+                    ctx,
+                    stream,
+                )?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Read one NVFP4 projection once for a short decode/verify batch.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn project_hot_multi_decode(
+        &self,
+        input: DevicePtr,
+        weight: &Glm5Projection,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        if self.try_project_mxfp8(input, weight, output, m, n, k, ctx, stream)? {
+            return Ok(());
+        }
+        // ATLAS_GLM_DECODE_GEMV_BATCH: the same bodies behind a weight touch.
+        let tier = self.w4a16_gemv_batchm.kernel(m);
+        let nvfp4 = &weight.nvfp4;
+        if let Some(done) =
+            ops::w4a16_verify_touch(ctx.gpu, tier, input, nvfp4, output, m, n, k, stream)
+        {
+            return done;
+        }
+        match m {
+            2 => ops::w4a16_gemv_batch2(
+                ctx.gpu,
+                self.w4a16_gemv_batch2_k,
+                input,
+                &weight.nvfp4,
+                output,
+                n,
+                k,
+                stream,
+            ),
+            3 => ops::w4a16_gemv_batch3(
+                ctx.gpu,
+                self.w4a16_gemv_batch3_k,
+                input,
+                &weight.nvfp4,
+                output,
+                n,
+                k,
+                stream,
+            ),
+            4..=8 => {
+                let kernel = self.w4a16_gemv_batchm.kernel(m);
+                anyhow::ensure!(
+                    kernel.0 != 0,
+                    "GLM KDA M={m} decode requires a matching w4a16 batch-M tier"
+                );
+                ops::w4a16_gemv_batchm(
+                    ctx.gpu,
+                    kernel,
+                    input,
+                    &weight.nvfp4,
+                    output,
+                    m,
+                    n,
+                    k,
+                    stream,
+                )
+            }
+            _ => anyhow::bail!("GLM KDA multi-decode projection requires M=2..=8, got {m}"),
+        }
+    }
+
+    /// Read one BF16 projection once for all concurrent decode rows.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn project_dense_multi_decode(
+        &self,
+        input: DevicePtr,
+        weight: &DenseWeight,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let kernel = if m == 5
+            && self.dense_gemv_batch5_k.0 != 0
+            && std::env::var("ATLAS_GLM_K5_DENSE_EXACT").as_deref() == Ok("1")
+        {
+            self.dense_gemv_batch5_k
+        } else {
+            self.dense_gemv_batchm_k
+        };
+        ops::dense_gemv_batchm(ctx.gpu, kernel, input, weight, output, m, n, k, n, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn project_hot(
+        &self,
+        input: DevicePtr,
+        weight: &Glm5Projection,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        decode: bool,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.project_hot_cast(input, weight, output, m, n, k, decode, true, ctx, stream)
+            .map(|_| ())
+    }
+
+    /// `project_hot`, returning whether it took the Lt FP8 route. `cast` false
+    /// reuses the E4M3 input the previous Lt FP8 projection of this same
+    /// `input` and `m` left in the scratch.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn project_hot_cast(
+        &self,
+        input: DevicePtr,
+        weight: &Glm5Projection,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        decode: bool,
+        cast: bool,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        if decode && self.try_project_mxfp8(input, weight, output, m, n, k, ctx, stream)? {
+            return Ok(false);
+        }
+        if !decode && self.try_project_w8a8(input, weight, output, m, n, k, cast, ctx, stream)? {
+            // `input`'s MXFP8 image stays in the scratch for the next
+            // projection of the same rows (`cast` false reuses it).
+            return Ok(true);
+        }
+        if !decode
+            && m >= 2048
+            && !crate::layers::glm_packed_scope::active()
+            && fp8::try_project(
+                ctx.gpu,
+                input,
+                weight,
+                output,
+                m,
+                n,
+                k,
+                decode,
+                ctx.graph_capture,
+                ctx.buffers.expert_gate_out(),
+                ctx.buffers.sizes().expert_gate_out,
+                ctx.buffers.max_batch_tokens(),
+                std::env::var("ATLAS_GLM_KDA_PREFILL_LT_FP8").as_deref() == Ok("1"),
+                cast,
+                stream,
+            )?
+        {
+            return Ok(true);
+        }
+        let () = match ProjectionPath::for_forward(decode, weight.prefill_nvfp4_t.is_some(), m) {
+            ProjectionPath::DecodeGemv => ops::w4a16_decode_gemv(
+                ctx.gpu,
+                self.w4a16_gemv_k,
+                self.w4a16_gemv_sw_k,
+                ctx.levers.gemv_sw,
+                input,
+                &weight.nvfp4,
+                output,
+                n,
+                k,
+                stream,
+            ),
+            ProjectionPath::PrefillTransposedM128 => ops::w4a16_gemm_n128_m128(
+                ctx.gpu,
+                self.w4a16_gemm_t_m128_k,
+                input,
+                weight.prefill_nvfp4_t.as_ref().unwrap(),
+                output,
+                m,
+                n,
+                k,
+                stream,
+            ),
+            ProjectionPath::PrefillBase => ops::w4a16_gemm(
+                ctx.gpu,
+                self.w4a16_gemm_k,
+                input,
+                &weight.nvfp4,
+                output,
+                m,
+                n,
+                k,
+                stream,
+            ),
+        }?;
+        Ok(false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn project_dense(
+        &self,
+        input: DevicePtr,
+        weight: &DenseWeight,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        match DensePath::for_forward(m, k, ops::bf16_gemm_cutlass_rows(m)) {
+            DensePath::Gemv => ops::dense_gemv(
+                ctx.gpu,
+                self.dense_gemv_k,
+                input,
+                weight,
+                output,
+                n,
+                k,
+                stream,
+            ),
+            // ~10% faster than the pipelined kernel on this store-bound shape.
+            DensePath::Cutlass => ops::bf16_gemm(input, weight.weight.0, output, m, n, k, stream),
+            DensePath::Pipelined => ops::dense_gemm_prefill(
+                ctx.gpu,
+                self.dense_gemm_k,
+                self.dense_gemm_pipelined_k,
+                input,
+                weight,
+                output,
+                m,
+                n,
+                k,
+                stream,
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "projection_path_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "projection_row_tests.rs"]
+mod verify_row_chunk_tests;

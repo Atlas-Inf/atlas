@@ -119,12 +119,6 @@ pub fn dense_gemv(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    // EXL3 packed dense linears (ATLAS_EXL3_DENSE_NATIVE=1): a BF16 copy that
-    // was materialized from a registered trellis runs the native batch-1
-    // EXL3 GEMV on the packed weight instead. No-op otherwise.
-    if let Some(r) = exl3_dense_try(gpu, kernel, input, weight.weight, output, n, k, stream) {
-        return r;
-    }
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -159,19 +153,6 @@ pub fn dense_gemv_batch2(
     out_stride: u32,
     stream: u64,
 ) -> Result<()> {
-    if let Some(r) = exl3_dense_try_rows(
-        gpu,
-        input,
-        weight.weight,
-        output,
-        2,
-        n,
-        k,
-        out_stride,
-        stream,
-    ) {
-        return r;
-    }
     let outputs_per_block = if cfg!(atlas_hip) { 8 } else { 4 };
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, outputs_per_block), 1, 1])
@@ -231,19 +212,6 @@ pub fn dense_gemv_batchm(
         "dense_gemv_batchm: m={m} outside 1..={DENSE_GEMV_BATCHM_MAX_M} \
          (kernel MAX_M clamps silently; use dense_gemm_tc for wider batches)"
     );
-    if let Some(r) = exl3_dense_try_rows(
-        gpu,
-        input,
-        weight.weight,
-        output,
-        m as usize,
-        n,
-        k,
-        out_stride,
-        stream,
-    ) {
-        return r;
-    }
     KernelLaunch::new(gpu, kernel)
         .grid([
             div_ceil(
@@ -315,6 +283,17 @@ pub fn w8a16_gemv(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    if super::skinny_mma::try_w8a16(
+        gpu,
+        kernel,
+        input,
+        &[((weight, row_scale), output, n)],
+        (1, k),
+        n,
+        stream,
+    )? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -424,6 +403,35 @@ pub fn per_token_group_quant_fp8(
     KernelLaunch::new(gpu, kernel)
         .grid([m, k / 128, 1])
         .block([128, 1, 1])
+        .arg_ptr(input_bf16)
+        .arg_ptr(output_fp8)
+        .arg_ptr(a_scale)
+        .arg_u32(m)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// [`per_token_group_quant_fp8`] on its warp-per-group twin
+/// (`per_token_group_quant_fp8_warp`, eight groups a CTA instead of one; the
+/// same bytes). `k % 128 == 0`.
+#[allow(clippy::too_many_arguments)]
+pub fn per_token_group_quant_fp8_warp(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input_bf16: DevicePtr,
+    output_fp8: DevicePtr,
+    a_scale: DevicePtr,
+    m: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        k.is_multiple_of(128),
+        "per_token_group_quant_fp8_warp: K {k} is not whole 128-groups"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([(m * (k / 128)).div_ceil(8), 1, 1])
+        .block([256, 1, 1])
         .arg_ptr(input_bf16)
         .arg_ptr(output_fp8)
         .arg_ptr(a_scale)
@@ -840,6 +848,12 @@ pub fn w8a16_gemm_n_m128(
     stream: u64,
 ) -> Result<()> {
     super::log_gemm_shape(gpu, "w8a16_gemm_n_m128", m, n, k);
+    // gfx1151 prefill: dequant once + hipBLASLt beats the fused kernel at
+    // M >= 1024 (see hip_fp8_blas.rs); falls through when not taken.
+    #[cfg(atlas_hip)]
+    if super::hip_fp8_blas::try_w8a16_n(gpu, input, weight, block_scale, output, m, n, k, stream)? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
         .block([256, 1, 1])

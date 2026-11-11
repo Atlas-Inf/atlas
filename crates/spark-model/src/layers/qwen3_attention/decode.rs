@@ -13,11 +13,15 @@ mod attention_forward_kv;
 // (`trait_impl::multi_seq::mla`) reuses `DecodeMlaArgs` to drive the
 // V4-Flash single-token chain per verify token.
 pub(in crate::layers::qwen3_attention) mod attention_forward_mla;
+mod attention_forward_mla_attn;
 mod attention_forward_oproj;
 mod attention_forward_v4;
+mod glm_index;
+mod glm_index_dynamic;
 mod high_speed_swap;
 mod run_paged_decode;
 mod write_kv_cache;
+mod write_kv_cache_glm;
 
 impl Qwen3AttentionLayer {
     pub(super) fn effective_fp8_scales(&self) -> (f32, f32) {

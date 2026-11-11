@@ -14,11 +14,32 @@ use crate::weight_map::DenseWeight;
 use spark_runtime::gpu::DevicePtr;
 
 impl BlockDiffusionDraftHead {
+    /// The selector's anchor and min_tokens ban for this propose, in the
+    /// device slots `seed_markov_prev` wrote.
+    pub(super) fn selector_anchor(
+        last_token: u32,
+        ban_depth: u32,
+        scratch: &DflashScratch,
+    ) -> super::selector::SelectorAnchor {
+        super::selector::SelectorAnchor {
+            token: last_token,
+            token_dev: scratch.markov_prev_dev,
+            ban_depth,
+            ban_depth_dev: scratch
+                .markov_prev_dev
+                .offset(super::MARKOV_BAN_DEPTH_OFFSET),
+            end_ids: crate::traits::EosBan::model_end_ids(),
+        }
+    }
+
     /// Argmax each γ row. When Markov weights are bound, add the sequential
     /// transition bias first using `last_token` as the position-0 previous.
+    /// A DFlash2 selector walks from the anchor seeded in `markov_prev_dev`
+    /// and skips end tokens at depths `1..=ban_depth`.
     pub(super) fn argmax_block_logits(
         &self,
         last_token: u32,
+        ban_depth: u32,
         hidden_buf: DevicePtr,
         gpu: &dyn spark_runtime::gpu::GpuBackend,
         stream: u64,
@@ -27,12 +48,35 @@ impl BlockDiffusionDraftHead {
         markov_bias: DevicePtr,
     ) -> Result<()> {
         let bf16 = 2usize;
+        if let Some(sc) = scratch.dspine.as_ref() {
+            let _ = (last_token, ban_depth, hidden_buf, markov_embed, markov_bias);
+            return self.dspine_tail(
+                gpu,
+                scratch.logits,
+                self.gamma as u32,
+                Self::dspine_single_blocks(scratch),
+                sc,
+                scratch.draft_tokens_dev,
+                stream,
+            );
+        }
         if let Some(ref selector) = self.candidate_selector {
+            let anchor = Self::selector_anchor(last_token, ban_depth, scratch);
+            self.note_select(self.kernels.dflash2_candidate_selector.map(|_| {
+                super::tree_lattice::LastSelect {
+                    logits: scratch.logits,
+                    projected: scratch.dflash2_projected_hidden,
+                    scratch: scratch.dflash2_selector_scratch,
+                    anchor: anchor.token_dev,
+                    ban_depth: anchor.ban_depth_dev,
+                }
+            }));
             return selector.select_candidates(
-                last_token,
+                Self::selector_anchor(last_token, ban_depth, scratch),
                 hidden_buf,
                 scratch.logits,
                 scratch.dflash2_projected_hidden,
+                scratch.dflash2_selector_scratch,
                 scratch.draft_tokens_dev,
                 self.gamma,
                 gpu,
@@ -152,11 +196,13 @@ impl BlockDiffusionDraftHead {
         Ok(())
     }
 
-    /// Write `last_token` into the stable device slot the tail graph reads.
-    /// Must run on `stream` BEFORE begin_capture(tail) / launch_graph(tail).
+    /// Write `[last_token, ban_depth]` into the stable device slots the tail
+    /// graph reads. Must run on `stream` BEFORE begin_capture(tail) /
+    /// launch_graph(tail).
     pub(super) fn seed_markov_prev(
         &self,
         last_token: u32,
+        ban_depth: u32,
         gpu: &dyn spark_runtime::gpu::GpuBackend,
         stream: u64,
         scratch: &DflashScratch,
@@ -165,10 +211,12 @@ impl BlockDiffusionDraftHead {
             .markov_prev_host_pinned
             .load(std::sync::atomic::Ordering::Relaxed);
         anyhow::ensure!(!ptr.is_null(), "markov_prev_host_pinned is null");
+        // SAFETY: `ptr` is the page-locked MARKOV_PREV_BYTES allocation made
+        // in `from_weights`, reached only through this scratch on its stream.
         unsafe {
-            std::ptr::write(ptr as *mut u32, last_token);
+            std::ptr::write_unaligned(ptr as *mut [u32; 2], [last_token, ban_depth]);
         }
-        let host = unsafe { std::slice::from_raw_parts(ptr, 4) };
+        let host = unsafe { std::slice::from_raw_parts(ptr, super::MARKOV_PREV_BYTES) };
         gpu.copy_h2d_async(host, scratch.markov_prev_dev, stream)
     }
 }

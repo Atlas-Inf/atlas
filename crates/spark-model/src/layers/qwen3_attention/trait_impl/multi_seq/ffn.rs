@@ -9,8 +9,12 @@ use super::ctx::MultiSeqCtx;
 use crate::layers::ops;
 use crate::layers::qwen3_attention::Qwen3AttentionLayer;
 
+// The three switches below pick the MoE passes of a batched decode step, so
+// its EP reduces: one over every row, one a pair, or one a row. Every rank
+// must run the same values (`model::startup_parity`).
+
 /// Kill-switch for the pairwise batched MoE decode path (`ATLAS_MOE_PAIRWISE_DECODE=0`).
-fn pairwise_moe_decode_enabled() -> bool {
+pub(crate) fn pairwise_moe_decode_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_MOE_PAIRWISE_DECODE").as_deref() != Ok("0"))
@@ -19,12 +23,12 @@ fn pairwise_moe_decode_enabled() -> bool {
 /// Route batched decode MoE (n >= min) through the grouped read-once GEMM
 /// (forward_prefill) instead of the pairwise per-slot loop. Default OFF.
 /// Min default 2: one consistent grouped path for every batched decode size.
-fn grouped_routed_decode_enabled() -> bool {
+pub(crate) fn grouped_routed_decode_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_MOE_GROUPED_ROUTED_DECODE").as_deref() == Ok("1"))
 }
-fn grouped_routed_decode_min() -> usize {
+pub(crate) fn grouped_routed_decode_min() -> usize {
     use std::sync::OnceLock;
     static M: OnceLock<usize> = OnceLock::new();
     *M.get_or_init(|| {
@@ -48,6 +52,9 @@ impl Qwen3AttentionLayer {
                 || self.mla.is_some(),
             "shortcut-MoE model reached the batched FFN ladder, which does not              implement the shortcut; only the per-token branch does"
         );
+        if self.has_post_sublayer_norms() {
+            return self.ms_phase_ffn_perinorm(c, o_out);
+        }
         let MultiSeqCtx {
             fwd,
             n,
@@ -142,7 +149,13 @@ impl Qwen3AttentionLayer {
                 (2 * h) as u32,
                 stream,
             )?;
-        } else if (4..=16).contains(&n) && !force_seq_ffn && self.ffn.can_forward_km(n as u32) {
+        } else if n >= 4
+            && !force_seq_ffn
+            && ((n <= 16 && self.ffn.can_forward_km(n as u32))
+                || self.ffn.rows_exact(n as u32, fwd))
+        {
+            // Under the batch lever (`model/exact_verify.rs`) also past 16
+            // rows: the row-exact arm instead of `forward_prefill` below.
             // MISSING K=4 ARM (2026-07-24): the ladder jumped from n==2/3
             // straight to the dense `forward_prefill` GEMM below, so K=4
             // verify ran the 16 attention layers' FFN through the MMQ/tile
@@ -167,7 +180,7 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
             let used = self.ffn.try_forward_km(normed2, n as u32, fwd, stream)?;
-            debug_assert!(used, "can_forward_km checked at branch entry");
+            debug_assert!(used, "can_forward_km / rows_exact checked at branch entry");
             let moe_out = fwd.buffers.moe_output();
             ops::residual_add(
                 fwd.gpu,

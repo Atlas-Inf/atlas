@@ -25,7 +25,7 @@ impl TransformerLayer for Qwen3SsmLayer {
         // (verify-exact bypasses the arm entirely; wyN has no FP16-h-state
         // twin). The intermediates-layout requirement is per-SEQUENCE and
         // checked by the caller (`SsmLayerState::h_inter_pool_layout`).
-        !super::verify_exact_enabled()
+        !super::verify_exact_for(levers)
             && !super::ssm_h_fp16_enabled()
             && self.wyn_kernel(num_tokens, levers.gdn_wyn).is_some()
             && Self::gdn_defer_active(
@@ -38,6 +38,21 @@ impl TransformerLayer for Qwen3SsmLayer {
                 },
                 self.gdn_commit_k,
             )
+    }
+
+    fn gdn_exact_defer(
+        &self,
+        gpu: &dyn GpuBackend,
+        levers: &crate::layers::ops::ModelLevers,
+        config: &atlas_core::config::ModelConfig,
+        num_tokens: usize,
+    ) -> bool {
+        self.exact_defer_arm(gpu, levers, config, num_tokens)
+            || self.q38_defer_arm(gpu, levers, config, num_tokens)
+    }
+
+    fn gdn_conv_weight(&self) -> DevicePtr {
+        self.ssm.conv1d.weight
     }
 
     // ── MoE layout transposes ───────────────────────────────────────────
@@ -190,6 +205,24 @@ impl TransformerLayer for Qwen3SsmLayer {
         if self.hc.is_none() || self.ffn.is_dense() {
             return None;
         }
+        // The ceiling this returns is already tunable: `ATLAS_MTP_MAX_DRAFTS`
+        // below (default 1 = two verify rows) lifts it without a rebuild, and
+        // the scheduler's own `--num-drafts` / `ATLAS_MTP_K_LADDER` decide how
+        // many drafts are actually proposed. So the only thing that ever made
+        // K>=4 unreachable was the MoE arm refusing the width — see
+        // `trait_decode_batched_hc`, which now routes K=4..8 through
+        // `forward_batched` instead of bailing. A verify error there finishes
+        // the request, so the previous refusal silently truncated answers
+        // rather than merely speculating less.
+        //
+        // Everything below this line was measured on ONE GB10 with 256-TOKEN
+        // COMPLETIONS. That regime is where the ceiling came from: `fwd` grows
+        // +29.78 ms from K=2 to K=3 there, out of a 786.9 us/layer verify, and
+        // that growth is what made K=3 lose. At long context the forward
+        // instead measures flat in row count (`fwd` ~= 106 ms at both 3 and 12
+        // rows), so the row penalty that decided that comparison is the part
+        // least likely to transfer. Re-measure on the target workload before
+        // treating any of it as a recommendation.
         // ONE draft (K=2 verify rows), not two. Two reasons, both measured on
         // one GB10 with 256-token completions, agg tok/s:
         //
@@ -383,12 +416,6 @@ impl TransformerLayer for Qwen3SsmLayer {
     /// around it, the batched path does not — veto batched graphs.
     fn decode_graph_unsupported(&self) -> bool {
         self.ple.is_some()
-    }
-
-    /// The single-row decode prestages PLE's host half (`decode_prestage`),
-    /// so its forward is capture-safe; lifted only under ATLAS_EXL3_PLE_GRAPHS=1.
-    fn single_decode_graph_unsupported(&self) -> bool {
-        self.ple.is_some() && !crate::layers::ple::ple_graphs_enabled()
     }
 
     fn snapshot_aux(
@@ -625,8 +652,18 @@ impl TransformerLayer for Qwen3SsmLayer {
         )
     }
 
+    fn prefill_multi(&self, pass: &mut crate::layer::MultiPass<'_, '_>) -> Result<()> {
+        self.prefill_multi_hc(pass)
+    }
+
     fn is_ssm_layer(&self) -> bool {
         self.is_ssm_layer_inner()
+    }
+
+    fn prefill_reads_residual(&self) -> bool {
+        // rms_norm_residual and residual_add_rms_norm only write it; the mHC
+        // paths are not audited for this.
+        self.hc.is_some()
     }
 
     fn prefill_phase1(
@@ -693,6 +730,44 @@ impl TransformerLayer for Qwen3SsmLayer {
         stream: u64,
     ) -> Result<()> {
         self.prefill_phase1_conv1d_one_inner(state, token_offset, len, gdn_bufs, ctx, stream)
+    }
+
+    fn score_conv1d(
+        &self,
+        tables: [DevicePtr; 2],
+        row0: usize,
+        gdn_bufs: &GdnPrefillBuffers,
+        batch: u32,
+        cu_seqlens: DevicePtr,
+        max_len: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        self.try_conv1d_varlen(
+            tables, row0, gdn_bufs, batch, cu_seqlens, max_len, ctx, stream,
+        )
+    }
+
+    fn score_gdn_scan(
+        &self,
+        h_ptrs: DevicePtr,
+        h_init: DevicePtr,
+        gdn_bufs: &GdnPrefillBuffers,
+        batch: u32,
+        cu_seqlens: DevicePtr,
+        max_len: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        let scan = super::gdn_chunk_tc::ChunkTcScan {
+            h_state: h_ptrs,
+            h_state_is_table: true,
+            batch,
+            seq_len: max_len,
+            cu_seqlens: Some(cu_seqlens),
+            h_init,
+        };
+        self.try_gdn_chunk_tc(gdn_bufs, scan, ctx, stream)
     }
 
     fn prefill_phase1_l2_batched(

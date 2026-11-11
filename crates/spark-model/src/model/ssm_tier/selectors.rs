@@ -7,8 +7,8 @@ use anyhow::{Result, bail};
 
 use super::fingerprint::{ModelFingerprint, resolve_decode_ns, resolve_swap_ns};
 use super::unified::{
-    DISK_GB_VAR, TransportSlotArena, build_unified_swap, disk_gb_requested, log_unified_tier,
-    ssm_tier_disk_slots, unified_hot_slots,
+    DISK_GB_VAR, SwapBacking, TransportSlotArena, build_unified_swap, disk_gb_requested,
+    log_unified_tier, ssm_tier_disk_slots, unified_hot_slots,
 };
 use super::{
     ArenaSnapshotStore, FileSnapshotArena, MemBlobStore, PagingSnapshotStore, RdmaSnapshotStore,
@@ -19,6 +19,47 @@ use super::{
 /// eviction drops exactly as before ⇒ byte-identical to a pre-tier build.
 pub(crate) fn ssm_tier_enabled() -> bool {
     std::env::var_os("ATLAS_SSM_TIER").is_some()
+}
+
+/// Where a built tier store keeps the snapshots spilled into it — what the KV
+/// sizing (and, with the NVMe prefix tier, the startup check) needs to know
+/// about a store that is otherwise only a `dyn SnapshotBlobStore`. Decided by
+/// [`build_tier_store`] from what it BUILT, never from the environment: every
+/// arm falls back to host RAM on a setup failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpillHome {
+    /// This process's RAM, under no bound the KV sizing counts: the legacy
+    /// `MemBlobStore`, or a unified store whose swap tier is not an O_DIRECT
+    /// file (`SwapBacking::HostRam`).
+    HostRam,
+    /// An O_DIRECT swap file under a hot arena of `hot_slots` blobs of host
+    /// RAM (0: the hot arena is a peer's).
+    Disk { hot_slots: usize },
+    /// A peer's arena.
+    Peer,
+}
+
+impl SpillHome {
+    fn unified(backing: SwapBacking, hot_slots: usize) -> Self {
+        match backing {
+            SwapBacking::ODirect => Self::Disk { hot_slots },
+            SwapBacking::HostRam => Self::HostRam,
+        }
+    }
+
+    /// Host RAM the tier commits only AFTER construction, for KV sizing
+    /// (`SsmPools::tier_lazy_host_bytes`): the pinned spill/fault-in staging
+    /// blob (allocated on the first spill) and the host hot arena — a zeroed
+    /// `Vec` the kernel backs page by page as slots fill. [`Self::HostRam`]
+    /// has no such bound; the NVMe prefix tier, the one consumer of this
+    /// number, refuses to start on it (`factory/build/kv_nvme.rs`).
+    pub(crate) fn lazy_host_bytes(self, blob_bytes: usize) -> usize {
+        let arena = match self {
+            Self::Disk { hot_slots } => hot_slots,
+            Self::HostRam | Self::Peer => 0,
+        };
+        (arena + 1) * blob_bytes
+    }
 }
 
 /// Build the SSM spill-tier store (called only when `ssm_tier_enabled()`).
@@ -42,7 +83,7 @@ pub(crate) fn ssm_tier_enabled() -> bool {
 pub(crate) fn build_tier_store(
     fp: ModelFingerprint,
     blob_bytes: usize,
-) -> Result<std::sync::Arc<dyn SnapshotBlobStore>> {
+) -> Result<(std::sync::Arc<dyn SnapshotBlobStore>, SpillHome)> {
     use std::sync::Arc;
     // An operator who sets a 32 GiB budget, gets the legacy MemBlobStore and
     // believes they are protected is worse off than one who set nothing: the
@@ -80,11 +121,8 @@ pub(crate) fn build_tier_store(
                          fingerprint {:#018x})",
                         fp.get(),
                     );
-                    return Ok(Arc::new(PagingSnapshotStore::new(
-                        Box::new(arena),
-                        blob_bytes,
-                        namespace,
-                    )));
+                    let store = PagingSnapshotStore::new(Box::new(arena), blob_bytes, namespace);
+                    return Ok((Arc::new(store), SpillHome::Peer));
                 }
                 Err(e) => tracing::warn!(
                     "SSM RDMA paging connect to {peer} failed ({e:#}); trying bounded RDMA"
@@ -119,14 +157,14 @@ pub(crate) fn build_tier_store(
                                 max_disk_slots,
                                 backing,
                             );
-                            return Ok(Arc::new(s));
+                            return Ok((Arc::new(s), SpillHome::unified(backing, 0)));
                         }
                         Err(e) => {
                             tracing::warn!(
                                 "SSM unified residency init failed ({e:#}); \
                                  falling back to host-RAM"
                             );
-                            return Ok(Arc::new(MemBlobStore::new(0)));
+                            return Ok((Arc::new(MemBlobStore::new(0)), SpillHome::HostRam));
                         }
                     }
                 }
@@ -135,11 +173,8 @@ pub(crate) fn build_tier_store(
                      {:.2} GiB arena)",
                     arena_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
                 );
-                return Ok(Arc::new(RdmaSnapshotStore::new(
-                    Box::new(arena),
-                    blob_bytes,
-                    slots,
-                )));
+                let store = RdmaSnapshotStore::new(Box::new(arena), blob_bytes, slots);
+                return Ok((Arc::new(store), SpillHome::Peer));
             }
             Err(e) => tracing::warn!(
                 "SSM RDMA tier connect to {peer} failed ({e:#}); falling back to host-RAM"
@@ -164,14 +199,14 @@ pub(crate) fn build_tier_store(
                     max_disk_slots,
                     backing,
                 );
-                return Ok(Arc::new(s));
+                return Ok((Arc::new(s), SpillHome::unified(backing, hot_slots)));
             }
             Err(e) => tracing::warn!(
                 "SSM unified residency init failed ({e:#}); falling back to host-RAM store"
             ),
         }
     }
-    Ok(Arc::new(MemBlobStore::new(0)))
+    Ok((Arc::new(MemBlobStore::new(0)), SpillHome::HostRam))
 }
 
 /// Build the **decode rolling-tier** cold store (a SEPARATE instance from the

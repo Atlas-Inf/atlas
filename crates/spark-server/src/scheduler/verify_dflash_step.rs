@@ -1,40 +1,85 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! DFlash-based verify step (drafted token verification).
+//! Width-generic drafted-token verification (DFlash, MTP K>=5, and repaired GLM K2/K3).
 
 use super::*;
 
-/// DFlash γ-token verify with accept-prefix.
+mod glm_owner;
+mod native_mtp;
+mod split_head;
+mod stats;
+mod think_end;
+mod tree;
+pub use glm_owner::{step_verify_glm_long_batched, step_verify_glm_long_with};
+pub(super) use think_end::accept_with_forced_think_end;
+
+/// Width-generic γ-token verify with accept-prefix. `draft_conf` is the
+/// drafter's confidence in `drafts` (`ActiveSeq::take_drafts`; empty when
+/// not measured).
 ///
-/// Phase 3 minimal-viable implementation: routes `[last_token, drafts...]`
-/// through the eager `decode_verify_dflash` path (which today defaults to
-/// `decode_verify`) and finds the first index where draft ≠ verified
-/// argmax. Tokens 0..first_mismatch are accepted; the verified token at
-/// the mismatch position becomes the bonus token; subsequent drafts are
-/// dropped.
+/// Routes `[last_token, drafts...]` through Atlas's width-generic target
+/// verifier and finds the first index where draft ≠ verified argmax. Tokens
+/// before the first mismatch are accepted; the target token at the mismatch
+/// becomes the bonus token and subsequent drafts are dropped.
 ///
-/// Deferred to Phase 6 (full integration):
-///   * EP=2 broadcast of verify-cmd + drafts (drafter currently runs only
-///     on rank 0; verify on a single-rank target is correct, but EP=2 needs
-///     the broadcast pattern from `step_verify_k2`).
-///   * Per-position logprobs extraction.
-///   * SSM `commit_verify_state_async(num_accepted, k)` loop. Without it,
-///     hybrid models (Qwen3.6-A3B has GDN layers) will see SSM state drift
-///     after γ-verify. Single-token decode unaffected; γ-verify only
-///     correct on pure-attention targets until this is wired.
-///   * `save_hidden_for_mtp` / `save_hidden_for_dflash` hook on the
-///     accepted bonus token (the next propose() needs the latest hidden).
-///   * Sliding-window state rollback for sliding-attention layers
-///     (Gemma-4-style; not used by Qwen3.6 targets).
+/// Remaining DFlash-specific work: sliding-window state rollback for
+/// sliding-attention layers (Gemma-4-style; not used by Qwen3.6 targets).
+#[allow(clippy::too_many_arguments)]
 pub fn step_verify_dflash(
     model: &dyn Model,
     a: &mut ActiveSeq,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
     drafts: &[u32],
+    draft_conf: &[f32],
     num_drafts: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
 ) {
+    if model.native_mtp_enabled() && dflash_verify_raw_argmax {
+        a.abort_on_engine_error("native GLM MTP cannot use the DFlash raw-argmax verifier lane");
+        return;
+    }
+    step_verify_dflash_inner(
+        model,
+        a,
+        sched,
+        drafts,
+        draft_conf,
+        num_drafts,
+        verify_ctx,
+        dflash_verify_raw_argmax,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn step_verify_dflash_inner(
+    model: &dyn Model,
+    a: &mut ActiveSeq,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    drafts: &[u32],
+    draft_conf: &[f32],
+    num_drafts: usize,
+    verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
+    dflash_verify_raw_argmax: bool,
+) {
+    // ATLAS_DFLASH_TREE: a lone greedy sequence verifies a draft tree.
+    if tree::try_step_verify_tree(
+        model,
+        a,
+        sched,
+        num_drafts,
+        verify_ctx,
+        dflash_verify_raw_argmax,
+    ) {
+        return;
+    }
+    // Reject an unsupported sampled request before any worker enters the
+    // verify command and waits for its verdict.
+    if let Err(e) = split_head::ensure_available(model, a) {
+        return a.abort_on_engine_error(format_args!("split verify admission: {e:#}"));
+    }
+    let _step_timer = crate::scheduler::mtp_timing::StepTimer::new(&sched.timing, a.seq.seq_len);
+
     if let Err(e) = model.sync_secondary() {
         tracing::error!("sync_secondary: {e:#}");
         a.engine_error = Some(format!("{e:#}"));
@@ -42,16 +87,64 @@ pub fn step_verify_dflash(
         return;
     }
 
+    // Strict structured output (`strict_spec`): the argmax-only head masks
+    // rows on device, so it walks the matcher for trimmed drafts and row
+    // masks. A full-logits verify masks every row in the host pick pipeline
+    // instead — no walk, no upload, no `MASKED_VERIFY` width flag.
+    let strict = if model.verify_logits_argmax_only() {
+        match super::strict_spec::prepare(a, drafts, model.vocab_size()) {
+            Ok(s) => s,
+            Err(e) => return a.abort_on_engine_error(format_args!("strict verify: {e:#}")),
+        }
+    } else {
+        None
+    };
+    let (drafts, draft_conf) = super::strict_spec::verified_drafts(&strict, drafts, draft_conf);
+
     // tokens = [last_verified, draft_0, draft_1, ..., draft_{γ-1}]
     let mut tokens = Vec::with_capacity(drafts.len() + 1);
     tokens.push(a.last_token);
     tokens.extend_from_slice(drafts);
 
+    // EP rank 1 must execute the same K-row target forward in NCCL lockstep.
+    // F5 is width-generic: K, then K tokens, followed after verification by
+    // the accepted-draft count. Fixed K=2/3/4 retain their established wire
+    // commands, except repaired GLM K2/K3 which needs the explicit verdict hook.
+    // Strict masks are validated and uploaded before anything is sent.
+    if let Err(e) = super::strict_spec::upload(model, &strict) {
+        return a.abort_on_engine_error(format_args!("strict verify: {e:#}"));
+    }
+    if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, 0xFFFFFFF5) {
+        tracing::error!("EP broadcast generic verify cmd: {e:#}");
+        a.finished = true;
+        return;
+    }
+    let width = super::strict_spec::width_word(tokens.len(), &strict);
+    if let Err(e) = model.ep_broadcast_cmd(width) {
+        tracing::error!("EP broadcast generic verify width: {e:#}");
+        a.finished = true;
+        return;
+    }
+    if let Err(e) = model.ep_broadcast_tokens(&tokens) {
+        tracing::error!("EP broadcast generic verify tokens: {e:#}");
+        a.finished = true;
+        return;
+    }
+    if let Err(e) = super::strict_spec::send(model, &strict) {
+        return a.abort_on_engine_error(format_args!("strict verify: {e:#}"));
+    }
+
     // STEP-TIMING (ATLAS_DFLASH_STEP_TIMING=1): split the ~0.88s/step into
     // verify (target M=1+γ forward) vs propose (drafter forward, tail below).
     // The ledger never had this split — it guessed "FFN + double sweep". This
     // measures it. Gated so the hot path pays nothing when the env is unset.
-    let step_timing = std::env::var("ATLAS_DFLASH_STEP_TIMING").ok().as_deref() == Some("1");
+    // Native MTP and DFlash have separate timing switches.
+    let timing_env = if model.native_mtp_enabled() {
+        "ATLAS_MTP_TIMING"
+    } else {
+        "ATLAS_DFLASH_STEP_TIMING"
+    };
+    let step_timing = std::env::var(timing_env).ok().as_deref() == Some("1");
     let t_verify = std::time::Instant::now();
     let verified_argmax = match model.decode_verify_dflash(&tokens, &mut a.seq, 0) {
         Ok(v) => v,
@@ -62,28 +155,122 @@ pub fn step_verify_dflash(
             return;
         }
     };
+    sched
+        .timing
+        .record(crate::scheduler::mtp_timing::Phase::VerifyForward, t_verify);
     let verify_ms = if step_timing {
         t_verify.elapsed().as_secs_f64() * 1000.0
     } else {
         0.0
     };
     a.last_token_time = Instant::now();
+    verify_dflash_tail(
+        model,
+        a,
+        sched,
+        drafts,
+        draft_conf,
+        num_drafts,
+        verify_ctx,
+        dflash_verify_raw_argmax,
+        &tokens,
+        verified_argmax,
+        step_timing,
+        verify_ms,
+        false,
+        strict.as_ref().is_none_or(|s| !s.dead),
+    );
+}
+
+/// Everything after the target forward: verdict, EP verdict word, rollback,
+/// repair record, emission, commit and re-propose for ONE sequence. Shared by
+/// the per-sequence verify and each owner of the owner-batched GLM verify.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn verify_dflash_tail(
+    model: &dyn Model,
+    a: &mut ActiveSeq,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    drafts: &[u32],
+    draft_conf: &[f32],
+    num_drafts: usize,
+    verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
+    dflash_verify_raw_argmax: bool,
+    tokens: &[u32],
+    verified_argmax: Vec<u32>,
+    step_timing: bool,
+    verify_ms: f64,
+    defer_propose: bool,
+    // False for a strict verify carrying only a dead draft (`strict_spec`):
+    // it says nothing about the drafter.
+    record_stats: bool,
+) -> Option<usize> {
+    let native_mtp = model.native_mtp_enabled();
     let raw_trace = if std::env::var("ATLAS_LIGHTNING_VERIFY_TOKEN_TRACE").as_deref() == Ok("1") {
         Some(verified_argmax.clone())
     } else {
         None
     };
 
-    // DFlash drafter proposes on raw argmax; when dflash_verify_raw_argmax is set
-    // (process-wide DFlash mode), skip the rep_pen/DRY pipeline so verifier and
-    // drafter judge on the SAME (GOLD) basis. For non-DFlash callers (unreachable
-    // today since step_verify_dflash is only dispatched at drafts.len()>=4 which
-    // only DFlash produces), apply the full pre-sample pipeline as in K=2/3/4.
-    let verified = if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
-        dflash_verify_raw_argmax,
-        sched.levers.dflash_masked_verify,
-        model.is_lightning_dspark_product(),
+    // Score the same processed rows as serial decode when requested. Plain
+    // requests retain the existing raw/masked selection paths.
+    let Ok(scored) = super::verify_pipeline_helper::scored::requested(
+        model,
+        verified_argmax.len(),
         a,
+        verify_ctx,
+        0,
+        Some(drafts),
+    ) else {
+        return None;
+    };
+    // An argmax-only split head that can sample picks every other sequence's
+    // rows through its exchange (`split_rows`): a sampled row accepts its
+    // draft only while it matches the sampled pick.
+    let (raw, masked) = (dflash_verify_raw_argmax, sched.levers.dflash_masked_verify);
+    let split_rows = scored.is_none()
+        && crate::scheduler::helpers::dflash_seq_uses_split_rows(
+            raw,
+            masked,
+            model,
+            a,
+            &verified_argmax,
+        );
+    // An exact verify (`Model::verify_bit_exact`, `ATLAS_EXACT_VERIFY`): the
+    // rows are serial decode's logits, so each is picked through serial
+    // decode's pipeline against the state serial decode would hold there
+    // (`exact_picks`), never the raw argmax.
+    let exact = scored.is_none() && !split_rows && exact_picks(raw, model.verify_bit_exact());
+    let mut verified = if let Some(scored) = &scored {
+        scored.tokens.clone()
+    } else if exact {
+        crate::scheduler::verify_pipeline_helper::verify_pick_prefix_with_pipeline(
+            model,
+            &verified_argmax,
+            drafts,
+            a,
+            verify_ctx,
+            0,
+        )
+    } else if split_rows {
+        match crate::scheduler::verify_pipeline_helper::split_verify_picks(
+            model,
+            &verified_argmax,
+            drafts,
+            a,
+            verify_ctx,
+        ) {
+            Ok(picks) => picks,
+            Err(e) => {
+                split_head::abort_exchange(model, a, "sampled picks", &e);
+                return None;
+            }
+        }
+    } else if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
+        raw,
+        masked,
+        model,
+        a,
+        &verified_argmax,
     ) {
         verified_argmax
     } else {
@@ -106,20 +293,30 @@ pub fn step_verify_dflash(
     // prediction for what should follow `tokens[i]`). drafts[i] was the
     // proposer's guess for the same slot. First mismatch terminates the
     // accepted prefix; verified[first_mismatch] becomes the bonus token.
-    let mut num_accepted = 0usize;
-    for i in 0..drafts.len() {
-        if i + 1 >= verified.len() {
-            break;
-        }
-        if drafts[i] == verified[i] {
-            num_accepted += 1;
-        } else {
-            break;
-        }
-    }
+    // An exhausted thinking budget may end the step early at `</think>`.
+    let num_accepted = if scored.is_some() || split_rows || exact {
+        // The full pipeline already enforces thinking boundaries per position.
+        // Split picks enforce them with each row's shadow state; replaying the
+        // raw helper would use the restored pre-span fence.
+        drafts
+            .iter()
+            .zip(&verified)
+            .take_while(|(d, v)| d == v)
+            .count()
+            .min(verified.len().saturating_sub(1))
+    } else {
+        accept_with_forced_think_end(
+            a,
+            verify_ctx.think_end_token,
+            verify_ctx.boundary_mask.as_deref(),
+            drafts,
+            &mut verified,
+        )
+    };
     if let Some(raw) = raw_trace {
         tracing::info!(
-            "LIGHTNING VERIFY TOKEN TRACE last={} drafts={:?} raw={:?} processed={:?} accepted={}",
+            "LIGHTNING VERIFY TOKEN TRACE slot={} last={} drafts={:?} raw={:?} processed={:?} accepted={}",
+            a.seq.slot_idx,
             a.last_token,
             drafts,
             raw,
@@ -138,28 +335,23 @@ pub fn step_verify_dflash(
         );
     }
 
-    // Logprobs for the tokens this step emits: the accepted prefix plus the
-    // bonus, which is exactly `verified[0..=num_accepted]` because an accepted
-    // draft is by definition equal to `verified` at that index. Extracted here,
-    // before `commit_ctx` reuses the logits buffer — the same ordering the
-    // verify_k2/k3/k4 paths use.
-    //
-    // Without this the DFlash path emitted every token with `logprobs: None`,
-    // so a request that asked for logprobs got the OpenAI four-array shape back
-    // filled entirely with nulls: structurally valid, informationally empty,
-    // and indistinguishable from "this model has no logprobs". The MTP verify
-    // paths have always extracted them; only this one did not. Gated on the
-    // request, so an ordinary run copies no logits and pays nothing.
-    let verify_lps = if let Some(k_logprobs) = a.top_logprobs {
-        let upto = (num_accepted + 1).min(verified.len());
-        extract_verify_logprobs(model, &verified[..upto], k_logprobs, 0)
-    } else {
-        Vec::new()
-    };
+    let verify_lps = scored.map(|s| s.logprobs).unwrap_or_default();
 
-    // Adaptive speculation (ATLAS_DFLASH_ADAPTIVE=1): feed the rolling
-    // accept window; may suspend this seq's speculation (see adaptive_spec).
-    crate::scheduler::adaptive_spec::record_verify(a, num_accepted, sched);
+    if let Err(e) = model.ep_broadcast_cmd(num_accepted as u32) {
+        tracing::error!("EP broadcast generic verify result: {e:#}");
+        a.finished = true;
+        return None;
+    }
+    if record_stats {
+        stats::record(
+            a,
+            sched,
+            (drafts, draft_conf),
+            &verified,
+            num_accepted,
+            dflash_verify_raw_argmax,
+        );
+    }
 
     // Roll back the over-extended `seq_len` and `seq.tokens`. The verify
     // advanced both by `tokens.len() = γ+1` (all γ drafts + the prefix
@@ -188,25 +380,49 @@ pub fn step_verify_dflash(
     // Unified ctx commit (ATLAS_DFLASH_UNIFIED_CTX=1): ONE unconditional
     // commit at the K=gamma point — rows 0..=num_accepted at RoPE base
     // pre_verify_len. Structural replacement for dflash_eagle_kgamma_append.
-    if sched.levers.dflash_unified_ctx {
-        if let Err(e) = model.commit_ctx(&mut a.seq, num_accepted + 1, pre_verify_len) {
-            tracing::error!("commit_ctx (kgamma): {e:#}");
-        }
-    } else {
-        let eagle_fix = std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref() == Some("1");
-        if eagle_fix
-            && let Err(e) =
-                model.dflash_eagle_kgamma_append(&mut a.seq, num_accepted, pre_verify_len)
-        {
-            tracing::error!("dflash_eagle_kgamma_append: {e:#}");
+    if !native_mtp {
+        if sched.levers.dflash_unified_ctx {
+            if let Err(e) = model.commit_ctx(&mut a.seq, num_accepted + 1, pre_verify_len) {
+                tracing::error!("commit_ctx (kgamma): {e:#}");
+            }
+        } else {
+            let eagle_fix = std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref() == Some("1");
+            if eagle_fix
+                && let Err(e) =
+                    model.dflash_eagle_kgamma_append(&mut a.seq, num_accepted, pre_verify_len)
+            {
+                tracing::error!("dflash_eagle_kgamma_append: {e:#}");
+            }
         }
     }
 
-    // Emit accepted drafts.
+    // Item #2 (STree-style in-place verify commit). h_state is canonical:
+    //  - num_accepted == k_verify (full accept): no-op (h_state already correct)
+    //  - 0 < num_accepted < k_verify (partial): intermediate[total_accepted-1] → h_state
+    // No checkpoint write needed — the next start_checkpoint_async syncs.
+    // k_verify counts the prefix bonus position, which is verified too.
+    // Committed BEFORE emission: an emit below can finish the sequence and
+    // return, and `finish_sequence` then caches `seq.tokens` with the live
+    // recurrent state. The worker rank has already committed these rows (it
+    // acts on the verdict word above), so a head that returned first kept a
+    // state that matched neither `seq.tokens` nor the other rank.
+    // The rows the target verified: an owner of a batch with dead rows
+    // judges fewer drafts than it verified rows.
+    let k_verify = tokens.len();
+    let total_accepted = num_accepted + 1; // bonus is always "accepted"
+    if let Err(e) = model.commit_accepted_prefix(&mut a.seq, total_accepted, k_verify) {
+        tracing::error!("commit_accepted_prefix (dflash): {e:#}");
+        a.engine_error = Some(format!("{e:#}"));
+        a.finished = true;
+        return None;
+    }
+
+    // Emit the accepted drafts, each row checked at its own position.
     for i in 0..num_accepted {
-        emit_token(a, drafts[i], verify_lps.get(i).cloned(), sched);
+        let lp = verify_lps.get(i).cloned();
+        emit_span_row(a, drafts[i], lp, sched, i, total_accepted);
         if a.finished {
-            return;
+            return None;
         }
     }
 
@@ -214,17 +430,21 @@ pub fn step_verify_dflash(
     // at the first mismatch, or the next-prediction past the full-accept case).
     let bonus_idx = num_accepted;
     if bonus_idx < verified.len() {
-        let bonus = verified[bonus_idx];
-        emit_token(a, bonus, verify_lps.get(bonus_idx).cloned(), sched);
+        let (bonus, lp) = (verified[bonus_idx], verify_lps.get(bonus_idx).cloned());
+        emit_span_row(a, bonus, lp, sched, bonus_idx, total_accepted);
         if a.finished {
-            return;
+            return None;
         }
         a.last_token = bonus;
     }
 
     crate::metrics::SPEC_DECODE_VERIFY
         .with_label_values(&[
-            "dflash",
+            if dflash_verify_raw_argmax {
+                "dflash"
+            } else {
+                "mtp"
+            },
             if num_accepted == drafts.len() {
                 "accept_all"
             } else {
@@ -233,8 +453,8 @@ pub fn step_verify_dflash(
         ])
         .inc();
 
-    tracing::info!(
-        "DFLASH K=γ verify: γ={} accepted={}/{} ({:.0}%) seq_len={}",
+    tracing::debug!(
+        "K=γ verify: γ={} accepted={}/{} ({:.0}%) seq_len={}",
         drafts.len(),
         num_accepted,
         drafts.len(),
@@ -242,45 +462,67 @@ pub fn step_verify_dflash(
         a.seq.seq_len,
     );
 
-    // Item #2 (STree-style in-place verify commit). h_state is canonical:
-    //  - num_accepted == k_verify (full accept): no-op (h_state already correct)
-    //  - 0 < num_accepted < k_verify (partial): intermediate[total_accepted-1] → h_state
-    // No checkpoint write needed — the next start_checkpoint_async syncs.
-    //
-    // k_verify = drafts.len() + 1 (the prefix bonus position is also verified).
-    let k_verify = drafts.len() + 1;
-    let total_accepted = num_accepted + 1; // bonus is always "accepted"
-    if let Err(e) = model.commit_accepted_prefix(&mut a.seq, total_accepted, k_verify) {
-        tracing::error!("commit_accepted_prefix (dflash): {e:#}");
-        a.engine_error = Some(format!("{e:#}"));
-        a.finished = true;
-        return;
-    }
-
-    // DFlash hidden is captured per-layer inside the verify graph
-    // (verify_d.rs try_dflash_capture at position k-1), mirroring verify_b.rs.
-    // No post-loop save needed; calling save_dflash_hidden_for_propose here
-    // would overwrite the correct per-layer intermediates with a repeated
-    // final-layer hidden, collapsing all 5 slots to the same value.
     let bonus_token_idx = total_accepted.saturating_sub(1);
-    // Stream-highway drafters (qwen4_exp MTP) read row 0 of the mHC streams:
-    // select the accepted row first, as the K=2/3 steps do.
-    if let Err(e) = model.select_mtp_stream_row(bonus_token_idx) {
-        tracing::error!("select_mtp_stream_row (dflash): {e:#}");
-    }
-    if let Err(e) = model.save_hidden_for_mtp(bonus_token_idx, 0) {
-        tracing::error!("save_hidden_for_mtp (dflash): {e:#}");
-    }
-
-    if let Err(e) = model.trim_proposer_state(&mut a.seq, num_accepted, 0) {
-        tracing::error!("trim_proposer_state: {e:#}");
+    if !native_mtp::save_and_repair(
+        model,
+        a,
+        drafts,
+        num_accepted,
+        pre_verify_len,
+        bonus_token_idx,
+    ) {
+        return None;
     }
 
+    propose_after_verify(
+        model,
+        a,
+        sched,
+        num_drafts,
+        dflash_verify_raw_argmax,
+        defer_propose,
+        bonus_token_idx,
+        (step_timing, verify_ms, tokens.len(), num_accepted),
+    )
+}
+
+/// The re-propose after a verify's commit and emission (shared by the chain
+/// and the tree verify): the next drafts, or `Some(width)` for an
+/// owner-batched caller that proposes every owner in one pass
+/// (`defer_propose`). The last argument is the step-timing switch, the
+/// verify's ms, its rows and its accepted drafts, for the STEP_TIMING line.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn propose_after_verify(
+    model: &dyn Model,
+    a: &mut ActiveSeq,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    num_drafts: usize,
+    dflash_verify_raw_argmax: bool,
+    defer_propose: bool,
+    bonus_token_idx: usize,
+    (step_timing, verify_ms, k_rows, num_accepted): (bool, f64, usize, usize),
+) -> Option<usize> {
+    let native_mtp = model.native_mtp_enabled();
     // Re-propose for next step — unless adaptive speculation just suspended
     // this seq (no drafts → the scheduler serial-decodes it via bootstrap).
     let _mtp_grammar_mask = mtp_grammar_mask_for(a);
     let t_propose = std::time::Instant::now();
     if crate::scheduler::adaptive_spec::spec_allowed(a, sched) {
+        let next_num_drafts = if dflash_verify_raw_argmax {
+            num_drafts
+        } else {
+            a.mtp_acct.depth_drafts(
+                num_drafts,
+                crate::scheduler::mtp_deep_depth::DepthLevers {
+                    deep: false,
+                    ..sched.levers.depth()
+                },
+            )
+        };
+        // Owner-batched callers propose every owner in one drafter pass.
+        if defer_propose && _mtp_grammar_mask.is_none() {
+            return Some(next_num_drafts);
+        }
         let proposal: anyhow::Result<Vec<u32>> =
             if model.mtp_propose_batch_min() == 1 && _mtp_grammar_mask.is_none() {
                 let one_token = [a.last_token];
@@ -291,7 +533,7 @@ pub fn step_verify_dflash(
                     &one_token,
                     &one_position,
                     &one_stash,
-                    num_drafts,
+                    next_num_drafts,
                     &mut one_seq,
                     0,
                     None,
@@ -310,15 +552,19 @@ pub fn step_verify_dflash(
                 model.run_mtp_propose_multi(
                     a.last_token,
                     a.seq.seq_len,
-                    num_drafts,
+                    next_num_drafts,
                     &mut a.seq,
                     0,
                     _mtp_grammar_mask.as_deref(),
                 )
             };
         match proposal {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
+            Ok(d) if !d.is_empty() => a.set_proposed_drafts(d),
             Ok(_) => {
+                if native_mtp {
+                    a.abort_on_engine_error("native GLM MTP re-propose returned no drafts");
+                    return None;
+                }
                 // Lightning product fail-closed boundary: an empty
                 // re-propose is an admission violation, not a silent
                 // serial-decode fallback on the next bootstrap.
@@ -327,25 +573,66 @@ pub fn step_verify_dflash(
                     a,
                     crate::scheduler::helpers::ProposalOutcome::Empty,
                 );
+                if spark_model::speculative::glm_repair_policy::enabled() {
+                    a.finished = true;
+                }
             }
             Err(e) => {
+                if native_mtp {
+                    a.abort_on_engine_error(format_args!(
+                        "native GLM MTP re-propose failed: {e:#}"
+                    ));
+                    return None;
+                }
                 tracing::error!("run_mtp_propose_multi (dflash): {e:#}");
                 crate::scheduler::helpers::handle_dspark_repropose_failure(
                     model,
                     a,
                     crate::scheduler::helpers::ProposalOutcome::Error,
                 );
+                if spark_model::speculative::glm_repair_policy::enabled() {
+                    a.finished = true;
+                }
             }
         }
     }
+    sched
+        .timing
+        .record(crate::scheduler::mtp_timing::Phase::Propose, t_propose);
     if step_timing {
         let propose_ms = t_propose.elapsed().as_secs_f64() * 1000.0;
         tracing::info!(
-            "DFLASH STEP_TIMING: verify={:.1}ms propose={:.1}ms (K={}, accepted={})",
+            "{} STEP_TIMING: verify={:.1}ms propose={:.1}ms (K={}, accepted={})",
+            if native_mtp { "MTP" } else { "DFLASH" },
             verify_ms,
             propose_ms,
-            tokens.len(),
+            k_rows,
             num_accepted,
         );
     }
+    None
 }
+
+/// Whether a DFlash verify (`raw_lane`: `--dflash`'s raw-argmax lane) picks
+/// its rows through the per-position pipeline instead: under an exact verify
+/// (`Model::verify_bit_exact`), whose rows are serial decode's logits.
+///
+/// The raw argmax skips every stateful stage serial decode runs per token.
+/// [`accept_with_forced_think_end`] only honours a `</think>` armed before the
+/// step, so a block crossing the thinking budget, completing F2's confidence
+/// streak or tripping the think-loop watchdog accepted past the point serial
+/// decode closes the reasoning. The pipeline picks row `i` against the state
+/// after committing rows `0..i` (`emit_step::SpanShadow`, MTP's verify):
+/// budget, F2, watchdog, sentence deferral, fences, penalties, bias, grammar,
+/// the min_tokens ban, content-loop steers, and the request's sampling at
+/// T>0 (each row drawn from its processed logits, seeded by position), with
+/// each stage's effect applied once per committed token (`PickEffects`).
+/// Off the exact verify the raw-argmax lane is unchanged.
+pub(super) fn exact_picks(raw_lane: bool, verify_bit_exact: bool) -> bool {
+    raw_lane && verify_bit_exact
+}
+
+#[cfg(test)]
+mod exact_pick_tests;
+#[cfg(test)]
+mod masked_path_tests;

@@ -75,20 +75,30 @@ pub fn dump_gate_input(
     Ok(())
 }
 
-/// Log the top-10 gate logits at the last token (post-matmul, pre-softmax).
+/// Log the top-10 gate logits at the last token (post-matmul, pre-softmax);
+/// `f32`: the logits are FP32, else BF16.
 pub fn dump_gate_logits(
     gpu: &dyn GpuBackend,
     stream: u64,
     gate_logits: DevicePtr,
     n: u32,
     num_experts: u32,
+    f32: bool,
 ) -> Result<()> {
     if !enabled() {
         return Ok(());
     }
     gpu.synchronize(stream)?;
-    let offset = (n - 1) as usize * num_experts as usize * 2;
-    let logits = read_bf16_row(gpu, gate_logits, offset, num_experts as usize);
+    let row = (n - 1) as usize * num_experts as usize;
+    let logits = if f32 {
+        let mut buf = vec![0u8; num_experts as usize * 4];
+        let _ = gpu.copy_d2h(gate_logits.offset(row * 4), &mut buf);
+        buf.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    } else {
+        read_bf16_row(gpu, gate_logits, row * 2, num_experts as usize)
+    };
     let mut idx_val: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
     idx_val.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let top10: Vec<(usize, f32)> = idx_val.iter().take(10).copied().collect();

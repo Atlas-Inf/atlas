@@ -13,7 +13,9 @@ fn parse(extra: &[&str]) -> ServeArgs {
     argv.extend_from_slice(extra);
     match super::super::Cli::parse_from(argv).command {
         super::super::Command::Serve(a) => a,
-        super::super::Command::Benchmark(_) => unreachable!("this test parses a serve command"),
+        super::super::Command::Benchmark(_) | super::super::Command::DisplayCarveout(_) => {
+            unreachable!("this test parses a serve command")
+        }
     }
 }
 
@@ -125,6 +127,23 @@ fn exact_verify_refuses_the_f16_h_state() {
         ]))
         .is_ok()
     );
+}
+
+#[test]
+fn the_dense_exact_verify_switch_refuses_the_f16_h_state() {
+    // `ATLAS_EXACT_VERIFY=1` runs the same FP32 GDN chain as `--exact-verify`,
+    // so the pair with an FP16 h-state is refused the same way (the env is
+    // read by the caller; this is the pure rule).
+    let msgs = |v: Vec<Violation>| v.into_iter().map(|x| x.what).collect::<Vec<_>>();
+    assert_eq!(
+        msgs(exact_verify_h_f16(None, true, true)),
+        ["ATLAS_EXACT_VERIFY=1 together with --ssm-h-dtype f16"]
+    );
+    assert_eq!(msgs(exact_verify_h_f16(Some(true), true, true)).len(), 2);
+    // POSITIVE controls: either side alone, or an explicit flag off.
+    assert!(exact_verify_h_f16(None, true, false).is_empty());
+    assert!(exact_verify_h_f16(None, false, true).is_empty());
+    assert!(exact_verify_h_f16(Some(false), false, true).is_empty());
 }
 
 #[test]
@@ -353,4 +372,24 @@ fn dflash_refuses_the_f16_h_state() {
         validate_serve_args(&parse(&["--dflash", "--ssm-h-dtype", "f32"])).is_ok(),
         "the FP32 h-state has always been DFlash's supported pairing"
     );
+}
+
+#[test]
+fn a_non_rung_batch_width_above_32_is_refused() {
+    // 36 pads to the 48 rung; per-row buffers sized to 36 are overrun (reiner 691).
+    let err = validate_serve_args(&parse(&["--max-batch-size", "36"])).unwrap_err();
+    assert!(
+        err.contains("--max-batch-size 36 is not a decode padding rung"),
+        "{err}"
+    );
+    assert!(
+        err.contains("48"),
+        "the message names the rung to use: {err}"
+    );
+    for ok in ["1", "20", "32", "48", "64", "96", "128"] {
+        assert!(
+            validate_serve_args(&parse(&["--max-batch-size", ok])).is_ok(),
+            "--max-batch-size {ok} must stay valid"
+        );
+    }
 }

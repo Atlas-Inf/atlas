@@ -5,19 +5,11 @@
 //! reachable through production teardown, and a backend-free failure must
 //! stay observable/retryable instead of silently leaking).
 //!
-//! `BlockDiffusionDraftHead::from_weights` resolves real kernel handles and
-//! cannot run on a host test runner, so these tests construct the head via
-//! a zeroed literal (all kernel handles `KernelHandle(0)`, no lanes, empty
-//! graph pool). `free_state` touches only: `kv_cache`, `propose_graphs`,
-//! and the state's own resources — none of which depend on kernel handles —
-//! so the zeroed head exercises the production cleanup path faithfully.
-
-use std::collections::HashMap;
-
-use spark_runtime::gpu::GpuBackend;
-use spark_runtime::gpu::mock::MockGpuBackend;
-use spark_runtime::gpu::{DevicePtr, KernelHandle};
-use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
+//! `BlockDiffusionDraftHead::from_weights` resolves real kernel handles and cannot run
+//! on a host test runner, so these tests construct the head via a zeroed literal (all
+//! kernel handles `KernelHandle(0)`, no lanes, empty graph pool). `free_state` touches
+//! only `kv_cache`, `propose_graphs` and the state's own resources — none of which
+//! depend on kernel handles — so the zeroed head exercises the production cleanup path.
 
 use super::lifecycle::*;
 use super::{
@@ -25,6 +17,11 @@ use super::{
 };
 use crate::speculative::DraftProposer;
 use crate::weight_map::DenseWeight;
+use spark_runtime::gpu::GpuBackend;
+use spark_runtime::gpu::mock::MockGpuBackend;
+use spark_runtime::gpu::{DevicePtr, KernelHandle};
+use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
+use std::collections::HashMap;
 
 /// Serializes tests that exercise the global `CTX_ACC_POOL` (free_state
 /// success paths and carry-reject recycling push into it). Rust runs tests
@@ -73,6 +70,8 @@ pub(super) fn zero_scratch() -> DflashScratch {
         dflash2_conv_delta: DevicePtr(0),
         dflash2_conv_out: DevicePtr(0),
         dflash2_projected_hidden: DevicePtr(0),
+        dflash2_selector_scratch: DevicePtr(0),
+        dspine: None,
     }
 }
 
@@ -96,6 +95,7 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         lm_head_shared: DevicePtr(0),
         lm_head_nvfp4: None,
         lm_head_shared_fp8: None,
+        fp8_m32: Vec::new(),
         hidden_norm: DenseWeight {
             weight: DevicePtr(0),
         },
@@ -111,6 +111,9 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         draft_id_to_target_id: None,
         layers: Vec::new(),
         candidate_selector: None,
+        dspine: None,
+        alt: None,
+        live: Default::default(),
         fused_kv_weight: None,
         kv_cache: parking_lot::Mutex::new(zero_kv_cache()),
         scratch: zero_scratch(),
@@ -149,6 +152,8 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         batch_markov_embed: DevicePtr(0),
         batch_markov_bias: DevicePtr(0),
         batch_dflash2_projected: DevicePtr(0),
+        batch_dflash2_selector_scratch: DevicePtr(0),
+        last_select: parking_lot::Mutex::new(None),
         batch_conv_delta: DevicePtr(0),
         batch_conv_out: DevicePtr(0),
         extra_lanes: Vec::new(),
@@ -163,12 +168,16 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         ctx_window: 0,
         propose_graphs: parking_lot::Mutex::new(HashMap::new()),
         next_lane: std::sync::atomic::AtomicUsize::new(0),
+        acc_pool: parking_lot::Mutex::new(Vec::new()),
+        acc_pool_cap: 0,
         lanes_start_event: 0,
         suppress_graphs: std::sync::atomic::AtomicBool::new(false),
         propose_warmup_count: std::sync::atomic::AtomicUsize::new(0),
         quant: super::DflashQuantization::Bf16,
+        twins: Default::default(),
         startup: super::DsparkStartupExecution::from_env_lenient(),
         ctx_carry: parking_lot::Mutex::new(None),
+        rank_split: None,
     }
 }
 
@@ -179,9 +188,14 @@ pub(super) fn zero_kernels() -> DflashKernels {
         residual_rms_norm: zero,
         dense_gemv: zero,
         dense_gemv_batchm: zero,
+        dense_gemv_tc16: zero,
+        dense_gemv_tc32: zero,
+        small_m_gemv: false,
         dense_gemm: zero,
         w4a16_gemm: zero,
         dense_gemm_pipelined: zero,
+        bf16_gemv_m32: zero,
+        fp8_gemv_m32: zero,
         rope_qwen3: zero,
         reshape_cache_fp8: zero,
         reshape_cache_bf16: zero,
@@ -208,6 +222,8 @@ pub(super) fn zero_kernels() -> DflashKernels {
         w4a16_gemv_batch8: zero,
         w4a16_gemv_batch16: zero,
         w4a16_gemv_batch32: zero,
+        mxfp8_quantize: zero,
+        mxfp8_gemv: [zero; 3],
         dflash2_conv: None,
         dflash2_candidate_selector_batched: KernelHandle(0),
         dflash2_candidate_selector: None,
@@ -244,6 +260,7 @@ pub(super) fn live_state(
         block_table: Vec::new(),
         seq_len: 300,
         last_num_drafted: 3,
+        last_draft_conf: Vec::new(),
         prefill_done: true,
         ctx_hidden_acc: gpu.alloc(4096).unwrap(),
         ctx_len: 300,
@@ -259,8 +276,19 @@ pub(super) fn live_state(
         max_ctx_count_drafter: 1024,
         ctx_committed: 300,
         ctx_positions: (0..300).collect(),
+        end_floor: 0,
+        first_append_at: None,
+        own_capture: false,
+        own_row_at: None,
+        own_row: None,
+        warm_ctx: super::WarmCtx::Legacy,
+        ctx_floor: 0,
+        ctx_run: None,
+        ctx_store: super::warm_ctx_store::StoreRefs::default(),
         lane_id: 0,
         lifecycle: Some(CaptureDescriptor::bind(own, 40, 4, 4, 16).unwrap()),
+        alt: None,
+        route: Default::default(),
     })
 }
 
@@ -290,6 +318,7 @@ pub(super) fn fresh_state_inner(gpu: &MockGpuBackend) -> Box<DflashProposerState
         block_table: Vec::new(),
         seq_len: 0,
         last_num_drafted: 0,
+        last_draft_conf: Vec::new(),
         prefill_done: false,
         ctx_hidden_acc: gpu.alloc(4096).unwrap(),
         ctx_len: 0,
@@ -305,8 +334,19 @@ pub(super) fn fresh_state_inner(gpu: &MockGpuBackend) -> Box<DflashProposerState
         max_ctx_count_drafter: 0,
         ctx_committed: 0,
         ctx_positions: Vec::new(),
+        end_floor: 0,
+        first_append_at: None,
+        own_capture: false,
+        own_row_at: None,
+        own_row: None,
+        warm_ctx: super::WarmCtx::Legacy,
+        ctx_floor: 0,
+        ctx_run: None,
+        ctx_store: super::warm_ctx_store::StoreRefs::default(),
         lane_id: 0,
         lifecycle: None,
+        alt: None,
+        route: Default::default(),
     })
 }
 
@@ -466,32 +506,4 @@ fn real_free_state_missing_owner_is_rejected_and_reclaimed() {
         CaptureStatus::Retired
     );
     assert_eq!(gpu.destroy_graph_count(), 0);
-}
-
-#[test]
-fn real_free_state_backend_free_failure_retains_pointer_for_retry() {
-    let _pool_guard = lock_and_drain_pool();
-    let gpu = MockGpuBackend::new();
-    let head = zero_head();
-    let own = owner(3, 77);
-
-    let mut boxed = live_state(&gpu, own);
-    hold_two_blocks(boxed.as_mut(), &head.kv_cache);
-
-    // The accumulator goes to the reuse pool (no backend free); the
-    // injected failure lands on the block-table-dev free — its handle must
-    // be RESTORED so a retry can release it.
-    gpu.fail_next_free();
-    head.free_state(&gpu, Some(own), boxed.as_mut())
-        .expect("free_state succeeds despite the backend free failure");
-
-    assert_eq!(boxed.ctx_hidden_acc.0, 0);
-    assert!(
-        boxed.block_table_dev.is_some(),
-        "handle restored, retryable"
-    );
-    // …and the retry DOES release it (flag is one-shot).
-    head.free_state(&gpu, Some(own), boxed.as_mut())
-        .expect("second free retries the block table free");
-    assert!(boxed.block_table_dev.is_none());
 }

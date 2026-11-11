@@ -200,22 +200,48 @@ void w8a16_gemm_n_m128(
         } \
     } while(0)
 
+    // Interior CTAs (whole 128x128 tile inside M x N, K % 16 == 0 so every 16-B load is
+    // aligned and in bounds) run a loop whose loads carry no per-load bounds or alignment
+    // branches; the per-element fallback paths of W8N128_LOAD_REGS are unrolled into the hot
+    // loop otherwise (615 instructions per 32-K step for 16 WMMA on gfx1151). Edge CTAs keep
+    // the general loop. Both load the same bytes, so the result is identical.
+    #define W8N128_LOAD_REGS_INTERIOR(kb, ra, rb, rs) do { \
+        _Pragma("unroll") \
+        for (int rnd = 0; rnd < 2; rnd++) { \
+            unsigned int row = (unsigned int)(rnd * 64) + a_row_base; \
+            (ra)[rnd] = *(const uint4*)&A[(unsigned long long)(cta_m + row) * K + (kb) + a_col]; \
+        } \
+        (rb) = *(const uint4*)&B[(unsigned long long)(cta_n + b_n) * K + (kb) + b_koff]; \
+        (rs) = block_scale[(unsigned long long)n_block * k_scale_blocks + ((kb) >> 7)]; \
+    } while(0)
+
+    #define W8N128_MAIN_LOOP(LOAD) do { \
+        LOAD(0, reg_A, reg_B, reg_S); \
+        W8N128_STORE_TILE(0, reg_A, reg_B, reg_S); \
+        __syncthreads(); \
+        int cur = 0; \
+        for (unsigned int k_base = W8N128_KSTEP; k_base < K; k_base += W8N128_KSTEP) { \
+            int nxt = 1 - cur; \
+            LOAD(k_base, reg_A, reg_B, reg_S);                /* global->regs in flight */ \
+            W8N128_COMPUTE(cur, cur);                        /* WMMA overlaps the loads */ \
+            W8N128_STORE_TILE(nxt, reg_A, reg_B, reg_S);     /* regs->smem (+ B dequant) */ \
+            __syncthreads(); \
+            cur = nxt; \
+        } \
+        W8N128_COMPUTE(cur, cur); \
+    } while(0)
+
     uint4 reg_A[2], reg_B;
     float reg_S;
-    W8N128_LOAD_REGS(0, reg_A, reg_B, reg_S);
-    W8N128_STORE_TILE(0, reg_A, reg_B, reg_S);
-    __syncthreads();
-
-    int cur = 0;
-    for (unsigned int k_base = W8N128_KSTEP; k_base < K; k_base += W8N128_KSTEP) {
-        int nxt = 1 - cur;
-        W8N128_LOAD_REGS(k_base, reg_A, reg_B, reg_S);   // global->regs in flight
-        W8N128_COMPUTE(cur, cur);                        // WMMA overlaps the loads
-        W8N128_STORE_TILE(nxt, reg_A, reg_B, reg_S);     // regs->smem (+ B dequant)
-        __syncthreads();
-        cur = nxt;
+    const bool interior = (cta_m + W8N128_M_TILE <= M) && (cta_n + W8N128_N_TILE <= N) && ((K & 15) == 0);
+    if (interior) {
+        W8N128_MAIN_LOOP(W8N128_LOAD_REGS_INTERIOR);
+    } else {
+        W8N128_MAIN_LOOP(W8N128_LOAD_REGS);
     }
-    W8N128_COMPUTE(cur, cur);
+
+    #undef W8N128_MAIN_LOOP
+    #undef W8N128_LOAD_REGS_INTERIOR
 
     #undef W8N128_LOAD_REGS
     #undef W8N128_STORE_TILE

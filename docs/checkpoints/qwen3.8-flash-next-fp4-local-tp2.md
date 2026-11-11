@@ -1,0 +1,272 @@
+# Qwen3.8-Flash-Next FP4-Local on two GB10s (TP=EP=2): resident n-grams, native formats
+
+The two-Spark continuation of [qwen3.8-flash-next-fp4-local.md](qwen3.8-flash-next-fp4-local.md)
+(PR #195). `nvidia/Qwen3.8-Flash-Next-FP4-Local` (snapshot `b9ce18a6887e18c089fdea8509a33e63429a3300`)
+served by Atlas on two DGX Sparks joined by one ConnectX-7 cable, tensor and expert parallel
+(`--tp-size 2 --ep-size 2`), with the 28.8 GB NVFP4 PLE n-gram table held **resident in device
+memory on both ranks**. That is the thing one Spark cannot do: there the table stays on NVMe behind a
+RAM row cache (§4 of the single-Spark doc).
+
+**Status.** It serves and is exact where exactness is claimed (§3a lists each contract and what
+proves it). Greedy output with speculation equals serial greedy output (8/8 at 1 and 8 concurrent
+streams) after every change below. The resident table is bit-identical to the NVMe-cached path. On
+the final head, BFCL golden ST-995 is 87.04 / 85.75 (n=995) and the MLPerf agentic performance leg
+completes 1,007 / 1,007 turns. All numbers are from one pair (two
+GB10s, driver 580, CUDA 13.0, cuBLAS 13.0.2.14 pinned on both ranks) with the rc16 TP2 profile: util
+0.88, 8 sequences x 32K, MTP 7 drafts, exact verify, prefix cache, `reasoning_effort` low. Single runs
+unless repetitions are listed.
+
+## 1. What changed (on top of PR #195)
+
+| Change | Why |
+|---|---|
+| MXFP8 tensor parallelism by byte slicing | GDN `in_proj_qkv`/`in_proj_z` (by q/k/v segment and value head) and attention q/k/v (by head) are sliced by rows. `o_proj` and GDN `out_proj` are sliced by columns on whole 32-input E8M0 groups (`(k/tp) % 32 == 0` is enforced). No dequant or requant; a shard is byte-identical to the shipped rows/columns. |
+| Shared expert added once under EP | The MXFP8 shared expert stays replicated. Under EP it is blended as a zero row before the all-reduce and added once after it. Two batched decode paths blended it before the reduce, counting it once per rank. **Cross-model:** the generic `forward_batched` EP tail is shared by every EP model with a shared expert; it now follows the contract the single-row `forward` already had (`moe/forward.rs`, "EP fix"), which assumes the shared expert is replicated on every EP rank (FP4-Local's loader, `weight_loader/qwen4_exp/ffn.rs`, loads the full module on each rank with no shard call). Any EP model that reached this tail with a shared expert had it counted once per rank before. |
+| Resident PLE table, `ATLAS_PLE_RESIDENT=1` | The 128 NVFP4 shards are streamed through pinned staging into one rows buffer and one block-scale buffer per rank, then the files are fadvise(DONTNEED)'d. A boot self-check compares sampled rows (first, last, each head's first and last row, 64 pseudo-random) against the host oracle. The gather uses the existing GPU decode with slot = row id. No row cache, keepalive or fault pool. Startup parity refuses a rank mismatch. |
+| BF16 router (dtype fix) | `mlp.gate` ships BF16 (not in `quantized_layers`), but Atlas requantized it to NVFP4 at load and routed on that. FP4-Local now routes on the shipped weight: decode/verify on row-invariant GEMV tiers (scoped to these layers by a load-time flag), prefill on the pipelined BF16 GEMM. `ATLAS_QWEN4EXP_ROUTER_NVFP4=1` restores the old path for A/B. |
+| TC v3 MoE units without a fused shared expert | The plan kernel takes `has_shared`. FP4-Local runs the tensor-core MoE units with its MXFP8 shared expert as a separate chain (previously it fell back to the slower rows path). |
+| MXFP8 multi-row projections | 2..=32 rows are served in one weight pass (bucketed GEMV, plus a register-tiled 17..=32 tier), every row bit-identical to the 1-row kernel. Before, verify windows re-streamed each weight once per 8 rows. |
+| Decode/verify MXFP8 rows exact at any batch | `mxfp8_proj_exact_rows` serves any row count as consecutive <=32-row GEMV launches. Decode and verify callers (GDN `exact_rows_proj`, attention `try_mx8(exact = true)`, the shared expert's decode/verify entries) use it; prefill keeps `mxfp8_proj` (dequant + GEMM past 32 rows). Before this, a batched verify passes every sequence's rows in one call (`qwen3_ssm/trait_decode_batched.rs`, `trait_decode_multi_seq/ssm_batched/impl.rs`): at 8 sequences x 8 verify rows that is 64 rows, which took the dequant + GEMM path, so C8 verify rows were not the serial GEMV's bytes. The C8 speculative-equals-serial gates matched on text, but bit-identity was not guaranteed there until this change. |
+
+A tensor-core MXFP8 tier was also built and tested (row-invariant, within 1 BF16 ULP of an FP64
+reference) but measured ~32% slower than the GEMV tiers at decode, so it is not shipped; it is kept
+on the `wip/mxfp8-tc` branch.
+
+## 2. Dtype contract at TP2
+
+| Tensor family | Ships | Served |
+|---|---|---|
+| Routed experts | NVFP4, CSF-compressed scales | CSF decoded once at load; W4A16; 256 experts per rank |
+| Attention q/k/v/o, GDN qkv/z/out | MXFP8 | native bytes, sliced per rank |
+| Shared expert | MXFP8 | native, replicated |
+| GDN `in_proj_a/b`, indexer `index_qk_proj` | MXFP8 | exact widening to BF16 (~28 MB), as on one Spark |
+| Router, `shared_expert_gate`, mHC, PLE projections, embed, lm_head | BF16 | BF16 |
+| `hc_norm` and PLE norms | F32 | F32 |
+| PLE n-gram table | NVFP4 (U8 + E4M3 + F32 global) | resident per rank, GPU-decoded |
+| Vision attention / MLP | MXFP8 / W4A16 NVFP4 | native bytes (attention dequantized on GPU into scratch) |
+| KV cache | unspecified | BF16 |
+| MTP attention, MTP shared expert, draft head | BF16 | draft-only paths; may approximate, which changes acceptance, never tokens |
+
+## 3. Verification
+
+- Exactness on the pair after each change: serial vs rc16 greedy 8/8 at C1 and C8; cached-prefix C4
+  8/8 vs no cache; cross-contamination 8/8; tool probe 21/21; needles at 32K / 128K / 240K (4x262k profile).
+- Resident vs NVMe-cached PLE: outputs bit-identical, arm for arm. Under a full benchmark set,
+  `/proc/<pid>/io` read_bytes moved by 0 on both ranks, with no checkpoint files open.
+- Kernel tests: MXFP8 shard byte-exactness (column, segmented, row-parallel) with an off-by-one-scale
+  negative control, and row-parallel reassembly `dequant(shard0) || dequant(shard1) == dequant(full)`
+  compared bit for bit on hostile E4M3/E8M0 bytes; resident vs cached gather parity on interleaved
+  shards incl. the last row; the multi-row MXFP8 tiers byte-identical to the 1-row kernel at
+  M = 1..=32 on the real shapes with hostile bytes, and the exact-rows path at M = 64 / 65.
+- Launch-recording tests: `m = 0` is refused with no launch; exact rows at M = 33 / 64 / 65 launch
+  only GEMV tiers (ceil(M/32) per projection, never the dequant); the shared expert's exact chain runs
+  the fused gate_up -> SiLU -> down sequence once per <=32-row chunk with per-chunk offsets; the EP
+  tails (qwen4exp fast path and the generic `forward_batched`) consume the shared expert exactly once
+  (zero row before the single all-reduce, one post-reduce add; without EP, blended once in place).
+- BFCL ST-995 golden draw: 87.64 / 87.71 (`run-1792365985129633322`, first resident build, NVFP4
+  router) and 87.44 / 87.45 (`run-1792406664787105023`, BF16 router + TC MoE).
+- Final head 864c81fb3 on the pair (rc16 profile, resident table):
+  - speculative == serial greedy 8/8 at C1 and C8, and both identical to the earlier references;
+    behind a shared ~4.4K-token prefix (4,448 / 4,480 cached tokens) the speculative, cached C1 and C4
+    outputs equal serial uncached output 8/8; cross-contamination 8/8 (1,696 tokens); tool probe 21/21;
+  - router rollback (`ATLAS_QWEN4EXP_ROUTER_NVFP4=1`): speculative == serial 8/8; NVFP4 pack on the
+    same binary: speculative == serial 8/8 at C1 and C8;
+  - long context (4x262k profile): key-value needles at 9K, 35K, 66K, 128K and 240K tokens all found;
+    a 77K needle with a warm follow-up and four concurrent 100K prompts all answered;
+  - BFCL ST-995: 87.04 / 85.75 (`run-1792557711972352834`), above the MLPerf floors (83.64 / 85.32).
+    Against the previous build the differences are one or two items in small subsets
+    (live_parallel 2 of 16, irrelevance, live_irrelevance and live_simple 1 each) while non_live rose
+    (85.95 vs 84.91). Single run;
+  - MLPerf edge agentic performance leg (2.5 h dataset, concurrency 1, temperature 0): 1,007 / 1,007
+    turns completed, 0 failed, 4,027 s; TTFT p50 / p90 / p99 364 / 609 / 1,179 ms; TPOT 24.2 / 26.4 /
+    28.2 ms; inline action score 0.587 over 1,006 scored turns (the harness's reference, Qwen3.6-27B
+    Q4_K_M on Jetson Thor, took 2 h 37 m at ~91 ms TPOT and scored 0.634; a different model, not a
+    gate).
+
+## 3a. Exactness and determinism contracts
+
+| Contract | Holds by | Proven by |
+|---|---|---|
+| A speculative verify row equals the serial decode row | Every decode/verify projection takes a row-invariant kernel: MXFP8 through `mxfp8_proj_exact_rows` (any M), the BF16 router through the `dense_rows` GEMV tiers, TC MoE units row-invariant by construction | Kernel byte-identity tests (§3); speculative == serial greedy on the pair |
+| Prefill may use other numerics than decode | Prefill takes dequant + BF16 GEMM for MXFP8 past 32 rows and the pipelined BF16 GEMM for the router. Each logit/output is an independent in-order chain, so prefill is chunk-invariant, which the cached-prefix gate requires | Cached-prefix C4 8/8 vs no cache |
+| Both ranks route identically | The router input is the replicated hidden state after the TP all-reduce. With two ranks every element is one BF16 add of the two partials, which is commutative, so both ranks hold the same bits (the same argument `forward_ep_reduce` documents for the EP reduce) | Both ranks produce the same tokens; any divergence would desynchronize EP dispatch and break the 8/8 gates |
+| Router rows and ties are deterministic | `dense_rows` (all tiers: 8-row narrow, 16/32-row wide, 32-row tile) gives each row the single-row `dense_gemv_bf16` bytes; the softmax top-k kernels break exact ties by the lower expert id | `moe/router_determinism_gpu_tests.rs` (GB10): row identity at M = 1..=32, 33, 64; prefill GEMM vs decode GEMV max logit difference 1.56e-2 (2^-6; not bit-identical, as the prefill contract allows), top-10 sets equal on every row whose 10th/11th gap exceeds twice that (35 of 64 random rows; 29 were near ties); single-row and multi-row top-k identical on every tie incl. 512 equal logits, prefill's batched top-k identical on boundary ties ({300, 7} -> 7, {450, 20, 333} -> 20, {511, 256} -> 256) but not on a row of 512 equal logits |
+| The shared expert counts exactly once | Replicated weights; under EP the pre-reduce blend takes a zero row and `forward_ep_reduce` adds it once after the all-reduce | Launch-recording tests on both EP tails (§3) |
+| TP shards are the shipped bytes | Row slices by head and column slices on whole 32-input scale groups; startup refuses head counts not divisible by `tp_size` (`serve_phases/topology.rs`), segments not divisible by `tp_size` (`tp_shard/gdn.rs`) and `(k/tp) % 32 != 0` (`tp_shard/mxfp8.rs`) | Shard byte-exactness and reassembly tests (§3) |
+
+## 4. Results (same pair; tok/s; every row on its own fresh boot)
+
+| | FP4-Local, first resident build | FP4-Local, V5 | V5 binary (37565c203), final session | This head (864c81fb3), final session | NVFP4 pack, same flags |
+|---|---|---|---|---|---|
+| decode-floor (1500 tok) x3 (accept) | 89.0 / 88.9 / 88.7 (4.37) | 84.6 / 84.6 / 84.3 (4.27) | 84.0 / 83.9 / 83.9 (4.27) | 83.7 / 83.6 / 83.6 (4.27) | 82.1 / 82.3 / 82.1 (4.13) |
+| short chat decode, first token | 67.98, 0.165 s | 63.02, 0.157 s | 63.48, 0.166 s | 63.07, 0.166 s | 60.86, 0.144 s |
+| ~18K agent turn decode, first token | 46.27, 5.73 s | 43.05, 5.83 s | 43.84, 5.83 s | 43.28, 5.82 s | 42.07, 6.15 s |
+| cold TTFT median (1K / 4K / 16K) | 1493 ms | 1503 ms | – | 1507 ms | 1408 ms |
+| total at 1 / 2 / 4 / 5 / 8 users (isl 512, osl 256) | 63.6 / 104.1 / 137.3 / 148.2 / 165.9 | 64.5 / 108.1 / 146.0 / 161.0 / 205.7 | 65 / 109 / 131 / 161 / 207 | 65 / 108 / 130 / 161 / 206 | 61.3 / 102.5 / 156.6 / 176.8 / 232.1 |
+
+- The two "final session" columns are a same-session A/B on fresh boots: this head is within 1% of the
+  V5 binary at the same acceptance. The 4-user total reads 130-131 on both binaries in that session,
+  against 146 two days earlier on the V5 binary: the change is between sessions, not between builds.
+- The NVFP4-pack column predates the TC-MoE and BF16-router changes; §4a has the NVFP4 pack on this
+  head.
+- Single-stream speed moves with acceptance, which moves with each numerics baseline: the TC MoE
+  family, the BF16 router and the prefill router each changed the exact outputs.
+- For reference, measured on one Spark with the same streaming client (another box, not an A/B):
+  - Atlas FP4-Local: short 25.6 tok/s; agent turn 22.9 tok/s with a 15.4 s first token.
+  - NVIDIA's vLLM recipe: short 41.5 tok/s; agent turn 43.6 tok/s with a 9.2 s first token.
+
+## 4a. Against other engines (sparkDash decode protocol)
+
+sparkDash is the decode benchmark MiaAI-Lab's TensorFold recipes and SparkQwen publish with: thinking
+off, temperature 0, 400 forced tokens, aggregate tok/s. Atlas rows are this PR's head (864c81fb3) on
+our pair, mean of 3 repetitions each (spread under 2%, except FP4-Local json at C8: 307.7-317.9), driven by SparkQwen's headless
+`sd_bench.mjs` against sparkDash `be35be9`. The other rows are published numbers from other GB10 pairs
+with their own recipes: observations, not A/Bs. Every engine here speculates (MTP; TensorFold adds
+copy drafts); Atlas's speculation is exact (drafted == serial, §3a).
+
+Aggregate tok/s at 1 / 2 / 4 / 8 concurrent requests:
+
+| Engine, checkpoint | prose | code | structured | json |
+|---|---|---|---|---|
+| Atlas TP2, FP4-Local (resident PLE) | 71.2 / 107.5 / 148.4 / 266.4 | 92.3 / 137.1 / 208.6 / 275.2 | 101.6 / 161.4 / 354 / 397.3 | 78.0 / 130.6 / 187.7 / 314.4 |
+| Atlas TP2, NVFP4 pack (same binary, cached PLE) | 72.0 / 116.9 / 160.7 / 283.9 | 91.7 / 142.2 / 218.9 / 291.0 | 99.7 / 175.0 / 403.6 / 461.1 | 83.7 / 143.8 / 202.2 / 350.9 |
+| TensorFold dual v1.0, NVFP4 (MiaAI-Lab README, 2026-10-07) | 67.4 / 98.9 / 152.2 / 231.2 | – | – | – |
+| vLLM v0.30 TP2+EP, MTP3, NVFP4 (SparkQwen RC15 receipts) | 61.0 / 95.9 / 148.2 / 238-241 | 72.2 / 120.9 / 190.8 / 291-307 | 77.3 / 129.6 / 230.5 / 362-376 | 66.4 / 115.7 / 201.2 / 331-339 |
+| SparkQwen RC16 (Atlas fork) TP2, NVFP4 (its receipts) | 72.7 / 112.5 / 170.5 / 260.3 | 93.8 / 147.9 / 214.3 / 296.9 | 102.0 / 165.1 / 251.0 / 389.1 | 84.5 / 141.4 / 217.7 / 333.0 |
+| Atlas TP2, FP4-Local, no speculation | 36.4 / 60.4 / 104.6 / 162.4 | 36.7 / 59.7 / 94.1 / 138.7 | 37.0 / 65.0 / 117.2 / 194.5 | 36.9 / 66.1 / 119.9 / 197.2 |
+
+- On the NVFP4 checkpoint, Atlas is ahead of TensorFold dual at every published point (prose
+  +7% / +18% / +6% / +23%) and of vLLM v0.30 everywhere except code at C8 (within vLLM's own 6%
+  run-to-run spread) and json at C4 (equal). Against SparkQwen RC16 it is level at C1 (1-2% lower),
+  6-7% lower at C4 on prose and json, and ahead at C8 except code (2% lower).
+- FP4-Local against the NVFP4 pack on the same binary: -7% to +2% at C1, 5-14% lower at C8. Its
+  attention/GDN projections are 8-bit MXFP8 instead of 4-bit (more bytes per step; §5).
+- SGLang publishes no sparkDash numbers for this model. Its published TP2 results (NVFP4, other
+  harnesses) are 47.5 / 87.6 / 158.2 tok/s at 1 / 4 / 8 requests on 192-token coding requests with
+  NEXTN, 26.1 tok/s without speculation (PixelML), and ~63 tok/s single stream / 306 tok/s at 6 streams
+  on long HTML generation (beastllama field notes).
+- Long context (4x262k profile): 77K-token needle found, 23.9 s to first token, 56.0 tok/s; four
+  concurrent 100K-token prompts all answered (SparkQwen's `long_probe.py`). SparkQwen RC16 reports
+  21.1 s / 58.4 tok/s and vLLM 22.3 s / 50.6 tok/s on the same probe on their pair.
+
+## 5. Where the time goes (nsys with CUDA-graph node tracing, rank 0, per decode step)
+
+| | 1 stream (V4, 45.1 ms) | 8 streams (V4, 102.2 ms) | 8 streams, NVFP4 pack (93 ms) |
+|---|---|---|---|
+| routed MoE (TC v3 units) | 10.9 | 42.6 | 40.9 (shared expert fused) |
+| MXFP8 projections | 11.1 | 21.6 | n/a (BF16/NVFP4 tiers ~16.5) |
+| mHC (replicated) | 7.4 | 8.8 | 8.6 |
+| RDMA all-reduce | 3.0 | 6.3 | 7.1 |
+
+Profile captures must trace graph nodes (`--cuda-graph-trace=node`). At graph level the kernel tables
+show only the ~25% of GPU time spent outside graphs.
+
+### 5a. Where prefill time goes (nsys, rank 0, V5 numerics, one cold prefill workload)
+
+| Kernel family | Share of prefill GPU time |
+|---|---|
+| BF16 GEMMs (the expanded MXFP8 projections, mHC, LM-side) | 26.3% |
+| Routed MoE (`moe_q38wn_gate_up_silu`, `_down`, unpermute) | 22.1% |
+| mHC (`hc_post_stage_bf16` 9.4%, `hc_pre_mix` 3.8%) | 14.8% |
+| Attention / QSA (`qsa_prefill_attn_tc2r` 10.3%) | 13.5% |
+| GDN chunked recurrence | 13.3% |
+| norms, activations, copies | 5.1% |
+| all-reduce | 1.8% |
+
+The fidelity release that SparkQwen ships reaches first token ~20% sooner on the same server_argv
+(maplepaladin73's same-box A/B on this PR). I ported its MXFP8 W8A8 prefill GEMM for the projections
+(cuBLASLt block-scaled FP8, activations quantized per row with ModelOpt's rule) as an opt-in on the
+branch `wip/fp4-local-tp2-w8a8`, not in this PR. On our pair it is exact where it has to be:
+- speculative == serial, cached == uncached and C8 == C1, all 8/8, in separate boots;
+- every output row is independent of the pass height, its position in the pass and the scratch
+  chunking, 0 differences;
+- the activation quantizer matches ModelOpt's reference byte for byte;
+- outputs are 2.4-2.5% (relative) from the exact BF16-activation projection.
+
+It moved cold TTFT by only 4-7% (2K / 8K / 16K / 28K: 0.93 / 2.68 / 5.65 / 9.47 s exact vs 0.86 / 2.55
+/ 5.43 / 9.09 s W8A8, 3 runs each, same session). The projection GEMMs are a small slice of the table
+above; the rest of the gap has to come from mHC, MoE and QSA prefill, which the fidelity release also
+reworks.
+
+## 6. What is left (ranked)
+
+1. Prefill (TTFT): mHC prefill (`hc_post_stage_bf16`, `hc_pre_mix`), routed-MoE prefill and QSA
+   prefill attention, per §5a. The W8A8 projection GEMM alone is worth 4-7%, so it stays off this PR.
+2. MXFP8 projections are still ~11 ms/step (1 stream) and ~22 ms/step (8 streams), against a ~7.5 ms
+   bandwidth floor. The GEMV tiers are load/latency-bound. Next: cp.async-pipelined staging, plus more
+   CTAs per small-n projection.
+3. MTP depth / draft policy sweep on the current numerics (measurement only).
+4. Head-sharded resident table (each rank holds 8 of the 16 n-gram heads, then an all-gather of
+   `[T, 8x160]` before the replicated projections; bit-exact): frees 14.4 GB per rank, so the 0.70
+   sidecar setting fits.
+5. MXFP8 verify LM head as an opt-in (NVIDIA ships one; lossy, so off by default); shared-expert TP
+   split; mHC split.
+
+## 7. Running it
+
+rc16 TP2 profile plus `ATLAS_PLE_RESIDENT=1` on both ranks, the same binary on both, cuBLAS 13.0.2.14
+pinned on both. Start rank 1 first:
+`spark serve --model-from-path=<snapshot> --kernel-target=qwen3.8-flash-next --world-size=2 --tp-size=2
+--ep-size=2 --gpu-memory-utilization=0.88 --kv-cache-dtype=bf16 --enable-prefix-caching
+--max-prefill-tokens=16384 --speculative --num-drafts=7 --max-num-seqs=8 --max-seq-len=32768
+--rank={0,1} --master-addr=<rank-0 cable IP>`.
+Per rank, the boot log shows pre-KV ≈ 85–87 GB, a ~1.1–1.3M-token KV pool and the line
+`PLE resident: 320001536 rows, 28.8 GB on device ... self-check PASS`.
+
+Through sparkrun: the recipe `qwen3.8/qwen3.8-flash-next-fp4-local-tp2` (Atlas-Inf/sparkrun-recipes#20,
+draft until this PR and #195 are in an image) carries the same profile, the measurements above and its own
+launch receipts. Launched with it on a validation image of this PR's head, the greedy outputs, tool
+probe and contamination results are identical to the native runs, and decode speed is within 2%. Point
+`model:` at a snapshot already on both nodes (or let sparkrun fetch it): sparkrun's model distribution
+from the head node to itself removed the blob symlinks of a cache that keeps its blobs in a separate
+store.
+
+### 7a. Switches this PR adds, and rollback
+
+| Variable | Default | Effect | Rollback |
+|---|---|---|---|
+| `ATLAS_PLE_RESIDENT=1` | off | Holds the whole NVFP4 n-gram table on device on each rank (28.8 GB). Refuses tables that are not the NVFP4 U8 pack. Must match on both ranks (startup parity). `ATLAS_PLE_CACHE_GB`, `ATLAS_PLE_CACHE_SLOTS` and `ATLAS_PLE_NVME_KEEPALIVE_MS` are ignored with a warning while it is on. | Unset it: the NVMe + RAM row cache of PR #195, bit-identical output. |
+| `ATLAS_QWEN4EXP_ROUTER_NVFP4=1` | off | Routes on the old load-time NVFP4 requantization of the BF16 router. | This is the rollback for the BF16 router; it changes routing numerics (lossy). |
+
+Everything else on the served path (TC MoE units, multi-row MXFP8 tiers, exact rows, shared expert
+once under EP, MXFP8 TP slicing) is unconditional for FP4-Local or keyed by the checkpoint's own
+formats, and has no switch. The remaining variables come from the rc16 TP2 profile this PR does not
+change.
+
+### 7b. Memory admission with the resident table
+
+The resident table is allocated during model load, before the KV cache is sized, so it is charged
+like any weight:
+
+1. `factory/build/kv_budget.rs` sizes the pool from the larger of two own-footprint measures (the
+   drop in free memory since context init, and what the process itself allocated by driver
+   accounting) and leaves the reserves plus a headroom floor free. The resident load fadvises its
+   source files out of the page cache, so free memory falls by much less than Atlas allocated; the
+   tracked measure catches that. Boot log, rank 0: `KV own-footprint: Atlas allocated 85.10 GB but
+   free memory fell by only 43.86 GB ... sizing from the tracked figure`, then `119.6 GB total x 88%
+   util = 105.3 GB budget; 85.1 GB pre-KV + 4.7 GB reserve -> 15.5 GB for KV ... 1271712 max KV
+   tokens`.
+2. Both ranks agree on the smaller block count before allocating (`agree_kv_blocks`).
+3. The scheduler rejects a request larger than the pool instead of admitting it
+   (`scheduler/admission.rs`, `reject_oversized`).
+
+At util 0.88 that leaves ~1.27M KV tokens per rank, enough for the 8 x 32K profile several times
+over. At util 0.70 (co-tenant setting) the replicated table does not fit; that needs the
+head-sharded table (§6). Residency stays opt-in until then.
+
+### 7c. Two-GB10 checklist
+
+- One ConnectX-7 cable, a private IPv4 subnet on the cable ports (`ping` both ways), RoCE v2 GID index
+  known per node (`show_gids`); it can move after a power cycle. The measured pair runs the cable
+  ports at the default MTU 1500 on both ends; keep the two ends equal.
+- Per rank: `NCCL_SOCKET_IFNAME` / `NCCL_IB_HCA` / `ATLAS_RDMA_RAILS` = that node's cable interface
+  and RDMA device, `NCCL_IB_GID_INDEX` = its RoCE v2 IPv4 GID. The rc16 profile sets
+  `NCCL_ALGO=Ring NCCL_PROTO=Simple NCCL_NET=IB NCCL_IB_ROCE_VERSION_NUM=2 NCCL_NVLS_ENABLE=0
+  NCCL_CUMEM_ENABLE=0`.
+- The same `spark` binary, the same profile and the same opt-ins on both ranks; startup parity refuses
+  a mismatch (including `ATLAS_PLE_RESIDENT`). cuBLAS 13.0.2.14 pinned on both.
+- `--gpu-memory-utilization 0.88`, `--kv-cache-dtype bf16`, `--max-seq-len 32768`,
+  `--max-num-seqs 8`; check the KV pool line on both ranks after boot.
+- Nothing else large on either GPU while it loads (unified memory: exhaustion stalls the node rather
+  than failing an allocation).
+- Start rank 1, then rank 0; ready when `/v1/models` answers and a 2-token completion returns.

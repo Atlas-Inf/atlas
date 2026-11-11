@@ -5,6 +5,7 @@
 // Used in the transformer loop after attention/SSM and FFN blocks.
 // Operates in-place on the residual stream.
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 extern "C" __global__ void bf16_residual_add(
@@ -12,6 +13,7 @@ extern "C" __global__ void bf16_residual_add(
     const __nv_bfloat16* __restrict__ src,  // [n]
     unsigned int n
 ) {
+    atlas_pdl_enter();
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         float r = __bfloat162float(residual[i]);
@@ -99,6 +101,7 @@ extern "C" __global__ void sigmoid_gate_mul(
     __nv_bfloat16* __restrict__ output,        // [n]
     unsigned int n
 ) {
+    atlas_pdl_enter();
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         float x = __bfloat162float(input[i]);
@@ -149,6 +152,25 @@ extern "C" __global__ void bf16_concat(
     if (i < N) {
         out[i] = a[i];
         out[N + i] = b[i];
+    }
+}
+
+// Row-batched BF16 concatenation: for each row r < rows,
+// out[r, 0..N] = a[r, 0..N] and out[r, N..2N] = b[r, 0..N].
+// One launch for the MTP drafter prefill's [rows, 2N] fc input, instead of
+// one bf16_concat launch per row.
+// Grid: (ceil(N/256), rows, 1)  Block: (256, 1, 1)
+extern "C" __global__ void bf16_concat_rows(
+    const __nv_bfloat16* __restrict__ a,      // [rows, N]
+    const __nv_bfloat16* __restrict__ b,      // [rows, N]
+    __nv_bfloat16* __restrict__ out,          // [rows, 2N]
+    unsigned int N
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t r = blockIdx.y;
+    if (i < N) {
+        out[r * 2 * N + i] = a[r * N + i];
+        out[r * 2 * N + N + i] = b[r * N + i];
     }
 }
 

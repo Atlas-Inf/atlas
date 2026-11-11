@@ -22,7 +22,7 @@
 use super::emit_step::emit_token;
 use super::lifecycle::derive_finish_reason;
 use super::sched_ctx::SchedCtx;
-use super::test_support::{EOS, test_seq};
+use super::test_support::{EOS, RespRx, test_seq};
 use super::types::{ActiveSeq, GUARD_STOP_THINK_SKIP};
 
 /// Qwen3's `</think>`. Distinct from the fixture's EOS (151645) and
@@ -37,15 +37,15 @@ const SKIP_LIMIT: u32 = 50;
 /// budget is deliberately far larger than any test emits so a
 /// `finished` flag can only have come from the watchdog and never from
 /// the `remaining == 0` length stop.
-fn content_phase_seq() -> ActiveSeq {
-    let (mut a, _rx) = test_seq(Vec::new(), 5000, None, 10);
+fn content_phase_seq() -> (ActiveSeq, RespRx) {
+    let (mut a, rx) = test_seq(Vec::new(), 5000, None, 10);
     a.finished = false;
     a.inside_thinking = false;
     a.think_ended = true;
     a.think_end_token = Some(THINK_END);
-    // `_rx` is dropped: the fixture's sink is Blocking, which `emit_token`
-    // never sends on (only `finish_sequence` does), so no send can fail.
-    a
+    // Emission observes receiver closure even for blocking requests. Keep
+    // the receiver live so these tests exercise the watchdog, not cancellation.
+    (a, rx)
 }
 
 /// Distinct, strictly increasing content tokens. Using distinct ids keeps
@@ -65,7 +65,7 @@ fn scattered_think_strays_do_not_stop_the_turn() {
     // reset in `emit_step.rs`: the cumulative counter reaches 50 on the
     // 50th stray and force-stops the sequence.
     let sched = SchedCtx::for_test();
-    let mut a = content_phase_seq();
+    let (mut a, _rx) = content_phase_seq();
     let strays = 60;
     for i in 0..strays {
         emit_token(&mut a, THINK_END, None, &sched);
@@ -103,7 +103,7 @@ fn fifty_consecutive_think_strays_still_stop_the_turn() {
     // fix: it is the guard against "fixing" the asymmetry by deleting
     // the watchdog. 49 consecutive strays are survivable; the 50th is not.
     let sched = SchedCtx::for_test();
-    let mut a = content_phase_seq();
+    let (mut a, _rx) = content_phase_seq();
     for i in 1..SKIP_LIMIT {
         emit_token(&mut a, THINK_END, None, &sched);
         assert!(
@@ -129,7 +129,7 @@ fn the_watchdog_rearms_after_content_defuses_it() {
     // counter, a FRESH consecutive run of 50 must still fire. Without this
     // the positive test above could be satisfied by never counting again.
     let sched = SchedCtx::for_test();
-    let mut a = content_phase_seq();
+    let (mut a, _rx) = content_phase_seq();
     // Nearly trip it, then defuse with one content token.
     for _ in 0..SKIP_LIMIT - 1 {
         emit_token(&mut a, THINK_END, None, &sched);
@@ -173,7 +173,7 @@ fn the_watchdog_cut_names_its_guard_and_wires_length() {
     // `was_cut_off()` (atlas-plugin agent.rs) grants a recovery turn ONLY
     // on "length", so a "stop" with no tool calls ends the whole run.
     let sched = SchedCtx::for_test();
-    let mut a = content_phase_seq();
+    let (mut a, _rx) = content_phase_seq();
     for i in 1..SKIP_LIMIT {
         emit_token(&mut a, THINK_END, None, &sched);
         assert!(
@@ -203,7 +203,7 @@ fn a_genuine_eos_stop_is_not_converted_to_length() {
     // that finishes naturally must still wire "stop", even after a
     // below-threshold burst of strays on the same turn.
     let sched = SchedCtx::for_test();
-    let mut a = content_phase_seq();
+    let (mut a, _rx) = content_phase_seq();
     a.min_tokens = 0; // the fixture's 7 would suppress a bare EOS
     for i in 0..5 {
         emit_token(&mut a, content_token(i), None, &sched);
@@ -233,7 +233,7 @@ fn strays_inside_thinking_are_not_counted_as_strays() {
     // thinking and leaves the counter alone, so a request that thinks
     // repeatedly does not accrue watchdog credit.
     let sched = SchedCtx::for_test();
-    let mut a = content_phase_seq();
+    let (mut a, _rx) = content_phase_seq();
     a.inside_thinking = true;
     a.think_ended = false;
     emit_token(&mut a, THINK_END, None, &sched);

@@ -122,27 +122,15 @@ impl Qwen3SsmLayer {
         // ones-placeholder would NOT make a second RMS pass an identity.
         let ssm_out = self.ssm_forward(hidden, ssm_state, ctx, stream, false)?;
         stage!("ssm_forward");
-        ops::hc_post_site(
+        // ── MoE sublayer, entered through the mixer's post ──
+        ops::hc_post_pre_site(
             ctx.gpu,
             self.hc_post_k,
+            self.hc_pre_k,
             hc,
             ssm_out,
             streams,
-            post,
-            comb,
-            streams,
-            1,
-            h as u32,
-            stream,
-        )?;
-
-        // ── MoE sublayer ──
-        ops::hc_pre_site(
-            ctx.gpu,
-            self.hc_pre_k,
-            streams,
             &hc.ffn,
-            hc,
             hidden,
             post,
             comb,
@@ -153,21 +141,30 @@ impl Qwen3SsmLayer {
             stream,
         )?;
         stage!("hc_post+hc_pre_ffn");
-        let moe_out = self.ffn.forward(hidden, ctx, stream)?;
+        let hc_post = (ops::HcVariant::of(hc) == ops::HcVariant::LowRank).then_some(
+            ops::qwen4exp_decode_fuse::MoeHcPost {
+                streams,
+                inj: post,
+                hc_mult,
+            },
+        );
+        let (moe_out, posted) = self.ffn.forward_hc_post(hidden, ctx, hc_post, stream)?;
         stage!("moe");
-        ops::hc_post_site(
-            ctx.gpu,
-            self.hc_post_k,
-            hc,
-            moe_out,
-            streams,
-            post,
-            comb,
-            streams,
-            1,
-            h as u32,
-            stream,
-        )?;
+        if !posted {
+            ops::hc_post_site(
+                ctx.gpu,
+                self.hc_post_k,
+                hc,
+                moe_out,
+                streams,
+                post,
+                comb,
+                streams,
+                1,
+                h as u32,
+                stream,
+            )?;
+        }
 
         Ok(())
     }

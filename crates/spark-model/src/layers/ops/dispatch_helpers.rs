@@ -86,15 +86,12 @@ pub fn log_cutlass_nvfp4_route(gpu: &dyn GpuBackend, name: &str, m: u32, n: u32,
 }
 
 /// Roofline instrumentation: log each unique (kernel, M, N, K) GEMM shape once,
-/// gated by `ATLAS_GEMM_SHAPE_LOG=1`. Used to cross-reference nsys per-call
-/// durations → achieved TFLOPS/bandwidth vs GB10 peak.
+/// at DEBUG (`RUST_LOG`). Used to cross-reference nsys per-call durations →
+/// achieved TFLOPS/bandwidth vs GB10 peak.
 pub fn log_gemm_shape(gpu: &dyn GpuBackend, name: &str, m: u32, n: u32, k: u32) {
-    if std::env::var("ATLAS_GEMM_SHAPE_LOG").ok().as_deref() != Some("1") {
-        return;
-    }
-    if gpu.op_cache().first_shape(name, m, n, k) {
+    if tracing::enabled!(tracing::Level::DEBUG) && gpu.op_cache().first_shape(name, m, n, k) {
         let flop = 2.0 * m as f64 * n as f64 * k as f64;
-        tracing::warn!("GEMM_SHAPE {name} M={m} N={n} K={k} FLOP={flop:.3e}");
+        tracing::debug!("GEMM_SHAPE {name} M={m} N={n} K={k} FLOP={flop:.3e}");
     }
 }
 

@@ -13,12 +13,12 @@
 //! the pools land in `used_so_far` and the KV pool shrinks to fit — the
 //! same positional-budgeting rule the LoRA adapter load documents.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 
 use super::ssm_pool::SsmStatePool;
 use super::ssm_snapshot::SsmSnapshotPool;
-use super::ssm_tier::SnapshotBlobStore;
+use super::ssm_tier::{SnapshotBlobStore, SpillHome};
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
 
@@ -28,19 +28,63 @@ pub struct SsmPools {
     pub(crate) pool: Arc<SsmStatePool>,
     pub(crate) snapshots: SsmSnapshotPool,
     pub(crate) tier_store: Option<Arc<dyn SnapshotBlobStore>>,
+    /// Where `tier_store` keeps its spills (`None` without a tier).
+    pub(crate) tier_home: Option<SpillHome>,
     pub(crate) has_mtp: bool,
+    /// Native GLM MTP was validated from rank-symmetric marker/head weights.
+    /// This remains distinct from the generic MTP and DFlash flags: native
+    /// GLM uses the canonical target verifier without setting DFlash env.
+    pub(crate) native_glm_mtp: bool,
     pub(crate) num_intermediates: usize,
     pub(crate) dflash_kgamma: usize,
 }
 
 impl SsmPools {
-    /// Build the pools. Must run before the KV-cache budget snapshot in
-    /// `factory::build_model` — see the module doc.
+    /// Host bytes the snapshot spill tier takes after KV sizing (0 without a
+    /// tier) — see `SpillHome::lazy_host_bytes`.
+    pub(crate) fn tier_lazy_host_bytes(&self) -> usize {
+        self.tier_home.map_or(0, |home| {
+            home.lazy_host_bytes(self.snapshots.spill_blob_bytes())
+        })
+    }
+
+    /// Compatibility constructor for callers that have no external native
+    /// MTP capability to report.
     pub(crate) fn new(
         config: &ModelConfig,
         max_batch_size: usize,
         self_speculative: bool,
         use_speculative: bool,
+        mtp_weights_empty: bool,
+        draft_lm_head_nvfp4_present: bool,
+        num_drafts: usize,
+        ssm_cache_slots: usize,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Self> {
+        Self::new_with_native(
+            config,
+            max_batch_size,
+            self_speculative,
+            use_speculative,
+            false,
+            mtp_weights_empty,
+            draft_lm_head_nvfp4_present,
+            num_drafts,
+            ssm_cache_slots,
+            gpu,
+        )
+    }
+
+    /// Build the pools. Must run before the KV-cache budget snapshot in
+    /// `factory::build_model` — see the module doc. `native_mtp` is a
+    /// rank-symmetric capability bit for architectures whose proposer body is
+    /// loaded outside the generic `MtpWeights` bundle (currently native GLM).
+    pub(crate) fn new_with_native(
+        config: &ModelConfig,
+        max_batch_size: usize,
+        self_speculative: bool,
+        use_speculative: bool,
+        native_mtp: bool,
         mtp_weights_empty: bool,
         draft_lm_head_nvfp4_present: bool,
         num_drafts: usize,
@@ -72,6 +116,7 @@ impl SsmPools {
         let has_mtp = self_speculative
             || (use_speculative && !mtp_weights_empty && draft_lm_head_nvfp4_present)
             || external_mtp_module
+            || native_mtp
             || dflash_kgamma > 0;
         let num_intermediates = if has_mtp {
             (num_drafts + 1).max(dflash_kgamma)
@@ -130,6 +175,30 @@ impl SsmPools {
                 atlas_kernels::DECODE_ROLLBACK_RING_SLOTS,
             );
         }
+        // The pools are deliberately out of `preflight_reserve` (see the
+        // module doc): they allocate BEFORE the KV budget's free_memory()
+        // snapshot, so nothing checks that they fit before `cuMemAlloc`
+        // dies with NV_ERR_NO_MEMORY and the process is killed with no error
+        // line (plain decode at 64 seqs: ~81 GB of decode-rollback ring). Size the
+        // same inputs the pool is about to use and fail fast with remedies.
+        let hidden_bytes = config.hidden_size * 2;
+        let marconi_bytes = ssm_cache_slots
+            .checked_mul(pool.num_ssm_layers)
+            .and_then(|s| s.checked_mul(pool.h_bytes + pool.conv_bytes))
+            .and_then(|s| s.checked_add(ssm_cache_slots.checked_mul(hidden_bytes)?))
+            .context("SSM snapshot pool size overflow")?;
+        let ring_bytes = ring
+            .slots
+            .checked_mul(max_batch_size)
+            .and_then(|s| s.checked_mul(pool.num_ssm_layers))
+            .and_then(|s| s.checked_mul(pool.h_bytes + pool.conv_bytes))
+            .context("SSM decode-rollback ring size overflow")?;
+        snapshot_pool_fits(
+            marconi_bytes,
+            ring_bytes,
+            gpu.free_memory()?,
+            SNAPSHOT_POOL_OOM_GUARD,
+        )?;
         let snapshots = SsmSnapshotPool::new(
             ssm_cache_slots,
             pool.h_bytes,
@@ -140,23 +209,63 @@ impl SsmPools {
             // Last-token hidden snapshot: post-final-norm `norm_output` is
             // BF16 (`hidden_size` elements). Used to emit exact-hit logits
             // without re-running the last token through the SSM layers.
-            config.hidden_size * 2,
+            hidden_bytes,
             gpu,
         )?;
         // Optional SSM snapshot spill tier. `None` (default) keeps the reclaim
         // drop path byte-identical; blob sizing tracks the pool's spill layout.
-        let tier_store = super::impl_a1_init::build_ssm_tier_store(
+        let (tier_store, tier_home) = super::impl_a1_init::build_ssm_tier_store(
             config,
             snapshots.spill_blob_bytes(),
             pool.num_ssm_layers,
-        )?;
+        )?
+        .unzip();
         Ok(Self {
             pool,
             snapshots,
             tier_store,
+            tier_home,
             has_mtp,
+            native_glm_mtp: native_mtp && config.model_type == "glm5_next",
             num_intermediates,
             dflash_kgamma,
         })
     }
 }
+
+/// Slack the snapshot-pool fit check keeps between the pools and the OOM
+/// kill: the KV budget sizes itself off the free memory measured after
+/// these allocations, so a pool that leaves ~0 free would boot-fail one
+/// step later anyway.
+const SNAPSHOT_POOL_OOM_GUARD: usize = 2 << 30;
+
+/// Does the SSM snapshot pool fit the currently-free device memory?
+/// `bail!`s with the split that overflowed and the operator remedies —
+/// the decode-rollback ring exists only for plain decode's watchdog
+/// re-steer, so speculation sidesteps it entirely.
+fn snapshot_pool_fits(
+    marconi_bytes: usize,
+    ring_bytes: usize,
+    free: usize,
+    guard: usize,
+) -> Result<()> {
+    let need = marconi_bytes
+        .checked_add(ring_bytes)
+        .context("SSM snapshot pool size overflow")?;
+    let budget = free.saturating_sub(guard);
+    if need <= budget {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "SSM snapshot pools do not fit: need {need_gb:.1} GB (Marconi prefix slots {marconi_gb:.1} GB + decode-rollback ring {ring_gb:.1} GB) against {free_gb:.1} GB free (guard {guard_gb:.1} GB). The decode ring serves only PLAIN decode's watchdog rollback — run with --speculative or --dflash, lower --max-batch-size, or shrink the ring with ATLAS_SSM_DECODE_RING=0 / ATLAS_DISABLE_WATCHDOGS=1.",
+        need_gb = need as f64 / 1e9,
+        marconi_gb = marconi_bytes as f64 / 1e9,
+        ring_gb = ring_bytes as f64 / 1e9,
+        free_gb = free as f64 / 1e9,
+        guard_gb = guard as f64 / 1e9,
+    )
+}
+
+#[cfg(test)]
+#[path = "ssm_pools_tests.rs"]
+mod tests;

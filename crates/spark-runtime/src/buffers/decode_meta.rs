@@ -11,7 +11,7 @@
 //!   seq_slot   i32  [4R,      8R)   (per-request LoRA routing)
 //!   slots      i64  [8R,     16R)
 //!   seq_lens   i32  [16R,    20R)
-//!   (gap            [20R,    24R))  — legacy [640,768) pad, scaled
+//!   ssm_slots  i32  [20R,    24R)   (reserved live SSM pool IDs; -1 padding)
 //!   block_tbl  i32  [24R,    24R + R·max_blocks·4)
 //!
 //! At `R = 32` this reproduces the legacy layout BYTE-FOR-BYTE
@@ -37,6 +37,30 @@ pub const DECODE_META_MIN_ROWS: usize = 32;
 /// concurrency campaign, not an smem wall.
 pub const DECODE_META_MAX_ROWS: usize = 128;
 
+/// The batched-decode padding rungs (`spark_model::traits::padded_batch_n`):
+/// an active batch of `n` runs as the smallest rung `>= n`, so one CUDA-graph
+/// shape serves a range of widths. SSOT here because the metadata layout must
+/// hold the PADDED width, not the served `max_batch_size`: a boot at a width
+/// that is not itself a rung (e.g. 36) pads n=33..36 to 48.
+///
+/// gfx1151 adds a 6 rung. Its batched decode GEMVs are compute-bound at these
+/// widths, so a C=5..6 step padded to 8 rows paid for 8 rows to emit 5..6
+/// tokens: strix s166/s168 (27B AR) C6 26.6 tok/s ~= 6/8 of C8's 34.1.
+#[cfg(atlas_hip)]
+pub const DECODE_BATCH_RUNGS: [usize; 12] = [2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128];
+#[cfg(not(atlas_hip))]
+pub const DECODE_BATCH_RUNGS: [usize; 11] = [2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128];
+
+/// The rung a batch of `n` pads to; `n` itself above the last rung.
+#[inline]
+pub fn padded_batch_rung(n: usize) -> usize {
+    DECODE_BATCH_RUNGS
+        .iter()
+        .copied()
+        .find(|&s| s >= n)
+        .unwrap_or(n)
+}
+
 /// Derived fixed-stride decode-metadata layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodeMetaLayout {
@@ -48,8 +72,13 @@ impl DecodeMetaLayout {
     /// `max_batch_size <= DECODE_META_MAX_ROWS` at serve time; this
     /// constructor only applies the byte-identity floor.
     pub fn for_max_batch_size(max_batch_size: usize) -> Self {
+        // Rows hold the widest PADDED batch, not the served width: at
+        // `max_batch_size = 36` a 33..36-row batch pads to the 48 rung, and a
+        // 36-row layout failed every such decode step with "padded_n=48
+        // exceeds the 36-row derived metadata layout" (GB10, Qwen3.6-35B,
+        // MLPerf C=36, 2026-10-03), erroring every active stream.
         Self {
-            rows: max_batch_size.max(DECODE_META_MIN_ROWS),
+            rows: padded_batch_rung(max_batch_size.max(DECODE_META_MIN_ROWS)),
         }
     }
 
@@ -79,6 +108,12 @@ impl DecodeMetaLayout {
         16 * self.rows
     }
 
+    /// Live SSM pool-slot i32 stream, independent of KV and LoRA slots.
+    /// Reuses the legacy gap without changing any existing offsets or sizes.
+    pub fn ssm_slots_off(&self) -> usize {
+        20 * self.rows
+    }
+
     /// Flattened block-table offset (row stride `max_blocks · 4` bytes).
     pub fn block_table_off(&self) -> usize {
         24 * self.rows
@@ -93,6 +128,19 @@ impl DecodeMetaLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssm_slots_reuse_only_the_existing_gap() {
+        for rows in [32, 64, 128] {
+            let layout = DecodeMetaLayout::for_max_batch_size(rows);
+            assert_eq!(layout.ssm_slots_off(), 20 * rows);
+            assert_eq!(layout.seq_lens_off() + rows * 4, layout.ssm_slots_off());
+            assert_eq!(layout.ssm_slots_off() + rows * 4, layout.block_table_off());
+            assert_eq!(layout.meta_bytes(257), 24 * rows + rows * 257 * 4);
+            assert_eq!(layout.seq_slot_off(), 4 * rows);
+            assert_eq!(layout.slots_off(), 8 * rows);
+        }
+    }
 
     /// bs <= 32 must reproduce the legacy hardcoded layout byte-for-byte.
     #[test]
@@ -118,7 +166,11 @@ mod tests {
         for bs in [33usize, 64, 128] {
             let l = DecodeMetaLayout::for_max_batch_size(bs);
             let r = l.rows();
-            assert_eq!(r, bs, "bs={bs}: rows derive from bs above the floor");
+            assert_eq!(
+                r,
+                padded_batch_rung(bs),
+                "bs={bs}: rows are the padded rung"
+            );
             // positions [0,4R) then seq_slot [4R,8R): no overlap.
             assert_eq!(l.seq_slot_off(), l.positions_off() + 4 * r);
             // slots i64 begins exactly after seq_slot and is 8-byte aligned.
@@ -146,6 +198,19 @@ mod tests {
             ),
             (64, 256, 512, 1024, 1536)
         );
+    }
+
+    /// Every width a batch can reach at a given `max_batch_size` must fit:
+    /// the padded rung of the widest admitted batch is at most `rows`.
+    #[test]
+    fn rows_hold_every_padded_width() {
+        for bs in 1..=DECODE_META_MAX_ROWS {
+            let rows = DecodeMetaLayout::for_max_batch_size(bs).rows();
+            for n in 1..=bs {
+                assert!(padded_batch_rung(n) <= rows, "bs={bs} n={n} rows={rows}");
+            }
+        }
+        assert_eq!(DecodeMetaLayout::for_max_batch_size(36).rows(), 48);
     }
 
     #[test]

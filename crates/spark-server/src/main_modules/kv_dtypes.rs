@@ -28,7 +28,7 @@ pub(crate) fn auto_high_precision_layers(
 ) -> Option<usize> {
     use spark_runtime::kv_cache::KvCacheDtype as D;
     match kv_dtype {
-        D::Bf16 | D::Fp8 | D::Nvfp4 => None,
+        D::Bf16 | D::Fp8 | D::Nvfp4 | D::Fp8G128 => None,
         D::Turbo2 | D::Bf16KTurbo3V => Some(((num_attention_layers * 4).div_ceil(5)).max(4)),
         D::Turbo3
         | D::Turbo4

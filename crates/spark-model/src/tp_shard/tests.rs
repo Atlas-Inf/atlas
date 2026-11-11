@@ -348,3 +348,15 @@ fn segment_plan_rejects_indivisible() {
     let r = segment_copy_plan(&[32, 33], 128, 0, 2);
     assert!(r.is_err());
 }
+
+#[test]
+fn wider_tp_takes_the_scale_of_the_tp2_shard_holding_its_slice() {
+    assert_eq!(
+        [0, 1, 2, 3].map(|r| pair_scale_rank(r, 4)),
+        [Some(0), Some(0), Some(1), Some(1)]
+    );
+    assert_eq!(pair_scale_rank(5, 8), Some(1));
+    for (r, tp) in [(0, 1), (0, 2), (1, 2), (0, 3)] {
+        assert_eq!(pair_scale_rank(r, tp), None, "rank {r} of {tp}");
+    }
+}

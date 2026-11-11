@@ -5,6 +5,9 @@
 //! Defines the [`DraftProposer`] trait for speculative decoding strategies.
 //! MTP implements this first; EAGLE-3 can implement later without engine changes.
 
+pub mod deep_depth;
+pub mod draft_tree;
+pub mod glm_repair_policy;
 pub mod ladder;
 pub mod tree_shape;
 pub mod verify_key;
@@ -27,6 +30,9 @@ use crate::layer::ForwardContext;
 pub trait ProposerState: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
+    /// The request's min_tokens floor (`EosBan::floor`, 0 = none): drafts
+    /// for positions below it should not end the turn. Default: ignored.
+    fn set_end_floor(&mut self, _floor: usize) {}
 }
 
 /// A draft token proposer for speculative decoding.
@@ -296,6 +302,72 @@ pub trait DraftProposer: Send + Sync {
         None
     }
 
+    /// An exact tree verify's draft tree (`draft_tree`): best-first, at most
+    /// `rows` rows, over the lattice of the last single-sequence propose.
+    /// `None` when this proposer has no lattice.
+    fn draft_tree(
+        &self,
+        _gpu: &dyn GpuBackend,
+        _rows: usize,
+    ) -> Result<Option<draft_tree::DraftTree>> {
+        Ok(None)
+    }
+
+    /// Whether a single-sequence [`Self::propose`] handed `comm` (with a
+    /// grammar mask or not) swaps work with the peer rank
+    /// (`ATLAS_GLM_DRAFT_TP`). The model announces such a propose to the
+    /// worker before it calls it.
+    fn rank_split_ready(&self, _comm: &dyn spark_comm::CommBackend, _grammar: bool) -> bool {
+        false
+    }
+
+    /// The rows a [`Self::propose_batch`] of `n` sequences handed `comm`
+    /// (with a grammar mask or not) swaps halves with the peer rank over
+    /// (`ATLAS_GLM_DRAFT_TP_BATCH`), if it does. The model announces such a
+    /// propose to the worker, with these rows, before it calls it.
+    fn rank_split_batch_rows(
+        &self,
+        _comm: &dyn spark_comm::CommBackend,
+        _n: usize,
+        _grammar: bool,
+    ) -> Option<usize> {
+        None
+    }
+
+    /// `ATLAS_QWEN4EXP_MTP_DRAFT_TP`: the announce word of a
+    /// [`Self::propose_batch`] of `n` sequences and `num_drafts` positions
+    /// handed `comm` (with a grammar mask or not), if the worker serves part
+    /// of it. The model announces such a propose with this word before it
+    /// calls it, and hands it `comm` then and only then. `ctx` is the
+    /// propose's: no announce for a propose that will not run batched.
+    fn draft_tp_word(
+        &self,
+        _comm: &dyn spark_comm::CommBackend,
+        _n: usize,
+        _num_drafts: usize,
+        _grammar: bool,
+        _ctx: &crate::layer::ForwardContext<'_>,
+    ) -> Option<u32> {
+        None
+    }
+
+    /// `ATLAS_GLM_DRAFT_TP_CTX`: the context rows the split propose about to
+    /// be announced over `comm` appends split, packed for the announce
+    /// (`rank_split::announce_word`; 0 = none). `seqs` holds each sequence's
+    /// state, capture row and position as the propose will receive them.
+    /// The proposer keeps the rows for that propose.
+    fn rank_split_ctx(
+        &self,
+        _comm: &dyn spark_comm::CommBackend,
+        _seqs: &[(
+            &dyn ProposerState,
+            Option<spark_runtime::gpu::DevicePtr>,
+            usize,
+        )],
+    ) -> u64 {
+        0
+    }
+
     /// Chain confidence of the most recent `propose` (min top-1 softmax prob
     /// across its drafts), when the proposer computes it (`draft_conf_tau` >
     /// 0). `None` = not computed; callers must not gate on it then.
@@ -307,6 +379,12 @@ pub trait DraftProposer: Send + Sync {
     /// 0 = unknown / not applicable (catch-up is skipped).
     fn drafter_rows(&self, _state: &mut dyn ProposerState) -> usize {
         0
+    }
+
+    /// Whether the first native proposal requires a verified prompt-context
+    /// prefill. Legacy drafters retain their permissive empty-context fallback.
+    fn requires_prompt_prefill(&self) -> bool {
+        false
     }
 
     /// Sequence-space pair key of the newest drafter row (`None` = untracked;
@@ -344,6 +422,64 @@ pub trait DraftProposer: Send + Sync {
     /// Release drafter KV blocks that no proposer state owns (a carried entry
     /// being replaced or dropped).
     fn free_drafter_kv(&self, _blocks: &[u32]) {}
+
+    /// Consume newly computed canonical target rows into private native MTP
+    /// context. `start` and the retained boundary are exclusive target lengths.
+    fn append_native_target_context(
+        &self,
+        _tokens: &[u32],
+        _start: usize,
+        _norm_hiddens: DevicePtr,
+        _state: &mut dyn ProposerState,
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("native target context is unsupported")
+    }
+
+    /// Retain only the final canonical target hidden after speculative commit;
+    /// accepted-token repair owns the private KV writes separately.
+    fn retain_native_target_hidden(
+        &self,
+        _hidden: DevicePtr,
+        _end: usize,
+        _state: &mut dyn ProposerState,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("native target hidden retention is unsupported")
+    }
+
+    /// Last normalized target row and its exclusive sequence end.
+    fn native_target_hidden(
+        &self,
+        _state: &dyn ProposerState,
+    ) -> Result<Option<(usize, DevicePtr)>> {
+        Ok(None)
+    }
+
+    /// Clone an immutable native predictor prefix including its boundary hidden.
+    /// Implementations share sealed blocks and copy the mutable final block.
+    fn clone_prefix_state(
+        &self,
+        _state: &dyn ProposerState,
+        _rows: usize,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<Option<Box<dyn ProposerState>>> {
+        Ok(None)
+    }
+
+    /// Available blocks in the private predictor pool, for prefix eviction.
+    fn native_prefix_free_blocks(&self) -> Option<usize> {
+        None
+    }
+
+    /// Drop abandoned private drafts before catching up a fresh proposal.
+    /// Never called while a scheduler-staged proposal awaits verification.
+    fn prepare_drafter_catchup(&self, state: &mut dyn ProposerState) -> Result<usize> {
+        Ok(self.drafter_rows(state))
+    }
 
     /// DFlash ctx carry (the Option-B drafter analogue of
     /// `take_drafter_kv`): move this sequence's drafter ctx — hidden
@@ -517,6 +653,22 @@ pub trait DraftProposer: Send + Sync {
         Ok(0)
     }
 
+    /// Repair the accepted draft pair before the next proposal. Native GLM
+    /// uses this to append `(embed(accepted_draft), verified_hidden)` through
+    /// its KV-only MLA path; all existing drafters keep the no-op default.
+    #[allow(clippy::too_many_arguments)]
+    fn repair_after_verify(
+        &self,
+        _accepted_draft: u32,
+        _position: usize,
+        _target_hidden: DevicePtr,
+        _state: &mut dyn ProposerState,
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Read the draft token ID stored on GPU by the last `propose()` call
     /// that used `draft_embed_target = Some(...)`. Returns 0 if not supported.
     fn read_deferred_draft_token(&self, gpu: &dyn GpuBackend) -> Result<u32> {
@@ -535,6 +687,54 @@ pub trait DraftProposer: Send + Sync {
         state: &mut dyn ProposerState,
         stream: u64,
     ) -> Result<()>;
+
+    /// `ATLAS_QWEN4EXP_MTP_ABSORB`: the verify settling this state's drafts
+    /// accepted `tokens` (its first `tokens.len()` drafts), and `streams`
+    /// holds that verify's first `tokens.len()` rows of the target's final
+    /// stream highway (`[rows, hc, hidden]` FP32, the live forward's). A
+    /// proposer that rebuilds its context from the target copies them now —
+    /// the next forward reuses the buffer. Default: no-op.
+    // Ported from Enntity/atlas 166e2b1, e7d4e1a (AGPL-3.0-only).
+    fn stage_absorb(
+        &self,
+        _state: &mut dyn ProposerState,
+        _streams: DevicePtr,
+        _tokens: &[u32],
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// `ATLAS_QWEN4EXP_MTP_PREFILL`: highway rows `hc_row ..` hold the final
+    /// streams of prompt positions `first_pos ..` (`rows` of them), noted at
+    /// a prefill chunk's capture point for [`Self::absorb_prompt`]. Default:
+    /// no-op.
+    fn note_prompt_rows(
+        &self,
+        _state: &mut dyn ProposerState,
+        _first_pos: usize,
+        _rows: usize,
+        _hc_row: usize,
+    ) {
+    }
+
+    /// After a prefill chunk returns (its logits computed, its highway rows
+    /// still live): build the drafter's context over the noted rows of
+    /// `prompt` (the whole prompt's tokens). Default: no-op.
+    fn absorb_prompt(
+        &self,
+        _state: &mut dyn ProposerState,
+        _prompt: &[u32],
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// At a propose, `tokens` the sequence's: hands over the token of a
+    /// prompt row [`Self::absorb_prompt`] left waiting. Default: no-op.
+    fn prompt_tail_token(&self, _state: &mut dyn ProposerState, _tokens: &[u32]) {}
 
     /// Free per-sequence proposer state (KV cache blocks, device buffers, etc.).
     ///

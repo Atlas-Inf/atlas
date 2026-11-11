@@ -3,7 +3,7 @@
 //! `build_model` — entry point that wires up the configured loader,
 //! buffers, KV cache, and (optional) DFlash drafter into a `TransformerModel`.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use atlas_core::config::ModelConfig;
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::GpuBackend;
@@ -16,11 +16,18 @@ use super::loader_for_config;
 use super::m2_setup::maybe_run_minimax_m2_moe_transpose;
 use super::{DflashBuildArgs, LoraBuildArgs, admit_lightning_dspark_product_build};
 use crate::layers::MtpQuantization;
-use crate::layers::dflash_head::{DsparkStartupExecution, LightningDsparkRuntimeToggles};
+use crate::layers::dflash_head::{
+    DsparkStartupExecution, FirstAppend, LightningDsparkRuntimeToggles,
+};
 use crate::model::TransformerModel;
 use crate::traits::Model;
 use crate::weight_loader::load_dflash_weights;
 
+mod dflash_reserve;
+mod glm;
+mod kv_budget;
+mod kv_carveout;
+mod kv_nvme;
 mod kv_summary;
 
 pub fn build_model(
@@ -66,6 +73,38 @@ pub fn build_model(
     // encoder-decoder checkpoint). `None` = base model.
     nllb_lora_dir: Option<std::path::PathBuf>,
 ) -> Result<Box<dyn Model>> {
+    crate::weight_loader::qwen4_exp::mode::validate(
+        &config,
+        use_speculative,
+        self_speculative || dflash_args.is_some(),
+    )?;
+    super::glm_sparse_decode::initialize(
+        gpu.as_ref(),
+        super::glm_sparse_decode::BuildPolicy {
+            config: &config,
+            self_speculative,
+            context: super::glm_sparse_decode::repair_context(max_seq_len),
+            block_size: kv_block_size,
+            kv_dtype,
+            layer_dtypes: &layer_dtypes,
+            dflash: dflash_args.is_some() && lora_args.is_none(),
+        },
+    )?;
+    // Validate and load Atlas's sparse CUDA modules before the KV free-memory
+    // snapshot so code residency is included in the model's memory budget.
+    crate::layers::ops::initialize_glm_sparse_native(
+        &config,
+        max_batch_tokens,
+        max_seq_len,
+        kv_block_size,
+        max_batch_size,
+        kv_dtype,
+        &layer_dtypes,
+    )?;
+    crate::layers::ops::preload_glm_sparse_native(gpu.as_ref(), config.num_attention_heads)?;
+    crate::layers::ops::initialize_glm_sparse_prefill_pipe(gpu.as_ref(), &config)?;
+    crate::layers::ops::initialize_glm_kv_canonical(gpu.as_ref(), &config, kv_dtype)?;
+    crate::layers::ops::initialize_glm_mla_fuse(gpu.as_ref(), &config)?;
     // NLLB / M2M-100 is an encoder-decoder model that cannot be represented by
     // the decoder-only TransformerModel stack. Serve it with the dedicated
     // `NllbGpuModel`, which reads its weights from the standard `store` — this
@@ -138,6 +177,9 @@ pub fn build_model(
         crate::weight_map::exl3::exl3_materialize_dense(&mut store, gpu.as_ref())?;
         config.attn_proj_bf16 = true;
     }
+    // FP4-Local: CSF expert scales and MXFP8 / vision-NVFP4 projections become
+    // the plain NVFP4 / BF16 layout the loaders below read. No-op otherwise.
+    crate::weight_map::modelopt_local::materialize(&mut store, &config, gpu.as_ref())?;
 
     // ── LoRA adapter load (pre-arena, pre-KV-sizing) ──
     // MUST run before `BufferArena::new` and the `gpu.free_memory()`
@@ -174,6 +216,25 @@ pub fn build_model(
         && let Some(ref sub) = args.drafter_config.dflash_config
     {
         config.dflash_capture_layers = sub.target_layer_ids.clone();
+        // `--draft-model-alt`: one capture covers both drafters' layers.
+        if let Some(alt) = args
+            .alt
+            .as_ref()
+            .and_then(|(_, c)| c.dflash_config.as_ref())
+        {
+            config.dflash_capture_layers = crate::layers::dflash_head::dual::union_layers(
+                &sub.target_layer_ids,
+                &alt.target_layer_ids,
+            );
+        }
+        // The window a bidirectional head keeps (`ctx_window_len`): the served
+        // one (Lightning admission's, else the caller's) capped at max_seq_len.
+        let served = lightning_dspark_policy
+            .as_ref()
+            .map(|policy| policy.profile().attention.swa_window)
+            .or(args.window_size);
+        config.dflash_ctx_window = (!args.drafter_config.query_causal())
+            .then(|| served.unwrap_or(max_seq_len).min(max_seq_len));
         tracing::info!(
             "DFlash: target layer capture indices = {:?} (drafter target_layer_ids, used directly)",
             config.dflash_capture_layers,
@@ -192,6 +253,16 @@ pub fn build_model(
     // "use global num_kv_heads/head_dim for all layers" (backward compatible).
     config.kv_layer_dims = loader.kv_layer_dims(&config);
 
+    let shared_cache_reserve = crate::layers::moe::validate_shared_fp8_cache_factory_reserve(
+        &config,
+        gpu.as_ref(),
+        max_batch_tokens,
+        max_seq_len,
+        kv_block_size,
+        max_batch_size,
+        inference_reserve,
+        true,
+    )?;
     // Attribute the memory the BUILD spends, not just the shards.
     //
     // Weight upload reports itself per shard, and the buffer arena reports its
@@ -203,6 +274,7 @@ pub fn build_model(
     // find the rest is to guess.
     let free_before_layers = gpu.free_memory().unwrap_or(0);
     let mut layers = loader.load_layers(&store, &config, gpu.as_ref(), &attn_layer_dtypes)?;
+    loader.attach_layer_buffers(&mut layers, &config, gpu.as_ref(), max_batch_tokens)?;
     let free_after_layers = gpu.free_memory().unwrap_or(0);
     tracing::info!(
         "Layer construction: {:.2} GB consumed ({:.2} GB free -> {:.2} GB free) \
@@ -224,6 +296,44 @@ pub fn build_model(
     let final_norm = loader.load_final_norm(&store, &config, gpu.as_ref())?;
     let lm_head = loader.load_lm_head(&store, &config, gpu.as_ref())?;
     let mtp_weights = loader.load_mtp_weights_multi(&store, &config, gpu.as_ref())?;
+
+    // GLM's appended predictor is a native full-rank module, not the generic
+    // MTP weight bundle.  Validate the rank-symmetric capability before any
+    // rank-0-only body construction, then load its body only on rank 0.
+    // `native_glm_mtp` remains true on worker ranks so SsmPools and the model
+    // scheduler reserve the same hidden/rollback capacity on every rank.
+    // `use_speculative` also covers DFlash at the server boundary.  Native
+    // GLM MTP is a separate lane: never load its rank-0 body for a DFlash
+    // request (where the appended tensors may intentionally be absent), nor
+    // for self/n-gram speculation that uses a different proposer contract.
+    let native_glm_requested =
+        glm::native_mtp_requested(use_speculative, dflash_args.is_some(), self_speculative);
+    let native_glm_mtp =
+        glm::native_mtp_capability(&config, &store, native_glm_requested, mtp_vocab_size)?;
+    if crate::weight_loader::glm5_mode::strict_native_mtp() {
+        anyhow::ensure!(
+            native_glm_mtp
+                && matches!(
+                    crate::weight_loader::glm5_mode::selected()?,
+                    Some(crate::weight_loader::glm5_mode::ServingMode::Strict)
+                )
+                && (1..=4).contains(&max_batch_size)
+                && max_seq_len <= config.max_position_embeddings,
+            "strict native MTP requires GLM TP2/TP4 native MTP, C1..C4 and the checkpoint context limit"
+        );
+    }
+    if native_glm_mtp {
+        glm::ensure_native_mtp_target_prerequisites(&config)?;
+    }
+    let glm5_mtp_module = if native_glm_mtp && config.tp_rank == 0 && config.ep_rank == 0 {
+        crate::weight_loader::glm5::load_glm5_mtp_module(&store, &config, gpu.as_ref())?
+            .ok_or_else(|| {
+                anyhow::anyhow!("GLM-5 native MTP was advertised but no module was loaded")
+            })
+            .map(Some)?
+    } else {
+        None
+    };
 
     // DeepSeek-V4 ships an architecturally distinct MTP module (MLA + mHC), not
     // the Qwen-shaped `MtpWeights`. Load it via the V4-specific path and keep it
@@ -262,6 +372,12 @@ pub fn build_model(
             None
         };
 
+    glm::ensure_expert_tp_drafter(
+        &config,
+        use_speculative,
+        dflash_args.is_none(),
+        native_glm_mtp,
+    )?;
     // Qwen3.8-Flash-Next ships an MTP block that is architecturally a full
     // layer (gated attention + QSA indexer + mHC + 512-expert MoE), not the
     // Qwen-shaped `MtpWeights`, so it loads through its own path exactly like
@@ -276,6 +392,9 @@ pub fn build_model(
             ) {
                 Ok(m) => m,
                 Err(e) => {
+                    if crate::weight_loader::qwen4_exp::mode::selected()?.is_some() {
+                        return Err(e.context("Qwen serving mode requires a working MTP module"));
+                    }
                     tracing::error!("qwen4_exp MTP module load FAILED: {e:#}");
                     None
                 }
@@ -284,13 +403,27 @@ pub fn build_model(
             None
         };
     let q4e_mtp_loaded = q4e_mtp_module.is_some();
+    anyhow::ensure!(
+        crate::weight_loader::qwen4_exp::mode::selected()?.is_none()
+            || config.ep_rank != 0
+            || q4e_mtp_loaded,
+        "Qwen serving mode requires checkpoint MTP weights on rank 0"
+    );
     let q4e_mtp_embed = embed;
     let q4e_mtp_lm_head = lm_head;
 
     // Capability warning: user asked for `--speculative` but the model has no
     // MTP head bundled, so speculative decoding will silently no-op. Surface
-    // this loudly so the user knows the flag was inert.
-    if use_speculative && mtp_weights.is_empty() && !q4e_mtp_loaded {
+    // this loudly so the user knows the flag was inert. Rank 0 only: the
+    // other ranks never draft and load no rank-0-only module.
+    if use_speculative
+        && config.ep_rank == 0
+        && dflash_args.is_none()
+        && mtp_weights.is_empty()
+        && v4_mtp_module.is_none()
+        && !q4e_mtp_loaded
+        && !native_glm_mtp
+    {
         tracing::warn!(
             "`--speculative` was requested but no MTP weights were loaded for this \
              model — speculative decoding will be disabled. Either drop `--speculative` \
@@ -358,6 +491,23 @@ pub fn build_model(
         !mtp_weights.is_empty(),
     )?;
 
+    // Reserve native MTP weights/workspace before measuring free memory. Its
+    // private KV is allocated later from the joint target/native pool budget.
+    let glm5_mtp_head = if let Some(module) = glm5_mtp_module {
+        Some(crate::layers::glm5_mtp::Glm5MtpHead::new(
+            module,
+            embed,
+            lm_head,
+            &config,
+            gpu.as_ref(),
+            mtp_vocab_size,
+            max_seq_len,
+            max_batch_size,
+        )?)
+    } else {
+        None
+    };
+
     // Capture the shared embed + resolved draft NVFP4 head for the DeepSeek-V4
     // MTP proposer BEFORE `embed` / `lm_head_nvfp4` / `mtp_lm_head_nvfp4` are
     // moved into `TransformerModel::new`. All are `Copy` (DenseWeight /
@@ -369,7 +519,6 @@ pub fn build_model(
     // same BF16 head via dense_gemv (drafts are re-verified by the target, so the
     // draft head only affects acceptance). DenseWeight is Copy.
     let v4_mtp_lm_head = lm_head;
-
     // ── Step 3b: Post-load MoE prefill transpose (MiniMax EP=2 TTFT fix) ──
     //
     // MiniMax M2.7-NVFP4 EP=2 has ~46 GB free at layer-0 load time but
@@ -379,8 +528,20 @@ pub fn build_model(
     // gemma4) still call `transpose_for_prefill` inline during layer
     // construction; this default-no-op hook doesn't perturb them.
     maybe_run_minimax_m2_moe_transpose(&config, gpu.as_ref(), &store, &mut layers)?;
+    glm::init_weight_caches(
+        &config,
+        &store,
+        gpu.as_ref(),
+        &mut layers,
+        shared_cache_reserve,
+        max_batch_tokens,
+        max_seq_len,
+        kv_block_size,
+        max_batch_size,
+        inference_reserve,
+    )?;
     // ── Step 4: Create buffer arena ──
-    let buffers = BufferArena::new(
+    let mut buffers = BufferArena::new(
         &config,
         max_batch_tokens,
         max_seq_len,
@@ -388,11 +549,42 @@ pub fn build_model(
         max_batch_size,
         gpu.as_ref(),
     )?;
+    // ATLAS_GLM_PREFILL_PIPE2: the second half-chunk's arena, sized with
+    // the model's before the KV pool.
+    let glm_latent_tokens = (kv_dtype == spark_runtime::kv_cache::KvCacheDtype::Fp8G128
+        && config.model_type == "glm5_next")
+        .then(|| {
+            crate::layers::ops::GLM_LATENT_BF16_VIEW_TOKENS.min(max_seq_len.next_multiple_of(16))
+        });
+    let pipe_arena = crate::model::glm_prefill_pipe::arena(
+        &config,
+        max_batch_tokens,
+        max_seq_len,
+        kv_block_size,
+        max_batch_size,
+        glm_latent_tokens,
+        gpu.as_ref(),
+    )?;
+    glm::init_arena_consumers(
+        &config,
+        &store,
+        gpu.as_ref(),
+        &mut layers,
+        &mut buffers,
+        kv_dtype,
+        max_seq_len,
+        max_batch_tokens,
+        lm_head.weight,
+        lm_head_fp8.is_none() && lm_head_nvfp4.is_none(),
+    )?;
 
     // ── Step 5: Size KV cache from actual free memory ──
     // MLA absorbed: cache compressed latent [kv_lora + rope] instead of expanded [nkv * hd]
     // This gives 12.8x smaller KV cache AND better precision (no expand→cache→read roundtrip)
-    let (kv_num_heads, kv_head_dim) = if config.kv_lora_rank > 0 {
+    let glm_cache_shape = glm::cache_shape(&config, kv_dtype, &layer_dtypes)?;
+    let (kv_num_heads, kv_head_dim) = if let Some(shape) = glm_cache_shape {
+        (shape.num_kv_heads(), shape.head_dim())
+    } else if config.kv_lora_rank > 0 {
         let mla_cache_dim = config.kv_lora_rank + config.qk_rope_head_dim;
         tracing::info!(
             "MLA absorbed KV cache: 1 head × {} dims ({}+{}) per token (vs {} heads × {})",
@@ -416,11 +608,34 @@ pub fn build_model(
         layer_dims: config.kv_layer_dims.clone(),
         cache_blocks_per_seq: hss_cache_blocks_per_seq,
     };
+    let (sparse_index, tail_slots, glm_cache_plan) = glm::cache_plan(
+        &config,
+        &kv_config,
+        glm_cache_shape,
+        // Slotted index tails need every resume to be lag-bounded. A prefix
+        // match covers whole cached blocks, which hold only finalized pools
+        // (`model::prefix_share`), provided SSM restores are block-aligned too.
+        use_speculative
+            && (!prefix_cache.is_active() || crate::model::mtp_carry::marconi_prefill_only())
+            && hss_cache_blocks_per_seq.is_none(),
+        max_batch_tokens,
+        kv_block_size,
+        max_batch_size,
+    )?;
+    let glm_cache_plan = glm::shard_plan(
+        glm_cache_plan,
+        &config,
+        &kv_config,
+        comm.as_deref(),
+        max_seq_len,
+        max_batch_tokens,
+    )?;
 
     if hss_cache_blocks_per_seq.is_some() {
         kv_summary::log_hss_kv_summary(&kv_config);
     }
-    // ── gpu_memory_utilization as fraction of TOTAL GPU memory ──
+    // ── KV budget: what is left of total × gpu_memory_utilization ──
+    // (contract, own-footprint measures and headroom floor: `kv_budget`).
     //
     // User-facing contract (matches vLLM / sparkrun convention):
     //   total_memory × gpu_memory_utilization = hard ceiling on everything
@@ -483,16 +698,26 @@ pub fn build_model(
     // they overflowed the physical remainder and boot died in cuMemAlloc
     // (Atlas-Inf/atlas#61).
     let draft_lm_head_nvfp4 = mtp_lm_head_nvfp4.or(lm_head_nvfp4);
-    let ssm_pools = crate::model::ssm_pools::SsmPools::new(
+    let ssm_pools = crate::model::ssm_pools::SsmPools::new_with_native(
         &config,
         max_batch_size,
         self_speculative,
         use_speculative,
+        native_glm_mtp,
         mtp_weights.is_empty(),
         draft_lm_head_nvfp4.is_some(),
         num_drafts,
         ssm_cache_slots,
         gpu.as_ref(),
+    )?;
+    // ATLAS_DFLASH_WARM_CTX=restore: the drafter window store, reserved here
+    // so the KV budget below sees it as used (nothing otherwise).
+    let dflash_warm_store = crate::layers::dflash_head::WarmCtxStore::for_build(
+        gpu.as_ref(),
+        config.dflash_capture_layers.len(),
+        config.hidden_size,
+        config.dflash_ctx_window,
+        comm.as_deref().is_none_or(|c| c.rank() == 0),
     )?;
 
     // Materialize the inference reserve as a "balloon" allocation held across
@@ -567,94 +792,205 @@ pub fn build_model(
         inference_reserve
     };
 
-    let total_mem = gpu.total_memory()?;
-    let actual_free = gpu.free_memory()?;
-    let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
-    let mut used_so_far = total_mem.saturating_sub(actual_free);
-    // GB10 is shared (ComfyUI/voxel/etc.). Raw `used_so_far` counts those
-    // co-tenants against our --gpu-memory-utilization budget, so a low util
-    // needlessly starves the KV pool (vs vLLM, whose util is self-relative).
-    //
-    // We want the KV pool sized against Atlas's OWN footprint (weights +
-    // buffers), excluding co-tenants. Two ways to find that footprint:
-    //
-    //   1. AUTO (default, preferred): free-at-context-init minus free-now =
-    //      exactly what THIS process allocated since startup. Co-tenants that
-    //      were already resident at init are in the baseline, so they cancel
-    //      out — and it self-corrects as co-tenants come and go (no stale
-    //      constant). Requires `set_baseline_free_bytes` to have run (it does
-    //      under the real server; absent under the mock backend → we skip it).
-    //
-    //   2. MANUAL override: ATLAS_KV_EXTERNAL_RESERVE_GB=<co-tenant GB> still
-    //      wins when explicitly set (>0), for operators who want to RESERVE
-    //      headroom for co-tenants that will arrive LATER (the auto measure
-    //      only sees current state).
-    //
-    // The `.min(actual_free - reserve)` clamp below still guarantees a physical
-    // fit regardless of which path set `used_so_far`.
-    let manual_reserve_gb = std::env::var("ATLAS_KV_EXTERNAL_RESERVE_GB")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|&gb| gb > 0.0);
-    if let Some(gb) = manual_reserve_gb {
-        let ext = (gb * 1024.0 * 1024.0 * 1024.0) as usize;
-        let discounted = used_so_far.saturating_sub(ext);
-        tracing::info!(
-            "ATLAS_KV_EXTERNAL_RESERVE_GB={gb} (manual override): discounting \
-             external/co-tenant memory from KV budget — used_so_far {:.1} GB → \
-             Atlas-own {:.1} GB",
-            gib(used_so_far),
-            gib(discounted),
-        );
-        used_so_far = discounted;
-    } else if let Some(baseline) = spark_runtime::gpu::baseline_free_bytes() {
-        // AUTO: bytes this process consumed since context init.
-        let atlas_own = baseline.saturating_sub(actual_free);
-        // Sanity-gate: baseline must be ≥ free-now, atlas_own positive and no
-        // larger than total used (co-tenants can't be negative). If a co-tenant
-        // *freed* memory during our load, baseline > free-now still holds and
-        // atlas_own just slightly overcounts (conservative — fine). If the
-        // numbers are implausible, fall back to raw used_so_far.
-        if atlas_own > 0 && atlas_own <= used_so_far {
-            tracing::info!(
-                "KV budget self-relative (auto): baseline-free {:.1} GB − free-now \
-                 {:.1} GB = Atlas-own {:.1} GB; co-tenants {:.1} GB excluded \
-                 (set ATLAS_KV_EXTERNAL_RESERVE_GB to override)",
-                gib(baseline),
-                gib(actual_free),
-                gib(atlas_own),
-                gib(used_so_far - atlas_own),
-            );
-            used_so_far = atlas_own;
-        } else {
-            tracing::warn!(
-                "KV budget auto-measure implausible (baseline {:.1} GB, free-now \
-                 {:.1} GB, used {:.1} GB) — using raw used_so_far",
-                gib(baseline),
-                gib(actual_free),
-                gib(used_so_far),
-            );
+    // The DFlash drafter head is built BEFORE the KV budget below: its paged KV
+    // pools, batch scratch, NVFP4 twins and (DSpine) serial tables then land in
+    // the measured footprint instead of past it. Installed after the model.
+    let mut dflash_head: Option<crate::layers::BlockDiffusionDraftHead> = None;
+    let mut dflash_weights_missing = false;
+    if let Some(ptr) = drafter_balloon
+        && let Err(e) = gpu.free(ptr)
+    {
+        tracing::warn!("drafter balloon free failed: {e}");
+    }
+    if let Some(args) = dflash_args.as_ref().filter(|a| !a.drafter_store.is_empty()) {
+        let target_embed_for_dflash = embed.weight;
+        let target_lm_head_for_dflash = lm_head.weight;
+        let target_lm_head_nvfp4_for_dflash = lm_head_nvfp4;
+        let target_hidden_for_dflash = config.hidden_size;
+        let target_vocab_for_dflash = config.vocab_size;
+        let weights = load_dflash_weights(
+            args.drafter_store,
+            &args.drafter_config,
+            gpu.as_ref(),
+            1, // tp_size for the drafter side: replicated, so always 1
+        )?;
+        match weights {
+            Some(weights) => {
+                if lightning_dspark_admitted {
+                    anyhow::ensure!(
+                        weights.markov_w1.is_some() && weights.markov_w2.is_some(),
+                        "Lightning DSpark required Markov weights disappeared after load"
+                    );
+                    anyhow::ensure!(
+                        weights
+                            .layers
+                            .iter()
+                            .all(|layer| layer.attention_sink_bias.is_some()),
+                        "Lightning DSpark required attention sink weights disappeared after load"
+                    );
+                }
+                // Lightning admission owns the served SWA window. Generic
+                // DFlash keeps the caller's existing override/default path.
+                let served_window_size = lightning_dspark_policy
+                    .as_ref()
+                    .map(|policy| policy.profile().attention.swa_window)
+                    .or(args.window_size);
+                // Startup-static execution is frozen at head construction:
+                // the admitted Lightning product derives it from the
+                // validated policy toggles; generic DFlash keeps legacy
+                // lenient environment semantics, still parsed exactly once.
+                let mut startup = match lightning_dspark_policy.as_ref() {
+                    Some(policy) => {
+                        DsparkStartupExecution::from_lightning(policy.runtime_toggles())
+                    }
+                    None => DsparkStartupExecution::from_env_lenient(),
+                };
+                // Strict for every head: an unknown value fails the build.
+                startup.diagnostics.first_append = FirstAppend::for_head()?;
+                startup.diagnostics.warm_ctx = crate::layers::dflash_head::WarmCtx::for_head()?;
+                let union = config.dflash_capture_layers.clone();
+                let dual = args.alt.is_some();
+                anyhow::ensure!(
+                    !dual || !lightning_dspark_admitted,
+                    "--draft-model-alt does not pair with the Lightning DSpark product"
+                );
+                let build_head =
+                    |mut weights: crate::weight_loader::DflashWeights,
+                     store: &WeightStore,
+                     startup: DsparkStartupExecution|
+                     -> Result<crate::layers::BlockDiffusionDraftHead> {
+                        // Two drafters: each reads its own layers out of the union
+                        // capture, and runs at its own block size (capped by γ).
+                        let gamma = if dual {
+                            crate::layers::dflash_head::dual::widen_to_union(
+                                &mut weights,
+                                &union,
+                                target_hidden_for_dflash,
+                                store,
+                                gpu.as_ref(),
+                            )?;
+                            Some(args.gamma.map_or(weights.config.block_size(), |g| {
+                                g.min(weights.config.block_size())
+                            }))
+                        } else {
+                            args.gamma
+                        };
+                        crate::layers::BlockDiffusionDraftHead::from_weights(
+                            weights,
+                            target_embed_for_dflash,
+                            target_lm_head_for_dflash,
+                            target_lm_head_nvfp4_for_dflash,
+                            target_hidden_for_dflash,
+                            target_vocab_for_dflash,
+                            gamma,
+                            served_window_size,
+                            gpu.as_ref(),
+                            max_seq_len,
+                            max_batch_size,
+                            &config.model_type,
+                            startup,
+                        )
+                    };
+                let alt_head = match args.alt.as_ref() {
+                    Some((store, alt_config)) => {
+                        let alt_weights = load_dflash_weights(store, alt_config, gpu.as_ref(), 1)?
+                            .context("--draft-model-alt has no DFlash weights (fc.weight)")?;
+                        let mut alt_startup = DsparkStartupExecution::from_env_lenient();
+                        alt_startup.diagnostics.first_append = FirstAppend::for_head()?;
+                        alt_startup.diagnostics.warm_ctx =
+                            crate::layers::dflash_head::WarmCtx::for_head()?;
+                        Some(build_head(alt_weights, store, alt_startup)?)
+                    }
+                    None => None,
+                };
+                let mut head = build_head(weights, args.drafter_store, startup)?;
+                if let Some(alt) = alt_head {
+                    head.set_alt(alt)?;
+                }
+                dflash_head = Some(head);
+            }
+            None => dflash_weights_missing = true,
         }
     }
+
+    let total_mem = gpu.total_memory()?;
+    let actual_free = gpu.free_memory()?;
+    let gib = kv_budget::gib;
     // Issue #71: lazy FP8→BF16 dequant copies allocate after this sizing;
     // see `ops::lazy_bf16_reserve` for what counts and what logs.
     let derived_reserve = crate::layers::ops::lazy_bf16_reserve(&store);
-    let total_budget = (total_mem as f64 * gpu_memory_utilization) as usize;
-    let kv_budget = total_budget
-        .saturating_sub(used_so_far)
-        .saturating_sub(reserve_net)
-        .saturating_sub(derived_reserve)
-        .min(
-            actual_free
-                .saturating_sub(reserve_net)
-                .saturating_sub(derived_reserve),
+    // NVMe spill tiers (default off → 0): their staging, the index of a full
+    // disk budget and the SSM tier's arena are all committed after this point.
+    let nvme_geometry = PagedKvCache::nvme_geometry_for(
+        &kv_config,
+        glm_cache_plan.is_some(),
+        sparse_index,
+        glm_cache_plan.and_then(|p| p.shard()).map(|s| s.world),
+    );
+    // ATLAS_QWEN4EXP_SNAPSHOT_SLOTS / _AUX_MB: the snapshots' host aux
+    // (`ssm_snapshot_budget`), 0 by default.
+    let snapshot_aux = crate::model::ssm_snapshot_budget::install(
+        &ssm_pools.snapshots,
+        layers.iter().map(|l| l.aux_bytes_per_token()).sum(),
+    );
+    // The drafter's per-sequence context accumulators, taken at request time.
+    let dflash_post_kv = dflash_args.as_ref().map_or(0, |_| {
+        dflash_reserve::bytes(
+            config.dflash_capture_layers.len(),
+            config.hidden_size,
+            max_seq_len,
+            max_batch_size,
+        )
+    });
+    if dflash_post_kv > 0 {
+        tracing::info!(
+            "DFlash context accumulators reserved from the KV \
+             budget: {:.2} GB for {max_batch_size} sequences",
+            dflash_post_kv as f64 / 1e9
         );
+    }
+    // The NVFP4 LM head's transposed twin, built in `TransformerModel::new`.
+    let lm_twin = crate::model::impl_a1::lm_head_twin_bytes(
+        lm_head_nvfp4.is_some(),
+        config.vocab_size,
+        config.hidden_size,
+    );
+    let reserve_net = reserve_net
+        + snapshot_aux
+        + dflash_post_kv
+        + lm_twin
+        + kv_nvme::host_reserve_bytes(nvme_geometry, ssm_pools.tier_lazy_host_bytes());
+    let budget = kv_budget::measure(
+        gpu.as_ref(),
+        total_mem,
+        actual_free,
+        gpu_memory_utilization,
+        reserve_net + derived_reserve,
+        hss_cache_blocks_per_seq.is_none(),
+    );
+    let (used_so_far, total_budget, kv_budget) = (budget.own, budget.total_budget, budget.bytes);
+    // Per-sequence state that grows with a sequence's tokens outside the pool
+    // (the QSA indexer carry): charged per pool token, so the pool and the
+    // state riding with its tokens fit the budget together.
+    let aux_bytes_per_token: usize = layers.iter().map(|l| l.aux_bytes_per_token()).sum();
     // Phase 6.1.f: when HBM-shrink is active, size the production cache to
     // `max_batch_size × cache_blocks_per_seq` rather than the unbounded
     // budget-driven sum. This is the *whole point* of the HBM-shrink
     // feature — the production cache becomes write staging only; older
     // blocks live on disk under the orchestrator's control.
-    let num_kv_blocks = match hss_cache_blocks_per_seq {
+    let (native_block_bytes, native_fixed_bytes) = glm5_mtp_head
+        .as_ref()
+        .map(|head| head.private_kv_budget(kv_block_size))
+        .transpose()?
+        .unwrap_or((0, 0));
+    let joint_glm_plan = glm_cache_plan
+        .map(|plan| plan.with_auxiliary_pool(native_block_bytes, native_fixed_bytes))
+        .transpose()?;
+    anyhow::ensure!(
+        glm5_mtp_head.is_none() || joint_glm_plan.is_some(),
+        "native MTP requires the GLM joint KV planner"
+    );
+    let mut num_kv_blocks = match hss_cache_blocks_per_seq {
         Some(cap) => {
             // Phase 6.3 (original): pool = max_batch × cap + 1 dummy + 1 spare per seq.
             // Issue #31 (2026-05-08): the cap×bs sizing assumed prefill would
@@ -705,8 +1041,7 @@ pub fn build_model(
                     "No memory left for KV cache: total GPU = {:.1} GB, \
                      --gpu-memory-utilization {:.0}% → budget {:.1} GB, \
                      but {:.1} GB already consumed + {:.1} GB inference reserve (net of balloon)\
-                     {lazy_bf16_term} = {:.1} GB committed.  Raise \
-                     --gpu-memory-utilization or use a smaller model.",
+                     {lazy_bf16_term} = {:.1} GB committed.  {}",
                     total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
                     gpu_memory_utilization * 100.0,
                     total_budget as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -714,18 +1049,31 @@ pub fn build_model(
                     reserve_net as f64 / (1024.0 * 1024.0 * 1024.0),
                     (used_so_far + reserve_net + derived_reserve) as f64
                         / (1024.0 * 1024.0 * 1024.0),
+                    budget.no_room_advice(actual_free),
                 );
             }
-            let n = PagedKvCache::compute_num_blocks(&kv_config, kv_budget)?;
+            let n = match joint_glm_plan {
+                Some(plan) => plan.num_blocks_for_budget(kv_budget),
+                None => kv_budget::blocks_with_aux(&kv_config, kv_budget, aux_bytes_per_token)?,
+            };
             let max_kv_tokens = n * kv_block_size;
             let lazy_bf16_term = if derived_reserve > 0 {
                 format!(" + {:.1} GB lazy BF16", gib(derived_reserve))
             } else {
                 String::new()
             };
+            let aux_term = if aux_bytes_per_token > 0 {
+                format!(
+                    " (incl. {:.1} GB for {aux_bytes_per_token} B/token of per-sequence \
+                     indexer state)",
+                    gib(max_kv_tokens * aux_bytes_per_token),
+                )
+            } else {
+                String::new()
+            };
             tracing::info!(
                 "KV cache: {:.1} GB total × {:.0}% util = {:.1} GB budget; \
-                 {:.1} GB pre-KV + {:.1} GB reserve{lazy_bf16_term} → {:.1} GB for KV \
+                 {:.1} GB pre-KV + {:.1} GB reserve{lazy_bf16_term} → {:.1} GB for KV{aux_term} \
                  → {} blocks × {} tok/block = {} max KV tokens",
                 total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
                 gpu_memory_utilization * 100.0,
@@ -740,6 +1088,34 @@ pub fn build_model(
             n
         }
     };
+    // The carveout adds blocks beyond the budget (not to a fixed HSS window).
+    // Under a latent shard it holds this rank's half-size latent pools.
+    let kv_shape = kv_carveout::KvShape {
+        config: &kv_config,
+        v_aliases_k: glm_cache_plan.is_some(),
+        index: sparse_index,
+        tail_slots,
+        latent_shard: glm_cache_plan.and_then(|p| p.shard()),
+        // Native proposer bytes per logical block; always remain in system
+        // memory (Enntity/atlas 4d75b9ec).
+        auxiliary_block_bytes: native_block_bytes,
+    }
+    .with_per_token_aux(aux_bytes_per_token)?;
+    let (blocks, kv_placement) = if hss_cache_blocks_per_seq.is_none() {
+        kv_carveout::extend(gpu.as_ref(), kv_shape, num_kv_blocks)
+    } else {
+        (num_kv_blocks, Default::default())
+    };
+    num_kv_blocks = glm::agree_kv_blocks(
+        comm.as_deref(),
+        gpu.as_ref(),
+        blocks,
+        glm_cache_plan,
+        kv_nvme::rank_word(nvme_geometry, ssm_pools.tier_home),
+    )?;
+    if let Some(head) = &glm5_mtp_head {
+        head.allocate_private_kv(num_kv_blocks, gpu.as_ref())?;
+    }
     let _max_kv_tokens = num_kv_blocks * kv_block_size;
     // Phase 6.1.f / 6.2.c — when --high-speed-swap is on with HBM-shrink, the
     // production KV cache only has to fit the per-seq HBM window, not the full
@@ -804,7 +1180,13 @@ pub fn build_model(
     // reports as free (Windows gfx1151: a 102 MB KV pool alloc failed with
     // 12 GB "free"), release the balloon and retry: the pre-balloon behavior.
     let mut balloon = balloon;
-    let kv_cache = match PagedKvCache::new(kv_config.clone(), num_kv_blocks, gpu.as_ref()) {
+    let mut kv_cache = match glm::new_kv_cache(
+        kv_config.clone(),
+        num_kv_blocks,
+        gpu.as_ref(),
+        glm_cache_plan,
+        kv_placement.clone(),
+    ) {
         Ok(kv) => kv,
         Err(e) if balloon.is_some() => {
             tracing::warn!(
@@ -814,10 +1196,27 @@ pub fn build_model(
             if let Some(ptr) = balloon.take() {
                 gpu.free(ptr)?;
             }
-            PagedKvCache::new(kv_config, num_kv_blocks, gpu.as_ref())?
+            glm::new_kv_cache(
+                kv_config,
+                num_kv_blocks,
+                gpu.as_ref(),
+                glm_cache_plan,
+                kv_placement,
+            )?
         }
         Err(e) => return Err(e),
     };
+
+    if let Some(index) = sparse_index {
+        kv_cache.attach_sparse_index_with_tail_slots(index, tail_slots, gpu.as_ref())?;
+    }
+    kv_nvme::attach(
+        &mut kv_cache,
+        prefix_cache.as_ref(),
+        gpu.as_ref(),
+        comm.as_deref().map_or(0, |c| c.rank()),
+        ssm_pools.tier_home,
+    )?;
 
     // Release the reserve balloon: everything after this point (Marconi
     // snapshot pool, SSM decode states, drafter KV, NVFP4 staging) allocates
@@ -832,13 +1231,41 @@ pub fn build_model(
     // Capture pointers for any post-construction sharing (DFlash drafter
     // shares embed_tokens + lm_head with the target). DenseWeight is Copy
     // so this clones the device pointer cheaply.
-    let target_embed_for_dflash = embed.weight;
-    let target_lm_head_for_dflash = lm_head.weight;
     // NVFP4 lm_head (Copy) shared with the DFlash drafter so its final logits
     // GEMM uses w4a16 instead of a BF16 dense_gemm on NVFP4-packed bytes.
-    let target_lm_head_nvfp4_for_dflash = lm_head_nvfp4;
-    let target_hidden_for_dflash = config.hidden_size;
-    let target_vocab_for_dflash = config.vocab_size;
+
+    // The BF16 lm_head is only ever a fallback: every logits producer prefers
+    // the NVFP4 head when it exists (impl_a3::lm_head, the lm_head_batched
+    // arm, the decode_b2 prefill-logits arm, and the DFlash drafter whose
+    // lm_head_shared is guarded by lm_head_nvfp4.is_none()). On NVFP4-head
+    // targets the BF16 copy (~vocab x hidden x 2 B) is provably dead weight —
+    // free it and NULL the stored pointer so no later fallback can
+    // dereference freed memory. Only when the NVFP4 head does not live in
+    // that buffer (pre-packed checkpoints) and it is not the tied embedding.
+    //
+    // Not when an MTP drafter captured the BF16 head above: `q4e_mtp_lm_head`
+    // and `v4_mtp_lm_head` are copies of this pointer, taken before this point,
+    // and the drafters project with it. Freeing it made Qwen3.8-Flash-Next's
+    // first propose read freed memory under `--lm-head-dtype nvfp4` (#264:
+    // illegal address in run_mtp_propose_multi; the fp8 and bf16 heads never
+    // reach this free, and NUM_DRAFTS=0 never reads the head).
+    let drafter_holds_bf16_head =
+        q4e_mtp_loaded || v4_mtp_module.is_some() || glm5_mtp_head.is_some();
+    let lm_head = if !drafter_holds_bf16_head
+        && super::lm_head_setup::bf16_lm_head_is_dead(
+            lm_head.weight,
+            lm_head_nvfp4.as_ref(),
+            embed.weight,
+        ) {
+        if let Err(e) = gpu.free(lm_head.weight) {
+            tracing::warn!("lm_head BF16 intermediate free failed: {e}");
+        }
+        crate::weight_map::DenseWeight {
+            weight: spark_runtime::gpu::DevicePtr::NULL,
+        }
+    } else {
+        lm_head
+    };
 
     let mut model = TransformerModel::new(
         config,
@@ -866,6 +1293,15 @@ pub fn build_model(
         ssm_checkpoint_interval,
         ssm_pools,
     )?;
+    model.set_dflash_warm_store(dflash_warm_store);
+    if let Some(arena) = pipe_arena {
+        model.set_prefill_pipe(arena)?;
+    }
+
+    if let Some(head) = glm5_mtp_head {
+        model.set_dflash_proposer(std::sync::Arc::new(head));
+        tracing::info!("GLM-5 native MTP speculative decoding: ENABLED (single full-rank module)");
+    }
 
     // ── Step 6b: DeepSeek-V4 MTP proposer (optional, post-construction) ──
     //
@@ -899,26 +1335,63 @@ pub fn build_model(
     // Same shape as 6b: the module holds a reused trunk layer, and the
     // proposer supplies the MTP-specific ends (the per-stream combiner in
     // front, the head mixer behind).
+    //
+    // ATLAS_QWEN4EXP_MTP_DRAFT_TP: on the TP2 pair the worker builds the same
+    // draft head and projects half of each batched propose's
+    // (`layers::qwen4exp_mtp::draft_tp`); it proposes nothing.
+    let (q4e_draft_tp, rank) = {
+        let c = model.config_ref();
+        let pair = c.tp_world_size == 2 && c.ep_world_size == 2;
+        let on = c.model_type == "qwen4_exp" && use_speculative && pair;
+        (
+            on && crate::layers::qwen4exp_mtp::draft_tp::requested()?,
+            c.ep_rank,
+        )
+    };
+    if q4e_draft_tp && rank != 0 {
+        let (vocab, hidden) = {
+            let c = model.config_ref();
+            (c.vocab_size, c.hidden_size)
+        };
+        let assist = crate::layers::qwen4exp_mtp::draft_tp::Qwen4ExpDraftAssist::new(
+            &q4e_mtp_lm_head,
+            vocab,
+            hidden,
+            mtp_vocab_size,
+            model.gpu_backend(),
+        )?;
+        model.set_draft_assist(std::sync::Arc::new(assist));
+        tracing::info!("qwen4_exp MTP draft head installed on rank {rank} to serve draft TP");
+    }
     if let Some(q4e_module) = q4e_mtp_module {
+        // Ported from Enntity/atlas 23350fb (AGPL-3.0-only).
+        crate::layers::qwen4exp_mtp::qwen4exp_mtp_prompt::check_exclusive()?;
         match crate::layers::Qwen4ExpMtpHead::new(
             q4e_module,
             q4e_mtp_embed,
             q4e_mtp_lm_head,
-            model.config_ref(),
             model.gpu_backend(),
             mtp_vocab_size,
             max_seq_len,
         ) {
-            Ok(head) => {
+            Ok(mut head) => {
+                if q4e_draft_tp {
+                    head.enable_draft_tp(model.gpu_backend())?;
+                }
                 model.set_dflash_proposer(std::sync::Arc::new(head));
                 tracing::info!(
                     "qwen4_exp MTP speculative decoding: ENABLED (single module, \
                      reused full-attention body)"
                 );
             }
-            Err(e) => tracing::warn!(
-                "Failed to build qwen4_exp MTP proposer: {e:#}. Speculative decoding disabled."
-            ),
+            Err(e) => {
+                if crate::weight_loader::qwen4_exp::mode::selected()?.is_some() {
+                    return Err(e.context("Qwen serving mode requires a working MTP proposer"));
+                }
+                tracing::warn!(
+                    "Failed to build qwen4_exp MTP proposer: {e:#}. Speculative decoding disabled."
+                );
+            }
         }
     }
 
@@ -936,92 +1409,54 @@ pub fn build_model(
     // first makes that precondition observable instead of bypassable.
     model.set_lora_weights(lora_weights)?;
 
-    // Free the drafter balloon: the drafter's pools, fused weights and NVFP4
-    // staging now allocate into its pristine region — not the shredded tail.
-    if let Some(ptr) = drafter_balloon
-        && let Err(e) = model.gpu_backend().free(ptr)
-    {
-        tracing::warn!("drafter balloon free failed: {e}");
-    }
-
-    if let Some(args) = dflash_args {
-        let weights = load_dflash_weights(
-            args.drafter_store,
-            &args.drafter_config,
-            model.gpu_backend(),
-            1, // tp_size for the drafter side: replicated, so always 1
-        )?;
-        match weights {
-            Some(weights) => {
-                if lightning_dspark_admitted {
-                    anyhow::ensure!(
-                        weights.markov_w1.is_some() && weights.markov_w2.is_some(),
-                        "Lightning DSpark required Markov weights disappeared after load"
-                    );
-                    anyhow::ensure!(
-                        weights
-                            .layers
-                            .iter()
-                            .all(|layer| layer.attention_sink_bias.is_some()),
-                        "Lightning DSpark required attention sink weights disappeared after load"
-                    );
-                }
-                // Lightning admission owns the served SWA window. Generic
-                // DFlash keeps the caller's existing override/default path.
-                let served_window_size = lightning_dspark_policy
-                    .as_ref()
-                    .map(|policy| policy.profile().attention.swa_window)
-                    .or(args.window_size);
-                // Startup-static execution is frozen at head construction:
-                // the admitted Lightning product derives it from the
-                // validated policy toggles; generic DFlash keeps legacy
-                // lenient environment semantics, still parsed exactly once.
-                let startup = match lightning_dspark_policy.as_ref() {
-                    Some(policy) => {
-                        DsparkStartupExecution::from_lightning(policy.runtime_toggles())
-                    }
-                    None => DsparkStartupExecution::from_env_lenient(),
-                };
-                let head = crate::layers::BlockDiffusionDraftHead::from_weights(
-                    weights,
-                    target_embed_for_dflash,
-                    target_lm_head_for_dflash,
-                    target_lm_head_nvfp4_for_dflash,
-                    target_hidden_for_dflash,
-                    target_vocab_for_dflash,
-                    args.gamma,
-                    served_window_size,
-                    model.gpu_backend(),
-                    max_seq_len,
-                    max_batch_size,
-                    startup,
-                )?;
-                match lightning_dspark_policy {
-                    Some(policy) => {
-                        model.set_lightning_dspark_proposer(std::sync::Arc::new(head), policy)?
-                    }
-                    None => model.set_dflash_proposer(std::sync::Arc::new(head)),
-                }
-                tracing::info!(
-                    "{} drafter installed as the active proposer",
-                    if lightning_dspark_admitted {
-                        "Lightning DSpark"
-                    } else {
-                        "DFlash"
-                    }
-                );
-            }
-            None if lightning_dspark_admitted => {
-                anyhow::bail!(
-                    "Lightning DSpark admission passed but required drafter weights were not loaded"
-                );
-            }
-            None => {
-                tracing::warn!(
-                    "Generic DFlash drafter store had no fc.weight — proposer not installed"
-                );
-            }
+    // A worker rank carries the drafter config only; the head proposes.
+    if let Some(mut head) = dflash_head {
+        // ATLAS_GLM_DRAFT_TP: on the TP2 pair or the TP4 chain every
+        // rank holds the drafter and computes its share of a propose;
+        // a worker's copy serves its share and proposes nothing.
+        let (rank, ranks, split_ranks) = {
+            let c = model.config_ref();
+            (c.ep_rank, c.ep_world_size, crate::layers::moe::glm_tp_ep(c))
+        };
+        let split = crate::layers::dflash_head::rank_split::requested()?
+            .filter(|_| split_ranks && !lightning_dspark_admitted);
+        if let Some(parts) = split {
+            let batch = crate::layers::dflash_head::rank_split::batch_requested()?;
+            let ctx = crate::layers::dflash_head::rank_split::ctx_requested()?;
+            let topk = crate::layers::dflash_head::rank_split::topk_requested()?;
+            head.enable_rank_split(parts, batch, ctx, topk, ranks, model.gpu_backend())?;
         }
+        if rank != 0 {
+            anyhow::ensure!(
+                split.is_some(),
+                "rank {rank} loaded a drafter it cannot use: ATLAS_GLM_DRAFT_TP \
+                 needs the generic DFlash drafter on the TP2 pair or the TP4 chain"
+            );
+            model.set_draft_assist(std::sync::Arc::new(head));
+            tracing::info!("DFlash drafter installed on rank {rank} to serve split proposes");
+        } else {
+            match lightning_dspark_policy {
+                Some(policy) => {
+                    model.set_lightning_dspark_proposer(std::sync::Arc::new(head), policy)?
+                }
+                None => model.set_dflash_proposer(std::sync::Arc::new(head)),
+            }
+            tracing::info!(
+                "{} drafter installed as the active proposer",
+                if lightning_dspark_admitted {
+                    "Lightning DSpark"
+                } else {
+                    "DFlash"
+                }
+            );
+        }
+    } else if dflash_weights_missing {
+        if lightning_dspark_admitted {
+            anyhow::bail!(
+                "Lightning DSpark admission passed but required drafter weights were not loaded"
+            );
+        }
+        tracing::warn!("Generic DFlash drafter store had no fc.weight — proposer not installed");
     }
 
     if let Some(ngram) = ngram_embed {

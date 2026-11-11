@@ -35,6 +35,27 @@ use super::vision::parse_vision_config;
 /// config against itself; the loader reads the real sizes off the checkpoint.
 const NGRAM_VOCAB_ALIGN: u64 = 128;
 
+/// `ATLAS_QWEN4EXP_DEBUG_LAYERS=<n>` (debug only, unset in serving): keep
+/// the first `n` decoder layers. A whole-model harness that fits one GB10
+/// beside other tenants -- with `n = 8` it still has every layer kind (GDN,
+/// the PLE layer 2, QSA attention, the last layer's `hc_head`) -- for checks
+/// that compare the engine against ITSELF, such as prefill chunk invariance.
+/// The logits are not the model's.
+fn debug_truncate_layers(config: &mut ModelConfig) {
+    let keep = std::env::var("ATLAS_QWEN4EXP_DEBUG_LAYERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0 && n < config.num_hidden_layers);
+    if let Some(n) = keep {
+        eprintln!(
+            "ATLAS_QWEN4EXP_DEBUG_LAYERS: keeping {n} of {} layers",
+            config.num_hidden_layers
+        );
+        config.num_hidden_layers = n;
+        config.layer_types.truncate(n);
+    }
+}
+
 pub(crate) fn parse_qwen4_exp(raw: &Value) -> Result<ModelConfig> {
     let text = raw
         .get("text_config")
@@ -63,6 +84,7 @@ pub(crate) fn parse_qwen4_exp(raw: &Value) -> Result<ModelConfig> {
     // prefix here means `config.layer_prefix(i)` yields the real key, so the
     // shared loader helpers need no qwen4_exp-specific naming.
     config.weight_prefix = "model.language_model".to_string();
+    debug_truncate_layers(&mut config);
 
     ensure!(
         config.hidden_size > 0,
@@ -89,7 +111,7 @@ pub(crate) fn parse_qwen4_exp(raw: &Value) -> Result<ModelConfig> {
         config.eos_token_id = primary.unwrap_or(0) as u32;
     }
 
-    parse_rope(text, &mut config);
+    parse_rope(text, &mut config)?;
     parse_hyper_connections(text, &mut config)?;
     parse_indexer(text, &mut config)?;
     parse_ngram_ple(text, &mut config)?;
@@ -150,9 +172,9 @@ pub(crate) fn parse_qwen4_exp(raw: &Value) -> Result<ModelConfig> {
 
 /// mRoPE + partial rotary live under `rope_parameters`, not at text_config
 /// top level, so serde's derive does not reach them.
-fn parse_rope(text: &Value, config: &mut ModelConfig) {
+fn parse_rope(text: &Value, config: &mut ModelConfig) -> Result<()> {
     let Some(rp) = text.get("rope_parameters") else {
-        return;
+        return Ok(());
     };
     if let Some(theta) = rp.get("rope_theta").and_then(Value::as_f64) {
         config.rope_theta = theta;
@@ -169,6 +191,7 @@ fn parse_rope(text: &Value, config: &mut ModelConfig) {
             config.mrope_section[i] = v.as_u64().unwrap_or(0) as usize;
         }
     }
+    crate::qwen_yarn::parse_parameters(rp, config)
 }
 
 /// `hc_count` / `hc_lowrank` -> `hc_mult` / `hc_lowrank`.

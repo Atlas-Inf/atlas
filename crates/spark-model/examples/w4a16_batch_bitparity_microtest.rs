@@ -24,7 +24,7 @@
 //! Exit: 0 all legs byte-identical, 1 any leg differs,
 //! 2 kernels absent from this target's module set.
 //!
-//! Run:
+//! Run (any NVFP4 target; `qwen3.8-27b` for the Qwen3.8-27B exact verify):
 //!   ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=nemotron-3-nano-30b-a3b \
 //!   ATLAS_TARGET_QUANT=nvfp4 cargo run -p spark-model --release \
 //!     --features cuda,gpu-examples --example w4a16_batch_bitparity_microtest
@@ -47,12 +47,24 @@ const _: () = assert!(!TAIL_N.is_multiple_of(4));
 /// rows cover the hidden-4096 Super/Puzzle backbone at the natural doubling
 /// (d_inner 8192); they are shape COVERAGE for a larger N and a deeper K, not
 /// a claim about that checkpoint's exact `in_proj_size`.
-const SHAPES: [(&str, usize, usize); 5] = [
+///
+/// The `q27` rows are the Qwen3.8-27B (qwen3_5, hidden 5120) NVFP4 shapes
+/// the `ATLAS_EXACT_VERIFY` DFlash K=γ verify runs on `w4a16_gemv_batch16`
+/// at 9..=16 rows (and the scalar tiers below that): dense FFN gate/up and
+/// down, attention K/V and o_proj (also the NVFP4 GDN out_proj's shape), the
+/// NVFP4 GDN in_proj_qkvz, and the LM head.
+const SHAPES: [(&str, usize, usize); 11] = [
     ("nano  in_proj  [10304 x 2688]", 10304, 2688),
     ("nano  out_proj [ 2688 x 4096]", 2688, 4096),
     ("super in_proj  [18560 x 4096]", 18560, 4096),
     ("super out_proj [ 4096 x 8192]", 4096, 8192),
     ("tail  odd-N    [10307 x 2688]", TAIL_N, 2688),
+    ("q27   gate/up  [17408 x 5120]", 17408, 5120),
+    ("q27   down     [5120 x 17408]", 5120, 17408),
+    ("q27   o_proj   [ 5120 x 6144]", 5120, 6144),
+    ("q27   gdn qkvz [16384 x 5120]", 16384, 5120),
+    ("q27   k/v      [ 1024 x 5120]", 1024, 5120),
+    ("q27   lm_head [248320 x 5120]", 248_320, 5120),
 ];
 
 struct Lcg(u64);

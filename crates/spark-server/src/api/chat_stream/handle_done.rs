@@ -6,8 +6,8 @@
 use crate::ir::StreamDelta;
 use crate::tool_parser;
 
-use super::super::sanitizer::sanitize_content_chunk;
-use super::super::stream_guards::flush_content_sanitizer;
+use super::super::sanitizer::sanitize_content_chunk_with_literal_state;
+use super::super::stream_guards::flush_content_sanitizer_with_literal_state;
 use super::ctx::StreamCtx;
 use super::state::StreamState;
 use super::tool_handlers::{
@@ -16,6 +16,9 @@ use super::tool_handlers::{
 };
 
 type DeltaVec = Vec<StreamDelta>;
+
+#[path = "done_finalization.rs"]
+mod finalization;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_done(
@@ -29,148 +32,6 @@ pub(super) fn handle_done(
     cached_prompt_tokens: u32,
     accepted_prediction_tokens: usize,
 ) -> DeltaVec {
-    let mut deltas: DeltaVec = Vec::new();
-
-    // ── Stop-string hold-back flush ─────────────────────────────────
-    // vLLM's `IncrementalDetokenizer` releases any bytes still in the
-    // hold-back window when the stream finalises (see
-    // `vllm/v1/engine/detokenizer.py`). Mirror that here: if a match
-    // never triggered (`stop_string_triggered == false`) the tail
-    // bytes are legitimate output and must be forwarded. Route them
-    // through the active detector / sanitizer so the same envelope
-    // and leak-marker rules apply — without this, a sub-stop-string
-    // suffix that happens to contain a tool-call fragment would
-    // bypass the live pipeline.
-    if !ctx.stop_strings.is_empty()
-        && !state.stop_string_triggered
-        && state.stop_string_emitted_len < state.accumulated_content.len()
-    {
-        let tail = state.accumulated_content[state.stop_string_emitted_len..].to_string();
-        state.stop_string_emitted_len = state.accumulated_content.len();
-        if !tail.is_empty() {
-            if let Some(det) = state.detector.as_mut() {
-                let outputs = det.process(&tail);
-                for output in outputs {
-                    match output {
-                        tool_parser::DetectorOutput::Content(text) => {
-                            let sanitized = sanitize_content_chunk(
-                                &text,
-                                &mut state.tag_scan_buf,
-                                &mut state.suppressing_param_leak,
-                                &mut state.inside_envelope,
-                                &ctx.leak_markers,
-                            );
-                            if !sanitized.is_empty() {
-                                deltas.push(StreamDelta::Content {
-                                    text: sanitized,
-                                    token_ids: Vec::new(),
-                                });
-                            }
-                        }
-                        tool_parser::DetectorOutput::ToolCall(mut tc, tc_idx) => {
-                            handle_complete_tool_call(state, ctx, &mut tc, tc_idx, &mut deltas);
-                        }
-                        tool_parser::DetectorOutput::ToolCallStart {
-                            id: tc_id,
-                            name,
-                            idx,
-                        } => {
-                            handle_tool_call_start(state, ctx, tc_id, name, idx, &mut deltas);
-                        }
-                        tool_parser::DetectorOutput::ToolCallDelta { args, idx } => {
-                            handle_tool_call_delta(state, ctx, args, idx, &mut deltas);
-                        }
-                        tool_parser::DetectorOutput::ToolCallArgsFragment { fragment, idx } => {
-                            handle_tool_call_args_fragment(state, ctx, fragment, idx, &mut deltas);
-                        }
-                        tool_parser::DetectorOutput::ToolCallEnd { idx } => {
-                            handle_tool_call_end(state, ctx, idx);
-                        }
-                    }
-                }
-            } else {
-                let sanitized = sanitize_content_chunk(
-                    &tail,
-                    &mut state.tag_scan_buf,
-                    &mut state.suppressing_param_leak,
-                    &mut state.inside_envelope,
-                    &ctx.leak_markers,
-                );
-                if !sanitized.is_empty() {
-                    if state.refusal_scan_buf.len() < 16_384 {
-                        state.refusal_scan_buf.push_str(&sanitized);
-                    }
-                    deltas.push(StreamDelta::Content {
-                        text: sanitized,
-                        token_ids: Vec::new(),
-                    });
-                }
-            }
-        }
-    }
-
-    // ── Detector flush ──────────────────────────────────────────────
-    if state.detector.is_some() {
-        let outputs = {
-            let det = state.detector.as_mut().expect("detector is Some");
-            det.flush()
-        };
-        for output in outputs {
-            match output {
-                tool_parser::DetectorOutput::Content(text) => {
-                    let sanitized = sanitize_content_chunk(
-                        &text,
-                        &mut state.tag_scan_buf,
-                        &mut state.suppressing_param_leak,
-                        &mut state.inside_envelope,
-                        &ctx.leak_markers,
-                    );
-                    if !sanitized.is_empty() {
-                        deltas.push(StreamDelta::Content {
-                            text: sanitized,
-                            token_ids: state.take_ids_if(ctx.req_return_token_ids),
-                        });
-                    }
-                }
-                tool_parser::DetectorOutput::ToolCall(mut tc, tc_idx) => {
-                    handle_complete_tool_call(state, ctx, &mut tc, tc_idx, &mut deltas);
-                }
-                tool_parser::DetectorOutput::ToolCallStart {
-                    id: tc_id,
-                    name,
-                    idx,
-                } => {
-                    handle_tool_call_start(state, ctx, tc_id, name, idx, &mut deltas);
-                }
-                tool_parser::DetectorOutput::ToolCallDelta { args, idx } => {
-                    handle_tool_call_delta(state, ctx, args, idx, &mut deltas);
-                }
-                tool_parser::DetectorOutput::ToolCallArgsFragment { fragment, idx } => {
-                    handle_tool_call_args_fragment(state, ctx, fragment, idx, &mut deltas);
-                }
-                tool_parser::DetectorOutput::ToolCallEnd { idx } => {
-                    handle_tool_call_end(state, ctx, idx);
-                }
-            }
-        }
-    }
-
-    // ── Sanitizer tail flush ────────────────────────────────────────
-    let tail = flush_content_sanitizer(
-        &mut state.tag_scan_buf,
-        &mut state.suppressing_param_leak,
-        &ctx.leak_markers,
-    );
-    if !tail.is_empty() {
-        if state.refusal_scan_buf.len() < 16_384 {
-            state.refusal_scan_buf.push_str(&tail);
-        }
-        deltas.push(StreamDelta::Content {
-            text: tail,
-            token_ids: state.take_ids_if(ctx.req_return_token_ids),
-        });
-    }
-
     // ── Usage block (neutral IR; the wire encoder derives
     //    total_tokens and the details sub-objects from it) ───────────
     let tps = if decode_time_ms > 0.0 {
@@ -188,36 +49,30 @@ pub(super) fn handle_done(
         response_tokens_per_second: tps,
     };
 
-    let fr = resolve_wire_finish_reason(
-        &finish_reason,
-        state.tool_loop_capped,
-        state.detector.as_ref().is_some_and(|d| d.has_tool_calls()) || state.salvaged_tool_call,
-        state.stop_string_matched,
-        state.guard_stop,
-    );
-
-    // Refusal classification.
-    let refusal_signal = if state.detector.as_ref().is_none_or(|d| !d.has_tool_calls()) {
-        crate::refusal::detect(&state.refusal_scan_buf)
-    } else {
-        None
-    };
-    if let Some(ref r) = refusal_signal {
-        deltas.push(StreamDelta::Refusal { text: r.clone() });
+    // A truncated native call must never be salvaged into an executable call.
+    if ctx.state.tool_guard.enabled
+        && !state.buffered_tool_chunks.is_empty()
+        && state.guard_stop.is_none()
+        && !state.stop_string_triggered
+    {
+        super::tool_security::reject(state, atlas_tool_guard::BlockReason::IncompleteCall);
     }
-
-    // Terminal delta: finish reason + usage. The `include_usage`
-    // two-chunk framing (usage-only chunk before a usage-less finish
-    // chunk) is the OpenAI encoder's decision
-    // (`openai::delta_to_chunk_events`), not the core's. Residual
-    // token ids — tokens whose decoded text was buffered/suppressed
-    // and never rode a content delta — ride the Finish delta so
-    // Σ token_ids == completion_tokens exactly.
-    deltas.push(StreamDelta::Finish {
-        reason: crate::ir::FinishReason::from(fr),
+    let (deltas, fr) = finalization::finalize_done(
+        state,
+        &finish_reason,
         usage,
-        token_ids: state.take_ids_if(ctx.req_return_token_ids),
-    });
+        ctx.req_return_token_ids,
+        |state| {
+            let deltas = flush_pending_output(state, ctx);
+            if ctx.state.tool_guard.enabled
+                && !state.stop_string_triggered
+                && !state.buffered_tool_chunks.is_empty()
+            {
+                super::tool_security::reject(state, atlas_tool_guard::BlockReason::IncompleteCall);
+            }
+            deltas
+        },
+    );
 
     // Metrics. (REQUESTS_ACTIVE is released by the ActiveRequestGuard in
     // StreamCtx when the stream is dropped — not here, so a stream that ends
@@ -280,6 +135,175 @@ pub(super) fn handle_done(
     deltas
 }
 
+fn flush_pending_output(state: &mut StreamState, ctx: &StreamCtx) -> DeltaVec {
+    let mut deltas: DeltaVec = Vec::new();
+
+    // EOS or a token limit can arrive before </think>. The reasoning
+    // sanitizer still holds a short safe tail in that case; preserve its
+    // channel instead of losing it or treating it as final answer content.
+    // finalize_done skips this entire flush for rejected output.
+    if ctx.enable_thinking && !state.reasoning_xml_leak_detected {
+        let tail = flush_content_sanitizer_with_literal_state(
+            &mut state.reasoning_tag_scan_buf,
+            &mut state.reasoning_suppressing_leak,
+            &mut state.reasoning_literal_xml_state,
+            &ctx.leak_markers,
+        );
+        if !tail.is_empty() {
+            deltas.push(StreamDelta::Reasoning {
+                text: tail,
+                token_ids: state.take_ids_if(ctx.req_return_token_ids),
+            });
+        }
+    }
+
+    // ── Stop-string hold-back flush ─────────────────────────────────
+    // vLLM's `IncrementalDetokenizer` releases any bytes still in the
+    // hold-back window when the stream finalises (see
+    // `vllm/v1/engine/detokenizer.py`). Mirror that here: if a match
+    // never triggered (`stop_string_triggered == false`) the tail
+    // bytes are legitimate output and must be forwarded. Route them
+    // through the active detector / sanitizer so the same envelope
+    // and leak-marker rules apply — without this, a sub-stop-string
+    // suffix that happens to contain a tool-call fragment would
+    // bypass the live pipeline.
+    if !ctx.stop_strings.is_empty()
+        && !state.stop_string_triggered
+        && state.stop_string_emitted_len < state.accumulated_content.len()
+    {
+        let tail = state.accumulated_content[state.stop_string_emitted_len..].to_string();
+        state.stop_string_emitted_len = state.accumulated_content.len();
+        if !tail.is_empty() {
+            if let Some(det) = state.detector.as_mut() {
+                let outputs = det.process(&tail);
+                for output in outputs {
+                    match output {
+                        tool_parser::DetectorOutput::Content(text) => {
+                            let sanitized = sanitize_content_chunk_with_literal_state(
+                                &text,
+                                &mut state.tag_scan_buf,
+                                &mut state.suppressing_param_leak,
+                                &mut state.inside_envelope,
+                                &mut state.literal_xml_state,
+                                &ctx.leak_markers,
+                            );
+                            if !sanitized.is_empty() {
+                                deltas.push(StreamDelta::Content {
+                                    text: sanitized,
+                                    token_ids: Vec::new(),
+                                });
+                            }
+                        }
+                        tool_parser::DetectorOutput::ToolCall(mut tc, tc_idx) => {
+                            handle_complete_tool_call(state, ctx, &mut tc, tc_idx, &mut deltas);
+                        }
+                        tool_parser::DetectorOutput::ToolCallStart {
+                            id: tc_id,
+                            name,
+                            idx,
+                        } => {
+                            handle_tool_call_start(state, ctx, tc_id, name, idx, &mut deltas);
+                        }
+                        tool_parser::DetectorOutput::ToolCallDelta { args, idx } => {
+                            handle_tool_call_delta(state, ctx, args, idx, &mut deltas);
+                        }
+                        tool_parser::DetectorOutput::ToolCallArgsFragment { fragment, idx } => {
+                            handle_tool_call_args_fragment(state, ctx, fragment, idx, &mut deltas);
+                        }
+                        tool_parser::DetectorOutput::ToolCallEnd { idx } => {
+                            handle_tool_call_end(state, ctx, idx, &mut deltas);
+                        }
+                    }
+                }
+            } else {
+                let sanitized = sanitize_content_chunk_with_literal_state(
+                    &tail,
+                    &mut state.tag_scan_buf,
+                    &mut state.suppressing_param_leak,
+                    &mut state.inside_envelope,
+                    &mut state.literal_xml_state,
+                    &ctx.leak_markers,
+                );
+                if !sanitized.is_empty() {
+                    if state.refusal_scan_buf.len() < 16_384 {
+                        state.refusal_scan_buf.push_str(&sanitized);
+                    }
+                    deltas.push(StreamDelta::Content {
+                        text: sanitized,
+                        token_ids: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+
+    // ── Detector flush ──────────────────────────────────────────────
+    if state.detector.is_some() {
+        let outputs = {
+            let det = state.detector.as_mut().expect("detector is Some");
+            det.flush()
+        };
+        for output in outputs {
+            match output {
+                tool_parser::DetectorOutput::Content(text) => {
+                    let sanitized = sanitize_content_chunk_with_literal_state(
+                        &text,
+                        &mut state.tag_scan_buf,
+                        &mut state.suppressing_param_leak,
+                        &mut state.inside_envelope,
+                        &mut state.literal_xml_state,
+                        &ctx.leak_markers,
+                    );
+                    if !sanitized.is_empty() {
+                        deltas.push(StreamDelta::Content {
+                            text: sanitized,
+                            token_ids: state.take_ids_if(ctx.req_return_token_ids),
+                        });
+                    }
+                }
+                tool_parser::DetectorOutput::ToolCall(mut tc, tc_idx) => {
+                    handle_complete_tool_call(state, ctx, &mut tc, tc_idx, &mut deltas);
+                }
+                tool_parser::DetectorOutput::ToolCallStart {
+                    id: tc_id,
+                    name,
+                    idx,
+                } => {
+                    handle_tool_call_start(state, ctx, tc_id, name, idx, &mut deltas);
+                }
+                tool_parser::DetectorOutput::ToolCallDelta { args, idx } => {
+                    handle_tool_call_delta(state, ctx, args, idx, &mut deltas);
+                }
+                tool_parser::DetectorOutput::ToolCallArgsFragment { fragment, idx } => {
+                    handle_tool_call_args_fragment(state, ctx, fragment, idx, &mut deltas);
+                }
+                tool_parser::DetectorOutput::ToolCallEnd { idx } => {
+                    handle_tool_call_end(state, ctx, idx, &mut deltas);
+                }
+            }
+        }
+    }
+
+    // ── Sanitizer tail flush ────────────────────────────────────────
+    let tail = flush_content_sanitizer_with_literal_state(
+        &mut state.tag_scan_buf,
+        &mut state.suppressing_param_leak,
+        &mut state.literal_xml_state,
+        &ctx.leak_markers,
+    );
+    if !tail.is_empty() {
+        if state.refusal_scan_buf.len() < 16_384 {
+            state.refusal_scan_buf.push_str(&tail);
+        }
+        deltas.push(StreamDelta::Content {
+            text: tail,
+            token_ids: state.take_ids_if(ctx.req_return_token_ids),
+        });
+    }
+
+    deltas
+}
+
 /// Stream-layer overrides on top of the scheduler's finish reason.
 /// Pure so the precedence is unit-testable. In order:
 ///
@@ -330,7 +354,9 @@ fn resolve_wire_finish_reason<'a>(
     stop_string_matched: bool,
     stream_guard_stop: Option<&'static str>,
 ) -> &'a str {
-    if scheduler_reason == crate::ir::FINISH_REASON_TIMEOUT {
+    if stream_guard_stop == Some(atlas_tool_guard::GUARD_STOP) {
+        "content_filter"
+    } else if scheduler_reason == crate::ir::FINISH_REASON_TIMEOUT {
         scheduler_reason
     } else if tool_loop_capped {
         "length"

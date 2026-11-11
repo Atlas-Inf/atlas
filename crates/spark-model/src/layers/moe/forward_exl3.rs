@@ -92,29 +92,6 @@ fn coopmk_selected() -> bool {
     COOPMK_ON.load(Ordering::Relaxed)
 }
 
-/// `ATLAS_EXL3_COOPMK_ROWS=1` (off by default): M = 2..=8 rows (MTP verify)
-/// run as ONE CoopMK call at bsz = M instead of M bsz-1 calls.
-/// `ATLAS_EXL3_COOPMK_ROWS_CHECK=N`: the first N such calls (outside graph
-/// capture) also run the per-row path and log max |diff| + bit-equality.
-fn coopmk_rows_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_is("ATLAS_EXL3_COOPMK_ROWS", "1"))
-}
-
-fn coopmk_rows_check_budget() -> u64 {
-    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("ATLAS_EXL3_COOPMK_ROWS_CHECK")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
-    })
-}
-
-static ROWS_LOGGED: AtomicBool = AtomicBool::new(false);
-static ROWS_CALLS: AtomicU64 = AtomicU64::new(0);
-static ROWS_CHECKED: AtomicU64 = AtomicU64::new(0);
-
 fn coopmk_prefill_allowed() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| !env_is("ATLAS_EXL3_COOPMK_PREFILL", "0"))
@@ -154,10 +131,6 @@ impl MoeLayer {
     ) -> Result<bool> {
         if !self.exl3_packed() {
             return Ok(false);
-        }
-        // ATLAS_EXL3_PREFILL_GROUPED=1: M >= 2 (prefill, MTP verify) runs grouped (forward_exl3_grouped.rs).
-        if self.try_forward_exl3_grouped(input, num_tokens, ctx, stream)? {
-            return Ok(true);
         }
         self.forward_exl3_rows(input, num_tokens, ctx, stream)?;
         Ok(true)
@@ -200,108 +173,12 @@ impl MoeLayer {
                 "EXL3 MoE interim: selected experts run reconstruct + Hadamard + hgemm (not NVFP4, not CoopMK)"
             );
         }
-        if use_coopmk
-            && !parity
-            && num_tokens >= 2
-            && coopmk_rows_enabled()
-            && self.forward_exl3_coopmk_rows(input, num_tokens, ctx, stream)?
-        {
-            return Ok(());
-        }
         for t in 0..num_tokens {
             let row_in = input.offset(t * h * 2);
             let row_out = out.offset(t * h * 2);
             self.forward_exl3_one(row_in, row_out, use_coopmk, parity, ctx, stream)?;
         }
         Ok(())
-    }
-
-    /// M rows through ONE CoopMK call (bsz = M). Returns false (nothing
-    /// launched) when this layer cannot take it: more rows than the load-time
-    /// scratch, hash/bias routing, or routing scratch too small.
-    fn forward_exl3_coopmk_rows(
-        &self,
-        input: DevicePtr,
-        n: usize,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<bool> {
-        if self.tid2eid_dev.is_some() || self.correction_bias_dev.is_some() {
-            return Ok(false);
-        }
-        let gate_key = self.weights.shared_expert_gate.weight.0;
-        let rows_max = with_exl3_moe(gate_key, |p| {
-            p.coopmk.as_ref().map(|c| c.rows_max).unwrap_or(0)
-        })
-        .unwrap_or(0);
-        let top_k = ctx.config.num_experts_per_tok;
-        if n > rows_max || ctx.buffers.scratch_bytes() < n * top_k * 8 {
-            return Ok(false);
-        }
-        let h = ctx.config.hidden_size;
-        let out = ctx.buffers.moe_output();
-        let idx_dev = ctx.buffers.scratch();
-        let w_dev = idx_dev.offset(n * top_k * 4);
-        self.exl3_route_rows(input, n, idx_dev, w_dev, ctx, stream)?;
-        let shared_gate_w = self.weights.shared_expert_gate.weight;
-        with_exl3_moe(gate_key, |pack| {
-            let c = pack.coopmk.as_ref().expect("coopmk checked by caller");
-            c.run_rows(
-                ctx.gpu,
-                n,
-                input,
-                idx_dev,
-                w_dev,
-                shared_gate_w,
-                out,
-                stream,
-            )
-        })
-        .ok_or_else(|| anyhow::anyhow!("EXL3 MoE pack missing for gate {gate_key:#x}"))??;
-        CALLS_COOPMK.fetch_add(n as u64, Ordering::Relaxed);
-        let calls = ROWS_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
-        if ROWS_LOGGED
-            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            tracing::info!(
-                "EXL3 MoE CoopMK rows: {n} rows in one bsz={n} call (rotation pre-kernel + run table; \
-                 each selected expert read once per run of <= 8 slots), graph_capture={}",
-                ctx.graph_capture
-            );
-        }
-        if !ctx.graph_capture && ROWS_CHECKED.load(Ordering::Relaxed) < coopmk_rows_check_budget() {
-            let k = ROWS_CHECKED.fetch_add(1, Ordering::Relaxed);
-            let bytes = n * h * 2;
-            let mut a = vec![0u8; bytes];
-            ctx.gpu.copy_d2h_on_stream(out, &mut a, stream)?;
-            for t in 0..n {
-                self.forward_exl3_one(
-                    input.offset(t * h * 2),
-                    out.offset(t * h * 2),
-                    true,
-                    false,
-                    ctx,
-                    stream,
-                )?;
-            }
-            let mut b = vec![0u8; bytes];
-            ctx.gpu.copy_d2h_on_stream(out, &mut b, stream)?;
-            ctx.gpu.copy_h2d(&a, out)?;
-            let (x, y) = (bf16_to_f64(&a), bf16_to_f64(&b));
-            let (mut maxd, mut maxy, mut same) = (0f64, 0f64, 0usize);
-            for (p, q) in x.iter().zip(y.iter()) {
-                maxd = maxd.max((p - q).abs());
-                maxy = maxy.max(q.abs());
-                same += usize::from(p.to_bits() == q.to_bits());
-            }
-            tracing::info!(
-                "EXL3 CoopMK rows check #{k} (call {calls}, {n} rows): max|diff| {maxd:.3e} (max|ref| {maxy:.3e}), \
-                 bit-identical {same}/{}",
-                x.len()
-            );
-        }
-        Ok(true)
     }
 
     fn forward_exl3_one(

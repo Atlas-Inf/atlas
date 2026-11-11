@@ -11,6 +11,27 @@
 
 use anyhow::Result;
 
+/// Never produced on metal; present so callers that classify CUTLASS errors
+/// compile unchanged.
+#[derive(Debug)]
+pub struct RejectedBeforeLaunch;
+
+impl std::fmt::Display for RejectedBeforeLaunch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CUTLASS rejected the operands before launching")
+    }
+}
+
+impl std::error::Error for RejectedBeforeLaunch {}
+
+pub fn rejected_before_launch(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RejectedBeforeLaunch>().is_some()
+}
+
+pub fn launch_failed(_error: &anyhow::Error) -> bool {
+    false
+}
+
 pub fn bf16_gemm_act_weight_t(
     _act: u64,
     _weight: u64,
@@ -102,3 +123,23 @@ pub fn transpose_nvfp4_packed_kton(
 ) -> Result<()> {
     unreachable!("cutlass::transpose_nvfp4_packed_kton is cuda-only (not built for metal)")
 }
+
+pub fn fp8_blockwise_gemm_act_weight_t(
+    _act: u64,
+    _act_sf: u64,
+    _weight: u64,
+    _weight_sf: u64,
+    _out: u64,
+    [_m, _n, _k]: [u32; 3],
+    _stream: u64,
+) -> Result<()> {
+    unreachable!("cutlass::fp8_blockwise_gemm_act_weight_t is cuda-only (not built for metal)")
+}
+
+// Backend-neutral: without `atlas_cutlass` every entry bails.
+#[path = "cutlass/prequant.rs"]
+mod prequant;
+pub use prequant::{
+    Nvfp4Act, Nvfp4WeightSfb, nvfp4_gemm_prequant, nvfp4_quant_act_scaled,
+    nvfp4_quant_swiglu_clamp, nvfp4_sf_bytes,
+};

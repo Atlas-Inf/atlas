@@ -245,13 +245,13 @@ pub fn step_ngram_verify(
         if idx > 0 {
             proposer.observe(&a.seq.tokens[..idx], a.seq.tokens[idx]);
         }
-        emit_token(a, drafts[j], verify_lps.get(j).cloned(), sched);
+        emit_span_row(a, drafts[j], verify_lps.get(j).cloned(), sched, j, na + 1);
         if a.finished {
             return;
         }
     }
     proposer.observe(&a.seq.tokens, v[na]);
-    emit_token(a, v[na], verify_lps.get(na).cloned(), sched);
+    emit_span_row(a, v[na], verify_lps.get(na).cloned(), sched, na, na + 1);
     if a.finished {
         return;
     }

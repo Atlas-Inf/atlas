@@ -32,7 +32,61 @@ impl NemotronMamba2Layer {
             .downcast_mut::<SsmLayerState>()
             .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState"))?;
 
+        // ATLAS_N35_L0_DUMP: shares the once-per-process latch with the decode
+        // dump; prefill runs first, so the armed dump lands here (all N rows).
+        let mut l0d = super::l0_dump::arm(ctx.gpu, self.layer_idx, hidden, num_tokens * h, stream);
+
         let gs = self.n_groups * self.state_size; // 8*128 = 1024
+        if let Some(ref mut d) = l0d {
+            d.stage(
+                ctx.gpu,
+                "W_a_log",
+                self.ssm.a_log.weight,
+                self.num_heads,
+                "f32",
+                &[self.num_heads],
+            );
+            d.stage(
+                ctx.gpu,
+                "W_d_param",
+                self.ssm.d_param.weight,
+                self.num_heads,
+                "f32",
+                &[self.num_heads],
+            );
+            d.stage(
+                ctx.gpu,
+                "W_dt_bias",
+                self.ssm.dt_bias.weight,
+                self.num_heads,
+                "f32",
+                &[self.num_heads],
+            );
+            d.stage(
+                ctx.gpu,
+                "W_conv1d_weight",
+                self.ssm.conv1d_weight.weight,
+                self.d_xbc * self.d_conv,
+                "bf16",
+                &[self.d_xbc, self.d_conv],
+            );
+            d.stage(
+                ctx.gpu,
+                "W_conv1d_bias",
+                self.ssm.conv1d_bias.weight,
+                self.d_xbc,
+                "f32",
+                &[self.d_xbc],
+            );
+            d.stage(
+                ctx.gpu,
+                "W_ssm_norm",
+                self.ssm.ssm_norm.weight,
+                self.d_inner,
+                "bf16",
+                &[self.d_inner],
+            );
+        }
 
         // ── 1. RMS norm + residual (batched, all N tokens) ──
         let normed = ctx.buffers.norm_output();
@@ -48,6 +102,16 @@ impl NemotronMamba2Layer {
             eps,
             stream,
         )?;
+        if let Some(ref mut d) = l0d {
+            d.stage(
+                ctx.gpu,
+                "02_normed",
+                normed,
+                num_tokens * h,
+                "bf16",
+                &[num_tokens, h],
+            );
+        }
 
         // ── 2. in_proj GEMM: [N, h] × [h, in_proj_size] → [N, in_proj_size] ──
         //    Layout per token: [z(d_inner) | xBC(d_xbc) | dt(num_heads)]
@@ -92,6 +156,21 @@ impl NemotronMamba2Layer {
         // transposed NVFP4 → plain W4A16) lives in `prefill_proj.rs` (500-LoC
         // cap split); the precedence rationale is documented there.
         self.prefill_in_proj(normed, proj, n, h, fp8_a, w4a4, pd_fp8_ok, ctx, stream)?;
+        if let Some(ref mut d) = l0d {
+            d.stage(
+                ctx.gpu,
+                "03_in_proj_out",
+                proj,
+                num_tokens * self.in_proj_size,
+                "bf16",
+                &[num_tokens, self.in_proj_size],
+            );
+            tracing::info!(
+                "ATLAS_L0_DUMP in_proj arm: fp8_a={fp8_a} w4a4={w4a4} pd_fp8_ok={pd_fp8_ok}                  native_fp8={} bf16={}",
+                self.in_proj_fp8.is_some(),
+                self.in_proj_bf16.is_some()
+            );
+        }
 
         // ── 3. Conv1d prefill on xBC (WITH bias, fused SiLU) ──
         //    Input: xBC at proj+d_inner, stride=in_proj_size between tokens
@@ -114,6 +193,24 @@ impl NemotronMamba2Layer {
             self.d_xbc as u32,
             stream,
         )?;
+        if let Some(ref mut d) = l0d {
+            d.stage(
+                ctx.gpu,
+                "05_conv_out",
+                conv_out,
+                num_tokens * self.d_xbc,
+                "bf16",
+                &[num_tokens, self.d_xbc],
+            );
+            d.stage(
+                ctx.gpu,
+                "06_conv_state_after",
+                ssm_state.conv_state,
+                self.d_xbc * self.d_conv,
+                "f32",
+                &[self.d_xbc, self.d_conv],
+            );
+        }
 
         // ── 4. Mamba-2 SSM prefill ──
         //    x at conv_out+0, B at conv_out+d_inner, C at conv_out+d_inner+gs
@@ -213,6 +310,40 @@ impl NemotronMamba2Layer {
                 self.d_inner as u32,
                 stream,
             )?;
+        } else if self.mamba2_ssm_prefill_reg_k.0 != 0
+            && self.head_dim == 64
+            && self.state_size == 128
+            && std::env::var("ATLAS_NO_SSM_REG").is_err()
+        {
+            // Omni overlay: register-resident H + TB-token staging — measured
+            // 3.5x the smem kernel at seq 8192, byte-identical. Dims must match
+            // the compiled template (STATE=128, ROWS=64, SUB=4).
+            ops::mamba2_ssm_prefill_reg(
+                ctx.gpu,
+                self.mamba2_ssm_prefill_reg_k,
+                ssm_state.h_state,
+                x_ptr,
+                b_ptr,
+                c_ptr,
+                dt_ptr,
+                self.ssm.a_log.weight,
+                self.ssm.d_param.weight,
+                self.ssm.dt_bias.weight,
+                y_out,
+                1,
+                n,
+                self.num_heads as u32,
+                self.head_dim as u32,
+                self.state_size as u32,
+                self.n_groups as u32,
+                1e-9,
+                1e9,
+                self.d_xbc as u32,
+                self.d_xbc as u32,
+                self.in_proj_size as u32,
+                self.d_inner as u32,
+                stream,
+            )?;
         } else if self.mamba2_ssm_prefill_persistent_k.0 != 0
             // Same-binary A/B against the plain sequential scan below. The
             // persistent kernel keeps H in shared memory and is only reachable
@@ -275,6 +406,30 @@ impl NemotronMamba2Layer {
             )?;
         }
 
+        if let Some(ref mut d) = l0d {
+            let n_h = self.num_heads * self.head_dim * self.state_size;
+            d.stage(
+                ctx.gpu,
+                "09_ssm_y",
+                y_out,
+                num_tokens * self.d_inner,
+                "bf16",
+                &[num_tokens, self.d_inner],
+            );
+            d.stage(
+                ctx.gpu,
+                "10_ssm_state_after",
+                ssm_state.h_state,
+                n_h,
+                "f32",
+                &[self.num_heads, self.head_dim, self.state_size],
+            );
+            tracing::info!(
+                "ATLAS_L0_DUMP ssd_ok={ssd_ok} persistent={}",
+                self.mamba2_ssm_prefill_persistent_k.0 != 0
+            );
+        }
+
         // ── 5. Gated RMS norm (N tokens) ──
         //    input=y [N, d_inner], gate=z at proj+0 [stride=in_proj_size]
         let gated_out = ctx.buffers.norm_output();
@@ -293,11 +448,31 @@ impl NemotronMamba2Layer {
             group_size,
             stream,
         )?;
+        if let Some(ref mut d) = l0d {
+            d.stage(
+                ctx.gpu,
+                "11_gated",
+                gated_out,
+                num_tokens * self.d_inner,
+                "bf16",
+                &[num_tokens, self.d_inner],
+            );
+        }
 
         // ── 6. out_proj GEMM: [N, d_inner] × [d_inner, h] → [N, h] ──
         let out = ctx.buffers.ssm_qkvz();
         // Mirrors the in_proj dispatch (see step 2); arms in `prefill_proj.rs`.
         self.prefill_out_proj(gated_out, out, n, h, fp8_a, w4a4, pd_fp8_ok, ctx, stream)?;
+        if let Some(ref mut d) = l0d {
+            d.stage(
+                ctx.gpu,
+                "12_out_proj",
+                out,
+                num_tokens * h,
+                "bf16",
+                &[num_tokens, h],
+            );
+        }
 
         // ── 7. Residual add (N*h elements) ──
         ops::residual_add(
@@ -308,6 +483,17 @@ impl NemotronMamba2Layer {
             (num_tokens * h) as u32,
             stream,
         )?;
+        if let Some(mut d) = l0d {
+            d.stage(
+                ctx.gpu,
+                "13_post_layer",
+                hidden,
+                num_tokens * h,
+                "bf16",
+                &[num_tokens, h],
+            );
+            d.finish();
+        }
 
         Ok(())
     }

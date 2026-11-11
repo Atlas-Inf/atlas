@@ -265,6 +265,7 @@ mod tests {
                 window_size: 4096,
                 mask_token_id: 0,
                 target_layer_ids: &[],
+                drop_bf16: false,
             }),
             shadowed_dropped: &[],
             expected_absent: &[],

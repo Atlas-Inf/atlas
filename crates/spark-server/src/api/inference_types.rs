@@ -45,8 +45,8 @@ pub struct RepetitionDetectionParams {
 
 /// Grammar specification for constrained decoding.
 ///
-/// Either tool-call grammar (Hermes/Qwen3-Coder format) or response-format
-/// grammar (generic JSON or JSON-schema).
+/// Tool-call grammar (Hermes/Qwen3-Coder format), response-format grammar
+/// (generic JSON or JSON-schema), or the union of the two.
 #[derive(Clone)]
 pub enum GrammarSpec {
     /// Tool-call constrained decoding: tools, parser instance, use_triggers flag.
@@ -68,6 +68,33 @@ pub enum GrammarSpec {
     JsonObject,
     /// Response format: JSON matching a specific schema.
     JsonSchema { schema: String },
+    /// `tool_choice="auto"` with a `response_format`: the output is EITHER
+    /// tool calls in the parser's format OR the response_format JSON — the
+    /// first output token picks the branch (OpenAI and vLLM enforce the
+    /// schema on the final answer while still allowing tool calls). A
+    /// response_format grammar ([`Self::is_response_format`]).
+    ToolCallOrJson {
+        tools: Vec<tool_parser::ToolDefinition>,
+        parser: std::sync::Arc<dyn tool_parser::ToolCallParser>,
+        /// The JSON schema; `None` for `json_object` (any JSON).
+        schema: Option<String>,
+    },
+}
+
+/// The scheduler rejected the request as asked (e.g. a `response_format` it
+/// cannot enforce). The blocking chat path maps it to HTTP 400, not 500.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct InvalidRequestError(pub String);
+
+impl GrammarSpec {
+    /// A `response_format` grammar, whose output must conform.
+    pub fn is_response_format(&self) -> bool {
+        matches!(
+            self,
+            Self::JsonObject | Self::JsonSchema { .. } | Self::ToolCallOrJson { .. }
+        )
+    }
 }
 
 /// Request submitted to the scheduler.
@@ -105,6 +132,10 @@ pub enum InferenceRequest {
         max_tokens: usize,
         /// Minimum tokens before allowing EOS/stop (0 = no minimum).
         min_tokens: usize,
+        /// vLLM `ignore_eos`: the model's end tokens do not end the request;
+        /// they are ordinary output tokens and generation runs to
+        /// `max_tokens`. The request's own `stop_tokens` still end it.
+        ignore_eos: bool,
         temperature: f32,
         /// Top-k: keep only the k highest-probability tokens (0 = disabled).
         top_k: u32,
@@ -137,6 +168,9 @@ pub enum InferenceRequest {
         stop_tokens: Vec<u32>,
         /// Whether thinking mode is enabled for this request.
         enable_thinking: bool,
+        /// chat_template_kwargs.force_nonempty_content: all-reasoning output
+        /// is returned as content instead of an empty content string.
+        force_nonempty_content: bool,
         /// Max thinking tokens before forcing `</think>`. None = unlimited.
         thinking_budget: Option<u32>,
         /// Per-request override for the vLLM-anchored token-loop detector.
@@ -213,6 +247,8 @@ pub enum InferenceRequest {
         max_tokens: usize,
         /// Minimum tokens before allowing EOS/stop (0 = no minimum).
         min_tokens: usize,
+        /// vLLM `ignore_eos` (see Blocking variant).
+        ignore_eos: bool,
         temperature: f32,
         /// Top-k: keep only the k highest-probability tokens (0 = disabled).
         top_k: u32,
@@ -241,6 +277,9 @@ pub enum InferenceRequest {
         stop_tokens: Vec<u32>,
         /// Whether thinking mode is enabled for this request.
         enable_thinking: bool,
+        /// chat_template_kwargs.force_nonempty_content: all-reasoning output
+        /// is returned as content instead of an empty content string.
+        force_nonempty_content: bool,
         /// Max thinking tokens before forcing `</think>`. None = unlimited.
         thinking_budget: Option<u32>,
         /// Per-request override for the vLLM-anchored token-loop detector.
@@ -321,8 +360,8 @@ pub struct InferenceResponse {
     /// Number of prompt tokens served by the prefix cache (no prefill compute
     /// cost). Reported as `usage.prompt_tokens_details.cached_tokens`.
     pub cached_prompt_tokens: u32,
-    /// Speculative-decode draft tokens ACCEPTED for this request (MTP verify
-    /// path, `RequestAccept::accepted_total`). Reported to clients as
+    /// Accepted speculative draft tokens retained in this completion
+    /// (`RequestAccept::accepted_output_total`). Reported to clients as
     /// `usage.completion_tokens_details.accepted_prediction_tokens` — the
     /// OpenAI field's meaning (predicted tokens that matched generation),
     /// carried by Atlas's self-drafted MTP predictions. 0 when speculation is
@@ -333,6 +372,11 @@ pub struct InferenceResponse {
     /// i+1. Empty unless requested. The handler prepends the null entry
     /// for the first prompt token (no preceding context).
     pub prompt_logprobs: Vec<TokenLogprobs>,
+    /// #55 (Enntity/atlas 8150f896): the server-side guard that cut this
+    /// response, when one did (`ActiveSeq::guard_stop`). Flows to the
+    /// blocking Choice and the final stream chunk as a `guard_stop`
+    /// extension field; the standard finish_reason is unchanged.
+    pub guard_stop: Option<&'static str>,
 }
 
 /// Events sent during streaming generation.
@@ -362,4 +406,8 @@ pub enum StreamEvent {
         guard_stop: Option<&'static str>,
     },
     Error(String),
+    /// A request the server cannot serve as asked (the streaming twin of
+    /// [`InvalidRequestError`]): sent as `invalid_request_error` / 400 so
+    /// agent clients stop resending it (#180).
+    InvalidRequest(String),
 }

@@ -88,6 +88,7 @@ pub fn step_verify_k2(
     dflash_verify_raw_argmax: bool,
 ) {
     use crate::scheduler::mtp_timing::Phase;
+    let native_mtp = model.native_mtp_enabled();
     let t_step = Instant::now();
     let t_sync = Instant::now();
     if let Err(e) = model.sync_secondary() {
@@ -153,11 +154,22 @@ pub fn step_verify_k2(
     a.last_token_time = Instant::now();
     let (v0_argmax, v1_argmax) = (result_vec[0], result_vec[1]);
 
-    let (v0, v1) = if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
+    let Ok(scored) =
+        super::verify_pipeline_helper::scored::requested(model, 2, a, verify_ctx, 0, None)
+    else {
+        return;
+    };
+    let (v0, v1) = if let Some(s) = &scored {
+        (
+            s.tokens.first().copied().unwrap_or(v0_argmax),
+            s.tokens.get(1).copied().unwrap_or(v1_argmax),
+        )
+    } else if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
         dflash_verify_raw_argmax,
         sched.levers.dflash_masked_verify,
-        model.is_lightning_dspark_product(),
+        model,
         a,
+        &[v0_argmax, v1_argmax],
     ) {
         // DFlash drafter proposes on raw argmax; verify on the SAME (GOLD) basis.
         (v0_argmax, v1_argmax)
@@ -178,13 +190,17 @@ pub fn step_verify_k2(
         )
     };
     let accepted = drafts[0] == v0;
+    // A copy round (`copy_drafts::mtp`) says nothing about the head.
+    let copied = crate::scheduler::copy_drafts::mtp::settle(a, 1, usize::from(accepted));
+    if !dflash_verify_raw_argmax && !copied {
+        a.mtp_acct
+            .record_depth_verify(1, usize::from(accepted), num_drafts, sched.levers.depth());
+    }
+    // The next propose's depth (`ATLAS_MTP_SINGLE_DEPTH_ADAPT`); `num_drafts`
+    // itself when the lever is off.
+    let next_drafts = a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth());
 
-    // Extract logprobs from verify logits buffer (K=2 positions) when requested.
-    let verify_lps = if let Some(top_logprobs) = a.top_logprobs {
-        extract_verify_logprobs(model, &[v0, v1], top_logprobs, 0)
-    } else {
-        Vec::new()
-    };
+    let verify_lps = scored.map(|s| s.logprobs).unwrap_or_default();
 
     // EP: always broadcast accept/reject to worker (prevents deadlock on EOS).
     if let Err(e) = model.ep_broadcast_cmd(accepted as u32) {
@@ -205,18 +221,11 @@ pub fn step_verify_k2(
 
     if accepted {
         // ── ACCEPTED ──
-        emit_token(a, drafts[0], verify_lps.first().cloned(), sched);
-        if !a.finished {
-            emit_token(a, v1, verify_lps.get(1).cloned(), sched);
-        }
-        if a.finished {
-            return;
-        }
-        a.last_token = v1;
-
         // Item #2 (STree-style in-place K=2 verify commit). Full accept
         // (num_accepted=k=2): the verify kernel already wrote the canonical
-        // h_state, so the commit is a no-op.
+        // h_state, so the commit is a no-op, except with KDA records, where
+        // it folds the rows in. Committed before emission for that case: an
+        // emit that finishes the sequence returns (see `verify_dflash_tail`).
         let t_commit = Instant::now();
         if let Err(e) = model.commit_accepted_prefix(&mut a.seq, 2, 2) {
             // An SSM-state commit error means the recurrent state is no longer
@@ -229,11 +238,21 @@ pub fn step_verify_k2(
         }
         sched.timing.record(Phase::Commit, t_commit);
 
+        emit_span_row(a, drafts[0], verify_lps.first().cloned(), sched, 0, 2);
+        if !a.finished {
+            emit_span_row(a, v1, verify_lps.get(1).cloned(), sched, 1, 2);
+        }
+        if a.finished {
+            return;
+        }
+        a.last_token = v1;
+
         // EAGLE-fix (ATLAS_DFLASH_EAGLE_FIX=1, K=2 accept only): append row 0 @ N
         // then row 1 @ N+1 BEFORE propose so forward_block conditions on row 1
         // (the hidden that generated bonus). This also sets the proposer's
         // skip-flag so propose does NOT re-append row 0.
-        let eagle_fix = std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref() == Some("1");
+        let eagle_fix =
+            !native_mtp && std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref() == Some("1");
         if eagle_fix && let Err(e) = model.dflash_eagle_accept_append(&mut a.seq) {
             tracing::error!("dflash_eagle_accept_append: {e:#}");
         }
@@ -241,35 +260,79 @@ pub fn step_verify_k2(
         // Same row, the other input shape: a drafter reading the PRE-mixer
         // stream highway needs row 1 staged into row 0, or it proposes from
         // the first verify row instead of the accepted one.
+        // Ported from Enntity/atlas 166e2b1 (AGPL-3.0-only).
+        super::verify_k4_verdict::stage_absorb(model, a, 0, &drafts[..1]);
         if let Err(e) = model.select_mtp_stream_row(1) {
             tracing::error!("select_mtp_stream_row(1): {e:#}");
+            if native_mtp {
+                a.abort_on_engine_error(format_args!(
+                    "native GLM MTP stream-row selection failed: {e:#}"
+                ));
+                return;
+            }
         }
         if let Err(e) = model.save_hidden_for_mtp(1, 0) {
             tracing::error!("save_hidden_for_mtp(1): {e:#}");
+            if native_mtp {
+                a.abort_on_engine_error(format_args!(
+                    "native GLM MTP hidden staging failed: {e:#}"
+                ));
+            }
             return;
         }
         sched.timing.record(Phase::SaveHidden, t_save);
         let t_trim = Instant::now();
-        if let Err(e) = model.trim_proposer_state(&mut a.seq, 1, 0) {
+        if let Err(e) = crate::scheduler::copy_drafts::mtp::trim_proposer(model, a, 1) {
             tracing::error!("trim_proposer_state: {e:#}");
+            if native_mtp {
+                a.abort_on_engine_error(format_args!(
+                    "native GLM MTP private-state trim failed: {e:#}"
+                ));
+                return;
+            }
         }
         sched.timing.record(Phase::TrimProposer, t_trim);
+        // Native GLM keeps the row for the verified input pair, then repairs
+        // the accepted-draft pair from verify row 0 before the next propose.
+        // Other proposer families receive the trait's no-op default.
+        if let Err(e) =
+            model.repair_mtp_after_verify(drafts[0], a.seq.seq_len.saturating_sub(1), &mut a.seq, 0)
+        {
+            tracing::error!("repair_mtp_after_verify: {e:#}");
+            a.engine_error = Some(format!("{e:#}"));
+            a.finished = true;
+            return;
+        }
         let t_mask = Instant::now();
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
         sched.timing.record(Phase::ProposeMask, t_mask);
         let t_propose = Instant::now();
-        match model.run_mtp_propose_multi(
-            v1,
-            a.seq.seq_len,
-            crate::scheduler::spec_step::effective_drafts_under_grammar(a, num_drafts),
-            &mut a.seq,
-            0,
-            _mtp_grammar_mask.as_deref(),
-        ) {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!("run_mtp_propose_multi: {e:#}");
+        // A copy (`ATLAS_QWEN_COPY_DRAFTS`) drafts in place of the head.
+        if !crate::scheduler::copy_drafts::mtp::propose(model, sched, a, num_drafts) {
+            match model.run_mtp_propose_multi(
+                v1,
+                a.seq.seq_len,
+                crate::scheduler::spec_step::effective_drafts_under_grammar(a, next_drafts),
+                &mut a.seq,
+                0,
+                _mtp_grammar_mask.as_deref(),
+            ) {
+                Ok(d) if !d.is_empty() => a.pending_drafts = d,
+                Ok(_) => {
+                    if native_mtp {
+                        a.abort_on_engine_error("native GLM MTP re-propose returned no drafts");
+                        return;
+                    }
+                }
+                Err(e) => {
+                    if native_mtp {
+                        a.abort_on_engine_error(format_args!(
+                            "native GLM MTP re-propose failed: {e:#}"
+                        ));
+                        return;
+                    }
+                    tracing::error!("run_mtp_propose_multi: {e:#}");
+                }
             }
         }
         sched.timing.record(Phase::Propose, t_propose);
@@ -296,8 +359,14 @@ pub fn step_verify_k2(
         a.seq.tokens.pop();
 
         let t_trim = Instant::now();
-        if let Err(e) = model.trim_proposer_state(&mut a.seq, 0, 0) {
+        if let Err(e) = crate::scheduler::copy_drafts::mtp::trim_proposer(model, a, 0) {
             tracing::error!("trim_proposer_state: {e:#}");
+            if native_mtp {
+                a.abort_on_engine_error(format_args!(
+                    "native GLM MTP private-state trim failed: {e:#}"
+                ));
+                return;
+            }
         }
         sched.timing.record(Phase::TrimProposer, t_trim);
         // Item #2 (STree-style in-place K=2 verify commit). K=2 reject means
@@ -325,9 +394,20 @@ pub fn step_verify_k2(
         // the first verify row instead of the accepted one.
         if let Err(e) = model.select_mtp_stream_row(0) {
             tracing::error!("select_mtp_stream_row(0): {e:#}");
+            if native_mtp {
+                a.abort_on_engine_error(format_args!(
+                    "native GLM MTP stream-row selection failed: {e:#}"
+                ));
+                return;
+            }
         }
         if let Err(e) = model.save_hidden_for_mtp(0, 0) {
             tracing::error!("save_hidden_for_mtp(0): {e:#}");
+            if native_mtp {
+                a.abort_on_engine_error(format_args!(
+                    "native GLM MTP hidden staging failed: {e:#}"
+                ));
+            }
             return;
         }
         sched.timing.record(Phase::SaveHidden, t_save);
@@ -335,18 +415,32 @@ pub fn step_verify_k2(
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
         sched.timing.record(Phase::ProposeMask, t_mask);
         let t_propose = Instant::now();
-        match model.run_mtp_propose_multi(
-            v0,
-            a.seq.seq_len,
-            crate::scheduler::spec_step::effective_drafts_under_grammar(a, num_drafts),
-            &mut a.seq,
-            0,
-            _mtp_grammar_mask.as_deref(),
-        ) {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!("run_mtp_propose_multi: {e:#}");
+        // A copy (`ATLAS_QWEN_COPY_DRAFTS`) drafts in place of the head.
+        if !crate::scheduler::copy_drafts::mtp::propose(model, sched, a, num_drafts) {
+            match model.run_mtp_propose_multi(
+                v0,
+                a.seq.seq_len,
+                crate::scheduler::spec_step::effective_drafts_under_grammar(a, next_drafts),
+                &mut a.seq,
+                0,
+                _mtp_grammar_mask.as_deref(),
+            ) {
+                Ok(d) if !d.is_empty() => a.pending_drafts = d,
+                Ok(_) => {
+                    if native_mtp {
+                        a.abort_on_engine_error("native GLM MTP re-propose returned no drafts");
+                        return;
+                    }
+                }
+                Err(e) => {
+                    if native_mtp {
+                        a.abort_on_engine_error(format_args!(
+                            "native GLM MTP re-propose failed: {e:#}"
+                        ));
+                        return;
+                    }
+                    tracing::error!("run_mtp_propose_multi: {e:#}");
+                }
             }
         }
         sched.timing.record(Phase::Propose, t_propose);

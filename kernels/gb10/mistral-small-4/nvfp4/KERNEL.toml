@@ -17,12 +17,21 @@ extra_nvcc_flags = ["--fmad=false", "-DHDIM=128"]
 #       therefore not "missing" here; they are the OTHER convention, and
 #       copying them in would silently rotate every query/key the wrong way.
 #       (`rope_forward_yarn_scaled` is the Laguna-S 2.1 rotate_half YaRN
-#       variant, resolved via `try_kernel` — same convention mismatch.)
+#       variant, resolved via `try_kernel` — same convention mismatch.
+#       `rope_forward_rows` is common's multi-row rotate_half `rope_forward`,
+#       looked up with `kernel_or_null`; null falls back to this target's own.)
 #       Porting them properly means reimplementing each against the interleaved
 #       layout, which is a Mistral kernel change, not a shadow-sync.
+# qwen4_exp-only optional kernel this shadow legitimately lacks:
+# rms_norm_f32_grouped is resolved with try_kernel only under
+# ATLAS_QWEN4EXP_MTP_GROUPED_NORM=1 (the qwen4exp MTP drafter); a null
+# handle falls back to per-row rms_norm_f32, so this model's decode chain
+# never reaches it.
 [shadow_exempt]
+norm = ["rms_norm_f32_grouped"]
 rope = [
     "rope_forward_proportional",
+    "rope_forward_rows",
     "rope_forward_strided",
     "rope_forward_yarn_interleaved",
     "rope_forward_yarn_interleaved_inv",

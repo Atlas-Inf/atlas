@@ -671,3 +671,65 @@ pub fn moe_expert_silu_down_shared_fp8(
         .arg_u32(top_k)
         .launch(stream)
 }
+
+/// Union-match prepass for `moe_expert_gemv_wide_grouped_u`: 512 threads,
+/// one per expert, each collecting its own (tok,slot) matches in scan
+/// order, then a compact pass writes the ascending unique-expert table.
+/// `u_buf` must be (1 + 2*MAXU + 2*MAXU*MAX_MATCH) u32 = 265 KB at
+/// MAXU=512 / MAX_MATCH=32.
+pub fn moe_union_match(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    expert_indices: DevicePtr,
+    u_buf: DevicePtr,
+    num_tokens: u32,
+    top_k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([1, 1, 1])
+        .block([512, 1, 1])
+        .arg_ptr(expert_indices)
+        .arg_ptr(u_buf)
+        .arg_u32(num_tokens)
+        .arg_u32(top_k)
+        .launch(stream)
+}
+
+/// Table-driven grouped expert GEMV. Grid (ceil(N/32), MAXU); CTA y reads
+/// its expert + match list from `u_buf` filled by `moe_union_match`.
+pub fn moe_expert_gemv_wide_grouped_u(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    packed_ptrs: DevicePtr,
+    scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    output: DevicePtr,
+    u_buf: DevicePtr,
+    n: u32,
+    k: u32,
+    top_k: u32,
+    input_stride: u32,
+    num_tokens: u32,
+    relu2_input: bool,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 32), (num_tokens * top_k).clamp(1, 512), 1])
+        .block([256, 1, 1])
+        .shared_mem(64 + 4 * k * 2)
+        .arg_ptr(input)
+        .arg_ptr(packed_ptrs)
+        .arg_ptr(scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(output)
+        .arg_ptr(u_buf)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(top_k)
+        .arg_u32(input_stride)
+        .arg_u32(num_tokens)
+        .arg_u32(relu2_input as u32)
+        .launch(stream)
+}

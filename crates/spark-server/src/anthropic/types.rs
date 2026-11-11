@@ -27,6 +27,16 @@ pub struct MessagesRequest {
     pub stream: bool,
     #[serde(default)]
     pub thinking: Option<ThinkingConfig>,
+    #[serde(default)]
+    pub metadata: Option<MessagesMetadata>,
+}
+
+/// Anthropic request `metadata`. Only `user_id` is defined; Claude Code fills
+/// it with an id that embeds its session uuid.
+#[derive(Debug, Deserialize)]
+pub struct MessagesMetadata {
+    #[serde(default)]
+    pub user_id: Option<String>,
 }
 
 /// System content: either a plain string or an array of content blocks.

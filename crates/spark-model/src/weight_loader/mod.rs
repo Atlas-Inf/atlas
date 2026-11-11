@@ -16,7 +16,9 @@
 
 pub(crate) mod deepseek_v4;
 pub mod dflash_loader;
+pub mod dflash_preshrink;
 mod gemma4;
+pub(crate) mod glm5;
 mod laguna;
 mod longcat;
 mod minimax;
@@ -28,6 +30,7 @@ mod qwen35_dense;
 mod qwen3_vl;
 #[cfg_attr(test, allow(unreachable_pub))]
 pub(crate) mod qwen4_exp;
+mod ricursive;
 mod step3p7;
 
 pub use deepseek_v4::DeepSeekV4WeightLoader;
@@ -36,6 +39,8 @@ pub use dflash_loader::{
     store_has_dflash_weights,
 };
 pub use gemma4::Gemma4WeightLoader;
+pub use glm5::Glm5WeightLoader;
+pub use glm5::mode as glm5_mode;
 pub use laguna::LagunaWeightLoader;
 pub use longcat::LongcatWeightLoader;
 pub use minimax::MinimaxM2WeightLoader;
@@ -44,8 +49,10 @@ pub use nllb::NllbWeightLoader;
 pub use qwen3::Qwen3WeightLoader;
 pub use qwen3_vl::Qwen3VLWeightLoader;
 pub use qwen4_exp::Qwen4ExpWeightLoader;
+pub use qwen4_exp::mode as qwen4exp_mode;
 pub use qwen35::Qwen35WeightLoader;
 pub use qwen35_dense::Qwen35DenseWeightLoader;
+pub use ricursive::RicursiveWeightLoader;
 pub use step3p7::Step3p7WeightLoader;
 
 use anyhow::Result;
@@ -55,7 +62,7 @@ use spark_runtime::kv_cache::KvCacheDtype;
 use spark_runtime::weights::WeightStore;
 
 use crate::layer::TransformerLayer;
-use crate::layers::VisionEncoder;
+use crate::layers::VisionTower;
 use crate::weight_map::{DenseWeight, MtpWeights, Nvfp4Variant, detect_nvfp4_variant};
 
 /// Can this box hold the transposed `[K/2, N]` MoE prefill copies for EVERY
@@ -214,6 +221,21 @@ pub trait ModelWeightLoader {
         layer_kv_dtypes: &[KvCacheDtype],
     ) -> Result<Vec<Box<dyn TransformerLayer>>>;
 
+    /// Whole tensor namespaces this loader never reads — skipped at upload
+    /// so they don't hold GPU memory as dead weight. Default empty: loaders
+    /// that consume the full checkpoint.
+    fn dead_namespaces(&self, _config: &ModelConfig) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Whether the fast weight loader may pack this model's shards into one
+    /// slab allocation per shard (`FastSafetensorsLoader::pack_slab`). The
+    /// opt-in requires the load path to never `gpu.free` a store-owned
+    /// tensor pointer; single-GPU only (TP/EP paths are not audited).
+    fn slab_pack_weights(&self, _config: &ModelConfig) -> bool {
+        false
+    }
+
     /// Per-(layer, role) weight precision schedule (C.3, 2026-04-25).
     /// Default impl returns the empty schedule (every lookup yields
     /// `Dtype::Inherit`), preserving the existing per-checkpoint
@@ -248,6 +270,17 @@ pub trait ModelWeightLoader {
         _max_tokens: usize,
     ) -> Result<Option<crate::layers::ngram_embed::NgramEmbedding>> {
         Ok(None)
+    }
+    /// Size per-forward activation state the layers share once the arena's
+    /// `max_tokens` is known (Ricursive value residuals). Default: none.
+    fn attach_layer_buffers(
+        &self,
+        _layers: &mut [Box<dyn TransformerLayer>],
+        _config: &ModelConfig,
+        _gpu: &dyn GpuBackend,
+        _max_tokens: usize,
+    ) -> Result<()> {
+        Ok(())
     }
     /// Load the final RMSNorm weight used before the LM head.
     ///
@@ -354,7 +387,7 @@ pub trait ModelWeightLoader {
         _store: &WeightStore,
         _config: &ModelConfig,
         _gpu: &dyn GpuBackend,
-    ) -> Result<Option<VisionEncoder>> {
+    ) -> Result<Option<VisionTower>> {
         Ok(None)
     }
 }

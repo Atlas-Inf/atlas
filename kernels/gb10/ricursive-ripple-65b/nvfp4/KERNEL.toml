@@ -1,0 +1,3 @@
+# Module names for this overlay (merged over laguna-s-2.1 / common).
+[modules]
+w4a4_gemm = "w4a4"

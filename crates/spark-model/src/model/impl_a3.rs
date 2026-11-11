@@ -27,13 +27,9 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
-/// Presence kill switch for the wide (9..=VERIFY_ROW_CAP row) batched LM head arm:
-/// `ATLAS_NO_LMHEAD_BATCHED_WIDE` restores the M64-tile `w4a16_gemm` fallback.
-/// Presence, not value — `=0` is NOT "off" (see `atlas_env_presence_check_trap`).
-fn lmhead_batched_wide_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ATLAS_NO_LMHEAD_BATCHED_WIDE").is_err())
-}
+#[path = "impl_a3/lmhead_arms.rs"]
+mod lmhead_arms;
+use lmhead_arms::*;
 
 impl TransformerModel {
     /// Scale in-place embeddings by config.embed_scale. The residual stream
@@ -200,26 +196,18 @@ impl TransformerModel {
                     )?;
                 }
             }
-        } else if (2..=8).contains(&num_tokens)
-            && self.lm_head_nvfp4.is_none()
-            && self.dense_gemv_batchm_kernel.0 != 0
-            && ops::exl3_dense_rows_env()
-            && ops::exl3_dense_is_registered(self.lm_head_weight.weight)
-        {
-            // Packed EXL3 lm_head: one trellis read for all verify rows
-            // (dense_gemv_batchm routes a registered weight to the native
-            // M-row GEMV). Without this, 3..8 rows fell to the BF16 tile
-            // GEMM (13 ms at M = 3) and 2 rows to two batch-1 GEMVs.
-            ops::dense_gemv_batchm(
-                self.gpu.as_ref(),
-                self.dense_gemv_batchm_kernel,
+        } else if self.levers.exact_verify && num_tokens > 2 && self.lm_head_nvfp4.is_none() {
+            // Exact verify (qwen4_exp, qwen3_5): serial decode's
+            // `dense_gemv_bf16` per row (one `_batchm` pass), not the scalar
+            // tile GEMM below.
+            self.head_project(
+                super::qwen4exp_lmhead_split::HeadArith::Gemv,
                 hidden,
-                &self.lm_head_weight,
+                0,
+                v as usize,
+                num_tokens as usize,
                 logits,
-                num_tokens,
-                v,
-                h,
-                v,
+                v as usize,
                 stream,
             )?;
         } else if num_tokens == 2 {
@@ -236,38 +224,78 @@ impl TransformerModel {
                     h,
                     stream,
                 )?;
-            } else {
-                // Dense fallback: 2× GEMV. Stays BF16 even when
-                // use_fp32_logits is on — the FP32 path is decode-only
-                // (single-token `lm_head`); batched-decode/prefill keeps
-                // BF16 because the bug it fixes only manifests at decode
-                // step 1 (first-token argmax tiebreak).
-                ops::dense_gemv(
+            } else if self.dense_gemv_bf16_batch2_kernel.0 != 0
+                && super::trait_impl::lm_head_batch_gemv_enabled()
+            {
+                // One BF16 weight pass for both verify tokens (Flash-Next ships a
+                // BF16 [248320, 2560] head: the fallback read 1.27 GB twice per
+                // step). Bit-identical to it, see the handle's lookup.
+                // Off with ATLAS_NO_LM_HEAD_BATCH_GEMV=1 like the other arms.
+                ops::dense_gemv_batch2(
                     self.gpu.as_ref(),
-                    self.dense_gemv_kernel,
+                    self.dense_gemv_bf16_batch2_kernel,
                     hidden,
                     &self.lm_head_weight,
                     logits,
                     v,
                     h,
+                    v,
                     stream,
                 )?;
-                ops::dense_gemv(
+            } else {
+                // Dense fallback: 2× GEMV — two full passes over the head,
+                // or one byte-identical batch-M pass under
+                // `ATLAS_QWEN4EXP_LMHEAD_BATCHM=1` (qwen4_exp). Stays BF16
+                // even when use_fp32_logits is on — the FP32 path is
+                // decode-only (single-token `lm_head`); batched-decode/prefill
+                // keeps BF16 because the bug it fixes only manifests at decode
+                // step 1 (first-token argmax tiebreak).
+                self.head_project(
+                    super::qwen4exp_lmhead_split::HeadArith::Gemv,
+                    hidden,
+                    0,
+                    v as usize,
+                    2,
+                    logits,
+                    v as usize,
+                    stream,
+                )?;
+            }
+        } else if (self.levers.mamba_verify_exact
+            || num_tokens > 8 && self.levers.dense_exact_rows(num_tokens as usize))
+            && self.w4a16_gemv_batch16_kernel.0 != 0
+            && let Some(ref nvfp4) = self.lm_head_nvfp4
+        {
+            // Exact-verify LM head (omni, K-row verify; the dense
+            // ATLAS_EXACT_VERIFY's 9..=16-row DFlash K=γ verify, one chunk):
+            // chunked w4a16_gemv_batchm at <=16 rows per call. The batchm twin is
+            // byte-identical to the serial w4a16 GEMV decode uses (proven at
+            // shared-expert dims; covered here at lm-head dims by
+            // lmhead_batchm_identical_to_serial). Chunking is result-free.
+            let bf16 = 2usize;
+            let mut c0 = 0usize;
+            while c0 < num_tokens as usize {
+                let m = (num_tokens as usize - c0).min(16);
+                ops::w4a16_gemv_batchm(
                     self.gpu.as_ref(),
-                    self.dense_gemv_kernel,
-                    hidden.offset(h as usize * 2),
-                    &self.lm_head_weight,
-                    logits.offset(v as usize * 2),
+                    self.w4a16_gemv_batch16_kernel,
+                    hidden.offset(c0 * h as usize * bf16),
+                    nvfp4,
+                    logits.offset(c0 * v as usize * bf16),
+                    m as u32,
                     v,
                     h,
                     stream,
                 )?;
+                c0 += m;
             }
-        } else if self.lm_head_dp4a_batch4(hidden, num_tokens, logits, h, v, stream)? {
+        } else if !self.levers.exact_verify
+            && self.lm_head_dp4a_batch4(hidden, num_tokens, logits, h, v, stream)?
+        {
             // Handled by the W4A8 DP4A arm (see `trait_impl/lm_head_dp4a.rs`).
             // Nothing further to launch.
         } else if (3..=8).contains(&num_tokens)
-            && self.w4a16_batchm.kernel(num_tokens).0 != 0
+            && self.lm_head_batchm_kernel(num_tokens).0 != 0
             && let Some(ref nvfp4) = self.lm_head_nvfp4
         {
             // K=3..8 verify lm_head: one weight read for all rows via the
@@ -285,7 +313,7 @@ impl TransformerModel {
             // (batchm_bench).
             ops::w4a16_gemv_batchm(
                 self.gpu.as_ref(),
-                self.w4a16_batchm.kernel(num_tokens),
+                self.lm_head_batchm_kernel(num_tokens),
                 hidden,
                 nvfp4,
                 logits,
@@ -311,17 +339,26 @@ impl TransformerModel {
                 h,
                 stream,
             )?;
+        } else if self.config.model_type == "ricursive" {
+            // BF16 head over the verify rows: cuBLASLt streams the 1 GB weight
+            // ~6x faster than the scalar `dense_gemm` tile kernel.
+            let w = self.lm_head_weight.weight.0;
+            ops::bf16_gemm(hidden, w, logits, num_tokens, v, h, stream)?;
         } else {
-            ops::dense_gemm(
+            super::glm_k3_head::project(
                 self.gpu.as_ref(),
-                self.dense_gemm_kernel,
+                &self.config,
                 hidden,
                 &self.lm_head_weight,
                 logits,
                 num_tokens,
-                v,
-                h,
+                self.dense_gemv_batchm_kernel,
+                self.dense_gemm_kernel,
                 stream,
+                num_tokens == 5
+                    && self.config.model_type == "glm5_next"
+                    && self.dense_gemv_batchm_kernel.0 != 0
+                    && glm_k5_bf16_lmhead_batchm_enabled(),
             )?;
         }
         // Feature-2: overlay overridden logit columns AFTER the base projection,
