@@ -6,8 +6,9 @@
 //! f_a / g_a side projections on the pipelined triple and on its packed
 //! CUTLASS twin, and every head's beta on the CUTLASS twin of the pipelined
 //! GEMM -- leave, on each quarter of a chunk and on each of its sixteenths
-//! (the per-block gather's seam blocks), those rows' bytes of the whole
-//! chunk's run.
+//! (the per-block gather's seam blocks), and on each half and eighth (the
+//! pair's parts and seam blocks, `ATLAS_GLM_SP_QUANT_GATHER_PAIR`), those
+//! rows' bytes of the whole chunk's run.
 //!
 //!   cargo test --release -p spark-model --lib sp_kda_quant -- --ignored --nocapture
 
@@ -109,7 +110,16 @@ fn sp_kda_quant_quarters_are_the_whole_chunks_bytes() -> Result<()> {
         for (m, seed) in [(8192usize, 1u64), (16384, 2)] {
             let x = upload(&gpu, &values(seed, m * H, 2.0))?;
             let scratch = poison(&gpu, m * n * 2)?;
-            for (parts, packed_gemm) in [(4, false), (4, true), (16, false), (16, true)] {
+            for (parts, packed_gemm) in [
+                (4, false),
+                (4, true),
+                (16, false),
+                (16, true),
+                (2, false),
+                (2, true),
+                (8, false),
+                (8, true),
+            ] {
                 let rows = m / parts;
                 let (whole, quarters) = (Outs::new(&gpu, m, heads)?, Outs::new(&gpu, m, heads)?);
                 let run = |o: &Outs, row0: usize, rows: usize| -> Result<()> {
@@ -184,7 +194,7 @@ fn sp_kda_quant_quarters_are_the_whole_chunks_bytes() -> Result<()> {
         }
     }
     println!(
-        "MXFP8 cast, side projections, every-head beta: quarters and sixteenths == whole (16/32 heads, 8192/16384 rows)"
+        "MXFP8 cast, side projections, every-head beta: halves, quarters, eighths and sixteenths == whole (16/32 heads, 8192/16384 rows)"
     );
     Ok(())
 }
