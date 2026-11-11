@@ -38,8 +38,24 @@ atlas)
     || { log "NVFP4 DOWNLOAD FAILED: $(grep -av "^ " "$OUT/download.log" | tail -8)"; exit 1; }
   log "atlas $(git rev-parse --short=9 HEAD), $NVFP4_REPO ($(du -shL "$NV" | cut -f1))"
   AENV=(GPU_UTIL=${GPU_UTIL:-0.70} MAX_SEQ_LEN=32768 ATLAS_KV_EXTERNAL_RESERVE_GB=0)
-  atlas_up $PORT "$NVFP4_REPO" "${AENV[@]}" MAX_BATCH=1; bench_arm atlas_b1 1
-  atlas_up $PORT "$NVFP4_REPO" "${AENV[@]}" MAX_BATCH=8; bench_arm atlas_b8 ;;
+  if [ "${PROF:-0}" = 1 ]; then   # PROF=1: only the b8 arm at C4 (the Flash-Next batched-MTP-verify collapse), under rocprofv3
+    command -v rocprofv3 >/dev/null || PATH=$PATH:/opt/rocm/bin; W="$OUT/spark-prof"; mkdir -p "$OUT/prof"
+    printf '#!/usr/bin/env bash\nexec rocprofv3 --kernel-trace --output-format csv -d %q -o run -- %q "$@"\n' "$OUT/prof" "$PWD/target/release/spark" > "$W"; chmod +x "$W"
+    atlas_up $PORT "$NVFP4_REPO" "${AENV[@]}" MAX_BATCH=8 ATLAS_BIN="$W"; bench_arm atlas_b8_prof 4 720
+    KT=$(find "$OUT/prof" -name '*kernel_trace.csv' | head -1)
+    [ -n "$KT" ] && python3 - "$KT" <<'PY' | tee -a "$RES"
+import csv, sys, collections
+tot, cnt = collections.Counter(), collections.Counter()
+for r in csv.DictReader(open(sys.argv[1])):
+    n = (r.get("Kernel_Name") or r.get("KernelName") or "?").split("(")[0][:90]
+    tot[n] += int(r["End_Timestamp"]) - int(r["Start_Timestamp"]); cnt[n] += 1
+s = sum(tot.values()); print(f"  [prof] {len(tot)} kernels, {s / 1e9:.2f} s GPU total")
+for n, t in tot.most_common(40): print(f"  [prof] {t / 1e6:10.1f} ms {100 * t / s:5.1f}% x{cnt[n]:<7} {n}")
+PY
+  else
+    atlas_up $PORT "$NVFP4_REPO" "${AENV[@]}" MAX_BATCH=1; bench_arm atlas_b1 1
+    atlas_up $PORT "$NVFP4_REPO" "${AENV[@]}" MAX_BATCH=8; bench_arm atlas_b8
+  fi ;;
 gufo)
   gufo_build || exit 1
   gufo_up $PORT "$SESSIONS" "$CONTEXT" "$Q4"; bench_arm gufo_ar
