@@ -118,6 +118,26 @@ impl BufferArena {
         Ok(self.lend_base)
     }
 
+    /// Lend `bytes` of the span past the members `zero_all` never zeroes
+    /// ([`UNZEROED`]), for a borrower that keeps using one of those members
+    /// as the arena's own (the mHC prewarm's activation beside its scratch in
+    /// `gate_logits_f32`). As [`Self::lend`]; give it back with
+    /// [`Self::return_lent_tail`].
+    pub fn lend_tail(&self, bytes: usize, gpu: &dyn GpuBackend) -> Result<DevicePtr> {
+        let tail = self.lend_bytes - self.lend_unzeroed;
+        ensure!(
+            bytes <= tail,
+            "arena lends {tail} bytes past its unzeroed members, a borrower asked for {bytes}"
+        );
+        gpu.synchronize_device()?;
+        Ok(self.lend_base.offset(self.lend_unzeroed))
+    }
+
+    /// Take back `bytes` lent by [`Self::lend_tail`]: all of them are zeroed.
+    pub fn return_lent_tail(&self, bytes: usize, gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
+        self.return_lent(self.lend_unzeroed + bytes, gpu, stream)
+    }
+
     /// Take back the first `bytes` of the span from work enqueued on
     /// `stream`: zero there what overlaps members `zero_all` zeroes, and wait
     /// for `stream`, so a pass enqueued afterwards on any stream finds them

@@ -139,7 +139,8 @@ pub struct BufferSizes {
     pub norm_unit_w: usize,
     /// HC residual streams: `[M, streams, hidden]` F32, where `streams` is
     /// `hc_mult` (DeepSeek-V4 mHC) or `hc_count` (qwen4_exp), whichever the
-    /// model sets. 256 (placeholder) when neither is set.
+    /// model sets; BF16 when the model keeps its highway BF16
+    /// (`ModelConfig::hc_highway_bf16`). 256 (placeholder) when neither is set.
     pub hc_streams: usize,
     /// HC `post` mixing weights: `[M, hc_mult]` F32.
     pub hc_post: usize,
@@ -625,7 +626,12 @@ impl BufferSizes {
                 // (`ops::qwen4exp`) and never read this arena buffer, so the
                 // per-family branch was removed rather than left as a trap for
                 // whoever reads it next.
-                m * hc_streams_count * h * 4
+                //
+                // GLM-5 under `ATLAS_GLM_HC_BF16=1` is the one exception, and
+                // it serves the `_bf16` twins of those kernels on a BF16
+                // highway (`hc_kernel_name`): half the bytes. The model build
+                // checks this size against the format it serves.
+                m * hc_streams_count * h * if config.hc_highway_bf16 { bf16 } else { 4 }
             } else {
                 256
             },
@@ -750,6 +756,18 @@ mod qwen4exp_hc_tests {
         // every entry point. bf16 here would not fail — it would read the
         // wrong half of every value.
         assert_eq!(sizes.hc_streams, 128 * 4 * 2560 * 4);
+    }
+
+    /// GLM-5 keeps its highway BF16 (`ATLAS_GLM_HC_BF16=1`); the launcher
+    /// says so in the config and the arena then holds BF16 rows.
+    #[test]
+    fn a_bf16_highway_is_half_the_bytes() {
+        let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+        cfg.hc_mult = 4;
+        cfg.hidden_size = 4096;
+        cfg.hc_highway_bf16 = true;
+        let sizes = BufferSizes::from_config(&cfg, 8196, 2048, 16, 1);
+        assert_eq!(sizes.hc_streams, 8196 * 4 * 4096 * 2);
     }
 
     /// A real `qwen4_exp` config sets BOTH spellings — the parser maps

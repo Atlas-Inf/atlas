@@ -191,32 +191,55 @@ pub(super) fn initialize(
     ensure!(cfg!(feature = "cuda"), "{FLAG}=1 requires CUDA");
     let hc_flag = env_value("ATLAS_HC_CUBLAS_PREFILL")?;
     let sizes = buffers.sizes();
-    let plan = Plan::new(
+    let stream = gpu.default_stream();
+    // The GEMM reads FP32 activations: the highway itself when it holds FP32
+    // rows. A BF16 highway is half that, so the activation then comes from
+    // the arena's per-pass span, past the member the scratch below lives in,
+    // and the highway is zeroed as the prewarm always left it.
+    let need = bytes(max_rows, config.hidden_size.saturating_mul(config.hc_mult))?;
+    let lent = sizes.hc_streams < need;
+    let (activation, activation_capacity) = if lent {
+        gpu.memset_async(buffers.hc_streams(), 0, sizes.hc_streams, stream)?;
+        (buffers.lend_tail(need, gpu)?, need)
+    } else {
+        (buffers.hc_streams(), sizes.hc_streams)
+    };
+    let free_before = gpu.free_memory()?;
+    let started = std::time::Instant::now();
+    let warmed = Plan::new(
         config,
         max_rows,
         hc_flag.as_deref(),
         Storage {
-            activation: buffers.hc_streams(),
-            activation_capacity: sizes.hc_streams,
+            activation,
+            activation_capacity,
             scratch: buffers.gate_logits_f32(),
             scratch_capacity: sizes.gate_logits_f32,
         },
-    )?;
-    let stream = gpu.default_stream();
-    let free_before = gpu.free_memory()?;
-    let started = std::time::Instant::now();
-    execute(gpu, &plan, stream, |call| {
-        spark_runtime::cublaslt::tf32_gemm_act_weight_t(
-            call.activation.0,
-            call.weight.0,
-            call.output.0,
-            call.m,
-            call.n,
-            call.k,
-            call.stream,
-        )
-    })
-    .context("requested HC TF32 startup prewarm failed")?;
+    )
+    .and_then(|plan| {
+        execute(gpu, &plan, stream, |call| {
+            spark_runtime::cublaslt::tf32_gemm_act_weight_t(
+                call.activation.0,
+                call.weight.0,
+                call.output.0,
+                call.m,
+                call.n,
+                call.k,
+                call.stream,
+            )
+        })
+        .context("requested HC TF32 startup prewarm failed")
+        .map(|()| plan)
+    });
+    // Give the span back whatever happened to the prewarm.
+    let returned = if lent {
+        buffers.return_lent_tail(need, gpu, stream)
+    } else {
+        Ok(())
+    };
+    let plan = warmed?;
+    returned.context("HC TF32 prewarm could not return the arena's span")?;
     let free_after = gpu.free_memory()?;
     tracing::info!(
         rank = config.ep_rank,

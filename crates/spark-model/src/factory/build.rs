@@ -549,6 +549,19 @@ pub fn build_model(
         max_batch_size,
         gpu.as_ref(),
     )?;
+    // The arena sized the mHC highway from `config.hc_highway_bf16`; the
+    // kernels read it in the format `hc_elem_bytes` names. A highway smaller
+    // than they read would be written past its end.
+    let highway = max_batch_tokens
+        * config.hc_mult.max(config.hc_count)
+        * config.hidden_size
+        * crate::layers::ops::hc_elem_bytes(&config.model_type);
+    anyhow::ensure!(
+        highway == 0 || buffers.sizes().hc_streams >= highway,
+        "buffer arena holds a {}-byte mHC highway, the model reads {highway} \
+         (ModelConfig::hc_highway_bf16 does not match ATLAS_GLM_HC_BF16)",
+        buffers.sizes().hc_streams
+    );
     // ATLAS_GLM_PREFILL_PIPE2: the second half-chunk's arena, sized with
     // the model's before the KV pool.
     let glm_latent_tokens = (kv_dtype == spark_runtime::kv_cache::KvCacheDtype::Fp8G128

@@ -178,3 +178,22 @@ fn a_failed_return_of_the_lent_span_leaves_everything_to_zero() {
     arena.zero_dirty_over(&gpu, 0, FLOOR, MIN).unwrap();
     assert!(all_zero(&arena, &gpu));
 }
+
+/// The span past the members `zero_all` never zeroes is lent on its own: the
+/// borrow starts at the first zeroed member, cannot exceed what follows, and
+/// comes back zeroed.
+#[test]
+fn the_tail_of_the_span_is_lent_and_comes_back_zeroed() {
+    let gpu = MockGpuBackend::new();
+    let arena = arena(&gpu);
+    arena.zero_all(&gpu, 0).unwrap();
+    let tail = arena.lendable_bytes() - arena.lend_unzeroed;
+    assert!(arena.lend_tail(tail + 1, &gpu).is_err());
+    let lent = arena.lend_tail(tail, &gpu).unwrap();
+    assert_eq!(lent, arena.qkv_output());
+    let unzeroed_end = arena.gate_logits_f32().0 + arena.sizes().gate_logits_f32 as u64;
+    assert!(unzeroed_end <= lent.0);
+    gpu.memset(lent, 0x5A, tail).unwrap();
+    arena.return_lent_tail(tail, &gpu, 0).unwrap();
+    assert!(all_zero(&arena, &gpu));
+}

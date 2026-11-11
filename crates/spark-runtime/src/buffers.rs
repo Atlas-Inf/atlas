@@ -91,7 +91,8 @@ pub struct BufferArena {
     /// Zero-filled BF16 weight (max_dim) for unweighted RMSNorm under the
     /// offset-from-1 kernel convention (scale = 1+weight → 1.0). Used by q_b_norm.
     norm_unit_w: DevicePtr,
-    /// HC residual streams: [M, hc_mult, hidden] BF16 (DeepSeek-V4 mHC).
+    /// HC residual streams: [M, hc_mult, hidden] F32 (BF16 for a model that
+    /// keeps its highway BF16; see `BufferSizes::hc_streams`).
     hc_streams: DevicePtr,
     /// HC `post` mixing weights: [M, hc_mult] F32.
     hc_post: DevicePtr,
