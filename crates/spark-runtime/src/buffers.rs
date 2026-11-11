@@ -24,7 +24,7 @@ pub use decode_meta::{
 };
 pub use sizes::{
     BufferSizes, HC_SCRATCH_ALIGN, HcPreScratchLayout, QSA_SELECT_SCRATCH_ROWS,
-    hc_pre_scratch_layout,
+    hc_pre_scratch_layout, router_worklist_bytes,
 };
 pub use sizes_q2::q2_dequant_scratch_bytes;
 pub use sizes_q12::{

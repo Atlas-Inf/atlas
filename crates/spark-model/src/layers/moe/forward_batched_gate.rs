@@ -67,6 +67,12 @@ impl MoeLayer {
             )?;
         } else if fp32_routing {
             // FP32 router_in (from residual_add_rms_norm_gatef32) × bf16 gate.
+            // An arena that sized this buffer as worklist scratch (a
+            // correction-bias router's) holds no router input.
+            anyhow::ensure!(
+                ctx.buffers.sizes().moe_router_in_f32 >= n as usize * h as usize * 4,
+                "FP32 routing of {n} rows exceeds the arena's router input"
+            );
             ops::dense_gemm(
                 ctx.gpu,
                 self.dense_gemm_f32in,

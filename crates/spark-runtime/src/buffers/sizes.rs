@@ -96,6 +96,28 @@ mod hc_scratch_layout_tests {
     }
 }
 
+/// Bytes of the MoE tile-worklist scratch for `rows` rows: a 16-byte tile
+/// count and one 8-byte item per row, routed expert and 128-wide tile of the
+/// expert intermediate. Every worklist the MoE builds in `moe_router_in_f32`
+/// is at most this for the rows it serves, and each checks the capacity
+/// before it writes (`spark-model` `moe::prequant_fp4`, `moe::decode_m16`,
+/// `moe::route_fuse`, `moe::gate_up_btile_grouped`).
+pub fn router_worklist_bytes(rows: usize, top_k: usize, inter: usize) -> usize {
+    16 + rows * top_k * inter.div_ceil(128) * 8
+}
+
+/// Whether `moe_router_in_f32` keeps its FP32 `[rows, hidden]` size. Only
+/// `ATLAS_FP32_ROUTING=1` reads a router input there
+/// (`MoeLayer::fp32_routing_active`), and never on a correction-bias router;
+/// without it the buffer is worklist scratch. Per-layer expert shapes keep
+/// the full size: the worklist bound is stated for one shape.
+fn fp32_router_input(config: &ModelConfig) -> bool {
+    !config.use_routing_bias
+        || !config.moe_intermediate_sizes.is_empty()
+        || !config.num_experts_per_toks.is_empty()
+        || std::env::var("ATLAS_FP32_ROUTING").as_deref() == Ok("1")
+}
+
 /// Byte sizes of each buffer, derived from ModelConfig.
 #[derive(Debug, Clone)]
 pub struct BufferSizes {
@@ -111,6 +133,8 @@ pub struct BufferSizes {
     pub gate_logits_f32: usize,
     /// FP32 MoE-input norm output [m, hidden] for ATLAS_FP32_ROUTING — the
     /// full-precision router_in the gate GEMM consumes. Allocated when experts > 0.
+    /// A correction-bias router never takes that path, and the buffer is then
+    /// only the MoE tile-worklist scratch ([`router_worklist_bytes`]).
     pub moe_router_in_f32: usize,
     pub moe_output: usize,
     pub logits: usize,
@@ -527,10 +551,17 @@ impl BufferSizes {
             } else {
                 256
             },
-            moe_router_in_f32: if config.num_experts > 0 {
+            moe_router_in_f32: if config.num_experts == 0 {
+                256
+            } else if fp32_router_input(config) {
                 m * h * 4
             } else {
-                256
+                // Worklist scratch only. One FP32 row stays, the size a
+                // one-row arena always had, and the K128W row-tile prefix
+                // (one word an expert, the end and the work counter).
+                router_worklist_bytes(m, top_k, config.moe_intermediate_size)
+                    .max(h * 4)
+                    .max((config.num_experts + config.zero_expert_num + 2) * 4)
             },
             moe_output: m * h * bf16,
             logits: logits_tokens * config.vocab_size * bf16, // BF16 from LM head kernel
