@@ -48,15 +48,20 @@ impl TransformerModel {
 
     /// [`crate::traits::Model::prefill_row_multiple`]: 128 rows a rank of
     /// the chain when its SP prefill is requested, twice it with the two-half
-    /// pipeline (the pair keeps its chunks). Each rank's part is then whole
-    /// 128-row tiles, which the MXFP8 exchanges need (the KDA quantized
-    /// gather, the all-to-all o_proj): the 8200-row arena used to cut an
-    /// 8196-row first chunk (2049 rows a part) that kept both off.
+    /// pipeline (the pair keeps its chunks, unless
+    /// `ATLAS_GLM_SP_QUANT_GATHER_PAIR=2` asks for its KDA quantized gather).
+    /// Each rank's part is then whole 128-row tiles, which the MXFP8
+    /// exchanges need (the KDA quantized gather, the all-to-all o_proj): the
+    /// 8200-row arena used to cut an 8196-row first chunk (2049 rows a part)
+    /// that kept both off.
     pub(super) fn glm_sp_row_multiple(&self) -> usize {
         let ranks = self.comm.as_ref().map_or(1, |c| c.world_size());
-        if glm_sp::requested() && self.config.model_type == "glm5_next" && ranks > 2 {
-            // The two-half pipeline splits each half over the ranks too.
-            128 * ranks * if self.prefill_pipe.is_some() { 2 } else { 1 }
+        if glm_sp::requested() && self.config.model_type == "glm5_next" {
+            sp_row_multiple(
+                ranks,
+                glm_sp::quant_gather_pair(),
+                self.prefill_pipe.is_some(),
+            )
         } else {
             1
         }
@@ -94,6 +99,19 @@ impl TransformerModel {
     }
 }
 
+/// The row multiple of a GLM SP prefill over `ranks` ranks: whole 128-row
+/// tiles a rank on the chain (each half's, under the two-half pipeline
+/// `pipe`), and on the pair when its switch `pair`
+/// (`glm_sp::quant_gather_pair`) is 2; else the pair keeps its chunks.
+fn sp_row_multiple(ranks: usize, pair: usize, pipe: bool) -> usize {
+    if ranks > 2 || (ranks == 2 && pair == 2) {
+        // The two-half pipeline splits each half over the ranks too.
+        128 * ranks * if pipe { 2 } else { 1 }
+    } else {
+        1
+    }
+}
+
 /// DFlash captures its context window on rank 0, and SP leaves rank 0 only
 /// the top part of the rows: on the pair the window has to fit there or the
 /// capture would have holes (`try_dflash_prefill_capture_layer`); a chain
@@ -110,8 +128,23 @@ fn dflash_window_stays_local(
 
 #[cfg(test)]
 mod tests {
-    use super::dflash_window_stays_local;
+    use super::{dflash_window_stays_local, sp_row_multiple};
     use atlas_core::config::ModelConfig;
+
+    #[test]
+    fn the_pair_keeps_its_chunks_unless_its_kda_gather_is_asked_for() {
+        // The chain, as before, whatever the pair's switch says.
+        for pair in 0..=2 {
+            assert_eq!(sp_row_multiple(4, pair, false), 512);
+            assert_eq!(sp_row_multiple(4, pair, true), 1024);
+            assert_eq!(sp_row_multiple(1, pair, false), 1);
+        }
+        assert_eq!(sp_row_multiple(2, 0, false), 1);
+        assert_eq!(sp_row_multiple(2, 1, false), 1);
+        // 128 rows a rank: an 8196-row chunk is cut to 8192, 4096 a part.
+        assert_eq!(sp_row_multiple(2, 2, false), 256);
+        assert_eq!(sp_row_multiple(2, 2, true), 512);
+    }
 
     #[test]
     fn dflash_keeps_sp_while_its_window_fits_rank_zero() {
