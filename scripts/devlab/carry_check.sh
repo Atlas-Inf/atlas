@@ -57,7 +57,7 @@ def say(leg, ok, ev):
 def words_ok(t):
     w = (t or "").split(); return len(w) >= 8 and len(set(w)) / len(w) > 0.3
 # probe
-for name, q in (("fib", "Write a Python function that returns the n-th Fibonacci number."), ("sky", "Explain in three sentences why the sky is blue."),
+for name, q in (("short", "Explain in two sentences why the sky is blue."), ("fib", "Write a Python function that returns the n-th Fibonacci number."), ("sky", "Explain in three sentences why the sky is blue."),
                 ("essay", "Write a 150-word paragraph about the history of the bicycle.")):
     t = time.time(); c, r = chat([{"role": "user", "content": q}]); dt = time.time() - t
     txt = r["choices"][0]["message"].get("content") if c == 200 else str(r)
@@ -108,5 +108,5 @@ else: say("long", None, "LONG=0")
 PY
 kill -INT "$APID" 2>/dev/null; for _ in $(seq 1 90); do kill -0 "$APID" 2>/dev/null || break; sleep 2; done; kill -9 "$APID" 2>/dev/null
 f="$OUT/serve-$TAG.log"
-log "$TAG boot: faults $(grep -acE 'panicked|illegal|HIP error|watchdog' "$f") | unresolved-kernels: $(grep -aoE '[0-9]+ unresolved kernel lookup' "$f" | head -1) | snapshot-pools: $(grep -aiE 'snapshot pool|ssm-cache-slots' "$f" | head -1 | sed 's/\x1b\[[0-9;]*m//g' | cut -c60-200) | spec: $(grep -aoE 'tok_step=[0-9.]+' "$f" | tail -3 | tr '\n' ' ')"
+log "$TAG boot: errors $(sed 's/\x1b\[[0-9;]*m//g' "$f" | grep -aE ' ERROR |panicked|illegal memory|HIP error' | cut -c28-160 | sort | uniq -c | tr '\n' ';') | unresolved-kernels: $(grep -aoE '[0-9]+ unresolved kernel lookup' "$f" | head -1) | snapshot-pools: $(grep -aiE 'snapshot pool|ssm-cache-slots' "$f" | head -1 | sed 's/\x1b\[[0-9;]*m//g' | cut -c60-200) | spec: $(grep -aoE 'tok_step=[0-9.]+' "$f" | tail -3 | tr '\n' ' ')"
 log "DONE $(grep -c ' FAIL ' "$RES") FAIL / $(grep -c ' PASS ' "$RES") PASS"

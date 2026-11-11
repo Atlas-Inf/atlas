@@ -47,7 +47,7 @@ for arm in ${ARMS:-dflash ar}; do
     log "ripple_$arm SERVE FAILED: $(grep -aE 'ERROR|allocfail|panick|Error' "$OUT/serve-ripple-$arm.log" | tail -3)"
   fi
   kill -INT "$APID" 2>/dev/null; for _ in $(seq 1 90); do kill -0 "$APID" 2>/dev/null || break; sleep 2; done; kill -9 "$APID" 2>/dev/null
-  log "ripple_$arm faults: $(grep -acE 'panicked|illegal|HIP error|watchdog' "$OUT/serve-ripple-$arm.log") | spec: $(grep -aoE 'tok_step=[0-9.]+' "$OUT/serve-ripple-$arm.log" | tail -3 | tr '\n' ' ')"
+  log "ripple_$arm errors: $(sed 's/\x1b\[[0-9;]*m//g' "$OUT/serve-ripple-$arm.log" | grep -aE ' ERROR |panicked|illegal memory|HIP error' | cut -c28-160 | sort | uniq -c | tr '\n' ';') | spec: $(grep -aoE 'tok_step=[0-9.]+' "$OUT/serve-ripple-$arm.log" | tail -3 | tr '\n' ' ')"
   for _ in $(seq 1 60); do [ "$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)" -gt 40000 ] && break; sleep 2; done
 done
 [ -f "$OUT/probe-ripple_dflash.json" ] && [ -f "$OUT/probe-ripple_ar.json" ] && python3 - "$OUT" <<'PY' | tee -a "$RES"
