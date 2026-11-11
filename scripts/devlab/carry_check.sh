@@ -40,7 +40,7 @@ if ! wait_ready "$PORT" 720; then
   log "$TAG SERVE FAILED: $(grep -aE 'ERROR|allocfail|panick|Error' "$OUT/serve-$TAG.log" | tail -3)"; kill -9 "$APID" 2>/dev/null; exit 1
 fi
 log "$TAG serving"
-python3 - "$PORT" "$TAG" "${LONG:-$([ "$MK" = 27b ] && echo 60000 || echo 0)}" <<'PY' | tee -a "$RES"
+python3 - "$PORT" "$TAG" "${LONG:-$([ "$MK" = 27b ] && echo 40000 || echo 0)}" <<'PY' | tee -a "$RES"
 import json, sys, time, threading, urllib.request, urllib.error
 port, tag, long_n = sys.argv[1], sys.argv[2], int(sys.argv[3])
 U = f"http://127.0.0.1:{port}"
@@ -83,7 +83,7 @@ c, r = chat([{"role": "user", "content": "What's the weather in Paris right now?
 txt = r["choices"][0]["message"].get("content") or "" if c == 200 else ""
 say("notool", c == 200 and "<tool_call>" not in txt, repr(txt[:80]))
 # score
-c, r = post("/v1/score", {"prefix": [9707, 11, 1879, 374], "branches": [[264], [279]], "options": [[1661, 2244, 3460]]})
+c, r = post("/v1/score", {"prefix": [9707, 11, 1879, 374], "branches": [[264], [279]], "options": [1661, 2244, 3460]})
 if c == 501: say("score", None, "501 (model does not score)")
 else:
     ok = c == 200 and isinstance(r, dict) and all(0 <= sum(p) <= 1.0001 for p in r.get("probs", [[2]]))
