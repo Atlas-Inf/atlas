@@ -16,6 +16,7 @@ HERE=$(cd "$(dirname "$0")" && pwd); . "$HERE/lib_engines.sh"
 [ -x target/release/spark ] || { log "no target/release/spark (run with job=bench)"; exit 1; }
 command -v rocprofv3 >/dev/null || PATH=$PATH:/opt/rocm/bin; command -v rocprofv3 >/dev/null || { log "no rocprofv3"; exit 1; }
 REPO=${REPO:-nvidia/Qwen3.8-Flash-Next-NVFP4}; BIG=model-fp8-mtp-ple.safetensors; PORT=${PORT:-8093}
+"${PY:-python3}" -c "import huggingface_hub" 2>/dev/null || { V="$HFC/.hfvenv"; [ -x "$V/bin/python" ] || python3 -m venv "$V"; "$V/bin/python" -c "import huggingface_hub" 2>/dev/null || "$V/bin/pip" install -q huggingface_hub >>"$OUT/download.log" 2>&1; PY="$V/bin/python"; }
 NV=$("${PY:-python3}" -c 'import sys; from huggingface_hub import snapshot_download as s; print(s(sys.argv[1], ignore_patterns=[sys.argv[2]]))' "$REPO" "$BIG" 2>>"$OUT/download.log") \
   && { [[ "$REPO" != *Flash-Next* ]] || curl -fsSL -C - --retry 5 --retry-all-errors -o "$NV/$BIG" "${HF_ENDPOINT:-https://huggingface.co}/$REPO/resolve/main/$BIG" 2>>"$OUT/download.log"; } \
   || { log "DOWNLOAD FAILED: $(grep -av '^ ' "$OUT/download.log" | tail -6)"; exit 1; }
