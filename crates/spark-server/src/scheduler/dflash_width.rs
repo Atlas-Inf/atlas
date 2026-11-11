@@ -212,12 +212,29 @@ pub(super) fn on_chain() -> bool {
     VERIFY_RANKS.get().is_some_and(|&ranks| ranks > 2)
 }
 
-/// What the chain is charged for a lone owner's 2-row verify over its 3-row
-/// one: the pair's 2026-09-28 sweep measured 10.3 ms, on the fused two-row
-/// path expert TP has since retired. The pair re-measured it on 2026-11-11
-/// (5.4 ms *under* the 3-row verify) and no longer pays this; the chain has
-/// not measured it and keeps the charge.
+/// What a lone owner's 2-row verify costs over its 3-row one on the fused
+/// two-row path (`moe::forward_k2`): the pair's 2026-09-28 sweep measured
+/// 10.3 ms. The chain has not measured it and is charged the same. A pair
+/// under expert TP has no such path ([`lone_two_on_row_line`]).
 pub(super) const LONE_TWO_ROWS_MS: f32 = 10.3;
+
+/// Whether the verify runs on a two-rank pair under expert TP, set once at
+/// startup ([`set_pair_expert_tp`]); unset is not.
+static PAIR_EXPERT_TP: OnceLock<bool> = OnceLock::new();
+
+/// Record that the verify runs on a two-rank pair under expert TP.
+pub(crate) fn set_pair_expert_tp(on: bool) {
+    let _ = PAIR_EXPERT_TP.set(on);
+}
+
+/// Whether a lone owner's 2-row verify is priced on its row line instead of
+/// carrying [`LONE_TWO_ROWS_MS`]: on the pair under expert TP, where it runs
+/// the grouped path its 3-row verify does and measured 42.0 ms against 47.4
+/// (SparkGLM 0.3.2, prose, 2026-11-11, `ATLAS_DFLASH_FIXED_WIDTH=1`). A
+/// single GPU and a pair without expert TP still take the fused path.
+pub(super) fn lone_two_on_row_line() -> bool {
+    !on_chain() && PAIR_EXPERT_TP.get().copied().unwrap_or(false)
+}
 
 /// Verify step cost in ms on the TP4 chain for `owners` owners of `rows`
 /// rows each: per owner count, a fixed part and a cost per owner-row, fitted
@@ -268,13 +285,16 @@ fn step_ms(owners: usize, rows: usize) -> f32 {
     if on_chain() {
         return chain_step_ms(owners, rows.clamp(2, 8));
     }
-    // Rows 2..=8, owners 1..=8. A lone owner's 2-row cell is its 3-row one
-    // less the 5.9 ms a row measured on 2026-11-11 (the 2026-09-28 sweep's
-    // 83.8 ms was a path expert TP retired). Owners x rows past the 32-row
-    // verify budget never run (infinite cost).
+    // Rows 2..=8, owners 1..=8. A lone owner's 2-row verify takes a slower
+    // path than 3 rows, except on the pair under expert TP, where it is the
+    // 3-row cell less the 5.4 ms measured on 2026-11-11. Owners x rows past
+    // the 32-row verify budget never run (infinite cost).
     const X: f32 = f32::INFINITY;
+    if owners <= 1 && rows <= 2 && lone_two_on_row_line() {
+        return 68.1;
+    }
     const MS: [[f32; 7]; 8] = [
-        [67.6, 73.5, 81.7, 88.7, 97.0, 104.1, 111.2],
+        [83.8, 73.5, 81.7, 88.7, 97.0, 104.1, 111.2],
         [93.2, 109.4, 123.1, 144.0, 155.3, 165.2, 175.9],
         [114.1, 141.0, 161.2, 176.3, 191.6, 202.7, 216.3],
         [132.1, 163.1, 186.2, 206.4, 222.1, 236.2, 248.4],
