@@ -63,6 +63,16 @@ impl Qwen3AttentionLayer {
         self.value_residual.is_some()
     }
 
+    /// Multi-row prefill projections on a native BF16 weight take the BLAS GEMM
+    /// (`bf16_gemm`: cuBLASLt, hipBLASLt on HIP) instead of
+    /// `dense_gemm_bf16_pipelined` when `ATLAS_CUBLAS_GEMM` is set, and always
+    /// for Ricursive on gfx1151, where the pipelined kernel runs at 8-18 TFLOPS
+    /// against hipBLASLt's 20-34 at Ripple's q+gate / k|v / o shapes. Unlike the
+    /// env flag this reserves no lazy BF16 copies (the weights are already BF16).
+    pub(crate) fn prefill_bf16_blas(&self, cublas_gemm: bool, rows: u32) -> bool {
+        rows > 1 && (cublas_gemm || (cfg!(atlas_hip) && self.wide_bf16_gemm()))
+    }
+
     /// The small-M BF16 GEMV for `rows` verify rows, or `None` (wider, or a
     /// model without it): callers fall back to the cuBLASLt GEMM.
     pub(crate) fn wide_bf16_gemv(&self, rows: usize) -> Option<KernelHandle> {
