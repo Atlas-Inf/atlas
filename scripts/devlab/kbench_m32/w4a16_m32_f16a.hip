@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+static inline float bf(__nv_bfloat16 v) { return __bfloat162float(v); }
 #define CHECK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { printf("HIP %s at %s:%d\n", hipGetErrorString(e_), __FILE__, __LINE__); exit(1); } } while (0)
 
 template <int NT>
@@ -126,16 +127,20 @@ int main() {
     struct S { const char* name; unsigned int M, N, K; } shapes[] = {
         {"ripple ffn gate/up", 17, 40960, 5120}, {"ripple ffn down", 17, 5120, 40960},
         {"ripple attn q|gate", 17, 20480, 5120}, {"ripple attn o", 17, 5120, 10240},
-        {"ripple ffn gate/up M9", 9, 40960, 5120}, {"ripple ffn gate/up M32", 32, 40960, 5120}};
+        {"ripple ffn gate/up M9", 9, 40960, 5120}, {"ripple ffn gate/up M32", 32, 40960, 5120},
+        {"wide-range M17 down", 17 | 0x100, 5120, 40960}, {"wide-range M17 o", 17 | 0x100, 5120, 10240},
+        {"wide-range M19 qg", 19 | 0x100, 20480, 5120}, {"wide-range M16 25600", 16 | 0x100, 5120, 25600},
+        {"lm_head-like M17", 17 | 0x100, 100278, 5120}};
     for (auto& s : shapes) {
-        const unsigned M = s.M, N = s.N, K = s.K;
+        const bool wide = s.M & 0x100; const unsigned M = s.M & 0xFF, N = s.N, K = s.K;
         const size_t pb = (size_t)K / 2 * N, sb = (size_t)K / 16 * N, wbytes = pb + sb;
         const int copies = (int)std::max<size_t>(2, (512ull << 20) / wbytes + 1);
         std::vector<unsigned char> hp(pb), hs(sb);
-        srand(7); for (auto& b : hp) b = rand() & 0x77; for (auto& b : hs) b = 0x30 + (rand() & 0x0F);
+        srand(7); for (auto& b : hp) b = wide ? (rand() & 0xFF) : (rand() & 0x77);
+        for (auto& b : hs) { b = wide ? (rand() % 0x7F) : 0x30 + (rand() & 0x0F); if (wide && (rand() & 1)) b |= 0x80; }
         std::vector<unsigned char*> P(copies), Q(copies);
         for (int c = 0; c < copies; c++) { CHECK(hipMalloc(&P[c], pb)); CHECK(hipMemcpy(P[c], hp.data(), pb, hipMemcpyHostToDevice)); CHECK(hipMalloc(&Q[c], sb)); CHECK(hipMemcpy(Q[c], hs.data(), sb, hipMemcpyHostToDevice)); }
-        std::vector<__nv_bfloat16> hA((size_t)M * K); for (auto& a : hA) a = __float2bfloat16(((rand() % 2001) - 1000) / 1000.f);
+        std::vector<__nv_bfloat16> hA((size_t)M * K); for (auto& a : hA) a = __float2bfloat16(wide ? ((rand() % 2001) - 1000) / 1000.f * std::pow(2.f, (float)(rand() % 24 - 12)) : ((rand() % 2001) - 1000) / 1000.f);
         __nv_bfloat16 *A, *C0, *C1; CHECK(hipMalloc(&A, hA.size() * 2)); CHECK(hipMemcpy(A, hA.data(), hA.size() * 2, hipMemcpyHostToDevice));
         CHECK(hipMalloc(&C0, (size_t)M * N * 2)); CHECK(hipMalloc(&C1, (size_t)M * N * 2));
         hipEvent_t e0, e1; CHECK(hipEventCreate(&e0)); CHECK(hipEventCreate(&e1));
@@ -145,7 +150,7 @@ int main() {
             else hipLaunchKernelGGL(w4a16_gemm_t_m32_f16a<64>, dim3((N + 63) / 64, (M + 31) / 32), dim3(128), 0, 0, A, P[c], Q[c], 0.01f, C, M, N, K);
         };
         const char* names[] = {"m128_f16a", "m32 NT128", "m32 NT64"};
-        printf("-- %s M=%u N=%u K=%u (%.1f MB)\n", s.name, M, N, K, wbytes / 1e6);
+        printf("-- %s M=%u N=%u K=%u wide=%d (%.1f MB)\n", s.name, M, N, K, (int)wide, wbytes / 1e6);
         std::vector<__nv_bfloat16> r0((size_t)M * N), r1((size_t)M * N);
         launch(0, 0, C0); CHECK(hipDeviceSynchronize()); CHECK(hipMemcpy(r0.data(), C0, r0.size() * 2, hipMemcpyDeviceToHost));
         for (int rep = 0; rep < 2; rep++)
@@ -155,7 +160,7 @@ int main() {
                 float ms; CHECK(hipEventElapsedTime(&ms, e0, e1));
                 CHECK(hipMemset(C1, 0xFF, (size_t)M * N * 2));
                 launch(v, 0, C1); CHECK(hipDeviceSynchronize()); CHECK(hipMemcpy(r1.data(), C1, r1.size() * 2, hipMemcpyDeviceToHost));
-                size_t neq = 0; for (size_t i = 0; i < r0.size(); i++) neq += memcmp(&r0[i], &r1[i], 2) != 0;
+                size_t neq = 0; for (size_t i = 0; i < r0.size(); i++) neq += memcmp(&r0[i], &r1[i], 2) != 0 && !(std::isnan(bf(r0[i])) && std::isnan(bf(r1[i])));
                 printf("   %-10s %8.1f us  %6.1f GB/s  (%zu/%zu differ from m128_f16a)\n", names[v], 1000 * ms / it, wbytes / 1e9 / (ms / it / 1000), neq, r0.size());
             }
         for (int c = 0; c < copies; c++) { hipFree(P[c]); hipFree(Q[c]); }
