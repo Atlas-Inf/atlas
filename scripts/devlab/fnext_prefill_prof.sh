@@ -20,12 +20,19 @@ REPO=${REPO:-nvidia/Qwen3.8-Flash-Next-NVFP4}; BIG=model-fp8-mtp-ple.safetensors
 NV=$("${PY:-python3}" -c 'import sys; from huggingface_hub import snapshot_download as s; print(s(sys.argv[1], ignore_patterns=[sys.argv[2]]))' "$REPO" "$BIG" 2>>"$OUT/download.log") \
   && { [[ "$REPO" != *Flash-Next* ]] || curl -fsSL -C - --retry 5 --retry-all-errors -o "$NV/$BIG" "${HF_ENDPOINT:-https://huggingface.co}/$REPO/resolve/main/$BIG" 2>>"$OUT/download.log"; } \
   || { log "DOWNLOAD FAILED: $(grep -av '^ ' "$OUT/download.log" | tail -6)"; exit 1; }
+# DRAFT_REPO (e.g. ricursiveAI/Ripple-65B-Preview-DFlash2): serve with that DFlash drafter; EXTRA: extra serve args, comma-separated.
+if [ -n "${DRAFT_REPO:-}" ]; then
+  DM=$("${PY:-python3}" -c 'import sys; from huggingface_hub import snapshot_download as s; print(s(sys.argv[1]))' "$DRAFT_REPO" 2>>"$OUT/download.log") \
+    || { log "DRAFT DOWNLOAD FAILED"; exit 1; }
+  export DFLASH=1 DRAFT_MODEL="$DM"
+fi
+IFS=, read -r -a EXTRA_A <<< "${EXTRA:-}"   # comma-separated (workflow args split on spaces)
 
 # spark under the profiler: serve-amd.sh execs $ATLAS_BIN, so point it at a wrapper.
 W="$OUT/spark-prof"; mkdir -p "$OUT/prof"
 if [ "${NOPROF:-0}" = 1 ]; then W="$PWD/target/release/spark"; else printf '#!/usr/bin/env bash\nexec rocprofv3 --kernel-trace --output-format csv -d %q -o run -- %q "$@"\n' "$OUT/prof" "$PWD/target/release/spark" > "$W"; chmod +x "$W"; fi
-( exec env RUST_LOG=info ATLAS_BIN="$W" PORT="$PORT" HOST=127.0.0.1 MODEL_NAME=m GPU_UTIL=${GPU_UTIL:-0.76} MAX_SEQ_LEN=32768 \
-    ATLAS_KV_EXTERNAL_RESERVE_GB=0 MAX_BATCH=${MAX_BATCH:-1} ./serve-amd.sh "$REPO" --disable-thinking --request-timeout 0 --enable-prefix-caching ) > "$OUT/atlas-server.log" 2>&1 &
+( exec env RUST_LOG=info ATLAS_BIN="$W" PORT="$PORT" HOST=127.0.0.1 MODEL_NAME=m GPU_UTIL=${GPU_UTIL:-0.76} MAX_SEQ_LEN=${MAX_SEQ_LEN:-32768} \
+    ATLAS_KV_EXTERNAL_RESERVE_GB=0 MAX_BATCH=${MAX_BATCH:-1} ./serve-amd.sh "$REPO" --disable-thinking --request-timeout 0 --enable-prefix-caching "${EXTRA_A[@]}" ) > "$OUT/atlas-server.log" 2>&1 &
 APID=$!; ENGINE_ALIVE() { kill -0 "$APID" 2>/dev/null; }
 wait_ready "$PORT" 720 || { log "SERVE FAILED: $(grep -aE 'ERROR|allocfail|panick' "$OUT/atlas-server.log" | tail -3)"; kill -9 "$APID" 2>/dev/null; exit 1; }
 log "serving under rocprofv3"
@@ -67,6 +74,14 @@ elif os.environ.get("PHASE") == "c8":
         t = time.time(); th = [threading.Thread(target=gen, args=(i,)) for i in range(8)]
         [x.start() for x in th]; [x.join() for x in th]
         print(f"  [prof] c8 round {rnd}: 8x256 tok in {time.time() - t:.2f}s -> {2048 / (time.time() - t):.1f} tok/s agg", flush=True)
+elif os.environ.get("PHASE") == "decode":
+    # C1 greedy decode on prose + code (Ripple DFlash2 verify-step attribution): 3 x 256 tokens, one at a time.
+    for i, q in enumerate(["Write a 300-word essay on the history of the bicycle.", "Explain how a refrigerator works in detail.",
+                           "Write a Python class implementing an LRU cache with tests."]):
+        body = {"model": "m", "messages": [{"role": "user", "content": q}], "max_tokens": 256, "temperature": 0}
+        t = time.time(); req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
+        u = json.load(urllib.request.urlopen(req, timeout=1800)).get("usage", {}); dt = time.time() - t
+        print(f"  [prof] decode-{i}: {u.get('completion_tokens')} tok in {dt:.2f}s -> {u.get('completion_tokens', 0) / dt:.1f} tok/s", flush=True)
 else:
     for i in range(3): ask(f"2k-{i}", 1900, 100 + i)
     for i in range(2): ask(f"16k-{i}", 16000, 200 + i)
