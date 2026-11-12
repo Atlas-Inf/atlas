@@ -662,11 +662,11 @@ pub fn build_model(
         && let Some(ref args) = dflash_args
         && let Some(ref sub) = args.drafter_config.dflash_config
     {
-        let ctx_window: usize = std::env::var("ATLAS_DFLASH_CTX_WINDOW")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(4096);
-        let ctx_capacity = ctx_window.min(max_seq_len);
+        let ctx_capacity = crate::layers::dflash_head::layer_attention::ctx_capacity(
+            args.window_size,
+            &args.drafter_config,
+            max_seq_len,
+        )?;
         if ctx_capacity > 0 && !sub.target_layer_ids.is_empty() {
             let acc_bytes = ctx_capacity
                 .saturating_mul(sub.target_layer_ids.len())

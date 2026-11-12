@@ -940,7 +940,7 @@ mod small_m_gemm;
 mod tree_lattice;
 
 mod context_window;
-mod layer_attention;
+pub(crate) mod layer_attention;
 mod markov_slots;
 use markov_slots::{MARKOV_BAN_DEPTH_OFFSET, MARKOV_PREV_BYTES};
 mod twins;

@@ -73,6 +73,23 @@ pub(super) fn resolve_context_window(
     Ok((Some(window), ctx_window))
 }
 
+/// Rows the head's context accumulator will have (`ctx_window` capped at
+/// `max_seq_len`), for sizing it before the head exists. The factory's early
+/// pool prime used the uniform 4096 and primed half of Ripple's 8192 rows:
+/// the first request took that buffer and its zeroing memset ran past the end
+/// (HIP InvalidValue, HTTP 500 on request 1 only).
+pub(crate) fn ctx_capacity(
+    requested: Option<usize>,
+    config: &DflashConfig,
+    max_seq_len: usize,
+) -> Result<usize> {
+    let env_ctx_window = std::env::var("ATLAS_DFLASH_CTX_WINDOW")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let (_, ctx_window) = resolve_context_window(requested, config, env_ctx_window)?;
+    Ok(ctx_window.min(max_seq_len))
+}
+
 impl BlockDiffusionDraftHead {
     /// The attention kernel's sliding window for layer `layer_idx`: the
     /// layer's own window when the checkpoint declares per-layer windows,
@@ -181,6 +198,8 @@ mod tests {
         assert!(resolve_context_window(Some(4096), &c, None).is_err());
         assert!(resolve_context_window(None, &c, None).is_err());
         assert!(resolve_context_window(Some(16384), &c, Some(8192)).is_err());
+        // What the factory primes: the head's rows, not the uniform 4096.
+        assert_eq!(ctx_capacity(Some(16384), &c, 8192).unwrap(), 8192);
     }
 
     #[test]
