@@ -36,6 +36,7 @@ pub fn w4a16_m128_kernel(gpu: &dyn GpuBackend) -> KernelHandle {
     let base = try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128");
     if h.0 != 0 && base.0 != 0 {
         record_m128_pair(h, base);
+        record_m32_twins(gpu, h);
         return h;
     }
     base
@@ -66,6 +67,46 @@ fn record_m128_pair(twin: KernelHandle, base: KernelHandle) {
     let _ = M128_PAIR.set((twin.0, base.0));
 }
 
+/// `(m128_f16a, m32_f16a_n128, m32_f16a_n64)` when the target ships the m32
+/// twins (`w4a16_gemm.cu`: same WMMA operands in the same order, so
+/// bit-identical to m128_f16a at a quarter of the WMMA work for M <= 32).
+static M32_TWINS: std::sync::OnceLock<(u64, u64, u64)> = std::sync::OnceLock::new();
+
+fn record_m32_twins(gpu: &dyn GpuBackend, m128_twin: KernelHandle) {
+    if M32_TWINS.get().is_some() {
+        return;
+    }
+    let n128 = try_kernel(gpu, "w4a16", "w4a16_gemm_t_m32_f16a_n128");
+    let n64 = try_kernel(gpu, "w4a16", "w4a16_gemm_t_m32_f16a_n64");
+    if n128.0 != 0 && n64.0 != 0 {
+        let _ = M32_TWINS.set((m128_twin.0, n128.0, n64.0));
+    }
+}
+
+/// Narrow N takes the 64-column tile: at N = 5120 the 128-column tile is only
+/// 40 CTAs (gfx1151 kbench 43302086666: Ripple down 1468 vs 1231 us, o 377 vs
+/// 317 us); wide N keeps 128 (gate/up 686 vs 738 us).
+const M32_N64_MAX_N: u32 = 8192;
+
+/// `ATLAS_W4A16_M32=0` keeps m128_f16a at every M (A/B kill switch).
+fn m32_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_W4A16_M32").as_deref() != Ok("0"))
+}
+
+/// The m32 twin and its N tile for an `m128_f16a` launch with `m <= 32` rows,
+/// or `None` (another kernel, wider M, or a target without the twins).
+pub(crate) fn m32_for_shape(kernel: KernelHandle, m: u32, n: u32) -> Option<(KernelHandle, u32)> {
+    let &(twin, n128, n64) = M32_TWINS.get()?;
+    if kernel.0 != twin || m > 32 || !m32_enabled() {
+        return None;
+    }
+    Some(match n <= M32_N64_MAX_N {
+        true => (KernelHandle(n64), 64),
+        false => (KernelHandle(n128), 128),
+    })
+}
+
 fn f16_m128_min_nk() -> u64 {
     static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -94,6 +135,7 @@ pub fn w4a16_m128_kernel_required(gpu: &dyn GpuBackend) -> Result<KernelHandle> 
     let base = gpu.kernel("w4a16", "w4a16_gemm_t_m128")?;
     if h.0 != 0 {
         record_m128_pair(h, base);
+        record_m32_twins(gpu, h);
         return Ok(h);
     }
     Ok(base)
