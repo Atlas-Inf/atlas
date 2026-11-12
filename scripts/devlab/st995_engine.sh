@@ -28,9 +28,18 @@ fi
 case $ENGINE in
 atlas)
   [ -x target/release/spark ] || { log "no target/release/spark"; exit 1; }
-  hf_get "$NVFP4_REPO" "" >/dev/null || { log "NVFP4 DOWNLOAD FAILED"; exit 1; }
-  TGT=$(hf_get "$NVFP4_REPO" "")/config.json
-  atlas_up $PORT "$NVFP4_REPO" GPU_UTIL=0.70 MAX_SEQ_LEN=$CTX MAX_BATCH=1 ATLAS_KV_EXTERNAL_RESERVE_GB=0
+  if [ "$MK" = fnext ]; then # the mirror refuses the >50 GB PLE file through the hub client (42981375215, 43121079823): curl it
+    BIG=model-fp8-mtp-ple.safetensors; pyhf
+    M=$("${PY:-python3}" -c 'import sys; from huggingface_hub import snapshot_download as s; print(s(sys.argv[1], ignore_patterns=[sys.argv[2]]))' \
+      "$NVFP4_REPO" "$BIG" 2>>"$OUT/download.log") && curl -fsSL -C - --retry 5 --retry-all-errors -o "$M/$BIG" \
+      "${HF_ENDPOINT:-https://huggingface.co}/$NVFP4_REPO/resolve/main/$BIG" 2>>"$OUT/download.log" || { log "NVFP4 DOWNLOAD FAILED"; exit 1; }
+    TGT=$M/config.json
+  else
+    hf_get "$NVFP4_REPO" "" >/dev/null || { log "NVFP4 DOWNLOAD FAILED"; exit 1; }
+    TGT=$(hf_get "$NVFP4_REPO" "")/config.json
+  fi
+  # Flash-Next's 92 GB of weights do not fit 0.70 of the runner's 100 GB (43121108957); 0.80 is its carry-check level.
+  atlas_up $PORT "$NVFP4_REPO" GPU_UTIL=${GPU_UTIL:-$([ "$MK" = fnext ] && echo 0.80 || echo 0.70)} MAX_SEQ_LEN=$CTX MAX_BATCH=1 ATLAS_KV_EXTERNAL_RESERVE_GB=0
   log "atlas mode ${ATLAS_MODE:-recipe}" ;;
 gufo) gufo_build || exit 1; gufo_up $PORT 1 "$CTX" "$TGT" ;;
 llamacpp)
