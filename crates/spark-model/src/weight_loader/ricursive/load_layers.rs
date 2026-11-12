@@ -52,7 +52,9 @@ pub(super) fn load_layers(
         tracing::info!("{O_NVFP4}=1: attention o_proj requantized BF16 -> NVFP4 at load");
     }
     if requant.q {
-        tracing::info!("{Q_NVFP4}=1: decode reads an NVFP4 twin of the BF16 q|gate projection");
+        tracing::info!(
+            "{Q_NVFP4}=1: q|gate requantized BF16 -> NVFP4 at load (decode, verify, prefill)"
+        );
     }
     let mut layers: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
@@ -156,14 +158,24 @@ fn load_attention(
         true => Some(requant.nvfp4(&o_dense, h, nq * hd, gpu)?),
         false => None,
     };
-    // Decode-only q|gate twin: the one-row GEMV reads NVFP4, while the
-    // multi-row verify / prefill arms keep reading the BF16 `qg`.
-    let q_decode = match requant.q {
-        true => Some(requant.nvfp4(&DenseWeight { weight: qg }, 2 * nq * hd, h, gpu)?),
+    // NVFP4 q|gate: decode reads it through the one-row GEMV, verify and
+    // prefill through its transposed twin, and the BF16 `qg` is freed.
+    let q_quant = match requant.q {
+        true => {
+            let q = requant.nvfp4(&DenseWeight { weight: qg }, 2 * nq * hd, h, gpu)?;
+            let qt = q.transpose_for_gemm(gpu, 2 * nq * hd, h)?;
+            gpu.synchronize(requant.qctx.stream)?;
+            gpu.free(qg)?;
+            Some((q, qt))
+        }
         false => None,
     };
+    let q_dense = match q_quant {
+        Some(_) => DevicePtr::NULL,
+        None => qg,
+    };
     let attn = AttentionWeights {
-        q_proj: DenseWeight { weight: qg },
+        q_proj: DenseWeight { weight: q_dense },
         k_proj: bf16_dense(store, &format!("{p}.k_proj.weight"), kv_width, h)?,
         v_proj: bf16_dense(store, &format!("{p}.v_proj.weight"), kv_width, h)?,
         o_proj: o_quant.unwrap_or_else(QuantizedWeight::null),
@@ -188,15 +200,20 @@ fn load_attention(
         config.fp8_kv_calibration_tokens,
         config,
     )?;
-    match o_quant {
+    // Transposed twins for the prefill / verify GEMM (`w4a16_gemm_t`).
+    let ot = match o_quant {
         Some(o) => {
-            // Transposed twin for the prefill / verify GEMM (`w4a16_gemm_t`).
             let ot = o.transpose_for_gemm(gpu, h, nq * hd)?;
-            layer.set_prefill_weights(None, None, None, Some(ot));
             store.reclaim(gpu, &o_key)?;
+            Some(ot)
         }
-        None => layer.set_o_dense_bf16(o_dense),
-    }
+        None => {
+            layer.set_o_dense_bf16(o_dense);
+            None
+        }
+    };
+    let (q_decode, qt) = q_quant.unzip();
+    layer.set_prefill_weights(qt, None, None, ot);
     if let Some(q) = q_decode {
         layer.set_q_decode_nvfp4(q);
     }
@@ -224,8 +241,8 @@ const Q_NVFP4: &str = "ATLAS_RIPPLE_Q_NVFP4";
 
 /// Opt-in attention requant at load (both change numerics, so both stay off
 /// until ST-995 clears them): `ATLAS_RIPPLE_O_NVFP4=1` replaces each layer's
-/// BF16 o_proj with NVFP4; `ATLAS_RIPPLE_Q_NVFP4=1` adds a decode-only NVFP4
-/// twin of the BF16 q|gate projection.
+/// BF16 o_proj with NVFP4; `ATLAS_RIPPLE_Q_NVFP4=1` replaces the BF16 q|gate
+/// projection with NVFP4 (decode, verify and prefill).
 #[derive(Clone, Copy)]
 struct AttnRequant {
     o: bool,

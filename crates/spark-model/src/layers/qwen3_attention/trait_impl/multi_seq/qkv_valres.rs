@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Multi-row Q/K/V for value-residual layers (Ricursive Ripple): dense BF16
-//! q/k/v where V reads the blended `lerp(x0, normed, blend)` rows.
+//! q/k/v (or NVFP4 q|gate, opt-in) where V reads the blended
+//! `lerp(x0, normed, blend)` rows.
 //!
 //! One BF16 GEMM per projection reads each weight once for all `n` rows (the
 //! DFlash verify width), instead of the per-row GEMV loop gated BF16 layers
@@ -42,9 +43,15 @@ impl Qwen3AttentionLayer {
         let v_scratch = k_scratch.offset(n * kv_bytes);
         let (m, k) = (n as u32, h as u32);
         let gpu = fwd.gpu;
-        // q|gate (the widest projection) straight into its qkv_buf rows.
-        let q_direct = self.wide_bf16_gemv(n);
-        if let Some(gemv) = q_direct {
+        // NVFP4 q|gate (`ATLAS_RIPPLE_Q_NVFP4=1`, no BF16 copy): the verify
+        // GEMM on the transposed twin, into the scratch rows.
+        let q_nvfp4 = self.q_decode_nvfp4.as_ref();
+        // Else BF16 q|gate (the widest projection) straight into its qkv_buf rows.
+        let q_direct = q_nvfp4.is_none().then(|| self.wide_bf16_gemv(n)).flatten();
+        if let Some(qd) = q_nvfp4 {
+            let qt = self.q_nvfp4_t.as_ref();
+            self.wide_verify_gemm(c, normed, qd, qt, q_scratch, m, q_proj_dim, k)?;
+        } else if let Some(gemv) = q_direct {
             let ldc = (per_seq_qkv / bf16) as u32;
             let q_w = self.attn.q_proj.weight;
             // Gated: the store splits [Q_h | G_h] (no deinterleave pass).
