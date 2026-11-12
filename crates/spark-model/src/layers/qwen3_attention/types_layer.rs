@@ -103,6 +103,10 @@ pub struct Qwen3AttentionLayer {
     /// NVFP4 path (`attn.o_proj`). Used by Gemma-4 dense which honors
     /// Nvidia ModelOpt's official ignore list.
     pub(super) o_dense_bf16: Option<DenseWeight>,
+    /// NVFP4 twin of a BF16 gated `[Q|gate]` projection, read only by the
+    /// one-row decode GEMV (Ricursive `ATLAS_RIPPLE_Q_NVFP4=1`). Multi-row
+    /// verify and prefill keep `attn.q_proj`'s BF16.
+    pub(super) q_decode_nvfp4: Option<QuantizedWeight>,
     /// MXFP8 kernels + prefill scratch for `QuantWeight::Mxfp8` (`mx8.rs`).
     pub(super) mx8_rt: Option<super::mx8::Mx8AttnRt>,
     // ── MLA (Multi-head Latent Attention) — 2-step decode ──

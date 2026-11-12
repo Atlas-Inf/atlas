@@ -43,24 +43,23 @@ pub(super) fn load_layers(
         gpu.kernel("bf16_gemv_m32", "bf16_gemv_m32")?
     };
     let verify_attn_k = gpu.kernel("ricursive_verify_attn", "ricursive_verify_attn")?;
-    let o_nvfp4 = o_proj_nvfp4();
-    if o_nvfp4 {
+    let requant = AttnRequant {
+        o: opt_in(O_NVFP4),
+        q: opt_in(Q_NVFP4),
+        qctx,
+    };
+    if requant.o {
         tracing::info!("{O_NVFP4}=1: attention o_proj requantized BF16 -> NVFP4 at load");
+    }
+    if requant.q {
+        tracing::info!("{Q_NVFP4}=1: decode reads an NVFP4 twin of the BF16 q|gate projection");
     }
     let mut layers: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
         let lp = format!("model.layers.{i}");
         let ffn = load_ffn(store, config, gpu, &lp, variant, qctx)?;
-        let mut layer = load_attention(
-            store,
-            config,
-            gpu,
-            &lp,
-            ffn,
-            layer_kv_dtypes[i],
-            i,
-            o_nvfp4.then_some(qctx),
-        )?;
+        let mut layer =
+            load_attention(store, config, gpu, &lp, ffn, layer_kv_dtypes[i], i, requant)?;
         let lambda = load_bf16_scalar(store, gpu, &format!("{lp}.self_attn.value_res_lambda"))?;
         layer.set_value_residual(ValueResidual {
             x0: DevicePtr::NULL,
@@ -136,7 +135,7 @@ fn load_attention(
     ffn: FfnComponent,
     kv_dtype: KvCacheDtype,
     i: usize,
-    o_nvfp4: Option<QuantizeCtx>,
+    requant: AttnRequant,
 ) -> Result<Qwen3AttentionLayer> {
     let p = format!("{lp}.self_attn");
     let (h, hd) = (config.hidden_size, config.head_dim);
@@ -153,17 +152,15 @@ fn load_attention(
     // The opt-in requant: o_proj is ~31% of the BF16 attention bytes every
     // decode step streams. Q/K/V stay BF16 (value residuals project V from
     // blended rows, which only the dense arms do).
-    let o_quant = match o_nvfp4 {
-        Some(q) => Some(quantize_to_nvfp4(
-            &o_dense,
-            h,
-            nq * hd,
-            gpu,
-            q.absmax_k,
-            q.quantize_k,
-            q.stream,
-        )?),
-        None => None,
+    let o_quant = match requant.o {
+        true => Some(requant.nvfp4(&o_dense, h, nq * hd, gpu)?),
+        false => None,
+    };
+    // Decode-only q|gate twin: the one-row GEMV reads NVFP4, while the
+    // multi-row verify / prefill arms keep reading the BF16 `qg`.
+    let q_decode = match requant.q {
+        true => Some(requant.nvfp4(&DenseWeight { weight: qg }, 2 * nq * hd, h, gpu)?),
+        false => None,
     };
     let attn = AttentionWeights {
         q_proj: DenseWeight { weight: qg },
@@ -200,6 +197,9 @@ fn load_attention(
         }
         None => layer.set_o_dense_bf16(o_dense),
     }
+    if let Some(q) = q_decode {
+        layer.set_q_decode_nvfp4(q);
+    }
     layer.set_post_sublayer_norms(
         dense(store, &format!("{lp}.post_attention_layernorm.weight"))?,
         dense(store, &format!("{lp}.post_feedforward_layernorm.weight"))?,
@@ -220,11 +220,34 @@ fn load_attention(
 }
 
 const O_NVFP4: &str = "ATLAS_RIPPLE_O_NVFP4";
+const Q_NVFP4: &str = "ATLAS_RIPPLE_Q_NVFP4";
 
-/// Opt-in (`ATLAS_RIPPLE_O_NVFP4=1`): requantize each layer's BF16 o_proj to
-/// NVFP4 at load. Changes numerics, so it stays off until ST-995 clears it.
-fn o_proj_nvfp4() -> bool {
-    std::env::var(O_NVFP4).as_deref() == Ok("1")
+/// Opt-in attention requant at load (both change numerics, so both stay off
+/// until ST-995 clears them): `ATLAS_RIPPLE_O_NVFP4=1` replaces each layer's
+/// BF16 o_proj with NVFP4; `ATLAS_RIPPLE_Q_NVFP4=1` adds a decode-only NVFP4
+/// twin of the BF16 q|gate projection.
+#[derive(Clone, Copy)]
+struct AttnRequant {
+    o: bool,
+    q: bool,
+    qctx: QuantizeCtx,
+}
+
+impl AttnRequant {
+    fn nvfp4(
+        &self,
+        w: &DenseWeight,
+        n: usize,
+        k: usize,
+        gpu: &dyn GpuBackend,
+    ) -> Result<QuantizedWeight> {
+        let q = self.qctx;
+        quantize_to_nvfp4(w, n, k, gpu, q.absmax_k, q.quantize_k, q.stream)
+    }
+}
+
+fn opt_in(var: &str) -> bool {
+    std::env::var(var).as_deref() == Ok("1")
 }
 
 fn bf16_matrix(store: &WeightStore, key: &str, rows: usize, cols: usize) -> Result<DevicePtr> {

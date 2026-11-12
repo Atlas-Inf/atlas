@@ -178,6 +178,7 @@ impl Qwen3AttentionLayer {
             v_weight: v_nvfp4.map(QuantWeight::Nvfp4),
             o_weight: None,
             o_dense_bf16: None,
+            q_decode_nvfp4: None,
             mx8_rt: None,
             mla: None,
             mla_mx: Vec::new(),

@@ -253,6 +253,12 @@ impl Qwen3AttentionLayer {
         self.o_dense_bf16 = Some(o_dense);
     }
 
+    /// Decode-only NVFP4 twin of the dense BF16 gated `[Q|gate]` projection
+    /// (see `q_decode_nvfp4`).
+    pub fn set_q_decode_nvfp4(&mut self, q: QuantizedWeight) {
+        self.q_decode_nvfp4 = Some(q);
+    }
+
     /// Set post-sublayer norms (Gemma-4: 4-norm residual structure).
     pub fn set_post_sublayer_norms(
         &mut self,

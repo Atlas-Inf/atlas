@@ -192,16 +192,29 @@ impl Qwen3AttentionLayer {
                     )?;
                 }
             } else {
-                ops::dense_gemv(
-                    ctx.gpu,
-                    self.dense_gemv_k,
-                    normed,
-                    &self.attn.q_proj,
-                    q_out,
-                    q_proj_dim,
-                    h,
-                    stream,
-                )?;
+                if let Some(qd) = self.q_decode_nvfp4.as_ref() {
+                    self.nvfp4_decode_gemv(
+                        ctx.gpu,
+                        ctx.levers.gemv_sw,
+                        normed,
+                        qd,
+                        q_out,
+                        q_proj_dim,
+                        h,
+                        stream,
+                    )?;
+                } else {
+                    ops::dense_gemv(
+                        ctx.gpu,
+                        self.dense_gemv_k,
+                        normed,
+                        &self.attn.q_proj,
+                        q_out,
+                        q_proj_dim,
+                        h,
+                        stream,
+                    )?;
+                }
                 // q_proj LoRA on the RAW interleaved [Q|gate] (BEFORE deinterleave).
                 self.apply_q_lora(ctx, normed, q_out, stream)?;
                 ops::deinterleave_qg(
