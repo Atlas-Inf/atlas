@@ -11,7 +11,7 @@
 # the leg is sequential, and Gufo's quality contract makes greedy speculation output-identical to AR anyway.
 set -uo pipefail
 ENGINE=${1:?atlas|gufo|llamacpp}; MK=fnext; ARGS=("${@:2}")
-[[ "${2:-}" =~ ^(27b|fnext)$ ]] && { MK=$2; ARGS=("${@:3}"); }
+[[ "${2:-}" =~ ^(27b|fnext|ripple)$ ]] && { MK=$2; ARGS=("${@:3}"); }
 for kv in "${ARGS[@]}"; do [[ "$kv" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9_./:,+-]*$ ]] && export "$kv"; done
 WEIGHTS=${WEIGHTS:-q4}; CTX=${CTX:-32768}; PORT=18085
 OUT=${DEVLAB_OUT:-$PWD/devlab-out}; mkdir -p "$OUT"; RES="$OUT/RESULTS.txt"
@@ -19,7 +19,10 @@ HERE=$(cd "$(dirname "$0")" && pwd); . "$HERE/lib_engines.sh"
 # The BFCL venv pip install hit "No space left on device" on the runner (41607542609): keep pip's temp and cache on the scratch disk.
 export TMPDIR=${RUNNER_TEMP:-/tmp}/st995-tmp PIP_CACHE_DIR=${RUNNER_TEMP:-/tmp}/st995-pipcache; mkdir -p "$TMPDIR" "$PIP_CACHE_DIR"
 log "disk: $(df -h "$HOME" /tmp "${RUNNER_TEMP:-/tmp}" 2>/dev/null | awk 'NR>1 {print $6"="$4" free"}' | sort -u | tr '\n' ' ')"
-model_spec "$MK" || exit 1; pyhf
+if [ "$MK" = ripple ]; then # atlas only: AR (no drafter), the runner's honest util floor after #351, Ripple's 8192 context
+  [ "$ENGINE" = atlas ] || { log "ripple: atlas only"; exit 1; }
+  NVFP4_REPO=ricursiveAI/Ripple-65B-Preview-NVFP4; CTX=${CTX_RIPPLE:-8192}; pyhf
+else model_spec "$MK" || exit 1; pyhf; fi
 if [ "$ENGINE" != atlas ]; then # the GGUF engines' weights; atlas serves NVIDIA's NVFP4 directly
   Q4D=$(hf_get "$Q4_REPO" "$Q4_PAT" "$Q4_REV") || { log "MODEL DOWNLOAD FAILED: $(tail -2 "$OUT/download.log")"; exit 1; }
   TGT=$(first_gguf "$Q4D" "$Q4_PAT")
@@ -39,7 +42,7 @@ atlas)
     TGT=$(hf_get "$NVFP4_REPO" "")/config.json
   fi
   # Flash-Next's 92 GB of weights do not fit 0.70 of the runner's 100 GB (43121108957); 0.80 is its carry-check level.
-  atlas_up $PORT "$NVFP4_REPO" GPU_UTIL=${GPU_UTIL:-$([ "$MK" = fnext ] && echo 0.80 || echo 0.70)} MAX_SEQ_LEN=$CTX MAX_BATCH=1 ATLAS_KV_EXTERNAL_RESERVE_GB=0
+  atlas_up $PORT "$NVFP4_REPO" GPU_UTIL=${GPU_UTIL:-$(case $MK in fnext) echo 0.80 ;; ripple) echo 0.90 ;; *) echo 0.70 ;; esac)} MAX_SEQ_LEN=$CTX MAX_BATCH=1 ATLAS_KV_EXTERNAL_RESERVE_GB=0
   log "atlas mode ${ATLAS_MODE:-recipe}" ;;
 gufo) gufo_build || exit 1; gufo_up $PORT 1 "$CTX" "$TGT" ;;
 llamacpp)
