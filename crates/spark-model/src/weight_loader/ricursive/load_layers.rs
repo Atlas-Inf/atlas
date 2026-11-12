@@ -12,7 +12,7 @@ use crate::layers::qwen3_attention::value_residual::{ValueResidual, value_residu
 use crate::layers::{DenseFfnLayer, FfnActivation, FfnComponent, Qwen3AttentionLayer};
 use crate::weight_map::{
     AttentionWeights, DenseWeight, QuantizeCtx, QuantizedWeight, dense, detect_nvfp4_variant,
-    load_kv_scales, quantized_any,
+    load_kv_scales, quantize_to_nvfp4, quantized_any,
 };
 
 pub(super) fn load_layers(
@@ -43,11 +43,24 @@ pub(super) fn load_layers(
         gpu.kernel("bf16_gemv_m32", "bf16_gemv_m32")?
     };
     let verify_attn_k = gpu.kernel("ricursive_verify_attn", "ricursive_verify_attn")?;
+    let o_nvfp4 = o_proj_nvfp4();
+    if o_nvfp4 {
+        tracing::info!("{O_NVFP4}=1: attention o_proj requantized BF16 -> NVFP4 at load");
+    }
     let mut layers: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
         let lp = format!("model.layers.{i}");
         let ffn = load_ffn(store, config, gpu, &lp, variant, qctx)?;
-        let mut layer = load_attention(store, config, gpu, &lp, ffn, layer_kv_dtypes[i], i)?;
+        let mut layer = load_attention(
+            store,
+            config,
+            gpu,
+            &lp,
+            ffn,
+            layer_kv_dtypes[i],
+            i,
+            o_nvfp4.then_some(qctx),
+        )?;
         let lambda = load_bf16_scalar(store, gpu, &format!("{lp}.self_attn.value_res_lambda"))?;
         layer.set_value_residual(ValueResidual {
             x0: DevicePtr::NULL,
@@ -114,6 +127,7 @@ fn load_ffn(
     Ok(FfnComponent::Dense(layer))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_attention(
     store: &WeightStore,
     config: &ModelConfig,
@@ -122,6 +136,7 @@ fn load_attention(
     ffn: FfnComponent,
     kv_dtype: KvCacheDtype,
     i: usize,
+    o_nvfp4: Option<QuantizeCtx>,
 ) -> Result<Qwen3AttentionLayer> {
     let p = format!("{lp}.self_attn");
     let (h, hd) = (config.hidden_size, config.head_dim);
@@ -133,11 +148,28 @@ fn load_attention(
     store.reclaim(gpu, &format!("{p}.q_proj.weight"))?;
     store.reclaim(gpu, &format!("{p}.g_proj.weight"))?;
     let (k_scale, v_scale) = load_kv_scales(store, &p, gpu);
+    let o_key = format!("{p}.o_proj.weight");
+    let o_dense = bf16_dense(store, &o_key, h, nq * hd)?;
+    // The opt-in requant: o_proj is ~31% of the BF16 attention bytes every
+    // decode step streams. Q/K/V stay BF16 (value residuals project V from
+    // blended rows, which only the dense arms do).
+    let o_quant = match o_nvfp4 {
+        Some(q) => Some(quantize_to_nvfp4(
+            &o_dense,
+            h,
+            nq * hd,
+            gpu,
+            q.absmax_k,
+            q.quantize_k,
+            q.stream,
+        )?),
+        None => None,
+    };
     let attn = AttentionWeights {
         q_proj: DenseWeight { weight: qg },
         k_proj: bf16_dense(store, &format!("{p}.k_proj.weight"), kv_width, h)?,
         v_proj: bf16_dense(store, &format!("{p}.v_proj.weight"), kv_width, h)?,
-        o_proj: QuantizedWeight::null(),
+        o_proj: o_quant.unwrap_or_else(QuantizedWeight::null),
         q_norm: dense(store, &format!("{p}.q_norm.weight"))?,
         k_norm: dense(store, &format!("{p}.k_norm.weight"))?,
         q_norm_full: None,
@@ -159,12 +191,15 @@ fn load_attention(
         config.fp8_kv_calibration_tokens,
         config,
     )?;
-    layer.set_o_dense_bf16(bf16_dense(
-        store,
-        &format!("{p}.o_proj.weight"),
-        h,
-        nq * hd,
-    )?);
+    match o_quant {
+        Some(o) => {
+            // Transposed twin for the prefill / verify GEMM (`w4a16_gemm_t`).
+            let ot = o.transpose_for_gemm(gpu, h, nq * hd)?;
+            layer.set_prefill_weights(None, None, None, Some(ot));
+            store.reclaim(gpu, &o_key)?;
+        }
+        None => layer.set_o_dense_bf16(o_dense),
+    }
     layer.set_post_sublayer_norms(
         dense(store, &format!("{lp}.post_attention_layernorm.weight"))?,
         dense(store, &format!("{lp}.post_feedforward_layernorm.weight"))?,
@@ -182,6 +217,14 @@ fn load_attention(
         layer.set_rope_disabled(true);
     }
     Ok(layer)
+}
+
+const O_NVFP4: &str = "ATLAS_RIPPLE_O_NVFP4";
+
+/// Opt-in (`ATLAS_RIPPLE_O_NVFP4=1`): requantize each layer's BF16 o_proj to
+/// NVFP4 at load. Changes numerics, so it stays off until ST-995 clears it.
+fn o_proj_nvfp4() -> bool {
+    std::env::var(O_NVFP4).as_deref() == Ok("1")
 }
 
 fn bf16_matrix(store: &WeightStore, key: &str, rows: usize, cols: usize) -> Result<DevicePtr> {
