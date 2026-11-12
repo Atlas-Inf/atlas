@@ -414,6 +414,7 @@ pub(crate) fn load_model(
         s.behavior.verbatim_prompt = resolved;
         s
     };
+    serve_phases::warn_if_native_precision_unset(&config);
     let sampling_presets = ptx_set.sampling;
     // Record the RESOLVED target identity for the dashboard's kernel table.
     // It used to re-run resolution from (model_type, hidden_size), but that

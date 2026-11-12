@@ -6,6 +6,7 @@
 
 mod build;
 mod config;
+mod fp4_local_precision;
 mod kernel_gate;
 mod kv_cache;
 mod preflight;
@@ -22,6 +23,7 @@ pub(super) use config::{
     apply_model_default_dflash_gamma, apply_model_default_num_drafts, cap_vocab_size_to_tokenizer,
     load_model_config, merge_sidecar_quant_config, resolve_model_dir,
 };
+pub(super) use fp4_local_precision::warn_if_native_precision_unset;
 pub(super) use kernel_gate::audit_and_gate;
 pub(super) use kv_cache::{
     KvCacheConfig, PrefillBudget, resolve_kv_cache_config, resolve_prefill_budget,
