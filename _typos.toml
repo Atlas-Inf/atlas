@@ -22,6 +22,9 @@ extend-ignore-identifiers-re = [
     # `BA_GEMM` — A+B linear-attention GEMM in the design docs. Not a
     # typo of `BY`/`BE`.
     "BA_GEMM",
+    # `interm_dtype` — exllamav3's intermediate-dtype config field, named in
+    # `exl3_coopmk_build.rs`. Not a typo of `interim`.
+    "interm_dtype",
 ]
 
 [default.extend-words]
@@ -208,6 +211,9 @@ extend-exclude = [
     # (`dout` = gradient-w.r.t.-output, standard kernel naming). Third-party
     # derived material, like `vendor/`.
     "3rdparty_patches/",
+    # ExLlamaV3 CoopMK MoE kernels vendored by #160 (`WNT`, `TWORDS`: upstream
+    # tile-count identifiers). Third-party source, like `vendor/`.
+    "exl3_vendor/",
     # Vendored llama.cpp/ggml CUDA MMQ sources (MIT). Upstream identifiers
     # (`n_leafs`, `GGML_OP_CPY`, `ggml_arange`, ...) read as typos but are
     # canonical; we don't ship typo fixes upstream from here, like `vendor/`.
