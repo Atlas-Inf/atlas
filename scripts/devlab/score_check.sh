@@ -138,6 +138,19 @@ if s8 == 200:
     P8 = r8["probs"]; dup = max(abs(x - y) for i in range(64) for x, y in zip(P8[i], P8[(i // 8) * 8]))
     d8 = max(abs(x - y) for i in range(64) for x, y in zip(P8[i], P[i // 8]))
     print(f"T8 64 branches: copies max|dp| {dup:.3e} (want 0), vs T1 {d8:.3e}, batched {r8.get('batched')}, engine {r8['engine_us'] / 1e3:.0f} ms")
+    # Where do copies diverge? Per copy slot j (0..7): max |P8[g*8+j] - P8[g*8]| over the 8 groups; per group g likewise.
+    byj = [max(abs(P8[g * 8 + j][0] - P8[g * 8][0]) for g in range(8)) for j in range(8)]
+    byg = [max(abs(P8[g * 8 + j][0] - P8[g * 8][0]) for j in range(8)) for g in range(8)]
+    print("T8 copy-slot dev " + " ".join(f"{x:.1e}" for x in byj) + " | group dev " + " ".join(f"{x:.1e}" for x in byg))
+    print("T8 P(Yes) row-major " + " ".join(f"{P8[i][0]:.4f}" for i in range(16)) + " ...")
+    s8b, r8b = post("/v1/score", {"prefix": prefix, "branches": b64, "options": opts})
+    if s8b == 200:
+        print(f"T8b repeat of the 64-branch request max|dp| {max(abs(x - y) for pa, pb in zip(r8b['probs'], P8) for x, y in zip(pa, pb)):.3e} (determinism)")
+    # T11 the 8 branches in reverse order: same branch, other slot.
+    s11, r11 = post("/v1/score", {"prefix": prefix, "branches": branches[::-1], "options": opts})
+    if s11 == 200:
+        d11 = [abs(r11["probs"][7 - i][0] - P[i][0]) for i in range(8)]
+        print("T11 reversed order |dP(Yes)| per branch " + " ".join(f"{x:.1e}" for x in d11))
 else:
     print(f"T8 64 branches status {s8} {r8}")
 # T9 4 concurrent requests (2 branches each) merged by the scheduler vs the same requests one at a time.
