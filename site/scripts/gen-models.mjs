@@ -116,7 +116,8 @@ const VENDOR_META = {
   Nemotron: { order: 3, icon: 'nemotron' },
   Mistral: { order: 4, icon: 'mistral' },
   MiniMax: { order: 5, icon: 'minimax' },
-  DeepSeek: { order: 6, icon: 'deepseek' }
+  DeepSeek: { order: 6, icon: 'deepseek' },
+  Ricursive: { order: 7, icon: 'ricursive' }
 };
 
 const FAMILY_DISPLAY = {
@@ -134,7 +135,8 @@ const FAMILY_DISPLAY = {
   'nemotron-3.5-super-vl': 'Nemotron-3.5 Super VL',
   'mistral-small-4': 'Mistral-Small-4',
   'minimax-m2.7': 'MiniMax-M2.7',
-  'deepseek-v4': 'DeepSeek-V4'
+  'deepseek-v4': 'DeepSeek-V4',
+  'ricursive': 'Ripple'
 };
 
 const VENDOR_OF_FAMILY = {
@@ -152,7 +154,8 @@ const VENDOR_OF_FAMILY = {
   'nemotron-3.5-super-vl': 'Nemotron',
   'mistral-small-4': 'Mistral',
   'minimax-m2.7': 'MiniMax',
-  'deepseek-v4': 'DeepSeek'
+  'deepseek-v4': 'DeepSeek',
+  'ricursive': 'Ricursive'
 };
 
 function vendorOf(fam) {
