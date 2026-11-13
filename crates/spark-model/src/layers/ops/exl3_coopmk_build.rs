@@ -242,9 +242,9 @@ impl Exl3CoopMk {
         )
     }
 
-    /// One token: `x_bf16` [H] MoE input, `indices`/`weights` the router's
-    /// top-k (u32 / f32 on device), `shared_gate_w` bf16 [H] (or NULL: weight
-    /// 1). Writes bf16 [H] to `out_bf16`. Launch-only, no host sync.
+    /// One token: `x_bf16` `[H]` MoE input, `indices`/`weights` the router's
+    /// top-k (u32 / f32 on device), `shared_gate_w` bf16 `[H]` (or NULL: weight
+    /// 1). Writes bf16 `[H]` to `out_bf16`. Launch-only, no host sync.
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
