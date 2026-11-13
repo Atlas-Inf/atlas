@@ -98,6 +98,11 @@ pub struct DflashTwins {
     /// `ATLAS_DFLASH_NVFP4_TC=1`: layer projections take the NVFP4 twins on
     /// the tensor-core tiers at any row count (main: only up to 4 rows).
     pub nvfp4_tc: bool,
+    /// `ATLAS_DFLASH_NVFP4_T=1` (gfx1151): the layer projections' NVFP4 twins
+    /// transposed in place to the `[K/2, N]` layout and run on the main model's
+    /// WMMA `w4a16_gemm_t_m128_f16a` (its 32-row twin at M <= 32) instead of
+    /// `w4a16_gemv_batch16`. The kernel handle, or `None`.
+    pub nvfp4_t: Option<spark_runtime::gpu::KernelHandle>,
     /// NVFP4 twin of the shared BF16 lm_head (`ATLAS_DFLASH_NVFP4_HEAD=1`),
     /// half the MXFP8 bytes, on the tensor-core tiers in 32-row pieces.
     /// Unlike a target NVFP4 head it is the drafter's own copy.
@@ -156,6 +161,9 @@ impl BlockDiffusionDraftHead {
                  (ATLAS_NO_DFLASH_DRAFTER_NVFP4, drafter FP8, or missing quantizer)"
             );
         }
+        if env_on("ATLAS_DFLASH_NVFP4_T") {
+            self.install_nvfp4_t(gpu)?;
+        }
         self.install_head_twin(gpu)?;
         if env_on("ATLAS_DFLASH_CTX_NVFP4") {
             self.install_ctx_twins(gpu)?;
@@ -166,8 +174,9 @@ impl BlockDiffusionDraftHead {
         self.twins.ctx_async_positions = env_on("ATLAS_DFLASH_CTX_ASYNC_POS");
         self.twins.async_uploads = env_on("ATLAS_DFLASH_ASYNC_UPLOADS");
         tracing::info!(
-            "DFlash twins: NVFP4 tensor-core layers {}, MXFP8 layers {}, head NVFP4 {} / MXFP8 {}, context NVFP4 {}, conv {:?} x {}, async context positions {}, async uploads {}",
+            "DFlash twins: NVFP4 tensor-core layers {}, NVFP4 transposed WMMA layers {}, MXFP8 layers {}, head NVFP4 {} / MXFP8 {}, context NVFP4 {}, conv {:?} x {}, async context positions {}, async uploads {}",
             self.twins.nvfp4_tc,
+            self.twins.nvfp4_t.is_some(),
             self.layers.iter().filter(|l| l.mx.is_some()).count(),
             self.twins.lm_head_q4.is_some(),
             self.twins.lm_head_mx.is_some(),
@@ -182,6 +191,76 @@ impl BlockDiffusionDraftHead {
             self.twins.async_uploads,
         );
         Ok(())
+    }
+
+    /// `ATLAS_DFLASH_NVFP4_T=1`: transpose each layer's seven NVFP4 twins to
+    /// the `[K/2, N]` / `[K/16, N]` layout the main model's WMMA GEMM reads,
+    /// freeing the native copies (no extra resident bytes). The native layout
+    /// is what caps `w4a16_gemv_batch16` near 50 GB/s on gfx1151 (KLOOP #70:
+    /// dot2-issue-bound); `m128_f16a` / its m32 twin on the transposed copy run
+    /// the Ripple drafter shapes 15-38% faster at M = 16 (DevLab kbench
+    /// 43394490022: gate/up 1597 vs 1884 us, down 786 vs 1263, q 804 vs 993).
+    /// The F16 dequant is exact where batch16 sums in a different order, so
+    /// draft tokens can move; the verifier still decides every output token.
+    /// HIP only, and not with the tensor-core tiers (their callers index the
+    /// native layout).
+    fn install_nvfp4_t(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
+        let kernel = ops::w4a16_m128_kernel(gpu);
+        if !cfg!(atlas_hip)
+            || kernel.0 == 0
+            || self.twins.nvfp4_tc
+            || !matches!(self.quant, super::DflashQuantization::Nvfp4Weights)
+        {
+            tracing::warn!(
+                "ATLAS_DFLASH_NVFP4_T=1 needs the gfx1151 w4a16_gemm_t_m128_f16a kernel, the drafter \
+                 NVFP4 twins, and ATLAS_DFLASH_NVFP4_TC off: the drafter keeps the native GEMV"
+            );
+            return Ok(());
+        }
+        let h = self.hidden_size;
+        let q_dim = self.num_q_heads * self.head_dim;
+        let kv_dim = self.num_kv_heads * self.head_dim;
+        let inter = self.intermediate_size;
+        for layer in &mut self.layers {
+            for (twin, n, k) in [
+                (&mut layer.q_proj_nvfp4, q_dim, h),
+                (&mut layer.k_proj_nvfp4, kv_dim, h),
+                (&mut layer.v_proj_nvfp4, kv_dim, h),
+                (&mut layer.o_proj_nvfp4, h, q_dim),
+                (&mut layer.gate_proj_nvfp4, inter, h),
+                (&mut layer.up_proj_nvfp4, inter, h),
+                (&mut layer.down_proj_nvfp4, h, inter),
+            ] {
+                let Some(native) = twin.as_ref() else {
+                    anyhow::bail!("ATLAS_DFLASH_NVFP4_T: a drafter NVFP4 twin is missing");
+                };
+                let t = native.transpose_for_gemm(gpu, n, k)?;
+                gpu.synchronize(0)?;
+                gpu.free(native.weight)?;
+                gpu.free(native.weight_scale)?;
+                *twin = Some(t);
+            }
+        }
+        self.twins.nvfp4_t = Some(kernel);
+        Ok(())
+    }
+
+    /// `out[m, n] = input[m, k] · Wᵀ` from a transposed NVFP4 twin
+    /// (`ATLAS_DFLASH_NVFP4_T`), any row count.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn nvfp4_t_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        kernel: spark_runtime::gpu::KernelHandle,
+        w: &QuantizedWeight,
+        input: DevicePtr,
+        out: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: u64,
+    ) -> Result<()> {
+        ops::w4a16_gemm_n128_m128(gpu, kernel, input, w, out, m, n, k, stream)
     }
 
     /// A twin of every conv's `kernel_projection` (`ATLAS_DFLASH_CONV_TWIN`).

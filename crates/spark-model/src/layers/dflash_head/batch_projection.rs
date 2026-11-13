@@ -30,6 +30,13 @@ impl BlockDiffusionDraftHead {
         {
             return Ok(());
         }
+        if let Some(kernel) = self.twins.nvfp4_t
+            && let Some(weight) = weight_nvfp4
+        {
+            return self.nvfp4_t_rows(
+                ctx.gpu, kernel, weight, src, dst, total_rows, n_out, k_in, stream,
+            );
+        }
         // Mirror the serial per-sequence choice (`drafter_gemm` at m = gamma):
         // NVFP4 only when gamma <= 8, else the FP8/BF16 dense arm. Keying on
         // total_rows sent gamma=8 DFlash2 through NVFP4 weights while its
