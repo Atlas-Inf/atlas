@@ -77,18 +77,9 @@ impl TransformerModel {
 
         // ── Phase 1: Pre-graph (varies per step, NOT captured) ──
 
-        // 1a. Embed K tokens
-        for t in 0..k {
-            self.embed(tokens[t], hidden.offset(t * h * fp32), stream)?;
-        }
-
-        // 1b. Allocate KV blocks for all K positions
+        // 1a/1b. Embed K tokens, allocate KV blocks for all K positions.
         let bs = kv_cache.block_size();
-        for t in 0..k {
-            let pos = seq.seq_len + t;
-            let blocks_needed = (pos / bs) + 1;
-            self.reserve_decode_blocks(seq, blocks_needed - 1, &mut kv_cache, stream)?;
-        }
+        self.kgamma_embed_reserve(tokens, seq, hidden, h * fp32, &mut kv_cache, stream)?;
 
         // 1c. Upload K-entry attention metadata (see `kgamma_upload_meta`).
         let metadata = match tree {
@@ -502,32 +493,6 @@ impl TransformerModel {
         }
 
         // ── Phase 3: Post-graph (D2H copy only) ──
-
-        let out_ptr = self.buffers.scratch();
-        let mut buf = vec![0u8; k * 4];
-        self.gpu.copy_d2h(out_ptr, &mut buf)?;
-        let mut out = Vec::with_capacity(k);
-        for t in 0..k {
-            let off = t * 4;
-            out.push(u32::from_le_bytes([
-                buf[off],
-                buf[off + 1],
-                buf[off + 2],
-                buf[off + 3],
-            ]));
-        }
-
-        // The diagnostic compares against an unmasked head; masked rows differ.
-        if allow.is_none() {
-            self.check_glm_k5_bf16_head(k, &out, stream)?;
-        }
-
-        // See decode_verify_graphed for rationale on `seq_len += k` fix.
-        for &t in tokens {
-            seq.tokens.push(t);
-        }
-        seq.seq_len += k;
-
-        Ok(out)
+        self.kgamma_finish(tokens, seq, allow, stream)
     }
 }

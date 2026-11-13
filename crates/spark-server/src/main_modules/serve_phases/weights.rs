@@ -454,55 +454,8 @@ fn skip_mtp(config: &ModelConfig, args: &cli::ServeArgs) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{quant_multiplier, skip_mtp};
-    use atlas_core::config::ModelConfig;
-    use clap::Parser as _;
-
-    /// qwen4_exp's `mtp.*` (5.21 GB) is uploaded only where it drafts: rank 0
-    /// under `--speculative`.
-    #[test]
-    fn qwen4_exp_mtp_is_uploaded_on_the_drafting_rank_only() {
-        let args = |more: &[&str]| {
-            let argv = ["spark", "some/model"].iter().chain(more);
-            crate::cli::ServeArgs::parse_from(argv)
-        };
-        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
-        config.model_type = "qwen4_exp".to_string();
-        assert!(skip_mtp(&config, &args(&[])));
-        assert!(!skip_mtp(&config, &args(&["--speculative"])));
-        config.ep_rank = 1;
-        assert!(skip_mtp(&config, &args(&["--speculative"])));
-    }
-
-    /// The dense hybrid uploads `mtp.*` unless DFlash replaces the MTP head.
-    #[test]
-    fn qwen3_5_skips_mtp_under_dflash_only() {
-        let args = |more: &[&str]| {
-            let argv = ["spark", "some/model"].iter().chain(more);
-            crate::cli::ServeArgs::parse_from(argv)
-        };
-        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
-        config.model_type = "qwen3_5".to_string();
-        assert!(!skip_mtp(&config, &args(&[])));
-        assert!(!skip_mtp(&config, &args(&["--speculative"])));
-        assert!(skip_mtp(&config, &args(&["--dflash"])));
-    }
-
-    #[test]
-    fn qwen4_exp_uses_measured_load_peak() {
-        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
-        config.model_type = "qwen4_exp".to_string();
-        assert_eq!(quant_multiplier(&config), Some(1.2));
-    }
-
-    #[test]
-    fn non_fp8_qwen35_keeps_generic_multiplier() {
-        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
-        config.model_type = "qwen3_5".to_string();
-        assert_eq!(quant_multiplier(&config), None);
-    }
-}
+#[path = "weights_tests.rs"]
+mod tests;
 
 // GLM's predictor is a physical appended layer, not the generic `mtp.*` tree.
 // Without speculative decoding the factory never consumes any of its tensors.
@@ -516,26 +469,5 @@ fn unused_glm_mtp_prefix(config: &ModelConfig, speculative: bool) -> Option<Stri
 }
 
 #[cfg(test)]
-mod unused_glm_mtp_tests {
-    use super::*;
-
-    #[test]
-    fn unused_glm_mtp_policy_uses_actual_prefix_and_target_layer_count() {
-        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
-        assert!(unused_glm_mtp_prefix(&config, false).is_none());
-        config.model_type = "glm5_next".into();
-        config.weight_prefix = "model.language_model".into();
-        config.num_hidden_layers = 45;
-        assert_eq!(
-            unused_glm_mtp_prefix(&config, false).as_deref(),
-            Some("model.language_model.layers.45.")
-        );
-        assert!(unused_glm_mtp_prefix(&config, true).is_none());
-        config.weight_prefix = "fixture".into();
-        config.num_hidden_layers = 3;
-        assert_eq!(
-            unused_glm_mtp_prefix(&config, false).as_deref(),
-            Some("fixture.layers.3.")
-        );
-    }
-}
+#[path = "weights_glm_mtp_tests.rs"]
+mod unused_glm_mtp_tests;

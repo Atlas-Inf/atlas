@@ -123,6 +123,69 @@ impl TransformerModel {
     }
 }
 
+impl TransformerModel {
+    /// Phase 1a/1b of the K=γ verify: embed the K tokens into `hidden` (row
+    /// stride `row_bytes`) and reserve the KV blocks for all K positions.
+    pub(super) fn kgamma_embed_reserve(
+        &self,
+        tokens: &[u32],
+        seq: &mut SequenceState,
+        hidden: spark_runtime::gpu::DevicePtr,
+        row_bytes: usize,
+        kv_cache: &mut PagedKvCache,
+        stream: u64,
+    ) -> Result<()> {
+        let k = tokens.len();
+        for t in 0..k {
+            self.embed(tokens[t], hidden.offset(t * row_bytes), stream)?;
+        }
+        let bs = kv_cache.block_size();
+        for t in 0..k {
+            let pos = seq.seq_len + t;
+            let blocks_needed = (pos / bs) + 1;
+            self.reserve_decode_blocks(seq, blocks_needed - 1, kv_cache, stream)?;
+        }
+        Ok(())
+    }
+
+    /// Phase 3 of the K=γ verify: read the K argmax ids back and advance `seq`.
+    pub(super) fn kgamma_finish(
+        &self,
+        tokens: &[u32],
+        seq: &mut SequenceState,
+        allow: Option<spark_runtime::gpu::DevicePtr>,
+        stream: u64,
+    ) -> Result<Vec<u32>> {
+        let k = tokens.len();
+        let out_ptr = self.buffers.scratch();
+        let mut buf = vec![0u8; k * 4];
+        self.gpu.copy_d2h(out_ptr, &mut buf)?;
+        let mut out = Vec::with_capacity(k);
+        for t in 0..k {
+            let off = t * 4;
+            out.push(u32::from_le_bytes([
+                buf[off],
+                buf[off + 1],
+                buf[off + 2],
+                buf[off + 3],
+            ]));
+        }
+
+        // The diagnostic compares against an unmasked head; masked rows differ.
+        if allow.is_none() {
+            self.check_glm_k5_bf16_head(k, &out, stream)?;
+        }
+
+        // See decode_verify_graphed for rationale on `seq_len += k` fix.
+        for &t in tokens {
+            seq.tokens.push(t);
+        }
+        seq.seq_len += k;
+
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::admitted;

@@ -481,91 +481,11 @@ impl Qwen3SsmLayer {
             ctx.gpu, &b, nk, nv, kd, vd, d_conv, 1e-6, eps, stream,
         )
     }
-
-    /// Whether a verify of `num_tokens` rows on this layer takes the deferred
-    /// fused rows (`ATLAS_QWEN38_VERIFY_DEFER`): the lever, the exact verify
-    /// on the fused rows' four-kernel FP32 arm, both kernels and the geometry,
-    /// and a window the staging holds. The dispatch entry marks the step
-    /// pending from this (`mark_gdn_deferred_commit`, through
-    /// `gdn_exact_defer`), outside any capture.
-    pub(super) fn q38_defer_arm(
-        &self,
-        gpu: &dyn spark_runtime::gpu::GpuBackend,
-        levers: &crate::layers::ops::ModelLevers,
-        config: &atlas_core::config::ModelConfig,
-        num_tokens: usize,
-    ) -> bool {
-        if !ops::qwen38_decode_fuse::defer_on() {
-            return false;
-        }
-        let (kv, kc) = ops::qwen38_decode_fuse::defer_kernels(gpu);
-        kv.0 != 0
-            && kc.0 != 0
-            && super::verify_exact_for(levers)
-            && self.conv1d_l2norm_f32_k.0 != 0
-            && self.gdn_f32_k.0 != 0
-            && self.gated_rms_norm_f32_k.0 != 0
-            && !crate::layers::qwen3_ssm::gdn_fused_norm_enabled()
-            && (1..=ops::qwen38_decode_fuse::DEFER_ROWS_MAX).contains(&num_tokens)
-            && config.linear_key_head_dim == 128
-            && config.linear_value_head_dim == 128
-            && config.linear_conv_kernel_dim == 4
-            && config.linear_num_key_heads != 0
-            && config.linear_num_value_heads == 3 * config.linear_num_key_heads
-    }
 }
+
+#[path = "trait_decode_batched_conv_gdn_exact_defer.rs"]
+mod defer;
 
 #[cfg(test)]
-mod tests {
-    use super::exact_row;
-
-    // Real 27B GDN shapes: nk=16, nv=48, kd=vd=128, d_conv=4.
-    const QKVZ: usize = 16384; // conv_dim + value_dim
-    const CONV_DIM: usize = 10240; // 2*2048 + 6144
-    const VALUE_DIM: usize = 6144; // 48*128
-    const NV: usize = 48;
-
-    /// POSITIVE: token offsets stride by the ROW sizes of each buffer — qkvz
-    /// rows in `deinterleaved`/`ssm_conv_out_f32`, value_dim rows in the
-    /// normed output, 2*nv FP32 in gates — on the real 27B shapes.
-    #[test]
-    fn exact_row_strides_match_27b_shapes() {
-        let r2 = exact_row(2, 4, QKVZ, CONV_DIM, VALUE_DIM, NV);
-        assert_eq!(r2.qkv_in, 2 * QKVZ * 2, "deinterleaved rows are qkvz BF16");
-        assert_eq!(r2.conv_out_f32, 2 * QKVZ * 4, "f32 conv rows are qkvz FP32");
-        assert_eq!(
-            r2.gdn_out_f32,
-            2 * QKVZ * 4 + CONV_DIM * 4,
-            "f32 gdn scratch is the conv row's Z-region tail"
-        );
-        assert_eq!(r2.z, 2 * QKVZ * 2 + CONV_DIM * 2, "Z sits after [Q|K|V]");
-        assert_eq!(r2.gate, 2 * NV * 2 * 4, "gates rows are [gate|beta] FP32");
-        assert_eq!(r2.beta, r2.gate + NV * 4);
-        assert_eq!(
-            r2.normed_out,
-            2 * VALUE_DIM * 2,
-            "normed rows are value_dim BF16"
-        );
-        // The FP32 GDN scratch must fit inside the row's tail: exactly
-        // value_dim FP32 elements between conv_dim and qkvz_size.
-        assert_eq!(QKVZ - CONV_DIM, VALUE_DIM);
-    }
-
-    /// POSITIVE + NEGATIVE: rollback intermediates are written for tokens
-    /// 0..K-2 and NOT for K-1 (no reader exists for that index — writing it
-    /// is the dead d2d the K=4 arm removed; skipping earlier ones would break
-    /// rollback).
-    #[test]
-    fn exact_row_snapshot_skips_only_last_token() {
-        for k in 2..=8usize {
-            for t in 0..k {
-                let row = exact_row(t, k, QKVZ, CONV_DIM, VALUE_DIM, NV);
-                assert_eq!(
-                    row.snapshot,
-                    t + 1 < k,
-                    "snapshot policy wrong at t={t}, k={k}"
-                );
-            }
-        }
-    }
-}
+#[path = "trait_decode_batched_conv_gdn_exact_tests.rs"]
+mod tests;
