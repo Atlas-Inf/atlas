@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, ensure};
 use atlas_core::config::{LayerType, ModelConfig};
-use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kv_cache::KvCacheDtype;
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
@@ -43,11 +43,13 @@ pub(super) fn load_layers(
         gpu.kernel("bf16_gemv_m32", "bf16_gemv_m32")?
     };
     let verify_attn_k = gpu.kernel("ricursive_verify_attn", "ricursive_verify_attn")?;
+    let fp8_sim = fp8_sim_kernel(gpu)?;
     let mut layers: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
         let lp = format!("model.layers.{i}");
         let ffn = load_ffn(store, config, gpu, &lp, variant, qctx)?;
-        let mut layer = load_attention(store, config, gpu, &lp, ffn, layer_kv_dtypes[i], i)?;
+        let mut layer =
+            load_attention(store, config, gpu, &lp, ffn, layer_kv_dtypes[i], i, fp8_sim)?;
         let lambda = load_bf16_scalar(store, gpu, &format!("{lp}.self_attn.value_res_lambda"))?;
         layer.set_value_residual(ValueResidual {
             x0: DevicePtr::NULL,
@@ -114,6 +116,7 @@ fn load_ffn(
     Ok(FfnComponent::Dense(layer))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_attention(
     store: &WeightStore,
     config: &ModelConfig,
@@ -122,6 +125,7 @@ fn load_attention(
     ffn: FfnComponent,
     kv_dtype: KvCacheDtype,
     i: usize,
+    fp8_sim: Option<KernelHandle>,
 ) -> Result<Qwen3AttentionLayer> {
     let p = format!("{lp}.self_attn");
     let (h, hd) = (config.hidden_size, config.head_dim);
@@ -133,10 +137,19 @@ fn load_attention(
     store.reclaim(gpu, &format!("{p}.q_proj.weight"))?;
     store.reclaim(gpu, &format!("{p}.g_proj.weight"))?;
     let (k_scale, v_scale) = load_kv_scales(store, &p, gpu);
+    let k_proj = bf16_dense(store, &format!("{p}.k_proj.weight"), kv_width, h)?;
+    let v_proj = bf16_dense(store, &format!("{p}.v_proj.weight"), kv_width, h)?;
+    let o_dense = bf16_dense(store, &format!("{p}.o_proj.weight"), h, nq * hd)?;
+    if let Some(kern) = fp8_sim {
+        fp8_roundtrip(gpu, kern, qg, 2 * nq * hd, h)?;
+        fp8_roundtrip(gpu, kern, k_proj.weight, kv_width, h)?;
+        fp8_roundtrip(gpu, kern, v_proj.weight, kv_width, h)?;
+        fp8_roundtrip(gpu, kern, o_dense.weight, h, nq * hd)?;
+    }
     let attn = AttentionWeights {
         q_proj: DenseWeight { weight: qg },
-        k_proj: bf16_dense(store, &format!("{p}.k_proj.weight"), kv_width, h)?,
-        v_proj: bf16_dense(store, &format!("{p}.v_proj.weight"), kv_width, h)?,
+        k_proj,
+        v_proj,
         o_proj: QuantizedWeight::null(),
         q_norm: dense(store, &format!("{p}.q_norm.weight"))?,
         k_norm: dense(store, &format!("{p}.k_norm.weight"))?,
@@ -159,12 +172,7 @@ fn load_attention(
         config.fp8_kv_calibration_tokens,
         config,
     )?;
-    layer.set_o_dense_bf16(bf16_dense(
-        store,
-        &format!("{p}.o_proj.weight"),
-        h,
-        nq * hd,
-    )?);
+    layer.set_o_dense_bf16(o_dense);
     layer.set_post_sublayer_norms(
         dense(store, &format!("{lp}.post_attention_layernorm.weight"))?,
         dense(store, &format!("{lp}.post_feedforward_layernorm.weight"))?,
@@ -182,6 +190,47 @@ fn load_attention(
         layer.set_rope_disabled(true);
     }
     Ok(layer)
+}
+
+const FP8_SIM: &str = "ATLAS_RIPPLE_ATTN_FP8_SIM";
+
+/// Opt-in accuracy slice of FP8 attention (`ATLAS_RIPPLE_ATTN_FP8_SIM=1`):
+/// every BF16 attention projection (q|gate, k, v, o) is round-tripped through
+/// per-row E4M3 in place at load, so ST-995 can price FP8 attention before the
+/// FP8 kernels are wired in. Bytes and speed are unchanged; it changes numerics,
+/// so it stays off by default.
+fn fp8_sim_kernel(gpu: &dyn GpuBackend) -> Result<Option<KernelHandle>> {
+    if std::env::var(FP8_SIM).as_deref() != Ok("1") {
+        return Ok(None);
+    }
+    let k = gpu.kernel("attn_fp8_sim", "fp8_rowscale_roundtrip")?;
+    ensure!(
+        k.0 != 0,
+        "{FP8_SIM}=1 but this kernel target has no fp8_rowscale_roundtrip"
+    );
+    tracing::info!(
+        "{FP8_SIM}=1: attention q|gate/k/v/o round-tripped through per-row FP8 E4M3 at load"
+    );
+    Ok(Some(k))
+}
+
+fn fp8_roundtrip(
+    gpu: &dyn GpuBackend,
+    kern: KernelHandle,
+    w: DevicePtr,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    use spark_runtime::kernel_args::KernelLaunch;
+    let stream = gpu.default_stream();
+    KernelLaunch::new(gpu, kern)
+        .grid([n as u32, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(w)
+        .arg_u32(n as u32)
+        .arg_u32(k as u32)
+        .launch(stream)?;
+    gpu.synchronize(stream)
 }
 
 fn bf16_matrix(store: &WeightStore, key: &str, rows: usize, cols: usize) -> Result<DevicePtr> {
