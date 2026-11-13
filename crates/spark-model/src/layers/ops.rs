@@ -107,6 +107,8 @@ mod w4a16_rowgemv;
 mod yarn_mrope;
 pub use model_stats::ModelStats;
 
+#[path = "ops/exl3_coopmk.rs"]
+mod exl3_coopmk;
 #[path = "ops/exl3_ops.rs"]
 mod exl3_ops;
 #[path = "ops/gemm_fp8_prefill.rs"]
@@ -350,6 +352,7 @@ pub use dispatch_proj::*;
 pub use dispatch_proj_rowwise::*;
 pub use dp4a::*;
 pub use embeddings::*;
+pub use exl3_coopmk::*;
 pub use exl3_ops::*;
 pub use fp8_gemv_batch::*;
 pub use fp8_gemv_rows::*;

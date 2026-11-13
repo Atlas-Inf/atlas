@@ -14,6 +14,19 @@ The `.cuh` files in this directory are adapted from ExLlamaV3 by turboderp-org:
     ptx_frag.cuh        exllamav3_ext/ptx.cuh (fragment types, lines 1-16)
     half_uint16.cuh     exllamav3_ext/util.cuh (half_uint16 union, lines 83-91)
 
+The files under `coopmk/` are adapted from the vcruz305/exllamav3 fork of ExLlamaV3 (same MIT license and
+copyright; CoopMK commits 9aa5329 / 047ce72, coop kernels from turboderp 58d4d73):
+
+    https://github.com/vcruz305/exllamav3  (commit 047ce72)
+
+    coopmk/moe_coop.cuh          exllamav3_ext/quant/exl3_moe_coop.cuh (MoeCoopParams + defines only)
+    coopmk/gemv_regs.cuh         exllamav3_ext/quant/exl3_gemv_kernel.cuh lines 32-155 (exl3_gemv_ns helpers)
+    coopmk/moe_coop_kernel.cuh   exllamav3_ext/quant/exl3_moe_coop_kernel.cuh lines 32-629 (shared device code)
+    coopmk/moe_coopmk_kernel.cuh exllamav3_ext/quant/exl3_moe_coopmk_kernel.cuh (coopmk_a/b bodies)
+
+Each header lists its modifications (includes, __host__ __device__ on the constexpr helpers, the stage kernels
+as __device__ bodies wrapped by extern "C" entry points in ../exl3_coopmk.cu).
+
 Only device code is vendored; the torch/ATen host launchers are replaced by Atlas extern "C" entry points
 (../exl3.cu) and Rust launchers. Each file keeps the AGPL SPDX line Atlas requires plus this MIT notice.
 The rest of Atlas remains AGPL-3.0-only.

@@ -223,7 +223,12 @@ impl FfnComponent {
     /// false). Lets callers gate branch entry BEFORE computing the pre-FFN
     /// norm, so there is no half-done fallthrough to `forward_prefill`.
     pub fn can_forward_km(&self, m: u32) -> bool {
-        matches!(self, Self::Dense(d) if d.can_forward_km(m))
+        match self {
+            Self::Dense(d) => d.can_forward_km(m),
+            // Packed EXL3 MoE: rows run one at a time on the packed kernels.
+            Self::Moe(mo) => (2..=16).contains(&m) && mo.is_exl3_packed(),
+            Self::None => false,
+        }
     }
 
     /// Whether `m` rows take the dense FFN's row-exact arm
@@ -248,6 +253,9 @@ impl FfnComponent {
             Self::Dense(d) if d.can_forward_km(m) || d.rows_exact_serves(m, ctx) => {
                 d.forward_km(input, m, ctx, stream)?;
                 Ok(true)
+            }
+            Self::Moe(mo) if (2..=16).contains(&m) && mo.is_exl3_packed() => {
+                mo.exl3_forward_km(input, m as usize, ctx, stream)
             }
             _ => Ok(false),
         }

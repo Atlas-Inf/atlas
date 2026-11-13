@@ -14,6 +14,8 @@
 #
 #   exl3.cu       vendored exllamav3 reconstruct / Hadamard / hgemm entry
 #                 points
+#   exl3_coopmk.cu  CoopMK: vcruz305/exllamav3 runtime-K cooperative decode
+#                 MoE (coopmk_a/b) on the packed trellis, extern "C" wrappers
 #   exl3_vendor/  the vendored exllamav3 device headers (see its NOTICE.md)
 
 [build]

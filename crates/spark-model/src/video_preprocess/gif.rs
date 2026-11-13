@@ -62,39 +62,49 @@ pub(super) fn decode_gif(
         count
     );
 
-    let native_fps = if total_ms > 0.0 {
-        (count as f64 * 1000.0 / total_ms) as f32
+    // A clip whose delays sum to zero carries no timeline of its own: the
+    // duration the sampler sees is the one implied by the same fallback
+    // rate `native_fps` takes below — `count / DEFAULT_FPS` (issue #352).
+    // Passing 0.0 would hit `video_sample`'s `unwrap_or(cap)` floor, which
+    // reads a frame-count cap as seconds and collapses the plan.
+    let (native_fps, duration_secs) = if total_ms > 0.0 {
+        (
+            (count as f64 * 1000.0 / total_ms) as f32,
+            (total_ms / 1000.0) as f32,
+        )
     } else {
-        DEFAULT_FPS
+        (DEFAULT_FPS, count as f32 / DEFAULT_FPS)
     };
     let fps = if target_fps.is_finite() && target_fps > 0.0 {
         target_fps
     } else {
         DEFAULT_FPS
     };
-    let want = crate::video_sample::wanted_frames(
-        (total_ms / 1000.0) as f32,
-        native_fps,
-        fps,
-        policy.max_frames,
-        fps,
-    );
-    let plan = crate::video_sample::sample_plan(want, (total_ms / 1000.0) as f32)?;
+    let want =
+        crate::video_sample::wanted_frames(duration_secs, native_fps, fps, policy.max_frames, fps);
+    let plan = crate::video_sample::sample_plan(want, duration_secs)?;
 
     // The plan's times are source seconds; a GIF has one frame per delay, so
     // the frame for time `t` is the one whose cumulative delay covers `t`.
     let mut cumulative = Vec::with_capacity(count);
     {
         let mut acc = 0f64;
-        for frame in GifDecoder::new(std::io::Cursor::new(bytes.to_vec()))
+        for (i, frame) in GifDecoder::new(std::io::Cursor::new(bytes.to_vec()))
             .context("not a decodable GIF")?
             .into_frames()
+            .enumerate()
         {
             let frame = frame.context("failed to decode animation frames")?;
-            cumulative.push(acc);
-            let (num, den) = frame.delay().numer_denom_ms();
-            if den != 0 {
-                acc += num as f64 / den as f64;
+            if total_ms > 0.0 {
+                cumulative.push(acc);
+                let (num, den) = frame.delay().numer_denom_ms();
+                if den != 0 {
+                    acc += num as f64 / den as f64;
+                }
+            } else {
+                // Same implied rate as `duration_secs` above: frame i sits at
+                // i/native_fps on the fallback timeline.
+                cumulative.push(i as f64 * 1000.0 / f64::from(native_fps));
             }
         }
     }

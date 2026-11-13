@@ -21,6 +21,9 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.try_forward_exl3(input, num_tokens, ctx, stream)? {
+            return Ok(());
+        }
         self.forward_prefill_impl(input, num_tokens, ctx, stream, false)
     }
 

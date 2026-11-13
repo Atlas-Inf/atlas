@@ -20,8 +20,8 @@ const HAD_SCALE: f32 = 0.088_388_346;
 
 /// The `exl3` module's kernels, resolved once per backend.
 pub struct Exl3Kernels {
-    /// The integer bit rates, mul1 codebook: index = `bits - 3` (k3..k6).
-    pub reconstruct: [KernelHandle; 4],
+    /// Integer bit rates, mul1 codebook: index = `bits - 2` (k2..=k8).
+    pub reconstruct: [KernelHandle; 7],
     pub had_pre: KernelHandle,
     pub had_post: KernelHandle,
     /// The scale-free pass; the linear uses only pre/post, which fold the
@@ -38,10 +38,13 @@ impl Exl3Kernels {
         let k = |name: &str| gpu.kernel("exl3", name);
         Ok(Self {
             reconstruct: [
+                k("exl3_reconstruct_mul1_k2")?,
                 k("exl3_reconstruct_mul1_k3")?,
                 k("exl3_reconstruct_mul1_k4")?,
                 k("exl3_reconstruct_mul1_k5")?,
                 k("exl3_reconstruct_mul1_k6")?,
+                k("exl3_reconstruct_mul1_k7")?,
+                k("exl3_reconstruct_mul1_k8")?,
             ],
             had_pre: k("exl3_had_r128_pre")?,
             had_post: k("exl3_had_r128_post")?,
@@ -70,8 +73,8 @@ pub fn exl3_reconstruct(
 ) -> Result<()> {
     let sh = &w.shape;
     anyhow::ensure!(
-        (3..=6).contains(&sh.bits),
-        "EXL3 reconstruct: bits {} has no kernel (only the integer rates 3..=6 are instantiated)",
+        (2..=8).contains(&sh.bits),
+        "EXL3 reconstruct: bits {} has no kernel (only the integer rates 2..=8 are instantiated)",
         sh.bits
     );
     anyhow::ensure!(
@@ -79,7 +82,7 @@ pub fn exl3_reconstruct(
         "EXL3 reconstruct: out_features {} must be a multiple of 128 (the kernel's column tile)",
         sh.out_features
     );
-    KernelLaunch::new(gpu, k.reconstruct[sh.bits as usize - 3])
+    KernelLaunch::new(gpu, k.reconstruct[sh.bits as usize - 2])
         .grid([
             div_ceil(sh.out_features as u32, 128),
             div_ceil(sh.in_features as u32, 16),

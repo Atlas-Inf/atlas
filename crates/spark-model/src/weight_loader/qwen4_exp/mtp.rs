@@ -106,6 +106,14 @@ fn mtp_expert_layout(store: &WeightStore, mlp: &str) -> MtpExpertLayout {
 /// The MTP block's own stream mixer, the twin of the model-level one.
 const MTP_MIXER_PREFIX: &str = "mtp.hyper_connection_mixer";
 
+/// MTP expert weights can be packed EXL3, unlike the stacked/FP8/NVFP4
+/// layouts handled by the regular loader.
+fn mtp_experts_packed_exl3(store: &WeightStore) -> bool {
+    let mlp = format!("{MTP_LAYER_PREFIX}.mlp");
+    store.contains(&format!("{mlp}.experts.0.gate_proj.trellis"))
+        || store.contains(&format!("{mlp}.shared_expert.gate_proj.trellis"))
+}
+
 /// A loaded Qwen3.8-Flash-Next MTP draft module.
 ///
 /// `embed_tokens` and `lm_head` are deliberately absent: this checkpoint sets
@@ -165,6 +173,24 @@ fn build_mtp_moe(
     let stream = gpu.default_stream();
 
     let mlp = format!("{MTP_LAYER_PREFIX}.mlp");
+    if mtp_experts_packed_exl3(store) {
+        let weights = crate::weight_map::exl3::moe_pack::load_moe_exl3_packed(
+            store, &mlp, n_experts, gpu, config, false,
+        )
+        .with_context(|| format!("qwen4_exp MTP: packed EXL3 experts at {mlp}"))?;
+        let gate_nvfp4 = Some(quantize_to_nvfp4(
+            &weights.gate,
+            n_experts,
+            h,
+            gpu,
+            absmax_k,
+            quantize_k,
+            stream,
+        )?);
+        let moe = MoeLayer::new(weights, n_experts, gate_nvfp4, gpu, config)
+            .context("qwen4_exp MTP: packed EXL3 MoeLayer")?;
+        return Ok(FfnComponent::Moe(moe));
+    }
     let q = |w: &DenseWeight, n: usize, k: usize| -> Result<_> {
         quantize_to_nvfp4(w, n, k, gpu, absmax_k, quantize_k, stream)
     };
