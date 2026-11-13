@@ -82,6 +82,21 @@ elif os.environ.get("PHASE") == "decode":
         t = time.time(); req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
         u = json.load(urllib.request.urlopen(req, timeout=1800)).get("usage", {}); dt = time.time() - t
         print(f"  [prof] decode-{i}: {u.get('completion_tokens')} tok in {dt:.2f}s -> {u.get('completion_tokens', 0) / dt:.1f} tok/s", flush=True)
+elif os.environ.get("PHASE") == "score":
+    # /v1/score (#331) attribution, the score_check.sh shape: a 44-token prefix with 8 x 12-token branches, then single
+    # branches. Token ids are arbitrary in-vocab ids (no tokenizer needed; the kernels are the same). Needs MAX_BATCH >= 2.
+    r = random.Random(5); pre = [r.randrange(1000, 60000) for _ in range(44)]
+    br = [[r.randrange(1000, 60000) for _ in range(12)] for _ in range(8)]
+    def score(branches, n):
+        ts = []
+        for _ in range(n):
+            body = {"prefix": pre, "branches": branches, "options": [7179, 2233]}
+            t = time.time(); req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/score", json.dumps(body).encode(), {"Content-Type": "application/json"})
+            out = json.load(urllib.request.urlopen(req, timeout=600)); ts.append(time.time() - t)
+        ts.sort(); return ts[len(ts) // 2], out.get("engine_us")
+    for tag, b in (("score-8br", br), ("score-1br", br[:1])):
+        p50, eng = score(b, 15)
+        print(f"  [prof] {tag}: wall p50 {1e3 * p50:.0f} ms (last engine_us {eng})", flush=True)
 else:
     for i in range(3): ask(f"2k-{i}", 1900, 100 + i)
     for i in range(2): ask(f"16k-{i}", 16000, 200 + i)
