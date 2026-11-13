@@ -146,6 +146,9 @@ mod glm_sparse_prefill_tc;
 #[cfg(atlas_hip)]
 #[path = "ops/hip_fp8_blas.rs"]
 mod hip_fp8_blas;
+#[cfg(atlas_hip)]
+#[path = "ops/hip_w8a16_small_m.rs"]
+mod hip_w8a16_small_m;
 pub use glm_router_bn4::glm_router_bn4;
 #[path = "ops/hyper_connection.rs"]
 mod hyper_connection;
