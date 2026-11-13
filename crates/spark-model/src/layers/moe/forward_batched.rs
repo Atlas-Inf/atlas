@@ -16,6 +16,9 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.try_forward_exl3(input, num_tokens, ctx, stream)? {
+            return Ok(());
+        }
         if self.grouped_only(ctx) {
             return self.forward_prefill(input, num_tokens, ctx, stream);
         }

@@ -31,6 +31,9 @@ impl MoeLayer {
         reduce_ep: bool,
         routes: Option<PrecomputedRoutes>,
     ) -> Result<()> {
+        if self.try_forward_exl3(input, 3, ctx, stream)? {
+            return Ok(());
+        }
         anyhow::ensure!(
             !ctx.config.expert_tp,
             "expert TP runs K=3 on the grouped path"

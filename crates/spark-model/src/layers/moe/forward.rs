@@ -101,6 +101,9 @@ impl MoeLayer {
         hc_post: Option<ops::qwen4exp_decode_fuse::MoeHcPost>,
         stream: u64,
     ) -> Result<(DevicePtr, bool)> {
+        if self.try_forward_exl3(input, 1, ctx, stream)? {
+            return Ok((ctx.buffers.moe_output(), false));
+        }
         self.btile_input_guard(input, 1, ctx, stream)?;
         // Expert TP slices the routed width, which the fused routed+shared
         // decode kernels assume equals the shared expert's; take the grouped path.

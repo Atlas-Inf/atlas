@@ -20,10 +20,10 @@
 //          (slicing; a multiple of 8).
 //   out:   fp16 row-major [in_features, out_cols].
 //
-// K = bits per weight (upstream derives it from trellis.shape[-1] / 16). Only
-// the integer-bit-rate mul1 entries the EXL3 checkpoints in scope need are
-// instantiated here (k3..k6); the half-integer rates (1.5/2.5/3.5, the
-// HALF = true template arm) are a later item.
+// K = bits per weight (upstream derives it from trellis.shape[-1] / 16).
+// Integer-bit-rate mul1 entries: k2 (3.5 pack) and k3..k8 (3.87 needs 7 and
+// 8 on dense linears / a few experts). The half-integer rates (1.5/2.5/3.5,
+// the HALF = true template arm) are a later item.
 
 #include <cuda_bf16.h>
 
@@ -31,6 +31,12 @@
 #include "exl3_vendor/reconstruct_tile.cuh"
 
 // One entry per integer bit rate; mul1 codebook = template arg cb = 2.
+extern "C" __global__ __launch_bounds__(256) void exl3_reconstruct_mul1_k2(
+    half* __restrict__ out, const uint16_t* __restrict__ packed, int packed_blocks_n, int packed_n_offset)
+{
+    reconstruct_tile<2, 2, false>(out, packed, packed_blocks_n, packed_n_offset);
+}
+
 extern "C" __global__ __launch_bounds__(256) void exl3_reconstruct_mul1_k3(
     half* __restrict__ out, const uint16_t* __restrict__ packed, int packed_blocks_n, int packed_n_offset)
 {
@@ -53,6 +59,18 @@ extern "C" __global__ __launch_bounds__(256) void exl3_reconstruct_mul1_k6(
     half* __restrict__ out, const uint16_t* __restrict__ packed, int packed_blocks_n, int packed_n_offset)
 {
     reconstruct_tile<6, 2, false>(out, packed, packed_blocks_n, packed_n_offset);
+}
+
+extern "C" __global__ __launch_bounds__(256) void exl3_reconstruct_mul1_k7(
+    half* __restrict__ out, const uint16_t* __restrict__ packed, int packed_blocks_n, int packed_n_offset)
+{
+    reconstruct_tile<7, 2, false>(out, packed, packed_blocks_n, packed_n_offset);
+}
+
+extern "C" __global__ __launch_bounds__(256) void exl3_reconstruct_mul1_k8(
+    half* __restrict__ out, const uint16_t* __restrict__ packed, int packed_blocks_n, int packed_n_offset)
+{
+    reconstruct_tile<8, 2, false>(out, packed, packed_blocks_n, packed_n_offset);
 }
 
 // ---------------------------------------------------------------------------

@@ -19,58 +19,24 @@ pub(super) use unified_phases::btile_shared_fixture;
 mod unified_tests;
 
 impl MoeLayer {
-    /// Transpose MoE weights for coalesced prefill GEMM reads.
-    ///
-    /// Transposes per-expert routed weights [N, K/2] → [K/2, N] to enable
-    /// the cp.async pipelined FP8-MMA K64 kernels. This doubles expert
-    /// memory (~17 GB for 35B, ~30 GB for 122B) but eliminates the
-    /// catastrophic uncoalesced B reads in the fallback grouped GEMM,
-    /// cutting MoE prefill time by ~2x.
-    /// Set pre-expert norm (Gemma-4 26B: pre_feedforward_layernorm_2).
-    /// Applied to input AFTER routing but BEFORE expert dispatch.
-    pub fn set_pre_expert_norm(&mut self, norm: crate::weight_map::DenseWeight) {
-        self.pre_expert_norm = Some(norm);
-    }
-
-    /// Set GeGLU activation for MoE experts (Gemma-4 26B).
-    /// Replaces SiLU with GELU in the sorted/unfused path and forces decode
-    /// to use the sorted path (avoiding fused SiLU kernels).
-    pub fn set_gelu_activation(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
-        self.btile_storage.require_legacy()?;
-        self.moe_act_mul = gpu.kernel("gelu", "gelu_mul")?;
-        self.gelu_activation = true;
-        Ok(())
-    }
-
-    pub fn transpose_for_prefill(
-        &mut self,
-        gpu: &dyn GpuBackend,
-        config: &atlas_core::config::ModelConfig,
-    ) -> Result<()> {
-        self.transpose_for_prefill_impl(gpu, config, true)
-    }
-
-    /// Transpose only the gate+up routed weights, leaving the down projection
-    /// in its original layout. Cuts the transpose memory cost from ~3×
-    /// (gate+up+down) to ~2× per expert. Used by MiniMax M2.7-NVFP4 EP=2
-    /// when the full transpose doesn't fit but gate+up does — the fused
-    /// `moe_w4a16_fused_gate_up_k64_n128` kernel still runs (capturing the
-    /// dominant gate+up bandwidth savings), while down stays on the
-    /// uncoalesced grouped-GEMM path.
-    pub fn transpose_gate_up_for_prefill(
-        &mut self,
-        gpu: &dyn GpuBackend,
-        config: &atlas_core::config::ModelConfig,
-    ) -> Result<()> {
-        self.transpose_for_prefill_impl(gpu, config, false)
-    }
-
     pub(super) fn transpose_for_prefill_impl(
         &mut self,
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
         include_down: bool,
     ) -> Result<()> {
+        // Packed EXL3 experts have no NVFP4 [N, K/2] copy to transpose, and
+        // building one would be the dequant-requant this path refuses. The
+        // decode/prefill for these layers reconstructs the selected experts
+        // (interim) or runs CoopMK; the K-major grouped GEMM does not apply.
+        if crate::weight_map::exl3::moe_pack::exl3_moe_registered(
+            self.weights.shared_expert_gate.weight.0,
+        ) {
+            tracing::info!(
+                "MoE transpose: layer is packed EXL3 — skipping the NVFP4 prefill transpose"
+            );
+            return Ok(());
+        }
         self.btile_storage.require_legacy()?;
         let h = config.hidden_size;
         let inter = config.routed_inter_local();
@@ -242,6 +208,14 @@ impl MoeLayer {
     ) -> Result<Vec<DevicePtr>> {
         let inplace = inplace && !keep_originals;
         let mut freed = Vec::new();
+        // Packed EXL3 experts: nothing NVFP4 to transpose, and allocating the
+        // transposed set would be a second copy of every expert.
+        if crate::weight_map::exl3::moe_pack::exl3_moe_registered(
+            self.weights.shared_expert_gate.weight.0,
+        ) {
+            tracing::debug!("MoE unified/hybrid transpose: packed EXL3 layer, skipped");
+            return Ok(freed);
+        }
         self.btile_storage.require_legacy()?;
         let h = config.hidden_size;
         let inter = config.routed_inter_local();
