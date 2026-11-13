@@ -137,6 +137,13 @@ extern "C" __global__ void KERNEL_NAME(
     const unsigned int batch_size,
     const int* __restrict__ cu_seqlens,
     const int* __restrict__ kv_lens,
+#ifdef PREFILL_STATE_END
+    // Prefix-bidirectional score streams (Atlas `/v1/score`, "prefix_bidir"; gb10 port, #331):
+    // `state_end[b]` >= 0 is stream b's state-block end in KV slot space; a query at slot
+    // p < state_end reads keys k < state_end, any other query reads every key k < kv_len.
+    // -1 (or a NULL array) keeps the stream causal, byte-identical to the build without it.
+    const int* __restrict__ state_end,
+#endif
 #ifdef PREFILL_BATCHED_INDIRECT_ARGS
     const unsigned int* __restrict__ batch_indirect_args,
 #endif
@@ -182,6 +189,11 @@ extern "C" __global__ void KERNEL_NAME(
 #endif
 #else
     const unsigned int q_len_eff = q_len;
+#endif
+#if defined(PREFILL_BATCHED) && defined(PREFILL_STATE_END)
+    const int s_end = (state_end != nullptr) ? state_end[b] : -1;
+#else
+    const int s_end = -1;
 #endif
     const unsigned int tid = threadIdx.x;
     const unsigned int warp_id = tid / 32;
@@ -245,8 +257,13 @@ extern "C" __global__ void KERNEL_NAME(
     for (int i = 0; i < PV_N_TILES; i++) acc_o[i] = v8f{0,0,0,0,0,0,0,0};
 
     unsigned int num_kv_blocks = (kv_len + BC - 1) / BC;
-    { unsigned int mx = (q_offset + q_tile_end - 1) / BC;
-      num_kv_blocks = min(num_kv_blocks, mx + 1); }
+    if (s_end < 0) {
+        unsigned int mx = (q_offset + q_tile_end - 1) / BC;
+        num_kv_blocks = min(num_kv_blocks, mx + 1);
+    } else if (q_offset + q_tile_end <= (unsigned int)s_end) {
+        // Every row of this tile is a state row: keys past the state are masked.
+        num_kv_blocks = min(num_kv_blocks, ((unsigned int)s_end + BC - 1) / BC);
+    }
     // Sliding-window lower bound (gb10 port): every KV block strictly below
     // the first in-window key is fully masked — start there instead of
     // scoring and discarding. The mask coordinate is the KV SLOT space
@@ -355,7 +372,11 @@ extern "C" __global__ void KERNEL_NAME(
                 float s = smem_S[r][c] * inv_sqrt_d;
                 unsigned int kpos = kv_start + c;
                 bool masked = (c >= kv_tile_len) || !row_valid;
-                if (causal_mask_enabled && kpos > qr) masked = true;
+                if (s_end >= 0) {
+                    // Prefix-bidirectional: state rows see the state, question rows see all.
+                    const unsigned int lim = (qr < (unsigned int)s_end) ? (unsigned int)s_end : kv_len;
+                    if (kpos >= lim) masked = true;
+                } else if (causal_mask_enabled && kpos > qr) masked = true;
                 if (sliding_window > 0 && kpos <= qr &&
                     (qr - kpos) >= sliding_window) masked = true;
                 if (masked) s = -1e30f;
@@ -571,6 +592,13 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     const unsigned int batch_size,
     const int* __restrict__ cu_seqlens,
     const int* __restrict__ kv_lens,
+#ifdef PREFILL_STATE_END
+    // Prefix-bidirectional score streams (Atlas `/v1/score`, "prefix_bidir"; gb10 port, #331):
+    // `state_end[b]` >= 0 is stream b's state-block end in KV slot space; a query at slot
+    // p < state_end reads keys k < state_end, any other query reads every key k < kv_len.
+    // -1 (or a NULL array) keeps the stream causal, byte-identical to the build without it.
+    const int* __restrict__ state_end,
+#endif
 #ifdef PREFILL_BATCHED_INDIRECT_ARGS
     const unsigned int* __restrict__ batch_indirect_args,
 #endif
@@ -614,6 +642,11 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
 #endif
 #else
     const unsigned int q_len_eff = q_len;
+#endif
+#if defined(PREFILL_BATCHED) && defined(PREFILL_STATE_END)
+    const int s_end = (state_end != nullptr) ? state_end[b] : -1;
+#else
+    const int s_end = -1;
 #endif
     const unsigned int tid = threadIdx.x;
     const unsigned int warp_id = tid / 32;
@@ -666,8 +699,13 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     for (int i = 0; i < PV_N_TILES; i++) acc_o[i] = v8f{0,0,0,0,0,0,0,0};
 
     unsigned int num_kv_blocks = (kv_len + BC - 1) / BC;
-    { unsigned int mx = (q_offset + q_tile_end - 1) / BC;
-      num_kv_blocks = min(num_kv_blocks, mx + 1); }
+    if (s_end < 0) {
+        unsigned int mx = (q_offset + q_tile_end - 1) / BC;
+        num_kv_blocks = min(num_kv_blocks, mx + 1);
+    } else if (q_offset + q_tile_end <= (unsigned int)s_end) {
+        // Every row of this tile is a state row: keys past the state are masked.
+        num_kv_blocks = min(num_kv_blocks, ((unsigned int)s_end + BC - 1) / BC);
+    }
     unsigned int kv_block_lo = 0;
     if (causal_mask_enabled && sliding_window > 0) {
         unsigned int q_abs_lo = q_offset + q_start;
@@ -773,7 +811,11 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
                 float s = smem_S[r][c] * inv_sqrt_d;
                 const unsigned int kpos = kv_start + c;
                 bool masked = (c >= kv_tile_len) || !row_valid;
-                if (causal_mask_enabled && kpos > qr) masked = true;
+                if (s_end >= 0) {
+                    // Prefix-bidirectional: state rows see the state, question rows see all.
+                    const unsigned int lim = (qr < (unsigned int)s_end) ? (unsigned int)s_end : kv_len;
+                    if (kpos >= lim) masked = true;
+                } else if (causal_mask_enabled && kpos > qr) masked = true;
                 if (sliding_window > 0 && kpos <= qr &&
                     (qr - kpos) >= sliding_window) masked = true;
                 if (masked) s = -1e30f;
