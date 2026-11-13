@@ -10,9 +10,12 @@
 # gfx1151 does with the path:
 #   T1 sanity      8 yes/no facts as branches of one few-shot prefix, options " Yes"/" No"; expected answers known.
 #   T2 merged=solo every branch scored alone vs in the merged pass (max |dp|).
-#   T3 reference   P(Yes) from /v1/chat/completions top_logprobs on the same tokens (if the server returns them).
+#   T3 reference   P(Yes) from /v1/completions top logprobs on the same tokens; T3b the same scores with the
+#                  prefix/branch split moved (one-token branches).
+#   T6 latency     20 calls of the 8-branch request (wall and engine p50/p95), 10 single-branch calls.
 #   T4 bidir       the same request with "attention": "prefix_bidir": status, and whether the probs move vs causal.
-#   T5 chat        4 concurrent greedy chats == solo (batched prefill after score passes), 0 server errors.
+#   T5 chat        4 concurrent greedy chats == solo, 3 reps (batched prefill after score passes), 0 server errors.
+# MAX_BATCH must be >= 2: a score pass needs the state stream plus one branch stream (MAX_BATCH 1 answers 422).
 set -euo pipefail
 for kv in "$@"; do [[ "$kv" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9_./:,+-]*$ ]] && export "$kv"; done
 MODEL=${MODEL:-nvidia/Qwen3.8-27B-NVFP4}
@@ -67,20 +70,48 @@ for i, b in enumerate(branches):
     if s2 != 200: print(f"T2 solo {i} status {s2} {r2}"); continue
     mx = max(mx, max(abs(x - y) for x, y in zip(r2["probs"][0], P[i])))
 print(f"T2 merged vs solo max|dp| {mx:.3e}")
-refs = []
+def lp_map(r3):
+    lp = r3["choices"][0]["logprobs"]
+    if lp.get("content"):
+        return {e["token"]: e["logprob"] for e in lp["content"][0]["top_logprobs"]}
+    t = lp["top_logprobs"]
+    t0 = t[0] if isinstance(t, list) else t
+    if isinstance(t0, dict) and "token" in t0:
+        return {e["token"]: e["logprob"] for e in t}
+    return t0
+refs = []; raw = None
 for (q, a), b in zip(qs, branches):
     s3, r3 = post("/v1/completions", {"model": "m", "prompt": prefix + b, "max_tokens": 1, "temperature": 0, "logprobs": 20})
     try:
-        tl = r3["choices"][0]["logprobs"]["top_logprobs"][0]
+        raw = raw or json.dumps(r3["choices"][0].get("logprobs"))[:400]
+        tl = lp_map(r3)
         py, pn = math.exp(tl.get(" Yes", -1e9)), math.exp(tl.get(" No", -1e9))
         refs.append(py / (py + pn) if py + pn > 0 else float("nan"))
-    except Exception:
+    except Exception as e:
         refs.append(None)
 if all(x is not None for x in refs):
     d = max(abs(x - p[0] / (p[0] + p[1])) for x, p in zip(refs, P))
     print(f"T3 completions-logprob reference: max |P(Yes|Yes,No) score - ref| {d:.3e}")
 else:
-    print(f"T3 reference unavailable (completions status {s3}: {str(r3)[:200]})")
+    print(f"T3 reference unavailable; logprobs raw: {raw}")
+# T3b: the same scores with the split moved (prefix = prefix + branch[:-1], branch = last token): one pass, other shape.
+d3 = 0.0
+for i, b in enumerate(branches):
+    s5, r5 = post("/v1/score", {"prefix": prefix + b[:-1], "branches": [b[-1:]], "options": opts})
+    if s5 != 200: print(f"T3b {i} status {s5} {r5}"); d3 = float("nan"); break
+    d3 = max(d3, max(abs(x - y) for x, y in zip(r5["probs"][0], P[i])))
+print(f"T3b split-moved reference max|dp| {d3:.3e}")
+import time
+lat = []; eng = []
+for _ in range(20):
+    t0 = time.time(); s6, r6 = post("/v1/score", {"prefix": prefix, "branches": branches, "options": opts}); lat.append(time.time() - t0)
+    if s6 == 200: eng.append(r6["engine_us"] / 1e3)
+lat.sort(); eng.sort()
+print(f"T6 latency 8 branches x {len(prefix)}+~{len(branches[0])} tok, 20 calls: wall p50 {1e3*lat[10]:.0f} ms p95 {1e3*lat[18]:.0f} ms | engine p50 {eng[len(eng)//2]:.0f} ms")
+lat1 = []
+for _ in range(10):
+    t0 = time.time(); post("/v1/score", {"prefix": prefix, "branches": branches[:1], "options": opts}); lat1.append(time.time() - t0)
+lat1.sort(); print(f"T6 latency 1 branch: wall p50 {1e3*lat1[5]:.0f} ms")
 s4, r4 = post("/v1/score", {"prefix": prefix, "branches": branches, "options": opts, "attention": "prefix_bidir"})
 if s4 == 200:
     d = max(abs(x - y) for p, q in zip(r4["probs"], P) for x, y in zip(p, q))
@@ -93,9 +124,10 @@ def chat(i, out):
         "messages": [{"role": "user", "content": f"List three facts about the number {i + 3}."}]})
     out[i] = r["choices"][0]["message"]["content"] if s == 200 else f"ERR {s}"
 solo = {}; [chat(i, solo) for i in range(4)]
-conc = {}; th = [threading.Thread(target=chat, args=(i, conc)) for i in range(4)]
-[t.start() for t in th]; [t.join() for t in th]
-print(f"T5 chat C4 == solo: {sum(conc[i] == solo[i] for i in range(4))}/4")
+for rep in range(3):
+    conc = {}; th = [threading.Thread(target=chat, args=(i, conc)) for i in range(4)]
+    [t.start() for t in th]; [t.join() for t in th]
+    print(f"T5 chat C4 == solo (rep {rep}): {sum(conc[i] == solo[i] for i in range(4))}/4")
 EOF
 kill -INT $SPID 2>/dev/null || true; for _ in $(seq 1 60); do kill -0 $SPID 2>/dev/null || break; sleep 2; done; kill -9 $SPID 2>/dev/null || true
 log "server: $(grep -ciE ' ERROR |panicked' "$SL") ERROR/panic lines"; grep -iE " ERROR |panicked" "$SL" | head -5 | cut -c1-250 | tee -a "$RES" || true
