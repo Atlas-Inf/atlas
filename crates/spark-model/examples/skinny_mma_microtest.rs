@@ -30,6 +30,10 @@ use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
+#[path = "skinny_mma_microtest_parts/host.rs"]
+mod host;
+use host::*;
+
 const ROWS: usize = MAX_ROWS as usize;
 const SCALE2: f32 = 0.0123;
 const SENTINEL: u8 = 0xA5;
@@ -131,41 +135,6 @@ const SHAPES: &[(&str, Family, usize, usize, u32, u32)] = &[
     ),
 ];
 
-struct Lcg(u64);
-impl Lcg {
-    fn f(&mut self) -> f64 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
-    }
-    fn byte(&mut self) -> u8 {
-        (self.f() * 256.0) as u8
-    }
-    /// Roughly normal, with a heavy tail (one value in 64 up to ~+-200).
-    fn act(&mut self) -> f32 {
-        let n = (0..4).map(|_| self.f()).sum::<f64>() - 2.0;
-        let big = self.f() < 1.0 / 64.0;
-        (n * if big { 120.0 } else { 1.2 }) as f32
-    }
-}
-
-fn e4m3(b: u8) -> f64 {
-    let (s, e, m) = (b >> 7, (b >> 3) & 0xF, b & 7);
-    let v = if e == 0 {
-        m as f64 / 8.0 * 2f64.powi(-6)
-    } else {
-        (1.0 + m as f64 / 8.0) * 2f64.powi(e as i32 - 7)
-    };
-    if s == 1 { -v } else { v }
-}
-const E2M1: [f64; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-fn e2m1(code: u8) -> f64 {
-    let v = E2M1[(code & 7) as usize];
-    if code & 8 != 0 { -v } else { v }
-}
-
 struct Shape {
     family: Family,
     n: usize,
@@ -182,20 +151,6 @@ struct Ops {
     a: DevicePtr,
     w: DevicePtr,
     s: DevicePtr,
-}
-
-fn up(g: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
-    let p = g.alloc(bytes.len().max(1))?;
-    g.copy_h2d(bytes, p)?;
-    Ok(p)
-}
-fn down(g: &dyn GpuBackend, p: DevicePtr, n: usize) -> Result<Vec<u8>> {
-    let mut b = vec![0u8; n];
-    g.copy_d2h(p, &mut b)?;
-    Ok(b)
-}
-fn a_bytes(a: &[u16]) -> Vec<u8> {
-    a.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
 impl Ops {
@@ -355,24 +310,6 @@ fn gemv_today(g: &dyn GpuBackend, sh: &Shape, op: &Ops, t: usize, c: DevicePtr) 
         l
     };
     l.launch(0)
-}
-
-/// (RMS error / output RMS, max error / output RMS, share not correctly rounded).
-fn errors(got: &[u8], want: &[f64]) -> (f64, f64, f64) {
-    let rms = (want.iter().map(|v| v * v).sum::<f64>() / want.len() as f64).sqrt();
-    let (mut se, mut mx, mut off) = (0f64, 0f64, 0usize);
-    for (b, &w) in got.chunks_exact(2).zip(want) {
-        let v = bf16::from_bits(u16::from_le_bytes([b[0], b[1]]));
-        let e = (v.to_f64() - w).abs();
-        se += e * e;
-        mx = mx.max(e);
-        off += usize::from(v != bf16::from_f64(w));
-    }
-    (
-        (se / want.len() as f64).sqrt() / rms,
-        mx / rms,
-        off as f64 / want.len() as f64,
-    )
 }
 
 fn main() -> Result<()> {
