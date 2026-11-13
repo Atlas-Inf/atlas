@@ -98,10 +98,10 @@ pub struct DflashTwins {
     /// `ATLAS_DFLASH_NVFP4_TC=1`: layer projections take the NVFP4 twins on
     /// the tensor-core tiers at any row count (main: only up to 4 rows).
     pub nvfp4_tc: bool,
-    /// `ATLAS_DFLASH_NVFP4_T=1` (gfx1151): the layer projections' NVFP4 twins
-    /// transposed in place to the `[K/2, N]` layout and run on the main model's
-    /// WMMA `w4a16_gemm_t_m128_f16a` (its 32-row twin at M <= 32) instead of
-    /// `w4a16_gemv_batch16`. The kernel handle, or `None`.
+    /// gfx1151 default (`ATLAS_DFLASH_NVFP4_T=0` turns it off): the layer
+    /// projections' NVFP4 twins transposed in place to the `[K/2, N]` layout and
+    /// run on the main model's WMMA `w4a16_gemm_t_m128_f16a` (its 32-row twin at
+    /// M <= 32) instead of `w4a16_gemv_batch16`. The kernel handle, or `None`.
     pub nvfp4_t: Option<spark_runtime::gpu::KernelHandle>,
     /// NVFP4 twin of the shared BF16 lm_head (`ATLAS_DFLASH_NVFP4_HEAD=1`),
     /// half the MXFP8 bytes, on the tensor-core tiers in 32-row pieces.
@@ -161,7 +161,8 @@ impl BlockDiffusionDraftHead {
                  (ATLAS_NO_DFLASH_DRAFTER_NVFP4, drafter FP8, or missing quantizer)"
             );
         }
-        if env_on("ATLAS_DFLASH_NVFP4_T") {
+        // Default on gfx1151; ATLAS_DFLASH_NVFP4_T=0 keeps the native GEMV.
+        if cfg!(atlas_hip) && std::env::var("ATLAS_DFLASH_NVFP4_T").as_deref() != Ok("0") {
             self.install_nvfp4_t(gpu)?;
         }
         self.install_head_twin(gpu)?;
@@ -193,27 +194,26 @@ impl BlockDiffusionDraftHead {
         Ok(())
     }
 
-    /// `ATLAS_DFLASH_NVFP4_T=1`: transpose each layer's seven NVFP4 twins to
-    /// the `[K/2, N]` / `[K/16, N]` layout the main model's WMMA GEMM reads,
-    /// freeing the native copies (no extra resident bytes). The native layout
-    /// is what caps `w4a16_gemv_batch16` near 50 GB/s on gfx1151 (KLOOP #70:
-    /// dot2-issue-bound); `m128_f16a` / its m32 twin on the transposed copy run
-    /// the Ripple drafter shapes 15-38% faster at M = 16 (DevLab kbench
-    /// 43394490022: gate/up 1597 vs 1884 us, down 786 vs 1263, q 804 vs 993).
+    /// gfx1151 default (`ATLAS_DFLASH_NVFP4_T=0` opts out): transpose each
+    /// layer's seven NVFP4 twins to the `[K/2, N]` / `[K/16, N]` layout the main
+    /// model's WMMA GEMM reads, freeing the native copies (no extra resident
+    /// bytes). On the native layout `w4a16_gemv_batch16` is dot2-issue-bound
+    /// near 50 GB/s; `m128_f16a` / its m32 twin on the transposed copy run the
+    /// Ripple drafter shapes 15-38% faster at M = 16 (DevLab kbench 43394490022:
+    /// gate/up 1597 vs 1884 us, down 786 vs 1263, q 804 vs 993), DFlash2 steady
+    /// decode +5% / +9% in two A/B rounds with byte-identical greedy probes.
     /// The F16 dequant is exact where batch16 sums in a different order, so
     /// draft tokens can move; the verifier still decides every output token.
-    /// HIP only, and not with the tensor-core tiers (their callers index the
-    /// native layout).
+    /// Not with the tensor-core tiers (their callers index the native layout).
     fn install_nvfp4_t(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
         let kernel = ops::w4a16_m128_kernel(gpu);
-        if !cfg!(atlas_hip)
-            || kernel.0 == 0
+        if kernel.0 == 0
             || self.twins.nvfp4_tc
             || !matches!(self.quant, super::DflashQuantization::Nvfp4Weights)
         {
-            tracing::warn!(
-                "ATLAS_DFLASH_NVFP4_T=1 needs the gfx1151 w4a16_gemm_t_m128_f16a kernel, the drafter \
-                 NVFP4 twins, and ATLAS_DFLASH_NVFP4_TC off: the drafter keeps the native GEMV"
+            tracing::info!(
+                "DFlash NVFP4 transposed WMMA: off (needs the w4a16_gemm_t_m128_f16a kernel, the \
+                 drafter NVFP4 twins, and ATLAS_DFLASH_NVFP4_TC off)"
             );
             return Ok(());
         }
