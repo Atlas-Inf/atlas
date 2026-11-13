@@ -15,6 +15,8 @@
 #   T6 latency     20 calls of the 8-branch request (wall and engine p50/p95), 10 single-branch calls.
 #   T4 bidir       the same request with "attention": "prefix_bidir": status, and whether the probs move vs causal.
 #   T5 chat        4 concurrent greedy chats == solo, 3 reps (batched prefill after score passes), 0 server errors.
+#   T7 long prefix (~1.5k tok), T8 64 branches (copies identical), T9 4 concurrent requests vs sequential,
+#   T10 prefix_bidir merged vs solo. EXTRA=a,b,c adds serve args (e.g. EXTRA=--lm-head-dtype,bf16).
 # MAX_BATCH must be >= 2: a score pass needs the state stream plus one branch stream (MAX_BATCH 1 answers 422).
 set -euo pipefail
 for kv in "$@"; do [[ "$kv" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9_./:,+-]*$ ]] && export "$kv"; done
@@ -23,13 +25,14 @@ export GPU_UTIL=${GPU_UTIL:-0.70} MAX_SEQ_LEN=${MAX_SEQ_LEN:-16384} ATLAS_KV_EXT
   SSM_SLOTS=${SSM_SLOTS:-8} MAX_BATCH=${MAX_BATCH:-8} NUM_DRAFTS=${NUM_DRAFTS:-0}
 OUT=${DEVLAB_OUT:-$PWD/devlab-out}; mkdir -p "$OUT"; RES="$OUT/RESULTS.txt"
 log() { echo "[$(date -u +%H:%M:%SZ)] $*" | tee -a "$RES"; }
-log "score_check $(git rev-parse --short=9 HEAD) model $MODEL GPU_UTIL=$GPU_UTIL MAX_BATCH=$MAX_BATCH"
+log "score_check $(git rev-parse --short=9 HEAD) model $MODEL GPU_UTIL=$GPU_UTIL MAX_BATCH=$MAX_BATCH EXTRA=${EXTRA:-}"
 python3 -c "import huggingface_hub, tokenizers" 2>/dev/null || python3 -m pip install --user -q --break-system-packages huggingface_hub tokenizers
 SNAP=$(python3 -c "import sys; from huggingface_hub import snapshot_download; print(snapshot_download(sys.argv[1]))" "$MODEL") \
   || { log "MODEL DOWNLOAD FAILED"; exit 1; }
+IFS=, read -r -a EXTRA_A <<< "${EXTRA:-}"   # extra serve args, comma-separated (e.g. EXTRA=--lm-head-dtype,bf16)
 PORT=18081; SL="$OUT/serve.log"
 ( exec env RUST_LOG=info ATLAS_BIN="$PWD/target/release/spark" PORT=$PORT HOST=127.0.0.1 MODEL_NAME=m \
-    ./serve-amd.sh "$MODEL" --disable-thinking --request-timeout 0 ) > "$SL" 2>&1 &
+    ./serve-amd.sh "$MODEL" --disable-thinking --request-timeout 0 "${EXTRA_A[@]}" ) > "$SL" 2>&1 &
 SPID=$!
 for _ in $(seq 1 720); do
   curl -s -m 5 "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1 && break
@@ -119,6 +122,39 @@ if s4 == 200:
     print(f"T4 prefix_bidir status 200, max|dp| vs causal {d:.3e} (0 => mask ignored), sanity {ok4}/{len(qs)}")
 else:
     print(f"T4 prefix_bidir status {s4} {r4}")
+# T7 long prefix: ~1.5k tokens of license text before the few-shot block, same 8 branches.
+filler = " ".join(open("/usr/share/common-licenses/GPL-3").read().split()[:1100])
+lp = enc("Background document:\n" + filler + "\n\n" + prefix_txt)
+s7, r7 = post("/v1/score", {"prefix": lp, "branches": branches, "options": opts})
+if s7 == 200:
+    ok7 = sum(1 for (q, a), p in zip(qs, r7["probs"]) if (p[0] > p[1]) == bool(a))
+    print(f"T7 long prefix {len(lp)} tok: sanity {ok7}/{len(qs)}, engine {r7['engine_us'] / 1e3:.0f} ms")
+else:
+    print(f"T7 long prefix status {s7} {r7}")
+# T8 64 branches = the 8 questions x 8 copies: copies must score identically within the pass, and match T1.
+b64 = [b for b in branches for _ in range(8)]
+s8, r8 = post("/v1/score", {"prefix": prefix, "branches": b64, "options": opts})
+if s8 == 200:
+    P8 = r8["probs"]; dup = max(abs(x - y) for i in range(64) for x, y in zip(P8[i], P8[(i // 8) * 8]))
+    d8 = max(abs(x - y) for i in range(64) for x, y in zip(P8[i], P[i // 8]))
+    print(f"T8 64 branches: copies max|dp| {dup:.3e} (want 0), vs T1 {d8:.3e}, batched {r8.get('batched')}, engine {r8['engine_us'] / 1e3:.0f} ms")
+else:
+    print(f"T8 64 branches status {s8} {r8}")
+# T9 4 concurrent requests (2 branches each) merged by the scheduler vs the same requests one at a time.
+subs = [branches[2 * i:2 * i + 2] for i in range(4)]
+seq = [post("/v1/score", {"prefix": prefix, "branches": sb, "options": opts})[1]["probs"] for sb in subs]
+res = {}
+def sc(i): res[i] = post("/v1/score", {"prefix": prefix, "branches": subs[i], "options": opts})
+th = [threading.Thread(target=sc, args=(i,)) for i in range(4)]; [t.start() for t in th]; [t.join() for t in th]
+d9 = max(abs(x - y) for i in range(4) for pa, pb in zip(res[i][1]["probs"], seq[i]) for x, y in zip(pa, pb))
+print(f"T9 4 concurrent vs sequential max|dp| {d9:.3e}, batched {[res[i][1].get('batched') for i in range(4)]}")
+# T10 prefix_bidir merged vs solo (#331 claims merged == solo for bidir).
+if s4 == 200:
+    d10 = 0.0
+    for i, b in enumerate(branches):
+        s10, r10 = post("/v1/score", {"prefix": prefix, "branches": [b], "options": opts, "attention": "prefix_bidir"})
+        d10 = max(d10, max(abs(x - y) for x, y in zip(r10["probs"][0], r4["probs"][i])))
+    print(f"T10 prefix_bidir merged vs solo max|dp| {d10:.3e}")
 def chat(i, out):
     s, r = post("/v1/chat/completions", {"model": "m", "temperature": 0, "max_tokens": 64,
         "messages": [{"role": "user", "content": f"List three facts about the number {i + 3}."}]})
