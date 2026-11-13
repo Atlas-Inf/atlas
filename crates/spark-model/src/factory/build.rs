@@ -1260,6 +1260,10 @@ pub fn build_model(
         if let Err(e) = gpu.free(lm_head.weight) {
             tracing::warn!("lm_head BF16 intermediate free failed: {e}");
         }
+        // The buffer is the store's `lm_head.weight` tensor: without this the
+        // store frees it again at teardown (`cuMemFree lm_head.weight status 1`
+        // on every Ripple-65B shutdown).
+        store.mark_freed_elsewhere(&[lm_head.weight])?;
         crate::weight_map::DenseWeight {
             weight: spark_runtime::gpu::DevicePtr::NULL,
         }
