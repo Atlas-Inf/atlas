@@ -234,7 +234,8 @@ int main() {
             for (size_t kp = 0; kp < K / 2; kp++) tp[kp * N + n] = hp[n * (K / 2) + kp];
             for (size_t g = 0; g < K / 16; g++) ts[g * N + n] = hs[n * (K / 16) + g];
         }
-        std::vector<unsigned char*> P(copies), Q(copies);
+        std::vector<unsigned char*> P(copies), Q(copies), TPc(copies), TSc(copies);
+        for (int c = 0; c < copies; c++) { CHECK(hipMalloc(&TPc[c], pb)); CHECK(hipMemcpy(TPc[c], tp.data(), pb, hipMemcpyHostToDevice)); CHECK(hipMalloc(&TSc[c], sb)); CHECK(hipMemcpy(TSc[c], ts.data(), sb, hipMemcpyHostToDevice)); }
         for (int c = 0; c < copies; c++) { CHECK(hipMalloc(&P[c], pb)); CHECK(hipMemcpy(P[c], hp.data(), pb, hipMemcpyHostToDevice)); CHECK(hipMalloc(&Q[c], sb)); CHECK(hipMemcpy(Q[c], hs.data(), sb, hipMemcpyHostToDevice)); }
         unsigned char *TP, *TS; CHECK(hipMalloc(&TP, pb)); CHECK(hipMemcpy(TP, tp.data(), pb, hipMemcpyHostToDevice)); CHECK(hipMalloc(&TS, sb)); CHECK(hipMemcpy(TS, ts.data(), sb, hipMemcpyHostToDevice));
         std::vector<__nv_bfloat16> hA((size_t)M * K); for (auto& a : hA) a = __float2bfloat16(wide ? ((rand() % 2001) - 1000) / 1000.f * std::pow(2.f, (float)(rand() % 24 - 12)) : ((rand() % 2001) - 1000) / 1000.f);
@@ -248,11 +249,14 @@ int main() {
         CHECK(hipMemcpy(r0.data(), C0, r0.size() * 2, hipMemcpyDeviceToHost));
         auto launch = [&](int v, int c, __nv_bfloat16* C) {
             if (v == 0) hipLaunchKernelGGL(w4a16_gemm_m32_native<128>, dim3((N + 127) / 128, (M + 31) / 32), dim3(128), 0, 0, A, P[c], Q[c], 0.01f, C, M, N, K);
-            else hipLaunchKernelGGL(w4a16_gemm_m32_native<64>, dim3((N + 63) / 64, (M + 31) / 32), dim3(128), 0, 0, A, P[c], Q[c], 0.01f, C, M, N, K);
+            else if (v == 1) hipLaunchKernelGGL(w4a16_gemm_m32_native<64>, dim3((N + 63) / 64, (M + 31) / 32), dim3(128), 0, 0, A, P[c], Q[c], 0.01f, C, M, N, K);
+            else hipLaunchKernelGGL(w4a16_gemm_t_m128_f16a, dim3((N + 127) / 128, (M + 127) / 128), dim3(128), 0, 0, A, TPc[c], TSc[c], 0.01f, C, M, N, K);
         };
-        const char* names[] = {"m32n NT128", "m32n NT64"};
+        // v2: m128_f16a on the transposed layout (what the drafter would run if its weights were transposed in place at
+        // load, like the main model's). batch16 baselines (KLOOP #16/#70): q|gate 993, o 559, gate/up 1884, down 1263, fc 1305, lm_head 4571 us.
+        const char* names[] = {"m32n NT128", "m32n NT64", "m128t"};
         printf("-- %s M=%u N=%u K=%u wide=%d (%.1f MB)\n", s.name, M, N, K, (int)wide, wbytes / 1e6);
-        for (int v = 0; v < 2; v++) {
+        for (int v = 0; v < 3; v++) {
             for (int i = 0; i < 3; i++) launch(v, i % copies, C1);
             const int it = 30; CHECK(hipEventRecord(e0)); for (int i = 0; i < it; i++) launch(v, i % copies, C1); CHECK(hipEventRecord(e1)); CHECK(hipEventSynchronize(e1));
             float ms; CHECK(hipEventElapsedTime(&ms, e0, e1));
@@ -261,7 +265,7 @@ int main() {
             size_t neq = 0; for (size_t i = 0; i < r0.size(); i++) neq += memcmp(&r0[i], &r1[i], 2) != 0 && !(std::isnan(bf(r0[i])) && std::isnan(bf(r1[i])));
             printf("   %-10s %8.1f us  %6.1f GB/s  (%zu/%zu differ from m128_f16a on the transposed copy)\n", names[v], 1000 * ms / it, wbytes / 1e9 / (ms / it / 1000), neq, r0.size());
         }
-        for (int c = 0; c < copies; c++) { hipFree(P[c]); hipFree(Q[c]); }
+        for (int c = 0; c < copies; c++) { hipFree(P[c]); hipFree(Q[c]); hipFree(TPc[c]); hipFree(TSc[c]); }
         hipFree(TP); hipFree(TS); hipFree(A); hipFree(C0); hipFree(C1);
     }
     return 0;
