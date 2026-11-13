@@ -301,15 +301,15 @@ pub struct Exl3CoopMk {
     pub kernels: Exl3CoopMkKernels,
     pub params: MoeCoopParams,
     pub k_tab: DevicePtr,
-    /// fp16 [H] converted input row (= params.x).
+    /// fp16 `[H]` converted input row (= params.x).
     pub xh: DevicePtr,
-    /// int64 [slots] selected experts (= params.sel).
+    /// int64 `[slots]` selected experts (= params.sel).
     pub sel: DevicePtr,
-    /// fp16 [slots] routing weights (= params.rw).
+    /// fp16 `[slots]` routing weights (= params.rw).
     pub rw: DevicePtr,
-    /// f32 [H] MoE output row (= params.out).
+    /// f32 `[H]` MoE output row (= params.out).
     pub out_f32: DevicePtr,
-    /// bf16 [H] second output for the parity debug switch.
+    /// bf16 `[H]` second output for the parity debug switch.
     pub parity_out: DevicePtr,
     pub top_k: u32,
     pub hidden: u32,
