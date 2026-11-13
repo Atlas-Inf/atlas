@@ -16,7 +16,7 @@ static inline float bf(__nv_bfloat16 v) { return __bfloat162float(v); }
 #define CHECK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { printf("HIP %s at %s:%d\n", hipGetErrorString(e_), __FILE__, __LINE__); exit(1); } } while (0)
 
 #define DK_B_OFF(n) ((n) * 40 + ((n) >> 4) * 8)
-template <int NT, int KS>
+template <int NT, int KS, int RQ = 1>
 __global__ __launch_bounds__(128)
 void m32_deepk(const __nv_bfloat16* __restrict__ A_, const unsigned char* __restrict__ B_packed,
     const unsigned char* __restrict__ B_scale, const float scale2, __nv_bfloat16* __restrict__ C,
@@ -96,6 +96,25 @@ void m32_deepk(const __nv_bfloat16* __restrict__ A_, const unsigned char* __rest
         }
     };
 
+    if constexpr (RQ > 1) {
+        // KLOOP #79 register queue: RQ-1 K-steps in flight in VGPRs, one LDS stage, same compute order.
+        uint4 qa[RQ], qb[RQ], qs[RQ];
+        load(0, qa[0], qb[0], qs[0]);
+        store(0, qa[0], qb[0], qs[0]);
+        #pragma unroll
+        for (int i = 1; i < RQ; i++) load(i * F16_K_STEP, qa[i], qb[i], qs[i]);
+        __syncthreads();
+        for (unsigned int k_base = F16_K_STEP; k_base < K; k_base += F16_K_STEP) {
+            load(k_base + (RQ - 1) * F16_K_STEP, qa[0], qb[0], qs[0]);
+            compute(0);
+            __syncthreads();
+            store(0, qa[1], qb[1], qs[1]);
+            __syncthreads();
+            #pragma unroll
+            for (int i = 1; i < RQ; i++) { const uint4 ta = qa[i], tb = qb[i], ts = qs[i]; qa[i] = qa[(i + 1) % RQ]; qb[i] = qb[(i + 1) % RQ]; qs[i] = qs[(i + 1) % RQ]; qa[(i + 1) % RQ] = ta; qb[(i + 1) % RQ] = tb; qs[(i + 1) % RQ] = ts; }
+        }
+        compute(0);
+    } else {
     uint4 ra[KS], rb[KS], rs[KS];
     #pragma unroll
     for (int s = 0; s < KS; s++) load(s * F16_K_STEP, ra[s], rb[s], rs[s]);
@@ -117,6 +136,7 @@ void m32_deepk(const __nv_bfloat16* __restrict__ A_, const unsigned char* __rest
     #pragma unroll
     for (int s = 0; s < KS; s++)
         if (k_cur + s * F16_K_STEP < K) compute(s);
+    }
 
     #pragma unroll
     for (int rt = 0; rt < 2; rt++)
@@ -139,7 +159,9 @@ int main() {
     V vs[] = {{"m32 n64 (KS1)", 64, m32_deepk<64, 1>}, {"deepk n64 KS2", 64, m32_deepk<64, 2>},
               {"deepk n64 KS4", 64, m32_deepk<64, 4>}, {"deepk n64 KS8", 64, m32_deepk<64, 8>},
               {"m32 n128 (KS1)", 128, m32_deepk<128, 1>}, {"deepk n128 KS2", 128, m32_deepk<128, 2>},
-              {"deepk n128 KS4", 128, m32_deepk<128, 4>}};
+              {"deepk n128 KS4", 128, m32_deepk<128, 4>}, {"rq n128 RQ2", 128, m32_deepk<128, 1, 2>},
+              {"rq n128 RQ3", 128, m32_deepk<128, 1, 3>}, {"rq n64 RQ2", 64, m32_deepk<64, 1, 2>},
+              {"rq n64 RQ3", 64, m32_deepk<64, 1, 3>}};
     for (auto& s : shapes) {
         const unsigned M = s.M, N = s.N, K = s.K;
         const size_t pb = (size_t)K / 2 * N, sb = (size_t)K / 16 * N, wbytes = pb + sb;
