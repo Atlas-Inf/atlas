@@ -97,6 +97,26 @@ impl SpRows {
         self.rows + self.peer_rows
     }
 
+    /// Whether this split may gather a block input quantized instead of as
+    /// BF16 rows (`moe::sp_quant_gather`, `glm5_kda::sp_quant_gather`,
+    /// `qwen3_attention::prefill::paged_glm_sp_gather`): the chain always,
+    /// the pair under `ATLAS_GLM_SP_QUANT_GATHER_PAIR` ([`quant_gather_pair`]).
+    pub fn quant_gathers(self) -> bool {
+        quant_gather_serves(self.ranks, quant_gather_pair())
+    }
+
+    /// Whether [`Self::all_gather`] / [`Self::all_gather_block`] can move
+    /// parts of `bytes`: the chain's segment gather, or the pair's exchange.
+    pub fn supports_gather(self, bytes: usize, ctx: &ForwardContext) -> bool {
+        ctx.comm.is_some_and(|c| {
+            if self.ranks == 2 {
+                c.supports_exchange_async(bytes)
+            } else {
+                c.supports_gather_async(bytes)
+            }
+        })
+    }
+
     /// `ptr` advanced to the local rows of a `[total, width]` BF16 tensor.
     pub fn local(self, ptr: DevicePtr, width: usize) -> DevicePtr {
         ptr.offset(self.row0 * width * 2)
@@ -385,76 +405,52 @@ pub fn requested() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_GLM_PREFILL_SP").as_deref() == Ok("1"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rank0_owns_the_upper_half() {
-        assert_eq!(
-            SpRows::for_rank(8196, 0, 2),
-            SpRows {
-                row0: 4098,
-                rows: 4098,
-                peer0: 0,
-                peer_rows: 4098,
-                full_shared: false,
-                ranks: 2,
-            }
-        );
-        assert_eq!(
-            SpRows::for_rank(8196, 1, 2),
-            SpRows {
-                row0: 0,
-                rows: 4098,
-                peer0: 4098,
-                peer_rows: 4098,
-                full_shared: false,
-                ranks: 2,
-            }
-        );
-        let r = SpRows::for_rank(8, 0, 2);
-        assert_eq!(
-            r.local(DevicePtr(0x1000), 4096),
-            DevicePtr(0x1000 + 4 * 4096 * 2)
-        );
-    }
-
-    #[test]
-    fn chain_ranks_own_quarters_top_down() {
-        let parts: Vec<(usize, usize)> = (0..4)
-            .map(|r| SpRows::for_rank(8192, r, 4))
-            .map(|sp| {
-                assert_eq!((sp.total(), sp.peer0, sp.ranks), (8192, 0, 4));
-                (sp.row0, sp.rows)
-            })
-            .collect();
-        assert_eq!(parts, [(6144, 2048), (4096, 2048), (2048, 2048), (0, 2048)]);
-    }
-
-    #[test]
-    fn split_at_gives_rank0_the_lower_rows() {
-        let lo = SpRows::split_at(16046, 8192, 0);
-        let hi = SpRows::split_at(16046, 8192, 1);
-        assert_eq!(
-            (lo.row0, lo.rows, lo.peer0, lo.peer_rows),
-            (0, 8192, 8192, 7854)
-        );
-        assert_eq!(
-            (hi.row0, hi.rows, hi.peer0, hi.peer_rows),
-            (8192, 7854, 0, 8192)
-        );
-        assert_eq!((lo.total(), hi.total()), (16046, 16046));
-        assert!(lo.full_shared && hi.full_shared);
-    }
-
-    #[test]
-    fn scope_clears_on_drop() {
-        assert_eq!(current(), None);
-        {
-            let _s = enter(SpRows::for_rank(16, 1, 2));
-            assert_eq!(current().map(|r| r.rows), Some(8));
+/// `ATLAS_GLM_SP_QUANT_GATHER_PAIR` (default 0, read once; the ranks compare
+/// it at startup, `model::startup_parity`): the two-rank pair gathers block
+/// inputs quantized, as the four-rank chain always does. `1`: the MoE and
+/// MLA inputs, on the pair's own chunks; KDA layers keep their BF16 gather.
+/// `2`: the pair's chunks are also cut to 128 rows a rank
+/// (`model::glm_prefill_sp`), the KDA cast's scale tile grid, and KDA layers
+/// gather quantized too.
+pub fn quant_gather_pair() -> usize {
+    static MODE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = parse_quant_gather_pair(
+            std::env::var("ATLAS_GLM_SP_QUANT_GATHER_PAIR")
+                .ok()
+                .as_deref(),
+        )
+        .unwrap_or_else(|e| panic!("{e:#}"));
+        if mode > 0 {
+            tracing::info!(
+                "ATLAS_GLM_SP_QUANT_GATHER_PAIR={mode}: a two-rank SP prefill gathers its MoE \
+                 and MLA inputs quantized{}",
+                if mode == 2 {
+                    ", and its KDA inputs on chunks cut to 128 rows a rank"
+                } else {
+                    ""
+                }
+            );
         }
-        assert_eq!(current(), None);
+        mode
+    })
+}
+
+fn parse_quant_gather_pair(value: Option<&str>) -> Result<usize> {
+    match value {
+        None | Some("") | Some("0") => Ok(0),
+        Some("1") => Ok(1),
+        Some("2") => Ok(2),
+        Some(v) => anyhow::bail!("ATLAS_GLM_SP_QUANT_GATHER_PAIR must be 0, 1 or 2, got {v:?}"),
     }
 }
+
+/// [`SpRows::quant_gathers`] for a split over `ranks` with the pair's
+/// switch at `pair` ([`quant_gather_pair`]).
+fn quant_gather_serves(ranks: usize, pair: usize) -> bool {
+    ranks > 2 || (ranks == 2 && pair > 0)
+}
+
+#[cfg(test)]
+#[path = "glm_sp_tests.rs"]
+mod tests;

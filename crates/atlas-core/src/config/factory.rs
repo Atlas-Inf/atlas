@@ -65,6 +65,7 @@ impl ModelConfig {
             ep_rank: 0,
             ep_world_size: 1,
             expert_tp: false,
+            hc_highway_bf16: false,
             tp_rank: 0,
             tp_world_size: 1,
             hybrid_override_pattern: String::new(),

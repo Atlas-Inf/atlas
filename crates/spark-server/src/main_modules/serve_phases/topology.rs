@@ -77,6 +77,9 @@ pub(crate) fn resolve_topology(
         && matches!(ep_size, 2 | 4)
         && tp_size == ep_size
         && world_size == ep_size;
+    // The arena sizes the mHC highway for the format the model keeps it in
+    // (environment only, so the same before and after CUDA is up).
+    config.hc_highway_bf16 = spark_model::layers::ops::hc_bf16_for(&config.model_type);
     if tp_size > 1 {
         // EXL3 packs each linear into 16x16 trellis tiles laid out
         // [in/16, out/16, ...]; a tile is atomic, so the tensor cannot be
@@ -103,6 +106,8 @@ pub(crate) fn resolve_topology(
             );
         }
         drop(loader);
+        // The pair under expert TP has no slower 2-row verify to charge for.
+        crate::scheduler::set_pair_expert_tp(config.expert_tp && tp_size == 2);
         // The MTP head (`--speculative`) runs unsharded on rank 0 from the
         // TP=1 view of the config; a DFlash drafter has not been tried here.
         if config.model_type == "qwen4_exp" && args.dflash {

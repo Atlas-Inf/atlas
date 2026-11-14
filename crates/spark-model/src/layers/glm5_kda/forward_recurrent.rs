@@ -5,6 +5,19 @@
 use super::*;
 
 impl Glm5KdaLayer {
+    /// The arena's conv scratch for `rows` convolved q|k|v rows (`[rows, 3p]`
+    /// BF16, row-major or as planes): a GLM arena sizes it for those rows of
+    /// that width, not the GDN's FP32 q|k|v|z.
+    pub(super) fn convolved_rows(&self, rows: usize, ctx: &ForwardContext) -> Result<DevicePtr> {
+        let need = rows * 3 * self.heads * self.dim * 2;
+        ensure!(
+            need <= ctx.buffers.sizes().ssm_conv_out_f32,
+            "GLM-5 KDA convolution of {rows} rows needs {need} bytes of conv scratch, the arena holds {}",
+            ctx.buffers.sizes().ssm_conv_out_f32
+        );
+        Ok(ctx.buffers.ssm_conv_out_f32())
+    }
+
     pub(super) fn forward_recurrent(
         &self,
         projected: DevicePtr,
@@ -29,7 +42,7 @@ impl Glm5KdaLayer {
             ops::kda_pack_qkv(ctx.gpu, self.pack_k, projected, packed, m, p as u32, stream)?;
         }
         profile::step(ctx, stream, &mut timer, "core.pack")?;
-        let convolved = ctx.buffers.ssm_conv_out_f32();
+        let convolved = self.convolved_rows(tokens, ctx)?;
         let core_out = ctx.buffers.attn_output();
         if capture_verify_intermediates {
             self.verify_recurrent_rows(
@@ -153,7 +166,7 @@ impl Glm5KdaLayer {
             p as u32,
             stream,
         )?;
-        let convolved = ctx.buffers.ssm_conv_out_f32();
+        let convolved = self.convolved_rows(chunk + owners.len() * rows, ctx)?;
         let core_out = ctx.buffers.attn_output();
         self.owner_recurrent_rows(
             packed, convolved, g1, beta, core_out, chunk, owners, rows, ctx, stream,
@@ -415,7 +428,7 @@ impl Glm5KdaLayer {
             p as u32,
             stream,
         )?;
-        let convolved = ctx.buffers.ssm_conv_out_f32();
+        let convolved = self.convolved_rows(owners.len() * rows, ctx)?;
         let core_out = ctx.buffers.attn_output();
         self.owner_recurrent_rows(
             packed, convolved, g1, beta, core_out, 0, owners, rows, ctx, stream,

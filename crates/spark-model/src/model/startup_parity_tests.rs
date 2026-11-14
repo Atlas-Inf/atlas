@@ -321,6 +321,7 @@ fn the_table_carries_each_setting_once() {
         "ATLAS_KDA_FLASH_LIBRARY",
         "ATLAS_GLM_HC_PREFILL_FUSE2",
         "ATLAS_GLM_SP_GATHER_OVERLAP",
+        "ATLAS_GLM_SP_QUANT_GATHER_PAIR",
         "ATLAS_GLM_INDEX_SPLIT",
         "ATLAS_GLM_INDEX_SPLIT_MIN_CTX",
         "ATLAS_GLM_INDEX_SPLIT_CHECK",

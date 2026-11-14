@@ -90,6 +90,11 @@ pub(crate) const SETTINGS_TAIL: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_GLM_SP_GATHER_OVERLAP", || {
         Ok(crate::layers::glm_sp_overlap::requested_blocks() as u64)
     }),
+    // The pair's quantized SP gathers: what each exchange carries, and (2)
+    // the rows of a prefill chunk.
+    ("ATLAS_GLM_SP_QUANT_GATHER_PAIR", || {
+        Ok(crate::layers::glm_sp::quant_gather_pair() as u64)
+    }),
     ("ATLAS_QWEN4EXP_EXACT_VERIFY_CHECK", || {
         Ok(qwen4exp_exact_verify::check_requested() as u64)
     }),

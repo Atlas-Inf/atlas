@@ -430,7 +430,7 @@ pub fn build_model(
              or use a checkpoint that ships an MTP head (e.g. `mtp.safetensors`)."
         );
     }
-    let vision_encoder = loader.load_vision_encoder(&store, &config, gpu.as_ref())?;
+    let mut vision_encoder = loader.load_vision_encoder(&store, &config, gpu.as_ref())?;
 
     // If the checkpoint's `quantization_config.ignore_modules` lists MTP
     // (e.g. Sehyo/Qwen3.5-35B-A3B-NVFP4 ignores `mtp.*`), the MTP weights
@@ -549,6 +549,19 @@ pub fn build_model(
         max_batch_size,
         gpu.as_ref(),
     )?;
+    // The arena sized the mHC highway from `config.hc_highway_bf16`; the
+    // kernels read it in the format `hc_elem_bytes` names. A highway smaller
+    // than they read would be written past its end.
+    let highway = max_batch_tokens
+        * config.hc_mult.max(config.hc_count)
+        * config.hidden_size
+        * crate::layers::ops::hc_elem_bytes(&config.model_type);
+    anyhow::ensure!(
+        highway == 0 || buffers.sizes().hc_streams >= highway,
+        "buffer arena holds a {}-byte mHC highway, the model reads {highway} \
+         (ModelConfig::hc_highway_bf16 does not match ATLAS_GLM_HC_BF16)",
+        buffers.sizes().hc_streams
+    );
     // ATLAS_GLM_PREFILL_PIPE2: the second half-chunk's arena, sized with
     // the model's before the KV pool.
     let glm_latent_tokens = (kv_dtype == spark_runtime::kv_cache::KvCacheDtype::Fp8G128
@@ -577,6 +590,30 @@ pub fn build_model(
         lm_head.weight,
         lm_head_fp8.is_none() && lm_head_nvfp4.is_none(),
     )?;
+
+    // The GLM budget tower borrows its scratch from the arena's lendable
+    // span between passes; an arena too small to lend it (a short prefill
+    // chunk) gives it an allocation of its own, before the KV pool is sized.
+    if let Some(ve) = vision_encoder.as_mut()
+        && ve.lent_scratch_bytes() > 0
+    {
+        let need = ve.lent_scratch_bytes();
+        if need <= buffers.lendable_bytes() {
+            ve.attach_lent_scratch(buffers.lend_base(), true)?;
+            tracing::info!(
+                "GLM vision scratch: {:.2} GiB lent by the arena's {:.2} GiB per-pass span",
+                need as f64 / (1u64 << 30) as f64,
+                buffers.lendable_bytes() as f64 / (1u64 << 30) as f64,
+            );
+        } else {
+            ve.attach_lent_scratch(gpu.alloc(need)?, false)?;
+            tracing::info!(
+                "GLM vision scratch: {:.2} GiB of its own (the arena lends {:.2} GiB)",
+                need as f64 / (1u64 << 30) as f64,
+                buffers.lendable_bytes() as f64 / (1u64 << 30) as f64,
+            );
+        }
+    }
 
     // ── Step 5: Size KV cache from actual free memory ──
     // MLA absorbed: cache compressed latent [kv_lora + rope] instead of expanded [nkv * hd]

@@ -103,7 +103,9 @@ fn test_buffer_arena_alloc() {
     // GGUF grouped MoE adds a moe_grouped_q8 arena buffer (06c89a33) that
     // this branch does not carry. Re-sync this count if that work is ever
     // picked.)
-    assert_eq!(gpu.alloc_count(), 31);
+    // 31 buffers, of which 15 (the lendable per-pass scratch, `lend`) are
+    // carved from one allocation: 31 - 15 + 1 = 17.
+    assert_eq!(gpu.alloc_count(), 17);
 }
 
 #[test]
@@ -193,4 +195,36 @@ fn glm_kda_skips_gdn_scratch() {
         BufferSizes::from_config(&cfg, 64, 4096, 16, 4).gdn_fla_scratch,
         0
     );
+}
+
+/// A correction-bias router never reads an FP32 input from
+/// `moe_router_in_f32` (`ATLAS_FP32_ROUTING` excludes it), so the buffer is
+/// the MoE tile-worklist scratch alone: every row's worklist, and no less
+/// than the one FP32 row a one-row arena always had.
+#[test]
+fn a_correction_bias_router_keeps_only_worklist_scratch() {
+    if std::env::var_os("ATLAS_FP32_ROUTING").is_some() {
+        return; // sized for the router input in this environment
+    }
+    let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+    cfg.model_type = "glm5_next".into();
+    cfg.hidden_size = 4096;
+    cfg.num_experts = 288;
+    cfg.num_experts_per_tok = 8;
+    cfg.moe_intermediate_size = 2048;
+    let full = |cfg: &ModelConfig, rows| {
+        BufferSizes::from_config(cfg, rows, 4096, 16, 32).moe_router_in_f32
+    };
+    assert_eq!(full(&cfg, 8196), 8196 * 4096 * 4);
+    cfg.use_routing_bias = true;
+    assert_eq!(full(&cfg, 8196), router_worklist_bytes(8196, 8, 2048));
+    assert_eq!(full(&cfg, 8196), 16 + 8196 * 8 * 16 * 8);
+    assert_eq!(full(&cfg, 1), 4096 * 4);
+    // Per-layer expert shapes: the bound is stated for one shape.
+    cfg.moe_intermediate_sizes = vec![2048];
+    assert_eq!(full(&cfg, 8196), 8196 * 4096 * 4);
+    // Another correction-bias model keeps the full size.
+    cfg.moe_intermediate_sizes.clear();
+    cfg.model_type = "deepseek_v4".into();
+    assert_eq!(full(&cfg, 8196), 8196 * 4096 * 4);
 }

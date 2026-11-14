@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! A four-rank sequence-parallel GLM MLA layer gathers its attention input
-//! already cast for the W8A8 q_a / kv_a (the chain always; the pair gathers
-//! BF16 rows).
+//! already cast for the W8A8 q_a / kv_a (the chain always; the pair under
+//! `ATLAS_GLM_SP_QUANT_GATHER_PAIR`, else it gathers BF16 rows).
 //!
 //! The attention seam all-gathers the BF16 normed rows (8 KiB a row at
 //! hidden 4096). Their readers are q_a and kv_a, whose native FP8 block
@@ -145,19 +145,18 @@ impl Qwen3AttentionLayer {
         let even = sp.rows * (sp.ranks - 1) == sp.peer_rows;
         let row_bytes = MlaCast::widths(h).map(|w| w * 2);
         let index_rows = [ctx.config.index_head_dim * 2, ctx.config.index_n_heads * 2];
-        let gathers = ctx.comm.is_some_and(|c| {
-            row_bytes
-                .iter()
-                .chain(&index_rows)
-                .all(|b| c.supports_gather_async(sp.rows * b))
-                && glm_sp_overlap::blocks(sp, ctx).is_none_or(|blocks| {
-                    blocks
-                        .iter()
-                        .all(|&(_, n)| row_bytes.iter().all(|b| c.supports_gather_async(n * b)))
-                })
-        });
+        // The chain's segment gather, or the pair's exchange.
+        let gathers = row_bytes
+            .iter()
+            .chain(&index_rows)
+            .all(|b| sp.supports_gather(sp.rows * b, ctx))
+            && glm_sp_overlap::blocks(sp, ctx).is_none_or(|blocks| {
+                blocks
+                    .iter()
+                    .all(|&(_, n)| row_bytes.iter().all(|b| sp.supports_gather(n * b, ctx)))
+            });
         let on = ctx.config.model_type == "glm5_next"
-            && sp.ranks > 2
+            && sp.quant_gathers()
             && even
             && num_tokens == total
             && !diag
