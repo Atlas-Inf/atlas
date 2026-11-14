@@ -294,7 +294,15 @@ fn dflash2_selector_topk_splits(columns: u32) -> u32 {
 /// zero), and launches sharing it must be stream-ordered.
 pub fn dflash2_selector_scratch_bytes(gamma: usize) -> usize {
     let k = super::DFLASH2_SELECTOR_WIDE_MAX_TOP_K;
-    16 + 2 * 4 * gamma * DFLASH2_SELECTOR_MAX_SPLITS * k + 4 * gamma + 2 * 4 * gamma * k
+    dflash2_selector_lists_offset(gamma, k) + 2 * 4 * gamma * k
+}
+
+/// Byte offset of the rows' merged lists (f32 values `[gamma, max_top_k]`,
+/// then u32 ids) in the scratch of a selector built for `max_top_k`
+/// candidates: past its ticket, its slice lists and the row tickets, as the
+/// kernel's `df2_sel_scratch` lays them out by its own `DF2_SEL_MAX_TOP_K`.
+pub fn dflash2_selector_lists_offset(gamma: usize, max_top_k: usize) -> usize {
+    16 + 2 * 4 * gamma * DFLASH2_SELECTOR_MAX_SPLITS * max_top_k + 4 * gamma
 }
 
 /// Bytes of `gamma` rows' top-`DFLASH2_SELECTOR_MAX_TOP_K` lists: f32 values

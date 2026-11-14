@@ -103,11 +103,12 @@ impl BlockDiffusionDraftHead {
         )?;
         gpu.synchronize(stream)?;
 
-        // The rows' merged lists: f32 values [gamma, K], then u32 ids.
-        let kmax = ops::DFLASH2_SELECTOR_MAX_TOP_K;
-        let lists_at =
-            ops::dflash2_selector_scratch_bytes(gamma) - ops::dflash2_selector_lists_bytes(gamma);
-        let mut lists = vec![0u8; ops::dflash2_selector_lists_bytes(gamma)];
+        // The rows' merged lists: f32 values [gamma, K], then u32 ids, where
+        // K is the launched selector's own cap (its scratch layout), not the
+        // widest selector's the scratch is sized for.
+        let kmax = ops::dflash2_selector_build(top_k)?.max_top_k;
+        let lists_at = ops::dflash2_selector_lists_offset(gamma, kmax);
+        let mut lists = vec![0u8; 2 * 4 * gamma * kmax];
         gpu.copy_d2h(sel.scratch.offset(lists_at), &mut lists)?;
         let mut proj = vec![0u8; gamma * rank * 2];
         gpu.copy_d2h(sel.projected, &mut proj)?;

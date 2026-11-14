@@ -85,4 +85,31 @@ mod tests {
         assert!(ensure_base_selector(32, "walk").is_err());
         assert!(ensure_base_selector(16, "walk").is_ok());
     }
+
+    /// The merged lists sit where each kernel's `df2_sel_scratch` puts them
+    /// (u32 words: 4 ticket, 2 * gamma * SPLITS * K slice lists, gamma row
+    /// tickets), by the launched build's own K, and the shared scratch holds
+    /// the widest build's lists exactly.
+    #[test]
+    fn merged_lists_follow_each_builds_own_layout() {
+        for gamma in [8, 16, 32] {
+            for b in [DFLASH2_SELECTOR_BASE, DFLASH2_SELECTOR_WIDE] {
+                let k = b.max_top_k;
+                let words = 4 + 2 * gamma * super::super::DFLASH2_SELECTOR_MAX_SPLITS * k + gamma;
+                assert_eq!(
+                    super::super::dflash2_selector_lists_offset(gamma, k),
+                    4 * words
+                );
+                assert!(
+                    super::super::dflash2_selector_lists_offset(gamma, k) + 8 * gamma * k
+                        <= super::super::dflash2_selector_scratch_bytes(gamma)
+                );
+            }
+            let w = DFLASH2_SELECTOR_WIDE.max_top_k;
+            assert_eq!(
+                super::super::dflash2_selector_lists_offset(gamma, w) + 8 * gamma * w,
+                super::super::dflash2_selector_scratch_bytes(gamma)
+            );
+        }
+    }
 }
