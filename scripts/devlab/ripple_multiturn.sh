@@ -20,7 +20,6 @@ PORT=18087
 run_serve() { # $1 = tag, $2 = PREFIX_CACHE value
   local ENV=(GPU_UTIL=${GPU_UTIL:-0.95} MAX_SEQ_LEN=8192 MAX_BATCH=1 ATLAS_KV_EXTERNAL_RESERVE_GB=0 PREFIX_CACHE=$2) extra=()
   [ "$ARM" = dflash ] && ENV+=(DFLASH=1 DRAFT_MODEL="$DM") && extra=(--dflash-window-size 16384)
-  [ "$2" = 1 ] && extra+=(--enable-prefix-caching)
   ( exec env RUST_LOG=info ATLAS_BIN="$PWD/target/release/spark" PORT=$PORT HOST=127.0.0.1 MODEL_NAME=m "${ENV[@]}" \
       ./serve-amd.sh "$RM" "${extra[@]}" --request-timeout 0 ) > "$OUT/serve-$1.log" 2>&1 &
   SPID=$!
