@@ -140,9 +140,9 @@ void m32_deepk(const __nv_bfloat16* __restrict__ A_, const unsigned char* __rest
 
 int main() {
     struct S { const char* name; unsigned M, N, K; } shapes[] = {
-        {"27B gate/up M40", 40, 17408, 5120}, {"27B gate/up M56", 56, 17408, 5120}, {"27B gate/up M64", 64, 17408, 5120},
-        {"27B down M40", 40, 5120, 17408}, {"27B down M56", 56, 5120, 17408}, {"27B down M64", 64, 5120, 17408},
-        {"Ripple gate/up M56", 56, 40960, 5120}, {"Ripple down M56", 56, 5120, 40960}, {"27B gate/up M17", 17, 17408, 5120}};
+        {"27B gate/up M68", 68, 17408, 5120}, {"27B gate/up M96", 96, 17408, 5120}, {"27B gate/up M128", 128, 17408, 5120},
+        {"27B gate/up M236", 236, 17408, 5120}, {"27B down M68", 68, 5120, 17408}, {"27B down M96", 96, 5120, 17408},
+        {"27B down M128", 128, 5120, 17408}, {"27B down M236", 236, 5120, 17408}, {"27B qkv M68", 68, 5120, 5120}};
     struct V { const char* name; int mt, nt; void (*f)(const __nv_bfloat16*, const unsigned char*, const unsigned char*, float, __nv_bfloat16*, unsigned, unsigned, unsigned); };
     V vs[] = {{"m128_f16a (ship)", 128, 128, w4a16_gemm_t_m128_f16a},
               {"m32 n64 KS4", 32, 64, m32_deepk<32, 64, 4>}, {"m32 n128 KS1", 32, 128, m32_deepk<32, 128, 1>},

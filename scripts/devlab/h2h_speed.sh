@@ -80,10 +80,12 @@ llamacpp)
   llama_up $PORT "$SESSIONS" "$CONTEXT" "$Q4"; bench_arm llamacpp_q4
   "$LB/llama-bench" -m "$Q4" -ngl 99 -p 2048 -n 128 -r 2 -o md 2>"$OUT/bench-q4.err" | tee -a "$RES" || tail -3 "$OUT/bench-q4.err" | tee -a "$RES" ;;
 haloloom)   # HaloLoom (Hyperloom's Strix Halo packaging) out of the box: its vLLM image on NVIDIA's NVFP4 checkpoint
-  NV=$(hf_get "$NVFP4_REPO" "*" "") || { log "NVFP4 DOWNLOAD FAILED"; exit 1; }
-  log "haloloom serving $NVFP4_REPO ($(du -shL "$NV" | cut -f1))"
-  haloloom_up $PORT "$NVFP4_REPO" "$SESSIONS" "$CONTEXT" || exit 1
-  bench_arm haloloom_vllm_nvfp4 "${CS:-1,4,8}" 1440 ;;
+  # HL_MODEL overrides the checkpoint: its vLLM cannot run NVIDIA's NVFP4 27B on gfx1151 (torch._scaled_mm on the
+  # ModelOpt FP8 layers: "only supported on ... ROCm MI300+", run 43578147604), so BF16 Qwen/Qwen3.8-27B is the fair arm.
+  HM=${HL_MODEL:-$NVFP4_REPO}; NV=$(hf_get "$HM" "" "") || { log "$HM DOWNLOAD FAILED: $(tail -2 "$OUT/download.log")"; exit 1; }
+  log "haloloom serving $HM ($(du -shL "$NV" | cut -f1))"
+  haloloom_up $PORT "$HM" "$SESSIONS" "$CONTEXT" || exit 1
+  bench_arm "haloloom_vllm_$(basename "$HM" | tr 'A-Z.-' 'a-z__')" "${CS:-1,4,8}" 1440 ;;
 halogen)
   [ "$MK" = fnext ] || { log "halogen serves Flash-Next only"; exit 1; }
   docker pull -q "ghcr.io/peonist-ai/halogen-flash-server:${HALOGEN_TAG:-0.20.1}" > "$OUT/pull.log" 2>&1 || { log "PULL FAILED: $(tail -2 "$OUT/pull.log")"; exit 1; }
