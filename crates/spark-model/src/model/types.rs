@@ -97,6 +97,8 @@ pub struct TransformerModel {
     pub(super) lm_head_fp8: Option<Fp8DenseWeight>,
     /// Score passes' host copies of BF16 LM-head rows (bounded).
     pub(super) score_head_rows: super::trait_impl::prefill_b::score_head::HeadRows,
+    /// Score passes' held knowledge packs (`score_pack.rs`).
+    pub(super) score_packs: super::trait_impl::prefill_b::score_pack::ScorePacks,
     pub(super) layers: Vec<Box<dyn TransformerLayer>>,
     pub(super) buffers: BufferArena,
     /// `ATLAS_GLM_PREFILL_PIPE2`: the second half-chunk's arena and stream
@@ -661,6 +663,8 @@ impl TransformerModel {
 
         attempt("native MTP prefixes", self.clear_native_mtp_prefix());
         self.score_head_rows.clear();
+        // Packs hold KV blocks and SSM slots: return them before the pools go.
+        attempt("score packs", self.score_packs_release());
         attempt("derived weights", self.derived.release(gpu));
         attempt("ssm snapshots", self.ssm_snapshots.release(gpu));
         // The pool is Arc'd because slots are handed out to sequences. A live
