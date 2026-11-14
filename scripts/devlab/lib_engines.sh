@@ -14,6 +14,8 @@ model_spec() {
     27b)   Q4_REPO=unsloth/Qwen3.8-27B-GGUF; Q4_PAT=Qwen3.8-27B-UD-Q4_K_XL.gguf; Q4_REV=""
            DRAFT_REPO=z-lab/Qwen3.8-27B-DFlash2-GGUF; DRAFT_PAT=Qwen3.8-27B-DFlash2-Q4_K_M.gguf
            NVFP4_REPO=nvidia/Qwen3.8-27B-NVFP4 ;;
+    ripple) Q4_REPO=${RIPPLE_GGUF_REPO:-AtomicChat/Ripple-65B-Preview-GGUF}; Q4_PAT=${RIPPLE_GGUF_PAT:-"*Q4_K_M*.gguf"}; Q4_REV=""
+           DRAFT_REPO=""; DRAFT_PAT=""; NVFP4_REPO=ricursiveAI/Ripple-65B-Preview-NVFP4 ;;   # community GGUF (llama.cpp's Ripple port)
     fnext) Q4_REPO=unsloth/Qwen3.8-Flash-Next-GGUF; Q4_PAT="UD-Q4_K_XL/*"; Q4_REV=38bb39ee97821de2c9009abb7e93950eec396e66
            DRAFT_REPO=""; DRAFT_PAT=""; NVFP4_REPO=nvidia/Qwen3.8-Flash-Next-NVFP4 ;;
     *) log "unknown model key $1"; return 1 ;;
