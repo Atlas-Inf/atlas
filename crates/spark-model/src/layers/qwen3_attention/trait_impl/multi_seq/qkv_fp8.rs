@@ -4,8 +4,8 @@
 //! weight pass per launch of [`ops::fp8_rows_plan`]. Up to 4 rows that is one
 //! `w8a16_gemv_batch4`, whose rows are serial decode's `w8a16_gemv` bytes, so
 //! the K=2/3/4 verify is exact (`model/exact_verify.rs`). Past 16 rows the
-//! plan chunks by 16 on NVIDIA under `ATLAS_DENSE_NATIVE_FP8_ATTN`; without
-//! it, and on HIP, those widths keep the per-row loop.
+//! plan chunks by 16 on NVIDIA under `ATLAS_DENSE_NATIVE_FP8_ATTN` (without it,
+//! the per-row loop); on HIP it runs 8-row slices past 8 rows.
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
@@ -15,6 +15,12 @@ use crate::layer::ForwardContext;
 use crate::layers::ops;
 use crate::layers::qwen3_attention::Qwen3AttentionLayer;
 use crate::weight_map::Fp8Weight;
+
+/// `ATLAS_HIP_FP8_WIDE_ROWS=0` keeps gfx1151's per-row loop past 8 rows (A/B).
+fn hip_wide_rows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_HIP_FP8_WIDE_ROWS").as_deref() != Ok("0"))
+}
 
 impl Qwen3AttentionLayer {
     /// The multi-row FP8 launches for `n` rows, `None` where the caller keeps
@@ -31,6 +37,22 @@ impl Qwen3AttentionLayer {
             batch8_dyn_vl2_n2: self.w8a16_gemv_batch8_dyn_vl2_n2_k,
             batch16: self.w8a16_gemv_batch16_k,
         };
+        if cfg!(atlas_hip) && n > 8 && hip_wide_rows() {
+            // gfx1151: 8-row slices on the batch-8 tiers (each row byte-identical to
+            // serial `w8a16_gemv`) instead of one `w8a16_gemv` per row. A C=4 27B
+            // DFlash2 verify (36 rows) re-read every q/k/v/o weight 36 times:
+            // per-row `w8a16_gemv` was 20% of decode GPU time (rocprof 43627623271).
+            let mut plan = Vec::with_capacity(n.div_ceil(8));
+            for first in (0..n).step_by(8) {
+                let rows = (n - first).min(8);
+                let slice = ops::fp8_rows_plan(rows, false, ops::gemv_vl2_enabled(), kernels)?;
+                plan.extend(slice.into_iter().map(|mut l| {
+                    l.first += first;
+                    l
+                }));
+            }
+            return Some(plan);
+        }
         let wide = !cfg!(atlas_hip) && fwd.levers.dense_native_fp8_attn;
         ops::fp8_rows_plan(n, wide, ops::gemv_vl2_enabled(), kernels)
     }
