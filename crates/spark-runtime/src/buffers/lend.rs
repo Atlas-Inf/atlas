@@ -119,7 +119,7 @@ impl BufferArena {
     }
 
     /// Lend `bytes` of the span past the members `zero_all` never zeroes
-    /// ([`UNZEROED`]), for a borrower that keeps using one of those members
+    /// (`UNZEROED`), for a borrower that keeps using one of those members
     /// as the arena's own (the mHC prewarm's activation beside its scratch in
     /// `gate_logits_f32`). As [`Self::lend`]; give it back with
     /// [`Self::return_lent_tail`].
