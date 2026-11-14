@@ -854,6 +854,21 @@ pub fn w8a16_gemm_n_m128(
     if super::hip_fp8_blas::try_w8a16_n(gpu, input, weight, block_scale, output, m, n, k, stream)? {
         return Ok(());
     }
+    // gfx1151 score / verify passes (M <= 64): the bit-identical small-M twins.
+    #[cfg(atlas_hip)]
+    if super::hip_w8a16_small_m::try_w8a16_n(
+        gpu,
+        input,
+        weight,
+        block_scale,
+        output,
+        m,
+        n,
+        k,
+        stream,
+    )? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
         .block([256, 1, 1])

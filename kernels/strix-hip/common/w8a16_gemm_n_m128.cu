@@ -258,3 +258,132 @@ void w8a16_gemm_n_m128(
             if (r < M && c < N) C[(unsigned long long)r * N + c] = __float2bfloat16(acc[nb][e]);
         }
 }
+
+// ── Small-M twins (score / verify passes, M <= 64) ─────────────────────────
+// w8a16_gemm_n_m128 launches ceil(N/128) CTAs per 128 rows, mostly padding at
+// M <= 64, and walks K one 32-step per barrier: 20-50 GB/s on gfx1151 at the
+// 27B FP8 shapes. These twins tile MT (32 or 64) rows x 64 cols over 128
+// threads and stage KS 32-K steps per barrier. A is the same bf16, B is the
+// same bf16(e4m3 * block_scale), and every output sees the same 16x16x16 bf16
+// WMMAs in the same k order, so the output is BIT-IDENTICAL to n_m128.
+// kbench_w8m32 (devlab 43500936821 / 43501707216, 0 differing outputs across
+// 7 shapes x M 17/56/140): M17 1.5-2.2x (m32 KS4), M56 1.2-1.7x (m64 KS4).
+// Grid: (ceil(N/64), ceil(M/MT), 1)  Block: (128, 1, 1)
+template <int MT, int NT, int KS>
+__device__ __forceinline__ void w8m32_body(const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B,
+    const float* __restrict__ block_scale, __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K) {
+    constexpr int NBW = NT / 64;            // 16-col tiles per warp
+    constexpr int BPT = NT / 64;            // B uint4 per thread per step (NT x 32 bytes / 16 / 128)
+    constexpr int RB = MT / 16;             // 16-row bands (every warp covers all of them)
+    constexpr int APT = MT / 32;            // A uint4 per thread per step (MT x 32 bf16 / 8 / 128)
+    const unsigned int cta_n = blockIdx.x * NT, cta_m = blockIdx.y * MT;
+    if (cta_m >= M) return;
+    const unsigned int warp_id = threadIdx.x >> 5, lane_id = threadIdx.x & 31;
+    __shared__ __align__(16) __nv_bfloat16 sA[KS][MT][W8N128_KSTEP + W8N128_APAD];
+    __shared__ __align__(16) __nv_bfloat16 sB[KS][NT][W8N128_KSTEP + W8N128_BPAD];
+    v8f acc[RB][NBW];
+    #pragma unroll
+    for (int r = 0; r < RB; r++)
+        #pragma unroll
+        for (int j = 0; j < NBW; j++) acc[r][j] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
+    const unsigned int a_row = threadIdx.x >> 2, a_col = (threadIdx.x & 3) << 3;
+    const unsigned int ksb = (K + W8N128_FP8B - 1) / W8N128_FP8B, n_block = cta_n >> 7;
+    auto load = [&](unsigned int kb, uint4 (&ra)[APT], uint4 (&rb)[BPT], float& rs) {
+        #pragma unroll
+        for (int q = 0; q < APT; q++) {
+        const unsigned int gr = cta_m + a_row + q * 32, gc = kb + a_col;
+        if (gr < M && gc + 7 < K && (K & 7) == 0) ra[q] = *(const uint4*)&A[(unsigned long long)gr * K + gc];
+        else { union { __nv_bfloat16 h[8]; uint4 v; } u;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) u.h[i] = (gr < M && gc + i < K) ? A[(unsigned long long)gr * K + gc + i] : __float2bfloat16(0.0f);
+            ra[q] = u.v; }
+        }
+        #pragma unroll
+        for (int u4 = 0; u4 < BPT; u4++) {
+            const unsigned int id = threadIdx.x + u4 * 128, gn = cta_n + (id >> 1), gk = kb + ((id & 1) << 4);
+            if (gn < N && gk + 15 < K && (K & 15) == 0) rb[u4] = *(const uint4*)&B[(unsigned long long)gn * K + gk];
+            else { union { unsigned char b[16]; uint4 v; } u;
+                #pragma unroll
+                for (int i = 0; i < 16; i++) u.b[i] = (gn < N && gk + i < K) ? B[(unsigned long long)gn * K + gk + i] : 0;
+                rb[u4] = u.v; }
+        }
+        rs = (kb < K) ? block_scale[(unsigned long long)n_block * ksb + (kb >> 7)] : 0.0f;
+    };
+    auto store = [&](int s, const uint4 (&ra)[APT], const uint4 (&rb)[BPT], float rs) {
+        #pragma unroll
+        for (int q = 0; q < APT; q++) *(uint4*)&sA[s][a_row + q * 32][a_col] = ra[q];
+        #pragma unroll
+        for (int u4 = 0; u4 < BPT; u4++) {
+            const unsigned int id = threadIdx.x + u4 * 128, n = id >> 1, ko = (id & 1) << 4;
+            union { __nv_bfloat16 h[16]; uint4 v[2]; } u;
+            const unsigned int rw[4] = {rb[u4].x, rb[u4].y, rb[u4].z, rb[u4].w};
+            #pragma unroll
+            for (int i = 0; i < 16; i++) u.h[i] = __float2bfloat16(w8n128_e4m3((unsigned char)((rw[i >> 2] >> ((i & 3) * 8)) & 0xFFu)) * rs);
+            *(uint4*)&sB[s][n][ko] = u.v[0];
+            *(uint4*)&sB[s][n][ko + 8] = u.v[1];
+        }
+    };
+    auto compute = [&](int s) {
+        const unsigned int r0 = lane_id & 15;
+        #pragma unroll
+        for (int h = 0; h < 2; h++) {
+            #pragma unroll
+            for (int j = 0; j < NBW; j++) {
+                const unsigned int nc = (warp_id * NBW + j) * 16 + (lane_id & 15);
+                v16bf b;
+                memcpy(&b, &sB[s][nc][h * 16], 32);
+                #pragma unroll
+                for (int rt = 0; rt < RB; rt++) {
+                    v16bf a;
+                    memcpy(&a, &sA[s][rt * 16 + r0][h * 16], 32);
+                    acc[rt][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc[rt][j]);
+                }
+            }
+        }
+    };
+    uint4 ra[KS][APT], rb[KS][BPT]; float rs[KS];
+    #pragma unroll
+    for (int s = 0; s < KS; s++) load(s * W8N128_KSTEP, ra[s], rb[s], rs[s]);
+    #pragma unroll
+    for (int s = 0; s < KS; s++) store(s, ra[s], rb[s], rs[s]);
+    __syncthreads();
+    unsigned int k_cur = 0;
+    for (unsigned int kb = KS * W8N128_KSTEP; kb < K; kb += KS * W8N128_KSTEP) {
+        #pragma unroll
+        for (int s = 0; s < KS; s++) load(kb + s * W8N128_KSTEP, ra[s], rb[s], rs[s]);
+        #pragma unroll
+        for (int s = 0; s < KS; s++) compute(s);
+        __syncthreads();
+        #pragma unroll
+        for (int s = 0; s < KS; s++) store(s, ra[s], rb[s], rs[s]);
+        __syncthreads();
+        k_cur = kb;
+    }
+    #pragma unroll
+    for (int s = 0; s < KS; s++)
+        if (k_cur + s * W8N128_KSTEP < K) compute(s);
+    #pragma unroll
+    for (int rt = 0; rt < RB; rt++)
+        #pragma unroll
+        for (int j = 0; j < NBW; j++)
+            #pragma unroll
+            for (int e = 0; e < 8; e++) {
+                const unsigned int r = cta_m + rt * 16 + 2 * e + (lane_id >> 4);
+                const unsigned int c = cta_n + (warp_id * NBW + j) * 16 + (lane_id & 15);
+                if (r < M && c < N) C[(unsigned long long)r * N + c] = __float2bfloat16(acc[rt][j][e]);
+            }
+}
+
+extern "C" __global__ __launch_bounds__(128) void w8a16_gemm_n_m32(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B,
+    const float* __restrict__ block_scale, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K) {
+    w8m32_body<32, 64, 4>(A, B, block_scale, C, M, N, K);
+}
+
+extern "C" __global__ __launch_bounds__(128) void w8a16_gemm_n_m64(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B,
+    const float* __restrict__ block_scale, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K) {
+    w8m32_body<64, 64, 4>(A, B, block_scale, C, M, N, K);
+}
