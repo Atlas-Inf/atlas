@@ -97,10 +97,11 @@ fn record_m32_twins(gpu: &dyn GpuBackend, m128_twin: KernelHandle) {
 /// one (27B gate/up 17408x5120 M56 KS1 411 vs KS2 442 us).
 const M64_K2_MIN_K: u32 = 8192;
 
-/// `ATLAS_W4A16_M64=0` keeps M 33..64 on m128_f16a (A/B kill switch).
+/// `ATLAS_W4A16_M64_TWIN=0` keeps M 33..64 on m128_f16a (A/B kill switch;
+/// `ATLAS_W4A16_M64` is an unrelated dense-FFN opt-in).
 fn m64_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ATLAS_W4A16_M64").as_deref() != Ok("0"))
+    *ON.get_or_init(|| std::env::var("ATLAS_W4A16_M64_TWIN").as_deref() != Ok("0"))
 }
 
 /// Narrow N takes the 64-column tile: at N = 5120 the 128-column tile is only
