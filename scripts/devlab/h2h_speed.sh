@@ -41,6 +41,9 @@ atlas)
     && { [ "$MK" != fnext ] || curl -fsSL -C - --retry 5 --retry-all-errors -o "$NV/$BIG" "${HF_ENDPOINT:-https://huggingface.co}/$NVFP4_REPO/resolve/main/$BIG" 2>>"$OUT/download.log"; } \
     || { log "NVFP4 DOWNLOAD FAILED: $(grep -av "^ " "$OUT/download.log" | tail -8)"; exit 1; }
   log "atlas $(git rev-parse --short=9 HEAD), $NVFP4_REPO ($(du -shL "$NV" | cut -f1))"
+  # DFLASH=1: Atlas's DFlash2 leg (serve-amd.sh's default drafter), fetched up front; the runner serves offline.
+  if [ "${DFLASH:-0}" = 1 ]; then DRAFT_MODEL=$(hf_get "${ATLAS_DRAFT_REPO:-incoai/Qwen3.8-27B-DFlash2}" "" "") \
+      || { log "DRAFT DOWNLOAD FAILED: $(tail -2 "$OUT/download.log")"; exit 1; }; export DRAFT_MODEL; log "atlas DFlash2 drafter $DRAFT_MODEL"; fi
   AENV=(GPU_UTIL=${GPU_UTIL:-0.70} MAX_SEQ_LEN=32768 ATLAS_KV_EXTERNAL_RESERVE_GB=0)
   if [ "${PROF:-0}" = 1 ]; then   # PROF=1: only the b8 arm at C4 (the Flash-Next batched-MTP-verify collapse), under rocprofv3
     command -v rocprofv3 >/dev/null || PATH=$PATH:/opt/rocm/bin; W="$OUT/spark-prof"; mkdir -p "$OUT/prof"
