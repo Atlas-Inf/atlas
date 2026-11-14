@@ -125,7 +125,7 @@ fn load_attention(
     ffn: FfnComponent,
     kv_dtype: KvCacheDtype,
     i: usize,
-    fp8_sim: Option<KernelHandle>,
+    fp8_sim: Option<(KernelHandle, bool)>,
 ) -> Result<Qwen3AttentionLayer> {
     let p = format!("{lp}.self_attn");
     let (h, hd) = (config.hidden_size, config.head_dim);
@@ -194,38 +194,56 @@ fn load_attention(
 
 const FP8_SIM: &str = "ATLAS_RIPPLE_ATTN_FP8_SIM";
 
-/// Opt-in accuracy slice of FP8 attention (`ATLAS_RIPPLE_ATTN_FP8_SIM=1`):
+/// Opt-in accuracy slice of FP8 attention (`ATLAS_RIPPLE_ATTN_FP8_SIM=1`, or
+/// `=g128` for one scale per row per 128-wide K group):
 /// every BF16 attention projection (q|gate, k, v, o) is round-tripped through
 /// per-row E4M3 in place at load, so ST-995 can price FP8 attention before the
 /// FP8 kernels are wired in. Bytes and speed are unchanged; it changes numerics,
 /// so it stays off by default.
-fn fp8_sim_kernel(gpu: &dyn GpuBackend) -> Result<Option<KernelHandle>> {
-    if std::env::var(FP8_SIM).as_deref() != Ok("1") {
-        return Ok(None);
-    }
-    let k = gpu.kernel("attn_fp8_sim", "fp8_rowscale_roundtrip")?;
+fn fp8_sim_kernel(gpu: &dyn GpuBackend) -> Result<Option<(KernelHandle, bool)>> {
+    let g128 = match std::env::var(FP8_SIM).as_deref() {
+        Ok("1") => false,
+        Ok("g128") => true,
+        _ => return Ok(None),
+    };
+    let name = if g128 {
+        "fp8_g128_roundtrip"
+    } else {
+        "fp8_rowscale_roundtrip"
+    };
+    let k = gpu.kernel("attn_fp8_sim", name)?;
     ensure!(
         k.0 != 0,
-        "{FP8_SIM}=1 but this kernel target has no fp8_rowscale_roundtrip"
+        "{FP8_SIM} is set but this kernel target has no {name}"
     );
+    let granularity = if g128 {
+        "per-row x 128-K group"
+    } else {
+        "per-row"
+    };
     tracing::info!(
-        "{FP8_SIM}=1: attention q|gate/k/v/o round-tripped through per-row FP8 E4M3 at load"
+        "{FP8_SIM}: attention q|gate/k/v/o round-tripped through {granularity} FP8 E4M3 at load"
     );
-    Ok(Some(k))
+    Ok(Some((k, g128)))
 }
 
 fn fp8_roundtrip(
     gpu: &dyn GpuBackend,
-    kern: KernelHandle,
+    (kern, g128): (KernelHandle, bool),
     w: DevicePtr,
     n: usize,
     k: usize,
 ) -> Result<()> {
     use spark_runtime::kernel_args::KernelLaunch;
     let stream = gpu.default_stream();
+    let (grid_y, block) = if g128 {
+        (k.div_ceil(128) as u32, 128)
+    } else {
+        (1, 256)
+    };
     KernelLaunch::new(gpu, kern)
-        .grid([n as u32, 1, 1])
-        .block([256, 1, 1])
+        .grid([n as u32, grid_y, 1])
+        .block([block, 1, 1])
         .arg_ptr(w)
         .arg_u32(n as u32)
         .arg_u32(k as u32)
