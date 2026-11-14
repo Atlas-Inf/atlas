@@ -697,29 +697,17 @@ impl BufferSizes {
         }
     }
 
-    /// Total bytes across all buffers.
+    /// Total bytes across all buffers: the lendable members as their one
+    /// aligned span (`lend`), the rest as allocated.
     pub fn total_bytes(&self) -> usize {
         self.hidden_states
             + self.residual
-            + self.norm_output
-            + self.qkv_output
-            + self.attn_output
             + self.gate_logits
-            + self.gate_logits_f32
-            + self.moe_router_in_f32
-            + self.moe_output
             + self.logits
-            + self.ssm_qkvz
-            + self.ssm_ba
-            + self.ssm_deinterleaved
             + self.ssm_gates
-            + self.ssm_conv_out_f32
             + self.scratch
-            + self.expert_gate_out
-            + self.expert_up_out
             + self.hc_lowrank_scratch
             + self.qsa_select_scratch
-            + self.expert_down_out
             + self.splitk_workspace
             + self.o_latent
             + self.norm_unit_w
@@ -732,14 +720,13 @@ impl BufferSizes {
             + self.ffn_act_q8
             + self.ffn_act_a
             + self.ffn_act_scale
-            + self.fp8_act
-            + self.fp8_act_scale
             + self.lora_xa
             + self.lora_delta
             + self.lora_hact
             + self.lora_seq_slot
             + self.q2_dequant_scratch
             + self.q2_act_q8
+            + super::lend::layout(&self.lent_sizes()).1
     }
 }
 
