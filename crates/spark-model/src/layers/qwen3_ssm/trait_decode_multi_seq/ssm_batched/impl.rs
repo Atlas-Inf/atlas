@@ -2,19 +2,6 @@
 
 use super::super::super::*;
 
-/// Batched-decode FP8 projections above the GEMV tiers (n > 16) on gfx1151: the
-/// block-scaled `w8a16_gemm_n_m128` route (bit-identical small-M twins for
-/// n <= 64) instead of the base `w8a16_gemm`. At C=4 with the 27B DFlash2
-/// drafter (4 x 9 rows) the base kernel was 35.7% of decode GPU time at ~5 ms
-/// per call and C4 ran at 15.9 tok/s (devlab rocprof 43616462758).
-/// `ATLAS_SSM_BATCHED_NM128=0` keeps the base kernel.
-fn use_nm128(fp8: &crate::weight_map::Fp8Weight, k: spark_runtime::gpu::KernelHandle) -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    k.0 != 0
-        && fp8.scale_format == crate::weight_map::WeightQuantFormat::Fp8BlockScaled
-        && *ON.get_or_init(|| std::env::var("ATLAS_SSM_BATCHED_NM128").as_deref() != Ok("0"))
-}
-
 fn ssm_tc_proj_min_n() -> Option<usize> {
     static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *N.get_or_init(
@@ -280,7 +267,7 @@ impl Qwen3SsmLayer {
                     h as u32,
                     stream,
                 )?;
-            } else if use_nm128(fp8, self.w8a16_gemm_n_m128_k) {
+            } else if crate::layers::qwen3_ssm::ssm_fp8_nm128(fp8, self.w8a16_gemm_n_m128_k) {
                 // gfx1151, n > 16 (C>=2 DFlash verify blocks): the n_m128 route (small-M
                 // twins for n <= 64) instead of the base kernel's strided [N,K] walk.
                 ops::w8a16_gemm_n_m128(
@@ -429,7 +416,7 @@ impl Qwen3SsmLayer {
                     value_dim as u32,
                     stream,
                 )?;
-            } else if use_nm128(fp8, self.w8a16_gemm_n_m128_k) {
+            } else if crate::layers::qwen3_ssm::ssm_fp8_nm128(fp8, self.w8a16_gemm_n_m128_k) {
                 ops::w8a16_gemm_n_m128(
                     ctx.gpu,
                     self.w8a16_gemm_n_m128_k,

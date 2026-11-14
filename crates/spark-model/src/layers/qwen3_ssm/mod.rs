@@ -482,3 +482,20 @@ mod tests;
 
 #[path = "hc.rs"]
 mod hc;
+
+/// Batched-decode FP8 projections past the GEMV tiers (multi-seq n > 16, per-seq
+/// verify num_tokens > 4) on gfx1151: the
+/// block-scaled `w8a16_gemm_n_m128` route (bit-identical small-M twins for
+/// n <= 64) instead of the base `w8a16_gemm`. At C=4 with the 27B DFlash2
+/// drafter (4 x 9 rows) the base kernel was 35.7% of decode GPU time at ~5 ms
+/// per call and C4 ran at 15.9 tok/s (devlab rocprof 43616462758).
+/// `ATLAS_SSM_BATCHED_NM128=0` keeps the base kernel.
+pub(super) fn ssm_fp8_nm128(
+    fp8: &crate::weight_map::Fp8Weight,
+    k: spark_runtime::gpu::KernelHandle,
+) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    k.0 != 0
+        && fp8.scale_format == crate::weight_map::WeightQuantFormat::Fp8BlockScaled
+        && *ON.get_or_init(|| std::env::var("ATLAS_SSM_BATCHED_NM128").as_deref() != Ok("0"))
+}

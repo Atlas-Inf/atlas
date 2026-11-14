@@ -366,6 +366,19 @@ impl Qwen3SsmLayer {
                     h as u32,
                     stream,
                 )?;
+            } else if crate::layers::qwen3_ssm::ssm_fp8_nm128(fp8, self.w8a16_gemm_n_m128_k) {
+                ops::w8a16_gemm_n_m128(
+                    ctx.gpu,
+                    self.w8a16_gemm_n_m128_k,
+                    normed,
+                    fp8.weight,
+                    fp8.row_scale,
+                    proj_dst,
+                    k,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
+                )?;
             } else {
                 ops::w8a16_gemm(
                     ctx.gpu,
@@ -1241,6 +1254,19 @@ impl Qwen3SsmLayer {
                 ops::w8a16_gemm_pipelined(
                     ctx.gpu,
                     self.w8a16_gemm_pipelined_k,
+                    normed_out_buf,
+                    fp8.weight,
+                    fp8.row_scale,
+                    out_proj_buf,
+                    k,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )?;
+            } else if crate::layers::qwen3_ssm::ssm_fp8_nm128(fp8, self.w8a16_gemm_n_m128_k) {
+                ops::w8a16_gemm_n_m128(
+                    ctx.gpu,
+                    self.w8a16_gemm_n_m128_k,
                     normed_out_buf,
                     fp8.weight,
                     fp8.row_scale,
