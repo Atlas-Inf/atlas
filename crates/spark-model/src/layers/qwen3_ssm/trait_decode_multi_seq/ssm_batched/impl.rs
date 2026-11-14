@@ -267,28 +267,11 @@ impl Qwen3SsmLayer {
                     h as u32,
                     stream,
                 )?;
-            } else if crate::layers::qwen3_ssm::ssm_fp8_nm128(fp8, self.w8a16_gemm_n_m128_k) {
-                // gfx1151, n > 16 (C>=2 DFlash verify blocks): the n_m128 route (small-M
-                // twins for n <= 64) instead of the base kernel's strided [N,K] walk.
-                ops::w8a16_gemm_n_m128(
-                    ctx.gpu,
-                    self.w8a16_gemm_n_m128_k,
-                    normed_base,
-                    fp8.weight,
-                    fp8.row_scale,
-                    deinterleaved,
-                    n as u32,
-                    qkvz_size as u32,
-                    h as u32,
-                    stream,
-                )?;
             } else {
-                ops::w8a16_gemm(
-                    ctx.gpu,
-                    self.w8a16_gemm_k,
+                self.ssm_fp8_gemm(
+                    ctx,
                     normed_base,
-                    fp8.weight,
-                    fp8.row_scale,
+                    fp8,
                     deinterleaved,
                     n as u32,
                     qkvz_size as u32,
@@ -416,26 +399,11 @@ impl Qwen3SsmLayer {
                     value_dim as u32,
                     stream,
                 )?;
-            } else if crate::layers::qwen3_ssm::ssm_fp8_nm128(fp8, self.w8a16_gemm_n_m128_k) {
-                ops::w8a16_gemm_n_m128(
-                    ctx.gpu,
-                    self.w8a16_gemm_n_m128_k,
-                    normed_out_base,
-                    fp8.weight,
-                    fp8.row_scale,
-                    ssm_out_base,
-                    n as u32,
-                    h as u32,
-                    value_dim as u32,
-                    stream,
-                )?;
             } else {
-                ops::w8a16_gemm(
-                    ctx.gpu,
-                    self.w8a16_gemm_k,
+                self.ssm_fp8_gemm(
+                    ctx,
                     normed_out_base,
-                    fp8.weight,
-                    fp8.row_scale,
+                    fp8,
                     ssm_out_base,
                     n as u32,
                     h as u32,
