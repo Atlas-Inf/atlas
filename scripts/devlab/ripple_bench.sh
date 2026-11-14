@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # DevLab Strix bench: Ripple-65B (#334, the strix-hip port) on the runner -- boot, greedy probe, speed.
 #
-#   scripts/devlab/ripple_bench.sh [KEY=VAL ...]     KEYS: GPU_UTIL (0.90), ARMS ("dflash ar"), MAX_SEQ_LEN (8192)
+#   scripts/devlab/ripple_bench.sh [KEY=VAL ...]     KEYS: GPU_UTIL (0.90), ARMS ("dflash ar"), MAX_SEQ_LEN (8192), EXTRA (a,b serve args)
 # arms:  dflash  ricursiveAI/Ripple-65B-Preview-NVFP4 + its DFlash2 drafter (the framework f263/f264 recipe, MAX_BATCH 1,
 #                --dflash-window-size 16384); ar  the same checkpoint with no drafter.
 # Each arm: a 3-prompt greedy probe (outputs kept, compared across arms: DFlash2 is output-preserving at greedy), then
@@ -36,6 +36,7 @@ PY
 for arm in ${ARMS:-dflash ar}; do
   ENV=(GPU_UTIL=${GPU_UTIL:-0.90} MAX_SEQ_LEN=${MAX_SEQ_LEN:-8192} MAX_BATCH=1 ATLAS_KV_EXTERNAL_RESERVE_GB=0)
   extra=(); [ "$arm" = dflash ] && ENV+=(DFLASH=1 DRAFT_MODEL="$DM") && extra=(--dflash-window-size 16384)
+  IFS=, read -r -a EXTRA_A <<< "${EXTRA:-}"; extra+=("${EXTRA_A[@]}")   # EXTRA=a,b: extra serve args (e.g. --enable-prefix-caching)
   ( exec env RUST_LOG=info ATLAS_BIN="$PWD/target/release/spark" PORT="$PORT" HOST=127.0.0.1 MODEL_NAME=m "${ENV[@]}" \
       ./serve-amd.sh "$RM" "${extra[@]}" --request-timeout 0 ) > "$OUT/serve-ripple-$arm.log" 2>&1 &
   APID=$!; ENGINE_ALIVE() { kill -0 "$APID" 2>/dev/null; }
