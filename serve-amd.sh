@@ -180,6 +180,8 @@ case "${PREFIX_CACHE:-auto}" in
   1) PC_ARGS=(--enable-prefix-caching) ;;
   auto) case "$MODEL" in *[Rr]ipple*|*ricursive*) PC_ARGS=(--enable-prefix-caching) ;; esac ;;
 esac
+# A caller that already passes the flag keeps its own (spark rejects it twice).
+for a in "$@"; do case "$a" in --enable-prefix-caching|--enable-prefix-caching=*) PC_ARGS=() ;; esac; done
 THINK_ARGS=()
 case "${THINKING:-}" in
   off) THINK_ARGS=(--disable-thinking) ;;
