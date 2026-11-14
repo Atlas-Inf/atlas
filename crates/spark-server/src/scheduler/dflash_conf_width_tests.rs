@@ -276,6 +276,10 @@ fn rows_are_priced_at_todays_step_cost() {
     assert!((row_ms() - 5.68).abs() < 1e-3);
     assert!(((step_ms(1, 8) - step_ms(1, 3)) / 5.0 - row_ms()).abs() < 1e-3);
     assert!(step_ms(1, 2) > step_ms(1, 3));
+    // The pair under expert TP has no slower 2-row path: 2 rows cost a row
+    // less than 3 (measured 42.0 ms against 47.4), so one draft can pay.
+    assert!((pair_step_ms(1, 3, true) - pair_step_ms(1, 2, true) - row_ms()).abs() < 1e-3);
+    assert_eq!(pair_step_ms(1, 3, true), pair_step_ms(1, 3, false));
     // Four owners: 3.2 ms an owner-row, linear (not the concave 2026-09-28
     // table, which priced deep rows too cheaply).
     assert!((step_ms(4, 5) - step_ms(4, 4) - 4.0 * 3.2).abs() < 1e-3);

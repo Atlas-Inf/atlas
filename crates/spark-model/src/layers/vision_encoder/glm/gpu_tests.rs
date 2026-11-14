@@ -60,6 +60,12 @@ fn shipped_config(depth: usize) -> atlas_core::config::VisionConfig {
 }
 
 fn tower(gpu: &dyn GpuBackend, depth: usize) -> Result<GlmVisionEncoder> {
+    tower_with(gpu, depth, false)
+}
+
+/// The same tower (same seeds, so the same weights), owning its scratch or
+/// built to borrow it (`lent`).
+fn tower_with(gpu: &dyn GpuBackend, depth: usize, lent: bool) -> Result<GlmVisionEncoder> {
     let config = shipped_config(depth);
     let (h, i, o, p) = (1024, 4096, 4096, 10240);
     let mut up = Uploader { gpu, seed: 7 };
@@ -96,7 +102,12 @@ fn tower(gpu: &dyn GpuBackend, depth: usize) -> Result<GlmVisionEncoder> {
             down_w: up.tensor(o * p, 1.0 / (p as f32).sqrt(), 0.0)?,
         },
     };
-    GlmVisionEncoder::new(Some(weights), &config, GlmCapacity::budgets(&config), gpu)
+    let capacity = GlmCapacity::budgets(&config);
+    if lent {
+        GlmVisionEncoder::new_lent(weights, &config, capacity, gpu)
+    } else {
+        GlmVisionEncoder::new(Some(weights), &config, capacity, gpu)
+    }
 }
 
 fn backend() -> Result<spark_runtime::cuda_backend::AtlasCudaBackend> {
@@ -177,5 +188,32 @@ fn the_largest_reference_sequences_encode() -> Result<()> {
             grid_h * grid_w / 4
         );
     }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a GB10 and a glm-5.3-flash kernel build"]
+fn lent_scratch_is_bit_exact_with_owned_scratch() -> Result<()> {
+    let gpu = backend()?;
+    let gpu: &dyn GpuBackend = &gpu;
+    let item = image(72, 100, 11);
+    let (reference, _) = encode(&tower(gpu, 2)?, gpu, &[&item])?;
+    let mut lent = tower_with(gpu, 2, true)?;
+    let bytes = lent.lent_bytes();
+    ensure!(bytes > 0, "a lent tower borrows its scratch");
+    // Whatever the span held before (here all-ones: BF16 NaNs) must not reach
+    // the output, and neither may the previous encode's leftovers.
+    let span = gpu.alloc(bytes)?;
+    gpu.copy_h2d(&vec![0xffu8; bytes], span)?;
+    lent.attach_lent_scratch(span, true)?;
+    ensure!(lent.borrows_arena(), "an attached span is borrowed");
+    for pass in 0..2 {
+        let (got, _) = encode(&lent, gpu, &[&item])?;
+        ensure!(
+            got == reference,
+            "lent scratch changed the output on pass {pass}"
+        );
+    }
+    gpu.free(span)?;
     Ok(())
 }

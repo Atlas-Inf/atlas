@@ -161,3 +161,20 @@ fn the_embedded_buffer_is_zeroed_whole() {
     arena.zero_dirty_over(&gpu, 0, FLOOR, MIN).unwrap();
     assert!(all_zero(&arena, &gpu));
 }
+
+/// A borrower dirtied the lent span and its return failed: the arena must
+/// not trust its dirty extent, so the next `zero_dirty` zeroes every member
+/// the span covers, not just the rows a pass noted.
+#[test]
+fn a_failed_return_of_the_lent_span_leaves_everything_to_zero() {
+    let gpu = MockGpuBackend::new();
+    let arena = arena(&gpu);
+    arena.zero_all(&gpu, 0).unwrap();
+    let bytes = arena.lendable_bytes();
+    let base = arena.lend(bytes, &gpu).unwrap();
+    gpu.memset(base, 0x5A, bytes).unwrap();
+    gpu.fail_next_memset();
+    assert!(arena.return_lent(bytes, &gpu, 0).is_err());
+    arena.zero_dirty_over(&gpu, 0, FLOOR, MIN).unwrap();
+    assert!(all_zero(&arena, &gpu));
+}
