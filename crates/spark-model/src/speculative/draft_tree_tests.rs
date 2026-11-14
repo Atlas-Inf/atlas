@@ -97,6 +97,31 @@ fn banned_and_invalid_candidates_never_enter() {
 }
 
 #[test]
+fn duplicate_candidates_merge_into_one_child() {
+    // The selector may list a token twice for one position: the tree must
+    // carry it once (siblings never share a token), with the duplicates'
+    // summed mass. 10 holds 2/(2 + e^0.5) = 0.55 against 11's 0.45, so it
+    // is the first child although each of its entries scores below 11.
+    let lat = Lattice {
+        anchor: 1,
+        ban_depth: 0,
+        end_ids: [u32::MAX; 4],
+        ids: vec![vec![10, 11, 10], vec![20, 20, 21]],
+        unary: vec![vec![0.0, 0.5, 0.0], vec![0.0, 0.0, 0.0]],
+    };
+    let mut score = |d: usize, _pred: u32| lat.unary[d].clone();
+    for rows in 2..=8 {
+        let t = best_first(&lat, rows, 100, &mut score);
+        t.validate().unwrap();
+        assert_eq!(t.tokens[1], 10, "rows {rows}");
+    }
+    let t = best_first(&lat, 16, 100, &mut score);
+    t.validate().unwrap();
+    // Root, two depth-1 children, two depth-2 children under each.
+    assert_eq!(t.rows(), 7);
+}
+
+#[test]
 fn walk_follows_branches() {
     // root -> a(1) -> c(2); root -> b(3)
     let t = DraftTree {
