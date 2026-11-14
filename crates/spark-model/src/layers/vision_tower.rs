@@ -26,6 +26,27 @@ impl VisionTower {
         }
     }
 
+    /// Bytes the native GLM tower borrows per encode (0 for any other).
+    pub fn lent_scratch_bytes(&self) -> usize {
+        match self {
+            VisionTower::Qwen(v) => v.lent_scratch_bytes(),
+            VisionTower::Radio(_) => 0,
+        }
+    }
+
+    /// See [`VisionEncoder::attach_lent_scratch`].
+    pub fn attach_lent_scratch(&mut self, base: DevicePtr, borrowed: bool) -> Result<()> {
+        match self {
+            VisionTower::Qwen(v) => v.attach_lent_scratch(base, borrowed),
+            VisionTower::Radio(_) => anyhow::bail!("the RADIO tower takes no lent scratch"),
+        }
+    }
+
+    /// Whether each encode borrows the model arena's lendable span.
+    pub fn borrows_arena(&self) -> bool {
+        matches!(self, VisionTower::Qwen(v) if v.borrows_arena())
+    }
+
     /// Whether this is the native GLM tower.
     pub fn is_glm(&self) -> bool {
         matches!(self, VisionTower::Qwen(v) if v.glm.is_some())

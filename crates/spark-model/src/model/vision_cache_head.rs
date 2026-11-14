@@ -38,7 +38,7 @@ impl TransformerModel {
             "vision items and grids disagree"
         );
         let refs: Vec<&VisionItem> = items.iter().map(|&i| &seq.vision.items[i]).collect();
-        let per_group = ve.forward_items(&refs, self.gpu.as_ref(), self.gpu.default_stream())?;
+        let per_group = self.vision_forward_items(ve, &refs, self.gpu.default_stream())?;
         // The grids were derived before the encode (the key and the worker
         // needed them); the encoder's own geometry must agree.
         let mut group = 0usize;
@@ -84,7 +84,7 @@ impl TransformerModel {
         gpu.copy_d2h(ve.out_row(), &mut window)?;
         let (mut at, mut differ) = (0usize, 0usize);
         for &i in items {
-            ve.forward_items(&[&seq.vision.items[i]], gpu, stream)?;
+            self.vision_forward_items(ve, &[&seq.vision.items[i]], stream)?;
             gpu.synchronize(stream)?;
             let mut alone = vec![0u8; count(i) * row];
             gpu.copy_d2h(ve.out_row(), &mut alone)?;
