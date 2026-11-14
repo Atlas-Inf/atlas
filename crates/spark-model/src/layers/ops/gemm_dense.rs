@@ -408,9 +408,10 @@ pub fn w4a16_gemm_n128_m128(
 ) -> Result<()> {
     log_gemm_shape(gpu, "w4a16_gemm_n128_m128", m, n, k);
     let kernel = super::m128_for_shape(kernel, n, k);
-    // Small-M verify widths: the bit-identical 32-row twin (`strix_f16.rs`).
-    let (kernel, grid) = match super::m32_for_shape(kernel, m, n) {
-        Some((k32, nt)) => (k32, [div_ceil(n, nt), div_ceil(m, 32), 1]),
+    // Small-M verify / score widths: the bit-identical 32- and 64-row twins
+    // (`strix_f16.rs`).
+    let (kernel, grid) = match super::m32_for_shape(kernel, m, n, k) {
+        Some((k32, nt, mt)) => (k32, [div_ceil(n, nt), div_ceil(m, mt), 1]),
         None => (kernel, [div_ceil(n, 128), div_ceil(m, 128), 1]),
     };
     KernelLaunch::new(gpu, kernel)

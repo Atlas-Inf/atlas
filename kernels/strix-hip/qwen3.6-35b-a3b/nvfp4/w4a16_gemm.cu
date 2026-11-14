@@ -1493,41 +1493,54 @@ void w4a16_gemm_t_m128_f16a(const __nv_bfloat16* __restrict__ A, const unsigned 
 // fc M16 718 -> 506, down M9 1143 -> 797. The wide n128 shapes are bandwidth-
 // bound already and lose occupancy to the bigger LDS (gate/up 647 -> 921 at
 // KS 4), so n128 keeps KS = 1.
-// Grid: (ceil(N/NT), ceil(M/32), 1)   Block: (128, 1, 1)
+//
+// MT (rows per CTA): 32, or 64 for M in 33..64 (score passes, short prefills).
+// Every warp covers all MT/16 row tiles of its n-blocks, so one B dequant
+// serves 64 rows; the WMMA operands and order per tile are unchanged
+// (bit-identical). gfx1151 kbench_w4m64 (0 differing outputs), m128_f16a ->
+// m64 n128: 27B gate/up 17408x5120 M56 813 -> 411 us (KS 1), 27B down
+// 5120x17408 M56 708 -> 468 us (KS 2), Ripple gate/up M56 1721 -> 923 us,
+// Ripple down M56 1690 -> 1189 us (KS 2).
+// Grid: (ceil(N/NT), ceil(M/MT), 1)   Block: (128, 1, 1)
 // ═══════════════════════════════════════════════════════════════════
-template <int NT, int KS>
+template <int MT, int NT, int KS>
 __device__ __forceinline__
 void w4a16_m32_f16a_body(const __nv_bfloat16* __restrict__ A_, const unsigned char* __restrict__ B_packed,
     const unsigned char* __restrict__ B_scale, const float scale2, __nv_bfloat16* __restrict__ C,
     unsigned int M, unsigned int N, unsigned int K) {
     constexpr int NBW = NT / 64;            // 16-col n-blocks per warp
     constexpr int TPR = NT / 16;            // threads per k-pair row of B (one uint4 = 16 columns each)
+    constexpr int RB = MT / 16;             // 16-row tiles per CTA (every warp covers all of them)
+    constexpr int APT = MT / 32;            // A uint4 loads per thread per 32-K step
     const unsigned short* A = (const unsigned short*)A_;
     const unsigned int cta_n = blockIdx.x * NT;
-    const unsigned int cta_m = blockIdx.y * 32;
+    const unsigned int cta_m = blockIdx.y * MT;
     if (cta_m >= M) return;
     const unsigned int warp_id = threadIdx.x / 32;
     const unsigned int lane_id = threadIdx.x % 32;
 
-    __shared__ __align__(16) _Float16 sA[KS][32][F16_K_STEP + F16_PAD_T];
+    __shared__ __align__(16) _Float16 sA[KS][MT][F16_K_STEP + F16_PAD_T];
     #define M32_B_OFF(n) ((n) * 40 + ((n) >> 4) * 8)
     __shared__ __align__(16) _Float16 sB[KS][M32_B_OFF(NT)];
 
-    v8f acc[2][NBW];
+    v8f acc[RB][NBW];
     #pragma unroll
-    for (int r = 0; r < 2; r++)
+    for (int r = 0; r < RB; r++)
         #pragma unroll
         for (int j = 0; j < NBW; j++) acc[r][j] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
 
-    const unsigned int a_row = threadIdx.x >> 2;          // 0..31
+    const unsigned int a_row = threadIdx.x >> 2;          // 0..31 (+32 per extra A load)
     const unsigned int a_col = (threadIdx.x & 3) << 3;
     const bool b_on = threadIdx.x < 16 * TPR;
     const unsigned int b_kp = threadIdx.x / TPR;
     const unsigned int b_ns = (threadIdx.x % TPR) << 4;
 
-    auto load = [&](unsigned int kb, uint4& ra, uint4& rb, uint4& rs) {
-        const unsigned int gr = cta_m + a_row, gc = kb + a_col;
-        ra = (gr < M && gc + 7 < K) ? *(const uint4*)&A[(unsigned long long)gr * K + gc] : uint4{0, 0, 0, 0};
+    auto load = [&](unsigned int kb, uint4 (&ra)[APT], uint4& rb, uint4& rs) {
+        #pragma unroll
+        for (int q = 0; q < APT; q++) {
+            const unsigned int gr = cta_m + a_row + q * 32, gc = kb + a_col;
+            ra[q] = (gr < M && gc + 7 < K) ? *(const uint4*)&A[(unsigned long long)gr * K + gc] : uint4{0, 0, 0, 0};
+        }
         rb = rs = uint4{0, 0, 0, 0};
         if (b_on && kb < K) {
             const unsigned int gke = kb + (b_kp << 1), gns = cta_n + b_ns;
@@ -1536,8 +1549,9 @@ void w4a16_m32_f16a_body(const __nv_bfloat16* __restrict__ A_, const unsigned ch
             if (gns + 15 < N) rs = *(const uint4*)&B_scale[(unsigned long long)sg * N + gns];
         }
     };
-    auto store = [&](int s, const uint4& ra, const uint4& rb, const uint4& rs) {
-        *(uint4*)&sA[s][a_row][a_col] = bf16x8_to_f16x8(ra);
+    auto store = [&](int s, const uint4 (&ra)[APT], const uint4& rb, const uint4& rs) {
+        #pragma unroll
+        for (int q = 0; q < APT; q++) *(uint4*)&sA[s][a_row + q * 32][a_col] = bf16x8_to_f16x8(ra[q]);
         if (!b_on) return;
         const unsigned int* pw = (const unsigned int*)&rb;
         const unsigned int* ps = (const unsigned int*)&rs;
@@ -1562,21 +1576,22 @@ void w4a16_m32_f16a_body(const __nv_bfloat16* __restrict__ A_, const unsigned ch
         const unsigned int r0 = lane_id & 15;
         #pragma unroll
         for (int h = 0; h < 2; h++) {
-            v16h a0, a1;
-            __builtin_memcpy(&a0, &sA[s][r0][h * 16], 32);
-            __builtin_memcpy(&a1, &sA[s][16 + r0][h * 16], 32);
             #pragma unroll
             for (int j = 0; j < NBW; j++) {
                 const unsigned int nc = (warp_id * NBW + j) * 16 + (lane_id & 15);
                 v16h b;
                 __builtin_memcpy(&b, &sB[s][M32_B_OFF(nc) + h * 16], 32);
-                acc[0][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b, acc[0][j]);
-                acc[1][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b, acc[1][j]);
+                #pragma unroll
+                for (int rt = 0; rt < RB; rt++) {
+                    v16h a;
+                    __builtin_memcpy(&a, &sA[s][rt * 16 + r0][h * 16], 32);
+                    acc[rt][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc[rt][j]);
+                }
             }
         }
     };
 
-    uint4 ra[KS], rb[KS], rs[KS];
+    uint4 ra[KS][APT], rb[KS], rs[KS];
     #pragma unroll
     for (int s = 0; s < KS; s++) load(s * F16_K_STEP, ra[s], rb[s], rs[s]);
     #pragma unroll
@@ -1600,7 +1615,7 @@ void w4a16_m32_f16a_body(const __nv_bfloat16* __restrict__ A_, const unsigned ch
     #undef M32_B_OFF
 
     #pragma unroll
-    for (int rt = 0; rt < 2; rt++)
+    for (int rt = 0; rt < RB; rt++)
         #pragma unroll
         for (int j = 0; j < NBW; j++)
             #pragma unroll
@@ -1615,12 +1630,26 @@ extern "C" __global__ __launch_bounds__(128)
 void w4a16_gemm_t_m32_f16a_n128(const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
     const unsigned char* __restrict__ B_scale, const float scale2, __nv_bfloat16* __restrict__ C,
     unsigned int M, unsigned int N, unsigned int K) {
-    w4a16_m32_f16a_body<128, 1>(A, B_packed, B_scale, scale2, C, M, N, K);
+    w4a16_m32_f16a_body<32, 128, 1>(A, B_packed, B_scale, scale2, C, M, N, K);
 }
 
 extern "C" __global__ __launch_bounds__(128)
 void w4a16_gemm_t_m32_f16a_n64(const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
     const unsigned char* __restrict__ B_scale, const float scale2, __nv_bfloat16* __restrict__ C,
     unsigned int M, unsigned int N, unsigned int K) {
-    w4a16_m32_f16a_body<64, 4>(A, B_packed, B_scale, scale2, C, M, N, K);
+    w4a16_m32_f16a_body<32, 64, 4>(A, B_packed, B_scale, scale2, C, M, N, K);
+}
+
+extern "C" __global__ __launch_bounds__(128)
+void w4a16_gemm_t_m64_f16a_n128(const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K) {
+    w4a16_m32_f16a_body<64, 128, 1>(A, B_packed, B_scale, scale2, C, M, N, K);
+}
+
+extern "C" __global__ __launch_bounds__(128)
+void w4a16_gemm_t_m64_f16a_n128_k2(const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K) {
+    w4a16_m32_f16a_body<64, 128, 2>(A, B_packed, B_scale, scale2, C, M, N, K);
 }

@@ -72,6 +72,10 @@ fn record_m128_pair(twin: KernelHandle, base: KernelHandle) {
 /// bit-identical to m128_f16a at a quarter of the WMMA work for M <= 32).
 static M32_TWINS: std::sync::OnceLock<(u64, u64, u64)> = std::sync::OnceLock::new();
 
+/// `(m64_f16a_n128, m64_f16a_n128_k2)`: the 64-row twins for M in 33..64
+/// (KS 1 for K <= [`M64_K2_MIN_K`], KS 2 above), recorded with the m32 twins.
+static M64_TWINS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+
 fn record_m32_twins(gpu: &dyn GpuBackend, m128_twin: KernelHandle) {
     if M32_TWINS.get().is_some() {
         return;
@@ -80,7 +84,23 @@ fn record_m32_twins(gpu: &dyn GpuBackend, m128_twin: KernelHandle) {
     let n64 = try_kernel(gpu, "w4a16", "w4a16_gemm_t_m32_f16a_n64");
     if n128.0 != 0 && n64.0 != 0 {
         let _ = M32_TWINS.set((m128_twin.0, n128.0, n64.0));
+        let m64 = try_kernel(gpu, "w4a16", "w4a16_gemm_t_m64_f16a_n128");
+        let m64k2 = try_kernel(gpu, "w4a16", "w4a16_gemm_t_m64_f16a_n128_k2");
+        if m64.0 != 0 && m64k2.0 != 0 {
+            let _ = M64_TWINS.set((m64.0, m64k2.0));
+        }
     }
+}
+
+/// Long K stages two 32-K steps per barrier on the m64 twin (gfx1151
+/// kbench_w4m64: 27B down 5120x17408 M56 KS1 572 vs KS2 468 us); short K keeps
+/// one (27B gate/up 17408x5120 M56 KS1 411 vs KS2 442 us).
+const M64_K2_MIN_K: u32 = 8192;
+
+/// `ATLAS_W4A16_M64=0` keeps M 33..64 on m128_f16a (A/B kill switch).
+fn m64_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_W4A16_M64").as_deref() != Ok("0"))
 }
 
 /// Narrow N takes the 64-column tile: at N = 5120 the 128-column tile is only
@@ -94,16 +114,30 @@ fn m32_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_W4A16_M32").as_deref() != Ok("0"))
 }
 
-/// The m32 twin and its N tile for an `m128_f16a` launch with `m <= 32` rows,
-/// or `None` (another kernel, wider M, or a target without the twins).
-pub(crate) fn m32_for_shape(kernel: KernelHandle, m: u32, n: u32) -> Option<(KernelHandle, u32)> {
+/// The small-M twin, its N tile and its M tile for an `m128_f16a` launch:
+/// the m32 twin for `m <= 32`, the m64 twin for `m` in 33..64, or `None`
+/// (another kernel, wider M, or a target without the twins).
+pub(crate) fn m32_for_shape(
+    kernel: KernelHandle,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> Option<(KernelHandle, u32, u32)> {
     let &(twin, n128, n64) = M32_TWINS.get()?;
-    if kernel.0 != twin || m > 32 || !m32_enabled() {
+    if kernel.0 != twin || !m32_enabled() {
         return None;
     }
+    if m > 32 {
+        let &(m64, m64k2) = M64_TWINS.get()?;
+        if m > 64 || !m64_enabled() {
+            return None;
+        }
+        let pick = if k > M64_K2_MIN_K { m64k2 } else { m64 };
+        return Some((KernelHandle(pick), 128, 64));
+    }
     Some(match n <= M32_N64_MAX_N {
-        true => (KernelHandle(n64), 64),
-        false => (KernelHandle(n128), 128),
+        true => (KernelHandle(n64), 64, 32),
+        false => (KernelHandle(n128), 128, 32),
     })
 }
 
