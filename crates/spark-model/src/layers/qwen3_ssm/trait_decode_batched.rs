@@ -367,12 +367,10 @@ impl Qwen3SsmLayer {
                     stream,
                 )?;
             } else {
-                ops::w8a16_gemm(
-                    ctx.gpu,
-                    self.w8a16_gemm_k,
+                self.ssm_fp8_gemm(
+                    ctx,
                     normed,
-                    fp8.weight,
-                    fp8.row_scale,
+                    fp8,
                     proj_dst,
                     k,
                     qkvz_size as u32,
@@ -1251,12 +1249,10 @@ impl Qwen3SsmLayer {
                     stream,
                 )?;
             } else {
-                ops::w8a16_gemm(
-                    ctx.gpu,
-                    self.w8a16_gemm_k,
+                self.ssm_fp8_gemm(
+                    ctx,
                     normed_out_buf,
-                    fp8.weight,
-                    fp8.row_scale,
+                    fp8,
                     out_proj_buf,
                     k,
                     h as u32,

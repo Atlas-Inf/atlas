@@ -431,6 +431,7 @@ mod ckpt_capture;
 mod debug;
 mod exact_rows;
 mod fla_dispatch;
+mod fp8_route;
 mod gdn_chunk_tc;
 mod gdn_defer;
 pub mod gdn_flags;
