@@ -9,6 +9,7 @@
 #   SSM_CKPT_INTERVAL=128 ./serve-amd.sh   # coarser SSM snapshots for long ctx
 #   THINKING=off ./serve-amd.sh            # engine thinking kill switch
 #   THINKING=on  ./serve-amd.sh            # thinking on by server default (per-request still wins)
+#   PREFIX_CACHE=1 ./serve-amd.sh          # prefix caching for any model (default: on for Ripple only)
 #
 # DFLASH=1 swaps MTP for the DFlash2 drafter: it appends --dflash
 # --draft-model (DRAFT_MODEL, default incoai/Qwen3.8-27B-DFlash2) and forces
@@ -168,6 +169,17 @@ fi
 # request; THINKING=on sets the SERVER default to thinking-enabled
 # (--default-chat-template-kwargs) while clients can still turn it off per
 # request. Unset/empty = unchanged.
+# Ripple (pure attention: sliding-window + NoPE global layers, no SSM state) reuses a cached prefix
+# directly, and nothing else turned prefix caching on here, so every turn re-prefilled the whole
+# conversation. DevLab runner, Ripple C1 at a cached depth of 4096 (+1.84k new tokens): prefill 51 ->
+# 144 tok/s (DFlash2) / 146 tok/s (AR), TTFT 35.8 -> 12.8 s, decode and greedy probes unchanged
+# (runs 43586140647 / 43586143545 vs 43578039290). PREFIX_CACHE=0 turns it off; PREFIX_CACHE=1 turns
+# it on for any model.
+PC_ARGS=()
+case "${PREFIX_CACHE:-auto}" in
+  1) PC_ARGS=(--enable-prefix-caching) ;;
+  auto) case "$MODEL" in *[Rr]ipple*|*ricursive*) PC_ARGS=(--enable-prefix-caching) ;; esac ;;
+esac
 THINK_ARGS=()
 case "${THINKING:-}" in
   off) THINK_ARGS=(--disable-thinking) ;;
@@ -232,7 +244,7 @@ exec "$BIN" serve "$MODEL" "${NAME_ARG[@]}" \
   --max-prefill-tokens "$MAX_PREFILL_TOKENS" \
   --gpu-memory-utilization "$GPU_UTIL" \
   --kv-cache-dtype bf16 --lm-head-dtype "${LM_HEAD:-nvfp4}" --max-batch-size "${MAX_BATCH:-1}" \
-  "${SPEC_ARGS[@]}" "${DFLASH_ARGS[@]}" "${THINK_ARGS[@]}" \
+  "${SPEC_ARGS[@]}" "${DFLASH_ARGS[@]}" "${THINK_ARGS[@]}" "${PC_ARGS[@]}" \
   --ssm-cache-slots "$SSM_SLOTS" --ssm-checkpoint-interval "$SSM_CKPT_INTERVAL" \
   $ALLOW_FALLBACKS \
   "$@"
