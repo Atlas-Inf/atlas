@@ -24,6 +24,12 @@
 //! Verification is exact at any width, so only the rows per step change.
 //! The drafter has already run; the cut rows are simply never launched.
 //!
+//! Where a batch may hold dead rows (the chain, and the pair under
+//! `ATLAS_GLM_PAIR_LIVE_WIDTHS`: `dflash_width::LiveLane`) each owner
+//! verifies its own number of drafts instead, admitted best survival first
+//! while the step's expected tokens per millisecond grow
+//! ([`Policy::choose_live`], [`Policy::choose_live_pair`]).
+//!
 //! The table cannot drift: every cell decays each verify of its kind back
 //! towards its confidence bin's rate over all depths (the first draft is
 //! verified at any confidence, so every bin stays observed), and every
@@ -306,7 +312,31 @@ impl Policy {
         max: usize,
         params: Params,
     ) -> Option<(usize, Vec<usize>)> {
-        use super::dflash_width::chain_step_ms_live;
+        self.choose_live_at(owners, max, params, super::dflash_width::chain_step_ms_live)
+    }
+
+    /// [`Self::choose_live`] on the pair (`ATLAS_GLM_PAIR_LIVE_WIDTHS`): the
+    /// same rule at the pair's step costs
+    /// (`dflash_pair_live::step_ms_live`).
+    pub(crate) fn choose_live_pair<'a>(
+        &mut self,
+        owners: impl ExactSizeIterator<Item = &'a [f32]> + Clone,
+        max: usize,
+        params: Params,
+    ) -> Option<(usize, Vec<usize>)> {
+        self.choose_live_at(owners, max, params, super::dflash_pair_live::step_ms_live)
+    }
+
+    /// [`Self::choose_live`] with the step cost supplied:
+    /// `step_ms_live(owners, rows, live)` is the step's milliseconds for
+    /// `owners` owners of `rows` rows each, `live` of those rows live.
+    fn choose_live_at<'a>(
+        &mut self,
+        owners: impl ExactSizeIterator<Item = &'a [f32]> + Clone,
+        max: usize,
+        params: Params,
+        step_ms_live: fn(usize, usize, usize) -> f32,
+    ) -> Option<(usize, Vec<usize>)> {
         let max = max.min(MAX_DRAFTS);
         let n = owners.len();
         if self.probe(owners.clone(), max, params)? {
@@ -325,7 +355,7 @@ impl Policy {
         let rate = |counts: &[usize], expected: f32| {
             let width = counts.iter().copied().max().unwrap_or(1);
             let live = counts.iter().sum::<usize>() + n;
-            expected / chain_step_ms_live(n, width + 1, live)
+            expected / step_ms_live(n, width + 1, live)
         };
         let mut best = (rate(&counts, expected), counts.clone());
         for (o, d) in slots {
@@ -390,15 +420,21 @@ pub(crate) fn choose<'a>(
     policy().choose(owners, max, params())
 }
 
-/// [`Policy::choose_live`] on the serving policy; `None` with the rule off.
+/// [`Policy::choose_live`] (or, on the pair, [`Policy::choose_live_pair`])
+/// on the serving policy; `None` with the rule off.
 pub(crate) fn choose_live<'a>(
     owners: impl ExactSizeIterator<Item = &'a [f32]> + Clone,
     max: usize,
+    lane: super::dflash_width::LiveLane,
 ) -> Option<(usize, Vec<usize>)> {
+    use super::dflash_width::LiveLane;
     if !enabled() {
         return None;
     }
-    policy().choose_live(owners, max, params())
+    match lane {
+        LiveLane::Chain => policy().choose_live(owners, max, params()),
+        LiveLane::Pair => policy().choose_live_pair(owners, max, params()),
+    }
 }
 
 /// Feed one owner's verify outcome to the calibration (`conf` is the

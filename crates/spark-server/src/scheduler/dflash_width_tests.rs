@@ -150,3 +150,24 @@ fn wide_batches_narrow_then_decode_plain() {
     assert_eq!(depth_for(&[(8, 7), (64, 2)], 99), 2);
     assert_eq!(parse_depths(Some("")), None);
 }
+
+#[test]
+fn a_pair_has_dead_rows_only_with_its_switch_on() {
+    // Off the chain with the switch off: no lane, and owners share a width.
+    assert_eq!(LiveLane::of(false, false), None);
+    assert_eq!(LiveLane::of(false, true), Some(LiveLane::Pair));
+    // This process is a pair (no ranks recorded): without the switch its
+    // owners are never given dead rows.
+    assert!(!on_chain());
+    if !crate::scheduler::dflash_pair_live::enabled() {
+        let (sure, unsure) = ([-0.001; 7], [-2.5; 7]);
+        let owners: [&[f32]; 2] = [&sure, &unsure];
+        assert_eq!(choose_live(owners.iter().copied(), 7), None);
+    }
+}
+
+#[test]
+fn the_chain_keeps_its_own_costs_whatever_the_pairs_switch() {
+    assert_eq!(LiveLane::of(true, false), Some(LiveLane::Chain));
+    assert_eq!(LiveLane::of(true, true), Some(LiveLane::Chain));
+}

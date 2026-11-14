@@ -151,7 +151,10 @@ fn verify_owner_batch_with(
     // ONE target traversal instead of one traversal per owner —
     // two drafts on the repaired long-context K3 lane, the most common width
     // on the DFlash lane. Everything else keeps the per-sequence path.
-    // With dead rows, each chosen owner's verified drafts (`(owner, drafts)`).
+    // With dead rows (the chain, and the pair under
+    // `ATLAS_GLM_PAIR_LIVE_WIDTHS`), each chosen owner's verified drafts
+    // (`(owner, drafts)`): at most `max` below, so a strict owner's stay
+    // within the drafts its walk kept.
     let mut live: Vec<(usize, usize)> = Vec::new();
     let adaptive_width = if dflash_verify_raw_argmax {
         let owners: Vec<usize> = serial_idxs

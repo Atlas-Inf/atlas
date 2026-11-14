@@ -43,11 +43,11 @@ pub const ROW_BUDGET: usize = 32;
 
 /// Marks a dead verify row's token: on the TP4 chain the head may verify
 /// each owner of a batch on a prefix of the batch's width, its other rows
-/// dead (`scheduler::dflash_width::choose_live`; the pair never does). The
-/// owner's verdict keeps none of its rows from there on, so the row's routed
-/// FFN is skipped (`layers::moe::DeadRows`). Rows of one owner past its
-/// first dead row are dead too. The token broadcast carries the mark to
-/// every rank.
+/// dead (`scheduler::dflash_width::choose_live`; the pair only under
+/// `ATLAS_GLM_PAIR_LIVE_WIDTHS=1`). The owner's verdict keeps none of its
+/// rows from there on, so the row's routed FFN is skipped
+/// (`layers::moe::DeadRows`). Rows of one owner past its first dead row are
+/// dead too. The token broadcast carries the mark to every rank.
 pub const DEAD_ROW: u32 = 1 << 31;
 
 /// Whether one call may verify `owners` owners of `rows` rows each within
