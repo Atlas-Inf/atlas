@@ -88,6 +88,48 @@ pub(super) struct StrictVerify {
     pub masks: Vec<u32>,
 }
 
+impl StrictVerify {
+    /// Cut the verify to its first `width` drafts and their `width + 1`
+    /// rows: an owner batch verifies one width for every owner. Row r is the
+    /// matcher state after `drafts[..r]`, so the cut rows are exactly the
+    /// walk of the shorter draft list, and the grammar is not walked again.
+    pub(super) fn truncate(&mut self, width: usize) {
+        if width < self.drafts.len() {
+            let words = self.masks.len() / (self.drafts.len() + 1);
+            self.drafts.truncate(width);
+            self.masks.truncate((width + 1) * words);
+        }
+    }
+}
+
+/// Row masks of one owner-batched verify (`ATLAS_GLM_STRICT_OWNER_BATCH`):
+/// `rows` rows of `words` words per owner, owner-major in the order the
+/// batch announces its owners. A strict owner's rows are its walk's; every
+/// other owner's rows allow everything, and the masked argmax of such a row
+/// is the plain argmax, so those owners pick what they pick unmasked.
+pub(super) fn owner_masks(
+    strict: &[Option<StrictVerify>],
+    rows: usize,
+    words: usize,
+) -> Result<Vec<u32>> {
+    let mut masks = Vec::with_capacity(strict.len() * rows * words);
+    for (owner, walk) in strict.iter().enumerate() {
+        match walk {
+            Some(walk) => {
+                ensure!(
+                    walk.drafts.len() + 1 == rows && walk.masks.len() == rows * words,
+                    "strict owner {owner} carries {} drafts and {} mask words for {rows} rows",
+                    walk.drafts.len(),
+                    walk.masks.len()
+                );
+                masks.extend_from_slice(&walk.masks);
+            }
+            None => masks.resize(masks.len() + rows * words, u32::MAX),
+        }
+    }
+    Ok(masks)
+}
+
 /// Build the verify of `drafts` for a strict sequence, or `None` when `a`
 /// has no strict grammar.
 pub(super) fn prepare(

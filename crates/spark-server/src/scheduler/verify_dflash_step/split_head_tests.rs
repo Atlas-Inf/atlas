@@ -3,7 +3,9 @@
 use crate::scheduler::cancel_test_model::{SCRIPT, Script, TestModel, VerifyScript};
 use crate::scheduler::sched_ctx::SchedCtx;
 use crate::scheduler::test_support::test_seq;
-use crate::scheduler::verify_dflash_step::{step_verify_dflash, step_verify_glm_long_with};
+use crate::scheduler::verify_dflash_step::{
+    step_verify_dflash, step_verify_glm_long_strict, step_verify_glm_long_with,
+};
 use std::sync::Arc;
 
 fn model(script: Arc<VerifyScript>) -> TestModel {
@@ -146,6 +148,41 @@ fn unsupported_owner_group_is_rejected_before_traversal() {
     );
     assert!(!traversed);
     assert!(a.finished && a.engine_error.is_some());
+}
+
+#[test]
+fn a_masked_owner_group_without_a_walk_per_owner_ends_before_any_wire_word() {
+    SCRIPT.with(|s| *s.borrow_mut() = None);
+    let script = Arc::new(VerifyScript {
+        picks: vec![10; 4],
+        owner_batch: true,
+        ..Default::default()
+    });
+    let model = model(script.clone());
+    let (mut a, _rx) = test_seq(vec![], 1, None, 8);
+    let (mut b, _rx_b) = test_seq(vec![], 1, None, 8);
+    for seq in [&mut a, &mut b] {
+        seq.finished = false;
+        seq.pending_drafts = vec![1];
+    }
+    let sched = SchedCtx::for_test();
+    let ctx = sched.verify_logits_ctx(None, None, None, None);
+    // One walk slot for two owners: the rows cannot be laid out owner by
+    // owner, so nothing is uploaded and no rank hears of the group.
+    step_verify_glm_long_strict(
+        &model,
+        &mut [&mut a, &mut b],
+        &sched,
+        1,
+        &ctx,
+        true,
+        &[],
+        &[None],
+    );
+    assert!(a.finished && a.engine_error.is_some());
+    assert!(b.finished && b.engine_error.is_some());
+    assert!(a.output_tokens.is_empty() && b.output_tokens.is_empty());
+    assert!(script.log.lock().unwrap().is_empty());
 }
 
 #[test]

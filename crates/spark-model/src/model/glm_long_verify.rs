@@ -193,6 +193,9 @@ impl TransformerModel {
         seqs: &mut [&mut SequenceState],
     ) -> Result<Vec<u32>> {
         let n = seqs.len();
+        // Taken first, so staged row masks never outlive the verify they
+        // were staged for (`glm_verify_masks`); `None` on an unmasked batch.
+        let allow = self.take_verify_row_masks(n * rows)?;
         ensure!(
             self.can_batch_glm_long_verify_impl(n, rows) && tokens.len() == n * rows,
             "GLM long owner verify refused for {n} owners x {rows} rows"
@@ -426,7 +429,7 @@ impl TransformerModel {
         )?;
         let argmax = self.buffers.scratch();
         let split =
-            self.glm_split_head_argmax(normed, total, argmax, (ban_rows, &ban), None, stream)?;
+            self.glm_split_head_argmax(normed, total, argmax, (ban_rows, &ban), allow, stream)?;
         if split && self.native_glm_mtp {
             self.glm_split_head_full_rows(total, stream)?;
         }
@@ -434,6 +437,10 @@ impl TransformerModel {
             ensure!(
                 !self.native_glm_mtp,
                 "native GLM MTP requires the MXFP8 split target head"
+            );
+            ensure!(
+                allow.is_none(),
+                "masked owner verify needs the GLM vocab-split head, which declined"
             );
             self.lm_head_batched(normed, total as u32, self.buffers.logits(), stream)?;
             let vocab = self.config.vocab_size;
@@ -465,7 +472,8 @@ impl TransformerModel {
             .collect();
         if let Some(snapshot) = snapshot {
             drop(kv_cache);
-            return self.glm_long_oracle(rows, tokens, seqs, &stage, snapshot, &ids);
+            let masked = allow.is_some();
+            return self.glm_long_oracle(rows, tokens, seqs, &stage, snapshot, &ids, masked);
         }
         for (seq, t) in seqs.iter_mut().zip(tokens.chunks_exact(rows)) {
             seq.tokens.extend_from_slice(t);

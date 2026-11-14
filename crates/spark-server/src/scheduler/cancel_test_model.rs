@@ -29,6 +29,11 @@ pub(super) struct VerifyScript {
     pub is_ep: bool,
     pub fail_candidates: bool,
     pub fail_full_rows: bool,
+    /// Serve the owner-batched verify (`owner_batch` tests): owner-major
+    /// `picks`, one per row. Off, it stays rejected as before.
+    pub owner_batch: bool,
+    /// The row masks the last masked owner batch carried.
+    pub masks: std::sync::Mutex<Vec<u32>>,
     pub log: std::sync::Mutex<Vec<String>>,
 }
 
@@ -276,6 +281,39 @@ impl Model for TestModel {
     }
     fn is_ep(&self) -> bool {
         self.verify.as_ref().is_some_and(|v| v.is_ep)
+    }
+    fn can_batch_glm_long_verify_rows(&self, _: usize, _: usize) -> bool {
+        self.verify.as_ref().is_some_and(|v| v.owner_batch)
+    }
+    fn decode_verify_glm_long_owner_rows(
+        &self,
+        rows: usize,
+        tokens: &[u32],
+        seqs: &mut [&mut SequenceState],
+    ) -> Result<Vec<u32>> {
+        let Some(v) = self.verify.as_ref().filter(|v| v.owner_batch) else {
+            anyhow::bail!("unexpected compute in cancellation test")
+        };
+        self.log(format!("owners {}x{rows} {tokens:?}", seqs.len()));
+        for (seq, t) in seqs.iter_mut().zip(tokens.chunks_exact(rows)) {
+            seq.tokens.extend_from_slice(t);
+            seq.seq_len += rows;
+        }
+        Ok(v.picks[..tokens.len()].to_vec())
+    }
+    fn decode_verify_glm_long_owner_rows_masked(
+        &self,
+        rows: usize,
+        tokens: &[u32],
+        seqs: &mut [&mut SequenceState],
+        masks: &[u32],
+    ) -> Result<Vec<u32>> {
+        anyhow::ensure!(self.verify.is_some(), "no masked verify");
+        self.log(format!("masks {} words", masks.len()));
+        if let Some(v) = &self.verify {
+            *v.masks.lock().unwrap() = masks.to_vec();
+        }
+        self.decode_verify_glm_long_owner_rows(rows, tokens, seqs)
     }
     fn begin_glm_long_owner_tail(&self, _: u32, owner: usize, _: &[u32]) -> Result<()> {
         anyhow::ensure!(self.verify.is_some(), "no scripted owner tail");
