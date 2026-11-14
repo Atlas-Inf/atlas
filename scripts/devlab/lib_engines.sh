@@ -104,6 +104,21 @@ llama_up() { # port parallel ctx-per-slot model [extra llama-server args...]
   ENGINE_DOWN() { kill -INT "$LPID" 2>/dev/null; sleep 8; kill -9 "$LPID" 2>/dev/null; cp "$OUT/llama-server.log" "$1" 2>/dev/null; true; }
 }
 
+haloloom_up() { # port model sessions ctx: HawgAuto/HaloLoom v0.1.3's pinned gfx1151 vLLM image (Hyperloom's serving stack), with
+  # the README's Strix settings (eager, Triton attention, fixed KV bytes instead of a utilization fraction).
+  local port=$1 m=$2 ses=$3 ctx=$4 img=${HALOLOOM_IMG:-ghcr.io/hawgauto/haloloom-vllm-full-gfx1151:v0.1.3}
+  docker pull -q "$img" > "$OUT/pull.log" 2>&1 || { log "HALOLOOM PULL FAILED: $(tail -2 "$OUT/pull.log")"; return 1; }
+  log "haloloom $img $(docker image inspect -f '{{.Id}}' "$img" | cut -c8-19)"
+  local GV GR; GV=$(getent group video | cut -d: -f3); GR=$(getent group render | cut -d: -f3)
+  docker rm -f haloloom-h2h >/dev/null 2>&1
+  docker run -d --name haloloom-h2h --network host --device /dev/kfd --device /dev/dri --group-add "$GV" --group-add "$GR" \
+    --security-opt seccomp=unconfined --ipc host -e HF_HOME="$HFC" -e HF_HUB_OFFLINE=1 -v "$HFC":"$HFC" --entrypoint vllm "$img" \
+    serve "$m" --host 127.0.0.1 --port "$port" --max-model-len "$ctx" --max-num-seqs "$ses" \
+    --kv-cache-memory-bytes "${HL_KV_BYTES:-17179869184}" --enforce-eager --attention-backend TRITON_ATTN \
+    --language-model-only --trust-remote-code > /dev/null || { log "haloloom run failed"; return 1; }
+  ENGINE_ALIVE() { docker ps -q -f name=haloloom-h2h | grep -q .; }
+  ENGINE_DOWN() { docker logs haloloom-h2h > "$1" 2>&1; docker rm -f haloloom-h2h >/dev/null 2>&1; }
+}
 halogen_up() { # Peonist's published halogen-flash-server image at its defaults (EULA s4 permits benchmarking and
   # publishing results), weights fetched by the image itself on first start into the runner's scratch.
   # Host network (as gufo_up): the bridge could not reach the runner's HF mirror (07:37Z Errno 110). Serves on 8731.

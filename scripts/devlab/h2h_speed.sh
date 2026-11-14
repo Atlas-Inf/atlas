@@ -8,11 +8,12 @@
 # atlas arms:   b1 (MAX_BATCH 1, MTP: the single-user recipe) and b8 (MAX_BATCH 8) on NVIDIA's NVFP4 via serve-amd.sh, GPU_UTIL
 #               0.70 (the runner's batch-8 27B ceiling, run 41181983380), so all three engines share one machine.
 # gufo arms:     ar, and its speculative leg (DFlash2 for 27B, MTP for Flash-Next) -- each engine's own performance leg
+# haloloom arm: HawgAuto/HaloLoom v0.1.3 vLLM image (Hyperloom stack) on NVIDIA NVFP4, eager + Triton attention.
 # halogen arm:   fnext only; Peonist's image at its defaults (drafting on), thinking off per request (it thinks by default).
 # llamacpp arms: nvfp4 (NVIDIA's checkpoint through llama.cpp's own converter, if it converts) and q4 (the Unsloth
 #                UD-Q4_K_XL Gufo uses); stock llama.cpp has no speculative leg for these models.
 set -uo pipefail
-ENGINE=${1:?atlas|gufo|llamacpp|halogen}; MK=${2:?27b|fnext}
+ENGINE=${1:?atlas|gufo|llamacpp|halogen|haloloom}; MK=${2:?27b|fnext}
 for kv in "${@:3}"; do [[ "$kv" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9_./:,+-]*$ ]] && export "$kv"; done
 # ripple: the Atlas Ripple recipe's shape (1 session, 8192 context, depths 0/4096, C1), so rows compare with ripple_bench.sh.
 [ "$MK" = ripple ] && { SESSIONS=${SESSIONS:-1}; CONTEXT=${CONTEXT:-8192}; DEPTHS=${DEPTHS:-0,4096}; CS=${CS:-1}; }
@@ -78,6 +79,11 @@ llamacpp)
   fi
   llama_up $PORT "$SESSIONS" "$CONTEXT" "$Q4"; bench_arm llamacpp_q4
   "$LB/llama-bench" -m "$Q4" -ngl 99 -p 2048 -n 128 -r 2 -o md 2>"$OUT/bench-q4.err" | tee -a "$RES" || tail -3 "$OUT/bench-q4.err" | tee -a "$RES" ;;
+haloloom)   # HaloLoom (Hyperloom's Strix Halo packaging) out of the box: its vLLM image on NVIDIA's NVFP4 checkpoint
+  NV=$(hf_get "$NVFP4_REPO" "*" "") || { log "NVFP4 DOWNLOAD FAILED"; exit 1; }
+  log "haloloom serving $NVFP4_REPO ($(du -shL "$NV" | cut -f1))"
+  haloloom_up $PORT "$NVFP4_REPO" "$SESSIONS" "$CONTEXT" || exit 1
+  bench_arm haloloom_vllm_nvfp4 "${CS:-1,4,8}" 1440 ;;
 halogen)
   [ "$MK" = fnext ] || { log "halogen serves Flash-Next only"; exit 1; }
   docker pull -q "ghcr.io/peonist-ai/halogen-flash-server:${HALOGEN_TAG:-0.20.1}" > "$OUT/pull.log" 2>&1 || { log "PULL FAILED: $(tail -2 "$OUT/pull.log")"; exit 1; }
