@@ -7,6 +7,9 @@ use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
+use crate::layers::ops::mxfp8_gemv_rows;
+use crate::weight_map::Mxfp8Weight;
+
 /// Values in one key, and in one head's query.
 pub const HEAD_DIM: usize = 512;
 /// The most keys one query attends to: the window and the selected
@@ -110,12 +113,13 @@ pub fn rotate(
         .launch(stream)
 }
 
-/// FP8 under a power-of-two scale per 32 values, back as BF16, over `values`
-/// BF16 values of `x` in place.
+/// FP8 under a power-of-two scale per 32 values, as BF16: `values` BF16
+/// values of `src` into `dst`, which may be `src`.
 pub fn fp8_quant_dequant(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
-    x: DevicePtr,
+    src: DevicePtr,
+    dst: DevicePtr,
     values: usize,
     stream: u64,
 ) -> Result<()> {
@@ -127,9 +131,39 @@ pub fn fp8_quant_dequant(
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(blocks, THREADS), 1, 1])
         .block([THREADS, 1, 1])
-        .arg_ptr(x)
+        .arg_ptr(src)
+        .arg_ptr(dst)
         .arg_u32(blocks)
         .launch(stream)
+}
+
+/// A projection with FP8 weights, as the reference runs it: `rows` rows of
+/// `input` (`[rows, k]` BF16) are quantized to FP8 into `quantized` (the same
+/// size, left holding them) and multiplied by `w` (`[n, k]`) into `output`
+/// (`[rows, n]` BF16). `tiers` holds `mxfp8_gemv_tc{8,16,32}`.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_linear(
+    gpu: &dyn GpuBackend,
+    kernels: &Kernels,
+    tiers: &[KernelHandle; 3],
+    w: &Mxfp8Weight,
+    input: DevicePtr,
+    quantized: DevicePtr,
+    output: DevicePtr,
+    rows: usize,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<()> {
+    fp8_quant_dequant(
+        gpu,
+        kernels.fp8_quant_dequant,
+        input,
+        quantized,
+        rows * k,
+        stream,
+    )?;
+    mxfp8_gemv_rows(gpu, tiers, w, quantized, output, rows, n, k, n, stream)
 }
 
 /// The scale an FP4 group is quantized under.
@@ -171,3 +205,7 @@ pub fn fp4_quant_dequant(
 #[cfg(test)]
 #[path = "ops_test_gpu.rs"]
 mod test_gpu;
+
+#[cfg(test)]
+#[path = "proj_test_gpu.rs"]
+mod proj_test_gpu;

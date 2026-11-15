@@ -59,18 +59,24 @@ extern "C" __global__ void dsv41_rotate(
     p[1] = __float2bfloat16(re * s + im * c);
 }
 
-// FP8 (E4M3) under one power-of-two scale per 32 values, written back as
-// BF16. x holds `blocks` blocks of 32. One thread per block.
-extern "C" __global__ void dsv41_fp8_quant_dequant(__nv_bfloat16* __restrict__ x, unsigned int blocks) {
+// FP8 (E4M3) under one power-of-two scale per 32 values, written as BF16:
+// `blocks` blocks of 32 from `src` into `dst`, which may be the same buffer.
+// One thread per block.
+extern "C" __global__ void dsv41_fp8_quant_dequant(
+    const __nv_bfloat16* src, __nv_bfloat16* dst, unsigned int blocks) {
     const size_t b = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= blocks) return;
-    __nv_bfloat16* p = x + b * 32;
+    const __nv_bfloat16* p = src + b * 32;
+    float v[32];
     float amax = 0.0f;
-    for (int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(__bfloat162float(p[i])));
+    for (int i = 0; i < 32; ++i) {
+        v[i] = __bfloat162float(p[i]);
+        amax = fmaxf(amax, fabsf(v[i]));
+    }
     const float scale = dsv41_pow2_ceil(fmaxf(amax, 1e-4f) * (1.0f / 448.0f));
     for (int i = 0; i < 32; ++i) {
-        const float scaled = fminf(fmaxf(__bfloat162float(p[i]) / scale, -448.0f), 448.0f);
-        p[i] = __float2bfloat16(dsv41_round_e4m3(scaled) * scale);
+        const float scaled = fminf(fmaxf(v[i] / scale, -448.0f), 448.0f);
+        dst[b * 32 + i] = __float2bfloat16(dsv41_round_e4m3(scaled) * scale);
     }
 }
 

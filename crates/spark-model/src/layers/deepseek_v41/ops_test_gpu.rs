@@ -38,7 +38,7 @@ fn cache_kernels_write_what_the_host_recipe_writes() -> Result<()> {
     ] {
         let dev = upload(gpu, &bytes_of(&host, u16::to_le_bytes))?;
         match launch {
-            0 => fp8_quant_dequant(gpu, k.fp8_quant_dequant, dev, host.len(), stream)?,
+            0 => fp8_quant_dequant(gpu, k.fp8_quant_dequant, dev, dev, host.len(), stream)?,
             1 => fp4_quant_dequant(
                 gpu,
                 k.fp4_quant_dequant,
