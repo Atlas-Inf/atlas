@@ -101,6 +101,7 @@ tower-http = { version = "0.7", features = ["catch-panic", "cors"] }
 base64 = "0.22"
 
 [dev-dependencies]
+sha2 = { workspace = true }
 tempfile = "3"
 
 [lints]

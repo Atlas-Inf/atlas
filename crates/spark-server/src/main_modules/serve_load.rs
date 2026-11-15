@@ -931,6 +931,17 @@ pub(crate) fn load_model(
         args.disable_template_overrides || args.reference_mode,
         ptx_set.behavior.verbatim_prompt,
     )?;
+    // DeepSeek-V4.1's Engram tables are hashed over a token map derived from
+    // the tokenizer; one that derives a different map is refused before load.
+    if let Some(engram) =
+        crate::tokenizer::engram_dsv41::resolve(tokenizer.inner(), tokenizer.vocab_size(), &config)?
+    {
+        tracing::info!(
+            "Engram: {} token ids hash as {} compressed ids",
+            engram.map.len(),
+            engram.geometry.compressed_vocab_size,
+        );
+    }
 
     // (AM1 attractor-mask registration removed 2026-06-03 — see
     // decode_logits_seq.rs / compile_tools.rs; `lean` was an Atlas-only
