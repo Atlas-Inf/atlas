@@ -62,9 +62,11 @@ impl Dialect {
             Self::V4 => Ok(ReasoningEffort::parse(value)?.prefix().to_string()),
             Self::V41 => {
                 let budget = match value.unwrap_or("high") {
-                    "low" | "minimal" | "medium" | "none" => 50,
-                    "high" => 75,
-                    "max" | "xhigh" => 100,
+                    // low, high and max are the encoder's; the OpenAI names
+                    // map as the checkpoint's chat_template.jinja maps them.
+                    "low" | "minimal" => 50,
+                    "high" | "medium" | "xhigh" | "none" => 75,
+                    "max" => 100,
                     other => match other.parse::<u8>() {
                         Ok(budget @ 1..=100) => budget,
                         _ => bail!(

@@ -106,8 +106,13 @@ fn reasoning_effort_is_a_budget_from_1_to_100() {
     for (effort, budget) in [
         (None, 75),
         (Some("low"), 50),
-        (Some("xhigh"), 100),
+        (Some("max"), 100),
         (Some("37"), 37),
+        // The OpenAI names, as the checkpoint's chat_template.jinja maps them.
+        (Some("minimal"), 50),
+        (Some("medium"), 75),
+        (Some("xhigh"), 75),
+        (Some("none"), 75),
     ] {
         assert!(
             thinking(effort).unwrap().starts_with(&format!(
