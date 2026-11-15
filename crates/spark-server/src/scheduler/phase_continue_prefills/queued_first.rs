@@ -44,25 +44,35 @@ pub(super) fn run(
     };
     let total = p.prompt_tokens.len();
     let is_last = chunk_len >= total;
-    tracing::info!(
-        "Queued prefill start: {total} prompt tokens, chunk_size={chunk_len}, queued {:.0} ms",
-        p.request_start.elapsed().as_secs_f64() * 1e3,
+    if p.paused.is_none() {
+        tracing::info!(
+            "Queued prefill start: {total} prompt tokens, chunk_size={chunk_len}, queued {:.0} ms",
+            p.request_start.elapsed().as_secs_f64() * 1e3,
+        );
+    }
+    let layers = super::layer_yield::slice(&sched.levers, model, !active.is_empty(), p.paused);
+    let began = std::time::Instant::now();
+    let step = prefill_chunk_with_preemption(
+        model,
+        &p.prompt_tokens,
+        &mut p.seq,
+        p.disable_mtp,
+        0,
+        chunk_len,
+        is_last,
+        prefill_stream,
+        active,
+        layers,
     );
-    let logits = (|| -> anyhow::Result<DevicePtr> {
-        let logits = prefill_chunk_with_preemption(
-            model,
-            &p.prompt_tokens,
-            &mut p.seq,
-            p.disable_mtp,
-            0,
-            chunk_len,
-            is_last,
-            prefill_stream,
-            active,
-        )?;
+    let Some(logits) = super::layer_yield::settle(&mut p.paused, began, step) else {
+        // Its pass paused: still this prompt's queued first chunk.
+        p.queued_first_chunk = Some(chunk_len);
+        return true;
+    };
+    let logits = logits.and_then(|logits| -> anyhow::Result<DevicePtr> {
         super::super::prefill_normalization::initial(model, &p.seq)?;
         Ok(logits)
-    })();
+    });
     let logits = match logits {
         Ok(l) => l,
         Err(e) => {
@@ -106,9 +116,10 @@ pub(super) fn run(
     true
 }
 
-/// A queued prompt whose streaming client is gone or cancelled: nothing ran
-/// for it and nobody reads its tokens, so it leaves the queue before its
-/// first chunk (a buffered caller is caught by `ResponseSink::receiver_closed`).
+/// A queued prompt whose streaming client is gone or cancelled: nobody reads
+/// its tokens, so it leaves the queue before its first chunk ends, having
+/// run nothing or (`layer_yield`) some slices of that chunk, which its free
+/// discards (a buffered caller is caught by `ResponseSink::receiver_closed`).
 /// Prompts already prefilling keep today's streaming contract (`cancel_flag`,
 /// read at the emit and decode boundaries).
 pub(super) fn abandoned(p: &PrefillInProgress) -> bool {

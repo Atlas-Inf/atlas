@@ -261,25 +261,29 @@ pub(super) fn run_standard_chunk_loop(
         tool_call_start_token,
         tool_call_end_token,
     );
-    if super::run_fused::try_fused_chunk(
-        model,
-        p,
-        idx,
-        active,
-        chunk_len,
-        max_batch_tokens,
-        spec,
-        &verify_ctx,
-        sched,
-        completed_indices,
-        rode,
-    ) {
+    if p.paused.is_none()
+        && super::run_fused::try_fused_chunk(
+            model,
+            p,
+            idx,
+            active,
+            chunk_len,
+            max_batch_tokens,
+            spec,
+            &verify_ctx,
+            sched,
+            completed_indices,
+            rode,
+        )
+    {
         return;
     }
 
     // ── Standard path: prefill chunk only, decode separately ──
     // EP: the chunk command is broadcast (and re-sent after each agreed KV
     // refusal, resuming at recorded progress) by `prefill_preempt`.
+    let layers = super::layer_yield::slice(&sched.levers, model, !active.is_empty(), p.paused);
+    let began = Instant::now();
     let chunk_res = super::super::prefill_preempt::prefill_chunk_with_preemption(
         model,
         &p.prompt_tokens,
@@ -290,7 +294,12 @@ pub(super) fn run_standard_chunk_loop(
         is_last,
         prefill_stream,
         active,
+        layers,
     );
+    // Its pass paused: this tick's decode step runs, then the same chunk.
+    let Some(chunk_res) = super::layer_yield::settle(&mut p.paused, began, chunk_res) else {
+        return;
+    };
     match chunk_res {
         Ok(logits) => {
             p.chunk_offset += chunk_len;

@@ -41,7 +41,11 @@ use super::FirstChunk;
 /// (co-dispatch, VARLEN, always-mixed fuse, multi-prompt prefill) takes it;
 /// `queue_lever`: `ATLAS_PREFILL_QUEUE_FIRST_CHUNK`; `in_flight`: a prefill is
 /// in `prefilling` ahead of it, admitted this tick or before; `one_chunk`:
-/// the whole prompt fits its first chunk.
+/// the whole prompt fits its first chunk; `yields`: sequences are decoding
+/// and prefill passes yield to them (`ATLAS_GLM_PREFILL_YIELD_MS`), which
+/// only a chunk the continue phase runs can do, so the chunk queues whatever
+/// its length.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn first_chunk(
     defer: bool,
     queue_lever: bool,
@@ -50,10 +54,12 @@ pub(super) fn first_chunk(
     vision: bool,
     beams: bool,
     one_chunk: bool,
+    yields: bool,
 ) -> FirstChunk {
+    let queue = yields || (queue_lever && in_flight && !one_chunk);
     if defer {
         FirstChunk::Defer
-    } else if queue_lever && multi_rank && in_flight && !vision && !beams && !one_chunk {
+    } else if queue && multi_rank && !vision && !beams {
         FirstChunk::Queue
     } else {
         FirstChunk::Inline
@@ -68,18 +74,18 @@ mod tests {
     /// than one chunk.
     fn decide(flags: (bool, bool, bool, bool, bool, bool)) -> FirstChunk {
         let (defer, lever, ep, in_flight, vision, beams) = flags;
-        first_chunk(defer, lever, ep, in_flight, vision, beams, false)
+        first_chunk(defer, lever, ep, in_flight, vision, beams, false, false)
     }
 
     #[test]
     fn a_prompt_that_fits_one_chunk_runs_at_admission() {
         assert_eq!(
-            first_chunk(false, true, true, true, false, false, true),
+            first_chunk(false, true, true, true, false, false, true, false),
             FirstChunk::Inline
         );
         // A deferral still takes it.
         assert_eq!(
-            first_chunk(true, true, true, true, false, false, true),
+            first_chunk(true, true, true, true, false, false, true, false),
             FirstChunk::Defer
         );
     }
@@ -139,6 +145,37 @@ mod tests {
         assert_eq!(
             decide((false, true, true, true, false, true)),
             FirstChunk::Inline
+        );
+    }
+
+    /// With passes yielding to decoders a prompt of any length queues, with
+    /// or without the queue lever or a prefill in flight; image prompts,
+    /// beams, one GPU and deferrals are as before.
+    #[test]
+    fn a_prompt_admitted_beside_decoders_queues_when_passes_yield() {
+        for one_chunk in [false, true] {
+            for (lever, in_flight) in [(false, false), (true, true)] {
+                assert_eq!(
+                    first_chunk(false, lever, true, in_flight, false, false, one_chunk, true),
+                    FirstChunk::Queue
+                );
+            }
+        }
+        assert_eq!(
+            first_chunk(false, false, false, false, false, false, false, true),
+            FirstChunk::Inline
+        );
+        assert_eq!(
+            first_chunk(false, false, true, false, true, false, false, true),
+            FirstChunk::Inline
+        );
+        assert_eq!(
+            first_chunk(false, false, true, false, false, true, false, true),
+            FirstChunk::Inline
+        );
+        assert_eq!(
+            first_chunk(true, false, true, false, false, false, false, true),
+            FirstChunk::Defer
         );
     }
 }

@@ -31,7 +31,12 @@ fn run(
     active: &mut Vec<ActiveSeq>,
 ) -> Result<DevicePtr> {
     let (prompt, _) = prefilling();
-    prefill_chunk_with_preemption(model, &prompt, seq, false, 16, 40, true, 0, active)
+    let step =
+        prefill_chunk_with_preemption(model, &prompt, seq, false, 16, 40, true, 0, active, None)?;
+    match step {
+        spark_model::traits::ChunkStep::Done(logits) => Ok(logits),
+        paused => anyhow::bail!("a whole chunk came back {paused:?}"),
+    }
 }
 
 #[test]

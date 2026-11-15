@@ -22,8 +22,7 @@
 
 use anyhow::Result;
 use spark_model::model::kv_admission::kv_admission_refusal;
-use spark_model::traits::{Model, SequenceState};
-use spark_runtime::gpu::DevicePtr;
+use spark_model::traits::{ChunkStep, EP_CMD_PREFILL_SLICE, Model, SequenceState};
 
 use super::lifecycle::send_error;
 use super::types::ActiveSeq;
@@ -42,6 +41,8 @@ pub(super) fn resume_point(offset: usize, end: usize, seq_len: usize) -> Result<
 /// Send (EP) and run the prompt chunk `[offset, end)`, killing the largest
 /// grammar-free active sequence after each agreed KV exhaustion refusal.
 /// Falls through with the refusal when it is final or nothing can be evicted.
+/// `layers`: a slice of that many layers (`layer_yield`); the same call
+/// again continues a chunk that came back paused.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prefill_chunk_with_preemption(
     model: &dyn Model,
@@ -53,7 +54,8 @@ pub(super) fn prefill_chunk_with_preemption(
     is_last: bool,
     stream: u64,
     active: &mut Vec<ActiveSeq>,
-) -> Result<DevicePtr> {
+    layers: Option<usize>,
+) -> Result<ChunkStep> {
     loop {
         match send_and_run(
             model,
@@ -64,6 +66,7 @@ pub(super) fn prefill_chunk_with_preemption(
             end,
             is_last,
             stream,
+            layers,
         ) {
             Err(e) if kv_admission_refusal(&e).is_some_and(|r| r.retryable) => {
                 let Some(vi) = active
@@ -104,7 +107,11 @@ fn send_and_run(
     end: usize,
     is_last: bool,
     stream: u64,
-) -> Result<DevicePtr> {
+    layers: Option<usize>,
+) -> Result<ChunkStep> {
+    // Convert before any word goes out: a failure between two words would
+    // leave the worker reading the next command as the count.
+    let slice = layers.map(u32::try_from).transpose()?;
     let start = resume_point(offset, end, seq.seq_len)?;
     if start > offset {
         tracing::info!("prefill chunk {offset}..{end} resumes at recorded progress {start}");
@@ -112,10 +119,15 @@ fn send_and_run(
     let slot = seq.slot_idx as u32;
     // EP: the worker mirrors this exact command (bulk tokens, one NCCL op).
     model.ep_broadcast_disable_mtp_for_seq(slot, disable_mtp)?;
+    // A slice: the worker runs the layer count the head runs.
+    if let Some(n) = slice {
+        model.ep_broadcast_cmd_for_seq(slot, EP_CMD_PREFILL_SLICE)?;
+        model.ep_broadcast_cmd(n)?;
+    }
     model.ep_broadcast_cmd_for_seq(slot, 0xFFFFFFF0)?;
     model.ep_broadcast_cmd((end - start) as u32)?;
     model.ep_broadcast_cmd(start as u32)?;
     model.ep_broadcast_cmd(prompt.len() as u32)?;
     model.ep_broadcast_tokens(prompt)?;
-    model.prefill_chunk(prompt, seq, start, end - start, is_last, stream)
+    model.prefill_chunk_slice(prompt, seq, start, end - start, is_last, stream, layers)
 }

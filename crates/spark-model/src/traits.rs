@@ -54,6 +54,35 @@ pub struct MixedBatchResult {
     pub prefill_logits: Vec<DevicePtr>,
 }
 
+/// A prefill pass stopped between layers ([`Model::prefill_chunk_slice`];
+/// `model::trait_impl::prefill_b::pass_slice`): what the same chunk call
+/// needs to run its remaining layers.
+#[derive(Clone, Debug)]
+pub struct PausedPass {
+    /// The pass's first token and length: a chunk, or one pass of a split one.
+    pub span: (usize, usize),
+    /// The first layer still to run.
+    pub next_layer: usize,
+    /// The rows the pass computes: first token and count.
+    pub proc: (usize, usize),
+    pub effective_seq_len_start: usize,
+    pub kv_write_start: usize,
+    pub marconi_skip: bool,
+    /// The highway rows a decode step may overwrite, as they stood.
+    pub highway: Vec<u8>,
+    /// The chunk's first token ids in the arena, likewise.
+    pub token_ids: Vec<u8>,
+}
+
+/// What one [`Model::prefill_chunk_slice`] call left of its chunk.
+#[derive(Clone, Copy, Debug)]
+pub enum ChunkStep {
+    /// The chunk is in: its logits (NULL before the last chunk).
+    Done(DevicePtr),
+    /// The current pass stopped between layers after running `ran` more.
+    Paused { ran: usize },
+}
+
 /// Per-sequence paged attention metadata for chunked prefill.
 ///
 /// Positions and slots remain chunk-local, but the paged block table and
@@ -188,6 +217,10 @@ pub struct SequenceState {
     /// that share its prefix (`ATLAS_GLM_PC_INFLIGHT`, [`EP_CMD_PC_PLANT`]).
     /// Becomes `pc_branch_at` at the first chunk where it is still ahead.
     pub pc_plant_at: Option<usize>,
+    /// This prefill's pass stopped between layers
+    /// ([`Model::prefill_chunk_slice`]). Until the same chunk call ends it,
+    /// the sequence's layer states are ahead of `seq_len` and `tokens`.
+    pub paused_pass: Option<Box<PausedPass>>,
     /// Rolling end-of-turn SSM snapshot (`ATLAS_GLM_PC_FINISH_LEAF`).
     pub(crate) finish_leaf: crate::model::trait_impl::finish_leaf::LeafCell,
     /// Contiguous prefix length (in tokens, from position 0) whose paged KV is
@@ -326,6 +359,7 @@ impl SequenceState {
             prefix_lookup_skip: false,
             pc_branch_at: None,
             pc_plant_at: None,
+            paused_pass: None,
             finish_leaf: Default::default(),
             kv_valid_tokens: 0,
             last_decode_ckpt_block: 0,
@@ -456,5 +490,5 @@ mod seq_vision;
 pub use eos_ban::EosBan;
 pub use logprobs::*;
 pub use model::{BeamReq, Model, ScoreInput, padded_batch_n};
-pub use model_defaults::EP_CMD_PC_PLANT;
+pub use model_defaults::{EP_CMD_PC_PLANT, EP_CMD_PREFILL_SLICE};
 pub use seq_vision::SeqVision;

@@ -18,7 +18,7 @@ use super::*;
 use crate::api::InferenceRequest;
 use crate::scheduling_policy::FifoPolicy;
 
-const CHUNK: u32 = 0xFFFF_FFF0;
+pub(super) const CHUNK: u32 = 0xFFFF_FFF0;
 const RELEASE: u32 = 0xFFFF_FFF1;
 /// The chunk budget: a longer prompt takes more than one chunk.
 const BUDGET: usize = 16;
@@ -85,9 +85,9 @@ fn streaming(
 /// The scheduler's prefill state across ticks.
 pub(super) struct Tick<'a> {
     model: &'a PreemptStubModel,
-    sched: SchedCtx,
+    pub(super) sched: SchedCtx,
     pub(super) active: Vec<ActiveSeq>,
-    prefilling: Vec<PrefillInProgress>,
+    pub(super) prefilling: Vec<PrefillInProgress>,
 }
 
 impl<'a> Tick<'a> {
@@ -132,7 +132,7 @@ impl<'a> Tick<'a> {
     }
 
     /// One tick's continue phase.
-    fn step(&mut self) {
+    pub(super) fn step(&mut self) {
         self.step_spec(false, false);
     }
 
@@ -178,7 +178,7 @@ impl<'a> Tick<'a> {
     }
 }
 
-fn wire(model: &PreemptStubModel) -> Vec<u32> {
+pub(super) fn wire(model: &PreemptStubModel) -> Vec<u32> {
     model.wire.lock().unwrap().clone()
 }
 

@@ -191,3 +191,22 @@ fn resume_loop_errors_out_a_sequence_that_can_never_fit() {
     // The client is told, not left hanging forever.
     assert!(rx.try_recv().expect("error delivered").is_err());
 }
+
+#[test]
+fn spill_pool_runs_only_for_models_that_resume_a_swap() {
+    let resumable = PreemptStubModel::default();
+    assert!(spill_pool_enabled(&resumable, 3));
+    assert!(!spill_pool_enabled(&resumable, 0));
+    // The trait default, which TransformerModel also reports for a GLM
+    // semantic-index cache: its spill image carries no index pools or tails,
+    // so a swapped-in sequence would select over another owner's keys.
+    // Admission then waits for blocks and decode preemption requeues.
+    let cannot = super::super::cancel_test_model::TestModel {
+        tokens: vec![],
+        host_logits: false,
+        cancel_after_sampling: None,
+        cancel_after_row_commit: None,
+        verify: None,
+    };
+    assert!(!spill_pool_enabled(&cannot, 3));
+}

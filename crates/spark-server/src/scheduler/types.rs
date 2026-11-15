@@ -81,6 +81,10 @@ pub(super) struct PrefillInProgress {
     /// ranks got no prefill command yet, so only the continue phase may run
     /// that chunk, as the head of the queue (`phase_continue_prefills::queued_first`).
     pub queued_first_chunk: Option<usize>,
+    /// `Some`: the pass it was running stopped between layers
+    /// (`ATLAS_GLM_PREFILL_YIELD_MS`, `phase_continue_prefills::layer_yield`).
+    /// Until that pass ends no other prefill may run and nothing is admitted.
+    pub paused: Option<super::phase_continue_prefills::layer_yield::Paused>,
     /// Arc-wrapped so the original request, the per-prefill scheduler
     /// state, and any retry path (Tier 5c) can share the read-only
     /// token slice without copying ~40 KB on every long prompt.

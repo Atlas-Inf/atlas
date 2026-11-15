@@ -119,6 +119,24 @@ impl TransformerModel {
             }
         }
 
+        // A pass of this chunk stopped between layers (`pass_slice`): the
+        // call continues it, here or through the split that ran it.
+        match Self::pass_standing(seq, chunk_start, chunk_len)? {
+            pass_slice::Standing::Fresh => {}
+            pass_slice::Standing::Here(p) => {
+                anyhow::ensure!(
+                    passengers.is_none(),
+                    "a paused pass carries no verify owners"
+                );
+                let stream = self.gpu.default_stream();
+                return self.pass_resume(tokens, seq, p, is_last_chunk, stream);
+            }
+            pass_slice::Standing::Below(at) => {
+                let span = (chunk_start, chunk_len);
+                return self.pc_branch_split(tokens, seq, span, at, is_last_chunk, stream);
+            }
+        }
+
         // Guard: chunk_len must not exceed buffer arena capacity.
         // Exceeding this causes CUDA illegal memory access (error 700)
         // which permanently corrupts GPU state.
@@ -338,7 +356,7 @@ impl TransformerModel {
 
         // ── Phase 4: forward through all layers ──
         if !self.prefill_b_exact_direct(seq, chunk_start + chunk_len, is_last_chunk, proc_count) {
-            self.prefill_b_forward_layers(
+            let stopped = self.prefill_b_forward_layers(
                 seq,
                 tokens,
                 &mut kv_cache,
@@ -357,7 +375,18 @@ impl TransformerModel {
                 midcap_plan.as_ref(),
                 passengers.as_deref_mut().zip(passenger_run.as_ref()),
                 stream,
+                0,
             )?;
+            Self::pass_settle(seq, stopped, |s| crate::traits::PausedPass {
+                span,
+                next_layer: s.next_layer,
+                proc: (proc_start, proc_count),
+                effective_seq_len_start,
+                kv_write_start,
+                marconi_skip,
+                highway: s.highway,
+                token_ids: s.token_ids,
+            })?;
         }
         let t_fwd = tp.elapsed();
         self.warm_trace_sync(stream)?;
@@ -403,57 +432,17 @@ impl TransformerModel {
             self.finalize_midchunk_capture(tokens, seq, plan);
         }
 
-        // ── Phase 5: update sequence state incrementally ──
-        // Always add chunk tokens exactly once. The early-return path for
-        // fully cached non-last chunks doesn't add tokens, so this is the
-        // single insertion point for all chunks that reach here.
-        seq.tokens
-            .extend_from_slice(&tokens[chunk_start..chunk_start + chunk_len]);
-        seq.seq_len = chunk_start + chunk_len;
-        // #155: prime the decode-checkpoint cadence gate; the last chunk
-        // leaves it at the prompt's complete-block count (see prefill_a).
-        seq.last_decode_ckpt_block = seq.tokens.len() / bs;
-
-        // ── Legacy echo+logprobs: project prompt positions while this
-        // chunk's hidden rows are live, BEFORE finalize_last (which
-        // re-derives norm_output + logits for the first sampled token).
-        // No-op unless seq.collect_prompt_logprobs is set.
-        self.collect_prompt_logprobs_chunk(
+        let span = (chunk_start, chunk_len, proc_start, proc_count);
+        let trace = (tp, t_pre, marks);
+        self.pass_finish(
             tokens,
             seq,
-            chunk_start,
-            proc_start,
-            proc_count,
+            &mut kv_cache,
+            span,
+            is_last_chunk,
+            &midcap_plan,
+            trace,
             stream,
-        )?;
-
-        let _pass_aux =
-            self.qwen4exp_ckpt_saves(tokens, seq, &mut kv_cache, &midcap_plan, stream)?;
-        let out = if is_last_chunk {
-            // ── Phase 6+7+8: final norm, lm_head, prefix-cache + snapshot save ──
-            self.prefill_b_finalize_last(
-                tokens,
-                seq,
-                &mut kv_cache,
-                chunk_start,
-                chunk_len,
-                proc_count,
-                stream,
-            )?
-        } else {
-            // ── Phase 9: intermediate Marconi checkpoint ──
-            self.prefill_b_save_checkpoint(
-                tokens,
-                seq,
-                &mut kv_cache,
-                chunk_start,
-                chunk_len,
-                stream,
-            )?;
-            DevicePtr::NULL
-        };
-        let (chunk, logits) = ((span.0, proc_count), is_last_chunk.then_some(out));
-        self.warm_trace_chunk(seq, total, tp, chunk, t_pre, marks, logits, stream)?;
-        Ok(out)
+        )
     }
 }

@@ -193,6 +193,31 @@ impl Model for TransformerModel {
         self.gdn_fuse_flush_all()?;
         self.prefill_chunk_entry(tokens, seq, chunk_start, chunk_len, is_last_chunk, stream)
     }
+    fn prefill_slices(&self) -> bool {
+        self.pass_slices()
+    }
+    fn prefill_chunk_slice(
+        &self,
+        tokens: &[u32],
+        seq: &mut SequenceState,
+        chunk_start: usize,
+        chunk_len: usize,
+        is_last_chunk: bool,
+        stream: u64,
+        layers: Option<usize>,
+    ) -> Result<crate::traits::ChunkStep> {
+        use crate::traits::ChunkStep;
+        use prefill_b::pass_slice;
+        self.gdn_fuse_flush_all()?;
+        let _budget = pass_slice::begin(layers.filter(|_| self.pass_slices()));
+        match self.prefill_chunk_entry(tokens, seq, chunk_start, chunk_len, is_last_chunk, stream) {
+            Ok(logits) => Ok(ChunkStep::Done(logits)),
+            Err(e) if e.is::<pass_slice::PassPaused>() => Ok(ChunkStep::Paused {
+                ran: layers.unwrap_or(0),
+            }),
+            Err(e) => Err(e),
+        }
+    }
     fn prefill_twophase(
         &self,
         tokens: &[u32],

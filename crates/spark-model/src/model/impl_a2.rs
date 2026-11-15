@@ -556,6 +556,11 @@ impl TransformerModel {
             super::glm_long_verify::EP_CMD_GLM_LONG_TAIL => self.glm_long_receive_tail(seq)?,
             0xFFFFFFF6 => self.ep_worker_set_native_fence(seq)?,
             crate::traits::EP_CMD_PC_PLANT => self.pc_plant_receive(seq)?,
+            // The head's layer count for this sequence's next chunk command.
+            crate::traits::EP_CMD_PREFILL_SLICE => {
+                let layers = self.ep_broadcast_u32(0)? as usize;
+                super::trait_impl::prefill_b::pass_slice::worker_set(layers);
+            }
             super::trait_impl::finish_leaf::EP_CMD_CACHE_SEQUENCE => {
                 self.finish_leaf_cache_command(seq)
             }
@@ -570,8 +575,21 @@ impl TransformerModel {
                 // value so Marconi skip branches are identical (bug #33).
                 let is_last = chunk_start + chunk_len >= full_len;
                 super::kv_admission::check_worker_chunk_start(seq, chunk_start)?;
-                let _ =
-                    self.prefill_chunk(&full_tokens, seq, chunk_start, chunk_len, is_last, stream)?;
+                // A slice (`pass_slice`): the pass stops where the head's does,
+                // and the head sends this command again to continue it.
+                let layers = super::trait_impl::prefill_b::pass_slice::worker_take();
+                let step = self.prefill_chunk_slice(
+                    &full_tokens,
+                    seq,
+                    chunk_start,
+                    chunk_len,
+                    is_last,
+                    stream,
+                    layers,
+                )?;
+                if matches!(step, crate::traits::ChunkStep::Paused { .. }) {
+                    return Ok(true);
+                }
                 // Normalize SSM states after every chunk — must mirror the head's
                 // normalize_ssm_states call (scheduler.rs line 584). Without this,
                 // SSM states diverge between ranks causing MoE all-reduce corruption
