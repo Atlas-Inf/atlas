@@ -3,13 +3,14 @@
 //! Shared by the V4.1 GPU tests: the backend on this build's kernel target,
 //! host <-> device copies, and the reference recording.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use spark_runtime::cuda_backend::AtlasCudaBackend;
-use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
-use crate::weight_map::test_checkpoint::read_safetensors_tensor;
+use crate::weight_map::test_checkpoint::{read_checkpoint_tensor, read_safetensors_tensor};
+use crate::weight_map::{Mxfp8Weight, fp8_block_scales_to_rows};
 
 pub(crate) fn backend() -> Result<&'static AtlasCudaBackend> {
     static GPU: std::sync::OnceLock<AtlasCudaBackend> = std::sync::OnceLock::new();
@@ -147,4 +148,33 @@ pub(crate) fn picks(rec: &Recording, count: usize) -> Vec<usize> {
     (0..count)
         .map(|i| i * (rec.prefill - 1) / (count - 1))
         .collect()
+}
+
+pub(crate) fn checkpoint() -> Result<String> {
+    std::env::var("ATLAS_DSV41_CKPT").context("ATLAS_DSV41_CKPT=<checkpoint dir>")
+}
+
+pub(crate) fn tiers(gpu: &dyn GpuBackend) -> Result<[KernelHandle; 3]> {
+    Ok([
+        gpu.kernel("mxfp8_gemv", "mxfp8_gemv_tc8")?,
+        gpu.kernel("mxfp8_gemv", "mxfp8_gemv_tc16")?,
+        gpu.kernel("mxfp8_gemv", "mxfp8_gemv_tc32")?,
+    ])
+}
+
+/// An FP8 projection of the release, with its 32 x 32 block scales repeated
+/// into the per-row layout the MXFP8 tiers read. `(weight, n, k)`.
+pub(crate) fn load_fp8(gpu: &dyn GpuBackend, prefix: &str) -> Result<(Mxfp8Weight, usize, usize)> {
+    let ckpt = checkpoint()?;
+    let (dtype, shape, values) =
+        read_checkpoint_tensor(Path::new(&ckpt), &format!("{prefix}.weight"))?;
+    let (_, _, grid) = read_checkpoint_tensor(Path::new(&ckpt), &format!("{prefix}.scale"))?;
+    anyhow::ensure!(dtype == "F8_E4M3", "{prefix}: {dtype}");
+    let (n, k) = (shape[0], shape[1]);
+    let w = Mxfp8Weight {
+        data: upload(gpu, &values)?,
+        scales: upload(gpu, &fp8_block_scales_to_rows(&grid, n, k)?)?,
+        tiled: false,
+    };
+    Ok((w, n, k))
 }

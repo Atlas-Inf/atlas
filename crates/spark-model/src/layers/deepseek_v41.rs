@@ -6,6 +6,7 @@
 
 pub mod cache_recipe;
 pub mod hc;
+pub mod moe;
 pub mod ops;
 
 #[cfg(test)]

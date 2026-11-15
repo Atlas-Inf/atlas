@@ -9,46 +9,18 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
-use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+use anyhow::Result;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::*;
 use crate::layers::deepseek_v41::cache_recipe as recipe;
 use crate::layers::deepseek_v41::test_support::{
-    Recording, backend, bf16s, closeness, download, le_bytes, picks, rows_of, upload,
+    Recording, backend, bf16s, checkpoint, closeness, download, le_bytes, load_fp8, picks, rows_of,
+    tiers, upload,
 };
 use crate::layers::ops::rms_norm;
+use crate::weight_map::DenseWeight;
 use crate::weight_map::test_checkpoint::read_checkpoint_tensor;
-use crate::weight_map::{DenseWeight, fp8_block_scales_to_rows};
-
-fn checkpoint() -> Result<String> {
-    std::env::var("ATLAS_DSV41_CKPT").context("ATLAS_DSV41_CKPT=<checkpoint dir>")
-}
-
-fn tiers(gpu: &dyn GpuBackend) -> Result<[KernelHandle; 3]> {
-    Ok([
-        gpu.kernel("mxfp8_gemv", "mxfp8_gemv_tc8")?,
-        gpu.kernel("mxfp8_gemv", "mxfp8_gemv_tc16")?,
-        gpu.kernel("mxfp8_gemv", "mxfp8_gemv_tc32")?,
-    ])
-}
-
-/// An FP8 projection of the release, with its 32 x 32 block scales repeated
-/// into the per-row layout the MXFP8 tiers read. `(weight, n, k)`.
-fn load_fp8(gpu: &dyn GpuBackend, prefix: &str) -> Result<(Mxfp8Weight, usize, usize)> {
-    let ckpt = checkpoint()?;
-    let (dtype, shape, values) =
-        read_checkpoint_tensor(Path::new(&ckpt), &format!("{prefix}.weight"))?;
-    let (_, _, grid) = read_checkpoint_tensor(Path::new(&ckpt), &format!("{prefix}.scale"))?;
-    anyhow::ensure!(dtype == "F8_E4M3", "{prefix}: {dtype}");
-    let (n, k) = (shape[0], shape[1]);
-    let w = Mxfp8Weight {
-        data: upload(gpu, &values)?,
-        scales: upload(gpu, &fp8_block_scales_to_rows(&grid, n, k)?)?,
-        tiled: false,
-    };
-    Ok((w, n, k))
-}
 
 #[test]
 #[ignore = "needs a GB10 GPU, the deepseek-v4.1-flash target, ATLAS_DSV41_REC (--ops) and ATLAS_DSV41_CKPT"]
