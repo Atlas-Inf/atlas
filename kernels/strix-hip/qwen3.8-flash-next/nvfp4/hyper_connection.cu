@@ -424,10 +424,25 @@ extern "C" __global__ void hc_pre_down(
     const unsigned int rows_per_split = (rank + gridDim.y - 1) / gridDim.y;
     const unsigned int r0 = blockIdx.y * rows_per_split;
     const unsigned int r1 = min(r0 + rows_per_split, rank);
+    // Each lane prefetches 16 of its lane-strided BF16 weights (i, i+32, ..,
+    // i+480) into registers before the FMAs, then runs them in the same
+    // ascending-i order, so the per-lane sum and the shfl tree are unchanged
+    // (bit-exact). One 2-B load per FMA left each warp latency-bound at ~52
+    // GB/s on gfx1151: kbench_hc2 (devlab 43686225170, 0 differing outputs)
+    // 125 -> 46 us at T=1, 111 -> 53 us at T=2, 127 -> 57 us at T=4.
+    constexpr unsigned int HC_DOWN_U = 16;
     for (unsigned int r = r0 + warp; r < r1; r += warps) {
         const __nv_bfloat16* row = down_w + (size_t)r * hc_dim;
         float acc = 0.0f;
-        for (unsigned int i = lane; i < hc_dim; i += 32) {
+        unsigned int i = lane;
+        for (; i + 32 * (HC_DOWN_U - 1) < hc_dim; i += 32 * HC_DOWN_U) {
+            __nv_bfloat16 w[HC_DOWN_U];
+            #pragma unroll
+            for (unsigned int u = 0; u < HC_DOWN_U; u++) w[u] = row[i + 32 * u];
+            #pragma unroll
+            for (unsigned int u = 0; u < HC_DOWN_U; u++) acc += (float)w[u] * smem_nx[i + 32 * u];
+        }
+        for (; i < hc_dim; i += 32) {
             acc += (float)row[i] * smem_nx[i];
         }
         #pragma unroll
