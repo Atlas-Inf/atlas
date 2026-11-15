@@ -81,8 +81,10 @@ elif os.environ.get("PHASE") == "decode":
                            "Write a Python class implementing an LRU cache with tests."]):
         body = {"model": "m", "messages": [{"role": "user", "content": q}], "max_tokens": 256, "temperature": 0}
         t = time.time(); req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
-        u = json.load(urllib.request.urlopen(req, timeout=1800)).get("usage", {}); dt = time.time() - t
-        print(f"  [prof] decode-{i}: {u.get('completion_tokens')} tok in {dt:.2f}s -> {u.get('completion_tokens', 0) / dt:.1f} tok/s", flush=True)
+        r = json.load(urllib.request.urlopen(req, timeout=1800)); u = r.get("usage", {}); dt = time.time() - t
+        txt = (r.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        import hashlib
+        print(f"  [prof] decode-{i}: {u.get('completion_tokens')} tok in {dt:.2f}s -> {u.get('completion_tokens', 0) / dt:.1f} tok/s | sha {hashlib.sha1(txt.encode()).hexdigest()[:12]} | {txt[:70]!r}", flush=True)
 elif os.environ.get("PHASE") == "score":
     # /v1/score (#331) attribution, the score_check.sh shape: a 44-token prefix with 8 x 12-token branches, then single
     # branches. Token ids are arbitrary in-vocab ids (no tokenizer needed; the kernels are the same). Needs MAX_BATCH >= 2.
