@@ -178,6 +178,11 @@ pub(crate) struct GlmVisionEncoder {
     pub buf_out: DevicePtr,
     /// False on a rank that only receives rows (built without weights).
     encodes: bool,
+    /// Bytes of each scratch buffer, in field order, when the arena lends
+    /// them ([`Self::new_lent`]); empty when the tower owns its scratch.
+    scratch: Vec<usize>,
+    /// Whether each encode must borrow the arena's span ([`Self::borrows_arena`]).
+    borrows: bool,
     pub out_hidden_size: usize,
     /// Pre-merge patches of the largest attention sequence (one still, or one
     /// temporal group of a video) the processor can emit.
@@ -237,15 +242,42 @@ impl GlmVisionEncoder {
         capacity: GlmCapacity,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
+        Self::build(weights, config, capacity, false, gpu)
+    }
+
+    /// An encoding tower that holds no scratch of its own: it borrows the
+    /// model's arena for each encode ([`Self::attach_lent_scratch`]), so the
+    /// KV pool keeps the scratch's bytes between encodes.
+    pub(crate) fn new_lent(
+        weights: GlmVisionWeights,
+        config: &VisionConfig,
+        capacity: GlmCapacity,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Self> {
+        Self::build(Some(weights), config, capacity, true, gpu)
+    }
+
+    fn build(
+        weights: Option<GlmVisionWeights>,
+        config: &VisionConfig,
+        capacity: GlmCapacity,
+        lent: bool,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Self> {
         let encodes = weights.is_some();
         let weights = weights.unwrap_or_else(GlmVisionWeights::absent);
         let mut scratch_bytes = 0usize;
+        let mut scratch_sizes = Vec::new();
         let mut alloc = |bytes: usize| {
-            if encodes {
-                scratch_bytes += bytes;
-                gpu.alloc(bytes)
-            } else {
+            if !encodes {
+                return Ok(DevicePtr::NULL);
+            }
+            scratch_bytes += bytes;
+            scratch_sizes.push(bytes);
+            if lent {
                 Ok(DevicePtr::NULL)
+            } else {
+                gpu.alloc(bytes)
             }
         };
         ensure!(
@@ -294,13 +326,17 @@ impl GlmVisionEncoder {
         let gib = |bytes: usize| bytes as f64 / (1u64 << 30) as f64;
         tracing::info!(
             "GLM vision tower: {p_max} patches per sequence, {out_rows} merged rows per encode \
-             ({:.2} GiB scratch + {:.2} GiB rows)",
+             ({:.2} GiB scratch{} + {:.2} GiB rows)",
             gib(scratch_bytes),
+            if lent { " lent by the arena" } else { "" },
             gib(out_rows * out_hidden * 2),
         );
+        let scratch = if lent { scratch_sizes } else { Vec::new() };
         Ok(Self {
             buf_out,
             encodes,
+            scratch,
+            borrows: false,
             out_hidden_size: config.out_hidden_size,
             p_max,
             out_rows,
@@ -342,5 +378,72 @@ impl GlmVisionEncoder {
             buf_rope_cos,
             buf_rope_sin,
         })
+    }
+}
+
+/// Alignment of each lent buffer inside the arena's span.
+const LENT_ALIGN: usize = 4096;
+
+/// Offsets of `sizes` packed at [`LENT_ALIGN`] and their total.
+fn lent_layout(sizes: &[usize]) -> (Vec<usize>, usize) {
+    let mut at = 0usize;
+    let offsets = sizes
+        .iter()
+        .map(|&bytes| {
+            let here = at;
+            at += bytes.next_multiple_of(LENT_ALIGN);
+            here
+        })
+        .collect();
+    (offsets, at)
+}
+
+impl GlmVisionEncoder {
+    /// Bytes this tower borrows for each encode: 0 when it owns its scratch.
+    pub(crate) fn lent_bytes(&self) -> usize {
+        lent_layout(&self.scratch).1
+    }
+
+    /// Point the scratch at `base`, [`Self::lent_bytes`] long: the arena's
+    /// lendable span (`borrowed`, so the caller brackets each encode with the
+    /// arena's `lend` and `return_lent`) or an allocation of the tower's own.
+    pub(crate) fn attach_lent_scratch(&mut self, base: DevicePtr, borrowed: bool) -> Result<()> {
+        let (offsets, _) = lent_layout(&self.scratch);
+        let [f32_, pixels, h1, norm, wide, act, conv, merger, cos, sin] = offsets[..] else {
+            anyhow::bail!(
+                "a lent GLM vision tower has ten scratch buffers, got {}",
+                offsets.len()
+            );
+        };
+        self.buf_f32 = base.offset(f32_);
+        self.buf_pixels = base.offset(pixels);
+        self.buf_h1 = base.offset(h1);
+        self.buf_norm = base.offset(norm);
+        self.buf_wide = base.offset(wide);
+        self.buf_act = base.offset(act);
+        self.buf_conv = base.offset(conv);
+        self.buf_merger = base.offset(merger);
+        self.buf_rope_cos = base.offset(cos);
+        self.buf_rope_sin = base.offset(sin);
+        self.borrows = borrowed;
+        Ok(())
+    }
+
+    /// Whether each encode runs in the arena's lent span, between its `lend`
+    /// and `return_lent`.
+    pub(crate) fn borrows_arena(&self) -> bool {
+        self.borrows
+    }
+}
+
+#[cfg(test)]
+mod lent_tests {
+    use super::{LENT_ALIGN, lent_layout};
+
+    #[test]
+    fn lent_buffers_are_aligned_and_disjoint() {
+        let (offsets, total) = lent_layout(&[3, LENT_ALIGN, 1]);
+        assert_eq!(offsets, vec![0, LENT_ALIGN, 2 * LENT_ALIGN]);
+        assert_eq!(total, 3 * LENT_ALIGN);
     }
 }

@@ -98,6 +98,10 @@ impl GlmVisionEncoder {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<Vec<(usize, usize, usize)>> {
+        ensure!(
+            !self.buf_f32.is_null(),
+            "GLM vision tower has no scratch: a lent tower encodes only after attach_lent_scratch"
+        );
         let mut out = Vec::with_capacity(sequences.len());
         let mut out_rows = 0usize;
         for &(pixels, grid_h, grid_w) in sequences {

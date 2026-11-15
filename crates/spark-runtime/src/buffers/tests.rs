@@ -103,7 +103,9 @@ fn test_buffer_arena_alloc() {
     // GGUF grouped MoE adds a moe_grouped_q8 arena buffer (06c89a33) that
     // this branch does not carry. Re-sync this count if that work is ever
     // picked.)
-    assert_eq!(gpu.alloc_count(), 31);
+    // 31 buffers, of which 15 (the lendable per-pass scratch, `lend`) are
+    // carved from one allocation: 31 - 15 + 1 = 17.
+    assert_eq!(gpu.alloc_count(), 17);
 }
 
 #[test]

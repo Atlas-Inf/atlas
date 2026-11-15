@@ -47,6 +47,8 @@ pub struct MockGpuBackend {
     host_pinned_allocs: AtomicUsize,
     /// Pending `free` failure injections (see [`Self::fail_next_free`]).
     pending_free_failures: AtomicUsize,
+    /// Pending `memset_async` failure injections (see [`Self::fail_next_memset`]).
+    pending_memset_failures: AtomicUsize,
     alloc_failure_countdown: Mutex<Option<usize>>,
     /// `free` calls on a pointer that is not the base of a live allocation
     /// (see [`Self::invalid_free_count`]).
@@ -92,6 +94,7 @@ impl MockGpuBackend {
             memsets: AtomicUsize::new(0),
             host_pinned_allocs: AtomicUsize::new(0),
             pending_free_failures: AtomicUsize::new(0),
+            pending_memset_failures: AtomicUsize::new(0),
             alloc_failure_countdown: Mutex::new(None),
             invalid_frees: AtomicUsize::new(0),
             destroyed_graphs: AtomicUsize::new(0),
@@ -116,6 +119,12 @@ impl MockGpuBackend {
     /// leaking (queue N to fail N consecutive frees).
     pub fn fail_next_free(&self) {
         self.pending_free_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Queue one `memset_async` failure: the next call returns an error,
+    /// writes nothing and consumes one queued failure.
+    pub fn fail_next_memset(&self) {
+        self.pending_memset_failures.fetch_add(1, Ordering::Relaxed);
     }
 
     /// `destroy_graph` calls so far — the tripwire proving a cleanup error

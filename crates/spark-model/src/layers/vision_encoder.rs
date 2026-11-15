@@ -20,6 +20,13 @@ fn glm_budget_tower(config: &atlas_core::config::ModelConfig) -> bool {
     config.tp_world_size.max(config.ep_world_size) > 1
 }
 
+/// Whether the encoding rank of `config`'s world borrows its tower's scratch
+/// from the model's arena instead of holding it: the budget tower, whose
+/// scratch is sized for a whole video group and idle between encodes.
+pub(crate) fn glm_lends_scratch(config: &atlas_core::config::ModelConfig) -> bool {
+    glm_budget_tower(config)
+}
+
 /// Whether this rank only receives encoded vision rows: a worker of a GLM-5
 /// multi-rank world. Rank 0 encodes every item and broadcasts its rows
 /// (`EP_CMD_VISION_STATE`), so a worker loads no vision weights and allocates

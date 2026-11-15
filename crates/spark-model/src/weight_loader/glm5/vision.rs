@@ -241,7 +241,11 @@ pub(crate) fn load(
         downsample_b: dense_ptr(store, &format!("{vp}.downsample.bias"))?,
         merger,
     };
-    let encoder = VisionEncoder::new_glm(Some(weights), vcfg, capacity, gpu)?;
+    let encoder = if crate::layers::vision_encoder::glm_lends_scratch(config) {
+        VisionEncoder::new_glm_lent(weights, vcfg, capacity, gpu)?
+    } else {
+        VisionEncoder::new_glm(Some(weights), vcfg, capacity, gpu)?
+    };
     // The tower holds BF16 copies of FP4-Local's quantized linears now.
     let mut released = 0;
     for stem in linear_stems(vp, vcfg.depth) {

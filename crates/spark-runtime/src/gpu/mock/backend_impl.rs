@@ -178,6 +178,13 @@ impl GpuBackend for MockGpuBackend {
     }
 
     fn memset_async(&self, ptr: DevicePtr, value: u8, bytes: usize, _stream: u64) -> Result<()> {
+        if self
+            .pending_memset_failures
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            anyhow::bail!("mock memset failed (injected): ptr {ptr}");
+        }
         self.memsets.fetch_add(1, Ordering::Relaxed);
         self.memset(ptr, value, bytes)
     }

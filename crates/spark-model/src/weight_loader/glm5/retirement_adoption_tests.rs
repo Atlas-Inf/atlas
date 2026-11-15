@@ -56,7 +56,9 @@ fn actual_model_adopts_only_filtered_store_and_teardown_frees_each_owner_once() 
     cfg.linear_num_value_heads = 0;
     cfg.num_mtp_modules = 0;
     let buffers = BufferArena::new(&cfg, 5, 64, 16, 1, gpu.as_ref()).unwrap();
-    let arena_norm = buffers.norm_output();
+    // The arena's per-pass members (`norm_output` among them) are one
+    // allocation, freed through the span's base.
+    let arena_span = buffers.lend_base();
     let kv = PagedKvCache::new(
         KvCacheConfig {
             block_size: 16,
@@ -117,7 +119,7 @@ fn actual_model_adopts_only_filtered_store_and_teardown_frees_each_owner_once() 
     {
         let recorded = frees.lock();
         assert!(
-            recorded.iter().position(|&p| p == arena_norm).unwrap()
+            recorded.iter().position(|&p| p == arena_span).unwrap()
                 < recorded.iter().position(|&p| p == gate).unwrap(),
             "arena released before adopted checkpoint store"
         );
