@@ -8,6 +8,7 @@ pub mod cache_recipe;
 pub mod hc;
 pub mod moe;
 pub mod ops;
+pub mod side;
 
 #[cfg(test)]
 mod test_support;
