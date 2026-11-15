@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <vector>
 #include <algorithm>
+#include <cstring>
 #define CHECK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { printf("HIP %s at %s:%d\n", hipGetErrorString(e_), __FILE__, __LINE__); exit(1); } } while (0)
 int main() {
     struct S { const char* nm; unsigned N, K; } shapes[] = {{"gdn qkvz", 16384, 2560}, {"gdn out", 2560, 6144}, {"attn q", 12288, 2560}, {"attn kv", 1024, 2560}, {"attn o", 2560, 8192}};
@@ -23,7 +24,18 @@ int main() {
         auto f = [&](int c) { hipLaunchKernelGGL(w8a16_gemv_batch4, dim3((s.N + 3) / 4), dim3(256), 0, 0, A, B[c], SC[c], C, M, s.N, s.K); };
         for (int i = 0; i < 4; i++) f(i % copies); CHECK(hipEventRecord(e0)); for (int i = 0; i < 40; i++) f(i % copies); CHECK(hipEventRecord(e1)); CHECK(hipEventSynchronize(e1));
         float ms; CHECK(hipEventElapsedTime(&ms, e0, e1)); const float us = 1000.f * ms / 40;
-        printf("-- %-9s N=%5u K=%5u M=%u: %7.1f us  %6.1f GB/s\n", s.nm, s.N, s.K, M, us, wb / 1e3 / us);
+        f(0); CHECK(hipDeviceSynchronize()); std::vector<__nv_bfloat16> r0((size_t)M * s.N), r1((size_t)M * s.N); CHECK(hipMemcpy(r0.data(), C, r0.size() * 2, hipMemcpyDeviceToHost));
+        printf("-- %-9s N=%5u K=%5u M=%u: batch4 %7.1f us %6.1f GB/s", s.nm, s.N, s.K, M, us, wb / 1e3 / us);
+        // KLOOP #141: the batch-8 tiers (vl2: 8 outputs/block; n2: 16 outputs/block), bit-identical per row per their docs.
+        auto tier = [&](int which) {
+            auto g = [&](int c) { if (which == 0) hipLaunchKernelGGL(w8a16_gemv_batch8_dyn_vl2, dim3((s.N + 7) / 8), dim3(256), 0, 0, A, B[c], SC[c], C, M, s.N, s.K);
+                                  else hipLaunchKernelGGL(w8a16_gemv_batch8_dyn_vl2_n2, dim3((s.N + 15) / 16), dim3(256), 0, 0, A, B[c], SC[c], C, M, s.N, s.K); };
+            for (int i = 0; i < 4; i++) g(i % copies); CHECK(hipEventRecord(e0)); for (int i = 0; i < 40; i++) g(i % copies); CHECK(hipEventRecord(e1)); CHECK(hipEventSynchronize(e1));
+            float m2; CHECK(hipEventElapsedTime(&m2, e0, e1)); const float u2 = 1000.f * m2 / 40;
+            CHECK(hipMemset(C, 0xFF, r1.size() * 2)); g(0); CHECK(hipDeviceSynchronize()); CHECK(hipMemcpy(r1.data(), C, r1.size() * 2, hipMemcpyDeviceToHost));
+            printf(" | %s %6.1f us x%.2f %s", which ? "n2" : "vl2", u2, us / u2, memcmp(r0.data(), r1.data(), r0.size() * 2) ? "DIFF" : "same");
+        };
+        tier(0); tier(1); printf("\n");
         for (int c = 0; c < copies; c++) { hipFree(B[c]); hipFree(SC[c]); } hipFree(A); hipFree(C);
     }
     return 0;
