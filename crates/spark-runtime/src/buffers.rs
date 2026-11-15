@@ -23,8 +23,8 @@ pub use decode_meta::{
     padded_batch_rung,
 };
 pub use sizes::{
-    BufferSizes, HC_SCRATCH_ALIGN, HcPreScratchLayout, QSA_SELECT_SCRATCH_ROWS,
-    hc_pre_scratch_layout,
+    BufferSizes, GLM_ATTENTION_PIECE_ROWS, HC_SCRATCH_ALIGN, HcPreScratchLayout,
+    QSA_SELECT_SCRATCH_ROWS, hc_pre_scratch_layout, router_worklist_bytes,
 };
 pub use sizes_q2::q2_dequant_scratch_bytes;
 pub use sizes_q12::{
@@ -91,7 +91,8 @@ pub struct BufferArena {
     /// Zero-filled BF16 weight (max_dim) for unweighted RMSNorm under the
     /// offset-from-1 kernel convention (scale = 1+weight → 1.0). Used by q_b_norm.
     norm_unit_w: DevicePtr,
-    /// HC residual streams: [M, hc_mult, hidden] BF16 (DeepSeek-V4 mHC).
+    /// HC residual streams: [M, hc_mult, hidden] F32 (BF16 for a model that
+    /// keeps its highway BF16; see `BufferSizes::hc_streams`).
     hc_streams: DevicePtr,
     /// HC `post` mixing weights: [M, hc_mult] F32.
     hc_post: DevicePtr,
@@ -160,6 +161,9 @@ pub struct BufferArena {
     lend_unzeroed: usize,
     /// Maximum batch tokens this arena was sized for.
     max_batch_tokens: usize,
+    /// Rows `ssm_conv_out_f32` holds at its widest writer's row
+    /// (`BufferSizes::conv_wide_rows`), for `zero_dirty`.
+    conv_wide_rows: usize,
     /// Rows a pass may have written since the arena was last all zero
     /// (`accessors`, `zero_dirty`); `usize::MAX` when unknown.
     dirty_rows: std::sync::atomic::AtomicUsize,
@@ -362,6 +366,7 @@ impl BufferArena {
             lend_bytes,
             lend_unzeroed,
             max_batch_tokens,
+            conv_wide_rows: sizes.conv_wide_rows(config, max_batch_tokens),
             dirty_rows: std::sync::atomic::AtomicUsize::new(usize::MAX),
             decode_meta,
             sizes,

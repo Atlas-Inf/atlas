@@ -210,7 +210,7 @@ impl Glm5KdaLayer {
 
         // Recurrent state is sequence-private. Only submission of this core
         // changes; all projections and subsequent normalization stay identical.
-        let convolved = ctx.buffers.ssm_conv_out_f32();
+        let convolved = self.convolved_rows(n, ctx)?;
         let core_out = ctx.buffers.attn_output();
         let packed_row_bytes = 3 * p * bf16;
         let gate_row_bytes = p * bf16;

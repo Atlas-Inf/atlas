@@ -8,6 +8,9 @@ use atlas_core::device::sm121::NUM_SMS;
 use super::sizes_q12::{Q12_SIZING_STREAMS, q12_batched_scratch_bytes};
 
 #[cfg(test)]
+#[path = "sizes_glm_tests.rs"]
+mod glm_tests;
+#[cfg(test)]
 #[path = "sizes_total_tests.rs"]
 mod total_tests;
 
@@ -96,6 +99,36 @@ mod hc_scratch_layout_tests {
     }
 }
 
+/// Rows of the widest attention piece of a GLM-5 prefill chunk: its native
+/// sparse attention and FlashKDA take at most this many rows a call, and a
+/// wider chunk runs them piece by piece (`spark-model`
+/// `layer::PREFILL_ATTENTION_ROWS`, `glm_sparse_native_plan::admit`).
+pub const GLM_ATTENTION_PIECE_ROWS: usize = 4100;
+
+/// Bytes of the MoE tile-worklist scratch for `rows` rows: a 16-byte tile
+/// count and one 8-byte item per row, routed expert and 128-wide tile of the
+/// expert intermediate. Every worklist the MoE builds in `moe_router_in_f32`
+/// is at most this for the rows it serves, and each checks the capacity
+/// before it writes (`spark-model` `moe::prequant_fp4`, `moe::decode_m16`,
+/// `moe::route_fuse`, `moe::gate_up_btile_grouped`).
+pub fn router_worklist_bytes(rows: usize, top_k: usize, inter: usize) -> usize {
+    16 + rows * top_k * inter.div_ceil(128) * 8
+}
+
+/// Whether `moe_router_in_f32` keeps its FP32 `[rows, hidden]` size. Only
+/// `ATLAS_FP32_ROUTING=1` reads a router input there
+/// (`MoeLayer::fp32_routing_active`), and never on a correction-bias router;
+/// without it the buffer is worklist scratch. Per-layer expert shapes keep
+/// the full size: the worklist bound is stated for one shape. Only GLM-5 is
+/// trimmed: the other correction-bias models have not run with less.
+fn fp32_router_input(config: &ModelConfig) -> bool {
+    config.model_type != "glm5_next"
+        || !config.use_routing_bias
+        || !config.moe_intermediate_sizes.is_empty()
+        || !config.num_experts_per_toks.is_empty()
+        || std::env::var("ATLAS_FP32_ROUTING").as_deref() == Ok("1")
+}
+
 /// Byte sizes of each buffer, derived from ModelConfig.
 #[derive(Debug, Clone)]
 pub struct BufferSizes {
@@ -111,6 +144,8 @@ pub struct BufferSizes {
     pub gate_logits_f32: usize,
     /// FP32 MoE-input norm output [m, hidden] for ATLAS_FP32_ROUTING — the
     /// full-precision router_in the gate GEMM consumes. Allocated when experts > 0.
+    /// A correction-bias router never takes that path, and the buffer is then
+    /// only the MoE tile-worklist scratch ([`router_worklist_bytes`]).
     pub moe_router_in_f32: usize,
     pub moe_output: usize,
     pub logits: usize,
@@ -139,7 +174,8 @@ pub struct BufferSizes {
     pub norm_unit_w: usize,
     /// HC residual streams: `[M, streams, hidden]` F32, where `streams` is
     /// `hc_mult` (DeepSeek-V4 mHC) or `hc_count` (qwen4_exp), whichever the
-    /// model sets. 256 (placeholder) when neither is set.
+    /// model sets; BF16 when the model keeps its highway BF16
+    /// (`ModelConfig::hc_highway_bf16`). 256 (placeholder) when neither is set.
     pub hc_streams: usize,
     /// HC `post` mixing weights: `[M, hc_mult]` F32.
     pub hc_post: usize,
@@ -498,6 +534,15 @@ impl BufferSizes {
             (0, 0, 0)
         };
 
+        // GLM-5's linear-attention layers are KDA, whose prefill convolution
+        // writes BF16 (`causal_conv1d_update_prefill*`), and its MLA has no
+        // RoPE partition and no low-rank O projection, the other two users
+        // that scale this buffer with the rows.
+        let kda_conv_bf16 = config.model_type == "glm5_next"
+            && config.linear_num_value_heads > 0
+            && config.qk_rope_head_dim == 0
+            && config.o_lora_rank == 0;
+
         Self {
             hidden_states: m * h * residual_elem,
             residual: m * h * residual_elem,
@@ -526,10 +571,17 @@ impl BufferSizes {
             } else {
                 256
             },
-            moe_router_in_f32: if config.num_experts > 0 {
+            moe_router_in_f32: if config.num_experts == 0 {
+                256
+            } else if fp32_router_input(config) {
                 m * h * 4
             } else {
-                256
+                // Worklist scratch only. One FP32 row stays, the size a
+                // one-row arena always had, and the K128W row-tile prefix
+                // (one word an expert, the end and the work counter).
+                router_worklist_bytes(m, top_k, config.moe_intermediate_size)
+                    .max(h * 4)
+                    .max((config.num_experts + config.zero_expert_num + 2) * 4)
             },
             moe_output: m * h * bf16,
             logits: logits_tokens * config.vocab_size * bf16, // BF16 from LM head kernel
@@ -571,13 +623,23 @@ impl BufferSizes {
             // FP32 conv output for SSM recurrent path precision (4 bytes/element).
             // Uses ssm_qkvz_size as upper bound (includes Q+K+V+Z).
             // Also reused by MLA as q_rope contiguous buffer: [M, nq * qk_rope_head_dim] BF16.
-            ssm_conv_out_f32: (m * config.ssm_qkvz_size() * 4)
-                .max(if config.kv_lora_rank > 0 {
-                    m * q_heads * config.qk_rope_head_dim * bf16
-                } else {
-                    0
-                })
-                .max(256),
+            ssm_conv_out_f32: if kda_conv_bf16 {
+                // GLM-5 KDA convolves q|k|v into `[M, 3p]` BF16 rows, not the
+                // GDN's FP32 q|k|v|z. The first rows keep the FP32 width:
+                // what an attention piece borrows of this buffer (the native
+                // sparse attention's padded queries) fits as it always did.
+                (m * config.ssm_qkv_size() * bf16)
+                    .max(m.min(GLM_ATTENTION_PIECE_ROWS) * config.ssm_qkvz_size() * 4)
+                    .max(256)
+            } else {
+                (m * config.ssm_qkvz_size() * 4)
+                    .max(if config.kv_lora_rank > 0 {
+                        m * q_heads * config.qk_rope_head_dim * bf16
+                    } else {
+                        0
+                    })
+                    .max(256)
+            },
             scratch,
             expert_gate_out,
             expert_up_out,
@@ -625,7 +687,12 @@ impl BufferSizes {
                 // (`ops::qwen4exp`) and never read this arena buffer, so the
                 // per-family branch was removed rather than left as a trap for
                 // whoever reads it next.
-                m * hc_streams_count * h * 4
+                //
+                // GLM-5 under `ATLAS_GLM_HC_BF16=1` is the one exception, and
+                // it serves the `_bf16` twins of those kernels on a BF16
+                // highway (`hc_kernel_name`): half the bytes. The model build
+                // checks this size against the format it serves.
+                m * hc_streams_count * h * if config.hc_highway_bf16 { bf16 } else { 4 }
             } else {
                 256
             },
@@ -697,6 +764,15 @@ impl BufferSizes {
         }
     }
 
+    /// Rows of an `m`-row arena's `ssm_conv_out_f32` at the FP32 q|k|v|z
+    /// row its widest writers reach (an attention piece's borrow is narrower):
+    /// `m` unless the buffer was sized for GLM-5's BF16 convolution.
+    /// `zero_dirty` shares this buffer out by these rows, so what it zeroes
+    /// for a pass of `n` rows is what it zeroed before the trim.
+    pub(super) fn conv_wide_rows(&self, config: &ModelConfig, m: usize) -> usize {
+        m.min(self.ssm_conv_out_f32 / (config.ssm_qkvz_size() * 4).max(1))
+    }
+
     /// Total bytes across all buffers: the lendable members as their one
     /// aligned span (`lend`), the rest as allocated.
     pub fn total_bytes(&self) -> usize {
@@ -750,6 +826,18 @@ mod qwen4exp_hc_tests {
         // every entry point. bf16 here would not fail — it would read the
         // wrong half of every value.
         assert_eq!(sizes.hc_streams, 128 * 4 * 2560 * 4);
+    }
+
+    /// GLM-5 keeps its highway BF16 (`ATLAS_GLM_HC_BF16=1`); the launcher
+    /// says so in the config and the arena then holds BF16 rows.
+    #[test]
+    fn a_bf16_highway_is_half_the_bytes() {
+        let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+        cfg.hc_mult = 4;
+        cfg.hidden_size = 4096;
+        cfg.hc_highway_bf16 = true;
+        let sizes = BufferSizes::from_config(&cfg, 8196, 2048, 16, 1);
+        assert_eq!(sizes.hc_streams, 8196 * 4 * 4096 * 2);
     }
 
     /// A real `qwen4_exp` config sets BOTH spellings — the parser maps

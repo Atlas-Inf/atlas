@@ -76,7 +76,7 @@ impl Glm5KdaLayer {
             p as u32,
             stream,
         )?;
-        let convolved = ctx.buffers.ssm_conv_out_f32();
+        let convolved = self.convolved_rows(total, ctx)?;
         let core_out = ctx.buffers.attn_output();
         let row = PackedRowBytes::new(p, self.heads, bf16);
         for owner in owners.iter_mut() {

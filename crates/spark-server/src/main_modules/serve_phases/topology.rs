@@ -77,6 +77,9 @@ pub(crate) fn resolve_topology(
         && matches!(ep_size, 2 | 4)
         && tp_size == ep_size
         && world_size == ep_size;
+    // The arena sizes the mHC highway for the format the model keeps it in
+    // (environment only, so the same before and after CUDA is up).
+    config.hc_highway_bf16 = spark_model::layers::ops::hc_bf16_for(&config.model_type);
     if tp_size > 1 {
         // EXL3 packs each linear into 16x16 trellis tiles laid out
         // [in/16, out/16, ...]; a tile is atomic, so the tensor cannot be

@@ -486,6 +486,14 @@ pub struct ModelConfig {
     /// and the existing all-reduce sums the partial outputs.
     #[serde(skip)]
     pub expert_tp: bool,
+    /// The mHC highway is stored BF16, not FP32 (GLM-5 under
+    /// `ATLAS_GLM_HC_BF16=1`): the launcher copies the model's own answer
+    /// (`spark_model::layers::ops::hc_bf16_for`) here so the buffer arena,
+    /// which cannot see that policy, sizes `hc_streams` for the elements the
+    /// kernels read. Left false, the arena keeps the FP32 size (never too
+    /// small); the model build refuses an arena smaller than its highway.
+    #[serde(skip)]
+    pub hc_highway_bf16: bool,
 
     // ── Tensor Parallelism (set at runtime, not from config.json) ──
     /// TP rank within the TP sub-communicator. 0 if `tp_world_size==1`.

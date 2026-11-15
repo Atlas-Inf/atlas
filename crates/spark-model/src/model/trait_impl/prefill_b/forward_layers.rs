@@ -441,6 +441,10 @@ impl TransformerModel {
                 && self.config.hc_mult > 0
             {
                 let n = proc_count * self.config.hc_mult * self.config.hidden_size;
+                anyhow::ensure!(
+                    n * 4 <= ctx.buffers.sizes().hc_streams,
+                    "ATLAS_DUMP_HYPER_RMS reads an FP32 highway; this one is BF16"
+                );
                 let mut buf = vec![0u8; n * 4];
                 self.gpu
                     .copy_d2h_on_stream(ctx.buffers.hc_streams(), &mut buf, stream)?;
