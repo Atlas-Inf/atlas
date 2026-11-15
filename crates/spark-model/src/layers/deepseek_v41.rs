@@ -5,6 +5,7 @@
 //! produce and the layers after them read.
 
 pub mod cache_recipe;
+pub mod hc;
 pub mod ops;
 
 #[cfg(test)]

@@ -15,7 +15,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use super::*;
 use crate::layers::deepseek_v41::cache_recipe as recipe;
 use crate::layers::deepseek_v41::test_support::{
-    Recording, backend, bf16s, download, le_bytes, upload,
+    Recording, backend, bf16s, closeness, download, le_bytes, picks, rows_of, upload,
 };
 use crate::layers::ops::rms_norm;
 use crate::weight_map::test_checkpoint::read_checkpoint_tensor;
@@ -48,34 +48,6 @@ fn load_fp8(gpu: &dyn GpuBackend, prefix: &str) -> Result<(Mxfp8Weight, usize, u
         tiled: false,
     };
     Ok((w, n, k))
-}
-
-/// Rows `picks` of a recorded `[.., rows, width]` tensor.
-fn rows_of(all: &[u8], width: usize, picks: &[usize]) -> Vec<u8> {
-    picks
-        .iter()
-        .flat_map(|&row| all[row * width * 2..(row + 1) * width * 2].iter().copied())
-        .collect()
-}
-
-/// How close `got` is to the recorded `want`: the share of BF16 values equal,
-/// and the relative L2 distance.
-fn closeness(got: &[u16], want: &[u16]) -> (f64, f64) {
-    let value = |bits: u16| f64::from(recipe::bf16_to_f32(bits));
-    let same = got.iter().zip(want).filter(|(a, b)| a == b).count();
-    let (mut diff, mut norm) = (0.0, 0.0);
-    for (&a, &b) in got.iter().zip(want) {
-        diff += (value(a) - value(b)).powi(2);
-        norm += value(b).powi(2);
-    }
-    (same as f64 / got.len() as f64, (diff / norm).sqrt())
-}
-
-/// Prefill rows spread over the prompt.
-fn picks(rec: &Recording, count: usize) -> Vec<usize> {
-    (0..count)
-        .map(|i| i * (rec.prefill - 1) / (count - 1))
-        .collect()
 }
 
 #[test]
