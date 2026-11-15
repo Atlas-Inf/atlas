@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! A four-rank sequence-parallel KDA layer gathers its attention input
-//! already cast and side-projected (the chain always; the pair gathers BF16
-//! rows).
+//! already cast and side-projected (the chain always; the pair under
+//! `ATLAS_GLM_SP_QUANT_GATHER_PAIR` when each rank's part is whole 128-row
+//! scale tiles, which its own 8196-row chunks are not: `=2` cuts them to
+//! 8192; else it gathers BF16 rows).
 //!
 //! The attention seam all-gathers the BF16 normed rows (8 KiB a row at
 //! hidden 4096). On the W8A8 prefill path every reader of a peer row is
@@ -29,7 +31,11 @@ impl Glm5KdaLayer {
     /// Whether this prefill over `sp` gathers its attention input cast and
     /// side-projected: the seam then gathers no BF16 rows.
     pub(super) fn sp_kda_quant_gather(&self, sp: SpRows, ctx: &ForwardContext) -> bool {
-        sp.ranks > 2
+        sp.quant_gathers()
+            // The pair's KDA gather is mode 2's alone: mode 1 keeps its own
+            // chunks, and a tail that happens to land on the tile grid stays
+            // on the BF16 gather the rest of that prompt took.
+            && (sp.ranks > 2 || crate::layers::glm_sp::quant_gather_pair() == 2)
             && sp.rows * (sp.ranks - 1) == sp.peer_rows
             && sp.rows.is_multiple_of(ops::MX_LT_TILE_ROWS)
             && !ctx.graph_capture

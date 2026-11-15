@@ -4,7 +4,9 @@
 //! kernel build): the row-local steps `route_sp_quantized` runs on one
 //! rank's rows -- the router GEMM on `ops::bf16_gemm_f32out`'s CUTLASS tiles
 //! (FP32 logits), the sigmoid top-k and the NVFP4 quantization -- leave, on
-//! each quarter of a chunk, that quarter's bytes of the whole chunk's run.
+//! each quarter of a chunk (a chain rank's part), on each half (a pair
+//! rank's, `ATLAS_GLM_SP_QUANT_GATHER_PAIR`) and on each of a half's four
+//! seam blocks, those rows' bytes of the whole chunk's run.
 //!
 //!   cargo test --release -p spark-model --lib sp_quant_gather -- --ignored --nocapture
 
@@ -140,31 +142,39 @@ fn quarter_routes_are_the_whole_chunks_bytes() -> Result<()> {
     )?;
     for (total, seed) in [(8192u32, 1u64), (8196, 2), (16384, 3)] {
         let input = upload(&gpu, &values(seed, (total * H) as usize, 2.0))?;
-        let (whole, quarters) = (Outs::new(&gpu, total)?, Outs::new(&gpu, total)?);
+        let whole = Outs::new(&gpu, total)?;
         route(&gpu, input, gate, bias, &whole, 0, total, stream)?;
-        let rows = total / 4;
-        for part in 0..4 {
-            route(
-                &gpu,
-                input,
-                gate,
-                bias,
-                &quarters,
-                part * rows,
-                rows,
-                stream,
-            )?;
-        }
-        gpu.synchronize(stream)?;
-        let covered = rows * 4;
-        let (want, got) = (whole.bytes(&gpu, covered)?, quarters.bytes(&gpu, covered)?);
-        for (name, (w, g)) in ["logits", "ids", "weights", "packed", "scales"]
-            .iter()
-            .zip(want.iter().zip(&got))
-        {
-            ensure!(w == g, "{total} rows: {name} of the quarters differ");
+        // The chain's quarters, the pair's halves, and the pair's halves in
+        // the four seam blocks `glm_sp_overlap` cuts (1025, 1025, 1025 and
+        // 1023 rows of a 4098-row half).
+        for (ranks, blocks) in [(4u32, 1u32), (2, 1), (2, 4)] {
+            let part = total / ranks;
+            let block = part.div_ceil(blocks);
+            let split = Outs::new(&gpu, total)?;
+            for rank in 0..ranks {
+                for r0 in (0..part).step_by(block as usize) {
+                    let rows = block.min(part - r0);
+                    let row0 = rank * part + r0;
+                    route(&gpu, input, gate, bias, &split, row0, rows, stream)?;
+                }
+            }
+            gpu.synchronize(stream)?;
+            let covered = part * ranks;
+            let (want, got) = (whole.bytes(&gpu, covered)?, split.bytes(&gpu, covered)?);
+            for (name, (w, g)) in ["logits", "ids", "weights", "packed", "scales"]
+                .iter()
+                .zip(want.iter().zip(&got))
+            {
+                ensure!(
+                    w == g,
+                    "{total} rows, {ranks} parts in {blocks} blocks: {name} of the parts differ"
+                );
+            }
         }
     }
-    println!("router, top-k and NVFP4 rows: quarters == whole at 8192, 8196, 16384");
+    println!(
+        "router, top-k and NVFP4 rows: quarters, halves and a half's seam blocks == whole at \
+         8192, 8196, 16384"
+    );
     Ok(())
 }

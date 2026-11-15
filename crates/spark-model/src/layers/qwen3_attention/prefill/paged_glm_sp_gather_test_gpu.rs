@@ -5,7 +5,8 @@
 //! the semantic indexer gives their outputs the whole chunk's bytes.
 //!
 //! - The per-token-group cast of each quarter and sixteenth of a chunk (a
-//!   rank's part, a seam block), placed at its rows, is the whole chunk's
+//!   rank's part, a seam block; each half and eighth too, the pair's under
+//!   `ATLAS_GLM_SP_QUANT_GATHER_PAIR`), placed at its rows, is the whole chunk's
 //!   cast, and the W8A8 block FP8 GEMM on those cast rows
 //!   (`Fp8bRows::Cast`) writes the BF16 rows' output: on the probed path
 //!   and on both of the in-tree hand paths, with an FP8 scratch that takes
@@ -122,7 +123,7 @@ fn sp_mla_cast_quarters_are_the_whole_chunks_bytes() -> Result<()> {
         };
         quant(x, (0, m), act, scale)?;
         let want = [read(g, act, m * H)?, read(g, scale, m * groups * 4)?];
-        for parts in [RANKS, 4 * RANKS]
+        for parts in [RANKS, 4 * RANKS, 2, 8]
             .into_iter()
             .filter(|p| m.is_multiple_of(*p))
         {
@@ -189,8 +190,12 @@ fn sp_mla_cast_quarters_are_the_whole_chunks_bytes() -> Result<()> {
         // The indexer's keys GEMM per owner (the whole chunk, or a first
         // piece and the rest) on one part's rows.
         let wk = upload(g, &rng.bf16(128 * H, 0.03))?;
-        let rows = m / RANKS;
-        for owners in [vec![(0, m)], vec![(0, 2048), (2048, m - 2048)]] {
+        for (owners, ranks) in [vec![(0, m)], vec![(0, 2048), (2048, m - 2048)]]
+            .into_iter()
+            .flat_map(|owners| [(owners.clone(), RANKS), (owners, 2)])
+        {
+            // A chain rank's part, or a pair rank's.
+            let rows = m / ranks;
             let gemm = |input: DevicePtr, out: DevicePtr| -> Result<()> {
                 for &(row0, on) in &owners {
                     ops::bf16_gemm(
@@ -208,7 +213,7 @@ fn sp_mla_cast_quarters_are_the_whole_chunks_bytes() -> Result<()> {
             let whole = poison(g, m * 256)?;
             gemm(x, whole)?;
             let want = read(g, whole, m * 256)?;
-            for part in 0..RANKS {
+            for part in 0..ranks {
                 let only = poison(g, m * H * 2)?;
                 g.copy_d2d_async(
                     x.offset(part * rows * H * 2),
@@ -223,7 +228,7 @@ fn sp_mla_cast_quarters_are_the_whole_chunks_bytes() -> Result<()> {
                 let span = part * rows * 256..(part + 1) * rows * 256;
                 ensure!(
                     got[span.clone()] == want[span],
-                    "{m} rows, owners {owners:?}: part {part}'s index keys differ"
+                    "{m} rows, owners {owners:?}: part {part} of {ranks}'s index keys differ"
                 );
                 g.free(only)?;
                 g.free(out)?;

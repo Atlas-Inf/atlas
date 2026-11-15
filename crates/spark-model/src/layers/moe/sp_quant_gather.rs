@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! A four-rank sequence-parallel MoE gathers its input already routed and
-//! quantized (the chain always; the pair gathers BF16 rows).
+//! quantized (the chain always; the pair under
+//! `ATLAS_GLM_SP_QUANT_GATHER_PAIR`, else it gathers BF16 rows).
 //!
 //! The seam before a chain MoE all-gathers the BF16 normed rows (8 KiB a row
 //! at hidden 4096) so that every rank can route and quantize all of them.
@@ -14,6 +15,10 @@
 //! row's top-k ids and weights: 2368 bytes a row, in one staged gather. The
 //! sort, the K128W gate/up and down and the unpermute then see the bytes the
 //! BF16 gather would have led to.
+//!
+//! Nothing here depends on the rank count: the gather is `SpRows::all_gather`
+//! (whole) or the seam's `SpRows::all_gather_block`, which on the pair swap
+//! this rank's staged rows for the peer's over its exchange.
 
 use super::route_fuse::Routes;
 use super::*;
@@ -33,7 +38,9 @@ impl MoeLayer {
     pub fn sp_quant_gather(&self, sp: SpRows, ctx: &ForwardContext) -> bool {
         let (n, h) = (sp.total() as u32, ctx.config.hidden_size as u32);
         let inter = ctx.config.routed_inter_local() as u32;
-        sp.ranks > 2
+        sp.quant_gathers()
+            // An MXFP8 shared expert's slice reads every row of the input.
+            && (sp.ranks > 2 || !self.shared_joins_reduce())
             && !sp.full_shared
             && ctx.config.model_type == "glm5_next"
             && ctx.comm.is_some()

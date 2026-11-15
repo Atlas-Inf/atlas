@@ -103,6 +103,117 @@ fn overlapped_seam_leaves_the_whole_seams_bytes() {
     }
 }
 
+/// The BF16 widths of the staged tensors a quantized gather moves in place
+/// of the normed rows: here two, as the MLA input's E4M3 rows and their
+/// scales are (the MoE's 2368-byte rows and the KDA's 4864 are one), neither
+/// a multiple of the reduced width.
+const STAGED: [usize; 2] = [37, 1];
+
+/// Rows `rows` of staged tensor `which`, `width` bytes each: from the row's
+/// place in the chunk alone, as every rank casts a row to the same bytes.
+fn staged_rows(rows: std::ops::Range<usize>, width: usize, which: usize) -> Vec<u8> {
+    rows.flat_map(|r| (0..width).map(move |b| (r * 31 + b * 7 + which * 13 + 1) as u8))
+        .collect()
+}
+
+/// A pair seam under `ATLAS_GLM_SP_QUANT_GATHER_PAIR`: the reduce-scatter
+/// and the site as before, then, in place of the normed rows' gather, that
+/// of the [`STAGED`] tensors, whose local rows the site writes block by
+/// block (`group` blocks a gather; `None`: the whole seam's form). Each
+/// rank's reduced local rows and its staged tensors.
+fn run_pair_staged(total: usize, group: Option<usize>) -> [(Vec<u8>, Vec<Vec<u8>>); 2] {
+    let wire = Arc::new(Wire::default());
+    let run = |rank: usize| {
+        let gpu = MockGpuBackend::new();
+        let pair = LoopPair {
+            gpu: &gpu,
+            rank,
+            wire: wire.clone(),
+        };
+        let sp = SpRows::for_rank(total, rank, 2);
+        let start: Vec<u8> = (0..total * W)
+            .flat_map(|i| bf16(i as f32 * 0.11 + rank as f32 * 7.0 - 50.0).to_le_bytes())
+            .collect();
+        let buf = gpu.alloc(start.len()).unwrap();
+        gpu.copy_h2d(&start, buf).unwrap();
+        // The peer's rows hold this rank's own garbage until gathered.
+        let staged = STAGED.map(|w| {
+            let p = gpu.alloc(total * w * 2).unwrap();
+            gpu.copy_h2d(&vec![0xa5 ^ rank as u8; total * w * 2], p)
+                .unwrap();
+            (p, w)
+        });
+        let stage = |(r0, rows): (usize, usize)| {
+            let first = sp.row0 + r0;
+            for (which, &(p, w)) in staged.iter().enumerate() {
+                let bytes = staged_rows(first..first + rows, w * 2, which);
+                gpu.copy_h2d(&bytes, p.offset(first * w * 2)).unwrap();
+            }
+        };
+        with_ctx(&gpu, &pair, |ctx| match group {
+            Some(group) => {
+                let blocks = cut(sp.rows, 4).unwrap();
+                let gather = Some((&staged[..], group));
+                pipelined(sp, &blocks, Some(buf), gather, W, ctx, 0, |b| {
+                    site_on_host(&gpu, buf, sp.row0, b);
+                    stage(b);
+                    Ok(())
+                })
+                .unwrap();
+            }
+            None => {
+                sp.reduce_scatter(buf, W, ctx, 0).unwrap();
+                site_on_host(&gpu, buf, sp.row0, (0, sp.rows));
+                stage((0, sp.rows));
+                for &(p, w) in &staged {
+                    sp.all_gather(p, w, ctx, 0).unwrap();
+                }
+            }
+        });
+        let read = |p: DevicePtr, bytes: usize| {
+            let mut out = vec![0u8; bytes];
+            gpu.copy_d2h(p, &mut out).unwrap();
+            out
+        };
+        let local = read(sp.local(buf, W), sp.rows * W * 2);
+        let staged = staged.iter().map(|&(p, w)| read(p, total * w * 2));
+        (local, staged.collect())
+    };
+    std::thread::scope(|s| {
+        let a = s.spawn(|| run(0));
+        let b = s.spawn(|| run(1));
+        [a.join().unwrap(), b.join().unwrap()]
+    })
+}
+
+#[test]
+fn a_pair_seam_gathers_staged_rows_in_place_of_the_normed_ones() {
+    // 8196: the pair's own chunk, 4098 rows a part in blocks of 1025 and 1023.
+    for total in [4096usize, 8196, 5388] {
+        let whole = run_pair(total, false);
+        let want: Vec<Vec<u8>> = STAGED
+            .iter()
+            .enumerate()
+            .map(|(which, &w)| staged_rows(0..total, w * 2, which))
+            .collect();
+        for group in [None, Some(1), Some(2), Some(4)] {
+            let got = run_pair_staged(total, group);
+            for (rank, (local, staged)) in got.iter().enumerate() {
+                let sp = SpRows::for_rank(total, rank, 2);
+                let rows = sp.row0 * W * 2..(sp.row0 + sp.rows) * W * 2;
+                assert!(
+                    local.as_slice() == &whole[rank][rows],
+                    "{total}, group {group:?}: rank {rank}'s reduced rows differ"
+                );
+                assert!(
+                    *staged == want,
+                    "{total}, group {group:?}: rank {rank} lacks a rank's staged rows"
+                );
+            }
+        }
+    }
+}
+
 /// Four ranks through a host mailbox, landing at once: the chain's
 /// all-reduce ((x0 + x1) + (x2 + x3)), reduce-scatter (that sum of each
 /// rank's own segment) and gather. `rs` says whether the reduce-scatter is
