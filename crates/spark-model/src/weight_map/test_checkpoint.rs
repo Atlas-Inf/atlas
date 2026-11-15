@@ -21,14 +21,24 @@ pub(crate) fn read_checkpoint_tensor(
     let shard = index["weight_map"][name]
         .as_str()
         .with_context(|| format!("{name}: not in the index"))?;
-    let mut f = std::fs::File::open(dir.join(shard))?;
+    read_safetensors_tensor(&dir.join(shard), name)
+}
+
+/// `(dtype, shape, raw bytes)` of tensor `name` in the safetensors file `path`.
+pub(crate) fn read_safetensors_tensor(
+    path: &Path,
+    name: &str,
+) -> Result<(String, Vec<usize>, Vec<u8>)> {
+    let mut f = std::fs::File::open(path).with_context(|| path.display().to_string())?;
     let mut len = [0u8; 8];
     f.read_exact(&mut len)?;
     let len = u64::from_le_bytes(len);
     let mut header = vec![0u8; len as usize];
     f.read_exact(&mut header)?;
     let header: serde_json::Value = serde_json::from_slice(&header)?;
-    let t = &header[name];
+    let t = header
+        .get(name)
+        .with_context(|| format!("{name}: not in {}", path.display()))?;
     let shape = serde_json::from_value(t["shape"].clone())?;
     let [lo, hi]: [u64; 2] = serde_json::from_value(t["data_offsets"].clone())?;
     f.seek(SeekFrom::Start(8 + len + lo))?;

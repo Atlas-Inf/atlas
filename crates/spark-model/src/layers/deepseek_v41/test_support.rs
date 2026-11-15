@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Shared by the V4.1 GPU tests: the backend on this build's kernel target,
+//! host <-> device copies, and the reference recording.
+
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use spark_runtime::cuda_backend::AtlasCudaBackend;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
+
+use crate::weight_map::test_checkpoint::read_safetensors_tensor;
+
+pub(crate) fn backend() -> Result<&'static AtlasCudaBackend> {
+    static GPU: std::sync::OnceLock<AtlasCudaBackend> = std::sync::OnceLock::new();
+    if GPU.get().is_none() {
+        let gpu =
+            AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules()).context("CUDA backend")?;
+        let _ = GPU.set(gpu);
+    }
+    let gpu = GPU.get().expect("set above");
+    gpu.bind_to_thread()?;
+    Ok(gpu)
+}
+
+pub(crate) fn upload(gpu: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
+    let p = gpu.alloc(bytes.len().max(1))?;
+    gpu.copy_h2d(bytes, p)?;
+    Ok(p)
+}
+
+pub(crate) fn bf16s(bytes: &[u8]) -> Vec<u16> {
+    bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect()
+}
+
+pub(crate) fn le_bytes<T: Copy, const N: usize>(
+    values: &[T],
+    le: impl Fn(T) -> [u8; N],
+) -> Vec<u8> {
+    values.iter().flat_map(|&v| le(v)).collect()
+}
+
+/// `values` BF16 values at `p`, once everything queued has run.
+pub(crate) fn download(gpu: &dyn GpuBackend, p: DevicePtr, values: usize) -> Result<Vec<u16>> {
+    gpu.synchronize(gpu.default_stream())?;
+    let mut b = vec![0u8; values * 2];
+    gpu.copy_d2h(p, &mut b)?;
+    Ok(bf16s(&b))
+}
+
+pub(crate) struct Rng(pub(crate) u64);
+
+impl Rng {
+    pub(crate) fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+}
+
+/// BF16 values spread over many binades, as activations are.
+pub(crate) fn activations(rng: &mut Rng, n: usize) -> Vec<u16> {
+    (0..n)
+        .map(|_| {
+            let r = rng.next();
+            let mantissa = (r & 0x7f) as u16;
+            let exponent = 112 + ((r >> 8) % 20) as u16; // 2^-15 .. 2^4
+            let sign = ((r >> 16) & 1) as u16;
+            sign << 15 | exponent << 7 | mantissa
+        })
+        .collect()
+}
+
+/// The reference recording (`sparkseek/results/2026-11-15-reference-layers`),
+/// at `ATLAS_DSV41_REC`.
+pub(crate) struct Recording {
+    dir: PathBuf,
+    pub(crate) prefill: usize,
+    pub(crate) decode: usize,
+}
+
+impl Recording {
+    pub(crate) fn open() -> Result<Self> {
+        let dir: PathBuf = std::env::var("ATLAS_DSV41_REC")
+            .context("ATLAS_DSV41_REC=<recording dir>")?
+            .into();
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)?;
+        let count =
+            |key: &str| Ok::<_, anyhow::Error>(meta[key].as_u64().context("meta")? as usize);
+        Ok(Self {
+            prefill: count("prefill")?,
+            decode: count("decode")?,
+            dir,
+        })
+    }
+
+    /// `(shape, bytes)` of a tensor of run A's prefill.
+    pub(crate) fn prefill(&self, name: &str) -> Result<(Vec<usize>, Vec<u8>)> {
+        self.tensor("A_prefill.safetensors", name)
+    }
+
+    /// One of run A's decode steps: steps of one shape were saved stacked,
+    /// others one by one.
+    pub(crate) fn step(&self, name: &str, step: usize) -> Result<(Vec<usize>, Vec<u8>)> {
+        if let Ok((shape, bytes)) = self.tensor("A_decode.safetensors", name) {
+            let each = bytes.len() / self.decode;
+            let bytes = bytes[step * each..(step + 1) * each].to_vec();
+            return Ok((shape[1..].to_vec(), bytes));
+        }
+        self.tensor("A_decode.safetensors", &format!("{name}.{step}"))
+    }
+
+    fn tensor(&self, file: &str, name: &str) -> Result<(Vec<usize>, Vec<u8>)> {
+        let (_, shape, bytes) = read_safetensors_tensor(&self.dir.join(file), name)?;
+        Ok((shape, bytes))
+    }
+}
