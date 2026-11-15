@@ -195,21 +195,29 @@ pub(crate) const DEFAULT_PARAMS: Params = Params {
 /// (3..=8 rows; 5.3 ms of each row is MoE), four owners 109.8 ms + 3.2 ms an
 /// owner-row (16..=32 rows). Two and three owners interpolate; more than four
 /// keep four's per-row cost. A lone owner's 2-row verify takes the slower
-/// path the 2026-09-28 sweep measured (10.3 ms over its 3-row one); a batch
+/// fused path the 2026-09-28 sweep measured (10.3 ms over its 3-row one),
+/// except on the pair under expert TP, where it stays on the row line
+/// (`dflash_width::lone_two_on_row_line`). A batch
 /// past the 32-row verify budget never runs. Only differences between widths
 /// at one owner count decide a width. On the TP4 chain the chain's measured
 /// costs price the rows (`dflash_width::chain_step_ms`).
 pub(super) fn step_ms(owners: usize, rows: usize) -> f32 {
-    use super::dflash_width::{LONE_TWO_ROWS_MS, chain_step_ms, on_chain};
+    use super::dflash_width::{chain_step_ms, lone_two_on_row_line, on_chain};
     if on_chain() {
         return chain_step_ms(owners, rows);
     }
+    pair_step_ms(owners, rows, lone_two_on_row_line())
+}
+
+/// [`step_ms`] off the chain; `row_line` is
+/// `dflash_width::lone_two_on_row_line`.
+fn pair_step_ms(owners: usize, rows: usize, row_line: bool) -> f32 {
     let owners = owners.max(1);
     if owners * rows > spark_model::layer::glm_long_owner::ROW_BUDGET {
         return f32::INFINITY;
     }
-    if owners == 1 && rows == 2 {
-        return step_ms(1, 3) + LONE_TWO_ROWS_MS;
+    if owners == 1 && rows == 2 && !row_line {
+        return pair_step_ms(1, 3, row_line) + super::dflash_width::LONE_TWO_ROWS_MS;
     }
     let t = (owners - 1) as f32 / 3.0;
     let base = 44.4 + (109.8 - 44.4) * t;

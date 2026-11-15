@@ -26,7 +26,7 @@ mod decode_logits_step;
 mod decode_step;
 mod dflash_conf_width;
 mod dflash_width;
-pub(crate) use dflash_width::set_verify_ranks;
+pub(crate) use dflash_width::{set_pair_expert_tp, set_verify_ranks};
 #[cfg(test)]
 mod dspark_fail_closed_tests;
 mod emit_step;

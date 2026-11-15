@@ -103,6 +103,8 @@ pub(crate) fn resolve_topology(
             );
         }
         drop(loader);
+        // The pair under expert TP has no slower 2-row verify to charge for.
+        crate::scheduler::set_pair_expert_tp(config.expert_tp && tp_size == 2);
         // The MTP head (`--speculative`) runs unsharded on rank 0 from the
         // TP=1 view of the config; a DFlash drafter has not been tried here.
         if config.model_type == "qwen4_exp" && args.dflash {
