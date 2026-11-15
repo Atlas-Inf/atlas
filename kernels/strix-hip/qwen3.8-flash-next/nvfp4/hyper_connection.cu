@@ -702,9 +702,22 @@ extern "C" __global__ void hc_pre_finish_x4(
     // Injection vector: same warp-per-stream contraction as `hc_pre_finish`
     // (there `s2 = warp; s2 < hc; s2 += warps` with 4 warps is this mapping).
     if (inject_w != nullptr && blockIdx.y == 0) {
+        // In-order register prefetch of 16 lane-strided weights (bit-exact, as
+        // hc_pre_down): one 2-B load per FMA made this serialized tail in block
+        // (t, 0) most of the kernel. kbench_hc3 (devlab 43700121506, 0 differing
+        // outputs): 106 -> 38 us at T=1, 103 -> 38 us at T=2, 105 -> 42 us at T=4.
+        constexpr unsigned int HC_INJ_U = 16;
         const __nv_bfloat16* row = inject_w + (size_t)warp * hc_dim;
         float acc = 0.0f;
-        for (unsigned int j = lane; j < hc_dim; j += 32) {
+        unsigned int j = lane;
+        for (; j + 32 * (HC_INJ_U - 1) < hc_dim; j += 32 * HC_INJ_U) {
+            __nv_bfloat16 w[HC_INJ_U];
+            #pragma unroll
+            for (unsigned int u = 0; u < HC_INJ_U; u++) w[u] = row[j + 32 * u];
+            #pragma unroll
+            for (unsigned int u = 0; u < HC_INJ_U; u++) acc += (float)w[u] * nx[j + 32 * u];
+        }
+        for (; j < hc_dim; j += 32) {
             acc += (float)row[j] * nx[j];
         }
         #pragma unroll
