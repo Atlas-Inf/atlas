@@ -332,3 +332,6 @@ fn bench(name: &str, values: &[u8], scales: &[u8], bf16: &[u16], n: usize, k: us
 
 #[path = "mxfp8_real_test_gpu.rs"]
 pub(crate) mod real;
+
+#[path = "mxfp8_block32_test_gpu.rs"]
+mod block32;

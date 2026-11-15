@@ -73,10 +73,10 @@ pub use loaders_fp8::*;
 pub use loaders_mtp::*;
 pub use model_a::*;
 pub use moe::*;
-pub use mxfp8::dequant_mxfp8_to_bf16;
 #[cfg(test)]
 pub(crate) use mxfp8::mxfp8_to_bf16_host;
 pub use mxfp8::{Mxfp8Proj, Mxfp8Weight};
+pub use mxfp8::{dequant_mxfp8_to_bf16, fp8_block_scales_to_rows};
 pub use mxfp8_load::{
     RawMxfp8, mxfp8_cols_twin, mxfp8_geometry, mxfp8_row_range_twin, mxfp8_rows_twin, raw_mxfp8,
     release_raw_mxfp8,
