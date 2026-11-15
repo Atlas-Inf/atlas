@@ -136,6 +136,10 @@ fn the_window_ring_holds_the_last_128_positions() {
         slots[WINDOW - 1] = 1;
         slots
     });
+    // The engine's row: the window in position order, padding last.
+    assert_eq!(window_row(1)[..3], [0, 1, -1]);
+    assert_eq!(window_row(1).len(), WINDOW);
+    assert_eq!(window_row(1448), decode_window_slots(1448));
     let slots = decode_window_slots(1448);
     assert_eq!(slots.len(), WINDOW);
     assert_eq!(slots[0], (1448 + 1) % 128);

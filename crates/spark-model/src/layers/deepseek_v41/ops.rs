@@ -43,7 +43,8 @@ impl Kernels {
 /// (`[queries, keys]` i32) holds row numbers, -1 for none: columns below
 /// `split` read `keys_a`, the rest `keys_b`. `sink` is `[heads]` FP32.
 ///
-/// A query's bytes depend only on its own q and on its keys in index order.
+/// A query's bytes depend only on its own q and on its index row, not on the
+/// other queries of the launch.
 #[allow(clippy::too_many_arguments)]
 pub fn sparse_attn(
     gpu: &dyn GpuBackend,

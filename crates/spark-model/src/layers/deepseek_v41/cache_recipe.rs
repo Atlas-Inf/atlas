@@ -154,8 +154,22 @@ pub fn prefill_window(position: usize) -> Range<usize> {
     (position + 1).saturating_sub(WINDOW)..position + 1
 }
 
-/// The ring slots a decode query at `position` attends to, oldest first; -1
-/// for a slot the sequence has not reached.
+/// The ring slots a query at `position` attends to: the positions of its
+/// window in order, then -1 up to 128 entries. This is the reference's
+/// prefill row, with ring slots for positions. The engine builds this row
+/// for decode as well, so that a decode step and the same position inside a
+/// prefill chunk give the attention kernel the same keys in the same places.
+pub fn window_row(position: usize) -> Vec<i32> {
+    let mut row: Vec<i32> = prefill_window(position)
+        .map(|at| window_slot(at) as i32)
+        .collect();
+    row.resize(WINDOW, -1);
+    row
+}
+
+/// The ring slots the reference's own decode step attends to, oldest first;
+/// -1 for a slot the sequence has not reached. It differs from
+/// [`window_row`] only in where the -1s sit, before position 127.
 pub fn decode_window_slots(position: usize) -> Vec<i32> {
     let oldest = window_slot(position) + 1;
     (oldest..WINDOW)

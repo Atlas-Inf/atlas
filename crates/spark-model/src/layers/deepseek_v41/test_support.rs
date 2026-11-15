@@ -105,6 +105,12 @@ impl Recording {
         self.tensor("A_prefill.safetensors", name)
     }
 
+    /// `(shape, bytes)` of one of run A's caches, e.g.
+    /// `after_prefill.L2.compress_kv_cache`.
+    pub(crate) fn caches(&self, name: &str) -> Result<(Vec<usize>, Vec<u8>)> {
+        self.tensor("A_caches.safetensors", name)
+    }
+
     /// One of run A's decode steps: steps of one shape were saved stacked,
     /// others one by one.
     pub(crate) fn step(&self, name: &str, step: usize) -> Result<(Vec<usize>, Vec<u8>)> {
@@ -177,4 +183,51 @@ pub(crate) fn load_fp8(gpu: &dyn GpuBackend, prefix: &str) -> Result<(Mxfp8Weigh
         tiled: false,
     };
     Ok((w, n, k))
+}
+
+/// Every tensor of layer `layer` that sits in the layer's own shard of the
+/// checkpoint, uploaded into a store. (An Engram layer's table and
+/// projection are in another shard and are not loaded.)
+pub(crate) fn layer_store(
+    gpu: &dyn GpuBackend,
+    layer: usize,
+) -> Result<spark_runtime::weights::WeightStore> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    use spark_runtime::weights::{WeightDtype, WeightStore, WeightTensor};
+
+    let dir = checkpoint()?;
+    let index: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        Path::new(&dir).join("model.safetensors.index.json"),
+    )?)?;
+    let prefix = format!("layers.{layer}.");
+    let shard = index["weight_map"][format!("{prefix}attn_norm.weight")]
+        .as_str()
+        .context("layer not in the index")?;
+    let mut f = std::fs::File::open(Path::new(&dir).join(shard))?;
+    let mut len = [0u8; 8];
+    f.read_exact(&mut len)?;
+    let len = u64::from_le_bytes(len);
+    let mut header = vec![0u8; len as usize];
+    f.read_exact(&mut header)?;
+    let header: serde_json::Value = serde_json::from_slice(&header)?;
+    let mut map = std::collections::HashMap::new();
+    for (name, t) in header.as_object().context("header")? {
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let [lo, hi]: [u64; 2] = serde_json::from_value(t["data_offsets"].clone())?;
+        f.seek(SeekFrom::Start(8 + len + lo))?;
+        let mut data = vec![0u8; (hi - lo) as usize];
+        f.read_exact(&mut data)?;
+        map.insert(
+            name.clone(),
+            WeightTensor {
+                ptr: upload(gpu, &data)?,
+                shape: serde_json::from_value(t["shape"].clone())?,
+                dtype: WeightDtype::from_safetensors_str(t["dtype"].as_str().unwrap_or(""))?,
+            },
+        );
+    }
+    Ok(WeightStore::from_map(map))
 }

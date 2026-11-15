@@ -257,9 +257,15 @@ fn attention_replays_the_reference_recording() -> Result<()> {
         };
         let got = run(gpu, &k, &case, sink_dev)?;
         let against_reference = rel_l2(&got, &case.reference);
+        let equal = got
+            .iter()
+            .zip(&case.reference)
+            .filter(|(a, b)| a == b)
+            .count();
 
-        // Against plain softmax in f64, on a few heads of a few queries.
-        let (mut same, mut seen) = (0usize, 0usize);
+        // Plain softmax in f64, on a few heads of a few queries: the
+        // reference's schedule is not it, by the BF16 rounding of the weights.
+        let (mut diff, mut norm) = (0.0f64, 0.0f64);
         for query in (0..case.m).step_by(6) {
             for head in (0..HEADS).step_by(13) {
                 let at = (query * HEADS + head) * HEAD_DIM;
@@ -270,47 +276,42 @@ fn attention_replays_the_reference_recording() -> Result<()> {
                     sink_host[head],
                 );
                 for (d, w) in want.iter().enumerate() {
-                    same += usize::from(got[at + d] == atlas_core::numeric::f32_to_bf16(*w as f32));
-                    seen += 1;
+                    diff += (f64::from(recipe::bf16_to_f32(got[at + d])) - w).powi(2);
+                    norm += w * w;
                 }
             }
         }
+        let from_exact = (diff / norm).sqrt();
         println!(
-            "layer {layer} prefill: {} queries x {width} keys, {:.2e} from the reference, {:.3}% of bits equal exact softmax",
+            "layer {layer} prefill: {} queries x {width} keys, {:.3}% of values equal the reference's ({against_reference:.2e} away); {from_exact:.2e} from plain softmax",
             case.m,
-            against_reference,
-            100.0 * same as f64 / seen as f64
+            100.0 * equal as f64 / got.len() as f64
         );
         assert!(
-            against_reference < 2e-3,
-            "layer {layer} prefill: {against_reference:.3e} from the reference"
+            equal * 1000 >= got.len() * 995 && against_reference < 2e-4,
+            "layer {layer} prefill: {equal} of {} values equal, {against_reference:.3e} away",
+            got.len()
         );
         assert!(
-            same * 1000 >= seen * 998,
-            "layer {layer} prefill: {same} of {seen} bits equal exact softmax"
+            from_exact < 3e-3,
+            "layer {layer} prefill: {from_exact:.3e} from plain softmax"
         );
 
-        // A query alone, and with its padding moved to the front, gives the
-        // same bytes as it did among the others.
+        // A query alone gives the same bytes as it did among the others.
         for query in [0, case.m / 2, case.m - 1] {
-            let row = &case.idx[query * width..(query + 1) * width];
-            let mut padded_first: Vec<i32> = row.iter().copied().filter(|&i| i < 0).collect();
-            padded_first.extend(row.iter().copied().filter(|&i| i >= 0));
-            for idx in [row.to_vec(), padded_first] {
-                let alone = Case {
-                    q: case.q[query * HEADS * HEAD_DIM..(query + 1) * HEADS * HEAD_DIM].to_vec(),
-                    keys: case.keys.clone(),
-                    idx,
-                    reference: Vec::new(),
-                    m: 1,
-                    k: width,
-                };
-                let bytes = run(gpu, &k, &alone, sink_dev)?;
-                assert!(
-                    bytes[..] == got[query * HEADS * HEAD_DIM..(query + 1) * HEADS * HEAD_DIM],
-                    "layer {layer}: query {query} alone differs"
-                );
-            }
+            let alone = Case {
+                q: case.q[query * HEADS * HEAD_DIM..(query + 1) * HEADS * HEAD_DIM].to_vec(),
+                keys: case.keys.clone(),
+                idx: case.idx[query * width..(query + 1) * width].to_vec(),
+                reference: Vec::new(),
+                m: 1,
+                k: width,
+            };
+            let bytes = run(gpu, &k, &alone, sink_dev)?;
+            assert!(
+                bytes[..] == got[query * HEADS * HEAD_DIM..(query + 1) * HEADS * HEAD_DIM],
+                "layer {layer}: query {query} alone differs"
+            );
         }
 
         // Decode: every recorded step.
@@ -337,7 +338,7 @@ fn attention_replays_the_reference_recording() -> Result<()> {
         }
         println!("layer {layer} decode: {decode} steps, worst {worst:.2e} from the reference");
         assert!(
-            worst < 2e-3,
+            worst < 4e-4,
             "layer {layer} decode: {worst:.3e} from the reference"
         );
         gpu.free(sink_dev)?;

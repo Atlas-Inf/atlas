@@ -4,11 +4,17 @@
 //! layer, plus compressed keys and index keys that a few source layers
 //! produce and the layers after them read.
 
+pub mod block;
+mod block_attention;
+mod block_moe;
 pub mod cache_recipe;
 pub mod hc;
 pub mod moe;
 pub mod ops;
+mod shape;
 pub mod side;
+mod state;
+pub mod weights;
 
 #[cfg(test)]
 mod test_support;
