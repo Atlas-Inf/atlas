@@ -34,6 +34,12 @@ TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 BIN="${ATLAS_BIN:-$TARGET_DIR/release/spark}"
 
 # ── gfx1151 runtime shims (each explained in docs §4) ────────────────────────
+# Small-M FFN GEMMs (M <= 64: DFlash / MTP verify blocks) take the m128 dispatch, which on
+# gfx1151 routes to the bit-identical-to-m128_f16a m32 / m64 twins (#354, #359, #367), instead of
+# the GB10-tuned BF16 w4a16_gemm_t / _k64 small-M arm. DevLab runner, 27B DFlash2 C4: 26.1 ->
+# 30.7 tok/s (runs 43649011843 / 43649009330). Changes numerics (F16 vs BF16 dequant), so it is
+# gated by ST-995. ATLAS_FFN_SMALLM=1 restores the small-M arm.
+export ATLAS_FFN_SMALLM="${ATLAS_FFN_SMALLM:-0}"
 export ATLAS_W4A16_VARIANT=v1     # BF16-MMA NVFP4 GEMM (SCALE device FP8 encode is broken on gfx1151)
 # ATLAS_W4A16_DP4A is ON BY DEFAULT in current source (the int8-DP4A decode
 # GEMV arm is accuracy-validated: 995-row bfcl-subset 83.02/80.41, 511/511
