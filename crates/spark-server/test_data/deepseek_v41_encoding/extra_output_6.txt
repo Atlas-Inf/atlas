@@ -1,0 +1,8 @@
+<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 1 (range 1-100, the higher the value, the more thorough the reasoning)
+
+S
+
+## Response Format:
+
+You MUST strictly adhere to the following schema to reply:
+{"type": "json_schema", "json_schema": {"name": "n", "schema": {"type": "object"}}}<｜latest_reminder｜>2026-11-14<｜User｜>q1<｜query｜>rewritten<｜end▁of▁sentence｜><｜User｜>q2<｜Assistant｜><think><｜action｜>Search

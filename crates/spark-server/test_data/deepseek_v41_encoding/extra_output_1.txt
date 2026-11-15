@@ -1,0 +1,3 @@
+<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 88 (range 1-100, the higher the value, the more thorough the reasoning)
+
+<｜User｜>Hi<｜Assistant｜></think>Hello.<｜end▁of▁sentence｜><｜System｜>From now on answer in French.<｜Assistant｜><think>

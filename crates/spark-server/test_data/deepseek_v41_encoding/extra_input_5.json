@@ -1,0 +1,14 @@
+{
+ "thinking_mode": "thinking",
+ "messages": [
+  {
+   "role": "system",
+   "content": "S"
+  },
+  {
+   "role": "assistant",
+   "reasoning_content": "why",
+   "content": "Unprompted."
+  }
+ ]
+}

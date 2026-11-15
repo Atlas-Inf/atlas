@@ -1,0 +1,42 @@
+{
+ "thinking_mode": "thinking",
+ "reasoning_effort": 1,
+ "messages": [
+  {
+   "role": "system",
+   "content": "S",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "n",
+     "schema": {
+      "type": "object"
+     }
+    }
+   }
+  },
+  {
+   "role": "latest_reminder",
+   "content": "2026-11-14"
+  },
+  {
+   "role": "user",
+   "content": "q1",
+   "task": "query"
+  },
+  {
+   "role": "assistant",
+   "content": "rewritten"
+  },
+  {
+   "role": "user",
+   "content": "q2",
+   "task": "action"
+  },
+  {
+   "role": "assistant",
+   "content": "Search",
+   "wo_eos": true
+  }
+ ]
+}

@@ -14,7 +14,8 @@ pub struct StreamingToolDetector {
     /// Exact opener retained so a non-call XML mention can be returned as
     /// content byte-for-byte, including namespaced/native opener variants.
     pub(super) current_tag_open: Option<String>,
-    pub(super) inside_dsml: bool,
+    /// The DSML dialect whose block is open, if one is.
+    pub(super) inside_dsml: Option<&'static Dsml>,
     /// Whether a bare identifier inside `<tool_call>` is a legitimate
     /// zero-argument call (Poolside v1 only — see
     /// `ToolCallParser::promotes_bare_call_names`). Default FALSE: every
@@ -95,7 +96,7 @@ pub enum DetectorOutput {
 impl StreamingToolDetector {
     /// Unreleased raw tool syntax, for the API's bounded tool-call guard.
     pub fn pending_tool_bytes(&self) -> usize {
-        if self.inside_tag || self.inside_dsml || self.current_tc_name.is_some() {
+        if self.inside_tag || self.inside_dsml.is_some() || self.current_tc_name.is_some() {
             self.buffer.len()
         } else {
             0
@@ -126,7 +127,8 @@ impl StreamingToolDetector {
                 "<|tool_call>",
                 "<minimax:tool_call>",
                 "<minimax:_call>",
-                DSML_OPEN,
+                DSML_V4.open,
+                DSML_V41.open,
             ]
             .iter()
             .any(|tag| tag.starts_with(pending))

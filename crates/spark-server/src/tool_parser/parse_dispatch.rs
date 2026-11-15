@@ -60,7 +60,7 @@ fn parse_tool_calls_impl(text: &str, promote_bare_names: bool) -> (Option<String
     } else {
         text
     };
-    if text.contains(DSML_OPEN) {
+    if DSML_DIALECTS.iter().any(|dsml| text.contains(dsml.open)) {
         let parsed = parse_dsml_tool_calls(text);
         if !parsed.1.is_empty() {
             return parsed;

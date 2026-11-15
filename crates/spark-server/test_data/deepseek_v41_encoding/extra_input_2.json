@@ -1,0 +1,32 @@
+{
+ "thinking_mode": "thinking",
+ "reasoning_effort": "low",
+ "messages": [
+  {
+   "role": "system",
+   "content": "Be brief."
+  },
+  {
+   "role": "user",
+   "content": "One"
+  },
+  {
+   "role": "assistant",
+   "reasoning_content": "r1",
+   "content": "1"
+  },
+  {
+   "role": "system",
+   "content": "Now count in German."
+  },
+  {
+   "role": "assistant",
+   "reasoning_content": "r2",
+   "content": "eins"
+  },
+  {
+   "role": "user",
+   "content": "Two"
+  }
+ ]
+}

@@ -1,0 +1,3 @@
+<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)
+
+Be brief.<｜User｜>One<｜Assistant｜></think>1<｜end▁of▁sentence｜><｜System｜>Now count in German.<｜Assistant｜></think>eins<｜end▁of▁sentence｜><｜User｜>Two<｜Assistant｜><think>

@@ -77,7 +77,8 @@ pub(crate) use message_preprocess::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatEncoding {
     Jinja,
-    DeepseekV4,
+    /// The checkpoint's own encoder, not a chat template.
+    Deepseek(deepseek_v4::Dialect),
 }
 
 pub struct ChatTokenizer {
