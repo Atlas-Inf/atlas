@@ -136,8 +136,33 @@ impl Block {
             quantized: sc.quantized,
             partials: sc.hc_partials,
         };
-        profile::stage(gpu, stream, "site", || {
-            hc::site(
+        // A batch's mix is a GEMM against the site's weights in three BF16
+        // shares.
+        let split = self
+            .gemm
+            .as_ref()
+            .filter(|_| rows >= GEMM_ROWS)
+            .map(|g| g.hc[usize::from(before.is_some())]);
+        profile::stage(gpu, stream, "site", || match split {
+            Some(split) => hc::site_rows(
+                gpu,
+                &k.hc,
+                &s.hc,
+                weights,
+                split,
+                before,
+                streams,
+                pre_in,
+                pre_out,
+                sc.post,
+                sc.comb,
+                norm_weight,
+                out,
+                sc.hc_sums,
+                rows,
+                stream,
+            ),
+            None => hc::site(
                 gpu,
                 &k.hc,
                 &s.hc,
@@ -152,7 +177,7 @@ impl Block {
                 out,
                 rows,
                 stream,
-            )
+            ),
         })
     }
 

@@ -225,8 +225,10 @@ pub struct Scratch {
     pub(super) pooled: DevicePtr,
     pub(super) group_positions: DevicePtr,
     pub(super) site_pre: DevicePtr,
-    /// The mix's partial sums, a block of the token each.
+    /// The mix's partial sums, a block of the token each; and `[rows, 3 *
+    /// mix rows]` FP32, a batch's from its GEMM.
     pub(super) hc_partials: DevicePtr,
+    pub(super) hc_sums: DevicePtr,
     pub(super) post: DevicePtr,
     pub(super) comb: DevicePtr,
     /// The indexer's query heads and head weights, `[score_rows, ..]`, and
@@ -314,6 +316,7 @@ impl Scratch {
             group_positions: f32s(rows)?,
             site_pre: f32s(rows * (copies))?,
             hc_partials: gpu.alloc(s.hc.partials(rows))?,
+            hc_sums: f32s(rows * 3 * super::hc::mix_rows(copies))?,
             post: f32s(rows * (copies))?,
             comb: f32s(rows * (copies * copies))?,
             index_q: bf16(score_rows * s.index_heads * INDEX_DIM)?,

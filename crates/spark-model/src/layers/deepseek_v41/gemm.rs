@@ -13,10 +13,11 @@
 //! FP32; its order is another, so a row's bytes differ from that path's the
 //! way the reference's own differ from one batch shape to the next.
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
+use super::hc::{self, HcSite};
 use super::parts::{Held, PARTS};
 use super::shape::Shape;
 use super::weights::{BlockWeights, Fp8Proj, Slice, row_part};
@@ -142,6 +143,9 @@ pub struct GemmWeights {
     pub wo_b: [Option<MxW8a8>; PARTS],
     /// A part's rows of the shared expert's w1, w3 and w2.
     pub shared: [Option<[MxW8a8; 3]>; PARTS],
+    /// The mixing weights of the attention's site and the FFN's, each as
+    /// three BF16 matrices that add up to it (`hc::split_fn`).
+    pub hc: [DevicePtr; 2],
 }
 
 /// The `[n, k]` FP8 projection at `slice` as a GEMM operand.
@@ -160,6 +164,23 @@ pub(super) fn operand(
     // One kernel a shape, whatever the batch height: a row's bytes do not
     // depend on the rows beside it.
     Ok(MxW8a8::from_twin(gpu, &twin, [n, k], 0, stream)?.pinned_timed(REF_ROWS, stream))
+}
+
+/// A site's FP32 mixing weights as the BF16 operand of its GEMM.
+fn split(gpu: &dyn GpuBackend, s: &Shape, site: &HcSite) -> Result<DevicePtr> {
+    let values = hc::mix_rows(s.hc.copies) * s.hc.copies * s.hidden;
+    let mut bytes = vec![0u8; values * 4];
+    gpu.copy_d2h(site.fn_, &mut bytes)?;
+    let words: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|w| f32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+        .collect();
+    let shares = hc::split_fn(&words)
+        .context("a Hyper-Connection weight is not the sum of three BF16 values")?;
+    let shares: Vec<u8> = shares.iter().flat_map(|b| b.to_le_bytes()).collect();
+    let on_device = gpu.alloc(shares.len())?;
+    gpu.copy_h2d(&shares, on_device)?;
+    Ok(on_device)
 }
 
 impl GemmWeights {
@@ -185,6 +206,7 @@ impl GemmWeights {
             wo_a: vec![None; s.o_groups],
             wo_b: [None; PARTS],
             shared: [None; PARTS],
+            hc: [split(gpu, s, &w.hc_attn)?, split(gpu, s, &w.hc_ffn)?],
         };
         let groups = s.o_groups / PARTS;
         for at in held.range() {

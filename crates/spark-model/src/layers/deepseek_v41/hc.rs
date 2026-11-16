@@ -31,6 +31,9 @@ pub struct HcKernels {
     pub expand_parts: KernelHandle,
     site_sums: KernelHandle,
     site_finish: KernelHandle,
+    /// A batch's site around a GEMM ([`site_rows`]).
+    site_rows: KernelHandle,
+    mix_rows: KernelHandle,
 }
 
 impl HcKernels {
@@ -44,6 +47,8 @@ impl HcKernels {
             expand_parts: kernel("dsv41_hc_expand_parts")?,
             site_sums: kernel("dsv41_hc_site_sums")?,
             site_finish: kernel("dsv41_hc_site_finish")?,
+            site_rows: kernel("dsv41_hc_site_rows")?,
+            mix_rows: kernel("dsv41_hc_mix_rows")?,
         })
     }
 }
@@ -302,6 +307,138 @@ pub fn site(
         .arg_f32(shape.norm_eps)
         .arg_f32(shape.hc_eps)
         .launch(stream)
+}
+
+/// The rows of a site's mix: `pre`, `post` and `comb`.
+pub fn mix_rows(copies: usize) -> usize {
+    (2 + copies) * copies
+}
+
+/// A site's `fn_` (FP32, as `words` of `[rows, columns]`) as three BF16
+/// matrices that add up to it, one after another: BF16 bits of `[3 * rows,
+/// columns]`. An FP32 value is its eight leading bits, the next eight and
+/// the last, each a BF16 value, so a BF16 GEMM against the three multiplies
+/// what the FP32 weights would. `None` if some value is not such a sum (one
+/// too near the smallest FP32 can hold).
+pub fn split_fn(words: &[f32]) -> Option<Vec<u16>> {
+    use atlas_core::numeric::f32_to_bf16;
+    let widen = |bits: u16| f32::from_bits(u32::from(bits) << 16);
+    let mut out = vec![0u16; 3 * words.len()];
+    for (i, &w) in words.iter().enumerate() {
+        let mut rest = w;
+        let mut sum = 0.0f32;
+        for share in 0..3 {
+            let bits = f32_to_bf16(rest);
+            out[share * words.len() + i] = bits;
+            rest -= widen(bits);
+            sum += widen(bits);
+        }
+        if rest != 0.0 || sum != w {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// [`site`] for a batch: the same site with the mix as a GEMM against
+/// `split` (the site's `fn_` as [`split_fn`] leaves it, on the device).
+/// `sums` is scratch of `[tokens, 3 * mix_rows]` FP32, and `out.partials` of
+/// `[tokens, MIX_SUMS]`. The collapse, the norm and its rounding are
+/// [`site`]'s value for value; the mix's FP32 sums have another order.
+#[allow(clippy::too_many_arguments)]
+pub fn site_rows(
+    gpu: &dyn GpuBackend,
+    kernels: &HcKernels,
+    shape: &HcShape,
+    weights: &HcSite,
+    split: DevicePtr,
+    before: Option<SublayerParts>,
+    streams: DevicePtr,
+    pre_in: DevicePtr,
+    pre_out: DevicePtr,
+    post: DevicePtr,
+    comb: DevicePtr,
+    norm_weight: DevicePtr,
+    out: SiteOut,
+    sums: DevicePtr,
+    tokens: usize,
+    stream: u64,
+) -> Result<()> {
+    shape.check()?;
+    ensure!(
+        shape.hidden.is_multiple_of(64),
+        "dsv41_hc_site_rows: hidden {}",
+        shape.hidden
+    );
+    if let Some(before) = before {
+        expand_parts(
+            gpu,
+            kernels.expand_parts,
+            shape,
+            before,
+            streams,
+            post,
+            comb,
+            tokens,
+            stream,
+        )?;
+    }
+    let (m, n) = (tokens as u32, 3 * mix_rows(shape.copies) as u32);
+    let k = (shape.copies * shape.hidden) as u32;
+    crate::layers::ops::bf16_gemm_f32out(streams, split.0, sums, m, n, k, stream)?;
+    KernelLaunch::new(gpu, kernels.site_rows)
+        .grid([tokens as u32, 1, 1])
+        .block([FINISH_THREADS, 1, 1])
+        .arg_ptr(streams)
+        .arg_ptr(sums)
+        .arg_ptr(pre_in)
+        .arg_ptr(norm_weight)
+        .arg_ptr(out.collapsed)
+        .arg_ptr(out.normed)
+        .arg_ptr(out.quantized)
+        .arg_ptr(out.partials)
+        .arg_u32(shape.hidden as u32)
+        .arg_u32(shape.copies as u32)
+        .arg_f32(shape.norm_eps)
+        .launch(stream)?;
+    KernelLaunch::new(gpu, kernels.mix_rows)
+        .grid([tokens as u32, 1, 1])
+        .block([32, 1, 1])
+        .arg_ptr(out.partials)
+        .arg_ptr(weights.scale)
+        .arg_ptr(weights.base)
+        .arg_ptr(pre_out)
+        .arg_ptr(post)
+        .arg_ptr(comb)
+        .arg_u32(shape.hidden as u32)
+        .arg_u32(shape.copies as u32)
+        .arg_u32(shape.sinkhorn_iters as u32)
+        .arg_f32(shape.norm_eps)
+        .arg_f32(shape.hc_eps)
+        .launch(stream)
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::split_fn;
+
+    #[test]
+    fn an_fp32_weight_is_the_sum_of_its_three_bf16_shares() {
+        let widen = |bits: u16| f32::from_bits(u32::from(bits) << 16);
+        // Every mantissa, over the exponents a weight has.
+        let words: Vec<f32> = (0..4096u32)
+            .map(|i| {
+                let bits = i.wrapping_mul(0x9e37_79b9);
+                f32::from_bits((bits & 0x807f_ffff) | ((100 + i % 30) << 23))
+            })
+            .chain([0.0, -0.0, 1.0, -1.5, 3.0e-3])
+            .collect();
+        let shares = split_fn(&words).expect("every value splits");
+        for (i, &w) in words.iter().enumerate() {
+            let [a, b, c] = [0, 1, 2].map(|s| widen(shares[s * words.len() + i]));
+            assert_eq!((a + b) + c, w, "{w:e}");
+        }
+    }
 }
 
 #[cfg(test)]
