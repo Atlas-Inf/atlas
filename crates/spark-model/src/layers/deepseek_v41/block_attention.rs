@@ -2,12 +2,13 @@
 
 //! The attention sublayer of a DeepSeek-V4.1 block on one token.
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use spark_comm::CommBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::block::Block;
 use super::cache_recipe::{WINDOW, prefill_window, window_row, window_slot};
+use super::gemm::{GEMM_ROWS, Input};
 use super::ops::{self, HEAD_DIM, MAX_KEYS, Turn};
 use super::parts::{self, PARTS};
 use super::profile;
@@ -94,16 +95,25 @@ impl Block {
         // The low-rank query and the window key, both from the input's FP8
         // form; then the query normed, and the key normed, turned to the
         // token's position and rounded into the window.
-        parts::project_two(
-            gpu,
-            k.parts.fp8_two,
-            sc.quantized,
-            (w.wq_a.rows_from(0), w.wq_a.n, sc.q_low),
-            (w.wkv.rows_from(0), w.wkv.n, sc.key),
-            s.hidden,
-            rows,
-            stream,
-        )?;
+        let gemm = self.gemm.as_ref().filter(|_| rows >= GEMM_ROWS);
+        match gemm {
+            Some(g) => {
+                let x = Input::rows(sc.quantized, s.hidden);
+                let act = sc.gemm.quantize(gpu, x, rows, s.hidden, stream)?;
+                g.wq_a.gemm(act, sc.q_low, rows, stream)?;
+                g.wkv.gemm(act, sc.key, rows, stream)?;
+            }
+            None => parts::project_two(
+                gpu,
+                k.parts.fp8_two,
+                sc.quantized,
+                (w.wq_a.rows_from(0), w.wq_a.n, sc.q_low),
+                (w.wkv.rows_from(0), w.wkv.n, sc.key),
+                s.hidden,
+                rows,
+                stream,
+            )?,
+        }
         self.at(position + rows - 1)?;
         let turn = Turn {
             positions: self.at(position)?,
@@ -199,21 +209,33 @@ impl Block {
             // attended, turned to the position and back inside the kernel.
             let q = sc.q.offset(part * sc.rows * heads * HEAD_DIM * 2);
             let attended = sc.attended.offset(part * sc.rows * heads * HEAD_DIM * 2);
-            let wq = w.wq_b.rows_from(part * heads * HEAD_DIM);
-            parts::project_rows(
-                gpu,
-                k.parts.fp8_q,
-                sc.q_low_normed,
-                wq.data,
-                wq.scales,
-                q,
-                2,
-                heads * HEAD_DIM,
-                rows,
-                heads * HEAD_DIM,
-                w.wq_b.k,
-                stream,
-            )?;
+            match gemm {
+                Some(g) => sc.gemm.project(
+                    gpu,
+                    Input::rows(sc.q_low_normed, s.q_rank),
+                    g.wq_b[part].as_ref().context("a held part of wq_b")?,
+                    q,
+                    rows,
+                    stream,
+                )?,
+                None => {
+                    let wq = w.wq_b.rows_from(part * heads * HEAD_DIM);
+                    parts::project_rows(
+                        gpu,
+                        k.parts.fp8_q,
+                        sc.q_low_normed,
+                        wq.data,
+                        wq.scales,
+                        q,
+                        2,
+                        heads * HEAD_DIM,
+                        rows,
+                        heads * HEAD_DIM,
+                        w.wq_b.k,
+                        stream,
+                    )?
+                }
+            }
             ops::sparse_attn(
                 gpu,
                 &k.cache,
@@ -234,21 +256,40 @@ impl Block {
             profile::end(gpu, stream, "sparse attention", began)?;
             let began = profile::begin(gpu, stream)?;
             // Project out, rounding the input to FP8: this part's groups of
-            // heads through their blocks of wo_a.
+            // heads through their blocks of wo_a. A part of the low-rank
+            // output follows the last, with the batch's rows and no more.
             let (low, width) = (part * groups * s.o_rank, groups * s.o_rank);
-            let o_low = sc.o_low.offset(part * sc.rows * width * 2);
-            parts::project_groups(
-                gpu,
-                k.parts.fp8_groups_q,
-                attended,
-                w.wo_a.rows_from(low),
-                o_low,
-                rows,
-                groups,
-                s.o_rank,
-                group_in,
-                stream,
-            )?;
+            let o_low = sc.o_low.offset(part * rows * width * 2);
+            match gemm {
+                // A group a GEMM, and a group's rows together.
+                Some(g) => {
+                    for group in 0..groups {
+                        let block = g.wo_a[part * groups + group]
+                            .as_ref()
+                            .context("a held group of wo_a")?;
+                        sc.gemm.project(
+                            gpu,
+                            Input::rows(attended.offset(group * group_in * 2), groups * group_in),
+                            block,
+                            o_low.offset(group * rows * s.o_rank * 2),
+                            rows,
+                            stream,
+                        )?;
+                    }
+                }
+                None => parts::project_groups(
+                    gpu,
+                    k.parts.fp8_groups_q,
+                    attended,
+                    w.wo_a.rows_from(low),
+                    o_low,
+                    rows,
+                    groups,
+                    s.o_rank,
+                    group_in,
+                    stream,
+                )?,
+            }
             profile::end(gpu, stream, "output projections", began)?;
         }
         // wo_b reads every group, so the ranks gather their low-rank
@@ -268,27 +309,45 @@ impl Block {
                 held,
                 sc.o_low,
                 sc.gather_recv,
-                sc.rows * width * 2,
+                rows * width * 2,
                 rows * width * 2,
                 stream,
             )
         })?;
         let began = profile::begin(gpu, stream)?;
         for part in held.range() {
-            parts::project_pieces(
-                gpu,
-                k.parts.fp8_pieces_q,
-                sc.o_low,
-                row_part(&w.wo_b, part),
-                sc.attn_out.offset(part * sc.rows * part_n * 2),
-                part_n,
-                rows,
-                part_n,
-                w.wo_b.k,
-                width,
-                sc.rows * width,
-                stream,
-            )?;
+            let out = sc.attn_out.offset(part * rows * part_n * 2);
+            match gemm {
+                // The groups' rows are a piece each.
+                Some(g) => sc.gemm.project(
+                    gpu,
+                    Input {
+                        x: sc.o_low,
+                        stride: s.o_rank,
+                        piece: s.o_rank,
+                        piece_stride: rows * s.o_rank,
+                    },
+                    g.wo_b[part].as_ref().context("a held part of wo_b")?,
+                    out,
+                    rows,
+                    stream,
+                )?,
+                // A part's rows are a piece, a row its groups.
+                None => parts::project_pieces(
+                    gpu,
+                    k.parts.fp8_pieces_q,
+                    sc.o_low,
+                    row_part(&w.wo_b, part),
+                    out,
+                    part_n,
+                    rows,
+                    part_n,
+                    w.wo_b.k,
+                    width,
+                    rows * width,
+                    stream,
+                )?,
+            }
         }
         profile::end(gpu, stream, "output projections", began)?;
         profile::stage(gpu, stream, "gather", || {
@@ -298,7 +357,7 @@ impl Block {
                 held,
                 sc.attn_out,
                 sc.gather_recv,
-                sc.rows * part_n * 2,
+                rows * part_n * 2,
                 rows * part_n * 2,
                 stream,
             )

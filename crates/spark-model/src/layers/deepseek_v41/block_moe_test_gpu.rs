@@ -79,7 +79,7 @@ fn the_moe_leaves_the_bytes_of_one_launch_at_a_time() -> Result<()> {
             stream,
         )?;
         block.moe(gpu, 1, None, stream)?;
-        let fused = read(sc.moe_out, PARTS * sc.rows * n * 2)?;
+        let fused = read(sc.moe_out, PARTS * n * 2)?;
         let chosen: Vec<usize> = read(sc.chosen, s.top_k * 4)?
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
@@ -152,8 +152,18 @@ fn the_moe_leaves_the_bytes_of_one_launch_at_a_time() -> Result<()> {
                     stream,
                 )?;
             }
-            parts::slots_sum(gpu, k.parts.slots_sum, slot_out, one, 1, slots, n, stream)?;
-            let at = part * sc.rows * n * 2;
+            parts::slots_sum(
+                gpu,
+                k.parts.slots_sum,
+                slot_out,
+                spark_runtime::gpu::DevicePtr::NULL,
+                one,
+                1,
+                slots,
+                n,
+                stream,
+            )?;
+            let at = part * n * 2;
             assert!(
                 read(one, n * 2)? == fused[at..at + n * 2],
                 "token {token}, part {part}: the block's MoE differs"

@@ -124,6 +124,7 @@ pub(crate) fn block(
             experts,
             gpu.default_stream(),
         )?,
+        gemm: None,
         shared,
     };
     Ok((block, store))

@@ -169,23 +169,27 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_experts_i
 }
 
 // inner[r] = fp8(BF16(weight[r] * silu(min(gate, limit)) * clamp(up, limit)))
-// for each of `count` rows of gate_up [count, 2, rows]; with no `weights`,
-// under 1 (the shared expert). One thread per 32 values.
+// for each of `count` rows; with no `weights`, under 1 (the shared expert).
+// Row r's gate values are at gate_up[r * row_stride] and its up values
+// `up_offset` after them: [count, 2, rows] has a row_stride of 2 * rows and
+// an up_offset of rows. One thread per 32 values.
 extern "C" __global__ void dsv41_experts_act(
     const __nv_bfloat16* __restrict__ gate_up,
     const float* __restrict__ weights,
     __nv_bfloat16* __restrict__ inner,
     unsigned int count,
     unsigned int rows,
-    float limit) {
+    float limit,
+    unsigned long long up_offset,
+    unsigned long long row_stride) {
     const size_t b = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int per_row = rows / 32;
     if (b >= (size_t)count * per_row) return;
     const size_t r = b / per_row;
     const unsigned int at = (unsigned int)(b % per_row) * 32;
     const float weight = weights ? weights[r] : 1.0f;
-    const __nv_bfloat16* gate = gate_up + r * 2 * rows + at;
-    const __nv_bfloat16* up = gate + rows;
+    const __nv_bfloat16* gate = gate_up + r * row_stride + at;
+    const __nv_bfloat16* up = gate + up_offset;
     float v[32];
     for (int i = 0; i < 32; ++i)
         v[i] = dsv41_swiglu_one(__bfloat162float(gate[i]), __bfloat162float(up[i]), weight, limit);

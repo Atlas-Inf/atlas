@@ -7,6 +7,7 @@ use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use super::cache_recipe::WINDOW;
+use super::gemm::GemmScratch;
 use super::hc::{HcKernels, HcShape};
 use super::index::{INDEX_DIM, IndexKernels};
 use super::moe::MoeKernels;
@@ -153,6 +154,10 @@ pub struct Scratch {
     /// `[rows, 2, inter / PARTS]` gate and up rows.
     pub(super) grouped: GroupedScratch,
     pub(super) shared_gate_up: DevicePtr,
+    /// A batch's activation as a GEMM reads it, and `[rows, hidden / PARTS]`
+    /// BF16: one part of the shared expert's output from one.
+    pub(super) gemm: GemmScratch,
+    pub(super) shared_out: DevicePtr,
     /// `[128 + rows, 512]` BF16: the window's keys in position order and
     /// then the batch's own, when a batch is more than one row.
     pub(super) chunk_keys: DevicePtr,
@@ -173,16 +178,15 @@ pub struct Scratch {
     /// What the attention keeps of one part's heads between its launches.
     pub(super) attn_records: DevicePtr,
     pub(super) o_low: DevicePtr,
-    /// One token's sublayer output in one run, for a test to read.
-    #[cfg(test)]
-    pub(super) sublayer_out: DevicePtr,
     /// `[top_k + 1, 2, inter / PARTS]` BF16: one part's gate and up rows of
     /// each chosen expert, then of the shared expert.
     pub(super) gate_up: DevicePtr,
     /// `[PARTS, rows * (top_k + 1), inter / PARTS]` BF16: the parts of the
     /// experts' hidden activations, in FP8. A token alone has its chosen
     /// experts' and then the shared expert's; a batch has its (row, expert)
-    /// pairs' in expert order and then every row's shared expert's.
+    /// pairs' in expert order and then every row's shared expert's. Like
+    /// every buffer in parts, a part follows the last with no room between
+    /// for the rows a batch does not have.
     pub(super) inner_parts: DevicePtr,
     /// `[rows, top_k + 1, hidden / PARTS]` BF16: one part of each expert's
     /// output.
@@ -239,6 +243,8 @@ impl Scratch {
             rows: ROWS,
             grouped: GroupedScratch::alloc(gpu, ROWS, s.top_k, s.experts, s.inter / PARTS)?,
             shared_gate_up: bf16(ROWS * 2 * s.inter / PARTS)?,
+            gemm: GemmScratch::alloc(gpu, ROWS, s.hidden.max(s.o_groups * s.o_rank))?,
+            shared_out: bf16(ROWS * s.hidden / PARTS)?,
             chunk_keys: bf16((WINDOW + ROWS) * HEAD_DIM)?,
             x: bf16(ROWS * (s.hidden))?,
             normed: bf16(ROWS * (s.hidden))?,
@@ -259,8 +265,6 @@ impl Scratch {
             attended: bf16(ROWS * (s.heads * HEAD_DIM))?,
             attn_records: gpu.alloc(attn_records(ROWS, s.heads / PARTS))?,
             o_low: bf16(ROWS * (s.o_groups * s.o_rank))?,
-            #[cfg(test)]
-            sublayer_out: bf16(s.hidden)?,
             gate_up: bf16((s.top_k + 1) * 2 * s.inter / PARTS)?,
             inner_parts: bf16(ROWS * (s.top_k + 1) * s.inter)?,
             slot_out: bf16(ROWS * (s.top_k + 1) * s.hidden / PARTS)?,

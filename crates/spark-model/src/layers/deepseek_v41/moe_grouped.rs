@@ -168,7 +168,7 @@ pub fn experts_in(
     activate(
         gpu,
         kernels,
-        scratch.gate_up,
+        GateUp::paired(scratch.gate_up, part_rows),
         scratch.weights,
         inner,
         plan.pairs(),
@@ -222,14 +222,33 @@ pub fn experts_out(
     .launch(stream)
 }
 
+/// Where [`activate`] finds a row's gate values and its up values: rows
+/// `row_stride` values apart, the up values `up_offset` after the gate's.
+#[derive(Clone, Copy)]
+pub struct GateUp {
+    pub base: DevicePtr,
+    pub up_offset: usize,
+    pub row_stride: usize,
+}
+
+impl GateUp {
+    /// `[count, 2, part_rows]`: a row's gate values and then its up values.
+    pub fn paired(base: DevicePtr, part_rows: usize) -> Self {
+        Self {
+            base,
+            up_offset: part_rows,
+            row_stride: 2 * part_rows,
+        }
+    }
+}
+
 /// `inner` (`[count, part_rows]` BF16) = the FP8 activation of `gate_up`
-/// (`[count, 2, part_rows]`) under `weights` (`[count]` FP32, or none for the
-/// shared expert's 1).
+/// under `weights` (`[count]` FP32, or none for the shared expert's 1).
 #[allow(clippy::too_many_arguments)]
 pub fn activate(
     gpu: &dyn GpuBackend,
     kernels: &MoeKernels,
-    gate_up: DevicePtr,
+    gate_up: GateUp,
     weights: DevicePtr,
     inner: DevicePtr,
     count: usize,
@@ -240,11 +259,13 @@ pub fn activate(
     KernelLaunch::new(gpu, kernels.experts_act)
         .grid([div_ceil((count * part_rows / 32) as u32, 256), 1, 1])
         .block([256, 1, 1])
-        .arg_ptr(gate_up)
+        .arg_ptr(gate_up.base)
         .arg_ptr(weights)
         .arg_ptr(inner)
         .arg_u32(count as u32)
         .arg_u32(part_rows as u32)
         .arg_f32(limit)
+        .arg_u64(gate_up.up_offset as u64)
+        .arg_u64(gate_up.row_stride as u64)
         .launch(stream)
 }

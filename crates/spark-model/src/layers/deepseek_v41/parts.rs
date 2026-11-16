@@ -323,12 +323,14 @@ pub fn project_pieces(
 
 /// The MoE's output `y` (`[rows, n]` BF16) from its experts' (`out`, `[rows,
 /// slots, n]` BF16): the slots added in FP32 in slot order, and the sum
-/// rounded.
+/// rounded. With `shared` (`[rows, n]` BF16, else null) the last slot is
+/// read from there.
 #[allow(clippy::too_many_arguments)]
 pub fn slots_sum(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
     out: DevicePtr,
+    shared: DevicePtr,
     y: DevicePtr,
     rows: usize,
     slots: usize,
@@ -343,6 +345,7 @@ pub fn slots_sum(
         .arg_u32(slots as u32)
         .arg_u32(n as u32)
         .arg_u32(rows as u32)
+        .arg_ptr(shared)
         .launch(stream)
 }
 

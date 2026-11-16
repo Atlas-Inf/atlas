@@ -7,19 +7,21 @@ use spark_comm::CommBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::block::Block;
+use super::gemm::{GEMM_ROWS, Input};
 use super::hc::SublayerParts;
 use super::moe::{self, ExpertPart};
-use super::moe_grouped::{self, Plan};
+use super::moe_grouped::{self, GateUp, Plan};
 use super::parts::{self, PARTS};
 use super::profile;
 use super::weights::row_part;
 
 impl Block {
-    /// The MoE's output, as the parts [`Block::moe`] leaves.
-    pub(super) fn moe_parts(&self) -> SublayerParts {
+    /// The MoE's output for a batch of `rows`, as the parts [`Block::moe`]
+    /// leaves.
+    pub(super) fn moe_parts(&self, rows: usize) -> SublayerParts {
         SublayerParts {
             parts: self.shared.scratch.moe_out,
-            rows: self.shared.scratch.rows,
+            rows,
         }
     }
 
@@ -96,7 +98,8 @@ impl Block {
         // The way in: a part of every slot's hidden activation. A token
         // alone has a slot an expert; a batch has its pairs in expert order
         // and then every row's shared expert.
-        let (part_n, room) = (s.hidden / PARTS, sc.rows * slots * part_rows);
+        let (part_n, room) = (s.hidden / PARTS, rows * slots * part_rows);
+        let gemm = self.gemm.as_ref().filter(|_| rows >= GEMM_ROWS);
         let part_of = |part: usize| -> Result<ExpertPart> {
             Ok(ExpertPart {
                 slab: w.experts[part].context("a held part of the routed experts")?,
@@ -141,29 +144,47 @@ impl Block {
                 s.swiglu_limit,
                 stream,
             )?;
-            // The shared expert, every row through the same weights: its gate
-            // and up rows side by side.
-            let [w1, w3, _] = of.shared;
-            for (weights, at) in [(w1, 0), (w3, part_rows)] {
-                parts::project_rows(
-                    gpu,
-                    k.parts.fp8,
-                    sc.quantized,
-                    weights.data,
-                    weights.scales,
-                    sc.shared_gate_up.offset(at * 2),
-                    2,
-                    2 * part_rows,
-                    rows,
-                    part_rows,
-                    s.hidden,
-                    stream,
-                )?;
-            }
+            // The shared expert, every row through the same weights.
+            let gate_up = match gemm.and_then(|g| g.shared[part].as_ref()) {
+                // Every row's gate values, then every row's up values.
+                Some([w1, w3, _]) => {
+                    let x = Input::rows(sc.quantized, s.hidden);
+                    let act = sc.gemm.quantize(gpu, x, rows, s.hidden, stream)?;
+                    let up = sc.shared_gate_up.offset(rows * part_rows * 2);
+                    w1.gemm(act, sc.shared_gate_up, rows, stream)?;
+                    w3.gemm(act, up, rows, stream)?;
+                    GateUp {
+                        base: sc.shared_gate_up,
+                        up_offset: rows * part_rows,
+                        row_stride: part_rows,
+                    }
+                }
+                // A row's gate and up values side by side.
+                None => {
+                    let [w1, w3, _] = of.shared;
+                    for (weights, at) in [(w1, 0), (w3, part_rows)] {
+                        parts::project_rows(
+                            gpu,
+                            k.parts.fp8,
+                            sc.quantized,
+                            weights.data,
+                            weights.scales,
+                            sc.shared_gate_up.offset(at * 2),
+                            2,
+                            2 * part_rows,
+                            rows,
+                            part_rows,
+                            s.hidden,
+                            stream,
+                        )?;
+                    }
+                    GateUp::paired(sc.shared_gate_up, part_rows)
+                }
+            };
             moe_grouped::activate(
                 gpu,
                 &k.moe,
-                sc.shared_gate_up,
+                gate_up,
                 DevicePtr::NULL,
                 inner.offset(plan.pairs() * part_rows * 2),
                 rows,
@@ -181,7 +202,7 @@ impl Block {
                 sc.inner_parts,
                 sc.gather_recv,
                 room * 2,
-                rows * slots * part_rows * 2,
+                room * 2,
                 stream,
             )
         })?;
@@ -190,6 +211,7 @@ impl Block {
         let began = profile::begin(gpu, stream)?;
         for part in held.range() {
             let of = part_of(part)?;
+            let mut shared_out = DevicePtr::NULL;
             match &plan {
                 None => moe::experts_out(
                     gpu,
@@ -218,28 +240,44 @@ impl Block {
                         part_n,
                         stream,
                     )?;
-                    // The shared expert's, in each row's last slot.
-                    parts::project_pieces(
-                        gpu,
-                        k.parts.fp8_pieces,
-                        sc.inner_parts.offset(plan.pairs() * part_rows * 2),
-                        of.shared[2],
-                        sc.slot_out.offset(s.top_k * part_n * 2),
-                        slots * part_n,
-                        rows,
-                        part_n,
-                        s.inter,
-                        part_rows,
-                        room,
-                        stream,
-                    )?;
+                    // The shared expert's: its rows of the hidden
+                    // activations come after the pairs'.
+                    let x = sc.inner_parts.offset(plan.pairs() * part_rows * 2);
+                    match gemm.and_then(|g| g.shared[part].as_ref()) {
+                        Some([_, _, w2]) => {
+                            let x = Input {
+                                x,
+                                stride: part_rows,
+                                piece: part_rows,
+                                piece_stride: room,
+                            };
+                            sc.gemm.project(gpu, x, w2, sc.shared_out, rows, stream)?;
+                            shared_out = sc.shared_out;
+                        }
+                        // Into each row's last slot.
+                        None => parts::project_pieces(
+                            gpu,
+                            k.parts.fp8_pieces,
+                            x,
+                            of.shared[2],
+                            sc.slot_out.offset(s.top_k * part_n * 2),
+                            slots * part_n,
+                            rows,
+                            part_n,
+                            s.inter,
+                            part_rows,
+                            room,
+                            stream,
+                        )?,
+                    }
                 }
             }
             parts::slots_sum(
                 gpu,
                 k.parts.slots_sum,
                 sc.slot_out,
-                sc.moe_out.offset(part * sc.rows * part_n * 2),
+                shared_out,
+                sc.moe_out.offset(part * rows * part_n * 2),
                 rows,
                 slots,
                 part_n,
@@ -254,7 +292,7 @@ impl Block {
                 held,
                 sc.moe_out,
                 sc.gather_recv,
-                sc.rows * part_n * 2,
+                rows * part_n * 2,
                 rows * part_n * 2,
                 stream,
             )

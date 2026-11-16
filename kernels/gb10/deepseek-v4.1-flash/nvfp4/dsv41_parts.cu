@@ -33,19 +33,23 @@ extern "C" __global__ void dsv41_parts_round(
 
 // The MoE's output from its experts': y[row, d] = BF16(sum over slots of
 // out[row, slot, d]), added in FP32 in slot order (the chosen experts in
-// expert order, then the shared expert). out [rows, slots, n] BF16.
+// expert order, then the shared expert). out [rows, slots, n] BF16. With
+// `shared` ([rows, n] BF16), the last slot is read from there.
 extern "C" __global__ void dsv41_slots_sum(
     const __nv_bfloat16* __restrict__ out,
     __nv_bfloat16* __restrict__ y,
     unsigned int slots,
     unsigned int n,
-    unsigned int rows) {
+    unsigned int rows,
+    const __nv_bfloat16* __restrict__ shared) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)rows * n) return;
     const size_t row = i / n, d = i % n;
+    const unsigned int own = shared ? slots - 1u : slots;
     float total = 0.0f;
-    for (unsigned int slot = 0; slot < slots; ++slot)
+    for (unsigned int slot = 0; slot < own; ++slot)
         total += __bfloat162float(out[(row * slots + slot) * n + d]);
+    if (shared) total += __bfloat162float(shared[i]);
     y[i] = __float2bfloat16(total);
 }
 

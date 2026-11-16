@@ -14,6 +14,7 @@ use anyhow::Result;
 use spark_comm::CommBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
+use super::gemm::GemmWeights;
 use super::hc::{self, HcSite, SiteOut, SublayerParts};
 use super::parts::Held;
 use super::profile;
@@ -53,6 +54,10 @@ pub struct Block {
     /// window-only layer, the compressed one elsewhere.
     pub freqs: DevicePtr,
     pub weights: BlockWeights,
+    /// The FP8 projections as GEMM operands, for batches of
+    /// [`GEMM_ROWS`](super::gemm::GEMM_ROWS) rows or more; without them
+    /// every batch goes eight rows a launch.
+    pub gemm: Option<GemmWeights>,
     pub shared: Shared,
 }
 
@@ -128,11 +133,12 @@ impl Block {
         })
     }
 
-    /// The attention's output, as the parts [`Block::attention`] leaves.
-    pub(super) fn attention_parts(&self) -> SublayerParts {
+    /// The attention's output for a batch of `rows`, as the parts
+    /// [`Block::attention`] leaves.
+    pub(super) fn attention_parts(&self, rows: usize) -> SublayerParts {
         SublayerParts {
             parts: self.shared.scratch.attn_out,
-            rows: self.shared.scratch.rows,
+            rows,
         }
     }
 
@@ -196,7 +202,7 @@ impl Block {
         self.site(
             gpu,
             &w.hc_ffn,
-            Some(self.attention_parts()),
+            Some(self.attention_parts(rows)),
             rows,
             streams,
             sc.site_pre,
@@ -210,7 +216,7 @@ impl Block {
                 gpu,
                 k.hc.expand_parts,
                 &s.hc,
-                self.moe_parts(),
+                self.moe_parts(rows),
                 streams,
                 sc.post,
                 sc.comb,
@@ -245,29 +251,18 @@ impl Block {
 
 #[cfg(test)]
 impl Block {
-    /// The first token's attention output, its parts in one run, in
-    /// `scratch.sublayer_out`.
+    /// The attention output of a batch of one token: its parts follow one
+    /// another, so it is one run.
     pub(super) fn attention_out(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<DevicePtr> {
-        let sc = &self.shared.scratch;
-        let part = self.shared.shape.hidden / super::parts::PARTS * 2;
         gpu.synchronize(stream)?;
-        for at in 0..super::parts::PARTS {
-            let from = sc.attn_out.offset(at * sc.rows * part);
-            gpu.copy_d2d(from, sc.sublayer_out.offset(at * part), part)?;
-        }
-        Ok(sc.sublayer_out)
+        Ok(self.shared.scratch.attn_out)
     }
 
-    /// Stand `output` (`[hidden]` BF16, as bytes) in for the first token's
-    /// attention output.
+    /// Stand `output` (`[hidden]` BF16, as bytes) in for the attention
+    /// output of a batch of one token.
     pub(super) fn set_attention_out(&self, gpu: &dyn GpuBackend, output: &[u8]) -> Result<()> {
-        let sc = &self.shared.scratch;
-        let part = self.shared.shape.hidden / super::parts::PARTS * 2;
         gpu.synchronize(gpu.default_stream())?;
-        for (at, bytes) in output.chunks_exact(part).enumerate() {
-            gpu.copy_h2d(bytes, sc.attn_out.offset(at * sc.rows * part))?;
-        }
-        Ok(())
+        gpu.copy_h2d(output, self.shared.scratch.attn_out)
     }
 }
 
