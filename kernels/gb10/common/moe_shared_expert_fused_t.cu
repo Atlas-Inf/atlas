@@ -966,6 +966,73 @@ __device__ __forceinline__ void gate_up_shared_t_rows_impl(
         }
     };
 
+#if defined(__HIP_PLATFORM_AMD__)
+    // gfx1151: WMMA. Each wave owns 32 columns (two 16x16 tiles); per 16 k each lane decodes its
+    // column's 16 FP4 values times the E4M3 group scale to bf16 (exact: <= 6 significant bits) and one
+    // wmma_f32_16x16x16_bf16 per tile takes the ROWS real + zero-padded rows. s2 is applied once at the
+    // end. Numerics-changing (summation order, s2 placement): gated by ST-995, not byte identity.
+    if constexpr (VEC && COLS == 1 && BS == 256) {
+        typedef __bf16 v16bf __attribute__((ext_vector_type(16)));
+        typedef float v8f __attribute__((ext_vector_type(8)));
+        const unsigned int wave = lane / 32u, l = lane % 32u, arow = l & 15u;
+        const unsigned int ccol0 = wave * 32u + (l & 15u);
+        v8f acc0 = {0, 0, 0, 0, 0, 0, 0, 0}, acc1 = {0, 0, 0, 0, 0, 0, 0, 0};
+        const unsigned int ntg = (K / 2u) / TILE_KH;
+        stage(0, 0);
+        for (unsigned int tg = 0; tg < ntg; tg++) {
+            __syncthreads();
+            if (tg + 1u < ntg) stage(tg + 1u, (tg + 1u) & 1u);
+            const unsigned int buf = tg & 1u;
+            _Pragma("unroll 2")
+            for (unsigned int s = 0; s < TILE_KH / 8u; s++) {
+                v16bf a;
+                if (arow < (unsigned int)ROWS) {
+                    const uint4 a0 = *(const uint4*)&s_a[buf][arow * TILE_KH * 2 + s * 16];
+                    const uint4 a1 = *(const uint4*)&s_a[buf][arow * TILE_KH * 2 + s * 16 + 8];
+                    const __bf16* p0 = (const __bf16*)&a0; const __bf16* p1 = (const __bf16*)&a1;
+                    _Pragma("unroll")
+                    for (int i = 0; i < 8; i++) { a[i] = p0[i]; a[8 + i] = p1[i]; }
+                } else {
+                    _Pragma("unroll")
+                    for (int i = 0; i < 16; i++) a[i] = (__bf16)0.0f;
+                }
+                _Pragma("unroll")
+                for (unsigned int t = 0; t < 2; t++) {
+                    const unsigned int cc = ccol0 + t * 16u;
+                    const float sc = atlas_dec_e4m3(s_sc[buf][s * STRIDE + cc]);
+                    v16bf b;
+                    _Pragma("unroll")
+                    for (int j = 0; j < 8; j++) {
+                        const unsigned char byte = s_pk[buf][(s * 8u + j) * STRIDE + cc];
+                        b[2 * j] = (__bf16)(s_lut[byte & 0xFu] * sc);
+                        b[2 * j + 1] = (__bf16)(s_lut[(byte >> 4) & 0xFu] * sc);
+                    }
+                    if (t == 0) acc0 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc0);
+                    else        acc1 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc1);
+                }
+            }
+        }
+        __syncthreads();
+        _Pragma("unroll")
+        for (unsigned int t = 0; t < 2; t++) {
+            const unsigned int cn = ns0 + ccol0 + t * 16u;
+            if (cn >= N) continue;
+            _Pragma("unroll")
+            for (unsigned int e = 0; e < 4; e++) {          // tile rows 2e + (l >> 4); e 4..7 are the pad
+                const unsigned int r = 2u * e + (l >> 4);
+                if (r >= (unsigned int)ROWS || !(mask & (1u << r))) continue;
+                const __nv_bfloat16 v = __float2bfloat16((t == 0 ? acc0[e] : acc1[e]) * s2);
+                if (is_shared) { if (proj == 0) sh_gate_out[r * N + cn] = v; else sh_up_out[r * N + cn] = v; }
+                else {
+                    unsigned int slot = u_rowslot[u * MOE_MAX_K + r];
+                    __nv_bfloat16* Cw = (proj == 0) ? gate_out : up_out;
+                    Cw[(unsigned long long)(r * top_k + slot) * N + cn] = v;
+                }
+            }
+        }
+        return;
+    }
+#endif
     float acc[COLS][ROWS];
     _Pragma("unroll")
     for (unsigned int c = 0; c < COLS; c++)
