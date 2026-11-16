@@ -372,27 +372,20 @@ pub fn site_rows(
         "dsv41_hc_site_rows: hidden {}",
         shape.hidden
     );
-    if let Some(before) = before {
-        expand_parts(
-            gpu,
-            kernels.expand_parts,
-            shape,
-            before,
-            streams,
-            post,
-            comb,
-            tokens,
-            stream,
-        )?;
-    }
-    let (m, n) = (tokens as u32, 3 * mix_rows(shape.copies) as u32);
-    let k = (shape.copies * shape.hidden) as u32;
-    crate::layers::ops::bf16_gemm_f32out(streams, split.0, sums, m, n, k, stream)?;
+    // The sublayer before into the stream, and the stream collapsed, in one
+    // pass over it; then the mix's GEMM over the stream that leaves.
+    let (parts, part_rows) = match before {
+        Some(before) => (before.parts, before.rows),
+        None => (DevicePtr::NULL, 0),
+    };
     KernelLaunch::new(gpu, kernels.site_rows)
         .grid([tokens as u32, 1, 1])
         .block([FINISH_THREADS, 1, 1])
         .arg_ptr(streams)
-        .arg_ptr(sums)
+        .arg_ptr(parts)
+        .arg_ptr(post)
+        .arg_ptr(comb)
+        .arg_u32(part_rows as u32)
         .arg_ptr(pre_in)
         .arg_ptr(norm_weight)
         .arg_ptr(out.collapsed)
@@ -403,9 +396,13 @@ pub fn site_rows(
         .arg_u32(shape.copies as u32)
         .arg_f32(shape.norm_eps)
         .launch(stream)?;
+    let (m, n) = (tokens as u32, 3 * mix_rows(shape.copies) as u32);
+    let k = (shape.copies * shape.hidden) as u32;
+    crate::layers::ops::bf16_gemm_f32out(streams, split.0, sums, m, n, k, stream)?;
     KernelLaunch::new(gpu, kernels.mix_rows)
         .grid([tokens as u32, 1, 1])
         .block([32, 1, 1])
+        .arg_ptr(sums)
         .arg_ptr(out.partials)
         .arg_ptr(weights.scale)
         .arg_ptr(weights.base)

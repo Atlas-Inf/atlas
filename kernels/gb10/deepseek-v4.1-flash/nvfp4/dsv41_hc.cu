@@ -407,28 +407,36 @@ extern "C" __global__ void __launch_bounds__(DSV41_FINISH_THREADS) dsv41_hc_site
     }
 }
 
-// A site of a batch, around a GEMM.
+// A site of a batch, before a GEMM.
 //
 // The mix is 24 dot products over a token's 20,480 stream values against
 // FP32 weights, and for a batch it is most of a site. A tensor core
 // multiplies BF16, and an FP32 weight is exactly the sum of three BF16
 // values (its eight leading bits, the next eight and the last), so the
 // same products come out of a BF16 GEMM against the three: sums [T, 3 * R]
-// FP32, R the mix's rows, a row's three shares R columns apart. The launch
-// after the GEMM is this one, a block of 1,024 threads a token:
+// FP32, R the mix's rows, a row's three shares R columns apart, which
+// `dsv41_hc_mix_rows` adds. The GEMM reads the stream this launch leaves, a
+// block of 1,024 threads a token:
 //
+//   with `x_parts` (the parts of the sublayer before this site, as
+//   `dsv41_hc_expand_parts` reads them, under `post` and `comb`, that
+//   site's), the stream expanded in place, in the pass that reads it: a
+//   stream is 40 KB a token, and a launch of its own for the expansion read
+//   and wrote every byte of it once more;
 //   the stream collapsed with `pre_in`, the coefficients of the site before
 //   (`dsv41_hc_collapse`), into `collapsed`; its RMS norm under
 //   `norm_weight` and that in FP8, as `dsv41_hc_site_finish` leaves them;
-//   and the token's mix sums for `dsv41_hc_mix_rows`, partials [T,
-//   DSV41_MIX_SUMS]: each row's three shares added, and the stream's sum of
-//   squares.
+//   and the stream's sum of squares, partials [T, DSV41_MIX_SUMS] at
+//   DSV41_MIX_ROWS.
 //
-// The collapse, the norm and the rounding are the row-at-a-time site's,
-// value for value. The mix's sums have another order.
+// The expansion, the collapse, the norm and the rounding are the
+// row-at-a-time site's, value for value. The mix's sums have another order.
 extern "C" __global__ void __launch_bounds__(DSV41_FINISH_THREADS) dsv41_hc_site_rows(
-    const __nv_bfloat16* __restrict__ streams,
-    const float* __restrict__ sums,
+    __nv_bfloat16* __restrict__ streams,
+    const __nv_bfloat16* __restrict__ x_parts,
+    const float* __restrict__ post,
+    const float* __restrict__ comb,
+    unsigned int part_rows,
     const float* __restrict__ pre_in,
     const __nv_bfloat16* __restrict__ norm_weight,
     __nv_bfloat16* __restrict__ collapsed,
@@ -439,21 +447,35 @@ extern "C" __global__ void __launch_bounds__(DSV41_FINISH_THREADS) dsv41_hc_site
     unsigned int hc,
     float norm_eps) {
     const unsigned int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
-    const unsigned int t = blockIdx.x, half = H / 2, rows = (2 + hc) * hc;
+    const unsigned int t = blockIdx.x, half = H / 2;
     __shared__ float squares[2][DSV41_FINISH_THREADS / 32];
-    const unsigned int* s32 = (const unsigned int*)(streams + (size_t)t * hc * H);
+    unsigned int* s32 = (unsigned int*)(streams + (size_t)t * hc * H);
+    post += (size_t)t * hc;
+    comb += (size_t)t * hc * hc;
     const float* pre = pre_in + (size_t)t * hc;
     unsigned int* y32 = (unsigned int*)(collapsed + (size_t)t * H);
     // Of the collapsed vector, and of the stream.
     float sum_sq = 0.0f, stream_sq = 0.0f;
     for (unsigned int i = tid; i < half; i += DSV41_FINISH_THREADS) {
+        float v0[DSV41_HC_MAX], v1[DSV41_HC_MAX];
+        for (unsigned int j = 0; j < hc; ++j) dsv41_unpack2(s32[(size_t)j * half + i], v0[j], v1[j]);
+        if (x_parts) {
+            const float x0 = dsv41_hc_gathered(x_parts, t, 2u * i, H, part_rows);
+            const float x1 = dsv41_hc_gathered(x_parts, t, 2u * i + 1u, H, part_rows);
+            unsigned int pair[DSV41_HC_MAX];
+            for (unsigned int j = 0; j < hc; ++j)
+                pair[j] = dsv41_pack2(dsv41_hc_expand_one(comb, v0, post[j], x0, j, hc),
+                                      dsv41_hc_expand_one(comb, v1, post[j], x1, j, hc));
+            for (unsigned int j = 0; j < hc; ++j) {
+                s32[(size_t)j * half + i] = pair[j];
+                dsv41_unpack2(pair[j], v0[j], v1[j]);
+            }
+        }
         float a0 = 0.0f, a1 = 0.0f;
         for (unsigned int j = 0; j < hc; ++j) {
-            float v0, v1;
-            dsv41_unpack2(s32[(size_t)j * half + i], v0, v1);
-            a0 = j == 0 ? pre[0] * v0 : a0 + pre[j] * v0;
-            a1 = j == 0 ? pre[0] * v1 : a1 + pre[j] * v1;
-            stream_sq += v0 * v0 + v1 * v1;
+            a0 = j == 0 ? pre[0] * v0[0] : a0 + pre[j] * v0[j];
+            a1 = j == 0 ? pre[0] * v1[0] : a1 + pre[j] * v1[j];
+            stream_sq += v0[j] * v0[j] + v1[j] * v1[j];
         }
         const unsigned int pair = dsv41_pack2(a0, a1);
         y32[i] = pair;
@@ -483,10 +505,6 @@ extern "C" __global__ void __launch_bounds__(DSV41_FINISH_THREADS) dsv41_hc_site
             partials[(size_t)t * DSV41_MIX_SUMS + DSV41_MIX_ROWS] = of_stream;
         }
     }
-    if (tid < rows) {
-        const float* mine = sums + (size_t)t * 3u * rows + tid;
-        partials[(size_t)t * DSV41_MIX_SUMS + tid] = (mine[0] + mine[rows]) + mine[2u * rows];
-    }
     __syncthreads();
     const float rms = rsqrtf(squares[0][0] / (float)H + norm_eps);
     const unsigned int* w32 = (const unsigned int*)norm_weight;
@@ -509,10 +527,13 @@ extern "C" __global__ void __launch_bounds__(DSV41_FINISH_THREADS) dsv41_hc_site
     }
 }
 
-// `dsv41_hc_mix_finish` from one set of sums a token (partials [T,
-// DSV41_MIX_SUMS], as `dsv41_hc_site_rows` leaves them). Grid (T), block 32.
+// `dsv41_hc_mix_finish` from one set of sums a token: partials [T,
+// DSV41_MIX_SUMS], of which `dsv41_hc_site_rows` left the stream's sum of
+// squares and this fills the mix's rows, the three shares of each added from
+// the GEMM's sums [T, 3 * R]. Grid (T), block 32.
 extern "C" __global__ void __launch_bounds__(32) dsv41_hc_mix_rows(
-    const float* __restrict__ partials,
+    const float* __restrict__ sums,
+    float* __restrict__ partials,
     const float* __restrict__ hc_scale,
     const float* __restrict__ hc_base,
     float* __restrict__ pre_out,
@@ -523,9 +544,15 @@ extern "C" __global__ void __launch_bounds__(32) dsv41_hc_mix_rows(
     unsigned int sinkhorn_iters,
     float norm_eps,
     float hc_eps) {
-    const unsigned int t = blockIdx.x;
+    const unsigned int t = blockIdx.x, rows = (2 + hc) * hc;
     __shared__ float mix[DSV41_MIX_SUMS];
     __shared__ volatile float comb[DSV41_HC_MAX * DSV41_HC_MAX];
+    if (threadIdx.x < rows) {
+        const float* mine = sums + (size_t)t * 3u * rows + threadIdx.x;
+        partials[(size_t)t * DSV41_MIX_SUMS + threadIdx.x] =
+            (mine[0] + mine[rows]) + mine[2u * rows];
+    }
+    __syncthreads();
     dsv41_hc_coefficients(
         partials + (size_t)t * DSV41_MIX_SUMS, 1, mix, comb, threadIdx.x, H, hc, sinkhorn_iters,
         norm_eps, hc_eps, hc_scale, hc_base, pre_out + (size_t)t * hc, post_out + (size_t)t * hc,
