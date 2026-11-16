@@ -9,7 +9,12 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use super::cache_recipe::WINDOW;
 use super::index::INDEX_DIM;
 use super::ops::HEAD_DIM;
+use super::shape::MAX_RATIO;
 use crate::layer::LayerState;
+
+/// The most rows of a batch whose effect on a sequence can be taken back
+/// ([`SeqState::roll_back`]): a verify of that many tokens less one draft.
+pub const KEPT_ROWS: usize = 16;
 
 /// A source layer's compressed keys for one sequence, their index keys, and
 /// the group its compressor is filling.
@@ -27,6 +32,11 @@ pub struct CompressedKeys {
     /// filled.
     pub(super) kv_state: DevicePtr,
     pub(super) score_state: DevicePtr,
+    /// `[MAX_RATIO + KEPT_ROWS, 512]` FP32 each: the same projections of the
+    /// group that was open before the last small batch and of the batch's
+    /// tokens, from which the open group of any of its positions is put back.
+    pub(super) kept_kv: DevicePtr,
+    pub(super) kept_score: DevicePtr,
 }
 
 impl CompressedKeys {
@@ -61,6 +71,11 @@ pub struct SeqState {
     /// `[128, 512]` BF16 ring: slot `position % 128` holds that position's key.
     pub window: DevicePtr,
     pub compressed: Option<CompressedKeys>,
+    /// `[KEPT_ROWS, 512]` BF16: the window keys the last small batch
+    /// displaced from the ring, in the order of its rows; and that batch's
+    /// first position and rows, while it can still be taken back.
+    pub(super) kept_window: DevicePtr,
+    pub(super) kept: Option<(usize, usize)>,
     /// On an Engram layer: the compressed id of the token at every position
     /// so far, which the n-grams ending at the next ones are hashed from.
     pub history: Vec<u32>,
@@ -84,20 +99,78 @@ impl SeqState {
                     retired: Vec::new(),
                     kv_state: gpu.alloc(ratio * HEAD_DIM * 4)?,
                     score_state: gpu.alloc(ratio * HEAD_DIM * 4)?,
+                    kept_kv: gpu.alloc((MAX_RATIO + KEPT_ROWS) * HEAD_DIM * 4)?,
+                    kept_score: gpu.alloc((MAX_RATIO + KEPT_ROWS) * HEAD_DIM * 4)?,
                 })
             }
         };
         Ok(Self {
             window,
             compressed,
+            kept_window: gpu.alloc(KEPT_ROWS * HEAD_DIM * 2)?,
+            kept: None,
             history: Vec::new(),
         })
     }
 
+    /// Take back all but the first `accepted` of the `rows` tokens the last
+    /// batch ran: a verify whose later drafts were refused. The ring gets
+    /// back the keys those rows displaced, a compressor the group that was
+    /// open at the last accepted token, and an Engram's history ends there.
+    /// Keys of groups the refused rows completed stay where they are: no
+    /// query sees them before the tokens that complete those groups again
+    /// have written them.
+    pub fn roll_back(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        ratio: usize,
+        accepted: usize,
+        rows: usize,
+        stream: u64,
+    ) -> Result<()> {
+        if accepted >= rows {
+            return Ok(());
+        }
+        let Some((first, kept)) = self.kept else {
+            anyhow::bail!(
+                "deepseek_v41: {accepted} of {rows} rows accepted, and the batch was not kept"
+            );
+        };
+        anyhow::ensure!(
+            kept == rows,
+            "deepseek_v41: a verify of {rows} rows after a batch of {kept}"
+        );
+        gpu.synchronize(stream)?;
+        let key = HEAD_DIM * 2;
+        for row in accepted..rows {
+            let slot = (first + row) % WINDOW;
+            let from = self.kept_window.offset(row * key);
+            gpu.copy_d2d(from, self.window.offset(slot * key), key)?;
+        }
+        let end = first + accepted;
+        if let Some(c) = self.compressed.as_ref().filter(|_| ratio > 1) {
+            // The pools start at the group that was open before the batch.
+            let (start, open) = (first - first % ratio, end % ratio);
+            let (at, bytes) = ((end - open - start) * HEAD_DIM * 4, open * HEAD_DIM * 4);
+            if bytes > 0 {
+                gpu.copy_d2d(c.kept_kv.offset(at), c.kv_state, bytes)?;
+                gpu.copy_d2d(c.kept_score.offset(at), c.score_state, bytes)?;
+            }
+        }
+        self.history.truncate(end);
+        self.kept = None;
+        Ok(())
+    }
+
     pub fn free(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
         gpu.free(self.window)?;
+        gpu.free(self.kept_window)?;
         if let Some(c) = self.compressed.take() {
-            for p in [c.keys, c.index_keys, c.kv_state, c.score_state] {
+            let kept = [c.kept_kv, c.kept_score];
+            for p in [c.keys, c.index_keys, c.kv_state, c.score_state]
+                .into_iter()
+                .chain(kept)
+            {
                 gpu.free(p)?;
             }
             for p in c.retired {

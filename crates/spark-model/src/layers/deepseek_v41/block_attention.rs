@@ -14,7 +14,7 @@ use super::index;
 use super::ops::{self, HEAD_DIM, MAX_KEYS, Turn};
 use super::parts::{self, PARTS};
 use super::profile;
-use super::state::SeqState;
+use super::state::{KEPT_ROWS, SeqState};
 use super::weights::row_part;
 
 impl Block {
@@ -62,6 +62,11 @@ impl Block {
         };
         copy(turn, 0, WINDOW - turn, false)?;
         copy(0, WINDOW - turn, turn, false)?;
+        // A small batch may be a verify whose rows are taken back: the keys
+        // its rows displace are the first of the unrolled ones.
+        if rows <= KEPT_ROWS {
+            gpu.copy_d2d_async(sc.chunk_keys, state.kept_window, rows * key, stream)?;
+        }
         // The batch's keys, once `front` has written them, into the ring:
         // its last 128, when it is longer than the window.
         let kept = rows.min(WINDOW);
@@ -149,6 +154,7 @@ impl Block {
         if rows > 1 {
             self.unroll_window(gpu, state, position, rows, stream)?;
         }
+        state.kept = (rows > 1 && rows <= KEPT_ROWS).then_some((position, rows));
         profile::end(gpu, stream, "query and window key", began)?;
         let began = profile::begin(gpu, stream)?;
         // Compressed keys: a source writes its own and chooses which a query

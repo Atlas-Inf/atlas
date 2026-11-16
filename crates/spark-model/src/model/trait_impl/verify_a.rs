@@ -70,7 +70,9 @@ impl TransformerModel {
         for (i, layer) in self.layers.iter().enumerate() {
             let layer_type = self.config.layer_type(i);
 
-            if layer_type == atlas_core::config::LayerType::FullAttention {
+            if layer_type == atlas_core::config::LayerType::FullAttention
+                && !layer.decode_batched_is_native()
+            {
                 // Attention layers: sequential per-token (need per-token metadata)
                 for t in 0..k {
                     let pos = seq.seq_len + t;

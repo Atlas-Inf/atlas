@@ -657,6 +657,10 @@ impl Model for TransformerModel {
     ) -> Result<[u32; 2]> {
         self.ssm_pool.require_verify_rollback_supported()?;
         self.mark_gdn_deferred_commit(seq, tokens.len())?;
+        if self.verifies_in_one_pass() {
+            let rows = self.decode_verify_dispatch(&tokens[..], seq, _stream)?;
+            return Ok([rows[0], rows[1]]);
+        }
         if self.native_glm_mtp_enabled() {
             let allow = self.take_verify_row_masks(2)?;
             let rows = self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream, allow)?;
@@ -677,6 +681,10 @@ impl Model for TransformerModel {
     ) -> Result<[u32; 3]> {
         self.ssm_pool.require_verify_rollback_supported()?;
         self.mark_gdn_deferred_commit(seq, tokens.len())?;
+        if self.verifies_in_one_pass() {
+            let rows = self.decode_verify_dispatch(&tokens[..], seq, _stream)?;
+            return Ok([rows[0], rows[1], rows[2]]);
+        }
         self.decode_verify_graphed_k3_dispatch(tokens, seq, _stream)
     }
     fn decode_verify_graphed_k4(
@@ -687,6 +695,10 @@ impl Model for TransformerModel {
     ) -> Result<[u32; 4]> {
         self.ssm_pool.require_verify_rollback_supported()?;
         self.mark_gdn_deferred_commit(seq, tokens.len())?;
+        if self.verifies_in_one_pass() {
+            let rows = self.decode_verify_dispatch(&tokens[..], seq, _stream)?;
+            return Ok([rows[0], rows[1], rows[2], rows[3]]);
+        }
         self.decode_verify_graphed_k4_dispatch(tokens, seq, _stream)
     }
     fn can_batch_glm_long_verify_rows(&self, owners: usize, rows: usize) -> bool {
@@ -874,6 +886,9 @@ impl Model for TransformerModel {
         };
         let seq_len = seq.seq_len;
         self.mark_gdn_deferred_commit(seq, tokens.len())?;
+        if self.verifies_in_one_pass() {
+            return self.decode_verify_dispatch(tokens, seq, _stream);
+        }
         let rows = self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream, allow)?;
         if let Some(serial) = serial {
             self.exact_verify_compare(serial, seq_len)?;

@@ -126,6 +126,16 @@ impl TransformerModel {
         Ok(())
     }
 
+    /// Whether a verify of K tokens is one pass of K rows through every
+    /// layer's own batched decode (`decode_batched_is_native`), with no
+    /// per-width graph or per-row staging: the eager verify then serves
+    /// every width.
+    pub(super) fn verifies_in_one_pass(&self) -> bool {
+        self.layers
+            .first()
+            .is_some_and(|l| l.decode_batched_is_native())
+    }
+
     pub(super) fn supports_chunked_mla_impl(&self) -> bool {
         // DeepSeek-V4.1 keeps a sequence's window, compressed keys and
         // Engram history in its layers' own state, which a later chunk reads

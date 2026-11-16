@@ -13,7 +13,7 @@ use super::moe;
 use super::ops::{self, Fp4Scale, HEAD_DIM};
 use super::shape::MAX_RATIO;
 use super::side;
-use super::state::SeqState;
+use super::state::{KEPT_ROWS, SeqState};
 use super::weights::IndexKeyWeights;
 
 impl Block {
@@ -55,10 +55,10 @@ impl Block {
         let open = carried + rows - groups * ratio;
         held.reserve(gpu, first + groups, stream)?;
         let held = &*held;
-        let projections = [(Some(w.wkv), held.kv_state, sc.pool_kv)]
+        let projections = [(Some(w.wkv), held.kv_state, sc.pool_kv, held.kept_kv)]
             .into_iter()
-            .chain([(w.wgate, held.score_state, sc.pool_score)]);
-        for (weights, kept, pool) in projections {
+            .chain([(w.wgate, held.score_state, sc.pool_score, held.kept_score)]);
+        for (weights, kept, pool, saved) in projections {
             let Some(weights) = weights else { continue };
             if carried > 0 {
                 gpu.copy_d2d_async(kept, pool, carried * token, stream)?;
@@ -76,6 +76,10 @@ impl Block {
             if open > 0 {
                 let from = pool.offset(groups * ratio * token);
                 gpu.copy_d2d_async(from, kept, open * token, stream)?;
+            }
+            // A small batch may be a verify whose rows are taken back.
+            if rows <= KEPT_ROWS {
+                gpu.copy_d2d_async(pool, saved, (carried + rows) * token, stream)?;
             }
         }
         if groups == 0 {

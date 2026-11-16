@@ -29,6 +29,7 @@ use super::ops::HEAD_DIM;
 use super::parts::Held;
 use super::profile;
 use super::shape::batch_rows;
+use super::state::KEPT_ROWS;
 use super::tail;
 use super::weights::BlockWeights;
 use crate::layer::{ForwardContext, LayerState, TransformerLayer};
@@ -190,6 +191,50 @@ impl TransformerLayer for Layer {
         stream: u64,
     ) -> Result<()> {
         self.run(hidden, 1, state, seq_len, ctx, stream)
+    }
+
+    /// Several consecutive tokens of a sequence in one pass, for a verify of
+    /// drafted tokens: each row's bytes are a decode step's, for a batch
+    /// this small runs the kernels a row alone runs.
+    fn decode_batched(
+        &self,
+        hidden: DevicePtr,
+        _residual: DevicePtr,
+        num_tokens: usize,
+        state: &mut dyn LayerState,
+        _kv_cache: &mut PagedKvCache,
+        seq_len: usize,
+        _block_table: &mut Vec<u32>,
+        _disk_block_ids: &mut Vec<u32>,
+        _disk_last_offloaded_per_layer: &mut Vec<u32>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.run(hidden, num_tokens, state, seq_len, ctx, stream)
+    }
+
+    fn decode_batched_is_native(&self) -> bool {
+        true
+    }
+
+    /// A verify runs its drafts and the token before them.
+    fn verify_max_drafts(&self) -> Option<usize> {
+        Some(KEPT_ROWS - 1)
+    }
+
+    fn rollback_aux_verify(
+        &self,
+        state: &mut dyn LayerState,
+        num_accepted: usize,
+        k: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let state = state
+            .as_any_mut()
+            .downcast_mut::<SeqState>()
+            .context("deepseek_v41: a layer state that is not this layer's")?;
+        state.roll_back(gpu, self.compresses, num_accepted, k, stream)
     }
 
     /// A chunk of a prompt, a batch of rows at a time: the bytes of a
