@@ -9,6 +9,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use super::block::Block;
 use super::moe;
 use super::ops;
+use super::profile;
 use super::weights::Fp8Proj;
 use crate::layers::ops::mxfp8_gemv_rows;
 
@@ -79,12 +80,14 @@ impl Block {
             self.index,
             s.experts
         );
-        moe::route(
+        let began = profile::begin(gpu, stream)?;
+        moe::route_fast(
             gpu,
-            k.moe.route,
+            &k.moe,
             sc.normed,
             w.gate,
             w.bias,
+            sc.route_scores,
             sc.chosen,
             sc.weights,
             1,
@@ -119,6 +122,8 @@ impl Block {
             .collect();
         // The reference adds the experts' outputs in expert order.
         routed.sort_unstable_by_key(|&(expert, _)| expert);
+        profile::end(gpu, stream, "route", began)?;
+        let began = profile::begin(gpu, stream)?;
         for (slot, (expert, weight)) in routed.into_iter().enumerate() {
             if !held.contains(&expert) {
                 continue;
@@ -127,9 +132,9 @@ impl Block {
             self.expert(
                 gpu,
                 |gate, up| {
-                    moe::fp4_gemv(
+                    moe::fp4_project(
                         gpu,
-                        k.moe.fp4_gemv,
+                        &k.moe,
                         sc.quantized,
                         e.w1.w4,
                         e.w1.scales,
@@ -138,9 +143,9 @@ impl Block {
                         s.hidden,
                         stream,
                     )?;
-                    moe::fp4_gemv(
+                    moe::fp4_project(
                         gpu,
-                        k.moe.fp4_gemv,
+                        &k.moe,
                         sc.quantized,
                         e.w3.w4,
                         e.w3.scales,
@@ -151,9 +156,9 @@ impl Block {
                     )
                 },
                 |inner, down| {
-                    moe::fp4_gemv(
+                    moe::fp4_project(
                         gpu,
-                        k.moe.fp4_gemv,
+                        &k.moe,
                         inner,
                         e.w2.w4,
                         e.w2.scales,
@@ -168,10 +173,15 @@ impl Block {
                 stream,
             )?;
         }
+        profile::end(gpu, stream, "routed experts", began)?;
         if let Some(comm) = comm {
-            comm.all_reduce_async(sc.expert_out.0, s.top_k * s.hidden * 2, stream)?;
+            profile::stage(gpu, stream, "expert all-reduce", || {
+                comm.all_reduce_async(sc.expert_out.0, s.top_k * s.hidden * 2, stream)
+            })?;
         }
-        let add = |x: DevicePtr| moe::accumulate(gpu, k.moe.accumulate, sc.acc, x, s.hidden, stream);
+        let began = profile::begin(gpu, stream)?;
+        let add =
+            |x: DevicePtr| moe::accumulate(gpu, k.moe.accumulate, sc.acc, x, s.hidden, stream);
         for slot in 0..s.top_k {
             add(sc.expert_out.offset(slot * s.hidden * 2))?;
         }
@@ -197,6 +207,7 @@ impl Block {
             sc.sublayer_out,
             s.hidden,
             stream,
-        )
+        )?;
+        profile::end(gpu, stream, "shared expert and sum", began)
     }
 }

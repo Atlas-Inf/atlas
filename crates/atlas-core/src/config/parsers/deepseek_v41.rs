@@ -44,8 +44,7 @@ pub fn parse_deepseek_v41(raw: &serde_json::Value) -> Result<ModelConfig> {
     let window_theta = flat.get("rope_theta").and_then(serde_json::Value::as_f64);
     let json = serde_json::Value::Object(flat).to_string();
     let mut config = parse_deepseek_family(&json, "deepseek_v41")?;
-    config.window_rope_theta =
-        window_theta.context("deepseek_v41 config missing rope_theta")?;
+    config.window_rope_theta = window_theta.context("deepseek_v41 config missing rope_theta")?;
     validate_shared_attention(&config)?;
     // The pad id needs the tokenizer; the table geometry does not.
     config.deepseek_v41_engram(0)?;
@@ -71,7 +70,9 @@ fn debug_truncate_layers(config: &mut ModelConfig) {
         config.num_hidden_layers = n;
         config.layer_types.truncate(n);
         config.engram_layer_ids.retain(|&layer| layer < n);
-        config.engram_num_embeddings.truncate(config.engram_layer_ids.len());
+        config
+            .engram_num_embeddings
+            .truncate(config.engram_layer_ids.len());
         config.kv_source_layer_ids.retain(|&layer| layer < n);
         config.index_source_layer_ids.retain(|&layer| layer < n);
         config.candidate_source_layer_id = config.candidate_source_layer_id.filter(|&l| l < n);

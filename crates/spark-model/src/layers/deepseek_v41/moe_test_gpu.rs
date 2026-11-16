@@ -51,6 +51,8 @@ fn routing_replays_the_reference() -> Result<()> {
             gpu.alloc(picks.len() * TOP_K * 4)?,
             gpu.alloc(picks.len() * TOP_K * 4)?,
         );
+        // The plain routing first, then the one the block runs: they must
+        // choose alike, and it is the block's that is held to the reference.
         route(
             gpu,
             k.route,
@@ -66,6 +68,34 @@ fn routing_replays_the_reference() -> Result<()> {
             ROUTE_SCALE,
             gpu.default_stream(),
         )?;
+        gpu.synchronize(gpu.default_stream())?;
+        let mut plain = vec![0u8; picks.len() * TOP_K * 4];
+        gpu.copy_d2h(chosen, &mut plain)?;
+        let scores = gpu.alloc(picks.len() * EXPERTS * 4)?;
+        route_fast(
+            gpu,
+            &k,
+            x,
+            gate,
+            bias,
+            scores,
+            chosen,
+            weights,
+            picks.len(),
+            HIDDEN,
+            EXPERTS,
+            TOP_K,
+            ROUTE_SCALE,
+            gpu.default_stream(),
+        )?;
+        gpu.synchronize(gpu.default_stream())?;
+        let mut fast = vec![0u8; picks.len() * TOP_K * 4];
+        gpu.copy_d2h(chosen, &mut fast)?;
+        assert!(
+            plain == fast,
+            "layer {layer}: the two routings choose differently"
+        );
+        gpu.free(scores)?;
         gpu.synchronize(gpu.default_stream())?;
         let mut got = vec![0u8; picks.len() * TOP_K * 4];
         gpu.copy_d2h(chosen, &mut got)?;
@@ -206,6 +236,7 @@ fn the_moe_replays_the_reference() -> Result<()> {
             &picks,
         );
         let mut got = Vec::new();
+        let (mut fast_same, mut fast_seen) = (0usize, 0usize);
         for token in 0..picks.len() {
             let x = upload(gpu, &inputs[token * HIDDEN * 2..(token + 1) * HIDDEN * 2])?;
             // Every projection of the token reads the same FP8 activation.
@@ -225,12 +256,26 @@ fn the_moe_replays_the_reference() -> Result<()> {
             routed.sort_unstable_by_key(|&(expert, _)| expert);
             for (expert, weight) in routed {
                 let e = Expert::load(gpu, layer, expert)?;
+                // The tensor-core projection against the plain one.
                 fp4_gemv(
                     gpu, k.fp4_gemv, xq, e.w1.0, e.w1.1, gate, INTER, HIDDEN, stream,
                 )?;
-                fp4_gemv(
-                    gpu, k.fp4_gemv, xq, e.w3.0, e.w3.1, up, INTER, HIDDEN, stream,
+                fp4_gemv_tc(
+                    gpu,
+                    k.fp4_gemv_tc,
+                    xq,
+                    e.w1.0,
+                    e.w1.1,
+                    up,
+                    INTER,
+                    HIDDEN,
+                    stream,
                 )?;
+                let (plain, fast) = (download(gpu, gate, INTER)?, download(gpu, up, INTER)?);
+                fast_same += plain.iter().zip(&fast).filter(|(a, b)| a == b).count();
+                fast_seen += INTER;
+                fp4_project(gpu, &k, xq, e.w1.0, e.w1.1, gate, INTER, HIDDEN, stream)?;
+                fp4_project(gpu, &k, xq, e.w3.0, e.w3.1, up, INTER, HIDDEN, stream)?;
                 swiglu(
                     gpu,
                     k.swiglu,
@@ -243,9 +288,7 @@ fn the_moe_replays_the_reference() -> Result<()> {
                     stream,
                 )?;
                 ops::fp8_quant_dequant(gpu, cache.fp8_quant_dequant, h, h, INTER, stream)?;
-                fp4_gemv(
-                    gpu, k.fp4_gemv, h, e.w2.0, e.w2.1, down, HIDDEN, INTER, stream,
-                )?;
+                fp4_project(gpu, &k, h, e.w2.0, e.w2.1, down, HIDDEN, INTER, stream)?;
                 accumulate(gpu, k.accumulate, acc, down, HIDDEN, stream)?;
                 gpu.synchronize(stream)?;
                 e.free(gpu)?;
@@ -263,8 +306,18 @@ fn the_moe_replays_the_reference() -> Result<()> {
         }
         let (same, distance) = closeness(&got, &outputs);
         println!(
-            "layer {layer} MoE: {:.3}% of values equal, {distance:.2e} away",
-            100.0 * same
+            "layer {layer} MoE ({}): {:.3}% of values equal, {distance:.2e} away; the tensor-core projection gives {:.4}% of the plain one's values",
+            if k.plain_fp4 {
+                "plain FP4"
+            } else {
+                "tensor-core FP4"
+            },
+            100.0 * same,
+            100.0 * fast_same as f64 / fast_seen as f64
+        );
+        assert!(
+            fast_same * 1000 >= fast_seen * 995,
+            "tensor-core FP4 differs from plain"
         );
         assert!(
             same > 0.995 && distance < 5e-4,

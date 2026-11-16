@@ -124,7 +124,11 @@ impl EngramTable {
         };
         let caches = Caches {
             rows: open("weight", WeightDtype::FP8E4M3, ENGRAM_DIM)?,
-            scales: open("scale", WeightDtype::FP8E8M0, ENGRAM_DIM / ENGRAM_SCALE_GROUP)?,
+            scales: open(
+                "scale",
+                WeightDtype::FP8E8M0,
+                ENGRAM_DIM / ENGRAM_SCALE_GROUP,
+            )?,
         };
         Ok(Self {
             slots: gpu.alloc(2 * hash.columns() * 4)?,

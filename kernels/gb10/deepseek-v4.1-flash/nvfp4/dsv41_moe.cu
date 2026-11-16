@@ -81,6 +81,70 @@ extern "C" __global__ void __launch_bounds__(DSV41_MOE_THREADS) dsv41_moe_route(
     }
 }
 
+// Routing in two launches, for when one token must not take a millisecond:
+// every (expert, token) is a block here, so a thread adds 20 products where
+// `dsv41_moe_route`'s adds 5,120. The scores are the same FP32 sums in
+// another order.
+//
+// score[t, e] = sqrt(softplus(x[t] . gate[e])). Grid (experts, T).
+extern "C" __global__ void __launch_bounds__(DSV41_MOE_THREADS) dsv41_moe_scores(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ gate,
+    float* __restrict__ score,
+    unsigned int H,
+    unsigned int experts) {
+    const unsigned int e = blockIdx.x, t = blockIdx.y, tid = threadIdx.x;
+    const __nv_bfloat16* xr = x + (size_t)t * H;
+    const __nv_bfloat16* row = gate + (size_t)e * H;
+    __shared__ float red[DSV41_MOE_THREADS];
+    float acc = 0.0f;
+    for (unsigned int d = tid; d < H; d += DSV41_MOE_THREADS)
+        acc += __bfloat162float(xr[d]) * __bfloat162float(row[d]);
+    red[tid] = acc;
+    __syncthreads();
+    for (unsigned int width = DSV41_MOE_THREADS / 2; width > 0; width >>= 1) {
+        if (tid < width) red[tid] += red[tid + width];
+        __syncthreads();
+    }
+    if (tid != 0) return;
+    const float logit = red[0];
+    score[(size_t)t * experts + e] = sqrtf(logit > 20.0f ? logit : log1pf(expf(logit)));
+}
+
+// The top_k of score + bias and their weights, as `dsv41_moe_route` picks
+// them: best first, the lower expert first among equals. One block per
+// token, one thread per expert: a thread counts the experts ahead of its own.
+extern "C" __global__ void __launch_bounds__(DSV41_MAX_EXPERTS) dsv41_moe_pick(
+    const float* __restrict__ score,
+    const float* __restrict__ bias,
+    unsigned int* __restrict__ chosen,
+    float* __restrict__ weights,
+    unsigned int experts,
+    unsigned int top_k,
+    float route_scale) {
+    const unsigned int t = blockIdx.x, tid = threadIdx.x;
+    __shared__ float value[DSV41_MAX_EXPERTS];
+    __shared__ unsigned int pick[DSV41_MAX_TOPK];
+    const float* s = score + (size_t)t * experts;
+    if (tid < experts) value[tid] = s[tid] + bias[tid];
+    __syncthreads();
+    if (tid < experts) {
+        const float mine = value[tid];
+        unsigned int ahead = 0;
+        for (unsigned int j = 0; j < experts; ++j)
+            ahead += (value[j] > mine) || (value[j] == mine && j < tid);
+        if (ahead < top_k) pick[ahead] = tid;
+    }
+    __syncthreads();
+    if (tid != 0) return;
+    float sum = 0.0f;
+    for (unsigned int k = 0; k < top_k; ++k) sum += s[pick[k]];
+    for (unsigned int k = 0; k < top_k; ++k) {
+        chosen[(size_t)t * top_k + k] = pick[k];
+        weights[(size_t)t * top_k + k] = s[pick[k]] / (sum + 1e-20f) * route_scale;
+    }
+}
+
 // out[row] = BF16(sum over blocks of 32 columns of (sum_k w4[row, k] * x[k]) * 2^scale),
 // one vector x. w4 [n, k / 2] packs two E2M1 values a byte, low nibble first;
 // scales [n, k / 32] are E8M0. One thread per row.

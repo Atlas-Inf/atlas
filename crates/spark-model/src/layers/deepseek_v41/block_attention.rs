@@ -10,6 +10,7 @@ use super::cache_recipe::{WINDOW, completed_group, group_position, window_row, w
 use super::index::INDEX_DIM;
 use super::moe;
 use super::ops::{self, Fp4Scale, HEAD_DIM};
+use super::profile;
 use super::side;
 use super::state::SeqState;
 use crate::layers::ops::mxfp8_gemv_rows;
@@ -143,6 +144,7 @@ impl Block {
             &self.shared.scratch,
             &self.weights.attn,
         );
+        let began = profile::begin(gpu, stream)?;
         // q: low-rank projection, norm, per-head projection, rotation.
         self.fp8(gpu, &w.wq_a, sc.normed, sc.quantized, sc.q_low, stream)?;
         self.norm(gpu, sc.q_low, w.q_norm, sc.q_low_normed, s.q_rank, stream)?;
@@ -205,6 +207,8 @@ impl Block {
             stream,
         )?;
 
+        profile::end(gpu, stream, "query and window key", began)?;
+        let began = profile::begin(gpu, stream)?;
         // Compressed keys: a source writes its own and chooses which a query
         // reads; the layers after it read the same keys at the same choice.
         let mut idx = window_row(position);
@@ -217,6 +221,8 @@ impl Block {
             compressed = keys;
             idx.extend(chosen);
         }
+        profile::end(gpu, stream, "compress and choose", began)?;
+        let began = profile::begin(gpu, stream)?;
         gpu.synchronize(stream)?;
         let bytes: Vec<u8> = idx.iter().flat_map(|i| i.to_le_bytes()).collect();
         gpu.copy_h2d(&bytes, sc.idx)?;
@@ -235,6 +241,8 @@ impl Block {
             WINDOW,
             stream,
         )?;
+        profile::end(gpu, stream, "sparse attention", began)?;
+        let began = profile::begin(gpu, stream)?;
 
         // Undo the query's rotation, quantize, and project out: each group of
         // heads through its own block of wo_a, then wo_b.
@@ -292,6 +300,7 @@ impl Block {
             sc.o_low_quantized,
             sc.sublayer_out,
             stream,
-        )
+        )?;
+        profile::end(gpu, stream, "output projections", began)
     }
 }

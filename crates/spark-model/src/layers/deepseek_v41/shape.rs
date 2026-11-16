@@ -147,6 +147,8 @@ pub struct Scratch {
     /// `[top_k, hidden]` BF16: each chosen expert's output, in expert order.
     pub(super) expert_out: DevicePtr,
     pub(super) acc: DevicePtr,
+    /// `[experts]` FP32: the routing score of every expert.
+    pub(super) route_scores: DevicePtr,
     pub(super) chosen: DevicePtr,
     pub(super) weights: DevicePtr,
     pub(super) pooled: DevicePtr,
@@ -193,6 +195,7 @@ impl Scratch {
             down: bf16(s.hidden)?,
             expert_out: bf16(s.top_k * s.hidden)?,
             acc: f32s(s.hidden)?,
+            route_scores: f32s(s.experts)?,
             chosen: f32s(s.top_k)?,
             weights: f32s(s.top_k)?,
             pooled: bf16(HEAD_DIM)?,

@@ -13,10 +13,11 @@ use spark_runtime::weights::WeightStore;
 use crate::mistral_loader::MistralWeightLoader;
 use crate::weight_loader::LongcatWeightLoader;
 use crate::weight_loader::{
-    DeepSeekV4WeightLoader, DeepSeekV41WeightLoader, DflashConfig, Gemma4WeightLoader, Glm5WeightLoader, LagunaWeightLoader,
-    MinimaxM2WeightLoader, ModelWeightLoader, NemotronHWeightLoader, NllbWeightLoader,
-    Qwen3VLWeightLoader, Qwen3WeightLoader, Qwen4ExpWeightLoader, Qwen35DenseWeightLoader,
-    Qwen35WeightLoader, RicursiveWeightLoader, Step3p7WeightLoader,
+    DeepSeekV4WeightLoader, DeepSeekV41WeightLoader, DflashConfig, Gemma4WeightLoader,
+    Glm5WeightLoader, LagunaWeightLoader, MinimaxM2WeightLoader, ModelWeightLoader,
+    NemotronHWeightLoader, NllbWeightLoader, Qwen3VLWeightLoader, Qwen3WeightLoader,
+    Qwen4ExpWeightLoader, Qwen35DenseWeightLoader, Qwen35WeightLoader, RicursiveWeightLoader,
+    Step3p7WeightLoader,
 };
 
 mod dspark_admission;

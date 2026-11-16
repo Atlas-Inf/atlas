@@ -14,6 +14,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::hc::{self, HcSite};
 use super::ops;
+use super::profile;
 pub use super::shape::{BlockKernels, Scratch, Shape};
 pub use super::state::{CompressedKeys, Handoff, SeqState};
 use super::weights::{BlockWeights, Fp8Proj};
@@ -147,9 +148,11 @@ impl Block {
             &self.weights,
         );
         // Its own site's post and comb, the previous site's pre.
-        self.site(gpu, &w.hc_attn, streams, sc.site_pre, stream)?;
-        hc::collapse(gpu, k.hc.collapse, &s.hc, streams, pre, sc.x, 1, stream)?;
-        self.norm(gpu, sc.x, w.attn.norm, sc.normed, s.hidden, stream)?;
+        profile::stage(gpu, stream, "mix, collapse, norm", || {
+            self.site(gpu, &w.hc_attn, streams, sc.site_pre, stream)?;
+            hc::collapse(gpu, k.hc.collapse, &s.hc, streams, pre, sc.x, 1, stream)?;
+            self.norm(gpu, sc.x, w.attn.norm, sc.normed, s.hidden, stream)
+        })?;
         self.attention(gpu, row, state, position, stream)
     }
 
@@ -184,7 +187,8 @@ impl Block {
                 stream,
             )
         };
-        expand(streams)?;
+        profile::stage(gpu, stream, "expand", || expand(streams))?;
+        let began = profile::begin(gpu, stream)?;
         self.site(gpu, &w.hc_ffn, streams, sc.next_pre, stream)?;
         hc::collapse(
             gpu,
@@ -197,8 +201,9 @@ impl Block {
             stream,
         )?;
         self.norm(gpu, sc.x, w.moe.norm, sc.normed, s.hidden, stream)?;
+        profile::end(gpu, stream, "mix, collapse, norm", began)?;
         self.moe(gpu, comm, stream)?;
-        expand(streams)?;
+        profile::stage(gpu, stream, "expand", || expand(streams))?;
         gpu.synchronize(stream)?;
         gpu.copy_d2d(sc.next_pre, pre, s.hc.copies * 4)
     }

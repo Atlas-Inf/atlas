@@ -31,14 +31,22 @@ pub struct CompressedKeys {
 
 impl CompressedKeys {
     /// Room for `groups` groups, keeping the ones held.
-    pub(super) fn reserve(&mut self, gpu: &dyn GpuBackend, groups: usize, stream: u64) -> Result<()> {
+    pub(super) fn reserve(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        groups: usize,
+        stream: u64,
+    ) -> Result<()> {
         if groups <= self.capacity {
             return Ok(());
         }
         // Kernels still running may be writing the buffers being copied.
         gpu.synchronize(stream)?;
         let capacity = groups.max(2 * self.capacity);
-        for (buffer, width) in [(&mut self.keys, HEAD_DIM), (&mut self.index_keys, INDEX_DIM)] {
+        for (buffer, width) in [
+            (&mut self.keys, HEAD_DIM),
+            (&mut self.index_keys, INDEX_DIM),
+        ] {
             let grown = gpu.alloc(capacity * width * 2)?;
             gpu.copy_d2d(*buffer, grown, self.capacity * width * 2)?;
             self.retired.push(std::mem::replace(buffer, grown));

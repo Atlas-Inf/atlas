@@ -25,6 +25,7 @@ use super::engram_table::{EngramHash, EngramTable};
 use super::hc::{self, IDENTITY_PRE};
 use super::index::INDEX_DIM;
 use super::ops::HEAD_DIM;
+use super::profile;
 use super::weights::BlockWeights;
 use crate::layer::{ForwardContext, LayerState, TransformerLayer};
 
@@ -54,7 +55,10 @@ impl Layer {
     fn row(&self, hidden: DevicePtr, ctx: &ForwardContext) -> Result<usize> {
         let width = (self.block.shared.shape.hidden * 2) as u64;
         let base = ctx.buffers.hidden_states().0;
-        let offset = hidden.0.checked_sub(base).context("a row before the arena's")?;
+        let offset = hidden
+            .0
+            .checked_sub(base)
+            .context("a row before the arena's")?;
         let row = (offset / width) as usize;
         ensure!(
             offset % width == 0 && row < ctx.buffers.max_batch_tokens(),
@@ -155,7 +159,9 @@ impl TransformerLayer for Layer {
             gpu.copy_h2d(&identity, pre)?;
         }
         if let Some(lookup) = &self.lookup {
-            self.look_up(lookup, row, streams, state, seq_len, ctx, stream)?;
+            profile::stage(gpu, stream, "engram", || {
+                self.look_up(lookup, row, streams, state, seq_len, ctx, stream)
+            })?;
         }
         let comm = ctx.comm.filter(|_| ctx.config.ep_world_size > 1);
         self.block
@@ -172,6 +178,7 @@ impl TransformerLayer for Layer {
                 1,
                 stream,
             )?;
+            profile::token_done();
         }
         Ok(())
     }
@@ -299,7 +306,13 @@ pub fn load_layers(
                 );
                 Some(Lookup {
                     engram: Engram::new(gpu, shared.kernels, &shape, weights)?,
-                    table: EngramTable::open(store, gpu, layer, hash, geometry.num_embeddings[index])?,
+                    table: EngramTable::open(
+                        store,
+                        gpu,
+                        layer,
+                        hash,
+                        geometry.num_embeddings[index],
+                    )?,
                     token_map: config.engram_token_map.clone().context(
                         "deepseek_v41: the Engram token map was not derived from the tokenizer",
                     )?,
