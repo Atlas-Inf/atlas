@@ -38,7 +38,7 @@ wait_ready "$PORT" 720 || { log "SERVE FAILED: $(grep -aE 'ERROR|allocfail|panic
 log "serving under rocprofv3"
 
 python3 - "$PORT" <<'EOF' | tee -a "$RES"
-import json, sys, time, urllib.request, random
+import hashlib, json, sys, time, urllib.request, random
 port = sys.argv[1]
 words = "river stone lantern harvest copper meadow signal orbit canvas thunder violet ember glacier compass atlas".split()
 def ask(tag, n_words, seed):
