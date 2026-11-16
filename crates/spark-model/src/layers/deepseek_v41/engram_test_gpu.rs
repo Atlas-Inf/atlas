@@ -50,13 +50,13 @@ fn engram_layers_replay_the_reference_from_hash_ids() -> Result<()> {
         let weights = EngramWeights::load(
             &store(gpu, dir, layer)?,
             gpu,
-            &kernels.parts,
             layer,
             &SHAPE,
             Held::ALL,
             stream,
         )?;
         let engram = Engram::new(gpu, kernels, &SHAPE, Held::ALL, weights)?;
+        let scratch = GemmScratch::alloc(gpu, 1, engram.weights.columns * ENGRAM_DIM)?;
         let columns = engram.weights.columns;
         let table = format!("layers.{layer}.engram.embed");
         let mut rows = CheckpointRows::open(dir, &format!("{table}.weight"))?;
@@ -109,7 +109,7 @@ fn engram_layers_replay_the_reference_from_hash_ids() -> Result<()> {
                 streams,
             )?;
             engram.apply(
-                gpu, row_dev, scale_dev, slots, slots, streams, 1, None, stream,
+                gpu, &scratch, row_dev, scale_dev, slots, slots, streams, 1, None, stream,
             )?;
             values.extend(download(gpu, engram.values, read)?);
             projected.extend(download(gpu, engram.kv, kv)?);

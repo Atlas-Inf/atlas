@@ -348,15 +348,7 @@ pub fn load_layers(
             .filter(|&index| index < tables.len())
         {
             Some(index) => {
-                let weights = EngramWeights::load(
-                    store,
-                    gpu,
-                    &shared.kernels.parts,
-                    layer,
-                    &shape,
-                    held,
-                    stream,
-                )?;
+                let weights = EngramWeights::load(store, gpu, layer, &shape, held, stream)?;
                 let table = tables[index].clone();
                 ensure!(
                     table.hash.columns() == weights.columns,

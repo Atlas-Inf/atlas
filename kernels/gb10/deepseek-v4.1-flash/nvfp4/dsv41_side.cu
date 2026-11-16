@@ -81,8 +81,10 @@ extern "C" __global__ void dsv41_engram_rows(
 }
 
 // Engram on one copy of one token per block. stream [T, hc, H] BF16 in
-// place; kv [T, (hc + 1) * H] BF16 is the lookup's projection, hc keys then
-// one value; weight [hc, H] FP32 is q_weight * k_weight.
+// place; kv is the lookup's projection, (hc + 1) * H BF16 a token, hc keys
+// then one value, in the four parts it was computed in: a part a quarter of
+// every token's values, the T tokens' one after another. weight [hc, H]
+// FP32 is q_weight * k_weight.
 //   gate_j = sigmoid(sign(dot_j) * sqrt(max(|dot_j|, 1e-6)))
 //   dot_j  = sum(h_j * weight_j * key_j) * rsqrt(mean(h_j^2) + eps)
 //            * rsqrt(mean(key_j^2) + eps) / sqrt(H)
@@ -98,15 +100,19 @@ extern "C" __global__ void __launch_bounds__(DSV41_SIDE_THREADS) dsv41_engram_ga
     float eps) {
     const unsigned int t = blockIdx.x, j = blockIdx.y, tid = threadIdx.x;
     __nv_bfloat16* h = stream + ((size_t)t * hc + j) * H;
-    const __nv_bfloat16* key = kv + ((size_t)t * (hc + 1) + j) * H;
-    const __nv_bfloat16* value = kv + ((size_t)t * (hc + 1) + hc) * H;
+    // Value e of this token's projection.
+    const unsigned int part = (hc + 1) * H / DSV41_PARTS;
+    const size_t part_stride = (size_t)gridDim.x * part;
+    auto projected = [&](unsigned int e) {
+        return __bfloat162float(kv[(e / part) * part_stride + (size_t)t * part + e % part]);
+    };
     const float* w = weight + (size_t)j * H;
     __shared__ float red[3][DSV41_SIDE_THREADS];
     __shared__ float gate;
     float hh = 0.0f, kk = 0.0f, hk = 0.0f;
     for (unsigned int d = tid; d < H; d += DSV41_SIDE_THREADS) {
         const float hv = __bfloat162float(h[d]);
-        const float kval = __bfloat162float(key[d]);
+        const float kval = projected(j * H + d);
         hh += hv * hv;
         kk += kval * kval;
         hk += hv * w[d] * kval;
@@ -128,5 +134,5 @@ extern "C" __global__ void __launch_bounds__(DSV41_SIDE_THREADS) dsv41_engram_ga
     }
     __syncthreads();
     for (unsigned int d = tid; d < H; d += DSV41_SIDE_THREADS)
-        h[d] = __float2bfloat16(__bfloat162float(h[d]) + gate * __bfloat162float(value[d]));
+        h[d] = __float2bfloat16(__bfloat162float(h[d]) + gate * projected(hc * H + d));
 }

@@ -10,9 +10,11 @@
 //! takes the rows a token reads, as the table stores them and wherever they
 //! sit; `engram_table.rs` finds them on disk.
 //!
-//! The projection is in four column parts, like every wide one (`parts.rs`):
-//! a part reads a quarter of the token's rows, so a rank fetches only the
-//! rows of the parts it holds, and the ranks gather the partial sums.
+//! The projection is in four parts by its output rows, like every wide one
+//! (`parts.rs`), and it reads a token's rows in four parts too: a rank
+//! fetches the table rows of a quarter of the hash columns, the ranks gather
+//! the values, a rank projects a quarter of the output from all of them, and
+//! the ranks gather that.
 
 use std::ops::Range;
 
@@ -22,26 +24,29 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
 use super::cache_recipe::bf16_to_f32;
-use super::parts::{self, Held, PARTS, PartKernels};
+use super::gemm::{GEMM_ROWS, GemmScratch, Input, operand};
+use super::parts::{self, Held, PARTS};
 use super::shape::{BlockKernels, Shape};
 use super::side;
-use super::weights::{Parted, column_parts, tensor};
+use super::weights::{Parted, Slice, fp8, tensor};
+use crate::layers::ops::MxW8a8;
 
 /// Values in one table row.
 pub const ENGRAM_DIM: usize = 256;
 /// Values of a row under one scale.
 pub const ENGRAM_SCALE_GROUP: usize = 32;
-/// Tokens one lookup takes: their rows are held in memory together, and
-/// their projections are 400 KB a token and part.
-pub const ENGRAM_ROWS: usize = 64;
+/// Tokens one lookup takes: their rows are held in memory together.
+pub const ENGRAM_ROWS: usize = 256;
 
 /// An Engram layer's weights, apart from its table.
 pub struct EngramWeights {
-    /// `[(copies + 1) * hidden, columns * 256]` in four column parts: a key
-    /// per copy, then the value.
+    /// `[(copies + 1) * hidden, columns * 256]` in four parts by rows: a key
+    /// per copy, then the value. And the same as GEMM operands.
     pub wkv: Parted,
-    /// Rows of `wkv`.
+    gemm: [Option<MxW8a8>; PARTS],
+    /// Rows of `wkv`, and its columns.
     pub rows: usize,
+    k: usize,
     /// `[copies, hidden]` FP32: `q_weight * k_weight`, which the reference
     /// only ever uses as that product.
     pub weight: DevicePtr,
@@ -53,20 +58,38 @@ impl EngramWeights {
     pub fn load(
         store: &WeightStore,
         gpu: &dyn GpuBackend,
-        kernels: &PartKernels,
         layer: usize,
         shape: &Shape,
         held: Held,
         stream: u64,
     ) -> Result<Self> {
         let prefix = format!("layers.{layer}.engram");
-        let (wkv, rows, width) =
-            column_parts(store, gpu, kernels, &format!("{prefix}.wkv"), held, stream)?;
+        let whole = fp8(store, gpu, &format!("{prefix}.wkv"))?;
+        let (rows, k) = (whole.n, whole.k);
         let gate = shape.hc.copies * shape.hidden;
         ensure!(
-            rows == gate + shape.hidden && width.is_multiple_of(ENGRAM_DIM),
-            "{prefix}.wkv [{rows}, {PARTS} x {width}]"
+            rows == gate + shape.hidden
+                && rows.is_multiple_of(PARTS)
+                && k.is_multiple_of(PARTS * ENGRAM_DIM),
+            "{prefix}.wkv [{rows}, {k}]"
         );
+        // A rank keeps the rows of its parts.
+        let part_rows = rows / PARTS;
+        let (mut wkv, mut gemm): (Parted, _) = ([None; PARTS], [None; PARTS]);
+        gpu.synchronize(stream)?;
+        for at in held.range() {
+            let from = whole.rows_from(at * part_rows);
+            let slice = Slice {
+                data: gpu.alloc(part_rows * k)?,
+                scales: gpu.alloc(part_rows * k / 32)?,
+            };
+            gpu.copy_d2d(from.data, slice.data, part_rows * k)?;
+            gpu.copy_d2d(from.scales, slice.scales, part_rows * k / 32)?;
+            wkv[at] = Some(slice);
+            gemm[at] = Some(operand(gpu, slice, part_rows, k, stream)?);
+        }
+        store.reclaim(gpu, &format!("{prefix}.wkv.weight"))?;
+        gpu.free(whole.w.scales)?;
         let part = |name: &str| -> Result<Vec<f32>> {
             let name = format!("{prefix}.{name}");
             let p = tensor(store, &name, WeightDtype::BF16)?;
@@ -89,9 +112,11 @@ impl EngramWeights {
         let weight = gpu.alloc(product.len())?;
         gpu.copy_h2d(&product, weight)?;
         Ok(Self {
-            columns: PARTS * width / ENGRAM_DIM,
+            columns: k / ENGRAM_DIM,
             wkv,
+            gemm,
             rows,
+            k,
             weight,
         })
     }
@@ -110,14 +135,14 @@ pub struct Engram {
     kernels: BlockKernels,
     shape: Shape,
     held: Held,
-    /// `[PARTS, tokens, columns / PARTS * 256]` BF16: the rows as values.
+    /// `[PARTS, tokens, columns / PARTS * 256]` BF16: the rows as values, a
+    /// part's tokens together.
     pub(super) values: DevicePtr,
-    /// `[PARTS, tokens, rows]` FP32: the parts of the projection, and
-    /// scratch as large for a gather that is not in place.
-    kv_parts: DevicePtr,
-    gather_recv: DevicePtr,
-    /// `[tokens, (copies + 1) * hidden]` BF16: the keys, then the value.
+    /// `[PARTS, tokens, (copies + 1) * hidden / PARTS]` BF16: the
+    /// projection, the keys and then the value of a token, in parts.
     pub(super) kv: DevicePtr,
+    /// Scratch for a gather that is not in place.
+    gather_recv: DevicePtr,
 }
 
 impl Engram {
@@ -131,9 +156,8 @@ impl Engram {
         let read = ENGRAM_ROWS * weights.columns * ENGRAM_DIM * 2;
         Ok(Self {
             values: gpu.alloc(read)?,
-            kv_parts: gpu.alloc(ENGRAM_ROWS * PARTS * weights.rows * 4)?,
-            gather_recv: gpu.alloc(ENGRAM_ROWS * PARTS * weights.rows * 4)?,
             kv: gpu.alloc(ENGRAM_ROWS * weights.rows * 2)?,
+            gather_recv: gpu.alloc(read.max(ENGRAM_ROWS * weights.rows * 2))?,
             kernels,
             shape: *shape,
             held,
@@ -156,11 +180,13 @@ impl Engram {
     /// rows `row_slots` of `rows` (256 FP8 values a row) and rows
     /// `scale_slots` of `scales` (8 E8M0 scales a row). The slots are u32,
     /// `[tokens, columns / PARTS]` for each part this rank holds, one part
-    /// after another. `comm` reaches the ranks that hold the other parts.
+    /// after another. `comm` reaches the ranks that hold the other parts,
+    /// and `scratch` is where a batch's values are rounded for a GEMM.
     #[allow(clippy::too_many_arguments)]
     pub fn apply(
         &self,
         gpu: &dyn GpuBackend,
+        scratch: &GemmScratch,
         rows: DevicePtr,
         scales: DevicePtr,
         row_slots: DevicePtr,
@@ -173,11 +199,11 @@ impl Engram {
         let (k, w, s) = (&self.kernels, &self.weights, &self.shape);
         ensure!(tokens <= ENGRAM_ROWS, "Engram: {tokens} tokens at once");
         let per = self.per_part();
-        let width = per * ENGRAM_DIM;
-        let part_bytes = tokens * w.rows * 4;
+        let (width, part_n) = (per * ENGRAM_DIM, w.rows / PARTS);
+        // A part of every token's values: the table rows of a quarter of the
+        // hash columns.
         for part in self.held.range() {
             let slots = (part - self.held.first) * tokens * per * 4;
-            let values = self.values.offset(part * tokens * width * 2);
             side::engram_rows(
                 gpu,
                 k.side.engram_rows,
@@ -185,45 +211,62 @@ impl Engram {
                 scales,
                 row_slots.offset(slots),
                 scale_slots.offset(slots),
-                values,
+                self.values.offset(part * tokens * width * 2),
                 tokens * per,
                 stream,
             )?;
-            // The projection rounds the values to FP8 on the way in.
-            let wkv = w.wkv[part].context("a held part of the Engram projection")?;
-            parts::project_rows(
-                gpu,
-                k.parts.fp8_f32_q,
-                values,
-                wkv.data,
-                wkv.scales,
-                self.kv_parts.offset(part * part_bytes),
-                4,
-                w.rows,
-                tokens,
-                w.rows,
-                width,
-                stream,
-            )?;
         }
+        let values = tokens * width * 2;
         parts::gather(
             gpu,
             comm,
             self.held,
-            self.kv_parts,
+            self.values,
             self.gather_recv,
-            part_bytes,
-            part_bytes,
+            values,
+            values,
             stream,
         )?;
-        parts::round(
+        // A part of the projection from all of them, which it rounds to FP8
+        // on the way in.
+        for part in self.held.range() {
+            let out = self.kv.offset(part * tokens * part_n * 2);
+            let gemm = w.gemm[part].as_ref().filter(|_| tokens >= GEMM_ROWS);
+            match gemm {
+                Some(operand) => {
+                    let x = Input {
+                        x: self.values,
+                        stride: width,
+                        piece: width,
+                        piece_stride: tokens * width,
+                    };
+                    scratch.project(gpu, x, operand, out, tokens, stream)?
+                }
+                None => parts::project_pieces(
+                    gpu,
+                    k.parts.fp8_pieces_q,
+                    self.values,
+                    w.wkv[part].context("a held part of the Engram projection")?,
+                    out,
+                    part_n,
+                    tokens,
+                    part_n,
+                    w.k,
+                    width,
+                    tokens * width,
+                    stream,
+                )?,
+            }
+        }
+        let projected = tokens * part_n * 2;
+        parts::gather(
             gpu,
-            k.parts.round,
-            self.kv_parts,
+            comm,
+            self.held,
             self.kv,
-            tokens * w.rows,
-            1,
-            tokens * w.rows,
+            self.gather_recv,
+            projected,
+            projected,
             stream,
         )?;
         side::engram_gate(

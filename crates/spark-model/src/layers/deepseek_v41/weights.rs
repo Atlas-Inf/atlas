@@ -209,59 +209,6 @@ pub fn row_part(whole: &Fp8Proj, part: usize) -> Slice {
     whole.rows_from(part * whole.n / PARTS)
 }
 
-/// The held column parts of FP8 projection `prefix`, each `[n, k / 4]`. The
-/// whole projection is read from the store and freed.
-pub(super) fn column_parts(
-    store: &WeightStore,
-    gpu: &dyn GpuBackend,
-    kernels: &PartKernels,
-    prefix: &str,
-    held: Held,
-    stream: u64,
-) -> Result<(Parted, usize, usize)> {
-    let whole = fp8(store, gpu, prefix)?;
-    let (n, k) = (whole.n, whole.k);
-    ensure!(
-        k.is_multiple_of(PARTS * 32),
-        "{prefix}: {k} columns do not split in {PARTS} parts of whole scale blocks"
-    );
-    let (width, blocks) = (k / PARTS, k / PARTS / 32);
-    let mut out: Parted = [None; PARTS];
-    for part in held.range() {
-        let slice = Slice {
-            data: gpu.alloc(n * width)?,
-            scales: gpu.alloc(n * blocks)?,
-        };
-        parts::slice_columns(
-            gpu,
-            kernels.slice,
-            whole.w.data,
-            slice.data,
-            n,
-            k,
-            part * width,
-            width,
-            stream,
-        )?;
-        parts::slice_columns(
-            gpu,
-            kernels.slice,
-            whole.w.scales,
-            slice.scales,
-            n,
-            k / 32,
-            part * blocks,
-            blocks,
-            stream,
-        )?;
-        out[part] = Some(slice);
-    }
-    gpu.synchronize(stream)?;
-    store.reclaim(gpu, &format!("{prefix}.weight"))?;
-    gpu.free(whole.w.scales)?;
-    Ok((out, n, width))
-}
-
 /// Part `part` of one routed-expert tensor `name` (`[rows, row_bytes]`
 /// bytes) into `dst`: a quarter of its rows or of its columns. The tensor is
 /// read from disk where the loader left it there, and from the device

@@ -130,6 +130,7 @@ impl Layer {
             profile::stage(ctx.gpu, stream, "engram", || {
                 lookup.engram.apply(
                     ctx.gpu,
+                    &self.block.shared.scratch.gemm,
                     found.rows,
                     found.scales,
                     found.row_slots,

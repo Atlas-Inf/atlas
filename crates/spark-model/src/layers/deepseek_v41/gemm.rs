@@ -142,7 +142,14 @@ pub struct GemmWeights {
     pub shared: [Option<[MxW8a8; 3]>; PARTS],
 }
 
-fn operand(gpu: &dyn GpuBackend, slice: Slice, n: usize, k: usize, stream: u64) -> Result<MxW8a8> {
+/// The `[n, k]` FP8 projection at `slice` as a GEMM operand.
+pub(super) fn operand(
+    gpu: &dyn GpuBackend,
+    slice: Slice,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<MxW8a8> {
     let twin = Mxfp8Weight {
         data: slice.data,
         scales: slice.scales,
