@@ -472,7 +472,8 @@ pub(super) fn hc_pre_split(
     let (k_fin, grid_y, fblock) = if x4 {
         (
             gpu.kernel("hyper_connection", "hc_pre_finish_x4")?,
-            hidden_size.div_ceil(32),
+            // HIP: + 1 y-block that runs only the injection contraction (the strix kernel).
+            hidden_size.div_ceil(32) + u32::from(cfg!(atlas_hip)),
             128,
         )
     } else {
