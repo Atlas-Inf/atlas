@@ -658,6 +658,40 @@ extern "C" __global__ void hc_pre_finish_x4(
     const float* nx = normed + (size_t)t * hc_dim;
     const float inv_hc = 1.0f / (float)hc;
 
+    // The injection contraction runs in its own block (grid y = ceil(H/32) + 1, the last y), so it
+    // overlaps the main part instead of trailing block (t, 0)'s. Same warp walk + shuffle tree per
+    // (t, stream), bit-identical; kbench_hc7 (43957553515): T=1 38.6 -> 31.5 us, T=2 39.0 -> 32.0, T=8 57.0 -> 58.7.
+    // Injection vector: same warp-per-stream contraction as `hc_pre_finish`
+    // (there `s2 = warp; s2 < hc; s2 += warps` with 4 warps is this mapping).
+    if (blockIdx.y == (H + 31u) / 32u) {
+        if (inject_w == nullptr) return;
+        // In-order register prefetch of 16 lane-strided weights (bit-exact, as
+        // hc_pre_down): one 2-B load per FMA made this serialized tail in block
+        // (t, 0) most of the kernel. kbench_hc3 (devlab 43700121506, 0 differing
+        // outputs): 106 -> 38 us at T=1, 103 -> 38 us at T=2, 105 -> 42 us at T=4.
+        constexpr unsigned int HC_INJ_U = 16;
+        const __nv_bfloat16* row = inject_w + (size_t)warp * hc_dim;
+        float acc = 0.0f;
+        unsigned int j = lane;
+        for (; j + 32 * (HC_INJ_U - 1) < hc_dim; j += 32 * HC_INJ_U) {
+            __nv_bfloat16 w[HC_INJ_U];
+            #pragma unroll
+            for (unsigned int u = 0; u < HC_INJ_U; u++) w[u] = row[j + 32 * u];
+            #pragma unroll
+            for (unsigned int u = 0; u < HC_INJ_U; u++) acc += (float)w[u] * nx[j + 32 * u];
+        }
+        for (; j < hc_dim; j += 32) {
+            acc += (float)row[j] * nx[j];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+        }
+        if (lane == 0) {
+            inj_out[(size_t)t * hc + warp] = 2.0f * qhc_sigmoid(acc * inv_hc);
+        }
+        return;
+    }
     extern __shared__ float smem_lo[];         // [rank]
     __shared__ float part[4][32];
     for (unsigned int r = tid; r < rank; r += blockDim.x) {
@@ -697,36 +731,6 @@ extern "C" __global__ void hc_pre_finish_x4(
         mixed += part[2][lane];
         mixed += part[3][lane];
         y_out[(size_t)t * H + d] = __float2bfloat16(mixed * inv_hc);
-    }
-
-    // Injection vector: same warp-per-stream contraction as `hc_pre_finish`
-    // (there `s2 = warp; s2 < hc; s2 += warps` with 4 warps is this mapping).
-    if (inject_w != nullptr && blockIdx.y == 0) {
-        // In-order register prefetch of 16 lane-strided weights (bit-exact, as
-        // hc_pre_down): one 2-B load per FMA made this serialized tail in block
-        // (t, 0) most of the kernel. kbench_hc3 (devlab 43700121506, 0 differing
-        // outputs): 106 -> 38 us at T=1, 103 -> 38 us at T=2, 105 -> 42 us at T=4.
-        constexpr unsigned int HC_INJ_U = 16;
-        const __nv_bfloat16* row = inject_w + (size_t)warp * hc_dim;
-        float acc = 0.0f;
-        unsigned int j = lane;
-        for (; j + 32 * (HC_INJ_U - 1) < hc_dim; j += 32 * HC_INJ_U) {
-            __nv_bfloat16 w[HC_INJ_U];
-            #pragma unroll
-            for (unsigned int u = 0; u < HC_INJ_U; u++) w[u] = row[j + 32 * u];
-            #pragma unroll
-            for (unsigned int u = 0; u < HC_INJ_U; u++) acc += (float)w[u] * nx[j + 32 * u];
-        }
-        for (; j < hc_dim; j += 32) {
-            acc += (float)row[j] * nx[j];
-        }
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
-        }
-        if (lane == 0) {
-            inj_out[(size_t)t * hc + warp] = 2.0f * qhc_sigmoid(acc * inv_hc);
-        }
     }
 }
 
