@@ -20,8 +20,14 @@ use crate::weight_map::{DenseWeight, MtpWeights, dense};
 pub struct RicursiveWeightLoader;
 
 impl ModelWeightLoader for RicursiveWeightLoader {
+    /// Megatron TP: attention Q/K/V/G shard column-parallel and O
+    /// row-parallel (the layer's `tp_world_size > 1` seam all-reduces the
+    /// attention output); the dense FFN shards gate/up column-parallel and
+    /// down row-parallel (`DenseFfnLayer::set_tp_sharded` installs the
+    /// local width and the output all-reduce). Embedding, lm_head, the
+    /// per-head q/k norms and the DFlash2 drafter stay replicated.
     fn supports_tp(&self) -> bool {
-        false
+        true
     }
 
     fn load_layers(

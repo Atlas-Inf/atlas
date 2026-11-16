@@ -26,7 +26,7 @@ impl DenseFfnLayer {
             return Ok(false);
         };
         let h = ctx.config.hidden_size as u32;
-        let inter = ctx.config.intermediate_size as u32;
+        let inter = self.inter(ctx);
         if !ctx.levers.dense_prefill_bf16mma
             || !matches!(self.activation, FfnActivation::SiLU)
             || self.lora.is_some()

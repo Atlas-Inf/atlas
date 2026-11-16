@@ -266,6 +266,12 @@ pub struct DenseFfnLayer {
     act_mul: KernelHandle,
     /// Multi-row passes on W4A4 at the checkpoint's input scales (`enable_w4a4_rows`).
     w4a4_rows: Option<w4a4_rows::W4a4Rows>,
+    /// TP-sharded dense FFN's local intermediate width. `Some(n)`: the
+    /// loader installed gate/up column-parallel and down row-parallel on
+    /// `intermediate_size / tp_world_size`, so every row path runs on `n`
+    /// and each public entry all-reduces its `[rows, hidden]` output.
+    /// `None`: ordinary full-width FFN (untouched).
+    local_inter: Option<u32>,
     /// BF16 dense MLP weights — when `Some`, all forward paths use the
     /// `dense_gemv_bf16` / `dense_gemm_bf16` kernels instead of w4a16
     /// NVFP4. Falls back to the NVFP4 weights when `None`. Set via
@@ -569,6 +575,7 @@ impl DenseFfnLayer {
             w4a16_gemm_t_k64_k: super::k64_kernel(gpu).unwrap_or(KernelHandle(0)),
             act_mul,
             w4a4_rows: None,
+            local_inter: None,
             bf16_weights: None,
             prefill_bf16_weights: None,
             dense_gemv_bf16_k,
@@ -1012,10 +1019,56 @@ impl DenseFfnLayer {
         self.w4a16_gemv_silu_input_sw = KernelHandle(0);
     }
 
+    /// Mark this FFN TP-sharded on `local_inter` (`intermediate_size` /
+    /// `tp_world_size`): gate/up column-parallel, down row-parallel. Every
+    /// row path below then computes on the local width and each public
+    /// entry all-reduces its `[rows, hidden]` output before returning.
+    /// Only a loader that actually shards the weights may set this.
+    pub fn set_tp_sharded(&mut self, local_inter: usize) {
+        self.local_inter = Some(local_inter as u32);
+    }
+
+    /// The intermediate width this FFN's weights span: the TP-local slice
+    /// when [`Self::set_tp_sharded`] ran, else the config's full size.
+    fn inter(&self, ctx: &ForwardContext) -> u32 {
+        self.local_inter
+            .unwrap_or(ctx.config.intermediate_size as u32)
+    }
+
+    /// Sum the `[rows, hidden]` partial output a TP-sharded FFN leaves in
+    /// `moe_output` (its down projection is row-parallel) across the TP
+    /// ranks. No-op on a full-width layer.
+    fn tp_reduce(&self, rows: usize, ctx: &ForwardContext, stream: u64) -> Result<()> {
+        if self.local_inter.is_none() || ctx.config.tp_world_size <= 1 {
+            return Ok(());
+        }
+        let Some(comm) = ctx.comm else {
+            anyhow::bail!("TP-sharded dense FFN ran without a communicator");
+        };
+        comm.all_reduce_async(
+            ctx.buffers.moe_output().0,
+            rows * ctx.config.hidden_size * 2,
+            stream,
+        )
+    }
+
+    /// Single-token decode, then the TP output all-reduce (a no-op seam
+    /// on a full-width layer). See `forward_inner` for the dispatch.
+    pub fn forward(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        let out = self.forward_inner(input, ctx, stream)?;
+        self.tp_reduce(1, ctx, stream)?;
+        Ok(out)
+    }
+
     /// Single-token decode: 2-3 kernel launches depending on activation.
     /// SiLU: dual GEMV + SiLU-fused down GEMV (2 launches).
     /// GELU: dual GEMV + gelu_mul + down GEMV (3 launches, no fused GELU down kernel).
-    pub fn forward(
+    fn forward_inner(
         &self,
         input: DevicePtr,
         ctx: &ForwardContext,
@@ -1025,7 +1078,7 @@ impl DenseFfnLayer {
             return Ok(ctx.buffers.moe_output());
         }
         let h = ctx.config.hidden_size as u32;
-        let inter = ctx.config.intermediate_size as u32;
+        let inter = self.inter(ctx);
 
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
@@ -1473,7 +1526,7 @@ impl DenseFfnLayer {
                 self.activation
             );
         }
-        let inter = ctx.config.intermediate_size as u32;
+        let inter = self.inter(ctx);
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
         let batchm = |w: &PackedQ2Weight, inp: DevicePtr, out: DevicePtr| -> Result<()> {
@@ -1495,9 +1548,15 @@ impl DenseFfnLayer {
         Ok(())
     }
 
+    /// K=2 speculative + the TP output all-reduce (no-op on a full-width layer).
+    pub fn forward_k2(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
+        self.forward_k2_inner(input, ctx, stream)?;
+        self.tp_reduce(2, ctx, stream)
+    }
+
     /// K=2 speculative: read-once batched GEMV for two tokens.
     /// Native BF16 uses separate gate/up batch2 launches; NVFP4 keeps its fused path.
-    pub fn forward_k2(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
+    fn forward_k2_inner(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
         if self.try_glm_canonical_rows(input, 2, ctx, stream)? {
             return Ok(());
         }
@@ -1515,7 +1574,7 @@ impl DenseFfnLayer {
             self.dense_gemv_bf16_batch2_k.0 != 0,
         ) {
             let h = ctx.config.hidden_size as u32;
-            let inter = ctx.config.intermediate_size as u32;
+            let inter = self.inter(ctx);
             let weights = self.bf16_weights.as_ref().unwrap();
             let gate_out = ctx.buffers.expert_gate_out();
             let up_out = ctx.buffers.expert_up_out();
@@ -1565,14 +1624,14 @@ impl DenseFfnLayer {
         }
         if native_small_batch_uses_prefill(self.bf16_weights.is_some(), self.fp8_weights.is_some())
         {
-            return self.forward_prefill(input, 2, ctx, stream);
+            return self.forward_prefill_inner(input, 2, ctx, stream);
         }
         if self.forward_dp4a_batch(input, 2, ctx, stream)? {
             return Ok(());
         }
 
         let h = ctx.config.hidden_size as u32;
-        let inter = ctx.config.intermediate_size as u32;
+        let inter = self.inter(ctx);
 
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
@@ -1614,9 +1673,15 @@ impl DenseFfnLayer {
         Ok(())
     }
 
+    /// K=3 speculative + the TP output all-reduce (no-op on a full-width layer).
+    pub fn forward_k3(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
+        self.forward_k3_inner(input, ctx, stream)?;
+        self.tp_reduce(3, ctx, stream)
+    }
+
     /// K=3 speculative: batched GEMV for 3 tokens.
     /// 3 launches: dual batch3 (gate+up) + silu_mul + batch3 (down).
-    pub fn forward_k3(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
+    fn forward_k3_inner(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
         if self.try_glm_canonical_rows(input, 3, ctx, stream)? {
             return Ok(());
         }
@@ -1630,14 +1695,14 @@ impl DenseFfnLayer {
         }
         if native_small_batch_uses_prefill(self.bf16_weights.is_some(), self.fp8_weights.is_some())
         {
-            return self.forward_prefill(input, 3, ctx, stream);
+            return self.forward_prefill_inner(input, 3, ctx, stream);
         }
         if self.forward_dp4a_batch(input, 3, ctx, stream)? {
             return Ok(());
         }
 
         let h = ctx.config.hidden_size as u32;
-        let inter = ctx.config.intermediate_size as u32;
+        let inter = self.inter(ctx);
 
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
@@ -1713,8 +1778,19 @@ impl DenseFfnLayer {
     /// measures ~290 GB/s on the same shapes (w8a16_gemv_batch4 sibling),
     /// putting this path at the ~31 ms weight-traffic floor. m=5..8 uses
     /// `w4a16_gemv_batch8` (batchm_bench: same weight-streaming bandwidth,
-    /// removing the M>4 tile-GEMM cliff for chain-verify K=5..8).
+    /// removing the M>4 tile-GEMV cliff for chain-verify K=5..8).
     pub fn forward_km(
+        &self,
+        input: DevicePtr,
+        m: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.forward_km_inner(input, m, ctx, stream)?;
+        self.tp_reduce(m as usize, ctx, stream)
+    }
+
+    fn forward_km_inner(
         &self,
         input: DevicePtr,
         m: u32,
@@ -1732,7 +1808,7 @@ impl DenseFfnLayer {
             return Ok(());
         }
         let h = ctx.config.hidden_size as u32;
-        let inter = ctx.config.intermediate_size as u32;
+        let inter = self.inter(ctx);
         let kh = self.batchm_kernel(m);
 
         let gate_out = ctx.buffers.expert_gate_out();
@@ -1908,7 +1984,8 @@ impl DenseFfnLayer {
         stream: u64,
     ) -> Result<()> {
         if !ctx.profile {
-            return self.forward_prefill_inner(input, num_tokens, ctx, stream);
+            self.forward_prefill_inner(input, num_tokens, ctx, stream)?;
+            return self.tp_reduce(num_tokens, ctx, stream);
         }
         let t0 = std::time::Instant::now();
         let r = self.forward_prefill_inner(input, num_tokens, ctx, stream);
@@ -1920,7 +1997,8 @@ impl DenseFfnLayer {
             num_tokens,
             t0.elapsed().as_micros()
         );
-        r
+        r?;
+        self.tp_reduce(num_tokens, ctx, stream)
     }
 
     fn forward_prefill_inner(
@@ -1937,7 +2015,7 @@ impl DenseFfnLayer {
             return Ok(());
         }
         let h = ctx.config.hidden_size as u32;
-        let inter = ctx.config.intermediate_size as u32;
+        let inter = self.inter(ctx);
         let m = num_tokens as u32;
 
         let gate_out = ctx.buffers.expert_gate_out();
