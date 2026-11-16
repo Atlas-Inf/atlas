@@ -28,7 +28,7 @@ use super::index::INDEX_DIM;
 use super::ops::HEAD_DIM;
 use super::parts::Held;
 use super::profile;
-use super::shape::ROWS;
+use super::shape::batch_rows;
 use super::weights::BlockWeights;
 use crate::layer::{ForwardContext, LayerState, TransformerLayer};
 
@@ -181,8 +181,9 @@ impl TransformerLayer for Layer {
         stream: u64,
     ) -> Result<()> {
         let width = self.block.shared.shape.hidden * 2;
-        for first in (0..num_tokens).step_by(ROWS) {
-            let rows = (num_tokens - first).min(ROWS);
+        let batch = self.block.shared.scratch.rows;
+        for first in (0..num_tokens).step_by(batch) {
+            let rows = (num_tokens - first).min(batch);
             let at = hidden.offset(first * width);
             self.run(at, rows, state, seq_len_start + first, ctx, stream)?;
         }
@@ -237,7 +238,12 @@ pub fn load_layers(
         held,
         kernels: BlockKernels::load(gpu)?,
         // At ratio 1 a query scores one compressed position a token.
-        scratch: Arc::new(Scratch::alloc(gpu, &shape, config.max_position_embeddings)?),
+        scratch: Arc::new(Scratch::alloc_rows(
+            gpu,
+            &shape,
+            config.max_position_embeddings,
+            batch_rows(),
+        )?),
         handoff: Arc::new(std::sync::Mutex::new(Handoff::default())),
     };
     let ladder = |original: usize, theta: f64| -> Result<DevicePtr> {

@@ -144,7 +144,45 @@ impl Default for RowHandoff {
 }
 
 /// What source layers hand down the stack within one pass, per row.
-#[derive(Default)]
 pub struct Handoff {
     pub(super) rows: Vec<RowHandoff>,
+    /// `[table_rows, index_topk]` i32: for the rows of a pass that went in
+    /// batches, the compressed positions the latest index source chose.
+    table: DevicePtr,
+    table_rows: usize,
+}
+
+impl Default for Handoff {
+    fn default() -> Self {
+        Self {
+            rows: Vec::new(),
+            table: DevicePtr::NULL,
+            table_rows: 0,
+        }
+    }
+}
+
+impl Handoff {
+    /// The table, with room for `rows` rows of `topk`; it keeps what it
+    /// holds when it grows.
+    pub(super) fn table(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        rows: usize,
+        topk: usize,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        if rows > self.table_rows {
+            // Kernels still running may be writing the table being copied.
+            gpu.synchronize(stream)?;
+            let room = rows.max(2 * self.table_rows);
+            let grown = gpu.alloc(room * topk * 4)?;
+            if self.table_rows > 0 {
+                gpu.copy_d2d(self.table, grown, self.table_rows * topk * 4)?;
+                gpu.free(self.table)?;
+            }
+            (self.table, self.table_rows) = (grown, room);
+        }
+        Ok(self.table)
+    }
 }

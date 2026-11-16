@@ -7,8 +7,10 @@ use spark_comm::CommBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::block::Block;
-use super::cache_recipe::{WINDOW, prefill_window, window_row, window_slot};
+use super::block_index::Chosen;
+use super::cache_recipe::{WINDOW, visible_groups, window_row, window_slot};
 use super::gemm::{GEMM_ROWS, Input};
+use super::index;
 use super::ops::{self, HEAD_DIM, MAX_KEYS, Turn};
 use super::parts::{self, PARTS};
 use super::profile;
@@ -151,45 +153,56 @@ impl Block {
         let began = profile::begin(gpu, stream)?;
         // Compressed keys: a source writes its own and chooses which a query
         // reads; the layers after it read the same keys at the same choice.
-        let mut index: Vec<Vec<i32>> = (0..rows)
-            .map(|r| match rows {
-                1 => window_row(position),
-                // Position q is entry q - position + 128 of the unrolled keys.
-                _ => {
-                    let mut row: Vec<i32> = prefill_window(position + r)
-                        .map(|q| (q + WINDOW - position) as i32)
-                        .collect();
-                    row.resize(WINDOW, -1);
-                    row
-                }
-            })
-            .collect();
         let mut compressed = state.window;
+        let mut chosen = match rows {
+            1 => Chosen::Host(Vec::new()),
+            _ => Chosen::Table(DevicePtr::NULL),
+        };
         if self.ratio > 0 {
             if self.weights.compressor.is_some() {
                 self.compress(gpu, state, position, rows, stream)?;
             }
-            let (keys, chosen) = self.compressed_rows(gpu, row, rows, state, position, stream)?;
-            compressed = keys;
-            for (idx, chosen) in index.iter_mut().zip(chosen) {
-                idx.extend(chosen);
-            }
+            (compressed, chosen) = self.compressed_rows(gpu, row, rows, state, position, stream)?;
         }
+        // The keys each query reads: its window, then its chosen.
+        let keys = match chosen {
+            // A row alone reads the ring.
+            Chosen::Host(positions) => {
+                let mut idx = window_row(position);
+                idx.extend(positions);
+                let bytes: Vec<u8> = idx.iter().flat_map(|i| i.to_le_bytes()).collect();
+                // In stream order, behind the kernels of the batch before.
+                gpu.copy_h2d_async(&bytes, sc.idx, stream)?;
+                idx.len()
+            }
+            // A batch reads the window unrolled, and the shorter rows end in
+            // none.
+            Chosen::Table(table) => {
+                let most = match self.ratio {
+                    0 => 0,
+                    ratio => visible_groups(position + rows - 1, ratio).min(s.index_topk),
+                };
+                let (keys, topk) = (WINDOW + most, s.index_topk);
+                index::attn_index(
+                    gpu,
+                    k.index.attn_index,
+                    table,
+                    sc.idx,
+                    keys,
+                    topk,
+                    position,
+                    rows,
+                    stream,
+                )?;
+                keys
+            }
+        };
         profile::end(gpu, stream, "compress and choose", began)?;
-        // Every row's keys in one table, the shorter rows ending in none.
-        let keys = index.iter().map(Vec::len).max().unwrap_or(0);
         ensure!(
             keys <= MAX_KEYS,
             "layer {}: {keys} keys for one query",
             self.index
         );
-        let mut bytes = Vec::with_capacity(rows * keys * 4);
-        for idx in &index {
-            bytes.extend(idx.iter().flat_map(|i| i.to_le_bytes()));
-            bytes.extend((idx.len()..keys).flat_map(|_| (-1i32).to_le_bytes()));
-        }
-        // In stream order, behind the kernels of the batch before.
-        gpu.copy_h2d_async(&bytes, sc.idx, stream)?;
 
         let (heads, groups) = (s.heads / PARTS, s.o_groups / PARTS);
         let group_in = s.heads / s.o_groups * HEAD_DIM;

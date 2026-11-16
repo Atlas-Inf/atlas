@@ -132,6 +132,8 @@ impl GemmScratch {
 pub struct GemmWeights {
     pub wq_a: MxW8a8,
     pub wkv: MxW8a8,
+    /// An index source's query heads, whole.
+    pub index_wq_b: Option<MxW8a8>,
     pub wq_b: [Option<MxW8a8>; PARTS],
     /// One group's block of wo_a each.
     pub wo_a: Vec<Option<MxW8a8>>,
@@ -166,6 +168,10 @@ impl GemmWeights {
         let mut out = Self {
             wq_a: whole(&a.wq_a)?,
             wkv: whole(&a.wkv)?,
+            index_wq_b: match &w.indexer {
+                Some(indexer) => Some(whole(&indexer.wq_b)?),
+                None => None,
+            },
             wq_b: [None; PARTS],
             wo_a: vec![None; s.o_groups],
             wo_b: [None; PARTS],

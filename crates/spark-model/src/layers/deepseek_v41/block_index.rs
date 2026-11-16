@@ -1,221 +1,47 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The compressed keys of a DeepSeek-V4.1 block over a batch of rows: the
-//! keys and index keys of the groups the batch completes, and which
-//! compressed positions each row's query attends to.
+//! Which compressed positions the queries of a batch attend to: the
+//! indexer's scores and the choice among them. A row alone is chosen for on
+//! the host (`index_recipe.rs`); a batch on the device (`dsv41_choose.cu`).
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::block::{Block, Candidates};
-use super::cache_recipe::{bf16_to_f32, group_position, visible_groups};
+use super::cache_recipe::{bf16_to_f32, visible_groups};
+use super::gemm::{GEMM_ROWS, Input};
 use super::index::{self, INDEX_DIM, Queries, head_weight_scale};
 use super::index_recipe::{candidate_blocks, keep_candidates, top_positions};
 use super::moe;
-use super::ops::{self, Fp4Scale, HEAD_DIM};
+use super::ops::{self, Fp4Scale};
 use super::parts;
-use super::shape::MAX_RATIO;
 use super::side;
 use super::state::SeqState;
-use super::weights::{IndexKeyWeights, IndexerWeights};
+use super::weights::IndexerWeights;
+
+/// The compressed positions the queries of a batch read.
+pub(super) enum Chosen {
+    /// One query's, on the host, ascending.
+    Host(Vec<i32>),
+    /// A batch's, on the device: `[rows, index_topk]` i32, a row ascending
+    /// and then -1. Null on a layer that attends over its window only.
+    Table(DevicePtr),
+}
 
 impl Block {
-    /// The compressor over `rows` tokens from `position`, whose attention
-    /// inputs are `scratch.normed`: project each, pool every group the batch
-    /// completes into its key and, on a layer that makes them, its index
-    /// key; and keep the tokens of a group it leaves open.
-    pub(super) fn compress(
-        &self,
-        gpu: &dyn GpuBackend,
-        state: &mut SeqState,
-        position: usize,
-        rows: usize,
-        stream: u64,
-    ) -> Result<()> {
-        let (s, k, sc) = (
-            &self.shared.shape,
-            &self.shared.kernels,
-            &self.shared.scratch,
-        );
-        let w = self
-            .weights
-            .compressor
-            .as_ref()
-            .context("a source layer has a compressor")?;
-        let held = state
-            .compressed
-            .as_mut()
-            .context("a source layer holds compressed keys")?;
-        // Tokens of a group the batch before left open come first.
-        let (ratio, token) = (w.ratio, HEAD_DIM * 4);
-        ensure!(
-            ratio <= MAX_RATIO && rows <= sc.rows,
-            "layer {}: {rows} rows at {ratio} tokens a key",
-            self.index
-        );
-        let carried = position % ratio;
-        let (first, groups) = (position / ratio, (carried + rows) / ratio);
-        let open = carried + rows - groups * ratio;
-        held.reserve(gpu, first + groups, stream)?;
-        let held = &*held;
-        let projections = [(Some(w.wkv), held.kv_state, sc.pool_kv)]
-            .into_iter()
-            .chain([(w.wgate, held.score_state, sc.pool_score)]);
-        for (weights, kept, pool) in projections {
-            let Some(weights) = weights else { continue };
-            if carried > 0 {
-                gpu.copy_d2d_async(kept, pool, carried * token, stream)?;
-            }
-            side::gemv_f32_rows(
-                gpu,
-                k.side.gemv_f32,
-                sc.normed,
-                weights,
-                pool.offset(carried * token),
-                rows,
-                HEAD_DIM,
-                s.hidden,
-                stream,
-            )?;
-            if open > 0 {
-                let from = pool.offset(groups * ratio * token);
-                gpu.copy_d2d_async(from, kept, open * token, stream)?;
-            }
-        }
-        if groups == 0 {
-            return Ok(());
-        }
-        match w.wgate {
-            Some(_) => side::compress_pool_groups(
-                gpu,
-                k.side.compress_pool,
-                sc.pool_kv,
-                sc.pool_score,
-                sc.pooled,
-                groups,
-                ratio,
-                HEAD_DIM,
-                stream,
-            )?,
-            // One token a group: nothing to pool, the projection is the key.
-            None => moe::round_bf16(
-                gpu,
-                k.moe.round_bf16,
-                sc.pool_kv,
-                sc.pooled,
-                groups * HEAD_DIM,
-                stream,
-            )?,
-        }
-        let keys = held.keys.offset(first * HEAD_DIM * 2);
-        self.norm(gpu, sc.pooled, w.norm, keys, groups, HEAD_DIM, stream)?;
-        // A group is turned to its first token's position.
-        let at: Vec<u8> = (first..first + groups)
-            .flat_map(|group| (group_position(group, ratio) as u32).to_le_bytes())
-            .collect();
-        gpu.copy_h2d_async(&at, sc.group_positions, stream)?;
-        // The index key comes from the key as it is before its rotation.
-        if let Some(index) = self.weights.indexer.as_ref().and_then(|i| i.key.as_ref()) {
-            let index_keys = held.index_keys.offset(first * INDEX_DIM * 2);
-            self.index_keys(gpu, index, keys, index_keys, groups, stream)?;
-        }
-        ops::rotate(
-            gpu,
-            k.cache.rotate,
-            keys,
-            sc.group_positions,
-            self.freqs,
-            groups,
-            1,
-            HEAD_DIM,
-            s.rope,
-            false,
-            stream,
-        )?;
-        ops::fp4_quant_dequant(
-            gpu,
-            k.cache.fp4_quant_dequant,
-            keys,
-            groups * HEAD_DIM,
-            Fp4Scale::E4m3Per16,
-            stream,
-        )
-    }
-
-    /// `keys` (`[groups, 128]` BF16) = the index keys of the groups whose
-    /// compressed keys, normed and not yet rotated, are `latents`. Their
-    /// positions are in `scratch.group_positions`.
-    fn index_keys(
-        &self,
-        gpu: &dyn GpuBackend,
-        w: &IndexKeyWeights,
-        latents: DevicePtr,
-        keys: DevicePtr,
-        groups: usize,
-        stream: u64,
-    ) -> Result<()> {
-        let (s, k, sc) = (
-            &self.shared.shape,
-            &self.shared.kernels,
-            &self.shared.scratch,
-        );
-        side::gemv_f32_rows(
-            gpu,
-            k.side.gemv_f32,
-            latents,
-            w.wk,
-            sc.index_key_f32,
-            groups,
-            INDEX_DIM,
-            HEAD_DIM,
-            stream,
-        )?;
-        moe::round_bf16(
-            gpu,
-            k.moe.round_bf16,
-            sc.index_key_f32,
-            sc.index_key,
-            groups * INDEX_DIM,
-            stream,
-        )?;
-        self.norm(gpu, sc.index_key, w.norm, keys, groups, INDEX_DIM, stream)?;
-        ops::rotate(
-            gpu,
-            k.cache.rotate,
-            keys,
-            sc.group_positions,
-            self.freqs,
-            groups,
-            1,
-            INDEX_DIM,
-            s.rope,
-            false,
-            stream,
-        )?;
-        ops::fp4_quant_dequant(
-            gpu,
-            k.cache.fp4_quant_dequant,
-            keys,
-            groups * INDEX_DIM,
-            Fp4Scale::PowerOfTwoPer32,
-            stream,
-        )
-    }
-
-    /// What the index keys score for each of `count` tokens of the batch,
-    /// from its row `first` at `position`: a row of `stride` scores a token,
-    /// of which the token's visible groups are meaningful.
-    #[allow(clippy::too_many_arguments)]
-    fn index_scores(
+    /// The indexer's queries for `count` tokens of the batch, from its row
+    /// `first` at `position`, in `scratch.index_q` and
+    /// `scratch.index_weights`; and how many compressed positions the last
+    /// of them sees.
+    fn index_queries(
         &self,
         gpu: &dyn GpuBackend,
         w: &IndexerWeights,
-        keys: DevicePtr,
         first: usize,
         count: usize,
         position: usize,
         stream: u64,
-    ) -> Result<(Vec<f32>, usize)> {
+    ) -> Result<Queries> {
         let (s, k, sc) = (
             &self.shared.shape,
             &self.shared.kernels,
@@ -223,7 +49,7 @@ impl Block {
         );
         let stride = visible_groups(position + count - 1, self.ratio);
         ensure!(
-            stride <= sc.max_groups && count <= sc.score_rows && !keys.is_null(),
+            stride <= sc.max_groups && count <= sc.score_rows,
             "layer {}: {count} queries over {stride} compressed positions, room for {} over {}",
             self.index,
             sc.score_rows,
@@ -237,20 +63,28 @@ impl Block {
         );
         // The query heads: projected from the query's FP8 form, rotated,
         // rounded to FP4.
-        parts::project_rows(
-            gpu,
-            k.parts.fp8_q,
-            sc.q_low_normed.offset(first * s.q_rank * 2),
-            w.wq_b.w.data,
-            w.wq_b.w.scales,
-            sc.index_q,
-            2,
-            w.wq_b.n,
-            count,
-            w.wq_b.n,
-            w.wq_b.k,
-            stream,
-        )?;
+        let q_low = sc.q_low_normed.offset(first * s.q_rank * 2);
+        let gemm = self.gemm.as_ref().filter(|_| count >= GEMM_ROWS);
+        match gemm.and_then(|g| g.index_wq_b.as_ref()) {
+            Some(wq) => {
+                let x = Input::rows(q_low, s.q_rank);
+                sc.gemm.project(gpu, x, wq, sc.index_q, count, stream)?
+            }
+            None => parts::project_rows(
+                gpu,
+                k.parts.fp8_q,
+                q_low,
+                w.wq_b.w.data,
+                w.wq_b.w.scales,
+                sc.index_q,
+                2,
+                w.wq_b.n,
+                count,
+                w.wq_b.n,
+                w.wq_b.k,
+                stream,
+            )?,
+        }
         ops::rotate(
             gpu,
             k.cache.rotate,
@@ -292,12 +126,35 @@ impl Block {
             count * s.index_heads,
             stream,
         )?;
-        let queries = Queries {
+        Ok(Queries {
             count,
             position,
             ratio: self.ratio,
             stride,
-        };
+        })
+    }
+
+    /// What the index keys score for each of `count` tokens of the batch,
+    /// from its row `first` at `position`, read back: a row of `stride`
+    /// scores a token, of which the token's visible groups are meaningful.
+    #[allow(clippy::too_many_arguments)]
+    fn index_scores(
+        &self,
+        gpu: &dyn GpuBackend,
+        w: &IndexerWeights,
+        keys: DevicePtr,
+        first: usize,
+        count: usize,
+        position: usize,
+        stream: u64,
+    ) -> Result<(Vec<f32>, usize)> {
+        let (s, k, sc) = (
+            &self.shared.shape,
+            &self.shared.kernels,
+            &self.shared.scratch,
+        );
+        let queries = self.index_queries(gpu, w, first, count, position, stream)?;
+        let stride = queries.stride;
         index::score_rows(
             gpu,
             k.index.score,
@@ -352,6 +209,37 @@ impl Block {
         Ok(top_positions(scores, s.index_topk))
     }
 
+    /// The positions each of `rows` queries from `position` reads, chosen
+    /// on the host as a row alone is, into `table`.
+    #[allow(clippy::too_many_arguments)]
+    fn choose_on_host(
+        &self,
+        gpu: &dyn GpuBackend,
+        w: &IndexerWeights,
+        index_keys: DevicePtr,
+        candidates: &mut [Vec<bool>],
+        table: DevicePtr,
+        rows: usize,
+        position: usize,
+        stream: u64,
+    ) -> Result<()> {
+        let (topk, score_rows) = (self.shared.shape.index_topk, self.shared.scratch.score_rows);
+        let visible = |r: usize| visible_groups(position + r, self.ratio);
+        let mut words: Vec<u8> = Vec::with_capacity(rows * topk * 4);
+        for first in (0..rows).step_by(score_rows) {
+            let count = (rows - first).min(score_rows);
+            let (mut scores, stride) =
+                self.index_scores(gpu, w, index_keys, first, count, position + first, stream)?;
+            for i in 0..count {
+                let of_row = &mut scores[i * stride..i * stride + visible(first + i)];
+                let chosen = self.choose(of_row, &mut candidates[first + i])?;
+                words.extend(chosen.iter().flat_map(|p| p.to_le_bytes()));
+                words.extend((chosen.len()..topk).flat_map(|_| (-1i32).to_le_bytes()));
+            }
+        }
+        gpu.copy_h2d_async(&words, table, stream)
+    }
+
     /// The compressed keys the queries of `rows` rows from row `row` at
     /// `position` read, and the positions among them each attends to. A
     /// source layer publishes its own for the layers after it; the others
@@ -364,13 +252,25 @@ impl Block {
         state: &SeqState,
         position: usize,
         stream: u64,
-    ) -> Result<(DevicePtr, Vec<Vec<i32>>)> {
-        let (topk, score_rows) = (self.shared.shape.index_topk, self.shared.scratch.score_rows);
+    ) -> Result<(DevicePtr, Chosen)> {
+        let (s, k, sc) = (
+            &self.shared.shape,
+            &self.shared.kernels,
+            &self.shared.scratch,
+        );
+        let topk = s.index_topk;
         let visible = |r: usize| visible_groups(position + r, self.ratio);
         let mut handoff = self.shared.handoff.lock().expect("handoff");
         if handoff.rows.len() < row + rows {
             handoff.rows.resize_with(row + rows, Default::default);
         }
+        // A batch's choices stay on the device, a row of a table each.
+        let table = match rows {
+            1 => DevicePtr::NULL,
+            _ => handoff
+                .table(gpu, row + rows, topk, stream)?
+                .offset(row * topk * 4),
+        };
         let batch = &mut handoff.rows[row..row + rows];
         if let Some(held) = &state.compressed {
             for mine in batch.iter_mut() {
@@ -384,40 +284,124 @@ impl Block {
             "layer {}: no source layer has run for row {row}",
             self.index
         );
-        if let Some(w) = &self.weights.indexer {
-            // Below `index_topk` positions there is nothing to choose: every
-            // position is read, and all are candidates (`Shape::from_config`
-            // checks that they would be). The rows that see more come last.
-            let scored = (0..rows).find(|&r| visible(r) > topk).unwrap_or(rows);
-            for (r, mine) in batch.iter_mut().enumerate().take(scored) {
-                if self.candidates == Candidates::Source {
-                    mine.candidates = vec![true; visible(r)];
+        let Some(w) = &self.weights.indexer else {
+            // The latest index source chose for these rows.
+            return Ok(match rows {
+                1 => {
+                    ensure!(
+                        batch[0].chosen.len() == visible(0).min(topk),
+                        "layer {}: row {row} was handed {} compressed positions, and its query sees {}",
+                        self.index,
+                        batch[0].chosen.len(),
+                        visible(0)
+                    );
+                    (keys, Chosen::Host(batch[0].chosen.clone()))
                 }
-                mine.chosen = (0..visible(r) as i32).collect();
+                _ => (keys, Chosen::Table(table)),
+            });
+        };
+        ensure!(
+            !index_keys.is_null(),
+            "layer {}: no index keys for row {row}",
+            self.index
+        );
+        // Below `index_topk` positions there is nothing to choose: every
+        // position is read, and all are candidates (`Shape::from_config`
+        // checks that they would be). The rows that see more come last.
+        let scored = (0..rows).find(|&r| visible(r) > topk).unwrap_or(rows);
+        if rows == 1 {
+            let mine = &mut batch[0];
+            mine.chosen = match scored {
+                0 => {
+                    let (mut scores, _) =
+                        self.index_scores(gpu, w, index_keys, 0, 1, position, stream)?;
+                    self.choose(&mut scores, &mut mine.candidates)?
+                }
+                _ => {
+                    if self.candidates == Candidates::Source {
+                        mine.candidates = vec![true; visible(0)];
+                    }
+                    (0..visible(0) as i32).collect()
+                }
+            };
+            return Ok((keys, Chosen::Host(mine.chosen.clone())));
+        }
+        // While every position is a candidate, the device chooses. Past
+        // that the two-level choice is the host's.
+        let all_candidates = s.candidate_blocks * s.candidate_block_size;
+        if self.candidates != Candidates::None && visible(rows - 1) > all_candidates {
+            let mut candidates: Vec<Vec<bool>> = batch
+                .iter_mut()
+                .enumerate()
+                .map(|(r, mine)| match (self.candidates, r < scored) {
+                    (Candidates::Source, true) => vec![true; visible(r)],
+                    _ => std::mem::take(&mut mine.candidates),
+                })
+                .collect();
+            self.choose_on_host(
+                gpu,
+                w,
+                index_keys,
+                &mut candidates,
+                table,
+                rows,
+                position,
+                stream,
+            )?;
+            for (mine, flags) in batch.iter_mut().zip(candidates) {
+                mine.candidates = flags;
             }
-            for first in (scored..rows).step_by(score_rows) {
-                let count = (rows - first).min(score_rows);
-                let (mut scores, stride) =
-                    self.index_scores(gpu, w, index_keys, first, count, position + first, stream)?;
-                for (i, mine) in batch[first..first + count].iter_mut().enumerate() {
-                    let of_row = &mut scores[i * stride..i * stride + visible(first + i)];
-                    mine.chosen = self.choose(of_row, &mut mine.candidates)?;
-                }
+            return Ok((keys, Chosen::Table(table)));
+        }
+        if self.candidates == Candidates::Source {
+            // What a row alone after this batch would be handed.
+            for (r, mine) in batch.iter_mut().enumerate() {
+                mine.candidates = vec![true; visible(r)];
             }
         }
-        let mut chosen = Vec::with_capacity(rows);
-        for (r, mine) in batch.iter().enumerate() {
-            ensure!(
-                mine.chosen.len() == visible(r).min(topk),
-                "layer {}: row {} was handed {} compressed positions, and its query sees {}",
-                self.index,
-                row + r,
-                mine.chosen.len(),
-                visible(r)
-            );
-            chosen.push(mine.chosen.clone());
+        if scored > 0 {
+            let all = Queries {
+                count: scored,
+                position,
+                ratio: self.ratio,
+                stride: 0,
+            };
+            index::choose_rows(
+                gpu,
+                k.index.choose,
+                DevicePtr::NULL,
+                table,
+                topk,
+                all,
+                stream,
+            )?;
         }
-        Ok((keys, chosen))
+        for first in (scored..rows).step_by(sc.score_rows) {
+            let count = (rows - first).min(sc.score_rows);
+            let queries = self.index_queries(gpu, w, first, count, position + first, stream)?;
+            index::score_rows_tc(
+                gpu,
+                k.index.score_tc,
+                sc.index_q,
+                index_keys,
+                sc.index_weights,
+                sc.scores_f32,
+                s.index_heads,
+                queries,
+                head_weight_scale(s.index_heads),
+                stream,
+            )?;
+            index::choose_rows(
+                gpu,
+                k.index.choose,
+                sc.scores_f32,
+                table.offset(first * topk * 4),
+                topk,
+                queries,
+                stream,
+            )?;
+        }
+        Ok((keys, Chosen::Table(table)))
     }
 }
 

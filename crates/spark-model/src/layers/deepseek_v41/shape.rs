@@ -130,11 +130,20 @@ impl BlockKernels {
     }
 }
 
-/// Rows of a sequence a block runs together: a decode step is one, a
-/// prefill chunk goes through in turns of this many. The more rows, the more
-/// of them choose the same expert and share one read of its weights: at 512
-/// an expert has eight rows on average.
+/// Rows of a sequence a block runs together unless `ATLAS_DSV41_ROWS` says
+/// otherwise: a decode step is one, a prefill chunk goes through in turns of
+/// this many. The more rows, the more of them choose the same expert and
+/// share one read of its weights: at 512 an expert has eight rows on average.
 pub const ROWS: usize = 512;
+
+/// The batch a model's blocks are given room for.
+pub fn batch_rows() -> usize {
+    std::env::var("ATLAS_DSV41_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&rows| rows > 0)
+        .unwrap_or(ROWS)
+}
 
 /// The most tokens a compressor pools into one key that there is room for.
 pub const MAX_RATIO: usize = 8;
@@ -234,26 +243,37 @@ impl Scratch {
     /// `max_positions` bounds a sequence, and so the compressed positions one
     /// query scores.
     pub fn alloc(gpu: &dyn GpuBackend, s: &Shape, max_positions: usize) -> Result<Self> {
+        Self::alloc_rows(gpu, s, max_positions, ROWS)
+    }
+
+    /// The same with room for batches of `rows` rows.
+    pub fn alloc_rows(
+        gpu: &dyn GpuBackend,
+        s: &Shape,
+        max_positions: usize,
+        rows: usize,
+    ) -> Result<Self> {
+        ensure!(rows > 0, "deepseek_v41: batches of no rows");
         let max_groups = max_positions.max(1);
-        let score_rows = (SCORES / max_groups).clamp(1, ROWS);
+        let score_rows = (SCORES / max_groups).clamp(1, rows);
         let bf16 = |values: usize| gpu.alloc(values * 2);
         let f32s = |values: usize| gpu.alloc(values * 4);
         let copies = s.hc.copies;
         Ok(Self {
-            rows: ROWS,
-            grouped: GroupedScratch::alloc(gpu, ROWS, s.top_k, s.experts, s.inter / PARTS)?,
-            shared_gate_up: bf16(ROWS * 2 * s.inter / PARTS)?,
-            gemm: GemmScratch::alloc(gpu, ROWS, s.hidden.max(s.o_groups * s.o_rank))?,
-            shared_out: bf16(ROWS * s.hidden / PARTS)?,
-            chunk_keys: bf16((WINDOW + ROWS) * HEAD_DIM)?,
-            x: bf16(ROWS * (s.hidden))?,
-            normed: bf16(ROWS * (s.hidden))?,
-            quantized: bf16(ROWS * (s.hidden))?,
-            q_low: bf16(ROWS * (s.q_rank))?,
-            q_low_normed: bf16(ROWS * (s.q_rank))?,
-            q: bf16(ROWS * (s.heads * HEAD_DIM))?,
-            key: bf16(ROWS * (HEAD_DIM))?,
-            idx: f32s(ROWS * (MAX_KEYS))?,
+            rows,
+            grouped: GroupedScratch::alloc(gpu, rows, s.top_k, s.experts, s.inter / PARTS)?,
+            shared_gate_up: bf16(rows * 2 * s.inter / PARTS)?,
+            gemm: GemmScratch::alloc(gpu, rows, s.hidden.max(s.o_groups * s.o_rank))?,
+            shared_out: bf16(rows * s.hidden / PARTS)?,
+            chunk_keys: bf16((WINDOW + rows) * HEAD_DIM)?,
+            x: bf16(rows * (s.hidden))?,
+            normed: bf16(rows * (s.hidden))?,
+            quantized: bf16(rows * (s.hidden))?,
+            q_low: bf16(rows * (s.q_rank))?,
+            q_low_normed: bf16(rows * (s.q_rank))?,
+            q: bf16(rows * (s.heads * HEAD_DIM))?,
+            key: bf16(rows * (HEAD_DIM))?,
+            idx: f32s(rows * (MAX_KEYS))?,
             positions: {
                 let table = f32s(max_positions.max(1))?;
                 let words: Vec<u8> = (0..max_positions as u32)
@@ -262,31 +282,31 @@ impl Scratch {
                 gpu.copy_h2d(&words, table)?;
                 table
             },
-            attended: bf16(ROWS * (s.heads * HEAD_DIM))?,
-            attn_records: gpu.alloc(attn_records(ROWS, s.heads / PARTS))?,
-            o_low: bf16(ROWS * (s.o_groups * s.o_rank))?,
+            attended: bf16(rows * (s.heads * HEAD_DIM))?,
+            attn_records: gpu.alloc(attn_records(rows, s.heads / PARTS))?,
+            o_low: bf16(rows * (s.o_groups * s.o_rank))?,
             gate_up: bf16((s.top_k + 1) * 2 * s.inter / PARTS)?,
-            inner_parts: bf16(ROWS * (s.top_k + 1) * s.inter)?,
-            slot_out: bf16(ROWS * (s.top_k + 1) * s.hidden / PARTS)?,
-            attn_out: bf16(ROWS * s.hidden)?,
-            moe_out: bf16(ROWS * s.hidden)?,
-            gather_recv: bf16(ROWS * ((s.top_k + 1) * s.inter).max(s.o_groups * s.o_rank))?,
-            route_scores: f32s(ROWS * (s.experts))?,
-            chosen: f32s(ROWS * (s.top_k))?,
-            weights: f32s(ROWS * (s.top_k))?,
-            pool_kv: f32s((ROWS + MAX_RATIO) * HEAD_DIM)?,
-            pool_score: f32s((ROWS + MAX_RATIO) * HEAD_DIM)?,
-            pooled: bf16(ROWS * HEAD_DIM)?,
-            group_positions: f32s(ROWS)?,
-            site_pre: f32s(ROWS * (copies))?,
-            hc_partials: gpu.alloc(s.hc.partials(ROWS))?,
-            post: f32s(ROWS * (copies))?,
-            comb: f32s(ROWS * (copies * copies))?,
+            inner_parts: bf16(rows * (s.top_k + 1) * s.inter)?,
+            slot_out: bf16(rows * (s.top_k + 1) * s.hidden / PARTS)?,
+            attn_out: bf16(rows * s.hidden)?,
+            moe_out: bf16(rows * s.hidden)?,
+            gather_recv: bf16(rows * ((s.top_k + 1) * s.inter).max(s.o_groups * s.o_rank))?,
+            route_scores: f32s(rows * (s.experts))?,
+            chosen: f32s(rows * (s.top_k))?,
+            weights: f32s(rows * (s.top_k))?,
+            pool_kv: f32s((rows + MAX_RATIO) * HEAD_DIM)?,
+            pool_score: f32s((rows + MAX_RATIO) * HEAD_DIM)?,
+            pooled: bf16(rows * HEAD_DIM)?,
+            group_positions: f32s(rows)?,
+            site_pre: f32s(rows * (copies))?,
+            hc_partials: gpu.alloc(s.hc.partials(rows))?,
+            post: f32s(rows * (copies))?,
+            comb: f32s(rows * (copies * copies))?,
             index_q: bf16(score_rows * s.index_heads * INDEX_DIM)?,
             index_weights_f32: f32s(score_rows * s.index_heads)?,
             index_weights: bf16(score_rows * s.index_heads)?,
-            index_key_f32: f32s(ROWS * INDEX_DIM)?,
-            index_key: bf16(ROWS * INDEX_DIM)?,
+            index_key_f32: f32s(rows * INDEX_DIM)?,
+            index_key: bf16(rows * INDEX_DIM)?,
             scores_f32: f32s(score_rows * max_groups)?,
             scores: bf16(score_rows * max_groups)?,
             max_groups,

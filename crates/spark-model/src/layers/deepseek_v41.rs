@@ -6,6 +6,7 @@
 
 pub mod block;
 mod block_attention;
+mod block_compress;
 mod block_index;
 mod block_moe;
 pub mod cache_recipe;
