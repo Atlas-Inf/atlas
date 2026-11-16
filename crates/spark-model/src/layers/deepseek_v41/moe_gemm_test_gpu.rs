@@ -14,9 +14,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, ensure};
 use spark_runtime::gpu::GpuBackend;
 
-use super::{ExpertGemm, Runs};
+use super::{ExpertGemm, Runs, Sent};
 use crate::layers::deepseek_v41::block::{BlockKernels, Handoff, Scratch, Shared};
-use crate::layers::deepseek_v41::moe_grouped::{self, Plan};
+use crate::layers::deepseek_v41::moe_grouped::{self, GateUp, Plan};
 use crate::layers::deepseek_v41::ops;
 use crate::layers::deepseek_v41::parts::{Held, PARTS};
 use crate::layers::deepseek_v41::test_support::{
@@ -129,13 +129,32 @@ fn the_tensor_cores_leave_what_the_tile_kernels_leave() -> Result<()> {
     );
     ensure!(same > 0.99 && distance < 1e-3, "the way in differs");
 
-    // The way out, every part of the hidden activations being the first's.
+    // The way out, every part of the hidden activations being the first's:
+    // as values for the tile kernels, and for the tensor cores as the codes
+    // and scales the ranks would send.
     let piece_stride = pairs * part_rows;
-    for part in 1..PARTS {
-        gpu.copy_d2d(
-            inner,
-            inner.offset(part * piece_stride * 2),
-            piece_stride * 2,
+    let sent = Sent::new(pairs, ROWS, part_rows);
+    let coded = gpu.alloc(PARTS * sent.bytes)?;
+    for part in 0..PARTS {
+        if part > 0 {
+            gpu.copy_d2d(
+                inner,
+                inner.offset(part * piece_stride * 2),
+                piece_stride * 2,
+            )?;
+        }
+        let to = coded.offset(part * sent.bytes);
+        moe_grouped::activate_codes(
+            gpu,
+            &k.moe,
+            GateUp::paired(sc.grouped.gate_up, part_rows),
+            sc.grouped.weights,
+            to,
+            to.offset(sent.scales),
+            pairs,
+            part_rows,
+            limit,
+            stream,
         )?;
     }
     let out = gpu.alloc(ROWS * slots * n * 2)?;
@@ -152,16 +171,7 @@ fn the_tensor_cores_leave_what_the_tile_kernels_leave() -> Result<()> {
         n,
         stream,
     )?;
-    big.project_out(
-        gpu,
-        &slab,
-        &runs,
-        inner,
-        piece_stride,
-        part_rows,
-        s.hidden,
-        stream,
-    )?;
+    big.project_out(gpu, &slab, &runs, coded, sent, part_rows, s.hidden, stream)?;
     gpu.synchronize(stream)?;
     let (tiled, got) = (
         download(gpu, out, ROWS * slots * n)?,
@@ -184,7 +194,7 @@ fn the_tensor_cores_leave_what_the_tile_kernels_leave() -> Result<()> {
     );
     ensure!(same > 0.99 && distance < 1e-3, "the way out differs");
 
-    for p in [x, quantized, inner, gate_up, out] {
+    for p in [x, quantized, inner, gate_up, out, coded] {
         gpu.free(p)?;
     }
     free_store(gpu, &store)

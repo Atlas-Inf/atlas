@@ -138,7 +138,10 @@ static __device__ __forceinline__ void mxg_mma(
 // bytes into an expert (its scales at `sc{half}`), and `col` is that row.
 //
 // codes [.., K] E4M3 bytes and sfa [.., K / 32] E8M0, a pair's row being
-// a_rows[pair], or the pair with no `a_rows`. An expert is `stride` bytes
+// a_rows[pair], or the pair with no `a_rows`. Codes the ranks gathered are
+// in runs of `run` K values a row, a row's next run `run_stride` bytes
+// after the same row's last; codes whole have a `run` of 0. A run is a
+// multiple of 64. An expert is `stride` bytes
 // after the last in `slab`; a projection's rows are K / 2 bytes, its scales
 // K / 32. out rows are `out_stride` values apart. K % (32 * MXG_STAGE) == 0.
 // Grid (weight rows / row_step, tiles), block MXG_THREADS, MXG_SHARED
@@ -159,7 +162,9 @@ extern "C" __global__ void __launch_bounds__(MXG_THREADS) dsv41_mxg(
     unsigned int row_step,
     unsigned int half_row,
     unsigned int K,
-    unsigned int out_stride) {
+    unsigned int out_stride,
+    unsigned int run,
+    unsigned long long run_stride) {
     extern __shared__ __align__(16) unsigned char sm[];
     const unsigned int sm_at = (unsigned int)__cvta_generic_to_shared(sm);
 
@@ -221,10 +226,15 @@ extern "C" __global__ void __launch_bounds__(MXG_THREADS) dsv41_mxg(
         #pragma unroll
         for (unsigned int j = 0; j < MXG_ROWS * MXG_SUB * 2u / MXG_THREADS; ++j) {
             const unsigned int piece = j * MXG_THREADS + i, pair = piece >> 2, at = piece & 3u;
-            if (pair < tile.count)
+            if (pair < tile.count) {
+                const unsigned long long row = *pair_row(pair);
+                const unsigned int k = u * (MXG_SUB * 32u);
+                const unsigned char* from =
+                    run ? codes + (unsigned long long)(k / run) * run_stride + row * run + k % run
+                        : codes + row * K + k;
                 mxg_copy16(to + (at >> 1) * MXG_A_STEP + pair * 32u + (at & 1u) * 16u,
-                           codes + (unsigned long long)*pair_row(pair) * K +
-                               (unsigned long long)u * (MXG_SUB * 32u) + at * 16u);
+                           from + at * 16u);
+            }
         }
     };
     // Block `sb` of the scales into the unread bytes of its set: 8 bytes a

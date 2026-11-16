@@ -64,6 +64,25 @@ extern "C" __global__ void dsv41_mx_quant(
     if (b + 1u == blocks) mx_sf_zero_pad(sf, m, blocks, inner_pad);
 }
 
+// Scales the ranks gathered, a part each, as one run a row: out[m, part *
+// blocks + b] = sf[part * piece_stride + m * blocks + b], where a part's
+// `blocks` scales of a row are `piece_stride` bytes after the part's before.
+// One thread a scale of the output.
+extern "C" __global__ void dsv41_mx_scales_rows(
+    const unsigned char* __restrict__ sf,
+    unsigned char* __restrict__ out,
+    unsigned int M,
+    unsigned int blocks,
+    unsigned int parts,
+    unsigned long long piece_stride) {
+    const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int per = blocks * parts;
+    if (t >= (size_t)M * per) return;
+    const size_t m = t / per;
+    const unsigned int at = (unsigned int)(t % per);
+    out[t] = sf[(size_t)(at / blocks) * piece_stride + m * blocks + at % blocks];
+}
+
 // The MoE's output from its experts' when a GEMM left them in pair order:
 // y[row, d] = BF16(sum over a row's chosen experts of out[pair_of[row, slot],
 // d], then shared[row, d]), added in FP32 in that order, as

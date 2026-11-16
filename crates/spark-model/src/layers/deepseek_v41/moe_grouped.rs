@@ -271,3 +271,34 @@ pub fn activate(
         .arg_u64(gate_up.row_stride as u64)
         .launch(stream)
 }
+
+/// [`activate`]'s values as the ranks send them and the tensor cores read
+/// them: `codes` (`[count, part_rows]` E4M3) and `sf` (`[count, part_rows /
+/// 32]` E8M0), half the bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn activate_codes(
+    gpu: &dyn GpuBackend,
+    kernels: &MoeKernels,
+    gate_up: GateUp,
+    weights: DevicePtr,
+    codes: DevicePtr,
+    sf: DevicePtr,
+    count: usize,
+    part_rows: usize,
+    limit: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernels.experts_act_codes)
+        .grid([div_ceil((count * part_rows / 32) as u32, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(gate_up.base)
+        .arg_ptr(weights)
+        .arg_ptr(codes)
+        .arg_ptr(sf)
+        .arg_u32(count as u32)
+        .arg_u32(part_rows as u32)
+        .arg_f32(limit)
+        .arg_u64(gate_up.up_offset as u64)
+        .arg_u64(gate_up.row_stride as u64)
+        .launch(stream)
+}

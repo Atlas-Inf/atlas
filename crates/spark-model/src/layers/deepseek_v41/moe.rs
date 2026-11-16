@@ -30,6 +30,7 @@ pub struct MoeKernels {
     /// The same for a batch of rows, grouped by expert (`moe_grouped.rs`).
     pub experts_in: KernelHandle,
     pub experts_act: KernelHandle,
+    pub experts_act_codes: KernelHandle,
     pub experts_out: KernelHandle,
     /// The plain projection, one thread per row.
     pub fp4_gemv: KernelHandle,
@@ -55,6 +56,7 @@ impl MoeKernels {
             expert_out: gpu.kernel("dsv41_expert", "dsv41_expert_out")?,
             experts_in: gpu.kernel("dsv41_expert", "dsv41_experts_in")?,
             experts_act: gpu.kernel("dsv41_expert", "dsv41_experts_act")?,
+            experts_act_codes: gpu.kernel("dsv41_expert", "dsv41_experts_act_codes")?,
             experts_out: gpu.kernel("dsv41_expert", "dsv41_experts_out")?,
             fp4_gemv: kernel("dsv41_fp4_gemv")?,
             fp4_gemv_tc: gpu.kernel("dsv41_tc", "dsv41_fp4_gemv_tc8")?,

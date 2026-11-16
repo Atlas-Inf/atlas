@@ -89,6 +89,31 @@ impl Runs {
     }
 }
 
+/// One part of a batch's hidden activations as a rank sends it: the pairs'
+/// codes, their scales, and then the shared expert's rows as BF16 values
+/// (its projection out is a GEMM of its own, which rounds them itself).
+#[derive(Clone, Copy)]
+pub struct Sent {
+    /// Bytes of a part, and from one part to the next.
+    pub bytes: usize,
+    /// Where the scales and the shared expert's rows start in a part.
+    pub scales: usize,
+    pub shared: usize,
+}
+
+impl Sent {
+    pub fn new(pairs: usize, rows: usize, part_rows: usize) -> Self {
+        // Each on a 16-byte boundary, which the copies want.
+        let scales = pairs * part_rows;
+        let shared = scales + (pairs * part_rows / 32).next_multiple_of(16);
+        Self {
+            bytes: (shared + rows * part_rows * 2).next_multiple_of(16),
+            scales,
+            shared,
+        }
+    }
+}
+
 /// One launch's two halves of 64 weight rows a block: where each half's
 /// projection is in an expert, how far apart the blocks' rows and the
 /// halves' are, and where each half's outputs go.
@@ -103,10 +128,12 @@ struct Halves {
 /// `rows` rows.
 pub struct ExpertGemm {
     quant: KernelHandle,
+    scales_rows: KernelHandle,
     multiply: KernelHandle,
     pairs_sum: KernelHandle,
-    /// E4M3 codes and their scales: the batch's `[rows, hidden]` on the way
-    /// in, the pairs' `[pairs, inter]` on the way out.
+    /// The batch's input as E4M3 codes, `[rows, hidden]`; and scales, its
+    /// `[rows, hidden / 32]` on the way in and the pairs' `[pairs, inter /
+    /// 32]` on the way out.
     codes: DevicePtr,
     sf: DevicePtr,
     tiles: DevicePtr,
@@ -126,8 +153,7 @@ impl ExpertGemm {
             s.hidden.is_multiple_of(128)
                 && s.inter.is_multiple_of(128)
                 && part_rows.is_multiple_of(64)
-                && part_n.is_multiple_of(128)
-                && s.inter * s.top_k >= s.hidden,
+                && part_n.is_multiple_of(128),
             "deepseek_v41: experts [{}, {}] are not the tensor-core kernel's",
             s.inter,
             s.hidden
@@ -136,9 +162,10 @@ impl ExpertGemm {
         let max_tiles = s.experts + pairs / TILE;
         Ok(Self {
             quant: gpu.kernel("dsv41_mx", "dsv41_mx_quant")?,
+            scales_rows: gpu.kernel("dsv41_mx", "dsv41_mx_scales_rows")?,
             multiply: gpu.kernel("dsv41_mxg", "dsv41_mxg")?,
             pairs_sum: gpu.kernel("dsv41_mx", "dsv41_pairs_sum")?,
-            codes: gpu.alloc(pairs * s.inter)?,
+            codes: gpu.alloc(rows * s.hidden)?,
             sf: gpu.alloc(pairs * s.inter / 32)?,
             tiles: gpu.alloc(max_tiles * 3 * 4)?,
             pair_of: gpu.alloc(pairs * 4)?,
@@ -165,18 +192,13 @@ impl ExpertGemm {
         gpu.copy_h2d(&pairs, self.pair_of)
     }
 
-    /// `rows` rows of `k` values of `x` as codes and scales: rounded to FP8,
-    /// a row `stride` values after the last and in pieces as `gemm::Input`
-    /// has them.
-    #[allow(clippy::too_many_arguments)]
+    /// `rows` rows of `k` values of `x` as codes and scales, rounded to FP8.
     fn quantize(
         &self,
         gpu: &dyn GpuBackend,
         x: DevicePtr,
         rows: usize,
         k: usize,
-        stride: usize,
-        piece: [usize; 2],
         stream: u64,
     ) -> Result<()> {
         KernelLaunch::new(gpu, self.quant)
@@ -187,23 +209,26 @@ impl ExpertGemm {
             .arg_ptr(self.sf)
             .arg_u32(rows as u32)
             .arg_u32(k as u32)
-            .arg_u32(stride as u32)
-            .arg_u32(piece[0] as u32)
-            .arg_u64(piece[1] as u64)
+            .arg_u32(k as u32)
+            .arg_u32(0)
+            .arg_u64(0)
             .arg_u32(0)
             .launch(stream)
     }
 
     /// One launch of the tiles through `n` weight rows of `k` values of
-    /// their experts. A pair's codes are row `a_rows[pair]` of the codes, or
-    /// the pair's own with no `a_rows`; its outputs are `out_stride` values
-    /// after the pair's before.
+    /// their experts. A pair's codes are row `a_rows[pair]` of `codes`, or
+    /// the pair's own with no `a_rows`, in pieces of `piece[0]` values
+    /// `piece[1]` bytes apart, or in one run when that is 0; its outputs are
+    /// `out_stride` values after the pair's before.
     #[allow(clippy::too_many_arguments)]
     fn launch(
         &self,
         gpu: &dyn GpuBackend,
         slab: &ExpertSlab,
         runs: &Runs,
+        codes: DevicePtr,
+        piece: [usize; 2],
         a_rows: DevicePtr,
         halves: Halves,
         n: usize,
@@ -221,7 +246,7 @@ impl ExpertGemm {
             .grid([(n / halves.row_step) as u32, runs.tile_count() as u32, 1])
             .block([TILE as u32, 1, 1])
             .shared_mem(SHARED)
-            .arg_ptr(self.codes)
+            .arg_ptr(codes)
             .arg_ptr(self.sf)
             .arg_ptr(a_rows)
             .arg_ptr(slab.base)
@@ -237,6 +262,8 @@ impl ExpertGemm {
             .arg_u32(halves.half_row as u32)
             .arg_u32(k as u32)
             .arg_u32(out_stride as u32)
+            .arg_u32(piece[0] as u32)
+            .arg_u64(piece[1] as u64)
             .launch(stream)
     }
 
@@ -258,7 +285,7 @@ impl ExpertGemm {
         hidden: usize,
         stream: u64,
     ) -> Result<()> {
-        self.quantize(gpu, x, rows, hidden, hidden, [0, 0], stream)?;
+        self.quantize(gpu, x, rows, hidden, stream)?;
         // A block's two halves are the same 64 rows of the gate and of the
         // up projection, which read the same codes.
         let halves = Halves {
@@ -268,13 +295,23 @@ impl ExpertGemm {
             out: [gate_up, gate_up.offset(runs.pairs * part_rows * 2)],
         };
         self.launch(
-            gpu, slab, runs, row_of, halves, part_rows, hidden, part_rows, stream,
+            gpu,
+            slab,
+            runs,
+            self.codes,
+            [0, 0],
+            row_of,
+            halves,
+            part_rows,
+            hidden,
+            part_rows,
+            stream,
         )
     }
 
     /// The way out: one part of every pair's output, kept here for
-    /// [`Self::sum`]. `inner` is every part of the pairs' hidden activations,
-    /// a part `piece_stride` values after the last.
+    /// [`Self::sum`]. `inner` is every part of the pairs' hidden activations
+    /// as the ranks sent them ([`Sent`]).
     #[allow(clippy::too_many_arguments)]
     pub fn project_out(
         &self,
@@ -282,14 +319,23 @@ impl ExpertGemm {
         slab: &ExpertSlab,
         runs: &Runs,
         inner: DevicePtr,
-        piece_stride: usize,
+        sent: Sent,
         part_rows: usize,
         hidden: usize,
         stream: u64,
     ) -> Result<()> {
         let (inter, part_n) = (part_rows * PARTS, hidden / PARTS);
-        let piece = [part_rows, piece_stride];
-        self.quantize(gpu, inner, runs.pairs, inter, part_rows, piece, stream)?;
+        // A pair's scales in one run; its codes are read where they are.
+        KernelLaunch::new(gpu, self.scales_rows)
+            .grid([div_ceil((runs.pairs * inter / 32) as u32, 256), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(inner.offset(sent.scales))
+            .arg_ptr(self.sf)
+            .arg_u32(runs.pairs as u32)
+            .arg_u32((part_rows / 32) as u32)
+            .arg_u32(PARTS as u32)
+            .arg_u64(sent.bytes as u64)
+            .launch(stream)?;
         // 128 rows of the down projection a block.
         let halves = Halves {
             projections: [2, 2],
@@ -301,6 +347,8 @@ impl ExpertGemm {
             gpu,
             slab,
             runs,
+            inner,
+            [part_rows, sent.bytes],
             DevicePtr::NULL,
             halves,
             part_n,

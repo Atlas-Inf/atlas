@@ -10,7 +10,7 @@ use super::block::Block;
 use super::gemm::{GEMM_ROWS, Input};
 use super::hc::SublayerParts;
 use super::moe::{self, ExpertPart};
-use super::moe_gemm::Runs;
+use super::moe_gemm::{Runs, Sent};
 use super::moe_grouped::{self, GateUp, Plan};
 use super::parts::{self, PARTS};
 use super::profile;
@@ -122,9 +122,16 @@ impl Block {
                 ],
             })
         };
+        // A part of the hidden activations as the ranks gather it: values,
+        // or from the tensor cores codes and scales.
+        let sent = match (&big, &plan) {
+            (Some(_), Some(plan)) => Some(Sent::new(plan.pairs(), rows, part_rows)),
+            _ => None,
+        };
+        let part_bytes = sent.map_or(room * 2, |sent| sent.bytes);
         for part in held.range() {
             let of = part_of(part)?;
-            let inner = sc.inner_parts.offset(part * room * 2);
+            let inner = sc.inner_parts.offset(part * part_bytes);
             let Some(plan) = &plan else {
                 moe::experts_in(
                     gpu,
@@ -163,12 +170,14 @@ impl Block {
                         up_offset: plan.pairs() * part_rows,
                         row_stride: part_rows,
                     };
-                    moe_grouped::activate(
+                    let sent = sent.context("a part as the ranks send it")?;
+                    moe_grouped::activate_codes(
                         gpu,
                         &k.moe,
                         gate_up,
                         sc.grouped.weights,
                         inner,
+                        inner.offset(sent.scales),
                         plan.pairs(),
                         part_rows,
                         s.swiglu_limit,
@@ -231,7 +240,7 @@ impl Block {
                 &k.moe,
                 gate_up,
                 DevicePtr::NULL,
-                inner.offset(plan.pairs() * part_rows * 2),
+                inner.offset(sent.map_or(plan.pairs() * part_rows * 2, |sent| sent.shared)),
                 rows,
                 part_rows,
                 s.swiglu_limit,
@@ -246,8 +255,8 @@ impl Block {
                 held,
                 sc.inner_parts,
                 sc.gather_recv,
-                room * 2,
-                room * 2,
+                part_bytes,
+                part_bytes,
                 stream,
             )
         })?;
@@ -278,7 +287,7 @@ impl Block {
                             &of.slab,
                             runs,
                             sc.inner_parts,
-                            room,
+                            sent.context("the parts as the ranks sent them")?,
                             part_rows,
                             s.hidden,
                             stream,
@@ -299,14 +308,16 @@ impl Block {
                     }
                     // The shared expert's: its rows of the hidden
                     // activations come after the pairs'.
-                    let x = sc.inner_parts.offset(plan.pairs() * part_rows * 2);
+                    let x = sc
+                        .inner_parts
+                        .offset(sent.map_or(plan.pairs() * part_rows * 2, |sent| sent.shared));
                     match gemm.and_then(|g| g.shared[part].as_ref()) {
                         Some([_, _, w2]) => {
                             let x = Input {
                                 x,
                                 stride: part_rows,
                                 piece: part_rows,
-                                piece_stride: room,
+                                piece_stride: part_bytes / 2,
                             };
                             sc.gemm.project(gpu, x, w2, sc.shared_out, rows, stream)?;
                             shared_out = sc.shared_out;

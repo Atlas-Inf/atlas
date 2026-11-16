@@ -196,6 +196,44 @@ extern "C" __global__ void dsv41_experts_act(
     dsv41_fp8_block(v, inner + r * rows + at);
 }
 
+// The same activations as the ranks send them and the tensor cores read
+// them (`dsv41_mxg.cu`): codes[r] the E4M3 codes and sf[r] the E8M0 scale of
+// each 32, half the bytes of the values. A code times its scale is the
+// value `dsv41_experts_act` leaves.
+extern "C" __global__ void dsv41_experts_act_codes(
+    const __nv_bfloat16* __restrict__ gate_up,
+    const float* __restrict__ weights,
+    unsigned char* __restrict__ codes,
+    unsigned char* __restrict__ sf,
+    unsigned int count,
+    unsigned int rows,
+    float limit,
+    unsigned long long up_offset,
+    unsigned long long row_stride) {
+    const size_t b = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int per_row = rows / 32;
+    if (b >= (size_t)count * per_row) return;
+    const size_t r = b / per_row;
+    const unsigned int at = (unsigned int)(b % per_row) * 32;
+    const float weight = weights ? weights[r] : 1.0f;
+    const __nv_bfloat16* gate = gate_up + r * row_stride + at;
+    const __nv_bfloat16* up = gate + up_offset;
+    float v[32];
+    float amax = 0.0f;
+    for (int i = 0; i < 32; ++i) {
+        v[i] = dsv41_swiglu_one(__bfloat162float(gate[i]), __bfloat162float(up[i]), weight, limit);
+        amax = fmaxf(amax, fabsf(v[i]));
+    }
+    const float scale = dsv41_fp8_scale(amax);
+    unsigned char* dst = codes + r * rows + at;
+    for (int i = 0; i < 32; ++i) {
+        const float scaled = fminf(fmaxf(v[i] / scale, -448.0f), 448.0f);
+        dst[i] = (unsigned char)__nv_cvt_float_to_fp8(dsv41_round_e4m3(scaled), __NV_SATFINITE,
+                                                      __NV_E4M3);
+    }
+    sf[b] = (unsigned char)(dsv41_exponent(scale) + 127);
+}
+
 // out[out_row[pair]] = BF16(w2 . inner[pair]) for the part's N rows of w2.
 // Pair q of piece p of `inner` is at inner[p * piece_stride + q * rows].
 // Grid (ceil(N / 16), tiles), block 256.
