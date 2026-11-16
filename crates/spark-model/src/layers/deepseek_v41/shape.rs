@@ -144,6 +144,8 @@ pub struct Scratch {
     pub(super) up: DevicePtr,
     pub(super) inner: DevicePtr,
     pub(super) down: DevicePtr,
+    /// `[top_k, hidden]` BF16: each chosen expert's output, in expert order.
+    pub(super) expert_out: DevicePtr,
     pub(super) acc: DevicePtr,
     pub(super) chosen: DevicePtr,
     pub(super) weights: DevicePtr,
@@ -189,6 +191,7 @@ impl Scratch {
             up: bf16(s.inter)?,
             inner: bf16(s.inter)?,
             down: bf16(s.hidden)?,
+            expert_out: bf16(s.top_k * s.hidden)?,
             acc: f32s(s.hidden)?,
             chosen: f32s(s.top_k)?,
             weights: f32s(s.top_k)?,

@@ -127,7 +127,7 @@ fn blocks_replay_the_reference_token_by_token() -> Result<()> {
                 &attention[position * hidden * 2..(position + 1) * hidden * 2],
                 scratch.sublayer_out,
             )?;
-            block.finish(gpu, streams, pre, stream)?;
+            block.finish(gpu, streams, pre, None, stream)?;
             got.extend(download(gpu, streams, copies * hidden)?);
             let mut out = vec![0u8; copies * 4];
             gpu.copy_d2h(pre, &mut out)?;

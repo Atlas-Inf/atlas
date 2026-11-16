@@ -74,6 +74,14 @@ thinking_default = false
 default_kv_dtype = "fp8"
 fp8_kv_calibration_tokens = 256
 
-# No [expected_absent] yet: V4's entries were harvested from a V4
-# `--check-kernels` run and name V4's dispatch sites. V4.1's are harvested
-# from its own first run, not copied.
+# expected_absent: harvested from V4.1's own runs, one entry per lookup its
+# start-up gate reported. V4's entries name V4's dispatch sites and are not
+# copied.
+
+[expected_absent.w4a16]
+w4a16_gemm_t_p3 = """
+3-deep weight-pipeline twin shipped only in qwen3.6-27b's shadow.
+`layers::tgemm_kernel` probes it for the model's lm_head handle
+(model/impl_a1.rs) and falls back to w4a16_gemm_t, which resolves here.
+V4.1's head is BF16 and its layers launch their own dsv41 kernels, so the
+handle is not on a path this model runs."""

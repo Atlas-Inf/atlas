@@ -19,10 +19,33 @@ pub struct CompressedKeys {
     /// `[capacity, 128]` BF16: what the indexer scores each group by.
     pub index_keys: DevicePtr,
     pub capacity: usize,
+    /// Buffers these outgrew. A row of a pass that was handed one still
+    /// reads it, and every group it may read is in it, so they are kept
+    /// until the sequence ends.
+    retired: Vec<DevicePtr>,
     /// `[ratio, 512]` FP32: the key and gate projections of the group being
     /// filled.
     pub(super) kv_state: DevicePtr,
     pub(super) score_state: DevicePtr,
+}
+
+impl CompressedKeys {
+    /// Room for `groups` groups, keeping the ones held.
+    pub(super) fn reserve(&mut self, gpu: &dyn GpuBackend, groups: usize, stream: u64) -> Result<()> {
+        if groups <= self.capacity {
+            return Ok(());
+        }
+        // Kernels still running may be writing the buffers being copied.
+        gpu.synchronize(stream)?;
+        let capacity = groups.max(2 * self.capacity);
+        for (buffer, width) in [(&mut self.keys, HEAD_DIM), (&mut self.index_keys, INDEX_DIM)] {
+            let grown = gpu.alloc(capacity * width * 2)?;
+            gpu.copy_d2d(*buffer, grown, self.capacity * width * 2)?;
+            self.retired.push(std::mem::replace(buffer, grown));
+        }
+        self.capacity = capacity;
+        Ok(())
+    }
 }
 
 /// One sequence's attention cache on one layer.
@@ -30,34 +53,46 @@ pub struct SeqState {
     /// `[128, 512]` BF16 ring: slot `position % 128` holds that position's key.
     pub window: DevicePtr,
     pub compressed: Option<CompressedKeys>,
+    /// On an Engram layer: the compressed id of the token at every position
+    /// so far, which the n-grams ending at the next ones are hashed from.
+    pub history: Vec<u32>,
 }
 
 impl SeqState {
     /// `ratio` is the layer's compression ratio when it produces compressed
-    /// keys itself, else 0. `max_positions` bounds the sequence.
-    pub fn alloc(gpu: &dyn GpuBackend, ratio: usize, max_positions: usize) -> Result<Self> {
+    /// keys itself, else 0. There is room for `positions` positions to start
+    /// with, and it grows.
+    pub fn alloc(gpu: &dyn GpuBackend, ratio: usize, positions: usize) -> Result<Self> {
         let window = gpu.alloc(WINDOW * HEAD_DIM * 2)?;
         gpu.memset(window, 0, WINDOW * HEAD_DIM * 2)?;
         let compressed = match ratio {
             0 => None,
             ratio => {
-                let capacity = max_positions / ratio;
+                let capacity = (positions / ratio).max(1);
                 Some(CompressedKeys {
-                    keys: gpu.alloc(capacity.max(1) * HEAD_DIM * 2)?,
-                    index_keys: gpu.alloc(capacity.max(1) * INDEX_DIM * 2)?,
+                    keys: gpu.alloc(capacity * HEAD_DIM * 2)?,
+                    index_keys: gpu.alloc(capacity * INDEX_DIM * 2)?,
                     capacity,
+                    retired: Vec::new(),
                     kv_state: gpu.alloc(ratio * HEAD_DIM * 4)?,
                     score_state: gpu.alloc(ratio * HEAD_DIM * 4)?,
                 })
             }
         };
-        Ok(Self { window, compressed })
+        Ok(Self {
+            window,
+            compressed,
+            history: Vec::new(),
+        })
     }
 
     pub fn free(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
         gpu.free(self.window)?;
         if let Some(c) = self.compressed.take() {
             for p in [c.keys, c.index_keys, c.kv_state, c.score_state] {
+                gpu.free(p)?;
+            }
+            for p in c.retired {
                 gpu.free(p)?;
             }
         }

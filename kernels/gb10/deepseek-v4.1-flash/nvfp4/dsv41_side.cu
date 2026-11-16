@@ -56,23 +56,28 @@ extern "C" __global__ void dsv41_compress_pool(
     pooled[d] = __float2bfloat16(acc);
 }
 
-// Engram table rows as the values a lookup reads:
-//   out[i] = BF16(E4M3(rows[i]) * 2^(scales[i / 32] - 127))
-// rows [n] FP8 E4M3 and scales [n / 32] E8M0, as the table stores them.
+// Engram table rows as the values a lookup reads. Column c of the lookup is
+// row row_slots[c] of `rows` (256 FP8 E4M3 values a row) under row
+// scale_slots[c] of `scales` (8 E8M0 scales a row, one per 32 values), as
+// the table stores them:
+//   out[c * 256 + d] = BF16(E4M3(row[d]) * 2^(scale[d / 32] - 127))
 extern "C" __global__ void dsv41_engram_rows(
     const unsigned char* __restrict__ rows,
     const unsigned char* __restrict__ scales,
+    const unsigned int* __restrict__ row_slots,
+    const unsigned int* __restrict__ scale_slots,
     __nv_bfloat16* __restrict__ out,
-    unsigned int n) {
+    unsigned int columns) {
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const unsigned int b = rows[i];
+    if (i >= columns * 256) return;
+    const unsigned int c = i / 256, d = i % 256;
+    const unsigned int b = rows[(size_t)row_slots[c] * 256 + d];
     const int e = (b >> 3) & 0xF;
     const float m = (float)(b & 7);
     // Subnormal below exponent 1; the bias is 7 and the mantissa 3 bits.
     float v = e == 0 ? ldexpf(m, -9) : ldexpf(8.0f + m, e - 10);
     if (b & 0x80) v = -v;
-    out[i] = __float2bfloat16(ldexpf(v, (int)scales[i / 32] - 127));
+    out[i] = __float2bfloat16(ldexpf(v, (int)scales[(size_t)scale_slots[c] * 8 + d / 32] - 127));
 }
 
 // Engram on one token per block. stream [T, hc, H] BF16 in place;

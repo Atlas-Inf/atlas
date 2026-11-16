@@ -83,6 +83,9 @@ pub struct MoeWeights {
     pub gate: DevicePtr,
     /// `[experts]` FP32.
     pub bias: DevicePtr,
+    /// The routed experts this rank holds: `first_expert` and the ones
+    /// after it.
+    pub first_expert: usize,
     pub experts: Vec<ExpertWeights>,
     pub shared_w1: Fp8Proj,
     pub shared_w3: Fp8Proj,
@@ -214,6 +217,7 @@ impl BlockWeights {
             norm: bf16("ffn_norm.weight")?,
             gate: bf16("ffn.gate.weight")?,
             bias: tensor(store, &format!("{layer}.ffn.gate.bias"), WeightDtype::FP32)?,
+            first_expert: experts.start,
             experts: experts
                 .map(|e| {
                     let expert = format!("{layer}.ffn.experts.{e}");

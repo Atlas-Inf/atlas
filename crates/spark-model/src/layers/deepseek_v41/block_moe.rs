@@ -3,6 +3,7 @@
 //! The MoE sublayer of a DeepSeek-V4.1 block on one token.
 
 use anyhow::{Result, ensure};
+use spark_comm::CommBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::block::Block;
@@ -12,14 +13,15 @@ use super::weights::Fp8Proj;
 use crate::layers::ops::mxfp8_gemv_rows;
 
 impl Block {
-    /// One expert on the FP8 input in `scratch.quantized`, added into
-    /// `scratch.acc`.
+    /// One expert on the FP8 input in `scratch.quantized`: its output
+    /// (`[hidden]` BF16) into `out`.
     fn expert(
         &self,
         gpu: &dyn GpuBackend,
         gate_up: impl Fn(DevicePtr, DevicePtr) -> Result<()>,
         down: impl Fn(DevicePtr, DevicePtr) -> Result<()>,
         weight: f32,
+        out: DevicePtr,
         stream: u64,
     ) -> Result<()> {
         let (s, k, sc) = (
@@ -47,24 +49,34 @@ impl Block {
             s.inter,
             stream,
         )?;
-        down(sc.inner, sc.down)?;
-        moe::accumulate(gpu, k.moe.accumulate, sc.acc, sc.down, s.hidden, stream)
+        down(sc.inner, out)
     }
 
     /// The MoE of the normed input in `scratch.normed` into
     /// `scratch.sublayer_out`.
-    pub(super) fn moe(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
+    ///
+    /// With the routed experts split over ranks (`comm`), a rank computes
+    /// the chosen experts it holds, each into its own slot, and the slots
+    /// are summed across ranks: every slot is one rank's output plus zeros,
+    /// so every rank ends with the same six outputs, bit for bit, and adds
+    /// them in the order one rank would.
+    pub(super) fn moe(
+        &self,
+        gpu: &dyn GpuBackend,
+        comm: Option<&dyn CommBackend>,
+        stream: u64,
+    ) -> Result<()> {
         let (s, k, sc, w) = (
             &self.shared.shape,
             &self.shared.kernels,
             &self.shared.scratch,
             &self.weights.moe,
         );
+        let held = w.first_expert..w.first_expert + w.experts.len();
         ensure!(
-            w.experts.len() == s.experts,
-            "layer {}: {} of {} experts are loaded",
+            comm.is_some() || held == (0..s.experts),
+            "layer {}: experts {held:?} of {} are loaded and there are no other ranks",
             self.index,
-            w.experts.len(),
             s.experts
         );
         moe::route(
@@ -91,6 +103,7 @@ impl Block {
             stream,
         )?;
         gpu.memset_zero_async(sc.acc, s.hidden * 4, stream)?;
+        gpu.memset_zero_async(sc.expert_out, s.top_k * s.hidden * 2, stream)?;
         gpu.synchronize(stream)?;
         let (mut chosen, mut weights) = (vec![0u8; s.top_k * 4], vec![0u8; s.top_k * 4]);
         gpu.copy_d2h(sc.chosen, &mut chosen)?;
@@ -106,8 +119,11 @@ impl Block {
             .collect();
         // The reference adds the experts' outputs in expert order.
         routed.sort_unstable_by_key(|&(expert, _)| expert);
-        for (expert, weight) in routed {
-            let e = &w.experts[expert];
+        for (slot, (expert, weight)) in routed.into_iter().enumerate() {
+            if !held.contains(&expert) {
+                continue;
+            }
+            let e = &w.experts[expert - held.start];
             self.expert(
                 gpu,
                 |gate, up| {
@@ -148,8 +164,16 @@ impl Block {
                     )
                 },
                 weight,
+                sc.expert_out.offset(slot * s.hidden * 2),
                 stream,
             )?;
+        }
+        if let Some(comm) = comm {
+            comm.all_reduce_async(sc.expert_out.0, s.top_k * s.hidden * 2, stream)?;
+        }
+        let add = |x: DevicePtr| moe::accumulate(gpu, k.moe.accumulate, sc.acc, x, s.hidden, stream);
+        for slot in 0..s.top_k {
+            add(sc.expert_out.offset(slot * s.hidden * 2))?;
         }
         let gemv = |p: &Fp8Proj, x, out| {
             mxfp8_gemv_rows(gpu, &k.tiers, &p.w, x, out, 1, p.n, p.k, p.n, stream)
@@ -162,8 +186,10 @@ impl Block {
             },
             |inner, down| gemv(&w.shared_w2, inner, down),
             1.0,
+            sc.down,
             stream,
         )?;
+        add(sc.down)?;
         moe::round_bf16(
             gpu,
             k.moe.round_bf16,

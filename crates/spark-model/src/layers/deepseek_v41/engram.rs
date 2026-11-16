@@ -7,8 +7,8 @@
 //! the release's `inference/model.py`).
 //!
 //! The table is 384 million rows of 256 FP8 values, 101 GB a layer. This
-//! takes the rows a token reads, as the table stores them; finding them is
-//! the caller's.
+//! takes the rows a token reads, as the table stores them and wherever they
+//! sit; `engram_table.rs` finds them on disk.
 
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
@@ -113,13 +113,17 @@ impl Engram {
     }
 
     /// Add a token's lookup into its stream (`[copies, hidden]` BF16, in
-    /// place). `rows` (`[columns, 256]` FP8) and `scales` (`[columns, 8]`
-    /// E8M0) are the table rows its hash ids name, in the ids' order.
+    /// place). The rows its hash ids name are, in the ids' order, rows
+    /// `row_slots` (`[columns]` u32) of `rows` (256 FP8 values a row) and
+    /// rows `scale_slots` of `scales` (8 E8M0 scales a row).
+    #[allow(clippy::too_many_arguments)]
     pub fn apply(
         &self,
         gpu: &dyn GpuBackend,
         rows: DevicePtr,
         scales: DevicePtr,
+        row_slots: DevicePtr,
+        scale_slots: DevicePtr,
         streams: DevicePtr,
         stream: u64,
     ) -> Result<()> {
@@ -129,8 +133,10 @@ impl Engram {
             k.side.engram_rows,
             rows,
             scales,
+            row_slots,
+            scale_slots,
             self.values,
-            w.columns * ENGRAM_DIM,
+            w.columns,
             stream,
         )?;
         ops::fp8_linear(

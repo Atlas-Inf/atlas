@@ -9,6 +9,7 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
+use spark_comm::CommBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::hc::{self, HcSite};
@@ -153,12 +154,14 @@ impl Block {
     }
 
     /// The rest of the block: the attention output into the stream, then the
-    /// FFN, collapsed with the attention site's pre.
+    /// FFN, collapsed with the attention site's pre. `comm` reaches the other
+    /// ranks when the routed experts are split over them.
     fn finish(
         &self,
         gpu: &dyn GpuBackend,
         streams: DevicePtr,
         pre: DevicePtr,
+        comm: Option<&dyn CommBackend>,
         stream: u64,
     ) -> Result<()> {
         let (s, k, sc, w) = (
@@ -194,7 +197,7 @@ impl Block {
             stream,
         )?;
         self.norm(gpu, sc.x, w.moe.norm, sc.normed, s.hidden, stream)?;
-        self.moe(gpu, stream)?;
+        self.moe(gpu, comm, stream)?;
         expand(streams)?;
         gpu.synchronize(stream)?;
         gpu.copy_d2d(sc.next_pre, pre, s.hc.copies * 4)
@@ -213,10 +216,11 @@ impl Block {
         pre: DevicePtr,
         state: &mut SeqState,
         position: usize,
+        comm: Option<&dyn CommBackend>,
         stream: u64,
     ) -> Result<()> {
         self.attend(gpu, row, streams, pre, state, position, stream)?;
-        self.finish(gpu, streams, pre, stream)
+        self.finish(gpu, streams, pre, comm, stream)
     }
 }
 

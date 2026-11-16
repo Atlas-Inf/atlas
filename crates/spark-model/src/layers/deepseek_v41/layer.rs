@@ -1,0 +1,319 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! A DeepSeek-V4.1 block as the engine's layer, in the plain form: one
+//! token at a time, every step its own kernel.
+//!
+//! The engine hands a layer one row of `[hidden]` BF16 per token. The stream
+//! between blocks is four copies of that, so it lives in the arena's
+//! Hyper-Connection buffers, one row per token of the pass: the first layer
+//! fills a row from the token's embedding, the last collapses it back for
+//! the final norm and head. The mix the next block collapses with rides
+//! beside it.
+
+use std::sync::Arc;
+
+use anyhow::{Context, Result, ensure};
+use atlas_core::config::ModelConfig;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::kv_cache::PagedKvCache;
+use spark_runtime::weights::WeightStore;
+
+use super::block::{Block, BlockKernels, Candidates, Handoff, Scratch, SeqState, Shape, Shared};
+use super::cache_recipe::rope_freqs;
+use super::engram::{Engram, EngramWeights};
+use super::engram_table::{EngramHash, EngramTable};
+use super::hc::{self, IDENTITY_PRE};
+use super::index::INDEX_DIM;
+use super::ops::HEAD_DIM;
+use super::weights::BlockWeights;
+use crate::layer::{ForwardContext, LayerState, TransformerLayer};
+
+/// Positions a new sequence's compressed keys have room for; they grow.
+const FIRST_POSITIONS: usize = 8192;
+
+/// An Engram in front of a block.
+struct Lookup {
+    engram: Engram,
+    table: EngramTable,
+    /// The compressed id of every token id.
+    token_map: Arc<Vec<u32>>,
+}
+
+pub struct Layer {
+    block: Block,
+    lookup: Option<Lookup>,
+    /// The ratio the layer compresses keys at itself, 0 if it does not.
+    compresses: usize,
+    first: bool,
+    last: bool,
+}
+
+impl Layer {
+    /// Which row of the pass `hidden` is: the engine's rows are rows of the
+    /// arena's hidden buffer.
+    fn row(&self, hidden: DevicePtr, ctx: &ForwardContext) -> Result<usize> {
+        let width = (self.block.shared.shape.hidden * 2) as u64;
+        let base = ctx.buffers.hidden_states().0;
+        let offset = hidden.0.checked_sub(base).context("a row before the arena's")?;
+        let row = (offset / width) as usize;
+        ensure!(
+            offset % width == 0 && row < ctx.buffers.max_batch_tokens(),
+            "deepseek_v41: a row that is not one of the arena's {}",
+            ctx.buffers.max_batch_tokens()
+        );
+        Ok(row)
+    }
+
+    /// The token of row `row`, as the engine staged it.
+    fn token(&self, row: usize, ctx: &ForwardContext, stream: u64) -> Result<u32> {
+        if let Some(ids) = ctx.token_ids {
+            ctx.gpu.synchronize(stream)?;
+            let mut word = [0u8; 4];
+            ctx.gpu.copy_d2h(ids.offset(row * 4), &mut word)?;
+            return Ok(u32::from_le_bytes(word));
+        }
+        ctx.host_token_ids
+            .and_then(|ids| ids.get(row).copied())
+            .with_context(|| format!("deepseek_v41: no token id for row {row}"))
+    }
+
+    /// Add the Engram lookup of the token at `position` into its stream.
+    fn look_up(
+        &self,
+        lookup: &Lookup,
+        row: usize,
+        streams: DevicePtr,
+        state: &mut SeqState,
+        position: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let token = self.token(row, ctx, stream)? as usize;
+        let compressed = *lookup
+            .token_map
+            .get(token)
+            .with_context(|| format!("token {token} is outside the Engram token map"))?;
+        // A sequence that was rolled back hashes its new tokens over the
+        // ones kept.
+        state.history.truncate(position);
+        ensure!(
+            state.history.len() == position,
+            "deepseek_v41: Engram at position {position} of a sequence it has seen {} tokens of",
+            state.history.len()
+        );
+        state.history.push(compressed);
+        let hash = &lookup.table.hash;
+        let from = (position + 1).saturating_sub(hash.reach());
+        let rows = hash.rows(&state.history[from..]);
+        let found = lookup.table.find(ctx.gpu, &rows, stream)?;
+        lookup.engram.apply(
+            ctx.gpu,
+            found.rows,
+            found.scales,
+            found.row_slots,
+            found.scale_slots,
+            streams,
+            stream,
+        )?;
+        ctx.gpu.synchronize(stream)?;
+        lookup.table.done();
+        Ok(())
+    }
+}
+
+impl TransformerLayer for Layer {
+    fn decode(
+        &self,
+        hidden: DevicePtr,
+        _residual: DevicePtr,
+        state: &mut dyn LayerState,
+        _kv_cache: &mut PagedKvCache,
+        seq_len: usize,
+        _block_table: &mut Vec<u32>,
+        _disk_block_ids: &mut Vec<u32>,
+        _disk_last_offloaded_per_layer: &mut Vec<u32>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let (gpu, shared) = (ctx.gpu, &self.block.shared);
+        let (hidden_bytes, copies) = (shared.shape.hidden * 2, shared.shape.hc.copies);
+        let state = state
+            .as_any_mut()
+            .downcast_mut::<SeqState>()
+            .context("deepseek_v41: a layer state that is not this layer's")?;
+        let row = self.row(hidden, ctx)?;
+        let streams = ctx.buffers.hc_streams().offset(row * copies * hidden_bytes);
+        let pre = ctx.buffers.hc_post().offset(row * copies * 4);
+        if self.first {
+            // Every copy of the stream starts as the embedding, and the
+            // first block collapses with the identity mix.
+            gpu.synchronize(stream)?;
+            for copy in 0..copies {
+                gpu.copy_d2d(hidden, streams.offset(copy * hidden_bytes), hidden_bytes)?;
+            }
+            let identity: Vec<u8> = IDENTITY_PRE.iter().flat_map(|v| v.to_le_bytes()).collect();
+            gpu.copy_h2d(&identity, pre)?;
+        }
+        if let Some(lookup) = &self.lookup {
+            self.look_up(lookup, row, streams, state, seq_len, ctx, stream)?;
+        }
+        let comm = ctx.comm.filter(|_| ctx.config.ep_world_size > 1);
+        self.block
+            .forward_row(gpu, row, streams, pre, state, seq_len, comm, stream)?;
+        if self.last {
+            // Before the head, the stream collapses with the last mix.
+            hc::collapse(
+                gpu,
+                shared.kernels.hc.collapse,
+                &shared.shape.hc,
+                streams,
+                pre,
+                hidden,
+                1,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
+        Ok(Box::new(SeqState::alloc(
+            gpu,
+            self.compresses,
+            FIRST_POSITIONS,
+        )?))
+    }
+
+    fn free_state(&self, gpu: &dyn GpuBackend, state: &mut dyn LayerState) -> Result<()> {
+        match state.as_any_mut().downcast_mut::<SeqState>() {
+            Some(state) => state.free(gpu),
+            None => Ok(()),
+        }
+    }
+
+    /// Every token reads back to the host: positions chosen, expert routing,
+    /// table rows.
+    fn decode_graph_unsupported(&self) -> bool {
+        true
+    }
+
+    /// A key source keeps a compressed key and an index key per group, and
+    /// while they grow a buffer of up to their size again.
+    fn aux_bytes_per_token(&self) -> usize {
+        match self.compresses {
+            0 => 0,
+            ratio => 2 * (HEAD_DIM + INDEX_DIM) * 2 / ratio,
+        }
+    }
+}
+
+/// Every layer of the model, from the release's weights.
+pub fn load_layers(
+    store: &WeightStore,
+    config: &ModelConfig,
+    gpu: &dyn GpuBackend,
+) -> Result<Vec<Box<dyn TransformerLayer>>> {
+    let shape = Shape::from_config(config)?;
+    let layers = config.num_hidden_layers;
+    let shared = Shared {
+        shape,
+        kernels: BlockKernels::load(gpu)?,
+        // At ratio 1 a query scores one compressed position a token.
+        scratch: Arc::new(Scratch::alloc(gpu, &shape, config.max_position_embeddings)?),
+        handoff: Arc::new(std::sync::Mutex::new(Handoff::default())),
+    };
+    let ladder = |original: usize, theta: f64| -> Result<DevicePtr> {
+        let freqs = rope_freqs(
+            shape.rope,
+            original,
+            theta as f32,
+            config.yarn_factor,
+            config.yarn_beta_fast,
+            config.yarn_beta_slow,
+        );
+        let bytes: Vec<u8> = freqs.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let p = gpu.alloc(bytes.len())?;
+        gpu.copy_h2d(&bytes, p)?;
+        Ok(p)
+    };
+    ensure!(
+        config.window_rope_theta > 0.0 && config.rope_theta > 0.0,
+        "deepseek_v41: no rotary bases"
+    );
+    // A layer that attends over its window only is not YaRN-scaled.
+    let window = ladder(0, config.window_rope_theta)?;
+    let compressed = ladder(
+        config.yarn_original_max_position_embeddings,
+        config.rope_theta,
+    )?;
+    let (first_expert, end_expert) = config.local_expert_range();
+    let geometry = config.deepseek_v41_engram(config.engram_pad_id)?;
+    tracing::info!(
+        "DeepSeek-V4.1: {layers} layers, experts {first_expert}..{end_expert} of {}, key sources {:?}, index sources {:?}, Engram at {:?}",
+        shape.experts,
+        config.kv_source_layer_ids,
+        config.index_source_layer_ids,
+        config.engram_layer_ids
+    );
+    let mut out: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(layers);
+    for layer in 0..layers {
+        let ratio = config.compress_ratios.get(layer).copied().unwrap_or(0);
+        let compresses = match config.kv_source_layer_ids.contains(&layer) {
+            true => ratio,
+            false => 0,
+        };
+        let index_source = config.index_source_layer_ids.contains(&layer);
+        let candidates = match config.candidate_source_layer_id {
+            Some(source) if source == layer => Candidates::Source,
+            Some(source) if index_source && source < layer => Candidates::Reader,
+            _ => Candidates::None,
+        };
+        let block = Block {
+            index: layer,
+            ratio,
+            candidates,
+            freqs: if ratio == 0 { window } else { compressed },
+            weights: BlockWeights::load(
+                store,
+                gpu,
+                layer,
+                compresses,
+                index_source,
+                first_expert..end_expert,
+            )
+            .with_context(|| format!("layer {layer}"))?,
+            shared: shared.clone(),
+        };
+        let lookup = match (
+            &geometry,
+            config.engram_layer_ids.iter().position(|&l| l == layer),
+        ) {
+            (Some(geometry), Some(index)) => {
+                let weights = EngramWeights::load(store, gpu, layer, &shape)?;
+                let hash = EngramHash::new(geometry, index);
+                ensure!(
+                    hash.columns() == weights.columns,
+                    "layer {layer}: Engram hashes {} rows a token and projects {}",
+                    hash.columns(),
+                    weights.columns
+                );
+                Some(Lookup {
+                    engram: Engram::new(gpu, shared.kernels, &shape, weights)?,
+                    table: EngramTable::open(store, gpu, layer, hash, geometry.num_embeddings[index])?,
+                    token_map: config.engram_token_map.clone().context(
+                        "deepseek_v41: the Engram token map was not derived from the tokenizer",
+                    )?,
+                })
+            }
+            _ => None,
+        };
+        out.push(Box::new(Layer {
+            block,
+            lookup,
+            compresses,
+            first: layer == 0,
+            last: layer + 1 == layers,
+        }));
+    }
+    Ok(out)
+}

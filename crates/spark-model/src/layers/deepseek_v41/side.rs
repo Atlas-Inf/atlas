@@ -78,25 +78,31 @@ pub fn compress_pool(
         .launch(stream)
 }
 
-/// `out` (`[values]` BF16) = Engram table rows as the values a lookup
-/// reads: `rows` (`[values]` FP8 E4M3, as stored) times `scales` (E8M0, one
-/// per 32 values).
+/// `out` (`[columns, 256]` BF16) = Engram table rows as the values a
+/// lookup reads. Column `c` is row `row_slots[c]` of `rows` (256 FP8 E4M3
+/// values a row, as stored) times row `scale_slots[c]` of `scales` (8 E8M0
+/// scales a row, one per 32 values). The slots are `[columns]` u32.
+#[allow(clippy::too_many_arguments)]
 pub fn engram_rows(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
     rows: DevicePtr,
     scales: DevicePtr,
+    row_slots: DevicePtr,
+    scale_slots: DevicePtr,
     out: DevicePtr,
-    values: usize,
+    columns: usize,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(values as u32, THREADS), 1, 1])
+        .grid([div_ceil((columns * 256) as u32, THREADS), 1, 1])
         .block([THREADS, 1, 1])
         .arg_ptr(rows)
         .arg_ptr(scales)
+        .arg_ptr(row_slots)
+        .arg_ptr(scale_slots)
         .arg_ptr(out)
-        .arg_u32(values as u32)
+        .arg_u32(columns as u32)
         .launch(stream)
 }
 

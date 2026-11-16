@@ -647,6 +647,23 @@ pub(crate) fn load_model(
         max_batch_tokens_pre,
     )?;
 
+    // DeepSeek-V4.1's Engram layers hash n-grams over a token map derived
+    // from the tokenizer, so the model is built with it.
+    if config.model_type == "deepseek_v41" && !config.engram_layer_ids.is_empty() {
+        let tk = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
+            .map_err(|e| anyhow::anyhow!("deepseek_v41: load tokenizer for Engram: {e}"))?;
+        let base = tk.get_vocab_size(false) as u32;
+        let vocab = tk
+            .get_added_tokens_decoder()
+            .keys()
+            .map(|&id| id + 1)
+            .fold(base, u32::max);
+        if let Some(engram) = crate::tokenizer::engram_dsv41::resolve(&tk, vocab, &config)? {
+            config.engram_pad_id = engram.geometry.pad_id;
+            config.engram_token_map = Some(std::sync::Arc::new(engram.map));
+        }
+    }
+
     // 5. Build model via factory.
     spark_runtime::progress::phase(6, "kv cache");
     let serve_phases::PrefillBudget {

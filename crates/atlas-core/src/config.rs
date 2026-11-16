@@ -408,6 +408,19 @@ pub struct ModelConfig {
     /// stream (see `config/engram_dsv41.rs`). Empty = no Engram.
     #[serde(default)]
     pub engram_layer_ids: Vec<usize>,
+    /// DeepSeek-V4.1: the compressed id of every token id, which the Engram
+    /// tables are hashed over. It is derived from the tokenizer, so the
+    /// server sets it before the model is built.
+    #[serde(skip)]
+    pub engram_token_map: Option<std::sync::Arc<Vec<u32>>>,
+    /// The compressed id of the Engram pad token, beside `engram_token_map`.
+    #[serde(skip)]
+    pub engram_pad_id: u32,
+    /// DeepSeek-V4.1: the rotary base of a layer that attends over its
+    /// window only (HF `rope_theta`). `rope_theta` holds the compressing
+    /// layers' base, HF `compress_rope_theta`.
+    #[serde(default)]
+    pub window_rope_theta: f64,
     /// Rows of each Engram layer's table, as published.
     #[serde(default)]
     pub engram_num_embeddings: Vec<u64>,

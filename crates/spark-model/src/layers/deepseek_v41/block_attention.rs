@@ -38,8 +38,12 @@ impl Block {
             .context("a source layer has a compressor")?;
         let held = state
             .compressed
-            .as_ref()
+            .as_mut()
             .context("a source layer holds compressed keys")?;
+        if let Some(group) = completed_group(position, w.ratio) {
+            held.reserve(gpu, group + 1, stream)?;
+        }
+        let held = &*held;
         let slot = (position % w.ratio) * HEAD_DIM * 4;
         side::gemv_f32(
             gpu,
@@ -66,12 +70,6 @@ impl Block {
         let Some(group) = completed_group(position, w.ratio) else {
             return Ok(());
         };
-        ensure!(
-            group < held.capacity,
-            "layer {}: group {group} is past the sequence's {} compressed keys",
-            self.index,
-            held.capacity
-        );
         let key = held.keys.offset(group * HEAD_DIM * 2);
         match w.wgate {
             Some(_) => side::compress_pool(

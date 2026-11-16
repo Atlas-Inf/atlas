@@ -15,6 +15,7 @@
 //!   - `gemma4`: Gemma-4 (pure attention, GeGLU, sliding + full attention)
 
 pub(crate) mod deepseek_v4;
+mod deepseek_v41;
 pub mod dflash_loader;
 pub mod dflash_preshrink;
 mod gemma4;
@@ -34,6 +35,7 @@ mod ricursive;
 mod step3p7;
 
 pub use deepseek_v4::DeepSeekV4WeightLoader;
+pub use deepseek_v41::DeepSeekV41WeightLoader;
 pub use dflash_loader::{
     DflashConfig, DflashLayerWeights, DflashSubConfig, DflashWeights, load_dflash_weights,
     store_has_dflash_weights,

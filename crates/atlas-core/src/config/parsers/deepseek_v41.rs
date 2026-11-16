@@ -41,12 +41,43 @@ pub fn parse_deepseek_v41(raw: &serde_json::Value) -> Result<ModelConfig> {
             flat.entry(key.clone()).or_insert_with(|| value.clone());
         }
     }
+    let window_theta = flat.get("rope_theta").and_then(serde_json::Value::as_f64);
     let json = serde_json::Value::Object(flat).to_string();
-    let config = parse_deepseek_family(&json, "deepseek_v41")?;
+    let mut config = parse_deepseek_family(&json, "deepseek_v41")?;
+    config.window_rope_theta =
+        window_theta.context("deepseek_v41 config missing rope_theta")?;
     validate_shared_attention(&config)?;
     // The pad id needs the tokenizer; the table geometry does not.
     config.deepseek_v41_engram(0)?;
+    debug_truncate_layers(&mut config);
     Ok(config)
+}
+
+/// `ATLAS_DSV41_DEBUG_LAYERS=<n>` (debug only, unset in serving): keep the
+/// first `n` decoder layers, so a cut of the model fits one Spark. The
+/// stream is collapsed after layer `n - 1` and goes through the real norm
+/// and head, which is what DeepSeek's reference computes when it is built
+/// with `n_layers = n`. The logits are not the model's.
+fn debug_truncate_layers(config: &mut ModelConfig) {
+    let keep = std::env::var("ATLAS_DSV41_DEBUG_LAYERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0 && n < config.num_hidden_layers);
+    if let Some(n) = keep {
+        eprintln!(
+            "ATLAS_DSV41_DEBUG_LAYERS: keeping {n} of {} layers",
+            config.num_hidden_layers
+        );
+        config.num_hidden_layers = n;
+        config.layer_types.truncate(n);
+        config.engram_layer_ids.retain(|&layer| layer < n);
+        config.engram_num_embeddings.truncate(config.engram_layer_ids.len());
+        config.kv_source_layer_ids.retain(|&layer| layer < n);
+        config.index_source_layer_ids.retain(|&layer| layer < n);
+        config.candidate_source_layer_id = config.candidate_source_layer_id.filter(|&l| l < n);
+        config.num_mtp_modules = 0;
+        config.compress_ratios.truncate(n);
+    }
 }
 
 fn validate_shared_attention(c: &ModelConfig) -> Result<()> {

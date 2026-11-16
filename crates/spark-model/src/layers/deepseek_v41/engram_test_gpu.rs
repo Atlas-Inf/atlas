@@ -81,6 +81,9 @@ fn engram_layers_replay_the_reference_from_hash_ids() -> Result<()> {
             gpu.alloc(columns * rows.row_bytes)?,
             gpu.alloc(columns * scales.row_bytes)?,
         );
+        // The rows are read in the ids' order, so column c is row c.
+        let in_order: Vec<u8> = (0..columns as u32).flat_map(u32::to_le_bytes).collect();
+        let slots = upload(gpu, &in_order)?;
         let (mut values, mut projected, mut got) = (Vec::new(), Vec::new(), Vec::new());
         for (at, &position) in picks.iter().enumerate() {
             let (mut row_bytes, mut scale_bytes) = (Vec::new(), Vec::new());
@@ -96,7 +99,7 @@ fn engram_layers_replay_the_reference_from_hash_ids() -> Result<()> {
                 &inputs[at * copies * hidden * 2..(at + 1) * copies * hidden * 2],
                 streams,
             )?;
-            engram.apply(gpu, row_dev, scale_dev, streams, stream)?;
+            engram.apply(gpu, row_dev, scale_dev, slots, slots, streams, stream)?;
             values.extend(download(gpu, engram.values, read)?);
             projected.extend(download(gpu, engram.kv, kv)?);
             got.extend(download(gpu, streams, copies * hidden)?);
