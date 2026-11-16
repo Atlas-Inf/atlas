@@ -23,19 +23,23 @@ impl Layer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<Vec<u32>> {
-        if let Some(ids) = ctx.token_ids {
-            ctx.gpu.synchronize(stream)?;
-            let mut words = vec![0u8; rows * 4];
-            ctx.gpu.copy_d2h(ids.offset(row * 4), &mut words)?;
-            return Ok(words
-                .chunks_exact(4)
-                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
-                .collect());
+        // What the host was handed is read from the host: reading the ids
+        // back from the device waits for the pass's stream, and a decode
+        // step's host was held there until the layers before had run, with
+        // the GPU idle while it then looked the rows up.
+        if let Some(ids) = ctx.host_token_ids.and_then(|ids| ids.get(row..row + rows)) {
+            return Ok(ids.to_vec());
         }
-        ctx.host_token_ids
-            .and_then(|ids| ids.get(row..row + rows))
-            .map(<[u32]>::to_vec)
-            .with_context(|| format!("deepseek_v41: no token ids for {rows} rows from {row}"))
+        let ids = ctx
+            .token_ids
+            .with_context(|| format!("deepseek_v41: no token ids for {rows} rows from {row}"))?;
+        ctx.gpu.synchronize(stream)?;
+        let mut words = vec![0u8; rows * 4];
+        ctx.gpu.copy_d2h(ids.offset(row * 4), &mut words)?;
+        Ok(words
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect())
     }
 
     /// Add the tokens of `rows` rows from `row`, at `position` on, to the
