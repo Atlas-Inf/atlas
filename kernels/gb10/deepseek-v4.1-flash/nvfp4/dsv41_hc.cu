@@ -299,13 +299,19 @@ extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_site_sum
 
 #define DSV41_FINISH_THREADS 1024
 
-// A site of one token, second launch, one block of 1,024 threads:
+// A site of one token, second launch, two blocks of 1,024 threads:
 //
-//   4. `normed` = the RMS norm of `collapsed` under `norm_weight`
+//   4. Block 0: `normed` = the RMS norm of `collapsed` under `norm_weight`
 //      (`rms_norm_vanilla` on a block of 1,024), and `quantized` its FP8
-//      form (`dsv41_fp8_quant_dequant`).
-//   5. The site's coefficients from the partials: `pre_out`, and `post` and
-//      `comb` replaced (`dsv41_hc_mix_finish`).
+//      form (`dsv41_fp8_quant_dequant`). A thread rounds the two values it
+//      has just normed: the 32 values of a scale block are the pairs of 16
+//      neighbouring lanes, which find the block's largest by shuffles.
+//   5. Block 1, on one warp: the site's coefficients from the partials:
+//      `pre_out`, and `post` and `comb` replaced (`dsv41_hc_mix_finish`).
+//      Twenty Sinkhorn rounds are a chain nothing shortens, so they run
+//      beside the norm, not after it.
+//
+// Grid (2).
 extern "C" __global__ void __launch_bounds__(DSV41_FINISH_THREADS) dsv41_hc_site_finish(
     const float* __restrict__ partials,
     const float* __restrict__ hc_scale,
@@ -326,6 +332,13 @@ extern "C" __global__ void __launch_bounds__(DSV41_FINISH_THREADS) dsv41_hc_site
     __shared__ float mix[DSV41_MIX_SUMS];
     __shared__ volatile float comb[DSV41_HC_MAX * DSV41_HC_MAX];
     __shared__ float squares[DSV41_FINISH_THREADS / 32];
+    if (blockIdx.x == 1) {
+        if (warp == 0)
+            dsv41_hc_coefficients(
+                partials, H / DSV41_HC_THREADS, mix, comb, lane, H, hc, sinkhorn_iters, norm_eps,
+                hc_eps, hc_scale, hc_base, pre_out, post, comb_out);
+        return;
+    }
 
     // The norm of the collapsed vector, two values a word.
     const unsigned int half = H / 2;
@@ -350,20 +363,22 @@ extern "C" __global__ void __launch_bounds__(DSV41_FINISH_THREADS) dsv41_hc_site
     const float rms = rsqrtf(squares[0] / (float)H + norm_eps);
     const unsigned int* w32 = (const unsigned int*)norm_weight;
     unsigned int* n32 = (unsigned int*)normed;
+    unsigned int* q32 = (unsigned int*)quantized;
+    // Every thread of a warp takes as many turns: 1,024 divides the pairs
+    // by whole warps.
     for (unsigned int i = tid; i < half; i += DSV41_FINISH_THREADS) {
         float xv0, xv1, wv0, wv1;
         dsv41_unpack2(y32[i], xv0, xv1);
         dsv41_unpack2(w32[i], wv0, wv1);
-        n32[i] = dsv41_pack2(xv0 * rms * wv0, xv1 * rms * wv1);
+        const unsigned int pair = dsv41_pack2(xv0 * rms * wv0, xv1 * rms * wv1);
+        n32[i] = pair;
+        float v0, v1;
+        dsv41_unpack2(pair, v0, v1);
+        float amax = fmaxf(fabsf(v0), fabsf(v1));
+        #pragma unroll
+        for (unsigned int o = 8; o > 0; o >>= 1)
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        const float scale = dsv41_fp8_scale(amax);
+        q32[i] = dsv41_pack2(dsv41_fp8_value(v0, scale), dsv41_fp8_value(v1, scale));
     }
-    __syncthreads();
-    if (tid < H / 32) {
-        float values[32];
-        for (int i = 0; i < 32; ++i) values[i] = __bfloat162float(normed[tid * 32 + i]);
-        dsv41_fp8_block(values, quantized + tid * 32);
-    }
-    if (warp != 0) return;
-    dsv41_hc_coefficients(
-        partials, H / DSV41_HC_THREADS, mix, comb, lane, H, hc, sinkhorn_iters, norm_eps, hc_eps,
-        hc_scale, hc_base, pre_out, post, comb_out);
 }

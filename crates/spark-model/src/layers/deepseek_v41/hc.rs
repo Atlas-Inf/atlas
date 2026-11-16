@@ -258,7 +258,7 @@ pub fn site(
 ) -> Result<()> {
     shape.check()?;
     ensure!(
-        shape.hidden.is_multiple_of(64) && shape.hidden <= 32 * FINISH_THREADS as usize,
+        shape.hidden.is_multiple_of(64),
         "dsv41_hc_site: hidden {}",
         shape.hidden
     );
@@ -281,8 +281,9 @@ pub fn site(
         .arg_u32(shape.copies as u32)
         .arg_u32(before.slots as u32)
         .launch(stream)?;
+    // The norm and its rounding on one block, the coefficients on another.
     KernelLaunch::new(gpu, kernels.site_finish)
-        .grid([1, 1, 1])
+        .grid([2, 1, 1])
         .block([FINISH_THREADS, 1, 1])
         .arg_ptr(out.partials)
         .arg_ptr(weights.scale)
