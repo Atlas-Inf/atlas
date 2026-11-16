@@ -52,6 +52,20 @@ pub(super) fn generation_max_tokens(
     }
 }
 
+/// `--thinking-off-budget`: what a request that resolved thinking off gets
+/// instead, on a model whose template reasons whatever it is told (GLM-5.3):
+/// the template's low effort under this token cap, which never takes more
+/// than half of `max_tokens` from the answer. `None` leaves the request as
+/// it resolved (the flag is unset, or thinking is on).
+pub(super) fn low_effort_when_off(
+    cap: Option<u32>,
+    enable_thinking: bool,
+    max_tokens: u32,
+) -> Option<u32> {
+    let cap = cap.filter(|_| !enable_thinking)?;
+    Some(cap.min((max_tokens / 2).max(1)))
+}
+
 /// Server/model policy inputs, split from `AppState` so the resolution
 /// core is a pure function.
 #[derive(Clone, Copy)]

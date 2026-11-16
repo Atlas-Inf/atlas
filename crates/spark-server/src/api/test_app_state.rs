@@ -55,6 +55,7 @@ pub(crate) fn app_state(tokenizer: crate::tokenizer::ChatTokenizer) -> AppState 
         effective_context: 0,
         behavior: Default::default(),
         disable_thinking: false,
+        thinking_off_budget: None,
         default_thinking: Default::default(),
         default_reasoning_effort: None,
         response_store: crate::response_store::ResponseStore::with_config(
