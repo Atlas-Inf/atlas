@@ -7,7 +7,7 @@
 //! reads six a row: 384 experts' worth every 64 rows. Rows that chose the
 //! same expert can share one read of it. The host sorts the batch's (row,
 //! slot) pairs by expert and cuts each expert's run into tiles of up to
-//! eight, and three launches take every tile: both projections in, the
+//! 32, and three launches take every tile: both projections in, the
 //! activation, and, once the ranks have gathered the activations, the
 //! projection out. A row's bytes are those of [`super::moe::experts_in`]
 //! and [`super::moe::experts_out`] on it alone.
@@ -17,8 +17,10 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 use super::moe::MoeKernels;
-use super::parts::TILE;
 use super::weights::ExpertSlab;
+
+/// The pairs of one expert a launch takes together (`dsv41_expert.cu`).
+const TILE: usize = 32;
 
 /// A batch's (row, slot) pairs in expert order, as the kernels read them.
 pub struct Plan {

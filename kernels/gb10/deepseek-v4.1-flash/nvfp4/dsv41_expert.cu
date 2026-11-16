@@ -133,7 +133,7 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_expert_ou
 }
 
 // The routed experts of a batch of rows, grouped. Rows that chose the same
-// expert share a launch's read of its weights: a tile is up to 8 of them,
+// expert share a launch's read of its weights: a tile is up to 32 of them,
 // `first` on in the order the host sorted (row, slot) pairs by expert. A
 // row's bytes are those of `dsv41_expert_in` / `_act` / `_out` on it alone,
 // for a block computes a row from that row.
@@ -157,13 +157,13 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_experts_i
     unsigned long long stride,
     unsigned int data,
     unsigned int scales) {
-    __shared__ F4Shared<1> sh;
+    __shared__ F4Shared<4> sh;
     __shared__ F4Staged staged;
     const Dsv41Tile tile = tiles[blockIdx.y / 2];
     const unsigned int which = blockIdx.y & 1u;
     const unsigned char* w = slab + (unsigned long long)tile.expert * stride +
                              (unsigned long long)which * (data + scales);
-    dsv41_gemv_staged_impl<1, true, false>(
+    dsv41_gemv_staged_impl<4, true, false>(
         sh, staged, x, w, w + data, gate_up + ((size_t)tile.first * 2 + which) * rows, tile.count,
         rows, K, 2 * rows, blockIdx.x, K, row_of + tile.first);
 }
@@ -211,12 +211,12 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_experts_o
     unsigned int data,
     unsigned int scales,
     unsigned long long piece_stride) {
-    __shared__ F4Shared<1> sh;
+    __shared__ F4Shared<4> sh;
     __shared__ F4Staged staged;
     const Dsv41Tile tile = tiles[blockIdx.y];
     const unsigned char* w =
         slab + (unsigned long long)tile.expert * stride + 2ull * (data + scales);
-    dsv41_gemv_staged_impl<1, true, false>(
+    dsv41_gemv_staged_impl<4, true, false>(
         sh, staged, inner + (size_t)tile.first * rows, w, w + data, out, tile.count, N,
         rows * DSV41_PARTS, N, blockIdx.x, rows, nullptr, out_row + tile.first, rows,
         piece_stride);
