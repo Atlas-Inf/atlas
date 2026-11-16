@@ -108,8 +108,9 @@ impl PartKernels {
 
 /// `rows` vectors `x` (`[rows, k]` BF16) through a tensor-core projection `w`
 /// (`[n, k]`, FP4 or FP8 by `kernel`) under `scales` (`[n, k / 32]` E8M0),
-/// into `out` (`[rows, n]`, BF16 or FP32 by `kernel`: `out_bytes` a value).
-/// `x` is FP8-rounded already, or with a `_q` kernel as it was computed.
+/// into `out` (BF16 or FP32 by `kernel`: `out_bytes` a value), whose rows are
+/// `out_stride` values apart, `n` of each written. `x` is FP8-rounded
+/// already, or with a `_q` kernel as it was computed.
 #[allow(clippy::too_many_arguments)]
 pub fn project_rows(
     gpu: &dyn GpuBackend,
@@ -119,6 +120,7 @@ pub fn project_rows(
     scales: DevicePtr,
     out: DevicePtr,
     out_bytes: usize,
+    out_stride: usize,
     rows: usize,
     n: usize,
     k: usize,
@@ -132,11 +134,11 @@ pub fn project_rows(
             .arg_ptr(x.offset(first * k * 2))
             .arg_ptr(w)
             .arg_ptr(scales)
-            .arg_ptr(out.offset(first * n * out_bytes))
+            .arg_ptr(out.offset(first * out_stride * out_bytes))
             .arg_u32((rows - first).min(TILE) as u32)
             .arg_u32(n as u32)
             .arg_u32(k as u32)
-            .arg_u32(n as u32)
+            .arg_u32(out_stride as u32)
             .launch(stream)?;
     }
     Ok(())
@@ -156,7 +158,7 @@ pub fn project(
     stream: u64,
 ) -> Result<()> {
     // One row: the width of a value does not enter.
-    project_rows(gpu, kernel, x, w, scales, out, 0, 1, n, k, stream)
+    project_rows(gpu, kernel, x, w, scales, out, 0, n, 1, n, k, stream)
 }
 
 /// A projection's weights, rows and output, as `dsv41_fp8_gemv_two` takes

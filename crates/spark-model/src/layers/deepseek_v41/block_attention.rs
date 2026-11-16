@@ -170,10 +170,13 @@ impl Block {
         };
         copy(turn, 0, WINDOW - turn, false)?;
         copy(0, WINDOW - turn, turn, false)?;
-        // The batch's keys, once `front` has written them, into the ring.
-        let first = rows.min(WINDOW - turn);
-        copy(turn, WINDOW, first, true)?;
-        copy(0, WINDOW + first, rows - first, true)
+        // The batch's keys, once `front` has written them, into the ring:
+        // its last 128, when it is longer than the window.
+        let kept = rows.min(WINDOW);
+        let (from, turn) = (WINDOW + rows - kept, window_slot(position + rows - kept));
+        let first = kept.min(WINDOW - turn);
+        copy(turn, from, first, true)?;
+        copy(0, from + first, kept - first, true)
     }
 
     /// Attention of the `rows` inputs in `scratch.normed`, and in FP8 in
@@ -327,6 +330,7 @@ impl Block {
                 wq.scales,
                 q,
                 2,
+                heads * HEAD_DIM,
                 rows,
                 heads * HEAD_DIM,
                 w.wq_b.k,
@@ -377,6 +381,7 @@ impl Block {
                 wo.scales,
                 sc.attn_parts.offset(part * sc.rows * s.hidden * 4),
                 4,
+                s.hidden,
                 rows,
                 s.hidden,
                 width,

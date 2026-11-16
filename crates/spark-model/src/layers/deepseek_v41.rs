@@ -16,6 +16,7 @@ pub mod index;
 pub mod index_recipe;
 pub mod layer;
 pub mod moe;
+pub mod moe_grouped;
 pub mod ops;
 pub mod parts;
 mod profile;

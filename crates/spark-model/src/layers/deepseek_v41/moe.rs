@@ -25,6 +25,10 @@ pub struct MoeKernels {
     pub expert_in: KernelHandle,
     pub expert_act: KernelHandle,
     pub expert_out: KernelHandle,
+    /// The same for a batch of rows, grouped by expert (`moe_grouped.rs`).
+    pub experts_in: KernelHandle,
+    pub experts_act: KernelHandle,
+    pub experts_out: KernelHandle,
     /// The plain projection, one thread per row.
     pub fp4_gemv: KernelHandle,
     /// The same on tensor cores, for up to 8 rows (`dsv41_fp4_tc.cu`).
@@ -46,6 +50,9 @@ impl MoeKernels {
             expert_in: gpu.kernel("dsv41_expert", "dsv41_expert_in")?,
             expert_act: gpu.kernel("dsv41_expert", "dsv41_expert_act")?,
             expert_out: gpu.kernel("dsv41_expert", "dsv41_expert_out")?,
+            experts_in: gpu.kernel("dsv41_expert", "dsv41_experts_in")?,
+            experts_act: gpu.kernel("dsv41_expert", "dsv41_experts_act")?,
+            experts_out: gpu.kernel("dsv41_expert", "dsv41_experts_out")?,
             fp4_gemv: kernel("dsv41_fp4_gemv")?,
             fp4_gemv_tc: gpu.kernel("dsv41_tc", "dsv41_fp4_gemv_tc8")?,
             plain_fp4: std::env::var("ATLAS_DSV41_PLAIN_FP4").is_ok_and(|v| v == "1"),

@@ -122,3 +122,86 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_expert_ou
                                                blockIdx.x, rows);
     }
 }
+
+// The routed experts of a batch of rows, grouped. Rows that chose the same
+// expert share a launch's read of its weights: a tile is up to 8 of them,
+// `first` on in the order the host sorted (row, slot) pairs by expert. A
+// row's bytes are those of `dsv41_expert_in` / `_act` / `_out` on it alone,
+// for a block computes a row from that row.
+struct Dsv41Tile {
+    unsigned int expert;
+    unsigned int first;
+    unsigned int count;
+};
+
+// gate_up[pair][0] = BF16(w1 . x[row_of[pair]]), [pair][1] the same of w3.
+// x [T, K] FP8-rounded BF16; gate_up [pairs, 2, rows].
+// Grid (ceil(rows / 16), 2 * tiles), block 256.
+extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_experts_in(
+    const __nv_bfloat16* __restrict__ x,
+    const unsigned char* __restrict__ slab,
+    const Dsv41Tile* __restrict__ tiles,
+    const int* __restrict__ row_of,
+    __nv_bfloat16* __restrict__ gate_up,
+    unsigned int rows,
+    unsigned int K,
+    unsigned long long stride,
+    unsigned int data,
+    unsigned int scales) {
+    __shared__ F4Shared<1> sh;
+    __shared__ F4Staged staged;
+    const Dsv41Tile tile = tiles[blockIdx.y / 2];
+    const unsigned int which = blockIdx.y & 1u;
+    const unsigned char* w = slab + (unsigned long long)tile.expert * stride +
+                             (unsigned long long)which * (data + scales);
+    dsv41_gemv_staged_impl<1, true, false>(
+        sh, staged, x, w, w + data, gate_up + ((size_t)tile.first * 2 + which) * rows, tile.count,
+        rows, K, 2 * rows, blockIdx.x, K, row_of + tile.first);
+}
+
+// inner[r] = fp8(BF16(weight[r] * silu(min(gate, limit)) * clamp(up, limit)))
+// for each of `count` rows of gate_up [count, 2, rows]; with no `weights`,
+// under 1 (the shared expert). One thread per 32 values.
+extern "C" __global__ void dsv41_experts_act(
+    const __nv_bfloat16* __restrict__ gate_up,
+    const float* __restrict__ weights,
+    __nv_bfloat16* __restrict__ inner,
+    unsigned int count,
+    unsigned int rows,
+    float limit) {
+    const size_t b = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int per_row = rows / 32;
+    if (b >= (size_t)count * per_row) return;
+    const size_t r = b / per_row;
+    const unsigned int at = (unsigned int)(b % per_row) * 32;
+    const float weight = weights ? weights[r] : 1.0f;
+    const __nv_bfloat16* gate = gate_up + r * 2 * rows + at;
+    const __nv_bfloat16* up = gate + rows;
+    float v[32];
+    for (int i = 0; i < 32; ++i)
+        v[i] = dsv41_swiglu_one(__bfloat162float(gate[i]), __bfloat162float(up[i]), weight, limit);
+    dsv41_fp8_block(v, inner + r * rows + at);
+}
+
+// out[out_row[pair]] = this part's FP32 partial of w2 . inner[pair], [.., H].
+// Grid (ceil(H / 16), tiles), block 256.
+extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_experts_out(
+    const __nv_bfloat16* __restrict__ inner,
+    const unsigned char* __restrict__ slab,
+    const Dsv41Tile* __restrict__ tiles,
+    const int* __restrict__ out_row,
+    float* __restrict__ out,
+    unsigned int H,
+    unsigned int rows,
+    unsigned long long stride,
+    unsigned int data,
+    unsigned int scales) {
+    __shared__ F4Shared<1> sh;
+    __shared__ F4Staged staged;
+    const Dsv41Tile tile = tiles[blockIdx.y];
+    const unsigned char* w =
+        slab + (unsigned long long)tile.expert * stride + 2ull * (data + scales);
+    dsv41_gemv_staged_impl<1, true, true>(
+        sh, staged, inner + (size_t)tile.first * rows, w, w + data, out, tile.count, H, rows, H,
+        blockIdx.x, rows, nullptr, out_row + tile.first);
+}

@@ -10,6 +10,7 @@ use super::cache_recipe::WINDOW;
 use super::hc::{HcKernels, HcShape};
 use super::index::{INDEX_DIM, IndexKernels};
 use super::moe::MoeKernels;
+use super::moe_grouped::GroupedScratch;
 use super::ops::{HEAD_DIM, Kernels, MAX_KEYS, attn_records};
 use super::parts::{PARTS, PartKernels};
 use super::side::SideKernels;
@@ -129,8 +130,10 @@ impl BlockKernels {
 }
 
 /// Rows of a sequence a block runs together: a decode step is one, a
-/// prefill chunk goes through in turns of this many.
-pub const ROWS: usize = 32;
+/// prefill chunk goes through in turns of this many. The more rows, the more
+/// of them choose the same expert and share one read of its weights: at 512
+/// an expert has eight rows on average.
+pub const ROWS: usize = 512;
 
 /// Working buffers for a batch of up to [`ROWS`] rows, shared by every block
 /// of a model: blocks run one after another. Unless it says otherwise a
@@ -138,6 +141,12 @@ pub const ROWS: usize = 32;
 pub struct Scratch {
     /// Rows there is room for.
     pub(super) rows: usize,
+    /// The routed experts of a batch, grouped; and the shared expert's
+    /// `[rows, 2, inter / PARTS]` gate and up rows and `[rows, inter / PARTS]`
+    /// activations.
+    pub(super) grouped: GroupedScratch,
+    pub(super) shared_gate_up: DevicePtr,
+    pub(super) shared_inner: DevicePtr,
     /// `[128 + rows, 512]` BF16: the window's keys in position order and
     /// then the batch's own, when a batch is more than one row.
     pub(super) chunk_keys: DevicePtr,
@@ -204,6 +213,9 @@ impl Scratch {
         let copies = s.hc.copies;
         Ok(Self {
             rows: ROWS,
+            grouped: GroupedScratch::alloc(gpu, ROWS, s.top_k, s.experts, s.inter / PARTS)?,
+            shared_gate_up: bf16(ROWS * 2 * s.inter / PARTS)?,
+            shared_inner: bf16(ROWS * s.inter / PARTS)?,
             chunk_keys: bf16((WINDOW + ROWS) * HEAD_DIM)?,
             x: bf16(ROWS * (s.hidden))?,
             normed: bf16(ROWS * (s.hidden))?,

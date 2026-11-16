@@ -4,11 +4,12 @@
 
 use anyhow::{Context, Result};
 use spark_comm::CommBackend;
-use spark_runtime::gpu::GpuBackend;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::block::Block;
 use super::hc::SublayerParts;
 use super::moe::{self, ExpertPart, ExpertScratch};
+use super::moe_grouped::{self, Plan};
 use super::parts::{self, PARTS};
 use super::profile;
 use super::weights::row_part;
@@ -68,37 +69,117 @@ impl Block {
         // One slot per chosen expert, then the shared expert's.
         let slots = s.top_k + 1;
         let began = profile::begin(gpu, stream)?;
+        let part_rows = s.inter / PARTS;
+        // More than one row: the rows that chose an expert share its weights.
+        let plan = match rows {
+            1 => None,
+            _ => {
+                gpu.synchronize(stream)?;
+                let mut chosen = vec![0u8; rows * s.top_k * 4];
+                let mut weights = vec![0u8; rows * s.top_k * 4];
+                gpu.copy_d2h(sc.chosen, &mut chosen)?;
+                gpu.copy_d2h(sc.weights, &mut weights)?;
+                let word = |c: &[u8]| [c[0], c[1], c[2], c[3]];
+                let chosen: Vec<u32> = chosen
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes(word(c)))
+                    .collect();
+                let weights: Vec<f32> = weights
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(word(c)))
+                    .collect();
+                let plan = Plan::new(&chosen, &weights, s.top_k, slots, s.experts);
+                sc.grouped.upload(gpu, &plan)?;
+                Some(plan)
+            }
+        };
         for part in held.range() {
-            let experts = ExpertPart {
-                slab: w.experts[part].context("a held part of the routed experts")?,
-                shared: [
-                    row_part(&w.shared_w1, part),
-                    row_part(&w.shared_w3, part),
-                    w.shared_w2[part].context("a held part of the shared expert")?,
-                ],
-            };
-            // A row's experts are its own: a launch set a row.
-            for row in 0..rows {
+            let slab = w.experts[part].context("a held part of the routed experts")?;
+            let shared = [
+                row_part(&w.shared_w1, part),
+                row_part(&w.shared_w3, part),
+                w.shared_w2[part].context("a held part of the shared expert")?,
+            ];
+            let out = sc.moe_parts.offset(part * sc.rows * slots * s.hidden * 4);
+            let Some(plan) = &plan else {
                 moe::experts(
                     gpu,
                     &k.moe,
-                    &experts,
-                    sc.quantized.offset(row * s.hidden * 2),
-                    sc.chosen.offset(row * s.top_k * 4),
-                    sc.weights.offset(row * s.top_k * 4),
+                    &ExpertPart { slab, shared },
+                    sc.quantized,
+                    sc.chosen,
+                    sc.weights,
                     ExpertScratch {
                         gate_up: sc.gate_up,
                         inner: sc.inner,
                     },
-                    sc.moe_parts
-                        .offset((part * sc.rows + row) * slots * s.hidden * 4),
+                    out,
                     s.top_k,
-                    s.inter / PARTS,
+                    part_rows,
                     s.hidden,
                     s.swiglu_limit,
                     stream,
                 )?;
+                continue;
+            };
+            moe_grouped::experts(
+                gpu,
+                &k.moe,
+                &slab,
+                plan,
+                &sc.grouped,
+                sc.quantized,
+                out,
+                part_rows,
+                s.hidden,
+                s.swiglu_limit,
+                stream,
+            )?;
+            // The shared expert, every row through the same weights: its gate
+            // and up rows side by side, and its partial in each row's last
+            // slot.
+            let [w1, w3, w2] = shared;
+            for (weights, at) in [(w1, 0), (w3, part_rows)] {
+                parts::project_rows(
+                    gpu,
+                    k.parts.fp8,
+                    sc.quantized,
+                    weights.data,
+                    weights.scales,
+                    sc.shared_gate_up.offset(at * 2),
+                    2,
+                    2 * part_rows,
+                    rows,
+                    part_rows,
+                    s.hidden,
+                    stream,
+                )?;
             }
+            moe_grouped::activate(
+                gpu,
+                &k.moe,
+                sc.shared_gate_up,
+                DevicePtr::NULL,
+                sc.shared_inner,
+                rows,
+                part_rows,
+                s.swiglu_limit,
+                stream,
+            )?;
+            parts::project_rows(
+                gpu,
+                k.parts.fp8_f32,
+                sc.shared_inner,
+                w2.data,
+                w2.scales,
+                out.offset(s.top_k * s.hidden * 4),
+                4,
+                slots * s.hidden,
+                rows,
+                s.hidden,
+                part_rows,
+                stream,
+            )?;
         }
         profile::end(gpu, stream, "experts", began)?;
         profile::stage(gpu, stream, "gather", || {
