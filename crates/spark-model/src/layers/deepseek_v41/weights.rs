@@ -98,7 +98,7 @@ pub struct BlockWeights {
     pub moe: MoeWeights,
 }
 
-fn tensor(store: &WeightStore, name: &str, dtype: WeightDtype) -> Result<DevicePtr> {
+pub(super) fn tensor(store: &WeightStore, name: &str, dtype: WeightDtype) -> Result<DevicePtr> {
     let t = store.get(name)?;
     ensure!(
         t.dtype == dtype,
@@ -108,7 +108,7 @@ fn tensor(store: &WeightStore, name: &str, dtype: WeightDtype) -> Result<DeviceP
     Ok(t.ptr)
 }
 
-fn fp8(store: &WeightStore, gpu: &dyn GpuBackend, prefix: &str) -> Result<Fp8Proj> {
+pub(super) fn fp8(store: &WeightStore, gpu: &dyn GpuBackend, prefix: &str) -> Result<Fp8Proj> {
     let weight = store.get(&format!("{prefix}.weight"))?;
     let scale = store.get(&format!("{prefix}.scale"))?;
     ensure!(

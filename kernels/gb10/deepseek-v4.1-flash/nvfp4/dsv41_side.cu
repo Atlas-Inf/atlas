@@ -56,6 +56,25 @@ extern "C" __global__ void dsv41_compress_pool(
     pooled[d] = __float2bfloat16(acc);
 }
 
+// Engram table rows as the values a lookup reads:
+//   out[i] = BF16(E4M3(rows[i]) * 2^(scales[i / 32] - 127))
+// rows [n] FP8 E4M3 and scales [n / 32] E8M0, as the table stores them.
+extern "C" __global__ void dsv41_engram_rows(
+    const unsigned char* __restrict__ rows,
+    const unsigned char* __restrict__ scales,
+    __nv_bfloat16* __restrict__ out,
+    unsigned int n) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const unsigned int b = rows[i];
+    const int e = (b >> 3) & 0xF;
+    const float m = (float)(b & 7);
+    // Subnormal below exponent 1; the bias is 7 and the mantissa 3 bits.
+    float v = e == 0 ? ldexpf(m, -9) : ldexpf(8.0f + m, e - 10);
+    if (b & 0x80) v = -v;
+    out[i] = __float2bfloat16(ldexpf(v, (int)scales[i / 32] - 127));
+}
+
 // Engram on one token per block. stream [T, hc, H] BF16 in place;
 // kv [T, (hc + 1) * H] BF16 is the lookup's projection, hc keys then one
 // value; weight [hc, H] FP32 is q_weight * k_weight.

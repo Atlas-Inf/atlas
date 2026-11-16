@@ -14,6 +14,7 @@ const MAX_K: usize = 5120;
 pub struct SideKernels {
     pub gemv_f32: KernelHandle,
     pub compress_pool: KernelHandle,
+    pub engram_rows: KernelHandle,
     pub engram_gate: KernelHandle,
 }
 
@@ -23,6 +24,7 @@ impl SideKernels {
         Ok(Self {
             gemv_f32: kernel("dsv41_gemv_f32")?,
             compress_pool: kernel("dsv41_compress_pool")?,
+            engram_rows: kernel("dsv41_engram_rows")?,
             engram_gate: kernel("dsv41_engram_gate")?,
         })
     }
@@ -73,6 +75,28 @@ pub fn compress_pool(
         .arg_ptr(pooled)
         .arg_u32(ratio as u32)
         .arg_u32(dim as u32)
+        .launch(stream)
+}
+
+/// `out` (`[values]` BF16) = Engram table rows as the values a lookup
+/// reads: `rows` (`[values]` FP8 E4M3, as stored) times `scales` (E8M0, one
+/// per 32 values).
+pub fn engram_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    rows: DevicePtr,
+    scales: DevicePtr,
+    out: DevicePtr,
+    values: usize,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(values as u32, THREADS), 1, 1])
+        .block([THREADS, 1, 1])
+        .arg_ptr(rows)
+        .arg_ptr(scales)
+        .arg_ptr(out)
+        .arg_u32(values as u32)
         .launch(stream)
 }
 

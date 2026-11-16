@@ -9,6 +9,7 @@ mod block_attention;
 mod block_index;
 mod block_moe;
 pub mod cache_recipe;
+pub mod engram;
 pub mod hc;
 pub mod index;
 pub mod index_recipe;
