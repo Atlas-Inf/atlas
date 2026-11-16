@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! One DeepSeek-V4.1 block on one token. A Hyper-Connection site is two
+//! One DeepSeek-V4.1 block on a batch of rows of one sequence: one for a
+//! decode step, up to `shape::ROWS` consecutive positions of a prefill
+//! chunk. A row's bytes do not depend on the rows beside it: every kernel
+//! here computes a row from that row alone, and the projections take the
+//! rows of a batch a tile at a time. A Hyper-Connection site is two
 //! launches and the experts are three (`hc::site`, `moe::experts`); each is
 //! held to the bytes of the plain kernels it stands for, which replay the
 //! reference a step at a time.
@@ -76,7 +80,7 @@ impl Block {
         )
     }
 
-    /// One Hyper-Connection site of a token (`hc::site`): the sublayer
+    /// One Hyper-Connection site of `rows` tokens (`hc::site`): the sublayer
     /// `before` into the stream, then the input of the next, collapsed with
     /// `pre_in`, in `scratch.normed` and `scratch.quantized`.
     #[allow(clippy::too_many_arguments)]
@@ -85,6 +89,7 @@ impl Block {
         gpu: &dyn GpuBackend,
         weights: &HcSite,
         before: Option<SublayerParts>,
+        rows: usize,
         streams: DevicePtr,
         pre_in: DevicePtr,
         pre_out: DevicePtr,
@@ -116,6 +121,7 @@ impl Block {
                 sc.comb,
                 norm_weight,
                 out,
+                rows,
                 stream,
             )
         })
@@ -126,17 +132,20 @@ impl Block {
         SublayerParts {
             parts: self.shared.scratch.attn_parts,
             slots: 1,
+            rows: self.shared.scratch.rows,
         }
     }
 
-    /// The attention sublayer of one token, up to its output in
-    /// [`Block::attention_parts`]. Its site collapses with `pre`, the
-    /// coefficients of the site before, and leaves its own in scratch.
+    /// The attention sublayer of `rows` tokens from row `row` of a pass, up
+    /// to its output in [`Block::attention_parts`]. Its site collapses with
+    /// `pre`, the coefficients of the site before, and leaves its own in
+    /// scratch.
     #[allow(clippy::too_many_arguments)]
     fn attend(
         &self,
         gpu: &dyn GpuBackend,
         row: usize,
+        rows: usize,
         streams: DevicePtr,
         pre: DevicePtr,
         state: &mut SeqState,
@@ -145,17 +154,24 @@ impl Block {
         stream: u64,
     ) -> Result<()> {
         let (sc, w) = (&self.shared.scratch, &self.weights);
+        anyhow::ensure!(
+            (1..=sc.rows).contains(&rows),
+            "layer {}: {rows} rows in a batch of at most {}",
+            self.index,
+            sc.rows
+        );
         self.site(
             gpu,
             &w.hc_attn,
             None,
+            rows,
             streams,
             pre,
             sc.site_pre,
             w.attn.norm,
             stream,
         )?;
-        self.attention(gpu, row, state, position, comm, stream)
+        self.attention(gpu, row, rows, state, position, comm, stream)
     }
 
     /// The rest of the block: the attention's output into the stream, the
@@ -165,6 +181,7 @@ impl Block {
     fn finish(
         &self,
         gpu: &dyn GpuBackend,
+        rows: usize,
         streams: DevicePtr,
         pre: DevicePtr,
         comm: Option<&dyn CommBackend>,
@@ -180,13 +197,14 @@ impl Block {
             gpu,
             &w.hc_ffn,
             Some(self.attention_parts()),
+            rows,
             streams,
             sc.site_pre,
             pre,
             w.moe.norm,
             stream,
         )?;
-        self.moe(gpu, comm, stream)?;
+        self.moe(gpu, rows, comm, stream)?;
         profile::stage(gpu, stream, "expand", || {
             hc::expand_parts(
                 gpu,
@@ -196,20 +214,23 @@ impl Block {
                 streams,
                 sc.post,
                 sc.comb,
+                rows,
                 stream,
             )
         })
     }
 
-    /// Run the block on one token of row `row` of a pass. `streams` is the
-    /// token's `[copies, hidden]` BF16 stream, updated in place. `pre` is
-    /// `[copies]` FP32: the coefficients this block's attention is collapsed
-    /// with on entry, the ones the next block's is on return.
+    /// Run the block on `rows` consecutive tokens of a sequence, from
+    /// `position`, which are rows `row..` of a pass. `streams` is their
+    /// `[rows, copies, hidden]` BF16 stream, updated in place. `pre` is
+    /// `[rows, copies]` FP32: the coefficients this block's attention is
+    /// collapsed with on entry, the ones the next block's is on return.
     #[allow(clippy::too_many_arguments)]
-    pub fn forward_row(
+    pub fn forward_rows(
         &self,
         gpu: &dyn GpuBackend,
         row: usize,
+        rows: usize,
         streams: DevicePtr,
         pre: DevicePtr,
         state: &mut SeqState,
@@ -217,8 +238,8 @@ impl Block {
         comm: Option<&dyn CommBackend>,
         stream: u64,
     ) -> Result<()> {
-        self.attend(gpu, row, streams, pre, state, position, comm, stream)?;
-        self.finish(gpu, streams, pre, comm, stream)
+        self.attend(gpu, row, rows, streams, pre, state, position, comm, stream)?;
+        self.finish(gpu, rows, streams, pre, comm, stream)
     }
 }
 
@@ -237,6 +258,7 @@ impl Block {
             k.parts.round,
             sc.attn_parts,
             sc.sublayer_out,
+            sc.rows * s.hidden,
             1,
             s.hidden,
             stream,
@@ -247,13 +269,21 @@ impl Block {
     /// Stand `output` (`[hidden]` BF16, as bytes) in for the attention's
     /// parts: the first part holds it and the others nothing.
     pub(super) fn set_attention_out(&self, gpu: &dyn GpuBackend, output: &[u8]) -> Result<()> {
-        let mut parts = vec![0u8; super::parts::PARTS * self.shared.shape.hidden * 4];
-        for (value, bits) in parts.chunks_exact_mut(4).zip(output.chunks_exact(2)) {
+        let (sc, hidden) = (&self.shared.scratch, self.shared.shape.hidden);
+        let mut first = vec![0u8; hidden * 4];
+        for (value, bits) in first.chunks_exact_mut(4).zip(output.chunks_exact(2)) {
             let bits = u16::from_le_bytes([bits[0], bits[1]]);
             value.copy_from_slice(&super::cache_recipe::bf16_to_f32(bits).to_le_bytes());
         }
         gpu.synchronize(gpu.default_stream())?;
-        gpu.copy_h2d(&parts, self.shared.scratch.attn_parts)
+        for part in 0..super::parts::PARTS {
+            let at = sc.attn_parts.offset(part * sc.rows * hidden * 4);
+            match part {
+                0 => gpu.copy_h2d(&first, at)?,
+                _ => gpu.copy_h2d(&vec![0u8; hidden * 4], at)?,
+            }
+        }
+        Ok(())
     }
 }
 

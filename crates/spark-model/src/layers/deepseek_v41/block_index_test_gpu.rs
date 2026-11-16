@@ -130,7 +130,7 @@ fn run(layer: usize) -> Result<Report> {
             hidden,
             stream,
         )?;
-        block.attention(gpu, 0, &mut state, position, None, stream)?;
+        block.attention(gpu, 0, 1, &mut state, position, None, stream)?;
         let kind = match step {
             None => 0,
             Some(_) if visible.is_multiple_of(2) => 1,

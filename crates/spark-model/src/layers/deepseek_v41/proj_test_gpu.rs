@@ -290,6 +290,7 @@ fn the_output_projection_replays_the_reference() -> Result<()> {
                 o.offset(row * GROUPS * group_in * 2),
                 w,
                 low.offset(row * GROUPS * RANK * 2),
+                1,
                 GROUPS,
                 RANK,
                 group_in,

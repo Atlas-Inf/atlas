@@ -61,11 +61,11 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_expert_in
         const unsigned char* w =
             dsv41_expert_weights(slab, chosen, slot, stride, data, scales, which);
         dsv41_gemv_staged_impl<1, true, false>(sh, staged, x, w, w + data, out, 1, rows, K, rows,
-                                               blockIdx.x);
+                                               blockIdx.x, K);
     } else {
         dsv41_gemv_staged_impl<1, false, false>(
             sh, staged, x, which ? shared_w3 : shared_w1, which ? shared_s3 : shared_s1, out, 1,
-            rows, K, rows, blockIdx.x);
+            rows, K, rows, blockIdx.x, K);
     }
 }
 
@@ -115,9 +115,10 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_expert_ou
     float* c = out + (size_t)slot * H;
     if (slot < routed) {
         const unsigned char* w = dsv41_expert_weights(slab, chosen, slot, stride, data, scales, 2);
-        dsv41_gemv_staged_impl<1, true, true>(sh, staged, a, w, w + data, c, 1, H, rows, H, blockIdx.x);
+        dsv41_gemv_staged_impl<1, true, true>(sh, staged, a, w, w + data, c, 1, H, rows, H, blockIdx.x,
+                                              rows);
     } else {
         dsv41_gemv_staged_impl<1, false, true>(sh, staged, a, shared_w2, shared_s2, c, 1, H, rows, H,
-                                           blockIdx.x);
+                                               blockIdx.x, rows);
     }
 }

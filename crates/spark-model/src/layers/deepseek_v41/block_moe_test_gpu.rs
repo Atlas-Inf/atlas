@@ -78,8 +78,8 @@ fn the_experts_in_three_launches_leave_the_bytes_of_one_at_a_time() -> Result<()
             s.hidden,
             stream,
         )?;
-        block.moe(gpu, None, stream)?;
-        let fused = read(sc.moe_parts, PARTS * slots * s.hidden * 4)?;
+        block.moe(gpu, 1, None, stream)?;
+        let fused = read(sc.moe_parts, PARTS * sc.rows * slots * s.hidden * 4)?;
         let chosen: Vec<usize> = read(sc.chosen, s.top_k * 4)?
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
@@ -135,7 +135,7 @@ fn the_experts_in_three_launches_leave_the_bytes_of_one_at_a_time() -> Result<()
                 parts::project(
                     gpu, out, inner, w2.data, w2.scales, one, s.hidden, rows, stream,
                 )?;
-                let at = (part * slots + slot) * s.hidden * 4;
+                let at = (part * sc.rows * slots + slot) * s.hidden * 4;
                 assert!(
                     read(one, s.hidden * 4)? == fused[at..at + s.hidden * 4],
                     "token {token}, part {part}, slot {slot}: the fused launch differs"

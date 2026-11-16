@@ -19,11 +19,12 @@ impl Block {
         SublayerParts {
             parts: self.shared.scratch.moe_parts,
             slots: self.shared.shape.top_k + 1,
+            rows: self.shared.scratch.rows,
         }
     }
 
-    /// The MoE of the token whose input is in `scratch.normed`, and in FP8
-    /// in `scratch.quantized`, into the parts of [`Block::moe_parts`].
+    /// The MoE of the `rows` tokens whose input is in `scratch.normed`, and in
+    /// FP8 in `scratch.quantized`, into the parts of [`Block::moe_parts`].
     ///
     /// Every expert is in four parts: a quarter of its hidden rows, and the
     /// columns of its down projection that read them. A part's output is an
@@ -33,6 +34,7 @@ impl Block {
     pub(super) fn moe(
         &self,
         gpu: &dyn GpuBackend,
+        rows: usize,
         comm: Option<&dyn CommBackend>,
         stream: u64,
     ) -> Result<()> {
@@ -54,7 +56,7 @@ impl Block {
                 sc.route_scores,
                 sc.chosen,
                 sc.weights,
-                1,
+                rows,
                 s.hidden,
                 s.experts,
                 s.top_k,
@@ -75,24 +77,28 @@ impl Block {
                     w.shared_w2[part].context("a held part of the shared expert")?,
                 ],
             };
-            moe::experts(
-                gpu,
-                &k.moe,
-                &experts,
-                sc.quantized,
-                sc.chosen,
-                sc.weights,
-                ExpertScratch {
-                    gate_up: sc.gate_up,
-                    inner: sc.inner,
-                },
-                sc.moe_parts.offset(part * slots * s.hidden * 4),
-                s.top_k,
-                s.inter / PARTS,
-                s.hidden,
-                s.swiglu_limit,
-                stream,
-            )?;
+            // A row's experts are its own: a launch set a row.
+            for row in 0..rows {
+                moe::experts(
+                    gpu,
+                    &k.moe,
+                    &experts,
+                    sc.quantized.offset(row * s.hidden * 2),
+                    sc.chosen.offset(row * s.top_k * 4),
+                    sc.weights.offset(row * s.top_k * 4),
+                    ExpertScratch {
+                        gate_up: sc.gate_up,
+                        inner: sc.inner,
+                    },
+                    sc.moe_parts
+                        .offset((part * sc.rows + row) * slots * s.hidden * 4),
+                    s.top_k,
+                    s.inter / PARTS,
+                    s.hidden,
+                    s.swiglu_limit,
+                    stream,
+                )?;
+            }
         }
         profile::end(gpu, stream, "experts", began)?;
         profile::stage(gpu, stream, "gather", || {
@@ -102,7 +108,8 @@ impl Block {
                 held,
                 sc.moe_parts,
                 sc.gather_recv,
-                slots * s.hidden * 4,
+                sc.rows * slots * s.hidden * 4,
+                rows * slots * s.hidden * 4,
                 stream,
             )
         })

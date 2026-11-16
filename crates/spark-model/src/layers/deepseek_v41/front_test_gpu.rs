@@ -127,6 +127,7 @@ fn the_front_in_one_launch_leaves_the_bytes_of_five() -> Result<()> {
             fused_slot,
             turn,
             q_rank,
+            1,
             eps,
             stream,
         )?;

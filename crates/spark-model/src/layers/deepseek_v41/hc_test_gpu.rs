@@ -313,6 +313,7 @@ fn a_site_in_two_launches_leaves_the_plain_kernels_bytes() -> Result<()> {
             let before = (slots > 0).then_some(SublayerParts {
                 parts: parts_dev,
                 slots,
+                rows: 1,
             });
             // The plain kernels, a launch each.
             if before.is_some() {
@@ -321,6 +322,7 @@ fn a_site_in_two_launches_leaves_the_plain_kernels_bytes() -> Result<()> {
                     part_kernels.combine,
                     parts_dev,
                     x,
+                    slots * hidden,
                     slots,
                     hidden,
                     stream,
@@ -394,6 +396,7 @@ fn a_site_in_two_launches_leaves_the_plain_kernels_bytes() -> Result<()> {
                 fused.comb,
                 norm.weight,
                 fused.out,
+                1,
                 stream,
             )?;
             assert!(
@@ -427,6 +430,7 @@ fn a_site_in_two_launches_leaves_the_plain_kernels_bytes() -> Result<()> {
                 fused.streams,
                 fused.post,
                 fused.comb,
+                1,
                 stream,
             )?;
             assert!(

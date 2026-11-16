@@ -234,9 +234,10 @@ extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_expand(
         o[j * H + d] = __float2bfloat16(dsv41_hc_expand_one(c, rv, p[j], xd, j, hc));
 }
 
-// The same expansion of one token from the sublayer's output as its four
-// parts (`dsv41_parts.cu`): x_parts [4, slots, H] FP32, combined and rounded
-// here, in place into the stream. Grid (ceil(H / 256)), block 256.
+// The same expansion from the sublayer's output as its four parts
+// (`dsv41_parts.cu`), combined and rounded here, in place into the stream.
+// A part is [rows, slots, H] FP32 with room for `part_rows` rows, of which
+// the grid's T are in use. Grid (ceil(H / 256), T), block 256.
 extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_expand_parts(
     const float* __restrict__ x_parts,
     __nv_bfloat16* streams,
@@ -244,26 +245,31 @@ extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_expand_p
     const float* __restrict__ comb,
     unsigned int H,
     unsigned int hc,
-    unsigned int slots) {
-    const unsigned int d = blockIdx.x * DSV41_HC_THREADS + threadIdx.x;
+    unsigned int slots,
+    unsigned int part_rows) {
+    const unsigned int t = blockIdx.y, d = blockIdx.x * DSV41_HC_THREADS + threadIdx.x;
     if (d >= H) return;
-    const float xd = dsv41_parts_combine(x_parts, slots, H, d);
+    const size_t row = (size_t)slots * H;
+    const float xd = dsv41_parts_combine(x_parts + t * row, part_rows * row, slots, H, d);
+    streams += (size_t)t * hc * H;
+    post += (size_t)t * hc;
+    comb += (size_t)t * hc * hc;
     float rv[DSV41_HC_MAX];
     for (unsigned int i = 0; i < hc; ++i) rv[i] = __bfloat162float(streams[i * H + d]);
     for (unsigned int j = 0; j < hc; ++j)
         streams[j * H + d] = __float2bfloat16(dsv41_hc_expand_one(comb, rv, post[j], xd, j, hc));
 }
 
-// A site of one token, first launch. Thread d:
+// A site, first launch, a token a row of the grid. Thread d:
 //
-//   1. With `x_parts` (the parts [4, slots, H] of the sublayer before this
-//      site), that sublayer's output into the stream, under the `post` and
-//      `comb` the site before left: `dsv41_hc_expand_parts`.
+//   1. With `x_parts` (the parts of the sublayer before this site, as
+//      `dsv41_hc_expand_parts` takes them), that sublayer's output into the
+//      stream, under the `post` and `comb` the site before left.
 //   2. Its share of this site's mix of the stream: `dsv41_hc_mix_sums`.
 //   3. The stream collapsed with `pre_in`, the coefficients of the site
 //      before: `dsv41_hc_collapse`, into `collapsed`.
 //
-// Grid (H / 256), block 256.
+// Grid (H / 256, T), block 256.
 extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_site_sums(
     const float* __restrict__ x_parts,
     __nv_bfloat16* streams,
@@ -275,14 +281,23 @@ extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_site_sum
     float* __restrict__ partials,
     unsigned int H,
     unsigned int hc,
-    unsigned int slots) {
-    const unsigned int d = blockIdx.x * DSV41_HC_THREADS + threadIdx.x;
+    unsigned int slots,
+    unsigned int part_rows) {
+    const unsigned int t = blockIdx.y, d = blockIdx.x * DSV41_HC_THREADS + threadIdx.x;
+    streams += (size_t)t * hc * H;
+    pre_in += (size_t)t * hc;
+    post += (size_t)t * hc;
+    comb += (size_t)t * hc * hc;
+    collapsed += (size_t)t * H;
+    partials += (size_t)t * gridDim.x * DSV41_MIX_SUMS;
     float v[DSV41_HC_MAX];
     if (d < H) {
         float rv[DSV41_HC_MAX];
         for (unsigned int j = 0; j < hc; ++j) rv[j] = __bfloat162float(streams[j * H + d]);
         if (x_parts) {
-            const float xd = dsv41_parts_combine(x_parts, slots, H, d);
+            const size_t row = (size_t)slots * H;
+            const float xd =
+                dsv41_parts_combine(x_parts + t * row, part_rows * row, slots, H, d);
             for (unsigned int j = 0; j < hc; ++j) {
                 const __nv_bfloat16 out =
                     __float2bfloat16(dsv41_hc_expand_one(comb, rv, post[j], xd, j, hc));
@@ -299,7 +314,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_site_sum
 
 #define DSV41_FINISH_THREADS 1024
 
-// A site of one token, second launch, two blocks of 1,024 threads:
+// A site, second launch, two blocks of 1,024 threads a token:
 //
 //   4. Block 0: `normed` = the RMS norm of `collapsed` under `norm_weight`
 //      (`rms_norm_vanilla` on a block of 1,024), and `quantized` its FP8
@@ -311,7 +326,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_HC_THREADS) dsv41_hc_site_sum
 //      Twenty Sinkhorn rounds are a chain nothing shortens, so they run
 //      beside the norm, not after it.
 //
-// Grid (2).
+// Grid (2, T).
 extern "C" __global__ void __launch_bounds__(DSV41_FINISH_THREADS) dsv41_hc_site_finish(
     const float* __restrict__ partials,
     const float* __restrict__ hc_scale,
@@ -329,16 +344,21 @@ extern "C" __global__ void __launch_bounds__(DSV41_FINISH_THREADS) dsv41_hc_site
     float norm_eps,
     float hc_eps) {
     const unsigned int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+    const unsigned int t = blockIdx.y, blocks = H / DSV41_HC_THREADS;
     __shared__ float mix[DSV41_MIX_SUMS];
     __shared__ volatile float comb[DSV41_HC_MAX * DSV41_HC_MAX];
     __shared__ float squares[DSV41_FINISH_THREADS / 32];
     if (blockIdx.x == 1) {
         if (warp == 0)
             dsv41_hc_coefficients(
-                partials, H / DSV41_HC_THREADS, mix, comb, lane, H, hc, sinkhorn_iters, norm_eps,
-                hc_eps, hc_scale, hc_base, pre_out, post, comb_out);
+                partials + (size_t)t * blocks * DSV41_MIX_SUMS, blocks, mix, comb, lane, H, hc,
+                sinkhorn_iters, norm_eps, hc_eps, hc_scale, hc_base, pre_out + (size_t)t * hc,
+                post + (size_t)t * hc, comb_out + (size_t)t * hc * hc);
         return;
     }
+    collapsed += (size_t)t * H;
+    normed += (size_t)t * H;
+    quantized += (size_t)t * H;
 
     // The norm of the collapsed vector, two values a word.
     const unsigned int half = H / 2;

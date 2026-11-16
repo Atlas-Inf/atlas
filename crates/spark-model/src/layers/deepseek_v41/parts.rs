@@ -24,6 +24,9 @@ use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 use super::weights::Slice;
 
 pub const PARTS: usize = 4;
+/// Rows of activations one launch of a projection takes; more go in turns,
+/// and a row's bytes do not depend on which rows share its launch.
+pub const TILE: usize = 8;
 /// The widest row a kernel that stages its weights has room for
 /// (`F4_MAX_BLOCKS` scale blocks in `dsv41_tc.cuh`).
 pub const STAGED_K: usize = 5120;
@@ -103,10 +106,43 @@ impl PartKernels {
     }
 }
 
-/// One vector `x` (`[k]` BF16) through a tensor-core projection `w` (`[n,
-/// k]`, FP4 or FP8 by `kernel`) under `scales` (`[n, k / 32]` E8M0), into
-/// `out` (`[n]`, BF16 or FP32 by `kernel`). `x` is FP8-rounded already, or
-/// with a `_q` kernel as it was computed.
+/// `rows` vectors `x` (`[rows, k]` BF16) through a tensor-core projection `w`
+/// (`[n, k]`, FP4 or FP8 by `kernel`) under `scales` (`[n, k / 32]` E8M0),
+/// into `out` (`[rows, n]`, BF16 or FP32 by `kernel`: `out_bytes` a value).
+/// `x` is FP8-rounded already, or with a `_q` kernel as it was computed.
+#[allow(clippy::too_many_arguments)]
+pub fn project_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    x: DevicePtr,
+    w: DevicePtr,
+    scales: DevicePtr,
+    out: DevicePtr,
+    out_bytes: usize,
+    rows: usize,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<()> {
+    ensure!(k.is_multiple_of(32), "dsv41_gemv_tc: k {k}");
+    for first in (0..rows).step_by(TILE) {
+        KernelLaunch::new(gpu, kernel)
+            .grid([div_ceil(n as u32, 16), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(x.offset(first * k * 2))
+            .arg_ptr(w)
+            .arg_ptr(scales)
+            .arg_ptr(out.offset(first * n * out_bytes))
+            .arg_u32((rows - first).min(TILE) as u32)
+            .arg_u32(n as u32)
+            .arg_u32(k as u32)
+            .arg_u32(n as u32)
+            .launch(stream)?;
+    }
+    Ok(())
+}
+
+/// [`project_rows`] of one vector.
 #[allow(clippy::too_many_arguments)]
 pub fn project(
     gpu: &dyn GpuBackend,
@@ -119,19 +155,8 @@ pub fn project(
     k: usize,
     stream: u64,
 ) -> Result<()> {
-    ensure!(k.is_multiple_of(32), "dsv41_gemv_tc: k {k}");
-    KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n as u32, 16), 1, 1])
-        .block([256, 1, 1])
-        .arg_ptr(x)
-        .arg_ptr(w)
-        .arg_ptr(scales)
-        .arg_ptr(out)
-        .arg_u32(1)
-        .arg_u32(n as u32)
-        .arg_u32(k as u32)
-        .arg_u32(n as u32)
-        .launch(stream)
+    // One row: the width of a value does not enter.
+    project_rows(gpu, kernel, x, w, scales, out, 0, 1, n, k, stream)
 }
 
 /// A projection's weights, rows and output, as `dsv41_fp8_gemv_two` takes
@@ -147,9 +172,10 @@ fn projection<'a>(
         .arg_u32(n as u32)
 }
 
-/// Two FP8 projections of one FP8-rounded vector `x` (`[k]` BF16) in one
-/// launch, each as [`project`] would compute it: `a` and `b` are `(weights,
-/// rows, output)`.
+/// Two FP8 projections of the same `rows` FP8-rounded vectors `x` (`[rows,
+/// k]` BF16) in one launch a tile of rows, each as [`project_rows`] would
+/// compute it: `a` and `b` are `(weights, n, output [rows, n])`.
+#[allow(clippy::too_many_arguments)]
 pub fn project_two(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -157,6 +183,7 @@ pub fn project_two(
     a: (Slice, usize, DevicePtr),
     b: (Slice, usize, DevicePtr),
     k: usize,
+    rows: usize,
     stream: u64,
 ) -> Result<()> {
     ensure!(
@@ -164,19 +191,24 @@ pub fn project_two(
         "dsv41_fp8_gemv_two: k {k}"
     );
     let blocks = div_ceil(a.1 as u32, 16) + div_ceil(b.1 as u32, 16);
-    let launch = KernelLaunch::new(gpu, kernel)
-        .grid([blocks, 1, 1])
-        .block([256, 1, 1])
-        .arg_ptr(x);
-    projection(projection(launch, a), b)
-        .arg_u32(k as u32)
-        .launch(stream)
+    for first in (0..rows).step_by(TILE) {
+        let from = |(w, n, out): (Slice, usize, DevicePtr)| (w, n, out.offset(first * n * 2));
+        let launch = KernelLaunch::new(gpu, kernel)
+            .grid([blocks, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(x.offset(first * k * 2));
+        projection(projection(launch, from(a)), from(b))
+            .arg_u32(k as u32)
+            .arg_u32((rows - first).min(TILE) as u32)
+            .launch(stream)?;
+    }
+    Ok(())
 }
 
-/// A block-diagonal FP8 projection in one launch: group `g` of `groups` is
-/// `out[g]` (`[n]` BF16) = `w[g]` (`[n, k]`) times the FP8 rounding of
-/// `x[g]` (`[k]` BF16, as it was computed). `x`, `w` and `out` hold the
-/// groups one after another.
+/// A block-diagonal FP8 projection, a launch a tile of rows: group `g` of
+/// `groups` is `out[row][g]` (`[n]` BF16) = `w[g]` (`[n, k]`) times the FP8
+/// rounding of `x[row][g]` (`[k]` BF16, as it was computed). `w` holds the
+/// groups one after another, `x` and `out` a row's groups one after another.
 #[allow(clippy::too_many_arguments)]
 pub fn project_groups(
     gpu: &dyn GpuBackend,
@@ -184,6 +216,7 @@ pub fn project_groups(
     x: DevicePtr,
     w: Slice,
     out: DevicePtr,
+    rows: usize,
     groups: usize,
     n: usize,
     k: usize,
@@ -193,25 +226,32 @@ pub fn project_groups(
         k.is_multiple_of(32) && k <= STAGED_K,
         "dsv41_fp8_gemv_groups_q: k {k}"
     );
-    KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n as u32, 16), groups as u32, 1])
-        .block([256, 1, 1])
-        .arg_ptr(x)
-        .arg_ptr(w.data)
-        .arg_ptr(w.scales)
-        .arg_ptr(out)
-        .arg_u32(n as u32)
-        .arg_u32(k as u32)
-        .launch(stream)
+    for first in (0..rows).step_by(TILE) {
+        KernelLaunch::new(gpu, kernel)
+            .grid([div_ceil(n as u32, 16), groups as u32, 1])
+            .block([256, 1, 1])
+            .arg_ptr(x.offset(first * groups * k * 2))
+            .arg_ptr(w.data)
+            .arg_ptr(w.scales)
+            .arg_ptr(out.offset(first * groups * n * 2))
+            .arg_u32(n as u32)
+            .arg_u32(k as u32)
+            .arg_u32((rows - first).min(TILE) as u32)
+            .launch(stream)?;
+    }
+    Ok(())
 }
 
-/// `out` (`[slots, n]` BF16) = the four parts of `parts` (`[PARTS, slots,
-/// n]` FP32) added in part order and rounded.
+/// `out` (`[slots, n]` BF16) = the four parts of `parts` added in part order
+/// and rounded. A part is `[slots, n]` FP32 and the next starts `stride`
+/// values on.
+#[allow(clippy::too_many_arguments)]
 pub fn round(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
     parts: DevicePtr,
     out: DevicePtr,
+    stride: usize,
     slots: usize,
     n: usize,
     stream: u64,
@@ -223,17 +263,20 @@ pub fn round(
         .arg_ptr(out)
         .arg_u32(slots as u32)
         .arg_u32(n as u32)
+        .arg_u32(stride as u32)
         .launch(stream)
 }
 
-/// The MoE's output `y` (`[n]` BF16): every slot of `parts` (`[PARTS, slots,
-/// n]` FP32) rounded as [`round`] rounds it, the slots added in FP32 in slot
-/// order, and the sum rounded.
+/// The MoE's output `y` (`[n]` BF16): every slot of `parts` rounded as
+/// [`round`] rounds it, the slots added in FP32 in slot order, and the sum
+/// rounded.
+#[allow(clippy::too_many_arguments)]
 pub fn combine(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
     parts: DevicePtr,
     y: DevicePtr,
+    stride: usize,
     slots: usize,
     n: usize,
     stream: u64,
@@ -245,6 +288,7 @@ pub fn combine(
         .arg_ptr(y)
         .arg_u32(slots as u32)
         .arg_u32(n as u32)
+        .arg_u32(stride as u32)
         .launch(stream)
 }
 
@@ -274,28 +318,38 @@ pub fn slice_columns(
         .launch(stream)
 }
 
-/// Bring the other ranks' parts of `base` (`[PARTS, part_bytes]`) here, and
-/// this rank's there. `recv` is scratch of the same size, for the transport
-/// that cannot gather in place.
+/// Bring the other ranks' parts of `base` here, and this rank's there. A
+/// part starts every `stride` bytes and `bytes` of it are in use. `recv` is
+/// scratch of `PARTS * bytes`, for the transport that cannot gather in place.
+#[allow(clippy::too_many_arguments)]
 pub fn gather(
     gpu: &dyn GpuBackend,
     comm: Option<&dyn CommBackend>,
     held: Held,
     base: DevicePtr,
     recv: DevicePtr,
-    part_bytes: usize,
+    stride: usize,
+    bytes: usize,
     stream: u64,
 ) -> Result<()> {
     let Some(comm) = comm.filter(|_| held.count < PARTS) else {
         return Ok(());
     };
-    let mine = held.count * part_bytes;
-    if comm.supports_gather_async(mine) && comm.gather_async(base.0, mine as i64, mine, stream)? {
+    let (mine, stride) = (held.count * bytes, held.count * stride);
+    ensure!(
+        held.count == 1 || stride == mine,
+        "deepseek_v41: a rank that holds {} parts gathers whole parts",
+        held.count
+    );
+    if comm.supports_gather_async(mine) && comm.gather_async(base.0, stride as i64, mine, stream)? {
         return Ok(());
     }
     gpu.synchronize(stream)?;
-    comm.all_gather(base.offset(held.first * part_bytes).0, recv.0, mine)?;
-    gpu.copy_d2d(recv, base, PARTS * part_bytes)
+    comm.all_gather(base.offset(held.first * stride).0, recv.0, mine)?;
+    for rank in 0..PARTS / held.count {
+        gpu.copy_d2d(recv.offset(rank * mine), base.offset(rank * stride), mine)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

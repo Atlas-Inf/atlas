@@ -128,9 +128,19 @@ impl BlockKernels {
     }
 }
 
-/// Working buffers for one token, shared by every block of a model: blocks
-/// run one after another.
+/// Rows of a sequence a block runs together: a decode step is one, a
+/// prefill chunk goes through in turns of this many.
+pub const ROWS: usize = 32;
+
+/// Working buffers for a batch of up to [`ROWS`] rows, shared by every block
+/// of a model: blocks run one after another. Unless it says otherwise a
+/// buffer is `[rows, ..]`, and those of the parts `[PARTS, rows, ..]`.
 pub struct Scratch {
+    /// Rows there is room for.
+    pub(super) rows: usize,
+    /// `[128 + rows, 512]` BF16: the window's keys in position order and
+    /// then the batch's own, when a batch is more than one row.
+    pub(super) chunk_keys: DevicePtr,
     pub(super) x: DevicePtr,
     pub(super) normed: DevicePtr,
     pub(super) quantized: DevicePtr,
@@ -193,14 +203,16 @@ impl Scratch {
         let f32s = |values: usize| gpu.alloc(values * 4);
         let copies = s.hc.copies;
         Ok(Self {
-            x: bf16(s.hidden)?,
-            normed: bf16(s.hidden)?,
-            quantized: bf16(s.hidden)?,
-            q_low: bf16(s.q_rank)?,
-            q_low_normed: bf16(s.q_rank)?,
-            q: bf16(s.heads * HEAD_DIM)?,
-            key: bf16(HEAD_DIM)?,
-            idx: f32s(MAX_KEYS)?,
+            rows: ROWS,
+            chunk_keys: bf16((WINDOW + ROWS) * HEAD_DIM)?,
+            x: bf16(ROWS * (s.hidden))?,
+            normed: bf16(ROWS * (s.hidden))?,
+            quantized: bf16(ROWS * (s.hidden))?,
+            q_low: bf16(ROWS * (s.q_rank))?,
+            q_low_normed: bf16(ROWS * (s.q_rank))?,
+            q: bf16(ROWS * (s.heads * HEAD_DIM))?,
+            key: bf16(ROWS * (HEAD_DIM))?,
+            idx: f32s(ROWS * (MAX_KEYS))?,
             positions: {
                 let table = f32s(max_positions.max(1))?;
                 let words: Vec<u8> = (0..max_positions as u32)
@@ -209,24 +221,24 @@ impl Scratch {
                 gpu.copy_h2d(&words, table)?;
                 table
             },
-            attended: bf16(s.heads * HEAD_DIM)?,
-            attn_records: gpu.alloc(attn_records(1, s.heads / PARTS))?,
-            o_low: bf16(s.o_groups * s.o_rank)?,
+            attended: bf16(ROWS * (s.heads * HEAD_DIM))?,
+            attn_records: gpu.alloc(attn_records(ROWS, s.heads / PARTS))?,
+            o_low: bf16(ROWS * (s.o_groups * s.o_rank))?,
             #[cfg(test)]
             sublayer_out: bf16(s.hidden)?,
             gate_up: bf16((s.top_k + 1) * 2 * s.inter / PARTS)?,
             inner: bf16((s.top_k + 1) * s.inter / PARTS)?,
-            attn_parts: f32s(PARTS * s.hidden)?,
-            moe_parts: f32s(PARTS * (s.top_k + 1) * s.hidden)?,
-            gather_recv: f32s(PARTS * (s.top_k + 1) * s.hidden)?,
-            route_scores: f32s(s.experts)?,
-            chosen: f32s(s.top_k)?,
-            weights: f32s(s.top_k)?,
+            attn_parts: f32s(ROWS * (PARTS * s.hidden))?,
+            moe_parts: f32s(ROWS * (PARTS * (s.top_k + 1) * s.hidden))?,
+            gather_recv: f32s(ROWS * (PARTS * (s.top_k + 1) * s.hidden))?,
+            route_scores: f32s(ROWS * (s.experts))?,
+            chosen: f32s(ROWS * (s.top_k))?,
+            weights: f32s(ROWS * (s.top_k))?,
             pooled: bf16(HEAD_DIM)?,
-            site_pre: f32s(copies)?,
-            hc_partials: gpu.alloc(s.hc.partials(1))?,
-            post: f32s(copies)?,
-            comb: f32s(copies * copies)?,
+            site_pre: f32s(ROWS * (copies))?,
+            hc_partials: gpu.alloc(s.hc.partials(ROWS))?,
+            post: f32s(ROWS * (copies))?,
+            comb: f32s(ROWS * (copies * copies))?,
             index_q: bf16(s.index_heads * INDEX_DIM)?,
             index_weights_f32: f32s(s.index_heads)?,
             index_weights: bf16(s.index_heads)?,

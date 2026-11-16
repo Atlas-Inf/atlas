@@ -198,6 +198,7 @@ impl Engram {
             self.kv_parts,
             self.gather_recv,
             w.rows * 4,
+            w.rows * 4,
             stream,
         )?;
         parts::round(
@@ -205,6 +206,7 @@ impl Engram {
             k.parts.round,
             self.kv_parts,
             self.kv,
+            w.rows,
             1,
             w.rows,
             stream,

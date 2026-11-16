@@ -60,11 +60,12 @@ pub struct Turn {
     pub rope: usize,
 }
 
-/// What one token's attention does between its first two projections and
-/// its heads, in one launch (`dsv41_front.cu`): `q_normed` (`[q_rank]` BF16)
-/// = the norm of `q_low` under `q_weight`, and `slot` (`[512]` BF16) = the
-/// FP8 form of the norm of `key` under `key_weight` turned to the token's
-/// position. The bytes of [`rotate`], [`fp8_quant_dequant`] and the RMS norm
+/// What each of `rows` tokens' attention does between its first two
+/// projections and its heads, in one launch (`dsv41_front.cu`): `q_normed`
+/// (`[rows, q_rank]` BF16) = the norm of `q_low` under `q_weight`, and `slot`
+/// (`[rows, 512]` BF16) = the FP8 form of the norm of `key` under
+/// `key_weight` turned to the token's position (`turn.positions`, a row a
+/// token). The bytes of [`rotate`], [`fp8_quant_dequant`] and the RMS norm
 /// launched one at a time.
 #[allow(clippy::too_many_arguments)]
 pub fn front(
@@ -78,6 +79,7 @@ pub fn front(
     slot: DevicePtr,
     turn: Turn,
     q_rank: usize,
+    rows: usize,
     eps: f32,
     stream: u64,
 ) -> Result<()> {
@@ -87,7 +89,7 @@ pub fn front(
         turn.rope
     );
     KernelLaunch::new(gpu, kernel)
-        .grid([1, 1, 1])
+        .grid([rows as u32, 1, 1])
         .block([1024, 1, 1])
         .arg_ptr(q_low)
         .arg_ptr(q_weight)

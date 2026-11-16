@@ -93,6 +93,7 @@ fn fused_projections_leave_the_bytes_of_their_launches() -> Result<()> {
             (a, n_a, fused),
             (b, n_b, fused.offset(n_a * 2)),
             k_a,
+            1,
             stream,
         )?;
         assert!(
@@ -129,6 +130,7 @@ fn fused_projections_leave_the_bytes_of_their_launches() -> Result<()> {
             x,
             rows_from(&wo_a, first * rank, group_in),
             fused,
+            1,
             groups,
             rank,
             group_in,

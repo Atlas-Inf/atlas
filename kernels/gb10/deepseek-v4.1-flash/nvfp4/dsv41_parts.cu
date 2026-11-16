@@ -17,16 +17,17 @@
 
 #include "dsv41_common.cuh"
 
-// out[slot, d] = BF16(sum over parts of parts[part, slot, d]). parts is
-// [4, slots, n] FP32, out [slots, n] BF16.
+// out[slot, d] = BF16(sum over parts of parts[part, slot, d]). A part is
+// [slots, n] FP32 and the next starts `stride` values on; out [slots, n] BF16.
 extern "C" __global__ void dsv41_parts_round(
     const float* __restrict__ parts,
     __nv_bfloat16* __restrict__ out,
     unsigned int slots,
-    unsigned int n) {
+    unsigned int n,
+    unsigned int stride) {
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= slots * n) return;
-    out[i] = __float2bfloat16(dsv41_parts_sum(parts, (size_t)slots * n, i));
+    out[i] = __float2bfloat16(dsv41_parts_sum(parts, stride, i));
 }
 
 // The MoE's output: every slot (the chosen experts in expert order, then the
@@ -36,10 +37,11 @@ extern "C" __global__ void dsv41_moe_combine(
     const float* __restrict__ parts,
     __nv_bfloat16* __restrict__ y,
     unsigned int slots,
-    unsigned int n) {
+    unsigned int n,
+    unsigned int stride) {
     const unsigned int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= n) return;
-    y[d] = __float2bfloat16(dsv41_parts_combine(parts, slots, n, d));
+    y[d] = __float2bfloat16(dsv41_parts_combine(parts, stride, slots, n, d));
 }
 
 // dst[row, 0..width) = src[row, first..first + width), bytes: one part's

@@ -79,8 +79,9 @@ impl Block {
     }
 
     /// What each of the first `visible` index keys scores for the token whose
-    /// attention input is in `scratch.normed` and whose low-rank query,
-    /// normed, is in `scratch.q_low_normed`. `at` holds the token's position.
+    /// attention input is `normed` and whose low-rank query, normed, is
+    /// `q_low_normed`. `at` holds the token's position.
+    #[allow(clippy::too_many_arguments)]
     fn index_scores(
         &self,
         gpu: &dyn GpuBackend,
@@ -88,6 +89,8 @@ impl Block {
         keys: DevicePtr,
         visible: usize,
         at: DevicePtr,
+        normed: DevicePtr,
+        q_low_normed: DevicePtr,
         stream: u64,
     ) -> Result<Vec<f32>> {
         let (s, k, sc) = (
@@ -112,7 +115,7 @@ impl Block {
         parts::project(
             gpu,
             k.parts.fp8_q,
-            sc.q_low_normed,
+            q_low_normed,
             w.wq_b.w.data,
             w.wq_b.w.scales,
             sc.index_q,
@@ -145,7 +148,7 @@ impl Block {
         side::gemv_f32(
             gpu,
             k.side.gemv_f32,
-            sc.normed,
+            normed,
             w.head_weights,
             sc.index_weights_f32,
             s.index_heads,
@@ -192,6 +195,7 @@ impl Block {
     /// The compressed positions, of `visible`, that an index source's query
     /// attends to, in ascending order. The candidate source also leaves the
     /// positions the index sources after it may choose from.
+    #[allow(clippy::too_many_arguments)]
     fn choose(
         &self,
         gpu: &dyn GpuBackend,
@@ -200,6 +204,8 @@ impl Block {
         candidates: &mut Vec<bool>,
         visible: usize,
         at: DevicePtr,
+        normed: DevicePtr,
+        q_low_normed: DevicePtr,
         stream: u64,
     ) -> Result<Vec<i32>> {
         let s = &self.shared.shape;
@@ -211,7 +217,8 @@ impl Block {
             }
             return Ok((0..visible as i32).collect());
         }
-        let mut scores = self.index_scores(gpu, w, keys, visible, at, stream)?;
+        let mut scores =
+            self.index_scores(gpu, w, keys, visible, at, normed, q_low_normed, stream)?;
         match self.candidates {
             Candidates::None => {}
             Candidates::Source => {
@@ -233,7 +240,9 @@ impl Block {
     /// The compressed keys the query of row `row` at `position` reads, and
     /// the positions among them it attends to. A source layer publishes its
     /// own for the layers after it; the others read what the latest source
-    /// published. `at` holds `position`.
+    /// published. `at` holds `position`; `normed` and `q_low_normed` are the
+    /// row's attention input and its low-rank query.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn compressed_row(
         &self,
         gpu: &dyn GpuBackend,
@@ -241,6 +250,8 @@ impl Block {
         state: &SeqState,
         position: usize,
         at: DevicePtr,
+        normed: DevicePtr,
+        q_low_normed: DevicePtr,
         stream: u64,
     ) -> Result<(DevicePtr, Vec<i32>)> {
         let visible = visible_groups(position, self.ratio);
@@ -260,7 +271,17 @@ impl Block {
         );
         if let Some(w) = &self.weights.indexer {
             let keys = mine.index_keys;
-            mine.chosen = self.choose(gpu, w, keys, &mut mine.candidates, visible, at, stream)?;
+            mine.chosen = self.choose(
+                gpu,
+                w,
+                keys,
+                &mut mine.candidates,
+                visible,
+                at,
+                normed,
+                q_low_normed,
+                stream,
+            )?;
         }
         ensure!(
             mine.chosen.len() == visible.min(self.shared.shape.index_topk),

@@ -76,7 +76,8 @@ template <int NT, bool FP4>
 __device__ __forceinline__ void f4_load(
     F4Chunk<NT>& t, const unsigned char* w0p, const unsigned char* w1p,
     const unsigned char* s0p, const unsigned char* s1p,
-    const __nv_bfloat16* A, unsigned int g, unsigned int M, unsigned int K,
+    const __nv_bfloat16* A, unsigned int a_stride, unsigned int g, unsigned int M,
+    unsigned int K,
     unsigned int ch, unsigned int kb, bool v0, bool v1
 ) {
     const uint4 z = make_uint4(0u, 0u, 0u, 0u);
@@ -97,7 +98,7 @@ __device__ __forceinline__ void f4_load(
     for (int i = 0; i < NT; i++) {
         const unsigned int row = 8u * i + g;
         if (row < M) {
-            const uint4* xp = (const uint4*)(A + (unsigned long long)row * K + kb);
+            const uint4* xp = (const uint4*)(A + (unsigned long long)row * a_stride + kb);
             t.x[i][0] = xp[0];
             t.x[i][1] = xp[1];
         }
@@ -109,7 +110,8 @@ __device__ __forceinline__ void f4_load(
 template <int NT, bool FP4>
 __device__ __forceinline__ void f4_take(
     F4Chunk<NT>& t, const unsigned char* w0, const unsigned char* w1, unsigned int s0,
-    unsigned int s1, const __nv_bfloat16* A, unsigned int g, unsigned int M, unsigned int K,
+    unsigned int s1, const __nv_bfloat16* A, unsigned int a_stride, unsigned int g, unsigned int M,
+    unsigned int K,
     unsigned int kb, bool v0, bool v1
 ) {
     const uint4 z = make_uint4(0u, 0u, 0u, 0u);
@@ -128,7 +130,7 @@ __device__ __forceinline__ void f4_take(
     for (int i = 0; i < NT; i++) {
         const unsigned int row = 8u * i + g;
         if (row < M) {
-            const uint4* xp = (const uint4*)(A + (unsigned long long)row * K + kb);
+            const uint4* xp = (const uint4*)(A + (unsigned long long)row * a_stride + kb);
             t.x[i][0] = xp[0];
             t.x[i][1] = xp[1];
         }
@@ -307,7 +309,8 @@ __device__ __forceinline__ void dsv41_gemv_tc_impl(
     unsigned int N,
     unsigned int K,
     unsigned int out_stride,
-    unsigned int cta
+    unsigned int cta,
+    unsigned int a_stride
 ) {
     f4_codes<FP4>(sh.code);
     __syncthreads();
@@ -326,14 +329,14 @@ __device__ __forceinline__ void dsv41_gemv_tc_impl(
     F4Chunk<NT> cur, nxt;
     unsigned int ch = warp;
     if (ch < chunks) {
-        f4_load<NT, FP4>(cur, r.w0p, r.w1p, r.s0p, r.s1p, A, g, M, K, ch, ch * 64u + 16u * c,
+        f4_load<NT, FP4>(cur, r.w0p, r.w1p, r.s0p, r.s1p, A, a_stride, g, M, K, ch, ch * 64u + 16u * c,
                          r.v0, r.v1);
         f4_prepare<NT, IN>(cur, g, M);
     }
     for (; ch < chunks; ch += F4_WARPS) {
         const unsigned int next = ch + F4_WARPS;
         if (next < chunks) {
-            f4_load<NT, FP4>(nxt, r.w0p, r.w1p, r.s0p, r.s1p, A, g, M, K, next,
+            f4_load<NT, FP4>(nxt, r.w0p, r.w1p, r.s0p, r.s1p, A, a_stride, g, M, K, next,
                              next * 64u + 16u * c, r.v0, r.v1);
             f4_prepare<NT, IN>(nxt, g, M);
         }
@@ -374,7 +377,8 @@ __device__ __forceinline__ void dsv41_gemv_staged_impl(
     unsigned int N,
     unsigned int K,
     unsigned int out_stride,
-    unsigned int cta
+    unsigned int cta,
+    unsigned int a_stride
 ) {
     f4_codes<FP4>(sh.code);
     const unsigned int warp = threadIdx.x / F4_WARP;
@@ -438,7 +442,7 @@ __device__ __forceinline__ void dsv41_gemv_staged_impl(
             const unsigned int block = ch * 2u + (c >> 1);
             F4Chunk<NT> cur;
             f4_take<NT, FP4>(cur, rows[g] + at, rows[g + 8u] + at, st_sh.s[g * blocks + block],
-                             st_sh.s[(g + 8u) * blocks + block], A, g, M, K, ch * 64u + 16u * c, v0,
+                             st_sh.s[(g + 8u) * blocks + block], A, a_stride, g, M, K, ch * 64u + 16u * c, v0,
                              v1);
             f4_prepare<NT, IN>(cur, g, M);
             f4_chunk<NT, FP4>(acc, cur, sh.code);

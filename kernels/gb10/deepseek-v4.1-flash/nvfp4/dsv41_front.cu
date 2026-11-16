@@ -10,7 +10,7 @@
 // window in FP8. That was five launches of a block each, and at one token a
 // launch costs more than these 1,792 values.
 //
-// One block of 1,024 threads. Each norm is `rms_norm_vanilla` as it runs on
+// A block of 1,024 threads a token. Each norm is `rms_norm_vanilla` as it runs on
 // its own block (1,024 threads for the query's 1,280 values, 512 for the
 // key's 512): the same threads add the same pairs, the warps reduce by the
 // same shuffles, and the warps' sums meet the same way. The turn is
@@ -56,10 +56,11 @@ __device__ __forceinline__ void dsv41_squares_block(unsigned int threads, float*
     if (tid == 0) warp_sums[0] = total;
 }
 
-// q_low [q_rank] and key [512] BF16, as projected. q_normed [q_rank] = the
-// norm of q_low under q_weight. slot [512] = fp8(turn(norm of key under
-// key_weight, position)), the turn over the last `rope` values by
+// q_low [T, q_rank] and key [T, 512] BF16, as projected. q_normed [T, q_rank]
+// = the norm of q_low under q_weight. slot [T, 512] = fp8(turn(norm of key
+// under key_weight, position[T])), the turn over the last `rope` values by
 // freqs [rope / 2] radians a position. q_rank is even and at most 2,048.
+// Grid (T).
 extern "C" __global__ void __launch_bounds__(DSV41_FRONT_THREADS) dsv41_attn_front(
     const __nv_bfloat16* __restrict__ q_low,
     const __nv_bfloat16* __restrict__ q_weight,
@@ -72,7 +73,11 @@ extern "C" __global__ void __launch_bounds__(DSV41_FRONT_THREADS) dsv41_attn_fro
     unsigned int q_rank,
     unsigned int rope,
     float eps) {
-    const unsigned int tid = threadIdx.x;
+    const unsigned int tid = threadIdx.x, t = blockIdx.x;
+    q_low += (size_t)t * q_rank;
+    q_normed += (size_t)t * q_rank;
+    key += (size_t)t * DSV41_KEY;
+    slot += (size_t)t * DSV41_KEY;
     __shared__ float q_squares[DSV41_FRONT_WARPS];
     __shared__ float key_squares[DSV41_FRONT_WARPS];
     __shared__ float normed[DSV41_KEY];
@@ -105,7 +110,7 @@ extern "C" __global__ void __launch_bounds__(DSV41_FRONT_THREADS) dsv41_attn_fro
     __syncthreads();
     if (tid < rope / 2) {
         float* pair = normed + (DSV41_KEY - rope) + 2 * tid;
-        dsv41_rotate_pair(pair[0], pair[1], (float)position[0] * freqs[tid], false, pair[0],
+        dsv41_rotate_pair(pair[0], pair[1], (float)position[t] * freqs[tid], false, pair[0],
                           pair[1]);
     }
     __syncthreads();

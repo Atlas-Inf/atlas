@@ -27,6 +27,7 @@ use super::index::INDEX_DIM;
 use super::ops::HEAD_DIM;
 use super::parts::Held;
 use super::profile;
+use super::shape::ROWS;
 use super::weights::BlockWeights;
 use crate::layer::{ForwardContext, LayerState, TransformerLayer};
 
@@ -187,17 +188,15 @@ impl Layer {
     }
 }
 
-impl TransformerLayer for Layer {
-    fn decode(
+impl Layer {
+    /// The layer on `rows` consecutive tokens of one sequence, from
+    /// `position`: rows of the arena from `hidden`'s.
+    fn run(
         &self,
         hidden: DevicePtr,
-        _residual: DevicePtr,
+        rows: usize,
         state: &mut dyn LayerState,
-        _kv_cache: &mut PagedKvCache,
-        seq_len: usize,
-        _block_table: &mut Vec<u32>,
-        _disk_block_ids: &mut Vec<u32>,
-        _disk_last_offloaded_per_layer: &mut Vec<u32>,
+        position: usize,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -214,21 +213,28 @@ impl TransformerLayer for Layer {
             // Every copy of the stream starts as the embedding, and the
             // first block collapses with the identity mix.
             gpu.synchronize(stream)?;
-            for copy in 0..copies {
-                gpu.copy_d2d(hidden, streams.offset(copy * hidden_bytes), hidden_bytes)?;
-            }
             let identity: Vec<u8> = IDENTITY_PRE.iter().flat_map(|v| v.to_le_bytes()).collect();
-            gpu.copy_h2d(&identity, pre)?;
+            for r in 0..rows {
+                let token = hidden.offset(r * hidden_bytes);
+                for copy in 0..copies {
+                    let to = streams.offset((r * copies + copy) * hidden_bytes);
+                    gpu.copy_d2d(token, to, hidden_bytes)?;
+                }
+                gpu.copy_h2d(&identity, pre.offset(r * copies * 4))?;
+            }
         }
-        if let Some(ahead) = &self.ahead {
-            self.look_ahead(ahead, row, state, seq_len, ctx, stream)?;
-        }
-        if let Some(lookup) = &self.lookup {
-            self.look_up(lookup, row, streams, state, seq_len, ctx, stream)?;
+        for r in 0..rows {
+            let stream_of = streams.offset(r * copies * hidden_bytes);
+            if let Some(ahead) = &self.ahead {
+                self.look_ahead(ahead, row + r, state, position + r, ctx, stream)?;
+            }
+            if let Some(lookup) = &self.lookup {
+                self.look_up(lookup, row + r, stream_of, state, position + r, ctx, stream)?;
+            }
         }
         let comm = ctx.comm.filter(|_| ctx.config.ep_world_size > 1);
         self.block
-            .forward_row(gpu, row, streams, pre, state, seq_len, comm, stream)?;
+            .forward_rows(gpu, row, rows, streams, pre, state, position, comm, stream)?;
         if self.last {
             // Before the head, the stream collapses with the last mix.
             hc::collapse(
@@ -238,10 +244,54 @@ impl TransformerLayer for Layer {
                 streams,
                 pre,
                 hidden,
-                1,
+                rows,
                 stream,
             )?;
-            profile::token_done();
+            (0..rows).for_each(|_| profile::token_done());
+        }
+        Ok(())
+    }
+}
+
+impl TransformerLayer for Layer {
+    fn decode(
+        &self,
+        hidden: DevicePtr,
+        _residual: DevicePtr,
+        state: &mut dyn LayerState,
+        _kv_cache: &mut PagedKvCache,
+        seq_len: usize,
+        _block_table: &mut Vec<u32>,
+        _disk_block_ids: &mut Vec<u32>,
+        _disk_last_offloaded_per_layer: &mut Vec<u32>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.run(hidden, 1, state, seq_len, ctx, stream)
+    }
+
+    /// A chunk of a prompt, a batch of rows at a time: the bytes of a
+    /// decode step for each row.
+    fn prefill(
+        &self,
+        hidden: DevicePtr,
+        _residual: DevicePtr,
+        num_tokens: usize,
+        state: &mut dyn LayerState,
+        _kv_cache: &mut PagedKvCache,
+        seq_len_start: usize,
+        _block_table: &mut Vec<u32>,
+        _disk_block_ids: &mut Vec<u32>,
+        _disk_last_offloaded_per_layer: &mut Vec<u32>,
+        _kv_write_start: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let width = self.block.shared.shape.hidden * 2;
+        for first in (0..num_tokens).step_by(ROWS) {
+            let rows = (num_tokens - first).min(ROWS);
+            let at = hidden.offset(first * width);
+            self.run(at, rows, state, seq_len_start + first, ctx, stream)?;
         }
         Ok(())
     }

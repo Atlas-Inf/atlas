@@ -190,16 +190,17 @@ pub fn expand(
 }
 
 /// A sublayer's output as the four parts it was computed in (`parts.rs`):
-/// `[PARTS, slots, hidden]` FP32, a slot per expert of the MoE and one for
-/// the attention.
+/// `[PARTS, rows, slots, hidden]` FP32, a slot per expert of the MoE and one
+/// for the attention, with room for `rows` tokens in a part.
 #[derive(Clone, Copy)]
 pub struct SublayerParts {
     pub parts: DevicePtr,
     pub slots: usize,
+    pub rows: usize,
 }
 
-/// [`expand`] of one token in place from a sublayer's parts, combined and
-/// rounded in the same launch.
+/// [`expand`] of `tokens` tokens in place from a sublayer's parts, combined
+/// and rounded in the same launch.
 #[allow(clippy::too_many_arguments)]
 pub fn expand_parts(
     gpu: &dyn GpuBackend,
@@ -209,10 +210,11 @@ pub fn expand_parts(
     streams: DevicePtr,
     post: DevicePtr,
     comb: DevicePtr,
+    tokens: usize,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid(shape.grid(1))
+        .grid(shape.grid(tokens))
         .block([THREADS, 1, 1])
         .arg_ptr(x.parts)
         .arg_ptr(streams)
@@ -221,10 +223,11 @@ pub fn expand_parts(
         .arg_u32(shape.hidden as u32)
         .arg_u32(shape.copies as u32)
         .arg_u32(x.slots as u32)
+        .arg_u32(x.rows as u32)
         .launch(stream)
 }
 
-/// The vectors a site leaves for its sublayer, `[hidden]` BF16 each: the
+/// The vectors a site leaves for its sublayer, `[tokens, hidden]` BF16 each: the
 /// collapsed stream, its norm, and the norm's FP8 form. `partials` is the
 /// mix's scratch ([`HcShape::partials`] bytes).
 #[derive(Clone, Copy)]
@@ -235,7 +238,7 @@ pub struct SiteOut {
     pub partials: DevicePtr,
 }
 
-/// A whole site of one token in two launches, with the bytes of the
+/// A whole site of `tokens` tokens in two launches, with the bytes of the
 /// launches they stand for: [`expand_parts`] of the sublayer before
 /// (`before`, with the `post` and `comb` the site before left), then [`mix`]
 /// (`pre_out`, and `post` and `comb` replaced), [`collapse`] with `pre_in`,
@@ -254,6 +257,7 @@ pub fn site(
     comb: DevicePtr,
     norm_weight: DevicePtr,
     out: SiteOut,
+    tokens: usize,
     stream: u64,
 ) -> Result<()> {
     shape.check()?;
@@ -265,9 +269,10 @@ pub fn site(
     let before = before.unwrap_or(SublayerParts {
         parts: DevicePtr::NULL,
         slots: 0,
+        rows: 0,
     });
     KernelLaunch::new(gpu, kernels.site_sums)
-        .grid(shape.grid(1))
+        .grid(shape.grid(tokens))
         .block([THREADS, 1, 1])
         .arg_ptr(before.parts)
         .arg_ptr(streams)
@@ -280,10 +285,11 @@ pub fn site(
         .arg_u32(shape.hidden as u32)
         .arg_u32(shape.copies as u32)
         .arg_u32(before.slots as u32)
+        .arg_u32(before.rows as u32)
         .launch(stream)?;
     // The norm and its rounding on one block, the coefficients on another.
     KernelLaunch::new(gpu, kernels.site_finish)
-        .grid([2, 1, 1])
+        .grid([2, tokens as u32, 1])
         .block([FINISH_THREADS, 1, 1])
         .arg_ptr(out.partials)
         .arg_ptr(weights.scale)
