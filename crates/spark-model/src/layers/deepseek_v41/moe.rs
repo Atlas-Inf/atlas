@@ -320,7 +320,7 @@ pub fn experts(
     stream: u64,
 ) -> Result<()> {
     ensure!(
-        rows.is_multiple_of(32) && hidden.is_multiple_of(32),
+        rows.is_multiple_of(32) && hidden.is_multiple_of(32) && hidden <= super::parts::STAGED_K,
         "dsv41_expert: {rows} rows of {hidden}"
     );
     let slots = top_k as u32 + 1;

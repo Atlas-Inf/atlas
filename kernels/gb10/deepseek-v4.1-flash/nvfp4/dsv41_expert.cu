@@ -10,9 +10,9 @@
 // activations are one block, and every projection out is a row of another.
 //
 // A block computes what the same block of `dsv41_{fp4,fp8}_gemv_tc8[_f32]`
-// computes (`dsv41_tc.cuh`), and the activation is `dsv41_swiglu` then
-// `dsv41_fp8_quant_dequant` (`dsv41_common.cuh`), so the bytes are those of
-// the launches these replace.
+// computes, from staged weights (`dsv41_tc.cuh`), and the activation is
+// `dsv41_swiglu` then `dsv41_fp8_quant_dequant` (`dsv41_common.cuh`), so the
+// bytes are those of the launches these replace.
 //
 // A slot is an expert: the chosen in ascending expert order (`chosen`, as
 // `dsv41_moe_pick` leaves them with `by_expert`), then the shared expert.
@@ -53,16 +53,19 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_expert_in
     unsigned long long stride,
     unsigned int data,
     unsigned int scales) {
+    __shared__ F4Shared<1> sh;
+    __shared__ F4Staged staged;
     const unsigned int slot = blockIdx.y / 2, which = blockIdx.y & 1u;
     __nv_bfloat16* out = gate_up + (size_t)blockIdx.y * rows;
     if (slot < routed) {
         const unsigned char* w =
             dsv41_expert_weights(slab, chosen, slot, stride, data, scales, which);
-        dsv41_gemv_tc_impl<1, true, false>(x, w, w + data, out, 1, rows, K, rows, blockIdx.x);
+        dsv41_gemv_staged_impl<1, true, false>(sh, staged, x, w, w + data, out, 1, rows, K, rows,
+                                               blockIdx.x);
     } else {
-        dsv41_gemv_tc_impl<1, false, false>(
-            x, which ? shared_w3 : shared_w1, which ? shared_s3 : shared_s1, out, 1, rows, K, rows,
-            blockIdx.x);
+        dsv41_gemv_staged_impl<1, false, false>(
+            sh, staged, x, which ? shared_w3 : shared_w1, which ? shared_s3 : shared_s1, out, 1,
+            rows, K, rows, blockIdx.x);
     }
 }
 
@@ -105,13 +108,16 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_expert_ou
     unsigned long long stride,
     unsigned int data,
     unsigned int scales) {
+    __shared__ F4Shared<1> sh;
+    __shared__ F4Staged staged;
     const unsigned int slot = blockIdx.y;
     const __nv_bfloat16* a = inner + (size_t)slot * rows;
     float* c = out + (size_t)slot * H;
     if (slot < routed) {
         const unsigned char* w = dsv41_expert_weights(slab, chosen, slot, stride, data, scales, 2);
-        dsv41_gemv_tc_impl<1, true, true>(a, w, w + data, c, 1, H, rows, H, blockIdx.x);
+        dsv41_gemv_staged_impl<1, true, true>(sh, staged, a, w, w + data, c, 1, H, rows, H, blockIdx.x);
     } else {
-        dsv41_gemv_tc_impl<1, false, true>(a, shared_w2, shared_s2, c, 1, H, rows, H, blockIdx.x);
+        dsv41_gemv_staged_impl<1, false, true>(sh, staged, a, shared_w2, shared_s2, c, 1, H, rows, H,
+                                           blockIdx.x);
     }
 }

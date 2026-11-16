@@ -24,6 +24,9 @@ use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 use super::weights::Slice;
 
 pub const PARTS: usize = 4;
+/// The widest row a kernel that stages its weights has room for
+/// (`F4_MAX_BLOCKS` scale blocks in `dsv41_tc.cuh`).
+pub const STAGED_K: usize = 5120;
 
 /// The parts one rank computes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,7 +159,10 @@ pub fn project_two(
     k: usize,
     stream: u64,
 ) -> Result<()> {
-    ensure!(k.is_multiple_of(32), "dsv41_fp8_gemv_two: k {k}");
+    ensure!(
+        k.is_multiple_of(32) && k <= STAGED_K,
+        "dsv41_fp8_gemv_two: k {k}"
+    );
     let blocks = div_ceil(a.1 as u32, 16) + div_ceil(b.1 as u32, 16);
     let launch = KernelLaunch::new(gpu, kernel)
         .grid([blocks, 1, 1])
@@ -183,7 +189,10 @@ pub fn project_groups(
     k: usize,
     stream: u64,
 ) -> Result<()> {
-    ensure!(k.is_multiple_of(32), "dsv41_fp8_gemv_groups_q: k {k}");
+    ensure!(
+        k.is_multiple_of(32) && k <= STAGED_K,
+        "dsv41_fp8_gemv_groups_q: k {k}"
+    );
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n as u32, 16), groups as u32, 1])
         .block([256, 1, 1])

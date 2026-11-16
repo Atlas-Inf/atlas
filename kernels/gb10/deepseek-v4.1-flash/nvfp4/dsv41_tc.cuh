@@ -11,6 +11,18 @@
 // were computed and rounds them here, as `dsv41_fp8_quant_dequant` does (a
 // lane holds 16 of a scale block's 32 values and the lane beside it the
 // rest). A block pays for it again, which costs about what the launch did.
+//
+// How the weights reach the block: two forms with the same sums in the same
+// order. In `dsv41_gemv_tc_impl` a warp loads its weights as it uses them,
+// one chunk ahead. It waits on memory for each load, and on cold weights
+// that wait, not the arithmetic, is nine tenths of its time. In
+// `dsv41_gemv_staged_impl` a block stages its 16 rows into shared memory
+// with asynchronous copies, 512 K values of every row at a time and three
+// such stages in flight, its scales whole and first, and the warps multiply
+// from there. Staging wins where a row is long (K of 4,096 and 5,120, by a
+// quarter), and loses where it is short and the blocks many, for it costs a
+// block a barrier a stage and 27 KB of shared memory. Measured on GB10, on
+// weights no cache held.
 
 #pragma once
 
@@ -25,6 +37,30 @@
 #define F4_WARPS 8
 #define F4_WARP 32
 #define F4_BLOCK 32
+// Stages of weights in flight, a row's bytes of one (FP8; FP4 packs two
+// values a byte), and the scale blocks of the widest row (K = 5120).
+#define F4_DEPTH 3
+#define F4_STAGE_BYTES 512
+#define F4_MAX_BLOCKS 160
+
+// What a block keeps in shared memory: the weight codes and the warps'
+// sums; and, when it stages its weights, those and their scales.
+template <int NT>
+struct F4Shared {
+    float red[F4_WARPS][F4_WARP][NT * 4];
+    unsigned short code[256];
+};
+
+struct F4Staged {
+    alignas(16) unsigned char w[F4_DEPTH][16][F4_STAGE_BYTES];
+    alignas(16) unsigned char s[16 * F4_MAX_BLOCKS];
+};
+
+// Sixteen bytes into shared memory without waiting for them.
+__device__ __forceinline__ void f4_cp16(void* dst, const void* src) {
+    const unsigned int d = (unsigned int)__cvta_generic_to_shared(dst);
+    asm volatile("cp.async.ca.shared.global [%0],[%1],16;\n" : : "r"(d), "l"(src));
+}
 
 template <int NT>
 struct F4Chunk {
@@ -56,6 +92,37 @@ __device__ __forceinline__ void f4_load(
     } else {
         if (v0) { t.w0 = *(const uint4*)(w0p + wo); t.s0 = s0p[so]; }
         if (v1) { t.w1 = *(const uint4*)(w1p + wo); t.s1 = s1p[so]; }
+    }
+    #pragma unroll
+    for (int i = 0; i < NT; i++) {
+        const unsigned int row = 8u * i + g;
+        if (row < M) {
+            const uint4* xp = (const uint4*)(A + (unsigned long long)row * K + kb);
+            t.x[i][0] = xp[0];
+            t.x[i][1] = xp[1];
+        }
+    }
+}
+
+// A chunk for one lane: its rows' 16 values at `w0` and `w1` (8 or 16 staged
+// bytes each), their block scales, and the activations at k = kb.
+template <int NT, bool FP4>
+__device__ __forceinline__ void f4_take(
+    F4Chunk<NT>& t, const unsigned char* w0, const unsigned char* w1, unsigned int s0,
+    unsigned int s1, const __nv_bfloat16* A, unsigned int g, unsigned int M, unsigned int K,
+    unsigned int kb, bool v0, bool v1
+) {
+    const uint4 z = make_uint4(0u, 0u, 0u, 0u);
+    t.w0 = z; t.w1 = z; t.s0 = 0u; t.s1 = 0u;
+    #pragma unroll
+    for (int i = 0; i < NT; i++) { t.x[i][0] = z; t.x[i][1] = z; }
+    if (kb >= K) return;
+    if constexpr (FP4) {
+        if (v0) { const uint2 w = *(const uint2*)w0; t.w0.x = w.x; t.w0.y = w.y; t.s0 = s0; }
+        if (v1) { const uint2 w = *(const uint2*)w1; t.w1.x = w.x; t.w1.y = w.y; t.s1 = s1; }
+    } else {
+        if (v0) { t.w0 = *(const uint4*)w0; t.s0 = s0; }
+        if (v1) { t.w1 = *(const uint4*)w1; t.s1 = s1; }
     }
     #pragma unroll
     for (int i = 0; i < NT; i++) {
@@ -231,6 +298,7 @@ __device__ __forceinline__ F4Rows f4_rows(
 
 template <int NT, bool FP4, bool F32OUT, int IN = F4_ROUNDED>
 __device__ __forceinline__ void dsv41_gemv_tc_impl(
+    F4Shared<NT>& sh,
     const __nv_bfloat16* __restrict__ A,
     const unsigned char* __restrict__ W,
     const unsigned char* __restrict__ S,
@@ -241,9 +309,7 @@ __device__ __forceinline__ void dsv41_gemv_tc_impl(
     unsigned int out_stride,
     unsigned int cta
 ) {
-    __shared__ unsigned short s_code[256];
-    __shared__ float s_red[F4_WARPS][F4_WARP][NT * 4];
-    f4_codes<FP4>(s_code);
+    f4_codes<FP4>(sh.code);
     __syncthreads();
 
     const unsigned int warp = threadIdx.x / F4_WARP;
@@ -271,14 +337,14 @@ __device__ __forceinline__ void dsv41_gemv_tc_impl(
                              next * 64u + 16u * c, r.v0, r.v1);
             f4_prepare<NT, IN>(nxt, g, M);
         }
-        f4_chunk<NT, FP4>(acc, cur, s_code);
+        f4_chunk<NT, FP4>(acc, cur, sh.code);
         cur = nxt;
     }
 
     #pragma unroll
     for (int i = 0; i < NT; i++) {
         #pragma unroll
-        for (int q = 0; q < 4; q++) s_red[warp][lane][i * 4 + q] = acc[i][q];
+        for (int q = 0; q < 4; q++) sh.red[warp][lane][i * 4 + q] = acc[i][q];
     }
     __syncthreads();
     if (warp != 0) return;
@@ -289,7 +355,114 @@ __device__ __forceinline__ void dsv41_gemv_tc_impl(
         for (int q = 0; q < 4; q++) {
             v[q] = 0.0f;
             #pragma unroll
-            for (int w = 0; w < F4_WARPS; w++) v[q] += s_red[w][lane][i * 4 + q];
+            for (int w = 0; w < F4_WARPS; w++) v[q] += sh.red[w][lane][i * 4 + q];
+        }
+        f4_store<F32OUT>(C, v, i, c, r0, r1, M, N, out_stride);
+    }
+}
+
+// The staged form: see the head of this file.
+template <int NT, bool FP4, bool F32OUT, int IN = F4_ROUNDED>
+__device__ __forceinline__ void dsv41_gemv_staged_impl(
+    F4Shared<NT>& sh,
+    F4Staged& st_sh,
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S,
+    void* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int out_stride,
+    unsigned int cta
+) {
+    f4_codes<FP4>(sh.code);
+    const unsigned int warp = threadIdx.x / F4_WARP;
+    const unsigned int lane = threadIdx.x % F4_WARP;
+    const unsigned int g = lane >> 2, c = lane & 3u;
+    const unsigned int first = cta * 16u;
+    const unsigned int r0 = first + g, r1 = r0 + 8u;
+    const bool v0 = r0 < N, v1 = r1 < N;
+    const unsigned int blocks = K / F4_BLOCK;
+    const unsigned int chunks = (K + 63u) / 64u;
+    const unsigned int stages = (chunks + F4_WARPS - 1u) / F4_WARPS;
+    // A row is K bytes, or K/2 packed; a chunk of it 64 or 32, of which the
+    // lane's 16 values are 16 or 8.
+    const unsigned int row_bytes = FP4 ? K / 2u : K;
+    const unsigned int stage_bytes = FP4 ? F4_STAGE_BYTES / 2u : F4_STAGE_BYTES;
+    const unsigned int chunk_bytes = FP4 ? 32u : 64u, lane_bytes = FP4 ? 8u : 16u;
+
+    // The block's scales: 16 rows are one run of 16 * blocks bytes, which
+    // starts on a 16-byte boundary whatever K is. A piece that would reach
+    // past the last row's end comes a byte at a time.
+    const unsigned long long scales_at = (unsigned long long)first * blocks;
+    const unsigned long long scales_end = (unsigned long long)N * blocks;
+    for (unsigned int p = threadIdx.x; p < blocks; p += F4_WARPS * F4_WARP) {
+        const unsigned long long at = scales_at + 16ull * p;
+        if (at + 16ull <= scales_end) {
+            f4_cp16(&st_sh.s[16u * p], S + at);
+        } else {
+            for (unsigned int b = 0; b < 16u && at + b < scales_end; ++b) st_sh.s[16u * p + b] = S[at + b];
+        }
+    }
+    asm volatile("cp.async.commit_group;\n" ::);
+    // Stage `st` of the block's rows: K values [512 st, 512 st + 512).
+    auto stage_in = [&](unsigned int st) {
+        const unsigned int pieces = stage_bytes / 16u;
+        for (unsigned int p = threadIdx.x; p < 16u * pieces; p += F4_WARPS * F4_WARP) {
+            const unsigned int row = p / pieces, off = (p % pieces) * 16u;
+            const unsigned long long at = (unsigned long long)st * stage_bytes + off;
+            if (first + row < N && at < row_bytes)
+                f4_cp16(&st_sh.w[st % F4_DEPTH][row][off],
+                        W + (unsigned long long)(first + row) * row_bytes + at);
+        }
+    };
+    #pragma unroll
+    for (unsigned int st = 0; st < F4_DEPTH - 1; st++) {
+        if (st < stages) stage_in(st);
+        asm volatile("cp.async.commit_group;\n" ::);
+    }
+
+    float acc[NT][4];
+    #pragma unroll
+    for (int i = 0; i < NT; i++) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.0f;
+    for (unsigned int st = 0; st < stages; st++) {
+        // Everything but the newest stages has landed; the barrier lets
+        // every warp see it, and says the stage before is no longer read.
+        asm volatile("cp.async.wait_group %0;\n" :: "n"(F4_DEPTH - 2));
+        __syncthreads();
+        const unsigned int ch = st * F4_WARPS + warp;
+        if (ch < chunks) {
+            const unsigned char (*rows)[F4_STAGE_BYTES] = st_sh.w[st % F4_DEPTH];
+            const unsigned int at = warp * chunk_bytes + lane_bytes * c;
+            const unsigned int block = ch * 2u + (c >> 1);
+            F4Chunk<NT> cur;
+            f4_take<NT, FP4>(cur, rows[g] + at, rows[g + 8u] + at, st_sh.s[g * blocks + block],
+                             st_sh.s[(g + 8u) * blocks + block], A, g, M, K, ch * 64u + 16u * c, v0,
+                             v1);
+            f4_prepare<NT, IN>(cur, g, M);
+            f4_chunk<NT, FP4>(acc, cur, sh.code);
+        }
+        const unsigned int next = st + F4_DEPTH - 1u;
+        if (next < stages) stage_in(next);
+        asm volatile("cp.async.commit_group;\n" ::);
+    }
+
+    #pragma unroll
+    for (int i = 0; i < NT; i++) {
+        #pragma unroll
+        for (int q = 0; q < 4; q++) sh.red[warp][lane][i * 4 + q] = acc[i][q];
+    }
+    __syncthreads();
+    if (warp != 0) return;
+    #pragma unroll
+    for (int i = 0; i < NT; i++) {
+        float v[4];
+        #pragma unroll
+        for (int q = 0; q < 4; q++) {
+            v[q] = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < F4_WARPS; w++) v[q] += sh.red[w][lane][i * 4 + q];
         }
         f4_store<F32OUT>(C, v, i, c, r0, r1, M, N, out_stride);
     }

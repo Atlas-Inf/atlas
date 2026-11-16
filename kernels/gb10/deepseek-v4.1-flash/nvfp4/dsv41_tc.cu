@@ -27,7 +27,8 @@
 //     run in both A and B. A row's output bits do not depend on how many
 //     rows share the launch.
 //
-// A: BF16 [M, K] (row stride K). C rows at C + m*out_stride. K % 32 == 0.
+// A: BF16 [M, K] (row stride K). C rows at C + m*out_stride. K % 32 == 0,
+// K <= 5120, and N a multiple of 16 or the weights' last rows padded to one.
 // Grid: (ceil(N/16),1,1) Block: (256,1,1). The body is `dsv41_tc.cuh`.
 
 #include "dsv41_tc.cuh"
@@ -37,7 +38,9 @@
         const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,           \
         const unsigned char* __restrict__ S, CTYPE* __restrict__ C, unsigned int M,         \
         unsigned int N, unsigned int K, unsigned int out_stride) {                          \
-        dsv41_gemv_tc_impl<NT, FP4, F32OUT>(A, W, S, C, M, N, K, out_stride, blockIdx.x);   \
+        __shared__ F4Shared<NT> sh;                                                         \
+        dsv41_gemv_tc_impl<NT, FP4, F32OUT>(sh, A, W, S, C, M, N, K, out_stride,            \
+                                            blockIdx.x);                                    \
     }
 
 DSV41_TC(dsv41_fp4_gemv_tc8, 1, true, false, __nv_bfloat16)
@@ -61,7 +64,8 @@ DSV41_TC(dsv41_fp8_gemv_tc32_f32, 4, false, true, float)
         const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,           \
         const unsigned char* __restrict__ S, CTYPE* __restrict__ C, unsigned int M,         \
         unsigned int N, unsigned int K, unsigned int out_stride) {                          \
-        dsv41_gemv_tc_impl<1, false, F32OUT, F4_QUANT>(A, W, S, C, M, N, K, out_stride,     \
+        __shared__ F4Shared<1> sh;                                                          \
+        dsv41_gemv_tc_impl<1, false, F32OUT, F4_QUANT>(sh, A, W, S, C, M, N, K, out_stride, \
                                                        blockIdx.x);                         \
     }
 
@@ -70,7 +74,8 @@ DSV41_TC_Q(dsv41_fp8_gemv_tc8_f32_q, true, float)
 
 // Two FP8 projections of one vector in one launch: C0 [N0] = W0 . A and
 // C1 [N1] = W1 . A, A [K] FP8-rounded BF16. A block computes what the same
-// block of `dsv41_fp8_gemv_tc8` computes. Grid (ceil(N0 / 16) + ceil(N1 / 16)).
+// block of `dsv41_fp8_gemv_tc8` computes, from staged weights: this is for
+// long rows. Grid (ceil(N0 / 16) + ceil(N1 / 16)).
 extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_two(
     const __nv_bfloat16* __restrict__ A,
     const unsigned char* __restrict__ W0,
@@ -82,18 +87,23 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_
     __nv_bfloat16* __restrict__ C1,
     unsigned int N1,
     unsigned int K) {
+    __shared__ F4Shared<1> sh;
+    __shared__ F4Staged staged;
     const unsigned int first = (N0 + 15u) / 16u;
     if (blockIdx.x < first) {
-        dsv41_gemv_tc_impl<1, false, false>(A, W0, S0, C0, 1, N0, K, N0, blockIdx.x);
+        dsv41_gemv_staged_impl<1, false, false>(sh, staged, A, W0, S0, C0, 1, N0, K, N0,
+                                                blockIdx.x);
     } else {
-        dsv41_gemv_tc_impl<1, false, false>(A, W1, S1, C1, 1, N1, K, N1, blockIdx.x - first);
+        dsv41_gemv_staged_impl<1, false, false>(sh, staged, A, W1, S1, C1, 1, N1, K, N1,
+                                                blockIdx.x - first);
     }
 }
 
 // A block-diagonal FP8 projection in one launch: group y of the grid is
 // C[y] [N] = W[y] [N, K] . fp8(A[y] [K]), with A, W, S and C each the
 // groups' one after another. A block computes what the same block of
-// `dsv41_fp8_gemv_tc8_q` computes for its group. Grid (ceil(N / 16), groups).
+// `dsv41_fp8_gemv_tc8_q` computes for its group, from staged weights: this
+// is for long rows. Grid (ceil(N / 16), groups).
 extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_groups_q(
     const __nv_bfloat16* __restrict__ A,
     const unsigned char* __restrict__ W,
@@ -101,7 +111,10 @@ extern "C" __global__ void __launch_bounds__(F4_WARPS * F4_WARP) dsv41_fp8_gemv_
     __nv_bfloat16* __restrict__ C,
     unsigned int N,
     unsigned int K) {
+    __shared__ F4Shared<1> sh;
+    __shared__ F4Staged staged;
     const unsigned long long y = blockIdx.y;
-    dsv41_gemv_tc_impl<1, false, false, F4_QUANT>(
-        A + y * K, W + y * N * K, S + y * N * (K / F4_BLOCK), C + y * N, 1, N, K, N, blockIdx.x);
+    dsv41_gemv_staged_impl<1, false, false, F4_QUANT>(
+        sh, staged, A + y * K, W + y * N * K, S + y * N * (K / F4_BLOCK), C + y * N, 1, N, K, N,
+        blockIdx.x);
 }
