@@ -531,3 +531,24 @@ extern "C" __global__ void __launch_bounds__(32) dsv41_hc_mix_rows(
         norm_eps, hc_eps, hc_scale, hc_base, pre_out + (size_t)t * hc, post_out + (size_t)t * hc,
         comb_out + (size_t)t * hc * hc);
 }
+
+// Where a pass starts: every copy of each token's stream its embedding, and
+// each token's coefficients the identity mix, which collapses to the first
+// copy. tokens [rows, hidden] BF16, streams [rows, copies, hidden] BF16, pre
+// [rows, copies] FP32. hidden % 8 == 0. One thread 8 values of a token.
+extern "C" __global__ void dsv41_hc_start(
+    const uint4* __restrict__ tokens,
+    uint4* __restrict__ streams,
+    float* __restrict__ pre,
+    unsigned int rows,
+    unsigned int hidden,
+    unsigned int copies) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int per = hidden / 8u;
+    if (i >= (size_t)rows * per) return;
+    const size_t row = i / per, at = i % per;
+    const uint4 v = tokens[i];
+    for (unsigned int copy = 0; copy < copies; ++copy)
+        streams[(row * copies + copy) * per + at] = v;
+    if (at < copies) pre[row * copies + at] = at == 0 ? 1.0f : 0.0f;
+}

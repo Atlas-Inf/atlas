@@ -42,19 +42,37 @@ extern "C" __global__ void dsv41_mx_quant(
     const unsigned int kb = b * 32u;
     const __nv_bfloat16* src = x + (size_t)m * a_stride +
                                (piece ? (size_t)(kb / piece) * piece_stride + kb % piece : kb);
+    // A block's 64 bytes in four loads and its 32 codes out in two stores:
+    // a value or a code at a time, every instruction of a warp went to 16
+    // lines of memory for two bytes of each.
     float v[32];
-    float amax = 0.0f;
-    for (int i = 0; i < 32; ++i) {
-        v[i] = __bfloat162float(src[i]);
-        amax = fmaxf(amax, fabsf(v[i]));
+    if ((((size_t)src) & 15u) == 0u) {
+        const uint4* in = (const uint4*)src;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint4 w = in[j];
+            dsv41_unpack2(w.x, v[8 * j], v[8 * j + 1]);
+            dsv41_unpack2(w.y, v[8 * j + 2], v[8 * j + 3]);
+            dsv41_unpack2(w.z, v[8 * j + 4], v[8 * j + 5]);
+            dsv41_unpack2(w.w, v[8 * j + 6], v[8 * j + 7]);
+        }
+    } else {
+        for (int i = 0; i < 32; ++i) v[i] = __bfloat162float(src[i]);
     }
+    float amax = 0.0f;
+    for (int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(v[i]));
     const float scale = dsv41_fp8_scale(amax);
-    unsigned char* dst = q + (size_t)m * K + kb;
+    unsigned int codes[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
     for (int i = 0; i < 32; ++i) {
         const float scaled = fminf(fmaxf(v[i] / scale, -448.0f), 448.0f);
-        dst[i] = (unsigned char)__nv_cvt_float_to_fp8(dsv41_round_e4m3(scaled), __NV_SATFINITE,
-                                                      __NV_E4M3);
+        const unsigned int code = (unsigned char)__nv_cvt_float_to_fp8(
+            dsv41_round_e4m3(scaled), __NV_SATFINITE, __NV_E4M3);
+        codes[i / 4] |= code << (8 * (i % 4));
     }
+    // q is whole blocks of 32 from an allocation's start.
+    uint4* dst = (uint4*)(q + (size_t)m * K + kb);
+    dst[0] = make_uint4(codes[0], codes[1], codes[2], codes[3]);
+    dst[1] = make_uint4(codes[4], codes[5], codes[6], codes[7]);
     const unsigned char code = (unsigned char)(dsv41_exponent(scale) + 127);
     if (inner_pad == 0u) {
         sf[t] = code;

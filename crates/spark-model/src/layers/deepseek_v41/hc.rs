@@ -9,7 +9,7 @@
 
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
-use spark_runtime::kernel_args::KernelLaunch;
+use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 /// The `pre` layer 0's attention is collapsed with: the first copy alone.
 pub const IDENTITY_PRE: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
@@ -27,6 +27,7 @@ pub struct HcKernels {
     mix_sums: KernelHandle,
     mix_finish: KernelHandle,
     pub collapse: KernelHandle,
+    start: KernelHandle,
     pub expand: KernelHandle,
     pub expand_parts: KernelHandle,
     site_sums: KernelHandle,
@@ -43,6 +44,7 @@ impl HcKernels {
             mix_sums: kernel("dsv41_hc_mix_sums")?,
             mix_finish: kernel("dsv41_hc_mix_finish")?,
             collapse: kernel("dsv41_hc_collapse")?,
+            start: kernel("dsv41_hc_start")?,
             expand: kernel("dsv41_hc_expand")?,
             expand_parts: kernel("dsv41_hc_expand_parts")?,
             site_sums: kernel("dsv41_hc_site_sums")?,
@@ -415,6 +417,38 @@ pub fn site_rows(
         .arg_u32(shape.sinkhorn_iters as u32)
         .arg_f32(shape.norm_eps)
         .arg_f32(shape.hc_eps)
+        .launch(stream)
+}
+
+/// Where a pass starts for `rows` tokens: every copy of `streams` (`[rows,
+/// copies, hidden]` BF16) the token's embedding (`tokens`, `[rows, hidden]`
+/// BF16), and `pre` (`[rows, copies]` FP32) [`IDENTITY_PRE`].
+#[allow(clippy::too_many_arguments)]
+pub fn start(
+    gpu: &dyn GpuBackend,
+    kernels: &HcKernels,
+    shape: &HcShape,
+    tokens: DevicePtr,
+    streams: DevicePtr,
+    pre: DevicePtr,
+    rows: usize,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        shape.hidden.is_multiple_of(8) && shape.copies == IDENTITY_PRE.len(),
+        "dsv41_hc_start: {} copies of {}",
+        shape.copies,
+        shape.hidden
+    );
+    KernelLaunch::new(gpu, kernels.start)
+        .grid([div_ceil((rows * shape.hidden / 8) as u32, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(tokens)
+        .arg_ptr(streams)
+        .arg_ptr(pre)
+        .arg_u32(rows as u32)
+        .arg_u32(shape.hidden as u32)
+        .arg_u32(shape.copies as u32)
         .launch(stream)
 }
 

@@ -23,7 +23,7 @@ use super::cache_recipe::rope_freqs;
 use super::engram::{Engram, EngramWeights, held_columns};
 use super::engram_table::{EngramHash, EngramTable, Prefetcher};
 use super::gemm::{GemmWeights, gemms};
-use super::hc::{self, IDENTITY_PRE};
+use super::hc;
 use super::index::INDEX_DIM;
 use super::ops::HEAD_DIM;
 use super::parts::Held;
@@ -115,16 +115,8 @@ impl Layer {
         if self.first {
             // Every copy of the stream starts as the embedding, and the
             // first block collapses with the identity mix.
-            gpu.synchronize(stream)?;
-            let identity: Vec<u8> = IDENTITY_PRE.iter().flat_map(|v| v.to_le_bytes()).collect();
-            for r in 0..rows {
-                let token = hidden.offset(r * hidden_bytes);
-                for copy in 0..copies {
-                    let to = streams.offset((r * copies + copy) * hidden_bytes);
-                    gpu.copy_d2d(token, to, hidden_bytes)?;
-                }
-                gpu.copy_h2d(&identity, pre.offset(r * copies * 4))?;
-            }
+            let (kernels, shape) = (&shared.kernels.hc, &shared.shape.hc);
+            hc::start(gpu, kernels, shape, hidden, streams, pre, rows, stream)?;
         }
         if let Some(ahead) = &self.ahead {
             self.look_ahead(ahead, row, rows, state, position, ctx, stream)?;
