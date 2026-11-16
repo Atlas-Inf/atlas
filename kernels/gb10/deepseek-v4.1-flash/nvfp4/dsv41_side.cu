@@ -76,13 +76,15 @@ extern "C" __global__ void dsv41_engram_rows(
     out[i] = __float2bfloat16(ldexpf(v, (int)scales[(size_t)scale_slots[c] * 8 + d / 32] - 127));
 }
 
-// Engram on one token per block. stream [T, hc, H] BF16 in place;
-// kv [T, (hc + 1) * H] BF16 is the lookup's projection, hc keys then one
-// value; weight [hc, H] FP32 is q_weight * k_weight.
+// Engram on one copy of one token per block. stream [T, hc, H] BF16 in
+// place; kv [T, (hc + 1) * H] BF16 is the lookup's projection, hc keys then
+// one value; weight [hc, H] FP32 is q_weight * k_weight.
 //   gate_j = sigmoid(sign(dot_j) * sqrt(max(|dot_j|, 1e-6)))
 //   dot_j  = sum(h_j * weight_j * key_j) * rsqrt(mean(h_j^2) + eps)
 //            * rsqrt(mean(key_j^2) + eps) / sqrt(H)
 //   h_j   += gate_j * value
+// A copy's gate reads nothing of the other copies, so each has its block and
+// they run side by side. Grid (T, hc), block 256.
 extern "C" __global__ void __launch_bounds__(DSV41_SIDE_THREADS) dsv41_engram_gate(
     __nv_bfloat16* __restrict__ stream,
     const __nv_bfloat16* __restrict__ kv,
@@ -90,41 +92,37 @@ extern "C" __global__ void __launch_bounds__(DSV41_SIDE_THREADS) dsv41_engram_ga
     unsigned int H,
     unsigned int hc,
     float eps) {
-    const unsigned int t = blockIdx.x, tid = threadIdx.x;
-    __nv_bfloat16* h = stream + (size_t)t * hc * H;
-    const __nv_bfloat16* key = kv + (size_t)t * (hc + 1) * H;
-    const __nv_bfloat16* value = key + (size_t)hc * H;
+    const unsigned int t = blockIdx.x, j = blockIdx.y, tid = threadIdx.x;
+    __nv_bfloat16* h = stream + ((size_t)t * hc + j) * H;
+    const __nv_bfloat16* key = kv + ((size_t)t * (hc + 1) + j) * H;
+    const __nv_bfloat16* value = kv + ((size_t)t * (hc + 1) + hc) * H;
+    const float* w = weight + (size_t)j * H;
     __shared__ float red[3][DSV41_SIDE_THREADS];
-    __shared__ float gate[4];
-    for (unsigned int j = 0; j < hc; ++j) {
-        float hh = 0.0f, kk = 0.0f, hk = 0.0f;
-        for (unsigned int d = tid; d < H; d += DSV41_SIDE_THREADS) {
-            const float hv = __bfloat162float(h[j * H + d]);
-            const float kval = __bfloat162float(key[j * H + d]);
-            hh += hv * hv;
-            kk += kval * kval;
-            hk += hv * weight[j * H + d] * kval;
-        }
-        red[0][tid] = hh;
-        red[1][tid] = kk;
-        red[2][tid] = hk;
-        __syncthreads();
-        for (unsigned int width = DSV41_SIDE_THREADS / 2; width > 0; width >>= 1) {
-            if (tid < width)
-                for (int s = 0; s < 3; ++s) red[s][tid] += red[s][tid + width];
-            __syncthreads();
-        }
-        if (tid == 0) {
-            const float rstd = rsqrtf(red[0][0] / (float)H + eps) * rsqrtf(red[1][0] / (float)H + eps);
-            const float dot = red[2][0] * rstd * rsqrtf((float)H);
-            const float root = copysignf(sqrtf(fmaxf(fabsf(dot), 1e-6f)), dot);
-            gate[j] = 1.0f / (1.0f + expf(-root));
-        }
-        __syncthreads();
-    }
+    __shared__ float gate;
+    float hh = 0.0f, kk = 0.0f, hk = 0.0f;
     for (unsigned int d = tid; d < H; d += DSV41_SIDE_THREADS) {
-        const float v = __bfloat162float(value[d]);
-        for (unsigned int j = 0; j < hc; ++j)
-            h[j * H + d] = __float2bfloat16(__bfloat162float(h[j * H + d]) + gate[j] * v);
+        const float hv = __bfloat162float(h[d]);
+        const float kval = __bfloat162float(key[d]);
+        hh += hv * hv;
+        kk += kval * kval;
+        hk += hv * w[d] * kval;
     }
+    red[0][tid] = hh;
+    red[1][tid] = kk;
+    red[2][tid] = hk;
+    __syncthreads();
+    for (unsigned int width = DSV41_SIDE_THREADS / 2; width > 0; width >>= 1) {
+        if (tid < width)
+            for (int s = 0; s < 3; ++s) red[s][tid] += red[s][tid + width];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        const float rstd = rsqrtf(red[0][0] / (float)H + eps) * rsqrtf(red[1][0] / (float)H + eps);
+        const float dot = red[2][0] * rstd * rsqrtf((float)H);
+        const float root = copysignf(sqrtf(fmaxf(fabsf(dot), 1e-6f)), dot);
+        gate = 1.0f / (1.0f + expf(-root));
+    }
+    __syncthreads();
+    for (unsigned int d = tid; d < H; d += DSV41_SIDE_THREADS)
+        h[d] = __float2bfloat16(__bfloat162float(h[d]) + gate * __bfloat162float(value[d]));
 }

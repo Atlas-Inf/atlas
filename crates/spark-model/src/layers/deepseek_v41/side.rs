@@ -3,7 +3,7 @@
 //! The compressor and Engram in their plain forms (`dsv41_side.cu`): the two
 //! paths the reference runs in FP32.
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
@@ -120,9 +120,9 @@ pub fn engram_gate(
     eps: f32,
     stream: u64,
 ) -> Result<()> {
-    ensure!(copies <= 4, "dsv41_engram_gate: {copies} copies");
+    // A block a copy of a token.
     KernelLaunch::new(gpu, kernel)
-        .grid([tokens as u32, 1, 1])
+        .grid([tokens as u32, copies as u32, 1])
         .block([THREADS, 1, 1])
         .arg_ptr(stream_buf)
         .arg_ptr(kv)
