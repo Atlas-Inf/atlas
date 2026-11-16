@@ -19,6 +19,7 @@ impl Qwen4ExpMtpHead {
         stream: u64,
         grammar_bitmask: Option<&[i32]>,
         want_conf: bool,
+        tp: Option<&draft_tp::TpRun<'_>>,
     ) -> Result<(u32, Option<f32>)> {
         let h = ctx.config.hidden_size;
         let hc = ctx.config.hc_mult.max(1);
@@ -248,15 +249,19 @@ impl Qwen4ExpMtpHead {
         } else {
             // The draft head (`qwen4exp_draft_head.rs`): a prefix, a gathered
             // id list, optionally NVFP4. Its row index maps back to the id.
+            // Under one-row draft TP the worker projects half of the rows.
             let rows = self.draft.rows();
-            self.draft.project(
-                ctx.gpu,
-                self.dense_gemv_k,
-                self.h_out,
-                logits,
-                h as u32,
-                stream,
-            )?;
+            match tp {
+                Some(run) => run.head(&self.draft, self.dense_gemv_batchm_k, self.h_out, logits)?,
+                None => self.draft.project(
+                    ctx.gpu,
+                    self.dense_gemv_k,
+                    self.h_out,
+                    logits,
+                    h as u32,
+                    stream,
+                )?,
+            }
             if state.bans_draft_after(position) {
                 self.ban_draft_rows(ctx.gpu, logits, [0], stream)?;
             }

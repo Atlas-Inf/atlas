@@ -112,6 +112,7 @@ impl Qwen4ExpMtpHead {
             batch_slab: gpu.alloc(qwen4exp_mtp_batch::slab_bytes(batch_slab_blocks))?,
             batch_slab_blocks,
             tp: None,
+            tp_one: false,
             absorb: qwen4exp_mtp_absorb::AbsorbBufs::new(gpu, hc, h)?,
         })
     }
