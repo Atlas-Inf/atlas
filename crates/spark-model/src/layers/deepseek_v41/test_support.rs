@@ -9,9 +9,11 @@ use anyhow::{Context, Result};
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
+use super::block::{Block, Candidates, Shared};
 use super::cache_recipe::rope_freqs;
 use super::hc::HcShape;
 use super::shape::Shape;
+use super::weights::BlockWeights;
 use crate::weight_map::test_checkpoint::{read_checkpoint_tensor, read_safetensors_tensor};
 use crate::weight_map::{Mxfp8Weight, fp8_block_scales_to_rows};
 
@@ -41,6 +43,151 @@ pub(crate) const SHAPE: Shape = Shape {
         hc_eps: 1e-6,
     },
 };
+
+/// What a layer of the 1017 release does for the layers after it (the
+/// release's `config.json`).
+pub(crate) struct Role {
+    /// 0: the layer attends over its window only.
+    pub(crate) ratio: usize,
+    /// It compresses keys and makes index keys; otherwise it reads those of
+    /// layer `keys_from`.
+    pub(crate) key_source: bool,
+    pub(crate) keys_from: usize,
+    /// It runs an indexer; otherwise it reads the positions a layer below
+    /// chose.
+    pub(crate) index_source: bool,
+    pub(crate) candidates: Candidates,
+}
+
+impl Role {
+    /// The ratio `SeqState` and `BlockWeights` take: the layer's own, if it
+    /// compresses keys itself.
+    pub(crate) fn compresses(&self) -> usize {
+        if self.key_source { self.ratio } else { 0 }
+    }
+}
+
+pub(crate) fn role(layer: usize) -> Role {
+    const KEY_SOURCES: [usize; 4] = [2, 8, 14, 20];
+    const INDEX_SOURCES: [usize; 8] = [2, 8, 14, 20, 24, 28, 32, 36];
+    const CANDIDATE_SOURCE: usize = 20;
+    let index_source = INDEX_SOURCES.contains(&layer);
+    Role {
+        ratio: match layer {
+            0 | 1 => 0,
+            2..=19 => 2,
+            _ => 1,
+        },
+        key_source: KEY_SOURCES.contains(&layer),
+        keys_from: KEY_SOURCES
+            .iter()
+            .copied()
+            .rfind(|&s| s <= layer)
+            .unwrap_or(0),
+        index_source,
+        candidates: match layer {
+            CANDIDATE_SOURCE => Candidates::Source,
+            _ if index_source && layer > CANDIDATE_SOURCE => Candidates::Reader,
+            _ => Candidates::None,
+        },
+    }
+}
+
+/// Block `layer` of the release as its role has it, without or with its
+/// routed experts, and the store its weights sit in.
+pub(crate) fn block(
+    gpu: &dyn GpuBackend,
+    layer: usize,
+    experts: bool,
+    shared: Shared,
+) -> Result<(Block, spark_runtime::weights::WeightStore)> {
+    let role = role(layer);
+    let store = layer_store(gpu, layer, experts)?;
+    let ladder = match role.ratio {
+        0 => rope_freqs(SHAPE.rope, 0, 10_000.0, 16.0, 32.0, 1.0),
+        _ => compressed_ladder(),
+    };
+    let held = if experts { 0..SHAPE.experts } else { 0..0 };
+    let block = Block {
+        index: layer,
+        ratio: role.ratio,
+        candidates: role.candidates,
+        freqs: upload(gpu, &le_bytes(&ladder, f32::to_le_bytes))?,
+        weights: BlockWeights::load(
+            &store,
+            gpu,
+            layer,
+            role.compresses(),
+            role.index_source,
+            held,
+        )?,
+        shared,
+    };
+    Ok((block, store))
+}
+
+/// Free every tensor of a test's store.
+pub(crate) fn free_store(
+    gpu: &dyn GpuBackend,
+    store: &spark_runtime::weights::WeightStore,
+) -> Result<()> {
+    let names: Vec<String> = store.names().map(str::to_owned).collect();
+    names.iter().try_for_each(|name| store.reclaim(gpu, name))
+}
+
+/// The compressed keys and index keys DeepSeek's key source left after the
+/// whole prompt, `(keys, index keys)`: what a layer that makes its own is
+/// compared with, and what a layer that reads them is handed.
+pub(crate) fn source_keys(rec: &Recording, role: &Role) -> Result<(Vec<u8>, Vec<u8>)> {
+    let from = format!("after_decode.L{}.", role.keys_from);
+    Ok((
+        rec.caches(&format!("{from}compress_kv_cache"))?.1,
+        rec.caches(&format!("{from}indexer_k_cache"))?.1,
+    ))
+}
+
+/// Row 0 of the block's handoff as DeepSeek's layers below left it: the key
+/// source's keys, for a layer that reads them.
+pub(crate) fn hand_keys(
+    gpu: &dyn GpuBackend,
+    block: &Block,
+    role: &Role,
+    keys: &[u8],
+    index_keys: &[u8],
+) -> Result<()> {
+    let mut handoff = block.shared.handoff.lock().expect("handoff");
+    handoff.rows.clear();
+    handoff.rows.resize_with(1, Default::default);
+    if !role.key_source {
+        handoff.rows[0].compressed = upload(gpu, keys)?;
+        handoff.rows[0].index_keys = upload(gpu, index_keys)?;
+    }
+    Ok(())
+}
+
+/// Before a token: the positions DeepSeek's index source chose for it, for
+/// a layer that reads them, and every position a candidate (2,048 blocks of
+/// 8 hold every position of the recorded prompt).
+pub(crate) fn hand_choice(block: &Block, role: &Role, theirs: &[i32], visible: usize) {
+    let mut handoff = block.shared.handoff.lock().expect("handoff");
+    if !role.index_source {
+        handoff.rows[0].chosen = theirs.to_vec();
+    }
+    if role.candidates == Candidates::Reader {
+        handoff.rows[0].candidates = vec![true; visible];
+    }
+}
+
+/// The compressed positions of a recorded attention index row: the columns
+/// after the window's, -1 for none, the rest `offset` up.
+pub(crate) fn chosen(row: &[u8], offset: i32) -> Vec<i32> {
+    row[super::cache_recipe::WINDOW * 4..]
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .filter(|&i| i >= 0)
+        .map(|i| i - offset)
+        .collect()
+}
 
 /// The rotary ladder of a layer that reads compressed keys.
 pub(crate) fn compressed_ladder() -> Vec<f32> {
@@ -171,16 +318,27 @@ impl Recording {
     pub(crate) fn final_collapse(&self) -> Result<(usize, Vec<u8>)> {
         let full = "final.safetensors";
         if self.dir.join(full).exists() {
-            let last = (0..).find(|n| {
-                !self
-                    .dir
-                    .join(format!("L{:02}_prefill.safetensors", n + 1))
-                    .exists()
-            });
             let (_, bytes) = self.tensor(full, "prefill.final.collapsed")?;
-            return Ok((last.context("layers")?, bytes));
+            return Ok((self.layers() - 1, bytes));
         }
         Ok((2, self.prefill("L2.op.hc.final.collapsed")?.1))
+    }
+
+    /// `first` and, at full depth, `deeper`: the layers a per-operation
+    /// test runs.
+    pub(crate) fn sample(&self, first: &[usize], deeper: &[usize]) -> Vec<usize> {
+        let held = deeper.iter().filter(|&&layer| layer < self.layers());
+        first.iter().chain(held).copied().collect()
+    }
+
+    /// How many layers are recorded: 3, or all of them at full depth.
+    pub(crate) fn layers(&self) -> usize {
+        let held = |n: &usize| {
+            self.dir
+                .join(format!("L{n:02}_prefill.safetensors"))
+                .exists()
+        };
+        (0..).take_while(held).count().max(3)
     }
 
     /// `(shape, bytes)` of one of run A's caches, e.g.

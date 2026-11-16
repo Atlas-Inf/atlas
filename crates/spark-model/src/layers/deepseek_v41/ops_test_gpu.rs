@@ -212,7 +212,9 @@ fn attention_replays_the_reference_recording() -> Result<()> {
     let k = Kernels::load(gpu)?;
     let (prefill, decode) = (rec.prefill, rec.decode);
 
-    for layer in 0..3 {
+    // 20, 21 and 35 are where a whole block's attention is furthest from the
+    // reference.
+    for layer in rec.sample(&[0, 1, 2], &[20, 21, 35]) {
         let l = format!("L{layer}.");
         let (_, _, sink) =
             read_checkpoint_tensor(Path::new(&ckpt), &format!("layers.{layer}.attn.attn_sink"))?;

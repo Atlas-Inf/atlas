@@ -248,7 +248,7 @@ fn the_output_projection_replays_the_reference() -> Result<()> {
     const GROUPS: usize = 8;
     const RANK: usize = 1024;
     let group_in = 64 / GROUPS * HEAD_DIM;
-    for layer in [0, 2] {
+    for layer in rec.sample(&[0, 2], &[21, 35]) {
         let l = format!("L{layer}.");
         let (wo_a, n, width) = load_fp8(gpu, &format!("layers.{layer}.attn.wo_a"))?;
         anyhow::ensure!(

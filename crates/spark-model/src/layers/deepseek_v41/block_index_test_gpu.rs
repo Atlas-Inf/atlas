@@ -18,44 +18,14 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use spark_runtime::gpu::GpuBackend;
 
-use crate::layers::deepseek_v41::block::{
-    Block, BlockKernels, Candidates, Handoff, Scratch, SeqState, Shared,
-};
-use crate::layers::deepseek_v41::cache_recipe::{completed_group, visible_groups};
+use crate::layers::deepseek_v41::block::{BlockKernels, Handoff, Scratch, SeqState, Shared};
+use crate::layers::deepseek_v41::cache_recipe::{WINDOW, completed_group, visible_groups};
 use crate::layers::deepseek_v41::index::INDEX_DIM;
 use crate::layers::deepseek_v41::ops::HEAD_DIM;
 use crate::layers::deepseek_v41::test_support::{
-    Recording, SHAPE, backend, bf16s, closeness, compressed_ladder, download, layer_store,
-    le_bytes, upload,
+    Recording, SHAPE, backend, bf16s, block, chosen, closeness, download, free_store, hand_choice,
+    hand_keys, role, source_keys,
 };
-use crate::layers::deepseek_v41::weights::BlockWeights;
-
-const WINDOW: usize = 128;
-
-/// A layer and what it does for the layers after it.
-struct Case {
-    layer: usize,
-    ratio: usize,
-    /// It compresses keys and makes index keys itself; otherwise it reads
-    /// those of layer `keys_from`.
-    key_source: bool,
-    keys_from: usize,
-    /// It runs an indexer; otherwise it reads the positions a layer below
-    /// chose.
-    index_source: bool,
-    candidates: Candidates,
-}
-
-/// The compressed positions of a recorded attention index row: the columns
-/// after the window's, -1 for none, the rest `offset` up.
-fn chosen(row: &[u8], offset: i32) -> Vec<i32> {
-    row[WINDOW * 4..]
-        .chunks_exact(4)
-        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .filter(|&i| i >= 0)
-        .map(|i| i - offset)
-        .collect()
-}
 
 /// Queries that chose among more positions than they may read, and how
 /// their choices compare with the reference's.
@@ -89,51 +59,31 @@ struct Report {
     distance: [f64; 3],
 }
 
-fn run(case: &Case) -> Result<Report> {
+fn run(layer: usize) -> Result<Report> {
     let rec = Recording::open()?;
     let gpu = backend()?;
     let stream = gpu.default_stream();
     let (hidden, topk, heads) = (SHAPE.hidden, SHAPE.index_topk, SHAPE.index_heads);
-    let (layer, ratio) = (case.layer, case.ratio);
+    let role = role(layer);
+    let ratio = role.ratio;
     let total = rec.prefill + rec.decode;
-    let store = layer_store(gpu, layer, false)?;
-    let compress = if case.key_source { ratio } else { 0 };
-    let block = Block {
-        index: layer,
-        ratio,
-        candidates: case.candidates,
-        freqs: upload(gpu, &le_bytes(&compressed_ladder(), f32::to_le_bytes))?,
-        weights: BlockWeights::load(&store, gpu, layer, compress, case.index_source, 0..0)?,
-        shared: Shared {
-            shape: SHAPE,
-            kernels: BlockKernels::load(gpu)?,
-            scratch: Arc::new(Scratch::alloc(gpu, &SHAPE, total / ratio)?),
-            handoff: Arc::new(Mutex::new(Handoff::default())),
-        },
+    let shared = Shared {
+        shape: SHAPE,
+        kernels: BlockKernels::load(gpu)?,
+        scratch: Arc::new(Scratch::alloc(gpu, &SHAPE, total / ratio)?),
+        handoff: Arc::new(Mutex::new(Handoff::default())),
     };
+    let (block, store) = block(gpu, layer, false, shared)?;
     let sc = block.shared.scratch.clone();
-    let mut state = SeqState::alloc(gpu, compress, total)?;
+    let mut state = SeqState::alloc(gpu, role.compresses(), total)?;
 
     let l = format!("L{layer}.");
     let (_, inputs) = rec.prefill(&format!("{l}attn_in"))?;
     let (_, outputs) = rec.prefill(&format!("{l}attn_out"))?;
     let (shape, rows) = rec.prefill(&format!("{l}sa_idxs"))?;
     let row = shape[2] * 4;
-    let from = format!("after_decode.L{}.", case.keys_from);
-    let (_, keys) = rec.caches(&format!("{from}compress_kv_cache"))?;
-    let (_, index_keys) = rec.caches(&format!("{from}indexer_k_cache"))?;
-    block
-        .shared
-        .handoff
-        .lock()
-        .expect("handoff")
-        .rows
-        .resize_with(1, Default::default);
-    if !case.key_source {
-        let mut handoff = block.shared.handoff.lock().expect("handoff");
-        handoff.rows[0].compressed = upload(gpu, &keys)?;
-        handoff.rows[0].index_keys = upload(gpu, &index_keys)?;
-    }
+    let (keys, index_keys) = source_keys(&rec, &role)?;
+    hand_keys(gpu, &block, &role, &keys, &index_keys)?;
     // Layer 2 has the reference's own scores replayed (`index_replay.py`).
     let replay = match layer {
         2 => Some((
@@ -167,16 +117,7 @@ fn run(case: &Case) -> Result<Report> {
                 chosen(&rec.step(&format!("{l}sa_idxs"), step)?.1, WINDOW as i32),
             ),
         };
-        {
-            let mut handoff = block.shared.handoff.lock().expect("handoff");
-            if !case.index_source {
-                handoff.rows[0].chosen = theirs.clone();
-            }
-            if case.candidates == Candidates::Reader {
-                // 2,048 blocks of 8 hold every position of this prompt.
-                handoff.rows[0].candidates = vec![true; visible];
-            }
-        }
+        hand_choice(&block, &role, &theirs, visible);
         gpu.synchronize(stream)?;
         gpu.copy_h2d(&input, sc.normed)?;
         block.attention(gpu, 0, &mut state, position, stream)?;
@@ -234,7 +175,7 @@ fn run(case: &Case) -> Result<Report> {
     }
 
     let share = |same: usize, of: usize| 100.0 * same as f64 / of.max(1) as f64;
-    if case.key_source {
+    if role.key_source {
         println!(
             "layer {layer}: {total} tokens, {groups} groups; {key_differ} of {} compressed-key values and {index_key_differ} of {} index-key values differ from the reference's",
             groups * HEAD_DIM,
@@ -253,7 +194,7 @@ fn run(case: &Case) -> Result<Report> {
             share(score_same, scored)
         );
     }
-    if case.index_source {
+    if role.index_source {
         for (name, c) in [
             ("prefill", &prefill),
             ("decode, even keys", &even),
@@ -276,6 +217,7 @@ fn run(case: &Case) -> Result<Report> {
         distance[2]
     );
     state.free(gpu)?;
+    free_store(gpu, &store)?;
     Ok(Report {
         prefill,
         even,
@@ -297,14 +239,7 @@ fn check(report: &Report) {
 #[test]
 #[ignore = "needs a GB10 GPU, the deepseek-v4.1-flash target, ATLAS_DSV41_REC (with the index replay) and ATLAS_DSV41_CKPT"]
 fn layer_2_chooses_the_references_compressed_positions() -> Result<()> {
-    let report = run(&Case {
-        layer: 2,
-        ratio: 2,
-        key_source: true,
-        keys_from: 2,
-        index_source: true,
-        candidates: Candidates::None,
-    })?;
+    let report = run(2)?;
     check(&report);
     // Measured: 375 of 376, the other sharing 510.
     assert!(report.prefill.same * 100 >= report.prefill.queries * 98);
@@ -314,15 +249,7 @@ fn layer_2_chooses_the_references_compressed_positions() -> Result<()> {
 #[test]
 #[ignore = "needs a GB10 GPU, the deepseek-v4.1-flash target, ATLAS_DSV41_REC (full depth) and ATLAS_DSV41_CKPT"]
 fn layer_3_reads_what_layer_2_made_and_chose() -> Result<()> {
-    let report = run(&Case {
-        layer: 3,
-        ratio: 2,
-        key_source: false,
-        keys_from: 2,
-        index_source: false,
-        candidates: Candidates::None,
-    })?;
-    assert!(report.distance[0] < 5e-3);
+    assert!(run(3)?.distance[0] < 5e-3);
     Ok(())
 }
 
@@ -331,15 +258,7 @@ fn layer_3_reads_what_layer_2_made_and_chose() -> Result<()> {
 #[test]
 #[ignore = "needs a GB10 GPU, the deepseek-v4.1-flash target, ATLAS_DSV41_REC (full depth) and ATLAS_DSV41_CKPT"]
 fn layer_20_compresses_every_token_and_chooses() -> Result<()> {
-    let report = run(&Case {
-        layer: 20,
-        ratio: 1,
-        key_source: true,
-        keys_from: 20,
-        index_source: true,
-        candidates: Candidates::Source,
-    })?;
-    check(&report);
+    check(&run(20)?);
     Ok(())
 }
 
@@ -348,14 +267,6 @@ fn layer_20_compresses_every_token_and_chooses() -> Result<()> {
 #[test]
 #[ignore = "needs a GB10 GPU, the deepseek-v4.1-flash target, ATLAS_DSV41_REC (full depth) and ATLAS_DSV41_CKPT"]
 fn layer_24_chooses_among_layer_20s_keys() -> Result<()> {
-    let report = run(&Case {
-        layer: 24,
-        ratio: 1,
-        key_source: false,
-        keys_from: 20,
-        index_source: true,
-        candidates: Candidates::Reader,
-    })?;
-    check(&report);
+    check(&run(24)?);
     Ok(())
 }
