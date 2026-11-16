@@ -14,6 +14,8 @@ use spark_runtime::gpu::GpuBackend;
 struct Totals {
     stages: BTreeMap<&'static str, (Duration, u64)>,
     tokens: u64,
+    /// When the last layer last finished a pass.
+    left: Option<Instant>,
 }
 
 fn totals() -> Option<&'static Mutex<Totals>> {
@@ -25,6 +27,7 @@ fn totals() -> Option<&'static Mutex<Totals>> {
                 Mutex::new(Totals {
                     stages: BTreeMap::new(),
                     tokens: 0,
+                    left: None,
                 })
             })
     })
@@ -76,6 +79,34 @@ pub(super) fn end(
     let entry = totals.stages.entry(name).or_default();
     entry.0 += began.elapsed();
     entry.1 += 1;
+    Ok(())
+}
+
+/// A pass is entering the first layer: what has passed since the last one
+/// left the last layer is the engine's own time around the layers (the
+/// head, the sampling, the scheduler, the ranks' commands), stage "between
+/// passes". A gap of seconds is the wait for a request, and is not counted.
+pub(super) fn pass_begins() {
+    let Some(totals) = totals() else {
+        return;
+    };
+    let mut totals = totals.lock().expect("profile");
+    if let Some(gap) = totals.left.take().map(|left| left.elapsed())
+        && gap < Duration::from_secs(1)
+    {
+        let entry = totals.stages.entry("between passes").or_default();
+        entry.0 += gap;
+        entry.1 += 1;
+    }
+}
+
+/// A pass has left the last layer.
+pub(super) fn pass_ends(gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
+    let Some(totals) = totals() else {
+        return Ok(());
+    };
+    gpu.synchronize(stream)?;
+    totals.lock().expect("profile").left = Some(Instant::now());
     Ok(())
 }
 

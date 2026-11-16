@@ -109,6 +109,9 @@ impl Layer {
         let streams = ctx.buffers.hc_streams().offset(row * copies * hidden_bytes);
         let pre = ctx.buffers.hc_post().offset(row * copies * 4);
         if self.first {
+            profile::pass_begins();
+        }
+        if self.first {
             // Every copy of the stream starts as the embedding, and the
             // first block collapses with the identity mix.
             gpu.synchronize(stream)?;
@@ -144,6 +147,7 @@ impl Layer {
                 stream,
             )?;
             (0..rows).for_each(|_| profile::token_done());
+            profile::pass_ends(gpu, stream)?;
         }
         Ok(())
     }
