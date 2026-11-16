@@ -112,8 +112,6 @@ impl GemmScratch {
             .arg_u32(x.piece as u32)
             .arg_u64(x.piece_stride as u64)
             .arg_u32(mx_lt_inner_pad(k) as u32)
-            .arg_ptr(DevicePtr::NULL)
-            .arg_ptr(DevicePtr::NULL)
             .launch(stream)?;
         Ok(MxAct {
             q: self.q,

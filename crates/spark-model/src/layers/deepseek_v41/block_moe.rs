@@ -97,8 +97,8 @@ impl Block {
                 Some(plan)
             }
         };
-        // A large batch's experts go as grouped GEMMs, an expert's pairs a
-        // group.
+        // A large batch's experts go to the block-scaled tensor cores, an
+        // expert's pairs in tiles.
         let big = match (&plan, &sc.expert_gemm) {
             (Some(plan), Some(big)) if self.gemm.is_some() && rows >= big.from => {
                 let runs = Runs::new(plan, rows, s.top_k, slots);
@@ -150,6 +150,7 @@ impl Block {
                         &of.slab,
                         runs,
                         sc.quantized,
+                        rows,
                         sc.grouped.row_of,
                         sc.grouped.gate_up,
                         part_rows,

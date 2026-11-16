@@ -78,7 +78,6 @@ use std::sync::OnceLock;
 
 mod gemm;
 mod grouped;
-mod mx84;
 mod pack;
 mod prequant;
 
@@ -87,7 +86,6 @@ pub use gemm::{
     bf16_grouped_gemm_act_weight_t, fp8_blockwise_gemm_act_weight_t, nvfp4_gemm_bf16_act_weight_t,
 };
 pub use grouped::{nvfp4_grouped_down, nvfp4_grouped_gate_up, nvfp4_grouped_gate_up_fused};
-pub use mx84::{Mx84Group, mx84_grouped, mx84_workspace_bytes};
 pub use pack::{pack_bf16_weight_to_nvfp4_t, pack_weight_sfb, transpose_nvfp4_packed_kton};
 pub use prequant::{
     Nvfp4Act, Nvfp4WeightSfb, nvfp4_gemm_prequant, nvfp4_quant_act_scaled,
@@ -225,20 +223,6 @@ unsafe extern "C" {
         c_bf16: *mut c_void,
         expert_offsets_host: *const i32,
         num_experts: i32,
-        n: i32,
-        k: i32,
-        workspace: *mut c_void,
-        workspace_size: usize,
-        stream: *mut c_void,
-    ) -> i32;
-    pub(crate) fn atlas_cutlass_mx84_grouped(
-        a_ptrs: *const u64,
-        sfa_ptrs: *const u64,
-        b_ptrs: *const u64,
-        sfb_ptrs: *const u64,
-        d_ptrs: *const u64,
-        rows: *const i32,
-        groups: i32,
         n: i32,
         k: i32,
         workspace: *mut c_void,
