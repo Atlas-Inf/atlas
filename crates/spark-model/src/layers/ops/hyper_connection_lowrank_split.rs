@@ -382,11 +382,9 @@ pub(super) fn hc_pre_split(
     // and to fill the part after grid.x shrinks by HC_TT. At or below HC_TT the
     // tile degenerates to one token per block while still paying
     // hc_dim/HC_CH rounds of barriers, which is the decode regression measured
-    // above -- so the single-pass kernel keeps those shapes. On strix it once
-    // cut over to tiled from T=5 (kbench 42932386097: 189 vs 319 us at T=8),
-    // but #373 made the single-pass kernel 2.7x faster: now it wins at every
-    // decode width (kbench 43868021041, bit-identical: T=5 59.6 vs 163.2 us,
-    // T=6 66.4 vs 166.4, T=8 76.3 vs 183.7), so no platform cuts over below HC_TT.
+    // above -- so the single-pass kernel keeps those shapes. Strix once cut over
+    // at T=5 (42932386097); after #373 single-pass wins at every decode width
+    // (43868021041, bit-identical: T=5 59.6 vs 163.2 us, T=8 76.3 vs 183.7).
     if num_tokens > HC_TT {
         let smem = HC_TT as usize * HC_CH * 4;
         anyhow::ensure!(
