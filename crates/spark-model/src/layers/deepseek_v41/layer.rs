@@ -29,6 +29,7 @@ use super::ops::HEAD_DIM;
 use super::parts::Held;
 use super::profile;
 use super::shape::batch_rows;
+use super::tail;
 use super::weights::BlockWeights;
 use crate::layer::{ForwardContext, LayerState, TransformerLayer};
 
@@ -62,6 +63,8 @@ pub struct Layer {
     compresses: usize,
     first: bool,
     last: bool,
+    /// The rows of a chunk's end a prefill may run alone (`tail.rs`).
+    tail: Option<usize>,
 }
 
 impl Layer {
@@ -146,6 +149,28 @@ impl Layer {
     }
 }
 
+impl Layer {
+    /// At a chunk's first layer: whether the pass reads every row of the
+    /// last layer, which the rank that serves the request knows and the
+    /// others are told, for the layers after this one to go by.
+    fn agree_on_rows(&self, ctx: &ForwardContext, stream: u64) -> Result<()> {
+        let shared = &self.block.shared;
+        let mut whole = tail::whole_here();
+        if let Some(comm) = ctx.comm.filter(|_| ctx.config.ep_world_size > 1) {
+            let word = shared.scratch.word;
+            let mut bytes = [0u8; 16];
+            bytes[0] = u8::from(whole);
+            ctx.gpu.synchronize(stream)?;
+            ctx.gpu.copy_h2d(&bytes, word)?;
+            comm.broadcast(word.0, bytes.len(), 0)?;
+            ctx.gpu.copy_d2h(word, &mut bytes)?;
+            whole = bytes[0] != 0;
+        }
+        shared.handoff.lock().expect("handoff").whole = whole;
+        Ok(())
+    }
+}
+
 impl TransformerLayer for Layer {
     fn decode(
         &self,
@@ -182,7 +207,12 @@ impl TransformerLayer for Layer {
     ) -> Result<()> {
         let width = self.block.shared.shape.hidden * 2;
         let batch = self.block.shared.scratch.rows;
-        for first in (0..num_tokens).step_by(batch) {
+        if self.first {
+            self.agree_on_rows(ctx, stream)?;
+        }
+        let whole = self.block.shared.handoff.lock().expect("handoff").whole;
+        let from = tail::first_row(self.tail, num_tokens, whole);
+        for first in (from..num_tokens).step_by(batch) {
             let rows = (num_tokens - first).min(batch);
             let at = hidden.offset(first * width);
             self.run(at, rows, state, seq_len_start + first, ctx, stream)?;
@@ -298,6 +328,14 @@ pub fn load_layers(
             .clone()
             .context("deepseek_v41: the Engram token map was not derived from the tokenizer")
     };
+    // The layers something reads at every row of a prompt: the ones that
+    // make compressed keys, and the Engram layers, which keep a history.
+    let per_row: Vec<usize> = config
+        .kv_source_layer_ids
+        .iter()
+        .chain(&config.engram_layer_ids)
+        .copied()
+        .collect();
     let mut out: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(layers);
     for layer in 0..layers {
         let ratio = config.compress_ratios.get(layer).copied().unwrap_or(0);
@@ -381,6 +419,7 @@ pub fn load_layers(
             compresses,
             first: layer == 0,
             last: layer + 1 == layers,
+            tail: tail::rows_of_layer(layer, layers, &per_row),
         }));
     }
     Ok(out)

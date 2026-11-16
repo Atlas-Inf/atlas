@@ -150,6 +150,9 @@ pub struct Handoff {
     /// batches, the compressed positions the latest index source chose.
     table: DevicePtr,
     table_rows: usize,
+    /// Whether the pass reads every row of the last layer, as rank 0 said at
+    /// its first layer (`tail.rs`).
+    pub(super) whole: bool,
 }
 
 impl Default for Handoff {
@@ -158,6 +161,7 @@ impl Default for Handoff {
             rows: Vec::new(),
             table: DevicePtr::NULL,
             table_rows: 0,
+            whole: true,
         }
     }
 }

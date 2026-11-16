@@ -26,6 +26,7 @@ mod profile;
 mod shape;
 pub mod side;
 mod state;
+pub mod tail;
 pub mod weights;
 
 #[cfg(test)]

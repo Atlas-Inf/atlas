@@ -160,6 +160,8 @@ const SCORES: usize = 1 << 25;
 pub struct Scratch {
     /// Rows there is room for.
     pub(super) rows: usize,
+    /// A device word for the ranks to agree on (`Layer::agree_on_rows`).
+    pub(super) word: DevicePtr,
     /// The routed experts of a batch, grouped; and the shared expert's
     /// `[rows, 2, inter / PARTS]` gate and up rows.
     pub(super) grouped: GroupedScratch,
@@ -267,6 +269,7 @@ impl Scratch {
         let copies = s.hc.copies;
         Ok(Self {
             rows,
+            word: gpu.alloc(64)?,
             grouped: GroupedScratch::alloc(gpu, rows, s.top_k, s.experts, s.inter / PARTS)?,
             shared_gate_up: bf16(rows * 2 * s.inter / PARTS)?,
             gemm: GemmScratch::alloc(gpu, rows, s.hidden.max(s.o_groups * s.o_rank))?,
