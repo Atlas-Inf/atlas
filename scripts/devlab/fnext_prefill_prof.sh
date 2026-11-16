@@ -109,6 +109,12 @@ else:
 EOF
 kill -INT "$APID" 2>/dev/null; for _ in $(seq 1 120); do kill -0 "$APID" 2>/dev/null || break; sleep 2; done; kill -9 "$APID" 2>/dev/null || true
 cp "$OUT/atlas-server.log" "$OUT/serve-prof.log" 2>/dev/null || true
+# ATLAS_QWEN4EXP_BATCH_FAST_CHECK=1: the batched rows vs single-sequence decode, byte for byte.
+if grep -aq "BATCH_FAST_CHECK" "$OUT/atlas-server.log"; then
+  log "BATCH_FAST_CHECK lines: $(grep -ac BATCH_FAST_CHECK "$OUT/atlas-server.log"), mismatching: $(grep -a BATCH_FAST_CHECK "$OUT/atlas-server.log" | grep -aciE 'mismatch|differ|FAIL')"
+  grep -a BATCH_FAST_CHECK "$OUT/atlas-server.log" | grep -aiE 'mismatch|differ|FAIL' | head -5
+  grep -a BATCH_FAST_CHECK "$OUT/atlas-server.log" | tail -2
+fi
 
 [ "${NOPROF:-0}" = 1 ] && { log DONE; exit 0; }
 KT=$(find "$OUT/prof" -name '*kernel_trace.csv' | head -1)
