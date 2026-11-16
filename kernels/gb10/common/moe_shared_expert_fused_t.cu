@@ -812,6 +812,49 @@ extern "C" __global__ void moe_expert_union_t(
     unsigned int* __restrict__ u_count,
     unsigned int K, unsigned int top_k
 ) {
+#if defined(__HIP_PLATFORM_AMD__)
+    // gfx1151: the serial fill below re-reads u_experts from global memory inside lane 0's
+    // compare loop (~K*top_k x U dependent loads) and cost 97-142 us a call (2.5% of Flash-Next
+    // C8 decode). Same result in parallel: ids in LDS, each slot finds its first occurrence, a
+    // prefix over the first-occurrence flags numbers the unique ids in the serial loop's order,
+    // then a parallel scatter. Byte-identical outputs (kbench: 140 routings, 142 -> 13 us).
+    constexpr unsigned int UNION_MAX = 256u;
+    const unsigned int n = K * top_k;
+    if (n <= UNION_MAX) {
+        const unsigned int lane = threadIdx.x, nt = blockDim.x;
+        __shared__ unsigned int s_id[UNION_MAX], s_fi[UNION_MAX], s_pref[UNION_MAX], s_mask[UNION_MAX];
+        __shared__ unsigned int s_U;
+        for (unsigned int t = lane; t < n; t += nt) s_id[t] = expert_indices[t];
+        __syncthreads();
+        for (unsigned int t = lane; t < n; t += nt) {
+            const unsigned int id = s_id[t];
+            unsigned int f = t;
+            for (unsigned int q = 0; q < t; q++) if (s_id[q] == id) { f = q; break; }
+            s_fi[t] = f;
+        }
+        __syncthreads();
+        if (lane == 0) {
+            unsigned int U = 0;
+            for (unsigned int t = 0; t < n; t++) { s_pref[t] = U; U += (s_fi[t] == t); }
+            s_U = U; *u_count = U;
+        }
+        __syncthreads();
+        for (unsigned int t = lane; t < n; t += nt) if (s_fi[t] == t) {
+            const unsigned int u = s_pref[t];
+            u_experts[u] = s_id[t]; s_mask[u] = 0;
+            for (unsigned int rr = 0; rr < MOE_MAX_K; rr++) u_rowslot[u * MOE_MAX_K + rr] = 0xFF;
+        }
+        __syncthreads();
+        for (unsigned int t = lane; t < n; t += nt) {
+            const unsigned int u = s_pref[s_fi[t]], r = t / top_k;
+            atomicOr(&s_mask[u], 1u << r);
+            u_rowslot[u * MOE_MAX_K + r] = (unsigned char)(t % top_k);
+        }
+        __syncthreads();
+        for (unsigned int u = lane; u < s_U; u += nt) u_rowmask[u] = s_mask[u];
+        return;
+    }
+#endif
     // Serial fill by lane 0: K*top_k <= 80 slots, trivially cheap on GPU.
     if (threadIdx.x == 0) {
         unsigned int U = 0;
