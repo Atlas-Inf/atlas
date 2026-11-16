@@ -238,11 +238,48 @@ fn attention_with_the_heads_together_leaves_the_plain_forms_bytes() -> Result<()
             count,
             split,
             Some(turn),
+            false,
             stream,
         )?;
+        let want = bytes(gpu, plain, HEADS * HEAD_DIM * 2)?;
         assert!(
-            bytes(gpu, plain, HEADS * HEAD_DIM * 2)? == bytes(gpu, fused, HEADS * HEAD_DIM * 2)?,
+            want == bytes(gpu, fused, HEADS * HEAD_DIM * 2)?,
             "{count} keys: the attention with the heads together differs"
+        );
+        // And on tensor cores, as a batch runs it: the same products, summed
+        // in another order, so a value in a few hundred may round the other
+        // way.
+        sparse_attn(
+            gpu,
+            &k,
+            q,
+            keys,
+            keys,
+            idx,
+            sink,
+            fused,
+            records,
+            1,
+            HEADS,
+            count,
+            split,
+            Some(turn),
+            true,
+            stream,
+        )?;
+        let got = bytes(gpu, fused, HEADS * HEAD_DIM * 2)?;
+        let same = want
+            .chunks_exact(2)
+            .zip(got.chunks_exact(2))
+            .filter(|(a, b)| a == b)
+            .count();
+        println!(
+            "{count} keys: {same} of {} values equal on tensor cores",
+            HEADS * HEAD_DIM
+        );
+        assert!(
+            same * 100 >= HEADS * HEAD_DIM * 97,
+            "{count} keys: the attention on tensor cores is not the same attention"
         );
         gpu.free(idx)?;
         gpu.free(q)?;

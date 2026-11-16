@@ -155,6 +155,7 @@ fn run(gpu: &dyn GpuBackend, k: &Kernels, case: &Case, sink: DevicePtr) -> Resul
         case.k,
         case.k,
         None,
+        false,
         gpu.default_stream(),
     )?;
     let got = download(gpu, out, case.q.len())?;

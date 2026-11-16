@@ -31,6 +31,10 @@ pub struct Kernels {
     attn_logits: KernelHandle,
     attn_schedule: KernelHandle,
     attn_output: KernelHandle,
+    /// The first and third of those on tensor cores, for a batch
+    /// (`dsv41_attn_tc.cu`).
+    attn_logits_tc: KernelHandle,
+    attn_output_tc: KernelHandle,
     pub rotate: KernelHandle,
     pub fp8_quant_dequant: KernelHandle,
     pub fp4_quant_dequant: KernelHandle,
@@ -44,6 +48,8 @@ impl Kernels {
             attn_logits: gpu.kernel("dsv41_attn", "dsv41_attn_logits")?,
             attn_schedule: gpu.kernel("dsv41_attn", "dsv41_attn_schedule")?,
             attn_output: gpu.kernel("dsv41_attn", "dsv41_attn_output")?,
+            attn_logits_tc: gpu.kernel("dsv41_attn_tc", "dsv41_attn_logits_tc")?,
+            attn_output_tc: gpu.kernel("dsv41_attn_tc", "dsv41_attn_output_tc")?,
             rotate: gpu.kernel("dsv41_cache", "dsv41_rotate")?,
             fp8_quant_dequant: gpu.kernel("dsv41_cache", "dsv41_fp8_quant_dequant")?,
             fp4_quant_dequant: gpu.kernel("dsv41_cache", "dsv41_fp4_quant_dequant")?,
@@ -159,6 +165,10 @@ pub fn attn_records(queries: usize, heads: usize) -> usize {
 /// With `turn`, `q` is turned to each query's position before it scores
 /// and the output turned back, as [`rotate`] would in place before and
 /// after.
+///
+/// `batch` takes the first and third launches on tensor cores: the same
+/// products with their FP32 sums in another order, a block a query, for a
+/// prefill's thousands of queries.
 #[allow(clippy::too_many_arguments)]
 pub fn sparse_attn(
     gpu: &dyn GpuBackend,
@@ -175,6 +185,7 @@ pub fn sparse_attn(
     keys: usize,
     split: usize,
     turn: Option<Turn>,
+    batch: bool,
     stream: u64,
 ) -> Result<()> {
     let turn = turn.unwrap_or(Turn {
@@ -198,9 +209,20 @@ pub fn sparse_attn(
             .arg_u32(turn.rope as u32)
             .launch(stream)
     };
+    let (logits, output, across) = match batch {
+        true => (kernels.attn_logits_tc, kernels.attn_output_tc, [1, 1]),
+        false => (
+            kernels.attn_logits,
+            kernels.attn_output,
+            [
+                steps * (64 / ATTN_GROUP) as u32,
+                (HEAD_DIM / ATTN_GROUP) as u32,
+            ],
+        ),
+    };
     turned(
-        KernelLaunch::new(gpu, kernels.attn_logits)
-            .grid([steps * (64 / ATTN_GROUP) as u32, groups, 1])
+        KernelLaunch::new(gpu, logits)
+            .grid([across[0], groups, 1])
             .block(block)
             .arg_ptr(q)
             .arg_ptr(keys_a)
@@ -221,8 +243,8 @@ pub fn sparse_attn(
         .arg_u32(keys as u32)
         .launch(stream)?;
     turned(
-        KernelLaunch::new(gpu, kernels.attn_output)
-            .grid([(HEAD_DIM / ATTN_GROUP) as u32, groups, 1])
+        KernelLaunch::new(gpu, output)
+            .grid([across[1], groups, 1])
             .block(block)
             .arg_ptr(keys_a)
             .arg_ptr(keys_b)

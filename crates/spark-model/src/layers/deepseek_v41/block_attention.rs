@@ -264,6 +264,7 @@ impl Block {
                 keys,
                 WINDOW,
                 Some(turn),
+                gemm.is_some(),
                 stream,
             )?;
             profile::end(gpu, stream, "sparse attention", began)?;
